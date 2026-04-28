@@ -65,6 +65,7 @@ describe("openai-completions image output", () => {
 			api: "openai-completions",
 			provider: "openrouter",
 			baseUrl: "https://openrouter.ai/api/v1",
+			compat: { openRouterImageGeneration: true },
 			reasoning: false,
 			input: ["text", "image"],
 			cost: { input: 0.015, output: 0.03, cacheRead: 0, cacheWrite: 0 },
