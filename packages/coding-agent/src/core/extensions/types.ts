@@ -993,6 +993,11 @@ export interface ToolResultEventResult {
 	isError?: boolean;
 }
 
+export interface MessageEndEventResult {
+	/** Replace the finalized message. The replacement must keep the original message role. */
+	message?: AgentMessage;
+}
+
 export interface BeforeAgentStartEventResult {
 	message?: Pick<CustomMessage, "customType" | "content" | "display" | "details">;
 	/** Replace the system prompt for this turn. If multiple extensions return this, they are chained. */
@@ -1101,7 +1106,7 @@ export interface ExtensionAPI {
 	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent>): void;
 	on(event: "message_start", handler: ExtensionHandler<MessageStartEvent>): void;
 	on(event: "message_update", handler: ExtensionHandler<MessageUpdateEvent>): void;
-	on(event: "message_end", handler: ExtensionHandler<MessageEndEvent>): void;
+	on(event: "message_end", handler: ExtensionHandler<MessageEndEvent, MessageEndEventResult>): void;
 	on(event: "tool_execution_start", handler: ExtensionHandler<ToolExecutionStartEvent>): void;
 	on(event: "tool_execution_update", handler: ExtensionHandler<ToolExecutionUpdateEvent>): void;
 	on(event: "tool_execution_end", handler: ExtensionHandler<ToolExecutionEndEvent>): void;

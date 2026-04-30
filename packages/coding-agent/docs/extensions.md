@@ -527,6 +527,7 @@ Fired for message lifecycle updates.
 
 - `message_start` and `message_end` fire for user, assistant, and toolResult messages.
 - `message_update` fires for assistant streaming updates.
+- `message_end` handlers can return `{ message }` to replace the finalized message. The replacement must keep the same `role`.
 
 ```typescript
 pi.on("message_start", async (event, ctx) => {
@@ -539,7 +540,20 @@ pi.on("message_update", async (event, ctx) => {
 });
 
 pi.on("message_end", async (event, ctx) => {
-  // event.message
+  if (event.message.role !== "assistant") return;
+
+  return {
+    message: {
+      ...event.message,
+      usage: {
+        ...event.message.usage,
+        cost: {
+          ...event.message.usage.cost,
+          total: 0.123,
+        },
+      },
+    },
+  };
 });
 ```
 
@@ -2557,7 +2571,6 @@ All examples in [examples/extensions/](../examples/extensions/).
 | `session-name.ts` | Name sessions for selector | `setSessionName`, `getSessionName` |
 | `bookmark.ts` | Bookmark entries for /tree | `setLabel` |
 | **Misc** |||
-| `antigravity-image-gen.ts` | Image generation tool | `registerTool`, Google Antigravity |
 | `inline-bash.ts` | Inline bash in tool calls | `on("tool_call")` |
 | `bash-spawn-hook.ts` | Adjust bash command, cwd, and env before execution | `createBashTool`, `spawnHook` |
 | `with-deps/` | Extension with npm dependencies | Package structure with `package.json` |
