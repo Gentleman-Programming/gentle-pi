@@ -43,7 +43,10 @@ export type KnownProvider =
 	| "kimi-coding"
 	| "cloudflare-workers-ai"
 	| "cloudflare-ai-gateway"
-	| "xiaomi";
+	| "xiaomi"
+	| "xiaomi-token-plan-cn"
+	| "xiaomi-token-plan-ams"
+	| "xiaomi-token-plan-sgp";
 export type Provider = KnownProvider | string;
 
 export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";

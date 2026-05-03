@@ -320,7 +320,10 @@ ${chalk.bold("Environment Variables:")}
   CLOUDFLARE_API_KEY               - Cloudflare API token (Workers AI and AI Gateway)
   CLOUDFLARE_ACCOUNT_ID            - Cloudflare account id (required for both)
   CLOUDFLARE_GATEWAY_ID            - Cloudflare AI Gateway slug (required for AI Gateway)
-  XIAOMI_API_KEY                   - Xiaomi MiMo Token Plan API key
+  XIAOMI_API_KEY                   - Xiaomi MiMo API key (api.xiaomimimo.com billing)
+  XIAOMI_TOKEN_PLAN_CN_API_KEY     - Xiaomi MiMo Token Plan API key (China region)
+  XIAOMI_TOKEN_PLAN_AMS_API_KEY    - Xiaomi MiMo Token Plan API key (Amsterdam region)
+  XIAOMI_TOKEN_PLAN_SGP_API_KEY    - Xiaomi MiMo Token Plan API key (Singapore region)
   AWS_PROFILE                      - AWS profile for Amazon Bedrock
   AWS_ACCESS_KEY_ID                - AWS access key for Amazon Bedrock
   AWS_SECRET_ACCESS_KEY            - AWS secret key for Amazon Bedrock

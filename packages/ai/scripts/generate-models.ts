@@ -931,28 +931,40 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 		}
 
 		// Process Xiaomi MiMo models
-		if (data.xiaomi?.models) {
-			for (const [modelId, model] of Object.entries(data.xiaomi.models)) {
-				const m = model as ModelsDevModel;
-				if (m.tool_call !== true) continue;
+		// Built-in `xiaomi` targets the API billing endpoint (single stable URL,
+		// keys from platform.xiaomimimo.com). The three `xiaomi-token-plan-*`
+		// providers cover prepaid Token Plan endpoints in cn / ams / sgp.
+		const xiaomiVariants = [
+			{ provider: "xiaomi", baseUrl: "https://api.xiaomimimo.com/anthropic" },
+			{ provider: "xiaomi-token-plan-cn", baseUrl: "https://token-plan-cn.xiaomimimo.com/anthropic" },
+			{ provider: "xiaomi-token-plan-ams", baseUrl: "https://token-plan-ams.xiaomimimo.com/anthropic" },
+			{ provider: "xiaomi-token-plan-sgp", baseUrl: "https://token-plan-sgp.xiaomimimo.com/anthropic" },
+		] as const;
 
-				models.push({
-					id: modelId,
-					name: m.name || modelId,
-					api: "anthropic-messages",
-					provider: "xiaomi",
-					baseUrl: "https://token-plan-ams.xiaomimimo.com/anthropic",
-					reasoning: m.reasoning === true,
-					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
-					contextWindow: m.limit?.context || 4096,
-					maxTokens: m.limit?.output || 4096,
-				});
+		if (data.xiaomi?.models) {
+			for (const { provider, baseUrl } of xiaomiVariants) {
+				for (const [modelId, model] of Object.entries(data.xiaomi.models)) {
+					const m = model as ModelsDevModel;
+					if (m.tool_call !== true) continue;
+
+					models.push({
+						id: modelId,
+						name: m.name || modelId,
+						api: "anthropic-messages",
+						provider,
+						baseUrl,
+						reasoning: m.reasoning === true,
+						input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
+						cost: {
+							input: m.cost?.input || 0,
+							output: m.cost?.output || 0,
+							cacheRead: m.cost?.cache_read || 0,
+							cacheWrite: m.cost?.cache_write || 0,
+						},
+						contextWindow: m.limit?.context || 4096,
+						maxTokens: m.limit?.output || 4096,
+					});
+				}
 			}
 		}
 

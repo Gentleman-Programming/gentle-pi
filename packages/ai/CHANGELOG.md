@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Switched the built-in `xiaomi` provider endpoint from Token Plan AMS (`https://token-plan-ams.xiaomimimo.com/anthropic`) to API billing (`https://api.xiaomimimo.com/anthropic`). `XIAOMI_API_KEY` now refers to the API billing key from [platform.xiaomimimo.com](https://platform.xiaomimimo.com). Users still on Token Plan must move to the appropriate `xiaomi-token-plan-*` provider and set the corresponding env var.
+
+### Added
+
+- Added Xiaomi MiMo Token Plan regional providers with per-region env vars: `xiaomi-token-plan-cn` (`XIAOMI_TOKEN_PLAN_CN_API_KEY`), `xiaomi-token-plan-ams` (`XIAOMI_TOKEN_PLAN_AMS_API_KEY`), and `xiaomi-token-plan-sgp` (`XIAOMI_TOKEN_PLAN_SGP_API_KEY`).
+
 ## [0.72.1] - 2026-05-02
 
 ## [0.72.0] - 2026-05-01

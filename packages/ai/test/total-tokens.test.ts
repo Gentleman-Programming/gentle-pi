@@ -447,7 +447,7 @@ describe("totalTokens field", () => {
 	// Xiaomi MiMo
 	// =========================================================================
 
-	describe.skipIf(!process.env.XIAOMI_API_KEY)("Xiaomi MiMo", () => {
+	describe.skipIf(!process.env.XIAOMI_API_KEY)("Xiaomi MiMo (API billing)", () => {
 		it(
 			"mimo-v2.5-pro - should return totalTokens equal to sum of components",
 			{ retry: 3, timeout: 60000 },
@@ -456,6 +456,81 @@ describe("totalTokens field", () => {
 
 				console.log(`\nXiaomi MiMo / ${llm.id}:`);
 				const { first, second } = await testTotalTokensWithCache(llm, { apiKey: process.env.XIAOMI_API_KEY });
+
+				logUsage("First request", first);
+				logUsage("Second request", second);
+
+				assertTotalTokensEqualsComponents(first);
+				assertTotalTokensEqualsComponents(second);
+			},
+		);
+	});
+
+	// =========================================================================
+	// Xiaomi MiMo Token Plan CN
+	// =========================================================================
+
+	describe.skipIf(!process.env.XIAOMI_TOKEN_PLAN_CN_API_KEY)("Xiaomi MiMo Token Plan (CN)", () => {
+		it(
+			"mimo-v2.5-pro - should return totalTokens equal to sum of components",
+			{ retry: 3, timeout: 60000 },
+			async () => {
+				const llm = getModel("xiaomi-token-plan-cn", "mimo-v2.5-pro");
+
+				console.log(`\nXiaomi MiMo Token Plan CN / ${llm.id}:`);
+				const { first, second } = await testTotalTokensWithCache(llm, {
+					apiKey: process.env.XIAOMI_TOKEN_PLAN_CN_API_KEY,
+				});
+
+				logUsage("First request", first);
+				logUsage("Second request", second);
+
+				assertTotalTokensEqualsComponents(first);
+				assertTotalTokensEqualsComponents(second);
+			},
+		);
+	});
+
+	// =========================================================================
+	// Xiaomi MiMo Token Plan AMS
+	// =========================================================================
+
+	describe.skipIf(!process.env.XIAOMI_TOKEN_PLAN_AMS_API_KEY)("Xiaomi MiMo Token Plan (AMS)", () => {
+		it(
+			"mimo-v2.5-pro - should return totalTokens equal to sum of components",
+			{ retry: 3, timeout: 60000 },
+			async () => {
+				const llm = getModel("xiaomi-token-plan-ams", "mimo-v2.5-pro");
+
+				console.log(`\nXiaomi MiMo Token Plan AMS / ${llm.id}:`);
+				const { first, second } = await testTotalTokensWithCache(llm, {
+					apiKey: process.env.XIAOMI_TOKEN_PLAN_AMS_API_KEY,
+				});
+
+				logUsage("First request", first);
+				logUsage("Second request", second);
+
+				assertTotalTokensEqualsComponents(first);
+				assertTotalTokensEqualsComponents(second);
+			},
+		);
+	});
+
+	// =========================================================================
+	// Xiaomi MiMo Token Plan SGP
+	// =========================================================================
+
+	describe.skipIf(!process.env.XIAOMI_TOKEN_PLAN_SGP_API_KEY)("Xiaomi MiMo Token Plan (SGP)", () => {
+		it(
+			"mimo-v2.5-pro - should return totalTokens equal to sum of components",
+			{ retry: 3, timeout: 60000 },
+			async () => {
+				const llm = getModel("xiaomi-token-plan-sgp", "mimo-v2.5-pro");
+
+				console.log(`\nXiaomi MiMo Token Plan SGP / ${llm.id}:`);
+				const { first, second } = await testTotalTokensWithCache(llm, {
+					apiKey: process.env.XIAOMI_TOKEN_PLAN_SGP_API_KEY,
+				});
 
 				logUsage("First request", first);
 				logUsage("Second request", second);
