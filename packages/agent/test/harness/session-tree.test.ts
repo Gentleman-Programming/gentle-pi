@@ -3,11 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-	DefaultSessionTree,
-	InMemorySessionTreeStorage,
-	JsonlSessionTreeStorage,
-} from "../../src/harness/session-tree.js";
+import { JsonlSessionTreeStorage } from "../../src/harness/session/jsonl-session-storage.js";
+import { InMemorySessionTreeStorage } from "../../src/harness/session/memory-session-storage.js";
+import { DefaultSessionTree } from "../../src/harness/session/session-tree.js";
 import type { SessionTreeStorage } from "../../src/harness/types.js";
 
 function createUserMessage(text: string): AgentMessage {
@@ -128,6 +126,8 @@ async function runSessionTreeSuite(name: string, createStorage: () => SessionTre
 			const entries = await tree.getEntries();
 			expect(entries.some((entry) => entry.type === "label")).toBe(true);
 			expect(entries.some((entry) => entry.type === "session_info")).toBe(true);
+			expect(await tree.getLabel(user1)).toBe("checkpoint");
+			expect(await tree.getSessionName()).toBe("name");
 			expect((await tree.buildContext()).messages).toHaveLength(1);
 		});
 
@@ -136,11 +136,15 @@ async function runSessionTreeSuite(name: string, createStorage: () => SessionTre
 			const tree = new DefaultSessionTree(storage);
 			const user1 = await tree.appendMessage(createUserMessage("one"));
 			await tree.appendMessage(createAssistantMessage("two"));
+			await tree.appendLabelChange(user1, "checkpoint");
+			await tree.appendSessionInfo("name");
 			await tree.moveTo(user1);
 			await tree.appendMessage(createAssistantMessage("branched"));
 			const tree2 = new DefaultSessionTree(storage);
 			const context = await tree2.buildContext();
 			expect(context.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+			expect(await tree2.getLabel(user1)).toBe("checkpoint");
+			expect(await tree2.getSessionName()).toBe("name");
 			inspect?.();
 		});
 	});

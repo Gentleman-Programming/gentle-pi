@@ -3,13 +3,8 @@ import { readFileSync } from "node:fs";
 import type { ImageContent, Model } from "@mariozechner/pi-ai";
 import type { Agent } from "../agent.js";
 import type { AgentEvent, AgentMessage, AgentTool, ThinkingLevel } from "../types.js";
-import {
-	collectEntriesForBranchSummary,
-	compact,
-	DEFAULT_COMPACTION_SETTINGS,
-	generateBranchSummary,
-	prepareCompaction,
-} from "./compaction.js";
+import { collectEntriesForBranchSummary, generateBranchSummary } from "./compaction/branch-summarization.js";
+import { compact, DEFAULT_COMPACTION_SETTINGS, prepareCompaction } from "./compaction/compaction.js";
 import { expandPromptTemplate } from "./prompt-templates.js";
 import type {
 	AbortResult,
@@ -24,8 +19,6 @@ import type {
 	ExecutionEnv,
 	NavigateTreeResult,
 	PromptTemplate,
-	SessionBeforeCompactResult,
-	SessionBeforeTreeResult,
 	SessionTree,
 	Skill,
 	SystemPromptInputs,
@@ -388,8 +381,8 @@ export class DefaultAgentHarness implements AgentHarness {
 			customInstructions,
 			signal: new AbortController().signal,
 		});
-		if ((hookResult as SessionBeforeCompactResult | undefined)?.cancel) throw new Error("Compaction cancelled");
-		const provided = (hookResult as SessionBeforeCompactResult | undefined)?.compaction;
+		if (hookResult?.cancel) throw new Error("Compaction cancelled");
+		const provided = hookResult?.compaction;
 		const result =
 			provided ??
 			(await compact(
@@ -442,11 +435,10 @@ export class DefaultAgentHarness implements AgentHarness {
 			preparation,
 			signal,
 		});
-		const typedHook = hookResult as SessionBeforeTreeResult | undefined;
-		if (typedHook?.cancel) return { cancelled: true };
+		if (hookResult?.cancel) return { cancelled: true };
 		let summaryEntry: any | undefined;
-		let summaryText: string | undefined = typedHook?.summary?.summary;
-		let summaryDetails: unknown = typedHook?.summary?.details;
+		let summaryText: string | undefined = hookResult?.summary?.summary;
+		let summaryDetails: unknown = hookResult?.summary?.details;
 		if (!summaryText && options?.summarize && entries.length > 0) {
 			const model = this.conversation.model;
 			if (!model) throw new Error("No model set for branch summary");
@@ -457,8 +449,8 @@ export class DefaultAgentHarness implements AgentHarness {
 				apiKey: auth.apiKey,
 				headers: auth.headers,
 				signal: new AbortController().signal,
-				customInstructions: typedHook?.customInstructions ?? options?.customInstructions,
-				replaceInstructions: typedHook?.replaceInstructions ?? options?.replaceInstructions,
+				customInstructions: hookResult?.customInstructions ?? options?.customInstructions,
+				replaceInstructions: hookResult?.replaceInstructions ?? options?.replaceInstructions,
 			});
 			if (branchSummary.aborted) return { cancelled: true };
 			if (branchSummary.error) throw new Error(branchSummary.error);
@@ -498,7 +490,7 @@ export class DefaultAgentHarness implements AgentHarness {
 				newLeafId ?? "root",
 				summaryText,
 				summaryDetails,
-				typedHook?.summary !== undefined,
+				hookResult?.summary !== undefined,
 			);
 			summaryEntry = await this.sessionTree.getEntry(summaryId);
 		}
@@ -508,7 +500,7 @@ export class DefaultAgentHarness implements AgentHarness {
 			newLeafId: await this.sessionTree.getLeafId(),
 			oldLeafId,
 			summaryEntry,
-			fromHook: typedHook?.summary !== undefined,
+			fromHook: hookResult?.summary !== undefined,
 		});
 		return { cancelled: false, editorText, summaryEntry };
 	}
@@ -573,12 +565,7 @@ export class DefaultAgentHarness implements AgentHarness {
 		await this.agent.waitForIdle();
 	}
 
-	subscribe(
-		listener: (
-			event: AgentEvent | import("./types.js").AgentHarnessOwnEvent,
-			signal?: AbortSignal,
-		) => Promise<void> | void,
-	): () => void {
+	subscribe(listener: (event: AgentHarnessEvent, signal?: AbortSignal) => Promise<void> | void): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
 	}

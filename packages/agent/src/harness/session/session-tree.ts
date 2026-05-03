@@ -1,9 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
-import type { AgentMessage } from "../types.js";
-import { createBranchSummaryMessage, createCompactionSummaryMessage, createCustomMessage } from "./messages.js";
+import type { AgentMessage } from "../../types.js";
+import { createBranchSummaryMessage, createCompactionSummaryMessage, createCustomMessage } from "../messages.js";
 import type {
 	BranchSummaryEntry,
 	CompactionEntry,
@@ -13,12 +11,14 @@ import type {
 	MessageEntry,
 	ModelChangeEntry,
 	SessionContext,
+	SessionInfo,
 	SessionInfoEntry,
 	SessionTree,
 	SessionTreeEntry,
 	SessionTreeStorage,
 	ThinkingLevelChangeEntry,
-} from "./types.js";
+} from "../types.js";
+import { InMemorySessionTreeStorage } from "./memory-session-storage.js";
 
 function generateId(byId: { has(id: string): boolean }): string {
 	for (let i = 0; i < 100; i++) {
@@ -79,172 +79,6 @@ export function buildSessionContext(entries: SessionTreeEntry[]): SessionContext
 	return { messages, thinkingLevel, model };
 }
 
-interface SessionHeader {
-	type: "session";
-	version: 3;
-	id: string;
-	timestamp: string;
-	cwd: string;
-	parentSession?: string;
-}
-
-async function loadJsonlStorage(
-	filePath: string,
-): Promise<{ header?: SessionHeader; entries: SessionTreeEntry[]; leafId: string | null }> {
-	try {
-		const content = await readFile(filePath, "utf8");
-		const entries: SessionTreeEntry[] = [];
-		let header: SessionHeader | undefined;
-		let leafId: string | null = null;
-		for (const line of content.split("\n")) {
-			if (!line.trim()) continue;
-			try {
-				const record = JSON.parse(line) as SessionHeader | SessionTreeEntry;
-				if (record.type === "session") {
-					header = record as SessionHeader;
-					continue;
-				}
-				entries.push(record as SessionTreeEntry);
-				leafId = (record as SessionTreeEntry).id;
-			} catch {
-				// ignore malformed lines
-			}
-		}
-		return { header, entries, leafId };
-	} catch {
-		return { entries: [], leafId: null };
-	}
-}
-
-export class JsonlSessionTreeStorage implements SessionTreeStorage {
-	private filePath: string;
-	private cwd: string;
-	private headerInitialized = false;
-	private cacheLoaded = false;
-	private entries: SessionTreeEntry[] = [];
-	private byId = new Map<string, SessionTreeEntry>();
-	private currentLeafId: string | null = null;
-
-	constructor(filePath: string, options: { cwd: string }) {
-		this.filePath = resolve(filePath);
-		this.cwd = options.cwd;
-	}
-
-	private async ensureParentDir(): Promise<void> {
-		await mkdir(dirname(this.filePath), { recursive: true });
-	}
-
-	private async ensureLoaded(): Promise<void> {
-		if (this.cacheLoaded) {
-			return;
-		}
-		const loaded = await loadJsonlStorage(this.filePath);
-		this.entries = loaded.entries;
-		this.byId = new Map(loaded.entries.map((entry) => [entry.id, entry]));
-		this.currentLeafId = loaded.leafId;
-		this.headerInitialized = loaded.header !== undefined;
-		this.cacheLoaded = true;
-	}
-
-	private async ensureHeader(): Promise<void> {
-		await this.ensureLoaded();
-		if (this.headerInitialized) return;
-		await this.ensureParentDir();
-		const header: SessionHeader = {
-			type: "session",
-			version: 3,
-			id: randomUUID(),
-			timestamp: new Date().toISOString(),
-			cwd: this.cwd,
-		};
-		await writeFile(this.filePath, `${JSON.stringify(header)}\n`);
-		this.headerInitialized = true;
-	}
-
-	async getLeafId(): Promise<string | null> {
-		await this.ensureLoaded();
-		return this.currentLeafId;
-	}
-
-	async setLeafId(leafId: string | null): Promise<void> {
-		await this.ensureLoaded();
-		this.currentLeafId = leafId;
-	}
-
-	async appendEntry(entry: SessionTreeEntry): Promise<void> {
-		await this.ensureHeader();
-		await appendFile(this.filePath, `${JSON.stringify(entry)}\n`);
-		this.entries.push(entry);
-		this.byId.set(entry.id, entry);
-		this.currentLeafId = entry.id;
-	}
-
-	async getEntry(id: string): Promise<SessionTreeEntry | undefined> {
-		await this.ensureLoaded();
-		return this.byId.get(id);
-	}
-
-	async getPathToRoot(leafId: string | null): Promise<SessionTreeEntry[]> {
-		await this.ensureLoaded();
-		if (leafId === null) return [];
-		const path: SessionTreeEntry[] = [];
-		let current = this.byId.get(leafId);
-		while (current) {
-			path.unshift(current);
-			current = current.parentId ? this.byId.get(current.parentId) : undefined;
-		}
-		return path;
-	}
-
-	async getEntries(): Promise<SessionTreeEntry[]> {
-		await this.ensureLoaded();
-		return [...this.entries];
-	}
-}
-
-export class InMemorySessionTreeStorage implements SessionTreeStorage {
-	private entries: SessionTreeEntry[];
-	private leafId: string | null;
-
-	constructor(options?: { entries?: SessionTreeEntry[]; leafId?: string | null }) {
-		this.entries = options?.entries ? [...options.entries] : [];
-		this.leafId = options?.leafId ?? this.entries[this.entries.length - 1]?.id ?? null;
-	}
-
-	async getLeafId(): Promise<string | null> {
-		return this.leafId;
-	}
-
-	async setLeafId(leafId: string | null): Promise<void> {
-		this.leafId = leafId;
-	}
-
-	async appendEntry(entry: SessionTreeEntry): Promise<void> {
-		this.entries.push(entry);
-		this.leafId = entry.id;
-	}
-
-	async getEntry(id: string): Promise<SessionTreeEntry | undefined> {
-		return this.entries.find((entry) => entry.id === id);
-	}
-
-	async getPathToRoot(leafId: string | null): Promise<SessionTreeEntry[]> {
-		if (leafId === null) return [];
-		const byId = new Map<string, SessionTreeEntry>(this.entries.map((entry) => [entry.id, entry]));
-		const path: SessionTreeEntry[] = [];
-		let current = byId.get(leafId);
-		while (current) {
-			path.unshift(current);
-			current = current.parentId ? byId.get(current.parentId) : undefined;
-		}
-		return path;
-	}
-
-	async getEntries(): Promise<SessionTreeEntry[]> {
-		return [...this.entries];
-	}
-}
-
 export class DefaultSessionTree implements SessionTree {
 	private storage: SessionTreeStorage;
 
@@ -271,6 +105,32 @@ export class DefaultSessionTree implements SessionTree {
 
 	async buildContext(): Promise<SessionContext> {
 		return buildSessionContext(await this.getBranch());
+	}
+
+	getSessionInfo(): Promise<SessionInfo> {
+		return this.storage.getSessionInfo();
+	}
+
+	async getLabel(id: string): Promise<string | undefined> {
+		const entries = await this.storage.getEntries();
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const entry = entries[i]!;
+			if (entry.type === "label" && entry.targetId === id) {
+				return entry.label?.trim() || undefined;
+			}
+		}
+		return undefined;
+	}
+
+	async getSessionName(): Promise<string | undefined> {
+		const entries = await this.storage.getEntries();
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const entry = entries[i]!;
+			if (entry.type === "session_info") {
+				return entry.name?.trim() || undefined;
+			}
+		}
+		return undefined;
 	}
 
 	private async makeEntryId(): Promise<string> {

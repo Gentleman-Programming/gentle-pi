@@ -1,4 +1,3 @@
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import {
 	type AssistantMessage,
 	type FauxProviderRegistration,
@@ -18,8 +17,8 @@ import {
 	prepareCompaction,
 	serializeConversation,
 	shouldCompact,
-} from "../../src/harness/compaction.js";
-import { buildSessionContext } from "../../src/harness/session-tree.js";
+} from "../../src/harness/compaction/compaction.js";
+import { buildSessionContext } from "../../src/harness/session/session-tree.js";
 import type {
 	CompactionEntry,
 	CompactionSettings,
@@ -28,6 +27,7 @@ import type {
 	SessionTreeEntry,
 	ThinkingLevelChangeEntry,
 } from "../../src/harness/types.js";
+import type { AgentMessage } from "../../src/types.js";
 
 let nextId = 0;
 function createId(): string {
