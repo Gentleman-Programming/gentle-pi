@@ -28,7 +28,7 @@ export function images<TApi extends ImagesApi>(
 	return provider.images(model, context, options as ImagesOptions);
 }
 
-export async function completeImages<TApi extends ImagesApi>(
+export async function generateImages<TApi extends ImagesApi>(
 	model: ImagesModel<TApi>,
 	context: ImagesContext,
 	options?: ProviderImagesOptions,

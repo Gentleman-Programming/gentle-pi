@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { completeImages, images } from "../src/images.js";
+import { generateImages, images } from "../src/images.js";
 import type { ImagesContext, ImagesModel } from "../src/types.js";
 
 const mockState = vi.hoisted(() => ({
@@ -90,7 +90,7 @@ describe("openrouter images", () => {
 		expect(params.messages?.[0]?.content?.[0]).toMatchObject({ type: "text", text: "Generate a dog" });
 	});
 
-	it("completeImages resolves the final assistant images result", async () => {
+	it("generateImages resolves the final assistant images result", async () => {
 		const model: ImagesModel<"openrouter-images"> = {
 			id: "black-forest-labs/flux.2-pro",
 			name: "FLUX.2 Pro",
@@ -105,7 +105,7 @@ describe("openrouter images", () => {
 			input: [{ type: "text", text: "Generate a dog" }],
 		};
 
-		const output = await completeImages(model, context, { apiKey: "test" });
+		const output = await generateImages(model, context, { apiKey: "test" });
 		expect(output.output.some((item) => item.type === "image")).toBe(true);
 	});
 });
