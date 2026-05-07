@@ -1,6 +1,6 @@
 {
 	"name": "@earendil-works/pi-web-ui",
-	"version": "0.73.1",
+	"version": "0.74.0",
 	"description": "Reusable web UI components for AI chat interfaces powered by @earendil-works/pi-ai",
 	"type": "module",
 	"main": "dist/index.js",
@@ -18,8 +18,8 @@
 	},
 	"dependencies": {
 		"@lmstudio/sdk": "^1.5.0",
-		"@earendil-works/pi-ai": "^0.73.1",
-		"@earendil-works/pi-tui": "^0.73.1",
+		"@earendil-works/pi-ai": "^0.74.0",
+		"@earendil-works/pi-tui": "^0.74.0",
 		"typebox": "^1.1.24",
 		"docx-preview": "^0.3.7",
 		"jszip": "^3.10.1",
