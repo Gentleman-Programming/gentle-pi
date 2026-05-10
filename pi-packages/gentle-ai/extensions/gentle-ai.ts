@@ -102,7 +102,7 @@ const CUSTOM_MODEL = "Custom model id";
 
 const MODEL_CONTROL_OPTIONS = [KEEP_CURRENT, INHERIT_MODEL, CUSTOM_MODEL] as const;
 
-function evaluateCommand(command: string): ToolCallEventResult | undefined {
+function evaluateDeniedCommand(command: string): ToolCallEventResult | undefined {
 	for (const pattern of DENIED_BASH_PATTERNS) {
 		if (pattern.test(command)) {
 			return {
@@ -111,15 +111,30 @@ function evaluateCommand(command: string): ToolCallEventResult | undefined {
 			};
 		}
 	}
-	for (const pattern of CONFIRM_BASH_PATTERNS) {
-		if (pattern.test(command)) {
-			return {
-				block: true,
-				reason: "Gentle AI safety policy requires explicit user approval before this command.",
-			};
-		}
-	}
 	return undefined;
+}
+
+function commandRequiresConfirmation(command: string): boolean {
+	return CONFIRM_BASH_PATTERNS.some((pattern) => pattern.test(command));
+}
+
+async function confirmCommand(command: string, ctx: ExtensionContext): Promise<ToolCallEventResult | undefined> {
+	const denied = evaluateDeniedCommand(command);
+	if (denied) return denied;
+	if (!commandRequiresConfirmation(command)) return undefined;
+	if (!ctx.hasUI) {
+		return {
+			block: true,
+			reason: "Gentle AI safety policy requires interactive confirmation before this command.",
+		};
+	}
+	const preview = truncateToWidth(command.replace(/\s+/g, " ").trim(), 180, "…");
+	const approved = await ctx.ui.confirm("Allow guarded command?", preview);
+	if (approved) return undefined;
+	return {
+		block: true,
+		reason: "Gentle AI safety policy blocked the command because it was not confirmed.",
+	};
 }
 
 function copyDirectoryFiles(sourceDir: string, targetDir: string, force: boolean): { copied: number; skipped: number } {
@@ -594,9 +609,9 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		systemPrompt: `${event.systemPrompt}\n\n${buildGentlePrompt(readPersonaMode(ctx.cwd))}`,
 	}));
 
-	pi.on("tool_call", (event) => {
+	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "bash") return undefined;
-		return evaluateCommand(event.input.command);
+		return confirmCommand(event.input.command, ctx);
 	});
 
 	pi.registerCommand("gentle-ai:install-sdd", {
