@@ -17,6 +17,78 @@ detect_shell_name() {
 	basename "${0}"
 }
 
+detect_arch() {
+	case "$(uname -m)" in
+		x86_64|amd64) echo "amd64" ;;
+		arm64|aarch64) echo "arm64" ;;
+		*) echo "unsupported" ;;
+	esac
+}
+
+resolve_engram_tag() {
+	if ! command -v curl >/dev/null 2>&1; then
+		echo ""
+		return
+	fi
+	curl -fsSL https://api.github.com/repos/Gentleman-Programming/engram/releases/latest 2>/dev/null \
+		| grep '"tag_name"' | head -1 | cut -d'"' -f4
+}
+
+install_engram_macos() {
+	if ! command -v brew >/dev/null 2>&1; then
+		echo "Homebrew not found. Install from https://brew.sh and re-run, or grab a binary from https://github.com/Gentleman-Programming/engram/releases/latest"
+		return 1
+	fi
+	brew tap Gentleman-Programming/homebrew-tap
+	brew install engram
+}
+
+install_engram_linux() {
+	local arch tag version asset url tmp
+	arch="$(detect_arch)"
+	if [ "${arch}" = "unsupported" ]; then
+		echo "Unsupported Linux architecture: $(uname -m). Install engram manually from https://github.com/Gentleman-Programming/engram/releases"
+		return 1
+	fi
+	tag="$(resolve_engram_tag)"
+	if [ -z "${tag}" ]; then
+		echo "Could not resolve latest engram release tag (curl missing or network error)."
+		return 1
+	fi
+	version="${tag#v}"
+	asset="engram_${version}_linux_${arch}.tar.gz"
+	url="https://github.com/Gentleman-Programming/engram/releases/download/${tag}/${asset}"
+	tmp="$(mktemp -d)"
+	echo "Downloading ${asset}..."
+	curl -fsSL "${url}" -o "${tmp}/engram.tar.gz"
+	tar -xzf "${tmp}/engram.tar.gz" -C "${tmp}"
+	mkdir -p "${HOME}/.local/bin"
+	install -m 0755 "${tmp}/engram" "${HOME}/.local/bin/engram"
+	rm -rf "${tmp}"
+	echo "Installed engram to ${HOME}/.local/bin/engram"
+	case ":${PATH}:" in
+		*":${HOME}/.local/bin:"*) ;;
+		*) echo "Note: add ${HOME}/.local/bin to PATH so 'engram' is on \$PATH." ;;
+	esac
+}
+
+install_engram() {
+	if command -v engram >/dev/null 2>&1 || [ -x "${HOME}/.local/bin/engram" ]; then
+		echo "Engram CLI already installed."
+		return 0
+	fi
+	case "$(uname -s)" in
+		Darwin) install_engram_macos || echo "Engram install skipped." ;;
+		Linux) install_engram_linux || echo "Engram install skipped." ;;
+		MINGW*|MSYS*|CYGWIN*)
+			echo "Windows detected. Run scripts/install-engram.ps1 from PowerShell to install engram."
+			;;
+		*)
+			echo "Unsupported OS for engram auto-install: $(uname -s). See https://github.com/Gentleman-Programming/engram/releases"
+			;;
+	esac
+}
+
 install_shell_alias() {
 	local shell_name="$1"
 	case "${shell_name}" in
@@ -77,10 +149,11 @@ install_shell_alias "${SHELL_NAME}" || true
 echo "Warming Pi package resolution..."
 PATH="${PI_BIN_DIR}:${PATH}" node "${GENTLE_PI_CLI}" --help >/dev/null
 
+install_engram
 if command -v engram >/dev/null 2>&1 || [ -x "${HOME}/.local/bin/engram" ]; then
-	echo "Engram CLI detected. MCP config: ${MCP_CONFIG}"
+	echo "Engram CLI ready. MCP config: ${MCP_CONFIG}"
 else
-	echo "Warning: Engram CLI was not found. Gentle Pi will run with degraded memory until Engram is installed."
+	echo "Warning: Engram CLI is not on PATH. Gentle Pi will run with degraded memory until Engram is installed."
 fi
 
 cat <<EOF
