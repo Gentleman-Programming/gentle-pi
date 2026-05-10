@@ -2,11 +2,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PI_BIN_DIR="${HOME}/.pi/agent/bin"
+AGENT_DIR="${HOME}/.pi/agent"
+PI_BIN_DIR="${AGENT_DIR}/bin"
 PI_WRAPPER="${PI_BIN_DIR}/pi"
 GENTLE_PI_CLI="${ROOT_DIR}/packages/coding-agent/dist/cli.js"
 MCP_CONFIG="${ROOT_DIR}/.pi/mcp.json"
-GENTLE_PI_COMMAND="PATH=\"${PI_BIN_DIR}:\$PATH\" node \"${GENTLE_PI_CLI}\" --mcp-config \"${MCP_CONFIG}\""
+GLOBAL_MCP_CONFIG="${AGENT_DIR}/mcp.json"
+GENTLE_PI_COMMAND="PATH=\"${PI_BIN_DIR}:\$PATH\" node \"${GENTLE_PI_CLI}\""
 
 detect_shell_name() {
 	local shell_path="${SHELL:-}"
@@ -89,6 +91,18 @@ install_engram() {
 	esac
 }
 
+rewrite_gentle_pi_alias() {
+	local rc_file="$1"
+	local new_line="$2"
+	# Drop any previous gentle-pi alias (and its "# Gentle Pi" header) so re-running
+	# this script picks up changes to GENTLE_PI_COMMAND instead of leaving a stale alias.
+	if grep -qE '^(# Gentle Pi$|alias gentle-pi=)' "${rc_file}" 2>/dev/null; then
+		sed -i.gentle-pi.bak -e '/^# Gentle Pi$/d' -e '/^alias gentle-pi=/d' "${rc_file}"
+		rm -f "${rc_file}.gentle-pi.bak"
+	fi
+	printf '\n# Gentle Pi\n%s\n' "${new_line}" >>"${rc_file}"
+}
+
 install_shell_alias() {
 	local shell_name="$1"
 	case "${shell_name}" in
@@ -97,7 +111,7 @@ install_shell_alias() {
 			mkdir -p "${fish_dir}"
 			cat >"${fish_dir}/gentle-pi.fish" <<EOF
 function gentle-pi
-    env PATH="${PI_BIN_DIR}:\$PATH" node "${GENTLE_PI_CLI}" --mcp-config "${MCP_CONFIG}" \$argv
+    env PATH="${PI_BIN_DIR}:\$PATH" node "${GENTLE_PI_CLI}" \$argv
 end
 EOF
 			echo "Installed fish function: ${fish_dir}/gentle-pi.fish"
@@ -106,14 +120,14 @@ EOF
 			local rc_file="${HOME}/.zshrc"
 			local line="alias gentle-pi='${GENTLE_PI_COMMAND}'"
 			touch "${rc_file}"
-			grep -F "${GENTLE_PI_CLI}" "${rc_file}" >/dev/null 2>&1 || printf '\n# Gentle Pi\n%s\n' "${line}" >>"${rc_file}"
+			rewrite_gentle_pi_alias "${rc_file}" "${line}"
 			echo "Installed zsh alias in ${rc_file}"
 			;;
 		bash)
 			local rc_file="${HOME}/.bashrc"
 			local line="alias gentle-pi='${GENTLE_PI_COMMAND}'"
 			touch "${rc_file}"
-			grep -F "${GENTLE_PI_CLI}" "${rc_file}" >/dev/null 2>&1 || printf '\n# Gentle Pi\n%s\n' "${line}" >>"${rc_file}"
+			rewrite_gentle_pi_alias "${rc_file}" "${line}"
 			echo "Installed bash alias in ${rc_file}"
 			;;
 		*)
@@ -142,6 +156,10 @@ exec node "${GENTLE_PI_CLI}" "\$@"
 EOF
 chmod +x "${PI_WRAPPER}"
 
+echo "Installing global MCP config to ${GLOBAL_MCP_CONFIG}..."
+mkdir -p "${AGENT_DIR}"
+install -m 0644 "${MCP_CONFIG}" "${GLOBAL_MCP_CONFIG}"
+
 SHELL_NAME="$(detect_shell_name)"
 echo "Detected shell: ${SHELL_NAME}"
 install_shell_alias "${SHELL_NAME}" || true
@@ -151,7 +169,7 @@ PATH="${PI_BIN_DIR}:${PATH}" node "${GENTLE_PI_CLI}" --help >/dev/null
 
 install_engram
 if command -v engram >/dev/null 2>&1 || [ -x "${HOME}/.local/bin/engram" ]; then
-	echo "Engram CLI ready. MCP config: ${MCP_CONFIG}"
+	echo "Engram CLI ready. MCP config: ${GLOBAL_MCP_CONFIG}"
 else
 	echo "Warning: Engram CLI is not on PATH. Gentle Pi will run with degraded memory until Engram is installed."
 fi
@@ -176,5 +194,5 @@ EOF
 
 if [ "${GENTLE_PI_SKIP_LAUNCH:-0}" != "1" ]; then
 	echo "Launching Gentle Pi..."
-	exec env PATH="${PI_BIN_DIR}:${PATH}" node "${GENTLE_PI_CLI}" --mcp-config "${MCP_CONFIG}"
+	exec env PATH="${PI_BIN_DIR}:${PATH}" node "${GENTLE_PI_CLI}"
 fi
