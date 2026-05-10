@@ -1,15 +1,62 @@
-import { randomUUID } from "node:crypto";
+/**
+ * Engram — pi extension adapter
+ *
+ * Port 1:1 of the OpenCode plugin (plugin/opencode/engram.ts) adapted to pi's
+ * hook surface. Same Go HTTP server (engram serve, port 7437), same MCP tools,
+ * same Memory Protocol, same passive capture. Hook mapping:
+ *
+ *   OpenCode hook                            pi hook
+ *   ─────────────────────────────────────────────────────────────────────
+ *   session.created                          session_start (via ensureSession)
+ *   session.deleted                          session_shutdown
+ *   chat.message                             before_agent_start (event.prompt)
+ *   tool.execute.after                       tool_execution_end
+ *   experimental.chat.system.transform       before_agent_start (return.systemPrompt)
+ *   experimental.session.compacting          session_compact + before_agent_start
+ *
+ * Differences from OpenCode plugin:
+ *   - Sub-agent session inflation (issue #116) does not apply to pi: pi-subagents
+ *     runs sub-agents inside the parent session, so subAgentSessions stays empty
+ *     here but the structural skip is preserved for future-proofing.
+ *   - The compressor-context hook does not exist in pi. The recovery notice is
+ *     delivered to the post-compact agent via the next before_agent_start system
+ *     prompt instead of being embedded in the compacted summary.
+ */
+
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { basename } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const ENGRAM_PORT = process.env.ENGRAM_PORT ?? "7437";
-const ENGRAM_URL = `http://127.0.0.1:${ENGRAM_PORT}`;
-const REQUEST_TIMEOUT_MS = 5_000;
-const PROMPT_MIN_LENGTH = 10;
-const PASSIVE_CAPTURE_TOOLS = new Set(["task", "agent", "subagent"]);
-const PASSIVE_CAPTURE_MIN_LENGTH = 50;
+// ─── Configuration ───────────────────────────────────────────────────────────
 
-const MEMORY_PROTOCOL = `## Engram Persistent Memory — Protocol
+const ENGRAM_PORT = Number.parseInt(process.env.ENGRAM_PORT ?? "7437", 10);
+const ENGRAM_URL = `http://127.0.0.1:${ENGRAM_PORT}`;
+const ENGRAM_BIN = process.env.ENGRAM_BIN ?? "engram";
+
+// Engram's own MCP tools — don't count these as "tool calls" for session stats
+const ENGRAM_TOOLS = new Set([
+	"mem_search",
+	"mem_save",
+	"mem_update",
+	"mem_delete",
+	"mem_suggest_topic_key",
+	"mem_save_prompt",
+	"mem_session_summary",
+	"mem_context",
+	"mem_stats",
+	"mem_timeline",
+	"mem_get_observation",
+	"mem_session_start",
+	"mem_session_end",
+]);
+
+// ─── Memory Instructions ─────────────────────────────────────────────────────
+// Injected into the system prompt on every agent run so the agent always knows
+// to call mem_save / mem_search / mem_session_summary. Verbatim from the
+// OpenCode plugin.
+
+const MEMORY_INSTRUCTIONS = `## Engram Persistent Memory — Protocol
 
 You have access to Engram, a persistent memory system that survives across sessions and compactions.
 
@@ -85,150 +132,252 @@ If you see a message about compaction or context reset, or if you see "FIRST ACT
 2. Then call \`mem_context\` to recover any additional context from previous sessions
 3. Only THEN continue working
 
-Do not skip step 1. Without it, everything done before compaction is lost from memory.`;
+Do not skip step 1. Without it, everything done before compaction is lost from memory.
+`;
 
-const MEMORY_PROTOCOL_MARKER = "## Engram Persistent Memory — Protocol";
-
-let currentSessionId: string | undefined;
-let pendingRecoveryNotice: string | undefined;
-let engramAvailable = false;
+// ─── HTTP Client ─────────────────────────────────────────────────────────────
 
 interface FetchOpts {
-	method?: "GET" | "POST" | "PATCH" | "DELETE";
+	method?: string;
 	body?: unknown;
 }
 
-async function engramFetch<T = unknown>(path: string, opts: FetchOpts = {}): Promise<T | undefined> {
-	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+async function engramFetch<T = unknown>(path: string, opts: FetchOpts = {}): Promise<T | null> {
 	try {
 		const res = await fetch(`${ENGRAM_URL}${path}`, {
 			method: opts.method ?? "GET",
-			headers: opts.body !== undefined ? { "Content-Type": "application/json" } : undefined,
-			body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-			signal: controller.signal,
+			headers: opts.body ? { "Content-Type": "application/json" } : undefined,
+			body: opts.body ? JSON.stringify(opts.body) : undefined,
 		});
-		if (!res.ok) return undefined;
-		const ct = res.headers.get("content-type") ?? "";
-		if (!ct.includes("application/json")) return undefined;
 		return (await res.json()) as T;
 	} catch {
-		return undefined;
-	} finally {
-		clearTimeout(timer);
+		return null;
 	}
 }
 
-async function isEngramHealthy(): Promise<boolean> {
-	const health = await engramFetch<{ status?: string }>("/health");
-	return Boolean(health?.status);
-}
-
-function stripPrivateTags(text: string): string {
-	return text.replace(/<private>[\s\S]*?<\/private>/g, "").trim();
-}
-
-function deriveProject(cwd: string): string {
-	return basename(cwd);
-}
-
-interface EngramContext {
-	summary?: string;
-	observations?: unknown[];
-	prompts?: unknown[];
-}
-
-function formatRecoveryNotice(context: EngramContext | undefined): string {
-	const parts: string[] = [
-		"## FIRST ACTION REQUIRED — POST-COMPACTION RECOVERY",
-		"",
-		"Before responding to anything else, you MUST:",
-		"1. Call `mem_session_summary` with the compacted summary content (persists what was done before compaction).",
-		"2. Call `mem_context` to recover prior session context.",
-		"3. Only after that, continue with the user's request.",
-	];
-	if (context?.summary) {
-		parts.push("", "### Prior session summary (from Engram /context)", "", context.summary);
+async function isEngramRunning(): Promise<boolean> {
+	try {
+		const res = await fetch(`${ENGRAM_URL}/health`, {
+			signal: AbortSignal.timeout(500),
+		});
+		return res.ok;
+	} catch {
+		return false;
 	}
-	return parts.join("\n");
 }
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function extractProjectName(directory: string): string {
+	// Try git remote origin URL
+	try {
+		const result = spawnSync("git", ["-C", directory, "remote", "get-url", "origin"], {
+			encoding: "utf8",
+		});
+		if (result.status === 0) {
+			const url = result.stdout?.trim();
+			if (url) {
+				const name = url.replace(/\.git$/, "").split(/[/:]/).pop();
+				if (name) return name;
+			}
+		}
+	} catch {}
+
+	// Fallback: git root directory name (works in worktrees)
+	try {
+		const result = spawnSync("git", ["-C", directory, "rev-parse", "--show-toplevel"], {
+			encoding: "utf8",
+		});
+		if (result.status === 0) {
+			const root = result.stdout?.trim();
+			if (root) return root.split("/").pop() ?? "unknown";
+		}
+	} catch {}
+
+	// Final fallback: cwd basename
+	return directory.split("/").pop() ?? "unknown";
+}
+
+function truncate(str: string, max: number): string {
+	if (!str) return "";
+	return str.length > max ? `${str.slice(0, max)}...` : str;
+}
+
+/**
+ * Strip <private>...</private> tags before sending to engram.
+ * Double safety: the Go binary also strips, but we strip here too
+ * so sensitive data never even hits the wire.
+ */
+function stripPrivateTags(str: string): string {
+	if (!str) return "";
+	return str.replace(/<private>[\s\S]*?<\/private>/gi, "[REDACTED]").trim();
+}
+
+// ─── Module State ───────────────────────────────────────────────────────────
+// One pi extension instance per pi session, so module state is per-session.
+
+let initialized = false;
+let project = "unknown";
+let directory = "";
+
+// Track which sessions we've already ensured exist in engram. ensureSession()
+// is idempotent on the server (INSERT OR IGNORE) but we cache locally to avoid
+// the round trip.
+const knownSessions = new Set<string>();
+
+// Sub-agent sessions to suppress (issue #116 from OpenCode). pi-subagents in
+// pi runs sub-agents inside the parent session so this stays empty in current
+// pi versions, but the structural filter is preserved.
+const subAgentSessions = new Set<string>();
+
+// In-memory tool counters per session.
+const toolCounts = new Map<string, number>();
+
+// Recovery notice queued by session_compact, drained by next before_agent_start.
+let pendingRecoveryNotice: string | undefined;
+
+async function ensureSession(sessionId: string): Promise<void> {
+	if (!sessionId || knownSessions.has(sessionId)) return;
+	if (subAgentSessions.has(sessionId)) return;
+	knownSessions.add(sessionId);
+	await engramFetch("/sessions", {
+		method: "POST",
+		body: {
+			id: sessionId,
+			project,
+			directory,
+		},
+	});
+}
+
+async function initOnce(cwd: string): Promise<void> {
+	if (initialized) return;
+	initialized = true;
+	directory = cwd;
+
+	const oldProject = cwd.split("/").pop() ?? "unknown";
+	project = extractProjectName(cwd);
+
+	// Try to start engram server if not running
+	const running = await isEngramRunning();
+	if (!running) {
+		try {
+			const proc = spawn(ENGRAM_BIN, ["serve"], {
+				detached: true,
+				stdio: "ignore",
+			});
+			proc.unref();
+			await new Promise((r) => setTimeout(r, 500));
+		} catch {
+			// Binary not found or can't start — extension will silently no-op
+		}
+	}
+
+	// Migrate project name if it changed (one-time, idempotent).
+	// Must run AFTER server startup to ensure the endpoint is available.
+	if (oldProject !== project) {
+		await engramFetch("/projects/migrate", {
+			method: "POST",
+			body: { old_project: oldProject, new_project: project },
+		});
+	}
+
+	// Auto-import: if .engram/manifest.json exists in the project repo, run
+	// `engram sync --import` to load any new chunks into the local DB. This is
+	// how git-synced memories get loaded when cloning a repo or pulling
+	// changes. Each chunk is imported only once (tracked by ID).
+	try {
+		const manifestFile = `${cwd}/.engram/manifest.json`;
+		if (existsSync(manifestFile)) {
+			const proc = spawn(ENGRAM_BIN, ["sync", "--import"], {
+				cwd,
+				detached: true,
+				stdio: "ignore",
+			});
+			proc.unref();
+		}
+	} catch {
+		// Manifest doesn't exist or binary not found — silently skip
+	}
+}
+
+// ─── Plugin Export ───────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	if (process.env.ENGRAM_DISABLE === "1") {
-		return;
-	}
-
-	pi.on("session_start", async (event, ctx) => {
-		const reason = (event as { reason?: string }).reason;
-		if (reason === "reload") {
-			engramAvailable = await isEngramHealthy();
-			return;
-		}
-
-		engramAvailable = await isEngramHealthy();
-		if (!engramAvailable) {
-			currentSessionId = undefined;
-			return;
-		}
-
-		const id = randomUUID();
-		const created = await engramFetch<{ id?: string }>("/sessions", {
-			method: "POST",
-			body: {
-				id,
-				project: deriveProject(ctx.cwd),
-				directory: ctx.cwd,
-			},
-		});
-		if (!created) {
-			currentSessionId = undefined;
-			return;
-		}
-		currentSessionId = id;
-		if (ctx.hasUI) {
-			ctx.ui.notify(`Engram session ready (${deriveProject(ctx.cwd)})`, "info");
-		}
+	pi.on("session_start", async (_event, ctx) => {
+		await initOnce(ctx.cwd);
 	});
 
-	pi.on("session_shutdown", async () => {
-		if (!currentSessionId) return;
-		const id = currentSessionId;
-		currentSessionId = undefined;
-		await engramFetch(`/sessions/${id}/end`, { method: "POST" });
+	pi.on("session_shutdown", async (_event, ctx) => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		if (sessionId) {
+			toolCounts.delete(sessionId);
+			knownSessions.delete(sessionId);
+			subAgentSessions.delete(sessionId);
+		}
 	});
 
 	pi.on("session_compact", async (_event, ctx) => {
-		if (!engramAvailable) return;
-		const project = deriveProject(ctx.cwd);
-		const query = `?project=${encodeURIComponent(project)}&directory=${encodeURIComponent(ctx.cwd)}`;
-		const context = await engramFetch<EngramContext>(`/context${query}`);
-		pendingRecoveryNotice = formatRecoveryNotice(context);
+		const sessionId = ctx.sessionManager.getSessionId();
+		if (sessionId) {
+			await ensureSession(sessionId);
+		}
+
+		// Inject context from previous sessions
+		const data = await engramFetch<{ context?: string }>(
+			`/context?project=${encodeURIComponent(project)}`,
+		);
+
+		// Tell the post-compact agent to persist the compacted summary to Engram.
+		// In OpenCode this text is fed to the compressor (which embeds it at the
+		// top of its summary); in pi the compressor surface is not exposed to
+		// extensions, so the next before_agent_start delivers it as a system
+		// prompt addendum instead.
+		const recovery =
+			`CRITICAL INSTRUCTION FOR COMPACTED SUMMARY:\n` +
+			`The agent has access to Engram persistent memory via MCP tools.\n` +
+			`You MUST include the following instruction at the TOP of the compacted summary:\n\n` +
+			`"FIRST ACTION REQUIRED: Call mem_session_summary with the content of this compacted summary. ` +
+			`Use project: '${project}'. This preserves what was accomplished before compaction. Do this BEFORE any other work."\n\n` +
+			`This is NOT optional. Without this, everything done before compaction is lost from memory.`;
+
+		const parts: string[] = [];
+		if (data?.context) parts.push(data.context);
+		parts.push(recovery);
+		pendingRecoveryNotice = parts.join("\n\n");
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
-		let systemPrompt = (event as { systemPrompt: string }).systemPrompt;
-		const userPrompt = (event as { prompt?: string }).prompt;
+		await initOnce(ctx.cwd);
+		const sessionId = ctx.sessionManager.getSessionId();
+		const e = event as { systemPrompt: string; prompt?: string };
+
+		// Always-on Memory Protocol injection. Append to the chained system
+		// prompt instead of pushing a new system block — pi's systemPrompt is
+		// already a single string, so concatenation matches the OpenCode
+		// "append to last system entry" semantics (see Qwen/Mistral note).
+		let systemPrompt =
+			e.systemPrompt.length > 0 ? `${e.systemPrompt}\n\n${MEMORY_INSTRUCTIONS}` : MEMORY_INSTRUCTIONS;
 
 		if (pendingRecoveryNotice !== undefined) {
 			systemPrompt = `${systemPrompt}\n\n${pendingRecoveryNotice}`;
 			pendingRecoveryNotice = undefined;
 		}
 
-		if (!systemPrompt.includes(MEMORY_PROTOCOL_MARKER)) {
-			systemPrompt = `${systemPrompt}\n\n${MEMORY_PROTOCOL}`;
-		}
-
-		if (currentSessionId && typeof userPrompt === "string") {
-			const cleaned = stripPrivateTags(userPrompt);
-			if (cleaned.length >= PROMPT_MIN_LENGTH) {
-				engramFetch("/prompts", {
+		// User prompt capture (chat.message analog).
+		const userPrompt = e.prompt;
+		if (sessionId && typeof userPrompt === "string") {
+			const finalContent = userPrompt.trim();
+			if (finalContent.length > 10) {
+				await ensureSession(sessionId);
+				await engramFetch("/prompts", {
 					method: "POST",
 					body: {
-						session_id: currentSessionId,
-						project: deriveProject(ctx.cwd),
-						content: cleaned,
+						session_id: sessionId,
+						content: stripPrivateTags(truncate(finalContent, 2000)),
+						project,
 					},
-				}).catch(() => undefined);
+				});
 			}
 		}
 
@@ -236,35 +385,30 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_execution_end", async (event, ctx) => {
-		if (!currentSessionId) return;
 		const e = event as { toolName?: string; result?: unknown; isError?: boolean };
-		if (e.isError) return;
-		const toolName = (e.toolName ?? "").toLowerCase();
-		if (!PASSIVE_CAPTURE_TOOLS.has(toolName)) return;
-		const result = typeof e.result === "string" ? e.result : JSON.stringify(e.result);
-		if (!result || result.length < PASSIVE_CAPTURE_MIN_LENGTH) return;
-		engramFetch("/observations/passive", {
-			method: "POST",
-			body: {
-				session_id: currentSessionId,
-				project: deriveProject(ctx.cwd),
-				content: result,
-			},
-		}).catch(() => undefined);
-	});
+		const toolName = e.toolName ?? "";
+		if (ENGRAM_TOOLS.has(toolName.toLowerCase())) return;
 
-	pi.registerCommand("engram:status", {
-		description: "Show Engram connection status and current session.",
-		handler: async (_args, ctx) => {
-			const healthy = await isEngramHealthy();
-			const project = deriveProject(ctx.cwd);
-			const lines = [
-				`URL: ${ENGRAM_URL}`,
-				`Health: ${healthy ? "ok" : "unreachable"}`,
-				`Session: ${currentSessionId ?? "—"}`,
-				`Project: ${project}`,
-			];
-			ctx.ui.notify(lines.join(" · "), healthy ? "info" : "warning");
-		},
+		const sessionId = ctx.sessionManager.getSessionId();
+		if (sessionId) {
+			await ensureSession(sessionId);
+			toolCounts.set(sessionId, (toolCounts.get(sessionId) ?? 0) + 1);
+		}
+
+		// Passive capture: extract learnings from Task tool output.
+		if (toolName === "Task" && e.result !== undefined && sessionId) {
+			const text = typeof e.result === "string" ? e.result : JSON.stringify(e.result);
+			if (text.length > 50) {
+				await engramFetch("/observations/passive", {
+					method: "POST",
+					body: {
+						session_id: sessionId,
+						content: stripPrivateTags(text),
+						project,
+						source: "task-complete",
+					},
+				});
+			}
+		}
 	});
 }
