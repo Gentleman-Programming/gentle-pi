@@ -161,7 +161,7 @@ describe("skills", () => {
 		});
 
 		it("should load all skills from fixture directory", () => {
-			const { skills } = loadSkillsFromDir({
+			const { skills, diagnostics } = loadSkillsFromDir({
 				dir: fixturesDir,
 				source: "test",
 			});
@@ -169,7 +169,14 @@ describe("skills", () => {
 			// Should load all skills that have descriptions (even with warnings)
 			// valid-skill, name-mismatch, invalid-name-chars, long-name, unknown-field, nested/child-skill, consecutive-hyphens
 			// NOT: missing-description, no-frontmatter (both missing descriptions)
+			// NOT: _shared (underscore-prefixed folders are skipped per anthropics/skills convention)
 			expect(skills.length).toBeGreaterThanOrEqual(6);
+			expect(skills.find((s) => s.name === "_shared")).toBeUndefined();
+			expect(
+				diagnostics.some(
+					(d: ResourceDiagnostic) => d.message.includes("_shared") && d.message.includes("invalid characters"),
+				),
+			).toBe(false);
 		});
 
 		it("should return empty for non-existent directory", () => {

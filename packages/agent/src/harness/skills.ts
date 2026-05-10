@@ -117,7 +117,9 @@ async function loadSkillsFromDirInternal(
 	}
 
 	for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-		if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+		// Skip hidden ("."), convention-private ("_", e.g. "_shared/" per
+		// anthropics/skills) and node_modules entries during tree discovery.
+		if (entry.name.startsWith(".") || entry.name.startsWith("_") || entry.name === "node_modules") continue;
 		const fullPath = entry.path;
 		const kind = await resolveKind(env, entry);
 		if (!kind) continue;

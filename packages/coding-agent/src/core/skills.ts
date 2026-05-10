@@ -226,7 +226,10 @@ function loadSkillsFromDirInternal(
 		}
 
 		for (const entry of entries) {
-			if (entry.name.startsWith(".")) {
+			// Skip hidden entries (".") and convention-private entries ("_") so
+			// shared utility folders like "_shared/" (anthropics/skills convention)
+			// are not picked up as skills and rejected by the name validator.
+			if (entry.name.startsWith(".") || entry.name.startsWith("_")) {
 				continue;
 			}
 
