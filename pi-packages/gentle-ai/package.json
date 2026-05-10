@@ -1,6 +1,6 @@
 {
   "name": "gentle-pi",
-  "version": "0.1.6",
+  "version": "0.1.8",
   "description": "Opinionated el Gentleman harness package for Pi: SDD/OpenSpec workflow, strict TDD guidance, subagent assets, and safety defaults.",
   "license": "MIT",
   "type": "module",
@@ -35,6 +35,9 @@
     "skills": [
       "./skills"
     ]
+  },
+  "dependencies": {
+    "@earendil-works/pi-tui": "*"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

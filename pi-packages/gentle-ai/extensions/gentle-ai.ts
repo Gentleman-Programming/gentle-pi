@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
+import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
@@ -214,6 +215,221 @@ async function getPiModelOptions(ctx: ExtensionContext): Promise<string[]> {
 	return [...MODEL_CONTROL_OPTIONS, ...modelIds];
 }
 
+interface OverlayComponent {
+	render(width: number): string[];
+	handleInput(data: string): void;
+	invalidate(): void;
+}
+
+type ModelPanelResult =
+	| { type: "save"; config: SddModelConfig }
+	| { type: "custom"; phase: SddAgentName | "all" }
+	| { type: "cancel" };
+
+const SET_ALL_PHASES = "Set all phases";
+const MODEL_PANEL_ROWS = [SET_ALL_PHASES, ...SDD_AGENT_NAMES] as const;
+type ModelPanelRow = (typeof MODEL_PANEL_ROWS)[number];
+
+class SddModelPanel implements OverlayComponent {
+	private cursor = 0;
+	private mode: "phases" | "models" = "phases";
+	private selectedRow: ModelPanelRow = SET_ALL_PHASES;
+	private modelCursor = 0;
+	private query = "";
+	private readonly draft: SddModelConfig;
+
+	constructor(
+		initialConfig: SddModelConfig,
+		private readonly modelOptions: string[],
+		private readonly done: (result: ModelPanelResult) => void,
+	) {
+		this.draft = { ...initialConfig };
+	}
+
+	invalidate(): void {}
+
+	handleInput(data: string): void {
+		if (this.mode === "models") {
+			this.handleModelInput(data);
+			return;
+		}
+		this.handlePhaseInput(data);
+	}
+
+	render(width: number): string[] {
+		return this.mode === "models" ? this.renderModelPicker(width) : this.renderPhaseList(width);
+	}
+
+	private handlePhaseInput(data: string): void {
+		const maxCursor = MODEL_PANEL_ROWS.length + 1;
+		if (matchesKey(data, "ctrl+c") || matchesKey(data, "escape")) {
+			this.done({ type: "cancel" });
+			return;
+		}
+		if (matchesKey(data, "ctrl+s")) {
+			this.done({ type: "save", config: this.draft });
+			return;
+		}
+		if (matchesKey(data, "down") || data === "j") {
+			this.cursor = Math.min(maxCursor, this.cursor + 1);
+			return;
+		}
+		if (matchesKey(data, "up") || data === "k") {
+			this.cursor = Math.max(0, this.cursor - 1);
+			return;
+		}
+		if (data === "i") {
+			this.applySelection(undefined);
+			return;
+		}
+		if (data === "c") {
+			const row = MODEL_PANEL_ROWS[this.cursor];
+			if (row === SET_ALL_PHASES) this.done({ type: "custom", phase: "all" });
+			else if (row) this.done({ type: "custom", phase: row });
+			return;
+		}
+		if (!matchesKey(data, "return")) return;
+		if (this.cursor === MODEL_PANEL_ROWS.length) {
+			this.done({ type: "save", config: this.draft });
+			return;
+		}
+		if (this.cursor === MODEL_PANEL_ROWS.length + 1) {
+			this.done({ type: "cancel" });
+			return;
+		}
+		this.selectedRow = MODEL_PANEL_ROWS[this.cursor] ?? SET_ALL_PHASES;
+		this.mode = "models";
+		this.modelCursor = 0;
+		this.query = "";
+	}
+
+	private handleModelInput(data: string): void {
+		const options = this.filteredModelOptions();
+		if (matchesKey(data, "ctrl+c")) {
+			this.done({ type: "cancel" });
+			return;
+		}
+		if (matchesKey(data, "escape")) {
+			this.mode = "phases";
+			this.query = "";
+			return;
+		}
+		if (matchesKey(data, "backspace")) {
+			this.query = this.query.slice(0, -1);
+			this.modelCursor = Math.min(this.modelCursor, Math.max(0, this.filteredModelOptions().length - 1));
+			return;
+		}
+		if (matchesKey(data, "down") || data === "j") {
+			this.modelCursor = Math.min(Math.max(0, options.length - 1), this.modelCursor + 1);
+			return;
+		}
+		if (matchesKey(data, "up") || data === "k") {
+			this.modelCursor = Math.max(0, this.modelCursor - 1);
+			return;
+		}
+		if (matchesKey(data, "return")) {
+			const selected = options[this.modelCursor];
+			if (!selected) return;
+			if (selected === CUSTOM_MODEL) {
+				this.done({ type: "custom", phase: this.selectedRow === SET_ALL_PHASES ? "all" : this.selectedRow });
+				return;
+			}
+			if (selected === KEEP_CURRENT) {
+				this.mode = "phases";
+				return;
+			}
+			this.applySelection(selected === INHERIT_MODEL ? undefined : selected);
+			this.mode = "phases";
+			return;
+		}
+		if (data.length === 1 && data.charCodeAt(0) >= 32) {
+			this.query += data;
+			this.modelCursor = 0;
+		}
+	}
+
+	private applySelection(model: string | undefined): void {
+		const row = MODEL_PANEL_ROWS[this.cursor];
+		if (row === SET_ALL_PHASES) {
+			for (const name of SDD_AGENT_NAMES) {
+				if (model === undefined) delete this.draft[name];
+				else this.draft[name] = model;
+			}
+			return;
+		}
+		if (!row) return;
+		if (model === undefined) delete this.draft[row];
+		else this.draft[row] = model;
+	}
+
+	private filteredModelOptions(): string[] {
+		const query = this.query.trim().toLowerCase();
+		if (!query) return this.modelOptions;
+		return this.modelOptions.filter((option) => option.toLowerCase().includes(query));
+	}
+
+	private renderPhaseList(width: number): string[] {
+		const lines: string[] = [];
+		const line = (text = "") => truncateToWidth(text, Math.max(1, width), "…", true);
+		lines.push(line("Assign Models to SDD Phases"));
+		lines.push("");
+		lines.push(line("Current assignments:"));
+		lines.push("");
+		for (let i = 0; i < MODEL_PANEL_ROWS.length; i++) {
+			const row = MODEL_PANEL_ROWS[i];
+			const focused = i === this.cursor;
+			const label = row === SET_ALL_PHASES ? this.renderSetAllLabel(row) : this.renderPhaseLabel(row);
+			lines.push(line(`${focused ? "▸" : " "} ${label}`));
+		}
+		lines.push("");
+		lines.push(line(`${this.cursor === MODEL_PANEL_ROWS.length ? "▸" : " "} Continue`));
+		lines.push(line(`${this.cursor === MODEL_PANEL_ROWS.length + 1 ? "▸" : " "} ← Back`));
+		lines.push("");
+		lines.push(line("j/k: navigate • enter: change model / confirm • i: inherit • c: custom • ctrl+s: save • esc: back"));
+		return lines;
+	}
+
+	private renderModelPicker(width: number): string[] {
+		const lines: string[] = [];
+		const options = this.filteredModelOptions();
+		const line = (text = "") => truncateToWidth(text, Math.max(1, width), "…", true);
+		lines.push(line(`Select model for ${this.selectedRow}`));
+		lines.push("");
+		lines.push(line(`◎ ${this.query || "search..."}`));
+		lines.push("");
+		const maxVisible = 12;
+		const start = Math.max(0, Math.min(this.modelCursor - Math.floor(maxVisible / 2), Math.max(0, options.length - maxVisible)));
+		const end = Math.min(options.length, start + maxVisible);
+		for (let i = start; i < end; i++) {
+			const focused = i === this.modelCursor;
+			lines.push(line(`${focused ? "▸" : " "} ${options[i]}`));
+		}
+		if (options.length === 0) lines.push(line("  No matching models"));
+		lines.push("");
+		lines.push(line("j/k: navigate • type: search • enter: select • esc: back"));
+		return lines;
+	}
+
+	private renderSetAllLabel(row: string): string {
+		const values = SDD_AGENT_NAMES.map((name) => this.draft[name] ?? "inherit");
+		const first = values[0];
+		const allSame = values.every((value) => value === first);
+		return `${row.padEnd(20)} ${allSame ? first : "mixed"}`;
+	}
+
+	private renderPhaseLabel(row: SddAgentName): string {
+		return `${row.padEnd(20)} ${this.draft[row] ?? "inherit"}`;
+	}
+}
+
+async function showSddModelPanel(ctx: ExtensionContext, config: SddModelConfig): Promise<ModelPanelResult> {
+	const modelOptions = await getPiModelOptions(ctx);
+	return ctx.ui.custom<ModelPanelResult>((_tui, _theme, _keybindings, done) => new SddModelPanel(config, modelOptions, done), {
+		overlay: true,
+		overlayOptions: { anchor: "center", width: "70%", minWidth: 72, maxHeight: "85%" },
+	});
+}
+
 export default function gentleAi(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
 		const result = installSddAssets(ctx.cwd, false);
@@ -253,34 +469,34 @@ export default function gentleAi(pi: ExtensionAPI): void {
 	pi.registerCommand("gentleman:models", {
 		description: "Configure per-phase SDD agent models for el Gentleman.",
 		handler: async (_args, ctx) => {
-			const config = readModelConfig(ctx.cwd);
-			const modelOptions = await getPiModelOptions(ctx);
-			for (const name of SDD_AGENT_NAMES) {
-				const current = config[name] ?? "inherit";
-				const selected = await ctx.ui.select(`${name} model (current: ${current})`, modelOptions);
-				if (selected === undefined) return;
-				if (selected === KEEP_CURRENT) continue;
-				if (selected === INHERIT_MODEL) {
-					delete config[name];
-					continue;
+			let config = readModelConfig(ctx.cwd);
+			let result = await showSddModelPanel(ctx, config);
+			while (result.type === "custom") {
+				const current = result.phase === "all" ? "inherit" : (config[result.phase] ?? "inherit");
+				const custom = await ctx.ui.input(
+					`${result.phase === "all" ? "all SDD phases" : result.phase} custom model id`,
+					current === "inherit" ? "provider/model" : current,
+				);
+				if (custom === undefined) return;
+				const trimmed = custom.trim();
+				if (trimmed.length > 0) {
+					if (result.phase === "all") {
+						config = Object.fromEntries(SDD_AGENT_NAMES.map((name) => [name, trimmed])) as SddModelConfig;
+					} else {
+						config = { ...config, [result.phase]: trimmed };
+					}
 				}
-				if (selected === CUSTOM_MODEL) {
-					const custom = await ctx.ui.input(`${name} custom model id`, current === "inherit" ? "provider/model" : current);
-					if (custom === undefined) return;
-					const trimmed = custom.trim();
-					if (trimmed.length > 0) config[name] = trimmed;
-					continue;
-				}
-				config[name] = selected;
+				result = await showSddModelPanel(ctx, config);
 			}
-			writeModelConfig(ctx.cwd, config);
-			const result = applyModelConfig(ctx.cwd, config);
+			if (result.type !== "save") return;
+			writeModelConfig(ctx.cwd, result.config);
+			const applyResult = applyModelConfig(ctx.cwd, result.config);
 			ctx.ui.notify(
 				[
 					"el Gentleman SDD model config saved.",
 					`Config: ${modelConfigPath(ctx.cwd)}`,
-					`Agents updated: ${result.updated}`,
-					...describeModelConfig(config),
+					`Agents updated: ${applyResult.updated}`,
+					...describeModelConfig(result.config),
 				].join("\n"),
 				"info",
 			);
