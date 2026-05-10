@@ -1,6 +1,6 @@
 # Gentle Pi
 
-Gentle Pi is a private Pi coding-agent fork tuned for controlled autonomy: SDD planning, native subagents, Engram memory, strict TDD, and a senior-architect persona.
+Gentle Pi it's a Pi coding-agent fork tuned for controlled autonomy: SDD planning, native subagents, Engram memory, strict TDD, and a senior-architect persona.
 
 It is not a generic Gentle AI runtime. It is Gentle AI made-to-measure for this Pi agent.
 
