@@ -57,7 +57,7 @@ Run:
 /gentleman:models
 ```
 
-This opens a modal similar to Gentle-AI's model picker. It discovers every local agent in `.pi/agents/*.md`, with SDD agents sorted first:
+This opens a modal similar to Gentle-AI's model picker. It discovers Pi subagents from project, user, and built-in sources, with SDD agents sorted first:
 
 ```text
 Assign Models to Agents
@@ -74,6 +74,7 @@ Current assignments:
   sdd-apply            anthropic/claude-sonnet-4
   sdd-verify           google/gemini-3-pro
   sdd-archive          inherit
+  delegate             inherit
   my-custom-agent      anthropic/claude-sonnet-4
 
 Continue
@@ -100,13 +101,14 @@ Saved config:
 .pi/gentle-ai/models.json
 ```
 
-Applied agent frontmatter:
+Applied configuration:
 
 ```text
-.pi/agents/*.md
+.pi/agents/*.md                 # project/user markdown agents
+.pi/settings.json               # project overrides for built-in pi-subagents agents
 ```
 
-Use `Inherit active/default model` to remove a phase override.
+Use `Inherit active/default model` to remove an agent override.
 
 ## Installed project files
 

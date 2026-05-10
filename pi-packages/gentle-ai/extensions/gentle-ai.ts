@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
@@ -67,6 +68,13 @@ const SDD_AGENT_NAMES = [
 
 type SddAgentName = (typeof SDD_AGENT_NAMES)[number];
 type AgentModelConfig = Record<string, string>;
+type AgentSource = "project" | "user" | "builtin";
+
+interface AgentEntry {
+	name: string;
+	source: AgentSource;
+	filePath?: string;
+}
 
 const KEEP_CURRENT = "Keep current";
 const INHERIT_MODEL = "Inherit active/default model";
@@ -181,42 +189,123 @@ function updateFrontmatterModel(content: string, model: string | undefined): str
 	return `---\n${lines.join("\n")}${body}`;
 }
 
-function listProjectAgents(cwd: string): string[] {
-	const agentsDir = join(cwd, ".pi", "agents");
-	if (!existsSync(agentsDir)) return [...SDD_AGENT_NAMES];
-	const discovered = readdirSync(agentsDir, { withFileTypes: true })
-		.filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
-		.map((entry) => entry.name.slice(0, -".md".length));
-	const ordered = [
-		...SDD_AGENT_NAMES.filter((name) => discovered.includes(name)),
-		...discovered.filter((name) => !SDD_AGENT_NAMES.includes(name as SddAgentName)).sort(),
+function parseAgentName(filePath: string): string | undefined {
+	let content: string;
+	try {
+		content = readFileSync(filePath, "utf8");
+	} catch {
+		return undefined;
+	}
+	const name = content.match(/^name:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1]?.trim();
+	if (!name) return undefined;
+	const packageName = content.match(/^package:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1]?.trim();
+	return packageName ? `${packageName}.${name}` : name;
+}
+
+function listAgentFilesRecursive(dir: string): string[] {
+	if (!existsSync(dir)) return [];
+	const files: string[] = [];
+	for (const entry of readdirSync(dir, { withFileTypes: true })) {
+		const path = join(dir, entry.name);
+		if (entry.isDirectory()) files.push(...listAgentFilesRecursive(path));
+		else if (entry.isFile() && entry.name.endsWith(".md") && !entry.name.endsWith(".chain.md")) files.push(path);
+	}
+	return files;
+}
+
+function listAgentsFromDir(dir: string, source: AgentSource): AgentEntry[] {
+	return listAgentFilesRecursive(dir)
+		.map((filePath) => {
+			const name = parseAgentName(filePath);
+			return name ? { name, source, filePath } : undefined;
+		})
+		.filter((entry): entry is AgentEntry => entry !== undefined);
+}
+
+function listDiscoverableAgents(cwd: string): AgentEntry[] {
+	const builtinDirs = [
+		join(PACKAGE_ROOT, "..", "pi-subagents", "agents"),
+		join(cwd, ".pi", "npm", "node_modules", "pi-subagents", "agents"),
+		join(homedir(), ".local", "lib", "node_modules", "pi-subagents", "agents"),
 	];
-	return ordered.length > 0 ? ordered : [...SDD_AGENT_NAMES];
+	const agents = [
+		...builtinDirs.flatMap((dir) => listAgentsFromDir(dir, "builtin")),
+		...listAgentsFromDir(join(homedir(), ".pi", "agent", "agents"), "user"),
+		...listAgentsFromDir(join(homedir(), ".agents"), "user"),
+		...listAgentsFromDir(join(cwd, ".agents"), "project"),
+		...listAgentsFromDir(join(cwd, ".pi", "agents"), "project"),
+	];
+	const byName = new Map<string, AgentEntry>();
+	for (const agent of agents) byName.set(agent.name, agent);
+	const discovered = Array.from(byName.values());
+	const sddFirst = SDD_AGENT_NAMES
+		.map((name) => discovered.find((agent) => agent.name === name))
+		.filter((agent): agent is AgentEntry => agent !== undefined);
+	const rest = discovered
+		.filter((agent) => !SDD_AGENT_NAMES.includes(agent.name as SddAgentName))
+		.sort((left, right) => left.name.localeCompare(right.name));
+	return [...sddFirst, ...rest];
+}
+
+function projectSettingsPath(cwd: string): string {
+	return join(cwd, ".pi", "settings.json");
+}
+
+function updateBuiltinModelOverride(cwd: string, name: string, model: string | undefined): boolean {
+	const path = projectSettingsPath(cwd);
+	let settings: Record<string, unknown> = {};
+	if (existsSync(path)) {
+		try {
+			const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+			if (isRecord(parsed)) settings = parsed;
+		} catch {
+			settings = {};
+		}
+	}
+	const subagents = isRecord(settings.subagents) ? { ...settings.subagents } : {};
+	const agentOverrides = isRecord(subagents.agentOverrides) ? { ...subagents.agentOverrides } : {};
+	const current = isRecord(agentOverrides[name]) ? { ...agentOverrides[name] } : {};
+	if (model === undefined) delete current.model;
+	else current.model = model;
+	if (Object.keys(current).length > 0) agentOverrides[name] = current;
+	else delete agentOverrides[name];
+	if (Object.keys(agentOverrides).length > 0) subagents.agentOverrides = agentOverrides;
+	else delete subagents.agentOverrides;
+	if (Object.keys(subagents).length > 0) settings.subagents = subagents;
+	else delete settings.subagents;
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `${JSON.stringify(settings, null, "\t")}\n`);
+	return true;
 }
 
 function applyModelConfig(cwd: string, config: AgentModelConfig): { updated: number; skipped: number } {
 	let updated = 0;
 	let skipped = 0;
-	for (const [name, model] of Object.entries(config)) {
-		const agentPath = join(cwd, ".pi", "agents", `${name}.md`);
-		if (!existsSync(agentPath)) {
+	for (const agent of listDiscoverableAgents(cwd)) {
+		const model = config[agent.name];
+		if (agent.source === "builtin") {
+			if (updateBuiltinModelOverride(cwd, agent.name, model)) updated += 1;
+			else skipped += 1;
+			continue;
+		}
+		if (!agent.filePath || !existsSync(agent.filePath)) {
 			skipped += 1;
 			continue;
 		}
-		const original = readFileSync(agentPath, "utf8");
+		const original = readFileSync(agent.filePath, "utf8");
 		const next = updateFrontmatterModel(original, model);
 		if (next === original) {
 			skipped += 1;
 			continue;
 		}
-		writeFileSync(agentPath, next);
+		writeFileSync(agent.filePath, next);
 		updated += 1;
 	}
 	return { updated, skipped };
 }
 
 function describeModelConfig(cwd: string, config: AgentModelConfig): string[] {
-	return listProjectAgents(cwd).map((name) => `${name}: ${config[name] ?? "inherit"}`);
+	return listDiscoverableAgents(cwd).map((agent) => `${agent.name}: ${config[agent.name] ?? "inherit"}`);
 }
 
 async function getPiModelOptions(ctx: ExtensionContext): Promise<string[]> {
@@ -437,7 +526,7 @@ class SddModelPanel implements OverlayComponent {
 
 async function showSddModelPanel(ctx: ExtensionContext, config: AgentModelConfig): Promise<ModelPanelResult> {
 	const modelOptions = await getPiModelOptions(ctx);
-	const agents = listProjectAgents(ctx.cwd);
+	const agents = listDiscoverableAgents(ctx.cwd).map((agent) => agent.name);
 	return ctx.ui.custom<ModelPanelResult>((_tui, _theme, _keybindings, done) => new SddModelPanel(config, modelOptions, agents, done), {
 		overlay: true,
 		overlayOptions: { anchor: "center", width: "70%", minWidth: 72, maxHeight: "85%" },
@@ -495,7 +584,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 				const trimmed = custom.trim();
 				if (trimmed.length > 0) {
 					if (result.agent === "all") {
-						config = Object.fromEntries(listProjectAgents(ctx.cwd).map((name) => [name, trimmed]));
+						config = Object.fromEntries(listDiscoverableAgents(ctx.cwd).map((agent) => [agent.name, trimmed]));
 					} else {
 						config = { ...config, [result.agent]: trimmed };
 					}
