@@ -23,7 +23,7 @@
  *     prompt instead of being embedded in the compacted summary.
  */
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -31,7 +31,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 // ─── Configuration ───────────────────────────────────────────────────────────
 
 const ENGRAM_PORT = Number.parseInt(process.env.ENGRAM_PORT ?? "7437", 10);
-const ENGRAM_URL = `http://127.0.0.1:${ENGRAM_PORT}`;
+const CONFIGURED_ENGRAM_URL = process.env.ENGRAM_URL?.trim() || undefined;
+const ENGRAM_URL = CONFIGURED_ENGRAM_URL || `http://127.0.0.1:${ENGRAM_PORT}`;
 const ENGRAM_BIN = process.env.ENGRAM_BIN ?? "engram";
 
 // Engram's own MCP tools — don't count these as "tool calls" for session stats
@@ -213,6 +214,39 @@ function stripPrivateTags(str: string): string {
 	return str.replace(/<private>[\s\S]*?<\/private>/gi, "[REDACTED]").trim();
 }
 
+function wait(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function spawnDetached(command: string, args: readonly string[], cwd?: string): Promise<boolean> {
+	return new Promise((resolve) => {
+		let proc: ChildProcess;
+		try {
+			proc = spawn(command, [...args], {
+				cwd,
+				detached: true,
+				stdio: "ignore",
+			});
+		} catch {
+			resolve(false);
+			return;
+		}
+
+		let settled = false;
+		const settle = (started: boolean) => {
+			if (settled) return;
+			settled = true;
+			resolve(started);
+		};
+
+		proc.once("error", () => settle(false));
+		proc.once("spawn", () => {
+			proc.unref();
+			settle(true);
+		});
+	});
+}
+
 // ─── Module State ───────────────────────────────────────────────────────────
 // One pi extension instance per pi session, so module state is per-session.
 
@@ -258,19 +292,13 @@ async function initOnce(cwd: string): Promise<void> {
 	const oldProject = cwd.split("/").pop() ?? "unknown";
 	project = extractProjectName(cwd);
 
-	// Try to start engram server if not running
+	// Try to start a local engram server if the default local URL is not running.
+	// If ENGRAM_URL is configured, treat it as an externally managed server and
+	// never spawn a local fallback.
 	const running = await isEngramRunning();
-	if (!running) {
-		try {
-			const proc = spawn(ENGRAM_BIN, ["serve"], {
-				detached: true,
-				stdio: "ignore",
-			});
-			proc.unref();
-			await new Promise((r) => setTimeout(r, 500));
-		} catch {
-			// Binary not found or can't start — extension will silently no-op
-		}
+	if (!running && CONFIGURED_ENGRAM_URL === undefined) {
+		await spawnDetached(ENGRAM_BIN, ["serve"]);
+		await wait(500);
 	}
 
 	// Migrate project name if it changed (one-time, idempotent).
@@ -289,12 +317,7 @@ async function initOnce(cwd: string): Promise<void> {
 	try {
 		const manifestFile = `${cwd}/.engram/manifest.json`;
 		if (existsSync(manifestFile)) {
-			const proc = spawn(ENGRAM_BIN, ["sync", "--import"], {
-				cwd,
-				detached: true,
-				stdio: "ignore",
-			});
-			proc.unref();
+			await spawnDetached(ENGRAM_BIN, ["sync", "--import"], cwd);
 		}
 	} catch {
 		// Manifest doesn't exist or binary not found — silently skip

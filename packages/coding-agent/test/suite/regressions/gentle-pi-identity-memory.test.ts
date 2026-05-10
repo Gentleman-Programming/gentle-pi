@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -47,6 +48,15 @@ interface ChainStep {
 	agent: string;
 	config: readonly string[];
 	task: string;
+}
+
+interface McpServerConfig {
+	command?: string;
+	args?: string[];
+}
+
+interface McpConfigFile {
+	mcpServers?: Record<string, McpServerConfig>;
 }
 
 function withTempProject(run: (paths: { projectRoot: string; agentDir: string }) => void): void {
@@ -263,6 +273,25 @@ describe("Gentle Pi identity and memory harness", () => {
 		const signals = detectGentlePiMemoryConfigSignals(projectRoot);
 
 		expect(signals).not.toContain(join(projectRoot, ".pi", "settings.json"));
+	});
+
+	it("guards the project Engram MCP launcher when the engram binary is missing", () => {
+		const config = JSON.parse(readFileSync(join(projectRoot, ".pi", "mcp.json"), "utf-8")) as McpConfigFile;
+		const engram = config.mcpServers?.engram;
+
+		expect(engram?.command).toBe("node");
+		expect(engram?.args?.[0]).toBe("-e");
+
+		const result = spawnSync(engram?.command ?? "", engram?.args ?? [], {
+			env: {
+				...process.env,
+				ENGRAM_BIN: "/definitely/missing/engram",
+			},
+			encoding: "utf8",
+		});
+
+		expect(result.status).toBe(127);
+		expect(`${result.stdout}${result.stderr}`).not.toContain("Unhandled 'error' event");
 	});
 
 	it("distinguishes unavailable from unknown Engram state", () => {

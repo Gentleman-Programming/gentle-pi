@@ -105,14 +105,19 @@ Engram is configured in `.pi/mcp.json`:
 {
 	"mcpServers": {
 		"engram": {
-			"command": "/Users/alanbuscaglia/.local/bin/engram",
-			"args": ["mcp", "--tools=agent"],
+			"command": "node",
+			"args": ["-e", "/* launcher uses ENGRAM_BIN or falls back to engram */"],
 			"lifecycle": "lazy",
 			"directTools": true
 		}
 	}
 }
 ```
+
+Set `ENGRAM_URL` to point the Pi extension at an already running Engram HTTP
+server. Set `ENGRAM_BIN` only when Pi should launch a local `engram mcp` process
+for MCP tools; if the binary is missing, the launcher exits cleanly instead of
+crashing Pi with `spawn engram ENOENT`.
 
 ## SDD workflow
 
