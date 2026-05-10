@@ -66,7 +66,7 @@ const SDD_AGENT_NAMES = [
 ] as const;
 
 type SddAgentName = (typeof SDD_AGENT_NAMES)[number];
-type SddModelConfig = Partial<Record<SddAgentName, string>>;
+type AgentModelConfig = Record<string, string>;
 
 const KEEP_CURRENT = "Keep current";
 const INHERIT_MODEL = "Inherit active/default model";
@@ -142,15 +142,14 @@ function modelConfigPath(cwd: string): string {
 	return join(cwd, ".pi", "gentle-ai", "models.json");
 }
 
-function readModelConfig(cwd: string): SddModelConfig {
+function readModelConfig(cwd: string): AgentModelConfig {
 	const path = modelConfigPath(cwd);
 	if (!existsSync(path)) return {};
 	try {
 		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
 		if (!isRecord(parsed)) return {};
-		const config: SddModelConfig = {};
-		for (const name of SDD_AGENT_NAMES) {
-			const value = parsed[name];
+		const config: AgentModelConfig = {};
+		for (const [name, value] of Object.entries(parsed)) {
 			if (typeof value === "string" && value.trim().length > 0) {
 				config[name] = value.trim();
 			}
@@ -161,7 +160,7 @@ function readModelConfig(cwd: string): SddModelConfig {
 	}
 }
 
-function writeModelConfig(cwd: string, config: SddModelConfig): void {
+function writeModelConfig(cwd: string, config: AgentModelConfig): void {
 	const path = modelConfigPath(cwd);
 	mkdirSync(dirname(path), { recursive: true });
 	writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
@@ -182,17 +181,30 @@ function updateFrontmatterModel(content: string, model: string | undefined): str
 	return `---\n${lines.join("\n")}${body}`;
 }
 
-function applyModelConfig(cwd: string, config: SddModelConfig): { updated: number; skipped: number } {
+function listProjectAgents(cwd: string): string[] {
+	const agentsDir = join(cwd, ".pi", "agents");
+	if (!existsSync(agentsDir)) return [...SDD_AGENT_NAMES];
+	const discovered = readdirSync(agentsDir, { withFileTypes: true })
+		.filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
+		.map((entry) => entry.name.slice(0, -".md".length));
+	const ordered = [
+		...SDD_AGENT_NAMES.filter((name) => discovered.includes(name)),
+		...discovered.filter((name) => !SDD_AGENT_NAMES.includes(name as SddAgentName)).sort(),
+	];
+	return ordered.length > 0 ? ordered : [...SDD_AGENT_NAMES];
+}
+
+function applyModelConfig(cwd: string, config: AgentModelConfig): { updated: number; skipped: number } {
 	let updated = 0;
 	let skipped = 0;
-	for (const name of SDD_AGENT_NAMES) {
+	for (const [name, model] of Object.entries(config)) {
 		const agentPath = join(cwd, ".pi", "agents", `${name}.md`);
 		if (!existsSync(agentPath)) {
 			skipped += 1;
 			continue;
 		}
 		const original = readFileSync(agentPath, "utf8");
-		const next = updateFrontmatterModel(original, config[name]);
+		const next = updateFrontmatterModel(original, model);
 		if (next === original) {
 			skipped += 1;
 			continue;
@@ -203,8 +215,8 @@ function applyModelConfig(cwd: string, config: SddModelConfig): { updated: numbe
 	return { updated, skipped };
 }
 
-function describeModelConfig(config: SddModelConfig): string[] {
-	return SDD_AGENT_NAMES.map((name) => `${name}: ${config[name] ?? "inherit"}`);
+function describeModelConfig(cwd: string, config: AgentModelConfig): string[] {
+	return listProjectAgents(cwd).map((name) => `${name}: ${config[name] ?? "inherit"}`);
 }
 
 async function getPiModelOptions(ctx: ExtensionContext): Promise<string[]> {
@@ -222,28 +234,29 @@ interface OverlayComponent {
 }
 
 type ModelPanelResult =
-	| { type: "save"; config: SddModelConfig }
-	| { type: "custom"; phase: SddAgentName | "all" }
+	| { type: "save"; config: AgentModelConfig }
+	| { type: "custom"; agent: string | "all" }
 	| { type: "cancel" };
 
-const SET_ALL_PHASES = "Set all phases";
-const MODEL_PANEL_ROWS = [SET_ALL_PHASES, ...SDD_AGENT_NAMES] as const;
-type ModelPanelRow = (typeof MODEL_PANEL_ROWS)[number];
+const SET_ALL_AGENTS = "Set all agents";
 
 class SddModelPanel implements OverlayComponent {
 	private cursor = 0;
-	private mode: "phases" | "models" = "phases";
-	private selectedRow: ModelPanelRow = SET_ALL_PHASES;
+	private mode: "agents" | "models" = "agents";
+	private selectedRow = SET_ALL_AGENTS;
 	private modelCursor = 0;
 	private query = "";
-	private readonly draft: SddModelConfig;
+	private readonly draft: AgentModelConfig;
+	private readonly rows: string[];
 
 	constructor(
-		initialConfig: SddModelConfig,
+		initialConfig: AgentModelConfig,
 		private readonly modelOptions: string[],
+		agents: string[],
 		private readonly done: (result: ModelPanelResult) => void,
 	) {
 		this.draft = { ...initialConfig };
+		this.rows = [SET_ALL_AGENTS, ...agents];
 	}
 
 	invalidate(): void {}
@@ -253,15 +266,15 @@ class SddModelPanel implements OverlayComponent {
 			this.handleModelInput(data);
 			return;
 		}
-		this.handlePhaseInput(data);
+		this.handleAgentInput(data);
 	}
 
 	render(width: number): string[] {
-		return this.mode === "models" ? this.renderModelPicker(width) : this.renderPhaseList(width);
+		return this.mode === "models" ? this.renderModelPicker(width) : this.renderAgentList(width);
 	}
 
-	private handlePhaseInput(data: string): void {
-		const maxCursor = MODEL_PANEL_ROWS.length + 1;
+	private handleAgentInput(data: string): void {
+		const maxCursor = this.rows.length + 1;
 		if (matchesKey(data, "ctrl+c") || matchesKey(data, "escape")) {
 			this.done({ type: "cancel" });
 			return;
@@ -283,21 +296,21 @@ class SddModelPanel implements OverlayComponent {
 			return;
 		}
 		if (data === "c") {
-			const row = MODEL_PANEL_ROWS[this.cursor];
-			if (row === SET_ALL_PHASES) this.done({ type: "custom", phase: "all" });
-			else if (row) this.done({ type: "custom", phase: row });
+			const row = this.rows[this.cursor];
+			if (row === SET_ALL_AGENTS) this.done({ type: "custom", agent: "all" });
+			else if (row) this.done({ type: "custom", agent: row });
 			return;
 		}
 		if (!matchesKey(data, "return")) return;
-		if (this.cursor === MODEL_PANEL_ROWS.length) {
+		if (this.cursor === this.rows.length) {
 			this.done({ type: "save", config: this.draft });
 			return;
 		}
-		if (this.cursor === MODEL_PANEL_ROWS.length + 1) {
+		if (this.cursor === this.rows.length + 1) {
 			this.done({ type: "cancel" });
 			return;
 		}
-		this.selectedRow = MODEL_PANEL_ROWS[this.cursor] ?? SET_ALL_PHASES;
+		this.selectedRow = this.rows[this.cursor] ?? SET_ALL_AGENTS;
 		this.mode = "models";
 		this.modelCursor = 0;
 		this.query = "";
@@ -310,7 +323,7 @@ class SddModelPanel implements OverlayComponent {
 			return;
 		}
 		if (matchesKey(data, "escape")) {
-			this.mode = "phases";
+			this.mode = "agents";
 			this.query = "";
 			return;
 		}
@@ -331,15 +344,15 @@ class SddModelPanel implements OverlayComponent {
 			const selected = options[this.modelCursor];
 			if (!selected) return;
 			if (selected === CUSTOM_MODEL) {
-				this.done({ type: "custom", phase: this.selectedRow === SET_ALL_PHASES ? "all" : this.selectedRow });
+				this.done({ type: "custom", agent: this.selectedRow === SET_ALL_AGENTS ? "all" : this.selectedRow });
 				return;
 			}
 			if (selected === KEEP_CURRENT) {
-				this.mode = "phases";
+				this.mode = "agents";
 				return;
 			}
 			this.applySelection(selected === INHERIT_MODEL ? undefined : selected);
-			this.mode = "phases";
+			this.mode = "agents";
 			return;
 		}
 		if (data.length === 1 && data.charCodeAt(0) >= 32) {
@@ -349,9 +362,9 @@ class SddModelPanel implements OverlayComponent {
 	}
 
 	private applySelection(model: string | undefined): void {
-		const row = MODEL_PANEL_ROWS[this.cursor];
-		if (row === SET_ALL_PHASES) {
-			for (const name of SDD_AGENT_NAMES) {
+		const row = this.rows[this.cursor];
+		if (row === SET_ALL_AGENTS) {
+			for (const name of this.rows.slice(1)) {
 				if (model === undefined) delete this.draft[name];
 				else this.draft[name] = model;
 			}
@@ -368,22 +381,22 @@ class SddModelPanel implements OverlayComponent {
 		return this.modelOptions.filter((option) => option.toLowerCase().includes(query));
 	}
 
-	private renderPhaseList(width: number): string[] {
+	private renderAgentList(width: number): string[] {
 		const lines: string[] = [];
 		const line = (text = "") => truncateToWidth(text, Math.max(1, width), "…", true);
-		lines.push(line("Assign Models to SDD Phases"));
+		lines.push(line("Assign Models to Agents"));
 		lines.push("");
 		lines.push(line("Current assignments:"));
 		lines.push("");
-		for (let i = 0; i < MODEL_PANEL_ROWS.length; i++) {
-			const row = MODEL_PANEL_ROWS[i];
+		for (let i = 0; i < this.rows.length; i++) {
+			const row = this.rows[i] ?? SET_ALL_AGENTS;
 			const focused = i === this.cursor;
-			const label = row === SET_ALL_PHASES ? this.renderSetAllLabel(row) : this.renderPhaseLabel(row);
+			const label = row === SET_ALL_AGENTS ? this.renderSetAllLabel(row) : this.renderAgentLabel(row);
 			lines.push(line(`${focused ? "▸" : " "} ${label}`));
 		}
 		lines.push("");
-		lines.push(line(`${this.cursor === MODEL_PANEL_ROWS.length ? "▸" : " "} Continue`));
-		lines.push(line(`${this.cursor === MODEL_PANEL_ROWS.length + 1 ? "▸" : " "} ← Back`));
+		lines.push(line(`${this.cursor === this.rows.length ? "▸" : " "} Continue`));
+		lines.push(line(`${this.cursor === this.rows.length + 1 ? "▸" : " "} ← Back`));
 		lines.push("");
 		lines.push(line("j/k: navigate • enter: change model / confirm • i: inherit • c: custom • ctrl+s: save • esc: back"));
 		return lines;
@@ -411,20 +424,21 @@ class SddModelPanel implements OverlayComponent {
 	}
 
 	private renderSetAllLabel(row: string): string {
-		const values = SDD_AGENT_NAMES.map((name) => this.draft[name] ?? "inherit");
-		const first = values[0];
+		const values = this.rows.slice(1).map((name) => this.draft[name] ?? "inherit");
+		const first = values[0] ?? "inherit";
 		const allSame = values.every((value) => value === first);
 		return `${row.padEnd(20)} ${allSame ? first : "mixed"}`;
 	}
 
-	private renderPhaseLabel(row: SddAgentName): string {
+	private renderAgentLabel(row: string): string {
 		return `${row.padEnd(20)} ${this.draft[row] ?? "inherit"}`;
 	}
 }
 
-async function showSddModelPanel(ctx: ExtensionContext, config: SddModelConfig): Promise<ModelPanelResult> {
+async function showSddModelPanel(ctx: ExtensionContext, config: AgentModelConfig): Promise<ModelPanelResult> {
 	const modelOptions = await getPiModelOptions(ctx);
-	return ctx.ui.custom<ModelPanelResult>((_tui, _theme, _keybindings, done) => new SddModelPanel(config, modelOptions, done), {
+	const agents = listProjectAgents(ctx.cwd);
+	return ctx.ui.custom<ModelPanelResult>((_tui, _theme, _keybindings, done) => new SddModelPanel(config, modelOptions, agents, done), {
 		overlay: true,
 		overlayOptions: { anchor: "center", width: "70%", minWidth: 72, maxHeight: "85%" },
 	});
@@ -467,23 +481,23 @@ export default function gentleAi(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("gentleman:models", {
-		description: "Configure per-phase SDD agent models for el Gentleman.",
+		description: "Configure per-agent models for el Gentleman.",
 		handler: async (_args, ctx) => {
 			let config = readModelConfig(ctx.cwd);
 			let result = await showSddModelPanel(ctx, config);
 			while (result.type === "custom") {
-				const current = result.phase === "all" ? "inherit" : (config[result.phase] ?? "inherit");
+				const current = result.agent === "all" ? "inherit" : (config[result.agent] ?? "inherit");
 				const custom = await ctx.ui.input(
-					`${result.phase === "all" ? "all SDD phases" : result.phase} custom model id`,
+					`${result.agent === "all" ? "all agents" : result.agent} custom model id`,
 					current === "inherit" ? "provider/model" : current,
 				);
 				if (custom === undefined) return;
 				const trimmed = custom.trim();
 				if (trimmed.length > 0) {
-					if (result.phase === "all") {
-						config = Object.fromEntries(SDD_AGENT_NAMES.map((name) => [name, trimmed])) as SddModelConfig;
+					if (result.agent === "all") {
+						config = Object.fromEntries(listProjectAgents(ctx.cwd).map((name) => [name, trimmed]));
 					} else {
-						config = { ...config, [result.phase]: trimmed };
+						config = { ...config, [result.agent]: trimmed };
 					}
 				}
 				result = await showSddModelPanel(ctx, config);
@@ -493,10 +507,10 @@ export default function gentleAi(pi: ExtensionAPI): void {
 			const applyResult = applyModelConfig(ctx.cwd, result.config);
 			ctx.ui.notify(
 				[
-					"el Gentleman SDD model config saved.",
+					"el Gentleman model config saved.",
 					`Config: ${modelConfigPath(ctx.cwd)}`,
 					`Agents updated: ${applyResult.updated}`,
-					...describeModelConfig(result.config),
+					...describeModelConfig(ctx.cwd, result.config),
 				].join("\n"),
 				"info",
 			);
@@ -506,7 +520,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 	pi.registerCommand("gentle-ai:models", {
 		description: "Alias for /gentleman:models.",
 		handler: async (_args, ctx) => {
-			ctx.ui.notify("Use /gentleman:models to configure per-phase SDD agent models.", "info");
+			ctx.ui.notify("Use /gentleman:models to configure per-agent models.", "info");
 		},
 	});
 
@@ -524,7 +538,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 					`SDD chains: ${chainsInstalled ? "installed" : "not installed"}`,
 					`OpenSpec config: ${openspecConfigured ? "present" : "missing"}`,
 					`Model config: ${existsSync(modelConfigPath(ctx.cwd)) ? "present" : "missing"}`,
-					...describeModelConfig(modelConfig),
+					...describeModelConfig(ctx.cwd, modelConfig),
 				].join("\n"),
 				"info",
 			);

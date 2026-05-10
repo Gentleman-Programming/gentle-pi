@@ -34,7 +34,7 @@ On session start, `gentle-pi` automatically installs SDD assets into the project
 | SDD phase agents | Installs `sdd-init`, `sdd-explore`, `sdd-proposal`, `sdd-spec`, `sdd-design`, `sdd-tasks`, `sdd-apply`, `sdd-verify`, and `sdd-archive`. |
 | Strict TDD support | Preserves RED → GREEN → TRIANGULATE → REFACTOR evidence and verify-time compliance checks. |
 | Review workload guard | Forecasts large diffs and recommends chained PRs or explicit `size:exception`. |
-| Model assignment UI | Opens a modal to assign Pi models to each SDD phase. |
+| Model assignment UI | Opens a modal to assign Pi models to any `.pi/agents/*.md` agent, with SDD agents shown first. |
 | Foundation skills | Adds PR, issue, chained-PR, comment, docs, work-unit, and Judgment Day skills. |
 | Safety policy | Blocks destructive shell actions unless there is explicit user approval. |
 
@@ -42,14 +42,14 @@ On session start, `gentle-pi` automatically installs SDD assets into the project
 
 ```text
 /gentle-ai:status          Show package, SDD asset, OpenSpec, and model config status.
-/gentleman:models          Open the SDD phase model assignment modal.
+/gentleman:models          Open the per-agent model assignment modal.
 /sdd-init                  Bootstrap or refresh openspec/config.yaml.
 /gentle-ai:install-sdd     Reinstall SDD assets without overwriting local files.
 /gentle-ai:install-sdd --force
                            Force-refresh installed SDD assets.
 ```
 
-## Assign models to SDD phases
+## Assign models to agents
 
 Run:
 
@@ -57,14 +57,14 @@ Run:
 /gentleman:models
 ```
 
-This opens a modal similar to Gentle-AI's model picker:
+This opens a modal similar to Gentle-AI's model picker. It discovers every local agent in `.pi/agents/*.md`, with SDD agents sorted first:
 
 ```text
-Assign Models to SDD Phases
+Assign Models to Agents
 
 Current assignments:
 
-▸ Set all phases       inherit
+▸ Set all agents       mixed
   sdd-init             inherit
   sdd-explore          openai-codex/gpt-5.5
   sdd-proposal         openai-codex/gpt-5.5
@@ -74,6 +74,7 @@ Current assignments:
   sdd-apply            anthropic/claude-sonnet-4
   sdd-verify           google/gemini-3-pro
   sdd-archive          inherit
+  my-custom-agent      anthropic/claude-sonnet-4
 
 Continue
 ← Back
@@ -82,6 +83,16 @@ j/k: navigate • enter: change model / confirm • i: inherit • c: custom •
 ```
 
 Model choices come from Pi itself via the active model registry. The modal also supports custom model IDs for advanced setups.
+
+Small recommendation in English:
+
+| Agent kind | Recommended model shape |
+|---|---|
+| Exploration, proposal, archive | Fast and cheap is usually enough. |
+| Spec, design, tasks | Strong reasoning model, because these phases shape the implementation. |
+| Apply | Strong coding model with good tool-use reliability. |
+| Verify / review agents | Strongest fresh-context model you can afford; verification benefits from independence. |
+| Tiny utility agents | Inherit the active/default model unless they become a bottleneck. |
 
 Saved config:
 
@@ -92,7 +103,7 @@ Saved config:
 Applied agent frontmatter:
 
 ```text
-.pi/agents/sdd-*.md
+.pi/agents/*.md
 ```
 
 Use `Inherit active/default model` to remove a phase override.
