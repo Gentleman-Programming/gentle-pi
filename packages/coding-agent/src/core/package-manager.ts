@@ -206,6 +206,10 @@ function getHomeDir(): string {
 	return process.env.HOME || homedir();
 }
 
+function uniqueNonEmpty(values: readonly string[]): string[] {
+	return [...new Set(values.map((value) => value.trim()).filter((value) => value.length > 0))];
+}
+
 function prefixIgnorePattern(line: string, prefix: string): string | null {
 	const trimmed = line.trim();
 	if (!trimmed) return null;
@@ -812,8 +816,7 @@ export class DefaultPackageManager implements PackageManager {
 	getInstalledPath(source: string, scope: "user" | "project"): string | undefined {
 		const parsed = this.parseSource(source);
 		if (parsed.type === "npm") {
-			const path = this.getNpmInstallPath(parsed, scope);
-			return existsSync(path) ? path : undefined;
+			return this.findInstalledNpmPath(parsed, scope);
 		}
 		if (parsed.type === "git") {
 			const path = this.getGitInstallPath(parsed, scope);
@@ -1084,8 +1087,8 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async shouldUpdateNpmSource(source: NpmSource, scope: InstalledSourceScope): Promise<boolean> {
-		const installedPath = this.getNpmInstallPath(source, scope);
-		const installedVersion = existsSync(installedPath) ? this.getInstalledNpmVersion(installedPath) : undefined;
+		const installedPath = this.findInstalledNpmPath(source, scope);
+		const installedVersion = installedPath ? this.getInstalledNpmVersion(installedPath) : undefined;
 		if (!installedVersion) {
 			return true;
 		}
@@ -1114,10 +1117,6 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async installNpmBatch(specs: string[], scope: InstalledSourceScope): Promise<void> {
-		if (scope === "user") {
-			await this.runNpmCommand(["install", "-g", ...specs]);
-			return;
-		}
 		const installRoot = this.getNpmInstallRoot(scope, false);
 		this.ensureNpmProject(installRoot);
 		await this.runNpmCommand(["install", ...specs, "--prefix", installRoot]);
@@ -1152,8 +1151,8 @@ export class DefaultPackageManager implements PackageManager {
 				}
 
 				if (parsed.type === "npm") {
-					const installedPath = this.getNpmInstallPath(parsed, entry.scope);
-					if (!existsSync(installedPath)) {
+					const installedPath = this.findInstalledNpmPath(parsed, entry.scope);
+					if (!installedPath) {
 						return undefined;
 					}
 					const hasUpdate = await this.npmHasAvailableUpdate(parsed, installedPath);
@@ -1221,16 +1220,18 @@ export class DefaultPackageManager implements PackageManager {
 			};
 
 			if (parsed.type === "npm") {
-				const installedPath = this.getNpmInstallPath(parsed, scope);
+				const installedPath = this.findInstalledNpmPath(parsed, scope);
 				const needsInstall =
-					!existsSync(installedPath) ||
+					!installedPath ||
 					(parsed.pinned && !(await this.installedNpmMatchesPinnedVersion(parsed, installedPath)));
 				if (needsInstall) {
 					const installed = await installMissing();
 					if (!installed) continue;
 				}
-				metadata.baseDir = installedPath;
-				this.collectPackageResources(installedPath, accumulator, filter, metadata);
+				const resolvedInstalledPath = this.findInstalledNpmPath(parsed, scope);
+				if (!resolvedInstalledPath) continue;
+				metadata.baseDir = resolvedInstalledPath;
+				this.collectPackageResources(resolvedInstalledPath, accumulator, filter, metadata);
 				continue;
 			}
 
@@ -1687,20 +1688,12 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async installNpm(source: NpmSource, scope: SourceScope, temporary: boolean): Promise<void> {
-		if (scope === "user" && !temporary) {
-			await this.runNpmCommand(["install", "-g", source.spec]);
-			return;
-		}
 		const installRoot = this.getNpmInstallRoot(scope, temporary);
 		this.ensureNpmProject(installRoot);
 		await this.runNpmCommand(["install", source.spec, "--prefix", installRoot]);
 	}
 
 	private async uninstallNpm(source: NpmSource, scope: SourceScope): Promise<void> {
-		if (scope === "user") {
-			await this.runNpmCommand(["uninstall", "-g", source.name]);
-			return;
-		}
 		const installRoot = this.getNpmInstallRoot(scope, false);
 		if (!existsSync(installRoot)) {
 			return;
@@ -1835,7 +1828,19 @@ export class DefaultPackageManager implements PackageManager {
 		if (scope === "project") {
 			return join(this.cwd, CONFIG_DIR_NAME, "npm");
 		}
-		return join(this.getGlobalNpmRoot(), "..");
+		return this.getUserNpmInstallRoot();
+	}
+
+	private getUserNpmInstallRoot(): string {
+		return join(this.agentDir, "npm");
+	}
+
+	private getUserNpmPrefixRoots(): string[] {
+		return uniqueNonEmpty([
+			join(getHomeDir(), ".npm-global"),
+			process.env.NPM_CONFIG_PREFIX ?? "",
+			process.env.npm_config_prefix ?? "",
+		]);
 	}
 
 	private getGlobalNpmRoot(): string {
@@ -1862,7 +1867,23 @@ export class DefaultPackageManager implements PackageManager {
 		if (scope === "project") {
 			return join(this.cwd, CONFIG_DIR_NAME, "npm", "node_modules", source.name);
 		}
-		return join(this.getGlobalNpmRoot(), source.name);
+		return join(this.getUserNpmInstallRoot(), "node_modules", source.name);
+	}
+
+	private getNpmInstallPathCandidates(source: NpmSource, scope: SourceScope): string[] {
+		if (scope !== "user") {
+			return [this.getNpmInstallPath(source, scope)];
+		}
+
+		return uniqueNonEmpty([
+			...this.getUserNpmPrefixRoots().map((prefix) => join(prefix, "lib", "node_modules", source.name)),
+			this.getNpmInstallPath(source, scope),
+			join(this.getGlobalNpmRoot(), source.name),
+		]);
+	}
+
+	private findInstalledNpmPath(source: NpmSource, scope: SourceScope): string | undefined {
+		return this.getNpmInstallPathCandidates(source, scope).find((path) => existsSync(path));
 	}
 
 	private getGitInstallPath(source: GitSource, scope: SourceScope): string {

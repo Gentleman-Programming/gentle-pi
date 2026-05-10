@@ -4,6 +4,21 @@ import type { Model } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.js";
 import { AuthStorage } from "./auth-storage.js";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
+import { createRollbackCheckpoint } from "./gentle-pi/backup.js";
+import { detectEngramBridgeConfigEvidence } from "./gentle-pi/engram-bridge.js";
+import {
+	createGentlePiIdentityMemoryServices,
+	detectGentlePiMemoryConfigSignals,
+} from "./gentle-pi/identity-memory.js";
+import { resolveGentlePiProjectStandards } from "./gentle-pi/project-standards.js";
+import { evaluateGentlePiCommandPolicy } from "./gentle-pi/security-policy.js";
+import {
+	GENTLE_PI_PHASE,
+	type GentlePiPhase,
+	type GentlePiPhaseBlocker,
+	type GentlePiRouteTable,
+	type GentlePiServices,
+} from "./gentle-pi/types.js";
 import { ModelRegistry } from "./model-registry.js";
 import { DefaultResourceLoader, type DefaultResourceLoaderOptions, type ResourceLoader } from "./resource-loader.js";
 import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "./sdk.js";
@@ -37,6 +52,7 @@ export interface CreateAgentSessionServicesOptions {
 	modelRegistry?: ModelRegistry;
 	extensionFlagValues?: Map<string, boolean | string>;
 	resourceLoaderOptions?: Omit<DefaultResourceLoaderOptions, "cwd" | "agentDir" | "settingsManager">;
+	gentlePiEnabled?: boolean;
 }
 
 /**
@@ -55,6 +71,7 @@ export interface CreateAgentSessionFromServicesOptions {
 	tools?: string[];
 	noTools?: CreateAgentSessionOptions["noTools"];
 	customTools?: ToolDefinition[];
+	gentlePi?: GentlePiServices;
 }
 
 /**
@@ -70,7 +87,133 @@ export interface AgentSessionServices {
 	settingsManager: SettingsManager;
 	modelRegistry: ModelRegistry;
 	resourceLoader: ResourceLoader;
+	gentlePi?: GentlePiServices;
 	diagnostics: AgentSessionRuntimeDiagnostic[];
+}
+
+export class GentlePiPhaseBlockedError extends Error {
+	readonly blocker: GentlePiPhaseBlocker;
+
+	constructor(blocker: GentlePiPhaseBlocker) {
+		super(blocker.executive_summary);
+		this.name = "GentlePiPhaseBlockedError";
+		this.blocker = blocker;
+	}
+}
+
+function isGentlePiDisabledByEnv(): boolean {
+	const value = process.env.PI_GENTLE_PI_DISABLED;
+	return value === "1" || value?.toLowerCase() === "true" || value?.toLowerCase() === "yes";
+}
+
+function resolveGentlePiPhaseFromEnv(): GentlePiPhase | undefined {
+	const value = process.env.PI_GENTLE_PI_PHASE;
+	if (!value) return undefined;
+	return Object.values(GENTLE_PI_PHASE).includes(value as GentlePiPhase) ? (value as GentlePiPhase) : undefined;
+}
+
+function createDefaultGentlePiRoutes(): GentlePiRouteTable {
+	return {
+		explore: { provider: "openai-codex", model: "gpt-5.5", thinkingLevel: "medium" },
+		proposal: { provider: "openai-codex", model: "gpt-5.5", thinkingLevel: "medium" },
+		spec: { provider: "openai-codex", model: "gpt-5.5", thinkingLevel: "high" },
+		design: { provider: "openai-codex", model: "gpt-5.5", thinkingLevel: "high" },
+		tasks: { provider: "openai-codex", model: "gpt-5.5", thinkingLevel: "medium" },
+		apply: { provider: "openai-codex", model: "gpt-5.5", thinkingLevel: "high" },
+		verify: { provider: "openai-codex", model: "gpt-5.5", thinkingLevel: "high" },
+		archive: { provider: "openai-codex", model: "gpt-5.5", thinkingLevel: "medium" },
+	};
+}
+
+function createGentlePiServices(
+	cwd: string,
+	agentDir: string,
+	enabled: boolean,
+): {
+	services: GentlePiServices | undefined;
+	diagnostics: AgentSessionRuntimeDiagnostic[];
+	blocker?: GentlePiPhaseBlocker;
+} {
+	if (!enabled) {
+		return { services: undefined, diagnostics: [] };
+	}
+	const phase = resolveGentlePiPhaseFromEnv();
+	const changeName = process.env.PI_GENTLE_PI_CHANGE || "gentle-pi-agent";
+	const routes = createDefaultGentlePiRoutes();
+	const configEvidence = detectEngramBridgeConfigEvidence({ projectRoot: cwd, agentDir });
+	const checkpointHook: GentlePiServices["checkpointHook"] = ({ command, decision }) => {
+		if (!phase) {
+			return;
+		}
+		createRollbackCheckpoint({
+			projectRoot: cwd,
+			changeName,
+			phase,
+			files: [
+				"openspec/config.yaml",
+				`openspec/changes/${changeName}/tasks.md`,
+				`openspec/changes/${changeName}/apply-progress.md`,
+				"package.json",
+				"package-lock.json",
+			],
+			reason: `${decision.reason}: ${command}`,
+		});
+	};
+	const standards = resolveGentlePiProjectStandards({ projectRoot: cwd });
+	if (standards.status === "blocked") {
+		const blocker: GentlePiPhaseBlocker = {
+			status: "blocked",
+			executive_summary: "Gentle Pi phase blocked because project standards are unavailable.",
+			artifacts: [],
+			next_recommended: "sdd-init",
+			risks: standards.missing.join(", "),
+			reason: standards.reason,
+			missing: standards.missing,
+		};
+		if (phase) {
+			return { services: undefined, diagnostics: [], blocker };
+		}
+		return {
+			services: {
+				enabled: true,
+				phase,
+				changeName,
+				projectRoot: cwd,
+				identityMemory: createGentlePiIdentityMemoryServices({
+					configuredSignals: detectGentlePiMemoryConfigSignals(cwd, agentDir),
+					configEvidence,
+					packageNames: ["pi-subagents", "pi-intercom", "pi-mcp-adapter"],
+				}),
+				routes,
+				commandPolicy: evaluateGentlePiCommandPolicy,
+				checkpointHook,
+			},
+			diagnostics: [
+				{
+					type: "warning",
+					message: `Gentle Pi standards unavailable: ${standards.missing.join(", ")}`,
+				},
+			],
+		};
+	}
+	return {
+		services: {
+			enabled: true,
+			phase,
+			changeName,
+			projectRoot: cwd,
+			identityMemory: createGentlePiIdentityMemoryServices({
+				configuredSignals: detectGentlePiMemoryConfigSignals(cwd, agentDir),
+				configEvidence,
+				packageNames: ["pi-subagents", "pi-intercom", "pi-mcp-adapter"],
+			}),
+			standardsPrompt: standards.standards.promptBlock,
+			routes,
+			commandPolicy: evaluateGentlePiCommandPolicy,
+			checkpointHook,
+		},
+		diagnostics: [],
+	};
 }
 
 function applyExtensionFlagValues(
@@ -156,6 +299,11 @@ export async function createAgentSessionServices(
 		}
 	}
 	extensionsResult.runtime.pendingProviderRegistrations = [];
+	const gentlePi = createGentlePiServices(cwd, agentDir, options.gentlePiEnabled ?? !isGentlePiDisabledByEnv());
+	if (gentlePi.blocker) {
+		throw new GentlePiPhaseBlockedError(gentlePi.blocker);
+	}
+	diagnostics.push(...gentlePi.diagnostics);
 	diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
 
 	return {
@@ -165,6 +313,7 @@ export async function createAgentSessionServices(
 		settingsManager,
 		modelRegistry,
 		resourceLoader,
+		gentlePi: gentlePi.services,
 		diagnostics,
 	};
 }
@@ -194,5 +343,6 @@ export async function createAgentSessionFromServices(
 		noTools: options.noTools,
 		customTools: options.customTools,
 		sessionStartEvent: options.sessionStartEvent,
+		gentlePi: options.gentlePi ?? options.services.gentlePi,
 	});
 }

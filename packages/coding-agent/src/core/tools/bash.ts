@@ -15,6 +15,7 @@ import {
 	untrackDetachedChildPid,
 } from "../../utils/shell.js";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.js";
+import type { GentlePiCommandDecision } from "../gentle-pi/types.js";
 import { OutputAccumulator } from "./output-accumulator.js";
 import { getTextOutput, invalidArgText, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
@@ -134,6 +135,14 @@ export interface BashSpawnContext {
 
 export type BashSpawnHook = (context: BashSpawnContext) => BashSpawnContext;
 
+export type BashPreExecPolicy = (context: BashSpawnContext) => GentlePiCommandDecision;
+
+export type BashCheckpointHook = (context: {
+	command: string;
+	cwd: string;
+	decision: GentlePiCommandDecision;
+}) => void | Promise<void>;
+
 function resolveSpawnContext(command: string, cwd: string, spawnHook?: BashSpawnHook): BashSpawnContext {
 	const baseContext: BashSpawnContext = { command, cwd, env: { ...getShellEnv() } };
 	return spawnHook ? spawnHook(baseContext) : baseContext;
@@ -148,6 +157,10 @@ export interface BashToolOptions {
 	shellPath?: string;
 	/** Hook to adjust command, cwd, or env before execution */
 	spawnHook?: BashSpawnHook;
+	/** Runtime policy evaluated immediately before command execution */
+	preExecPolicy?: BashPreExecPolicy;
+	/** Runtime checkpoint hook executed before mutating commands */
+	checkpointHook?: BashCheckpointHook;
 }
 
 const BASH_PREVIEW_LINES = 5;
@@ -268,6 +281,8 @@ export function createBashToolDefinition(
 	const ops = options?.operations ?? createLocalBashOperations({ shellPath: options?.shellPath });
 	const commandPrefix = options?.commandPrefix;
 	const spawnHook = options?.spawnHook;
+	const preExecPolicy = options?.preExecPolicy;
+	const checkpointHook = options?.checkpointHook;
 	return {
 		name: "bash",
 		label: "bash",
@@ -283,6 +298,20 @@ export function createBashToolDefinition(
 		) {
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
 			const spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook);
+			const policyDecision = preExecPolicy?.(spawnContext);
+			if (policyDecision?.action === "deny") {
+				throw new Error(policyDecision.reason);
+			}
+			if (policyDecision?.action === "confirm") {
+				throw new Error(`Command requires confirmation: ${policyDecision.reason}`);
+			}
+			if (policyDecision?.checkpoint) {
+				await checkpointHook?.({
+					command: spawnContext.command,
+					cwd: spawnContext.cwd,
+					decision: policyDecision,
+				});
+			}
 			const output = new OutputAccumulator({ tempFilePrefix: "pi-bash" });
 			let updateTimer: NodeJS.Timeout | undefined;
 			let updateDirty = false;

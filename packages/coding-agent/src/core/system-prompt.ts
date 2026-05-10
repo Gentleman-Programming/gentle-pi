@@ -16,6 +16,10 @@ export interface BuildSystemPromptOptions {
 	promptGuidelines?: string[];
 	/** Text to append to system prompt. */
 	appendSystemPrompt?: string;
+	/** Compact standards injected only for isolated Gentle Pi phase runs. */
+	gentlePiPhaseStandards?: string;
+	/** Runtime Gentle Pi identity/memory contract injected for normal and phase runs. */
+	gentlePiIdentityPrompt?: string;
 	/** Working directory. */
 	cwd: string;
 	/** Pre-loaded context files. */
@@ -32,6 +36,8 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		toolSnippets,
 		promptGuidelines,
 		appendSystemPrompt,
+		gentlePiPhaseStandards,
+		gentlePiIdentityPrompt,
 		cwd,
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
@@ -45,7 +51,13 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const day = String(now.getDate()).padStart(2, "0");
 	const date = `${year}-${month}-${day}`;
 
-	const appendSection = appendSystemPrompt ? `\n\n${appendSystemPrompt}` : "";
+	const appendParts = [gentlePiIdentityPrompt, appendSystemPrompt, gentlePiPhaseStandards].filter(
+		(value): value is string => value !== undefined && value.trim().length > 0,
+	);
+	const appendSection = appendParts.length > 0 ? `\n\n${appendParts.join("\n\n")}` : "";
+	const intro = gentlePiIdentityPrompt
+		? "You are Gentle Pi, a Pi-specific coding-agent harness. You help users by reading files, executing commands, editing code, and writing new files."
+		: "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
 
 	const contextFiles = providedContextFiles ?? [];
 	const skills = providedSkills ?? [];
@@ -128,7 +140,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 
 	const guidelines = guidelinesList.map((g) => `- ${g}`).join("\n");
 
-	let prompt = `You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
+	let prompt = `${intro}
 
 Available tools:
 ${toolsList}

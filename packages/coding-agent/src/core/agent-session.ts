@@ -76,6 +76,7 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
+import type { GentlePiServices } from "./gentle-pi/types.js";
 import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
@@ -174,6 +175,8 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Optional Gentle Pi runtime policy/services. */
+	gentlePi?: GentlePiServices;
 }
 
 export interface ExtensionBindings {
@@ -291,6 +294,7 @@ export class AgentSession {
 	private _allowedToolNames?: Set<string>;
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
+	private _gentlePi?: GentlePiServices;
 	private _extensionUIContext?: ExtensionUIContext;
 	private _extensionCommandContextActions?: ExtensionCommandContextActions;
 	private _extensionShutdownHandler?: ShutdownHandler;
@@ -324,6 +328,7 @@ export class AgentSession {
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		this._gentlePi = config.gentlePi;
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -937,6 +942,10 @@ export class AgentSession {
 			loaderAppendSystemPrompt.length > 0 ? loaderAppendSystemPrompt.join("\n\n") : undefined;
 		const loadedSkills = this._resourceLoader.getSkills().skills;
 		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
+		const gentlePiPhaseStandards = process.env.PI_GENTLE_PI_PHASE ? this._gentlePi?.standardsPrompt : undefined;
+		const gentlePiIdentityPrompt = this._gentlePi?.identityMemory?.renderPrompt({
+			activeToolNames: validToolNames,
+		});
 
 		this._baseSystemPromptOptions = {
 			cwd: this._cwd,
@@ -947,6 +956,8 @@ export class AgentSession {
 			selectedTools: validToolNames,
 			toolSnippets,
 			promptGuidelines,
+			gentlePiIdentityPrompt,
+			gentlePiPhaseStandards,
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
 	}
@@ -2343,7 +2354,18 @@ export class AgentSession {
 				)
 			: createAllToolDefinitions(this._cwd, {
 					read: { autoResizeImages },
-					bash: { commandPrefix: shellCommandPrefix, shellPath },
+					bash: {
+						commandPrefix: shellCommandPrefix,
+						shellPath,
+						preExecPolicy: this._gentlePi?.commandPolicy
+							? (context) =>
+									this._gentlePi!.commandPolicy!({
+										command: context.command,
+										phase: this._gentlePi!.phase,
+									})
+							: undefined,
+						checkpointHook: this._gentlePi?.checkpointHook,
+					},
 				});
 
 		this._baseToolDefinitions = new Map(
@@ -2569,6 +2591,24 @@ export class AgentSession {
 		const resolvedCommand = prefix ? `${prefix}\n${command}` : command;
 
 		try {
+			const policyDecision = this._gentlePi?.commandPolicy?.({
+				command: resolvedCommand,
+				phase: this._gentlePi.phase,
+			});
+			if (policyDecision?.action === "deny") {
+				throw new Error(policyDecision.reason);
+			}
+			if (policyDecision?.action === "confirm") {
+				throw new Error(`Command requires confirmation: ${policyDecision.reason}`);
+			}
+			if (policyDecision?.checkpoint) {
+				await this._gentlePi?.checkpointHook?.({
+					command: resolvedCommand,
+					cwd: this.sessionManager.getCwd(),
+					decision: policyDecision,
+				});
+			}
+
 			const result = await executeBashWithOperations(
 				resolvedCommand,
 				this.sessionManager.getCwd(),

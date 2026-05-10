@@ -1,0 +1,43 @@
+{
+	"packages": [
+		"npm:pi-subagents",
+		"npm:pi-intercom",
+		"npm:pi-mcp-adapter",
+		"npm:@juicesharp/rpiv-ask-user-question"
+	],
+	"gentlePi": {
+		"packages": {
+			"installed": [
+				{
+					"name": "pi-subagents",
+					"version": "0.24.0",
+					"purpose": "Native SDD phase agents and chains",
+					"runtimeDefault": true
+				},
+				{
+					"name": "pi-intercom",
+					"version": "0.6.0",
+					"purpose": "Optional supervisor progress and blocked-decision path",
+					"runtimeDefault": false
+				},
+				{
+					"name": "pi-mcp-adapter",
+					"version": "2.5.4",
+					"purpose": "Optional MCP bridge for direct MCP-backed tools",
+					"runtimeDefault": false
+				},
+				{
+					"name": "@juicesharp/rpiv-ask-user-question",
+					"version": "1.3.1",
+					"purpose": "Structured clarification questions instead of guessing",
+					"runtimeDefault": true
+				}
+			],
+			"notes": [
+				"Engram remains the primary memory target when callable tools are available.",
+				"Pi memory extensions are evaluated references only and are not runtime defaults.",
+				"Do not claim Pi memory packages replace Engram without an explicit later user decision."
+			]
+		}
+	}
+}

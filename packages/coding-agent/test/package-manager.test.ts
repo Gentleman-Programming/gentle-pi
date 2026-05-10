@@ -43,6 +43,11 @@ const isDisabled = (r: ResolvedResource, pathMatch: string, matchFn: "endsWith" 
 		: normalizedPath.includes(normalizedMatch) && !r.enabled;
 };
 
+interface PackageManagerInternals {
+	runCommand(command: string, args: string[], options?: { cwd?: string }): Promise<void>;
+	runCommandSync(command: string, args: string[]): string;
+}
+
 describe("DefaultPackageManager", () => {
 	let tempDir: string;
 	let agentDir: string;
@@ -645,9 +650,36 @@ Content`,
 
 			expect(runCommandSpy).toHaveBeenCalledWith(
 				"mise",
-				["exec", "node@20", "--", "npm", "install", "-g", "@scope/pkg"],
+				["exec", "node@20", "--", "npm", "install", "@scope/pkg", "--prefix", join(agentDir, "npm")],
 				undefined,
 			);
+		});
+
+		it("should resolve user-prefix packages before installing into a read-only npm global root", async () => {
+			const userPrefix = join(tempDir, "home", ".npm-global");
+			const installedPath = join(userPrefix, "lib", "node_modules", "pi-subagents");
+			mkdirSync(join(installedPath, "extensions"), { recursive: true });
+			writeFileSync(
+				join(installedPath, "package.json"),
+				JSON.stringify({ name: "pi-subagents", version: "0.24.0" }),
+			);
+			writeFileSync(join(installedPath, "extensions", "index.js"), "export default function() {};\n");
+			vi.stubEnv("HOME", join(tempDir, "home"));
+			settingsManager.setPackages(["npm:pi-subagents@0.24.0"]);
+			const packageManagerInternals = packageManager as unknown as PackageManagerInternals;
+
+			vi.spyOn(packageManagerInternals, "runCommandSync").mockReturnValue(
+				"/nix/store/read-only-node/lib/node_modules",
+			);
+			const runCommandSpy = vi.spyOn(packageManagerInternals, "runCommand").mockResolvedValue(undefined);
+
+			const result = await packageManager.resolve();
+
+			expect(runCommandSpy).not.toHaveBeenCalled();
+			expect(
+				result.extensions.some((resource) => resource.path === join(installedPath, "extensions", "index.js")),
+			).toBe(true);
+			expect(packageManager.getInstalledPath("npm:pi-subagents@0.24.0", "user")).toBe(installedPath);
 		});
 
 		it("should install git package dependencies with --omit=dev", async () => {
@@ -1825,7 +1857,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 			expect(runCommandSpy).toHaveBeenNthCalledWith(
 				1,
 				"npm",
-				["install", "-g", "user-old@latest", "user-unknown@latest"],
+				["install", "user-old@latest", "user-unknown@latest", "--prefix", join(agentDir, "npm")],
 				undefined,
 			);
 			expect(runCommandSpy).toHaveBeenNthCalledWith(

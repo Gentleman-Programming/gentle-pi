@@ -8,6 +8,8 @@ import chalk from "chalk";
 import { minimatch } from "minimatch";
 import { isValidThinkingLevel } from "../cli/args.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
+import { resolveGentlePiPhaseRoute } from "./gentle-pi/model-routing.js";
+import type { GentlePiPhase, GentlePiRouteTable } from "./gentle-pi/types.js";
 import type { ModelRegistry } from "./model-registry.js";
 
 /** Default model IDs for each known provider */
@@ -489,6 +491,10 @@ export async function findInitialModel(options: {
 	defaultModelId?: string;
 	defaultThinkingLevel?: ThinkingLevel;
 	modelRegistry: ModelRegistry;
+	gentlePiRoute?: {
+		phase: GentlePiPhase;
+		routes: GentlePiRouteTable;
+	};
 }): Promise<InitialModelResult> {
 	const {
 		cliProvider,
@@ -503,6 +509,22 @@ export async function findInitialModel(options: {
 
 	let model: Model<Api> | undefined;
 	let thinkingLevel: ThinkingLevel = DEFAULT_THINKING_LEVEL;
+
+	if (options.gentlePiRoute && !cliProvider && !cliModel) {
+		const routeResult = resolveGentlePiPhaseRoute(options.gentlePiRoute);
+		if (routeResult.status === "blocked") {
+			throw new Error(`${routeResult.reason}:${routeResult.phase}`);
+		}
+		const routedModel = modelRegistry.find(routeResult.route.provider, routeResult.route.model);
+		if (!routedModel) {
+			throw new Error(`routing-model-unavailable:${routeResult.route.provider}/${routeResult.route.model}`);
+		}
+		return {
+			model: routedModel,
+			thinkingLevel: routeResult.route.thinkingLevel ?? defaultThinkingLevel ?? DEFAULT_THINKING_LEVEL,
+			fallbackMessage: undefined,
+		};
+	}
 
 	// 1. CLI args take priority
 	if (cliProvider && cliModel) {

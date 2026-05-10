@@ -1488,101 +1488,104 @@ describe("Generate E2E Tests", () => {
 
 	// Check if ollama is installed and local LLM tests are enabled
 	let ollamaInstalled = false;
+	let ollamaModelAvailable = false;
 	if (!process.env.PI_NO_LOCAL_LLM) {
 		try {
 			execSync("which ollama", { stdio: "ignore" });
 			ollamaInstalled = true;
+			try {
+				execSync("ollama list | grep -q 'gpt-oss:20b'", { stdio: "ignore" });
+				ollamaModelAvailable = true;
+			} catch {
+				console.log("Pulling gpt-oss:20b model for Ollama tests...");
+				try {
+					execSync("ollama pull gpt-oss:20b", { stdio: "inherit" });
+					ollamaModelAvailable = true;
+				} catch {
+					console.warn("Failed to pull gpt-oss:20b model, tests will be skipped");
+				}
+			}
 		} catch {
 			ollamaInstalled = false;
 		}
 	}
 
-	describe.skipIf(!ollamaInstalled)("Ollama Provider (gpt-oss-20b via OpenAI Completions)", () => {
-		let llm: Model<"openai-completions">;
-		let ollamaProcess: ChildProcess | null = null;
+	describe.skipIf(!ollamaInstalled || !ollamaModelAvailable)(
+		"Ollama Provider (gpt-oss-20b via OpenAI Completions)",
+		() => {
+			let llm: Model<"openai-completions">;
+			let ollamaProcess: ChildProcess | null = null;
 
-		beforeAll(async () => {
-			// Check if model is available, if not pull it
-			try {
-				execSync("ollama list | grep -q 'gpt-oss:20b'", { stdio: "ignore" });
-			} catch {
-				console.log("Pulling gpt-oss:20b model for Ollama tests...");
-				try {
-					execSync("ollama pull gpt-oss:20b", { stdio: "inherit" });
-				} catch (_e) {
-					console.warn("Failed to pull gpt-oss:20b model, tests will be skipped");
-					return;
-				}
-			}
+			beforeAll(async () => {
+				// Start ollama server
+				ollamaProcess = spawn("ollama", ["serve"], {
+					detached: false,
+					stdio: "ignore",
+				});
 
-			// Start ollama server
-			ollamaProcess = spawn("ollama", ["serve"], {
-				detached: false,
-				stdio: "ignore",
-			});
-
-			// Wait for server to be ready
-			await new Promise<void>((resolve) => {
-				const checkServer = async () => {
-					try {
-						const response = await fetch("http://localhost:11434/api/tags");
-						if (response.ok) {
-							resolve();
-						} else {
+				// Wait for server to be ready
+				await new Promise<void>((resolve) => {
+					const checkServer = async () => {
+						try {
+							const response = await fetch("http://localhost:11434/api/tags");
+							if (response.ok) {
+								resolve();
+							} else {
+								setTimeout(checkServer, 500);
+							}
+						} catch {
 							setTimeout(checkServer, 500);
 						}
-					} catch {
-						setTimeout(checkServer, 500);
-					}
+					};
+					setTimeout(checkServer, 1000); // Initial delay
+				});
+
+				llm = {
+					id: "gpt-oss:20b",
+					api: "openai-completions",
+					provider: "ollama",
+					baseUrl: "http://localhost:11434/v1",
+					reasoning: true,
+					input: ["text"],
+					contextWindow: 128000,
+					maxTokens: 16000,
+					cost: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+					},
+					name: "Ollama GPT-OSS 20B",
 				};
-				setTimeout(checkServer, 1000); // Initial delay
+			}, 30000); // 30 second timeout for setup
+
+			afterAll(() => {
+				// Kill ollama server
+				if (ollamaProcess) {
+					ollamaProcess.kill("SIGTERM");
+					ollamaProcess = null;
+				}
 			});
 
-			llm = {
-				id: "gpt-oss:20b",
-				api: "openai-completions",
-				provider: "ollama",
-				baseUrl: "http://localhost:11434/v1",
-				reasoning: true,
-				input: ["text"],
-				contextWindow: 128000,
-				maxTokens: 16000,
-				cost: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-				},
-				name: "Ollama GPT-OSS 20B",
-			};
-		}, 30000); // 30 second timeout for setup
+			it("should complete basic text generation", { retry: 3 }, async () => {
+				await basicTextGeneration(llm, { apiKey: "test" });
+			});
 
-		afterAll(() => {
-			// Kill ollama server
-			if (ollamaProcess) {
-				ollamaProcess.kill("SIGTERM");
-				ollamaProcess = null;
-			}
-		});
+			it("should handle tool calling", { retry: 3 }, async () => {
+				await handleToolCall(llm, { apiKey: "test" });
+			});
 
-		it("should complete basic text generation", { retry: 3 }, async () => {
-			await basicTextGeneration(llm, { apiKey: "test" });
-		});
+			it("should handle streaming", { retry: 3 }, async () => {
+				await handleStreaming(llm, { apiKey: "test" });
+			});
 
-		it("should handle tool calling", { retry: 3 }, async () => {
-			await handleToolCall(llm, { apiKey: "test" });
-		});
+			it("should handle thinking mode", { retry: 3 }, async () => {
+				await handleThinking(llm, { apiKey: "test", reasoningEffort: "medium" });
+			});
 
-		it("should handle streaming", { retry: 3 }, async () => {
-			await handleStreaming(llm, { apiKey: "test" });
-		});
-
-		it("should handle thinking mode", { retry: 3 }, async () => {
-			await handleThinking(llm, { apiKey: "test", reasoningEffort: "medium" });
-		});
-
-		it("should handle multi-turn with thinking and tools", { retry: 3 }, async () => {
-			await multiTurn(llm, { apiKey: "test", reasoningEffort: "medium" });
-		});
-	});
+			it("should handle multi-turn with thinking and tools", { retry: 3 }, async () => {
+				await multiTurn(llm, { apiKey: "test", reasoningEffort: "medium" });
+			});
+		},
+	);
 });

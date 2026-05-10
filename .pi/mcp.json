@@ -1,0 +1,10 @@
+{
+	"mcpServers": {
+		"engram": {
+			"command": "/Users/alanbuscaglia/.local/bin/engram",
+			"args": ["mcp", "--tools=agent"],
+			"lifecycle": "lazy",
+			"directTools": true
+		}
+	}
+}

@@ -1,0 +1,68 @@
+schema: spec-driven
+
+context: |
+  Project: gentle-pi (private upstream import)
+  Focus: packages/coding-agent (made-to-measure Gentle Pi Agent)
+  Stack: TypeScript monorepo (Node >=20, npm workspaces)
+  Architecture intent: Harness-first runtime (see GENTLE_PI_HARNESSES.md)
+  Quality: Biome + tsgo typecheck + Vitest tests
+  Persistence mode: openspec
+
+strict_tdd: true
+
+testing:
+  detected_at: "2026-05-10"
+  runner:
+    available: true
+    framework: vitest
+    command: "npm --prefix packages/coding-agent run test"
+  layers:
+    unit:
+      available: true
+      tool: vitest
+    integration:
+      available: true
+      tool: "vitest (rpc/session/extensions harness tests)"
+    e2e:
+      available: false
+      tool: "—"
+  coverage:
+    available: false
+    command: "—"
+  quality:
+    linter:
+      available: true
+      command: "npx biome check --write --error-on-warnings ."
+    type_checker:
+      available: true
+      command: "npx tsgo --noEmit"
+    formatter:
+      available: true
+      command: "npx biome format --write ."
+
+rules:
+  proposal:
+    - Keep scope anchored to packages/coding-agent unless explicitly expanded.
+    - State harness impact (SDD orchestration, artifact continuity, safety guardrails).
+  specs:
+    - Use RFC 2119 language (MUST/SHOULD/MAY).
+    - Write scenarios in Given/When/Then.
+  design:
+    - Preserve harness-first, non-generic product direction.
+    - Record tradeoffs only for coding-agent-focused outcomes.
+  tasks:
+    - Keep tasks vertically sliceable and reviewer-friendly.
+    - Prefer work units that stay below large-review thresholds.
+  apply:
+    tdd: true
+    test_command: "npm --prefix packages/coding-agent run test"
+    guidance:
+      - Follow strict TDD when touching behavior (red/green/refactor evidence).
+  verify:
+    test_command: "npm --prefix packages/coding-agent run test"
+    build_command: "npm run check"
+    coverage_threshold: 0
+    guidance:
+      - Verify artifact-contract compliance for each executed phase.
+  archive:
+    - Archive only after verify report exists and confirms task/spec alignment.

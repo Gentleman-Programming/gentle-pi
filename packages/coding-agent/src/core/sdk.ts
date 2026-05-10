@@ -7,6 +7,7 @@ import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
 import { AuthStorage } from "./auth-storage.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.js";
+import type { GentlePiServices } from "./gentle-pi/types.js";
 import { convertToLlm } from "./messages.js";
 import { ModelRegistry } from "./model-registry.js";
 import { findInitialModel } from "./model-resolver.js";
@@ -77,6 +78,8 @@ export interface CreateAgentSessionOptions {
 	settingsManager?: SettingsManager;
 	/** Session start event metadata for extension runtime startup. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Optional Gentle Pi runtime policy/services. */
+	gentlePi?: GentlePiServices;
 }
 
 /** Result from createAgentSession */
@@ -217,6 +220,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;
+	let resolvedInitialThinkingLevel: ThinkingLevel | undefined;
 
 	// If session has data, try to restore model from it
 	if (!model && hasExistingSession && existingSession.model) {
@@ -238,8 +242,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			defaultModelId: settingsManager.getDefaultModel(),
 			defaultThinkingLevel: settingsManager.getDefaultThinkingLevel(),
 			modelRegistry,
+			gentlePiRoute:
+				options.gentlePi?.phase && options.gentlePi.routes
+					? { phase: options.gentlePi.phase, routes: options.gentlePi.routes }
+					: undefined,
 		});
 		model = result.model;
+		resolvedInitialThinkingLevel = result.thinkingLevel;
 		if (!model) {
 			modelFallbackMessage = formatNoModelsAvailableMessage();
 		} else if (modelFallbackMessage) {
@@ -247,7 +256,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 	}
 
-	let thinkingLevel = options.thinkingLevel;
+	let thinkingLevel = options.thinkingLevel ?? resolvedInitialThinkingLevel;
 
 	// If session has data, restore thinking level from it
 	if (thinkingLevel === undefined && hasExistingSession) {
@@ -402,6 +411,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		allowedToolNames,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
+		gentlePi: options.gentlePi,
 	});
 	const extensionsResult = resourceLoader.getExtensions();
 
