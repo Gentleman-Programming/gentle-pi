@@ -52,6 +52,35 @@ const CONFIRM_BASH_PATTERNS: RegExp[] = [
 	/\bpi\s+remove\b/,
 ];
 
+const SDD_AGENT_NAMES = [
+	"sdd-init",
+	"sdd-explore",
+	"sdd-proposal",
+	"sdd-spec",
+	"sdd-design",
+	"sdd-tasks",
+	"sdd-apply",
+	"sdd-verify",
+	"sdd-archive",
+] as const;
+
+type SddAgentName = (typeof SDD_AGENT_NAMES)[number];
+type SddModelConfig = Partial<Record<SddAgentName, string>>;
+
+const MODEL_OPTIONS = [
+	"Keep current",
+	"Inherit active/default model",
+	"anthropic/claude-sonnet-4",
+	"google/gemini-3-pro",
+	"openai/gpt-5",
+	"openai/gpt-5-mini",
+	"Custom model id",
+] as const;
+
+const KEEP_CURRENT = MODEL_OPTIONS[0];
+const INHERIT_MODEL = MODEL_OPTIONS[1];
+const CUSTOM_MODEL = MODEL_OPTIONS[6];
+
 function evaluateCommand(command: string): ToolCallEventResult | undefined {
 	for (const pattern of DENIED_BASH_PATTERNS) {
 		if (pattern.test(command)) {
@@ -112,14 +141,91 @@ function installSddAssets(
 	};
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function modelConfigPath(cwd: string): string {
+	return join(cwd, ".pi", "gentle-ai", "models.json");
+}
+
+function readModelConfig(cwd: string): SddModelConfig {
+	const path = modelConfigPath(cwd);
+	if (!existsSync(path)) return {};
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+		if (!isRecord(parsed)) return {};
+		const config: SddModelConfig = {};
+		for (const name of SDD_AGENT_NAMES) {
+			const value = parsed[name];
+			if (typeof value === "string" && value.trim().length > 0) {
+				config[name] = value.trim();
+			}
+		}
+		return config;
+	} catch {
+		return {};
+	}
+}
+
+function writeModelConfig(cwd: string, config: SddModelConfig): void {
+	const path = modelConfigPath(cwd);
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+}
+
+function updateFrontmatterModel(content: string, model: string | undefined): string {
+	if (!content.startsWith("---\n")) return content;
+	const endIndex = content.indexOf("\n---", 4);
+	if (endIndex === -1) return content;
+	const frontmatter = content.slice(4, endIndex);
+	const body = content.slice(endIndex);
+	const lines = frontmatter.split("\n").filter((line) => !line.startsWith("model:"));
+	if (model !== undefined) {
+		const descriptionIndex = lines.findIndex((line) => line.startsWith("description:"));
+		const insertIndex = descriptionIndex >= 0 ? descriptionIndex + 1 : Math.min(1, lines.length);
+		lines.splice(insertIndex, 0, `model: ${model}`);
+	}
+	return `---\n${lines.join("\n")}${body}`;
+}
+
+function applyModelConfig(cwd: string, config: SddModelConfig): { updated: number; skipped: number } {
+	let updated = 0;
+	let skipped = 0;
+	for (const name of SDD_AGENT_NAMES) {
+		const agentPath = join(cwd, ".pi", "agents", `${name}.md`);
+		if (!existsSync(agentPath)) {
+			skipped += 1;
+			continue;
+		}
+		const original = readFileSync(agentPath, "utf8");
+		const next = updateFrontmatterModel(original, config[name]);
+		if (next === original) {
+			skipped += 1;
+			continue;
+		}
+		writeFileSync(agentPath, next);
+		updated += 1;
+	}
+	return { updated, skipped };
+}
+
+function describeModelConfig(config: SddModelConfig): string[] {
+	return SDD_AGENT_NAMES.map((name) => `${name}: ${config[name] ?? "inherit"}`);
+}
+
 export default function gentleAi(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
 		const result = installSddAssets(ctx.cwd, false);
+		const modelResult = applyModelConfig(ctx.cwd, readModelConfig(ctx.cwd));
 		if (ctx.hasUI && (result.agents > 0 || result.chains > 0 || result.support > 0)) {
 			ctx.ui.notify(
 				`Gentle AI SDD assets auto-installed: ${result.agents} agent(s), ${result.chains} chain(s), ${result.support} support file(s).`,
 				"info",
 			);
+		}
+		if (ctx.hasUI && modelResult.updated > 0) {
+			ctx.ui.notify(`el Gentleman applied SDD model config to ${modelResult.updated} agent(s).`, "info");
 		}
 	});
 
@@ -144,18 +250,64 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerCommand("gentleman:models", {
+		description: "Configure per-phase SDD agent models for el Gentleman.",
+		handler: async (_args, ctx) => {
+			const config = readModelConfig(ctx.cwd);
+			for (const name of SDD_AGENT_NAMES) {
+				const current = config[name] ?? "inherit";
+				const selected = await ctx.ui.select(`${name} model (current: ${current})`, [...MODEL_OPTIONS]);
+				if (selected === undefined) return;
+				if (selected === KEEP_CURRENT) continue;
+				if (selected === INHERIT_MODEL) {
+					delete config[name];
+					continue;
+				}
+				if (selected === CUSTOM_MODEL) {
+					const custom = await ctx.ui.input(`${name} custom model id`, current === "inherit" ? "provider/model" : current);
+					if (custom === undefined) return;
+					const trimmed = custom.trim();
+					if (trimmed.length > 0) config[name] = trimmed;
+					continue;
+				}
+				config[name] = selected;
+			}
+			writeModelConfig(ctx.cwd, config);
+			const result = applyModelConfig(ctx.cwd, config);
+			ctx.ui.notify(
+				[
+					"el Gentleman SDD model config saved.",
+					`Config: ${modelConfigPath(ctx.cwd)}`,
+					`Agents updated: ${result.updated}`,
+					...describeModelConfig(config),
+				].join("\n"),
+				"info",
+			);
+		},
+	});
+
+	pi.registerCommand("gentle-ai:models", {
+		description: "Alias for /gentleman:models.",
+		handler: async (_args, ctx) => {
+			ctx.ui.notify("Use /gentleman:models to configure per-phase SDD agent models.", "info");
+		},
+	});
+
 	pi.registerCommand("gentle-ai:status", {
 		description: "Show Gentle AI package status for this project.",
 		handler: async (_args, ctx) => {
 			const agentsInstalled = existsSync(join(ctx.cwd, ".pi", "agents", "sdd-apply.md"));
 			const chainsInstalled = existsSync(join(ctx.cwd, ".pi", "chains", "sdd-full.chain.md"));
 			const openspecConfigured = existsSync(join(ctx.cwd, "openspec", "config.yaml"));
+			const modelConfig = readModelConfig(ctx.cwd);
 			ctx.ui.notify(
 				[
-					"Gentle AI package is active.",
+					"el Gentleman package is active.",
 					`SDD agents: ${agentsInstalled ? "installed" : "not installed"}`,
 					`SDD chains: ${chainsInstalled ? "installed" : "not installed"}`,
 					`OpenSpec config: ${openspecConfigured ? "present" : "missing"}`,
+					`Model config: ${existsSync(modelConfigPath(ctx.cwd)) ? "present" : "missing"}`,
+					...describeModelConfig(modelConfig),
 				].join("\n"),
 				"info",
 			);

@@ -18,7 +18,7 @@ pi install ./pi-packages/gentle-ai
 
 ## What it loads
 
-- `extensions/gentle-ai.ts` — injects the parent-session Gentle AI orchestrator, auto-installs SDD assets non-destructively, registers `/gentle-ai:*` commands, and blocks high-risk shell commands.
+- `extensions/gentle-ai.ts` — injects the parent-session el Gentleman orchestrator, auto-installs SDD assets non-destructively, registers commands, applies SDD model config, and blocks high-risk shell commands.
 - `extensions/sdd-init.ts` — registers `/sdd-init` to bootstrap `openspec/config.yaml`.
 - `extensions/skill-registry.ts` — registers `/skill-registry:refresh` and maintains `.atl/skill-registry.md` from compact skill rules.
 - `skills/gentle-ai` — compact rules for Gentle AI orchestration.
@@ -36,11 +36,14 @@ Useful diagnostics/recovery commands:
 
 ```text
 /gentle-ai:status
+/gentleman:models
 /sdd-init
 /gentle-ai:install-sdd --force
 ```
 
 `/gentle-ai:install-sdd` is a recovery command. The normal path is automatic. It copies SDD agents to `.pi/agents/` and chains to `.pi/chains/`; existing files are skipped unless `--force` is passed.
+
+`/gentleman:models` opens interactive selectors for per-phase SDD agent models, writes `.pi/gentle-ai/models.json`, and applies `model:` frontmatter to `.pi/agents/sdd-*.md`. Use `Inherit active/default model` to remove a phase override.
 
 ## Optional companion packages
 
