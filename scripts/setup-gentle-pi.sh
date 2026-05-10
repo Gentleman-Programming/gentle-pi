@@ -160,6 +160,38 @@ echo "Installing global MCP config to ${GLOBAL_MCP_CONFIG}..."
 mkdir -p "${AGENT_DIR}"
 install -m 0644 "${MCP_CONFIG}" "${GLOBAL_MCP_CONFIG}"
 
+GLOBAL_SETTINGS="${AGENT_DIR}/settings.json"
+echo "Ensuring pi-mcp-adapter is registered in global settings (${GLOBAL_SETTINGS})..."
+GLOBAL_SETTINGS="${GLOBAL_SETTINGS}" node <<'NODE'
+const fs = require("fs");
+const path = process.env.GLOBAL_SETTINGS;
+const pkg = "npm:pi-mcp-adapter";
+let data = {};
+if (fs.existsSync(path)) {
+	try {
+		data = JSON.parse(fs.readFileSync(path, "utf-8"));
+	} catch (err) {
+		console.error(`Refusing to seed ${path}: existing file is not valid JSON (${err.message}).`);
+		console.error("Fix the file by hand or delete it and re-run the setup.");
+		process.exit(1);
+	}
+	if (typeof data !== "object" || data === null || Array.isArray(data)) {
+		console.error(`Refusing to seed ${path}: top-level value must be a JSON object.`);
+		process.exit(1);
+	}
+}
+if (!Array.isArray(data.packages)) {
+	data.packages = [];
+}
+if (data.packages.includes(pkg)) {
+	console.log(`${pkg} already declared in ${path}`);
+	process.exit(0);
+}
+data.packages.push(pkg);
+fs.writeFileSync(path, `${JSON.stringify(data, null, "\t")}\n`, "utf-8");
+console.log(`Added ${pkg} to ${path}`);
+NODE
+
 SHELL_NAME="$(detect_shell_name)"
 echo "Detected shell: ${SHELL_NAME}"
 install_shell_alias "${SHELL_NAME}" || true
