@@ -43,7 +43,7 @@ Useful diagnostics/recovery commands:
 
 `/gentle-ai:install-sdd` is a recovery command. The normal path is automatic. It copies SDD agents to `.pi/agents/` and chains to `.pi/chains/`; existing files are skipped unless `--force` is passed.
 
-`/gentleman:models` opens interactive selectors for per-phase SDD agent models, writes `.pi/gentle-ai/models.json`, and applies `model:` frontmatter to `.pi/agents/sdd-*.md`. Use `Inherit active/default model` to remove a phase override.
+`/gentleman:models` opens interactive selectors populated from Pi's available model registry, writes `.pi/gentle-ai/models.json`, and applies `model:` frontmatter to `.pi/agents/sdd-*.md`. Use `Inherit active/default model` to remove a phase override, or `Custom model id` for an explicit provider/model not listed by Pi.
 
 ## Optional companion packages
 

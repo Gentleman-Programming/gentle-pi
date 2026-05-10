@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
@@ -67,19 +67,11 @@ const SDD_AGENT_NAMES = [
 type SddAgentName = (typeof SDD_AGENT_NAMES)[number];
 type SddModelConfig = Partial<Record<SddAgentName, string>>;
 
-const MODEL_OPTIONS = [
-	"Keep current",
-	"Inherit active/default model",
-	"anthropic/claude-sonnet-4",
-	"google/gemini-3-pro",
-	"openai/gpt-5",
-	"openai/gpt-5-mini",
-	"Custom model id",
-] as const;
+const KEEP_CURRENT = "Keep current";
+const INHERIT_MODEL = "Inherit active/default model";
+const CUSTOM_MODEL = "Custom model id";
 
-const KEEP_CURRENT = MODEL_OPTIONS[0];
-const INHERIT_MODEL = MODEL_OPTIONS[1];
-const CUSTOM_MODEL = MODEL_OPTIONS[6];
+const MODEL_CONTROL_OPTIONS = [KEEP_CURRENT, INHERIT_MODEL, CUSTOM_MODEL] as const;
 
 function evaluateCommand(command: string): ToolCallEventResult | undefined {
 	for (const pattern of DENIED_BASH_PATTERNS) {
@@ -214,6 +206,14 @@ function describeModelConfig(config: SddModelConfig): string[] {
 	return SDD_AGENT_NAMES.map((name) => `${name}: ${config[name] ?? "inherit"}`);
 }
 
+async function getPiModelOptions(ctx: ExtensionContext): Promise<string[]> {
+	const models = await ctx.modelRegistry.getAvailable();
+	const modelIds = models
+		.map((model) => `${model.provider}/${model.id}`)
+		.sort((left, right) => left.localeCompare(right));
+	return [...MODEL_CONTROL_OPTIONS, ...modelIds];
+}
+
 export default function gentleAi(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
 		const result = installSddAssets(ctx.cwd, false);
@@ -254,9 +254,10 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		description: "Configure per-phase SDD agent models for el Gentleman.",
 		handler: async (_args, ctx) => {
 			const config = readModelConfig(ctx.cwd);
+			const modelOptions = await getPiModelOptions(ctx);
 			for (const name of SDD_AGENT_NAMES) {
 				const current = config[name] ?? "inherit";
-				const selected = await ctx.ui.select(`${name} model (current: ${current})`, [...MODEL_OPTIONS]);
+				const selected = await ctx.ui.select(`${name} model (current: ${current})`, modelOptions);
 				if (selected === undefined) return;
 				if (selected === KEEP_CURRENT) continue;
 				if (selected === INHERIT_MODEL) {
