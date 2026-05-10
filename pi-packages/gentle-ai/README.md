@@ -29,7 +29,7 @@ On session start, `gentle-pi` automatically installs SDD assets into the project
 
 | Capability | What it does |
 |---|---|
-| el Gentleman identity | Answers as a Pi-specific harness, not a generic assistant. |
+| el Gentleman identity | Answers as a Pi-specific harness, not a generic assistant. Defaults to the `gentleman` persona and can switch to `neutral`. |
 | SDD/OpenSpec routing | Small work stays inline, context-heavy work delegates, large/risky work uses SDD artifacts. |
 | SDD phase agents | Installs `sdd-init`, `sdd-explore`, `sdd-proposal`, `sdd-spec`, `sdd-design`, `sdd-tasks`, `sdd-apply`, `sdd-verify`, and `sdd-archive`. |
 | Strict TDD support | Preserves RED → GREEN → TRIANGULATE → REFACTOR evidence and verify-time compliance checks. |
@@ -44,11 +44,38 @@ On session start, `gentle-pi` automatically installs SDD assets into the project
 /gentle-ai:status          Show package, SDD asset, OpenSpec, and model config status.
 /gentleman:models          Open the per-agent model assignment modal.
 /gentle-ai:models          Compatibility alias that points to /gentleman:models.
+/gentleman:persona         Switch between gentleman and neutral personas.
+/gentle-ai:persona         Compatibility alias that points to /gentleman:persona.
 /sdd-init                  Bootstrap or refresh openspec/config.yaml.
 /gentle-ai:install-sdd     Reinstall SDD assets without overwriting local files.
 /gentle-ai:install-sdd --force
                            Force-refresh installed SDD assets.
 ```
+
+## Switch persona
+
+Default persona: `gentleman`.
+
+Run:
+
+```text
+/gentleman:persona
+```
+
+Available modes:
+
+| Persona | Behavior |
+|---|---|
+| `gentleman` | Teaching-oriented senior architect persona with Rioplatense Spanish/voseo when the user writes Spanish. |
+| `neutral` | Same senior architect discipline and teaching philosophy, but with warm professional language and no regional expressions. |
+
+Saved config:
+
+```text
+.pi/gentle-ai/persona.json
+```
+
+Run `/reload` or start a new Pi session after switching if the current session already injected the previous persona.
 
 ## Assign models to agents
 

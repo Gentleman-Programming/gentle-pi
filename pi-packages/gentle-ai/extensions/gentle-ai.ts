@@ -9,7 +9,30 @@ const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
 const ORCHESTRATOR_PROMPT = readFileSync(join(ASSETS_DIR, "orchestrator.md"), "utf8").trim();
 
-const GENTLE_AI_PROMPT = `## el Gentleman Identity and Harness
+type PersonaMode = "gentleman" | "neutral";
+
+const PERSONA_OPTIONS = ["gentleman", "neutral"] as const;
+
+const GENTLEMAN_PERSONA_PROMPT = `Persona:
+- Be direct, technical, and concise.
+- When the user writes Spanish, answer in natural Rioplatense Spanish with voseo.
+- Act as a senior architect and teacher: concepts before code, no shortcuts.
+- Treat AI as a tool directed by the human; never present yourself as a default chatbot.
+- Push back when the user asks for code without enough context or understanding.
+- Correct errors directly, explain why, and show the better path.`;
+
+const NEUTRAL_PERSONA_PROMPT = `Persona:
+- Be direct, technical, concise, warm, and professional.
+- Always respond in the same language the user writes in.
+- Do not use slang or regional expressions.
+- Act as a senior architect and teacher: concepts before code, no shortcuts.
+- Treat AI as a tool directed by the human; never present yourself as a default chatbot.
+- Push back when the user asks for code without enough context or understanding.
+- Correct errors directly, explain why, and show the better path.`;
+
+function buildGentlePrompt(persona: PersonaMode): string {
+	const personaPrompt = persona === "neutral" ? NEUTRAL_PERSONA_PROMPT : GENTLEMAN_PERSONA_PROMPT;
+	return `## el Gentleman Identity and Harness
 You are el Gentleman: a Pi-specific coding-agent harness for controlled development work.
 
 Identity contract:
@@ -19,11 +42,7 @@ Identity contract:
 - Mention memory only when memory packages or callable memory tools are actually active; never invent persistent memory.
 - Do not claim portability outside the Pi runtime.
 
-Persona:
-- Be direct, technical, and concise.
-- When the user writes Spanish, answer in natural Rioplatense Spanish with voseo.
-- Act as a senior architect and teacher: concepts before code, no shortcuts.
-- Treat AI as a tool directed by the human; never present yourself as a default chatbot.
+${personaPrompt}
 
 Harness principles:
 - el Gentleman is not prompt engineering. It is runtime discipline around powerful agents.
@@ -36,6 +55,7 @@ Harness principles:
 - Never claim persistent memory is available because of this package. Memory is provided by separate packages or MCP tools when installed and callable.
 
 ${ORCHESTRATOR_PROMPT}`;
+}
 
 const DENIED_BASH_PATTERNS: RegExp[] = [
 	/\brm\s+-rf\s+(?:\/|~|\$HOME|\.\.?)(?:\s|$)/,
@@ -148,6 +168,28 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function modelConfigPath(cwd: string): string {
 	return join(cwd, ".pi", "gentle-ai", "models.json");
+}
+
+function personaConfigPath(cwd: string): string {
+	return join(cwd, ".pi", "gentle-ai", "persona.json");
+}
+
+function readPersonaMode(cwd: string): PersonaMode {
+	const path = personaConfigPath(cwd);
+	if (!existsSync(path)) return "gentleman";
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+		if (!isRecord(parsed)) return "gentleman";
+		return parsed.mode === "neutral" ? "neutral" : "gentleman";
+	} catch {
+		return "gentleman";
+	}
+}
+
+function writePersonaMode(cwd: string, mode: PersonaMode): void {
+	const path = personaConfigPath(cwd);
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `${JSON.stringify({ mode }, null, 2)}\n`);
 }
 
 function readModelConfig(cwd: string): AgentModelConfig {
@@ -548,8 +590,8 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		}
 	});
 
-	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n${GENTLE_AI_PROMPT}`,
+	pi.on("before_agent_start", (event, ctx) => ({
+		systemPrompt: `${event.systemPrompt}\n\n${buildGentlePrompt(readPersonaMode(ctx.cwd))}`,
 	}));
 
 	pi.on("tool_call", (event) => {
@@ -613,6 +655,31 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerCommand("gentleman:persona", {
+		description: "Switch el Gentleman persona between gentleman and neutral.",
+		handler: async (_args, ctx) => {
+			const current = readPersonaMode(ctx.cwd);
+			const selected = await ctx.ui.select(`el Gentleman persona (current: ${current})`, [...PERSONA_OPTIONS]);
+			if (selected !== "gentleman" && selected !== "neutral") return;
+			writePersonaMode(ctx.cwd, selected);
+			ctx.ui.notify(
+				[
+					`el Gentleman persona set to: ${selected}`,
+					`Config: ${personaConfigPath(ctx.cwd)}`,
+					"Run /reload or start a new Pi session for already-injected prompts to refresh.",
+				].join("\n"),
+				"info",
+			);
+		},
+	});
+
+	pi.registerCommand("gentle-ai:persona", {
+		description: "Alias for /gentleman:persona.",
+		handler: async (_args, ctx) => {
+			ctx.ui.notify("Use /gentleman:persona to switch between gentleman and neutral personas.", "info");
+		},
+	});
+
 	pi.registerCommand("gentle-ai:status", {
 		description: "Show Gentle AI package status for this project.",
 		handler: async (_args, ctx) => {
@@ -623,6 +690,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 			ctx.ui.notify(
 				[
 					"el Gentleman package is active.",
+					`Persona: ${readPersonaMode(ctx.cwd)}`,
 					`SDD agents: ${agentsInstalled ? "installed" : "not installed"}`,
 					`SDD chains: ${chainsInstalled ? "installed" : "not installed"}`,
 					`OpenSpec config: ${openspecConfigured ? "present" : "missing"}`,
