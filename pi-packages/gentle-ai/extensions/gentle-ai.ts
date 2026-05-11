@@ -272,7 +272,7 @@ function listAgentFilesRecursive(dir: string): string[] {
 
 function listAgentsFromDir(dir: string, source: AgentSource): AgentEntry[] {
 	return listAgentFilesRecursive(dir)
-		.map((filePath) => {
+		.map((filePath): AgentEntry | undefined => {
 			const name = parseAgentName(filePath);
 			return name ? { name, source, filePath } : undefined;
 		})
@@ -590,6 +590,55 @@ async function showSddModelPanel(ctx: ExtensionContext, config: AgentModelConfig
 	});
 }
 
+async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
+	let config = readModelConfig(ctx.cwd);
+	let result = await showSddModelPanel(ctx, config);
+	while (result.type === "custom") {
+		const current = result.agent === "all" ? "inherit" : (config[result.agent] ?? "inherit");
+		const custom = await ctx.ui.input(
+			`${result.agent === "all" ? "all agents" : result.agent} custom model id`,
+			current === "inherit" ? "provider/model" : current,
+		);
+		if (custom === undefined) return;
+		const trimmed = custom.trim();
+		if (trimmed.length > 0) {
+			if (result.agent === "all") {
+				config = Object.fromEntries(listDiscoverableAgents(ctx.cwd).map((agent) => [agent.name, trimmed]));
+			} else {
+				config = { ...config, [result.agent]: trimmed };
+			}
+		}
+		result = await showSddModelPanel(ctx, config);
+	}
+	if (result.type !== "save") return;
+	writeModelConfig(ctx.cwd, result.config);
+	const applyResult = applyModelConfig(ctx.cwd, result.config);
+	ctx.ui.notify(
+		[
+			"el Gentleman model config saved.",
+			`Config: ${modelConfigPath(ctx.cwd)}`,
+			`Agents updated: ${applyResult.updated}`,
+			...describeModelConfig(ctx.cwd, result.config),
+		].join("\n"),
+		"info",
+	);
+}
+
+async function handlePersonaCommand(ctx: ExtensionContext): Promise<void> {
+	const current = readPersonaMode(ctx.cwd);
+	const selected = await ctx.ui.select(`el Gentleman persona (current: ${current})`, [...PERSONA_OPTIONS]);
+	if (selected !== "gentleman" && selected !== "neutral") return;
+	writePersonaMode(ctx.cwd, selected);
+	ctx.ui.notify(
+		[
+			`el Gentleman persona set to: ${selected}`,
+			`Config: ${personaConfigPath(ctx.cwd)}`,
+			"Run /reload or start a new Pi session for already-injected prompts to refresh.",
+		].join("\n"),
+		"info",
+	);
+}
+
 export default function gentleAi(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
 		const result = installSddAssets(ctx.cwd, false);
@@ -611,6 +660,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "bash") return undefined;
+		if (!isRecord(event.input) || typeof event.input.command !== "string") return undefined;
 		return confirmCommand(event.input.command, ctx);
 	});
 
@@ -626,72 +676,45 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.registerCommand("gentleman:models", {
+	pi.registerCommand("gentle:models", {
 		description: "Configure per-agent models for el Gentleman.",
 		handler: async (_args, ctx) => {
-			let config = readModelConfig(ctx.cwd);
-			let result = await showSddModelPanel(ctx, config);
-			while (result.type === "custom") {
-				const current = result.agent === "all" ? "inherit" : (config[result.agent] ?? "inherit");
-				const custom = await ctx.ui.input(
-					`${result.agent === "all" ? "all agents" : result.agent} custom model id`,
-					current === "inherit" ? "provider/model" : current,
-				);
-				if (custom === undefined) return;
-				const trimmed = custom.trim();
-				if (trimmed.length > 0) {
-					if (result.agent === "all") {
-						config = Object.fromEntries(listDiscoverableAgents(ctx.cwd).map((agent) => [agent.name, trimmed]));
-					} else {
-						config = { ...config, [result.agent]: trimmed };
-					}
-				}
-				result = await showSddModelPanel(ctx, config);
-			}
-			if (result.type !== "save") return;
-			writeModelConfig(ctx.cwd, result.config);
-			const applyResult = applyModelConfig(ctx.cwd, result.config);
-			ctx.ui.notify(
-				[
-					"el Gentleman model config saved.",
-					`Config: ${modelConfigPath(ctx.cwd)}`,
-					`Agents updated: ${applyResult.updated}`,
-					...describeModelConfig(ctx.cwd, result.config),
-				].join("\n"),
-				"info",
-			);
+			await handleModelsCommand(ctx);
 		},
 	});
 
 	pi.registerCommand("gentle-ai:models", {
-		description: "Alias for /gentleman:models.",
+		description: "Compatibility alias for /gentle:models.",
 		handler: async (_args, ctx) => {
-			ctx.ui.notify("Use /gentleman:models to configure per-agent models.", "info");
+			await handleModelsCommand(ctx);
 		},
 	});
 
-	pi.registerCommand("gentleman:persona", {
+	pi.registerCommand("gentleman:models", {
+		description: "Compatibility alias for /gentle:models.",
+		handler: async (_args, ctx) => {
+			await handleModelsCommand(ctx);
+		},
+	});
+
+	pi.registerCommand("gentle:persona", {
 		description: "Switch el Gentleman persona between gentleman and neutral.",
 		handler: async (_args, ctx) => {
-			const current = readPersonaMode(ctx.cwd);
-			const selected = await ctx.ui.select(`el Gentleman persona (current: ${current})`, [...PERSONA_OPTIONS]);
-			if (selected !== "gentleman" && selected !== "neutral") return;
-			writePersonaMode(ctx.cwd, selected);
-			ctx.ui.notify(
-				[
-					`el Gentleman persona set to: ${selected}`,
-					`Config: ${personaConfigPath(ctx.cwd)}`,
-					"Run /reload or start a new Pi session for already-injected prompts to refresh.",
-				].join("\n"),
-				"info",
-			);
+			await handlePersonaCommand(ctx);
 		},
 	});
 
 	pi.registerCommand("gentle-ai:persona", {
-		description: "Alias for /gentleman:persona.",
+		description: "Compatibility alias for /gentle:persona.",
 		handler: async (_args, ctx) => {
-			ctx.ui.notify("Use /gentleman:persona to switch between gentleman and neutral personas.", "info");
+			await handlePersonaCommand(ctx);
+		},
+	});
+
+	pi.registerCommand("gentleman:persona", {
+		description: "Compatibility alias for /gentle:persona.",
+		handler: async (_args, ctx) => {
+			await handlePersonaCommand(ctx);
 		},
 	});
 

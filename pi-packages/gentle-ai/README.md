@@ -27,25 +27,27 @@ On session start, `gentle-pi` automatically installs SDD assets into the project
 
 ## What you get
 
-| Capability | What it does |
-|---|---|
-| el Gentleman identity | Answers as a Pi-specific harness, not a generic assistant. Defaults to the `gentleman` persona and can switch to `neutral`. |
-| SDD/OpenSpec routing | Small work stays inline, context-heavy work delegates, large/risky work uses SDD artifacts. |
-| SDD phase agents | Installs `sdd-init`, `sdd-explore`, `sdd-proposal`, `sdd-spec`, `sdd-design`, `sdd-tasks`, `sdd-apply`, `sdd-verify`, and `sdd-archive`. |
-| Strict TDD support | Preserves RED → GREEN → TRIANGULATE → REFACTOR evidence and verify-time compliance checks. |
-| Review workload guard | Forecasts large diffs and recommends chained PRs or explicit `size:exception`. |
-| Model assignment UI | Opens a modal to assign Pi models to project, user, and built-in agents, with SDD agents shown first. |
-| Foundation skills | Adds PR, issue, chained-PR, comment, docs, work-unit, and Judgment Day skills. |
-| Safety policy | Blocks destructive shell actions unless there is explicit user approval. |
+| Capability            | What it does                                                                                                                             |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| el Gentleman identity | Answers as a Pi-specific harness, not a generic assistant. Defaults to the `gentleman` persona and can switch to `neutral`.              |
+| SDD/OpenSpec routing  | Small work stays inline, context-heavy work delegates, large/risky work uses SDD artifacts.                                              |
+| SDD phase agents      | Installs `sdd-init`, `sdd-explore`, `sdd-proposal`, `sdd-spec`, `sdd-design`, `sdd-tasks`, `sdd-apply`, `sdd-verify`, and `sdd-archive`. |
+| Strict TDD support    | Preserves RED → GREEN → TRIANGULATE → REFACTOR evidence and verify-time compliance checks.                                               |
+| Review workload guard | Forecasts large diffs and recommends chained PRs or explicit `size:exception`.                                                           |
+| Model assignment UI   | Opens a modal to assign Pi models to project, user, and built-in agents, with SDD agents shown first.                                    |
+| Foundation skills     | Adds PR, issue, chained-PR, comment, docs, work-unit, and Judgment Day skills.                                                           |
+| Safety policy         | Blocks destructive shell actions unless there is explicit user approval.                                                                 |
 
 ## Core commands
 
 ```text
 /gentle-ai:status          Show package, SDD asset, OpenSpec, and model config status.
-/gentleman:models          Open the per-agent model assignment modal.
-/gentle-ai:models          Compatibility alias that points to /gentleman:models.
-/gentleman:persona         Switch between gentleman and neutral personas.
-/gentle-ai:persona         Compatibility alias that points to /gentleman:persona.
+/gentle:models             Open the per-agent model assignment modal.
+/gentle-ai:models          Compatibility alias that points to /gentle:models.
+/gentleman:models          Compatibility alias that points to /gentle:models.
+/gentle:persona            Switch between gentleman and neutral personas.
+/gentle-ai:persona         Compatibility alias that points to /gentle:persona.
+/gentleman:persona         Compatibility alias that points to /gentle:persona.
 /sdd-init                  Bootstrap or refresh openspec/config.yaml.
 /gentle-ai:install-sdd     Reinstall SDD assets without overwriting local files.
 /gentle-ai:install-sdd --force
@@ -59,15 +61,15 @@ Default persona: `gentleman`.
 Run:
 
 ```text
-/gentleman:persona
+/gentle:persona
 ```
 
 Available modes:
 
-| Persona | Behavior |
-|---|---|
-| `gentleman` | Teaching-oriented senior architect persona with Rioplatense Spanish/voseo when the user writes Spanish. |
-| `neutral` | Same senior architect discipline and teaching philosophy, but with warm professional language and no regional expressions. |
+| Persona     | Behavior                                                                                                                   |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `gentleman` | Teaching-oriented senior architect persona with Rioplatense Spanish/voseo when the user writes Spanish.                    |
+| `neutral`   | Same senior architect discipline and teaching philosophy, but with warm professional language and no regional expressions. |
 
 Saved config:
 
@@ -82,7 +84,7 @@ Run `/reload` or start a new Pi session after switching if the current session a
 Run:
 
 ```text
-/gentleman:models
+/gentle:models
 ```
 
 This opens a modal similar to Gentle-AI's model picker. It discovers Pi subagents from project, user, and built-in sources, with SDD agents sorted first:
@@ -121,13 +123,13 @@ The modal covers:
 
 Small recommendation in English:
 
-| Agent kind | Recommended model shape |
-|---|---|
-| Exploration, proposal, archive | Fast and cheap is usually enough. |
-| Spec, design, tasks | Strong reasoning model, because these phases shape the implementation. |
-| Apply | Strong coding model with good tool-use reliability. |
-| Verify / review agents | Strongest fresh-context model you can afford; verification benefits from independence. |
-| Tiny utility agents | Inherit the active/default model unless they become a bottleneck. |
+| Agent kind                     | Recommended model shape                                                                |
+| ------------------------------ | -------------------------------------------------------------------------------------- |
+| Exploration, proposal, archive | Fast and cheap is usually enough.                                                      |
+| Spec, design, tasks            | Strong reasoning model, because these phases shape the implementation.                 |
+| Apply                          | Strong coding model with good tool-use reliability.                                    |
+| Verify / review agents         | Strongest fresh-context model you can afford; verification benefits from independence. |
+| Tiny utility agents            | Inherit the active/default model unless they become a bottleneck.                      |
 
 Saved config:
 
@@ -163,17 +165,17 @@ Existing files are skipped. Your local edits remain unless you explicitly run:
 
 ## Package contents
 
-| Path | Purpose |
-|---|---|
-| `extensions/gentle-ai.ts` | Injects el Gentleman, installs assets, provides commands, applies model config, blocks unsafe shell commands. |
-| `extensions/sdd-init.ts` | Registers `/sdd-init` for OpenSpec project initialization. |
-| `extensions/skill-registry.ts` | Registers `/skill-registry:refresh` and maintains `.atl/skill-registry.md`. |
-| `assets/orchestrator.md` | Parent-session orchestration contract. |
-| `assets/agents/` | SDD phase agents copied into `.pi/agents/`. |
-| `assets/chains/` | SDD chains copied into `.pi/chains/`. |
-| `assets/support/` | Strict TDD apply/verify support docs. |
-| `skills/` | el Gentleman and foundation skills. |
-| `prompts/` | Gentle-prefixed prompt templates: `/gcl`, `/gis`, `/gpr`, `/gwr`. |
+| Path                           | Purpose                                                                                                       |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `extensions/gentle-ai.ts`      | Injects el Gentleman, installs assets, provides commands, applies model config, blocks unsafe shell commands. |
+| `extensions/sdd-init.ts`       | Registers `/sdd-init` for OpenSpec project initialization.                                                    |
+| `extensions/skill-registry.ts` | Registers `/skill-registry:refresh` and maintains `.atl/skill-registry.md`.                                   |
+| `assets/orchestrator.md`       | Parent-session orchestration contract.                                                                        |
+| `assets/agents/`               | SDD phase agents copied into `.pi/agents/`.                                                                   |
+| `assets/chains/`               | SDD chains copied into `.pi/chains/`.                                                                         |
+| `assets/support/`              | Strict TDD apply/verify support docs.                                                                         |
+| `skills/`                      | el Gentleman and foundation skills.                                                                           |
+| `prompts/`                     | Gentle-prefixed prompt templates: `/gcl`, `/gis`, `/gpr`, `/gwr`.                                             |
 
 ## Foundation skills
 
