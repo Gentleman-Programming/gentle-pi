@@ -1,13 +1,26 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionContext, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	ToolCallEventResult,
+} from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
-const ORCHESTRATOR_PROMPT = readFileSync(join(ASSETS_DIR, "orchestrator.md"), "utf8").trim();
+const ORCHESTRATOR_PROMPT = readFileSync(
+	join(ASSETS_DIR, "orchestrator.md"),
+	"utf8",
+).trim();
 
 type PersonaMode = "gentleman" | "neutral";
 
@@ -31,7 +44,8 @@ const NEUTRAL_PERSONA_PROMPT = `Persona:
 - Correct errors directly, explain why, and show the better path.`;
 
 function buildGentlePrompt(persona: PersonaMode): string {
-	const personaPrompt = persona === "neutral" ? NEUTRAL_PERSONA_PROMPT : GENTLEMAN_PERSONA_PROMPT;
+	const personaPrompt =
+		persona === "neutral" ? NEUTRAL_PERSONA_PROMPT : GENTLEMAN_PERSONA_PROMPT;
 	return `## el Gentleman Identity and Harness
 You are el Gentleman: a Pi-specific coding-agent harness for controlled development work.
 
@@ -100,14 +114,21 @@ const KEEP_CURRENT = "Keep current";
 const INHERIT_MODEL = "Inherit active/default model";
 const CUSTOM_MODEL = "Custom model id";
 
-const MODEL_CONTROL_OPTIONS = [KEEP_CURRENT, INHERIT_MODEL, CUSTOM_MODEL] as const;
+const MODEL_CONTROL_OPTIONS = [
+	KEEP_CURRENT,
+	INHERIT_MODEL,
+	CUSTOM_MODEL,
+] as const;
 
-function evaluateDeniedCommand(command: string): ToolCallEventResult | undefined {
+function evaluateDeniedCommand(
+	command: string,
+): ToolCallEventResult | undefined {
 	for (const pattern of DENIED_BASH_PATTERNS) {
 		if (pattern.test(command)) {
 			return {
 				block: true,
-				reason: "Gentle AI safety policy blocked a destructive shell command. Ask the user for an explicit safer plan.",
+				reason:
+					"Gentle AI safety policy blocked a destructive shell command. Ask the user for an explicit safer plan.",
 			};
 		}
 	}
@@ -118,26 +139,39 @@ function commandRequiresConfirmation(command: string): boolean {
 	return CONFIRM_BASH_PATTERNS.some((pattern) => pattern.test(command));
 }
 
-async function confirmCommand(command: string, ctx: ExtensionContext): Promise<ToolCallEventResult | undefined> {
+async function confirmCommand(
+	command: string,
+	ctx: ExtensionContext,
+): Promise<ToolCallEventResult | undefined> {
 	const denied = evaluateDeniedCommand(command);
 	if (denied) return denied;
 	if (!commandRequiresConfirmation(command)) return undefined;
 	if (!ctx.hasUI) {
 		return {
 			block: true,
-			reason: "Gentle AI safety policy requires interactive confirmation before this command.",
+			reason:
+				"Gentle AI safety policy requires interactive confirmation before this command.",
 		};
 	}
-	const preview = truncateToWidth(command.replace(/\s+/g, " ").trim(), 180, "…");
+	const preview = truncateToWidth(
+		command.replace(/\s+/g, " ").trim(),
+		180,
+		"…",
+	);
 	const approved = await ctx.ui.confirm("Allow guarded command?", preview);
 	if (approved) return undefined;
 	return {
 		block: true,
-		reason: "Gentle AI safety policy blocked the command because it was not confirmed.",
+		reason:
+			"Gentle AI safety policy blocked the command because it was not confirmed.",
 	};
 }
 
-function copyDirectoryFiles(sourceDir: string, targetDir: string, force: boolean): { copied: number; skipped: number } {
+function copyDirectoryFiles(
+	sourceDir: string,
+	targetDir: string,
+	force: boolean,
+): { copied: number; skipped: number } {
 	if (!existsSync(sourceDir)) return { copied: 0, skipped: 0 };
 	mkdirSync(targetDir, { recursive: true });
 	let copied = 0;
@@ -166,9 +200,21 @@ function installSddAssets(
 	cwd: string,
 	force: boolean,
 ): { agents: number; chains: number; support: number; skipped: number } {
-	const agents = copyDirectoryFiles(join(ASSETS_DIR, "agents"), join(cwd, ".pi", "agents"), force);
-	const chains = copyDirectoryFiles(join(ASSETS_DIR, "chains"), join(cwd, ".pi", "chains"), force);
-	const support = copyDirectoryFiles(join(ASSETS_DIR, "support"), join(cwd, ".pi", "gentle-ai", "support"), force);
+	const agents = copyDirectoryFiles(
+		join(ASSETS_DIR, "agents"),
+		join(cwd, ".pi", "agents"),
+		force,
+	);
+	const chains = copyDirectoryFiles(
+		join(ASSETS_DIR, "chains"),
+		join(cwd, ".pi", "chains"),
+		force,
+	);
+	const support = copyDirectoryFiles(
+		join(ASSETS_DIR, "support"),
+		join(cwd, ".pi", "gentle-ai", "support"),
+		force,
+	);
 	return {
 		agents: agents.copied,
 		chains: chains.copied,
@@ -231,16 +277,24 @@ function writeModelConfig(cwd: string, config: AgentModelConfig): void {
 	writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
 }
 
-function updateFrontmatterModel(content: string, model: string | undefined): string {
+function updateFrontmatterModel(
+	content: string,
+	model: string | undefined,
+): string {
 	if (!content.startsWith("---\n")) return content;
 	const endIndex = content.indexOf("\n---", 4);
 	if (endIndex === -1) return content;
 	const frontmatter = content.slice(4, endIndex);
 	const body = content.slice(endIndex);
-	const lines = frontmatter.split("\n").filter((line) => !line.startsWith("model:"));
+	const lines = frontmatter
+		.split("\n")
+		.filter((line) => !line.startsWith("model:"));
 	if (model !== undefined) {
-		const descriptionIndex = lines.findIndex((line) => line.startsWith("description:"));
-		const insertIndex = descriptionIndex >= 0 ? descriptionIndex + 1 : Math.min(1, lines.length);
+		const descriptionIndex = lines.findIndex((line) =>
+			line.startsWith("description:"),
+		);
+		const insertIndex =
+			descriptionIndex >= 0 ? descriptionIndex + 1 : Math.min(1, lines.length);
 		lines.splice(insertIndex, 0, `model: ${model}`);
 	}
 	return `---\n${lines.join("\n")}${body}`;
@@ -255,7 +309,9 @@ function parseAgentName(filePath: string): string | undefined {
 	}
 	const name = content.match(/^name:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1]?.trim();
 	if (!name) return undefined;
-	const packageName = content.match(/^package:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1]?.trim();
+	const packageName = content
+		.match(/^package:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1]
+		?.trim();
 	return packageName ? `${packageName}.${name}` : name;
 }
 
@@ -265,7 +321,12 @@ function listAgentFilesRecursive(dir: string): string[] {
 	for (const entry of readdirSync(dir, { withFileTypes: true })) {
 		const path = join(dir, entry.name);
 		if (entry.isDirectory()) files.push(...listAgentFilesRecursive(path));
-		else if (entry.isFile() && entry.name.endsWith(".md") && !entry.name.endsWith(".chain.md")) files.push(path);
+		else if (
+			entry.isFile() &&
+			entry.name.endsWith(".md") &&
+			!entry.name.endsWith(".chain.md")
+		)
+			files.push(path);
 	}
 	return files;
 }
@@ -295,9 +356,9 @@ function listDiscoverableAgents(cwd: string): AgentEntry[] {
 	const byName = new Map<string, AgentEntry>();
 	for (const agent of agents) byName.set(agent.name, agent);
 	const discovered = Array.from(byName.values());
-	const sddFirst = SDD_AGENT_NAMES
-		.map((name) => discovered.find((agent) => agent.name === name))
-		.filter((agent): agent is AgentEntry => agent !== undefined);
+	const sddFirst = SDD_AGENT_NAMES.map((name) =>
+		discovered.find((agent) => agent.name === name),
+	).filter((agent): agent is AgentEntry => agent !== undefined);
 	const rest = discovered
 		.filter((agent) => !SDD_AGENT_NAMES.includes(agent.name as SddAgentName))
 		.sort((left, right) => left.name.localeCompare(right.name));
@@ -308,7 +369,11 @@ function projectSettingsPath(cwd: string): string {
 	return join(cwd, ".pi", "settings.json");
 }
 
-function updateBuiltinModelOverride(cwd: string, name: string, model: string | undefined): boolean {
+function updateBuiltinModelOverride(
+	cwd: string,
+	name: string,
+	model: string | undefined,
+): boolean {
 	const path = projectSettingsPath(cwd);
 	let settings: Record<string, unknown> = {};
 	if (existsSync(path)) {
@@ -319,14 +384,21 @@ function updateBuiltinModelOverride(cwd: string, name: string, model: string | u
 			settings = {};
 		}
 	}
-	const subagents = isRecord(settings.subagents) ? { ...settings.subagents } : {};
-	const agentOverrides = isRecord(subagents.agentOverrides) ? { ...subagents.agentOverrides } : {};
-	const current = isRecord(agentOverrides[name]) ? { ...agentOverrides[name] } : {};
+	const subagents = isRecord(settings.subagents)
+		? { ...settings.subagents }
+		: {};
+	const agentOverrides = isRecord(subagents.agentOverrides)
+		? { ...subagents.agentOverrides }
+		: {};
+	const current = isRecord(agentOverrides[name])
+		? { ...agentOverrides[name] }
+		: {};
 	if (model === undefined) delete current.model;
 	else current.model = model;
 	if (Object.keys(current).length > 0) agentOverrides[name] = current;
 	else delete agentOverrides[name];
-	if (Object.keys(agentOverrides).length > 0) subagents.agentOverrides = agentOverrides;
+	if (Object.keys(agentOverrides).length > 0)
+		subagents.agentOverrides = agentOverrides;
 	else delete subagents.agentOverrides;
 	if (Object.keys(subagents).length > 0) settings.subagents = subagents;
 	else delete settings.subagents;
@@ -335,7 +407,10 @@ function updateBuiltinModelOverride(cwd: string, name: string, model: string | u
 	return true;
 }
 
-function applyModelConfig(cwd: string, config: AgentModelConfig): { updated: number; skipped: number } {
+function applyModelConfig(
+	cwd: string,
+	config: AgentModelConfig,
+): { updated: number; skipped: number } {
 	let updated = 0;
 	let skipped = 0;
 	for (const agent of listDiscoverableAgents(cwd)) {
@@ -362,7 +437,9 @@ function applyModelConfig(cwd: string, config: AgentModelConfig): { updated: num
 }
 
 function describeModelConfig(cwd: string, config: AgentModelConfig): string[] {
-	return listDiscoverableAgents(cwd).map((agent) => `${agent.name}: ${config[agent.name] ?? "inherit"}`);
+	return listDiscoverableAgents(cwd).map(
+		(agent) => `${agent.name}: ${config[agent.name] ?? "inherit"}`,
+	);
 }
 
 async function getPiModelOptions(ctx: ExtensionContext): Promise<string[]> {
@@ -416,7 +493,9 @@ class SddModelPanel implements OverlayComponent {
 	}
 
 	render(width: number): string[] {
-		return this.mode === "models" ? this.renderModelPicker(width) : this.renderAgentList(width);
+		return this.mode === "models"
+			? this.renderModelPicker(width)
+			: this.renderAgentList(width);
 	}
 
 	private handleAgentInput(data: string): void {
@@ -475,11 +554,17 @@ class SddModelPanel implements OverlayComponent {
 		}
 		if (matchesKey(data, "backspace")) {
 			this.query = this.query.slice(0, -1);
-			this.modelCursor = Math.min(this.modelCursor, Math.max(0, this.filteredModelOptions().length - 1));
+			this.modelCursor = Math.min(
+				this.modelCursor,
+				Math.max(0, this.filteredModelOptions().length - 1),
+			);
 			return;
 		}
 		if (matchesKey(data, "down") || data === "j") {
-			this.modelCursor = Math.min(Math.max(0, options.length - 1), this.modelCursor + 1);
+			this.modelCursor = Math.min(
+				Math.max(0, options.length - 1),
+				this.modelCursor + 1,
+			);
 			return;
 		}
 		if (matchesKey(data, "up") || data === "k") {
@@ -490,7 +575,10 @@ class SddModelPanel implements OverlayComponent {
 			const selected = options[this.modelCursor];
 			if (!selected) return;
 			if (selected === CUSTOM_MODEL) {
-				this.done({ type: "custom", agent: this.selectedRow === SET_ALL_AGENTS ? "all" : this.selectedRow });
+				this.done({
+					type: "custom",
+					agent: this.selectedRow === SET_ALL_AGENTS ? "all" : this.selectedRow,
+				});
 				return;
 			}
 			if (selected === KEEP_CURRENT) {
@@ -524,12 +612,15 @@ class SddModelPanel implements OverlayComponent {
 	private filteredModelOptions(): string[] {
 		const query = this.query.trim().toLowerCase();
 		if (!query) return this.modelOptions;
-		return this.modelOptions.filter((option) => option.toLowerCase().includes(query));
+		return this.modelOptions.filter((option) =>
+			option.toLowerCase().includes(query),
+		);
 	}
 
 	private renderAgentList(width: number): string[] {
 		const lines: string[] = [];
-		const line = (text = "") => truncateToWidth(text, Math.max(1, width), "…", true);
+		const line = (text = "") =>
+			truncateToWidth(text, Math.max(1, width), "…", true);
 		lines.push(line("Assign Models to Agents"));
 		lines.push("");
 		lines.push(line("Current assignments:"));
@@ -537,27 +628,45 @@ class SddModelPanel implements OverlayComponent {
 		for (let i = 0; i < this.rows.length; i++) {
 			const row = this.rows[i] ?? SET_ALL_AGENTS;
 			const focused = i === this.cursor;
-			const label = row === SET_ALL_AGENTS ? this.renderSetAllLabel(row) : this.renderAgentLabel(row);
+			const label =
+				row === SET_ALL_AGENTS
+					? this.renderSetAllLabel(row)
+					: this.renderAgentLabel(row);
 			lines.push(line(`${focused ? "▸" : " "} ${label}`));
 		}
 		lines.push("");
-		lines.push(line(`${this.cursor === this.rows.length ? "▸" : " "} Continue`));
-		lines.push(line(`${this.cursor === this.rows.length + 1 ? "▸" : " "} ← Back`));
+		lines.push(
+			line(`${this.cursor === this.rows.length ? "▸" : " "} Continue`),
+		);
+		lines.push(
+			line(`${this.cursor === this.rows.length + 1 ? "▸" : " "} ← Back`),
+		);
 		lines.push("");
-		lines.push(line("j/k: navigate • enter: change model / confirm • i: inherit • c: custom • ctrl+s: save • esc: back"));
+		lines.push(
+			line(
+				"j/k: navigate • enter: change model / confirm • i: inherit • c: custom • ctrl+s: save • esc: back",
+			),
+		);
 		return lines;
 	}
 
 	private renderModelPicker(width: number): string[] {
 		const lines: string[] = [];
 		const options = this.filteredModelOptions();
-		const line = (text = "") => truncateToWidth(text, Math.max(1, width), "…", true);
+		const line = (text = "") =>
+			truncateToWidth(text, Math.max(1, width), "…", true);
 		lines.push(line(`Select model for ${this.selectedRow}`));
 		lines.push("");
 		lines.push(line(`◎ ${this.query || "search..."}`));
 		lines.push("");
 		const maxVisible = 12;
-		const start = Math.max(0, Math.min(this.modelCursor - Math.floor(maxVisible / 2), Math.max(0, options.length - maxVisible)));
+		const start = Math.max(
+			0,
+			Math.min(
+				this.modelCursor - Math.floor(maxVisible / 2),
+				Math.max(0, options.length - maxVisible),
+			),
+		);
 		const end = Math.min(options.length, start + maxVisible);
 		for (let i = start; i < end; i++) {
 			const focused = i === this.modelCursor;
@@ -565,12 +674,16 @@ class SddModelPanel implements OverlayComponent {
 		}
 		if (options.length === 0) lines.push(line("  No matching models"));
 		lines.push("");
-		lines.push(line("j/k: navigate • type: search • enter: select • esc: back"));
+		lines.push(
+			line("j/k: navigate • type: search • enter: select • esc: back"),
+		);
 		return lines;
 	}
 
 	private renderSetAllLabel(row: string): string {
-		const values = this.rows.slice(1).map((name) => this.draft[name] ?? "inherit");
+		const values = this.rows
+			.slice(1)
+			.map((name) => this.draft[name] ?? "inherit");
 		const first = values[0] ?? "inherit";
 		const allSame = values.every((value) => value === first);
 		return `${row.padEnd(20)} ${allSame ? first : "mixed"}`;
@@ -581,20 +694,33 @@ class SddModelPanel implements OverlayComponent {
 	}
 }
 
-async function showSddModelPanel(ctx: ExtensionContext, config: AgentModelConfig): Promise<ModelPanelResult> {
+async function showSddModelPanel(
+	ctx: ExtensionContext,
+	config: AgentModelConfig,
+): Promise<ModelPanelResult> {
 	const modelOptions = await getPiModelOptions(ctx);
 	const agents = listDiscoverableAgents(ctx.cwd).map((agent) => agent.name);
-	return ctx.ui.custom<ModelPanelResult>((_tui, _theme, _keybindings, done) => new SddModelPanel(config, modelOptions, agents, done), {
-		overlay: true,
-		overlayOptions: { anchor: "center", width: "70%", minWidth: 72, maxHeight: "85%" },
-	});
+	return ctx.ui.custom<ModelPanelResult>(
+		(_tui, _theme, _keybindings, done) =>
+			new SddModelPanel(config, modelOptions, agents, done),
+		{
+			overlay: true,
+			overlayOptions: {
+				anchor: "center",
+				width: "70%",
+				minWidth: 72,
+				maxHeight: "85%",
+			},
+		},
+	);
 }
 
 async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
 	let config = readModelConfig(ctx.cwd);
 	let result = await showSddModelPanel(ctx, config);
 	while (result.type === "custom") {
-		const current = result.agent === "all" ? "inherit" : (config[result.agent] ?? "inherit");
+		const current =
+			result.agent === "all" ? "inherit" : (config[result.agent] ?? "inherit");
 		const custom = await ctx.ui.input(
 			`${result.agent === "all" ? "all agents" : result.agent} custom model id`,
 			current === "inherit" ? "provider/model" : current,
@@ -603,7 +729,9 @@ async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
 		const trimmed = custom.trim();
 		if (trimmed.length > 0) {
 			if (result.agent === "all") {
-				config = Object.fromEntries(listDiscoverableAgents(ctx.cwd).map((agent) => [agent.name, trimmed]));
+				config = Object.fromEntries(
+					listDiscoverableAgents(ctx.cwd).map((agent) => [agent.name, trimmed]),
+				);
 			} else {
 				config = { ...config, [result.agent]: trimmed };
 			}
@@ -626,7 +754,10 @@ async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
 
 async function handlePersonaCommand(ctx: ExtensionContext): Promise<void> {
 	const current = readPersonaMode(ctx.cwd);
-	const selected = await ctx.ui.select(`el Gentleman persona (current: ${current})`, [...PERSONA_OPTIONS]);
+	const selected = await ctx.ui.select(
+		`el Gentleman persona (current: ${current})`,
+		[...PERSONA_OPTIONS],
+	);
 	if (selected !== "gentleman" && selected !== "neutral") return;
 	writePersonaMode(ctx.cwd, selected);
 	ctx.ui.notify(
@@ -643,14 +774,20 @@ export default function gentleAi(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
 		const result = installSddAssets(ctx.cwd, false);
 		const modelResult = applyModelConfig(ctx.cwd, readModelConfig(ctx.cwd));
-		if (ctx.hasUI && (result.agents > 0 || result.chains > 0 || result.support > 0)) {
+		if (
+			ctx.hasUI &&
+			(result.agents > 0 || result.chains > 0 || result.support > 0)
+		) {
 			ctx.ui.notify(
 				`Gentle AI SDD assets auto-installed: ${result.agents} agent(s), ${result.chains} chain(s), ${result.support} support file(s).`,
 				"info",
 			);
 		}
 		if (ctx.hasUI && modelResult.updated > 0) {
-			ctx.ui.notify(`el Gentleman applied SDD model config to ${modelResult.updated} agent(s).`, "info");
+			ctx.ui.notify(
+				`el Gentleman applied SDD model config to ${modelResult.updated} agent(s).`,
+				"info",
+			);
 		}
 	});
 
@@ -660,12 +797,14 @@ export default function gentleAi(pi: ExtensionAPI): void {
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "bash") return undefined;
-		if (!isRecord(event.input) || typeof event.input.command !== "string") return undefined;
+		if (!isRecord(event.input) || typeof event.input.command !== "string")
+			return undefined;
 		return confirmCommand(event.input.command, ctx);
 	});
 
 	pi.registerCommand("gentle-ai:install-sdd", {
-		description: "Install Gentle AI SDD subagent and chain assets into this project.",
+		description:
+			"Install Gentle AI SDD subagent and chain assets into this project.",
 		handler: async (args, ctx) => {
 			const force = args.includes("--force");
 			const result = installSddAssets(ctx.cwd, force);
@@ -721,9 +860,15 @@ export default function gentleAi(pi: ExtensionAPI): void {
 	pi.registerCommand("gentle-ai:status", {
 		description: "Show Gentle AI package status for this project.",
 		handler: async (_args, ctx) => {
-			const agentsInstalled = existsSync(join(ctx.cwd, ".pi", "agents", "sdd-apply.md"));
-			const chainsInstalled = existsSync(join(ctx.cwd, ".pi", "chains", "sdd-full.chain.md"));
-			const openspecConfigured = existsSync(join(ctx.cwd, "openspec", "config.yaml"));
+			const agentsInstalled = existsSync(
+				join(ctx.cwd, ".pi", "agents", "sdd-apply.md"),
+			);
+			const chainsInstalled = existsSync(
+				join(ctx.cwd, ".pi", "chains", "sdd-full.chain.md"),
+			);
+			const openspecConfigured = existsSync(
+				join(ctx.cwd, "openspec", "config.yaml"),
+			);
 			const modelConfig = readModelConfig(ctx.cwd);
 			ctx.ui.notify(
 				[
