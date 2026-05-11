@@ -1,141 +1,132 @@
 # gentle-pi
 
-`gentle-pi` instala **el Gentleman** en Pi: un harness de desarrollo controlado para que el agente deje de ser un chat genérico y empiece a trabajar con disciplina de arquitectura, SDD/OpenSpec, subagentes, evidencia de TDD y cuidado real del reviewer.
+[![npm](https://img.shields.io/npm/v/gentle-pi?color=blue)](https://www.npmjs.com/package/gentle-pi)
+[![pi package](https://img.shields.io/badge/Pi-package-6f42c1)](https://pi.dev/packages/gentle-pi)
+[![license](https://img.shields.io/npm/l/gentle-pi?color=blue)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/Gentleman-Programming/gentle-pi?style=flat&color=yellow)](https://github.com/Gentleman-Programming/gentle-pi/stargazers)
+[![Gentle-AI](https://img.shields.io/badge/Gentle--AI-ecosystem-ff69b4)](https://github.com/Gentleman-Programming/gentle-ai)
+[![Gentleman Programming](https://img.shields.io/badge/by-Gentleman%20Programming-black)](https://github.com/Gentleman-Programming)
+[![YouTube](https://img.shields.io/badge/YouTube-Gentleman%20Programming-red?logo=youtube&logoColor=white)](https://www.youtube.com/c/GentlemanProgramming)
+[![Discord](https://img.shields.io/badge/Discord-community-5865F2?logo=discord&logoColor=white)](https://discord.com/invite/gentleman-programming-769863833996754944)
+[![SDD/OpenSpec](https://img.shields.io/badge/SDD-OpenSpec-00ADD8)](#sddopenspec-flow)
+[![Subagents](https://img.shields.io/badge/Pi-subagents-brightgreen)](#what-it-adds)
 
-La idea es simple: Pi ya tiene herramientas poderosas; `gentle-pi` agrega criterio operativo para usarlas bien.
+**Turn Pi from a powerful coding agent into a controlled development harness.**
 
-## Instalación
+`gentle-pi` installs **el Gentleman** in Pi: a senior-architect operating layer for Spec-Driven Development, focused subagents, strict TDD evidence, reviewable work units, safety guards, and project/user skill discovery.
+
+Pi already has strong tools. `gentle-pi` adds the discipline for using them well.
+
+`gentle-pi` is the Pi-native package from the [Gentle-AI ecosystem](https://github.com/Gentleman-Programming/gentle-ai), built by [Gentleman Programming](https://github.com/Gentleman-Programming): the broader open-source project for turning AI coding agents into disciplined engineering environments with SDD workflows, skills, memory integrations, model routing, and review guardrails across multiple agents.
+
+Follow the project and the community around it:
+
+- GitHub: [Gentleman-Programming](https://github.com/Gentleman-Programming)
+- YouTube: [Gentleman Programming](https://www.youtube.com/c/GentlemanProgramming)
+- Community Discord: [Gentleman Programming](https://discord.com/invite/gentleman-programming-769863833996754944)
+
+## The problem
+
+Most coding-agent sessions fail for operational reasons, not model reasons:
+
+- the agent jumps into code before requirements are clear;
+- architectural decisions disappear into chat history;
+- one request quietly becomes a huge multi-area diff;
+- tests run late, or not at all;
+- reviewers get handed a wall of changes;
+- subagents are available, but the parent session has no orchestration discipline;
+- project skills exist, but the model forgets to load them.
+
+`gentle-pi` fixes the workflow around the agent.
+
+## What it adds
+
+| Capability                     | What it does                                                                                                                         |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| **el Gentleman persona**       | Makes Pi behave like a senior architect and teacher, not a generic chatbot. Spanish responses use Rioplatense voseo by default.      |
+| **Work routing discipline**    | Small tasks stay inline. Context-heavy exploration can be delegated. Large or risky changes go through SDD/OpenSpec.                 |
+| **SDD/OpenSpec assets**        | Installs phase agents and chains for `init`, `explore`, `proposal`, `spec`, `design`, `tasks`, `apply`, `verify`, and `archive`.     |
+| **Subagent orchestration**     | Keeps one parent session responsible while child agents explore, implement, test, or review with focused context.                    |
+| **Strict TDD support**         | When project config declares a test command, apply/verify phases must record RED → GREEN → TRIANGULATE → REFACTOR evidence.          |
+| **Reviewer protection**        | Surfaces review workload risk before a task turns into an oversized PR.                                                              |
+| **Per-agent model assignment** | Pi-native modal for assigning stronger or cheaper models to specific SDD/custom agents.                                              |
+| **Skill discovery registry**   | Maintains `.atl/skill-registry.md` from project and user skills so review/comment/PR workflows do not silently miss the right skill. |
+| **Delivery skills**            | Includes issue-first PRs, chained PRs, work-unit commits, cognitive docs, comment writing, and Judgment Day review.                  |
+| **Shell safety**               | Blocks destructive shell commands and asks for confirmation for sensitive operations.                                                |
+
+## Install
 
 ```bash
 pi install npm:gentle-pi
 ```
 
-Paquetes compañeros recomendados:
+Recommended companion packages:
 
 ```bash
 pi install npm:pi-subagents
 pi install npm:pi-intercom
+pi install npm:gentle-engram
+pi install npm:pi-web-access
+pi install npm:pi-lens
+pi install npm:@juicesharp/rpiv-todo
+pi install npm:@juicesharp/rpiv-ask-user-question
 ```
 
-Después iniciá Pi dentro de tu proyecto:
+Then start Pi in a project:
 
 ```bash
 pi
 ```
 
-En cada sesión, `gentle-pi` instala o refresca assets SDD del proyecto sin pisar cambios locales.
+On session start, `gentle-pi` installs local SDD assets without overwriting your edits.
 
-## Qué hacemos
-
-`gentle-pi` configura Pi para trabajar como **el Gentleman**:
-
-- piensa como arquitecto senior, no como chatbot;
-- separa trabajo chico, trabajo delegable y trabajo que necesita SDD;
-- usa artifacts de fase en vez de depender solo del contexto flotante del chat;
-- coordina subagentes cuando conviene reducir contexto o revisar con independencia;
-- protege el tamaño de los cambios para no quemar al reviewer;
-- aplica política de seguridad contra comandos destructivos;
-- deja comandos y UI para asignar modelos por agente.
-
-## Hermosuras que agrega
-
-| Hermosura | Qué aporta |
-|---|---|
-| Identidad el Gentleman | Responde como harness específico de Pi, con persona de arquitecto senior. En español usa voseo rioplatense. |
-| Routing de trabajo | Trabajo chico queda inline; exploración pesada se delega; cambios grandes van por SDD/OpenSpec. |
-| SDD/OpenSpec | Instala agentes y chains para `init`, `explore`, `proposal`, `spec`, `design`, `tasks`, `apply`, `verify` y `archive`. |
-| Subagentes listos | Deja assets para que Pi pueda ejecutar fases con contexto enfocado. |
-| Strict TDD | Incluye soporte para RED → GREEN → TRIANGULATE → REFACTOR cuando el proyecto declara TDD estricto. |
-| Guard de review | Detecta riesgo de PRs grandes y empuja a dividir trabajo antes de saturar al reviewer. |
-| Asignación de modelos | Modal para elegir modelos por agente: SDD primero, custom agents después. |
-| Skills de delivery | Incluye skills para PRs, issues, commits por unidad, chained PRs, documentación cognitiva, comments y Judgment Day. |
-| Prompts cortos | Agrega templates `/gcl`, `/gis`, `/gpr`, `/gwr` para flujos frecuentes. |
-| Seguridad de shell | Bloquea comandos destructivos y pide confirmación para operaciones sensibles. |
-
-## Comandos principales
+## Quick start
 
 ```text
-/gentle-ai:status          Muestra estado del paquete, assets SDD, OpenSpec y modelos.
-/gentle:models             Abre el modal de asignación de modelos por agente.
-/gentle:persona            Cambia entre persona gentleman y neutral.
-/sdd-init                  Inicializa o refresca openspec/config.yaml.
-/gentle-ai:install-sdd     Reinstala assets SDD sin pisar archivos existentes.
-/gentle-ai:install-sdd --force
-                           Fuerza el refresco de assets SDD instalados.
+/gentle-ai:status      Check package, SDD assets, OpenSpec, and model config.
+/sdd-init              Create or refresh openspec/config.yaml.
+/gentle:models         Assign models to SDD/custom agents.
+/gentle:persona        Switch between gentleman and neutral persona modes.
 ```
 
-Aliases de compatibilidad:
+Typical flow:
+
+1. Open Pi in your repo.
+2. Run `/gentle-ai:status`.
+3. Run `/sdd-init` once per project, or when test/project capabilities change.
+4. For a substantial change, ask Pi to use SDD.
+5. Review the phase artifacts instead of trusting floating chat context.
+
+## How the harness decides what to do
+
+`gentle-pi` routes through the smallest safe workflow:
+
+| Request shape                                                               | Harness                      |
+| --------------------------------------------------------------------------- | ---------------------------- |
+| Small, clear, local edit                                                    | Inline direct work.          |
+| Unknown codebase area or context-heavy investigation                        | Focused subagent delegation. |
+| Large, ambiguous, architectural, product-facing, or high-review-risk change | SDD/OpenSpec flow.           |
+
+The goal is not ceremony. The goal is to avoid accidental chaos.
+
+## SDD/OpenSpec flow
 
 ```text
-/gentle-ai:models
-/gentleman:models
-/gentle-ai:persona
-/gentleman:persona
+init → explore → proposal → spec → design → tasks → apply → verify → archive
 ```
 
-## Persona
+For substantial work, the parent session coordinates the flow and each phase writes artifacts. That gives you:
 
-La persona default es `gentleman`.
+- explicit requirements and non-goals;
+- design decisions that survive compaction;
+- task plans reviewers can reason about;
+- implementation evidence;
+- verification reports;
+- archive notes for future agents.
 
-```text
-/gentle:persona
-```
+## Project files installed
 
-Modos disponibles:
-
-| Persona | Comportamiento |
-|---|---|
-| `gentleman` | Arquitecto senior, didáctico, directo, con español rioplatense/voseo cuando escribís en español. |
-| `neutral` | Misma disciplina técnica, pero con tono profesional neutro y sin regionalismos. |
-
-Config persistida en el proyecto:
-
-```text
-.pi/gentle-ai/persona.json
-```
-
-Después de cambiar la persona, corré `/reload` o abrí una nueva sesión para refrescar prompts ya inyectados.
-
-## Modelos por agente
-
-```text
-/gentle:models
-```
-
-El modal descubre agentes en:
-
-- `.pi/agents/` y `.agents/` del proyecto;
-- `~/.pi/agent/agents/` y `~/.agents/` del usuario;
-- agentes built-in de `pi-subagents`.
-
-Los agentes SDD aparecen primero para que puedas asignar modelos fuertes donde más impactan.
-
-Recomendación práctica:
-
-| Tipo de agente | Modelo recomendado |
-|---|---|
-| Explore, proposal, archive | Rápido y barato suele alcanzar. |
-| Spec, design, tasks | Modelo fuerte en razonamiento. |
-| Apply | Modelo fuerte en coding y tool-use. |
-| Verify / review | El modelo más fuerte que puedas costear; la independencia importa. |
-| Utilitarios chicos | Heredar el modelo activo/default. |
-
-Config persistida:
-
-```text
-.pi/gentle-ai/models.json
-```
-
-Aplicación de overrides:
-
-```text
-.pi/agents/*.md                 # agentes markdown del proyecto/usuario
-.pi/settings.json               # overrides para agentes built-in de pi-subagents
-```
-
-## Archivos que instala en proyectos
-
-`gentle-pi` copia assets locales al iniciar sesión:
+On Pi `session_start`, `gentle-pi` copies these assets if they are missing:
 
 ```text
 .pi/agents/sdd-*.md
@@ -144,76 +135,181 @@ Aplicación de overrides:
 .pi/gentle-ai/support/strict-tdd-verify.md
 ```
 
-No pisa archivos existentes salvo que ejecutes:
+It does **not** overwrite existing files unless you explicitly run:
 
 ```text
 /gentle-ai:install-sdd --force
 ```
 
-## Contenido del paquete
+## Skill registry
 
-| Ruta | Propósito |
-|---|---|
-| `extensions/gentle-ai.ts` | Inyecta identidad, instala assets, registra comandos, aplica modelos y protege shell. |
-| `extensions/sdd-init.ts` | Registra `/sdd-init` para inicialización OpenSpec. |
-| `extensions/skill-registry.ts` | Mantiene `.atl/skill-registry.md` para reglas compactas por skill. |
-| `assets/orchestrator.md` | Contrato de orquestación para la sesión padre. |
-| `assets/agents/` | Agentes SDD copiados a `.pi/agents/`. |
-| `assets/chains/` | Chains SDD copiadas a `.pi/chains/`. |
-| `assets/support/` | Guías Strict TDD para apply/verify. |
-| `skills/` | Skills de Gentle AI y delivery. |
-| `prompts/` | Prompt templates Gentle-prefixed. |
+`gentle-pi` keeps a local registry at:
 
-## Skills incluidos
+```text
+.atl/skill-registry.md
+```
 
-- `gentle-ai` — disciplina del harness el Gentleman.
-- `branch-pr` — PRs con issue-first checks.
-- `chained-pr` — división de cambios grandes en PRs encadenados.
-- `work-unit-commits` — commits por unidad revisable.
-- `judgment-day` — dual review adversarial y re-juicio.
-- `cognitive-doc-design` — documentación que baja carga cognitiva.
-- `comment-writer` — comentarios técnicos, cálidos y concisos.
-- `issue-creation` — workflow de issues con checks previos.
+The registry scans project and user skill roots, not package-owned skills. It exists to catch workflow skills that are present on disk but not visible in Pi's injected skill list.
 
-## Memoria
+It scans common roots such as:
 
-Este paquete **no** configura memoria persistente por sí mismo.
+```text
+./skills
+.pi/skills
+.agent/skills
+.agents/skills
+.claude/skills
+.gemini/skills
+~/.config/opencode/skills
+~/.claude/skills
+~/.gemini/skills
+~/.cursor/skills
+~/.copilot/skills
+```
 
-Si querés memoria, instalá un paquete separado, por ejemplo:
+Behavior:
+
+- `.atl/` is added to `.gitignore` when needed;
+- the registry refreshes on session start;
+- `/skill-registry:refresh` forces regeneration;
+- a best-effort watcher refreshes when skill files change;
+- skills without `## Compact Rules` are still listed with an instruction to load the full skill file.
+
+Skill discovery is a guardrail, not a workflow router: it helps Pi load the right skill without forcing extra ceremony.
+
+## Persona modes
+
+```text
+/gentle:persona
+```
+
+| Persona     | Behavior                                                                                                      |
+| ----------- | ------------------------------------------------------------------------------------------------------------- |
+| `gentleman` | Senior architect, teacher, direct technical feedback, Rioplatense Spanish/voseo when the user writes Spanish. |
+| `neutral`   | Same discipline, warmer professional language, no regional expression.                                        |
+
+Saved at:
+
+```text
+.pi/gentle-ai/persona.json
+```
+
+Run `/reload` or start a new Pi session after switching persona.
+
+## Model assignment
+
+```text
+/gentle:models
+```
+
+The modal discovers:
+
+- project agents in `.pi/agents/` and `.agents/`;
+- user agents in `~/.pi/agent/agents/` and `~/.agents/`;
+- built-in agents from `pi-subagents`.
+
+Recommended model shape:
+
+| Agent kind                 | Recommended model                                    |
+| -------------------------- | ---------------------------------------------------- |
+| Explore, proposal, archive | Fast and cheap is usually enough.                    |
+| Spec, design, tasks        | Strong reasoning model.                              |
+| Apply                      | Strong coding and tool-use model.                    |
+| Verify / review            | Strong fresh-context model.                          |
+| Tiny utilities             | Inherit active/default model unless they bottleneck. |
+
+Saved at:
+
+```text
+.pi/gentle-ai/models.json
+```
+
+## Commands
+
+| Command                          | What it does                                                 |
+| -------------------------------- | ------------------------------------------------------------ |
+| `/gentle-ai:status`              | Shows package, SDD asset, OpenSpec, and model config status. |
+| `/gentle:models`                 | Opens model assignment UI.                                   |
+| `/gentle:persona`                | Switches persona mode.                                       |
+| `/sdd-init`                      | Initializes or refreshes `openspec/config.yaml`.             |
+| `/gentle-ai:install-sdd`         | Reinstalls SDD assets without overwriting local files.       |
+| `/gentle-ai:install-sdd --force` | Force-refreshes installed SDD assets.                        |
+| `/skill-registry:refresh`        | Regenerates `.atl/skill-registry.md`.                        |
+
+Compatibility aliases:
+
+```text
+/gentle-ai:models
+/gentleman:models
+/gentle-ai:persona
+/gentleman:persona
+```
+
+## Included skills
+
+- `gentle-ai` — harness discipline for controlled Pi work.
+- `branch-pr` — issue-first PR preparation.
+- `chained-pr` — split oversized changes into reviewable PR chains.
+- `work-unit-commits` — commits as reviewable work units.
+- `judgment-day` — blind dual review, fixes, and re-judgment.
+- `cognitive-doc-design` — documentation that reduces cognitive load.
+- `comment-writer` — concise, warm, postable collaboration comments.
+- `issue-creation` — issue workflow with checks before creation.
+
+## Memory
+
+`gentle-pi` does **not** provide persistent memory by itself.
+
+For memory, install the companion package:
 
 ```bash
 pi install npm:gentle-engram
 ```
 
-el Gentleman solo menciona memoria cuando una herramienta o paquete de memoria está realmente activo.
+When memory tools are actually active, el Gentleman can save decisions, bug fixes, discoveries, user prompts, and session summaries across Pi sessions.
 
-## Desarrollo local
+## Package contents
 
-Desde este repo:
+| Path                           | Purpose                                                                                                    |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| `extensions/gentle-ai.ts`      | Injects identity, installs assets, registers commands, applies model config, and protects shell execution. |
+| `extensions/sdd-init.ts`       | Registers `/sdd-init` for OpenSpec initialization.                                                         |
+| `extensions/skill-registry.ts` | Maintains `.atl/skill-registry.md` from project/user skills.                                               |
+| `assets/orchestrator.md`       | Parent-session orchestration contract.                                                                     |
+| `assets/agents/`               | SDD agents copied into `.pi/agents/`.                                                                      |
+| `assets/chains/`               | SDD chains copied into `.pi/chains/`.                                                                      |
+| `assets/support/`              | Strict TDD support docs for apply/verify phases.                                                           |
+| `skills/`                      | Gentle AI delivery and collaboration skills.                                                               |
+| `prompts/`                     | Gentle-prefixed prompt templates.                                                                          |
+
+## Development
+
+Install from this repo:
 
 ```bash
 pi install .
 ```
 
-Validaciones útiles antes de publicar:
+Validate before publishing:
 
 ```bash
+bun build extensions/skill-registry.ts --target=node --format=esm --outfile=/tmp/skill-registry.js
 node --experimental-strip-types --check extensions/gentle-ai.ts
 npm pack --dry-run
 ```
 
-Publicación:
+Publish:
 
 ```bash
 npm publish
 ```
 
-## Principios
+## Principles
 
-- Conceptos antes que código.
-- Artifacts sobre contexto flotante.
-- SDD cuando el riesgo lo justifica.
-- TDD estricto cuando hay tests.
-- Un orquestador padre, subagentes enfocados.
-- Cambios revisables antes que PRs gigantes.
-- Control humano por encima del momentum del agente.
+- Human control over agent momentum.
+- Concepts before code.
+- Artifacts over floating chat context.
+- SDD when risk justifies it.
+- Strict TDD when tests exist.
+- One parent orchestrator, focused subagents.
+- Reviewable changes over giant diffs.

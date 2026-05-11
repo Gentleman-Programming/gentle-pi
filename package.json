@@ -1,7 +1,7 @@
 {
   "name": "gentle-pi",
-  "version": "0.1.15",
-  "description": "Opinionated el Gentleman harness package for Pi: SDD/OpenSpec workflow, strict TDD guidance, subagent assets, and safety defaults.",
+  "version": "0.1.16",
+  "description": "Turn Pi into el Gentleman: a senior-architect development harness with SDD/OpenSpec, subagents, strict TDD evidence, review guardrails, and skill discovery.",
   "license": "MIT",
   "type": "module",
   "keywords": [
@@ -9,9 +9,14 @@
     "pi",
     "pi-coding-agent",
     "gentle-pi",
+    "gentle-ai",
     "sdd",
     "openspec",
-    "subagents"
+    "subagents",
+    "tdd",
+    "code-review",
+    "ai-coding-agent",
+    "agent-harness"
   ],
   "repository": {
     "type": "git",
