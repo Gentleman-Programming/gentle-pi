@@ -1,161 +1,219 @@
-# Gentle Pi
+# gentle-pi
 
-Gentle Pi it's a Pi coding-agent fork tuned for controlled autonomy: SDD planning, native subagents, Engram memory, strict TDD, and a senior-architect persona.
+`gentle-pi` instala **el Gentleman** en Pi: un harness de desarrollo controlado para que el agente deje de ser un chat genérico y empiece a trabajar con disciplina de arquitectura, SDD/OpenSpec, subagentes, evidencia de TDD y cuidado real del reviewer.
 
-It is not a generic Gentle AI runtime. It is Gentle AI made-to-measure for this Pi agent.
+La idea es simple: Pi ya tiene herramientas poderosas; `gentle-pi` agrega criterio operativo para usarlas bien.
 
-## Quick start
-
-```bash
-npm install
-npm run build
-node packages/coding-agent/dist/cli.js --mcp-config .pi/mcp.json
-```
-
-## One-command setup
-
-For the MVP flow, clone this repo and run the setup script:
+## Instalación
 
 ```bash
-bash scripts/setup-gentle-pi.sh
+pi install npm:gentle-pi
 ```
 
-The script:
-
-- installs workspace dependencies,
-- builds all packages,
-- creates a local `pi` wrapper for `pi-subagents`,
-- warms Pi package resolution from `.pi/settings.json`,
-- detects your shell,
-- installs a `gentle-pi` alias/function for bash, zsh, or fish,
-- launches Gentle Pi automatically.
-
-To set everything up without launching at the end:
+Paquetes compañeros recomendados:
 
 ```bash
-GENTLE_PI_SKIP_LAUNCH=1 bash scripts/setup-gentle-pi.sh
+pi install npm:pi-subagents
+pi install npm:pi-intercom
 ```
 
-If subagents report `spawn pi ENOENT`, make sure a `pi` executable is on `PATH`. The setup script creates this wrapper automatically:
+Después iniciá Pi dentro de tu proyecto:
 
 ```bash
-mkdir -p ~/.pi/agent/bin
-cat > ~/.pi/agent/bin/pi <<'EOF'
-#!/usr/bin/env bash
-exec node "/Users/alanbuscaglia/work/gentle-pi/packages/coding-agent/dist/cli.js" "$@"
-EOF
-chmod +x ~/.pi/agent/bin/pi
+pi
 ```
 
-## Shell aliases
+En cada sesión, `gentle-pi` instala o refresca assets SDD del proyecto sin pisar cambios locales.
 
-Use an alias so you do not have to pass the MCP config every time.
+## Qué hacemos
 
-The setup script installs this automatically. Manual setup is only needed if you do not run the script.
+`gentle-pi` configura Pi para trabajar como **el Gentleman**:
 
-### zsh / bash
+- piensa como arquitecto senior, no como chatbot;
+- separa trabajo chico, trabajo delegable y trabajo que necesita SDD;
+- usa artifacts de fase en vez de depender solo del contexto flotante del chat;
+- coordina subagentes cuando conviene reducir contexto o revisar con independencia;
+- protege el tamaño de los cambios para no quemar al reviewer;
+- aplica política de seguridad contra comandos destructivos;
+- deja comandos y UI para asignar modelos por agente.
 
-Add this to `~/.zshrc` or `~/.bashrc`:
+## Hermosuras que agrega
 
-```bash
-alias gentle-pi='PATH="$HOME/.pi/agent/bin:$PATH" node "/Users/alanbuscaglia/work/gentle-pi/packages/coding-agent/dist/cli.js" --mcp-config "/Users/alanbuscaglia/work/gentle-pi/.pi/mcp.json"'
-```
+| Hermosura | Qué aporta |
+|---|---|
+| Identidad el Gentleman | Responde como harness específico de Pi, con persona de arquitecto senior. En español usa voseo rioplatense. |
+| Routing de trabajo | Trabajo chico queda inline; exploración pesada se delega; cambios grandes van por SDD/OpenSpec. |
+| SDD/OpenSpec | Instala agentes y chains para `init`, `explore`, `proposal`, `spec`, `design`, `tasks`, `apply`, `verify` y `archive`. |
+| Subagentes listos | Deja assets para que Pi pueda ejecutar fases con contexto enfocado. |
+| Strict TDD | Incluye soporte para RED → GREEN → TRIANGULATE → REFACTOR cuando el proyecto declara TDD estricto. |
+| Guard de review | Detecta riesgo de PRs grandes y empuja a dividir trabajo antes de saturar al reviewer. |
+| Asignación de modelos | Modal para elegir modelos por agente: SDD primero, custom agents después. |
+| Skills de delivery | Incluye skills para PRs, issues, commits por unidad, chained PRs, documentación cognitiva, comments y Judgment Day. |
+| Prompts cortos | Agrega templates `/gcl`, `/gis`, `/gpr`, `/gwr` para flujos frecuentes. |
+| Seguridad de shell | Bloquea comandos destructivos y pide confirmación para operaciones sensibles. |
 
-### fish
-
-Add this to `~/.config/fish/config.fish`:
-
-```fish
-function gentle-pi
-    env PATH="$HOME/.pi/agent/bin:$PATH" node "/Users/alanbuscaglia/work/gentle-pi/packages/coding-agent/dist/cli.js" --mcp-config "/Users/alanbuscaglia/work/gentle-pi/.pi/mcp.json" $argv
-end
-```
-
-Then ask:
+## Comandos principales
 
 ```text
-quién sos?
-tenés Engram?
-podés delegar en subagentes?
+/gentle-ai:status          Muestra estado del paquete, assets SDD, OpenSpec y modelos.
+/gentle:models             Abre el modal de asignación de modelos por agente.
+/gentle:persona            Cambia entre persona gentleman y neutral.
+/sdd-init                  Inicializa o refresca openspec/config.yaml.
+/gentle-ai:install-sdd     Reinstala assets SDD sin pisar archivos existentes.
+/gentle-ai:install-sdd --force
+                           Fuerza el refresco de assets SDD instalados.
 ```
 
-## What this fork adds
+Aliases de compatibilidad:
 
-| Harness | What it does |
-|---------|--------------|
-| Gentle identity | Makes the agent answer as Gentle Pi: direct, technical, Rioplatense in Spanish, senior-architect oriented. |
-| SDD runtime | Uses OpenSpec artifacts for proposal, specs, design, tasks, apply progress, verify reports, and archive flow. |
-| Native subagents | Uses `pi-subagents` project agents and chains for SDD phases, reviewers, workers, and orchestration. |
-| Engram bridge | Connects Engram through Pi MCP adapter using `.pi/mcp.json`; falls back truthfully when unavailable. |
-| Safety policy | Blocks destructive shell/git/npm paths and checkpoints mutating execution where the Gentle Pi phase requires it. |
-| Review guard | Forecasts review workload and records delivery strategy/size exception decisions. |
-
-## Installed Pi packages
-
-Gentle Pi loads these project packages from `.pi/settings.json`:
-
-- `pi-subagents` — native delegation, chains, parallel reviewers, workers, and SDD phase agents.
-- `pi-intercom` — supervisor/child coordination for blocked decisions and progress updates.
-- `pi-mcp-adapter` — MCP bridge for Engram and future external tools.
-- `@juicesharp/rpiv-ask-user-question` — structured clarification questions when the agent should not guess.
-
-Engram is configured in `.pi/mcp.json`:
-
-```json
-{
-	"mcpServers": {
-		"engram": {
-			"command": "node",
-			"args": ["-e", "/* launcher uses ENGRAM_BIN or falls back to engram */"],
-			"lifecycle": "lazy",
-			"directTools": true
-		}
-	}
-}
+```text
+/gentle-ai:models
+/gentleman:models
+/gentle-ai:persona
+/gentleman:persona
 ```
 
-Set `ENGRAM_URL` to point the Pi extension at an already running Engram HTTP
-server. Set `ENGRAM_BIN` only when Pi should launch a local `engram mcp` process
-for MCP tools; if the binary is missing, the launcher exits cleanly instead of
-crashing Pi with `spawn engram ENOENT`.
+## Persona
 
-## SDD workflow
+La persona default es `gentleman`.
 
-Planning artifacts live under `openspec/changes/`.
+```text
+/gentle:persona
+```
 
-Current completed changes:
+Modos disponibles:
 
-- `gentle-pi-agent` — core harness runtime, safety policy, routing, TDD evidence, review guard.
-- `gentle-pi-identity-memory` — persona, self-description, subagent SDD assets, memory protocol.
-- `gentle-pi-engram-bridge` — typed Engram bridge detection, tool mapping, and truthful memory states.
+| Persona | Comportamiento |
+|---|---|
+| `gentleman` | Arquitecto senior, didáctico, directo, con español rioplatense/voseo cuando escribís en español. |
+| `neutral` | Misma disciplina técnica, pero con tono profesional neutro y sin regionalismos. |
 
-Project subagent assets live under:
+Config persistida en el proyecto:
 
-- `.pi/agents/`
-- `.pi/chains/`
+```text
+.pi/gentle-ai/persona.json
+```
 
-## Verification
+Después de cambiar la persona, corré `/reload` o abrí una nueva sesión para refrescar prompts ya inyectados.
 
-Use the repo gates after changes:
+## Modelos por agente
+
+```text
+/gentle:models
+```
+
+El modal descubre agentes en:
+
+- `.pi/agents/` y `.agents/` del proyecto;
+- `~/.pi/agent/agents/` y `~/.agents/` del usuario;
+- agentes built-in de `pi-subagents`.
+
+Los agentes SDD aparecen primero para que puedas asignar modelos fuertes donde más impactan.
+
+Recomendación práctica:
+
+| Tipo de agente | Modelo recomendado |
+|---|---|
+| Explore, proposal, archive | Rápido y barato suele alcanzar. |
+| Spec, design, tasks | Modelo fuerte en razonamiento. |
+| Apply | Modelo fuerte en coding y tool-use. |
+| Verify / review | El modelo más fuerte que puedas costear; la independencia importa. |
+| Utilitarios chicos | Heredar el modelo activo/default. |
+
+Config persistida:
+
+```text
+.pi/gentle-ai/models.json
+```
+
+Aplicación de overrides:
+
+```text
+.pi/agents/*.md                 # agentes markdown del proyecto/usuario
+.pi/settings.json               # overrides para agentes built-in de pi-subagents
+```
+
+## Archivos que instala en proyectos
+
+`gentle-pi` copia assets locales al iniciar sesión:
+
+```text
+.pi/agents/sdd-*.md
+.pi/chains/sdd-*.chain.md
+.pi/gentle-ai/support/strict-tdd.md
+.pi/gentle-ai/support/strict-tdd-verify.md
+```
+
+No pisa archivos existentes salvo que ejecutes:
+
+```text
+/gentle-ai:install-sdd --force
+```
+
+## Contenido del paquete
+
+| Ruta | Propósito |
+|---|---|
+| `extensions/gentle-ai.ts` | Inyecta identidad, instala assets, registra comandos, aplica modelos y protege shell. |
+| `extensions/sdd-init.ts` | Registra `/sdd-init` para inicialización OpenSpec. |
+| `extensions/skill-registry.ts` | Mantiene `.atl/skill-registry.md` para reglas compactas por skill. |
+| `assets/orchestrator.md` | Contrato de orquestación para la sesión padre. |
+| `assets/agents/` | Agentes SDD copiados a `.pi/agents/`. |
+| `assets/chains/` | Chains SDD copiadas a `.pi/chains/`. |
+| `assets/support/` | Guías Strict TDD para apply/verify. |
+| `skills/` | Skills de Gentle AI y delivery. |
+| `prompts/` | Prompt templates Gentle-prefixed. |
+
+## Skills incluidos
+
+- `gentle-ai` — disciplina del harness el Gentleman.
+- `branch-pr` — PRs con issue-first checks.
+- `chained-pr` — división de cambios grandes en PRs encadenados.
+- `work-unit-commits` — commits por unidad revisable.
+- `judgment-day` — dual review adversarial y re-juicio.
+- `cognitive-doc-design` — documentación que baja carga cognitiva.
+- `comment-writer` — comentarios técnicos, cálidos y concisos.
+- `issue-creation` — workflow de issues con checks previos.
+
+## Memoria
+
+Este paquete **no** configura memoria persistente por sí mismo.
+
+Si querés memoria, instalá un paquete separado, por ejemplo:
 
 ```bash
-npm run build
-npm run check
-npm --prefix packages/coding-agent run test
+pi install npm:gentle-engram
 ```
 
-For focused Gentle Pi regressions:
+el Gentleman solo menciona memoria cuando una herramienta o paquete de memoria está realmente activo.
+
+## Desarrollo local
+
+Desde este repo:
 
 ```bash
-npm --prefix packages/coding-agent run test -- test/suite/regressions/gentle-pi-agent-context.test.ts test/suite/regressions/gentle-pi-agent-process.test.ts test/suite/regressions/gentle-pi-agent-routing.test.ts test/suite/regressions/gentle-pi-agent-runtime-flow.test.ts test/suite/regressions/gentle-pi-agent-safety.test.ts test/suite/regressions/gentle-pi-identity-memory.test.ts
+pi install .
 ```
 
-## Notes
+Validaciones útiles antes de publicar:
 
-- `auth.json` is intentionally ignored locally and must not be committed.
-- `.pi/mcp.json` is machine-specific because it points to the local Engram binary.
-- Pi memory extensions were evaluated as references only. Engram remains the primary memory target.
+```bash
+node --experimental-strip-types --check extensions/gentle-ai.ts
+npm pack --dry-run
+```
 
-## License
+Publicación:
 
-MIT
+```bash
+npm publish
+```
+
+## Principios
+
+- Conceptos antes que código.
+- Artifacts sobre contexto flotante.
+- SDD cuando el riesgo lo justifica.
+- TDD estricto cuando hay tests.
+- Un orquestador padre, subagentes enfocados.
+- Cambios revisables antes que PRs gigantes.
+- Control humano por encima del momentum del agente.
