@@ -147,7 +147,7 @@ function loadSkill(file: string): SkillEntry | undefined {
 		rules:
 			rules.length > 0
 				? rules
-				: ["No compact rules declared; load the full skill file before doing work that matches this trigger."],
+				: ["No compact rules declared; delegators should load the full skill file before direct work, or pass an explicit fallback path only when Project Standards cannot be injected."],
 	};
 }
 
@@ -197,6 +197,12 @@ function renderRegistry(cwd: string, sources: string[], entries: SkillEntry[]): 
 	for (const src of sources) {
 		lines.push(`- ${src}`);
 	}
+	lines.push("");
+	lines.push("## Contract");
+	lines.push("");
+	lines.push("**Delegator use only.** Any agent that launches subagents reads this registry to resolve compact rules, then injects matching rule text into subagent prompts under `## Project Standards (auto-resolved)`.");
+	lines.push("");
+	lines.push("Subagents still read their assigned executor/phase skill. During normal runtime, they do **not** independently discover or load additional project/user `SKILL.md` files or this registry; project/user rules arrive pre-digested. Explicit fallback loading is degraded self-healing and must be reported in `skill_resolution` as `fallback-registry` or `fallback-path`.");
 	lines.push("");
 	lines.push(SECTION_MARKER);
 	lines.push("");

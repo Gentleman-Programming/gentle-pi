@@ -178,7 +178,18 @@ The parent resolves skills once per session or before first delegation:
 3. Inject matching rule text into subagent prompts under `## Project Standards (auto-resolved)`.
 4. If the registry is absent, continue but mention that project-specific skill rules were unavailable.
 
-Subagents should receive pre-digested rules. They should not have to rediscover the registry.
+Subagents should receive pre-digested project/user rules. They should not have to rediscover the registry.
+
+Important distinction: SDD subagents still use their assigned executor/phase skill (for example `sdd-apply`, `sdd-design`, or `sdd-verify`). What they should not do during normal runtime is independently discover or load additional project/user `SKILL.md` files or the registry. Those project/user rules arrive pre-digested from the parent under `## Project Standards (auto-resolved)`.
+
+If a subagent reports `skill_resolution`, interpret it as project/user skill resolution:
+
+- `injected`: parent supplied `## Project Standards (auto-resolved)`.
+- `fallback-registry`: subagent self-loaded compact rules from a registry because Project Standards were missing; degraded but auditable.
+- `fallback-path`: subagent loaded explicit `SKILL: Load` paths because Project Standards were missing; degraded but auditable.
+- `none`: no project/user skills were loaded.
+
+If any subagent reports a fallback instead of `injected`, treat it as an orchestration gap and correct future delegations by injecting the compact rules directly.
 
 ## Intent-Driven Skill Discovery
 

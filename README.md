@@ -173,9 +173,16 @@ Behavior:
 - the registry refreshes on session start;
 - `/skill-registry:refresh` forces regeneration;
 - a best-effort watcher refreshes when skill files change;
-- skills without `## Compact Rules` are still listed with an instruction to load the full skill file.
+- skills without `## Compact Rules` are still listed, but delegators should inject project/user compact rules into subagents whenever possible.
 
 Skill discovery is a guardrail, not a workflow router: it helps Pi load the right skill without forcing extra ceremony.
+
+Delegation contract:
+
+- parent/orchestrator resolves project/user skills from the registry and injects compact rule text under `## Project Standards (auto-resolved)`;
+- SDD subagents still use their assigned executor/phase skill;
+- during normal runtime, subagents should not independently discover or load additional project/user `SKILL.md` files or the registry;
+- fallback loading is degraded self-healing and must be reported via `skill_resolution` as `fallback-registry`, `fallback-path`, or `none`.
 
 ## Persona modes
 
