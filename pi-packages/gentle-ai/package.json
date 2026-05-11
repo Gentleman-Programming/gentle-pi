@@ -1,6 +1,6 @@
 {
   "name": "gentle-pi",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "Opinionated el Gentleman harness package for Pi: SDD/OpenSpec workflow, strict TDD guidance, subagent assets, and safety defaults.",
   "license": "MIT",
   "type": "module",
@@ -26,7 +26,7 @@
     "README.md"
   ],
   "pi": {
-    "image": "https://raw.githubusercontent.com/Gentleman-Programming/gentle-pi/main/pi-packages/gentle-ai/assets/gentle-logo-only.png",
+    "image": "https://cdn.jsdelivr.net/npm/gentle-pi/assets/gentle-logo-only.png",
     "extensions": [
       "./extensions"
     ],
