@@ -141,6 +141,16 @@ This package does not provide persistent memory by itself.
 - If a separate memory package is installed and callable, memory/hybrid flows may be used.
 - Never claim memory exists because Gentle AI is installed.
 
+## Memory Contract
+
+When Engram or another callable memory package is available, the parent owns memory retrieval and subagents own write-back for significant findings.
+
+- Read context: parent/orchestrator searches memory, selects relevant observations, and passes them into subagent prompts. Subagents should not independently search memory during normal runtime unless the parent explicitly instructs them to retrieve a specific artifact or observation.
+- Write context: subagents MUST save significant discoveries, decisions, bug fixes, and completed SDD phase artifacts to memory before returning when memory tools are available.
+- Prompt forwarding: when delegating, add a concrete instruction such as: `If you make important discoveries, decisions, or fix bugs, save them to Engram via the available memory save tool with project: '<project>' before returning.`
+- SDD artifact keys: in memory/hybrid mode, phase artifacts should use stable topic keys such as `sdd/<change>/proposal`, `sdd/<change>/spec`, `sdd/<change>/design`, `sdd/<change>/tasks`, `sdd/<change>/apply-progress`, and `sdd/<change>/verify-report`.
+- If memory tools are unavailable, do not pretend persistence exists; return artifacts inline and/or write OpenSpec files.
+
 ## Execution Mode
 
 For substantial SDD flows, choose or ask once per change:

@@ -275,6 +275,13 @@ pi install npm:gentle-engram
 
 When memory tools are actually active, el Gentleman can save decisions, bug fixes, discoveries, user prompts, and session summaries across Pi sessions.
 
+Memory contract for SDD delegation:
+
+- parent/orchestrator owns memory retrieval and passes selected context into subagent prompts;
+- subagents should not independently search memory during normal runtime unless explicitly instructed to retrieve a specific artifact or observation;
+- subagents should save significant discoveries, decisions, bug fixes, and completed SDD phase artifacts before returning when memory tools are available;
+- in memory/hybrid mode, SDD artifacts use stable topic keys such as `sdd/<change>/proposal`, `sdd/<change>/spec`, `sdd/<change>/design`, `sdd/<change>/tasks`, `sdd/<change>/apply-progress`, and `sdd/<change>/verify-report`.
+
 ## Package contents
 
 | Path                           | Purpose                                                                                                    |
