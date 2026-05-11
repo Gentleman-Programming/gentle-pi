@@ -8,12 +8,18 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { VERSION } from "@earendil-works/pi-coding-agent";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
+	Theme,
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
-import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import {
+	matchesKey,
+	truncateToWidth,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
@@ -42,6 +48,139 @@ const NEUTRAL_PERSONA_PROMPT = `Persona:
 - Treat AI as a tool directed by the human; never present yourself as a default chatbot.
 - Push back when the user asks for code without enough context or understanding.
 - Correct errors directly, explain why, and show the better path.`;
+
+const ROSE_LOGO_LINES = [
+	"             ⣠⣾⣷⣶⣦⣤⣤⣄⣠⣄⣀  ⢀⣀⣀",
+	"          ⢀⣴⣿⣿⠿⣋⣭⣭⣯⣭⣍⣭⣿⣟⠛⠛⠿⠿⣿⣷⣄",
+	"      ⢀⣴⣾⡟⢻⣿⡟⠁⣼⣿⠏⣵⢻⣿⣻⣿⣿⢿⡻⣿⣿⣶⡌⢿⣿⣷⣦⣤⡄",
+	"   ⣤⣶⣾⣿⣿⠏ ⠈⢿⣄ ⢹⣏⠠⠟⣾⣿⣿⣿⣿⣿⠷⣏⣼⠟⢡⣿⡟⠋⢻⣿⣿⡄",
+	"   ⠈⣿⣿⣿⣿⡆   ⣽⢧⡘⠈⠳⣦⣍⠛⠛⢦⣉⣴⣛⣫⣭⣴⡟⠋  ⣾⣿⣿⡿",
+	"   ⢀⠹⣿⣿⣿⣷⣤⡄ ⠋ ⠙⢆ ⣠⠴⠟⠛⣛⣛⣛⠟⠋⠁⠺⡇ ⣀⣴⣿⣿⡟⠁",
+	"   ⠈⣀⠈⠛⠷⠿⣿⣿⣷⣤⣀ ⢠⠋   ⠈⠉⠉    ⣠⣴⣥⠾⠛⠉⣰⣿⣷",
+	"          ⠹⣯⣝⠛⠛⠷⢶⣤⣤⣀   ⢀⡠⠖⠋⠉⢉⣀⣀⣴⣾⣿⠿⠟⠃ ⠠⠦",
+	"⠁       ⠖  ⠘⠻⢿⣦⣄⡀  ⠉⠛⢦⠠⢊⠤⠴⢒⣛⣛⣩⣽⡿⠟⠁⢀⡀",
+	"⠲⠶⣦⠴⠶⠶⠶⠶⡶⠶⢶⣤⣄⡀⠨⠭⠽⠟⣓⢦⣀⠈⢇⡥⠖⠛⠋⠉⠉⠉    ⠈  ⢠⡤",
+	"  ⠈⢷ ⠐⠂⢤⣽⣄ ⠰⡎⠙⠳⣄⡀ ⠈⢣⠘⢦⠋⣀⡬⠟⠛⠛⠉⢀⣀⣀⣠⡤⠄⠃",
+	"   ⠈⢳⣀⡒⠉⠉⣉⠙⡲⣽⣄ ⣏⠳⡄ ⠘⡇ ⡾⠁ ⢀⡤⠖⣻⣿⡏⢡⡎ ⠰⠄",
+	"     ⠛⠻⢦⣄⣉⡁⣀⣀⣈⣙⣺⣌⡇⢠⢀⡇⡾  ⣴⣿⡷⠊ ⢲⣠⠟",
+	"          ⠈⠉    ⠈⠳⡄⣸⢱⠇⢀⣰⣯⣭⣥⠭⠾⠛⠃",
+	"                  ⡷⠡⡯⢖⠉   ⢠⠤",
+	"                ⡠⢊⡴⠤⠂⠃ ⠒",
+	"             ⢀⡴⢪⠔⣉⠔⠋",
+	"               ⠐⠈",
+];
+
+const ROSE_FADE_STEPS = 12;
+const ROSE_FADE_INTERVAL_MS = 45;
+const ROSE_INTRO_HOLD_MS = 180;
+
+function rgb(r: number, g: number, b: number, text: string): string {
+	return `\x1b[38;2;${r};${g};${b}m${text}\x1b[39m`;
+}
+
+function italic(text: string): string {
+	return `\x1b[3m${text}\x1b[23m`;
+}
+
+function bold(text: string): string {
+	return `\x1b[1m${text}\x1b[22m`;
+}
+
+function centerLine(line: string, width: number): string {
+	const clipped = truncateToWidth(line, width, "");
+	const padding = Math.max(0, width - visibleWidth(clipped));
+	return `${" ".repeat(Math.floor(padding / 2))}${clipped}`;
+}
+
+function pinkFade(text: string, frame: number): string {
+	const progress = Math.max(0, Math.min(1, frame / ROSE_FADE_STEPS));
+	const eased = 1 - (1 - progress) ** 3;
+	const r = Math.round(72 + (255 - 72) * eased);
+	const g = Math.round(38 + (122 - 38) * eased);
+	const b = Math.round(58 + (198 - 58) * eased);
+	return rgb(r, g, b, text);
+}
+
+function buildGentlemanTitle(width: number, frame: number): string[] {
+	const title = "✧  𝓮𝓵 𝓖𝓮𝓷𝓽𝓵𝓮𝓶𝓪𝓷  ✧";
+	const version = `━━  v${VERSION}  ━━`;
+	return [
+		pinkFade(bold(italic(centerLine(title, width))), frame),
+		pinkFade(italic(centerLine(version, width)), frame),
+	];
+}
+
+function buildRoseHeader(
+	_theme: Theme,
+	width: number,
+	frame: number,
+): string[] {
+	return [
+		"",
+		...ROSE_LOGO_LINES.map((line) => pinkFade(centerLine(line, width), frame)),
+		...buildGentlemanTitle(width, frame),
+		"",
+	];
+}
+
+function installRoseHeader(ctx: ExtensionContext): void {
+	if (!ctx.hasUI) return;
+
+	process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
+
+	let closeIntro: (() => void) | undefined;
+	const closeIntroSafely = () => {
+		const close = closeIntro;
+		closeIntro = undefined;
+		try {
+			close?.();
+		} catch {
+			// Ignore shutdown races during startup/reload.
+		}
+	};
+
+	void ctx.ui
+		.custom((_tui, _theme, _keybindings, done) => {
+			closeIntro = () => done(undefined);
+			return {
+				render: () => [""],
+				invalidate: () => {},
+				handleInput: () => {},
+			};
+		})
+		.catch(() => {
+			closeIntro = undefined;
+		});
+
+	const state: { frame: number; timer?: NodeJS.Timeout } = { frame: 0 };
+	ctx.ui.setHeader((tui, theme) => {
+		if (state.timer) clearInterval(state.timer);
+		state.timer = setInterval(() => {
+			state.frame += 1;
+			tui.requestRender();
+			if (
+				state.frame <
+				ROSE_FADE_STEPS + Math.ceil(ROSE_INTRO_HOLD_MS / ROSE_FADE_INTERVAL_MS)
+			) {
+				return;
+			}
+			if (state.timer) clearInterval(state.timer);
+			state.timer = undefined;
+			closeIntroSafely();
+		}, ROSE_FADE_INTERVAL_MS);
+
+		return {
+			render(width: number): string[] {
+				return buildRoseHeader(theme, width, state.frame);
+			},
+			invalidate() {
+				if (state.timer) clearInterval(state.timer);
+				state.timer = undefined;
+				closeIntroSafely();
+			},
+		};
+	});
+}
 
 function buildGentlePrompt(persona: PersonaMode): string {
 	const personaPrompt =
@@ -772,6 +911,7 @@ async function handlePersonaCommand(ctx: ExtensionContext): Promise<void> {
 
 export default function gentleAi(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
+		installRoseHeader(ctx);
 		const result = installSddAssets(ctx.cwd, false);
 		const modelResult = applyModelConfig(ctx.cwd, readModelConfig(ctx.cwd));
 		if (
