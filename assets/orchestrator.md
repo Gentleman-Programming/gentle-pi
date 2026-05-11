@@ -180,6 +180,29 @@ The parent resolves skills once per session or before first delegation:
 
 Subagents should receive pre-digested rules. They should not have to rediscover the registry.
 
+## Intent-Driven Skill Discovery
+
+For skill-shaped requests, do not treat injected `<available_skills>` as complete. Use the registry and filesystem only as a discovery aid; do not let a trigger table override the user's concrete request or turn a small request into a larger workflow.
+
+Discovery order:
+
+1. Read `.atl/skill-registry.md` when present.
+2. If the registry suggests a specific skill, load that skill before acting.
+3. If the expected skill is absent from the registry but the request clearly names a known workflow, search common project/user skill dirs such as `./skills`, `.pi/skills`, `.agents/skills`, `~/.config/opencode/skills`, `~/.claude/skills`, and other configured skill roots.
+4. Prefer the most specific project skill over a global skill with the same intent.
+5. If no matching skill exists, continue with the smallest safe fallback and say which expected skill was unavailable.
+
+Common intent hints, not hard routing:
+
+| User intent | Skill to check |
+|---|---|
+| PR review / GitHub PR URL | project review skill, then `pr-review` |
+| Post-ready review comments | `comment-writer` |
+| Create/open/prepare PR | `branch-pr` |
+| Split/stack/large PR | `chained-pr` |
+
+Keep this lightweight: loading a skill should improve the immediate task, not force extra ceremony.
+
 ## Strict TDD Forwarding
 
 For `sdd-apply` and `sdd-verify`, read `openspec/config.yaml` when present.

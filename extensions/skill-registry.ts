@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, relative } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -9,6 +9,9 @@ const CACHE_REL_PATH = ".atl/.skill-registry.cache.json";
 const SECTION_MARKER = "## Selected skills and compact rules";
 const EXCLUDE_NAMES = new Set(["_shared", "skill-registry"]);
 const EXCLUDE_PREFIXES = ["sdd-"];
+const ATL_IGNORE_ENTRY = ".atl/";
+const WATCH_DEBOUNCE_MS = 500;
+const REGISTRY_SCHEMA_VERSION = 2;
 
 interface SkillEntry {
 	name: string;
@@ -32,9 +35,12 @@ function userSkillDirs(): string[] {
 
 function projectSkillDirs(cwd: string): string[] {
 	return [
+		join(cwd, "skills"),
 		join(cwd, ".pi/skills"),
+		join(cwd, ".agent/skills"),
 		join(cwd, ".agents/skills"),
 		join(cwd, ".claude/skills"),
+		join(cwd, ".gemini/skills"),
 		join(cwd, ".atl/skills"),
 	];
 }
@@ -112,6 +118,17 @@ function isExcluded(name: string): boolean {
 	return EXCLUDE_PREFIXES.some((p) => name.startsWith(p));
 }
 
+function uniqueExistingDirs(dirs: string[]): string[] {
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const dir of dirs) {
+		if (seen.has(dir) || !existsSync(dir)) continue;
+		seen.add(dir);
+		out.push(dir);
+	}
+	return out;
+}
+
 function loadSkill(file: string): SkillEntry | undefined {
 	let source: string;
 	try {
@@ -123,12 +140,14 @@ function loadSkill(file: string): SkillEntry | undefined {
 	const name = deriveSkillName(file, fm.name);
 	if (isExcluded(name)) return undefined;
 	const rules = extractCompactRulesSection(fm.body);
-	if (rules.length === 0) return undefined;
 	return {
 		name,
 		path: file,
 		description: fm.description ?? "",
-		rules,
+		rules:
+			rules.length > 0
+				? rules
+				: ["No compact rules declared; load the full skill file before doing work that matches this trigger."],
 	};
 }
 
@@ -149,16 +168,17 @@ function dedupeBySkillName(entries: SkillEntry[], cwd: string): SkillEntry[] {
 }
 
 function fingerprint(files: string[]): string {
-	const lines = files
-		.map((f) => {
+	const lines = [
+		`schema:${REGISTRY_SCHEMA_VERSION}`,
+		...files.map((f) => {
 			try {
 				const stat = statSync(f);
 				return `${f}:${stat.mtimeMs}:${stat.size}`;
 			} catch {
 				return `${f}:missing`;
 			}
-		})
-		.sort();
+		}),
+	].sort();
 	return createHash("sha1").update(lines.join("\n")).digest("hex");
 }
 
@@ -201,9 +221,24 @@ interface RegenResult {
 	reason: string;
 }
 
+function ensureAtlIgnored(cwd: string): void {
+	const gitignorePath = join(cwd, ".gitignore");
+	let existing = "";
+	if (existsSync(gitignorePath)) {
+		existing = readFileSync(gitignorePath, "utf8");
+	}
+	const hasAtlIgnore = existing
+		.split("\n")
+		.map((line) => line.trim())
+		.some((line) => line === ".atl" || line === ATL_IGNORE_ENTRY);
+	if (hasAtlIgnore) return;
+	const prefix = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+	const header = existing.includes("# Local Pi runtime state") ? "" : "# Local Pi runtime state\n";
+	writeFileSync(gitignorePath, `${existing}${prefix}${header}${ATL_IGNORE_ENTRY}\n`);
+}
+
 function regenerateRegistry(cwd: string, force: boolean): RegenResult {
-	const dirs = [...userSkillDirs(), ...projectSkillDirs(cwd)];
-	const existingDirs = dirs.filter((d) => existsSync(d));
+	const existingDirs = uniqueExistingDirs([...projectSkillDirs(cwd), ...userSkillDirs()]);
 	const files = existingDirs.flatMap(findSkillFiles).sort();
 	const cachePath = join(cwd, CACHE_REL_PATH);
 	const registryPath = join(cwd, REGISTRY_REL_PATH);
@@ -234,13 +269,46 @@ function regenerateRegistry(cwd: string, force: boolean): RegenResult {
 	return { regenerated: true, skillCount: deduped.length, reason: force ? "forced" : "fingerprint-changed" };
 }
 
+const watchedCwds = new Set<string>();
+
+function startSkillRegistryWatcher(cwd: string, notify: (message: string) => void): void {
+	if (watchedCwds.has(cwd)) return;
+	watchedCwds.add(cwd);
+	const dirs = uniqueExistingDirs([...projectSkillDirs(cwd), ...userSkillDirs()]);
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const refresh = () => {
+		if (timer) clearTimeout(timer);
+		timer = setTimeout(() => {
+			try {
+				const result = regenerateRegistry(cwd, false);
+				if (result.regenerated) {
+					notify(`Skill registry refreshed (${result.skillCount} skills)`);
+				}
+			} catch {
+				// Keep the watcher best-effort; session_start/manual refresh surfaces detailed failures.
+			}
+		}, WATCH_DEBOUNCE_MS);
+	};
+	for (const dir of dirs) {
+		try {
+			watch(dir, { recursive: true }, refresh);
+		} catch {
+			// Some filesystems do not support recursive watches; session_start/manual refresh still work.
+		}
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		try {
+			ensureAtlIgnored(ctx.cwd);
 			const result = regenerateRegistry(ctx.cwd, false);
 			if (result.regenerated && ctx.hasUI) {
 				ctx.ui.notify(`Skill registry refreshed (${result.skillCount} skills)`, "info");
 			}
+			startSkillRegistryWatcher(ctx.cwd, (message) => {
+				if (ctx.hasUI) ctx.ui.notify(message, "info");
+			});
 		} catch (error) {
 			if (ctx.hasUI) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -253,6 +321,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Regenerate .atl/skill-registry.md from local skill sources.",
 		handler: async (_args, ctx) => {
 			try {
+				ensureAtlIgnored(ctx.cwd);
 				const result = regenerateRegistry(ctx.cwd, true);
 				ctx.ui.notify(
 					`Skill registry: ${result.skillCount} skill(s) written to ${REGISTRY_REL_PATH}`,
