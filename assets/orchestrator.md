@@ -34,9 +34,11 @@ el Gentleman is an ecosystem configurator and harness layer. After installation,
 - User says "use sdd" / "hacelo con sdd": run the SDD flow.
 - Parent session orchestrates; phase agents execute.
 
+Delegation is not optional once complexity appears. If a task crosses the triggers below, use the smallest useful subagent workflow instead of continuing as a monolithic executor.
+
 ## Work Routing Ladder
 
-Route work through the smallest harness that is safe.
+Route work through the smallest harness that is safe. "Smallest" means minimal safe coordination, not zero delegation by default.
 
 ### 1. Inline Direct
 
@@ -49,7 +51,7 @@ Examples:
 - focused verification over 1-3 files;
 - bash for state, e.g. `git status` or `gh issue view`.
 
-Do not add SDD ceremony. Do not delegate just to look sophisticated.
+Do not add SDD ceremony. Do not delegate just to look sophisticated. But do not use this exception to avoid delegation after the task stops being small.
 
 ### 2. Simple Delegation
 
@@ -65,6 +67,14 @@ Examples:
 - fresh-context review.
 
 Use `pi-subagents` when available. Prefer background/async for long exploration, implementation, tests, or review when the parent has independent work.
+
+Default balanced pattern for bounded implementation:
+
+```text
+parent clarifies and checks git → scout/context-builder when context-heavy → one worker writes → fresh reviewer audits diff → parent validates and reports
+```
+
+Do not make every task SDD. Do make non-trivial tasks multi-agent at the narrowest useful point.
 
 ### 3. SDD
 
@@ -85,15 +95,58 @@ If the request is large enough for SDD, do not jump directly to implementation. 
 
 Core question: does this inflate parent context without need?
 
-| Action | Inline | Delegate |
-|---|---:|---:|
-| Read to decide/verify 1-3 files | yes | no |
-| Read to explore/understand 4+ files | no | yes |
-| Read as preparation for multi-file writing | no | yes |
-| Write atomic one-file mechanical change | yes | no |
-| Write with analysis across multiple files | no | yes |
-| Bash for state, e.g. git status | yes | no |
-| Bash for execution, e.g. tests/builds | no | yes |
+| Action                                               | Inline |                Delegate |
+| ---------------------------------------------------- | -----: | ----------------------: |
+| Read to decide/verify 1-3 files                      |    yes |                      no |
+| Read to explore/understand 4+ files                  |     no |                     yes |
+| Read as preparation for multi-file writing           |     no |                     yes |
+| Write atomic one-file mechanical change              |    yes |                      no |
+| Write with analysis across multiple files            |     no |                     yes |
+| Bash for state, e.g. git status                      |    yes |                      no |
+| Bash for execution, e.g. tests/builds                |     no |                     yes |
+| Commit, push, or open PR after code changes          |     no | yes, fresh review first |
+| Recover from wrong cwd/worktree/git/tooling incident |     no |  yes, fresh audit first |
+
+### Mandatory Delegation Triggers
+
+These are parent-orchestrator stop rules. Once any trigger fires, the parent must either delegate or explicitly tell the user why delegation would be unsafe or wasteful for this exact case. Do not inject these as child-agent permission to spawn subagents; children receive concrete role work and must not orchestrate.
+
+1. **4-file rule**: if understanding requires reading 4+ files, launch `scout` or `context-builder` with fresh context and a narrow mapping task.
+2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, use one `worker` or keep writing inline only if a fresh reviewer will audit before completion.
+3. **PR rule**: before commit/push/PR for code changes, run a fresh-context `reviewer` unless the diff is a trivial docs/text-only change.
+4. **Incident rule**: after wrong `cwd`, accidental repo/worktree mutation, failed merge recovery, confusing test command, or environment workaround, stop and run a fresh audit reviewer.
+5. **Long-session rule**: if accumulating work is no longer clearly local — roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without delegation — pause and choose `scout`, `worker`, or `reviewer` instead of silently continuing monolithically.
+6. **Fresh review rule**: use `context: "fresh"` for adversarial review of diffs, conflicts, PR readiness, and incident audits. Use forked context for continuity-oriented `worker`/`oracle` tasks.
+
+### Cost and Context Balance
+
+Prefer delegation when fresh context improves correctness more than token savings:
+
+- Use `scout`/`context-builder` to compress broad repo exploration into a short handoff instead of loading many files into the parent.
+- Use a single `worker` for one writer thread; do not run parallel writers unless isolated worktrees are explicitly approved.
+- Use fresh `reviewer` agents after implementation, conflict resolution, or incidents because their value is independence from the parent's assumptions.
+- Use `outputMode: "file-only"` for large child reports and summarize only decisions, blockers, and paths in the parent thread.
+- Avoid delegation for truly local one-file fixes, quick state checks, and already-understood mechanical edits.
+
+### Canonical Lightweight Workflows
+
+Bugfix with unfamiliar flow:
+
+```text
+parent git/status + clarify → scout fresh maps flow/files → parent decides → worker fork implements + tests → reviewer fresh audits diff → parent validates
+```
+
+Conflict or dependency-marker cleanup:
+
+```text
+parent reproduces/checks conflict → parent or worker resolves → reviewer fresh checks markers, package/lock consistency, and repo cleanliness → parent reports/pushes
+```
+
+After tooling/worktree incident:
+
+```text
+stop writes → parent captures git status → reviewer fresh audits affected repos/worktrees with no edits → parent applies only confirmed recovery steps
+```
 
 ## SDD Workflow
 
@@ -215,12 +268,12 @@ Discovery order:
 
 Common intent hints, not hard routing:
 
-| User intent | Skill to check |
-|---|---|
-| PR review / GitHub PR URL | project review skill, then `pr-review` |
-| Post-ready review comments | `comment-writer` |
-| Create/open/prepare PR | `branch-pr` |
-| Split/stack/large PR | `chained-pr` |
+| User intent                | Skill to check                         |
+| -------------------------- | -------------------------------------- |
+| PR review / GitHub PR URL  | project review skill, then `pr-review` |
+| Post-ready review comments | `comment-writer`                       |
+| Create/open/prepare PR     | `branch-pr`                            |
+| Split/stack/large PR       | `chained-pr`                           |
 
 Keep this lightweight: loading a skill should improve the immediate task, not force extra ceremony.
 

@@ -110,7 +110,27 @@ Typical flow:
 | Unknown codebase area or context-heavy investigation                        | Focused subagent delegation. |
 | Large, ambiguous, architectural, product-facing, or high-review-risk change | SDD/OpenSpec flow.           |
 
-The goal is not ceremony. The goal is to avoid accidental chaos.
+The goal is not ceremony. The goal is to avoid accidental chaos. Once a task stops being small, delegation is expected rather than optional.
+
+### Delegation triggers
+
+`gentle-pi` keeps the parent session thin and uses subagents at the narrowest useful point:
+
+| Trigger                                                                                                                     | Expected behavior                                                    |
+| --------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Reading 4+ files to understand a flow                                                                                       | Launch `scout` or `context-builder` and synthesize its handoff.      |
+| Touching 2+ non-trivial code files                                                                                          | Use one `worker`, or require fresh review before completion.         |
+| Commit, push, or PR after code changes                                                                                      | Run a fresh-context `reviewer` unless the diff is trivial docs/text. |
+| Wrong cwd, worktree/git accident, merge recovery, confusing test/env issue                                                  | Stop and run a fresh audit reviewer before continuing.               |
+| Long monolithic session with accumulating complexity, roughly 20 tool calls, 5 exploratory reads, or 2 non-mechanical edits | Pause and delegate or explain why not.                               |
+
+The intended balanced loop for a bounded bugfix is:
+
+```text
+parent git/status + clarify → scout when context-heavy → one worker writes → fresh reviewer audits → parent validates and reports
+```
+
+Fresh reviewers are intentionally not token-saving devices; they buy independent judgment. `scout`/`context-builder` save parent context by compressing broad exploration. `worker` preserves a single writer thread.
 
 ## SDD/OpenSpec flow
 
