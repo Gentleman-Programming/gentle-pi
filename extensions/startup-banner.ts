@@ -185,42 +185,79 @@ export default function (pi: ExtensionAPI) {
             const flashPhase = tick >= flashStartTick ? Math.max(0, 1 - (tick - flashStartTick) / 20) : 0;
             const frame = Math.floor(tick / 2);
 
+            const sideBySideMinWidth = roseBase.width + 3 + logoBase.width + 4;
+            const wideStatsMinWidth = 122;
+            const horizontal = width >= sideBySideMinWidth;
+            const wideStats = width >= wideStatsMinWidth;
+
             const b = new LayoutBuilder();
             b.addRow();
             b.center(width);
 
-            const rowCount = roseBase.lines.length;
-            const logoOffset = Math.max(0, Math.floor((rowCount - logoBase.lines.length) / 2));
+            if (horizontal) {
+              const rowCount = roseBase.lines.length;
+              const logoOffset = Math.max(0, Math.floor((rowCount - logoBase.lines.length) / 2));
 
-            for (let i = 0; i < rowCount; i++) {
-              const roseLine = roseBase.lines[i] || " ".repeat(roseBase.width);
-              const logoLine = i >= logoOffset && i < logoOffset + logoBase.lines.length
-                ? logoBase.lines[i - logoOffset]
-                : " ".repeat(logoBase.width);
+              for (let i = 0; i < rowCount; i++) {
+                const roseLine = roseBase.lines[i] || " ".repeat(roseBase.width);
+                const logoLine = i >= logoOffset && i < logoOffset + logoBase.lines.length
+                  ? logoBase.lines[i - logoOffset]
+                  : " ".repeat(logoBase.width);
 
+                b.addRow();
+                b.add("rose", roseLine);
+                b.add("none", "   ");
+                b.add("banner", logoLine);
+                b.center(width);
+              }
+            } else {
+              for (const logoLine of logoBase.lines) {
+                b.addRow();
+                b.add("banner", logoLine);
+                b.center(width);
+              }
               b.addRow();
-              b.add("rose", roseLine);
-              b.add("none", "   ");
-              b.add("banner", logoLine);
               b.center(width);
+              for (const roseLine of roseBase.lines) {
+                b.addRow();
+                b.add("rose", roseLine);
+                b.center(width);
+              }
             }
 
             b.addRow();
             b.center(width);
 
-            const fit = (v: any, w: number) => String(v ?? "").replace(/\s+/g, " ").trim().slice(0, w).padEnd(w);
-            const addSysRow = (l1: string, v1: string, l2: string, v2: string) => {
+            const fit = (v: unknown, w: number) =>
+              String(v ?? "").replace(/\s+/g, " ").trim().slice(0, w).padEnd(w);
+            const addWideRow = (l1: string, v1: string, l2: string, v2: string) => {
               b.addRow();
               b.add("label", fit(l1, 10)); b.add("none", " "); b.add("value", fit(v1, 48));
               b.add("none", "   ");
               b.add("label", fit(l2, 12)); b.add("none", " "); b.add("value", fit(v2, 46));
               b.center(width);
             };
+            const addNarrowRow = (label: string, value: string) => {
+              b.addRow();
+              b.add("label", fit(label, 12)); b.add("none", " "); b.add("value", value);
+              b.center(width);
+            };
 
-            addSysRow("GIT:", gitBranch, "PATH:", ctx.cwd);
-            addSysRow("MCP:", `${mcpServersCount} server(s)`, "PLUGINS:", `${packagesCount} package(s)`);
-            addSysRow("AGENTS:", `${skills.length} loaded`, "EXTENSIONS:", `${extensionsCount} active`);
-            addSysRow("VER:", `v${VERSION}`, "TOOLS:", `${customTools.length} custom`);
+            if (wideStats) {
+              addWideRow("GIT:", gitBranch, "PATH:", ctx.cwd);
+              addWideRow("MCP:", `${mcpServersCount} server(s)`, "PLUGINS:", `${packagesCount} package(s)`);
+              addWideRow("AGENTS:", `${skills.length} loaded`, "EXTENSIONS:", `${extensionsCount} active`);
+              addWideRow("VER:", `v${VERSION}`, "TOOLS:", `${customTools.length} custom`);
+            } else {
+              addNarrowRow("GIT:", gitBranch);
+              addNarrowRow("PATH:", ctx.cwd);
+              addNarrowRow("MCP:", `${mcpServersCount} server(s)`);
+              addNarrowRow("PLUGINS:", `${packagesCount} package(s)`);
+              addNarrowRow("AGENTS:", `${skills.length} loaded`);
+              addNarrowRow("EXTENSIONS:", `${extensionsCount} active`);
+              addNarrowRow("VER:", `v${VERSION}`);
+              addNarrowRow("TOOLS:", `${customTools.length} custom`);
+            }
 
             b.addRow(); b.center(width);
 
