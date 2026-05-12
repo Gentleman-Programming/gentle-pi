@@ -1,3 +1,14 @@
+# Reject installs of packages published less than 3 days ago (4320 minutes).
+# Supply-chain defense — most malicious packages are caught within a few days.
+minimumReleaseAge: 4320
+
+# Refuse to install a package whose maintainer trust level has decreased
+# (e.g. previously verified publisher loses verification).
+trustPolicy: no-downgrade
+
+# Block transitive dependencies from using git: or tarball sources.
+blockExoticSubdeps: true
+
 allowBuilds:
   '@google/genai': true
   koffi: true

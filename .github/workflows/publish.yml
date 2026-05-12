@@ -1,0 +1,41 @@
+name: Publish to npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      dist-tag:
+        description: 'npm dist-tag (latest, next, beta)'
+        required: false
+        default: 'latest'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify package contents
+        run: node scripts/verify-package-files.mjs
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public --tag "${{ inputs.dist-tag }}"
