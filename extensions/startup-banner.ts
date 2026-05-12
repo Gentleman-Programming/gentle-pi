@@ -266,17 +266,25 @@ export default function (pi: ExtensionAPI) {
                 b.center(width);
               }
             } else {
-              for (const logoLine of logoBase.lines) {
-                b.addRow();
-                b.add("banner", logoLine);
-                b.center(width);
+              const showBanner = width >= logoBase.width + 2;
+              const showRose = width >= roseBase.width + 2;
+              if (showBanner) {
+                for (const logoLine of logoBase.lines) {
+                  b.addRow();
+                  b.add("banner", logoLine);
+                  b.center(width);
+                }
+                if (showRose) {
+                  b.addRow();
+                  b.center(width);
+                }
               }
-              b.addRow();
-              b.center(width);
-              for (const roseLine of roseBase.lines) {
-                b.addRow();
-                b.add("rose", roseLine);
-                b.center(width);
+              if (showRose) {
+                for (const roseLine of roseBase.lines) {
+                  b.addRow();
+                  b.add("rose", roseLine);
+                  b.center(width);
+                }
               }
             }
 
@@ -305,11 +313,29 @@ export default function (pi: ExtensionAPI) {
               b.add("value", fit(v2, 46));
               b.center(width);
             };
+            const narrowRows: Array<[string, string]> = [
+              ["GIT:", gitBranch],
+              ["PATH:", ctx.cwd],
+              ["MCP:", `${mcpServersCount} server(s)`],
+              ["PLUGINS:", `${packagesCount} package(s)`],
+              ["AGENTS:", `${skills.length} loaded`],
+              ["EXTENSIONS:", `${extensionsCount} active`],
+              ["VER:", `v${VERSION}`],
+              ["TOOLS:", `${customTools.length} custom`],
+            ];
+            const narrowLabelW = Math.max(...narrowRows.map(([l]) => l.length));
+            const narrowValueW = Math.max(
+              0,
+              Math.min(
+                Math.max(...narrowRows.map(([, v]) => v.length)),
+                Math.max(8, width - narrowLabelW - 4),
+              ),
+            );
             const addNarrowRow = (label: string, value: string) => {
               b.addRow();
-              b.add("label", fit(label, 12));
-              b.add("none", " ");
-              b.add("value", value);
+              b.add("label", label.padEnd(narrowLabelW));
+              b.add("none", "  ");
+              b.add("value", fit(value, narrowValueW));
               b.center(width);
             };
 
