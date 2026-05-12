@@ -310,6 +310,7 @@ Memory contract for SDD delegation:
 | Path                           | Purpose                                                                                                    |
 | ------------------------------ | ---------------------------------------------------------------------------------------------------------- |
 | `extensions/gentle-ai.ts`      | Injects identity, installs assets, registers commands, applies model config, and protects shell execution. |
+| `extensions/startup-banner.ts` | Shows the rose startup intro, compact runtime panel, and collaboration credit.                             |
 | `extensions/sdd-init.ts`       | Registers `/sdd-init` for OpenSpec initialization.                                                         |
 | `extensions/skill-registry.ts` | Maintains `.atl/skill-registry.md` from project/user skills.                                               |
 | `assets/orchestrator.md`       | Parent-session orchestration contract.                                                                     |
@@ -332,6 +333,8 @@ Validate before publishing:
 ```bash
 bun build extensions/skill-registry.ts --target=node --format=esm --outfile=/tmp/skill-registry.js
 node --experimental-strip-types --check extensions/gentle-ai.ts
+node --experimental-strip-types --check extensions/sdd-init.ts
+node --experimental-strip-types --check extensions/startup-banner.ts
 npm pack --dry-run
 ```
 
