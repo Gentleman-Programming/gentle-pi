@@ -25,6 +25,8 @@ Follow the project and the community around it:
 - YouTube: [Gentleman Programming](https://www.youtube.com/c/GentlemanProgramming)
 - Community Discord: [Gentleman Programming](https://discord.com/invite/gentleman-programming-769863833996754944)
 
+Startup intro collaboration: thanks to [@aporcelli](https://github.com/aporcelli) for [`pi-gentle-startup`](https://github.com/aporcelli/pi-gentle-startup), which inspired the clean-screen startup animation, compact runtime panel, and pink visual treatment.
+
 ## The problem
 
 Most coding-agent sessions fail for operational reasons, not model reasons:
@@ -44,6 +46,7 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | Capability                     | What it does                                                                                                                         |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
 | **el Gentleman persona**       | Makes Pi behave like a senior architect and teacher, not a generic chatbot. Spanish responses use Rioplatense voseo by default.      |
+| **Rose startup intro**         | Adds a pink rose fade-in, compact project/runtime panel, and visible startup collaboration credit for @aporcelli's `pi-gentle-startup` ideas. |
 | **Work routing discipline**    | Small tasks stay inline. Context-heavy exploration can be delegated. Large or risky changes go through SDD/OpenSpec.                 |
 | **SDD/OpenSpec assets**        | Installs phase agents and chains for `init`, `explore`, `proposal`, `spec`, `design`, `tasks`, `apply`, `verify`, and `archive`.     |
 | **Subagent orchestration**     | Keeps one parent session responsible while child agents explore, implement, test, or review with focused context.                    |

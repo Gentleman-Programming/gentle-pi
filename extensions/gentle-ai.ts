@@ -1,3 +1,4 @@
+import { exec } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
@@ -5,10 +6,14 @@ import {
 	readFileSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { cpus, freemem, homedir, totalmem, type as osType } from "node:os";
+import { promisify } from "node:util";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { VERSION } from "@earendil-works/pi-coding-agent";
+import {
+	SessionManager,
+	VERSION,
+} from "@earendil-works/pi-coding-agent";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -20,6 +25,8 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
+
+const execAsync = promisify(exec);
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
@@ -101,6 +108,54 @@ function pinkFade(text: string, frame: number): string {
 	return rgb(r, g, b, text);
 }
 
+interface StartupInfo {
+	machine: string;
+	project: string;
+	commands: number;
+	tools: number;
+	recentSessions: number;
+	branch: string;
+}
+
+function initialStartupInfo(ctx: ExtensionContext, pi: ExtensionAPI): StartupInfo {
+	const cpu = cpus()[0]?.model.replace(/\(R\)|\(TM\)/g, "").trim() ?? osType();
+	const totalRam = (totalmem() / 1073741824).toFixed(1);
+	const usedRam = ((totalmem() - freemem()) / 1073741824).toFixed(1);
+	return {
+		machine: `${truncateToWidth(cpu, 18, "")} · ${usedRam}/${totalRam} GB`,
+		project: ctx.cwd.split("/").pop() || ctx.cwd,
+		commands: pi.getCommands().length,
+		tools: pi.getAllTools().length,
+		recentSessions: 0,
+		branch: "loading",
+	};
+}
+
+async function hydrateStartupInfo(
+	ctx: ExtensionContext,
+	info: StartupInfo,
+): Promise<void> {
+	try {
+		const { stdout } = await execAsync(`git -C "${ctx.cwd}" branch --show-current`, {
+			timeout: 700,
+		});
+		info.branch = stdout.trim() || "detached";
+	} catch {
+		info.branch = "no git";
+	}
+
+	try {
+		const sessions = (await SessionManager.list(ctx.cwd)) as unknown[];
+		const currentId = ctx.sessionManager.getSessionId();
+		info.recentSessions = sessions.filter((session) => {
+			if (!session || typeof session !== "object") return false;
+			return (session as { id?: string }).id !== currentId;
+		}).length;
+	} catch {
+		info.recentSessions = 0;
+	}
+}
+
 function buildGentlemanTitle(width: number, frame: number): string[] {
 	const title = "✧  𝓮𝓵 𝓖𝓮𝓷𝓽𝓵𝓮𝓶𝓪𝓷  ✧";
 	const version = `━━  v${VERSION}  ━━`;
@@ -110,21 +165,41 @@ function buildGentlemanTitle(width: number, frame: number): string[] {
 	];
 }
 
+function buildStartupPanel(
+	width: number,
+	frame: number,
+	info: StartupInfo,
+): string[] {
+	const projectLine = `project ${info.project} · ${info.branch}`;
+	const runtimeLine = `${info.machine} · ${info.commands} commands · ${info.tools} tools · ${info.recentSessions} sessions`;
+	const collabLine = "startup collab ✦ @aporcelli / pi-gentle-startup";
+	return [
+		pinkFade(centerLine(projectLine, width), frame),
+		pinkFade(centerLine(runtimeLine, width), frame),
+		pinkFade(italic(centerLine(collabLine, width)), frame),
+	];
+}
+
 function buildRoseHeader(
 	_theme: Theme,
 	width: number,
 	frame: number,
+	info: StartupInfo,
 ): string[] {
 	return [
 		"",
 		...ROSE_LOGO_LINES.map((line) => pinkFade(centerLine(line, width), frame)),
 		...buildGentlemanTitle(width, frame),
 		"",
+		...buildStartupPanel(width, frame, info),
+		"",
 	];
 }
 
-function installRoseHeader(ctx: ExtensionContext): void {
+function installRoseHeader(ctx: ExtensionContext, pi: ExtensionAPI): void {
 	if (!ctx.hasUI) return;
+
+	const startupInfo = initialStartupInfo(ctx, pi);
 
 	process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
 
@@ -154,6 +229,7 @@ function installRoseHeader(ctx: ExtensionContext): void {
 
 	const state: { frame: number; timer?: NodeJS.Timeout } = { frame: 0 };
 	ctx.ui.setHeader((tui, theme) => {
+		void hydrateStartupInfo(ctx, startupInfo).then(() => tui.requestRender());
 		if (state.timer) clearInterval(state.timer);
 		state.timer = setInterval(() => {
 			state.frame += 1;
@@ -171,7 +247,7 @@ function installRoseHeader(ctx: ExtensionContext): void {
 
 		return {
 			render(width: number): string[] {
-				return buildRoseHeader(theme, width, state.frame);
+				return buildRoseHeader(theme, width, state.frame, startupInfo);
 			},
 			invalidate() {
 				if (state.timer) clearInterval(state.timer);
@@ -911,7 +987,7 @@ async function handlePersonaCommand(ctx: ExtensionContext): Promise<void> {
 
 export default function gentleAi(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
-		installRoseHeader(ctx);
+		installRoseHeader(ctx, pi);
 		const result = installSddAssets(ctx.cwd, false);
 		const modelResult = applyModelConfig(ctx.cwd, readModelConfig(ctx.cwd));
 		if (
