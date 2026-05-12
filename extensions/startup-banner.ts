@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { VERSION } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import * as os from "node:os";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
@@ -9,12 +10,17 @@ import { join } from "node:path";
 const execAsync = promisify(exec);
 
 const TEXT_LOGO = [
-  "  ██████╗ ███████╗███╗   ██╗████████╗██╗     ███████╗      ██████╗ ██╗",
-  " ██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝██║     ██╔════╝      ██╔══██╗██║",
-  " ██║  ███╗█████╗  ██╔██╗ ██║   ██║   ██║     █████╗  █████╗██████╔╝██║",
-  " ██║   ██║██╔══╝  ██║╚██╗██║   ██║   ██║     ██╔══╝  ╚════╝██╔═══╝ ██║",
-  " ╚██████╔╝███████╗██║ ╚████║   ██║   ███████╗███████╗      ██║     ██║",
-  "  ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚══════╝      ╚═╝     ╚═╝",
+  "                  ▄▄▄▀▀▀▀▀██                                ▄▄▀▄▄           ▄▄█▀▀▀██   ▀▀█▄    ▄▄▄",
+  "              ▄▄█▀▀▒▒▒▒▒▄▄█▀▒                   ▄██     ▄▄█▀█▄█▀▒▒      ▄█▀▀ ▒▒▒▄█▀▀▒   ▄██▒ ▄█▀▒▒▒",
+  "          ▄▄██▀▒▒▒▒▒▄▄▄▀▀▒▒▒▒        ▄▄▄  ▀▀▀▀██▀▀▀▀▀███▀█▄▀▀▒▒▒▒      ██▒▒▒▒▄▄█▀▒▒▒▒▄▄█▀▀▄██▀▒▒▒",
+  "        ▄██▀▒▒▒▒     ▒▒▄▄█ ▄▄▄▀██ ▄▄▄▀▀▀▄  ▄██▀▒▒▒▒▄██▀▀▀▒▄▄███         ▒▒ ▄███▄▄▄█▀▀▀▒▒▄██▀▒▒▒",
+  "       ██▀▒▒▒     ▄▄▄███▀▄██▀▀▀▄▄██▀▀▄█▀▄▄██▀▒▒▒▄▄██▀▒▒▄██▀▀▀▄▄▀▀▀▀▀▀▀▀▀ ▄█▀▀▒▒▒▒▒▒▒▒▒▄██▒▒▒▒",
+  "       ▀█▄▄▄▄▄▀▀▀█▄▄███▄▒▀▀▀▀▀▀▒▀▀▒▒▀▀▀▀▒██▄▄▀▀▀ ▀█▄▀▀▀ ▀▀▀▀▀▒▒▒▒▒▒▒▒▒▒▄██▀▒▒▒       ███▒▒",
+  "        ▒▄▄▄█▀▀▀█▄█▀▀▒▒▒▒ ▒▒▒▒▒▒ ▒▒  ▒▒▒▒ ▒▒▒▒▒▒▒ ▒▒▒▒▒▒ ▒▒▒▒▒        ▀▀▀▒▒▒          ▒▒▒",
+  "     ▄▄▀▀ ▒▒▒▒▄██▀▒▒▒▒                                                 ▒▒▒",
+  "   ▄█ ▒▒▒▄▄██▀▀▒▒▒▒",
+  "    ▀▀▀▀▀▀▒▒▒▒▒▒",
+  "     ▒▒▒▒▒▒",
 ];
 
 const ROSE_LARGE_RAW = [
@@ -55,7 +61,14 @@ function padLines(lines: string[]): { lines: string[]; width: number } {
   return { lines: lines.map((l) => l.padEnd(width)), width };
 }
 
-type CellType = "banner" | "rose" | "label" | "value" | "dim" | "accent" | "none";
+type CellType =
+  | "banner"
+  | "rose"
+  | "label"
+  | "value"
+  | "dim"
+  | "accent"
+  | "none";
 type LayoutCell = { char: string; type: CellType };
 
 class LayoutBuilder {
@@ -73,7 +86,10 @@ class LayoutBuilder {
   center(width: number) {
     const row = this.lines[this.lines.length - 1];
     const pad = Math.max(0, Math.floor((width - row.length) / 2));
-    const prefix = Array.from({ length: pad }, () => ({ char: " ", type: "none" as const }));
+    const prefix = Array.from({ length: pad }, () => ({
+      char: " ",
+      type: "none" as const,
+    }));
     this.lines[this.lines.length - 1] = prefix.concat(row);
   }
 }
@@ -83,7 +99,9 @@ export default function (pi: ExtensionAPI) {
     if (!ctx.hasUI) return;
 
     // Si se está ejecutando un comando de CLI como "pi update" o "pi install", no mostramos la intro animada.
-    const isCLICommand = process.argv.length > 2 && !process.argv.every(arg => arg.startsWith('-') || arg.endsWith('.ts'));
+    const isCLICommand =
+      process.argv.length > 2 &&
+      !process.argv.every((arg) => arg.startsWith("-") || arg.endsWith(".ts"));
     if (isCLICommand) return;
 
     process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
@@ -93,17 +111,23 @@ export default function (pi: ExtensionAPI) {
       if (!closeIntro) return;
       const fn = closeIntro;
       closeIntro = null;
-      try { fn(); } catch {}
+      try {
+        fn();
+      } catch {}
     };
 
-    void ctx.ui.custom((_tui, _theme, _keybindings, done) => {
-      closeIntro = () => done(undefined);
-      return {
-        render: () => [""],
-        invalidate: () => {},
-        handleInput: () => {},
-      };
-    }).catch(() => { closeIntro = null; });
+    void ctx.ui
+      .custom((_tui, _theme, _keybindings, done) => {
+        closeIntro = () => done(undefined);
+        return {
+          render: () => [""],
+          invalidate: () => {},
+          handleInput: () => {},
+        };
+      })
+      .catch(() => {
+        closeIntro = null;
+      });
 
     const roseBase = padLines(normalizeAscii(ROSE_LARGE_RAW));
     const logoBase = padLines(TEXT_LOGO);
@@ -116,19 +140,26 @@ export default function (pi: ExtensionAPI) {
     const allCommands = pi.getCommands();
     const skills = allCommands.filter((c) => c.source === "skill");
     const allTools = pi.getAllTools();
-    const customTools = allTools.filter((t) => !["builtin", "sdk"].includes(t.sourceInfo.source));
+    const customTools = allTools.filter(
+      (t) => !["builtin", "sdk"].includes(t.sourceInfo.source),
+    );
 
     setTimeout(() => {
-      execAsync(`git -C "${ctx.cwd}" branch --show-current`).then(({ stdout }) => {
-        const b = stdout.trim();
-        gitBranch = b ? `On branch ${b}` : "Detached HEAD";
-      }).catch(() => {});
+      execAsync(`git -C "${ctx.cwd}" branch --show-current`)
+        .then(({ stdout }) => {
+          const b = stdout.trim();
+          gitBranch = b ? `On branch ${b}` : "Detached HEAD";
+        })
+        .catch(() => {});
     }, 100);
 
     setTimeout(() => {
       (async () => {
         try {
-          const raw = await readFile(join(os.homedir(), ".pi", "agent", "mcp.json"), "utf8");
+          const raw = await readFile(
+            join(os.homedir(), ".pi", "agent", "mcp.json"),
+            "utf8",
+          );
           const cfg = JSON.parse(raw);
           mcpServersCount = Object.keys(cfg.mcpServers || {}).length;
         } catch {
@@ -140,9 +171,14 @@ export default function (pi: ExtensionAPI) {
     setTimeout(() => {
       (async () => {
         try {
-          const raw = await readFile(join(os.homedir(), ".pi", "agent", "settings.json"), "utf8");
+          const raw = await readFile(
+            join(os.homedir(), ".pi", "agent", "settings.json"),
+            "utf8",
+          );
           const cfg = JSON.parse(raw);
-          extensionsCount = Array.isArray(cfg.extensions) ? cfg.extensions.length : 0;
+          extensionsCount = Array.isArray(cfg.extensions)
+            ? cfg.extensions.length
+            : 0;
           packagesCount = Array.isArray(cfg.packages) ? cfg.packages.length : 0;
         } catch {
           extensionsCount = 0;
@@ -182,7 +218,10 @@ export default function (pi: ExtensionAPI) {
           render(width: number): string[] {
             const flashStartTick = 16;
             const roseOpacity = Math.min(1, tick / 16);
-            const flashPhase = tick >= flashStartTick ? Math.max(0, 1 - (tick - flashStartTick) / 20) : 0;
+            const flashPhase =
+              tick >= flashStartTick
+                ? Math.max(0, 1 - (tick - flashStartTick) / 20)
+                : 0;
             const frame = Math.floor(tick / 2);
 
             const sideBySideMinWidth = roseBase.width + 3 + logoBase.width + 4;
@@ -195,14 +234,30 @@ export default function (pi: ExtensionAPI) {
             b.center(width);
 
             if (horizontal) {
-              const rowCount = roseBase.lines.length;
-              const logoOffset = Math.max(0, Math.floor((rowCount - logoBase.lines.length) / 2));
+              const rowCount = Math.max(
+                roseBase.lines.length,
+                logoBase.lines.length,
+              );
+              const roseOffset = Math.max(
+                0,
+                Math.floor((rowCount - roseBase.lines.length) / 2),
+              );
+              const logoOffset = Math.max(
+                0,
+                Math.floor((rowCount - logoBase.lines.length) / 2),
+              );
 
               for (let i = 0; i < rowCount; i++) {
-                const roseLine = roseBase.lines[i] || " ".repeat(roseBase.width);
-                const logoLine = i >= logoOffset && i < logoOffset + logoBase.lines.length
-                  ? logoBase.lines[i - logoOffset]
-                  : " ".repeat(logoBase.width);
+                const roseI = i - roseOffset;
+                const logoI = i - logoOffset;
+                const roseLine =
+                  roseI >= 0 && roseI < roseBase.lines.length
+                    ? roseBase.lines[roseI]
+                    : " ".repeat(roseBase.width);
+                const logoLine =
+                  logoI >= 0 && logoI < logoBase.lines.length
+                    ? logoBase.lines[logoI]
+                    : " ".repeat(logoBase.width);
 
                 b.addRow();
                 b.add("rose", roseLine);
@@ -229,25 +284,55 @@ export default function (pi: ExtensionAPI) {
             b.center(width);
 
             const fit = (v: unknown, w: number) =>
-              String(v ?? "").replace(/\s+/g, " ").trim().slice(0, w).padEnd(w);
-            const addWideRow = (l1: string, v1: string, l2: string, v2: string) => {
+              String(v ?? "")
+                .replace(/\s+/g, " ")
+                .trim()
+                .slice(0, w)
+                .padEnd(w);
+            const addWideRow = (
+              l1: string,
+              v1: string,
+              l2: string,
+              v2: string,
+            ) => {
               b.addRow();
-              b.add("label", fit(l1, 10)); b.add("none", " "); b.add("value", fit(v1, 48));
+              b.add("label", fit(l1, 10));
+              b.add("none", " ");
+              b.add("value", fit(v1, 48));
               b.add("none", "   ");
-              b.add("label", fit(l2, 12)); b.add("none", " "); b.add("value", fit(v2, 46));
+              b.add("label", fit(l2, 12));
+              b.add("none", " ");
+              b.add("value", fit(v2, 46));
               b.center(width);
             };
             const addNarrowRow = (label: string, value: string) => {
               b.addRow();
-              b.add("label", fit(label, 12)); b.add("none", " "); b.add("value", value);
+              b.add("label", fit(label, 12));
+              b.add("none", " ");
+              b.add("value", value);
               b.center(width);
             };
 
             if (wideStats) {
               addWideRow("GIT:", gitBranch, "PATH:", ctx.cwd);
-              addWideRow("MCP:", `${mcpServersCount} server(s)`, "PLUGINS:", `${packagesCount} package(s)`);
-              addWideRow("AGENTS:", `${skills.length} loaded`, "EXTENSIONS:", `${extensionsCount} active`);
-              addWideRow("VER:", `v${VERSION}`, "TOOLS:", `${customTools.length} custom`);
+              addWideRow(
+                "MCP:",
+                `${mcpServersCount} server(s)`,
+                "PLUGINS:",
+                `${packagesCount} package(s)`,
+              );
+              addWideRow(
+                "AGENTS:",
+                `${skills.length} loaded`,
+                "EXTENSIONS:",
+                `${extensionsCount} active`,
+              );
+              addWideRow(
+                "VER:",
+                `v${VERSION}`,
+                "TOOLS:",
+                `${customTools.length} custom`,
+              );
             } else {
               addNarrowRow("GIT:", gitBranch);
               addNarrowRow("PATH:", ctx.cwd);
@@ -259,14 +344,15 @@ export default function (pi: ExtensionAPI) {
               addNarrowRow("TOOLS:", `${customTools.length} custom`);
             }
 
-            b.addRow(); b.center(width);
+            b.addRow();
+            b.center(width);
 
             const out: string[] = [];
             const layout = b.lines;
 
             for (let y = 0; y < layout.length; y++) {
               const row = layout[y] || [];
-              const firstBannerX = row.findIndex((c) => c.type === "banner" && c.char !== " ");
+              const firstBannerX = row.findIndex((c) => c.type === "banner");
               let line = "";
 
               for (let x = 0; x < row.length; x++) {
@@ -284,7 +370,7 @@ export default function (pi: ExtensionAPI) {
                   const rBase = Math.floor(255 * k);
                   const gBase = Math.floor(118 * k);
                   const bBase = Math.floor(195 * k);
-                  
+
                   if (f > 0.85) {
                     line += `\x1b[1m\x1b[38;2;255;255;255m${cell.char}\x1b[0m`;
                   } else {
@@ -297,10 +383,15 @@ export default function (pi: ExtensionAPI) {
                 }
 
                 if (cell.type === "banner") {
+                  if (cell.char === "▒") {
+                    line += rgb(95, 30, 60, cell.char);
+                    continue;
+                  }
                   const localX = firstBannerX >= 0 ? x - firstBannerX : x;
                   const sweep = Math.floor((tick - 16) * 2.2);
-                  const isFlashing = tick >= 16 && localX >= sweep - 4 && localX <= sweep + 2;
-                  
+                  const isFlashing =
+                    tick >= 16 && localX >= sweep - 4 && localX <= sweep + 2;
+
                   if (isFlashing) {
                     line += `\x1b[1m\x1b[38;2;255;255;255m${cell.char}\x1b[0m`;
                   } else {
@@ -310,15 +401,24 @@ export default function (pi: ExtensionAPI) {
                 }
 
                 switch (cell.type) {
-                  case "label": line += theme.fg("muted", cell.char); break;
-                  case "value": line += theme.fg("text", cell.char); break;
-                  case "dim": line += theme.fg("dim", cell.char); break;
-                  case "accent": line += theme.fg("accent", cell.char); break;
-                  default: line += cell.char;
+                  case "label":
+                    line += rgb(200, 100, 160, cell.char);
+                    break;
+                  case "value":
+                    line += rgb(255, 140, 210, cell.char);
+                    break;
+                  case "dim":
+                    line += theme.fg("dim", cell.char);
+                    break;
+                  case "accent":
+                    line += theme.fg("accent", cell.char);
+                    break;
+                  default:
+                    line += cell.char;
                 }
               }
 
-              out.push(line);
+              out.push(truncateToWidth(line, Math.max(1, width), ""));
             }
 
             return out;
