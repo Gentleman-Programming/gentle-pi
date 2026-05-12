@@ -43,19 +43,19 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 
 ## What it adds
 
-| Capability                     | What it does                                                                                                                         |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| **el Gentleman persona**       | Makes Pi behave like a senior architect and teacher, not a generic chatbot. Spanish responses use Rioplatense voseo by default.      |
+| Capability                     | What it does                                                                                                                                  |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| **el Gentleman persona**       | Makes Pi behave like a senior architect and teacher, not a generic chatbot. Spanish responses use Rioplatense voseo by default.               |
 | **Rose startup intro**         | Adds a pink rose fade-in, compact project/runtime panel, and visible startup collaboration credit for @aporcelli's `pi-gentle-startup` ideas. |
-| **Work routing discipline**    | Small tasks stay inline. Context-heavy exploration can be delegated. Large or risky changes go through SDD/OpenSpec.                 |
-| **SDD/OpenSpec assets**        | Installs phase agents and chains for `init`, `explore`, `proposal`, `spec`, `design`, `tasks`, `apply`, `verify`, and `archive`.     |
-| **Subagent orchestration**     | Keeps one parent session responsible while child agents explore, implement, test, or review with focused context.                    |
-| **Strict TDD support**         | When project config declares a test command, apply/verify phases must record RED → GREEN → TRIANGULATE → REFACTOR evidence.          |
-| **Reviewer protection**        | Surfaces review workload risk before a task turns into an oversized PR.                                                              |
-| **Per-agent model assignment** | Pi-native modal for assigning stronger or cheaper models to specific SDD/custom agents.                                              |
-| **Skill discovery registry**   | Maintains `.atl/skill-registry.md` from project and user skills so review/comment/PR workflows do not silently miss the right skill. |
-| **Delivery skills**            | Includes issue-first PRs, chained PRs, work-unit commits, cognitive docs, comment writing, and Judgment Day review.                  |
-| **Shell safety**               | Blocks destructive shell commands and asks for confirmation for sensitive operations.                                                |
+| **Work routing discipline**    | Small tasks stay inline. Context-heavy exploration can be delegated. Large or risky changes go through SDD/OpenSpec.                          |
+| **SDD/OpenSpec assets**        | Installs phase agents and chains for `init`, `explore`, `proposal`, `spec`, `design`, `tasks`, `apply`, `verify`, and `archive`.              |
+| **Subagent orchestration**     | Keeps one parent session responsible while child agents explore, implement, test, or review with focused context.                             |
+| **Strict TDD support**         | When project config declares a test command, apply/verify phases must record RED → GREEN → TRIANGULATE → REFACTOR evidence.                   |
+| **Reviewer protection**        | Surfaces review workload risk before a task turns into an oversized PR.                                                                       |
+| **Per-agent model assignment** | Pi-native modal for assigning stronger or cheaper models to specific SDD/custom agents.                                                       |
+| **Skill discovery registry**   | Maintains `.atl/skill-registry.md` from project and user skills so review/comment/PR workflows do not silently miss the right skill.          |
+| **Delivery skills**            | Includes issue-first PRs, chained PRs, work-unit commits, cognitive docs, comment writing, and Judgment Day review.                           |
+| **Shell safety**               | Blocks destructive shell commands and asks for confirmation for sensitive operations.                                                         |
 
 ## Install
 
