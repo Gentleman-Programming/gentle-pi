@@ -64,7 +64,10 @@ function padLines(lines: string[]): { lines: string[]; width: number } {
 type CellType =
   | "banner"
   | "logo-tip"
+  | "logo-tip2"
   | "logo-fresh"
+  | "logo-fresh2"
+  | "logo-warm"
   | "logo-ink"
   | "rose"
   | "label"
@@ -262,11 +265,13 @@ function buildLetterStrokeMap(letterIdx: number): { orderMap: Map<string, number
 
 const LETTER_STROKES = LETTER_SPANS.map((_, i) => buildLetterStrokeMap(i));
 const WRITING_START_TICK = 10;
-const LETTER_TICKS = LETTER_STROKES.map((s) => Math.max(7, Math.ceil(((s.maxOrder + 8) / 11) * 0.74)));
+const LETTER_TICKS = LETTER_STROKES.map((s) => Math.max(8, Math.ceil(((s.maxOrder + 8) / 11) * 0.6)));
+// Micro-pausa visual entre letras: 2 ticks de reposo entre cada stroke.
+const PAUSE_TICKS = 2;
 const LETTER_START_TICKS = LETTER_TICKS.map((_, i) =>
-  WRITING_START_TICK + LETTER_TICKS.slice(0, i).reduce((a, b) => a + b, 0),
+  WRITING_START_TICK + LETTER_TICKS.slice(0, i).reduce((a, b) => a + b + PAUSE_TICKS, 0),
 );
-const WRITING_END_TICK = WRITING_START_TICK + LETTER_TICKS.reduce((a, b) => a + b, 0);
+const WRITING_END_TICK = WRITING_START_TICK + LETTER_TICKS.reduce((a, b) => a + b + PAUSE_TICKS, 0);
 
 function buildPenLogoLine(
   line: string,
@@ -319,9 +324,19 @@ function buildPenLogoLine(
     }
 
     const age = head - order;
-    if (age < 1.2) out.push({ char: ch, type: "logo-tip" });
-    else if (age < 4.9) out.push({ char: ch, type: "logo-fresh" });
-    else out.push({ char: ch, type: "logo-ink" });
+    if (age < 0.6) {
+      out.push({ char: ch, type: "logo-tip" });
+    } else if (age < 1.8) {
+      out.push({ char: ch, type: "logo-tip2" });
+    } else if (age < 4.0) {
+      out.push({ char: ch, type: "logo-fresh" });
+    } else if (age < 7.0) {
+      out.push({ char: ch, type: "logo-fresh2" });
+    } else if (age < 11.0) {
+      out.push({ char: ch, type: "logo-warm" });
+    } else {
+      out.push({ char: ch, type: "logo-ink" });
+    }
   }
   return out;
 }
@@ -357,29 +372,6 @@ export default function (pi: ExtensionAPI) {
     // así que no filtramos por argv en esta versión.
 
     process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
-
-    let closeIntro: (() => void) | null = null;
-    const closeIntroSafely = () => {
-      if (!closeIntro) return;
-      const fn = closeIntro;
-      closeIntro = null;
-      try {
-        fn();
-      } catch {}
-    };
-
-    void ctx.ui
-      .custom((_tui, _theme, _keybindings, done) => {
-        closeIntro = () => done(undefined);
-        return {
-          render: () => [""],
-          invalidate: () => {},
-          handleInput: () => {},
-        };
-      })
-      .catch(() => {
-        closeIntro = null;
-      });
 
     const roseBase = padLines(normalizeAscii(ROSE_LARGE_RAW));
     const logoBase = padLines(TEXT_LOGO);
@@ -448,12 +440,11 @@ export default function (pi: ExtensionAPI) {
 
         state.timer = setInterval(() => {
           tick++;
-          if (tick > WRITING_END_TICK + 34) {
+          if (tick > WRITING_END_TICK + 55) {
             if (state.timer) {
               clearInterval(state.timer);
               state.timer = null;
             }
-            closeIntroSafely();
             return;
           }
           try {
@@ -464,7 +455,7 @@ export default function (pi: ExtensionAPI) {
               state.timer = null;
             }
           }
-        }, 33);
+        }, 25);
 
         return {
           render(width: number): string[] {
@@ -647,7 +638,7 @@ export default function (pi: ExtensionAPI) {
             const out: string[] = [];
             const layout = b.lines;
 
-            const logoTypes = new Set(["banner", "logo-tip", "logo-fresh", "logo-ink"] as const);
+            const logoTypes = new Set(["banner", "logo-tip", "logo-tip2", "logo-fresh", "logo-fresh2", "logo-warm", "logo-ink"] as const);
             const logoRows = layout
               .map((row, idx) => ({ idx, hasLogo: (row || []).some((c) => logoTypes.has(c.type as any)) }))
               .filter((r) => r.hasLogo)
@@ -670,7 +661,33 @@ export default function (pi: ExtensionAPI) {
             const glintEndTick = WRITING_END_TICK + 18;
             const glintActive = tick >= glintStartTick && tick <= glintEndTick;
             const glintHead = ((tick - glintStartTick) / Math.max(1, glintEndTick - glintStartTick)) * (LOGO_BOUNDS.end - LOGO_BOUNDS.start + 1);
-            const sparkleActive = tick >= WRITING_END_TICK + 19 && tick <= WRITING_END_TICK + 28;
+            // Estrella en la punta de la I (ultima letra del logo GENTLE-PI)
+            const sparkleActive = tick >= WRITING_END_TICK + 19 && tick <= WRITING_END_TICK + 55;
+            const sparkleTick = tick - (WRITING_END_TICK + 19);
+
+            // Encontrar la celda mas a la derecha del logo (punta de la I)
+            let starCX = -1, starCY = 0;
+            if (sparkleActive) {
+              for (let y = 0; y < layout.length; y++) {
+                const row = layout[y] || [];
+                for (let x = row.length - 1; x >= 0; x--) {
+                  const c = row[x];
+                  if (c && c.char !== " " && logoTypes.has(c.type as any)) {
+                    if (x > starCX) { starCX = x; starCY = y; }
+                    break;
+                  }
+                }
+              }
+              // Asegurar espacio vertical: forzar starCY >= 2
+              if (starCY < 2) starCY = 2;
+              // Asegurar espacio horizontal
+              const maxW = layout.length > 0 ? (layout[0] || []).length : 100;
+              if (starCX + 3 >= maxW) starCX = maxW - 4;
+            }
+
+            const renderStarCell = (_x: number, _y: number): string | null => {
+              return null;
+            };
 
             for (let y = 0; y < layout.length; y++) {
               const row = layout[y] || [];
@@ -679,6 +696,16 @@ export default function (pi: ExtensionAPI) {
 
               for (let x = 0; x < row.length; x++) {
                 const cell = row[x] || { char: " ", type: "none" as const };
+
+                // Estrella check FIRST (antes del espacio)
+                if (sparkleActive) {
+                  const starResult = renderStarCell(x, y);
+                  if (starResult) {
+                    line += starResult;
+                    continue;
+                  }
+                }
+
                 if (cell.char === " ") {
                   line += " ";
                   continue;
@@ -707,24 +734,26 @@ export default function (pi: ExtensionAPI) {
                 if (logoTypes.has(cell.type as any)) {
                   const localLogoX = firstLogoX >= 0 ? x - firstLogoX : x;
                   const glintOnCell = glintActive && localLogoX >= glintHead - 2 && localLogoX <= glintHead + 1;
-                  const sparkleOnCell = sparkleActive && y === sparkleY && (x === logoLastX || x === logoLastX - 1);
-
-                  if (sparkleOnCell) {
-                    line += `\x1b[1m` + rgb(255, 255, 255, "✦") + `\x1b[22m`;
-                    continue;
-                  }
 
                   if (glintOnCell) {
-                    line += `\x1b[1m` + rgb(255, 245, 252, cell.char) + `\x1b[22m`;
+                    line += `\x1b[1m` + rgb(255, 220, 185, cell.char) + `\x1b[22m`;
                     continue;
                   }
 
-                  if (cell.type === "logo-tip") {
-                    line += `\x1b[1m` + rgb(255, 205, 238, cell.char) + `\x1b[22m`;
-                  } else if (cell.type === "logo-fresh") {
+                  if (cell.type === "logo-tip" || cell.type === "logo-tip2") {
+                    const glow = cell.type === "logo-tip" ? 245 : 225;
+                    line += `\x1b[1m` + rgb(255, glow, 238, cell.char) + `\x1b[22m`;
+                  } else if (cell.type === "logo-fresh" || cell.type === "logo-fresh2") {
+                    const r = cell.type === "logo-fresh" ? 255 : 230;
+                    const g = cell.type === "logo-fresh" ? 138 : 118;
+                    const b = cell.type === "logo-fresh" ? 206 : 178;
                     line += cell.char === "▒"
                       ? rgb(110, 36, 70, cell.char)
-                      : rgb(255, 138, 206, cell.char);
+                      : rgb(r, g, b, cell.char);
+                  } else if (cell.type === "logo-warm") {
+                    line += cell.char === "▒"
+                      ? rgb(125, 40, 76, cell.char)
+                      : rgb(245, 128, 196, cell.char);
                   } else {
                     line += cell.char === "▒"
                       ? rgb(95, 30, 60, cell.char)
@@ -761,7 +790,6 @@ export default function (pi: ExtensionAPI) {
               clearInterval(state.timer);
               state.timer = null;
             }
-            closeIntroSafely();
           },
         };
       });
