@@ -10,7 +10,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, relative } from "node:path";
+import { basename, join, normalize, relative, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const REGISTRY_REL_PATH = ".atl/skill-registry.md";
@@ -20,7 +20,7 @@ const EXCLUDE_NAMES = new Set(["_shared", "skill-registry"]);
 const EXCLUDE_PREFIXES = ["sdd-"];
 const ATL_IGNORE_ENTRY = ".atl/";
 const WATCH_DEBOUNCE_MS = 500;
-const REGISTRY_SCHEMA_VERSION = 3;
+const REGISTRY_SCHEMA_VERSION = 4;
 const LEGACY_PROJECT_REGISTRY_REL_PATH = ".pi/extensions/skill-registry.ts";
 const LEGACY_PROJECT_REGISTRY_DISABLED_REL_PATH =
 	".pi/extensions/skill-registry.ts.disabled";
@@ -36,23 +36,39 @@ function userSkillDirs(): string[] {
 	const home = homedir();
 	return [
 		join(home, ".pi/agent/skills"),
+		join(home, ".config/agents/skills"),
 		join(home, ".agents/skills"),
+		join(home, ".kimi/skills"),
 		join(home, ".config/opencode/skills"),
+		join(home, ".config/kilo/skills"),
 		join(home, ".claude/skills"),
 		join(home, ".gemini/skills"),
+		join(home, ".gemini/antigravity/skills"),
 		join(home, ".cursor/skills"),
 		join(home, ".copilot/skills"),
+		join(home, ".codex/skills"),
+		join(home, ".codeium/windsurf/skills"),
+		join(home, ".qwen/skills"),
+		join(home, ".kiro/skills"),
+		join(home, ".openclaw/skills"),
 	];
 }
 
 function projectSkillDirs(cwd: string): string[] {
 	return [
 		join(cwd, "skills"),
+		join(cwd, ".opencode/skills"),
+		join(cwd, ".claude/skills"),
+		join(cwd, ".gemini/skills"),
+		join(cwd, ".cursor/skills"),
+		join(cwd, ".github/skills"),
+		join(cwd, ".codex/skills"),
+		join(cwd, ".qwen/skills"),
+		join(cwd, ".kiro/skills"),
+		join(cwd, ".openclaw/skills"),
 		join(cwd, ".pi/skills"),
 		join(cwd, ".agent/skills"),
 		join(cwd, ".agents/skills"),
-		join(cwd, ".claude/skills"),
-		join(cwd, ".gemini/skills"),
 		join(cwd, ".atl/skills"),
 	];
 }
@@ -78,7 +94,7 @@ function findSkillFiles(root: string): string[] {
 			}
 		}
 	}
-	return out;
+	return out.sort();
 }
 
 function parseFrontmatter(source: string): { name?: string; description?: string; body: string } {
@@ -102,22 +118,74 @@ function parseFrontmatter(source: string): { name?: string; description?: string
 	return { ...out, body };
 }
 
+const FALLBACK_RULE_HEADINGS = ["Hard Rules", "Critical Rules", "Critical Patterns", "Voice Rules", "Decision Gates"];
+const MAX_EXTRACTED_RULE_COUNT = 15;
+
 function extractCompactRulesSection(body: string): string[] {
-	const lines = body.split("\n");
+	const compactRules = extractRulesFromHeadings(body, ["Compact Rules"]);
+	if (compactRules.length > 0) return compactRules;
+	return extractRulesFromHeadings(body, FALLBACK_RULE_HEADINGS);
+}
+
+function extractRulesFromHeadings(body: string, headings: string[]): string[] {
+	const wanted = new Set(headings.map(normalizeHeading));
 	let inSection = false;
 	const rules: string[] = [];
-	for (const raw of lines) {
+	for (const raw of body.split("\n")) {
 		const line = raw.trimEnd();
-		if (/^##\s+Compact Rules\s*$/i.test(line)) {
-			inSection = true;
+		const heading = line.match(/^##\s+(.+?)\s*$/);
+		if (heading) {
+			inSection = wanted.has(normalizeHeading(heading[1]));
 			continue;
 		}
 		if (!inSection) continue;
-		if (/^##\s+/.test(line)) break;
-		const m = line.match(/^-\s+(.+)$/);
-		if (m) rules.push(m[1].trim());
+		if (/^##\s+/.test(line)) {
+			inSection = false;
+			continue;
+		}
+		const rule = extractRuleLine(line);
+		if (rule) {
+			rules.push(rule);
+			if (rules.length >= MAX_EXTRACTED_RULE_COUNT) return rules;
+		}
 	}
 	return rules;
+}
+
+function extractRuleLine(line: string): string | undefined {
+	const trimmed = line.trim();
+	if (!trimmed) return undefined;
+	const bullet = trimmed.match(/^-\s+(.+)$/);
+	if (bullet) return bullet[1].trim();
+	const ordered = trimmed.match(/^\d+[.)]\s+(.+)$/);
+	if (ordered) return ordered[1].trim();
+	if (trimmed.startsWith("|") && trimmed.endsWith("|")) return extractRuleTableRow(trimmed);
+	return undefined;
+}
+
+function extractRuleTableRow(line: string): string | undefined {
+	const cells = line
+		.slice(1, -1)
+		.split("|")
+		.map((cell) => cell.trim());
+	if (cells.length < 2) return undefined;
+	if (isTableSeparator(cells) || isTableHeader(cells) || !cells[0] || !cells[1]) return undefined;
+	return `${cells[0]}: ${cells[1]}`;
+}
+
+function isTableSeparator(cells: string[]): boolean {
+	return cells.every((cell) => cell.replace(/[\s:-]/g, "") === "");
+}
+
+function isTableHeader(cells: string[]): boolean {
+	if (cells.length < 2) return false;
+	const first = normalizeHeading(cells[0]);
+	const second = normalizeHeading(cells[1]);
+	return (first === "rule" && second === "requirement") || (first === "target" && second === "test pattern");
+}
+
+function normalizeHeading(heading: string): string {
+	return heading.trim().toLowerCase();
 }
 
 function deriveSkillName(file: string, frontmatterName: string | undefined): string {
@@ -130,13 +198,19 @@ function isExcluded(name: string): boolean {
 	return EXCLUDE_PREFIXES.some((p) => name.startsWith(p));
 }
 
+function comparablePath(path: string): string {
+	const clean = normalize(path);
+	return clean.length > 1 ? clean.replace(/[\\/]+$/, "") : clean;
+}
+
 function uniqueExistingDirs(dirs: string[]): string[] {
 	const seen = new Set<string>();
 	const out: string[] = [];
 	for (const dir of dirs) {
-		if (seen.has(dir) || !existsSync(dir)) continue;
-		seen.add(dir);
-		out.push(dir);
+		const clean = comparablePath(dir);
+		if (seen.has(clean) || !existsSync(clean)) continue;
+		seen.add(clean);
+		out.push(clean);
 	}
 	return out;
 }
@@ -155,7 +229,7 @@ function loadSkill(file: string): SkillEntry | undefined {
 	return {
 		name,
 		path: file,
-		description: fm.description ?? "",
+		description: extractTriggerDescription(fm.description ?? ""),
 		rules:
 			rules.length > 0
 				? rules
@@ -163,8 +237,14 @@ function loadSkill(file: string): SkillEntry | undefined {
 	};
 }
 
+function extractTriggerDescription(description: string): string {
+	const match = description.match(/\bTrigger:\s*(.+)$/i);
+	return match ? match[1].trim() : description;
+}
+
 function dedupeBySkillName(entries: SkillEntry[], cwd: string): SkillEntry[] {
-	const projectPrefix = cwd.endsWith("/") ? cwd : `${cwd}/`;
+	const cleanCwd = comparablePath(cwd);
+	const projectPrefix = cleanCwd.endsWith(sep) ? cleanCwd : `${cleanCwd}${sep}`;
 	const buckets = new Map<string, SkillEntry[]>();
 	for (const entry of entries) {
 		const list = buckets.get(entry.name) ?? [];
@@ -173,7 +253,7 @@ function dedupeBySkillName(entries: SkillEntry[], cwd: string): SkillEntry[] {
 	}
 	const out: SkillEntry[] = [];
 	for (const [, list] of buckets) {
-		const projectScoped = list.find((e) => e.path.startsWith(projectPrefix));
+		const projectScoped = list.find((e) => comparablePath(e.path).startsWith(projectPrefix));
 		out.push(projectScoped ?? list[0]);
 	}
 	return out.sort((a, b) => a.name.localeCompare(b.name));
@@ -298,7 +378,7 @@ function quarantineLegacyProjectRegistry(cwd: string): boolean {
 
 function regenerateRegistry(cwd: string, force: boolean): RegenResult {
 	const existingDirs = uniqueExistingDirs([...projectSkillDirs(cwd), ...userSkillDirs()]);
-	const files = existingDirs.flatMap(findSkillFiles).sort();
+	const files = existingDirs.flatMap(findSkillFiles);
 	const cachePath = join(cwd, CACHE_REL_PATH);
 	const registryPath = join(cwd, REGISTRY_REL_PATH);
 	const fp = fingerprint(files);
@@ -356,6 +436,15 @@ function startSkillRegistryWatcher(cwd: string, notify: (message: string) => voi
 		}
 	}
 }
+
+export const __testing = {
+	projectSkillDirs,
+	userSkillDirs,
+	extractCompactRulesSection,
+	extractTriggerDescription,
+	uniqueExistingDirs,
+	dedupeBySkillName,
+};
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {

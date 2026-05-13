@@ -178,16 +178,35 @@ It scans common roots such as:
 
 ```text
 ./skills
+.opencode/skills
+.claude/skills
+.gemini/skills
+.cursor/skills
+.github/skills
+.codex/skills
+.qwen/skills
+.kiro/skills
+.openclaw/skills
 .pi/skills
 .agent/skills
 .agents/skills
-.claude/skills
-.gemini/skills
+.atl/skills
+~/.pi/agent/skills
+~/.config/agents/skills
+~/.agents/skills
+~/.kimi/skills
 ~/.config/opencode/skills
+~/.config/kilo/skills
 ~/.claude/skills
 ~/.gemini/skills
+~/.gemini/antigravity/skills
 ~/.cursor/skills
 ~/.copilot/skills
+~/.codex/skills
+~/.codeium/windsurf/skills
+~/.qwen/skills
+~/.kiro/skills
+~/.openclaw/skills
 ```
 
 Behavior:
@@ -196,7 +215,7 @@ Behavior:
 - the registry refreshes on session start;
 - `/skill-registry:refresh` forces regeneration;
 - a best-effort watcher refreshes when skill files change;
-- skills without `## Compact Rules` are still listed, but delegators should inject project/user compact rules into subagents whenever possible.
+- `## Compact Rules` wins when present; otherwise the registry extracts compact rules from `## Hard Rules`, `## Critical Rules`, `## Critical Patterns`, `## Voice Rules`, and `## Decision Gates` using bullets, numbered lists, or simple tables.
 
 Skill discovery is a guardrail, not a workflow router: it helps Pi load the right skill without forcing extra ceremony.
 
@@ -331,6 +350,7 @@ pi install .
 Validate before publishing:
 
 ```bash
+pnpm test
 bun build extensions/skill-registry.ts --target=node --format=esm --outfile=/tmp/skill-registry.js
 node --experimental-strip-types --check extensions/gentle-ai.ts
 node --experimental-strip-types --check extensions/sdd-init.ts

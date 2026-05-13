@@ -1,6 +1,6 @@
 {
   "name": "gentle-pi",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Turn Pi into el Gentleman: a senior-architect development harness with SDD/OpenSpec, subagents, strict TDD evidence, review guardrails, and skill discovery.",
   "license": "MIT",
   "type": "module",
@@ -28,11 +28,13 @@
     "prompts/",
     "skills/",
     "scripts/",
+    "tests/",
     "README.md"
   ],
   "scripts": {
-    "prepack": "node scripts/verify-package-files.mjs",
-    "prepublishOnly": "node scripts/verify-package-files.mjs"
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "prepack": "pnpm test && node scripts/verify-package-files.mjs",
+    "prepublishOnly": "pnpm test && node scripts/verify-package-files.mjs"
   },
   "pi": {
     "image": "https://cdn.jsdelivr.net/npm/gentle-pi/assets/gentle-logo-only.png",

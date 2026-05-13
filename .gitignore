@@ -18,6 +18,7 @@ auth.json
 
 # Local Pi runtime state
 .pi/
+.pi-lens/
 .atl/
 .npm/
 coverage/
