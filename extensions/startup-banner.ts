@@ -86,7 +86,7 @@ class LayoutBuilder {
   center(width: number) {
     const row = this.lines[this.lines.length - 1];
     const pad = Math.max(0, Math.floor((width - row.length) / 2));
-    const prefix = Array.from({ length: pad }, () => ({
+    const prefix: LayoutCell[] = Array.from({ length: pad }, () => ({
       char: " ",
       type: "none" as const,
     }));
@@ -106,28 +106,9 @@ export default function (pi: ExtensionAPI) {
 
     process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
 
-    let closeIntro: (() => void) | null = null;
-    const closeIntroSafely = () => {
-      if (!closeIntro) return;
-      const fn = closeIntro;
-      closeIntro = null;
-      try {
-        fn();
-      } catch {}
+    const finishIntro = () => {
+      ctx.ui.setHeader(undefined);
     };
-
-    void ctx.ui
-      .custom((_tui, _theme, _keybindings, done) => {
-        closeIntro = () => done(undefined);
-        return {
-          render: () => [""],
-          invalidate: () => {},
-          handleInput: () => {},
-        };
-      })
-      .catch(() => {
-        closeIntro = null;
-      });
 
     const roseBase = padLines(normalizeAscii(ROSE_LARGE_RAW));
     const logoBase = padLines(TEXT_LOGO);
@@ -201,7 +182,7 @@ export default function (pi: ExtensionAPI) {
               clearInterval(state.timer);
               state.timer = null;
             }
-            closeIntroSafely();
+            finishIntro();
             return;
           }
           try {
@@ -391,7 +372,7 @@ export default function (pi: ExtensionAPI) {
                 if (cell.type === "rose") {
                   const pulse = 0.9 + Math.sin((x + y + frame) * 0.08) * 0.1;
                   const k = Math.max(0.01, roseOpacity * pulse);
-                  const f = Math.pow(flashPhase, 0.4);
+                  const f = flashPhase ** 0.4;
 
                   const rBase = Math.floor(255 * k);
                   const gBase = Math.floor(118 * k);
@@ -454,7 +435,7 @@ export default function (pi: ExtensionAPI) {
               clearInterval(state.timer);
               state.timer = null;
             }
-            closeIntroSafely();
+            finishIntro();
           },
         };
       });
