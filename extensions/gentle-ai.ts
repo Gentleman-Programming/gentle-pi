@@ -471,15 +471,19 @@ class SddModelPanel implements OverlayComponent {
 	private query = "";
 	private readonly draft: AgentModelConfig;
 	private readonly rows: string[];
+	private readonly modelOptions: string[];
+	private readonly done: (result: ModelPanelResult) => void;
 
 	constructor(
 		initialConfig: AgentModelConfig,
-		private readonly modelOptions: string[],
+		modelOptions: string[],
 		agents: string[],
-		private readonly done: (result: ModelPanelResult) => void,
+		done: (result: ModelPanelResult) => void,
 	) {
 		this.draft = { ...initialConfig };
 		this.rows = [SET_ALL_AGENTS, ...agents];
+		this.modelOptions = modelOptions;
+		this.done = done;
 	}
 
 	invalidate(): void {}
