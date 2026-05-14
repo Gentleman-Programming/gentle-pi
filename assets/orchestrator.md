@@ -31,6 +31,8 @@ User-facing conversation should stay in the user's language and follow the curre
 
 Subagent-facing prompts should be written in English by default, even when the user speaks Spanish. Translate the user's request into concise English before delegation. This keeps token usage lower and gives built-in/project subagents a consistent operating language without changing the user-facing persona.
 
+Generated artifacts — whether by the parent inline or by subagents — (code, UI copy, comments, identifiers, commit messages, filenames, PR descriptions) default to English, regardless of the user's conversation language. Override only when the user explicitly requests another language for that artifact, or when extending a project whose existing convention is non-English.
+
 Exceptions:
 
 - Preserve exact user quotes, UI copy, error messages, filenames, commands, and domain terms in their original language when they are evidence.
