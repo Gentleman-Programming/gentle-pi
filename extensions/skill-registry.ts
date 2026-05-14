@@ -21,6 +21,8 @@ const EXCLUDE_PREFIXES = ["sdd-"];
 const ATL_IGNORE_ENTRY = ".atl/";
 const WATCH_DEBOUNCE_MS = 500;
 const REGISTRY_SCHEMA_VERSION = 4;
+const NO_SKILL_REGISTRY_FLAG = "no-skill-registry";
+const NO_SKILL_REGISTRY_ENV = "GENTLE_PI_NO_SKILL_REGISTRY";
 const LEGACY_PROJECT_REGISTRY_REL_PATH = ".pi/extensions/skill-registry.ts";
 const LEGACY_PROJECT_REGISTRY_DISABLED_REL_PATH =
 	".pi/extensions/skill-registry.ts.disabled";
@@ -410,6 +412,26 @@ function regenerateRegistry(cwd: string, force: boolean): RegenResult {
 
 const watchedCwds = new Set<string>();
 
+function isTruthyEnv(value: string | undefined): boolean {
+	return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+
+function hasCliArg(args: string[], ...names: string[]): boolean {
+	return args.some((arg) => names.includes(arg));
+}
+
+function shouldSkipSkillRegistryStartup(
+	pi: Pick<ExtensionAPI, "getFlag">,
+	argv = process.argv.slice(2),
+	env = process.env,
+): boolean {
+	return (
+		pi.getFlag(NO_SKILL_REGISTRY_FLAG) === true ||
+		isTruthyEnv(env[NO_SKILL_REGISTRY_ENV]) ||
+		hasCliArg(argv, "--no-skills", "-ns")
+	);
+}
+
 function startSkillRegistryWatcher(cwd: string, notify: (message: string) => void): void {
 	if (watchedCwds.has(cwd)) return;
 	watchedCwds.add(cwd);
@@ -444,10 +466,18 @@ export const __testing = {
 	extractTriggerDescription,
 	uniqueExistingDirs,
 	dedupeBySkillName,
+	shouldSkipSkillRegistryStartup,
 };
 
 export default function (pi: ExtensionAPI) {
+	pi.registerFlag(NO_SKILL_REGISTRY_FLAG, {
+		description: "Skip the Gentle AI skill registry refresh and watcher on startup.",
+		type: "boolean",
+		default: false,
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
+		if (shouldSkipSkillRegistryStartup(pi)) return;
 		try {
 			ensureAtlIgnored(ctx.cwd);
 			const quarantinedLegacy = quarantineLegacyProjectRegistry(ctx.cwd);

@@ -213,6 +213,7 @@ Behavior:
 
 - `.atl/` is added to `.gitignore` when needed;
 - the registry refreshes on session start;
+- startup refresh is skipped when Pi starts with `--no-skills` / `-ns`, `--no-skill-registry`, or `GENTLE_PI_NO_SKILL_REGISTRY=1`;
 - `/skill-registry:refresh` forces regeneration;
 - a best-effort watcher refreshes when skill files change;
 - `## Compact Rules` wins when present; otherwise the registry extracts compact rules from `## Hard Rules`, `## Critical Rules`, `## Critical Patterns`, `## Voice Rules`, and `## Decision Gates` using bullets, numbered lists, or simple tables.
@@ -284,6 +285,14 @@ Saved at:
 | `/gentle-ai:install-sdd`         | Reinstalls SDD assets without overwriting local files.       |
 | `/gentle-ai:install-sdd --force` | Force-refreshes installed SDD assets.                        |
 | `/skill-registry:refresh`        | Regenerates `.atl/skill-registry.md`.                        |
+
+Startup flag:
+
+```text
+pi --no-skill-registry
+```
+
+Use it when you want skills available normally but do not want Gentle AI to refresh/watch `.atl/skill-registry.md` on startup. `pi -ns` / `pi --no-skills` also skip the registry startup work because Pi is already disabling skill loading.
 
 Compatibility aliases:
 

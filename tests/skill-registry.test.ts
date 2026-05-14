@@ -112,3 +112,17 @@ test("uniqueExistingDirs normalizes duplicates and ignores missing roots", () =>
 
 	assert.deepEqual(__testing.uniqueExistingDirs([existing, join(root, "skills/"), join(root, "missing")]), [existing]);
 });
+
+test("startup skip honors no skill registry controls", () => {
+	const enabled = { getFlag: () => true };
+	const disabled = { getFlag: () => false };
+
+	assert.equal(__testing.shouldSkipSkillRegistryStartup(enabled, [], {}), true);
+	assert.equal(__testing.shouldSkipSkillRegistryStartup(disabled, ["--no-skills"], {}), true);
+	assert.equal(__testing.shouldSkipSkillRegistryStartup(disabled, ["-ns"], {}), true);
+	assert.equal(
+		__testing.shouldSkipSkillRegistryStartup(disabled, [], { GENTLE_PI_NO_SKILL_REGISTRY: "1" }),
+		true,
+	);
+	assert.equal(__testing.shouldSkipSkillRegistryStartup(disabled, [], {}), false);
+});
