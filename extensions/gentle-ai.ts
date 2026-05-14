@@ -14,6 +14,14 @@ import type {
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import {
+	ensureSddPreflight,
+	getSddPreflightPreferences,
+	installSddAssets,
+	isSddPreflightTrigger,
+	renderSddPreflightPrompt,
+	type SddPreflightPreferences,
+} from "../lib/sdd-preflight.ts";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
@@ -182,62 +190,6 @@ async function confirmCommand(
 	};
 }
 
-function copyDirectoryFiles(
-	sourceDir: string,
-	targetDir: string,
-	force: boolean,
-): { copied: number; skipped: number } {
-	if (!existsSync(sourceDir)) return { copied: 0, skipped: 0 };
-	mkdirSync(targetDir, { recursive: true });
-	let copied = 0;
-	let skipped = 0;
-	for (const entry of readdirSync(sourceDir, { withFileTypes: true })) {
-		const sourcePath = join(sourceDir, entry.name);
-		const targetPath = join(targetDir, entry.name);
-		if (entry.isDirectory()) {
-			const child = copyDirectoryFiles(sourcePath, targetPath, force);
-			copied += child.copied;
-			skipped += child.skipped;
-			continue;
-		}
-		if (!entry.isFile()) continue;
-		if (!force && existsSync(targetPath)) {
-			skipped += 1;
-			continue;
-		}
-		writeFileSync(targetPath, readFileSync(sourcePath));
-		copied += 1;
-	}
-	return { copied, skipped };
-}
-
-function installSddAssets(
-	cwd: string,
-	force: boolean,
-): { agents: number; chains: number; support: number; skipped: number } {
-	const agents = copyDirectoryFiles(
-		join(ASSETS_DIR, "agents"),
-		join(cwd, ".pi", "agents"),
-		force,
-	);
-	const chains = copyDirectoryFiles(
-		join(ASSETS_DIR, "chains"),
-		join(cwd, ".pi", "chains"),
-		force,
-	);
-	const support = copyDirectoryFiles(
-		join(ASSETS_DIR, "support"),
-		join(cwd, ".pi", "gentle-ai", "support"),
-		force,
-	);
-	return {
-		agents: agents.copied,
-		chains: chains.copied,
-		support: support.copied,
-		skipped: agents.skipped + chains.skipped + support.skipped,
-	};
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -294,7 +246,7 @@ function normalizeRoutingEntry(value: unknown): AgentRoutingEntry | undefined {
 	return { model, thinking };
 }
 
-function readModelConfig(cwd: string): AgentModelConfig {
+export function readModelConfig(cwd: string): AgentModelConfig {
 	const path = modelConfigPath(cwd);
 	if (!existsSync(path)) return {};
 	try {
@@ -465,7 +417,7 @@ function updateBuiltinModelOverride(
 	return true;
 }
 
-function applyModelConfig(
+export function applyModelConfig(
 	cwd: string,
 	config: AgentModelConfig,
 ): { updated: number; skipped: number } {
@@ -953,18 +905,16 @@ async function handlePersonaCommand(ctx: ExtensionContext): Promise<void> {
 }
 
 export default function gentleAi(pi: ExtensionAPI): void {
+	function runSddPreflight(ctx: ExtensionContext): Promise<SddPreflightPreferences> {
+		return ensureSddPreflight(ctx, {
+			pi,
+			installAssets: (cwd) => installSddAssets(cwd, false),
+			applyModelConfig: (cwd) => applyModelConfig(cwd, readModelConfig(cwd)),
+		});
+	}
+
 	pi.on("session_start", (_event, ctx) => {
-		const result = installSddAssets(ctx.cwd, false);
 		const modelResult = applyModelConfig(ctx.cwd, readModelConfig(ctx.cwd));
-		if (
-			ctx.hasUI &&
-			(result.agents > 0 || result.chains > 0 || result.support > 0)
-		) {
-			ctx.ui.notify(
-				`Gentle AI SDD assets auto-installed: ${result.agents} agent(s), ${result.chains} chain(s), ${result.support} support file(s).`,
-				"info",
-			);
-		}
 		if (ctx.hasUI && modelResult.updated > 0) {
 			ctx.ui.notify(
 				`el Gentleman applied SDD model config to ${modelResult.updated} agent(s).`,
@@ -973,9 +923,21 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		}
 	});
 
-	pi.on("before_agent_start", (event, ctx) => ({
-		systemPrompt: `${event.systemPrompt}\n\n${buildGentlePrompt(readPersonaMode(ctx.cwd))}`,
-	}));
+	pi.on("input", async (event, ctx) => {
+		if (typeof event.text !== "string" || !isSddPreflightTrigger(event.text)) {
+			return { action: "continue" };
+		}
+		await runSddPreflight(ctx);
+		return { action: "continue" };
+	});
+
+	pi.on("before_agent_start", (event, ctx) => {
+		const prefs = getSddPreflightPreferences(ctx);
+		const sddPrompt = prefs ? `\n\n${renderSddPreflightPrompt(prefs)}` : "";
+		return {
+			systemPrompt: `${event.systemPrompt}\n\n${buildGentlePrompt(readPersonaMode(ctx.cwd))}${sddPrompt}`,
+		};
+	});
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "bash") return undefined;
@@ -994,6 +956,21 @@ export default function gentleAi(pi: ExtensionAPI): void {
 				`Gentle AI SDD assets installed: ${result.agents} agent(s), ${result.chains} chain(s), ${result.support} support file(s), ${result.skipped} skipped.`,
 				"info",
 			);
+		},
+	});
+
+	pi.registerCommand("gentle-ai:sdd-preflight", {
+		description:
+			"Run or reuse the lazy SDD preflight for this Pi session.",
+		handler: async (_args, ctx) => {
+			await runSddPreflight(ctx);
+		},
+	});
+
+	pi.registerCommand("gentle:sdd-preflight", {
+		description: "Compatibility alias for /gentle-ai:sdd-preflight.",
+		handler: async (_args, ctx) => {
+			await runSddPreflight(ctx);
 		},
 	});
 

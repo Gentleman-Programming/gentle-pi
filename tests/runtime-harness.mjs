@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -15,6 +17,8 @@ const EXTENSIONS = [
 
 const EXPECTED_COMMANDS = [
 	"gentle-ai:install-sdd",
+	"gentle-ai:sdd-preflight",
+	"gentle:sdd-preflight",
 	"gentle:models",
 	"gentle-ai:models",
 	"gentleman:models",
@@ -31,6 +35,7 @@ function createPi() {
 	const commands = new Map();
 	const flags = new Map();
 	const flagValues = new Map([["no-skill-registry", true]]);
+	let activeTools = ["read", "bash", "edit", "write"];
 
 	const pi = {
 		on(name, handler) {
@@ -53,12 +58,19 @@ function createPi() {
 		getCommands() {
 			return Array.from(commands, ([name, definition]) => ({ name, ...definition }));
 		},
+		getActiveTools() {
+			return activeTools;
+		},
+		setActiveTools(value) {
+			activeTools = value;
+		},
 		getAllTools() {
 			return [
 				{ name: "read" },
 				{ name: "bash" },
 				{ name: "edit" },
 				{ name: "write" },
+				{ name: "mem_save" },
 			];
 		},
 	};
@@ -68,15 +80,18 @@ function createPi() {
 
 function createUi() {
 	const notifications = [];
+	const selections = [];
 	return {
 		notifications,
+		selections,
 		notify(message, level = "info") {
 			notifications.push({ message, level });
 		},
 		async confirm() {
 			return false;
 		},
-		async select(_label, options) {
+		async select(label, options) {
+			selections.push({ label, options });
 			return options[0];
 		},
 		async input(_label, placeholder) {
@@ -88,11 +103,19 @@ function createUi() {
 	};
 }
 
-function createCtx(cwd, hasUI = false) {
+function createCtx(cwd, hasUI = false, sessionId = "session-1") {
 	return {
 		cwd,
 		hasUI,
 		ui: createUi(),
+		sessionManager: {
+			getSessionFile() {
+				return join(cwd, `${sessionId}.jsonl`);
+			},
+			getSessionId() {
+				return sessionId;
+			},
+		},
 		modelRegistry: {
 			async getAvailable() {
 				return [];
@@ -122,8 +145,16 @@ async function run() {
 	}
 	assert.ok(flags.has("no-skill-registry"), "missing no-skill-registry flag");
 	assert.ok(hooks.has("session_start"), "missing session_start hook");
+	assert.ok(hooks.has("input"), "missing input hook");
 	assert.ok(hooks.has("before_agent_start"), "missing before_agent_start hook");
 	assert.ok(hooks.has("tool_call"), "missing tool_call hook");
+
+	const discovered = await discoverAndLoadExtensions(["./extensions"], ROOT);
+	assert.deepEqual(
+		discovered.errors,
+		[],
+		"declared extension directory must load without invalid helper modules",
+	);
 
 	const promptCwd = await tempWorkspace();
 	try {
@@ -154,8 +185,144 @@ async function run() {
 		for (const handler of hooks.get("session_start")) {
 			await handler({ reason: "startup" }, createCtx(noUiCwd, false));
 		}
+		assert.equal(
+			existsSync(join(noUiCwd, ".pi", "agents", "sdd-apply.md")),
+			false,
+			"session_start must not install SDD agents before first SDD intent",
+		);
+		assert.equal(
+			existsSync(join(noUiCwd, ".pi", "chains", "sdd-full.chain.md")),
+			false,
+			"session_start must not install SDD chains before first SDD intent",
+		);
 	} finally {
 		await rm(noUiCwd, { recursive: true, force: true });
+	}
+
+	const lazySddCwd = await tempWorkspace();
+	try {
+		await mkdir(join(lazySddCwd, ".pi", "gentle-ai"), { recursive: true });
+		await writeFile(
+			join(lazySddCwd, ".pi", "gentle-ai", "models.json"),
+			JSON.stringify({ "sdd-apply": { model: "openai/gpt-5", thinking: "high" } }, null, 2),
+		);
+		const ctx = createCtx(lazySddCwd, true);
+		const inputHook = hooks.get("input")[0];
+		assert.deepEqual(
+			await inputHook({ text: "hola, solo mirando", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.deepEqual(
+			await inputHook({ text: "what is SDD?", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.deepEqual(
+			await inputHook({ text: "what can I do with SDD?", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.deepEqual(
+			await inputHook({ text: "how do I use SDD?", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.deepEqual(
+			await inputHook({ text: "Can I use SDD?", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.deepEqual(
+			await inputHook({ text: "don't use sdd for this", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.deepEqual(
+			await inputHook({ text: "sin usar SDD por ahora", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.deepEqual(
+			await inputHook({ text: "let's not use SDD for this", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.deepEqual(
+			await inputHook({ text: "never use SDD here", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.deepEqual(
+			await inputHook({ text: "no quiero usar SDD por ahora", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.deepEqual(
+			await inputHook({ text: "I use SDD sometimes", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.deepEqual(
+			await inputHook({ text: "I'm using SDD in another repo", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.equal(existsSync(join(lazySddCwd, ".pi", "agents", "sdd-apply.md")), false);
+
+		assert.deepEqual(
+			await inputHook({ text: "please use sdd for this change", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.deepEqual(
+			await inputHook({ text: "/sdd", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.deepEqual(
+			await inputHook({ text: "/sdd plan", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.deepEqual(
+			await inputHook({ text: "/sdd:plan", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.equal(existsSync(join(lazySddCwd, ".pi", "agents", "sdd-apply.md")), false);
+
+		assert.deepEqual(
+			await inputHook({ text: "/sdd-plan this change", source: "interactive" }, ctx),
+			{ action: "continue" },
+		);
+		assert.equal(existsSync(join(lazySddCwd, ".pi", "agents", "sdd-apply.md")), true);
+		assert.equal(existsSync(join(lazySddCwd, ".pi", "chains", "sdd-full.chain.md")), true);
+		const lazyAppliedAgent = await readFile(
+			join(lazySddCwd, ".pi", "agents", "sdd-apply.md"),
+			"utf8",
+		);
+		assert.match(lazyAppliedAgent, /model: openai\/gpt-5/);
+		assert.match(lazyAppliedAgent, /thinking: high/);
+		assert.equal(ctx.ui.selections.length, 3);
+		assert.deepEqual(ctx.ui.selections[1].options, ["openspec"]);
+		assert.match(ctx.ui.notifications.at(-1).message, /SDD preflight complete/);
+
+		await inputHook({ text: "/sdd-plan another change", source: "interactive" }, ctx);
+		assert.equal(ctx.ui.selections.length, 3, "preflight should run only once per session");
+		const promptHook = hooks.get("before_agent_start")[0];
+		const promptResult = promptHook({ systemPrompt: "base" }, ctx);
+		assert.match(promptResult.systemPrompt, /SDD Session Preflight/);
+		assert.match(promptResult.systemPrompt, /Execution mode: interactive/);
+	} finally {
+		await rm(lazySddCwd, { recursive: true, force: true });
+	}
+
+	const commandSddCwd = await tempWorkspace();
+	try {
+		const ctx = createCtx(commandSddCwd, true, "command-session");
+		await commands.get("gentle-ai:sdd-preflight").handler("", ctx);
+		assert.equal(existsSync(join(commandSddCwd, ".pi", "agents", "sdd-apply.md")), true);
+		assert.equal(ctx.ui.selections.length, 3);
+		await commands.get("gentle:sdd-preflight").handler("", ctx);
+		assert.equal(ctx.ui.selections.length, 3, "manual preflight command should reuse session choices");
+	} finally {
+		await rm(commandSddCwd, { recursive: true, force: true });
+	}
+
+	const engramSddCwd = await tempWorkspace();
+	try {
+		pi.setActiveTools(["read", "bash", "edit", "write", "mem_save"]);
+		const ctx = createCtx(engramSddCwd, true, "engram-session");
+		await commands.get("gentle-ai:sdd-preflight").handler("", ctx);
+		assert.deepEqual(ctx.ui.selections[1].options, ["openspec", "engram", "both"]);
+	} finally {
+		pi.setActiveTools(["read", "bash", "edit", "write"]);
+		await rm(engramSddCwd, { recursive: true, force: true });
 	}
 
 	const installCwd = await tempWorkspace();
@@ -171,7 +338,14 @@ async function run() {
 	try {
 		const ctx = createCtx(sddCwd, true);
 		await commands.get("sdd-init").handler("", ctx);
+		assert.equal(existsSync(join(sddCwd, ".pi", "agents", "sdd-apply.md")), true);
+		assert.equal(existsSync(join(sddCwd, ".pi", "chains", "sdd-full.chain.md")), true);
+		assert.equal(ctx.ui.selections.length, 3);
+		assert.match(ctx.ui.notifications[0].message, /SDD preflight complete/);
 		assert.match(ctx.ui.notifications.at(-1).message, /Wrote openspec\/config\.yaml/);
+
+		await commands.get("gentle-ai:sdd-preflight").handler("", ctx);
+		assert.equal(ctx.ui.selections.length, 3, "/sdd-init preflight should be reused by later manual preflight");
 	} finally {
 		await rm(sddCwd, { recursive: true, force: true });
 	}

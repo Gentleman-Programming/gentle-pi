@@ -25,6 +25,7 @@
   "files": [
     "assets/",
     "extensions/",
+    "lib/",
     "prompts/",
     "skills/",
     "scripts/",

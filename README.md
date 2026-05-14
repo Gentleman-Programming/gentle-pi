@@ -81,7 +81,7 @@ Then start Pi in a project:
 pi
 ```
 
-On session start, `gentle-pi` installs local SDD assets without overwriting your edits.
+`gentle-pi` waits until the first SDD request in a session, then runs a one-time SDD preflight and installs local SDD assets without overwriting your edits.
 
 ## Quick start
 
@@ -147,9 +147,9 @@ For substantial work, the parent session coordinates the flow and each phase wri
 - verification reports;
 - archive notes for future agents.
 
-## Project files installed
+## SDD preflight and project files
 
-On Pi `session_start`, `gentle-pi` copies these assets if they are missing:
+`gentle-pi` does not interrupt every new session. Slash SDD flows such as `/sdd-*`, `/sdd-init`, and the explicit `/gentle-ai:sdd-preflight` command run a lazy preflight, ask for session-scoped SDD preferences, and then copy these assets if they are missing. For natural-language requests, the parent agent decides whether the work should use SDD and must run/reuse `/gentle-ai:sdd-preflight` before continuing.
 
 ```text
 .pi/agents/sdd-*.md
@@ -158,10 +158,24 @@ On Pi `session_start`, `gentle-pi` copies these assets if they are missing:
 .pi/gentle-ai/support/strict-tdd-verify.md
 ```
 
+The preflight choices are reused for later SDD flows in the same session:
+
+- execution mode: `interactive` or `auto`;
+- artifact store: `openspec`, or `engram`/`both` when callable memory tools are available;
+- PR chaining strategy: `auto-forecast`, `ask-always`, `single-pr-default`, or `force-chained`;
+- review budget line threshold.
+
 It does **not** overwrite existing files unless you explicitly run:
 
 ```text
 /gentle-ai:install-sdd --force
+```
+
+Manual preflight commands:
+
+```text
+/gentle-ai:sdd-preflight
+/gentle:sdd-preflight
 ```
 
 ## Skill registry

@@ -177,16 +177,25 @@ proposal → spec ─┬→ tasks → apply → verify → archive
 proposal → design ┘
 ```
 
-## Automatic Setup Expectations
+## Lazy SDD Preflight
 
-On startup, the package should ensure SDD assets are present for `pi-subagents` without the user needing to remember setup commands. If assets are missing, install them non-destructively into:
+Do not ask SDD setup questions on session start. The first time the user initiates an SDD process in a Pi session, run the SDD preflight once and keep those choices for the rest of that session. Runtime trigger detection is intentionally deterministic: slash SDD flows and `/sdd-init` run preflight automatically; for natural-language requests, the parent/orchestrator decides semantically whether SDD is needed and must run/reuse `/gentle-ai:sdd-preflight` before continuing.
+
+The preflight captures:
+
+- execution mode: `interactive` or `auto`;
+- artifact store: `openspec`, `engram`, or `both` when callable memory tools are available;
+- chained PR strategy: `auto-forecast`, `ask-always`, `single-pr-default`, or `force-chained`;
+- review budget in changed lines.
+
+During that lazy preflight, the package should ensure SDD assets are present for `pi-subagents` without the user needing to remember setup commands. If assets are missing, install them non-destructively into:
 
 ```text
 .pi/agents/sdd-*.md
 .pi/chains/sdd-*.chain.md
 ```
 
-Manual commands are recovery/debug paths, not the happy path.
+Manual install commands are recovery/debug paths, not the happy path. `/gentle-ai:sdd-preflight` and `/gentle:sdd-preflight` are the explicit preflight commands for agent/orchestrator use. If the user explicitly changes SDD preferences later in the same session, follow the new instruction.
 
 ## Init Guard
 
@@ -220,7 +229,7 @@ When Engram or another callable memory package is available, the parent owns mem
 
 ## Execution Mode
 
-For substantial SDD flows, choose or ask once per change:
+Use the session's SDD preflight choice:
 
 - `interactive`: default, pause between major phases and ask whether to continue.
 - `auto`: run phases back-to-back when the user explicitly wants speed and trusts the flow.
