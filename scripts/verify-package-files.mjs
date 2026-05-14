@@ -12,6 +12,7 @@ const requiredPaths = [
   "extensions/gentle-ai.ts",
   "extensions/sdd-init.ts",
   "extensions/skill-registry.ts",
+  "lib/sdd-preflight.ts",
   "prompts/gcl.md",
   "prompts/gis.md",
   "prompts/gpr.md",
