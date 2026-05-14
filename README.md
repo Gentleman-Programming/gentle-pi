@@ -49,6 +49,7 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | **Rose startup intro**         | Adds a pink rose fade-in, compact project/runtime panel, and visible startup collaboration credit for @aporcelli's `pi-gentle-startup` ideas. |
 | **Work routing discipline**    | Small tasks stay inline. Context-heavy exploration can be delegated. Large or risky changes go through SDD/OpenSpec.                          |
 | **SDD/OpenSpec assets**        | Installs phase agents and chains for `init`, `explore`, `proposal`, `spec`, `design`, `tasks`, `apply`, `verify`, and `archive`.              |
+| **Lazy SDD preflight**         | Asks once per session for SDD mode, artifact store, PR chaining strategy, and review budget before the first SDD flow.                       |
 | **Subagent orchestration**     | Keeps one parent session responsible while child agents explore, implement, test, or review with focused context.                             |
 | **Strict TDD support**         | When project config declares a test command, apply/verify phases must record RED → GREEN → TRIANGULATE → REFACTOR evidence.                   |
 | **Reviewer protection**        | Surfaces review workload risk before a task turns into an oversized PR.                                                                       |
@@ -81,23 +82,24 @@ Then start Pi in a project:
 pi
 ```
 
-`gentle-pi` waits until the first SDD request in a session, then runs a one-time SDD preflight and installs local SDD assets without overwriting your edits.
+`gentle-pi` waits until the first SDD flow in a session, then runs a one-time SDD preflight and installs local SDD assets without overwriting your edits. Slash SDD commands trigger this automatically; for natural-language requests, el Gentleman decides when SDD is needed and runs the explicit preflight first.
 
 ## Quick start
 
 ```text
-/gentle-ai:status      Check package, SDD assets, OpenSpec, and model config.
-/sdd-init              Create or refresh openspec/config.yaml.
-/gentle:models         Assign models to SDD/custom agents.
-/gentle:persona        Switch between gentleman and neutral persona modes.
+/gentle-ai:status          Check package, SDD assets, OpenSpec, and model config.
+/gentle-ai:sdd-preflight   Run or reuse the session SDD preflight explicitly.
+/sdd-init                  Create or refresh openspec/config.yaml.
+/gentle:models             Assign models to SDD/custom agents.
+/gentle:persona            Switch between gentleman and neutral persona modes.
 ```
 
 Typical flow:
 
 1. Open Pi in your repo.
 2. Run `/gentle-ai:status`.
-3. Run `/sdd-init` once per project, or when test/project capabilities change.
-4. For a substantial change, ask Pi to use SDD.
+3. Run `/sdd-init` once per project, or when test/project capabilities change. This also runs the session SDD preflight.
+4. For a substantial change, ask Pi to use SDD. Natural-language requests are classified by the parent agent, not by brittle runtime regexes.
 5. Review the phase artifacts instead of trusting floating chat context.
 
 ## How the harness decides what to do
