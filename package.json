@@ -1,6 +1,6 @@
 {
   "name": "gentle-pi",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Turn Pi into el Gentleman: a senior-architect development harness with SDD/OpenSpec, subagents, strict TDD evidence, review guardrails, and skill discovery.",
   "license": "MIT",
   "type": "module",
