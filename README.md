@@ -246,7 +246,7 @@ Saved at:
 
 Run `/reload` or start a new Pi session after switching persona.
 
-## Model assignment
+## Model and effort assignment
 
 ```text
 /gentle:models
@@ -258,15 +258,15 @@ The modal discovers:
 - user agents in `~/.pi/agent/agents/` and `~/.agents/`;
 - built-in agents from `pi-subagents`.
 
-Recommended model shape:
+Recommended model/effort shape:
 
-| Agent kind                 | Recommended model                                    |
-| -------------------------- | ---------------------------------------------------- |
-| Explore, proposal, archive | Fast and cheap is usually enough.                    |
-| Spec, design, tasks        | Strong reasoning model.                              |
-| Apply                      | Strong coding and tool-use model.                    |
-| Verify / review            | Strong fresh-context model.                          |
-| Tiny utilities             | Inherit active/default model unless they bottleneck. |
+| Agent kind                 | Recommended model                                    | Recommended effort (`thinking`) |
+| -------------------------- | ---------------------------------------------------- | ------------------------------- |
+| Explore, proposal, archive | Fast and cheap is usually enough.                    | `off` to `low`                  |
+| Spec, design, tasks        | Strong reasoning model.                              | `medium` to `high`              |
+| Apply                      | Strong coding and tool-use model.                    | `medium` to `high`              |
+| Verify / review            | Strong fresh-context model.                          | `high`                          |
+| Tiny utilities             | Inherit active/default model unless they bottleneck. | `inherit`                       |
 
 Saved at:
 
@@ -274,12 +274,28 @@ Saved at:
 .pi/gentle-ai/models.json
 ```
 
+Config shape (per agent):
+
+```json
+{
+  "sdd-design": {
+    "model": "anthropic/claude-sonnet-4",
+    "thinking": "high"
+  },
+  "sdd-archive": {
+    "model": "openai/gpt-5-mini"
+  }
+}
+```
+
+Legacy string entries are still accepted and treated as `model`-only config.
+
 ## Commands
 
 | Command                          | What it does                                                 |
 | -------------------------------- | ------------------------------------------------------------ |
 | `/gentle-ai:status`              | Shows package, SDD asset, OpenSpec, and model config status. |
-| `/gentle:models`                 | Opens model assignment UI.                                   |
+| `/gentle:models`                 | Opens model + effort assignment UI.                          |
 | `/gentle:persona`                | Switches persona mode.                                       |
 | `/sdd-init`                      | Initializes or refreshes `openspec/config.yaml`.             |
 | `/gentle-ai:install-sdd`         | Reinstalls SDD assets without overwriting local files.       |

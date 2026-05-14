@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -174,6 +174,106 @@ async function run() {
 		assert.match(ctx.ui.notifications.at(-1).message, /Wrote openspec\/config\.yaml/);
 	} finally {
 		await rm(sddCwd, { recursive: true, force: true });
+	}
+
+	const modelsCwd = await tempWorkspace();
+	try {
+		await mkdir(join(modelsCwd, ".pi", "agents"), { recursive: true });
+		await mkdir(
+			join(modelsCwd, ".pi", "npm", "node_modules", "pi-subagents", "agents"),
+			{ recursive: true },
+		);
+		await writeFile(
+			join(
+				modelsCwd,
+				".pi",
+				"npm",
+				"node_modules",
+				"pi-subagents",
+				"agents",
+				"worker.md",
+			),
+			`---\nname: worker\ndescription: Builtin worker\n---\n`,
+		);
+		await writeFile(
+			join(modelsCwd, ".pi", "agents", "sdd-apply.md"),
+			`---\nname: sdd-apply\ndescription: Apply phase\n---\n\nbody\n`,
+		);
+		await mkdir(join(modelsCwd, ".pi", "gentle-ai"), { recursive: true });
+		await writeFile(
+			join(modelsCwd, ".pi", "gentle-ai", "models.json"),
+			JSON.stringify({ "sdd-apply": "openai/gpt-5" }, null, 2),
+		);
+
+		const ctx = createCtx(modelsCwd, true);
+		await hooks.get("session_start")[0]({ reason: "startup" }, ctx);
+		const legacyAppliedAgent = await readFile(
+			join(modelsCwd, ".pi", "agents", "sdd-apply.md"),
+			"utf8",
+		);
+		assert.match(legacyAppliedAgent, /model: openai\/gpt-5/);
+		assert.doesNotMatch(legacyAppliedAgent, /thinking:/);
+
+		ctx.ui.custom = () =>
+			Promise.resolve({
+				type: "save",
+				config: {
+					"sdd-apply": { model: "openai/gpt-5", thinking: "high" },
+					worker: { model: "openai/gpt-5-mini", thinking: "low" },
+				},
+			});
+		await commands.get("gentle:models").handler("", ctx);
+
+		const savedConfig = JSON.parse(
+			await readFile(join(modelsCwd, ".pi", "gentle-ai", "models.json"), "utf8"),
+		);
+		assert.deepEqual(savedConfig["sdd-apply"], {
+			model: "openai/gpt-5",
+			thinking: "high",
+		});
+
+		const applyAgent = await readFile(
+			join(modelsCwd, ".pi", "agents", "sdd-apply.md"),
+			"utf8",
+		);
+		assert.match(applyAgent, /model: openai\/gpt-5/);
+		assert.match(applyAgent, /thinking: high/);
+
+		const settings = JSON.parse(
+			await readFile(join(modelsCwd, ".pi", "settings.json"), "utf8"),
+		);
+		assert.equal(
+			settings.subagents.agentOverrides.worker.model,
+			"openai/gpt-5-mini",
+		);
+		assert.equal(settings.subagents.agentOverrides.worker.thinking, "low");
+
+		let customPanelCalls = 0;
+		ctx.ui.input = async () => "custom/provider-model";
+		ctx.ui.custom = (factory) =>
+			new Promise((resolve) => {
+				customPanelCalls += 1;
+				const panel = factory(null, null, null, resolve);
+				if (customPanelCalls === 1) {
+					panel.handleInput("e"); // effort picker for all agents
+					for (let i = 0; i < 4; i++) panel.handleInput("j"); // medium
+					panel.handleInput("\r");
+					panel.handleInput("c"); // custom model from the same unsaved draft
+					return;
+				}
+				panel.handleInput("\u0013"); // ctrl+s saves the draft reopened after custom model input
+			});
+		await commands.get("gentle:models").handler("", ctx);
+
+		const customSavedConfig = JSON.parse(
+			await readFile(join(modelsCwd, ".pi", "gentle-ai", "models.json"), "utf8"),
+		);
+		assert.deepEqual(customSavedConfig["sdd-apply"], {
+			model: "custom/provider-model",
+			thinking: "medium",
+		});
+	} finally {
+		await rm(modelsCwd, { recursive: true, force: true });
 	}
 
 	const registryCwd = await tempWorkspace();

@@ -1,0 +1,48 @@
+strict_tdd: true
+context: |
+  gentle-pi is a Node.js/TypeScript ESM, Pi extension package project.
+  Detected markers: package.json, pnpm package manager, GitHub Actions.
+  Package managers: pnpm.
+  Primary test command: pnpm test.
+  Unit tests: package script (pnpm test).
+  Integration tests: none.
+  E2E tests: none.
+rules:
+  proposal:
+    require_problem_statement: true
+  spec:
+    require_acceptance_criteria: true
+  design:
+    require_tradeoffs: true
+  tasks:
+    protect_review_workload: true
+  apply:
+    test_command: "pnpm test"
+  verify:
+    test_command: "pnpm test"
+testing:
+  detected: "2026-05-14"
+  runner:
+    command: "pnpm test"
+    framework: "node:test (via package script)"
+  layers:
+    unit: "node:test"
+    integration: ""
+    e2e: ""
+  commands:
+    unit:
+      - scope: "."
+        command: "pnpm test"
+        framework: "package script"
+    integration: []
+    e2e: []
+  coverage:
+    command: ""
+    commands: []
+quality:
+  lint: ""
+  lint_commands: []
+  typecheck: ""
+  typecheck_commands: []
+  format: ""
+  format_commands: []

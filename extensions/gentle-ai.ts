@@ -101,7 +101,12 @@ const SDD_AGENT_NAMES = [
 ] as const;
 
 type SddAgentName = (typeof SDD_AGENT_NAMES)[number];
-type AgentModelConfig = Record<string, string>;
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+interface AgentRoutingEntry {
+	model?: string;
+	thinking?: ThinkingLevel;
+}
+type AgentModelConfig = Record<string, AgentRoutingEntry>;
 type AgentSource = "project" | "user" | "builtin";
 
 interface AgentEntry {
@@ -113,6 +118,16 @@ interface AgentEntry {
 const KEEP_CURRENT = "Keep current";
 const INHERIT_MODEL = "Inherit active/default model";
 const CUSTOM_MODEL = "Custom model id";
+const INHERIT_THINKING = "Inherit effort";
+const THINKING_OPTIONS: (ThinkingLevel | typeof INHERIT_THINKING)[] = [
+	INHERIT_THINKING,
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+];
 
 const MODEL_CONTROL_OPTIONS = [
 	KEEP_CURRENT,
@@ -253,6 +268,32 @@ function writePersonaMode(cwd: string, mode: PersonaMode): void {
 	writeFileSync(path, `${JSON.stringify({ mode }, null, 2)}\n`);
 }
 
+function isThinkingLevel(value: unknown): value is ThinkingLevel {
+	return (
+		value === "off" ||
+		value === "minimal" ||
+		value === "low" ||
+		value === "medium" ||
+		value === "high" ||
+		value === "xhigh"
+	);
+}
+
+function normalizeRoutingEntry(value: unknown): AgentRoutingEntry | undefined {
+	if (typeof value === "string") {
+		const model = value.trim();
+		return model.length > 0 ? { model } : undefined;
+	}
+	if (!isRecord(value)) return undefined;
+	const model =
+		typeof value.model === "string" && value.model.trim().length > 0
+			? value.model.trim()
+			: undefined;
+	const thinking = isThinkingLevel(value.thinking) ? value.thinking : undefined;
+	if (!model && !thinking) return undefined;
+	return { model, thinking };
+}
+
 function readModelConfig(cwd: string): AgentModelConfig {
 	const path = modelConfigPath(cwd);
 	if (!existsSync(path)) return {};
@@ -261,9 +302,8 @@ function readModelConfig(cwd: string): AgentModelConfig {
 		if (!isRecord(parsed)) return {};
 		const config: AgentModelConfig = {};
 		for (const [name, value] of Object.entries(parsed)) {
-			if (typeof value === "string" && value.trim().length > 0) {
-				config[name] = value.trim();
-			}
+			const entry = normalizeRoutingEntry(value);
+			if (entry) config[name] = entry;
 		}
 		return config;
 	} catch {
@@ -274,12 +314,23 @@ function readModelConfig(cwd: string): AgentModelConfig {
 function writeModelConfig(cwd: string, config: AgentModelConfig): void {
 	const path = modelConfigPath(cwd);
 	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+	const cleaned: AgentModelConfig = {};
+	for (const [name, value] of Object.entries(config)) {
+		const entry = normalizeRoutingEntry(value);
+		if (entry) cleaned[name] = entry;
+	}
+	writeFileSync(path, `${JSON.stringify(cleaned, null, 2)}\n`);
 }
 
-function updateFrontmatterModel(
+function cloneModelConfig(config: AgentModelConfig): AgentModelConfig {
+	return Object.fromEntries(
+		Object.entries(config).map(([name, entry]) => [name, { ...entry }]),
+	);
+}
+
+function updateFrontmatterRouting(
 	content: string,
-	model: string | undefined,
+	entry: AgentRoutingEntry | undefined,
 ): string {
 	if (!content.startsWith("---\n")) return content;
 	const endIndex = content.indexOf("\n---", 4);
@@ -288,14 +339,19 @@ function updateFrontmatterModel(
 	const body = content.slice(endIndex);
 	const lines = frontmatter
 		.split("\n")
-		.filter((line) => !line.startsWith("model:"));
-	if (model !== undefined) {
+		.filter(
+			(line) => !line.startsWith("model:") && !line.startsWith("thinking:"),
+		);
+	const toInsert: string[] = [];
+	if (entry?.model) toInsert.push(`model: ${entry.model}`);
+	if (entry?.thinking) toInsert.push(`thinking: ${entry.thinking}`);
+	if (toInsert.length > 0) {
 		const descriptionIndex = lines.findIndex((line) =>
 			line.startsWith("description:"),
 		);
 		const insertIndex =
 			descriptionIndex >= 0 ? descriptionIndex + 1 : Math.min(1, lines.length);
-		lines.splice(insertIndex, 0, `model: ${model}`);
+		lines.splice(insertIndex, 0, ...toInsert);
 	}
 	return `---\n${lines.join("\n")}${body}`;
 }
@@ -372,7 +428,7 @@ function projectSettingsPath(cwd: string): string {
 function updateBuiltinModelOverride(
 	cwd: string,
 	name: string,
-	model: string | undefined,
+	entry: AgentRoutingEntry | undefined,
 ): boolean {
 	const path = projectSettingsPath(cwd);
 	let settings: Record<string, unknown> = {};
@@ -393,8 +449,10 @@ function updateBuiltinModelOverride(
 	const current = isRecord(agentOverrides[name])
 		? { ...agentOverrides[name] }
 		: {};
-	if (model === undefined) delete current.model;
-	else current.model = model;
+	if (entry?.model === undefined) delete current.model;
+	else current.model = entry.model;
+	if (entry?.thinking === undefined) delete current.thinking;
+	else current.thinking = entry.thinking;
 	if (Object.keys(current).length > 0) agentOverrides[name] = current;
 	else delete agentOverrides[name];
 	if (Object.keys(agentOverrides).length > 0)
@@ -414,9 +472,9 @@ function applyModelConfig(
 	let updated = 0;
 	let skipped = 0;
 	for (const agent of listDiscoverableAgents(cwd)) {
-		const model = config[agent.name];
+		const entry = config[agent.name];
 		if (agent.source === "builtin") {
-			if (updateBuiltinModelOverride(cwd, agent.name, model)) updated += 1;
+			if (updateBuiltinModelOverride(cwd, agent.name, entry)) updated += 1;
 			else skipped += 1;
 			continue;
 		}
@@ -425,7 +483,7 @@ function applyModelConfig(
 			continue;
 		}
 		const original = readFileSync(agent.filePath, "utf8");
-		const next = updateFrontmatterModel(original, model);
+		const next = updateFrontmatterRouting(original, entry);
 		if (next === original) {
 			skipped += 1;
 			continue;
@@ -437,9 +495,12 @@ function applyModelConfig(
 }
 
 function describeModelConfig(cwd: string, config: AgentModelConfig): string[] {
-	return listDiscoverableAgents(cwd).map(
-		(agent) => `${agent.name}: ${config[agent.name] ?? "inherit"}`,
-	);
+	return listDiscoverableAgents(cwd).map((agent) => {
+		const entry = config[agent.name];
+		const model = entry?.model ?? "inherit";
+		const thinking = entry?.thinking ?? "inherit";
+		return `${agent.name}: model=${model}, effort=${thinking}`;
+	});
 }
 
 async function getPiModelOptions(ctx: ExtensionContext): Promise<string[]> {
@@ -458,16 +519,17 @@ interface OverlayComponent {
 
 type ModelPanelResult =
 	| { type: "save"; config: AgentModelConfig }
-	| { type: "custom"; agent: string | "all" }
+	| { type: "custom"; agent: string | "all"; config: AgentModelConfig }
 	| { type: "cancel" };
 
 const SET_ALL_AGENTS = "Set all agents";
 
 class SddModelPanel implements OverlayComponent {
 	private cursor = 0;
-	private mode: "agents" | "models" = "agents";
+	private mode: "agents" | "models" | "effort" = "agents";
 	private selectedRow = SET_ALL_AGENTS;
 	private modelCursor = 0;
+	private effortCursor = 0;
 	private query = "";
 	private readonly draft: AgentModelConfig;
 	private readonly rows: string[];
@@ -480,7 +542,7 @@ class SddModelPanel implements OverlayComponent {
 		agents: string[],
 		done: (result: ModelPanelResult) => void,
 	) {
-		this.draft = { ...initialConfig };
+		this.draft = cloneModelConfig(initialConfig);
 		this.rows = [SET_ALL_AGENTS, ...agents];
 		this.modelOptions = modelOptions;
 		this.done = done;
@@ -493,13 +555,17 @@ class SddModelPanel implements OverlayComponent {
 			this.handleModelInput(data);
 			return;
 		}
+		if (this.mode === "effort") {
+			this.handleEffortInput(data);
+			return;
+		}
 		this.handleAgentInput(data);
 	}
 
 	render(width: number): string[] {
-		return this.mode === "models"
-			? this.renderModelPicker(width)
-			: this.renderAgentList(width);
+		if (this.mode === "models") return this.renderModelPicker(width);
+		if (this.mode === "effort") return this.renderEffortPicker(width);
+		return this.renderAgentList(width);
 	}
 
 	private handleAgentInput(data: string): void {
@@ -521,13 +587,21 @@ class SddModelPanel implements OverlayComponent {
 			return;
 		}
 		if (data === "i") {
-			this.applySelection(undefined);
+			this.applyInherit();
+			return;
+		}
+		if (data === "e") {
+			this.selectedRow = this.rows[this.cursor] ?? SET_ALL_AGENTS;
+			this.mode = "effort";
+			this.effortCursor = 0;
 			return;
 		}
 		if (data === "c") {
 			const row = this.rows[this.cursor];
-			if (row === SET_ALL_AGENTS) this.done({ type: "custom", agent: "all" });
-			else if (row) this.done({ type: "custom", agent: row });
+			if (row === SET_ALL_AGENTS)
+				this.done({ type: "custom", agent: "all", config: this.draft });
+			else if (row)
+				this.done({ type: "custom", agent: row, config: this.draft });
 			return;
 		}
 		if (!matchesKey(data, "return")) return;
@@ -582,6 +656,7 @@ class SddModelPanel implements OverlayComponent {
 				this.done({
 					type: "custom",
 					agent: this.selectedRow === SET_ALL_AGENTS ? "all" : this.selectedRow,
+					config: this.draft,
 				});
 				return;
 			}
@@ -589,7 +664,9 @@ class SddModelPanel implements OverlayComponent {
 				this.mode = "agents";
 				return;
 			}
-			this.applySelection(selected === INHERIT_MODEL ? undefined : selected);
+			this.applyModelSelection(
+				selected === INHERIT_MODEL ? undefined : selected,
+			);
 			this.mode = "agents";
 			return;
 		}
@@ -599,18 +676,52 @@ class SddModelPanel implements OverlayComponent {
 		}
 	}
 
-	private applySelection(model: string | undefined): void {
+	private applyModelSelection(model: string | undefined): void {
 		const row = this.rows[this.cursor];
 		if (row === SET_ALL_AGENTS) {
-			for (const name of this.rows.slice(1)) {
-				if (model === undefined) delete this.draft[name];
-				else this.draft[name] = model;
-			}
+			for (const name of this.rows.slice(1)) this.setModel(name, model);
 			return;
 		}
 		if (!row) return;
-		if (model === undefined) delete this.draft[row];
-		else this.draft[row] = model;
+		this.setModel(row, model);
+	}
+
+	private applyThinkingSelection(thinking: ThinkingLevel | undefined): void {
+		const row = this.selectedRow;
+		if (row === SET_ALL_AGENTS) {
+			for (const name of this.rows.slice(1)) this.setThinking(name, thinking);
+			return;
+		}
+		this.setThinking(row, thinking);
+	}
+
+	private applyInherit(): void {
+		const row = this.rows[this.cursor];
+		if (row === SET_ALL_AGENTS) {
+			for (const name of this.rows.slice(1)) this.clearEntry(name);
+			return;
+		}
+		if (row) this.clearEntry(row);
+	}
+
+	private setModel(name: string, model: string | undefined): void {
+		const current = this.draft[name] ?? {};
+		if (model === undefined) delete current.model;
+		else current.model = model;
+		if (!current.model && !current.thinking) delete this.draft[name];
+		else this.draft[name] = current;
+	}
+
+	private setThinking(name: string, thinking: ThinkingLevel | undefined): void {
+		const current = this.draft[name] ?? {};
+		if (thinking === undefined) delete current.thinking;
+		else current.thinking = thinking;
+		if (!current.model && !current.thinking) delete this.draft[name];
+		else this.draft[name] = current;
+	}
+
+	private clearEntry(name: string): void {
+		delete this.draft[name];
 	}
 
 	private filteredModelOptions(): string[] {
@@ -648,7 +759,7 @@ class SddModelPanel implements OverlayComponent {
 		lines.push("");
 		lines.push(
 			line(
-				"j/k: navigate • enter: change model / confirm • i: inherit • c: custom • ctrl+s: save • esc: back",
+				"j/k: navigate • enter: change model / confirm • e: change effort • i: inherit all • c: custom model • ctrl+s: save • esc: back",
 			),
 		);
 		return lines;
@@ -684,17 +795,70 @@ class SddModelPanel implements OverlayComponent {
 		return lines;
 	}
 
+	private handleEffortInput(data: string): void {
+		if (matchesKey(data, "ctrl+c")) {
+			this.done({ type: "cancel" });
+			return;
+		}
+		if (matchesKey(data, "escape")) {
+			this.mode = "agents";
+			return;
+		}
+		if (matchesKey(data, "down") || data === "j") {
+			this.effortCursor = Math.min(
+				Math.max(0, THINKING_OPTIONS.length - 1),
+				this.effortCursor + 1,
+			);
+			return;
+		}
+		if (matchesKey(data, "up") || data === "k") {
+			this.effortCursor = Math.max(0, this.effortCursor - 1);
+			return;
+		}
+		if (!matchesKey(data, "return")) return;
+		const selected = THINKING_OPTIONS[this.effortCursor];
+		if (selected === INHERIT_THINKING) this.applyThinkingSelection(undefined);
+		else this.applyThinkingSelection(selected);
+		this.mode = "agents";
+	}
+
+	private renderEffortPicker(width: number): string[] {
+		const lines: string[] = [];
+		const line = (text = "") =>
+			truncateToWidth(text, Math.max(1, width), "…", true);
+		lines.push(line(`Select effort for ${this.selectedRow}`));
+		lines.push("");
+		for (let i = 0; i < THINKING_OPTIONS.length; i++) {
+			const focused = i === this.effortCursor;
+			lines.push(line(`${focused ? "▸" : " "} ${THINKING_OPTIONS[i]}`));
+		}
+		lines.push("");
+		lines.push(line("j/k: navigate • enter: select • esc: back"));
+		return lines;
+	}
+
 	private renderSetAllLabel(row: string): string {
-		const values = this.rows
+		const models = this.rows
 			.slice(1)
-			.map((name) => this.draft[name] ?? "inherit");
-		const first = values[0] ?? "inherit";
-		const allSame = values.every((value) => value === first);
-		return `${row.padEnd(20)} ${allSame ? first : "mixed"}`;
+			.map((name) => this.draft[name]?.model ?? "inherit");
+		const efforts = this.rows
+			.slice(1)
+			.map((name) => this.draft[name]?.thinking ?? "inherit");
+		const firstModel = models[0] ?? "inherit";
+		const firstEffort = efforts[0] ?? "inherit";
+		const modelLabel = models.every((value) => value === firstModel)
+			? firstModel
+			: "mixed";
+		const effortLabel = efforts.every((value) => value === firstEffort)
+			? firstEffort
+			: "mixed";
+		return `${row.padEnd(20)} model=${modelLabel}, effort=${effortLabel}`;
 	}
 
 	private renderAgentLabel(row: string): string {
-		return `${row.padEnd(20)} ${this.draft[row] ?? "inherit"}`;
+		const model = this.draft[row]?.model ?? "inherit";
+		const effort = this.draft[row]?.thinking ?? "inherit";
+		return `${row.padEnd(20)} model=${model}, effort=${effort}`;
 	}
 }
 
@@ -723,8 +887,11 @@ async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
 	let config = readModelConfig(ctx.cwd);
 	let result = await showSddModelPanel(ctx, config);
 	while (result.type === "custom") {
+		config = cloneModelConfig(result.config);
 		const current =
-			result.agent === "all" ? "inherit" : (config[result.agent] ?? "inherit");
+			result.agent === "all"
+				? "inherit"
+				: (config[result.agent]?.model ?? "inherit");
 		const custom = await ctx.ui.input(
 			`${result.agent === "all" ? "all agents" : result.agent} custom model id`,
 			current === "inherit" ? "provider/model" : current,
@@ -733,11 +900,22 @@ async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
 		const trimmed = custom.trim();
 		if (trimmed.length > 0) {
 			if (result.agent === "all") {
-				config = Object.fromEntries(
-					listDiscoverableAgents(ctx.cwd).map((agent) => [agent.name, trimmed]),
-				);
+				const next: AgentModelConfig = { ...config };
+				for (const agent of listDiscoverableAgents(ctx.cwd)) {
+					next[agent.name] = {
+						...(next[agent.name] ?? {}),
+						model: trimmed,
+					};
+				}
+				config = next;
 			} else {
-				config = { ...config, [result.agent]: trimmed };
+				config = {
+					...config,
+					[result.agent]: {
+						...(config[result.agent] ?? {}),
+						model: trimmed,
+					},
+				};
 			}
 		}
 		result = await showSddModelPanel(ctx, config);
