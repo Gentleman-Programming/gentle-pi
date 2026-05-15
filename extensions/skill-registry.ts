@@ -26,10 +26,6 @@ const NO_SKILL_REGISTRY_ENV = "GENTLE_PI_NO_SKILL_REGISTRY";
 const LEGACY_PROJECT_REGISTRY_REL_PATH = ".pi/extensions/skill-registry.ts";
 const LEGACY_PROJECT_REGISTRY_DISABLED_REL_PATH =
 	".pi/extensions/skill-registry.ts.disabled";
-// Defer hook work so the intro animation interval can start before we walk
-// the skill directories asynchronously.
-const BOOT_DEFER_MS = 100;
-
 async function pathExists(path: string): Promise<boolean> {
 	try {
 		await access(path);
@@ -514,56 +510,48 @@ export default function (pi: ExtensionAPI) {
 		default: false,
 	});
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		if (shouldSkipSkillRegistryStartup(pi)) return;
-		// Defer the registry refresh so the intro animation interval can start
-		// before we walk every skill directory.
-		setTimeout(() => {
-			void (async () => {
-				try {
-					await ensureAtlIgnored(ctx.cwd);
-					const quarantinedLegacy = await quarantineLegacyProjectRegistry(
-						ctx.cwd,
-					);
-					const result = await regenerateRegistry(ctx.cwd, quarantinedLegacy);
-					if (result.regenerated && ctx.hasUI) {
-						ctx.ui.notify(
-							`Skill registry refreshed (${result.skillCount} skills)`,
-							"info",
-						);
-					}
-					if (quarantinedLegacy && ctx.hasUI) {
-						ctx.ui.notify(
-							"Disabled stale project-local skill registry extension; using package registry with project skills first.",
-							"warning",
-						);
-					}
-					await startSkillRegistryWatcher(ctx.cwd, (message) => {
-						if (ctx.hasUI) ctx.ui.notify(message, "info");
-					});
-					if (quarantinedLegacy) {
-						setTimeout(() => {
-							void (async () => {
-								try {
-									await regenerateRegistry(ctx.cwd, true);
-								} catch {
-									// Best-effort same-session self-heal in case the stale extension already ran.
-								}
-							})();
-						}, WATCH_DEBOUNCE_MS);
-					}
-				} catch (error) {
-					if (ctx.hasUI) {
-						const message =
-							error instanceof Error ? error.message : String(error);
-						ctx.ui.notify(
-							`Skill registry refresh failed: ${message}`,
-							"warning",
-						);
-					}
-				}
-			})();
-		}, BOOT_DEFER_MS);
+		try {
+			await ensureAtlIgnored(ctx.cwd);
+			const quarantinedLegacy = await quarantineLegacyProjectRegistry(ctx.cwd);
+			const result = await regenerateRegistry(ctx.cwd, quarantinedLegacy);
+			if (result.regenerated && ctx.hasUI) {
+				ctx.ui.notify(
+					`Skill registry refreshed (${result.skillCount} skills)`,
+					"info",
+				);
+			}
+			if (quarantinedLegacy && ctx.hasUI) {
+				ctx.ui.notify(
+					"Disabled stale project-local skill registry extension; using package registry with project skills first.",
+					"warning",
+				);
+			}
+			await startSkillRegistryWatcher(ctx.cwd, (message) => {
+				if (ctx.hasUI) ctx.ui.notify(message, "info");
+			});
+			if (quarantinedLegacy) {
+				setTimeout(() => {
+					void (async () => {
+						try {
+							await regenerateRegistry(ctx.cwd, true);
+						} catch {
+							// Best-effort same-session self-heal in case the stale extension already ran.
+						}
+					})();
+				}, WATCH_DEBOUNCE_MS);
+			}
+		} catch (error) {
+			if (ctx.hasUI) {
+				const message =
+					error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(
+					`Skill registry refresh failed: ${message}`,
+					"warning",
+				);
+			}
+		}
 	});
 
 	pi.registerCommand("skill-registry:refresh", {

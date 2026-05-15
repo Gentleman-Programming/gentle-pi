@@ -44,10 +44,6 @@ function getOrchestratorPrompt(): string {
 	return orchestratorPromptCache;
 }
 
-// Defer hook work so the intro animation interval can start without the
-// event loop being blocked by synchronous filesystem walks.
-const BOOT_DEFER_MS = 100;
-
 async function pathExists(path: string): Promise<boolean> {
 	try {
 		await access(path);
@@ -1115,32 +1111,26 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		});
 	}
 
-	pi.on("session_start", (_event, ctx) => {
-		// Defer the model-config sweep so the intro animation interval can start
-		// before we walk the agent directories asynchronously.
-		setTimeout(() => {
-			void (async () => {
-				try {
-					const config = await readModelConfigAsync(ctx.cwd);
-					const modelResult = await applyModelConfigAsync(ctx.cwd, config);
-					if (ctx.hasUI && modelResult.updated > 0) {
-						ctx.ui.notify(
-							`el Gentleman applied SDD model config to ${modelResult.updated} agent(s).`,
-							"info",
-						);
-					}
-				} catch (error) {
-					if (ctx.hasUI) {
-						const message =
-							error instanceof Error ? error.message : String(error);
-						ctx.ui.notify(
-							`el Gentleman model config sweep failed: ${message}`,
-							"warning",
-						);
-					}
-				}
-			})();
-		}, BOOT_DEFER_MS);
+	pi.on("session_start", async (_event, ctx) => {
+		try {
+			const config = await readModelConfigAsync(ctx.cwd);
+			const modelResult = await applyModelConfigAsync(ctx.cwd, config);
+			if (ctx.hasUI && modelResult.updated > 0) {
+				ctx.ui.notify(
+					`el Gentleman applied SDD model config to ${modelResult.updated} agent(s).`,
+					"info",
+				);
+			}
+		} catch (error) {
+			if (ctx.hasUI) {
+				const message =
+					error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(
+					`el Gentleman model config sweep failed: ${message}`,
+					"warning",
+				);
+			}
+		}
 	});
 
 	pi.on("input", async (event, ctx) => {
