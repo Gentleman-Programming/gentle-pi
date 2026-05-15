@@ -137,6 +137,9 @@ async function loadExtensions(pi) {
 }
 
 async function run() {
+	const globalConfigHome = await tempWorkspace();
+	process.env.GENTLE_PI_CONFIG_HOME = globalConfigHome;
+	const globalModelsPath = join(globalConfigHome, "models.json");
 	const { pi, hooks, commands, flags } = createPi();
 	await loadExtensions(pi);
 
@@ -201,9 +204,8 @@ async function run() {
 
 	const lazySddCwd = await tempWorkspace();
 	try {
-		await mkdir(join(lazySddCwd, ".pi", "gentle-ai"), { recursive: true });
 		await writeFile(
-			join(lazySddCwd, ".pi", "gentle-ai", "models.json"),
+			globalModelsPath,
 			JSON.stringify({ "sdd-apply": { model: "openai/gpt-5", thinking: "high" } }, null, 2),
 		);
 		const ctx = createCtx(lazySddCwd, true);
@@ -300,6 +302,7 @@ async function run() {
 		assert.match(promptResult.systemPrompt, /Execution mode: interactive/);
 	} finally {
 		await rm(lazySddCwd, { recursive: true, force: true });
+		await rm(globalModelsPath, { force: true });
 	}
 
 	const commandSddCwd = await tempWorkspace();
@@ -312,6 +315,19 @@ async function run() {
 		assert.equal(ctx.ui.selections.length, 3, "manual preflight command should reuse session choices");
 	} finally {
 		await rm(commandSddCwd, { recursive: true, force: true });
+	}
+
+	const invalidPreflightCwd = await tempWorkspace();
+	try {
+		await writeFile(globalModelsPath, "{ invalid json");
+		const ctx = createCtx(invalidPreflightCwd, true, "invalid-preflight-session");
+		await commands.get("gentle-ai:sdd-preflight").handler("", ctx);
+		assert.equal(ctx.ui.notifications.at(-1).level, "warning");
+		assert.match(ctx.ui.notifications.at(-1).message, /Model routing skipped:/);
+		assert.match(ctx.ui.notifications.at(-1).message, /invalid JSON or not an object/);
+	} finally {
+		await rm(invalidPreflightCwd, { recursive: true, force: true });
+		await rm(globalModelsPath, { force: true });
 	}
 
 	const engramSddCwd = await tempWorkspace();
@@ -350,6 +366,92 @@ async function run() {
 		await rm(sddCwd, { recursive: true, force: true });
 	}
 
+	const invalidSddInitCwd = await tempWorkspace();
+	try {
+		await mkdir(join(invalidSddInitCwd, ".pi", "agents"), { recursive: true });
+		await writeFile(
+			join(invalidSddInitCwd, ".pi", "agents", "sdd-apply.md"),
+			`---\nname: sdd-apply\ndescription: Apply phase\nmodel: keep/provider-model\n---\n\nbody\n`,
+		);
+		await writeFile(globalModelsPath, "{ invalid json");
+		const ctx = createCtx(invalidSddInitCwd, true, "invalid-sdd-init-session");
+		await commands.get("sdd-init").handler("", ctx);
+		assert.equal(ctx.ui.notifications[0].level, "warning");
+		assert.match(ctx.ui.notifications[0].message, /Model routing skipped:/);
+		assert.match(ctx.ui.notifications[0].message, /models\.json/);
+		assert.match(ctx.ui.notifications.at(-1).message, /Wrote openspec\/config\.yaml/);
+		const preservedAgent = await readFile(
+			join(invalidSddInitCwd, ".pi", "agents", "sdd-apply.md"),
+			"utf8",
+		);
+		assert.match(preservedAgent, /model: keep\/provider-model/);
+	} finally {
+		await rm(invalidSddInitCwd, { recursive: true, force: true });
+		await rm(globalModelsPath, { force: true });
+	}
+
+	const legacyModelsCwd = await tempWorkspace();
+	try {
+		await mkdir(join(legacyModelsCwd, ".pi", "agents"), { recursive: true });
+		await mkdir(join(legacyModelsCwd, ".pi", "gentle-ai"), { recursive: true });
+		await writeFile(
+			join(legacyModelsCwd, ".pi", "agents", "sdd-apply.md"),
+			`---\nname: sdd-apply\ndescription: Apply phase\n---\n\nbody\n`,
+		);
+		await writeFile(
+			join(legacyModelsCwd, ".pi", "gentle-ai", "models.json"),
+			JSON.stringify({ "sdd-apply": "legacy/provider-model" }, null, 2),
+		);
+		const legacyCtx = createCtx(legacyModelsCwd, true);
+		await hooks.get("session_start")[0]({ reason: "startup" }, legacyCtx);
+		const legacyAgent = await readFile(
+			join(legacyModelsCwd, ".pi", "agents", "sdd-apply.md"),
+			"utf8",
+		);
+		assert.match(legacyAgent, /model: legacy\/provider-model/);
+		await writeFile(
+			globalModelsPath,
+			JSON.stringify({ "sdd-apply": "global/provider-model" }, null, 2),
+		);
+		await hooks.get("session_start")[0]({ reason: "startup" }, legacyCtx);
+		const globalWinsAgent = await readFile(
+			join(legacyModelsCwd, ".pi", "agents", "sdd-apply.md"),
+			"utf8",
+		);
+		assert.match(globalWinsAgent, /model: global\/provider-model/);
+		assert.doesNotMatch(globalWinsAgent, /model: legacy\/provider-model/);
+		await writeFile(globalModelsPath, "{ invalid json");
+		await hooks.get("session_start")[0]({ reason: "startup" }, legacyCtx);
+		const invalidGlobalSkippedAgent = await readFile(
+			join(legacyModelsCwd, ".pi", "agents", "sdd-apply.md"),
+			"utf8",
+		);
+		assert.match(invalidGlobalSkippedAgent, /model: global\/provider-model/);
+		assert.doesNotMatch(invalidGlobalSkippedAgent, /model: legacy\/provider-model/);
+		assert.equal(legacyCtx.ui.notifications.at(-1).level, "warning");
+		assert.match(legacyCtx.ui.notifications.at(-1).message, /skipped model config/);
+		let modelPanelOpened = false;
+		legacyCtx.ui.custom = () => {
+			modelPanelOpened = true;
+			return Promise.resolve({ type: "save", config: {} });
+		};
+		await commands.get("gentle:models").handler("", legacyCtx);
+		assert.equal(modelPanelOpened, false);
+		assert.equal(await readFile(globalModelsPath, "utf8"), "{ invalid json");
+		assert.equal(legacyCtx.ui.notifications.at(-1).level, "warning");
+		assert.match(legacyCtx.ui.notifications.at(-1).message, /cannot open model config/);
+		await writeFile(globalModelsPath, JSON.stringify({}, null, 2));
+		await hooks.get("session_start")[0]({ reason: "startup" }, legacyCtx);
+		const emptyGlobalSuppressesLegacyAgent = await readFile(
+			join(legacyModelsCwd, ".pi", "agents", "sdd-apply.md"),
+			"utf8",
+		);
+		assert.doesNotMatch(emptyGlobalSuppressesLegacyAgent, /model:/);
+	} finally {
+		await rm(legacyModelsCwd, { recursive: true, force: true });
+		await rm(globalModelsPath, { force: true });
+	}
+
 	const modelsCwd = await tempWorkspace();
 	try {
 		await mkdir(join(modelsCwd, ".pi", "agents"), { recursive: true });
@@ -373,9 +475,8 @@ async function run() {
 			join(modelsCwd, ".pi", "agents", "sdd-apply.md"),
 			`---\nname: sdd-apply\ndescription: Apply phase\n---\n\nbody\n`,
 		);
-		await mkdir(join(modelsCwd, ".pi", "gentle-ai"), { recursive: true });
 		await writeFile(
-			join(modelsCwd, ".pi", "gentle-ai", "models.json"),
+			globalModelsPath,
 			JSON.stringify({ "sdd-apply": "openai/gpt-5" }, null, 2),
 		);
 
@@ -399,12 +500,17 @@ async function run() {
 		await commands.get("gentle:models").handler("", ctx);
 
 		const savedConfig = JSON.parse(
-			await readFile(join(modelsCwd, ".pi", "gentle-ai", "models.json"), "utf8"),
+			await readFile(globalModelsPath, "utf8"),
 		);
 		assert.deepEqual(savedConfig["sdd-apply"], {
 			model: "openai/gpt-5",
 			thinking: "high",
 		});
+		assert.equal(
+			existsSync(join(modelsCwd, ".pi", "gentle-ai", "models.json")),
+			false,
+			"/gentle:models must save model routing globally, not per project",
+		);
 
 		const applyAgent = await readFile(
 			join(modelsCwd, ".pi", "agents", "sdd-apply.md"),
@@ -440,7 +546,7 @@ async function run() {
 		await commands.get("gentle:models").handler("", ctx);
 
 		const customSavedConfig = JSON.parse(
-			await readFile(join(modelsCwd, ".pi", "gentle-ai", "models.json"), "utf8"),
+			await readFile(globalModelsPath, "utf8"),
 		);
 		assert.deepEqual(customSavedConfig["sdd-apply"], {
 			model: "custom/provider-model",
@@ -448,6 +554,7 @@ async function run() {
 		});
 	} finally {
 		await rm(modelsCwd, { recursive: true, force: true });
+		await rm(globalModelsPath, { force: true });
 	}
 
 	const registryCwd = await tempWorkspace();

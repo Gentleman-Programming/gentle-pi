@@ -138,6 +138,10 @@ interface AgentRoutingEntry {
 	thinking?: ThinkingLevel;
 }
 type AgentModelConfig = Record<string, AgentRoutingEntry>;
+type ModelConfigFileResult =
+	| { status: "missing" }
+	| { status: "invalid"; path: string }
+	| { status: "valid"; config: AgentModelConfig };
 type AgentSource = "project" | "user" | "builtin";
 
 interface AgentEntry {
@@ -217,7 +221,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function modelConfigPath(cwd: string): string {
+function gentleAiConfigHome(): string {
+	return process.env.GENTLE_PI_CONFIG_HOME ?? join(homedir(), ".pi", "gentle-ai");
+}
+
+function modelConfigPath(_cwd: string): string {
+	return join(gentleAiConfigHome(), "models.json");
+}
+
+function legacyProjectModelConfigPath(cwd: string): string {
 	return join(cwd, ".pi", "gentle-ai", "models.json");
 }
 
@@ -269,40 +281,70 @@ function normalizeRoutingEntry(value: unknown): AgentRoutingEntry | undefined {
 	return { model, thinking };
 }
 
-export function readModelConfig(cwd: string): AgentModelConfig {
-	const path = modelConfigPath(cwd);
-	if (!existsSync(path)) return {};
+function readModelConfigFile(path: string): ModelConfigFileResult {
+	if (!existsSync(path)) return { status: "missing" };
 	try {
 		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-		if (!isRecord(parsed)) return {};
+		if (!isRecord(parsed)) return { status: "invalid", path };
 		const config: AgentModelConfig = {};
 		for (const [name, value] of Object.entries(parsed)) {
 			const entry = normalizeRoutingEntry(value);
 			if (entry) config[name] = entry;
 		}
-		return config;
+		return { status: "valid", config };
 	} catch {
-		return {};
+		return { status: "invalid", path };
 	}
+}
+
+async function readModelConfigFileAsync(
+	path: string,
+): Promise<ModelConfigFileResult> {
+	if (!(await pathExists(path))) return { status: "missing" };
+	try {
+		const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+		if (!isRecord(parsed)) return { status: "invalid", path };
+		const config: AgentModelConfig = {};
+		for (const [name, value] of Object.entries(parsed)) {
+			const entry = normalizeRoutingEntry(value);
+			if (entry) config[name] = entry;
+		}
+		return { status: "valid", config };
+	} catch {
+		return { status: "invalid", path };
+	}
+}
+
+function readSavedModelConfig(cwd: string): ModelConfigFileResult {
+	const globalResult = readModelConfigFile(modelConfigPath(cwd));
+	if (globalResult.status !== "missing") return globalResult;
+	const legacyResult = readModelConfigFile(legacyProjectModelConfigPath(cwd));
+	if (legacyResult.status === "invalid") return { status: "valid", config: {} };
+	return legacyResult;
+}
+
+async function readSavedModelConfigAsync(
+	cwd: string,
+): Promise<ModelConfigFileResult> {
+	const globalResult = await readModelConfigFileAsync(modelConfigPath(cwd));
+	if (globalResult.status !== "missing") return globalResult;
+	const legacyResult = await readModelConfigFileAsync(
+		legacyProjectModelConfigPath(cwd),
+	);
+	if (legacyResult.status === "invalid") return { status: "valid", config: {} };
+	return legacyResult;
+}
+
+export function readModelConfig(cwd: string): AgentModelConfig {
+	const result = readSavedModelConfig(cwd);
+	return result.status === "valid" ? result.config : {};
 }
 
 export async function readModelConfigAsync(
 	cwd: string,
 ): Promise<AgentModelConfig> {
-	const path = modelConfigPath(cwd);
-	if (!(await pathExists(path))) return {};
-	try {
-		const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
-		if (!isRecord(parsed)) return {};
-		const config: AgentModelConfig = {};
-		for (const [name, value] of Object.entries(parsed)) {
-			const entry = normalizeRoutingEntry(value);
-			if (entry) config[name] = entry;
-		}
-		return config;
-	} catch {
-		return {};
-	}
+	const result = await readSavedModelConfigAsync(cwd);
+	return result.status === "valid" ? result.config : {};
 }
 
 function writeModelConfig(cwd: string, config: AgentModelConfig): void {
@@ -641,6 +683,19 @@ export async function applyModelConfigAsync(
 		updated += 1;
 	}
 	return { updated, skipped };
+}
+
+export async function applySavedModelConfig(
+	ctx: ExtensionContext,
+): Promise<{ updated: number; skipped: number; invalidPath?: string }> {
+	const result = await readSavedModelConfigAsync(ctx.cwd);
+	if (result.status === "invalid") {
+		return { updated: 0, skipped: 0, invalidPath: result.path };
+	}
+	return applyModelConfigAsync(
+		ctx.cwd,
+		result.status === "valid" ? result.config : {},
+	);
 }
 
 function describeModelConfig(cwd: string, config: AgentModelConfig): string[] {
@@ -1033,7 +1088,15 @@ async function showSddModelPanel(
 }
 
 async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
-	let config = readModelConfig(ctx.cwd);
+	const savedConfig = await readSavedModelConfigAsync(ctx.cwd);
+	if (savedConfig.status === "invalid") {
+		ctx.ui.notify(
+			`el Gentleman cannot open model config because ${savedConfig.path} is invalid JSON or not an object. Fix or remove the file, then run /gentle:models again.`,
+			"warning",
+		);
+		return;
+	}
+	let config = savedConfig.status === "valid" ? savedConfig.config : {};
 	let result = await showSddModelPanel(ctx, config);
 	while (result.type === "custom") {
 		config = cloneModelConfig(result.config);
@@ -1071,11 +1134,11 @@ async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
 	}
 	if (result.type !== "save") return;
 	writeModelConfig(ctx.cwd, result.config);
-	const applyResult = applyModelConfig(ctx.cwd, result.config);
+	const applyResult = await applyModelConfigAsync(ctx.cwd, result.config);
 	ctx.ui.notify(
 		[
-			"el Gentleman model config saved.",
-			`Config: ${modelConfigPath(ctx.cwd)}`,
+			"el Gentleman global model config saved.",
+			`Global config: ${modelConfigPath(ctx.cwd)}`,
 			`Agents updated: ${applyResult.updated}`,
 			...describeModelConfig(ctx.cwd, result.config),
 		].join("\n"),
@@ -1106,15 +1169,20 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		return ensureSddPreflight(ctx, {
 			pi,
 			installAssets: (cwd) => installSddAssets(cwd, false),
-			applyModelConfig: async (cwd) =>
-				applyModelConfigAsync(cwd, await readModelConfigAsync(cwd)),
+			applyModelConfig: async () => applySavedModelConfig(ctx),
 		});
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
 		try {
-			const config = await readModelConfigAsync(ctx.cwd);
-			const modelResult = await applyModelConfigAsync(ctx.cwd, config);
+			const modelResult = await applySavedModelConfig(ctx);
+			if (ctx.hasUI && modelResult.invalidPath) {
+				ctx.ui.notify(
+					`el Gentleman skipped model config because ${modelResult.invalidPath} is invalid JSON or not an object. Fix or remove the file, then run /gentle:models again.`,
+					"warning",
+				);
+				return;
+			}
 			if (ctx.hasUI && modelResult.updated > 0) {
 				ctx.ui.notify(
 					`el Gentleman applied SDD model config to ${modelResult.updated} agent(s).`,
@@ -1185,7 +1253,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("gentle:models", {
-		description: "Configure per-agent models for el Gentleman.",
+		description: "Configure global per-agent models for el Gentleman.",
 		handler: async (_args, ctx) => {
 			await handleModelsCommand(ctx);
 		},
@@ -1238,7 +1306,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 			const openspecConfigured = existsSync(
 				join(ctx.cwd, "openspec", "config.yaml"),
 			);
-			const modelConfig = readModelConfig(ctx.cwd);
+			const modelConfig = await readModelConfigAsync(ctx.cwd);
 			ctx.ui.notify(
 				[
 					"el Gentleman package is active.",
@@ -1246,7 +1314,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 					`SDD agents: ${agentsInstalled ? "installed" : "not installed"}`,
 					`SDD chains: ${chainsInstalled ? "installed" : "not installed"}`,
 					`OpenSpec config: ${openspecConfigured ? "present" : "missing"}`,
-					`Model config: ${existsSync(modelConfigPath(ctx.cwd)) ? "present" : "missing"}`,
+					`Global model config: ${existsSync(modelConfigPath(ctx.cwd)) ? "present" : "missing"}`,
 					...describeModelConfig(ctx.cwd, modelConfig),
 				].join("\n"),
 				"info",

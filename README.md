@@ -49,7 +49,7 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | **Rose startup intro**         | Adds a pink rose fade-in, compact project/runtime panel, and visible startup collaboration credit for @aporcelli's `pi-gentle-startup` ideas. |
 | **Work routing discipline**    | Small tasks stay inline. Context-heavy exploration can be delegated. Large or risky changes go through SDD/OpenSpec.                          |
 | **SDD/OpenSpec assets**        | Installs phase agents and chains for `init`, `explore`, `proposal`, `spec`, `design`, `tasks`, `apply`, `verify`, and `archive`.              |
-| **Lazy SDD preflight**         | Asks once per session for SDD mode, artifact store, PR chaining strategy, and review budget before the first SDD flow.                       |
+| **Lazy SDD preflight**         | Asks once per session for SDD mode, artifact store, PR chaining strategy, and review budget before the first SDD flow.                        |
 | **Subagent orchestration**     | Keeps one parent session responsible while child agents explore, implement, test, or review with focused context.                             |
 | **Strict TDD support**         | When project config declares a test command, apply/verify phases must record RED → GREEN → TRIANGULATE → REFACTOR evidence.                   |
 | **Reviewer protection**        | Surfaces review workload risk before a task turns into an oversized PR.                                                                       |
@@ -87,10 +87,10 @@ pi
 ## Quick start
 
 ```text
-/gentle-ai:status          Check package, SDD assets, OpenSpec, and model config.
+/gentle-ai:status          Check package, SDD assets, OpenSpec, and global model config.
 /gentle-ai:sdd-preflight   Run or reuse the session SDD preflight explicitly.
 /sdd-init                  Create or refresh openspec/config.yaml.
-/gentle:models             Assign models to SDD/custom agents.
+/gentle:models             Assign global model/effort routing to SDD/custom agents.
 /gentle:persona            Switch between gentleman and neutral persona modes.
 ```
 
@@ -284,11 +284,13 @@ Recommended model/effort shape:
 | Verify / review            | Strong fresh-context model.                          | `high`                          |
 | Tiny utilities             | Inherit active/default model unless they bottleneck. | `inherit`                       |
 
-Saved at:
+Saved globally at:
 
 ```text
-.pi/gentle-ai/models.json
+~/.pi/gentle-ai/models.json
 ```
+
+Existing project-local `.pi/gentle-ai/models.json` files are still read as a legacy fallback when no global model config exists, but `/gentle:models` writes the shared global config.
 
 Config shape (per agent):
 
@@ -308,15 +310,15 @@ Legacy string entries are still accepted and treated as `model`-only config.
 
 ## Commands
 
-| Command                          | What it does                                                 |
-| -------------------------------- | ------------------------------------------------------------ |
-| `/gentle-ai:status`              | Shows package, SDD asset, OpenSpec, and model config status. |
-| `/gentle:models`                 | Opens model + effort assignment UI.                          |
-| `/gentle:persona`                | Switches persona mode.                                       |
-| `/sdd-init`                      | Initializes or refreshes `openspec/config.yaml`.             |
-| `/gentle-ai:install-sdd`         | Reinstalls SDD assets without overwriting local files.       |
-| `/gentle-ai:install-sdd --force` | Force-refreshes installed SDD assets.                        |
-| `/skill-registry:refresh`        | Regenerates `.atl/skill-registry.md`.                        |
+| Command                          | What it does                                                        |
+| -------------------------------- | ------------------------------------------------------------------- |
+| `/gentle-ai:status`              | Shows package, SDD asset, OpenSpec, and global model config status. |
+| `/gentle:models`                 | Opens global model + effort assignment UI.                          |
+| `/gentle:persona`                | Switches persona mode.                                              |
+| `/sdd-init`                      | Initializes or refreshes `openspec/config.yaml`.                    |
+| `/gentle-ai:install-sdd`         | Reinstalls SDD assets without overwriting local files.              |
+| `/gentle-ai:install-sdd --force` | Force-refreshes installed SDD assets.                               |
+| `/skill-registry:refresh`        | Regenerates `.atl/skill-registry.md`.                               |
 
 Startup flag:
 

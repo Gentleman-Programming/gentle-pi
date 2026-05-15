@@ -40,8 +40,8 @@ interface SddPreflightCallbacks {
 	applyModelConfig?: (
 		cwd: string,
 	) =>
-		| { updated: number; skipped: number }
-		| Promise<{ updated: number; skipped: number }>;
+		| { updated: number; skipped: number; invalidPath?: string }
+		| Promise<{ updated: number; skipped: number; invalidPath?: string }>;
 }
 
 const DEFAULT_SDD_PREFLIGHT: SddPreflightPreferences = {
@@ -238,6 +238,9 @@ export async function ensureSddPreflight(
 			skipped: 0,
 		};
 		if (ctx.hasUI) {
+			const modelRoutingLine = modelResult.invalidPath
+				? `Model routing skipped: ${modelResult.invalidPath} is invalid JSON or not an object.`
+				: `Model-routed agents updated: ${modelResult.updated}`;
 			ctx.ui.notify(
 				[
 					"Gentle AI SDD preflight complete.",
@@ -246,9 +249,9 @@ export async function ensureSddPreflight(
 					`PR chaining: ${prefs.chainedPrStrategy}`,
 					`Review budget: ${prefs.reviewBudgetLines} changed lines`,
 					`Assets installed: ${result.agents} agent(s), ${result.chains} chain(s), ${result.support} support file(s), ${result.skipped} skipped.`,
-					`Model-routed agents updated: ${modelResult.updated}`,
+					modelRoutingLine,
 				].join("\n"),
-				"info",
+				modelResult.invalidPath ? "warning" : "info",
 			);
 		}
 		sddPreflightBySession.set(sessionKey, prefs);
