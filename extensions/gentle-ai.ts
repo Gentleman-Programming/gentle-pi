@@ -130,6 +130,7 @@ const SDD_AGENT_NAMES = [
 	"sdd-verify",
 	"sdd-archive",
 ] as const;
+const SDD_AGENT_NAME_SET = new Set<string>(SDD_AGENT_NAMES);
 
 type SddAgentName = (typeof SDD_AGENT_NAMES)[number];
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -169,6 +170,34 @@ const MODEL_CONTROL_OPTIONS = [
 	INHERIT_MODEL,
 	CUSTOM_MODEL,
 ] as const;
+
+function readStringPath(value: unknown, path: string[]): string | undefined {
+	let current = value;
+	for (const key of path) {
+		if (!isRecord(current)) return undefined;
+		current = current[key];
+	}
+	return typeof current === "string" ? current : undefined;
+}
+
+function isSddAgentStartEvent(event: unknown): boolean {
+	const candidates = [
+		readStringPath(event, ["agentName"]),
+		readStringPath(event, ["agent"]),
+		readStringPath(event, ["name"]),
+		readStringPath(event, ["agent", "name"]),
+		readStringPath(event, ["subagent", "name"]),
+	]
+		.filter((value): value is string => value !== undefined)
+		.map((value) => value.trim());
+	if (candidates.some((value) => SDD_AGENT_NAME_SET.has(value))) return true;
+
+	const systemPrompt = readStringPath(event, ["systemPrompt"]) ?? "";
+	return SDD_AGENT_NAMES.some((name) => {
+		const phase = name.replace(/^sdd-/, "");
+		return new RegExp(`\\bSDD ${phase} executor\\b`, "i").test(systemPrompt);
+	});
+}
 
 function evaluateDeniedCommand(
 	command: string,
@@ -1209,7 +1238,10 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		return { action: "continue" };
 	});
 
-	pi.on("before_agent_start", (event, ctx) => {
+	pi.on("before_agent_start", async (event, ctx) => {
+		if (isSddAgentStartEvent(event) && !getSddPreflightPreferences(ctx)) {
+			await runSddPreflight(ctx);
+		}
 		const prefs = getSddPreflightPreferences(ctx);
 		const sddPrompt = prefs ? `\n\n${renderSddPreflightPrompt(prefs)}` : "";
 		return {

@@ -162,9 +162,14 @@ async function run() {
 	const promptCwd = await tempWorkspace();
 	try {
 		const promptHook = hooks.get("before_agent_start")[0];
-		const promptResult = promptHook({ systemPrompt: "base" }, createCtx(promptCwd));
+		const promptResult = await promptHook({ systemPrompt: "base" }, createCtx(promptCwd));
 		assert.match(promptResult.systemPrompt, /base/);
 		assert.match(promptResult.systemPrompt, /el Gentleman/);
+		assert.equal(
+			existsSync(join(promptCwd, ".pi", "agents", "sdd-apply.md")),
+			false,
+			"normal agent startup must not run SDD preflight",
+		);
 	} finally {
 		await rm(promptCwd, { recursive: true, force: true });
 	}
@@ -297,7 +302,7 @@ async function run() {
 		await inputHook({ text: "/sdd-plan another change", source: "interactive" }, ctx);
 		assert.equal(ctx.ui.selections.length, 3, "preflight should run only once per session");
 		const promptHook = hooks.get("before_agent_start")[0];
-		const promptResult = promptHook({ systemPrompt: "base" }, ctx);
+		const promptResult = await promptHook({ systemPrompt: "base" }, ctx);
 		assert.match(promptResult.systemPrompt, /SDD Session Preflight/);
 		assert.match(promptResult.systemPrompt, /Execution mode: interactive/);
 	} finally {
@@ -315,6 +320,34 @@ async function run() {
 		assert.equal(ctx.ui.selections.length, 3, "manual preflight command should reuse session choices");
 	} finally {
 		await rm(commandSddCwd, { recursive: true, force: true });
+	}
+
+	const sddAgentGuardCwd = await tempWorkspace();
+	try {
+		const ctx = createCtx(sddAgentGuardCwd, true, "sdd-agent-guard-session");
+		const promptHook = hooks.get("before_agent_start")[0];
+		const promptResult = await promptHook(
+			{
+				systemPrompt: "You are the SDD proposal executor for Gentle AI.",
+			},
+			ctx,
+		);
+		assert.equal(existsSync(join(sddAgentGuardCwd, ".pi", "agents", "sdd-apply.md")), true);
+		assert.equal(existsSync(join(sddAgentGuardCwd, ".pi", "chains", "sdd-full.chain.md")), true);
+		assert.equal(ctx.ui.selections.length, 3);
+		assert.match(promptResult.systemPrompt, /SDD Session Preflight/);
+		assert.match(ctx.ui.notifications.at(-1).message, /SDD preflight complete/);
+
+		await promptHook(
+			{
+				agentName: "sdd-tasks",
+				systemPrompt: "You are the SDD tasks executor for Gentle AI.",
+			},
+			ctx,
+		);
+		assert.equal(ctx.ui.selections.length, 3, "SDD agent guard should reuse session choices");
+	} finally {
+		await rm(sddAgentGuardCwd, { recursive: true, force: true });
 	}
 
 	const invalidPreflightCwd = await tempWorkspace();
