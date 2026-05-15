@@ -33,6 +33,36 @@ import {
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
 
+function sddAssetDriftCount(cwd: string): number {
+	let stale = 0;
+	for (const [assetSubdir, installedSubdir] of [
+		["agents", join(".pi", "agents")],
+		["chains", join(".pi", "chains")],
+	] as const) {
+		const assetDir = join(ASSETS_DIR, assetSubdir);
+		if (!existsSync(assetDir)) continue;
+		for (const entry of readdirSync(assetDir, { withFileTypes: true })) {
+			if (!entry.isFile()) continue;
+			const installedPath = join(cwd, installedSubdir, entry.name);
+			try {
+				if (!existsSync(installedPath)) {
+					stale += 1;
+					continue;
+				}
+				if (
+					readFileSync(join(assetDir, entry.name), "utf8") !==
+					readFileSync(installedPath, "utf8")
+				) {
+					stale += 1;
+				}
+			} catch {
+				stale += 1;
+			}
+		}
+	}
+	return stale;
+}
+
 let orchestratorPromptCache: string | null = null;
 function getOrchestratorPrompt(): string {
 	if (orchestratorPromptCache === null) {
@@ -128,6 +158,7 @@ const SDD_AGENT_NAMES = [
 	"sdd-tasks",
 	"sdd-apply",
 	"sdd-verify",
+	"sdd-sync",
 	"sdd-archive",
 ] as const;
 const SDD_AGENT_NAME_SET = new Set<string>(SDD_AGENT_NAMES);
@@ -1338,6 +1369,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 			const openspecConfigured = existsSync(
 				join(ctx.cwd, "openspec", "config.yaml"),
 			);
+			const staleSddAssets = sddAssetDriftCount(ctx.cwd);
 			const modelConfig = await readModelConfigAsync(ctx.cwd);
 			ctx.ui.notify(
 				[
@@ -1345,11 +1377,16 @@ export default function gentleAi(pi: ExtensionAPI): void {
 					`Persona: ${readPersonaMode(ctx.cwd)}`,
 					`SDD agents: ${agentsInstalled ? "installed" : "not installed"}`,
 					`SDD chains: ${chainsInstalled ? "installed" : "not installed"}`,
+					`SDD assets stale: ${staleSddAssets} file(s)${
+						staleSddAssets > 0
+							? " — run /gentle-ai:install-sdd --force to refresh intentionally"
+							: ""
+					}`,
 					`OpenSpec config: ${openspecConfigured ? "present" : "missing"}`,
 					`Global model config: ${existsSync(modelConfigPath(ctx.cwd)) ? "present" : "missing"}`,
 					...describeModelConfig(ctx.cwd, modelConfig),
 				].join("\n"),
-				"info",
+				staleSddAssets > 0 ? "warning" : "info",
 			);
 		},
 	});

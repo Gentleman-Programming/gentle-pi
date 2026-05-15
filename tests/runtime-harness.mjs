@@ -288,6 +288,7 @@ async function run() {
 			{ action: "continue" },
 		);
 		assert.equal(existsSync(join(lazySddCwd, ".pi", "agents", "sdd-apply.md")), true);
+		assert.equal(existsSync(join(lazySddCwd, ".pi", "agents", "sdd-sync.md")), true);
 		assert.equal(existsSync(join(lazySddCwd, ".pi", "chains", "sdd-full.chain.md")), true);
 		const lazyAppliedAgent = await readFile(
 			join(lazySddCwd, ".pi", "agents", "sdd-apply.md"),
@@ -383,11 +384,27 @@ async function run() {
 		await rm(installCwd, { recursive: true, force: true });
 	}
 
+	const staleAssetsCwd = await tempWorkspace();
+	try {
+		await mkdir(join(staleAssetsCwd, ".pi", "agents"), { recursive: true });
+		await mkdir(join(staleAssetsCwd, ".pi", "chains"), { recursive: true });
+		await writeFile(join(staleAssetsCwd, ".pi", "agents", "sdd-apply.md"), "stale apply\n");
+		await writeFile(join(staleAssetsCwd, ".pi", "agents", "sdd-spec.md"), "stale spec\n");
+		await writeFile(join(staleAssetsCwd, ".pi", "chains", "sdd-full.chain.md"), "stale chain\n");
+		const ctx = createCtx(staleAssetsCwd, true);
+		await commands.get("gentle-ai:status").handler("", ctx);
+		assert.match(ctx.ui.notifications.at(-1).message, /SDD assets stale: \d+ file\(s\)/);
+		assert.match(ctx.ui.notifications.at(-1).message, /gentle-ai:install-sdd --force/);
+	} finally {
+		await rm(staleAssetsCwd, { recursive: true, force: true });
+	}
+
 	const sddCwd = await tempWorkspace();
 	try {
 		const ctx = createCtx(sddCwd, true);
 		await commands.get("sdd-init").handler("", ctx);
 		assert.equal(existsSync(join(sddCwd, ".pi", "agents", "sdd-apply.md")), true);
+		assert.equal(existsSync(join(sddCwd, ".pi", "agents", "sdd-sync.md")), true);
 		assert.equal(existsSync(join(sddCwd, ".pi", "chains", "sdd-full.chain.md")), true);
 		assert.equal(ctx.ui.selections.length, 3);
 		assert.match(ctx.ui.notifications[0].message, /SDD preflight complete/);

@@ -29,11 +29,20 @@ progress: true
 
 Run focused and full verification for {task} using the apply-progress and project artifacts. Include review/judgment blockers.
 
+## sdd-sync
+
+reads: init.md+apply-progress.md+verify-report.md
+output: sync-report.md
+outputMode: file-only
+progress: true
+
+Sync verified file-backed delta specs for {task} into `openspec/specs/` without archiving. In Engram-only mode, report that canonical sync is not applicable.
+
 ## sdd-archive
 
-reads: verify-report.md
+reads: verify-report.md+sync-report.md
 output: archive-report.md
 outputMode: file-only
 progress: true
 
-Archive {task} only when verification succeeds. If verification fails, leave artifacts active and report the blocker.
+Archive {task} only when verification succeeds and file-backed sync is complete or not applicable. If verification or sync fails, leave artifacts active and report the blocker.

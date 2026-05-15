@@ -6,9 +6,21 @@ import { fileURLToPath } from "node:url";
 const root = join(fileURLToPath(new URL("..", import.meta.url)));
 
 const requiredPaths = [
+  "assets/agents/sdd-apply.md",
+  "assets/agents/sdd-archive.md",
+  "assets/agents/sdd-design.md",
+  "assets/agents/sdd-explore.md",
   "assets/agents/sdd-init.md",
+  "assets/agents/sdd-proposal.md",
+  "assets/agents/sdd-spec.md",
+  "assets/agents/sdd-sync.md",
+  "assets/agents/sdd-tasks.md",
+  "assets/agents/sdd-verify.md",
+  "assets/chains/sdd-full.chain.md",
   "assets/chains/sdd-plan.chain.md",
+  "assets/chains/sdd-verify.chain.md",
   "assets/support/strict-tdd.md",
+  "assets/support/strict-tdd-verify.md",
   "extensions/gentle-ai.ts",
   "extensions/sdd-init.ts",
   "extensions/skill-registry.ts",

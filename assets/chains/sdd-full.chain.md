@@ -74,11 +74,20 @@ progress: true
 
 Verify {task} against specs, design, tasks, implementation, apply-progress, strict TDD evidence, assertion quality, and review workload boundaries.
 
+## sdd-sync
+
+reads: proposal.md+spec.md+design.md+tasks.md+apply-progress.md+verify-report.md
+output: sync-report.md
+outputMode: file-only
+progress: true
+
+Sync verified file-backed delta specs for {task} into `openspec/specs/` without archiving. In Engram-only mode, report that canonical sync is not applicable.
+
 ## sdd-archive
 
-reads: verify-report.md
+reads: verify-report.md+sync-report.md
 output: archive-report.md
 outputMode: file-only
 progress: true
 
-Archive {task} only when the verification report passes; otherwise report that archive is blocked and preserve active artifacts.
+Archive {task} only when the verification report passes and file-backed sync is complete or not applicable; otherwise report that archive is blocked and preserve active artifacts.

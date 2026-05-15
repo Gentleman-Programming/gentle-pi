@@ -137,7 +137,18 @@ Fresh reviewers are intentionally not token-saving devices; they buy independent
 ## SDD/OpenSpec flow
 
 ```text
-init → explore → proposal → spec → design → tasks → apply → verify → archive
+init
+  ↓
+explore → proposal → spec ─┬→ design ─┐
+                            └─────────┴→ tasks → apply → verify → sync → archive
+```
+
+The main loop is intentionally file-backed when you choose `openspec` or `both`:
+
+```text
+planning artifacts                implementation evidence        canonical update
+──────────────────                ───────────────────────        ────────────────
+proposal/spec/design/tasks   →    apply-progress/verify-report → sync-report → archive-report
 ```
 
 For substantial work, the parent session coordinates the flow and each phase writes artifacts. That gives you:
@@ -147,7 +158,58 @@ For substantial work, the parent session coordinates the flow and each phase wri
 - task plans reviewers can reason about;
 - implementation evidence;
 - verification reports;
+- sync reports that update canonical specs while keeping the change active;
 - archive notes for future agents.
+
+### OpenSpec artifact model
+
+`gentle-pi` treats OpenSpec-compatible behavior as part of the harness. You do not need to install the external OpenSpec CLI/package for SDD.
+
+In file-backed modes, canonical accepted behavior lives in `openspec/specs/`, while active changes carry deltas under `openspec/changes/`:
+
+```text
+openspec/
+├── specs/                                      # accepted source of truth
+│   └── {domain}/spec.md
+└── changes/
+    ├── {change}/                              # active work
+    │   ├── proposal.md
+    │   ├── specs/{domain}/spec.md             # full spec or delta spec
+    │   ├── design.md
+    │   ├── tasks.md
+    │   ├── apply-progress.md
+    │   ├── verify-report.md
+    │   └── sync-report.md
+    └── archive/YYYY-MM-DD-{change}/           # immutable audit trail
+```
+
+Delta flow:
+
+```text
+openspec/changes/{change}/specs/{domain}/spec.md
+        │
+        │  sdd-sync applies ADDED / MODIFIED / REMOVED
+        ▼
+openspec/specs/{domain}/spec.md
+        │
+        │  sdd-archive moves the completed change folder
+        ▼
+openspec/changes/archive/YYYY-MM-DD-{change}/
+```
+
+When a canonical spec already exists, change specs use requirement operation sections:
+
+```markdown
+## ADDED Requirements
+
+## MODIFIED Requirements
+
+## REMOVED Requirements
+```
+
+`MODIFIED` requirements must include the full requirement block, including still-valid scenarios, because sync replaces the canonical block by requirement name. `sdd-sync` syncs file-backed deltas into `openspec/specs/{domain}/spec.md` while keeping the change active; `sdd-archive` then moves the synced change to `openspec/changes/archive/YYYY-MM-DD-{change}/`.
+
+Engram-only mode is different by design: Engram is working memory and does not maintain a canonical spec merge layer. Use `openspec` or `both` (hybrid file + memory persistence) when you need canonical spec evolution.
 
 ## SDD preflight and project files
 
