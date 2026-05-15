@@ -6,7 +6,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
-import { applyModelConfig, readModelConfig } from "./gentle-ai.ts";
+import { applyModelConfigAsync, readModelConfigAsync } from "./gentle-ai.ts";
 import { ensureSddPreflight, installSddAssets } from "../lib/sdd-preflight.ts";
 type ExtensionAPI = any;
 
@@ -778,7 +778,8 @@ export default function (pi: ExtensionAPI) {
 			await ensureSddPreflight(ctx, {
 				pi,
 				installAssets: (cwd) => installSddAssets(cwd, false),
-				applyModelConfig: (cwd) => applyModelConfig(cwd, readModelConfig(cwd)),
+				applyModelConfig: async (cwd) =>
+					applyModelConfigAsync(cwd, await readModelConfigAsync(cwd)),
 			});
 			const configPath = join(ctx.cwd, CONFIG_REL_PATH);
 			if (existsSync(configPath)) {

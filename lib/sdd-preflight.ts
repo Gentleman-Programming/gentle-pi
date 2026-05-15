@@ -24,13 +24,24 @@ export interface SddPreflightPreferences {
 
 interface SddPreflightCallbacks {
 	pi: ExtensionAPI;
-	installAssets?: (cwd: string) => {
-		agents: number;
-		chains: number;
-		support: number;
-		skipped: number;
-	};
-	applyModelConfig?: (cwd: string) => { updated: number; skipped: number };
+	installAssets?: (cwd: string) =>
+		| {
+				agents: number;
+				chains: number;
+				support: number;
+				skipped: number;
+		  }
+		| Promise<{
+				agents: number;
+				chains: number;
+				support: number;
+				skipped: number;
+		  }>;
+	applyModelConfig?: (
+		cwd: string,
+	) =>
+		| { updated: number; skipped: number }
+		| Promise<{ updated: number; skipped: number }>;
 }
 
 const DEFAULT_SDD_PREFLIGHT: SddPreflightPreferences = {
@@ -219,8 +230,13 @@ export async function ensureSddPreflight(
 	const promise = (async () => {
 		const engramAvailable = hasWritableEngramTool(callbacks.pi);
 		const prefs = await collectSddPreflightPreferences(ctx, engramAvailable);
-		const result = callbacks.installAssets?.(ctx.cwd) ?? installSddAssets(ctx.cwd, false);
-		const modelResult = callbacks.applyModelConfig?.(ctx.cwd) ?? { updated: 0, skipped: 0 };
+		const result =
+			(await callbacks.installAssets?.(ctx.cwd)) ??
+			installSddAssets(ctx.cwd, false);
+		const modelResult = (await callbacks.applyModelConfig?.(ctx.cwd)) ?? {
+			updated: 0,
+			skipped: 0,
+		};
 		if (ctx.hasUI) {
 			ctx.ui.notify(
 				[

@@ -5,6 +5,13 @@ import {
 	readFileSync,
 	writeFileSync,
 } from "node:fs";
+import {
+	access,
+	mkdir,
+	readFile,
+	readdir,
+	writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,10 +32,30 @@ import {
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
-const ORCHESTRATOR_PROMPT = readFileSync(
-	join(ASSETS_DIR, "orchestrator.md"),
-	"utf8",
-).trim();
+
+let orchestratorPromptCache: string | null = null;
+function getOrchestratorPrompt(): string {
+	if (orchestratorPromptCache === null) {
+		orchestratorPromptCache = readFileSync(
+			join(ASSETS_DIR, "orchestrator.md"),
+			"utf8",
+		).trim();
+	}
+	return orchestratorPromptCache;
+}
+
+// Defer hook work so the intro animation interval can start without the
+// event loop being blocked by synchronous filesystem walks.
+const BOOT_DEFER_MS = 100;
+
+async function pathExists(path: string): Promise<boolean> {
+	try {
+		await access(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
 
 type PersonaMode = "gentleman" | "neutral";
 
@@ -76,7 +103,7 @@ Harness principles:
 - Protect the human reviewer: avoid oversized changes, surface review workload risk, and ask before turning one task into a large multi-area change.
 - Never claim persistent memory is available because of this package. Memory is provided by separate packages or MCP tools when installed and callable.
 
-${ORCHESTRATOR_PROMPT}`;
+${getOrchestratorPrompt()}`;
 }
 
 const DENIED_BASH_PATTERNS: RegExp[] = [
@@ -263,6 +290,25 @@ export function readModelConfig(cwd: string): AgentModelConfig {
 	}
 }
 
+export async function readModelConfigAsync(
+	cwd: string,
+): Promise<AgentModelConfig> {
+	const path = modelConfigPath(cwd);
+	if (!(await pathExists(path))) return {};
+	try {
+		const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+		if (!isRecord(parsed)) return {};
+		const config: AgentModelConfig = {};
+		for (const [name, value] of Object.entries(parsed)) {
+			const entry = normalizeRoutingEntry(value);
+			if (entry) config[name] = entry;
+		}
+		return config;
+	} catch {
+		return {};
+	}
+}
+
 function writeModelConfig(cwd: string, config: AgentModelConfig): void {
 	const path = modelConfigPath(cwd);
 	mkdirSync(dirname(path), { recursive: true });
@@ -323,6 +369,23 @@ function parseAgentName(filePath: string): string | undefined {
 	return packageName ? `${packageName}.${name}` : name;
 }
 
+async function parseAgentNameAsync(
+	filePath: string,
+): Promise<string | undefined> {
+	let content: string;
+	try {
+		content = await readFile(filePath, "utf8");
+	} catch {
+		return undefined;
+	}
+	const name = content.match(/^name:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1]?.trim();
+	if (!name) return undefined;
+	const packageName = content
+		.match(/^package:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1]
+		?.trim();
+	return packageName ? `${packageName}.${name}` : name;
+}
+
 function listAgentFilesRecursive(dir: string): string[] {
 	if (!existsSync(dir)) return [];
 	const files: string[] = [];
@@ -339,6 +402,30 @@ function listAgentFilesRecursive(dir: string): string[] {
 	return files;
 }
 
+async function listAgentFilesRecursiveAsync(dir: string): Promise<string[]> {
+	if (!(await pathExists(dir))) return [];
+	const files: string[] = [];
+	let entries;
+	try {
+		entries = await readdir(dir, { withFileTypes: true });
+	} catch {
+		return files;
+	}
+	for (const entry of entries) {
+		const path = join(dir, entry.name);
+		if (entry.isDirectory()) {
+			files.push(...(await listAgentFilesRecursiveAsync(path)));
+		} else if (
+			entry.isFile() &&
+			entry.name.endsWith(".md") &&
+			!entry.name.endsWith(".chain.md")
+		) {
+			files.push(path);
+		}
+	}
+	return files;
+}
+
 function listAgentsFromDir(dir: string, source: AgentSource): AgentEntry[] {
 	return listAgentFilesRecursive(dir)
 		.map((filePath): AgentEntry | undefined => {
@@ -346,6 +433,19 @@ function listAgentsFromDir(dir: string, source: AgentSource): AgentEntry[] {
 			return name ? { name, source, filePath } : undefined;
 		})
 		.filter((entry): entry is AgentEntry => entry !== undefined);
+}
+
+async function listAgentsFromDirAsync(
+	dir: string,
+	source: AgentSource,
+): Promise<AgentEntry[]> {
+	const filePaths = await listAgentFilesRecursiveAsync(dir);
+	const entries: AgentEntry[] = [];
+	for (const filePath of filePaths) {
+		const name = await parseAgentNameAsync(filePath);
+		if (name) entries.push({ name, source, filePath });
+	}
+	return entries;
 }
 
 function listDiscoverableAgents(cwd: string): AgentEntry[] {
@@ -361,6 +461,37 @@ function listDiscoverableAgents(cwd: string): AgentEntry[] {
 		...listAgentsFromDir(join(cwd, ".agents"), "project"),
 		...listAgentsFromDir(join(cwd, ".pi", "agents"), "project"),
 	];
+	const byName = new Map<string, AgentEntry>();
+	for (const agent of agents) byName.set(agent.name, agent);
+	const discovered = Array.from(byName.values());
+	const sddFirst = SDD_AGENT_NAMES.map((name) =>
+		discovered.find((agent) => agent.name === name),
+	).filter((agent): agent is AgentEntry => agent !== undefined);
+	const rest = discovered
+		.filter((agent) => !SDD_AGENT_NAMES.includes(agent.name as SddAgentName))
+		.sort((left, right) => left.name.localeCompare(right.name));
+	return [...sddFirst, ...rest];
+}
+
+async function listDiscoverableAgentsAsync(cwd: string): Promise<AgentEntry[]> {
+	const builtinDirs = [
+		join(PACKAGE_ROOT, "..", "pi-subagents", "agents"),
+		join(cwd, ".pi", "npm", "node_modules", "pi-subagents", "agents"),
+		join(homedir(), ".local", "lib", "node_modules", "pi-subagents", "agents"),
+	];
+	const agents: AgentEntry[] = [];
+	for (const dir of builtinDirs) {
+		agents.push(...(await listAgentsFromDirAsync(dir, "builtin")));
+	}
+	const otherDirs: Array<[string, AgentSource]> = [
+		[join(homedir(), ".pi", "agent", "agents"), "user"],
+		[join(homedir(), ".agents"), "user"],
+		[join(cwd, ".agents"), "project"],
+		[join(cwd, ".pi", "agents"), "project"],
+	];
+	for (const [dir, source] of otherDirs) {
+		agents.push(...(await listAgentsFromDirAsync(dir, source)));
+	}
 	const byName = new Map<string, AgentEntry>();
 	for (const agent of agents) byName.set(agent.name, agent);
 	const discovered = Array.from(byName.values());
@@ -417,6 +548,46 @@ function updateBuiltinModelOverride(
 	return true;
 }
 
+async function updateBuiltinModelOverrideAsync(
+	cwd: string,
+	name: string,
+	entry: AgentRoutingEntry | undefined,
+): Promise<boolean> {
+	const path = projectSettingsPath(cwd);
+	let settings: Record<string, unknown> = {};
+	if (await pathExists(path)) {
+		try {
+			const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+			if (isRecord(parsed)) settings = parsed;
+		} catch {
+			settings = {};
+		}
+	}
+	const subagents = isRecord(settings.subagents)
+		? { ...settings.subagents }
+		: {};
+	const agentOverrides = isRecord(subagents.agentOverrides)
+		? { ...subagents.agentOverrides }
+		: {};
+	const current = isRecord(agentOverrides[name])
+		? { ...agentOverrides[name] }
+		: {};
+	if (entry?.model === undefined) delete current.model;
+	else current.model = entry.model;
+	if (entry?.thinking === undefined) delete current.thinking;
+	else current.thinking = entry.thinking;
+	if (Object.keys(current).length > 0) agentOverrides[name] = current;
+	else delete agentOverrides[name];
+	if (Object.keys(agentOverrides).length > 0)
+		subagents.agentOverrides = agentOverrides;
+	else delete subagents.agentOverrides;
+	if (Object.keys(subagents).length > 0) settings.subagents = subagents;
+	else delete settings.subagents;
+	await mkdir(dirname(path), { recursive: true });
+	await writeFile(path, `${JSON.stringify(settings, null, "\t")}\n`);
+	return true;
+}
+
 export function applyModelConfig(
 	cwd: string,
 	config: AgentModelConfig,
@@ -441,6 +612,36 @@ export function applyModelConfig(
 			continue;
 		}
 		writeFileSync(agent.filePath, next);
+		updated += 1;
+	}
+	return { updated, skipped };
+}
+
+export async function applyModelConfigAsync(
+	cwd: string,
+	config: AgentModelConfig,
+): Promise<{ updated: number; skipped: number }> {
+	let updated = 0;
+	let skipped = 0;
+	for (const agent of await listDiscoverableAgentsAsync(cwd)) {
+		const entry = config[agent.name];
+		if (agent.source === "builtin") {
+			if (await updateBuiltinModelOverrideAsync(cwd, agent.name, entry))
+				updated += 1;
+			else skipped += 1;
+			continue;
+		}
+		if (!agent.filePath || !(await pathExists(agent.filePath))) {
+			skipped += 1;
+			continue;
+		}
+		const original = await readFile(agent.filePath, "utf8");
+		const next = updateFrontmatterRouting(original, entry);
+		if (next === original) {
+			skipped += 1;
+			continue;
+		}
+		await writeFile(agent.filePath, next);
 		updated += 1;
 	}
 	return { updated, skipped };
@@ -909,18 +1110,37 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		return ensureSddPreflight(ctx, {
 			pi,
 			installAssets: (cwd) => installSddAssets(cwd, false),
-			applyModelConfig: (cwd) => applyModelConfig(cwd, readModelConfig(cwd)),
+			applyModelConfig: async (cwd) =>
+				applyModelConfigAsync(cwd, await readModelConfigAsync(cwd)),
 		});
 	}
 
 	pi.on("session_start", (_event, ctx) => {
-		const modelResult = applyModelConfig(ctx.cwd, readModelConfig(ctx.cwd));
-		if (ctx.hasUI && modelResult.updated > 0) {
-			ctx.ui.notify(
-				`el Gentleman applied SDD model config to ${modelResult.updated} agent(s).`,
-				"info",
-			);
-		}
+		// Defer the model-config sweep so the intro animation interval can start
+		// before we walk the agent directories asynchronously.
+		setTimeout(() => {
+			void (async () => {
+				try {
+					const config = await readModelConfigAsync(ctx.cwd);
+					const modelResult = await applyModelConfigAsync(ctx.cwd, config);
+					if (ctx.hasUI && modelResult.updated > 0) {
+						ctx.ui.notify(
+							`el Gentleman applied SDD model config to ${modelResult.updated} agent(s).`,
+							"info",
+						);
+					}
+				} catch (error) {
+					if (ctx.hasUI) {
+						const message =
+							error instanceof Error ? error.message : String(error);
+						ctx.ui.notify(
+							`el Gentleman model config sweep failed: ${message}`,
+							"warning",
+						);
+					}
+				}
+			})();
+		}, BOOT_DEFER_MS);
 	});
 
 	pi.on("input", async (event, ctx) => {

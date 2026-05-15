@@ -280,15 +280,50 @@ function buildLetterStrokeMap(letterIdx: number): { orderMap: Map<string, number
   return { orderMap, maxOrder: Math.max(1, order - 1) };
 }
 
-const LETTER_STROKES = LETTER_SPANS.map((_, i) => buildLetterStrokeMap(i));
+type LetterStroke = { orderMap: Map<string, number>; maxOrder: number };
+
 const WRITING_START_TICK = 6;
-const LETTER_TICKS = LETTER_STROKES.map((s) =>
-  Math.max(5, Math.ceil(((s.maxOrder + 8) / 11) * 0.48)),
+const FALLBACK_LETTER_TICKS = 8;
+
+const LETTER_STROKES: Array<LetterStroke | null> = LETTER_SPANS.map(() => null);
+const LETTER_TICKS: number[] = LETTER_SPANS.map(() => FALLBACK_LETTER_TICKS);
+const LETTER_START_TICKS: number[] = LETTER_SPANS.map(
+  (_, i) => WRITING_START_TICK + i * FALLBACK_LETTER_TICKS,
 );
-const LETTER_START_TICKS = LETTER_TICKS.map((_, i) =>
-  WRITING_START_TICK + LETTER_TICKS.slice(0, i).reduce((a, b) => a + b, 0),
-);
-const WRITING_END_TICK = WRITING_START_TICK + LETTER_TICKS.reduce((a, b) => a + b, 0);
+let WRITING_END_TICK =
+  WRITING_START_TICK + LETTER_TICKS.reduce((a, b) => a + b, 0);
+
+function recomputeLetterTicks(): void {
+  for (let i = 0; i < LETTER_STROKES.length; i++) {
+    const stroke = LETTER_STROKES[i];
+    LETTER_TICKS[i] = stroke
+      ? Math.max(5, Math.ceil(((stroke.maxOrder + 8) / 11) * 0.48))
+      : FALLBACK_LETTER_TICKS;
+  }
+  let acc = WRITING_START_TICK;
+  for (let i = 0; i < LETTER_TICKS.length; i++) {
+    LETTER_START_TICKS[i] = acc;
+    acc += LETTER_TICKS[i];
+  }
+  WRITING_END_TICK = acc;
+}
+
+function allStrokesReady(): boolean {
+  for (const stroke of LETTER_STROKES) if (stroke === null) return false;
+  return true;
+}
+
+let warmupStarted = false;
+async function warmupLetterStrokes(): Promise<void> {
+  if (warmupStarted) return;
+  warmupStarted = true;
+  for (let i = 0; i < LETTER_SPANS.length; i++) {
+    if (LETTER_STROKES[i] !== null) continue;
+    LETTER_STROKES[i] = buildLetterStrokeMap(i);
+    recomputeLetterTicks();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
 
 function buildPenLogoLine(
   line: string,
@@ -307,6 +342,10 @@ function buildPenLogoLine(
 
     const letterIdx = letterIndexAtX(x);
     const stroke = LETTER_STROKES[letterIdx];
+    if (stroke === null) {
+      out.push({ char: ch, type: "logo-ink" });
+      continue;
+    }
     const startTick = LETTER_START_TICKS[letterIdx];
     const duration = LETTER_TICKS[letterIdx];
     const progress = (tick - startTick) / Math.max(1, duration);
@@ -371,6 +410,29 @@ class LayoutBuilder {
   }
 }
 
+const FULL_INTRO_MIN_ROWS = 30;
+const FULL_INTRO_MIN_COLS = 80;
+const MINIMAL_INTRO_MIN_ROWS = 20;
+const MINIMAL_INTRO_MIN_COLS = 40;
+const RESIZE_DEBOUNCE_MS = 150;
+const RESIZE_GRACE_PERIOD_MS = 300;
+
+type IntroMode = "full" | "minimal" | "skip";
+
+function pickIntroMode(rows: number, cols: number): IntroMode {
+  if (rows >= FULL_INTRO_MIN_ROWS && cols >= FULL_INTRO_MIN_COLS) return "full";
+  if (rows >= MINIMAL_INTRO_MIN_ROWS && cols >= MINIMAL_INTRO_MIN_COLS) return "minimal";
+  return "skip";
+}
+
+function currentIntroMode(): IntroMode {
+  // process.stdout.rows/columns reflejan el tamaño real del TTY del proceso;
+  // el TUI no expone alto en render(width) y por eso lo leemos directo acá.
+  const rows = process.stdout.rows ?? 0;
+  const cols = process.stdout.columns ?? 0;
+  return pickIntroMode(rows, cols);
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
@@ -380,6 +442,12 @@ export default function (pi: ExtensionAPI) {
       process.argv.length > 2 &&
       !process.argv.every((arg) => arg.startsWith("-") || arg.endsWith(".ts"));
     if (isCLICommand) return;
+
+    if (currentIntroMode() === "skip") return;
+
+    // Fire-and-forget: el setup geométrico de cada letra corre en background
+    // para que la animación arranque en el primer frame sin bloquear el event loop.
+    void warmupLetterStrokes();
 
     process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
 
@@ -442,33 +510,80 @@ export default function (pi: ExtensionAPI) {
     }, 200);
 
     let tick = 0;
-    const state = { timer: null as NodeJS.Timeout | null };
+    const state = {
+      timer: null as NodeJS.Timeout | null,
+      mode: currentIntroMode() as IntroMode,
+      resizeHandler: null as (() => void) | null,
+      resizeDebounceTimer: null as NodeJS.Timeout | null,
+    };
+
+    const cleanup = () => {
+      if (state.timer) {
+        clearInterval(state.timer);
+        state.timer = null;
+      }
+      if (state.resizeHandler) {
+        process.stdout.off("resize", state.resizeHandler);
+        state.resizeHandler = null;
+      }
+      if (state.resizeDebounceTimer) {
+        clearTimeout(state.resizeDebounceTimer);
+        state.resizeDebounceTimer = null;
+      }
+    };
 
     setTimeout(() => {
       ctx.ui.setHeader((tui, theme) => {
         if (state.timer) clearInterval(state.timer);
 
+        const animStart = Date.now();
+        const HARD_TIMEOUT_MS = 5000;
+
         state.timer = setInterval(() => {
           tick++;
-          if (tick > WRITING_END_TICK + 22) {
-            if (state.timer) {
-              clearInterval(state.timer);
-              state.timer = null;
-            }
+          const elapsed = Date.now() - animStart;
+          const finishedAnimation =
+            allStrokesReady() && tick > WRITING_END_TICK + 22;
+          if (finishedAnimation || elapsed > HARD_TIMEOUT_MS) {
+            cleanup();
             return;
           }
           try {
             tui.requestRender();
           } catch {
-            if (state.timer) {
-              clearInterval(state.timer);
-              state.timer = null;
-            }
+            cleanup();
           }
         }, 25);
 
+        // Grace period: pi-tui emite resizes transitorios mientras compone su layout inicial.
+        const bootStart = Date.now();
+        const resizeHandler = () => {
+          if (Date.now() - bootStart < RESIZE_GRACE_PERIOD_MS) return;
+          if (state.resizeDebounceTimer) clearTimeout(state.resizeDebounceTimer);
+          state.resizeDebounceTimer = setTimeout(() => {
+            state.resizeDebounceTimer = null;
+            const next = currentIntroMode();
+            if (next === state.mode) return;
+            state.mode = next;
+            if (next === "skip") {
+              cleanup();
+              process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
+              return;
+            }
+            try {
+              tui.requestRender();
+            } catch {
+              cleanup();
+            }
+          }, RESIZE_DEBOUNCE_MS);
+        };
+        state.resizeHandler = resizeHandler;
+        process.stdout.on("resize", resizeHandler);
+
         return {
           render(width: number): string[] {
+            if (state.mode === "skip") return [];
+
             const flashStartTick = 10;
             const roseOpacity = Math.min(1, tick / 10);
             const flashPhase =
@@ -479,14 +594,29 @@ export default function (pi: ExtensionAPI) {
 
             const sideBySideMinWidth = roseBase.width + 3 + logoBase.width + 4;
             const wideStatsMinWidth = 122;
-            const horizontal = width >= sideBySideMinWidth;
+            const horizontal =
+              state.mode === "full" && width >= sideBySideMinWidth;
             const wideStats = width >= wideStatsMinWidth;
 
             const b = new LayoutBuilder();
             b.addRow();
             b.center(width);
 
-            if (horizontal) {
+            if (state.mode === "minimal") {
+              for (let logoI = 0; logoI < logoBase.lines.length; logoI++) {
+                const logoLine = logoBase.lines[logoI];
+                b.addRow();
+                b.lines[b.lines.length - 1].push(
+                  ...buildPenLogoLine(
+                    logoLine,
+                    logoI,
+                    logoBase.lines.length,
+                    tick,
+                  ),
+                );
+                b.center(width);
+              }
+            } else if (horizontal) {
               const rowCount = Math.max(
                 roseBase.lines.length,
                 logoBase.lines.length,
@@ -560,90 +690,92 @@ export default function (pi: ExtensionAPI) {
               }
             }
 
-            b.addRow();
-            b.center(width);
-
-            const fit = (v: unknown, w: number) =>
-              String(v ?? "")
-                .replace(/\s+/g, " ")
-                .trim()
-                .slice(0, w)
-                .padEnd(w);
-            const addWideRow = (
-              l1: string,
-              v1: string,
-              l2: string,
-              v2: string,
-            ) => {
+            if (state.mode === "full") {
               b.addRow();
-              b.add("label", fit(l1, 10));
-              b.add("none", " ");
-              b.add("value", fit(v1, 48));
-              b.add("none", "   ");
-              b.add("label", fit(l2, 12));
-              b.add("none", " ");
-              b.add("value", fit(v2, 46));
               b.center(width);
-            };
-            const narrowRows: Array<[string, string]> = [
-              ["GIT:", gitBranch],
-              ["PATH:", ctx.cwd],
-              ["MCP:", `${mcpServersCount} server(s)`],
-              ["PLUGINS:", `${packagesCount} package(s)`],
-              ["AGENTS:", `${skills.length} loaded`],
-              ["EXTENSIONS:", `${extensionsCount} active`],
-              ["VER:", `v${VERSION}`],
-              ["TOOLS:", `${customTools.length} custom`],
-            ];
-            const narrowLabelW = Math.max(...narrowRows.map(([l]) => l.length));
-            const narrowValueW = Math.max(
-              0,
-              Math.min(
-                Math.max(...narrowRows.map(([, v]) => v.length)),
-                Math.max(8, width - narrowLabelW - 4),
-              ),
-            );
-            const addNarrowRow = (label: string, value: string) => {
-              b.addRow();
-              b.add("label", label.padEnd(narrowLabelW));
-              b.add("none", "  ");
-              b.add("value", fit(value, narrowValueW));
-              b.center(width);
-            };
 
-            if (wideStats) {
-              addWideRow("GIT:", gitBranch, "PATH:", ctx.cwd);
-              addWideRow(
-                "MCP:",
-                `${mcpServersCount} server(s)`,
-                "PLUGINS:",
-                `${packagesCount} package(s)`,
+              const fit = (v: unknown, w: number) =>
+                String(v ?? "")
+                  .replace(/\s+/g, " ")
+                  .trim()
+                  .slice(0, w)
+                  .padEnd(w);
+              const addWideRow = (
+                l1: string,
+                v1: string,
+                l2: string,
+                v2: string,
+              ) => {
+                b.addRow();
+                b.add("label", fit(l1, 10));
+                b.add("none", " ");
+                b.add("value", fit(v1, 48));
+                b.add("none", "   ");
+                b.add("label", fit(l2, 12));
+                b.add("none", " ");
+                b.add("value", fit(v2, 46));
+                b.center(width);
+              };
+              const narrowRows: Array<[string, string]> = [
+                ["GIT:", gitBranch],
+                ["PATH:", ctx.cwd],
+                ["MCP:", `${mcpServersCount} server(s)`],
+                ["PLUGINS:", `${packagesCount} package(s)`],
+                ["AGENTS:", `${skills.length} loaded`],
+                ["EXTENSIONS:", `${extensionsCount} active`],
+                ["VER:", `v${VERSION}`],
+                ["TOOLS:", `${customTools.length} custom`],
+              ];
+              const narrowLabelW = Math.max(...narrowRows.map(([l]) => l.length));
+              const narrowValueW = Math.max(
+                0,
+                Math.min(
+                  Math.max(...narrowRows.map(([, v]) => v.length)),
+                  Math.max(8, width - narrowLabelW - 4),
+                ),
               );
-              addWideRow(
-                "AGENTS:",
-                `${skills.length} loaded`,
-                "EXTENSIONS:",
-                `${extensionsCount} active`,
-              );
-              addWideRow(
-                "VER:",
-                `v${VERSION}`,
-                "TOOLS:",
-                `${customTools.length} custom`,
-              );
-            } else {
-              addNarrowRow("GIT:", gitBranch);
-              addNarrowRow("PATH:", ctx.cwd);
-              addNarrowRow("MCP:", `${mcpServersCount} server(s)`);
-              addNarrowRow("PLUGINS:", `${packagesCount} package(s)`);
-              addNarrowRow("AGENTS:", `${skills.length} loaded`);
-              addNarrowRow("EXTENSIONS:", `${extensionsCount} active`);
-              addNarrowRow("VER:", `v${VERSION}`);
-              addNarrowRow("TOOLS:", `${customTools.length} custom`);
+              const addNarrowRow = (label: string, value: string) => {
+                b.addRow();
+                b.add("label", label.padEnd(narrowLabelW));
+                b.add("none", "  ");
+                b.add("value", fit(value, narrowValueW));
+                b.center(width);
+              };
+
+              if (wideStats) {
+                addWideRow("GIT:", gitBranch, "PATH:", ctx.cwd);
+                addWideRow(
+                  "MCP:",
+                  `${mcpServersCount} server(s)`,
+                  "PLUGINS:",
+                  `${packagesCount} package(s)`,
+                );
+                addWideRow(
+                  "AGENTS:",
+                  `${skills.length} loaded`,
+                  "EXTENSIONS:",
+                  `${extensionsCount} active`,
+                );
+                addWideRow(
+                  "VER:",
+                  `v${VERSION}`,
+                  "TOOLS:",
+                  `${customTools.length} custom`,
+                );
+              } else {
+                addNarrowRow("GIT:", gitBranch);
+                addNarrowRow("PATH:", ctx.cwd);
+                addNarrowRow("MCP:", `${mcpServersCount} server(s)`);
+                addNarrowRow("PLUGINS:", `${packagesCount} package(s)`);
+                addNarrowRow("AGENTS:", `${skills.length} loaded`);
+                addNarrowRow("EXTENSIONS:", `${extensionsCount} active`);
+                addNarrowRow("VER:", `v${VERSION}`);
+                addNarrowRow("TOOLS:", `${customTools.length} custom`);
+              }
+
+              b.addRow();
+              b.center(width);
             }
-
-            b.addRow();
-            b.center(width);
 
             const out: string[] = [];
             const layout = b.lines;
@@ -776,10 +908,7 @@ export default function (pi: ExtensionAPI) {
             return out;
           },
           invalidate() {
-            if (state.timer) {
-              clearInterval(state.timer);
-              state.timer = null;
-            }
+            cleanup();
           },
         };
       });

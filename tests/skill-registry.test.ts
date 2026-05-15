@@ -105,12 +105,15 @@ test("project-scoped duplicate wins over user duplicate", () => {
 	assert.equal(chosen.path, projectPath);
 });
 
-test("uniqueExistingDirs normalizes duplicates and ignores missing roots", () => {
+test("uniqueExistingDirs normalizes duplicates and ignores missing roots", async () => {
 	const root = join(tmpdir(), `gentle-pi-existing-${Date.now()}`);
 	const existing = join(root, "skills");
 	mkdirSync(existing, { recursive: true });
 
-	assert.deepEqual(__testing.uniqueExistingDirs([existing, join(root, "skills/"), join(root, "missing")]), [existing]);
+	assert.deepEqual(
+		await __testing.uniqueExistingDirs([existing, join(root, "skills/"), join(root, "missing")]),
+		[existing],
+	);
 });
 
 test("startup skip honors no skill registry controls", () => {
