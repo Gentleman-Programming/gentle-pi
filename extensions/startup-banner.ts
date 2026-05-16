@@ -6,6 +6,7 @@ import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { isShyMode } from "../lib/shy-config.ts";
 
 const execAsync = promisify(exec);
 
@@ -436,6 +437,9 @@ function currentIntroMode(): IntroMode {
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
+
+    // Shy mode: skip startup animation entirely
+    if (isShyMode(ctx.cwd)) return;
 
     // Si se está ejecutando un comando de CLI como "pi update" o "pi install", no mostramos la intro animada.
     const isCLICommand =
