@@ -484,13 +484,29 @@ async function parseAgentNameAsync(
 	return packageName ? `${packageName}.${name}` : name;
 }
 
-function listAgentFilesRecursive(dir: string): string[] {
+type AgentDiscoveryOptions = {
+	skipDirectoryNames?: readonly string[];
+};
+
+function shouldSkipDiscoveryDirectory(
+	name: string,
+	options: AgentDiscoveryOptions,
+): boolean {
+	return options.skipDirectoryNames?.includes(name) ?? false;
+}
+
+function listAgentFilesRecursive(
+	dir: string,
+	options: AgentDiscoveryOptions = {},
+): string[] {
 	if (!existsSync(dir)) return [];
 	const files: string[] = [];
 	for (const entry of readdirSync(dir, { withFileTypes: true })) {
 		const path = join(dir, entry.name);
-		if (entry.isDirectory()) files.push(...listAgentFilesRecursive(path));
-		else if (
+		if (entry.isDirectory()) {
+			if (shouldSkipDiscoveryDirectory(entry.name, options)) continue;
+			files.push(...listAgentFilesRecursive(path, options));
+		} else if (
 			entry.isFile() &&
 			entry.name.endsWith(".md") &&
 			!entry.name.endsWith(".chain.md")
@@ -500,7 +516,10 @@ function listAgentFilesRecursive(dir: string): string[] {
 	return files;
 }
 
-async function listAgentFilesRecursiveAsync(dir: string): Promise<string[]> {
+async function listAgentFilesRecursiveAsync(
+	dir: string,
+	options: AgentDiscoveryOptions = {},
+): Promise<string[]> {
 	if (!(await pathExists(dir))) return [];
 	const files: string[] = [];
 	let entries;
@@ -512,7 +531,8 @@ async function listAgentFilesRecursiveAsync(dir: string): Promise<string[]> {
 	for (const entry of entries) {
 		const path = join(dir, entry.name);
 		if (entry.isDirectory()) {
-			files.push(...(await listAgentFilesRecursiveAsync(path)));
+			if (shouldSkipDiscoveryDirectory(entry.name, options)) continue;
+			files.push(...(await listAgentFilesRecursiveAsync(path, options)));
 		} else if (
 			entry.isFile() &&
 			entry.name.endsWith(".md") &&
@@ -524,8 +544,12 @@ async function listAgentFilesRecursiveAsync(dir: string): Promise<string[]> {
 	return files;
 }
 
-function listAgentsFromDir(dir: string, source: AgentSource): AgentEntry[] {
-	return listAgentFilesRecursive(dir)
+function listAgentsFromDir(
+	dir: string,
+	source: AgentSource,
+	options: AgentDiscoveryOptions = {},
+): AgentEntry[] {
+	return listAgentFilesRecursive(dir, options)
 		.map((filePath): AgentEntry | undefined => {
 			const name = parseAgentName(filePath);
 			return name ? { name, source, filePath } : undefined;
@@ -536,8 +560,9 @@ function listAgentsFromDir(dir: string, source: AgentSource): AgentEntry[] {
 async function listAgentsFromDirAsync(
 	dir: string,
 	source: AgentSource,
+	options: AgentDiscoveryOptions = {},
 ): Promise<AgentEntry[]> {
-	const filePaths = await listAgentFilesRecursiveAsync(dir);
+	const filePaths = await listAgentFilesRecursiveAsync(dir, options);
 	const entries: AgentEntry[] = [];
 	for (const filePath of filePaths) {
 		const name = await parseAgentNameAsync(filePath);
@@ -552,11 +577,12 @@ function listDiscoverableAgents(cwd: string): AgentEntry[] {
 		join(cwd, ".pi", "npm", "node_modules", "pi-subagents", "agents"),
 		join(homedir(), ".local", "lib", "node_modules", "pi-subagents", "agents"),
 	];
+	const dotAgentsOptions = { skipDirectoryNames: ["skills"] };
 	const agents = [
 		...builtinDirs.flatMap((dir) => listAgentsFromDir(dir, "builtin")),
 		...listAgentsFromDir(join(homedir(), ".pi", "agent", "agents"), "user"),
-		...listAgentsFromDir(join(homedir(), ".agents"), "user"),
-		...listAgentsFromDir(join(cwd, ".agents"), "project"),
+		...listAgentsFromDir(join(homedir(), ".agents"), "user", dotAgentsOptions),
+		...listAgentsFromDir(join(cwd, ".agents"), "project", dotAgentsOptions),
 		...listAgentsFromDir(join(cwd, ".pi", "agents"), "project"),
 	];
 	const byName = new Map<string, AgentEntry>();
@@ -581,14 +607,19 @@ async function listDiscoverableAgentsAsync(cwd: string): Promise<AgentEntry[]> {
 	for (const dir of builtinDirs) {
 		agents.push(...(await listAgentsFromDirAsync(dir, "builtin")));
 	}
-	const otherDirs: Array<[string, AgentSource]> = [
-		[join(homedir(), ".pi", "agent", "agents"), "user"],
-		[join(homedir(), ".agents"), "user"],
-		[join(cwd, ".agents"), "project"],
-		[join(cwd, ".pi", "agents"), "project"],
+	const dotAgentsOptions = { skipDirectoryNames: ["skills"] };
+	const otherDirs: Array<[
+		string,
+		AgentSource,
+		AgentDiscoveryOptions | undefined,
+	]> = [
+		[join(homedir(), ".pi", "agent", "agents"), "user", undefined],
+		[join(homedir(), ".agents"), "user", dotAgentsOptions],
+		[join(cwd, ".agents"), "project", dotAgentsOptions],
+		[join(cwd, ".pi", "agents"), "project", undefined],
 	];
-	for (const [dir, source] of otherDirs) {
-		agents.push(...(await listAgentsFromDirAsync(dir, source)));
+	for (const [dir, source, options] of otherDirs) {
+		agents.push(...(await listAgentsFromDirAsync(dir, source, options)));
 	}
 	const byName = new Map<string, AgentEntry>();
 	for (const agent of agents) byName.set(agent.name, agent);
@@ -1223,6 +1254,11 @@ async function handlePersonaCommand(ctx: ExtensionContext): Promise<void> {
 		"info",
 	);
 }
+
+export const __testing = {
+	listAgentsFromDir,
+	listAgentFilesRecursive,
+};
 
 export default function gentleAi(pi: ExtensionAPI): void {
 	function runSddPreflight(ctx: ExtensionContext): Promise<SddPreflightPreferences> {
