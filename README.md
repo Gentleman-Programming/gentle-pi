@@ -46,7 +46,7 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | Capability                     | What it does                                                                                                                                  |
 | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | **el Gentleman persona**       | Makes Pi behave like a senior architect and teacher, not a generic chatbot. Spanish responses use Rioplatense voseo by default.               |
-| **Rose startup intro**         | Adds a pink rose fade-in, compact project/runtime panel, and visible startup collaboration credit for @aporcelli's `pi-gentle-startup` ideas. |
+| **Rose startup intro**         | Adds a pink rose fade-in, compact project/runtime panel, and visible startup collaboration credit for @aporcelli's `pi-gentle-startup` ideas. Toggle via `/gentle:shy`. |
 | **Work routing discipline**    | Small tasks stay inline. Context-heavy exploration can be delegated. Large or risky changes go through SDD/OpenSpec.                          |
 | **SDD/OpenSpec assets**        | Installs phase agents and chains for `init`, `explore`, `proposal`, `spec`, `design`, `tasks`, `apply`, `verify`, and `archive`.              |
 | **Lazy SDD preflight**         | Asks once per session for SDD mode, artifact store, PR chaining strategy, and review budget before the first SDD flow.                        |
@@ -92,6 +92,7 @@ pi
 /sdd-init                  Create or refresh openspec/config.yaml.
 /gentle:models             Assign global model/effort routing to SDD/custom agents.
 /gentle:persona            Switch between gentleman and neutral persona modes.
+/gentle:shy                Toggle startup role and title animation on/off.
 ```
 
 Typical flow:
@@ -324,6 +325,30 @@ Saved at:
 
 Run `/reload` or start a new Pi session after switching persona.
 
+## Shy mode
+
+```text
+/gentle:shy
+```
+
+When shy mode is **ON**, the startup role and title animation (rose fade-in, pen-writing logo, runtime stats panel) are skipped entirely. Pi starts directly on a clean prompt, respecting users who prefer a minimal startup.
+
+Off by default — run the command once to persist the choice.
+
+Saved at:
+
+```text
+.pi/gentle-ai/shy.json
+```
+
+```json
+{
+  "shy": true
+}
+```
+
+Restart Pi after toggling. Status visible via `/gentle-ai:status`.
+
 ## Model and effort assignment
 
 ```text
@@ -377,6 +402,7 @@ Legacy string entries are still accepted and treated as `model`-only config.
 | `/gentle-ai:status`              | Shows package, SDD asset, OpenSpec, and global model config status. |
 | `/gentle:models`                 | Opens global model + effort assignment UI.                          |
 | `/gentle:persona`                | Switches persona mode.                                              |
+| `/gentle:shy`                    | Toggles startup role and title animation on/off.                    |
 | `/sdd-init`                      | Initializes or refreshes `openspec/config.yaml`.                    |
 | `/gentle-ai:install-sdd`         | Reinstalls SDD assets without overwriting local files.              |
 | `/gentle-ai:install-sdd --force` | Force-refreshes installed SDD assets.                               |
@@ -397,6 +423,8 @@ Compatibility aliases:
 /gentleman:models
 /gentle-ai:persona
 /gentleman:persona
+/gentle-ai:shy
+/gentleman:shy
 ```
 
 ## Included skills

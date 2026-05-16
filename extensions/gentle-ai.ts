@@ -29,6 +29,7 @@ import {
 	renderSddPreflightPrompt,
 	type SddPreflightPreferences,
 } from "../lib/sdd-preflight.ts";
+import { isShyMode, toggleShyMode } from "../lib/shy-config.ts";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
@@ -1375,6 +1376,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 				[
 					"el Gentleman package is active.",
 					`Persona: ${readPersonaMode(ctx.cwd)}`,
+					`Shy mode: ${isShyMode(ctx.cwd) ? "ON (startup hidden)" : "OFF"}`,
 					`SDD agents: ${agentsInstalled ? "installed" : "not installed"}`,
 					`SDD chains: ${chainsInstalled ? "installed" : "not installed"}`,
 					`SDD assets stale: ${staleSddAssets} file(s)${
@@ -1387,6 +1389,39 @@ export default function gentleAi(pi: ExtensionAPI): void {
 					...describeModelConfig(ctx.cwd, modelConfig),
 				].join("\n"),
 				staleSddAssets > 0 ? "warning" : "info",
+			);
+		},
+	});
+
+	pi.registerCommand("gentle:shy", {
+		description: "Toggle shy mode: disable/enable startup role and title animation.",
+		handler: async (_args, ctx) => {
+			const next = toggleShyMode(ctx.cwd);
+			ctx.ui.notify(
+				`Shy mode is now ${next ? "ON" : "OFF"}. ${next ? "Startup animation hidden." : "Startup animation visible."}\nRestart Pi for the change to take effect.`,
+				"info",
+			);
+		},
+	});
+
+	pi.registerCommand("gentle-ai:shy", {
+		description: "Compatibility alias for /gentle:shy.",
+		handler: async (_args, ctx) => {
+			const next = toggleShyMode(ctx.cwd);
+			ctx.ui.notify(
+				`Shy mode is now ${next ? "ON" : "OFF"}. ${next ? "Startup animation hidden." : "Startup animation visible."}\nRestart Pi for the change to take effect.`,
+				"info",
+			);
+		},
+	});
+
+	pi.registerCommand("gentleman:shy", {
+		description: "Compatibility alias for /gentle:shy.",
+		handler: async (_args, ctx) => {
+			const next = toggleShyMode(ctx.cwd);
+			ctx.ui.notify(
+				`Shy mode is now ${next ? "ON" : "OFF"}. ${next ? "Startup animation hidden." : "Startup animation visible."}\nRestart Pi for the change to take effect.`,
+				"info",
 			);
 		},
 	});
