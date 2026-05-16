@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -10,67 +10,27 @@ function writeMarkdown(path: string, content: string): void {
 	writeFileSync(path, content);
 }
 
-test("agent discovery can skip .agents skills directories", () => {
-	const root = join(tmpdir(), `gentle-pi-agents-${Date.now()}`);
+test("agent discovery skips skills directories", async (t) => {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-agents-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
 	const dotAgents = join(root, ".agents");
-	writeMarkdown(
-		join(dotAgents, "reviewer.md"),
-		`---
-name: reviewer
----
-
-# Reviewer
-`,
-	);
-	writeMarkdown(
-		join(dotAgents, "skills", "ai-sdk", "SKILL.md"),
-		`---
-name: ai-sdk
-description: AI SDK skill.
----
-
-# AI SDK
-`,
-	);
+	writeMarkdown(join(dotAgents, "reviewer.md"), "name: reviewer\n");
+	writeMarkdown(join(dotAgents, "team", "worker.md"), "name: worker\n");
+	writeMarkdown(join(dotAgents, "skills", "ai-sdk", "SKILL.md"), "name: ai-sdk\n");
 	writeMarkdown(
 		join(dotAgents, "skills", "ai-sdk", "references", "evaluation.md"),
-		`---
-name: Prompt Evaluation
----
-
-# Prompt Evaluation
-`,
+		"name: Prompt Evaluation\n",
 	);
 
-	const agents = __testing.listAgentsFromDir(dotAgents, "user", {
-		skipDirectoryNames: ["skills"],
-	});
+	const syncAgents = __testing.listAgentsFromDir(dotAgents, "user");
+	const asyncAgents = await __testing.listAgentsFromDirAsync(dotAgents, "user");
 
 	assert.deepEqual(
-		agents.map((agent) => agent.name),
-		["reviewer"],
+		syncAgents.map((agent) => agent.name),
+		["reviewer", "worker"],
 	);
-});
-
-test("agent discovery still scans non-skill subdirectories", () => {
-	const root = join(tmpdir(), `gentle-pi-nested-agents-${Date.now()}`);
-	const dotAgents = join(root, ".agents");
-	writeMarkdown(
-		join(dotAgents, "team", "worker.md"),
-		`---
-name: worker
----
-
-# Worker
-`,
-	);
-
-	const agents = __testing.listAgentsFromDir(dotAgents, "project", {
-		skipDirectoryNames: ["skills"],
-	});
-
 	assert.deepEqual(
-		agents.map((agent) => agent.name),
-		["worker"],
+		asyncAgents.map((agent) => agent.name),
+		["reviewer", "worker"],
 	);
 });
