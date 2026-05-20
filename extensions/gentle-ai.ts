@@ -5,13 +5,7 @@ import {
 	readFileSync,
 	writeFileSync,
 } from "node:fs";
-import {
-	access,
-	mkdir,
-	readFile,
-	readdir,
-	writeFile,
-} from "node:fs/promises";
+import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +15,17 @@ import type {
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import {
+	AUTONOMOUS_GUARD_DEFAULTS,
+	commandRequiresConfirmation,
+	evaluateDeniedCommand,
+	evaluateRuntimeGuardCommand as evaluateRuntimeGuardProfileCommand,
+	guardedCommandFor,
+	type RuntimeGuardAction,
+	type RuntimeGuardedCommand,
+	type RuntimeGuardedCommands,
+	type RuntimeGuardProfile,
+} from "../lib/runtime-guardrails.ts";
 import {
 	ensureSddPreflight,
 	getSddPreflightPreferences,
@@ -47,7 +52,11 @@ function sddGlobalAssetDriftCount(): number {
 		if (!existsSync(assetDir)) continue;
 		for (const entry of readdirSync(assetDir, { withFileTypes: true })) {
 			if (!entry.isFile()) continue;
-			const installedPath = join(gentlePiAgentHome(), installedSubdir, entry.name);
+			const installedPath = join(
+				gentlePiAgentHome(),
+				installedSubdir,
+				entry.name,
+			);
 			try {
 				if (!existsSync(installedPath)) {
 					stale += 1;
@@ -164,22 +173,10 @@ Harness principles:
 ${getOrchestratorPrompt()}`;
 }
 
-const DENIED_BASH_PATTERNS: RegExp[] = [
-	/\brm\s+-rf\s+(?:\/|~|\$HOME|\.\.?)(?:\s|$)/,
-	/\bgit\s+reset\s+--hard\b/,
-	/\bgit\s+clean\b(?=[^\n]*(?:-[^\n]*f|--force))(?=[^\n]*(?:-[^\n]*d|--directories))/,
-	/\bgit\s+push\b(?=[^\n]*\s--force(?:-with-lease)?\b)/,
-	/\bchmod\s+-R\s+777\b/,
-	/\bchown\s+-R\b/,
-];
-
-const CONFIRM_BASH_PATTERNS: RegExp[] = [
-	/\bgit\s+push\b/,
-	/\bgit\s+rebase\b/,
-	/\bgit\s+branch\s+-D\b/,
-	/\bnpm\s+publish\b/,
-	/\bpi\s+remove\b/,
-];
+type RuntimeGuardConfigFileResult =
+	| { status: "missing" }
+	| { status: "invalid"; path: string }
+	| { status: "valid"; profile: Partial<RuntimeGuardProfile> };
 
 const SDD_AGENT_NAMES = [
 	"sdd-init",
@@ -271,23 +268,90 @@ function isNamedAgentStartEvent(event: unknown): boolean {
 	return readAgentStartNames(event).length > 0;
 }
 
-function evaluateDeniedCommand(
-	command: string,
-): ToolCallEventResult | undefined {
-	for (const pattern of DENIED_BASH_PATTERNS) {
-		if (pattern.test(command)) {
-			return {
-				block: true,
-				reason:
-					"Gentle AI safety policy blocked a destructive shell command. Ask the user for an explicit safer plan.",
-			};
-		}
-	}
-	return undefined;
+function isRuntimeGuardAction(value: unknown): value is RuntimeGuardAction {
+	return value === "allow" || value === "confirm" || value === "block";
 }
 
-function commandRequiresConfirmation(command: string): boolean {
-	return CONFIRM_BASH_PATTERNS.some((pattern) => pattern.test(command));
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function gentleAiConfigHome(): string {
+	return (
+		process.env.GENTLE_PI_CONFIG_HOME || join(homedir(), ".pi", "gentle-ai")
+	);
+}
+
+function runtimeGuardConfigPath(_cwd: string): string {
+	return join(gentleAiConfigHome(), "runtime-guardrails.json");
+}
+
+function projectRuntimeGuardConfigPath(cwd: string): string {
+	return join(cwd, ".pi", "gentle-ai", "runtime-guardrails.json");
+}
+
+function normalizeRuntimeGuardProfile(
+	value: unknown,
+): Partial<RuntimeGuardProfile> | undefined {
+	if (!isRecord(value)) return undefined;
+	const profile: Partial<RuntimeGuardProfile> = {};
+	if (typeof value.autonomousMode === "boolean") {
+		profile.autonomousMode = value.autonomousMode;
+	}
+	if (isRecord(value.guardedCommands)) {
+		const guardedCommands: RuntimeGuardedCommands = {};
+		for (const key of Object.keys(
+			AUTONOMOUS_GUARD_DEFAULTS,
+		) as RuntimeGuardedCommand[]) {
+			const action = value.guardedCommands[key];
+			if (isRuntimeGuardAction(action)) guardedCommands[key] = action;
+		}
+		profile.guardedCommands = guardedCommands;
+	}
+	return profile;
+}
+
+function readRuntimeGuardConfigFile(
+	path: string,
+): RuntimeGuardConfigFileResult {
+	if (!existsSync(path)) return { status: "missing" };
+	try {
+		const profile = normalizeRuntimeGuardProfile(
+			JSON.parse(readFileSync(path, "utf8")),
+		);
+		return profile ? { status: "valid", profile } : { status: "invalid", path };
+	} catch {
+		return { status: "invalid", path };
+	}
+}
+
+function readRuntimeGuardProfile(cwd: string): RuntimeGuardProfile {
+	const projectResult = readRuntimeGuardConfigFile(
+		projectRuntimeGuardConfigPath(cwd),
+	);
+	const globalResult = readRuntimeGuardConfigFile(runtimeGuardConfigPath(cwd));
+	const selected =
+		projectResult.status !== "missing" ? projectResult : globalResult;
+	const configured = selected.status === "valid" ? selected.profile : {};
+	const autonomousMode =
+		process.env.GENTLE_PI_AUTONOMOUS_MODE === "1" ||
+		configured.autonomousMode === true;
+	return {
+		autonomousMode,
+		guardedCommands: autonomousMode
+			? { ...AUTONOMOUS_GUARD_DEFAULTS, ...configured.guardedCommands }
+			: (configured.guardedCommands ?? {}),
+	};
+}
+
+function evaluateRuntimeGuardCommand(
+	command: string,
+	cwd: string,
+): ToolCallEventResult | undefined {
+	return evaluateRuntimeGuardProfileCommand(
+		command,
+		readRuntimeGuardProfile(cwd),
+	);
 }
 
 async function confirmCommand(
@@ -296,6 +360,20 @@ async function confirmCommand(
 ): Promise<ToolCallEventResult | undefined> {
 	const denied = evaluateDeniedCommand(command);
 	if (denied) return denied;
+	const runtimeGuardProfile = readRuntimeGuardProfile(ctx.cwd);
+	const runtimeGuard = evaluateRuntimeGuardProfileCommand(
+		command,
+		runtimeGuardProfile,
+	);
+	if (runtimeGuard) return runtimeGuard;
+	const guardedCommand = guardedCommandFor(command);
+	if (
+		runtimeGuardProfile.autonomousMode &&
+		guardedCommand &&
+		runtimeGuardProfile.guardedCommands[guardedCommand] === "allow"
+	) {
+		return undefined;
+	}
 	if (!commandRequiresConfirmation(command)) return undefined;
 	if (!ctx.hasUI) {
 		return {
@@ -316,14 +394,6 @@ async function confirmCommand(
 		reason:
 			"Gentle AI safety policy blocked the command because it was not confirmed.",
 	};
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function gentleAiConfigHome(): string {
-	return process.env.GENTLE_PI_CONFIG_HOME ?? join(homedir(), ".pi", "gentle-ai");
 }
 
 function modelConfigPath(_cwd: string): string {
@@ -1265,8 +1335,20 @@ async function handlePersonaCommand(ctx: ExtensionContext): Promise<void> {
 	);
 }
 
+export const __testing = {
+	commandRequiresConfirmation,
+	evaluateDeniedCommand,
+	evaluateRuntimeGuardCommand,
+	guardedCommandFor,
+	readRuntimeGuardProfile,
+	runtimeGuardConfigPath,
+	projectRuntimeGuardConfigPath,
+};
+
 export default function gentleAi(pi: ExtensionAPI): void {
-	function runSddPreflight(ctx: ExtensionContext): Promise<SddPreflightPreferences> {
+	function runSddPreflight(
+		ctx: ExtensionContext,
+	): Promise<SddPreflightPreferences> {
 		return ensureSddPreflight(ctx, {
 			pi,
 			installAssets: (cwd) => installSddAssets(cwd, false),
@@ -1293,8 +1375,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 			}
 		} catch (error) {
 			if (ctx.hasUI) {
-				const message =
-					error instanceof Error ? error.message : String(error);
+				const message = error instanceof Error ? error.message : String(error);
 				ctx.ui.notify(
 					`el Gentleman model config sweep failed: ${message}`,
 					"warning",
@@ -1322,9 +1403,10 @@ export default function gentleAi(pi: ExtensionAPI): void {
 			prefs && (!isNamedAgent || isSddAgent)
 				? `\n\n${renderSddPreflightPrompt(prefs)}`
 				: "";
-		const gentlePrompt = isNamedAgent || isSddAgent
-			? ""
-			: `\n\n${buildGentlePrompt(readPersonaMode(ctx.cwd))}`;
+		const gentlePrompt =
+			isNamedAgent || isSddAgent
+				? ""
+				: `\n\n${buildGentlePrompt(readPersonaMode(ctx.cwd))}`;
 		return {
 			systemPrompt: `${event.systemPrompt}${gentlePrompt}${sddPrompt}`,
 		};
@@ -1351,8 +1433,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("gentle-ai:sdd-preflight", {
-		description:
-			"Run or reuse the lazy SDD preflight for this Pi session.",
+		description: "Run or reuse the lazy SDD preflight for this Pi session.",
 		handler: async (_args, ctx) => {
 			await runSddPreflight(ctx);
 		},

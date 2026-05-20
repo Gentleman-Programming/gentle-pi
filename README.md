@@ -369,17 +369,53 @@ Config shape (per agent):
 
 Legacy string entries are still accepted and treated as `model`-only config.
 
+## Runtime guardrails
+
+Gentle AI protects shell execution before `bash` tool calls run. Destructive deny rules always run first, so force pushes (`--force`, `--force-with-lease`, or `-f`), hard resets, forced cleans, critical `rm -rf`, recursive `chmod 777`, and recursive `chown` remain blocked even when a profile allows a guarded command.
+
+Autonomous runtime defaults can be enabled with:
+
+```bash
+GENTLE_PI_AUTONOMOUS_MODE=1 pi
+```
+
+When autonomous mode is active, normal `git push` is allowed without an interactive prompt; `git rebase`, forced branch delete (`git branch --delete --force` / `git branch -D`), and `pi remove` still require confirmation; `npm publish` is blocked.
+
+You can persist a profile globally or per project:
+
+```text
+${GENTLE_PI_CONFIG_HOME:-~/.pi/gentle-ai}/runtime-guardrails.json
+<project>/.pi/gentle-ai/runtime-guardrails.json
+```
+
+Project config overrides global config. Minimal shape:
+
+```json
+{
+  "autonomousMode": true,
+  "guardedCommands": {
+    "gitPush": "allow",
+    "gitRebase": "confirm",
+    "gitBranchDeleteForce": "confirm",
+    "npmPublish": "block",
+    "piRemove": "confirm"
+  }
+}
+```
+
+Each guarded command action is one of `allow`, `confirm`, or `block`.
+
 ## Commands
 
-| Command                          | What it does                                                        |
-| -------------------------------- | ------------------------------------------------------------------- |
-| `/gentle-ai:status`              | Shows package, SDD asset, OpenSpec, and global model config status. |
-| `/gentle:models`                 | Opens global model + effort assignment UI.                          |
-| `/gentle:persona`                | Switches persona mode.                                              |
-| `/sdd-init`                      | Initializes or refreshes `openspec/config.yaml`.                    |
+| Command                          | What it does                                                         |
+| -------------------------------- | -------------------------------------------------------------------- |
+| `/gentle-ai:status`              | Shows package, SDD asset, OpenSpec, and global model config status.  |
+| `/gentle:models`                 | Opens global model + effort assignment UI.                           |
+| `/gentle:persona`                | Switches persona mode.                                               |
+| `/sdd-init`                      | Initializes or refreshes `openspec/config.yaml`.                     |
 | `/gentle-ai:install-sdd`         | Repairs missing global SDD runtime assets without overwriting files. |
 | `/gentle-ai:install-sdd --force` | Force-refreshes installed global SDD assets.                         |
-| `/skill-registry:refresh`        | Regenerates `.atl/skill-registry.md`.                               |
+| `/skill-registry:refresh`        | Regenerates `.atl/skill-registry.md`.                                |
 
 Startup flag:
 
@@ -430,18 +466,18 @@ Memory contract for SDD delegation:
 
 ## Package contents
 
-| Path                           | Purpose                                                                                                    |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| Path                           | Purpose                                                                                                              |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
 | `extensions/gentle-ai.ts`      | Injects identity, ensures global SDD assets, registers commands, applies model config, and protects shell execution. |
-| `extensions/startup-banner.ts` | Shows the rose startup intro, compact runtime panel, and collaboration credit.                             |
-| `extensions/sdd-init.ts`       | Registers `/sdd-init` for OpenSpec initialization.                                                         |
-| `extensions/skill-registry.ts` | Maintains `.atl/skill-registry.md` from project/user skills.                                               |
-| `assets/orchestrator.md`       | Parent-session orchestration contract.                                                                     |
-| `assets/agents/`               | SDD agents installed as global Pi runtime assets.                                                          |
-| `assets/chains/`               | SDD chains installed as global Pi runtime assets.                                                          |
-| `assets/support/`              | Strict TDD support docs for apply/verify phases.                                                           |
-| `skills/`                      | Gentle AI delivery and collaboration skills.                                                               |
-| `prompts/`                     | Gentle-prefixed prompt templates.                                                                          |
+| `extensions/startup-banner.ts` | Shows the rose startup intro, compact runtime panel, and collaboration credit.                                       |
+| `extensions/sdd-init.ts`       | Registers `/sdd-init` for OpenSpec initialization.                                                                   |
+| `extensions/skill-registry.ts` | Maintains `.atl/skill-registry.md` from project/user skills.                                                         |
+| `assets/orchestrator.md`       | Parent-session orchestration contract.                                                                               |
+| `assets/agents/`               | SDD agents installed as global Pi runtime assets.                                                                    |
+| `assets/chains/`               | SDD chains installed as global Pi runtime assets.                                                                    |
+| `assets/support/`              | Strict TDD support docs for apply/verify phases.                                                                     |
+| `skills/`                      | Gentle AI delivery and collaboration skills.                                                                         |
+| `prompts/`                     | Gentle-prefixed prompt templates.                                                                                    |
 
 ## Development
 
