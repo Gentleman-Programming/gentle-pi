@@ -4,10 +4,15 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import * as os from "node:os";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
+import { existsSync } from "node:fs";
 
 const execAsync = promisify(exec);
+
+const PI_AGENT_DIR = join(os.homedir(), ".pi", "agent");
+const PI_NPM_DIR = join(PI_AGENT_DIR, "npm", "node_modules");
+const PI_GIT_DIR = join(PI_AGENT_DIR, "git");
 
 const TEXT_LOGO = [
   "                  ▄▄▄▀▀▀▀▀██                                ▄▄▀▄▄           ▄▄█▀▀▀██   ▀▀█▄    ▄▄▄",
@@ -64,7 +69,10 @@ function padLines(lines: string[]): { lines: string[]; width: number } {
 type CellType =
   | "banner"
   | "logo-tip"
+  | "logo-tip2"
   | "logo-fresh"
+  | "logo-fresh2"
+  | "logo-warm"
   | "logo-ink"
   | "rose"
   | "label"
@@ -73,21 +81,6 @@ type CellType =
   | "accent"
   | "none";
 type LayoutCell = { char: string; type: CellType };
-type LogoCellType = Extract<
-  CellType,
-  "banner" | "logo-tip" | "logo-fresh" | "logo-ink"
->;
-
-const LOGO_CELL_TYPES: ReadonlySet<CellType> = new Set<CellType>([
-  "banner",
-  "logo-tip",
-  "logo-fresh",
-  "logo-ink",
-]);
-
-function isLogoCellType(type: CellType): type is LogoCellType {
-  return LOGO_CELL_TYPES.has(type);
-}
 
 type Span = { start: number; end: number };
 
@@ -102,9 +95,7 @@ function computeLogoBounds(lines: string[]): Span {
       }
     }
   }
-  if (!Number.isFinite(start) || !Number.isFinite(end)) {
-    return { start: 0, end: 0 };
-  }
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return { start: 0, end: 0 };
   return { start, end };
 }
 
@@ -115,10 +106,7 @@ function buildLetterSpans(bounds: Span, weights: number[]): Span[] {
   return weights.map((w, i) => {
     const remaining = bounds.end - cursor + 1;
     const raw = Math.max(1, Math.round((w / total) * spanWidth));
-    const width =
-      i === weights.length - 1
-        ? remaining
-        : Math.min(raw, remaining - (weights.length - i - 1));
+    const width = i === weights.length - 1 ? remaining : Math.min(raw, remaining - (weights.length - i - 1));
     const s = cursor;
     const e = s + width - 1;
     cursor = e + 1;
@@ -280,50 +268,15 @@ function buildLetterStrokeMap(letterIdx: number): { orderMap: Map<string, number
   return { orderMap, maxOrder: Math.max(1, order - 1) };
 }
 
-type LetterStroke = { orderMap: Map<string, number>; maxOrder: number };
-
-const WRITING_START_TICK = 6;
-const FALLBACK_LETTER_TICKS = 8;
-
-const LETTER_STROKES: Array<LetterStroke | null> = LETTER_SPANS.map(() => null);
-const LETTER_TICKS: number[] = LETTER_SPANS.map(() => FALLBACK_LETTER_TICKS);
-const LETTER_START_TICKS: number[] = LETTER_SPANS.map(
-  (_, i) => WRITING_START_TICK + i * FALLBACK_LETTER_TICKS,
+const LETTER_STROKES = LETTER_SPANS.map((_, i) => buildLetterStrokeMap(i));
+const WRITING_START_TICK = 10;
+const LETTER_TICKS = LETTER_STROKES.map((s) => Math.max(5, Math.ceil(((s.maxOrder + 8) / 11) * 0.3)));
+// Micro-pausa visual entre letras: 1 tick de reposo entre cada stroke.
+const PAUSE_TICKS = 1;
+const LETTER_START_TICKS = LETTER_TICKS.map((_, i) =>
+  WRITING_START_TICK + LETTER_TICKS.slice(0, i).reduce((a, b) => a + b + PAUSE_TICKS, 0),
 );
-let WRITING_END_TICK =
-  WRITING_START_TICK + LETTER_TICKS.reduce((a, b) => a + b, 0);
-
-function recomputeLetterTicks(): void {
-  for (let i = 0; i < LETTER_STROKES.length; i++) {
-    const stroke = LETTER_STROKES[i];
-    LETTER_TICKS[i] = stroke
-      ? Math.max(5, Math.ceil(((stroke.maxOrder + 8) / 11) * 0.48))
-      : FALLBACK_LETTER_TICKS;
-  }
-  let acc = WRITING_START_TICK;
-  for (let i = 0; i < LETTER_TICKS.length; i++) {
-    LETTER_START_TICKS[i] = acc;
-    acc += LETTER_TICKS[i];
-  }
-  WRITING_END_TICK = acc;
-}
-
-function allStrokesReady(): boolean {
-  for (const stroke of LETTER_STROKES) if (stroke === null) return false;
-  return true;
-}
-
-let warmupStarted = false;
-async function warmupLetterStrokes(): Promise<void> {
-  if (warmupStarted) return;
-  warmupStarted = true;
-  for (let i = 0; i < LETTER_SPANS.length; i++) {
-    if (LETTER_STROKES[i] !== null) continue;
-    LETTER_STROKES[i] = buildLetterStrokeMap(i);
-    recomputeLetterTicks();
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
-}
+const WRITING_END_TICK = WRITING_START_TICK + LETTER_TICKS.reduce((a, b) => a + b + PAUSE_TICKS, 0);
 
 function buildPenLogoLine(
   line: string,
@@ -342,10 +295,6 @@ function buildPenLogoLine(
 
     const letterIdx = letterIndexAtX(x);
     const stroke = LETTER_STROKES[letterIdx];
-    if (stroke === null) {
-      out.push({ char: ch, type: "logo-ink" });
-      continue;
-    }
     const startTick = LETTER_START_TICKS[letterIdx];
     const duration = LETTER_TICKS[letterIdx];
     const progress = (tick - startTick) / Math.max(1, duration);
@@ -380,9 +329,19 @@ function buildPenLogoLine(
     }
 
     const age = head - order;
-    if (age < 1.2) out.push({ char: ch, type: "logo-tip" });
-    else if (age < 4.9) out.push({ char: ch, type: "logo-fresh" });
-    else out.push({ char: ch, type: "logo-ink" });
+    if (age < 0.6) {
+      out.push({ char: ch, type: "logo-tip" });
+    } else if (age < 1.8) {
+      out.push({ char: ch, type: "logo-tip2" });
+    } else if (age < 4.0) {
+      out.push({ char: ch, type: "logo-fresh" });
+    } else if (age < 7.0) {
+      out.push({ char: ch, type: "logo-fresh2" });
+    } else if (age < 11.0) {
+      out.push({ char: ch, type: "logo-warm" });
+    } else {
+      out.push({ char: ch, type: "logo-ink" });
+    }
   }
   return out;
 }
@@ -402,7 +361,7 @@ class LayoutBuilder {
   center(width: number) {
     const row = this.lines[this.lines.length - 1];
     const pad = Math.max(0, Math.floor((width - row.length) / 2));
-    const prefix: LayoutCell[] = Array.from({ length: pad }, () => ({
+    const prefix = Array.from({ length: pad }, () => ({
       char: " ",
       type: "none" as const,
     }));
@@ -410,44 +369,12 @@ class LayoutBuilder {
   }
 }
 
-const FULL_INTRO_MIN_ROWS = 30;
-const FULL_INTRO_MIN_COLS = 80;
-const MINIMAL_INTRO_MIN_ROWS = 20;
-const MINIMAL_INTRO_MIN_COLS = 40;
-const RESIZE_DEBOUNCE_MS = 150;
-const RESIZE_GRACE_PERIOD_MS = 300;
-
-type IntroMode = "full" | "minimal" | "skip";
-
-function pickIntroMode(rows: number, cols: number): IntroMode {
-  if (rows >= FULL_INTRO_MIN_ROWS && cols >= FULL_INTRO_MIN_COLS) return "full";
-  if (rows >= MINIMAL_INTRO_MIN_ROWS && cols >= MINIMAL_INTRO_MIN_COLS) return "minimal";
-  return "skip";
-}
-
-function currentIntroMode(): IntroMode {
-  // process.stdout.rows/columns reflejan el tamaño real del TTY del proceso;
-  // el TUI no expone alto en render(width) y por eso lo leemos directo acá.
-  const rows = process.stdout.rows ?? 0;
-  const cols = process.stdout.columns ?? 0;
-  return pickIntroMode(rows, cols);
-}
-
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
 
-    // Si se está ejecutando un comando de CLI como "pi update" o "pi install", no mostramos la intro animada.
-    const isCLICommand =
-      process.argv.length > 2 &&
-      !process.argv.every((arg) => arg.startsWith("-") || arg.endsWith(".ts"));
-    if (isCLICommand) return;
-
-    if (currentIntroMode() === "skip") return;
-
-    // Fire-and-forget: el setup geométrico de cada letra corre en background
-    // para que la animación arranque en el primer frame sin bloquear el event loop.
-    void warmupLetterStrokes();
+    // En modo de prueba con `-e <archivo.ts>` sí queremos mostrar la intro,
+    // así que no filtramos por argv en esta versión.
 
     process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
 
@@ -456,11 +383,13 @@ export default function (pi: ExtensionAPI) {
 
     let gitBranch = "Not a git repo";
     let mcpServersCount = 0;
-    let extensionsCount = 0;
+    let extensionFilesCount = 0;
     let packagesCount = 0;
+    let sddAgentCount = 0;
+    let skillCommandCount = 0;
 
     const allCommands = pi.getCommands();
-    const skills = allCommands.filter((c) => c.source === "skill");
+    skillCommandCount = allCommands.filter((c) => c.source === "skill").length;
     const allTools = pi.getAllTools();
     const customTools = allTools.filter(
       (t) => !["builtin", "sdk"].includes(t.sourceInfo.source),
@@ -490,133 +419,122 @@ export default function (pi: ExtensionAPI) {
       })();
     }, 150);
 
+    // Count SDD agent files from the agents directory
+    const countSddAgents = async (): Promise<number> => {
+      try {
+        const entries = await readdir(join(PI_AGENT_DIR, "agents"), { withFileTypes: true });
+        return entries.filter((e) => e.isFile() && e.name.startsWith("sdd-") && e.name.endsWith(".md")).length;
+      } catch { return 0; }
+    };
+
+    // Count real extension files from installed packages
+    const countPackageExtensions = async (): Promise<number> => {
+      let count = 0;
+      try {
+        const settingsRaw = await readFile(join(PI_AGENT_DIR, "settings.json"), "utf8");
+        const cfg = JSON.parse(settingsRaw);
+        packagesCount = Array.isArray(cfg.packages) ? cfg.packages.length : 0;
+
+        if (!Array.isArray(cfg.packages)) return 0;
+
+        for (const pkg of cfg.packages) {
+          let pkgJsonPath: string | null = null;
+
+          if (typeof pkg === "string" && pkg.startsWith("npm:")) {
+            const name = pkg.slice("npm:".length);
+            const candidate = join(PI_NPM_DIR, name, "package.json");
+            if (existsSync(candidate)) {
+              pkgJsonPath = candidate;
+            }
+          } else if (typeof pkg === "string" && (pkg.startsWith("git:") || pkg.startsWith("https://") || pkg.startsWith("http://"))) {
+            // git/https packages: extract path under PI_GIT_DIR
+            const url = pkg.replace(/^git:/, "https:").replace(/\.git$/, "");
+            const urlObj = new URL(url);
+            const host = urlObj.hostname;
+            const pathParts = urlObj.pathname.replace(/^\//, "").replace(/\/$/, "").split("/");
+            // Try: git/{host}/{org}/{repo}/package.json, git/{host}/{org}/{repo}/, etc.
+            const domainDir = join(PI_GIT_DIR, host);
+            if (existsSync(domainDir)) {
+              for (let depth = pathParts.length; depth >= 2; depth--) {
+                const sub = pathParts.slice(0, depth).join("/");
+                const candidate = join(PI_GIT_DIR, host, sub, "package.json");
+                if (existsSync(candidate)) { pkgJsonPath = candidate; break; }
+              }
+            }
+          }
+
+          if (pkgJsonPath) {
+            try {
+              const pkgRaw = await readFile(pkgJsonPath, "utf8");
+              const pkgJson = JSON.parse(pkgRaw);
+              const exts = pkgJson.pi?.extensions;
+              if (Array.isArray(exts)) {
+                count += exts.length;
+              }
+            } catch { /* skip */ }
+          }
+        }
+      } catch { /* skip */ }
+      return count;
+    };
+
     setTimeout(() => {
       (async () => {
-        try {
-          const raw = await readFile(
-            join(os.homedir(), ".pi", "agent", "settings.json"),
-            "utf8",
-          );
-          const cfg = JSON.parse(raw);
-          extensionsCount = Array.isArray(cfg.extensions)
-            ? cfg.extensions.length
-            : 0;
-          packagesCount = Array.isArray(cfg.packages) ? cfg.packages.length : 0;
-        } catch {
-          extensionsCount = 0;
-          packagesCount = 0;
-        }
+        const [extCount, sddCount] = await Promise.all([
+          countPackageExtensions(),
+          countSddAgents(),
+        ]);
+        extensionFilesCount = extCount;
+        sddAgentCount = sddCount;
       })();
     }, 200);
 
     let tick = 0;
-    const state = {
-      timer: null as NodeJS.Timeout | null,
-      mode: currentIntroMode() as IntroMode,
-      resizeHandler: null as (() => void) | null,
-      resizeDebounceTimer: null as NodeJS.Timeout | null,
-    };
-
-    const cleanup = () => {
-      if (state.timer) {
-        clearInterval(state.timer);
-        state.timer = null;
-      }
-      if (state.resizeHandler) {
-        process.stdout.off("resize", state.resizeHandler);
-        state.resizeHandler = null;
-      }
-      if (state.resizeDebounceTimer) {
-        clearTimeout(state.resizeDebounceTimer);
-        state.resizeDebounceTimer = null;
-      }
-    };
+    const state = { timer: null as NodeJS.Timeout | null };
 
     setTimeout(() => {
       ctx.ui.setHeader((tui, theme) => {
         if (state.timer) clearInterval(state.timer);
 
-        const animStart = Date.now();
-        const HARD_TIMEOUT_MS = 5000;
-
         state.timer = setInterval(() => {
           tick++;
-          const elapsed = Date.now() - animStart;
-          const finishedAnimation =
-            allStrokesReady() && tick > WRITING_END_TICK + 22;
-          if (finishedAnimation || elapsed > HARD_TIMEOUT_MS) {
-            cleanup();
+          if (tick > WRITING_END_TICK + 25) {
+            if (state.timer) {
+              clearInterval(state.timer);
+              state.timer = null;
+            }
             return;
           }
           try {
             tui.requestRender();
           } catch {
-            cleanup();
+            if (state.timer) {
+              clearInterval(state.timer);
+              state.timer = null;
+            }
           }
         }, 25);
 
-        // Grace period: pi-tui emite resizes transitorios mientras compone su layout inicial.
-        const bootStart = Date.now();
-        const resizeHandler = () => {
-          if (Date.now() - bootStart < RESIZE_GRACE_PERIOD_MS) return;
-          if (state.resizeDebounceTimer) clearTimeout(state.resizeDebounceTimer);
-          state.resizeDebounceTimer = setTimeout(() => {
-            state.resizeDebounceTimer = null;
-            const next = currentIntroMode();
-            if (next === state.mode) return;
-            state.mode = next;
-            if (next === "skip") {
-              cleanup();
-              process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
-              return;
-            }
-            try {
-              tui.requestRender();
-            } catch {
-              cleanup();
-            }
-          }, RESIZE_DEBOUNCE_MS);
-        };
-        state.resizeHandler = resizeHandler;
-        process.stdout.on("resize", resizeHandler);
-
         return {
           render(width: number): string[] {
-            if (state.mode === "skip") return [];
-
-            const flashStartTick = 10;
-            const roseOpacity = Math.min(1, tick / 10);
+            const flashStartTick = 16;
+            const roseOpacity = Math.min(1, tick / 16);
             const flashPhase =
               tick >= flashStartTick
-                ? Math.max(0, 1 - (tick - flashStartTick) / 12)
+                ? Math.max(0, 1 - (tick - flashStartTick) / 20)
                 : 0;
             const frame = Math.floor(tick / 2);
 
             const sideBySideMinWidth = roseBase.width + 3 + logoBase.width + 4;
             const wideStatsMinWidth = 122;
-            const horizontal =
-              state.mode === "full" && width >= sideBySideMinWidth;
+            const horizontal = width >= sideBySideMinWidth;
             const wideStats = width >= wideStatsMinWidth;
 
             const b = new LayoutBuilder();
             b.addRow();
             b.center(width);
 
-            if (state.mode === "minimal") {
-              for (let logoI = 0; logoI < logoBase.lines.length; logoI++) {
-                const logoLine = logoBase.lines[logoI];
-                b.addRow();
-                b.lines[b.lines.length - 1].push(
-                  ...buildPenLogoLine(
-                    logoLine,
-                    logoI,
-                    logoBase.lines.length,
-                    tick,
-                  ),
-                );
-                b.center(width);
-              }
-            } else if (horizontal) {
+            if (horizontal) {
               const rowCount = Math.max(
                 roseBase.lines.length,
                 logoBase.lines.length,
@@ -690,114 +608,109 @@ export default function (pi: ExtensionAPI) {
               }
             }
 
-            if (state.mode === "full") {
-              b.addRow();
-              b.center(width);
+            b.addRow();
+            b.center(width);
 
-              const fit = (v: unknown, w: number) =>
-                String(v ?? "")
-                  .replace(/\s+/g, " ")
-                  .trim()
-                  .slice(0, w)
-                  .padEnd(w);
-              const addWideRow = (
-                l1: string,
-                v1: string,
-                l2: string,
-                v2: string,
-              ) => {
-                b.addRow();
-                b.add("label", fit(l1, 10));
-                b.add("none", " ");
-                b.add("value", fit(v1, 48));
-                b.add("none", "   ");
-                b.add("label", fit(l2, 12));
-                b.add("none", " ");
-                b.add("value", fit(v2, 46));
-                b.center(width);
-              };
-              const narrowRows: Array<[string, string]> = [
-                ["GIT:", gitBranch],
-                ["PATH:", ctx.cwd],
-                ["MCP:", `${mcpServersCount} server(s)`],
-                ["PLUGINS:", `${packagesCount} package(s)`],
-                ["AGENTS:", `${skills.length} loaded`],
-                ["EXTENSIONS:", `${extensionsCount} active`],
-                ["VER:", `v${VERSION}`],
-                ["TOOLS:", `${customTools.length} custom`],
-              ];
-              const narrowLabelW = Math.max(...narrowRows.map(([l]) => l.length));
-              const narrowValueW = Math.max(
-                0,
-                Math.min(
-                  Math.max(...narrowRows.map(([, v]) => v.length)),
-                  Math.max(8, width - narrowLabelW - 4),
-                ),
+            const fit = (v: unknown, w: number) =>
+              String(v ?? "")
+                .replace(/\s+/g, " ")
+                .trim()
+                .slice(0, w)
+                .padEnd(w);
+            const addWideRow = (
+              l1: string,
+              v1: string,
+              l2: string,
+              v2: string,
+            ) => {
+              b.addRow();
+              b.add("label", fit(l1, 10));
+              b.add("none", " ");
+              b.add("value", fit(v1, 48));
+              b.add("none", "   ");
+              b.add("label", fit(l2, 12));
+              b.add("none", " ");
+              b.add("value", fit(v2, 46));
+              b.center(width);
+            };
+            const narrowRows: Array<[string, string]> = [
+              ["PATH:", ctx.cwd],
+              ["GIT:", gitBranch],
+              ["MCP:", `${mcpServersCount} server(s)`],
+              ["PLUGINS:", `${packagesCount} package(s)`],
+              ["AGENTS:", `${sddAgentCount} phases`],
+              ["VER:", `v${VERSION}`],
+              ["EXTENSIONS:", `${extensionFilesCount} active`],
+              ["SKILLS:", `${skillCommandCount} loaded`],
+              ["TOOLS:", `${customTools.length} custom`],
+            ];
+            const narrowLabelW = Math.max(...narrowRows.map(([l]) => l.length));
+            const narrowValueW = Math.max(
+              0,
+              Math.min(
+                Math.max(...narrowRows.map(([, v]) => v.length)),
+                Math.max(8, width - narrowLabelW - 4),
+              ),
+            );
+            const addNarrowRow = (label: string, value: string) => {
+              b.addRow();
+              b.add("label", label.padEnd(narrowLabelW));
+              b.add("none", "  ");
+              b.add("value", fit(value, narrowValueW));
+              b.center(width);
+            };
+
+            if (wideStats) {
+              addWideRow("PATH:", ctx.cwd, "EXTENSIONS:", `${extensionFilesCount} active`);
+              addWideRow(
+                "GIT:",
+                gitBranch,
+                "PLUGINS:",
+                `${packagesCount} package(s)`,
               );
-              const addNarrowRow = (label: string, value: string) => {
-                b.addRow();
-                b.add("label", label.padEnd(narrowLabelW));
-                b.add("none", "  ");
-                b.add("value", fit(value, narrowValueW));
-                b.center(width);
-              };
-
-              if (wideStats) {
-                addWideRow("GIT:", gitBranch, "PATH:", ctx.cwd);
-                addWideRow(
-                  "MCP:",
-                  `${mcpServersCount} server(s)`,
-                  "PLUGINS:",
-                  `${packagesCount} package(s)`,
-                );
-                addWideRow(
-                  "AGENTS:",
-                  `${skills.length} loaded`,
-                  "EXTENSIONS:",
-                  `${extensionsCount} active`,
-                );
-                addWideRow(
-                  "VER:",
-                  `v${VERSION}`,
-                  "TOOLS:",
-                  `${customTools.length} custom`,
-                );
-              } else {
-                addNarrowRow("GIT:", gitBranch);
-                addNarrowRow("PATH:", ctx.cwd);
-                addNarrowRow("MCP:", `${mcpServersCount} server(s)`);
-                addNarrowRow("PLUGINS:", `${packagesCount} package(s)`);
-                addNarrowRow("AGENTS:", `${skills.length} loaded`);
-                addNarrowRow("EXTENSIONS:", `${extensionsCount} active`);
-                addNarrowRow("VER:", `v${VERSION}`);
-                addNarrowRow("TOOLS:", `${customTools.length} custom`);
-              }
-
-              b.addRow();
-              b.center(width);
+              addWideRow(
+                "MCP:",
+                `${mcpServersCount} server(s)`,
+                "SKILLS:",
+                `${skillCommandCount} loaded`,
+              );
+              addWideRow(
+                "AGENTS:",
+                `${sddAgentCount} phases`,
+                "TOOLS:",
+                `${customTools.length} custom`,
+              );
+              addWideRow("VER:", `v${VERSION}`, "", "");
+            } else {
+              addNarrowRow("PATH:", ctx.cwd);
+              addNarrowRow("GIT:", gitBranch);
+              addNarrowRow("MCP:", `${mcpServersCount} server(s)`);
+              addNarrowRow("PLUGINS:", `${packagesCount} package(s)`);
+              addNarrowRow("AGENTS:", `${sddAgentCount} phases`);
+              addNarrowRow("VER:", `v${VERSION}`);
+              addNarrowRow("EXTENSIONS:", `${extensionFilesCount} active`);
+              addNarrowRow("SKILLS:", `${skillCommandCount} loaded`);
+              addNarrowRow("TOOLS:", `${customTools.length} custom`);
             }
+
+            b.addRow();
+            b.center(width);
 
             const out: string[] = [];
             const layout = b.lines;
 
+            const logoTypes = new Set(["banner", "logo-tip", "logo-tip2", "logo-fresh", "logo-fresh2", "logo-warm", "logo-ink"] as const);
             const logoRows = layout
-              .map((row, idx) => ({
-                idx,
-                hasLogo: (row || []).some((c) => isLogoCellType(c.type)),
-              }))
+              .map((row, idx) => ({ idx, hasLogo: (row || []).some((c) => logoTypes.has(c.type as any)) }))
               .filter((r) => r.hasLogo)
               .map((r) => r.idx);
-            const sparkleY =
-              logoRows.length > 0
-                ? logoRows[Math.floor(logoRows.length / 2)]
-                : -1;
+            const sparkleY = logoRows.length > 0 ? logoRows[Math.floor(logoRows.length / 2)] : -1;
             const logoLastX = Math.max(
               -1,
               ...layout.map((row) => {
                 let last = -1;
                 for (let i = 0; i < (row || []).length; i++) {
-                  const cell = row?.[i];
-                  if (cell && isLogoCellType(cell.type) && cell.char !== " ") {
+                  if (logoTypes.has((row?.[i]?.type as any) ?? "none") && (row?.[i]?.char ?? " ") !== " ") {
                     last = i;
                   }
                 }
@@ -805,25 +718,55 @@ export default function (pi: ExtensionAPI) {
               }),
             );
 
-            const glintStartTick = WRITING_END_TICK + 3;
-            const glintEndTick = WRITING_END_TICK + 12;
+            const glintStartTick = WRITING_END_TICK + 4;
+            const glintEndTick = WRITING_END_TICK + 18;
             const glintActive = tick >= glintStartTick && tick <= glintEndTick;
-            const glintHead =
-              ((tick - glintStartTick) /
-                Math.max(1, glintEndTick - glintStartTick)) *
-              (LOGO_BOUNDS.end - LOGO_BOUNDS.start + 1);
-            const sparkleActive =
-              tick >= WRITING_END_TICK + 13 && tick <= WRITING_END_TICK + 20;
+            const glintHead = ((tick - glintStartTick) / Math.max(1, glintEndTick - glintStartTick)) * (LOGO_BOUNDS.end - LOGO_BOUNDS.start + 1);
+            // Estrella en la punta de la I (ultima letra del logo GENTLE-PI)
+            const sparkleActive = tick >= WRITING_END_TICK + 19 && tick <= WRITING_END_TICK + 25;
+            const sparkleTick = tick - (WRITING_END_TICK + 19);
+
+            // Encontrar la celda mas a la derecha del logo (punta de la I)
+            let starCX = -1, starCY = 0;
+            if (sparkleActive) {
+              for (let y = 0; y < layout.length; y++) {
+                const row = layout[y] || [];
+                for (let x = row.length - 1; x >= 0; x--) {
+                  const c = row[x];
+                  if (c && c.char !== " " && logoTypes.has(c.type as any)) {
+                    if (x > starCX) { starCX = x; starCY = y; }
+                    break;
+                  }
+                }
+              }
+              // Asegurar espacio vertical: forzar starCY >= 2
+              if (starCY < 2) starCY = 2;
+              // Asegurar espacio horizontal
+              const maxW = layout.length > 0 ? (layout[0] || []).length : 100;
+              if (starCX + 3 >= maxW) starCX = maxW - 4;
+            }
+
+            const renderStarCell = (_x: number, _y: number): string | null => {
+              return null;
+            };
 
             for (let y = 0; y < layout.length; y++) {
               const row = layout[y] || [];
-              const firstLogoX = row.findIndex(
-                (c) => isLogoCellType(c.type) && c.char !== " ",
-              );
+              const firstLogoX = row.findIndex((c) => logoTypes.has(c.type as any) && c.char !== " ");
               let line = "";
 
               for (let x = 0; x < row.length; x++) {
                 const cell = row[x] || { char: " ", type: "none" as const };
+
+                // Estrella check FIRST (antes del espacio)
+                if (sparkleActive) {
+                  const starResult = renderStarCell(x, y);
+                  if (starResult) {
+                    line += starResult;
+                    continue;
+                  }
+                }
+
                 if (cell.char === " ") {
                   line += " ";
                   continue;
@@ -832,7 +775,7 @@ export default function (pi: ExtensionAPI) {
                 if (cell.type === "rose") {
                   const pulse = 0.9 + Math.sin((x + y + frame) * 0.08) * 0.1;
                   const k = Math.max(0.01, roseOpacity * pulse);
-                  const f = flashPhase ** 0.4;
+                  const f = Math.pow(flashPhase, 0.4);
 
                   const rBase = Math.floor(255 * k);
                   const gBase = Math.floor(118 * k);
@@ -849,33 +792,29 @@ export default function (pi: ExtensionAPI) {
                   continue;
                 }
 
-                if (isLogoCellType(cell.type)) {
+                if (logoTypes.has(cell.type as any)) {
                   const localLogoX = firstLogoX >= 0 ? x - firstLogoX : x;
-                  const glintOnCell =
-                    glintActive &&
-                    localLogoX >= glintHead - 2 &&
-                    localLogoX <= glintHead + 1;
-                  const sparkleOnCell =
-                    sparkleActive &&
-                    y === sparkleY &&
-                    (x === logoLastX || x === logoLastX - 1);
-
-                  if (sparkleOnCell) {
-                    line += `\x1b[1m` + rgb(255, 255, 255, "✦") + `\x1b[22m`;
-                    continue;
-                  }
+                  const glintOnCell = glintActive && localLogoX >= glintHead - 2 && localLogoX <= glintHead + 1;
 
                   if (glintOnCell) {
-                    line += `\x1b[1m` + rgb(255, 245, 252, cell.char) + `\x1b[22m`;
+                    line += `\x1b[1m` + rgb(255, 220, 185, cell.char) + `\x1b[22m`;
                     continue;
                   }
 
-                  if (cell.type === "logo-tip") {
-                    line += `\x1b[1m` + rgb(255, 205, 238, cell.char) + `\x1b[22m`;
-                  } else if (cell.type === "logo-fresh") {
+                  if (cell.type === "logo-tip" || cell.type === "logo-tip2") {
+                    const glow = cell.type === "logo-tip" ? 245 : 225;
+                    line += `\x1b[1m` + rgb(255, glow, 238, cell.char) + `\x1b[22m`;
+                  } else if (cell.type === "logo-fresh" || cell.type === "logo-fresh2") {
+                    const r = cell.type === "logo-fresh" ? 255 : 230;
+                    const g = cell.type === "logo-fresh" ? 138 : 118;
+                    const b = cell.type === "logo-fresh" ? 206 : 178;
                     line += cell.char === "▒"
                       ? rgb(110, 36, 70, cell.char)
-                      : rgb(255, 138, 206, cell.char);
+                      : rgb(r, g, b, cell.char);
+                  } else if (cell.type === "logo-warm") {
+                    line += cell.char === "▒"
+                      ? rgb(125, 40, 76, cell.char)
+                      : rgb(245, 128, 196, cell.char);
                   } else {
                     line += cell.char === "▒"
                       ? rgb(95, 30, 60, cell.char)
@@ -908,10 +847,13 @@ export default function (pi: ExtensionAPI) {
             return out;
           },
           invalidate() {
-            cleanup();
+            if (state.timer) {
+              clearInterval(state.timer);
+              state.timer = null;
+            }
           },
         };
       });
-    }, 50);
+    }, 0);
   });
 }
