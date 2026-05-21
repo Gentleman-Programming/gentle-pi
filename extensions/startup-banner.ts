@@ -423,16 +423,19 @@ export default function (pi: ExtensionAPI) {
     );
   };
 
-  pi.registerShortcut("f1", {
-    description: "Toggle startup animation",
-    handler: toggleIntro,
-  });
+  const registerShortcut = (pi as any).registerShortcut;
+  if (typeof registerShortcut === "function") {
+    registerShortcut.call(pi, "f1", {
+      description: "Toggle startup animation",
+      handler: toggleIntro,
+    });
 
-  // Backup shortcut in case terminal does not forward F1
-  pi.registerShortcut("alt+n", {
-    description: "Toggle startup animation (backup)",
-    handler: toggleIntro,
-  });
+    // Backup shortcut in case terminal does not forward F1
+    registerShortcut.call(pi, "alt+n", {
+      description: "Toggle startup animation (backup)",
+      handler: toggleIntro,
+    });
+  }
 
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
