@@ -450,12 +450,6 @@ export default function (pi: ExtensionAPI) {
       description: "Toggle startup animation",
       handler: toggleIntro,
     });
-
-    // Backup shortcut in case terminal does not forward F1
-    registerShortcut.call(pi, "alt+n", {
-      description: "Toggle startup animation (backup)",
-      handler: toggleIntro,
-    });
   }
 
   pi.on("session_start", async (_event, ctx) => {
