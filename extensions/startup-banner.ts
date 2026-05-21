@@ -4,7 +4,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import * as os from "node:os";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 
@@ -370,11 +370,77 @@ class LayoutBuilder {
 }
 
 export default function (pi: ExtensionAPI) {
+  const settingsPath = join(os.homedir(), ".pi", "agent", "settings.json");
+
+  const readStartupAnimation = async (): Promise<boolean> => {
+    try {
+      const raw = await readFile(settingsPath, "utf8");
+      const cfg = JSON.parse(raw);
+      return cfg.startupAnimation !== false;
+    } catch {
+      return true;
+    }
+  };
+
+  const writeStartupAnimation = async (enabled: boolean): Promise<void> => {
+    const raw = await readFile(settingsPath, "utf8");
+    const cfg = JSON.parse(raw);
+    cfg.startupAnimation = enabled;
+    await writeFile(settingsPath, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
+  };
+
+  pi.registerCommand("intro", {
+    description: "Toggle startup animation. Usage: /intro on | /intro off",
+    getArgumentCompletions: (prefix) => {
+      const vals = ["on", "off"];
+      return vals
+        .filter((v) => v.startsWith((prefix || "").toLowerCase()))
+        .map((v) => ({ value: v, label: v }));
+    },
+    handler: async (args, ctx) => {
+      const arg = String(args || "").trim().toLowerCase();
+      if (arg !== "on" && arg !== "off") {
+        ctx.ui.notify("Use: /intro on | /intro off", "info");
+        return;
+      }
+      await writeStartupAnimation(arg === "on");
+      ctx.ui.notify(
+        arg === "on"
+          ? "Intro: ON (next startup)"
+          : "Intro: OFF (next startup)",
+        "info",
+      );
+    },
+  });
+
+  const toggleIntro = async (ctx: any) => {
+    const current = await readStartupAnimation();
+    const next = !current;
+    await writeStartupAnimation(next);
+    ctx.ui.notify(
+      next ? "Intro: ON (next startup)" : "Intro: OFF (next startup)",
+      "info",
+    );
+  };
+
+  pi.registerShortcut("f1", {
+    description: "Toggle startup animation",
+    handler: toggleIntro,
+  });
+
+  // Backup shortcut in case terminal does not forward F1
+  pi.registerShortcut("alt+n", {
+    description: "Toggle startup animation (backup)",
+    handler: toggleIntro,
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
 
     // En modo de prueba con `-e <archivo.ts>` sí queremos mostrar la intro,
     // así que no filtramos por argv en esta versión.
+
+    const startupAnimation = await readStartupAnimation();
 
     process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
 
@@ -489,31 +555,33 @@ export default function (pi: ExtensionAPI) {
       })();
     }, 200);
 
-    let tick = 0;
+    let tick = startupAnimation ? 0 : WRITING_END_TICK + 25;
     const state = { timer: null as NodeJS.Timeout | null };
 
     setTimeout(() => {
       ctx.ui.setHeader((tui, theme) => {
         if (state.timer) clearInterval(state.timer);
 
-        state.timer = setInterval(() => {
-          tick++;
-          if (tick > WRITING_END_TICK + 25) {
-            if (state.timer) {
-              clearInterval(state.timer);
-              state.timer = null;
+        if (startupAnimation) {
+          state.timer = setInterval(() => {
+            tick++;
+            if (tick > WRITING_END_TICK + 25) {
+              if (state.timer) {
+                clearInterval(state.timer);
+                state.timer = null;
+              }
+              return;
             }
-            return;
-          }
-          try {
-            tui.requestRender();
-          } catch {
-            if (state.timer) {
-              clearInterval(state.timer);
-              state.timer = null;
+            try {
+              tui.requestRender();
+            } catch {
+              if (state.timer) {
+                clearInterval(state.timer);
+                state.timer = null;
+              }
             }
-          }
-        }, 25);
+          }, 25);
+        }
 
         return {
           render(width: number): string[] {
