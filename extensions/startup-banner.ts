@@ -4,7 +4,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import * as os from "node:os";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 
@@ -391,6 +391,70 @@ function currentIntroMode(): IntroMode {
 }
 
 export default function (pi: ExtensionAPI) {
+  const settingsPath = join(os.homedir(), ".pi", "agent", "settings.json");
+
+  const readStartupAnimation = async (): Promise<boolean> => {
+    try {
+      const raw = await readFile(settingsPath, "utf8");
+      const cfg = JSON.parse(raw);
+      return cfg.startupAnimation !== false;
+    } catch {
+      return true;
+    }
+  };
+
+  const writeStartupAnimation = async (enabled: boolean): Promise<void> => {
+    const raw = await readFile(settingsPath, "utf8");
+    const cfg = JSON.parse(raw);
+    cfg.startupAnimation = enabled;
+    await writeFile(settingsPath, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
+  };
+
+  pi.registerCommand("intro", {
+    description: "Toggle startup animation. Usage: /intro on | /intro off",
+    getArgumentCompletions: (prefix) => {
+      const vals = ["on", "off"];
+      return vals
+        .filter((v) => v.startsWith((prefix || "").toLowerCase()))
+        .map((v) => ({ value: v, label: v }));
+    },
+    handler: async (args, ctx) => {
+      const arg = String(args || "").trim().toLowerCase();
+      if (arg !== "on" && arg !== "off") {
+        ctx.ui.notify("Use: /intro on | /intro off", "info");
+        return;
+      }
+      await writeStartupAnimation(arg === "on");
+      ctx.ui.notify(
+        arg === "on"
+          ? "Intro: ON (next startup)"
+          : "Intro: OFF (next startup)",
+        "info",
+      );
+    },
+  });
+
+  const toggleIntro = async (ctx: any) => {
+    const current = await readStartupAnimation();
+    const next = !current;
+    await writeStartupAnimation(next);
+    ctx.ui.notify(
+      next ? "Intro: ON (next startup)" : "Intro: OFF (next startup)",
+      "info",
+    );
+  };
+
+  pi.registerShortcut("f1", {
+    description: "Toggle startup animation",
+    handler: toggleIntro,
+  });
+
+  // Backup shortcut in case terminal does not forward F1
+  pi.registerShortcut("alt+n", {
+    description: "Toggle startup animation (backup)",
+    handler: toggleIntro,
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
 
@@ -401,6 +465,8 @@ export default function (pi: ExtensionAPI) {
     if (isCLICommand) return;
 
     if (currentIntroMode() === "skip") return;
+
+    const startupAnimation = await readStartupAnimation();
 
     process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
 
@@ -515,7 +581,7 @@ export default function (pi: ExtensionAPI) {
       })();
     }, 200);
 
-    let tick = 0;
+    let tick = startupAnimation ? 0 : WRITING_END_TICK + 25;
     const state = {
       timer: null as NodeJS.Timeout | null,
       mode: currentIntroMode() as IntroMode,
@@ -542,22 +608,24 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setHeader((tui, theme) => {
         if (state.timer) clearInterval(state.timer);
 
-        const animStart = Date.now();
-        const HARD_TIMEOUT_MS = 5000;
+        if (startupAnimation) {
+          const animStart = Date.now();
+          const HARD_TIMEOUT_MS = 5000;
 
-        state.timer = setInterval(() => {
-          tick++;
-          const elapsed = Date.now() - animStart;
-          if (tick > WRITING_END_TICK + 25 || elapsed > HARD_TIMEOUT_MS) {
-            cleanup();
-            return;
-          }
-          try {
-            tui.requestRender();
-          } catch {
-            cleanup();
-          }
-        }, 25);
+          state.timer = setInterval(() => {
+            tick++;
+            const elapsed = Date.now() - animStart;
+            if (tick > WRITING_END_TICK + 25 || elapsed > HARD_TIMEOUT_MS) {
+              cleanup();
+              return;
+            }
+            try {
+              tui.requestRender();
+            } catch {
+              cleanup();
+            }
+          }, 25);
+        }
 
         const bootStart = Date.now();
         const resizeHandler = () => {
