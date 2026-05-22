@@ -233,7 +233,8 @@ const MODEL_CONTROL_OPTIONS = [
 	INHERIT_MODEL,
 	CUSTOM_MODEL,
 ] as const;
-const AGENT_LIST_MAX_VISIBLE_ROWS = 16;
+const MODEL_PANEL_MAX_RENDER_ROWS = 20;
+const AGENT_LIST_MAX_VISIBLE_ROWS = MODEL_PANEL_MAX_RENDER_ROWS - 13;
 const MODEL_LIST_MAX_VISIBLE_ROWS = 12;
 
 function readStringPath(value: unknown, path: string[]): string | undefined {
@@ -369,16 +370,32 @@ function isThinkingLevel(value: unknown): value is ThinkingLevel {
 	);
 }
 
+const ANSI_ESCAPE_PATTERN =
+	/[\u001b\u009b][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[a-zA-Z\d]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
+const CONTROL_CHAR_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
+const SAFE_MODEL_ID_PATTERN = /^[A-Za-z0-9._~:@/+%-]+$/;
+
+function sanitizeTerminalText(value: string): string {
+	return value
+		.replace(ANSI_ESCAPE_PATTERN, "")
+		.replace(CONTROL_CHAR_PATTERN, "");
+}
+
+function normalizeModelId(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const model = value.trim();
+	if (model.length === 0) return undefined;
+	if (!SAFE_MODEL_ID_PATTERN.test(model)) return undefined;
+	return model;
+}
+
 function normalizeRoutingEntry(value: unknown): AgentRoutingEntry | undefined {
 	if (typeof value === "string") {
-		const model = value.trim();
-		return model.length > 0 ? { model } : undefined;
+		const model = normalizeModelId(value);
+		return model ? { model } : undefined;
 	}
 	if (!isRecord(value)) return undefined;
-	const model =
-		typeof value.model === "string" && value.model.trim().length > 0
-			? value.model.trim()
-			: undefined;
+	const model = normalizeModelId(value.model);
 	const thinking = isThinkingLevel(value.thinking) ? value.thinking : undefined;
 	if (!model && !thinking) return undefined;
 	return { model, thinking };
@@ -806,14 +823,15 @@ function describeModelConfig(cwd: string, config: AgentModelConfig): string[] {
 		const entry = config[agent.name];
 		const model = entry?.model ?? "inherit";
 		const thinking = entry?.thinking ?? "inherit";
-		return `${agent.name}: model=${model}, effort=${thinking}`;
+		return `${sanitizeTerminalText(agent.name)}: model=${sanitizeTerminalText(model)}, effort=${sanitizeTerminalText(thinking)}`;
 	});
 }
 
 async function getPiModelOptions(ctx: ExtensionContext): Promise<string[]> {
 	const models = await ctx.modelRegistry.getAvailable();
 	const modelIds = models
-		.map((model) => `${model.provider}/${model.id}`)
+		.map((model) => normalizeModelId(`${model.provider}/${model.id}`))
+		.filter((model): model is string => model !== undefined)
 		.sort((left, right) => left.localeCompare(right));
 	return [...MODEL_CONTROL_OPTIONS, ...modelIds];
 }
@@ -883,7 +901,7 @@ class SddModelPanel implements OverlayComponent {
 	private renderCard(lines: string[], width: number): string[] {
 		const innerWidth = Math.max(1, width - 4);
 		const fit = (text = "") =>
-			truncateToWidth(text, innerWidth, "…", true).padEnd(innerWidth);
+			truncateToWidth(sanitizeTerminalText(text), innerWidth, "…", true).padEnd(innerWidth);
 		return [
 			`╭${"─".repeat(innerWidth + 2)}╮`,
 			...lines.map((line) => `│ ${fit(line)} │`),
@@ -901,15 +919,15 @@ class SddModelPanel implements OverlayComponent {
 			this.done({ type: "save", config: this.draft });
 			return;
 		}
-		if (matchesKey(data, "down") || data === "j") {
+		if (matchesKey(data, "down") || matchesKey(data, "j")) {
 			this.cursor = Math.min(maxCursor, this.cursor + 1);
 			return;
 		}
-		if (matchesKey(data, "up") || data === "k") {
+		if (matchesKey(data, "up") || matchesKey(data, "k")) {
 			this.cursor = Math.max(0, this.cursor - 1);
 			return;
 		}
-		if (data === "g") {
+		if (matchesKey(data, "g")) {
 			this.cursor = 0;
 			return;
 		}
@@ -917,17 +935,17 @@ class SddModelPanel implements OverlayComponent {
 			this.cursor = maxCursor;
 			return;
 		}
-		if (data === "i") {
+		if (matchesKey(data, "i")) {
 			this.applyInherit();
 			return;
 		}
-		if (data === "e") {
+		if (matchesKey(data, "e")) {
 			this.selectedRow = this.rows[this.cursor] ?? SET_ALL_AGENTS;
 			this.mode = "effort";
 			this.effortCursor = 0;
 			return;
 		}
-		if (data === "c") {
+		if (matchesKey(data, "c")) {
 			const row = this.rows[this.cursor];
 			if (row === SET_ALL_AGENTS)
 				this.done({ type: "custom", agent: "all", config: this.draft });
@@ -969,14 +987,14 @@ class SddModelPanel implements OverlayComponent {
 			);
 			return;
 		}
-		if (matchesKey(data, "down") || data === "j") {
+		if (matchesKey(data, "down") || matchesKey(data, "j")) {
 			this.modelCursor = Math.min(
 				Math.max(0, options.length - 1),
 				this.modelCursor + 1,
 			);
 			return;
 		}
-		if (matchesKey(data, "up") || data === "k") {
+		if (matchesKey(data, "up") || matchesKey(data, "k")) {
 			this.modelCursor = Math.max(0, this.modelCursor - 1);
 			return;
 		}
@@ -1067,7 +1085,7 @@ class SddModelPanel implements OverlayComponent {
 		const lines: string[] = [];
 		const line = (text = "") =>
 			truncateToWidth(text, Math.max(1, width), "…", true);
-		lines.push(line("Assign Models to Agents"));
+		lines.push(line("Assign Models and Effort to Agents"));
 		lines.push("");
 		lines.push(line("Current assignments:"));
 		lines.push("");
@@ -1114,7 +1132,7 @@ class SddModelPanel implements OverlayComponent {
 		const options = this.filteredModelOptions();
 		const line = (text = "") =>
 			truncateToWidth(text, Math.max(1, width), "…", true);
-		lines.push(line(`Select model for ${this.selectedRow}`));
+		lines.push(line(`Select model for ${sanitizeTerminalText(this.selectedRow)}`));
 		lines.push("");
 		lines.push(line(`◎ ${this.query || "search..."}`));
 		lines.push("");
@@ -1128,7 +1146,7 @@ class SddModelPanel implements OverlayComponent {
 		const end = Math.min(options.length, start + MODEL_LIST_MAX_VISIBLE_ROWS);
 		for (let i = start; i < end; i++) {
 			const focused = i === this.modelCursor;
-			lines.push(line(`${focused ? "▸" : " "} ${options[i]}`));
+			lines.push(line(`${focused ? "▸" : " "} ${sanitizeTerminalText(options[i] ?? "")}`));
 		}
 		if (options.length === 0) lines.push(line("  No matching models"));
 		lines.push("");
@@ -1147,14 +1165,14 @@ class SddModelPanel implements OverlayComponent {
 			this.mode = "agents";
 			return;
 		}
-		if (matchesKey(data, "down") || data === "j") {
+		if (matchesKey(data, "down") || matchesKey(data, "j")) {
 			this.effortCursor = Math.min(
 				Math.max(0, THINKING_OPTIONS.length - 1),
 				this.effortCursor + 1,
 			);
 			return;
 		}
-		if (matchesKey(data, "up") || data === "k") {
+		if (matchesKey(data, "up") || matchesKey(data, "k")) {
 			this.effortCursor = Math.max(0, this.effortCursor - 1);
 			return;
 		}
@@ -1169,7 +1187,7 @@ class SddModelPanel implements OverlayComponent {
 		const lines: string[] = [];
 		const line = (text = "") =>
 			truncateToWidth(text, Math.max(1, width), "…", true);
-		lines.push(line(`Select effort for ${this.selectedRow}`));
+		lines.push(line(`Select effort for ${sanitizeTerminalText(this.selectedRow)}`));
 		lines.push("");
 		for (let i = 0; i < THINKING_OPTIONS.length; i++) {
 			const focused = i === this.effortCursor;
@@ -1195,13 +1213,13 @@ class SddModelPanel implements OverlayComponent {
 		const effortLabel = efforts.every((value) => value === firstEffort)
 			? firstEffort
 			: "mixed";
-		return `${row.padEnd(20)} model=${modelLabel}, effort=${effortLabel}`;
+		return `${sanitizeTerminalText(row).padEnd(20)} model=${sanitizeTerminalText(modelLabel)}, effort=${sanitizeTerminalText(effortLabel)}`;
 	}
 
 	private renderAgentLabel(row: string): string {
 		const model = this.draft[row]?.model ?? "inherit";
 		const effort = this.draft[row]?.thinking ?? "inherit";
-		return `${row.padEnd(20)} model=${model}, effort=${effort}`;
+		return `${sanitizeTerminalText(row).padEnd(20)} model=${sanitizeTerminalText(model)}, effort=${sanitizeTerminalText(effort)}`;
 	}
 }
 
@@ -1244,18 +1262,27 @@ async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
 				? "inherit"
 				: (config[result.agent]?.model ?? "inherit");
 		const custom = await ctx.ui.input(
-			`${result.agent === "all" ? "all agents" : result.agent} custom model id`,
-			current === "inherit" ? "provider/model" : current,
+			`${result.agent === "all" ? "all agents" : sanitizeTerminalText(result.agent)} custom model id`,
+			current === "inherit" ? "provider/model" : sanitizeTerminalText(current),
 		);
 		if (custom === undefined) return;
 		const trimmed = custom.trim();
 		if (trimmed.length > 0) {
+			const model = normalizeModelId(trimmed);
+			if (!model) {
+				ctx.ui.notify(
+					"Custom model id must be a single-line provider/model identifier using letters, numbers, '.', '-', '_', '~', ':', '@', '/', '+', '%' only.",
+					"warning",
+				);
+				result = await showSddModelPanel(ctx, config);
+				continue;
+			}
 			if (result.agent === "all") {
 				const next: AgentModelConfig = { ...config };
 				for (const agent of listDiscoverableAgents(ctx.cwd)) {
 					next[agent.name] = {
 						...(next[agent.name] ?? {}),
-						model: trimmed,
+						model,
 					};
 				}
 				config = next;
@@ -1264,7 +1291,7 @@ async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
 					...config,
 					[result.agent]: {
 						...(config[result.agent] ?? {}),
-						model: trimmed,
+						model,
 					},
 				};
 			}

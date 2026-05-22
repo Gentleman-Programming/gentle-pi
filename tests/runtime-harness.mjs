@@ -5,6 +5,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
+import { matchesKey } from "@earendil-works/pi-tui";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -636,17 +637,29 @@ async function run() {
 			);
 		}
 		await writeFile(
+			join(modelsCwd, ".pi", "agents", "escape-agent.md"),
+			`---\nname: evil\u001b]52;c;Zm9v\u0007-agent\ndescription: Escape fixture\n---\n`,
+		);
+		await writeFile(
 			globalModelsPath,
 			JSON.stringify({ "sdd-apply": "openai/gpt-5" }, null, 2),
 		);
 
 		const ctx = createCtx(modelsCwd, true);
+		ctx.modelRegistry.getAvailable = async () => [
+			{ provider: "safe", id: "model" },
+			{ provider: "evil\u001b]52;c;Zm9v\u0007", id: "model" },
+		];
 		ctx.ui.custom = (factory) => {
 			const panel = factory(null, null, null, () => undefined);
 			const initialLines = panel.render(120);
 			assert.ok(
 				initialLines[0].startsWith("╭") && initialLines.at(-1).startsWith("╰"),
 				"model panel should render inside a bordered card",
+			);
+			assert.ok(
+				initialLines.length <= 20,
+				"long model agent list should fit within a 24-row terminal 85% overlay budget",
 			);
 			assert.ok(
 				initialLines.some((line) => /↓ \d+ more agent\(s\)/.test(line)),
@@ -656,11 +669,30 @@ async function run() {
 				initialLines.some((line) => line.includes("Continue")),
 				"long model agent list should keep Continue visible",
 			);
+			assert.doesNotMatch(
+				initialLines.join("\n"),
+				/[\u001b\u0007]/,
+				"model panel must strip terminal control sequences from agent labels",
+			);
 			for (let i = 0; i < 20; i++) panel.handleInput("j");
 			const scrolledLines = panel.render(120);
 			assert.ok(
+				scrolledLines.length <= 20,
+				"scrolled model agent list should stay within the overlay height budget",
+			);
+			assert.ok(
 				scrolledLines.some((line) => /↑ \d+ more agent\(s\)/.test(line)),
 				"long model agent list should render an up-scroll indicator after navigation",
+			);
+			panel.handleInput("G");
+			const bottomLines = panel.render(120);
+			assert.ok(
+				bottomLines.length <= 20,
+				"bottom model agent list should stay within the overlay height budget",
+			);
+			assert.ok(
+				bottomLines.some((line) => line.includes("▸ ← Back")),
+				"G should jump to the Back action",
 			);
 			return Promise.resolve({ type: "cancel" });
 		};
@@ -683,6 +715,11 @@ async function run() {
 				},
 			});
 		await commands.get("gentle:models").handler("", ctx);
+		assert.doesNotMatch(
+			ctx.ui.notifications.at(-1).message,
+			/[\u001b\u0007]/,
+			"model save notification must strip terminal control sequences from discovered agent names",
+		);
 
 		const savedConfig = JSON.parse(
 			await readFile(globalModelsPath, "utf8"),
@@ -713,6 +750,10 @@ async function run() {
 		);
 		assert.equal(settings.subagents.agentOverrides.worker.thinking, "low");
 
+		const kittyE = "\x1b[101u";
+		assert.notEqual(kittyE, "e");
+		assert.equal(matchesKey(kittyE, "e"), true);
+
 		let customPanelCalls = 0;
 		ctx.ui.input = async () => "custom/provider-model";
 		ctx.ui.custom = (factory) =>
@@ -720,7 +761,7 @@ async function run() {
 				customPanelCalls += 1;
 				const panel = factory(null, null, null, resolve);
 				if (customPanelCalls === 1) {
-					panel.handleInput("e"); // effort picker for all agents
+					panel.handleInput(kittyE); // effort picker for all agents
 					for (let i = 0; i < 4; i++) panel.handleInput("j"); // medium
 					panel.handleInput("\r");
 					panel.handleInput("c"); // custom model from the same unsaved draft
@@ -734,6 +775,31 @@ async function run() {
 			await readFile(globalModelsPath, "utf8"),
 		);
 		assert.deepEqual(customSavedConfig["sdd-apply"], {
+			model: "custom/provider-model",
+			thinking: "medium",
+		});
+
+		let invalidCustomCalls = 0;
+		ctx.ui.input = async () => "bad\nmodel: injected";
+		ctx.ui.custom = (factory) =>
+			new Promise((resolve) => {
+				invalidCustomCalls += 1;
+				const panel = factory(null, null, null, resolve);
+				if (invalidCustomCalls === 1) {
+					panel.handleInput("c");
+					return;
+				}
+				panel.handleInput("\u001b");
+			});
+		await commands.get("gentle:models").handler("", ctx);
+		assert.match(
+			ctx.ui.notifications.at(-1).message,
+			/Custom model id must be a single-line/,
+		);
+		const rejectedCustomConfig = JSON.parse(
+			await readFile(globalModelsPath, "utf8"),
+		);
+		assert.deepEqual(rejectedCustomConfig["sdd-apply"], {
 			model: "custom/provider-model",
 			thinking: "medium",
 		});
