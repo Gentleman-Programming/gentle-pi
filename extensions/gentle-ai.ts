@@ -342,15 +342,28 @@ function personaConfigPath(cwd: string): string {
 }
 
 function readPersonaMode(cwd: string): PersonaMode {
-	const path = personaConfigPath(cwd);
-	if (!existsSync(path)) return "gentleman";
-	try {
-		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-		if (!isRecord(parsed)) return "gentleman";
-		return parsed.mode === "neutral" ? "neutral" : "gentleman";
-	} catch {
-		return "gentleman";
+	// 1. Project-local override
+	const localPath = personaConfigPath(cwd);
+	if (existsSync(localPath)) {
+		try {
+			const parsed: unknown = JSON.parse(readFileSync(localPath, "utf8"));
+			if (isRecord(parsed)) {
+				return parsed.mode === "neutral" ? "neutral" : "gentleman";
+			}
+		} catch { /* fall through */ }
 	}
+	// 2. Global fallback
+	const globalPath = join(gentleAiConfigHome(), "persona.json");
+	if (existsSync(globalPath)) {
+		try {
+			const parsed: unknown = JSON.parse(readFileSync(globalPath, "utf8"));
+			if (isRecord(parsed)) {
+				return parsed.mode === "neutral" ? "neutral" : "gentleman";
+			}
+		} catch { /* fall through */ }
+	}
+	// 3. Package default
+	return "gentleman";
 }
 
 function writePersonaMode(cwd: string, mode: PersonaMode): void {
