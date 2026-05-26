@@ -393,61 +393,89 @@ function currentIntroMode(): IntroMode {
 export default function (pi: ExtensionAPI) {
   const settingsPath = join(os.homedir(), ".pi", "agent", "settings.json");
 
-  const readStartupAnimation = async (): Promise<boolean> => {
+  const readSettings = async (): Promise<Record<string, unknown>> => {
     try {
       const raw = await readFile(settingsPath, "utf8");
-      const cfg = JSON.parse(raw);
-      return cfg.startupAnimation !== false;
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : {};
     } catch {
-      return true;
+      return {};
     }
   };
 
-  const writeStartupAnimation = async (enabled: boolean): Promise<void> => {
-    const raw = await readFile(settingsPath, "utf8");
-    const cfg = JSON.parse(raw);
-    cfg.startupAnimation = enabled;
+  const writeSettings = async (cfg: Record<string, unknown>): Promise<void> => {
     await writeFile(settingsPath, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
   };
 
+  const readStartupAnimation = async (): Promise<boolean> => {
+    const cfg = await readSettings();
+    return cfg.startupAnimation !== false;
+  };
+
+  const readIntroDisabled = async (): Promise<boolean> => {
+    const cfg = await readSettings();
+    return cfg.startupIntroDisabled === true;
+  };
+
+  const setIntroMode = async (mode: "on" | "off" | "disable"): Promise<void> => {
+    const cfg = await readSettings();
+    if (mode === "disable") {
+      cfg.startupIntroDisabled = true;
+    } else {
+      cfg.startupIntroDisabled = false;
+      cfg.startupAnimation = mode === "on";
+    }
+    await writeSettings(cfg);
+  };
+
   pi.registerCommand("intro", {
-    description: "Toggle startup animation. Usage: /intro on | /intro off",
+    description: "Control startup intro. Usage: /intro on | /intro off | /intro disable",
     getArgumentCompletions: (prefix) => {
-      const vals = ["on", "off"];
+      const vals = ["on", "off", "disable"];
       return vals
         .filter((v) => v.startsWith((prefix || "").toLowerCase()))
         .map((v) => ({ value: v, label: v }));
     },
     handler: async (args, ctx) => {
       const arg = String(args || "").trim().toLowerCase();
-      if (arg !== "on" && arg !== "off") {
-        ctx.ui.notify("Use: /intro on | /intro off", "info");
+      if (arg !== "on" && arg !== "off" && arg !== "disable") {
+        ctx.ui.notify("Use: /intro on | /intro off | /intro disable", "info");
         return;
       }
-      await writeStartupAnimation(arg === "on");
-      ctx.ui.notify(
-        arg === "on"
-          ? "Intro: ON (next startup)"
-          : "Intro: OFF (next startup)",
-        "info",
-      );
+      await setIntroMode(arg);
+      if (arg === "on") {
+        ctx.ui.notify("Intro: ON (animation enabled, next startup)", "info");
+      } else if (arg === "off") {
+        ctx.ui.notify("Intro: OFF (static banner, next startup)", "info");
+      } else {
+        ctx.ui.notify("Intro: DISABLED (HUD only, next startup)", "info");
+      }
     },
   });
 
   const toggleIntro = async (ctx: any) => {
-    const current = await readStartupAnimation();
-    const next = !current;
-    await writeStartupAnimation(next);
-    ctx.ui.notify(
-      next ? "Intro: ON (next startup)" : "Intro: OFF (next startup)",
-      "info",
-    );
+    const disabled = await readIntroDisabled();
+    if (disabled) {
+      await setIntroMode("on");
+      ctx.ui.notify("Intro: ON (animation enabled, next startup)", "info");
+      return;
+    }
+
+    const animated = await readStartupAnimation();
+    if (animated) {
+      await setIntroMode("off");
+      ctx.ui.notify("Intro: OFF (static banner, next startup)", "info");
+      return;
+    }
+
+    await setIntroMode("disable");
+    ctx.ui.notify("Intro: DISABLED (HUD only, next startup)", "info");
   };
 
   const registerShortcut = (pi as any).registerShortcut;
   if (typeof registerShortcut === "function") {
     registerShortcut.call(pi, "f1", {
-      description: "Toggle startup animation",
+      description: "Cycle startup intro mode (on/off/disable)",
       handler: toggleIntro,
     });
   }
@@ -463,7 +491,8 @@ export default function (pi: ExtensionAPI) {
 
     if (currentIntroMode() === "skip") return;
 
-    const startupAnimation = await readStartupAnimation();
+    const introDisabled = await readIntroDisabled();
+    const startupAnimation = !introDisabled && (await readStartupAnimation());
 
     process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
 
@@ -669,7 +698,7 @@ export default function (pi: ExtensionAPI) {
             b.addRow();
             b.center(width);
 
-            if (state.mode === "minimal") {
+            if (!introDisabled && state.mode === "minimal") {
               for (let logoI = 0; logoI < logoBase.lines.length; logoI++) {
                 const logoLine = logoBase.lines[logoI];
                 b.addRow();
@@ -683,7 +712,7 @@ export default function (pi: ExtensionAPI) {
                 );
                 b.center(width);
               }
-            } else if (horizontal) {
+            } else if (!introDisabled && horizontal) {
               const rowCount = Math.max(
                 roseBase.lines.length,
                 logoBase.lines.length,
@@ -726,7 +755,7 @@ export default function (pi: ExtensionAPI) {
                 }
                 b.center(width);
               }
-            } else {
+            } else if (!introDisabled) {
               const showBanner = width >= logoBase.width + 2;
               const showRose = width >= roseBase.width + 2;
               if (showBanner) {
@@ -757,7 +786,7 @@ export default function (pi: ExtensionAPI) {
               }
             }
 
-            if (state.mode === "full") {
+            if (state.mode === "full" || introDisabled) {
               b.addRow();
               b.center(width);
 
