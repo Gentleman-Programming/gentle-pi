@@ -369,12 +369,38 @@ class LayoutBuilder {
   }
 }
 
+const FULL_INTRO_MIN_ROWS = 30;
+const FULL_INTRO_MIN_COLS = 80;
+const MINIMAL_INTRO_MIN_ROWS = 20;
+const MINIMAL_INTRO_MIN_COLS = 40;
+const RESIZE_DEBOUNCE_MS = 150;
+const RESIZE_GRACE_PERIOD_MS = 300;
+
+type IntroMode = "full" | "minimal" | "skip";
+
+function pickIntroMode(rows: number, cols: number): IntroMode {
+  if (rows >= FULL_INTRO_MIN_ROWS && cols >= FULL_INTRO_MIN_COLS) return "full";
+  if (rows >= MINIMAL_INTRO_MIN_ROWS && cols >= MINIMAL_INTRO_MIN_COLS) return "minimal";
+  return "skip";
+}
+
+function currentIntroMode(): IntroMode {
+  const rows = process.stdout.rows ?? 0;
+  const cols = process.stdout.columns ?? 0;
+  return pickIntroMode(rows, cols);
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
 
-    // En modo de prueba con `-e <archivo.ts>` sí queremos mostrar la intro,
-    // así que no filtramos por argv en esta versión.
+    // Si se está ejecutando un comando CLI (update/install/etc), no mostrar intro.
+    const isCLICommand =
+      process.argv.length > 2 &&
+      !process.argv.every((arg) => arg.startsWith("-") || arg.endsWith(".ts"));
+    if (isCLICommand) return;
+
+    if (currentIntroMode() === "skip") return;
 
     process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
 
@@ -490,33 +516,77 @@ export default function (pi: ExtensionAPI) {
     }, 200);
 
     let tick = 0;
-    const state = { timer: null as NodeJS.Timeout | null };
+    const state = {
+      timer: null as NodeJS.Timeout | null,
+      mode: currentIntroMode() as IntroMode,
+      resizeHandler: null as (() => void) | null,
+      resizeDebounceTimer: null as NodeJS.Timeout | null,
+    };
+
+    const cleanup = () => {
+      if (state.timer) {
+        clearInterval(state.timer);
+        state.timer = null;
+      }
+      if (state.resizeHandler) {
+        process.stdout.off("resize", state.resizeHandler);
+        state.resizeHandler = null;
+      }
+      if (state.resizeDebounceTimer) {
+        clearTimeout(state.resizeDebounceTimer);
+        state.resizeDebounceTimer = null;
+      }
+    };
 
     setTimeout(() => {
       ctx.ui.setHeader((tui, theme) => {
         if (state.timer) clearInterval(state.timer);
 
+        const animStart = Date.now();
+        const HARD_TIMEOUT_MS = 5000;
+
         state.timer = setInterval(() => {
           tick++;
-          if (tick > WRITING_END_TICK + 25) {
-            if (state.timer) {
-              clearInterval(state.timer);
-              state.timer = null;
-            }
+          const elapsed = Date.now() - animStart;
+          if (tick > WRITING_END_TICK + 25 || elapsed > HARD_TIMEOUT_MS) {
+            cleanup();
             return;
           }
           try {
             tui.requestRender();
           } catch {
-            if (state.timer) {
-              clearInterval(state.timer);
-              state.timer = null;
-            }
+            cleanup();
           }
         }, 25);
 
+        const bootStart = Date.now();
+        const resizeHandler = () => {
+          if (Date.now() - bootStart < RESIZE_GRACE_PERIOD_MS) return;
+          if (state.resizeDebounceTimer) clearTimeout(state.resizeDebounceTimer);
+          state.resizeDebounceTimer = setTimeout(() => {
+            state.resizeDebounceTimer = null;
+            const next = currentIntroMode();
+            if (next === state.mode) return;
+            state.mode = next;
+            if (next === "skip") {
+              cleanup();
+              process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
+              return;
+            }
+            try {
+              tui.requestRender();
+            } catch {
+              cleanup();
+            }
+          }, RESIZE_DEBOUNCE_MS);
+        };
+        state.resizeHandler = resizeHandler;
+        process.stdout.on("resize", resizeHandler);
+
         return {
           render(width: number): string[] {
+            if (state.mode === "skip") return [];
+
             const flashStartTick = 16;
             const roseOpacity = Math.min(1, tick / 16);
             const flashPhase =
@@ -527,14 +597,28 @@ export default function (pi: ExtensionAPI) {
 
             const sideBySideMinWidth = roseBase.width + 3 + logoBase.width + 4;
             const wideStatsMinWidth = 122;
-            const horizontal = width >= sideBySideMinWidth;
+            const horizontal = state.mode === "full" && width >= sideBySideMinWidth;
             const wideStats = width >= wideStatsMinWidth;
 
             const b = new LayoutBuilder();
             b.addRow();
             b.center(width);
 
-            if (horizontal) {
+            if (state.mode === "minimal") {
+              for (let logoI = 0; logoI < logoBase.lines.length; logoI++) {
+                const logoLine = logoBase.lines[logoI];
+                b.addRow();
+                b.lines[b.lines.length - 1].push(
+                  ...buildPenLogoLine(
+                    logoLine,
+                    logoI,
+                    logoBase.lines.length,
+                    tick,
+                  ),
+                );
+                b.center(width);
+              }
+            } else if (horizontal) {
               const rowCount = Math.max(
                 roseBase.lines.length,
                 logoBase.lines.length,
@@ -608,10 +692,11 @@ export default function (pi: ExtensionAPI) {
               }
             }
 
-            b.addRow();
-            b.center(width);
+            if (state.mode === "full") {
+              b.addRow();
+              b.center(width);
 
-            const fit = (v: unknown, w: number) =>
+              const fit = (v: unknown, w: number) =>
               String(v ?? "")
                 .replace(/\s+/g, " ")
                 .trim()
@@ -693,62 +778,18 @@ export default function (pi: ExtensionAPI) {
               addNarrowRow("TOOLS:", `${customTools.length} custom`);
             }
 
-            b.addRow();
-            b.center(width);
+              b.addRow();
+              b.center(width);
+            }
 
             const out: string[] = [];
             const layout = b.lines;
 
             const logoTypes = new Set(["banner", "logo-tip", "logo-tip2", "logo-fresh", "logo-fresh2", "logo-warm", "logo-ink"] as const);
-            const logoRows = layout
-              .map((row, idx) => ({ idx, hasLogo: (row || []).some((c) => logoTypes.has(c.type as any)) }))
-              .filter((r) => r.hasLogo)
-              .map((r) => r.idx);
-            const sparkleY = logoRows.length > 0 ? logoRows[Math.floor(logoRows.length / 2)] : -1;
-            const logoLastX = Math.max(
-              -1,
-              ...layout.map((row) => {
-                let last = -1;
-                for (let i = 0; i < (row || []).length; i++) {
-                  if (logoTypes.has((row?.[i]?.type as any) ?? "none") && (row?.[i]?.char ?? " ") !== " ") {
-                    last = i;
-                  }
-                }
-                return last;
-              }),
-            );
-
             const glintStartTick = WRITING_END_TICK + 4;
             const glintEndTick = WRITING_END_TICK + 18;
             const glintActive = tick >= glintStartTick && tick <= glintEndTick;
             const glintHead = ((tick - glintStartTick) / Math.max(1, glintEndTick - glintStartTick)) * (LOGO_BOUNDS.end - LOGO_BOUNDS.start + 1);
-            // Estrella en la punta de la I (ultima letra del logo GENTLE-PI)
-            const sparkleActive = tick >= WRITING_END_TICK + 19 && tick <= WRITING_END_TICK + 25;
-            const sparkleTick = tick - (WRITING_END_TICK + 19);
-
-            // Encontrar la celda mas a la derecha del logo (punta de la I)
-            let starCX = -1, starCY = 0;
-            if (sparkleActive) {
-              for (let y = 0; y < layout.length; y++) {
-                const row = layout[y] || [];
-                for (let x = row.length - 1; x >= 0; x--) {
-                  const c = row[x];
-                  if (c && c.char !== " " && logoTypes.has(c.type as any)) {
-                    if (x > starCX) { starCX = x; starCY = y; }
-                    break;
-                  }
-                }
-              }
-              // Asegurar espacio vertical: forzar starCY >= 2
-              if (starCY < 2) starCY = 2;
-              // Asegurar espacio horizontal
-              const maxW = layout.length > 0 ? (layout[0] || []).length : 100;
-              if (starCX + 3 >= maxW) starCX = maxW - 4;
-            }
-
-            const renderStarCell = (_x: number, _y: number): string | null => {
-              return null;
-            };
 
             for (let y = 0; y < layout.length; y++) {
               const row = layout[y] || [];
@@ -757,15 +798,6 @@ export default function (pi: ExtensionAPI) {
 
               for (let x = 0; x < row.length; x++) {
                 const cell = row[x] || { char: " ", type: "none" as const };
-
-                // Estrella check FIRST (antes del espacio)
-                if (sparkleActive) {
-                  const starResult = renderStarCell(x, y);
-                  if (starResult) {
-                    line += starResult;
-                    continue;
-                  }
-                }
 
                 if (cell.char === " ") {
                   line += " ";
@@ -847,10 +879,7 @@ export default function (pi: ExtensionAPI) {
             return out;
           },
           invalidate() {
-            if (state.timer) {
-              clearInterval(state.timer);
-              state.timer = null;
-            }
+            cleanup();
           },
         };
       });
