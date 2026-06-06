@@ -1586,11 +1586,24 @@ Active discipline (el Gentleman harness):
 - Never fabricate persistent memory or capabilities; report failures honestly.
 </gentle-harness-reminder>`;
 
+const POST_COMPACTION_REMINDER_CONTENT = `Context was just compacted: earlier conversation details now exist only as a summary.
+Re-check current SDD/OpenSpec state on disk before continuing multi-step work, and restate scope and acceptance criteria for the active task before further changes.`;
+
+let compactionPending = false;
+
 function buildContextReminder(): ReturnType<typeof buildContextReminder> {
+	const baseContent = GENTLE_HARNESS_REMINDER_CONTENT;
+	let fullContent = baseContent;
+
+	if (compactionPending) {
+		fullContent = `${baseContent}\n\n${POST_COMPACTION_REMINDER_CONTENT}`;
+		compactionPending = false;
+	}
+
 	return {
 		role: "custom" as const,
 		customType: "gentle-harness-reminder",
-		content: GENTLE_HARNESS_REMINDER_CONTENT,
+		content: fullContent,
 		display: false,
 		timestamp: Date.now(),
 	};
@@ -1600,7 +1613,7 @@ function applyHarnessReminder(
 	messages: Array<{ customType?: string; role?: string } | unknown>,
 ): unknown[] {
 	// Strip all existing reminders and append fresh one
-	// This ensures exactly one reminder per context event
+	// This ensures exactly one reminder per context event and resets compactionPending flag
 	const filtered = messages.filter((msg) => {
 		if (!isRecord(msg)) return true;
 		return (msg as Record<string, unknown>).customType !== "gentle-harness-reminder";
@@ -1617,6 +1630,10 @@ export const __testing = {
 		getOrchestratorPromptImpl(pathOverride),
 	buildContextReminder,
 	applyHarnessReminder,
+	setCompactionPending: (value: boolean) => {
+		compactionPending = value;
+	},
+	getCompactionPending: () => compactionPending,
 };
 
 export default function gentleAi(pi: ExtensionAPI): void {
@@ -1630,6 +1647,8 @@ export default function gentleAi(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		try {
+			// Reset compaction state at session start to prevent reminder leakage across sessions
+			compactionPending = false;
 			const installResult = installSddAssets(ctx.cwd, true);
 			const modelResult = await applySavedModelConfig(ctx);
 			if (ctx.hasUI && modelResult.invalidPath) {
@@ -1655,6 +1674,10 @@ export default function gentleAi(pi: ExtensionAPI): void {
 				);
 			}
 		}
+	});
+
+	pi.on("session_compact", (_event, _ctx) => {
+		compactionPending = true;
 	});
 
 	pi.on("context", (event) => {
