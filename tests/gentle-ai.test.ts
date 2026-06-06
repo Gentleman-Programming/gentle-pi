@@ -211,3 +211,21 @@ test("compaction flag resets when applyHarnessReminder builds fresh reminder", a
 	assert.equal(__testing.getCompactionPending(), false, "flag should be reset after applyHarnessReminder");
 	assert(result[0].content.includes("Context was just compacted"), "reminder should include compaction content");
 });
+
+test("agent slim rules contain expected content", async () => {
+	const slimRules = __testing.getAgentSlimRules();
+	assert(slimRules.includes("Gentle Agent Rules"), "should include header");
+	assert(slimRules.includes("Stay strictly within your assigned scope"), "should include scope rule");
+	assert(slimRules.includes("Never run destructive commands"), "should include safety rule");
+	assert(slimRules.includes("TDD evidence"), "should include TDD rule");
+	assert(slimRules.includes("Do not spawn further orchestration"), "should include no-orchestration rule");
+	assert(slimRules.includes("Report results honestly"), "should include honesty rule");
+});
+
+test("agent slim rules do not contain persona or orchestrator markers", async () => {
+	const slimRules = __testing.getAgentSlimRules();
+	assert(!slimRules.includes("el Gentleman Identity"), "slim rules must not contain identity contract");
+	assert(!slimRules.includes("Persona:"), "slim rules must not contain persona marker");
+	assert(!slimRules.includes("orchestrator.md"), "slim rules must not reference orchestrator");
+	assert(!slimRules.includes("Harness principles"), "slim rules must not contain harness principles");
+});

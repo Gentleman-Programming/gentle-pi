@@ -213,7 +213,10 @@ async function run() {
 			{ agentName: "worker", systemPrompt: "worker base" },
 			createCtx(promptCwd),
 		);
-		assert.equal(subagentPromptResult.systemPrompt, "worker base");
+		assert.match(subagentPromptResult.systemPrompt, /worker base/);
+		assert.match(subagentPromptResult.systemPrompt, /Gentle Agent Rules/);
+		assert.match(subagentPromptResult.systemPrompt, /Stay strictly within your assigned scope/);
+		assert.doesNotMatch(subagentPromptResult.systemPrompt, /el Gentleman Identity/);
 		assert.equal(
 			existsSync(join(promptCwd, ".pi", "agents", "sdd-apply.md")),
 			false,
@@ -504,11 +507,13 @@ async function run() {
 			{ agentName: "worker", systemPrompt: "worker base" },
 			ctx,
 		);
-		assert.equal(
+		assert.match(
 			workerPromptResult.systemPrompt,
-			"worker base",
-			"non-SDD subagents must not receive parent harness or SDD preflight prompts",
+			/worker base/,
+			"non-SDD subagents must receive slim rules but not parent harness or SDD preflight prompts",
 		);
+		assert.match(workerPromptResult.systemPrompt, /Gentle Agent Rules/);
+		assert.doesNotMatch(workerPromptResult.systemPrompt, /el Gentleman Identity/);
 	} finally {
 		await rm(lazySddCwd, { recursive: true, force: true });
 		await rm(globalModelsPath, { force: true });
