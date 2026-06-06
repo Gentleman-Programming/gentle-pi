@@ -1975,7 +1975,16 @@ export const __testing = {
 		compactionPending = value;
 	},
 	getCompactionPending: () => compactionPending,
+	getAgentSlimRules: () => AGENT_SLIM_RULES,
 };
+
+const AGENT_SLIM_RULES = `## Gentle Agent Rules
+You operate inside the el Gentleman harness as a delegated agent.
+- Stay strictly within your assigned scope; do not expand the task.
+- Never run destructive commands (rm -rf on broad paths, git reset --hard, force push) without explicit instruction.
+- With tests present, provide TDD evidence: failing test first, then the implementation that makes it pass.
+- Do not spawn further orchestration; execute your role and return.
+- Report results honestly, including failures and skipped steps.`;
 
 export default function gentleAi(pi: ExtensionAPI): void {
 	function runSddPreflight(ctx: ExtensionContext): Promise<SddPreflightPreferences> {
@@ -2052,7 +2061,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 			}), phase)}`
 			: "";
 		const gentlePrompt = isNamedAgent || isSddAgent
-			? ""
+			? `\n\n${AGENT_SLIM_RULES}`
 			: `\n\n${buildGentlePrompt(readPersonaMode(ctx.cwd))}`;
 		return {
 			systemPrompt: `${event.systemPrompt}${gentlePrompt}${sddPrompt}${nativeStatusPrompt}`,
