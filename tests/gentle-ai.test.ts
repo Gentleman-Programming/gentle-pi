@@ -65,3 +65,78 @@ test("orchestrator prompt returns empty string when file is missing", (t) => {
 	// Should not throw, should return empty string instead
 	assert.equal(result, "");
 });
+
+test("context event handler builds reminder message", () => {
+	const original: typeof __testing.buildContextReminder = (...args) => {
+		throw new Error("Not implemented");
+	};
+	const reminder = __testing.buildContextReminder();
+	assert.equal(reminder.role, "custom");
+	assert.equal(reminder.customType, "gentle-harness-reminder");
+	assert.equal(typeof reminder.content, "string");
+	assert.equal(reminder.display, false);
+	assert.equal(typeof reminder.timestamp, "number");
+	assert(reminder.content.includes("Active discipline"));
+	assert(reminder.content.includes("el Gentleman harness"));
+	assert(reminder.content.includes("Keep the parent session as orchestrator"));
+});
+
+test("applyHarnessReminder appends reminder to messages without mutation", () => {
+	const messages: typeof __testing.buildContextReminder[] = [];
+	const result = __testing.applyHarnessReminder(messages);
+	assert.notEqual(result, messages, "should return new array");
+	assert.equal(messages.length, 0, "original should not be mutated");
+	assert.equal(result.length, 1, "result should have one message");
+	assert.equal(result[0].customType, "gentle-harness-reminder");
+});
+
+test("applyHarnessReminder deduplicates reminder messages", () => {
+	const reminder = __testing.buildContextReminder();
+	const messages = [
+		{ role: "user", content: "hello" },
+		reminder,
+	];
+	const result = __testing.applyHarnessReminder(messages);
+	assert.equal(result.length, 2, "should not double-append duplicate reminder");
+	assert.equal(result[result.length - 1].customType, "gentle-harness-reminder");
+	// Verify only one reminder exists (dedup strips old and appends fresh)
+	const reminderCount = result.filter((m: any) => m.customType === "gentle-harness-reminder").length;
+	assert.equal(reminderCount, 1, "should have exactly one reminder");
+});
+
+test("applyHarnessReminder removes reminder from middle of message array", () => {
+	const reminder = __testing.buildContextReminder();
+	// Simulate scenario where reminder is not in last position
+	const messages = [
+		{ role: "user", content: "message 1" },
+		reminder,
+		{ role: "assistant", content: "response" },
+	];
+	const result = __testing.applyHarnessReminder(messages);
+	// Original: 3 messages (user, old reminder, assistant)
+	// After dedup: 3 messages (user, assistant, new reminder)
+	assert.equal(result.length, 3, "should maintain message count");
+	// Verify only one reminder and it is at the end
+	const reminderCount = result.filter((m: any) => m.customType === "gentle-harness-reminder").length;
+	assert.equal(reminderCount, 1, "should have exactly one reminder after dedup");
+	assert.equal(result[result.length - 1].customType, "gentle-harness-reminder", "reminder should be last");
+	assert.equal(result[0].role, "user", "first message should be user");
+	assert.equal(result[1].role, "assistant", "second message should be assistant");
+});
+
+test("applyHarnessReminder handles empty messages", () => {
+	const messages: typeof __testing.buildContextReminder[] = [];
+	const result = __testing.applyHarnessReminder(messages);
+	assert.equal(result.length, 1);
+	assert.equal(result[0].customType, "gentle-harness-reminder");
+});
+
+test("applyHarnessReminder appends reminder as last message", () => {
+	const messages = [
+		{ role: "user", content: "message 1" },
+		{ role: "user", content: "message 2" },
+	];
+	const result = __testing.applyHarnessReminder(messages);
+	assert.equal(result[result.length - 1].customType, "gentle-harness-reminder");
+	assert.equal(result.length, 3);
+});

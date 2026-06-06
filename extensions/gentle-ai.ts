@@ -1907,6 +1907,39 @@ async function applyReviewGate(
 	};
 }
 
+const GENTLE_HARNESS_REMINDER_CONTENT = `<gentle-harness-reminder>
+Active discipline (el Gentleman harness):
+- Keep the parent session as orchestrator; delegate exploration, implementation, and review to subagents when available.
+- For non-trivial work, anchor decisions in SDD/OpenSpec artifacts, not floating chat context.
+- Single-writer discipline: never run parallel writes without explicit user-approved isolation.
+- With tests present, follow strict TDD evidence: RED, GREEN, TRIANGULATE, REFACTOR.
+- Protect the reviewer: keep changes small; surface review-workload risk before expanding scope.
+- Never fabricate persistent memory or capabilities; report failures honestly.
+</gentle-harness-reminder>`;
+
+function buildContextReminder() {
+	return {
+		role: "custom" as const,
+		customType: "gentle-harness-reminder",
+		content: GENTLE_HARNESS_REMINDER_CONTENT,
+		display: false,
+		timestamp: Date.now(),
+	};
+}
+
+function applyHarnessReminder(
+	messages: Array<{ customType?: string; role?: string } | unknown>,
+): unknown[] {
+	// Strip all existing reminders and append fresh one
+	// This ensures exactly one reminder per context event
+	const filtered = messages.filter((msg) => {
+		if (!isRecord(msg)) return true;
+		return (msg as Record<string, unknown>).customType !== "gentle-harness-reminder";
+	});
+	filtered.push(buildContextReminder());
+	return filtered;
+}
+
 /** @internal */
 export const __testing = {
 	listAgentsFromDir,
@@ -1918,6 +1951,8 @@ export const __testing = {
 	parseNumstat,
 	getOrchestratorPrompt: (pathOverride?: string) =>
 		getOrchestratorPromptImpl(pathOverride),
+	buildContextReminder,
+	applyHarnessReminder,
 };
 
 export default function gentleAi(pi: ExtensionAPI): void {
@@ -1956,6 +1991,10 @@ export default function gentleAi(pi: ExtensionAPI): void {
 				);
 			}
 		}
+	});
+
+	pi.on("context", (event) => {
+		return { messages: applyHarnessReminder(event.messages) };
 	});
 
 	pi.on("input", async (event, ctx) => {
