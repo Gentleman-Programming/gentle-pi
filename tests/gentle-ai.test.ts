@@ -34,3 +34,31 @@ test("agent discovery skips skills directories", async (t) => {
 		["reviewer", "worker"],
 	);
 });
+
+test("orchestrator prompt refreshes from disk on each access", async (t) => {
+	const tmpDir = mkdtempSync(join(tmpdir(), "gentle-pi-orchestrator-"));
+	t.after(() => rmSync(tmpDir, { recursive: true, force: true }));
+	const promptFile = join(tmpDir, "orchestrator.md");
+
+	// Write initial content
+	writeFileSync(promptFile, "First version");
+	const first = __testing.getOrchestratorPrompt(promptFile);
+	assert.equal(first, "First version");
+
+	// Update the file
+	writeFileSync(promptFile, "Updated version");
+	const second = __testing.getOrchestratorPrompt(promptFile);
+	assert.equal(second, "Updated version");
+
+	// Change it again to prove freshness on each call
+	writeFileSync(promptFile, "Third version");
+	const third = __testing.getOrchestratorPrompt(promptFile);
+	assert.equal(third, "Third version");
+});
+
+test("orchestrator prompt returns empty string when file is missing", async () => {
+	const missingPath = "/nonexistent/path/orchestrator.md";
+	const result = __testing.getOrchestratorPrompt(missingPath);
+	// Should not throw, should return empty string instead
+	assert.equal(result, "");
+});
