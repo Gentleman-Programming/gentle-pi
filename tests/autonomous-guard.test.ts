@@ -340,3 +340,198 @@ test("classifyGuardedCommand: pi remove allowed when autonomousMode=true and piR
 	});
 	assert.equal(result, "allow");
 });
+
+// ---------------------------------------------------------------------------
+// Fix 1: git global flags bypass — git -C <dir> push / git --work-tree push
+// ---------------------------------------------------------------------------
+
+test("classifyGuardedCommand: git -C /repo push --force → block even with gitPush=allow", () => {
+	const result = classifyGuardedCommand("git -C /repo push --force origin main", {
+		autonomousMode: true,
+		guardedCommands: { gitPush: "allow" },
+	});
+	assert.equal(result, "block");
+});
+
+test("classifyGuardedCommand: git --work-tree=/tmp push --force → block", () => {
+	const result = classifyGuardedCommand("git --work-tree=/tmp push --force origin main", {
+		autonomousMode: true,
+		guardedCommands: { gitPush: "allow" },
+	});
+	assert.equal(result, "block");
+});
+
+test("classifyGuardedCommand: git -C /repo push -f → block", () => {
+	const result = classifyGuardedCommand("git -C /repo push -f origin main", {
+		autonomousMode: true,
+		guardedCommands: { gitPush: "allow" },
+	});
+	assert.equal(result, "block");
+});
+
+test("classifyGuardedCommand: git -C /repo push origin feat → classified as gitPush (allow when configured)", () => {
+	const result = classifyGuardedCommand("git -C /repo push origin feat", {
+		autonomousMode: true,
+		guardedCommands: { gitPush: "allow" },
+	});
+	assert.equal(result, "allow");
+});
+
+test("classifyGuardedCommand: git -C /repo push origin feat → confirm when autonomousMode=false", () => {
+	const result = classifyGuardedCommand("git -C /repo push origin feat", {
+		autonomousMode: false,
+		guardedCommands: {},
+	});
+	assert.equal(result, "confirm");
+});
+
+// ---------------------------------------------------------------------------
+// Fix 2: rm -rf $HOME was not blocked (dead regex branch)
+// ---------------------------------------------------------------------------
+
+test("classifyGuardedCommand: rm -rf $HOME → block", () => {
+	const result = classifyGuardedCommand("rm -rf $HOME", {
+		autonomousMode: true,
+		guardedCommands: {},
+	});
+	assert.equal(result, "block");
+});
+
+test("classifyGuardedCommand: rm -rf $HOME/foo → block", () => {
+	const result = classifyGuardedCommand("rm -rf $HOME/foo", {
+		autonomousMode: true,
+		guardedCommands: {},
+	});
+	assert.equal(result, "block");
+});
+
+// ---------------------------------------------------------------------------
+// Fix 5a: gitBranchDeleteForce allow path is tested
+// ---------------------------------------------------------------------------
+
+test("classifyGuardedCommand: gitBranchDeleteForce=allow in autonomous mode → allow", () => {
+	const result = classifyGuardedCommand("git branch -D old-feature", {
+		autonomousMode: true,
+		guardedCommands: { gitBranchDeleteForce: "allow" },
+	});
+	assert.equal(result, "allow");
+});
+
+// ---------------------------------------------------------------------------
+// Fix 5b: AUTONOMOUS_DEFAULT_ACTIONS fallback — empty guardedCommands in autonomous mode
+// ---------------------------------------------------------------------------
+
+test("classifyGuardedCommand: autonomousMode=true, empty guardedCommands, gitPush defaults to allow", () => {
+	const result = classifyGuardedCommand("git push origin main", {
+		autonomousMode: true,
+		guardedCommands: {},
+	});
+	assert.equal(result, "allow");
+});
+
+// ---------------------------------------------------------------------------
+// Fix 5c: env var negatives — only "1" activates autonomous mode
+// ---------------------------------------------------------------------------
+
+test("loadRuntimeGuardrailsConfig: GENTLE_PI_AUTONOMOUS_MODE=0 does NOT activate autonomous mode", () => {
+	const original = process.env.GENTLE_PI_AUTONOMOUS_MODE;
+	process.env.GENTLE_PI_AUTONOMOUS_MODE = "0";
+	const dir = makeTmpDir();
+	try {
+		const config = __testing.loadRuntimeGuardrailsConfig(dir, {
+			gentlePiConfigHome: join(dir, "global-config"),
+		});
+		assert.equal(config.autonomousMode, false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+		if (original === undefined) delete process.env.GENTLE_PI_AUTONOMOUS_MODE;
+		else process.env.GENTLE_PI_AUTONOMOUS_MODE = original;
+	}
+});
+
+test("loadRuntimeGuardrailsConfig: GENTLE_PI_AUTONOMOUS_MODE=true does NOT activate autonomous mode", () => {
+	const original = process.env.GENTLE_PI_AUTONOMOUS_MODE;
+	process.env.GENTLE_PI_AUTONOMOUS_MODE = "true";
+	const dir = makeTmpDir();
+	try {
+		const config = __testing.loadRuntimeGuardrailsConfig(dir, {
+			gentlePiConfigHome: join(dir, "global-config"),
+		});
+		assert.equal(config.autonomousMode, false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+		if (original === undefined) delete process.env.GENTLE_PI_AUTONOMOUS_MODE;
+		else process.env.GENTLE_PI_AUTONOMOUS_MODE = original;
+	}
+});
+
+test("loadRuntimeGuardrailsConfig: GENTLE_PI_AUTONOMOUS_MODE='' does NOT activate autonomous mode", () => {
+	const original = process.env.GENTLE_PI_AUTONOMOUS_MODE;
+	process.env.GENTLE_PI_AUTONOMOUS_MODE = "";
+	const dir = makeTmpDir();
+	try {
+		const config = __testing.loadRuntimeGuardrailsConfig(dir, {
+			gentlePiConfigHome: join(dir, "global-config"),
+		});
+		assert.equal(config.autonomousMode, false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+		if (original === undefined) delete process.env.GENTLE_PI_AUTONOMOUS_MODE;
+		else process.env.GENTLE_PI_AUTONOMOUS_MODE = original;
+	}
+});
+
+// ---------------------------------------------------------------------------
+// Fix 5d: JSON config autonomousMode strict === true check
+// ---------------------------------------------------------------------------
+
+test("loadRuntimeGuardrailsConfig: autonomousMode:1 (number) in JSON does NOT activate autonomous mode", () => {
+	const dir = makeTmpDir();
+	try {
+		const globalConfigDir = join(dir, "global-config");
+		writeConfig(globalConfigDir, "runtime-guardrails.json", {
+			autonomousMode: 1,
+			guardedCommands: {},
+		});
+		const config = __testing.loadRuntimeGuardrailsConfig(join(dir, "project"), {
+			gentlePiConfigHome: globalConfigDir,
+		});
+		assert.equal(config.autonomousMode, false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test('loadRuntimeGuardrailsConfig: autonomousMode:"true" (string) in JSON does NOT activate autonomous mode', () => {
+	const dir = makeTmpDir();
+	try {
+		const globalConfigDir = join(dir, "global-config");
+		writeConfig(globalConfigDir, "runtime-guardrails.json", {
+			autonomousMode: "true",
+			guardedCommands: {},
+		});
+		const config = __testing.loadRuntimeGuardrailsConfig(join(dir, "project"), {
+			gentlePiConfigHome: globalConfigDir,
+		});
+		assert.equal(config.autonomousMode, false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("loadRuntimeGuardrailsConfig: autonomousMode:{} (object) in JSON does NOT activate autonomous mode", () => {
+	const dir = makeTmpDir();
+	try {
+		const globalConfigDir = join(dir, "global-config");
+		writeConfig(globalConfigDir, "runtime-guardrails.json", {
+			autonomousMode: {},
+			guardedCommands: {},
+		});
+		const config = __testing.loadRuntimeGuardrailsConfig(join(dir, "project"), {
+			gentlePiConfigHome: globalConfigDir,
+		});
+		assert.equal(config.autonomousMode, false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

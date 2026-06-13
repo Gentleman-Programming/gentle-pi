@@ -182,12 +182,19 @@ Harness principles:
 ${getOrchestratorPrompt()}`;
 }
 
+// Matches `git [global-flags] push` — tolerates flags like -C /repo or --work-tree=/tmp
+// between `git` and the subcommand. Short flags may be followed by a separate value token.
+const GIT_GLOBAL_FLAGS_SRC = String.raw`(?:\s+--?\S+(?:\s+[^-\s]\S*)?)* `;
+const GIT_PUSH_RE = new RegExp(String.raw`\bgit${GIT_GLOBAL_FLAGS_SRC}push\b`);
+
 const DENIED_BASH_PATTERNS: RegExp[] = [
-	/\brm\s+-rf\s+(?:\/|~|\$HOME|\.\.?)(?:\s|$)/,
+	// Block rm -rf targeting /, ~ or ~/subdir, $HOME or $HOME/subdir, .. or .
+	/\brm\s+-rf\s+(?:\/(?:\s|$)|~(?:\/|\s|$)|[$]HOME(?:\/|\s|$)|\.\.?(?:\s|$))/,
 	/\bgit\s+reset\s+--hard\b/,
 	/\bgit\s+clean\b(?=[^\n]*(?:-[^\n]*f|--force))(?=[^\n]*(?:-[^\n]*d|--directories))/,
-	/\bgit\s+push\b(?=[^\n]*\s--force(?:-with-lease)?\b)/,
-	/\bgit\s+push\b(?=[^\n]*(?:\s|^)-[^\s-]*f)/,
+	// Force-push deny: tolerates git global flags (e.g. -C /repo) before the subcommand
+	new RegExp(String.raw`\bgit${GIT_GLOBAL_FLAGS_SRC}push\b(?=[^\n]*\s--force(?:-with-lease)?\b)`),
+	new RegExp(String.raw`\bgit${GIT_GLOBAL_FLAGS_SRC}push\b(?=[^\n]*\s-[^\s-]*f)`),
 	/\bchmod\s+-R\s+777\b/,
 	/\bchown\s+-R\b/,
 ];
@@ -236,7 +243,7 @@ interface LoadGuardrailsOptions {
 }
 
 const GUARDED_KEY_PATTERNS: Record<GuardedCommandKey, RegExp> = {
-	gitPush: /\bgit\s+push\b/,
+	gitPush: GIT_PUSH_RE,
 	gitRebase: /\bgit\s+rebase\b/,
 	gitBranchDeleteForce: /\bgit\s+branch\s+(?:-[a-zA-Z]*D[a-zA-Z]*|-[a-zA-Z]*d[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*d[a-zA-Z]*|--delete\b[^\n]*--force\b|--force\b[^\n]*--delete\b)/,
 	npmPublish: /\bnpm\s+publish\b/,
@@ -506,25 +513,6 @@ function sddPhaseFromAgentStartEvent(event: unknown): SddPhase | undefined {
 	if (/\bSDD sync executor\b/i.test(systemPrompt)) return "sync";
 	if (/\bSDD archive executor\b/i.test(systemPrompt)) return "archive";
 	return undefined;
-}
-
-function evaluateDeniedCommand(
-	command: string,
-): ToolCallEventResult | undefined {
-	for (const pattern of DENIED_BASH_PATTERNS) {
-		if (pattern.test(command)) {
-			return {
-				block: true,
-				reason:
-					"Gentle AI safety policy blocked a destructive shell command. Ask the user for an explicit safer plan.",
-			};
-		}
-	}
-	return undefined;
-}
-
-function commandRequiresConfirmation(command: string): boolean {
-	return CONFIRM_BASH_PATTERNS.some((pattern) => pattern.test(command));
 }
 
 function normalizePolicyPath(value: string): string {
