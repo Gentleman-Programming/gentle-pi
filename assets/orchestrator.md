@@ -271,6 +271,15 @@ When Engram or another callable memory package is available, the parent owns mem
 - SDD artifact keys: in memory/hybrid mode, phase artifacts should use stable topic keys such as `sdd/<change>/proposal`, `sdd/<change>/spec`, `sdd/<change>/design`, `sdd/<change>/tasks`, `sdd/<change>/apply-progress`, and `sdd/<change>/verify-report`.
 - If memory tools are unavailable, do not pretend persistence exists; return artifacts inline and/or write OpenSpec files.
 
+Memory lifecycle rule (when Engram exposes lifecycle metadata/tooling):
+
+- At session start or before architecture-sensitive work, call `mem_review` with action `list` for the current project when the tool is available.
+- If `mem_review` is unavailable, do not fail the task. Continue with normal `mem_context`/`mem_search`, and still apply lifecycle metadata from any returned observations when present.
+- `active` memories may be used normally.
+- `needs_review` memories are stale context, not trusted facts.
+- When a retrieved memory is marked `needs_review`, surface that stale context to the user and verify it against current evidence before relying on it.
+- Do NOT call `mem_review` with action `mark_reviewed` automatically. Only call `mark_reviewed` after explicit user confirmation or through a dedicated memory maintenance command.
+
 ## Execution Mode
 
 Use the session's SDD preflight choice:

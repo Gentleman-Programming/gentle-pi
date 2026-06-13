@@ -84,6 +84,33 @@ test("rendered SDD preflight prompt is English artifact copy", () => {
 	}
 });
 
+test("orchestrator Memory Contract carries the Engram memory lifecycle rule", async () => {
+	const orchestrator = await readFile(join(ROOT, "assets/orchestrator.md"), "utf8");
+
+	// Mirrors gentle-ai's engram-protocol/engram-convention lifecycle rule (PRs #842 + #844),
+	// in its final availability-gated form: agents must treat needs_review memories as stale,
+	// prefer mem_review when present, fall back safely when it is not, and never auto-mark reviewed.
+	for (const required of [
+		"when Engram exposes lifecycle metadata/tooling",
+		"At session start or before architecture-sensitive work",
+		"call `mem_review` with action `list`",
+		"for the current project when the tool is available",
+		"If `mem_review` is unavailable, do not fail the task",
+		"Continue with normal `mem_context`/`mem_search`",
+		"still apply lifecycle metadata from any returned observations when present",
+		"`active` memories may be used normally",
+		"`needs_review` memories are stale context, not trusted facts",
+		"verify it against current evidence before relying on it",
+		"Do NOT call `mem_review` with action `mark_reviewed` automatically",
+		"Only call `mark_reviewed` after explicit user confirmation or through a dedicated memory maintenance command",
+	]) {
+		assert.ok(
+			orchestrator.includes(required),
+			`orchestrator.md missing memory lifecycle rule: ${required}`,
+		);
+	}
+});
+
 test("SDD proposal questions focus on business and PRD gaps", async () => {
 	const proposalAgent = await readFile(join(ROOT, "assets/agents/sdd-proposal.md"), "utf8");
 
