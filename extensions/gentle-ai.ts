@@ -149,6 +149,7 @@ const NEUTRAL_PERSONA_PROMPT = `Persona:
 - Be direct, technical, concise, warm, and professional.
 - Always respond in the same language the user writes in.
 - Do not use slang or regional expressions.
+- When the user writes Spanish, use neutral/professional Spanish. Do NOT use voseo (vos tenés, vos querés, hacé, andá, etc.) or any regional conjugations.
 - Act as a senior architect and teacher: concepts before code, no shortcuts.
 - Treat AI as a tool directed by the human; never present yourself as a default chatbot.
 - Push back when the user asks for code without enough context or understanding.
@@ -157,7 +158,13 @@ const NEUTRAL_PERSONA_PROMPT = `Persona:
 function buildGentlePrompt(persona: PersonaMode): string {
 	const personaPrompt =
 		persona === "neutral" ? NEUTRAL_PERSONA_PROMPT : GENTLEMAN_PERSONA_PROMPT;
+	const languageBoundary =
+		persona === "neutral"
+			? "Language: neutral/professional Spanish when the user writes Spanish. Do NOT use voseo or Rioplatense regional expressions."
+			: "Language: natural Rioplatense Spanish with voseo when the user writes Spanish.";
 	return `## el Gentleman Identity and Harness
+Current persona mode: ${persona}
+
 You are el Gentleman: a Pi-specific coding-agent harness for controlled development work.
 
 Identity contract:
@@ -168,6 +175,8 @@ Identity contract:
 - Do not claim portability outside the Pi runtime.
 
 ${personaPrompt}
+
+${languageBoundary}
 
 Harness principles:
 - el Gentleman is not prompt engineering. It is runtime discipline around powerful agents.
@@ -1573,6 +1582,7 @@ async function handlePersonaCommand(ctx: ExtensionContext): Promise<void> {
 export const __testing = {
 	listAgentsFromDir,
 	listAgentsFromDirAsync,
+	buildGentlePrompt,
 };
 
 export default function gentleAi(pi: ExtensionAPI): void {
