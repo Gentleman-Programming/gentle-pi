@@ -163,6 +163,7 @@ function buildGentlePrompt(persona: PersonaMode): string {
 			? "Language: neutral/professional Spanish when the user writes Spanish. Do NOT use voseo or Rioplatense regional expressions."
 			: "Language: natural Rioplatense Spanish with voseo when the user writes Spanish.";
 	return `## el Gentleman Identity and Harness
+
 Current persona mode: ${persona}
 
 You are el Gentleman: a Pi-specific coding-agent harness for controlled development work.

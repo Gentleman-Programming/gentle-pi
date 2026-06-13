@@ -21,13 +21,28 @@ test("neutral mode composed prompt does not instruct to use voseo", () => {
 	);
 });
 
-test("neutral mode composed prompt does not contain unqualified Rioplatense instruction", () => {
+test("neutral mode composed prompt has no positive voseo/Rioplatense instruction and includes explicit prohibition", () => {
 	const prompt = __testing.buildGentlePrompt("neutral");
-	// Must not say "In gentleman mode, Spanish uses natural Rioplatense voseo"
+	// Any sentence that affirmatively tells the model to use voseo or natural Rioplatense
+	// must be absent. The prohibition line ("Do NOT use voseo") is the only allowed voseo
+	// mention. We match patterns that indicate a positive directive by requiring the word
+	// "use" (or its inflections) in proximity to "voseo" or "Rioplatense" WITHOUT a
+	// preceding negation — concretely, lines that start/contain "use", "uses", or "with voseo".
 	assert.doesNotMatch(
 		prompt,
-		/In `gentleman` mode, Spanish uses natural Rioplatense voseo/i,
-		"neutral prompt must not carry static mode-description mentioning Rioplatense voseo",
+		/\bwith voseo\b/i,
+		"neutral prompt must not contain 'with voseo' (positive directive)",
+	);
+	assert.doesNotMatch(
+		prompt,
+		/\buse(?:s)? (?:natural )?Rioplatense\b/i,
+		"neutral prompt must not instruct to use Rioplatense",
+	);
+	// The prohibition line must remain present so the model knows NOT to use voseo
+	assert.match(
+		prompt,
+		/Do NOT use voseo/i,
+		"neutral prompt must explicitly prohibit voseo",
 	);
 });
 
