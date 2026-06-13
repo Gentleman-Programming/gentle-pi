@@ -187,6 +187,7 @@ const DENIED_BASH_PATTERNS: RegExp[] = [
 	/\bgit\s+reset\s+--hard\b/,
 	/\bgit\s+clean\b(?=[^\n]*(?:-[^\n]*f|--force))(?=[^\n]*(?:-[^\n]*d|--directories))/,
 	/\bgit\s+push\b(?=[^\n]*\s--force(?:-with-lease)?\b)/,
+	/\bgit\s+push\b(?=[^\n]*(?:\s|^)-[^\s-]*f)/,
 	/\bchmod\s+-R\s+777\b/,
 	/\bchown\s+-R\b/,
 ];
@@ -194,10 +195,188 @@ const DENIED_BASH_PATTERNS: RegExp[] = [
 const CONFIRM_BASH_PATTERNS: RegExp[] = [
 	/\bgit\s+push\b/,
 	/\bgit\s+rebase\b/,
-	/\bgit\s+branch\s+-D\b/,
+	/\bgit\s+branch\s+(?:-[a-zA-Z]*D[a-zA-Z]*|-[a-zA-Z]*d[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*d[a-zA-Z]*|--delete\b[^\n]*--force\b|--force\b[^\n]*--delete\b)/,
 	/\bnpm\s+publish\b/,
 	/\bpi\s+remove\b/,
 ];
+
+// ---------------------------------------------------------------------------
+// Autonomous guard — runtime guardrails config
+// ---------------------------------------------------------------------------
+
+const GUARD_ACTION = {
+	ALLOW: "allow",
+	CONFIRM: "confirm",
+	BLOCK: "block",
+} as const;
+
+type GuardAction = (typeof GUARD_ACTION)[keyof typeof GUARD_ACTION];
+type GuardClassification = GuardAction | "not-guarded";
+
+const GUARDED_COMMAND_KEY = {
+	GIT_PUSH: "gitPush",
+	GIT_REBASE: "gitRebase",
+	GIT_BRANCH_DELETE_FORCE: "gitBranchDeleteForce",
+	NPM_PUBLISH: "npmPublish",
+	PI_REMOVE: "piRemove",
+} as const;
+
+type GuardedCommandKey = (typeof GUARDED_COMMAND_KEY)[keyof typeof GUARDED_COMMAND_KEY];
+
+type GuardedCommandsConfig = Partial<Record<GuardedCommandKey, GuardAction>>;
+
+interface RuntimeGuardrailsConfig {
+	autonomousMode: boolean;
+	guardedCommands: GuardedCommandsConfig;
+}
+
+interface LoadGuardrailsOptions {
+	/** Override the config home directory (used in tests to avoid touching ~/.pi). */
+	gentlePiConfigHome?: string;
+}
+
+const GUARDED_KEY_PATTERNS: Record<GuardedCommandKey, RegExp> = {
+	gitPush: /\bgit\s+push\b/,
+	gitRebase: /\bgit\s+rebase\b/,
+	gitBranchDeleteForce: /\bgit\s+branch\s+(?:-[a-zA-Z]*D[a-zA-Z]*|-[a-zA-Z]*d[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*d[a-zA-Z]*|--delete\b[^\n]*--force\b|--force\b[^\n]*--delete\b)/,
+	npmPublish: /\bnpm\s+publish\b/,
+	piRemove: /\bpi\s+remove\b/,
+};
+
+const AUTONOMOUS_DEFAULT_ACTIONS: Record<GuardedCommandKey, GuardAction> = {
+	gitPush: "allow",
+	gitRebase: "confirm",
+	gitBranchDeleteForce: "confirm",
+	npmPublish: "block",
+	piRemove: "confirm",
+};
+
+const SAFE_GUARDRAILS_CONFIG: RuntimeGuardrailsConfig = {
+	autonomousMode: false,
+	guardedCommands: {},
+};
+
+/**
+ * Classify a shell command under the runtime guard policy.
+ *
+ * Ordering (non-negotiable):
+ *   1. Hard-deny patterns → "block" (always, cannot be overridden by config)
+ *   2. If autonomousMode is false → mirror the legacy CONFIRM_BASH_PATTERNS result
+ *   3. If autonomousMode is true → use configured GuardAction for the matched key
+ *      (applying AUTONOMOUS_DEFAULT_ACTIONS for any key not set in guardedCommands)
+ *   4. No match → "not-guarded"
+ */
+function classifyGuardedCommand(
+	command: string,
+	config: RuntimeGuardrailsConfig,
+): GuardClassification {
+	// Step 1: hard-deny always wins, regardless of any config
+	for (const pattern of DENIED_BASH_PATTERNS) {
+		if (pattern.test(command)) return "block";
+	}
+
+	// Step 2 & 3: find which guarded key (if any) this command matches
+	for (const [key, pattern] of Object.entries(GUARDED_KEY_PATTERNS) as [GuardedCommandKey, RegExp][]) {
+		if (!pattern.test(command)) continue;
+
+		// Matched a guarded key
+		if (!config.autonomousMode) {
+			// Legacy behavior: any match → confirm
+			return "confirm";
+		}
+
+		// Autonomous mode: use configured action, fall back to sensible defaults
+		const configuredAction = config.guardedCommands[key];
+		return configuredAction ?? AUTONOMOUS_DEFAULT_ACTIONS[key];
+	}
+
+	return "not-guarded";
+}
+
+function parseGuardrailsConfigFile(
+	raw: string,
+): RuntimeGuardrailsConfig | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return undefined;
+	}
+	if (!isRecord(parsed)) return undefined;
+
+	const autonomousMode = parsed.autonomousMode === true;
+
+	const rawCommands = isRecord(parsed.guardedCommands) ? parsed.guardedCommands : {};
+	const guardedCommands: GuardedCommandsConfig = {};
+	const validActions = new Set<string>(["allow", "confirm", "block"]);
+	for (const [key, value] of Object.entries(rawCommands)) {
+		if (
+			typeof value === "string" &&
+			validActions.has(value) &&
+			Object.values(GUARDED_COMMAND_KEY).includes(key as GuardedCommandKey)
+		) {
+			guardedCommands[key as GuardedCommandKey] = value as GuardAction;
+		}
+	}
+
+	return { autonomousMode, guardedCommands };
+}
+
+/**
+ * Load the runtime guardrails config.
+ *
+ * Resolution order (project overrides global):
+ *   1. Check GENTLE_PI_AUTONOMOUS_MODE env var — if "1", forces autonomousMode=true
+ *      and uses default guarded command actions.
+ *   2. Read global config from ${gentlePiConfigHome}/runtime-guardrails.json
+ *   3. Read project config from ${cwd}/.pi/gentle-ai/runtime-guardrails.json
+ *      (project values are merged on top of global)
+ *   4. Any parse/read error anywhere → fail safe (return SAFE_GUARDRAILS_CONFIG)
+ */
+function loadRuntimeGuardrailsConfig(
+	cwd: string,
+	options: LoadGuardrailsOptions = {},
+): RuntimeGuardrailsConfig {
+	try {
+		// Env var override: forces autonomous mode with default actions
+		if (process.env.GENTLE_PI_AUTONOMOUS_MODE === "1") {
+			return { autonomousMode: true, guardedCommands: {} };
+		}
+
+		const configHome = options.gentlePiConfigHome ?? gentleAiConfigHome();
+		const globalConfigPath = join(configHome, "runtime-guardrails.json");
+		const projectConfigPath = join(cwd, ".pi", "gentle-ai", "runtime-guardrails.json");
+
+		let merged: RuntimeGuardrailsConfig = { autonomousMode: false, guardedCommands: {} };
+
+		if (existsSync(globalConfigPath)) {
+			const globalParsed = parseGuardrailsConfigFile(
+				readFileSync(globalConfigPath, "utf8"),
+			);
+			if (!globalParsed) return SAFE_GUARDRAILS_CONFIG;
+			merged = globalParsed;
+		}
+
+		if (existsSync(projectConfigPath)) {
+			const projectParsed = parseGuardrailsConfigFile(
+				readFileSync(projectConfigPath, "utf8"),
+			);
+			if (!projectParsed) return SAFE_GUARDRAILS_CONFIG;
+			// Project values fully override global values
+			merged = {
+				autonomousMode: projectParsed.autonomousMode,
+				guardedCommands: {
+					...merged.guardedCommands,
+					...projectParsed.guardedCommands,
+				},
+			};
+		}
+
+		return merged;
+	} catch {
+		return SAFE_GUARDRAILS_CONFIG;
+	}
+}
 
 const PATH_GUARDED_TOOL_NAMES = new Set(["read", "write", "edit"]);
 const PATH_INPUT_KEYS = new Set([
@@ -408,9 +587,23 @@ async function confirmCommand(
 	command: string,
 	ctx: ExtensionContext,
 ): Promise<ToolCallEventResult | undefined> {
-	const denied = evaluateDeniedCommand(command);
-	if (denied) return denied;
-	if (!commandRequiresConfirmation(command)) return undefined;
+	const guardrailsConfig = loadRuntimeGuardrailsConfig(ctx.cwd);
+	const classification = classifyGuardedCommand(command, guardrailsConfig);
+
+	if (classification === "block") {
+		return {
+			block: true,
+			reason:
+				"Gentle AI safety policy blocked a destructive shell command. Ask the user for an explicit safer plan.",
+		};
+	}
+
+	if (classification === "not-guarded") return undefined;
+
+	// classification is "allow" or "confirm" from this point on
+	if (classification === "allow") return undefined;
+
+	// classification === "confirm"
 	if (!ctx.hasUI) {
 		return {
 			block: true,
@@ -1573,6 +1766,8 @@ async function handlePersonaCommand(ctx: ExtensionContext): Promise<void> {
 export const __testing = {
 	listAgentsFromDir,
 	listAgentsFromDirAsync,
+	classifyGuardedCommand,
+	loadRuntimeGuardrailsConfig,
 };
 
 export default function gentleAi(pi: ExtensionAPI): void {
