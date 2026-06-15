@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
@@ -38,6 +39,12 @@ import {
 	sddStatusSeverity,
 	type SddPhase,
 } from "../lib/sdd-status.ts";
+import {
+	evaluateEvent,
+	matchPathGlobs,
+	type ChangedDiff,
+	type TriggerEvent,
+} from "../lib/review-triggers.ts";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
@@ -1760,6 +1767,139 @@ async function handlePersonaCommand(ctx: ExtensionContext): Promise<void> {
 	);
 }
 
+// ---------------------------------------------------------------------------
+// Review gate helpers — pure, exported via __testing for unit tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Classifies a bash command string as a TriggerEvent for the review gate,
+ * or returns null if the command is not a recognized git/gh workflow trigger.
+ *
+ * Regexes are tolerant of flags between tokens.
+ */
+export function classifyReviewEvent(command: string): TriggerEvent | null {
+	const trimmed = command.trim();
+	// gh pr create → pre-pr (check before generic push to avoid overlap)
+	if (/^gh\s+pr\s+create\b/.test(trimmed)) return "pre-pr";
+	// git commit → pre-commit
+	if (/^git(?:\s+(?:-C\s+\S+|--work-tree=\S+|--git-dir=\S+))?\s+commit\b/.test(trimmed))
+		return "pre-commit";
+	// git push → pre-push
+	if (/^git(?:\s+(?:-C\s+\S+|--work-tree=\S+|--git-dir=\S+))?\s+push\b/.test(trimmed))
+		return "pre-push";
+	return null;
+}
+
+/**
+ * Parses the output of `git diff --numstat` into a ChangedDiff.
+ * Binary files show `-  -  path`; their contribution to changedLines is 0.
+ */
+export function parseNumstat(output: string): ChangedDiff {
+	const changedPaths: string[] = [];
+	let changedLines = 0;
+	for (const line of output.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		// Format: "<added>\t<deleted>\t<path>"
+		const parts = trimmed.split("\t");
+		if (parts.length < 3) continue;
+		const added = parts[0];
+		const deleted = parts[1];
+		const filePath = parts.slice(2).join("\t");
+		if (!filePath) continue;
+		changedPaths.push(filePath);
+		// Binary rows have "-" in both columns; treat as 0.
+		const addedNum = added === "-" ? 0 : parseInt(added, 10);
+		const deletedNum = deleted === "-" ? 0 : parseInt(deleted, 10);
+		if (!isNaN(addedNum)) changedLines += addedNum;
+		if (!isNaN(deletedNum)) changedLines += deletedNum;
+	}
+	return { changedPaths, changedLines };
+}
+
+/**
+ * Computes a ChangedDiff for the given event by running git numstat.
+ * Returns null on any error (fail open — never break the user's git command).
+ */
+function computeDiffForEvent(event: TriggerEvent, cwd: string): ChangedDiff | null {
+	const gitOpts = {
+		cwd,
+		encoding: "utf8" as const,
+		stdio: ["pipe", "pipe", "pipe"] as const,
+		// Bound synchronous git calls so a slow/large repo cannot freeze the extension process.
+		// The existing outer try/catch returns null (fail-open) when this throws.
+		timeout: 2000,
+	};
+	try {
+		let raw: string;
+		if (event === "pre-commit") {
+			raw = execFileSync("git", ["diff", "--cached", "--numstat"], gitOpts);
+		} else {
+			// pre-push or pre-pr: diff vs merge-base
+			let base = "";
+			for (const ref of ["origin/HEAD", "origin/main", "main"]) {
+				try {
+					base = execFileSync("git", ["merge-base", "HEAD", ref], gitOpts).trim();
+					if (base) break;
+				} catch {
+					// try next ref
+				}
+			}
+			if (!base) {
+				// Final fallback: cached diff
+				try {
+					raw = execFileSync("git", ["diff", "--cached", "--numstat"], gitOpts);
+					return parseNumstat(raw);
+				} catch {
+					return null;
+				}
+			}
+			raw = execFileSync("git", ["diff", "--numstat", `${base}...HEAD`], gitOpts);
+		}
+		return parseNumstat(raw);
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Runs the review gate for a bash command, composing with the existing
+ * confirmCommand flow. Returns a block result for strong mode, notifies for
+ * advisory mode, or returns undefined to fall through.
+ */
+async function applyReviewGate(
+	command: string,
+	ctx: ExtensionContext,
+): Promise<ToolCallEventResult | undefined> {
+	const event = classifyReviewEvent(command);
+	if (!event) return undefined;
+
+	const diff = computeDiffForEvent(event, ctx.cwd);
+	if (!diff) return undefined;
+
+	const result = evaluateEvent(event, diff);
+	if (!result) return undefined;
+
+	if (result.mode === "advisory") {
+		if (ctx.hasUI) {
+			const commitOrPush = event === "pre-push" ? "this push" : "this commit";
+			ctx.ui.notify(
+				`Review suggestion: consider running agent "${result.run.join(", ")}" before ${commitOrPush}. ${result.reason}`,
+				"info",
+			);
+		}
+		return undefined;
+	}
+
+	// strong mode — block
+	return {
+		block: true,
+		reason:
+			`Gentle AI 4R review gate: run ${result.run.join(", ")} before this command. ` +
+			result.reason,
+	};
+}
+
 /** @internal */
 export const __testing = {
 	listAgentsFromDir,
@@ -1767,6 +1907,8 @@ export const __testing = {
 	classifyGuardedCommand,
 	loadRuntimeGuardrailsConfig,
 	buildGentlePrompt,
+	classifyReviewEvent,
+	parseNumstat,
 };
 
 export default function gentleAi(pi: ExtensionAPI): void {
@@ -1850,6 +1992,8 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		if (event.toolName !== "bash") return undefined;
 		if (!isRecord(event.input) || typeof event.input.command !== "string")
 			return undefined;
+		const reviewGateResult = await applyReviewGate(event.input.command, ctx);
+		if (reviewGateResult) return reviewGateResult;
 		return confirmCommand(event.input.command, ctx);
 	});
 
