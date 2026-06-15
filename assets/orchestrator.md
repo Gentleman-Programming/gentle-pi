@@ -384,3 +384,19 @@ Automatic mode does not override reviewer burnout protection.
 - Ask before destructive git operations, publishing, or irreversible file changes.
 - Keep writes single-threaded unless isolated worktrees are explicitly approved.
 - Preserve human control: user decisions beat agent momentum.
+
+## 4R Review Triggers
+
+The extension (`extensions/gentle-ai.ts`) gates `bash` tool calls that look like git/gh workflow events. Gate semantics:
+
+- **pre-commit** (`git commit`): advisory only. The extension notifies the user to consider running `review-readability` but does NOT block. No orchestrator action needed.
+- **pre-push** (`git push`): advisory only. Same as pre-commit — notify, do not block.
+- **pre-pr** (`gh pr create`): **strong gate**. The extension blocks when any of these hold:
+  - Changed paths match hot globs: `**/auth/**`, `**/update/**`, `**/security/**`, `**/payments/**`
+  - Diff exceeds 400 changed lines (added + deleted)
+  - When blocked, the reason names all four agents to run first.
+- **post-sdd-phase** (design, apply): **strong gate** for `judgment-day`. Handled separately by SDD phase orchestration, not this diff-based hook.
+
+When the extension blocks a `gh pr create` command, the orchestrator must launch the `4r-review` chain (or run the four agents individually) and wait for their reports before the user retries the PR command.
+
+Prohibition: do NOT configure the full 4R fan-out on `pre-commit` or `pre-push` with `always: true`. Everyday events must use a single advisory lens to keep development-loop cost low (spec G token-budget rule). The `validateTriggerRuleSet` function in `lib/review-triggers.ts` enforces this at config load time.
