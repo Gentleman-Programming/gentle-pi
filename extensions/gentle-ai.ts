@@ -120,15 +120,22 @@ function sddLocalOverrideDriftCount(cwd: string): number {
 	return stale;
 }
 
-let orchestratorPromptCache: string | null = null;
-function getOrchestratorPrompt(): string {
-	if (orchestratorPromptCache === null) {
-		orchestratorPromptCache = readFileSync(
-			join(ASSETS_DIR, "orchestrator.md"),
-			"utf8",
-		).trim();
+function getOrchestratorPromptImpl(pathOverride?: string): string {
+	const path = pathOverride ?? join(ASSETS_DIR, "orchestrator.md");
+	try {
+		return readFileSync(path, "utf8").trim();
+	} catch (error) {
+		// Fallback if file is missing or unreadable
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+			return "";
+		}
+		// For permission denied or other errors, also return empty to avoid crash
+		return "";
 	}
-	return orchestratorPromptCache;
+}
+
+function getOrchestratorPrompt(): string {
+	return getOrchestratorPromptImpl();
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -1900,6 +1907,57 @@ async function applyReviewGate(
 	};
 }
 
+const GENTLE_HARNESS_REMINDER_CONTENT = `<gentle-harness-reminder>
+Active discipline (el Gentleman harness):
+- Keep the parent session as orchestrator; delegate exploration, implementation, and review to subagents when available.
+- For non-trivial work, anchor decisions in SDD/OpenSpec artifacts, not floating chat context.
+- Single-writer discipline: never run parallel writes without explicit user-approved isolation.
+- With tests present, follow strict TDD evidence: RED, GREEN, TRIANGULATE, REFACTOR.
+- Protect the reviewer: keep changes small; surface review-workload risk before expanding scope.
+- Never fabricate persistent memory or capabilities; report failures honestly.
+</gentle-harness-reminder>`;
+
+const POST_COMPACTION_REMINDER_CONTENT = `Context was just compacted: earlier conversation details now exist only as a summary.
+Re-check current SDD/OpenSpec state on disk before continuing multi-step work, and restate scope and acceptance criteria for the active task before further changes.`;
+
+// Module-scoped, but safe across sessions: Pi loads extensions with jiti
+// moduleCache:false, so each session/runner re-evaluates this module and gets
+// its own `compactionPending`. There is one ExtensionRunner per agent session,
+// and the flag is reset on session_start. No shared mutable state across
+// concurrent sessions, so no cross-session race.
+let compactionPending = false;
+
+function buildContextReminder() {
+	const baseContent = GENTLE_HARNESS_REMINDER_CONTENT;
+	let fullContent = baseContent;
+
+	if (compactionPending) {
+		fullContent = `${baseContent}\n\n${POST_COMPACTION_REMINDER_CONTENT}`;
+		compactionPending = false;
+	}
+
+	return {
+		role: "custom" as const,
+		customType: "gentle-harness-reminder",
+		content: fullContent,
+		display: false,
+		timestamp: Date.now(),
+	};
+}
+
+function applyHarnessReminder(
+	messages: Array<{ customType?: string; role?: string } | unknown>,
+): unknown[] {
+	// Strip all existing reminders and append fresh one
+	// This ensures exactly one reminder per context event and resets compactionPending flag
+	const filtered = messages.filter((msg) => {
+		if (!isRecord(msg)) return true;
+		return (msg as Record<string, unknown>).customType !== "gentle-harness-reminder";
+	});
+	filtered.push(buildContextReminder());
+	return filtered;
+}
+
 /** @internal */
 export const __testing = {
 	listAgentsFromDir,
@@ -1909,7 +1967,24 @@ export const __testing = {
 	buildGentlePrompt,
 	classifyReviewEvent,
 	parseNumstat,
+	getOrchestratorPrompt: (pathOverride?: string) =>
+		getOrchestratorPromptImpl(pathOverride),
+	buildContextReminder,
+	applyHarnessReminder,
+	setCompactionPending: (value: boolean) => {
+		compactionPending = value;
+	},
+	getCompactionPending: () => compactionPending,
+	getAgentSlimRules: () => AGENT_SLIM_RULES,
 };
+
+const AGENT_SLIM_RULES = `## Gentle Agent Rules
+You operate inside the el Gentleman harness as a delegated agent.
+- Stay strictly within your assigned scope; do not expand the task.
+- Never run destructive commands (rm -rf on broad paths, git reset --hard, force push) without explicit instruction.
+- With tests present, provide TDD evidence: failing test first, then the implementation that makes it pass.
+- Do not spawn further orchestration; execute your role and return.
+- Report results honestly, including failures and skipped steps.`;
 
 export default function gentleAi(pi: ExtensionAPI): void {
 	function runSddPreflight(ctx: ExtensionContext): Promise<SddPreflightPreferences> {
@@ -1922,6 +1997,8 @@ export default function gentleAi(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		try {
+			// Reset compaction state at session start to prevent reminder leakage across sessions
+			compactionPending = false;
 			const installResult = installSddAssets(ctx.cwd, true);
 			const modelResult = await applySavedModelConfig(ctx);
 			if (ctx.hasUI && modelResult.invalidPath) {
@@ -1947,6 +2024,14 @@ export default function gentleAi(pi: ExtensionAPI): void {
 				);
 			}
 		}
+	});
+
+	pi.on("session_compact", (_event, _ctx) => {
+		compactionPending = true;
+	});
+
+	pi.on("context", (event) => {
+		return { messages: applyHarnessReminder(event.messages) };
 	});
 
 	pi.on("input", async (event, ctx) => {
@@ -1976,7 +2061,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 			}), phase)}`
 			: "";
 		const gentlePrompt = isNamedAgent || isSddAgent
-			? ""
+			? `\n\n${AGENT_SLIM_RULES}`
 			: `\n\n${buildGentlePrompt(readPersonaMode(ctx.cwd))}`;
 		return {
 			systemPrompt: `${event.systemPrompt}${gentlePrompt}${sddPrompt}${nativeStatusPrompt}`,
