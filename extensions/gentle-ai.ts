@@ -120,15 +120,22 @@ function sddLocalOverrideDriftCount(cwd: string): number {
 	return stale;
 }
 
-let orchestratorPromptCache: string | null = null;
-function getOrchestratorPrompt(): string {
-	if (orchestratorPromptCache === null) {
-		orchestratorPromptCache = readFileSync(
-			join(ASSETS_DIR, "orchestrator.md"),
-			"utf8",
-		).trim();
+function getOrchestratorPromptImpl(pathOverride?: string): string {
+	const path = pathOverride ?? join(ASSETS_DIR, "orchestrator.md");
+	try {
+		return readFileSync(path, "utf8").trim();
+	} catch (error) {
+		// Fallback if file is missing or unreadable
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+			return "";
+		}
+		// For permission denied or other errors, also return empty to avoid crash
+		return "";
 	}
-	return orchestratorPromptCache;
+}
+
+function getOrchestratorPrompt(): string {
+	return getOrchestratorPromptImpl();
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -1909,6 +1916,8 @@ export const __testing = {
 	buildGentlePrompt,
 	classifyReviewEvent,
 	parseNumstat,
+	getOrchestratorPrompt: (pathOverride?: string) =>
+		getOrchestratorPromptImpl(pathOverride),
 };
 
 export default function gentleAi(pi: ExtensionAPI): void {
