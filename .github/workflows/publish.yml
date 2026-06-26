@@ -38,5 +38,10 @@ jobs:
       - name: Verify package contents
         run: node scripts/verify-package-files.mjs
 
+      - name: Reinstall with npm for bundled dependency publish
+        run: |
+          rm -rf node_modules
+          npm install --package-lock=false
+
       - name: Publish to npm
         run: npm publish --provenance --access public --tag "${{ inputs.dist-tag }}"
