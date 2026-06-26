@@ -1,3 +1,6 @@
+# Use hoisted node_modules so npm bundledDependencies can be packed for Pi package dependencies.
+nodeLinker: hoisted
+
 # Reject installs of packages published less than 3 days ago (4320 minutes).
 # Supply-chain defense — most malicious packages are caught within a few days.
 minimumReleaseAge: 4320

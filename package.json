@@ -1,6 +1,6 @@
 {
   "name": "gentle-pi",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "Turn Pi into el Gentleman: a senior-architect development harness with SDD/OpenSpec, subagents, strict TDD evidence, review guardrails, and skill discovery.",
   "license": "MIT",
   "type": "module",
@@ -43,7 +43,8 @@
   "pi": {
     "image": "https://cdn.jsdelivr.net/npm/gentle-pi/assets/gentle-logo-only.png",
     "extensions": [
-      "./extensions"
+      "./extensions",
+      "./node_modules/@heyhuynhgiabuu/pi-pretty/dist/index.js"
     ],
     "themes": [
       "./themes"
@@ -56,8 +57,12 @@
     ]
   },
   "dependencies": {
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    "@heyhuynhgiabuu/pi-pretty": "0.6.14"
   },
+  "bundledDependencies": [
+    "@heyhuynhgiabuu/pi-pretty"
+  ],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
