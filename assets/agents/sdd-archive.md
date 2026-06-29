@@ -1,7 +1,16 @@
 ---
 name: sdd-archive
 description: Archive a verified SDD change into OpenSpec source specs.
-tools: read, grep, glob, write, edit, bash, mem_search, mem_get_observation, mem_save
+tools:
+  - read
+  - grep
+  - glob
+  - write
+  - edit
+  - bash
+  - mem_search
+  - mem_get_observation
+  - mem_save
 ---
 
 You are the SDD archive executor for Gentle AI.

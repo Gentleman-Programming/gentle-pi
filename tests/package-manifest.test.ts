@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -59,6 +59,42 @@ test("package manifest installs pi-pretty through a wrapper without bundling nat
 	);
 });
 
+
+function readAgentFrontmatter(file: string): string {
+	const source = readFileSync(file, "utf8");
+	const match = source.match(/^---\n([\s\S]*?)\n---/);
+	assert.ok(match, `${file} must have frontmatter`);
+	return match[1];
+}
+
+test("packaged agents use YAML list syntax for tool allowlists", () => {
+	const agentsDir = join(PACKAGE_ROOT, "assets", "agents");
+	const agentFiles = readdirSync(agentsDir).flatMap((entry) =>
+		entry.endsWith(".md") ? [join(agentsDir, entry)] : [],
+	);
+
+	assert.ok(agentFiles.length > 0, "gentle-pi must ship packaged agents");
+
+	for (const file of agentFiles) {
+		const frontmatter = readAgentFrontmatter(file);
+		assert.doesNotMatch(
+			frontmatter,
+			/^tools:\s*[^\n,]+(?:,\s*[^\n,]+)+$/m,
+			`${file} must not use comma-separated inline tools; pi-subagents expects a YAML list`,
+		);
+		assert.match(frontmatter, /^tools:\n(?: {2}- [\w-]+\n?)+/m, `${file} must declare tools as a YAML list`);
+	}
+});
+
+test("jd-fix-agent packaged allowlist includes write tools", () => {
+	const frontmatter = readAgentFrontmatter(
+		join(PACKAGE_ROOT, "assets", "agents", "jd-fix-agent.md"),
+	);
+
+	for (const tool of ["read", "edit", "write", "bash"]) {
+		assert.match(frontmatter, new RegExp(`^  - ${tool}$`, "m"));
+	}
+});
 
 test("pi-pretty wrapper uses real package path resolution for pnpm symlink installs", () => {
 	const wrapper = readFileSync(

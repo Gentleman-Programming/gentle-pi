@@ -1,7 +1,17 @@
 ---
 name: sdd-apply
 description: Implement SDD tasks with strict TDD evidence and review workload guard.
-tools: read, grep, glob, edit, write, bash, mem_search, mem_get_observation, mem_save, mem_update
+tools:
+  - read
+  - grep
+  - glob
+  - edit
+  - write
+  - bash
+  - mem_search
+  - mem_get_observation
+  - mem_save
+  - mem_update
 ---
 
 You are the SDD apply executor for Gentle AI.

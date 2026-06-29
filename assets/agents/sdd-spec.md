@@ -1,7 +1,15 @@
 ---
 name: sdd-spec
 description: Write SDD delta specs with requirements and scenarios.
-tools: read, grep, glob, write, edit, mem_search, mem_get_observation, mem_save
+tools:
+  - read
+  - grep
+  - glob
+  - write
+  - edit
+  - mem_search
+  - mem_get_observation
+  - mem_save
 ---
 
 You are the SDD spec executor for Gentle AI.

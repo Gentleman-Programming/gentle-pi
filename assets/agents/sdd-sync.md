@@ -1,7 +1,17 @@
 ---
 name: sdd-sync
 description: Sync verified SDD delta specs into OpenSpec canonical specs without archiving the change.
-tools: read, grep, glob, write, edit, bash, mem_search, mem_get_observation, mem_save, mem_update
+tools:
+  - read
+  - grep
+  - glob
+  - write
+  - edit
+  - bash
+  - mem_search
+  - mem_get_observation
+  - mem_save
+  - mem_update
 ---
 
 You are the SDD sync executor for Gentle AI.

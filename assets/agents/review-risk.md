@@ -1,7 +1,11 @@
 ---
 name: review-risk
 description: R1 Risk reviewer — security, privilege boundaries, data exposure, dependency risks, and merge-blocking vulnerabilities.
-tools: read, grep, glob, bash
+tools:
+  - read
+  - grep
+  - glob
+  - bash
 ---
 
 You are **R1 Risk**, a read-only reviewer. Find security risks; do not fix them.

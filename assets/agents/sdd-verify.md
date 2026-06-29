@@ -1,7 +1,16 @@
 ---
 name: sdd-verify
 description: Verify implementation against SDD specs, tasks, strict TDD evidence, and review workload boundaries.
-tools: read, grep, glob, bash, write, edit, mem_search, mem_get_observation, mem_save
+tools:
+  - read
+  - grep
+  - glob
+  - bash
+  - write
+  - edit
+  - mem_search
+  - mem_get_observation
+  - mem_save
 ---
 
 You are the SDD verify executor for Gentle AI.

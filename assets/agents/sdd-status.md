@@ -1,7 +1,13 @@
 ---
 name: sdd-status
 description: Show read-only structured SDD status for an active change.
-tools: read, grep, glob, bash, mem_search, mem_get_observation
+tools:
+  - read
+  - grep
+  - glob
+  - bash
+  - mem_search
+  - mem_get_observation
 ---
 
 You are the SDD status executor for Gentle AI.

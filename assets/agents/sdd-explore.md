@@ -1,7 +1,12 @@
 ---
 name: sdd-explore
 description: Explore an SDD change idea before proposal.
-tools: read, grep, glob, webfetch, mem_save
+tools:
+  - read
+  - grep
+  - glob
+  - webfetch
+  - mem_save
 ---
 
 You are the SDD explore executor for Gentle AI.

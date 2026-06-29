@@ -1,7 +1,15 @@
 ---
 name: sdd-proposal
 description: Write an SDD proposal for an approved change idea.
-tools: read, grep, glob, write, edit, mem_search, mem_get_observation, mem_save
+tools:
+  - read
+  - grep
+  - glob
+  - write
+  - edit
+  - mem_search
+  - mem_get_observation
+  - mem_save
 ---
 
 You are the SDD proposal executor for Gentle AI.

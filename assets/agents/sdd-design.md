@@ -1,7 +1,15 @@
 ---
 name: sdd-design
 description: Design the technical approach for an SDD change.
-tools: read, grep, glob, write, edit, mem_search, mem_get_observation, mem_save
+tools:
+  - read
+  - grep
+  - glob
+  - write
+  - edit
+  - mem_search
+  - mem_get_observation
+  - mem_save
 ---
 
 You are the SDD design executor for Gentle AI.
