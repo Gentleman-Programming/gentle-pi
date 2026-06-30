@@ -222,7 +222,7 @@ Rules:
 - `sdd-apply`, `sdd-verify`, `sdd-sync`, and `sdd-archive` must obey parent-provided native status; they must not reconstruct readiness from prompt inference when status JSON is present.
 - Do not launch a phase when native status marks that dependency `blocked`.
 - `sdd-archive` cannot proceed unless native status says `dependencies.archive` is `ready` or `all_done` — UNLESS the store carve-out is active (`nextRecommended: "resolve-via-engram"`), in which case resolve archive readiness from Engram instead of treating `not_applicable` as a gate failure.
-- **Non-authoritative store carve-out:** when `nextRecommended: "resolve-via-engram"` is set, native status is **not authoritative**. This applies to `artifactStore: engram`, `artifactStore: none`, and `artifactStore: both` when the `openspec/` directory does not exist. For non-authoritative stores: resolve readiness from Engram using `mem_search` + `mem_get_observation` on the change topic keys (`sdd/{change-name}/proposal`, `sdd/{change-name}/spec`, `sdd/{change-name}/design`, `sdd/{change-name}/tasks`, etc.). Do **not** treat `blockedReasons` or `not_applicable` dependency states from the native engine as real blockers when the store carve-out is active.
+- **Non-authoritative store carve-out:** when `nextRecommended: "resolve-via-engram"` is set, native status is **not authoritative**. This applies to `artifactStore: engram`, `artifactStore: none`, and `artifactStore: both` when the `openspec/` directory does not exist. For non-authoritative stores: resolve readiness from Engram using the Engram memory tools injected by the memory provider on the change topic keys (`sdd/{change-name}/proposal`, `sdd/{change-name}/spec`, `sdd/{change-name}/design`, `sdd/{change-name}/tasks`, etc.). Do **not** treat `blockedReasons` or `not_applicable` dependency states from the native engine as real blockers when the store carve-out is active.
 
 ## SDD Status Contract
 
@@ -292,8 +292,8 @@ When Engram or another callable memory package is available, the parent owns con
 
 ### Non-SDD delegation
 
-- Read context: the parent/orchestrator searches memory (`mem_search`), selects relevant observations, and passes them into the subagent prompt. The subagent does NOT search memory itself.
-- Write context: the subagent MUST save significant discoveries, decisions, or bug fixes via `mem_save` before returning when memory tools are available.
+- Read context: the parent/orchestrator searches memory (the injected Engram search tool), selects relevant observations, and passes them into the subagent prompt. The subagent does NOT search memory itself.
+- Write context: the subagent MUST save significant discoveries, decisions, or bug fixes via the injected Engram save tool before returning when memory tools are available.
 - Prompt forwarding: when delegating, add a concrete instruction such as: `If you make important discoveries, decisions, or fix bugs, save them to Engram via the available memory save tool with project: '<project>' before returning.`
 
 ### SDD phases
@@ -318,12 +318,12 @@ Each SDD phase subagent reads its own required inputs directly from the active b
 
 Memory lifecycle rule (when Engram exposes lifecycle metadata/tooling):
 
-- At session start or before architecture-sensitive work, call `mem_review` with action `list` for the current project when the tool is available.
-- If `mem_review` is unavailable, do not fail the task. Continue with normal `mem_context`/`mem_search`, and still apply lifecycle metadata from any returned observations when present.
+- At session start or before architecture-sensitive work, call the injected Engram review tool with action `list` for the current project when the tool is available.
+- If the injected Engram review tool is unavailable, do not fail the task. Continue with the injected Engram context/search tools, and still apply lifecycle metadata from any returned observations when present.
 - `active` memories may be used normally.
 - `needs_review` memories are stale context, not trusted facts.
 - When a retrieved memory is marked `needs_review`, surface that stale context to the user and verify it against current evidence before relying on it.
-- Do NOT call `mem_review` with action `mark_reviewed` automatically. Only call `mark_reviewed` after explicit user confirmation or through a dedicated memory maintenance command.
+- Do NOT call the injected Engram review tool with action `mark_reviewed` automatically. Only call `mark_reviewed` after explicit user confirmation or through a dedicated memory maintenance command.
 
 ## Execution Mode
 

@@ -26,15 +26,15 @@ If skill paths are missing, explicit fallback loading is allowed only as degrade
 
 Read your own input artifacts directly from the active backend before doing the phase work; do not wait for the parent to inline them. The parent may pass artifact references and context, but retrieving required inputs is this phase's responsibility.
 
-Inputs to read (`engram`/`both`: `mem_search("<topic-key>")` then `mem_get_observation`; `openspec`: read the file under `openspec/changes/{change}/`):
+Inputs to read (`engram`/`both`: use the injected Engram memory read tools for the topic key, then fetch the full observation; `openspec`: read the file under `openspec/changes/{change}/`):
 - Tasks (required): `sdd/{change}/tasks`
 - Spec (required): `sdd/{change}/spec`
 - Design (required): `sdd/{change}/design`
 - Previous apply-progress (if it exists): `sdd/{change}/apply-progress` — read and MERGE with your new progress; do NOT overwrite.
 
 Persist this phase's artifact to the active backend before returning (mandatory):
-- `engram`/`both`: call `mem_save` with title and `topic_key` `"sdd/{change}/apply-progress"`, `type: "architecture"`, `project` from context, and `capture_prompt: false` when the tool schema supports it (omit the field if an older schema rejects it).
-- Also update the tasks artifact checkboxes via `mem_update` (`engram`/`both`) or file edit (`openspec`).
+- `engram`/`both`: call the injected Engram save tool with title and `topic_key` `"sdd/{change}/apply-progress"`, `type: "architecture"`, `project` from context, and `capture_prompt: false` when the tool schema supports it (omit the field if an older schema rejects it).
+- Also update the tasks artifact checkboxes via the injected Engram update tool (`engram`/`both`) or file edit (`openspec`).
 - `openspec`: write/update the apply-progress and tasks files under `openspec/changes/{change}/`.
 - `none`: return progress inline.
 
@@ -45,7 +45,7 @@ Never claim persistence you did not perform.
 Before writing code, consume structured SDD status from the parent prompt. If missing, produce the same fields using this lookup order: project override `.pi/gentle-ai/support/sdd-status-contract.md`, then globally installed `~/.pi/agent/gentle-ai/support/sdd-status-contract.md`, then the embedded status contract. Do not use `assets/support/...` as a runtime path; that is only the package source path before installation.
 
 **Non-authoritative store carve-out:** when the native status JSON shows `nextRecommended: "resolve-via-engram"` (covers `artifactStore: engram`, `artifactStore: none`, and `artifactStore: both` without an `openspec/` directory), the status is non-authoritative. Do not treat `applyState`, `dependencies`, or `blockedReasons` from that status as real blockers. Resolve readiness as follows:
-- `engram` (or `both` without openspec/): search Engram for `sdd/{change}/tasks`, `sdd/{change}/spec`, and `sdd/{change}/design` using `mem_search` + `mem_get_observation`. Proceed with implementation once those artifacts are confirmed present.
+- `engram` (or `both` without openspec/): search Engram for `sdd/{change}/tasks`, `sdd/{change}/spec`, and `sdd/{change}/design` using the Engram memory tools injected by the memory provider. Proceed with implementation once those artifacts are confirmed present.
 - `none`: there is no persistent backend. Return artifacts inline and ask the user to provide required inputs (tasks, spec, design) or acknowledge that no persistent artifact store is available.
 
 Stop with `blocked` before editing if:

@@ -26,11 +26,11 @@ If skill paths are missing, explicit fallback loading is allowed only as degrade
 
 Read the change artifacts directly from the active backend before syncing; do not wait for the parent to inline them. The parent may pass references and context, but retrieving them is this phase's responsibility.
 
-Inputs to read (`engram`/`both`: `mem_search("<topic-key>")` then `mem_get_observation`; `openspec`: read the files under `openspec/changes/{change}/`):
+Inputs to read (`engram`/`both`: use the injected Engram memory read tools for the topic key, then fetch the full observation; `openspec`: read the files under `openspec/changes/{change}/`):
 - Core change artifacts: `sdd/{change}/proposal`, `sdd/{change}/spec`, `sdd/{change}/design`, `sdd/{change}/tasks`, and `sdd/{change}/verify-report`.
 
 Persist this phase's artifact to the active backend before returning (mandatory):
-- `engram`/`both`: call `mem_save` with title and `topic_key` `"sdd/{change}/sync-report"`, `type: "architecture"`, `project` from context, and `capture_prompt: false` when the tool schema supports it (omit the field if an older schema rejects it).
+- `engram`/`both`: call the injected Engram save tool with title and `topic_key` `"sdd/{change}/sync-report"`, `type: "architecture"`, `project` from context, and `capture_prompt: false` when the tool schema supports it (omit the field if an older schema rejects it).
 - `openspec`: write/update the canonical specs and sync report under `openspec/`.
 - `none`: return the sync report inline.
 

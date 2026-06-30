@@ -545,7 +545,7 @@ export function renderNativeSddPhasePrompt(status: SddStatus, phase?: SddPhase):
 		? `This status is non-authoritative (artifact store: ${status.artifactStore}). The orchestrator must resolve readiness from Engram instead.`
 		: "The parent/orchestrator resolved this status deterministically. Treat it as authoritative over prompt inference.";
 	const blockLine = isNonAuthoritative
-		? `Do not block phase work based on this status — resolve readiness from Engram using mem_search + mem_get_observation on the change topic keys (sdd/{change}/proposal, sdd/{change}/spec, sdd/{change}/design, sdd/{change}/tasks, etc.) instead.`
+		? `Do not block phase work based on this status — resolve readiness from Engram using the injected Engram memory read tools on the change topic keys (sdd/{change}/proposal, sdd/{change}/spec, sdd/{change}/design, sdd/{change}/tasks, etc.) instead.`
 		: "Do not run phase work when this status marks the phase blocked; return the blockers instead.";
 	return [
 		"## Native SDD Status Engine",
@@ -567,7 +567,7 @@ export function renderSddDispatcherMarkdown(status: SddStatus): string {
 		? [
 				"### Non-authoritative store — resolve via Engram",
 				`This status is non-authoritative (artifact store: ${status.artifactStore}).`,
-				"Resolve readiness directly from Engram using mem_search + mem_get_observation on the change topic keys:",
+				"Resolve readiness directly from Engram using the injected Engram memory read tools on the change topic keys:",
 				`- sdd/${status.changeName ?? "<change>"}/proposal`,
 				`- sdd/${status.changeName ?? "<change>"}/spec`,
 				`- sdd/${status.changeName ?? "<change>"}/design`,

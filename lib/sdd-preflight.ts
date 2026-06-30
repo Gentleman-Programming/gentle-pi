@@ -229,12 +229,7 @@ function hasWritableEngramTool(pi: ExtensionAPI): boolean {
 					: isRecord(tool) && typeof tool.name === "string"
 						? tool.name
 						: "";
-			return (
-				name === "mem_save" ||
-				name === "engram_mem_save" ||
-				name.endsWith(".mem_save") ||
-				name.endsWith(".engram_mem_save")
-			);
+			return name === "mem_save" || name.endsWith(".mem_save");
 		});
 	} catch {
 		return false;

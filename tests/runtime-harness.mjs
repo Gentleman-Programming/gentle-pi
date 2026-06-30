@@ -637,6 +637,17 @@ async function run() {
 		await rm(engramSddCwd, { recursive: true, force: true });
 	}
 
+	const directEngramToolCwd = await tempWorkspace();
+	try {
+		pi.setActiveTools(["read", "bash", "edit", "write", "engram_mem_save"]);
+		const ctx = createCtx(directEngramToolCwd, true, "direct-engram-session");
+		await commands.get("gentle-ai:sdd-preflight").handler("", ctx);
+		assert.deepEqual(ctx.ui.selections[1].options, ["openspec"]);
+	} finally {
+		pi.setActiveTools(["read", "bash", "edit", "write"]);
+		await rm(directEngramToolCwd, { recursive: true, force: true });
+	}
+
 	const installCwd = await tempWorkspace();
 	try {
 		const ctx = createCtx(installCwd, true);
@@ -669,6 +680,9 @@ async function run() {
 		pi.setActiveTools([{ name: "engram.mem_save" }]);
 		await commands.get("gentle-ai:doctor").handler("", ctx);
 		assert.match(ctx.ui.notifications.at(-1).message, /Engram memory tools active/);
+		pi.setActiveTools([{ name: "engram_mem_save" }]);
+		await commands.get("gentle-ai:doctor").handler("", ctx);
+		assert.match(ctx.ui.notifications.at(-1).message, /Engram memory tools not active in this session/);
 		pi.setActiveTools(["read", "bash", "edit", "write"]);
 	} finally {
 		await rm(staleAssetsCwd, { recursive: true, force: true });

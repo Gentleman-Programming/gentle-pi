@@ -22,9 +22,10 @@ If skill paths are missing, explicit fallback loading is allowed only as degrade
 
 ## Memory Contract
 
-This phase is READ-ONLY. Read the change artifacts directly from the active backend to compute status; do not wait for the parent to inline them, and do NOT write or `mem_save` anything.
+This phase is READ-ONLY. Read the change artifacts directly from the active backend to compute status; do not wait for the parent to inline them, and do NOT write files or call the injected Engram save tool.
 
-Inputs to read (`engram`/`both`: `mem_search("<topic-key>")` then `mem_get_observation`; `openspec`: read the files under `openspec/changes/{change}/`):
+Inputs to read (`engram`/`both`: use the injected Engram memory read tools for the topic key, then fetch the full observation; `openspec`: read the files under `openspec/changes/{change}/`):
+
 - Whichever change artifacts are needed to compute status, named `sdd/{change}/<phase>` (proposal, spec, design, tasks, apply-progress, verify-report, sync-report).
 
 Do not persist anything — status is a read-only report. Never claim persistence.
@@ -104,7 +105,7 @@ If parent context reports `workspace-planning` and no `allowedEditRoots`, mark a
 - `sync` is `ready` when verify-report exists and has no unresolved `FAIL`, `BLOCKED`, `CRITICAL`, or verification blockers; it is `not_applicable` for `engram`/`none` modes.
 - `archive` is `ready` only when verify-report is passing, sync-report exists or sync is not applicable, and no unchecked implementation tasks remain. CRITICAL verification issues have no override. Explicit recorded exceptions are limited to non-critical partial archives or stale-checkbox reconciliation when apply-progress/verify-report prove completion.
 
-**Non-authoritative carve-out:** when `nextRecommended: "resolve-via-engram"` or `isNonAuthoritative: true` is set on the status object, the `dependencies`, `applyState`, and `blockedReasons` fields are non-authoritative — they must not be treated as real blockers. This condition applies when the artifact store is `engram`, `none`, or `both` without an `openspec/` directory present on disk. For `engram`/`both-without-openspec`, resolve readiness directly from Engram using `mem_search` + `mem_get_observation` on the change topic keys (`sdd/{change}/proposal`, `sdd/{change}/spec`, `sdd/{change}/design`, `sdd/{change}/tasks`, etc.). For `none`, return inline status or ask the user — do not use the engine's `not_applicable`/`blockedReasons` as real gate failures.
+**Non-authoritative carve-out:** when `nextRecommended: "resolve-via-engram"` or `isNonAuthoritative: true` is set on the status object, the `dependencies`, `applyState`, and `blockedReasons` fields are non-authoritative — they must not be treated as real blockers. This condition applies when the artifact store is `engram`, `none`, or `both` without an `openspec/` directory present on disk. For `engram`/`both-without-openspec`, resolve readiness directly from Engram using the Engram memory tools injected by the memory provider on the change topic keys (`sdd/{change}/proposal`, `sdd/{change}/spec`, `sdd/{change}/design`, `sdd/{change}/tasks`, etc.). For `none`, return inline status or ask the user — do not use the engine's `not_applicable`/`blockedReasons` as real gate failures.
 
 ## Output
 

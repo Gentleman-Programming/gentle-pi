@@ -43,7 +43,6 @@ import {
 } from "../lib/sdd-status.ts";
 import {
 	evaluateEvent,
-	matchPathGlobs,
 	type ChangedDiff,
 	type TriggerEvent,
 } from "../lib/review-triggers.ts";
@@ -217,14 +216,6 @@ const DENIED_BASH_PATTERNS: RegExp[] = [
 	new RegExp(String.raw`\bgit${GIT_GLOBAL_FLAGS_SRC}push\b(?=[^\n]*\s-[^\s-]*f)`),
 	/\bchmod\s+-R\s+777\b/,
 	/\bchown\s+-R\b/,
-];
-
-const CONFIRM_BASH_PATTERNS: RegExp[] = [
-	/\bgit\s+push\b/,
-	/\bgit\s+rebase\b/,
-	/\bgit\s+branch\s+(?:-[a-zA-Z]*D[a-zA-Z]*|-[a-zA-Z]*d[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*d[a-zA-Z]*|--delete\b[^\n]*--force\b|--force\b[^\n]*--delete\b)/,
-	/\bnpm\s+publish\b/,
-	/\bpi\s+remove\b/,
 ];
 
 // ---------------------------------------------------------------------------
@@ -577,12 +568,7 @@ function hasWritableEngramTool(pi: ExtensionAPI): boolean {
 					: isRecord(tool) && typeof tool.name === "string"
 						? tool.name
 						: "";
-			return (
-				name === "mem_save" ||
-				name === "engram_mem_save" ||
-				name.endsWith(".mem_save") ||
-				name.endsWith(".engram_mem_save")
-			);
+			return name === "mem_save" || name.endsWith(".mem_save");
 		});
 	} catch {
 		return false;
@@ -1992,7 +1978,7 @@ function computeDiffForEvent(event: TriggerEvent, cwd: string): ChangedDiff | nu
 	const gitOpts = {
 		cwd,
 		encoding: "utf8" as const,
-		stdio: ["pipe", "pipe", "pipe"] as const,
+		stdio: "pipe" as const,
 		// Bound synchronous git calls so a slow/large repo cannot freeze the extension process.
 		// The existing outer try/catch returns null (fail-open) when this throws.
 		timeout: 2000,

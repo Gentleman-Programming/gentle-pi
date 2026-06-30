@@ -95,7 +95,7 @@ The orchestrator MUST carry `actionContext` into any phase launch.
 ## Engine Authority by Store
 
 - `openspec` and `both` (when `openspec/` directory exists): the native status engine resolves artifact state from disk and is authoritative. Phase executors must obey it.
-- `engram`, `none`, and `both` (when `openspec/` directory does NOT exist): the native status engine cannot read Engram artifacts. It returns `nextRecommended: "resolve-via-engram"` and empty `blockedReasons`. This output is **non-authoritative**. The orchestrator must resolve readiness directly from Engram using `mem_search` + `mem_get_observation` on the change topic keys (`sdd/{change-name}/proposal`, `sdd/{change-name}/spec`, etc.) instead of relying on the engine's dependency states. The `artifactStore` field still reflects the real chosen store value (e.g. `"both"`) and must not be rewritten.
+- `engram`, `none`, and `both` (when `openspec/` directory does NOT exist): the native status engine cannot read Engram artifacts. It returns `nextRecommended: "resolve-via-engram"` and empty `blockedReasons`. This output is **non-authoritative**. The orchestrator must resolve readiness directly from Engram using the Engram memory tools injected by the memory provider on the change topic keys (`sdd/{change-name}/proposal`, `sdd/{change-name}/spec`, etc.) instead of relying on the engine's dependency states. The `artifactStore` field still reflects the real chosen store value (e.g. `"both"`) and must not be rewritten.
 
 ## Status Output
 

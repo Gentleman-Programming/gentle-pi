@@ -42,11 +42,11 @@ If skill paths are missing, explicit fallback loading is allowed only as degrade
 
 Read your own input artifacts directly from the active backend before doing the phase work; do not wait for the parent to inline them. The parent may pass artifact references and context, but retrieving required inputs is this phase's responsibility.
 
-Inputs to read (`engram`/`both`: `mem_search("<topic-key>")` then `mem_get_observation`; `openspec`: read the file under `openspec/changes/{change}/`):
+Inputs to read (`engram`/`both`: use the injected Engram memory read tools for the topic key, then fetch the full observation; `openspec`: read the file under `openspec/changes/{change}/`):
 - Exploration (optional): `sdd/{change}/explore`
 
 Persist this phase's artifact to the active backend before returning (mandatory):
-- `engram`/`both`: call `mem_save` with title and `topic_key` `"sdd/{change}/proposal"`, `type: "architecture"`, `project` from context, and `capture_prompt: false` when the tool schema supports it (omit the field if an older schema rejects it).
+- `engram`/`both`: call the injected Engram save tool with title and `topic_key` `"sdd/{change}/proposal"`, `type: "architecture"`, `project` from context, and `capture_prompt: false` when the tool schema supports it (omit the field if an older schema rejects it).
 - `openspec`: write/update `openspec/changes/{change}/proposal.md`.
 - `none`: return the proposal inline.
 
