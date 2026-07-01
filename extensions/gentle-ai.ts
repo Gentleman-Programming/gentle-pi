@@ -123,12 +123,18 @@ function sddLocalOverrideDriftCount(cwd: string): number {
 }
 
 let orchestratorPromptCache: string | null = null;
+function getSddWorkflowPath(): string {
+	return join(ASSETS_DIR, "sdd-orchestrator-workflow.md");
+}
+
 function getOrchestratorPrompt(): string {
 	if (orchestratorPromptCache === null) {
 		orchestratorPromptCache = readFileSync(
 			join(ASSETS_DIR, "orchestrator.md"),
 			"utf8",
-		).trim();
+		)
+			.replaceAll("{{GENTLE_PI_SDD_WORKFLOW_PATH}}", getSddWorkflowPath())
+			.trim();
 	}
 	return orchestratorPromptCache;
 }

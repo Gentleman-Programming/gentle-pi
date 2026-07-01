@@ -146,6 +146,21 @@ test("SDD chain assets distinguish interactive gates from auto execution", async
 	assert.match(fullChain, /must stop at each phase boundary/i);
 });
 
+test("orchestrator lazy-loads detailed SDD workflow", async () => {
+	const orchestrator = await readFile(join(ROOT, "assets/orchestrator.md"), "utf8");
+	const workflow = await readFile(join(ROOT, "assets/sdd-orchestrator-workflow.md"), "utf8");
+
+	assert.match(orchestrator, /## SDD Workflow \(lazy-loaded\)/);
+	assert.match(orchestrator, /\{\{GENTLE_PI_SDD_WORKFLOW_PATH\}\}/);
+	assert.doesNotMatch(orchestrator, /## Native SDD Dispatcher/);
+	assert.match(workflow, /## Native SDD Dispatcher/);
+	assert.match(workflow, /## SDD Status Contract/);
+	assert.match(workflow, /## Execution Mode/);
+	assert.match(workflow, /## Strict TDD Forwarding/);
+	assert.match(workflow, /## Review Workload Guard/);
+	assert.match(workflow, /## Result Contract/);
+});
+
 test("persistent harness prompt assets do not hardcode Spanish SDD artifact copy", async () => {
 	const files = [
 		...(await collectTextFiles(join(ROOT, "assets"))),

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -112,6 +112,36 @@ test("uniqueExistingDirs normalizes duplicates and ignores missing roots", async
 		await __testing.uniqueExistingDirs([existing, join(root, "skills/"), join(root, "missing")]),
 		[existing],
 	);
+});
+
+test("findSkillFiles scans one skill directory level only", async () => {
+	const root = join(tmpdir(), `gentle-pi-shallow-${Date.now()}`);
+	const skillPath = join(root, "docs", "SKILL.md");
+	const nestedSkillPath = join(root, "fixtures", "nested", "SKILL.md");
+	mkdirSync(dirname(skillPath), { recursive: true });
+	mkdirSync(dirname(nestedSkillPath), { recursive: true });
+	writeFileSync(skillPath, "---\nname: docs\ndescription: Docs.\n---\n");
+	writeFileSync(nestedSkillPath, "---\nname: nested\ndescription: Nested fixture.\n---\n");
+
+	assert.deepEqual(await __testing.findSkillFiles(root), [skillPath]);
+});
+
+test("findSkillFiles follows symlinked skill directories", async (t) => {
+	const root = join(tmpdir(), `gentle-pi-symlink-root-${Date.now()}`);
+	const realSkillDir = join(tmpdir(), `gentle-pi-symlink-target-${Date.now()}`);
+	const linkedSkillDir = join(root, "linked");
+	const skillPath = join(linkedSkillDir, "SKILL.md");
+	mkdirSync(root, { recursive: true });
+	mkdirSync(realSkillDir, { recursive: true });
+	writeFileSync(join(realSkillDir, "SKILL.md"), "---\nname: linked\ndescription: Linked skill.\n---\n");
+	try {
+		symlinkSync(realSkillDir, linkedSkillDir, "dir");
+	} catch (error) {
+		t.skip(`symlink creation unavailable: ${error instanceof Error ? error.message : String(error)}`);
+		return;
+	}
+
+	assert.deepEqual(await __testing.findSkillFiles(root), [skillPath]);
 });
 
 test("skill registry watchers close on shutdown", async () => {

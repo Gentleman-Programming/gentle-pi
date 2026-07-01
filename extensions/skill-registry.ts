@@ -21,7 +21,7 @@ const EXCLUDE_NAMES = new Set(["_shared", "skill-registry"]);
 const EXCLUDE_PREFIXES = ["sdd-"];
 const ATL_IGNORE_ENTRY = ".atl/";
 const WATCH_DEBOUNCE_MS = 500;
-const REGISTRY_SCHEMA_VERSION = 5;
+const REGISTRY_SCHEMA_VERSION = 6;
 const NO_SKILL_REGISTRY_FLAG = "no-skill-registry";
 const NO_SKILL_REGISTRY_ENV = "GENTLE_PI_NO_SKILL_REGISTRY";
 const LEGACY_PROJECT_REGISTRY_REL_PATH = ".pi/extensions/skill-registry.ts";
@@ -96,23 +96,30 @@ function projectSkillDirs(cwd: string): string[] {
 
 async function findSkillFiles(root: string): Promise<string[]> {
 	if (!(await pathExists(root))) return [];
+	let entries;
+	try {
+		entries = await readdir(root, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+
 	const out: string[] = [];
-	const stack: string[] = [root];
-	while (stack.length > 0) {
-		const dir = stack.pop()!;
-		let entries;
+	for (const entry of entries) {
+		const skillDir = join(root, entry.name);
+		let dirInfo;
 		try {
-			entries = await readdir(dir, { withFileTypes: true });
+			dirInfo = await stat(skillDir);
 		} catch {
 			continue;
 		}
-		for (const entry of entries) {
-			const full = join(dir, entry.name);
-			if (entry.isDirectory()) {
-				stack.push(full);
-			} else if (entry.isFile() && entry.name === "SKILL.md") {
-				out.push(full);
-			}
+		if (!dirInfo.isDirectory()) continue;
+
+		const candidate = join(skillDir, "SKILL.md");
+		try {
+			const skillInfo = await stat(candidate);
+			if (skillInfo.isFile()) out.push(candidate);
+		} catch {
+			// Missing or unreadable skill files are ignored; the registry is best-effort.
 		}
 	}
 	return out.sort();
@@ -512,6 +519,7 @@ async function startSkillRegistryWatcher(
 export const __testing = {
 	projectSkillDirs,
 	userSkillDirs,
+	findSkillFiles,
 	uniqueExistingDirs,
 	dedupeBySkillName,
 	scopeForPath,
