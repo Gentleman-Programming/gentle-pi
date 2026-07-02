@@ -132,6 +132,10 @@ skill_resolution
 
 The parent should synthesize these envelopes, not paste long raw reports unless needed.
 
+## SDD Phase Delegation Mode
+
+Launch SDD phase subagents with `subagent_run` `mode: "task"` when the parent needs the phase result to route the next step. Do not use `mode: "background"` for SDD phases that must feed continuation; background completion is a notification/history mechanism, not an orchestration resume guarantee.
+
 ## Strict TDD Forwarding
 
 For `sdd-apply` and `sdd-verify`, read `openspec/config.yaml` when present.

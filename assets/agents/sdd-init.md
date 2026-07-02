@@ -7,6 +7,7 @@ tools:
   - grep
   - glob
   - write
+  - edit
   - bash
   - mem_search
   - mem_get_observation

@@ -93,33 +93,26 @@ function sddGlobalAssetDriftCount(): number {
 	return stale;
 }
 
-function sddLocalOverrideDriftCount(cwd: string): number {
-	let stale = 0;
-	for (const [assetSubdir, installedSubdir] of [
-		["agents", join(".pi", "agents")],
-		["chains", join(".pi", "chains")],
-		["support", join(".pi", "gentle-ai", "support")],
-	] as const) {
-		const assetDir = join(ASSETS_DIR, assetSubdir);
-		const installedDir = join(cwd, installedSubdir);
-		if (!existsSync(assetDir) || !existsSync(installedDir)) continue;
-		for (const entry of readdirSync(assetDir, { withFileTypes: true })) {
-			if (!entry.isFile()) continue;
-			const installedPath = join(installedDir, entry.name);
-			if (!existsSync(installedPath)) continue;
-			try {
-				if (
-					readFileSync(join(assetDir, entry.name), "utf8") !==
-					readFileSync(installedPath, "utf8")
-				) {
-					stale += 1;
-				}
-			} catch {
-				stale += 1;
-			}
+function sddLocalAgentOverrideCount(cwd: string): number {
+	const packageSddAgentsDir = join(ASSETS_DIR, "agents");
+	const packageSddAgentNames = existsSync(packageSddAgentsDir)
+		? new Set(
+				readdirSync(packageSddAgentsDir, { withFileTypes: true })
+					.filter((entry) => entry.isFile() && /^sdd-.*\.md$/i.test(entry.name))
+					.map((entry) => entry.name),
+			)
+		: new Set<string>();
+	let count = 0;
+	for (const installedDir of [
+		join(cwd, ".pi", "agents"),
+		join(cwd, ".pi", "subagents"),
+	]) {
+		if (!existsSync(installedDir)) continue;
+		for (const entry of readdirSync(installedDir, { withFileTypes: true })) {
+			if (entry.isFile() && packageSddAgentNames.has(entry.name)) count += 1;
 		}
 	}
-	return stale;
+	return count;
 }
 
 let orchestratorPromptCache: string | null = null;
@@ -2302,7 +2295,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 				join(ctx.cwd, ".atl", "skill-registry.md"),
 			);
 			const staleSddAssets = sddGlobalAssetDriftCount();
-			const staleLocalOverrides = sddLocalOverrideDriftCount(ctx.cwd);
+			const localSddAgentOverrides = sddLocalAgentOverrideCount(ctx.cwd);
 			const modelConfig = await readSavedModelConfigAsync(ctx.cwd);
 			const engramActive = hasWritableEngramTool(pi);
 			const lines = [
@@ -2310,7 +2303,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 				`${agentsInstalled ? "pass" : "fail"}: Global SDD agents ${agentsInstalled ? "installed" : "missing"}`,
 				`${chainsInstalled ? "pass" : "fail"}: Global SDD chains ${chainsInstalled ? "installed" : "missing"}`,
 				`${staleSddAssets === 0 ? "pass" : "warn"}: Global SDD asset drift ${staleSddAssets} file(s)`,
-				`${staleLocalOverrides === 0 ? "pass" : "warn"}: Project-local SDD override drift ${staleLocalOverrides} file(s)`,
+				`${localSddAgentOverrides === 0 ? "pass" : "warn"}: Project-local SDD agent overrides ${localSddAgentOverrides} file(s)`,
 				`${openspecConfigured ? "pass" : "warn"}: OpenSpec config ${openspecConfigured ? "present" : "missing"}`,
 				`${skillRegistryPresent ? "pass" : "warn"}: Skill registry ${skillRegistryPresent ? "present" : "missing"}`,
 				`${modelConfig.status === "invalid" ? "fail" : "pass"}: Global model config ${modelConfig.status}`,
@@ -2322,6 +2315,9 @@ export default function gentleAi(pi: ExtensionAPI): void {
 			}
 			if (modelConfig.status === "invalid") {
 				lines.push(`remedy: fix or remove ${modelConfig.path}`);
+			}
+			if (localSddAgentOverrides > 0) {
+				lines.push("remedy: remove project-local SDD agent overrides unless intentionally debugging package assets");
 			}
 			ctx.ui.notify(
 				lines.join("\n"),
@@ -2343,7 +2339,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 				join(ctx.cwd, "openspec", "config.yaml"),
 			);
 			const staleSddAssets = sddGlobalAssetDriftCount();
-			const staleLocalOverrides = sddLocalOverrideDriftCount(ctx.cwd);
+			const localSddAgentOverrides = sddLocalAgentOverrideCount(ctx.cwd);
 			const modelConfig = await readModelConfigAsync(ctx.cwd);
 			ctx.ui.notify(
 				[
@@ -2356,16 +2352,16 @@ export default function gentleAi(pi: ExtensionAPI): void {
 							? " — run /gentle-ai:install-sdd --force to refresh intentionally"
 							: ""
 					}`,
-					`Project-local SDD override drift: ${staleLocalOverrides} file(s)${
-						staleLocalOverrides > 0
-							? " — run /gentle-ai:install-sdd --force only if you intentionally want to replace local overrides"
+					`Project-local SDD agent overrides: ${localSddAgentOverrides} file(s)${
+						localSddAgentOverrides > 0
+							? " — local SDD agents shadow package assets; remove them unless intentionally debugging"
 							: ""
 					}`,
 					`OpenSpec config: ${openspecConfigured ? "present" : "missing"}`,
 					`Global model config: ${existsSync(modelConfigPath(ctx.cwd)) ? "present" : "missing"}`,
 					...describeModelConfig(ctx.cwd, modelConfig),
 				].join("\n"),
-				staleSddAssets > 0 || staleLocalOverrides > 0 ? "warning" : "info",
+				staleSddAssets > 0 || localSddAgentOverrides > 0 ? "warning" : "info",
 			);
 		},
 	});

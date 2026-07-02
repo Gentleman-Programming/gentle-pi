@@ -673,12 +673,13 @@ async function run() {
 		await mkdir(join(staleAssetsCwd, ".pi", "gentle-ai", "support"), { recursive: true });
 		await writeFile(join(staleAssetsCwd, ".pi", "agents", "sdd-apply.md"), "stale apply\n");
 		await writeFile(join(staleAssetsCwd, ".pi", "agents", "sdd-spec.md"), "stale spec\n");
+		await writeFile(join(staleAssetsCwd, ".pi", "agents", "sdd-custom-debug.md"), "custom debug agent\n");
 		await writeFile(join(staleAssetsCwd, ".pi", "chains", "sdd-full.chain.md"), "stale chain\n");
 		await writeFile(join(staleAssetsCwd, ".pi", "gentle-ai", "support", "sdd-status-contract.md"), "stale status contract\n");
 		const ctx = createCtx(staleAssetsCwd, true);
 		await commands.get("gentle-ai:status").handler("", ctx);
-		assert.match(ctx.ui.notifications.at(-1).message, /Project-local SDD override drift: \d+ file\(s\)/);
-		assert.match(ctx.ui.notifications.at(-1).message, /gentle-ai:install-sdd --force/);
+		assert.match(ctx.ui.notifications.at(-1).message, /Project-local SDD agent overrides: 2 file\(s\)/);
+		assert.match(ctx.ui.notifications.at(-1).message, /local SDD agents shadow package assets/);
 		await commands.get("gentle-ai:doctor").handler("", ctx);
 		assert.match(ctx.ui.notifications.at(-1).message, /el Gentleman doctor/);
 		assert.match(ctx.ui.notifications.at(-1).message, /Sensitive-path guard active/);

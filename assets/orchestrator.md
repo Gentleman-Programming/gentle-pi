@@ -82,7 +82,12 @@ Examples:
 - run tests/builds and summarize results;
 - fresh-context review.
 
-Use the configured subagent runtime when available. Prefer the `subagent_*` tools (`subagent_run`, status/result helpers) when the Pi Subagents extension is installed, because they run the user's configured project/global subagent definitions and preserve history/background behavior. Prefer `subagent_run` with `mode: "background"` for long independent exploration, implementation, tests, or review, and `mode: "task"` when the parent needs the result before continuing.
+Use the configured subagent runtime when available. Prefer the `subagent_*` tools (`subagent_run`, status/result helpers) when the Pi Subagents extension is installed, because they run the user's configured project/global subagent definitions and preserve history/background behavior.
+
+Choose subagent mode by orchestration dependency, not by task length:
+
+- Use `mode: "task"` when the parent must consume the result and continue the workflow, including SDD phases, implementation batches, verification, review gates, and any delegated work whose output determines the next action.
+- Use `mode: "background"` only for independent work where automatic parent continuation is not required. Background completion may notify the user and preserve history, but it is not a guarantee that the parent model will resume orchestration.
 
 If `subagent_*` tools are unavailable, fall back to Pi's native `Agent` tool or another available delegation mechanism. The delegation trigger remains mandatory; the fallback changes the runtime, not the requirement to delegate. If no delegation mechanism is available, stop the complex work and explain the blocker instead of silently continuing inline.
 
