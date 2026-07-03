@@ -132,6 +132,28 @@ skill_resolution
 
 The parent should synthesize these envelopes, not paste long raw reports unless needed.
 
+## Automatic Mode Gatekeeper
+
+In `auto` execution mode, the parent/orchestrator is the quality gate between SDD phases. After a delegated phase returns and before launching the next phase, validate that the phase actually reached its objective. This validation is autonomous: do not ask the user on the happy path, but stop and report if the gate catches a real problem.
+
+Check every phase result against the Result Contract:
+
+- **Contract conformance:** the phase returned `status`, `executive_summary`, `artifacts`, `next_recommended`, `risks`, and `skill_resolution`, and `status` indicates success rather than partial, failed, or blocked.
+- **Artifact existence:** every declared artifact exists and is readable in the active backend. For memory-backed flows, retrieve the topic with the available memory tools; for OpenSpec/file-backed flows, read the declared path. A successful phase with no retrievable artifact fails the gate.
+- **No hallucinated references:** spot-check concrete file paths, symbols, commands, and artifacts the phase claims it created or used. Referenced paths or artifacts that do not resolve fail the gate.
+- **No scope drift:** the output must stay consistent with its inputs and the dependency graph: spec stays within proposal scope, design answers the proposal, tasks cover spec and design, apply implements the tasks, verify checks the implementation against the spec, and sync reflects the verified state before archive.
+- **Routing coherence:** `next_recommended` must follow the SDD dependency graph, and no unaddressed critical risk may be carried silently into the next phase.
+
+Use cost-aware validation:
+
+- For lower-risk phases (`sdd-explore`, `sdd-spec`, `sdd-tasks`, `sdd-sync`, `sdd-archive`), the parent may validate inline by reading artifacts back and checking claims.
+- For higher-risk phases (`sdd-design`, `sdd-apply`), run fresh-context validation/review before continuing because errors there compound downstream.
+- If an inline gate finds any smell — missing artifact, status mismatch, unresolved path, likely drift, or critical risk — escalate to fresh-context validation before deciding.
+
+On gate pass, continue automatically to the next phase. On gate fail, rerun the same phase exactly once with corrective feedback naming the specific failures. Validate the rerun. If it fails again, stop the automatic chain and report the phase, failures from both attempts, and the recommended fix. Never advance to dependent phases on a failed gate.
+
+The gatekeeper is additive: it does not relax the Review Workload Guard, Strict TDD Forwarding, native status dependency checks, or mandatory delegation/review rules.
+
 ## SDD Phase Delegation Mode
 
 Launch SDD phase subagents with `subagent_run` `mode: "task"` when the parent needs the phase result to route the next step. Do not use `mode: "background"` for SDD phases that must feed continuation; background completion is a notification/history mechanism, not an orchestration resume guarantee.
