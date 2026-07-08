@@ -88,7 +88,12 @@ test("rendered SDD preflight prompt is English artifact copy", () => {
 });
 
 test("orchestrator Memory Contract carries the Engram memory lifecycle rule", async () => {
-	const orchestrator = await readFile(join(ROOT, "assets/orchestrator.md"), "utf8");
+	// orchestrator-lazy-diet: the lifecycle rule moved verbatim to
+	// assets/orchestrator-memory.md; core keeps only the intro + pointer.
+	// Union read so this assertion is repointed, not weakened.
+	const orchestrator =
+		(await readFile(join(ROOT, "assets/orchestrator.md"), "utf8")) +
+		(await readFile(join(ROOT, "assets/orchestrator-memory.md"), "utf8"));
 
 	// Mirrors gentle-ai's engram-protocol/engram-convention lifecycle rule (PRs #842 + #844),
 	// in its final availability-gated form: agents must treat needs_review memories as stale,

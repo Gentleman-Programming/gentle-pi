@@ -51,7 +51,14 @@ test("runtime guidance routes review intent to concrete lenses", () => {
 	];
 
 	for (const file of guidedFiles) {
-		const content = readFileSync(file, "utf8");
+		// orchestrator-lazy-diet: the 4R/Review Lens content is split between the
+		// always-on core and `assets/orchestrator-delegation.md`. Only this one
+		// loop entry is repointed to the core+delegation-ref union; README.md and
+		// skills/gentle-ai/SKILL.md are unchanged single-file reads.
+		const content =
+			file === "assets/orchestrator.md"
+				? readFileSync(file, "utf8") + readFileSync("assets/orchestrator-delegation.md", "utf8")
+				: readFileSync(file, "utf8");
 		assert.match(content, /Review Lens Selection|review lens/);
 		assert.match(content, /review-risk/);
 		assert.match(content, /review-reliability/);

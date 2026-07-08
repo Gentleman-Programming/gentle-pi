@@ -49,7 +49,7 @@ import {
 import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
+const ASSETS_DIR = process.env.GENTLE_PI_TEST_ASSETS_DIR ?? join(PACKAGE_ROOT, "assets");
 
 function gentlePiAgentHome(): string {
 	return process.env.GENTLE_PI_AGENT_HOME ?? join(homedir(), ".pi", "agent");
@@ -120,6 +120,18 @@ function getSddWorkflowPath(): string {
 	return join(ASSETS_DIR, "sdd-orchestrator-workflow.md");
 }
 
+function getDelegationPath(): string {
+	return join(ASSETS_DIR, "orchestrator-delegation.md");
+}
+
+function getMemoryPath(): string {
+	return join(ASSETS_DIR, "orchestrator-memory.md");
+}
+
+function getSkillsPath(): string {
+	return join(ASSETS_DIR, "orchestrator-skills.md");
+}
+
 function getOrchestratorPrompt(): string {
 	if (orchestratorPromptCache === null) {
 		orchestratorPromptCache = readFileSync(
@@ -127,6 +139,9 @@ function getOrchestratorPrompt(): string {
 			"utf8",
 		)
 			.replaceAll("{{GENTLE_PI_SDD_WORKFLOW_PATH}}", getSddWorkflowPath())
+			.replaceAll("{{GENTLE_PI_DELEGATION_PATH}}", getDelegationPath())
+			.replaceAll("{{GENTLE_PI_MEMORY_PATH}}", getMemoryPath())
+			.replaceAll("{{GENTLE_PI_SKILLS_PATH}}", getSkillsPath())
 			.trim();
 	}
 	return orchestratorPromptCache;
@@ -2134,6 +2149,7 @@ export const __testing = {
 	classifyReviewEvent,
 	parseNumstat,
 	renderSddModelPanel: renderSddModelPanelForTesting,
+	getOrchestratorPrompt,
 };
 
 export default function gentleAi(pi: ExtensionAPI): void {

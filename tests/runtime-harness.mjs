@@ -201,14 +201,24 @@ async function run() {
 		"declared extension directory must load without invalid helper modules",
 	);
 
+	// orchestrator-lazy-diet: Pi Subagent Model Routing detail (the "do not
+	// pass the `model` parameter by default" / SDD-model-assignment-scoping
+	// rules) moved verbatim to assets/orchestrator-delegation.md; the
+	// always-on combined prompt now only carries a pointer to it. Union read
+	// so these assertions are repointed, not weakened.
+	const delegationDetail = await readFile(join(ROOT, "assets", "orchestrator-delegation.md"), "utf8");
+
 	const promptCwd = await tempWorkspace();
 	try {
 		const promptHook = hooks.get("before_agent_start")[0];
 		const promptResult = await promptHook({ systemPrompt: "base" }, createCtx(promptCwd));
 		assert.match(promptResult.systemPrompt, /base/);
 		assert.match(promptResult.systemPrompt, /el Gentleman/);
-		assert.match(promptResult.systemPrompt, /do not pass the `model` parameter by default/);
-		assert.match(promptResult.systemPrompt, /SDD model assignment tables apply only to SDD\/Judgment-Day phase agents/);
+		assert.match(promptResult.systemPrompt + delegationDetail, /do not pass the `model` parameter by default/);
+		assert.match(
+			promptResult.systemPrompt + delegationDetail,
+			/SDD model assignment tables apply only to SDD\/Judgment-Day phase agents/,
+		);
 		assert.doesNotMatch(promptResult.systemPrompt, /Every Agent tool call MUST include `model`/);
 		assert.doesNotMatch(promptResult.systemPrompt, /default\s*\|\s*sonnet\s*\|\s*Non-SDD general delegation/);
 		assert.match(promptResult.systemPrompt, /openspec\/config\.yaml.*not session preflight/s);

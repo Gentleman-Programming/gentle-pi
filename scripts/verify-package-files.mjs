@@ -7,6 +7,9 @@ const root = join(fileURLToPath(new URL("..", import.meta.url)));
 
 const requiredPaths = [
   "assets/orchestrator.md",
+  "assets/orchestrator-delegation.md",
+  "assets/orchestrator-memory.md",
+  "assets/orchestrator-skills.md",
   "assets/agents/sdd-apply.md",
   "assets/agents/sdd-archive.md",
   "assets/agents/sdd-design.md",

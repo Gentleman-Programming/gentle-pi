@@ -305,8 +305,16 @@ test("Table A rule: 'Do not claim portability outside the Pi runtime.' survives 
 });
 
 test("Table B rule: LB2 subagent-English delegation kept verbatim in orchestrator (unique)", () => {
+	// orchestrator-lazy-diet: LB2 moved verbatim to
+	// assets/orchestrator-delegation.md (delegation-scoped rule); the always-on
+	// combined injection now only carries a pointer to it. Union read so this
+	// assertion is repointed, not weakened.
+	const delegationDetail = readFileSync(
+		fileURLToPath(new URL("../assets/orchestrator-delegation.md", import.meta.url)),
+		"utf8",
+	);
 	for (const persona of ["gentleman", "neutral"] as const) {
-		const prompt = __testing.buildGentlePrompt(persona);
+		const prompt = __testing.buildGentlePrompt(persona) + delegationDetail;
 		assert.match(
 			prompt,
 			/Subagent-facing prompts should be written in English by default, even when the user speaks Spanish\./,
@@ -338,8 +346,16 @@ test("Table B rule: LB4 public-comment target language kept verbatim in orchestr
 });
 
 test("Table B rule: LB5 exceptions kept verbatim in orchestrator (unique)", () => {
+	// orchestrator-lazy-diet: LB5 moved verbatim to
+	// assets/orchestrator-delegation.md (delegation-scoped exceptions); the
+	// always-on combined injection now only carries a pointer to it. Union
+	// read so this assertion is repointed, not weakened.
+	const delegationDetail = readFileSync(
+		fileURLToPath(new URL("../assets/orchestrator-delegation.md", import.meta.url)),
+		"utf8",
+	);
 	for (const persona of ["gentleman", "neutral"] as const) {
-		const prompt = __testing.buildGentlePrompt(persona);
+		const prompt = __testing.buildGentlePrompt(persona) + delegationDetail;
 		assert.match(
 			prompt,
 			/Preserve exact user quotes, UI copy, error messages, filenames, commands, and domain terms in their original language when they are evidence\./,
@@ -416,6 +432,15 @@ test("dup guard (exact-string): identity self-description sentence occurs exactl
 });
 
 test("dup guard (exact-string): LB2/LB3/LB4 each occur exactly once", () => {
+	// orchestrator-lazy-diet: LB2 moved verbatim to
+	// assets/orchestrator-delegation.md (delegation-scoped rule, absent from
+	// the always-on combined injection by design — see "No Double-Delivery").
+	// LB3/LB4 stay verbatim in the always-on core. Union read for LB2 so the
+	// "exactly once" guard is repointed to its new home, not weakened.
+	const delegationDetail = readFileSync(
+		fileURLToPath(new URL("../assets/orchestrator-delegation.md", import.meta.url)),
+		"utf8",
+	);
 	const lb2 =
 		"Subagent-facing prompts should be written in English by default, even when the user speaks Spanish.";
 	const lb3 =
@@ -424,7 +449,11 @@ test("dup guard (exact-string): LB2/LB3/LB4 each occur exactly once", () => {
 		"Public/contextual comments and replies are different from technical artifacts.";
 	for (const persona of ["gentleman", "neutral"] as const) {
 		const prompt = __testing.buildGentlePrompt(persona);
-		assert.equal(countOccurrences(prompt, lb2), 1, `[${persona}] LB2 must occur exactly once`);
+		assert.equal(
+			countOccurrences(prompt + delegationDetail, lb2),
+			1,
+			`[${persona}] LB2 must occur exactly once`,
+		);
 		assert.equal(countOccurrences(prompt, lb3), 1, `[${persona}] LB3 must occur exactly once`);
 		assert.equal(countOccurrences(prompt, lb4), 1, `[${persona}] LB4 must occur exactly once`);
 	}

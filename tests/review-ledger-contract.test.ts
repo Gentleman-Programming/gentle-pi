@@ -325,7 +325,11 @@ test(`${promptsAndFormatsPath} documents the scoped re-review contract and both 
 });
 
 test(`${orchestratorPath} Review Execution Contract carries persistence branches and both execution-mode clauses`, () => {
-	const content = read(orchestratorPath);
+	// orchestrator-lazy-diet: the persistence-branch bullets stay verbatim in
+	// the always-on core; the empty-ledger rule and both execution-mode
+	// clauses moved to assets/orchestrator-delegation.md. Union read so this
+	// assertion is repointed, not weakened.
+	const content = read(orchestratorPath) + read("assets/orchestrator-delegation.md");
 	assertContainsAll(orchestratorPath, content, ledgerPersistenceClauses);
 	assertContainsAll(orchestratorPath, content, [
 		"persist an empty ledger record rather than skip persistence",
