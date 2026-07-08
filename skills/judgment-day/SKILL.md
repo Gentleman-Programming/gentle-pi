@@ -1,5 +1,5 @@
 ---
-name: judgment-day
+name: gentle-ai-judgment-day
 description: "Trigger: judgment day, judgement day, dual review, adversarial review, juzgar. Run blind dual review, fix confirmed issues, then re-judge."
 license: Apache-2.0
 metadata:

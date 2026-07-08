@@ -4,7 +4,7 @@ argument-hint: "<skill idea or name>"
 ---
 Create or update an LLM-first skill for: $ARGUMENTS
 
-Use the `skill-creator` skill if it is available. If the skill is not auto-loaded, read `skills/skill-creator/SKILL.md` and `docs/skill-style-guide.md` when present before editing.
+Use the `gentle-ai-skill-creator` skill if it is available. If the skill is not auto-loaded, read `skills/skill-creator/SKILL.md` and `docs/skill-style-guide.md` when present before editing.
 
 ## Process
 
