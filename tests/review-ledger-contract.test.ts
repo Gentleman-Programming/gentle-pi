@@ -57,6 +57,10 @@ const ledgerPersistenceClauses = Object.freeze([
 	// Compaction caveat for the `none` store, folded into the hand-copied
 	// `none` bullet instead of living only in a non-copied note.
 	"complete the review → fix → re-review loop within the session because it is not persisted across compaction",
+	// EXT-004: degraded-path fallback for the `engram` branch — if the upsert
+	// fails or the tool is unavailable, fall back to inline persistence and
+	// report the degradation instead of silently losing the ledger.
+	"If the engram upsert fails or the memory tool is unavailable, fall back to keeping the ledger inline in the response and explicitly report the degradation — never continue as if persistence succeeded.",
 ]);
 
 // Scoped re-review contract.

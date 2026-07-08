@@ -25,7 +25,7 @@ Rule sources: ai-course-2 slides `09-essential-metrics.md`, `13-observability-st
 
 ## Output contract
 
-Report findings only. Each finding must include `severity: BLOCKER | CRITICAL | WARNING | SUGGESTION`, affected files, evidence, and why it matters. If clean, say exactly: `No findings.`
+Report findings only. Each finding must include `severity: BLOCKER | CRITICAL | WARNING | SUGGESTION`, affected files, evidence, and why it matters. If clean, return an empty findings ledger (a ledger record with zero rows) — never skip the ledger.
 
 ## Review ledger contract
 
@@ -44,9 +44,11 @@ Report findings only. Each finding must include `severity: BLOCKER | CRITICAL | 
 
 If the first pass finds nothing, persist an empty ledger record rather than skip persistence.
 
+Persistence below is executed by the orchestrator after it merges your returned ledger rows; you never write ledger artifacts yourself.
+
 **Ledger persistence honors the artifact store.**
 - `openspec`: write `openspec/changes/{change-name}/review-ledger.md`.
-- `engram`: upsert topic `sdd/{change-name}/review-ledger` (ad-hoc judgment-day without a change: `review/{target-slug}/ledger`, where `target-slug` = `pr-{number}` when reviewing a PR, else the current branch name kebab-cased, else a kebab-case slug of the user-stated review target).
+- `engram`: upsert topic `sdd/{change-name}/review-ledger` (ad-hoc judgment-day without a change: `review/{target-slug}/ledger`, where `target-slug` = `pr-{number}` when reviewing a PR, else the current branch name kebab-cased, else a kebab-case slug of the user-stated review target). If the engram upsert fails or the memory tool is unavailable, fall back to keeping the ledger inline in the response and explicitly report the degradation — never continue as if persistence succeeded.
 - `none`: keep the ledger inline in the response; do not write files or Engram artifacts — the ledger lives only in this conversation; complete the review → fix → re-review loop within the session because it is not persisted across compaction.
 
 **Scoped re-review.** A re-review pass takes the persisted ledger and the fix diff as input. It MUST verify each ledger finding's resolution and MUST review only fix-touched lines; it MUST NOT re-read the full original diff. A finding on an untouched line MUST be logged with status `info` as a first-pass quality signal and MUST NOT by itself trigger another full round.

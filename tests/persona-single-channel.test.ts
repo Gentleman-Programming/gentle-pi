@@ -179,6 +179,25 @@ Exceptions:
 `;
 
 // ---------------------------------------------------------------------------
+// Byte-size constants (EXT-005) — repeated byte literals grouped by fixture
+// instead of duplicated magic numbers across the integrity and byte-delta
+// assertions below. Each constant is annotated with the fixture/pairing it
+// measures; see the PRE_*/POST_* fixtures above for the underlying text.
+// ---------------------------------------------------------------------------
+
+const PRE_WRAPPER_BYTES = 438; // PRE_WRAPPER_IDENTITY_BLOCK
+const POST_WRAPPER_BYTES = 817; // POST_WRAPPER_IDENTITY_BLOCK
+const WRAPPER_IDENTITY_DELTA_BYTES = 379; // POST_WRAPPER_BYTES - PRE_WRAPPER_BYTES
+
+const PRE_ORCH_IDENTITY_BYTES = 831; // PRE_ORCH_IDENTITY
+const ORCH_IDENTITY_DELTA_BYTES = 682; // PRE_ORCH_IDENTITY_BYTES - POST_ORCH_IDENTITY (149 B)
+
+const PRE_ORCH_LANGBOUNDARY_BYTES = 2117; // PRE_ORCH_LANGBOUNDARY
+
+const GENTLEMAN_NET_DELTA_BYTES = -283; // section-sum method, gentleman mode
+const NEUTRAL_NET_DELTA_BYTES = -341; // section-sum method, neutral mode
+
+// ---------------------------------------------------------------------------
 // Frozen fixture integrity — self-check the transcription against the design's
 // judge-measured byte counts (design.md "Byte estimates" table). If these
 // fail, the fixture above was transcribed incorrectly — fix the fixture, not
@@ -188,17 +207,17 @@ Exceptions:
 test("fixture integrity: PRE byte counts match design.md judge-measured figures", () => {
 	assert.equal(
 		Buffer.byteLength(PRE_WRAPPER_IDENTITY_BLOCK),
-		438,
+		PRE_WRAPPER_BYTES,
 		"PRE_WRAPPER_IDENTITY_BLOCK must equal the judge-measured 438 B (gentle-ai.ts:179-184)",
 	);
 	assert.equal(
 		Buffer.byteLength(PRE_ORCH_IDENTITY),
-		831,
+		PRE_ORCH_IDENTITY_BYTES,
 		"PRE_ORCH_IDENTITY must equal the judge-measured 831 B (orchestrator.md:5-21)",
 	);
 	assert.equal(
 		Buffer.byteLength(PRE_ORCH_LANGBOUNDARY),
-		2117,
+		PRE_ORCH_LANGBOUNDARY_BYTES,
 		"PRE_ORCH_LANGBOUNDARY must equal the judge-measured 2,117 B (orchestrator.md:28-42)",
 	);
 });
@@ -206,7 +225,7 @@ test("fixture integrity: PRE byte counts match design.md judge-measured figures"
 test("fixture integrity: POST_WRAPPER_IDENTITY_BLOCK matches design.md converged 817 B", () => {
 	assert.equal(
 		Buffer.byteLength(POST_WRAPPER_IDENTITY_BLOCK),
-		817,
+		POST_WRAPPER_BYTES,
 		"POST_WRAPPER_IDENTITY_BLOCK must equal the round-2/round-3 converged 817 B",
 	);
 });
@@ -527,23 +546,23 @@ test("regression: neutral output still contains its own unchanged language-match
 test("byte delta: wrapper Identity contract block grows by the measured delta (post > pre)", () => {
 	const pre = Buffer.byteLength(PRE_WRAPPER_IDENTITY_BLOCK);
 	const post = Buffer.byteLength(POST_WRAPPER_IDENTITY_BLOCK);
-	assert.equal(pre, 438, "pre wrapper Identity block must be 438 B");
-	assert.equal(post, 817, "post wrapper Identity block must be 817 B");
-	assert.equal(post - pre, 379, "wrapper Identity block delta must be +379 B");
+	assert.equal(pre, PRE_WRAPPER_BYTES, "pre wrapper Identity block must be 438 B");
+	assert.equal(post, POST_WRAPPER_BYTES, "post wrapper Identity block must be 817 B");
+	assert.equal(post - pre, WRAPPER_IDENTITY_DELTA_BYTES, "wrapper Identity block delta must be +379 B");
 });
 
 test("byte delta: orchestrator.md Identity Contract shrinks to the measured pointer size (149 B, ±1 B of design's 148 B estimate)", () => {
 	const pre = Buffer.byteLength(PRE_ORCH_IDENTITY);
 	const post = Buffer.byteLength(POST_ORCH_IDENTITY);
-	assert.equal(pre, 831, "pre orchestrator Identity Contract must be 831 B");
+	assert.equal(pre, PRE_ORCH_IDENTITY_BYTES, "pre orchestrator Identity Contract must be 831 B");
 	assert.equal(post, 149, "post orchestrator Identity Contract must be 149 B (measured, see byte-measurements.md)");
-	assert.equal(pre - post, 682, "orchestrator Identity Contract delta must be -682 B");
+	assert.equal(pre - post, ORCH_IDENTITY_DELTA_BYTES, "orchestrator Identity Contract delta must be -682 B");
 });
 
 test("byte delta: orchestrator.md Language Boundary LB1->pointer shrinks by the measured 38 B (LB2-LB5 unchanged)", () => {
 	const pre = Buffer.byteLength(PRE_ORCH_LANGBOUNDARY);
 	const post = Buffer.byteLength(POST_ORCH_LANGBOUNDARY);
-	assert.equal(pre, 2117, "pre orchestrator Language Boundary must be 2,117 B");
+	assert.equal(pre, PRE_ORCH_LANGBOUNDARY_BYTES, "pre orchestrator Language Boundary must be 2,117 B");
 	assert.equal(post, 2079, "post orchestrator Language Boundary must be 2,079 B (measured, see byte-measurements.md)");
 	assert.equal(pre - post, 38, "orchestrator Language Boundary delta must be -38 B (262 B LB1 sentence -> 224 B pointer)");
 });
@@ -571,12 +590,12 @@ test("byte delta: net per-session injection delta matches byte-measurements.md (
 	const gentlemanClauseDelta = Buffer.byteLength(`${NEW_GENTLEMAN_LANGUAGE_CLAUSE}\n`);
 	assert.equal(
 		wrapperDelta + orchDelta + gentlemanClauseDelta,
-		-283,
+		GENTLEMAN_NET_DELTA_BYTES,
 		"gentleman net per-session injection delta must be -283 B (section-sum method)",
 	);
 	assert.equal(
 		wrapperDelta + orchDelta,
-		-341,
+		NEUTRAL_NET_DELTA_BYTES,
 		"neutral net per-session injection delta must be -341 B (section-sum method, no persona-prompt change)",
 	);
 });

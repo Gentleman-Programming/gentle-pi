@@ -38,6 +38,7 @@ const requiredPaths = [
   "prompts/gpr.md",
   "prompts/gwr.md",
   "prompts/skill-creation.md",
+  "skills/_shared/review-ledger-contract.md",
   "skills/branch-pr/SKILL.md",
   "skills/chained-pr/SKILL.md",
   "skills/cognitive-doc-design/SKILL.md",
