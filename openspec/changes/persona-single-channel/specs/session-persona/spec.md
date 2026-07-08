@@ -102,9 +102,9 @@ Measured before/after byte counts for the affected injection channels, together 
 
 ## Acceptance Criteria
 
-- [ ] Identity/persona/language rules appear exactly once in gentle-pi's injection; orchestrator.md's Identity Contract reduces to a pointer; orchestrator.md's Language Boundary LB1 (duplicated) reduces to a pointer while LB2-LB5 (unique) remain verbatim.
-- [ ] Frozen-fixture migration test proves the union (zero rules lost) under `pnpm test`.
-- [ ] Persona constant selection (Gentleman/Neutral) verified unchanged.
-- [ ] Named/SDD subagent injection branch verified unchanged.
-- [ ] Cross-tool ownership contract exists as a written artifact in the change directory.
-- [ ] Before/after byte counts and measurement method are recorded.
+- [x] Identity/persona/language rules appear exactly once in gentle-pi's injection; orchestrator.md's Identity Contract reduces to a pointer; orchestrator.md's Language Boundary LB1 (duplicated) reduces to a pointer while LB2-LB5 (unique) remain verbatim.
+- [x] Frozen-fixture migration test proves the union (zero rules lost) under `pnpm test`.
+- [x] Persona constant selection (Gentleman/Neutral) verified unchanged.
+- [x] Named/SDD subagent injection branch verified unchanged.
+- [x] Cross-tool ownership contract exists as a written artifact in the change directory.
+- [x] Before/after byte counts and measurement method are recorded.

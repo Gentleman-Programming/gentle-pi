@@ -77,7 +77,7 @@ Known residual (out of scope for this change): the Harness principles block (`ge
 ## Decision 3 — Single persona-constant source
 
 **Choice.** Keep the two `*_PERSONA_PROMPT` constants (:148-164) as the ONLY persona text source
-feeding `${personaPrompt}`; factor the 4 shared bullets (senior architect, AI-as-tool, push-back,
+feeding `${personaPrompt}`; factor the 4 shared bullets (5 after the JD-001 fix adds the byte-identical language-match clause to both persona constants — reconcile SHARED_PERSONA_BULLETS scope accordingly if adopted) (senior architect, AI-as-tool, push-back,
 correct-errors — identical at :151-154 and :161-164) into one `SHARED_PERSONA_BULLETS` base, leaving
 each persona only its language-specific bullets. Kills intra-constant drift.
 **Alternative rejected:** leave both constants fully duplicated — simpler diff but preserves the
@@ -100,7 +100,10 @@ Identity contract:
 Note: the Identity contract bullet above deliberately drops the "in the user's language" clause that
 :18 originally carried (Table A). Language-matching is a SEPARATE concept, owned solely by the
 persona prompts (below), so it appears exactly once per rendered mode instead of being restated
-here too.
+here too. Scoped exception, deliberately distinct: Identity-contract bullet 1's "translated into
+the user's language" (merged from orchestrator.md:9) is a self-description conveyance directive,
+not a general reply-language rule; the concept-level guard intentionally does not count it, and
+this sentence documents that boundary explicitly (round-2 judge finding).
 
 ### `GENTLEMAN_PERSONA_PROMPT` (add one clause, mirrors `NEUTRAL_PERSONA_PROMPT` :158)
 
@@ -151,10 +154,10 @@ cells not independently re-measured are marked "estimate".
 |---|---|---|---|---|
 | Language Boundary LB1 only (`orchestrator.md` :30, the duplicated pointer target) | 262 B | → folded into the LB pointer line | (included in orchestrator.md total delta) | judge-measured |
 | Language Boundary total (`orchestrator.md` :28-42) | 2,117 B | LB1 (262 B) collapses to pointer; LB2-5 (unique) unchanged | not separately re-measured post-change | judge-measured (before) |
-| Identity Contract (`orchestrator.md` :5-21) | 830 B | 148 B (one-line pointer) | −682 B | judge-measured |
-| wrapper Identity contract block (`gentle-ai.ts` :179-184, pre-change) | 438 B | 861 B (post-change, incl. self-description union + JD-001 fix: :96 line dropped, Identity bullet trimmed, one clause added to `GENTLEMAN_PERSONA_PROMPT`) | ≈ +520 B (includes the JD-001 correction) | judge-measured |
+| Identity Contract (`orchestrator.md` :5-21) | 831 B | 148 B (one-line pointer) | −682 B | judge-measured |
+| wrapper Identity contract block (`gentle-ai.ts` :179-184, pre-change) | 438 B | 817 B (post-change; measured from the exact block quoted in this document — both round-2 judges and the orchestrator converged on 817 B) | ≈ +379 B (817 − 438; the GENTLEMAN_PERSONA_PROMPT clause is a separate ~60 B line item, not part of this block) (includes the JD-001 correction) | judge-measured |
 | `orchestrator.md` (Identity + Language Boundary dispositions combined) | 22,626 B | — | ≈ −720 B | judge-measured estimate |
-| **Net injection / parent session (gentleman)** | — | — | **≈ −0.2 KB** | judge-measured estimate, pending the apply RED test's authoritative `wc -c` |
+| **Net injection / parent session (gentleman)** | — | — | **≈ −0.28 KB (measured: −283 B gentleman / −341 B neutral)** | judge-measured estimate, pending the apply RED test's authoritative `wc -c` |
 | gentle-ai `APPEND_SYSTEM.md` | 37,276 B | unchanged | 0 | gentle-ai follow-up, out of scope |
 
 ## File Changes
@@ -210,7 +213,7 @@ or re-duplicate the wrapper's identity/persona/language content):
 - `## Language Boundary` (:28-42) → LB1 one-line pointer + LB2-LB5 verbatim (final).
 
 **Budget benefit (the real ~1 KB the diet needs) — derivation.** The dedup does NOT come from a
-large raw `orchestrator.md` file shrink (that net is only ≈ −0.2 KB gentleman, see Byte estimates
+large raw `orchestrator.md` file shrink (that net is only ≈ −0.28 KB (measured: −283 B gentleman / −341 B neutral) gentleman, see Byte estimates
 above). It comes from making the wrapper canonical, so the diet's core summary can point at it
 instead of paraphrasing identity/language content in-core. Without this change, the diet's own
 design (`orchestrator-lazy-diet/design.md:16`) budgets a ~350 B in-core summary for Language
