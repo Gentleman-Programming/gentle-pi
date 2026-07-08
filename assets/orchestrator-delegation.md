@@ -163,7 +163,7 @@ The extension (`extensions/gentle-ai.ts`) gates `bash` tool calls that look like
   - Changed paths match hot globs: `**/auth/**`, `**/update/**`, `**/security/**`, `**/payments/**`
   - Diff exceeds 400 changed lines (added + deleted)
   - When blocked, the reason names all four agents to run first.
-- **post-sdd-phase** (design, apply): **strong gate** for `judgment-day`. Handled separately by SDD phase orchestration, not this diff-based hook.
+- **post-sdd-phase** (design, apply): **strong gate** for the packaged `gentle-ai-judgment-day` skill. Handled separately by SDD phase orchestration, not this diff-based hook.
 
 When the extension blocks a `gh pr create` command, the orchestrator must launch the `4r-review` chain (or run the four agents individually) and wait for their reports before the user retries the PR command.
 

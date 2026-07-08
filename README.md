@@ -315,6 +315,8 @@ Skill discovery is a guardrail, not a workflow router: it helps Pi load the righ
 
 Packaged skills include `cognitive-doc-design`, `comment-writer`, `gentle-ai-judgment-day`, `gentle-ai-skill-creator`, `gentle-ai-skill-improver`, and the other delivery/review skills under `skills/`. SDD init is installed as the packaged `sdd-init` runtime agent under `assets/agents/` and refreshed with the SDD assets.
 
+Compatibility: the package keeps the existing skill folders (`skills/branch-pr`, `skills/judgment-day`, `skills/skill-creator`) but their exported frontmatter names are prefixed to avoid collisions with user/global skills. Treat former package names such as `branch-pr`, `judgment-day`, and `skill-creator` as legacy aliases in prose; runtime skill selection should use `gentle-ai-branch-pr`, `gentle-ai-judgment-day`, and `gentle-ai-skill-creator`.
+
 Delegation contract:
 
 - parent/orchestrator resolves project/user skills from the registry and passes matching paths under `## Skills to load before work`;

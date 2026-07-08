@@ -35,6 +35,18 @@ for (const [dir, expectedName] of Object.entries(PREFIXED_NAMES)) {
 	});
 }
 
+test("README documents legacy skill-name compatibility aliases", () => {
+	const readme = readFileSync(join(repoRoot, "README.md"), "utf8");
+	for (const [legacyName, prefixedName] of [
+		["branch-pr", "gentle-ai-branch-pr"],
+		["judgment-day", "gentle-ai-judgment-day"],
+		["skill-creator", "gentle-ai-skill-creator"],
+	] as const) {
+		assert.match(readme, new RegExp(`former package names such as[\\s\\S]*${legacyName}`));
+		assert.match(readme, new RegExp(`runtime skill selection should use[\\s\\S]*${prefixedName}`));
+	}
+});
+
 for (const dir of UNPREFIXED_DIRS) {
 	test(`skills/${dir}/SKILL.md frontmatter name carries no gentle-ai- prefix`, () => {
 		const name = readSkillName(dir);

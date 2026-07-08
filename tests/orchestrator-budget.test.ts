@@ -12,22 +12,18 @@ import test, { after } from "node:test";
 // plus three path-substituted lazy reference files (see design.md "Core
 // budget rebuilt from measured drafts" and "Appendix: drafted core texts").
 //
-// `getOrchestratorPrompt`'s `ASSETS_DIR` (extensions/gentle-ai.ts:52) is a
-// module-level `const` resolved at IMPORT time from
-// `process.env.GENTLE_PI_TEST_ASSETS_DIR`, and its rendered return value is
-// memoized in a module-level cache (first-read-wins for the process
-// lifetime — see design.md "Test seam (JD-005)"). Both constraints mean the
-// env override must be set BEFORE this module is first imported (a dynamic
-// `import()`, not a static top-of-file import), and every test below that
-// needs `__testing` must share the SAME module instance. To keep every test
-// in this file consistent, the stub fixture directory below is populated by
-// COPYING the real repo assets (dynamically, at test-run time) into a
-// short-path tmpdir — this isolates the byte-budget measurement from the
+// `getOrchestratorPrompt`'s rendered return value is memoized in a
+// module-level cache (first-read-wins for the process lifetime — see design.md
+// "Test seam (JD-005)"). Tests that need alternate asset roots use the
+// test-only `__testing.renderOrchestratorPrompt(assetsDir)` helper instead of
+// ambient environment variables, so production runtime asset resolution stays
+// deterministic. The representative production assets directory below is
+// populated by COPYING the real repo assets (dynamically, at test-run time)
+// into a short-path tmpdir — this isolates byte-budget measurement from the
 // real repo's absolute path length while keeping content representative of
 // production. Tests that need to inspect the real repo files directly (the
 // disposition-mapped union sweep, the core-alone token assertions) read
-// `assets/*.md` directly via `readFileSync`, sidestepping the cache/env
-// entirely.
+// `assets/*.md` directly via `readFileSync`, sidestepping the cache entirely.
 // ---------------------------------------------------------------------------
 
 const REPO_ROOT = join(import.meta.dirname, "..");
@@ -43,32 +39,29 @@ const LAZY_ASSET_NAMES = [
 	"orchestrator-skills.md",
 ] as const;
 
-const stubDir = mkdtempSync(join(tmpdir(), "gp-b-"));
+const representativeProductionAssetsDir = mkdtempSync(join(tmpdir(), "gp-b-"));
 for (const name of LAZY_ASSET_NAMES) {
 	const src = join(REAL_ASSETS_DIR, name);
 	writeFileSync(
-		join(stubDir, name),
+		join(representativeProductionAssetsDir, name),
 		existsSync(src) ? readFileSync(src) : `stub placeholder for ${name} (not authored yet)\n`,
 	);
 }
-process.env.GENTLE_PI_TEST_ASSETS_DIR = stubDir;
 const { __testing } = await import("../extensions/gentle-ai.ts");
 
-// Realistic-length ASSETS_DIR: mirrors an actual installed path such as
-// `~/.pi/agent/npm/node_modules/gentle-pi/assets` (measured well over 59
-// chars on real installs), so the budget assertion is not laundered through
-// an artificially short mkdtemp path. `ASSETS_DIR` and the memoized
-// `orchestratorPromptCache` are both resolved at module-import time
-// (first-read-wins for the process lifetime — see the file-level comment
-// above), so this longer directory cannot be measured via a second dynamic
-// import in THIS already-imported process; it is measured in a genuinely
-// fresh child process instead (`tests/fixtures/measure-orchestrator-prompt.mjs`).
+const MIN_REALISTIC_INSTALL_ASSETS_PATH_CHARS = 59;
+
+// Realistic-length assets path: mirrors an actual installed path such as
+// `~/.pi/agent/npm/node_modules/gentle-pi/assets`, so the budget assertion is
+// not laundered through an artificially short mkdtemp path. The helper is also
+// exercised in a fresh child process (`tests/fixtures/measure-orchestrator-prompt.mjs`)
+// to keep production cache behavior separate from fixture measurements.
 const realisticBaseDir = mkdtempSync(join(tmpdir(), "gp-realistic-"));
 const realisticDir = join(realisticBaseDir, ".pi", "agent", "npm", "node_modules", "gentle-pi", "assets");
 mkdirSync(realisticDir, { recursive: true });
 assert.ok(
-	realisticDir.length >= 59,
-	`realistic scratch ASSETS_DIR path is only ${realisticDir.length} chars, need >= 59 to mirror a real install path`,
+	realisticDir.length >= MIN_REALISTIC_INSTALL_ASSETS_PATH_CHARS,
+	`realistic scratch assets path is only ${realisticDir.length} chars, need >= ${MIN_REALISTIC_INSTALL_ASSETS_PATH_CHARS} to mirror a real install path`,
 );
 for (const name of LAZY_ASSET_NAMES) {
 	const src = join(REAL_ASSETS_DIR, name);
@@ -79,7 +72,7 @@ for (const name of LAZY_ASSET_NAMES) {
 }
 
 after(() => {
-	rmSync(stubDir, { recursive: true, force: true });
+	rmSync(representativeProductionAssetsDir, { recursive: true, force: true });
 	rmSync(realisticBaseDir, { recursive: true, force: true });
 });
 
@@ -89,8 +82,8 @@ function readRealAsset(name: string): string {
 
 function measureOrchestratorPromptBytes(assetsDir: string): number {
 	const scriptPath = join(import.meta.dirname, "fixtures", "measure-orchestrator-prompt.mjs");
-	const result = spawnSync(process.execPath, ["--experimental-strip-types", scriptPath], {
-		env: { ...process.env, GENTLE_PI_TEST_ASSETS_DIR: assetsDir },
+	const result = spawnSync(process.execPath, ["--experimental-strip-types", scriptPath, assetsDir], {
+		env: process.env,
 		encoding: "utf8",
 	});
 	assert.equal(
@@ -106,7 +99,7 @@ function measureOrchestratorPromptBytes(assetsDir: string): number {
 // ---------------------------------------------------------------------------
 
 test("getOrchestratorPrompt return value stays within the 10,240 B budget (short-path stub sanity check)", () => {
-	const rendered = __testing.getOrchestratorPrompt();
+	const rendered = __testing.renderOrchestratorPrompt(representativeProductionAssetsDir);
 	const bytes = Buffer.byteLength(rendered, "utf8");
 	assert.ok(
 		bytes <= BUDGET_BYTES,
@@ -114,7 +107,7 @@ test("getOrchestratorPrompt return value stays within the 10,240 B budget (short
 	);
 });
 
-test("getOrchestratorPrompt return value stays within the 10,240 B budget at a realistic (>= 59 char) install path length", () => {
+test(`getOrchestratorPrompt return value stays within the 10,240 B budget at a realistic (>= ${MIN_REALISTIC_INSTALL_ASSETS_PATH_CHARS} char) install path length`, () => {
 	const bytes = measureOrchestratorPromptBytes(realisticDir);
 	assert.ok(
 		bytes <= BUDGET_BYTES,
@@ -274,15 +267,15 @@ test("relocated lazy bodies are not double-delivered in the always-on core", () 
 test("relocated lazy files are reachable via in-core pointer paths", () => {
 	const rendered = __testing.getOrchestratorPrompt();
 	assert.ok(
-		rendered.includes(join(stubDir, "orchestrator-delegation.md")),
+		rendered.includes(join(REAL_ASSETS_DIR, "orchestrator-delegation.md")),
 		"core is missing a reachable pointer to orchestrator-delegation.md",
 	);
 	assert.ok(
-		rendered.includes(join(stubDir, "orchestrator-memory.md")),
+		rendered.includes(join(REAL_ASSETS_DIR, "orchestrator-memory.md")),
 		"core is missing a reachable pointer to orchestrator-memory.md",
 	);
 	assert.ok(
-		rendered.includes(join(stubDir, "orchestrator-skills.md")),
+		rendered.includes(join(REAL_ASSETS_DIR, "orchestrator-skills.md")),
 		"core is missing a reachable pointer to orchestrator-skills.md",
 	);
 });

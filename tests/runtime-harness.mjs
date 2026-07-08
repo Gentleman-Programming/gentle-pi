@@ -164,8 +164,10 @@ async function loadExtensions(pi) {
 async function run() {
 	const globalConfigHome = await tempWorkspace();
 	const globalAgentHome = await tempWorkspace();
+	const ambientTestAssetsDir = await tempWorkspace();
 	process.env.GENTLE_PI_CONFIG_HOME = globalConfigHome;
 	process.env.GENTLE_PI_AGENT_HOME = globalAgentHome;
+	process.env.GENTLE_PI_TEST_ASSETS_DIR = ambientTestAssetsDir;
 	const globalModelsPath = join(globalConfigHome, "models.json");
 	const globalSubagentsPath = join(globalAgentHome, "subagents.json");
 	const { pi, hooks, commands, flags } = createPi();
@@ -227,7 +229,14 @@ async function run() {
 			promptResult.systemPrompt,
 			new RegExp(`${ROOT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*assets.*sdd-orchestrator-workflow\\.md`),
 		);
+		assert.doesNotMatch(
+			promptResult.systemPrompt,
+			new RegExp(ambientTestAssetsDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+			"normal runtime must ignore ambient GENTLE_PI_TEST_ASSETS_DIR",
+		);
 		assert.doesNotMatch(promptResult.systemPrompt, /\{\{GENTLE_PI_SDD_WORKFLOW_PATH\}\}/);
+		delete process.env.GENTLE_PI_TEST_ASSETS_DIR;
+		await rm(ambientTestAssetsDir, { recursive: true, force: true });
 		await writeFile(
 			join(globalConfigHome, "persona.json"),
 			'{"mode":"neutral"}\n',

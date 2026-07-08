@@ -107,9 +107,9 @@ For skill-shaped requests, do not treat injected `<available_skills>` as complet
 
 ## 4R Review Triggers
 
-`extensions/gentle-ai.ts` gates `bash` calls that look like git/gh workflow events. **pre-commit**/**pre-push**: advisory only — notify to consider `review-readability`, do not block. **pre-pr** (`gh pr create`): strong gate — blocks when changed paths match hot globs (`**/auth/**`, `**/update/**`, `**/security/**`, `**/payments/**`) or the diff exceeds 400 changed lines; the reason names all four agents to run first. **post-sdd-phase** (design, apply): strong gate for `judgment-day`, handled by SDD phase orchestration.
+`extensions/gentle-ai.ts` gates git/gh `bash`: pre-commit/pre-push only suggest `review-readability`; pre-pr blocks on hot auth/update/security/payments paths or over 400 changed lines and requires `review-risk`, `review-resilience`, `review-readability`, `review-reliability`; post-SDD design/apply uses `gentle-ai-judgment-day`.
 
-When blocked, launch the `4r-review` chain or run `review-risk`, `review-reliability`, `review-resilience`, `review-readability` individually and wait for their reports before retrying.
+When blocked, run `4r-review` or all four review agents before retrying.
 
 ### Review Execution Contract
 
