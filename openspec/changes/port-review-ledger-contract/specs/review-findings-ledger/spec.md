@@ -120,13 +120,14 @@ Judgment-day's judge agents (jd-judge-a, jd-judge-b) MUST apply the same exhaust
 
 ### Requirement: Clauses live inside copy-pasteable prompt templates
 
-The exhaustive-pass, ledger, persistence, and scoped re-review clauses MUST be embedded inside the copy-pasteable prompt template body of each adopting asset, not in surrounding narrative or trailing prose that is not part of the template a caller copies and runs.
+The exhaustive-pass, ledger schema, and persistence clauses MUST be embedded inside the copy-pasteable prompt template body of each adopting asset, not in surrounding narrative or trailing prose that is not part of the template a caller copies and runs. The scoped re-review clause and both named execution-mode clauses govern the round AFTER a prompt is issued — not the prompt content itself — and instead live in the adopting asset's documented "## Ledger and Re-Judge Contract" prose section: a scoped re-judge prompt is composed by the orchestrator from the persisted ledger and the fix diff, not copied verbatim from the round-1 Judge Prompt template, so this subset does not need fence embedding to reach the caller.
 
 #### Scenario: Clause is inside the template fence
 
 - GIVEN an adopting asset defines a copy-pasteable prompt template
 - WHEN the template's content boundaries are inspected
-- THEN the required clauses MUST fall within those boundaries, not outside them in commentary text
+- THEN the exhaustive-pass, ledger schema, and persistence clauses MUST fall within those boundaries, not outside them in commentary text
+- AND the scoped re-review and execution-mode clauses MUST be documented in the asset's "## Ledger and Re-Judge Contract" prose section instead
 
 ---
 

@@ -10,7 +10,7 @@
 - Author canonical `skills/_shared/review-ledger-contract.md` (port of gentle-ai's 97-line source, `wc -l` verified): exhaustive first pass (loop until N=2 dry sweeps, ceiling 4/lens; R2 MAY use N=1), findings ledger schema (`id`, `lens`, `location`, `severity`, `status`, `evidence`), store-branched persistence (openspec `review-ledger.md` / engram topic / inline `none`), scoped re-review, execution-mode clause.
 - Hand-copy the judge-oriented clause block INTO the copy-pasteable prompt templates of: `assets/agents/review-{risk,readability,reliability,resilience}.md`, `assets/agents/jd-judge-a.md`, `jd-judge-b.md`, `skills/judgment-day/SKILL.md` hard rules, `skills/judgment-day/references/prompts-and-formats.md` Judge Prompt template.
 - `assets/agents/jd-fix-agent.md` + the Fix Agent Prompt template get the DISTINCT fix-agent clause set (status→fixed only; NO exhaustive-pass/emission clauses) — JD-001 lesson.
-- `assets/orchestrator.md` "4R Review Triggers": add a Review Execution Contract section (inline-mode ledger merge/persist), expressed as section-content agnostic to final section location.
+- `assets/orchestrator.md` "4R Review Triggers": add a Review Execution Contract section (persistence branches; subagent-primary only — no inline execution mode, per orchestrator.md:92), expressed as section-content agnostic to final section location.
 - `assets/sdd-orchestrator-workflow.md` Review Workload Guard: reference ledger persistence.
 - TypeScript drift-guard test (`tests/review-ledger-contract.test.ts`, `pnpm test`) asserting per-role clause slices with fence-scoped assertions — JD-013 lesson.
 

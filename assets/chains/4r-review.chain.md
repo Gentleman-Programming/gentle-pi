@@ -9,7 +9,7 @@ output: review-risk-report.md
 outputMode: file-only
 progress: true
 
-Run R1 Risk review on the current diff. Report security, privilege boundary, data exposure, dependency, and merge-blocking vulnerability findings. If clean, say exactly: `No findings.`
+Run R1 Risk review on the current diff. Report security, privilege boundary, data exposure, dependency, and merge-blocking vulnerability findings. If the first pass finds nothing, persist an empty ledger record rather than skip persistence.
 
 ## review-readability
 
@@ -18,7 +18,7 @@ output: review-readability-report.md
 outputMode: file-only
 progress: true
 
-Run R2 Readability review on the current diff. Report naming, complexity, intention, maintainability, review size, and context clarity findings. If clean, say exactly: `No findings.`
+Run R2 Readability review on the current diff. Report naming, complexity, intention, maintainability, review size, and context clarity findings. If the first pass finds nothing, persist an empty ledger record rather than skip persistence.
 
 ## review-reliability
 
@@ -27,7 +27,7 @@ output: review-reliability-report.md
 outputMode: file-only
 progress: true
 
-Run R3 Reliability review on the current diff. Report behavior-first test coverage, edge case, determinism, contract, and regression findings. If clean, say exactly: `No findings.`
+Run R3 Reliability review on the current diff. Report behavior-first test coverage, edge case, determinism, contract, and regression findings. If the first pass finds nothing, persist an empty ledger record rather than skip persistence.
 
 ## review-resilience
 
@@ -36,4 +36,4 @@ output: review-resilience-report.md
 outputMode: file-only
 progress: true
 
-Run R4 Resilience review on the current diff. Report fallback, retry/backoff, graceful degradation, observability, load, rollback, and SLO risk findings. If clean, say exactly: `No findings.`
+Run R4 Resilience review on the current diff. Report fallback, retry/backoff, graceful degradation, observability, load, rollback, and SLO risk findings. If the first pass finds nothing, persist an empty ledger record rather than skip persistence.

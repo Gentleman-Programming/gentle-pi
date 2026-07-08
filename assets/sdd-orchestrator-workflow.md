@@ -176,4 +176,6 @@ After `sdd-tasks` and before `sdd-apply`, inspect the task output for review wor
 
 If estimated changed lines exceed 400, chained PRs are recommended, or a decision is needed, pause and ask unless the user already approved a delivery strategy.
 
+Findings from any triggered review lens persist to the review findings ledger per the artifact-store branch (openspec/engram/none) and follow the scoped re-review contract on re-review — see `assets/orchestrator.md`'s Review Execution Contract.
+
 Automatic mode does not override reviewer burnout protection.

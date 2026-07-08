@@ -310,3 +310,16 @@ The extension (`extensions/gentle-ai.ts`) gates `bash` tool calls that look like
 When the extension blocks a `gh pr create` command, the orchestrator must launch the `4r-review` chain (or run the four agents individually) and wait for their reports before the user retries the PR command.
 
 Prohibition: do NOT configure the full 4R fan-out on `pre-commit` or `pre-push` with `always: true`. Everyday events must use a single advisory lens to keep development-loop cost low (spec G token-budget rule). The `validateTriggerRuleSet` function in `lib/review-triggers.ts` enforces this at config load time.
+
+### Review Execution Contract
+
+**Ledger persistence honors the artifact store.**
+- `openspec`: write `openspec/changes/{change-name}/review-ledger.md`.
+- `engram`: upsert topic `sdd/{change-name}/review-ledger` (ad-hoc judgment-day without a change: `review/{target-slug}/ledger`, where `target-slug` = `pr-{number}` when reviewing a PR, else the current branch name kebab-cased, else a kebab-case slug of the user-stated review target).
+- `none`: keep the ledger inline in the response; do not write files or Engram artifacts — the ledger lives only in this conversation; complete the review → fix → re-review loop within the session because it is not persisted across compaction.
+
+If the first pass finds nothing, persist an empty ledger record rather than skip persistence.
+
+Subagent execution-mode: this agent runs its lens exhaustively as a dedicated Pi subagent and returns its own ledger rows in its Output; the orchestrator merges those ledger rows into the persisted ledger.
+
+Fix execution-mode: jd-fix-agent applies only confirmed ledger findings and hands control back to the orchestrator, which runs the scoped re-judge.

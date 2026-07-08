@@ -64,13 +64,25 @@ JD-001 bug).
 (JD-011) makes reintroducing the judge block fail the build.
 
 ### Decision: Template-embedded placement + fence extraction (JD-003/JD-013)
-**Choice**: In `prompts-and-formats.md`, clauses live INSIDE the fenced Judge
-Prompt / Fix Agent Prompt blocks (not trailing prose). The test extracts each
-fenced block and asserts against the extraction only. For `review-*`/`jd-*`/
-`SKILL.md`, the whole file IS the delivered prompt, so clauses go in the Output
-contract / Rules / Hard Rules prose and whole-file assertions apply.
-**Rationale**: Pi composes judge/fix prompts from the fenced templates; a clause
-in surrounding prose never reaches the composed prompt (the exact JD-013 failure).
+**Choice**: In `prompts-and-formats.md`, the exhaustive-pass, ledger schema,
+and persistence clauses live INSIDE the fenced Judge Prompt / Fix Agent Prompt
+blocks (not trailing prose). The scoped-re-review clause and both named
+execution-mode clauses live in the trailing "## Ledger and Re-Judge Contract"
+prose section instead, because a scoped re-judge prompt is composed by the
+orchestrator from the persisted ledger and the fix diff — it is never copied
+verbatim from the round-1 Judge Prompt fence — and a whole-file assertion
+guards that prose section against silent deletion. The test extracts each
+fenced block and asserts against the extraction only for the fenced subset,
+plus a separate whole-file assertion for the prose subset. For
+`review-*`/`jd-*`/`SKILL.md`, the whole file IS the delivered prompt, so all
+clauses go in the Output contract / Rules / Hard Rules prose and whole-file
+assertions apply.
+**Rationale**: Pi composes judge/fix first-pass prompts from the fenced
+templates; a clause in surrounding prose never reaches that composed prompt
+(the exact JD-013 failure). The scoped-re-review and execution-mode clauses
+are the documented exception (gentle-ai's own 4-round-judged precedent for
+this exact subset choice): they govern a round the orchestrator composes
+itself, not a template a caller copies verbatim.
 
 ## Data Flow — review → ledger → fix → re-review
 
@@ -127,11 +139,17 @@ Canonical ledger row, rendered identically in every surface:
 
 **Ledger persistence vs. the 4R chain report-file handoff.** `4r-review.chain.md`
 passes `review-{lens}-report.md` between its four sequential steps
-(`reads:`/`output:` chain config, lines 12-39). This file relay is NOT a second
-persistence mechanism competing with the store branches above — each lens still
-persists its ledger rows via the openspec/engram/none branch exactly as any
-other review surface does; the report file is the SAME ledger content
-serialized so the next chain step can read prior lenses' findings as input. The
+(`output:`/`outputMode: file-only` config at :8-9, :17-18, :26-27, :35-36; the
+`reads:` keys at :16, :25, :34; the per-lens prompt lines are :12, :21, :30,
+:39). This file relay is CHAIN TRANSPORT — unconditional inter-step
+infrastructure (`outputMode: file-only` is not gated on any store choice; the
+same mechanism serves sdd-verify/sdd-plan/sdd-full chains, see
+orchestrator.md:159) — and is therefore NOT ledger persistence. The two
+coexist by definition: each lens persists its ledger rows via the
+openspec/engram/none branch exactly as any other review surface does, and the
+`none` branch's "do not write files" rule applies to LEDGER artifacts only —
+chain transport files exist in every mode and are ephemeral step-to-step
+inputs, not the ledger of record. The
 chain's per-lens "If clean, say exactly: `No findings.`" wording is replaced
 with the canonical empty-ledger-record clause so a clean lens still persists an
 empty ledger record through the same branch rather than skip persistence.
