@@ -50,6 +50,10 @@ test("package manifest installs pi-pretty through a wrapper without bundling nat
 		"gentle-pi must expose pi-pretty through a packaged wrapper extension",
 	);
 	assert.ok(
+		existsSync(join(PACKAGE_ROOT, "extensions", "quiet-tools.ts")),
+		"gentle-pi must expose quiet built-in tool rendering through a packaged extension",
+	);
+	assert.ok(
 		!packageJson.bundledDependencies?.includes("@heyhuynhgiabuu/pi-pretty"),
 		"pi-pretty must not be bundled because its native optional dependencies are platform-specific",
 	);
@@ -105,4 +109,6 @@ test("pi-pretty wrapper uses real package path resolution for pnpm symlink insta
 	assert.match(wrapper, /realpathSync/);
 	assert.match(wrapper, /createRequire/);
 	assert.match(wrapper, /@heyhuynhgiabuu\/pi-pretty/);
+	assert.match(wrapper, /PI_PRETTY_SUPPRESSED_TOOL_NAMES/);
+	assert.match(wrapper, /quietToolsEnabled/);
 });

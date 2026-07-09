@@ -12,6 +12,7 @@ import { stripAnsi } from "../lib/terminal-theme.ts";
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const EXTENSIONS = [
 	"extensions/gentle-ai.ts",
+	"extensions/quiet-tools.ts",
 	"extensions/skill-registry.ts",
 	"extensions/sdd-init.ts",
 	"extensions/startup-banner.ts",
@@ -59,6 +60,7 @@ function createPi() {
 	const hooks = new Map();
 	const commands = new Map();
 	const flags = new Map();
+	const tools = new Map();
 	const flagValues = new Map([["no-skill-registry", true]]);
 	let activeTools = ["read", "bash", "edit", "write"];
 
@@ -73,6 +75,9 @@ function createPi() {
 		},
 		registerFlag(name, definition) {
 			flags.set(name, definition);
+		},
+		registerTool(definition) {
+			tools.set(definition.name, definition);
 		},
 		getFlag(name) {
 			return flagValues.get(name) ?? false;
@@ -100,7 +105,7 @@ function createPi() {
 		},
 	};
 
-	return { pi, hooks, commands, flags };
+	return { pi, hooks, commands, flags, tools };
 }
 
 function createUi() {
@@ -170,7 +175,7 @@ async function run() {
 	process.env.GENTLE_PI_TEST_ASSETS_DIR = ambientTestAssetsDir;
 	const globalModelsPath = join(globalConfigHome, "models.json");
 	const globalSubagentsPath = join(globalAgentHome, "subagents.json");
-	const { pi, hooks, commands, flags } = createPi();
+	const { pi, hooks, commands, flags, tools } = createPi();
 	await loadExtensions(pi);
 
 	for (const name of EXPECTED_COMMANDS) {
@@ -185,6 +190,9 @@ async function run() {
 	assert.ok(hooks.has("input"), "missing input hook");
 	assert.ok(hooks.has("before_agent_start"), "missing before_agent_start hook");
 	assert.ok(hooks.has("tool_call"), "missing tool_call hook");
+	for (const toolName of ["read", "bash", "grep", "find", "ls", "edit", "write"]) {
+		assert.ok(tools.has(toolName), `missing quiet built-in tool renderer ${toolName}`);
+	}
 
 	for (const entry of await readdir(join(ROOT, "assets", "agents"))) {
 		if (!entry.endsWith(".md")) continue;
