@@ -44,10 +44,16 @@ Examples:
 
 Use the configured subagent runtime when available. Prefer the `subagent_*` tools (`subagent_run`, status/result helpers) when the Pi Subagents extension is installed, because they run the user's configured project/global subagent definitions and preserve history/background behavior.
 
+The bounded multi-file writer precedence below is the explicit exception to this general runtime preference.
+
 Choose subagent mode by orchestration dependency, not by task length:
 
 - Use `mode: "task"` when the parent must consume the result and continue the workflow, including SDD phases, implementation batches, verification, review gates, and any delegated work whose output determines the next action.
 - Use `mode: "background"` only for independent work where automatic parent continuation is not required. Background completion may notify the user and preserve history, but it is not a guarantee that the parent model will resume orchestration.
+
+For bounded multi-file writes, prefer the installed package-owned `gentle-ai-worker`, then a user-configured `worker`. If neither worker definition exists, fall back to the native `Agent` even when `subagent_*` tools are available. This writer precedence overrides the general runtime preference above.
+
+For delegation other than bounded multi-file writes, use the generic fallback:
 
 If `subagent_*` tools are unavailable, fall back to Pi's native `Agent` tool or another available delegation mechanism. The delegation trigger remains mandatory; the fallback changes the runtime, not the requirement to delegate. If no delegation mechanism is available, stop the complex work and explain the blocker instead of silently continuing inline.
 
@@ -102,8 +108,12 @@ Core question: does this inflate parent context without need?
 
 These are parent-orchestrator stop rules. Once any trigger fires, the parent MUST delegate through the best available subagent runtime. Prefer `subagent_run` when present; otherwise use Pi's native `Agent` or another available delegation mechanism. Do not replace a required delegation with inline execution. Do not inject these as child-agent permission to spawn subagents; children receive concrete role work and must not orchestrate.
 
+The bounded multi-file writer precedence in rule 2 overrides that general runtime preference. If no delegation mechanism is available, stop and explain the blocker.
+
 1. **4-file rule**: if understanding requires reading 4+ files, launch `scout`, `context-builder`, or the closest read-only mapping subagent with fresh context and a narrow mapping task. State the fallback agent/runtime if the preferred one is unavailable.
-2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, delegate one writer; inline writing is allowed only for trivial/mechanical edits or when the parent explicitly records why no delegation runtime is available. A fresh review still follows delegated implementation.
+2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, delegate one writer; inline writing is allowed only for trivial/mechanical edits. A fresh review still follows delegated implementation.
+   For bounded multi-file writes, prefer the installed package-owned `gentle-ai-worker`, then a user-configured `worker`. If neither worker definition exists, fall back to the native `Agent` even when `subagent_*` tools are available. If no delegation mechanism is available, stop and explain the blocker.
+
 3. **PR rule**: before commit/push/PR for code changes, select a fresh-context review lens unless the diff is trivial docs/text-only.
 4. **Incident rule**: after wrong `cwd`, accidental repo/worktree mutation, failed merge recovery, confusing test command, or environment workaround, stop and run a fresh audit through the relevant review lens before continuing.
 5. **Long-session rule**: if accumulating work is no longer clearly local — roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without delegation — pause and delegate the remaining work instead of silently continuing monolithically.

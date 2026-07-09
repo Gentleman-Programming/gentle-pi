@@ -121,19 +121,19 @@ test(`getOrchestratorPrompt return value stays within the 10,240 B budget at a r
 //
 // Every normative line of the frozen pre-diet fixture is assigned to exactly
 // one documented disposition: CORE_VERBATIM (byte-identical in the new
-// core), or LAZY_VERBATIM (byte-identical in one specific lazy file, while
-// core carries a freshly-authored CORE_SUMMARIZED_INTO summary sentence that
-// is NOT literal-matched against the original line). Section headings that
-// are reused unchanged as the new core's summary heading are CORE_VERBATIM;
-// section bodies that are condensed away in core are LAZY_VERBATIM against
-// their one target lazy file — never a blanket union across all three.
+// core), LAZY_VERBATIM (byte-identical in one specific lazy file), or OBSOLETE
+// (intentionally absent from every live model-facing asset). Section headings
+// that are reused unchanged as the new core's summary heading are
+// CORE_VERBATIM; section bodies that are condensed away in core are
+// LAZY_VERBATIM against their one target lazy file — never a blanket union
+// across all three.
 // ---------------------------------------------------------------------------
 
 type Target = "core" | "delegation" | "memory" | "skills";
 
 interface DispositionRange {
 	lines: [number, number];
-	target: Target;
+	target: Target | "obsolete";
 	label: string;
 }
 
@@ -162,9 +162,19 @@ const DISPOSITION_MAP: DispositionRange[] = [
 	{ lines: [112, 112], target: "core", label: "Delegation Rules heading" },
 	{ lines: [114, 114], target: "core", label: "Delegation Rules core question" },
 	{
-		lines: [116, 181],
+		lines: [116, 132],
 		target: "delegation",
-		label: "Delegation Rules table + Mandatory Triggers + Cost/Context Balance + Canonical Workflows + Review Lens Selection",
+		label: "Delegation Rules table + Mandatory Triggers preamble",
+	},
+	{
+		lines: [133, 133],
+		target: "obsolete",
+		label: "Superseded no-runtime inline exception",
+	},
+	{
+		lines: [134, 181],
+		target: "delegation",
+		label: "Mandatory Triggers remainder + Cost/Context Balance + Canonical Workflows + Review Lens Selection",
 	},
 	{ lines: [183, 191], target: "core", label: "SDD Workflow pointer" },
 	{ lines: [193, 193], target: "core", label: "Memory Contract heading" },
@@ -194,11 +204,21 @@ for (const range of DISPOSITION_MAP) {
 	test(
 		`disposition-mapped union: ${range.label} (fixture:${range.lines[0]}-${range.lines[1]}) -> ${range.target}`,
 		() => {
-			const targetContent = readRealAsset(TARGET_FILE[range.target]);
+			const targetContent =
+				range.target === "obsolete"
+					? Object.values(TARGET_FILE).map(readRealAsset).join("\n")
+					: readRealAsset(TARGET_FILE[range.target]);
 			for (let ln = range.lines[0]; ln <= range.lines[1]; ln++) {
 				const raw = fixtureLines[ln - 1];
 				if (raw === undefined || !isNormativeLine(raw)) continue;
 				const trimmed = raw.trim();
+				if (range.target === "obsolete") {
+					assert.ok(
+						!targetContent.includes(trimmed),
+						`obsolete line retained: fixture:${ln} "${trimmed}" remains in a live model-facing asset (section: ${range.label})`,
+					);
+					continue;
+				}
 				assert.ok(
 					targetContent.includes(trimmed),
 					`normative line lost: fixture:${ln} "${trimmed}" not found verbatim in ${TARGET_FILE[range.target]} (disposition: ${range.target}, section: ${range.label})`,
