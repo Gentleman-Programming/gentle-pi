@@ -886,6 +886,49 @@ test("installSddAssets installs gentle-ai-worker with a loader-compatible scoped
 	);
 });
 
+test("normal and forced installation copy generic agents with complete role contracts", () => {
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const expectedTools = {
+		"gentle-ai-explore": ["read", "grep", "find"],
+		"gentle-ai-verify": ["read", "grep", "find", "bash"],
+	} as const;
+
+	try {
+		for (const force of [false, true]) {
+			const temporaryAgentHome = mkdtempSync(join(tmpdir(), "gentle-pi-generic-agents-"));
+			process.env.GENTLE_PI_AGENT_HOME = temporaryAgentHome;
+			try {
+				installSddAssets(PACKAGE_ROOT, force);
+
+				for (const [name, tools] of Object.entries(expectedTools)) {
+					const packagedPath = join(PACKAGE_ROOT, "assets", "agents", `${name}.md`);
+					const installedPath = join(temporaryAgentHome, "agents", `${name}.md`);
+					const { name: installedName, source, tools: installedTools } = readAgentDefinition(installedPath);
+					assert.equal(source, readFileSync(packagedPath, "utf8"));
+					assert.equal(installedName, name);
+					assert.deepEqual(installedTools, tools);
+					assert.match(source, /generic non-SDD work/);
+					assert.match(source, /Do not (?:fix findings, delegate to child agents|delegate to child agents, commit)/);
+					assert.match(source, /Do not (?:edit, write|edit, write, or fix findings)/);
+					assert.match(source, /compressed (?:handoff|evidence handoff)/);
+					assert.match(source, /Do not use SDD phase protocols or review lenses\./);
+					if (name === "gentle-ai-verify") {
+						assert.match(source, /exact test, build, or lint commands explicitly authorized by the parent/);
+						assert.match(source, /only outputs the parent explicitly identified as expected/);
+						assert.match(source, /unexpected mutation as a blocker/);
+						assert.match(source, /do not clean it up or fix it/);
+					}
+				}
+			} finally {
+				rmSync(temporaryAgentHome, { recursive: true, force: true });
+			}
+		}
+	} finally {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+	}
+});
+
 test("bounded implementation routing uses the same explicit fallback in both policy sections", () => {
 	const routing = readFileSync(
 		join(PACKAGE_ROOT, "assets", "orchestrator-delegation.md"),
@@ -906,6 +949,24 @@ test("bounded implementation routing uses the same explicit fallback in both pol
 		/`generic-writer`/,
 		"routing must not revive the collision-prone generic package name",
 	);
+});
+
+test("orchestrator routes generic roles without reusing SDD or review agents", () => {
+	for (const file of ["orchestrator.md", "orchestrator-delegation.md"]) {
+		const routing = readFileSync(join(PACKAGE_ROOT, "assets", file), "utf8");
+		assert.match(routing, /generic non-SDD exploration[\s\S]*`gentle-ai-explore`/);
+		assert.match(
+			routing,
+			/bounded (?:non-SDD )?(?:implementation|multi-file writes)[\s\S]*`gentle-ai-worker`/,
+		);
+		assert.match(routing, /generic non-SDD (?:technical )?verification[\s\S]*`gentle-ai-verify`/);
+		assert.match(routing, /SDD roles stay inside SDD|Use `sdd-explore` and `sdd-verify` only inside SDD/);
+		assert.match(routing, /review lenses inside reviews|Use review lenses only inside explicit review transactions/);
+		assert.match(routing, /(?:truly local )?read-only check(?:ing)? of (?:known )?1-3 known files|1-3-file read-only check/);
+		assert.match(routing, /(?:verification that |verification commands →).*executes? or delegates?|executing\/delegating verification commands/);
+		assert.match(routing, /missing(?: or |\/)unusable[\s\S]*native `Agent`[\s\S]*(?:the )?same read-only/);
+		assert.match(routing, /report (?:the )?fallback/);
+	}
 });
 
 test("pi-pretty wrapper uses real package path resolution for pnpm symlink installs", () => {

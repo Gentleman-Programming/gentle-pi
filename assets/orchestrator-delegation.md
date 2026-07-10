@@ -29,6 +29,8 @@ Examples:
 
 Do not add SDD ceremony. Do not delegate just to look sophisticated. But do not use this exception to avoid delegation after the task stops being small.
 
+Here, focused verification means truly local read-only checking of 1-3 known files; verification that executes or delegates commands is not inline.
+
 ### 2. Simple Delegation
 
 Delegate when the work would inflate parent context or requires focused exploration, validation, or multi-file implementation, but does not yet need a full SDD lifecycle.
@@ -44,14 +46,20 @@ Examples:
 
 Use the configured subagent runtime when available. Prefer the `subagent_*` tools (`subagent_run`, status/result helpers) when the Pi Subagents extension is installed, because they run the user's configured project/global subagent definitions and preserve history/background behavior.
 
-The bounded multi-file writer precedence below is the explicit exception to this general runtime preference.
+The generic role precedence below is the explicit exception to this general runtime preference.
 
 Choose subagent mode by orchestration dependency, not by task length:
 
 - Use `mode: "task"` when the parent must consume the result and continue the workflow, including SDD phases, implementation batches, verification, controller-selected review actors, and any delegated work whose output determines the next action. Lifecycle gates themselves launch zero actors.
 - Use `mode: "background"` only for independent work where automatic parent continuation is not required. Background completion may notify the user and preserve history, but it is not a guarantee that the parent model will resume orchestration.
 
+For generic non-SDD exploration and mapping, first attempt the installed package-owned `gentle-ai-explore`. If that individual role is missing or unusable, fall back to Pi's native `Agent` with the same read-only mapping constraints and report the fallback.
+
 For bounded multi-file writes, prefer the installed package-owned `gentle-ai-worker`, then a user-configured `worker`. If neither worker definition exists, fall back to the native `Agent` even when `subagent_*` tools are available. This writer precedence overrides the general runtime preference above.
+
+For generic non-SDD technical verification that executes or delegates commands, first attempt the installed package-owned `gentle-ai-verify`. If that individual role is missing or unusable, fall back to Pi's native `Agent` with the same read-only verification constraints, exact parent-authorized commands, and fallback reporting. Truly local read-only checking of 1-3 known files may remain inline.
+
+Use `sdd-explore` and `sdd-verify` only inside SDD. Use review lenses only inside explicit review transactions.
 
 For delegation other than bounded multi-file writes, use the generic fallback:
 
@@ -104,6 +112,8 @@ Core question: does this inflate parent context without need?
 | Commit, push, or open PR after code changes          |     no | no actor; validate approved receipt + exact target |
 | Recover from wrong cwd/worktree/git/tooling incident |     no | diagnose separately without reopening review authority |
 
+The first row permits only a truly local read-only check of known files. Any generic non-SDD verification that executes or delegates commands must be delegated.
+
 ### Mandatory Delegation Triggers
 
 These are parent-orchestrator stop rules. Once any trigger fires, the parent MUST delegate through the best available subagent runtime. Prefer `subagent_run` when present; otherwise use Pi's native `Agent` or another available delegation mechanism. Do not replace a required delegation with inline execution. Do not inject these as child-agent permission to spawn subagents; children receive concrete role work and must not orchestrate.
@@ -111,6 +121,7 @@ These are parent-orchestrator stop rules. Once any trigger fires, the parent MUS
 The bounded multi-file writer precedence in rule 2 overrides that general runtime preference. If no delegation mechanism is available, stop and explain the blocker.
 
 1. **4-file rule**: if understanding requires reading 4+ files, launch `scout`, `context-builder`, or the closest read-only mapping subagent with fresh context and a narrow mapping task. State the fallback agent/runtime if the preferred one is unavailable.
+   Route generic non-SDD exploration to `gentle-ai-explore`; if missing or unusable, use native `Agent` with the same read-only mapping task and report the fallback.
 2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, delegate one writer; inline writing is allowed only for trivial/mechanical edits. Any review work remains inside the already-bound transaction budget.
    For bounded multi-file writes, prefer the installed package-owned `gentle-ai-worker`, then a user-configured `worker`. If neither worker definition exists, fall back to the native `Agent` even when `subagent_*` tools are available. If no delegation mechanism is available, stop and explain the blocker.
 
@@ -118,6 +129,7 @@ The bounded multi-file writer precedence in rule 2 overrides that general runtim
 4. **Incident rule**: after wrong `cwd`, accidental repo/worktree mutation, failed merge recovery, confusing test command, or environment workaround, stop and diagnose the incident separately without reopening a closed lineage or resetting its budget.
 5. **Long-session rule**: if accumulating work is no longer clearly local — roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without delegation — pause and delegate the remaining work instead of silently continuing monolithically.
 6. **Review actor rule**: use review lens subagents only when selected at ordinary transaction start. Explicit Judgment Day uses the named judges; lifecycle and SDD boundaries launch zero review actors.
+7. **Verification rule**: delegate generic non-SDD verification that executes or delegates commands to `gentle-ai-verify`. If that role is missing or unusable, use native `Agent` with the same read-only verification task and exact parent-authorized commands, and report the fallback. Only truly local read-only checking of 1-3 known files stays inline.
 
 ### Cost and Context Balance
 

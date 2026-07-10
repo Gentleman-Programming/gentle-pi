@@ -37,8 +37,8 @@ Delegation is not optional once complexity appears. If a task crosses the trigge
 
 Route work through the smallest harness that is safe. Three tiers:
 
-1. **Inline Direct** — small, mechanical, parent already has enough context (typo, one-file edit, 1-3-file verification, bash for state). No SDD ceremony; do not delegate to look sophisticated, but do not hide behind this once the task stops being small.
-2. **Simple Delegation** — inflates parent context, or needs focused exploration/validation/multi-file implementation, short of a full SDD lifecycle. Prefer `subagent_*` tools; use `mode: "task"` when the parent must consume the result and continue, `mode: "background"` only for independent work. Fall back to Pi's native `Agent` tool if `subagent_*` is unavailable — delegation stays mandatory, only the runtime changes. Do not pass `model` for generic subagents unless the user explicitly asks for an override.
+1. **Inline Direct** — small, mechanical, parent has context (typo, one-file edit, read-only check of 1-3 known files, bash for state). No SDD ceremony; stop when it is no longer small.
+2. **Simple Delegation** — generic non-SDD exploration → `gentle-ai-explore`; bounded implementation → `gentle-ai-worker`; command-running generic non-SDD verification → `gentle-ai-verify`. Try its package role; if missing/unusable, use native `Agent` under the same read-only mapping/verification constraints and report fallback. SDD roles stay inside SDD; review lenses inside reviews.
 3. **SDD** — large, ambiguous, architectural, product-facing, multi-area, or high-review-risk work, or an explicit `/sdd-new`/`/sdd-ff`/`/sdd-continue` request. Do not jump to implementation; create artifacts and gate for approval.
 
 ## Delegation Rules
@@ -47,7 +47,7 @@ Core question: does this inflate parent context without need?
 
 | Action | Inline | Delegate |
 |---|---:|---:|
-| Read to decide/verify 1-3 files | yes | no |
+| Truly local read-only check of 1-3 known files | yes | no |
 | Read to explore/understand 4+ files | no | yes |
 | Write atomic one-file mechanical change | yes | no |
 | Write with analysis across multiple files | no | yes |
@@ -61,8 +61,9 @@ Mandatory Delegation Triggers — stop rules; once fired, delegate through the b
 2. **Multi-file write rule** — 2+ non-trivial files touched → delegate one writer.
 3. **Lifecycle gate rule** — commit/push/PR/release validates an approved receipt and exact typed target with zero actors. Missing or changed authority fails closed; it never launches a same-lineage review.
 4. **Incident rule** — diagnose wrong cwd/worktree/git/tooling incidents separately. An incident never reopens a closed review lineage or resets its budget.
-5. **Long-session rule** — ~20 tool calls, 5 exploratory reads, or 2 non-mechanical edits without delegation → pause and delegate.
-6. **Review actor rule** — review lenses run only when selected by ordinary transaction start; explicit Judgment Day uses its two named judges. Lifecycle and SDD boundaries launch zero review actors.
+5. **Verification rule** — executing/delegating verification commands → `gentle-ai-verify`; only the 1-3-file read-only check stays inline.
+6. **Long-session rule** — ~20 tool calls, 5 exploratory reads, or 2 non-mechanical edits without delegation → pause and delegate.
+7. **Review actor rule** — review lenses run only when selected by ordinary transaction start; explicit Judgment Day uses its two named judges. Lifecycle and SDD boundaries launch zero review actors.
 
 Full table, Work Routing Ladder examples/model-routing detail, Cost and Context Balance, Canonical Workflows, and Review Lens Selection detail: `{{GENTLE_PI_DELEGATION_PATH}}`.
 
