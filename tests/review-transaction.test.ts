@@ -367,7 +367,7 @@ test("store exposes only reducer-bound authority transitions", (t) => {
 	assert.deepEqual(store.read("lineage-a").lenses, [REVIEW_LENS.RISK]);
 });
 
-test("repository store is rooted below the Git directory with private directory and file modes", (t) => {
+test("repository authority fails closed until Git has stable root commit anchors", (t) => {
 	const parent = mkdtempSync(join(tmpdir(), "gentle-pi-review-git-store-"));
 	const repository = join(parent, "repo");
 	mkdirSync(repository);
@@ -375,18 +375,5 @@ test("repository store is rooted below the Git directory with private directory 
 	const git = (...args: string[]): string =>
 		execFileSync("git", args, { cwd: repository, encoding: "utf8" }).trim();
 	git("init", "-b", "main");
-	const store = ReviewTransactionStore.forRepository(repository);
-	store.create(state(), "start-a");
-
-	assert.equal(store.root, join(git("rev-parse", "--absolute-git-dir"), "gentle-ai", "reviews"));
-	assert.equal(statSync(store.root).mode & 0o777, 0o700);
-	assert.equal(
-		statSync(join(store.root, "lineages", "lineage-a", "HEAD")).mode & 0o777,
-		0o600,
-	);
-	assert.equal(
-		statSync(join(store.root, "lineages", "lineage-a", "revisions", "0.json")).mode &
-			0o777,
-		0o600,
-	);
+	assert.throws(() => ReviewTransactionStore.forRepository(repository), /root commit anchors/i);
 });

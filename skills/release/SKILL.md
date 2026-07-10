@@ -17,6 +17,7 @@ Use this skill when preparing, publishing, or verifying a `gentle-pi` release.
 - npm publishing MUST go through the GitHub Actions workflow `.github/workflows/publish.yml` so provenance, environment protection, and registry credentials are controlled by GitHub.
 - Use a clean worktree for release commits. Do not package unrelated local files or scratch artifacts.
 - Validate the approved receipt against the exact immutable release target with zero review actors before publication.
+- Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise fail closed through native receipt validation. Never infer the tag target from local `HEAD`. Major and post-incident releases require explicit extraordinary review even when fast-path checks pass.
 - Never skip package verification. The publish workflow runs verification again, but local validation should still pass before tagging.
 
 ## Release Procedure

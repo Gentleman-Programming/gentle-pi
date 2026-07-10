@@ -267,7 +267,9 @@ test("core-alone: load-bearing delegation tokens present without lazy union", ()
 test("core-alone: receipt-only lifecycle and independent safety are present without lazy union", () => {
 	const core = readRealAsset("orchestrator.md");
 	assert.match(core, /Only ordinary transaction start classifies/i);
-	assert.match(core, /Pre-commit, pre-push, PR, and release gates.*zero actors/i);
+	assert.match(core, /Pre-commit, pre-push, and PR gates.*zero actors/i);
+	assert.match(core, /Release from protected `main` may bypass receipt validation only when/i);
+	assert.match(core, /Major and post-incident releases require explicit extraordinary review/i);
 	assert.match(core, /Dangerous-command safety remains independent and authoritative/i);
 	assert.match(core, /SDD completion adds no review or Judgment Day pass/i);
 });

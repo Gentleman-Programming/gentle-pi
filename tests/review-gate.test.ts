@@ -6,30 +6,38 @@ import { join } from "node:path";
 import test from "node:test";
 import { __testing } from "../extensions/gentle-ai.ts";
 import {
+	EXTERNAL_RELEASE_EVIDENCE,
 	GATE_RESULT,
 	GATE_TARGET_KIND,
 	PUSH_UPDATE_KIND,
+	RELEASE_FAST_PATH_PROTECTED_REF,
 	REVIEW_MODE,
 	REVIEW_TRANSITION,
 	TERMINAL_STATE,
 	ReviewTransactionStore,
+	type AuthoritativeReceiptV1,
 	canonicalHash,
 	createReceiptForState,
 	createReviewState,
 	evaluateGateTarget,
+	evaluateReleaseFastPathV1,
+	recheckReleaseFastPathRemoteHeadV1,
 	validateReviewGate,
 	type GateTargetV1,
+	type GhCommandRunnerV1,
 	type ReceiptBodyV1,
 	type ReceiptEnvelopeV1,
+	type ReleaseFastPathEvidenceV1,
 	type ReviewBudgetV1,
 	type ReviewStateV1,
 } from "../lib/review-transaction.ts";
 import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
-import { testSnapshot } from "./review-test-fixtures.ts";
+import { qualifiedReviewLockPlatform, testSnapshot } from "./review-test-fixtures.ts";
 
 interface GateRepository {
 	repository: string;
 	remote: string;
+	remotePath: string;
 	baseTree: string;
 	finalTree: string;
 	changedTree: string;
@@ -77,6 +85,7 @@ function createGateRepository(t: test.TestContext): GateRepository {
 	return {
 		repository,
 		remote: "origin",
+		remotePath: remote,
 		baseTree,
 		finalTree,
 		changedTree,
@@ -122,9 +131,10 @@ function receiptFor(state: ReviewStateV1): ReceiptEnvelopeV1 {
 function temporaryAuthority(t: test.TestContext): GateRepository & {
 	store: ReviewTransactionStore;
 	receipt: ReceiptEnvelopeV1;
+	authoritativeReceipt: AuthoritativeReceiptV1;
 } {
 	const repository = createGateRepository(t);
-	const store = ReviewTransactionStore.forRepository(repository.repository);
+	const store = ReviewTransactionStore.forRepository(repository.repository, { mutationLockPlatform: qualifiedReviewLockPlatform() });
 	store.create(initialState(repository), "start-approved-lineage");
 	store.runReducerOperation({
 		lineageId: "approved-lineage",
@@ -145,7 +155,7 @@ function temporaryAuthority(t: test.TestContext): GateRepository & {
 		input: { passed: true },
 	});
 	const state = store.read("approved-lineage");
-	return { ...repository, store, receipt: receiptFor(state) };
+	return { ...repository, store, receipt: receiptFor(state), authoritativeReceipt: store.createAuthoritativeReceipt("approved-lineage") };
 }
 
 test("lifecycle command classification identifies gates but never runs review routing", () => {
@@ -156,8 +166,34 @@ test("lifecycle command classification identifies gates but never runs review ro
 	assert.equal(__testing.classifyReviewEvent("git status"), null);
 });
 
-test("exact intended commit target allows with zero actors and journal replay is stable", (t) => {
+test("unbranded receipts are rejected before lifecycle gate evaluation", (t) => {
 	const { repository, finalTree, store, receipt } = temporaryAuthority(t);
+	execFileSync("git", ["read-tree", finalTree], { cwd: repository });
+	assert.throws(() => validateReviewGate({
+		store,
+		receipt,
+		target: { kind: GATE_TARGET_KIND.INTENDED_COMMIT, intended_commit_tree: finalTree },
+		repositoryCwd: repository,
+		idempotencyKey: "unbranded-gate",
+		scopeBudget: budget(),
+	}), /branded authoritative receipt/i);
+});
+
+test("authoritative receipts cannot be validated through another repository store", (t) => {
+	const authority = temporaryAuthority(t);
+	const other = temporaryAuthority(t);
+	assert.throws(() => validateReviewGate({
+		store: other.store,
+		receipt: authority.authoritativeReceipt,
+		target: { kind: GATE_TARGET_KIND.INTENDED_COMMIT, intended_commit_tree: authority.finalTree },
+		repositoryCwd: authority.repository,
+		idempotencyKey: "cross-store-gate",
+		scopeBudget: budget(),
+	}), /authority/i);
+});
+
+test("exact intended commit target allows with zero actors and journal replay is stable", (t) => {
+	const { repository, finalTree, store, receipt, authoritativeReceipt } = temporaryAuthority(t);
 	execFileSync("git", ["read-tree", finalTree], { cwd: repository });
 	const target = {
 		kind: GATE_TARGET_KIND.INTENDED_COMMIT,
@@ -165,7 +201,7 @@ test("exact intended commit target allows with zero actors and journal replay is
 	} as const;
 	const first = validateReviewGate({
 		store,
-		receipt,
+		receipt: authoritativeReceipt,
 		target,
 		repositoryCwd: repository,
 		idempotencyKey: "gate-commit-1",
@@ -175,8 +211,8 @@ test("exact intended commit target allows with zero actors and journal replay is
 	assert.equal(first.actor_count, 0);
 	assert.equal(first.target_hash, canonicalHash(target));
 	const replay = validateReviewGate({
-		store: ReviewTransactionStore.forRepository(repository),
-		receipt,
+		store: ReviewTransactionStore.forRepository(repository, { mutationLockPlatform: qualifiedReviewLockPlatform() }),
+		receipt: store.createAuthoritativeReceipt(receipt.body.lineage_id),
 		target,
 		repositoryCwd: repository,
 		idempotencyKey: "gate-commit-1",
@@ -184,6 +220,16 @@ test("exact intended commit target allows with zero actors and journal replay is
 	});
 	assert.deepEqual(replay, first);
 	assert.equal(store.read(receipt.body.lineage_id).revision, 4);
+});
+
+test("exact gate retries replay before stale receipt binding while new requests still deny", (t) => {
+	const { repository, finalTree, store, authoritativeReceipt } = temporaryAuthority(t);
+	execFileSync("git", ["read-tree", finalTree], { cwd: repository });
+	const target = { kind: GATE_TARGET_KIND.INTENDED_COMMIT, intended_commit_tree: finalTree } as const;
+	const first = validateReviewGate({ store, receipt: authoritativeReceipt, target, repositoryCwd: repository, idempotencyKey: "stale-retry", scopeBudget: budget() });
+	const replay = validateReviewGate({ store, receipt: authoritativeReceipt, target, repositoryCwd: repository, idempotencyKey: "stale-retry", scopeBudget: budget() });
+	assert.deepEqual(replay, first);
+	assert.throws(() => validateReviewGate({ store, receipt: authoritativeReceipt, target, repositoryCwd: repository, idempotencyKey: "stale-new-request", scopeBudget: budget() }), /stale|unbound/i);
 });
 
 test("intended commit target denies when the actual staged tree drifted after approval", (t) => {
@@ -207,14 +253,14 @@ test("intended commit target denies when the actual staged tree drifted after ap
 });
 
 test("changed exact target returns one deterministic child with a non-refreshing budget", (t) => {
-	const { repository, changedTree, store, receipt } = temporaryAuthority(t);
+	const { repository, changedTree, store, receipt, authoritativeReceipt } = temporaryAuthority(t);
 	const target = {
 		kind: GATE_TARGET_KIND.INTENDED_COMMIT,
 		intended_commit_tree: changedTree,
 	} as const;
 	const first = validateReviewGate({
 		store,
-		receipt,
+		receipt: authoritativeReceipt,
 		target,
 		repositoryCwd: repository,
 		idempotencyKey: "scope-1",
@@ -226,7 +272,7 @@ test("changed exact target returns one deterministic child with a non-refreshing
 	assert.equal(first.child_claim?.budget.review_actors, 4);
 	const replayUnderAnotherGateKey = validateReviewGate({
 		store,
-		receipt,
+		receipt: store.createAuthoritativeReceipt(receipt.body.lineage_id),
 		target,
 		repositoryCwd: repository,
 		idempotencyKey: "scope-2",
@@ -388,10 +434,11 @@ test("unsupported, ambiguous, nonexistent, and non-approved targets fail closed"
 });
 
 test("scope child claim and parent gate journal publish atomically across faults", (t) => {
-	const { repository, changedTree, store, receipt } = temporaryAuthority(t);
+	const { repository, changedTree, store, receipt, authoritativeReceipt } = temporaryAuthority(t);
 	const before = store.read(receipt.body.lineage_id);
 	let injected = false;
 	const faulty = ReviewTransactionStore.forRepository(repository, {
+		mutationLockPlatform: qualifiedReviewLockPlatform(),
 		faultInjector(point) {
 			if (!injected && point === "before-head-rename") {
 				injected = true;
@@ -406,7 +453,7 @@ test("scope child claim and parent gate journal publish atomically across faults
 	assert.throws(
 		() => validateReviewGate({
 			store: faulty,
-			receipt,
+			receipt: authoritativeReceipt,
 			target,
 			repositoryCwd: repository,
 			idempotencyKey: "scope-fault",
@@ -421,7 +468,7 @@ test("scope child claim and parent gate journal publish atomically across faults
 
 	const published = validateReviewGate({
 		store,
-		receipt,
+		receipt: authoritativeReceipt,
 		target,
 		repositoryCwd: repository,
 		idempotencyKey: "scope-fault",
@@ -468,4 +515,322 @@ test("receipt gate cannot bypass independent dangerous-command safety", async ()
 	assert.deepEqual(blocked, gateBlock);
 	assert.equal(safetyCalls, 2);
 	assert.equal(gateCalls, 1);
+});
+
+function releaseTarget(repository: GateRepository): GateTargetV1 {
+	return {
+		kind: GATE_TARGET_KIND.RELEASE,
+		tag_ref: "refs/tags/v1.2.3",
+		tag_object: repository.tagObject,
+		peeled_commit: repository.finalCommit,
+		tree: repository.finalTree,
+	};
+}
+
+function fastPathEvidence(
+	repository: GateRepository,
+	overrides: Partial<ReleaseFastPathEvidenceV1> = {},
+): ReleaseFastPathEvidenceV1 {
+	return {
+		protected_ref: RELEASE_FAST_PATH_PROTECTED_REF,
+		remote: repository.remote,
+		ci: { revision: repository.finalCommit, status: "success" },
+		external_evidence: EXTERNAL_RELEASE_EVIDENCE.NONE,
+		post_incident: false,
+		...overrides,
+	};
+}
+
+function setRemoteMain(repository: GateRepository, commit: string): void {
+	execFileSync("git", ["--git-dir", repository.remotePath, "update-ref", "refs/heads/main", commit]);
+}
+
+// A stub `gh` command runner that only reports success when the exact SHA
+// under test is present in the invoked arguments — mirroring `gh api
+// repos/{owner}/{repo}/commits/<sha>/status` being bound to one exact SHA.
+function successfulGhCommandRunner(expectedSha: string): GhCommandRunnerV1 {
+	return (args) => ({
+		status: args.some((arg) => arg.includes(expectedSha)) ? 0 : 1,
+		stdout: "success",
+	});
+}
+
+test("release fast path proves the immutable origin/main SHA and ignores local branch position and worktree dirtiness", (t) => {
+	const repository = createGateRepository(t);
+	setRemoteMain(repository, repository.finalCommit);
+	// Local publication inputs must be irrelevant: detached HEAD at an older commit plus a dirty worktree.
+	execFileSync("git", ["checkout", "--force", "--detach", repository.baseCommit], {
+		cwd: repository.repository,
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	writeFileSync(join(repository.repository, "app.ts"), "export const value = 999; // dirty\n");
+	const evaluation = evaluateReleaseFastPathV1({
+		target: releaseTarget(repository),
+		evidence: fastPathEvidence(repository),
+		repositoryCwd: repository.repository,
+		ghCommandRunner: successfulGhCommandRunner(repository.finalCommit),
+	});
+	assert.equal(evaluation.eligible, true, evaluation.reason);
+	assert.equal(evaluation.remote_head, repository.finalCommit);
+	assert.match(evaluation.reason, /immutable origin\/main SHA/i);
+});
+
+test("release fast path fails closed when the tag does not target the current immutable origin/main SHA", (t) => {
+	const repository = createGateRepository(t);
+	setRemoteMain(repository, repository.baseCommit);
+	const evaluation = evaluateReleaseFastPathV1({
+		target: releaseTarget(repository),
+		evidence: fastPathEvidence(repository, { ci: { revision: repository.baseCommit, status: "success" } }),
+		repositoryCwd: repository.repository,
+	});
+	assert.equal(evaluation.eligible, false);
+	assert.match(evaluation.reason, /not the current immutable origin\/main SHA/i);
+});
+
+test("release fast path requires successful required CI bound to the exact origin/main SHA", (t) => {
+	const repository = createGateRepository(t);
+	setRemoteMain(repository, repository.finalCommit);
+	for (const ci of [
+		{ revision: repository.baseCommit, status: "success" },
+		{ revision: repository.finalCommit, status: "failure" },
+		{ revision: repository.finalCommit, status: "pending" },
+	]) {
+		const evaluation = evaluateReleaseFastPathV1({
+			target: releaseTarget(repository),
+			evidence: fastPathEvidence(repository, { ci }),
+			repositoryCwd: repository.repository,
+		});
+		assert.equal(evaluation.eligible, false, JSON.stringify(ci));
+		assert.match(evaluation.reason, /required CI/i);
+	}
+});
+
+test("release fast path fails closed on escalating or invalidating fresh risk evidence", (t) => {
+	const repository = createGateRepository(t);
+	setRemoteMain(repository, repository.finalCommit);
+	for (const disposition of [
+		EXTERNAL_RELEASE_EVIDENCE.ESCALATING,
+		EXTERNAL_RELEASE_EVIDENCE.INVALIDATING,
+	]) {
+		const evaluation = evaluateReleaseFastPathV1({
+			target: releaseTarget(repository),
+			evidence: fastPathEvidence(repository, { external_evidence: disposition }),
+			repositoryCwd: repository.repository,
+			ghCommandRunner: successfulGhCommandRunner(repository.finalCommit),
+		});
+		assert.equal(evaluation.eligible, false, disposition);
+		assert.match(evaluation.reason, /vulnerability, policy, provenance, signing, generated-artifact, or release evidence/i);
+	}
+});
+
+test("major, post-incident, and unprovable-version releases always require explicit extraordinary review", (t) => {
+	const repository = createGateRepository(t);
+	setRemoteMain(repository, repository.finalCommit);
+	const git = (...args: string[]): string =>
+		execFileSync("git", args, { cwd: repository.repository, encoding: "utf8" }).trim();
+
+	const postIncident = evaluateReleaseFastPathV1({
+		target: releaseTarget(repository),
+		evidence: fastPathEvidence(repository, { post_incident: true }),
+		repositoryCwd: repository.repository,
+	});
+	assert.equal(postIncident.eligible, false);
+	assert.match(postIncident.reason, /extraordinary review/i);
+
+	git("-c", "user.name=Gate Test", "-c", "user.email=gate@example.invalid", "tag", "-a", "v2.0.0", "-m", "major", repository.finalCommit);
+	const majorTagObject = git("rev-parse", "refs/tags/v2.0.0^{object}");
+	const major = evaluateReleaseFastPathV1({
+		target: { ...releaseTarget(repository), tag_ref: "refs/tags/v2.0.0", tag_object: majorTagObject },
+		evidence: fastPathEvidence(repository),
+		repositoryCwd: repository.repository,
+	});
+	assert.equal(major.eligible, false);
+	assert.match(major.reason, /major releases require explicit extraordinary review/i);
+
+	git("-c", "user.name=Gate Test", "-c", "user.email=gate@example.invalid", "tag", "-a", "nightly", "-m", "opaque", repository.finalCommit);
+	const opaqueTagObject = git("rev-parse", "refs/tags/nightly^{object}");
+	const opaque = evaluateReleaseFastPathV1({
+		target: { ...releaseTarget(repository), tag_ref: "refs/tags/nightly", tag_object: opaqueTagObject },
+		evidence: fastPathEvidence(repository),
+		repositoryCwd: repository.repository,
+	});
+	assert.equal(opaque.eligible, false);
+	assert.match(opaque.reason, /major release cannot be ruled out/i);
+});
+
+test("release fast path treats vX.0.0 and pre-1.0 v0.Y.0 minor bumps as major-equivalent, while v0.Y.Z patch releases remain eligible", (t) => {
+	const repository = createGateRepository(t);
+	setRemoteMain(repository, repository.finalCommit);
+	const git = (...args: string[]): string =>
+		execFileSync("git", args, { cwd: repository.repository, encoding: "utf8" }).trim();
+	const tagRelease = (name: string): GateTargetV1 => {
+		git("-c", "user.name=Gate Test", "-c", "user.email=gate@example.invalid", "tag", "-a", name, "-m", name, repository.finalCommit);
+		const tagObject = git("rev-parse", `refs/tags/${name}^{object}`);
+		return { ...releaseTarget(repository), tag_ref: `refs/tags/${name}`, tag_object: tagObject };
+	};
+
+	const v100 = evaluateReleaseFastPathV1({
+		target: tagRelease("v1.0.0"),
+		evidence: fastPathEvidence(repository),
+		repositoryCwd: repository.repository,
+		ghCommandRunner: successfulGhCommandRunner(repository.finalCommit),
+	});
+	assert.equal(v100.eligible, false, v100.reason);
+	assert.match(v100.reason, /major releases require explicit extraordinary review/i);
+
+	const v0160 = evaluateReleaseFastPathV1({
+		target: tagRelease("v0.16.0"),
+		evidence: fastPathEvidence(repository),
+		repositoryCwd: repository.repository,
+		ghCommandRunner: successfulGhCommandRunner(repository.finalCommit),
+	});
+	assert.equal(v0160.eligible, false, v0160.reason);
+	assert.match(v0160.reason, /major releases require explicit extraordinary review/i);
+
+	const v0151 = evaluateReleaseFastPathV1({
+		target: tagRelease("v0.15.1"),
+		evidence: fastPathEvidence(repository),
+		repositoryCwd: repository.repository,
+		ghCommandRunner: successfulGhCommandRunner(repository.finalCommit),
+	});
+	assert.equal(v0151.eligible, true, v0151.reason);
+});
+
+test("release fast path applies only to protected main with a provable remote head and exact tag identity", (t) => {
+	const repository = createGateRepository(t);
+	setRemoteMain(repository, repository.finalCommit);
+
+	const wrongRef = evaluateReleaseFastPathV1({
+		target: releaseTarget(repository),
+		evidence: fastPathEvidence(repository, { protected_ref: "refs/heads/develop" }),
+		repositoryCwd: repository.repository,
+	});
+	assert.equal(wrongRef.eligible, false);
+	assert.match(wrongRef.reason, /protected refs\/heads\/main/i);
+
+	execFileSync("git", ["--git-dir", repository.remotePath, "update-ref", "-d", "refs/heads/main"]);
+	const missingRemoteHead = evaluateReleaseFastPathV1({
+		target: releaseTarget(repository),
+		evidence: fastPathEvidence(repository),
+		repositoryCwd: repository.repository,
+	});
+	assert.equal(missingRemoteHead.eligible, false);
+	assert.match(missingRemoteHead.reason, /cannot be proven/i);
+
+	setRemoteMain(repository, repository.finalCommit);
+	const forgedTag = evaluateReleaseFastPathV1({
+		target: { ...releaseTarget(repository), tag_object: repository.finalCommit === repository.tagObject ? repository.baseCommit : repository.finalCommit },
+		evidence: fastPathEvidence(repository),
+		repositoryCwd: repository.repository,
+	});
+	assert.equal(forgedTag.eligible, false);
+});
+
+test("release fast path denies a remote endpoint that is not the repository's actually configured remote name", (t) => {
+	const repository = createGateRepository(t);
+	setRemoteMain(repository, repository.finalCommit);
+
+	const fileUrl = evaluateReleaseFastPathV1({
+		target: releaseTarget(repository),
+		evidence: fastPathEvidence(repository, { remote: `file://${repository.remotePath}` }),
+		repositoryCwd: repository.repository,
+	});
+	assert.equal(fileUrl.eligible, false, "a file:// URL supplied as remote must not be eligible");
+
+	const attackerPath = evaluateReleaseFastPathV1({
+		target: releaseTarget(repository),
+		evidence: fastPathEvidence(repository, { remote: repository.remotePath }),
+		repositoryCwd: repository.repository,
+	});
+	assert.equal(attackerPath.eligible, false, "a bare filesystem path supplied as remote must not be eligible");
+
+	const nonConfigured = evaluateReleaseFastPathV1({
+		target: releaseTarget(repository),
+		evidence: fastPathEvidence(repository, { remote: "not-a-configured-remote" }),
+		repositoryCwd: repository.repository,
+	});
+	assert.equal(nonConfigured.eligible, false, "a remote name absent from the repository's configured remotes must not be eligible");
+
+	// The actually configured remote name must still resolve.
+	const configured = evaluateReleaseFastPathV1({
+		target: releaseTarget(repository),
+		evidence: fastPathEvidence(repository, { remote: "origin" }),
+		repositoryCwd: repository.repository,
+		ghCommandRunner: successfulGhCommandRunner(repository.finalCommit),
+	});
+	assert.equal(configured.eligible, true, configured.reason);
+});
+
+test("release fast path requires independently derived CI success via the gh CLI bound to the exact remote SHA — caller-supplied CI evidence alone is never sufficient", (t) => {
+	const repository = createGateRepository(t);
+	setRemoteMain(repository, repository.finalCommit);
+
+	// Caller-supplied CI evidence self-reports success for the exact SHA, but
+	// no gh command runner is supplied and the repository's remote is not a
+	// real GitHub remote, so independent derivation is unprovable — the fast
+	// path must fail closed rather than trust the self-report alone.
+	const undeprovable = evaluateReleaseFastPathV1({
+		target: releaseTarget(repository),
+		evidence: fastPathEvidence(repository),
+		repositoryCwd: repository.repository,
+	});
+	assert.equal(undeprovable.eligible, false, undeprovable.reason);
+	assert.match(undeprovable.reason, /independently derived|gh CLI/i);
+
+	// gh unavailable/erroring must fail closed.
+	const ghUnavailable = evaluateReleaseFastPathV1({
+		target: releaseTarget(repository),
+		evidence: fastPathEvidence(repository),
+		repositoryCwd: repository.repository,
+		ghCommandRunner: () => ({ status: 1, stdout: "", error: new Error("gh: command not found") }),
+	});
+	assert.equal(ghUnavailable.eligible, false);
+	assert.match(ghUnavailable.reason, /independently derived|gh CLI/i);
+
+	// Derived success bound to the wrong SHA must still deny: the runner only
+	// reports success for the base commit, never the exact remote head that
+	// the fast path is required to query.
+	const wrongShaBinding = evaluateReleaseFastPathV1({
+		target: releaseTarget(repository),
+		evidence: fastPathEvidence(repository),
+		repositoryCwd: repository.repository,
+		ghCommandRunner: successfulGhCommandRunner(repository.baseCommit),
+	});
+	assert.equal(wrongShaBinding.eligible, false);
+
+	// Derived success bound to the exact remote SHA is eligible.
+	const derived = evaluateReleaseFastPathV1({
+		target: releaseTarget(repository),
+		evidence: fastPathEvidence(repository),
+		repositoryCwd: repository.repository,
+		ghCommandRunner: successfulGhCommandRunner(repository.finalCommit),
+	});
+	assert.equal(derived.eligible, true, derived.reason);
+});
+
+test("release fast path remote head recheck detects an advanced or unresolvable protected main before tag push", (t) => {
+	const repository = createGateRepository(t);
+	setRemoteMain(repository, repository.finalCommit);
+	const unchanged = recheckReleaseFastPathRemoteHeadV1({
+		repositoryCwd: repository.repository,
+		remote: repository.remote,
+		expectedRemoteHead: repository.finalCommit,
+	});
+	assert.deepEqual(unchanged, { advanced: false, remote_head: repository.finalCommit });
+
+	setRemoteMain(repository, repository.baseCommit);
+	const advanced = recheckReleaseFastPathRemoteHeadV1({
+		repositoryCwd: repository.repository,
+		remote: repository.remote,
+		expectedRemoteHead: repository.finalCommit,
+	});
+	assert.equal(advanced.advanced, true);
+
+	execFileSync("git", ["--git-dir", repository.remotePath, "update-ref", "-d", "refs/heads/main"]);
+	const missing = recheckReleaseFastPathRemoteHeadV1({
+		repositoryCwd: repository.repository,
+		remote: repository.remote,
+		expectedRemoteHead: repository.finalCommit,
+	});
+	assert.deepEqual(missing, { advanced: true, remote_head: null });
 });

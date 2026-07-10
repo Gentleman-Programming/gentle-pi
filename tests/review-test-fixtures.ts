@@ -6,6 +6,8 @@ import {
 	type SnapshotV1,
 	type ReviewMode,
 } from "../lib/review-snapshot.ts";
+import { existsSync, renameSync } from "node:fs";
+import type { ReviewLockPlatformAdapterV1 } from "../lib/review-lock.ts";
 import {
 	REVIEW_EVENT,
 	REVIEW_LENS,
@@ -14,6 +16,18 @@ import {
 	type ReviewLens,
 	type ReviewRoute,
 } from "../lib/review-triggers.ts";
+
+export function qualifiedReviewLockPlatform(): ReviewLockPlatformAdapterV1 {
+	return {
+		name: "test-no-replace",
+		assertQualified() {},
+		proveOwnerDead() { return true; },
+		moveNoReplace(source, destination) {
+			if (existsSync(destination)) throw new Error("destination already exists");
+			renameSync(source, destination);
+		},
+	};
+}
 
 export interface TestSnapshotOptions {
 	mode?: ReviewMode;

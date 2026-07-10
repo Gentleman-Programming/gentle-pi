@@ -137,6 +137,10 @@ parent git/status + clarify → bind ordinary snapshot/route → one worker writ
 
 Review lenses are controller-selected transaction actors, not lifecycle hooks. `scout`/`context-builder` save parent context by compressing broad exploration. `worker` preserves a single writer thread. Commit, push, PR, and release validate receipts with zero actors.
 
+### Review-store migration safety
+
+Legacy review authority is never migrated. `gentle_review inspect` reports an exact repository-bound destructive reset challenge; only `reset` with that exact challenge can quarantine and delete legacy authority, initialize an empty graph-v1 incarnation, and require a completely fresh review. Interrupted resets remain blocked until explicit forward recovery; legacy receipts, bundles, and approvals never regain authority.
+
 `reviewer` is not an installed subagent name. It is a routing intent. Select the concrete lens by risk profile:
 
 | Context | Review lens |
@@ -185,7 +189,9 @@ Findings surviving round two escalate; no third-round transition exists.
 
 Only ordinary transaction start classifies the bound `base_tree -> complete_snapshot_tree` diff.
 
-Pre-commit, pre-push, PR, and release gates validate approved receipts and exact typed targets with zero actors.
+Pre-commit, pre-push, and PR gates validate approved receipts and exact typed targets with zero actors.
+Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise release fails closed through native receipt validation.
+Major and post-incident releases require explicit extraordinary review even when fast-path checks pass.
 
 Dangerous-command safety remains independent and authoritative.
 

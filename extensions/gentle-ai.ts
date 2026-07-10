@@ -1,10 +1,12 @@
 import { execFileSync } from "node:child_process";
 import {
 	existsSync,
+	lstatSync,
 	mkdtempSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -16,7 +18,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
 	ExtensionAPI,
@@ -46,17 +48,25 @@ import {
 	type SddPhase,
 } from "../lib/sdd-status.ts";
 import type { TriggerEvent } from "../lib/review-triggers.ts";
+import { ReviewBundleExporter, ReviewBundleImporter } from "../lib/review-bundle.ts";
+import { inspectLegacyReviewAuthorityV1 } from "../lib/review-legacy-detector.ts";
+import { destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
+import { ReviewMutationLockV1 } from "../lib/review-lock.ts";
+import { resolveRepositoryAuthorityV1 } from "../lib/review-repository.ts";
 import {
+	EXTERNAL_RELEASE_EVIDENCE,
 	GATE_RESULT,
 	GATE_TARGET_KIND,
 	PUSH_UPDATE_KIND,
 	REVIEW_TRANSITION,
 	ReviewTransactionStore,
 	canonicalHash,
-	createReceiptForState,
 	createReviewState,
-	validateReviewGate,
+	evaluateReleaseFastPathV1,
+	recheckReleaseFastPathRemoteHeadV1,
+	validateAuthoritativeReviewGate,
 	type GateTargetV1,
+	type ReleaseFastPathEvidenceV1,
 	type ReviewBudgetV1,
 	type ReviewReducerInput,
 	type ReviewTransition,
@@ -2042,6 +2052,13 @@ const REVIEW_CONTROLLER_OPERATION = {
 	ADVANCE: "advance",
 	STATUS: "status",
 	VALIDATE: "validate",
+	EXPORT: "export",
+	IMPORT: "import",
+	INSPECT: "inspect",
+	RESET: "reset",
+	RECOVER: "recover",
+	RECOVER_LOCK: "recover-lock",
+	REPAIR: "repair",
 } as const;
 
 type ReviewControllerOperation =
@@ -2050,7 +2067,7 @@ type ReviewControllerOperation =
 const REVIEW_CONTROLLER_PARAMETERS = {
 	type: "object",
 	additionalProperties: false,
-	required: ["operation", "lineageId"],
+	required: ["operation"],
 	properties: {
 		operation: {
 			type: "string",
@@ -2077,16 +2094,25 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 			type: "string",
 			description: "JSON object containing operation-specific controller input.",
 		},
+		outputPath: { type: "string", description: "Destination path for deterministic bundle export." },
+		inputPath: { type: "string", description: "Source path for staged bundle import." },
+		operationId: { type: "string", description: "Identity-bound import or export operation ID." },
+		lineageIds: { type: "string", description: "Optional JSON array of graph lineage IDs to export." },
 	},
 } as const;
 
 interface ReviewControllerParameters {
 	operation: ReviewControllerOperation;
-	lineageId: string;
+	lineageId?: string;
 	idempotencyKey?: string;
 	transition?: string;
 	command?: string;
 	input?: string;
+	outputPath?: string;
+	inputPath?: string;
+	operationId?: string;
+	lineageIds?: string;
+	acknowledgeUntrustedBundleSource?: string;
 }
 
 interface ReviewControllerStartInput {
@@ -2100,6 +2126,7 @@ interface ReviewControllerStartInput {
 
 interface ReviewControllerValidateInput {
 	scopeBudget: ReviewBudgetV1;
+	release?: ReleaseFastPathEvidenceV1;
 }
 
 interface DerivedReviewGateTarget {
@@ -2108,10 +2135,17 @@ interface DerivedReviewGateTarget {
 	actualIntendedCommitTree?: string;
 }
 
+interface ReleaseFastPathAuthorizationV1 {
+	remote: string;
+	protected_ref: string;
+	expected_remote_head: string;
+}
+
 interface PendingReviewAuthorization {
 	command_hash: string;
 	target_hash: string;
-	receipt_hash: string;
+	receipt_hash: string | null;
+	release_fast_path?: ReleaseFastPathAuthorizationV1;
 }
 
 function isReviewControllerOperation(value: string): value is ReviewControllerOperation {
@@ -2123,14 +2157,18 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 	if (typeof value.operation !== "string" || !isReviewControllerOperation(value.operation)) {
 		throw new Error("Review controller operation is unsupported");
 	}
-	if (typeof value.lineageId !== "string" || value.lineageId.trim().length === 0) {
+	// VALIDATE defers its lineage requirement to execution time: the proven
+	// release-from-protected-main fast path needs no receipt lineage, while
+	// every other validation still requires one before receipt validation.
+	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.REPAIR, REVIEW_CONTROLLER_OPERATION.VALIDATE].includes(value.operation as ReviewControllerOperation);
+	if (needsLineage && (typeof value.lineageId !== "string" || value.lineageId.trim().length === 0)) {
 		throw new Error("Review controller requires a lineageId");
 	}
 	const parameters: ReviewControllerParameters = {
 		operation: value.operation,
-		lineageId: value.lineageId,
+		...(typeof value.lineageId === "string" ? { lineageId: value.lineageId } : {}),
 	};
-	for (const key of ["idempotencyKey", "transition", "command", "input"] as const) {
+	for (const key of ["idempotencyKey", "transition", "command", "input", "outputPath", "inputPath", "operationId", "lineageIds", "acknowledgeUntrustedBundleSource"] as const) {
 		const optional = value[key];
 		if (optional !== undefined && typeof optional !== "string") {
 			throw new Error(`Review controller ${key} must be a string`);
@@ -2142,13 +2180,27 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 
 function requiredControllerString(
 	parameters: ReviewControllerParameters,
-	key: "idempotencyKey" | "transition" | "command" | "input",
+	key: "idempotencyKey" | "transition" | "command" | "input" | "outputPath" | "inputPath" | "operationId",
 ): string {
 	const value = parameters[key];
 	if (typeof value !== "string" || value.trim().length === 0) {
 		throw new Error(`Review controller ${parameters.operation} requires ${key}`);
 	}
 	return value;
+}
+
+function readRepositoryControllerInput(inputPath: string, repositoryRoot: string): string {
+	const canonicalRoot = realpathSync(repositoryRoot);
+	const requestedPath = resolve(canonicalRoot, inputPath);
+	const relativePath = relative(canonicalRoot, requestedPath);
+	if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
+		throw new Error("Review controller inputPath must be confined to the repository");
+	}
+	const stat = lstatSync(requestedPath);
+	if (!stat.isFile() || stat.isSymbolicLink() || realpathSync(requestedPath) !== requestedPath) {
+		throw new Error("Review controller inputPath must be a regular non-symlink file");
+	}
+	return readFileSync(requestedPath, "utf8");
 }
 
 function parseControllerJson(input: string, operation: ReviewControllerOperation): Record<string, unknown> {
@@ -2207,13 +2259,52 @@ function parseStartInput(value: Record<string, unknown>): ReviewControllerStartI
 	return result;
 }
 
-function parseValidateInput(value: Record<string, unknown>): ReviewControllerValidateInput {
+const RELEASE_EVIDENCE_OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+function parseReleaseFastPathEvidence(value: unknown): ReleaseFastPathEvidenceV1 {
+	if (!isRecord(value)) throw new Error("Review controller validate release evidence must be an object");
+	if (typeof value.protected_ref !== "string" || value.protected_ref.trim().length === 0) {
+		throw new Error("Release fast-path evidence requires an exact protected_ref");
+	}
+	if (typeof value.remote !== "string" || value.remote.trim().length === 0) {
+		throw new Error("Release fast-path evidence requires an exact remote identity");
+	}
+	if (
+		!isRecord(value.ci) ||
+		typeof value.ci.revision !== "string" ||
+		!RELEASE_EVIDENCE_OBJECT_ID.test(value.ci.revision) ||
+		typeof value.ci.status !== "string"
+	) {
+		throw new Error("Release fast-path evidence requires ci.revision bound to one exact SHA and ci.status");
+	}
+	if (
+		value.external_evidence !== EXTERNAL_RELEASE_EVIDENCE.NONE &&
+		value.external_evidence !== EXTERNAL_RELEASE_EVIDENCE.INVALIDATING &&
+		value.external_evidence !== EXTERNAL_RELEASE_EVIDENCE.ESCALATING
+	) {
+		throw new Error("Release fast-path evidence requires an explicit external_evidence disposition");
+	}
+	if (typeof value.post_incident !== "boolean") {
+		throw new Error("Release fast-path evidence requires an explicit post_incident declaration");
+	}
 	return {
+		protected_ref: value.protected_ref,
+		remote: value.remote,
+		ci: { revision: value.ci.revision, status: value.ci.status },
+		external_evidence: value.external_evidence,
+		post_incident: value.post_incident,
+	};
+}
+
+function parseValidateInput(value: Record<string, unknown>): ReviewControllerValidateInput {
+	const input: ReviewControllerValidateInput = {
 		scopeBudget: parseReviewBudget(
 			value.scopeBudget,
 			"Review controller validate scopeBudget",
 		),
 	};
+	if (value.release !== undefined) input.release = parseReleaseFastPathEvidence(value.release);
+	return input;
 }
 
 /**
@@ -2825,6 +2916,44 @@ function executeReviewControllerOperation(
 	pendingAuthorizations: Map<string, PendingReviewAuthorization>,
 ): Record<string, unknown> {
 	const parameters = parseReviewControllerParameters(parametersValue);
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.EXPORT) {
+		const outputPath = requiredControllerString(parameters, "outputPath");
+		const operationId = requiredControllerString(parameters, "operationId");
+		const lineageIds = parameters.lineageIds === undefined ? undefined : JSON.parse(parameters.lineageIds) as unknown;
+		if (lineageIds !== undefined && (!Array.isArray(lineageIds) || lineageIds.some((id) => typeof id !== "string"))) throw new Error("Export lineageIds must be a JSON string array");
+		return { operation: parameters.operation, result: new ReviewBundleExporter(defaultCwd).export({ outputPath, operationId, lineageIds }) };
+	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.IMPORT) {
+		// RISK2-001: adopting a brand-new lineage from a bundle is an experimental,
+		// operator-attested trust decision (see lib/review-bundle.ts import gate).
+		return { operation: parameters.operation, result: new ReviewBundleImporter(defaultCwd).import({ inputPath: requiredControllerString(parameters, "inputPath"), operationId: requiredControllerString(parameters, "operationId"), acknowledgeUntrustedBundleSource: parameters.acknowledgeUntrustedBundleSource === "true" }) };
+	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.INSPECT) {
+		const authority = resolveRepositoryAuthorityV1(defaultCwd);
+		const lock = new ReviewMutationLockV1(join(authority.store_root, "control"), authority.repository_id, authority.authority_id);
+		return { operation: parameters.operation, inspection: inspectLegacyReviewAuthorityV1(defaultCwd), lock: lock.inspect() };
+	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK) {
+		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
+		if (typeof input.ownerHash !== "string") throw new Error("Lock recovery requires an exact ownerHash");
+		const authority = resolveRepositoryAuthorityV1(defaultCwd);
+		const lock = new ReviewMutationLockV1(join(authority.store_root, "control"), authority.repository_id, authority.authority_id);
+		lock.recover(input.ownerHash);
+		return { operation: parameters.operation, recovered_lock: true };
+	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RECOVER) {
+		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
+		return { operation: parameters.operation, result: destructiveResetReviewAuthorityV1({ cwd: defaultCwd, repositoryId: String(input.repositoryId), commonDirHash: String(input.commonDirHash), inventoryHash: String(input.inventoryHash), confirmation: String(input.confirmation), resume: true }) };
+	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RESET) {
+		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
+		return { operation: parameters.operation, result: destructiveResetReviewAuthorityV1({ cwd: defaultCwd, repositoryId: String(input.repositoryId), commonDirHash: String(input.commonDirHash), inventoryHash: String(input.inventoryHash), confirmation: String(input.confirmation), resume: false }) };
+	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.REPAIR) {
+		const store = ReviewTransactionStore.forRepository(defaultCwd);
+		store.repairCurrentAuthority();
+		return { operation: parameters.operation, repaired: true };
+	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.START) {
 		const idempotencyKey = requiredControllerString(parameters, "idempotencyKey");
 		const input = parseStartInput(
@@ -2863,8 +2992,15 @@ function executeReviewControllerOperation(
 		if (!isReviewTransition(transitionValue)) {
 			throw new Error(`Review controller transition is unsupported: ${transitionValue}`);
 		}
+		const hasInput = parameters.input !== undefined;
+		const hasInputPath = parameters.inputPath !== undefined;
+		if (hasInput === hasInputPath) {
+			throw new Error("Review controller advance requires exactly one of input or inputPath");
+		}
 		const input = parseControllerJson(
-			requiredControllerString(parameters, "input"),
+			hasInput
+				? requiredControllerString(parameters, "input")
+				: readRepositoryControllerInput(requiredControllerString(parameters, "inputPath"), defaultCwd),
 			REVIEW_CONTROLLER_OPERATION.ADVANCE,
 		) as unknown as ReviewReducerInput;
 		const store = ReviewTransactionStore.forRepository(defaultCwd);
@@ -2886,7 +3022,9 @@ function executeReviewControllerOperation(
 			operation: parameters.operation,
 			state,
 		};
-		if (state.terminal_state !== undefined) response.receipt = createReceiptForState(state);
+		if (state.terminal_state !== undefined) {
+			response.receipt = ReviewTransactionStore.forRepository(defaultCwd).createAuthoritativeReceipt(parameters.lineageId);
+		}
 		return response;
 	}
 	const idempotencyKey = requiredControllerString(parameters, "idempotencyKey");
@@ -2898,9 +3036,59 @@ function executeReviewControllerOperation(
 		),
 	);
 	const derived = deriveReviewGateTarget(commandValue, defaultCwd);
+	let releaseFastPath: Record<string, unknown> | undefined;
+	if (input.release !== undefined) {
+		if (derived.command.event !== "pre-release") {
+			throw new Error("Release fast-path evidence is only valid for a pre-release lifecycle command");
+		}
+		// Release from protected `main` may bypass receipt validation only when
+		// every fast-path condition is proven against the remote; any failed or
+		// unprovable condition falls back to native receipt validation below.
+		const evaluation = evaluateReleaseFastPathV1({
+			target: derived.target,
+			evidence: input.release,
+			repositoryCwd: derived.command.cwd,
+		});
+		releaseFastPath = {
+			eligible: evaluation.eligible,
+			remote_head: evaluation.remote_head,
+			reason: evaluation.reason,
+		};
+		if (evaluation.eligible && evaluation.remote_head !== null) {
+			const commandHash = reviewAuthorizationKey(commandValue, derived.command.cwd);
+			const targetHash = canonicalHash(derived.target);
+			const authorization: PendingReviewAuthorization = {
+				command_hash: commandHash,
+				target_hash: targetHash,
+				receipt_hash: null,
+				release_fast_path: {
+					remote: input.release.remote,
+					protected_ref: input.release.protected_ref,
+					expected_remote_head: evaluation.remote_head,
+				},
+			};
+			pendingAuthorizations.set(commandHash, authorization);
+			return {
+				operation: parameters.operation,
+				result: {
+					status: GATE_RESULT.ALLOW,
+					actor_count: 0,
+					target_hash: targetHash,
+					receipt_hash: null,
+					reason: evaluation.reason,
+				},
+				derived_target: derived.target,
+				release_fast_path: releaseFastPath,
+				authorization,
+			};
+		}
+	}
+	if (typeof parameters.lineageId !== "string" || parameters.lineageId.trim().length === 0) {
+		throw new Error("Review controller validate requires a lineageId for native receipt validation");
+	}
 	const store = ReviewTransactionStore.forRepository(derived.command.cwd);
-	const receipt = createReceiptForState(store.read(parameters.lineageId));
-	const result = validateReviewGate({
+	const receipt = store.createAuthoritativeReceipt(parameters.lineageId);
+	const result = validateAuthoritativeReviewGate({
 		store,
 		receipt,
 		target: derived.target,
@@ -2914,12 +3102,13 @@ function executeReviewControllerOperation(
 		result,
 		derived_target: derived.target,
 	};
+	if (releaseFastPath !== undefined) response.release_fast_path = releaseFastPath;
 	if (result.status === GATE_RESULT.ALLOW) {
 		const commandHash = reviewAuthorizationKey(commandValue, derived.command.cwd);
 		const authorization: PendingReviewAuthorization = {
 			command_hash: commandHash,
 			target_hash: canonicalHash(derived.target),
-			receipt_hash: receipt.receipt_hash,
+			receipt_hash: receipt.envelope.receipt_hash,
 		};
 		pendingAuthorizations.set(commandHash, authorization);
 		response.authorization = authorization;
@@ -2964,6 +3153,21 @@ function gateLifecycleCommand(
 			block: true,
 			reason: `Gentle AI ${inspection.event} gate ${mismatch} changed after authorization and failed closed.`,
 		};
+	}
+	if (authorization.release_fast_path) {
+		// The remote protected main head is rechecked immediately before the tag
+		// push; an advanced or unprovable head fails closed.
+		const recheck = recheckReleaseFastPathRemoteHeadV1({
+			repositoryCwd: derived.command.cwd,
+			remote: authorization.release_fast_path.remote,
+			expectedRemoteHead: authorization.release_fast_path.expected_remote_head,
+		});
+		if (recheck.advanced) {
+			return {
+				block: true,
+				reason: `Gentle AI ${inspection.event} release fast path failed closed: the remote protected main head advanced or could not be re-proven immediately before tag push. Re-validate against the current immutable origin/main SHA or fall back to native receipt validation.`,
+			};
+		}
 	}
 	return undefined;
 }

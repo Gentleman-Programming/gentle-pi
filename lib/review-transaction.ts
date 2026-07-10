@@ -14,6 +14,15 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
+import { ReviewMutationLockV1, type ReviewLockPlatformAdapterV1 } from "./review-lock.ts";
+import { ReviewGraphObjectStoreV1 } from "./review-object-store.ts";
+import { assertNoLegacyReviewAuthorityV1 } from "./review-legacy-detector.ts";
+import { createReviewEventV1 } from "./review-graph-schema.ts";
+import {
+	resolveRepositoryAuthorityV1,
+	reviewGitEnvironment,
+	type RepositoryAuthorityV1,
+} from "./review-repository.ts";
 import {
 	REVIEW_MODE,
 	REVIEW_PROJECTION,
@@ -412,6 +421,29 @@ interface StoredHeadV1 {
 export interface ReviewTransactionStoreOptions {
 	root: string;
 	faultInjector?: (point: StoreFaultPoint) => void;
+	mutationLockPlatform?: ReviewLockPlatformAdapterV1;
+}
+
+const authoritativeReceiptBrand: unique symbol = Symbol("gentle-ai.authoritative-receipt");
+let mutationLockPlatformForTesting: ReviewLockPlatformAdapterV1 | undefined;
+
+/** @internal Test-only injection for exercising graph authority without a native platform adapter. */
+export function setReviewMutationLockPlatformForTesting(
+	platform: ReviewLockPlatformAdapterV1 | undefined,
+): void {
+	mutationLockPlatformForTesting = platform;
+}
+export interface AuthoritativeReceiptV1 {
+	readonly [authoritativeReceiptBrand]: true;
+	readonly envelope: ReceiptEnvelopeV1;
+	readonly repository_id: string;
+	readonly authority_id: string;
+	readonly common_directory: string;
+	readonly root_set_id: string;
+	readonly head_event_id: string;
+	readonly store_epoch?: string;
+	readonly authority_incarnation_id?: string;
+	readonly authority_receipt_hash: string;
 }
 
 interface RunOperationResult<TResult> {
@@ -424,6 +456,7 @@ interface RunOperationOptions<TRequest, TResult> {
 	operation: ReviewOperation;
 	idempotencyKey: string;
 	request: TRequest;
+	beforeReplay?: () => void;
 	apply: (state: ReviewStateV1) => RunOperationResult<TResult>;
 }
 
@@ -1043,6 +1076,43 @@ function reduceReviewState(
 	throw new ReviewIntegrityError(`Unsupported reducer transition: ${transition}`);
 }
 
+export function validateReviewGraphReplayV1(events: readonly ReturnType<ReviewGraphObjectStoreV1["readEvent"]>[]): ReviewStateV1 {
+	if (events.length === 0) throw new ReviewIntegrityError("Graph replay requires a genesis event");
+	let previous: ReviewStateV1 | undefined;
+	for (const [index, event] of events.entries()) {
+		const payload = event.body.payload as { state?: ReviewStateV1 };
+		if (!payload?.state || canonicalHash(payload.state) !== event.body.reduced_state_hash) throw new ReviewIntegrityError("Graph event state reduction is invalid");
+		if (event.body.reducer_transition === undefined || event.body.reducer_input === undefined) throw new ReviewIntegrityError("Graph event lacks canonical reducer transition/input");
+		const state = payload.state;
+		assertState(state, previous);
+		if (index === 0) {
+			if (event.body.reducer_transition !== "start" || canonicalHash(event.body.reducer_input) !== canonicalHash(state)) throw new ReviewIntegrityError("Graph genesis reducer input is invalid");
+		} else if (event.body.reducer_transition === "operation-prepared") {
+			const input = event.body.reducer_input as { transition?: unknown; request?: unknown };
+			if (typeof input.transition !== "string" || !(Object.values(REVIEW_TRANSITION) as string[]).includes(input.transition)) throw new ReviewIntegrityError("Graph prepared operation transition is invalid");
+			const expected = { ...previous!, revision: state.revision, request_journal: state.request_journal };
+			if (canonicalHash(expected) !== canonicalHash(state)) throw new ReviewIntegrityError("Graph prepared operation replay does not match event state");
+		} else if (event.body.reducer_transition === "gate") {
+			if (event.body.kind !== "gate-evaluated" || !Array.isArray(state.request_journal) || state.request_journal.length !== previous!.request_journal.length + 1 || canonicalHash(state.request_journal.slice(0, -1)) !== canonicalHash(previous!.request_journal)) throw new ReviewIntegrityError("Graph gate replay journal is invalid");
+			const journal = state.request_journal.at(-1);
+			if (!journal || journal.operation !== REVIEW_OPERATION.GATE || journal.status !== JOURNAL_STATUS.COMPLETED || journal.request_hash !== canonicalHash(event.body.reducer_input)) throw new ReviewIntegrityError("Graph gate replay request is invalid");
+			const priorClaims = previous!.child_claims ?? [];
+			const nextClaims = state.child_claims ?? [];
+			if (nextClaims.length < priorClaims.length || canonicalHash(nextClaims.slice(0, priorClaims.length)) !== canonicalHash(priorClaims) || nextClaims.length > priorClaims.length + 1) throw new ReviewIntegrityError("Graph gate replay claims are invalid");
+			const expected = { ...previous!, revision: state.revision, request_journal: state.request_journal, ...(nextClaims.length === 0 ? {} : { child_claims: nextClaims }) };
+			if (canonicalHash(expected) !== canonicalHash(state)) throw new ReviewIntegrityError("Graph gate replay does not match event state");
+		} else if ((Object.values(REVIEW_TRANSITION) as string[]).includes(event.body.reducer_transition)) {
+			const replayed = reduceReviewState(previous!, event.body.reducer_transition as ReviewTransition, event.body.reducer_input);
+			const expected = { ...replayed, revision: state.revision, request_journal: state.request_journal };
+			if (canonicalHash(expected) !== canonicalHash(state)) throw new ReviewIntegrityError("Graph adjacent reducer replay does not match event state");
+		} else {
+			throw new ReviewIntegrityError("Graph event reducer transition is unsupported");
+		}
+		previous = state;
+	}
+	return cloneCanonical(previous!);
+}
+
 function reducerOperationResult(
 	state: ReviewStateV1,
 	revision: number,
@@ -1058,21 +1128,44 @@ function reducerOperationResult(
 export class ReviewTransactionStore {
 	readonly root: string;
 	readonly faultInjector?: (point: StoreFaultPoint) => void;
+	readonly #authority?: RepositoryAuthorityV1;
+	readonly #authorityCwd?: string;
+	readonly #graphStore?: ReviewGraphObjectStoreV1;
+	readonly #mutationLock?: ReviewMutationLockV1;
 
-	constructor(options: ReviewTransactionStoreOptions) {
+	private constructor(options: ReviewTransactionStoreOptions, authority?: RepositoryAuthorityV1, authorityCwd?: string) {
 		this.root = resolve(options.root);
 		this.faultInjector = options.faultInjector;
-		this.ensureStoreDirectories();
+		this.#authority = authority;
+		this.#authorityCwd = authorityCwd;
+		this.#graphStore = authority ? new ReviewGraphObjectStoreV1(this.root, authority.repository_id, authority.authority_id, {
+			faultInjector: (point) => {
+				if (point === "before-current-slot-1-replace") this.faultInjector?.(STORE_FAULT_POINT.BEFORE_HEAD_RENAME);
+			},
+		}) : undefined;
+		this.#mutationLock = authority
+			? new ReviewMutationLockV1(join(authority.store_root, "control"), authority.repository_id, authority.authority_id, options.mutationLockPlatform)
+			: undefined;
+		if (!authority) this.ensureStoreDirectories();
 	}
 
 	static forRepository(
 		cwd: string,
-		options: Pick<ReviewTransactionStoreOptions, "faultInjector"> = {},
+		options: Pick<ReviewTransactionStoreOptions, "faultInjector" | "mutationLockPlatform"> = {},
 	): ReviewTransactionStore {
-		return new ReviewTransactionStore({
-			root: reviewStoreRootForRepository(cwd),
-			faultInjector: options.faultInjector,
-		});
+		const authority = resolveRepositoryAuthorityV1(cwd);
+		assertNoLegacyReviewAuthorityV1(cwd);
+		return new ReviewTransactionStore({ root: join(authority.store_root, "graph-v1"), faultInjector: options.faultInjector, mutationLockPlatform: options.mutationLockPlatform ?? mutationLockPlatformForTesting }, authority, cwd);
+	}
+
+	readCurrentAuthority(): ReturnType<ReviewGraphObjectStoreV1["readCurrent"]> {
+		if (!this.#graphStore) throw new ReviewIntegrityError("Legacy compatibility stores do not expose graph authority");
+		return this.#graphStore.readCurrent();
+	}
+
+	repairCurrentAuthority(): void {
+		if (!this.#graphStore) throw new ReviewIntegrityError("Legacy compatibility stores do not expose graph authority");
+		this.withLock("authority-repair", () => this.#graphStore!.repairCurrentPointers());
 	}
 
 	create(
@@ -1130,7 +1223,7 @@ export class ReviewTransactionStore {
 				],
 			};
 			assertState(started);
-			this.writeRevision(started, undefined);
+			this.writeRevision(started, undefined, { transition: "start", input: started });
 			return cloneCanonical(result);
 		});
 	}
@@ -1198,7 +1291,7 @@ export class ReviewTransactionStore {
 				request_journal: [...current.request_journal, entry],
 			};
 			assertState(next, current);
-			this.writeRevision(next, current);
+			this.writeRevision(next, current, { transition: "operation-prepared", input: { transition: options.transition, request: options.request } });
 		});
 	}
 
@@ -1238,13 +1331,14 @@ export class ReviewTransactionStore {
 				request_journal: journal,
 			};
 			assertState(next, current);
-			this.writeRevision(next, current);
+			this.writeRevision(next, current, { transition: options.transition, input: options.input });
 			return cloneCanonical(result);
 		});
 	}
 
-	validateGate(
+	#validateGate(
 		options: Omit<ValidateReviewGateOptions, "store">,
+		beforeReplay?: () => void,
 	): GateResultV1 {
 		const targetHash = canonicalHash(options.target);
 		const repositoryRoot = repositoryRootForGate(options.repositoryCwd);
@@ -1258,6 +1352,7 @@ export class ReviewTransactionStore {
 				repository_root: repositoryRoot,
 				actual_intended_commit_tree: options.actualIntendedCommitTree ?? null,
 			},
+			beforeReplay,
 			apply(state) {
 				assertReceiptIntegrity(options.receipt);
 				assertReceiptMatchesState(options.receipt, state);
@@ -1326,6 +1421,7 @@ export class ReviewTransactionStore {
 				}
 				return cloneCanonical(existing.canonical_result) as TResult;
 			}
+			options.beforeReplay?.();
 			this.assertNoPendingOperation(current);
 			const applied = options.apply(cloneCanonical(current));
 			const result = cloneCanonical(applied.result);
@@ -1342,7 +1438,8 @@ export class ReviewTransactionStore {
 				request_journal: [...current.request_journal, journalEntry],
 			};
 			assertState(next, current);
-			this.writeRevision(next, current);
+			const request = options.request as { transition?: unknown; input?: unknown };
+			this.writeRevision(next, current, { transition: typeof request.transition === "string" ? request.transition : options.operation, input: "input" in request ? request.input : options.request });
 			return result;
 		});
 	}
@@ -1360,6 +1457,7 @@ export class ReviewTransactionStore {
 	}
 
 	private readUnlocked(lineageId: string): ReviewStateV1 {
+		if (this.#graphStore) return this.readGraphState(lineageId);
 		const lineageDirectory = this.lineageDirectory(lineageId);
 		const head = this.readJson<StoredHeadV1>(join(lineageDirectory, "HEAD"), "review HEAD");
 		if (!Number.isSafeInteger(head.revision) || head.revision < 0) {
@@ -1402,6 +1500,16 @@ export class ReviewTransactionStore {
 
 	private withLock<T>(lockId: string, action: () => T): T {
 		assertLineageId(lockId);
+		if (this.#mutationLock) {
+			this.assertCurrentRepositoryAuthority();
+			const owner = this.#mutationLock.acquire();
+			try {
+				return action();
+			} finally {
+				this.#mutationLock.release(owner);
+			}
+		}
+		mkdirSync(join(this.root, "locks"), { recursive: true, mode: 0o700 });
 		const lockPath = join(this.root, "locks", `${lockId}.lock`);
 		let descriptor: number;
 		try {
@@ -1421,7 +1529,20 @@ export class ReviewTransactionStore {
 		}
 	}
 
-	private writeRevision(next: ReviewStateV1, previous?: ReviewStateV1): void {
+	private assertCurrentRepositoryAuthority(): void {
+		if (!this.#authority || !this.#authorityCwd) return;
+		const current = resolveRepositoryAuthorityV1(this.#authorityCwd);
+		if (
+			current.common_directory !== this.#authority.common_directory ||
+			current.repository_id !== this.#authority.repository_id ||
+			current.authority_id !== this.#authority.authority_id
+		) {
+			throw new ReviewIntegrityError("Repository authority changed before graph mutation");
+		}
+	}
+
+	private writeRevision(next: ReviewStateV1, previous?: ReviewStateV1, eventContext?: { transition: string; input: unknown }): void {
+		if (this.#graphStore) { this.writeGraphState(next, previous, eventContext); return; }
 		const lineageDirectory = this.lineageDirectory(next.lineage_id);
 		const revisionsDirectory = join(lineageDirectory, "revisions");
 		mkdirSync(revisionsDirectory, { recursive: true, mode: 0o700 });
@@ -1470,6 +1591,86 @@ export class ReviewTransactionStore {
 		if (previous && next.revision !== previous.revision + 1) {
 			throw new ReviewIntegrityError("Review revisions must advance exactly once");
 		}
+	}
+
+	private readGraphState(lineageId: string): ReviewStateV1 {
+		const root = this.#graphStore!.readCurrent();
+		const descriptor = existsSync(join(this.#graphStore!.root, "STORE")) ? this.#graphStore!.readStoreDescriptor() : undefined;
+		if (descriptor && (root.body.store_epoch !== descriptor.store_epoch || root.body.authority_incarnation_id !== descriptor.authority_incarnation_id || root.body.initialized_by_reset_id !== descriptor.initialized_by_reset_id)) throw new ReviewIntegrityError("Graph root does not match the live authority incarnation");
+		const entry = (root.body.lineages as Array<Record<string, unknown>>).find((value) => value.lineage_id === lineageId && value.mode === "graph");
+		if (!entry || typeof entry.head_event_id !== "string" || typeof entry.sequence !== "number" || typeof entry.reduced_state_hash !== "string") throw new ReviewIntegrityError("Graph lineage is missing from authoritative root set");
+		let eventId: string | null = entry.head_event_id;
+		let expectedSequence = entry.sequence;
+		const reversed: Array<{ event: ReturnType<ReviewGraphObjectStoreV1["readEvent"]>; state: ReviewStateV1 }> = [];
+		const seen = new Set<string>();
+		while (eventId !== null) {
+			if (seen.has(eventId)) throw new ReviewIntegrityError("Graph predecessor closure contains a cycle");
+			seen.add(eventId);
+			const event = this.#graphStore!.readEvent(eventId);
+			if (descriptor && (event.body.store_epoch !== descriptor.store_epoch || event.body.authority_incarnation_id !== descriptor.authority_incarnation_id || event.body.initialized_by_reset_id !== descriptor.initialized_by_reset_id)) throw new ReviewIntegrityError("Graph event does not match the live authority incarnation");
+			if (event.body.lineage_id !== lineageId || event.body.sequence !== expectedSequence) throw new ReviewIntegrityError("Graph predecessor closure is discontinuous");
+			const payload = event.body.payload as { state?: ReviewStateV1 };
+			if (!payload || !payload.state || canonicalHash(payload.state) !== event.body.reduced_state_hash) throw new ReviewIntegrityError("Graph event state reduction is invalid");
+			if (payload.state.lineage_id !== lineageId || payload.state.revision !== event.body.sequence) throw new ReviewIntegrityError("Graph event does not match lineage state");
+			reversed.push({ event, state: payload.state });
+			if (event.body.sequence === 0) {
+				if (event.body.predecessor_event_id !== null || event.body.kind !== "lineage-created") throw new ReviewIntegrityError("Graph genesis is invalid");
+				break;
+			}
+			eventId = event.body.predecessor_event_id;
+			expectedSequence -= 1;
+		}
+		const ordered = reversed.reverse();
+		let headState: ReviewStateV1;
+		try { headState = validateReviewGraphReplayV1(ordered.map(({ event }) => event)); }
+		catch (error) { throw new ReviewIntegrityError(`Authoritative graph semantic replay failed: ${error instanceof Error ? error.message : String(error)}`); }
+		if (expectedSequence !== 0 || canonicalHash(headState) !== entry.reduced_state_hash) throw new ReviewIntegrityError("Graph root entry does not bind a complete reduced state");
+		return cloneCanonical(headState);
+	}
+
+	private writeGraphState(next: ReviewStateV1, previous?: ReviewStateV1, eventContext?: { transition: string; input: unknown }): void {
+		const graph = this.#graphStore!;
+		let current: ReturnType<ReviewGraphObjectStoreV1["readCurrent"]> | undefined;
+		try { current = graph.readCurrent(); } catch {}
+		const existing = current ? (current.body.lineages as Array<Record<string, unknown>>).find((value) => value.lineage_id === next.lineage_id && value.mode === "graph") : undefined;
+		if (previous && !existing) throw new ReviewIntegrityError("Graph predecessor is missing");
+		if (!previous && existing) throw new ReviewIntegrityError("Graph lineage already exists");
+		const predecessor = existing?.head_event_id;
+		if (predecessor !== undefined && typeof predecessor !== "string") throw new ReviewIntegrityError("Graph head is invalid");
+		const last = next.request_journal.at(-1);
+		const descriptor = (() => { try { return graph.readStoreDescriptor(); } catch { return undefined; } })();
+		const reducerTransition = eventContext?.transition ?? (predecessor === undefined ? "start" : last?.operation ?? "state-update");
+		const reducerInput = eventContext === undefined ? (predecessor === undefined ? cloneCanonical(next) : { request_hash: last?.request_hash }) : cloneCanonical(eventContext.input);
+		const event = createReviewEventV1({ ...(descriptor === undefined ? {} : { store_epoch: descriptor.store_epoch, authority_incarnation_id: descriptor.authority_incarnation_id, initialized_by_reset_id: descriptor.initialized_by_reset_id }), lineage_id: next.lineage_id, sequence: next.revision, predecessor_event_id: predecessor ?? null, kind: predecessor === undefined ? "lineage-created" : last?.status === JOURNAL_STATUS.PENDING ? "operation-prepared" : last?.operation === REVIEW_OPERATION.GATE ? "gate-evaluated" : "operation-completed", reducer_transition: reducerTransition, reducer_input: reducerInput, payload: { state: cloneCanonical(next) }, reduced_state_hash: canonicalHash(next) });
+		graph.installEvent(event);
+		const lineages = [...(current?.body.lineages as Array<Record<string, unknown>> ?? []).filter((value) => value.lineage_id !== next.lineage_id), { lineage_id: next.lineage_id, mode: "graph", head_event_id: event.event_id, sequence: next.revision, reduced_state_hash: event.body.reduced_state_hash }].toSorted((a, b) => String(a.lineage_id).localeCompare(String(b.lineage_id)));
+		const root = graph.installRootSet({ schema: "gentle-ai.review-root-set/v1", repository_id: this.#authority!.repository_id, authority_id: this.#authority!.authority_id, ...(descriptor === undefined ? {} : { store_epoch: descriptor.store_epoch, authority_incarnation_id: descriptor.authority_incarnation_id, initialized_by_reset_id: descriptor.initialized_by_reset_id }), generation: current ? current.body.generation + 1 : 0, predecessor_root_set_id: current ? current.root_set_id : null, lineages });
+		graph.publishRootSet(root);
+	}
+
+	createAuthoritativeReceipt(lineageId: string): AuthoritativeReceiptV1 {
+		if (!this.#authority || !this.#graphStore) throw new ReviewIntegrityError("Authoritative receipts require a repository-backed graph store");
+		const state = this.read(lineageId);
+		const envelope = createReceiptForState(state);
+		const root = this.#graphStore.readCurrent();
+		const entry = (root.body.lineages as Array<Record<string, unknown>>).find((value) => value.lineage_id === lineageId && value.mode === "graph");
+		if (!entry || typeof entry.head_event_id !== "string") throw new ReviewIntegrityError("Authoritative graph head is missing");
+		const descriptor = (() => { try { return this.#graphStore!.readStoreDescriptor(); } catch { return undefined; } })();
+		const body = { receipt_hash: envelope.receipt_hash, repository_id: this.#authority.repository_id, authority_id: this.#authority.authority_id, common_directory: this.#authority.common_directory, root_set_id: root.root_set_id, head_event_id: entry.head_event_id, ...(descriptor === undefined ? {} : { store_epoch: descriptor.store_epoch, authority_incarnation_id: descriptor.authority_incarnation_id }) };
+		return Object.freeze({ [authoritativeReceiptBrand]: true as const, envelope, repository_id: this.#authority.repository_id, authority_id: this.#authority.authority_id, common_directory: this.#authority.common_directory, root_set_id: root.root_set_id, head_event_id: entry.head_event_id, ...(descriptor === undefined ? {} : { store_epoch: descriptor.store_epoch, authority_incarnation_id: descriptor.authority_incarnation_id }), authority_receipt_hash: canonicalHash(body) });
+	}
+
+	validateAuthoritativeGate(options: Omit<ValidateReviewGateOptions, "store" | "receipt"> & { receipt: AuthoritativeReceiptV1 }): GateResultV1 {
+		if (!this.#authority || !this.#graphStore || options.receipt[authoritativeReceiptBrand] !== true) throw new ReviewIntegrityError("Lifecycle gates require a branded authoritative receipt");
+		const gateAuthority = resolveRepositoryAuthorityV1(options.repositoryCwd);
+		if (gateAuthority.common_directory !== this.#authority.common_directory || gateAuthority.repository_id !== options.receipt.repository_id || gateAuthority.authority_id !== options.receipt.authority_id) throw new ReviewIntegrityError("Gate repository authority does not match receipt authority");
+		return this.#validateGate({ ...options, receipt: options.receipt.envelope }, () => {
+			const descriptor = (() => { try { return this.#graphStore!.readStoreDescriptor(); } catch { return undefined; } })();
+			if ((options.receipt.store_epoch !== undefined || options.receipt.authority_incarnation_id !== undefined) && (!descriptor || options.receipt.store_epoch !== descriptor.store_epoch || options.receipt.authority_incarnation_id !== descriptor.authority_incarnation_id)) throw new ReviewIntegrityError("REVIEW_RECEIPT_EPOCH_MISMATCH");
+			const currentRoot = this.#graphStore!.readCurrent();
+			const currentEntry = (currentRoot.body.lineages as Array<Record<string, unknown>>).find((value) => value.lineage_id === options.receipt.envelope.body.lineage_id && value.mode === "graph");
+			if (!currentEntry || currentRoot.root_set_id !== options.receipt.root_set_id || currentEntry.head_event_id !== options.receipt.head_event_id) throw new ReviewIntegrityError("Authoritative receipt is stale or unbound from the current graph head");
+		});
 	}
 
 	private writeTemporaryFile(
@@ -1552,25 +1753,60 @@ function resolveGateRef(cwd: string, ref: string, label: string): string {
 	return runGateGit(cwd, ["rev-parse", "--verify", `${ref}^{object}`]);
 }
 
+const CONFIGURED_REMOTE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+function listConfiguredRemotes(cwd: string): string[] {
+	const result = spawnSync("git", ["-C", cwd, "remote"], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+		env: reviewGitEnvironment(),
+	});
+	if (result.error || result.status !== 0) {
+		throw new ReviewIntegrityError("Configured Git remotes could not be listed");
+	}
+	return result.stdout.split(/\r?\n/).filter(Boolean);
+}
+
+// Resolves `remote` to the repository's actually configured remote URL. The
+// caller may only ever supply a bare configured remote NAME (default and
+// expected: "origin") — never a URL or filesystem path — so a caller can
+// never redirect the release fast path's remote-head proof to an
+// attacker-controlled endpoint.
+function resolveConfiguredRemoteUrl(cwd: string, remote: string): string {
+	if (typeof remote !== "string" || !CONFIGURED_REMOTE_NAME.test(remote)) {
+		throw new ReviewIntegrityError(
+			"Release fast path remote must be a bare configured Git remote name, not a URL or path",
+		);
+	}
+	if (!listConfiguredRemotes(cwd).includes(remote)) {
+		throw new ReviewIntegrityError(`Release fast path remote "${remote}" is not a configured Git remote`);
+	}
+	const result = spawnSync("git", ["-C", cwd, "remote", "get-url", remote], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+		env: reviewGitEnvironment(),
+	});
+	if (result.error || result.status !== 0) {
+		throw new ReviewIntegrityError(`Configured remote "${remote}" URL could not be resolved`);
+	}
+	const url = result.stdout.trim();
+	if (url.length === 0) throw new ReviewIntegrityError(`Configured remote "${remote}" has no URL`);
+	return url;
+}
+
 function resolveRemoteGateRef(
 	cwd: string,
 	remote: string,
 	ref: string,
 	label: string,
 ): string | null {
-	if (
-		typeof remote !== "string" ||
-		remote.trim().length === 0 ||
-		remote.startsWith("-") ||
-		/[\0\r\n]/.test(remote)
-	) {
-		throw new ReviewIntegrityError("push remote identity is invalid");
-	}
+	const remoteUrl = resolveConfiguredRemoteUrl(cwd, remote);
 	if (!isFullRef(ref)) throw new ReviewIntegrityError(`${label} is not a full ref`);
-	const result = spawnSync("git", ["ls-remote", "--refs", remote, ref], {
+	const result = spawnSync("git", ["ls-remote", "--refs", remoteUrl, ref], {
 		cwd,
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "pipe"],
+		env: reviewGitEnvironment(),
 	});
 	if (result.error) {
 		throw new ReviewIntegrityError(`${label} could not be resolved: ${result.error.message}`);
@@ -1911,6 +2147,209 @@ export function evaluateGateTarget(
 	};
 }
 
+// Release-from-protected-main fast path (gentle-ai 2b3a091 parity).
+// Release from protected `main` may bypass receipt validation only when every
+// condition is proven from the remote: the tag targets the current immutable
+// `origin/main` SHA (explicitly resolved from the remote, never inferred from
+// local HEAD), required CI for that exact SHA is successful, the remote head
+// is rechecked immediately before tag push, and no new vulnerability, policy,
+// provenance, signing, generated-artifact, or release evidence requires
+// escalation. Local branch position and worktree dirtiness are not publication
+// inputs. Major releases and releases following an operational or security
+// incident always require explicit extraordinary review. Any failed or
+// unprovable condition falls back to native receipt validation.
+export const RELEASE_FAST_PATH_PROTECTED_REF = "refs/heads/main";
+
+export const EXTERNAL_RELEASE_EVIDENCE = {
+	NONE: "none",
+	INVALIDATING: "invalidating",
+	ESCALATING: "escalating",
+} as const;
+
+export type ExternalReleaseEvidenceDisposition =
+	(typeof EXTERNAL_RELEASE_EVIDENCE)[keyof typeof EXTERNAL_RELEASE_EVIDENCE];
+
+export interface ReleaseFastPathCiEvidenceV1 {
+	revision: string;
+	status: string;
+}
+
+export interface ReleaseFastPathEvidenceV1 {
+	protected_ref: string;
+	remote: string;
+	ci: ReleaseFastPathCiEvidenceV1;
+	external_evidence: ExternalReleaseEvidenceDisposition;
+	post_incident: boolean;
+}
+
+export interface ReleaseFastPathEvaluationV1 {
+	eligible: boolean;
+	remote_head: string | null;
+	reason: string;
+}
+
+const RELEASE_SEMVER_TAG = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:[-+][0-9A-Za-z.+-]+)?$/;
+
+export type GhCommandRunnerV1 = (
+	args: readonly string[],
+	options: { cwd: string; env: NodeJS.ProcessEnv },
+) => { status: number | null; stdout: string; error?: Error };
+
+// Test-only injection seam, mirroring `setReviewMutationLockPlatformForTesting`:
+// production code always defaults to the real `gh` CLI unless a test
+// explicitly overrides it.
+let releaseGhCommandRunnerForTesting: GhCommandRunnerV1 | undefined;
+
+export function setReleaseGhCommandRunnerForTestingV1(
+	runner: GhCommandRunnerV1 | undefined,
+): void {
+	releaseGhCommandRunnerForTesting = runner;
+}
+
+function defaultGhCommandRunner(
+	args: readonly string[],
+	runnerOptions: { cwd: string; env: NodeJS.ProcessEnv },
+): { status: number | null; stdout: string; error?: Error } {
+	const result = spawnSync("gh", args, {
+		cwd: runnerOptions.cwd,
+		env: runnerOptions.env,
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	return { status: result.status, stdout: result.stdout ?? "", error: result.error };
+}
+
+// Independently derives whether required CI succeeded for the exact remote
+// SHA via the `gh` CLI. Caller-supplied CI evidence is never sufficient
+// alone: if `gh` is unavailable, errors, or does not prove success bound to
+// this exact SHA, the condition is UNPROVABLE and the caller must fail
+// closed to native receipt validation.
+function deriveReleaseCiStatusForShaV1(options: {
+	repositoryCwd: string;
+	sha: string;
+	ghCommandRunner: GhCommandRunnerV1;
+}): { proven: boolean; status: string | null } {
+	let result: { status: number | null; stdout: string; error?: Error };
+	try {
+		result = options.ghCommandRunner(
+			["api", `repos/{owner}/{repo}/commits/${options.sha}/status`, "--jq", ".state"],
+			{ cwd: options.repositoryCwd, env: reviewGitEnvironment() },
+		);
+	} catch {
+		return { proven: false, status: null };
+	}
+	if (result.error || result.status !== 0) return { proven: false, status: null };
+	const status = result.stdout.trim();
+	if (status.length === 0) return { proven: false, status: null };
+	return { proven: true, status };
+}
+
+export function evaluateReleaseFastPathV1(options: {
+	target: GateTargetV1;
+	evidence: ReleaseFastPathEvidenceV1;
+	repositoryCwd: string;
+	ghCommandRunner?: GhCommandRunnerV1;
+}): ReleaseFastPathEvaluationV1 {
+	const { target, evidence } = options;
+	const ineligible = (reason: string): ReleaseFastPathEvaluationV1 => ({
+		eligible: false,
+		remote_head: null,
+		reason,
+	});
+	if (!isRecord(target) || target.kind !== GATE_TARGET_KIND.RELEASE) {
+		return ineligible("Release fast path applies only to a release gate target.");
+	}
+	if (evidence.protected_ref !== RELEASE_FAST_PATH_PROTECTED_REF) {
+		return ineligible("Release fast path applies only to the protected refs/heads/main publication ref.");
+	}
+	if (evidence.post_incident) {
+		return ineligible("Releases following an operational or security incident require explicit extraordinary review even when fast-path checks pass.");
+	}
+	if (!isFullRef(target.tag_ref) || !target.tag_ref.startsWith("refs/tags/")) {
+		return ineligible("Release fast path requires an exact release tag ref.");
+	}
+	const semver = RELEASE_SEMVER_TAG.exec(target.tag_ref.slice("refs/tags/".length));
+	if (!semver) {
+		return ineligible("Release tag is not a provable semantic version, so a major release cannot be ruled out; explicit extraordinary review is required.");
+	}
+	// Major-equivalent (fast path denied, extraordinary review required):
+	// vX.0.0 for any X (a major release), or pre-1.0 v0.Y.0 (a minor bump
+	// under the 0.x semver convention, where any minor bump is
+	// breaking-equivalent). Patch releases v0.Y.Z with Z>0 remain eligible.
+	if (semver[3] === "0" && (semver[2] === "0" || semver[1] === "0")) {
+		return ineligible("Major releases require explicit extraordinary review even when fast-path checks pass.");
+	}
+	let remoteHead: string | null;
+	let repositoryRoot: string;
+	try {
+		repositoryRoot = repositoryRootForGate(options.repositoryCwd);
+		if (resolveGateRef(repositoryRoot, target.tag_ref, "release tag ref") !== target.tag_object) {
+			return ineligible("Release tag ref does not resolve to its supplied object.");
+		}
+		assertCommitBinding(repositoryRoot, target.tag_object, target.peeled_commit, target.tree, "release identity");
+		remoteHead = resolveRemoteGateRef(
+			repositoryRoot,
+			evidence.remote,
+			RELEASE_FAST_PATH_PROTECTED_REF,
+			"release protected main head",
+		);
+	} catch (error) {
+		return ineligible(`Release fast path identity cannot be proven: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (remoteHead === null) {
+		return ineligible("The current immutable origin/main SHA cannot be proven on the release remote.");
+	}
+	if (target.peeled_commit !== remoteHead) {
+		return ineligible("Release tag target is not the current immutable origin/main SHA.");
+	}
+	if (evidence.ci.revision !== remoteHead || evidence.ci.status !== "success") {
+		return ineligible("Required CI for the exact origin/main SHA is not proven successful.");
+	}
+	// Caller-supplied CI evidence above is a cross-check only, never
+	// sufficient alone: required CI success must be independently derived via
+	// the gh CLI for the exact remote SHA, or the fast path fails closed.
+	const derivedCi = deriveReleaseCiStatusForShaV1({
+		repositoryCwd: repositoryRoot,
+		sha: remoteHead,
+		ghCommandRunner: options.ghCommandRunner ?? releaseGhCommandRunnerForTesting ?? defaultGhCommandRunner,
+	});
+	if (!derivedCi.proven || derivedCi.status !== "success") {
+		return ineligible(
+			"Required CI success for the exact origin/main SHA could not be independently derived via the gh CLI; caller-supplied CI evidence alone is never sufficient.",
+		);
+	}
+	if (evidence.external_evidence !== EXTERNAL_RELEASE_EVIDENCE.NONE) {
+		return ineligible("New vulnerability, policy, provenance, signing, generated-artifact, or release evidence requires escalation and blocks the release fast path.");
+	}
+	return {
+		eligible: true,
+		remote_head: remoteHead,
+		reason: "Release fast path proven: the tag targets the current immutable origin/main SHA, required CI for that exact SHA is successful, and no new evidence requires escalation. Local branch position and worktree dirtiness are not publication inputs.",
+	};
+}
+
+export function recheckReleaseFastPathRemoteHeadV1(options: {
+	repositoryCwd: string;
+	remote: string;
+	expectedRemoteHead: string;
+}): { advanced: boolean; remote_head: string | null } {
+	let remoteHead: string | null;
+	try {
+		remoteHead = resolveRemoteGateRef(
+			repositoryRootForGate(options.repositoryCwd),
+			options.remote,
+			RELEASE_FAST_PATH_PROTECTED_REF,
+			"release protected main head",
+		);
+	} catch {
+		remoteHead = null;
+	}
+	return {
+		advanced: remoteHead === null || remoteHead !== options.expectedRemoteHead,
+		remote_head: remoteHead,
+	};
+}
+
 function assertReceiptMatchesState(
 	receipt: ReceiptEnvelopeV1,
 	state: ReviewStateV1,
@@ -1972,7 +2411,13 @@ export function createReceiptForState(state: ReviewStateV1): ReceiptEnvelopeV1 {
 }
 
 export function validateReviewGate(
-	options: ValidateReviewGateOptions,
+	options: Omit<ValidateReviewGateOptions, "receipt"> & { receipt: AuthoritativeReceiptV1 },
 ): GateResultV1 {
-	return options.store.validateGate(options);
+	return options.store.validateAuthoritativeGate(options);
+}
+
+export function validateAuthoritativeReviewGate(
+	options: Omit<ValidateReviewGateOptions, "receipt"> & { receipt: AuthoritativeReceiptV1 },
+): GateResultV1 {
+	return options.store.validateAuthoritativeGate(options);
 }

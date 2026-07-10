@@ -96,7 +96,9 @@ const JUDGMENT_DAY_DISCOVERY_CLAUSES = [
 
 const BOUNDARY_CLAUSES = [
 	"Only ordinary transaction start classifies the bound `base_tree -> complete_snapshot_tree` diff.",
-	"Pre-commit, pre-push, PR, and release gates validate approved receipts and exact typed targets with zero actors.",
+	"Pre-commit, pre-push, and PR gates validate approved receipts and exact typed targets with zero actors.",
+	"Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise release fails closed through native receipt validation.",
+	"Major and post-incident releases require explicit extraordinary review even when fast-path checks pass.",
 	"Dangerous-command safety remains independent and authoritative.",
 	"SDD completion adds no review or Judgment Day pass.",
 	"Review transactions, validation, and SDD perform no commit, push, PR creation, release, or publication.",

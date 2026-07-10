@@ -114,7 +114,7 @@ The bounded multi-file writer precedence in rule 2 overrides that general runtim
 2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, delegate one writer; inline writing is allowed only for trivial/mechanical edits. Any review work remains inside the already-bound transaction budget.
    For bounded multi-file writes, prefer the installed package-owned `gentle-ai-worker`, then a user-configured `worker`. If neither worker definition exists, fall back to the native `Agent` even when `subagent_*` tools are available. If no delegation mechanism is available, stop and explain the blocker.
 
-3. **Lifecycle gate rule**: commit/push/PR/release validates an approved receipt and exact typed target with zero actors. If authority is missing or scope changed, fail closed; do not launch a lifecycle review.
+3. **Lifecycle gate rule**: commit/push/PR/release validates an approved receipt and exact typed target with zero actors. If authority is missing or scope changed, fail closed; do not launch a lifecycle review. Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; major and post-incident releases require explicit extraordinary review.
 4. **Incident rule**: after wrong `cwd`, accidental repo/worktree mutation, failed merge recovery, confusing test command, or environment workaround, stop and diagnose the incident separately without reopening a closed lineage or resetting its budget.
 5. **Long-session rule**: if accumulating work is no longer clearly local — roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without delegation — pause and delegate the remaining work instead of silently continuing monolithically.
 6. **Review actor rule**: use review lens subagents only when selected at ordinary transaction start. Explicit Judgment Day uses the named judges; lifecycle and SDD boundaries launch zero review actors.
@@ -199,7 +199,9 @@ Findings surviving round two escalate; no third-round transition exists.
 
 Only ordinary transaction start classifies the bound `base_tree -> complete_snapshot_tree` diff.
 
-Pre-commit, pre-push, PR, and release gates validate approved receipts and exact typed targets with zero actors.
+Pre-commit, pre-push, and PR gates validate approved receipts and exact typed targets with zero actors.
+Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise release fails closed through native receipt validation.
+Major and post-incident releases require explicit extraordinary review even when fast-path checks pass.
 
 Dangerous-command safety remains independent and authoritative.
 

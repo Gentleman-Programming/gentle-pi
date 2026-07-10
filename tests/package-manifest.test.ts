@@ -98,6 +98,17 @@ function readPackageJson(): PackageJson {
 	}
 }
 
+test("package manifest has no obsolete native activation build surface", () => {
+	const packageJson = readPackageJson();
+	const manifest = JSON.stringify(packageJson);
+
+	assert.ok(!packageJson.files?.includes("native/"), "package must not ship the obsolete native addon directory");
+	assert.ok(!packageJson.scripts?.["native:build"], "package must not expose an obsolete native build script");
+	assert.doesNotMatch(manifest, /build-native-addon|gentle_review_native|review-native-fence/i);
+	assert.doesNotMatch(packageJson.scripts?.prepack ?? "", /native:build/);
+	assert.doesNotMatch(packageJson.scripts?.prepublishOnly ?? "", /native:build/);
+});
+
 test("package manifest installs pi-pretty through a wrapper without bundling native optional dependencies", () => {
 	const packageJson = readPackageJson();
 
@@ -942,7 +953,8 @@ test("README documents bounded review transactions and the honest installed perm
 	const readme = readFileSync(join(PACKAGE_ROOT, "README.md"), "utf8");
 	for (const clause of [
 		"Ordinary review runs the selected zero, one, or four lenses exactly once against `initial_review_tree`.",
-		"Pre-commit, pre-push, PR, and release gates validate approved receipts and exact typed targets with zero actors.",
+		"Pre-commit, pre-push, and PR gates validate approved receipts and exact typed targets with zero actors.",
+		"Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise release fails closed through native receipt validation.",
 		"Dangerous-command safety remains independent and authoritative.",
 		"`review-refuter` uses exactly `read`, `grep`, and `find`",
 		"package-managed isolated installation",

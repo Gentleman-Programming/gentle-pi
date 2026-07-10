@@ -36,7 +36,7 @@ const requiredToolsByAgent: Record<string, string[]> = {
 	"sdd-apply.md": ["read", "grep", "glob", "edit", "write", "bash", "mem_search", "mem_get_observation", "mem_save", "mem_update"],
 	"sdd-archive.md": ["read", "grep", "glob", "edit", "write", "bash", "mem_search", "mem_get_observation", "mem_save"],
 	"sdd-design.md": ["read", "grep", "glob", "edit", "write", "mem_search", "mem_get_observation", "mem_save"],
-	"sdd-explore.md": ["read", "grep", "glob", "mem_save"],
+	"sdd-explore.md": ["read", "grep", "glob", "edit", "write", "mem_save"],
 	"sdd-init.md": ["read", "grep", "glob", "edit", "write", "bash", "mem_search", "mem_get_observation", "mem_save", "mem_update"],
 	"sdd-onboard.md": ["read", "grep", "glob", "edit", "write", "bash", "mem_search", "mem_get_observation", "mem_save", "mem_update"],
 	"sdd-proposal.md": ["read", "grep", "glob", "edit", "write", "mem_search", "mem_get_observation", "mem_save"],
@@ -59,6 +59,20 @@ test("SDD package agents declare role-appropriate tools as YAML arrays", () => {
 			assert.ok(!tool.startsWith("subagent_"), `${fileName} must not allow child subagent tool ${tool}`);
 		}
 	}
+});
+
+test("artifact-producing SDD agents can persist OpenSpec files while status remains read-only", () => {
+	for (const fileName of Object.keys(requiredToolsByAgent).filter(
+		(fileName) => fileName !== "sdd-status.md",
+	)) {
+		const tools = readTools(join(assetsAgentsDir, fileName));
+		assert.ok(tools.includes("edit"), `${fileName} must include edit`);
+		assert.ok(tools.includes("write"), `${fileName} must include write`);
+	}
+
+	const statusTools = readTools(join(assetsAgentsDir, "sdd-status.md"));
+	assert.ok(!statusTools.includes("edit"), "sdd-status.md must remain read-only");
+	assert.ok(!statusTools.includes("write"), "sdd-status.md must remain read-only");
 });
 
 test("project does not ship local SDD agent overrides", () => {

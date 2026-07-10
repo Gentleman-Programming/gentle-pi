@@ -22,7 +22,7 @@ import {
 } from "../lib/review-transaction.ts";
 import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
-import { testSnapshot } from "./review-test-fixtures.ts";
+import { qualifiedReviewLockPlatform, testSnapshot } from "./review-test-fixtures.ts";
 
 function writeMarkdown(path: string, content: string): void {
 	mkdirSync(dirname(path), { recursive: true });
@@ -197,7 +197,7 @@ function runtimeAuthority(t: test.TestContext) {
 	git("add", ".");
 	git("-c", "user.name=Runtime Gate", "-c", "user.email=runtime@example.invalid", "commit", "-m", "final");
 	const finalTree = git("rev-parse", "HEAD^{tree}");
-	const store = ReviewTransactionStore.forRepository(repository);
+	const store = ReviewTransactionStore.forRepository(repository, { mutationLockPlatform: qualifiedReviewLockPlatform() });
 	store.create(createReviewState({
 		lineageId: "runtime-approved",
 		mode: REVIEW_MODE.ORDINARY,

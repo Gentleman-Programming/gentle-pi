@@ -5,6 +5,8 @@ tools:
   - read
   - grep
   - glob
+  - edit
+  - write
   - webfetch
   - mem_save
 ---
