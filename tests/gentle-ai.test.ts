@@ -1,11 +1,28 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import type { Theme } from "@earendil-works/pi-coding-agent";
-import { __testing } from "../extensions/gentle-ai.ts";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	Theme,
+	ToolCallEventResult,
+} from "@earendil-works/pi-coding-agent";
+import gentleAi, { __testing } from "../extensions/gentle-ai.ts";
+import {
+	GATE_TARGET_KIND,
+	REVIEW_MODE,
+	REVIEW_TRANSITION,
+	ReviewTransactionStore,
+	createReceiptForState,
+	createReviewState,
+	type ReviewBudgetV1,
+} from "../lib/review-transaction.ts";
+import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
+import { testSnapshot } from "./review-test-fixtures.ts";
 
 function writeMarkdown(path: string, content: string): void {
 	mkdirSync(dirname(path), { recursive: true });
@@ -149,4 +166,137 @@ test("model panel render uses the Pi-provided current theme when supplied", () =
 
 	assert.match(rendered, /\x1b\[35m/);
 	assert.match(stripAnsi(rendered), /Assign Models and Effort to Agents/);
+});
+
+function runtimeBudget(): ReviewBudgetV1 {
+	return {
+		review_batches: 1,
+		review_actors: 1,
+		refuter_batches: 1,
+		fix_batches: 1,
+		validator_runs: 1,
+		final_verifications: 1,
+		judgment_rounds: 0,
+		judge_runs: 0,
+	};
+}
+
+function runtimeAuthority(t: test.TestContext) {
+	const parent = mkdtempSync(join(tmpdir(), "gentle-pi-runtime-gate-"));
+	const repository = join(parent, "repo");
+	mkdirSync(repository);
+	t.after(() => rmSync(parent, { recursive: true, force: true }));
+	const git = (...args: string[]): string =>
+		execFileSync("git", args, { cwd: repository, encoding: "utf8" }).trim();
+	git("init", "-b", "main");
+	writeFileSync(join(repository, "app.ts"), "export const value = 1;\n");
+	git("add", ".");
+	git("-c", "user.name=Runtime Gate", "-c", "user.email=runtime@example.invalid", "commit", "-m", "base");
+	const baseTree = git("rev-parse", "HEAD^{tree}");
+	writeFileSync(join(repository, "app.ts"), "export const value = 2;\n");
+	git("add", ".");
+	git("-c", "user.name=Runtime Gate", "-c", "user.email=runtime@example.invalid", "commit", "-m", "final");
+	const finalTree = git("rev-parse", "HEAD^{tree}");
+	const store = ReviewTransactionStore.forRepository(repository);
+	store.create(createReviewState({
+		lineageId: "runtime-approved",
+		mode: REVIEW_MODE.ORDINARY,
+		snapshot: testSnapshot({
+			baseTree,
+			completeTree: finalTree,
+			route: REVIEW_ROUTE.STANDARD,
+			lenses: [REVIEW_LENS.READABILITY],
+		}),
+		evidenceHash: "b".repeat(64),
+		budget: runtimeBudget(),
+	}), "start-runtime-approved");
+	for (const [transition, input, idempotencyKey] of [
+		[REVIEW_TRANSITION.ORDINARY_DISCOVERY, { rows: [] }, "discover"],
+		[REVIEW_TRANSITION.ORDINARY_EVIDENCE, { deterministicResults: [] }, "evidence"],
+		[REVIEW_TRANSITION.ORDINARY_FINAL_VERIFICATION, { passed: true }, "verify"],
+	] as const) {
+		store.runReducerOperation({
+			lineageId: "runtime-approved",
+			transition,
+			idempotencyKey,
+			input,
+		});
+	}
+	return {
+		repository,
+		finalTree,
+		receipt: createReceiptForState(store.read("runtime-approved")),
+	};
+}
+
+test("runtime lifecycle gates reject fabricated metadata while compound and wrapper forms fail closed", async (t) => {
+	type ToolCallHandler = (
+		event: { toolName: string; input: unknown },
+		ctx: ExtensionContext,
+	) => Promise<ToolCallEventResult | undefined>;
+	const handlers = new Map<string, ToolCallHandler>();
+	const pi = {
+		on(name: string, handler: ToolCallHandler) {
+			handlers.set(name, handler);
+		},
+		registerCommand() {},
+		registerTool() {},
+	} as unknown as ExtensionAPI;
+	gentleAi(pi);
+	const toolCall = handlers.get("tool_call");
+	assert.equal(typeof toolCall, "function");
+	const authority = runtimeAuthority(t);
+	const ctx = {
+		cwd: authority.repository,
+		hasUI: false,
+	} as ExtensionContext;
+
+	const fabricated = await toolCall!(
+		{
+			toolName: "bash",
+			input: {
+				command: "git commit -m bounded",
+				reviewGate: {
+					receipt: authority.receipt,
+					target: {
+						kind: GATE_TARGET_KIND.INTENDED_COMMIT,
+						intended_commit_tree: authority.finalTree,
+					},
+					idempotencyKey: "runtime-commit",
+					scopeBudget: runtimeBudget(),
+				},
+			},
+		},
+		ctx,
+	);
+	assert.equal(fabricated?.block, true);
+	assert.match(fabricated?.reason ?? "", /registered review controller authorization/i);
+
+	const lifecycle = await toolCall!(
+		{ toolName: "bash", input: { command: "git commit -m bounded" } },
+		ctx,
+	);
+	assert.equal(lifecycle?.block, true);
+	assert.match(lifecycle?.reason ?? "", /approved receipt.*exact typed command target/i);
+	for (const command of [
+		"git status && git commit -m compound",
+		"env SAFE=1 git commit -m wrapped",
+		"command git commit -m wrapped",
+		"sh -c 'git commit -m wrapped'",
+		"git \\\n commit -m continued",
+		`git -c safe.long=${"x".repeat(8_192)} commit -m long-direct`,
+		`sh -c 'git -c safe.long=${"x".repeat(8_192)} commit -m long-wrapped'`,
+	]) {
+		const wrapped = await toolCall!({ toolName: "bash", input: { command } }, ctx);
+		assert.equal(wrapped?.block, true, command);
+		assert.match(wrapped?.reason ?? "", /compound or wrapped lifecycle command.*fail closed/i);
+	}
+
+	const destructive = await toolCall!(
+		{ toolName: "bash", input: { command: "git push --force origin main" } },
+		ctx,
+	);
+	assert.equal(destructive?.block, true);
+	assert.match(destructive?.reason ?? "", /safety policy blocked a destructive shell command/i);
+	assert.doesNotMatch(destructive?.reason ?? "", /approved receipt/i);
 });

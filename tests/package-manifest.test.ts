@@ -34,6 +34,21 @@ const V013_MANAGED_ASSETS = join(
 	"migrations",
 	"managed-assets-v0.13.json",
 );
+const V014_REVIEW_RISK_FIXTURE = join(
+	PACKAGE_ROOT,
+	"tests",
+	"fixtures",
+	"v0.14",
+	"assets",
+	"agents",
+	REVIEW_RISK_FILE,
+);
+const V014_MANAGED_ASSETS = join(
+	PACKAGE_ROOT,
+	"assets",
+	"migrations",
+	"managed-assets-v0.14.json",
+);
 const REVIEW_REFUTER_TOOLS = ["read", "grep", "find"];
 const FORBIDDEN_REFUTER_TOOLS = [
 	"bash",
@@ -347,6 +362,20 @@ test("v0.13 ownership evidence is bundled and matches the self-contained upgrade
 	);
 });
 
+test("v0.14 ownership evidence is bundled and matches the self-contained bounded-review fixture", () => {
+	const legacyManifest = JSON.parse(
+		readFileSync(V014_MANAGED_ASSETS, "utf8"),
+	) as LegacyManagedAssetsManifest;
+	const legacyReviewRisk = readFileSync(V014_REVIEW_RISK_FIXTURE, "utf8");
+
+	assert.equal(legacyManifest.packageVersion, "0.14.0");
+	assert.equal(
+		legacyManifest.assets[`agents/${REVIEW_RISK_FILE}`],
+		sha256(legacyReviewRisk),
+		"migration evidence must fingerprint the exact pre-transaction v0.14 asset",
+	);
+});
+
 test("first forced sync migrates untouched v0.13 assets, preserves routing, and owns new assets", () => {
 	const temporaryAgentHome = mkdtempSync(join(tmpdir(), "gentle-pi-v013-upgrade-"));
 	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
@@ -400,8 +429,8 @@ test("first forced sync migrates untouched v0.13 assets, preserves routing, and 
 		);
 
 		const userEditedMigration = migrated.replace(
-			"**Precision limits.**",
-			"**Precision limits with a user-authored note.**",
+			"Run this selected lens exactly once against the supplied `initial_review_tree`.",
+			"Run this selected lens exactly once against the supplied `initial_review_tree` with a user-authored note.",
 		);
 		assert.notEqual(userEditedMigration, migrated, "the fixture must exercise post-migration drift");
 		writeFileSync(installedReviewRisk, userEditedMigration);
@@ -421,6 +450,44 @@ test("first forced sync migrates untouched v0.13 assets, preserves routing, and 
 		} else {
 			process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
 		}
+		rmSync(temporaryAgentHome, { recursive: true, force: true });
+	}
+});
+
+test("first forced sync migrates untouched v0.14 review contracts and preserves routing", () => {
+	const temporaryAgentHome = mkdtempSync(join(tmpdir(), "gentle-pi-v014-upgrade-"));
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const installedReviewRisk = join(temporaryAgentHome, "agents", REVIEW_RISK_FILE);
+	const legacySource = readFileSync(V014_REVIEW_RISK_FIXTURE, "utf8");
+	const routedLegacySource = legacySource.replace(
+		"description: R1 Risk reviewer — security, privilege boundaries, data exposure, dependency risks, and merge-blocking vulnerabilities.\n",
+		"description: R1 Risk reviewer — security, privilege boundaries, data exposure, dependency risks, and merge-blocking vulnerabilities.\nmodel: private/v014-model\nthinking: high\n",
+	);
+
+	try {
+		process.env.GENTLE_PI_AGENT_HOME = temporaryAgentHome;
+		mkdirSync(dirname(installedReviewRisk), { recursive: true });
+		writeFileSync(installedReviewRisk, routedLegacySource);
+
+		installSddAssets(PACKAGE_ROOT, true);
+
+		const migrated = readFileSync(installedReviewRisk, "utf8");
+		assert.notEqual(migrated, routedLegacySource);
+		assert.match(migrated, /^model: private\/v014-model$/m);
+		assert.match(migrated, /^thinking: high$/m);
+		assert.match(migrated, /initial_review_tree/);
+		assert.doesNotMatch(migrated, /Full 4R runs at most two complete sweeps per lens/);
+		const currentPackageSource = readFileSync(
+			join(PACKAGE_ROOT, "assets", "agents", REVIEW_RISK_FILE),
+			"utf8",
+		);
+		assert.equal(
+			migrated.replace(/^model: .*\n|^thinking: .*\n/gm, ""),
+			currentPackageSource,
+		);
+	} finally {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
 		rmSync(temporaryAgentHome, { recursive: true, force: true });
 	}
 });
@@ -572,8 +639,8 @@ test("forced package installation preserves a thinking-only edit to a managed ag
 test("forced package installation preserves an ordinary body edit to a managed agent", () => {
 	assertManagedAgentUserEditIsPreserved("an ordinary body edit", (source) =>
 		source.replace(
-			"Challenge severe review findings",
-			"Preserve this user-authored body change and challenge severe review findings",
+			"Challenge the supplied inferential claims",
+			"Preserve this user-authored body change and challenge the supplied inferential claims",
 		),
 	);
 });
@@ -843,9 +910,9 @@ test("pi-pretty wrapper uses real package path resolution for pnpm symlink insta
 	assert.match(wrapper, /quietToolsEnabled/);
 });
 
-test("v0.14.0 release package and runtime stop before delivery or publication", () => {
+test("v0.15.0 release package and runtime stop before delivery or publication", () => {
 	const packageJson = readPackageJson();
-	assert.equal(packageJson.version, "0.14.0", "the release manifest must remain explicitly pinned to v0.14.0");
+	assert.equal(packageJson.version, "0.15.0", "the release manifest must remain explicitly pinned to v0.15.0");
 	assert.equal(
 		packageJson.scripts?.test,
 		"node --experimental-strip-types --test tests/*.test.ts && pnpm run test:harness",
@@ -855,18 +922,28 @@ test("v0.14.0 release package and runtime stop before delivery or publication", 
 	const verifier = readFileSync(join(PACKAGE_ROOT, "scripts", "verify-package-files.mjs"), "utf8");
 	assert.match(verifier, /assets\/agents\/review-refuter\.md/);
 	assert.match(verifier, /assets\/migrations\/managed-assets-v0\.13\.json/);
+	assert.match(verifier, /assets\/migrations\/managed-assets-v0\.14\.json/);
 
 	const runtime = readFileSync(join(PACKAGE_ROOT, "extensions", "gentle-ai.ts"), "utf8");
 	assert.doesNotMatch(runtime, /execFileSync\("git", \["(?:commit|push|tag)"/);
 	assert.doesNotMatch(runtime, /execFileSync\("(?:npm|pnpm)", \["publish"/);
 });
 
-test("README documents final review routing and the honest installed permission boundary", () => {
+test("bounded review keeps the Judgment Day skill contract at metadata version 1.4", () => {
+	const frontmatter = readAgentFrontmatter(
+		join(PACKAGE_ROOT, "skills", "judgment-day", "SKILL.md"),
+	);
+
+	assert.match(frontmatter, /^  version: "1\.4"$/m);
+	assert.doesNotMatch(frontmatter, /^  version: "1\.5"$/m);
+});
+
+test("README documents bounded review transactions and the honest installed permission boundary", () => {
 	const readme = readFileSync(join(PACKAGE_ROOT, "README.md"), "utf8");
 	for (const clause of [
-		"400 changed lines remains standard; 401 changed lines routes to full 4R.",
-		"Review advice never blocks commands.",
-		"Dangerous-command confirmation remains independently authoritative.",
+		"Ordinary review runs the selected zero, one, or four lenses exactly once against `initial_review_tree`.",
+		"Pre-commit, pre-push, PR, and release gates validate approved receipts and exact typed targets with zero actors.",
+		"Dangerous-command safety remains independent and authoritative.",
 		"`review-refuter` uses exactly `read`, `grep`, and `find`",
 		"package-managed isolated installation",
 		"Project and user overrides may shadow the package asset",

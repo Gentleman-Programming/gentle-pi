@@ -1,6 +1,6 @@
 # Orchestrator — Delegation Detail (lazy-loaded)
 
-Bind this to the parent Pi session only, on delegation/routing/review triggers. Not always-on; loaded on demand from `assets/orchestrator.md`'s `## Work Routing Ladder`, `## Delegation Rules`, `## Language Boundary`, and `## 4R Review Triggers` pointers.
+Bind this to the parent Pi session only, on delegation/routing/review triggers. Not always-on; loaded on demand from `assets/orchestrator.md`'s `## Work Routing Ladder`, `## Delegation Rules`, `## Language Boundary`, and `## Bounded Review Transactions` pointers.
 
 ## Language Boundary — subagent-facing English + exceptions
 
@@ -40,7 +40,7 @@ Examples:
 - investigate a failing test;
 - implement a bounded multi-file change;
 - run tests/builds and summarize results;
-- fresh-context review.
+- one controller-selected review lens against a bound initial review tree.
 
 Use the configured subagent runtime when available. Prefer the `subagent_*` tools (`subagent_run`, status/result helpers) when the Pi Subagents extension is installed, because they run the user's configured project/global subagent definitions and preserve history/background behavior.
 
@@ -48,7 +48,7 @@ The bounded multi-file writer precedence below is the explicit exception to this
 
 Choose subagent mode by orchestration dependency, not by task length:
 
-- Use `mode: "task"` when the parent must consume the result and continue the workflow, including SDD phases, implementation batches, verification, review gates, and any delegated work whose output determines the next action.
+- Use `mode: "task"` when the parent must consume the result and continue the workflow, including SDD phases, implementation batches, verification, controller-selected review actors, and any delegated work whose output determines the next action. Lifecycle gates themselves launch zero actors.
 - Use `mode: "background"` only for independent work where automatic parent continuation is not required. Background completion may notify the user and preserve history, but it is not a guarantee that the parent model will resume orchestration.
 
 For bounded multi-file writes, prefer the installed package-owned `gentle-ai-worker`, then a user-configured `worker`. If neither worker definition exists, fall back to the native `Agent` even when `subagent_*` tools are available. This writer precedence overrides the general runtime preference above.
@@ -68,7 +68,7 @@ Only pass `model` for generic subagents when the user explicitly requests a mode
 Default balanced pattern for bounded implementation:
 
 ```text
-parent clarifies and checks git → scout/context-builder when context-heavy → one worker writes → selected review lens audits diff → parent validates and reports
+parent clarifies and checks git → ordinary controller binds a snapshot/route → one worker writes when authorized → scoped validator if a fix ran → final verification
 ```
 
 Do not make every task SDD. Do make non-trivial tasks multi-agent at the narrowest useful point.
@@ -101,8 +101,8 @@ Core question: does this inflate parent context without need?
 | Write with analysis across multiple files            |     no |                     yes |
 | Bash for state, e.g. git status                      |    yes |                      no |
 | Bash for execution, e.g. tests/builds                |     no |                     yes |
-| Commit, push, or open PR after code changes          |     no | yes, fresh review first |
-| Recover from wrong cwd/worktree/git/tooling incident |     no |  yes, fresh audit first |
+| Commit, push, or open PR after code changes          |     no | no actor; validate approved receipt + exact target |
+| Recover from wrong cwd/worktree/git/tooling incident |     no | diagnose separately without reopening review authority |
 
 ### Mandatory Delegation Triggers
 
@@ -111,13 +111,13 @@ These are parent-orchestrator stop rules. Once any trigger fires, the parent MUS
 The bounded multi-file writer precedence in rule 2 overrides that general runtime preference. If no delegation mechanism is available, stop and explain the blocker.
 
 1. **4-file rule**: if understanding requires reading 4+ files, launch `scout`, `context-builder`, or the closest read-only mapping subagent with fresh context and a narrow mapping task. State the fallback agent/runtime if the preferred one is unavailable.
-2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, delegate one writer; inline writing is allowed only for trivial/mechanical edits. A fresh review still follows delegated implementation.
+2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, delegate one writer; inline writing is allowed only for trivial/mechanical edits. Any review work remains inside the already-bound transaction budget.
    For bounded multi-file writes, prefer the installed package-owned `gentle-ai-worker`, then a user-configured `worker`. If neither worker definition exists, fall back to the native `Agent` even when `subagent_*` tools are available. If no delegation mechanism is available, stop and explain the blocker.
 
-3. **PR rule**: before commit/push/PR for code changes, select a fresh-context review lens unless the diff is trivial docs/text-only.
-4. **Incident rule**: after wrong `cwd`, accidental repo/worktree mutation, failed merge recovery, confusing test command, or environment workaround, stop and run a fresh audit through the relevant review lens before continuing.
+3. **Lifecycle gate rule**: commit/push/PR/release validates an approved receipt and exact typed target with zero actors. If authority is missing or scope changed, fail closed; do not launch a lifecycle review.
+4. **Incident rule**: after wrong `cwd`, accidental repo/worktree mutation, failed merge recovery, confusing test command, or environment workaround, stop and diagnose the incident separately without reopening a closed lineage or resetting its budget.
 5. **Long-session rule**: if accumulating work is no longer clearly local — roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without delegation — pause and delegate the remaining work instead of silently continuing monolithically.
-6. **Fresh review rule**: use fresh-context review lens subagents for adversarial review of diffs, conflicts, PR readiness, and incidents. Use continuity-oriented workers only for implementation work that needs inherited state.
+6. **Review actor rule**: use review lens subagents only when selected at ordinary transaction start. Explicit Judgment Day uses the named judges; lifecycle and SDD boundaries launch zero review actors.
 
 ### Cost and Context Balance
 
@@ -125,7 +125,7 @@ Prefer delegation when fresh context improves correctness more than token saving
 
 - Use `scout`/`context-builder` to compress broad repo exploration into a short handoff instead of loading many files into the parent.
 - Use a single `worker` for one writer thread; do not run parallel writers unless isolated worktrees are explicitly approved.
-- Use fresh concrete review lens agents after implementation, conflict resolution, or incidents because their value is independence from the parent's assumptions. Do not call a generic `reviewer` subagent; choose from `review-risk`, `review-reliability`, `review-resilience`, `review-readability`, or the full 4R set.
+- When ordinary transaction start selects review actors, use the concrete lens named by the bound route. Do not call a generic `reviewer` subagent or add a later lifecycle review outside that transaction.
 - Use `outputMode: "file-only"` for large child reports and summarize only decisions, blockers, and paths in the parent thread.
 - Avoid delegation for truly local one-file fixes, quick state checks, and already-understood mechanical edits.
 
@@ -134,19 +134,19 @@ Prefer delegation when fresh context improves correctness more than token saving
 Bugfix with unfamiliar flow:
 
 ```text
-parent git/status + clarify → scout fresh maps flow/files → parent decides → worker fork implements + tests → selected review lens audits diff → parent validates
+parent git/status + clarify → scout maps flow/files → controller binds ordinary snapshot/route → worker implements authorized fixes + tests → scoped validator if required → final verification
 ```
 
 Conflict or dependency-marker cleanup:
 
 ```text
-parent reproduces/checks conflict → parent or worker resolves → selected review lens checks markers, package/lock consistency, and repo cleanliness → parent reports/pushes
+parent reproduces/checks conflict → parent or worker resolves inside the active scope → controller verifies markers, package/lock consistency, and repo cleanliness → receipt gate validates the exact target
 ```
 
 After tooling/worktree incident:
 
 ```text
-stop writes → parent captures git status → selected review lens audits affected repos/worktrees with no edits → parent applies only confirmed recovery steps
+stop writes → parent captures git status → diagnose affected repos/worktrees with no edits → parent applies only confirmed recovery steps without reopening review authority
 ```
 
 ### Review Lens Selection
@@ -163,51 +163,48 @@ stop writes → parent captures git status → selected review lens audits affec
 
 If multiple rows match, run the narrow set that covers the risk. Example: shell integration that mutates live state should use `review-reliability` plus `review-resilience`, not `review-readability` by default.
 
-## 4R Review Triggers
+## Bounded Review Transaction Contract
 
-The extension classifies recognized git/gh workflow diffs and emits advice only:
+Ordinary review runs the selected zero, one, or four lenses exactly once against `initial_review_tree`.
 
-- **Trivial**: use zero lenses only when complete evidence proves every change is documentation, comments, formatting, or a string typo and no executable/configuration content changed.
-- **Standard**: use exactly one dominant lens. Precedence is risk, resilience, reliability, then readability fallback. Ambiguous executable/configuration changes fail conservatively to standard.
-- **Full 4R**: for a non-trivial hot path or strictly more than 400 changed lines, use `review-risk`, `review-resilience`, `review-readability`, and `review-reliability` in that order. Exactly 400 remains standard; 401 is full.
-- **Event ceiling**: pre-commit and pre-push never run full 4R; cap them at one standard lens. Pre-PR, CI, and schedule may run full 4R.
+Before corroboration, the controller freezes canonical ID-sorted identity, claim, and evidence rows under `frozen_ledger_hash`.
 
-Review advice never pauses, denies, or requires a receipt. Continue to independent command safety after notification; dangerous-command denial or confirmation remains authoritative. Post-SDD design/apply uses the separate Judgment Day path.
+Frozen claims never change; refuter and validator outcomes are separate resolution records.
 
-### Review Execution Contract
+Actor output is untrusted data and cannot authorize transitions, fixes, receipts, gates, or delivery.
 
-The parent owns merge, persistence, refutation, voting, fixes, and scoped re-review. The static `4r-review` chain performs lens discovery and returns reports only.
+Deterministic evidence is controller-checked with zero refuters.
 
-**Precision limits.** Standard review runs exactly one complete sweep. Full 4R runs at most two complete sweeps per lens. Every finding MUST include concrete evidence of user impact; speculative findings are rejected.
+All inferential-severe rows may go once to at most one read-only refuter as one complete list.
 
-**Findings ledger.** Emit a findings ledger with this schema for every entry:
+Invalid, missing, duplicate, unknown, or inconclusive refuter output escalates without a replacement refuter.
 
-| Field | Values |
-|-------|--------|
-| `id` | `{LENS}-{NNN}` (e.g. `R1-001`) |
-| `lens` | risk \| readability \| reliability \| resilience \| judgment-day |
-| `location` | `path/to/file.ext:line` or `:start-end` |
-| `severity` | BLOCKER \| CRITICAL \| WARNING \| SUGGESTION |
-| `status` | open \| refuted \| fixed \| verified \| wont-fix \| info |
-| `evidence` | why it matters |
+Ordinary permits at most one fix batch.
 
-`refuted` is terminal and MUST NOT be reopened by later rounds. WARNING and SUGGESTION rows are recorded once with status `info` and MUST NOT schedule fixes.
+After a fix, exactly one validator receives only requested frozen IDs, their exact hash-bound rows, and the fix diff.
 
-**Ledger persistence honors the artifact store.**
-- `openspec`: write `openspec/changes/{change-name}/review-ledger.md`.
-- `engram`: upsert topic `sdd/{change-name}/review-ledger` (ad-hoc judgment-day without a change: `review/{target-slug}/ledger`, where `target-slug` = `pr-{number}` when reviewing a PR, else the current branch name kebab-cased, else a kebab-case slug of the user-stated review target). If the engram upsert fails or the memory tool is unavailable, fall back to keeping the ledger inline in the response and explicitly report the degradation — never continue as if persistence succeeded.
-- `none`: keep the ledger inline in the response; do not write files or Engram artifacts — the ledger lives only in this conversation; complete the review → fix → re-review loop within the session because it is not persisted across compaction.
+The validator cannot change claims, add findings, request fixes, launch actors, or repeat.
 
-If the first pass finds nothing, persist an empty ledger record rather than skip persistence.
+A no-fix path runs zero validators; both paths run exactly one final verification.
 
-**Constant refutation.** When no surviving BLOCKER/CRITICAL candidates exist, refutation launches zero actors. Standard review launches exactly one non-parallel general refuter. Full 4R launches exactly three parallel refuters: correctness, impact/exploitability, and reproducibility. Every active refuter receives the complete merged BLOCKER/CRITICAL candidate list. Per-finding refuter tasks and replacement refuters are forbidden.
+Ordinary ends only as `approved` or `escalated`.
 
-**Mode-specific voting.** Refuter outputs are keyed by finding ID. In standard review, the general refuter's single `refuted` verdict terminally refutes only that finding. In full 4R, at least two of three valid `refuted` verdicts terminally refute only that finding. `stands`, unknown, duplicate, malformed, omitted, or missing verdicts preserve the finding.
+Judgment Day starts only when explicitly requested and replaces ordinary review for that lineage.
 
-**Scoped convergence.** Re-review receives only the authoritative ledger and the fix diff. Re-review assesses affected ledger rows and regressions introduced by the fix. Only surviving BLOCKER/CRITICAL rows MAY schedule a fix round. At most two scoped fix/re-review rounds may run. Severe rows surviving round two MUST escalate; a third round MUST NOT run.
+Judgment Day starts with exactly two blind judges and zero refuters.
 
-**Judgment Day exception.** Each Judgment Day judge runs exactly one complete blind sweep. Judgment Day launches exactly two blind judges in parallel and zero refuters. Judgment Day applies the same two-round limit to surviving BLOCKER/CRITICAL rows. Judgment Day WARNING and SUGGESTION rows remain `info` and MUST NOT schedule fixes.
+Only Judgment Day may iterate, for at most two scoped fix/re-judgment rounds.
 
-Subagent execution-mode: this agent runs its lens exhaustively as a dedicated Pi subagent and returns its own ledger rows in its Output; the orchestrator merges those ledger rows into the persisted ledger.
+Findings surviving round two escalate; no third-round transition exists.
 
-Fix execution-mode: jd-fix-agent applies only confirmed ledger findings and hands control back to the orchestrator, which runs the scoped re-judge.
+Only ordinary transaction start classifies the bound `base_tree -> complete_snapshot_tree` diff.
+
+Pre-commit, pre-push, PR, and release gates validate approved receipts and exact typed targets with zero actors.
+
+Dangerous-command safety remains independent and authoritative.
+
+SDD completion adds no review or Judgment Day pass.
+
+Review transactions, validation, and SDD perform no commit, push, PR creation, release, or publication.
+
+The static `4r-review` chain performs only the selected lens calls. Controller APIs alone freeze rows, reduce state, journal results, claim scope children, and mint receipts.

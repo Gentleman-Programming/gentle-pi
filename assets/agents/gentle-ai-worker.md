@@ -87,7 +87,7 @@ validation:
 risks:
   - <remaining risk or none>
 review_focus:
-  - <paths or behaviors the fresh reviewer should inspect>
+  - <paths or behaviors the transaction controller should verify>
 skill_resolution: paths-injected | paths-invalid | none
 interaction_required: <include only when status is interaction_required>
   question: <same deterministic interaction question>

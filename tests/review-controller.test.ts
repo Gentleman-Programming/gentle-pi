@@ -1,0 +1,455 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	ToolCallEventResult,
+} from "@earendil-works/pi-coding-agent";
+import gentleAi from "../extensions/gentle-ai.ts";
+import {
+	REVIEW_MODE,
+	REVIEW_TRANSITION,
+	ReviewTransactionStore,
+	createReviewState,
+	type ReviewBudgetV1,
+} from "../lib/review-transaction.ts";
+import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
+import { testSnapshot } from "./review-test-fixtures.ts";
+
+interface ReviewToolResult {
+	content: Array<{ type: string; text: string }>;
+	details?: unknown;
+}
+
+interface RegisteredReviewTool {
+	name: string;
+	parameters: unknown;
+	execute: (
+		toolCallId: string,
+		params: unknown,
+		signal: AbortSignal | undefined,
+		onUpdate: undefined,
+		ctx: ExtensionContext,
+	) => Promise<ReviewToolResult>;
+}
+
+type ToolCallHandler = (
+	event: { toolName: string; input: unknown },
+	ctx: ExtensionContext,
+) => Promise<ToolCallEventResult | undefined>;
+
+interface RuntimeRegistration {
+	controller: RegisteredReviewTool;
+	toolCall: ToolCallHandler;
+}
+
+interface RepositoryFixture {
+	parent: string;
+	repository: string;
+	baseCommit: string;
+	baseTree: string;
+	finalCommit?: string;
+	finalTree?: string;
+	tagObject?: string;
+}
+
+function budget(): ReviewBudgetV1 {
+	return {
+		review_batches: 1,
+		review_actors: 1,
+		refuter_batches: 1,
+		fix_batches: 1,
+		validator_runs: 1,
+		final_verifications: 1,
+		judgment_rounds: 0,
+		judge_runs: 0,
+	};
+}
+
+function registerRuntime(): RuntimeRegistration {
+	const handlers = new Map<string, ToolCallHandler>();
+	const tools = new Map<string, RegisteredReviewTool>();
+	const pi = {
+		on(name: string, handler: ToolCallHandler) {
+			handlers.set(name, handler);
+		},
+		registerTool(definition: RegisteredReviewTool) {
+			tools.set(definition.name, definition);
+		},
+		registerCommand() {},
+	} as unknown as ExtensionAPI;
+	gentleAi(pi);
+	const controller = tools.get("gentle_review");
+	const toolCall = handlers.get("tool_call");
+	assert.ok(controller, "the supported review controller tool must be registered");
+	assert.ok(toolCall, "the lifecycle gate hook must be registered");
+	return { controller, toolCall };
+}
+
+function extensionContext(repository: string, confirmDangerous = false): ExtensionContext {
+	return {
+		cwd: repository,
+		hasUI: confirmDangerous,
+		ui: {
+			confirm: async () => true,
+		},
+	} as unknown as ExtensionContext;
+}
+
+function git(repository: string, ...args: string[]): string {
+	return execFileSync("git", args, {
+		cwd: repository,
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+	}).trim();
+}
+
+function createRepository(t: test.TestContext, commitFinal: boolean): RepositoryFixture {
+	const parent = mkdtempSync(join(tmpdir(), "gentle-pi-review-controller-"));
+	const repository = join(parent, "repo");
+	mkdirSync(repository);
+	t.after(() => rmSync(parent, { recursive: true, force: true }));
+	git(repository, "init", "-b", "main");
+	writeFileSync(join(repository, "app.ts"), "export const value = 1;\n");
+	git(repository, "add", ".");
+	git(
+		repository,
+		"-c",
+		"user.name=Review Controller",
+		"-c",
+		"user.email=review-controller@example.invalid",
+		"commit",
+		"-m",
+		"base",
+	);
+	const baseCommit = git(repository, "rev-parse", "HEAD");
+	const baseTree = git(repository, "rev-parse", "HEAD^{tree}");
+	git(repository, "branch", "base", baseCommit);
+	writeFileSync(join(repository, "app.ts"), "export const value = 2;\n");
+	if (!commitFinal) return { parent, repository, baseCommit, baseTree };
+	git(repository, "add", ".");
+	git(
+		repository,
+		"-c",
+		"user.name=Review Controller",
+		"-c",
+		"user.email=review-controller@example.invalid",
+		"commit",
+		"-m",
+		"final",
+	);
+	const finalCommit = git(repository, "rev-parse", "HEAD");
+	const finalTree = git(repository, "rev-parse", "HEAD^{tree}");
+	git(repository, "branch", "final", finalCommit);
+	git(
+		repository,
+		"-c",
+		"user.name=Review Controller",
+		"-c",
+		"user.email=review-controller@example.invalid",
+		"tag",
+		"-a",
+		"v1.2.3",
+		"-m",
+		"release",
+		finalCommit,
+	);
+	const tagObject = git(repository, "rev-parse", "refs/tags/v1.2.3^{object}");
+	return {
+		parent,
+		repository,
+		baseCommit,
+		baseTree,
+		finalCommit,
+		finalTree,
+		tagObject,
+	};
+}
+
+function details(result: ReviewToolResult): Record<string, unknown> {
+	assert.ok(result.details && typeof result.details === "object");
+	return result.details as Record<string, unknown>;
+}
+
+async function controllerCall(
+	controller: RegisteredReviewTool,
+	ctx: ExtensionContext,
+	params: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+	return details(await controller.execute("review-tool-call", params, undefined, undefined, ctx));
+}
+
+async function approveTrackedWorktreeTransaction(
+	controller: RegisteredReviewTool,
+	ctx: ExtensionContext,
+	lineageId: string,
+): Promise<void> {
+	const start = await controllerCall(controller, ctx, {
+		operation: "start",
+		lineageId,
+		idempotencyKey: `${lineageId}-start`,
+		input: JSON.stringify({
+			mode: REVIEW_MODE.ORDINARY,
+			projection: { kind: "complete" },
+			policyHash: "a".repeat(64),
+			evidenceHash: "b".repeat(64),
+			budget: budget(),
+		}),
+	});
+	assert.equal(start.operation, "start");
+	for (const [transition, input, suffix] of [
+		[REVIEW_TRANSITION.ORDINARY_DISCOVERY, { rows: [] }, "discovery"],
+		[REVIEW_TRANSITION.ORDINARY_EVIDENCE, { deterministicResults: [] }, "evidence"],
+		[REVIEW_TRANSITION.ORDINARY_FINAL_VERIFICATION, { passed: true }, "verify"],
+	] as const) {
+		const advanced = await controllerCall(controller, ctx, {
+			operation: "advance",
+			lineageId,
+			idempotencyKey: `${lineageId}-${suffix}`,
+			transition,
+			input: JSON.stringify(input),
+		});
+		assert.equal(advanced.operation, "advance");
+	}
+	const status = await controllerCall(controller, ctx, {
+		operation: "status",
+		lineageId,
+	});
+	const state = status.state as Record<string, unknown>;
+	assert.equal(state.terminal_state, "approved");
+	assert.equal(typeof status.receipt, "object");
+}
+
+function createTerminalAuthority(fixture: RepositoryFixture, lineageId: string): void {
+	assert.ok(fixture.finalTree);
+	const store = ReviewTransactionStore.forRepository(fixture.repository);
+	store.create(
+		createReviewState({
+			lineageId,
+			mode: REVIEW_MODE.ORDINARY,
+			snapshot: testSnapshot({
+				baseTree: fixture.baseTree,
+				completeTree: fixture.finalTree,
+				route: REVIEW_ROUTE.STANDARD,
+				lenses: [REVIEW_LENS.READABILITY],
+			}),
+			evidenceHash: "c".repeat(64),
+			budget: budget(),
+		}),
+		`${lineageId}-start`,
+	);
+	for (const [transition, input, suffix] of [
+		[REVIEW_TRANSITION.ORDINARY_DISCOVERY, { rows: [] }, "discovery"],
+		[REVIEW_TRANSITION.ORDINARY_EVIDENCE, { deterministicResults: [] }, "evidence"],
+		[REVIEW_TRANSITION.ORDINARY_FINAL_VERIFICATION, { passed: true }, "verify"],
+	] as const) {
+		store.runReducerOperation({
+			lineageId,
+			transition,
+			idempotencyKey: `${lineageId}-${suffix}`,
+			input,
+		});
+	}
+}
+
+test("registered controller creates, advances, reports, and authorizes an exact all-tracked commit once", async (t) => {
+	const fixture = createRepository(t, false);
+	const { controller, toolCall } = registerRuntime();
+	const ctx = extensionContext(fixture.repository);
+	await approveTrackedWorktreeTransaction(controller, ctx, "controller-lifecycle");
+
+	const command = "git commit -am bounded";
+	const validated = await controllerCall(controller, ctx, {
+		operation: "validate",
+		lineageId: "controller-lifecycle",
+		idempotencyKey: "controller-lifecycle-gate",
+		command,
+		input: JSON.stringify({ scopeBudget: budget() }),
+	});
+	const result = validated.result as Record<string, unknown>;
+	assert.equal(result.status, "allow", JSON.stringify(validated));
+	assert.equal(result.actor_count, 0);
+	assert.equal(typeof validated.authorization, "object");
+	assert.equal(await toolCall({ toolName: "bash", input: { command } }, ctx), undefined);
+
+	const replay = await toolCall({ toolName: "bash", input: { command } }, ctx);
+	assert.equal(replay?.block, true);
+	assert.match(replay?.reason ?? "", /registered review controller authorization/i);
+
+	const splitAllCommand = "git commit -a -m bounded";
+	const splitAllValidated = await controllerCall(controller, ctx, {
+		operation: "validate",
+		lineageId: "controller-lifecycle",
+		idempotencyKey: "controller-lifecycle-gate-split-all",
+		command: splitAllCommand,
+		input: JSON.stringify({ scopeBudget: budget() }),
+	});
+	assert.equal(
+		(splitAllValidated.result as Record<string, unknown>).status,
+		"allow",
+		JSON.stringify(splitAllValidated),
+	);
+	assert.equal(
+		await toolCall({ toolName: "bash", input: { command: splitAllCommand } }, ctx),
+		undefined,
+	);
+
+	const fabricated = await toolCall(
+		{
+			toolName: "bash",
+			input: {
+				command: "git commit -m bounded",
+				reviewGate: {
+					target: { kind: "intended-commit", intended_commit_tree: result.target_hash },
+				},
+			},
+		},
+		ctx,
+	);
+	assert.equal(fabricated?.block, true);
+	assert.match(fabricated?.reason ?? "", /registered review controller authorization/i);
+});
+
+test("controller binds push, PR, and release authorization to exact command arguments", async (t) => {
+	const fixture = createRepository(t, true);
+	assert.ok(fixture.finalCommit && fixture.finalTree && fixture.tagObject);
+	const remotePath = join(fixture.parent, "remote.git");
+	execFileSync("git", ["clone", "--bare", fixture.repository, remotePath], {
+		cwd: fixture.parent,
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	execFileSync("git", ["--git-dir", remotePath, "update-ref", "refs/heads/main", fixture.baseCommit]);
+	git(fixture.repository, "remote", "add", "origin", remotePath);
+	createTerminalAuthority(fixture, "controller-targets");
+	const { controller, toolCall } = registerRuntime();
+	const ctx = extensionContext(fixture.repository, true);
+
+	for (const [command, key] of [
+		["git push origin main:main", "push"],
+		["gh pr create --base base --head final", "pr"],
+		["gh release create v1.2.3 --notes bounded", "release"],
+	] as const) {
+		const validated = await controllerCall(controller, ctx, {
+			operation: "validate",
+			lineageId: "controller-targets",
+			idempotencyKey: `controller-targets-${key}`,
+			command,
+			input: JSON.stringify({ scopeBudget: budget() }),
+		});
+		assert.equal((validated.result as Record<string, unknown>).status, "allow", command);
+		assert.equal(await toolCall({ toolName: "bash", input: { command } }, ctx), undefined, command);
+	}
+
+	for (const command of [
+		"git push --all origin",
+		"git push origin main:main final:feature",
+		"git push --follow-tags origin main:main",
+		"git push origin --follow-tags main:main",
+		"git push origin main:main --follow-tags",
+	]) {
+		await assert.rejects(
+			controller.execute(
+				"unsupported-push",
+				{
+					operation: "validate",
+					lineageId: "controller-targets",
+					idempotencyKey: `unsupported-${command.length}`,
+					command,
+					input: JSON.stringify({ scopeBudget: budget() }),
+				},
+				undefined,
+				undefined,
+				ctx,
+			),
+			/exactly derive|unsupported.*push|complete ref update/i,
+		);
+	}
+	for (const [command, key] of [
+		["env SAFE=1 git push --follow-tags origin main:main", "env"],
+		["command git push origin --follow-tags main:main", "command"],
+		["sh -c 'git push origin main:main --follow-tags'", "shell"],
+	] as const) {
+		await assert.rejects(
+			controller.execute(
+				"unsupported-wrapped-follow-tags-push",
+				{
+					operation: "validate",
+					lineageId: "controller-targets",
+					idempotencyKey: `unsupported-wrapped-follow-tags-push-${key}`,
+					command,
+					input: JSON.stringify({ scopeBudget: budget() }),
+				},
+				undefined,
+				undefined,
+				ctx,
+			),
+			/compound or wrapped lifecycle command.*fail closed/i,
+		);
+	}
+	for (const [command, key] of [
+		["gh release create v1.2.3 --repo other/project", "long"],
+		["gh release create v1.2.3 -Rother/project", "short"],
+	] as const) {
+		await assert.rejects(
+			controller.execute(
+				"unsupported-release-repository",
+				{
+					operation: "validate",
+					lineageId: "controller-targets",
+					idempotencyKey: `unsupported-release-repository-${key}`,
+					command,
+					input: JSON.stringify({ scopeBudget: budget() }),
+				},
+				undefined,
+				undefined,
+				ctx,
+			),
+			/exact local review repository|--repo/i,
+		);
+	}
+
+	await controllerCall(controller, ctx, {
+		operation: "validate",
+		lineageId: "controller-targets",
+		idempotencyKey: "controller-targets-release-mismatch",
+		command: "gh release create v1.2.3",
+		input: JSON.stringify({ scopeBudget: budget() }),
+	});
+	git(
+		fixture.repository,
+		"-c",
+		"user.name=Review Controller",
+		"-c",
+		"user.email=review-controller@example.invalid",
+		"tag",
+		"-a",
+		"v9.9.9",
+		"-m",
+		"different release argument",
+		fixture.finalCommit,
+	);
+	const mismatchedRelease = await toolCall(
+		{
+			toolName: "bash",
+			input: {
+				command: "gh release create v9.9.9",
+				reviewGate: {
+					target: {
+						kind: "release",
+						tag_ref: "refs/tags/v1.2.3",
+						tag_object: fixture.tagObject,
+						peeled_commit: fixture.finalCommit,
+						tree: fixture.finalTree,
+					},
+				},
+			},
+		},
+		ctx,
+	);
+	assert.equal(mismatchedRelease?.block, true);
+	assert.match(mismatchedRelease?.reason ?? "", /registered review controller authorization/i);
+});

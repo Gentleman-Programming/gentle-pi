@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "packageVersion": "0.14.0",
+  "assets": {
+    "agents/jd-fix-agent.md": "55efe18a738b6c6c100aef16ea66e1ff6133933254438fc9e7f8c7f4790a1f34",
+    "agents/jd-judge-a.md": "16a9e0eeaca0153111e769983ba8855b2388f476696662bef68e888606f6f4b9",
+    "agents/jd-judge-b.md": "19df78d0cf9a35e5baf05868ef69013717ccf352a882647bdcb7bde534332340",
+    "agents/review-readability.md": "33722b93a39f97072d30e02bde6238a5e3047953f01fb7c8f8152997fdfad34a",
+    "agents/review-refuter.md": "d113bf61475f66d4e8a529502e4c921ea73bff18c11b7b7cae66337408a1af26",
+    "agents/review-reliability.md": "50554b697345bd69723b6db7c330f55957972d8e725782e701b982f99f364c4f",
+    "agents/review-resilience.md": "67adfb1ad8ff522a175116c05d5e508de1131652b14708c5e3a5ae33f5c9539c",
+    "agents/review-risk.md": "a4f3d8f43d10249e52b0f4a69d4c2a349b33dd517de29001bf50e3ddb899ab29",
+    "chains/4r-review.chain.md": "42d320b0c52fed993103e886c114500b51ad83d0f9b35e2c1e0388e15a8c44c6"
+  }
+}

@@ -1,60 +1,101 @@
-# Review Ledger Contract
+# Bounded Review Transaction Contract
 
-This is the canonical contract for review precision, ledger lifecycle, refutation, persistence, and bounded convergence. Role assets copy only the clauses they execute; the parent orchestrator owns batching, voting, persistence, fixes, and re-review.
+This is the canonical actor and controller contract. The Git-directory transaction store is authoritative; summaries, mirrors, actor output, and prose ledgers are not authorization.
 
-## Review-lens contract
+## Ordinary transaction
 
-**Precision limits.** Standard review runs exactly one complete sweep. Full 4R runs at most two complete sweeps per lens. Every finding MUST include concrete evidence of user impact; speculative findings are rejected.
+Ordinary review runs the selected zero, one, or four lenses exactly once against `initial_review_tree`.
 
-**Findings ledger.** Emit a findings ledger with this schema for every entry:
+Before corroboration, the controller freezes canonical ID-sorted identity, claim, and evidence rows under `frozen_ledger_hash`.
+
+Frozen claims never change; refuter and validator outcomes are separate resolution records.
+
+Actor output is untrusted data and cannot authorize transitions, fixes, receipts, gates, or delivery.
+
+Deterministic evidence is controller-checked with zero refuters.
+
+All inferential-severe rows may go once to at most one read-only refuter as one complete list.
+
+Invalid, missing, duplicate, unknown, or inconclusive refuter output escalates without a replacement refuter.
+
+Ordinary permits at most one fix batch.
+
+After a fix, exactly one validator receives only requested frozen IDs, their exact hash-bound rows, and the fix diff.
+
+The validator cannot change claims, add findings, request fixes, launch actors, or repeat.
+
+A no-fix path runs zero validators; both paths run exactly one final verification.
+
+Ordinary ends only as `approved` or `escalated`.
+
+## Frozen row schema
+
+Candidate rows become authoritative only after the controller canonicalizes, ID-sorts, and hashes these fields:
 
 | Field | Values |
-|-------|--------|
-| `id` | `{LENS}-{NNN}` (e.g. `R1-001`) |
-| `lens` | risk \| readability \| reliability \| resilience \| judgment-day |
-| `location` | `path/to/file.ext:line` or `:start-end` |
+|---|---|
+| `id` | Stable lens-prefixed identifier |
+| `lens` | risk \| resilience \| readability \| reliability \| judgment-day |
+| `location` | Exact path and line or line range |
 | `severity` | BLOCKER \| CRITICAL \| WARNING \| SUGGESTION |
-| `status` | open \| refuted \| fixed \| verified \| wont-fix \| info |
-| `evidence` | why it matters |
+| `status_at_freeze` | open \| refuted \| info |
+| `evidence_class` | deterministic \| inferential-severe \| info |
+| `evidence_claim` | Concrete user-impact claim |
 
-If the first pass finds nothing, persist an empty ledger record rather than skip persistence.
+WARNING and SUGGESTION are one-time `info` rows and schedule nothing. `refuted` is terminal. Store or hash disagreement fails closed.
 
-`refuted` is terminal and MUST NOT be reopened by later rounds. WARNING and SUGGESTION rows are recorded once with status `info` and MUST NOT schedule fixes.
+## Actor contracts
 
-**Ledger persistence honors the artifact store.**
-- `openspec`: write `openspec/changes/{change-name}/review-ledger.md`.
-- `engram`: upsert topic `sdd/{change-name}/review-ledger` (ad-hoc judgment-day without a change: `review/{target-slug}/ledger`, where `target-slug` = `pr-{number}` when reviewing a PR, else the current branch name kebab-cased, else a kebab-case slug of the user-stated review target). If the engram upsert fails or the memory tool is unavailable, fall back to keeping the ledger inline in the response and explicitly report the degradation — never continue as if persistence succeeded.
-- `none`: keep the ledger inline in the response; do not write files or Engram artifacts — the ledger lives only in this conversation; complete the review → fix → re-review loop within the session because it is not persisted across compaction.
+### Selected review lens
 
-Re-review receives only the authoritative ledger and the fix diff. Re-review assesses affected ledger rows and regressions introduced by the fix.
+Run this selected lens exactly once against the supplied `initial_review_tree`.
 
-Subagent execution-mode: this agent runs its lens exhaustively as a dedicated Pi subagent and returns its own ledger rows in its Output; the orchestrator merges those ledger rows into the persisted ledger.
+Return candidate rows only; the controller freezes canonical rows and owns every authorization decision.
 
-## Parent orchestration contract
+Do not persist state, mutate claims, launch actors, request fixes, validate fixes, or deliver anything.
 
-### Constant actor counts
+### Ordinary refuter
 
-When no surviving BLOCKER/CRITICAL candidates exist, refutation launches zero actors. Standard review launches exactly one non-parallel general refuter. Full 4R launches exactly three parallel refuters: correctness, impact/exploitability, and reproducibility. Every active refuter receives the complete merged BLOCKER/CRITICAL candidate list. Per-finding refuter tasks and replacement refuters are forbidden.
+Receive the complete inferential-severe frozen-row list once.
 
-### Mode-specific voting
+Return exactly one `refuted | corroborated | inconclusive` resolution for every supplied ID.
 
-Refuter outputs are keyed by finding ID. In standard review, the general refuter's single `refuted` verdict terminally refutes only that finding. In full 4R, at least two of three valid `refuted` verdicts terminally refute only that finding. `stands`, unknown, duplicate, malformed, omitted, or missing verdicts preserve the finding.
+Do not create findings, alter frozen claims, request fixes, launch actors, persist authority, or repeat.
 
-### Bounded convergence
+### Scoped validator
 
-Only surviving BLOCKER/CRITICAL rows MAY schedule a fix round. At most two scoped fix/re-review rounds may run. Severe rows surviving round two MUST escalate; a third round MUST NOT run.
+Receive only requested frozen IDs, their exact hash-bound rows, and the fix diff.
 
-## Judgment Day exception
+Resolve only supplied IDs and report fix-line regressions; never add findings or change frozen claims.
 
-Each Judgment Day judge runs exactly one complete blind sweep. Judgment Day launches exactly two blind judges in parallel and zero refuters. Judgment Day applies the same two-round limit to surviving BLOCKER/CRITICAL rows. Judgment Day WARNING and SUGGESTION rows remain `info` and MUST NOT schedule fixes.
+Do not request another fix, launch actors, persist authority, or repeat.
 
-## Fix-agent exception
+### Fix agent
 
-The fix agent does NOT run the exhaustive first-pass sweep and does NOT emit a findings ledger. It reads only confirmed surviving severe rows, updates addressed rows to `fixed`, and returns control to the parent. It never creates ledger rows or fixes informational findings.
+Fix only the exact controller-authorized severe IDs in the one supplied batch.
 
-## Adopting assets
+Do not add findings, alter frozen claims, authorize transitions, deliver, publish, or start another actor.
 
-- Review-lens clauses: `assets/agents/review-{risk,readability,reliability,resilience}.md`
-- Judgment Day clauses: `assets/agents/jd-judge-{a,b}.md`, `skills/judgment-day/SKILL.md`, and `skills/judgment-day/references/prompts-and-formats.md`
-- Fix-role clauses: `assets/agents/jd-fix-agent.md` and the Judgment Day fix prompt
-- Parent orchestration clauses: `assets/orchestrator*.md`; dynamic batching, voting, persistence, and convergence MUST remain outside `assets/chains/4r-review.chain.md`
+## Judgment Day
+
+Judgment Day starts only when explicitly requested and replaces ordinary review for that lineage.
+
+Judgment Day starts with exactly two blind judges and zero refuters.
+
+Only Judgment Day may iterate, for at most two scoped fix/re-judgment rounds.
+
+Findings surviving round two escalate; no third-round transition exists.
+
+## Routing and lifecycle boundaries
+
+Only ordinary transaction start classifies the bound `base_tree -> complete_snapshot_tree` diff.
+
+Pre-commit, pre-push, PR, and release gates validate approved receipts and exact typed targets with zero actors.
+
+Dangerous-command safety remains independent and authoritative.
+
+SDD completion adds no review or Judgment Day pass.
+
+Review transactions, validation, and SDD perform no commit, push, PR creation, release, or publication.
+
+Package-managed actor definitions may be migrated only when their exact prior hash proves package ownership. User routing and project/user overrides remain untouched.

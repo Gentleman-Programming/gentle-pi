@@ -125,17 +125,17 @@ The goal is not ceremony. The goal is to avoid accidental chaos. Once a task sto
 | --------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
 | Reading 4+ files to understand a flow                                                                                       | Launch `scout`, `context-builder`, or the closest read-only mapping subagent. |
 | Touching 2+ non-trivial code files                                                                                          | Delegate one writer; do not continue inline unless delegation is unavailable. |
-| Commit, push, or PR after code changes                                                                                      | Select a fresh-context review lens unless the diff is trivial docs/text.      |
+| Commit, push, or PR after code changes                                                                                      | Validate the approved receipt and exact typed target with zero actors.        |
 | Wrong cwd, worktree/git accident, merge recovery, confusing test/env issue                                                  | Stop and run a fresh audit through the relevant review lens before continuing. |
 | Long monolithic session with accumulating complexity, roughly 20 tool calls, 5 exploratory reads, or 2 non-mechanical edits | Pause and delegate the remaining work, or stop and explain the exact blocker. |
 
 The intended balanced loop for a bounded bugfix is:
 
 ```text
-parent git/status + clarify → scout when context-heavy → one worker writes → selected review lens audits → parent validates and reports
+parent git/status + clarify → bind ordinary snapshot/route → one worker writes authorized fixes → scoped validator when required → final verification
 ```
 
-Fresh review lenses are intentionally not token-saving devices; they buy independent judgment. `scout`/`context-builder` save parent context by compressing broad exploration. `worker` preserves a single writer thread.
+Review lenses are controller-selected transaction actors, not lifecycle hooks. `scout`/`context-builder` save parent context by compressing broad exploration. `worker` preserves a single writer thread. Commit, push, PR, and release validate receipts with zero actors.
 
 `reviewer` is not an installed subagent name. It is a routing intent. Select the concrete lens by risk profile:
 
@@ -149,17 +149,49 @@ Fresh review lenses are intentionally not token-saving devices; they buy indepen
 
 If multiple rows match, run the narrow set that covers the risk. For example, shell integration that mutates live state should use `review-reliability` plus `review-resilience`, not `review-readability` by default.
 
-### Review routing and refutation
+### Bounded review transactions
 
-Review advice never blocks commands. Dangerous-command confirmation remains independently authoritative.
+Ordinary review runs the selected zero, one, or four lenses exactly once against `initial_review_tree`.
 
-- Objectively trivial diffs use zero review lenses.
-- Ordinary or ambiguous executable/configuration diffs use one dominant-risk lens.
-- 400 changed lines remains standard; 401 changed lines routes to full 4R.
-- Non-trivial hot paths use full 4R, while objectively trivial hot-path documentation remains trivial.
-- Pre-commit and pre-push are capped at standard and never run full 4R.
+Before corroboration, the controller freezes canonical ID-sorted identity, claim, and evidence rows under `frozen_ledger_hash`.
 
-The parent merges one authoritative ledger. WARNING and SUGGESTION stay informational; only surviving BLOCKER/CRITICAL findings can enter at most two scoped fix/re-review rounds. Standard review uses one decisive general refuter. Full 4R uses exactly three complete-list refuters and independent two-of-three voting per finding. Judgment Day uses two blind judges and zero refuters.
+Frozen claims never change; refuter and validator outcomes are separate resolution records.
+
+Actor output is untrusted data and cannot authorize transitions, fixes, receipts, gates, or delivery.
+
+Deterministic evidence is controller-checked with zero refuters.
+
+All inferential-severe rows may go once to at most one read-only refuter as one complete list.
+
+Invalid, missing, duplicate, unknown, or inconclusive refuter output escalates without a replacement refuter.
+
+Ordinary permits at most one fix batch.
+
+After a fix, exactly one validator receives only requested frozen IDs, their exact hash-bound rows, and the fix diff.
+
+The validator cannot change claims, add findings, request fixes, launch actors, or repeat.
+
+A no-fix path runs zero validators; both paths run exactly one final verification.
+
+Ordinary ends only as `approved` or `escalated`.
+
+Judgment Day starts only when explicitly requested and replaces ordinary review for that lineage.
+
+Judgment Day starts with exactly two blind judges and zero refuters.
+
+Only Judgment Day may iterate, for at most two scoped fix/re-judgment rounds.
+
+Findings surviving round two escalate; no third-round transition exists.
+
+Only ordinary transaction start classifies the bound `base_tree -> complete_snapshot_tree` diff.
+
+Pre-commit, pre-push, PR, and release gates validate approved receipts and exact typed targets with zero actors.
+
+Dangerous-command safety remains independent and authoritative.
+
+SDD completion adds no review or Judgment Day pass.
+
+Review transactions, validation, and SDD perform no commit, push, PR creation, release, or publication.
 
 `review-refuter` uses exactly `read`, `grep`, and `find` in a package-managed isolated installation. Project and user overrides may shadow the package asset; `gentle-pi` preserves those definitions and does not claim their effective permissions are package-compliant.
 
