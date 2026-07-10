@@ -1,9 +1,11 @@
 import { execFileSync } from "node:child_process";
 import {
 	existsSync,
+	mkdtempSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	rmSync,
 	writeFileSync,
 } from "node:fs";
 import {
@@ -13,8 +15,8 @@ import {
 	readdir,
 	writeFile,
 } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
 	ExtensionAPI,
@@ -43,13 +45,29 @@ import {
 	sddStatusSeverity,
 	type SddPhase,
 } from "../lib/sdd-status.ts";
+import type { TriggerEvent } from "../lib/review-triggers.ts";
 import {
-	buildDiffEvidence,
-	classifyReviewRoute,
-	type ChangedDiff,
-	type ReviewPlan,
-	type TriggerEvent,
-} from "../lib/review-triggers.ts";
+	GATE_RESULT,
+	GATE_TARGET_KIND,
+	PUSH_UPDATE_KIND,
+	REVIEW_TRANSITION,
+	ReviewTransactionStore,
+	canonicalHash,
+	createReceiptForState,
+	createReviewState,
+	validateReviewGate,
+	type GateTargetV1,
+	type ReviewBudgetV1,
+	type ReviewReducerInput,
+	type ReviewTransition,
+} from "../lib/review-transaction.ts";
+import {
+	REVIEW_MODE,
+	REVIEW_PROJECTION,
+	captureReviewSnapshot,
+	type ReviewMode,
+	type ReviewProjectionV1,
+} from "../lib/review-snapshot.ts";
 import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -2019,6 +2037,185 @@ async function handlePersonaCommand(ctx: ExtensionContext): Promise<void> {
 // Review gate helpers — pure, exported via __testing for unit tests
 // ---------------------------------------------------------------------------
 
+const REVIEW_CONTROLLER_OPERATION = {
+	START: "start",
+	ADVANCE: "advance",
+	STATUS: "status",
+	VALIDATE: "validate",
+} as const;
+
+type ReviewControllerOperation =
+	(typeof REVIEW_CONTROLLER_OPERATION)[keyof typeof REVIEW_CONTROLLER_OPERATION];
+
+const REVIEW_CONTROLLER_PARAMETERS = {
+	type: "object",
+	additionalProperties: false,
+	required: ["operation", "lineageId"],
+	properties: {
+		operation: {
+			type: "string",
+			enum: Object.values(REVIEW_CONTROLLER_OPERATION),
+			description: "Controller operation: start, advance, status, or validate.",
+		},
+		lineageId: {
+			type: "string",
+			description: "Bounded review lineage identifier.",
+		},
+		idempotencyKey: {
+			type: "string",
+			description: "Required for start, advance, and validate operations.",
+		},
+		transition: {
+			type: "string",
+			description: "A supported REVIEW_TRANSITION value for advance.",
+		},
+		command: {
+			type: "string",
+			description: "One exact direct lifecycle command for validate.",
+		},
+		input: {
+			type: "string",
+			description: "JSON object containing operation-specific controller input.",
+		},
+	},
+} as const;
+
+interface ReviewControllerParameters {
+	operation: ReviewControllerOperation;
+	lineageId: string;
+	idempotencyKey?: string;
+	transition?: string;
+	command?: string;
+	input?: string;
+}
+
+interface ReviewControllerStartInput {
+	mode: ReviewMode;
+	projection: ReviewProjectionV1;
+	policyHash: string;
+	evidenceHash: string;
+	budget: ReviewBudgetV1;
+	parentLineageId?: string;
+}
+
+interface ReviewControllerValidateInput {
+	scopeBudget: ReviewBudgetV1;
+}
+
+interface DerivedReviewGateTarget {
+	command: ReviewLifecycleCommand;
+	target: GateTargetV1;
+	actualIntendedCommitTree?: string;
+}
+
+interface PendingReviewAuthorization {
+	command_hash: string;
+	target_hash: string;
+	receipt_hash: string;
+}
+
+function isReviewControllerOperation(value: string): value is ReviewControllerOperation {
+	return Object.values(REVIEW_CONTROLLER_OPERATION).some((operation) => operation === value);
+}
+
+function parseReviewControllerParameters(value: unknown): ReviewControllerParameters {
+	if (!isRecord(value)) throw new Error("Review controller parameters must be an object");
+	if (typeof value.operation !== "string" || !isReviewControllerOperation(value.operation)) {
+		throw new Error("Review controller operation is unsupported");
+	}
+	if (typeof value.lineageId !== "string" || value.lineageId.trim().length === 0) {
+		throw new Error("Review controller requires a lineageId");
+	}
+	const parameters: ReviewControllerParameters = {
+		operation: value.operation,
+		lineageId: value.lineageId,
+	};
+	for (const key of ["idempotencyKey", "transition", "command", "input"] as const) {
+		const optional = value[key];
+		if (optional !== undefined && typeof optional !== "string") {
+			throw new Error(`Review controller ${key} must be a string`);
+		}
+		if (typeof optional === "string") parameters[key] = optional;
+	}
+	return parameters;
+}
+
+function requiredControllerString(
+	parameters: ReviewControllerParameters,
+	key: "idempotencyKey" | "transition" | "command" | "input",
+): string {
+	const value = parameters[key];
+	if (typeof value !== "string" || value.trim().length === 0) {
+		throw new Error(`Review controller ${parameters.operation} requires ${key}`);
+	}
+	return value;
+}
+
+function parseControllerJson(input: string, operation: ReviewControllerOperation): Record<string, unknown> {
+	let value: unknown;
+	try {
+		value = JSON.parse(input);
+	} catch (error) {
+		throw new Error(
+			`Review controller ${operation} input is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (!isRecord(value)) throw new Error(`Review controller ${operation} input must be a JSON object`);
+	return value;
+}
+
+function parseReviewBudget(value: unknown, label: string): ReviewBudgetV1 {
+	if (!isRecord(value)) throw new Error(`${label} must be an object`);
+	return value as unknown as ReviewBudgetV1;
+}
+
+function parseStartInput(value: Record<string, unknown>): ReviewControllerStartInput {
+	if (value.mode !== REVIEW_MODE.ORDINARY && value.mode !== REVIEW_MODE.JUDGMENT_DAY) {
+		throw new Error("Review controller start mode is unsupported");
+	}
+	if (!isRecord(value.projection) || typeof value.projection.kind !== "string") {
+		throw new Error("Review controller start requires a projection");
+	}
+	let projection: ReviewProjectionV1;
+	if (value.projection.kind === REVIEW_PROJECTION.COMPLETE) {
+		projection = { kind: REVIEW_PROJECTION.COMPLETE };
+	} else if (
+		value.projection.kind === REVIEW_PROJECTION.INTENDED_COMMIT &&
+		typeof value.projection.tree === "string"
+	) {
+		projection = {
+			kind: REVIEW_PROJECTION.INTENDED_COMMIT,
+			tree: value.projection.tree,
+		};
+	} else {
+		throw new Error("Review controller start projection is unsupported or unresolved");
+	}
+	if (typeof value.policyHash !== "string" || typeof value.evidenceHash !== "string") {
+		throw new Error("Review controller start requires policyHash and evidenceHash");
+	}
+	if (value.parentLineageId !== undefined && typeof value.parentLineageId !== "string") {
+		throw new Error("Review controller parentLineageId must be a string");
+	}
+	const result: ReviewControllerStartInput = {
+		mode: value.mode,
+		projection,
+		policyHash: value.policyHash,
+		evidenceHash: value.evidenceHash,
+		budget: parseReviewBudget(value.budget, "Review controller start budget"),
+	};
+	if (typeof value.parentLineageId === "string") result.parentLineageId = value.parentLineageId;
+	return result;
+}
+
+function parseValidateInput(value: Record<string, unknown>): ReviewControllerValidateInput {
+	return {
+		scopeBudget: parseReviewBudget(
+			value.scopeBudget,
+			"Review controller validate scopeBudget",
+		),
+	};
+}
+
 /**
  * Classifies a bash command string as a TriggerEvent for the review gate,
  * or returns null if the command is not a recognized git/gh workflow trigger.
@@ -2026,20 +2223,123 @@ async function handlePersonaCommand(ctx: ExtensionContext): Promise<void> {
  * Token parsing preserves supported Git global repository selectors.
  */
 export function classifyReviewEvent(command: string): TriggerEvent | null {
-	return resolveReviewCollectionTarget(command, ".")?.event ?? null;
+	return inspectReviewLifecycleCommand(command, ".").event;
 }
 
-export interface ReviewCollectionTarget {
+export interface ReviewLifecycleCommand {
 	event: TriggerEvent;
 	cwd: string;
 	gitGlobalArgs: readonly string[];
-	includeAllTracked: boolean;
+	arguments: readonly string[];
 }
 
-type ReviewDiffOptions = Pick<
-	ReviewCollectionTarget,
-	"gitGlobalArgs" | "includeAllTracked"
->;
+interface ReviewLifecycleInspection {
+	event: TriggerEvent | null;
+	command: ReviewLifecycleCommand | null;
+	failClosedReason?: string;
+}
+
+function hasUnquotedShellControl(command: string): boolean {
+	let quote: "'" | '"' | undefined;
+	let escaping = false;
+	for (let index = 0; index < command.length; index += 1) {
+		const character = command[index]!;
+		if (escaping) {
+			escaping = false;
+			continue;
+		}
+		if (character === "\\" && quote !== "'") {
+			escaping = true;
+			continue;
+		}
+		if (quote) {
+			if (character === quote) quote = undefined;
+			continue;
+		}
+		if (character === "'" || character === '"') {
+			quote = character;
+			continue;
+		}
+		if (character === ";" || character === "|" || character === "&" || character === "\n") {
+			return true;
+		}
+		if (character === "`" || (character === "$" && command[index + 1] === "(")) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function detectWrappedLifecycleEvent(command: string): TriggerEvent | null {
+	const longestKeywordLength = "release".length;
+	let word = "";
+	let wordIsLongerThanKeyword = false;
+	let quote: "'" | '"' | undefined;
+	let gitSeen = false;
+	let ghStage = 0;
+	let event: TriggerEvent | null = null;
+
+	const consumeWord = (): void => {
+		if (!word && !wordIsLongerThanKeyword) return;
+		const token = wordIsLongerThanKeyword ? "" : word.toLowerCase();
+		word = "";
+		wordIsLongerThanKeyword = false;
+		if (token === "git") gitSeen = true;
+		else if (gitSeen && token === "commit") event = "pre-commit";
+		else if (gitSeen && token === "push") event = "pre-push";
+
+		if (token === "gh") ghStage = 1;
+		else if (ghStage === 1 && token === "pr") ghStage = 2;
+		else if (ghStage === 1 && token === "release") ghStage = 3;
+		else if (ghStage === 2 && token === "create") event = "pre-pr";
+		else if (ghStage === 3 && token === "create") event = "pre-release";
+	};
+
+	for (let index = 0; index < command.length; index += 1) {
+		const character = command[index]!;
+		if (character === "\\" && quote !== "'" && command[index + 1] === "\n") {
+			index += 1;
+			continue;
+		}
+		if (character === "'" || character === '"') {
+			if (!quote) quote = character;
+			else if (quote === character) quote = undefined;
+			continue;
+		}
+		if (!quote && (character === ";" || character === "|" || character === "&" || character === "\n")) {
+			consumeWord();
+			if (event) return event;
+			gitSeen = false;
+			ghStage = 0;
+			continue;
+		}
+		if (/[A-Za-z0-9_]/.test(character)) {
+			if (word.length < longestKeywordLength) word += character;
+			else wordIsLongerThanKeyword = true;
+			continue;
+		}
+		consumeWord();
+		if (event) return event;
+	}
+	consumeWord();
+	return event;
+}
+
+function inspectReviewLifecycleCommand(
+	command: string,
+	defaultCwd: string,
+): ReviewLifecycleInspection {
+	const direct = resolveReviewLifecycleCommand(command, defaultCwd);
+	if (direct) return { event: direct.event, command: direct };
+	const event = detectWrappedLifecycleEvent(command);
+	if (!event) return { event: null, command: null };
+	return {
+		event,
+		command: null,
+		failClosedReason:
+			"Compound or wrapped lifecycle command detection is ambiguous and must fail closed. Run one direct lifecycle command with its approved receipt and exact typed target.",
+	};
+}
 
 function tokenizeReviewCommand(command: string): string[] | null {
 	const words: string[] = [];
@@ -2086,32 +2386,11 @@ function tokenizeReviewCommand(command: string): string[] | null {
 	return words;
 }
 
-function commitIncludesAllTracked(args: readonly string[]): boolean {
-	for (let index = 0; index < args.length; index += 1) {
-		const arg = args[index];
-		if (arg === "--") return false;
-		if (arg === "--all") return true;
-		if (/^--(?:message|file|author|date|reuse-message|reedit-message|fixup|squash)=/.test(arg)) {
-			continue;
-		}
-		if (/^--(?:message|file|author|date|reuse-message|reedit-message|fixup|squash)$/.test(arg)) {
-			index += 1;
-			continue;
-		}
-		if (!arg.startsWith("-") || arg.startsWith("--")) continue;
-		for (const option of arg.slice(1)) {
-			if (option === "a") return true;
-			if (option === "m" || option === "F" || option === "C" || option === "c") break;
-		}
-		if (/^-[mFCc]$/.test(arg)) index += 1;
-	}
-	return false;
-}
-
-export function resolveReviewCollectionTarget(
+export function resolveReviewLifecycleCommand(
 	command: string,
 	defaultCwd: string,
-): ReviewCollectionTarget | null {
+): ReviewLifecycleCommand | null {
+	if (hasUnquotedShellControl(command)) return null;
 	const words = tokenizeReviewCommand(command);
 	if (!words) return null;
 	if (words[0] === "gh" && words[1] === "pr" && words[2] === "create") {
@@ -2119,11 +2398,20 @@ export function resolveReviewCollectionTarget(
 			event: "pre-pr",
 			cwd: defaultCwd,
 			gitGlobalArgs: [],
-			includeAllTracked: false,
+			arguments: words.slice(3),
+		};
+	}
+	if (words[0] === "gh" && words[1] === "release" && words[2] === "create") {
+		return {
+			event: "pre-release",
+			cwd: defaultCwd,
+			gitGlobalArgs: [],
+			arguments: words.slice(3),
 		};
 	}
 	if (words[0] !== "git") return null;
 	const gitGlobalArgs: string[] = [];
+	let resolvedCwd = resolve(defaultCwd);
 	let index = 1;
 	while (index < words.length) {
 		const option = words[index];
@@ -2131,13 +2419,13 @@ export function resolveReviewCollectionTarget(
 			const value = words[index + 1];
 			if (value === undefined) return null;
 			gitGlobalArgs.push(option, value);
+			if (option === "-C") resolvedCwd = resolve(resolvedCwd, value);
+			else return null;
 			index += 2;
 			continue;
 		}
 		if (/^--(?:git-dir|work-tree)=.+/.test(option)) {
-			gitGlobalArgs.push(option);
-			index += 1;
-			continue;
+			return null;
 		}
 		break;
 	}
@@ -2151,150 +2439,543 @@ export function resolveReviewCollectionTarget(
 	if (!event) return null;
 	return {
 		event,
-		cwd: defaultCwd,
+		cwd: resolvedCwd,
 		gitGlobalArgs,
-		includeAllTracked:
-			event === "pre-commit" && commitIncludesAllTracked(words.slice(index + 1)),
+		arguments: words.slice(index + 1),
 	};
 }
 
-export interface ReviewDiffCollection {
-	event: TriggerEvent;
-	diff: ChangedDiff | null;
+function runReviewGit(
+	cwd: string,
+	args: readonly string[],
+	environment: NodeJS.ProcessEnv = process.env,
+): string {
+	return execFileSync("git", args, {
+		cwd,
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+		env: environment,
+	}).trim();
 }
 
-export type ReviewDiffCollector = (
-	event: TriggerEvent,
-	cwd: string,
-	options: ReviewDiffOptions,
-) => ChangedDiff | null;
+function commitIncludesAllTracked(arguments_: readonly string[]): boolean {
+	let includesAllTracked = false;
+	const booleanOptions = new Set([
+		"--all",
+		"--allow-empty",
+		"--allow-empty-message",
+		"--amend",
+		"--dry-run",
+		"--edit",
+		"--no-edit",
+		"--no-gpg-sign",
+		"--no-post-rewrite",
+		"--no-signoff",
+		"--no-status",
+		"--no-verify",
+		"--quiet",
+		"--short",
+		"--signoff",
+		"--status",
+		"--verbose",
+	]);
+	const valueOptions = new Set([
+		"--author",
+		"--cleanup",
+		"--date",
+		"--file",
+		"--fixup",
+		"--gpg-sign",
+		"--message",
+		"--reedit-message",
+		"--reuse-message",
+		"--squash",
+		"-C",
+		"-F",
+		"-c",
+		"-m",
+	]);
+	const unsupportedTreeOptions = /^(?:--include|--interactive|--only|--patch|--pathspec-from-file|--pathspec-file-nul|-i|-o|-p)$/;
+	for (let index = 0; index < arguments_.length; index += 1) {
+		const argument = arguments_[index]!;
+		if (argument === "--") {
+			if (index !== arguments_.length - 1) {
+				throw new Error("Commit pathspecs cannot be exactly derived for review authorization");
+			}
+			continue;
+		}
+		if (unsupportedTreeOptions.test(argument) || unsupportedTreeOptions.test(argument.split("=")[0]!)) {
+			throw new Error(`Unsupported commit tree semantics: ${argument}`);
+		}
+		if (argument === "-a" || argument === "--all") {
+			includesAllTracked = true;
+			continue;
+		}
+		if (/^-[^-]+$/.test(argument) && argument.length > 2) {
+			const flags = argument.slice(1);
+			if (/[^aemnsqv]/.test(flags)) {
+				throw new Error(`Unsupported combined commit option: ${argument}`);
+			}
+			if (flags.includes("a")) includesAllTracked = true;
+			if (flags.includes("m")) {
+				index += 1;
+				if (arguments_[index] === undefined) throw new Error("Commit message option is missing its value");
+			}
+			continue;
+		}
+		if (booleanOptions.has(argument)) continue;
+		if ([...valueOptions].some((option) => argument.startsWith(`${option}=`))) continue;
+		if (valueOptions.has(argument)) {
+			index += 1;
+			if (arguments_[index] === undefined) throw new Error(`Commit option ${argument} is missing its value`);
+			continue;
+		}
+		if (!argument.startsWith("-")) {
+			throw new Error("Commit pathspecs cannot be exactly derived for review authorization");
+		}
+		throw new Error(`Unsupported commit option: ${argument}`);
+	}
+	return includesAllTracked;
+}
 
-export function collectReviewDiffForCommand(
+function deriveCommitTree(command: ReviewLifecycleCommand): string {
+	const includesAllTracked = commitIncludesAllTracked(command.arguments);
+	if (!includesAllTracked) return runReviewGit(command.cwd, ["write-tree"]);
+	const temporaryDirectory = mkdtempSync(join(tmpdir(), "gentle-pi-commit-tree-"));
+	const temporaryIndex = join(temporaryDirectory, "index");
+	try {
+		const environment = { ...process.env, GIT_INDEX_FILE: temporaryIndex };
+		const stagedTree = runReviewGit(command.cwd, ["write-tree"]);
+		runReviewGit(command.cwd, ["read-tree", stagedTree], environment);
+		runReviewGit(command.cwd, ["add", "-u", "--", "."], environment);
+		return runReviewGit(command.cwd, ["write-tree"], environment);
+	} finally {
+		rmSync(temporaryDirectory, { recursive: true, force: true });
+	}
+}
+
+function resolveLocalFullRef(cwd: string, value: string, label: string): string {
+	if (value === "HEAD") {
+		const head = runReviewGit(cwd, ["symbolic-ref", "--quiet", "HEAD"]);
+		if (!head.startsWith("refs/")) throw new Error(`${label} HEAD is detached`);
+		return head;
+	}
+	const candidates = value.startsWith("refs/")
+		? [value]
+		: [`refs/heads/${value}`, `refs/tags/${value}`];
+	const resolved = candidates.filter((candidate) => {
+		try {
+			runReviewGit(cwd, ["show-ref", "--verify", "--quiet", candidate]);
+			return true;
+		} catch {
+			return false;
+		}
+	});
+	if (resolved.length !== 1) throw new Error(`${label} must resolve to exactly one local full ref`);
+	return resolved[0]!;
+}
+
+function destinationFullRef(value: string, sourceRef: string): string {
+	if (value.startsWith("refs/")) return value;
+	if (sourceRef.startsWith("refs/tags/")) return `refs/tags/${value}`;
+	return `refs/heads/${value}`;
+}
+
+function remoteRefObject(cwd: string, remote: string, destinationRef: string): string | null {
+	const output = runReviewGit(cwd, ["ls-remote", "--refs", remote, destinationRef]);
+	if (!output) return null;
+	const rows = output
+		.split(/\r?\n/)
+		.map((line) => line.split(/\s+/))
+		.filter((parts) => parts[1] === destinationRef);
+	if (rows.length !== 1 || !/^[0-9a-f]{40,64}$/.test(rows[0]?.[0] ?? "")) {
+		throw new Error("Push remote destination did not resolve to one exact object");
+	}
+	return rows[0]![0]!;
+}
+
+function pushRemoteAndRefspec(arguments_: readonly string[]): { remote: string; refspec: string } {
+	const unsupported = arguments_.find((argument) =>
+		/^(?:--all|--delete|--follow-tags|--mirror|--prune|--tags|-d)$/.test(argument),
+	);
+	if (unsupported) throw new Error(`Unsupported broad push semantics: ${unsupported}`);
+	const optionsWithValues = new Set([
+		"--exec",
+		"--push-option",
+		"--receive-pack",
+		"--repo",
+		"-o",
+	]);
+	const booleanOptions = new Set([
+		"--atomic",
+		"--dry-run",
+		"--force",
+		"--force-if-includes",
+		"--force-with-lease",
+		"--no-verify",
+		"--porcelain",
+		"--progress",
+		"--quiet",
+		"--set-upstream",
+		"--signed",
+		"--thin",
+		"--verbose",
+		"-f",
+		"-n",
+		"-q",
+		"-u",
+		"-v",
+	]);
+	let index = 0;
+	while (index < arguments_.length && arguments_[index]!.startsWith("-")) {
+		const option = arguments_[index]!;
+		if ([...optionsWithValues].some((name) => option.startsWith(`${name}=`))) {
+			index += 1;
+			continue;
+		}
+		if (optionsWithValues.has(option)) {
+			index += 2;
+			if (index > arguments_.length) throw new Error(`Push option ${option} is missing its value`);
+			continue;
+		}
+		if (booleanOptions.has(option) || option.startsWith("--force-with-lease=")) {
+			index += 1;
+			continue;
+		}
+		throw new Error(`Unsupported push option: ${option}`);
+	}
+	const remote = arguments_[index];
+	const refspecs = arguments_.slice(index + 1);
+	if (!remote || remote.startsWith("-")) {
+		throw new Error("Push authorization requires an explicit remote and one complete ref update");
+	}
+	if (refspecs.length !== 1) {
+		throw new Error("Push authorization must exactly derive one complete ref update");
+	}
+	return { remote, refspec: refspecs[0]! };
+}
+
+function derivePushTarget(command: ReviewLifecycleCommand): GateTargetV1 {
+	const { remote, refspec } = pushRemoteAndRefspec(command.arguments);
+	if (refspec.startsWith(":")) throw new Error("Push deletion is unsupported");
+	const normalized = refspec.startsWith("+") ? refspec.slice(1) : refspec;
+	const separator = normalized.indexOf(":");
+	const sourceValue = separator < 0 ? normalized : normalized.slice(0, separator);
+	const destinationValue = separator < 0 ? normalized : normalized.slice(separator + 1);
+	if (!sourceValue || !destinationValue) throw new Error("Push refspec is incomplete");
+	const sourceRef = resolveLocalFullRef(command.cwd, sourceValue, "Push source");
+	const destinationRef = destinationFullRef(destinationValue, sourceRef);
+	const newObject = runReviewGit(command.cwd, ["rev-parse", "--verify", sourceRef]);
+	const newPeeledCommit = runReviewGit(command.cwd, ["rev-parse", "--verify", `${sourceRef}^{commit}`]);
+	const newTree = runReviewGit(command.cwd, ["rev-parse", "--verify", `${newPeeledCommit}^{tree}`]);
+	const oldObject = remoteRefObject(command.cwd, remote, destinationRef);
+	const update = oldObject === null
+		? {
+				kind: PUSH_UPDATE_KIND.CREATE,
+				source_ref: sourceRef,
+				destination_ref: destinationRef,
+				old_object: null,
+				old_peeled_commit: null,
+				old_tree: null,
+				new_object: newObject,
+				new_peeled_commit: newPeeledCommit,
+				new_tree: newTree,
+			}
+		: {
+				kind: PUSH_UPDATE_KIND.UPDATE,
+				source_ref: sourceRef,
+				destination_ref: destinationRef,
+				old_object: oldObject,
+				old_peeled_commit: runReviewGit(command.cwd, ["rev-parse", "--verify", `${oldObject}^{commit}`]),
+				old_tree: runReviewGit(command.cwd, ["rev-parse", "--verify", `${oldObject}^{tree}`]),
+				new_object: newObject,
+				new_peeled_commit: newPeeledCommit,
+				new_tree: newTree,
+			};
+	return {
+		kind: GATE_TARGET_KIND.PUSH,
+		remote,
+		updates: [update],
+	};
+}
+
+function commandOptionValue(arguments_: readonly string[], name: string): string {
+	const matches: string[] = [];
+	for (let index = 0; index < arguments_.length; index += 1) {
+		const argument = arguments_[index]!;
+		if (argument === name) {
+			const value = arguments_[index + 1];
+			if (!value) throw new Error(`${name} is missing its value`);
+			matches.push(value);
+			index += 1;
+		} else if (argument.startsWith(`${name}=`)) {
+			matches.push(argument.slice(name.length + 1));
+		}
+	}
+	if (matches.length !== 1) throw new Error(`Command requires exactly one ${name} value`);
+	return matches[0]!;
+}
+
+function derivePullRequestTarget(command: ReviewLifecycleCommand): GateTargetV1 {
+	const baseRef = resolveLocalFullRef(
+		command.cwd,
+		commandOptionValue(command.arguments, "--base"),
+		"Pull request base",
+	);
+	const headRef = resolveLocalFullRef(
+		command.cwd,
+		commandOptionValue(command.arguments, "--head"),
+		"Pull request head",
+	);
+	const baseCommit = runReviewGit(command.cwd, ["rev-parse", "--verify", `${baseRef}^{commit}`]);
+	const headCommit = runReviewGit(command.cwd, ["rev-parse", "--verify", `${headRef}^{commit}`]);
+	return {
+		kind: GATE_TARGET_KIND.PULL_REQUEST,
+		base_ref: baseRef,
+		base_commit: baseCommit,
+		base_tree: runReviewGit(command.cwd, ["rev-parse", "--verify", `${baseCommit}^{tree}`]),
+		head_ref: headRef,
+		head_commit: headCommit,
+		head_tree: runReviewGit(command.cwd, ["rev-parse", "--verify", `${headCommit}^{tree}`]),
+	};
+}
+
+function deriveReleaseTarget(command: ReviewLifecycleCommand): GateTargetV1 {
+	const tag = command.arguments[0];
+	if (!tag || tag.startsWith("-")) {
+		throw new Error("Release authorization requires gh release create <tag>");
+	}
+	if (
+		command.arguments.some(
+			(argument) =>
+				argument === "--repo" ||
+				argument.startsWith("--repo=") ||
+				argument.startsWith("-R"),
+		)
+	) {
+		throw new Error("Release --repo cannot be bound to the exact local review repository");
+	}
+	if (command.arguments.some((argument) => argument === "--target" || argument.startsWith("--target="))) {
+		throw new Error("Release --target semantics are unsupported; use an existing exact tag");
+	}
+	const tagRef = tag.startsWith("refs/tags/") ? tag : `refs/tags/${tag}`;
+	const tagObject = runReviewGit(command.cwd, ["rev-parse", "--verify", tagRef]);
+	const peeledCommit = runReviewGit(command.cwd, ["rev-parse", "--verify", `${tagRef}^{commit}`]);
+	return {
+		kind: GATE_TARGET_KIND.RELEASE,
+		tag_ref: tagRef,
+		tag_object: tagObject,
+		peeled_commit: peeledCommit,
+		tree: runReviewGit(command.cwd, ["rev-parse", "--verify", `${peeledCommit}^{tree}`]),
+	};
+}
+
+function deriveReviewGateTarget(
 	command: string,
 	defaultCwd: string,
-	collectDiff: ReviewDiffCollector,
-): ReviewDiffCollection | null {
-	const target = resolveReviewCollectionTarget(command, defaultCwd);
-	if (!target) return null;
-	return {
-		event: target.event,
-		diff: collectDiff(target.event, target.cwd, {
-			gitGlobalArgs: target.gitGlobalArgs,
-			includeAllTracked: target.includeAllTracked,
-		}),
-	};
-}
-
-/**
- * Parses the output of `git diff --numstat` into a ChangedDiff.
- * Binary files show `-  -  path`; their contribution to changedLines is 0.
- */
-export function parseNumstat(output: string): ChangedDiff {
-	const changedPaths: string[] = [];
-	let changedLines = 0;
-	for (const line of output.split("\n")) {
-		const trimmed = line.trim();
-		if (!trimmed) continue;
-		// Format: "<added>\t<deleted>\t<path>"
-		const parts = trimmed.split("\t");
-		if (parts.length < 3) continue;
-		const added = parts[0];
-		const deleted = parts[1];
-		const filePath = parts.slice(2).join("\t");
-		if (!filePath) continue;
-		changedPaths.push(filePath);
-		// Binary rows have "-" in both columns; treat as 0.
-		const addedNum = added === "-" ? 0 : parseInt(added, 10);
-		const deletedNum = deleted === "-" ? 0 : parseInt(deleted, 10);
-		if (!isNaN(addedNum)) changedLines += addedNum;
-		if (!isNaN(deletedNum)) changedLines += deletedNum;
+): DerivedReviewGateTarget {
+	const inspection = inspectReviewLifecycleCommand(command, defaultCwd);
+	if (!inspection.event || !inspection.command) {
+		throw new Error(
+			inspection.failClosedReason ?? "Command is not one supported direct review lifecycle operation",
+		);
 	}
-	return { changedPaths, changedLines };
+	if (inspection.command.event === "pre-commit") {
+		const tree = deriveCommitTree(inspection.command);
+		return {
+			command: inspection.command,
+			target: {
+				kind: GATE_TARGET_KIND.INTENDED_COMMIT,
+				intended_commit_tree: tree,
+			},
+			actualIntendedCommitTree: tree,
+		};
+	}
+	if (inspection.command.event === "pre-push") {
+		return { command: inspection.command, target: derivePushTarget(inspection.command) };
+	}
+	if (inspection.command.event === "pre-pr") {
+		return {
+			command: inspection.command,
+			target: derivePullRequestTarget(inspection.command),
+		};
+	}
+	if (inspection.command.event === "pre-release") {
+		return { command: inspection.command, target: deriveReleaseTarget(inspection.command) };
+	}
+	throw new Error("Review lifecycle target kind is unsupported");
 }
 
-/**
- * Computes a ChangedDiff for the given event by running git numstat.
- * Returns null on any error (fail open — never break the user's git command).
- */
-function computeDiffForEvent(
-	event: TriggerEvent,
-	cwd: string,
-	options: ReviewDiffOptions,
-): ChangedDiff | null {
-	const gitOpts = {
-		cwd,
-		encoding: "utf8" as const,
-		stdio: "pipe" as const,
-		// Bound synchronous git calls so a slow/large repo cannot freeze the extension process.
-		// The existing outer try/catch returns null (fail-open) when this throws.
-		timeout: 2000,
-	};
-	const git = (args: string[]): string =>
-		execFileSync("git", [...options.gitGlobalArgs, ...args], gitOpts);
-	try {
-		let raw: string;
-		if (event === "pre-commit") {
-			raw = git(
-				options.includeAllTracked
-					? ["diff", "--numstat", "HEAD"]
-					: ["diff", "--cached", "--numstat"],
-			);
-		} else {
-			// pre-push or pre-pr: diff vs merge-base
-			let base = "";
-			for (const ref of ["origin/HEAD", "origin/main", "main"]) {
-				try {
-					base = git(["merge-base", "HEAD", ref]).trim();
-					if (base) break;
-				} catch {
-					// try next ref
-				}
-			}
-			if (!base) {
-				// Final fallback: cached diff
-				try {
-					raw = git(["diff", "--cached", "--numstat"]);
-					return parseNumstat(raw);
-				} catch {
-					return null;
-				}
-			}
-			raw = git(["diff", "--numstat", `${base}...HEAD`]);
+function reviewAuthorizationKey(command: string, cwd: string): string {
+	return canonicalHash({ command, cwd: resolve(cwd) });
+}
+
+type ReviewGateEvaluator = (command: string) => ToolCallEventResult | undefined;
+type CommandSafetyEvaluator = (
+	command: string,
+) => Promise<ToolCallEventResult | undefined>;
+
+function isReviewTransition(value: string): value is ReviewTransition {
+	return Object.values(REVIEW_TRANSITION).some((transition) => transition === value);
+}
+
+function executeReviewControllerOperation(
+	parametersValue: unknown,
+	defaultCwd: string,
+	pendingAuthorizations: Map<string, PendingReviewAuthorization>,
+): Record<string, unknown> {
+	const parameters = parseReviewControllerParameters(parametersValue);
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.START) {
+		const idempotencyKey = requiredControllerString(parameters, "idempotencyKey");
+		const input = parseStartInput(
+			parseControllerJson(
+				requiredControllerString(parameters, "input"),
+				REVIEW_CONTROLLER_OPERATION.START,
+			),
+		);
+		const snapshot = captureReviewSnapshot({
+			cwd: defaultCwd,
+			mode: input.mode,
+			projection: input.projection,
+			policyHash: input.policyHash,
+		});
+		const stateInput = {
+			lineageId: parameters.lineageId,
+			mode: input.mode,
+			snapshot,
+			evidenceHash: input.evidenceHash,
+			budget: input.budget,
+		};
+		const state = createReviewState(
+			input.parentLineageId === undefined
+				? stateInput
+				: { ...stateInput, parentLineageId: input.parentLineageId },
+		);
+		const result = ReviewTransactionStore.forRepository(defaultCwd).create(
+			state,
+			idempotencyKey,
+		);
+		return { operation: parameters.operation, result, state };
+	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.ADVANCE) {
+		const idempotencyKey = requiredControllerString(parameters, "idempotencyKey");
+		const transitionValue = requiredControllerString(parameters, "transition");
+		if (!isReviewTransition(transitionValue)) {
+			throw new Error(`Review controller transition is unsupported: ${transitionValue}`);
 		}
-		return parseNumstat(raw);
-	} catch {
-		return null;
+		const input = parseControllerJson(
+			requiredControllerString(parameters, "input"),
+			REVIEW_CONTROLLER_OPERATION.ADVANCE,
+		) as unknown as ReviewReducerInput;
+		const store = ReviewTransactionStore.forRepository(defaultCwd);
+		const result = store.runReducerOperation({
+			lineageId: parameters.lineageId,
+			transition: transitionValue,
+			idempotencyKey,
+			input,
+		});
+		return {
+			operation: parameters.operation,
+			result,
+			state: store.read(parameters.lineageId),
+		};
 	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.STATUS) {
+		const state = ReviewTransactionStore.forRepository(defaultCwd).read(parameters.lineageId);
+		const response: Record<string, unknown> = {
+			operation: parameters.operation,
+			state,
+		};
+		if (state.terminal_state !== undefined) response.receipt = createReceiptForState(state);
+		return response;
+	}
+	const idempotencyKey = requiredControllerString(parameters, "idempotencyKey");
+	const commandValue = requiredControllerString(parameters, "command");
+	const input = parseValidateInput(
+		parseControllerJson(
+			requiredControllerString(parameters, "input"),
+			REVIEW_CONTROLLER_OPERATION.VALIDATE,
+		),
+	);
+	const derived = deriveReviewGateTarget(commandValue, defaultCwd);
+	const store = ReviewTransactionStore.forRepository(derived.command.cwd);
+	const receipt = createReceiptForState(store.read(parameters.lineageId));
+	const result = validateReviewGate({
+		store,
+		receipt,
+		target: derived.target,
+		repositoryCwd: derived.command.cwd,
+		idempotencyKey,
+		scopeBudget: input.scopeBudget,
+		actualIntendedCommitTree: derived.actualIntendedCommitTree,
+	});
+	const response: Record<string, unknown> = {
+		operation: parameters.operation,
+		result,
+		derived_target: derived.target,
+	};
+	if (result.status === GATE_RESULT.ALLOW) {
+		const commandHash = reviewAuthorizationKey(commandValue, derived.command.cwd);
+		const authorization: PendingReviewAuthorization = {
+			command_hash: commandHash,
+			target_hash: canonicalHash(derived.target),
+			receipt_hash: receipt.receipt_hash,
+		};
+		pendingAuthorizations.set(commandHash, authorization);
+		response.authorization = authorization;
+	}
+	return response;
 }
 
-export function reviewAdviceMessage(plan: ReviewPlan, event: TriggerEvent): string {
-	const lensSummary =
-		plan.lenses.length === 0
-			? "zero review lenses"
-			: `review lens${plan.lenses.length === 1 ? "" : "es"}: ${plan.lenses.join(", ")}`;
-	return `Review route ${plan.route} for ${event}; ${lensSummary}. ${plan.reason}. This advice does not block the command.`;
-}
-
-export function applyReviewAdvice(
-	plan: ReviewPlan,
-	event: TriggerEvent,
-	ctx: Pick<ExtensionContext, "hasUI" | "ui">,
-): undefined {
-	if (ctx.hasUI) {
-		ctx.ui.notify(reviewAdviceMessage(plan, event), "info");
+function gateLifecycleCommand(
+	command: string,
+	defaultCwd: string,
+	pendingAuthorizations: Map<string, PendingReviewAuthorization>,
+): ToolCallEventResult | undefined {
+	const inspection = inspectReviewLifecycleCommand(command, defaultCwd);
+	if (!inspection.event) return undefined;
+	if (!inspection.command) {
+		return { block: true, reason: inspection.failClosedReason ?? "Lifecycle command failed closed." };
+	}
+	let derived: DerivedReviewGateTarget;
+	try {
+		derived = deriveReviewGateTarget(command, defaultCwd);
+	} catch (error) {
+		return {
+			block: true,
+			reason: `Gentle AI ${inspection.event} gate could not exactly derive the command target and failed closed: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+	const commandHash = reviewAuthorizationKey(command, derived.command.cwd);
+	const authorization = pendingAuthorizations.get(commandHash);
+	if (!authorization) {
+		return {
+			block: true,
+			reason: `Gentle AI ${inspection.event} gate requires one registered review controller authorization produced from an approved receipt and the exact typed command target. Fabricated tool metadata cannot authorize lifecycle commands.`,
+		};
+	}
+	pendingAuthorizations.delete(commandHash);
+	if (
+		authorization.command_hash !== commandHash ||
+		authorization.target_hash !== canonicalHash(derived.target)
+	) {
+		const mismatch = authorization.command_hash !== commandHash ? "command identity" : "typed target";
+		return {
+			block: true,
+			reason: `Gentle AI ${inspection.event} gate ${mismatch} changed after authorization and failed closed.`,
+		};
 	}
 	return undefined;
 }
 
-function adviseReviewForCommand(command: string, ctx: ExtensionContext): undefined {
-	const collection = collectReviewDiffForCommand(command, ctx.cwd, computeDiffForEvent);
-	if (!collection) return undefined;
-	const evidence = buildDiffEvidence(
-		collection.event,
-		collection.diff ?? { changedPaths: [], changedLines: 0 },
-		collection.diff !== null,
-	);
-	return applyReviewAdvice(classifyReviewRoute(evidence), collection.event, ctx);
+export async function enforceReviewGateAndCommandSafety(
+	command: string,
+	evaluateGate: ReviewGateEvaluator,
+	evaluateSafety: CommandSafetyEvaluator,
+): Promise<ToolCallEventResult | undefined> {
+	const safetyResult = await evaluateSafety(command);
+	if (safetyResult) return safetyResult;
+	return evaluateGate(command);
 }
 
 /** @internal */
@@ -2307,18 +2988,45 @@ export const __testing = {
 	loadRuntimeGuardrailsConfig,
 	buildGentlePrompt,
 	classifyReviewEvent,
-	collectReviewDiffForCommand,
-	computeDiffForEvent,
-	applyReviewAdvice,
-	parseNumstat,
-	resolveReviewCollectionTarget,
-	reviewAdviceMessage,
+	resolveReviewLifecycleCommand,
+	inspectReviewLifecycleCommand,
+	deriveReviewGateTarget,
+	gateLifecycleCommand,
+	executeReviewControllerOperation,
+	enforceReviewGateAndCommandSafety,
 	renderSddModelPanel: renderSddModelPanelForTesting,
 	getOrchestratorPrompt,
 	renderOrchestratorPrompt,
 };
 
 export default function gentleAi(pi: ExtensionAPI): void {
+	const pendingReviewAuthorizations = new Map<string, PendingReviewAuthorization>();
+
+	pi.registerTool({
+		name: "gentle_review",
+		label: "Gentle Review Controller",
+		description:
+			"Create, advance, inspect, and validate a bounded Gentle AI review transaction. Validate accepts one exact direct lifecycle command, derives its typed target from the command itself, and produces a one-shot authorization consumed by that exact subsequent bash command.",
+		promptSnippet: "Create, advance, inspect, or validate a bounded review transaction",
+		promptGuidelines: [
+			"Use gentle_review for bounded review transaction start, advance, status, and exact lifecycle validation; never fabricate bash tool metadata or a separate gate target.",
+		],
+		parameters: REVIEW_CONTROLLER_PARAMETERS,
+		executionMode: "sequential",
+		async execute(_toolCallId, parameters, signal, _onUpdate, ctx) {
+			if (signal?.aborted) throw new Error("Review controller operation was cancelled");
+			const details = executeReviewControllerOperation(
+				parameters,
+				ctx.cwd,
+				pendingReviewAuthorizations,
+			);
+			return {
+				content: [{ type: "text", text: JSON.stringify(details) }],
+				details,
+			};
+		},
+	});
+
 	function runSddPreflight(ctx: ExtensionContext): Promise<SddPreflightPreferences> {
 		return ensureSddPreflight(ctx, {
 			pi,
@@ -2401,8 +3109,11 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		if (event.toolName !== "bash") return undefined;
 		if (!isRecord(event.input) || typeof event.input.command !== "string")
 			return undefined;
-		adviseReviewForCommand(event.input.command, ctx);
-		return confirmCommand(event.input.command, ctx);
+		return enforceReviewGateAndCommandSafety(
+			event.input.command,
+			(command) => gateLifecycleCommand(command, ctx.cwd, pendingReviewAuthorizations),
+			(command) => confirmCommand(command, ctx),
+		);
 	});
 
 	pi.registerCommand("gentle:install-sdd", {

@@ -209,6 +209,7 @@ async function run() {
 	for (const toolName of ["read", "bash", "grep", "find", "ls", "edit", "write"]) {
 		assert.ok(tools.has(toolName), `missing quiet built-in tool renderer ${toolName}`);
 	}
+	assert.ok(tools.has("gentle_review"), "missing registered bounded review controller tool");
 
 	for (const entry of await readdir(join(ROOT, "assets", "agents"))) {
 		if (!entry.endsWith(".md")) continue;
@@ -340,17 +341,12 @@ async function run() {
 	try {
 		const toolHook = hooks.get("tool_call")[0];
 		assert.equal(await toolHook({ toolName: "bash", input: { command: "git status" } }, createCtx(toolCwd)), undefined);
-		const reviewAdviceCtx = createCtx(toolCwd, true, "review-advice-session");
-		assert.equal(
-			await toolHook(
-				{ toolName: "bash", input: { command: "gh pr create --draft" } },
-				reviewAdviceCtx,
-			),
-			undefined,
-			"review advice must not block an otherwise allowed command",
+		const receiptGate = await toolHook(
+			{ toolName: "bash", input: { command: "gh pr create --draft" } },
+			createCtx(toolCwd, true, "receipt-gate-session"),
 		);
-		assert.match(reviewAdviceCtx.ui.notifications.at(-1).message, /standard/);
-		assert.match(reviewAdviceCtx.ui.notifications.at(-1).message, /review-readability/);
+		assert.equal(receiptGate.block, true);
+		assert.match(receiptGate.reason, /exactly derive.*--base/i);
 		const denied = await toolHook({ toolName: "bash", input: { command: "rm -rf /" } }, createCtx(toolCwd));
 		assert.equal(denied.block, true);
 		assert.match(denied.reason, /destructive/);
@@ -369,11 +365,17 @@ async function run() {
 		);
 		assert.equal(needsConfirm.block, true);
 		assert.match(needsConfirm.reason, /not confirmed/);
-		assert.match(
-			dangerousReviewCtx.ui.notifications.at(-1).message,
-			/standard/,
-			"review advice must run without bypassing independent dangerous-command confirmation",
+		assert.equal(
+			dangerousReviewCtx.ui.notifications.length,
+			0,
+			"receipt validation must not launch or announce review actors",
 		);
+		const commitGate = await toolHook(
+			{ toolName: "bash", input: { command: "git commit -m bounded" } },
+			createCtx(toolCwd),
+		);
+		assert.equal(commitGate.block, true);
+		assert.match(commitGate.reason, /exactly derive.*not a git repository/is);
 	} finally {
 		await rm(toolCwd, { recursive: true, force: true });
 	}
@@ -423,6 +425,16 @@ async function run() {
 			{ name: "review-refuter", tools: ["read", "grep", "find"] },
 			"isolated package installation must activate only the refuter inspection tools",
 		);
+		const installedRefuterSource = await readFile(installedRefuterPath, "utf8");
+		assert.match(installedRefuterSource, /complete inferential-severe frozen-row list once/);
+		assert.match(installedRefuterSource, /refuted \| corroborated \| inconclusive/);
+		assert.doesNotMatch(installedRefuterSource, /general, correctness, impact\/exploitability, or reproducibility/);
+		const installedRiskSource = await readFile(
+			join(globalAgentHome, "agents", "review-risk.md"),
+			"utf8",
+		);
+		assert.match(installedRiskSource, /exactly once against the supplied `initial_review_tree`/);
+		assert.match(installedRiskSource, /cannot authorize transitions, fixes, receipts, gates, or delivery/);
 		assert.equal(existsSync(join(globalAgentHome, "chains", "sdd-full.chain.md")), true);
 		assert.equal(existsSync(join(globalAgentHome, "gentle-ai", "support", "sdd-status-contract.md")), true);
 		const managedAssetsManifestPath = join(globalAgentHome, "gentle-ai", "managed-assets.json");

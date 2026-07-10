@@ -1,7 +1,9 @@
 export const REVIEW_EVENT = {
+	ORDINARY_START: "ordinary-start",
 	PRE_COMMIT: "pre-commit",
 	PRE_PUSH: "pre-push",
 	PRE_PR: "pre-pr",
+	PRE_RELEASE: "pre-release",
 	POST_SDD_PHASE: "post-sdd-phase",
 	ON_CI: "on-ci",
 	ON_SCHEDULE: "on-schedule",
@@ -33,13 +35,6 @@ export const TRIVIALITY = {
 } as const;
 
 export type Triviality = (typeof TRIVIALITY)[keyof typeof TRIVIALITY];
-
-export const EVENT_CEILING = {
-	STANDARD: REVIEW_ROUTE.STANDARD,
-	FULL_4R: REVIEW_ROUTE.FULL_4R,
-} as const;
-
-export type EventCeiling = (typeof EVENT_CEILING)[keyof typeof EVENT_CEILING];
 
 export const LARGE_CHANGED_LINE_THRESHOLD = 400;
 
@@ -97,12 +92,6 @@ function isConfigurationPath(path: string): boolean {
 	return CONFIGURATION_PATH.test(path);
 }
 
-function eventCeiling(event: TriggerEvent): EventCeiling {
-	return event === REVIEW_EVENT.PRE_COMMIT || event === REVIEW_EVENT.PRE_PUSH
-		? EVENT_CEILING.STANDARD
-		: EVENT_CEILING.FULL_4R;
-}
-
 function dominantLens(evidence: DiffEvidence): ReviewLens {
 	if (evidence.riskSignal) return REVIEW_LENS.RISK;
 	if (evidence.resilienceSignal) return REVIEW_LENS.RESILIENCE;
@@ -142,6 +131,9 @@ export function buildDiffEvidence(
 }
 
 export function classifyReviewRoute(evidence: DiffEvidence): ReviewPlan {
+	if (evidence.event !== REVIEW_EVENT.ORDINARY_START) {
+		throw new Error("Review route classification is allowed only at ordinary transaction start");
+	}
 	const objectivelyTrivial =
 		evidence.evidenceComplete &&
 		evidence.triviality === TRIVIALITY.PROVEN &&
@@ -159,7 +151,7 @@ export function classifyReviewRoute(evidence: DiffEvidence): ReviewPlan {
 	const requestsFull4R =
 		evidence.hotPathChanged ||
 		evidence.changedLines > LARGE_CHANGED_LINE_THRESHOLD;
-	if (requestsFull4R && eventCeiling(evidence.event) === EVENT_CEILING.FULL_4R) {
+	if (requestsFull4R) {
 		return {
 			route: REVIEW_ROUTE.FULL_4R,
 			lenses: FULL_4R_LENSES,
@@ -172,8 +164,6 @@ export function classifyReviewRoute(evidence: DiffEvidence): ReviewPlan {
 	return {
 		route: REVIEW_ROUTE.STANDARD,
 		lenses: [dominantLens(evidence)],
-		reason: requestsFull4R
-			? `${evidence.event} is capped at one standard lens`
-			: "non-trivial or unproven diff uses one dominant-risk lens",
+		reason: "non-trivial or unproven diff uses one dominant-risk lens",
 	};
 }

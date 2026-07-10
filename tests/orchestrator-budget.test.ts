@@ -186,9 +186,7 @@ const DISPOSITION_MAP: DispositionRange[] = [
 	{ lines: [255, 255], target: "core", label: "Intent-Driven Skill Discovery heading" },
 	{ lines: [257, 276], target: "skills", label: "Intent-Driven Skill Discovery detail" },
 	{ lines: [278, 283], target: "core", label: "Safety" },
-	{ lines: [285, 285], target: "core", label: "4R Review Triggers heading" },
-	{ lines: [287, 300], target: "obsolete", label: "Superseded blocking 4R trigger body" },
-	{ lines: [301, 312], target: "delegation", label: "Review Execution Contract" },
+	{ lines: [285, 312], target: "obsolete", label: "Superseded pre-transaction review contract" },
 ];
 
 function isNormativeLine(line: string): boolean {
@@ -200,6 +198,21 @@ function isNormativeLine(line: string): boolean {
 }
 
 const fixtureLines = readFileSync(FIXTURE_PATH, "utf8").split("\n");
+const SUPERSEDED_LIFECYCLE_REVIEW_LINES = new Set([
+	70,
+	76,
+	92,
+	125,
+	126,
+	133,
+	134,
+	135,
+	137,
+	145,
+	154,
+	160,
+	166,
+]);
 
 for (const range of DISPOSITION_MAP) {
 	test(
@@ -213,6 +226,13 @@ for (const range of DISPOSITION_MAP) {
 				const raw = fixtureLines[ln - 1];
 				if (raw === undefined || !isNormativeLine(raw)) continue;
 				const trimmed = raw.trim();
+				if (SUPERSEDED_LIFECYCLE_REVIEW_LINES.has(ln)) {
+					assert.ok(
+						!targetContent.includes(trimmed),
+						`superseded lifecycle-review line retained: fixture:${ln} "${trimmed}"`,
+					);
+					continue;
+				}
 				if (range.target === "obsolete") {
 					assert.ok(
 						!targetContent.includes(trimmed),
@@ -238,28 +258,26 @@ test("core-alone: load-bearing delegation tokens present without lazy union", ()
 	const core = readRealAsset("orchestrator.md");
 	assert.match(core, /4-file rule/);
 	assert.match(core, /Multi-file write rule/);
-	assert.match(core, /PR rule/);
+	assert.match(core, /Lifecycle gate rule/);
 	assert.match(core, /Incident rule/);
 	assert.match(core, /Long-session rule/);
-	assert.match(core, /Fresh review rule/);
+	assert.match(core, /Review actor rule/);
 });
 
-test("core-alone: routing boundaries and advice-only safety are present without lazy union", () => {
+test("core-alone: receipt-only lifecycle and independent safety are present without lazy union", () => {
 	const core = readRealAsset("orchestrator.md");
-	assert.match(core, /400 changed lines.*standard/i);
-	assert.match(core, /401 changed lines.*full 4R/i);
-	assert.match(core, /trivial.*zero lenses/i);
-	assert.match(core, /pre-commit.*pre-push.*never run full 4R/i);
-	assert.match(core, /review advice never blocks/i);
-	assert.match(core, /dangerous-command confirmation remains authoritative/i);
+	assert.match(core, /Only ordinary transaction start classifies/i);
+	assert.match(core, /Pre-commit, pre-push, PR, and release gates.*zero actors/i);
+	assert.match(core, /Dangerous-command safety remains independent and authoritative/i);
+	assert.match(core, /SDD completion adds no review or Judgment Day pass/i);
 });
 
-test("core-alone: all four review lens names present without lazy union", () => {
-	const core = readRealAsset("orchestrator.md");
-	assert.match(core, /review-risk/);
-	assert.match(core, /review-reliability/);
-	assert.match(core, /review-resilience/);
-	assert.match(core, /review-readability/);
+test("lazy bounded-review contract lists all four review lens names", () => {
+	const content = `${readRealAsset("orchestrator.md")}\n${readRealAsset("orchestrator-delegation.md")}`;
+	assert.match(content, /review-risk/);
+	assert.match(content, /review-reliability/);
+	assert.match(content, /review-resilience/);
+	assert.match(content, /review-readability/);
 });
 
 test("live orchestrator assets remove the stale strong-gate retry contract", () => {
@@ -268,6 +286,8 @@ test("live orchestrator assets remove the stale strong-gate retry contract", () 
 	assert.doesNotMatch(content, /extension blocks.*gh pr create/i);
 	assert.doesNotMatch(content, /before the user retries the PR command/i);
 	assert.doesNotMatch(content, /validateTriggerRuleSet/);
+	assert.doesNotMatch(content, /exactly three parallel refuters|two of three valid `refuted`/i);
+	assert.doesNotMatch(content, /review advice never/i);
 });
 
 // ---------------------------------------------------------------------------

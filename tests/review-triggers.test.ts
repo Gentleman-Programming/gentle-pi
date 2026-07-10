@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-	EVENT_CEILING,
 	FULL_4R_LENSES,
 	LARGE_CHANGED_LINE_THRESHOLD,
 	REVIEW_LENS,
+	REVIEW_EVENT,
 	REVIEW_ROUTE,
 	TRIVIALITY,
 	buildDiffEvidence,
@@ -15,7 +15,7 @@ import {
 
 function evidence(overrides: Partial<DiffEvidence> = {}): DiffEvidence {
 	return {
-		event: "pre-pr",
+		event: REVIEW_EVENT.ORDINARY_START,
 		changedLines: 20,
 		triviality: TRIVIALITY.NON_TRIVIAL,
 		evidenceComplete: true,
@@ -32,10 +32,6 @@ function evidence(overrides: Partial<DiffEvidence> = {}): DiffEvidence {
 test("routing constants expose stable runtime values", () => {
 	assert.deepEqual(REVIEW_ROUTE, {
 		TRIVIAL: "trivial",
-		STANDARD: "standard",
-		FULL_4R: "full-4R",
-	});
-	assert.deepEqual(EVENT_CEILING, {
 		STANDARD: "standard",
 		FULL_4R: "full-4R",
 	});
@@ -131,18 +127,17 @@ test("non-trivial hot path routes to full 4R regardless of size", () => {
 	assert.deepEqual(plan.lenses, FULL_4R_LENSES);
 });
 
-for (const event of ["pre-commit", "pre-push"] satisfies TriggerEvent[]) {
-	test(`${event} caps a large hot-path diff at one standard lens`, () => {
-		const plan = classifyReviewRoute(
-			evidence({ event, changedLines: 401, hotPathChanged: true, riskSignal: true }),
+for (const event of ["pre-commit", "pre-push", "pre-pr", "on-ci", "on-schedule"] satisfies TriggerEvent[]) {
+	test(`${event} cannot classify outside ordinary transaction start`, () => {
+		assert.throws(
+			() => classifyReviewRoute(evidence({ event, changedLines: 401 })),
+			/only.*ordinary.*start/i,
 		);
-		assert.equal(plan.route, REVIEW_ROUTE.STANDARD);
-		assert.deepEqual(plan.lenses, [REVIEW_LENS.RISK]);
 	});
 }
 
 test("runtime evidence proves documentation-only changes trivial", () => {
-	const result = buildDiffEvidence("pre-pr", {
+	const result = buildDiffEvidence(REVIEW_EVENT.ORDINARY_START, {
 		changedPaths: ["README.md", "docs/review-routing.md", "docs/guides/routing.mdx"],
 		changedLines: 14,
 	});
@@ -153,14 +148,14 @@ test("runtime evidence proves documentation-only changes trivial", () => {
 });
 
 test("runtime evidence treats executable and configuration content as unproven", () => {
-	const source = buildDiffEvidence("pre-pr", {
+	const source = buildDiffEvidence(REVIEW_EVENT.ORDINARY_START, {
 		changedPaths: ["src/review.ts"],
 		changedLines: 4,
 	});
 	assert.equal(source.triviality, TRIVIALITY.UNPROVEN);
 	assert.equal(source.executableChanged, true);
 
-	const config = buildDiffEvidence("pre-pr", {
+	const config = buildDiffEvidence(REVIEW_EVENT.ORDINARY_START, {
 		changedPaths: ["config/review.yaml"],
 		changedLines: 2,
 	});
@@ -177,7 +172,7 @@ test("documentation-like executable and configuration paths remain non-trivial",
 		{ path: "src/pages/dashboard.mdx", executableChanged: true, configurationChanged: false },
 		{ path: "README.sh", executableChanged: true, configurationChanged: false },
 	] as const) {
-		const result = buildDiffEvidence("pre-pr", {
+		const result = buildDiffEvidence(REVIEW_EVENT.ORDINARY_START, {
 			changedPaths: [expected.path],
 			changedLines: 4,
 		});
@@ -190,14 +185,14 @@ test("documentation-like executable and configuration paths remain non-trivial",
 });
 
 test("runtime evidence identifies hot paths and dominant-risk signals", () => {
-	const hot = buildDiffEvidence("pre-pr", {
+	const hot = buildDiffEvidence(REVIEW_EVENT.ORDINARY_START, {
 		changedPaths: ["src/auth/session.ts"],
 		changedLines: 5,
 	});
 	assert.equal(hot.hotPathChanged, true);
 	assert.equal(hot.riskSignal, true);
 
-	const resilient = buildDiffEvidence("pre-pr", {
+	const resilient = buildDiffEvidence(REVIEW_EVENT.ORDINARY_START, {
 		changedPaths: ["infra/deploy/rollback.ts"],
 		changedLines: 5,
 	});
@@ -216,7 +211,7 @@ test("sensitive configuration basenames select the risk lens at pre-commit", () 
 		"config/policy.yaml",
 		"config/security.ini",
 	]) {
-		const evidence = buildDiffEvidence("pre-commit", {
+		const evidence = buildDiffEvidence(REVIEW_EVENT.ORDINARY_START, {
 			changedPaths: [path],
 			changedLines: 3,
 		});
@@ -238,7 +233,7 @@ test("ordinary files containing sensitive-looking substrings do not select risk"
 		"docs/policy.md",
 		"src/environment.ts",
 	]) {
-		const evidence = buildDiffEvidence("pre-commit", {
+		const evidence = buildDiffEvidence(REVIEW_EVENT.ORDINARY_START, {
 			changedPaths: [path],
 			changedLines: 3,
 		});
@@ -256,7 +251,7 @@ test("ordinary files containing sensitive-looking substrings do not select risk"
 test("incomplete runtime collection remains standard instead of trivial", () => {
 	const plan = classifyReviewRoute(
 		buildDiffEvidence(
-			"pre-pr",
+			REVIEW_EVENT.ORDINARY_START,
 			{ changedPaths: [], changedLines: 0 },
 			false,
 		),
@@ -278,28 +273,25 @@ test("incomplete triviality evidence cannot suppress a known 401-line full route
 });
 
 test("stable full-lens order is independent of standard-risk signals", () => {
-	for (const event of ["pre-pr", "on-ci", "on-schedule"] satisfies TriggerEvent[]) {
-		const plan = classifyReviewRoute(
-			evidence({
-				event,
-				changedLines: 401,
-				riskSignal: true,
-				resilienceSignal: true,
-				reliabilitySignal: true,
-			}),
-		);
-		assert.deepEqual(plan.lenses, [
-			REVIEW_LENS.RISK,
-			REVIEW_LENS.RESILIENCE,
-			REVIEW_LENS.READABILITY,
-			REVIEW_LENS.RELIABILITY,
-		]);
-	}
+	const plan = classifyReviewRoute(
+		evidence({
+			changedLines: 401,
+			riskSignal: true,
+			resilienceSignal: true,
+			reliabilitySignal: true,
+		}),
+	);
+	assert.deepEqual(plan.lenses, [
+		REVIEW_LENS.RISK,
+		REVIEW_LENS.RESILIENCE,
+		REVIEW_LENS.READABILITY,
+		REVIEW_LENS.RELIABILITY,
+	]);
 });
 
 test("runtime collection keeps a large documentation-only hot-path edit trivial", () => {
 	const plan = classifyReviewRoute(
-		buildDiffEvidence("pre-pr", {
+		buildDiffEvidence(REVIEW_EVENT.ORDINARY_START, {
 			changedPaths: ["docs/auth/recovery.md"],
 			changedLines: 900,
 		}),

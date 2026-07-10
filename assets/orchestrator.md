@@ -53,16 +53,16 @@ Core question: does this inflate parent context without need?
 | Write with analysis across multiple files | no | yes |
 | Bash for state (e.g. git status) | yes | no |
 | Bash for execution (tests/builds) | no | yes |
-| Commit/push/PR after code changes | no | yes, fresh review first |
+| Commit/push/PR after code changes | no | no actor; validate the approved receipt and exact target |
 
 Mandatory Delegation Triggers — stop rules; once fired, delegate through the best available subagent runtime (prefer `subagent_run`, else Pi's native `Agent`):
 
 1. **4-file rule** — 4+ files to understand → delegate a scout/mapping task.
 2. **Multi-file write rule** — 2+ non-trivial files touched → delegate one writer.
-3. **PR rule** — before commit/push/PR, run a fresh-context review lens unless trivial docs/text.
-4. **Incident rule** — after a wrong cwd/worktree/git/tooling incident, run a fresh audit first.
+3. **Lifecycle gate rule** — commit/push/PR/release validates an approved receipt and exact typed target with zero actors. Missing or changed authority fails closed; it never launches a same-lineage review.
+4. **Incident rule** — diagnose wrong cwd/worktree/git/tooling incidents separately. An incident never reopens a closed review lineage or resets its budget.
 5. **Long-session rule** — ~20 tool calls, 5 exploratory reads, or 2 non-mechanical edits without delegation → pause and delegate.
-6. **Fresh review rule** — fresh-context review lenses for diffs/conflicts/PR readiness/incidents; continuity workers only for implementation needing inherited state.
+6. **Review actor rule** — review lenses run only when selected by ordinary transaction start; explicit Judgment Day uses its two named judges. Lifecycle and SDD boundaries launch zero review actors.
 
 Full table, Work Routing Ladder examples/model-routing detail, Cost and Context Balance, Canonical Workflows, and Review Lens Selection detail: `{{GENTLE_PI_DELEGATION_PATH}}`.
 
@@ -105,17 +105,16 @@ For skill-shaped requests, do not treat injected `<available_skills>` as complet
 - Keep writes single-threaded unless isolated worktrees are explicitly approved.
 - Preserve human control: user decisions beat agent momentum.
 
-## 4R Review Triggers
+## Bounded Review Transactions
 
-Route objectively trivial diffs to zero lenses. Route ordinary or ambiguous executable/configuration diffs to standard review with exactly one dominant lens: `review-risk`, `review-resilience`, `review-reliability`, or `review-readability` fallback. Exactly 400 changed lines remains standard; 401 changed lines or a non-trivial hot path runs full 4R in stable risk, resilience, readability, reliability order.
+Only ordinary transaction start classifies the bound `base_tree -> complete_snapshot_tree` diff.
 
-Pre-commit and pre-push never run full 4R. Review advice never blocks a command. Dangerous-command confirmation remains authoritative. Post-SDD design/apply remains the separate `gentle-ai-judgment-day` path.
+Pre-commit, pre-push, PR, and release gates validate approved receipts and exact typed targets with zero actors.
 
-### Review Execution Contract
+Dangerous-command safety remains independent and authoritative.
 
-**Ledger persistence follows the artifact store.**
-- `openspec`: write `openspec/changes/{change-name}/review-ledger.md`.
-- `engram`: upsert topic `sdd/{change-name}/review-ledger` (ad-hoc: `review/{target-slug}/ledger`).
-- `none`: keep the ledger inline only; not persisted across compaction.
+SDD completion adds no review or Judgment Day pass.
 
-Persist even empty ledgers. Full detail, the empty-ledger rule, and both execution-mode clauses: `{{GENTLE_PI_DELEGATION_PATH}}`.
+Review transactions, validation, and SDD perform no commit, push, PR creation, release, or publication.
+
+The complete ordinary/Judgment Day controller and actor contract is loaded from `{{GENTLE_PI_DELEGATION_PATH}}`.

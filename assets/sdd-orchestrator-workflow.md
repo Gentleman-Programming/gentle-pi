@@ -147,12 +147,12 @@ Check every phase result against the Result Contract:
 Use cost-aware validation:
 
 - For lower-risk phases (`sdd-explore`, `sdd-spec`, `sdd-tasks`, `sdd-sync`, `sdd-archive`), the parent may validate inline by reading artifacts back and checking claims.
-- For higher-risk phases (`sdd-design`, `sdd-apply`), run fresh-context validation/review before continuing because errors there compound downstream.
-- If an inline gate finds any smell — missing artifact, status mismatch, unresolved path, likely drift, or critical risk — escalate to fresh-context validation before deciding.
+- For higher-risk phases (`sdd-design`, `sdd-apply`), validate the artifact, declared paths, task state, and focused test evidence directly before continuing because errors there compound downstream.
+- If a gate finds any smell — missing artifact, status mismatch, unresolved path, likely drift, or critical risk — rerun the same SDD phase once with corrective feedback. SDD phase validation does not start ordinary review or Judgment Day.
 
 On gate pass, continue automatically to the next phase. On gate fail, rerun the same phase exactly once with corrective feedback naming the specific failures. Validate the rerun. If it fails again, stop the automatic chain and report the phase, failures from both attempts, and the recommended fix. Never advance to dependent phases on a failed gate.
 
-The gatekeeper is additive: it does not relax the Review Workload Guard, Strict TDD Forwarding, native status dependency checks, or mandatory delegation/review rules.
+The gatekeeper is additive: it does not relax the Review Workload Guard, Strict TDD Forwarding, native status dependency checks, or mandatory delegation rules. It never creates a post-SDD review pass.
 
 ## SDD Phase Delegation Mode
 
@@ -176,6 +176,6 @@ After `sdd-tasks` and before `sdd-apply`, inspect the task output for review wor
 
 If estimated changed lines exceed 400, chained PRs are recommended, or a decision is needed, pause and ask unless the user already approved a delivery strategy.
 
-Findings from any triggered review lens persist to the review findings ledger per the artifact-store branch (openspec/engram/none) and follow the scoped re-review contract on re-review — see `assets/orchestrator.md`'s Review Execution Contract.
+Any review transaction explicitly started outside SDD persists through its own artifact-store branch and budget. SDD completion itself launches no review actors and mints no review authority.
 
 Automatic mode does not override reviewer burnout protection.

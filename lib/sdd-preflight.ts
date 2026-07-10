@@ -12,11 +12,10 @@ const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
 const MANAGED_ASSETS_MANIFEST = "managed-assets.json";
 const MANAGED_ASSETS_SCHEMA_VERSION = 1;
-const LEGACY_V013_MANAGED_ASSETS = join(
-	ASSETS_DIR,
-	"migrations",
-	"managed-assets-v0.13.json",
-);
+const LEGACY_MANAGED_ASSET_MANIFESTS = Object.freeze([
+	{ path: join(ASSETS_DIR, "migrations", "managed-assets-v0.13.json"), version: "0.13.0" },
+	{ path: join(ASSETS_DIR, "migrations", "managed-assets-v0.14.json"), version: "0.14.0" },
+]);
 
 function gentlePiAgentHome(): string {
 	return process.env.GENTLE_PI_AGENT_HOME ?? join(homedir(), ".pi", "agent");
@@ -118,15 +117,16 @@ function managedAssetHash(content: string): string {
 	return createHash("sha256").update(content).digest("hex");
 }
 
-function readLegacyV013ManagedAssets(): LegacyManagedAssetsManifest | undefined {
+function readLegacyManagedAssets(
+	path: string,
+	version: string,
+): LegacyManagedAssetsManifest | undefined {
 	try {
-		const parsed: unknown = JSON.parse(
-			readFileSync(LEGACY_V013_MANAGED_ASSETS, "utf8"),
-		);
+		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
 		if (
 			!isRecord(parsed) ||
 			parsed.schemaVersion !== MANAGED_ASSETS_SCHEMA_VERSION ||
-			parsed.packageVersion !== "0.13.0" ||
+			parsed.packageVersion !== version ||
 			!isRecord(parsed.assets)
 		) {
 			return undefined;
@@ -138,12 +138,26 @@ function readLegacyV013ManagedAssets(): LegacyManagedAssetsManifest | undefined 
 		);
 		return {
 			schemaVersion: MANAGED_ASSETS_SCHEMA_VERSION,
-			packageVersion: "0.13.0",
+			packageVersion: version,
 			assets,
 		};
 	} catch {
 		return undefined;
 	}
+}
+
+function readLegacyManagedAssetHashes(): Record<string, readonly string[]> {
+	const hashes: Record<string, string[]> = {};
+	for (const manifest of LEGACY_MANAGED_ASSET_MANIFESTS) {
+		const assets = readLegacyManagedAssets(manifest.path, manifest.version)?.assets;
+		if (!assets) continue;
+		for (const [ownershipKey, hash] of Object.entries(assets)) {
+			const known = hashes[ownershipKey] ?? [];
+			if (!known.includes(hash)) known.push(hash);
+			hashes[ownershipKey] = known;
+		}
+	}
+	return hashes;
 }
 
 function updateAgentFrontmatterRouting(
@@ -304,7 +318,7 @@ function copyDirectoryFiles(
 	ownershipPrefix: string,
 	force: boolean,
 	manifest: ManagedAssetsManifest,
-	legacyAssets: Readonly<Record<string, string>> | undefined,
+	legacyAssetHashes: Readonly<Record<string, readonly string[]>> | undefined,
 ): { copied: number; skipped: number } {
 	if (!existsSync(sourceDir)) return { copied: 0, skipped: 0 };
 	mkdirSync(targetDir, { recursive: true });
@@ -321,7 +335,7 @@ function copyDirectoryFiles(
 				ownershipKey,
 				force,
 				manifest,
-				legacyAssets,
+				legacyAssetHashes,
 			);
 			copied += child.copied;
 			skipped += child.skipped;
@@ -346,13 +360,17 @@ function copyDirectoryFiles(
 				? undefined
 				: managedAssetHash(installedContent);
 			if (managedHash === undefined) {
-				const legacyHash = legacyAssets?.[ownershipKey];
+				const legacyHashes = legacyAssetHashes?.[ownershipKey];
 				const comparableLegacyHash = installedContent === undefined
 					? undefined
 					: managedAssetHash(
 							legacyComparableAssetContent(ownershipKey, installedContent),
 						);
-				if (legacyHash === undefined || comparableLegacyHash !== legacyHash) {
+				if (
+					legacyHashes === undefined ||
+					comparableLegacyHash === undefined ||
+					!legacyHashes.includes(comparableLegacyHash)
+				) {
 					delete manifest.assets[ownershipKey];
 					skipped += 1;
 					continue;
@@ -381,8 +399,8 @@ export function installSddAssets(
 ): { agents: number; chains: number; support: number; skipped: number } {
 	const agentHome = gentlePiAgentHome();
 	const manifestPath = join(agentHome, "gentle-ai", MANAGED_ASSETS_MANIFEST);
-	const legacyAssets = force && !existsSync(manifestPath)
-		? readLegacyV013ManagedAssets()?.assets
+	const legacyAssetHashes = force && !existsSync(manifestPath)
+		? readLegacyManagedAssetHashes()
 		: undefined;
 	const manifest = readManagedAssetsManifest(manifestPath);
 	const agents = copyDirectoryFiles(
@@ -391,7 +409,7 @@ export function installSddAssets(
 		"agents",
 		force,
 		manifest,
-		legacyAssets,
+		legacyAssetHashes,
 	);
 	const chains = copyDirectoryFiles(
 		join(ASSETS_DIR, "chains"),
@@ -399,7 +417,7 @@ export function installSddAssets(
 		"chains",
 		force,
 		manifest,
-		legacyAssets,
+		legacyAssetHashes,
 	);
 	const support = copyDirectoryFiles(
 		join(ASSETS_DIR, "support"),
@@ -407,7 +425,7 @@ export function installSddAssets(
 		"gentle-ai/support",
 		force,
 		manifest,
-		legacyAssets,
+		legacyAssetHashes,
 	);
 	mkdirSync(dirname(manifestPath), { recursive: true });
 	writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));

@@ -1,10 +1,18 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdtempSync,
+	mkdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+	installSddAssets,
 	readSddPreflightFromDisk,
 	sddPreflightDiskPath,
 	writeSddPreflightToDisk,
@@ -110,4 +118,31 @@ test("writeSddPreflightToDisk is non-fatal when directory is not writable (no th
 	assert.doesNotThrow(() => {
 		writeSddPreflightToDisk("/nonexistent/path/that/cannot/be/created/gently", SAMPLE_PREFS);
 	});
+});
+
+test("forced asset refresh migrates only untouched v0.14 package contracts and preserves user edits", () => {
+	const packageRoot = join(import.meta.dirname, "..");
+	const fixture = readFileSync(
+		join(packageRoot, "tests", "fixtures", "v0.14", "assets", "agents", "review-risk.md"),
+		"utf8",
+	);
+	const temporaryAgentHome = mkdtempSync(join(tmpdir(), "gentle-pi-v014-preflight-"));
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const untouched = join(temporaryAgentHome, "agents", "review-risk.md");
+	const edited = join(temporaryAgentHome, "agents", "review-readability.md");
+	try {
+		process.env.GENTLE_PI_AGENT_HOME = temporaryAgentHome;
+		mkdirSync(join(temporaryAgentHome, "agents"), { recursive: true });
+		writeFileSync(untouched, fixture);
+		writeFileSync(edited, `${fixture}\nuser-owned edit\n`);
+
+		installSddAssets(packageRoot, true);
+
+		assert.match(readFileSync(untouched, "utf8"), /initial_review_tree/);
+		assert.equal(readFileSync(edited, "utf8"), `${fixture}\nuser-owned edit\n`);
+	} finally {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		rmSync(temporaryAgentHome, { recursive: true, force: true });
+	}
 });

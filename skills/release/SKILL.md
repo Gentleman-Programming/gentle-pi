@@ -16,7 +16,7 @@ Use this skill when preparing, publishing, or verifying a `gentle-pi` release.
 - Do not publish `gentle-pi` to npm from a local machine.
 - npm publishing MUST go through the GitHub Actions workflow `.github/workflows/publish.yml` so provenance, environment protection, and registry credentials are controlled by GitHub.
 - Use a clean worktree for release commits. Do not package unrelated local files or scratch artifacts.
-- Run a fresh review before pushing a code release unless the change is trivial docs-only.
+- Validate the approved receipt against the exact immutable release target with zero review actors before publication.
 - Never skip package verification. The publish workflow runs verification again, but local validation should still pass before tagging.
 
 ## Release Procedure
@@ -88,6 +88,7 @@ Use this skill when preparing, publishing, or verifying a `gentle-pi` release.
 
 ## Failure Handling
 
+- A publication failure never reopens the closed review lineage. Diagnose and retry publication separately without resetting review counters.
 - If a local `npm publish` fails, do not retry locally. Use the GitHub workflow instead.
 - If the workflow fails, inspect logs with:
 

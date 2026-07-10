@@ -8,69 +8,78 @@ Define bounded review orchestration.
 
 ### Requirement: Precision-gated ledger
 
-Standard review MUST use one sweep; full 4R MUST use at most two per lens. Findings MUST evidence user impact. The merged ledger MUST be authoritative, with `refuted` terminal. WARNING/SUGGESTION MUST be one-time `info` rows and MUST NOT drive fixes. Persistence MUST use Engram or equivalent structured inline fallback.
+Ordinary MUST run 0/1/4 lenses once against `initial_review_tree`. Before corroboration, the authoritative store MUST freeze canonical ID-sorted rows containing immutable identity, claim, and evidence fields and bind them by `frozen_ledger_hash`. `refuted` remains terminal; WARNING/SUGGESTION is one-time `info`. Summaries and actor output are inert; only controller APIs MAY authorize, and store-integrity mismatch fails closed.
+(Previously: two sweeps/fallback authority.)
 
 #### Scenario: Precision limits
 
-- GIVEN standard or full-4R review
-- WHEN candidates are admitted
-- THEN sweeps MUST be one or at most two respectively, and speculative candidates MUST be rejected
+- GIVEN an ordinary 0/1/4 route
+- WHEN discovery runs
+- THEN each lens runs once and speculation is rejected
 
-#### Scenario: Terminal rows
+#### Scenario: Frozen terminal rows
 
-- GIVEN a `refuted`, WARNING, or SUGGESTION row
-- WHEN orchestration reruns
-- THEN `refuted` MUST remain terminal and WARNING/SUGGESTION MUST NOT schedule fixes
+- GIVEN frozen canonical rows
+- WHEN orchestration runs
+- THEN claims/evidence stay immutable and terminal/info rows schedule nothing
 
-#### Scenario: Persistence fallback
+#### Scenario: Authoritative persistence
 
-- GIVEN Engram unavailable
-- WHEN ledger is saved/read
-- THEN all ledger fields/statuses MUST remain inline
+- GIVEN summary/store disagreement
+- WHEN authority is checked
+- THEN the store prevails or integrity failure closes the gate
 
 ### Requirement: Constant batched refutation and voting
 
-Actor count MUST ignore finding count: zero without severe candidates, one general refuter for standard, and three full-4R refuters for correctness, impact/exploitability, and reproducibility. Every refuter MUST receive complete merged BLOCKER/CRITICAL list. In standard review, the general refuter's single per-finding verdict MUST decide: `refuted` MUST mark that finding terminal; `stands`, malformed, omitted, or missing MUST preserve it. Full 4R MUST vote independently per finding: at least two of three `refuted` verdicts MUST mark only that finding terminal; fewer MUST preserve it.
+The controller MUST verify `deterministic` evidence directly. All `inferential-severe` rows MAY go once to one read-only refuter returning per-ID `refuted | corroborated | inconclusive`. Invalid/insufficient evidence becomes `inconclusive` and escalates.
+(Previously: three refuters.)
 
-#### Scenario: Actor counts
+#### Scenario: Evidence routing
 
-- GIVEN no severe candidates, standard review, or full 4R
-- WHEN refutation starts for any finding count
-- THEN actor counts MUST respectively be zero, one general, or three fixed-role; every active actor MUST receive the complete list
+- GIVEN deterministic or insufficient evidence
+- WHEN corroborated
+- THEN zero refuters run and the controller corroborates or escalates
 
-#### Scenario: Mode-specific voting
+#### Scenario: Inferential batch
 
-- GIVEN the standard general refuter marks a finding `refuted`, or at least two full-4R refuters do
-- WHEN verdicts merge
-- THEN only that finding MUST become terminal `refuted`
+- GIVEN inferential-severe rows
+- WHEN authorized
+- THEN one actor at most receives the full list once
 
-#### Scenario: Fail-closed handling
+#### Scenario: Fail-closed result
 
-- GIVEN a standard verdict is `stands`, malformed, omitted, or missing, or a full-4R finding receives fewer than two valid refutations
-- WHEN verdicts merge
-- THEN that finding MUST be preserved
+- GIVEN invalid/inconclusive output
+- WHEN merged
+- THEN it escalates with no second refuter
 
 ### Requirement: Bounded convergence and Judgment Day
 
-Only surviving BLOCKER/CRITICAL rows MAY drive up to two scoped fix/re-review rounds. Re-review MUST receive only ledger and fix diff; round-two survivors MUST escalate. Judgment Day MUST use two blind judges, zero refuters, informational warnings, and the same limit.
+Ordinary MAY authorize one fix batch. After fixes, one validator receives only requested frozen IDs, their exact hash-bound canonical rows, and the fix diff; resolutions are separate. It MAY resolve IDs/detect fix-line regression but MUST NOT alter claims, add work, launch actors, or repeat. No-fix uses zero validators. One final verification ends `approved | escalated`. Explicit Judgment Day replaces ordinary, uses two blind judges/zero refuters, and alone permits two rounds.
+(Previously: shared iteration.)
 
-#### Scenario: Scoped re-review
+#### Scenario: Fix path
 
-- GIVEN a severe-finding fix completes
-- WHEN re-review starts
-- THEN reviewers MUST receive only ledger and fix diff, assessing affected rows and regressions
+- GIVEN ordinary fixes complete
+- WHEN advancing
+- THEN one validator and one final verification run without new work
 
-#### Scenario: Round limit
+#### Scenario: No-fix or failure
 
-- GIVEN severe rows survive round two
-- WHEN convergence is evaluated
-- THEN a third round MUST NOT run; unresolved rows MUST escalate
+- GIVEN no fix or failed validation/verification
+- WHEN reduced
+- THEN no-fix has zero validators and any failure escalates
 
-#### Scenario: Judgment Day exception
+#### Scenario: Judgment Day
 
-- GIVEN Judgment Day runs
-- WHEN adversarial review starts
-- THEN exactly two blind judges and zero refuter actors MUST run
+- GIVEN explicit Judgment Day
+- WHEN review runs
+- THEN two blind judges and zero refuters run
+
+#### Scenario: Judgment Day limit
+
+- GIVEN findings survive round two
+- WHEN evaluated
+- THEN no third round runs and the transaction escalates
 
 ### Requirement: Installed refuter boundary
 
@@ -90,13 +99,26 @@ Installation/forced refresh MUST provide `review-refuter` with exactly `read`, `
 
 ### Requirement: No delivery or publication
 
-Orchestration MAY implement and verify but MUST NOT commit, push, tag, release, publish, trigger publication, or make publication-only version changes.
+Orchestration MAY implement/verify but MUST NOT deliver/publish. SDD adds no review/Judgment Day; gates validate exact receipts with zero actors. A real scope change MUST claim the deterministic parent+target child once, assign one fresh explicit budget, and leave the parent closed. Incidents stay separate.
+(Previously: delivery-only boundary.)
+
+#### Scenario: SDD completion
+
+- GIVEN SDD completes approved
+- WHEN advancing
+- THEN no review/Judgment Day runs
+
+#### Scenario: Scope or incident
+
+- GIVEN new scope or an incident
+- WHEN work starts
+- THEN scope uses its claimed child/budget and incidents reset nothing
 
 #### Scenario: Verification stop
 
-- GIVEN implementation and verification complete
+- GIVEN implementation/verification complete
 - WHEN orchestration finishes
-- THEN files MUST remain undelivered and unpublished
+- THEN files remain undelivered/unpublished
 
 ## Acceptance Criteria
 

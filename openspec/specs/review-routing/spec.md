@@ -8,89 +8,101 @@ Define deterministic review depth and runtime behavior without turning review ad
 
 ### Requirement: Deterministic route classification
 
-The system MUST classify a diff as `trivial`, `standard`, or `full-4R`. Triviality MUST require objective evidence that every change is documentation, comments, formatting, or a string typo and that no executable or configuration content changed. Standard routing MUST select exactly one dominant-risk lens, defaulting to readability only when no stronger signal exists.
+Only ordinary start MUST classify persisted `base_tree -> complete_snapshot_tree` as `trivial | standard | full-4R`. State/receipt MUST also bind the exact `review_projection`, `initial_review_tree`, ordered lenses, and policy hash so classification is reconstructable. Triviality requires only docs/comments/formatting/typos; executable/configuration uncertainty is non-trivial. Standard selects one dominant lens, defaulting to readability. Gates/Judgment Day never classify.
+(Previously: ambient/lifecycle diffs were classified.)
 
-#### Scenario: Objectively trivial diff
+#### Scenario: Objectively trivial snapshot
 
-- GIVEN every changed line is objectively trivial and no executable or configuration content changed
-- WHEN the diff is classified
-- THEN the route MUST be `trivial` and request zero review lenses
+- GIVEN only objectively trivial complete-snapshot changes
+- WHEN ordinary starts
+- THEN route MUST be `trivial` with zero lenses
 
-#### Scenario: Ambiguous executable or configuration diff
+#### Scenario: Ambiguous executable or configuration snapshot
 
-- GIVEN executable or configuration content changed and triviality cannot be proven
-- WHEN the diff is classified
-- THEN the route MUST fail conservatively to `standard` with exactly one dominant-risk lens
+- GIVEN executable/configuration uncertainty
+- WHEN ordinary starts
+- THEN route MUST be at least `standard` with one lens
 
-#### Scenario: Ordinary non-trivial diff
+#### Scenario: Ordinary non-trivial snapshot
 
-- GIVEN a non-trivial, non-hot-path diff does not require full 4R
-- WHEN the diff is classified
-- THEN the route MUST be `standard` with exactly one highest-impact applicable lens
+- GIVEN non-trivial, non-hot-path scope
+- WHEN ordinary starts
+- THEN route MUST be `standard` with the highest-impact lens
 
 ### Requirement: Size and hot-path escalation
 
-After objective-triviality evaluation, the system MUST route non-trivial hot-path diffs or diffs strictly greater than 400 changed lines to `full-4R` with risk, resilience, readability, and reliability lenses.
+At ordinary start, non-trivial hot paths or over 400 changed lines MUST select `full-4R` with risk, resilience, readability, reliability in order.
+(Previously: escalation applied outside start.)
 
 #### Scenario: 399 and 400 line boundaries
 
-- GIVEN an ordinary non-trivial diff has 399 or exactly 400 changed lines
-- WHEN size routing is evaluated
-- THEN size alone MUST yield `standard`, not `full-4R`
+- GIVEN 399 or 400 non-trivial changed lines
+- WHEN start routes
+- THEN size alone MUST yield `standard`
 
 #### Scenario: 401 line boundary
 
-- GIVEN a non-trivial diff has 401 changed lines
-- WHEN size routing is evaluated
-- THEN the route MUST be `full-4R` with exactly four lenses
+- GIVEN 401 non-trivial changed lines
+- WHEN start routes
+- THEN route MUST be four-lens `full-4R`
 
 #### Scenario: Hot path
 
-- GIVEN a hot-path diff is not objectively trivial
-- WHEN risk routing is evaluated
-- THEN the route MUST be `full-4R` regardless of line count
+- GIVEN a non-trivial hot path
+- WHEN start routes
+- THEN route MUST be `full-4R`
 
 #### Scenario: Objectively trivial hot-path edit
 
-- GIVEN the entire hot-path diff satisfies the objective triviality rule
-- WHEN the diff is classified
-- THEN the route MUST remain `trivial` with zero lenses
+- GIVEN an objectively trivial hot path
+- WHEN start routes
+- THEN route remains zero-lens `trivial`
 
 ### Requirement: Pre-commit and pre-push ceiling
 
-Pre-commit and pre-push events MUST NOT run full 4R; a non-trivial event that would otherwise be full MUST be capped at standard with one dominant-risk lens.
+Pre-commit/pre-push MUST NOT classify or review. Pre-commit MUST resolve the exact intended commit tree. Pre-push MUST consume the complete stable-ordered ref-update set, binding each source/destination ref and exact object/peeled-commit/tree IDs—never `HEAD` as proxy. Const-tagged `create` binds absent-old plus new identity; `update` binds both sides. New/update trees MUST match receipt final/base semantics; deletion, unsupported, ambiguous, or unresolved forms fail closed.
+(Previously: these events rerouted full 4R to one standard lens.)
 
-#### Scenario: Large or hot pre-delivery diff
+#### Scenario: Pre-delivery validation
 
-- GIVEN a pre-commit or pre-push diff is non-trivial, hot-path, or greater than 400 lines
-- WHEN review routing runs
-- THEN it MUST request exactly one lens and MUST NOT request full 4R
+- GIVEN a resolved commit or push target and receipt
+- WHEN gated
+- THEN exact semantics MUST be checked with zero actors
 
 ### Requirement: Non-blocking safety composition
 
-Review routing MUST emit advice without pausing, denying, or requiring a receipt. Unrelated dangerous-command confirmation MUST remain independently authoritative.
+All lifecycle gates MUST use `GateTargetV1` and receipts only. PR targets bind base/head refs, commits, and trees; release targets bind tag ref/object, peeled commit, and commit tree. Every identity MUST resolve. Target hash and result MUST be journaled. Post-apply MAY explicitly start ordinary without a receipt, never Judgment Day. Dangerous-command confirmation remains authoritative.
+(Previously: routing emitted non-blocking advice without requiring receipts.)
 
-#### Scenario: Review advice does not gate a command
+#### Scenario: Same-lineage gate
 
-- GIVEN a command produces any review route and has no independent safety block
-- WHEN the runtime emits review advice
-- THEN command execution MUST continue without review completion or retry state
+- GIVEN a resolved target matches an approved receipt
+- WHEN gated
+- THEN it MUST allow with zero actors
 
-#### Scenario: Dangerous-command confirmation is preserved
+#### Scenario: Changed scope
 
-- GIVEN an unrelated safety rule requires confirmation for a dangerous command
-- WHEN review routing also emits advice
-- THEN the safety confirmation MUST still control execution and MUST NOT be bypassed by routing
+- GIVEN target semantics differ
+- WHEN validated
+- THEN return `scope-changed` with zero actors
+- AND parent+target MUST identify one claimed child with one fresh explicit budget
+
+#### Scenario: Dangerous command
+
+- GIVEN command safety requires confirmation
+- WHEN a receipt allows
+- THEN command safety MUST still control execution
 
 ### Requirement: Delivery boundary
 
-Review routing MUST NOT create hard workflow gates or initiate commits, pushes, tags, releases, publication triggers, publishing, or publication-only version changes.
+Routing/validation MUST perform no delivery, publication, or publication-only version change.
+(Previously: the boundary covered routing advice but not receipt validation.)
 
-#### Scenario: Routing completes without delivery
+#### Scenario: Validation completes without delivery
 
-- GIVEN routing has produced its review advice
-- WHEN the routing interaction completes
-- THEN it MUST perform no delivery or publication action
+- GIVEN a routing/validation result
+- WHEN complete
+- THEN no delivery/publication action occurs
 
 ## Acceptance Criteria
 
