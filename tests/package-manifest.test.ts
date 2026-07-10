@@ -18,6 +18,22 @@ import { installSddAssets } from "../lib/sdd-preflight.ts";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const REVIEW_REFUTER_FILE = "review-refuter.md";
+const REVIEW_RISK_FILE = "review-risk.md";
+const V013_REVIEW_RISK_FIXTURE = join(
+	PACKAGE_ROOT,
+	"tests",
+	"fixtures",
+	"v0.13",
+	"assets",
+	"agents",
+	REVIEW_RISK_FILE,
+);
+const V013_MANAGED_ASSETS = join(
+	PACKAGE_ROOT,
+	"assets",
+	"migrations",
+	"managed-assets-v0.13.json",
+);
 const REVIEW_REFUTER_TOOLS = ["read", "grep", "find"];
 const FORBIDDEN_REFUTER_TOOLS = [
 	"bash",
@@ -33,6 +49,10 @@ const FORBIDDEN_REFUTER_TOOLS = [
 interface ManagedAssetsManifest {
 	schemaVersion: number;
 	assets: Record<string, string>;
+}
+
+interface LegacyManagedAssetsManifest extends ManagedAssetsManifest {
+	packageVersion: string;
 }
 
 function sha256(content: string): string {
@@ -310,6 +330,129 @@ test("forced package installation preserves same-path user-authored agents and s
 		}
 		rmSync(temporaryAgentHome, { recursive: true, force: true });
 		rmSync(temporaryProject, { recursive: true, force: true });
+	}
+});
+
+test("v0.13 ownership evidence is bundled and matches the self-contained upgrade fixture", () => {
+	const legacyManifest = JSON.parse(
+		readFileSync(V013_MANAGED_ASSETS, "utf8"),
+	) as LegacyManagedAssetsManifest;
+	const legacyReviewRisk = readFileSync(V013_REVIEW_RISK_FIXTURE, "utf8");
+
+	assert.equal(legacyManifest.packageVersion, "0.13.0");
+	assert.equal(
+		legacyManifest.assets[`agents/${REVIEW_RISK_FILE}`],
+		sha256(legacyReviewRisk),
+		"published migration evidence must fingerprint the exact v0.13 package asset",
+	);
+});
+
+test("first forced sync migrates untouched v0.13 assets, preserves routing, and owns new assets", () => {
+	const temporaryAgentHome = mkdtempSync(join(tmpdir(), "gentle-pi-v013-upgrade-"));
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const installedReviewRisk = join(temporaryAgentHome, "agents", REVIEW_RISK_FILE);
+	const installedRefuter = join(temporaryAgentHome, "agents", REVIEW_REFUTER_FILE);
+	const managedAssetsManifest = join(
+		temporaryAgentHome,
+		"gentle-ai",
+		"managed-assets.json",
+	);
+	const legacySource = readFileSync(V013_REVIEW_RISK_FIXTURE, "utf8");
+	const routedLegacySource = legacySource.replace(
+		"description: R1 Risk reviewer — security, privilege boundaries, data exposure, dependency risks, and merge-blocking vulnerabilities.\n",
+		"description: R1 Risk reviewer — security, privilege boundaries, data exposure, dependency risks, and merge-blocking vulnerabilities.\nmodel: private/legacy-model\nthinking: xhigh\n",
+	);
+
+	try {
+		process.env.GENTLE_PI_AGENT_HOME = temporaryAgentHome;
+		mkdirSync(dirname(installedReviewRisk), { recursive: true });
+		writeFileSync(installedReviewRisk, routedLegacySource);
+		assert.equal(existsSync(managedAssetsManifest), false, "v0.13 had no ownership manifest");
+
+		installSddAssets(PACKAGE_ROOT, true);
+
+		const migrated = readFileSync(installedReviewRisk, "utf8");
+		const currentPackageSource = readFileSync(
+			join(PACKAGE_ROOT, "assets", "agents", REVIEW_RISK_FILE),
+			"utf8",
+		);
+		assert.notEqual(migrated, routedLegacySource, "the stale v0.13 review contract must refresh");
+		assert.match(migrated, /^model: private\/legacy-model$/m);
+		assert.match(migrated, /^thinking: xhigh$/m);
+		assert.equal(
+			migrated.replace(/^model: .*\n|^thinking: .*\n/gm, ""),
+			currentPackageSource,
+			"migration must update the package body without losing user routing",
+		);
+		assert.equal(
+			readFileSync(installedRefuter, "utf8"),
+			readFileSync(join(PACKAGE_ROOT, "assets", "agents", REVIEW_REFUTER_FILE), "utf8"),
+			"an asset missing from v0.13 must install normally",
+		);
+
+		const manifest = JSON.parse(
+			readFileSync(managedAssetsManifest, "utf8"),
+		) as ManagedAssetsManifest;
+		assert.equal(manifest.assets[`agents/${REVIEW_RISK_FILE}`], sha256(migrated));
+		assert.equal(
+			manifest.assets[`agents/${REVIEW_REFUTER_FILE}`],
+			sha256(readFileSync(installedRefuter, "utf8")),
+		);
+
+		const userEditedMigration = migrated.replace(
+			"**Precision limits.**",
+			"**Precision limits with a user-authored note.**",
+		);
+		assert.notEqual(userEditedMigration, migrated, "the fixture must exercise post-migration drift");
+		writeFileSync(installedReviewRisk, userEditedMigration);
+		installSddAssets(PACKAGE_ROOT, true);
+		assert.deepEqual(
+			readFileSync(installedReviewRisk),
+			Buffer.from(userEditedMigration),
+			"exact full-content ownership must protect edits made after migration",
+		);
+		const postEditManifest = JSON.parse(
+			readFileSync(managedAssetsManifest, "utf8"),
+		) as ManagedAssetsManifest;
+		assert.equal(postEditManifest.assets[`agents/${REVIEW_RISK_FILE}`], undefined);
+	} finally {
+		if (previousAgentHome === undefined) {
+			delete process.env.GENTLE_PI_AGENT_HOME;
+		} else {
+			process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		}
+		rmSync(temporaryAgentHome, { recursive: true, force: true });
+	}
+});
+
+test("first forced sync preserves a body-edited v0.13 asset byte-for-byte", () => {
+	const temporaryAgentHome = mkdtempSync(join(tmpdir(), "gentle-pi-v013-edited-"));
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const installedReviewRisk = join(temporaryAgentHome, "agents", REVIEW_RISK_FILE);
+	const editedLegacySource = readFileSync(V013_REVIEW_RISK_FIXTURE, "utf8").replace(
+		"Find security risks; do not fix them.",
+		"Find security risks; preserve this user-authored body edit.",
+	);
+
+	try {
+		process.env.GENTLE_PI_AGENT_HOME = temporaryAgentHome;
+		mkdirSync(dirname(installedReviewRisk), { recursive: true });
+		writeFileSync(installedReviewRisk, editedLegacySource);
+
+		installSddAssets(PACKAGE_ROOT, true);
+
+		assert.deepEqual(readFileSync(installedReviewRisk), Buffer.from(editedLegacySource));
+		const manifest = JSON.parse(
+			readFileSync(join(temporaryAgentHome, "gentle-ai", "managed-assets.json"), "utf8"),
+		) as ManagedAssetsManifest;
+		assert.equal(manifest.assets[`agents/${REVIEW_RISK_FILE}`], undefined);
+	} finally {
+		if (previousAgentHome === undefined) {
+			delete process.env.GENTLE_PI_AGENT_HOME;
+		} else {
+			process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		}
+		rmSync(temporaryAgentHome, { recursive: true, force: true });
 	}
 });
 
@@ -711,6 +854,7 @@ test("v0.14.0 release package and runtime stop before delivery or publication", 
 
 	const verifier = readFileSync(join(PACKAGE_ROOT, "scripts", "verify-package-files.mjs"), "utf8");
 	assert.match(verifier, /assets\/agents\/review-refuter\.md/);
+	assert.match(verifier, /assets\/migrations\/managed-assets-v0\.13\.json/);
 
 	const runtime = readFileSync(join(PACKAGE_ROOT, "extensions", "gentle-ai.ts"), "utf8");
 	assert.doesNotMatch(runtime, /execFileSync\("git", \["(?:commit|push|tag)"/);

@@ -119,7 +119,8 @@ export function buildDiffEvidence(
 	const executableChanged = diff.changedPaths.some(
 		(path) => !isDocumentationPath(path) && !isConfigurationPath(path),
 	);
-	const documentationOnly = diff.changedPaths.every(isDocumentationPath);
+	const documentationOnly =
+		diff.changedPaths.length > 0 && diff.changedPaths.every(isDocumentationPath);
 
 	return {
 		event,

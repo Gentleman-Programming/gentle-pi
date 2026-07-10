@@ -26,6 +26,7 @@ const requiredPaths = [
   "assets/chains/sdd-full.chain.md",
   "assets/chains/sdd-plan.chain.md",
   "assets/chains/sdd-verify.chain.md",
+  "assets/migrations/managed-assets-v0.13.json",
   "assets/support/sdd-status-contract.md",
   "assets/support/strict-tdd.md",
   "assets/support/strict-tdd-verify.md",

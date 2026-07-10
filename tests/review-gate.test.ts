@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
 import test from "node:test";
 import { __testing } from "../extensions/gentle-ai.ts";
 import {
 	FULL_4R_LENSES,
 	REVIEW_LENS,
 	REVIEW_ROUTE,
+	TRIVIALITY,
+	buildDiffEvidence,
+	classifyReviewRoute,
 	type ReviewPlan,
 } from "../lib/review-triggers.ts";
 
@@ -12,6 +19,7 @@ const {
 	applyReviewAdvice,
 	classifyReviewEvent,
 	collectReviewDiffForCommand,
+	computeDiffForEvent,
 	parseNumstat,
 	reviewAdviceMessage,
 } = __testing;
@@ -70,25 +78,198 @@ test("classifyReviewEvent: git log → null", () => {
 });
 
 for (const expected of [
-	{ command: "git -C /selected/commit-repo commit -m fix", event: "pre-commit", cwd: "/selected/commit-repo" },
-	{ command: "git -C /selected/push-repo push origin main", event: "pre-push", cwd: "/selected/push-repo" },
+	{
+		command: "git -C /selected/commit-repo commit -m fix",
+		event: "pre-commit",
+		gitGlobalArgs: ["-C", "/selected/commit-repo"],
+	},
+	{
+		command: "git -C /selected/push-repo push origin main",
+		event: "pre-push",
+		gitGlobalArgs: ["-C", "/selected/push-repo"],
+	},
+	{
+		command: "git --git-dir=/repos/commit.git commit -m fix",
+		event: "pre-commit",
+		gitGlobalArgs: ["--git-dir=/repos/commit.git"],
+	},
+	{
+		command: "git --git-dir /repos/push.git push origin main",
+		event: "pre-push",
+		gitGlobalArgs: ["--git-dir", "/repos/push.git"],
+	},
+	{
+		command: "git --work-tree=/work/commit commit -m fix",
+		event: "pre-commit",
+		gitGlobalArgs: ["--work-tree=/work/commit"],
+	},
+	{
+		command: "git --work-tree /work/push push origin main",
+		event: "pre-push",
+		gitGlobalArgs: ["--work-tree", "/work/push"],
+	},
+	{
+		command: "git -C /repo --git-dir=.git --work-tree . commit -m fix",
+		event: "pre-commit",
+		gitGlobalArgs: ["-C", "/repo", "--git-dir=.git", "--work-tree", "."],
+	},
+	{
+		command: "git -C /repo --git-dir .git --work-tree=. push origin main",
+		event: "pre-push",
+		gitGlobalArgs: ["-C", "/repo", "--git-dir", ".git", "--work-tree=."],
+	},
 ] as const) {
-	test(`${expected.event} evidence collection propagates the git -C repository`, () => {
+	test(`${expected.event} preserves repository selectors for diff evidence: ${expected.command}`, () => {
 		const expectedDiff = { changedPaths: ["src/selected.ts"], changedLines: 3 };
+		assert.equal(classifyReviewEvent(expected.command), expected.event);
 		const collection = collectReviewDiffForCommand(
 			expected.command,
 			"/session/repo",
-			(event, cwd) => {
-				assert.deepEqual({ event, cwd }, { event: expected.event, cwd: expected.cwd });
+			(event, cwd, options) => {
+				assert.equal(event, expected.event);
+				assert.equal(cwd, "/session/repo");
+				assert.deepEqual(options.gitGlobalArgs, expected.gitGlobalArgs);
 				return expectedDiff;
 			},
 		);
-		assert.deepEqual(collection, {
-			event: expected.event,
-			diff: expectedDiff,
+		assert.deepEqual(collection, { event: expected.event, diff: expectedDiff });
+	});
+}
+
+test("all-tracked collection reads staged plus tracked worktree changes and excludes untracked files", (t) => {
+	const parent = mkdtempSync(join(tmpdir(), "gentle-pi-review-git-"));
+	const repository = join(parent, "selected-repo");
+	t.after(() => rmSync(parent, { recursive: true, force: true }));
+	mkdirSync(repository);
+	const git = (...args: string[]): string =>
+		execFileSync("git", args, { cwd: repository, encoding: "utf8" });
+	git("init", "-b", "main");
+	for (const file of ["staged.ts", "tracked.ts", "deleted.ts"]) {
+		writeFileSync(join(repository, file), `initial ${file}\n`);
+	}
+	git("add", ".");
+	git(
+		"-c",
+		"user.name=Gentle Pi Tests",
+		"-c",
+		"user.email=gentle-pi@example.invalid",
+		"commit",
+		"-m",
+		"initial",
+	);
+	git("update-ref", "refs/remotes/origin/main", "HEAD");
+
+	writeFileSync(join(repository, "staged.ts"), "staged change\n");
+	git("add", "staged.ts");
+	writeFileSync(join(repository, "tracked.ts"), "tracked worktree change\n");
+	rmSync(join(repository, "deleted.ts"));
+	writeFileSync(join(repository, "untracked.ts"), "must not be reviewed\n");
+
+	const plain = computeDiffForEvent("pre-commit", repository, {
+		gitGlobalArgs: [],
+		includeAllTracked: false,
+	});
+	assert.deepEqual(plain?.changedPaths, ["staged.ts"]);
+
+	for (const target of [
+		{
+			cwd: parent,
+			gitGlobalArgs: ["-C", basename(repository)],
+		},
+		{
+			cwd: parent,
+			gitGlobalArgs: [
+				`--git-dir=${join(repository, ".git")}`,
+				`--work-tree=${repository}`,
+			],
+		},
+		{
+			cwd: parent,
+			gitGlobalArgs: [
+				"--git-dir",
+				join(repository, ".git"),
+				"--work-tree",
+				repository,
+			],
+		},
+	] as const) {
+		const allTracked = computeDiffForEvent("pre-commit", target.cwd, {
+			gitGlobalArgs: [...target.gitGlobalArgs],
+			includeAllTracked: true,
+		});
+		assert.deepEqual(
+			allTracked?.changedPaths.toSorted(),
+			["deleted.ts", "staged.ts", "tracked.ts"],
+		);
+	}
+
+	git("add", "-u");
+	git(
+		"-c",
+		"user.name=Gentle Pi Tests",
+		"-c",
+		"user.email=gentle-pi@example.invalid",
+		"commit",
+		"-m",
+		"tracked changes",
+	);
+	for (const target of [
+		{ cwd: parent, gitGlobalArgs: ["-C", basename(repository)] },
+		{
+			cwd: parent,
+			gitGlobalArgs: [
+				"--git-dir",
+				join(repository, ".git"),
+				`--work-tree=${repository}`,
+			],
+		},
+	] as const) {
+		const push = computeDiffForEvent("pre-push", target.cwd, {
+			gitGlobalArgs: [...target.gitGlobalArgs],
+			includeAllTracked: false,
+		});
+		assert.deepEqual(
+			push?.changedPaths.toSorted(),
+			["deleted.ts", "staged.ts", "tracked.ts"],
+		);
+	}
+});
+
+for (const command of [
+	"git commit -a -m fix",
+	"git commit -am fix",
+	"git commit --all --message fix",
+]) {
+	test(`pre-commit evidence includes tracked worktree changes for ${command}`, () => {
+		collectReviewDiffForCommand(command, "/session/repo", (_event, _cwd, options) => {
+			assert.equal(options.includeAllTracked, true);
+			return { changedPaths: ["src/tracked.ts"], changedLines: 2 };
 		});
 	});
 }
+
+for (const command of [
+	'git commit -m "describe -a without staging"',
+	'git commit --message="describe --all without staging"',
+]) {
+	test(`commit message text does not enable all-tracked collection for ${command}`, () => {
+		collectReviewDiffForCommand(command, "/session/repo", (_event, _cwd, options) => {
+			assert.equal(options.includeAllTracked, false);
+			return { changedPaths: ["docs/message.md"], changedLines: 1 };
+		});
+	});
+}
+
+test("empty successful diff evidence remains conservative", () => {
+	const evidence = buildDiffEvidence(
+		"pre-commit",
+		{ changedPaths: [], changedLines: 0 },
+		true,
+	);
+
+	assert.equal(evidence.triviality, TRIVIALITY.UNPROVEN);
+	assert.equal(classifyReviewRoute(evidence).route, REVIEW_ROUTE.STANDARD);
+});
 
 // ---------------------------------------------------------------------------
 // parseNumstat — parses git diff --numstat output

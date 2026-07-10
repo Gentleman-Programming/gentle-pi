@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "packageVersion": "0.13.0",
+  "assets": {
+    "agents/gentle-ai-worker.md": "b34488c0e91f134e38c595ab4659b47c0f38b8e74d2a52b12fc9fcac96dc0dd3",
+    "agents/jd-fix-agent.md": "4dfef5d62f6306d81d23a2babbbca42801f446181fed44eef07dc81d84a725c5",
+    "agents/jd-judge-a.md": "66e78e7210aee297a2968d1cf885f735ec7324d1cb3a297aa47360e7bfab60cc",
+    "agents/jd-judge-b.md": "aeb2485340c2beb7e0cc84b66105a0db2b51caa9aa4498940bd121baf952173b",
+    "agents/review-readability.md": "d27417efe6f3401f27908f2fcb8b5cd47c68c4bf17ed28fb8e76ea6446ddbf93",
+    "agents/review-reliability.md": "0bd10599c00a3f6fa505787021e14fafc8357bf7f4391513c420a179561e5358",
+    "agents/review-resilience.md": "f61ffb1fb813fed24e125accb0e4ee394750e719443266b7a8bec7c78c03e135",
+    "agents/review-risk.md": "0b673a54091b7b06c266da9686900ef53fd812e049d9df1f59997cf449a85081",
+    "agents/sdd-apply.md": "5e74256d56af1d5f99890e9c55f36239f2fbadd5b69e960a38cca6828a74eafb",
+    "agents/sdd-archive.md": "7ad865caf6a90a856b07f5d9b279a2ca6d13e2f5c804de9dc340296862b26869",
+    "agents/sdd-design.md": "143d37997b844a0dd9f8492878472026ecbf77f3961dce3454d91085f08ce5a3",
+    "agents/sdd-explore.md": "c1cffeca8bcf1c90537c537ac870f0da9101c0837606c231aa40585c8585e49d",
+    "agents/sdd-init.md": "cd1f88d78c97b4f3757589f5281baf9c6133604c1748dfa18c689c30da0f1f5a",
+    "agents/sdd-onboard.md": "4b179f360caa30a0dac82425ce75cd40da6cc9dd16a6152eb6aa2a6e6684f814",
+    "agents/sdd-proposal.md": "92500f275f0926b83e385ff0689e725b49fa03cc0630c582c63c81f1e429fc42",
+    "agents/sdd-spec.md": "18e9e33673f5ebb0a3830077204960e93f82ad28c566b44a343692d77af5ca33",
+    "agents/sdd-status.md": "0eb5be811512f7297ea6783915c7cda4cd14edb2a874b1d5d57cd55c3bacd4d6",
+    "agents/sdd-sync.md": "90d18cd53af48b3f654819768a12e81c41bd43e01fdc9595b5cbf9f553533b06",
+    "agents/sdd-tasks.md": "f22281433b80edf2079a6d8597bfb079bc442dbc42750aa46aef82e5818ffd2b",
+    "agents/sdd-verify.md": "8b58832fbf25489aae12034e9e8c4e64e7f38acdcbb610884841adb49a34ea60",
+    "chains/4r-review.chain.md": "659f08968bbf1e0293e794eebb3ed35d7e74c640ebd4f604f032f27463411cd3",
+    "chains/sdd-full.chain.md": "4af3ff8b5b1d4f17cdfbda26f150fc017f82aa7f43aa4db3a2eb4fd2fd20f81b",
+    "chains/sdd-plan.chain.md": "938c39f711539eae5b3f04c3aa031387ad420f7d7049906213a71c2e2704928c",
+    "chains/sdd-verify.chain.md": "48c3861eb5912631e54658281064c2c346b633fa36cf8d43cf862a1d5e56b40e",
+    "gentle-ai/support/sdd-status-contract.md": "b6796a3958e24f747446e9514a62bce1cbeab26a115e79f500eeb8fbdde5a1ae",
+    "gentle-ai/support/strict-tdd-verify.md": "becb50da4841aae5f6b157462efbfcd4f20332c0c054c82a55970450be8e649c",
+    "gentle-ai/support/strict-tdd.md": "2b0340bfa1160db7f609a4e1b6a24bbd3a1b1a8347b2b65d400865c104fdd237"
+  }
+}

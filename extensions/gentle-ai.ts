@@ -14,7 +14,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
 	ExtensionAPI,
@@ -2023,38 +2023,138 @@ async function handlePersonaCommand(ctx: ExtensionContext): Promise<void> {
  * Classifies a bash command string as a TriggerEvent for the review gate,
  * or returns null if the command is not a recognized git/gh workflow trigger.
  *
- * Regexes are tolerant of flags between tokens.
+ * Token parsing preserves supported Git global repository selectors.
  */
 export function classifyReviewEvent(command: string): TriggerEvent | null {
-	const trimmed = command.trim();
-	// gh pr create → pre-pr (check before generic push to avoid overlap)
-	if (/^gh\s+pr\s+create\b/.test(trimmed)) return "pre-pr";
-	// git commit → pre-commit
-	if (/^git(?:\s+(?:-C\s+\S+|--work-tree=\S+|--git-dir=\S+))?\s+commit\b/.test(trimmed))
-		return "pre-commit";
-	// git push → pre-push
-	if (/^git(?:\s+(?:-C\s+\S+|--work-tree=\S+|--git-dir=\S+))?\s+push\b/.test(trimmed))
-		return "pre-push";
-	return null;
+	return resolveReviewCollectionTarget(command, ".")?.event ?? null;
 }
 
 export interface ReviewCollectionTarget {
 	event: TriggerEvent;
 	cwd: string;
+	gitGlobalArgs: readonly string[];
+	includeAllTracked: boolean;
+}
+
+type ReviewDiffOptions = Pick<
+	ReviewCollectionTarget,
+	"gitGlobalArgs" | "includeAllTracked"
+>;
+
+function tokenizeReviewCommand(command: string): string[] | null {
+	const words: string[] = [];
+	let current = "";
+	let quote: "'" | '"' | undefined;
+	let escaping = false;
+	let started = false;
+	for (const character of command.trim()) {
+		if (escaping) {
+			current += character;
+			escaping = false;
+			started = true;
+			continue;
+		}
+		if (character === "\\" && quote !== "'") {
+			escaping = true;
+			started = true;
+			continue;
+		}
+		if (quote) {
+			if (character === quote) quote = undefined;
+			else current += character;
+			started = true;
+			continue;
+		}
+		if (character === "'" || character === '"') {
+			quote = character;
+			started = true;
+			continue;
+		}
+		if (/\s/.test(character)) {
+			if (started) {
+				words.push(current);
+				current = "";
+				started = false;
+			}
+			continue;
+		}
+		current += character;
+		started = true;
+	}
+	if (quote || escaping) return null;
+	if (started) words.push(current);
+	return words;
+}
+
+function commitIncludesAllTracked(args: readonly string[]): boolean {
+	for (let index = 0; index < args.length; index += 1) {
+		const arg = args[index];
+		if (arg === "--") return false;
+		if (arg === "--all") return true;
+		if (/^--(?:message|file|author|date|reuse-message|reedit-message|fixup|squash)=/.test(arg)) {
+			continue;
+		}
+		if (/^--(?:message|file|author|date|reuse-message|reedit-message|fixup|squash)$/.test(arg)) {
+			index += 1;
+			continue;
+		}
+		if (!arg.startsWith("-") || arg.startsWith("--")) continue;
+		for (const option of arg.slice(1)) {
+			if (option === "a") return true;
+			if (option === "m" || option === "F" || option === "C" || option === "c") break;
+		}
+		if (/^-[mFCc]$/.test(arg)) index += 1;
+	}
+	return false;
 }
 
 export function resolveReviewCollectionTarget(
 	command: string,
 	defaultCwd: string,
 ): ReviewCollectionTarget | null {
-	const event = classifyReviewEvent(command);
+	const words = tokenizeReviewCommand(command);
+	if (!words) return null;
+	if (words[0] === "gh" && words[1] === "pr" && words[2] === "create") {
+		return {
+			event: "pre-pr",
+			cwd: defaultCwd,
+			gitGlobalArgs: [],
+			includeAllTracked: false,
+		};
+	}
+	if (words[0] !== "git") return null;
+	const gitGlobalArgs: string[] = [];
+	let index = 1;
+	while (index < words.length) {
+		const option = words[index];
+		if (option === "-C" || option === "--git-dir" || option === "--work-tree") {
+			const value = words[index + 1];
+			if (value === undefined) return null;
+			gitGlobalArgs.push(option, value);
+			index += 2;
+			continue;
+		}
+		if (/^--(?:git-dir|work-tree)=.+/.test(option)) {
+			gitGlobalArgs.push(option);
+			index += 1;
+			continue;
+		}
+		break;
+	}
+	const subcommand = words[index];
+	const event: TriggerEvent | undefined =
+		subcommand === "commit"
+			? "pre-commit"
+			: subcommand === "push"
+				? "pre-push"
+				: undefined;
 	if (!event) return null;
-	const selectedRepository = command
-		.trim()
-		.match(/^git\s+-C\s+(\S+)\s+(?:commit|push)\b/)?.[1];
 	return {
 		event,
-		cwd: selectedRepository ? resolve(defaultCwd, selectedRepository) : defaultCwd,
+		cwd: defaultCwd,
+		gitGlobalArgs,
+		includeAllTracked:
+			event === "pre-commit" && commitIncludesAllTracked(words.slice(index + 1)),
 	};
 }
 
@@ -2066,6 +2166,7 @@ export interface ReviewDiffCollection {
 export type ReviewDiffCollector = (
 	event: TriggerEvent,
 	cwd: string,
+	options: ReviewDiffOptions,
 ) => ChangedDiff | null;
 
 export function collectReviewDiffForCommand(
@@ -2077,7 +2178,10 @@ export function collectReviewDiffForCommand(
 	if (!target) return null;
 	return {
 		event: target.event,
-		diff: collectDiff(target.event, target.cwd),
+		diff: collectDiff(target.event, target.cwd, {
+			gitGlobalArgs: target.gitGlobalArgs,
+			includeAllTracked: target.includeAllTracked,
+		}),
 	};
 }
 
@@ -2112,7 +2216,11 @@ export function parseNumstat(output: string): ChangedDiff {
  * Computes a ChangedDiff for the given event by running git numstat.
  * Returns null on any error (fail open — never break the user's git command).
  */
-function computeDiffForEvent(event: TriggerEvent, cwd: string): ChangedDiff | null {
+function computeDiffForEvent(
+	event: TriggerEvent,
+	cwd: string,
+	options: ReviewDiffOptions,
+): ChangedDiff | null {
 	const gitOpts = {
 		cwd,
 		encoding: "utf8" as const,
@@ -2121,16 +2229,22 @@ function computeDiffForEvent(event: TriggerEvent, cwd: string): ChangedDiff | nu
 		// The existing outer try/catch returns null (fail-open) when this throws.
 		timeout: 2000,
 	};
+	const git = (args: string[]): string =>
+		execFileSync("git", [...options.gitGlobalArgs, ...args], gitOpts);
 	try {
 		let raw: string;
 		if (event === "pre-commit") {
-			raw = execFileSync("git", ["diff", "--cached", "--numstat"], gitOpts);
+			raw = git(
+				options.includeAllTracked
+					? ["diff", "--numstat", "HEAD"]
+					: ["diff", "--cached", "--numstat"],
+			);
 		} else {
 			// pre-push or pre-pr: diff vs merge-base
 			let base = "";
 			for (const ref of ["origin/HEAD", "origin/main", "main"]) {
 				try {
-					base = execFileSync("git", ["merge-base", "HEAD", ref], gitOpts).trim();
+					base = git(["merge-base", "HEAD", ref]).trim();
 					if (base) break;
 				} catch {
 					// try next ref
@@ -2139,13 +2253,13 @@ function computeDiffForEvent(event: TriggerEvent, cwd: string): ChangedDiff | nu
 			if (!base) {
 				// Final fallback: cached diff
 				try {
-					raw = execFileSync("git", ["diff", "--cached", "--numstat"], gitOpts);
+					raw = git(["diff", "--cached", "--numstat"]);
 					return parseNumstat(raw);
 				} catch {
 					return null;
 				}
 			}
-			raw = execFileSync("git", ["diff", "--numstat", `${base}...HEAD`], gitOpts);
+			raw = git(["diff", "--numstat", `${base}...HEAD`]);
 		}
 		return parseNumstat(raw);
 	} catch {
@@ -2194,6 +2308,7 @@ export const __testing = {
 	buildGentlePrompt,
 	classifyReviewEvent,
 	collectReviewDiffForCommand,
+	computeDiffForEvent,
 	applyReviewAdvice,
 	parseNumstat,
 	resolveReviewCollectionTarget,
