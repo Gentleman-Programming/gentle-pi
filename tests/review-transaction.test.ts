@@ -34,6 +34,10 @@ import {
 	type ReviewBudgetV1,
 } from "../lib/review-transaction.ts";
 import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
+import {
+	ordinaryValidatorRequest,
+	recordOrdinaryValidation,
+} from "../lib/review-policy-ordinary.ts";
 import { testSnapshot } from "./review-test-fixtures.ts";
 
 const TREE = {
@@ -376,4 +380,57 @@ test("repository authority fails closed until Git has stable root commit anchors
 		execFileSync("git", args, { cwd: repository, encoding: "utf8" }).trim();
 	git("init", "-b", "main");
 	assert.throws(() => ReviewTransactionStore.forRepository(repository), /root commit anchors/i);
+});
+
+test("ordinary follow-ups are ID-sorted action-free validation evidence and do not change lifecycle authority", () => {
+	const fixed = {
+		...state(),
+		frozen_ledger: createFrozenLedger([frozenRows()[0]!]),
+		phase: REVIEW_PHASE.FIX_COMPLETE,
+		fix_record: {
+			candidate_tree: TREE.FINAL,
+			fixed_ids: ["RISK-002"],
+			fix_diff: "bounded fix",
+			fix_diff_hash: canonicalHash("bounded fix"),
+			changed_paths: ["src/auth.ts"],
+		},
+	};
+	const request = ordinaryValidatorRequest(fixed, {
+		originalAcceptanceTests: { passed: true, evidenceHash: "a".repeat(64) },
+		correctionRegressions: [{ findingId: "RISK-002", evidenceHash: "b".repeat(64), passed: true }],
+		originalCriterionRegressions: [],
+		followUps: [
+			{ id: "LATE-002", location: "docs/readme.md:2", summary: "Document later observation", evidenceHash: "c".repeat(64) },
+			{ id: "LATE-001", location: "docs/readme.md:1", summary: "Keep as a future note", evidenceHash: "d".repeat(64) },
+		],
+	});
+	const recorded = recordOrdinaryValidation(fixed, {
+		request,
+		results: [{ id: "RISK-002", outcome: "verified" }],
+	});
+	assert.deepEqual(recorded.validation_evidence?.follow_ups.map(({ id }) => id), ["LATE-001", "LATE-002"]);
+	assert.equal(recorded.phase, REVIEW_PHASE.FINAL_VERIFICATION);
+	assert.equal(recorded.counters.validator_runs, fixed.counters.validator_runs + 1);
+	assert.equal(recorded.current_candidate_tree, fixed.current_candidate_tree);
+	assert.equal(recorded.follow_ups, undefined);
+});
+
+test("new ordinary lineages fail closed when immutable genesis paths are absent", () => {
+	const snapshot = testSnapshot({
+		baseTree: TREE.BASE,
+		completeTree: TREE.COMPLETE,
+		route: REVIEW_ROUTE.STANDARD,
+		lenses: [REVIEW_LENS.RISK],
+	});
+	delete snapshot.genesis_paths;
+	assert.throws(
+		() => createReviewState({
+			lineageId: "missing-genesis",
+			mode: REVIEW_MODE.ORDINARY,
+			snapshot,
+			evidenceHash: "b".repeat(64),
+			budget: budget(),
+		}),
+		/immutable genesis paths/i,
+	);
 });

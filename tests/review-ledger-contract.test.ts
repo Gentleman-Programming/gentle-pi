@@ -20,6 +20,7 @@ const JD_SKILL = "skills/judgment-day/SKILL.md";
 const JD_PROMPTS = "skills/judgment-day/references/prompts-and-formats.md";
 const GENTLE_SKILL = "skills/gentle-ai/SKILL.md";
 const README = "README.md";
+const ORDINARY_SURFACES = [VALIDATOR, CANONICAL, "assets/orchestrator-delegation.md", GENTLE_SKILL, README] as const;
 const CHAIN = "assets/chains/4r-review.chain.md";
 const SDD_WORKFLOW = "assets/sdd-orchestrator-workflow.md";
 const RELEASE_SKILL = "skills/release/SKILL.md";
@@ -69,7 +70,8 @@ const ORDINARY_CLAUSES = [
 	"All inferential-severe rows may go once to at most one read-only refuter as one complete list.",
 	"Invalid, missing, duplicate, unknown, or inconclusive refuter output escalates without a replacement refuter.",
 	"Ordinary permits at most one fix batch.",
-	"After a fix, exactly one validator receives only requested frozen IDs, their exact hash-bound rows, and the fix diff.",
+	"After a fix, exactly one validator consumes only requested frozen IDs, their exact hash-bound rows, original acceptance-test proof, one passed correction-regression proof per ID, original-criterion regressions, and inert follow-ups.",
+	"The validator consumes proof only; it does not inspect a fix diff, candidate tree, changed paths or lines, discover, or re-review.",
 	"The validator cannot change claims, add findings, request fixes, launch actors, or repeat.",
 	"A no-fix path runs zero validators; both paths run exactly one final verification.",
 	"Ordinary ends only as `approved` or `escalated`.",
@@ -117,9 +119,16 @@ const REFUTER_CLAUSES = [
 ] as const;
 
 const VALIDATOR_CLAUSES = [
-	"Receive only requested frozen IDs, their exact hash-bound rows, and the fix diff.",
-	"Resolve only supplied IDs and report fix-line regressions; never add findings or change frozen claims.",
+	"Receive only requested frozen IDs, their exact hash-bound rows, original acceptance-test proof, one passed correction-regression proof per ID, original-criterion regressions, and inert follow-ups.",
+	"Consume proof for supplied IDs only; never inspect a fix diff, candidate tree, changed paths or lines, discover, re-review, add findings, or change frozen claims.",
 	"Do not request another fix, launch actors, persist authority, or repeat.",
+] as const;
+
+const ORDINARY_OBSOLETE = [
+	"scoped validator",
+	"and the fix diff",
+	"report fix-line regressions",
+	"lines changed by the supplied fix diff",
 ] as const;
 
 const FIX_CLAUSES = [
@@ -185,6 +194,15 @@ test("fix agent and validator contracts cannot create work or repeat", () => {
 	assertAll(VALIDATOR, read(VALIDATOR), VALIDATOR_CLAUSES);
 	assertAll(CANONICAL, read(CANONICAL), VALIDATOR_CLAUSES);
 	assertAll(JD_SKILL, read(JD_SKILL), FIX_CLAUSES);
+});
+
+test("ordinary contract surfaces prohibit fix-line review and preserve Judgment Day scoped re-judgment", () => {
+	for (const path of ORDINARY_SURFACES) {
+		const content = read(path);
+		assertAll(path, content, path === VALIDATOR ? VALIDATOR_CLAUSES : ORDINARY_CLAUSES);
+		assertNone(path, content, ORDINARY_OBSOLETE);
+	}
+	for (const path of JUDGES) assertAll(path, read(path), JUDGMENT_DAY_REJUDGMENT_CLAUSES);
 });
 
 test("Judgment Day skill and copy-paste prompts preserve explicit bounded authority", () => {

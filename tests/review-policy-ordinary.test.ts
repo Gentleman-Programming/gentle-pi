@@ -100,6 +100,15 @@ function rows(): CanonicalFrozenRowV1[] {
 	];
 }
 
+function validationProof(ids: readonly string[]) {
+	return {
+		originalAcceptanceTests: { passed: true, evidenceHash: "a".repeat(64) },
+		correctionRegressions: ids.map((findingId) => ({ findingId, evidenceHash: "b".repeat(64), passed: true })),
+		originalCriterionRegressions: [],
+		followUps: [],
+	};
+}
+
 test("ordinary discovery runs the selected zero, one, or four lenses exactly once", () => {
 	for (const selected of [
 		{ route: REVIEW_ROUTE.TRIVIAL, lenses: [] },
@@ -170,7 +179,7 @@ test("no-finding ordinary path runs zero refuters, fixes, and validators then ve
 	);
 });
 
-test("ordinary uses at most one complete-list refuter, one fix, one scoped validator, and one final verification", () => {
+test("ordinary uses at most one complete-list refuter, one fix, one targeted validator, and one final verification", () => {
 	const discovered = recordOrdinaryDiscovery(ordinaryState(), { rows: rows() });
 	const frozenHash = discovered.frozen_ledger!.frozen_ledger_hash;
 	const resolved = resolveOrdinaryEvidence(discovered, {
@@ -189,6 +198,7 @@ test("ordinary uses at most one complete-list refuter, one fix, one scoped valid
 		candidateTree: TREE.FIXED,
 		fixedIds: ["RISK-001"],
 		fixDiff: "diff --git a/src/auth.ts b/src/auth.ts\n",
+		changedPaths: ["src/auth.ts"],
 	});
 	assert.equal(fixed.counters.fix_batches, 1);
 	assert.equal(fixed.current_candidate_tree, TREE.FIXED);
@@ -202,10 +212,11 @@ test("ordinary uses at most one complete-list refuter, one fix, one scoped valid
 		/fix.*only.*refutation/i,
 	);
 
-	const request = ordinaryValidatorRequest(fixed);
+	const request = ordinaryValidatorRequest(fixed, validationProof(["RISK-001"]));
 	assert.deepEqual(request.requested_ids, ["RISK-001"]);
 	assert.equal(request.frozen_ledger_hash, frozenHash);
-	assert.equal(request.fix_diff, "diff --git a/src/auth.ts b/src/auth.ts\n");
+	assert.equal("fix_diff" in request, false);
+	assert.equal("candidate_tree" in request, false);
 	assert.deepEqual(request.frozen_rows, [
 		discovered.frozen_ledger!.rows.find(({ id }) => id === "RISK-001")!,
 	]);
@@ -300,8 +311,9 @@ test("validator cannot alter frozen claims, add findings, repeat, or hide regres
 		candidateTree: TREE.FIXED,
 		fixedIds: ["RISK-001"],
 		fixDiff: "bounded fix",
+		changedPaths: ["src/auth.ts"],
 	});
-	const request = ordinaryValidatorRequest(fixed);
+	const request = ordinaryValidatorRequest(fixed, validationProof(["RISK-001"]));
 	const altered = structuredClone(request);
 	altered.frozen_rows[0]!.evidence_claim = "validator rewrote the claim";
 	assert.throws(
@@ -363,4 +375,145 @@ test("failed final verification escalates and ordinary rejects Judgment Day stat
 		() => recordOrdinaryDiscovery(wrongMode, { rows: [] }),
 		/ordinary reducer.*ordinary mode/i,
 	);
+});
+
+test("ordinary fixes require exact genesis-scoped IDs and targeted validation evidence", () => {
+	const discovered = recordOrdinaryDiscovery(ordinaryState(), { rows: rows() });
+	const resolved = resolveOrdinaryEvidence(discovered, {
+		deterministicResults: [{ id: "RISK-001", outcome: RESOLUTION_OUTCOME.CORROBORATED }],
+		refuterResults: [{ id: "RELY-002", outcome: RESOLUTION_OUTCOME.REFUTED }],
+	});
+	assert.throws(() => applyOrdinaryFix(resolved, {
+		candidateTree: TREE.FIXED,
+		fixedIds: ["RISK-001", "EXTRA-999"],
+		fixDiff: "bounded fix",
+		changedPaths: ["outside.ts"],
+	}), /every corroborated|genesis/i);
+	const fixed = applyOrdinaryFix(resolved, {
+		candidateTree: TREE.FIXED,
+		fixedIds: ["RISK-001"],
+		fixDiff: "bounded fix",
+		changedPaths: ["src/auth.ts"],
+	});
+	const request = ordinaryValidatorRequest(fixed, validationProof(["RISK-001"]));
+	assert.throws(() => recordOrdinaryValidation(fixed, {
+		results: [{ id: "RISK-001", outcome: RESOLUTION_OUTCOME.VERIFIED }],
+		request: ordinaryValidatorRequest(fixed, {
+			...validationProof(["RISK-001"]),
+			originalAcceptanceTests: { passed: false, evidenceHash: "a".repeat(64) },
+		}),
+	}), /original acceptance/i);
+	const validated = recordOrdinaryValidation(fixed, {
+		results: [{ id: "RISK-001", outcome: RESOLUTION_OUTCOME.VERIFIED }],
+		request: ordinaryValidatorRequest(fixed, {
+			...validationProof(["RISK-001"]),
+			originalCriterionRegressions: ["baseline regression"],
+		}),
+	});
+	assert.equal(recordOrdinaryFinalVerification(validated, { passed: true }).terminal_state, TERMINAL_STATE.ESCALATED);
+});
+
+test("ordinary fixes reject omitted and extra frozen IDs independently of path scope", () => {
+	const discovered = recordOrdinaryDiscovery(ordinaryState(), { rows: rows() });
+	const resolved = resolveOrdinaryEvidence(discovered, {
+		deterministicResults: [{ id: "RISK-001", outcome: RESOLUTION_OUTCOME.CORROBORATED }],
+		refuterResults: [{ id: "RELY-002", outcome: RESOLUTION_OUTCOME.CORROBORATED }],
+	});
+	const common = {
+		candidateTree: TREE.FIXED,
+		fixDiff: "bounded fix",
+		changedPaths: ["src/auth.ts", "src/retry.ts"],
+	};
+	assert.throws(
+		() => applyOrdinaryFix(resolved, { ...common, fixedIds: ["RISK-001"] }),
+		/every corroborated severe finding/i,
+	);
+	assert.throws(
+		() => applyOrdinaryFix(resolved, { ...common, fixedIds: ["RISK-001", "RELY-002", "EXTRA-999"] }),
+		/every corroborated severe finding/i,
+	);
+});
+
+test("targeted validation requires one passing regression proof for every frozen ID", () => {
+	const discovered = recordOrdinaryDiscovery(ordinaryState(), { rows: rows() });
+	const resolved = resolveOrdinaryEvidence(discovered, {
+		deterministicResults: [{ id: "RISK-001", outcome: RESOLUTION_OUTCOME.CORROBORATED }],
+		refuterResults: [{ id: "RELY-002", outcome: RESOLUTION_OUTCOME.REFUTED }],
+	});
+	const fixed = applyOrdinaryFix(resolved, {
+		candidateTree: TREE.FIXED,
+		fixedIds: ["RISK-001"],
+		fixDiff: "bounded fix",
+		changedPaths: ["src/auth.ts"],
+	});
+	const record = (proof: ReturnType<typeof validationProof>) =>
+		recordOrdinaryValidation(fixed, {
+			request: ordinaryValidatorRequest(fixed, proof),
+			results: [{ id: "RISK-001", outcome: RESOLUTION_OUTCOME.VERIFIED }],
+		});
+	assert.throws(
+		() => record(validationProof([])),
+		/Correction regressions must pass once for every frozen finding ID/,
+	);
+	assert.throws(
+		() => record({
+			...validationProof(["RISK-001"]),
+			correctionRegressions: [
+				...validationProof(["RISK-001"]).correctionRegressions,
+				...validationProof(["RISK-001"]).correctionRegressions,
+			],
+		}),
+		/Correction regressions must pass once for every frozen finding ID/,
+	);
+	assert.throws(
+		() => record({
+			...validationProof(["RISK-001"]),
+			correctionRegressions: [{ findingId: "RISK-001", evidenceHash: "b".repeat(64), passed: false }],
+		}),
+		/Correction regressions must pass once for every frozen finding ID/,
+	);
+});
+
+test("targeted validation rejects action-bearing follow-ups and preserves sorted inert records", () => {
+	const discovered = recordOrdinaryDiscovery(ordinaryState(), { rows: rows() });
+	const resolved = resolveOrdinaryEvidence(discovered, {
+		deterministicResults: [{ id: "RISK-001", outcome: RESOLUTION_OUTCOME.CORROBORATED }],
+		refuterResults: [{ id: "RELY-002", outcome: RESOLUTION_OUTCOME.REFUTED }],
+	});
+	const fixed = applyOrdinaryFix(resolved, {
+		candidateTree: TREE.FIXED,
+		fixedIds: ["RISK-001"],
+		fixDiff: "bounded fix",
+		changedPaths: ["src/auth.ts"],
+	});
+	for (const actionField of [
+		{ requestedPath: "outside.ts" },
+		{ correctionId: "EXTRA-999" },
+		{ action: "schedule-correction" },
+	]) {
+		assert.throws(
+			() => ordinaryValidatorRequest(fixed, {
+				...validationProof(["RISK-001"]),
+				followUps: [{
+					id: "FOLLOW-001",
+					location: "src/auth.ts:1",
+					summary: "Inert observation.",
+					evidenceHash: "c".repeat(64),
+					...actionField,
+				} as never],
+			}),
+			/Follow-up contains an action-bearing field/i,
+		);
+	}
+	const request = ordinaryValidatorRequest(fixed, {
+		...validationProof(["RISK-001"]),
+		followUps: [
+			{ id: "FOLLOW-002", location: "src/retry.ts:2", summary: "Second inert observation.", evidenceHash: "d".repeat(64) },
+			{ id: "FOLLOW-001", location: "src/auth.ts:1", summary: "First inert observation.", evidenceHash: "c".repeat(64) },
+		],
+	});
+	assert.deepEqual(request.follow_ups, [
+		{ id: "FOLLOW-001", location: "src/auth.ts:1", summary: "First inert observation.", evidence_hash: "c".repeat(64) },
+		{ id: "FOLLOW-002", location: "src/retry.ts:2", summary: "Second inert observation.", evidence_hash: "d".repeat(64) },
+	]);
 });

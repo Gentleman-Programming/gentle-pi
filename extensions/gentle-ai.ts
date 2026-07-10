@@ -75,6 +75,7 @@ import {
 	REVIEW_MODE,
 	REVIEW_PROJECTION,
 	captureReviewSnapshot,
+	captureOrdinaryCorrectionSnapshot,
 	type ReviewMode,
 	type ReviewProjectionV1,
 } from "../lib/review-snapshot.ts";
@@ -2997,13 +2998,37 @@ function executeReviewControllerOperation(
 		if (hasInput === hasInputPath) {
 			throw new Error("Review controller advance requires exactly one of input or inputPath");
 		}
-		const input = parseControllerJson(
+		const rawInput = parseControllerJson(
 			hasInput
 				? requiredControllerString(parameters, "input")
 				: readRepositoryControllerInput(requiredControllerString(parameters, "inputPath"), defaultCwd),
 			REVIEW_CONTROLLER_OPERATION.ADVANCE,
-		) as unknown as ReviewReducerInput;
+		);
 		const store = ReviewTransactionStore.forRepository(defaultCwd);
+		let input = rawInput as unknown as ReviewReducerInput;
+		if (transitionValue === REVIEW_TRANSITION.ORDINARY_FIX) {
+			if (typeof rawInput.candidateTree !== "string" || !Array.isArray(rawInput.fixedIds) || rawInput.fixedIds.some((id) => typeof id !== "string")) {
+				throw new Error("Git-derived correction evidence requires candidateTree and fixedIds");
+			}
+			try {
+				const state = store.read(parameters.lineageId);
+				const correction = captureOrdinaryCorrectionSnapshot({
+					mode: state.mode,
+					genesis_paths: state.genesis_paths,
+					repository_root: defaultCwd,
+					initial_review_tree: state.initial_review_tree,
+					object_store: state.snapshot_object_store!,
+				}, rawInput.candidateTree);
+				input = {
+					candidateTree: correction.candidate_tree,
+					fixedIds: rawInput.fixedIds,
+					fixDiff: correction.fix_diff,
+					changedPaths: correction.changed_paths,
+				};
+			} catch (error) {
+				throw new Error(`Git-derived correction evidence could not be captured: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
 		const result = store.runReducerOperation({
 			lineageId: parameters.lineageId,
 			transition: transitionValue,

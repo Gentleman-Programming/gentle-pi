@@ -12,6 +12,8 @@ import {
 	type ResolutionOutcome,
 	type ReviewCountersV1,
 	type ReviewStateV1,
+	type ValidationEvidenceV1,
+	type FollowUpObservationV1,
 } from "./review-transaction.ts";
 import {
 	FULL_4R_LENSES,
@@ -39,20 +41,36 @@ export interface OrdinaryFixInput {
 	candidateTree: string;
 	fixedIds: readonly string[];
 	fixDiff: string;
+	changedPaths?: readonly string[];
 }
 
 export interface OrdinaryValidatorRequestV1 {
 	requested_ids: string[];
 	frozen_rows: CanonicalFrozenRowV1[];
 	frozen_ledger_hash: string;
-	fix_diff: string;
-	fix_diff_hash: string;
-	candidate_tree: string;
+	original_acceptance_tests: { passed: boolean; evidence_hash: string };
+	correction_regressions: Array<{ finding_id: string; evidence_hash: string; passed: boolean }>;
+	original_criterion_regressions: string[];
+	follow_ups: FollowUpObservationV1[];
 }
 
 export interface OrdinaryValidationInput {
 	request: OrdinaryValidatorRequestV1;
 	results: readonly FindingResolutionInput[];
+}
+
+export interface OrdinaryFollowUpInput {
+	id: string;
+	location: string;
+	summary: string;
+	evidenceHash: string;
+}
+
+export interface OrdinaryValidationProofInput {
+	originalAcceptanceTests: { passed: boolean; evidenceHash: string };
+	correctionRegressions: readonly { findingId: string; evidenceHash: string; passed: boolean }[];
+	originalCriterionRegressions: readonly string[];
+	followUps: readonly OrdinaryFollowUpInput[];
 }
 
 export interface OrdinaryFinalVerificationInput {
@@ -282,6 +300,11 @@ export function applyOrdinaryFix(
 	}
 	if (!OBJECT_ID.test(input.candidateTree)) throw new Error("Fix candidate tree must be resolved");
 	if (input.fixDiff.length === 0) throw new Error("Ordinary fix must bind a non-empty fix diff");
+	if (!input.changedPaths) throw new Error("Ordinary fix requires Git-derived correction paths");
+	const changedPaths = [...new Set(input.changedPaths)].toSorted();
+	if (canonicalHash(changedPaths) !== canonicalHash(input.changedPaths) || !state.genesis_paths || changedPaths.some((path) => !state.genesis_paths!.includes(path))) {
+		throw new Error("Ordinary fix touches a non-genesis path");
+	}
 	const requiredIds = corroboratedFindingIds(state);
 	const fixedIds = [...new Set(input.fixedIds)].toSorted();
 	if (canonicalHash(requiredIds) !== canonicalHash(fixedIds)) {
@@ -295,6 +318,7 @@ export function applyOrdinaryFix(
 		fixed_ids: fixedIds,
 		fix_diff: input.fixDiff,
 		fix_diff_hash: canonicalHash(input.fixDiff),
+		changed_paths: changedPaths,
 	};
 	next.phase = REVIEW_PHASE.FIX_COMPLETE;
 	return next;
@@ -319,12 +343,13 @@ export function declineOrdinaryFix(
 
 export function ordinaryValidatorRequest(
 	state: ReviewStateV1,
+	proof: OrdinaryValidationProofInput,
 ): OrdinaryValidatorRequestV1 {
 	assertOrdinaryMode(state);
 	if (state.phase !== REVIEW_PHASE.FIX_COMPLETE || !state.fix_record) {
-		throw new Error("An ordinary fix is required before scoped validation");
+		throw new Error("An ordinary fix is required before targeted validation");
 	}
-	if (!state.frozen_ledger) throw new Error("Scoped validation requires a frozen ledger");
+	if (!state.frozen_ledger) throw new Error("Targeted validation requires a frozen ledger");
 	const requestedIds = [...state.fix_record.fixed_ids];
 	const requested = new Set(requestedIds);
 	const frozenRows = state.frozen_ledger.rows.filter(({ id }) => requested.has(id));
@@ -335,9 +360,17 @@ export function ordinaryValidatorRequest(
 		requested_ids: requestedIds,
 		frozen_rows: structuredClone(frozenRows),
 		frozen_ledger_hash: state.frozen_ledger.frozen_ledger_hash,
-		fix_diff: state.fix_record.fix_diff,
-		fix_diff_hash: state.fix_record.fix_diff_hash,
-		candidate_tree: state.fix_record.candidate_tree,
+		original_acceptance_tests: {
+			passed: proof.originalAcceptanceTests.passed,
+			evidence_hash: proof.originalAcceptanceTests.evidenceHash,
+		},
+		correction_regressions: proof.correctionRegressions.map((regression) => ({
+			finding_id: regression.findingId,
+			evidence_hash: regression.evidenceHash,
+			passed: regression.passed,
+		})).toSorted((left, right) => left.finding_id.localeCompare(right.finding_id)),
+		original_criterion_regressions: [...proof.originalCriterionRegressions],
+		follow_ups: normalizeFollowUps(proof.followUps),
 	};
 }
 
@@ -349,11 +382,49 @@ export function recordOrdinaryValidation(
 	if (state.phase !== REVIEW_PHASE.FIX_COMPLETE) {
 		throw new Error("Ordinary validation is allowed only after a fix");
 	}
-	const expected = ordinaryValidatorRequest(state);
+	if (
+		typeof input.request !== "object" || input.request === null ||
+		typeof input.request.original_acceptance_tests !== "object" || input.request.original_acceptance_tests === null ||
+		!Array.isArray(input.request.correction_regressions) ||
+		!Array.isArray(input.request.original_criterion_regressions) ||
+		!Array.isArray(input.request.follow_ups)
+	) {
+		throw new Error("Validator request must preserve the exact frozen scope");
+	}
+	const expected = ordinaryValidatorRequest(state, {
+		originalAcceptanceTests: {
+			passed: input.request.original_acceptance_tests.passed,
+			evidenceHash: input.request.original_acceptance_tests.evidence_hash,
+		},
+		correctionRegressions: input.request.correction_regressions.map((regression) => ({
+			findingId: regression.finding_id,
+			evidenceHash: regression.evidence_hash,
+			passed: regression.passed,
+		})),
+		originalCriterionRegressions: input.request.original_criterion_regressions,
+		followUps: input.request.follow_ups.map((followUp) => ({
+			id: followUp.id,
+			location: followUp.location,
+			summary: followUp.summary,
+			evidenceHash: followUp.evidence_hash,
+		})),
+	});
 	if (canonicalHash(input.request) !== canonicalHash(expected)) {
 		throw new Error("Validator request must preserve the exact frozen scope");
 	}
+	if (!input.request.original_acceptance_tests.passed) throw new Error("Original acceptance tests must pass before validation");
+	const evidence: ValidationEvidenceV1 = {
+		original_acceptance_tests: structuredClone(input.request.original_acceptance_tests),
+		correction_regressions: structuredClone(input.request.correction_regressions),
+		original_criterion_regressions: [...input.request.original_criterion_regressions],
+		follow_ups: structuredClone(input.request.follow_ups),
+	};
+	const regressionIds = evidence.correction_regressions.map(({ finding_id }) => finding_id);
+	if (canonicalHash(regressionIds) !== canonicalHash(expected.requested_ids) || evidence.correction_regressions.some((regression) => !regression.passed)) {
+		throw new Error("Correction regressions must pass once for every frozen finding ID");
+	}
 	const next = cloneState(state);
+	next.validation_evidence = evidence;
 	increment(next, "validator_runs");
 	const expectedIds = new Set(expected.requested_ids);
 	const seen = new Set<string>();
@@ -391,8 +462,32 @@ export function recordOrdinaryValidation(
 	}
 	next.resolutions = [...(next.resolutions ?? []), ...resolutions];
 	appendReasons(next, reasons);
+	appendReasons(next, evidence.original_criterion_regressions.map((reason) => `Original-criterion regression: ${reason}`));
 	next.phase = REVIEW_PHASE.FINAL_VERIFICATION;
 	return next;
+}
+
+function normalizeFollowUps(input: readonly OrdinaryFollowUpInput[]): FollowUpObservationV1[] {
+	const allowedFields = new Set(["id", "location", "summary", "evidenceHash"]);
+	for (const followUp of input) {
+		if (typeof followUp !== "object" || followUp === null || Array.isArray(followUp)) {
+			throw new Error("Follow-up must be an inert record");
+		}
+		const unexpectedField = Object.keys(followUp).find((field) => !allowedFields.has(field));
+		if (unexpectedField) {
+			throw new Error(`Follow-up contains an action-bearing field: ${unexpectedField}`);
+		}
+	}
+	const followUps = input.map(({ id, location, summary, evidenceHash }) => ({
+		id,
+		location,
+		summary,
+		evidence_hash: evidenceHash,
+	})).toSorted((left, right) => left.id.localeCompare(right.id));
+	if (new Set(followUps.map(({ id }) => id)).size !== followUps.length) {
+		throw new Error("Follow-up IDs must be unique");
+	}
+	return followUps;
 }
 
 export function recordOrdinaryFinalVerification(

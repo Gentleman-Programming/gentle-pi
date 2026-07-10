@@ -132,7 +132,7 @@ The goal is not ceremony. The goal is to avoid accidental chaos. Once a task sto
 The intended balanced loop for a bounded bugfix is:
 
 ```text
-parent git/status + clarify → bind ordinary snapshot/route → one worker writes authorized fixes → scoped validator when required → final verification
+parent git/status + clarify → bind ordinary snapshot/route → one worker writes authorized fixes → targeted proof validation when required → final verification
 ```
 
 Review lenses are controller-selected transaction actors, not lifecycle hooks. `scout`/`context-builder` save parent context by compressing broad exploration. `worker` preserves a single writer thread. Commit, push, PR, and release validate receipts with zero actors.
@@ -171,7 +171,9 @@ Invalid, missing, duplicate, unknown, or inconclusive refuter output escalates w
 
 Ordinary permits at most one fix batch.
 
-After a fix, exactly one validator receives only requested frozen IDs, their exact hash-bound rows, and the fix diff.
+After a fix, exactly one validator consumes only requested frozen IDs, their exact hash-bound rows, original acceptance-test proof, one passed correction-regression proof per ID, original-criterion regressions, and inert follow-ups.
+
+The validator consumes proof only; it does not inspect a fix diff, candidate tree, changed paths or lines, discover, or re-review.
 
 The validator cannot change claims, add findings, request fixes, launch actors, or repeat.
 

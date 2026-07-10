@@ -68,7 +68,7 @@ Only pass `model` for generic subagents when the user explicitly requests a mode
 Default balanced pattern for bounded implementation:
 
 ```text
-parent clarifies and checks git → ordinary controller binds a snapshot/route → one worker writes when authorized → scoped validator if a fix ran → final verification
+parent clarifies and checks git → ordinary controller binds a snapshot/route → one worker writes when authorized → targeted proof validation if a fix ran → final verification
 ```
 
 Do not make every task SDD. Do make non-trivial tasks multi-agent at the narrowest useful point.
@@ -134,7 +134,7 @@ Prefer delegation when fresh context improves correctness more than token saving
 Bugfix with unfamiliar flow:
 
 ```text
-parent git/status + clarify → scout maps flow/files → controller binds ordinary snapshot/route → worker implements authorized fixes + tests → scoped validator if required → final verification
+parent git/status + clarify → scout maps flow/files → controller binds ordinary snapshot/route → worker implements authorized fixes + tests → targeted proof validation if required → final verification
 ```
 
 Conflict or dependency-marker cleanup:
@@ -181,7 +181,9 @@ Invalid, missing, duplicate, unknown, or inconclusive refuter output escalates w
 
 Ordinary permits at most one fix batch.
 
-After a fix, exactly one validator receives only requested frozen IDs, their exact hash-bound rows, and the fix diff.
+After a fix, exactly one validator consumes only requested frozen IDs, their exact hash-bound rows, original acceptance-test proof, one passed correction-regression proof per ID, original-criterion regressions, and inert follow-ups.
+
+The validator consumes proof only; it does not inspect a fix diff, candidate tree, changed paths or lines, discover, or re-review.
 
 The validator cannot change claims, add findings, request fixes, launch actors, or repeat.
 

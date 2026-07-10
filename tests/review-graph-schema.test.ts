@@ -85,3 +85,16 @@ test("event schema commits a canonical reducer transition and input", () => {
 		reduced_state_hash: stateHash,
 	} as never), /transition/i);
 });
+
+test("graph-v1 rejects the discarded ordinary follow-up lifecycle transition", () => {
+	assert.throws(() => createReviewEventV1({
+		lineage_id: "lineage-a",
+		sequence: 1,
+		predecessor_event_id: "b".repeat(64),
+		kind: "operation-completed",
+		reducer_transition: "ordinary-follow-up",
+		reducer_input: { followUp: "documentation only" },
+		payload: {},
+		reduced_state_hash: stateHash,
+	} as never), /transition/i);
+});

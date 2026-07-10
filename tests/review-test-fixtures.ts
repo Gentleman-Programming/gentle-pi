@@ -34,6 +34,7 @@ export interface TestSnapshotOptions {
 	baseTree: string;
 	completeTree: string;
 	initialTree?: string;
+	genesisPaths?: string[];
 	route?: ReviewRoute;
 	lenses?: readonly ReviewLens[];
 	policyHash?: string;
@@ -55,6 +56,7 @@ export function testSnapshot(options: TestSnapshotOptions): SnapshotV1 {
 				? { kind: REVIEW_PROJECTION.COMPLETE }
 				: { kind: REVIEW_PROJECTION.INTENDED_COMMIT, tree: initialTree },
 		initial_review_tree: initialTree,
+		genesis_paths: options.genesisPaths ?? ["app.ts", "src/auth.ts", "src/retry.ts", "src/review.ts"],
 		diff_evidence: {
 			event: REVIEW_EVENT.ORDINARY_START,
 			changedLines: route === REVIEW_ROUTE.FULL_4R ? 401 : route === REVIEW_ROUTE.TRIVIAL ? 1 : 10,

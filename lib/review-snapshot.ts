@@ -81,6 +81,7 @@ export interface SnapshotV1 {
 	complete_snapshot_tree: string;
 	review_projection: ReviewProjectionV1;
 	initial_review_tree: string;
+	genesis_paths?: string[];
 	diff_evidence: DiffEvidence;
 	route: ReviewRoute;
 	lenses: readonly ReviewLens[];
@@ -109,10 +110,18 @@ interface SnapshotIdentityV1 {
 	complete_snapshot_tree: string;
 	review_projection: ReviewProjectionV1;
 	initial_review_tree: string;
+	genesis_paths: string[];
 	diff_evidence: DiffEvidence;
 	route: ReviewRoute;
 	lenses: readonly ReviewLens[];
 	policy_hash: string;
+}
+
+export interface CorrectionSnapshotV1 {
+	candidate_tree: string;
+	changed_paths: string[];
+	fix_diff: string;
+	fix_diff_hash: string;
 }
 
 const OBJECT_ID = /^[0-9a-f]{40,64}$/;
@@ -194,6 +203,20 @@ function parseNumstat(value: string): { changedPaths: string[]; changedLines: nu
 	return { changedPaths, changedLines };
 }
 
+function canonicalPaths(value: string): string[] {
+	const paths = value.split("\0").filter(Boolean);
+	for (const path of paths) {
+		if (path.startsWith("/") || path.split("/").some((part) => part === "" || part === "." || part === "..")) {
+			throw new Error("Git returned a non-canonical repository-relative path");
+		}
+	}
+	return [...new Set(paths)].toSorted();
+}
+
+function canonicalStringHash(value: string): string {
+	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
 function snapshotId(identity: SnapshotIdentityV1): string {
 	return createHash("sha256").update(JSON.stringify(identity)).digest("hex");
 }
@@ -211,6 +234,7 @@ function assertExistingSnapshotMatches(
 		complete_snapshot_tree: existing.complete_snapshot_tree,
 		review_projection: existing.review_projection,
 		initial_review_tree: existing.initial_review_tree,
+		genesis_paths: existing.genesis_paths ?? [],
 		diff_evidence: existing.diff_evidence,
 		route: existing.route,
 		lenses: existing.lenses,
@@ -220,6 +244,37 @@ function assertExistingSnapshotMatches(
 		throw new Error("Existing review snapshot metadata does not match its identity");
 	}
 	return existing;
+}
+
+export function captureOrdinaryCorrectionSnapshot(
+	snapshot: Pick<SnapshotV1, "mode" | "genesis_paths" | "repository_root" | "initial_review_tree" | "object_store">,
+	candidateTree: string,
+): CorrectionSnapshotV1 {
+	if (snapshot.mode !== REVIEW_MODE.ORDINARY || snapshot.genesis_paths === undefined) {
+		throw new Error("Ordinary correction requires immutable genesis paths");
+	}
+	const root = repositoryRoot(snapshot.repository_root);
+	const candidate = resolveTree(root, candidateTree);
+	const environment: GitEnvironment = {
+		alternateObjectDirectory: `${snapshot.object_store.object_directory}:${snapshot.object_store.alternate_object_directory}`,
+	};
+	const changedPaths = canonicalPaths(runGit(root, [
+		"diff", "--no-renames", "--name-only", "-z", snapshot.initial_review_tree, candidate,
+	], environment));
+	const genesis = new Set(snapshot.genesis_paths);
+	if (changedPaths.some((path) => !genesis.has(path))) {
+		throw new Error("Ordinary correction touches a non-genesis path");
+	}
+	const fixDiff = runGit(root, [
+		"diff", "--no-ext-diff", "--no-renames", "--binary", snapshot.initial_review_tree, candidate,
+	], environment);
+	if (fixDiff.length === 0) throw new Error("Ordinary correction must contain a diff");
+	return {
+		candidate_tree: candidate,
+		changed_paths: changedPaths,
+		fix_diff: fixDiff,
+		fix_diff_hash: canonicalStringHash(fixDiff),
+	};
 }
 
 export function captureReviewSnapshot(
@@ -273,6 +328,9 @@ export function captureReviewSnapshot(
 			),
 		);
 		const diffEvidence = buildDiffEvidence(REVIEW_EVENT.ORDINARY_START, diff);
+		const genesisPaths = canonicalPaths(runGit(root, [
+			"diff", "--no-renames", "--name-only", "-z", baseTree, initialReviewTree,
+		], gitEnvironment));
 		const plan =
 			options.mode === REVIEW_MODE.ORDINARY
 				? classifyReviewRoute(diffEvidence)
@@ -288,6 +346,7 @@ export function captureReviewSnapshot(
 			complete_snapshot_tree: completeSnapshotTree,
 			review_projection: projection,
 			initial_review_tree: initialReviewTree,
+			genesis_paths: genesisPaths,
 			diff_evidence: diffEvidence,
 			route: plan.route,
 			lenses: [...plan.lenses],
@@ -305,6 +364,7 @@ export function captureReviewSnapshot(
 			complete_snapshot_tree: completeSnapshotTree,
 			review_projection: projection,
 			initial_review_tree: initialReviewTree,
+			genesis_paths: genesisPaths,
 			diff_evidence: diffEvidence,
 			route: plan.route,
 			lenses: Object.freeze([...plan.lenses]),

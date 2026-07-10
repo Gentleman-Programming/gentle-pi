@@ -16,6 +16,7 @@ import {
 	SNAPSHOT_CLEANUP_TRIGGER,
 	REVIEW_PROJECTION,
 	captureReviewSnapshot,
+	captureOrdinaryCorrectionSnapshot,
 	cleanupReviewSnapshot,
 	type CaptureReviewSnapshotOptions,
 	type ReviewProjectionV1,
@@ -159,6 +160,7 @@ test("intended-commit projection binds its resolved tree while complete snapshot
 		snapshotGit(snapshot, "show", `${snapshot.complete_snapshot_tree}:later.txt`),
 		"complete scope only",
 	);
+	assert.deepEqual(snapshot.genesis_paths, ["tracked.txt"]);
 	assert.deepEqual(readFileSync(indexPath), indexBefore);
 });
 
@@ -264,4 +266,36 @@ test("snapshot rejects unsupported and unresolved projections without changing t
 		/cannot be resolved/,
 	);
 	assert.deepEqual(readFileSync(indexPath), indexBefore);
+});
+
+test("ordinary snapshots bind canonical genesis paths and corrections cannot expand them", (t) => {
+	const { repository, git } = createRepository(t);
+	writeFileSync(join(repository, "requirements.txt"), "package==1\n");
+	writeFileSync(join(repository, "CMakeLists.txt"), "project(example)\n");
+	writeFileSync(join(repository, "guide.mdx"), "export const executable = true;\n");
+	writeFileSync(join(repository, "README.sh"), "#!/bin/sh\ntrue\n");
+	const snapshot = captureReviewSnapshot({
+		cwd: repository,
+		mode: REVIEW_MODE.ORDINARY,
+		projection: { kind: REVIEW_PROJECTION.COMPLETE },
+		policyHash: "d".repeat(64),
+	});
+	assert.deepEqual(snapshot.genesis_paths, [
+		"CMakeLists.txt",
+		"README.sh",
+		"guide.mdx",
+		"requirements.txt",
+	]);
+	writeFileSync(join(repository, "requirements.txt"), "package==2\n");
+	git("add", "requirements.txt", "CMakeLists.txt", "guide.mdx", "README.sh");
+	const candidate = git("write-tree");
+	const correction = captureOrdinaryCorrectionSnapshot(snapshot, candidate);
+	assert.deepEqual(correction.changed_paths, ["requirements.txt"]);
+	assert.equal(correction.candidate_tree, candidate);
+	writeFileSync(join(repository, "outside.ts"), "export {};\n");
+	git("add", "outside.ts");
+	assert.throws(
+		() => captureOrdinaryCorrectionSnapshot(snapshot, git("write-tree")),
+		/non-genesis path/i,
+	);
 });

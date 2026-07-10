@@ -29,6 +29,7 @@ import {
 	type ReviewMode,
 	type ReviewProjectionV1,
 	type SnapshotV1,
+	type ReviewSnapshotObjectStoreV1,
 } from "./review-snapshot.ts";
 export { REVIEW_MODE, type ReviewMode } from "./review-snapshot.ts";
 import {
@@ -331,6 +332,21 @@ export interface ReviewFixRecordV1 {
 	fixed_ids: string[];
 	fix_diff: string;
 	fix_diff_hash: string;
+	changed_paths?: string[];
+}
+
+export interface ValidationEvidenceV1 {
+	original_acceptance_tests: { passed: boolean; evidence_hash: string };
+	correction_regressions: Array<{ finding_id: string; evidence_hash: string; passed: boolean }>;
+	original_criterion_regressions: string[];
+	follow_ups: FollowUpObservationV1[];
+}
+
+export interface FollowUpObservationV1 {
+	id: string;
+	location: string;
+	summary: string;
+	evidence_hash: string;
 }
 
 export interface ReviewStateV1 {
@@ -344,6 +360,8 @@ export interface ReviewStateV1 {
 	complete_snapshot_tree: string;
 	review_projection: ReviewProjectionV1;
 	initial_review_tree: string;
+	genesis_paths?: string[];
+	snapshot_object_store?: ReviewSnapshotObjectStoreV1;
 	current_candidate_tree: string;
 	final_candidate_tree?: string;
 	route: ReviewRoute;
@@ -355,6 +373,7 @@ export interface ReviewStateV1 {
 	counters: ReviewCountersV1;
 	resolutions?: FindingResolutionV1[];
 	fix_record?: ReviewFixRecordV1;
+	validation_evidence?: ValidationEvidenceV1;
 	active_finding_ids?: string[];
 	escalation_reasons?: string[];
 	child_claims?: ChildClaimV1[];
@@ -645,6 +664,44 @@ function assertProjectionBinding(
 	throw new ReviewIntegrityError("Unsupported review projection");
 }
 
+function assertCanonicalPaths(paths: readonly string[], label: string): void {
+	if (canonicalize(paths) !== canonicalize([...new Set(paths)].toSorted())) {
+		throw new ReviewIntegrityError(`${label} must be unique and sorted`);
+	}
+	for (const path of paths) {
+		if (typeof path !== "string" || path.length === 0 || path.startsWith("/") || path.split("/").some((part) => part === "" || part === "." || part === "..")) {
+			throw new ReviewIntegrityError(`${label} must be canonical repository-relative paths`);
+		}
+	}
+}
+
+function assertFollowUp(value: FollowUpObservationV1): void {
+	if (Object.keys(value as object).some((key) => !["id", "location", "summary", "evidence_hash"].includes(key))) {
+		throw new ReviewIntegrityError("Follow-up cannot request lifecycle action or correction");
+	}
+	if (typeof value.id !== "string" || value.id.length === 0 || typeof value.location !== "string" || value.location.length === 0 || typeof value.summary !== "string" || value.summary.length === 0) {
+		throw new ReviewIntegrityError("Follow-up requires identity, location, and summary");
+	}
+	assertDigest(value.evidence_hash, "Follow-up evidence hash");
+}
+
+function assertValidationEvidence(value: ValidationEvidenceV1): void {
+	if (typeof value.original_acceptance_tests?.passed !== "boolean") throw new ReviewIntegrityError("Original acceptance evidence is invalid");
+	assertDigest(value.original_acceptance_tests.evidence_hash, "Original acceptance evidence hash");
+	for (const regression of value.correction_regressions) {
+		if (typeof regression.finding_id !== "string" || typeof regression.passed !== "boolean") throw new ReviewIntegrityError("Correction regression evidence is invalid");
+		assertDigest(regression.evidence_hash, "Correction regression evidence hash");
+	}
+	if (!Array.isArray(value.original_criterion_regressions) || value.original_criterion_regressions.some((reason) => typeof reason !== "string" || reason.length === 0)) {
+		throw new ReviewIntegrityError("Original criterion regression evidence is invalid");
+	}
+	if (!Array.isArray(value.follow_ups)) throw new ReviewIntegrityError("Follow-up evidence is invalid");
+	for (const followUp of value.follow_ups) assertFollowUp(followUp);
+	if (canonicalize(value.follow_ups) !== canonicalize([...value.follow_ups].toSorted((left, right) => left.id.localeCompare(right.id)))) {
+		throw new ReviewIntegrityError("Follow-up evidence must be ID-sorted");
+	}
+}
+
 export function createFrozenLedger(
 	rows: readonly CanonicalFrozenRowV1[],
 ): FrozenLedgerV1 {
@@ -756,6 +813,8 @@ export function createReviewState(input: CreateReviewStateInput): ReviewStateV1 
 		complete_snapshot_tree: input.snapshot.complete_snapshot_tree,
 		review_projection: cloneCanonical(input.snapshot.review_projection),
 		initial_review_tree: input.snapshot.initial_review_tree,
+		...(input.snapshot.genesis_paths === undefined ? {} : { genesis_paths: cloneCanonical(input.snapshot.genesis_paths) }),
+		snapshot_object_store: cloneCanonical(input.snapshot.object_store),
 		current_candidate_tree: input.snapshot.initial_review_tree,
 		route,
 		lenses: Object.freeze(lenses),
@@ -767,6 +826,9 @@ export function createReviewState(input: CreateReviewStateInput): ReviewStateV1 
 	};
 	if (input.parentLineageId !== undefined) result.parent_lineage_id = input.parentLineageId;
 	assertState(result);
+	if (input.mode === REVIEW_MODE.ORDINARY && result.genesis_paths === undefined) {
+		throw new ReviewIntegrityError("New ordinary lineages require immutable genesis paths");
+	}
 	return result;
 }
 
@@ -797,6 +859,7 @@ function assertState(state: ReviewStateV1, previous?: ReviewStateV1): void {
 		state.complete_snapshot_tree,
 		state.initial_review_tree,
 	);
+	if (state.genesis_paths !== undefined) assertCanonicalPaths(state.genesis_paths, "Genesis paths");
 	assertBudget(state.budget);
 	assertCounters(state.counters, state.budget, previous?.counters);
 	if (state.frozen_ledger) assertFrozenLedgerIntegrity(state.frozen_ledger);
@@ -807,6 +870,7 @@ function assertState(state: ReviewStateV1, previous?: ReviewStateV1): void {
 			throw new ReviewIntegrityError("Fix diff hash mismatch");
 		}
 	}
+	if (state.validation_evidence) assertValidationEvidence(state.validation_evidence);
 	if (state.active_finding_ids) {
 		const unique = new Set(state.active_finding_ids);
 		if (unique.size !== state.active_finding_ids.length) {
@@ -874,6 +938,8 @@ function assertImmutableState(previous: ReviewStateV1, next: ReviewStateV1): voi
 		complete_snapshot_tree: previous.complete_snapshot_tree,
 		review_projection: previous.review_projection,
 		initial_review_tree: previous.initial_review_tree,
+		genesis_paths: previous.genesis_paths,
+		snapshot_object_store: previous.snapshot_object_store,
 		route: previous.route,
 		lenses: previous.lenses,
 		policy_hash: previous.policy_hash,
@@ -888,6 +954,8 @@ function assertImmutableState(previous: ReviewStateV1, next: ReviewStateV1): voi
 		complete_snapshot_tree: next.complete_snapshot_tree,
 		review_projection: next.review_projection,
 		initial_review_tree: next.initial_review_tree,
+		genesis_paths: next.genesis_paths,
+		snapshot_object_store: next.snapshot_object_store,
 		route: next.route,
 		lenses: next.lenses,
 		policy_hash: next.policy_hash,

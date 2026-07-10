@@ -305,10 +305,15 @@ test("controller advances an ordinary validator request from a repository file a
 		lineageId,
 		transition: REVIEW_TRANSITION.ORDINARY_FIX,
 		idempotencyKey: "fix",
-		input: { candidateTree: "d".repeat(40), fixedIds: ["RISK-001"], fixDiff: "diff --git a/src/auth.ts b/src/auth.ts\n" },
+		input: { candidateTree: "d".repeat(40), fixedIds: ["RISK-001"], fixDiff: "diff --git a/src/auth.ts b/src/auth.ts\n", changedPaths: ["src/auth.ts"] },
 	});
 	const validatorInput = JSON.stringify({
-		request: ordinaryValidatorRequest(store.read(lineageId)),
+		request: ordinaryValidatorRequest(store.read(lineageId), {
+			originalAcceptanceTests: { passed: true, evidenceHash: "a".repeat(64) },
+			correctionRegressions: [{ findingId: "RISK-001", evidenceHash: "b".repeat(64), passed: true }],
+			originalCriterionRegressions: [],
+			followUps: [],
+		}),
 		results: [{ id: "RISK-001", outcome: "verified" }],
 	});
 	const inputPath = join(fixture.repository, "validator-input.json");
@@ -345,6 +350,29 @@ test("controller advances an ordinary validator request from a repository file a
 		inputPath,
 	});
 	assert.equal((advanced.state as Record<string, unknown>).phase, "final-verification");
+});
+
+test("controller rejects a manually supplied correction that lacks Git-derived scope evidence", async (t) => {
+	const fixture = createRepository(t, false);
+	const lineageId = "controller-correction-evidence";
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository);
+	await controllerCall(controller, ctx, {
+		operation: "start", lineageId, idempotencyKey: "start",
+		input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, projection: { kind: "complete" }, policyHash: "a".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }),
+	});
+	await controllerCall(controller, ctx, {
+		operation: "advance", lineageId, idempotencyKey: "discover", transition: REVIEW_TRANSITION.ORDINARY_DISCOVERY,
+		input: JSON.stringify({ rows: [{ id: "READ-001", lens: REVIEW_LENS.READABILITY, location: "app.ts:1", severity: "BLOCKER", status_at_freeze: "open", evidence_class: "deterministic", evidence_claim: "missing check" }] }),
+	});
+	await controllerCall(controller, ctx, {
+		operation: "advance", lineageId, idempotencyKey: "evidence", transition: REVIEW_TRANSITION.ORDINARY_EVIDENCE,
+		input: JSON.stringify({ deterministicResults: [{ id: "READ-001", outcome: "corroborated" }] }),
+	});
+	await assert.rejects(
+		controller.execute("unbound-fix", { operation: "advance", lineageId, idempotencyKey: "fix", transition: REVIEW_TRANSITION.ORDINARY_FIX, input: JSON.stringify({ candidateTree: "d".repeat(40), fixedIds: ["READ-001"], fixDiff: "manual" }) }, undefined, undefined, ctx),
+		/Git-derived correction evidence/i,
+	);
 });
 
 test("controller inspect reports lock state and recover never force-steals an absent lock", async (t) => {

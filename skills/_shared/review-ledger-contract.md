@@ -20,7 +20,9 @@ Invalid, missing, duplicate, unknown, or inconclusive refuter output escalates w
 
 Ordinary permits at most one fix batch.
 
-After a fix, exactly one validator receives only requested frozen IDs, their exact hash-bound rows, and the fix diff.
+After a fix, exactly one validator consumes only requested frozen IDs, their exact hash-bound rows, original acceptance-test proof, one passed correction-regression proof per ID, original-criterion regressions, and inert follow-ups.
+
+The validator consumes proof only; it does not inspect a fix diff, candidate tree, changed paths or lines, discover, or re-review.
 
 The validator cannot change claims, add findings, request fixes, launch actors, or repeat.
 
@@ -62,11 +64,11 @@ Return exactly one `refuted | corroborated | inconclusive` resolution for every 
 
 Do not create findings, alter frozen claims, request fixes, launch actors, persist authority, or repeat.
 
-### Scoped validator
+### Targeted proof validator
 
-Receive only requested frozen IDs, their exact hash-bound rows, and the fix diff.
+Receive only requested frozen IDs, their exact hash-bound rows, original acceptance-test proof, one passed correction-regression proof per ID, original-criterion regressions, and inert follow-ups.
 
-Resolve only supplied IDs and report fix-line regressions; never add findings or change frozen claims.
+Consume proof for supplied IDs only; never inspect a fix diff, candidate tree, changed paths or lines, discover, re-review, add findings, or change frozen claims.
 
 Do not request another fix, launch actors, persist authority, or repeat.
 
