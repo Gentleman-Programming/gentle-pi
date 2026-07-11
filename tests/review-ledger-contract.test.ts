@@ -42,9 +42,21 @@ function fencedBlock(path: string, heading: string): string {
 	const starts = lines.flatMap((line, index) => line === heading ? [index] : []);
 	assert.equal(starts.length, 1, `${path} must contain one exact ${heading}`);
 	const fenceStart = lines.findIndex((line, index) => index > starts[0]! && line.startsWith("```"));
-	const relativeEnd = lines.slice(fenceStart + 1).findIndex((line) => line.startsWith("```"));
+	const fence = lines[fenceStart]!.match(/^(`+)/)?.[1];
+	const relativeEnd = lines.slice(fenceStart + 1).findIndex((line) => line === fence);
 	assert.ok(fenceStart > starts[0]! && relativeEnd >= 0, `${path} must contain a complete fenced block`);
 	return lines.slice(fenceStart + 1, fenceStart + 1 + relativeEnd).join("\n");
+}
+
+function jsonBlocks(path: string): unknown[] {
+	return [...read(path).matchAll(/```json\n([\s\S]*?)\n```/g)].map((match) => JSON.parse(match[1]!));
+}
+
+function assertNativeJsonHasNoMetadata(path: string, value: unknown): void {
+	const serialized = JSON.stringify(value);
+	for (const forbidden of ["summary", "skill_resolution", "orchestration", "prose"]) {
+		assert.ok(!serialized.includes(forbidden), `${path} native JSON contains ${forbidden}`);
+	}
 }
 
 const JUDGMENT_DAY_PATTERNS = [
@@ -108,6 +120,35 @@ for (const path of REVIEW_LENSES) {
 	});
 }
 
+test("ordinary lens prompts contain the literal compact-v2 native result envelope", () => {
+	const expectedLenses = ["risk", "resilience", "readability", "reliability"];
+	for (const [index, path] of REVIEW_LENSES.entries()) {
+		const blocks = jsonBlocks(path);
+		assert.equal(blocks.length, 1, `${path} must contain one native JSON example`);
+		const envelope = blocks[0] as Record<string, unknown>;
+		assert.deepEqual(Object.keys(envelope), ["review_result"]);
+		const reviewResult = envelope.review_result as Record<string, unknown>;
+		assert.deepEqual(Object.keys(reviewResult), ["lens_results"]);
+		const lensResults = reviewResult.lens_results as Array<Record<string, unknown>>;
+		assert.equal(lensResults.length, 1);
+		assert.deepEqual(Object.keys(lensResults[0]!), ["lens", "findings", "evidence"]);
+		assert.equal(lensResults[0]!.lens, expectedLenses[index]);
+		const findings = lensResults[0]!.findings as Array<Record<string, unknown>>;
+		assert.deepEqual(Object.keys(findings[0]!), [
+			"id",
+			"lens",
+			"location",
+			"severity",
+			"claim",
+			"evidence_class",
+			"causal_disposition",
+			"proof_refs",
+		]);
+		assertNativeJsonHasNoMetadata(path, envelope);
+		assert.match(read(path), /Do not put `summary`, `skill_resolution`, prose, or orchestration metadata inside or beside the native JSON result/);
+	}
+});
+
 test("risk lens distinguishes trusted orchestration from concrete boundary bypasses", () => {
 	const content = read("assets/agents/review-risk.md");
 	assert.match(content, /local orchestrator and same-user process are trusted/i);
@@ -145,6 +186,37 @@ for (const path of JUDGES) {
 		assertMatches(path, content, JUDGMENT_DAY_REJUDGMENT_PATTERNS);
 	});
 }
+
+test("Judgment Day judge prompts contain distinct graph-v1 discovery and re-judgment shapes", () => {
+	for (const path of [...JUDGES, JD_PROMPTS]) {
+		const blocks = jsonBlocks(path);
+		assert.equal(blocks.length, 2, `${path} must contain discovery and re-judgment JSON examples`);
+		const discovery = blocks[0] as Record<string, unknown>;
+		assert.deepEqual(Object.keys(discovery), ["rows"]);
+		const rows = discovery.rows as Array<Record<string, unknown>>;
+		assert.deepEqual(Object.keys(rows[0]!), [
+			"id",
+			"lens",
+			"location",
+			"severity",
+			"status_at_freeze",
+			"evidence_class",
+			"evidence_claim",
+		]);
+		assert.equal(rows[0]!.lens, "judgment-day");
+
+		const rejudgment = blocks[1] as Record<string, unknown>;
+		assert.deepEqual(Object.keys(rejudgment), ["resolutions"]);
+		const resolutions = rejudgment.resolutions as Array<Record<string, unknown>>;
+		assert.deepEqual(Object.keys(resolutions[0]!), ["id", "outcome"]);
+		for (const block of blocks) assertNativeJsonHasNoMetadata(path, block);
+		assert.match(read(path), /Do not put `summary`, `skill_resolution`, prose, or orchestration metadata inside or beside (?:either )?(?:the )?native JSON result/);
+	}
+	const judgePrompt = fencedBlock(JD_PROMPTS, "## Judge Prompt");
+	assert.match(judgePrompt, /```json\n\{\n  "rows":/);
+	assert.match(judgePrompt, /Do not put `summary`, `skill_resolution`, prose, or orchestration metadata inside or beside the native JSON result/);
+	assert.doesNotMatch(judgePrompt, /End with `Skill Resolution:/);
+});
 
 test("Judgment Day skill and prompts preserve bounded fix and re-judgment authority", () => {
 	assertMatches(JD_SKILL, read(JD_SKILL), [...JUDGMENT_DAY_PATTERNS, ...JUDGMENT_DAY_REJUDGMENT_PATTERNS, ...FIX_PATTERNS]);
