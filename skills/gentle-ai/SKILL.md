@@ -73,6 +73,12 @@ If multiple rows match, run the narrow set that covers the risk. Example: shell 
 
 ## Bounded Review Transaction Contract
 
+Call `gentle_review` INSPECT before START. Normal review START uses exact mode `ordinary` and passes its operation-specific `input` as a JSON-serialized object string; mode `judgment-day` is valid only when the user explicitly selected Judgment Day.
+
+If INSPECT or START reports `blocked-legacy` or `blocked-mixed`, explain that legacy authority cannot be migrated and request explicit user authorization for the exact destructive-reset challenge. RESET and RECOVER each require fresh operation-bound confirmation through the interactive Pi UI and fail closed headlessly. The UI cannot cryptographically attest the human's identity; its residual trust is the operator controlling that Pi session, while exact challenge binding remains runtime-enforced. Only after authorization, call RESET with that exact challenge. RESET and RECOVER internally INSPECT authority; require a returned `clean` inspection with `start-fresh-ordinary-review-after-verified-clean`, then immediately issue a fresh ordinary START. For `reset-in-progress`, use INSPECT's durable original `reset_request` with authorized RECOVER.
+
+A `lineage_created: false` result or a validation error explicitly marked before authority access proves no lineage was created; do not call STATUS or ADVANCE for that attempt. A thrown START after authority access or lost output/response is ambiguous because authority may already be committed. Before any fresh START, replay or resume with the same `lineageId`, `idempotencyKey`, and exact request; the durable journal returns the committed result or rejects a mismatch. Never choose a different fresh lineage merely because START output was lost.
+
 Ordinary review runs the selected zero, one, or four lenses exactly once against `initial_review_tree`.
 
 Before corroboration, the controller freezes canonical ID-sorted identity, claim, and evidence rows under `frozen_ledger_hash`.

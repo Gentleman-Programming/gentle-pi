@@ -49,7 +49,8 @@ import {
 } from "../lib/sdd-status.ts";
 import type { TriggerEvent } from "../lib/review-triggers.ts";
 import { ReviewBundleExporter, ReviewBundleImporter } from "../lib/review-bundle.ts";
-import { inspectLegacyReviewAuthorityV1 } from "../lib/review-legacy-detector.ts";
+import { domainHashV1 } from "../lib/review-canonical.ts";
+import { inspectLegacyReviewAuthorityV1, type LegacyInspectionV1 } from "../lib/review-legacy-detector.ts";
 import { destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
 import { ReviewMutationLockV1 } from "../lib/review-lock.ts";
 import { resolveRepositoryAuthorityV1 } from "../lib/review-repository.ts";
@@ -57,7 +58,9 @@ import {
 	EXTERNAL_RELEASE_EVIDENCE,
 	GATE_RESULT,
 	GATE_TARGET_KIND,
+	JOURNAL_STATUS,
 	PUSH_UPDATE_KIND,
+	REVIEW_OPERATION,
 	REVIEW_TRANSITION,
 	ReviewTransactionStore,
 	canonicalHash,
@@ -69,6 +72,7 @@ import {
 	type ReleaseFastPathEvidenceV1,
 	type ReviewBudgetV1,
 	type ReviewReducerInput,
+	type StartOperationResultV1,
 	type ReviewTransition,
 } from "../lib/review-transaction.ts";
 import {
@@ -2073,11 +2077,11 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 		operation: {
 			type: "string",
 			enum: Object.values(REVIEW_CONTROLLER_OPERATION),
-			description: "Controller operation: start, advance, status, or validate.",
+			description: "Controller operation. Inspect authority before start. Reset requires the exact challenge returned by inspect.",
 		},
 		lineageId: {
 			type: "string",
-			description: "Bounded review lineage identifier.",
+			description: "Bounded review lineage identifier. A failed start creates no lineage; do not use it with status or advance.",
 		},
 		idempotencyKey: {
 			type: "string",
@@ -2093,7 +2097,7 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 		},
 		input: {
 			type: "string",
-			description: "JSON object containing operation-specific controller input.",
+			description: "A JSON-serialized object string, not a nested object. Exact ordinary START shape: {\"mode\":\"ordinary\",\"projection\":{\"kind\":\"complete\"},\"policyHash\":\"<hash>\",\"evidenceHash\":\"<hash>\",\"budget\":{...}}. START supports only mode ordinary or judgment-day; use judgment-day only when explicitly selected.",
 		},
 		outputPath: { type: "string", description: "Destination path for deterministic bundle export." },
 		inputPath: { type: "string", description: "Source path for staged bundle import." },
@@ -2128,6 +2132,26 @@ interface ReviewControllerStartInput {
 interface ReviewControllerValidateInput {
 	scopeBudget: ReviewBudgetV1;
 	release?: ReleaseFastPathEvidenceV1;
+}
+
+interface ReviewResetStateBody {
+	schema: string;
+	reset_id: string;
+	repository_id: string;
+	common_directory_hash: string;
+	authorized_inventory_hash: string;
+	authorization_hash: string;
+	sequence: number;
+	phase: string;
+	quarantine_relative_path: string;
+	moved_roots: string[];
+	deleted_roots: string[];
+	identity_recovery?: boolean;
+}
+
+interface ReviewResetStateEnvelope {
+	body: ReviewResetStateBody;
+	reset_state_hash: string;
 }
 
 interface DerivedReviewGateTarget {
@@ -2172,6 +2196,9 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 	for (const key of ["idempotencyKey", "transition", "command", "input", "outputPath", "inputPath", "operationId", "lineageIds", "acknowledgeUntrustedBundleSource"] as const) {
 		const optional = value[key];
 		if (optional !== undefined && typeof optional !== "string") {
+			if (value.operation === REVIEW_CONTROLLER_OPERATION.START && key === "input") {
+				throw new Error("Review controller START input must be a JSON string encoding an object, not a nested object. No lineage was created; do not call STATUS or ADVANCE for this attempted lineage.");
+			}
 			throw new Error(`Review controller ${key} must be a string`);
 		}
 		if (typeof optional === "string") parameters[key] = optional;
@@ -2209,12 +2236,119 @@ function parseControllerJson(input: string, operation: ReviewControllerOperation
 	try {
 		value = JSON.parse(input);
 	} catch (error) {
+		if (operation === REVIEW_CONTROLLER_OPERATION.START) {
+			throw new Error(
+				`Review controller START input must be a JSON string encoding an object: ${error instanceof Error ? error.message : String(error)}. No lineage was created; do not call STATUS or ADVANCE for this attempted lineage.`,
+			);
+		}
 		throw new Error(
 			`Review controller ${operation} input is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
 	if (!isRecord(value)) throw new Error(`Review controller ${operation} input must be a JSON object`);
 	return value;
+}
+
+function durableResetRecoveryRequest(cwd: string): LegacyInspectionV1["reset_request"] {
+	const authority = resolveRepositoryAuthorityV1(cwd);
+	const value = JSON.parse(readFileSync(join(authority.store_root, "control", "reset-state.json"), "utf8")) as unknown;
+	if (!isRecord(value) || !isRecord(value.body)) throw new Error("Review reset recovery state is malformed");
+	const envelope = value as unknown as ReviewResetStateEnvelope;
+	const body = envelope.body;
+	if (
+		body.schema !== "gentle-ai.review-reset-state/v1" ||
+		typeof body.reset_id !== "string" ||
+		typeof body.repository_id !== "string" ||
+		typeof body.common_directory_hash !== "string" ||
+		typeof body.authorized_inventory_hash !== "string" ||
+		typeof body.authorization_hash !== "string" ||
+		!Number.isSafeInteger(body.sequence) ||
+		typeof body.phase !== "string" ||
+		typeof body.quarantine_relative_path !== "string" ||
+		!Array.isArray(body.moved_roots) ||
+		!Array.isArray(body.deleted_roots) ||
+		typeof envelope.reset_state_hash !== "string" ||
+		envelope.reset_state_hash !== domainHashV1("reset-state", body)
+	) {
+		throw new Error("Review reset recovery state failed integrity validation");
+	}
+	const currentCommonDirectoryHash = domainHashV1("common-directory", authority.common_directory);
+	if (
+		body.repository_id !== authority.repository_id ||
+		body.common_directory_hash !== currentCommonDirectoryHash
+	) {
+		throw new Error("Review reset recovery state does not match the current repository authority");
+	}
+	const allowedRoots = new Set([
+		"lineages",
+		"locks",
+		"legacy-evidence",
+		"migration",
+		"migration-operations",
+		"graph-v1",
+		...(body.identity_recovery === true ? ["IDENTITY"] : []),
+	]);
+	const expectedQuarantinePath = join("reset-quarantine", body.reset_id);
+	if (
+		!/^[0-9a-f]{64}$/.test(body.reset_id) ||
+		body.quarantine_relative_path !== expectedQuarantinePath ||
+		isAbsolute(body.quarantine_relative_path) ||
+		body.moved_roots.some((root) => typeof root !== "string" || !allowedRoots.has(root)) ||
+		body.deleted_roots.some((root) => typeof root !== "string" || !body.moved_roots.includes(root)) ||
+		new Set(body.moved_roots).size !== body.moved_roots.length ||
+		new Set(body.deleted_roots).size !== body.deleted_roots.length
+	) {
+		throw new Error("Review reset recovery state contains unsafe quarantine path semantics");
+	}
+	const confirmation = `DESTROY REVIEW AUTHORITY ${body.repository_id} AT ${body.common_directory_hash} INVENTORY ${body.authorized_inventory_hash}`;
+	if (body.authorization_hash !== domainHashV1("reset-authorization", confirmation)) {
+		throw new Error("Review reset recovery authorization failed integrity validation");
+	}
+	return {
+		repositoryId: body.repository_id,
+		commonDirHash: body.common_directory_hash,
+		inventoryHash: body.authorized_inventory_hash,
+		confirmation,
+	};
+}
+
+function inspectReviewAuthorityForController(cwd: string): LegacyInspectionV1 {
+	const inspection = inspectLegacyReviewAuthorityV1(cwd);
+	return inspection.outcome === "reset-in-progress"
+		? { ...inspection, reset_request: durableResetRecoveryRequest(cwd) }
+		: inspection;
+}
+
+async function authorizeDestructiveReviewOperation(
+	parametersValue: unknown,
+	ctx: ExtensionContext,
+): Promise<void> {
+	const parameters = parseReviewControllerParameters(parametersValue);
+	if (
+		parameters.operation !== REVIEW_CONTROLLER_OPERATION.RESET &&
+		parameters.operation !== REVIEW_CONTROLLER_OPERATION.RECOVER
+	) return;
+	const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
+	for (const key of ["repositoryId", "commonDirHash", "inventoryHash", "confirmation"] as const) {
+		if (typeof input[key] !== "string" || input[key].length === 0) {
+			throw new Error(`Review controller ${parameters.operation} requires an exact string ${key}`);
+		}
+	}
+	if (!ctx.hasUI) {
+		throw new Error(`Review controller ${parameters.operation.toUpperCase()} requires fresh explicit authorization through the interactive Pi UI; headless execution fails closed`);
+	}
+	const approved = await ctx.ui.confirm(
+		`Authorize destructive review authority ${parameters.operation.toUpperCase()}?`,
+		[
+			`Operation: ${parameters.operation.toUpperCase()}`,
+			`Repository: ${input.repositoryId}`,
+			`Exact challenge: ${input.confirmation}`,
+			"This invalidates all prior review authority for this repository.",
+		].join("\n"),
+	);
+	if (!approved) {
+		throw new Error(`Review controller ${parameters.operation.toUpperCase()} was not explicitly authorized`);
+	}
 }
 
 function parseReviewBudget(value: unknown, label: string): ReviewBudgetV1 {
@@ -2224,7 +2358,9 @@ function parseReviewBudget(value: unknown, label: string): ReviewBudgetV1 {
 
 function parseStartInput(value: Record<string, unknown>): ReviewControllerStartInput {
 	if (value.mode !== REVIEW_MODE.ORDINARY && value.mode !== REVIEW_MODE.JUDGMENT_DAY) {
-		throw new Error("Review controller start mode is unsupported");
+		throw new Error(
+			'Review controller START supports only "ordinary" or "judgment-day" mode; use "ordinary" unless Judgment Day was explicitly selected. Pass input as a JSON string encoding the START object. START failed before authority access, so no lineage was created; do not call STATUS or ADVANCE for this attempted lineage.',
+		);
 	}
 	if (!isRecord(value.projection) || typeof value.projection.kind !== "string") {
 		throw new Error("Review controller start requires a projection");
@@ -2932,7 +3068,22 @@ function executeReviewControllerOperation(
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.INSPECT) {
 		const authority = resolveRepositoryAuthorityV1(defaultCwd);
 		const lock = new ReviewMutationLockV1(join(authority.store_root, "control"), authority.repository_id, authority.authority_id);
-		return { operation: parameters.operation, inspection: inspectLegacyReviewAuthorityV1(defaultCwd), lock: lock.inspect() };
+		const inspection = inspectReviewAuthorityForController(defaultCwd);
+		return {
+			operation: parameters.operation,
+			inspection,
+			lock: lock.inspect(),
+			...(inspection.outcome === "clean"
+				? { status: "ready", next_action: "start-ordinary-review" }
+				: inspection.outcome === "blocked-ambiguous"
+					? { status: "blocked", next_action: "stop-and-report-ambiguous-authority" }
+					: {
+						status: "blocked",
+						next_action: inspection.outcome === "reset-in-progress"
+							? "request-explicit-reset-recovery-authorization"
+							: "request-explicit-reset-authorization",
+					}),
+		};
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
@@ -2944,11 +3095,16 @@ function executeReviewControllerOperation(
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RECOVER) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
-		return { operation: parameters.operation, result: destructiveResetReviewAuthorityV1({ cwd: defaultCwd, repositoryId: String(input.repositoryId), commonDirHash: String(input.commonDirHash), inventoryHash: String(input.inventoryHash), confirmation: String(input.confirmation), resume: true }) };
+		durableResetRecoveryRequest(defaultCwd);
+		const result = destructiveResetReviewAuthorityV1({ cwd: defaultCwd, repositoryId: String(input.repositoryId), commonDirHash: String(input.commonDirHash), inventoryHash: String(input.inventoryHash), confirmation: String(input.confirmation), resume: true });
+		const inspection = inspectReviewAuthorityForController(defaultCwd);
+		return { operation: parameters.operation, result, inspection, next_action: inspection.outcome === "clean" ? "start-fresh-ordinary-review-after-verified-clean" : "inspect-reset-recovery" };
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RESET) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
-		return { operation: parameters.operation, result: destructiveResetReviewAuthorityV1({ cwd: defaultCwd, repositoryId: String(input.repositoryId), commonDirHash: String(input.commonDirHash), inventoryHash: String(input.inventoryHash), confirmation: String(input.confirmation), resume: false }) };
+		const result = destructiveResetReviewAuthorityV1({ cwd: defaultCwd, repositoryId: String(input.repositoryId), commonDirHash: String(input.commonDirHash), inventoryHash: String(input.inventoryHash), confirmation: String(input.confirmation), resume: false });
+		const inspection = inspectReviewAuthorityForController(defaultCwd);
+		return { operation: parameters.operation, result, inspection, next_action: inspection.outcome === "clean" ? "start-fresh-ordinary-review-after-verified-clean" : "inspect-reset-recovery" };
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.REPAIR) {
 		const store = ReviewTransactionStore.forRepository(defaultCwd);
@@ -2963,6 +3119,20 @@ function executeReviewControllerOperation(
 				REVIEW_CONTROLLER_OPERATION.START,
 			),
 		);
+		const inspection = inspectReviewAuthorityForController(defaultCwd);
+		if (inspection.outcome !== "clean") {
+			return {
+				operation: parameters.operation,
+				status: "blocked",
+				lineage_created: false,
+				inspection,
+				next_action: inspection.outcome === "blocked-ambiguous"
+					? "stop-and-report-ambiguous-authority"
+					: inspection.outcome === "reset-in-progress"
+						? "request-explicit-reset-recovery-authorization"
+						: "request-explicit-reset-authorization",
+			};
+		}
 		const snapshot = captureReviewSnapshot({
 			cwd: defaultCwd,
 			mode: input.mode,
@@ -2981,10 +3151,23 @@ function executeReviewControllerOperation(
 				? stateInput
 				: { ...stateInput, parentLineageId: input.parentLineageId },
 		);
-		const result = ReviewTransactionStore.forRepository(defaultCwd).create(
-			state,
-			idempotencyKey,
-		);
+		const store = ReviewTransactionStore.forRepository(defaultCwd);
+		let result: StartOperationResultV1;
+		try {
+			result = store.create(state, idempotencyKey);
+		} catch (error) {
+			if (!(error instanceof Error) || error.message !== "Graph lineage already exists") throw error;
+			const current = store.read(parameters.lineageId!);
+			const existing = current.request_journal.find((entry) => entry.idempotency_key === idempotencyKey);
+			if (
+				existing?.operation !== REVIEW_OPERATION.START ||
+				existing.request_hash !== canonicalHash(state) ||
+				existing.status !== JOURNAL_STATUS.COMPLETED
+			) {
+				throw new Error("Idempotency key was reused with a different START request; replay requires the same lineageId, idempotencyKey, and exact request");
+			}
+			result = existing.canonical_result as StartOperationResultV1;
+		}
 		return { operation: parameters.operation, result, state };
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.ADVANCE) {
@@ -3235,15 +3418,20 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		name: "gentle_review",
 		label: "Gentle Review Controller",
 		description:
-			"Create, advance, inspect, and validate a bounded Gentle AI review transaction. Validate accepts one exact direct lifecycle command, derives its typed target from the command itself, and produces a one-shot authorization consumed by that exact subsequent bash command.",
-		promptSnippet: "Create, advance, inspect, or validate a bounded review transaction",
+			"Inspect, recover, create, advance, and validate a bounded Gentle AI review transaction. Before START, call INSPECT. RESET and RECOVER require fresh explicit authorization through the interactive Pi UI and fail closed headlessly. Their response internally INSPECTS authority; only a verified clean result permits an immediate fresh ordinary START. Validate accepts one exact direct lifecycle command and produces a one-shot authorization for that exact subsequent bash command.",
+		promptSnippet: "Inspect review authority before START; recover blocked legacy authority only with explicit authorization; then start ordinary review",
 		promptGuidelines: [
-			"Use gentle_review for bounded review transaction start, advance, status, and exact lifecycle validation; never fabricate bash tool metadata or a separate gate target.",
+			'Call {"operation":"inspect"} before START. Ordinary START requires operation, lineageId, idempotencyKey, and input as a JSON string such as "{\\"mode\\":\\"ordinary\\",\\"projection\\":{\\"kind\\":\\"complete\\"},\\"policyHash\\":\\"<hash>\\",\\"evidenceHash\\":\\"<hash>\\",\\"budget\\":{...}}".',
+			'Only START modes "ordinary" and "judgment-day" are supported. Use "ordinary" by default; use "judgment-day" only when the user explicitly selected Judgment Day.',
+			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization for the exact reset_request challenge, then call RESET or RECOVER only after authorization. RESET and RECOVER internally INSPECT authority; require their verified clean result and next_action start-fresh-ordinary-review-after-verified-clean before continuing directly to a fresh ordinary START.",
+			"A reported lineage_created false or a validation error explicitly marked before authority access proves no lineage was created; do not call STATUS or ADVANCE for that attempt. If START output or response is lost after authority access, completion is ambiguous: before any fresh START, replay or resume with the same lineageId, idempotencyKey, and exact request so the durable journal returns the committed result or rejects a mismatch.",
+			"Use gentle_review for bounded review transaction operations and exact lifecycle validation; never fabricate bash tool metadata or a separate gate target.",
 		],
 		parameters: REVIEW_CONTROLLER_PARAMETERS,
 		executionMode: "sequential",
 		async execute(_toolCallId, parameters, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Review controller operation was cancelled");
+			await authorizeDestructiveReviewOperation(parameters, ctx);
 			const details = executeReviewControllerOperation(
 				parameters,
 				ctx.cwd,

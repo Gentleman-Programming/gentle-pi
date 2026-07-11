@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -20,6 +20,8 @@ import {
 	type ReviewBudgetV1,
 } from "../lib/review-transaction.ts";
 import { ordinaryValidatorRequest } from "../lib/review-policy-ordinary.ts";
+import { domainHashV1 } from "../lib/review-canonical.ts";
+import { destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
 import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
 import { qualifiedReviewLockPlatform, testSnapshot } from "./review-test-fixtures.ts";
 
@@ -36,6 +38,9 @@ interface ReviewToolResult {
 
 interface RegisteredReviewTool {
 	name: string;
+	description: string;
+	promptSnippet?: string;
+	promptGuidelines?: readonly string[];
 	parameters: unknown;
 	execute: (
 		toolCallId: string,
@@ -44,6 +49,27 @@ interface RegisteredReviewTool {
 		onUpdate: undefined,
 		ctx: ExtensionContext,
 	) => Promise<ReviewToolResult>;
+}
+
+function createLegacyReviewAuthority(repository: string): void {
+	mkdirSync(join(repository, ".git", "gentle-ai", "reviews", "lineages", "legacy", "revisions"), { recursive: true });
+	writeFileSync(join(repository, ".git", "gentle-ai", "reviews", "lineages", "legacy", "HEAD"), "legacy authority");
+}
+
+function rewriteResetState(
+	repository: string,
+	mutate: (body: Record<string, unknown>) => void,
+): string {
+	const path = join(repository, ".git", "gentle-ai", "reviews", "control", "reset-state.json");
+	const envelope = JSON.parse(readFileSync(path, "utf8")) as {
+		body: Record<string, unknown>;
+		reset_state_hash: string;
+	};
+	mutate(envelope.body);
+	envelope.reset_state_hash = domainHashV1("reset-state", envelope.body);
+	const serialized = JSON.stringify(envelope);
+	writeFileSync(path, serialized);
+	return serialized;
 }
 
 type ToolCallHandler = (
@@ -99,12 +125,16 @@ function registerRuntime(): RuntimeRegistration {
 	return { controller, toolCall };
 }
 
-function extensionContext(repository: string, confirmDangerous = false): ExtensionContext {
+function extensionContext(
+	repository: string,
+	hasUI = false,
+	confirm: (title: string, message: string) => Promise<boolean> = async () => true,
+): ExtensionContext {
 	return {
 		cwd: repository,
-		hasUI: confirmDangerous,
+		hasUI,
 		ui: {
-			confirm: async () => true,
+			confirm,
 		},
 	} as unknown as ExtensionContext;
 }
@@ -387,8 +417,319 @@ test("controller inspect reports lock state and recover never force-steals an ab
 	);
 	await assert.rejects(
 		controller.execute("recover-reset-requires-confirmation", { operation: "recover", input: JSON.stringify({ ownerHash: "a".repeat(64) }) }, undefined, undefined, ctx),
-		/confirmation|reset/i,
+		/exact string|confirmation|reset/i,
 	);
+});
+
+test("controller routes legacy authority through explicit reset, verifies clean, and starts ordinary review", async (t) => {
+	const fixture = createRepository(t, false);
+	createLegacyReviewAuthority(fixture.repository);
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository);
+
+	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
+	const blockedInspection = inspected.inspection as Record<string, unknown>;
+	assert.equal(blockedInspection.outcome, "blocked-legacy");
+	assert.equal(inspected.status, "blocked");
+	assert.equal(inspected.next_action, "request-explicit-reset-authorization");
+
+	const blockedStart = await controllerCall(controller, ctx, {
+		operation: "start",
+		lineageId: "blocked-before-reset",
+		idempotencyKey: "blocked-before-reset-start",
+		input: JSON.stringify({ mode: "ordinary", projection: { kind: "complete" }, policyHash: "a".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }),
+	});
+	assert.equal(blockedStart.status, "blocked");
+	assert.equal(blockedStart.lineage_created, false);
+	assert.equal(blockedStart.next_action, "request-explicit-reset-authorization");
+	assert.equal((blockedStart.inspection as Record<string, unknown>).outcome, "blocked-legacy");
+
+	const resetRequest = blockedInspection.reset_request as Record<string, unknown>;
+	await assert.rejects(
+		controller.execute("unauthorized-reset", { operation: "reset", input: JSON.stringify(resetRequest) }, undefined, undefined, ctx),
+		/interactive Pi UI.*fails closed/i,
+	);
+	const stillBlocked = await controllerCall(controller, ctx, { operation: "inspect" });
+	assert.equal((stillBlocked.inspection as Record<string, unknown>).outcome, "blocked-legacy");
+	assert.deepEqual((stillBlocked.inspection as Record<string, unknown>).reset_request, resetRequest);
+	await assert.rejects(
+		controller.execute("rejected-reset", { operation: "reset", input: JSON.stringify(resetRequest) }, undefined, undefined, extensionContext(fixture.repository, true, async () => false)),
+		/not explicitly authorized/i,
+	);
+	const stillBlockedAfterRejection = await controllerCall(controller, ctx, { operation: "inspect" });
+	assert.deepEqual(stillBlockedAfterRejection.inspection, stillBlocked.inspection);
+
+	const confirmations: Array<{ title: string; message: string }> = [];
+	const authorizedCtx = extensionContext(fixture.repository, true, async (title, message) => {
+		confirmations.push({ title, message });
+		return true;
+	});
+	const reset = await controllerCall(controller, authorizedCtx, {
+		operation: "reset",
+		input: JSON.stringify(resetRequest),
+	});
+	assert.equal(confirmations.length, 1);
+	assert.match(confirmations[0]?.title ?? "", /RESET/);
+	assert.match(confirmations[0]?.message ?? "", new RegExp(String(resetRequest.confirmation).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+	assert.equal((reset.inspection as Record<string, unknown>).outcome, "clean");
+	assert.equal(reset.next_action, "start-fresh-ordinary-review-after-verified-clean");
+
+	const clean = await controllerCall(controller, ctx, { operation: "inspect" });
+	assert.equal((clean.inspection as Record<string, unknown>).outcome, "clean");
+	assert.equal(clean.status, "ready");
+
+	const started = await controllerCall(controller, ctx, {
+		operation: "start",
+		lineageId: "ordinary-after-reset",
+		idempotencyKey: "ordinary-after-reset-start",
+		input: JSON.stringify({ mode: "ordinary", projection: { kind: "complete" }, policyHash: "a".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }),
+	});
+	assert.equal(started.operation, "start");
+	assert.equal((started.state as Record<string, unknown>).mode, "ordinary");
+});
+
+test("controller rejects altered destructive reset bindings without authority mutation", async (t) => {
+	const fixture = createRepository(t, false);
+	createLegacyReviewAuthority(fixture.repository);
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository, true);
+	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
+	const original = (inspected.inspection as Record<string, unknown>).reset_request as Record<string, unknown>;
+
+	for (const altered of [
+		{ ...original, confirmation: `${String(original.confirmation)} altered` },
+		{ ...original, inventoryHash: "0".repeat(64) },
+	]) {
+		await assert.rejects(
+			controller.execute("altered-reset", { operation: "reset", input: JSON.stringify(altered) }, undefined, undefined, ctx),
+			/exactly match/i,
+		);
+		const unchanged = await controllerCall(controller, ctx, { operation: "inspect" });
+		assert.equal((unchanged.inspection as Record<string, unknown>).outcome, "blocked-legacy");
+		assert.deepEqual((unchanged.inspection as Record<string, unknown>).reset_request, original);
+		assert.equal(existsSync(join(fixture.repository, ".git", "gentle-ai", "reviews", "control", "reset-state.json")), false);
+	}
+});
+
+test("controller INSPECT preserves the durable recovery request after interrupted RESET changes inventory", async (t) => {
+	const fixture = createRepository(t, false);
+	createLegacyReviewAuthority(fixture.repository);
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository);
+	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
+	const original = (inspected.inspection as Record<string, unknown>).reset_request as Record<string, unknown>;
+
+	assert.throws(
+		() => destructiveResetReviewAuthorityV1({
+			cwd: fixture.repository,
+			repositoryId: String(original.repositoryId),
+			commonDirHash: String(original.commonDirHash),
+			inventoryHash: String(original.inventoryHash),
+			confirmation: String(original.confirmation),
+			faultAfterPhase: "deleting",
+		}),
+		/injected/i,
+	);
+	const interrupted = await controllerCall(controller, ctx, { operation: "inspect" });
+	assert.equal((interrupted.inspection as Record<string, unknown>).outcome, "reset-in-progress");
+	assert.deepEqual((interrupted.inspection as Record<string, unknown>).reset_request, original);
+	await assert.rejects(
+		controller.execute("unauthorized-recover", { operation: "recover", input: JSON.stringify(original) }, undefined, undefined, ctx),
+		/interactive Pi UI.*fails closed/i,
+	);
+	const stillInterrupted = await controllerCall(controller, ctx, { operation: "inspect" });
+	assert.deepEqual(stillInterrupted.inspection, interrupted.inspection);
+
+	const recovered = await controllerCall(controller, extensionContext(fixture.repository, true), {
+		operation: "recover",
+		input: JSON.stringify(original),
+	});
+	assert.equal((recovered.inspection as Record<string, unknown>).outcome, "clean");
+	assert.equal(recovered.next_action, "start-fresh-ordinary-review-after-verified-clean");
+});
+
+test("controller RECOVER rejects transplanted reset identity and common-directory hash without mutation", async (t) => {
+	const source = createRepository(t, false);
+	const target = createRepository(t, false);
+	createLegacyReviewAuthority(source.repository);
+	const { controller } = registerRuntime();
+	const sourceCtx = extensionContext(source.repository);
+	const sourceInspection = await controllerCall(controller, sourceCtx, { operation: "inspect" });
+	const sourceRequest = (sourceInspection.inspection as Record<string, unknown>).reset_request as Record<string, unknown>;
+	assert.throws(() => destructiveResetReviewAuthorityV1({
+		cwd: source.repository,
+		repositoryId: String(sourceRequest.repositoryId),
+		commonDirHash: String(sourceRequest.commonDirHash),
+		inventoryHash: String(sourceRequest.inventoryHash),
+		confirmation: String(sourceRequest.confirmation),
+		faultAfterPhase: "deleting",
+	}), /injected/i);
+	const sourceState = readFileSync(join(source.repository, ".git", "gentle-ai", "reviews", "control", "reset-state.json"), "utf8");
+
+	const cleanTarget = await controllerCall(controller, extensionContext(target.repository), { operation: "inspect" });
+	const targetRepositoryId = String((cleanTarget.inspection as Record<string, unknown>).repository_id);
+	const targetControl = join(target.repository, ".git", "gentle-ai", "reviews", "control");
+	mkdirSync(targetControl, { recursive: true });
+	const targetStatePath = join(targetControl, "reset-state.json");
+	writeFileSync(targetStatePath, sourceState);
+	const sentinel = join(target.parent, "transplanted-sentinel.txt");
+	writeFileSync(sentinel, "keep");
+
+	await assert.rejects(
+		controller.execute("transplanted-recovery", { operation: "recover", input: JSON.stringify(sourceRequest) }, undefined, undefined, extensionContext(target.repository, true)),
+		/current repository authority|repository identity|common directory/i,
+	);
+	assert.equal(readFileSync(targetStatePath, "utf8"), sourceState);
+	assert.equal(readFileSync(sentinel, "utf8"), "keep");
+	assert.equal(existsSync(join(target.repository, ".git", "gentle-ai", "reviews", "graph-v1")), false);
+
+	const targetInspection = await controllerCall(controller, extensionContext(target.repository), { operation: "inspect" }).catch(() => undefined);
+	assert.equal(targetInspection, undefined);
+	const foreignCommonHashState = rewriteResetState(target.repository, (body) => {
+		body.repository_id = targetRepositoryId;
+		body.common_directory_hash = "f".repeat(64);
+		const confirmation = `DESTROY REVIEW AUTHORITY ${body.repository_id} AT ${body.common_directory_hash} INVENTORY ${body.authorized_inventory_hash}`;
+		body.authorization_hash = domainHashV1("reset-authorization", confirmation);
+	});
+	await assert.rejects(
+		controller.execute("transplanted-hash-recovery", { operation: "recover", input: JSON.stringify(sourceRequest) }, undefined, undefined, extensionContext(target.repository, true)),
+		/current repository authority|common directory/i,
+	);
+	assert.equal(readFileSync(targetStatePath, "utf8"), foreignCommonHashState);
+	assert.equal(readFileSync(sentinel, "utf8"), "keep");
+});
+
+test("controller RECOVER rejects malicious quarantine paths before external deletion or state mutation", async (t) => {
+	const fixture = createRepository(t, false);
+	createLegacyReviewAuthority(fixture.repository);
+	const { controller } = registerRuntime();
+	const inspected = await controllerCall(controller, extensionContext(fixture.repository), { operation: "inspect" });
+	const request = (inspected.inspection as Record<string, unknown>).reset_request as Record<string, unknown>;
+	assert.throws(() => destructiveResetReviewAuthorityV1({
+		cwd: fixture.repository,
+		repositoryId: String(request.repositoryId),
+		commonDirHash: String(request.commonDirHash),
+		inventoryHash: String(request.inventoryHash),
+		confirmation: String(request.confirmation),
+		faultAfterPhase: "deleting",
+	}), /injected/i);
+	const external = join(fixture.repository, ".git", "gentle-ai", "reviews", "external", "lineages");
+	mkdirSync(external, { recursive: true });
+	const sentinel = join(external, "sentinel");
+	writeFileSync(sentinel, "keep");
+
+	for (const quarantinePath of ["../external", "reset-quarantine/../external"]) {
+		const state = rewriteResetState(fixture.repository, (body) => {
+			body.quarantine_relative_path = quarantinePath;
+		});
+		await assert.rejects(
+			controller.execute("malicious-quarantine-recovery", { operation: "recover", input: JSON.stringify(request) }, undefined, undefined, extensionContext(fixture.repository, true)),
+			/quarantine|recovery path|reset state/i,
+		);
+		assert.equal(readFileSync(sentinel, "utf8"), "keep");
+		assert.equal(readFileSync(join(fixture.repository, ".git", "gentle-ai", "reviews", "control", "reset-state.json"), "utf8"), state);
+	}
+});
+
+test("controller successfully starts the explicitly supported judgment-day mode", async (t) => {
+	const fixture = createRepository(t, false);
+	const { controller } = registerRuntime();
+	const started = await controllerCall(controller, extensionContext(fixture.repository), {
+		operation: "start",
+		lineageId: "judgment-day-start",
+		idempotencyKey: "judgment-day-start-key",
+		input: JSON.stringify({ mode: "judgment-day", projection: { kind: "complete" }, policyHash: "a".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }),
+	});
+	assert.equal(started.operation, "start");
+	assert.equal((started.state as Record<string, unknown>).mode, "judgment-day");
+});
+
+test("failed START gives exact mode and serialization guidance and creates no lineage", async (t) => {
+	const fixture = createRepository(t, false);
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository);
+
+	await assert.rejects(
+		controller.execute("unsupported-start", {
+			operation: "start",
+			lineageId: "unsupported-start",
+			idempotencyKey: "unsupported-start-key",
+			input: JSON.stringify({ mode: "standard" }),
+		}, undefined, undefined, ctx),
+		/only "ordinary" or "judgment-day".*JSON string.*no lineage was created.*do not call STATUS or ADVANCE/is,
+	);
+	await assert.rejects(
+		controller.execute("nested-start-input", {
+			operation: "start",
+			lineageId: "nested-start-input",
+			idempotencyKey: "nested-start-input-key",
+			input: { mode: "ordinary" },
+		}, undefined, undefined, ctx),
+		/START input must be a JSON string.*no lineage was created.*do not call STATUS or ADVANCE/is,
+	);
+	await assert.rejects(
+		controller.execute("invalid-json-start-input", {
+			operation: "start",
+			lineageId: "invalid-json-start-input",
+			idempotencyKey: "invalid-json-start-input-key",
+			input: "{not-json}",
+		}, undefined, undefined, ctx),
+		/START input must be a JSON string encoding an object.*no lineage was created.*do not call STATUS or ADVANCE/is,
+	);
+	assert.equal(existsSync(join(fixture.repository, ".git", "gentle-ai", "reviews", "graph-v1")), false);
+});
+
+test("ambiguous START output loss is recovered only by exact idempotent replay", async (t) => {
+	const fixture = createRepository(t, false);
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository);
+	const request = {
+		operation: "start",
+		lineageId: "ambiguous-start",
+		idempotencyKey: "ambiguous-start-key",
+		input: JSON.stringify({ mode: "ordinary", projection: { kind: "complete" }, policyHash: "a".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }),
+	};
+
+	await controllerCall(controller, ctx, request); // Simulate committed authority whose response was lost.
+	const replay = await controllerCall(controller, ctx, request);
+	assert.deepEqual(replay.result, { lineage_id: "ambiguous-start", revision: 0, phase: "started" });
+	await assert.rejects(
+		controller.execute("changed-start-replay", { ...request, input: JSON.stringify({ mode: "ordinary", projection: { kind: "complete" }, policyHash: "c".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }) }, undefined, undefined, ctx),
+		/idempotency key.*different.*request/i,
+	);
+});
+
+test("shipped controller and orchestrator contracts specify inspect-first START without cascade", () => {
+	const { controller } = registerRuntime();
+	const toolContract = [
+		controller.description,
+		controller.promptSnippet ?? "",
+		...(controller.promptGuidelines ?? []),
+		JSON.stringify(controller.parameters),
+	].join("\n");
+	assert.match(toolContract, /operation.*start.*lineageId.*idempotencyKey.*input/is);
+	assert.match(toolContract, /mode\\?":\\?"ordinary|mode.*ordinary/is);
+	assert.match(toolContract, /ordinary.*judgment-day/is);
+	assert.match(toolContract, /input.*JSON string/is);
+	assert.match(toolContract, /blocked-legacy.*explicit.*authorization/is);
+	assert.match(toolContract, /reset.*inspect.*clean.*start/is);
+	assert.match(toolContract, /output.*lost|response.*lost|ambiguous.*START/is);
+	assert.match(toolContract, /same lineageId.*idempotencyKey.*request/is);
+	assert.doesNotMatch(toolContract, /START throws.*lineage does not exist/is);
+
+	for (const path of ["assets/orchestrator-delegation.md", "skills/gentle-ai/SKILL.md"]) {
+		const contract = readFileSync(path, "utf8");
+		assert.match(contract, /INSPECT before START|inspect.*before.*start/is, path);
+		assert.match(contract, /mode `ordinary`|mode.*ordinary/is, path);
+		assert.match(contract, /Judgment Day.*explicit/is, path);
+		assert.match(contract, /before authority access.*no lineage|pre-authority.*no lineage/is, path);
+		assert.match(contract, /same `?lineageId`?.*`?idempotencyKey`?.*request/is, path);
+	}
+	for (const path of ["assets/orchestrator-delegation.md", "skills/gentle-ai/SKILL.md"]) {
+		const recoveryContract = readFileSync(path, "utf8");
+		assert.match(recoveryContract, /blocked-legacy.*explicit.*authoriz/is, path);
+		assert.match(recoveryContract, /RESET.*RECOVER.*internally.*INSPECT|RESET.*RECOVER.*verified.*clean/is, path);
+	}
 });
 
 test("registered controller creates, advances, reports, and authorizes an exact all-tracked commit once", async (t) => {

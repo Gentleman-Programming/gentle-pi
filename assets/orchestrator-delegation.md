@@ -177,6 +177,20 @@ If multiple rows match, run the narrow set that covers the risk. Example: shell 
 
 ## Bounded Review Transaction Contract
 
+### Controller Start and Recovery Routing
+
+Call `gentle_review` INSPECT before START. On `clean`, ordinary review uses this outer tool shape, with `input` serialized as a JSON string rather than supplied as a nested object:
+
+```json
+{"operation":"start","lineageId":"<lineage>","idempotencyKey":"<key>","input":"{\"mode\":\"ordinary\",\"projection\":{\"kind\":\"complete\"},\"policyHash\":\"<hash>\",\"evidenceHash\":\"<hash>\",\"budget\":{...}}"}
+```
+
+START supports exactly `ordinary` and `judgment-day`. Use mode `ordinary` for normal review. Use `judgment-day` only when the user explicitly selected Judgment Day.
+
+When INSPECT or START reports `blocked-legacy` or `blocked-mixed`, do not retry START and do not present migration as an option. Explain that the old receipts, approvals, ledgers, and lineages will lose authority, then request explicit user authorization for the exact returned `reset_request.confirmation`. RESET and RECOVER independently require a fresh operation-bound confirmation through the interactive Pi UI and fail closed in headless execution. The UI boundary cannot cryptographically attest the human's identity, so its residual trust is the operator controlling that Pi session; challenge freshness and repository/inventory binding remain runtime-enforced. Only after authorization, call RESET with the exact serialized `reset_request`; RESET and RECOVER internally INSPECT authority, and only a returned `clean` inspection with `start-fresh-ordinary-review-after-verified-clean` permits an immediate fresh ordinary START. If INSPECT reports `reset-in-progress`, use its durable original `reset_request` for authorized RECOVER.
+
+A `lineage_created: false` result or a validation error explicitly marked as occurring before authority access proves that no lineage was created; never call STATUS or ADVANCE for that attempt. A thrown START after authority access or lost output/response is ambiguous because authority may already be committed. Before any fresh START, replay or resume with the same `lineageId`, `idempotencyKey`, and exact request; the durable journal must return the committed result or reject a mismatch. Never choose a different fresh lineage merely because START output was lost.
+
 Ordinary review runs the selected zero, one, or four lenses exactly once against `initial_review_tree`.
 
 Before corroboration, the controller freezes canonical ID-sorted identity, claim, and evidence rows under `frozen_ledger_hash`.
