@@ -841,9 +841,32 @@ test("controller binds push, PR, and release authorization to exact command argu
 				undefined,
 				ctx,
 			),
-			/exactly derive|unsupported.*push|complete ref update/i,
+			/exactly derive|unsupported.*push|complete ref update|force push refspec/i,
 		);
 	}
+	await t.test("rejects force refspecs and unsupported push --repo parsing", async () => {
+		for (const [command, pattern] of [
+			["git push origin +main:main", /force push refspec/i],
+			["git push --repo attacker origin main:main", /unsupported push option.*--repo/i],
+		] as const) {
+			await assert.rejects(
+				controller.execute(
+					"unsafe-push-form",
+					{
+						operation: "validate",
+						lineageId: "controller-targets",
+						idempotencyKey: `unsafe-push-form-${command.length}`,
+						command,
+						input: JSON.stringify({ scopeBudget: budget() }),
+					},
+					undefined,
+					undefined,
+					ctx,
+				),
+				pattern,
+			);
+		}
+	});
 	for (const [command, key] of [
 		["env SAFE=1 git push --follow-tags origin main:main", "env"],
 		["command git push origin --follow-tags main:main", "command"],
@@ -928,6 +951,202 @@ test("controller binds push, PR, and release authorization to exact command argu
 	);
 	assert.equal(mismatchedRelease?.block, true);
 	assert.match(mismatchedRelease?.reason ?? "", /registered review controller authorization/i);
+});
+
+test("controller authorizes the exact first push after an approved intended-commit receipt", async (t) => {
+	const fixture = createRepository(t, true);
+	assert.ok(fixture.finalCommit && fixture.finalTree);
+	const fetchRemotePath = join(fixture.parent, "fetch.git");
+	const pushRemotePath = join(fixture.parent, "push.git");
+	execFileSync("git", ["clone", "--bare", fixture.repository, fetchRemotePath], {
+		cwd: fixture.parent,
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	execFileSync("git", ["--git-dir", fetchRemotePath, "update-ref", "refs/heads/feature/first-push", fixture.finalCommit]);
+	execFileSync("git", ["clone", "--bare", fixture.repository, pushRemotePath], {
+		cwd: fixture.parent,
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	execFileSync("git", ["--git-dir", pushRemotePath, "update-ref", "refs/heads/main", fixture.baseCommit]);
+	git(fixture.repository, "remote", "add", "origin", fetchRemotePath);
+	git(fixture.repository, "remote", "set-url", "--add", "--push", "origin", pushRemotePath);
+	git(fixture.repository, "branch", "feature/first-push", fixture.finalCommit);
+	createTerminalAuthority(fixture, "controller-first-push");
+	const { controller, toolCall } = registerRuntime();
+	const ctx = extensionContext(fixture.repository, true);
+	const command = "git push -u origin feature/first-push";
+	const validated = await controllerCall(controller, ctx, {
+		operation: "validate",
+		lineageId: "controller-first-push",
+		idempotencyKey: "controller-first-push-gate",
+		command,
+		input: JSON.stringify({ scopeBudget: budget() }),
+	});
+
+	assert.equal((validated.result as Record<string, unknown>).status, "allow", JSON.stringify(validated));
+	const derivedTarget = validated.derived_target as Record<string, unknown>;
+	assert.equal((derivedTarget.updates as Array<Record<string, unknown>>)[0]?.kind, "create");
+	assert.equal(await toolCall({ toolName: "bash", input: { command } }, ctx), undefined);
+});
+
+test("controller resolves explicit abbreviated push destinations against advertised refs", async (t) => {
+	const fixture = createRepository(t, true);
+	assert.ok(fixture.finalCommit && fixture.finalTree);
+	const remotePath = join(fixture.parent, "destination-resolution.git");
+	execFileSync("git", ["clone", "--bare", fixture.repository, remotePath], {
+		cwd: fixture.parent,
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	execFileSync("git", ["--git-dir", remotePath, "update-ref", "refs/tags/publish-target", fixture.baseCommit]);
+	git(fixture.repository, "remote", "add", "origin", remotePath);
+	createTerminalAuthority(fixture, "controller-destination-resolution");
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository, true);
+	const validated = await controllerCall(controller, ctx, {
+		operation: "validate",
+		lineageId: "controller-destination-resolution",
+		idempotencyKey: "controller-destination-tag",
+		command: "git push origin final:publish-target",
+		input: JSON.stringify({ scopeBudget: budget() }),
+	});
+	const update = (validated.derived_target as { updates: Array<Record<string, unknown>> }).updates[0];
+	assert.equal(update?.destination_ref, "refs/tags/publish-target");
+
+	execFileSync("git", ["--git-dir", remotePath, "update-ref", "refs/heads/ambiguous-target", fixture.baseCommit]);
+	execFileSync("git", ["--git-dir", remotePath, "update-ref", "refs/tags/ambiguous-target", fixture.baseCommit]);
+	await assert.rejects(
+		controller.execute(
+			"ambiguous-push-destination",
+			{
+				operation: "validate",
+				lineageId: "controller-destination-resolution",
+				idempotencyKey: "controller-destination-ambiguous",
+				command: "git push origin final:ambiguous-target",
+				input: JSON.stringify({ scopeBudget: budget() }),
+			},
+			undefined,
+			undefined,
+			ctx,
+		),
+		/ambiguous/i,
+	);
+});
+
+test("controller push probes preserve safe user URL rewriting and ordinary credentials", async (t) => {
+	const fixture = createRepository(t, true);
+	assert.ok(fixture.finalCommit && fixture.finalTree);
+	const fetchRemotePath = join(fixture.parent, "fetch.git");
+	const pushRemotePath = join(fixture.parent, "push.git");
+	const userHome = join(fixture.parent, "home");
+	mkdirSync(userHome);
+	execFileSync("git", ["init", "--bare", fetchRemotePath], { cwd: fixture.parent, stdio: ["ignore", "pipe", "pipe"] });
+	execFileSync("git", ["clone", "--bare", fixture.repository, pushRemotePath], { cwd: fixture.parent, stdio: ["ignore", "pipe", "pipe"] });
+	execFileSync("git", ["--git-dir", pushRemotePath, "update-ref", "refs/heads/main", fixture.baseCommit]);
+	const logicalPushUrl = "https://github.com/example/first-push.git";
+	execFileSync("git", ["config", "--global", `url.${pushRemotePath}.insteadOf`, logicalPushUrl], {
+		env: { ...process.env, HOME: userHome },
+	});
+	git(fixture.repository, "remote", "add", "origin", fetchRemotePath);
+	git(fixture.repository, "remote", "set-url", "--add", "--push", "origin", logicalPushUrl);
+	git(fixture.repository, "branch", "feature/safe-config", fixture.finalCommit);
+	createTerminalAuthority(fixture, "controller-safe-config");
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository, true);
+	const originalEnvironment = new Map<string, string | undefined>();
+	for (const [key, value] of Object.entries({
+		HOME: userHome,
+		GIT_ASKPASS: join(fixture.parent, "askpass"),
+	})) {
+		originalEnvironment.set(key, process.env[key]);
+		process.env[key] = value;
+	}
+	t.after(() => {
+		for (const [key, value] of originalEnvironment) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	});
+
+	const validated = await controllerCall(controller, ctx, {
+		operation: "validate",
+		lineageId: "controller-safe-config",
+		idempotencyKey: "controller-safe-config-gate",
+		command: "git push -u origin feature/safe-config",
+		input: JSON.stringify({ scopeBudget: budget() }),
+	});
+	assert.equal((validated.result as Record<string, unknown>).status, "allow", JSON.stringify(validated));
+});
+
+test("controller blocks a previously authorized push when inherited Git config injection appears at execution", async (t) => {
+	const fixture = createRepository(t, true);
+	assert.ok(fixture.finalCommit && fixture.finalTree);
+	const pushRemotePath = join(fixture.parent, "execution-boundary-push.git");
+	execFileSync("git", ["clone", "--bare", fixture.repository, pushRemotePath], {
+		cwd: fixture.parent,
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	execFileSync("git", ["--git-dir", pushRemotePath, "update-ref", "refs/heads/main", fixture.baseCommit]);
+	git(fixture.repository, "remote", "add", "origin", pushRemotePath);
+	git(fixture.repository, "branch", "feature/execution-boundary", fixture.finalCommit);
+	createTerminalAuthority(fixture, "controller-execution-boundary");
+	const { controller, toolCall } = registerRuntime();
+	const ctx = extensionContext(fixture.repository, true);
+	const command = "git push -u origin feature/execution-boundary";
+	const validated = await controllerCall(controller, ctx, {
+		operation: "validate",
+		lineageId: "controller-execution-boundary",
+		idempotencyKey: "controller-execution-boundary-gate",
+		command,
+		input: JSON.stringify({ scopeBudget: budget() }),
+	});
+	assert.equal((validated.result as Record<string, unknown>).status, "allow");
+
+	const originalCount = process.env.GIT_CONFIG_COUNT;
+	const originalKey = process.env.GIT_CONFIG_KEY_0;
+	const originalValue = process.env.GIT_CONFIG_VALUE_0;
+	process.env.GIT_CONFIG_COUNT = "1";
+	process.env.GIT_CONFIG_KEY_0 = "remote.origin.pushurl";
+	process.env.GIT_CONFIG_VALUE_0 = join(fixture.parent, "attacker.git");
+	try {
+		const blocked = await toolCall({ toolName: "bash", input: { command } }, ctx);
+		assert.equal(blocked?.block, true);
+		assert.match(blocked?.reason ?? "", /Git.*environment|routing|configuration override/i);
+	} finally {
+		if (originalCount === undefined) delete process.env.GIT_CONFIG_COUNT;
+		else process.env.GIT_CONFIG_COUNT = originalCount;
+		if (originalKey === undefined) delete process.env.GIT_CONFIG_KEY_0;
+		else process.env.GIT_CONFIG_KEY_0 = originalKey;
+		if (originalValue === undefined) delete process.env.GIT_CONFIG_VALUE_0;
+		else process.env.GIT_CONFIG_VALUE_0 = originalValue;
+	}
+});
+
+test("controller fails closed when a configured remote has multiple pushurl destinations", async (t) => {
+	const fixture = createRepository(t, true);
+	assert.ok(fixture.finalCommit);
+	const fetchRemotePath = join(fixture.parent, "fetch.git");
+	const firstPushPath = join(fixture.parent, "push-one.git");
+	const secondPushPath = join(fixture.parent, "push-two.git");
+	for (const path of [fetchRemotePath, firstPushPath, secondPushPath]) {
+		execFileSync("git", ["init", "--bare", path], { cwd: fixture.parent, stdio: ["ignore", "pipe", "pipe"] });
+	}
+	git(fixture.repository, "remote", "add", "origin", fetchRemotePath);
+	git(fixture.repository, "remote", "set-url", "--add", "--push", "origin", firstPushPath);
+	git(fixture.repository, "remote", "set-url", "--add", "--push", "origin", secondPushPath);
+	git(fixture.repository, "branch", "feature/multiple-pushurl", fixture.finalCommit);
+	createTerminalAuthority(fixture, "controller-multiple-pushurl");
+	const { controller } = registerRuntime();
+
+	await assert.rejects(
+		controller.execute("multiple-pushurl", {
+			operation: "validate",
+			lineageId: "controller-multiple-pushurl",
+			idempotencyKey: "controller-multiple-pushurl-gate",
+			command: "git push -u origin feature/multiple-pushurl",
+			input: JSON.stringify({ scopeBudget: budget() }),
+		}, undefined, undefined, extensionContext(fixture.repository, true)),
+		/multiple pushurl|one effective push destination/i,
+	);
 });
 
 test("controller release fast path bypasses receipt validation only for the proven immutable origin/main SHA", async (t) => {

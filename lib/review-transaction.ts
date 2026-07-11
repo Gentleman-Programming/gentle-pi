@@ -19,6 +19,7 @@ import { ReviewGraphObjectStoreV1 } from "./review-object-store.ts";
 import { assertNoLegacyReviewAuthorityV1 } from "./review-legacy-detector.ts";
 import { createReviewEventV1 } from "./review-graph-schema.ts";
 import {
+	publicationProbeGitEnvironment,
 	resolveRepositoryAuthorityV1,
 	reviewGitEnvironment,
 	type RepositoryAuthorityV1,
@@ -282,6 +283,7 @@ export type PushRefUpdateV1 = PushCreateUpdateV1 | PushExistingUpdateV1;
 export interface PushGateTargetV1 {
 	kind: typeof GATE_TARGET_KIND.PUSH;
 	remote: string;
+	destination_id: string;
 	updates: readonly PushRefUpdateV1[];
 }
 
@@ -1787,7 +1789,7 @@ interface GateTargetInspection {
 	reason: string;
 }
 
-const FULL_REF = /^refs\/(?:heads|tags)\/[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
+const FULL_REF = /^refs\/[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -1798,7 +1800,15 @@ function isObjectId(value: unknown): value is string {
 }
 
 function isFullRef(value: unknown): value is string {
-	return typeof value === "string" && FULL_REF.test(value) && !value.includes("..");
+	return (
+		typeof value === "string" &&
+		FULL_REF.test(value) &&
+		!value.includes("..") &&
+		!value.includes("//") &&
+		!value.includes("/.") &&
+		!value.endsWith("/") &&
+		!value.endsWith(".")
+	);
 }
 
 function runGateGit(cwd: string, args: readonly string[]): string {
@@ -1835,11 +1845,174 @@ function listConfiguredRemotes(cwd: string): string[] {
 	return result.stdout.split(/\r?\n/).filter(Boolean);
 }
 
-// Resolves `remote` to the repository's actually configured remote URL. The
-// caller may only ever supply a bare configured remote NAME (default and
-// expected: "origin") — never a URL or filesystem path — so a caller can
-// never redirect the release fast path's remote-head proof to an
-// attacker-controlled endpoint.
+// Resolves one configured remote NAME to the single endpoint Git would use
+// for push, including pushurl and user URL rewrites. Callers can never replace
+// that configured binding with an arbitrary URL or filesystem path.
+export interface ConfiguredPushDestinationV1 {
+	remote: string;
+	url: string;
+	destination_id: string;
+}
+
+function configuredRemoteValues(cwd: string, key: string): string[] {
+	const result = spawnSync("git", ["-C", cwd, "config", "--get-all", key], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+		env: publicationProbeGitEnvironment(),
+	});
+	if (result.error || (result.status !== 0 && result.status !== 1)) {
+		throw new ReviewIntegrityError(`Configured Git remote value "${key}" could not be resolved`);
+	}
+	if (result.status === 1) return [];
+	return result.stdout.split(/\r?\n/).filter(Boolean);
+}
+
+export function resolveConfiguredPushDestinationV1(cwd: string, remote: string): ConfiguredPushDestinationV1 {
+	if (typeof remote !== "string" || !CONFIGURED_REMOTE_NAME.test(remote)) {
+		throw new ReviewIntegrityError(
+			"Publication remote must be a bare configured Git remote name, not a URL or path",
+		);
+	}
+	if (!listConfiguredRemotes(cwd).includes(remote)) {
+		throw new ReviewIntegrityError(`Publication remote "${remote}" is not a configured Git remote`);
+	}
+	const result = spawnSync("git", ["-C", cwd, "remote", "get-url", "--push", "--all", remote], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+		env: publicationProbeGitEnvironment(),
+	});
+	if (result.error || result.status !== 0) {
+		throw new ReviewIntegrityError(`Configured remote "${remote}" push destination could not be resolved`);
+	}
+	const urls = result.stdout.split(/\r?\n/).filter(Boolean);
+	if (urls.length !== 1) throw new ReviewIntegrityError(`Configured remote "${remote}" must have one effective push destination`);
+	const configuredPushUrls = configuredRemoteValues(cwd, `remote.${remote}.pushurl`);
+	if (configuredPushUrls.length > 1) throw new ReviewIntegrityError(`Configured remote "${remote}" has multiple pushurl destinations`);
+	return {
+		remote,
+		url: urls[0]!,
+		destination_id: createHash("sha256").update(urls[0]!).digest("hex"),
+	};
+}
+
+export function resolvePushRemoteRefV1(
+	cwd: string,
+	remote: string,
+	ref: string,
+	label: string,
+	expectedDestinationId?: string,
+): { destination: ConfiguredPushDestinationV1; object_id: string | null } {
+	const destination = resolveConfiguredPushDestinationV1(cwd, remote);
+	if (expectedDestinationId !== undefined && destination.destination_id !== expectedDestinationId) {
+		throw new ReviewIntegrityError(`${label} publication destination changed or does not match`);
+	}
+	if (!isFullRef(ref)) throw new ReviewIntegrityError(`${label} is not a full ref`);
+	const result = spawnSync("git", ["ls-remote", "--refs", destination.url, ref], {
+		cwd,
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+		env: publicationProbeGitEnvironment(),
+	});
+	if (result.error) {
+		throw new ReviewIntegrityError(`${label} could not be resolved: ${result.error.message}`);
+	}
+	if (result.status !== 0) {
+		throw new ReviewIntegrityError(`${label} could not be resolved`);
+	}
+	if (result.stdout.length === 0) return { destination, object_id: null };
+	const rows = result.stdout.split(/\r?\n/).filter(Boolean);
+	const matches = rows.flatMap((line) => {
+		const parts = line.split("\t");
+		return parts.length === 2 && parts[1] === ref && isObjectId(parts[0]) ? [parts[0]] : [];
+	});
+	if (matches.length !== rows.length) throw new ReviewIntegrityError(`${label} returned malformed output`);
+	if (matches.length !== 1) {
+		throw new ReviewIntegrityError(`${label} resolved ambiguously`);
+	}
+	return { destination, object_id: matches[0]! };
+}
+
+export function resolvePushDestinationRefV1(
+	cwd: string,
+	remote: string,
+	destinationValue: string,
+	sourceRef: string,
+	label: string,
+): { destination: ConfiguredPushDestinationV1; ref: string; object_id: string | null } {
+	if (destinationValue.startsWith("refs/")) {
+		const resolved = resolvePushRemoteRefV1(cwd, remote, destinationValue, label);
+		return { ...resolved, ref: destinationValue };
+	}
+	const formatCheck = spawnSync("git", ["check-ref-format", `refs/${destinationValue}`], {
+		cwd,
+		stdio: "ignore",
+		env: reviewGitEnvironment(),
+	});
+	if (formatCheck.error || formatCheck.status !== 0) {
+		throw new ReviewIntegrityError(`${label} is malformed`);
+	}
+	const destination = resolveConfiguredPushDestinationV1(cwd, remote);
+	const result = spawnSync("git", ["ls-remote", "--refs", destination.url], {
+		cwd,
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+		env: publicationProbeGitEnvironment(),
+	});
+	if (result.error || result.status !== 0) {
+		throw new ReviewIntegrityError(`${label} could not be resolved`);
+	}
+	const rows = result.stdout.split(/\r?\n/).filter(Boolean);
+	const advertised = rows.flatMap((line) => {
+		const parts = line.split("\t");
+		return parts.length === 2 && isObjectId(parts[0]) && isFullRef(parts[1])
+			? [{ object_id: parts[0], ref: parts[1] }]
+			: [];
+	});
+	if (advertised.length !== rows.length || new Set(advertised.map(({ ref }) => ref)).size !== advertised.length) {
+		throw new ReviewIntegrityError(`${label} returned malformed output`);
+	}
+	const matches = advertised.filter(({ ref }) => ref.endsWith(`/${destinationValue}`));
+	if (matches.length > 1) throw new ReviewIntegrityError(`${label} resolved ambiguously`);
+	if (matches.length === 1) return { destination, ...matches[0]! };
+	const namespace = sourceRef.startsWith("refs/heads/")
+		? "refs/heads/"
+		: sourceRef.startsWith("refs/tags/")
+			? "refs/tags/"
+			: undefined;
+	if (!namespace) throw new ReviewIntegrityError(`${label} namespace cannot be inferred from the source ref`);
+	return { destination, ref: `${namespace}${destinationValue}`, object_id: null };
+}
+
+function pushRemoteAdvertisesObjectV1(
+	cwd: string,
+	remote: string,
+	expectedDestinationId: string,
+	objectId: string,
+): boolean {
+	const destination = resolveConfiguredPushDestinationV1(cwd, remote);
+	if (destination.destination_id !== expectedDestinationId) {
+		throw new ReviewIntegrityError("Push parent publication destination changed or does not match");
+	}
+	const result = spawnSync("git", ["ls-remote", "--refs", destination.url], {
+		cwd,
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+		env: publicationProbeGitEnvironment(),
+	});
+	if (result.error || result.status !== 0) {
+		throw new ReviewIntegrityError("Push parent advertisement could not be resolved");
+	}
+	const rows = result.stdout.split(/\r?\n/).filter(Boolean);
+	const advertised = rows.flatMap((line) => {
+		const parts = line.split("\t");
+		return parts.length === 2 && isObjectId(parts[0]) && isFullRef(parts[1]) ? [parts[0]] : [];
+	});
+	if (advertised.length !== rows.length) {
+		throw new ReviewIntegrityError("Push parent advertisement returned malformed output");
+	}
+	return advertised.includes(objectId);
+}
+
 function resolveConfiguredRemoteUrl(cwd: string, remote: string): string {
 	if (typeof remote !== "string" || !CONFIGURED_REMOTE_NAME.test(remote)) {
 		throw new ReviewIntegrityError(
@@ -1876,12 +2049,8 @@ function resolveRemoteGateRef(
 		stdio: ["ignore", "pipe", "pipe"],
 		env: reviewGitEnvironment(),
 	});
-	if (result.error) {
-		throw new ReviewIntegrityError(`${label} could not be resolved: ${result.error.message}`);
-	}
-	if (result.status !== 0) {
-		throw new ReviewIntegrityError(`${label} could not be resolved`);
-	}
+	if (result.error) throw new ReviewIntegrityError(`${label} could not be resolved: ${result.error.message}`);
+	if (result.status !== 0) throw new ReviewIntegrityError(`${label} could not be resolved`);
 	const matches = result.stdout
 		.split(/\r?\n/)
 		.filter(Boolean)
@@ -1890,9 +2059,7 @@ function resolveRemoteGateRef(
 			return remoteRef === ref && isObjectId(objectId) ? [objectId] : [];
 		});
 	if (matches.length === 0) return null;
-	if (matches.length !== 1) {
-		throw new ReviewIntegrityError(`${label} resolved ambiguously`);
-	}
+	if (matches.length !== 1) throw new ReviewIntegrityError(`${label} resolved ambiguously`);
 	return matches[0]!;
 }
 
@@ -1939,6 +2106,9 @@ function inspectPushTarget(
 	if (typeof target.remote !== "string") {
 		return { valid: false, matchesReceipt: false, reason: "Push target requires an exact remote identity." };
 	}
+	if (typeof target.destination_id !== "string" || !DIGEST.test(target.destination_id)) {
+		return { valid: false, matchesReceipt: false, reason: "Push target requires one bound publication destination." };
+	}
 	if (!Array.isArray(target.updates) || target.updates.length === 0) {
 		return { valid: false, matchesReceipt: false, reason: "Push target requires a complete non-empty update set." };
 	}
@@ -1981,14 +2151,27 @@ function inspectPushTarget(
 				return { valid: false, matchesReceipt: false, reason: "Push create must bind an explicitly absent old identity." };
 			}
 			if (
-				resolveRemoteGateRef(
+				resolvePushRemoteRefV1(
 					repositoryCwd,
 					target.remote,
 					value.destination_ref,
 					"push remote destination ref",
-				) !== null
+					target.destination_id,
+				).object_id !== null
 			) {
 				return { valid: false, matchesReceipt: false, reason: "Push create destination ref already exists." };
+			}
+			const parentLine = runGateGit(repositoryCwd, ["rev-list", "--parents", "-n", "1", value.new_peeled_commit]);
+			const parents = parentLine.split(" ");
+			if (parents.length !== 2 || parents[0] !== value.new_peeled_commit || !isObjectId(parents[1])) {
+				return { valid: false, matchesReceipt: false, reason: "Push create requires exactly one resolved parent commit." };
+			}
+			const parent = parents[1]!;
+			if (runGateGit(repositoryCwd, ["rev-parse", "--verify", `${parent}^{tree}`]) !== receipt.body.base_tree) {
+				return { valid: false, matchesReceipt: false, reason: "Push create parent tree does not match the approved receipt base tree." };
+			}
+			if (!pushRemoteAdvertisesObjectV1(repositoryCwd, target.remote, target.destination_id, parent)) {
+				return { valid: false, matchesReceipt: false, reason: "Push create parent is not advertised by the bound publication destination." };
 			}
 		} else if (value.kind === PUSH_UPDATE_KIND.UPDATE) {
 			if (
@@ -1998,12 +2181,13 @@ function inspectPushTarget(
 			) {
 				return { valid: false, matchesReceipt: false, reason: "Push old identity is unresolved." };
 			}
-			const destinationObject = resolveRemoteGateRef(
+			const destinationObject = resolvePushRemoteRefV1(
 				repositoryCwd,
 				target.remote,
 				value.destination_ref,
 				"push remote destination ref",
-			);
+				target.destination_id,
+			).object_id;
 			if (destinationObject === null) {
 				return { valid: false, matchesReceipt: false, reason: "Push update destination ref does not exist." };
 			}

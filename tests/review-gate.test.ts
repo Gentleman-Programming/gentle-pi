@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -22,6 +22,7 @@ import {
 	evaluateGateTarget,
 	evaluateReleaseFastPathV1,
 	recheckReleaseFastPathRemoteHeadV1,
+	resolveConfiguredPushDestinationV1,
 	validateReviewGate,
 	type GateTargetV1,
 	type GhCommandRunnerV1,
@@ -32,6 +33,7 @@ import {
 	type ReviewStateV1,
 } from "../lib/review-transaction.ts";
 import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
+import { inheritedUnsafeGitEnvironmentKeys } from "../lib/review-repository.ts";
 import { qualifiedReviewLockPlatform, testSnapshot } from "./review-test-fixtures.ts";
 
 interface GateRepository {
@@ -45,6 +47,19 @@ interface GateRepository {
 	finalCommit: string;
 	tagObject: string;
 }
+
+test("unsafe publication Git environment matching preserves actual mixed-case keys", () => {
+	assert.deepEqual(
+		inheritedUnsafeGitEnvironmentKeys({
+			git_config_count: "1",
+			Git_Config_Key_0: "remote.origin.pushurl",
+			git_config_value_0: "attacker",
+			GIT_SSH_COMMAND: "unsafe",
+			GIT_ASKPASS: "safe",
+		}),
+		["GIT_SSH_COMMAND", "Git_Config_Key_0", "git_config_count", "git_config_value_0"],
+	);
+});
 
 function createGateRepository(t: test.TestContext): GateRepository {
 	const parent = mkdtempSync(join(tmpdir(), "gentle-pi-gate-repo-"));
@@ -289,9 +304,11 @@ test("changed exact target returns one deterministic child with a non-refreshing
 test("push gate allows normal same-name updates while preserving exact-old and create rules", (t) => {
 	const authority = temporaryAuthority(t);
 	const { repository, remote, baseTree, finalTree, baseCommit, finalCommit, receipt } = authority;
+	const destination = resolveConfiguredPushDestinationV1(repository, remote);
 	const target = {
 		kind: GATE_TARGET_KIND.PUSH,
 		remote,
+		destination_id: destination.destination_id,
 		updates: [
 			{
 				kind: PUSH_UPDATE_KIND.CREATE,
@@ -366,10 +383,105 @@ test("push gate allows normal same-name updates while preserving exact-old and c
 		evaluateGateTarget(receipt, { ...target, remote: "missing-remote" }, repository).status,
 		GATE_RESULT.DENY,
 	);
+	const changedDestination = join(authority.repository, "changed-destination.git");
+	execFileSync("git", ["init", "--bare", changedDestination], { stdio: ["ignore", "pipe", "pipe"] });
+	execFileSync("git", ["remote", "set-url", "--add", "--push", remote, changedDestination], { cwd: repository });
+	assert.equal(
+		evaluateGateTarget(receipt, target, repository).status,
+		GATE_RESULT.DENY,
+		"a target bound to the former publication destination must fail closed",
+	);
+});
+
+test("push gate treats only successful empty output as absent and fails closed on probe failures", async (t) => {
+	const authority = temporaryAuthority(t);
+	const { repository, remote, finalTree, finalCommit, receipt } = authority;
+	const destination = resolveConfiguredPushDestinationV1(repository, remote);
+	const target = {
+		kind: GATE_TARGET_KIND.PUSH,
+		remote,
+		destination_id: destination.destination_id,
+		updates: [{
+			kind: PUSH_UPDATE_KIND.CREATE,
+			source_ref: "refs/heads/final",
+			destination_ref: "refs/heads/feature",
+			old_object: null,
+			old_peeled_commit: null,
+			old_tree: null,
+			new_object: finalCommit,
+			new_peeled_commit: finalCommit,
+			new_tree: finalTree,
+		}],
+	} as const;
+	assert.equal(evaluateGateTarget(receipt, target, repository).status, GATE_RESULT.ALLOW);
+	const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+	const originalPath = process.env.PATH;
+	for (const [name, body] of [
+		["nonzero", "exit 1"],
+		["malformed", "printf 'not-a-valid-row\\n'; exit 0"],
+		["ambiguous", `printf '${finalCommit}\\trefs/heads/feature\\n${finalCommit}\\trefs/heads/feature\\n'; exit 0`],
+	] as const) {
+		await t.test(name, () => {
+			const bin = join(authority.repository, `fake-git-${name}`);
+			mkdirSync(bin);
+			const fakeGit = join(bin, "git");
+			writeFileSync(fakeGit, `#!/bin/sh\nif [ "$1" = "ls-remote" ]; then ${body}; fi\nexec "${realGit}" "$@"\n`);
+			chmodSync(fakeGit, 0o755);
+			process.env.PATH = `${bin}:${originalPath ?? ""}`;
+			try {
+				const result = evaluateGateTarget(receipt, target, repository);
+				assert.equal(result.status, GATE_RESULT.DENY, result.reason);
+			} finally {
+				process.env.PATH = originalPath;
+			}
+		});
+	}
+});
+
+test("push CREATE rejects unreviewed ancestor history", (t) => {
+	const authority = temporaryAuthority(t);
+	const { repository, remote, baseTree, finalTree, baseCommit, receipt } = authority;
+	const git = (...args: string[]): string =>
+		execFileSync("git", args, { cwd: repository, encoding: "utf8" }).trim();
+	git("checkout", "--force", "--detach", baseCommit);
+	writeFileSync(join(repository, "ancestor.ts"), "export const unreviewed = true;\n");
+	git("add", ".");
+	git("-c", "user.name=Gate Test", "-c", "user.email=gate@example.invalid", "commit", "-m", "unreviewed ancestor");
+	const unreviewedParent = git("rev-parse", "HEAD");
+	git("read-tree", finalTree);
+	git("-c", "user.name=Gate Test", "-c", "user.email=gate@example.invalid", "commit", "-m", "reviewed tree");
+	const newCommit = git("rev-parse", "HEAD");
+	git("branch", "unsafe-first-push", newCommit);
+	execFileSync("git", ["--git-dir", authority.remotePath, "fetch", repository, `${unreviewedParent}:refs/heads/unreviewed`], {
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	const destination = resolveConfiguredPushDestinationV1(repository, remote);
+	const target = {
+		kind: GATE_TARGET_KIND.PUSH,
+		remote,
+		destination_id: destination.destination_id,
+		updates: [{
+			kind: PUSH_UPDATE_KIND.CREATE,
+			source_ref: "refs/heads/unsafe-first-push",
+			destination_ref: "refs/heads/unsafe-first-push",
+			old_object: null,
+			old_peeled_commit: null,
+			old_tree: null,
+			new_object: newCommit,
+			new_peeled_commit: newCommit,
+			new_tree: finalTree,
+		}],
+	} as const;
+
+	const result = evaluateGateTarget(receipt, target, repository);
+	assert.equal(result.status, GATE_RESULT.DENY, result.reason);
+	assert.match(result.reason, /parent tree|base tree/i);
+	assert.notEqual(git("rev-parse", `${unreviewedParent}^{tree}`), baseTree);
 });
 
 test("PR and release gates resolve exact refs, commits, tag objects, peels, and trees", (t) => {
-	const { repository, baseTree, finalTree, changedTree, baseCommit, finalCommit, tagObject, receipt } = temporaryAuthority(t);
+	const authority = temporaryAuthority(t);
+	const { repository, baseTree, finalTree, changedTree, baseCommit, finalCommit, receipt } = authority;
 	const pullRequest = {
 		kind: GATE_TARGET_KIND.PULL_REQUEST,
 		base_ref: "refs/heads/base",
@@ -385,13 +497,7 @@ test("PR and release gates resolve exact refs, commits, tag objects, peels, and 
 		evaluateGateTarget(receipt, { ...pullRequest, base_commit: finalCommit }, repository).status,
 		GATE_RESULT.DENY,
 	);
-	const release = {
-		kind: GATE_TARGET_KIND.RELEASE,
-		tag_ref: "refs/tags/v1.2.3",
-		tag_object: tagObject,
-		peeled_commit: finalCommit,
-		tree: finalTree,
-	} as const;
+	const release = releaseTarget(authority);
 	const releaseResult = evaluateGateTarget(receipt, release, repository);
 	assert.equal(releaseResult.status, GATE_RESULT.ALLOW, releaseResult.reason);
 	assert.equal(

@@ -31,6 +31,22 @@ const UNSAFE_GIT_ENVIRONMENT = new Set([
 	"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_QUARANTINE_PATH", "GIT_PREFIX", "GIT_SUPER_PREFIX", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_COUNT", "GIT_REPLACE_REF_BASE", "GIT_NO_REPLACE_OBJECTS", "GIT_SHALLOW_FILE", "GIT_GRAFT_FILE",
 ]);
 
+const UNSAFE_PUBLICATION_GIT_ENVIRONMENT = new Set([
+	...UNSAFE_GIT_ENVIRONMENT,
+	"GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_CONFIG_PARAMETERS", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_PROXY_COMMAND",
+]);
+
+export function inheritedUnsafeGitEnvironmentKeys(
+	environment: NodeJS.ProcessEnv = process.env,
+): string[] {
+	return Object.keys(environment)
+		.filter((key) => {
+			const normalizedKey = key.toUpperCase();
+			return UNSAFE_PUBLICATION_GIT_ENVIRONMENT.has(normalizedKey) || /^GIT_CONFIG_(?:KEY|VALUE)_/.test(normalizedKey);
+		})
+		.toSorted();
+}
+
 export function reviewGitEnvironment(): NodeJS.ProcessEnv {
 	for (const key of Object.keys(process.env)) {
 		if (UNSAFE_GIT_ENVIRONMENT.has(key) || /^GIT_CONFIG_(?:KEY|VALUE)_/.test(key)) throw new ReviewRepositoryError("REVIEW_GIT_ENV_UNSAFE: inherited Git routing/configuration override is present");
@@ -40,6 +56,15 @@ export function reviewGitEnvironment(): NodeJS.ProcessEnv {
 	environment.GIT_CONFIG_NOSYSTEM = "1";
 	environment.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
 	environment.GIT_CONFIG_SYSTEM = process.platform === "win32" ? "NUL" : "/dev/null";
+	environment.GIT_OPTIONAL_LOCKS = "0";
+	environment.LC_ALL = "C";
+	environment.LANG = "C";
+	return environment;
+}
+
+export function publicationProbeGitEnvironment(): NodeJS.ProcessEnv {
+	const environment: NodeJS.ProcessEnv = { ...process.env };
+	for (const key of inheritedUnsafeGitEnvironmentKeys(environment)) delete environment[key];
 	environment.GIT_OPTIONAL_LOCKS = "0";
 	environment.LC_ALL = "C";
 	environment.LANG = "C";

@@ -53,7 +53,10 @@ import { domainHashV1 } from "../lib/review-canonical.ts";
 import { inspectLegacyReviewAuthorityV1, type LegacyInspectionV1 } from "../lib/review-legacy-detector.ts";
 import { destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
 import { ReviewMutationLockV1 } from "../lib/review-lock.ts";
-import { resolveRepositoryAuthorityV1 } from "../lib/review-repository.ts";
+import {
+	inheritedUnsafeGitEnvironmentKeys,
+	resolveRepositoryAuthorityV1,
+} from "../lib/review-repository.ts";
 import {
 	EXTERNAL_RELEASE_EVIDENCE,
 	GATE_RESULT,
@@ -67,6 +70,8 @@ import {
 	createReviewState,
 	evaluateReleaseFastPathV1,
 	recheckReleaseFastPathRemoteHeadV1,
+	resolvePushDestinationRefV1,
+	resolvePushRemoteRefV1,
 	validateAuthoritativeReviewGate,
 	type GateTargetV1,
 	type ReleaseFastPathEvidenceV1,
@@ -2803,25 +2808,6 @@ function resolveLocalFullRef(cwd: string, value: string, label: string): string 
 	return resolved[0]!;
 }
 
-function destinationFullRef(value: string, sourceRef: string): string {
-	if (value.startsWith("refs/")) return value;
-	if (sourceRef.startsWith("refs/tags/")) return `refs/tags/${value}`;
-	return `refs/heads/${value}`;
-}
-
-function remoteRefObject(cwd: string, remote: string, destinationRef: string): string | null {
-	const output = runReviewGit(cwd, ["ls-remote", "--refs", remote, destinationRef]);
-	if (!output) return null;
-	const rows = output
-		.split(/\r?\n/)
-		.map((line) => line.split(/\s+/))
-		.filter((parts) => parts[1] === destinationRef);
-	if (rows.length !== 1 || !/^[0-9a-f]{40,64}$/.test(rows[0]?.[0] ?? "")) {
-		throw new Error("Push remote destination did not resolve to one exact object");
-	}
-	return rows[0]![0]!;
-}
-
 function pushRemoteAndRefspec(arguments_: readonly string[]): { remote: string; refspec: string } {
 	const unsupported = arguments_.find((argument) =>
 		/^(?:--all|--delete|--follow-tags|--mirror|--prune|--tags|-d)$/.test(argument),
@@ -2831,7 +2817,6 @@ function pushRemoteAndRefspec(arguments_: readonly string[]): { remote: string; 
 		"--exec",
 		"--push-option",
 		"--receive-pack",
-		"--repo",
 		"-o",
 	]);
 	const booleanOptions = new Set([
@@ -2886,17 +2871,27 @@ function pushRemoteAndRefspec(arguments_: readonly string[]): { remote: string; 
 function derivePushTarget(command: ReviewLifecycleCommand): GateTargetV1 {
 	const { remote, refspec } = pushRemoteAndRefspec(command.arguments);
 	if (refspec.startsWith(":")) throw new Error("Push deletion is unsupported");
-	const normalized = refspec.startsWith("+") ? refspec.slice(1) : refspec;
+	if (refspec.startsWith("+")) throw new Error("Force push refspecs are unsupported");
+	const normalized = refspec;
 	const separator = normalized.indexOf(":");
 	const sourceValue = separator < 0 ? normalized : normalized.slice(0, separator);
 	const destinationValue = separator < 0 ? normalized : normalized.slice(separator + 1);
 	if (!sourceValue || !destinationValue) throw new Error("Push refspec is incomplete");
 	const sourceRef = resolveLocalFullRef(command.cwd, sourceValue, "Push source");
-	const destinationRef = destinationFullRef(destinationValue, sourceRef);
 	const newObject = runReviewGit(command.cwd, ["rev-parse", "--verify", sourceRef]);
 	const newPeeledCommit = runReviewGit(command.cwd, ["rev-parse", "--verify", `${sourceRef}^{commit}`]);
 	const newTree = runReviewGit(command.cwd, ["rev-parse", "--verify", `${newPeeledCommit}^{tree}`]);
-	const oldObject = remoteRefObject(command.cwd, remote, destinationRef);
+	const remoteResolution = separator < 0
+		? { ...resolvePushRemoteRefV1(command.cwd, remote, sourceRef, "push remote destination ref"), ref: sourceRef }
+		: resolvePushDestinationRefV1(
+				command.cwd,
+				remote,
+				destinationValue,
+				sourceRef,
+				"push remote destination ref",
+			);
+	const destinationRef = remoteResolution.ref;
+	const oldObject = remoteResolution.object_id;
 	const update = oldObject === null
 		? {
 				kind: PUSH_UPDATE_KIND.CREATE,
@@ -2923,6 +2918,7 @@ function derivePushTarget(command: ReviewLifecycleCommand): GateTargetV1 {
 	return {
 		kind: GATE_TARGET_KIND.PUSH,
 		remote,
+		destination_id: remoteResolution.destination.destination_id,
 		updates: [update],
 	};
 }
@@ -3007,6 +3003,14 @@ function deriveReviewGateTarget(
 		throw new Error(
 			inspection.failClosedReason ?? "Command is not one supported direct review lifecycle operation",
 		);
+	}
+	if (inspection.command.event === "pre-push") {
+		const unsafeKeys = inheritedUnsafeGitEnvironmentKeys();
+		if (unsafeKeys.length > 0) {
+			throw new Error(
+				`Push execution inherits unsafe Git routing or configuration override variables: ${unsafeKeys.join(", ")}`,
+			);
+		}
 	}
 	if (inspection.command.event === "pre-commit") {
 		const tree = deriveCommitTree(inspection.command);
