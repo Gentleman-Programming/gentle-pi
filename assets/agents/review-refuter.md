@@ -24,7 +24,7 @@ Return exactly one `refuted | corroborated | inconclusive` resolution for every 
 |---|---|
 | `id` | Exact supplied finding ID |
 | `resolution` | `refuted` \| `corroborated` \| `inconclusive` |
-| `evidence` | Concrete repository evidence supporting the verdict |
+| `proof_refs` | Concrete `changed-hunk:`, `candidate-created-path:`, `differential-test:`, or `before-after:` evidence supporting the verdict |
 
 Use `inconclusive` whenever evidence is insufficient or the supplied claim cannot be checked exactly. Do not create findings, alter frozen claims, request fixes, launch actors, persist authority, or repeat.
 

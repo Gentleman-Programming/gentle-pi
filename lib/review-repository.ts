@@ -49,7 +49,8 @@ export function inheritedUnsafeGitEnvironmentKeys(
 
 export function reviewGitEnvironment(): NodeJS.ProcessEnv {
 	for (const key of Object.keys(process.env)) {
-		if (UNSAFE_GIT_ENVIRONMENT.has(key) || /^GIT_CONFIG_(?:KEY|VALUE)_/.test(key)) throw new ReviewRepositoryError("REVIEW_GIT_ENV_UNSAFE: inherited Git routing/configuration override is present");
+		const normalizedKey = key.toUpperCase();
+		if (UNSAFE_GIT_ENVIRONMENT.has(normalizedKey) || /^GIT_CONFIG_(?:KEY|VALUE)_/.test(normalizedKey)) throw new ReviewRepositoryError("REVIEW_GIT_ENV_UNSAFE: inherited Git routing/configuration override is present");
 	}
 	const environment: NodeJS.ProcessEnv = {};
 	for (const [key, value] of Object.entries(process.env)) if (!key.startsWith("GIT_")) environment[key] = value;

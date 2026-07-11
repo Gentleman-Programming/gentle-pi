@@ -183,6 +183,23 @@ test("snapshot derives its ordinary route and selected lenses from the captured 
 	assert.equal(snapshot.diff_evidence.changedLines, 2);
 });
 
+test("generated testdata goldens stay in snapshot identity but not authored risk lines", (t) => {
+	const { repository } = createRepository(t);
+	mkdirSync(join(repository, "testdata", "golden"), { recursive: true });
+	writeFileSync(join(repository, "testdata", "golden", "adapter.golden"), `${"generated\n".repeat(500)}`);
+	writeFileSync(join(repository, "tracked.txt"), "authored change\n");
+	const snapshot = captureReviewSnapshot({
+		cwd: repository,
+		mode: REVIEW_MODE.ORDINARY,
+		projection: { kind: REVIEW_PROJECTION.COMPLETE },
+		policyHash: "a".repeat(64),
+	});
+	assert.equal(snapshot.original_changed_lines, 2);
+	assert.equal(snapshot.correction_budget, 1);
+	assert.ok(snapshot.genesis_paths?.includes("testdata/golden/adapter.golden"));
+	assert.ok(snapshotGit(snapshot, "ls-tree", "-r", "--name-only", snapshot.initial_review_tree).includes("testdata/golden/adapter.golden"));
+});
+
 test("explicit Judgment Day captures non-trivial scope without ordinary classification", (t) => {
 	const { repository } = createRepository(t);
 	writeFileSync(join(repository, "tracked.txt"), "non-trivial Judgment Day change\n");

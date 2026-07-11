@@ -10,16 +10,25 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { delimiter, isAbsolute, join, resolve, sep } from "node:path";
 import {
 	REVIEW_EVENT,
 	REVIEW_ROUTE,
 	buildDiffEvidence,
-	classifyReviewRoute,
 	type DiffEvidence,
 	type ReviewLens,
 	type ReviewRoute,
 } from "./review-triggers.ts";
+import {
+	classifyReviewRisk,
+	countAuthoredChangedLines,
+	isGeneratedGoldenPath,
+	REVIEW_RISK_TIER,
+	type ReviewDiffStat,
+	type ReviewRiskTier,
+	type ReviewRiskClassification,
+} from "./review-risk.ts";
+import { reviewGitEnvironment } from "./review-repository.ts";
 
 export const REVIEW_MODE = {
 	ORDINARY: "ordinary",
@@ -82,9 +91,13 @@ export interface SnapshotV1 {
 	review_projection: ReviewProjectionV1;
 	initial_review_tree: string;
 	genesis_paths?: string[];
+	intended_untracked: string[];
 	diff_evidence: DiffEvidence;
 	route: ReviewRoute;
 	lenses: readonly ReviewLens[];
+	risk_tier: ReviewRiskTier;
+	original_changed_lines: number;
+	correction_budget: number;
 	policy_hash: string;
 	object_store: ReviewSnapshotObjectStoreV1;
 }
@@ -111,15 +124,20 @@ interface SnapshotIdentityV1 {
 	review_projection: ReviewProjectionV1;
 	initial_review_tree: string;
 	genesis_paths: string[];
+	intended_untracked: string[];
 	diff_evidence: DiffEvidence;
 	route: ReviewRoute;
 	lenses: readonly ReviewLens[];
+	risk_tier: ReviewRiskTier;
+	original_changed_lines: number;
+	correction_budget: number;
 	policy_hash: string;
 }
 
 export interface CorrectionSnapshotV1 {
 	candidate_tree: string;
 	changed_paths: string[];
+	changed_lines: number;
 	fix_diff: string;
 	fix_diff_hash: string;
 }
@@ -131,7 +149,7 @@ function runGit(
 	args: readonly string[],
 	environment: GitEnvironment = {},
 ): string {
-	const env = { ...process.env };
+	const env = reviewGitEnvironment();
 	if (environment.indexFile) env.GIT_INDEX_FILE = environment.indexFile;
 	if (environment.objectDirectory) {
 		env.GIT_OBJECT_DIRECTORY = environment.objectDirectory;
@@ -173,34 +191,32 @@ function resolveBaseTree(root: string): string {
 	}
 }
 
-function resolveTree(root: string, value: string): string {
+function resolveTree(root: string, value: string, environment: GitEnvironment = {}): string {
 	if (!OBJECT_ID.test(value)) {
 		throw new Error("Review projection tree must be a resolved Git object ID");
 	}
 	try {
-		return runGit(root, ["rev-parse", "--verify", `${value}^{tree}`]);
+		return runGit(root, ["rev-parse", "--verify", `${value}^{tree}`], environment);
 	} catch {
 		throw new Error("Review projection tree cannot be resolved");
 	}
 }
 
-function parseNumstat(value: string): { changedPaths: string[]; changedLines: number } {
-	const changedPaths: string[] = [];
-	let changedLines = 0;
+function parseNumstat(value: string): { changedPaths: string[]; stats: ReviewDiffStat[] } {
+	const stats: ReviewDiffStat[] = [];
 	for (const line of value.split(/\r?\n/)) {
 		if (line.length === 0) continue;
 		const [added, deleted, path] = line.split("\t");
 		if (path === undefined) continue;
-		changedPaths.push(path);
-		if (added !== "-" && deleted !== "-") {
-			const addedLines = Number.parseInt(added ?? "", 10);
-			const deletedLines = Number.parseInt(deleted ?? "", 10);
-			if (Number.isSafeInteger(addedLines) && Number.isSafeInteger(deletedLines)) {
-				changedLines += addedLines + deletedLines;
-			}
+		const binary = added === "-" || deleted === "-";
+		const additions = binary ? 0 : Number.parseInt(added ?? "", 10);
+		const deletions = binary ? 0 : Number.parseInt(deleted ?? "", 10);
+		if (!Number.isSafeInteger(additions) || !Number.isSafeInteger(deletions)) {
+			throw new Error(`Git returned an invalid numstat for ${path}`);
 		}
+		stats.push({ path, additions, deletions, binary, mode_only: additions + deletions === 0 });
 	}
-	return { changedPaths, changedLines };
+	return { changedPaths: stats.map(({ path }) => path), stats };
 }
 
 function canonicalPaths(value: string): string[] {
@@ -211,6 +227,22 @@ function canonicalPaths(value: string): string[] {
 		}
 	}
 	return [...new Set(paths)].toSorted();
+}
+
+export function discoverReviewUntrackedPaths(cwd: string): string[] {
+	const root = repositoryRoot(cwd);
+	return canonicalPaths(runGit(root, ["ls-files", "--others", "--exclude-standard", "-z"]));
+}
+
+export function deriveReviewSnapshotRisk(snapshot: SnapshotV1): ReviewRiskClassification {
+	const root = repositoryRoot(snapshot.repository_root);
+	const environment: GitEnvironment = {
+		alternateObjectDirectory: `${snapshot.object_store.object_directory}${delimiter}${snapshot.object_store.alternate_object_directory}`,
+	};
+	const stats = parseNumstat(runGit(root, [
+		"diff", "--numstat", "--no-renames", snapshot.base_tree, snapshot.complete_snapshot_tree,
+	], environment)).stats;
+	return classifyReviewRisk(stats);
 }
 
 function canonicalStringHash(value: string): string {
@@ -235,9 +267,13 @@ function assertExistingSnapshotMatches(
 		review_projection: existing.review_projection,
 		initial_review_tree: existing.initial_review_tree,
 		genesis_paths: existing.genesis_paths ?? [],
+		intended_untracked: existing.intended_untracked ?? [],
 		diff_evidence: existing.diff_evidence,
 		route: existing.route,
 		lenses: existing.lenses,
+		risk_tier: existing.risk_tier,
+		original_changed_lines: existing.original_changed_lines,
+		correction_budget: existing.correction_budget,
 		policy_hash: existing.policy_hash,
 	};
 	if (snapshotId(existingIdentity) !== snapshotId(identity)) {
@@ -254,10 +290,10 @@ export function captureOrdinaryCorrectionSnapshot(
 		throw new Error("Ordinary correction requires immutable genesis paths");
 	}
 	const root = repositoryRoot(snapshot.repository_root);
-	const candidate = resolveTree(root, candidateTree);
 	const environment: GitEnvironment = {
-		alternateObjectDirectory: `${snapshot.object_store.object_directory}:${snapshot.object_store.alternate_object_directory}`,
+		alternateObjectDirectory: `${snapshot.object_store.object_directory}${delimiter}${snapshot.object_store.alternate_object_directory}`,
 	};
+	const candidate = resolveTree(root, candidateTree, environment);
 	const changedPaths = canonicalPaths(runGit(root, [
 		"diff", "--no-renames", "--name-only", "-z", snapshot.initial_review_tree, candidate,
 	], environment));
@@ -269,12 +305,35 @@ export function captureOrdinaryCorrectionSnapshot(
 		"diff", "--no-ext-diff", "--no-renames", "--binary", snapshot.initial_review_tree, candidate,
 	], environment);
 	if (fixDiff.length === 0) throw new Error("Ordinary correction must contain a diff");
+	const correctionStats = parseNumstat(runGit(root, [
+		"diff", "--numstat", "--no-renames", snapshot.initial_review_tree, candidate,
+	], environment)).stats;
 	return {
 		candidate_tree: candidate,
 		changed_paths: changedPaths,
+		changed_lines: countAuthoredChangedLines(correctionStats),
 		fix_diff: fixDiff,
 		fix_diff_hash: canonicalStringHash(fixDiff),
 	};
+}
+
+export function captureCurrentReviewCandidateTree(snapshot: SnapshotV1): string {
+	if (snapshot.mode !== REVIEW_MODE.ORDINARY) throw new Error("Compact correction requires an ordinary snapshot");
+	const root = repositoryRoot(snapshot.repository_root);
+	const temporaryDirectory = mkdtempSync(join(snapshot.object_store.snapshot_directory, ".correction-"));
+	const temporaryIndex = join(temporaryDirectory, "index");
+	const environment: GitEnvironment = {
+		indexFile: temporaryIndex,
+		objectDirectory: snapshot.object_store.object_directory,
+		alternateObjectDirectory: snapshot.object_store.alternate_object_directory,
+	};
+	try {
+		runGit(root, ["read-tree", snapshot.base_tree], environment);
+		runGit(root, ["add", "-A", "--", "."], environment);
+		return runGit(root, ["write-tree"], environment);
+	} finally {
+		rmSync(temporaryDirectory, { recursive: true, force: true });
+	}
 }
 
 export function captureReviewSnapshot(
@@ -306,6 +365,7 @@ export function captureReviewSnapshot(
 		runGit(root, ["read-tree", baseTree], gitEnvironment);
 		runGit(root, ["add", "-A", "--", "."], gitEnvironment);
 		const completeSnapshotTree = runGit(root, ["write-tree"], gitEnvironment);
+		const intendedUntracked = discoverReviewUntrackedPaths(root);
 		let projection: ReviewProjectionV1;
 		let initialReviewTree: string;
 		if (options.projection.kind === REVIEW_PROJECTION.COMPLETE) {
@@ -327,13 +387,27 @@ export function captureReviewSnapshot(
 				gitEnvironment,
 			),
 		);
-		const diffEvidence = buildDiffEvidence(REVIEW_EVENT.ORDINARY_START, diff);
+		const risk = classifyReviewRisk(diff.stats);
+		const authoredPaths = diff.stats
+			.filter((stat) => !isGeneratedGoldenPath(stat.path) && !stat.binary && !stat.mode_only)
+			.map(({ path }) => path);
+		const diffEvidence = buildDiffEvidence(REVIEW_EVENT.ORDINARY_START, {
+			changedPaths: authoredPaths,
+			changedLines: risk.original_changed_lines,
+		});
 		const genesisPaths = canonicalPaths(runGit(root, [
 			"diff", "--no-renames", "--name-only", "-z", baseTree, initialReviewTree,
 		], gitEnvironment));
 		const plan =
 			options.mode === REVIEW_MODE.ORDINARY
-				? classifyReviewRoute(diffEvidence)
+				? {
+					route: risk.tier === REVIEW_RISK_TIER.LOW
+						? REVIEW_ROUTE.TRIVIAL
+						: risk.tier === REVIEW_RISK_TIER.HIGH
+							? REVIEW_ROUTE.FULL_4R
+							: REVIEW_ROUTE.STANDARD,
+					lenses: risk.selected_lenses,
+				}
 				: {
 						route: REVIEW_ROUTE.TRIVIAL,
 						lenses: [] as const,
@@ -347,9 +421,13 @@ export function captureReviewSnapshot(
 			review_projection: projection,
 			initial_review_tree: initialReviewTree,
 			genesis_paths: genesisPaths,
+			intended_untracked: intendedUntracked,
 			diff_evidence: diffEvidence,
 			route: plan.route,
 			lenses: [...plan.lenses],
+			risk_tier: risk.tier,
+			original_changed_lines: risk.original_changed_lines,
+			correction_budget: risk.correction_budget,
 			policy_hash: options.policyHash,
 		};
 		const id = snapshotId(identity);
@@ -365,9 +443,13 @@ export function captureReviewSnapshot(
 			review_projection: projection,
 			initial_review_tree: initialReviewTree,
 			genesis_paths: genesisPaths,
+			intended_untracked: intendedUntracked,
 			diff_evidence: diffEvidence,
 			route: plan.route,
 			lenses: Object.freeze([...plan.lenses]),
+			risk_tier: risk.tier,
+			original_changed_lines: risk.original_changed_lines,
+			correction_budget: risk.correction_budget,
 			policy_hash: options.policyHash,
 			object_store: {
 				snapshot_directory: finalDirectory,

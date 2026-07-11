@@ -2,6 +2,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { domainHashV1 } from "./review-canonical.ts";
 import { resolveRepositoryAuthorityForRecoveryV1, resolveRepositoryAuthorityV1, type RepositoryAuthorityV1 } from "./review-repository.ts";
+import { ReviewGraphObjectStoreV1 } from "./review-object-store.ts";
 
 export type LegacyDetectionOutcomeV1 = "clean" | "blocked-legacy" | "blocked-mixed" | "reset-in-progress" | "blocked-reappeared" | "blocked-ambiguous";
 export interface LegacyInventoryEntryV1 { relative_path: string; kind: "file" | "directory" | "other"; size: number; modified_time: string; }
@@ -25,7 +26,7 @@ export interface LegacyInspectionV1 {
 }
 
 const LEGACY_ROOTS = ["lineages", "locks", "legacy-evidence", "migration", "migration-operations"] as const;
-const INVALIDATED = ["receipts", "approvals", "escalations", "ledgers", "findings", "frozen-hashes", "lineages", "journals", "counters", "gate-evidence"] as const;
+const INVALIDATED = ["receipts", "approvals", "escalations", "ledgers", "findings", "frozen-hashes", "lineages", "journals", "counters", "gate-evidence", "graph-v1-authority", "compact-v2-authority"] as const;
 
 function inventoryPath(root: string, path: string, result: LegacyInventoryEntryV1[]): void {
 	const stat = lstatSync(path);
@@ -40,14 +41,31 @@ export function inspectLegacyReviewAuthorityV1(cwd: string, options: LegacyInspe
 	try {
 		for (const name of LEGACY_ROOTS) { const path = join(authority.store_root, name); if (existsSync(path)) inventoryPath(authority.store_root, path, entries); }
 	} catch { return blocked(authority, entries, "blocked-ambiguous"); }
+	const legacyEntryCount = entries.length;
+	let versionAmbiguity = false;
+	try {
+		const graphRoot = join(authority.store_root, "graph-v1");
+		const compactRoot = join(authority.store_root, "compact-v2");
+		if (existsSync(graphRoot) && existsSync(compactRoot)) {
+			const graph = new ReviewGraphObjectStoreV1(graphRoot, authority.repository_id, authority.authority_id);
+			const graphIds = new Set((graph.readCurrent().body.lineages as Array<Record<string, unknown>>).map((entry) => String(entry.lineage_id)));
+			const compactIds = readdirSync(compactRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+			versionAmbiguity = compactIds.some((id) => graphIds.has(id));
+			if (versionAmbiguity) {
+				inventoryPath(authority.store_root, graphRoot, entries);
+				inventoryPath(authority.store_root, compactRoot, entries);
+			}
+		}
+	} catch { return blocked(authority, entries, "blocked-ambiguous"); }
 	entries.sort((a, b) => a.relative_path.localeCompare(b.relative_path));
 	const resetPath = join(authority.store_root, "control", "reset-state.json");
 	let resetPhase: string | undefined;
 	if (existsSync(resetPath)) { try { resetPhase = String((JSON.parse(readFileSync(resetPath, "utf8")) as { body?: { phase?: unknown } }).body?.phase); } catch { return blocked(authority, entries, "blocked-ambiguous"); } }
-	const graph = existsSync(join(authority.store_root, "graph-v1"));
+	const graphOrCompact = existsSync(join(authority.store_root, "graph-v1")) || existsSync(join(authority.store_root, "compact-v2"));
 	if (resetPhase && resetPhase !== "complete") return blocked(authority, entries, "reset-in-progress");
-	if (entries.length > 0 && resetPhase === "complete") return blocked(authority, entries, "blocked-reappeared");
-	return blocked(authority, entries, entries.length === 0 ? "clean" : graph ? "blocked-mixed" : "blocked-legacy");
+	if (legacyEntryCount > 0 && resetPhase === "complete") return blocked(authority, entries, "blocked-reappeared");
+	if (versionAmbiguity) return blocked(authority, entries, "blocked-mixed");
+	return blocked(authority, entries, legacyEntryCount === 0 ? "clean" : graphOrCompact ? "blocked-mixed" : "blocked-legacy");
 }
 
 function blocked(authority: RepositoryAuthorityV1 & { identity_broken?: boolean }, entries: readonly LegacyInventoryEntryV1[], outcome: LegacyDetectionOutcomeV1): LegacyInspectionV1 {

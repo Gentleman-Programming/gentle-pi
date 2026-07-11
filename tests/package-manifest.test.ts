@@ -1013,8 +1013,8 @@ test("bounded review keeps the Judgment Day skill contract at metadata version 1
 test("README documents bounded review transactions and the honest installed permission boundary", () => {
 	const readme = readFileSync(join(PACKAGE_ROOT, "README.md"), "utf8");
 	for (const clause of [
-		"Ordinary review runs the selected zero, one, or four lenses exactly once against `initial_review_tree`.",
-		"Pre-commit, pre-push, and PR gates validate approved receipts and exact typed targets with zero actors.",
+		"New ordinary review uses compact `gentle_review` `start -> finalize -> validate`.",
+		"Compact gate validation is read-only.",
 		"Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise release fails closed through native receipt validation.",
 		"Dangerous-command safety remains independent and authoritative.",
 		"`review-refuter` uses exactly `read`, `grep`, and `find`",

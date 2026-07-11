@@ -158,7 +158,7 @@ export function destructiveResetReviewAuthorityV1(options: DestructiveResetOptio
 		const phases: ResetPhase[] = ["marked", "quarantining", "deleting", "initializing", "verifying", "complete"];
 		const atLeast = (phase: ResetPhase) => phases.indexOf(state.body.phase) >= phases.indexOf(phase);
 		if (state.body.phase === "marked") state = next(authority.store_root, state, "quarantining", {}, options.faultAfterPhase);
-		const roots = ["lineages", "locks", "legacy-evidence", "migration", "migration-operations", "graph-v1", ...(state.body.identity_recovery ? [IDENTITY_FILENAME] : [])];
+		const roots = ["lineages", "locks", "legacy-evidence", "migration", "migration-operations", "graph-v1", "compact-v2", ...(state.body.identity_recovery ? [IDENTITY_FILENAME] : [])];
 		if (!atLeast("deleting")) for (const root of roots) {
 			const source = join(authority.store_root, root); const destination = join(quarantine, root);
 			if (existsSync(source) && !state.body.moved_roots.includes(root)) {

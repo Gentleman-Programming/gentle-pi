@@ -59,7 +59,10 @@ export interface ReviewBundleImportOptionsV1 {
 	 */
 	acknowledgeUntrustedBundleSource?: boolean;
 }
-export interface ReviewBundleImporterOptionsV1 { mutationLockPlatform?: ReviewLockPlatformAdapterV1; }
+export interface ReviewBundleImporterOptionsV1 {
+	mutationLockPlatform?: ReviewLockPlatformAdapterV1;
+	beforeMutationLock?: () => void;
+}
 export interface ReviewBundleImportResultV1 { bundle_id: string; root_set_id: string; imported: boolean; }
 
 function assertDigest(value: unknown, label: string): asserts value is string {
@@ -165,6 +168,7 @@ export class ReviewBundleExporter {
 			}))
 			.toSorted((a, b) => a.lineage_id.localeCompare(b.lineage_id));
 		if (roots.length === 0) throw new ReviewBundleError("Bundle export requires at least one authoritative graph root");
+		if (roots.some((root) => existsSync(join(this.#authority.store_root, "compact-v2", root.lineage_id, "review-state.json")))) throw new ReviewBundleError("Graph bundle export refuses graph-v1 and compact-v2 lineage ambiguity");
 		const objects = closure(this.#store, roots);
 		const objectIds = [...objects.keys()].toSorted();
 		const objectBytes = objectIds.map((id) => new TextEncoder().encode(canonicalJsonV1(objects.get(id)!)));
@@ -187,6 +191,7 @@ export class ReviewBundleImporter {
 	readonly #store: ReviewGraphObjectStoreV1;
 	readonly #checkpoints: ReviewCheckpointStoreV1;
 	readonly #lock: ReviewMutationLockV1;
+	readonly #beforeMutationLock?: () => void;
 	constructor(cwd: string, options: ReviewBundleImporterOptionsV1 = {}) {
 		this.#authority = resolveRepositoryAuthorityV1(cwd);
 		assertNoLegacyReviewAuthorityV1(cwd);
@@ -194,11 +199,13 @@ export class ReviewBundleImporter {
 		this.#store = new ReviewGraphObjectStoreV1(root, this.#authority.repository_id, this.#authority.authority_id);
 		this.#checkpoints = new ReviewCheckpointStoreV1(join(root, "operations", "imports"));
 		this.#lock = new ReviewMutationLockV1(join(this.#authority.store_root, "control"), this.#authority.repository_id, this.#authority.authority_id, options.mutationLockPlatform);
+		this.#beforeMutationLock = options.beforeMutationLock;
 	}
 	import(options: ReviewBundleImportOptionsV1): ReviewBundleImportResultV1 {
 		const input = readFileSync(options.inputPath); if (input.byteLength > MAX_BYTES) throw new ReviewBundleError("Bundle is oversized");
 		const frames = parseFrames(input); const manifest = validateManifest(parseCanonicalJsonV1(frames[0]!));
 		if (canonicalJsonV1(manifest.body.repository_identity) !== canonicalJsonV1(this.#authority.repository_identity) || manifest.body.repository_id !== this.#authority.repository_id || manifest.body.authority_id !== this.#authority.authority_id) throw new ReviewBundleError("Bundle repository authority does not match this repository");
+		if (manifest.body.roots.some((root) => existsSync(join(this.#authority.store_root, "compact-v2", root.lineage_id, "review-state.json")))) throw new ReviewBundleError("Graph bundle import refuses to collide with compact-v2 authority");
 		const descriptor = existsSync(join(this.#store.root, "STORE")) ? this.#store.readStoreDescriptor() : undefined;
 		const incarnation = incarnationFromManifest(manifest.body);
 		if (descriptor && (!incarnation || incarnation.store_epoch !== descriptor.store_epoch || incarnation.authority_incarnation_id !== descriptor.authority_incarnation_id || incarnation.initialized_by_reset_id !== descriptor.initialized_by_reset_id)) throw new ReviewBundleError("REVIEW_BUNDLE_EPOCH_MISMATCH");
@@ -231,6 +238,7 @@ export class ReviewBundleImporter {
 			}
 		}
 		writeCheckpoint(this.#checkpoints, { operation_id: options.operationId, kind: "import", input_identity: manifest.bundle_id, repository_id: this.#authority.repository_id, authority_id: this.#authority.authority_id, authority_root_set_id: null, reducer_version: "review-state-v1", phase: "graph-validated", completed_object_ids: manifest.body.object_ids, checkpoint_sequence: 0 });
+		this.#beforeMutationLock?.();
 		const owner = this.#lock.acquire();
 		try {
 			// A genesis (generation-0) CURRENT quorum can be lost to a crash
@@ -267,6 +275,7 @@ export class ReviewBundleImporter {
 				}
 			}
 			if (!changed) return { bundle_id: manifest.bundle_id, root_set_id: current!.root_set_id, imported: false };
+			if (manifest.body.roots.some((root) => existsSync(join(this.#authority.store_root, "compact-v2", root.lineage_id, "review-state.json")))) throw new ReviewBundleError("Graph bundle import refuses to collide with compact-v2 authority");
 			for (const event of staged.values()) this.#store.installEvent(event);
 			const lineages = [...existing.values()].toSorted((a, b) => String(a.lineage_id).localeCompare(String(b.lineage_id)));
 			const root = this.#store.installRootSet({ schema: "gentle-ai.review-root-set/v1", repository_id: this.#authority.repository_id, authority_id: this.#authority.authority_id, ...(descriptor === undefined ? {} : { store_epoch: descriptor.store_epoch, authority_incarnation_id: descriptor.authority_incarnation_id, initialized_by_reset_id: descriptor.initialized_by_reset_id }), generation: current ? current.body.generation + 1 : 0, predecessor_root_set_id: current ? current.root_set_id : null, lineages } satisfies ReviewRootSetBodyV1);

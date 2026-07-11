@@ -10,6 +10,7 @@ import { resolveRepositoryAuthorityV1 } from "../lib/review-repository.ts";
 import { REVIEW_MODE, ReviewTransactionStore, createReviewState } from "../lib/review-transaction.ts";
 import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
 import { qualifiedReviewLockPlatform, testSnapshot } from "./review-test-fixtures.ts";
+import { discoverCompactReview, startCompactReview } from "../lib/review-facade.ts";
 
 function repository(): string {
 	const root = mkdtempSync(join(tmpdir(), "review-reset-"));
@@ -65,6 +66,47 @@ test("legacy and mixed review stores fail closed until the exact destructive res
 		assert.equal(existsSync(join(cwd, ".git", "gentle-ai", "reviews", "lineages")), false);
 		assert.equal(ReviewTransactionStore.forRepository(cwd, { mutationLockPlatform: qualifiedReviewLockPlatform() }).readCurrentAuthority().body.lineages.length, 0);
 	} finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("same-lineage graph-v1 and compact-v2 ambiguity fails closed and reset quarantines both", () => {
+	const cwd = repository();
+	try {
+		writeFileSync(join(cwd, "README.md"), "compact candidate\n");
+		const compact = startCompactReview({ cwd, lineageId: "ambiguous-v2", policyHash: "a".repeat(64) });
+		const snapshot = discoverCompactReview(cwd, compact.lineage_id).record.state.initial_snapshot;
+		const graph = ReviewTransactionStore.forRepository(cwd, { mutationLockPlatform: qualifiedReviewLockPlatform() });
+		graph.create(createReviewState({
+			lineageId: compact.lineage_id,
+			mode: REVIEW_MODE.ORDINARY,
+			snapshot,
+			evidenceHash: "b".repeat(64),
+			budget: {
+				review_batches: 1,
+				review_actors: snapshot.lenses.length,
+				refuter_batches: 1,
+				fix_batches: 1,
+				validator_runs: 1,
+				final_verifications: 1,
+				judgment_rounds: 0,
+				judge_runs: 0,
+			},
+		}), "ambiguous-graph-start");
+
+		const inspection = inspectLegacyReviewAuthorityV1(cwd);
+		assert.equal(inspection.outcome, "blocked-mixed");
+		assert.ok(inspection.entries.some(({ relative_path }) => relative_path.startsWith("graph-v1")));
+		assert.ok(inspection.entries.some(({ relative_path }) => relative_path.startsWith("compact-v2")));
+		const reset = destructiveResetReviewAuthorityV1({
+			cwd,
+			...inspection.reset_request,
+			mutationLockPlatform: qualifiedReviewLockPlatform(),
+		});
+		assert.equal(reset.store.initialization_kind, "destructive-reset");
+		assert.equal(existsSync(join(storeRoot(cwd), "compact-v2")), false);
+		assert.equal(ReviewTransactionStore.forRepository(cwd, { mutationLockPlatform: qualifiedReviewLockPlatform() }).readCurrentAuthority().body.lineages.length, 0);
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
 });
 
 test("reset state is durable and incomplete state blocks authority until explicit resume", () => {

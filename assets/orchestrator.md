@@ -108,16 +108,16 @@ For skill-shaped requests, do not treat injected `<available_skills>` as complet
 
 ## Bounded Review Transactions
 
-Only ordinary transaction start classifies the bound `base_tree -> complete_snapshot_tree` diff.
+New ordinary review uses compact `gentle_review` `start -> finalize -> validate`: START freezes scope/risk/budget; FINALIZE admits only proven candidate-caused findings, permits one bounded correction and validator, and hashes final evidence.
 
-Pre-commit, pre-push, and PR gates validate approved receipts and exact typed targets with zero actors.
-Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise release fails closed through native receipt validation.
+Compact gates use zero actors and rederive authority, the exact target, and publication evidence before allow. Pi adds exact one-shot command authorization and bash-time rederivation. Graph-v1 ordinary authority is read-only; Judgment Day remains graph-v1.
+Release from protected `main` may bypass receipt validation only when its immutable remote SHA and required CI are proven; otherwise native receipt validation applies.
 Major and post-incident releases require explicit extraordinary review even when fast-path checks pass.
 
 Dangerous-command safety remains independent and authoritative.
 
 SDD completion adds no review or Judgment Day pass.
 
-Review transactions, validation, and SDD perform no commit, push, PR creation, release, or publication.
+Review transactions, validation, and SDD never deliver or publish.
 
-The complete ordinary/Judgment Day controller and actor contract is loaded from `{{GENTLE_PI_DELEGATION_PATH}}`.
+Controller and actor contract: `{{GENTLE_PI_DELEGATION_PATH}}`.

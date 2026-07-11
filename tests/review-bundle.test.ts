@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import { canonicalJsonV1, domainHashV1 } from "../lib/review-canonical.ts";
 import { REVIEW_MODE, ReviewTransactionStore, createReviewState, setReviewMutationLockPlatformForTesting } from "../lib/review-transaction.ts";
 import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
 import { qualifiedReviewLockPlatform, testSnapshot } from "./review-test-fixtures.ts";
+import { startCompactReview } from "../lib/review-facade.ts";
 
 setReviewMutationLockPlatformForTesting(qualifiedReviewLockPlatform());
 
@@ -101,6 +102,42 @@ test("bundle import allows a brand-new lineage once the caller explicitly acknow
 	const imported = new ReviewBundleImporter(target, { mutationLockPlatform: qualifiedReviewLockPlatform() }).import({ inputPath: bundle, operationId: "acknowledged", acknowledgeUntrustedBundleSource: true });
 	assert.equal(imported.imported, true);
 	assert.equal(ReviewTransactionStore.forRepository(target).read("bundle-lineage").lineage_id, "bundle-lineage");
+});
+
+test("graph bundle import never interprets or overwrites compact authority", (t) => {
+	const { parent, source, target } = repository(t);
+	createLineage(source);
+	const bundle = join(parent, "transfer.review-bundle");
+	new ReviewBundleExporter(source).export({ outputPath: bundle, operationId: "export" });
+	writeFileSync(join(target, "file.txt"), "compact candidate\n");
+	startCompactReview({ cwd: target, lineageId: "bundle-lineage", policyHash: "a".repeat(64) });
+	assert.throws(
+		() => new ReviewBundleImporter(target, { mutationLockPlatform: qualifiedReviewLockPlatform() }).import({ inputPath: bundle, operationId: "compact-collision", acknowledgeUntrustedBundleSource: true }),
+		/compact-v2 authority/i,
+	);
+});
+
+test("bundle import rechecks compact collision under the shared publication lock", (t) => {
+	const { parent, source, target } = repository(t);
+	createLineage(source);
+	const bundle = join(parent, "raced.review-bundle");
+	new ReviewBundleExporter(source).export({ outputPath: bundle, operationId: "export-race" });
+	let compactCreated = false;
+	const importer = new ReviewBundleImporter(target, {
+		mutationLockPlatform: qualifiedReviewLockPlatform(),
+		beforeMutationLock() {
+			writeFileSync(join(target, "file.txt"), "compact wins lock\n");
+			startCompactReview({ cwd: target, lineageId: "bundle-lineage", policyHash: "a".repeat(64) });
+			compactCreated = true;
+		},
+	});
+	assert.throws(
+		() => importer.import({ inputPath: bundle, operationId: "import-race", acknowledgeUntrustedBundleSource: true }),
+		/compact-v2 authority/i,
+	);
+	assert.equal(compactCreated, true);
+	const graphRoot = join(execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: target, encoding: "utf8" }).trim(), "gentle-ai", "reviews", "graph-v1");
+	assert.equal([0, 1, 2].some((slot) => existsSync(join(graphRoot, `CURRENT.${slot}`))), false);
 });
 
 test("bundle import forward-recovers a genesis quorum-loss crash in the target store instead of silently discarding its existing lineage", (t) => {

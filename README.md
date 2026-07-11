@@ -139,7 +139,7 @@ Review lenses are controller-selected transaction actors, not lifecycle hooks. `
 
 ### Review-store migration safety
 
-Legacy review authority is never migrated. `gentle_review inspect` reports an exact repository-bound destructive reset challenge; only `reset` with that exact challenge can quarantine and delete legacy authority, initialize an empty graph-v1 incarnation, and require a completely fresh review. Interrupted resets remain blocked until explicit forward recovery; legacy receipts, bundles, and approvals never regain authority.
+Legacy pre-graph authority is never migrated. `gentle_review inspect` reports an exact repository-bound destructive reset challenge; only that authorized reset can quarantine graph-v1 and compact-v2 authority, initialize an empty graph-v1 incarnation, and require fresh review. Interrupted resets remain blocked until explicit forward recovery. Existing graph-v1 ordinary lineages remain readable, gate-validatable, and exportable but are read-only; Judgment Day remains mutable on graph-v1.
 
 `reviewer` is not an installed subagent name. It is a routing intent. Select the concrete lens by risk profile:
 
@@ -155,29 +155,33 @@ If multiple rows match, run the narrow set that covers the risk. For example, sh
 
 ### Bounded review transactions
 
-Ordinary review runs the selected zero, one, or four lenses exactly once against `initial_review_tree`.
+New ordinary review uses compact `gentle_review` `start -> finalize -> validate`.
 
-Before corroboration, the controller freezes canonical ID-sorted identity, claim, and evidence rows under `frozen_ledger_hash`.
+START derives the complete Git/untracked snapshot, lineage, persisted `low | medium | high` tier, zero/one/four lenses, authored changed lines, and correction budget `min(200, ceil(original_changed_lines / 2))`. Generated `testdata/golden/**` stays in snapshot identity but does not count as authored risk lines.
 
-Frozen claims never change; refuter and validator outcomes are separate resolution records.
+Every finding requires `evidence_class`, `causal_disposition`, and concrete changed-hunk, candidate-created-path, differential-test, or before/after proof. Missing IDs are assigned natively and selected-lens results are canonicalized deterministically.
 
 Actor output is untrusted data and cannot authorize transitions, fixes, receipts, gates, or delivery.
 
-Deterministic evidence is controller-checked with zero refuters.
+Only severe `introduced`, `behavior-activated`, or `worsened` findings with valid proof enter correction IDs. `pre-existing` and `base-only` become follow-ups; `unknown`, insufficient, malformed, or inconclusive severe claims escalate. WARNING and SUGGESTION are informational.
 
-All inferential-severe rows may go once to at most one read-only refuter as one complete list.
+Deterministic blockers need no refuter. Inferential blockers use exactly one complete read-only refuter batch.
 
 Invalid, missing, duplicate, unknown, or inconclusive refuter output escalates without a replacement refuter.
 
-Ordinary permits at most one fix batch.
+When native IDs are assigned to inferential findings, the first FINALIZE returns their canonical rows and a content-derived request hash without mutation; the second replays identical lens input with that hash and one complete refuter batch.
 
-After a fix, exactly one validator consumes only requested frozen IDs, their exact hash-bound rows, original acceptance-test proof, one passed correction-regression proof per ID, original-criterion regressions, and inert follow-ups.
+Ordinary permits one correction and one targeted validator. FINALIZE requires a positive forecast before editing, derives actual correction lines from Git, and binds correction to original candidate, paths, untracked set, and correction IDs.
 
-The validator consumes proof only; it does not inspect a fix diff, candidate tree, changed paths or lines, discover, or re-review.
+The validator checks original criteria and correction regression only and cannot add scope or findings. Final evidence is hashed during FINALIZE, never at START.
+
+Compact ordinary has five states: `reviewing`, `correction_required`, `validating`, `approved`, and `escalated`.
 
 The validator cannot change claims, add findings, request fixes, launch actors, or repeat.
 
-A no-fix path runs zero validators; both paths run exactly one final verification.
+Compact authority uses content-derived CAS under the Git common directory. Exact retries are idempotent; stale/semantic retries, terminal mutation, and same-lineage graph-v1/compact-v2 ambiguity fail closed.
+
+Trust boundary: The local orchestrator and same-user process are trusted to execute selected actors and submit their exact outputs. Native code owns scope, risk, IDs, canonicalization, state, receipts, and gates, and rejects malformed or inconsistent results structurally and causally. Malicious same-user host/process authenticity is a non-goal because that actor can replace the extension or mutate local authority; externally trusted attestation would require a separately privileged signer/service and is not claimed.
 
 Ordinary ends only as `approved` or `escalated`.
 
@@ -189,9 +193,9 @@ Only Judgment Day may iterate, for at most two scoped fix/re-judgment rounds.
 
 Findings surviving round two escalate; no third-round transition exists.
 
-Only ordinary transaction start classifies the bound `base_tree -> complete_snapshot_tree` diff.
+Compact gate validation is read-only. It loads authority and receipt, derives the live target, then reloads authority and rederives target/publication evidence immediately before allow.
 
-Pre-commit, pre-push, and PR gates validate approved receipts and exact typed targets with zero actors.
+Pi also registers one one-shot authorization for the exact command and rederives its target again at bash time. First-push, push destination, exact PR base, repository identity, release, and dangerous-command protections remain fail closed.
 Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise release fails closed through native receipt validation.
 Major and post-incident releases require explicit extraordinary review even when fast-path checks pass.
 

@@ -54,6 +54,14 @@ import { inspectLegacyReviewAuthorityV1, type LegacyInspectionV1 } from "../lib/
 import { destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
 import { ReviewMutationLockV1 } from "../lib/review-lock.ts";
 import {
+	GRAPH_V1_ORDINARY_READ_ONLY,
+	discoverCompactReview,
+	finalizeCompactReview,
+	startCompactReview,
+} from "../lib/review-facade.ts";
+import { validateCompactReviewGate } from "../lib/review-compact-gate.ts";
+import { compactV2LineageExists, graphV1LineageExists } from "../lib/review-compact-store.ts";
+import {
 	inheritedUnsafeGitEnvironmentKeys,
 	resolveRepositoryAuthorityV1,
 } from "../lib/review-repository.ts";
@@ -2059,6 +2067,7 @@ async function handlePersonaCommand(ctx: ExtensionContext): Promise<void> {
 
 const REVIEW_CONTROLLER_OPERATION = {
 	START: "start",
+	FINALIZE: "finalize",
 	ADVANCE: "advance",
 	STATUS: "status",
 	VALIDATE: "validate",
@@ -2090,7 +2099,7 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 		},
 		idempotencyKey: {
 			type: "string",
-			description: "Required for start, advance, and validate operations.",
+			description: "Required for graph-v1 start/advance and lifecycle validate operations.",
 		},
 		transition: {
 			type: "string",
@@ -2102,7 +2111,7 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 		},
 		input: {
 			type: "string",
-			description: "A JSON-serialized object string, not a nested object. Exact ordinary START shape: {\"mode\":\"ordinary\",\"projection\":{\"kind\":\"complete\"},\"policyHash\":\"<hash>\",\"evidenceHash\":\"<hash>\",\"budget\":{...}}. START supports only mode ordinary or judgment-day; use judgment-day only when explicitly selected.",
+			description: "A JSON-serialized object string, not a nested object. Ordinary START uses {\"mode\":\"ordinary\",\"policyHash\":\"<hash>\"}; FINALIZE supplies reviewer results, correction forecast, targeted validation, final evidence, and an explicit final_verification_passed boolean. Judgment Day retains graph-v1 input.",
 		},
 		outputPath: { type: "string", description: "Destination path for deterministic bundle export." },
 		inputPath: { type: "string", description: "Source path for staged bundle import." },
@@ -2135,7 +2144,7 @@ interface ReviewControllerStartInput {
 }
 
 interface ReviewControllerValidateInput {
-	scopeBudget: ReviewBudgetV1;
+	scopeBudget?: ReviewBudgetV1;
 	release?: ReleaseFastPathEvidenceV1;
 }
 
@@ -2190,7 +2199,7 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 	// VALIDATE defers its lineage requirement to execution time: the proven
 	// release-from-protected-main fast path needs no receipt lineage, while
 	// every other validation still requires one before receipt validation.
-	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.REPAIR, REVIEW_CONTROLLER_OPERATION.VALIDATE].includes(value.operation as ReviewControllerOperation);
+	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.FINALIZE, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.REPAIR, REVIEW_CONTROLLER_OPERATION.VALIDATE].includes(value.operation as ReviewControllerOperation);
 	if (needsLineage && (typeof value.lineageId !== "string" || value.lineageId.trim().length === 0)) {
 		throw new Error("Review controller requires a lineageId");
 	}
@@ -2291,6 +2300,7 @@ function durableResetRecoveryRequest(cwd: string): LegacyInspectionV1["reset_req
 		"migration",
 		"migration-operations",
 		"graph-v1",
+		"compact-v2",
 		...(body.identity_recovery === true ? ["IDENTITY"] : []),
 	]);
 	const expectedQuarantinePath = join("reset-quarantine", body.reset_id);
@@ -2439,12 +2449,10 @@ function parseReleaseFastPathEvidence(value: unknown): ReleaseFastPathEvidenceV1
 }
 
 function parseValidateInput(value: Record<string, unknown>): ReviewControllerValidateInput {
-	const input: ReviewControllerValidateInput = {
-		scopeBudget: parseReviewBudget(
-			value.scopeBudget,
-			"Review controller validate scopeBudget",
-		),
-	};
+	const input: ReviewControllerValidateInput = {};
+	if (value.scopeBudget !== undefined) {
+		input.scopeBudget = parseReviewBudget(value.scopeBudget, "Review controller validate scopeBudget");
+	}
 	if (value.release !== undefined) input.release = parseReleaseFastPathEvidence(value.release);
 	return input;
 }
@@ -3100,12 +3108,14 @@ function executeReviewControllerOperation(
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RECOVER) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
 		durableResetRecoveryRequest(defaultCwd);
+		pendingAuthorizations.clear();
 		const result = destructiveResetReviewAuthorityV1({ cwd: defaultCwd, repositoryId: String(input.repositoryId), commonDirHash: String(input.commonDirHash), inventoryHash: String(input.inventoryHash), confirmation: String(input.confirmation), resume: true });
 		const inspection = inspectReviewAuthorityForController(defaultCwd);
 		return { operation: parameters.operation, result, inspection, next_action: inspection.outcome === "clean" ? "start-fresh-ordinary-review-after-verified-clean" : "inspect-reset-recovery" };
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RESET) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
+		pendingAuthorizations.clear();
 		const result = destructiveResetReviewAuthorityV1({ cwd: defaultCwd, repositoryId: String(input.repositoryId), commonDirHash: String(input.commonDirHash), inventoryHash: String(input.inventoryHash), confirmation: String(input.confirmation), resume: false });
 		const inspection = inspectReviewAuthorityForController(defaultCwd);
 		return { operation: parameters.operation, result, inspection, next_action: inspection.outcome === "clean" ? "start-fresh-ordinary-review-after-verified-clean" : "inspect-reset-recovery" };
@@ -3116,12 +3126,9 @@ function executeReviewControllerOperation(
 		return { operation: parameters.operation, repaired: true };
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.START) {
-		const idempotencyKey = requiredControllerString(parameters, "idempotencyKey");
-		const input = parseStartInput(
-			parseControllerJson(
-				requiredControllerString(parameters, "input"),
-				REVIEW_CONTROLLER_OPERATION.START,
-			),
+		const rawStart = parseControllerJson(
+			requiredControllerString(parameters, "input"),
+			REVIEW_CONTROLLER_OPERATION.START,
 		);
 		const inspection = inspectReviewAuthorityForController(defaultCwd);
 		if (inspection.outcome !== "clean") {
@@ -3137,6 +3144,30 @@ function executeReviewControllerOperation(
 						: "request-explicit-reset-authorization",
 			};
 		}
+		if (rawStart.mode === REVIEW_MODE.ORDINARY) {
+			if (typeof rawStart.policyHash !== "string") {
+				throw new Error("Compact ordinary START requires policyHash");
+			}
+			const projection = rawStart.projection === undefined
+				? { kind: REVIEW_PROJECTION.COMPLETE } as const
+				: isRecord(rawStart.projection) && rawStart.projection.kind === REVIEW_PROJECTION.COMPLETE
+					? { kind: REVIEW_PROJECTION.COMPLETE } as const
+					: undefined;
+			if (!projection) throw new Error("New compact ordinary START requires the complete projection");
+			const result = startCompactReview({
+				cwd: defaultCwd,
+				...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
+				policyHash: rawStart.policyHash,
+				projection,
+			});
+			const state = discoverCompactReview(defaultCwd, result.lineage_id).record.state;
+			return { operation: parameters.operation, result, state };
+		}
+		const idempotencyKey = requiredControllerString(parameters, "idempotencyKey");
+		if (typeof parameters.lineageId !== "string" || parameters.lineageId.trim().length === 0) {
+			throw new Error("Judgment Day graph-v1 START requires lineageId");
+		}
+		const input = parseStartInput(rawStart);
 		const snapshot = captureReviewSnapshot({
 			cwd: defaultCwd,
 			mode: input.mode,
@@ -3174,6 +3205,35 @@ function executeReviewControllerOperation(
 		}
 		return { operation: parameters.operation, result, state };
 	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.FINALIZE) {
+		const hasInput = parameters.input !== undefined;
+		const hasInputPath = parameters.inputPath !== undefined;
+		if (hasInput === hasInputPath) throw new Error("Review controller finalize requires exactly one of input or inputPath");
+		const raw = parseControllerJson(
+			hasInput
+				? requiredControllerString(parameters, "input")
+				: readRepositoryControllerInput(requiredControllerString(parameters, "inputPath"), defaultCwd),
+			REVIEW_CONTROLLER_OPERATION.FINALIZE,
+		);
+		if (raw.correction_line_forecast !== undefined && (!Number.isSafeInteger(raw.correction_line_forecast) || Number(raw.correction_line_forecast) <= 0)) {
+			throw new Error("Review controller finalize correction_line_forecast must be a positive integer");
+		}
+		if (raw.final_evidence !== undefined && typeof raw.final_evidence !== "string") throw new Error("Review controller finalize final_evidence must be a string");
+		if (raw.final_verification_passed !== undefined && typeof raw.final_verification_passed !== "boolean") throw new Error("Review controller finalize final_verification_passed must be boolean");
+		if (raw.final_evidence !== undefined && raw.final_verification_passed === undefined) throw new Error("Review controller finalize with final_evidence requires an explicit final_verification_passed boolean");
+		return {
+			operation: parameters.operation,
+			result: finalizeCompactReview({
+				cwd: defaultCwd,
+				...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
+				...(raw.review_result === undefined ? {} : { review_result: raw.review_result as never }),
+				...(raw.correction_line_forecast === undefined ? {} : { correction_line_forecast: Number(raw.correction_line_forecast) }),
+				...(raw.validation === undefined ? {} : { validation: raw.validation as never }),
+				...(raw.final_evidence === undefined ? {} : { final_evidence: raw.final_evidence }),
+				...(raw.final_verification_passed === undefined ? {} : { final_verification_passed: raw.final_verification_passed }),
+			}),
+		};
+	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.ADVANCE) {
 		const idempotencyKey = requiredControllerString(parameters, "idempotencyKey");
 		const transitionValue = requiredControllerString(parameters, "transition");
@@ -3191,7 +3251,13 @@ function executeReviewControllerOperation(
 				: readRepositoryControllerInput(requiredControllerString(parameters, "inputPath"), defaultCwd),
 			REVIEW_CONTROLLER_OPERATION.ADVANCE,
 		);
+		if (compactV2LineageExists(defaultCwd, parameters.lineageId!)) {
+			throw new Error("Compact-v2 ordinary reviews mutate only through review finalize");
+		}
 		const store = ReviewTransactionStore.forRepository(defaultCwd);
+		if (store.read(parameters.lineageId!).mode === REVIEW_MODE.ORDINARY) {
+			throw new Error(GRAPH_V1_ORDINARY_READ_ONLY);
+		}
 		let input = rawInput as unknown as ReviewReducerInput;
 		if (transitionValue === REVIEW_TRANSITION.ORDINARY_FIX) {
 			if (typeof rawInput.candidateTree !== "string" || !Array.isArray(rawInput.fixedIds) || rawInput.fixedIds.some((id) => typeof id !== "string")) {
@@ -3229,6 +3295,18 @@ function executeReviewControllerOperation(
 		};
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.STATUS) {
+		const compactExists = compactV2LineageExists(defaultCwd, parameters.lineageId!);
+		const graphExists = graphV1LineageExists(defaultCwd, parameters.lineageId!);
+		if (compactExists && graphExists) throw new Error("Review authority is ambiguous across graph-v1 and compact-v2");
+		if (compactExists) {
+			const discovered = discoverCompactReview(defaultCwd, parameters.lineageId);
+			const response: Record<string, unknown> = { operation: parameters.operation, state: discovered.record.state };
+			if (
+				discovered.record.state.state === "approved" ||
+				discovered.record.state.state === "escalated"
+			) response.receipt = discovered.store.loadTerminalReceipt().receipt;
+			return response;
+		}
 		const state = ReviewTransactionStore.forRepository(defaultCwd).read(parameters.lineageId);
 		const response: Record<string, unknown> = {
 			operation: parameters.operation,
@@ -3295,9 +3373,55 @@ function executeReviewControllerOperation(
 			};
 		}
 	}
+	let compact = false;
+	if (typeof parameters.lineageId === "string" && parameters.lineageId.trim().length > 0) {
+		const compactExists = compactV2LineageExists(derived.command.cwd, parameters.lineageId);
+		const graphExists = graphV1LineageExists(derived.command.cwd, parameters.lineageId);
+		if (compactExists && graphExists) throw new Error("Review authority is ambiguous across graph-v1 and compact-v2");
+		compact = compactExists;
+	} else {
+		try {
+			discoverCompactReview(derived.command.cwd, undefined, true);
+			compact = true;
+		} catch (error) {
+			if (!(error instanceof Error) || !/No discoverable compact review lineage/.test(error.message)) throw error;
+		}
+	}
+	if (compact) {
+		const result = validateCompactReviewGate({
+			cwd: derived.command.cwd,
+			...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
+			deriveTarget: () => {
+				const rederived = deriveReviewGateTarget(commandValue, defaultCwd);
+				if (rederived.command.cwd !== derived.command.cwd) throw new Error("Lifecycle command repository changed during compact validation");
+				return {
+					target: rederived.target,
+					...(rederived.actualIntendedCommitTree === undefined ? {} : { actualIntendedCommitTree: rederived.actualIntendedCommitTree }),
+				};
+			},
+		});
+		const response: Record<string, unknown> = {
+			operation: parameters.operation,
+			result,
+			derived_target: derived.target,
+		};
+		if (releaseFastPath !== undefined) response.release_fast_path = releaseFastPath;
+		if (result.status === GATE_RESULT.ALLOW) {
+			const commandHash = reviewAuthorizationKey(commandValue, derived.command.cwd);
+			const authorization: PendingReviewAuthorization = {
+				command_hash: commandHash,
+				target_hash: canonicalHash(derived.target),
+				receipt_hash: result.receipt_hash,
+			};
+			pendingAuthorizations.set(commandHash, authorization);
+			response.authorization = authorization;
+		}
+		return response;
+	}
 	if (typeof parameters.lineageId !== "string" || parameters.lineageId.trim().length === 0) {
 		throw new Error("Review controller validate requires a lineageId for native receipt validation");
 	}
+	if (!input.scopeBudget) throw new Error("Graph-v1 receipt validation requires scopeBudget");
 	const store = ReviewTransactionStore.forRepository(derived.command.cwd);
 	const receipt = store.createAuthoritativeReceipt(parameters.lineageId);
 	const result = validateAuthoritativeReviewGate({
@@ -3422,13 +3546,13 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		name: "gentle_review",
 		label: "Gentle Review Controller",
 		description:
-			"Inspect, recover, create, advance, and validate a bounded Gentle AI review transaction. Before START, call INSPECT. RESET and RECOVER require fresh explicit authorization through the interactive Pi UI and fail closed headlessly. Their response internally INSPECTS authority; only a verified clean result permits an immediate fresh ordinary START. Validate accepts one exact direct lifecycle command and produces a one-shot authorization for that exact subsequent bash command.",
-		promptSnippet: "Inspect review authority before START; recover blocked legacy authority only with explicit authorization; then start ordinary review",
+			"Inspect and recover review authority, run new ordinary review through compact start/finalize/validate, preserve graph-v1 Judgment Day and compatibility reads, and authorize one exact lifecycle command. RESET and RECOVER require fresh interactive authorization and fail closed headlessly.",
+		promptSnippet: "Inspect authority, then use compact start/finalize/validate for ordinary review; use graph-v1 only for explicit Judgment Day",
 		promptGuidelines: [
-			'Call {"operation":"inspect"} before START. Ordinary START requires operation, lineageId, idempotencyKey, and input as a JSON string such as "{\\"mode\\":\\"ordinary\\",\\"projection\\":{\\"kind\\":\\"complete\\"},\\"policyHash\\":\\"<hash>\\",\\"evidenceHash\\":\\"<hash>\\",\\"budget\\":{...}}".',
-			'Only START modes "ordinary" and "judgment-day" are supported. Use "ordinary" by default; use "judgment-day" only when the user explicitly selected Judgment Day.',
+			'Call {"operation":"inspect"} before START. Ordinary START uses a JSON string such as "{\\"mode\\":\\"ordinary\\",\\"policyHash\\":\\"<hash>\\"}"; the controller derives lineage, Git/untracked scope, tier, lenses, authored lines, and budget.',
+			"Run selected lenses once, then call FINALIZE with causal result JSON. FINALIZE alone records correction forecast, Git-derived correction evidence, targeted validation, and final evidence. Use ADVANCE only for explicit graph-v1 Judgment Day.",
 			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization for the exact reset_request challenge, then call RESET or RECOVER only after authorization. RESET and RECOVER internally INSPECT authority; require their verified clean result and next_action start-fresh-ordinary-review-after-verified-clean before continuing directly to a fresh ordinary START.",
-			"A reported lineage_created false or a validation error explicitly marked before authority access proves no lineage was created; do not call STATUS or ADVANCE for that attempt. If START output or response is lost after authority access, completion is ambiguous: before any fresh START, replay or resume with the same lineageId, idempotencyKey, and exact request so the durable journal returns the committed result or rejects a mismatch.",
+			"A reported lineage_created false or pre-authority validation error proves no lineage was created. After ambiguous START or FINALIZE output, replay the exact operation so compact CAS returns the committed revision or rejects a stale/semantic retry.",
 			"Use gentle_review for bounded review transaction operations and exact lifecycle validation; never fabricate bash tool metadata or a separate gate target.",
 		],
 		parameters: REVIEW_CONTROLLER_PARAMETERS,

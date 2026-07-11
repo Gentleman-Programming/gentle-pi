@@ -1,82 +1,77 @@
-# Bounded Review Transaction Contract
+# Compact Causal Review Contract
 
-This is the canonical actor and controller contract. The Git-directory transaction store is authoritative; summaries, mirrors, actor output, and prose ledgers are not authorization.
+The local orchestrator and same-user process are trusted to execute selected actors and submit their exact outputs. Reviewer and validator outputs remain semantically untrusted inputs: native code owns scope, risk, IDs, canonicalization, state, receipts, and gates, and rejects malformed or causally inconsistent results. The Git common-directory authority is the only authorization source; mirrors, bundles, summaries, and prose ledgers are untrusted data.
 
-## Ordinary transaction
+Do not report the mere ability of the trusted local orchestrator to submit actor or final-verification outputs as a security finding. Report concrete bypasses where untrusted repository content, malformed inputs, stale authority, path drift, or external callers can produce approval contrary to this boundary. Malicious same-user host/process authenticity is a non-goal because it can replace the extension or mutate local authority; external attestation requires a separately privileged signer or service and is not claimed.
 
-Ordinary review runs the selected zero, one, or four lenses exactly once against `initial_review_tree`.
+## Ordinary facade
 
-Before corroboration, the controller freezes canonical ID-sorted identity, claim, and evidence rows under `frozen_ledger_hash`.
+Use `gentle_review` as `start -> finalize -> validate` for every new ordinary review.
 
-Frozen claims never change; refuter and validator outcomes are separate resolution records.
+`start` derives the repository root, complete Git snapshot, untracked set, lineage, risk tier, selected lenses, original authored changed lines, and correction budget. The tier, scope, original lines, and budget never change after start.
 
-Actor output is untrusted data and cannot authorize transitions, fixes, receipts, gates, or delivery.
+Risk routing is deterministic:
 
-Deterministic evidence is controller-checked with zero refuters.
+| Tier | Route |
+|---|---|
+| `low` | Zero lenses; only proven docs/comments/format/typo-string work with no executable or configuration change |
+| `medium` | One dominant lens for ordinary changes |
+| `high` | Canonical 4R for auth, update, security, payments, data exposure/loss, permissions, shell/process, or more than 400 authored lines |
 
-All inferential-severe rows may go once to at most one read-only refuter as one complete list.
+Generated files matching `testdata/golden/**` remain in snapshot identity but do not count as authored risk lines. Ordinary tests, fixtures, and snapshots are never broadly excluded. The correction budget is frozen as `min(200, ceil(original_changed_lines / 2))`.
 
-Invalid, missing, duplicate, unknown, or inconclusive refuter output escalates without a replacement refuter.
+`finalize` canonicalizes selected-lens results, assigns missing lens/finding IDs, and performs only the legal transition from the current compact state. The five states are `reviewing`, `correction_required`, `validating`, `approved`, and `escalated`.
 
-Ordinary permits at most one fix batch.
+`validate` loads the terminal receipt and authority, derives the named live Git gate, and runs with zero actors. It never mutates compact authority.
 
-After a fix, exactly one validator consumes only requested frozen IDs, their exact hash-bound rows, original acceptance-test proof, one passed correction-regression proof per ID, original-criterion regressions, and inert follow-ups.
+## Causal findings
 
-The validator consumes proof only; it does not inspect a fix diff, candidate tree, changed paths or lines, discover, or re-review.
-
-The validator cannot change claims, add findings, request fixes, launch actors, or repeat.
-
-A no-fix path runs zero validators; both paths run exactly one final verification.
-
-Ordinary ends only as `approved` or `escalated`.
-
-## Frozen row schema
-
-Candidate rows become authoritative only after the controller canonicalizes, ID-sorts, and hashes these fields:
+Every finding supplies `evidence_class`, `causal_disposition`, and concrete proof. Concrete proof is one of `changed-hunk`, `candidate-created-path`, `differential-test`, or `before-after`.
 
 | Field | Values |
 |---|---|
-| `id` | Stable lens-prefixed identifier |
-| `lens` | risk \| resilience \| readability \| reliability \| judgment-day |
-| `location` | Exact path and line or line range |
-| `severity` | BLOCKER \| CRITICAL \| WARNING \| SUGGESTION |
-| `status_at_freeze` | open \| refuted \| info |
-| `evidence_class` | deterministic \| inferential-severe \| info |
-| `evidence_claim` | Concrete user-impact claim |
+| `severity` | `BLOCKER` \| `CRITICAL` \| `WARNING` \| `SUGGESTION` |
+| `evidence_class` | `deterministic` \| `inferential` \| `insufficient` |
+| `causal_disposition` | `introduced` \| `behavior-activated` \| `worsened` \| `pre-existing` \| `base-only` \| `unknown` |
+| `proof_refs` | Prefixed concrete proof references |
 
-WARNING and SUGGESTION are one-time `info` rows and schedule nothing. `refuted` is terminal. Store or hash disagreement fails closed.
+Only severe `introduced`, `behavior-activated`, or `worsened` findings with valid proof can enter `correction_ids`. Deterministic candidate-caused blockers need no refuter. All inferential candidate-caused blockers use exactly one complete read-only refuter batch.
 
-## Actor contracts
+If native IDs are assigned to inferential findings, FINALIZE first returns canonical rows plus a content-derived request hash without mutation; completion requires identical lens input, that hash, and one complete refuter batch.
 
-### Selected review lens
+`pre-existing` and `base-only` findings become non-blocking follow-ups. `unknown`, insufficient evidence, malformed severe claims, missing/duplicate/extra refuter rows, and inconclusive severe outcomes escalate. `WARNING` and `SUGGESTION` remain informational.
 
-Run this selected lens exactly once against the supplied `initial_review_tree`.
+Actor output cannot authorize transitions, corrections, receipts, gates, or delivery.
 
-Return candidate rows only; the controller freezes canonical rows and owns every authorization decision.
+## Correction
 
-Do not persist state, mutate claims, launch actors, request fixes, validate fixes, or deliver anything.
+Ordinary review permits one correction and one targeted validator.
 
-### Ordinary refuter
+Before editing, `finalize` requires a positive correction-line forecast. A forecast above the frozen budget escalates. After editing, the controller derives actual correction lines from Git and rejects an over-budget correction.
 
-Receive the complete inferential-severe frozen-row list once.
+Correction remains bound to the original candidate tree, genesis paths, untracked set, and frozen correction IDs. It cannot add scope.
 
-Return exactly one `refuted | corroborated | inconclusive` resolution for every supplied ID.
+The targeted validator checks only the original criteria and one correction regression for the exact correction IDs. It cannot add findings, request another correction, launch actors, persist authority, or repeat. Later observations are inert follow-ups.
 
-Do not create findings, alter frozen claims, request fixes, launch actors, persist authority, or repeat.
+Final verification evidence is supplied and hashed only during finalization. Failure escalates and never reopens review.
 
-### Targeted proof validator
+## Authority and compatibility
 
-Receive only requested frozen IDs, their exact hash-bound rows, original acceptance-test proof, one passed correction-regression proof per ID, original-criterion regressions, and inert follow-ups.
+Compact v2 stores one current state and terminal receipt under `<git-common-dir>/gentle-ai/reviews/compact-v2/<lineage>/`. Content-derived revisions, compare-and-swap replacement, exact retry idempotency, stale/semantic retry rejection, semantic validation, terminal immutability, atomic rename durability, and receipt readback are mandatory.
 
-Consume proof for supplied IDs only; never inspect a fix diff, candidate tree, changed paths or lines, discover, re-review, add findings, or change frozen claims.
+Existing graph-v1 ordinary lineages remain readable, gate-validatable, and exportable, but reject new mutation. Judgment Day remains mutable on graph-v1 until separately ported. Pre-graph numbered authority remains destructive-reset-only. Graph bundles never parse or import compact authority. Same-lineage graph-v1 and compact-v2 authority is ambiguous and fails closed until destructive reset quarantines both.
 
-Do not request another fix, launch actors, persist authority, or repeat.
+Mirrors remain non-authoritative and reconcile only after native allow.
 
-### Fix agent
+## Lifecycle gates
 
-Fix only the exact controller-authorized severe IDs in the one supplied batch.
+Pre-commit, pre-push, pre-PR, and release validate an approved receipt against one exact typed command target with zero actors. Compact validation loads authority and receipt, derives live target/publication evidence, then immediately reloads authority and re-derives target/publication evidence before allow.
 
-Do not add findings, alter frozen claims, authorize transitions, deliver, publish, or start another actor.
+Pi additionally registers one one-shot authorization for the exact subsequent command. Bash-time target/publication derivation runs again. Repository identity, first-push destination, push destination, exact PR base, release evidence, protected-main release fast path, and fail-closed dangerous-command interception remain mandatory. Base advancement is unsupported without a receipt-bound signed CI trust root and therefore fails closed.
+
+Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is independently proven successful, the remote head is rechecked before tag push, and no fresh risk evidence exists. Major and post-incident releases require explicit extraordinary review.
+
+Review transactions, validation, and SDD never commit, push, create a PR, release, or publish.
 
 ## Judgment Day
 
@@ -88,18 +83,4 @@ Only Judgment Day may iterate, for at most two scoped fix/re-judgment rounds.
 
 Findings surviving round two escalate; no third-round transition exists.
 
-## Routing and lifecycle boundaries
-
-Only ordinary transaction start classifies the bound `base_tree -> complete_snapshot_tree` diff.
-
-Pre-commit, pre-push, and PR gates validate approved receipts and exact typed targets with zero actors.
-Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise release fails closed through native receipt validation.
-Major and post-incident releases require explicit extraordinary review even when fast-path checks pass.
-
-Dangerous-command safety remains independent and authoritative.
-
-SDD completion adds no review or Judgment Day pass.
-
-Review transactions, validation, and SDD perform no commit, push, PR creation, release, or publication.
-
-Package-managed actor definitions may be migrated only when their exact prior hash proves package ownership. User routing and project/user overrides remain untouched.
+Judgment Day stays mutable on graph-v1 until separately ported.

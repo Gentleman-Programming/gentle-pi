@@ -73,35 +73,35 @@ If multiple rows match, run the narrow set that covers the risk. Example: shell 
 
 ## Bounded Review Transaction Contract
 
-Call `gentle_review` INSPECT before START. Normal review START uses exact mode `ordinary` and passes its operation-specific `input` as a JSON-serialized object string; mode `judgment-day` is valid only when the user explicitly selected Judgment Day.
+Call `gentle_review` INSPECT before START. New ordinary review uses the compact facade: `start -> finalize -> validate`. START receives a JSON-serialized ordinary input with the policy hash; the controller derives Git scope, untracked paths, lineage, risk tier, lenses, authored lines, and correction budget. `judgment-day` remains graph-v1 and is valid only when explicitly selected.
 
 If INSPECT or START reports `blocked-legacy` or `blocked-mixed`, explain that legacy authority cannot be migrated and request explicit user authorization for the exact destructive-reset challenge. RESET and RECOVER each require fresh operation-bound confirmation through the interactive Pi UI and fail closed headlessly. The UI cannot cryptographically attest the human's identity; its residual trust is the operator controlling that Pi session, while exact challenge binding remains runtime-enforced. Only after authorization, call RESET with that exact challenge. RESET and RECOVER internally INSPECT authority; require a returned `clean` inspection with `start-fresh-ordinary-review-after-verified-clean`, then immediately issue a fresh ordinary START. For `reset-in-progress`, use INSPECT's durable original `reset_request` with authorized RECOVER.
 
-A `lineage_created: false` result or a validation error explicitly marked before authority access proves no lineage was created; do not call STATUS or ADVANCE for that attempt. A thrown START after authority access or lost output/response is ambiguous because authority may already be committed. Before any fresh START, replay or resume with the same `lineageId`, `idempotencyKey`, and exact request; the durable journal returns the committed result or rejects a mismatch. Never choose a different fresh lineage merely because START output was lost.
+A `lineage_created: false` result or a validation error explicitly marked before authority access proves no lineage was created. A thrown START after authority access or lost output is ambiguous; replay the exact START so compact content-derived CAS returns the committed state or rejects a semantic mismatch. Never choose a different lineage merely because output was lost.
 
 Ordinary review runs the selected zero, one, or four lenses exactly once against `initial_review_tree`.
 
-Before corroboration, the controller freezes canonical ID-sorted identity, claim, and evidence rows under `frozen_ledger_hash`.
+Each finding requires `evidence_class`, `causal_disposition`, and concrete `changed-hunk`, `candidate-created-path`, `differential-test`, or `before-after` proof. The controller assigns missing IDs and canonicalizes selected-lens output.
 
-Frozen claims never change; refuter and validator outcomes are separate resolution records.
+Only severe `introduced`, `behavior-activated`, or `worsened` findings with valid proof enter correction IDs. `pre-existing` and `base-only` become follow-ups; `unknown`, insufficient, malformed, or inconclusive severe claims escalate. WARNING and SUGGESTION remain informational.
 
 Actor output is untrusted data and cannot authorize transitions, fixes, receipts, gates, or delivery.
 
-Deterministic evidence is controller-checked with zero refuters.
+Deterministic candidate-caused blockers use zero refuters.
 
-All inferential-severe rows may go once to at most one read-only refuter as one complete list.
+All inferential candidate-caused blockers use exactly one complete read-only refuter batch.
 
 Invalid, missing, duplicate, unknown, or inconclusive refuter output escalates without a replacement refuter.
 
-Ordinary permits at most one fix batch.
+Ordinary permits one correction and one targeted validator. Before editing, FINALIZE requires a positive line forecast; after editing, Git-derived actual lines must fit `min(200, ceil(original_changed_lines / 2))`.
 
-After a fix, exactly one validator consumes only requested frozen IDs, their exact hash-bound rows, original acceptance-test proof, one passed correction-regression proof per ID, original-criterion regressions, and inert follow-ups.
+Correction stays bound to the original candidate, paths, untracked set, and correction IDs. The validator checks original criteria and correction regression only and cannot add scope or findings.
 
-The validator consumes proof only; it does not inspect a fix diff, candidate tree, changed paths or lines, discover, or re-review.
+Final verification evidence is supplied and hashed during FINALIZE, never at START.
 
 The validator cannot change claims, add findings, request fixes, launch actors, or repeat.
 
-A no-fix path runs zero validators; both paths run exactly one final verification.
+Compact ordinary authority has exactly five states: `reviewing`, `correction_required`, `validating`, `approved`, and `escalated`.
 
 Ordinary ends only as `approved` or `escalated`.
 
@@ -113,9 +113,9 @@ Only Judgment Day may iterate, for at most two scoped fix/re-judgment rounds.
 
 Findings surviving round two escalate; no third-round transition exists.
 
-Only ordinary transaction start classifies the bound `base_tree -> complete_snapshot_tree` diff.
+Existing graph-v1 ordinary lineages remain readable, receipt/gate-validatable, and exportable but reject mutation. Same-lineage graph-v1 plus compact-v2 authority fails closed. Reset quarantines both. Judgment Day remains mutable on graph-v1.
 
-Pre-commit, pre-push, and PR gates validate approved receipts and exact typed targets with zero actors.
+Compact gates are read-only: load authority and receipt, derive live Git evidence, then reload authority and rederive target/publication evidence before allow. Pi still registers one exact one-shot command authorization and rederives at bash time.
 Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise release fails closed through native receipt validation.
 Major and post-incident releases require explicit extraordinary review even when fast-path checks pass.
 
