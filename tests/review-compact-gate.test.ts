@@ -38,6 +38,14 @@ function approved(root: string): string {
 	return started.lineage_id;
 }
 
+function deriveIntendedCommitTarget(root: string) {
+	const tree = git(root, "write-tree");
+	return {
+		target: { kind: GATE_TARGET_KIND.INTENDED_COMMIT, intended_commit_tree: tree } as const,
+		actualIntendedCommitTree: tree,
+	};
+}
+
 test("omitted final verification cannot approve a receipt or gate", (t) => {
 	const root = repository(t);
 	const started = startCompactReview({ cwd: root, policyHash: "a".repeat(64) });
@@ -89,4 +97,57 @@ test("compact gate is read-only and closes authority and target TOCTOU before al
 	});
 	assert.equal(denied.status, "deny");
 	assert.match(denied.reason, /changed during final authorization/i);
+});
+
+test("compact pre-commit gate preserves an approved receipt across exact staging of reviewed new files", (t) => {
+	const root = repository(t);
+	writeFileSync(join(root, "new-value.ts"), "export const newValue = 1;\n");
+	const started = startCompactReview({ cwd: root, policyHash: "a".repeat(64) });
+	finalizeCompactReview({
+		cwd: root,
+		lineageId: started.lineage_id,
+		review_result: { lens_results: [{ findings: [], evidence: [] }] },
+		final_evidence: "verification passed",
+		final_verification_passed: true,
+	});
+
+	git(root, "add", "value.ts", "new-value.ts");
+	const allowed = validateCompactReviewGate({
+		cwd: root,
+		lineageId: started.lineage_id,
+		deriveTarget: () => deriveIntendedCommitTarget(root),
+	});
+	assert.equal(allowed.status, "allow", allowed.reason);
+});
+
+test("compact pre-commit gate rejects partial or additional staging around reviewed new files", (t) => {
+	const root = repository(t);
+	writeFileSync(join(root, "first.ts"), "export const first = 1;\n");
+	writeFileSync(join(root, "second.ts"), "export const second = 2;\n");
+	const started = startCompactReview({ cwd: root, policyHash: "a".repeat(64) });
+	finalizeCompactReview({
+		cwd: root,
+		lineageId: started.lineage_id,
+		review_result: { lens_results: [{ findings: [], evidence: [] }] },
+		final_evidence: "verification passed",
+		final_verification_passed: true,
+	});
+
+	git(root, "add", "value.ts", "first.ts");
+	const partial = validateCompactReviewGate({
+		cwd: root,
+		lineageId: started.lineage_id,
+		deriveTarget: () => deriveIntendedCommitTarget(root),
+	});
+	assert.equal(partial.status, "scope-changed");
+
+	git(root, "add", "second.ts");
+	writeFileSync(join(root, "extra.ts"), "export const extra = 3;\n");
+	git(root, "add", "extra.ts");
+	const additional = validateCompactReviewGate({
+		cwd: root,
+		lineageId: started.lineage_id,
+		deriveTarget: () => deriveIntendedCommitTarget(root),
+	});
+	assert.equal(additional.status, "scope-changed");
 });
