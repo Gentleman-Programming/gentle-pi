@@ -3046,19 +3046,54 @@ function commandOptionValue(arguments_: readonly string[], name: string): string
 	return matches[0]!;
 }
 
+function githubRemoteOwner(url: string): string | null {
+	const match = /^(?:https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([^/]+)\/[^/]+(?:\.git)?\/?$/i.exec(url);
+	return match?.[1] ?? null;
+}
+
+function resolvePullRequestForkHead(cwd: string, value: string): { ref: string; commit: string } | null {
+	if (!value.includes(":")) return null;
+	const match = /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38})):(.+)$/.exec(value);
+	if (!match || match[2]!.includes(":")) {
+		throw new Error("Pull request fork head must use exact owner:branch syntax");
+	}
+	const owner = match[1]!;
+	const branch = match[2]!;
+	runReviewGit(cwd, ["check-ref-format", `refs/heads/${branch}`]);
+	const remotes = runReviewGit(cwd, ["remote"]).split(/\r?\n/).filter(Boolean);
+	const ownerRemotes = remotes.filter((remote) => {
+		let urls: string;
+		try {
+			urls = runReviewGit(cwd, ["config", "--get-all", `remote.${remote}.url`]);
+		} catch {
+			return false;
+		}
+		return urls.split(/\r?\n/).some((url) => githubRemoteOwner(url)?.toLowerCase() === owner.toLowerCase());
+	});
+	if (ownerRemotes.length !== 1) {
+		throw new Error(`Pull request fork owner ${owner} must match exactly one configured GitHub remote`);
+	}
+	const ref = `refs/heads/${branch}`;
+	const lines = runReviewGit(cwd, ["ls-remote", "--refs", ownerRemotes[0]!, ref]).split(/\r?\n/).filter(Boolean);
+	if (lines.length !== 1) throw new Error(`Pull request fork branch ${owner}:${branch} is missing or ambiguous`);
+	const remoteMatch = /^([0-9a-fA-F]{40,64})\t(.+)$/.exec(lines[0]!);
+	if (!remoteMatch || remoteMatch[2] !== ref) {
+		throw new Error(`Pull request fork branch ${owner}:${branch} did not resolve to one exact remote ref`);
+	}
+	return { ref, commit: runReviewGit(cwd, ["rev-parse", "--verify", `${remoteMatch[1]}^{commit}`]) };
+}
+
 function derivePullRequestTarget(command: ReviewLifecycleCommand): GateTargetV1 {
 	const baseRef = resolveLocalFullRef(
 		command.cwd,
 		commandOptionValue(command.arguments, "--base"),
 		"Pull request base",
 	);
-	const headRef = resolveLocalFullRef(
-		command.cwd,
-		commandOptionValue(command.arguments, "--head"),
-		"Pull request head",
-	);
+	const headValue = commandOptionValue(command.arguments, "--head");
+	const forkHead = resolvePullRequestForkHead(command.cwd, headValue);
+	const headRef = forkHead?.ref ?? resolveLocalFullRef(command.cwd, headValue, "Pull request head");
 	const baseCommit = runReviewGit(command.cwd, ["rev-parse", "--verify", `${baseRef}^{commit}`]);
-	const headCommit = runReviewGit(command.cwd, ["rev-parse", "--verify", `${headRef}^{commit}`]);
+	const headCommit = forkHead?.commit ?? runReviewGit(command.cwd, ["rev-parse", "--verify", `${headRef}^{commit}`]);
 	return {
 		kind: GATE_TARGET_KIND.PULL_REQUEST,
 		base_ref: baseRef,

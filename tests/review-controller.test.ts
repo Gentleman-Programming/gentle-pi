@@ -1186,6 +1186,8 @@ test("controller binds push, PR, and release authorization to exact command argu
 	});
 	execFileSync("git", ["--git-dir", remotePath, "update-ref", "refs/heads/main", fixture.baseCommit]);
 	git(fixture.repository, "remote", "add", "origin", remotePath);
+	git(fixture.repository, "remote", "add", "fork", "https://github.com/MarsSall/gentle-pi.git");
+	git(fixture.repository, "config", "url.file://" + remotePath.replace(/\\/g, "/") + ".insteadOf", "https://github.com/MarsSall/gentle-pi.git");
 	createTerminalAuthority(fixture, "controller-targets");
 	const { controller, toolCall } = registerRuntime();
 	const ctx = extensionContext(fixture.repository, true);
@@ -1193,6 +1195,7 @@ test("controller binds push, PR, and release authorization to exact command argu
 	for (const [command, key] of [
 		["git push origin main:main", "push"],
 		["gh pr create --base base --head final", "pr"],
+		["gh pr create --base base --head MarsSall:final", "fork-pr"],
 		["gh release create v1.2.3 --notes bounded", "release"],
 	] as const) {
 		const validated = await controllerCall(controller, ctx, {
@@ -1204,6 +1207,46 @@ test("controller binds push, PR, and release authorization to exact command argu
 		});
 		assert.equal((validated.result as Record<string, unknown>).status, "allow", command);
 		assert.equal(await toolCall({ toolName: "bash", input: { command } }, ctx), undefined, command);
+	}
+
+	execFileSync("git", ["--git-dir", remotePath, "update-ref", "refs/heads/final", fixture.baseCommit]);
+	await assert.rejects(
+		controller.execute(
+			"divergent-fork-pr-head",
+			{
+				operation: "validate",
+				lineageId: "controller-targets",
+				idempotencyKey: "divergent-fork-pr-head",
+				command: "gh pr create --base base --head MarsSall:final",
+				input: JSON.stringify({ scopeBudget: budget() }),
+			},
+			undefined,
+			undefined,
+			ctx,
+		),
+	);
+
+	for (const command of [
+		"gh pr create --base base --head :final",
+		"gh pr create --base base --head MarsSall:",
+		"gh pr create --base base --head MarsSall:final:extra",
+	]) {
+		await assert.rejects(
+			controller.execute(
+				"malformed-fork-pr-head",
+				{
+					operation: "validate",
+					lineageId: "controller-targets",
+					idempotencyKey: `malformed-fork-pr-head-${command.length}`,
+					command,
+					input: JSON.stringify({ scopeBudget: budget() }),
+				},
+				undefined,
+				undefined,
+				ctx,
+			),
+			/exact owner:branch syntax/i,
+		);
 	}
 
 	for (const command of [
