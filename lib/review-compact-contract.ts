@@ -41,6 +41,7 @@ export interface CompactFinalizeContractInput {
 	validation?: CompactTargetedValidationInput;
 	final_evidence?: string;
 	final_verification_passed?: boolean;
+	refuter_batch?: unknown;
 }
 
 function fail(area: string, code: string, message: string): never {
@@ -171,7 +172,7 @@ export function parseCompactStartInput(value: unknown): CompactStartContractInpu
 }
 
 export function parseCompactFinalizeInput(value: unknown): CompactFinalizeContractInput {
-	const input = exact(value, "review/finalize", ["cwd"], ["lineageId", "review_result", "correction_line_forecast", "validation_proof", "validation", "final_evidence", "final_verification_passed"]);
+	const input = exact(value, "review/finalize", ["cwd"], ["lineageId", "review_result", "correction_line_forecast", "validation_proof", "validation", "final_evidence", "final_verification_passed", "refuter_batch"]);
 	if ((input.final_evidence === undefined) !== (input.final_verification_passed === undefined)) fail("review/finalize", "field-pair", "final evidence and result must appear together");
 	let correction_line_forecast: number | undefined;
 	if (input.correction_line_forecast !== undefined) {
@@ -179,5 +180,5 @@ export function parseCompactFinalizeInput(value: unknown): CompactFinalizeContra
 		correction_line_forecast = input.correction_line_forecast;
 	}
 	if (input.final_verification_passed !== undefined && typeof input.final_verification_passed !== "boolean") fail("review/finalize.final_verification_passed", "type", "must be boolean");
-	return { cwd: string(input.cwd, "review/finalize.cwd"), ...(optionalLineage(input.lineageId, "review/finalize.lineageId") === undefined ? {} : { lineageId: optionalLineage(input.lineageId, "review/finalize.lineageId")! }), ...(input.review_result === undefined ? {} : { review_result: parseReviewResult(input.review_result, "review/finalize.review_result") }), ...(correction_line_forecast === undefined ? {} : { correction_line_forecast }), ...(input.validation_proof === undefined ? {} : { validation_proof: parseValidationProof(input.validation_proof, "review/finalize.validation_proof") }), ...(input.validation === undefined ? {} : { validation: parseValidation(input.validation, "review/finalize.validation") }), ...(input.final_evidence === undefined ? {} : { final_evidence: string(input.final_evidence, "review/finalize.final_evidence") }), ...(input.final_verification_passed === undefined ? {} : { final_verification_passed: input.final_verification_passed }) };
+	return { cwd: string(input.cwd, "review/finalize.cwd"), ...(optionalLineage(input.lineageId, "review/finalize.lineageId") === undefined ? {} : { lineageId: optionalLineage(input.lineageId, "review/finalize.lineageId")! }), ...(input.review_result === undefined ? {} : { review_result: parseReviewResult(input.review_result, "review/finalize.review_result") }), ...(correction_line_forecast === undefined ? {} : { correction_line_forecast }), ...(input.validation_proof === undefined ? {} : { validation_proof: parseValidationProof(input.validation_proof, "review/finalize.validation_proof") }), ...(input.validation === undefined ? {} : { validation: parseValidation(input.validation, "review/finalize.validation") }), ...(input.final_evidence === undefined ? {} : { final_evidence: string(input.final_evidence, "review/finalize.final_evidence") }), ...(input.final_verification_passed === undefined ? {} : { final_verification_passed: input.final_verification_passed }), ...(input.refuter_batch === undefined ? {} : { refuter_batch: input.refuter_batch }) };
 }

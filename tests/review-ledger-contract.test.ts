@@ -156,8 +156,10 @@ test("ordinary refuter is one complete read-only inferential batch with concrete
 	const content = read(REFUTER);
 	assertMatches(REFUTER, content, [
 		/Receive the complete inferential-severe frozen-row list once/,
-		/Return exactly one `refuted \| corroborated \| inconclusive` resolution for every supplied ID/,
+		/`gentle-ai\.refuter-result-batch\/v1`/,
+		/`request_hash`[\s\S]*`finding_id`/,
 		/`proof_refs`[\s\S]*`changed-hunk:`[\s\S]*`candidate-created-path:`[\s\S]*`differential-test:`[\s\S]*`before-after:`/,
+		/An `inconclusive` outcome is rejected/,
 		/Do not create findings, alter frozen claims, request fixes, launch actors, persist authority, or repeat/,
 	]);
 });

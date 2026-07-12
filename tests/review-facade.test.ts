@@ -77,7 +77,7 @@ test("facade exposes native refuter IDs without mutation before an identical sec
 	assert.equal(first.store_revision, before.revision);
 	assert.equal(first.state, "reviewing");
 	assert.deepEqual(first.refuter_request?.findings.map(({ id }) => id), ["READABILITY-001"]);
-	const refuterResults = [{ finding_id: "READABILITY-001", outcome: "refuted", proof_refs: ["before-after:proof"] }];
+	const refuterResults = [{ finding_id: "READABILITY-001", outcome: "refuted", proof_refs: ["differential-test:tests/value.test.ts"] }];
 	assert.throws(() => finalizeCompactReview({ cwd: root, lineageId: started.lineage_id, review_result: {
 		lens_results: lensResults, refuter_request_hash: "0".repeat(64), refuter_results: refuterResults,
 	} }), /request hash/i);
@@ -87,27 +87,39 @@ test("facade exposes native refuter IDs without mutation before an identical sec
 		refuter_results: refuterResults,
 	} }), /request hash/i);
 	assert.equal(discoverCompactReview(root, started.lineage_id).record.revision, before.revision);
-	const second = finalizeCompactReview({ cwd: root, lineageId: started.lineage_id, review_result: {
-		lens_results: lensResults, refuter_request_hash: first.refuter_request?.request_hash,
-		refuter_results: refuterResults,
-	} });
+	const second = finalizeCompactReview({
+		cwd: root,
+		lineageId: started.lineage_id,
+		review_result: { lens_results: lensResults },
+		refuter_batch: {
+			schema: "gentle-ai.refuter-result-batch/v1",
+			request_hash: first.refuter_request?.request_hash,
+			results: refuterResults,
+		},
+	});
 	assert.equal(second.state, "validating");
 });
 
-test("malformed refuter rows are rejected before authority mutation", (t) => {
-	for (const [index, malformed] of [null, "invalid", {}].entries()) {
-		const root = repository(t);
-		const started = startCompactReview({ cwd: root, lineageId: `malformed-refuter-${index}`, policyHash: "a".repeat(64) });
-		const lensResults = [{ findings: [{
-			location: "value.ts:1", severity: "CRITICAL", claim: "The value may be invalid.",
-			evidence_class: "inferential", causal_disposition: "introduced", proof_refs: ["differential-test:tests/value.test.ts"],
-		}], evidence: [] }];
-		const first = finalizeCompactReview({ cwd: root, lineageId: started.lineage_id, review_result: { lens_results: lensResults } });
-		assert.throws(() => finalizeCompactReview({ cwd: root, lineageId: started.lineage_id, review_result: {
-			lens_results: lensResults, refuter_request_hash: first.refuter_request?.request_hash, refuter_results: [malformed] as never,
-		} }), CompactReviewContractError);
-		assert.equal(discoverCompactReview(root, started.lineage_id).record.revision, first.store_revision);
-	}
+test("malformed refuter batches escalate atomically and replay idempotently", (t) => {
+	const root = repository(t);
+	const started = startCompactReview({ cwd: root, lineageId: "malformed-refuter", policyHash: "a".repeat(64) });
+	const lensResults = [{ findings: [{
+		location: "value.ts:1", severity: "CRITICAL", claim: "The value may be invalid.",
+		evidence_class: "inferential", causal_disposition: "introduced", proof_refs: ["differential-test:tests/value.test.ts"],
+	}], evidence: [] }];
+	const first = finalizeCompactReview({ cwd: root, lineageId: started.lineage_id, review_result: { lens_results: lensResults } });
+	const terminal = finalizeCompactReview({
+		cwd: root,
+		lineageId: started.lineage_id,
+		review_result: { lens_results: lensResults },
+		refuter_batch: `prose ${JSON.stringify({ schema: "gentle-ai.refuter-result-batch/v1", request_hash: first.refuter_request?.request_hash, results: [] })}`,
+	});
+	assert.equal(terminal.state, "escalated");
+	const state = discoverCompactReview(root, started.lineage_id, true).record.state;
+	assert.deepEqual(state.correction_ids, []);
+	assert.equal(state.outcomes["READABILITY-001"], "inconclusive");
+	assert.match(state.escalation_reasons.join("\n"), /refuter batch rejected/i);
+	assert.equal(finalizeCompactReview({ cwd: root, lineageId: started.lineage_id }).store_revision, terminal.store_revision);
 });
 
 test("facade freezes a pre-edit forecast, derives actual correction lines, and runs one targeted validator", (t) => {

@@ -4,6 +4,7 @@ import {
 	parseCompactStartInput,
 } from "./review-compact-contract.ts";
 import { domainHashV1 } from "./review-canonical.ts";
+import { normalizeRefuterBatch } from "./review-refuter-adapter.ts";
 import {
 	COMPACT_REVIEW_STATE,
 	beginCompactCorrection,
@@ -69,6 +70,7 @@ export interface CompactFacadeFinalizeInput {
 	validation?: CompactTargetedValidationInput;
 	final_evidence?: string;
 	final_verification_passed?: boolean;
+	refuter_batch?: unknown;
 }
 
 export interface CompactFacadeFinalizeResult {
@@ -291,12 +293,36 @@ export function finalizeCompactReview(
 	if (state.state === COMPACT_REVIEW_STATE.REVIEWING) {
 		if (!input.review_result) return finalizeResult(store, record, "supply all selected lens results");
 		const request = createCompactRefuterRequest(state, input.review_result.lens_results);
-		if (request && input.review_result.refuter_results === undefined) {
+		if (request && input.refuter_batch === undefined) {
+			if (input.review_result.refuter_results !== undefined && input.review_result.refuter_request_hash !== request.request_hash) {
+				throw new Error("Compact refuter request hash is missing or does not match the identical canonical lens input");
+			}
 			return { ...finalizeResult(store, record, "run one complete refuter batch, then replay identical lens input"), refuter_request: request };
 		}
-		state = completeCompactReview(state, input.review_result);
-		const revision = store.replace(record.revision, COMPACT_STORE_OPERATION.COMPLETE_REVIEW, state);
-		record = { schema: "gentle-ai.review-state-record/v2", revision, state };
+		if (request) {
+			const normalized = normalizeRefuterBatch(request, input.refuter_batch);
+			if (normalized.status === "normalized") {
+				input.review_result = {
+					...input.review_result,
+					refuter_request_hash: normalized.refuter_request_hash,
+					refuter_results: normalized.refuter_results,
+				};
+			} else {
+				state = completeCompactReview(state, {
+					...input.review_result,
+					refuter_request_hash: request.request_hash,
+					refuter_results: [],
+				});
+				state.escalation_reasons.push(`Refuter batch rejected: ${normalized.reason_code}.`);
+				const revision = store.replace(record.revision, COMPACT_STORE_OPERATION.COMPLETE_REVIEW, state);
+				record = { schema: "gentle-ai.review-state-record/v2", revision, state };
+			}
+		}
+		if (state.state === COMPACT_REVIEW_STATE.REVIEWING) {
+			state = completeCompactReview(state, input.review_result);
+			const revision = store.replace(record.revision, COMPACT_STORE_OPERATION.COMPLETE_REVIEW, state);
+			record = { schema: "gentle-ai.review-state-record/v2", revision, state };
+		}
 	}
 	if (
 		state.state === COMPACT_REVIEW_STATE.CORRECTION_REQUIRED &&
