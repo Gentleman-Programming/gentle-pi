@@ -77,6 +77,17 @@ Chain strategy: stacked-to-main|feature-branch-chain|size-exception|pending
 - Work units must have clear start, finish, verification, and rollback boundaries.
 - If chain strategy is not known, set it to `pending` and set `Decision needed before apply` according to delivery strategy.
 
+## Task Ownership
+
+Every generated Markdown checkbox MUST end with exactly one terminal ownership marker:
+
+```markdown
+- [ ] Implement and verify the behavior. <!-- sdd-owner: implementation -->
+- [ ] Start or reuse bounded review. <!-- sdd-owner: parent -->
+```
+
+Use `implementation` for RED/GREEN/TRIANGULATE/REFACTOR, code, tests, and apply-owned verification. Use `parent` only for explicit post-apply bounded-review and lifecycle-gate actions. Group parent actions separately after implementation work. Do not add owner values or infer ownership from headings.
+
 ## Task Rules
 
 - Every task references concrete file paths or concrete discovery targets.

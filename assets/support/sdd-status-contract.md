@@ -49,11 +49,17 @@ artifacts:
   applyProgress: missing | done | partial
   verifyReport: missing | done | partial
   syncReport: missing | done | partial
-taskProgress:
+taskProgress: # implementation-owned plus malformed unresolved rows
   total: 0
   complete: 0
   remaining: 0
   unchecked: []
+deferredParentActions:
+  total: 0
+  complete: 0
+  remaining: 0
+  unchecked: []
+taskArtifactErrors: []
 applyState: blocked | all_done | ready | not_applicable
 dependencies:
   apply: blocked | ready | all_done | not_applicable
@@ -69,9 +75,13 @@ nextRecommended: <command-or-action>
 isNonAuthoritative: false  # boolean; true when the native engine is not authoritative for the store
 ```
 
+## Task Ownership
+
+Each checkbox may end with one terminal marker: `<!-- sdd-owner: implementation -->` or `<!-- sdd-owner: parent -->`. An unmarked legacy checkbox is implementation-owned. Any line containing `sdd-owner` that is unsupported, duplicated, or non-terminal is malformed: add its exact line to `taskArtifactErrors` and `blockedReasons`, and count it as unresolved implementation work even when checked. `taskProgress` reports implementation work; `deferredParentActions` reports valid parent actions separately.
+
 ## Apply State
 
-- `blocked`: required apply artifacts are missing, task selection is ambiguous, or action context makes edits unsafe.
+- `blocked`: required apply artifacts are missing, task selection is ambiguous, malformed ownership markers exist, or action context makes edits unsafe.
 - `all_done`: tasks artifact exists and every implementation task is checked `[x]`.
 - `ready`: tasks artifact exists, at least one implementation task remains unchecked, and edit scope is safe.
 - `not_applicable`: emitted for non-authoritative stores (see Engine Authority by Store). This is NOT a blocker.
@@ -79,9 +89,9 @@ isNonAuthoritative: false  # boolean; true when the native engine is not authori
 ## Dependency States
 
 - `apply` is `ready` only when specs, design, and tasks are available and task progress is not all done.
-- `verify` is `ready` when tasks exist and either apply-progress exists or the tasks artifact shows all intended implementation work complete. Unchecked implementation tasks remain CRITICAL blockers for full archive readiness.
+- `verify` is ready only after implementation completion and authoritative parent review approval. Without that approval, the route is `parent-lifecycle`; missing receipt requires the parent to explicitly start bounded review and invalid authority fails closed. Unchecked implementation tasks remain CRITICAL blockers for full archive readiness.
 - `sync` is `ready` only when verify-report exists and has no unresolved `FAIL`, `BLOCKED`, `CRITICAL`, or verification blockers. `engram`/`none` modes may mark sync `not_applicable`.
-- `archive` is `ready` only when verify-report exists, sync is complete or not applicable, and tasks are complete. CRITICAL verification issues have no override. Explicit recorded exceptions are limited to non-critical partial archives or stale-checkbox reconciliation when apply-progress/verify-report prove completion.
+- `archive` is `ready` only when verify-report exists, sync is complete or not applicable, implementation tasks are complete, and explicit deferred mandatory parent actions are reconciled at their native lifecycle boundaries. CRITICAL verification issues have no override. Explicit recorded exceptions are limited to non-critical partial archives or stale-checkbox reconciliation when apply-progress/verify-report prove completion.
 - `not_applicable`: emitted for non-authoritative stores (engram, none, and both when no `openspec/` directory exists) when `nextRecommended: "resolve-via-engram"` is active. `not_applicable` is NOT a gate failure — readiness must be resolved from Engram instead of from these fields.
 
 ## Action Context Guard

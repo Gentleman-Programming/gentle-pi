@@ -16,6 +16,7 @@ import {
 	COMPACT_STORE_OPERATION,
 	CompactReviewStoreV2,
 	discoverCompactReviewStores,
+	discoverCompactReviewStoresForAuthority,
 	inspectCompactReviewAuthorityV2,
 } from "../lib/review-compact-store.ts";
 import {
@@ -23,6 +24,7 @@ import {
 	REVIEW_PROJECTION,
 	captureReviewSnapshot,
 } from "../lib/review-snapshot.ts";
+import { resolveRepositoryAuthorityV1 } from "../lib/review-repository.ts";
 
 function repository(t: test.TestContext): string {
 	const parent = mkdtempSync(join(tmpdir(), "compact-store-"));
@@ -36,6 +38,15 @@ function repository(t: test.TestContext): string {
 	writeFileSync(join(root, "value.ts"), "export const value = 2;\n");
 	return root;
 }
+
+test("authority-bound compact discovery rejects a repository tuple from another worktree", (t) => {
+	const source = repository(t);
+	const target = repository(t);
+	assert.throws(
+		() => discoverCompactReviewStoresForAuthority(target, resolveRepositoryAuthorityV1(source)),
+		/current repository authority|authority tuple/i,
+	);
+});
 
 test("compact discovery fails closed for malformed, non-directory, and invalid lineage entries", (t) => {
 	for (const entry of ["bad entry", "not-a-directory", "invalid!lineage"] as const) {

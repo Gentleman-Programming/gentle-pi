@@ -141,7 +141,63 @@ test("resolveSddStatus keeps planning-only changes read-only and blocks only an 
 	assert.equal(valid.blockedReasons.some((reason) => reason.startsWith("resolve-review:")), false);
 });
 
-test("resolveSddStatus marks apply all_done and verify ready when tasks are checked", async () => {
+test("resolveSddStatus blocks an expected missing native bound readiness without inferring approval", async () => {
+	const cwd = await workspace();
+	seedChange(cwd);
+	const status = resolveSddStatus({
+		cwd,
+		changeName: "add-auth",
+		nativeReviewReadiness: { expected: true, ready: false, reason: "binding is missing" },
+	});
+	assert.equal(status.applyState, "blocked");
+	assert.equal(status.nextRecommended, "resolve-review");
+	assert.match(status.blockedReasons.join("\n"), /binding is missing/);
+});
+
+test("resolveSddStatus routes completed implementation to parent lifecycle and separates parent actions", async () => {
+	const cwd = await workspace();
+	const root = seedChange(cwd);
+	write(
+		join(root, "tasks.md"),
+		"# Tasks\n\n- [x] 1.1 Build foundation <!-- sdd-owner: implementation -->\n- [ ] Start bounded review. <!-- sdd-owner: parent -->\n",
+	);
+
+	const status = resolveSddStatus({ cwd, changeName: "add-auth", includeInstructions: true });
+
+	assert.deepEqual(status.taskProgress, { total: 1, complete: 1, remaining: 0, unchecked: [] });
+	assert.deepEqual(status.deferredParentActions, {
+		total: 1,
+		complete: 0,
+		remaining: 1,
+		unchecked: ["- [ ] Start bounded review. <!-- sdd-owner: parent -->"],
+	});
+	assert.deepEqual(status.taskArtifactErrors, []);
+	assert.equal(status.applyState, "all_done");
+	assert.equal(status.dependencies.apply, "all_done");
+	assert.equal(status.nextRecommended, "parent-lifecycle");
+	assert.match(status.instructions?.apply.join("\n") ?? "", /Deferred parent lifecycle actions/);
+});
+
+test("resolveSddStatus treats malformed ownership as unresolved implementation work", async () => {
+	const cwd = await workspace();
+	const root = seedChange(cwd);
+	write(join(root, "tasks.md"), "# Tasks\n\n- [x] Completed but malformed. <!-- sdd-owner: Parent -->\n");
+
+	const status = resolveSddStatus({ cwd, changeName: "add-auth" });
+
+	assert.deepEqual(status.taskProgress, {
+		total: 1,
+		complete: 0,
+		remaining: 1,
+		unchecked: ["- [x] Completed but malformed. <!-- sdd-owner: Parent -->"],
+	});
+	assert.equal(status.applyState, "blocked");
+	assert.equal(status.nextRecommended, "fix-task-ownership-marker");
+	assert.match(status.taskArtifactErrors.join("\n"), /Completed but malformed/);
+	assert.match(status.blockedReasons.join("\n"), /task ownership marker/i);
+});
+
+test("resolveSddStatus routes completed legacy implementation to parent lifecycle", async () => {
 	const cwd = await workspace();
 	const root = seedChange(cwd);
 	write(join(root, "tasks.md"), "# Tasks\n\n- [x] 1.1 Build foundation\n");
@@ -150,7 +206,7 @@ test("resolveSddStatus marks apply all_done and verify ready when tasks are chec
 
 	assert.equal(status.applyState, "all_done");
 	assert.equal(status.dependencies.apply, "all_done");
-	assert.equal(status.dependencies.verify, "ready");
+	assert.equal(status.nextRecommended, "parent-lifecycle");
 });
 
 test("resolveSddStatus blocks sync when verify report is not clearly passing", async () => {
@@ -159,7 +215,11 @@ test("resolveSddStatus blocks sync when verify report is not clearly passing", a
 	write(join(root, "apply-progress.md"), "# Apply\n\nSome work completed.\n");
 	write(join(root, "verify-report.md"), "# Verify\n\nTODO: tests not run yet\n");
 
-	const status = resolveSddStatus({ cwd, changeName: "add-auth" });
+	const status = resolveSddStatus({
+		cwd,
+		changeName: "add-auth",
+		reviewAuthority: { expected: true, resolve: () => ({ activeAuthorityId: "approved" }) },
+	});
 
 	assert.equal(status.dependencies.verify, "ready");
 	assert.equal(status.dependencies.sync, "blocked");
@@ -173,7 +233,11 @@ test("resolveSddStatus rejects negated pass and sync-complete phrases", async ()
 	write(join(root, "verify-report.md"), "# Verify\n\nStatus: not passed\n");
 	write(join(root, "sync-report.md"), "# Sync\n\nSync complete: no\n");
 
-	const status = resolveSddStatus({ cwd, changeName: "add-auth" });
+	const status = resolveSddStatus({
+		cwd,
+		changeName: "add-auth",
+		reviewAuthority: { expected: true, resolve: () => ({ activeAuthorityId: "approved" }) },
+	});
 
 	assert.equal(status.dependencies.verify, "ready");
 	assert.equal(status.dependencies.sync, "blocked");
@@ -270,7 +334,11 @@ test("resolveSddStatus blocks stale sync report when current verify is not passi
 	write(join(root, "verify-report.md"), "# Verify\n\nStatus: not passed\n");
 	write(join(root, "sync-report.md"), "# Sync\n\nPASS\n");
 
-	const status = resolveSddStatus({ cwd, changeName: "add-auth" });
+	const status = resolveSddStatus({
+		cwd,
+		changeName: "add-auth",
+		reviewAuthority: { expected: true, resolve: () => ({ activeAuthorityId: "approved" }) },
+	});
 
 	assert.equal(status.dependencies.verify, "ready");
 	assert.equal(status.dependencies.sync, "blocked");
@@ -313,7 +381,11 @@ test("resolveSddStatus marks archive ready only after clean verify, sync, and co
 	write(join(root, "verify-report.md"), "# Verify\n\nPASS\n");
 	write(join(root, "sync-report.md"), "# Sync\n\nPASS\n");
 
-	const status = resolveSddStatus({ cwd, changeName: "add-auth" });
+	const status = resolveSddStatus({
+		cwd,
+		changeName: "add-auth",
+		reviewAuthority: { expected: true, resolve: () => ({ activeAuthorityId: "approved" }) },
+	});
 
 	assert.equal(status.dependencies.archive, "ready");
 	assert.equal(status.nextRecommended, "sdd-archive");

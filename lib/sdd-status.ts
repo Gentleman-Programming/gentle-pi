@@ -29,6 +29,26 @@ export interface SddTaskProgress {
 	unchecked: string[];
 }
 
+const SDD_TASK_OWNER = {
+	IMPLEMENTATION: "implementation",
+	PARENT: "parent",
+} as const;
+
+type SddTaskOwner = (typeof SDD_TASK_OWNER)[keyof typeof SDD_TASK_OWNER];
+
+interface SddTaskAccounting {
+	implementation: SddTaskProgress;
+	parent: SddTaskProgress;
+	errors: string[];
+}
+
+const EMPTY_TASK_PROGRESS: SddTaskProgress = {
+	total: 0,
+	complete: 0,
+	remaining: 0,
+	unchecked: [],
+};
+
 export interface SddActionContext {
 	mode: "repo-local";
 	workspaceRoot: string;
@@ -66,7 +86,12 @@ export interface SddStatus {
 	artifactPaths: SddArtifactPaths;
 	contextFiles: SddArtifactPaths;
 	artifacts: Record<keyof SddArtifactPaths, ArtifactState>;
+	/** Implementation-owned progress; malformed markers remain unresolved here. */
 	taskProgress: SddTaskProgress;
+	/** Visible parent/orchestrator lifecycle actions, excluded from apply completion. */
+	deferredParentActions: SddTaskProgress;
+	/** Stable diagnostics for malformed ownership markers. */
+	taskArtifactErrors: string[];
 	applyState: ApplyState;
 	dependencies: Record<SddPhase, DependencyState>;
 	actionContext: SddActionContext;
@@ -99,6 +124,15 @@ export interface SddReviewAuthorityOverlay {
 	resolve: () => ValidatedReviewAuthorityResolution | undefined;
 }
 
+/** Read-only native bound-change evidence supplied by the controller. */
+export interface NativeReviewReadinessOverlay {
+	expected: boolean;
+	ready: boolean;
+	lineageId?: string;
+	bindingRevision?: string;
+	reason?: string;
+}
+
 export interface ResolveSddStatusOptions {
 	cwd: string;
 	changeName?: string;
@@ -106,6 +140,7 @@ export interface ResolveSddStatusOptions {
 	workspaceRoot?: string;
 	artifactStore?: SddArtifactStore;
 	reviewAuthority?: SddReviewAuthorityOverlay;
+	nativeReviewReadiness?: NativeReviewReadinessOverlay;
 }
 
 const EMPTY_PATHS: SddArtifactPaths = {
@@ -175,22 +210,50 @@ function domainFromSpecPath(changeRoot: string, specPath: string): string | unde
 	return rel.length >= 2 && rel.at(-1) === "spec.md" ? rel.slice(0, -1).join("/") : undefined;
 }
 
-function countTasks(tasksPath: string | undefined): SddTaskProgress {
+function taskProgress(lines: string[]): SddTaskProgress {
+	const unchecked = lines.filter((line) => !/^\s*- \[[xX]\]/.test(line));
+	return {
+		total: lines.length,
+		complete: lines.length - unchecked.length,
+		remaining: unchecked.length,
+		unchecked: unchecked.map((line) => line.trim()),
+	};
+}
+
+function countTasks(tasksPath: string | undefined): SddTaskAccounting {
 	if (!tasksPath || !existsSync(tasksPath)) {
-		return { total: 0, complete: 0, remaining: 0, unchecked: [] };
+		return { implementation: { ...EMPTY_TASK_PROGRESS }, parent: { ...EMPTY_TASK_PROGRESS }, errors: [] };
 	}
-	const unchecked: string[] = [];
-	let complete = 0;
+	const implementation: string[] = [];
+	const malformed: string[] = [];
+	const parent: string[] = [];
+	const errors: string[] = [];
 	for (const rawLine of safeRead(tasksPath).split(/\r?\n/)) {
 		const line = rawLine.trimEnd();
-		if (/^\s*- \[[xX]\]/.test(line)) complete += 1;
-		if (/^\s*- \[ \]/.test(line)) unchecked.push(line.trim());
+		if (!/^\s*- \[(?: |x|X)\]/.test(line)) continue;
+		const markers = line.match(/<!--\s*sdd-owner\s*:[\s\S]*?-->/gi) ?? [];
+		const hasOwnerToken = /sdd-owner/i.test(line);
+		const canonical = /<!-- sdd-owner: (implementation|parent) -->\s*$/.exec(line);
+		const owner: SddTaskOwner | undefined = canonical?.[1] as SddTaskOwner | undefined;
+		if (!hasOwnerToken) {
+			implementation.push(line);
+		} else if (markers.length === 1 && canonical && canonical[0] === markers[0]) {
+			(owner === SDD_TASK_OWNER.PARENT ? parent : implementation).push(line);
+		} else {
+			malformed.push(line);
+			errors.push(`Malformed task ownership marker: ${line.trim()}`);
+		}
 	}
+	const implementationProgress = taskProgress(implementation);
 	return {
-		total: complete + unchecked.length,
-		complete,
-		remaining: unchecked.length,
-		unchecked,
+		implementation: {
+			total: implementationProgress.total + malformed.length,
+			complete: implementationProgress.complete,
+			remaining: implementationProgress.remaining + malformed.length,
+			unchecked: [...implementationProgress.unchecked, ...malformed.map((line) => line.trim())],
+		},
+		parent: taskProgress(parent),
+		errors,
 	};
 }
 
@@ -210,7 +273,16 @@ function reportIsClearlyPassing(path: string | undefined): boolean {
 	return hasPassSignal && !hasBlocker;
 }
 
-function withRecoveryBlock(status: SddStatus, reviewAuthority?: SddReviewAuthorityOverlay): SddStatus {
+function withRecoveryBlock(status: SddStatus, reviewAuthority?: SddReviewAuthorityOverlay, nativeReviewReadiness?: NativeReviewReadinessOverlay): SddStatus {
+	if (nativeReviewReadiness?.expected && !nativeReviewReadiness.ready) {
+		return {
+			...status,
+			applyState: "blocked",
+			dependencies: { apply: "blocked", verify: "blocked", sync: "blocked", archive: "blocked" },
+			nextRecommended: "resolve-review",
+			blockedReasons: [...status.blockedReasons, `resolve-review: ${nativeReviewReadiness.reason ?? "native bound review readiness is unavailable."}`],
+		};
+	}
 	if (!reviewAuthority?.expected) return status;
 	try {
 		const resolved = reviewAuthority.resolve();
@@ -261,7 +333,9 @@ function emptyStatus(cwd: string, changeName: string | null, blockedReasons: str
 			verifyReport: "missing",
 			syncReport: "missing",
 		},
-		taskProgress: { total: 0, complete: 0, remaining: 0, unchecked: [] },
+		taskProgress: { ...EMPTY_TASK_PROGRESS },
+		deferredParentActions: { ...EMPTY_TASK_PROGRESS },
+		taskArtifactErrors: [],
 		applyState: "blocked",
 		dependencies: { apply: "blocked", verify: "blocked", sync: "blocked", archive: "blocked" },
 		actionContext,
@@ -276,7 +350,7 @@ function emptyStatus(cwd: string, changeName: string | null, blockedReasons: str
 		nextRecommended: blockedReasons[0] ?? "Start an SDD change.",
 		blockedReasons,
 		isNonAuthoritative,
-	}, reviewAuthority);
+	}, reviewAuthority, undefined);
 }
 
 export function listActiveOpenSpecChanges(cwd: string): string[] {
@@ -300,11 +374,14 @@ export function renderPhaseInstructions(status: SddStatus): SddPhaseInstructions
 			`Change: ${change}`,
 			`State: ${status.dependencies.apply}`,
 			status.applyState === "all_done"
-				? "All tasks are already checked complete; do not edit."
-				: "Implement only unchecked tasks from the tasks artifact.",
-			`Tasks: ${status.taskProgress.complete}/${status.taskProgress.total} complete`,
-			"Update persisted task checkboxes immediately after completing each task.",
-			...status.taskProgress.unchecked.map((line) => `Remaining: ${line}`),
+				? "All implementation tasks are checked complete; do not edit."
+				: "Implement only unchecked implementation-owned tasks from the tasks artifact.",
+			`Implementation tasks: ${status.taskProgress.complete}/${status.taskProgress.total} complete`,
+			"Update persisted task checkboxes for implementation-owned tasks immediately after completing each task.",
+			...status.taskProgress.unchecked.map((line) => `Remaining implementation task: ${line}`),
+			`Deferred parent lifecycle actions: ${status.deferredParentActions.complete}/${status.deferredParentActions.total} complete`,
+			...status.deferredParentActions.unchecked.map((line) => `Deferred parent action: ${line}`),
+			...status.taskArtifactErrors.map((error) => `Task artifact error: ${error}`),
 		],
 		verify: [
 			`Change: ${change}`,
@@ -366,7 +443,9 @@ function nonAuthoritativeStatus(cwd: string, changeName: string | null, store: S
 			verifyReport: "missing",
 			syncReport: "missing",
 		},
-		taskProgress: { total: 0, complete: 0, remaining: 0, unchecked: [] },
+		taskProgress: { ...EMPTY_TASK_PROGRESS },
+		deferredParentActions: { ...EMPTY_TASK_PROGRESS },
+		taskArtifactErrors: [],
 		applyState: "not_applicable",
 		dependencies: { apply: "not_applicable", verify: "not_applicable", sync: "not_applicable", archive: "not_applicable" },
 		actionContext,
@@ -470,7 +549,8 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 		verifyReport: singleFileState(artifactPaths.verifyReport),
 		syncReport: singleFileState(artifactPaths.syncReport),
 	} satisfies SddStatus["artifacts"];
-	const taskProgress = countTasks(artifactPaths.tasks[0]);
+	const taskAccounting = countTasks(artifactPaths.tasks[0]);
+	const taskProgress = taskAccounting.implementation;
 	const actionContext: SddActionContext = {
 		mode: "repo-local",
 		workspaceRoot: options.workspaceRoot ? resolve(options.workspaceRoot) : root,
@@ -499,6 +579,7 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 	if (artifacts.tasks === "done" && taskProgress.total === 0) {
 		blockedReasons.push("tasks.md has no implementation task checkboxes.");
 	}
+	blockedReasons.push(...taskAccounting.errors);
 	if (flatOnly && legacyFlatSpec) {
 		blockedReasons.push(`Legacy flat spec is present without domain specs: ${legacyFlatSpec.path}.`);
 	}
@@ -516,14 +597,20 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 			blockedReasons.push(`resolve-review: ${message}`);
 		}
 	}
+	if (options.nativeReviewReadiness?.expected && !options.nativeReviewReadiness.ready) {
+		blockedReasons.push(`resolve-review: ${options.nativeReviewReadiness.reason ?? "native bound review readiness is unavailable."}`);
+	}
 
 	const coreArtifactsReady = artifacts.proposal === "done" && artifacts.specs === "done" && artifacts.design === "done" && artifacts.tasks === "done" && taskProgress.total > 0 && !flatOnly;
 	const reviewBlocked = blockedReasons.some((reason) => reason.startsWith("resolve-review:"));
-	const applyState: ApplyState = !coreArtifactsReady || reviewBlocked
+	const taskArtifactBlocked = taskAccounting.errors.length > 0;
+	const reviewApproved = Boolean((options.reviewAuthority?.expected || options.nativeReviewReadiness?.expected) && !reviewBlocked);
+	const applyState: ApplyState = !coreArtifactsReady || reviewBlocked || taskArtifactBlocked
 		? "blocked"
 		: taskProgress.remaining === 0
 			? "all_done"
 			: "ready";
+	const parentLifecycleRequired = applyState === "all_done" && !reviewApproved;
 	const verifyClean = reportIsClearlyPassing(artifactPaths.verifyReport[0]);
 	const syncClean = reportIsClearlyPassing(artifactPaths.syncReport[0]);
 	const syncPrerequisitesReady = coreArtifactsReady && verifyClean && collisions.length === 0 && !flatOnly;
@@ -534,27 +621,31 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 		: "blocked";
 	const verifyState: DependencyState = verifyClean
 		? "all_done"
-		: artifacts.tasks === "done" && taskProgress.total > 0 && (artifacts.applyProgress === "done" || applyState === "all_done")
+		: reviewApproved && artifacts.tasks === "done" && taskProgress.total > 0 && (artifacts.applyProgress === "done" || applyState === "all_done")
 			? "ready"
 			: "blocked";
 	const dependencies: SddStatus["dependencies"] = {
 		apply: applyState === "blocked" ? "blocked" : applyState,
 		verify: verifyState,
 		sync: syncState,
-		archive: coreArtifactsReady && verifyClean && syncClean && taskProgress.remaining === 0 && !reviewBlocked ? "ready" : "blocked",
+		archive: coreArtifactsReady && reviewApproved && verifyClean && syncClean && taskProgress.remaining === 0 && taskAccounting.parent.remaining === 0 && !reviewBlocked && !taskArtifactBlocked ? "ready" : "blocked",
 	};
 	const archiveReady = dependencies.archive === "ready";
 	const nextRecommended = reviewBlocked
 		? "resolve-review"
-		: dependencies.apply === "ready"
-			? "sdd-apply"
-			: dependencies.verify === "ready"
-				? "sdd-verify"
-				: dependencies.sync === "ready"
-					? "sdd-sync"
-					: archiveReady
-						? "sdd-archive"
-						: blockedReasons[0] ?? "Resolve blockers.";
+		: taskArtifactBlocked
+			? "fix-task-ownership-marker"
+			: parentLifecycleRequired
+				? "parent-lifecycle"
+				: dependencies.apply === "ready"
+					? "sdd-apply"
+					: dependencies.verify === "ready"
+						? "sdd-verify"
+						: dependencies.sync === "ready"
+							? "sdd-sync"
+							: archiveReady
+								? "sdd-archive"
+								: blockedReasons[0] ?? "Resolve blockers.";
 
 	const status: SddStatus = {
 		schemaName: "gentle-pi.sdd-status",
@@ -567,6 +658,8 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 		contextFiles: artifactPaths,
 		artifacts,
 		taskProgress,
+		deferredParentActions: taskAccounting.parent,
+		taskArtifactErrors: taskAccounting.errors,
 		applyState,
 		dependencies,
 		actionContext,
@@ -585,8 +678,9 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 		blockedReasons,
 		isNonAuthoritative: false,
 	};
-	if (options.includeInstructions) status.instructions = renderPhaseInstructions(status);
-	return status;
+	const resolvedStatus = withRecoveryBlock(status, options.reviewAuthority, options.nativeReviewReadiness);
+	if (options.includeInstructions) resolvedStatus.instructions = renderPhaseInstructions(resolvedStatus);
+	return resolvedStatus;
 }
 
 export function isNonAuthoritativeStatus(status: SddStatus): boolean {
@@ -671,10 +765,16 @@ export function renderSddStatusMarkdown(status: SddStatus): string {
 		`root: ${status.planningHome.root}`,
 		`next: ${status.nextRecommended}`,
 		"",
-		"### Tasks",
+		"### Implementation tasks",
 		`- complete: ${status.taskProgress.complete}/${status.taskProgress.total}`,
 		`- remaining: ${status.taskProgress.remaining}`,
 		...status.taskProgress.unchecked.map((line) => `- unchecked: ${line}`),
+		"",
+		"### Deferred parent lifecycle actions",
+		`- complete: ${status.deferredParentActions.complete}/${status.deferredParentActions.total}`,
+		`- remaining: ${status.deferredParentActions.remaining}`,
+		...status.deferredParentActions.unchecked.map((line) => `- deferred: ${line}`),
+		...status.taskArtifactErrors.map((error) => `- task artifact error: ${error}`),
 		"",
 		"### Dependencies",
 		...Object.entries(status.dependencies).map(([phase, state]) => `- ${phase}: ${state}`),

@@ -1,12 +1,19 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { validateCompactReviewGate } from "../lib/review-compact-gate.ts";
 import { domainHashV1 } from "../lib/review-canonical.ts";
-import { discoverCompactReview, finalizeCompactReview, startCompactReview } from "../lib/review-facade.ts";
+import {
+	COMPACT_TERMINAL_APPLICABILITY,
+	CompactReviewStartBlockedError,
+	discoverCompactReview,
+	finalizeCompactReview,
+	inspectCompactTerminalApplicability,
+	startCompactReview,
+} from "../lib/review-facade.ts";
 import {
 	createSupersessionEnvelopeV1,
 	inspectApprovedCompactSuccessorV1,
@@ -156,10 +163,34 @@ test("eligible graph-v1 authority requires a change-bound supersession even when
 	assert.equal(withCorruptMarker.status, "deny", withCorruptMarker.reason);
 });
 
-test("compact pre-commit gate preserves an approved receipt across exact staging of reviewed new files", (t) => {
+test("candidate A remains gate-valid and byte-preserved after candidate B starts", (t) => {
 	const root = repository(t);
+	const candidateA = approved(root);
+	const store = CompactReviewStoreV2.forRepository(root, candidateA);
+	const beforeState = readFileSync(store.statePath, "utf8");
+	const beforeReceipt = readFileSync(store.receiptPath, "utf8");
+
+	writeFileSync(join(root, "value.ts"), "export const value = 3;\n");
+	const candidateB = startCompactReview({ cwd: root, lineageId: "candidate-b", policyHash: "a".repeat(64) });
+	assert.equal(candidateB.state, "reviewing");
+
+	writeFileSync(join(root, "value.ts"), "export const value = 2;\n");
+	git(root, "add", "value.ts");
+	const result = validateCompactReviewGate({
+		cwd: root,
+		lineageId: candidateA,
+		deriveTarget: () => deriveIntendedCommitTarget(root),
+	});
+	assert.equal(result.status, "allow", result.reason);
+	assert.equal(readFileSync(store.statePath, "utf8"), beforeState);
+	assert.equal(readFileSync(store.receiptPath, "utf8"), beforeReceipt);
+});
+
+test("policy-bound terminal applicability survives exact staging of reviewed new files", (t) => {
+	const root = repository(t);
+	const policyHash = "a".repeat(64);
 	writeFileSync(join(root, "new-value.ts"), "export const newValue = 1;\n");
-	const started = startCompactReview({ cwd: root, policyHash: "a".repeat(64) });
+	const started = startCompactReview({ cwd: root, policyHash });
 	finalizeCompactReview({
 		cwd: root,
 		lineageId: started.lineage_id,
@@ -169,6 +200,13 @@ test("compact pre-commit gate preserves an approved receipt across exact staging
 	});
 
 	git(root, "add", "value.ts", "new-value.ts");
+	const inspected = inspectCompactTerminalApplicability(root, policyHash);
+	assert.equal(inspected.applicability, COMPACT_TERMINAL_APPLICABILITY.APPLICABLE);
+	assert.deepEqual(inspected.lineageIds, [started.lineage_id]);
+	assert.throws(
+		() => startCompactReview({ cwd: root, policyHash }),
+		(error: unknown) => error instanceof CompactReviewStartBlockedError && error.lineageId === started.lineage_id,
+	);
 	const allowed = validateCompactReviewGate({
 		cwd: root,
 		lineageId: started.lineage_id,

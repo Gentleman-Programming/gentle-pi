@@ -10,6 +10,7 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, isAbsolute, join, resolve, sep } from "node:path";
 import {
 	REVIEW_EVENT,
@@ -107,6 +108,15 @@ export interface CaptureReviewSnapshotOptions {
 	mode: ReviewMode;
 	projection: ReviewProjectionV1;
 	policyHash: string;
+}
+
+export interface LiveReviewCandidateBinding {
+	repository_id: string;
+	base_tree: string;
+	complete_snapshot_tree: string;
+	initial_review_tree: string;
+	genesis_paths: string[];
+	intended_untracked: string[];
 }
 
 interface GitEnvironment {
@@ -331,6 +341,38 @@ export function captureCurrentReviewCandidateTree(snapshot: SnapshotV1): string 
 		runGit(root, ["read-tree", snapshot.base_tree], environment);
 		runGit(root, ["add", "-A", "--", "."], environment);
 		return runGit(root, ["write-tree"], environment);
+	} finally {
+		rmSync(temporaryDirectory, { recursive: true, force: true });
+	}
+}
+
+export function captureLiveReviewCandidateBinding(options: {
+	cwd: string;
+	repositoryId: string;
+}): LiveReviewCandidateBinding {
+	const root = repositoryRoot(options.cwd);
+	const temporaryDirectory = mkdtempSync(join(tmpdir(), "gentle-ai-live-candidate-"));
+	const temporaryIndex = join(temporaryDirectory, "index");
+	const temporaryObjectDirectory = join(temporaryDirectory, "objects");
+	mkdirSync(temporaryObjectDirectory, { mode: 0o700 });
+	const environment: GitEnvironment = {
+		indexFile: temporaryIndex,
+		objectDirectory: temporaryObjectDirectory,
+		alternateObjectDirectory: repositoryObjectDirectory(root),
+	};
+	try {
+		const baseTree = resolveBaseTree(root);
+		runGit(root, ["read-tree", baseTree], environment);
+		runGit(root, ["add", "-A", "--", "."], environment);
+		const completeSnapshotTree = runGit(root, ["write-tree"], environment);
+		return {
+			repository_id: options.repositoryId,
+			base_tree: baseTree,
+			complete_snapshot_tree: completeSnapshotTree,
+			initial_review_tree: completeSnapshotTree,
+			genesis_paths: canonicalPaths(runGit(root, ["diff", "--no-renames", "--name-only", "-z", baseTree, completeSnapshotTree], environment)),
+			intended_untracked: discoverReviewUntrackedPaths(root),
+		};
 	} finally {
 		rmSync(temporaryDirectory, { recursive: true, force: true });
 	}

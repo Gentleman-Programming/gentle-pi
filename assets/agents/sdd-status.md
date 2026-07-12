@@ -84,12 +84,14 @@ openspec/changes/{change}/verify-report.md
 openspec/changes/{change}/sync-report.md
 ```
 
-Count implementation task checkboxes in `tasks.md`:
+Parse ownership on each task checkbox in `tasks.md`:
 
-- complete: lines matching `^\s*- \[x\]` or `^\s*- \[X\]`
-- unchecked: lines matching `^\s*- \[ \]`
+- no `sdd-owner` token: legacy `implementation`;
+- exactly one terminal `<!-- sdd-owner: implementation -->`: implementation;
+- exactly one terminal `<!-- sdd-owner: parent -->`: deferred parent action;
+- any other `sdd-owner` occurrence: malformed, fail closed as unresolved implementation work and report the exact line in `taskArtifactErrors`.
 
-Return the exact unchecked task lines in `taskProgress.unchecked`.
+Return implementation counters in `taskProgress`, valid parent counters in `deferredParentActions`, and exact unchecked implementation lines in `taskProgress.unchecked`. Parent actions are visible but never make apply incomplete.
 
 ## Action Context
 
@@ -101,6 +103,7 @@ If parent context reports `workspace-planning` and no `allowedEditRoots`, mark a
 
 - `apply` is `ready` only when specs, design, and tasks are present, at least one task is unchecked, and action context is safe.
 - `apply` is `all_done` when tasks exist and no unchecked implementation tasks remain.
+- Completed implementation without authoritative approved receipt evidence routes to `parent-lifecycle`, never another apply or direct verification. Parent markers are visibility only; the parent owns review and gates.
 - `verify` is `ready` when tasks exist and apply-progress exists or tasks are all done; unchecked implementation tasks are still CRITICAL archive blockers.
 - `sync` is `ready` when verify-report exists and has no unresolved `FAIL`, `BLOCKED`, `CRITICAL`, or verification blockers; it is `not_applicable` for `engram`/`none` modes.
 - `archive` is `ready` only when verify-report is passing, sync-report exists or sync is not applicable, and no unchecked implementation tasks remain. CRITICAL verification issues have no override. Explicit recorded exceptions are limited to non-critical partial archives or stale-checkbox reconciliation when apply-progress/verify-report prove completion.

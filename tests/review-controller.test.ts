@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,7 +9,7 @@ import type {
 	ExtensionContext,
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
-import gentleAi, { __testing } from "../extensions/gentle-ai.ts";
+import gentleAi, { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import {
 	REVIEW_MODE,
 	REVIEW_TRANSITION,
@@ -31,6 +31,7 @@ import {
 import { destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
 import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
 import { qualifiedReviewLockPlatform, testSnapshot } from "./review-test-fixtures.ts";
+import type { NativeReviewCli } from "../lib/native-review-cli.ts";
 
 setReviewMutationLockPlatformForTesting(qualifiedReviewLockPlatform());
 // The release fast path independently derives required CI success via the
@@ -124,7 +125,7 @@ function registerRuntime(): RuntimeRegistration {
 		},
 		registerCommand() {},
 	} as unknown as ExtensionAPI;
-	gentleAi(pi);
+	createGentleAiExtension({ nativeReviewCli: null })(pi);
 	const controller = tools.get("gentle_review");
 	const toolCall = handlers.get("tool_call");
 	assert.ok(controller, "the supported review controller tool must be registered");
@@ -442,12 +443,12 @@ test("controller publicly installs a supersession and exactly replays it with fr
 	writeFileSync(join(changeRoot, "verify-report.md"), "PASS\n");
 	writeFileSync(join(changeRoot, "sync-report.md"), "PASS\n");
 	unlinkSync(join(store.root, "recovery-required-v1", `${domainHashV1("openspec-change-name", changeName)}.json`));
-	const status = __testing.resolveControllerSddStatus(fixture.repository, changeName, false, "openspec");
+	const status = await __testing.resolveControllerSddStatus(fixture.repository, changeName, false, "openspec");
 	assert.equal(status.dependencies.archive, "blocked");
 	assert.equal(status.nextRecommended, "resolve-review");
 });
 
-test("controller SDD status treats removed OpenSpec recovery authority and deleted marker as blocking", (t) => {
+test("controller SDD status treats removed OpenSpec recovery authority and deleted marker as blocking", async (t) => {
 	const fixture = createRepository(t, false);
 	const changeName = "recover-legacy-review-authority";
 	const changeRoot = join(fixture.repository, "openspec", "changes", changeName);
@@ -463,14 +464,14 @@ test("controller SDD status treats removed OpenSpec recovery authority and delet
 	rmSync(changeRoot, { recursive: true, force: true });
 	unlinkSync(marker);
 
-	const status = __testing.resolveControllerSddStatus(fixture.repository, changeName, false, "openspec");
+	const status = await __testing.resolveControllerSddStatus(fixture.repository, changeName, false, "openspec");
 
 	assert.equal(status.dependencies.archive, "blocked");
 	assert.equal(status.nextRecommended, "resolve-review");
 	assert.match(status.blockedReasons.join("\n"), /recovery|required|graph/i);
 });
 
-test("controller SDD status blocks archive for a recovery-required marker without a supersession record", (t) => {
+test("controller SDD status blocks archive for a recovery-required marker without a supersession record", async (t) => {
 	const fixture = createRepository(t, false);
 	const changeName = "recover-legacy-review-authority";
 	const changeRoot = join(fixture.repository, "openspec", "changes", changeName);
@@ -486,7 +487,7 @@ test("controller SDD status blocks archive for a recovery-required marker withou
 	mkdirSync(markerDirectory, { recursive: true });
 	writeFileSync(join(markerDirectory, `${domainHashV1("openspec-change-name", changeName)}.json`), "recovery-required");
 
-	const status = __testing.resolveControllerSddStatus(fixture.repository, changeName, false, "openspec");
+	const status = await __testing.resolveControllerSddStatus(fixture.repository, changeName, false, "openspec");
 
 	assert.equal(status.dependencies.archive, "blocked");
 	assert.equal(status.nextRecommended, "resolve-review");
@@ -679,8 +680,9 @@ test("controller prioritizes active compact authority over terminal history and 
 	await approveTrackedWorktreeTransaction(controller, ctx, "historical-terminal");
 
 	const terminal = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.equal(terminal.status, "terminal");
-	assert.equal(terminal.next_action, "validate-existing-terminal-receipt");
+	assert.equal(terminal.status, "ready");
+	assert.equal(terminal.next_action, "start-ordinary-review");
+	assert.equal((terminal.inspection as Record<string, unknown>).terminal_applicability, "policy-unresolved");
 	assert.equal(((terminal.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "approved");
 	writeFileSync(join(fixture.repository, "app.ts"), "export const value = 3;\n");
 
@@ -693,6 +695,56 @@ test("controller prioritizes active compact authority over terminal history and 
 	assert.equal(active.status, "in-progress");
 	assert.equal(active.next_action, "finalize-existing-ordinary-review");
 	assert.equal(((active.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "active");
+});
+
+test("controller INSPECT and START bind terminal applicability to a linked worktree candidate", async (t) => {
+	const fixture = createRepository(t, false);
+	const { controller } = registerRuntime();
+	await approveTrackedWorktreeTransaction(controller, extensionContext(fixture.repository), "candidate-a");
+	const linked = join(fixture.parent, "linked");
+	git(fixture.repository, "worktree", "add", "-b", "linked", linked, "HEAD");
+	writeFileSync(join(linked, "app.ts"), "export const value = 2;\n");
+	const linkedContext = extensionContext(linked);
+	const bare = await controllerCall(controller, linkedContext, { operation: "inspect" });
+	assert.equal(bare.status, "ready");
+	assert.equal((bare.inspection as Record<string, unknown>).terminal_applicability, "policy-unresolved");
+	const policyBound = await controllerCall(controller, linkedContext, {
+		operation: "inspect",
+		input: JSON.stringify({ mode: "ordinary", policyHash: "a".repeat(64), projection: { kind: "complete" } }),
+	});
+	assert.equal(policyBound.status, "terminal");
+	assert.equal((policyBound.inspection as Record<string, unknown>).terminal_applicability, "applicable");
+	const replay = await controllerCall(controller, linkedContext, {
+		operation: "start", lineageId: "candidate-a",
+		input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, projection: { kind: "complete" }, policyHash: "a".repeat(64) }),
+	});
+	assert.equal(replay.status, "blocked");
+	writeFileSync(join(linked, "app.ts"), "export const value = 3;\n");
+	const fresh = await controllerCall(controller, linkedContext, {
+		operation: "start", lineageId: "candidate-b",
+		input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, projection: { kind: "complete" }, policyHash: "a".repeat(64) }),
+	});
+	assert.equal((fresh.result as Record<string, unknown>).state, "reviewing");
+});
+
+test("controller blocks policy-bound duplicate terminal applicability deterministically", async (t) => {
+	const fixture = createRepository(t, false);
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository);
+	await approveTrackedWorktreeTransaction(controller, ctx, "first-terminal");
+	const compactRoot = join(fixture.repository, ".git", "gentle-ai", "reviews", "compact-v2");
+	const parked = join(fixture.repository, ".git", "gentle-ai", "reviews", "parked-terminal");
+	renameSync(join(compactRoot, "first-terminal"), parked);
+	await approveTrackedWorktreeTransaction(controller, ctx, "second-terminal");
+	renameSync(parked, join(compactRoot, "first-terminal"));
+	const inspected = await controllerCall(controller, ctx, {
+		operation: "inspect",
+		input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, policyHash: "a".repeat(64), projection: { kind: "complete" } }),
+	});
+	assert.equal(inspected.status, "blocked");
+	assert.equal(inspected.next_action, "stop-and-report-ambiguous-compact-terminal-authority");
+	assert.equal((inspected.inspection as Record<string, unknown>).terminal_applicability, "ambiguous");
+	assert.deepEqual((inspected.inspection as Record<string, unknown>).terminal_lineage_ids, ["first-terminal", "second-terminal"]);
 });
 
 test("controller retains graph-v1 inspection and repair behavior without compact authority", async (t) => {
@@ -858,14 +910,15 @@ test("controller keeps valid compact terminal authority non-resettable", async (
 	const ctx = extensionContext(fixture.repository, true);
 	await approveTrackedWorktreeTransaction(controller, ctx, "terminal-compact-reset");
 	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.equal(inspected.status, "terminal");
+	assert.equal(inspected.status, "ready");
+	assert.equal((inspected.inspection as Record<string, unknown>).terminal_applicability, "policy-unresolved");
 	const request = (inspected.inspection as Record<string, unknown>).reset_request as Record<string, unknown>;
 	await assert.rejects(
 		controller.execute("terminal-compact-reset", { operation: "reset", input: JSON.stringify(request) }, undefined, undefined, ctx),
 		/destructive reset requires/i,
 	);
 	const unchanged = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.equal(unchanged.status, "terminal");
+	assert.equal(unchanged.status, "ready");
 	assert.equal(((unchanged.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "approved");
 });
 
@@ -932,6 +985,35 @@ test("controller INSPECT preserves the durable recovery request after interrupte
 	assert.equal(recovered.next_action, "start-fresh-ordinary-review-after-verified-clean");
 	const revoked = await toolCall({ toolName: "bash", input: { command } }, ctx);
 	assert.equal(revoked?.block, true);
+});
+
+test("controller RECOVER returns a stable zero-mutation result when durable reset state is absent", async (t) => {
+	const fixture = createRepository(t, false);
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository, true);
+	createLegacyReviewAuthority(fixture.repository);
+	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
+	const request = (inspected.inspection as Record<string, unknown>).reset_request as Record<string, unknown>;
+	assert.throws(() => destructiveResetReviewAuthorityV1({
+		cwd: fixture.repository,
+		repositoryId: String(request.repositoryId),
+		commonDirHash: String(request.commonDirHash),
+		inventoryHash: String(request.inventoryHash),
+		confirmation: String(request.confirmation),
+		faultAfterPhase: "deleting",
+	}), /injected/i);
+	const authorityRoot = join(fixture.repository, ".git", "gentle-ai", "reviews");
+	const statePath = join(authorityRoot, "control", "reset-state.json");
+	unlinkSync(statePath);
+	const inventory = JSON.stringify(execFileSync("find", [authorityRoot, "-type", "f", "-printf", "%P:%s\\n"], { encoding: "utf8" }).trim().split("\n").toSorted());
+	const recover = { operation: "recover", input: JSON.stringify(request) };
+	const first = await controllerCall(controller, ctx, recover);
+	const second = await controllerCall(controller, ctx, recover);
+	assert.deepEqual(first, second);
+	assert.equal(first.status, "blocked");
+	assert.equal(first.outcome, "reset-state-unavailable");
+	assert.equal(first.mutation_performed, false);
+	assert.equal(JSON.stringify(execFileSync("find", [authorityRoot, "-type", "f", "-printf", "%P:%s\\n"], { encoding: "utf8" }).trim().split("\n").toSorted()), inventory);
 });
 
 test("controller RECOVER rejects transplanted reset identity and common-directory hash without mutation", async (t) => {
@@ -1028,6 +1110,23 @@ test("controller successfully starts the explicitly supported judgment-day mode"
 	});
 	assert.equal(started.operation, "start");
 	assert.equal((started.state as Record<string, unknown>).mode, "judgment-day");
+});
+
+test("general STATUS returns the typed native-status-unsupported boundary without authority selection", () => {
+	const result = __testing.nativeStatusUnsupported("status");
+	assert.deepEqual(result, {
+		operation: "status",
+		status: "blocked",
+		outcome: "native-status-unsupported",
+		mutation_performed: false,
+		inventory_complete: false,
+		next_action: "require-upstream-read-only-native-status-inventory",
+		evidence: {
+			native_contract: "gentle-ai/2.1.0",
+			general_status: "unsupported",
+			claimant_inventory: "unsupported",
+		},
+	});
 });
 
 test("failed START gives exact mode and serialization guidance and creates no lineage", async (t) => {

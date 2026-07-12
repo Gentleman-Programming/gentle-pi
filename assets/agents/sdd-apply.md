@@ -56,7 +56,7 @@ Stop with `blocked` before editing if:
 - `actionContext.mode: workspace-planning` and no `allowedEditRoots` are provided;
 - any target file is outside the authoritative workspace or allowed edit roots.
 
-If status says `applyState: all_done`, do not edit. Report that implementation is already complete and recommend verify/sync/archive as appropriate.
+If status says `applyState: all_done`, do not edit. Report that implementation is complete and return `next_recommended: "parent-lifecycle"` unless native authority already proves an approved receipt for the live candidate. Do not recommend apply again because parent-owned actions are pending.
 
 ## Before Writing Code
 
@@ -98,6 +98,12 @@ If `openspec/config.yaml` declares strict TDD and a test runner, or the parent p
 5. Write a `TDD Cycle Evidence` table in `apply-progress.md`.
 
 If strict TDD is active and no external support file is available, follow the RED/GREEN/TRIANGULATE/REFACTOR contract from this prompt. Do not silently fall back to standard mode.
+
+## Task Ownership Boundary
+
+Read ownership markers on every checkbox: absent markers are legacy `implementation`; only terminal `<!-- sdd-owner: implementation -->` and `<!-- sdd-owner: parent -->` markers are valid. A line containing `sdd-owner` with any other, duplicate, or non-terminal form is malformed: stop with `fix-task-ownership-marker` and leave it unchanged. Select, check, and report only implementation-owned rows. Preserve parent-owned rows byte-for-byte and list them as deferred lifecycle actions.
+
+`sdd-apply` MUST NOT start bounded-review, refutation, correction, or validation actors; create or approve receipts; or validate pre-commit, pre-push, pre-PR, release, or other delivery gates. After implementation completion it returns `parent-lifecycle`, even when no parent markers exist.
 
 ## Persisted Task Checkbox Contract
 

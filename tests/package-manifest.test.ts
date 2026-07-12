@@ -109,6 +109,20 @@ test("package manifest has no obsolete native activation build surface", () => {
 	assert.doesNotMatch(packageJson.scripts?.prepublishOnly ?? "", /native:build/);
 });
 
+test("package verification names the native review runtime boundary and packaged fixtures", () => {
+	const verifier = readFileSync(join(PACKAGE_ROOT, "scripts", "verify-package-files.mjs"), "utf8");
+	const manifest = readPackageJson();
+
+	assert.ok(manifest.files?.includes("lib/"), "the published package must include the native review runtime module directory");
+	assert.match(verifier, /"lib\/native-review-cli\.ts"/, "package verification must require the native review adapter from the packaged runtime");
+	assert.match(verifier, /"tests\/fixtures\/native-review-cli\/v2\.1\.0\/start\.json"/, "package verification must retain the pinned native decoder fixture");
+	assert.match(
+		readFileSync(join(PACKAGE_ROOT, "extensions", "gentle-ai.ts"), "utf8"),
+		/createNativeReviewCli\(\)/,
+		"the production extension must construct its native client from the packaged runtime module",
+	);
+});
+
 test("package manifest installs pi-pretty through a wrapper without bundling native optional dependencies", () => {
 	const packageJson = readPackageJson();
 

@@ -444,8 +444,16 @@ export class CompactReviewStoreV2 {
 		lineageId: string,
 		options: CompactReviewStoreOptions = {},
 	): CompactReviewStoreV2 {
+		return CompactReviewStoreV2.forAuthority(cwd, resolveRepositoryAuthorityV1(cwd), lineageId, options);
+	}
+
+	static forAuthority(
+		cwd: string,
+		authority: RepositoryAuthorityV1,
+		lineageId: string,
+		options: CompactReviewStoreOptions = {},
+	): CompactReviewStoreV2 {
 		if (!LINEAGE_ID.test(lineageId)) throw new CompactReviewStoreError("Compact lineage ID is invalid");
-		const authority = resolveRepositoryAuthorityV1(cwd);
 		return new CompactReviewStoreV2(cwd, authority, lineageId, options);
 	}
 
@@ -647,7 +655,20 @@ export class CompactReviewStoreV2 {
 }
 
 export function discoverCompactReviewStores(cwd: string): CompactReviewStoreV2[] {
-	const authority = resolveRepositoryAuthorityV1(cwd);
+	return discoverCompactReviewStoresForAuthority(cwd, resolveRepositoryAuthorityV1(cwd));
+}
+
+export function discoverCompactReviewStoresForAuthority(
+	cwd: string,
+	authority: RepositoryAuthorityV1,
+): CompactReviewStoreV2[] {
+	const current = resolveRepositoryAuthorityV1(cwd);
+	if (
+		current.common_directory !== authority.common_directory ||
+		current.store_root !== authority.store_root ||
+		current.repository_id !== authority.repository_id ||
+		current.authority_id !== authority.authority_id
+	) throw new CompactReviewStoreError("Repository authority tuple does not match the current repository");
 	const root = assertManagedStorePathV1(authority.common_directory, join(authority.store_root, "compact-v2"));
 	if (!existsSync(root)) return [];
 	const rootStat = lstatSync(root);
@@ -661,7 +682,7 @@ export function discoverCompactReviewStores(cwd: string): CompactReviewStoreV2[]
 		}
 	}
 	return entries
-		.map((entry) => CompactReviewStoreV2.forRepository(cwd, entry.name))
+		.map((entry) => CompactReviewStoreV2.forAuthority(cwd, authority, entry.name))
 		.toSorted((left, right) => left.lineageDirectory.localeCompare(right.lineageDirectory));
 }
 

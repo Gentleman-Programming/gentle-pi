@@ -28,14 +28,20 @@ import {
 	CompactReviewStoreV2,
 	compactV2LineageExists,
 	discoverCompactReviewStores,
+	discoverCompactReviewStoresForAuthority,
 	graphV1LineageExists,
 	type CompactStateRecordV2,
 } from "./review-compact-store.ts";
 import { assertNoLegacyReviewAuthorityV1 } from "./review-legacy-detector.ts";
 import {
+	resolveRepositoryAuthorityV1,
+	type RepositoryAuthorityV1,
+} from "./review-repository.ts";
+import {
 	REVIEW_MODE,
 	REVIEW_PROJECTION,
 	captureCurrentReviewCandidateTree,
+	captureLiveReviewCandidateBinding,
 	captureOrdinaryCorrectionSnapshot,
 	captureReviewSnapshot,
 	discoverReviewUntrackedPaths,
@@ -109,6 +115,26 @@ export const COMPACT_START_BLOCK_ACTION = {
 	ESCALATED: "change-review-scope-or-use-supported-maintainer-action",
 } as const;
 
+export class CompactReviewTerminalAmbiguityError extends Error {
+	readonly lineageIds: string[];
+
+	constructor(lineageIds: string[]) {
+		super(`Compact terminal authority is ambiguous: ${lineageIds.join(", ")}`);
+		this.name = "CompactReviewTerminalAmbiguityError";
+		this.lineageIds = lineageIds;
+	}
+}
+
+export class CompactReviewLineageBindingMismatchError extends Error {
+	readonly lineageId: string;
+
+	constructor(lineageId: string) {
+		super(`Compact lineage ${lineageId} policy hash or candidate binding does not match the requested target`);
+		this.name = "CompactReviewLineageBindingMismatchError";
+		this.lineageId = lineageId;
+	}
+}
+
 export class CompactReviewStartBlockedError extends Error {
 	readonly lineageId: string;
 	readonly state: CompactReviewStateV2["state"];
@@ -130,10 +156,100 @@ export class CompactReviewStartBlockedError extends Error {
 function derivedLineageId(snapshot: ReturnType<typeof captureReviewSnapshot>): string {
 	return `review-${domainHashV1("compact-lineage", {
 		base_tree: snapshot.base_tree,
+		complete_snapshot_tree: snapshot.complete_snapshot_tree,
 		initial_review_tree: snapshot.initial_review_tree,
 		genesis_paths: snapshot.genesis_paths ?? [],
 		intended_untracked: snapshot.intended_untracked,
+		policy_hash: snapshot.policy_hash,
 	}).slice(0, 16)}`;
+}
+
+export interface TerminalReviewCandidateBinding {
+	repository_id: string;
+	receipt: ReturnType<CompactReviewStoreV2["loadTerminalReceipt"]>["receipt"];
+}
+
+export function createTerminalReviewCandidateBinding(
+	repositoryId: string,
+	receipt: ReturnType<CompactReviewStoreV2["loadTerminalReceipt"]>["receipt"],
+): TerminalReviewCandidateBinding {
+	return { repository_id: repositoryId, receipt };
+}
+
+export function matchesTerminalReviewCandidateBinding(
+	live: ReturnType<typeof captureLiveReviewCandidateBinding>,
+	policyHash: string,
+	terminal: TerminalReviewCandidateBinding,
+): boolean {
+	const { body } = terminal.receipt;
+	return terminal.repository_id === live.repository_id &&
+		body.base_tree === live.base_tree &&
+		body.final_candidate_tree === live.complete_snapshot_tree &&
+		body.genesis_paths_hash === domainHashV1("compact-paths", live.genesis_paths) &&
+		body.policy_hash === policyHash;
+}
+
+function snapshotCandidateBinding(
+	snapshot: ReturnType<typeof captureReviewSnapshot>,
+	repositoryId: string,
+): ReturnType<typeof captureLiveReviewCandidateBinding> {
+	return {
+		repository_id: repositoryId,
+		base_tree: snapshot.base_tree,
+		complete_snapshot_tree: snapshot.complete_snapshot_tree,
+		initial_review_tree: snapshot.initial_review_tree,
+		genesis_paths: snapshot.genesis_paths ?? [],
+		intended_untracked: snapshot.intended_untracked,
+	};
+}
+
+function authorityStillMatches(cwd: string, authority: RepositoryAuthorityV1): void {
+	const current = resolveRepositoryAuthorityV1(cwd);
+	if (
+		current.common_directory !== authority.common_directory ||
+		current.store_root !== authority.store_root ||
+		current.repository_id !== authority.repository_id ||
+		current.authority_id !== authority.authority_id
+	) throw new CompactReviewStoreError("Repository authority changed during terminal applicability inspection");
+}
+
+export const COMPACT_TERMINAL_APPLICABILITY = {
+	APPLICABLE: "applicable",
+	NOT_APPLICABLE: "not-applicable",
+	POLICY_UNRESOLVED: "policy-unresolved",
+	AMBIGUOUS: "ambiguous",
+} as const;
+
+export function inspectCompactTerminalApplicability(cwd: string, policyHash?: string): {
+	applicability: (typeof COMPACT_TERMINAL_APPLICABILITY)[keyof typeof COMPACT_TERMINAL_APPLICABILITY];
+	lineageIds: string[];
+} {
+	const authority = resolveRepositoryAuthorityV1(cwd);
+	const live = captureLiveReviewCandidateBinding({ cwd, repositoryId: authority.repository_id });
+	const matches = discoverCompactReviewStoresForAuthority(cwd, authority)
+		.filter((store) => {
+			const state = store.load().state.state;
+			return state === COMPACT_REVIEW_STATE.APPROVED || state === COMPACT_REVIEW_STATE.ESCALATED;
+		})
+		.map((store) => store.loadTerminalReceipt())
+		.filter(({ receipt }) => matchesTerminalReviewCandidateBinding(
+			live,
+			policyHash ?? receipt.body.policy_hash,
+			createTerminalReviewCandidateBinding(authority.repository_id, receipt),
+		))
+		.map(({ record }) => record.state.lineage_id)
+		.toSorted();
+	authorityStillMatches(cwd, authority);
+	if (policyHash === undefined) return {
+		applicability: matches.length === 0 ? COMPACT_TERMINAL_APPLICABILITY.NOT_APPLICABLE : COMPACT_TERMINAL_APPLICABILITY.POLICY_UNRESOLVED,
+		lineageIds: matches,
+	};
+	return {
+		applicability: matches.length === 0
+			? COMPACT_TERMINAL_APPLICABILITY.NOT_APPLICABLE
+			: matches.length === 1 ? COMPACT_TERMINAL_APPLICABILITY.APPLICABLE : COMPACT_TERMINAL_APPLICABILITY.AMBIGUOUS,
+		lineageIds: matches,
+	};
 }
 
 export function startCompactReview(
@@ -145,40 +261,48 @@ export function startCompactReview(
 	if (projection.kind !== REVIEW_PROJECTION.COMPLETE) {
 		throw new Error("New compact ordinary reviews require the complete live Git projection");
 	}
+	const authority = resolveRepositoryAuthorityV1(input.cwd);
 	const snapshot = captureReviewSnapshot({
 		cwd: input.cwd,
 		mode: REVIEW_MODE.ORDINARY,
 		projection,
 		policyHash: input.policyHash,
 	});
+	const live = snapshotCandidateBinding(snapshot, authority.repository_id);
 	const lineageId = input.lineageId?.trim() || derivedLineageId(snapshot);
 	if (graphV1LineageExists(input.cwd, lineageId)) {
 		throw new Error("Graph-v1 and compact-v2 authority are ambiguous for this lineage; choose a fresh compact lineage");
 	}
 	if (compactV2LineageExists(input.cwd, lineageId)) {
-		const existing = CompactReviewStoreV2.forRepository(input.cwd, lineageId).load().state;
-		if (existing.state === COMPACT_REVIEW_STATE.APPROVED) {
-			if (existing.policy_hash !== input.policyHash) {
-				throw new Error("Compact approved authority policy hash does not match requested policy hash.");
+		const store = CompactReviewStoreV2.forAuthority(input.cwd, authority, lineageId);
+		const existing = store.load().state;
+		if (existing.state === COMPACT_REVIEW_STATE.APPROVED || existing.state === COMPACT_REVIEW_STATE.ESCALATED) {
+			if (!matchesTerminalReviewCandidateBinding(live, input.policyHash, createTerminalReviewCandidateBinding(authority.repository_id, store.loadTerminalReceipt().receipt))) {
+				throw new CompactReviewLineageBindingMismatchError(lineageId);
 			}
-			throw new CompactReviewStartBlockedError(lineageId, existing.state, COMPACT_START_BLOCK_ACTION.APPROVED);
-		}
-		if (existing.state === COMPACT_REVIEW_STATE.ESCALATED) {
-			throw new CompactReviewStartBlockedError(lineageId, existing.state, COMPACT_START_BLOCK_ACTION.ESCALATED);
+			authorityStillMatches(input.cwd, authority);
+			throw new CompactReviewStartBlockedError(
+				lineageId,
+				existing.state,
+				existing.state === COMPACT_REVIEW_STATE.APPROVED
+					? COMPACT_START_BLOCK_ACTION.APPROVED
+					: COMPACT_START_BLOCK_ACTION.ESCALATED,
+			);
 		}
 	}
-	const terminal = discoverCompactReviewStores(input.cwd)
-		.map((store) => store.load().state)
-		.find((existing) => (
-			existing.state === COMPACT_REVIEW_STATE.APPROVED ||
-			existing.state === COMPACT_REVIEW_STATE.ESCALATED
-		) &&
-			existing.initial_snapshot.base_tree === snapshot.base_tree &&
-			existing.initial_snapshot.initial_review_tree === snapshot.initial_review_tree &&
-			domainHashV1("compact-target-paths", existing.genesis_paths) === domainHashV1("compact-target-paths", snapshot.genesis_paths ?? []) &&
-			domainHashV1("compact-target-untracked", existing.intended_untracked) === domainHashV1("compact-target-untracked", snapshot.intended_untracked)
-		);
+	const terminalMatches = discoverCompactReviewStoresForAuthority(input.cwd, authority)
+		.filter((store) => {
+			const state = store.load().state.state;
+			return state === COMPACT_REVIEW_STATE.APPROVED || state === COMPACT_REVIEW_STATE.ESCALATED;
+		})
+		.map((store) => store.loadTerminalReceipt())
+		.filter(({ receipt }) => matchesTerminalReviewCandidateBinding(live, input.policyHash, createTerminalReviewCandidateBinding(authority.repository_id, receipt)));
+	if (terminalMatches.length > 1) {
+		throw new CompactReviewTerminalAmbiguityError(terminalMatches.map(({ record }) => record.state.lineage_id).toSorted());
+	}
+	const terminal = terminalMatches[0]?.record.state;
 	if (terminal) {
+		authorityStillMatches(input.cwd, authority);
 		throw new CompactReviewStartBlockedError(
 			terminal.lineage_id,
 			terminal.state,
@@ -187,8 +311,9 @@ export function startCompactReview(
 				: COMPACT_START_BLOCK_ACTION.ESCALATED,
 		);
 	}
+	authorityStillMatches(input.cwd, authority);
 	const state = createCompactReviewState({ lineageId, snapshot, policyHash: input.policyHash });
-	const store = CompactReviewStoreV2.forRepository(input.cwd, lineageId);
+	const store = CompactReviewStoreV2.forAuthority(input.cwd, authority, lineageId);
 	const revision = store.replace("", COMPACT_STORE_OPERATION.START, state);
 	return {
 		operation: "review/start",

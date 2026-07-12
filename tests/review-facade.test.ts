@@ -5,11 +5,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+	CompactReviewLineageBindingMismatchError,
+	CompactReviewTerminalAmbiguityError,
+	createTerminalReviewCandidateBinding,
 	discoverCompactReview,
+	matchesTerminalReviewCandidateBinding,
 	finalizeCompactReview,
 	startCompactReview,
 } from "../lib/review-facade.ts";
 import { CompactReviewContractError } from "../lib/review-compact-contract.ts";
+import type { LiveReviewCandidateBinding } from "../lib/review-snapshot.ts";
 
 function repository(t: test.TestContext): string {
 	const parent = mkdtempSync(join(tmpdir(), "compact-facade-"));
@@ -228,6 +233,8 @@ test("facade blocks a caller-supplied alternate lineage for an unchanged termina
 		() => startCompactReview({ cwd: root, lineageId: "alternate", policyHash: "a".repeat(64) }),
 		/approved authority already exists for this review target/i,
 	);
+	const differentPolicy = startCompactReview({ cwd: root, lineageId: "different-policy", policyHash: "b".repeat(64) });
+	assert.equal(differentPolicy.state, "reviewing");
 	writeFileSync(join(root, "value.ts"), "export const value = 3;\n");
 	const alternate = startCompactReview({ cwd: root, lineageId: "alternate", policyHash: "a".repeat(64) });
 	const statePath = discoverCompactReview(root, alternate.lineage_id).store.statePath;
@@ -258,6 +265,72 @@ for (const kind of ["binary", "mode-only"] as const) {
 		assert.equal(terminal.state, "approved");
 	});
 }
+
+test("terminal binding rejects material candidate dimensions while allowing staging-state changes", (t) => {
+	const root = repository(t);
+	const started = startCompactReview({ cwd: root, lineageId: "terminal-a", policyHash: "a".repeat(64) });
+	finalizeCompactReview({ cwd: root, lineageId: started.lineage_id, review_result: { lens_results: [{ findings: [], evidence: [] }] }, final_evidence: "passed", final_verification_passed: true });
+	const { record, receipt } = discoverCompactReview(root, started.lineage_id, true).store.loadTerminalReceipt();
+	const snapshot = record.state.initial_snapshot;
+	const binding = createTerminalReviewCandidateBinding("repository-a", receipt);
+	const live: LiveReviewCandidateBinding = {
+		repository_id: "repository-a",
+		base_tree: snapshot.base_tree,
+		complete_snapshot_tree: receipt.body.final_candidate_tree,
+		initial_review_tree: snapshot.initial_review_tree,
+		genesis_paths: [...record.state.genesis_paths],
+		intended_untracked: [...record.state.intended_untracked],
+	};
+	assert.equal(matchesTerminalReviewCandidateBinding(live, "a".repeat(64), binding), true);
+	for (const candidate of [
+		{ ...live, repository_id: "repository-b" },
+		{ ...live, base_tree: "b".repeat(40) },
+		{ ...live, complete_snapshot_tree: "c".repeat(40) },
+		{ ...live, genesis_paths: ["other.ts"] },
+	]) assert.equal(matchesTerminalReviewCandidateBinding(candidate, "a".repeat(64), binding), false);
+	assert.equal(matchesTerminalReviewCandidateBinding({ ...live, intended_untracked: [] }, "a".repeat(64), binding), true);
+	assert.equal(matchesTerminalReviewCandidateBinding(live, "b".repeat(64), binding), false);
+});
+
+test("facade fails closed when a detached terminal receipt is discovered", (t) => {
+	const root = repository(t);
+	const first = startCompactReview({ cwd: root, lineageId: "first", policyHash: "a".repeat(64) });
+	finalizeCompactReview({ cwd: root, lineageId: first.lineage_id, review_result: { lens_results: [{ findings: [], evidence: [] }] }, final_evidence: "passed", final_verification_passed: true });
+	const compactRoot = join(root, ".git", "gentle-ai", "reviews", "compact-v2");
+	const parked = join(root, ".git", "gentle-ai", "reviews", "parked-first");
+	const detachedReceipt = readFileSync(discoverCompactReview(root, first.lineage_id, true).store.receiptPath, "utf8");
+	execFileSync("mv", [join(compactRoot, "first"), parked]);
+	const second = startCompactReview({ cwd: root, lineageId: "second", policyHash: "a".repeat(64) });
+	finalizeCompactReview({ cwd: root, lineageId: second.lineage_id, review_result: { lens_results: [{ findings: [], evidence: [] }] }, final_evidence: "passed", final_verification_passed: true });
+	writeFileSync(discoverCompactReview(root, second.lineage_id, true).store.receiptPath, detachedReceipt);
+	execFileSync("mv", [parked, join(compactRoot, "first")]);
+	writeFileSync(join(root, "value.ts"), "export const value = 3;\n");
+	assert.throws(
+		() => startCompactReview({ cwd: root, lineageId: "third", policyHash: "a".repeat(64) }),
+		/receipt does not match current terminal authority/i,
+	);
+});
+
+test("facade rejects explicit terminal lineage mismatch and reports duplicate exact terminals deterministically", (t) => {
+	const root = repository(t);
+	const first = startCompactReview({ cwd: root, lineageId: "first", policyHash: "a".repeat(64) });
+	finalizeCompactReview({ cwd: root, lineageId: first.lineage_id, review_result: { lens_results: [{ findings: [], evidence: [] }] }, final_evidence: "passed", final_verification_passed: true });
+	const compactRoot = join(root, ".git", "gentle-ai", "reviews", "compact-v2");
+	const parked = join(root, ".git", "gentle-ai", "reviews", "parked-first");
+	execFileSync("mv", [join(compactRoot, "first"), parked]);
+	const second = startCompactReview({ cwd: root, lineageId: "second", policyHash: "a".repeat(64) });
+	finalizeCompactReview({ cwd: root, lineageId: second.lineage_id, review_result: { lens_results: [{ findings: [], evidence: [] }] }, final_evidence: "passed", final_verification_passed: true });
+	execFileSync("mv", [parked, join(compactRoot, "first")]);
+	assert.throws(
+		() => startCompactReview({ cwd: root, lineageId: "third", policyHash: "a".repeat(64) }),
+		(error: unknown) => error instanceof CompactReviewTerminalAmbiguityError && error.lineageIds.join(",") === "first,second",
+	);
+	writeFileSync(join(root, "value.ts"), "export const value = 3;\n");
+	assert.throws(
+		() => startCompactReview({ cwd: root, lineageId: "first", policyHash: "a".repeat(64) }),
+		(error: unknown) => error instanceof CompactReviewLineageBindingMismatchError && error.lineageId === "first",
+	);
+});
 
 test("facade rejects a correction forecast recorded after editing began", (t) => {
 	const root = repository(t);

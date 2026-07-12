@@ -17,6 +17,7 @@ import {
 	REVIEW_PROJECTION,
 	captureReviewSnapshot,
 	captureOrdinaryCorrectionSnapshot,
+	captureLiveReviewCandidateBinding,
 	cleanupReviewSnapshot,
 	type CaptureReviewSnapshotOptions,
 	type ReviewProjectionV1,
@@ -126,6 +127,30 @@ test("complete snapshot captures the repository root from a nested cwd without m
 	);
 	assert.deepEqual(readFileSync(indexPath), indexBefore);
 	assert.equal(git("status", "--porcelain=v1", "--untracked-files=all"), statusBefore);
+});
+
+test("ephemeral live candidate binding derives the complete candidate without retaining a snapshot", (t) => {
+	const { repository, git } = createRepository(t);
+	writeFileSync(join(repository, "tracked.txt"), "working tree\n");
+	writeFileSync(join(repository, "untracked.txt"), "included\n");
+	const snapshots = join(repository, ".git", "gentle-ai", "reviews", "snapshots");
+	const indexPath = join(git("rev-parse", "--absolute-git-dir"), "index");
+	const indexBefore = readFileSync(indexPath);
+	const statusBefore = git("status", "--porcelain=v1", "--untracked-files=all");
+
+	const binding = captureLiveReviewCandidateBinding({
+		cwd: repository,
+		repositoryId: "repository-authority-id",
+	});
+
+	assert.equal(binding.repository_id, "repository-authority-id");
+	assert.equal(binding.base_tree, git("rev-parse", "HEAD^{tree}"));
+	assert.equal(binding.complete_snapshot_tree, binding.initial_review_tree);
+	assert.deepEqual(binding.genesis_paths, ["tracked.txt", "untracked.txt"]);
+	assert.deepEqual(binding.intended_untracked, ["untracked.txt"]);
+	assert.deepEqual(readFileSync(indexPath), indexBefore);
+	assert.equal(git("status", "--porcelain=v1", "--untracked-files=all"), statusBefore);
+	assert.equal(existsSync(snapshots), false);
 });
 
 test("intended-commit projection binds its resolved tree while complete snapshot retains later scope", (t) => {

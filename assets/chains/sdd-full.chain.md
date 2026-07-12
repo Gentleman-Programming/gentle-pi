@@ -67,7 +67,7 @@ output: apply-progress.md
 outputMode: file-only
 progress: true
 
-Implement only approved tasks for {task}; enforce strict TDD when active and stop before writing if workload decisions are unresolved. Update OpenSpec tasks and apply-progress with evidence.
+Implement only approved implementation-owned tasks for {task}; enforce strict TDD when active and stop before writing if workload decisions are unresolved. Update OpenSpec tasks and apply-progress with evidence. When implementation completes, yield to the parent lifecycle boundary: the parent reuses only an authoritatively valid approved receipt, explicitly starts bounded review when one is missing, and fails closed otherwise. The apply agent does not perform review or lifecycle gates. Resume independent verification only after parent receipt approval.
 
 ## sdd-verify
 

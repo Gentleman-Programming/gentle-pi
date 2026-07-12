@@ -57,10 +57,13 @@ import {
 	COMPACT_START_BLOCK_ACTION,
 	GRAPH_V1_ORDINARY_READ_ONLY,
 	CompactReviewStartBlockedError,
+	CompactReviewTerminalAmbiguityError,
+	inspectCompactTerminalApplicability,
 	discoverCompactReview,
 	finalizeCompactReview,
 	startCompactReview,
 } from "../lib/review-facade.ts";
+import { parseCompactFinalizeInput } from "../lib/review-compact-contract.ts";
 import { validateCompactReviewGate } from "../lib/review-compact-gate.ts";
 import {
 	assertLiveRecoveredSourceBindingV1,
@@ -84,6 +87,7 @@ import {
 } from "../lib/review-compact-store.ts";
 import {
 	inheritedUnsafeGitEnvironmentKeys,
+	ReviewRepositoryError,
 	resolveRepositoryAuthorityV1,
 } from "../lib/review-repository.ts";
 import {
@@ -118,6 +122,13 @@ import {
 	type ReviewProjectionV1,
 } from "../lib/review-snapshot.ts";
 import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
+import {
+	createNativeReviewCli,
+	type NativeReviewCli,
+	type NativeFinalizeResult,
+	type NativeStartResult,
+	type NativeValidateResult,
+} from "../lib/native-review-cli.ts";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
@@ -2101,10 +2112,13 @@ const REVIEW_CONTROLLER_OPERATION = {
 	PREPARE_SUPERSESSION: "prepare-supersession",
 	SUPERSEDE: "supersede",
 	REPAIR: "repair",
+	BIND_SDD: "bind-sdd",
 } as const;
 
 type ReviewControllerOperation =
 	(typeof REVIEW_CONTROLLER_OPERATION)[keyof typeof REVIEW_CONTROLLER_OPERATION];
+
+const NATIVE_BIND_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
 const REVIEW_CONTROLLER_PARAMETERS = {
 	type: "object",
@@ -2138,7 +2152,7 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 		},
 		input: {
 			type: "string",
-			description: "A JSON-serialized object string, not a nested object. Ordinary START uses {\"mode\":\"ordinary\",\"policyHash\":\"<hash>\"}; FINALIZE supplies reviewer results, correction forecast, targeted validation, final evidence, and an explicit final_verification_passed boolean. Judgment Day retains graph-v1 input.",
+			description: "A JSON-serialized object string, not a nested object. New native ordinary START uses {\"mode\":\"ordinary\"} or an optional repository-local policyPath; legacy compact START retains policyHash. FINALIZE supplies reviewer results, correction forecast, targeted validation, final evidence, and an explicit final_verification_passed boolean. Judgment Day retains graph-v1 input.",
 		},
 		outputPath: { type: "string", description: "Destination path for deterministic bundle export." },
 		inputPath: { type: "string", description: "Source path for staged bundle import." },
@@ -2218,10 +2232,19 @@ interface ReleaseFastPathAuthorizationV1 {
 	expected_remote_head: string;
 }
 
+interface NativeReviewAuthorizationContext {
+	lineage_id: string;
+	store_revision: string;
+	receipt_hash: string;
+	target_hash: string;
+	fingerprint: string;
+}
+
 interface PendingReviewAuthorization {
 	command_hash: string;
 	target_hash: string;
 	receipt_hash: string | null;
+	native_gate?: NativeReviewAuthorizationContext;
 	release_fast_path?: ReleaseFastPathAuthorizationV1;
 }
 
@@ -2237,7 +2260,7 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 	// VALIDATE defers its lineage requirement to execution time: the proven
 	// release-from-protected-main fast path needs no receipt lineage, while
 	// every other validation still requires one before receipt validation.
-	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.FINALIZE, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.PREPARE_SUPERSESSION, REVIEW_CONTROLLER_OPERATION.SUPERSEDE, REVIEW_CONTROLLER_OPERATION.REPAIR, REVIEW_CONTROLLER_OPERATION.VALIDATE].includes(value.operation as ReviewControllerOperation);
+	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.FINALIZE, REVIEW_CONTROLLER_OPERATION.STATUS, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.PREPARE_SUPERSESSION, REVIEW_CONTROLLER_OPERATION.SUPERSEDE, REVIEW_CONTROLLER_OPERATION.REPAIR, REVIEW_CONTROLLER_OPERATION.VALIDATE, REVIEW_CONTROLLER_OPERATION.BIND_SDD].includes(value.operation as ReviewControllerOperation);
 	if (needsLineage && (typeof value.lineageId !== "string" || value.lineageId.trim().length === 0)) {
 		throw new Error("Review controller requires a lineageId");
 	}
@@ -2336,9 +2359,32 @@ function assertSupersessionControllerIdentity(
 	) throw new Error("Review controller supersession identity does not exactly match the prepared request");
 }
 
+const REVIEW_CONTROLLER_OUTCOME = {
+	RESET_STATE_UNAVAILABLE: "reset-state-unavailable",
+} as const;
+
+class ReviewResetStateUnavailableError extends Error {
+	readonly code = REVIEW_CONTROLLER_OUTCOME.RESET_STATE_UNAVAILABLE;
+	readonly statePath: string;
+
+	constructor(statePath: string) {
+		super("Review reset recovery state is unavailable");
+		this.name = "ReviewResetStateUnavailableError";
+		this.statePath = statePath;
+	}
+}
+
 function durableResetRecoveryRequest(cwd: string): LegacyInspectionV1["reset_request"] {
 	const authority = resolveRepositoryAuthorityV1(cwd);
-	const value = JSON.parse(readFileSync(join(authority.store_root, "control", "reset-state.json"), "utf8")) as unknown;
+	const statePath = join(authority.store_root, "control", "reset-state.json");
+	let serialized: string;
+	try {
+		serialized = readFileSync(statePath, "utf8");
+	} catch (error) {
+		if (isRecord(error) && error.code === "ENOENT") throw new ReviewResetStateUnavailableError(statePath);
+		throw error;
+	}
+	const value = JSON.parse(serialized) as unknown;
 	if (!isRecord(value) || !isRecord(value.body)) throw new Error("Review reset recovery state is malformed");
 	const envelope = value as unknown as ReviewResetStateEnvelope;
 	const body = envelope.body;
@@ -2408,7 +2454,16 @@ function inspectReviewAuthorityForController(cwd: string): ControllerReviewAutho
 	const legacy = inspectLegacyReviewAuthorityV1(cwd);
 	const compact = inspectCompactReviewAuthorityV2(cwd);
 	const inspection = legacy.outcome === "reset-in-progress"
-		? { ...legacy, reset_request: durableResetRecoveryRequest(cwd) }
+		? (() => {
+			try {
+				return { ...legacy, reset_request: durableResetRecoveryRequest(cwd) };
+			} catch (error) {
+				if (error instanceof ReviewResetStateUnavailableError) {
+					return { ...legacy, reset_state_outcome: REVIEW_CONTROLLER_OUTCOME.RESET_STATE_UNAVAILABLE };
+				}
+				throw error;
+			}
+		})()
 		: compact.outcome === COMPACT_AUTHORITY_OUTCOME.INVALID
 			? { ...legacy, reset_request: compactResetRequestV1(cwd, legacy) }
 			: legacy;
@@ -3148,7 +3203,9 @@ function reviewAuthorizationKey(command: string, cwd: string): string {
 	return canonicalHash({ command, cwd: resolve(cwd) });
 }
 
-type ReviewGateEvaluator = (command: string) => ToolCallEventResult | undefined;
+type ReviewGateEvaluator = (
+	command: string,
+) => Promise<ToolCallEventResult | undefined>;
 type CommandSafetyEvaluator = (
 	command: string,
 ) => Promise<ToolCallEventResult | undefined>;
@@ -3157,11 +3214,184 @@ function isReviewTransition(value: string): value is ReviewTransition {
 	return Object.values(REVIEW_TRANSITION).some((transition) => transition === value);
 }
 
-function executeReviewControllerOperation(
+function isKnownPiLegacyLineage(cwd: string, lineageId: string): boolean {
+	try {
+		return compactV2LineageExists(cwd, lineageId) || graphV1LineageExists(cwd, lineageId);
+	} catch (error) {
+		if (error instanceof ReviewRepositoryError) return false;
+		throw error;
+	}
+}
+
+function hasLegacyReviewAuthority(cwd: string): boolean {
+	try {
+		const inspection = inspectReviewAuthorityForController(cwd);
+		return inspection.outcome !== "clean" || inspection.compact_authority !== undefined;
+	} catch (error) {
+		if (error instanceof ReviewRepositoryError) return false;
+		throw error;
+	}
+}
+
+function nativeStatusUnsupported(operation: ReviewControllerOperation): Record<string, unknown> {
+	return {
+		operation,
+		status: "blocked",
+		outcome: "native-status-unsupported",
+		mutation_performed: false,
+		inventory_complete: false,
+		next_action: "require-upstream-read-only-native-status-inventory",
+		evidence: {
+			native_contract: "gentle-ai/2.1.0",
+			general_status: "unsupported",
+			claimant_inventory: "unsupported",
+		},
+	};
+}
+
+function mapNativeStartResult(result: NativeStartResult): Record<string, unknown> {
+	return {
+		lineage_id: result.lineageId,
+		state: result.state,
+		risk_tier: result.riskLevel,
+		selected_lenses: result.selectedLenses,
+		changed_files: result.changedFiles,
+		original_changed_lines: result.changedLines,
+		correction_budget: result.correctionBudget,
+	};
+}
+
+function mapNativeFinalizeResult(result: NativeFinalizeResult): Record<string, unknown> {
+	return {
+		lineage_id: result.lineageId,
+		state: result.state,
+		action: result.action,
+		store_revision: result.storeRevision,
+		...(result.receiptPath === undefined ? {} : { receipt_path: result.receiptPath }),
+	};
+}
+
+function mapNativeValidateResult(result: NativeValidateResult): Record<string, unknown> {
+	return {
+		allowed: result.allowed,
+		result: result.result,
+		action: result.action,
+		reason: result.reason,
+		gate_context: {
+			lineage_id: result.gateContext.lineageId,
+			store_revision: result.gateContext.storeRevision,
+			receipt_hash: result.gateContext.receiptHash,
+			target_hash: result.gateContext.targetHash,
+		},
+	};
+}
+
+function nativeGateFingerprint(result: NativeValidateResult): string {
+	return canonicalHash({
+		lineage_id: result.gateContext.lineageId,
+		store_revision: result.gateContext.storeRevision,
+		receipt_hash: result.gateContext.receiptHash,
+		target_hash: result.gateContext.targetHash,
+	});
+}
+
+function nativeGateFlags(derived: DerivedReviewGateTarget): readonly string[] {
+	return derived.target.kind === GATE_TARGET_KIND.PULL_REQUEST
+		? ["--base-ref", derived.target.base_ref]
+		: [];
+}
+
+interface NativeStartPolicyValidation {
+	policyPath?: string;
+	reason?: string;
+}
+
+function isStrictDescendantPath(parent: string, candidate: string): boolean {
+	const pathFromParent = relative(parent, candidate);
+	return pathFromParent.length > 0 && pathFromParent !== ".." && !pathFromParent.startsWith(`..${sep}`) && !isAbsolute(pathFromParent);
+}
+
+function validateNativeStartPolicyPath(cwd: string, value: unknown): NativeStartPolicyValidation {
+	if (typeof value !== "string" || value.trim().length === 0) return { reason: "policy-path-not-regular" };
+	let repository: string;
+	try {
+		repository = realpathSync(cwd);
+	} catch {
+		return { reason: "policy-path-outside-scope" };
+	}
+	const policyRoot = join(repository, ".gentle-ai", "policies");
+	const candidate = resolve(repository, value);
+	if (!isStrictDescendantPath(policyRoot, candidate)) return { reason: "policy-path-outside-scope" };
+	const gentleDirectory = join(repository, ".gentle-ai");
+	for (const directory of [gentleDirectory, policyRoot]) {
+		try {
+			const metadata = lstatSync(directory);
+			if (metadata.isSymbolicLink()) return { reason: "policy-path-symlink" };
+			if (!metadata.isDirectory()) return { reason: "policy-path-not-regular" };
+		} catch {
+			return { reason: "policy-path-not-regular" };
+		}
+	}
+	const segments = relative(policyRoot, candidate).split(sep);
+	let current = policyRoot;
+	for (const [index, segment] of segments.entries()) {
+		current = join(current, segment);
+		try {
+			const metadata = lstatSync(current);
+			if (metadata.isSymbolicLink()) return { reason: "policy-path-symlink" };
+			if (index === segments.length - 1) {
+				if (!metadata.isFile()) return { reason: "policy-path-not-regular" };
+			} else if (!metadata.isDirectory()) {
+				return { reason: "policy-path-not-regular" };
+			}
+		} catch {
+			return { reason: "policy-path-not-regular" };
+		}
+	}
+	try {
+		const canonicalPath = realpathSync(candidate);
+		if (canonicalPath !== candidate || !isStrictDescendantPath(policyRoot, canonicalPath)) return { reason: "policy-path-symlink" };
+		return { policyPath: canonicalPath };
+	} catch {
+		return { reason: "policy-path-not-regular" };
+	}
+}
+
+function nativeStartPolicyRejection(reason: string): Record<string, unknown> {
+	return {
+		operation: REVIEW_CONTROLLER_OPERATION.START,
+		status: "blocked",
+		outcome: reason === "legacy-policy-hash-unsupported"
+			? "native-start-legacy-policy-hash-unsupported"
+			: "native-start-policy-path-invalid",
+		reason,
+		mutation_performed: false,
+		mutation_outcome: "none",
+	};
+}
+
+function nativeOperationFailure(operation: ReviewControllerOperation, error: unknown): Record<string, unknown> {
+	const value = error as { mutationOutcome?: unknown; nextAction?: unknown };
+	const mutationOutcome = value.mutationOutcome === "unknown" ? "unknown" : "none";
+	return {
+		operation,
+		status: "blocked",
+		outcome: "native-operation-failed",
+		mutation_performed: false,
+		mutation_outcome: mutationOutcome,
+		...(mutationOutcome === "unknown" || value.nextAction === "replay-exact-native-operation"
+			? { next_action: "replay-exact-native-operation" }
+			: { next_action: "resolve-native-operation-failure" }),
+	};
+}
+
+async function executeReviewControllerOperation(
 	parametersValue: unknown,
 	defaultCwd: string,
 	pendingAuthorizations: Map<string, PendingReviewAuthorization>,
-): Record<string, unknown> {
+	nativeReviewCli: NativeReviewCli | null,
+	signal?: AbortSignal,
+): Promise<Record<string, unknown>> {
 	const parameters = parseReviewControllerParameters(parametersValue);
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.EXPORT) {
 		const outputPath = requiredControllerString(parameters, "outputPath");
@@ -3214,37 +3444,48 @@ function executeReviewControllerOperation(
 		if (!active || active.recovery.recovery_id !== installed.recovery_id) throw new Error("Review controller SUPERSEDE did not produce one validated active authority");
 		return { operation: parameters.operation, change_name: input.changeName, recovery_id: installed.recovery_id, active_authority_id: active.record.state.lineage_id, next_action: "validate-recovered-authority" };
 	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.INSPECT && nativeReviewCli !== null) {
+		return nativeStatusUnsupported(parameters.operation);
+	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.INSPECT) {
 		const authority = resolveRepositoryAuthorityV1(defaultCwd);
 		const lock = new ReviewMutationLockV1(join(authority.store_root, "control"), authority.repository_id, authority.authority_id);
 		const inspection = inspectReviewAuthorityForController(defaultCwd);
+		const input = parameters.input === undefined ? undefined : parseControllerJson(parameters.input, parameters.operation);
+		const policyHash = input?.mode === REVIEW_MODE.ORDINARY && isRecord(input.projection) && input.projection.kind === REVIEW_PROJECTION.COMPLETE && typeof input.policyHash === "string" ? input.policyHash : undefined;
+		const applicability = inspection.outcome === "clean" && (
+			inspection.compact_authority?.outcome === COMPACT_AUTHORITY_OUTCOME.APPROVED ||
+			inspection.compact_authority?.outcome === COMPACT_AUTHORITY_OUTCOME.ESCALATED
+		) ? inspectCompactTerminalApplicability(defaultCwd, policyHash) : undefined;
+		const candidateInspection = applicability === undefined ? inspection : {
+			...inspection,
+			terminal_applicability: applicability.applicability,
+			terminal_lineage_ids: applicability.lineageIds,
+		};
+		const terminal = applicability?.applicability === "applicable";
+		const terminalAmbiguous = applicability?.applicability === "ambiguous";
 		return {
 			operation: parameters.operation,
-			inspection,
+			inspection: candidateInspection,
 			lock: lock.inspect(),
 			...(inspection.outcome === "clean" && inspection.compact_authority !== undefined
-				? {
-					status: inspection.compact_authority.outcome === COMPACT_AUTHORITY_OUTCOME.ESCALATED
-						? "escalated"
-						: inspection.compact_authority.outcome === COMPACT_AUTHORITY_OUTCOME.APPROVED
-							? "terminal"
-							: inspection.compact_authority.outcome === COMPACT_AUTHORITY_OUTCOME.ACTIVE
-								? "in-progress"
-								: "blocked",
-					next_action: compactAuthorityAction(inspection),
-				}
+				? inspection.compact_authority.outcome === COMPACT_AUTHORITY_OUTCOME.INVALID
+					? { status: "blocked", next_action: "request-explicit-reset-authorization" }
+					: inspection.compact_authority.outcome === COMPACT_AUTHORITY_OUTCOME.ACTIVE
+					? { status: "in-progress", next_action: "finalize-existing-ordinary-review" }
+					: terminalAmbiguous
+						? { status: "blocked", next_action: "stop-and-report-ambiguous-compact-terminal-authority" }
+						: terminal
+							? { status: "terminal", next_action: compactAuthorityAction(inspection) }
+						: { status: "ready", next_action: "start-ordinary-review" }
 				: inspection.outcome === "clean"
 					? { status: "ready", next_action: "start-ordinary-review" }
 					: inspection.outcome === "blocked-ambiguous"
-					? { status: "blocked", next_action: "stop-and-report-ambiguous-authority" }
-					: {
-						status: "blocked",
-						next_action: inspection.outcome === "reset-in-progress"
-							? "request-explicit-reset-recovery-authorization"
-							: "request-explicit-reset-authorization",
-					}),
+						? { status: "blocked", next_action: "stop-and-report-ambiguous-authority" }
+						: { status: "blocked", next_action: inspection.outcome === "reset-in-progress" ? "request-explicit-reset-recovery-authorization" : "request-explicit-reset-authorization" }),
 		};
 	}
+
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
 		if (typeof input.ownerHash !== "string") throw new Error("Lock recovery requires an exact ownerHash");
@@ -3255,7 +3496,20 @@ function executeReviewControllerOperation(
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RECOVER) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
-		durableResetRecoveryRequest(defaultCwd);
+		try {
+			durableResetRecoveryRequest(defaultCwd);
+		} catch (error) {
+			if (error instanceof ReviewResetStateUnavailableError) {
+				return {
+					operation: parameters.operation,
+					status: "blocked",
+					outcome: REVIEW_CONTROLLER_OUTCOME.RESET_STATE_UNAVAILABLE,
+					mutation_performed: false,
+					next_action: "stop-and-restore-durable-reset-state",
+				};
+			}
+			throw error;
+		}
 		pendingAuthorizations.clear();
 		const result = destructiveResetReviewAuthorityV1({ cwd: defaultCwd, repositoryId: String(input.repositoryId), commonDirHash: String(input.commonDirHash), inventoryHash: String(input.inventoryHash), confirmation: String(input.confirmation), resume: true });
 		const inspection = inspectReviewAuthorityForController(defaultCwd);
@@ -3287,11 +3541,86 @@ function executeReviewControllerOperation(
 		store.repairCurrentAuthority();
 		return { operation: parameters.operation, repaired: true };
 	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.BIND_SDD) {
+		if (nativeReviewCli === null) return nativeStatusUnsupported(parameters.operation);
+		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
+		if (
+			typeof input.change !== "string" ||
+			typeof input.lineageId !== "string" ||
+			typeof input.expectedBindingRevision !== "string"
+		) throw new Error("Native bind-sdd requires change, lineageId, and expected binding revision");
+		if (!/^[a-z0-9][a-z0-9-]*$/.test(input.change)) throw new Error("Native bind-sdd change name is invalid");
+		if (!NATIVE_BIND_TOKEN_RE.test(input.lineageId)) throw new Error("Native bind-sdd lineageId is invalid");
+		if (input.expectedBindingRevision !== "" && !NATIVE_BIND_TOKEN_RE.test(input.expectedBindingRevision)) throw new Error("Native bind-sdd expected binding revision is invalid");
+		const expectedPath = join("openspec", "changes", input.change);
+		const canonicalCwd = realpathSync(defaultCwd);
+		const absolutePath = resolve(canonicalCwd, expectedPath);
+		if (!existsSync(absolutePath) || !lstatSync(absolutePath).isDirectory()) throw new Error("Native bind-sdd change path is outside or missing from the repository");
+		const canonicalPath = realpathSync(absolutePath);
+		const pathFromRepository = relative(canonicalCwd, canonicalPath);
+		if (pathFromRepository === ".." || pathFromRepository.startsWith(`..${sep}`) || isAbsolute(pathFromRepository)) throw new Error("Native bind-sdd change path is outside or missing from the repository");
+		try {
+			const bound = await nativeReviewCli.bindSdd({
+				cwd: canonicalCwd,
+				change: input.change,
+				lineage: input.lineageId,
+				expectedBindingRevision: input.expectedBindingRevision,
+				...(signal === undefined ? {} : { signal }),
+			});
+			if (
+				bound.change !== input.change ||
+				bound.path !== expectedPath ||
+				bound.lineageId !== input.lineageId ||
+				typeof bound.repository !== "string" || bound.repository.length === 0 ||
+				typeof bound.authorityRevision !== "string" || bound.authorityRevision.length === 0 ||
+				typeof bound.receiptHash !== "string" || bound.receiptHash.length === 0 ||
+				typeof bound.bindingRevision !== "string" || bound.bindingRevision.length === 0
+			) throw Object.assign(
+				new Error("Native bind-sdd returned malformed or inconsistent binding evidence"),
+				{ mutationOutcome: "unknown", nextAction: "replay-exact-native-operation" },
+			);
+			return { operation: parameters.operation, binding: {
+				repository: bound.repository,
+				change: bound.change,
+				path: bound.path,
+				lineage_id: bound.lineageId,
+				authority_revision: bound.authorityRevision,
+				receipt_hash: bound.receiptHash,
+				binding_revision: bound.bindingRevision,
+			} };
+		} catch (error) {
+			return nativeOperationFailure(parameters.operation, error);
+		}
+	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.START) {
 		const rawStart = parseControllerJson(
 			requiredControllerString(parameters, "input"),
 			REVIEW_CONTROLLER_OPERATION.START,
 		);
+		if (rawStart.mode === REVIEW_MODE.ORDINARY && nativeReviewCli !== null) {
+			if (
+				hasLegacyReviewAuthority(defaultCwd) ||
+				(typeof parameters.lineageId === "string" && isKnownPiLegacyLineage(defaultCwd, parameters.lineageId))
+			) {
+				return { operation: parameters.operation, status: "blocked", outcome: "legacy-read-only", mutation_performed: false, next_action: "use-compatible-read-or-gate-route" };
+			}
+			if ("policyHash" in rawStart) return nativeStartPolicyRejection("legacy-policy-hash-unsupported");
+			const policy: NativeStartPolicyValidation = rawStart.policyPath === undefined
+				? {}
+				: validateNativeStartPolicyPath(defaultCwd, rawStart.policyPath);
+			if (policy.reason !== undefined) return nativeStartPolicyRejection(policy.reason);
+			try {
+				const result = await nativeReviewCli.start({
+					cwd: defaultCwd,
+					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
+					...(policy.policyPath === undefined ? {} : { policyPath: policy.policyPath }),
+					...(signal === undefined ? {} : { signal }),
+				});
+				return { operation: parameters.operation, result: mapNativeStartResult(result) };
+			} catch (error) {
+				return nativeOperationFailure(parameters.operation, error);
+			}
+		}
 		const inspection = inspectReviewAuthorityForController(defaultCwd);
 		if (inspection.outcome !== "clean") {
 			return {
@@ -3326,6 +3655,16 @@ function executeReviewControllerOperation(
 				const state = discoverCompactReview(defaultCwd, result.lineage_id).record.state;
 				return { operation: parameters.operation, result, state };
 			} catch (error) {
+				if (error instanceof CompactReviewTerminalAmbiguityError) {
+					return {
+						operation: parameters.operation,
+						status: "blocked",
+						lineage_created: false,
+						lineage_ids: error.lineageIds,
+						next_action: "stop-and-report-ambiguous-compact-terminal-authority",
+						inspection: inspectReviewAuthorityForController(defaultCwd),
+					};
+				}
 				if (error instanceof CompactReviewStartBlockedError) {
 					return {
 						operation: parameters.operation,
@@ -3398,6 +3737,35 @@ function executeReviewControllerOperation(
 		if (raw.final_evidence !== undefined && typeof raw.final_evidence !== "string") throw new Error("Review controller finalize final_evidence must be a string");
 		if (raw.final_verification_passed !== undefined && typeof raw.final_verification_passed !== "boolean") throw new Error("Review controller finalize final_verification_passed must be boolean");
 		if (raw.final_evidence !== undefined && raw.final_verification_passed === undefined) throw new Error("Review controller finalize with final_evidence requires an explicit final_verification_passed boolean");
+		if (
+			nativeReviewCli !== null &&
+			typeof parameters.lineageId === "string" &&
+			isKnownPiLegacyLineage(defaultCwd, parameters.lineageId)
+		) {
+			return { operation: parameters.operation, status: "blocked", outcome: "legacy-read-only", mutation_performed: false, next_action: "use-compatible-read-or-gate-route" };
+		}
+		if (nativeReviewCli !== null) {
+			const input = parseCompactFinalizeInput({
+				cwd: defaultCwd,
+				...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
+				...raw,
+			});
+			try {
+				const result = await nativeReviewCli.finalize({
+					cwd: defaultCwd,
+					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
+					...(input.review_result === undefined ? {} : { lensResults: input.review_result.lens_results.map((document, index) => ({ lens: `lens-${index}`, document })) }),
+					...(input.refuter_batch === undefined ? {} : { refuterDocument: input.refuter_batch }),
+					...(input.correction_line_forecast === undefined ? {} : { correctionLines: input.correction_line_forecast }),
+					...(input.validation === undefined ? {} : { validationDocument: input.validation }),
+					...(input.final_evidence === undefined ? {} : { evidenceDocument: { evidence: input.final_evidence, passed: input.final_verification_passed } }),
+					...(signal === undefined ? {} : { signal }),
+				});
+				return { operation: parameters.operation, result: mapNativeFinalizeResult(result) };
+			} catch (error) {
+				return nativeOperationFailure(parameters.operation, error);
+			}
+		}
 		return {
 			operation: parameters.operation,
 			result: finalizeCompactReview({
@@ -3473,6 +3841,7 @@ function executeReviewControllerOperation(
 		};
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.STATUS) {
+		if (parameters.lineageId === undefined) return nativeStatusUnsupported(parameters.operation);
 		const compactExists = compactV2LineageExists(defaultCwd, parameters.lineageId!);
 		const graphExists = graphV1LineageExists(defaultCwd, parameters.lineageId!);
 		if (compactExists && graphExists) throw new Error("Review authority is ambiguous across graph-v1 and compact-v2");
@@ -3504,6 +3873,47 @@ function executeReviewControllerOperation(
 		),
 	);
 	const derived = deriveReviewGateTarget(commandValue, defaultCwd);
+	if (
+		nativeReviewCli !== null &&
+		typeof parameters.lineageId === "string" &&
+		!compactV2LineageExists(derived.command.cwd, parameters.lineageId) &&
+		!graphV1LineageExists(derived.command.cwd, parameters.lineageId)
+	) {
+		try {
+			const result = await nativeReviewCli.validate({
+				cwd: derived.command.cwd,
+				gate: derived.command.event,
+				lineageId: parameters.lineageId,
+				flags: nativeGateFlags(derived),
+				...(signal === undefined ? {} : { signal }),
+			});
+			const response: Record<string, unknown> = {
+				operation: parameters.operation,
+				result: mapNativeValidateResult(result),
+				derived_target: derived.target,
+			};
+			if (result.allowed && result.result === "allow") {
+				const commandHash = reviewAuthorizationKey(commandValue, derived.command.cwd);
+				const authorization: PendingReviewAuthorization = {
+					command_hash: commandHash,
+					target_hash: canonicalHash(derived.target),
+					receipt_hash: result.gateContext.receiptHash,
+					native_gate: {
+						lineage_id: result.gateContext.lineageId,
+						store_revision: result.gateContext.storeRevision,
+						receipt_hash: result.gateContext.receiptHash,
+						target_hash: result.gateContext.targetHash,
+						fingerprint: nativeGateFingerprint(result),
+					},
+				};
+				pendingAuthorizations.set(commandHash, authorization);
+				response.authorization = authorization;
+			}
+			return response;
+		} catch (error) {
+			return nativeOperationFailure(parameters.operation, error);
+		}
+	}
 	let releaseFastPath: Record<string, unknown> | undefined;
 	if (input.release !== undefined) {
 		if (derived.command.event !== "pre-release") {
@@ -3648,11 +4058,12 @@ function executeReviewControllerOperation(
 	return response;
 }
 
-function gateLifecycleCommand(
+async function gateLifecycleCommand(
 	command: string,
 	defaultCwd: string,
 	pendingAuthorizations: Map<string, PendingReviewAuthorization>,
-): ToolCallEventResult | undefined {
+	nativeReviewCli: NativeReviewCli | null = null,
+): Promise<ToolCallEventResult | undefined> {
 	const inspection = inspectReviewLifecycleCommand(command, defaultCwd);
 	if (!inspection.event) return undefined;
 	if (!inspection.command) {
@@ -3686,6 +4097,37 @@ function gateLifecycleCommand(
 			reason: `Gentle AI ${inspection.event} gate ${mismatch} changed after authorization and failed closed.`,
 		};
 	}
+	if (authorization.native_gate) {
+		if (nativeReviewCli === null) {
+			return {
+				block: true,
+				reason: `Gentle AI ${inspection.event} gate native validation dependency is unavailable and failed closed.`,
+			};
+		}
+		try {
+			const fresh = await nativeReviewCli.validate({
+				cwd: derived.command.cwd,
+				gate: derived.command.event,
+				lineageId: authorization.native_gate.lineage_id,
+				flags: nativeGateFlags(derived),
+			});
+			if (
+				!fresh.allowed ||
+				fresh.result !== "allow" ||
+				nativeGateFingerprint(fresh) !== authorization.native_gate.fingerprint
+			) {
+				return {
+					block: true,
+					reason: `Gentle AI ${inspection.event} gate native authority, receipt, revision, or target changed after authorization and failed closed.`,
+				};
+			}
+		} catch {
+			return {
+				block: true,
+				reason: `Gentle AI ${inspection.event} gate native bash-time validation failed closed.`,
+			};
+		}
+	}
 	if (authorization.release_fast_path) {
 		// The remote protected main head is rechecked immediately before the tag
 		// push; an advanced or unprovable head fails closed.
@@ -3711,7 +4153,7 @@ export async function enforceReviewGateAndCommandSafety(
 ): Promise<ToolCallEventResult | undefined> {
 	const safetyResult = await evaluateSafety(command);
 	if (safetyResult) return safetyResult;
-	return evaluateGate(command);
+	return await evaluateGate(command);
 }
 
 /** @internal */
@@ -3728,6 +4170,7 @@ export const __testing = {
 	inspectReviewLifecycleCommand,
 	deriveReviewGateTarget,
 	gateLifecycleCommand,
+	nativeStatusUnsupported,
 	executeReviewControllerOperation,
 	enforceReviewGateAndCommandSafety,
 	renderSddModelPanel: renderSddModelPanelForTesting,
@@ -3736,28 +4179,50 @@ export const __testing = {
 	resolveControllerSddStatus,
 };
 
-function resolveControllerSddStatus(
+async function resolveControllerSddStatus(
 	cwd: string,
 	changeName: string | undefined,
 	includeInstructions: boolean,
 	artifactStore: SddPreflightPreferences["artifactStore"] | undefined,
+	nativeReviewCli: NativeReviewCli | null = null,
 ) {
 	const base = resolveSddStatus({ cwd, changeName, includeInstructions, artifactStore });
-	if (!base.changeName || !hasRecoveryObligationForChange(cwd, base.changeName)) return base;
-	return resolveSddStatus({
-		cwd,
-		changeName: base.changeName,
-		includeInstructions,
-		artifactStore,
-		reviewAuthority: {
-			expected: true,
-			resolve: () => {
-				const active = resolveReviewAuthorityForChange(cwd, base.changeName!);
-				if (!active) throw new Error("validated recovered review authority is missing");
-				return { activeAuthorityId: active.record.state.lineage_id };
+	if (!base.changeName || base.isNonAuthoritative) return base;
+	if (hasRecoveryObligationForChange(cwd, base.changeName)) {
+		return resolveSddStatus({
+			cwd,
+			changeName: base.changeName,
+			includeInstructions,
+			artifactStore,
+			reviewAuthority: {
+				expected: true,
+				resolve: () => {
+					const active = resolveReviewAuthorityForChange(cwd, base.changeName!);
+					if (!active) throw new Error("validated recovered review authority is missing");
+					return { activeAuthorityId: active.record.state.lineage_id };
+				},
 			},
-		},
-	});
+		});
+	}
+	if (nativeReviewCli === null) return base;
+	try {
+		const native = await nativeReviewCli.sddStatus({ cwd, change: base.changeName });
+		return resolveSddStatus({
+			cwd,
+			changeName: base.changeName,
+			includeInstructions,
+			artifactStore,
+			nativeReviewReadiness: { expected: true, ready: native.ready },
+		});
+	} catch (error) {
+		return resolveSddStatus({
+			cwd,
+			changeName: base.changeName,
+			includeInstructions,
+			artifactStore,
+			nativeReviewReadiness: { expected: true, ready: false, reason: error instanceof Error ? error.message : "native bound status failed" },
+		});
+	}
 }
 
 function hasRecoveryObligationForChange(cwd: string, changeName: string): boolean {
@@ -3771,17 +4236,23 @@ function hasRecoveryObligationForChange(cwd: string, changeName: string): boolea
 	}
 }
 
-export default function gentleAi(pi: ExtensionAPI): void {
+export interface GentleAiRuntimeDependencies {
+	nativeReviewCli?: NativeReviewCli | null;
+}
+
+export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencies = {}): (pi: ExtensionAPI) => void {
+	const nativeReviewCli = dependencies.nativeReviewCli === undefined ? createNativeReviewCli() : dependencies.nativeReviewCli;
+	return function gentleAi(pi: ExtensionAPI): void {
 	const pendingReviewAuthorizations = new Map<string, PendingReviewAuthorization>();
 
 	pi.registerTool({
 		name: "gentle_review",
 		label: "Gentle Review Controller",
 		description:
-			"Inspect and recover review authority, run new ordinary review through compact start/finalize/validate, preserve graph-v1 Judgment Day and compatibility reads, and authorize one exact lifecycle command. RESET/RECOVER remain destructive; prepare-supersession/supersede require fresh interactive authorization and fail closed headlessly.",
-		promptSnippet: "Inspect authority, then use compact start/finalize/validate for ordinary review; use graph-v1 only for explicit Judgment Day",
+			"Inspect and recover review authority, run new native ordinary review through start/finalize/validate, preserve legacy compact compatibility reads and graph-v1 Judgment Day, and authorize one exact lifecycle command. RESET/RECOVER remain destructive; prepare-supersession/supersede require fresh interactive authorization and fail closed headlessly.",
+		promptSnippet: "Inspect authority, then use native start/finalize/validate for a new ordinary review; use graph-v1 only for explicit Judgment Day",
 		promptGuidelines: [
-			'Call {"operation":"inspect"} before START. Ordinary START uses a JSON string such as "{\\"mode\\":\\"ordinary\\",\\"policyHash\\":\\"<hash>\\"}"; the controller derives lineage, Git/untracked scope, tier, lenses, authored lines, and budget.',
+			'Call {"operation":"inspect"} before START. New native ordinary START uses a JSON string such as "{\\"mode\\":\\"ordinary\\"}" or "{\\"mode\\":\\"ordinary\\",\\"policyPath\\":\\".gentle-ai/policies/team.json\\"}"; policyHash is legacy compact-only. The controller derives lineage, Git/untracked scope, tier, lenses, authored lines, and budget.',
 			"For non-destructive legacy recovery, call prepare-supersession with one exact change, source, successor, operation, and prepared evidence input. Call supersede only with the returned request hash and exact English challenge after fresh UI approval; it never falls back to RESET or RECOVER. Headless, stale, conflicting, malformed, or unsupported recovery remains resolve-review blocked; exact retries are idempotent, but semantic retries require a new operation.",
 			"Run selected lenses once, then call FINALIZE with causal result JSON. FINALIZE alone records correction forecast, Git-derived correction evidence, targeted validation, and final evidence. Use ADVANCE only for explicit graph-v1 Judgment Day.",
 			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization for the exact reset_request challenge, then call RESET or RECOVER only after authorization. RESET and RECOVER internally INSPECT authority; require their verified clean result and next_action start-fresh-ordinary-review-after-verified-clean before continuing directly to a fresh ordinary START.",
@@ -3793,10 +4264,12 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		async execute(_toolCallId, parameters, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Review controller operation was cancelled");
 			await authorizeDestructiveReviewOperation(parameters, ctx);
-			const details = executeReviewControllerOperation(
+			const details = await executeReviewControllerOperation(
 				parameters,
 				ctx.cwd,
 				pendingReviewAuthorizations,
+				nativeReviewCli,
+				signal,
 			);
 			return {
 				content: [{ type: "text", text: JSON.stringify(details) }],
@@ -3864,11 +4337,12 @@ export default function gentleAi(pi: ExtensionAPI): void {
 				: "";
 		const phase = isSddAgent ? sddPhaseFromAgentStartEvent(event) : undefined;
 		const nativeStatusPrompt = phase
-			? `\n\n${renderNativeSddPhasePrompt(resolveControllerSddStatus(
+			? `\n\n${renderNativeSddPhasePrompt(await resolveControllerSddStatus(
 				ctx.cwd,
 				undefined,
 				true,
 				prefs?.artifactStore,
+				nativeReviewCli,
 			), phase)}`
 			: "";
 		const gentlePrompt = isNamedAgent || isSddAgent
@@ -3890,7 +4364,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 			return undefined;
 		return enforceReviewGateAndCommandSafety(
 			event.input.command,
-			(command) => gateLifecycleCommand(command, ctx.cwd, pendingReviewAuthorizations),
+			(command) => gateLifecycleCommand(command, ctx.cwd, pendingReviewAuthorizations, nativeReviewCli),
 			(command) => confirmCommand(command, ctx),
 		);
 	});
@@ -3916,13 +4390,14 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		},
 	});
 
-	const handleSddStatusCommand = (args: string, ctx: ExtensionContext) => {
+	const handleSddStatusCommand = async (args: string, ctx: ExtensionContext) => {
 		const parsed = parseSddStatusCommandArgs(args);
-		const status = resolveControllerSddStatus(
+		const status = await resolveControllerSddStatus(
 			ctx.cwd,
 			parsed.changeName,
 			true,
 			getSddPreflightPreferences(ctx)?.artifactStore,
+			nativeReviewCli,
 		);
 		ctx.ui.notify(
 			parsed.json ? JSON.stringify(status, null, 2) : renderSddStatusMarkdown(status),
@@ -3933,17 +4408,18 @@ export default function gentleAi(pi: ExtensionAPI): void {
 	pi.registerCommand("sdd-status", {
 		description: "Show deterministic SDD change status and instructions.",
 		handler: async (args, ctx) => {
-			handleSddStatusCommand(args, ctx);
+			await handleSddStatusCommand(args, ctx);
 		},
 	});
 
-	const handleSddContinueCommand = (args: string, ctx: ExtensionContext) => {
+	const handleSddContinueCommand = async (args: string, ctx: ExtensionContext) => {
 		const parsed = parseSddStatusCommandArgs(args);
-		const status = resolveControllerSddStatus(
+		const status = await resolveControllerSddStatus(
 			ctx.cwd,
 			parsed.changeName,
 			true,
 			getSddPreflightPreferences(ctx)?.artifactStore,
+			nativeReviewCli,
 		);
 		ctx.ui.notify(
 			parsed.json ? JSON.stringify(status, null, 2) : renderSddDispatcherMarkdown(status),
@@ -3954,7 +4430,7 @@ export default function gentleAi(pi: ExtensionAPI): void {
 	pi.registerCommand("sdd-continue", {
 		description: "Resolve SDD status and route the next phase deterministically.",
 		handler: async (args, ctx) => {
-			handleSddContinueCommand(args, ctx);
+			await handleSddContinueCommand(args, ctx);
 		},
 	});
 
@@ -4058,4 +4534,9 @@ export default function gentleAi(pi: ExtensionAPI): void {
 			);
 		},
 	});
+	};
+}
+
+export default function gentleAi(pi: ExtensionAPI): void {
+	return createGentleAiExtension()(pi);
 }
