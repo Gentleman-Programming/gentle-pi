@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { closeSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync, fsyncSync } from "node:fs";
-import { join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { canonicalJsonV1, domainHashV1, parseCanonicalJsonV1 } from "./review-canonical.ts";
 
 const OBJECT_FORMAT = /^(sha1|sha256)$/;
@@ -243,7 +243,7 @@ interface LiveRepositoryProbeV1 {
 
 function probeLiveRepositoryV1(cwd: string): LiveRepositoryProbeV1 {
 	const commonDirectory = oneGitLine(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
-	if (!commonDirectory.startsWith("/")) throw new ReviewRepositoryError("Git common directory is not absolute");
+	if (!isAbsolute(commonDirectory)) throw new ReviewRepositoryError("Git common directory is not absolute");
 	let canonicalCommonDirectory: string;
 	try {
 		canonicalCommonDirectory = realpathSync(commonDirectory);
