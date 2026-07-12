@@ -49,7 +49,7 @@ import {
 } from "../lib/sdd-status.ts";
 import type { TriggerEvent } from "../lib/review-triggers.ts";
 import { ReviewBundleExporter, ReviewBundleImporter } from "../lib/review-bundle.ts";
-import { domainHashV1 } from "../lib/review-canonical.ts";
+import { canonicalJsonV1, domainHashV1 } from "../lib/review-canonical.ts";
 import { inspectLegacyReviewAuthorityV1, type LegacyInspectionV1 } from "../lib/review-legacy-detector.ts";
 import { compactResetRequestV1, destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
 import { ReviewMutationLockV1 } from "../lib/review-lock.ts";
@@ -62,6 +62,18 @@ import {
 	startCompactReview,
 } from "../lib/review-facade.ts";
 import { validateCompactReviewGate } from "../lib/review-compact-gate.ts";
+import {
+	assertLiveRecoveredSourceBindingV1,
+	assertLiveRecoveredSuccessorBindingV1,
+	createSupersessionEnvelopeV1,
+	hasEligibleGraphV1RecoveryAuthorityV1,
+	inspectApprovedCompactSuccessorV1,
+	inspectRecoverableGraphSourceV1,
+	prepareSupersessionV1,
+	resolveReviewAuthorityForChange,
+	SupersessionStoreV1,
+	type PrepareSupersessionInputV1,
+} from "../lib/review-authority-supersession.ts";
 import {
 	COMPACT_AUTHORITY_OUTCOME,
 	compactV2LineageExists,
@@ -2086,6 +2098,8 @@ const REVIEW_CONTROLLER_OPERATION = {
 	RESET: "reset",
 	RECOVER: "recover",
 	RECOVER_LOCK: "recover-lock",
+	PREPARE_SUPERSESSION: "prepare-supersession",
+	SUPERSEDE: "supersede",
 	REPAIR: "repair",
 } as const;
 
@@ -2105,6 +2119,10 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 		lineageId: {
 			type: "string",
 			description: "Bounded review lineage identifier. A failed start creates no lineage; do not use it with status or advance.",
+		},
+		changeName: {
+			type: "string",
+			description: "Canonical OpenSpec change name required to resolve a recovered authority during lifecycle validate.",
 		},
 		idempotencyKey: {
 			type: "string",
@@ -2132,6 +2150,7 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 interface ReviewControllerParameters {
 	operation: ReviewControllerOperation;
 	lineageId?: string;
+	changeName?: string;
 	idempotencyKey?: string;
 	transition?: string;
 	command?: string;
@@ -2141,6 +2160,16 @@ interface ReviewControllerParameters {
 	operationId?: string;
 	lineageIds?: string;
 	acknowledgeUntrustedBundleSource?: string;
+}
+
+interface SupersessionControllerInput {
+	changeName: string;
+	sourceLineageId: string;
+	successorLineageId: string;
+	operationId: string;
+	prepared: PrepareSupersessionInputV1;
+	challenge?: string;
+	request_hash?: string;
 }
 
 interface ReviewControllerStartInput {
@@ -2208,7 +2237,7 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 	// VALIDATE defers its lineage requirement to execution time: the proven
 	// release-from-protected-main fast path needs no receipt lineage, while
 	// every other validation still requires one before receipt validation.
-	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.FINALIZE, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.REPAIR, REVIEW_CONTROLLER_OPERATION.VALIDATE].includes(value.operation as ReviewControllerOperation);
+	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.FINALIZE, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.PREPARE_SUPERSESSION, REVIEW_CONTROLLER_OPERATION.SUPERSEDE, REVIEW_CONTROLLER_OPERATION.REPAIR, REVIEW_CONTROLLER_OPERATION.VALIDATE].includes(value.operation as ReviewControllerOperation);
 	if (needsLineage && (typeof value.lineageId !== "string" || value.lineageId.trim().length === 0)) {
 		throw new Error("Review controller requires a lineageId");
 	}
@@ -2216,7 +2245,7 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 		operation: value.operation,
 		...(typeof value.lineageId === "string" ? { lineageId: value.lineageId } : {}),
 	};
-	for (const key of ["idempotencyKey", "transition", "command", "input", "outputPath", "inputPath", "operationId", "lineageIds", "acknowledgeUntrustedBundleSource"] as const) {
+	for (const key of ["changeName", "idempotencyKey", "transition", "command", "input", "outputPath", "inputPath", "operationId", "lineageIds", "acknowledgeUntrustedBundleSource"] as const) {
 		const optional = value[key];
 		if (optional !== undefined && typeof optional !== "string") {
 			if (value.operation === REVIEW_CONTROLLER_OPERATION.START && key === "input") {
@@ -2270,6 +2299,41 @@ function parseControllerJson(input: string, operation: ReviewControllerOperation
 	}
 	if (!isRecord(value)) throw new Error(`Review controller ${operation} input must be a JSON object`);
 	return value;
+}
+
+function parseSupersessionControllerInput(value: Record<string, unknown>): SupersessionControllerInput {
+	for (const key of ["changeName", "sourceLineageId", "successorLineageId", "operationId"] as const) {
+		if (typeof value[key] !== "string" || value[key].trim().length === 0) throw new Error(`Review controller supersession requires ${key}`);
+	}
+	if (!isRecord(value.prepared)) throw new Error("Review controller supersession requires the exact prepared request input");
+	return {
+		changeName: value.changeName as string,
+		sourceLineageId: value.sourceLineageId as string,
+		successorLineageId: value.successorLineageId as string,
+		operationId: value.operationId as string,
+		prepared: value.prepared as unknown as PrepareSupersessionInputV1,
+		...(typeof value.challenge === "string" ? { challenge: value.challenge } : {}),
+		...(typeof value.request_hash === "string" ? { request_hash: value.request_hash } : {}),
+	};
+}
+
+function assertSupersessionControllerIdentity(
+	input: SupersessionControllerInput,
+	prepared: ReturnType<typeof prepareSupersessionV1>,
+): void {
+	if (
+		input.operationId !== prepared.body.operation_id ||
+		input.changeName !== prepared.body.change.change_name ||
+		input.sourceLineageId !== prepared.body.source.lineage_id ||
+		input.successorLineageId !== prepared.body.successor.lineage_id ||
+		canonicalJsonV1(input.prepared) !== canonicalJsonV1({
+			operation_id: prepared.body.operation_id,
+			eligibility: input.prepared.eligibility,
+			equivalence: input.prepared.equivalence,
+			...(input.prepared.predecessor_recovery_id === undefined ? {} : { predecessor_recovery_id: input.prepared.predecessor_recovery_id }),
+			...(input.prepared.sequence === undefined ? {} : { sequence: input.prepared.sequence }),
+		})
+	) throw new Error("Review controller supersession identity does not exactly match the prepared request");
 }
 
 function durableResetRecoveryRequest(cwd: string): LegacyInspectionV1["reset_request"] {
@@ -2375,31 +2439,29 @@ async function authorizeDestructiveReviewOperation(
 	ctx: ExtensionContext,
 ): Promise<void> {
 	const parameters = parseReviewControllerParameters(parametersValue);
-	if (
-		parameters.operation !== REVIEW_CONTROLLER_OPERATION.RESET &&
-		parameters.operation !== REVIEW_CONTROLLER_OPERATION.RECOVER
-	) return;
+	const isReset = parameters.operation === REVIEW_CONTROLLER_OPERATION.RESET || parameters.operation === REVIEW_CONTROLLER_OPERATION.RECOVER;
+	const isSupersession = parameters.operation === REVIEW_CONTROLLER_OPERATION.SUPERSEDE;
+	if (!isReset && !isSupersession) return;
 	const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
-	for (const key of ["repositoryId", "commonDirHash", "inventoryHash", "confirmation"] as const) {
-		if (typeof input[key] !== "string" || input[key].length === 0) {
-			throw new Error(`Review controller ${parameters.operation} requires an exact string ${key}`);
+	const challengeKey = isSupersession ? "challenge" : "confirmation";
+	if (isReset) {
+		for (const key of ["repositoryId", "commonDirHash", "inventoryHash"] as const) {
+			if (typeof input[key] !== "string" || input[key].length === 0) throw new Error(`Review controller ${parameters.operation} requires an exact string ${key}`);
 		}
+	}
+	if (typeof input[challengeKey] !== "string" || input[challengeKey].length === 0) {
+		throw new Error(`Review controller ${parameters.operation} requires an exact string ${challengeKey}`);
 	}
 	if (!ctx.hasUI) {
 		throw new Error(`Review controller ${parameters.operation.toUpperCase()} requires fresh explicit authorization through the interactive Pi UI; headless execution fails closed`);
 	}
 	const approved = await ctx.ui.confirm(
-		`Authorize destructive review authority ${parameters.operation.toUpperCase()}?`,
-		[
-			`Operation: ${parameters.operation.toUpperCase()}`,
-			`Repository: ${input.repositoryId}`,
-			`Exact challenge: ${input.confirmation}`,
-			"This invalidates all prior review authority for this repository.",
-		].join("\n"),
+		isSupersession ? "Authorize review authority SUPERSESSION?" : `Authorize destructive review authority ${parameters.operation.toUpperCase()}?`,
+		isSupersession
+			? ["Operation: SUPERSEDE", `Exact challenge: ${input.challenge}`, "This preserves graph-v1 history and activates only the exact compact-v2 successor."].join("\n")
+			: [`Operation: ${parameters.operation.toUpperCase()}`, `Repository: ${input.repositoryId}`, `Exact challenge: ${input.confirmation}`, "This invalidates all prior review authority for this repository."].join("\n"),
 	);
-	if (!approved) {
-		throw new Error(`Review controller ${parameters.operation.toUpperCase()} was not explicitly authorized`);
-	}
+	if (!approved) throw new Error(`Review controller ${parameters.operation.toUpperCase()} was not explicitly authorized`);
 }
 
 function parseReviewBudget(value: unknown, label: string): ReviewBudgetV1 {
@@ -3113,6 +3175,45 @@ function executeReviewControllerOperation(
 		// operator-attested trust decision (see lib/review-bundle.ts import gate).
 		return { operation: parameters.operation, result: new ReviewBundleImporter(defaultCwd).import({ inputPath: requiredControllerString(parameters, "inputPath"), operationId: requiredControllerString(parameters, "operationId"), acknowledgeUntrustedBundleSource: parameters.acknowledgeUntrustedBundleSource === "true" }) };
 	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.PREPARE_SUPERSESSION) {
+		const input = parseSupersessionControllerInput(parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation));
+		const prepared = prepareSupersessionV1(input.prepared);
+		assertSupersessionControllerIdentity(input, prepared);
+		return { operation: parameters.operation, change_name: input.changeName, request_hash: prepared.request_hash, challenge: prepared.challenge, body: prepared.body };
+	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.SUPERSEDE) {
+		const input = parseSupersessionControllerInput(parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation));
+		if (typeof input.challenge !== "string" || typeof input.request_hash !== "string") throw new Error("Review controller SUPERSEDE requires the exact prepared request_hash and challenge");
+		const prepared = prepareSupersessionV1(input.prepared);
+		assertSupersessionControllerIdentity(input, prepared);
+		if (input.request_hash !== prepared.request_hash || input.challenge !== prepared.challenge) throw new Error("Review controller SUPERSEDE prepared request and challenge must exactly match the fresh authorization");
+		const body = { ...prepared.body, authorization_hash: domainHashV1("review-authority-supersession-authorization", { challenge: prepared.challenge, request_hash: prepared.request_hash }) };
+		const envelope = createSupersessionEnvelopeV1(body);
+		const installed = SupersessionStoreV1.forRepository(defaultCwd).install(input.changeName, envelope, {
+			casChecks: [
+				{
+					label: "graph source",
+					expected: canonicalJsonV1(prepared.body.source),
+					observe: () => {
+						assertLiveRecoveredSourceBindingV1(defaultCwd, envelope);
+						return canonicalJsonV1(inspectRecoverableGraphSourceV1(defaultCwd, input.changeName, input.sourceLineageId).source);
+					},
+				},
+				{
+					label: "compact successor",
+					expected: canonicalJsonV1(prepared.body.successor),
+					observe: () => {
+						const successor = inspectApprovedCompactSuccessorV1(defaultCwd, input.successorLineageId);
+						assertLiveRecoveredSuccessorBindingV1(defaultCwd, envelope, discoverCompactReview(defaultCwd, input.successorLineageId, true).record.state);
+						return canonicalJsonV1(successor);
+					},
+				},
+			],
+		});
+		const active = resolveReviewAuthorityForChange(defaultCwd, input.changeName);
+		if (!active || active.recovery.recovery_id !== installed.recovery_id) throw new Error("Review controller SUPERSEDE did not produce one validated active authority");
+		return { operation: parameters.operation, change_name: input.changeName, recovery_id: installed.recovery_id, active_authority_id: active.record.state.lineage_id, next_action: "validate-recovered-authority" };
+	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.INSPECT) {
 		const authority = resolveRepositoryAuthorityV1(defaultCwd);
 		const lock = new ReviewMutationLockV1(join(authority.store_root, "control"), authority.repository_id, authority.authority_id);
@@ -3450,13 +3551,30 @@ function executeReviewControllerOperation(
 			};
 		}
 	}
-	let compact = false;
-	if (typeof parameters.lineageId === "string" && parameters.lineageId.trim().length > 0) {
+	if (
+		parameters.changeName === undefined &&
+		(parameters.lineageId === undefined || !graphV1LineageExists(derived.command.cwd, parameters.lineageId)) &&
+		hasEligibleGraphV1RecoveryAuthorityV1(derived.command.cwd)
+	) {
+		throw new Error("Review controller validate requires changeName and a valid supersession for eligible graph-v1 recovery authority");
+	}
+	const recoveredAuthority = parameters.changeName === undefined
+		? undefined
+		: resolveReviewAuthorityForChange(derived.command.cwd, parameters.changeName);
+	if (
+		recoveredAuthority !== undefined &&
+		parameters.lineageId !== undefined &&
+		parameters.lineageId !== recoveredAuthority.record.state.lineage_id
+	) {
+		throw new Error("Review controller validate lineageId does not match the change-scoped recovered authority");
+	}
+	let compact = recoveredAuthority !== undefined;
+	if (!compact && typeof parameters.lineageId === "string" && parameters.lineageId.trim().length > 0) {
 		const compactExists = compactV2LineageExists(derived.command.cwd, parameters.lineageId);
 		const graphExists = graphV1LineageExists(derived.command.cwd, parameters.lineageId);
 		if (compactExists && graphExists) throw new Error("Review authority is ambiguous across graph-v1 and compact-v2");
 		compact = compactExists;
-	} else {
+	} else if (!compact) {
 		try {
 			discoverCompactReview(derived.command.cwd, undefined, true);
 			compact = true;
@@ -3468,6 +3586,7 @@ function executeReviewControllerOperation(
 		const result = validateCompactReviewGate({
 			cwd: derived.command.cwd,
 			...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
+			...(parameters.changeName === undefined ? {} : { changeName: parameters.changeName }),
 			deriveTarget: () => {
 				const rederived = deriveReviewGateTarget(commandValue, defaultCwd);
 				if (rederived.command.cwd !== derived.command.cwd) throw new Error("Lifecycle command repository changed during compact validation");
@@ -3614,7 +3733,43 @@ export const __testing = {
 	renderSddModelPanel: renderSddModelPanelForTesting,
 	getOrchestratorPrompt,
 	renderOrchestratorPrompt,
+	resolveControllerSddStatus,
 };
+
+function resolveControllerSddStatus(
+	cwd: string,
+	changeName: string | undefined,
+	includeInstructions: boolean,
+	artifactStore: SddPreflightPreferences["artifactStore"] | undefined,
+) {
+	const base = resolveSddStatus({ cwd, changeName, includeInstructions, artifactStore });
+	if (!base.changeName || !hasRecoveryObligationForChange(cwd, base.changeName)) return base;
+	return resolveSddStatus({
+		cwd,
+		changeName: base.changeName,
+		includeInstructions,
+		artifactStore,
+		reviewAuthority: {
+			expected: true,
+			resolve: () => {
+				const active = resolveReviewAuthorityForChange(cwd, base.changeName!);
+				if (!active) throw new Error("validated recovered review authority is missing");
+				return { activeAuthorityId: active.record.state.lineage_id };
+			},
+		},
+	});
+}
+
+function hasRecoveryObligationForChange(cwd: string, changeName: string): boolean {
+	try {
+		return SupersessionStoreV1.forRepository(cwd).hasRecoveryRequiredMarker(changeName) || hasEligibleGraphV1RecoveryAuthorityV1(cwd);
+	} catch (error) {
+		// A non-repository cannot have repository-anchored recovery authority.
+		if (error instanceof Error && error.message === "Unable to resolve Git repository authority") return false;
+		// An unreadable marker, store, or Git authority is recovery-required, never absent.
+		return true;
+	}
+}
 
 export default function gentleAi(pi: ExtensionAPI): void {
 	const pendingReviewAuthorizations = new Map<string, PendingReviewAuthorization>();
@@ -3623,10 +3778,11 @@ export default function gentleAi(pi: ExtensionAPI): void {
 		name: "gentle_review",
 		label: "Gentle Review Controller",
 		description:
-			"Inspect and recover review authority, run new ordinary review through compact start/finalize/validate, preserve graph-v1 Judgment Day and compatibility reads, and authorize one exact lifecycle command. RESET and RECOVER require fresh interactive authorization and fail closed headlessly.",
+			"Inspect and recover review authority, run new ordinary review through compact start/finalize/validate, preserve graph-v1 Judgment Day and compatibility reads, and authorize one exact lifecycle command. RESET/RECOVER remain destructive; prepare-supersession/supersede require fresh interactive authorization and fail closed headlessly.",
 		promptSnippet: "Inspect authority, then use compact start/finalize/validate for ordinary review; use graph-v1 only for explicit Judgment Day",
 		promptGuidelines: [
 			'Call {"operation":"inspect"} before START. Ordinary START uses a JSON string such as "{\\"mode\\":\\"ordinary\\",\\"policyHash\\":\\"<hash>\\"}"; the controller derives lineage, Git/untracked scope, tier, lenses, authored lines, and budget.',
+			"For non-destructive legacy recovery, call prepare-supersession with one exact change, source, successor, operation, and prepared evidence input. Call supersede only with the returned request hash and exact English challenge after fresh UI approval; it never falls back to RESET or RECOVER. Headless, stale, conflicting, malformed, or unsupported recovery remains resolve-review blocked; exact retries are idempotent, but semantic retries require a new operation.",
 			"Run selected lenses once, then call FINALIZE with causal result JSON. FINALIZE alone records correction forecast, Git-derived correction evidence, targeted validation, and final evidence. Use ADVANCE only for explicit graph-v1 Judgment Day.",
 			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization for the exact reset_request challenge, then call RESET or RECOVER only after authorization. RESET and RECOVER internally INSPECT authority; require their verified clean result and next_action start-fresh-ordinary-review-after-verified-clean before continuing directly to a fresh ordinary START.",
 			"A reported lineage_created false or pre-authority validation error proves no lineage was created. After ambiguous START or FINALIZE output, replay the exact operation so compact CAS returns the committed revision or rejects a stale/semantic retry.",
@@ -3708,11 +3864,12 @@ export default function gentleAi(pi: ExtensionAPI): void {
 				: "";
 		const phase = isSddAgent ? sddPhaseFromAgentStartEvent(event) : undefined;
 		const nativeStatusPrompt = phase
-			? `\n\n${renderNativeSddPhasePrompt(resolveSddStatus({
-				cwd: ctx.cwd,
-				includeInstructions: true,
-				artifactStore: prefs?.artifactStore,
-			}), phase)}`
+			? `\n\n${renderNativeSddPhasePrompt(resolveControllerSddStatus(
+				ctx.cwd,
+				undefined,
+				true,
+				prefs?.artifactStore,
+			), phase)}`
 			: "";
 		const gentlePrompt = isNamedAgent || isSddAgent
 			? ""
@@ -3761,12 +3918,12 @@ export default function gentleAi(pi: ExtensionAPI): void {
 
 	const handleSddStatusCommand = (args: string, ctx: ExtensionContext) => {
 		const parsed = parseSddStatusCommandArgs(args);
-		const status = resolveSddStatus({
-			cwd: ctx.cwd,
-			changeName: parsed.changeName,
-			includeInstructions: true,
-			artifactStore: getSddPreflightPreferences(ctx)?.artifactStore,
-		});
+		const status = resolveControllerSddStatus(
+			ctx.cwd,
+			parsed.changeName,
+			true,
+			getSddPreflightPreferences(ctx)?.artifactStore,
+		);
 		ctx.ui.notify(
 			parsed.json ? JSON.stringify(status, null, 2) : renderSddStatusMarkdown(status),
 			sddStatusSeverity(status),
@@ -3782,12 +3939,12 @@ export default function gentleAi(pi: ExtensionAPI): void {
 
 	const handleSddContinueCommand = (args: string, ctx: ExtensionContext) => {
 		const parsed = parseSddStatusCommandArgs(args);
-		const status = resolveSddStatus({
-			cwd: ctx.cwd,
-			changeName: parsed.changeName,
-			includeInstructions: true,
-			artifactStore: getSddPreflightPreferences(ctx)?.artifactStore,
-		});
+		const status = resolveControllerSddStatus(
+			ctx.cwd,
+			parsed.changeName,
+			true,
+			getSddPreflightPreferences(ctx)?.artifactStore,
+		);
 		ctx.ui.notify(
 			parsed.json ? JSON.stringify(status, null, 2) : renderSddDispatcherMarkdown(status),
 			sddStatusSeverity(status),

@@ -9,6 +9,7 @@ import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { stripAnsi } from "../lib/terminal-theme.ts";
+import { domainHashV1 } from "../lib/review-canonical.ts";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const EXTENSIONS = [
@@ -210,6 +211,11 @@ async function run() {
 		assert.ok(tools.has(toolName), `missing quiet built-in tool renderer ${toolName}`);
 	}
 	assert.ok(tools.has("gentle_review"), "missing registered bounded review controller tool");
+	assert.deepEqual(
+		tools.get("gentle_review").parameters.properties.operation.enum.filter((operation) => operation.includes("supersession") || operation === "supersede"),
+		["prepare-supersession", "supersede"],
+		"runtime controller must expose explicit supersession operations",
+	);
 
 	for (const entry of await readdir(join(ROOT, "assets", "agents"))) {
 		if (!entry.endsWith(".md")) continue;
@@ -333,6 +339,18 @@ async function run() {
 		await commands.get("sdd-continue").handler("status-demo", continueCtx);
 		assert.match(continueCtx.ui.notifications.at(-1).message, /Native SDD Dispatcher/);
 		assert.match(continueCtx.ui.notifications.at(-1).message, /nextPhase: sdd-apply/);
+		const { execFileSync } = await import("node:child_process");
+		execFileSync("git", ["init"], { cwd: promptCwd, stdio: "ignore" });
+		const recoveryRequiredDirectory = join(promptCwd, ".git", "gentle-ai", "reviews", "control", "recovery-required-v1");
+		await mkdir(recoveryRequiredDirectory, { recursive: true });
+		await writeFile(
+			join(recoveryRequiredDirectory, `${domainHashV1("openspec-change-name", "status-demo")}.json`),
+			'{"schema":"gentle-ai.recovery-required/v1","change_name":"status-demo"}',
+		);
+		const blockedContinueCtx = createCtx(promptCwd, true);
+		await commands.get("sdd-continue").handler("status-demo", blockedContinueCtx);
+		assert.match(blockedContinueCtx.ui.notifications.at(-1).message, /resolve-review:/);
+		assert.match(blockedContinueCtx.ui.notifications.at(-1).message, /nextPhase: resolve-review/);
 	} finally {
 		await rm(promptCwd, { recursive: true, force: true });
 	}

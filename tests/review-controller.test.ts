@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,7 +9,7 @@ import type {
 	ExtensionContext,
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
-import gentleAi from "../extensions/gentle-ai.ts";
+import gentleAi, { __testing } from "../extensions/gentle-ai.ts";
 import {
 	REVIEW_MODE,
 	REVIEW_TRANSITION,
@@ -21,7 +21,13 @@ import {
 } from "../lib/review-transaction.ts";
 import { ordinaryValidatorRequest } from "../lib/review-policy-ordinary.ts";
 import { discoverCompactReview, startCompactReview } from "../lib/review-facade.ts";
-import { domainHashV1 } from "../lib/review-canonical.ts";
+import { canonicalJsonV1, domainHashV1 } from "../lib/review-canonical.ts";
+import {
+	inspectApprovedCompactSuccessorV1,
+	inspectRecoverableGraphSourceV1,
+	resolveReviewAuthorityForChange,
+	SupersessionStoreV1,
+} from "../lib/review-authority-supersession.ts";
 import { destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
 import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
 import { qualifiedReviewLockPlatform, testSnapshot } from "./review-test-fixtures.ts";
@@ -273,6 +279,7 @@ function createTerminalAuthority(fixture: RepositoryFixture, lineageId: string):
 			snapshot: testSnapshot({
 				baseTree: fixture.baseTree,
 				completeTree: fixture.finalTree,
+				genesisPaths: ["app.ts"],
 				route: REVIEW_ROUTE.STANDARD,
 				lenses: [REVIEW_LENS.READABILITY],
 			}),
@@ -294,6 +301,219 @@ function createTerminalAuthority(fixture: RepositoryFixture, lineageId: string):
 		});
 	}
 }
+
+function recoveryEvidence(
+	state: ReturnType<typeof discoverCompactReview>["record"]["state"],
+	receiptHash: string,
+	ledgerHash: string,
+) {
+	return {
+		base_tree: domainHashV1("review-recovery-tree", state.initial_snapshot.base_tree),
+		complete_snapshot_tree: domainHashV1("review-recovery-tree", state.initial_snapshot.complete_snapshot_tree),
+		initial_review_tree: domainHashV1("review-recovery-tree", state.initial_snapshot.initial_review_tree),
+		final_candidate_tree: domainHashV1("review-recovery-tree", state.current_candidate_tree),
+		review_projection_hash: domainHashV1("review-recovery-projection", state.initial_snapshot.review_projection),
+		genesis_paths_hash: domainHashV1("compact-paths", state.genesis_paths),
+		scope_digest: domainHashV1("review-recovery-scope", {
+			base_tree: state.initial_snapshot.base_tree,
+			complete_snapshot_tree: state.initial_snapshot.complete_snapshot_tree,
+			initial_review_tree: state.initial_snapshot.initial_review_tree,
+			final_candidate_tree: state.current_candidate_tree,
+			genesis_paths: state.genesis_paths,
+			intended_untracked: state.intended_untracked,
+		}),
+		intended_untracked_hash: domainHashV1("compact-untracked", state.intended_untracked),
+		intended_untracked_proof_hash: domainHashV1("review-recovery-empty-untracked", { candidate_tree: state.current_candidate_tree, paths: [] }),
+		policy_hash: state.policy_hash,
+		policy_evidence_hash: domainHashV1("review-recovery-policy-evidence", { policy_hash: state.policy_hash, runtime_identity_hash: state.runtime_identity.identity_hash }),
+		receipt_hash: receiptHash,
+		ledger_hash: ledgerHash,
+	};
+}
+
+function recoveryEquivalence(
+	source: ReturnType<typeof inspectRecoverableGraphSourceV1>,
+	successor: ReturnType<typeof inspectApprovedCompactSuccessorV1>,
+	state: ReturnType<typeof discoverCompactReview>["record"]["state"],
+) {
+	return {
+		repository: source.repository,
+		change: source.change,
+		source: source.source,
+		successor,
+		source_evidence: recoveryEvidence(state, source.source.receipt_hash, source.source.frozen_ledger_hash),
+		successor_evidence: recoveryEvidence(state, successor.receipt_hash, successor.ledger_hash),
+	};
+}
+
+test("controller publicly installs a supersession and exactly replays it with fresh approval", async (t) => {
+	const fixture = createRepository(t, false);
+	writeFileSync(join(fixture.repository, "app.ts"), "export const value = 2;\n");
+	git(fixture.repository, "add", "app.ts");
+	fixture.finalTree = git(fixture.repository, "write-tree");
+	const sourceLineageId = "graph-v1-source";
+	const successorLineageId = "compact-v2-successor";
+	const changeName = "recover-legacy-review-authority";
+	mkdirSync(join(fixture.repository, "openspec", "changes", changeName), { recursive: true });
+	createTerminalAuthority(fixture, sourceLineageId);
+	const { controller, toolCall } = registerRuntime();
+	await approveTrackedWorktreeTransaction(controller, extensionContext(fixture.repository), successorLineageId);
+	const source = inspectRecoverableGraphSourceV1(fixture.repository, changeName, sourceLineageId);
+	const successor = inspectApprovedCompactSuccessorV1(fixture.repository, successorLineageId);
+	const preparedInput = {
+		operation_id: domainHashV1("controller-positive-supersession", { changeName, sourceLineageId, successorLineageId }),
+		eligibility: source,
+		equivalence: recoveryEquivalence(source, successor, discoverCompactReview(fixture.repository, successorLineageId).record.state),
+	};
+	const prepareParameters = {
+		operation: "prepare-supersession",
+		input: JSON.stringify({ changeName, sourceLineageId, successorLineageId, operationId: preparedInput.operation_id, prepared: preparedInput }),
+	};
+	const prepared = await controllerCall(controller, extensionContext(fixture.repository), prepareParameters);
+	assert.equal(prepared.operation, "prepare-supersession");
+	assert.equal(typeof prepared.request_hash, "string");
+	assert.equal(typeof prepared.challenge, "string");
+	assert.equal((prepared.body as { request_hash: string }).request_hash, prepared.request_hash);
+	const supersedeParameters = {
+		operation: "supersede",
+		input: JSON.stringify({ changeName, sourceLineageId, successorLineageId, operationId: preparedInput.operation_id, prepared: preparedInput, request_hash: prepared.request_hash, challenge: prepared.challenge }),
+	};
+	let approvals = 0;
+	const approvingContext = () => extensionContext(fixture.repository, true, async (title, message) => {
+		approvals += 1;
+		assert.equal(title, "Authorize review authority SUPERSESSION?");
+		assert.ok(message.includes(`Exact challenge: ${prepared.challenge}`));
+		return true;
+	});
+	const installed = await controllerCall(controller, approvingContext(), supersedeParameters);
+	assert.equal(installed.operation, "supersede");
+	assert.equal(installed.active_authority_id, successorLineageId);
+	const recoveryId = installed.recovery_id as string;
+	const store = SupersessionStoreV1.forRepository(fixture.repository);
+	const chain = store.load(changeName);
+	assert.deepEqual(chain.map((record) => record.recovery_id), [recoveryId]);
+	const durableBytes = canonicalJsonV1(chain[0]!);
+	assert.equal(resolveReviewAuthorityForChange(fixture.repository, changeName)?.record.state.lineage_id, successorLineageId);
+
+	const command = "git commit -am recovered";
+	await assert.rejects(
+		controller.execute("missing-recovered-change", {
+			operation: "validate",
+			idempotencyKey: "missing-recovered-change",
+			command,
+			input: JSON.stringify({ scopeBudget: budget() }),
+		}, undefined, undefined, extensionContext(fixture.repository)),
+		/requires changeName and a valid supersession/i,
+	);
+	await assert.rejects(
+		controller.execute("incorrect-recovered-change", {
+			operation: "validate",
+			changeName: "incorrect-recovered-change",
+			idempotencyKey: "incorrect-recovered-change",
+			command,
+			input: JSON.stringify({ scopeBudget: budget() }),
+		}, undefined, undefined, extensionContext(fixture.repository)),
+		/recovery-required authority has no bound supersession record/i,
+	);
+	const validated = await controllerCall(controller, extensionContext(fixture.repository), {
+		operation: "validate",
+		changeName,
+		idempotencyKey: "validated-recovered-change",
+		command,
+		input: JSON.stringify({ scopeBudget: budget() }),
+	});
+	const validationResult = validated.result as Record<string, unknown>;
+	assert.equal(validationResult.status, "allow", JSON.stringify(validated));
+	assert.equal(validationResult.receipt_hash, successor.receipt_hash);
+	assert.equal(await toolCall({ toolName: "bash", input: { command } }, extensionContext(fixture.repository)), undefined);
+
+	const replayed = await controllerCall(controller, approvingContext(), supersedeParameters);
+	assert.deepEqual(replayed, installed);
+	assert.equal(approvals, 2);
+	assert.deepEqual(store.load(changeName).map((record) => record.recovery_id), [recoveryId]);
+	assert.equal(canonicalJsonV1(store.load(changeName)[0]!), durableBytes);
+
+	const changeRoot = join(fixture.repository, "openspec", "changes", changeName);
+	mkdirSync(join(changeRoot, "specs", "review"), { recursive: true });
+	writeFileSync(join(changeRoot, "proposal.md"), "# Proposal\n");
+	writeFileSync(join(changeRoot, "specs", "review", "spec.md"), "# Spec\n");
+	writeFileSync(join(changeRoot, "design.md"), "# Design\n");
+	writeFileSync(join(changeRoot, "tasks.md"), "- [x] 1.1 Done\n");
+	writeFileSync(join(changeRoot, "verify-report.md"), "PASS\n");
+	writeFileSync(join(changeRoot, "sync-report.md"), "PASS\n");
+	unlinkSync(join(store.root, "recovery-required-v1", `${domainHashV1("openspec-change-name", changeName)}.json`));
+	const status = __testing.resolveControllerSddStatus(fixture.repository, changeName, false, "openspec");
+	assert.equal(status.dependencies.archive, "blocked");
+	assert.equal(status.nextRecommended, "resolve-review");
+});
+
+test("controller SDD status treats removed OpenSpec recovery authority and deleted marker as blocking", (t) => {
+	const fixture = createRepository(t, false);
+	const changeName = "recover-legacy-review-authority";
+	const changeRoot = join(fixture.repository, "openspec", "changes", changeName);
+	mkdirSync(changeRoot, { recursive: true });
+	writeFileSync(join(fixture.repository, "app.ts"), "export const value = 2;\n");
+	git(fixture.repository, "add", "app.ts");
+	fixture.finalTree = git(fixture.repository, "write-tree");
+	createTerminalAuthority(fixture, "archived-graph-source");
+	const store = SupersessionStoreV1.forRepository(fixture.repository);
+	const marker = join(store.root, "recovery-required-v1", `${domainHashV1("openspec-change-name", changeName)}.json`);
+	mkdirSync(join(store.root, "recovery-required-v1"), { recursive: true });
+	writeFileSync(marker, "recovery-required");
+	rmSync(changeRoot, { recursive: true, force: true });
+	unlinkSync(marker);
+
+	const status = __testing.resolveControllerSddStatus(fixture.repository, changeName, false, "openspec");
+
+	assert.equal(status.dependencies.archive, "blocked");
+	assert.equal(status.nextRecommended, "resolve-review");
+	assert.match(status.blockedReasons.join("\n"), /recovery|required|graph/i);
+});
+
+test("controller SDD status blocks archive for a recovery-required marker without a supersession record", (t) => {
+	const fixture = createRepository(t, false);
+	const changeName = "recover-legacy-review-authority";
+	const changeRoot = join(fixture.repository, "openspec", "changes", changeName);
+	mkdirSync(join(changeRoot, "specs", "review"), { recursive: true });
+	writeFileSync(join(changeRoot, "proposal.md"), "# Proposal\n");
+	writeFileSync(join(changeRoot, "specs", "review", "spec.md"), "# Spec\n");
+	writeFileSync(join(changeRoot, "design.md"), "# Design\n");
+	writeFileSync(join(changeRoot, "tasks.md"), "- [x] 1.1 Done\n");
+	writeFileSync(join(changeRoot, "verify-report.md"), "PASS\n");
+	writeFileSync(join(changeRoot, "sync-report.md"), "PASS\n");
+	const store = SupersessionStoreV1.forRepository(fixture.repository);
+	const markerDirectory = join(store.root, "recovery-required-v1");
+	mkdirSync(markerDirectory, { recursive: true });
+	writeFileSync(join(markerDirectory, `${domainHashV1("openspec-change-name", changeName)}.json`), "recovery-required");
+
+	const status = __testing.resolveControllerSddStatus(fixture.repository, changeName, false, "openspec");
+
+	assert.equal(status.dependencies.archive, "blocked");
+	assert.equal(status.nextRecommended, "resolve-review");
+	assert.match(status.blockedReasons.join("\n"), /recovery-required/i);
+});
+
+test("controller rejects headless or rejected supersession approval without creating recovery authority", async (t) => {
+	const fixture = createRepository(t, false);
+	const { controller } = registerRuntime();
+	const request = {
+		operation: "supersede",
+		input: JSON.stringify({
+			challenge: "SUPERSEDE REVIEW AUTHORITY test CHANGE recovery",
+			request_hash: "a".repeat(64),
+			prepared: {},
+		}),
+	};
+	await assert.rejects(
+		controller.execute("headless-supersession", request, undefined, undefined, extensionContext(fixture.repository)),
+		/interactive Pi UI.*fails closed/i,
+	);
+	await assert.rejects(
+		controller.execute("rejected-supersession", request, undefined, undefined, extensionContext(fixture.repository, true, async () => false)),
+		/not explicitly authorized/i,
+	);
+	assert.equal(existsSync(join(fixture.repository, ".git", "gentle-ai", "reviews", "control", "authority-supersession-v1")), false);
+});
 
 test("controller keeps graph-v1 ordinary mutation read-only while preserving repository-file input confinement", async (t) => {
 	const fixture = createRepository(t, false);

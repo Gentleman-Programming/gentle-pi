@@ -92,6 +92,55 @@ test("resolveSddStatus selects the only active change and counts task progress",
 	assert.match(status.instructions?.apply.join("\n") ?? "", /persisted task checkboxes/);
 });
 
+test("resolveSddStatus keeps planning-only changes read-only and blocks only an expected invalid review authority", async () => {
+	const cwd = await workspace();
+	const root = seedChange(cwd);
+	write(join(root, "tasks.md"), "# Tasks\n\n- [x] 1.1 Done\n");
+	write(join(root, "verify-report.md"), "# Verify\n\nPASS\n");
+	write(join(root, "sync-report.md"), "# Sync\n\nPASS\n");
+	let resolverCalls = 0;
+	const planning = resolveSddStatus({
+		cwd,
+		changeName: "add-auth",
+		reviewAuthority: {
+			expected: false,
+			resolve: () => {
+				resolverCalls += 1;
+				return { activeAuthorityId: "must-not-run" };
+			},
+		},
+	});
+	assert.equal(resolverCalls, 0);
+	assert.equal(planning.blockedReasons.some((reason) => reason.startsWith("resolve-review:")), false);
+
+	const invalid = resolveSddStatus({
+		cwd,
+		changeName: "add-auth",
+		reviewAuthority: {
+			expected: true,
+			resolve: () => {
+				throw new Error("stale compact successor");
+			},
+		},
+	});
+	assert.equal(invalid.applyState, "blocked");
+	assert.equal(invalid.dependencies.archive, "blocked");
+	assert.equal(invalid.nextRecommended, "resolve-review");
+	assert.match(invalid.blockedReasons.join("\n"), /^resolve-review: stale compact successor/m);
+
+	const valid = resolveSddStatus({
+		cwd,
+		changeName: "add-auth",
+		reviewAuthority: {
+			expected: true,
+			resolve: () => ({ activeAuthorityId: "validated-compact-authority" }),
+		},
+	});
+	assert.equal(valid.applyState, "all_done");
+	assert.equal(valid.dependencies.archive, "ready");
+	assert.equal(valid.blockedReasons.some((reason) => reason.startsWith("resolve-review:")), false);
+});
+
 test("resolveSddStatus marks apply all_done and verify ready when tasks are checked", async () => {
 	const cwd = await workspace();
 	const root = seedChange(cwd);

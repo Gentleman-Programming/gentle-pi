@@ -137,9 +137,15 @@ parent git/status + clarify → bind ordinary snapshot/route → one worker writ
 
 Review lenses are controller-selected transaction actors, not lifecycle hooks. `scout`/`context-builder` save parent context by compressing broad exploration. `worker` preserves a single writer thread. Commit, push, PR, and release validate receipts with zero actors.
 
-### Review-store migration safety
+### Review authority recovery and reset safety
 
-Legacy pre-graph authority is never migrated. `gentle_review inspect` reports an exact repository-bound destructive reset challenge; only that authorized reset can quarantine graph-v1 and compact-v2 authority, initialize an empty graph-v1 incarnation, and require fresh review. Interrupted resets remain blocked until explicit forward recovery. Existing graph-v1 ordinary lineages remain readable, gate-validatable, and exportable but are read-only; Judgment Day remains mutable on graph-v1.
+Legacy pre-graph authority is never migrated. `gentle_review inspect` reports an exact repository-bound destructive reset challenge; only that authorized RESET or RECOVER can quarantine graph-v1 and compact-v2 authority, initialize an empty graph-v1 incarnation, and require fresh review. Interrupted destructive recovery remains blocked until explicit forward recovery. Existing graph-v1 ordinary lineages remain readable, gate-validatable, and exportable but are read-only; Judgment Day remains mutable on graph-v1.
+
+A **non-destructive supersession** is available only for an eligible, immutable graph-v1 source and an independently approved compact-v2 successor with identical repository, change, target, scope, untracked, policy, ledger, and receipt bindings. First call `prepare-supersession`, review its exact English challenge, then call `supersede` only after fresh interactive approval. Headless approval, a changed challenge, a stale binding, unsupported data, or ambiguous authority fails closed and leaves the change `resolve-review` blocked.
+
+Supersession records are append-only under `authority-supersession-v1`; they do not rewrite graph-v1 history. An exact retry is idempotent. A divergent retry or conflict fails closed and requires a new operation. RESET/RECOVER stay destructive and never run as a fallback from supersession. Rollback can stop recognizing a record but does not delete it, re-enable graph-v1 mutation, or select another successor.
+
+Pre-commit, pre-push, pre-PR, and release gates revalidate the recovered source, successor, receipt, policy, scope, intended-untracked proof, and live target. Recovery does not grant a new budget or bypass dangerous-command authorization, publication checks, historical graph-v1 receipt validation, or graph export.
 
 `reviewer` is not an installed subagent name. It is a routing intent. Select the concrete lens by risk profile:
 
