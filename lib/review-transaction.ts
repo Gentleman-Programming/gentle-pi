@@ -2161,17 +2161,29 @@ function inspectPushTarget(
 			) {
 				return { valid: false, matchesReceipt: false, reason: "Push create destination ref already exists." };
 			}
-			const parentLine = runGateGit(repositoryCwd, ["rev-list", "--parents", "-n", "1", value.new_peeled_commit]);
-			const parents = parentLine.split(" ");
-			if (parents.length !== 2 || parents[0] !== value.new_peeled_commit || !isObjectId(parents[1])) {
-				return { valid: false, matchesReceipt: false, reason: "Push create requires exactly one resolved parent commit." };
-			}
-			const parent = parents[1]!;
-			if (runGateGit(repositoryCwd, ["rev-parse", "--verify", `${parent}^{tree}`]) !== receipt.body.base_tree) {
-				return { valid: false, matchesReceipt: false, reason: "Push create parent tree does not match the approved receipt base tree." };
-			}
-			if (!pushRemoteAdvertisesObjectV1(repositoryCwd, target.remote, target.destination_id, parent)) {
-				return { valid: false, matchesReceipt: false, reason: "Push create parent is not advertised by the bound publication destination." };
+			if (value.destination_ref.startsWith("refs/tags/")) {
+				if (!value.source_ref.startsWith("refs/tags/") || value.source_ref !== value.destination_ref) {
+					return { valid: false, matchesReceipt: false, reason: "Push tag create requires one exact matching tag source and destination ref." };
+				}
+				if (value.new_tree !== receipt.body.final_candidate_tree) {
+					return { valid: false, matchesReceipt: false, reason: "Push tag create tree does not match the approved receipt final candidate." };
+				}
+				if (!pushRemoteAdvertisesObjectV1(repositoryCwd, target.remote, target.destination_id, value.new_peeled_commit)) {
+					return { valid: false, matchesReceipt: false, reason: "Push tag create peeled commit is not advertised by the bound publication destination." };
+				}
+			} else {
+				const parentLine = runGateGit(repositoryCwd, ["rev-list", "--parents", "-n", "1", value.new_peeled_commit]);
+				const parents = parentLine.split(" ");
+				if (parents.length !== 2 || parents[0] !== value.new_peeled_commit || !isObjectId(parents[1])) {
+					return { valid: false, matchesReceipt: false, reason: "Push create requires exactly one resolved parent commit." };
+				}
+				const parent = parents[1]!;
+				if (runGateGit(repositoryCwd, ["rev-parse", "--verify", `${parent}^{tree}`]) !== receipt.body.base_tree) {
+					return { valid: false, matchesReceipt: false, reason: "Push create parent tree does not match the approved receipt base tree." };
+				}
+				if (!pushRemoteAdvertisesObjectV1(repositoryCwd, target.remote, target.destination_id, parent)) {
+					return { valid: false, matchesReceipt: false, reason: "Push create parent is not advertised by the bound publication destination." };
+				}
 			}
 		} else if (value.kind === PUSH_UPDATE_KIND.UPDATE) {
 			if (

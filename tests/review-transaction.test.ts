@@ -15,7 +15,10 @@ import test from "node:test";
 import { REVIEW_PROJECTION } from "../lib/review-snapshot.ts";
 import {
 	EVIDENCE_CLASS,
+	GATE_RESULT,
+	GATE_TARGET_KIND,
 	JOURNAL_STATUS,
+	PUSH_UPDATE_KIND,
 	REVIEW_MODE,
 	REVIEW_OPERATION,
 	REVIEW_PHASE,
@@ -29,6 +32,8 @@ import {
 	createFrozenLedger,
 	createReceiptEnvelope,
 	createReviewState,
+	evaluateGateTarget,
+	resolveConfiguredPushDestinationV1,
 	type CanonicalFrozenRowV1,
 	type ReceiptBodyV1,
 	type ReviewBudgetV1,
@@ -433,4 +438,120 @@ test("new ordinary lineages fail closed when immutable genesis paths are absent"
 		}),
 		/immutable genesis paths/i,
 	);
+});
+
+test("tag PUSH CREATE accepts an annotated tag for an approved commit advertised by the bound destination", (t) => {
+	const parent = mkdtempSync(join(tmpdir(), "gentle-pi-tag-gate-"));
+	const repository = join(parent, "repo");
+	const remote = join(parent, "remote.git");
+	mkdirSync(repository);
+	t.after(() => rmSync(parent, { recursive: true, force: true }));
+	const git = (...args: string[]): string =>
+		execFileSync("git", args, { cwd: repository, encoding: "utf8" }).trim();
+	git("init", "-b", "main");
+	writeFileSync(join(repository, "release.ts"), "export const release = 1;\n");
+	git("add", ".");
+	git("-c", "user.name=Gate", "-c", "user.email=gate@example.invalid", "commit", "-m", "release");
+	const commit = git("rev-parse", "HEAD");
+	const tree = git("rev-parse", "HEAD^{tree}");
+	execFileSync("git", ["clone", "--bare", repository, remote], { stdio: "ignore" });
+	git("remote", "add", "origin", remote);
+	git("-c", "user.name=Gate", "-c", "user.email=gate@example.invalid", "tag", "-a", "v1.0.0", "-m", "release", commit);
+	const tagObject = git("rev-parse", "refs/tags/v1.0.0^{object}");
+	const destination = resolveConfiguredPushDestinationV1(repository, "origin");
+	const receipt = createReceiptEnvelope({ ...receiptBody(), final_candidate_tree: tree });
+	const tagPush = (tag: string, object: string, peeledCommit: string, targetTree: string) => ({
+		kind: GATE_TARGET_KIND.PUSH,
+		remote: "origin",
+		destination_id: destination.destination_id,
+		updates: [{
+			kind: PUSH_UPDATE_KIND.CREATE,
+			source_ref: `refs/tags/${tag}`,
+			destination_ref: `refs/tags/${tag}`,
+			old_object: null,
+			old_peeled_commit: null,
+			old_tree: null,
+			new_object: object,
+			new_peeled_commit: peeledCommit,
+			new_tree: targetTree,
+		}],
+	} as const);
+	const annotated = evaluateGateTarget(receipt, tagPush("v1.0.0", tagObject, commit, tree), repository);
+	assert.equal(annotated.status, GATE_RESULT.ALLOW, annotated.reason);
+
+	git("tag", "v1.0.1", commit);
+	const lightweightTarget = tagPush("v1.0.1", commit, commit, tree);
+	const lightweight = evaluateGateTarget(receipt, lightweightTarget, repository);
+	assert.equal(lightweight.status, GATE_RESULT.ALLOW, lightweight.reason);
+	const remapped = evaluateGateTarget(
+		receipt,
+		{
+			...lightweightTarget,
+			updates: [{
+				...lightweightTarget.updates[0],
+				destination_ref: "refs/tags/remapped",
+			}],
+		},
+		repository,
+	);
+	assert.equal(remapped.status, GATE_RESULT.DENY, remapped.reason);
+	assert.match(remapped.reason, /matching tag source and destination/i);
+
+	git("-c", "user.name=Gate", "-c", "user.email=gate@example.invalid", "commit", "--allow-empty", "-m", "unadvertised");
+	const unadvertisedCommit = git("rev-parse", "HEAD");
+	git("tag", "v1.0.2", unadvertisedCommit);
+	const unadvertised = evaluateGateTarget(
+		receipt,
+		tagPush("v1.0.2", unadvertisedCommit, unadvertisedCommit, tree),
+		repository,
+	);
+	assert.equal(unadvertised.status, GATE_RESULT.DENY, unadvertised.reason);
+	assert.match(unadvertised.reason, /peeled commit.*advertised/i);
+
+	const unresolved = evaluateGateTarget(
+		receipt,
+		tagPush("missing", tagObject, commit, tree),
+		repository,
+	);
+	assert.equal(unresolved.status, GATE_RESULT.DENY, unresolved.reason);
+
+	const fakeGitDirectory = join(parent, "fake-git");
+	mkdirSync(fakeGitDirectory);
+	const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+	const fakeGit = join(fakeGitDirectory, "git");
+	writeFileSync(
+		fakeGit,
+		`#!/bin/sh\nif [ "$1" = "ls-remote" ] && [ "$4" = "refs/tags/v1.0.0" ]; then printf '${tagObject}\\trefs/tags/v1.0.0\\n${tagObject}\\trefs/tags/v1.0.0\\n'; exit 0; fi\nexec "${realGit}" "$@"\n`,
+	);
+	chmodSync(fakeGit, 0o755);
+	const originalPath = process.env.PATH;
+	process.env.PATH = `${fakeGitDirectory}:${originalPath ?? ""}`;
+	try {
+		const ambiguous = evaluateGateTarget(receipt, tagPush("v1.0.0", tagObject, commit, tree), repository);
+		assert.equal(ambiguous.status, GATE_RESULT.DENY, ambiguous.reason);
+		assert.match(ambiguous.reason, /ambiguously/i);
+	} finally {
+		process.env.PATH = originalPath;
+	}
+
+	writeFileSync(join(repository, "release.ts"), "export const release = 2;\n");
+	git("add", ".");
+	git("-c", "user.name=Gate", "-c", "user.email=gate@example.invalid", "commit", "-m", "wrong tree");
+	const wrongCommit = git("rev-parse", "HEAD");
+	const wrongTree = git("rev-parse", "HEAD^{tree}");
+	git("tag", "v1.0.3", wrongCommit);
+	const wrongTreeResult = evaluateGateTarget(
+		receipt,
+		tagPush("v1.0.3", wrongCommit, wrongCommit, wrongTree),
+		repository,
+	);
+	assert.equal(wrongTreeResult.status, GATE_RESULT.DENY, wrongTreeResult.reason);
+	assert.match(wrongTreeResult.reason, /tree.*approved receipt/i);
+
+	const changedRemote = join(parent, "changed-remote.git");
+	execFileSync("git", ["init", "--bare", changedRemote], { stdio: "ignore" });
+	git("remote", "set-url", "--push", "origin", changedRemote);
+	const drifted = evaluateGateTarget(receipt, tagPush("v1.0.0", tagObject, commit, tree), repository);
+	assert.equal(drifted.status, GATE_RESULT.DENY, drifted.reason);
+	assert.match(drifted.reason, /destination changed/i);
 });

@@ -291,3 +291,21 @@ Completed reset journals are now moved to `control/reset-history/<reset-id>.json
 - PASS: `pnpm run prepack` (package resource check: 49 files)
 
 No live repository `.git` authority was mutated, and no commit, push, publish, or release action was performed.
+
+## Tag-create gate lifecycle validation — 2026-07-12
+
+### Change
+
+`PUSH_UPDATE_KIND.CREATE` now branches by destination namespace. Branch creates retain the existing single-parent, receipt-base-tree, and advertised-parent requirements. Creates to `refs/tags/*` require one matching local tag source/destination ref, a resolved object/peeled-commit/tree binding, the approved final-candidate tree, an absent remote tag destination, and an advertised peeled commit at the bound remote destination. This admits annotated and lightweight `git push origin <tag>` releases without broadening tag remapping or bypassing destination identity binding.
+
+### Strict TDD evidence
+
+- RED: `node --experimental-strip-types --test tests/review-transaction.test.ts` failed because annotated tag creates were evaluated through the branch-parent rule (`Push create requires exactly one resolved parent commit`).
+- GREEN: the same focused test passed after destination-ref-aware tag validation.
+- TRIANGULATE: focused transaction/gate coverage passes annotated and lightweight tag creates and denies tag remapping, unadvertised peeled commits, unresolved tag refs, ambiguous remote tag resolution, wrong trees, and changed push destinations.
+
+### Verification
+
+- PASS: `node --experimental-strip-types --test tests/review-transaction.test.ts tests/review-gate.test.ts` (40/40)
+
+No commit, push, tag, publish, or release action was performed.
