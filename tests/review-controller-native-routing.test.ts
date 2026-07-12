@@ -7,6 +7,8 @@ import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import type { NativeReviewCli } from "../lib/native-review-cli.ts";
+import { domainHashV1 } from "../lib/review-canonical.ts";
+import { SupersessionStoreV1 } from "../lib/review-authority-supersession.ts";
 
 interface RegisteredTool {
 	execute: (
@@ -363,7 +365,29 @@ test("native bind treats malformed or mismatched post-call evidence as committed
 	assert.equal(bindCalls, 2);
 });
 
-test("exact selected SDD status consumes only native bound readiness", async (t) => {
+test("pending implementation skips unavailable native review readiness and routes sdd-apply", async (t) => {
+	const cwd = repository(t);
+	const change = "native-review-authority-parity";
+	const root = join(cwd, "openspec", "changes", change);
+	mkdirSync(join(root, "specs", "review"), { recursive: true });
+	writeFileSync(join(root, "proposal.md"), "# Proposal\n");
+	writeFileSync(join(root, "specs", "review", "spec.md"), "# Spec\n");
+	writeFileSync(join(root, "design.md"), "# Design\n");
+	writeFileSync(join(root, "tasks.md"), "- [ ] 1.1 Implement status routing\n");
+	let statuses = 0;
+	const status = await (await import("../extensions/gentle-ai.ts")).__testing.resolveControllerSddStatus(
+		cwd,
+		change,
+		false,
+		"openspec",
+		fakeNative({ sddStatus: async () => { statuses += 1; throw new Error("gentle-ai unavailable"); } }),
+	);
+	assert.equal(statuses, 0);
+	assert.equal(status.nextRecommended, "sdd-apply");
+	assert.equal(status.dependencies.apply, "ready");
+});
+
+test("completed implementation fails closed when native review readiness is unavailable", async (t) => {
 	const cwd = repository(t);
 	const root = join(cwd, "openspec", "changes", "native-review-authority-parity");
 	mkdirSync(join(root, "specs", "review"), { recursive: true });
@@ -377,11 +401,36 @@ test("exact selected SDD status consumes only native bound readiness", async (t)
 		"native-review-authority-parity",
 		false,
 		"openspec",
-		fakeNative({ sddStatus: async () => { statuses += 1; return { ready: false }; } }),
+		fakeNative({ sddStatus: async () => { statuses += 1; throw new Error("gentle-ai unavailable"); } }),
 	);
 	assert.equal(statuses, 1);
 	assert.equal(status.nextRecommended, "resolve-review");
-	assert.match(status.blockedReasons.join("\n"), /native bound review readiness/);
+	assert.match(status.blockedReasons.join("\n"), /gentle-ai unavailable/);
+});
+
+test("recovery obligation blocks pending implementation before native review readiness", async (t) => {
+	const cwd = repository(t);
+	const change = "native-review-authority-parity";
+	const root = join(cwd, "openspec", "changes", change);
+	mkdirSync(join(root, "specs", "review"), { recursive: true });
+	writeFileSync(join(root, "proposal.md"), "# Proposal\n");
+	writeFileSync(join(root, "specs", "review", "spec.md"), "# Spec\n");
+	writeFileSync(join(root, "design.md"), "# Design\n");
+	writeFileSync(join(root, "tasks.md"), "- [ ] 1.1 Implement status routing\n");
+	const store = SupersessionStoreV1.forRepository(cwd);
+	mkdirSync(join(store.root, "recovery-required-v1"), { recursive: true });
+	writeFileSync(join(store.root, "recovery-required-v1", `${domainHashV1("openspec-change-name", change)}.json`), "recovery-required");
+	let statuses = 0;
+	const status = await (await import("../extensions/gentle-ai.ts")).__testing.resolveControllerSddStatus(
+		cwd,
+		change,
+		false,
+		"openspec",
+		fakeNative({ sddStatus: async () => { statuses += 1; throw new Error("gentle-ai unavailable"); } }),
+	);
+	assert.equal(statuses, 0);
+	assert.equal(status.nextRecommended, "resolve-review");
+	assert.equal(status.dependencies.apply, "blocked");
 });
 
 test("native ordinary START blocks every discovered legacy claimant before any native call", async (t) => {

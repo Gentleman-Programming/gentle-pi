@@ -4204,7 +4204,7 @@ async function resolveControllerSddStatus(
 			},
 		});
 	}
-	if (nativeReviewCli === null) return base;
+	if (base.applyState !== "all_done" || nativeReviewCli === null) return base;
 	try {
 		const native = await nativeReviewCli.sddStatus({ cwd, change: base.changeName });
 		return resolveSddStatus({
