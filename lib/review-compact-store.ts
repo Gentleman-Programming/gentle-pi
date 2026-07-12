@@ -3,6 +3,7 @@ import {
 	closeSync,
 	existsSync,
 	fsyncSync,
+	lstatSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
@@ -32,6 +33,7 @@ import {
 	type RepositoryAuthorityV1,
 } from "./review-repository.ts";
 import { ReviewTransactionStore } from "./review-transaction.ts";
+import { assertLoadedReviewRuntimeIdentity } from "./review-runtime-contract.ts";
 import {
 	captureCurrentReviewCandidateTree,
 	captureOrdinaryCorrectionSnapshot,
@@ -43,6 +45,7 @@ export const COMPACT_STORE_OPERATION = {
 	START: "review/start",
 	COMPLETE_REVIEW: "review/complete-review",
 	BEGIN_CORRECTION: "review/begin-correction",
+	FREEZE_VALIDATOR_REQUEST: "review/freeze-validator-request",
 	COMPLETE_CORRECTION: "review/complete-correction",
 	COMPLETE_VERIFICATION: "review/complete-verification",
 } as const;
@@ -61,6 +64,28 @@ export interface CompactReviewStoreOptions {
 	faultInjector?: (point: "before-state-rename" | "before-receipt-rename") => void;
 }
 
+export const COMPACT_AUTHORITY_OUTCOME = {
+	NONE: "none",
+	ACTIVE: "active",
+	APPROVED: "approved",
+	ESCALATED: "escalated",
+	INVALID: "invalid",
+} as const;
+
+export type CompactAuthorityOutcomeV2 =
+	(typeof COMPACT_AUTHORITY_OUTCOME)[keyof typeof COMPACT_AUTHORITY_OUTCOME];
+
+export interface CompactAuthorityLineageV2 {
+	lineage_id: string;
+	state: CompactReviewStateV2["state"];
+	revision: string;
+}
+
+export interface CompactAuthorityInspectionV2 {
+	outcome: CompactAuthorityOutcomeV2;
+	lineages: readonly CompactAuthorityLineageV2[];
+}
+
 export class CompactReviewStoreError extends Error {
 	constructor(message: string) {
 		super(message);
@@ -75,7 +100,7 @@ const STATE_KEYS = new Set([
 	"current_candidate_tree", "genesis_paths", "intended_untracked", "policy_hash",
 	"risk_tier", "selected_lenses", "original_changed_lines", "correction_budget",
 	"lens_results", "findings", "outcomes", "correction_ids", "follow_ups",
-	"correction_line_forecast", "correction", "validation", "final_evidence_hash",
+	"correction_line_forecast", "validator_request", "runtime_identity", "correction", "validation", "final_evidence_hash",
 	"escalation_reasons",
 ]);
 const SNAPSHOT_KEYS = new Set([
@@ -108,6 +133,15 @@ const VALIDATION_KEYS = new Set([
 	"correction_ids", "original_criteria", "correction_regression", "follow_ups",
 ]);
 const VALIDATION_CHECK_KEYS = new Set(["passed", "evidence"]);
+const VALIDATOR_REQUEST_KEYS = new Set(["body", "request_hash"]);
+const VALIDATOR_REQUEST_BODY_KEYS = new Set([
+	"schema", "purpose", "scope", "lineage_id", "candidate_tree", "fix_diff_hash", "correction_ids", "correction_paths",
+	"frozen_rows", "frozen_ledger_hash",
+]);
+const RUNTIME_IDENTITY_KEYS = new Set([
+	"schema", "compact_contract", "operation_contract", "state_schema", "record_schema", "receipt_schema",
+	"canonicalization", "identity_hash",
+]);
 const RECEIPT_BODY_KEYS = new Set([
 	"schema", "lineage_id", "generation", "authority_revision", "base_tree",
 	"initial_review_tree", "final_candidate_tree", "genesis_paths_hash",
@@ -168,6 +202,20 @@ function assertExactStateShape(state: CompactReviewStateV2): void {
 		assertObject(state.correction, "Compact correction");
 		assertExactKeys(state.correction, CORRECTION_KEYS, "Compact correction");
 	}
+	assertObject(state.runtime_identity, "Compact runtime identity");
+	assertExactKeys(state.runtime_identity, RUNTIME_IDENTITY_KEYS, "Compact runtime identity");
+	if (state.validator_request !== undefined) {
+		assertObject(state.validator_request, "Compact validator request");
+		assertExactKeys(state.validator_request, VALIDATOR_REQUEST_KEYS, "Compact validator request");
+		assertObject(state.validator_request.body, "Compact validator request body");
+		assertExactKeys(state.validator_request.body, VALIDATOR_REQUEST_BODY_KEYS, "Compact validator request body");
+		for (const finding of assertObjectArray(state.validator_request.body.frozen_rows, "Compact validator frozen rows")) {
+			assertExactKeys(finding, FINDING_KEYS, "Compact validator frozen row");
+		}
+		if (!Array.isArray(state.validator_request.body.scope) || state.validator_request.body.scope.some((scope) => typeof scope !== "string")) {
+			throw new CompactReviewStoreError("Compact validator request scope is malformed");
+		}
+	}
 	if (state.validation !== undefined) {
 		assertObject(state.validation, "Compact validation");
 		assertExactKeys(state.validation, VALIDATION_KEYS, "Compact validation");
@@ -184,6 +232,7 @@ function assertExactStateShape(state: CompactReviewStateV2): void {
 
 function operationMatchesState(operation: CompactStoreOperation, state: CompactReviewStateV2): boolean {
 	if (operation === COMPACT_STORE_OPERATION.START) return state.state === COMPACT_REVIEW_STATE.REVIEWING;
+	if (operation === COMPACT_STORE_OPERATION.FREEZE_VALIDATOR_REQUEST) return state.validator_request !== undefined;
 	if (operation === COMPACT_STORE_OPERATION.COMPLETE_VERIFICATION) return state.final_evidence_hash !== undefined;
 	if (operation === COMPACT_STORE_OPERATION.COMPLETE_CORRECTION) return state.correction !== undefined;
 	if (operation === COMPACT_STORE_OPERATION.BEGIN_CORRECTION) {
@@ -260,6 +309,7 @@ function immutableBinding(state: CompactReviewStateV2): unknown {
 		selected_lenses: state.selected_lenses,
 		original_changed_lines: state.original_changed_lines,
 		correction_budget: state.correction_budget,
+		runtime_identity: state.runtime_identity,
 	};
 }
 
@@ -306,6 +356,20 @@ function assertSuccessor(
 		if (!equal(expected, next)) throw new CompactReviewStoreError("Compact correction forecast changed unrelated state");
 		return;
 	}
+	if (operation === COMPACT_STORE_OPERATION.FREEZE_VALIDATOR_REQUEST) {
+		if (
+			previous.state !== COMPACT_REVIEW_STATE.CORRECTION_REQUIRED ||
+			previous.correction_line_forecast === undefined ||
+			previous.validator_request !== undefined ||
+			next.validator_request === undefined
+		) {
+			throw new CompactReviewStoreError("Invalid compact validator request successor");
+		}
+		const expected = clone(previous);
+		expected.validator_request = next.validator_request;
+		if (!equal(expected, next)) throw new CompactReviewStoreError("Compact validator request changed unrelated state");
+		return;
+	}
 	if (operation === COMPACT_STORE_OPERATION.COMPLETE_CORRECTION) {
 		if (
 			previous.state !== COMPACT_REVIEW_STATE.CORRECTION_REQUIRED ||
@@ -313,6 +377,8 @@ function assertSuccessor(
 			!stateIsOneOf(next.state, [COMPACT_REVIEW_STATE.VALIDATING, COMPACT_REVIEW_STATE.ESCALATED]) ||
 			!next.correction ||
 			!next.validation ||
+			!previous.validator_request ||
+			!equal(previous.validator_request, next.validator_request) ||
 			next.final_evidence_hash !== undefined ||
 			!equal(previous.lens_results, next.lens_results) ||
 			!equal(previous.findings, next.findings) ||
@@ -344,6 +410,10 @@ function assertSuccessor(
 function graphCurrentExists(authority: RepositoryAuthorityV1): boolean {
 	const graphRoot = join(authority.store_root, "graph-v1");
 	return [0, 1, 2].some((slot) => existsSync(join(graphRoot, `CURRENT.${slot}`)));
+}
+
+export function hasGraphV1Authority(cwd: string): boolean {
+	return graphCurrentExists(resolveRepositoryAuthorityV1(cwd));
 }
 
 export function graphV1LineageExists(cwd: string, lineageId: string): boolean {
@@ -403,7 +473,9 @@ export class CompactReviewStoreV2 {
 
 	load(): CompactStateRecordV2 {
 		try {
-			return parseRecord(readFileSync(this.statePath, "utf8"), this.#lineageId);
+			const record = parseRecord(readFileSync(this.statePath, "utf8"), this.#lineageId);
+			this.assertRuntimeIdentity(record.state);
+			return record;
 		} catch (error) {
 			if (error instanceof CompactReviewStoreError) throw error;
 			throw new CompactReviewStoreError(`Compact review state is unavailable: ${error instanceof Error ? error.message : String(error)}`);
@@ -416,6 +488,7 @@ export class CompactReviewStoreV2 {
 		nextState: CompactReviewStateV2,
 	): string {
 		assertCompactReviewState(nextState);
+		this.assertRuntimeIdentity(nextState);
 		if (nextState.lineage_id !== this.#lineageId) throw new CompactReviewStoreError("Compact state lineage does not match the store");
 		const owner = this.#lock.acquire();
 		try {
@@ -531,6 +604,14 @@ export class CompactReviewStoreV2 {
 		return clone(receipt);
 	}
 
+	private assertRuntimeIdentity(state: CompactReviewStateV2): void {
+		try {
+			assertLoadedReviewRuntimeIdentity(state.runtime_identity);
+		} catch {
+			throw new CompactReviewStoreError("Persisted compact runtime identity is incompatible: REVIEW_RUNTIME_INCOMPATIBLE");
+		}
+	}
+
 	private assertCurrentAuthority(): void {
 		const current = resolveRepositoryAuthorityV1(this.#cwd);
 		if (
@@ -569,8 +650,17 @@ export function discoverCompactReviewStores(cwd: string): CompactReviewStoreV2[]
 	const authority = resolveRepositoryAuthorityV1(cwd);
 	const root = assertManagedStorePathV1(authority.common_directory, join(authority.store_root, "compact-v2"));
 	if (!existsSync(root)) return [];
-	return readdirSync(root, { withFileTypes: true })
-		.filter((entry) => entry.isDirectory() && LINEAGE_ID.test(entry.name))
+	const rootStat = lstatSync(root);
+	if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+		throw new CompactReviewStoreError("Invalid compact authority entry: compact-v2 root is not a real directory");
+	}
+	const entries = readdirSync(root, { withFileTypes: true });
+	for (const entry of entries) {
+		if (!entry.isDirectory() || entry.isSymbolicLink() || !LINEAGE_ID.test(entry.name)) {
+			throw new CompactReviewStoreError(`Invalid compact authority entry: ${entry.name}`);
+		}
+	}
+	return entries
 		.map((entry) => CompactReviewStoreV2.forRepository(cwd, entry.name))
 		.toSorted((left, right) => left.lineageDirectory.localeCompare(right.lineageDirectory));
 }
@@ -578,4 +668,34 @@ export function discoverCompactReviewStores(cwd: string): CompactReviewStoreV2[]
 export function compactV2LineageExists(cwd: string, lineageId: string): boolean {
 	const store = CompactReviewStoreV2.forRepository(cwd, lineageId);
 	return existsSync(store.statePath) && statSync(store.statePath).isFile();
+}
+
+export function inspectCompactReviewAuthorityV2(cwd: string): CompactAuthorityInspectionV2 {
+	const lineages: CompactAuthorityLineageV2[] = [];
+	try {
+		for (const store of discoverCompactReviewStores(cwd)) {
+			const record = store.load();
+			lineages.push({
+				lineage_id: record.state.lineage_id,
+				state: record.state.state,
+				revision: record.revision,
+			});
+		}
+	} catch {
+		return { outcome: COMPACT_AUTHORITY_OUTCOME.INVALID, lineages };
+	}
+	if (lineages.length === 0) return { outcome: COMPACT_AUTHORITY_OUTCOME.NONE, lineages };
+	if (lineages.some((lineage) =>
+		lineage.state !== COMPACT_REVIEW_STATE.APPROVED &&
+		lineage.state !== COMPACT_REVIEW_STATE.ESCALATED
+	)) {
+		return { outcome: COMPACT_AUTHORITY_OUTCOME.ACTIVE, lineages };
+	}
+	if (lineages.some((lineage) => lineage.state === COMPACT_REVIEW_STATE.ESCALATED)) {
+		return { outcome: COMPACT_AUTHORITY_OUTCOME.ESCALATED, lineages };
+	}
+	if (lineages.some((lineage) => lineage.state === COMPACT_REVIEW_STATE.APPROVED)) {
+		return { outcome: COMPACT_AUTHORITY_OUTCOME.APPROVED, lineages };
+	}
+	throw new CompactReviewStoreError("Compact authority inspection found no terminal or active lineage");
 }

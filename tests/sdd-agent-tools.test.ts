@@ -7,7 +7,7 @@ const repoRoot = process.cwd();
 const assetsAgentsDir = join(repoRoot, "assets", "agents");
 const REVIEW_REFUTER_TOOLS = ["read", "grep", "find"];
 const GENERIC_ROLE_TOOLS: Record<string, string[]> = {
-	"gentle-ai-explore.md": ["read", "grep", "find"],
+	"gentle-ai-explore.md": ["read", "grep", "find", "codegraph"],
 	"gentle-ai-worker.md": ["read", "grep", "find", "edit", "write", "bash", "mem_save"],
 	"gentle-ai-verify.md": ["read", "grep", "find", "bash"],
 };
@@ -44,6 +44,13 @@ function assertGenericRoleBody(fileName: string, source: string): void {
 	assert.match(source, /compressed (?:handoff|evidence handoff)/);
 	assert.match(source, /supporting (?:paths|evidence)/);
 	assert.match(source, /Do not use SDD phase protocols or review lenses\./);
+
+	if (fileName === "gentle-ai-explore.md") {
+		assert.match(source, /sole permitted mutation/);
+		assert.match(source, /all tracked files, source files, and other project content remain read-only/);
+		assert.match(source, /CodeGraph reports that it is unavailable or fails/);
+		assert.match(source, /Do not use that fallback before CodeGraph is unavailable or fails/);
+	}
 
 	if (fileName === "gentle-ai-verify.md") {
 		assert.match(source, /execute only exact test, build, or lint commands explicitly authorized by the parent/);

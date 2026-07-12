@@ -9,6 +9,7 @@ import {
 	finalizeCompactReview,
 	startCompactReview,
 } from "../lib/review-facade.ts";
+import { CompactReviewContractError } from "../lib/review-compact-contract.ts";
 
 function repository(t: test.TestContext): string {
 	const parent = mkdtempSync(join(tmpdir(), "compact-facade-"));
@@ -22,6 +23,17 @@ function repository(t: test.TestContext): string {
 	writeFileSync(join(root, "value.ts"), "export const value = 2;\n");
 	return root;
 }
+
+test("facade rejects malformed compact inputs before repository discovery", () => {
+	assert.throws(
+		() => startCompactReview({ cwd: "/does-not-exist", policyHash: "not-a-digest" }),
+		(error: unknown) => error instanceof CompactReviewContractError && error.area === "review/start.policyHash",
+	);
+	assert.throws(
+		() => finalizeCompactReview({ cwd: "/does-not-exist", final_evidence: "evidence" }),
+		(error: unknown) => error instanceof CompactReviewContractError && error.code === "field-pair",
+	);
+});
 
 test("ordinary facade derives compact start authority and finalizes a clean review with evidence hashed only at finalization", (t) => {
 	const root = repository(t);
@@ -82,7 +94,7 @@ test("facade exposes native refuter IDs without mutation before an identical sec
 	assert.equal(second.state, "validating");
 });
 
-test("malformed refuter rows persist escalation and cannot be replaced", (t) => {
+test("malformed refuter rows are rejected before authority mutation", (t) => {
 	for (const [index, malformed] of [null, "invalid", {}].entries()) {
 		const root = repository(t);
 		const started = startCompactReview({ cwd: root, lineageId: `malformed-refuter-${index}`, policyHash: "a".repeat(64) });
@@ -91,16 +103,10 @@ test("malformed refuter rows persist escalation and cannot be replaced", (t) => 
 			evidence_class: "inferential", causal_disposition: "introduced", proof_refs: ["differential-test:tests/value.test.ts"],
 		}], evidence: [] }];
 		const first = finalizeCompactReview({ cwd: root, lineageId: started.lineage_id, review_result: { lens_results: lensResults } });
-		const terminal = finalizeCompactReview({ cwd: root, lineageId: started.lineage_id, review_result: {
+		assert.throws(() => finalizeCompactReview({ cwd: root, lineageId: started.lineage_id, review_result: {
 			lens_results: lensResults, refuter_request_hash: first.refuter_request?.request_hash, refuter_results: [malformed] as never,
-		} });
-		assert.equal(terminal.state, "escalated");
-		const retry = finalizeCompactReview({ cwd: root, lineageId: started.lineage_id, review_result: {
-			lens_results: lensResults, refuter_request_hash: first.refuter_request?.request_hash,
-			refuter_results: [{ finding_id: "READABILITY-001", outcome: "refuted", proof_refs: ["before-after:proof"] }],
-		} });
-		assert.equal(retry.state, "escalated");
-		assert.equal(retry.store_revision, terminal.store_revision);
+		} }), CompactReviewContractError);
+		assert.equal(discoverCompactReview(root, started.lineage_id).record.revision, first.store_revision);
 	}
 });
 
@@ -138,23 +144,83 @@ test("facade freezes a pre-edit forecast, derives actual correction lines, and r
 	assert.equal(forecast.state, "correction_required");
 
 	writeFileSync(join(root, "value.ts"), readFileSync(join(root, "value.ts"), "utf8").replace("value = 2", "value = 3"));
+	const validation = {
+		original_criteria: { passed: true, evidence: ["original acceptance suite passed"] },
+		correction_regression: { passed: true, evidence: ["wrong-value regression passed"] },
+	};
+	const handoff = finalizeCompactReview({ cwd: root, lineageId: started.lineage_id });
+	assert.equal(handoff.state, "correction_required");
+	assert.deepEqual(handoff.validator_request?.body.correction_ids, ["READABILITY-001"]);
+	assert.deepEqual(handoff.repair_report?.allowed_paths, ["value.ts"]);
+	assert.throws(() => finalizeCompactReview({
+		cwd: root, lineageId: started.lineage_id,
+		validation: { request_hash: "0".repeat(64), correction_ids: ["READABILITY-001"], ...validation, fix_caused_findings: [], follow_ups: [] },
+	}), /frozen native validator request/i);
 	const terminal = finalizeCompactReview({
 		cwd: root,
 		lineageId: started.lineage_id,
-		validation: {
-			correction_ids: ["READABILITY-001"],
-			original_criteria: { passed: true, evidence: ["original acceptance suite passed"] },
-			correction_regression: { passed: true, evidence: ["wrong-value regression passed"] },
-			fix_caused_findings: [],
-			follow_ups: [],
-		},
+		validation: { request_hash: handoff.validator_request!.request_hash, correction_ids: ["READABILITY-001"], ...validation, fix_caused_findings: [], follow_ups: [] },
 		final_evidence: "focused and full verification passed",
 		final_verification_passed: true,
 	});
 	assert.equal(terminal.state, "approved");
+	assert.equal(terminal.repair_report?.phase, "approved");
 	const state = discoverCompactReview(root, started.lineage_id, true).record.state;
 	assert.equal(state.correction?.changed_lines, 2);
 	assert.equal(state.validation?.correction_ids[0], "READABILITY-001");
+});
+
+test("facade freezes validator scope without caller-predeclared results", (t) => {
+	const root = repository(t);
+	const started = startCompactReview({ cwd: root, policyHash: "a".repeat(64) });
+	const review = finalizeCompactReview({
+		cwd: root,
+		lineageId: started.lineage_id,
+		review_result: {
+			lens_results: [{
+				findings: [{
+					location: "value.ts:1", severity: "CRITICAL", claim: "Value must be corrected.",
+					evidence_class: "deterministic", causal_disposition: "introduced", proof_refs: ["changed-hunk:value.ts:1"],
+				}], evidence: [],
+			}],
+		},
+		correction_line_forecast: 1,
+	});
+	assert.equal(review.state, "correction_required");
+	writeFileSync(join(root, "value.ts"), readFileSync(join(root, "value.ts"), "utf8").replace("value = 2", "value = 3"));
+	const originalProof = {
+		original_criteria: { passed: true, evidence: ["original acceptance passed"] },
+		correction_regression: { passed: true, evidence: ["correction regression passed"] },
+	};
+	const request = finalizeCompactReview({ cwd: root, lineageId: started.lineage_id, validation_proof: originalProof }).validator_request!;
+	const substitutedProof = {
+		original_criteria: { passed: false, evidence: ["independent acceptance failure"] },
+		correction_regression: { passed: true, evidence: ["independent regression evidence"] },
+	};
+	const after = finalizeCompactReview({ cwd: root, lineageId: started.lineage_id, validation_proof: substitutedProof });
+	assert.equal(after.validator_request?.request_hash, request.request_hash);
+});
+
+test("facade blocks a caller-supplied alternate lineage for an unchanged terminal target", (t) => {
+	const root = repository(t);
+	const started = startCompactReview({ cwd: root, lineageId: "first", policyHash: "a".repeat(64) });
+	const terminal = finalizeCompactReview({
+		cwd: root,
+		lineageId: started.lineage_id,
+		review_result: { lens_results: [{ findings: [], evidence: [] }] },
+		final_evidence: "verification passed",
+		final_verification_passed: true,
+	});
+	assert.equal(terminal.state, "approved");
+	assert.throws(
+		() => startCompactReview({ cwd: root, lineageId: "alternate", policyHash: "a".repeat(64) }),
+		/approved authority already exists for this review target/i,
+	);
+	writeFileSync(join(root, "value.ts"), "export const value = 3;\n");
+	const alternate = startCompactReview({ cwd: root, lineageId: "alternate", policyHash: "a".repeat(64) });
+	const statePath = discoverCompactReview(root, alternate.lineage_id).store.statePath;
+	writeFileSync(statePath, "malformed compact state");
+	assert.throws(() => discoverCompactReview(root), /compact review state is malformed|state is unavailable/i);
 });
 
 for (const kind of ["binary", "mode-only"] as const) {

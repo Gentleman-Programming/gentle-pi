@@ -46,28 +46,22 @@ function deriveIntendedCommitTarget(root: string) {
 	};
 }
 
-test("omitted final verification cannot approve a receipt or gate", (t) => {
+test("omitted final verification result rejects before compact authority mutation", (t) => {
 	const root = repository(t);
 	const started = startCompactReview({ cwd: root, policyHash: "a".repeat(64) });
-	const finalized = finalizeCompactReview({
-		cwd: root,
-		lineageId: started.lineage_id,
-		review_result: { lens_results: [{ findings: [], evidence: [] }] },
-		final_evidence: "verification result was never reported",
-	});
-	assert.equal(finalized.state, "escalated");
-	git(root, "add", ".");
-	const tree = git(root, "write-tree");
-	const denied = validateCompactReviewGate({
-		cwd: root,
-		lineageId: started.lineage_id,
-		deriveTarget: () => ({
-			target: { kind: GATE_TARGET_KIND.INTENDED_COMMIT, intended_commit_tree: tree },
-			actualIntendedCommitTree: tree,
+	const before = discoverCompactReview(root, started.lineage_id).record;
+	assert.throws(
+		() => finalizeCompactReview({
+			cwd: root,
+			lineageId: started.lineage_id,
+			review_result: { lens_results: [{ findings: [], evidence: [] }] },
+			final_evidence: "verification result was never reported",
 		}),
-	});
-	assert.equal(denied.status, "deny");
-	assert.match(denied.reason, /escalated/i);
+		/final evidence and result/i,
+	);
+	const after = discoverCompactReview(root, started.lineage_id).record;
+	assert.equal(after.revision, before.revision);
+	assert.equal(after.state.state, "reviewing");
 });
 
 test("compact gate is read-only and closes authority and target TOCTOU before allow", (t) => {

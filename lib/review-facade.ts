@@ -1,4 +1,8 @@
 import { existsSync } from "node:fs";
+import {
+	parseCompactFinalizeInput,
+	parseCompactStartInput,
+} from "./review-compact-contract.ts";
 import { domainHashV1 } from "./review-canonical.ts";
 import {
 	COMPACT_REVIEW_STATE,
@@ -7,8 +11,12 @@ import {
 	completeCompactReview,
 	completeCompactVerification,
 	createCompactRefuterRequest,
+	createCompactValidatorRequest,
 	createCompactReviewState,
+	freezeCompactValidatorRequest,
 	type CompactRefuterRequest,
+	type CompactValidationProofInput,
+	type CompactValidatorRequest,
 	type CompactReviewResultInput,
 	type CompactReviewStateV2,
 	type CompactTargetedValidationInput,
@@ -57,6 +65,7 @@ export interface CompactFacadeFinalizeInput {
 	lineageId?: string;
 	review_result?: CompactReviewResultInput;
 	correction_line_forecast?: number;
+	validation_proof?: CompactValidationProofInput;
 	validation?: CompactTargetedValidationInput;
 	final_evidence?: string;
 	final_verification_passed?: boolean;
@@ -70,9 +79,51 @@ export interface CompactFacadeFinalizeResult {
 	store_revision: string;
 	receipt_path?: string;
 	refuter_request?: CompactRefuterRequest;
+	validator_request?: CompactValidatorRequest;
+	repair_report?: CompactRepairReport;
+}
+
+export const COMPACT_REPAIR_PHASE = {
+	CORRECTION_REQUIRED: "correction-required",
+	SCOPED_VALIDATION: "scoped-validation",
+	APPROVED: "approved",
+	ESCALATED: "escalated",
+} as const;
+
+export interface CompactRepairReport {
+	phase: (typeof COMPACT_REPAIR_PHASE)[keyof typeof COMPACT_REPAIR_PHASE];
+	correction_ids: string[];
+	allowed_paths: string[];
+	changed_paths?: string[];
+	correction_budget: number;
+	forecast_lines?: number;
+	actual_lines?: number;
 }
 
 export const GRAPH_V1_ORDINARY_READ_ONLY = "Graph-v1 ordinary review lineages are read-only; new ordinary work must use the compact-v2 facade";
+
+export const COMPACT_START_BLOCK_ACTION = {
+	APPROVED: "validate-existing-terminal-receipt",
+	ESCALATED: "change-review-scope-or-use-supported-maintainer-action",
+} as const;
+
+export class CompactReviewStartBlockedError extends Error {
+	readonly lineageId: string;
+	readonly state: CompactReviewStateV2["state"];
+	readonly action: (typeof COMPACT_START_BLOCK_ACTION)[keyof typeof COMPACT_START_BLOCK_ACTION];
+
+	constructor(
+		lineageId: string,
+		state: CompactReviewStateV2["state"],
+		action: (typeof COMPACT_START_BLOCK_ACTION)[keyof typeof COMPACT_START_BLOCK_ACTION],
+	) {
+		super(`Compact ${state} authority already exists for this review target; ${action}`);
+		this.name = "CompactReviewStartBlockedError";
+		this.lineageId = lineageId;
+		this.state = state;
+		this.action = action;
+	}
+}
 
 function derivedLineageId(snapshot: ReturnType<typeof captureReviewSnapshot>): string {
 	return `review-${domainHashV1("compact-lineage", {
@@ -86,6 +137,7 @@ function derivedLineageId(snapshot: ReturnType<typeof captureReviewSnapshot>): s
 export function startCompactReview(
 	input: CompactFacadeStartInput,
 ): CompactFacadeStartResult {
+	input = parseCompactStartInput(input);
 	assertNoLegacyReviewAuthorityV1(input.cwd);
 	const projection = input.projection ?? { kind: REVIEW_PROJECTION.COMPLETE };
 	if (projection.kind !== REVIEW_PROJECTION.COMPLETE) {
@@ -100,6 +152,38 @@ export function startCompactReview(
 	const lineageId = input.lineageId?.trim() || derivedLineageId(snapshot);
 	if (graphV1LineageExists(input.cwd, lineageId)) {
 		throw new Error("Graph-v1 and compact-v2 authority are ambiguous for this lineage; choose a fresh compact lineage");
+	}
+	if (compactV2LineageExists(input.cwd, lineageId)) {
+		const existing = CompactReviewStoreV2.forRepository(input.cwd, lineageId).load().state;
+		if (existing.state === COMPACT_REVIEW_STATE.APPROVED) {
+			if (existing.policy_hash !== input.policyHash) {
+				throw new Error("Compact approved authority policy hash does not match requested policy hash.");
+			}
+			throw new CompactReviewStartBlockedError(lineageId, existing.state, COMPACT_START_BLOCK_ACTION.APPROVED);
+		}
+		if (existing.state === COMPACT_REVIEW_STATE.ESCALATED) {
+			throw new CompactReviewStartBlockedError(lineageId, existing.state, COMPACT_START_BLOCK_ACTION.ESCALATED);
+		}
+	}
+	const terminal = discoverCompactReviewStores(input.cwd)
+		.map((store) => store.load().state)
+		.find((existing) => (
+			existing.state === COMPACT_REVIEW_STATE.APPROVED ||
+			existing.state === COMPACT_REVIEW_STATE.ESCALATED
+		) &&
+			existing.initial_snapshot.base_tree === snapshot.base_tree &&
+			existing.initial_snapshot.initial_review_tree === snapshot.initial_review_tree &&
+			domainHashV1("compact-target-paths", existing.genesis_paths) === domainHashV1("compact-target-paths", snapshot.genesis_paths ?? []) &&
+			domainHashV1("compact-target-untracked", existing.intended_untracked) === domainHashV1("compact-target-untracked", snapshot.intended_untracked)
+		);
+	if (terminal) {
+		throw new CompactReviewStartBlockedError(
+			terminal.lineage_id,
+			terminal.state,
+			terminal.state === COMPACT_REVIEW_STATE.APPROVED
+				? COMPACT_START_BLOCK_ACTION.APPROVED
+				: COMPACT_START_BLOCK_ACTION.ESCALATED,
+		);
 	}
 	const state = createCompactReviewState({ lineageId, snapshot, policyHash: input.policyHash });
 	const store = CompactReviewStoreV2.forRepository(input.cwd, lineageId);
@@ -134,15 +218,10 @@ export function discoverCompactReview(
 		return { store, record };
 	}
 	let candidates = discoverCompactReviewStores(cwd).flatMap((store) => {
-		try {
-			const record = store.load();
-			if (graphV1LineageExists(cwd, record.state.lineage_id)) throw new Error("Review authority is ambiguous across graph-v1 and compact-v2");
-			if (terminal && !existsSync(store.receiptPath)) return [];
-			return [{ store, record }];
-		} catch (error) {
-			if (error instanceof Error && /ambiguous across graph-v1/.test(error.message)) throw error;
-			return [];
-		}
+		const record = store.load();
+		if (graphV1LineageExists(cwd, record.state.lineage_id)) throw new Error("Review authority is ambiguous across graph-v1 and compact-v2");
+		if (terminal && !existsSync(store.receiptPath)) return [];
+		return [{ store, record }];
 	});
 	if (!terminal) {
 		const active = candidates.filter(({ record }) =>
@@ -175,12 +254,30 @@ function finalizeResult(
 		record.state.state === COMPACT_REVIEW_STATE.APPROVED ||
 		record.state.state === COMPACT_REVIEW_STATE.ESCALATED
 	) result.receipt_path = store.receiptPath;
+	if (record.state.correction_ids.length > 0) {
+		const phase = record.state.state === COMPACT_REVIEW_STATE.CORRECTION_REQUIRED
+			? COMPACT_REPAIR_PHASE.CORRECTION_REQUIRED
+			: record.state.state === COMPACT_REVIEW_STATE.VALIDATING
+				? COMPACT_REPAIR_PHASE.SCOPED_VALIDATION
+				: record.state.state === COMPACT_REVIEW_STATE.APPROVED
+					? COMPACT_REPAIR_PHASE.APPROVED
+					: COMPACT_REPAIR_PHASE.ESCALATED;
+		result.repair_report = {
+			phase,
+			correction_ids: [...record.state.correction_ids],
+			allowed_paths: [...record.state.genesis_paths],
+			...(record.state.correction === undefined ? {} : { changed_paths: [...record.state.correction.changed_paths], actual_lines: record.state.correction.changed_lines }),
+			correction_budget: record.state.correction_budget,
+			...(record.state.correction_line_forecast === undefined ? {} : { forecast_lines: record.state.correction_line_forecast }),
+		};
+	}
 	return result;
 }
 
 export function finalizeCompactReview(
 	input: CompactFacadeFinalizeInput,
 ): CompactFacadeFinalizeResult {
+	input = parseCompactFinalizeInput(input);
 	const discovered = discoverCompactReview(input.cwd, input.lineageId);
 	let { store, record } = discovered;
 	let state = record.state;
@@ -211,10 +308,20 @@ export function finalizeCompactReview(
 		state = beginCompactCorrection(state, input.correction_line_forecast);
 		const revision = store.replace(record.revision, COMPACT_STORE_OPERATION.BEGIN_CORRECTION, state);
 		record = { schema: "gentle-ai.review-state-record/v2", revision, state };
+		return finalizeResult(store, record, "apply the bounded correction, then rerun finalize to derive the validator request");
 	}
 	if (state.state === COMPACT_REVIEW_STATE.CORRECTION_REQUIRED) {
+		if (state.validator_request === undefined) {
+			const candidateTree = captureCurrentReviewCandidateTree(state.initial_snapshot);
+			const correction = captureOrdinaryCorrectionSnapshot(state.initial_snapshot, candidateTree);
+			const request = createCompactValidatorRequest(state, correction);
+			state = freezeCompactValidatorRequest(state, request);
+			const revision = store.replace(record.revision, COMPACT_STORE_OPERATION.FREEZE_VALIDATOR_REQUEST, state);
+			record = { schema: "gentle-ai.review-state-record/v2", revision, state };
+			return { ...finalizeResult(store, record, "run the one targeted validator against the frozen native request"), validator_request: request };
+		}
 		if (!input.validation) {
-			return finalizeResult(store, record, "apply the bounded correction, then supply one targeted validation result");
+			return { ...finalizeResult(store, record, "run the one targeted validator against the frozen native request"), validator_request: state.validator_request };
 		}
 		const candidateTree = captureCurrentReviewCandidateTree(state.initial_snapshot);
 		const correction = captureOrdinaryCorrectionSnapshot(state.initial_snapshot, candidateTree);

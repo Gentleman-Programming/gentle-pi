@@ -20,6 +20,7 @@ import {
 	type ReviewBudgetV1,
 } from "../lib/review-transaction.ts";
 import { ordinaryValidatorRequest } from "../lib/review-policy-ordinary.ts";
+import { discoverCompactReview, startCompactReview } from "../lib/review-facade.ts";
 import { domainHashV1 } from "../lib/review-canonical.ts";
 import { destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
 import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
@@ -392,6 +393,101 @@ test("controller rejects graph-style ADVANCE for new compact ordinary authority"
 	);
 });
 
+test("controller rejects malformed refuter payloads before compact authority mutation", async (t) => {
+	const fixture = createRepository(t, false);
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository);
+	const started = await controllerCall(controller, ctx, {
+		operation: "start",
+		input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, projection: { kind: "complete" }, policyHash: "a".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }),
+	});
+	const result = started.result as { lineage_id: string };
+	const state = started.state as { selected_lenses: string[] };
+	const lens_results = state.selected_lenses.map(() => ({ findings: [{
+		location: "app.ts:1",
+		severity: "CRITICAL",
+		claim: "The review cannot establish correctness.",
+		evidence_class: "inferential",
+		causal_disposition: "introduced",
+		proof_refs: ["differential-test:tests/app.test.ts"],
+	}], evidence: [] }));
+	const pending = await controllerCall(controller, ctx, {
+		operation: "finalize",
+		lineageId: result.lineage_id,
+		input: JSON.stringify({ review_result: { lens_results } }),
+	});
+	const pendingResult = pending.result as { refuter_request: { request_hash: string } };
+	const before = discoverCompactReview(fixture.repository, result.lineage_id).record;
+	await assert.rejects(
+		controller.execute("malformed-refuter", {
+			operation: "finalize",
+			lineageId: result.lineage_id,
+			input: JSON.stringify({ review_result: {
+				lens_results,
+				refuter_request_hash: pendingResult.refuter_request.request_hash,
+				refuter_results: [null],
+			} }),
+		}, undefined, undefined, ctx),
+		/review\/finalize\.review_result\.refuter_results\[0\]/,
+	);
+	const after = discoverCompactReview(fixture.repository, result.lineage_id).record;
+	assert.equal(after.revision, before.revision);
+	assert.equal(after.state.state, "reviewing");
+});
+
+test("controller requires an approved compact lineage to match its stored policy hash", async (t) => {
+	const fixture = createRepository(t, false);
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository);
+	const lineageId = "approved-policy-lineage";
+	await approveTrackedWorktreeTransaction(controller, ctx, lineageId);
+
+	await assert.rejects(
+		controller.execute("stale-policy", {
+			operation: "start",
+			lineageId,
+			input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, projection: { kind: "complete" }, policyHash: "c".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }),
+		}, undefined, undefined, ctx),
+		/policy hash.*does not match/i,
+	);
+});
+
+test("controller prioritizes active compact authority over terminal history and reports terminals without active authority", async (t) => {
+	const fixture = createRepository(t, false);
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository);
+	await approveTrackedWorktreeTransaction(controller, ctx, "historical-terminal");
+
+	const terminal = await controllerCall(controller, ctx, { operation: "inspect" });
+	assert.equal(terminal.status, "terminal");
+	assert.equal(terminal.next_action, "validate-existing-terminal-receipt");
+	assert.equal(((terminal.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "approved");
+	writeFileSync(join(fixture.repository, "app.ts"), "export const value = 3;\n");
+
+	await controllerCall(controller, ctx, {
+		operation: "start",
+		lineageId: "active-after-terminal",
+		input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, projection: { kind: "complete" }, policyHash: "a".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }),
+	});
+	const active = await controllerCall(controller, ctx, { operation: "inspect" });
+	assert.equal(active.status, "in-progress");
+	assert.equal(active.next_action, "finalize-existing-ordinary-review");
+	assert.equal(((active.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "active");
+});
+
+test("controller retains graph-v1 inspection and repair behavior without compact authority", async (t) => {
+	const fixture = createRepository(t, true);
+	createTerminalAuthority(fixture, "graph-only-authority");
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository);
+	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
+	assert.equal(inspected.status, "ready");
+	assert.equal(inspected.next_action, "start-ordinary-review");
+	assert.equal((inspected.inspection as Record<string, unknown>).compact_authority, undefined);
+	const repaired = await controllerCall(controller, ctx, { operation: "repair" });
+	assert.equal(repaired.repaired, true);
+});
+
 test("controller inspect reports lock state and recover never force-steals an absent lock", async (t) => {
 	const fixture = createRepository(t, false);
 	const { controller } = registerRuntime();
@@ -478,6 +574,79 @@ test("controller routes legacy authority through explicit reset, verifies clean,
 	});
 	assert.equal(started.operation, "start");
 	assert.equal((started.state as Record<string, unknown>).mode, "ordinary");
+});
+
+test("controller resets only invalid compact-v2 authority after an exact interactive challenge", async (t) => {
+	const fixture = createRepository(t, false);
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository, true);
+	const started = await controllerCall(controller, ctx, {
+		operation: "start",
+		lineageId: "invalid-compact-reset",
+		input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, projection: { kind: "complete" }, policyHash: "a".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }),
+	});
+	const lineageId = (started.result as { lineage_id: string }).lineage_id;
+	writeFileSync(discoverCompactReview(fixture.repository, lineageId).store.statePath, "malformed compact state");
+
+	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
+	assert.equal((inspected.inspection as Record<string, unknown>).outcome, "clean");
+	assert.equal(((inspected.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "invalid");
+	assert.equal(inspected.status, "blocked");
+	assert.equal(inspected.next_action, "request-explicit-reset-authorization");
+	const request = (inspected.inspection as Record<string, unknown>).reset_request as Record<string, unknown>;
+	await assert.rejects(
+		controller.execute("wrong-invalid-compact-reset", { operation: "reset", input: JSON.stringify({ ...request, confirmation: `${String(request.confirmation)} altered` }) }, undefined, undefined, ctx),
+		/exactly match/i,
+	);
+	const reset = await controllerCall(controller, ctx, { operation: "reset", input: JSON.stringify(request) });
+	assert.equal((reset.inspection as Record<string, unknown>).outcome, "clean");
+	assert.equal((reset.inspection as Record<string, unknown>).compact_authority, undefined);
+	assert.equal(reset.next_action, "start-fresh-ordinary-review-after-verified-clean");
+});
+
+test("controller INSPECT treats a completed reset journal as history and routes a fresh compact-invalid reset", async (t) => {
+	const fixture = createRepository(t, false);
+	createLegacyReviewAuthority(fixture.repository);
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository, true);
+	const original = await controllerCall(controller, ctx, { operation: "inspect" });
+	await controllerCall(controller, ctx, {
+		operation: "reset",
+		input: JSON.stringify((original.inspection as Record<string, unknown>).reset_request),
+	});
+	const compact = startCompactReview({ cwd: fixture.repository, lineageId: "completed-journal-invalid", policyHash: "a".repeat(64) });
+	writeFileSync(discoverCompactReview(fixture.repository, compact.lineage_id).store.statePath, "malformed compact state");
+
+	const invalid = await controllerCall(controller, ctx, { operation: "inspect" });
+	assert.equal((invalid.inspection as Record<string, unknown>).outcome, "clean");
+	assert.equal(((invalid.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "invalid");
+	assert.equal(invalid.status, "blocked");
+	assert.equal(invalid.next_action, "request-explicit-reset-authorization");
+	assert.notEqual(invalid.next_action, "request-explicit-reset-recovery-authorization");
+
+	const reset = await controllerCall(controller, ctx, {
+		operation: "reset",
+		input: JSON.stringify((invalid.inspection as Record<string, unknown>).reset_request),
+	});
+	assert.equal((reset.inspection as Record<string, unknown>).outcome, "clean");
+	assert.equal(reset.next_action, "start-fresh-ordinary-review-after-verified-clean");
+});
+
+test("controller keeps valid compact terminal authority non-resettable", async (t) => {
+	const fixture = createRepository(t, false);
+	const { controller } = registerRuntime();
+	const ctx = extensionContext(fixture.repository, true);
+	await approveTrackedWorktreeTransaction(controller, ctx, "terminal-compact-reset");
+	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
+	assert.equal(inspected.status, "terminal");
+	const request = (inspected.inspection as Record<string, unknown>).reset_request as Record<string, unknown>;
+	await assert.rejects(
+		controller.execute("terminal-compact-reset", { operation: "reset", input: JSON.stringify(request) }, undefined, undefined, ctx),
+		/destructive reset requires/i,
+	);
+	const unchanged = await controllerCall(controller, ctx, { operation: "inspect" });
+	assert.equal(unchanged.status, "terminal");
+	assert.equal(((unchanged.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "approved");
 });
 
 test("controller rejects altered destructive reset bindings without authority mutation", async (t) => {

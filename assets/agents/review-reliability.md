@@ -45,11 +45,11 @@ Return only this compact-v2 native JSON envelope, with one lens result for this 
   "review_result": {
     "lens_results": [
       {
-        "lens": "reliability",
+        "lens": "review-reliability",
         "findings": [
           {
             "id": "RELIABILITY-001",
-            "lens": "reliability",
+            "lens": "review-reliability",
             "location": "path/to/file.ts:1",
             "severity": "CRITICAL",
             "claim": "Concrete user-impact claim.",

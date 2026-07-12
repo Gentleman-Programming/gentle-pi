@@ -15,6 +15,11 @@ import {
 	REVIEW_LENS,
 	type ReviewLens,
 } from "./review-triggers.ts";
+import {
+	assertReviewRuntimeIdentity,
+	loadedReviewRuntimeIdentity,
+	type LoadedReviewRuntimeIdentityV1,
+} from "./review-runtime-contract.ts";
 
 export const COMPACT_REVIEW_STATE = {
 	REVIEWING: "reviewing",
@@ -148,7 +153,35 @@ export interface CompactValidationCheckInput {
 	evidence: string[];
 }
 
+export interface CompactValidationProofInput {
+	original_criteria: CompactValidationCheckInput;
+	correction_regression: CompactValidationCheckInput;
+}
+
+export const COMPACT_VALIDATOR_PURPOSE = { TARGETED_CORRECTION: "targeted-correction-validation" } as const;
+
+export const COMPACT_VALIDATOR_SCOPE = { ORIGINAL_CRITERIA: "original-criteria", CORRECTION_REGRESSION: "correction-regression" } as const;
+
+export interface CompactValidatorRequestBody {
+	schema: "gentle-ai.compact-validator-request/v1";
+	purpose: (typeof COMPACT_VALIDATOR_PURPOSE)[keyof typeof COMPACT_VALIDATOR_PURPOSE];
+	scope: Array<(typeof COMPACT_VALIDATOR_SCOPE)[keyof typeof COMPACT_VALIDATOR_SCOPE]>;
+	lineage_id: string;
+	candidate_tree: string;
+	fix_diff_hash: string;
+	correction_ids: string[];
+	correction_paths: string[];
+	frozen_rows: CompactFinding[];
+	frozen_ledger_hash: string;
+}
+
+export interface CompactValidatorRequest {
+	body: CompactValidatorRequestBody;
+	request_hash: string;
+}
+
 export interface CompactTargetedValidationInput {
+	request_hash: string;
 	correction_ids: string[];
 	original_criteria: CompactValidationCheckInput;
 	correction_regression: CompactValidationCheckInput;
@@ -193,6 +226,8 @@ export interface CompactReviewStateV2 {
 	correction_ids: string[];
 	follow_ups: CompactFollowUp[];
 	correction_line_forecast?: number;
+	validator_request?: CompactValidatorRequest;
+	runtime_identity: LoadedReviewRuntimeIdentityV1;
 	correction?: CompactCorrectionRecord;
 	validation?: CompactTargetedValidation;
 	final_evidence_hash?: string;
@@ -490,6 +525,7 @@ export function createCompactReviewState(input: {
 		outcomes: {},
 		correction_ids: [],
 		follow_ups: [],
+		runtime_identity: loadedReviewRuntimeIdentity(),
 		escalation_reasons: [],
 	};
 	assertCompactReviewState(state);
@@ -576,6 +612,48 @@ export function completeCompactReview(
 	return next;
 }
 
+export function createCompactValidatorRequest(
+	current: CompactReviewStateV2,
+	snapshot: CorrectionSnapshotV1,
+): CompactValidatorRequest {
+	assertCompactReviewState(current);
+	if (current.state !== COMPACT_REVIEW_STATE.CORRECTION_REQUIRED || current.correction_line_forecast === undefined) {
+		throw new Error(`Cannot create compact validator request from ${current.state}`);
+	}
+	const frozenRows = current.findings.filter((finding) => current.correction_ids.includes(finding.id));
+	const body: CompactValidatorRequestBody = {
+		schema: "gentle-ai.compact-validator-request/v1",
+		purpose: COMPACT_VALIDATOR_PURPOSE.TARGETED_CORRECTION,
+		scope: Object.values(COMPACT_VALIDATOR_SCOPE),
+		lineage_id: current.lineage_id,
+		candidate_tree: snapshot.candidate_tree,
+		fix_diff_hash: snapshot.fix_diff_hash,
+		correction_ids: [...current.correction_ids],
+		correction_paths: [...snapshot.changed_paths],
+		frozen_rows: clone(frozenRows),
+		frozen_ledger_hash: domainHashV1("compact-findings", current.findings),
+	};
+	return { body, request_hash: domainHashV1("compact-validator-request", body) };
+}
+
+export function freezeCompactValidatorRequest(
+	current: CompactReviewStateV2,
+	request: CompactValidatorRequest,
+): CompactReviewStateV2 {
+	assertCompactReviewState(current);
+	if (current.state !== COMPACT_REVIEW_STATE.CORRECTION_REQUIRED || current.correction_line_forecast === undefined) {
+		throw new Error(`Cannot freeze compact validator request from ${current.state}`);
+	}
+	if (current.validator_request !== undefined) {
+		if (!equal(current.validator_request, request)) throw new Error("Targeted validation does not match the frozen native validator request");
+		return clone(current);
+	}
+	const next = clone(current);
+	next.validator_request = clone(request);
+	assertCompactReviewState(next);
+	return next;
+}
+
 export function beginCompactCorrection(
 	current: CompactReviewStateV2,
 	forecast: number,
@@ -627,6 +705,17 @@ export function completeCompactCorrection(
 	}
 	if (!equal(canonicalStrings(intendedUntracked, "Correction untracked paths"), current.intended_untracked)) {
 		throw new Error("Compact correction changed the frozen untracked path set");
+	}
+	if (!DIGEST.test(input.request_hash)) throw new Error("Targeted validation request hash is invalid");
+	if (current.validator_request === undefined || input.request_hash !== current.validator_request.request_hash) {
+		throw new Error("Targeted validation does not match the frozen native validator request");
+	}
+	if (
+		snapshot.candidate_tree !== current.validator_request.body.candidate_tree ||
+		snapshot.fix_diff_hash !== current.validator_request.body.fix_diff_hash ||
+		!equal(snapshot.changed_paths, current.validator_request.body.correction_paths)
+	) {
+		throw new Error("Recaptured correction does not match the frozen validator request");
 	}
 	const correctionIds = canonicalStrings(input.correction_ids, "Targeted validation correction IDs");
 	if (!equal(correctionIds, current.correction_ids)) {
@@ -764,6 +853,23 @@ export function assertCompactReviewState(state: CompactReviewStateV2): void {
 	if (state.correction_line_forecast !== undefined && (!Number.isSafeInteger(state.correction_line_forecast) || state.correction_line_forecast <= 0)) {
 		throw new Error("Compact correction forecast must be positive");
 	}
+	assertReviewRuntimeIdentity(state.runtime_identity);
+	if (state.validator_request !== undefined) {
+		const request = state.validator_request;
+		if (
+			state.correction_line_forecast === undefined ||
+			request.request_hash !== domainHashV1("compact-validator-request", request.body) ||
+			request.body.purpose !== COMPACT_VALIDATOR_PURPOSE.TARGETED_CORRECTION ||
+			!equal(request.body.scope, Object.values(COMPACT_VALIDATOR_SCOPE)) ||
+			request.body.lineage_id !== state.lineage_id ||
+			!equal(request.body.correction_ids, state.correction_ids) ||
+			!equal(request.body.frozen_rows, state.findings.filter((finding) => state.correction_ids.includes(finding.id))) ||
+			request.body.frozen_ledger_hash !== domainHashV1("compact-findings", state.findings) ||
+			request.body.correction_paths.some((path) => !state.genesis_paths.includes(path))
+		) {
+			throw new Error("Compact validator request is not bound to frozen review evidence");
+		}
+	}
 	if (state.correction) {
 		if (!DIGEST.test(state.correction.fix_diff_hash) || state.correction.changed_lines > state.correction_budget || state.correction.candidate_tree !== state.current_candidate_tree || !equal(state.correction.correction_ids, state.correction_ids) || !equal(state.correction.intended_untracked, state.intended_untracked)) {
 			throw new Error("Compact correction record is not bound to frozen authority");
@@ -773,7 +879,7 @@ export function assertCompactReviewState(state: CompactReviewStateV2): void {
 		throw new Error("Compact targeted validation is incomplete or unbound");
 	}
 	if (state.state === COMPACT_REVIEW_STATE.REVIEWING) {
-		if (state.findings.length > 0 || state.lens_results.length > 0 || state.correction_ids.length > 0 || state.final_evidence_hash !== undefined) {
+		if (state.findings.length > 0 || state.lens_results.length > 0 || state.correction_ids.length > 0 || state.validator_request !== undefined || state.final_evidence_hash !== undefined) {
 			throw new Error("Reviewing compact state contains post-review data");
 		}
 	} else if (state.lens_results.length !== state.selected_lenses.length) {
@@ -782,7 +888,7 @@ export function assertCompactReviewState(state: CompactReviewStateV2): void {
 	if (state.state === COMPACT_REVIEW_STATE.CORRECTION_REQUIRED && state.correction_ids.length === 0) {
 		throw new Error("Correction-required compact state has no correction IDs");
 	}
-	if (state.state === COMPACT_REVIEW_STATE.VALIDATING && state.correction_ids.length > 0 && (!state.correction || !state.validation)) {
+	if (state.state === COMPACT_REVIEW_STATE.VALIDATING && state.correction_ids.length > 0 && (!state.correction || !state.validation || !state.validator_request)) {
 		throw new Error("Corrected compact state requires one targeted validation");
 	}
 	if (state.state === COMPACT_REVIEW_STATE.APPROVED && !DIGEST.test(state.final_evidence_hash ?? "")) {

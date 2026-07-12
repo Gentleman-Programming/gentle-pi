@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
+import { REVIEW_LENS_PARITY_PATTERNS } from "./support/review-lens-parity.ts";
 
 const ROOT = join(import.meta.dirname, "..");
 const CANONICAL = "skills/_shared/review-ledger-contract.md";
@@ -109,19 +110,12 @@ test("canonical contract defines compact risk, causal admission, correction, CAS
 for (const path of REVIEW_LENSES) {
 	test(`${path} requires causal evidence and remains a one-shot read-only result producer`, () => {
 		const content = read(path);
-		assertMatches(path, content, [
-			/Run this selected lens exactly once against the supplied `initial_review_tree`/,
-			/`evidence_class` \(`deterministic \| inferential \| insufficient`\)/,
-			/`causal_disposition` \(`introduced \| behavior-activated \| worsened \| pre-existing \| base-only \| unknown`\)/,
-			/`changed-hunk:`[\s\S]*`candidate-created-path:`[\s\S]*`differential-test:`[\s\S]*`before-after:`/,
-			/Only candidate-caused BLOCKER or CRITICAL findings may require correction/,
-			/Do not persist state, mutate claims, launch actors, request fixes, validate fixes, or deliver anything/,
-		]);
+		assertMatches(path, content, REVIEW_LENS_PARITY_PATTERNS);
 	});
 }
 
 test("ordinary lens prompts contain the literal compact-v2 native result envelope", () => {
-	const expectedLenses = ["risk", "resilience", "readability", "reliability"];
+	const expectedLenses = ["review-risk", "review-resilience", "review-readability", "review-reliability"];
 	for (const [index, path] of REVIEW_LENSES.entries()) {
 		const blocks = jsonBlocks(path);
 		assert.equal(blocks.length, 1, `${path} must contain one native JSON example`);
@@ -134,6 +128,7 @@ test("ordinary lens prompts contain the literal compact-v2 native result envelop
 		assert.deepEqual(Object.keys(lensResults[0]!), ["lens", "findings", "evidence"]);
 		assert.equal(lensResults[0]!.lens, expectedLenses[index]);
 		const findings = lensResults[0]!.findings as Array<Record<string, unknown>>;
+		assert.equal(findings[0]!.lens, expectedLenses[index]);
 		assert.deepEqual(Object.keys(findings[0]!), [
 			"id",
 			"lens",

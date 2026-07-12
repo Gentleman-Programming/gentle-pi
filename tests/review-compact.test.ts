@@ -9,7 +9,9 @@ import {
 	completeCompactVerification,
 	beginCompactCorrection,
 	createCompactRefuterRequest,
+	createCompactValidatorRequest,
 	createCompactReceipt,
+	freezeCompactValidatorRequest,
 	createCompactReviewState,
 } from "../lib/review-compact.ts";
 import { REVIEW_RISK_TIER } from "../lib/review-risk.ts";
@@ -177,19 +179,23 @@ test("one forecast, one repository-sized correction, one targeted validator, and
 		}],
 	});
 	const forecast = beginCompactCorrection(reviewed, 3);
-	const corrected = completeCompactCorrection(forecast, {
+	const correction = {
 		candidate_tree: "3".repeat(40),
 		changed_paths: ["src/value.ts"],
 		changed_lines: 3,
 		fix_diff: "diff --git a/src/value.ts b/src/value.ts",
 		fix_diff_hash: "b".repeat(64),
-	}, [], {
-		correction_ids: ["READABILITY-009"],
+	};
+	const proof = {
 		original_criteria: { passed: true, evidence: ["original suite passed"] },
 		correction_regression: { passed: true, evidence: ["guard regression passed"] },
-		fix_caused_findings: [],
-		follow_ups: [],
-	});
+	};
+	const request = createCompactValidatorRequest(forecast, correction);
+	const frozen = freezeCompactValidatorRequest(forecast, request);
+	const validation = { request_hash: request.request_hash, correction_ids: ["READABILITY-009"], ...proof, fix_caused_findings: [], follow_ups: [] };
+	assert.throws(() => completeCompactCorrection(frozen, { ...correction, candidate_tree: "4".repeat(40) }, [], validation), /frozen validator request/i);
+	assert.equal(completeCompactCorrection(frozen, correction, [], { ...validation, original_criteria: { passed: false, evidence: ["independent acceptance failure"] } }).state, COMPACT_REVIEW_STATE.ESCALATED);
+	const corrected = completeCompactCorrection(frozen, correction, [], validation);
 	assert.equal(corrected.state, COMPACT_REVIEW_STATE.VALIDATING);
 	const terminal = completeCompactVerification(corrected, "full suite passed", true);
 	assert.equal(terminal.state, COMPACT_REVIEW_STATE.APPROVED);

@@ -889,7 +889,7 @@ test("installSddAssets installs gentle-ai-worker with a loader-compatible scoped
 test("normal and forced installation copy generic agents with complete role contracts", () => {
 	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
 	const expectedTools = {
-		"gentle-ai-explore": ["read", "grep", "find"],
+		"gentle-ai-explore": ["read", "grep", "find", "codegraph"],
 		"gentle-ai-verify": ["read", "grep", "find", "bash"],
 	} as const;
 
@@ -909,6 +909,14 @@ test("normal and forced installation copy generic agents with complete role cont
 					assert.deepEqual(installedTools, tools);
 					assert.match(source, /generic non-SDD work/);
 					assert.match(source, /Do not (?:fix findings, delegate to child agents|delegate to child agents, commit)/);
+					if (name === "gentle-ai-explore") {
+						assert.match(source, /cwd-scoped `codegraph` tool/);
+						assert.match(source, /never ask it to target another path/);
+						assert.match(source, /sole permitted mutation/);
+						assert.match(source, /all tracked files, source files, and other project content remain read-only/);
+						assert.match(source, /CodeGraph reports that it is unavailable or fails/);
+						assert.match(source, /Do not use that fallback before CodeGraph is unavailable or fails/);
+					}
 					assert.match(source, /Do not (?:edit, write|edit, write, or fix findings)/);
 					assert.match(source, /compressed (?:handoff|evidence handoff)/);
 					assert.match(source, /Do not use SDD phase protocols or review lenses\./);

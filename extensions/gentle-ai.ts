@@ -51,16 +51,25 @@ import type { TriggerEvent } from "../lib/review-triggers.ts";
 import { ReviewBundleExporter, ReviewBundleImporter } from "../lib/review-bundle.ts";
 import { domainHashV1 } from "../lib/review-canonical.ts";
 import { inspectLegacyReviewAuthorityV1, type LegacyInspectionV1 } from "../lib/review-legacy-detector.ts";
-import { destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
+import { compactResetRequestV1, destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
 import { ReviewMutationLockV1 } from "../lib/review-lock.ts";
 import {
+	COMPACT_START_BLOCK_ACTION,
 	GRAPH_V1_ORDINARY_READ_ONLY,
+	CompactReviewStartBlockedError,
 	discoverCompactReview,
 	finalizeCompactReview,
 	startCompactReview,
 } from "../lib/review-facade.ts";
 import { validateCompactReviewGate } from "../lib/review-compact-gate.ts";
-import { compactV2LineageExists, graphV1LineageExists } from "../lib/review-compact-store.ts";
+import {
+	COMPACT_AUTHORITY_OUTCOME,
+	compactV2LineageExists,
+	graphV1LineageExists,
+	hasGraphV1Authority,
+	inspectCompactReviewAuthorityV2,
+	type CompactAuthorityInspectionV2,
+} from "../lib/review-compact-store.ts";
 import {
 	inheritedUnsafeGitEnvironmentKeys,
 	resolveRepositoryAuthorityV1,
@@ -2327,11 +2336,38 @@ function durableResetRecoveryRequest(cwd: string): LegacyInspectionV1["reset_req
 	};
 }
 
-function inspectReviewAuthorityForController(cwd: string): LegacyInspectionV1 {
-	const inspection = inspectLegacyReviewAuthorityV1(cwd);
-	return inspection.outcome === "reset-in-progress"
-		? { ...inspection, reset_request: durableResetRecoveryRequest(cwd) }
-		: inspection;
+interface ControllerReviewAuthorityInspection extends LegacyInspectionV1 {
+	compact_authority?: CompactAuthorityInspectionV2;
+}
+
+function inspectReviewAuthorityForController(cwd: string): ControllerReviewAuthorityInspection {
+	const legacy = inspectLegacyReviewAuthorityV1(cwd);
+	const compact = inspectCompactReviewAuthorityV2(cwd);
+	const inspection = legacy.outcome === "reset-in-progress"
+		? { ...legacy, reset_request: durableResetRecoveryRequest(cwd) }
+		: compact.outcome === COMPACT_AUTHORITY_OUTCOME.INVALID
+			? { ...legacy, reset_request: compactResetRequestV1(cwd, legacy) }
+			: legacy;
+	return compact.outcome === COMPACT_AUTHORITY_OUTCOME.NONE
+		? inspection
+		: { ...inspection, compact_authority: compact };
+}
+
+function compactAuthorityAction(inspection: ControllerReviewAuthorityInspection): string | undefined {
+	switch (inspection.compact_authority?.outcome) {
+		case COMPACT_AUTHORITY_OUTCOME.APPROVED:
+			return COMPACT_START_BLOCK_ACTION.APPROVED;
+		case COMPACT_AUTHORITY_OUTCOME.ESCALATED:
+			return COMPACT_START_BLOCK_ACTION.ESCALATED;
+		case COMPACT_AUTHORITY_OUTCOME.ACTIVE:
+			return "finalize-existing-ordinary-review";
+		case COMPACT_AUTHORITY_OUTCOME.INVALID:
+			return inspection.outcome === "clean"
+				? "request-explicit-reset-authorization"
+				: "stop-and-report-ambiguous-authority";
+		default:
+			return undefined;
+	}
 }
 
 async function authorizeDestructiveReviewOperation(
@@ -3085,9 +3121,20 @@ function executeReviewControllerOperation(
 			operation: parameters.operation,
 			inspection,
 			lock: lock.inspect(),
-			...(inspection.outcome === "clean"
-				? { status: "ready", next_action: "start-ordinary-review" }
-				: inspection.outcome === "blocked-ambiguous"
+			...(inspection.outcome === "clean" && inspection.compact_authority !== undefined
+				? {
+					status: inspection.compact_authority.outcome === COMPACT_AUTHORITY_OUTCOME.ESCALATED
+						? "escalated"
+						: inspection.compact_authority.outcome === COMPACT_AUTHORITY_OUTCOME.APPROVED
+							? "terminal"
+							: inspection.compact_authority.outcome === COMPACT_AUTHORITY_OUTCOME.ACTIVE
+								? "in-progress"
+								: "blocked",
+					next_action: compactAuthorityAction(inspection),
+				}
+				: inspection.outcome === "clean"
+					? { status: "ready", next_action: "start-ordinary-review" }
+					: inspection.outcome === "blocked-ambiguous"
 					? { status: "blocked", next_action: "stop-and-report-ambiguous-authority" }
 					: {
 						status: "blocked",
@@ -3121,6 +3168,20 @@ function executeReviewControllerOperation(
 		return { operation: parameters.operation, result, inspection, next_action: inspection.outcome === "clean" ? "start-fresh-ordinary-review-after-verified-clean" : "inspect-reset-recovery" };
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.REPAIR) {
+		const inspection = inspectReviewAuthorityForController(defaultCwd);
+		if (
+			inspection.outcome === "clean" &&
+			inspection.compact_authority !== undefined &&
+			!hasGraphV1Authority(defaultCwd)
+		) {
+			return {
+				operation: parameters.operation,
+				repaired: false,
+				compact_authority: "immutable-untouched",
+				inspection,
+				next_action: compactAuthorityAction(inspection),
+			};
+		}
 		const store = ReviewTransactionStore.forRepository(defaultCwd);
 		store.repairCurrentAuthority();
 		return { operation: parameters.operation, repaired: true };
@@ -3154,14 +3215,29 @@ function executeReviewControllerOperation(
 					? { kind: REVIEW_PROJECTION.COMPLETE } as const
 					: undefined;
 			if (!projection) throw new Error("New compact ordinary START requires the complete projection");
-			const result = startCompactReview({
-				cwd: defaultCwd,
-				...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
-				policyHash: rawStart.policyHash,
-				projection,
-			});
-			const state = discoverCompactReview(defaultCwd, result.lineage_id).record.state;
-			return { operation: parameters.operation, result, state };
+			try {
+				const result = startCompactReview({
+					cwd: defaultCwd,
+					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
+					policyHash: rawStart.policyHash,
+					projection,
+				});
+				const state = discoverCompactReview(defaultCwd, result.lineage_id).record.state;
+				return { operation: parameters.operation, result, state };
+			} catch (error) {
+				if (error instanceof CompactReviewStartBlockedError) {
+					return {
+						operation: parameters.operation,
+						status: "blocked",
+						lineage_created: false,
+						lifecycle: `compact-${error.state}`,
+						lineage_id: error.lineageId,
+						next_action: error.action,
+						inspection: inspectReviewAuthorityForController(defaultCwd),
+					};
+				}
+				throw error;
+			}
 		}
 		const idempotencyKey = requiredControllerString(parameters, "idempotencyKey");
 		if (typeof parameters.lineageId !== "string" || parameters.lineageId.trim().length === 0) {
@@ -3228,6 +3304,7 @@ function executeReviewControllerOperation(
 				...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 				...(raw.review_result === undefined ? {} : { review_result: raw.review_result as never }),
 				...(raw.correction_line_forecast === undefined ? {} : { correction_line_forecast: Number(raw.correction_line_forecast) }),
+				...(raw.validation_proof === undefined ? {} : { validation_proof: raw.validation_proof as never }),
 				...(raw.validation === undefined ? {} : { validation: raw.validation as never }),
 				...(raw.final_evidence === undefined ? {} : { final_evidence: raw.final_evidence }),
 				...(raw.final_verification_passed === undefined ? {} : { final_verification_passed: raw.final_verification_passed }),

@@ -1,9 +1,10 @@
-import { randomBytes } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, type BigIntStats } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync, type BigIntStats } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { canonicalJsonV1, domainHashV1 } from "./review-canonical.ts";
 import { inspectLegacyReviewAuthorityV1, type LegacyInspectionV1 } from "./review-legacy-detector.ts";
 import { ReviewMutationLockV1, type ReviewLockPlatformAdapterV1 } from "./review-lock.ts";
+import { COMPACT_AUTHORITY_OUTCOME, inspectCompactReviewAuthorityV2 } from "./review-compact-store.ts";
 import { ReviewGraphObjectStoreV1, type ReviewStoreDescriptorV1 } from "./review-object-store.ts";
 import { IDENTITY_FILENAME, resolveRepositoryAuthorityForRecoveryV1, resolveRepositoryAuthorityV1, writePinnedRepositoryIdentityV1, type RepositoryAuthorityV1 } from "./review-repository.ts";
 
@@ -127,9 +128,60 @@ function readCurrentWithGenesisRepair(graph: ReviewGraphObjectStoreV1): ReturnTy
 	}
 }
 
-function assertExact(inspection: LegacyInspectionV1, options: DestructiveResetOptionsV1): void {
-	const request = inspection.reset_request;
+function compactV2ContentIdentityV1(cwd: string, allowBrokenIdentity = false): string {
+	const authority = allowBrokenIdentity ? resolveRepositoryAuthorityForRecoveryV1(cwd) : resolveRepositoryAuthorityV1(cwd);
+	const entries: string[] = [];
+	const collect = (path: string): void => {
+		const stat = lstatSync(path);
+		const kind = stat.isFile() ? "file" : stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "other";
+		const content = stat.isFile() ? readFileSync(path) : stat.isSymbolicLink() ? Buffer.from(readlinkSync(path)) : Buffer.alloc(0);
+		entries.push(domainHashV1("compact-v2-reset-entry", { relative_path: relative(authority.store_root, path), kind, mode: stat.mode, content_hash: createHash("sha256").update(content).digest("hex") }));
+		if (stat.isDirectory()) for (const entry of readdirSync(path).toSorted()) collect(join(path, entry));
+	};
+	const root = join(authority.store_root, "compact-v2");
+	if (existsSync(root)) collect(root);
+	return domainHashV1("compact-v2-reset-content", entries);
+}
+
+export function compactResetRequestV1(cwd: string, inspection: LegacyInspectionV1 = inspectLegacyReviewAuthorityV1(cwd), allowBrokenIdentity = false): LegacyInspectionV1["reset_request"] {
+	const authority = allowBrokenIdentity ? resolveRepositoryAuthorityForRecoveryV1(cwd) : resolveRepositoryAuthorityV1(cwd);
+	if (!existsSync(join(authority.store_root, "compact-v2")) || inspectCompactReviewAuthorityV2(cwd).outcome !== COMPACT_AUTHORITY_OUTCOME.INVALID) return inspection.reset_request;
+	const inventoryHash = domainHashV1("reset-inventory", {
+		legacy_inventory_hash: inspection.legacy_inventory_hash,
+		compact_v2_content_identity: compactV2ContentIdentityV1(cwd, allowBrokenIdentity),
+	});
+	return {
+		repositoryId: inspection.repository_id,
+		commonDirHash: inspection.common_directory_hash,
+		inventoryHash,
+		confirmation: `DESTROY REVIEW AUTHORITY ${inspection.repository_id} AT ${inspection.common_directory_hash} INVENTORY ${inventoryHash}`,
+	};
+}
+
+function assertExact(cwd: string, inspection: LegacyInspectionV1, options: DestructiveResetOptionsV1): void {
+	const request = compactResetRequestV1(cwd, inspection, options.allowBrokenIdentity === true);
 	if (options.repositoryId !== request.repositoryId || options.commonDirHash !== request.commonDirHash || options.inventoryHash !== request.inventoryHash || options.confirmation !== request.confirmation) throw new ReviewResetError("Destructive reset confirmation does not exactly match the current repository inventory");
+}
+
+function archiveCompletedResetStateV1(root: string, anchor: string): void {
+	const completed = readState(root);
+	if (completed.body.phase !== "complete") throw new ReviewResetError("A reset state already exists; use explicit resume");
+	const control = join(root, "control");
+	const history = join(control, "reset-history");
+	const destination = join(history, `${completed.body.reset_id}.json`);
+	mkdirSync(history, { recursive: true, mode: 0o700 });
+	anchoredDestructiveOperationV1({
+		anchor,
+		operation: "quarantine-move",
+		primaryPath: statePath(root),
+		paths: [statePath(root), destination],
+		action: () => {
+			if (existsSync(destination)) throw new ReviewResetError("Completed reset journal archive already exists");
+			renameSync(statePath(root), destination);
+		},
+	});
+	fsyncPath(history);
+	fsyncPath(control);
 }
 
 export function destructiveResetReviewAuthorityV1(options: DestructiveResetOptionsV1): DestructiveResetResultV1 {
@@ -137,21 +189,25 @@ export function destructiveResetReviewAuthorityV1(options: DestructiveResetOptio
 	let inspection = inspectLegacyReviewAuthorityV1(options.cwd, { allowBrokenIdentity: options.allowBrokenIdentity });
 	if (options.resume) {
 		const prior = readState(authority.store_root).body;
+		if (prior.phase === "complete") throw new ReviewResetError("Reset recovery requires an incomplete reset state");
 		if (options.repositoryId !== prior.repository_id || options.commonDirHash !== prior.common_directory_hash || options.inventoryHash !== prior.authorized_inventory_hash || options.confirmation !== `DESTROY REVIEW AUTHORITY ${prior.repository_id} AT ${prior.common_directory_hash} INVENTORY ${prior.authorized_inventory_hash}`) throw new ReviewResetError("Reset resume confirmation does not match the recorded destructive authorization");
-	} else assertExact(inspection, options);
+	} else assertExact(options.cwd, inspection, options);
 	const lock = new ReviewMutationLockV1(join(authority.store_root, "control"), authority.repository_id, authority.authority_id, options.mutationLockPlatform);
 	const owner = lock.acquire();
 	try {
 		inspection = inspectLegacyReviewAuthorityV1(options.cwd, { allowBrokenIdentity: options.allowBrokenIdentity });
 		const recoveringBrokenIdentity = Boolean(options.allowBrokenIdentity && inspection.identity_broken);
-		if (inspection.outcome === "clean" && !options.resume && !recoveringBrokenIdentity) throw new ReviewResetError("Destructive reset requires detected legacy or mixed authority");
-		if (!options.resume) assertExact(inspection, options);
+		const invalidCompactAuthority = inspectCompactReviewAuthorityV2(options.cwd).outcome === COMPACT_AUTHORITY_OUTCOME.INVALID;
+		if (inspection.outcome === "clean" && !options.resume && !recoveringBrokenIdentity && !invalidCompactAuthority) {
+			throw new ReviewResetError("Destructive reset requires detected legacy, mixed, or invalid compact authority");
+		}
+		if (!options.resume) assertExact(options.cwd, inspection, options);
 		let state: ResetState;
 		if (options.resume) state = readState(authority.store_root);
 		else {
-			if (existsSync(statePath(authority.store_root))) throw new ReviewResetError("A reset state already exists; use explicit resume");
+			if (existsSync(statePath(authority.store_root))) archiveCompletedResetStateV1(authority.store_root, authority.common_directory);
 			const resetId = randomBytes(32).toString("hex");
-			state = writeState(authority.store_root, { schema: "gentle-ai.review-reset-state/v1", reset_id: resetId, repository_id: authority.repository_id, common_directory_hash: inspection.common_directory_hash, authorized_inventory_hash: inspection.legacy_inventory_hash, authorization_hash: domainHashV1("reset-authorization", options.confirmation), sequence: 0, phase: "marked", quarantine_relative_path: join("reset-quarantine", resetId), moved_roots: [], deleted_roots: [], identity_recovery: recoveringBrokenIdentity });
+			state = writeState(authority.store_root, { schema: "gentle-ai.review-reset-state/v1", reset_id: resetId, repository_id: authority.repository_id, common_directory_hash: inspection.common_directory_hash, authorized_inventory_hash: options.inventoryHash, authorization_hash: domainHashV1("reset-authorization", options.confirmation), sequence: 0, phase: "marked", quarantine_relative_path: join("reset-quarantine", resetId), moved_roots: [], deleted_roots: [], identity_recovery: recoveringBrokenIdentity });
 		}
 		const quarantine = join(authority.store_root, "control", state.body.quarantine_relative_path);
 		mkdirSync(quarantine, { recursive: true, mode: 0o700 });
@@ -162,7 +218,10 @@ export function destructiveResetReviewAuthorityV1(options: DestructiveResetOptio
 		if (!atLeast("deleting")) for (const root of roots) {
 			const source = join(authority.store_root, root); const destination = join(quarantine, root);
 			if (existsSync(source) && !state.body.moved_roots.includes(root)) {
-				anchoredDestructiveOperationV1({ anchor: authority.common_directory, operation: "quarantine-move", primaryPath: source, paths: [source, destination], hook: options.raceWindowHook, action: () => renameSync(source, destination) });
+				anchoredDestructiveOperationV1({ anchor: authority.common_directory, operation: "quarantine-move", primaryPath: source, paths: [source, destination], hook: options.raceWindowHook, action: () => {
+					if (root === "compact-v2" && !options.resume) assertExact(options.cwd, inspection, options);
+					renameSync(source, destination);
+				} });
 				state = next(authority.store_root, state, "quarantining", { moved_roots: [...state.body.moved_roots, root] }, options.faultAfterPhase);
 			}
 		}

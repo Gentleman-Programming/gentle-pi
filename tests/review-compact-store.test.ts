@@ -12,8 +12,11 @@ import {
 	createCompactReviewState,
 } from "../lib/review-compact.ts";
 import {
+	COMPACT_AUTHORITY_OUTCOME,
 	COMPACT_STORE_OPERATION,
 	CompactReviewStoreV2,
+	discoverCompactReviewStores,
+	inspectCompactReviewAuthorityV2,
 } from "../lib/review-compact-store.ts";
 import {
 	REVIEW_MODE,
@@ -33,6 +36,18 @@ function repository(t: test.TestContext): string {
 	writeFileSync(join(root, "value.ts"), "export const value = 2;\n");
 	return root;
 }
+
+test("compact discovery fails closed for malformed, non-directory, and invalid lineage entries", (t) => {
+	for (const entry of ["bad entry", "not-a-directory", "invalid!lineage"] as const) {
+		const root = repository(t);
+		const store = CompactReviewStoreV2.forRepository(root, "valid-lineage");
+		mkdirSync(store.root, { recursive: true });
+		if (entry === "not-a-directory") writeFileSync(join(store.root, entry), "not a lineage directory");
+		else mkdirSync(join(store.root, entry));
+		assert.throws(() => discoverCompactReviewStores(root), /invalid compact authority entry/i, entry);
+		assert.equal(inspectCompactReviewAuthorityV2(root).outcome, COMPACT_AUTHORITY_OUTCOME.INVALID, entry);
+	}
+});
 
 test("compact store provides content-derived CAS, exact retry idempotency, terminal readback, and immutability", (t) => {
 	const root = repository(t);

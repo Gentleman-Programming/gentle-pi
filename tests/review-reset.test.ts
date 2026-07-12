@@ -5,12 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { inspectLegacyReviewAuthorityV1 } from "../lib/review-legacy-detector.ts";
-import { destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
+import { compactResetRequestV1, destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
 import { resolveRepositoryAuthorityV1 } from "../lib/review-repository.ts";
 import { REVIEW_MODE, ReviewTransactionStore, createReviewState } from "../lib/review-transaction.ts";
 import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
 import { qualifiedReviewLockPlatform, testSnapshot } from "./review-test-fixtures.ts";
 import { discoverCompactReview, startCompactReview } from "../lib/review-facade.ts";
+import { COMPACT_AUTHORITY_OUTCOME, inspectCompactReviewAuthorityV2 } from "../lib/review-compact-store.ts";
 
 function repository(): string {
 	const root = mkdtempSync(join(tmpdir(), "review-reset-"));
@@ -109,6 +110,45 @@ test("same-lineage graph-v1 and compact-v2 ambiguity fails closed and reset quar
 	}
 });
 
+test("invalid compact-v2 authority accepts only its exact reset challenge and is quarantined", () => {
+	const cwd = repository();
+	try {
+		const compact = startCompactReview({ cwd, lineageId: "invalid-compact", policyHash: "a".repeat(64) });
+		const compactStatePath = discoverCompactReview(cwd, compact.lineage_id).store.statePath;
+		writeFileSync(compactStatePath, "malformed compact state");
+		const legacyInspection = inspectLegacyReviewAuthorityV1(cwd);
+		assert.equal(legacyInspection.outcome, "clean");
+		assert.equal(inspectCompactReviewAuthorityV2(cwd).outcome, COMPACT_AUTHORITY_OUTCOME.INVALID);
+		const compactRequest = compactResetRequestV1(cwd, legacyInspection);
+		assert.notEqual(compactRequest.inventoryHash, legacyInspection.reset_request.inventoryHash);
+		assert.throws(
+			() => destructiveResetReviewAuthorityV1({
+				cwd,
+				...compactRequest,
+				inventoryHash: "0".repeat(64),
+				mutationLockPlatform: qualifiedReviewLockPlatform(),
+			}),
+			/exactly match/i,
+		);
+		let compactChanged = false;
+		assert.throws(
+			() => destructiveResetReviewAuthorityV1({
+				cwd,
+				...compactRequest,
+				mutationLockPlatform: qualifiedReviewLockPlatform(),
+				raceWindowHook: (event) => {
+					if (compactChanged || event.operation !== "quarantine-move" || !event.path.endsWith("compact-v2")) return;
+					compactChanged = true;
+					writeFileSync(compactStatePath, "mutated compact state");
+				},
+			}),
+			/exactly match/i,
+		);
+		assert.equal(compactChanged, true);
+		assert.equal(existsSync(join(storeRoot(cwd), "compact-v2")), true);
+	} finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
 test("reset state is durable and incomplete state blocks authority until explicit resume", () => {
 	const cwd = repository();
 	try {
@@ -118,6 +158,42 @@ test("reset state is durable and incomplete state blocks authority until explici
 		assert.throws(() => ReviewTransactionStore.forRepository(cwd), /reset/i);
 		const state = destructiveResetReviewAuthorityV1({ cwd, ...inspection.reset_request, resume: true, mutationLockPlatform: qualifiedReviewLockPlatform() });
 		assert.equal(state.store.initialization_kind, "destructive-reset");
+	} finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test("a completed reset journal is archived before a fresh compact-invalid reset, while only the fresh authorization may resume it", () => {
+	const cwd = repository();
+	try {
+		legacy(cwd);
+		const original = inspectLegacyReviewAuthorityV1(cwd).reset_request;
+		destructiveResetReviewAuthorityV1({ cwd, ...original, mutationLockPlatform: qualifiedReviewLockPlatform() });
+		const completed = JSON.parse(readFileSync(join(storeRoot(cwd), "control", "reset-state.json"), "utf8")) as { body: { reset_id: string; phase: string } };
+		assert.equal(completed.body.phase, "complete");
+
+		const compact = startCompactReview({ cwd, lineageId: "fresh-invalid-compact", policyHash: "a".repeat(64) });
+		writeFileSync(discoverCompactReview(cwd, compact.lineage_id).store.statePath, "malformed compact state");
+		const fresh = inspectLegacyReviewAuthorityV1(cwd);
+		assert.equal(fresh.outcome, "clean");
+		const compactRequest = compactResetRequestV1(cwd, fresh);
+
+		assert.throws(
+			() => destructiveResetReviewAuthorityV1({ cwd, ...compactRequest, mutationLockPlatform: qualifiedReviewLockPlatform(), faultAfterPhase: "deleting" }),
+			/injected/i,
+		);
+		assert.equal(inspectLegacyReviewAuthorityV1(cwd).outcome, "reset-in-progress");
+		assert.equal(existsSync(join(storeRoot(cwd), "compact-v2")), false);
+		assert.equal(
+			existsSync(join(storeRoot(cwd), "control", "reset-quarantine", JSON.parse(readFileSync(join(storeRoot(cwd), "control", "reset-state.json"), "utf8")).body.reset_id, "compact-v2")),
+			true,
+		);
+		assert.equal(existsSync(join(storeRoot(cwd), "control", "reset-history", `${completed.body.reset_id}.json`)), true);
+		assert.throws(
+			() => destructiveResetReviewAuthorityV1({ cwd, ...original, resume: true, mutationLockPlatform: qualifiedReviewLockPlatform() }),
+			/recorded destructive authorization/i,
+		);
+
+		destructiveResetReviewAuthorityV1({ cwd, ...compactRequest, resume: true, mutationLockPlatform: qualifiedReviewLockPlatform() });
+		assert.equal(inspectLegacyReviewAuthorityV1(cwd).outcome, "clean");
 	} finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 
@@ -170,26 +246,15 @@ function quarantinePath(cwd: string): string {
 	return join(storeRoot(cwd), "control", state.body.quarantine_relative_path);
 }
 
-test("reset resume forward-recovers a genesis quorum-loss crash in the graph-v1 store instead of throwing uncaught", () => {
+test("completed reset journals reject RECOVER instead of reviving their prior authorization", () => {
 	const cwd = repository();
 	try {
 		legacy(cwd);
 		const inspection = inspectLegacyReviewAuthorityV1(cwd);
-		const first = destructiveResetReviewAuthorityV1({ cwd, ...inspection.reset_request, mutationLockPlatform: qualifiedReviewLockPlatform() });
-		assert.equal(first.store.initialization_kind, "destructive-reset");
-		const graphRoot = join(storeRoot(cwd), "graph-v1");
-		// Simulate a crash that left only CURRENT.0 durably published.
-		unlinkSync(join(graphRoot, "CURRENT.1"));
-		unlinkSync(join(graphRoot, "CURRENT.2"));
+		destructiveResetReviewAuthorityV1({ cwd, ...inspection.reset_request, mutationLockPlatform: qualifiedReviewLockPlatform() });
 		assert.throws(
-			() => ReviewTransactionStore.forRepository(cwd, { mutationLockPlatform: qualifiedReviewLockPlatform() }).readCurrentAuthority(),
-			/quorum/i,
-		);
-		const resumed = destructiveResetReviewAuthorityV1({ cwd, ...inspection.reset_request, resume: true, mutationLockPlatform: qualifiedReviewLockPlatform() });
-		assert.equal(resumed.store.store_epoch, first.store.store_epoch);
-		assert.equal(
-			ReviewTransactionStore.forRepository(cwd, { mutationLockPlatform: qualifiedReviewLockPlatform() }).readCurrentAuthority().body.lineages.length,
-			0,
+			() => destructiveResetReviewAuthorityV1({ cwd, ...inspection.reset_request, resume: true, mutationLockPlatform: qualifiedReviewLockPlatform() }),
+			/incomplete reset state/i,
 		);
 	} finally { rmSync(cwd, { recursive: true, force: true }); }
 });
