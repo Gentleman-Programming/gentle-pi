@@ -92,14 +92,15 @@ function anchoredDestructiveOperationV1(options: { anchor: string; operation: Re
 }
 
 function statePath(root: string): string { return join(root, "control", "reset-state.json"); }
-function fsyncPath(path: string): void { const fd = openSync(path, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } }
+function fsyncFile(path: string): void { const fd = openSync(path, "r+"); try { fsyncSync(fd); } finally { closeSync(fd); } }
+function fsyncDirectory(path: string): void { if (process.platform === "win32") return; const fd = openSync(path, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } }
 function writeState(root: string, body: ResetState["body"]): ResetState {
 	const control = join(root, "control");
 	mkdirSync(control, { recursive: true, mode: 0o700 });
 	const envelope: ResetState = { body, reset_state_hash: domainHashV1("reset-state", body) };
 	const temporary = `${statePath(root)}.${process.pid}.tmp`;
 	writeFileSync(temporary, canonicalJsonV1(envelope), { flag: "w", mode: 0o600 });
-	fsyncPath(temporary); renameSync(temporary, statePath(root)); fsyncPath(control);
+	fsyncFile(temporary); renameSync(temporary, statePath(root)); fsyncDirectory(control);
 	return envelope;
 }
 function readState(root: string): ResetState {
@@ -180,8 +181,8 @@ function archiveCompletedResetStateV1(root: string, anchor: string): void {
 			renameSync(statePath(root), destination);
 		},
 	});
-	fsyncPath(history);
-	fsyncPath(control);
+	fsyncDirectory(history);
+	fsyncDirectory(control);
 }
 
 export function destructiveResetReviewAuthorityV1(options: DestructiveResetOptionsV1): DestructiveResetResultV1 {

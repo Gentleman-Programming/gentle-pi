@@ -238,7 +238,7 @@ test("live intended-untracked proof rejects mixed, ignored, extra, missing, cont
 	assert.throws(() => deriveIntendedUntrackedProofV1(root, candidate, ["one.txt", "two.txt"]), /UNTRACKED_DRIFT/);
 	writeFileSync(join(root, "one.txt"), "one\n");
 	chmodSync(join(root, "one.txt"), 0o755);
-	assert.throws(() => deriveIntendedUntrackedProofV1(root, candidate, ["one.txt", "two.txt"]), /UNTRACKED_DRIFT/);
+	if (process.platform !== "win32") assert.throws(() => deriveIntendedUntrackedProofV1(root, candidate, ["one.txt", "two.txt"]), /UNTRACKED_DRIFT/);
 	chmodSync(join(root, "one.txt"), 0o644);
 	git("add", "one.txt", "two.txt");
 	writeFileSync(join(root, "tracked.txt"), "drift\n");
@@ -294,7 +294,7 @@ function immutableFiles(root: string): Map<string, string> {
 		for (const entry of readdirSync(directory, { withFileTypes: true })) {
 			const path = join(directory, entry.name);
 			if (entry.isDirectory()) visit(path);
-			else if (entry.isFile()) files.set(path.slice(root.length + 1), readFileSync(path, "utf8"));
+			else if (entry.isFile()) files.set(path.slice(root.length + 1).replaceAll("\\", "/"), readFileSync(path, "utf8"));
 		}
 	};
 	visit(root);
@@ -448,7 +448,7 @@ test("repository-anchored supersession installation serializes CAS, retries exac
 	}), /STALE_AUTHORIZATION/);
 	assert.equal(supersessions.install("recover-legacy-review-authority", envelope).recovery_id, first.recovery_id);
 	assert.equal(lstatSync(join(supersessions.root, "recovery-required-v1", `${domainHashV1("openspec-change-name", "recover-legacy-review-authority")}.json`)).isFile(), true);
-	assert.equal(lstatSync(first.path).mode & 0o777, 0o600);
+	if (process.platform !== "win32") assert.equal(lstatSync(first.path).mode & 0o777, 0o600);
 	assert.deepEqual(immutableFiles(graphStore.root), sourceBytes);
 	const conflict = createSupersessionEnvelopeV1({ ...envelope.body, request_hash: digest("c") });
 	assert.throws(() => supersessions.install("recover-legacy-review-authority", conflict), /OPERATION_CONFLICT/);

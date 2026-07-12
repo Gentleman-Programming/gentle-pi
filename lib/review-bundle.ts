@@ -137,8 +137,8 @@ function closure(store: ReviewGraphObjectStoreV1, roots: readonly ReviewBundleRo
 	return events;
 }
 
-function fsyncFile(path: string): void { const fd = openSync(path, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } }
-function fsyncDirectory(path: string): void { if (!statSync(path).isDirectory()) throw new ReviewBundleError("Bundle destination parent is invalid"); const fd = openSync(path, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } }
+function fsyncFile(path: string): void { const fd = openSync(path, "r+"); try { fsyncSync(fd); } finally { closeSync(fd); } }
+function fsyncDirectory(path: string): void { if (!statSync(path).isDirectory()) throw new ReviewBundleError("Bundle destination parent is invalid"); if (process.platform === "win32") return; const fd = openSync(path, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } }
 function writeCheckpoint(checkpoints: ReviewCheckpointStoreV1, input: Parameters<ReviewCheckpointStoreV1["write"]>[0]): void {
 	let sequence = 0;
 	try { sequence = checkpoints.read(input.operation_id, input).checkpoint_sequence + 1; } catch (error) { if (!(error instanceof Error) || !/missing or malformed/.test(error.message)) throw error; }

@@ -634,12 +634,14 @@ export class CompactReviewStoreV2 {
 		const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
 		try {
 			writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
-			const file = openSync(temporary, "r");
+			const file = openSync(temporary, "r+");
 			try { fsyncSync(file); } finally { closeSync(file); }
 			this.#faultInjector?.(faultPoint);
 			renameSync(temporary, path);
-			const directory = openSync(this.lineageDirectory, "r");
-			try { fsyncSync(directory); } finally { closeSync(directory); }
+			if (process.platform !== "win32") {
+				const directory = openSync(this.lineageDirectory, "r");
+				try { fsyncSync(directory); } finally { closeSync(directory); }
+			}
 		} finally {
 			rmSync(temporary, { force: true });
 		}

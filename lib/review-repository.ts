@@ -199,7 +199,7 @@ export function writePinnedRepositoryIdentityV1(storeRoot: string, identity: Rev
 	let installed = false;
 	try {
 		writeFileSync(temporary, canonicalJsonV1(identity), { flag: "wx", mode: 0o600 });
-		const temporaryFile = openSync(temporary, "r");
+		const temporaryFile = openSync(temporary, "r+");
 		try {
 			fsyncSync(temporaryFile);
 		} finally {
@@ -219,17 +219,19 @@ export function writePinnedRepositoryIdentityV1(storeRoot: string, identity: Rev
 		} catch {}
 	}
 	if (!installed) return readPinnedRepositoryIdentityV1(storeRoot) ?? identity;
-	const file = openSync(path, "r");
+	const file = openSync(path, "r+");
 	try {
 		fsyncSync(file);
 	} finally {
 		closeSync(file);
 	}
-	const directory = openSync(storeRoot, "r");
-	try {
-		fsyncSync(directory);
-	} finally {
-		closeSync(directory);
+	if (process.platform !== "win32") {
+		const directory = openSync(storeRoot, "r");
+		try {
+			fsyncSync(directory);
+		} finally {
+			closeSync(directory);
+		}
 	}
 	return identity;
 }

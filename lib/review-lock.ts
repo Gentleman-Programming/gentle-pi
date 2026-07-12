@@ -77,6 +77,14 @@ export function qualifiedNodeFsLockPlatformV1(): ReviewLockPlatformAdapterV1 {
 			} catch (error) {
 				throw new ReviewLockError(`Review lock atomic no-replace move source is unavailable: ${error instanceof Error ? error.message : String(error)}`);
 			}
+			if (process.platform === "win32") {
+				try {
+					renameSync(source, destination);
+				} catch (error) {
+					throw new ReviewLockError(`Review lock atomic no-replace move is unsupported on this platform or filesystem: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				return;
+			}
 			if (!isDirectory) {
 				try {
 					linkSync(source, destination);
@@ -212,12 +220,13 @@ export class ReviewMutationLockV1 {
 	}
 
 	private fsyncFile(path: string): void {
-		const descriptor = openSync(path, "r");
+		const descriptor = openSync(path, "r+");
 		try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
 	}
 
 	private fsyncDirectory(path: string): void {
 		if (!statSync(path).isDirectory()) throw new ReviewLockError("Review lock path is not a directory");
+		if (process.platform === "win32") return;
 		const descriptor = openSync(path, "r");
 		try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
 	}

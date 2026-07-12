@@ -1773,6 +1773,7 @@ export class ReviewTransactionStore {
 
 	private fsyncDirectory(path: string): void {
 		if (!statSync(path).isDirectory()) throw new ReviewIntegrityError("Expected store directory");
+		if (process.platform === "win32") return;
 		const descriptor = openSync(path, "r");
 		try {
 			fsyncSync(descriptor);

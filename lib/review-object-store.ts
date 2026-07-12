@@ -217,6 +217,6 @@ export class ReviewGraphObjectStoreV1 {
 		this.fsyncDirectory(this.root);
 	}
 	private readPointer(slot: number): CurrentPointerV1 { const pointer = parseCanonicalJsonV1(readFileSync(join(this.root, `CURRENT.${slot}`))) as CurrentPointerV1; const { pointer_hash, ...body } = pointer; if (pointer.schema !== "gentle-ai.review-current/v1" || pointer.repository_id !== this.#repositoryId || pointer.authority_id !== this.#authorityId || !DIGEST.test(pointer.root_set_id) || pointer.pointer_hash !== domainHashV1("current", body)) throw new ReviewObjectStoreError("CURRENT pointer is invalid"); return pointer; }
-	private fsyncFile(path: string): void { const descriptor = openSync(path, "r"); try { fsyncSync(descriptor); } finally { closeSync(descriptor); } }
-	private fsyncDirectory(path: string): void { if (!statSync(path).isDirectory()) throw new ReviewObjectStoreError("Expected a directory"); const descriptor = openSync(path, "r"); try { fsyncSync(descriptor); } finally { closeSync(descriptor); } }
+	private fsyncFile(path: string): void { const descriptor = openSync(path, "r+"); try { fsyncSync(descriptor); } finally { closeSync(descriptor); } }
+	private fsyncDirectory(path: string): void { if (!statSync(path).isDirectory()) throw new ReviewObjectStoreError("Expected a directory"); if (process.platform === "win32") return; const descriptor = openSync(path, "r"); try { fsyncSync(descriptor); } finally { closeSync(descriptor); } }
 }
