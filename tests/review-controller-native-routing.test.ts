@@ -166,6 +166,55 @@ test("native START uses the default policy or a canonical safe policy path, and 
 	assert.equal(requests.length, 2);
 });
 
+test("native START forwards a validated base ref and rejects invalid values before native calls", async (t) => {
+	const cwd = repository(t);
+	const requests: Array<{ cwd: string; baseRef?: string }> = [];
+	const { controller } = runtime(fakeNative({
+		start: async (request) => {
+			requests.push(request);
+			return { lineageId: "native-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 2, changedLines: 7, correctionBudget: 4 };
+		},
+	}));
+	await controller.execute("committed-base", { operation: "start", input: JSON.stringify({ mode: "ordinary", baseRef: "origin/main" }) }, undefined, undefined, context(cwd));
+	assert.deepEqual(requests, [{ cwd, baseRef: "origin/main" }]);
+	for (const baseRef of ["", "   ", " origin/main", "origin/main ", "origin\0main", "origin\nmain", "origin\rmain", "origin\tmain", "origin\u007fmain", 42, [], {}]) {
+		const rejected = await controller.execute("invalid-base", { operation: "start", input: JSON.stringify({ mode: "ordinary", baseRef }) }, undefined, undefined, context(cwd));
+		assert.deepEqual(rejected.details, {
+			operation: "start",
+			status: "blocked",
+			outcome: "native-start-base-ref-invalid",
+			reason: "base-ref-invalid",
+			mutation_performed: false,
+			mutation_outcome: "none",
+		});
+	}
+	assert.equal(requests.length, 1);
+});
+
+test("native ordinary START blocks unknown input fields before native calls", async (t) => {
+	const cwd = repository(t);
+	let starts = 0;
+	const { controller } = runtime(fakeNative({
+		start: async () => {
+			starts += 1;
+			return { lineageId: "native-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 2, changedLines: 7, correctionBudget: 4 };
+		},
+	}));
+	for (const field of ["base_ref", "unexpected"]) {
+		const rejected = await controller.execute("unknown-start-field", { operation: "start", input: JSON.stringify({ mode: "ordinary", [field]: "origin/main" }) }, undefined, undefined, context(cwd));
+		assert.deepEqual(rejected.details, {
+			operation: "start",
+			status: "blocked",
+			outcome: "native-start-input-invalid",
+			reason: "unknown-field",
+			field,
+			mutation_performed: false,
+			mutation_outcome: "none",
+		});
+	}
+	assert.equal(starts, 0);
+});
+
 test("legacy compact START retains its policyHash contract", async (t) => {
 	const cwd = repository(t);
 	const { controller } = runtime(null);
