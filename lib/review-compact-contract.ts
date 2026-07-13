@@ -4,11 +4,14 @@ import {
 	COMPACT_FINDING_OUTCOME,
 	COMPACT_SEVERITY,
 	type CompactRefuterResultInput,
+	type CompactFinding,
+	type CompactLensResultInput,
 	type CompactValidationProofInput,
 	type CompactReviewResultInput,
 	type CompactTargetedValidationInput,
 } from "./review-compact.ts";
 import { REVIEW_LENS } from "./review-triggers.ts";
+import { normalizeRefuterBatch, type RefuterBatch } from "./review-refuter-adapter.ts";
 
 const DIGEST = /^[0-9a-f]{64}$/;
 const LINEAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -92,15 +95,18 @@ function optionalLineage(value: unknown, area: string): string | undefined {
 }
 
 function parseFinding(value: unknown, area: string) {
-	const row = exact(value, area, ["location", "severity", "claim", "evidence_class", "causal_disposition", "proof_refs"], ["id", "lens"]);
+	const row = exact(value, area, ["location", "severity", "claim", "proof_refs"], ["id", "lens", "evidence_class", "causal_disposition"]);
+	const severity = enumValue(row.severity, COMPACT_SEVERITY, `${area}.severity`);
+	const severe = severity === COMPACT_SEVERITY.BLOCKER || severity === COMPACT_SEVERITY.CRITICAL;
+	if (severe && (row.evidence_class === undefined || row.causal_disposition === undefined)) fail(area, "required", "severe findings require evidence_class and causal_disposition");
 	return {
 		...(row.id === undefined ? {} : { id: string(row.id, `${area}.id`) }),
 		...(row.lens === undefined ? {} : { lens: enumValue(row.lens, REVIEW_LENS, `${area}.lens`) }),
 		location: string(row.location, `${area}.location`),
-		severity: enumValue(row.severity, COMPACT_SEVERITY, `${area}.severity`),
+		severity,
 		claim: string(row.claim, `${area}.claim`),
-		evidence_class: enumValue(row.evidence_class, COMPACT_EVIDENCE_CLASS, `${area}.evidence_class`),
-		causal_disposition: enumValue(row.causal_disposition, CAUSAL_DISPOSITION, `${area}.causal_disposition`),
+		...(row.evidence_class === undefined ? {} : { evidence_class: enumValue(row.evidence_class, COMPACT_EVIDENCE_CLASS, `${area}.evidence_class`) }),
+		...(row.causal_disposition === undefined ? {} : { causal_disposition: enumValue(row.causal_disposition, CAUSAL_DISPOSITION, `${area}.causal_disposition`) }),
 		proof_refs: strings(row.proof_refs, `${area}.proof_refs`),
 	};
 }
@@ -171,7 +177,7 @@ export function parseCompactStartInput(value: unknown): CompactStartContractInpu
 	return { cwd: string(input.cwd, "review/start.cwd"), ...(optionalLineage(input.lineageId, "review/start.lineageId") === undefined ? {} : { lineageId: optionalLineage(input.lineageId, "review/start.lineageId")! }), policyHash, ...(projection === undefined ? {} : { projection }) };
 }
 
-export function parseCompactFinalizeInput(value: unknown): CompactFinalizeContractInput {
+function parseCompactFinalizeInputValue(value: unknown, preserveFinalEvidence: boolean): CompactFinalizeContractInput {
 	const input = exact(value, "review/finalize", ["cwd"], ["lineageId", "review_result", "correction_line_forecast", "validation_proof", "validation", "final_evidence", "final_verification_passed", "refuter_batch"]);
 	if ((input.final_evidence === undefined) !== (input.final_verification_passed === undefined)) fail("review/finalize", "field-pair", "final evidence and result must appear together");
 	let correction_line_forecast: number | undefined;
@@ -180,5 +186,85 @@ export function parseCompactFinalizeInput(value: unknown): CompactFinalizeContra
 		correction_line_forecast = input.correction_line_forecast;
 	}
 	if (input.final_verification_passed !== undefined && typeof input.final_verification_passed !== "boolean") fail("review/finalize.final_verification_passed", "type", "must be boolean");
-	return { cwd: string(input.cwd, "review/finalize.cwd"), ...(optionalLineage(input.lineageId, "review/finalize.lineageId") === undefined ? {} : { lineageId: optionalLineage(input.lineageId, "review/finalize.lineageId")! }), ...(input.review_result === undefined ? {} : { review_result: parseReviewResult(input.review_result, "review/finalize.review_result") }), ...(correction_line_forecast === undefined ? {} : { correction_line_forecast }), ...(input.validation_proof === undefined ? {} : { validation_proof: parseValidationProof(input.validation_proof, "review/finalize.validation_proof") }), ...(input.validation === undefined ? {} : { validation: parseValidation(input.validation, "review/finalize.validation") }), ...(input.final_evidence === undefined ? {} : { final_evidence: string(input.final_evidence, "review/finalize.final_evidence") }), ...(input.final_verification_passed === undefined ? {} : { final_verification_passed: input.final_verification_passed }), ...(input.refuter_batch === undefined ? {} : { refuter_batch: input.refuter_batch }) };
+	let final_evidence: string | undefined;
+	if (input.final_evidence !== undefined) {
+		if (preserveFinalEvidence) {
+			if (typeof input.final_evidence !== "string" || input.final_evidence.length === 0) fail("review/finalize.final_evidence", "empty", "must contain at least one byte");
+			final_evidence = input.final_evidence;
+		} else {
+			final_evidence = string(input.final_evidence, "review/finalize.final_evidence");
+		}
+	}
+	return { cwd: string(input.cwd, "review/finalize.cwd"), ...(optionalLineage(input.lineageId, "review/finalize.lineageId") === undefined ? {} : { lineageId: optionalLineage(input.lineageId, "review/finalize.lineageId")! }), ...(input.review_result === undefined ? {} : { review_result: parseReviewResult(input.review_result, "review/finalize.review_result") }), ...(correction_line_forecast === undefined ? {} : { correction_line_forecast }), ...(input.validation_proof === undefined ? {} : { validation_proof: parseValidationProof(input.validation_proof, "review/finalize.validation_proof") }), ...(input.validation === undefined ? {} : { validation: parseValidation(input.validation, "review/finalize.validation") }), ...(final_evidence === undefined ? {} : { final_evidence }), ...(input.final_verification_passed === undefined ? {} : { final_verification_passed: input.final_verification_passed }), ...(input.refuter_batch === undefined ? {} : { refuter_batch: input.refuter_batch }) };
+}
+
+export function parseCompactFinalizeInput(value: unknown): CompactFinalizeContractInput {
+	return parseCompactFinalizeInputValue(value, false);
+}
+
+export function parseNativeCompactFinalizeInput(value: unknown): CompactFinalizeContractInput & { refuter_batch?: RefuterBatch } {
+	const input = parseCompactFinalizeInputValue(value, true);
+	for (const lens of input.review_result?.lens_results ?? []) {
+		if (lens.evidence.length === 0 || lens.findings.some((finding) => finding.proof_refs?.length === 0)) fail("review/finalize.review_result", "empty", "reviewer evidence and proof_refs must be non-empty");
+		if (lens.findings.some((finding) => finding.evidence_class === COMPACT_EVIDENCE_CLASS.INFO)) fail("review/finalize.review_result", "enum", "reviewer evidence_class must match the published native schema");
+	}
+	for (const validation of [input.validation_proof, input.validation]) {
+		if (validation && (validation.original_criteria.evidence.length === 0 || validation.correction_regression.evidence.length === 0)) fail("review/finalize.validation", "empty", "validator evidence must be non-empty");
+	}
+	if (input.validation?.follow_ups.some((row) => row.proof_refs.length === 0)) fail("review/finalize.validation.follow_ups", "empty", "follow-up proof_refs must be non-empty");
+	let refuter_batch: RefuterBatch | undefined;
+	if (input.refuter_batch !== undefined) {
+		const reviewResult = input.review_result;
+		if (reviewResult?.refuter_request_hash === undefined) fail("review/finalize.refuter_batch", "request-hash", "requires the expected review_result.refuter_request_hash");
+		const candidateCausality = new Set<string>([CAUSAL_DISPOSITION.INTRODUCED, CAUSAL_DISPOSITION.BEHAVIOR_ACTIVATED, CAUSAL_DISPOSITION.WORSENED]);
+		const findings: CompactFinding[] = [];
+		for (const lens of reviewResult.lens_results) {
+			for (const finding of lens.findings) {
+				if ((finding.severity !== COMPACT_SEVERITY.BLOCKER && finding.severity !== COMPACT_SEVERITY.CRITICAL) || finding.evidence_class !== COMPACT_EVIDENCE_CLASS.INFERENTIAL || !candidateCausality.has(finding.causal_disposition ?? "")) continue;
+				if (finding.id === undefined || (finding.lens ?? lens.lens) === undefined) fail("review/finalize.refuter_batch", "finding-id", "requires stable IDs and lenses for every refuted finding");
+				findings.push({
+					id: finding.id,
+					lens: (finding.lens ?? lens.lens)!,
+					location: finding.location!,
+					severity: finding.severity,
+					claim: finding.claim!,
+					evidence_class: finding.evidence_class,
+					causal_disposition: finding.causal_disposition!,
+					proof_refs: [...finding.proof_refs!],
+				});
+			}
+		}
+		const normalized = normalizeRefuterBatch({ request_hash: reviewResult.refuter_request_hash, findings }, input.refuter_batch);
+		if (normalized.status !== "normalized") fail("review/finalize.refuter_batch", normalized.reason_code, "must match the frozen request hash and IDs with complete concrete proof rows");
+		refuter_batch = {
+			schema: "gentle-ai.refuter-result-batch/v1",
+			request_hash: normalized.refuter_request_hash,
+			results: normalized.refuter_results,
+		};
+	}
+	return { ...input, ...(refuter_batch === undefined ? {} : { refuter_batch }) };
+}
+
+const NATIVE_REVIEWER_LENS = {
+	[REVIEW_LENS.RISK]: "risk",
+	[REVIEW_LENS.RESILIENCE]: "resilience",
+	[REVIEW_LENS.READABILITY]: "readability",
+	[REVIEW_LENS.RELIABILITY]: "reliability",
+} as const;
+
+export function toNativeReviewerDocument(input: CompactLensResultInput) {
+	const lens = input.lens === undefined ? undefined : NATIVE_REVIEWER_LENS[input.lens as keyof typeof NATIVE_REVIEWER_LENS];
+	return {
+		...(lens === undefined ? {} : { lens }),
+		findings: input.findings.map((finding) => ({ ...finding, ...(finding.lens === undefined ? {} : { lens: NATIVE_REVIEWER_LENS[finding.lens as keyof typeof NATIVE_REVIEWER_LENS] }) })),
+		evidence: [...input.evidence],
+	};
+}
+
+export function toNativeValidatorDocument(input: CompactValidationProofInput | CompactTargetedValidationInput) {
+	return {
+		original_criteria: input.original_criteria,
+		correction_regression: input.correction_regression,
+		follow_ups: "follow_ups" in input ? input.follow_ups.map((row) => ({ observation: row.summary, proof_refs: [...row.proof_refs] })) : [],
+	};
 }

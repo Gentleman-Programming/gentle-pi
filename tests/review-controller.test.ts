@@ -1122,7 +1122,7 @@ test("general STATUS returns the typed native-status-unsupported boundary withou
 		inventory_complete: false,
 		next_action: "require-upstream-read-only-native-status-inventory",
 		evidence: {
-			native_contract: "gentle-ai/2.1.0",
+			native_contract: "gentle-ai/2.1.2",
 			general_status: "unsupported",
 			claimant_inventory: "unsupported",
 		},

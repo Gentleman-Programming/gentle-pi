@@ -41,12 +41,40 @@ test("refuter adapter normalizes only the exact complete frozen batch", () => {
 	});
 });
 
-test("refuter adapter rejects prose, aliases, invalid outcomes, and proof outside frozen evidence", () => {
+test("refuter adapter preserves published inconclusive outcomes", () => {
+	const normalized = normalizeRefuterBatch(request, {
+		schema: "gentle-ai.refuter-result-batch/v1",
+		request_hash: request.request_hash,
+		results: [{ finding_id: "READABILITY-001", outcome: "inconclusive", proof_refs: ["changed-hunk:lib/value.ts:1"] }],
+	});
+	assert.equal(normalized.status, "normalized");
+	assert.equal(normalized.status === "normalized" && normalized.refuter_results[0]?.outcome, "inconclusive");
+});
+
+test("refuter adapter accepts independent concrete refuter proof", () => {
+	const normalized = normalizeRefuterBatch(request, {
+		schema: "gentle-ai.refuter-result-batch/v1",
+		request_hash: request.request_hash,
+		results: [{
+			finding_id: "READABILITY-001",
+			outcome: "refuted",
+			proof_refs: ["differential-test:independent reproduction passes"],
+		}],
+	});
+
+	assert.equal(normalized.status, "normalized");
+	assert.deepEqual(normalized.status === "normalized" && normalized.refuter_results[0]?.proof_refs, [
+		"differential-test:independent reproduction passes",
+	]);
+});
+
+test("refuter adapter rejects prose, aliases, invalid outcomes, and empty or malformed proof", () => {
 	for (const batch of [
 		`prose ${JSON.stringify({ schema: "gentle-ai.refuter-result-batch/v1", request_hash: request.request_hash, results: [] })}`,
 		{ schema: "gentle-ai.refuter-result-batch/v1", request_hash: request.request_hash, results: [{ id: "READABILITY-001", resolution: "refuted", proof_refs: ["changed-hunk:lib/value.ts:1"] }] },
-		{ schema: "gentle-ai.refuter-result-batch/v1", request_hash: request.request_hash, results: [{ finding_id: "READABILITY-001", outcome: "inconclusive", proof_refs: ["changed-hunk:lib/value.ts:1"] }] },
-		{ schema: "gentle-ai.refuter-result-batch/v1", request_hash: request.request_hash, results: [{ finding_id: "READABILITY-001", outcome: "refuted", proof_refs: ["changed-hunk:other.ts:1"] }] },
+		{ schema: "gentle-ai.refuter-result-batch/v1", request_hash: request.request_hash, results: [{ finding_id: "READABILITY-001", outcome: "refuted", proof_refs: [] }] },
+		{ schema: "gentle-ai.refuter-result-batch/v1", request_hash: request.request_hash, results: [{ finding_id: "READABILITY-001", outcome: "refuted", proof_refs: [""] }] },
+		{ schema: "gentle-ai.refuter-result-batch/v1", request_hash: request.request_hash, results: [{ finding_id: "READABILITY-001", outcome: "refuted", proof_refs: [" untrimmed proof"] }] },
 	]) assert.equal(normalizeRefuterBatch(request, batch).status, "invalid");
 });
 

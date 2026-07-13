@@ -66,7 +66,7 @@ Return only this compact-v2 native JSON envelope, with one lens result for this 
 }
 ```
 
-Use empty `findings` and `evidence` arrays when clean. Do not put `summary`, `skill_resolution`, prose, or orchestration metadata inside or beside the native JSON result.
+If clean, use an empty `findings` array and a non-empty `evidence` array containing concrete scope-reviewed evidence. Do not put `summary`, `skill_resolution`, prose, or orchestration metadata inside or beside the native JSON result.
 
 Only candidate-caused BLOCKER or CRITICAL findings may require correction. Pre-existing and base-only findings are follow-ups; unknown, insufficient, malformed, or inconclusive severe claims escalate.
 

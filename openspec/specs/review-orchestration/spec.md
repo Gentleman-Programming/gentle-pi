@@ -31,7 +31,7 @@ Ordinary MUST run 0/1/4 lenses once against `initial_review_tree`. Before corrob
 
 ### Requirement: Constant batched refutation and voting
 
-The controller MUST verify `deterministic` evidence directly. All `inferential-severe` rows MAY go once to one read-only refuter returning per-ID `refuted | corroborated | inconclusive`. Invalid/insufficient evidence becomes `inconclusive` and escalates.
+The controller MUST verify `deterministic` evidence directly. All `inferential-severe` rows MAY go once to one read-only refuter returning per-ID `refuted | corroborated | inconclusive`. A complete row MAY cite independent concrete proof rather than duplicating reviewer proof references. Empty/malformed proof and invalid/insufficient evidence become `inconclusive` and escalate.
 (Previously: three refuters.)
 
 #### Scenario: Evidence routing
@@ -54,20 +54,20 @@ The controller MUST verify `deterministic` evidence directly. All `inferential-s
 
 ### Requirement: Bounded convergence and Judgment Day
 
-Ordinary MAY authorize one fix batch. After fixes, one validator receives only requested frozen IDs, their exact hash-bound canonical rows, and the fix diff; resolutions are separate. It MAY resolve IDs/detect fix-line regression but MUST NOT alter claims, add work, launch actors, or repeat. No-fix uses zero validators. One final verification ends `approved | escalated`. Explicit Judgment Day replaces ordinary, uses two blind judges/zero refuters, and alone permits two rounds.
+Ordinary MAY authorize up to three failed targeted attempts within the original cumulative changed-line budget. Each attempt uses one positive pre-edit forecast, one correction bound to the frozen IDs and genesis paths, and one validator result for original criteria plus correction regression. Failed targeted validation returns to `correction_required` while both attempt and cumulative budget remain; it never reruns initial lenses or refutation, changes frozen claims, adds work, or launches discovery actors. A passing targeted validation advances to one final verification; the third failed attempt or cumulative-budget exhaustion escalates. No-fix uses zero validators. Explicit Judgment Day replaces ordinary, uses two blind judges/zero refuters, and alone permits discovery re-judgment rounds.
 (Previously: shared iteration.)
 
 #### Scenario: Fix path
 
-- GIVEN ordinary fixes complete
+- GIVEN an ordinary correction attempt passes targeted validation
 - WHEN advancing
-- THEN one validator and one final verification run without new work
+- THEN one final verification runs without rerunning initial review
 
 #### Scenario: No-fix or failure
 
-- GIVEN no fix or failed validation/verification
+- GIVEN no fix, a failed targeted validation with budget remaining, or exhausted correction/final verification
 - WHEN reduced
-- THEN no-fix has zero validators and any failure escalates
+- THEN no-fix has zero validators, a bounded failed attempt returns to correction, and exhausted or final-verification failure escalates
 
 #### Scenario: Judgment Day
 
@@ -119,6 +119,22 @@ Orchestration MAY implement/verify but MUST NOT deliver/publish. SDD adds no rev
 - GIVEN implementation/verification complete
 - WHEN orchestration finishes
 - THEN files remain undelivered/unpublished
+
+### Requirement: Native SDD readiness evidence
+
+For both OpenSpec and Engram native status, adapter readiness MUST be true only when `nextRecommended` is `verify` or `archive`, `blockedReasons` is empty, and published `reviewGate.result` is `allow`. Missing gate evidence, `review`, `resolve-review`, blockers, and every non-allow or stale gate result MUST remain false.
+
+#### Scenario: Post-review allow
+
+- GIVEN OpenSpec or Engram status recommends verify/archive with no blockers and an allow gate
+- WHEN readiness is decoded
+- THEN readiness is true
+
+#### Scenario: Missing, stale, or blocked evidence
+
+- GIVEN any other action, blocker, missing gate, or non-allow gate
+- WHEN readiness is decoded
+- THEN readiness is false
 
 ## Acceptance Criteria
 

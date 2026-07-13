@@ -1,1 +1,0 @@
-{"schema":"gentle-ai.review-gate-result/v1","result":"deny","allowed":false,"action":"blocked","reason":"scope changed","gate_context":{"lineage_id":"lineage-1","store_revision":"rev-2","receipt_hash":"receipt-1","target_hash":"target-2"}}

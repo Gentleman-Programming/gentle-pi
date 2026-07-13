@@ -91,15 +91,15 @@ Deterministic candidate-caused blockers use zero refuters.
 
 All inferential candidate-caused blockers use exactly one complete read-only refuter batch.
 
-Invalid, missing, duplicate, unknown, or inconclusive refuter output escalates without a replacement refuter.
+Independent concrete refuter proof is valid and need not repeat reviewer `proof_refs`. Invalid, empty, malformed, missing, duplicate, unknown, or inconclusive refuter output escalates without a replacement refuter.
 
-Ordinary permits one correction and one targeted validator. Before editing, FINALIZE requires a positive line forecast; after editing, Git-derived actual lines must fit `min(200, ceil(original_changed_lines / 2))`.
+Ordinary permits up to three failed targeted attempts within the original cumulative budget `min(200, ceil(original_changed_lines / 2))`. Each attempt uses one correction and one targeted validator; FINALIZE requires a positive pre-edit forecast and accounts Git-derived actual lines cumulatively.
 
-Correction stays bound to the original candidate, paths, untracked set, and correction IDs. The validator checks original criteria and correction regression only and cannot add scope or findings.
+Initial lenses never rerun. Every attempt preserves frozen findings and genesis scope: the original candidate, paths, untracked set, and correction IDs. The validator checks original criteria and correction regression only and cannot add scope or findings.
 
 Final verification evidence is supplied and hashed during FINALIZE, never at START.
 
-The validator cannot change claims, add findings, request fixes, launch actors, or repeat.
+Each validator invocation cannot change claims, add findings, request fixes, launch actors, or request another attempt. Native FINALIZE alone returns `correction_required` while another bounded attempt remains.
 
 Compact ordinary authority has exactly five states: `reviewing`, `correction_required`, `validating`, `approved`, and `escalated`.
 
@@ -109,13 +109,15 @@ Judgment Day starts only when explicitly requested and replaces ordinary review 
 
 Judgment Day starts with exactly two blind judges and zero refuters.
 
-Only Judgment Day may iterate, for at most two scoped fix/re-judgment rounds.
+Judgment Day alone may iterate discovery and scoped re-judgment, for at most two rounds.
 
 Findings surviving round two escalate; no third-round transition exists.
 
 Existing graph-v1 ordinary lineages remain readable, receipt/gate-validatable, and exportable but reject mutation. Same-lineage graph-v1 plus compact-v2 authority fails closed. Reset quarantines both. Judgment Day remains mutable on graph-v1.
 
-Compact gates are read-only: load authority and receipt, derive live Git evidence, then reload authority and rederive target/publication evidence before allow. Pi still registers one exact one-shot command authorization and rederives at bash time.
+PR #1216 introduced the v2.1.1 `<remote>/<branch>` selector contract that v2.1.2 inherits unchanged.
+
+Compact gates are read-only: load authority and receipt, derive live Git evidence, then reload authority and rederive target/publication evidence before allow. Pi still registers one exact one-shot command authorization and rederives before and after bash-time native validation. Native pre-PR binds GitHub CLI repository precedence plus the exact advertised remote head equal to reviewed local `HEAD` and keeps fetch-side semantics. Existing native push destinations are supported only when effective push and fetch URL/identity match. Split fetch/push pre-push fails closed before native validation because upstream v2.1.1 resolves `<remote>/<branch>` through fetch-side remote-tracking state; probing `pushurl` does not change that resolution. Native first-push authorization remains unsupported until a separate follow-up adds a persisted explicit advertised-base source. Publication probes are shell-free, bounded, and cancellation-aware, and complete bash-time revalidation has one aggregate bounded deadline combined with Pi cancellation when available.
 Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise release fails closed through native receipt validation.
 Major and post-incident releases require explicit extraordinary review even when fast-path checks pass.
 

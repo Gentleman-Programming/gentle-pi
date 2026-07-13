@@ -205,13 +205,13 @@ Inferential blockers use exactly one complete read-only refuter batch.
 
 Invalid, missing, duplicate, unknown, or inconclusive refuter output escalates without a replacement refuter.
 
-Ordinary permits one correction and one targeted validator. FINALIZE requires a positive pre-edit forecast and rejects Git-derived actual correction lines above the frozen budget.
+Ordinary permits up to three failed targeted attempts within the original cumulative budget. Each attempt uses one correction and one targeted validator; FINALIZE requires a positive pre-edit forecast and accounts Git-derived actual lines cumulatively.
 
-Correction remains bound to original candidate, paths, untracked set, and correction IDs. Targeted validation checks original criteria and correction regression only, adds no scope, and cannot repeat.
+Initial lenses never rerun. Every attempt preserves frozen findings and genesis scope: the original candidate, paths, untracked set, and correction IDs. Targeted validation checks original criteria and correction regression only and adds no scope.
 
 Final evidence is hashed during FINALIZE, not supplied at START.
 
-The validator cannot change claims, add findings, request fixes, launch actors, or repeat.
+Each validator invocation cannot change claims, add findings, request fixes, launch actors, or request another attempt. Native FINALIZE alone returns `correction_required` while another bounded attempt remains.
 
 Compact ordinary uses only `reviewing`, `correction_required`, `validating`, `approved`, and `escalated`.
 
@@ -221,7 +221,7 @@ Judgment Day starts only when explicitly requested and replaces ordinary review 
 
 Judgment Day starts with exactly two blind judges and zero refuters.
 
-Only Judgment Day may iterate, for at most two scoped fix/re-judgment rounds.
+Judgment Day alone may iterate discovery and scoped re-judgment, for at most two rounds.
 
 Findings surviving round two escalate; no third-round transition exists.
 

@@ -275,12 +275,13 @@ function reportIsClearlyPassing(path: string | undefined): boolean {
 
 function withRecoveryBlock(status: SddStatus, reviewAuthority?: SddReviewAuthorityOverlay, nativeReviewReadiness?: NativeReviewReadinessOverlay): SddStatus {
 	if (nativeReviewReadiness?.expected && !nativeReviewReadiness.ready) {
+		const reason = `resolve-review: ${nativeReviewReadiness.reason ?? "native bound review readiness is unavailable."}`;
 		return {
 			...status,
 			applyState: "blocked",
 			dependencies: { apply: "blocked", verify: "blocked", sync: "blocked", archive: "blocked" },
 			nextRecommended: "resolve-review",
-			blockedReasons: [...status.blockedReasons, `resolve-review: ${nativeReviewReadiness.reason ?? "native bound review readiness is unavailable."}`],
+			blockedReasons: status.blockedReasons.includes(reason) ? status.blockedReasons : [...status.blockedReasons, reason],
 		};
 	}
 	if (!reviewAuthority?.expected) return status;
@@ -289,20 +290,22 @@ function withRecoveryBlock(status: SddStatus, reviewAuthority?: SddReviewAuthori
 		if (resolved?.activeAuthorityId) return status;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
+		const reason = `resolve-review: ${message}`;
 		return {
 			...status,
 			applyState: "blocked",
 			dependencies: { apply: "blocked", verify: "blocked", sync: "blocked", archive: "blocked" },
 			nextRecommended: "resolve-review",
-			blockedReasons: [...status.blockedReasons, `resolve-review: ${message}`],
+			blockedReasons: status.blockedReasons.includes(reason) ? status.blockedReasons : [...status.blockedReasons, reason],
 		};
 	}
+	const reason = "resolve-review: validated active review authority is missing.";
 	return {
 		...status,
 		applyState: "blocked",
 		dependencies: { apply: "blocked", verify: "blocked", sync: "blocked", archive: "blocked" },
 		nextRecommended: "resolve-review",
-		blockedReasons: [...status.blockedReasons, "resolve-review: validated active review authority is missing."],
+		blockedReasons: status.blockedReasons.includes(reason) ? status.blockedReasons : [...status.blockedReasons, reason],
 	};
 }
 

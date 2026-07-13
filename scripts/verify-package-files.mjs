@@ -38,7 +38,7 @@ const requiredPaths = [
   "extensions/skill-registry.ts",
   "lib/native-review-cli.ts",
   "lib/sdd-preflight.ts",
-  "tests/fixtures/native-review-cli/v2.1.0/start.json",
+  "tests/fixtures/native-review-cli/v2.1.2/start.json",
   "prompts/gcl.md",
   "prompts/gis.md",
   "prompts/gpr.md",

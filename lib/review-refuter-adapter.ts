@@ -5,21 +5,26 @@ import {
 } from "./review-compact.ts";
 
 const REFUTER_BATCH_SCHEMA = "gentle-ai.refuter-result-batch/v1";
+const DIGEST = /^[0-9a-f]{64}$/;
 
 export const REFUTER_BATCH_STATUS = {
 	NORMALIZED: "normalized",
 	INVALID: "invalid",
 } as const;
 
-interface RefuterBatchRow {
+export interface RefuterBatchRow {
 	finding_id: string;
 	outcome: CompactRefuterResult["outcome"];
 	proof_refs: string[];
 }
 
-interface RefuterBatch {
+export interface RefuterBatch {
 	schema: typeof REFUTER_BATCH_SCHEMA;
 	request_hash: string;
+	results: RefuterBatchRow[];
+}
+
+export interface NativeRefuterDocument {
 	results: RefuterBatchRow[];
 }
 
@@ -61,7 +66,7 @@ function parseBatch(value: unknown): RefuterBatch | InvalidRefuterBatch {
 	}
 	const batch = record(raw);
 	if (!batch || !exact(batch, ["schema", "request_hash", "results"])) return invalid("refuter-batch-shape");
-	if (batch.schema !== REFUTER_BATCH_SCHEMA || typeof batch.request_hash !== "string" || !Array.isArray(batch.results)) {
+	if (batch.schema !== REFUTER_BATCH_SCHEMA || typeof batch.request_hash !== "string" || !DIGEST.test(batch.request_hash) || !Array.isArray(batch.results)) {
 		return invalid("refuter-batch-shape");
 	}
 	const results: RefuterBatchRow[] = [];
@@ -69,14 +74,25 @@ function parseBatch(value: unknown): RefuterBatch | InvalidRefuterBatch {
 		const row = record(result);
 		if (!row || !exact(row, ["finding_id", "outcome", "proof_refs"])) return invalid("refuter-row-shape");
 		if (
-			typeof row.finding_id !== "string" ||
-			(row.outcome !== COMPACT_FINDING_OUTCOME.REFUTED && row.outcome !== COMPACT_FINDING_OUTCOME.CORROBORATED) ||
+			typeof row.finding_id !== "string" || row.finding_id.length === 0 || row.finding_id.trim() !== row.finding_id ||
+			(row.outcome !== COMPACT_FINDING_OUTCOME.REFUTED && row.outcome !== COMPACT_FINDING_OUTCOME.CORROBORATED && row.outcome !== COMPACT_FINDING_OUTCOME.INCONCLUSIVE) ||
 			!Array.isArray(row.proof_refs) ||
+			row.proof_refs.length === 0 ||
 			row.proof_refs.some((proof) => typeof proof !== "string" || proof.length === 0 || proof.trim() !== proof)
 		) return invalid("refuter-row-value");
 		results.push({ finding_id: row.finding_id, outcome: row.outcome, proof_refs: [...row.proof_refs] });
 	}
 	return { schema: REFUTER_BATCH_SCHEMA, request_hash: batch.request_hash, results };
+}
+
+export function parseRefuterBatch(value: unknown): RefuterBatch {
+	const batch = parseBatch(value);
+	if ("status" in batch) throw new TypeError(batch.reason_code);
+	return batch;
+}
+
+export function toNativeRefuterDocument(batch: RefuterBatch): NativeRefuterDocument {
+	return { results: batch.results.map((row) => ({ ...row, proof_refs: [...row.proof_refs] })) };
 }
 
 export function normalizeRefuterBatch(
@@ -93,7 +109,6 @@ export function normalizeRefuterBatch(
 		if (!finding) return invalid("refuter-finding-id");
 		if (rows.has(row.finding_id)) return invalid("refuter-duplicate-id");
 		if (row.proof_refs.length === 0 || new Set(row.proof_refs).size !== row.proof_refs.length) return invalid("refuter-proof-refs");
-		if (row.proof_refs.some((proof) => !finding.proof_refs.includes(proof))) return invalid("refuter-proof-causality");
 		rows.set(row.finding_id, row);
 	}
 	if (rows.size !== request.findings.length) return invalid("refuter-missing-id");

@@ -1,0 +1,12 @@
+{
+  "operation": "review/start",
+  "lineage_id": "lineage-1",
+  "state": "reviewing",
+  "risk_level": "medium",
+  "selected_lenses": [
+    "review-reliability"
+  ],
+  "changed_files": 1,
+  "changed_lines": 2,
+  "correction_budget": 1
+}

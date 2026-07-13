@@ -163,6 +163,8 @@ If multiple rows match, run the narrow set that covers the risk. For example, sh
 
 New ordinary review uses compact `gentle_review` `start -> finalize -> validate`.
 
+Native contract pairing is exact: this adapter supports `gentle-ai 2.1.2` only and rechecks that version before every native operation. Once v2.1.2 has written review authority, rollback MUST preserve every native store and receipt and MUST NOT run a downgraded binary against that repository. Disable the Pi route or roll forward to a compatible authority-aware release instead; deleting authority data or reinstalling an older binary is not a rollback path.
+
 START derives the complete Git/untracked snapshot, lineage, persisted `low | medium | high` tier, zero/one/four lenses, authored changed lines, and correction budget `min(200, ceil(original_changed_lines / 2))`. Generated `testdata/golden/**` stays in snapshot identity but does not count as authored risk lines.
 
 Every finding requires `evidence_class`, `causal_disposition`, and concrete changed-hunk, candidate-created-path, differential-test, or before/after proof. Missing IDs are assigned natively and selected-lens results are canonicalized deterministically.
@@ -173,17 +175,17 @@ Only severe `introduced`, `behavior-activated`, or `worsened` findings with vali
 
 Deterministic blockers need no refuter. Inferential blockers use exactly one complete read-only refuter batch.
 
-Invalid, missing, duplicate, unknown, or inconclusive refuter output escalates without a replacement refuter.
+Refuter proof may be independent concrete reproduction evidence; it does not need to duplicate reviewer `proof_refs`. Invalid, empty, malformed, missing, duplicate, unknown, or inconclusive refuter output escalates without a replacement refuter.
 
 When native IDs are assigned to inferential findings, the first FINALIZE returns their canonical rows and a content-derived request hash without mutation; the second replays identical lens input with that hash and one complete refuter batch.
 
-Ordinary permits one correction and one targeted validator. FINALIZE requires a positive forecast before editing, derives actual correction lines from Git, and binds correction to original candidate, paths, untracked set, and correction IDs.
+Ordinary permits up to three failed targeted attempts within the original cumulative budget; each attempt is one correction plus one targeted validator. FINALIZE requires a positive forecast before editing and derives actual correction lines from Git. Initial lenses are never rerun, while frozen findings and genesis scope remain unchanged.
 
 The validator checks original criteria and correction regression only and cannot add scope or findings. Final evidence is hashed during FINALIZE, never at START.
 
 Compact ordinary has five states: `reviewing`, `correction_required`, `validating`, `approved`, and `escalated`.
 
-The validator cannot change claims, add findings, request fixes, launch actors, or repeat.
+Each validator invocation cannot change claims, add findings, request fixes, launch actors, or request another attempt. Native FINALIZE alone returns `correction_required` while another bounded attempt remains.
 
 Compact authority uses content-derived CAS under the Git common directory. Exact retries are idempotent; stale/semantic retries, terminal mutation, and same-lineage graph-v1/compact-v2 ambiguity fail closed.
 
@@ -195,13 +197,16 @@ Judgment Day starts only when explicitly requested and replaces ordinary review 
 
 Judgment Day starts with exactly two blind judges and zero refuters.
 
-Only Judgment Day may iterate, for at most two scoped fix/re-judgment rounds.
+Judgment Day alone may iterate discovery and scoped re-judgment, for at most two rounds.
 
 Findings surviving round two escalate; no third-round transition exists.
 
 Compact gate validation is read-only. It loads authority and receipt, derives the live target, then reloads authority and rederives target/publication evidence immediately before allow.
 
-Pi also registers one one-shot authorization for the exact command and rederives its target again at bash time. First-push, push destination, exact PR base, repository identity, release, and dangerous-command protections remain fail closed.
+Pi also registers one one-shot authorization for the exact command and rederives its full publication target before registration, before bash-time native validation, and again after that validation before allowing the command. For `gh pr create`, the effective repository follows GitHub CLI precedence (`--repo`, then `GH_REPO`, then local inference), and both that source/value and the exact advertised remote head commit are bound and rechecked against reviewed local `HEAD`. Publication `ls-remote` probes are shell-free, output-bounded, time-bounded, and cancellation-aware. The complete bash-time publication/native revalidation uses one aggregate bounded deadline combined with Pi's cancellation signal when available. First-push, push destination, exact PR base/head, repository identity, release, and dangerous-command protections remain fail closed.
+Native pre-push to an existing branch is supported only when the effective push URL and repository identity equal the fetch URL and identity used by the exact `<remote>/<destination-branch>` selector, and its advertised commit equals the command update's old object. Split fetch/push topology is unsupported because PR #1216 introduced the upstream v2.1.1 `--base-ref` contract that v2.1.2 inherits unchanged: that contract resolves the selector through fetch-side remote-tracking state, and probing `pushurl` does not change selector resolution. Pi fails closed before native validation with `native-split-fetch-push-unsupported-until-upstream-supports-explicit-push-base`. Native pre-PR remains fetch-side and may use advertised remote selectors. Residual gap (separate follow-up): native first-push authorization remains unsupported until Pi has a persisted explicit advertised-base source. A missing destination fails closed with `native-first-push-unsupported-until-persisted-advertised-base-exists`; Pi never guesses a base from an upstream, default branch, or nearest ancestor.
+
+Native SDD readiness is true only for `verify` or `archive` with empty blockers and a published `reviewGate.result: "allow"`; review/resolve-review, missing gate evidence, and every non-allow or stale result remain blocked.
 Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise release fails closed through native receipt validation.
 Major and post-incident releases require explicit extraordinary review even when fast-path checks pass.
 

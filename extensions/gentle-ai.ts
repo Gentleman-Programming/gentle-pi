@@ -1,4 +1,5 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
 	existsSync,
 	lstatSync,
@@ -20,6 +21,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -63,7 +65,8 @@ import {
 	finalizeCompactReview,
 	startCompactReview,
 } from "../lib/review-facade.ts";
-import { parseCompactFinalizeInput } from "../lib/review-compact-contract.ts";
+import { parseCompactFinalizeInput, parseNativeCompactFinalizeInput, toNativeReviewerDocument, toNativeValidatorDocument } from "../lib/review-compact-contract.ts";
+import { toNativeRefuterDocument } from "../lib/review-refuter-adapter.ts";
 import { validateCompactReviewGate } from "../lib/review-compact-gate.ts";
 import {
 	assertLiveRecoveredSourceBindingV1,
@@ -87,6 +90,7 @@ import {
 } from "../lib/review-compact-store.ts";
 import {
 	inheritedUnsafeGitEnvironmentKeys,
+	publicationProbeGitEnvironment,
 	ReviewRepositoryError,
 	resolveRepositoryAuthorityV1,
 } from "../lib/review-repository.ts";
@@ -103,10 +107,12 @@ import {
 	createReviewState,
 	evaluateReleaseFastPathV1,
 	recheckReleaseFastPathRemoteHeadV1,
+	resolveConfiguredPushDestinationV1,
 	resolvePushDestinationRefV1,
 	resolvePushRemoteRefV1,
 	validateAuthoritativeReviewGate,
 	type GateTargetV1,
+	type PushGateTargetV1,
 	type ReleaseFastPathEvidenceV1,
 	type ReviewBudgetV1,
 	type ReviewReducerInput,
@@ -130,6 +136,8 @@ import {
 	type NativeStartResult,
 	type NativeValidateResult,
 } from "../lib/native-review-cli.ts";
+
+const execFileAsync = promisify(execFile);
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
@@ -2225,7 +2233,180 @@ interface DerivedReviewGateTarget {
 	command: ReviewLifecycleCommand;
 	target: GateTargetV1;
 	actualIntendedCommitTree?: string;
+	nativePublication?: NativePublicationBinding;
 }
+
+interface NativePrePrBoundaryBinding {
+	source: "explicit";
+	selector: string;
+	commit: string;
+	remote: string;
+	remoteRef: string;
+	remoteIdentity: string;
+}
+
+const GH_REPOSITORY_SOURCE = {
+	EXPLICIT: "explicit",
+	ENVIRONMENT: "environment",
+	LOCAL: "local",
+} as const;
+
+type GhRepositorySource = (typeof GH_REPOSITORY_SOURCE)[keyof typeof GH_REPOSITORY_SOURCE];
+
+interface GhRepositoryBinding {
+	source: GhRepositorySource;
+	value: string;
+	remote: string;
+	remoteIdentity: string;
+}
+
+interface NativePrePrHeadBinding {
+	selector: string;
+	commit: string;
+	remote: string;
+	remoteRef: string;
+	remoteIdentity: string;
+}
+
+interface NativePrePushRangeBinding {
+	remote: string;
+	destinationRef: string;
+	oldObject: string;
+	newObject: string;
+	baseSelector: string;
+	advertisedBaseCommit: string;
+}
+
+interface NativePublicationBinding {
+	flags: readonly string[];
+	pushRemote: string;
+	pushIdentity: string;
+	prePushRange?: NativePrePushRangeBinding;
+	prePrBoundary?: NativePrePrBoundaryBinding;
+	prePrHead?: NativePrePrHeadBinding;
+	repository?: GhRepositoryBinding;
+}
+
+interface AdvertisedBranch {
+	selector: string;
+	remote: string;
+	remoteRef: string;
+	commit: string;
+	remoteIdentity: string;
+	localRef: string;
+}
+
+interface AdvertisedRemoteBranch {
+	remote: string;
+	remoteRef: string;
+	commit: string;
+	remoteIdentity: string;
+}
+
+const ADVERTISED_BRANCH_KIND = {
+	BASE: "base",
+	HEAD: "head",
+} as const;
+
+type AdvertisedBranchKind = (typeof ADVERTISED_BRANCH_KIND)[keyof typeof ADVERTISED_BRANCH_KIND];
+
+const PUBLICATION_PROBE_ERROR_CODE = {
+	CANCELLED: "cancelled",
+	TIMEOUT: "timeout",
+	UNAVAILABLE: "unavailable",
+	NON_ZERO: "non-zero",
+	SIGNAL: "signal",
+	OUTPUT_LIMIT: "output-limit",
+} as const;
+
+type PublicationProbeErrorCode = (typeof PUBLICATION_PROBE_ERROR_CODE)[keyof typeof PUBLICATION_PROBE_ERROR_CODE];
+
+interface PublicationProbeRequest {
+	file: "git";
+	arguments: readonly string[];
+	cwd: string;
+	timeoutMs: number;
+	maxBufferBytes: number;
+	shell: false;
+	signal?: AbortSignal;
+	environment: NodeJS.ProcessEnv;
+}
+
+interface PublicationProbeResult {
+	stdout: string;
+	stderr: string;
+	exitCode: number;
+	signal: NodeJS.Signals | null;
+	timedOut: boolean;
+	outputLimitExceeded: boolean;
+}
+
+type PublicationProbe = (request: PublicationProbeRequest) => Promise<PublicationProbeResult>;
+
+class PublicationProbeError extends Error {
+	readonly code: PublicationProbeErrorCode;
+
+	constructor(code: PublicationProbeErrorCode, message: string) {
+		super(message);
+		this.name = "PublicationProbeError";
+		this.code = code;
+	}
+}
+
+const NATIVE_PUBLICATION_BASE_NEXT_ACTION = {
+	UNSUPPORTED_UNTIL_PERSISTED_BASE: "native-first-push-unsupported-until-persisted-advertised-base-exists",
+} as const;
+
+const NATIVE_SPLIT_FETCH_PUSH_NEXT_ACTION = "native-split-fetch-push-unsupported-until-upstream-supports-explicit-push-base";
+
+class NativePublicationBaseRequiredError extends Error {
+	readonly nextAction = NATIVE_PUBLICATION_BASE_NEXT_ACTION.UNSUPPORTED_UNTIL_PERSISTED_BASE;
+
+	constructor() {
+		super("Native first-push authorization is unsupported until Pi has a persisted explicit advertised-base source");
+		this.name = "NativePublicationBaseRequiredError";
+	}
+}
+
+class NativeSplitFetchPushUnsupportedError extends Error {
+	readonly nextAction = NATIVE_SPLIT_FETCH_PUSH_NEXT_ACTION;
+
+	constructor() {
+		super("Native split fetch/push pre-push is unsupported by the upstream base-ref contract because <remote>/<branch> resolves through fetch-side remote-tracking state");
+		this.name = "NativeSplitFetchPushUnsupportedError";
+	}
+}
+
+const PUBLICATION_PROBE_TIMEOUT_MS = 2_000;
+const PUBLICATION_PROBE_MAX_BUFFER_BYTES = 64 * 1024;
+const BASH_TIME_REVALIDATION_TIMEOUT_MS = 30_000;
+
+const nodePublicationProbe: PublicationProbe = async (request) => {
+	try {
+		const output = await execFileAsync(request.file, [...request.arguments], {
+			cwd: request.cwd,
+			encoding: "utf8",
+			env: request.environment,
+			maxBuffer: request.maxBufferBytes,
+			shell: request.shell,
+			signal: request.signal,
+			timeout: request.timeoutMs,
+			windowsHide: true,
+		});
+		return { stdout: output.stdout, stderr: output.stderr, exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false };
+	} catch (error) {
+		const detail = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string; code?: string | number; signal?: NodeJS.Signals; killed?: boolean };
+		if (detail.code === "ENOENT" || detail.code === "EACCES" || detail.name === "AbortError") throw error;
+		return {
+			stdout: detail.stdout ?? "",
+			stderr: detail.stderr ?? "",
+			exitCode: typeof detail.code === "number" ? detail.code : 1,
+			signal: detail.signal ?? null,
+			timedOut: detail.killed === true,
+			outputLimitExceeded: detail.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+		};
+	}
+};
 
 interface ReleaseFastPathAuthorizationV1 {
 	remote: string;
@@ -2236,8 +2417,6 @@ interface ReleaseFastPathAuthorizationV1 {
 interface NativeReviewAuthorizationContext {
 	lineage_id: string;
 	store_revision: string;
-	receipt_hash: string;
-	target_hash: string;
 	fingerprint: string;
 }
 
@@ -2853,6 +3032,401 @@ function runReviewGit(
 	}).trim();
 }
 
+function runPublicationGit(cwd: string, args: readonly string[]): string {
+	return execFileSync("git", args, {
+		cwd,
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+		env: publicationProbeGitEnvironment(),
+	}).trim();
+}
+
+async function runPublicationProbeGit(
+	cwd: string,
+	args: readonly string[],
+	probe: PublicationProbe,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<string> {
+	const timeoutSignal = AbortSignal.timeout(timeoutMs);
+	const boundedSignal = signal === undefined ? timeoutSignal : AbortSignal.any([signal, timeoutSignal]);
+	let result: PublicationProbeResult;
+	try {
+		result = await probe({
+			file: "git",
+			arguments: args,
+			cwd,
+			timeoutMs,
+			maxBufferBytes: PUBLICATION_PROBE_MAX_BUFFER_BYTES,
+			shell: false,
+			signal: boundedSignal,
+			environment: publicationProbeGitEnvironment(),
+		});
+	} catch (error) {
+		if (error instanceof PublicationProbeError) throw error;
+		if (error instanceof Error && error.name === "AbortError") {
+			throw new PublicationProbeError(
+				signal?.aborted ? PUBLICATION_PROBE_ERROR_CODE.CANCELLED : PUBLICATION_PROBE_ERROR_CODE.TIMEOUT,
+				signal?.aborted ? "Publication probe was cancelled" : "Publication probe timed out",
+			);
+		}
+		throw new PublicationProbeError(PUBLICATION_PROBE_ERROR_CODE.UNAVAILABLE, "Publication probe could not start");
+	}
+	if (result.timedOut) throw new PublicationProbeError(PUBLICATION_PROBE_ERROR_CODE.TIMEOUT, "Publication probe timed out");
+	if (result.outputLimitExceeded) throw new PublicationProbeError(PUBLICATION_PROBE_ERROR_CODE.OUTPUT_LIMIT, "Publication probe output exceeded its limit");
+	if (result.signal) throw new PublicationProbeError(PUBLICATION_PROBE_ERROR_CODE.SIGNAL, "Publication probe was signalled");
+	if (result.exitCode !== 0) throw new PublicationProbeError(PUBLICATION_PROBE_ERROR_CODE.NON_ZERO, "Publication probe failed");
+	return result.stdout.trim();
+}
+
+function configuredGitValues(cwd: string, key: string): string[] {
+	try {
+		return runPublicationGit(cwd, ["config", "--get-all", key]).split(/\r?\n/).filter(Boolean);
+	} catch {
+		return [];
+	}
+}
+
+function configuredRemotes(cwd: string): string[] {
+	const remotes = runPublicationGit(cwd, ["remote"]).split(/\r?\n/).filter(Boolean);
+	if (new Set(remotes).size !== remotes.length) throw new Error("Configured Git remotes are ambiguous");
+	return remotes;
+}
+
+function singleConfiguredValue(cwd: string, key: string): string | undefined {
+	const values = configuredGitValues(cwd, key);
+	if (values.length > 1) throw new Error(`Git configuration ${key} is ambiguous`);
+	return values[0];
+}
+
+function currentBranch(cwd: string): string {
+	try {
+		return runPublicationGit(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+	} catch {
+		throw new Error("Publication requires an attached current branch");
+	}
+}
+
+function resolveNativePushRemote(cwd: string): string {
+	const branch = currentBranch(cwd);
+	const keys = [`branch.${branch}.pushRemote`, "remote.pushDefault", `branch.${branch}.remote`];
+	for (const key of keys) {
+		const remote = singleConfiguredValue(cwd, key);
+		if (remote !== undefined) {
+			resolveConfiguredPushDestinationV1(cwd, remote);
+			return remote;
+		}
+	}
+	if (configuredRemotes(cwd).includes("origin")) {
+		resolveConfiguredPushDestinationV1(cwd, "origin");
+		return "origin";
+	}
+	throw new Error("Native publication push remote is not configured");
+}
+
+function repositoryLocationIdentity(cwd: string, location: string): string {
+	let normalized = location;
+	try {
+		const parsed = new URL(location);
+		if (parsed.protocol && !parsed.pathname.startsWith("//")) {
+			normalized = `${parsed.host.toLowerCase()}/${parsed.pathname.replace(/^\/+|\/+$/g, "")}`;
+		} else throw new Error("not an absolute URL");
+	} catch {
+		const colon = location.indexOf(":");
+		const slash = location.indexOf("/");
+		if (colon > 0 && (slash < 0 || colon < slash)) {
+			const host = location.slice(0, colon).split("@").at(-1)!.toLowerCase();
+			normalized = `${host}/${location.slice(colon + 1)}`;
+		} else if (!isAbsolute(location)) {
+			normalized = resolve(runPublicationGit(cwd, ["rev-parse", "--show-toplevel"]), location);
+		}
+	}
+	normalized = normalized.replace(/\/+$/, "").replace(/\.git$/, "");
+	return `sha256:${createHash("sha256").update(normalized).digest("hex")}`;
+}
+
+function repositoryCoordinates(location: string): { host: string; owner: string; repository: string } | undefined {
+	let host: string;
+	let path: string;
+	try {
+		const parsed = new URL(location);
+		if (!parsed.host) throw new Error("not an absolute URL");
+		host = parsed.host.toLowerCase();
+		path = parsed.pathname;
+	} catch {
+		const colon = location.indexOf(":");
+		const slash = location.indexOf("/");
+		if (colon <= 0 || (slash >= 0 && colon > slash)) return undefined;
+		host = location.slice(0, colon).split("@").at(-1)!.toLowerCase();
+		path = location.slice(colon + 1);
+	}
+	const segments = path.replace(/^\/+|\/+$/g, "").replace(/\.git$/, "").split("/");
+	if (segments.length !== 2 || !segments[0] || !segments[1]) return undefined;
+	return { host, owner: segments[0], repository: segments[1] };
+}
+
+function remoteFetchUrl(cwd: string, remote: string): string {
+	const value = singleConfiguredValue(cwd, `remote.${remote}.url`);
+	if (value === undefined) throw new Error(`Publication remote ${remote} has no unambiguous fetch URL`);
+	return value;
+}
+
+function pushRemoteIdentity(cwd: string, remote: string): string {
+	return repositoryLocationIdentity(cwd, resolveConfiguredPushDestinationV1(cwd, remote).url);
+}
+
+function localRefAtCommit(cwd: string, remote: string, branch: string, commit: string): string {
+	for (const ref of [`refs/heads/${branch}`, `refs/remotes/${remote}/${branch}`]) {
+		try {
+			if (runPublicationGit(cwd, ["rev-parse", "--verify", `${ref}^{commit}`]) === commit) return ref;
+		} catch {
+			// Continue to the other exact local evidence source.
+		}
+	}
+	throw new Error(`Advertised base ${remote}/${branch} is not available at the same local commit`);
+}
+
+async function advertisedRemoteBranch(
+	cwd: string,
+	remote: string,
+	branch: string,
+	label: AdvertisedBranchKind,
+	probe: PublicationProbe,
+	timeoutMs: number,
+	signal?: AbortSignal,
+	location = remoteFetchUrl(cwd, remote),
+): Promise<AdvertisedRemoteBranch> {
+	runPublicationGit(cwd, ["check-ref-format", "--branch", branch]);
+	const remoteRef = `refs/heads/${branch}`;
+	const output = await runPublicationProbeGit(cwd, ["ls-remote", "--heads", location, remoteRef], probe, timeoutMs, signal);
+	const rows = output.split(/\r?\n/).filter(Boolean);
+	if (rows.length !== 1) throw new Error(`Advertised ${label} ${remote}/${branch} is missing or ambiguous`);
+	const [commit, ref, extra] = rows[0]!.split(/\s+/);
+	if (extra !== undefined || ref !== remoteRef || !/^[0-9a-f]{40,64}$/.test(commit ?? "")) throw new Error(`Advertised ${label} ${remote}/${branch} is malformed`);
+	return {
+		remote,
+		remoteRef,
+		commit: commit!,
+		remoteIdentity: repositoryLocationIdentity(cwd, location),
+	};
+}
+
+async function advertisedBranch(
+	cwd: string,
+	remote: string,
+	branch: string,
+	probe: PublicationProbe,
+	timeoutMs: number,
+	signal?: AbortSignal,
+	location = remoteFetchUrl(cwd, remote),
+): Promise<AdvertisedBranch> {
+	const advertised = await advertisedRemoteBranch(cwd, remote, branch, ADVERTISED_BRANCH_KIND.BASE, probe, timeoutMs, signal, location);
+	return {
+		...advertised,
+		selector: `${remote}/${branch}`,
+		localRef: localRefAtCommit(cwd, remote, branch, advertised.commit),
+	};
+}
+
+function optionalCommandOptionValue(arguments_: readonly string[], names: readonly string[]): string | undefined {
+	const matches: string[] = [];
+	for (let index = 0; index < arguments_.length; index += 1) {
+		const argument = arguments_[index]!;
+		const exact = names.find((name) => argument === name);
+		if (exact) {
+			const value = arguments_[index + 1];
+			if (!value) throw new Error(`${exact} is missing its value`);
+			matches.push(value);
+			index += 1;
+			continue;
+		}
+		const equals = names.find((name) => argument.startsWith(`${name}=`));
+		if (equals) matches.push(argument.slice(equals.length + 1));
+	}
+	if (matches.length > 1) throw new Error(`Command option ${names.join("/")} is ambiguous`);
+	return matches[0];
+}
+
+interface ParsedGhRepository {
+	host?: string;
+	owner: string;
+	repository: string;
+	value: string;
+}
+
+function parseGhRepository(value: string, label: string): ParsedGhRepository {
+	if (value.length === 0 || value.trim() !== value || /[\u0000-\u001f\u007f\\?#@]/.test(value) || value.includes("://")) {
+		throw new Error(`${label} is malformed`);
+	}
+	const segments = value.split("/");
+	if (segments.length !== 2 && segments.length !== 3) throw new Error(`${label} must use [HOST/]OWNER/REPO`);
+	const [host, owner, repository] = segments.length === 3
+		? [segments[0], segments[1], segments[2]]
+		: [undefined, segments[0], segments[1]];
+	if (!owner || !repository || !/^[A-Za-z0-9_.-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+$/.test(repository)) {
+		throw new Error(`${label} is malformed`);
+	}
+	if (host !== undefined) {
+		const match = /^([A-Za-z0-9.-]+)(?::([0-9]+))?$/.exec(host);
+		const port = match?.[2] === undefined ? undefined : Number(match[2]);
+		if (!match || (port !== undefined && (!Number.isSafeInteger(port) || port < 1 || port > 65_535))) {
+			throw new Error(`${label} host is malformed`);
+		}
+	}
+	const normalizedHost = host?.toLowerCase();
+	return {
+		...(normalizedHost === undefined ? {} : { host: normalizedHost }),
+		owner,
+		repository,
+		value: normalizedHost === undefined ? `${owner}/${repository}` : `${normalizedHost}/${owner}/${repository}`,
+	};
+}
+
+function repositoryRemoteMatches(cwd: string, remote: string, repository: ParsedGhRepository): boolean {
+	const coordinates = repositoryCoordinates(remoteFetchUrl(cwd, remote));
+	return coordinates !== undefined &&
+		(repository.host === undefined || coordinates.host === repository.host) &&
+		coordinates.owner.toLowerCase() === repository.owner.toLowerCase() &&
+		coordinates.repository.toLowerCase() === repository.repository.toLowerCase();
+}
+
+function effectiveGhRepository(command: ReviewLifecycleCommand): GhRepositoryBinding {
+	if (command.arguments.some((argument) => /^-R.+/.test(argument))) {
+		throw new Error("Pull request -R must pass its repository as a separate value");
+	}
+	const explicit = optionalCommandOptionValue(command.arguments, ["--repo", "-R"]);
+	const inherited = explicit === undefined && process.env.GH_REPO !== undefined && process.env.GH_REPO.length > 0
+		? process.env.GH_REPO
+		: undefined;
+	const selected = explicit ?? inherited;
+	const remotes = configuredRemotes(command.cwd);
+	if (remotes.length === 0) throw new Error("Pull request repository has no configured remote");
+	let source: GhRepositorySource;
+	let value: string;
+	let remote: string;
+	if (selected !== undefined) {
+		const repository = parseGhRepository(selected, explicit === undefined ? "GH_REPO" : "Pull request --repo");
+		const matches = remotes.filter((candidate) => repositoryRemoteMatches(command.cwd, candidate, repository));
+		if (matches.length !== 1) throw new Error("Pull request repository does not map to one configured remote");
+		source = explicit === undefined ? GH_REPOSITORY_SOURCE.ENVIRONMENT : GH_REPOSITORY_SOURCE.EXPLICIT;
+		value = repository.value;
+		remote = matches[0]!;
+	} else {
+		const resolved = remotes.filter((candidate) => singleConfiguredValue(command.cwd, `remote.${candidate}.gh-resolved`) !== undefined);
+		if (resolved.length > 1) throw new Error("GitHub CLI default repository context is ambiguous");
+		if (resolved.length === 0 && remotes.length !== 1) throw new Error("GitHub CLI local repository inference is ambiguous");
+		remote = resolved[0] ?? remotes[0]!;
+		const location = remoteFetchUrl(command.cwd, remote);
+		const coordinates = repositoryCoordinates(location);
+		source = GH_REPOSITORY_SOURCE.LOCAL;
+		value = coordinates === undefined
+			? location
+			: `${coordinates.host}/${coordinates.owner}/${coordinates.repository}`;
+	}
+	return {
+		source,
+		value,
+		remote,
+		remoteIdentity: repositoryLocationIdentity(command.cwd, remoteFetchUrl(command.cwd, remote)),
+	};
+}
+
+async function deriveAdvertisedPrePrBase(
+	command: ReviewLifecycleCommand,
+	base: string,
+	repository: GhRepositoryBinding,
+	probe: PublicationProbe,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<AdvertisedBranch> {
+	if (base.startsWith("refs/") || /^[0-9a-f]{40,64}$/.test(base)) throw new Error("Pull request base must be an advertised branch name");
+	runPublicationGit(command.cwd, ["check-ref-format", "--branch", base]);
+	return advertisedBranch(command.cwd, repository.remote, base, probe, timeoutMs, signal);
+}
+
+function parsePullRequestHead(head: string): { owner?: string; branch: string; remoteRef: string } {
+	const separator = head.indexOf(":");
+	if (separator !== head.lastIndexOf(":")) throw new Error("Pull request head is malformed");
+	const owner = separator < 0 ? undefined : head.slice(0, separator);
+	const branch = separator < 0 ? head : head.slice(separator + 1);
+	if (
+		!branch ||
+		branch.startsWith("refs/") ||
+		/^[0-9a-f]{40,64}$/.test(branch) ||
+		(owner !== undefined && !owner) ||
+		!/^[A-Za-z0-9_.-]+$/.test(owner ?? "owner")
+	) throw new Error("Pull request head must use branch or owner:branch syntax");
+	return { ...(owner === undefined ? {} : { owner }), branch, remoteRef: `refs/heads/${branch}` };
+}
+
+async function deriveAdvertisedPrePrHead(
+	command: ReviewLifecycleCommand,
+	head: string,
+	repository: GhRepositoryBinding,
+	probe: PublicationProbe,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<NativePrePrHeadBinding> {
+	const parsed = parsePullRequestHead(head);
+	runPublicationGit(command.cwd, ["check-ref-format", "--branch", parsed.branch]);
+	let remote = repository.remote;
+	if (parsed.owner !== undefined) {
+		const baseCoordinates = repositoryCoordinates(remoteFetchUrl(command.cwd, repository.remote));
+		if (baseCoordinates === undefined) throw new Error("Pull request base repository coordinates are unavailable for an owner-qualified head");
+		const matches = configuredRemotes(command.cwd).filter((candidate) => {
+			const coordinates = repositoryCoordinates(remoteFetchUrl(command.cwd, candidate));
+			return coordinates !== undefined &&
+				coordinates.owner.toLowerCase() === parsed.owner!.toLowerCase() &&
+				coordinates.host === baseCoordinates.host &&
+				coordinates.repository.toLowerCase() === baseCoordinates.repository.toLowerCase();
+		});
+		if (matches.length !== 1) throw new Error("Pull request head repository does not map to one configured remote");
+		remote = matches[0]!;
+	}
+	const advertised = await advertisedRemoteBranch(command.cwd, remote, parsed.branch, ADVERTISED_BRANCH_KIND.HEAD, probe, timeoutMs, signal);
+	const localHead = runPublicationGit(command.cwd, ["rev-parse", "--verify", "HEAD^{commit}"]);
+	if (advertised.commit !== localHead) throw new Error("Advertised pull request head does not match reviewed local HEAD");
+	return { selector: head, ...advertised };
+}
+
+async function deriveNativePrePushBinding(
+	command: ReviewLifecycleCommand,
+	target: PushGateTargetV1,
+	probe: PublicationProbe,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<NativePublicationBinding> {
+	const pushRemote = resolveNativePushRemote(command.cwd);
+	if (pushRemote !== target.remote) throw new Error(`Push command remote ${target.remote} does not match native publication remote ${pushRemote}`);
+	if (target.updates.length !== 1) throw new Error("Native pre-push requires one exact destination update");
+	const update = target.updates[0]!;
+	if (update.kind === PUSH_UPDATE_KIND.CREATE) throw new NativePublicationBaseRequiredError();
+	if (!update.destination_ref.startsWith("refs/heads/")) throw new Error("Native pre-push destination must be an advertised branch");
+	const branch = update.destination_ref.slice("refs/heads/".length);
+	const destination = resolveConfiguredPushDestinationV1(command.cwd, target.remote);
+	if (destination.destination_id !== target.destination_id) throw new Error("Push publication destination changed after exact command target derivation");
+	const fetchUrl = remoteFetchUrl(command.cwd, target.remote);
+	const pushIdentity = repositoryLocationIdentity(command.cwd, destination.url);
+	if (destination.url !== fetchUrl || pushIdentity !== repositoryLocationIdentity(command.cwd, fetchUrl)) {
+		throw new NativeSplitFetchPushUnsupportedError();
+	}
+	const base = await advertisedBranch(command.cwd, target.remote, branch, probe, timeoutMs, signal, destination.url);
+	if (base.commit !== update.old_object) throw new Error("Advertised push destination changed after exact command target derivation");
+	return {
+		flags: ["--base-ref", base.selector],
+		pushRemote,
+		pushIdentity,
+		prePushRange: {
+			remote: target.remote,
+			destinationRef: update.destination_ref,
+			oldObject: update.old_object,
+			newObject: update.new_object,
+			baseSelector: base.selector,
+			advertisedBaseCommit: base.commit,
+		},
+	};
+}
+
 function commitIncludesAllTracked(arguments_: readonly string[]): boolean {
 	let includesAllTracked = false;
 	const booleanOptions = new Set([
@@ -3030,7 +3604,7 @@ function pushRemoteAndRefspec(arguments_: readonly string[]): { remote: string; 
 	return { remote, refspec: refspecs[0]! };
 }
 
-function derivePushTarget(command: ReviewLifecycleCommand): GateTargetV1 {
+function derivePushTarget(command: ReviewLifecycleCommand, pinnedTarget?: PushGateTargetV1): GateTargetV1 {
 	const { remote, refspec } = pushRemoteAndRefspec(command.arguments);
 	if (refspec.startsWith(":")) throw new Error("Push deletion is unsupported");
 	if (refspec.startsWith("+")) throw new Error("Force push refspecs are unsupported");
@@ -3043,15 +3617,28 @@ function derivePushTarget(command: ReviewLifecycleCommand): GateTargetV1 {
 	const newObject = runReviewGit(command.cwd, ["rev-parse", "--verify", sourceRef]);
 	const newPeeledCommit = runReviewGit(command.cwd, ["rev-parse", "--verify", `${sourceRef}^{commit}`]);
 	const newTree = runReviewGit(command.cwd, ["rev-parse", "--verify", `${newPeeledCommit}^{tree}`]);
-	const remoteResolution = separator < 0
-		? { ...resolvePushRemoteRefV1(command.cwd, remote, sourceRef, "push remote destination ref"), ref: sourceRef }
-		: resolvePushDestinationRefV1(
+	const pinnedUpdate = pinnedTarget?.updates.length === 1 ? pinnedTarget.updates[0] : undefined;
+	const pinnedDestinationMatches = pinnedUpdate === undefined || (separator < 0
+		? pinnedUpdate.destination_ref === sourceRef
+		: destinationValue.startsWith("refs/")
+			? pinnedUpdate.destination_ref === destinationValue
+			: pinnedUpdate.destination_ref.endsWith(`/${destinationValue}`));
+	if (!pinnedDestinationMatches) throw new Error("Push destination changed after authorization");
+	const remoteResolution = pinnedUpdate === undefined
+		? separator < 0
+			? { ...resolvePushRemoteRefV1(command.cwd, remote, sourceRef, "push remote destination ref"), ref: sourceRef }
+			: resolvePushDestinationRefV1(
 				command.cwd,
 				remote,
 				destinationValue,
 				sourceRef,
 				"push remote destination ref",
-			);
+				)
+		: {
+				destination: resolveConfiguredPushDestinationV1(command.cwd, remote),
+				ref: pinnedUpdate.destination_ref,
+				object_id: pinnedUpdate.old_object,
+			};
 	const destinationRef = remoteResolution.ref;
 	const oldObject = remoteResolution.object_id;
 	const update = oldObject === null
@@ -3085,36 +3672,19 @@ function derivePushTarget(command: ReviewLifecycleCommand): GateTargetV1 {
 	};
 }
 
-function commandOptionValue(arguments_: readonly string[], name: string): string {
-	const matches: string[] = [];
-	for (let index = 0; index < arguments_.length; index += 1) {
-		const argument = arguments_[index]!;
-		if (argument === name) {
-			const value = arguments_[index + 1];
-			if (!value) throw new Error(`${name} is missing its value`);
-			matches.push(value);
-			index += 1;
-		} else if (argument.startsWith(`${name}=`)) {
-			matches.push(argument.slice(name.length + 1));
-		}
-	}
-	if (matches.length !== 1) throw new Error(`Command requires exactly one ${name} value`);
-	return matches[0]!;
+function commandOptionValue(arguments_: readonly string[], names: readonly string[]): string {
+	const value = optionalCommandOptionValue(arguments_, names);
+	if (value === undefined) throw new Error(`Command requires exactly one ${names.join("/")} value`);
+	return value;
 }
 
+
 function derivePullRequestTarget(command: ReviewLifecycleCommand): GateTargetV1 {
-	const baseRef = resolveLocalFullRef(
-		command.cwd,
-		commandOptionValue(command.arguments, "--base"),
-		"Pull request base",
-	);
-	const headRef = resolveLocalFullRef(
-		command.cwd,
-		commandOptionValue(command.arguments, "--head"),
-		"Pull request head",
-	);
+	const baseRef = resolveLocalFullRef(command.cwd, commandOptionValue(command.arguments, ["--base", "-B"]), "Pull request base");
+	const headOption = commandOptionValue(command.arguments, ["--head", "-H"]);
+	const headRef = parsePullRequestHead(headOption).remoteRef;
 	const baseCommit = runReviewGit(command.cwd, ["rev-parse", "--verify", `${baseRef}^{commit}`]);
-	const headCommit = runReviewGit(command.cwd, ["rev-parse", "--verify", `${headRef}^{commit}`]);
+	const headCommit = runReviewGit(command.cwd, ["rev-parse", "--verify", "HEAD^{commit}"]);
 	return {
 		kind: GATE_TARGET_KIND.PULL_REQUEST,
 		base_ref: baseRef,
@@ -3123,6 +3693,61 @@ function derivePullRequestTarget(command: ReviewLifecycleCommand): GateTargetV1 
 		head_ref: headRef,
 		head_commit: headCommit,
 		head_tree: runReviewGit(command.cwd, ["rev-parse", "--verify", `${headCommit}^{tree}`]),
+	};
+}
+
+async function deriveNativePublicationTarget(
+	derived: DerivedReviewGateTarget,
+	probe: PublicationProbe,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<DerivedReviewGateTarget> {
+	if (derived.command.event === "pre-push") {
+		if (derived.target.kind !== GATE_TARGET_KIND.PUSH) throw new Error("Push target derivation returned the wrong kind");
+		return { ...derived, nativePublication: await deriveNativePrePushBinding(derived.command, derived.target, probe, timeoutMs, signal) };
+	}
+	if (derived.command.event !== "pre-pr") return derived;
+	if (derived.target.kind !== GATE_TARGET_KIND.PULL_REQUEST) throw new Error("Pull request target derivation returned the wrong kind");
+	const repository = effectiveGhRepository(derived.command);
+	const advertised = await deriveAdvertisedPrePrBase(
+		derived.command,
+		commandOptionValue(derived.command.arguments, ["--base", "-B"]),
+		repository,
+		probe,
+		timeoutMs,
+		signal,
+	);
+	const head = await deriveAdvertisedPrePrHead(
+		derived.command,
+		commandOptionValue(derived.command.arguments, ["--head", "-H"]),
+		repository,
+		probe,
+		timeoutMs,
+		signal,
+	);
+	const pushRemote = resolveNativePushRemote(derived.command.cwd);
+	if (
+		advertised.commit !== derived.target.base_commit ||
+		head.remoteRef !== derived.target.head_ref ||
+		head.commit !== derived.target.head_commit
+	) throw new Error("Advertised PR topology does not match the exact local command target");
+	return {
+		...derived,
+		nativePublication: {
+			flags: ["--base-ref", advertised.selector],
+			pushRemote,
+			pushIdentity: pushRemoteIdentity(derived.command.cwd, pushRemote),
+			repository,
+			prePrBoundary: {
+				source: "explicit",
+				selector: advertised.selector,
+				commit: advertised.commit,
+				remote: advertised.remote,
+				remoteRef: advertised.remoteRef,
+				remoteIdentity: advertised.remoteIdentity,
+			},
+			prePrHead: head,
+		},
 	};
 }
 
@@ -3159,6 +3784,7 @@ function deriveReleaseTarget(command: ReviewLifecycleCommand): GateTargetV1 {
 function deriveReviewGateTarget(
 	command: string,
 	defaultCwd: string,
+	pinnedPushTarget?: PushGateTargetV1,
 ): DerivedReviewGateTarget {
 	const inspection = inspectReviewLifecycleCommand(command, defaultCwd);
 	if (!inspection.event || !inspection.command) {
@@ -3186,13 +3812,10 @@ function deriveReviewGateTarget(
 		};
 	}
 	if (inspection.command.event === "pre-push") {
-		return { command: inspection.command, target: derivePushTarget(inspection.command) };
+		return { command: inspection.command, target: derivePushTarget(inspection.command, pinnedPushTarget) };
 	}
 	if (inspection.command.event === "pre-pr") {
-		return {
-			command: inspection.command,
-			target: derivePullRequestTarget(inspection.command),
-		};
+		return { command: inspection.command, target: derivePullRequestTarget(inspection.command) };
 	}
 	if (inspection.command.event === "pre-release") {
 		return { command: inspection.command, target: deriveReleaseTarget(inspection.command) };
@@ -3243,7 +3866,7 @@ function nativeStatusUnsupported(operation: ReviewControllerOperation): Record<s
 		inventory_complete: false,
 		next_action: "require-upstream-read-only-native-status-inventory",
 		evidence: {
-			native_contract: "gentle-ai/2.1.0",
+			native_contract: "gentle-ai/2.1.2",
 			general_status: "unsupported",
 			claimant_inventory: "unsupported",
 		},
@@ -3278,28 +3901,83 @@ function mapNativeValidateResult(result: NativeValidateResult): Record<string, u
 		result: result.result,
 		action: result.action,
 		reason: result.reason,
-		gate_context: {
-			lineage_id: result.gateContext.lineageId,
-			store_revision: result.gateContext.storeRevision,
-			receipt_hash: result.gateContext.receiptHash,
-			target_hash: result.gateContext.targetHash,
-		},
+		context: result.gateContext.raw,
 	};
 }
 
-function nativeGateFingerprint(result: NativeValidateResult): string {
+function nativeGateFingerprint(result: NativeValidateResult, derived: DerivedReviewGateTarget): string {
 	return canonicalHash({
-		lineage_id: result.gateContext.lineageId,
-		store_revision: result.gateContext.storeRevision,
-		receipt_hash: result.gateContext.receiptHash,
-		target_hash: result.gateContext.targetHash,
+		gate_context: result.gateContext.raw,
+		publication_target: {
+			target: derived.target,
+			native_publication: derived.nativePublication ?? null,
+		},
 	});
 }
 
+function requestedNativeGate(command: ReviewLifecycleCommand): string {
+	return command.event === "pre-release" ? "release" : command.event;
+}
+
 function nativeGateFlags(derived: DerivedReviewGateTarget): readonly string[] {
-	return derived.target.kind === GATE_TARGET_KIND.PULL_REQUEST
-		? ["--base-ref", derived.target.base_ref]
-		: [];
+	return derived.nativePublication?.flags ?? [];
+}
+
+function authorizationTargetHash(derived: DerivedReviewGateTarget): string {
+	return derived.nativePublication === undefined
+		? canonicalHash(derived.target)
+		: canonicalHash({ target: derived.target, native_publication: derived.nativePublication });
+}
+
+function assertNativePublicationBinding(result: NativeValidateResult, derived: DerivedReviewGateTarget): void {
+	const returnedGate = result.gateContext.raw.gate;
+	if (returnedGate !== requestedNativeGate(derived.command) && (result.allowed || returnedGate !== "")) {
+		throw new Error("Native validation returned a gate context for a different gate");
+	}
+	const expected = derived.nativePublication?.prePrBoundary;
+	if (expected === undefined || !result.allowed || result.result !== "allow") return;
+	const value = result.gateContext.raw.pre_pr_boundary;
+	if (!isRecord(value)) throw new Error("Native pre-PR result omitted its publication boundary");
+	if (
+		value.source !== expected.source ||
+		value.selector !== expected.selector ||
+		value.commit !== expected.commit ||
+		value.remote !== expected.remote ||
+		value.remote_ref !== expected.remoteRef ||
+		value.remote_identity !== expected.remoteIdentity
+	) throw new Error("Native pre-PR publication boundary does not match the exact PR command target");
+}
+
+function assertNativePublicationUnchanged(before: DerivedReviewGateTarget, after: DerivedReviewGateTarget): void {
+	if (authorizationTargetHash(before) !== authorizationTargetHash(after)) {
+		throw new Error("Native publication target changed during native validation");
+	}
+	if (before.target.kind === GATE_TARGET_KIND.PULL_REQUEST) {
+		if (
+			after.target.kind !== GATE_TARGET_KIND.PULL_REQUEST ||
+			after.target.head_commit !== before.target.head_commit ||
+			after.nativePublication?.prePrHead?.commit !== before.target.head_commit
+		) throw new Error("Advertised pull request head changed during native validation");
+	}
+}
+
+async function rederiveNativePublicationTarget(
+	expected: DerivedReviewGateTarget,
+	command: string,
+	defaultCwd: string,
+	probe: PublicationProbe,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<DerivedReviewGateTarget> {
+	const rederived = deriveReviewGateTarget(
+		command,
+		defaultCwd,
+		expected.target.kind === GATE_TARGET_KIND.PUSH ? expected.target : undefined,
+	);
+	if (rederived.command.cwd !== expected.command.cwd) throw new Error("Lifecycle command repository changed during native validation");
+	const fresh = await deriveNativePublicationTarget(rederived, probe, timeoutMs, signal);
+	assertNativePublicationUnchanged(expected, fresh);
+	return fresh;
 }
 
 interface NativeStartPolicyValidation {
@@ -3391,12 +4069,38 @@ function nativeOperationFailure(operation: ReviewControllerOperation, error: unk
 	};
 }
 
+function nativePublicationFailure(operation: ReviewControllerOperation, error: unknown): Record<string, unknown> {
+	if (error instanceof NativeSplitFetchPushUnsupportedError) {
+		return {
+			operation,
+			status: "blocked",
+			outcome: "native-split-fetch-push-unsupported",
+			reason: error.message,
+			mutation_performed: false,
+			mutation_outcome: "none",
+			next_action: error.nextAction,
+		};
+	}
+	if (!(error instanceof NativePublicationBaseRequiredError)) return nativeOperationFailure(operation, error);
+	return {
+		operation,
+		status: "blocked",
+		outcome: "native-publication-base-required",
+		reason: error.message,
+		mutation_performed: false,
+		mutation_outcome: "none",
+		next_action: error.nextAction,
+	};
+}
+
 async function executeReviewControllerOperation(
 	parametersValue: unknown,
 	defaultCwd: string,
 	pendingAuthorizations: Map<string, PendingReviewAuthorization>,
 	nativeReviewCli: NativeReviewCli | null,
 	signal?: AbortSignal,
+	publicationProbe: PublicationProbe = nodePublicationProbe,
+	publicationProbeTimeoutMs = PUBLICATION_PROBE_TIMEOUT_MS,
 ): Promise<Record<string, unknown>> {
 	const parameters = parseReviewControllerParameters(parametersValue);
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.EXPORT) {
@@ -3575,24 +4279,23 @@ async function executeReviewControllerOperation(
 			});
 			if (
 				bound.change !== input.change ||
-				bound.path !== expectedPath ||
-				bound.lineageId !== input.lineageId ||
-				typeof bound.repository !== "string" || bound.repository.length === 0 ||
+				bound.lineage !== input.lineageId ||
+				typeof bound.revision !== "string" || bound.revision.length === 0 ||
 				typeof bound.authorityRevision !== "string" || bound.authorityRevision.length === 0 ||
 				typeof bound.receiptHash !== "string" || bound.receiptHash.length === 0 ||
-				typeof bound.bindingRevision !== "string" || bound.bindingRevision.length === 0
+				bound.gateContext.lineageId !== input.lineageId ||
+				bound.gateContext.storeRevision !== bound.authorityRevision
 			) throw Object.assign(
 				new Error("Native bind-sdd returned malformed or inconsistent binding evidence"),
 				{ mutationOutcome: "unknown", nextAction: "replay-exact-native-operation" },
 			);
 			return { operation: parameters.operation, binding: {
-				repository: bound.repository,
+				revision: bound.revision,
 				change: bound.change,
-				path: bound.path,
-				lineage_id: bound.lineageId,
+				lineage: bound.lineage,
 				authority_revision: bound.authorityRevision,
 				receipt_hash: bound.receiptHash,
-				binding_revision: bound.bindingRevision,
+				gate_context: bound.gateContext.raw,
 			} };
 		} catch (error) {
 			return nativeOperationFailure(parameters.operation, error);
@@ -3756,7 +4459,7 @@ async function executeReviewControllerOperation(
 			return { operation: parameters.operation, status: "blocked", outcome: "legacy-read-only", mutation_performed: false, next_action: "use-compatible-read-or-gate-route" };
 		}
 		if (nativeReviewCli !== null) {
-			const input = parseCompactFinalizeInput({
+			const input = parseNativeCompactFinalizeInput({
 				cwd: defaultCwd,
 				...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 				...raw,
@@ -3765,11 +4468,11 @@ async function executeReviewControllerOperation(
 				const result = await nativeReviewCli.finalize({
 					cwd: defaultCwd,
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
-					...(input.review_result === undefined ? {} : { lensResults: input.review_result.lens_results.map((document, index) => ({ lens: `lens-${index}`, document })) }),
-					...(input.refuter_batch === undefined ? {} : { refuterDocument: input.refuter_batch }),
+					...(input.review_result === undefined ? {} : { lensResults: input.review_result.lens_results.map((document, index) => ({ lens: document.lens ?? `lens-${index}`, document: toNativeReviewerDocument(document) })) }),
+					...(input.refuter_batch === undefined ? {} : { refuterDocument: toNativeRefuterDocument(input.refuter_batch) }),
 					...(input.correction_line_forecast === undefined ? {} : { correctionLines: input.correction_line_forecast }),
-					...(input.validation === undefined ? {} : { validationDocument: input.validation }),
-					...(input.final_evidence === undefined ? {} : { evidenceDocument: { evidence: input.final_evidence, passed: input.final_verification_passed } }),
+					...(input.validation === undefined && input.validation_proof === undefined ? {} : { validationDocument: toNativeValidatorDocument(input.validation ?? input.validation_proof!) }),
+					...(input.final_evidence === undefined ? {} : { evidenceDocument: input.final_evidence, failed: input.final_verification_passed === false }),
 					...(signal === undefined ? {} : { signal }),
 				});
 				return { operation: parameters.operation, result: mapNativeFinalizeResult(result) };
@@ -3891,30 +4594,45 @@ async function executeReviewControllerOperation(
 		!graphV1LineageExists(derived.command.cwd, parameters.lineageId)
 	) {
 		try {
+			const nativeDerived = await deriveNativePublicationTarget(
+				derived,
+				publicationProbe,
+				publicationProbeTimeoutMs,
+				signal,
+			);
 			const result = await nativeReviewCli.validate({
-				cwd: derived.command.cwd,
-				gate: derived.command.event,
+				cwd: nativeDerived.command.cwd,
+				gate: requestedNativeGate(nativeDerived.command),
 				lineageId: parameters.lineageId,
-				flags: nativeGateFlags(derived),
+				flags: nativeGateFlags(nativeDerived),
 				...(signal === undefined ? {} : { signal }),
 			});
+			assertNativePublicationBinding(result, nativeDerived);
+			const authorizedDerived = result.allowed && result.result === "allow"
+				? await rederiveNativePublicationTarget(
+					nativeDerived,
+					commandValue,
+					defaultCwd,
+					publicationProbe,
+					publicationProbeTimeoutMs,
+					signal,
+				)
+				: nativeDerived;
 			const response: Record<string, unknown> = {
 				operation: parameters.operation,
 				result: mapNativeValidateResult(result),
-				derived_target: derived.target,
+				derived_target: nativeDerived.target,
 			};
 			if (result.allowed && result.result === "allow") {
-				const commandHash = reviewAuthorizationKey(commandValue, derived.command.cwd);
+				const commandHash = reviewAuthorizationKey(commandValue, authorizedDerived.command.cwd);
 				const authorization: PendingReviewAuthorization = {
 					command_hash: commandHash,
-					target_hash: canonicalHash(derived.target),
-					receipt_hash: result.gateContext.receiptHash,
+					target_hash: authorizationTargetHash(authorizedDerived),
+					receipt_hash: null,
 					native_gate: {
 						lineage_id: result.gateContext.lineageId,
 						store_revision: result.gateContext.storeRevision,
-						receipt_hash: result.gateContext.receiptHash,
-						target_hash: result.gateContext.targetHash,
-						fingerprint: nativeGateFingerprint(result),
+						fingerprint: nativeGateFingerprint(result, authorizedDerived),
 					},
 				};
 				pendingAuthorizations.set(commandHash, authorization);
@@ -3922,7 +4640,7 @@ async function executeReviewControllerOperation(
 			}
 			return response;
 		} catch (error) {
-			return nativeOperationFailure(parameters.operation, error);
+			return nativePublicationFailure(parameters.operation, error);
 		}
 	}
 	let releaseFastPath: Record<string, unknown> | undefined;
@@ -4074,6 +4792,9 @@ async function gateLifecycleCommand(
 	defaultCwd: string,
 	pendingAuthorizations: Map<string, PendingReviewAuthorization>,
 	nativeReviewCli: NativeReviewCli | null = null,
+	publicationProbe: PublicationProbe = nodePublicationProbe,
+	publicationProbeTimeoutMs = PUBLICATION_PROBE_TIMEOUT_MS,
+	signal?: AbortSignal,
 ): Promise<ToolCallEventResult | undefined> {
 	const inspection = inspectReviewLifecycleCommand(command, defaultCwd);
 	if (!inspection.event) return undefined;
@@ -4098,9 +4819,24 @@ async function gateLifecycleCommand(
 		};
 	}
 	pendingAuthorizations.delete(commandHash);
+	if (authorization.native_gate) {
+		try {
+			derived = await deriveNativePublicationTarget(
+				derived,
+				publicationProbe,
+				publicationProbeTimeoutMs,
+				signal,
+			);
+		} catch (error) {
+			return {
+				block: true,
+				reason: `Gentle AI ${inspection.event} gate native publication target changed after authorization and failed closed: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+	}
 	if (
 		authorization.command_hash !== commandHash ||
-		authorization.target_hash !== canonicalHash(derived.target)
+		authorization.target_hash !== authorizationTargetHash(derived)
 	) {
 		const mismatch = authorization.command_hash !== commandHash ? "command identity" : "typed target";
 		return {
@@ -4118,20 +4854,37 @@ async function gateLifecycleCommand(
 		try {
 			const fresh = await nativeReviewCli.validate({
 				cwd: derived.command.cwd,
-				gate: derived.command.event,
+				gate: requestedNativeGate(derived.command),
 				lineageId: authorization.native_gate.lineage_id,
 				flags: nativeGateFlags(derived),
+				...(signal === undefined ? {} : { signal }),
 			});
+			assertNativePublicationBinding(fresh, derived);
 			if (
 				!fresh.allowed ||
-				fresh.result !== "allow" ||
-				nativeGateFingerprint(fresh) !== authorization.native_gate.fingerprint
+				fresh.result !== "allow"
 			) {
 				return {
 					block: true,
 					reason: `Gentle AI ${inspection.event} gate native authority, receipt, revision, or target changed after authorization and failed closed.`,
 				};
 			}
+			const postNativeDerived = await rederiveNativePublicationTarget(
+				derived,
+				command,
+				defaultCwd,
+				publicationProbe,
+				publicationProbeTimeoutMs,
+				signal,
+			);
+			assertNativePublicationBinding(fresh, postNativeDerived);
+			if (nativeGateFingerprint(fresh, postNativeDerived) !== authorization.native_gate.fingerprint) {
+				return {
+					block: true,
+					reason: `Gentle AI ${inspection.event} gate native authority, receipt, revision, or target changed after authorization and failed closed.`,
+				};
+			}
+			derived = postNativeDerived;
 		} catch {
 			return {
 				block: true,
@@ -4188,7 +4941,13 @@ export const __testing = {
 	getOrchestratorPrompt,
 	renderOrchestratorPrompt,
 	resolveControllerSddStatus,
+	resolveStartupControllerSddStatus,
+	repositoryLocationIdentity,
+	runPublicationProbeGit,
+	publicationProbeErrorCode: PUBLICATION_PROBE_ERROR_CODE,
 };
+
+const NATIVE_SDD_STATUS_STARTUP_TIMEOUT_MS = 1_000;
 
 async function resolveControllerSddStatus(
 	cwd: string,
@@ -4196,6 +4955,7 @@ async function resolveControllerSddStatus(
 	includeInstructions: boolean,
 	artifactStore: SddPreflightPreferences["artifactStore"] | undefined,
 	nativeReviewCli: NativeReviewCli | null = null,
+	signal?: AbortSignal,
 ) {
 	const base = resolveSddStatus({ cwd, changeName, includeInstructions, artifactStore });
 	if (!base.changeName || base.isNonAuthoritative) return base;
@@ -4217,7 +4977,7 @@ async function resolveControllerSddStatus(
 	}
 	if (base.applyState !== "all_done" || nativeReviewCli === null) return base;
 	try {
-		const native = await nativeReviewCli.sddStatus({ cwd, change: base.changeName });
+		const native = await nativeReviewCli.sddStatus({ cwd, change: base.changeName, ...(signal === undefined ? {} : { signal }) });
 		return resolveSddStatus({
 			cwd,
 			changeName: base.changeName,
@@ -4236,6 +4996,17 @@ async function resolveControllerSddStatus(
 	}
 }
 
+async function resolveStartupControllerSddStatus(
+	cwd: string,
+	changeName: string | undefined,
+	includeInstructions: boolean,
+	artifactStore: SddPreflightPreferences["artifactStore"] | undefined,
+	nativeReviewCli: NativeReviewCli | null,
+	timeoutMs = NATIVE_SDD_STATUS_STARTUP_TIMEOUT_MS,
+) {
+	return resolveControllerSddStatus(cwd, changeName, includeInstructions, artifactStore, nativeReviewCli, AbortSignal.timeout(timeoutMs));
+}
+
 function hasRecoveryObligationForChange(cwd: string, changeName: string): boolean {
 	try {
 		return SupersessionStoreV1.forRepository(cwd).hasRecoveryRequiredMarker(changeName) || hasEligibleGraphV1RecoveryAuthorityV1(cwd);
@@ -4249,10 +5020,18 @@ function hasRecoveryObligationForChange(cwd: string, changeName: string): boolea
 
 export interface GentleAiRuntimeDependencies {
 	nativeReviewCli?: NativeReviewCli | null;
+	publicationProbe?: PublicationProbe;
+	publicationProbeTimeoutMs?: number;
+	bashTimeRevalidationTimeoutMs?: number;
 }
 
 export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencies = {}): (pi: ExtensionAPI) => void {
 	const nativeReviewCli = dependencies.nativeReviewCli === undefined ? createNativeReviewCli() : dependencies.nativeReviewCli;
+	const publicationProbe = dependencies.publicationProbe ?? nodePublicationProbe;
+	const publicationProbeTimeoutMs = dependencies.publicationProbeTimeoutMs ?? PUBLICATION_PROBE_TIMEOUT_MS;
+	const bashTimeRevalidationTimeoutMs = dependencies.bashTimeRevalidationTimeoutMs ?? BASH_TIME_REVALIDATION_TIMEOUT_MS;
+	if (!Number.isSafeInteger(publicationProbeTimeoutMs) || publicationProbeTimeoutMs <= 0) throw new TypeError("Publication probe timeout must be a positive safe integer");
+	if (!Number.isSafeInteger(bashTimeRevalidationTimeoutMs) || bashTimeRevalidationTimeoutMs <= 0) throw new TypeError("Bash-time revalidation timeout must be a positive safe integer");
 	return function gentleAi(pi: ExtensionAPI): void {
 	const pendingReviewAuthorizations = new Map<string, PendingReviewAuthorization>();
 
@@ -4281,6 +5060,8 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 				pendingReviewAuthorizations,
 				nativeReviewCli,
 				signal,
+				publicationProbe,
+				publicationProbeTimeoutMs,
 			);
 			return {
 				content: [{ type: "text", text: JSON.stringify(details) }],
@@ -4348,7 +5129,7 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 				: "";
 		const phase = isSddAgent ? sddPhaseFromAgentStartEvent(event) : undefined;
 		const nativeStatusPrompt = phase
-			? `\n\n${renderNativeSddPhasePrompt(await resolveControllerSddStatus(
+			? `\n\n${renderNativeSddPhasePrompt(await resolveStartupControllerSddStatus(
 				ctx.cwd,
 				undefined,
 				true,
@@ -4375,7 +5156,11 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 			return undefined;
 		return enforceReviewGateAndCommandSafety(
 			event.input.command,
-			(command) => gateLifecycleCommand(command, ctx.cwd, pendingReviewAuthorizations, nativeReviewCli),
+			(command) => {
+				const deadline = AbortSignal.timeout(bashTimeRevalidationTimeoutMs);
+				const signal = ctx.signal === undefined ? deadline : AbortSignal.any([ctx.signal, deadline]);
+				return gateLifecycleCommand(command, ctx.cwd, pendingReviewAuthorizations, nativeReviewCli, publicationProbe, publicationProbeTimeoutMs, signal);
+			},
 			(command) => confirmCommand(command, ctx),
 		);
 	});

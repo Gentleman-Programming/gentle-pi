@@ -151,7 +151,7 @@ test("resolveSddStatus blocks an expected missing native bound readiness without
 	});
 	assert.equal(status.applyState, "blocked");
 	assert.equal(status.nextRecommended, "resolve-review");
-	assert.match(status.blockedReasons.join("\n"), /binding is missing/);
+	assert.deepEqual(status.blockedReasons, ["resolve-review: binding is missing"]);
 });
 
 test("resolveSddStatus routes completed implementation to parent lifecycle and separates parent actions", async () => {

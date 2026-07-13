@@ -25,6 +25,14 @@ const CHAIN = "assets/chains/4r-review.chain.md";
 const SDD_WORKFLOW = "assets/sdd-orchestrator-workflow.md";
 const RELEASE_SKILL = "skills/release/SKILL.md";
 const WORKER = "assets/agents/gentle-ai-worker.md";
+const CANONICAL_LIFECYCLE_SPECS = [
+	"openspec/specs/review-orchestration/spec.md",
+	"openspec/specs/review-transaction/spec.md",
+] as const;
+const HISTORICAL_LIFECYCLE_SPECS = [
+	"openspec/changes/complete-native-review-lifecycle/specs/review-orchestration/spec.md",
+	"openspec/changes/complete-native-review-lifecycle/specs/review-transaction/spec.md",
+] as const;
 
 function read(path: string): string {
 	return readFileSync(join(ROOT, path), "utf8");
@@ -63,7 +71,7 @@ function assertNativeJsonHasNoMetadata(path: string, value: unknown): void {
 const JUDGMENT_DAY_PATTERNS = [
 	/Judgment Day starts only when explicitly requested and replaces ordinary review for that lineage\./,
 	/Judgment Day starts with exactly two blind judges and zero refuters\./,
-	/Only Judgment Day may iterate, for at most two scoped fix\/re-judgment rounds\./,
+	/Judgment Day alone may iterate discovery and scoped re-judgment, for at most two rounds\./,
 	/Findings surviving round two escalate; no third-round transition exists\./,
 ] as const;
 
@@ -91,7 +99,9 @@ test("canonical contract defines compact risk, causal admission, correction, CAS
 		/`changed-hunk`[\s\S]*`candidate-created-path`[\s\S]*`differential-test`[\s\S]*`before-after`/,
 		/Only severe `introduced`, `behavior-activated`, or `worsened` findings with valid proof can enter `correction_ids`/,
 		/`pre-existing` and `base-only` findings become non-blocking follow-ups/,
-		/one correction and one targeted validator/i,
+		/up to three failed targeted attempts/i,
+		/original cumulative budget/i,
+		/frozen findings and genesis scope/i,
 		/content-derived revisions, compare-and-swap replacement, exact retry idempotency/i,
 		/graph-v1 ordinary lineages remain readable, gate-validatable, and exportable, but reject new mutation/i,
 		/Judgment Day remains mutable on graph-v1/i,
@@ -105,6 +115,13 @@ test("canonical contract defines compact risk, causal admission, correction, CAS
 	]);
 	assert.match(read(README), /Trust boundary:[\s\S]*separately privileged signer\/service/);
 	assert.doesNotMatch(read(README), /Known limitation:[\s\S]*runtime-owned child-agent identity\/attestation/);
+	assert.match(read(README), /split fetch\/push[\s\S]*unsupported[\s\S]*upstream[\s\S]*base-ref/i);
+	assert.match(read(README), /Residual gap \(separate follow-up\): native first-push authorization remains unsupported until Pi has a persisted explicit advertised-base source\./);
+	const lifecycleSpec = read("openspec/specs/review-transaction/spec.md");
+	assert.match(lifecycleSpec, /split fetch\/push[\s\S]*upstream contract limitation/i);
+	assert.match(lifecycleSpec, /allow response MUST return the exact requested gate/i);
+	assert.match(lifecycleSpec, /non-authorizing denial MAY return an empty gate[\s\S]*pre_pr_boundary/i);
+	assert.match(lifecycleSpec, /one aggregate bash-time deadline/i);
 });
 
 for (const path of REVIEW_LENSES) {
@@ -141,6 +158,29 @@ test("ordinary lens prompts contain the literal compact-v2 native result envelop
 		]);
 		assertNativeJsonHasNoMetadata(path, envelope);
 		assert.match(read(path), /Do not put `summary`, `skill_resolution`, prose, or orchestration metadata inside or beside the native JSON result/);
+		assert.match(read(path), /If clean, use an empty `findings` array and a non-empty `evidence` array/);
+		assert.doesNotMatch(read(path), /Use empty `findings` and `evidence` arrays when clean/);
+	}
+});
+
+test("canonical ordinary review specs preserve the shipped three-attempt cumulative correction contract", () => {
+	for (const path of CANONICAL_LIFECYCLE_SPECS) {
+		const content = read(path);
+		assert.match(content, /up to three failed targeted attempts/i, path);
+		assert.match(content, /cumulative.*budget|budget.*cumulative/i, path);
+		assert.match(content, /never reruns initial lenses|without rerunning initial (?:lenses|review)/i, path);
+		assert.match(content, /correction_required/, path);
+		assert.match(content, /third failed attempt|three failed targeted attempts/i, path);
+		assert.match(content, /forecast/i, path);
+		assert.doesNotMatch(content, /at most one correction|one correction batch|After the one correction|GIVEN one exact ordinary correction|one validator and one final verification/i, path);
+	}
+});
+
+test("historical lifecycle change specs preserve their completed one-attempt design context", () => {
+	for (const path of HISTORICAL_LIFECYCLE_SPECS) {
+		const content = read(path);
+		assert.match(content, /at most one correction|one correction batch|After the one correction|GIVEN one exact ordinary correction|one validator and one final verification/i, path);
+		assert.doesNotMatch(content, /up to three failed targeted attempts/i, path);
 	}
 });
 
@@ -159,7 +199,8 @@ test("ordinary refuter is one complete read-only inferential batch with concrete
 		/`gentle-ai\.refuter-result-batch\/v1`/,
 		/`request_hash`[\s\S]*`finding_id`/,
 		/`proof_refs`[\s\S]*`changed-hunk:`[\s\S]*`candidate-created-path:`[\s\S]*`differential-test:`[\s\S]*`before-after:`/,
-		/An `inconclusive` outcome is rejected/,
+		/independent concrete refuter proof is valid and need not repeat reviewer `proof_refs`/,
+		/Use `inconclusive` when the supplied evidence supports neither `refuted` nor `corroborated`/,
 		/Do not create findings, alter frozen claims, request fixes, launch actors, persist authority, or repeat/,
 	]);
 });
@@ -172,7 +213,7 @@ test("targeted validator checks only original criteria and correction regression
 		/Validate the original criteria and correction regression only/,
 		/Never expand paths, IDs, untracked scope, acceptance criteria, or correction purpose/,
 		/empty `fix_caused_findings` array/,
-		/Do not request another fix, launch actors, persist authority, or repeat/,
+		/Do not request another fix or attempt, launch actors, persist authority, or repeat yourself/,
 	]);
 });
 
@@ -231,12 +272,22 @@ test("orchestrator, skill, and README agree on compact facade and compatibility"
 		assertMatches(label, content, [
 			/start -> finalize -> validate/,
 			/`evidence_class`[\s\S]*`causal_disposition`/,
-			/one correction and one targeted validator/i,
+			/up to three failed targeted attempts/i,
 			/graph-v1[\s\S]*(?:read-only|reject mutation)/i,
 			/Judgment Day[\s\S]*graph-v1/i,
 			/(?:one-shot|one exact one-shot)[\s\S]*(?:bash time|bash-time)/i,
 		]);
 	}
+});
+
+test("README documents the exact native pairing and authority-preserving rollback boundary", () => {
+	const content = read(README);
+	assert.match(content, /adapter supports `gentle-ai 2\.1\.2` only/i);
+	assert.match(content, /rechecks that version before every native operation/i);
+	assert.match(content, /rollback MUST preserve every native store and receipt/);
+	assert.match(content, /MUST NOT run a downgraded binary/i);
+	assert.match(content, /existing branch.*advertised commit equals.*old object/is);
+	assert.match(content, /never guesses? a base.*upstream.*default branch.*nearest ancestor/is);
 });
 
 test("managed contracts retain no fresh lifecycle review directive", () => {

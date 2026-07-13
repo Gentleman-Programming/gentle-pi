@@ -1,0 +1,20 @@
+{
+  "schema": "gentle-ai.review-gate-result/v1",
+  "result": "invalidated",
+  "allowed": false,
+  "action": "explicit-maintainer-action",
+  "reason": "compact gate inputs cannot be derived: configured upstream is missing or ambiguous; pass --base-ref \u003cremote\u003e/\u003cbranch\u003e",
+  "context": {
+    "gate": "",
+    "lineage_id": "",
+    "generation": 0,
+    "base_tree": "",
+    "candidate_tree": "",
+    "paths_digest": "",
+    "fix_delta_hash": "",
+    "policy_hash": "",
+    "ledger_hash": "",
+    "evidence_hash": "",
+    "base_relationship_valid": false
+  }
+}

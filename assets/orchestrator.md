@@ -108,7 +108,7 @@ For skill-shaped requests, do not treat injected `<available_skills>` as complet
 
 ## Bounded Review Transactions
 
-New ordinary review uses compact `gentle_review` `start -> finalize -> validate`: START freezes scope/risk/budget; FINALIZE admits only proven candidate-caused findings, permits one bounded correction and validator, and hashes final evidence.
+New ordinary review uses `gentle_review` `start -> finalize -> validate`. START freezes scope, findings, genesis, risk, and budget. FINALIZE permits up to three failed targeted attempts inside that cumulative budget without rerunning lenses.
 
 Compact gates use zero actors and rederive authority, the exact target, and publication evidence before allow. Pi adds exact one-shot command authorization and bash-time rederivation. Graph-v1 ordinary authority is read-only; Judgment Day remains graph-v1.
 Release from protected `main` may bypass receipt validation only when its immutable remote SHA and required CI are proven; otherwise native receipt validation applies.
