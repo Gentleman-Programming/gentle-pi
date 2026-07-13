@@ -1176,6 +1176,31 @@ test("registered controller creates, advances, reports, and authorizes an exact 
 	assert.match(fabricated?.reason ?? "", /registered review controller authorization/i);
 });
 
+test("pull request fork heads require one exact configured remote ref", (t) => {
+	const fixture = createRepository(t, true);
+	git(fixture.repository, "remote", "add", "fork", "https://github.com/MarsSall/gentle-pi.git");
+	const ref = "refs/heads/final";
+	const commit = "a".repeat(40);
+	const resolved = __testing.resolvePullRequestForkHead(fixture.repository, "MarsSall:final", (_cwd, remote, requestedRef) => {
+		assert.equal(remote, "fork");
+		assert.equal(requestedRef, ref);
+		return `${commit}\t${ref}`;
+	});
+	assert.deepEqual(resolved, { ref, commit });
+	assert.throws(
+		() => __testing.resolvePullRequestForkHead(fixture.repository, "OtherOwner:final", () => ""),
+		/exactly one configured GitHub remote/i,
+	);
+	git(fixture.repository, "remote", "add", "fork-copy", "git@github.com:MarsSall/gentle-pi.git");
+	assert.throws(() => __testing.resolvePullRequestForkHead(fixture.repository, "MarsSall:final", () => ""), /exactly one configured GitHub remote/i);
+	git(fixture.repository, "remote", "remove", "fork-copy");
+	assert.throws(() => __testing.resolvePullRequestForkHead(fixture.repository, "MarsSall:missing", () => ""), /missing or ambiguous/i);
+	assert.throws(
+		() => __testing.resolvePullRequestForkHead(fixture.repository, "MarsSall:final", () => `${commit}\t${ref}\n${"b".repeat(40)}\t${ref}`),
+		/missing or ambiguous/i,
+	);
+});
+
 test("controller binds push, PR, and release authorization to exact command arguments", async (t) => {
 	const fixture = createRepository(t, true);
 	assert.ok(fixture.finalCommit && fixture.finalTree && fixture.tagObject);
@@ -1210,34 +1235,32 @@ test("controller binds push, PR, and release authorization to exact command argu
 	}
 
 	execFileSync("git", ["--git-dir", remotePath, "update-ref", "refs/heads/final", fixture.baseCommit]);
-	await assert.rejects(
-		controller.execute(
-			"divergent-fork-pr-head",
-			{
-				operation: "validate",
-				lineageId: "controller-targets",
-				idempotencyKey: "divergent-fork-pr-head",
-				command: "gh pr create --base base --head MarsSall:final",
-				input: JSON.stringify({ scopeBudget: budget() }),
-			},
-			undefined,
-			undefined,
-			ctx,
-		),
-	);
+	const divergentCommand = "gh pr create --base base --head MarsSall:final";
+	const divergent = await controllerCall(controller, ctx, {
+		operation: "validate",
+		lineageId: "controller-targets",
+		idempotencyKey: "divergent-fork-pr-head",
+		command: divergentCommand,
+		input: JSON.stringify({ scopeBudget: budget() }),
+	});
+	assert.equal(divergent.status, "deny");
+	assert.match(String(divergent.reason), /target|receipt|snapshot|head/i);
+	const blockedDivergent = await toolCall({ toolName: "bash", input: { command: divergentCommand } }, ctx);
+	assert.equal(blockedDivergent?.block, true);
+	assert.match(blockedDivergent?.reason ?? "", /registered review controller authorization/i);
 
-	for (const command of [
+	for (const [index, command] of [
 		"gh pr create --base base --head :final",
 		"gh pr create --base base --head MarsSall:",
 		"gh pr create --base base --head MarsSall:final:extra",
-	]) {
+	].entries()) {
 		await assert.rejects(
 			controller.execute(
 				"malformed-fork-pr-head",
 				{
 					operation: "validate",
 					lineageId: "controller-targets",
-					idempotencyKey: `malformed-fork-pr-head-${command.length}`,
+					idempotencyKey: `malformed-fork-pr-head-${index}`,
 					command,
 					input: JSON.stringify({ scopeBudget: budget() }),
 				},

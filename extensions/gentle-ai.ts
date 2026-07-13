@@ -2788,12 +2788,14 @@ function runReviewGit(
 	cwd: string,
 	args: readonly string[],
 	environment: NodeJS.ProcessEnv = process.env,
+	timeout?: number,
 ): string {
 	return execFileSync("git", args, {
 		cwd,
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "pipe"],
 		env: environment,
+		timeout,
 	}).trim();
 }
 
@@ -3051,7 +3053,14 @@ function githubRemoteOwner(url: string): string | null {
 	return match?.[1] ?? null;
 }
 
-function resolvePullRequestForkHead(cwd: string, value: string): { ref: string; commit: string } | null {
+type PullRequestForkHeadRemoteResolver = (cwd: string, remote: string, ref: string) => string;
+
+function resolvePullRequestForkHead(
+	cwd: string,
+	value: string,
+	resolveRemote: PullRequestForkHeadRemoteResolver = (repositoryCwd, remote, ref) =>
+		runReviewGit(repositoryCwd, ["ls-remote", "--refs", remote, ref], process.env, 10_000),
+): { ref: string; commit: string } | null {
 	if (!value.includes(":")) return null;
 	const match = /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38})):(.+)$/.exec(value);
 	if (!match || match[2]!.includes(":")) {
@@ -3074,13 +3083,13 @@ function resolvePullRequestForkHead(cwd: string, value: string): { ref: string; 
 		throw new Error(`Pull request fork owner ${owner} must match exactly one configured GitHub remote`);
 	}
 	const ref = `refs/heads/${branch}`;
-	const lines = runReviewGit(cwd, ["ls-remote", "--refs", ownerRemotes[0]!, ref]).split(/\r?\n/).filter(Boolean);
+	const lines = resolveRemote(cwd, ownerRemotes[0]!, ref).split(/\r?\n/).filter(Boolean);
 	if (lines.length !== 1) throw new Error(`Pull request fork branch ${owner}:${branch} is missing or ambiguous`);
 	const remoteMatch = /^([0-9a-fA-F]{40,64})\t(.+)$/.exec(lines[0]!);
 	if (!remoteMatch || remoteMatch[2] !== ref) {
 		throw new Error(`Pull request fork branch ${owner}:${branch} did not resolve to one exact remote ref`);
 	}
-	return { ref, commit: runReviewGit(cwd, ["rev-parse", "--verify", `${remoteMatch[1]}^{commit}`]) };
+	return { ref, commit: remoteMatch[1]! };
 }
 
 function derivePullRequestTarget(command: ReviewLifecycleCommand): GateTargetV1 {
@@ -3762,6 +3771,7 @@ export const __testing = {
 	resolveReviewLifecycleCommand,
 	inspectReviewLifecycleCommand,
 	deriveReviewGateTarget,
+	resolvePullRequestForkHead,
 	gateLifecycleCommand,
 	executeReviewControllerOperation,
 	enforceReviewGateAndCommandSafety,
