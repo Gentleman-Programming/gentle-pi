@@ -124,6 +124,7 @@ import {
 import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
 import {
 	createNativeReviewCli,
+	isCanonicalProcessString,
 	type NativeReviewCli,
 	type NativeFinalizeResult,
 	type NativeStartResult,
@@ -2152,7 +2153,7 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 		},
 		input: {
 			type: "string",
-			description: "A JSON-serialized object string, not a nested object. New native ordinary START uses {\"mode\":\"ordinary\"} or an optional repository-local policyPath; legacy compact START retains policyHash. FINALIZE supplies reviewer results, correction forecast, targeted validation, final evidence, and an explicit final_verification_passed boolean. Judgment Day retains graph-v1 input.",
+			description: "A JSON-serialized object string, not a nested object. New native ordinary START uses {\"mode\":\"ordinary\"} with optional baseRef and repository-local policyPath; legacy compact START retains policyHash. FINALIZE supplies reviewer results, correction forecast, targeted validation, final evidence, and an explicit final_verification_passed boolean. Judgment Day retains graph-v1 input.",
 		},
 		outputPath: { type: "string", description: "Destination path for deterministic bundle export." },
 		inputPath: { type: "string", description: "Source path for staged bundle import." },
@@ -3357,14 +3358,19 @@ function validateNativeStartPolicyPath(cwd: string, value: unknown): NativeStart
 	}
 }
 
-function nativeStartPolicyRejection(reason: string): Record<string, unknown> {
+function nativeStartRejection(reason: string, field?: string): Record<string, unknown> {
 	return {
 		operation: REVIEW_CONTROLLER_OPERATION.START,
 		status: "blocked",
 		outcome: reason === "legacy-policy-hash-unsupported"
 			? "native-start-legacy-policy-hash-unsupported"
-			: "native-start-policy-path-invalid",
+			: reason === "base-ref-invalid"
+				? "native-start-base-ref-invalid"
+				: reason === "unknown-field"
+					? "native-start-input-invalid"
+					: "native-start-policy-path-invalid",
 		reason,
+		...(field === undefined ? {} : { field }),
 		mutation_performed: false,
 		mutation_outcome: "none",
 	};
@@ -3604,14 +3610,19 @@ async function executeReviewControllerOperation(
 			) {
 				return { operation: parameters.operation, status: "blocked", outcome: "legacy-read-only", mutation_performed: false, next_action: "use-compatible-read-or-gate-route" };
 			}
-			if ("policyHash" in rawStart) return nativeStartPolicyRejection("legacy-policy-hash-unsupported");
+			if ("policyHash" in rawStart) return nativeStartRejection("legacy-policy-hash-unsupported");
+			const unknownField = Object.keys(rawStart).find((field) => !["mode", "baseRef", "policyPath"].includes(field));
+			if (unknownField !== undefined) return nativeStartRejection("unknown-field", unknownField);
 			const policy: NativeStartPolicyValidation = rawStart.policyPath === undefined
 				? {}
 				: validateNativeStartPolicyPath(defaultCwd, rawStart.policyPath);
-			if (policy.reason !== undefined) return nativeStartPolicyRejection(policy.reason);
+			if (policy.reason !== undefined) return nativeStartRejection(policy.reason);
+			const baseRef = rawStart.baseRef;
+			if (baseRef !== undefined && !isCanonicalProcessString(baseRef)) return nativeStartRejection("base-ref-invalid");
 			try {
 				const result = await nativeReviewCli.start({
 					cwd: defaultCwd,
+					...(baseRef === undefined ? {} : { baseRef }),
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 					...(policy.policyPath === undefined ? {} : { policyPath: policy.policyPath }),
 					...(signal === undefined ? {} : { signal }),
@@ -4252,7 +4263,7 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 			"Inspect and recover review authority, run new native ordinary review through start/finalize/validate, preserve legacy compact compatibility reads and graph-v1 Judgment Day, and authorize one exact lifecycle command. RESET/RECOVER remain destructive; prepare-supersession/supersede require fresh interactive authorization and fail closed headlessly.",
 		promptSnippet: "Inspect authority, then use native start/finalize/validate for a new ordinary review; use graph-v1 only for explicit Judgment Day",
 		promptGuidelines: [
-			'Call {"operation":"inspect"} before START. New native ordinary START uses a JSON string such as "{\\"mode\\":\\"ordinary\\"}" or "{\\"mode\\":\\"ordinary\\",\\"policyPath\\":\\".gentle-ai/policies/team.json\\"}"; policyHash is legacy compact-only. The controller derives lineage, Git/untracked scope, tier, lenses, authored lines, and budget.',
+			'Call {"operation":"inspect"} before START. New native ordinary START uses a JSON string such as "{\\"mode\\":\\"ordinary\\"}", with optional baseRef or repository-local policyPath; policyHash is legacy compact-only. The controller derives lineage, Git/untracked scope, tier, lenses, authored lines, and budget.',
 			"For non-destructive legacy recovery, call prepare-supersession with one exact change, source, successor, operation, and prepared evidence input. Call supersede only with the returned request hash and exact English challenge after fresh UI approval; it never falls back to RESET or RECOVER. Headless, stale, conflicting, malformed, or unsupported recovery remains resolve-review blocked; exact retries are idempotent, but semantic retries require a new operation.",
 			"Run selected lenses once, then call FINALIZE with causal result JSON. FINALIZE alone records correction forecast, Git-derived correction evidence, targeted validation, and final evidence. Use ADVANCE only for explicit graph-v1 Judgment Day.",
 			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization for the exact reset_request challenge, then call RESET or RECOVER only after authorization. RESET and RECOVER internally INSPECT authority; require their verified clean result and next_action start-fresh-ordinary-review-after-verified-clean before continuing directly to a fresh ordinary START.",

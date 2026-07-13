@@ -7,6 +7,7 @@ import {
 	NativeReviewCliV210,
 	createNodeExecFileAdapter,
 	type ExecFileAdapter,
+	type NativeStartRequest,
 } from "../lib/native-review-cli.ts";
 
 interface QueuedResult {
@@ -43,18 +44,29 @@ const START = { stdout: JSON.stringify({ operation: "review/start", lineage_id: 
 const VALIDATE_ALLOW = { stdout: JSON.stringify({ schema: "gentle-ai.review-gate-result/v1", result: "allow", allowed: true, action: "allow", reason: "approved", gate_context: { lineage_id: "lineage-1", store_revision: "rev-1", receipt_hash: "receipt-1", target_hash: "target-1" } }) };
 
 test("native client verifies the pinned version once and uses argv without a shell", async () => {
-	const queue = queuedAdapter([VERSION, START, START, START]);
+	const queue = queuedAdapter([VERSION, START, START, START, START]);
 	const client = new NativeReviewCliV210(queue.adapter);
 	await client.start({ cwd: "/repo with spaces" });
+	await client.start({ cwd: "/repo with spaces", baseRef: "origin/main" });
 	await client.start({ cwd: "/repo with spaces", policyPath: "/repo with spaces/.gentle-ai/policies/team policy.json" });
 	await client.start({ cwd: "/repo with spaces", policyHash: "legacy-policy" } as unknown as { cwd: string; policyPath?: string });
 	assert.deepEqual(queue.calls.map((call) => call.arguments), [
 		["version"],
 		["review", "start", "--cwd", "/repo with spaces"],
+		["review", "start", "--cwd", "/repo with spaces", "--base-ref", "origin/main"],
 		["review", "start", "--cwd", "/repo with spaces", "--policy", "/repo with spaces/.gentle-ai/policies/team policy.json"],
 		["review", "start", "--cwd", "/repo with spaces"],
 	]);
 	assert.equal(queue.calls.every((call) => call.cwd === "/repo with spaces"), true);
+});
+
+test("native START rejects invalid runtime base refs before any adapter invocation", async () => {
+	for (const baseRef of ["", "   ", " origin/main", "origin/main ", "origin\0main", "origin\nmain", "origin\rmain", "origin\tmain", "origin\u007fmain", 42, [], {}]) {
+		const queue = queuedAdapter([]);
+		const request = { cwd: "/repo", baseRef } as unknown as NativeStartRequest;
+		await assert.rejects(() => new NativeReviewCliV210(queue.adapter).start(request), TypeError);
+		assert.equal(queue.calls.length, 0);
+	}
 });
 
 test("native client rejects incompatible version and malformed allow output", async () => {

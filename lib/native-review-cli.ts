@@ -44,7 +44,7 @@ export interface NativeReviewCli {
 	sddStatus(request: NativeSddStatusRequest): Promise<NativeSddStatusResult>;
 }
 
-export interface NativeStartRequest { cwd: string; lineageId?: string; policyPath?: string; focus?: string; signal?: AbortSignal; }
+export interface NativeStartRequest { cwd: string; baseRef?: string; lineageId?: string; policyPath?: string; focus?: string; signal?: AbortSignal; }
 export interface NativeFinalizeLensResult { lens: string; document: unknown; }
 export interface NativeFinalizeRequest {
 	cwd: string;
@@ -78,6 +78,10 @@ export interface NativeBindSddResult {
 	bindingRevision: string;
 }
 export interface NativeSddStatusResult { ready: boolean; [key: string]: unknown; }
+
+export function isCanonicalProcessString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value);
+}
 
 const NATIVE_RISK_LEVEL = ["low", "medium", "high"] as const;
 const NATIVE_REVIEW_LENS = ["review-risk", "review-resilience", "review-readability", "review-reliability"] as const;
@@ -193,8 +197,9 @@ export class NativeReviewCliV210 {
 	}
 
 	async start(request: NativeStartRequest): Promise<NativeStartResult> {
+		if (request.baseRef !== undefined && !isCanonicalProcessString(request.baseRef)) throw new TypeError("Native START baseRef must be a non-empty, trimmed, NUL-free string");
 		await this.verifyVersion(request.cwd, request.signal);
-		const result = await this.execute(NATIVE_REVIEW_OPERATION.START, request.cwd, ["review", "start", "--cwd", request.cwd, ...(request.lineageId ? ["--lineage", request.lineageId] : []), ...(request.policyPath ? ["--policy", request.policyPath] : []), ...(request.focus ? ["--focus", request.focus] : [])], true, request.signal);
+		const result = await this.execute(NATIVE_REVIEW_OPERATION.START, request.cwd, ["review", "start", "--cwd", request.cwd, ...(request.baseRef === undefined ? [] : ["--base-ref", request.baseRef]), ...(request.lineageId ? ["--lineage", request.lineageId] : []), ...(request.policyPath ? ["--policy", request.policyPath] : []), ...(request.focus ? ["--focus", request.focus] : [])], true, request.signal);
 		return decode(NATIVE_REVIEW_OPERATION.START, true, () => {
 			const body = exactObject(result, ["operation", "lineage_id", "state", "risk_level", "selected_lenses", "changed_files", "changed_lines", "correction_budget"]);
 			if (body.operation !== "review/start" || body.state !== "reviewing") throw new Error("wrong start discriminator");
