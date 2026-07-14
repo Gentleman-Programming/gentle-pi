@@ -42,8 +42,12 @@ function upstreamArchitecture(architecture) {
 	return architecture === "x64" ? "amd64" : architecture;
 }
 
+function upstreamPlatform(platform) {
+	return platform === "win32" ? "windows" : platform;
+}
+
 export function resolveGentleAiReleaseAsset(platform = process.platform, architecture = process.arch, releaseAssets = GENTLE_AI_RELEASE_ASSETS) {
-	const key = `${platform}/${upstreamArchitecture(architecture)}`;
+	const key = `${upstreamPlatform(platform)}/${upstreamArchitecture(architecture)}`;
 	const resolved = releaseAssets[key];
 	if (!resolved) throw new Error(`unsupported Gentle AI platform/architecture: ${platform}/${architecture}; supported pairs are darwin, linux, or windows with x64 or arm64`);
 	return resolved;

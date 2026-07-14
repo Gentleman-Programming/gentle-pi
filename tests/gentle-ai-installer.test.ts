@@ -46,6 +46,11 @@ test("release mapping selects only the supported official v2.1.4 archive and pin
 	}
 });
 
+test("win32 platform normalizes to windows for asset lookup", () => {
+	assert.equal(resolveGentleAiReleaseAsset("win32", "x64").name, "gentle-ai_2.1.4_windows_amd64.zip");
+	assert.equal(resolveGentleAiReleaseAsset("win32", "arm64").name, "gentle-ai_2.1.4_windows_arm64.zip");
+});
+
 test("unsupported platform pairs fail clearly before download", () => {
 	for (const [platform, arch] of [["freebsd", "x64"], ["linux", "ia32"], ["darwin", "ppc64"]]) {
 		assert.throws(() => resolveGentleAiReleaseAsset(platform, arch), /unsupported Gentle AI platform\/architecture/);
