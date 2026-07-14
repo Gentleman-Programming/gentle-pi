@@ -13,9 +13,9 @@
 
 **Turn Pi from a powerful coding agent into a controlled development harness.**
 
-`gentle-pi` installs **el Gentleman** in Pi: a senior-architect operating layer for Spec-Driven Development, focused subagents, strict TDD evidence, reviewable work units, safety guards, and project/user skill discovery.
+`gentle-pi` installs **el Gentleman** in Pi: a senior-architect operating layer for Spec-Driven Development, focused subagents, strict TDD evidence, reviewable work units, safety guards, project/user skill discovery, and bounded native review.
 
-Pi already has strong tools. `gentle-pi` adds the discipline for using them well.
+Pi already has strong tools. `gentle-pi` adds the discipline for using them well, then binds review and delivery decisions to Git-derived evidence instead of agent narration.
 
 `gentle-pi` is the Pi-native package from the [Gentle-AI ecosystem](https://github.com/Gentleman-Programming/gentle-ai), built by [Gentleman Programming](https://github.com/Gentleman-Programming): the broader open-source project for turning AI coding agents into disciplined engineering environments with SDD workflows, skills, memory integrations, model routing, and review guardrails across multiple agents.
 
@@ -57,6 +57,8 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | **Skill discovery registry**   | Maintains `.atl/skill-registry.md` from project and user skills so review/comment/PR workflows do not silently miss the right skill.          |
 | **Skill creation workflow**    | Provides the `gentle-ai-skill-creator`/`gentle-ai-skill-improver` skills, `/skill-creation` prompt, and packaged style guide for LLM-first skills. |
 | **Delivery skills**            | Includes issue-first PRs, chained PRs, work-unit commits, cognitive docs, comment writing, and Judgment Day review.                           |
+| **Bounded native review**      | Freezes one candidate, dispatches only controller-selected lenses, records native authority, and reuses the same content-bound receipt at delivery gates. |
+| **Verified native runtime**    | Provisions the exact package-local Gentle AI v2.1.4 binary, verifies pinned archive/binary integrity, and rejects PATH, global, sibling, symlink, and mode fallbacks. |
 | **Runtime safety**             | Blocks destructive shell commands, asks for confirmation for sensitive operations, and blocks direct read/write/edit access to sensitive paths. |
 
 ## Install
@@ -107,6 +109,16 @@ Typical flow:
 4. For a substantial change, ask Pi to use SDD. Natural-language requests are classified by the parent agent, not by brittle runtime regexes.
 5. Review the phase artifacts instead of trusting floating chat context.
 
+## Core workflow
+
+1. **Install and inspect.** Install `gentle-pi`, open Pi in the target repository, then run `/gentle:status` or `/gentle:doctor`.
+2. **Plan when risk justifies it.** Small work stays direct; substantial work uses SDD with Engram, OpenSpec, or both so requirements and decisions survive compaction.
+3. **Build with evidence.** One focused writer implements the approved scope. When Strict TDD is available, apply and verify preserve RED → GREEN → TRIANGULATE → REFACTOR evidence.
+4. **Review one candidate.** Native START derives and freezes the Git candidate, risk tier, selected lenses, authored-line budget, and correction allowance. Review actors assess that immutable view; they do not grant authority.
+5. **Deliver the same candidate.** FINALIZE records native authority and an approved receipt. Commit, push, PR, and release gates validate that same receipt and live Git target with zero review actors; they never silently reopen review or reset its budget.
+
+> **Trust what the system can derive, not what an agent claims.** Agents analyze the candidate. The package-local Gentle AI runtime owns scope, risk, findings, receipts, and lifecycle gates. This protects against accidental scope and identity drift, not a malicious same-user process that can replace local code or authority. See Gentle AI's [review authority threat model](https://github.com/Gentleman-Programming/gentle-ai/blob/main/docs/review-authority-threat-model.md) and [Chapter 21 — Verifiable Trust](https://the-amazing-gentleman-programming-book.vercel.app/en/book/Chapter21_Verifiable-Trust).
+
 ## How the harness decides what to do
 
 `gentle-pi` routes through the smallest safe workflow:
@@ -128,7 +140,7 @@ The goal is not ceremony. The goal is to avoid accidental chaos. Once a task sto
 | Reading 4+ files to understand a flow                                                                                       | Launch `scout`, `context-builder`, or the closest read-only mapping subagent. |
 | Touching 2+ non-trivial code files                                                                                          | Delegate one writer; do not continue inline unless delegation is unavailable. |
 | Commit, push, or PR after code changes                                                                                      | Validate the approved receipt and exact typed target with zero actors.        |
-| Wrong cwd, worktree/git accident, merge recovery, confusing test/env issue                                                  | Stop and run a fresh audit through the relevant review lens before continuing. |
+| Wrong cwd, worktree/git accident, merge recovery, confusing test/env issue                                                  | Stop, preserve the frozen scope, investigate separately, and validate the existing receipt; never launch a fresh review lens or reopen review as incident handling. |
 | Long monolithic session with accumulating complexity, roughly 20 tool calls, 5 exploratory reads, or 2 non-mechanical edits | Pause and delegate the remaining work, or stop and explain the exact blocker. |
 
 The intended balanced loop for a bounded bugfix is:
@@ -161,13 +173,15 @@ Pre-commit, pre-push, pre-PR, and release gates revalidate the recovered source,
 | Security, permissions, data exposure/loss, architecture, dependencies | `review-risk` |
 | Large PR, hot path, or >400 changed lines | Full 4R: `review-risk`, `review-resilience`, `review-readability`, `review-reliability` |
 
-If multiple rows match, run the narrow set that covers the risk. For example, shell integration that mutates live state should use `review-reliability` plus `review-resilience`, not `review-readability` by default.
+Risk selection is deterministic: documentation/comment/formatting-only changes use zero lenses; every other standard change uses exactly one dominant-risk lens; security/auth/update/payment paths, data-loss or exposure risk, shell/process integration, or more than 400 authored changed lines use the full 4R set. A standard review never accumulates multiple lenses ad hoc.
 
 ### Bounded review transactions
 
 New ordinary review uses compact `gentle_review` `start -> finalize -> validate`.
 
 Native contract pairing is exact: this adapter supports `gentle-ai 2.1.4` only from its package-local verified binary and rechecks that version before every native operation. Production native operations resolve an absolute package-owned path and never fall back to `PATH` or a global executable. Once v2.1.4 has written review authority, rollback MUST preserve every native store and receipt and MUST NOT run a downgraded binary against that repository. Disable the Pi route or roll forward to a compatible authority-aware release instead; deleting authority data or reinstalling an older binary is not a rollback path.
+
+Gentle AI v2.1.4 supports `gentle-ai review start --projection staged`, and upstream `main` now documents that focused-index workflow. `gentle-pi` v1.0.3 intentionally submits `projection: "workspace"` and does not expose staged projection yet. Native binary capability is not automatically a Pi adapter contract; package support still requires an adapter update, parity fixtures, and bounded validation.
 
 ### FINALIZE wrapper input
 
@@ -558,7 +572,11 @@ Memory contract for SDD delegation:
 
 | Path                           | Purpose                                                                                                    |
 | ------------------------------ | ---------------------------------------------------------------------------------------------------------- |
-| `extensions/gentle-ai.ts`      | Injects identity, auto-refreshes global SDD assets, registers commands, applies model/persona config, exports/restores model routing, and enforces runtime safety. |
+| `extensions/gentle-ai.ts`      | Injects identity, orchestrates native review authority and lifecycle gates, refreshes global SDD assets, registers commands, applies model/persona config, and enforces runtime safety. |
+| `lib/native-review-cli.ts`     | Strict package-local adapter for Gentle AI START, FINALIZE, VALIDATE, SDD binding, and status contracts.     |
+| `lib/review-candidate-view.ts` | Builds immutable changed-scope actor views while preserving full-tree, path, mode, symlink, and index integrity. |
+| `lib/gentle-ai-binary.ts`      | Resolves and verifies the confined package-local Gentle AI runtime without global or PATH fallback.          |
+| `scripts/gentle-ai-installer.mjs` | Downloads, verifies, extracts, and atomically promotes the pinned native runtime for six platform targets. |
 | `extensions/startup-banner.ts` | Shows and configures the startup intro, color presets, compact runtime panel, and collaboration credit.     |
 | `extensions/sdd-init.ts`       | Registers `/sdd-init` for OpenSpec initialization.                                                         |
 | `extensions/skill-registry.ts` | Maintains `.atl/skill-registry.md` from project/user skills and closes file watchers on shutdown.          |

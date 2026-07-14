@@ -181,6 +181,10 @@ function stringValue(value: unknown): string { if (typeof value !== "string") th
 function booleanValue(value: unknown): boolean { if (typeof value !== "boolean") throw new Error("expected boolean"); return value; }
 function nonNegativeInteger(value: unknown): number { if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error("expected safe non-negative integer"); return value; }
 function stringArray(value: unknown): readonly string[] { if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || entry.length === 0)) throw new Error("expected string array"); return value; }
+function decodeSelectedLenses(value: unknown, riskLevel: string, lensesRequired: boolean): readonly string[] {
+	if (value === null && riskLevel === "low" && !lensesRequired) return [];
+	return stringArray(value);
+}
 function enumString(value: unknown, allowed: readonly string[]): string { const parsed = stringValue(value); if (!allowed.includes(parsed)) throw new Error("unsupported enum"); return parsed; }
 function parseJson(stdout: string, operation: NativeReviewOperation, mutating: boolean): Record<string, unknown> {
 	if (stdout.length === 0) throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.EMPTY_OUTPUT, operation, true, mutating, "native command returned empty output");
@@ -399,9 +403,9 @@ export class NativeReviewCliV214 {
 			const lineageId = requiredString(body.lineage_id);
 			if (request.lineageId && lineageId !== request.lineageId) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native start lineage mismatch");
 			const riskLevel = requiredString(body.risk_level);
-			const selectedLenses = stringArray(body.selected_lenses);
 			const action = enumString(body.action, NATIVE_START_ACTION_VALUES) as NativeStartAction;
 			const lensesRequired = booleanValue(body.lenses_required);
+			const selectedLenses = decodeSelectedLenses(body.selected_lenses, riskLevel, lensesRequired);
 			if (
 				!(NATIVE_RISK_LEVEL as readonly string[]).includes(riskLevel) ||
 				selectedLenses.some((lens) => !(NATIVE_REVIEW_LENS as readonly string[]).includes(lens)) ||

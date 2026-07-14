@@ -72,6 +72,28 @@ test("native client re-verifies the pinned version before every operation and us
 	assert.equal(queue.calls.every((call) => call.cwd === "/repo with spaces"), true);
 });
 
+test("native START normalizes null selected lenses only for low-risk no-lens responses", async () => {
+	const start = JSON.parse(START.stdout) as Record<string, unknown>;
+	const valid = queuedAdapter([VERSION, {
+		stdout: JSON.stringify({
+			...start,
+			risk_level: "low",
+			selected_lenses: null,
+			lenses_required: false,
+		}),
+	}]);
+	assert.deepEqual((await new NativeReviewCliV213(valid.adapter).start({ cwd: "/repo" })).selectedLenses, []);
+
+	for (const scenario of [
+		{ risk_level: "low", lenses_required: true },
+		{ risk_level: "medium", lenses_required: false },
+		{ risk_level: "high", lenses_required: false },
+	]) {
+		const queue = queuedAdapter([VERSION, { stdout: JSON.stringify({ ...start, ...scenario, selected_lenses: null }) }]);
+		await assert.rejects(() => new NativeReviewCliV213(queue.adapter).start({ cwd: "/repo" }), NativeReviewCliError);
+	}
+});
+
 test("native START action/lenses_required matrix accepts only authoritative dispatch combinations", async () => {
 	const start = JSON.parse(START.stdout) as Record<string, unknown>;
 	const valid = [
