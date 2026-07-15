@@ -160,6 +160,11 @@ function isCanonicalObjectId(objectId: string): boolean {
 	return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(objectId);
 }
 
+function gitlinkMapsEqual(left: Readonly<Record<string, string>>, right: Readonly<Record<string, string>>): boolean {
+	const leftEntries = Object.entries(left);
+	return leftEntries.length === Object.keys(right).length && leftEntries.every(([path, objectId]) => Object.hasOwn(right, path) && right[path] === objectId);
+}
+
 function decodeCanonicalPath(value: Buffer): string {
 	const path = value.toString("utf8");
 	if (!Buffer.from(path, "utf8").equals(value) || !isSafeCandidatePath(path)) {
@@ -629,7 +634,7 @@ export class CandidateViewRegistry {
 				(state.committedOnly ?? false) === record.committedOnly &&
 				JSON.stringify(state.paths) === JSON.stringify(record.scope.paths) &&
 				JSON.stringify(state.modes) === JSON.stringify(record.scope.modes) &&
-				JSON.stringify(state.gitlinks ?? {}) === JSON.stringify(record.scope.gitlinks) &&
+				gitlinkMapsEqual(state.gitlinks ?? {}, record.scope.gitlinks) &&
 				JSON.stringify(state.deletedPaths) === JSON.stringify(record.scope.deletedPaths);
 		} catch {
 			return false;
@@ -714,7 +719,7 @@ export class CandidateViewRegistry {
 				live.committedOnly !== record.committedOnly ||
 				JSON.stringify(live.scope.paths) !== JSON.stringify(record.scope.paths) ||
 				JSON.stringify(live.scope.modes) !== JSON.stringify(record.scope.modes) ||
-				JSON.stringify(live.scope.gitlinks) !== JSON.stringify(record.scope.gitlinks) ||
+				!gitlinkMapsEqual(live.scope.gitlinks, record.scope.gitlinks) ||
 				JSON.stringify(live.scope.deletedPaths) !== JSON.stringify(record.scope.deletedPaths)
 			) throw new CandidateViewError("live candidate no longer matches the current controller-owned lineage binding", "current-binding-live-candidate-drift");
 		} finally {

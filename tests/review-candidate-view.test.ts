@@ -229,6 +229,36 @@ test("authoritative restore requires the exact frozen gitlink OID", (t) => {
 	}
 });
 
+test("authoritative restore treats gitlink maps as equal regardless of insertion order", (t) => {
+	const contributorRoot = repository(t);
+	const baseCommit = git(contributorRoot, "rev-parse", "HEAD");
+	git(contributorRoot, "update-index", "--add", "--cacheinfo", "160000,0123456789abcdef0123456789abcdef01234567,vendor/alpha");
+	git(contributorRoot, "update-index", "--add", "--cacheinfo", "160000,89abcdef0123456789abcdef0123456789abcdef,vendor/beta");
+	git(contributorRoot, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "add gitlinks");
+	const source = new CandidateViewRegistry();
+	const frozen = source.create({ contributorRoot, baseRef: baseCommit, committedOnly: true });
+	const restored = new CandidateViewRegistry();
+	try {
+		restored.restoreCurrentFromAuthoritativeReviewingStates(contributorRoot, [{
+			lineageId: "reordered-authoritative-gitlinks",
+			contributorRoot,
+			baseCommit: frozen.baseCommit,
+			baseTree: frozen.baseTree,
+			candidateTree: frozen.candidateTree,
+			committedOnly: true,
+			paths: frozen.paths,
+			modes: frozen.modes,
+			gitlinks: Object.fromEntries(Object.entries(frozen.gitlinks).toReversed()),
+			deletedPaths: frozen.deletedPaths,
+			selectedLenses: ["review-reliability"],
+		}]);
+		assert.deepEqual(restored.resolveCurrentForLens("review-reliability").gitlinks, frozen.gitlinks);
+	} finally {
+		source.cleanup(frozen.token);
+		if (restored.hasCurrentBinding()) restored.cleanup(restored.resolveCurrentForLens("review-reliability").token);
+	}
+});
+
 test("candidate view rejects malformed tree mode-kind-OID pairings", (t) => {
 	const malformedHeaders = [
 		"160000 blob 0123456789abcdef0123456789abcdef01234567",
