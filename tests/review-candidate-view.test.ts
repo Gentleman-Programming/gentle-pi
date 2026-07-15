@@ -168,6 +168,121 @@ function commitFileAfterBase(cwd: string): void {
 	git(cwd, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "committed after base");
 }
 
+function commitGitlinkAfterBase(cwd: string, path = "vendor/dependency"): { baseCommit: string; gitlinkCommit: string } {
+	const baseCommit = git(cwd, "rev-parse", "HEAD");
+	const gitlinkCommit = "0123456789abcdef0123456789abcdef01234567";
+	git(cwd, "update-index", "--add", "--cacheinfo", `160000,${gitlinkCommit},${path}`);
+	git(cwd, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "add gitlink");
+	return { baseCommit, gitlinkCommit };
+}
+
+test("candidate view freezes changed gitlinks as metadata without materializing their contents", (t) => {
+	const contributorRoot = repository(t);
+	const { baseCommit, gitlinkCommit } = commitGitlinkAfterBase(contributorRoot);
+	const registry = new CandidateViewRegistry();
+	const view = registry.create({ contributorRoot, baseRef: baseCommit, committedOnly: true });
+	try {
+		assert.deepEqual(view.paths, ["vendor/dependency"]);
+		assert.deepEqual(view.modes, { "vendor/dependency": "160000" });
+		assert.deepEqual(view.gitlinks, { "vendor/dependency": gitlinkCommit });
+		assert.equal(lstatSync(join(view.root, "vendor", "dependency"), { throwIfNoEntry: false }), undefined);
+		registry.bindCurrent({ token: view.token, lineageId: "gitlink", selectedLenses: ["review-reliability"] });
+		assert.deepEqual(registry.resolveProjection("gitlink", contributorRoot).gitlinks, { "vendor/dependency": gitlinkCommit });
+		const dispatch = { agent: "review-reliability", task: "review", mode: "task" };
+		injectReviewCandidateView(dispatch, registry);
+		assert.match(dispatch.task, new RegExp(`Frozen metadata-only gitlinks: .*${gitlinkCommit}`));
+		view.verify();
+	} finally {
+		registry.cleanup(view.token);
+	}
+});
+
+test("authoritative restore requires the exact frozen gitlink OID", (t) => {
+	const contributorRoot = repository(t);
+	const { baseCommit } = commitGitlinkAfterBase(contributorRoot);
+	const source = new CandidateViewRegistry();
+	const frozen = source.create({ contributorRoot, baseRef: baseCommit, committedOnly: true });
+	const state = {
+		lineageId: "authoritative-gitlink",
+		contributorRoot,
+		baseCommit: frozen.baseCommit,
+		baseTree: frozen.baseTree,
+		candidateTree: frozen.candidateTree,
+		committedOnly: true,
+		paths: frozen.paths,
+		modes: frozen.modes,
+		gitlinks: frozen.gitlinks,
+		deletedPaths: frozen.deletedPaths,
+		selectedLenses: ["review-reliability"],
+	};
+	const restored = new CandidateViewRegistry();
+	try {
+		assert.throws(
+			() => new CandidateViewRegistry().restoreCurrentFromAuthoritativeReviewingStates(contributorRoot, [{ ...state, gitlinks: { "vendor/dependency": "89abcdef0123456789abcdef0123456789abcdef" } }]),
+			(error: unknown) => error instanceof CandidateViewError && error.reason === "authoritative-current-match-missing",
+		);
+		restored.restoreCurrentFromAuthoritativeReviewingStates(contributorRoot, [state]);
+		assert.deepEqual(restored.resolveCurrentForLens("review-reliability").gitlinks, frozen.gitlinks);
+	} finally {
+		source.cleanup(frozen.token);
+		if (restored.hasCurrentBinding()) restored.cleanup(restored.resolveCurrentForLens("review-reliability").token);
+	}
+});
+
+test("candidate view rejects malformed tree mode-kind-OID pairings", (t) => {
+	const malformedHeaders = [
+		"160000 blob 0123456789abcdef0123456789abcdef01234567",
+		"100644 commit 0123456789abcdef0123456789abcdef01234567",
+		"100664 blob 0123456789abcdef0123456789abcdef01234567",
+		"160000 commit 0123456789abcdef0123456789abcdef0123456g",
+		"160000  commit 0123456789abcdef0123456789abcdef01234567",
+	];
+	for (const header of malformedHeaders) {
+		const contributorRoot = repository(t);
+		const executor: CandidateGitExecutor = (file, arguments_, options) => arguments_[0] === "ls-tree"
+			? Buffer.from(`${header}\tdependency\0`)
+			: execFileSync(file, arguments_, options);
+		assert.throws(() => new CandidateViewRegistry(executor).create({ contributorRoot }), CandidateViewError, header);
+	}
+});
+
+test("candidate view fails closed on gitlink materialization and frozen-index identity tampering", (t) => {
+	const contributorRoot = repository(t);
+	const { baseCommit } = commitGitlinkAfterBase(contributorRoot);
+	const view = new CandidateViewRegistry().create({ contributorRoot, baseRef: baseCommit, committedOnly: true });
+	try {
+		chmodSync(view.root, 0o755);
+		mkdirSync(join(view.root, "vendor", "dependency"), { recursive: true });
+		chmodSync(view.root, 0o555);
+		assert.throws(() => view.verify(), /gitlink/);
+		chmodSync(view.root, 0o755);
+		rmSync(join(view.root, "vendor"), { recursive: true });
+		chmodSync(view.root, 0o555);
+		git(view.root, "update-index", "--cacheinfo", "160000,89abcdef0123456789abcdef0123456789abcdef,vendor/dependency");
+		assert.throws(() => view.verify(), /frozen tree/);
+	} finally {
+		view.cleanup();
+	}
+});
+
+test("current binding detects live contributor gitlink identity drift", (t) => {
+	const contributorRoot = repository(t);
+	const { baseCommit } = commitGitlinkAfterBase(contributorRoot);
+	const registry = new CandidateViewRegistry();
+	const view = registry.create({ contributorRoot, baseRef: baseCommit, committedOnly: true });
+	registry.bindCurrent({ token: view.token, lineageId: "gitlink-drift", selectedLenses: ["review-reliability"] });
+	try {
+		git(contributorRoot, "update-index", "--cacheinfo", "160000,89abcdef0123456789abcdef0123456789abcdef,vendor/dependency");
+		git(contributorRoot, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "move gitlink");
+		assert.throws(
+			() => registry.resolveCurrentForLens("review-reliability"),
+			(error: unknown) => error instanceof CandidateViewError && error.reason === "current-binding-live-candidate-drift",
+		);
+	} finally {
+		registry.cleanup(view.token);
+	}
+});
+
 test("candidate view materializes exact tracked and initially-untracked content while contributor diverges", (t) => {
 	const contributorRoot = repository(t);
 	writeFileSync(join(contributorRoot, "tracked.txt"), "frozen tracked\n");
@@ -274,13 +389,13 @@ test("corrected views stay within frozen scope and replace projections only when
 	const registry = new CandidateViewRegistry();
 	const initial = registry.create({ contributorRoot }); registry.bind({ token: initial.token, lineageId: "correction", selectedLenses: ["review-risk"] });
 	writeFileSync(join(contributorRoot, "tracked.txt"), "corrected\n");
-	const corrected = registry.createCorrected("correction", contributorRoot);
+	const corrected = registry.createCorrected("correction", contributorRoot, "corrected-replay");
 	assert.notEqual(corrected.candidateTree, initial.candidateTree);
 	assert.equal(registry.resolveProjection("correction", contributorRoot).candidateTree, initial.candidateTree);
 	registry.promoteCorrected("correction", corrected.token);
 	assert.equal(registry.resolveProjection("correction", contributorRoot).candidateTree, corrected.candidateTree);
 	writeFileSync(join(contributorRoot, "escaped.txt"), "outside scope\n");
-	assert.throws(() => registry.createCorrected("correction", contributorRoot), /escapes the frozen genesis paths/);
+	assert.throws(() => registry.createCorrected("correction", contributorRoot, "escaped-replay"), /escapes the frozen genesis paths/);
 	registry.cleanupTerminal("correction", "approved");
 });
 
