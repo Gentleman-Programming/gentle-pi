@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
 	NATIVE_REVIEW_ERROR_CODE,
@@ -40,11 +42,26 @@ function queuedAdapter(results: QueuedResult[]): { adapter: ExecFileAdapter; cal
 }
 
 const VERSION = { stdout: "gentle-ai 2.1.4\n" };
+const STATUS_VERSION = { stdout: "gentle-ai 2.1.5\n" };
 const START = { stdout: JSON.stringify({ operation: "review/start", lineage_id: "lineage-1", state: "reviewing", risk_level: "medium", selected_lenses: ["review-reliability"], changed_files: 1, changed_lines: 2, correction_budget: 1, action: "created", lenses_required: true, projection: "workspace" }) };
+const REVIEW_STATUS = {
+	stdout: JSON.stringify({
+		schema: "gentle-ai.review-authority-status/v1",
+		operation: "review/status",
+		repository: "C:\\repo with spaces",
+		complete: true,
+		authoritative: true,
+		status: "clean",
+		entries: [],
+		locks: [],
+		diagnostics: [],
+	}),
+};
 
-test("native START requires the v2.1.4 workspace projection", async () => {
+test("native START supports every declared version with the START capability and requires the workspace projection", async () => {
 	const start = JSON.parse(START.stdout) as Record<string, unknown>;
 	assert.equal((await new NativeReviewCliV213(queuedAdapter([VERSION, { stdout: JSON.stringify({ ...start, projection: "workspace" }) }]).adapter).start({ cwd: "/repo" })).lineageId, "lineage-1");
+	assert.equal((await new NativeReviewCliV213(queuedAdapter([STATUS_VERSION, { stdout: JSON.stringify({ ...start, projection: "workspace" }) }]).adapter).start({ cwd: "/repo" })).lineageId, "lineage-1");
 	const missing = Object.fromEntries(Object.entries(start).filter(([key]) => key !== "projection"));
 	for (const body of [missing, { ...start, projection: "repository" }]) {
 		const queue = queuedAdapter([VERSION, { stdout: JSON.stringify(body) }]);
@@ -56,14 +73,14 @@ test("native client re-verifies the pinned version before every operation and us
 	const queue = queuedAdapter([VERSION, START, VERSION, START, VERSION, START, VERSION, START]);
 	const client = new NativeReviewCliV213(queue.adapter);
 	await client.start({ cwd: "/repo with spaces" });
-	await client.start({ cwd: "/repo with spaces", baseRef: "origin/main" });
+	await client.start({ cwd: "/repo with spaces", baseRef: "origin/main", committedOnly: true });
 	await client.start({ cwd: "/repo with spaces", policyPath: "/repo with spaces/.gentle-ai/policies/team policy.json" });
 	await client.start({ cwd: "/repo with spaces", policyHash: "legacy-policy" } as unknown as { cwd: string; policyPath?: string });
 	assert.deepEqual(queue.calls.map((call) => call.arguments), [
 		["version"],
 		["review", "start", "--cwd", "/repo with spaces"],
 		["version"],
-		["review", "start", "--cwd", "/repo with spaces", "--base-ref", "origin/main"],
+		["review", "start", "--cwd", "/repo with spaces", "--base-ref", "origin/main", "--committed-only"],
 		["version"],
 		["review", "start", "--cwd", "/repo with spaces", "--policy", "/repo with spaces/.gentle-ai/policies/team policy.json"],
 		["version"],
@@ -99,6 +116,7 @@ test("native START action/lenses_required matrix accepts only authoritative disp
 	const valid = [
 		{ action: "created", lenses_required: true, risk_level: "medium", selected_lenses: ["review-reliability"] },
 		{ action: "created", lenses_required: false, risk_level: "low", selected_lenses: [] },
+		{ action: "resumed", lenses_required: true, risk_level: "medium", selected_lenses: ["review-reliability"], state: "reviewing" },
 		{ action: "resumed", lenses_required: false, risk_level: "medium", selected_lenses: ["review-reliability"], state: "correction_required" },
 		{ action: "reuse-receipt", lenses_required: false, risk_level: "high", selected_lenses: ["review-risk", "review-resilience", "review-readability", "review-reliability"], state: "approved" },
 		{ action: "blocked-scope-action", lenses_required: false, risk_level: "low", selected_lenses: [] },
@@ -156,23 +174,33 @@ test("long-lived native client rejects a replaced incompatible executable before
 	]);
 });
 
-test("native START rejects invalid runtime base refs before any adapter invocation", async () => {
+test("native START rejects invalid committed-range combinations before any adapter invocation", async () => {
 	for (const baseRef of ["", "   ", " origin/main", "origin/main ", "origin\0main", "origin\nmain", "origin\rmain", "origin\tmain", "origin\u007fmain", 42, [], {}]) {
 		const queue = queuedAdapter([]);
-		const request = { cwd: "/repo", baseRef } as unknown as NativeStartRequest;
+		const request = { cwd: "/repo", baseRef, committedOnly: true } as unknown as NativeStartRequest;
 		await assert.rejects(() => new NativeReviewCliV213(queue.adapter).start(request), TypeError);
+		assert.equal(queue.calls.length, 0);
+	}
+	for (const request of [
+		{ cwd: "/repo", baseRef: "origin/main" },
+		{ cwd: "/repo", baseRef: "origin/main", committedOnly: false },
+		{ cwd: "/repo", committedOnly: true },
+		{ cwd: "/repo", committedOnly: false },
+		{ cwd: "/repo", baseRef: "origin/main", committedOnly: "true" },
+	] as const) {
+		const queue = queuedAdapter([]);
+		await assert.rejects(() => new NativeReviewCliV213(queue.adapter).start(request as NativeStartRequest), TypeError);
 		assert.equal(queue.calls.length, 0);
 	}
 });
 
-test("native client accepts only v2.1.4 and rejects v2.1.3 without fallback", async () => {
-	for (const rejectedVersion of ["2.1.1", "2.1.3"]) {
+test("native client accepts known versions only when they support the requested capability", async () => {
+	for (const rejectedVersion of ["2.1.1", "2.1.3", "2.1.6"]) {
 		const incompatible = queuedAdapter([{ stdout: `gentle-ai ${rejectedVersion}\n` }]);
 		await assert.rejects(
 			() => new NativeReviewCliV213(incompatible.adapter).start({ cwd: "/repo" }),
 			(error: unknown) => error instanceof NativeReviewCliError
-				&& error.code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE
-				&& error.message === "gentle-ai 2.1.4 is required",
+				&& error.code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE,
 		);
 	}
 	const malformed = queuedAdapter([VERSION, { stdout: JSON.stringify({ ...JSON.parse(await fixture("validate-allow")), allowed: false }) }]);
@@ -206,6 +234,115 @@ test("native mutation uncertainty requires exact replay", async () => {
 			&& error.mutationOutcome === "unknown"
 			&& error.nextAction === "replay-exact-native-operation",
 	);
+});
+
+test("native process failures retain bounded sanitized process diagnostics and parsed denial evidence", async () => {
+	const denial = JSON.parse(await fixture("validate-deny")) as Record<string, unknown>;
+	const queue = queuedAdapter([VERSION, {
+		stdout: JSON.stringify(denial),
+		stderr: "token=super-secret\nBearer another-secret\n".repeat(2_000),
+		exitCode: 2,
+	}]);
+	await assert.rejects(
+		() => new NativeReviewCliV213(queue.adapter).validate({ cwd: "/repo", gate: "post-apply" }),
+		(error: unknown) => {
+			if (!(error instanceof NativeReviewCliError)) return false;
+			const diagnostics = (error as unknown as { diagnostics?: Record<string, unknown> }).diagnostics;
+			return error.code === NATIVE_REVIEW_ERROR_CODE.NON_ZERO
+				&& diagnostics?.operation === "review/validate"
+				&& diagnostics.exit_code === 2
+				&& diagnostics.stderr !== undefined
+				&& !String(diagnostics.stderr).includes("super-secret")
+				&& String(diagnostics.stderr).length <= 4_096
+				&& (diagnostics.denial as Record<string, unknown> | undefined)?.result === "scope-changed";
+		},
+	);
+});
+
+test("native diagnostics deterministically redact OSC/control sequences and quoted JSON secret values", async () => {
+	const denial = JSON.parse(await fixture("validate-deny")) as Record<string, unknown>;
+	const secretDiagnostic = [
+		"\u001b]8;;https://example.invalid/token\u0007click\u001b]8;;\u0007",
+		"\u001bPprivate-control\u001b\\",
+		'{"token":"token-value","PASSWORD":"password-value","secret":"secret-value","api_key":"key-value","apiKey":"camel-key","authorization":"authorization-value","cookie":"cookie-value","private_key":"private-value"}',
+	].join("\n");
+	const queue = queuedAdapter([VERSION, { stdout: JSON.stringify(denial), stderr: secretDiagnostic, exitCode: 2 }]);
+	await assert.rejects(
+		() => new NativeReviewCliV213(queue.adapter).validate({ cwd: "/repo", gate: "post-apply" }),
+		(error: unknown) => {
+			if (!(error instanceof NativeReviewCliError)) return false;
+			const diagnostics = error.diagnostics as unknown as Record<string, unknown>;
+			const stderr = String(diagnostics.stderr);
+			return error.code === NATIVE_REVIEW_ERROR_CODE.NON_ZERO
+				&& !/[\u0000-\u001f\u007f]/.test(stderr)
+				&& !["token-value", "password-value", "secret-value", "key-value", "camel-key", "authorization-value", "cookie-value", "private-value", ].some((secret) => stderr.includes(secret))
+				&& (diagnostics.denial as Record<string, unknown> | undefined)?.action === "create-new-lineage";
+		},
+	);
+});
+
+test("structured denial fields redact token-shaped secrets and obey the 1 KiB field limit", async () => {
+	const denial = JSON.parse(await fixture("validate-deny")) as Record<string, unknown>;
+	const context = denial.context as Record<string, unknown>;
+	const nested = context.denial as Record<string, unknown>;
+	const secret = "GITHUB_TOKEN=github-secret ACCESS_TOKEN=access-secret access_token=lower-secret CUSTOM_TOKEN=custom-secret";
+	const queue = queuedAdapter([VERSION, {
+		stdout: JSON.stringify({ ...denial, reason: `${secret} ${"x".repeat(2_000)}`, context: { ...context, denial: { ...nested, stage: secret, code: secret } } }),
+		stderr: "denied",
+		exitCode: 2,
+	}]);
+	await assert.rejects(
+		() => new NativeReviewCliV213(queue.adapter).validate({ cwd: "/repo", gate: "post-apply" }),
+		(error: unknown) => {
+			if (!(error instanceof NativeReviewCliError)) return false;
+			const denial = error.diagnostics.denial;
+			return denial !== undefined
+				&& [denial.reason, denial.denial?.stage, denial.denial?.code].every((field) => field !== undefined && field.length <= 1_024)
+				&& !JSON.stringify(denial).includes("secret");
+		},
+	);
+});
+
+test("native validate redacts and bounds returned structured-denial fields", async () => {
+	const denial = JSON.parse(await fixture("validate-deny")) as Record<string, unknown>;
+	const context = denial.context as Record<string, unknown>;
+	const nested = context.denial as Record<string, unknown>;
+	const secret = "GITHUB_TOKEN=github-secret ACCESS_TOKEN=access-secret access_token=lower-secret CUSTOM_TOKEN=custom-secret";
+	const queue = queuedAdapter([VERSION, {
+		stdout: JSON.stringify({
+			...denial,
+			reason: `${secret} ${"x".repeat(2_000)}`,
+			context: { ...context, denial: { ...nested, stage: secret, code: secret } },
+		}),
+		stderr: "Error: review gate denied: scope-changed\n",
+		exitCode: 1,
+	}]);
+	const result = await new NativeReviewCliV213(queue.adapter).validate({ cwd: "/repo", gate: "post-apply" });
+	const returned = result.gateContext.raw.denial as Record<string, string>;
+	assert.equal(result.reason.length <= 1_024, true);
+	assert.equal(returned.stage.length <= 1_024, true);
+	assert.equal(returned.code.length <= 1_024, true);
+	assert.equal(JSON.stringify({ reason: result.reason, returned }).includes("secret"), false);
+});
+
+test("native diagnostics reject non-canonical or extra structured-denial fields", async () => {
+	const published = JSON.parse(await fixture("validate-deny")) as Record<string, unknown>;
+	const context = published.context as Record<string, unknown>;
+	for (const body of [
+		{ ...published, unexpected: true },
+		{ ...published, context: { ...context, unexpected: true } },
+		{ ...published, context: { ...context, denial: { ...(context.denial as Record<string, unknown>), unexpected: true } } },
+		{ ...published, action: " create-new-lineage" },
+		{ ...published, reason: "reason " },
+	]) {
+		const queue = queuedAdapter([VERSION, { stdout: JSON.stringify(body), stderr: "denied", exitCode: 2 }]);
+		await assert.rejects(
+			() => new NativeReviewCliV213(queue.adapter).validate({ cwd: "/repo", gate: "post-apply" }),
+			(error: unknown) => error instanceof NativeReviewCliError
+				&& error.code === NATIVE_REVIEW_ERROR_CODE.NON_ZERO
+				&& error.diagnostics.denial === undefined,
+		);
+	}
 });
 
 test("native validate requires a strict allow body", async () => {
@@ -408,6 +545,93 @@ test("finalize stages every optional document privately and cleans it after fail
 	assert.equal(observed.filter((argument) => argument.endsWith(".json")).length, 3);
 	await Promise.all(observed.filter((argument) => argument.endsWith(".json")).map(async (path) => assert.rejects(() => import("node:fs/promises").then(({ stat }) => stat(path)))));
 });
+test("native review status uses the anticipated v2.1.5 contract, preserves Windows paths, and never reports mutation", async () => {
+	const queue = queuedAdapter([STATUS_VERSION, REVIEW_STATUS]);
+	const result = await new NativeReviewCliV213(queue.adapter).reviewStatus({ cwd: "C:\\repo with spaces" });
+	assert.equal(result.status, "clean");
+	assert.equal(result.complete, true);
+	assert.equal(result.authoritative, true);
+	assert.deepEqual(queue.calls.map((call) => call.arguments), [
+		["version"],
+		["review", "status", "--cwd", "C:\\repo with spaces"],
+	]);
+	assert.equal(queue.calls.length, 2);
+
+	const wrongRepository = queuedAdapter([STATUS_VERSION, { stdout: JSON.stringify({ ...JSON.parse(REVIEW_STATUS.stdout), repository: "C:\\other repository" }) }]);
+	await assert.rejects(
+		() => new NativeReviewCliV213(wrongRepository.adapter).reviewStatus({ cwd: "C:\\repo with spaces" }),
+		(error: unknown) => error instanceof NativeReviewCliError
+			&& error.code === NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH
+			&& error.operation === "review/status"
+			&& error.mutationOutcome === "none",
+	);
+
+	const incomplete = queuedAdapter([STATUS_VERSION, { stdout: JSON.stringify({ ...JSON.parse(REVIEW_STATUS.stdout), complete: false, authoritative: false, status: "invalid" }) }]);
+	assert.equal((await new NativeReviewCliV213(incomplete.adapter).reviewStatus({ cwd: "C:\\repo with spaces" })).complete, false);
+
+	const populated = queuedAdapter([STATUS_VERSION, { stdout: JSON.stringify({ ...JSON.parse(REVIEW_STATUS.stdout), status: "active", entries: [{ version: "compact-v2", lineage_id: "lineage", path: "C:\\repo\\.git\\gentle-ai", status: "active", revision: "r1", recovery: { predecessor_lineage_id: "old", predecessor_revision: "r0", disposition: "scope_changed", reason: "scope", actor: "maintainer", recovered_at: "2026-07-14T00:00:00Z" }, problems: ["stale"] }], locks: [{ version: "compact-v2", path: "C:\\repo\\.git\\gentle-ai\\LOCK", status: "owned", owner: { schema: "gentle-ai.review-store-lock/v1", owner_id: "owner", pid: 1, host: "host", acquired_at: "2026-07-14T00:00:00Z" } }], diagnostics: [{ path: "C:\\repo\\.git\\gentle-ai", problem: "stale" }] }) }]);
+	const decoded = await new NativeReviewCliV213(populated.adapter).reviewStatus({ cwd: "C:\\repo with spaces" });
+	assert.deepEqual(decoded.entries[0]?.recovery?.predecessorLineageId, "old");
+	assert.deepEqual(decoded.locks[0]?.owner?.ownerId, "owner");
+	assert.deepEqual(decoded.diagnostics, [{ path: "C:\\repo\\.git\\gentle-ai", problem: "stale" }]);
+
+	const unsupportedLockSchema = queuedAdapter([STATUS_VERSION, {
+		stdout: JSON.stringify({
+			...JSON.parse(REVIEW_STATUS.stdout),
+			locks: [{
+				version: "compact-v2",
+				path: "C:\\repo\\.git\\gentle-ai\\LOCK",
+				status: "owned",
+				owner: { schema: "unexpected", owner_id: "owner", pid: 2_147_483_647, host: "host", acquired_at: "2026-07-14T00:00:00Z" },
+			}],
+		}),
+	}]);
+	await assert.rejects(
+		() => new NativeReviewCliV213(unsupportedLockSchema.adapter).reviewStatus({ cwd: "C:\\repo with spaces" }),
+		(error: unknown) => error instanceof NativeReviewCliError
+			&& error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE
+			&& error.operation === "review/status"
+			&& error.mutationOutcome === "none",
+	);
+
+	for (const body of [
+		{ ...JSON.parse(REVIEW_STATUS.stdout), complete: false, authoritative: true },
+		{ ...JSON.parse(REVIEW_STATUS.stdout), entries: [{ version: "compact-v2", lineage_id: "lineage", path: "C:\\repo\\.git\\gentle-ai", status: "active", problems: [], unexpected: true }] },
+		{ ...JSON.parse(REVIEW_STATUS.stdout), status: "unknown" },
+	]) {
+		const malformed = queuedAdapter([STATUS_VERSION, { stdout: JSON.stringify(body) }]);
+		await assert.rejects(
+			() => new NativeReviewCliV213(malformed.adapter).reviewStatus({ cwd: "C:\\repo with spaces" }),
+			(error: unknown) => error instanceof NativeReviewCliError
+				&& error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE
+				&& error.operation === "review/status"
+				&& error.mutationOutcome === "none",
+		);
+	}
+});
+
+test("native review status accepts a canonical POSIX symlink repository identity", async (t) => {
+	if (process.platform === "win32") return t.skip("directory symlink creation requires elevated Windows privileges");
+	const repository = await mkdtemp(join(tmpdir(), "gentle-pi-native-status-"));
+	const alias = `${repository}-alias`;
+	await symlink(repository, alias);
+	t.after(async () => { await rm(alias); await rm(repository, { recursive: true }); });
+	const queue = queuedAdapter([STATUS_VERSION, { stdout: JSON.stringify({ ...JSON.parse(REVIEW_STATUS.stdout), repository }) }]);
+	assert.equal((await new NativeReviewCliV213(queue.adapter).reviewStatus({ cwd: alias })).repository, repository);
+});
+
+test("native review status keeps v2.1.4 truthfully unsupported", async () => {
+	const queue = queuedAdapter([VERSION]);
+	await assert.rejects(
+		() => new NativeReviewCliV213(queue.adapter).reviewStatus({ cwd: "/repo" }),
+		(error: unknown) => error instanceof NativeReviewCliError
+			&& error.code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE
+			&& error.operation === "version"
+			&& error.mutationOutcome === "none",
+	);
+	assert.deepEqual(queue.calls.map((call) => call.arguments), [["version"]]);
+});
+
 async function fixture(name: string): Promise<string> {
 	return readFile(new URL(`./fixtures/native-review-cli/v2.1.3/${name}.json`, import.meta.url), "utf8");
 }

@@ -7,6 +7,7 @@ import { ReviewMutationLockV1, type ReviewLockPlatformAdapterV1 } from "./review
 import { COMPACT_AUTHORITY_OUTCOME, inspectCompactReviewAuthorityV2 } from "./review-compact-store.ts";
 import { ReviewGraphObjectStoreV1, type ReviewStoreDescriptorV1 } from "./review-object-store.ts";
 import { IDENTITY_FILENAME, resolveRepositoryAuthorityForRecoveryV1, resolveRepositoryAuthorityV1, writePinnedRepositoryIdentityV1, type RepositoryAuthorityV1 } from "./review-repository.ts";
+import { nativeReviewRemediationPermitsReset, type NativeReviewRemediationClassification } from "./native-review-remediation.ts";
 
 export class ReviewResetError extends Error { constructor(message: string) { super(message); this.name = "ReviewResetError"; } }
 type ResetPhase = "marked" | "quarantining" | "deleting" | "initializing" | "verifying" | "complete" | "failed-closed";
@@ -21,6 +22,7 @@ export interface DestructiveResetOptionsV1 {
 	// operator who explicitly wants to recover from that broken pin must
 	// pass this flag; it is never inferred or defaulted on.
 	allowBrokenIdentity?: boolean;
+	nativeRemediation?: NativeReviewRemediationClassification;
 }
 export interface DestructiveResetResultV1 { reset_id: string; store: ReviewStoreDescriptorV1; }
 
@@ -198,7 +200,8 @@ export function destructiveResetReviewAuthorityV1(options: DestructiveResetOptio
 		inspection = inspectLegacyReviewAuthorityV1(options.cwd, { allowBrokenIdentity: options.allowBrokenIdentity });
 		const recoveringBrokenIdentity = Boolean(options.allowBrokenIdentity && inspection.identity_broken);
 		const invalidCompactAuthority = inspectCompactReviewAuthorityV2(options.cwd).outcome === COMPACT_AUTHORITY_OUTCOME.INVALID;
-		if (inspection.outcome === "clean" && !options.resume && !recoveringBrokenIdentity && !invalidCompactAuthority) {
+		const nativeRemediation = options.nativeRemediation !== undefined && nativeReviewRemediationPermitsReset(options.nativeRemediation);
+		if (inspection.outcome === "clean" && !options.resume && !recoveringBrokenIdentity && !invalidCompactAuthority && !nativeRemediation) {
 			throw new ReviewResetError("Destructive reset requires detected legacy, mixed, or invalid compact authority");
 		}
 		if (!options.resume) assertExact(options.cwd, inspection, options);

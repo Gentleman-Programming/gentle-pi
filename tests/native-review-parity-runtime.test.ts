@@ -12,7 +12,7 @@ import { resolveGentleAiBinary } from "../lib/gentle-ai-binary.ts";
 const execFileAsync = promisify(execFile);
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const binary = resolveGentleAiBinary(packageRoot, process.platform);
-const OFFICIAL_BINARY_SHA256 = "aa60f95186520d6e8c70bb9cca8d8a5735adbc3b69576519d35e32754aed261a";
+const OFFICIAL_BINARY_SHA256 = "d2cf080ebb92f73ef30aaf36eb7ca6eeb750592d670a71ca5a045f121edf9071";
 const REVIEWED_PATHS = ["tracked.txt", "initially-untracked.txt"] as const;
 // Golden captured by the clean external-artifact differential fixture for v2.1.3.
 // This is released runtime output, not a locally reconstructed authority digest.
@@ -90,11 +90,11 @@ async function restoreCandidate(repository: string, candidateTree: string): Prom
 	await assertPublishedProjection(repository, candidateTree);
 }
 
-test("official v2.1.4 package runtime authorizes an unchanged linked-view candidate and denies a changed staging tree", async (t) => {
+test("official v2.1.5 package runtime authorizes an unchanged linked-view candidate and denies a changed staging tree", async (t) => {
 	assert.equal(createHash("sha256").update(await readFile(binary)).digest("hex"), OFFICIAL_BINARY_SHA256);
-	assert.deepEqual(await run(binary, ["version"], packageRoot), { exitCode: 0, stdout: "gentle-ai 2.1.4\n", stderr: "" });
+	assert.deepEqual(await run(binary, ["version"], packageRoot), { exitCode: 0, stdout: "gentle-ai 2.1.5\n", stderr: "" });
 
-	const workspace = await mkdtemp(join(tmpdir(), "gentle-pi-v214-parity-"));
+	const workspace = await mkdtemp(join(tmpdir(), "gentle-pi-v215-parity-"));
 	const repository = join(workspace, "repository");
 	const view = join(workspace, "candidate-view");
 	const artifacts = join(workspace, "artifacts");

@@ -34,6 +34,140 @@ test("candidate view Git commands have a finite timeout and block materializatio
 	assert.equal(calls.some((call) => call.arguments[0] === "worktree"), false);
 });
 
+test("committed-only candidate views scope an explicit base to committed changes and exclude dirty worktree files", (t) => {
+	const contributorRoot = repository(t);
+	const baseCommit = git(contributorRoot, "rev-parse", "HEAD");
+	writeFileSync(join(contributorRoot, "committed-after-base.txt"), "committed after base\n");
+	git(contributorRoot, "add", "committed-after-base.txt");
+	git(contributorRoot, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "committed after base");
+	writeFileSync(join(contributorRoot, "tracked.txt"), "dirty after base\n");
+	writeFileSync(join(contributorRoot, "untracked.txt"), "untracked after base\n");
+	const view = new CandidateViewRegistry().create({ contributorRoot, baseRef: baseCommit, committedOnly: true });
+	try {
+		assert.deepEqual(view.paths, ["committed-after-base.txt"]);
+		assert.equal(view.committedOnly, true);
+		assert.equal(view.baseCommit, baseCommit);
+		assert.equal(view.baseTree, git(contributorRoot, "rev-parse", `${baseCommit}^{tree}`));
+		assert.equal(readFileSync(join(view.root, "tracked.txt"), "utf8"), "base\n");
+		assert.equal(lstatSync(join(view.root, "untracked.txt"), { throwIfNoEntry: false }), undefined);
+	} finally {
+		view.cleanup();
+	}
+});
+
+test("explicit base refs reject ambiguous DWIM names even when they resolve identically, while full refs stay valid", (t) => {
+	const contributorRoot = repository(t);
+	const baseCommit = git(contributorRoot, "rev-parse", "HEAD");
+	git(contributorRoot, "branch", "same-commit", baseCommit);
+	git(contributorRoot, "tag", "same-commit", baseCommit);
+	git(contributorRoot, "update-ref", "refs/remotes/origin/main", baseCommit);
+	assert.throws(
+		() => new CandidateViewRegistry().create({ contributorRoot, baseRef: "same-commit" }),
+		(error: unknown) => error instanceof CandidateViewError && error.reason === "base-ref-ambiguous",
+	);
+	for (const [baseRef, expectedCommit] of [
+		["refs/heads/same-commit", baseCommit],
+		["refs/tags/same-commit", baseCommit],
+		["origin/main", baseCommit],
+		[baseCommit, baseCommit],
+	] as const) {
+		const view = new CandidateViewRegistry().create({ contributorRoot, baseRef });
+		try {
+			assert.equal(view.baseCommit, expectedCommit);
+		} finally {
+			view.cleanup();
+		}
+	}
+	commitFileAfterBase(contributorRoot);
+	const tipCommit = git(contributorRoot, "rev-parse", "HEAD");
+	git(contributorRoot, "branch", "different-commit", baseCommit);
+	git(contributorRoot, "tag", "different-commit", baseCommit);
+	git(contributorRoot, "branch", "-f", "different-commit", tipCommit);
+	assert.throws(
+		() => new CandidateViewRegistry().create({ contributorRoot, baseRef: "different-commit" }),
+		(error: unknown) => error instanceof CandidateViewError && error.reason === "base-ref-ambiguous",
+	);
+	for (const [baseRef, expectedCommit] of [
+		["refs/heads/different-commit", tipCommit],
+		["refs/tags/different-commit", baseCommit],
+	] as const) {
+		const view = new CandidateViewRegistry().create({ contributorRoot, baseRef });
+		try {
+			assert.equal(view.baseCommit, expectedCommit);
+		} finally {
+			view.cleanup();
+		}
+	}
+});
+
+test("candidate view defaults its frozen base identity to HEAD", (t) => {
+	const contributorRoot = repository(t);
+	commitFileAfterBase(contributorRoot);
+	writeFileSync(join(contributorRoot, "tracked.txt"), "dirty after HEAD\n");
+	const view = new CandidateViewRegistry().create({ contributorRoot });
+	try {
+		assert.equal(view.baseCommit, git(contributorRoot, "rev-parse", "HEAD"));
+		assert.equal(view.baseTree, git(contributorRoot, "rev-parse", "HEAD^{tree}"));
+		assert.deepEqual(view.paths, ["tracked.txt"]);
+	} finally {
+		view.cleanup();
+	}
+});
+
+test("candidate view rejects invalid or moving base refs and restores the frozen base tree after reload", (t) => {
+	const contributorRoot = repository(t);
+	const baseCommit = git(contributorRoot, "rev-parse", "HEAD");
+	commitFileAfterBase(contributorRoot);
+	writeFileSync(join(contributorRoot, "tracked.txt"), "dirty after base\n");
+	assert.throws(
+		() => new CandidateViewRegistry().create({ contributorRoot, baseRef: "refs/heads/missing-base" }),
+		(error: unknown) => error instanceof CandidateViewError && error.reason === "base-ref-unresolvable",
+	);
+	git(contributorRoot, "branch", "moving-base", baseCommit);
+	let baseResolutions = 0;
+	const movingExecutor: CandidateGitExecutor = (file, arguments_, options) => {
+		if (arguments_.at(-1) === "moving-base^{commit}" && ++baseResolutions === 2) git(contributorRoot, "branch", "-f", "moving-base", "HEAD");
+		return execFileSync(file, arguments_, options);
+	};
+	assert.throws(
+		() => new CandidateViewRegistry(movingExecutor).create({ contributorRoot, baseRef: "moving-base" }),
+		(error: unknown) => error instanceof CandidateViewError && error.reason === "base-ref-moved",
+	);
+	const source = new CandidateViewRegistry();
+	const frozen = source.create({ contributorRoot, baseRef: baseCommit, committedOnly: true });
+	const state = {
+		lineageId: "restored-explicit-base",
+		contributorRoot,
+		baseCommit: frozen.baseCommit,
+		baseTree: frozen.baseTree,
+		candidateTree: frozen.candidateTree,
+		committedOnly: true,
+		paths: frozen.paths,
+		modes: frozen.modes,
+		deletedPaths: frozen.deletedPaths,
+		selectedLenses: ["review-reliability"],
+	};
+	const restored = new CandidateViewRegistry();
+	try {
+		restored.restoreCurrentFromAuthoritativeReviewingStates(contributorRoot, [state]);
+		const view = restored.resolveCurrentForLens("review-reliability");
+		assert.equal(view.baseCommit, baseCommit);
+		assert.equal(view.baseTree, git(contributorRoot, "rev-parse", `${baseCommit}^{tree}`));
+		assert.equal(view.committedOnly, true);
+		assert.deepEqual(view.paths, ["committed-after-base.txt"]);
+	} finally {
+		source.cleanup(frozen.token);
+		const restoredView = restored.resolveCurrentForLens("review-reliability");
+		restored.cleanup(restoredView.token);
+	}
+});
+
+function commitFileAfterBase(cwd: string): void {
+	writeFileSync(join(cwd, "committed-after-base.txt"), "committed after base\n");
+	git(cwd, "add", "committed-after-base.txt");
+	git(cwd, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "committed after base");
+}
+
 test("candidate view materializes exact tracked and initially-untracked content while contributor diverges", (t) => {
 	const contributorRoot = repository(t);
 	writeFileSync(join(contributorRoot, "tracked.txt"), "frozen tracked\n");
@@ -95,7 +229,7 @@ test("candidate view registry rejects unsafe, moved, writable, stale, and unsele
 	registry.cleanup(view.token);
 });
 
-test("review subagent dispatch rejects missing or ambiguous selected candidate views", (t) => {
+test("review subagent dispatch rejects missing candidate views and uses the explicitly current overlapping lens", (t) => {
 	const missing = new CandidateViewRegistry();
 	assert.throws(
 		() => injectReviewCandidateView({ agent: "review-risk", task: "review", mode: "task" }, missing),
@@ -108,11 +242,10 @@ test("review subagent dispatch rejects missing or ambiguous selected candidate v
 	registry.bind({ token: first.token, lineageId: "first", selectedLenses: ["review-risk"] });
 	writeFileSync(join(contributorRoot, "tracked.txt"), "candidate two\n");
 	const second = registry.create({ contributorRoot });
-	registry.bind({ token: second.token, lineageId: "second", selectedLenses: ["review-risk"] });
-	assert.throws(
-		() => injectReviewCandidateView({ agent: "review-risk", task: "review", mode: "task" }, registry),
-		CandidateViewError,
-	);
+	registry.bindCurrent({ token: second.token, lineageId: "second", selectedLenses: ["review-risk"] });
+	const dispatch = { agent: "review-risk", task: "review", mode: "task" };
+	assert.doesNotThrow(() => injectReviewCandidateView(dispatch, registry));
+	assert.match(dispatch.task, new RegExp(`Frozen candidate tree: \`${second.candidateTree}\``));
 	registry.cleanup(first.token);
 	registry.cleanup(second.token);
 });
@@ -284,5 +417,99 @@ test("candidate view represents an all-deletion candidate without requiring a ca
 		view.verify();
 	} finally {
 		view.cleanup();
+	}
+});
+
+test("current lineage binding selects its exact frozen tree despite overlapping historical 4R records", (t) => {
+	const contributorRoot = repository(t);
+	const registry = new CandidateViewRegistry();
+	const lenses = ["review-risk", "review-resilience", "review-readability", "review-reliability"] as const;
+	const historical = [] as string[];
+	for (let index = 0; index < 3; index += 1) {
+		writeFileSync(join(contributorRoot, "tracked.txt"), `historical-${index}\n`);
+		const view = registry.create({ contributorRoot });
+		registry.bind({ token: view.token, lineageId: `historical-${index}`, selectedLenses: lenses });
+		historical.push(view.token);
+	}
+	writeFileSync(join(contributorRoot, "tracked.txt"), "current\n");
+	const current = registry.create({ contributorRoot });
+	registry.bindCurrent({ token: current.token, lineageId: "current", selectedLenses: lenses });
+	try {
+		for (const lens of lenses) {
+			assert.equal(registry.resolveCurrentForLens(lens).candidateTree, current.candidateTree);
+		}
+		const single = { agent: "review-risk", task: "review", mode: "task" };
+		const parallel = { agents: [...lenses], task: "review", mode: "task" };
+		injectReviewCandidateView(single, registry);
+		injectReviewCandidateView(parallel, registry);
+		assert.match(single.task, /Controller-owned review lineage: `current`/);
+		assert.match(parallel.task, new RegExp(`Frozen candidate tree: \`${current.candidateTree}\``));
+		assert.throws(() => registry.resolveCurrentForLens("review-unknown"), CandidateViewError);
+	} finally {
+		for (const token of [...historical, current.token]) registry.cleanup(token);
+	}
+});
+
+test("fresh registries restore only one exact authoritative reviewing candidate and reject zero or multiple matches", (t) => {
+	const contributorRoot = repository(t);
+	writeFileSync(join(contributorRoot, "tracked.txt"), "reviewing\n");
+	const source = new CandidateViewRegistry();
+	const frozen = source.create({ contributorRoot });
+	const state = {
+		lineageId: "reloaded-current",
+		contributorRoot,
+		baseCommit: frozen.baseCommit,
+		baseTree: frozen.baseTree,
+		candidateTree: frozen.candidateTree,
+		paths: frozen.paths,
+		modes: frozen.modes,
+		deletedPaths: frozen.deletedPaths,
+		selectedLenses: ["review-reliability"],
+	};
+	const restored = new CandidateViewRegistry();
+	try {
+		restored.restoreCurrentFromAuthoritativeReviewingStates(contributorRoot, [state]);
+		const dispatch = { agent: "review-reliability", task: "review", mode: "task" };
+		injectReviewCandidateView(dispatch, restored);
+		assert.match(dispatch.task, /Controller-owned review lineage: `reloaded-current`/);
+		assert.throws(() => restored.resolveCurrentForLens("review-risk"), (error: unknown) => error instanceof CandidateViewError && error.reason === "current-binding-lens-unselected");
+		for (const candidates of [[], [state, { ...state, lineageId: "duplicate" }]]) {
+			const rejected = new CandidateViewRegistry();
+			let error: unknown;
+			try {
+				rejected.restoreCurrentFromAuthoritativeReviewingStates(contributorRoot, candidates);
+			} catch (value) {
+				error = value;
+			}
+			assert.ok(error instanceof CandidateViewError);
+			assert.match(error.reason, /authoritative-current-match-(missing|ambiguous)/);
+		}
+	} finally {
+		source.cleanup(frozen.token);
+		const resolved = restored.resolveCurrentForLens("review-reliability");
+		restored.cleanup(resolved.token);
+	}
+});
+
+test("live candidate drift blocks dispatch before candidate text can be injected", (t) => {
+	const contributorRoot = repository(t);
+	writeFileSync(join(contributorRoot, "tracked.txt"), "reviewed\n");
+	const registry = new CandidateViewRegistry();
+	const view = registry.create({ contributorRoot });
+	registry.bindCurrent({ token: view.token, lineageId: "drifted", selectedLenses: ["review-reliability"] });
+	try {
+		writeFileSync(join(contributorRoot, "tracked.txt"), "drifted\n");
+		const input = { agent: "review-reliability", task: "review", mode: "task" };
+		let error: unknown;
+		try {
+			injectReviewCandidateView(input, registry);
+		} catch (value) {
+			error = value;
+		}
+		assert.ok(error instanceof CandidateViewError);
+		assert.equal(error.reason, "current-binding-live-candidate-drift");
+		assert.equal(input.task, "review");
+	} finally {
+		registry.cleanup(view.token);
 	}
 });

@@ -5,7 +5,7 @@ import { resolveGentleAiReleaseAsset } from "../scripts/gentle-ai-installer.mjs"
 import { fileURLToPath } from "node:url";
 
 export const GENTLE_AI_BINARY_MISSING_CODE = "package-local-binary-missing";
-export const GENTLE_AI_VERSION = "2.1.4";
+export const GENTLE_AI_VERSION = "2.1.5";
 
 export class PackageLocalGentleAiBinaryMissingError extends Error {
 	readonly code = GENTLE_AI_BINARY_MISSING_CODE;
@@ -76,6 +76,7 @@ export function resolveGentleAiBinary(
 			manifest.asset !== asset.name ||
 			manifest.assetSha256 !== asset.sha256 ||
 			typeof manifest.binarySha256 !== "string" ||
+			manifest.binarySha256 !== asset.binarySha256 ||
 			!/^[0-9a-f]{64}$/.test(manifest.binarySha256) ||
 			sha256(readBinary(binaryPath)) !== manifest.binarySha256
 		) throw new Error("invalid runtime integrity manifest");

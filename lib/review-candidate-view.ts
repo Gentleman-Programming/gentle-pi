@@ -38,7 +38,9 @@ interface CandidateViewRecord {
 	contributorRoot: string;
 	commonDir: string;
 	baseCommit: string;
+	baseTree: string;
 	candidateTree: string;
+	committedOnly: boolean;
 	entries: readonly CandidateViewEntry[];
 	scope: CandidateViewScope;
 	lineageId?: string;
@@ -49,7 +51,10 @@ interface CandidateViewRecord {
 export interface CandidateView {
 	token: string;
 	root: string;
+	baseCommit: string;
+	baseTree: string;
 	candidateTree: string;
+	committedOnly: boolean;
 	paths: readonly string[];
 	modes: Readonly<Record<string, string>>;
 	deletedPaths: readonly string[];
@@ -59,7 +64,10 @@ export interface CandidateView {
 
 export interface FrozenCandidateProjection {
 	contributorRoot: string;
+	baseCommit: string;
+	baseTree: string;
 	candidateTree: string;
+	committedOnly: boolean;
 	paths: readonly string[];
 	modes: Readonly<Record<string, string>>;
 	deletedPaths: readonly string[];
@@ -67,6 +75,8 @@ export interface FrozenCandidateProjection {
 
 export interface CreateCandidateViewRequest {
 	contributorRoot: string;
+	baseRef?: string;
+	committedOnly?: boolean;
 	replayKey?: string;
 }
 
@@ -76,10 +86,25 @@ export interface BindCandidateViewRequest {
 	selectedLenses: readonly string[];
 }
 
+export interface AuthoritativeReviewingCandidateState {
+	lineageId: string;
+	contributorRoot: string;
+	baseCommit: string;
+	baseTree: string;
+	candidateTree: string;
+	committedOnly?: boolean;
+	paths: readonly string[];
+	modes: Readonly<Record<string, string>>;
+	deletedPaths: readonly string[];
+	selectedLenses: readonly string[];
+}
+
 export class CandidateViewError extends Error {
-	constructor(message: string) {
+	readonly reason: string;
+	constructor(message: string, reason = "candidate-view-invalid") {
 		super(message);
 		this.name = "CandidateViewError";
+		this.reason = reason;
 	}
 }
 
@@ -244,22 +269,77 @@ function candidateViewParent(commonDir: string): string {
 	return realpathSync(parent);
 }
 
+export interface ResolvedCandidateBase {
+	commit: string;
+	tree: string;
+}
+
+function isFullCommitId(selector: string): boolean {
+	return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(selector);
+}
+
+function explicitBaseRefCandidates(cwd: string, selector: string, env: NodeJS.ProcessEnv, executor: CandidateGitExecutor): string[] {
+	if (selector === "HEAD" || isFullCommitId(selector)) return [selector];
+	const refs = new Set(git(cwd, ["for-each-ref", "--format=%(refname)"], env, executor).split("\n").filter((ref) => ref.length > 0));
+	const candidates = selector.startsWith("refs/")
+		? [selector]
+		: [
+			`refs/${selector}`,
+			`refs/tags/${selector}`,
+			`refs/heads/${selector}`,
+			`refs/remotes/${selector}`,
+			`refs/remotes/${selector}/HEAD`,
+		];
+	return [...new Set(candidates)].filter((candidate) => refs.has(candidate));
+}
+
+function resolveCandidateBase(cwd: string, baseRef: string | undefined, env: NodeJS.ProcessEnv, executor: CandidateGitExecutor): ResolvedCandidateBase {
+	const selector = baseRef ?? "HEAD";
+	try {
+		if (baseRef !== undefined) {
+			const candidates = explicitBaseRefCandidates(cwd, selector, env, executor);
+			if (candidates.length > 1) throw new CandidateViewError("candidate base reference is ambiguous", "base-ref-ambiguous");
+			if (candidates.length === 0) throw new CandidateViewError("candidate base reference is unresolvable", "base-ref-unresolvable");
+		}
+		const firstCommit = git(cwd, ["rev-parse", "--verify", "--end-of-options", `${selector}^{commit}`], env, executor);
+		const tree = git(cwd, ["rev-parse", "--verify", "--end-of-options", `${firstCommit}^{tree}`], env, executor);
+		const confirmedCommit = git(cwd, ["rev-parse", "--verify", "--end-of-options", `${selector}^{commit}`], env, executor);
+		if (firstCommit !== confirmedCommit) throw new CandidateViewError("candidate base reference moved during resolution", "base-ref-moved");
+		const confirmedTree = git(cwd, ["rev-parse", "--verify", "--end-of-options", `${confirmedCommit}^{tree}`], env, executor);
+		if (tree !== confirmedTree) throw new CandidateViewError("candidate base tree changed during resolution", "base-ref-moved");
+		return { commit: confirmedCommit, tree: confirmedTree };
+	} catch (error) {
+		if (error instanceof CandidateViewError && (error.reason === "base-ref-ambiguous" || error.reason === "base-ref-moved" || error.reason === "base-ref-unresolvable")) throw error;
+		throw new CandidateViewError("candidate base reference is unresolvable", "base-ref-unresolvable");
+	}
+}
+
+export function resolveCanonicalCandidateBase(contributorRoot: string, baseRef: string): ResolvedCandidateBase {
+	return resolveCandidateBase(realpathSync(contributorRoot), baseRef, process.env, defaultCandidateGitExecutor);
+}
+
 function materializeCandidateView(request: CreateCandidateViewRequest, executor: CandidateGitExecutor): CandidateViewRecord {
 	const contributorRoot = realpathSync(request.contributorRoot);
 	if (!lstatSync(contributorRoot).isDirectory()) throw new CandidateViewError("contributor root is not a directory");
+	if (request.committedOnly === true && request.baseRef === undefined) throw new CandidateViewError("committed-only candidate views require an explicit base reference", "committed-only-base-required");
 	const commonDir = resolve(contributorRoot, git(contributorRoot, ["rev-parse", "--git-common-dir"], process.env, executor));
 	const canonicalCommonDir = realpathSync(commonDir);
+	const base = resolveCandidateBase(contributorRoot, request.baseRef, process.env, executor);
+	const committedOnly = request.committedOnly === true;
+	const candidateCommit = committedOnly
+		? resolveCandidateBase(contributorRoot, "HEAD", process.env, executor)
+		: base;
 	const parent = candidateViewParent(canonicalCommonDir);
 	const index = mkdtempSync(join(tmpdir(), "gentle-ai-candidate-index-"));
 	const indexPath = join(index, "index");
 	const environment = { ...process.env, GIT_INDEX_FILE: indexPath };
 	try {
-		const baseCommit = git(contributorRoot, ["rev-parse", "HEAD"], environment, executor);
-		git(contributorRoot, ["read-tree", "HEAD"], environment, executor);
-		git(contributorRoot, ["add", "-A"], environment, executor);
+		const baseCommit = base.commit;
+		git(contributorRoot, ["read-tree", candidateCommit.commit], environment, executor);
+		if (!committedOnly) git(contributorRoot, ["add", "-A"], environment, executor);
 		const candidateTree = git(contributorRoot, ["write-tree"], environment, executor);
 		const root = join(parent, randomUUID());
-		git(contributorRoot, ["worktree", "add", "--detach", "--no-checkout", root, baseCommit], process.env, executor);
+		git(contributorRoot, ["worktree", "add", "--detach", "--no-checkout", root, candidateCommit.commit], process.env, executor);
 		try {
 			git(root, ["read-tree", candidateTree], process.env, executor);
 			git(root, ["checkout-index", "-a", "-f"], process.env, executor);
@@ -267,7 +347,7 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 			const entries = treeEntries.map((entry) => ({ ...entry, contentHash: entryContentHash(root, entry) }));
 			const scope = deriveChangedScope(contributorRoot, baseCommit, candidateTree, entries, executor);
 			makeReadonly(root, entries);
-			return { token: basename(root), root: realpathSync(root), parent, contributorRoot, commonDir: canonicalCommonDir, baseCommit, candidateTree, entries, scope, gitExecutor: executor };
+			return { token: basename(root), root: realpathSync(root), parent, contributorRoot, commonDir: canonicalCommonDir, baseCommit, baseTree: base.tree, candidateTree, committedOnly, entries, scope, gitExecutor: executor };
 		} catch (error) {
 			try { git(contributorRoot, ["worktree", "remove", "--force", root], process.env, executor); } catch { rmSync(root, { recursive: true, force: true }); }
 			throw error;
@@ -316,6 +396,7 @@ export class CandidateViewRegistry {
 	private readonly lineages = new Map<string, string>();
 	private readonly projections = new Map<string, FrozenCandidateProjection>();
 	private readonly replays = new Map<string, string>();
+	private current: { lineageId: string; token: string } | undefined;
 
 	create(request: CreateCandidateViewRequest): CandidateView {
 		return this.createOrReuse(request);
@@ -332,13 +413,54 @@ export class CandidateViewRegistry {
 	}
 
 	bind(request: BindCandidateViewRequest): void {
-		const selectedLenses = request.selectedLenses.filter((lens): lens is ReviewLens => (REVIEW_LENS as readonly string[]).includes(lens));
-		if (selectedLenses.length !== request.selectedLenses.length || selectedLenses.length === 0) throw new CandidateViewError("candidate view has no valid selected review lenses");
+		this.bindCurrent(request);
+	}
+
+	bindCurrent(request: BindCandidateViewRequest): void {
+		const selectedLenses = this.validateSelectedLenses(request.selectedLenses);
 		this.bindRecord(request.token, request.lineageId, selectedLenses);
+		this.current = { lineageId: request.lineageId, token: request.token };
 	}
 
 	retain(token: string, lineageId: string): void {
 		this.bindRecord(token, lineageId, []);
+		this.current = { lineageId, token };
+	}
+
+	restoreCurrentFromNativeStart(request: BindCandidateViewRequest): void {
+		if (this.current !== undefined) throw new CandidateViewError("candidate view already has a current lineage binding", "current-binding-already-established");
+		const record = this.records.get(request.token);
+		if (!record || record.lineageId !== undefined) throw new CandidateViewError("native reviewing candidate view is missing or already bound", "authoritative-current-match-missing");
+		assertRecordSafe(record);
+		this.assertCurrentBindingMatchesLiveCandidate(record);
+		this.bindCurrent(request);
+	}
+
+	hasCurrentBinding(): boolean {
+		return this.current !== undefined;
+	}
+
+	restoreCurrentFromAuthoritativeReviewingStates(
+		contributorRoot: string,
+		states: readonly AuthoritativeReviewingCandidateState[],
+	): void {
+		if (this.current !== undefined) throw new CandidateViewError("candidate view already has a current lineage binding", "current-binding-already-established");
+		if (states.length === 0) throw new CandidateViewError("no authoritative reviewing lineage exactly matches the live candidate", "authoritative-current-match-missing");
+		if (states.length !== 1) throw new CandidateViewError("multiple authoritative reviewing lineages exactly match the live candidate", "authoritative-current-match-ambiguous");
+		const live = materializeCandidateView({ contributorRoot, baseRef: states[0]!.baseCommit, committedOnly: states[0]!.committedOnly === true }, this.gitExecutor);
+		try {
+			const matches = states.filter((state) => this.matchesAuthoritativeState(live, state));
+			if (matches.length === 0) throw new CandidateViewError("no authoritative reviewing lineage exactly matches the live candidate", "authoritative-current-match-missing");
+			if (matches.length !== 1) throw new CandidateViewError("multiple authoritative reviewing lineages exactly match the live candidate", "authoritative-current-match-ambiguous");
+			const state = matches[0]!;
+			const selectedLenses = this.validateSelectedLenses(state.selectedLenses);
+			this.records.set(live.token, live);
+			this.bindRecord(live.token, state.lineageId, selectedLenses);
+			this.current = { lineageId: state.lineageId, token: live.token };
+		} catch (error) {
+			if (!this.records.has(live.token)) this.remove(live);
+			throw error;
+		}
 	}
 
 	createCorrected(lineageId: string, contributorRoot: string, replayKey: string): CandidateView {
@@ -350,8 +472,9 @@ export class CandidateViewRegistry {
 			assertRecordSafe(existing);
 			return this.expose(existing);
 		}
-		const record = materializeCandidateView({ contributorRoot }, this.gitExecutor);
+		const record = materializeCandidateView({ contributorRoot, baseRef: projection.baseCommit, committedOnly: projection.committedOnly }, this.gitExecutor);
 		try {
+			if (record.baseCommit !== projection.baseCommit || record.baseTree !== projection.baseTree) throw new CandidateViewError("corrected candidate base does not match the frozen genesis base");
 			if (!record.scope.paths.every((path) => projection.paths.includes(path))) throw new CandidateViewError("corrected candidate scope escapes the frozen genesis paths");
 			this.records.set(record.token, record);
 			this.replays.set(replayKey, record.token);
@@ -371,6 +494,28 @@ export class CandidateViewRegistry {
 		this.remove(current);
 		this.forget(current);
 		this.bindRecord(token, lineageId, []);
+		this.current = { lineageId, token };
+	}
+
+	private validateSelectedLenses(lenses: readonly string[]): ReviewLens[] {
+		const selectedLenses = lenses.filter((lens): lens is ReviewLens => (REVIEW_LENS as readonly string[]).includes(lens));
+		if (selectedLenses.length !== lenses.length || selectedLenses.length === 0) throw new CandidateViewError("candidate view has no valid selected review lenses");
+		return selectedLenses;
+	}
+
+	private matchesAuthoritativeState(record: CandidateViewRecord, state: AuthoritativeReviewingCandidateState): boolean {
+		try {
+			return realpathSync(state.contributorRoot) === record.contributorRoot &&
+				state.baseCommit === record.baseCommit &&
+				state.baseTree === record.baseTree &&
+				state.candidateTree === record.candidateTree &&
+				(state.committedOnly ?? false) === record.committedOnly &&
+				JSON.stringify(state.paths) === JSON.stringify(record.scope.paths) &&
+				JSON.stringify(state.modes) === JSON.stringify(record.scope.modes) &&
+				JSON.stringify(state.deletedPaths) === JSON.stringify(record.scope.deletedPaths);
+		} catch {
+			return false;
+		}
 	}
 
 	private bindRecord(token: string, lineageId: string, selectedLenses: readonly ReviewLens[]): void {
@@ -382,7 +527,10 @@ export class CandidateViewRegistry {
 		this.lineages.set(lineageId, record.token);
 		this.projections.set(lineageId, {
 			contributorRoot: record.contributorRoot,
+			baseCommit: record.baseCommit,
+			baseTree: record.baseTree,
 			candidateTree: record.candidateTree,
+			committedOnly: record.committedOnly,
 			paths: record.scope.paths,
 			modes: record.scope.modes,
 			deletedPaths: record.scope.deletedPaths,
@@ -394,6 +542,13 @@ export class CandidateViewRegistry {
 		return this.projections.has(lineageId);
 	}
 
+	restoreProjection(lineageId: string, contributorRoot: string, baseCommit: string, baseTree: string, candidateTree: string, paths: readonly string[]): void {
+		const root = realpathSync(contributorRoot);
+		const base = resolveCandidateBase(root, baseCommit, process.env, this.gitExecutor);
+		if (!lineageId || this.projections.has(lineageId) || base.commit !== baseCommit || base.tree !== baseTree || !isFullCommitId(candidateTree) || paths.some((path) => !isSafeCandidatePath(path)) || new Set(paths).size !== paths.length) throw new CandidateViewError("frozen correction projection is invalid or already restored");
+		this.projections.set(lineageId, { contributorRoot: root, baseCommit, baseTree, candidateTree, committedOnly: false, paths: [...paths], modes: {}, deletedPaths: [] });
+	}
+
 	resolveProjection(lineageId: string, contributorRoot: string): FrozenCandidateProjection {
 		const projection = this.projections.get(lineageId);
 		if (!projection || realpathSync(contributorRoot) !== projection.contributorRoot) {
@@ -402,14 +557,49 @@ export class CandidateViewRegistry {
 		return projection;
 	}
 
-	resolveForLens(lineageId: string | undefined, lens: string): CandidateView {
-		const matching = lineageId === undefined
-			? [...this.records.values()].filter((record) => record.lineageId !== undefined && record.selectedLenses?.includes(lens as ReviewLens))
-			: [this.lineages.get(lineageId)].flatMap((token) => token === undefined ? [] : [this.records.get(token)]).filter((record): record is CandidateViewRecord => record !== undefined);
-		const record = matching.length === 1 ? matching[0] : undefined;
-		if (!record || (lineageId !== undefined && record.lineageId !== lineageId) || !record.selectedLenses?.includes(lens as ReviewLens)) throw new CandidateViewError("candidate view context is missing, ambiguous, stale, or lens-unselected");
+	resolveForLens(lineageId: string, lens: string): CandidateView {
+		const token = this.lineages.get(lineageId);
+		const record = token === undefined ? undefined : this.records.get(token);
+		if (!record || record.lineageId !== lineageId || !record.selectedLenses?.includes(lens as ReviewLens)) throw new CandidateViewError("candidate view context is missing, ambiguous, stale, or lens-unselected");
 		assertRecordSafe(record);
 		return this.expose(record);
+	}
+
+	currentLineageId(): string {
+		if (this.current === undefined) throw new CandidateViewError("review subagent dispatch has no current controller-owned candidate view lineage binding", "current-binding-missing");
+		return this.current.lineageId;
+	}
+
+	resolveCurrentForLens(lens: string): CandidateView {
+		return this.resolveCurrentForLenses([lens])[0]!;
+	}
+
+	resolveCurrentForLenses(lenses: readonly string[]): CandidateView[] {
+		const lineageId = this.currentLineageId();
+		const token = this.current?.token;
+		const record = token === undefined ? undefined : this.records.get(token);
+		if (!record || record.lineageId !== lineageId || this.lineages.get(lineageId) !== token) throw new CandidateViewError("review subagent dispatch current lineage binding is stale or ambiguous", "current-binding-stale");
+		assertRecordSafe(record);
+		this.assertCurrentBindingMatchesLiveCandidate(record);
+		if (!lenses.every((lens) => record.selectedLenses?.includes(lens as ReviewLens))) throw new CandidateViewError("candidate view context is missing, ambiguous, stale, or lens-unselected", "current-binding-lens-unselected");
+		return lenses.map(() => this.expose(record));
+	}
+
+	private assertCurrentBindingMatchesLiveCandidate(record: CandidateViewRecord): void {
+		const live = materializeCandidateView({ contributorRoot: record.contributorRoot, baseRef: record.baseCommit, committedOnly: record.committedOnly }, this.gitExecutor);
+		try {
+			if (
+				live.baseCommit !== record.baseCommit ||
+				live.baseTree !== record.baseTree ||
+				live.candidateTree !== record.candidateTree ||
+				live.committedOnly !== record.committedOnly ||
+				JSON.stringify(live.scope.paths) !== JSON.stringify(record.scope.paths) ||
+				JSON.stringify(live.scope.modes) !== JSON.stringify(record.scope.modes) ||
+				JSON.stringify(live.scope.deletedPaths) !== JSON.stringify(record.scope.deletedPaths)
+			) throw new CandidateViewError("live candidate no longer matches the current controller-owned lineage binding", "current-binding-live-candidate-drift");
+		} finally {
+			this.remove(live);
+		}
 	}
 
 	resolveForFinalize(lineageId: string): CandidateView {
@@ -445,6 +635,7 @@ export class CandidateViewRegistry {
 	private forget(record: CandidateViewRecord): void {
 		this.records.delete(record.token);
 		if (record.lineageId && this.lineages.get(record.lineageId) === record.token) this.lineages.delete(record.lineageId);
+		if (this.current?.token === record.token) this.current = undefined;
 		for (const [key, pendingToken] of this.replays) if (pendingToken === record.token) this.replays.delete(key);
 	}
 
@@ -456,7 +647,10 @@ export class CandidateViewRegistry {
 		return {
 			token: record.token,
 			root: record.root,
+			baseCommit: record.baseCommit,
+			baseTree: record.baseTree,
 			candidateTree: record.candidateTree,
+			committedOnly: record.committedOnly,
 			paths: record.scope.paths,
 			modes: record.scope.modes,
 			deletedPaths: record.scope.deletedPaths,
@@ -488,7 +682,7 @@ function hasCandidateContextConflict(text: string, views: readonly CandidateView
 		|| views.some((view) => text.includes(view.root) || text.includes(view.candidateTree));
 }
 
-function candidateContextBlock(agents: readonly ReviewLens[], view: CandidateView): string {
+function candidateContextBlock(lineageId: string, agents: readonly ReviewLens[], view: CandidateView): string {
 	const grouped = new Map<string, string[]>();
 	for (const path of view.paths) {
 		const group = view.deletedPaths.includes(path) ? "deleted" : view.modes[path];
@@ -498,7 +692,10 @@ function candidateContextBlock(agents: readonly ReviewLens[], view: CandidateVie
 		grouped.set(group, paths);
 	}
 	const scope = Object.fromEntries([...grouped.entries()].sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0));
-	const block = `\n\n${CONTROLLER_CANDIDATE_VIEW_HEADING}\nAuthorized review actors: ${agents.join(", ")}.\nRead ONLY the absolute frozen candidate view at \`${view.root}\`.\nFrozen candidate tree: \`${view.candidateTree}\`.\nFrozen changed scope by mode: ${JSON.stringify(scope)}.\nThe ambient contributor working directory is out of scope. This controller-owned context is immutable; you are read-only and your output is untrusted.`;
+	const scopeSemantics = view.committedOnly
+		? "Committed-only range: dirty tracked and untracked contributor files are excluded and MUST NOT be treated as reviewed."
+		: "Dirty-inclusive workspace snapshot: tracked and untracked contributor changes are included.";
+	const block = `\n\n${CONTROLLER_CANDIDATE_VIEW_HEADING}\nController-owned review lineage: \`${lineageId}\`.\nAuthorized review actors: ${agents.join(", ")}.\nRead ONLY the absolute frozen candidate view at \`${view.root}\`.\nFrozen candidate tree: \`${view.candidateTree}\`.\nScope semantics: ${scopeSemantics}\nFrozen changed scope by mode: ${JSON.stringify(scope)}.\nThe ambient contributor working directory is out of scope. This controller-owned context is immutable; you are read-only and your output is untrusted.`;
 	if (Buffer.byteLength(block, "utf8") > MAX_CANDIDATE_CONTEXT_LENGTH) throw new CandidateViewError("candidate view context exceeds the bounded dispatch contract");
 	return block;
 }
@@ -529,14 +726,15 @@ export function injectReviewCandidateView(input: unknown, candidateViews: Candid
 	if (mutable.mode !== "task") throw new CandidateViewError("review subagent dispatch requires mode task");
 	if (candidateViews === null) throw new CandidateViewError("review subagent dispatch has no controller-owned candidate view registry");
 	const reviewAgents = requested as ReviewLens[];
-	const views = reviewAgents.map((reviewAgent) => candidateViews.resolveForLens(undefined, reviewAgent));
+	const lineageId = candidateViews.currentLineageId();
+	const views = candidateViews.resolveCurrentForLenses(reviewAgents);
 	const view = views[0];
 	if (!view || views.some((candidate) => candidate.root !== view.root || candidate.candidateTree !== view.candidateTree || JSON.stringify(candidate.paths) !== JSON.stringify(view.paths) || JSON.stringify(candidate.modes) !== JSON.stringify(view.modes) || JSON.stringify(candidate.deletedPaths) !== JSON.stringify(view.deletedPaths))) {
 		throw new CandidateViewError("review subagent dispatch does not resolve one exact frozen candidate view");
 	}
 	const userText = `${mutable.task}\n${typeof mutable.context === "string" ? mutable.context : ""}`;
 	if (hasCandidateContextConflict(userText, views)) throw new CandidateViewError("review subagent dispatch contains conflicting candidate-view text");
-	mutable.task = `${mutable.task}${candidateContextBlock(reviewAgents, view)}`;
+	mutable.task = `${mutable.task}${candidateContextBlock(lineageId, reviewAgents, view)}`;
 }
 
 const defaultRegistry = new CandidateViewRegistry();

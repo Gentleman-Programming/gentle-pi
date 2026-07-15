@@ -19,23 +19,23 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const RELEASE_BASE_URL = "https://github.com/Gentleman-Programming/gentle-ai/releases/download/v2.1.4/";
+const RELEASE_BASE_URL = "https://github.com/Gentleman-Programming/gentle-ai/releases/download/v2.1.5/";
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const DOWNLOAD_TIMEOUTS = { headers: 10_000, body: 30_000, attempts: 2, retryDelay: 100 };
-const INSTALLER_VERSION = "2.1.4";
+const INSTALLER_VERSION = "2.1.5";
 
-function asset(name, sha256, executable) {
-	return Object.freeze({ name, sha256, executable, url: `${RELEASE_BASE_URL}${name}` });
+function asset(name, sha256, binarySha256, executable) {
+	return Object.freeze({ name, sha256, binarySha256, executable, url: `${RELEASE_BASE_URL}${name}` });
 }
 
 export const GENTLE_AI_RELEASE_ASSETS = Object.freeze({
-	"darwin/amd64": asset("gentle-ai_2.1.4_darwin_amd64.tar.gz", "ffdc278bcd87185ea8b0f6970217c06a8f7bf95d14be552a505a5b05dab6f733", "gentle-ai"),
-	"darwin/arm64": asset("gentle-ai_2.1.4_darwin_arm64.tar.gz", "8e689b3189069af0724f9b27a89a1a3422a5711ead85804d0e97611719174036", "gentle-ai"),
-	"linux/amd64": asset("gentle-ai_2.1.4_linux_amd64.tar.gz", "6f12f906b6aca5b45e4177b1ff0ae4e3792516877861bfb37a654d76f77e72c2", "gentle-ai"),
-	"linux/arm64": asset("gentle-ai_2.1.4_linux_arm64.tar.gz", "f44768ef00db265d192e95da1de6e6d751e248ee3b6fbfe8902849c917d7859f", "gentle-ai"),
-	"windows/amd64": asset("gentle-ai_2.1.4_windows_amd64.zip", "50e705968d52a96a8e551804661287e3b619a677597a21615d2f0554e14710ce", "gentle-ai.exe"),
-	"windows/arm64": asset("gentle-ai_2.1.4_windows_arm64.zip", "1a8045776005dcecc611403b664b2cec0570329ca0e190ea176a8dfb136a3616", "gentle-ai.exe"),
+	"darwin/amd64": asset("gentle-ai_2.1.5_darwin_amd64.tar.gz", "c8a5dbf6c5f48bac4a57427d02f9d32df4ef486d4a458a41d65098bc7f15fb44", "87fa39d190e8bc08cc1276cfc77720d276aad7171b9ede8d7a1b59abe99e14b2", "gentle-ai"),
+	"darwin/arm64": asset("gentle-ai_2.1.5_darwin_arm64.tar.gz", "3ef2d2a2b721303067dce8739ec9d46968b95f59d6c1c9dfe67649073f5e4cbf", "e899f3ee37ad07bbde28467c4e7fc53dd6875632f034afdb0b2722646d640f8a", "gentle-ai"),
+	"linux/amd64": asset("gentle-ai_2.1.5_linux_amd64.tar.gz", "28f78160efd92da4dac1820e295f0ad62b1dbb2e91d5d6d91f841b8b1504ba44", "d2cf080ebb92f73ef30aaf36eb7ca6eeb750592d670a71ca5a045f121edf9071", "gentle-ai"),
+	"linux/arm64": asset("gentle-ai_2.1.5_linux_arm64.tar.gz", "3ccd04879ef50ca8822329c404678f289bd9780ddf8d79824d9c95caf7135867", "3c254d7e45ab54fa64e9362192f4e2ae741c3396a59f303cc6906ea04df5b63b", "gentle-ai"),
+	"windows/amd64": asset("gentle-ai_2.1.5_windows_amd64.zip", "f027c453e3307a8490b2ebd0dfa679fd1130fd3861caed0949929050fbb6ca95", "2e7da41c9339c071a034cee177f60fba4a1c636bfb6b0194ef63d14f0c948d0b", "gentle-ai.exe"),
+	"windows/arm64": asset("gentle-ai_2.1.5_windows_arm64.zip", "fe9beaf77a432369494a819a4c2f57e3cea671186851fbfacd7aaf1c3ec71c12", "844770e53e922cc43c889965c5ec232700e1b05f94d22d9e6bd305d20e979503", "gentle-ai.exe"),
 });
 
 function upstreamArchitecture(architecture) {
@@ -181,6 +181,7 @@ async function existingBinaryMatches(binaryPath, manifestPath, asset, platform) 
 			&& parsed.assetSha256 === asset.sha256
 			&& typeof parsed.binarySha256 === "string"
 			&& /^[0-9a-f]{64}$/.test(parsed.binarySha256)
+			&& (!asset.binarySha256 || parsed.binarySha256 === asset.binarySha256)
 			&& parsed.binarySha256 === await sha256File(binaryPath);
 	} catch {
 		return false;
@@ -211,6 +212,7 @@ export async function installGentleAi(options = {}) {
 		const extracted = join(temporaryDirectory, "extracted");
 		await (options.extractArchive ?? extractGentleAiArchive)(archive, extracted);
 		const source = await expectedRegularFile(extracted, asset.executable);
+		if (asset.binarySha256 && (await sha256File(source)) !== asset.binarySha256) throw new Error(`Gentle AI binary checksum mismatch for ${asset.name}`);
 		await mkdir(installDirectory, { recursive: true, mode: 0o700 });
 		await assertRuntimeDirectory(join(packageRoot, ".gentle-ai"));
 		await assertRuntimeDirectory(installDirectory);

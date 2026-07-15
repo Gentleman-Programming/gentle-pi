@@ -904,22 +904,17 @@ test("controller INSPECT treats a completed reset journal as history and routes 
 	assert.equal(reset.next_action, "start-fresh-ordinary-review-after-verified-clean");
 });
 
-test("controller keeps valid compact terminal authority non-resettable", async (t) => {
+test("controller hides destructive reset material for ineligible terminal compact authority", async (t) => {
 	const fixture = createRepository(t, false);
 	const { controller } = registerRuntime();
 	const ctx = extensionContext(fixture.repository, true);
 	await approveTrackedWorktreeTransaction(controller, ctx, "terminal-compact-reset");
 	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
 	assert.equal(inspected.status, "ready");
+	assert.equal(inspected.reset_eligible, false);
 	assert.equal((inspected.inspection as Record<string, unknown>).terminal_applicability, "policy-unresolved");
-	const request = (inspected.inspection as Record<string, unknown>).reset_request as Record<string, unknown>;
-	await assert.rejects(
-		controller.execute("terminal-compact-reset", { operation: "reset", input: JSON.stringify(request) }, undefined, undefined, ctx),
-		/destructive reset requires/i,
-	);
-	const unchanged = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.equal(unchanged.status, "ready");
-	assert.equal(((unchanged.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "approved");
+	assert.equal(((inspected.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "approved");
+	assert.doesNotMatch(JSON.stringify(inspected), /reset_request|challenge|confirmation|DESTROY/);
 });
 
 test("controller rejects altered destructive reset bindings without authority mutation", async (t) => {

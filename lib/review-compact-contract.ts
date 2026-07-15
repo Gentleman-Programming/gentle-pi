@@ -11,6 +11,7 @@ import {
 	type CompactTargetedValidationInput,
 } from "./review-compact.ts";
 import { REVIEW_LENS } from "./review-triggers.ts";
+import { canonicalJsonV1, domainHashV1 } from "./review-canonical.ts";
 import { normalizeRefuterBatch, type RefuterBatch } from "./review-refuter-adapter.ts";
 
 const DIGEST = /^[0-9a-f]{64}$/;
@@ -45,6 +46,33 @@ export interface CompactFinalizeContractInput {
 	final_evidence?: string;
 	final_verification_passed?: boolean;
 	refuter_batch?: unknown;
+}
+
+export interface NativeRefuterRequestInput {
+	lineageId: string;
+	candidateTree?: string;
+	reviewResult: CompactReviewResultInput;
+}
+
+export interface NativeRefuterRequest {
+	request_hash: string;
+	findings: CompactFinding[];
+}
+
+export interface NativeValidationRequestInput {
+	lineageId: string;
+	candidateTree: string;
+	state: unknown;
+}
+
+export interface NativeValidationRequest {
+	request_hash: string;
+	lineage_id: string;
+	blocking_finding_ids: string[];
+	fix_finding_ids: string[];
+	correction_candidate_tree: string;
+	correction_identity: string;
+	validation_criteria: readonly string[];
 }
 
 function fail(area: string, code: string, message: string): never {
@@ -162,6 +190,54 @@ function parseValidation(value: unknown, area: string): CompactTargetedValidatio
 	const request_hash = string(input.request_hash, `${area}.request_hash`);
 	if (!DIGEST.test(request_hash)) fail(`${area}.request_hash`, "digest", "is malformed");
 	return { request_hash, correction_ids: strings(input.correction_ids, `${area}.correction_ids`), original_criteria: check(input.original_criteria, `${area}.original_criteria`), correction_regression: check(input.correction_regression, `${area}.correction_regression`), fix_caused_findings: [], follow_ups };
+}
+
+const CANDIDATE_CAUSAL_DISPOSITIONS = new Set<string>([
+	CAUSAL_DISPOSITION.INTRODUCED,
+	CAUSAL_DISPOSITION.BEHAVIOR_ACTIVATED,
+	CAUSAL_DISPOSITION.WORSENED,
+]);
+
+export function deriveNativeRefuterRequest(input: NativeRefuterRequestInput): NativeRefuterRequest | undefined {
+	const lens_results = input.reviewResult.lens_results.map((result, index) => ({
+		lens: result.lens ?? `lens-${index}`,
+		findings: result.findings.map((finding) => ({ ...finding, proof_refs: [...finding.proof_refs].toSorted() })).toSorted((left, right) => (left.id ?? "").localeCompare(right.id ?? "")),
+		evidence: [...result.evidence].toSorted(),
+	})).toSorted((left, right) => left.lens.localeCompare(right.lens));
+	const findings = lens_results.flatMap(({ findings }) => findings).filter((finding) =>
+		(finding.severity === COMPACT_SEVERITY.BLOCKER || finding.severity === COMPACT_SEVERITY.CRITICAL) &&
+		finding.evidence_class === COMPACT_EVIDENCE_CLASS.INFERENTIAL &&
+		CANDIDATE_CAUSAL_DISPOSITIONS.has(finding.causal_disposition ?? ""),
+	);
+	if (findings.some((finding) => finding.id === undefined || finding.lens === undefined)) fail("review/finalize.review_result", "finding-id", "inferential severe findings require stable IDs and lenses for refuter derivation");
+	if (findings.length === 0) return undefined;
+	if (input.candidateTree === undefined) fail("review/finalize", "candidate-tree", "requires a frozen candidate tree for refuter derivation");
+	return {
+		request_hash: domainHashV1("compact-refuter-request", {
+			lineage_id: input.lineageId,
+			candidate_tree: input.candidateTree,
+			lens_results,
+			finding_ids: findings.map(({ id }) => id),
+		}),
+		findings: findings as CompactFinding[],
+	};
+}
+
+export function deriveNativeValidationRequest(input: NativeValidationRequestInput): NativeValidationRequest {
+	const state = record(input.state, "review/finalize.validation-request");
+	if (string(state.lineage_id, "review/finalize.validation-request.lineage_id") !== input.lineageId || state.state !== "correction_required") fail("review/finalize.validation-request", "state", "requires the authoritative correction-required lineage");
+	const initial = record(state.initial_snapshot, "review/finalize.validation-request.initial_snapshot");
+	const initialCandidateTree = string(initial.candidate_tree, "review/finalize.validation-request.initial_snapshot.candidate_tree");
+	const fix_finding_ids = strings(state.fix_finding_ids, "review/finalize.validation-request.fix_finding_ids");
+	if (!Array.isArray(state.findings)) fail("review/finalize.validation-request.findings", "type", "must be an array");
+	const blocking_finding_ids = state.findings.flatMap((finding, index) => {
+		const row = record(finding, `review/finalize.validation-request.findings[${index}]`);
+		return row.severity === COMPACT_SEVERITY.BLOCKER || row.severity === COMPACT_SEVERITY.CRITICAL ? [string(row.id, `review/finalize.validation-request.findings[${index}].id`)] : [];
+	});
+	if (canonicalJsonV1(fix_finding_ids.toSorted()) !== canonicalJsonV1(blocking_finding_ids.toSorted())) fail("review/finalize.validation-request", "finding-ids", "fix IDs must exactly match frozen blocking findings");
+	const correction_identity = domainHashV1("compact-correction-identity", { initial_candidate_tree: initialCandidateTree, correction_candidate_tree: input.candidateTree });
+	const validation_criteria = ["original_criteria", "correction_regression", "follow_ups"] as const;
+	return { lineage_id: input.lineageId, blocking_finding_ids, fix_finding_ids, correction_candidate_tree: input.candidateTree, correction_identity, validation_criteria, request_hash: domainHashV1("compact-validation-request", { lineage_id: input.lineageId, blocking_finding_ids, fix_finding_ids, correction_identity, validation_criteria }) };
 }
 
 export function parseCompactStartInput(value: unknown): CompactStartContractInput {

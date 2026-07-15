@@ -7,10 +7,12 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
-import { NativeReviewCliV214, type NativeReviewCli } from "../lib/native-review-cli.ts";
+import { NATIVE_REVIEW_ERROR_CODE, NATIVE_REVIEW_OPERATION, NativeReviewCliError, NativeReviewCliV214, type NativeReviewCli, type NativeReviewStatusResult } from "../lib/native-review-cli.ts";
 import { canonicalJsonV1, domainHashV1 } from "../lib/review-canonical.ts";
 import { SupersessionStoreV1 } from "../lib/review-authority-supersession.ts";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
+import { compactResetRequestV1, destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
+import { NATIVE_REVIEW_REMEDIATION, classifyNativeReviewRemediation } from "../lib/native-review-remediation.ts";
 
 interface RegisteredTool {
 	execute: (
@@ -206,8 +208,43 @@ function fakeNative(overrides: Partial<NativeReviewCli> = {}): NativeReviewCli {
 		validate: async () => ({ allowed: true, result: "allow", action: "continue", reason: "ok", gateContext: nativeGateContext() }),
 		bindSdd: async () => ({ revision: "b1", change: "native-review-authority-parity", lineage: "native-lineage", authorityRevision: "r1", receiptHash: "receipt", gateContext: nativeBindingGateContext() }),
 		sddStatus: async () => ({ ready: false }),
+		reviewStatus: async () => ({ schema: "gentle-ai.review-authority-status/v1", repository: "/repo", complete: true, authoritative: true, status: "clean", entries: [], locks: [], diagnostics: [], raw: { schema: "gentle-ai.review-authority-status/v1", operation: "review/status", repository: "/repo", complete: true, authoritative: true, status: "clean", entries: [], locks: [], diagnostics: [] } }),
 		...overrides,
 	};
+}
+
+function findResetRequests(value: unknown): unknown[] {
+	if (Array.isArray(value)) return value.flatMap(findResetRequests);
+	if (!value || typeof value !== "object") return [];
+	return Object.entries(value).flatMap(([key, child]) => [
+		...(key === "reset_request" ? [child] : []),
+		...findResetRequests(child),
+	]);
+}
+
+function assertNoPublicNativeResetRequest(value: unknown): void {
+	for (const request of findResetRequests(value)) {
+		assert.equal("nativeEvidenceHash" in (request as Record<string, unknown>), false);
+		assert.equal("piInventoryHash" in (request as Record<string, unknown>), false);
+		assert.equal("applicableLineageId" in (request as Record<string, unknown>), false);
+	}
+}
+
+const assertNoPublicResetRequest = assertNoPublicNativeResetRequest;
+
+function assertNoPublicDestructiveResetMaterial(value: unknown): void {
+	const serialized = JSON.stringify(value);
+	assert.doesNotMatch(serialized, /DESTROY/);
+	assert.doesNotMatch(serialized, /request-explicit-reset-authorization/);
+	if (Array.isArray(value)) {
+		for (const child of value) assertNoPublicDestructiveResetMaterial(child);
+		return;
+	}
+	if (!value || typeof value !== "object") return;
+	for (const [key, child] of Object.entries(value)) {
+		assert.equal(["reset_request", "confirmation", "challenge"].includes(key), false, `public INSPECT leaked ${key}`);
+		assertNoPublicDestructiveResetMaterial(child);
+	}
 }
 
 test("new ordinary START and native-lineage FINALIZE use exactly one native call and stable envelopes", async (t) => {
@@ -261,6 +298,57 @@ test("parent subagent_run mutates single and parallel review actors with one ver
 	assert.match(parallel.task, /review-risk, review-resilience, review-readability, review-reliability/);
 	assert.match(parallel.task, /Frozen candidate tree:/);
 	candidateViews.resolveForLens("c3-lineage", "review-risk").cleanup();
+});
+
+test("controller START binds the exact current lineage ahead of overlapping historical 4R candidate views", async (t) => {
+	const cwd = repository(t);
+	const candidateViews = new CandidateViewRegistry();
+	const lenses = ["review-risk", "review-resilience", "review-readability", "review-reliability"] as const;
+	const historicalTokens: string[] = [];
+	for (let index = 0; index < 3; index += 1) {
+		writeFileSync(join(cwd, "app.ts"), `export const value = ${index + 2};\n`);
+		const historical = candidateViews.create({ contributorRoot: cwd });
+		candidateViews.bind({ token: historical.token, lineageId: `historical-${index}`, selectedLenses: lenses });
+		historicalTokens.push(historical.token);
+	}
+	writeFileSync(join(cwd, "app.ts"), "export const value = 9;\n");
+	const { controller, toolCall } = runtime(fakeNative({
+		start: async () => ({ lineageId: "current-lineage", state: "reviewing", riskLevel: "high", selectedLenses: lenses, changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+	}), undefined, undefined, undefined, candidateViews);
+	await controller.execute("current-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	const current = candidateViews.resolveForLens("current-lineage", "review-risk");
+	try {
+		const single = { agent: "review-risk", task: "review", mode: "task" };
+		const parallel = { agents: [...lenses], task: "review", mode: "task" };
+		assert.equal(await toolCall({ toolName: "subagent_run", input: single }, context(cwd)), undefined);
+		assert.equal(await toolCall({ toolName: "subagent_run", input: parallel }, context(cwd)), undefined);
+		for (const task of [single.task, parallel.task]) {
+			assert.match(task, /Controller-owned review lineage: `current-lineage`/);
+			assert.match(task, new RegExp(`Frozen candidate tree: \`${current.candidateTree}\``));
+		}
+	} finally {
+		for (const token of [...historicalTokens, current.token]) candidateViews.cleanup(token);
+	}
+});
+
+test("fresh registry reload restores the native resumed lineage only while the live candidate exactly matches", async (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	const candidateViews = new CandidateViewRegistry();
+	const native = new NativeReviewCliV214(async (request) => ({
+		stdout: request.arguments[0] === "version"
+			? "gentle-ai 2.1.5\n"
+			: request.arguments[1] === "status"
+				? JSON.stringify({ schema: "gentle-ai.review-authority-status/v1", operation: "review/status", repository: cwd, complete: true, authoritative: true, status: "clean", entries: [], locks: [], diagnostics: [] })
+				: JSON.stringify({ operation: "review/start", lineage_id: "reloaded-lineage", state: "reviewing", risk_level: "medium", selected_lenses: ["review-reliability"], changed_files: 1, changed_lines: 1, correction_budget: 1, action: "resumed", lenses_required: true, projection: "workspace" }),
+		stderr: "", exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false,
+	}));
+	const { controller, toolCall } = runtime(native, undefined, undefined, undefined, candidateViews);
+	await controller.execute("reload-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	const dispatch = { agent: "review-reliability", task: "review", mode: "task" };
+	assert.equal(await toolCall({ toolName: "subagent_run", input: dispatch }, context(cwd)), undefined);
+	assert.match(dispatch.task, /Controller-owned review lineage: `reloaded-lineage`/);
+	candidateViews.resolveForLens("reloaded-lineage", "review-reliability").cleanup();
 });
 
 test("parent subagent_run fails closed before child execution for malformed, mixed, stale, conflicting, unsafe, and non-task review dispatch", async (t) => {
@@ -368,55 +456,71 @@ test("ambiguous native START replay preserves the exact request and returned aut
 	assert.deepEqual(replay.details, { operation: "start", result: { lineage_id: "resumed-lineage", state: "reviewing", risk_tier: "medium", selected_lenses: ["review-reliability"], changed_files: 2, original_changed_lines: 7, correction_budget: 4, action: "resumed", lenses_required: false } });
 });
 
-test("ambiguous correction FINALIZE reuses its immutable corrected view despite contributor changes", async (t) => {
+test("fresh registry reload projects a correction state without accepting scope escape", async (t) => {
 	const cwd = repository(t);
 	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
-	const candidateViews = new CandidateViewRegistry();
-	const requests: Parameters<NativeReviewCli["finalize"]>[0][] = [];
-	const observedContent: string[] = [];
+	const frozen = new CandidateViewRegistry().create({ contributorRoot: cwd });
+	mkdirSync(dirname(join(cwd, ".git", "gentle-ai", "review-transactions", "v2", "correction-lineage", "review-state.json")), { recursive: true });
+	writeFileSync(join(cwd, ".git", "gentle-ai", "review-transactions", "v2", "correction-lineage", "review-state.json"), JSON.stringify({ schema: "gentle-ai.review-state-record/v2", state: { schema: "gentle-ai.review-state/v2", lineage_id: "correction-lineage", state: "correction_required", initial_snapshot: { kind: "current-changes", base_tree: frozen.baseTree, candidate_tree: frozen.candidateTree, paths: frozen.paths, paths_digest: "paths" }, current_snapshot: { kind: "current-changes", base_tree: frozen.baseTree, candidate_tree: frozen.candidateTree, paths: frozen.paths, paths_digest: "paths" }, fix_finding_ids: ["RELIABILITY-001"], findings: [{ id: "RELIABILITY-001", severity: "CRITICAL" }] } }));
+	frozen.cleanup();
+	let finalizes = 0;
+	const { controller } = runtime(fakeNative({ finalize: async () => { finalizes += 1; return { lineageId: "correction-lineage", state: "approved", action: "approved", storeRevision: "r2" }; } }), undefined, undefined, undefined, new CandidateViewRegistry());
+	const required = await controller.execute("correction-validation-request", { operation: "finalize", lineageId: "correction-lineage", input: JSON.stringify({ final_evidence: "focused tests passed", final_verification_passed: true }) }, undefined, undefined, context(cwd));
+	const request = required.details as { outcome: string; validation_request: { request_hash: string; fix_finding_ids: string[] } };
+	assert.equal(request.outcome, "validation-required");
+	assert.deepEqual(request.validation_request.fix_finding_ids, ["RELIABILITY-001"]);
+	assert.match(request.validation_request.request_hash, /^[0-9a-f]{64}$/);
+	writeFileSync(join(cwd, "escape.ts"), "export const escape = true;\n");
+	assert.equal(((await controller.execute("correction-scope-escape", { operation: "finalize", lineageId: "correction-lineage", input: JSON.stringify({ final_evidence: "focused tests passed", final_verification_passed: true }) }, undefined, undefined, context(cwd))).details as { outcome: string }).outcome, "native-operation-failed");
+	assert.equal(finalizes, 0);
+});
+
+test("native FINALIZE derives and requires the trusted refuter request before invoking native FINALIZE", async (t) => {
+	const cwd = repository(t);
+	let finalizes = 0;
 	const { controller } = runtime(fakeNative({
-		start: async () => ({ lineageId: "correction-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
-		finalize: async (request) => {
-			requests.push(request);
-			if (requests.length === 1) throw Object.assign(new Error("lost output"), { mutationOutcome: "unknown", nextAction: "replay-exact-native-operation" });
-			observedContent.push(readFileSync(join(request.cwd, "app.ts"), "utf8"));
-			return { lineageId: "correction-lineage", state: "approved", action: "approved", storeRevision: "r2" };
+		start: async () => ({ lineageId: "native-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-risk"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+		finalize: async () => {
+			finalizes += 1;
+			return { lineageId: "native-lineage", state: "validating", action: "continue", storeRevision: "r1" };
 		},
-	}), undefined, undefined, undefined, candidateViews);
-	await controller.execute("correction-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
-	writeFileSync(join(cwd, "app.ts"), "export const value = 3;\n");
-	const input = JSON.stringify({
-		correction_line_forecast: 1,
-		validation: { request_hash: "b".repeat(64), correction_ids: ["RELIABILITY-001"], original_criteria: { passed: true, evidence: ["fixed"] }, correction_regression: { passed: true, evidence: ["covered"] }, fix_caused_findings: [], follow_ups: [] },
-		final_evidence: "focused tests passed",
-		final_verification_passed: true,
-	});
-	const ambiguous = await controller.execute("correction-finalize", { operation: "finalize", lineageId: "correction-lineage", input }, undefined, undefined, context(cwd));
-	assert.equal((ambiguous.details as { mutation_outcome: string }).mutation_outcome, "unknown");
-	writeFileSync(join(cwd, "app.ts"), "export const value = 4;\n");
-	await controller.execute("correction-finalize-replay", { operation: "finalize", lineageId: "correction-lineage", input }, undefined, undefined, context(cwd));
-	assert.equal(requests.length, 2);
-	assert.equal(requests[0]?.cwd, requests[1]?.cwd);
-	assert.deepEqual(observedContent, ["export const value = 3;\n"]);
+	}));
+	await controller.execute("risk-001-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	const proof = "differential-test:candidate still fails";
+	const finding = { id: "RISK-001", lens: "review-risk", location: "lib/a.ts:1", severity: "CRITICAL", claim: "Candidate fails", evidence_class: "inferential", causal_disposition: "introduced", proof_refs: [proof] };
+	const review_result = { lens_results: [{ lens: "review-risk", findings: [finding], evidence: ["complete candidate reviewed"] }] };
+	const required = await controller.execute("risk-001-refuter-request", { operation: "finalize", lineageId: "native-lineage", input: JSON.stringify({ review_result }) }, undefined, undefined, context(cwd));
+	const request = (required.details as { refuter_request?: { request_hash: string; findings: unknown[] } }).refuter_request;
+	assert.equal(finalizes, 0);
+	assert.equal((required.details as { outcome?: string }).outcome, "refuter-required");
+	assert.equal(typeof request?.request_hash, "string");
+	assert.deepEqual(request?.findings.map((row) => (row as { id: string }).id), ["RISK-001"]);
+	const retry = await controller.execute("risk-001-refuter-retry", { operation: "finalize", lineageId: "native-lineage", input: JSON.stringify({
+		review_result: { ...review_result, refuter_request_hash: request!.request_hash },
+		refuter_batch: { schema: "gentle-ai.refuter-result-batch/v1", request_hash: request!.request_hash, results: [{ finding_id: "RISK-001", outcome: "corroborated", proof_refs: [proof] }] },
+	}) }, undefined, undefined, context(cwd));
+	assert.equal(finalizes, 1);
+	assert.equal((retry.details as { result?: { state?: string } }).result?.state, "validating");
 });
 
 test("native FINALIZE emits exact v2.1.4 process documents and failed verification argv intent", async (t) => {
 	const cwd = repository(t);
-	const refuterBatch = {
-		schema: "gentle-ai.refuter-result-batch/v1",
-		request_hash: "a".repeat(64),
-		results: [{ finding_id: "RISK-001", outcome: "inconclusive", proof_refs: ["differential-test:candidate still fails"] }],
-	};
 	const requests: Parameters<NativeReviewCli["finalize"]>[0][] = [];
 	const { controller } = runtime(fakeNative({
+		start: async () => ({ lineageId: "native-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-risk"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
 		finalize: async (request) => {
 			requests.push(request);
 			return { lineageId: "native-lineage", state: "approved", action: "approved", storeRevision: "r1" };
 		},
 	}));
+	await controller.execute("finalize-v212-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
 	const finding = { id: "RISK-001", lens: "review-risk", location: "lib/a.ts:1", severity: "CRITICAL", claim: "Candidate fails", evidence_class: "inferential", causal_disposition: "introduced", proof_refs: ["differential-test:candidate still fails"] };
+	const review_result = { lens_results: [{ lens: "review-risk", findings: [finding], evidence: ["complete candidate reviewed"] }] };
+	const requested = await controller.execute("finalize-v212-request", { operation: "finalize", lineageId: "native-lineage", input: JSON.stringify({ review_result }) }, undefined, undefined, context(cwd));
+	const request_hash = (requested.details as { refuter_request: { request_hash: string } }).refuter_request.request_hash;
+	const refuterBatch = { schema: "gentle-ai.refuter-result-batch/v1", request_hash, results: [{ finding_id: "RISK-001", outcome: "inconclusive", proof_refs: ["differential-test:candidate still fails"] }] };
 	await controller.execute("finalize-v212", { operation: "finalize", lineageId: "native-lineage", input: JSON.stringify({
-		review_result: { lens_results: [{ lens: "review-risk", findings: [finding], evidence: ["complete candidate reviewed"] }], refuter_request_hash: "a".repeat(64) },
+		review_result: { ...review_result, refuter_request_hash: request_hash },
 		refuter_batch: refuterBatch,
 		validation: { request_hash: "b".repeat(64), correction_ids: ["RISK-001"], original_criteria: { passed: false, evidence: ["acceptance still fails"] }, correction_regression: { passed: true, evidence: ["regression suite passes"] }, fix_caused_findings: [], follow_ups: [{ finding_id: "RISK-001", location: "lib/a.ts:1", summary: "Track the remaining failure", proof_refs: ["differential-test:candidate still fails"] }] },
 		final_evidence: "  focused verification failed\n\n",
@@ -564,24 +668,131 @@ test("native START uses the default policy or a canonical safe policy path, and 
 			status: "blocked",
 			outcome,
 			reason,
+			lineage_created: false,
 			mutation_performed: false,
 			mutation_outcome: "none",
+			reset_eligible: false,
 		});
 	}
 	assert.equal(requests.length, 2);
 });
 
-test("native START forwards a validated base ref and rejects invalid values before native calls", async (t) => {
+test("native START preserves the default dirty-inclusive candidate without base flags", async (t) => {
 	const cwd = repository(t);
-	const requests: Array<{ cwd: string; baseRef?: string }> = [];
+	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	writeFileSync(join(cwd, "untracked.ts"), "export const untracked = true;\n");
+	const candidateViews = new CandidateViewRegistry();
+	const requests: Parameters<NativeReviewCli["start"]>[0][] = [];
+	const { controller } = runtime(fakeNative({
+		start: async (request) => {
+			requests.push(request);
+			return { lineageId: "default-dirty-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 2, changedLines: 2, correctionBudget: 1, action: "created", lensesRequired: true };
+		},
+	}), undefined, undefined, undefined, candidateViews);
+	await controller.execute("default-dirty", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	const view = candidateViews.resolveForLens("default-dirty-lineage", "review-reliability");
+	try {
+		assert.deepEqual(view.paths, ["app.ts", "untracked.ts"]);
+		assert.equal(view.committedOnly, false);
+		assert.deepEqual(requests, [{ cwd: view.root }]);
+	} finally {
+		view.cleanup();
+	}
+});
+
+test("native START binds an acknowledged committed range and native identity to one frozen candidate view", async (t) => {
+	const cwd = repository(t);
+	const baseCommit = git(cwd, "rev-parse", "HEAD");
+	commitFile(cwd, "committed-after-base.ts", "export const committedAfterBase = true;\n", "committed after base");
+	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	writeFileSync(join(cwd, "untracked.ts"), "export const untracked = true;\n");
+	const candidateViews = new CandidateViewRegistry();
+	const requests: Parameters<NativeReviewCli["start"]>[0][] = [];
+	const { controller } = runtime(fakeNative({
+		start: async (request) => {
+			requests.push(request);
+			return { lineageId: "explicit-base-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 2, changedLines: 2, correctionBudget: 1, action: "created", lensesRequired: true };
+		},
+	}), undefined, undefined, undefined, candidateViews);
+	await controller.execute("explicit-base", { operation: "start", input: JSON.stringify({ mode: "ordinary", baseRef: baseCommit, committedOnly: true }) }, undefined, undefined, context(cwd));
+	const view = candidateViews.resolveForLens("explicit-base-lineage", "review-reliability");
+	try {
+		assert.deepEqual(view.paths, ["committed-after-base.ts"]);
+		assert.equal(view.committedOnly, true);
+		assert.equal(view.baseCommit, baseCommit);
+		assert.deepEqual(requests, [{ cwd: view.root, baseRef: view.baseCommit, committedOnly: true }]);
+	} finally {
+		view.cleanup();
+	}
+});
+
+test("native START rejects an unresolvable explicit base before native mutation", async (t) => {
+	const cwd = repository(t);
+	let starts = 0;
+	const { controller } = runtime(fakeNative({
+		start: async () => {
+			starts += 1;
+			return { lineageId: "must-not-start", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true };
+		},
+	}), undefined, undefined, undefined, new CandidateViewRegistry());
+	const rejected = await controller.execute("missing-explicit-base", { operation: "start", input: JSON.stringify({ mode: "ordinary", baseRef: "refs/heads/missing-base", committedOnly: true }) }, undefined, undefined, context(cwd));
+	assert.deepEqual(rejected.details, {
+		operation: "start",
+		status: "blocked",
+		outcome: "native-start-base-ref-unresolvable",
+		reason: "base-ref-unresolvable",
+		lineage_created: false,
+		mutation_performed: false,
+		mutation_outcome: "none",
+		reset_eligible: false,
+	});
+	assert.equal(starts, 0);
+});
+
+test("native START rejects same-name branch and tag base refs before native mutation", async (t) => {
+	const cwd = repository(t);
+	const baseCommit = git(cwd, "rev-parse", "HEAD");
+	git(cwd, "branch", "same-commit", baseCommit);
+	git(cwd, "tag", "same-commit", baseCommit);
+	commitFile(cwd, "after-base.ts", "export const afterBase = true;\n", "after base");
+	const tipCommit = git(cwd, "rev-parse", "HEAD");
+	git(cwd, "branch", "different-commit", baseCommit);
+	git(cwd, "tag", "different-commit", baseCommit);
+	git(cwd, "branch", "-f", "different-commit", tipCommit);
+	let starts = 0;
+	const { controller } = runtime(fakeNative({
+		start: async () => {
+			starts += 1;
+			return { lineageId: "must-not-start", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true };
+		},
+	}), undefined, undefined, undefined, new CandidateViewRegistry());
+	for (const baseRef of ["same-commit", "different-commit"]) {
+		const rejected = await controller.execute(`ambiguous-${baseRef}`, { operation: "start", input: JSON.stringify({ mode: "ordinary", baseRef, committedOnly: true }) }, undefined, undefined, context(cwd));
+		assert.deepEqual(rejected.details, {
+			operation: "start",
+			status: "blocked",
+			outcome: "native-start-base-ref-ambiguous",
+			reason: "base-ref-ambiguous",
+			lineage_created: false,
+			mutation_performed: false,
+			mutation_outcome: "none",
+			reset_eligible: false,
+		});
+	}
+	assert.equal(starts, 0);
+});
+
+test("native START forwards an acknowledged base ref and rejects invalid values before native calls", async (t) => {
+	const cwd = repository(t);
+	const requests: Parameters<NativeReviewCli["start"]>[0][] = [];
 	const { controller } = runtime(fakeNative({
 		start: async (request) => {
 			requests.push(request);
 			return { lineageId: "native-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 2, changedLines: 7, correctionBudget: 4, action: "created", lensesRequired: true };
 		},
 	}));
-	await controller.execute("committed-base", { operation: "start", input: JSON.stringify({ mode: "ordinary", baseRef: "origin/main" }) }, undefined, undefined, context(cwd));
-	assert.deepEqual(requests, [{ cwd, baseRef: "origin/main" }]);
+	await controller.execute("committed-base", { operation: "start", input: JSON.stringify({ mode: "ordinary", baseRef: "refs/heads/main", committedOnly: true }) }, undefined, undefined, context(cwd));
+	assert.deepEqual(requests, [{ cwd, baseRef: git(cwd, "rev-parse", "refs/heads/main"), committedOnly: true }]);
 	for (const baseRef of ["", "   ", " origin/main", "origin/main ", "origin\0main", "origin\nmain", "origin\rmain", "origin\tmain", "origin\u007fmain", 42, [], {}]) {
 		const rejected = await controller.execute("invalid-base", { operation: "start", input: JSON.stringify({ mode: "ordinary", baseRef }) }, undefined, undefined, context(cwd));
 		assert.deepEqual(rejected.details, {
@@ -589,11 +800,58 @@ test("native START forwards a validated base ref and rejects invalid values befo
 			status: "blocked",
 			outcome: "native-start-base-ref-invalid",
 			reason: "base-ref-invalid",
+			lineage_created: false,
 			mutation_performed: false,
 			mutation_outcome: "none",
+			reset_eligible: false,
 		});
 	}
 	assert.equal(requests.length, 1);
+});
+
+test("native START rejects missing committed-only acknowledgement and invalid combinations before native calls", async (t) => {
+	const cwd = repository(t);
+	let starts = 0;
+	const { controller } = runtime(fakeNative({
+		start: async () => {
+			starts += 1;
+			return { lineageId: "must-not-start", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true };
+		},
+	}));
+	for (const input of [
+		{ mode: "ordinary", baseRef: "origin/main" },
+		{ mode: "ordinary", baseRef: "origin/main", committedOnly: false },
+		{ mode: "ordinary", baseRef: "origin/main", committedOnly: "true" },
+	] as const) {
+		const rejected = await controller.execute("missing-committed-only", { operation: "start", input: JSON.stringify(input) }, undefined, undefined, context(cwd));
+		assert.deepEqual(rejected.details, {
+			operation: "start",
+			status: "blocked",
+			outcome: "native-start-committed-only-required",
+			reason: "committed-only-required",
+			lineage_created: false,
+			mutation_performed: false,
+			mutation_outcome: "none",
+			reset_eligible: false,
+		});
+	}
+	for (const input of [
+		{ mode: "ordinary", committedOnly: true },
+		{ mode: "ordinary", committedOnly: false },
+	] as const) {
+		const rejected = await controller.execute("invalid-committed-only", { operation: "start", input: JSON.stringify(input) }, undefined, undefined, context(cwd));
+		assert.deepEqual(rejected.details, {
+			operation: "start",
+			status: "blocked",
+			outcome: "native-start-committed-only-invalid",
+			reason: "committed-only-invalid",
+			lineage_created: false,
+			mutation_performed: false,
+			mutation_outcome: "none",
+			reset_eligible: false,
+		});
+	}
+	assert.equal(starts, 0);
 });
 
 test("native ordinary START blocks unknown input fields before native calls", async (t) => {
@@ -613,8 +871,10 @@ test("native ordinary START blocks unknown input fields before native calls", as
 			outcome: "native-start-input-invalid",
 			reason: "unknown-field",
 			field,
+			lineage_created: false,
 			mutation_performed: false,
 			mutation_outcome: "none",
+			reset_eligible: false,
 		});
 	}
 	assert.equal(starts, 0);
@@ -1100,7 +1360,10 @@ test("native ordinary START distinguishes unrelated compact history from an exac
 		operation: "start",
 		status: "blocked",
 		outcome: "compact-authority-nonterminal",
+		lineage_created: false,
 		mutation_performed: false,
+		mutation_outcome: "none",
+		reset_eligible: false,
 		next_action: "stop-and-resolve-existing-compact-authority",
 		lineage_ids: ["historical-compact"],
 	});
@@ -1121,10 +1384,11 @@ test("explicit native selectors bypass a matching compact claimant and preserve 
 		}));
 		const policyPath = join(cwd, ".gentle-ai", "policies", "alternate.json");
 		if (selector === "policyPath") { mkdirSync(dirname(policyPath), { recursive: true }); writeFileSync(policyPath, "{}\n"); }
-		const result = await controller.execute(`explicit-${selector}`, { operation: "start", input: JSON.stringify(selector === "policyPath" ? { mode: "ordinary", policyPath: ".gentle-ai/policies/alternate.json" } : { mode: "ordinary", baseRef: "refs/heads/main" }) }, undefined, undefined, context(cwd));
+		const result = await controller.execute(`explicit-${selector}`, { operation: "start", input: JSON.stringify(selector === "policyPath" ? { mode: "ordinary", policyPath: ".gentle-ai/policies/alternate.json" } : { mode: "ordinary", baseRef: "refs/heads/main", committedOnly: true }) }, undefined, undefined, context(cwd));
 		assert.equal(requests.length, 1);
 		assert.equal((result.details as { result: { action: string } }).result.action, "blocked-scope-action");
-		assert.equal(selector === "policyPath" ? requests[0]?.policyPath : requests[0]?.baseRef, selector === "policyPath" ? policyPath : "refs/heads/main");
+		assert.equal(selector === "policyPath" ? requests[0]?.policyPath : requests[0]?.baseRef, selector === "policyPath" ? policyPath : git(cwd, "rev-parse", "refs/heads/main"));
+		if (selector === "baseRef") assert.equal(requests[0]?.committedOnly, true);
 	}
 });
 
@@ -1150,7 +1414,10 @@ test("native ordinary START fails closed for a matching correction-required comp
 		operation: "start",
 		status: "blocked",
 		outcome: "compact-authority-nonterminal",
+		lineage_created: false,
 		mutation_performed: false,
+		mutation_outcome: "none",
+		reset_eligible: false,
 		next_action: "stop-and-resolve-existing-compact-authority",
 		lineage_ids: ["matching-correction-required"],
 	});
@@ -1669,6 +1936,74 @@ test("native first pushes fail closed without a persisted explicit advertised ba
 	});
 });
 
+function nativeReleaseEvidence(): Record<string, string> {
+	return {
+		release_configuration: "/evidence/release configuration.json",
+		release_generated: "/evidence/release generated.json",
+		release_provenance: "/evidence/release provenance.json",
+		release_publication_boundary: "/evidence/release publication-boundary.json",
+		release_evidence_freshness: "/evidence/release evidence-freshness.json",
+	};
+}
+
+test("native release validation forwards complete release evidence in contract order", async (t) => {
+	const cwd = repository(t);
+	addBareRemote(t, cwd, "origin");
+	const head = git(cwd, "rev-parse", "HEAD");
+	git(cwd, "-c", "user.name=Native Test", "-c", "user.email=native@example.invalid", "tag", "-a", "v2.1.5", "-m", "release", head);
+	const requests: Array<{ gate: string; flags?: readonly string[] }> = [];
+	const { controller } = runtime(fakeNative({ validate: async (request) => {
+		requests.push(request);
+		const gateContext = nativeGateContext();
+		gateContext.raw.gate = "release";
+		return { allowed: true, result: "allow", action: "continue", reason: "ok", gateContext };
+	} }));
+	const result = await controller.execute("release-artifacts", {
+		operation: "validate",
+		lineageId: "native-lineage",
+		idempotencyKey: "release-artifacts",
+		command: "gh release create v2.1.5",
+		input: JSON.stringify({ nativeRelease: nativeReleaseEvidence() }),
+	}, undefined, undefined, context(cwd));
+	assert.notEqual((result.details as { authorization?: unknown }).authorization, undefined);
+	assert.equal(requests[0]?.gate, "release");
+	assert.deepEqual(requests[0]?.flags, [
+			"--release-configuration", "/evidence/release configuration.json",
+			"--release-generated", "/evidence/release generated.json",
+			"--release-provenance", "/evidence/release provenance.json",
+			"--release-publication-boundary", "/evidence/release publication-boundary.json",
+			"--release-evidence-freshness", "/evidence/release evidence-freshness.json",
+		],
+	);
+});
+
+test("native tag-only first publication uses the release gate with complete evidence", async (t) => {
+	const cwd = repository(t);
+	const origin = addBareRemote(t, cwd, "origin");
+	const head = git(cwd, "rev-parse", "HEAD");
+	git(cwd, "-c", "user.name=Native Test", "-c", "user.email=native@example.invalid", "tag", "-a", "v2.1.5", "-m", "release", head);
+	git(cwd, "config", "branch.main.pushRemote", "origin");
+	const requests: Array<{ gate: string; flags?: readonly string[] }> = [];
+	const { controller, toolCall } = runtime(fakeNative({ validate: async (request) => {
+		requests.push(request);
+		const gateContext = nativeGateContext();
+		gateContext.raw.gate = "release";
+		return { allowed: true, result: "allow", action: "continue", reason: "ok", gateContext };
+	} }), queuedPublicationProbe({ [`${origin} refs/heads/main`]: head }));
+	const command = "git push origin v2.1.5";
+	const result = await controller.execute("tag-first-publication", {
+		operation: "validate",
+		lineageId: "native-lineage",
+		idempotencyKey: "tag-first-publication",
+		command,
+		input: JSON.stringify({ nativeRelease: nativeReleaseEvidence() }),
+	}, undefined, undefined, context(cwd));
+	assert.notEqual((result.details as { authorization?: unknown }).authorization, undefined);
+	assert.equal(await toolCall({ toolName: "bash", input: { command } }, interactiveContext(cwd)), undefined);
+	assert.equal(requests.length, 2);
+	assert.equal(requests.every((request) => request.gate === "release"), true);
+});
+
 test("native pre-PR command binding detects push destination movement before bash-time revalidation", async (t) => {
 	for (const movement of ["pushurl", "pushRemote"] as const) {
 		await t.test(movement, async (t) => {
@@ -2171,6 +2506,114 @@ test("native deny, target drift, and bash-time errors never restore an authoriza
 	assert.equal((failure.details as { authorization?: unknown }).authorization, undefined);
 });
 
+test("maintainer release exception is native-first, exact, interactive, and one-shot", async (t) => {
+	const cwd = repository(t);
+	const origin = addBareRemote(t, cwd, "origin");
+	const head = git(cwd, "rev-parse", "HEAD");
+	git(cwd, "-c", "user.name=Native Test", "-c", "user.email=native@example.invalid", "tag", "-a", "v2.1.5", "-m", "release", head);
+	const command = "git push origin v2.1.5";
+	const denied = (result: "invalidated" | "scope-changed" | "escalated" = "invalidated", action = "explicit-maintainer-action") => fakeNative({ validate: async () => {
+		const gateContext = nativeGateContext();
+		gateContext.raw.gate = "release";
+		return { allowed: false, result, action, reason: "release provenance predicate failed", gateContext };
+	} });
+	const evidence = nativeReleaseEvidence();
+	const { controller, toolCall } = runtime(denied(), queuedPublicationProbe({ [`${origin} refs/heads/main`]: head }));
+	const first = await controller.execute("exception-first", { operation: "validate", lineageId: "native-lineage", idempotencyKey: "exception", command, input: JSON.stringify({ nativeRelease: evidence }) }, undefined, undefined, context(cwd));
+	const firstDetails = first.details as Record<string, unknown>;
+	const request = firstDetails.maintainer_exception_request as Record<string, unknown>;
+	assert.equal((firstDetails.result as Record<string, unknown>).result, "invalidated");
+	assert.equal(typeof request.request_hash, "string");
+	assert.match(String(request.challenge), /^AUTHORIZE RELEASE EXCEPTION /);
+	assert.equal((firstDetails as { authorization?: unknown }).authorization, undefined);
+
+	const accepted = { ...request, reason: "v2.1.5 incident acknowledged", accepted_predicates: request.failed_predicates };
+	for (const [name, exception] of [
+		["headless", accepted],
+		["wrong-hash", { ...accepted, request_hash: "wrong" }],
+		["wrong-challenge", { ...accepted, challenge: "wrong" }],
+	] as const) {
+		const rejected = await controller.execute(name, { operation: "validate", lineageId: "native-lineage", idempotencyKey: name, command, input: JSON.stringify({ nativeRelease: evidence, maintainer_exception: exception }) }, undefined, undefined, context(cwd));
+		assert.equal((rejected.details as Record<string, unknown>).exception_authorized, false, name);
+		assert.equal(((rejected.details as Record<string, unknown>).result as Record<string, unknown>).result, "invalidated", name);
+	}
+	const uiDenied = await controller.execute("exception-ui-denied", { operation: "validate", lineageId: "native-lineage", idempotencyKey: "ui-denied", command, input: JSON.stringify({ nativeRelease: evidence, maintainer_exception: accepted }) }, undefined, undefined, { ...interactiveContext(cwd), ui: { confirm: async () => false } } as ExtensionContext);
+	assert.equal((uiDenied.details as Record<string, unknown>).exception_authorized, false);
+	const authorized = await controller.execute("exception-accepted", { operation: "validate", lineageId: "native-lineage", idempotencyKey: "accepted", command, input: JSON.stringify({ nativeRelease: evidence, maintainer_exception: accepted }) }, undefined, undefined, interactiveContext(cwd));
+	assert.equal((authorized.details as Record<string, unknown>).exception_authorized, false);
+	assert.equal((await toolCall({ toolName: "bash", input: { command } }, interactiveContext(cwd)) as { block: boolean }).block, true);
+
+	for (const [result, action] of [["scope-changed", "create-new-lineage"], ["escalated", "stop"]] as const) {
+		const ineligible = runtime(denied(result, action), queuedPublicationProbe({ [`${origin} refs/heads/main`]: head }));
+		const response = await ineligible.controller.execute(result, { operation: "validate", lineageId: "native-lineage", idempotencyKey: result, command, input: JSON.stringify({ nativeRelease: evidence }) }, undefined, undefined, interactiveContext(cwd));
+		assert.equal((response.details as Record<string, unknown>).maintainer_exception_request, undefined);
+	}
+});
+
+test("release exception stale bindings and audit evidence fail closed", async (t) => {
+	const setup = (t: test.TestContext) => {
+		const cwd = repository(t);
+		const origin = addBareRemote(t, cwd, "origin");
+		const head = git(cwd, "rev-parse", "HEAD");
+		git(cwd, "-c", "user.name=Native Test", "-c", "user.email=native@example.invalid", "tag", "-a", "v2.1.5", "-m", "release", head);
+		const rows: Record<string, string> = { [`${origin} refs/heads/main`]: head };
+		const { controller, toolCall } = runtime(fakeNative({ validate: async () => {
+			const gateContext = nativeGateContext();
+			gateContext.raw.gate = "release";
+			return { allowed: false, result: "invalidated", action: "explicit-maintainer-action", reason: "release provenance predicate failed", gateContext };
+		} }), queuedPublicationProbe(rows));
+		const command = "git push origin v2.1.5";
+		const request = async () => {
+			const response = await controller.execute("request", { operation: "validate", lineageId: "native-lineage", idempotencyKey: "request", command, input: JSON.stringify({ nativeRelease: nativeReleaseEvidence() }) }, undefined, undefined, context(cwd));
+			return (response.details as Record<string, unknown>).maintainer_exception_request as Record<string, unknown>;
+		};
+		const accept = (request: Record<string, unknown>) => ({ ...request, reason: "incident acknowledged", accepted_predicates: request.failed_predicates });
+		const authorize = async (request: Record<string, unknown>, evidence = nativeReleaseEvidence()) => await controller.execute("authorize", { operation: "validate", lineageId: "native-lineage", idempotencyKey: "authorize", command, input: JSON.stringify({ nativeRelease: evidence, maintainer_exception: accept(request) }) }, undefined, undefined, interactiveContext(cwd));
+		return { cwd, origin, head, rows, controller, toolCall, command, request, authorize };
+	};
+
+	await t.test("response audit is explicitly non-durable and complete", async (t) => {
+		const fixture = setup(t);
+		const request = await fixture.request();
+		const audit = (request as { audit?: Record<string, unknown> }).audit!;
+		assert.equal(audit.durable_audit, false);
+		assert.equal(audit.command, fixture.command);
+		assert.deepEqual(audit.target, request.target);
+		assert.deepEqual(audit.native_denial, request.native_denial);
+		assert.equal(audit.request_hash, request.request_hash);
+		assert.deepEqual(audit.accepted_predicates, request.accepted_predicates);
+	});
+
+	await t.test("origin/main, tag object, and peeled target movement deny stale authorization", async (t) => {
+		for (const movement of ["remote", "tag-object", "peeled-target"] as const) await t.test(movement, async (t) => {
+			const fixture = setup(t);
+			const request = await fixture.request();
+			await fixture.authorize(request);
+			if (movement === "remote") {
+				const next = git(fixture.cwd, "-c", "user.name=Native Test", "-c", "user.email=native@example.invalid", "--git-dir", fixture.origin, "commit-tree", `${fixture.head}^{tree}`, "-m", "advance");
+				git(fixture.cwd, "--git-dir", fixture.origin, "update-ref", "refs/heads/main", next);
+				fixture.rows[`${fixture.origin} refs/heads/main`] = next;
+			} else if (movement === "tag-object") {
+				git(fixture.cwd, "-c", "user.name=Native Test", "-c", "user.email=native@example.invalid", "tag", "-fa", "v2.1.5", "-m", "moved object", fixture.head);
+			} else {
+				const next = git(fixture.cwd, "-c", "user.name=Native Test", "-c", "user.email=native@example.invalid", "commit-tree", `${fixture.head}^{tree}`, "-m", "moved target");
+				git(fixture.cwd, "-c", "user.name=Native Test", "-c", "user.email=native@example.invalid", "tag", "-fa", "v2.1.5", "-m", "moved target", next);
+			}
+			assert.equal((await fixture.toolCall({ toolName: "bash", input: { command: fixture.command } }, interactiveContext(fixture.cwd)) as { block: boolean }).block, true);
+		});
+	});
+
+	await t.test("changed evidence and ordinary branch create cannot request an exception", async (t) => {
+		const fixture = setup(t);
+		const request = await fixture.request();
+		const changed = { ...nativeReleaseEvidence(), release_generated: "/evidence/changed.json" };
+		const stale = await fixture.authorize(request, changed);
+		assert.equal((stale.details as Record<string, unknown>).exception_authorized, false);
+		const branch = await fixture.controller.execute("branch", { operation: "validate", lineageId: "native-lineage", idempotencyKey: "branch", command: "git push origin main:refs/heads/release", input: "{}" }, undefined, undefined, interactiveContext(fixture.cwd));
+		assert.equal((branch.details as Record<string, unknown>).maintainer_exception_request, undefined);
+	});
+});
+
 test("controller exposes every structured native denial recovery action from exit code 1", async (t) => {
 	const cwd = repository(t);
 	const published = JSON.parse(readFileSync(join(import.meta.dirname, "fixtures", "native-review-cli", "v2.1.3", "validate-deny.json"), "utf8")) as Record<string, unknown>;
@@ -2262,8 +2705,9 @@ test("parallel 4R dispatch receives one compact changed scope and blocks oversiz
 	assert.ok(Buffer.byteLength(dispatch.task, "utf8") <= 4_096 + "Review compact scope".length);
 	writeFileSync(join(cwd, "app.ts"), "export const value = 3;\n");
 	const divergentDispatch = { agents: [...lenses], task: "Review compact scope", mode: "task" };
-	assert.equal(await toolCall({ toolName: "subagent_run", input: divergentDispatch }, context(cwd)), undefined);
-	assert.equal(divergentDispatch.task, dispatch.task, "parallel actors retain byte-identical frozen scope after live contributor divergence");
+	const rejectedDrift = await toolCall({ toolName: "subagent_run", input: divergentDispatch }, context(cwd)) as { block?: boolean };
+	assert.equal(rejectedDrift.block, true, "live candidate drift blocks all actors before old candidate bytes can be injected");
+	assert.equal(divergentDispatch.task, "Review compact scope");
 	candidateViews.resolveForLens("c4-compact", "review-risk").cleanup();
 
 	for (let index = 0; index < 80; index += 1) {
@@ -2277,4 +2721,390 @@ test("parallel 4R dispatch receives one compact changed scope and blocks oversiz
 	const rejected = await oversized.toolCall({ toolName: "subagent_run", input: { agent: "review-reliability", task: "Review oversized scope", mode: "task" } }, context(cwd)) as { block?: boolean };
 	assert.equal(rejected.block, true, "oversized scope blocks before an actor can launch");
 	oversizedViews.resolveForLens("c4-oversized", "review-reliability").cleanup();
+});
+
+test("INSPECT maps complete native status inventory without reconstructing native authority and fails closed otherwise", async (t) => {
+	const cwd = repository(t);
+	let mutations = 0;
+	const nativeStatus = (status: string, complete = true, authoritative = true, locks: readonly unknown[] = []) => ({
+		schema: "gentle-ai.review-authority-status/v1",
+		repository: cwd,
+		complete,
+		authoritative,
+		status,
+		entries: [],
+		locks,
+		diagnostics: [],
+		raw: { schema: "gentle-ai.review-authority-status/v1", operation: "review/status", status, complete, authoritative, entries: [], locks, diagnostics: [] },
+	});
+	for (const scenario of [
+		{ name: "clean", native: nativeStatus("clean"), expectedStatus: "ready", inventoryComplete: true, nextAction: "start-native-authoritative" },
+		{ name: "active", native: nativeStatus("active"), expectedStatus: "in-progress", inventoryComplete: true, nextAction: "finalize-existing-native-review" },
+		{ name: "approved", native: nativeStatus("approved"), expectedStatus: "blocked", inventoryComplete: true, nextAction: "use-compatible-read-or-gate-route" },
+		{ name: "escalated", native: nativeStatus("escalated"), expectedStatus: "blocked", inventoryComplete: true, nextAction: "stop-and-report-escalated-native-authority" },
+		{ name: "reset", native: nativeStatus("reset-in-progress"), expectedStatus: "blocked", inventoryComplete: true, nextAction: "recover-native-reset" },
+		{ name: "mixed", native: nativeStatus("same-lineage-mixed-collision", false, false), expectedStatus: "blocked", inventoryComplete: false, nextAction: "require-complete-native-authority-inventory" },
+		{ name: "lock", native: nativeStatus("clean", true, true, [{ version: "compact-v2", path: "C:\\repo\\.git\\gentle-ai\\LOCK", status: "owned", owner: { schema: "gentle-ai.review-store-lock/v1", owner_id: "owner", pid: 1, host: "host", acquired_at: "2026-07-14T00:00:00Z" } }]), expectedStatus: "blocked", inventoryComplete: true, nextAction: "wait-for-native-lock-release" },
+		{ name: "invalid", native: nativeStatus("invalid", true, false), expectedStatus: "blocked", inventoryComplete: false, nextAction: "require-complete-native-authority-inventory" },
+		{ name: "incomplete", native: nativeStatus("invalid", false, false), expectedStatus: "blocked", inventoryComplete: false, nextAction: "require-complete-native-authority-inventory" },
+	] as const) {
+		const { controller } = runtime(fakeNative({
+			reviewStatus: async () => scenario.native,
+			start: async () => { mutations += 1; throw new Error("INSPECT must not mutate"); },
+			finalize: async () => { mutations += 1; throw new Error("INSPECT must not mutate"); },
+		}) as Partial<NativeReviewCli>);
+		const response = await controller.execute(`native-status-${scenario.name}`, { operation: "inspect" }, undefined, undefined, context(cwd));
+		const details = response.details as Record<string, unknown>;
+		assert.equal(details.status, scenario.expectedStatus, scenario.name);
+		assert.equal(details.inventory_complete, scenario.inventoryComplete, scenario.name);
+		assert.equal(details.next_action, scenario.nextAction, scenario.name);
+		assert.equal((details.evidence as Record<string, unknown>).native_status, scenario.name === "reset" ? "reset-in-progress" : scenario.name === "mixed" ? "same-lineage-mixed-collision" : scenario.name === "lock" ? "clean" : scenario.name === "incomplete" ? "invalid" : scenario.name);
+	}
+	assert.equal(mutations, 0);
+});
+
+test("native remediation classification accepts only invalid legacy, compact, collision, or reset evidence", () => {
+	const status = (authorityStatus: NativeReviewStatusResult["status"], entries: NativeReviewStatusResult["entries"]): NativeReviewStatusResult => ({
+		repository: "/repo",
+		complete: authorityStatus !== "invalid",
+		authoritative: authorityStatus !== "invalid",
+		status: authorityStatus,
+		entries,
+		locks: [],
+		diagnostics: [],
+		raw: {},
+	});
+	assert.equal(classifyNativeReviewRemediation(status("invalid", [{ version: "legacy-v1", lineageId: "current", path: "/repo/legacy", status: "invalid", problems: [] }]), ["current"]).kind, NATIVE_REVIEW_REMEDIATION.LEGACY);
+	assert.equal(classifyNativeReviewRemediation(status("invalid", [{ version: "compact-v2", lineageId: "current", path: "/repo/compact", status: "invalid", problems: [] }]), ["current"]).kind, NATIVE_REVIEW_REMEDIATION.INVALID_OR_MIXED);
+	assert.equal(classifyNativeReviewRemediation({ ...status("same-lineage-mixed-collision", []), complete: false, authoritative: false }, ["current"]).kind, NATIVE_REVIEW_REMEDIATION.NONE);
+	assert.equal(classifyNativeReviewRemediation(status("reset-in-progress", [])).kind, NATIVE_REVIEW_REMEDIATION.NONE);
+	assert.equal(classifyNativeReviewRemediation(status("invalid", [])).kind, NATIVE_REVIEW_REMEDIATION.NONE);
+	assert.equal(classifyNativeReviewRemediation({ ...status("invalid", [{ version: "legacy-v1", path: "/repo/legacy", status: "invalid", problems: [] }]), complete: true }).kind, NATIVE_REVIEW_REMEDIATION.NONE);
+	assert.equal(classifyNativeReviewRemediation(status("approved", [{ version: "legacy-v1", path: "/repo/legacy", status: "approved", problems: [] }])).kind, NATIVE_REVIEW_REMEDIATION.NONE);
+});
+
+test("native INSPECT exposes reset material only for exact applicable Pi corruption", async (t) => {
+	const compact = await import("../lib/review-facade.ts");
+	const nativeStatus = (cwd: string, entries: NativeReviewStatusResult["entries"]): NativeReviewStatusResult => ({
+		repository: cwd,
+		complete: false,
+		authoritative: false,
+		status: "invalid",
+		entries,
+		locks: [],
+		diagnostics: [],
+		raw: { schema: "gentle-ai.review-authority-status/v1", operation: "review/status", repository: cwd, complete: false, authoritative: false, status: "invalid", entries, locks: [], diagnostics: [] },
+	});
+	const invalidEntry = (cwd: string, lineageId?: string) => ({
+		version: "compact-v2" as const,
+		path: join(cwd, ".git", "gentle-ai", "compact-v2"),
+		status: "invalid" as const,
+		problems: ["malformed compact authority"],
+		...(lineageId === undefined ? {} : { lineageId }),
+	});
+
+	for (const scenario of [
+		{
+			name: "pre-lineage",
+			prepare: (_cwd: string) => undefined,
+			entries: (cwd: string) => [invalidEntry(cwd)],
+		},
+		{
+			name: "unknown",
+			prepare: (_cwd: string) => undefined,
+			entries: (_cwd: string) => [],
+		},
+		{
+			name: "unrelated",
+			prepare: (cwd: string) => compact.startCompactReview({ cwd, lineageId: "historical-lineage", policyHash: "a".repeat(64), projection: { kind: "complete" } }),
+			entries: (cwd: string) => [invalidEntry(cwd, "other-lineage")],
+		},
+	] as const) await t.test(scenario.name, async (child) => {
+		const cwd = repository(child);
+		scenario.prepare(cwd);
+		const { controller } = runtime(fakeNative({ reviewStatus: async () => nativeStatus(cwd, scenario.entries(cwd)) }));
+		const inspected = await controller.execute(`ineligible-${scenario.name}`, { operation: "inspect" }, undefined, undefined, context(cwd));
+		const details = inspected.details as Record<string, unknown>;
+		assert.equal(details.reset_eligible, false);
+		assertNoPublicResetRequest(details);
+		assertNoPublicDestructiveResetMaterial(details);
+	});
+
+	await t.test("exact Pi-owned legacy corruption exposes its existing reset request without native fabrication", async (child) => {
+		const cwd = repository(child);
+		const legacyPath = join(cwd, ".git", "gentle-ai", "reviews", "lineages", "legacy");
+		mkdirSync(legacyPath, { recursive: true });
+		writeFileSync(join(legacyPath, "authority.json"), "legacy\n");
+		let nativeStatuses = 0;
+		const { controller } = runtime(fakeNative({ reviewStatus: async () => {
+			nativeStatuses += 1;
+			return nativeStatus(cwd, []);
+		} }));
+		const inspected = await controller.execute("eligible-pi-corruption", { operation: "inspect" }, undefined, undefined, context(cwd));
+		const details = inspected.details as Record<string, unknown>;
+		assert.equal(details.reset_eligible, true);
+		assert.deepEqual((details.inspection as Record<string, unknown>).reset_request, compactResetRequestV1(cwd));
+		assert.equal(nativeStatuses, 0);
+	});
+
+	await t.test("Pi reset-in-progress remains RECOVER-only with its durable recovery request", async (child) => {
+		const cwd = repository(child);
+		const legacyPath = join(cwd, ".git", "gentle-ai", "reviews", "lineages", "legacy");
+		mkdirSync(legacyPath, { recursive: true });
+		writeFileSync(join(legacyPath, "authority.json"), "legacy\n");
+		const request = compactResetRequestV1(cwd);
+		assert.throws(
+			() => destructiveResetReviewAuthorityV1({ cwd, ...request, faultAfterPhase: "quarantining" }),
+			/injected/i,
+		);
+		const { controller } = runtime(fakeNative());
+		const inspected = await controller.execute("reset-in-progress", { operation: "inspect" }, undefined, undefined, context(cwd));
+		const details = inspected.details as Record<string, unknown>;
+		assert.equal(details.reset_eligible, false);
+		assert.equal(details.next_action, "request-explicit-reset-recovery-authorization");
+		assert.deepEqual((details.inspection as Record<string, unknown>).reset_request, request);
+	});
+
+	await t.test("applicable corruption remains read-only and exposes only the Pi reset material", async (child) => {
+		const cwd = repository(child);
+		const status = nativeStatus(cwd, [invalidEntry(cwd, "applicable-lineage")]);
+		const { controller } = runtime(fakeNative({ reviewStatus: async () => status }));
+		const inspected = await controller.execute("applicable-native-only", { operation: "inspect" }, undefined, undefined, context(cwd));
+		const details = inspected.details as Record<string, unknown>;
+		assert.equal(details.reset_eligible, false);
+		assertNoPublicResetRequest(details);
+	});
+});
+
+test("native invalid inventory authorizes only RESET remediation while unrelated or identity-mismatched history remains fail-closed", async (t) => {
+	const compact = await import("../lib/review-facade.ts");
+	const nativeStatus = (cwd: string, status: string, complete: boolean, authoritative: boolean, entries: readonly Record<string, unknown>[]) => ({
+		repository: cwd,
+		complete,
+		authoritative,
+		status,
+		entries,
+		locks: [],
+		diagnostics: [],
+		raw: { schema: "gentle-ai.review-authority-status/v1", operation: "review/status", repository: cwd, complete, authoritative, status, entries, locks: [], diagnostics: [] },
+	});
+	const unrelatedHistory = (cwd: string) => {
+		compact.startCompactReview({ cwd, lineageId: "unrelated-history", policyHash: "a".repeat(64), projection: { kind: "complete" } });
+		writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	};
+	const invalidLegacy = (cwd: string) => nativeStatus(cwd, "invalid", false, false, [{ version: "legacy-v1", path: join(cwd, ".git", "gentle-ai", "reviews", "legacy"), status: "invalid", problems: ["malformed legacy authority"] }]);
+
+	await t.test("a freshly clean empty native inventory reaches START", async (t) => {
+		const cwd = repository(t);
+		let statuses = 0;
+		let starts = 0;
+		const { controller } = runtime(fakeNative({
+			reviewStatus: async () => { statuses += 1; return nativeStatus(cwd, "clean", true, true, []); },
+			start: async () => { starts += 1; return { lineageId: "native-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: [], changedFiles: 0, changedLines: 0, correctionBudget: 0, action: "created", lensesRequired: false }; },
+		}));
+		const started = await controller.execute("native-clean-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+		assert.equal((started.details as { result?: { lineage_id?: string } }).result?.lineage_id, "native-lineage");
+		assert.equal(statuses, 1);
+		assert.equal(starts, 1);
+	});
+
+	await t.test("invalid/incomplete unrelated multi-store inventory delegates one native START and preserves no-reset evidence", async (t) => {
+		const cwd = repository(t);
+		unrelatedHistory(cwd);
+		const status = nativeStatus(cwd, "invalid", false, false, [
+			{ version: "legacy-v1", lineageId: "foreign-legacy", path: join(cwd, ".git", "gentle-ai", "reviews", "foreign-legacy"), status: "invalid", problems: ["malformed legacy authority"] },
+			{ version: "compact-v2", lineageId: "foreign-compact", path: join(cwd, ".git", "gentle-ai", "compact-v2", "foreign-compact"), status: "invalid", problems: ["malformed compact authority"] },
+		]);
+		let starts = 0;
+		const diagnostics = { operation: NATIVE_REVIEW_OPERATION.START, error_code: NATIVE_REVIEW_ERROR_CODE.NON_ZERO, exit_code: 1, timed_out: false, output_limit_exceeded: false, denial: { schema: "gentle-ai.review-gate-result/v1" as const, result: "invalidated" as const, action: "pre-lineage-denial", reason: "native target has no applicable lineage", denial: { stage: "authority", code: "unrelated-history" } } };
+		const { controller } = runtime(fakeNative({
+			reviewStatus: async () => status,
+			start: async () => {
+				starts += 1;
+				throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, NATIVE_REVIEW_OPERATION.START, true, false, "native pre-lineage denial", diagnostics);
+			},
+		}));
+		const inspected = await controller.execute("native-unrelated-inspect", { operation: "inspect" }, undefined, undefined, context(cwd));
+		const inspectionDetails = inspected.details as Record<string, unknown>;
+		assert.equal(inspectionDetails.reset_eligible, false);
+		assertNoPublicResetRequest(inspectionDetails);
+		const started = await controller.execute("native-unrelated-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+		assert.equal(starts, 1);
+		assert.deepEqual(started.details, {
+			operation: "start",
+			status: "blocked",
+			outcome: "native-operation-failed",
+			lineage_created: false,
+			mutation_performed: false,
+			mutation_outcome: "none",
+			reset_eligible: false,
+			diagnostics,
+			next_action: "resolve-native-operation-failure",
+		});
+		assertNoPublicResetRequest(started.details);
+
+		for (const [name, failure] of [
+			["unproven-invocation", () => new Error("native START output was lost")],
+			["decoder-rejection", () => new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE, NATIVE_REVIEW_OPERATION.START, true, true, "native START decoder rejected the response")],
+		] as const) await t.test(name, async () => {
+			let failedStarts = 0;
+			const { controller: failingController } = runtime(fakeNative({
+				reviewStatus: async () => status,
+				start: async () => {
+					failedStarts += 1;
+					throw failure();
+				},
+			}));
+			const failed = await failingController.execute(`native-${name}-start`, { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+			const failureDetails = failed.details as Record<string, unknown>;
+			assert.equal(failedStarts, 1);
+			assert.equal(failureDetails.lineage_created, undefined);
+			assert.equal(failureDetails.mutation_outcome, "unknown");
+			assert.equal(failureDetails.next_action, "replay-exact-native-operation");
+			assertNoPublicResetRequest(failureDetails);
+		});
+	});
+
+	await t.test("unknown, ambiguous, and applicable current authority block before native START", async (t) => {
+		const controls = [
+			{
+				name: "unknown",
+				prepare: (cwd: string) => compact.startCompactReview({ cwd, lineageId: "unknown-current", policyHash: "a".repeat(64), projection: { kind: "complete" } }),
+				status: (cwd: string) => nativeStatus(cwd, "invalid", false, false, []),
+			},
+			{
+				name: "ambiguous",
+				prepare: (cwd: string) => {
+					compact.startCompactReview({ cwd, lineageId: "ambiguous-one", policyHash: "a".repeat(64), projection: { kind: "complete" } });
+					compact.startCompactReview({ cwd, lineageId: "ambiguous-two", policyHash: "a".repeat(64), projection: { kind: "complete" } });
+				},
+				status: (cwd: string) => nativeStatus(cwd, "invalid", false, false, []),
+			},
+			{
+				name: "applicable",
+				prepare: (cwd: string) => compact.startCompactReview({ cwd, lineageId: "applicable-current", policyHash: "a".repeat(64), projection: { kind: "complete" } }),
+				status: (cwd: string) => nativeStatus(cwd, "invalid", false, false, [{ version: "compact-v2", lineageId: "applicable-current", path: join(cwd, ".git", "gentle-ai", "compact-v2", "applicable-current"), status: "invalid", problems: ["malformed current authority"] }]),
+			},
+		] as const;
+		for (const control of controls) await t.test(control.name, async (child) => {
+			const cwd = repository(child);
+			control.prepare(cwd);
+			let starts = 0;
+			const { controller } = runtime(fakeNative({
+				reviewStatus: async () => control.status(cwd),
+				start: async () => {
+					starts += 1;
+					return { lineageId: "must-not-start", state: "reviewing", riskLevel: "medium", selectedLenses: [], changedFiles: 0, changedLines: 0, correctionBudget: 0, action: "created", lensesRequired: false };
+				},
+			}));
+			const started = await controller.execute(`native-${control.name}-start`, { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+			assert.equal((started.details as Record<string, unknown>).status, "blocked");
+			assert.equal(starts, 0);
+			assertNoPublicResetRequest(started.details);
+		});
+	});
+
+	await t.test("unrelated valid native history does not authorize RESET", async (t) => {
+		const cwd = repository(t);
+		unrelatedHistory(cwd);
+		const { controller } = runtime(fakeNative({
+			reviewStatus: async () => nativeStatus(cwd, "approved", true, true, [{ version: "legacy-v1", path: join(cwd, ".git", "gentle-ai", "reviews", "legacy"), status: "approved", problems: [] }]),
+		}));
+		const inspected = await controller.execute("native-valid-inspect", { operation: "inspect" }, undefined, undefined, context(cwd));
+		const inspectionDetails = inspected.details as Record<string, unknown>;
+		assert.equal(inspectionDetails.reset_eligible, false);
+		assertNoPublicResetRequest(inspectionDetails);
+		const reset = await controller.execute("native-valid-reset", { operation: "reset", input: JSON.stringify(compactResetRequestV1(cwd)) }, undefined, undefined, interactiveContext(cwd));
+		assert.deepEqual(reset.details, {
+			operation: "reset",
+			status: "blocked",
+			outcome: "native-reset-not-eligible",
+			lineage_created: false,
+			mutation_performed: false,
+			mutation_outcome: "none",
+			next_action: "resolve-native-authority-without-destroy",
+			evidence: { native_status: "approved", authority_applicability: "unrelated-history" },
+		});
+	});
+
+	await t.test("native repository identity mismatch cannot authorize RESET", async (t) => {
+		const cwd = repository(t);
+		unrelatedHistory(cwd);
+		const { controller } = runtime(fakeNative({
+			reviewStatus: async () => { throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.STATUS, true, false, "native repository mismatch"); },
+		}));
+		const request = compactResetRequestV1(cwd);
+		const reset = await controller.execute("native-identity-reset", { operation: "reset", input: JSON.stringify(request) }, undefined, undefined, interactiveContext(cwd));
+		assert.equal((reset.details as Record<string, unknown>).status, "blocked");
+		assert.equal((reset.details as Record<string, unknown>).outcome, "native-operation-failed");
+	});
+});
+
+test("applicable native corruption without Pi corruption fails typed and never invokes a native mutation", async (t) => {
+	const cwd = repository(t);
+	const compact = await import("../lib/review-facade.ts");
+	compact.startCompactReview({ cwd, lineageId: "pi-current", policyHash: "a".repeat(64), projection: { kind: "complete" } });
+	let statusCalls = 0;
+	const { controller } = runtime(fakeNative({ reviewStatus: async () => {
+		statusCalls += 1;
+		return {
+			repository: cwd, complete: false, authoritative: false, status: "invalid",
+			entries: [{ version: "compact-v2", lineageId: "pi-current", path: join(cwd, ".git", "gentle-ai", "review-transactions"), status: "invalid", problems: ["native corruption"] }],
+			locks: [], diagnostics: [], raw: {},
+		};
+	} }));
+	const result = await controller.execute("native-only-corruption", { operation: "reset", input: JSON.stringify(compactResetRequestV1(cwd)) }, undefined, undefined, interactiveContext(cwd));
+	assert.equal((result.details as { outcome?: string }).outcome, "native-authority-remediation-unavailable");
+	assert.equal(statusCalls, 1);
+});
+
+test("independent-verification routing matrix names every native authority contract", () => {
+	const rows = [
+		"1 status unsupported/pre-START => no lineage/no reset",
+		"2 valid unrelated compact history => reaches native START",
+		"3 invalid/incomplete unrelated native stores + one pre-lineage START denial => diagnostics/no reset",
+		"4 BIND-SDD native failure => diagnostics",
+		"5 successful START then decoder rejection => unknown/exact replay",
+		"6 invalid historical inventory + Pi clean/unrelated => reset_eligible:false",
+		"7 applicable corrupt lineage => exact fresh reset request",
+		"8 FINALIZE failure existing lineage => unknown/replay/diagnostics",
+		"9 stale/foreign challenge => zero mutation",
+		"10 reset-in-progress => RECOVER-only/zero destructive calls",
+	] as const;
+	assert.deepEqual(rows, [...new Set(rows)]);
+	assert.equal(rows.length, 10);
+	for (const row of rows) assert.match(row, /^\d+ /);
+});
+
+test("native RESET preflight table rejects every non-corrupt native authority before Pi mutation", async (t) => {
+	const rows = [
+		{ name: "unknown/incomplete", status: "invalid" as const, complete: false, authoritative: false, outcome: "native-reset-not-eligible" },
+		{ name: "unrelated/clean", status: "clean" as const, complete: true, authoritative: true, outcome: "native-reset-not-eligible" },
+		{ name: "active", status: "active" as const, complete: true, authoritative: true, outcome: "native-reset-not-eligible" },
+		{ name: "approved", status: "approved" as const, complete: true, authoritative: true, outcome: "native-reset-not-eligible" },
+		{ name: "reset-in-progress RECOVER-only", status: "reset-in-progress" as const, complete: true, authoritative: true, outcome: "native-authority-reset-in-progress" },
+		{ name: "superseded", status: "superseded" as const, complete: true, authoritative: true, outcome: "native-reset-not-eligible" },
+		{ name: "recovered", status: "recovered" as const, complete: true, authoritative: true, outcome: "native-reset-not-eligible" },
+	] as const;
+	for (const row of rows) await t.test(row.name, async (child) => {
+		const cwd = repository(child); let statusCalls = 0;
+		const native = fakeNative({ reviewStatus: async () => {
+			statusCalls += 1;
+			return {
+				repository: cwd,
+				complete: row.complete,
+				authoritative: row.authoritative,
+				status: row.status,
+				entries: [], locks: [], diagnostics: [],
+				raw: { schema: "gentle-ai.review-authority-status/v1", operation: "review/status", repository: cwd, complete: row.complete, authoritative: row.authoritative, status: row.status, entries: [], locks: [], diagnostics: [] },
+			};
+		} });
+		const { controller } = runtime(native);
+		const result = await controller.execute(`reset-${row.name}`, { operation: "reset", input: JSON.stringify(compactResetRequestV1(cwd)) }, undefined, undefined, interactiveContext(cwd));
+		const details = result.details as Record<string, unknown>;
+		assert.equal(details.outcome, row.outcome);
+		assert.equal(details.mutation_performed, false);
+		assert.equal(statusCalls, 1);
+		if (row.status === "reset-in-progress") assert.equal(details.next_action, "recover-native-reset");
+	});
 });

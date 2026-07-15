@@ -13,15 +13,15 @@ import {
 import { NativeReviewCliV213, createNativeReviewCli, type ExecFileAdapter } from "../lib/native-review-cli.ts";
 import { resolveGentleAiReleaseAsset } from "../scripts/gentle-ai-installer.mjs";
 
-const VERSION = { stdout: "gentle-ai 2.1.4\n", stderr: "", exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false } as const;
+const VERSION = { stdout: "gentle-ai 2.1.5\n", stderr: "", exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false } as const;
 
 async function writeVerifiedBinary(packageRoot: string, platform = process.platform): Promise<string> {
 	const asset = resolveGentleAiReleaseAsset(platform, process.arch);
-	const binaryPath = join(packageRoot, ".gentle-ai", "v2.1.4", asset.executable);
-	await mkdir(join(packageRoot, ".gentle-ai", "v2.1.4"), { recursive: true });
-	await writeFile(binaryPath, "native");
+	const binaryPath = join(packageRoot, ".gentle-ai", "v2.1.5", asset.executable);
+	await mkdir(join(packageRoot, ".gentle-ai", "v2.1.5"), { recursive: true });
+	await writeFile(binaryPath, readFileSync(join(import.meta.dirname, "..", ".gentle-ai", "v2.1.5", asset.executable)));
 	if (platform !== "win32") await chmod(binaryPath, 0o700);
-	await writeFile(join(packageRoot, ".gentle-ai", "v2.1.4", "integrity.json"), `${JSON.stringify({ version: "2.1.4", asset: asset.name, assetSha256: asset.sha256, binarySha256: createHash("sha256").update("native").digest("hex") })}\n`);
+	await writeFile(join(packageRoot, ".gentle-ai", "v2.1.5", "integrity.json"), `${JSON.stringify({ version: "2.1.5", asset: asset.name, assetSha256: asset.sha256, binarySha256: asset.binarySha256 })}\n`);
 	return binaryPath;
 }
 
@@ -40,15 +40,15 @@ test("runtime resolves an absolute package-local binary path without PATH fallba
 test("runtime rejects an unverified binary, a symlinked manifest, and ambient executable injection", async () => {
 	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-binary-integrity-"));
 	const executable = process.platform === "win32" ? "gentle-ai.exe" : "gentle-ai";
-	const binaryPath = join(packageRoot, ".gentle-ai", "v2.1.4", executable);
-	const manifestPath = join(packageRoot, ".gentle-ai", "v2.1.4", "integrity.json");
-	await mkdir(join(packageRoot, ".gentle-ai", "v2.1.4"), { recursive: true });
+	const binaryPath = join(packageRoot, ".gentle-ai", "v2.1.5", executable);
+	const manifestPath = join(packageRoot, ".gentle-ai", "v2.1.5", "integrity.json");
+	await mkdir(join(packageRoot, ".gentle-ai", "v2.1.5"), { recursive: true });
 	await writeFile(binaryPath, "native");
 
 	assert.throws(() => resolveGentleAiBinary(packageRoot, process.platform), /package-local-binary-missing/);
 	const binarySha256 = createHash("sha256").update("native").digest("hex");
 	const manifestTarget = join(packageRoot, "manifest-target.json");
-	await writeFile(manifestTarget, `${JSON.stringify({ version: "2.1.4", asset: `gentle-ai_2.1.4_${process.platform}_${process.arch === "x64" ? "amd64" : process.arch}.tar.gz`, assetSha256: "a".repeat(64), binarySha256 })}\n`);
+	await writeFile(manifestTarget, `${JSON.stringify({ version: "2.1.5", asset: `gentle-ai_2.1.5_${process.platform}_${process.arch === "x64" ? "amd64" : process.arch}.tar.gz`, assetSha256: "a".repeat(64), binarySha256 })}\n`);
 	await symlink(manifestTarget, manifestPath);
 	assert.throws(() => resolveGentleAiBinary(packageRoot, process.platform), /package-local-binary-missing/);
 	assert.throws(() => new NativeReviewCliV213(async () => VERSION, "gentle-ai"), /absolute package-local executable/);
@@ -57,7 +57,7 @@ test("runtime rejects an unverified binary, a symlinked manifest, and ambient ex
 test("runtime rejects malformed, unknown, wrong, and symlinked integrity paths", async () => {
 	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-binary-manifest-"));
 	const binaryPath = await writeVerifiedBinary(packageRoot);
-	const manifestPath = join(packageRoot, ".gentle-ai", "v2.1.4", "integrity.json");
+	const manifestPath = join(packageRoot, ".gentle-ai", "v2.1.5", "integrity.json");
 	const valid = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, string>;
 	for (const manifest of [
 		"{",
@@ -80,6 +80,16 @@ test("runtime rejects malformed, unknown, wrong, and symlinked integrity paths",
 	const directoryRoot = await mkdtemp(join(tmpdir(), "gentle-pi-binary-directory-"));
 	await symlink(join(packageRoot, ".gentle-ai"), join(directoryRoot, ".gentle-ai"));
 	assert.throws(() => resolveGentleAiBinary(directoryRoot, process.platform), /package-local-binary-missing/);
+});
+
+test("runtime rejects an arbitrary binary even when a forged manifest matches its digest", async () => {
+	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-binary-forged-manifest-"));
+	const binaryPath = await writeVerifiedBinary(packageRoot);
+	const asset = resolveGentleAiReleaseAsset(process.platform, process.arch);
+	await writeFile(binaryPath, "arbitrary binary");
+	if (process.platform !== "win32") await chmod(binaryPath, 0o700);
+	await writeFile(join(packageRoot, ".gentle-ai", "v2.1.5", "integrity.json"), JSON.stringify({ version: "2.1.5", asset: asset.name, assetSha256: asset.sha256, binarySha256: createHash("sha256").update("arbitrary binary").digest("hex") }));
+	assert.throws(() => resolveGentleAiBinary(packageRoot, process.platform), /package-local-binary-missing/);
 });
 
 test("runtime rejects binary replacement during verification", async () => {
