@@ -141,8 +141,10 @@ import {
 	NATIVE_REVIEW_AUTHORITY_STATUS,
 	NATIVE_REVIEW_ERROR_CODE,
 	NATIVE_REVIEW_LOCK_STATUS,
+	sanitizeForeignNativeReviewDiagnostics,
 	type NativeReviewCli,
 	type NativeFinalizeResult,
+	type NativeReviewProcessDiagnostics,
 	type NativeStartResult,
 	type NativeReviewStatusResult,
 	type NativeValidateResult,
@@ -3597,7 +3599,7 @@ async function deriveNativePrePushBinding(
 }
 
 function commitIncludesAllTracked(arguments_: readonly string[]): boolean {
-	let includesAllTracked = false;
+	const includesAllTracked = false;
 	const booleanOptions = new Set([
 		"--all",
 		"--allow-empty",
@@ -4169,9 +4171,20 @@ function nativeStatusUnsupported(operation: ReviewControllerOperation): Record<s
 	};
 }
 
+// Bundled and source module instances can coexist, making instanceof insufficient.
+function asNativeReviewCliError(error: unknown): { code: string; diagnostics: NativeReviewProcessDiagnostics } | undefined {
+	if (error instanceof NativeReviewCliError) return error;
+	if (!(error instanceof Error) || error.name !== "NativeReviewCliError") return undefined;
+	const value = error as unknown as { code?: unknown; diagnostics?: unknown };
+	if (typeof value.code !== "string") return undefined;
+	const diagnostics = sanitizeForeignNativeReviewDiagnostics(value.diagnostics);
+	return diagnostics === undefined || value.code !== diagnostics.error_code ? undefined : { code: value.code, diagnostics };
+}
+
 function nativeStatusFailed(operation: ReviewControllerOperation, error: unknown): Record<string, unknown> {
-	if (error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE) return nativeStatusUnsupported(operation);
-	if (error instanceof NativeReviewCliError) {
+	const cliError = asNativeReviewCliError(error);
+	if (cliError?.code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE) return nativeStatusUnsupported(operation);
+	if (cliError !== undefined) {
 		return {
 			...nativeOperationFailure(operation, error),
 			outcome: "native-status-unavailable",
@@ -4207,7 +4220,7 @@ async function nativeResetRemediationPreflight(
 		const compact = classifyCompactAuthorityApplicability(cwd);
 		return { classification: classifyNativeReviewRemediation(status, compact.lineageIds), status };
 	} catch (error) {
-		if (error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE) return undefined;
+		if (asNativeReviewCliError(error)?.code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE) return undefined;
 		throw error;
 	}
 }
@@ -4609,8 +4622,9 @@ function nativeOperationFailure(operation: ReviewControllerOperation, error: unk
 		};
 	}
 	const mutationOutcome = value.mutationOutcome === "unknown" ? "unknown" : "none";
-	const diagnostics = error instanceof NativeReviewCliError
-		? error.diagnostics
+	const nativeDiagnostics = asNativeReviewCliError(error)?.diagnostics;
+	const diagnostics = nativeDiagnostics?.operation === `review/${operation}`
+		? nativeDiagnostics
 		: operation === REVIEW_CONTROLLER_OPERATION.START && error instanceof CandidateViewError && value.candidateViewPreNative === true
 			? { code: error.reason, message: "candidate view rejected before native START" }
 			: undefined;

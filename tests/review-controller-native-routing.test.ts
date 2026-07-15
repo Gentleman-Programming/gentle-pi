@@ -1108,6 +1108,35 @@ test("native START preserves a candidate-view diagnostic before native invocatio
 	assert.equal(starts, 0);
 });
 
+test("ambiguous native START failure preserves rebuilt sanitized diagnostics across duplicated module instances", async (t) => {
+	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-native-controller-"));
+	t.after(() => rmSync(cwd, { recursive: true, force: true }));
+	const diagnostics = { operation: "review/start", error_code: "timeout", exit_code: 1, timed_out: true, output_limit_exceeded: false, stderr: "projection stalled token=abc123" };
+	const foreignInstance = Object.assign(new Error("native process timed out"), { name: "NativeReviewCliError", code: "timeout", mutationOutcome: "unknown", nextAction: "replay-exact-native-operation", diagnostics });
+	const { controller } = runtime(fakeNative({ start: async () => { throw foreignInstance; } }));
+	const result = await controller.execute("start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	assert.deepEqual(result.details, { operation: "start", status: "blocked", outcome: "native-mutation-status-required", mutation_outcome: "unknown", diagnostics: { operation: "review/start", error_code: "timeout", exit_code: 1, timed_out: true, output_limit_exceeded: false, stderr: "projection stalled token=[REDACTED]" }, replayability: "status_required", next_action: "review.status", required_status_action: "Run target-scoped review.status and follow only its declared action; never start a new review, create a new budget, launch a lens, or fall back to inventory discovery." });
+});
+
+test("foreign errors with unrecognized diagnostics shapes stay diagnostics-free", async (t) => {
+	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-native-controller-"));
+	t.after(() => rmSync(cwd, { recursive: true, force: true }));
+	const malformedShapes: Record<string, unknown>[] = [
+		{ name: "NativeReviewCliError", code: "timeout", diagnostics: { operation: "review/start", error_code: "timeout", timed_out: "yes", output_limit_exceeded: false } },
+		{ name: "NativeReviewCliError", code: "timeout", diagnostics: { operation: "review/start", error_code: "timeout", timed_out: true, output_limit_exceeded: false, unexpected: "extra" } },
+		{ name: "NativeReviewCliError", code: "timeout", diagnostics: { operation: "not-an-operation", error_code: "timeout", timed_out: true, output_limit_exceeded: false } },
+		{ name: "NativeReviewCliError", code: "timeout", diagnostics: { operation: "review/finalize", error_code: "timeout", timed_out: true, output_limit_exceeded: false } },
+		{ name: "NativeReviewCliError", code: "version-incompatible", diagnostics: { operation: "review/start", error_code: "timeout", timed_out: true, output_limit_exceeded: false } },
+		{ code: "timeout", diagnostics: { stderr: "raw unsanitized output" } },
+	];
+	for (const shape of malformedShapes) {
+		const foreignError = Object.assign(new Error("boom"), { mutationOutcome: "unknown", ...shape });
+		const { controller } = runtime(fakeNative({ start: async () => { throw foreignError; } }));
+		const result = await controller.execute("start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+		assert.deepEqual(result.details, { operation: "start", status: "blocked", outcome: "native-mutation-status-required", mutation_outcome: "unknown", replayability: "status_required", next_action: "review.status", required_status_action: "Run target-scoped review.status and follow only its declared action; never start a new review, create a new budget, launch a lens, or fall back to inventory discovery." }, JSON.stringify(shape));
+	}
+});
+
 test("native START uses the default policy or a canonical safe policy path, and rejects unsafe policy inputs before native calls", async (t) => {
 	const cwd = repository(t);
 	const policyDirectory = join(cwd, ".gentle-ai", "policies");

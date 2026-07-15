@@ -377,6 +377,30 @@ function parseStructuredNativeDenial(stdout        )                            
 	} catch { return undefined; }
 }
 
+// Rebuild diagnostics from a duplicated module instance before facade output.
+export function sanitizeForeignNativeReviewDiagnostics(value         )                                             {
+	try {
+		const raw = exactObject(value, ["operation", "error_code", "timed_out", "output_limit_exceeded"], ["exit_code", "signal", "stderr", "denial"]);
+		const operation = enumString(raw.operation, Object.values(NATIVE_REVIEW_OPERATION))                         ;
+		const errorCode = enumString(raw.error_code, Object.values(NATIVE_REVIEW_ERROR_CODE))                         ;
+		const signal = raw.signal === undefined ? undefined : requiredString(raw.signal);
+		if (signal !== undefined && !/^SIG[A-Z0-9]{1,12}$/.test(signal)) return undefined;
+		return { operation, error_code: errorCode, ...(raw.exit_code === undefined ? {} : { exit_code: nonNegativeInteger(raw.exit_code) }), ...(signal === undefined ? {} : { signal: signal                   }), timed_out: booleanValue(raw.timed_out), output_limit_exceeded: booleanValue(raw.output_limit_exceeded), ...(raw.stderr === undefined ? {} : { stderr: sanitizeNativeDiagnosticText(stringValue(raw.stderr)) }), ...(raw.denial === undefined ? {} : { denial: sanitizeForeignStructuredDenial(raw.denial) }) };
+	} catch { return undefined; }
+}
+
+function sanitizeForeignStructuredDenial(value         )                               {
+	const parsed = exactObject(value, ["schema", "result", "action", "reason"], ["denial"]);
+	if (parsed.schema !== "gentle-ai.review-gate-result/v1") throw new Error("invalid denial schema");
+	const result = enumString(parsed.result, ["scope-changed", "invalidated", "escalated"]         )                                          ;
+	const action = sanitizeNativeDiagnosticText(requiredString(parsed.action), NATIVE_REVIEW_DENIAL_TEXT_LIMIT);
+	const reason = sanitizeNativeDiagnosticText(requiredString(parsed.reason), NATIVE_REVIEW_DENIAL_TEXT_LIMIT);
+	const expectedAction = { "scope-changed": "create-new-lineage", invalidated: "explicit-maintainer-action", escalated: "stop" }[result];
+	if (action !== expectedAction || !isCanonicalProcessString(action) || !isCanonicalProcessString(reason)) throw new Error("non-canonical denial evidence");
+	const denial = parsed.denial === undefined ? undefined : (() => { const nested = exactObject(parsed.denial, ["stage", "code"]); const stage = sanitizeNativeDiagnosticText(requiredString(nested.stage), NATIVE_REVIEW_DENIAL_TEXT_LIMIT); const code = sanitizeNativeDiagnosticText(requiredString(nested.code), NATIVE_REVIEW_DENIAL_TEXT_LIMIT); if (!isCanonicalProcessString(stage) || !isCanonicalProcessString(code)) throw new Error("non-canonical denial evidence"); return { stage, code }; })();
+	return { schema: "gentle-ai.review-gate-result/v1", result, action, reason, ...(denial === undefined ? {} : { denial }) };
+}
+
 function nativeProcessDiagnostics(operation                       , code                       , result                 )                                 {
 	return {
 		operation,
