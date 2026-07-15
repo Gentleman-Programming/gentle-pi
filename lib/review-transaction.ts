@@ -2452,7 +2452,38 @@ export interface ReleaseFastPathEvaluationV1 {
 	reason: string;
 }
 
-const RELEASE_SEMVER_TAG = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:[-+][0-9A-Za-z.+-]+)?$/;
+const SEMVER_NUMERIC_IDENTIFIER = "(?:0|[1-9]\\d*)";
+const SEMVER_PRERELEASE_IDENTIFIER = `(?:${SEMVER_NUMERIC_IDENTIFIER}|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)`;
+const SEMVER_BUILD_IDENTIFIER = "[0-9A-Za-z-]+";
+const RELEASE_SEMVER_TAG_SOURCE = `v(${SEMVER_NUMERIC_IDENTIFIER})\\.(${SEMVER_NUMERIC_IDENTIFIER})\\.(${SEMVER_NUMERIC_IDENTIFIER})(?:-${SEMVER_PRERELEASE_IDENTIFIER}(?:\\.${SEMVER_PRERELEASE_IDENTIFIER})*)?(?:\\+${SEMVER_BUILD_IDENTIFIER}(?:\\.${SEMVER_BUILD_IDENTIFIER})*)?`;
+const RELEASE_SEMVER_TAG = new RegExp(`^${RELEASE_SEMVER_TAG_SOURCE}$`);
+const RELEASE_FAST_PATH_TAG_REF = new RegExp(`^refs/tags/${RELEASE_SEMVER_TAG_SOURCE}$`);
+
+// A tag-create push is authorized as a release only through this narrow
+// projection. The caller retains the original PUSH target as the command
+// authorization identity; this projection is solely evaluator input.
+export function projectExactTagCreatePushAsReleaseV1(target: GateTargetV1): ReleaseGateTargetV1 | null {
+	if (target.kind !== GATE_TARGET_KIND.PUSH || target.remote !== "origin" || target.updates.length !== 1) return null;
+	const update = target.updates[0]!;
+	if (
+		update.kind !== PUSH_UPDATE_KIND.CREATE ||
+		update.old_object !== null ||
+		update.old_peeled_commit !== null ||
+		update.old_tree !== null ||
+		update.source_ref !== update.destination_ref ||
+		!RELEASE_FAST_PATH_TAG_REF.test(update.destination_ref) ||
+		!isObjectId(update.new_object) ||
+		!isObjectId(update.new_peeled_commit) ||
+		!isObjectId(update.new_tree)
+	) return null;
+	return {
+		kind: GATE_TARGET_KIND.RELEASE,
+		tag_ref: update.destination_ref,
+		tag_object: update.new_object,
+		peeled_commit: update.new_peeled_commit,
+		tree: update.new_tree,
+	};
+}
 
 export type GhCommandRunnerV1 = (
 	args: readonly string[],
@@ -2532,6 +2563,19 @@ function deriveReleaseCiStatusForShaV1(options: {
 	}
 	if (legacyResult.error || legacyResult.status !== 0 || legacyResult.stdout.trim() !== "success") return { proven: false, status: null };
 	return { proven: true, status: "success" };
+}
+
+export function recheckReleaseFastPathCiStatusV1(options: {
+	repositoryCwd: string;
+	sha: string;
+	expectedStatus: "success";
+}): { proven: boolean; status: string | null } {
+	const derived = deriveReleaseCiStatusForShaV1({
+		repositoryCwd: options.repositoryCwd,
+		sha: options.sha,
+		ghCommandRunner: releaseGhCommandRunnerForTesting ?? defaultGhCommandRunner,
+	});
+	return { proven: derived.proven && derived.status === options.expectedStatus, status: derived.status };
 }
 
 export function evaluateReleaseFastPathV1(options: {

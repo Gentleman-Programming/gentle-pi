@@ -108,6 +108,8 @@ import {
 	canonicalHash,
 	createReviewState,
 	evaluateReleaseFastPathV1,
+	projectExactTagCreatePushAsReleaseV1,
+	recheckReleaseFastPathCiStatusV1,
 	recheckReleaseFastPathRemoteHeadV1,
 	resolveConfiguredPushDestinationV1,
 	resolvePushDestinationRefV1,
@@ -2439,6 +2441,9 @@ interface ReleaseFastPathAuthorizationV1 {
 	remote: string;
 	protected_ref: string;
 	expected_remote_head: string;
+	expected_ci_revision: string;
+	expected_ci_status: "success";
+	push_destination_id?: string;
 }
 
 interface NativeReviewAuthorizationContext {
@@ -3806,6 +3811,41 @@ function derivePushTarget(command: ReviewLifecycleCommand, pinnedTarget?: PushGa
 		destination_id: remoteResolution.destination.destination_id,
 		updates: [update],
 	};
+}
+
+function isExactReleaseTagPushCommand(
+	command: ReviewLifecycleCommand,
+	target: GateTargetV1,
+): boolean {
+	if (target.kind !== GATE_TARGET_KIND.PUSH || target.updates.length !== 1 || command.arguments.length !== 2) return false;
+	const update = target.updates[0]!;
+	const [remote, refspec] = command.arguments;
+	return remote === target.remote && refspec === update.source_ref && update.source_ref === update.destination_ref;
+}
+
+function assertReleaseFastPathPushBinding(
+	cwd: string,
+	target: GateTargetV1,
+	evidenceRemote: string,
+	expectedDestinationId?: string,
+): string {
+	if (target.kind !== GATE_TARGET_KIND.PUSH || target.remote !== evidenceRemote) {
+		throw new Error("Release fast-path evidence remote must exactly match the tag push remote");
+	}
+	const destination = resolveConfiguredPushDestinationV1(cwd, target.remote);
+	if (destination.destination_id !== target.destination_id) {
+		throw new Error("Release fast-path push destination changed after command target derivation");
+	}
+	if (expectedDestinationId !== undefined && destination.destination_id !== expectedDestinationId) {
+		throw new Error("Release fast-path push destination changed after authorization");
+	}
+	const fetchUrl = remoteFetchUrl(cwd, target.remote);
+	const fetchIdentity = repositoryLocationIdentity(cwd, fetchUrl);
+	const pushIdentity = repositoryLocationIdentity(cwd, destination.url);
+	if (destination.url !== fetchUrl || pushIdentity !== fetchIdentity) {
+		throw new Error("Release fast-path requires the configured fetch URL and repository identity to exactly match the effective push destination");
+	}
+	return destination.destination_id;
 }
 
 function commandOptionValue(arguments_: readonly string[], names: readonly string[]): string {
@@ -5205,6 +5245,65 @@ async function executeReviewControllerOperation(
 		),
 	);
 	const derived = deriveReviewGateTarget(commandValue, defaultCwd);
+	let releaseFastPath: Record<string, unknown> | undefined;
+	if (input.release !== undefined) {
+		const releaseTarget = derived.command.event === "pre-release"
+			? derived.target
+			: derived.command.event === "pre-push" && isExactReleaseTagPushCommand(derived.command, derived.target)
+				? projectExactTagCreatePushAsReleaseV1(derived.target)
+				: null;
+		if (releaseTarget === null && derived.command.event !== "pre-push") {
+			throw new Error("Release fast-path evidence is only valid for a pre-release lifecycle command or one exact full semantic-version tag create refspec");
+		}
+		if (releaseTarget !== null) {
+		const pushDestinationId = derived.command.event === "pre-push"
+			? assertReleaseFastPathPushBinding(derived.command.cwd, derived.target, input.release.remote)
+			: undefined;
+		// The evaluator sees only the release identity projection. The pending
+		// authorization remains bound to the original PUSH target and command.
+		const evaluation = evaluateReleaseFastPathV1({
+			target: releaseTarget,
+			evidence: input.release,
+			repositoryCwd: derived.command.cwd,
+		});
+		releaseFastPath = {
+			eligible: evaluation.eligible,
+			remote_head: evaluation.remote_head,
+			reason: evaluation.reason,
+		};
+		if (evaluation.eligible && evaluation.remote_head !== null) {
+			const commandHash = reviewAuthorizationKey(commandValue, derived.command.cwd);
+			const targetHash = canonicalHash(derived.target);
+			const authorization: PendingReviewAuthorization = {
+				command_hash: commandHash,
+				target_hash: targetHash,
+				receipt_hash: null,
+				release_fast_path: {
+					remote: input.release.remote,
+					protected_ref: input.release.protected_ref,
+					expected_remote_head: evaluation.remote_head,
+					expected_ci_revision: evaluation.remote_head,
+					expected_ci_status: "success",
+					...(pushDestinationId === undefined ? {} : { push_destination_id: pushDestinationId }),
+				},
+			};
+			pendingAuthorizations.set(commandHash, authorization);
+			return {
+				operation: parameters.operation,
+				result: {
+					status: GATE_RESULT.ALLOW,
+					actor_count: 0,
+					target_hash: targetHash,
+					receipt_hash: null,
+					reason: evaluation.reason,
+				},
+				derived_target: derived.target,
+				release_fast_path: releaseFastPath,
+				authorization,
+			};
+		}
+		}
+	}
 	if (
 		nativeReviewCli !== null &&
 		typeof parameters.lineageId === "string" &&
@@ -5274,53 +5373,6 @@ async function executeReviewControllerOperation(
 			return response;
 		} catch (error) {
 			return nativePublicationFailure(parameters.operation, error);
-		}
-	}
-	let releaseFastPath: Record<string, unknown> | undefined;
-	if (input.release !== undefined) {
-		if (derived.command.event !== "pre-release") {
-			throw new Error("Release fast-path evidence is only valid for a pre-release lifecycle command");
-		}
-		// Release from protected `main` may bypass receipt validation only when
-		// every fast-path condition is proven against the remote; any failed or
-		// unprovable condition falls back to native receipt validation below.
-		const evaluation = evaluateReleaseFastPathV1({
-			target: derived.target,
-			evidence: input.release,
-			repositoryCwd: derived.command.cwd,
-		});
-		releaseFastPath = {
-			eligible: evaluation.eligible,
-			remote_head: evaluation.remote_head,
-			reason: evaluation.reason,
-		};
-		if (evaluation.eligible && evaluation.remote_head !== null) {
-			const commandHash = reviewAuthorizationKey(commandValue, derived.command.cwd);
-			const targetHash = canonicalHash(derived.target);
-			const authorization: PendingReviewAuthorization = {
-				command_hash: commandHash,
-				target_hash: targetHash,
-				receipt_hash: null,
-				release_fast_path: {
-					remote: input.release.remote,
-					protected_ref: input.release.protected_ref,
-					expected_remote_head: evaluation.remote_head,
-				},
-			};
-			pendingAuthorizations.set(commandHash, authorization);
-			return {
-				operation: parameters.operation,
-				result: {
-					status: GATE_RESULT.ALLOW,
-					actor_count: 0,
-					target_hash: targetHash,
-					receipt_hash: null,
-					reason: evaluation.reason,
-				},
-				derived_target: derived.target,
-				release_fast_path: releaseFastPath,
-				authorization,
-			};
 		}
 	}
 	if (
@@ -5548,6 +5600,32 @@ async function gateLifecycleCommand(
 		}
 	}
 	if (authorization.release_fast_path) {
+		const ciRecheck = recheckReleaseFastPathCiStatusV1({
+			repositoryCwd: derived.command.cwd,
+			sha: authorization.release_fast_path.expected_ci_revision,
+			expectedStatus: authorization.release_fast_path.expected_ci_status,
+		});
+		if (!ciRecheck.proven) {
+			return {
+				block: true,
+				reason: `Gentle AI ${inspection.event} release fast path failed closed: required CI for the authorized exact SHA could not be re-proven immediately before publication.`,
+			};
+		}
+		try {
+			if (derived.command.event === "pre-push") {
+				assertReleaseFastPathPushBinding(
+					derived.command.cwd,
+					derived.target,
+					authorization.release_fast_path.remote,
+					authorization.release_fast_path.push_destination_id,
+				);
+			}
+		} catch (error) {
+			return {
+				block: true,
+				reason: `Gentle AI ${inspection.event} release fast path destination binding changed after authorization and failed closed: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
 		// The remote protected main head is rechecked immediately before the tag
 		// push; an advanced or unprovable head fails closed.
 		const recheck = recheckReleaseFastPathRemoteHeadV1({

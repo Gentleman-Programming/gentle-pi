@@ -14,7 +14,9 @@ import {
 	REVIEW_MODE,
 	REVIEW_TRANSITION,
 	ReviewTransactionStore,
+	canonicalHash,
 	createReviewState,
+	projectExactTagCreatePushAsReleaseV1,
 	setReleaseGhCommandRunnerForTestingV1,
 	setReviewMutationLockPlatformForTesting,
 	type ReviewBudgetV1,
@@ -38,9 +40,15 @@ setReviewMutationLockPlatformForTesting(qualifiedReviewLockPlatform());
 // gh CLI; these controller-level fixtures are local bare clones with no real
 // GitHub remote, so a deterministic Check Runs response stands in for `gh`.
 // Legacy combined status stays pending to model Checks-only repositories.
-setReleaseGhCommandRunnerForTestingV1((args) => args[1]?.includes("/check-runs?")
-	? { status: 0, stdout: JSON.stringify({ total_count: 1, returned: 1, checks: [["completed", "success"]] }) }
-	: { status: 0, stdout: "pending" });
+let releaseCheckRuns: { total_count: number; returned: number; checks: ReadonlyArray<readonly [string, string | null]> } = { total_count: 1, returned: 1, checks: [["completed", "success"]] };
+const releaseCheckRunArguments: string[][] = [];
+setReleaseGhCommandRunnerForTestingV1((args) => {
+	if (args[1]?.includes("/check-runs?")) {
+		releaseCheckRunArguments.push([...args]);
+		return { status: 0, stdout: JSON.stringify(releaseCheckRuns) };
+	}
+	return { status: 0, stdout: "pending" };
+});
 
 interface ReviewToolResult {
 	content: Array<{ type: string; text: string }>;
@@ -1677,6 +1685,240 @@ test("controller release fast path bypasses receipt validation only for the prov
 	const advanced = await toolCall({ toolName: "bash", input: { command } }, ctx);
 	assert.equal(advanced?.block, true);
 	assert.match(advanced?.reason ?? "", /advanced|re-proven/i);
+});
+
+test("controller routes exact tag-create pushes through the release fast path before GitHub release creation", async (t) => {
+	t.after(() => { releaseCheckRuns = { total_count: 1, returned: 1, checks: [["completed", "success"]] }; });
+	const fixture = createRepository(t, true);
+	assert.ok(fixture.finalCommit && fixture.tagObject);
+	const remotePath = join(fixture.parent, "remote.git");
+	git(fixture.repository, "-c", "user.name=Review Controller", "-c", "user.email=review-controller@example.invalid", "tag", "-a", "v1.0.5", "-m", "patch release", fixture.finalCommit);
+	execFileSync("git", ["init", "--bare", remotePath], { cwd: fixture.parent, stdio: ["ignore", "pipe", "pipe"] });
+	git(fixture.repository, "remote", "add", "origin", remotePath);
+	git(fixture.repository, "push", "origin", `${fixture.finalCommit}:refs/heads/main`);
+	const { controller, toolCall } = registerRuntime();
+	const ctx = extensionContext(fixture.repository, true);
+	const releaseEvidence = {
+		protected_ref: "refs/heads/main",
+		remote: "origin",
+		ci: { revision: fixture.finalCommit, status: "success" },
+		external_evidence: "none",
+		post_incident: false,
+	};
+	const pushCommand = "git push origin refs/tags/v1.0.5";
+	const pushed = await controllerCall(controller, ctx, {
+		operation: "validate",
+		idempotencyKey: "tag-push-release-fast-path",
+		command: pushCommand,
+		input: JSON.stringify({ scopeBudget: budget(), release: releaseEvidence }),
+	});
+	assert.equal((pushed.result as Record<string, unknown>).status, "allow", JSON.stringify(pushed));
+	assert.equal((pushed.result as Record<string, unknown>).actor_count, 0);
+	assert.equal((pushed.derived_target as Record<string, unknown>).kind, "push");
+	assert.equal((pushed.authorization as Record<string, unknown>).target_hash, canonicalHash(pushed.derived_target));
+	const fastPathAuthorization = (pushed.authorization as { release_fast_path: Record<string, unknown> }).release_fast_path;
+	assert.equal(fastPathAuthorization.expected_ci_revision, fixture.finalCommit);
+	assert.equal(fastPathAuthorization.expected_ci_status, "success");
+	assert.equal(await toolCall({ toolName: "bash", input: { command: pushCommand } }, ctx), undefined);
+	assert.equal(releaseCheckRunArguments.at(-1)?.[1], `repos/{owner}/{repo}/commits/${fixture.finalCommit}/check-runs?per_page=100`);
+	git(fixture.repository, "push", "origin", "refs/tags/v1.0.5");
+	for (const [tag, checks] of [
+		["v1.0.6", [["completed", "failure"]]],
+		["v1.0.7", [["in_progress", null]]],
+	] as const) {
+		git(fixture.repository, "-c", "user.name=Review Controller", "-c", "user.email=review-controller@example.invalid", "tag", "-a", tag, "-m", "ci recheck", fixture.finalCommit);
+		releaseCheckRuns = { total_count: 1, returned: 1, checks: [["completed", "success"]] };
+		const command = `git push origin refs/tags/${tag}`;
+		await controllerCall(controller, ctx, {
+			operation: "validate", idempotencyKey: `tag-push-ci-${tag}`, command,
+			input: JSON.stringify({ scopeBudget: budget(), release: releaseEvidence }),
+		});
+		releaseCheckRuns = { total_count: 1, returned: 1, checks };
+		assert.equal((await toolCall({ toolName: "bash", input: { command } }, ctx))?.block, true);
+	}
+	releaseCheckRuns = { total_count: 1, returned: 1, checks: [["completed", "success"]] };
+	assert.equal(
+		execFileSync("git", ["--git-dir", remotePath, "rev-parse", "refs/tags/v1.0.5^{object}"], { encoding: "utf8" }).trim(),
+		git(fixture.repository, "rev-parse", "refs/tags/v1.0.5^{object}"),
+	);
+	assert.equal(
+		execFileSync("git", ["--git-dir", remotePath, "rev-parse", "refs/tags/v1.0.5^{commit}"], { encoding: "utf8" }).trim(),
+		fixture.finalCommit,
+	);
+
+	const releaseCommand = "gh release create v1.0.5 --title patch --notes-file notes.md";
+	const released = await controllerCall(controller, ctx, {
+		operation: "validate",
+		idempotencyKey: "remote-tag-release-fast-path",
+		command: releaseCommand,
+		input: JSON.stringify({ scopeBudget: budget(), release: releaseEvidence }),
+	});
+	assert.equal((released.result as Record<string, unknown>).status, "allow", JSON.stringify(released));
+	assert.equal((released.result as Record<string, unknown>).actor_count, 0);
+	assert.equal((released.derived_target as Record<string, unknown>).peeled_commit, fixture.finalCommit);
+	assert.equal(await toolCall({ toolName: "bash", input: { command: releaseCommand } }, ctx), undefined);
+	await controllerCall(controller, ctx, {
+		operation: "validate",
+		idempotencyKey: "remote-tag-release-fast-path-recheck",
+		command: releaseCommand,
+		input: JSON.stringify({ scopeBudget: budget(), release: releaseEvidence }),
+	});
+	execFileSync("git", ["--git-dir", remotePath, "update-ref", "refs/heads/main", fixture.baseCommit]);
+	const advanced = await toolCall({ toolName: "bash", input: { command: releaseCommand } }, ctx);
+	assert.equal(advanced?.block, true);
+	assert.match(advanced?.reason ?? "", /advanced|re-proven/i);
+});
+
+test("controller rejects ambiguous or ineligible tag pushes from the receipt-free release fast path", async (t) => {
+	const fixture = createRepository(t, true);
+	assert.ok(fixture.finalCommit);
+	const remotePath = join(fixture.parent, "remote.git");
+	execFileSync("git", ["init", "--bare", remotePath], { cwd: fixture.parent, stdio: ["ignore", "pipe", "pipe"] });
+	git(fixture.repository, "remote", "add", "origin", remotePath);
+	git(fixture.repository, "push", "origin", `${fixture.finalCommit}:refs/heads/main`);
+	git(fixture.repository, "-c", "user.name=Review Controller", "-c", "user.email=review-controller@example.invalid", "tag", "-a", "v1.0.5", "-m", "patch release", fixture.finalCommit);
+	git(fixture.repository, "-c", "user.name=Review Controller", "-c", "user.email=review-controller@example.invalid", "tag", "-a", "nightly", "-m", "nightly", fixture.finalCommit);
+	git(fixture.repository, "-c", "user.name=Review Controller", "-c", "user.email=review-controller@example.invalid", "tag", "-a", "v1.0.7", "-m", "base release", fixture.baseCommit);
+	git(fixture.repository, "tag", "v1.0.6", fixture.finalCommit);
+	const { controller, toolCall } = registerRuntime();
+	const ctx = extensionContext(fixture.repository, true);
+	const releaseEvidence = {
+		protected_ref: "refs/heads/main",
+		remote: "origin",
+		ci: { revision: fixture.finalCommit, status: "success" },
+		external_evidence: "none",
+		post_incident: false,
+	};
+	const validate = async (command: string, evidence = releaseEvidence): Promise<void> => {
+		await assert.rejects(controller.execute("ineligible-tag-push", {
+			operation: "validate",
+			idempotencyKey: `ineligible-${command}`,
+			command,
+			input: JSON.stringify({ scopeBudget: budget(), release: evidence }),
+		}, undefined, undefined, ctx));
+	};
+	const tagCreateTarget = (tag: string) => ({
+		kind: "push" as const,
+		remote: "origin",
+		destination_id: "a".repeat(64),
+		updates: [{
+			kind: "create" as const,
+			source_ref: `refs/tags/${tag}`,
+			destination_ref: `refs/tags/${tag}`,
+			old_object: null,
+			old_peeled_commit: null,
+			old_tree: null,
+			new_object: fixture.finalCommit!,
+			new_peeled_commit: fixture.finalCommit!,
+			new_tree: fixture.finalTree!,
+		}],
+	});
+
+	await validate("git push origin :refs/tags/v1.0.5");
+	await validate("git push origin refs/tags/v1.0.5:refs/tags/v1.0.6");
+	await validate("git push origin refs/tags/v1.0.5 refs/tags/v1.0.6");
+	await validate("git push origin refs/tags/nightly");
+	await validate("git push origin refs/tags/v1.0.7");
+	await validate("git push origin refs/tags/v1.0.5", { ...releaseEvidence, ci: { revision: fixture.finalCommit, status: "failure" } });
+	await validate("git push origin refs/tags/v1.0.5", { ...releaseEvidence, ci: { revision: fixture.finalCommit, status: "pending" } });
+	await validate("git push origin v1.0.5");
+	await validate("git push --force origin refs/tags/v1.0.5");
+	for (const command of [
+		"git push --exec git-receive-pack origin refs/tags/v1.0.5",
+		"git push --receive-pack git-receive-pack origin refs/tags/v1.0.5",
+	]) {
+		await validate(command);
+		assert.equal((await toolCall({ toolName: "bash", input: { command } }, ctx))?.block, true);
+	}
+
+	for (const tag of [
+		"v1.2.3+foo+bar",
+		"v1.2.3-foo..bar",
+		"v1.2.3-01",
+		"v01.2.3",
+		"v1.2.3-",
+		"v1.2.3+",
+	]) {
+		assert.equal(projectExactTagCreatePushAsReleaseV1(tagCreateTarget(tag)), null, tag);
+	}
+	assert.notEqual(projectExactTagCreatePushAsReleaseV1(tagCreateTarget("v1.2.3-rc.1+build.5")), null);
+	for (const tag of ["v1.2.3+foo+bar", "v1.2.3-01", "v01.2.3", "v1.2.3-", "v1.2.3+"]) {
+		git(fixture.repository, "-c", "user.name=Review Controller", "-c", "user.email=review-controller@example.invalid", "tag", "-a", tag, "-m", "invalid semver", fixture.finalCommit);
+		await validate(`git push origin refs/tags/${tag}`);
+	}
+	await validate("git push origin refs/tags/v1.2.3-foo..bar");
+
+	const lightweight = await controllerCall(controller, ctx, {
+		operation: "validate",
+		idempotencyKey: "lightweight-exact-tag-push",
+		command: "git push origin refs/tags/v1.0.6",
+		input: JSON.stringify({ scopeBudget: budget(), release: releaseEvidence }),
+	});
+	assert.equal((lightweight.result as Record<string, unknown>).status, "allow", JSON.stringify(lightweight));
+	assert.equal((lightweight.result as Record<string, unknown>).actor_count, 0);
+
+	git(fixture.repository, "push", "origin", "refs/tags/v1.0.5");
+	await validate("git push origin refs/tags/v1.0.5");
+});
+
+test("controller release tag-push fast path binds the evidence remote and re-proves one fetch/push destination at bash time", async (t) => {
+	const fixture = createRepository(t, true);
+	assert.ok(fixture.finalCommit);
+	const fetchRemotePath = join(fixture.parent, "fetch.git");
+	const pushRemotePath = join(fixture.parent, "push.git");
+	const alternateRemotePath = join(fixture.parent, "alternate.git");
+	for (const path of [fetchRemotePath, pushRemotePath, alternateRemotePath]) {
+		execFileSync("git", ["clone", "--bare", fixture.repository, path], { cwd: fixture.parent, stdio: ["ignore", "pipe", "pipe"] });
+	}
+	git(fixture.repository, "remote", "add", "origin", fetchRemotePath);
+	git(fixture.repository, "remote", "set-url", "--add", "--push", "origin", pushRemotePath);
+	git(fixture.repository, "remote", "add", "evidence", alternateRemotePath);
+	execFileSync("git", ["--git-dir", fetchRemotePath, "update-ref", "refs/heads/main", fixture.finalCommit]);
+	git(fixture.repository, "-c", "user.name=Review Controller", "-c", "user.email=review-controller@example.invalid", "tag", "-a", "v1.0.5", "-m", "patch release", fixture.finalCommit);
+	const { controller, toolCall } = registerRuntime();
+	const ctx = extensionContext(fixture.repository, true);
+	const evidence = {
+		protected_ref: "refs/heads/main",
+		remote: "origin",
+		ci: { revision: fixture.finalCommit, status: "success" },
+		external_evidence: "none",
+		post_incident: false,
+	};
+	const command = "git push origin refs/tags/v1.0.5";
+
+	await assert.rejects(
+		controller.execute("split-fetch-push-release-fast-path", {
+			operation: "validate",
+			idempotencyKey: "split-fetch-push-release-fast-path",
+			command,
+			input: JSON.stringify({ scopeBudget: budget(), release: evidence }),
+		}, undefined, undefined, ctx),
+		/fetch.*push|destination|identity/i,
+	);
+	await assert.rejects(
+		controller.execute("nonmatching-evidence-remote", {
+			operation: "validate",
+			idempotencyKey: "nonmatching-evidence-remote",
+			command,
+			input: JSON.stringify({ scopeBudget: budget(), release: { ...evidence, remote: "evidence" } }),
+		}, undefined, undefined, ctx),
+		/evidence remote.*match/i,
+	);
+
+	git(fixture.repository, "remote", "set-url", "--delete", "--push", "origin", pushRemotePath);
+	git(fixture.repository, "remote", "set-url", "--add", "--push", "origin", fetchRemotePath);
+	const validated = await controllerCall(controller, ctx, {
+		operation: "validate",
+		idempotencyKey: "pushurl-drift-release-fast-path",
+		command,
+		input: JSON.stringify({ scopeBudget: budget(), release: evidence }),
+	});
+	assert.equal((validated.result as Record<string, unknown>).status, "allow", JSON.stringify(validated));
+	git(fixture.repository, "remote", "set-url", "--delete", "--push", "origin", fetchRemotePath);
+	git(fixture.repository, "remote", "set-url", "--add", "--push", "origin", pushRemotePath);
+	const drifted = await toolCall({ toolName: "bash", input: { command } }, ctx);
+	assert.equal(drifted?.block, true);
+	assert.match(drifted?.reason ?? "", /target|destination|fetch.*push|binding/i);
 });
 
 test("failed or unprovable release fast-path conditions fall back to native receipt validation and fail closed", async (t) => {
