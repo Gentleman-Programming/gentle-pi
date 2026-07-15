@@ -58,7 +58,7 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | **Skill creation workflow**    | Provides the `gentle-ai-skill-creator`/`gentle-ai-skill-improver` skills, `/skill-creation` prompt, and packaged style guide for LLM-first skills. |
 | **Delivery skills**            | Includes issue-first PRs, chained PRs, work-unit commits, cognitive docs, comment writing, and Judgment Day review.                           |
 | **Bounded native review**      | Freezes one candidate, dispatches only controller-selected lenses, records native authority, and reuses the same content-bound receipt at delivery gates. |
-| **Verified native runtime**    | Provisions the exact package-local Gentle AI v2.1.4 binary, verifies pinned archive/binary integrity, and rejects PATH, global, sibling, symlink, and mode fallbacks. |
+| **Verified native runtime**    | Provisions the exact package-local Gentle AI v2.1.5 binary, verifies pinned archive/binary integrity, and rejects PATH, global, sibling, symlink, and mode fallbacks. |
 | **Runtime safety**             | Blocks destructive shell commands, asks for confirmation for sensitive operations, and blocks direct read/write/edit access to sensitive paths. |
 
 ## Install
@@ -67,7 +67,7 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 pi install npm:gentle-pi
 ```
 
-The npm postinstall downloads the exact platform-specific official Gentle AI v2.1.4 archive into this package's private `.gentle-ai/v2.1.4/` directory and verifies its pinned SHA-256 before extraction. It never uses `PATH` or a global `gentle-ai` installation. For development or offline installs only, set `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1`; native review operations then fail closed with an actionable `package-local-binary-missing` error until the package is reinstalled normally.
+The npm postinstall downloads the exact platform-specific official Gentle AI v2.1.5 archive into this package's private `.gentle-ai/v2.1.5/` directory and verifies its pinned SHA-256 before extraction. It never uses `PATH` or a global `gentle-ai` installation. For development or offline installs only, set `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1`; native review operations then fail closed with an actionable `package-local-binary-missing` error until the package is reinstalled normally.
 
 Recommended companion packages:
 
@@ -177,11 +177,62 @@ Risk selection is deterministic: documentation/comment/formatting-only changes u
 
 ### Bounded review transactions
 
-New ordinary review uses compact `gentle_review` `start -> finalize -> validate`.
+New ordinary review uses compact `gentle_review` `start -> finalize -> validate`. This diagram shows the complete development-to-delivery path, including every ordinary review state and the fail-closed branches.
 
-Native contract pairing is exact: this adapter supports `gentle-ai 2.1.4` only from its package-local verified binary and rechecks that version before every native operation. Production native operations resolve an absolute package-owned path and never fall back to `PATH` or a global executable. Once v2.1.4 has written review authority, rollback MUST preserve every native store and receipt and MUST NOT run a downgraded binary against that repository. Disable the Pi route or roll forward to a compatible authority-aware release instead; deleting authority data or reinstalling an older binary is not a rollback path.
+```mermaid
+flowchart TD
+    A["Clarify scope and acceptance criteria"] --> B{"Choose the smallest safe workflow"}
+    B -->|Small and local| C["Inline implementation"]
+    B -->|Context-heavy or multi-file| D["Focused subagent"]
+    B -->|Large or architectural| E["SDD phase artifacts"]
+    C --> F["Implement with test evidence"]
+    D --> F
+    E --> F
+    F --> G["Independent verification"]
+    G --> H["INSPECT authority"]
+    H -->|Applicable invalid authority| X["Blocked: explicit recovery required"]
+    H -->|Clean or unrelated history| I["START freezes candidate, scope, tier, lenses, and budget"]
 
-Gentle AI v2.1.4 supports `gentle-ai review start --projection staged`, and upstream `main` now documents that focused-index workflow. The current `gentle-pi` adapter intentionally submits `projection: "workspace"` and does not expose staged projection yet. Native binary capability is not automatically a Pi adapter contract; package support still requires an adapter update, parity fixtures, and bounded validation.
+    subgraph Ordinary_review["Ordinary bounded review"]
+        I --> R["reviewing"]
+        R --> J["Run each selected lens once"]
+        J --> K{"Severe candidate-caused blocker?"}
+        K -->|No| A1["approved"]
+        K -->|Yes| C1["correction_required"]
+        C1 --> C2["Forecast bounded correction"]
+        C2 --> C3["Apply scoped fix"]
+        C3 --> V["validating"]
+        V -->|Validator passes| A1
+        V -->|Fails; attempt and budget remain| C1
+        V -->|Malformed, out of scope, or exhausted| E1["escalated"]
+    end
+
+    A1 --> P["Receipt binds the exact candidate tree"]
+    P --> PC["Stage reviewed paths"]
+    PC --> G1{"pre-commit validate"}
+    G1 -->|allow| CM["Commit"]
+    G1 -->|scope changed| N["Start a new lineage"]
+    G1 -->|invalidated or escalated| X
+    CM --> G2{"pre-push validate"}
+    G2 -->|allow| PS["Push"]
+    G2 -->|deny| X
+    PS --> CI["Required CI on exact remote SHA"]
+    CI -->|success| RL{"Release gate"}
+    CI -->|pending or failed| X
+    RL -->|Exact patch tag on protected main; no fresh risk evidence| FP["Zero-actor release fast path"]
+    RL -->|Receipt-bound release evidence| RV["Native receipt validation"]
+    RL -->|Major, post-incident, stale, or unprovable| X
+    FP --> PUB["Publish release"]
+    RV -->|allow| PUB
+    RV -->|deny| X
+    N --> H
+```
+
+Lifecycle gates never launch review actors. They rederive Git and publication targets, validate the existing receipt, and authorize one exact command. Any target drift, stale evidence, malformed authority, or unprovable state blocks delivery instead of silently reopening review.
+
+Native contract pairing is exact: this adapter supports `gentle-ai 2.1.5` only from its package-local verified binary and rechecks that version before every native operation. Production native operations resolve an absolute package-owned path and never fall back to `PATH` or a global executable. Once v2.1.5 has written review authority, rollback MUST preserve every native store and receipt and MUST NOT run a downgraded binary against that repository. Disable the Pi route or roll forward to a compatible authority-aware release instead; deleting authority data or reinstalling an older binary is not a rollback path.
+
+Gentle AI v2.1.5 supports `gentle-ai review start --projection staged`, and upstream `main` now documents that focused-index workflow. The current `gentle-pi` adapter intentionally submits `projection: "workspace"` and does not expose staged projection yet. Native binary capability is not automatically a Pi adapter contract; package support still requires an adapter update, parity fixtures, and bounded validation.
 
 ### FINALIZE wrapper input
 
