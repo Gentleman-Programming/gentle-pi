@@ -21,8 +21,8 @@ interface QueuedResult {
 	outputLimitExceeded?: boolean;
 }
 
-function queuedAdapter(results: QueuedResult[]): { adapter: ExecFileAdapter; calls: Array<{ file: string; arguments: readonly string[]; cwd: string }> } {
-	const calls: Array<{ file: string; arguments: readonly string[]; cwd: string }> = [];
+function queuedAdapter(results: QueuedResult[]): { adapter: ExecFileAdapter; calls: Array<{ file: string; arguments: readonly string[]; cwd: string; timeoutMs: number | undefined; maxBufferBytes: number }> } {
+	const calls: Array<{ file: string; arguments: readonly string[]; cwd: string; timeoutMs: number | undefined; maxBufferBytes: number }> = [];
 	return {
 		calls,
 		adapter: async (request) => {
@@ -234,6 +234,29 @@ test("native mutation uncertainty requires exact replay", async () => {
 			&& error.mutationOutcome === "unknown"
 			&& error.nextAction === "replay-exact-native-operation",
 	);
+});
+
+test("native mutating commands omit the automatic timeout while preserving output caps", async () => {
+	const queue = queuedAdapter([
+		VERSION,
+		START,
+		VERSION,
+		{ stdout: await fixture("finalize") },
+		VERSION,
+		{ stdout: await fixture("bind-sdd") },
+	]);
+	const client = new NativeReviewCliV213(queue.adapter, "/package/.gentle-ai/v2.1.4/gentle-ai", 321, 654);
+	await client.start({ cwd: "/repo" });
+	await client.finalize({ cwd: "/repo", lineageId: "lineage-1" });
+	await client.bindSdd({ cwd: "/repo", change: "native-review-authority-parity", lineage: "issue136-contract-runtime", expectedBindingRevision: "" });
+	assert.deepEqual(queue.calls.map((call) => call.timeoutMs), [321, undefined, 321, undefined, 321, undefined]);
+	assert.deepEqual(queue.calls.map((call) => call.maxBufferBytes), [654, 654, 654, 654, 654, 654]);
+});
+
+test("native read-only commands and version checks retain the automatic timeout", async () => {
+	const queue = queuedAdapter([VERSION, { stdout: await fixture("validate-allow") }]);
+	await new NativeReviewCliV213(queue.adapter, "/package/.gentle-ai/v2.1.4/gentle-ai", 321).validate({ cwd: "/repo", gate: "post-apply", lineageId: "issue136-contract-runtime" });
+	assert.deepEqual(queue.calls.map((call) => call.timeoutMs), [321, 321]);
 });
 
 test("native process failures retain bounded sanitized process diagnostics and parsed denial evidence", async () => {
@@ -877,11 +900,13 @@ test("node execFile adapter passes AbortSignal to child_process", async () => {
 	await assert.rejects(pending, (error: unknown) => error instanceof Error && error.name === "AbortError");
 });
 
-test("native adapter receives the controller AbortSignal and preserves mutating replay guidance", async () => {
+test("native adapter receives the controller AbortSignal without an automatic mutation timeout", async () => {
 	const controller = new AbortController();
 	controller.abort();
+	let mutationTimeoutMs: number | undefined;
 	const adapter: ExecFileAdapter = async (request) => {
 		if (request.arguments[0] === "version") return { stdout: "gentle-ai 2.1.4\n", stderr: "", exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false };
+		mutationTimeoutMs = request.timeoutMs;
 		if (request.signal?.aborted) {
 			const error = new Error("cancelled");
 			error.name = "AbortError";
@@ -896,4 +921,5 @@ test("native adapter receives the controller AbortSignal and preserves mutating 
 			&& error.mutationOutcome === "unknown"
 			&& error.nextAction === "replay-exact-native-operation",
 	);
+	assert.equal(mutationTimeoutMs, undefined);
 });
