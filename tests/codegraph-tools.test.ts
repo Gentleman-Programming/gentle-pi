@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import codeGraphTools, {
+	createCodeGraphRunner,
 	createCodeGraphTool,
 	type CodeGraphRunner,
 } from "../extensions/codegraph-tools.ts";
@@ -16,6 +17,23 @@ function workspace(t: test.TestContext): string {
 	t.after(() => rmSync(cwd, { recursive: true, force: true }));
 	return cwd;
 }
+
+test("runner preserves direct shell-free Unix execution", async () => {
+	const signal = new AbortController().signal;
+	const calls: Array<{ file: string; args: string[]; options: Record<string, unknown> }> = [];
+	const runner = createCodeGraphRunner({
+		execFile: async (file, args, options) => {
+			calls.push({ file, args, options });
+			return { stdout: "ok", stderr: "" };
+		},
+	});
+
+	await runner(["query", "--", "a;b"], { cwd: "/repo", signal, maxBuffer: 99 });
+	assert.deepEqual(calls, [
+		{ file: "codegraph", args: ["query", "--", "a;b"], options: { cwd: "/repo", signal, maxBuffer: 99 } },
+	]);
+	assert.equal(calls[0]?.options.signal, signal);
+});
 
 test("CodeGraph tool rejects non-project, nested-project, HOME, and temporary workspaces before init", async (t) => {
 	const nonProject = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-non-project-")));
@@ -128,6 +146,7 @@ test("CodeGraph tool returns structured fallback instructions when the binary is
 		status: "unavailable",
 		operation: "query",
 		cwd,
+		args: ["query", "--path", cwd, "--limit", "10", "--", "symbol"],
 		fallback: "Use read, grep, and find for this exploration.",
 	});
 });
@@ -149,6 +168,7 @@ test("CodeGraph tool returns fallback instructions when CodeGraph fails", async 
 		status: "failed",
 		operation: "explore",
 		cwd,
+		args: ["explore", "--path", cwd, "--max-files", "10", "--", "call path"],
 		fallback: "Use read, grep, and find for this exploration.",
 	});
 });

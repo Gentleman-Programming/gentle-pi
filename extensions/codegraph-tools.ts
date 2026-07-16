@@ -42,6 +42,7 @@ interface CodeGraphFallbackDetails {
 	status: CodeGraphStatus;
 	operation: CodeGraphOperation;
 	cwd: string;
+	args: string[];
 	fallback: string;
 }
 
@@ -67,6 +68,30 @@ const MAX_OUTPUT_CHARS = 100_000;
 const PROCESS_MAX_BUFFER = MAX_OUTPUT_CHARS * 2;
 const FALLBACK_INSTRUCTIONS = "Use read, grep, and find for this exploration.";
 const execFileAsync = promisify(execFile);
+
+type ExecFileResult = Promise<CodeGraphCommandResult>;
+type ExecFileFunction = (
+	file: string,
+	args: string[],
+	options: { cwd: string; signal?: AbortSignal; maxBuffer: number },
+) => ExecFileResult;
+
+interface CodeGraphRunnerDependencies {
+	execFile?: ExecFileFunction;
+}
+
+export function createCodeGraphRunner(
+	dependencies: CodeGraphRunnerDependencies = {},
+): CodeGraphRunner {
+	const execute =
+		dependencies.execFile ?? (execFileAsync as unknown as ExecFileFunction);
+	return async (args, options) =>
+		execute("codegraph", [...args], {
+			cwd: options.cwd,
+			signal: options.signal,
+			maxBuffer: options.maxBuffer,
+		});
+}
 
 function resolveWorkspaceCwd(cwd: string): string {
 	const resolved = realpathSync(cwd);
@@ -163,12 +188,13 @@ function codeGraphFailureDetails(
 	error: unknown,
 	operation: CodeGraphOperation,
 	cwd: string,
+	args: readonly string[],
 ): CodeGraphFallbackDetails {
 	const status =
 		typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT"
 			? CODEGRAPH_STATUS.UNAVAILABLE
 			: CODEGRAPH_STATUS.FAILED;
-	return { status, operation, cwd, fallback: FALLBACK_INSTRUCTIONS };
+	return { status, operation, cwd, args: [...args], fallback: FALLBACK_INSTRUCTIONS };
 }
 
 function codeGraphFailureMessage(status: CodeGraphStatus): string {
@@ -177,14 +203,7 @@ function codeGraphFailureMessage(status: CodeGraphStatus): string {
 		: `CodeGraph failed to run. ${FALLBACK_INSTRUCTIONS}`;
 }
 
-const runCodeGraphCommand: CodeGraphRunner = async (args, options) => {
-	const result = await execFileAsync("codegraph", [...args], {
-		cwd: options.cwd,
-		signal: options.signal,
-		maxBuffer: options.maxBuffer,
-	});
-	return { stdout: result.stdout, stderr: result.stderr };
-};
+const runCodeGraphCommand = createCodeGraphRunner();
 
 export function createCodeGraphTool(runner: CodeGraphRunner = runCodeGraphCommand) {
 	return {
@@ -217,7 +236,7 @@ export function createCodeGraphTool(runner: CodeGraphRunner = runCodeGraphComman
 					details: { operation: parameters.operation, cwd, args },
 				};
 			} catch (error: unknown) {
-				const details = codeGraphFailureDetails(error, parameters.operation, cwd);
+				const details = codeGraphFailureDetails(error, parameters.operation, cwd, args);
 				return {
 					content: [{ type: "text" as const, text: codeGraphFailureMessage(details.status) }],
 					details,
