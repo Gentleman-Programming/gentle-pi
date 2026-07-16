@@ -69,15 +69,15 @@ Never request a subagent named `reviewer`; it is an intent, not an installed age
 | Security, permissions, data exposure/loss, architecture, dependencies | `review-risk` |
 | Large PR, hot path, or >400 changed lines | Full 4R: `review-risk`, `review-resilience`, `review-readability`, `review-reliability` |
 
-If multiple rows match, run the narrow set that covers the risk. Example: shell integration that mutates live state should use `review-reliability` plus `review-resilience`, not `review-readability` by default.
+For a standard change, choose exactly one dominant-risk lens using the fixed precedence encoded by the controller. Only high-risk changes—security/auth/update/payments, data loss/exposure, permissions, shell/process integration, or more than 400 authored changed lines—run the canonical full 4R set.
 
 ## Bounded Review Transaction Contract
 
-Call `gentle_review` INSPECT before START. New ordinary review uses the compact facade: `start -> finalize -> validate`. START receives a JSON-serialized ordinary input with the policy hash; the controller derives Git scope, untracked paths, lineage, risk tier, lenses, authored lines, and correction budget. `judgment-day` remains graph-v1 and is valid only when explicitly selected.
+Call `gentle_review` INSPECT before START. The package-local Gentle AI v2.1.6 executable negotiates `gentle-ai.review-integration/v1`; INSPECT is target-scoped status, not a Pi-built authority inventory. New ordinary review uses native compact-v2 `start -> finalize -> validate`. START receives a JSON-serialized ordinary input; an optional repository-local `policyPath` and an explicit `baseRef` paired with `committedOnly: true` are the only selectors. Native code derives Git scope, untracked paths, lineage, risk tier/reasons, lenses, authored lines, and correction budget. `judgment-day` remains explicit and separate.
 
 If INSPECT or START reports `blocked-legacy` or `blocked-mixed`, explain that legacy authority cannot be migrated and request explicit user authorization for the exact destructive-reset challenge. RESET and RECOVER each require fresh operation-bound confirmation through the interactive Pi UI and fail closed headlessly. The UI cannot cryptographically attest the human's identity; its residual trust is the operator controlling that Pi session, while exact challenge binding remains runtime-enforced. Only after authorization, call RESET with that exact challenge. RESET and RECOVER internally INSPECT authority; require a returned `clean` inspection with `start-fresh-ordinary-review-after-verified-clean`, then immediately issue a fresh ordinary START. For `reset-in-progress`, use INSPECT's durable original `reset_request` with authorized RECOVER.
 
-A `lineage_created: false` result or a validation error explicitly marked before authority access proves no lineage was created. A thrown START after authority access or lost output is ambiguous; replay the exact START so compact content-derived CAS returns the committed state or rejects a semantic mismatch. Never choose a different lineage merely because output was lost.
+Preserve the negotiated native failure envelope exactly. Before authority access, `mutation_outcome: not_started` means no lineage was created. For `unknown` or lost mutating output, the controller immediately calls target-scoped status and returns its exact action; it never emits a generic replay instruction. Replay the exact START or FINALIZE only when that provider result declares `exact_replay_safe` for the same canonical request and required lineage. `mutation_outcome: committed` is never weakened, and Pi never chooses a lineage merely because output was lost.
 
 Ordinary review runs the selected zero, one, or four lenses exactly once against `initial_review_tree`.
 
@@ -93,13 +93,13 @@ All inferential candidate-caused blockers use exactly one complete read-only ref
 
 Independent concrete refuter proof is valid and need not repeat reviewer `proof_refs`. Invalid, empty, malformed, missing, duplicate, unknown, or inconclusive refuter output escalates without a replacement refuter.
 
-Ordinary permits up to three failed targeted attempts within the original cumulative budget `min(200, ceil(original_changed_lines / 2))`. Each attempt uses one correction and one targeted validator; FINALIZE requires a positive pre-edit forecast and accounts Git-derived actual lines cumulatively.
+Ordinary permits one correction transaction within the original budget `min(200, ceil(original_changed_lines / 2))`. FINALIZE requires a positive pre-edit forecast, accounts Git-derived actual lines, and accepts one targeted validator plus final verification. Failure escalates instead of starting another correction or review budget.
 
 Initial lenses never rerun. Every attempt preserves frozen findings and genesis scope: the original candidate, paths, untracked set, and correction IDs. The validator checks original criteria and correction regression only and cannot add scope or findings.
 
 Final verification evidence is supplied and hashed during FINALIZE, never at START.
 
-Each validator invocation cannot change claims, add findings, request fixes, launch actors, or request another attempt. Native FINALIZE alone returns `correction_required` while another bounded attempt remains.
+The validator cannot change claims, add findings, request fixes, launch actors, or request another attempt.
 
 Compact ordinary authority has exactly five states: `reviewing`, `correction_required`, `validating`, `approved`, and `escalated`.
 
@@ -113,11 +113,11 @@ Judgment Day alone may iterate discovery and scoped re-judgment, for at most two
 
 Findings surviving round two escalate; no third-round transition exists.
 
-Existing graph-v1 ordinary lineages remain readable, receipt/gate-validatable, and exportable but reject mutation. Same-lineage graph-v1 plus compact-v2 authority fails closed. Reset quarantines both. Judgment Day remains mutable on graph-v1.
+Existing graph-v1 and legacy-v1 ordinary lineages remain compatibility-readable but reject ordinary mutation. Every new ordinary START, status, FINALIZE, gate, and SDD binding uses native compact-v2. Ambiguous or corrupted target status requires the single native maintainer action; Pi never resets, quarantines, migrates, or selects authority implicitly. Judgment Day remains explicit and separate.
 
 PR #1216 introduced the v2.1.1 `<remote>/<branch>` selector contract that v2.1.2 inherits unchanged.
 
-Compact gates are read-only: load authority and receipt, derive live Git evidence, then reload authority and rederive target/publication evidence before allow. Pi still registers one exact one-shot command authorization and rederives before and after bash-time native validation. Native pre-PR binds GitHub CLI repository precedence plus the exact advertised remote head equal to reviewed local `HEAD` and keeps fetch-side semantics. Existing native push destinations are supported only when effective push and fetch URL/identity match. Split fetch/push pre-push fails closed before native validation because upstream v2.1.1 resolves `<remote>/<branch>` through fetch-side remote-tracking state; probing `pushurl` does not change that resolution. Native first-push authorization remains unsupported until a separate follow-up adds a persisted explicit advertised-base source. Publication probes are shell-free, bounded, and cancellation-aware, and complete bash-time revalidation has one aggregate bounded deadline combined with Pi cancellation when available.
+Native gates are read-only and always pass `--contract gentle-ai.review-integration/v1`. Pi registers one exact one-shot command authorization and rederives before and after bash-time native validation. Authorized direct `git commit` is rewritten through the package-owned durable transaction: run the effective pre-commit hook once, derive the post-hook index tree, validate that exact tree natively, preserve remaining hooks through proxies, commit without rerunning pre-commit, then prove `HEAD^{tree}`. An unresolved transaction blocks push, PR, and release; recovery never resets Git content automatically. Native pre-PR binds GitHub CLI repository precedence plus the exact advertised remote head equal to reviewed local `HEAD`. Publication probes remain shell-free, bounded, cancellation-aware, and fail closed on unsupported topology.
 Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise release fails closed through native receipt validation.
 Major and post-incident releases require explicit extraordinary review even when fast-path checks pass.
 
@@ -125,6 +125,6 @@ Dangerous-command safety remains independent and authoritative.
 
 SDD completion adds no review or Judgment Day pass.
 
-Review transactions, validation, and SDD perform no commit, push, PR creation, release, or publication.
+Review operations, validation, and SDD perform no push, PR creation, release, or publication. Only the separate durable commit runner may create one local commit after exact native authorization and HEAD proof.
 
 The package ensures SDD agents and chains are available as global Pi runtime assets. Its isolated package-managed `review-refuter` uses exactly `read`, `grep`, and `find`. Project/user agent definitions are overrides and may shadow package assets; never rewrite or claim their effective permissions. Use `/gentle:install-sdd --force` only for recovery or intentional global refresh.

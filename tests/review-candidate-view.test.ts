@@ -542,6 +542,67 @@ test("current lineage binding selects its exact frozen tree despite overlapping 
 	}
 });
 
+test("candidate views freeze gitlinks as immutable metadata without materializing them", (t) => {
+	const contributorRoot = repository(t);
+	const baseCommit = git(contributorRoot, "rev-parse", "HEAD");
+	const gitlinkCommit = "0123456789abcdef0123456789abcdef01234567";
+	git(contributorRoot, "update-index", "--add", "--cacheinfo", `160000,${gitlinkCommit},vendor/dependency`);
+	git(contributorRoot, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "add gitlink");
+	const view = new CandidateViewRegistry().create({ contributorRoot, baseRef: baseCommit, committedOnly: true });
+	try {
+		assert.deepEqual(view.paths, ["vendor/dependency"]);
+		assert.deepEqual(view.modes, { "vendor/dependency": "160000" });
+		assert.deepEqual(view.gitlinks, { "vendor/dependency": gitlinkCommit });
+		assert.equal(lstatSync(join(view.root, "vendor", "dependency"), { throwIfNoEntry: false }), undefined);
+		view.verify();
+	} finally {
+		view.cleanup();
+	}
+});
+
+test("native projections reconstruct symlink, intended-untracked, and gitlink identity from Git objects", (t) => {
+	const contributorRoot = repository(t);
+	const baseTree = git(contributorRoot, "rev-parse", "HEAD^{tree}");
+	writeFileSync(join(contributorRoot, "new.txt"), "new\n");
+	symlinkSync("new.txt", join(contributorRoot, "alias.txt"));
+	git(contributorRoot, "add", "new.txt", "alias.txt");
+	const gitlinkCommit = "89abcdef0123456789abcdef0123456789abcdef";
+	git(contributorRoot, "update-index", "--add", "--cacheinfo", `160000,${gitlinkCommit},vendor/dependency`);
+	const candidateTree = git(contributorRoot, "write-tree");
+	const registry = new CandidateViewRegistry();
+	registry.restoreProjectionFromNative("native-projection", contributorRoot, {
+		baseTree,
+		currentCandidateTree: candidateTree,
+		paths: ["alias.txt", "new.txt", "vendor/dependency"],
+		intendedUntracked: ["alias.txt", "new.txt"],
+		projection: "workspace",
+	});
+	const projection = registry.resolveProjection("native-projection", contributorRoot);
+	assert.deepEqual(projection.modes, { "alias.txt": "120000", "new.txt": "100644", "vendor/dependency": "160000" });
+	assert.deepEqual(projection.gitlinks, { "vendor/dependency": gitlinkCommit });
+});
+
+test("native projections recover a committed range base from its frozen tree", (t) => {
+	const contributorRoot = repository(t);
+	const baseCommit = git(contributorRoot, "rev-parse", "HEAD");
+	const baseTree = git(contributorRoot, "rev-parse", "HEAD^{tree}");
+	writeFileSync(join(contributorRoot, "tracked.txt"), "committed candidate\n");
+	git(contributorRoot, "add", "tracked.txt");
+	git(contributorRoot, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "candidate");
+	const candidateTree = git(contributorRoot, "rev-parse", "HEAD^{tree}");
+	const registry = new CandidateViewRegistry();
+	registry.restoreProjectionFromNative("committed-projection", contributorRoot, {
+		baseTree,
+		currentCandidateTree: candidateTree,
+		paths: ["tracked.txt"],
+		intendedUntracked: [],
+		projection: "workspace",
+	});
+	const projection = registry.resolveProjection("committed-projection", contributorRoot);
+	assert.equal(projection.baseCommit, baseCommit);
+	assert.equal(projection.committedOnly, true);
+});
+
 test("fresh registries restore only one exact authoritative reviewing candidate and reject zero or multiple matches", (t) => {
 	const contributorRoot = repository(t);
 	writeFileSync(join(contributorRoot, "tracked.txt"), "reviewing\n");

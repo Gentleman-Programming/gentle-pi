@@ -1205,7 +1205,7 @@ test("shipped controller and orchestrator contracts specify inspect-first compac
 	assert.match(toolContract, /blocked-legacy.*explicit.*authorization/is);
 	assert.match(toolContract, /reset.*inspect.*clean.*start/is);
 	assert.match(toolContract, /output.*lost|response.*lost|ambiguous.*START/is);
-	assert.match(toolContract, /ambiguous START or FINALIZE.*compact CAS/is);
+	assert.match(toolContract, /ambiguous START or FINALIZE.*target-scoped native status.*declared action/is);
 	assert.doesNotMatch(toolContract, /START throws.*lineage does not exist/is);
 
 	for (const path of ["assets/orchestrator-delegation.md", "skills/gentle-ai/SKILL.md"]) {
@@ -1214,7 +1214,8 @@ test("shipped controller and orchestrator contracts specify inspect-first compac
 		assert.match(contract, /mode `ordinary`|mode.*ordinary|ordinary review/is, path);
 		assert.match(contract, /Judgment Day.*explicit/is, path);
 		assert.match(contract, /before authority access.*no lineage|pre-authority.*no lineage/is, path);
-		assert.match(contract, /replay the exact START|replay the exact START or FINALIZE/is, path);
+		assert.match(contract, /unknown.*target-scoped status.*before any retry|unknown.*immediately calls target-scoped status/is, path);
+		assert.match(contract, /exact_replay_safe/is, path);
 	}
 	for (const path of ["assets/orchestrator-delegation.md", "skills/gentle-ai/SKILL.md"]) {
 		const recoveryContract = readFileSync(path, "utf8");

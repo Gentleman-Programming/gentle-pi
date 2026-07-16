@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { cpSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { resolveRepositoryAuthorityV1, setReviewRepositoryIdentityRetryHookForTesting } from "../lib/review-repository.ts";
 import { REVIEW_MODE, ReviewTransactionStore, createReviewState, setReviewMutationLockPlatformForTesting } from "../lib/review-transaction.ts";
@@ -48,6 +48,20 @@ function addOrphanRoot(root: string, branch: string, file: string): void {
 	git(root, "commit", "-m", `orphan root on ${branch}`);
 	git(root, "checkout", "main");
 }
+
+test("a Windows drive-letter Git common directory resolves repository authority", { skip: process.platform !== "win32" }, (t) => {
+	const root = repository(t);
+	const commonDirectory = git(root, "rev-parse", "--path-format=absolute", "--git-common-dir");
+	assert.match(commonDirectory, /^[A-Za-z]:[\\/]/);
+	const storeRoot = join(commonDirectory, "gentle-ai", "reviews");
+	mkdirSync(storeRoot, { recursive: true });
+	writeFileSync(join(storeRoot, "IDENTITY"), JSON.stringify({
+		object_format: "sha1",
+		root_commit_ids: [git(root, "rev-list", "--max-parents=0", "--all")],
+		schema: "gentle-ai.review-repository/v1",
+	}));
+	assert.equal(resolveRepositoryAuthorityV1(root).common_directory, resolve(commonDirectory));
+});
 
 test("linked worktrees resolve one common-directory authority", (t) => {
 	const root = repository(t);

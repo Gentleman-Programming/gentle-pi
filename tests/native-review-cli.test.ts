@@ -195,7 +195,7 @@ test("native START rejects invalid committed-range combinations before any adapt
 });
 
 test("native client accepts known versions only when they support the requested capability", async () => {
-	for (const rejectedVersion of ["2.1.1", "2.1.3", "2.1.6"]) {
+	for (const rejectedVersion of ["2.1.1", "2.1.3"]) {
 		const incompatible = queuedAdapter([{ stdout: `gentle-ai ${rejectedVersion}\n` }]);
 		await assert.rejects(
 			() => new NativeReviewCliV213(incompatible.adapter).start({ cwd: "/repo" }),
@@ -225,14 +225,14 @@ test("version process failures retain their typed failure code", async () => {
 	}
 });
 
-test("native mutation uncertainty requires exact replay", async () => {
+test("native mutation uncertainty requires target status before any replay decision", async () => {
 	const queue = queuedAdapter([VERSION, { stdout: "", timedOut: true }]);
 	await assert.rejects(
 		() => new NativeReviewCliV213(queue.adapter).start({ cwd: "/repo" }),
 		(error: unknown) => error instanceof NativeReviewCliError
 			&& error.code === NATIVE_REVIEW_ERROR_CODE.TIMEOUT
 			&& error.mutationOutcome === "unknown"
-			&& error.nextAction === "replay-exact-native-operation",
+			&& error.nextAction === "review.status",
 	);
 });
 
@@ -541,7 +541,7 @@ test("native process failures are typed and never authorize mutation", async () 
 		};
 		await assert.rejects(
 			() => new NativeReviewCliV213(adapter).start({ cwd: "/repo" }),
-			(error: unknown) => error instanceof NativeReviewCliError && error.code === scenario.code && error.mutationOutcome === "unknown" && error.nextAction === "replay-exact-native-operation",
+			(error: unknown) => error instanceof NativeReviewCliError && error.code === scenario.code && error.mutationOutcome === "unknown" && error.nextAction === "review.status",
 		);
 	}
 });
@@ -889,7 +889,7 @@ test("native cancellation fails closed and preserves mutating ambiguity", async 
 		(error: unknown) => error instanceof NativeReviewCliError
 			&& error.code === NATIVE_REVIEW_ERROR_CODE.CANCELLED
 			&& error.mutationOutcome === "unknown"
-			&& error.nextAction === "replay-exact-native-operation",
+			&& error.nextAction === "review.status",
 	);
 });
 
@@ -919,7 +919,7 @@ test("native adapter receives the controller AbortSignal without an automatic mu
 		(error: unknown) => error instanceof NativeReviewCliError
 			&& error.code === NATIVE_REVIEW_ERROR_CODE.CANCELLED
 			&& error.mutationOutcome === "unknown"
-			&& error.nextAction === "replay-exact-native-operation",
+			&& error.nextAction === "review.status",
 	);
 	assert.equal(mutationTimeoutMs, undefined);
 });

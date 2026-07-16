@@ -38,6 +38,22 @@ Each mutation MUST atomically append `{operation, idempotency_key, request_hash,
 - WHEN authority is checked
 - THEN only controller APIs MAY authorize; local files are not claimed tamper-proof
 
+### Requirement: Negotiated native ordinary authority
+
+The consumer MUST resolve the integrity-verified package-local Gentle AI v2.1.6 executable, independently hash it, negotiate `gentle-ai.review-integration/v1` outside repository context, and cache capabilities only by that digest. START, target status, FINALIZE, validation, and SDD binding MUST pass the same contract identifier. Native compact-v2 MUST be the sole mutable ordinary authority; legacy-v1 and Pi authority remain compatibility-read-only. Unknown mandatory behavior, incompatible protocol/schema identity, or executable drift MUST fail closed, while advertised optional additions MAY be ignored without disabling mandatory operations.
+
+#### Scenario: Target-scoped restart
+
+- GIVEN a fresh Pi process and existing native authority
+- WHEN target status returns a Git/content projection
+- THEN Pi reconstructs only its derived candidate view without reading provider-private authority files or selecting a lineage
+
+#### Scenario: Native failure truth
+
+- GIVEN a negotiated mutating operation fails or loses output
+- WHEN Pi reconciles an unknown result
+- THEN Pi calls target-scoped native status first, preserves the exact failure and status evidence, follows only the provider-declared action, and replays only when native declares the exact request safe
+
 ### Requirement: Mode-isolated reducers
 
 Separate reducers MUST keep mode/budget immutable, counters monotonic, and Judgment Day unreachable from ordinary.
@@ -50,17 +66,17 @@ Separate reducers MUST keep mode/budget immutable, counters monotonic, and Judgm
 
 ### Requirement: One-shot ordinary transaction
 
-Ordinary MUST run selected 0/1/4 lenses once, controller-check deterministic evidence, permit one inferential refuter batch with independent concrete proof, escalate insufficient or malformed evidence, and permit up to three failed targeted attempts under one original cumulative changed-line budget without rerunning initial lenses or refutation.
+Ordinary MUST run selected 0/1/4 lenses once, controller-check deterministic evidence, permit one inferential refuter batch with independent concrete proof, escalate insufficient or malformed evidence, and permit one correction transaction under the original changed-line budget without rerunning initial lenses or refutation.
 
 #### Scenario: Bounded ordinary work
 
 - GIVEN any finding count
 - WHEN ordinary runs
-- THEN review and refutation are one-shot while correction attempts are capped at three and share the frozen cumulative budget
+- THEN review, refutation, and correction are each one-shot within the frozen budget
 
 ### Requirement: Terminal scoped validation
 
-The authoritative ledger MUST retain immutable canonical ID-sorted identity/claim/evidence rows bound by its hash. Each correction attempt receives the same requested IDs and frozen scope, records its forecast, Git-derived actual changed lines, snapshot, and targeted validation checks, then advances only when original criteria and correction regression both pass. Failed targeted validation MAY return to `correction_required` until the third failed attempt, provided cumulative actual lines plus the next forecast remain within the original budget. Attempts MUST NOT alter claims, add work, launch discovery actors, or rerun initial lenses. No-fix runs no validator; a passing correction runs one final verification to `approved | escalated`.
+The authoritative ledger MUST retain immutable canonical ID-sorted identity/claim/evidence rows bound by its hash. The correction receives the requested IDs and frozen scope, records its forecast, Git-derived actual changed lines, snapshot, and targeted validation checks, then advances only when original criteria and correction regression both pass. Failed targeted validation MUST escalate and MUST NOT return to `correction_required`. The correction MUST NOT alter claims, add work, launch discovery actors, or rerun initial lenses. No-fix runs no validator; a passing correction runs one final verification to `approved | escalated`.
 
 #### Scenario: Fixed candidate
 
@@ -70,9 +86,9 @@ The authoritative ledger MUST retain immutable canonical ID-sorted identity/clai
 
 #### Scenario: Unfixed or failed candidate
 
-- GIVEN no fix, a failed targeted validation with remaining budget, or exhausted correction/final verification
+- GIVEN no fix, a failed targeted validation, or exhausted correction/final verification
 - WHEN reduced
-- THEN no-fix uses zero validators, bounded validation failure permits another attempt, and exhaustion or final-verification failure escalates
+- THEN no-fix uses zero validators and every validation, budget, or final-verification failure escalates without another attempt
 
 ### Requirement: Explicit Judgment Day replacement
 
@@ -101,6 +117,22 @@ Gates MUST accept only typed exact targets: intended commit tree; ordered push r
 - GIVEN a post-approval incident
 - WHEN recovery starts
 - THEN the lineage remains closed and performs no delivery
+
+### Requirement: Durable pre-commit transaction
+
+An authorized direct `git commit` MUST be replaced by one package-owned Git-common-dir transaction. It MUST bind command intent, repository/worktree identity, original HEAD/index, lineage, and recovery state; execute the effective pre-commit hook once; derive and natively validate the exact post-hook tree; preserve applicable message/post hooks through proxies without rerunning pre-commit; and prove the resulting `HEAD^{tree}` equals native authorization. Hook/validation/commit failure or interruption MUST create no silently publishable result, MUST NOT reset Git content automatically, and MUST block push, PR, and release until deterministic reconciliation or explicit safe abandonment. Amend, signing arguments, cancellation, stale locks, and exact post-hook retry MUST remain bound to the same transaction.
+
+#### Scenario: Mutating pre-commit hook
+
+- GIVEN a reviewed staged tree and a hook that formats and stages content
+- WHEN direct commit runs
+- THEN the hook runs once, native validation evaluates the formatted tree, and scope change creates no commit until that tree is reviewed; exact retry skips the completed hook
+
+#### Scenario: Commit proof or crash
+
+- GIVEN native allowed the post-hook tree
+- WHEN Git returns or the runner restarts after an uncertain boundary
+- THEN the transaction proves or reconciles `HEAD^{tree}` against that tree, and any mismatch remains a publication-blocking incident
 
 ## Acceptance Criteria
 

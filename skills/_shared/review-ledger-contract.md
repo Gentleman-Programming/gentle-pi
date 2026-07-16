@@ -45,13 +45,13 @@ Actor output cannot authorize transitions, corrections, receipts, gates, or deli
 
 ## Correction
 
-Ordinary review permits up to three failed targeted attempts within the original cumulative budget. Each attempt consists of one correction and one targeted validator.
+Ordinary review permits one correction transaction within the original budget. It consists of one correction, one targeted validator, and final verification.
 
-Before each edit, `finalize` requires a positive correction-line forecast. A forecast above the remaining budget escalates. After editing, native authority derives actual correction lines from Git and accounts them cumulatively.
+Before editing, `finalize` requires a positive correction-line forecast. A forecast above the budget escalates. After editing, native authority derives actual correction lines from Git.
 
-Initial lenses never rerun. Every attempt preserves frozen findings and genesis scope: the original candidate tree, paths, untracked set, and correction IDs. It cannot add scope.
+Initial lenses never rerun. The correction preserves frozen findings and genesis scope: the original candidate tree, paths, untracked set, and correction IDs. It cannot add scope.
 
-Each targeted validator checks only the original criteria and one correction regression for the exact correction IDs. It cannot add findings, request another correction, launch actors, persist authority, or request another attempt. Native FINALIZE alone returns `correction_required` while another bounded attempt remains. Later observations are inert follow-ups.
+The targeted validator checks only the original criteria and one correction regression for the exact correction IDs. It cannot add findings, request another correction, launch actors, persist authority, or request another attempt. Failure escalates. Later observations are inert follow-ups.
 
 Final verification evidence is supplied and hashed only during finalization. Failure escalates and never reopens review.
 
@@ -65,7 +65,7 @@ Mirrors remain non-authoritative and reconcile only after native allow.
 
 ## Lifecycle gates
 
-Pre-commit, pre-push, pre-PR, and release validate an approved receipt against one exact typed command target with zero actors. Compact validation loads authority and receipt, derives live target/publication evidence, then immediately reloads authority and re-derives target/publication evidence before allow.
+Pre-commit, pre-push, pre-PR, and release validate an approved receipt against one exact typed command target with zero actors. Native validation uses `gentle-ai.review-integration/v1`, loads authority and receipt, derives live target/publication evidence, then immediately reloads authority and re-derives target/publication evidence before allow. Authorized direct commit uses the durable hook/native-validation transaction and unresolved recovery blocks publication.
 
 PR #1216 introduced the v2.1.1 `<remote>/<branch>` selector contract that v2.1.2 inherits unchanged.
 

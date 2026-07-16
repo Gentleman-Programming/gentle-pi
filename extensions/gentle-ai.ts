@@ -146,6 +146,16 @@ import {
 	type NativeReviewStatusResult,
 	type NativeValidateResult,
 } from "../lib/native-review-cli.ts";
+import type { ReviewStatusV1 } from "../lib/review-integration-v1.ts";
+import {
+	abandonCommitTransaction,
+	assertNoUnresolvedCommitTransaction,
+	buildCommitTransactionShellCommand,
+	inspectCommitTransaction,
+	prepareCommitTransactionInvocation,
+	reconcileCommitTransaction,
+	verifyCommitTransactionResult,
+} from "../lib/git-commit-transaction.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -3992,13 +4002,19 @@ function deriveReviewGateTarget(
 		};
 	}
 	if (inspection.command.event === "pre-push") {
-		return { command: inspection.command, target: derivePushTarget(inspection.command, pinnedPushTarget) };
+		const target = derivePushTarget(inspection.command, pinnedPushTarget);
+		assertNoUnresolvedCommitTransaction(inspection.command.cwd);
+		return { command: inspection.command, target };
 	}
 	if (inspection.command.event === "pre-pr") {
-		return { command: inspection.command, target: derivePullRequestTarget(inspection.command) };
+		const target = derivePullRequestTarget(inspection.command);
+		assertNoUnresolvedCommitTransaction(inspection.command.cwd);
+		return { command: inspection.command, target };
 	}
 	if (inspection.command.event === "pre-release") {
-		return { command: inspection.command, target: deriveReleaseTarget(inspection.command) };
+		const target = deriveReleaseTarget(inspection.command);
+		assertNoUnresolvedCommitTransaction(inspection.command.cwd);
+		return { command: inspection.command, target };
 	}
 	throw new Error("Review lifecycle target kind is unsupported");
 }
@@ -4274,6 +4290,15 @@ function mapNativeStartResult(result: NativeStartResult): Record<string, unknown
 		correction_budget: result.correctionBudget,
 		action: result.action,
 		lenses_required: result.lensesRequired,
+		...(result.riskReasons === undefined ? {} : { risk_reasons: result.riskReasons }),
+	};
+}
+
+function mapNativeTargetStatus(operation: ReviewControllerOperation, status: ReviewStatusV1): Record<string, unknown> {
+	return {
+		operation,
+		status: status.applicability === "current_target" && status.action === "finalize" ? "in-progress" : status.action === "start" ? "ready" : "blocked",
+		result: status.raw,
 	};
 }
 
@@ -4499,7 +4524,22 @@ function nativeStartRejection(reason: string, field?: string): Record<string, un
 }
 
 function nativeOperationFailure(operation: ReviewControllerOperation, error: unknown): Record<string, unknown> {
-	const value = error as { mutationOutcome?: unknown; nextAction?: unknown; diagnostics?: unknown; launchAttempted?: unknown; candidateViewPreNative?: unknown };
+	const value = error as { mutationOutcome?: unknown; nextAction?: unknown; diagnostics?: unknown; launchAttempted?: unknown; candidateViewPreNative?: unknown; failureEnvelope?: { raw?: unknown; mutationOutcome?: unknown; replayability?: unknown; nextAction?: unknown } };
+	if (isRecord(value.failureEnvelope) && isRecord(value.failureEnvelope.raw)) {
+		const mutationOutcome = value.failureEnvelope.mutationOutcome;
+		return {
+			operation,
+			status: "blocked",
+			native_failure: value.failureEnvelope.raw,
+			...(mutationOutcome === "committed"
+				? { mutation_performed: true, mutation_outcome: "committed" }
+				: mutationOutcome === "unknown"
+					? { mutation_outcome: "unknown" }
+					: { mutation_performed: false, mutation_outcome: "none" }),
+			...(typeof value.failureEnvelope.replayability === "string" ? { replayability: value.failureEnvelope.replayability } : {}),
+			...(typeof value.failureEnvelope.nextAction === "string" ? { next_action: value.failureEnvelope.nextAction } : {}),
+		};
+	}
 	const mutationOutcome = value.mutationOutcome === "unknown" ? "unknown" : "none";
 	const diagnostics = error instanceof NativeReviewCliError
 		? error.diagnostics
@@ -4514,12 +4554,63 @@ function nativeOperationFailure(operation: ReviewControllerOperation, error: unk
 			? nativeStartPreAuthorityRejection()
 			: mutationOutcome === "none"
 				? { lineage_created: false, mutation_performed: false, mutation_outcome: "none" as const }
-				: { mutation_performed: false, mutation_outcome: mutationOutcome }),
+				: { mutation_outcome: mutationOutcome }),
 		...(diagnostics === undefined ? {} : { diagnostics }),
-		...(mutationOutcome === "unknown" || value.nextAction === "replay-exact-native-operation"
-			? { next_action: "replay-exact-native-operation" }
+		...(mutationOutcome === "unknown" || value.nextAction === "review.status"
+			? { replayability: "status_required", next_action: "review.status" }
 			: { next_action: "resolve-native-operation-failure" }),
 	};
+}
+
+function nativeMutationRequiresStatus(error: unknown): boolean {
+	const value = error as {
+		mutationOutcome?: unknown;
+		nextAction?: unknown;
+		failureEnvelope?: { mutationOutcome?: unknown; replayability?: unknown; nextAction?: unknown };
+	};
+	return value.mutationOutcome === "unknown" ||
+		value.nextAction === "review.status" ||
+		value.failureEnvelope?.mutationOutcome === "unknown" ||
+		value.failureEnvelope?.replayability === "status_required" ||
+		value.failureEnvelope?.nextAction === "review.status";
+}
+
+async function reconcileNativeMutationFailure(
+	operation: ReviewControllerOperation,
+	error: unknown,
+	nativeReviewCli: NativeReviewCli,
+	target: { cwd: string; lineageId?: string; baseRef?: string; projection?: "workspace" | "staged" },
+): Promise<Record<string, unknown>> {
+	const failure = nativeOperationFailure(operation, error);
+	if (!nativeMutationRequiresStatus(error)) return failure;
+	if (nativeReviewCli.targetStatus === undefined) {
+		return {
+			...failure,
+			outcome: "native-mutation-status-required",
+			replayability: "status_required",
+			next_action: "review.status",
+		};
+	}
+	try {
+		const status = await nativeReviewCli.targetStatus(target);
+		return {
+			...failure,
+			outcome: "native-mutation-status-reconciled",
+			reconciliation: status.raw,
+			authority_applicability: status.applicability,
+			provider_action: status.action,
+			replayability: status.replayability,
+			next_action: status.action,
+		};
+	} catch (statusError) {
+		return {
+			...failure,
+			outcome: "native-mutation-status-reconciliation-failed",
+			reconciliation_failure: nativeOperationFailure(REVIEW_CONTROLLER_OPERATION.STATUS, statusError),
+			replayability: "status_required",
+			next_action: "review.status",
+		};
+	}
 }
 
 function nativePublicationFailure(operation: ReviewControllerOperation, error: unknown): Record<string, unknown> {
@@ -4611,6 +4702,10 @@ async function executeReviewControllerOperation(
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.INSPECT && nativeReviewCli !== null) {
 		try {
+			if (nativeReviewCli.targetStatus !== undefined) {
+				const status = await nativeReviewCli.targetStatus({ cwd: defaultCwd, ...(signal === undefined ? {} : { signal }) });
+				return mapNativeTargetStatus(parameters.operation, status);
+			}
 			const inspection = inspectReviewAuthorityForController(defaultCwd);
 			const resetEligible = hasPiResetEligibility(inspection);
 			const publicInspection = publicReviewAuthorityInspection(inspection, resetEligible);
@@ -4824,7 +4919,7 @@ async function executeReviewControllerOperation(
 				bound.gateContext.storeRevision !== bound.authorityRevision
 			) throw Object.assign(
 				new Error("Native bind-sdd returned malformed or inconsistent binding evidence"),
-				{ mutationOutcome: "unknown", nextAction: "replay-exact-native-operation" },
+				{ mutationOutcome: "unknown", nextAction: "review.status" },
 			);
 			return { operation: parameters.operation, binding: {
 				revision: bound.revision,
@@ -4835,7 +4930,10 @@ async function executeReviewControllerOperation(
 				gate_context: bound.gateContext.raw,
 			} };
 		} catch (error) {
-			return nativeOperationFailure(parameters.operation, error);
+			return reconcileNativeMutationFailure(parameters.operation, error, nativeReviewCli, {
+				cwd: canonicalCwd,
+				lineageId: input.lineageId,
+			});
 		}
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.START) {
@@ -4846,7 +4944,7 @@ async function executeReviewControllerOperation(
 		if (rawStart.mode === REVIEW_MODE.ORDINARY && nativeReviewCli !== null) {
 			const selectorFree = !("policyPath" in rawStart) && !("baseRef" in rawStart) && !("committedOnly" in rawStart);
 			let compact: CompactNativeStartClassification | undefined;
-			if (selectorFree) {
+			if (nativeReviewCli.targetStatus === undefined && selectorFree) {
 				try {
 					const inspection = inspectReviewAuthorityForController(defaultCwd);
 					if (inspection.outcome !== "clean") {
@@ -4863,7 +4961,7 @@ async function executeReviewControllerOperation(
 					return compactNativeStartBlockedResult(compact);
 				}
 			}
-			if (typeof parameters.lineageId === "string" && isKnownPiLegacyLineage(defaultCwd, parameters.lineageId)) {
+			if (nativeReviewCli.targetStatus === undefined && typeof parameters.lineageId === "string" && isKnownPiLegacyLineage(defaultCwd, parameters.lineageId)) {
 				return { operation: parameters.operation, status: "blocked", outcome: "legacy-read-only", ...nativeStartPreAuthorityRejection(), next_action: "use-compatible-read-or-gate-route" };
 			}
 			if ("policyHash" in rawStart) return nativeStartRejection("legacy-policy-hash-unsupported");
@@ -4887,10 +4985,20 @@ async function executeReviewControllerOperation(
 				}
 			}
 			try {
-				const nativeStatus = await nativeReviewCli.reviewStatus({ cwd: defaultCwd, ...(signal === undefined ? {} : { signal }) });
-				const preconditionFailure = nativeStartPreconditionFailure(nativeStatus);
-				const routeUnrelatedIncompleteInventory = classifyNativeStartPrecondition(nativeStatus) === NATIVE_START_PRECONDITION.INCOMPLETE && mayRouteIncompleteNativeStartToUnrelatedHistory(nativeStatus, compact);
-				if (preconditionFailure !== undefined && !routeUnrelatedIncompleteInventory) return preconditionFailure;
+				if (nativeReviewCli.targetStatus !== undefined) {
+					const target = await nativeReviewCli.targetStatus({
+						cwd: defaultCwd,
+						...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
+						...(canonicalBaseRef === undefined ? {} : { baseRef: canonicalBaseRef }),
+						...(signal === undefined ? {} : { signal }),
+					});
+					if (target.applicability !== "unrelated" || target.action !== "start") return mapNativeTargetStatus(parameters.operation, target);
+				} else {
+					const nativeStatus = await nativeReviewCli.reviewStatus({ cwd: defaultCwd, ...(signal === undefined ? {} : { signal }) });
+					const preconditionFailure = nativeStartPreconditionFailure(nativeStatus);
+					const routeUnrelatedIncompleteInventory = classifyNativeStartPrecondition(nativeStatus) === NATIVE_START_PRECONDITION.INCOMPLETE && mayRouteIncompleteNativeStartToUnrelatedHistory(nativeStatus, compact);
+					if (preconditionFailure !== undefined && !routeUnrelatedIncompleteInventory) return preconditionFailure;
+				}
 			} catch (error) {
 				return nativeOperationFailure(parameters.operation, error);
 			}
@@ -4928,9 +5036,14 @@ async function executeReviewControllerOperation(
 						? Object.assign(error, { candidateViewPreNative: true })
 						: Object.assign(error instanceof Error ? error : new Error(String(error)), {
 							mutationOutcome: "unknown",
-							nextAction: "replay-exact-native-operation",
+							nextAction: "review.status",
 						});
-				return nativeOperationFailure(parameters.operation, failure);
+				return reconcileNativeMutationFailure(parameters.operation, failure, nativeReviewCli, {
+					cwd: candidateView?.root ?? defaultCwd,
+					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
+					...(canonicalBaseRef === undefined ? {} : { baseRef: candidateView?.baseCommit ?? canonicalBaseRef }),
+					projection: "workspace",
+				});
 			}
 		}
 		const inspection = inspectReviewAuthorityForController(defaultCwd);
@@ -5051,6 +5164,7 @@ async function executeReviewControllerOperation(
 		if (raw.final_evidence !== undefined && raw.final_verification_passed === undefined) throw new Error("Review controller finalize with final_evidence requires an explicit final_verification_passed boolean");
 		if (
 			nativeReviewCli !== null &&
+			nativeReviewCli.targetStatus === undefined &&
 			typeof parameters.lineageId === "string" &&
 			isKnownPiLegacyLineage(defaultCwd, parameters.lineageId)
 		) {
@@ -5064,6 +5178,7 @@ async function executeReviewControllerOperation(
 			});
 			let correctionCompletion = false;
 			let authoritativeState: unknown;
+			let negotiatedStatus: ReviewStatusV1 | undefined;
 			let candidateView: ReturnType<CandidateViewRegistry["create"]> | undefined;
 			let nativeResult: NativeFinalizeResult;
 			try {
@@ -5071,25 +5186,42 @@ async function executeReviewControllerOperation(
 				correctionCompletion = input.review_result === undefined && (input.validation !== undefined || input.validation_proof !== undefined) && input.final_evidence !== undefined;
 				const validationAttempt = input.review_result === undefined && input.correction_line_forecast === undefined && input.final_evidence !== undefined;
 				const replayKey = JSON.stringify({ cwd: defaultCwd, lineageId: parameters.lineageId ?? null, input: parameters.input ?? null, inputPath: parameters.inputPath ?? null });
-				if (validationAttempt && candidateViews && parameters.lineageId && !candidateViews.hasProjection(parameters.lineageId)) {
-					const raw = JSON.parse(readFileSync(join(resolveRepositoryAuthorityV1(defaultCwd).common_directory, "gentle-ai", "review-transactions", "v2", parameters.lineageId, "review-state.json"), "utf8"));
-					if (!isRecord(raw) || raw.schema !== "gentle-ai.review-state-record/v2" || !isRecord(raw.state) || raw.state.schema !== "gentle-ai.review-state/v2" || raw.state.lineage_id !== parameters.lineageId || raw.state.state !== "correction_required") throw new CandidateViewError("authoritative correction state is invalid");
-					const snapshots = [raw.state.initial_snapshot, raw.state.current_snapshot];
-					if (!snapshots.every((snapshot) => isRecord(snapshot) && snapshot.kind === "current-changes" && typeof snapshot.base_tree === "string" && typeof snapshot.candidate_tree === "string" && typeof snapshot.paths_digest === "string" && Array.isArray(snapshot.paths) && snapshot.paths.every((path) => typeof path === "string")) || snapshots.some((snapshot) => JSON.stringify(snapshot) !== JSON.stringify(snapshots[0]))) throw new CandidateViewError("authoritative correction snapshot is invalid");
-					const snapshot = snapshots[0] as Record<string, unknown>;
-					const head = resolveCanonicalCandidateBase(defaultCwd, "HEAD");
-					if (head.tree !== snapshot.base_tree) throw new CandidateViewError("authoritative correction base no longer matches HEAD");
-					candidateViews.restoreProjection(parameters.lineageId, defaultCwd, head.commit, snapshot.base_tree as string, snapshot.candidate_tree as string, snapshot.paths as string[]);
-					authoritativeState = raw.state;
-				}
-				candidateView = candidateViews && parameters.lineageId ? (correctionCompletion || validationAttempt) ? candidateViews.createCorrected(parameters.lineageId, defaultCwd, replayKey) : candidateViews.resolveForFinalize(parameters.lineageId) : undefined;
-				if (validationAttempt && candidateView && parameters.lineageId) {
-					const request = deriveNativeValidationRequest({ lineageId: parameters.lineageId, candidateTree: candidateView.candidateTree, state: authoritativeState ?? JSON.parse(readFileSync(join(resolveRepositoryAuthorityV1(defaultCwd).common_directory, "gentle-ai", "review-transactions", "v2", parameters.lineageId, "review-state.json"), "utf8")).state });
-					if (input.validation === undefined) {
-						candidateViews.cleanup(candidateView.token);
-						return { operation: parameters.operation, status: "blocked", outcome: "validation-required", lineage_created: false, mutation_performed: false, mutation_outcome: "none", validation_request: request };
+				if ((validationAttempt || input.review_result !== undefined) && candidateViews && parameters.lineageId && !candidateViews.hasProjection(parameters.lineageId)) {
+					if (nativeReviewCli.targetStatus !== undefined) {
+						negotiatedStatus = await nativeReviewCli.targetStatus({ cwd: defaultCwd, lineageId: parameters.lineageId, ...(signal === undefined ? {} : { signal }) });
+						if (negotiatedStatus.applicability !== "current_target" || negotiatedStatus.authority?.lineageId !== parameters.lineageId) return mapNativeTargetStatus(parameters.operation, negotiatedStatus);
+						candidateView = input.review_result === undefined
+							? (candidateViews.restoreProjectionFromNative(parameters.lineageId, defaultCwd, negotiatedStatus.projection), undefined)
+							: candidateViews.restoreForFinalizeFromNative(parameters.lineageId, defaultCwd, negotiatedStatus.projection);
+					} else {
+						const raw = JSON.parse(readFileSync(join(resolveRepositoryAuthorityV1(defaultCwd).common_directory, "gentle-ai", "review-transactions", "v2", parameters.lineageId, "review-state.json"), "utf8"));
+						if (!isRecord(raw) || raw.schema !== "gentle-ai.review-state-record/v2" || !isRecord(raw.state) || raw.state.schema !== "gentle-ai.review-state/v2" || raw.state.lineage_id !== parameters.lineageId || raw.state.state !== "correction_required") throw new CandidateViewError("authoritative correction state is invalid");
+						const snapshots = [raw.state.initial_snapshot, raw.state.current_snapshot];
+						if (!snapshots.every((snapshot) => isRecord(snapshot) && snapshot.kind === "current-changes" && typeof snapshot.base_tree === "string" && typeof snapshot.candidate_tree === "string" && typeof snapshot.paths_digest === "string" && Array.isArray(snapshot.paths) && snapshot.paths.every((path) => typeof path === "string")) || snapshots.some((snapshot) => JSON.stringify(snapshot) !== JSON.stringify(snapshots[0]))) throw new CandidateViewError("authoritative correction snapshot is invalid");
+						const snapshot = snapshots[0] as Record<string, unknown>;
+						const head = resolveCanonicalCandidateBase(defaultCwd, "HEAD");
+						if (head.tree !== snapshot.base_tree) throw new CandidateViewError("authoritative correction base no longer matches HEAD");
+						candidateViews.restoreProjection(parameters.lineageId, defaultCwd, head.commit, snapshot.base_tree as string, snapshot.candidate_tree as string, snapshot.paths as string[]);
+						authoritativeState = raw.state;
 					}
-					if (input.validation_proof !== undefined || input.validation.request_hash !== request.request_hash || canonicalJsonV1(input.validation.correction_ids) !== canonicalJsonV1(request.fix_finding_ids)) throw new Error("Native FINALIZE validation must exactly match the controller-derived request");
+				}
+				candidateView ??= candidateViews && parameters.lineageId ? (correctionCompletion || validationAttempt) ? candidateViews.createCorrected(parameters.lineageId, defaultCwd, replayKey) : candidateViews.resolveForFinalize(parameters.lineageId) : undefined;
+				if (validationAttempt && candidateView && parameters.lineageId) {
+					if (nativeReviewCli.targetStatus !== undefined) {
+						if (input.validation === undefined) {
+							candidateViews.cleanup(candidateView.token);
+							negotiatedStatus ??= await nativeReviewCli.targetStatus({ cwd: defaultCwd, lineageId: parameters.lineageId, ...(signal === undefined ? {} : { signal }) });
+							return mapNativeTargetStatus(parameters.operation, negotiatedStatus);
+						}
+						if (input.validation_proof !== undefined) throw new Error("Negotiated FINALIZE requires the native targeted validation document");
+					} else {
+						const request = deriveNativeValidationRequest({ lineageId: parameters.lineageId, candidateTree: candidateView.candidateTree, state: authoritativeState ?? JSON.parse(readFileSync(join(resolveRepositoryAuthorityV1(defaultCwd).common_directory, "gentle-ai", "review-transactions", "v2", parameters.lineageId, "review-state.json"), "utf8")).state });
+						if (input.validation === undefined) {
+							candidateViews.cleanup(candidateView.token);
+							return { operation: parameters.operation, status: "blocked", outcome: "validation-required", lineage_created: false, mutation_performed: false, mutation_outcome: "none", validation_request: request };
+						}
+						if (input.validation_proof !== undefined || input.validation.request_hash !== request.request_hash || canonicalJsonV1(input.validation.correction_ids) !== canonicalJsonV1(request.fix_finding_ids)) throw new Error("Native FINALIZE validation must exactly match the controller-derived request");
+					}
 				}
 				if (input.review_result !== undefined) {
 					if (parameters.lineageId === undefined) throw new CandidateViewError("Native FINALIZE requires an explicit lineage for refuter derivation");
@@ -5125,25 +5257,34 @@ async function executeReviewControllerOperation(
 					...(signal === undefined ? {} : { signal }),
 				});
 			} catch (error) {
-				const value = error as { mutationOutcome?: unknown; nextAction?: unknown };
-				if (correctionCompletion && candidateView && candidateViews && value.mutationOutcome !== "unknown" && value.nextAction !== "replay-exact-native-operation") candidateViews.cleanup(candidateView.token);
-				return nativeOperationFailure(parameters.operation, error);
+				if (correctionCompletion && candidateView && candidateViews && !nativeMutationRequiresStatus(error)) candidateViews.cleanup(candidateView.token);
+				return reconcileNativeMutationFailure(parameters.operation, error, nativeReviewCli, {
+					cwd: candidateView?.root ?? defaultCwd,
+					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
+					projection: "workspace",
+				});
 			}
 			try {
 				if (correctionCompletion && candidateViews && parameters.lineageId) candidateViews.promoteCorrected(parameters.lineageId, candidateView!.token);
 				candidateViews?.cleanupTerminal(nativeResult.lineageId, nativeResult.state);
 				return { operation: parameters.operation, result: mapNativeFinalizeResult(nativeResult) };
-			} catch {
+			} catch (error) {
+				const committedFailure = Object.assign(error instanceof Error ? error : new Error(String(error)), {
+					mutationOutcome: "unknown",
+					nextAction: "review.status",
+				});
 				return {
-					operation: parameters.operation,
-					status: "blocked",
-					outcome: "post-native-finalize-reconciliation-required",
+					...(await reconcileNativeMutationFailure(parameters.operation, committedFailure, nativeReviewCli, {
+						cwd: candidateView?.root ?? defaultCwd,
+						lineageId: nativeResult.lineageId,
+						projection: "workspace",
+					})),
+					reconciliation_context: "post-native-finalize",
 					mutation_performed: true,
 					mutation_outcome: "committed",
 					lineage_id: nativeResult.lineageId,
 					state: nativeResult.state,
 					store_revision: nativeResult.storeRevision,
-					next_action: "replay-exact-native-operation",
 				};
 			}
 		}
@@ -5222,6 +5363,18 @@ async function executeReviewControllerOperation(
 		};
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.STATUS) {
+		if (nativeReviewCli?.targetStatus !== undefined) {
+			try {
+				const status = await nativeReviewCli.targetStatus({
+					cwd: defaultCwd,
+					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
+					...(signal === undefined ? {} : { signal }),
+				});
+				return mapNativeTargetStatus(parameters.operation, status);
+			} catch (error) {
+				return nativeOperationFailure(parameters.operation, error);
+			}
+		}
 		if (parameters.lineageId === undefined) return nativeStatusUnsupported(parameters.operation);
 		const compactExists = compactV2LineageExists(defaultCwd, parameters.lineageId!);
 		const graphExists = graphV1LineageExists(defaultCwd, parameters.lineageId!);
@@ -5316,8 +5469,9 @@ async function executeReviewControllerOperation(
 	if (
 		nativeReviewCli !== null &&
 		typeof parameters.lineageId === "string" &&
-		!compactV2LineageExists(derived.command.cwd, parameters.lineageId) &&
-		!graphV1LineageExists(derived.command.cwd, parameters.lineageId)
+		(nativeReviewCli.targetStatus !== undefined
+			? !graphV1LineageExists(derived.command.cwd, parameters.lineageId)
+			: !compactV2LineageExists(derived.command.cwd, parameters.lineageId) && !graphV1LineageExists(derived.command.cwd, parameters.lineageId))
 	) {
 		try {
 			const nativeDerived = await deriveNativePublicationTarget(
@@ -5326,6 +5480,11 @@ async function executeReviewControllerOperation(
 				publicationProbeTimeoutMs,
 				signal,
 			);
+			if (nativeDerived.command.event === "pre-commit" && candidateViews && !candidateViews.hasProjection(parameters.lineageId) && nativeReviewCli.targetStatus !== undefined) {
+				const targetStatus = await nativeReviewCli.targetStatus({ cwd: nativeDerived.command.cwd, lineageId: parameters.lineageId, projection: "staged", ...(signal === undefined ? {} : { signal }) });
+				if (targetStatus.applicability !== "current_target" || targetStatus.authority?.lineageId !== parameters.lineageId) return mapNativeTargetStatus(parameters.operation, targetStatus);
+				candidateViews.restoreProjectionFromNative(parameters.lineageId, nativeDerived.command.cwd, targetStatus.projection);
+			}
 			const intendedTree = assertFrozenPreCommitProjection(nativeDerived, parameters.lineageId, candidateViews);
 			const result = await nativeReviewCli.validate({
 				cwd: nativeDerived.command.cwd,
@@ -5777,6 +5936,7 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 	if (!Number.isSafeInteger(bashTimeRevalidationTimeoutMs) || bashTimeRevalidationTimeoutMs <= 0) throw new TypeError("Bash-time revalidation timeout must be a positive safe integer");
 	return function gentleAi(pi: ExtensionAPI): void {
 	const pendingReviewAuthorizations = new Map<string, PendingReviewAuthorization>();
+	const pendingCommitTransactions = new Map<string, { cwd: string; transactionId: string }>();
 	const candidateViews = dependencies.candidateViews === undefined ? new CandidateViewRegistry() : dependencies.candidateViews;
 
 	pi.registerTool({
@@ -5790,7 +5950,7 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 			"For non-destructive legacy recovery, call prepare-supersession with one exact change, source, successor, operation, and prepared evidence input. Call supersede only with the returned request hash and exact English challenge after fresh UI approval; it never falls back to RESET or RECOVER. Headless, stale, conflicting, malformed, or unsupported recovery remains resolve-review blocked; exact retries are idempotent, but semantic retries require a new operation.",
 			"Run selected lenses once, then call FINALIZE with a JSON string containing review_result.lens_results entries for every START-selected lens. Each entry has lens, findings, and non-empty evidence; clean lenses use findings: []. Pair final_evidence with final_verification_passed. This Pi wrapper shape differs from native CLI --result, --refuter, --validation, and --evidence files. FINALIZE alone records correction forecast, Git-derived correction evidence, targeted validation, and final evidence. Use ADVANCE only for explicit graph-v1 Judgment Day.",
 			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization for the exact reset_request challenge, then call RESET or RECOVER only after authorization. RESET and RECOVER internally INSPECT authority; require their verified clean result and next_action start-fresh-ordinary-review-after-verified-clean before continuing directly to a fresh ordinary START.",
-			"A reported lineage_created false or pre-authority validation error proves no lineage was created. After ambiguous START or FINALIZE output, replay the exact operation so compact CAS returns the committed revision or rejects a stale/semantic retry.",
+			"A reported lineage_created false or pre-authority validation error proves no lineage was created. After ambiguous START or FINALIZE output, the controller calls target-scoped native status first and returns only its declared action. Never infer or prescribe replay unless native explicitly reports exact_replay_safe for the same canonical request and required lineage.",
 			"Use gentle_review for bounded review transaction operations and exact lifecycle validation; never fabricate bash tool metadata or a separate gate target.",
 		],
 		parameters: REVIEW_CONTROLLER_PARAMETERS,
@@ -5825,6 +5985,24 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		try {
+			const transactionRecovery = reconcileCommitTransaction(ctx.cwd);
+			if (ctx.hasUI && transactionRecovery.status !== "clean") {
+				ctx.ui.notify(
+					transactionRecovery.status === "active"
+						? `Commit transaction ${transactionRecovery.record!.transaction_id} requires recovery from ${transactionRecovery.record!.state}. Publication remains blocked.`
+						: `Commit transaction recovery state is corrupted: ${transactionRecovery.reason}`,
+					"warning",
+				);
+			}
+		} catch (error) {
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					`Gentle AI could not inspect commit transaction recovery state: ${error instanceof Error ? error.message : String(error)}`,
+					"warning",
+				);
+			}
+		}
 		try {
 			const installResult = installSddAssets(ctx.cwd, true);
 			migrateLegacyProjectModelOverrides(ctx.cwd);
@@ -5911,8 +6089,13 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 		if (event.toolName !== "bash") return undefined;
 		if (!isRecord(event.input) || typeof event.input.command !== "string")
 			return undefined;
-		return enforceReviewGateAndCommandSafety(
-			event.input.command,
+		const originalCommand = event.input.command;
+		const inspection = inspectReviewLifecycleCommand(originalCommand, ctx.cwd);
+		const nativeCommitAuthorization = inspection.command?.event === "pre-commit"
+			? pendingReviewAuthorizations.get(reviewAuthorizationKey(originalCommand, inspection.command.cwd))
+			: undefined;
+		const gateResult = await enforceReviewGateAndCommandSafety(
+			originalCommand,
 			(command) => {
 				const deadline = AbortSignal.timeout(bashTimeRevalidationTimeoutMs);
 				const signal = ctx.signal === undefined ? deadline : AbortSignal.any([ctx.signal, deadline]);
@@ -5920,6 +6103,50 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 			},
 			(command) => confirmCommand(command, ctx),
 		);
+		if (gateResult) return gateResult;
+		if (inspection.command?.event !== "pre-commit" || nativeCommitAuthorization?.native_gate === undefined) return undefined;
+		if (nativeReviewCli?.targetStatus === undefined) return undefined;
+		if (nativeCommitAuthorization.native_gate.intended_tree === undefined) {
+			return { block: true, reason: "Gentle AI pre-commit authorization omitted the exact reviewed tree required by the durable commit transaction." };
+		}
+		try {
+			const invocation = prepareCommitTransactionInvocation({
+				command: originalCommand,
+				cwd: inspection.command.cwd,
+				arguments: inspection.command.arguments,
+				authorization: {
+					lineageId: nativeCommitAuthorization.native_gate.lineage_id,
+					storeRevision: nativeCommitAuthorization.native_gate.store_revision,
+					fingerprint: nativeCommitAuthorization.native_gate.fingerprint,
+					intendedTree: nativeCommitAuthorization.native_gate.intended_tree,
+				},
+			});
+			event.input.command = buildCommitTransactionShellCommand(invocation);
+			pendingCommitTransactions.set(event.toolCallId, { cwd: invocation.cwd, transactionId: invocation.transactionId });
+			return undefined;
+		} catch (error) {
+			return { block: true, reason: `Gentle AI pre-commit transaction preparation failed closed: ${error instanceof Error ? error.message : String(error)}` };
+		}
+	});
+
+	pi.on("tool_result", async (event) => {
+		if (event.toolName !== "bash") return undefined;
+		const pending = pendingCommitTransactions.get(event.toolCallId);
+		if (pending === undefined) return undefined;
+		pendingCommitTransactions.delete(event.toolCallId);
+		if (event.isError) return undefined;
+		try {
+			verifyCommitTransactionResult(pending.cwd, pending.transactionId);
+			return undefined;
+		} catch (error) {
+			return {
+				isError: true,
+				content: [
+					...event.content,
+					{ type: "text", text: `Gentle AI commit transaction tool_result proof failed closed: ${error instanceof Error ? error.message : String(error)}` },
+				],
+			};
+		}
 	});
 
 	pi.registerCommand("gentle:install-sdd", {
@@ -5984,6 +6211,26 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 		description: "Resolve SDD status and route the next phase deterministically.",
 		handler: async (args, ctx) => {
 			await handleSddContinueCommand(args, ctx);
+		},
+	});
+
+	pi.registerCommand("gentle:commit-status", {
+		description: "Inspect the durable Git commit transaction for this worktree.",
+		handler: async (_args, ctx) => {
+			const inspection = inspectCommitTransaction(ctx.cwd);
+			ctx.ui.notify(JSON.stringify(inspection, null, 2), inspection.status === "clean" ? "info" : "warning");
+		},
+	});
+
+	pi.registerCommand("gentle:commit-abort", {
+		description: "Explicitly abandon an unresolved commit transaction without changing HEAD or the index.",
+		handler: async (_args, ctx) => {
+			try {
+				const record = abandonCommitTransaction(ctx.cwd);
+				ctx.ui.notify(`Commit transaction ${record.transaction_id} was abandoned without modifying Git content.`, "warning");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
 		},
 	});
 

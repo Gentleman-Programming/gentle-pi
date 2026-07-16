@@ -16,7 +16,7 @@ import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 const execFileAsync = promisify(execFile);
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const binary = resolveGentleAiBinary(packageRoot, process.platform);
-const OFFICIAL_BINARY_SHA256 = "d2cf080ebb92f73ef30aaf36eb7ca6eeb750592d670a71ca5a045f121edf9071";
+const OFFICIAL_BINARY_SHA256 = "a7bbfcf58c4b6e933672338984ec011251595155198047f20c41a69242c6cf5d";
 const REVIEWED_PATHS = ["tracked.txt", "initially-untracked.txt"] as const;
 // Golden captured by the clean external-artifact differential fixture for v2.1.3.
 // This is released runtime output, not a locally reconstructed authority digest.
@@ -152,11 +152,11 @@ async function finalizeEmptyReview(repository: string, artifacts: string, starte
 	return run(binary, ["review", "finalize", "--cwd", repository, "--lineage", started.lineage_id, ...resultFiles.flatMap((result) => ["--result", result]), "--evidence", evidence], repository);
 }
 
-test("official v2.1.5 package runtime authorizes an unchanged linked-view candidate and denies a changed staging tree", async (t) => {
+test("official v2.1.6 package runtime authorizes an unchanged linked-view candidate and denies a changed staging tree", async (t) => {
 	assert.equal(createHash("sha256").update(await readFile(binary)).digest("hex"), OFFICIAL_BINARY_SHA256);
-	assert.deepEqual(await run(binary, ["version"], packageRoot), { exitCode: 0, stdout: "gentle-ai 2.1.5\n", stderr: "" });
+	assert.deepEqual(await run(binary, ["version"], packageRoot), { exitCode: 0, stdout: "gentle-ai 2.1.6\n", stderr: "" });
 
-	const workspace = await mkdtemp(join(tmpdir(), "gentle-pi-v215-parity-"));
+	const workspace = await mkdtemp(join(tmpdir(), "gentle-pi-v216-parity-"));
 	const repository = join(workspace, "repository");
 	const view = join(workspace, "candidate-view");
 	const artifacts = join(workspace, "artifacts");
@@ -231,7 +231,7 @@ test("official v2.1.5 package runtime authorizes an unchanged linked-view candid
 	await restoreCandidate(repository, candidateTree);
 });
 
-test("official v2.1.5 package runtime keeps frozen candidate lineages and receipts isolated across replay and replacement", async (t) => {
+test("official v2.1.6 package runtime keeps frozen candidate lineages and receipts isolated across replay and replacement", async (t) => {
 	const workspace = await mkdtemp(join(tmpdir(), "gentle-pi-v215-lineage-"));
 	const repository = join(workspace, "repository");
 	const artifacts = join(workspace, "artifacts");

@@ -54,7 +54,7 @@ The controller MUST verify `deterministic` evidence directly. All `inferential-s
 
 ### Requirement: Bounded convergence and Judgment Day
 
-Ordinary MAY authorize up to three failed targeted attempts within the original cumulative changed-line budget. Each attempt uses one positive pre-edit forecast, one correction bound to the frozen IDs and genesis paths, and one validator result for original criteria plus correction regression. Failed targeted validation returns to `correction_required` while both attempt and cumulative budget remain; it never reruns initial lenses or refutation, changes frozen claims, adds work, or launches discovery actors. A passing targeted validation advances to one final verification; the third failed attempt or cumulative-budget exhaustion escalates. No-fix uses zero validators. Explicit Judgment Day replaces ordinary, uses two blind judges/zero refuters, and alone permits discovery re-judgment rounds.
+Ordinary MAY enter `correction_required` once and authorize one correction transaction within the original changed-line budget. It uses one positive pre-edit forecast, one correction bound to the frozen IDs and genesis paths, one validator result for original criteria plus correction regression, and one final verification. Failed targeted validation, budget exhaustion, malformed evidence, or final-verification failure escalates; it never reruns initial lenses or refutation, changes frozen claims, adds work, or launches discovery actors. No-fix uses zero validators. Explicit Judgment Day replaces ordinary, uses two blind judges/zero refuters, and alone permits discovery re-judgment rounds.
 (Previously: shared iteration.)
 
 #### Scenario: Fix path
@@ -65,9 +65,9 @@ Ordinary MAY authorize up to three failed targeted attempts within the original 
 
 #### Scenario: No-fix or failure
 
-- GIVEN no fix, a failed targeted validation with budget remaining, or exhausted correction/final verification
+- GIVEN no fix, a failed targeted validation, or exhausted correction/final verification
 - WHEN reduced
-- THEN no-fix has zero validators, a bounded failed attempt returns to correction, and exhausted or final-verification failure escalates
+- THEN no-fix has zero validators and every failed correction or final verification escalates without another attempt
 
 #### Scenario: Judgment Day
 

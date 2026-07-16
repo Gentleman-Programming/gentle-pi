@@ -195,7 +195,7 @@ It also records:
 - `mutationOutcome: "none" | "unknown"`;
 - bounded exit/signal/stderr diagnostics.
 
-Pre-launch validation failures report `mutationOutcome: "none"`. Timeout, signal, output overflow, or lost/malformed successful output after a mutating launch report `mutationOutcome: "unknown"` and `next_action: "replay-exact-native-operation"`. For `bind-sdd`, this committed-or-ambiguous rule also applies when an exit-zero result fails strict schema or post-call identity validation: the native call already occurred and may have committed, so Pi blocks readiness and authorization and does not claim zero mutation. Pi must not claim `lineage_created: false` after an ambiguous launch. No error creates local authority, binding, receipt, approval, or authorization.
+Pre-launch validation failures report `mutationOutcome: "none"`. Timeout, signal, output overflow, or lost/malformed successful output after a mutating launch report `mutationOutcome: "unknown"` and require target-scoped `review.status` before any replay decision. For `bind-sdd`, this committed-or-ambiguous rule also applies when an exit-zero result fails strict schema or post-call identity validation: the native call already occurred and may have committed, so Pi blocks readiness and authorization, queries target status, and does not claim zero mutation. Pi must not claim `lineage_created: false` after an ambiguous launch. No error creates local authority, binding, receipt, approval, or authorization.
 
 ## Controller integration and public envelopes
 

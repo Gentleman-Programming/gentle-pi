@@ -15,7 +15,7 @@ Partial — implementation batch 5 completed work unit 3. No review, receipt, ga
 - Added `GentleAiRuntimeDependencies` and `createGentleAiExtension(dependencies)` while retaining the default package export as the production wrapper using `createNativeReviewCli()`.
 - Made controller execution asynchronous and routed new ordinary `START`, native-lineage `FINALIZE`, and unknown-lineage `VALIDATE` through exactly one native client method.
 - Added stable native public mappings: native `risk_level` maps to `risk_tier`; `changed_lines` maps to `original_changed_lines`; receipt paths remain opaque.
-- Native errors return a typed blocked envelope and never fall through to compact-v2 or graph-v1 mutation. Ambiguous mutating outcomes require `replay-exact-native-operation`.
+- Native errors return a typed blocked envelope and never fall through to compact-v2 or graph-v1 mutation. Ambiguous mutating outcomes require target-scoped `review.status`; Pi follows only the provider-declared action.
 - Preserved explicit Judgment Day and legacy test routes. Existing known compact-v2/graph-v1 lineages return `legacy-read-only` for ordinary mutation under native routing.
 - Kept lineage-free general `STATUS` and mixed-inventory `INSPECT` on the typed `native-status-unsupported` boundary before any native invocation.
 - Added fake-client controller tests for success, stable mapping, no-fallback ambiguity, and zero-call unsupported status.

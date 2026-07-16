@@ -114,13 +114,27 @@ test("package verification names the native review runtime boundary and packaged
 	const manifest = readPackageJson();
 
 	assert.ok(manifest.files?.includes("lib/"), "the published package must include the native review runtime module directory");
+	assert.ok(manifest.files?.includes("runtime/"), "the published package must include the generated JavaScript transaction runtime");
 	assert.match(verifier, /"lib\/native-review-cli\.ts"/, "package verification must require the native review adapter from the packaged runtime");
+	assert.match(verifier, /"runtime\/git-commit-transaction\.mjs"/, "package verification must require the installed JavaScript transaction runtime");
+	assert.match(verifier, /build-git-commit-transaction-runner\.mjs.*--check/s, "package verification must reject generated-runtime drift");
 	assert.match(verifier, /"tests\/fixtures\/native-review-cli\/v2\.1\.3\/start\.json"/, "package verification must retain the pinned native decoder fixture");
 	assert.match(
 		readFileSync(join(PACKAGE_ROOT, "extensions", "gentle-ai.ts"), "utf8"),
 		/createNativeReviewCli\(\)/,
 		"the production extension must construct its native client from the packaged runtime module",
 	);
+});
+
+test("installed commit transaction runner loads JavaScript only and has deterministic build checks", () => {
+	const packageJson = readPackageJson();
+	const runner = readFileSync(join(PACKAGE_ROOT, "scripts", "run-git-commit-transaction.mjs"), "utf8");
+	assert.equal(packageJson.scripts?.["build:transaction-runner"], "node scripts/build-git-commit-transaction-runner.mjs --write");
+	assert.equal(packageJson.scripts?.["check:transaction-runner"], "node scripts/build-git-commit-transaction-runner.mjs --check");
+	assert.equal(packageJson.scripts?.["test:packed-runner"], "node scripts/test-packed-runner.mjs");
+	assert.match(runner, /\.\.\/runtime\/git-commit-transaction\.mjs/);
+	assert.doesNotMatch(runner, /\.ts["']/);
+	assert.doesNotMatch(runner, /experimental-strip-types/);
 });
 
 test("package manifest ships and runs the checked-in package-local Gentle AI installer", () => {
@@ -1015,14 +1029,15 @@ test("pi-pretty wrapper uses real package path resolution for pnpm symlink insta
 	assert.match(wrapper, /quietToolsEnabled/);
 });
 
-test("v1.0.6 release package and runtime stop before delivery or publication", () => {
+test("v1.1.0 release package and runtime stop before publication", () => {
 	const packageJson = readPackageJson();
-	assert.equal(packageJson.version, "1.0.6", "the release manifest must remain explicitly pinned to v1.0.6");
+	assert.equal(packageJson.version, "1.1.0", "the release manifest must remain explicitly pinned to v1.1.0");
 	assert.equal(
 		packageJson.scripts?.test,
 		"node --experimental-strip-types --test tests/*.test.ts && pnpm run test:harness",
 	);
 	assert.ok(packageJson.files?.includes("assets/"));
+	assert.ok(packageJson.files?.includes("contracts/"));
 
 	const verifier = readFileSync(join(PACKAGE_ROOT, "scripts", "verify-package-files.mjs"), "utf8");
 	assert.match(verifier, /assets\/agents\/review-refuter\.md/);

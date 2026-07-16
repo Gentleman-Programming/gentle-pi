@@ -20,6 +20,6 @@ test("recovery guidance documents the non-destructive supersession contract", ()
 test("controller help keeps authorization, blocked outcomes, and recovery boundaries explicit", () => {
 	assert.match(CONTROLLER, /prepare-supersession.*fresh UI approval.*never falls back to RESET or RECOVER/is);
 	assert.match(CONTROLLER, /headlessly|headless/i);
-	assert.match(CONTROLLER, /exact retry|semantic retry/i);
+	assert.match(CONTROLLER, /exact retr(?:y|ies)|semantic retr(?:y|ies)/i);
 	assert.match(CONTROLLER, /resolve-review/);
 });

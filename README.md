@@ -58,7 +58,7 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | **Skill creation workflow**    | Provides the `gentle-ai-skill-creator`/`gentle-ai-skill-improver` skills, `/skill-creation` prompt, and packaged style guide for LLM-first skills. |
 | **Delivery skills**            | Includes issue-first PRs, chained PRs, work-unit commits, cognitive docs, comment writing, and Judgment Day review.                           |
 | **Bounded native review**      | Freezes one candidate, dispatches only controller-selected lenses, records native authority, and reuses the same content-bound receipt at delivery gates. |
-| **Verified native runtime**    | Provisions the exact package-local Gentle AI v2.1.5 binary, verifies pinned archive/binary integrity, and rejects PATH, global, sibling, symlink, and mode fallbacks. |
+| **Verified native runtime**    | Provisions the exact package-local Gentle AI v2.1.6 binary, verifies pinned archive/binary integrity, negotiates `review-integration/v1`, and rejects PATH, global, sibling, symlink, and mode fallbacks. |
 | **Runtime safety**             | Blocks destructive shell commands, asks for confirmation for sensitive operations, and blocks direct read/write/edit access to sensitive paths. |
 
 ## Install
@@ -67,7 +67,7 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 pi install npm:gentle-pi
 ```
 
-The npm postinstall downloads the exact platform-specific official Gentle AI v2.1.5 archive into this package's private `.gentle-ai/v2.1.5/` directory and verifies its pinned SHA-256 before extraction. It never uses `PATH` or a global `gentle-ai` installation. For development or offline installs only, set `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1`; native review operations then fail closed with an actionable `package-local-binary-missing` error until the package is reinstalled normally.
+The npm postinstall downloads the exact platform-specific official Gentle AI v2.1.6 archive into this package's private `.gentle-ai/v2.1.6/` directory and verifies its pinned archive and executable SHA-256 values before extraction. It never uses `PATH` or a global `gentle-ai` installation. For development or offline installs only, set `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1`; native review operations then fail closed with an actionable `package-local-binary-missing` error until the package is reinstalled normally.
 
 Recommended companion packages:
 
@@ -99,6 +99,8 @@ pi
 /gentle:models             Assign global model/effort routing to SDD/custom agents.
 /gentle:persona            Switch between gentleman and neutral persona modes.
 /gentle:banner             Configure startup rose, text logo, and color preset.
+/gentle:commit-status      Inspect an unresolved durable commit transaction.
+/gentle:commit-abort       Abandon safe recovery state without changing HEAD or the index.
 ```
 
 Typical flow:
@@ -189,9 +191,9 @@ flowchart TD
     D --> F
     E --> F
     F --> G["Independent verification"]
-    G --> H["INSPECT authority"]
-    H -->|Applicable invalid authority| X["Blocked: explicit recovery required"]
-    H -->|Clean or unrelated history| I["START freezes candidate, scope, tier, lenses, and budget"]
+    G --> H["Target-scoped native status"]
+    H -->|Ambiguous or corrupted| X["Blocked: native maintainer action"]
+    H -->|Unrelated| I["START freezes candidate, scope, tier, lenses, and budget"]
 
     subgraph Ordinary_review["Ordinary bounded review"]
         I --> R["reviewing"]
@@ -203,16 +205,17 @@ flowchart TD
         C2 --> C3["Apply scoped fix"]
         C3 --> V["validating"]
         V -->|Validator passes| A1
-        V -->|Fails; attempt and budget remain| C1
-        V -->|Malformed, out of scope, or exhausted| E1["escalated"]
+		V -->|Fails, malformed, or out of scope| E1["escalated"]
     end
 
     A1 --> P["Receipt binds the exact candidate tree"]
     P --> PC["Stage reviewed paths"]
-    PC --> G1{"pre-commit validate"}
-    G1 -->|allow| CM["Commit"]
-    G1 -->|scope changed| N["Start a new lineage"]
-    G1 -->|invalidated or escalated| X
+    PC --> G1{"durable commit transaction"}
+    G1 --> HK["Run effective pre-commit hook once"]
+    HK --> NV{"validate exact post-hook tree"}
+    NV -->|allow| CM["Commit through hook proxies and prove HEAD tree"]
+    NV -->|scope changed| N["Review post-hook tree; exact retry skips completed hook"]
+    NV -->|invalidated or escalated| X
     CM --> G2{"pre-push validate"}
     G2 -->|allow| PS["Push"]
     G2 -->|deny| X
@@ -230,9 +233,13 @@ flowchart TD
 
 Lifecycle gates never launch review actors. They rederive Git and publication targets, validate the existing receipt, and authorize one exact command. Any target drift, stale evidence, malformed authority, or unprovable state blocks delivery instead of silently reopening review.
 
-Native contract pairing is exact: this adapter supports `gentle-ai 2.1.5` only from its package-local verified binary and rechecks that version before every native operation. Production native operations resolve an absolute package-owned path and never fall back to `PATH` or a global executable. Once v2.1.5 has written review authority, rollback MUST preserve every native store and receipt and MUST NOT run a downgraded binary against that repository. Disable the Pi route or roll forward to a compatible authority-aware release instead; deleting authority data or reinstalling an older binary is not a rollback path.
+Native contract pairing is exact: this adapter resolves only the integrity-verified package-local Gentle AI v2.1.6 executable, independently hashes it, then negotiates `gentle-ai.review-integration/v1` outside the repository. Capabilities are cached by that executable digest. Every START, target status, FINALIZE, validate, and BIND-SDD request passes the same contract identifier. Current protocol 1.0 envelopes decode exactly against the vendored schemas; optional additions require a future compatible schema/minor that the provider explicitly advertises and the consumer negotiates.
 
-Gentle AI v2.1.5 supports `gentle-ai review start --projection staged`, and upstream `main` now documents that focused-index workflow. The current `gentle-pi` adapter intentionally submits `projection: "workspace"` and does not expose staged projection yet. Native binary capability is not automatically a Pi adapter contract; package support still requires an adapter update, parity fixtures, and bounded validation.
+Target status owns `current_target`, `unrelated`, `ambiguous`, and `corrupted` applicability and returns one native action. Pi does not reconstruct ordinary authority from provider-private files or choose a lineage from repository-wide history. Restart recovery rebuilds only the derived candidate view from the native Git/content projection, including intended-untracked paths, symlinks, and immutable gitlink identities. Native failure envelopes retain their exact mutation outcome, replayability, required inputs, request digest, and next action. After an unknown or lost mutating result, Pi calls target status before any replay decision and returns only the provider-declared action.
+
+Direct authorized `git commit` commands use a durable recovery record under the Git common directory. The package runs the effective pre-commit hook once, captures the post-hook index, performs final native validation against that tree, suppresses only the already-completed pre-commit hook while preserving message/post hooks through proxies, and proves `HEAD^{tree}` before the tool result succeeds. Any unresolved, interrupted, failed, or mismatched transaction blocks push, PR, and release. Recovery never resets HEAD or the index automatically.
+
+Once v2.1.6 has written review authority, rollback MUST preserve every native store and receipt and MUST NOT run a downgraded binary against that repository. Disable the Pi route or roll forward to a compatible authority-aware release instead; deleting authority data or reinstalling an older binary is not a rollback path.
 
 ### FINALIZE wrapper input
 
@@ -268,13 +275,13 @@ Refuter proof may be independent concrete reproduction evidence; it does not nee
 
 When native IDs are assigned to inferential findings, the first FINALIZE returns their canonical rows and a content-derived request hash without mutation; the second replays identical lens input with that hash and one complete refuter batch.
 
-Ordinary permits up to three failed targeted attempts within the original cumulative budget; each attempt is one correction plus one targeted validator. FINALIZE requires a positive forecast before editing and derives actual correction lines from Git. Initial lenses are never rerun, while frozen findings and genesis scope remain unchanged.
+Ordinary permits one correction transaction within the original budget. FINALIZE requires a positive forecast before editing and derives actual correction lines from Git; one targeted validator and final verification close that transaction. Initial lenses are never rerun, while frozen findings and genesis scope remain unchanged.
 
 The validator checks original criteria and correction regression only and cannot add scope or findings. Final evidence is hashed during FINALIZE, never at START.
 
 Compact ordinary has five states: `reviewing`, `correction_required`, `validating`, `approved`, and `escalated`.
 
-Each validator invocation cannot change claims, add findings, request fixes, launch actors, or request another attempt. Native FINALIZE alone returns `correction_required` while another bounded attempt remains.
+The validator cannot change claims, add findings, request fixes, launch actors, or request another attempt. A failed correction escalates instead of opening another review budget.
 
 Compact authority uses content-derived CAS under the Git common directory. Exact retries are idempotent; stale/semantic retries, terminal mutation, and same-lineage graph-v1/compact-v2 ambiguity fail closed.
 
@@ -303,7 +310,7 @@ Dangerous-command safety remains independent and authoritative.
 
 SDD completion adds no review or Judgment Day pass.
 
-Review transactions, validation, and SDD perform no commit, push, PR creation, release, or publication.
+Review operations, validation, and SDD perform no push, PR creation, release, or publication. The separate durable commit runner may create exactly one local commit only after final native pre-commit validation and post-commit tree proof.
 
 `review-refuter` uses exactly `read`, `grep`, and `find` in a package-managed isolated installation. Project and user overrides may shadow the package asset; `gentle-pi` preserves those definitions and does not claim their effective permissions are package-compliant.
 
@@ -625,9 +632,12 @@ Memory contract for SDD delegation:
 | ------------------------------ | ---------------------------------------------------------------------------------------------------------- |
 | `extensions/gentle-ai.ts`      | Injects identity, orchestrates native review authority and lifecycle gates, refreshes global SDD assets, registers commands, applies model/persona config, and enforces runtime safety. |
 | `lib/native-review-cli.ts`     | Strict package-local adapter for Gentle AI START, FINALIZE, VALIDATE, SDD binding, and status contracts.     |
+| `lib/review-integration-v1.ts` | Strict consumer decoder for negotiated capabilities, operations, target status, projections, and failures.  |
+| `lib/git-commit-transaction.ts` | Durable hook/native-validation/commit/recovery transaction with publication blocking and HEAD proof.        |
 | `lib/review-candidate-view.ts` | Builds immutable changed-scope actor views while preserving full-tree, path, mode, symlink, and index integrity. |
 | `lib/gentle-ai-binary.ts`      | Resolves and verifies the confined package-local Gentle AI runtime without global or PATH fallback.          |
 | `scripts/gentle-ai-installer.mjs` | Downloads, verifies, extracts, and atomically promotes the pinned native runtime for six platform targets. |
+| `contracts/review-integration/v1/` | Exact v2.1.6 provider schemas and conformance fixtures, hash-checked before packaging.                       |
 | `extensions/startup-banner.ts` | Shows and configures the startup intro, color presets, compact runtime panel, and collaboration credit.     |
 | `extensions/sdd-init.ts`       | Registers `/sdd-init` for OpenSpec initialization.                                                         |
 | `extensions/skill-registry.ts` | Maintains `.atl/skill-registry.md` from project/user skills and closes file watchers on shutdown.          |

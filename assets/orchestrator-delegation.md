@@ -179,17 +179,19 @@ If multiple rows match, run the narrow set that covers the risk. Example: shell 
 
 ### Compact Controller Routing
 
-Call `gentle_review` INSPECT before START. On `clean`, new ordinary review uses compact v2:
+Call `gentle_review` INSPECT before START. INSPECT delegates to negotiated target-scoped native status. When applicability is `unrelated` and native action is `start`, new ordinary review uses compact v2:
 
 ```json
-{"operation":"start","lineageId":"<optional-lineage>","input":"{\"mode\":\"ordinary\",\"policyHash\":\"<hash>\"}"}
+{"operation":"start","input":"{\"mode\":\"ordinary\",\"policyPath\":\"<optional-repository-local-path>\"}"}
 ```
 
 Use `start -> finalize -> validate` for ordinary review. START derives complete Git/untracked scope, lineage, tier, selected lenses, authored changed lines, and the correction budget. Use graph-v1 `judgment-day` only when explicitly selected.
 
-When INSPECT or START reports `blocked-legacy` or `blocked-mixed`, do not retry START and do not present migration as an option. Explain that the old receipts, approvals, ledgers, and lineages will lose authority, then request explicit user authorization for the exact returned `reset_request.confirmation`. RESET and RECOVER independently require a fresh operation-bound confirmation through the interactive Pi UI and fail closed in headless execution. The UI boundary cannot cryptographically attest the human's identity, so its residual trust is the operator controlling that Pi session; challenge freshness and repository/inventory binding remain runtime-enforced. Only after authorization, call RESET with the exact serialized `reset_request`; RESET and RECOVER internally INSPECT authority, and only a returned `clean` inspection with `start-fresh-ordinary-review-after-verified-clean` permits an immediate fresh ordinary START. If INSPECT reports `reset-in-progress`, use its durable original `reset_request` for authorized RECOVER.
+When target status is `current_target`, follow its single native action. `ambiguous` requires native lineage selection and `corrupted` requires native authority repair; Pi never guesses, resets, quarantines, migrates, or creates a lineage implicitly. Legacy/Pi ordinary authority stays compatibility-read-only. A `blocked-legacy` result requires explicit authorization for its exact compatibility challenge. Destructive RESET/RECOVER exists only for that historical lane and requires exact fresh interactive authorization; it is never a normal-lane fallback.
 
-A `lineage_created: false` result or a pre-authority validation error proves no lineage was created. After ambiguous output, replay the exact START or FINALIZE; compact CAS returns the exact committed revision or rejects stale/semantic retry. Never choose a different lineage merely because output was lost.
+Preserve the negotiated failure envelope exactly. `mutation_outcome: not_started` proves no mutation. For `unknown` or lost mutating output, the controller immediately calls target-scoped status and returns its exact action; it never emits a generic replay instruction. Replay the exact START or FINALIZE only when that provider result declares `exact_replay_safe` for the same canonical request and required lineage. Never choose a lineage merely because output was lost.
+
+Before authority access, `mutation_outcome: not_started` means no lineage was created. In the historical lane only, RESET and RECOVER internally INSPECT and may proceed only after verified clean authority.
 
 Ordinary review runs the selected zero, one, or four lenses exactly once against `initial_review_tree`.
 
@@ -205,13 +207,13 @@ Inferential blockers use exactly one complete read-only refuter batch.
 
 Invalid, missing, duplicate, unknown, or inconclusive refuter output escalates without a replacement refuter.
 
-Ordinary permits up to three failed targeted attempts within the original cumulative budget. Each attempt uses one correction and one targeted validator; FINALIZE requires a positive pre-edit forecast and accounts Git-derived actual lines cumulatively.
+Ordinary permits one correction transaction within the original budget. FINALIZE requires a positive pre-edit forecast and accounts Git-derived actual lines. After the bounded edit, run one targeted validator and final verification; failure escalates without another correction or review budget.
 
-Initial lenses never rerun. Every attempt preserves frozen findings and genesis scope: the original candidate, paths, untracked set, and correction IDs. Targeted validation checks original criteria and correction regression only and adds no scope.
+Initial lenses never rerun. The correction preserves frozen findings and genesis scope: the original candidate, paths, untracked set, and correction IDs. Targeted validation checks original criteria and correction regression only and adds no scope.
 
 Final evidence is hashed during FINALIZE, not supplied at START.
 
-Each validator invocation cannot change claims, add findings, request fixes, launch actors, or request another attempt. Native FINALIZE alone returns `correction_required` while another bounded attempt remains.
+The validator cannot change claims, add findings, request fixes, launch actors, or request another attempt.
 
 Compact ordinary uses only `reviewing`, `correction_required`, `validating`, `approved`, and `escalated`.
 

@@ -99,14 +99,16 @@ test("canonical contract defines compact risk, causal admission, correction, CAS
 		/`changed-hunk`[\s\S]*`candidate-created-path`[\s\S]*`differential-test`[\s\S]*`before-after`/,
 		/Only severe `introduced`, `behavior-activated`, or `worsened` findings with valid proof can enter `correction_ids`/,
 		/`pre-existing` and `base-only` findings become non-blocking follow-ups/,
-		/up to three failed targeted attempts/i,
-		/original cumulative budget/i,
+		/one correction transaction/i,
+		/original budget/i,
 		/frozen findings and genesis scope/i,
 		/content-derived revisions, compare-and-swap replacement, exact retry idempotency/i,
 		/graph-v1 ordinary lineages remain readable, gate-validatable, and exportable, but reject new mutation/i,
 		/Judgment Day remains mutable on graph-v1/i,
 		/reloads authority and re-derives target\/publication evidence before allow/i,
 		/one one-shot authorization for the exact subsequent command/i,
+		/gentle-ai\.review-integration\/v1/i,
+		/durable hook\/native-validation transaction/i,
 		/local orchestrator and same-user process are trusted/i,
 		/reviewer and validator outputs remain semantically untrusted/i,
 		/do not report.*trusted local orchestrator.*security finding/i,
@@ -163,16 +165,16 @@ test("ordinary lens prompts contain the literal compact-v2 native result envelop
 	}
 });
 
-test("canonical ordinary review specs preserve the shipped three-attempt cumulative correction contract", () => {
+test("canonical ordinary review specs preserve the negotiated one-correction contract", () => {
 	for (const path of CANONICAL_LIFECYCLE_SPECS) {
 		const content = read(path);
-		assert.match(content, /up to three failed targeted attempts/i, path);
-		assert.match(content, /cumulative.*budget|budget.*cumulative/i, path);
+		assert.match(content, /one correction transaction/i, path);
+		assert.match(content, /original.*budget|budget.*original/i, path);
 		assert.match(content, /never reruns initial lenses|without rerunning initial (?:lenses|review)/i, path);
 		assert.match(content, /correction_required/, path);
-		assert.match(content, /third failed attempt|three failed targeted attempts/i, path);
+		assert.match(content, /failure escalates|failed.*escalates|MUST escalate/i, path);
 		assert.match(content, /forecast/i, path);
-		assert.doesNotMatch(content, /at most one correction|one correction batch|After the one correction|GIVEN one exact ordinary correction|one validator and one final verification/i, path);
+		assert.doesNotMatch(content, /up to three failed targeted attempts|third failed attempt/i, path);
 	}
 });
 
@@ -272,9 +274,9 @@ test("orchestrator, skill, and README agree on compact facade and compatibility"
 		assertMatches(label, content, [
 			/start -> finalize -> validate/,
 			/`evidence_class`[\s\S]*`causal_disposition`/,
-			/up to three failed targeted attempts/i,
-			/graph-v1[\s\S]*(?:read-only|reject mutation)/i,
-			/Judgment Day[\s\S]*graph-v1/i,
+			/one correction transaction/i,
+			/(?:graph-v1|legacy)[\s\S]*(?:read-only|reject mutation)/i,
+			/Judgment Day[\s\S]*(?:explicit|separate)/i,
 			/(?:one-shot|one exact one-shot)[\s\S]*(?:bash time|bash-time)/i,
 		]);
 	}
@@ -282,8 +284,10 @@ test("orchestrator, skill, and README agree on compact facade and compatibility"
 
 test("README documents the exact native pairing and authority-preserving rollback boundary", () => {
 	const content = read(README);
-	assert.match(content, /adapter supports `gentle-ai 2\.1\.5` only/i);
-	assert.match(content, /rechecks that version before every native operation/i);
+	assert.match(content, /package-local Gentle AI v2\.1\.6 executable/i);
+	assert.match(content, /independently hashes it[\s\S]*negotiates `gentle-ai\.review-integration\/v1`/i);
+	assert.match(content, /Capabilities are cached by that executable digest/i);
+	assert.match(content, /Every START, target status, FINALIZE, validate, and BIND-SDD request passes the same contract identifier/i);
 	assert.match(content, /rollback MUST preserve every native store and receipt/);
 	assert.match(content, /MUST NOT run a downgraded binary/i);
 	assert.match(content, /existing branch.*advertised commit equals.*old object/is);

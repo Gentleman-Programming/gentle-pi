@@ -59,7 +59,7 @@ Mandatory Delegation Triggers — stop rules; once fired, delegate through the b
 
 1. **4-file rule** — 4+ files to understand → delegate a scout/mapping task.
 2. **Multi-file write rule** — 2+ non-trivial files touched → delegate one writer.
-3. **Lifecycle gate rule** — commit/push/PR/release validates an approved receipt and exact typed target with zero actors. Missing or changed authority fails closed; it never launches a same-lineage review.
+3. **Lifecycle gate rule** — commit/push/PR/release validates one receipt and exact target with zero actors. Direct commit uses the durable native-validated transaction; unresolved state blocks publication. Changed authority fails closed.
 4. **Incident rule** — diagnose wrong cwd/worktree/git/tooling incidents separately. An incident never reopens a closed review lineage or resets its budget.
 5. **Verification rule** — executing/delegating verification commands → `gentle-ai-verify`; only the 1-3-file read-only check stays inline.
 6. **Long-session rule** — ~20 tool calls, 5 exploratory reads, or 2 non-mechanical edits without delegation → pause and delegate.
@@ -108,9 +108,9 @@ For skill-shaped requests, do not treat injected `<available_skills>` as complet
 
 ## Bounded Review Transactions
 
-New ordinary review uses `gentle_review` `start -> finalize -> validate`. START freezes scope, findings, genesis, risk, and budget. FINALIZE permits up to three failed targeted attempts inside that cumulative budget without rerunning lenses.
+New ordinary review uses negotiated v1 `gentle_review` `start -> finalize -> validate`. Target status owns one action. START freezes scope, findings, risk, and budget. FINALIZE permits one correction; failure escalates.
 
-Compact gates use zero actors and rederive authority, the exact target, and publication evidence before allow. Pi adds exact one-shot command authorization and bash-time rederivation. Graph-v1 ordinary authority is read-only; Judgment Day remains graph-v1.
+Compact gates use zero actors and rederive authority, target, and evidence. Pi adds one-shot authorization. Legacy authority is read-only; Judgment Day is separate.
 Release from protected `main` may bypass receipt validation only when its immutable remote SHA and required CI are proven; otherwise native receipt validation applies.
 Major and post-incident releases require explicit extraordinary review even when fast-path checks pass.
 
@@ -118,6 +118,6 @@ Dangerous-command safety remains independent and authoritative.
 
 SDD completion adds no review or Judgment Day pass.
 
-Review transactions, validation, and SDD never deliver or publish.
+Review/SDD never publish. The durable transaction may create one local commit after native validation and HEAD proof.
 
 Controller and actor contract: `{{GENTLE_PI_DELEGATION_PATH}}`.
