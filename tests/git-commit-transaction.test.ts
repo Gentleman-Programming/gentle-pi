@@ -144,3 +144,36 @@ test("amend and post-commit crash reconciliation preserve the exact authorized t
 	assert.deepEqual(reconcileCommitTransaction(cwd), { status: "clean" });
 	assert.deepEqual(inspectCommitTransaction(cwd), { status: "clean" });
 });
+
+test("a post-commit hook cannot replace the exact commit created by Git", async (t) => {
+	const cwd = repository(t);
+	stage(cwd, "intermediate\n");
+	git(cwd, "commit", "-m", "intermediate");
+	stage(cwd);
+	installHook(cwd, "post-commit", [
+		"original=$(git rev-parse HEAD)",
+		"tree=$(git rev-parse HEAD^{tree})",
+		"alternate_parent=$(git rev-parse HEAD~2)",
+		"replacement=$(printf 'replacement\\n' | git commit-tree \"$tree\" -p \"$alternate_parent\")",
+		"git update-ref HEAD \"$replacement\" \"$original\"",
+	].join("\n"));
+	await assert.rejects(
+		runGitCommitTransaction(invocation(cwd, "post-commit-replacement"), { nativeReviewCli: native(cwd, "post-commit-replacement") }),
+		/different commit|identity changed/,
+	);
+	assert.equal(inspectCommitTransaction(cwd).record?.state, COMMIT_TRANSACTION_STATE.INCIDENT);
+});
+
+test("cancellation cannot strand a commit after HEAD advances", async (t) => {
+	const cwd = repository(t);
+	stage(cwd);
+	installHook(cwd, "post-commit", "sleep 1");
+	const before = git(cwd, "rev-parse", "HEAD");
+	const result = await runGitCommitTransaction(invocation(cwd, "commit-cancellation"), {
+		nativeReviewCli: native(cwd, "commit-cancellation"),
+		signal: AbortSignal.timeout(100),
+	});
+	assert.notEqual(result.head, before);
+	assert.equal(result.status, "committed");
+	assert.deepEqual(inspectCommitTransaction(cwd), { status: "clean" });
+});

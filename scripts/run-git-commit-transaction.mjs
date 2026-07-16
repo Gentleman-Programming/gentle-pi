@@ -2,6 +2,7 @@
 
 import {
 	assertCommitTransactionIndex,
+	captureCommitTransactionHead,
 	COMMIT_TRANSACTION_STATE,
 	decodeCommitTransactionInvocation,
 	runGitCommitTransaction,
@@ -17,6 +18,10 @@ async function main() {
 	if (extra.length > 0 || !payload) throw new Error("commit transaction runner requires one encoded payload");
 	if (operation === "assert-index") {
 		assertCommitTransactionIndex(payload);
+		return;
+	}
+	if (operation === "capture-commit") {
+		captureCommitTransactionHead(payload);
 		return;
 	}
 	if (operation !== "run") throw new Error("commit transaction runner operation is unsupported");

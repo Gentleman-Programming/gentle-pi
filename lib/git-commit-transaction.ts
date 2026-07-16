@@ -28,6 +28,7 @@ import {
 const TRANSACTION_SCHEMA = "gentle-pi.git-commit-transaction/v1";
 const INVOCATION_SCHEMA = "gentle-pi.git-commit-transaction-invocation/v1";
 const INDEX_ASSERTION_SCHEMA = "gentle-pi.git-commit-index-assertion/v1";
+const COMMIT_CAPTURE_SCHEMA = "gentle-pi.git-commit-capture/v1";
 const GIT_TIMEOUT_MS = 10_000;
 
 export const COMMIT_TRANSACTION_STATE = {
@@ -94,6 +95,8 @@ interface CommitTransactionRecordBody {
 	gate_context_hash?: string;
 	committed_head?: string;
 	committed_tree?: string;
+	git_created_head?: string;
+	git_created_tree?: string;
 	error?: string;
 	native_result?: Record<string, unknown>;
 }
@@ -242,6 +245,9 @@ function decodeRecord(value: unknown): CommitTransactionRecord {
 		"original_index_hash", "authorized_pre_hook_tree", "state", "created_at", "updated_at", "record_hash",
 	]) if (typeof record[field] !== "string" || (record[field] as string).length === 0) throw new Error(`commit transaction record ${field} is invalid`);
 	if (!isStringArray(record.arguments) || !isStringArray(record.invocation_ids) || !isStringArray(record.lineage_history)) throw new Error("commit transaction record arrays are invalid");
+	for (const field of ["post_hook_tree", "post_hook_index_hash", "authorized_tree", "authority_revision", "gate_context_hash", "committed_head", "committed_tree", "git_created_head", "git_created_tree", "error"] as const) {
+		if (record[field] !== undefined && typeof record[field] !== "string") throw new Error(`commit transaction record ${field} is invalid`);
+	}
 	if (!Number.isSafeInteger(record.hook_runs) || (record.hook_runs as number) < 0) throw new Error("commit transaction hook count is invalid");
 	if (!(Object.values(COMMIT_TRANSACTION_STATE) as readonly unknown[]).includes(record.state)) throw new Error("commit transaction state is invalid");
 	const { record_hash: hash, ...body } = record;
@@ -479,6 +485,15 @@ function assertionPayload(binding: RepositoryBinding, record: CommitTransactionR
 	}), "utf8").toString("base64url");
 }
 
+function capturePayload(binding: RepositoryBinding, record: CommitTransactionRecord): string {
+	return Buffer.from(canonicalJson({
+		schema: COMMIT_CAPTURE_SCHEMA,
+		cwd: binding.root,
+		transaction_id: record.transaction_id,
+		authorized_tree: record.authorized_tree,
+	}), "utf8").toString("base64url");
+}
+
 function writeHook(path: string, lines: readonly string[]): void {
 	writeFileSync(path, `#!/bin/sh\nset -eu\n${lines.join("\n")}\n`, { encoding: "utf8", mode: 0o700 });
 	chmodSync(path, 0o700);
@@ -491,6 +506,7 @@ function createHookProxy(binding: RepositoryBinding, record: CommitTransactionRe
 	rmSync(proxy, { recursive: true, force: true });
 	mkdirSync(proxy, { recursive: true, mode: 0o700 });
 	const assertion = `${shellQuote(process.execPath)} ${shellQuote(runnerPath)} assert-index ${shellQuote(assertionPayload(binding, record))}`;
+	const capture = `${shellQuote(process.execPath)} ${shellQuote(runnerPath)} capture-commit ${shellQuote(capturePayload(binding, record))}`;
 	writeHook(join(proxy, "pre-commit"), [`exec ${assertion}`]);
 	for (const name of ["prepare-commit-msg", "commit-msg"]) {
 		const original = join(originalHooks, name);
@@ -499,10 +515,10 @@ function createHookProxy(binding: RepositoryBinding, record: CommitTransactionRe
 			: [`exec ${assertion}`];
 		writeHook(join(proxy, name), lines);
 	}
-	for (const name of ["post-commit", "post-rewrite"]) {
-		const original = join(originalHooks, name);
-		if (existsSync(original) && (statSync(original).mode & 0o111) !== 0) writeHook(join(proxy, name), [`exec ${shellQuote(original)} \"$@\"`]);
-	}
+	const postCommit = join(originalHooks, "post-commit");
+	writeHook(join(proxy, "post-commit"), [capture, ...(existsSync(postCommit) && (statSync(postCommit).mode & 0o111) !== 0 ? [`exec ${shellQuote(postCommit)} \"$@\"`] : [])]);
+	const postRewrite = join(originalHooks, "post-rewrite");
+	if (existsSync(postRewrite) && (statSync(postRewrite).mode & 0o111) !== 0) writeHook(join(proxy, "post-rewrite"), [`exec ${shellQuote(postRewrite)} \"$@\"`]);
 	return proxy;
 }
 
@@ -563,9 +579,9 @@ function recoverCompletedCommit(binding: RepositoryBinding, record: CommitTransa
 	const head = git(binding.root, ["rev-parse", "--verify", "HEAD"]);
 	if (head === record.original_head) return undefined;
 	const tree = git(binding.root, ["rev-parse", "--verify", "HEAD^{tree}"]);
-	if (record.authorized_tree === undefined || tree !== record.authorized_tree) {
-		transition(binding, record, COMMIT_TRANSACTION_STATE.INCIDENT, { committed_head: head, committed_tree: tree, error: "HEAD tree differs from the native-authorized transaction tree" }, now);
-		throw new Error("commit transaction incident: HEAD tree differs from the native-authorized tree; push, PR, and release remain blocked");
+	if (record.git_created_head === undefined || record.git_created_tree === undefined || head !== record.git_created_head || tree !== record.git_created_tree || tree !== record.authorized_tree) {
+		transition(binding, record, COMMIT_TRANSACTION_STATE.INCIDENT, { committed_head: head, committed_tree: tree, error: "HEAD identity differs from the exact Git-created authorized commit" }, now);
+		throw new Error("commit transaction incident: HEAD identity differs from the exact Git-created authorized commit; push, PR, and release remain blocked");
 	}
 	const committed = transition(binding, record, COMMIT_TRANSACTION_STATE.COMMITTED, { committed_head: head, committed_tree: tree }, now);
 	archive(binding, committed);
@@ -658,25 +674,30 @@ export async function runGitCommitTransaction(
 
 		const runnerPath = dependencies.runnerPath ?? commitTransactionRunnerPath();
 		const proxy = createHookProxy(binding, record, runnerPath);
+		dependencies.signal?.throwIfAborted();
 		record = transition(binding, record, COMMIT_TRANSACTION_STATE.COMMIT_RUNNING, {}, now);
-		const commit = await runProcess("git", ["-c", `core.hooksPath=${proxy}`, "commit", ...invocation.arguments], binding.root, dependencies.signal);
+		const commit = await runProcess("git", ["-c", `core.hooksPath=${proxy}`, "commit", ...invocation.arguments], binding.root);
 		if (dependencies.failpoint === "after-commit-before-proof") throw new Error("commit transaction test interruption after Git returned");
+		record = readRecord(binding.activePath) ?? record;
 		const head = git(binding.root, ["rev-parse", "--verify", "HEAD"]);
 		const headTree = git(binding.root, ["rev-parse", "--verify", "HEAD^{tree}"]);
-		if (head !== record.original_head && headTree === record.authorized_tree) {
+		if (head !== record.original_head && head === record.git_created_head && headTree === record.git_created_tree && headTree === record.authorized_tree) {
 			const committed = transition(binding, record, COMMIT_TRANSACTION_STATE.COMMITTED, { committed_head: head, committed_tree: headTree, ...(commit.code === 0 && commit.signal === null ? {} : { error: `Git returned ${commit.signal ?? `exit ${commit.code}`} after creating the authorized commit` }) }, now);
 			archive(binding, committed);
 			return { transactionId: record.transaction_id, status: "committed", head, tree: headTree };
 		}
 		if (head !== record.original_head) {
-			transition(binding, record, COMMIT_TRANSACTION_STATE.INCIDENT, { committed_head: head, committed_tree: headTree, error: "Git created a commit whose tree differs from native authorization" }, now);
-			throw new Error("commit transaction incident: Git created a commit whose tree differs from native authorization; publication remains blocked");
+			transition(binding, record, COMMIT_TRANSACTION_STATE.INCIDENT, { committed_head: head, committed_tree: headTree, error: "HEAD identity differs from the exact Git-created authorized commit" }, now);
+			throw new Error("commit transaction incident: HEAD identity changed after Git created the authorized commit; publication remains blocked");
 		}
 		record = transition(binding, record, COMMIT_TRANSACTION_STATE.COMMIT_FAILED, { error: `Git commit failed with ${commit.signal ?? `exit ${commit.code}`}` }, now);
 		throw new Error(`Git commit failed; transaction ${record.transaction_id} created no commit and requires explicit recovery`);
 	} catch (error) {
 		if (record !== undefined && dependencies.signal?.aborted === true && existsSync(binding.activePath)) {
-			try { transition(binding, readRecord(binding.activePath) ?? record, COMMIT_TRANSACTION_STATE.INTERRUPTED, { error: "commit transaction was cancelled" }, now); } catch { /* retain the earlier durable state */ }
+			try {
+				const active = readRecord(binding.activePath) ?? record;
+				if (git(binding.root, ["rev-parse", "--verify", "HEAD"]) === active.original_head) transition(binding, active, COMMIT_TRANSACTION_STATE.INTERRUPTED, { error: "commit transaction was cancelled" }, now);
+			} catch { /* retain the earlier durable state */ }
 		}
 		throw error;
 	} finally {
@@ -695,6 +716,23 @@ export function assertCommitTransactionIndex(encoded: string): void {
 	const record = readRecord(binding.activePath);
 	if (record === undefined || record.transaction_id !== body.transaction_id || record.state !== COMMIT_TRANSACTION_STATE.COMMIT_RUNNING || record.authorized_tree !== body.authorized_tree) throw new Error("commit transaction index assertion has no matching active authorization");
 	if (git(binding.root, ["write-tree"]) !== body.authorized_tree) throw new Error("Git hook changed the index after native pre-commit authorization");
+}
+
+export function captureCommitTransactionHead(encoded: string): void {
+	let value: unknown;
+	try { value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")); }
+	catch { throw new Error("commit transaction capture is malformed"); }
+	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("commit transaction capture is invalid");
+	const body = value as Record<string, unknown>;
+	if (body.schema !== COMMIT_CAPTURE_SCHEMA || typeof body.cwd !== "string" || typeof body.transaction_id !== "string" || typeof body.authorized_tree !== "string") throw new Error("commit transaction capture is incompatible");
+	const binding = repositoryBinding(body.cwd);
+	const record = readRecord(binding.activePath);
+	if (record === undefined || record.transaction_id !== body.transaction_id || record.state !== COMMIT_TRANSACTION_STATE.COMMIT_RUNNING || record.authorized_tree !== body.authorized_tree) throw new Error("commit transaction capture has no matching active authorization");
+	const head = git(binding.root, ["rev-parse", "--verify", "HEAD"]);
+	const tree = git(binding.root, ["rev-parse", "--verify", "HEAD^{tree}"]);
+	if (head === record.original_head || tree !== record.authorized_tree) throw new Error("commit transaction capture does not match a new authorized commit");
+	if (record.git_created_head !== undefined && (record.git_created_head !== head || record.git_created_tree !== tree)) throw new Error("commit transaction capture conflicts with the recorded Git commit");
+	transition(binding, record, COMMIT_TRANSACTION_STATE.COMMIT_RUNNING, { git_created_head: head, git_created_tree: tree });
 }
 
 export function inspectCommitTransaction(cwd: string): CommitTransactionInspection {
@@ -750,7 +788,7 @@ export function verifyCommitTransactionResult(cwd: string, transactionId: string
 	const active = readRecord(binding.activePath);
 	if (active?.transaction_id === transactionId) throw new Error(`commit transaction ${transactionId} remains unresolved in state ${active.state}`);
 	const history = readRecord(join(binding.historyDir, `${transactionId}.json`));
-	if (history === undefined || history.state !== COMMIT_TRANSACTION_STATE.COMMITTED || history.committed_head === undefined || history.committed_tree === undefined || history.authorized_tree !== history.committed_tree) throw new Error(`commit transaction ${transactionId} has no durable verified commit result`);
+	if (history === undefined || history.state !== COMMIT_TRANSACTION_STATE.COMMITTED || history.committed_head === undefined || history.committed_tree === undefined || history.git_created_head !== history.committed_head || history.git_created_tree !== history.committed_tree || history.authorized_tree !== history.committed_tree) throw new Error(`commit transaction ${transactionId} has no durable verified commit result`);
 	const head = git(binding.root, ["rev-parse", "--verify", "HEAD"]);
 	const tree = git(binding.root, ["rev-parse", "--verify", `${history.committed_head}^{tree}`]);
 	if (head !== history.committed_head || tree !== history.committed_tree) throw new Error(`commit transaction ${transactionId} HEAD proof changed before tool_result reconciliation`);
