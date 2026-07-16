@@ -120,6 +120,42 @@ test("capabilities reject additional properties at every exact object boundary",
 	}
 });
 
+test("capabilities accept additive minor optional fields while rejecting unknown mandatory behavior", () => {
+	const source = fixture<JsonObject>("capabilities.fixture.json");
+	(source.protocol as JsonObject).minor = 1;
+	source.future_diagnostics = { enabled: true };
+	(source.package as JsonObject).future_channel_metadata = "additive";
+	(((source.features as JsonObject).optional as JsonObject[])).push({
+		name: "future_optional_diagnostics",
+		supported: true,
+		requires: [],
+		future_detail: "ignored",
+	});
+	const decoded = decodeReviewCapabilitiesV1(source, executableDigest);
+	assert.equal(decoded.optionalFeatures.has("risk_reasons"), true);
+	assert.equal((decoded.optionalFeatures as ReadonlySet<string>).has("future_optional_diagnostics"), false);
+
+	const unknownMandatory = clone(source);
+	((unknownMandatory.features as JsonObject).mandatory as JsonObject[]).push({ name: "future_required_authority", supported: true, requires: [] });
+	assert.throws(() => decodeReviewCapabilitiesV1(unknownMandatory, executableDigest), /unsupported/);
+
+	const incompatibleMajor = clone(source);
+	(incompatibleMajor.protocol as JsonObject).major = 2;
+	assert.throws(() => decodeReviewCapabilitiesV1(incompatibleMajor, executableDigest), /incompatible/);
+
+	const negativeMinor = clone(source);
+	(negativeMinor.protocol as JsonObject).minor = -1;
+	assert.throws(() => decodeReviewCapabilitiesV1(negativeMinor, executableDigest), /integer in range/);
+
+	const duplicateOptional = clone(source);
+	((duplicateOptional.features as JsonObject).optional as JsonObject[]).push({ name: "future_optional_diagnostics", supported: false, requires: [] });
+	assert.throws(() => decodeReviewCapabilitiesV1(duplicateOptional, executableDigest), /duplicate/);
+
+	const overlappingFeature = clone(source);
+	((overlappingFeature.features as JsonObject).optional as JsonObject[]).push({ name: "compact_v2_authority", supported: true, requires: [] });
+	assert.throws(() => decodeReviewCapabilitiesV1(overlappingFeature, executableDigest), /overlap/);
+});
+
 test("capabilities enforce exact v1.0 arrays, enums, patterns, and digest binding", () => {
 	const source = fixture<JsonObject>("capabilities.fixture.json");
 	const decode = (value: unknown) => decodeReviewCapabilitiesV1(value, executableDigest);

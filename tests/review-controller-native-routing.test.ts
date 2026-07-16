@@ -1403,9 +1403,9 @@ test("native bind treats malformed post-call evidence as status-required without
 	const { controller } = runtime(fakeNative({
 		bindSdd: async () => {
 			bindCalls += 1;
-			return bindCalls === 1
-				? { revision: "b1", change: "other-change", lineage: "native-lineage", authorityRevision: "r1", receiptHash: "receipt", gateContext: nativeBindingGateContext() }
-				: { revision: "", change: "native-review-authority-parity", lineage: "native-lineage", authorityRevision: "r1", receiptHash: "receipt", gateContext: nativeBindingGateContext() };
+			if (bindCalls === 1) return { revision: "b1", change: "other-change", lineage: "native-lineage", authorityRevision: "r1", receiptHash: "receipt", gateContext: nativeBindingGateContext() };
+			if (bindCalls === 2) return { revision: "", change: "native-review-authority-parity", lineage: "native-lineage", authorityRevision: "r1", receiptHash: "receipt", gateContext: nativeBindingGateContext() };
+			return { revision: "b3", change: "native-review-authority-parity", lineage: "native-lineage", authorityRevision: "r1", receiptHash: "receipt", gateContext: nativeGateContext() };
 		},
 	}));
 	const input = JSON.stringify({ change: "native-review-authority-parity", lineageId: "native-lineage", expectedBindingRevision: "" });
@@ -1421,7 +1421,9 @@ test("native bind treats malformed post-call evidence as status-required without
 	assert.deepEqual(mismatched.details, expected);
 	const malformed = await controller.execute("malformed-bind", { operation: "bind-sdd", input }, undefined, undefined, context(cwd));
 	assert.deepEqual(malformed.details, expected);
-	assert.equal(bindCalls, 2);
+	const wrongGate = await controller.execute("wrong-gate-bind", { operation: "bind-sdd", input }, undefined, undefined, context(cwd));
+	assert.deepEqual(wrongGate.details, expected);
+	assert.equal(bindCalls, 3);
 });
 
 test("pending implementation skips unavailable native review readiness and routes sdd-apply", async (t) => {

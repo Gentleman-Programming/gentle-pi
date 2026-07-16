@@ -4916,7 +4916,8 @@ async function executeReviewControllerOperation(
 				typeof bound.authorityRevision !== "string" || bound.authorityRevision.length === 0 ||
 				typeof bound.receiptHash !== "string" || bound.receiptHash.length === 0 ||
 				bound.gateContext.lineageId !== input.lineageId ||
-				bound.gateContext.storeRevision !== bound.authorityRevision
+				bound.gateContext.storeRevision !== bound.authorityRevision ||
+				bound.gateContext.raw.gate !== "post-apply"
 			) throw Object.assign(
 				new Error("Native bind-sdd returned malformed or inconsistent binding evidence"),
 				{ mutationOutcome: "unknown", nextAction: "review.status" },

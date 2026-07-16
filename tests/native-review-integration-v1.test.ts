@@ -3,7 +3,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import {
+	NATIVE_REVIEW_ERROR_CODE,
 	NativeReviewCliV216,
+	NativeReviewCliError,
 	NativeReviewIntegrationError,
 	clearNativeReviewCapabilitiesCacheForTesting,
 	type ExecFileAdapter,
@@ -76,4 +78,25 @@ test("capability cache invalidates when the verified executable digest changes",
 	await new NativeReviewCliV216(queue.adapter, "/package/gentle-ai", 321, 654, undefined, () => firstDigest).capabilities();
 	await new NativeReviewCliV216(queue.adapter, "/package/gentle-ai", 321, 654, undefined, () => secondDigest).capabilities();
 	assert.equal(queue.calls.length, 2);
+});
+
+test("v2.1.6 bind-sdd rejects a response from the wrong lifecycle gate", async () => {
+	clearNativeReviewCapabilitiesCacheForTesting();
+	const digest = "dcc846103b16d365eaeeb9d7f289c23fc4f2897f23def1cb3fe7f05557b64705";
+	const binding = JSON.parse(readFileSync(join(process.cwd(), "tests", "fixtures", "native-review-cli", "v2.1.3", "bind-sdd.json"), "utf8")) as Record<string, unknown>;
+	const gateContext = binding.gate_context as Record<string, unknown>;
+	const queue = queued([
+		{ stdout: JSON.stringify(fixture("capabilities.fixture.json")) },
+		{ stdout: JSON.stringify({
+			schema: "gentle-ai.review-integration.operation/v1",
+			contract: "gentle-ai.review-integration/v1",
+			operation: "review.bind_sdd",
+			result: { ...binding, gate_context: { ...gateContext, gate: "pre-commit" } },
+		}) },
+	]);
+	const client = new NativeReviewCliV216(queue.adapter, "/package/gentle-ai", 321, 654, undefined, () => digest);
+	await assert.rejects(
+		() => client.bindSdd({ cwd: "/repo", change: "native-review-authority-parity", lineage: "issue136-contract-runtime", expectedBindingRevision: "" }),
+		(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH,
+	);
 });

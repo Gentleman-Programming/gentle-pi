@@ -1104,7 +1104,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		const gateContext = decodeGateContext(body.gate_context);
 		const lineage = requiredString(body.lineage);
 		const change = requiredString(body.change);
-		if (lineage !== request.lineage || change !== request.change) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.BIND_SDD, true, "native binding identity mismatch");
+		if (lineage !== request.lineage || change !== request.change || gateContext.raw.gate !== "post-apply") throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.BIND_SDD, true, "native binding identity mismatch");
 		return {
 			revision: requiredString(body.revision),
 			change,

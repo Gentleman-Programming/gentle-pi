@@ -242,15 +242,13 @@ function record(value         , label        )                          {
 	return value                           ;
 }
 
-function exactRecord(value         , label        , required                   , optional                    = [])                          {
+function exactRecord(value         , label        , required                   , optional                    = [], allowAdditional = false)                          {
 	const body = record(value, label);
 	for (const key of required) {
 		if (!Object.hasOwn(body, key)) throw new TypeError(`${label}.${key} is required`);
 	}
 	const allowed = new Set([...required, ...optional]);
-	for (const key of Object.keys(body)) {
-		if (!allowed.has(key)) throw new TypeError(`${label}.${key} is not allowed`);
-	}
+	if (!allowAdditional) for (const key of Object.keys(body)) if (!allowed.has(key)) throw new TypeError(`${label}.${key} is not allowed`);
 	return body;
 }
 
@@ -335,8 +333,8 @@ function assertExactSet(actual                   , expected                   , 
 	if (actual.length !== expected.length || expected.some((value) => !actual.includes(value))) throw new TypeError(`${label} does not match the required integration surface`);
 }
 
-function decodeFeature(value         , label        )                  {
-	const feature = exactRecord(value, label, ["name", "supported", "requires"]);
+function decodeFeature(value         , label        , allowAdditional = false)                  {
+	const feature = exactRecord(value, label, ["name", "supported", "requires"], [], allowAdditional);
 	return {
 		name: enumeration(feature.name, FEATURE_NAMES, `${label}.name`),
 		supported: boolean(feature.supported, `${label}.supported`),
@@ -344,25 +342,43 @@ function decodeFeature(value         , label        )                  {
 	};
 }
 
+function decodeOptionalFeature(value         , label        , allowUnknown         )                                                                    {
+	const feature = exactRecord(value, label, ["name", "supported", "requires"], [], allowUnknown);
+	const name = nonempty(feature.name, `${label}.name`);
+	if (!allowUnknown && !(FEATURE_NAMES                     ).includes(name)) throw new TypeError(`${label}.name is unsupported`);
+	return {
+		name,
+		supported: boolean(feature.supported, `${label}.supported`),
+		requires: stringArray(feature.requires, `${label}.requires`, { unique: true }),
+	};
+}
+
 export function decodeReviewCapabilitiesV1(value         , verifiedExecutableDigest        )                       {
-	const body = exactRecord(value, "capabilities", ["schema", "contract", "protocol", "package", "build", "executable", "operations", "gates", "projections", "schemas", "features", "compatibility"]);
+	const requiredFields = ["schema", "contract", "protocol", "package", "build", "executable", "operations", "gates", "projections", "schemas", "features", "compatibility"]         ;
+	const candidate = exactRecord(value, "capabilities", requiredFields, [], true);
+	const candidateProtocol = exactRecord(candidate.protocol, "capabilities.protocol", ["major", "minor"], [], true);
+	const protocolMajor = integer(candidateProtocol.major, "capabilities.protocol.major");
+	const protocolMinor = integer(candidateProtocol.minor, "capabilities.protocol.minor");
+	if (protocolMajor !== 1) throw new TypeError("incompatible review integration protocol");
+	const allowAdditions = protocolMinor > 0;
+	const body = exactRecord(value, "capabilities", requiredFields, [], allowAdditions);
 	requireIdentity(body, "gentle-ai.review-integration.capabilities/v1");
 
-	const protocol = exactRecord(body.protocol, "capabilities.protocol", ["major", "minor"]);
-	if (protocol.major !== 1 || protocol.minor !== 0) throw new TypeError("incompatible review integration protocol");
+	const protocol = exactRecord(body.protocol, "capabilities.protocol", ["major", "minor"], [], allowAdditions);
+	if (protocol.major !== protocolMajor || protocol.minor !== protocolMinor) throw new TypeError("incompatible review integration protocol");
 
-	const packageIdentity = exactRecord(body.package, "capabilities.package", ["name", "version", "release_channel"]);
+	const packageIdentity = exactRecord(body.package, "capabilities.package", ["name", "version", "release_channel"], [], allowAdditions);
 	if (packageIdentity.name !== "gentle-ai") throw new TypeError("capabilities package identity mismatch");
 	const packageVersion = nonempty(packageIdentity.version, "capabilities.package.version");
 	enumeration(packageIdentity.release_channel, ["development", "prerelease", "stable"]         , "capabilities.package.release_channel");
 
-	const build = exactRecord(body.build, "capabilities.build", ["id", "go_version", "module_version", "vcs", "vcs_revision", "vcs_time", "vcs_modified"]);
+	const build = exactRecord(body.build, "capabilities.build", ["id", "go_version", "module_version", "vcs", "vcs_revision", "vcs_time", "vcs_modified"], [], allowAdditions);
 	const buildId = sha256(build.id, "capabilities.build.id");
 	nonempty(build.go_version, "capabilities.build.go_version");
 	for (const field of ["module_version", "vcs", "vcs_revision", "vcs_time"]         ) text(build[field], `capabilities.build.${field}`);
 	enumeration(build.vcs_modified, ["true", "false", "unknown"]         , "capabilities.build.vcs_modified");
 
-	const executable = exactRecord(body.executable, "capabilities.executable", ["sha256", "evidence", "verification"]);
+	const executable = exactRecord(body.executable, "capabilities.executable", ["sha256", "evidence", "verification"], [], allowAdditions);
 	const selfReportedDigest = sha256(executable.sha256, "capabilities.executable.sha256");
 	if (executable.evidence !== "self-reported" || executable.verification !== "compare-with-published-manifest") throw new TypeError("capabilities executable evidence is incompatible");
 	const normalizedVerifiedDigest = sha256(verifiedExecutableDigest.startsWith("sha256:") ? verifiedExecutableDigest : `sha256:${verifiedExecutableDigest}`, "verified executable digest");
@@ -377,20 +393,23 @@ export function decodeReviewCapabilitiesV1(value         , verifiedExecutableDig
 	assertExactSet(projections, REQUIRED_PROJECTIONS, "capabilities projections");
 	assertExactSet(schemas, REQUIRED_SCHEMAS, "capabilities schemas");
 
-	const features = exactRecord(body.features, "capabilities.features", ["mandatory", "optional"]);
-	const mandatory = array(features.mandatory, "capabilities.features.mandatory", decodeFeature, { minimum: 10, maximum: 10 });
-	const optional = array(features.optional, "capabilities.features.optional", decodeFeature, { minimum: 1, maximum: 1 });
+	const features = exactRecord(body.features, "capabilities.features", ["mandatory", "optional"], [], allowAdditions);
+	const mandatory = array(features.mandatory, "capabilities.features.mandatory", (entry, label) => decodeFeature(entry, label, allowAdditions), { minimum: 10, ...(allowAdditions ? {} : { maximum: 10 }) });
+	const optional = array(features.optional, "capabilities.features.optional", (entry, label) => decodeOptionalFeature(entry, label, allowAdditions), { minimum: 1, ...(allowAdditions ? {} : { maximum: 1 }), unique: true });
 	const mandatoryNames = mandatory.map((feature) => feature.name);
+	const optionalNames = optional.map((feature) => feature.name);
 	assertExactSet(mandatoryNames, REQUIRED_MANDATORY_FEATURES, "mandatory capabilities");
+	if (new Set(optionalNames).size !== optionalNames.length) throw new TypeError("optional capabilities contain duplicate names");
+	if (optionalNames.some((name) => mandatoryNames.includes(name                           ))) throw new TypeError("mandatory and optional capabilities overlap");
 	if (mandatory.some((feature) => !feature.supported)) throw new TypeError("mandatory capability is unsupported");
 
-	const compatibility = exactRecord(body.compatibility, "capabilities.compatibility", ["minimum_protocol_major", "maximum_protocol_major", "additive_minor_policy", "unknown_mandatory", "unknown_optional", "modes", "legacy_window"]);
+	const compatibility = exactRecord(body.compatibility, "capabilities.compatibility", ["minimum_protocol_major", "maximum_protocol_major", "additive_minor_policy", "unknown_mandatory", "unknown_optional", "modes", "legacy_window"], [], allowAdditions);
 	if (compatibility.minimum_protocol_major !== 1 || compatibility.maximum_protocol_major !== 1 || compatibility.additive_minor_policy !== "optional-fields-only" || compatibility.unknown_mandatory !== "reject" || compatibility.unknown_optional !== "ignore") {
 		throw new TypeError("incompatible capability evolution policy");
 	}
 	const modes = enumArray(compatibility.modes, Object.values(REVIEW_AUTHORITY_VERSION), "capabilities.compatibility.modes", { minimum: 2, maximum: 2 });
 	if (modes[0] !== REVIEW_AUTHORITY_VERSION.COMPACT_V2 || modes[1] !== REVIEW_AUTHORITY_VERSION.LEGACY_V1) throw new TypeError("capabilities compatibility modes are out of order");
-	const legacyWindow = exactRecord(compatibility.legacy_window, "capabilities.compatibility.legacy_window", ["mode", "state", "read_only", "deprecation_started", "removal", "minimum_compatibility_releases"]);
+	const legacyWindow = exactRecord(compatibility.legacy_window, "capabilities.compatibility.legacy_window", ["mode", "state", "read_only", "deprecation_started", "removal", "minimum_compatibility_releases"], [], allowAdditions);
 	if (legacyWindow.mode !== REVIEW_AUTHORITY_VERSION.LEGACY_V1) throw new TypeError("capabilities legacy window mode is incompatible");
 	enumeration(legacyWindow.state, ["pre-fence", "active", "deprecated", "expired"]         , "capabilities.compatibility.legacy_window.state");
 	boolean(legacyWindow.read_only, "capabilities.compatibility.legacy_window.read_only");
@@ -408,7 +427,7 @@ export function decodeReviewCapabilitiesV1(value         , verifiedExecutableDig
 		projections: new Set(projections),
 		schemas: new Set(schemas),
 		mandatoryFeatures: new Set(mandatoryNames),
-		optionalFeatures: new Set(optional.filter((feature) => feature.supported).map((feature) => feature.name)),
+		optionalFeatures: new Set(optional.filter((feature) => feature.supported && (FEATURE_NAMES                     ).includes(feature.name)).map((feature) => feature.name)),
 		raw: body,
 	};
 }
