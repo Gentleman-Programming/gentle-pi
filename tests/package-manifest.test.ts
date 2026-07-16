@@ -129,9 +129,18 @@ test("package verification names the native review runtime boundary and packaged
 test("installed commit transaction runner loads JavaScript only and has deterministic build checks", () => {
 	const packageJson = readPackageJson();
 	const runner = readFileSync(join(PACKAGE_ROOT, "scripts", "run-git-commit-transaction.mjs"), "utf8");
+	const packedRunner = readFileSync(join(PACKAGE_ROOT, "scripts", "test-packed-runner.mjs"), "utf8");
+	const ci = readFileSync(join(PACKAGE_ROOT, ".github", "workflows", "ci.yml"), "utf8");
 	assert.equal(packageJson.scripts?.["build:transaction-runner"], "node scripts/build-git-commit-transaction-runner.mjs --write");
 	assert.equal(packageJson.scripts?.["check:transaction-runner"], "node scripts/build-git-commit-transaction-runner.mjs --check");
 	assert.equal(packageJson.scripts?.["test:packed-runner"], "node scripts/test-packed-runner.mjs");
+	assert.match(packageJson.scripts?.prepublishOnly ?? "", /pnpm run test:packed-runner/);
+	assert.match(ci, /pnpm run test:packed-runner/);
+	assert.doesNotMatch(packedRunner, /\["install"[^\]]*"--ignore-scripts"/s);
+	assert.match(packedRunner, /execFileSync\("where\.exe", \["npm"\]/);
+	assert.match(packedRunner, /could not resolve npm-cli\.js without a command shell/);
+	assert.doesNotMatch(packedRunner, /ComSpec|cmd\.exe/);
+	assert.match(packedRunner, /review", "capabilities", "--contract", "gentle-ai\.review-integration\/v1"/);
 	assert.match(runner, /\.\.\/runtime\/git-commit-transaction\.mjs/);
 	assert.doesNotMatch(runner, /\.ts["']/);
 	assert.doesNotMatch(runner, /experimental-strip-types/);

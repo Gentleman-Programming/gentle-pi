@@ -35,3 +35,6 @@ jobs:
 
       - name: Verify package contents
         run: node scripts/verify-package-files.mjs
+
+      - name: Verify packed installation
+        run: pnpm run test:packed-runner
