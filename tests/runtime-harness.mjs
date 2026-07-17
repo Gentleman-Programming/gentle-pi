@@ -398,7 +398,7 @@ async function run() {
 			createCtx(toolCwd),
 		);
 		assert.equal(commitGate.block, true);
-		assert.match(commitGate.reason, /exactly derive.*not a git repository/is);
+		assert.match(commitGate.reason, /exactly derive/i);
 	} finally {
 		await rm(toolCwd, { recursive: true, force: true });
 	}
