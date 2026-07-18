@@ -122,6 +122,6 @@ export class ReviewCheckpointStoreV1 {
 		return join(this.root, `${operationId}.json`);
 	}
 
-	private fsyncFile(path: string): void { const descriptor = openSync(path, "r"); try { fsyncSync(descriptor); } finally { closeSync(descriptor); } }
-	private fsyncDirectory(path: string): void { if (!statSync(path).isDirectory()) throw new ReviewCheckpointError("Checkpoint root is not a directory"); const descriptor = openSync(path, "r"); try { fsyncSync(descriptor); } finally { closeSync(descriptor); } }
+	private fsyncFile(path: string): void { const descriptor = openSync(path, "r+"); try { fsyncSync(descriptor); } finally { closeSync(descriptor); } }
+	private fsyncDirectory(path: string): void { if (!statSync(path).isDirectory()) throw new ReviewCheckpointError("Checkpoint root is not a directory"); if (process.platform === "win32") return; const descriptor = openSync(path, "r"); try { fsyncSync(descriptor); } finally { closeSync(descriptor); } }
 }

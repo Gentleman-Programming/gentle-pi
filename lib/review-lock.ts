@@ -78,9 +78,22 @@ export function qualifiedNodeFsLockPlatformV1(): ReviewLockPlatformAdapterV1 {
 				throw new ReviewLockError(`Review lock atomic no-replace move source is unavailable: ${error instanceof Error ? error.message : String(error)}`);
 			}
 			if (!isDirectory) {
+				// NTFS supports hard links too: CreateHardLinkW fails when the
+				// destination already exists, so the same EEXIST no-replace
+				// guarantee holds on every supported platform.
 				try {
 					linkSync(source, destination);
 					unlinkSync(source);
+				} catch (error) {
+					throw new ReviewLockError(`Review lock atomic no-replace move is unsupported on this platform or filesystem: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				return;
+			}
+			if (process.platform === "win32") {
+				// Directories cannot be hard-linked; a Windows rename onto an
+				// existing destination directory fails, preserving no-replace.
+				try {
+					renameSync(source, destination);
 				} catch (error) {
 					throw new ReviewLockError(`Review lock atomic no-replace move is unsupported on this platform or filesystem: ${error instanceof Error ? error.message : String(error)}`);
 				}
@@ -212,12 +225,13 @@ export class ReviewMutationLockV1 {
 	}
 
 	private fsyncFile(path: string): void {
-		const descriptor = openSync(path, "r");
+		const descriptor = openSync(path, "r+");
 		try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
 	}
 
 	private fsyncDirectory(path: string): void {
 		if (!statSync(path).isDirectory()) throw new ReviewLockError("Review lock path is not a directory");
+		if (process.platform === "win32") return;
 		const descriptor = openSync(path, "r");
 		try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
 	}

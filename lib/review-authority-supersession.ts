@@ -594,6 +594,7 @@ export interface SupersessionWriteOptionsV1 {
 }
 
 function fsyncDirectoryV1(directory: string): void {
+	if (process.platform === "win32") return;
 	const handle = openSync(directory, "r");
 	try { fsyncSync(handle); } finally { closeSync(handle); }
 }
@@ -624,7 +625,7 @@ export function writeSupersessionRecordV1(directory: string, envelope: Supersess
 	try {
 		writeFileSync(temporary, bytes, { flag: "wx", mode: 0o600 });
 		options.faultInjector?.("before-temp-fsync");
-		const file = openSync(temporary, "r");
+		const file = openSync(temporary, "r+");
 		try { fsyncSync(file); } finally { closeSync(file); }
 		options.faultInjector?.("before-link");
 		try { linkSync(temporary, path); } catch (error) {
@@ -844,7 +845,7 @@ export class SupersessionStoreV1 {
 		const path = this.recoveryMarkerPath(changeName, true);
 		if (!this.isRecoveryRequiredMarker(path)) {
 			writeFileSync(path, canonicalJsonV1({ schema: "gentle-ai.recovery-required/v1", change_name: changeName }), { flag: "wx", mode: 0o600 });
-			const file = openSync(path, "r");
+			const file = openSync(path, "r+");
 			try { fsyncSync(file); } finally { closeSync(file); }
 		}
 		fsyncDirectoryV1(this.recoveryMarkerDirectory(false));
