@@ -2,6 +2,7 @@
 name: review-refuter
 description: One-shot read-only verifier for the complete inferential-severe frozen-row list.
 tools:
+  - "*": false
   - read
   - grep
   - find

@@ -210,7 +210,9 @@ function readAgentDefinition(file: string): {
 	const frontmatter = readAgentFrontmatter(file);
 	const name = frontmatter.match(/^name:\s*(\S+)$/m)?.[1];
 	assert.ok(name, `${file} must declare a frontmatter name`);
-	const toolsBlock = frontmatter.match(/^tools:\n((?: {2}- [\w-]+\n?)+)/m)?.[1];
+	const toolsBlock = frontmatter.match(
+		/^tools:\n(?: {2}- "\*": false\n)?((?: {2}- [\w-]+\n?)+)/m,
+	)?.[1];
 	assert.ok(toolsBlock, `${file} must declare a YAML tool list`);
 	const tools = [...toolsBlock.matchAll(/^ {2}- ([\w-]+)$/gm)].map(
 		(match) => match[1],
@@ -336,7 +338,11 @@ test("packaged agents use YAML list syntax for tool allowlists", () => {
 			/^tools:\s*[^\n,]+(?:,\s*[^\n,]+)+$/m,
 			`${file} must not use comma-separated inline tools; pi-subagents expects a YAML list`,
 		);
-		assert.match(frontmatter, /^tools:\n(?: {2}- [\w-]+\n?)+/m, `${file} must declare tools as a YAML list`);
+		assert.match(
+			frontmatter,
+			/^tools:\n(?: {2}- "\*": false\n)?(?: {2}- [\w-]+\n?)+/m,
+			`${file} must declare tools as a YAML list`,
+		);
 	}
 });
 

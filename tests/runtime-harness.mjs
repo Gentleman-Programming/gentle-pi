@@ -449,6 +449,11 @@ async function run() {
 			"isolated package installation must activate only the refuter inspection tools",
 		);
 		const installedRefuterSource = await readFile(installedRefuterPath, "utf8");
+		assert.match(
+			installedRefuterSource,
+			/^tools:\n {2}- "\*": false$/m,
+			"installed refuter must lead its tool map with the deny-all rule",
+		);
 		assert.match(installedRefuterSource, /complete inferential-severe frozen-row list once/);
 		assert.match(installedRefuterSource, /refuted \| corroborated \| inconclusive/);
 		assert.doesNotMatch(installedRefuterSource, /general, correctness, impact\/exploitability, or reproducibility/);

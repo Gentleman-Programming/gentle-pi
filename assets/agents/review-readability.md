@@ -2,6 +2,7 @@
 name: review-readability
 description: R2 Readability reviewer — naming, complexity, intention, maintainability, review size, and context clarity.
 tools:
+  - "*": false
   - read
   - grep
   - glob

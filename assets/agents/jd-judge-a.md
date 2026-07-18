@@ -2,6 +2,7 @@
 name: jd-judge-a
 description: Judgment Day blind adversarial reviewer A. Read-only; reports findings and does not fix code.
 tools:
+  - "*": false
   - read
   - grep
   - glob

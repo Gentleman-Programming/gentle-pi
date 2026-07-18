@@ -126,7 +126,9 @@ test("generic non-SDD agents declare exact role tool allowlists", () => {
 test("review-refuter exposes only complete-list inspection tools", () => {
 	const path = join(assetsAgentsDir, "review-refuter.md");
 	assert.ok(existsSync(path), "review-refuter.md must exist");
-	assert.deepEqual(readTools(path), REVIEW_REFUTER_TOOLS);
+	const entries = readTools(path);
+	assert.equal(entries[0], '"*": false', "review-refuter must lead with the deny-all rule");
+	assert.deepEqual(entries.slice(1), REVIEW_REFUTER_TOOLS);
 
 	const frontmatter = readFrontmatter(path);
 	assert.match(frontmatter, /^name:\s*review-refuter$/m);
