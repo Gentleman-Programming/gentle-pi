@@ -90,8 +90,11 @@ function bindEnvelope(): JsonObject {
 
 test("every published review integration fixture decodes", () => {
 	assert.equal(decodeReviewCapabilitiesV1(fixture("capabilities.fixture.json"), executableDigest).contract, REVIEW_INTEGRATION_CONTRACT);
+	assert.equal(decodeReviewCapabilitiesV1(fixture("capabilities-v1.1.fixture.json"), executableDigest).contract, REVIEW_INTEGRATION_CONTRACT);
 	assert.equal(decodeReviewStartV1(fixture("start.fixture.json")).riskLevel, "high");
-	assert.equal(decodeReviewFailureV1(fixture("failure.fixture.json")).mutationOutcome, "committed");
+	const failure = decodeReviewFailureV1(fixture("failure.fixture.json"));
+	assert.equal(failure.mutationOutcome, "not_started");
+	assert.equal(failure.code, "gate_scope_changed");
 	assert.equal(decodeReviewOperationV1(fixture("operation.fixture.json")).operation, "review.finalize");
 	for (const name of ["status.fixture.json", "status-unrelated.fixture.json", "status-ambiguous.fixture.json", "status-corrupted.fixture.json"]) {
 		assert.equal(decodeReviewStatusV1(fixture(name)).contract, REVIEW_INTEGRATION_CONTRACT);
@@ -121,8 +124,7 @@ test("capabilities reject additional properties at every exact object boundary",
 });
 
 test("capabilities accept additive minor optional fields while rejecting unknown mandatory behavior", () => {
-	const source = fixture<JsonObject>("capabilities.fixture.json");
-	(source.protocol as JsonObject).minor = 1;
+	const source = fixture<JsonObject>("capabilities-v1.1.fixture.json");
 	source.future_diagnostics = { enabled: true };
 	(source.package as JsonObject).future_channel_metadata = "additive";
 	(((source.features as JsonObject).optional as JsonObject[])).push({
@@ -344,6 +346,111 @@ test("status enforces applicability, authority version, receipt, and frozen cond
 	const badCandidate = clone(current);
 	badCandidate.candidates = ["review-a", "review-a"];
 	assert.throws(() => decodeReviewStatusV1(badCandidate), /duplicates/);
+});
+
+test("projection accepts the v2.1.7 base-workspace-overlay kind", () => {
+	const source = (fixture<JsonObject>("status.fixture.json").projection as JsonObject);
+	const candidate = clone(source);
+	candidate.kind = "base-workspace-overlay";
+	assert.equal(decodeReviewProjectionV1(candidate).kind, "base-workspace-overlay");
+});
+
+test("START accepts the complete workspace-overlay target binding and rejects partial bindings", () => {
+	const source = fixture<JsonObject>("start.fixture.json");
+	const tree = "a".repeat(40);
+	const overlay = {
+		target_mode: "base-workspace-overlay",
+		target_identity: digest,
+		base_tree: tree,
+		candidate_tree: tree,
+	};
+	const complete = { ...clone(source), ...overlay };
+	const decoded = decodeReviewStartV1(complete);
+	assert.equal(decoded.targetMode, "base-workspace-overlay");
+	assert.equal(decoded.targetIdentity, digest);
+	assert.equal(decoded.baseTree, tree);
+	assert.equal(decoded.candidateTree, tree);
+	assert.equal(decodeReviewStartV1(fixture("start.fixture.json")).targetMode, undefined);
+	for (const missing of ["target_mode", "target_identity", "base_tree", "candidate_tree"]) {
+		const partial = { ...clone(source), ...overlay } as JsonObject;
+		delete partial[missing];
+		assert.throws(() => decodeReviewStartV1(partial), /target|tree/, missing);
+	}
+	const wrongMode = { ...clone(source), ...overlay, target_mode: "workspace" };
+	assert.throws(() => decodeReviewStartV1(wrongMode), /target_mode/);
+	const badIdentity = { ...clone(source), ...overlay, target_identity: "not-a-digest" };
+	assert.throws(() => decodeReviewStartV1(badIdentity), /target_identity/);
+	const badTree = { ...clone(source), ...overlay, base_tree: "zz" };
+	assert.throws(() => decodeReviewStartV1(badTree), /base_tree/);
+});
+
+function reconcileStatus(): JsonObject {
+	const source = fixture<JsonObject>("status.fixture.json");
+	source.action = "reconcile_finalize";
+	source.replayability = "status_required";
+	source.reconciliation = { required: true };
+	return source;
+}
+
+test("status accepts the v2.1.7 finalize reconciliation state", () => {
+	const decoded = decodeReviewStatusV1(reconcileStatus());
+	assert.equal(decoded.action, "reconcile_finalize");
+	assert.equal(decoded.replayability, "status_required");
+	assert.deepEqual(decoded.reconciliation, { required: true });
+});
+
+test("status rejects contradictory finalize reconciliation shapes", () => {
+	const missingReconciliation = reconcileStatus();
+	delete missingReconciliation.reconciliation;
+	assert.throws(() => decodeReviewStatusV1(missingReconciliation), /reconciliation/);
+	const wrongReplayability = reconcileStatus();
+	wrongReplayability.replayability = "exact_replay_safe";
+	assert.throws(() => decodeReviewStatusV1(wrongReplayability), /status_required/);
+	const strayReconciliation = fixture<JsonObject>("status.fixture.json");
+	strayReconciliation.reconciliation = { required: true };
+	assert.throws(() => decodeReviewStatusV1(strayReconciliation), /reconciliation/);
+	const notRequired = reconcileStatus();
+	notRequired.reconciliation = { required: false };
+	assert.throws(() => decodeReviewStatusV1(notRequired), /required/);
+	const extraReconciliation = reconcileStatus();
+	extraReconciliation.reconciliation = { required: true, extra: true };
+	assert.throws(() => decodeReviewStatusV1(extraReconciliation), /not allowed/);
+	const nonCurrent = fixture<JsonObject>("status-unrelated.fixture.json");
+	nonCurrent.action = "reconcile_finalize";
+	nonCurrent.replayability = "status_required";
+	nonCurrent.reconciliation = { required: true };
+	assert.throws(() => decodeReviewStatusV1(nonCurrent), /current_target/);
+});
+
+test("failure accepts v2.1.7 recovery inputs, bounded backoff, bind replay, cause category, and scope-change context", () => {
+	const source = fixture<JsonObject>("failure.fixture.json");
+	const decoded = decodeReviewFailureV1(source);
+	assert.deepEqual(decoded.requiredInputs, ["predecessor_lineage_id", "expected_predecessor_revision", "successor_lineage_id", "disposition", "reason", "actor"]);
+	assert.equal(decoded.nextAction, "explicit-maintainer-action");
+	assert.ok(decoded.context);
+	const bindReplay = clone(source);
+	bindReplay.next_action = "review.bind_sdd";
+	bindReplay.required_inputs = ["change", "lineage_id", "expected_binding_revision"];
+	const bindDecoded = decodeReviewFailureV1(bindReplay);
+	assert.equal(bindDecoded.nextAction, "review.bind_sdd");
+	assert.deepEqual(bindDecoded.requiredInputs, ["change", "lineage_id", "expected_binding_revision"]);
+	const backoff = clone(source);
+	backoff.next_action = "retry_with_bounded_backoff";
+	assert.equal(decodeReviewFailureV1(backoff).nextAction, "retry_with_bounded_backoff");
+	for (const category of ["inventory_io_or_layout", "lock_ambiguous", "reset_residue", "record_or_graph_invalid", "inventory_incomplete"]) {
+		const candidate = clone(source);
+		candidate.cause_category = category;
+		assert.equal(decodeReviewFailureV1(candidate).causeCategory, category);
+	}
+	const badCategory = clone(source);
+	badCategory.cause_category = "cosmic_rays";
+	assert.throws(() => decodeReviewFailureV1(badCategory), /cause_category/);
+	const badContext = clone(source);
+	badContext.context = { scope_change: { unexpected: true } };
+	assert.throws(() => decodeReviewFailureV1(badContext), /context/);
+	const strayContextKey = clone(source);
+	(strayContextKey.context as JsonObject).unadvertised = true;
+	assert.throws(() => decodeReviewFailureV1(strayContextKey), /not allowed/);
 });
 
 test("failure enforces exact keys, enums, identifiers, message bounds, and required-input uniqueness", () => {

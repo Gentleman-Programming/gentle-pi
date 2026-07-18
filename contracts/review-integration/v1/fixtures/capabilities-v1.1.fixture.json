@@ -1,9 +1,9 @@
 {
-  "schema": "gentle-ai.review-integration.capabilities/v1",
+  "schema": "gentle-ai.review-integration.capabilities/v1.1",
   "contract": "gentle-ai.review-integration/v1",
   "protocol": {
     "major": 1,
-    "minor": 0
+    "minor": 1
   },
   "package": {
     "name": "gentle-ai",
@@ -46,7 +46,7 @@
   "schemas": [
     "gentle-ai.review-authority-status/v1",
     "gentle-ai.review-gate-request/v1",
-    "gentle-ai.review-integration.capabilities/v1",
+    "gentle-ai.review-integration.capabilities/v1.1",
     "gentle-ai.review-integration.failure/v1",
     "gentle-ai.review-integration.operation/v1",
     "gentle-ai.review-integration.projection/v1",
@@ -127,6 +127,14 @@
       }
     ],
     "optional": [
+      {
+        "name": "base_ref_workspace_overlay",
+        "supported": true,
+        "requires": [
+          "immutable_snapshot",
+          "restart_safe_projection"
+        ]
+      },
       {
         "name": "bounded_process_waits",
         "supported": true,

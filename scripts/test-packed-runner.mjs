@@ -58,7 +58,7 @@ try {
 	if (versions.length !== 1) throw new Error("packed install did not contain exactly one package-local Gentle AI version");
 	const executable = join(packageRoot, ".gentle-ai", versions[0].name, process.platform === "win32" ? "gentle-ai.exe" : "gentle-ai");
 	const capabilities = JSON.parse(execFileSync(executable, ["review", "capabilities", "--contract", "gentle-ai.review-integration/v1"], { cwd: installDirectory, encoding: "utf8" }));
-	if (capabilities.schema !== "gentle-ai.review-integration.capabilities/v1" || capabilities.contract !== "gentle-ai.review-integration/v1" || capabilities.package?.version !== versions[0].name.slice(1)) throw new Error("package-local Gentle AI returned incompatible capabilities");
+	if (!["gentle-ai.review-integration.capabilities/v1", "gentle-ai.review-integration.capabilities/v1.1"].includes(capabilities.schema) || capabilities.contract !== "gentle-ai.review-integration/v1" || capabilities.package?.version !== versions[0].name.slice(1)) throw new Error("package-local Gentle AI returned incompatible capabilities");
 	const packageManifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
 	process.stdout.write(`packed runner E2E passed (gentle-pi ${packageManifest.version ?? "unknown"}; Gentle AI ${capabilities.package?.version ?? "unknown"}; ${result.states.length} states)\n`);
 } finally {

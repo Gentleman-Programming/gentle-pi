@@ -4294,7 +4294,59 @@ function mapNativeStartResult(result: NativeStartResult): Record<string, unknown
 	};
 }
 
-function mapNativeTargetStatus(operation: ReviewControllerOperation, status: ReviewStatusV1): Record<string, unknown> {
+const RECONCILE_FINALIZE_NEXT_ACTION = "rerun-native-finalize-same-lineage";
+// Consumer-side bound only: the wire contract carries no attempt counter, so Pi
+// caps how many FINALIZE-driven reruns it will direct per lineage in one
+// process. Read-only observations (INSPECT/STATUS/START/VALIDATE/BIND_SDD)
+// never consume this budget; only reconciliation of an actually attempted
+// FINALIZE counts, and a successful FINALIZE clears the counter.
+const RECONCILE_FINALIZE_RERUN_LIMIT = 3;
+const reconcileFinalizeRerunAttemptsByLineage = new Map<string, number>();
+
+function requiredStatusActionText(lineageId?: string): string {
+	return `Run target-scoped review.status${lineageId === undefined ? "" : ` for lineage ${lineageId}`} and follow only its declared action; never start a new review, create a new budget, launch a lens, or fall back to inventory discovery.`;
+}
+
+function reconcileFinalizeRouting(status: ReviewStatusV1, requestedLineageId?: string, countRerunAttempt = false): Record<string, unknown> {
+	const lineageId = status.authority?.lineageId;
+	const base = { provider_action: "reconcile_finalize", replayability: status.replayability, reconciliation_required: true };
+	if (status.applicability !== "current_target" || lineageId === undefined || (requestedLineageId !== undefined && lineageId !== requestedLineageId)) {
+		return {
+			...base,
+			...(lineageId === undefined ? {} : { authority_lineage_id: lineageId }),
+			...(requestedLineageId === undefined ? {} : { requested_lineage_id: requestedLineageId }),
+			next_action: "stop-and-report-reconcile-lineage-mismatch",
+			required_status_action: `Finalize reconciliation reported authority${lineageId === undefined ? " without a current-target lineage" : ` for lineage ${lineageId}`}${requestedLineageId === undefined ? "" : ` while lineage ${requestedLineageId} was requested`}; stop and obtain explicit maintainer action. Never rerun finalize for a foreign lineage, start a new review, create a new budget, launch a lens, or fall back to inventory discovery.`,
+		};
+	}
+	const attempts = reconcileFinalizeRerunAttemptsByLineage.get(lineageId) ?? 0;
+	if (attempts >= RECONCILE_FINALIZE_RERUN_LIMIT) {
+		return {
+			...base,
+			lineage_id: lineageId,
+			next_action: "stop-and-escalate-finalize-reconciliation",
+			required_status_action: `Finalize reconciliation for lineage ${lineageId} was already directed ${RECONCILE_FINALIZE_RERUN_LIMIT} times without reaching terminal authority; stop and obtain explicit maintainer action instead of another rerun. Never start a new review, create a new budget, launch a lens, or fall back to inventory discovery.`,
+		};
+	}
+	if (countRerunAttempt) reconcileFinalizeRerunAttemptsByLineage.set(lineageId, attempts + 1);
+	return {
+		...base,
+		lineage_id: lineageId,
+		next_action: RECONCILE_FINALIZE_NEXT_ACTION,
+		required_status_action: `Finalize reconciliation required: rerun review.finalize for lineage ${lineageId} with the original content-bound payload; native discovery resumes committed authority. Never start a new review, create a new budget, launch a lens, or fall back to inventory discovery.`,
+	};
+}
+
+function mapNativeTargetStatus(operation: ReviewControllerOperation, status: ReviewStatusV1, requestedLineageId?: string): Record<string, unknown> {
+	if (status.action === "reconcile_finalize") {
+		const routing = reconcileFinalizeRouting(status, requestedLineageId);
+		return {
+			operation,
+			status: routing.next_action === RECONCILE_FINALIZE_NEXT_ACTION ? "in-progress" : "blocked",
+			result: status.raw,
+			...routing,
+		};
+	}
 	return {
 		operation,
 		status: status.applicability === "current_target" && status.action === "finalize" ? "in-progress" : status.action === "start" ? "ready" : "blocked",
@@ -4557,7 +4609,7 @@ function nativeOperationFailure(operation: ReviewControllerOperation, error: unk
 				: { mutation_outcome: mutationOutcome }),
 		...(diagnostics === undefined ? {} : { diagnostics }),
 		...(mutationOutcome === "unknown" || value.nextAction === "review.status"
-			? { replayability: "status_required", next_action: "review.status" }
+			? { replayability: "status_required", next_action: "review.status", required_status_action: requiredStatusActionText() }
 			: { next_action: "resolve-native-operation-failure" }),
 	};
 }
@@ -4589,12 +4641,24 @@ async function reconcileNativeMutationFailure(
 			outcome: "native-mutation-status-required",
 			replayability: "status_required",
 			next_action: "review.status",
+			required_status_action: requiredStatusActionText(target.lineageId),
 		};
 	}
 	try {
 		const status = await nativeReviewCli.targetStatus(target);
+		const { required_status_action: staleStatusDirective, ...reconciledBase } = failure;
+		void staleStatusDirective;
+		if (status.action === "reconcile_finalize") {
+			return {
+				...reconciledBase,
+				outcome: "native-mutation-status-reconciled",
+				reconciliation: status.raw,
+				authority_applicability: status.applicability,
+				...reconcileFinalizeRouting(status, target.lineageId, operation === REVIEW_CONTROLLER_OPERATION.FINALIZE),
+			};
+		}
 		return {
-			...failure,
+			...reconciledBase,
 			outcome: "native-mutation-status-reconciled",
 			reconciliation: status.raw,
 			authority_applicability: status.applicability,
@@ -4609,6 +4673,7 @@ async function reconcileNativeMutationFailure(
 			reconciliation_failure: nativeOperationFailure(REVIEW_CONTROLLER_OPERATION.STATUS, statusError),
 			replayability: "status_required",
 			next_action: "review.status",
+			required_status_action: requiredStatusActionText(target.lineageId),
 		};
 	}
 }
@@ -4993,7 +5058,7 @@ async function executeReviewControllerOperation(
 						...(canonicalBaseRef === undefined ? {} : { baseRef: canonicalBaseRef }),
 						...(signal === undefined ? {} : { signal }),
 					});
-					if (target.applicability !== "unrelated" || target.action !== "start") return mapNativeTargetStatus(parameters.operation, target);
+					if (target.applicability !== "unrelated" || target.action !== "start") return mapNativeTargetStatus(parameters.operation, target, parameters.lineageId);
 				} else {
 					const nativeStatus = await nativeReviewCli.reviewStatus({ cwd: defaultCwd, ...(signal === undefined ? {} : { signal }) });
 					const preconditionFailure = nativeStartPreconditionFailure(nativeStatus);
@@ -5190,7 +5255,7 @@ async function executeReviewControllerOperation(
 				if ((validationAttempt || input.review_result !== undefined) && candidateViews && parameters.lineageId && !candidateViews.hasProjection(parameters.lineageId)) {
 					if (nativeReviewCli.targetStatus !== undefined) {
 						negotiatedStatus = await nativeReviewCli.targetStatus({ cwd: defaultCwd, lineageId: parameters.lineageId, ...(signal === undefined ? {} : { signal }) });
-						if (negotiatedStatus.applicability !== "current_target" || negotiatedStatus.authority?.lineageId !== parameters.lineageId) return mapNativeTargetStatus(parameters.operation, negotiatedStatus);
+						if (negotiatedStatus.applicability !== "current_target" || negotiatedStatus.authority?.lineageId !== parameters.lineageId) return mapNativeTargetStatus(parameters.operation, negotiatedStatus, parameters.lineageId);
 						candidateView = input.review_result === undefined
 							? (candidateViews.restoreProjectionFromNative(parameters.lineageId, defaultCwd, negotiatedStatus.projection), undefined)
 							: candidateViews.restoreForFinalizeFromNative(parameters.lineageId, defaultCwd, negotiatedStatus.projection);
@@ -5212,7 +5277,7 @@ async function executeReviewControllerOperation(
 						if (input.validation === undefined) {
 							candidateViews.cleanup(candidateView.token);
 							negotiatedStatus ??= await nativeReviewCli.targetStatus({ cwd: defaultCwd, lineageId: parameters.lineageId, ...(signal === undefined ? {} : { signal }) });
-							return mapNativeTargetStatus(parameters.operation, negotiatedStatus);
+							return mapNativeTargetStatus(parameters.operation, negotiatedStatus, parameters.lineageId);
 						}
 						if (input.validation_proof !== undefined) throw new Error("Negotiated FINALIZE requires the native targeted validation document");
 					} else {
@@ -5268,6 +5333,7 @@ async function executeReviewControllerOperation(
 			try {
 				if (correctionCompletion && candidateViews && parameters.lineageId) candidateViews.promoteCorrected(parameters.lineageId, candidateView!.token);
 				candidateViews?.cleanupTerminal(nativeResult.lineageId, nativeResult.state);
+				reconcileFinalizeRerunAttemptsByLineage.delete(nativeResult.lineageId);
 				return { operation: parameters.operation, result: mapNativeFinalizeResult(nativeResult) };
 			} catch (error) {
 				const committedFailure = Object.assign(error instanceof Error ? error : new Error(String(error)), {
@@ -5371,7 +5437,7 @@ async function executeReviewControllerOperation(
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 					...(signal === undefined ? {} : { signal }),
 				});
-				return mapNativeTargetStatus(parameters.operation, status);
+				return mapNativeTargetStatus(parameters.operation, status, parameters.lineageId);
 			} catch (error) {
 				return nativeOperationFailure(parameters.operation, error);
 			}
@@ -5483,7 +5549,7 @@ async function executeReviewControllerOperation(
 			);
 			if (nativeDerived.command.event === "pre-commit" && candidateViews && !candidateViews.hasProjection(parameters.lineageId) && nativeReviewCli.targetStatus !== undefined) {
 				const targetStatus = await nativeReviewCli.targetStatus({ cwd: nativeDerived.command.cwd, lineageId: parameters.lineageId, projection: "staged", ...(signal === undefined ? {} : { signal }) });
-				if (targetStatus.applicability !== "current_target" || targetStatus.authority?.lineageId !== parameters.lineageId) return mapNativeTargetStatus(parameters.operation, targetStatus);
+				if (targetStatus.applicability !== "current_target" || targetStatus.authority?.lineageId !== parameters.lineageId) return mapNativeTargetStatus(parameters.operation, targetStatus, parameters.lineageId);
 				candidateViews.restoreProjectionFromNative(parameters.lineageId, nativeDerived.command.cwd, targetStatus.projection);
 			}
 			const intendedTree = assertFrozenPreCommitProjection(nativeDerived, parameters.lineageId, candidateViews);

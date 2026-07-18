@@ -6,11 +6,21 @@ import test from "node:test";
 import {
 	NATIVE_REVIEW_ERROR_CODE,
 	NativeReviewCliError,
-	NativeReviewCliV213,
+	NativeReviewCliV213 as NativeReviewCliV213Production,
 	createNodeExecFileAdapter,
 	type ExecFileAdapter,
 	type NativeStartRequest,
 } from "../lib/native-review-cli.ts";
+
+// The queued-adapter unit tests never execute a real process; default to a fixed
+// absolute package-local path so they do not depend on an installed binary
+// (unavailable while the pinned v2.1.7 release digests are pending).
+class NativeReviewCliV213 extends NativeReviewCliV213Production {
+	constructor(...parameters: ConstructorParameters<typeof NativeReviewCliV213Production>) {
+		const [adapter, executable, ...rest] = parameters;
+		super(adapter, executable ?? "/package/.gentle-ai/gentle-ai", ...rest);
+	}
+}
 
 interface QueuedResult {
 	stdout: string;

@@ -32,7 +32,7 @@ function queued(results: Result[]): { adapter: ExecFileAdapter; calls: readonly 
 	};
 }
 
-test("v2.1.6 negotiates once per verified digest and binds every operation argv", async () => {
+test("v2.1.7 negotiates once per verified digest and binds every operation argv", async () => {
 	clearNativeReviewCapabilitiesCacheForTesting();
 	const digest = "dcc846103b16d365eaeeb9d7f289c23fc4f2897f23def1cb3fe7f05557b64705";
 	const queue = queued([
@@ -52,7 +52,7 @@ test("v2.1.6 negotiates once per verified digest and binds every operation argv"
 	assert.equal(queue.calls[1]?.timeoutMs, undefined);
 });
 
-test("v2.1.6 preserves the native uniform failure envelope", async () => {
+test("v2.1.7 preserves the native uniform failure envelope", async () => {
 	clearNativeReviewCapabilitiesCacheForTesting();
 	const digest = "dcc846103b16d365eaeeb9d7f289c23fc4f2897f23def1cb3fe7f05557b64705";
 	const queue = queued([
@@ -62,7 +62,7 @@ test("v2.1.6 preserves the native uniform failure envelope", async () => {
 	const client = new NativeReviewCliV216(queue.adapter, "/package/gentle-ai", 321, 654, undefined, () => digest);
 	await assert.rejects(
 		() => client.finalize({ cwd: "/repo", lineageId: "review-failure-fixture" }),
-		(error: unknown) => error instanceof NativeReviewIntegrationError && error.failureEnvelope.raw === error.failureEnvelope.raw && error.mutationOutcome === "committed" && error.nextAction === "review.finalize",
+		(error: unknown) => error instanceof NativeReviewIntegrationError && error.failureEnvelope.code === "gate_scope_changed" && error.mutationOutcome === "not_started" && error.nextAction === "explicit-maintainer-action",
 	);
 });
 
@@ -80,7 +80,7 @@ test("capability cache invalidates when the verified executable digest changes",
 	assert.equal(queue.calls.length, 2);
 });
 
-test("v2.1.6 bind-sdd rejects a response from the wrong lifecycle gate", async () => {
+test("v2.1.7 bind-sdd rejects a response from the wrong lifecycle gate", async () => {
 	clearNativeReviewCapabilitiesCacheForTesting();
 	const digest = "dcc846103b16d365eaeeb9d7f289c23fc4f2897f23def1cb3fe7f05557b64705";
 	const binding = JSON.parse(readFileSync(join(process.cwd(), "tests", "fixtures", "native-review-cli", "v2.1.3", "bind-sdd.json"), "utf8")) as Record<string, unknown>;

@@ -20,7 +20,7 @@
   ],
   "properties": {
     "schema": { "const": "gentle-ai.review-integration.projection/v1" },
-    "kind": { "enum": ["current-changes", "base-diff", "exact-revision", "fix-diff"] },
+    "kind": { "enum": ["current-changes", "base-diff", "base-workspace-overlay", "exact-revision", "fix-diff"] },
     "projection": { "enum": ["staged", "workspace"] },
     "base_tree": { "$ref": "#/$defs/gitTree" },
     "initial_review_tree": { "$ref": "#/$defs/gitTree" },
