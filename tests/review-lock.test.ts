@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { canonicalJsonV1, domainHashV1 } from "../lib/review-canonical.ts";
-import { conservativeOwnerDeathProofV1, ReviewLockError, ReviewMutationLockV1, type ReviewLockPlatformAdapterV1 } from "../lib/review-lock.ts";
+import { conservativeOwnerDeathProofV1, qualifiedNodeFsLockPlatformV1, ReviewLockError, ReviewMutationLockV1, type ReviewLockPlatformAdapterV1 } from "../lib/review-lock.ts";
 
 function temporaryRoot(): string {
 	return mkdtempSync(join(tmpdir(), "gentle-review-lock-"));
@@ -116,6 +116,56 @@ test("default production lock platform preserves no-replace semantics when the q
 		assert.equal(existsSync(lock.path), true);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+function withStubbedPlatform(platform: NodeJS.Platform, run: () => void): void {
+	const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+	Object.defineProperty(process, "platform", { value: platform, configurable: true });
+	try {
+		run();
+	} finally {
+		if (descriptor) Object.defineProperty(process, "platform", descriptor);
+	}
+}
+
+test("qualified production moveNoReplace never replaces an existing destination file on any platform", () => {
+	for (const platform of [process.platform, "win32" as NodeJS.Platform]) {
+		const root = temporaryRoot();
+		try {
+			const source = join(root, "source.json");
+			const destination = join(root, "destination.json");
+			writeFileSync(source, "candidate", { mode: 0o600 });
+			writeFileSync(destination, "holder", { mode: 0o600 });
+			withStubbedPlatform(platform, () => {
+				assert.throws(() => qualifiedNodeFsLockPlatformV1().moveNoReplace(source, destination), ReviewLockError, `platform ${platform} must fail closed on an occupied destination file`);
+			});
+			assert.equal(readFileSync(destination, "utf8"), "holder", `platform ${platform} must not modify the occupied destination file`);
+			assert.equal(existsSync(source), true, `platform ${platform} must keep the source after the refused move`);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}
+});
+
+test("qualified production moveNoReplace never replaces an existing destination directory on any platform", () => {
+	for (const platform of [process.platform, "win32" as NodeJS.Platform]) {
+		const root = temporaryRoot();
+		try {
+			const source = join(root, "source-lock");
+			const destination = join(root, "destination-lock");
+			mkdirSync(source, { mode: 0o700 });
+			writeFileSync(join(source, "owner.json"), "candidate", { mode: 0o600 });
+			mkdirSync(destination, { mode: 0o700 });
+			writeFileSync(join(destination, "sentinel.txt"), "pre-existing", { mode: 0o600 });
+			withStubbedPlatform(platform, () => {
+				assert.throws(() => qualifiedNodeFsLockPlatformV1().moveNoReplace(source, destination), ReviewLockError, `platform ${platform} must fail closed on an occupied destination directory`);
+			});
+			assert.equal(readFileSync(join(destination, "sentinel.txt"), "utf8"), "pre-existing", `platform ${platform} must not modify the occupied destination directory`);
+			assert.equal(existsSync(join(source, "owner.json")), true, `platform ${platform} must keep the source directory after the refused move`);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	}
 });
 
