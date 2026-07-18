@@ -42,7 +42,7 @@
         "identity": { "$ref": "#/$defs/sha256" }
       }
     },
-    "action": { "enum": ["start", "finalize", "validate", "recover", "maintainer_action", "select_lineage", "repair_authority", "stop"] },
+    "action": { "enum": ["start", "finalize", "validate", "recover", "maintainer_action", "select_lineage", "repair_authority", "reconcile_finalize", "stop"] },
     "replayability": { "enum": ["not_replayable", "exact_replay_safe", "status_required", "manual_action_required"] },
     "frozen": {
       "type": "object",
@@ -60,12 +60,29 @@
       "type": "array",
       "uniqueItems": true,
       "items": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" }
+    },
+    "reconciliation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required"],
+      "properties": { "required": { "const": true } }
     }
   },
   "$defs": {
     "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
   },
   "allOf": [
+    {
+      "if": { "properties": { "action": { "const": "reconcile_finalize" } } },
+      "then": {
+        "required": ["reconciliation"],
+        "properties": {
+          "applicability": { "const": "current_target" },
+          "replayability": { "const": "status_required" }
+        }
+      },
+      "else": { "not": { "required": ["reconciliation"] } }
+    },
     {
       "if": { "properties": { "applicability": { "const": "current_target" } } },
       "then": { "required": ["authority"] },

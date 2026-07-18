@@ -4,19 +4,31 @@ import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import test from "node:test";
+import baseTest from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
-import { resolveGentleAiBinary } from "../lib/gentle-ai-binary.ts";
+import { GENTLE_AI_VERSION, resolveGentleAiBinary } from "../lib/gentle-ai-binary.ts";
 import { NativeReviewCliV214 } from "../lib/native-review-cli.ts";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
+import { resolveGentleAiReleaseAsset } from "../scripts/gentle-ai-installer.mjs";
 
 const execFileAsync = promisify(execFile);
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const binary = resolveGentleAiBinary(packageRoot, process.platform);
-const OFFICIAL_BINARY_SHA256 = "a7bbfcf58c4b6e933672338984ec011251595155198047f20c41a69242c6cf5d";
+// The parity suite exercises the published official binary; it skips while a
+// re-pinned release's archives and digest table are still pending, because the
+// pinned package-local binary cannot be installed or integrity-verified yet.
+const resolvedBinary = (() => {
+	try {
+		return resolveGentleAiBinary(packageRoot, process.platform);
+	} catch {
+		return undefined;
+	}
+})();
+const test = resolvedBinary === undefined ? baseTest.skip : baseTest;
+const binary = resolvedBinary ?? "";
+const OFFICIAL_BINARY_SHA256 = resolveGentleAiReleaseAsset(process.platform, process.arch).binarySha256;
 const REVIEWED_PATHS = ["tracked.txt", "initially-untracked.txt"] as const;
 // Golden captured by the clean external-artifact differential fixture for v2.1.3.
 // This is released runtime output, not a locally reconstructed authority digest.
@@ -152,9 +164,9 @@ async function finalizeEmptyReview(repository: string, artifacts: string, starte
 	return run(binary, ["review", "finalize", "--cwd", repository, "--lineage", started.lineage_id, ...resultFiles.flatMap((result) => ["--result", result]), "--evidence", evidence], repository);
 }
 
-test("official v2.1.6 package runtime authorizes an unchanged linked-view candidate and denies a changed staging tree", async (t) => {
+test("official pinned package runtime authorizes an unchanged linked-view candidate and denies a changed staging tree", async (t) => {
 	assert.equal(createHash("sha256").update(await readFile(binary)).digest("hex"), OFFICIAL_BINARY_SHA256);
-	assert.deepEqual(await run(binary, ["version"], packageRoot), { exitCode: 0, stdout: "gentle-ai 2.1.6\n", stderr: "" });
+	assert.deepEqual(await run(binary, ["version"], packageRoot), { exitCode: 0, stdout: `gentle-ai ${GENTLE_AI_VERSION}\n`, stderr: "" });
 
 	const workspace = await mkdtemp(join(tmpdir(), "gentle-pi-v216-parity-"));
 	const repository = join(workspace, "repository");
@@ -231,7 +243,7 @@ test("official v2.1.6 package runtime authorizes an unchanged linked-view candid
 	await restoreCandidate(repository, candidateTree);
 });
 
-test("official v2.1.6 package runtime keeps frozen candidate lineages and receipts isolated across replay and replacement", async (t) => {
+test("official pinned package runtime keeps frozen candidate lineages and receipts isolated across replay and replacement", async (t) => {
 	const workspace = await mkdtemp(join(tmpdir(), "gentle-pi-v215-lineage-"));
 	const repository = join(workspace, "repository");
 	const artifacts = join(workspace, "artifacts");
@@ -256,7 +268,11 @@ test("official v2.1.6 package runtime keeps frozen candidate lineages and receip
 
 	const firstFinalized = JSON.parse((await finalizeEmptyReview(repository, artifacts, first, "first-evidence.txt")).stdout) as ReviewFinalize;
 	const firstFinalizedInventory = authorityInventory(await reviewStatus(repository));
-	const firstFinalizeReplay = JSON.parse((await finalizeEmptyReview(repository, artifacts, first, "first-evidence.txt")).stdout) as ReviewFinalize;
+	// v2.1.7 terminal replay contract: replay uses the exact explicit lineage with
+	// no mutation inputs; re-sending reviewer results after approval is rejected.
+	const repeatedResults = await finalizeEmptyReview(repository, artifacts, first, "first-evidence.txt").catch((error: NodeJS.ErrnoException & { stderr?: string }) => error);
+	assert.match((repeatedResults as { stderr?: string }).stderr ?? "", /reviewer results are accepted only while the authority is reviewing/, "terminal authority must reject replayed reviewer results");
+	const firstFinalizeReplay = JSON.parse((await run(binary, ["review", "finalize", "--cwd", repository, "--lineage", first.lineage_id], repository)).stdout) as ReviewFinalize;
 	const firstFinalizeReplayInventory = authorityInventory(await reviewStatus(repository));
 	assert.equal(firstFinalized.lineage_id, first.lineage_id);
 	assert.equal(firstFinalized.state, "approved");

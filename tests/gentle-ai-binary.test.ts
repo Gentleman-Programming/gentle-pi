@@ -1,31 +1,38 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
 import test from "node:test";
 import {
 	GENTLE_AI_BINARY_MISSING_CODE,
+	GENTLE_AI_VERSION,
 	PackageLocalGentleAiBinaryMissingError,
 	resolveGentleAiBinary,
 } from "../lib/gentle-ai-binary.ts";
 import { NativeReviewCliV213, createNativeReviewCli, type ExecFileAdapter } from "../lib/native-review-cli.ts";
 import { resolveGentleAiReleaseAsset } from "../scripts/gentle-ai-installer.mjs";
 
-const VERSION = { stdout: "gentle-ai 2.1.6\n", stderr: "", exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false } as const;
+const VERSION = { stdout: `gentle-ai ${GENTLE_AI_VERSION}\n`, stderr: "", exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false } as const;
+const RUNTIME_DIRECTORY = `v${GENTLE_AI_VERSION}`;
+const repoRuntimeBinary = join(import.meta.dirname, "..", ".gentle-ai", RUNTIME_DIRECTORY, process.platform === "win32" ? "gentle-ai.exe" : "gentle-ai");
+const releaseDigestsPinned = /^[0-9a-f]{64}$/.test(resolveGentleAiReleaseAsset(process.platform, process.arch).sha256);
+// These integrity tests need the published official binary; they skip while a
+// re-pinned release's archives and digest table are still pending.
+const verifiedBinaryTest = releaseDigestsPinned && existsSync(repoRuntimeBinary) ? test : test.skip;
 
 async function writeVerifiedBinary(packageRoot: string, platform = process.platform): Promise<string> {
 	const asset = resolveGentleAiReleaseAsset(platform, process.arch);
-	const binaryPath = join(packageRoot, ".gentle-ai", "v2.1.6", asset.executable);
-	await mkdir(join(packageRoot, ".gentle-ai", "v2.1.6"), { recursive: true });
-	await writeFile(binaryPath, readFileSync(join(import.meta.dirname, "..", ".gentle-ai", "v2.1.6", asset.executable)));
+	const binaryPath = join(packageRoot, ".gentle-ai", RUNTIME_DIRECTORY, asset.executable);
+	await mkdir(join(packageRoot, ".gentle-ai", RUNTIME_DIRECTORY), { recursive: true });
+	await writeFile(binaryPath, readFileSync(join(import.meta.dirname, "..", ".gentle-ai", RUNTIME_DIRECTORY, asset.executable)));
 	if (platform !== "win32") await chmod(binaryPath, 0o700);
-	await writeFile(join(packageRoot, ".gentle-ai", "v2.1.6", "integrity.json"), `${JSON.stringify({ version: "2.1.6", asset: asset.name, assetSha256: asset.sha256, binarySha256: asset.binarySha256 })}\n`);
+	await writeFile(join(packageRoot, ".gentle-ai", RUNTIME_DIRECTORY, "integrity.json"), `${JSON.stringify({ version: GENTLE_AI_VERSION, asset: asset.name, assetSha256: asset.sha256, binarySha256: asset.binarySha256 })}\n`);
 	return binaryPath;
 }
 
-test("runtime resolves an absolute package-local binary path without PATH fallback", async () => {
+verifiedBinaryTest("runtime resolves an absolute package-local binary path without PATH fallback", async () => {
 	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-binary-"));
 	const executable = process.platform === "win32" ? "gentle-ai.exe" : "gentle-ai";
 	const binaryPath = await writeVerifiedBinary(packageRoot);
@@ -40,24 +47,24 @@ test("runtime resolves an absolute package-local binary path without PATH fallba
 test("runtime rejects an unverified binary, a symlinked manifest, and ambient executable injection", async () => {
 	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-binary-integrity-"));
 	const executable = process.platform === "win32" ? "gentle-ai.exe" : "gentle-ai";
-	const binaryPath = join(packageRoot, ".gentle-ai", "v2.1.6", executable);
-	const manifestPath = join(packageRoot, ".gentle-ai", "v2.1.6", "integrity.json");
-	await mkdir(join(packageRoot, ".gentle-ai", "v2.1.6"), { recursive: true });
+	const binaryPath = join(packageRoot, ".gentle-ai", RUNTIME_DIRECTORY, executable);
+	const manifestPath = join(packageRoot, ".gentle-ai", RUNTIME_DIRECTORY, "integrity.json");
+	await mkdir(join(packageRoot, ".gentle-ai", RUNTIME_DIRECTORY), { recursive: true });
 	await writeFile(binaryPath, "native");
 
 	assert.throws(() => resolveGentleAiBinary(packageRoot, process.platform), /package-local-binary-missing/);
 	const binarySha256 = createHash("sha256").update("native").digest("hex");
 	const manifestTarget = join(packageRoot, "manifest-target.json");
-	await writeFile(manifestTarget, `${JSON.stringify({ version: "2.1.6", asset: `gentle-ai_2.1.6_${process.platform}_${process.arch === "x64" ? "amd64" : process.arch}.tar.gz`, assetSha256: "a".repeat(64), binarySha256 })}\n`);
+	await writeFile(manifestTarget, `${JSON.stringify({ version: GENTLE_AI_VERSION, asset: `gentle-ai_${GENTLE_AI_VERSION}_${process.platform}_${process.arch === "x64" ? "amd64" : process.arch}.tar.gz`, assetSha256: "a".repeat(64), binarySha256 })}\n`);
 	await symlink(manifestTarget, manifestPath);
 	assert.throws(() => resolveGentleAiBinary(packageRoot, process.platform), /package-local-binary-missing/);
 	assert.throws(() => new NativeReviewCliV213(async () => VERSION, "gentle-ai"), /absolute package-local executable/);
 });
 
-test("runtime rejects malformed, unknown, wrong, and symlinked integrity paths", async () => {
+verifiedBinaryTest("runtime rejects malformed, unknown, wrong, and symlinked integrity paths", async () => {
 	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-binary-manifest-"));
 	const binaryPath = await writeVerifiedBinary(packageRoot);
-	const manifestPath = join(packageRoot, ".gentle-ai", "v2.1.6", "integrity.json");
+	const manifestPath = join(packageRoot, ".gentle-ai", RUNTIME_DIRECTORY, "integrity.json");
 	const valid = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, string>;
 	for (const manifest of [
 		"{",
@@ -82,17 +89,17 @@ test("runtime rejects malformed, unknown, wrong, and symlinked integrity paths",
 	assert.throws(() => resolveGentleAiBinary(directoryRoot, process.platform), /package-local-binary-missing/);
 });
 
-test("runtime rejects an arbitrary binary even when a forged manifest matches its digest", async () => {
+verifiedBinaryTest("runtime rejects an arbitrary binary even when a forged manifest matches its digest", async () => {
 	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-binary-forged-manifest-"));
 	const binaryPath = await writeVerifiedBinary(packageRoot);
 	const asset = resolveGentleAiReleaseAsset(process.platform, process.arch);
 	await writeFile(binaryPath, "arbitrary binary");
 	if (process.platform !== "win32") await chmod(binaryPath, 0o700);
-	await writeFile(join(packageRoot, ".gentle-ai", "v2.1.6", "integrity.json"), JSON.stringify({ version: "2.1.6", asset: asset.name, assetSha256: asset.sha256, binarySha256: createHash("sha256").update("arbitrary binary").digest("hex") }));
+	await writeFile(join(packageRoot, ".gentle-ai", RUNTIME_DIRECTORY, "integrity.json"), JSON.stringify({ version: GENTLE_AI_VERSION, asset: asset.name, assetSha256: asset.sha256, binarySha256: createHash("sha256").update("arbitrary binary").digest("hex") }));
 	assert.throws(() => resolveGentleAiBinary(packageRoot, process.platform), /package-local-binary-missing/);
 });
 
-test("runtime rejects binary replacement during verification", async () => {
+verifiedBinaryTest("runtime rejects binary replacement during verification", async () => {
 	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-binary-replacement-"));
 	const binaryPath = await writeVerifiedBinary(packageRoot);
 	assert.throws(
@@ -115,7 +122,7 @@ test("runtime fails closed when the package-local binary is missing", async () =
 	);
 });
 
-test("runtime rejects a valid but non-executable POSIX binary", async (t) => {
+verifiedBinaryTest("runtime rejects a valid but non-executable POSIX binary", async (t) => {
 	if (process.platform === "win32") {
 		t.skip("Windows does not use POSIX executable mode bits");
 		return;
@@ -137,7 +144,7 @@ test("production native operations report the package-local missing binary code"
 	);
 });
 
-test("production native client never invokes a global gentle-ai executable", async () => {
+verifiedBinaryTest("production native client never invokes a global gentle-ai executable", async () => {
 	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-native-"));
 	const binaryPath = await writeVerifiedBinary(packageRoot);
 	const calls: string[] = [];

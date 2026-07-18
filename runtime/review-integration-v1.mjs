@@ -44,6 +44,7 @@ export const REVIEW_PROJECTION = {
 export const REVIEW_PROJECTION_KIND = {
 	CURRENT_CHANGES: "current-changes",
 	BASE_DIFF: "base-diff",
+	BASE_WORKSPACE_OVERLAY: "base-workspace-overlay",
 	EXACT_REVISION: "exact-revision",
 	FIX_DIFF: "fix-diff",
 }         ;
@@ -77,7 +78,7 @@ const RISK_LEVELS = ["low", "medium", "high"]         ;
 const REVIEW_LENSES = ["review-risk", "review-resilience", "review-readability", "review-reliability"]         ;
 const RISK_REASON_CODES = ["configuration_change", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "service_token", "shell_source"]         ;
 const RISK_SIGNALS = ["auth", "update", "security", "payments", "permissions", "shell_process"]         ;
-const STATUS_ACTIONS = ["start", "finalize", "validate", "recover", "maintainer_action", "select_lineage", "repair_authority", "stop"]         ;
+const STATUS_ACTIONS = ["start", "finalize", "validate", "recover", "maintainer_action", "select_lineage", "repair_authority", "reconcile_finalize", "stop"]         ;
 const RECEIPT_STATUSES = ["expected_missing", "present", "publication_pending", "not_applicable"]         ;
 const REQUIRED_OPERATIONS = Object.freeze(Object.values(REVIEW_INTEGRATION_OPERATION));
 const REQUIRED_GATES = Object.freeze(["post-apply", "pre-commit", "pre-push", "pre-pr", "release"]         );
@@ -93,24 +94,36 @@ const REQUIRED_SCHEMAS = Object.freeze([
 	"gentle-ai.review-integration.status/v1",
 	"gentle-ai.review-receipt/v1",
 	"gentle-ai.review-receipt/v2",
+	"gentle-ai.review-result-artifact/v1",
 	"https://gentle-ai.dev/schema/review/refuter/v1",
 	"https://gentle-ai.dev/schema/review/reviewer/v1",
 	"https://gentle-ai.dev/schema/review/validator/v1",
 ]         );
+const OPTIONAL_FEATURE_NAMES = Object.freeze([
+	"bounded_process_waits",
+	"exact_gate_receipt_discovery",
+	"native_low_risk_verification",
+	"risk_reasons",
+	"scope_change_diagnostics",
+]         );
 const FEATURE_NAMES = Object.freeze([
+	"bounded_process_waits",
 	"compact_v2_authority",
+	"exact_gate_receipt_discovery",
 	"exact_receipt_replay",
 	"five_delivery_gates",
 	"immutable_snapshot",
 	"legacy_v1_target_scoped_read_only",
+	"native_low_risk_verification",
 	"repository_independent_capabilities",
 	"restart_safe_projection",
 	"risk_reasons",
+	"scope_change_diagnostics",
 	"sdd_receipt_binding",
 	"target_scoped_status",
 	"uniform_failure_envelope",
 ]         );
-const REQUIRED_MANDATORY_FEATURES = Object.freeze(FEATURE_NAMES.filter((name) => name !== "risk_reasons"));
+const REQUIRED_MANDATORY_FEATURES = Object.freeze(FEATURE_NAMES.filter((name) => !(OPTIONAL_FEATURE_NAMES                     ).includes(name)));
 
 
 
@@ -186,6 +199,54 @@ const REQUIRED_MANDATORY_FEATURES = Object.freeze(FEATURE_NAMES.filter((name) =>
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+const FAILURE_REQUIRED_INPUTS = [
+	"lineage_id",
+	"change",
+	"expected_binding_revision",
+	"predecessor_lineage_id",
+	"expected_predecessor_revision",
+	"successor_lineage_id",
+	"disposition",
+	"reason",
+	"actor",
+]         ;
+const FAILURE_NEXT_ACTIONS = ["correct_request", "retry", "retry_with_bounded_backoff", "review.status", "review.finalize", "review.bind_sdd", "explicit-maintainer-action", "stop"]         ;
+const FAILURE_CAUSE_CATEGORIES = ["inventory_io_or_layout", "lock_ambiguous", "reset_residue", "record_or_graph_invalid", "inventory_incomplete"]         ;
 
 
 
@@ -362,7 +423,9 @@ export function decodeReviewCapabilitiesV1(value         , verifiedExecutableDig
 	if (protocolMajor !== 1) throw new TypeError("incompatible review integration protocol");
 	const allowAdditions = protocolMinor > 0;
 	const body = exactRecord(value, "capabilities", requiredFields, [], allowAdditions);
-	requireIdentity(body, "gentle-ai.review-integration.capabilities/v1");
+	const capabilitiesSchema = protocolMinor === 0 ? "gentle-ai.review-integration.capabilities/v1" : `gentle-ai.review-integration.capabilities/v1.${protocolMinor}`;
+	requireIdentity(body, capabilitiesSchema);
+	const requiredSchemas = REQUIRED_SCHEMAS.map((schema) => (schema === "gentle-ai.review-integration.capabilities/v1" ? capabilitiesSchema : schema));
 
 	const protocol = exactRecord(body.protocol, "capabilities.protocol", ["major", "minor"], [], allowAdditions);
 	if (protocol.major !== protocolMajor || protocol.minor !== protocolMinor) throw new TypeError("incompatible review integration protocol");
@@ -387,15 +450,15 @@ export function decodeReviewCapabilitiesV1(value         , verifiedExecutableDig
 	const operations = enumArray(body.operations, REQUIRED_OPERATIONS, "capabilities.operations", { minimum: 6, maximum: 6, unique: true });
 	const gates = enumArray(body.gates, REQUIRED_GATES, "capabilities.gates", { minimum: 5, maximum: 5, unique: true });
 	const projections = enumArray(body.projections, REQUIRED_PROJECTIONS, "capabilities.projections", { minimum: 2, maximum: 2, unique: true });
-	const schemas = enumArray(body.schemas, REQUIRED_SCHEMAS, "capabilities.schemas", { minimum: 13, maximum: 13, unique: true });
+	const schemas = enumArray(body.schemas, requiredSchemas, "capabilities.schemas", { minimum: 14, maximum: 14, unique: true });
 	assertExactSet(operations, REQUIRED_OPERATIONS, "capabilities operations");
 	assertExactSet(gates, REQUIRED_GATES, "capabilities gates");
 	assertExactSet(projections, REQUIRED_PROJECTIONS, "capabilities projections");
-	assertExactSet(schemas, REQUIRED_SCHEMAS, "capabilities schemas");
+	assertExactSet(schemas, requiredSchemas, "capabilities schemas");
 
 	const features = exactRecord(body.features, "capabilities.features", ["mandatory", "optional"], [], allowAdditions);
 	const mandatory = array(features.mandatory, "capabilities.features.mandatory", (entry, label) => decodeFeature(entry, label, allowAdditions), { minimum: 10, ...(allowAdditions ? {} : { maximum: 10 }) });
-	const optional = array(features.optional, "capabilities.features.optional", (entry, label) => decodeOptionalFeature(entry, label, allowAdditions), { minimum: 1, ...(allowAdditions ? {} : { maximum: 1 }), unique: true });
+	const optional = array(features.optional, "capabilities.features.optional", (entry, label) => decodeOptionalFeature(entry, label, allowAdditions), { minimum: 5, ...(allowAdditions ? {} : { maximum: 5 }), unique: true });
 	const mandatoryNames = mandatory.map((feature) => feature.name);
 	const optionalNames = optional.map((feature) => feature.name);
 	assertExactSet(mandatoryNames, REQUIRED_MANDATORY_FEATURES, "mandatory capabilities");
@@ -433,8 +496,20 @@ export function decodeReviewCapabilitiesV1(value         , verifiedExecutableDig
 }
 
 export function decodeReviewStartV1(value         )                {
-	const body = exactRecord(value, "start", ["schema", "contract", "operation", "action", "lenses_required", "lineage_id", "state", "risk_level", "selected_lenses", "projection", "changed_files", "changed_lines", "correction_budget", "risk_reasons"]);
+	const overlayFields = ["target_mode", "target_identity", "base_tree", "candidate_tree"]         ;
+	const body = exactRecord(value, "start", ["schema", "contract", "operation", "action", "lenses_required", "lineage_id", "state", "risk_level", "selected_lenses", "projection", "changed_files", "changed_lines", "correction_budget", "risk_reasons"], [...overlayFields]);
 	requireIdentity(body, "gentle-ai.review-integration.start/v1", REVIEW_INTEGRATION_OPERATION.START);
+	const overlayPresent = overlayFields.filter((field) => body[field] !== undefined);
+	if (overlayPresent.length > 0 && overlayPresent.length !== overlayFields.length) throw new TypeError("start workspace-overlay target binding requires target_mode, target_identity, base_tree, and candidate_tree together");
+	let overlay                                                                                      = {};
+	if (overlayPresent.length === overlayFields.length) {
+		overlay = {
+			targetMode: enumeration(body.target_mode, ["base-workspace-overlay"]         , "start.target_mode"),
+			targetIdentity: sha256(body.target_identity, "start.target_identity"),
+			baseTree: gitTree(body.base_tree, "start.base_tree"),
+			candidateTree: gitTree(body.candidate_tree, "start.candidate_tree"),
+		};
+	}
 	const riskReasons = array(body.risk_reasons, "start.risk_reasons", (entry, label)                     => {
 		const reason = exactRecord(entry, label, ["code"], ["signal", "path", "old_mode", "new_mode"]);
 		return {
@@ -458,6 +533,7 @@ export function decodeReviewStartV1(value         )                {
 		changedLines: integer(body.changed_lines, "start.changed_lines"),
 		correctionBudget: integer(body.correction_budget, "start.correction_budget", 0, 200),
 		riskReasons,
+		...overlay,
 		raw: body,
 	};
 }
@@ -482,7 +558,7 @@ export function decodeReviewProjectionV1(value         )                        
 }
 
 export function decodeReviewStatusV1(value         )                 {
-	const body = exactRecord(value, "status", ["schema", "contract", "operation", "applicability", "receipt", "action", "replayability", "target_identity", "projection", "candidates"], ["authority", "frozen"]);
+	const body = exactRecord(value, "status", ["schema", "contract", "operation", "applicability", "receipt", "action", "replayability", "target_identity", "projection", "candidates"], ["authority", "frozen", "reconciliation"]);
 	requireIdentity(body, "gentle-ai.review-integration.status/v1", REVIEW_INTEGRATION_OPERATION.STATUS);
 	const applicability = enumeration(body.applicability, ["current_target", "unrelated", "ambiguous", "corrupted"]         , "status.applicability");
 	const receiptBody = exactRecord(body.receipt, "status.receipt", ["status"], ["identity"]);
@@ -516,14 +592,29 @@ export function decodeReviewStatusV1(value         )                 {
 	if ((authority?.version === REVIEW_AUTHORITY_VERSION.LEGACY_V1 || applicability !== REVIEW_AUTHORITY_APPLICABILITY.CURRENT_TARGET) && frozen !== undefined) throw new TypeError("legacy/non-current status cannot expose frozen metadata");
 	if (authority?.version === REVIEW_AUTHORITY_VERSION.LEGACY_V1 && receiptStatus !== "expected_missing" && receiptStatus !== "present") throw new TypeError("legacy status receipt is incompatible");
 
+	const action = enumeration(body.action, STATUS_ACTIONS, "status.action");
+	const replayability = enumeration(body.replayability, Object.values(REVIEW_REPLAYABILITY), "status.replayability");
+	let reconciliation                                          ;
+	if (action === "reconcile_finalize") {
+		if (body.reconciliation === undefined) throw new TypeError("reconcile_finalize status requires reconciliation");
+		const source = exactRecord(body.reconciliation, "status.reconciliation", ["required"]);
+		if (source.required !== true) throw new TypeError("status.reconciliation.required must be true");
+		if (applicability !== REVIEW_AUTHORITY_APPLICABILITY.CURRENT_TARGET) throw new TypeError("reconcile_finalize status requires current_target applicability");
+		if (replayability !== REVIEW_REPLAYABILITY.STATUS_REQUIRED) throw new TypeError("reconcile_finalize status requires status_required replayability");
+		reconciliation = { required: true };
+	} else if (body.reconciliation !== undefined) {
+		throw new TypeError("status.reconciliation is only valid for the reconcile_finalize action");
+	}
+
 	return {
 		contract: REVIEW_INTEGRATION_CONTRACT,
 		applicability,
 		...(authority === undefined ? {} : { authority }),
 		receipt,
-		action: enumeration(body.action, STATUS_ACTIONS, "status.action"),
-		replayability: enumeration(body.replayability, Object.values(REVIEW_REPLAYABILITY), "status.replayability"),
+		action,
+		replayability,
 		...(frozen === undefined ? {} : { frozen }),
+		...(reconciliation === undefined ? {} : { reconciliation }),
 		targetIdentity: sha256(body.target_identity, "status.target_identity"),
 		projection: decodeReviewProjectionV1(body.projection),
 		candidates: stringArray(body.candidates, "status.candidates", { unique: true, pattern: /^[a-z0-9]+(?:-[a-z0-9]+)*$/ }),
@@ -531,8 +622,38 @@ export function decodeReviewStatusV1(value         )                 {
 	};
 }
 
+function decodeFailureTargetEvidence(value         , label        )                                {
+	const evidence = exactRecord(value, label, ["candidate_tree", "paths_digest"]);
+	return {
+		candidateTree: gitTree(evidence.candidate_tree, `${label}.candidate_tree`),
+		pathsDigest: sha256(evidence.paths_digest, `${label}.paths_digest`),
+	};
+}
+
+function decodeFailureContext(value         , label        )                         {
+	const context = exactRecord(value, label, ["scope_change"]);
+	const scopeLabel = `${label}.scope_change`;
+	const scope = exactRecord(context.scope_change, scopeLabel, ["expected", "actual", "differing_path_count", "differing_paths_digest", "predecessor_lineage_id", "predecessor_revision", "recovery_operation", "recovery_required_inputs"]);
+	if (scope.recovery_operation !== "review.recover") throw new TypeError(`${scopeLabel}.recovery_operation is unsupported`);
+	const recoveryInputs = stringArray(scope.recovery_required_inputs, `${scopeLabel}.recovery_required_inputs`, { minimum: 6, maximum: 6 });
+	const expectedRecoveryInputs = ["predecessor_lineage_id", "expected_predecessor_revision", "successor_lineage_id", "disposition", "reason", "actor"];
+	if (recoveryInputs.some((input, index) => input !== expectedRecoveryInputs[index])) throw new TypeError(`${scopeLabel}.recovery_required_inputs is unsupported`);
+	return {
+		scopeChange: {
+			expected: decodeFailureTargetEvidence(scope.expected, `${scopeLabel}.expected`),
+			actual: decodeFailureTargetEvidence(scope.actual, `${scopeLabel}.actual`),
+			differingPathCount: integer(scope.differing_path_count, `${scopeLabel}.differing_path_count`, 0, 1_000_000),
+			differingPathsDigest: sha256(scope.differing_paths_digest, `${scopeLabel}.differing_paths_digest`),
+			predecessorLineageId: lineage(scope.predecessor_lineage_id, `${scopeLabel}.predecessor_lineage_id`),
+			predecessorRevision: sha256(scope.predecessor_revision, `${scopeLabel}.predecessor_revision`),
+			recoveryOperation: "review.recover",
+			recoveryRequiredInputs: recoveryInputs,
+		},
+	};
+}
+
 export function decodeReviewFailureV1(value         )                  {
-	const body = exactRecord(value, "failure", ["schema", "contract", "operation", "phase", "code", "message", "mutation_outcome", "authority_applicability", "retry_safe", "replayability", "required_inputs", "next_action"], ["lineage_id", "request_digest"]);
+	const body = exactRecord(value, "failure", ["schema", "contract", "operation", "phase", "code", "message", "mutation_outcome", "authority_applicability", "retry_safe", "replayability", "required_inputs", "next_action"], ["lineage_id", "request_digest", "cause_category", "context"]);
 	requireIdentity(body, "gentle-ai.review-integration.failure/v1");
 	return {
 		schema: "gentle-ai.review-integration.failure/v1",
@@ -547,8 +668,10 @@ export function decodeReviewFailureV1(value         )                  {
 		replayability: enumeration(body.replayability, Object.values(REVIEW_REPLAYABILITY), "failure.replayability"),
 		...(body.lineage_id === undefined ? {} : { lineageId: lineage(body.lineage_id, "failure.lineage_id") }),
 		...(body.request_digest === undefined ? {} : { requestDigest: sha256(body.request_digest, "failure.request_digest") }),
-		requiredInputs: enumArray(body.required_inputs, ["lineage_id"]         , "failure.required_inputs", { unique: true }),
-		nextAction: enumeration(body.next_action, ["correct_request", "retry", "review.status", "review.finalize", "explicit-maintainer-action", "stop"]         , "failure.next_action"),
+		requiredInputs: enumArray(body.required_inputs, FAILURE_REQUIRED_INPUTS, "failure.required_inputs", { unique: true }),
+		nextAction: enumeration(body.next_action, FAILURE_NEXT_ACTIONS, "failure.next_action"),
+		...(body.cause_category === undefined ? {} : { causeCategory: enumeration(body.cause_category, FAILURE_CAUSE_CATEGORIES, "failure.cause_category") }),
+		...(body.context === undefined ? {} : { context: decodeFailureContext(body.context, "failure.context") }),
 		raw: body,
 	};
 }

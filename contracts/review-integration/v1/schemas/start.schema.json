@@ -4,6 +4,12 @@
   "title": "Gentle AI negotiated review START response",
   "type": "object",
   "additionalProperties": false,
+  "dependentRequired": {
+    "target_mode": ["target_identity", "base_tree", "candidate_tree"],
+    "target_identity": ["target_mode", "base_tree", "candidate_tree"],
+    "base_tree": ["target_mode", "target_identity", "candidate_tree"],
+    "candidate_tree": ["target_mode", "target_identity", "base_tree"]
+  },
   "required": [
     "schema",
     "contract",
@@ -52,6 +58,10 @@
       "items": {"enum": ["review-risk", "review-resilience", "review-readability", "review-reliability"]}
     },
     "projection": {"enum": ["workspace", "staged"]},
+    "target_mode": {"const": "base-workspace-overlay"},
+    "target_identity": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "base_tree": {"type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"},
+    "candidate_tree": {"type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"},
     "changed_files": {"type": "integer", "minimum": 0},
     "changed_lines": {"type": "integer", "minimum": 0},
     "correction_budget": {"type": "integer", "minimum": 0, "maximum": 200},

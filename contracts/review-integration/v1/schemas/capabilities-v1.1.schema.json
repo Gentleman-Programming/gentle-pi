@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://gentle-ai.dev/contracts/review-integration/v1/schemas/capabilities.schema.json",
-  "title": "Gentle AI review integration capabilities",
+  "$id": "https://gentle-ai.dev/contracts/review-integration/v1/schemas/capabilities-v1.1.schema.json",
+  "title": "Gentle AI review integration capabilities protocol 1.1",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -20,7 +20,7 @@
   ],
   "properties": {
     "schema": {
-      "const": "gentle-ai.review-integration.capabilities/v1"
+      "const": "gentle-ai.review-integration.capabilities/v1.1"
     },
     "contract": {
       "const": "gentle-ai.review-integration/v1"
@@ -31,7 +31,7 @@
       "required": ["major", "minor"],
       "properties": {
         "major": {"const": 1},
-        "minor": {"const": 0}
+        "minor": {"const": 1}
       }
     },
     "package": {
@@ -107,7 +107,7 @@
         "enum": [
           "gentle-ai.review-authority-status/v1",
           "gentle-ai.review-gate-request/v1",
-          "gentle-ai.review-integration.capabilities/v1",
+          "gentle-ai.review-integration.capabilities/v1.1",
           "gentle-ai.review-integration.failure/v1",
           "gentle-ai.review-integration.operation/v1",
           "gentle-ai.review-integration.projection/v1",
@@ -135,8 +135,8 @@
         },
         "optional": {
           "type": "array",
-          "minItems": 5,
-          "maxItems": 5,
+          "minItems": 6,
+          "maxItems": 6,
           "items": {"$ref": "#/$defs/feature"}
         }
       }
@@ -192,6 +192,7 @@
       "properties": {
         "name": {
           "enum": [
+            "base_ref_workspace_overlay",
             "bounded_process_waits",
             "compact_v2_authority",
             "exact_receipt_replay",

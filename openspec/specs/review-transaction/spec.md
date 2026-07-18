@@ -40,7 +40,7 @@ Each mutation MUST atomically append `{operation, idempotency_key, request_hash,
 
 ### Requirement: Negotiated native ordinary authority
 
-The consumer MUST resolve the integrity-verified package-local Gentle AI v2.1.6 executable, independently hash it, negotiate `gentle-ai.review-integration/v1` outside repository context, and cache capabilities only by that digest. START, target status, FINALIZE, validation, and SDD binding MUST pass the same contract identifier. Native compact-v2 MUST be the sole mutable ordinary authority; legacy-v1 and Pi authority remain compatibility-read-only. Unknown mandatory behavior, incompatible protocol/schema identity, or executable drift MUST fail closed, while advertised optional additions MAY be ignored without disabling mandatory operations.
+The consumer MUST resolve the integrity-verified package-local Gentle AI v2.1.7 executable, independently hash it, negotiate `gentle-ai.review-integration/v1` outside repository context, and cache capabilities only by that digest. START, target status, FINALIZE, validation, and SDD binding MUST pass the same contract identifier. Native compact-v2 MUST be the sole mutable ordinary authority; legacy-v1 and Pi authority remain compatibility-read-only. Unknown mandatory behavior, incompatible protocol/schema identity, or executable drift MUST fail closed, while advertised optional additions MAY be ignored without disabling mandatory operations.
 
 #### Scenario: Target-scoped restart
 

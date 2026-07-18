@@ -7,7 +7,17 @@ import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
-import { NATIVE_REVIEW_ERROR_CODE, NATIVE_REVIEW_OPERATION, NativeReviewCliError, NativeReviewCliV214, type NativeReviewCli, type NativeReviewStatusResult } from "../lib/native-review-cli.ts";
+import { NATIVE_REVIEW_ERROR_CODE, NATIVE_REVIEW_OPERATION, NativeReviewCliError, NativeReviewCliV214 as NativeReviewCliV214Production, type NativeReviewCli, type NativeReviewStatusResult } from "../lib/native-review-cli.ts";
+
+// Queued-adapter clients never execute a real process; default to a fixed absolute
+// package-local path so these tests do not depend on an installed binary
+// (unavailable while the pinned v2.1.7 release digests are pending).
+class NativeReviewCliV214 extends NativeReviewCliV214Production {
+	constructor(...parameters: ConstructorParameters<typeof NativeReviewCliV214Production>) {
+		const [adapter, executable, ...rest] = parameters;
+		super(adapter, executable ?? "/package/.gentle-ai/gentle-ai", ...rest);
+	}
+}
 import { canonicalJsonV1, domainHashV1 } from "../lib/review-canonical.ts";
 import { SupersessionStoreV1 } from "../lib/review-authority-supersession.ts";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
@@ -222,7 +232,7 @@ function targetStatusFixture(options: {
 } = {}): ReviewStatusV1 {
 	const applicability = options.applicability ?? "current_target";
 	const action = options.action ?? (applicability === "current_target" ? "finalize" : applicability === "unrelated" ? "start" : applicability === "ambiguous" ? "select_lineage" : "repair_authority");
-	const replayability = options.replayability ?? (applicability === "ambiguous" ? "status_required" : applicability === "corrupted" ? "manual_action_required" : "not_replayable");
+	const replayability = options.replayability ?? (action === "reconcile_finalize" ? "status_required" : applicability === "ambiguous" ? "status_required" : applicability === "corrupted" ? "manual_action_required" : "not_replayable");
 	const lineageId = options.lineageId ?? "native-lineage";
 	const sha = `sha256:${"a".repeat(64)}`;
 	const tree = "b".repeat(40);
@@ -269,6 +279,7 @@ function targetStatusFixture(options: {
 		raw.authority = { version: "compact-v2", lineage_id: lineageId, state: "reviewing", generation: 1, revision: sha };
 		raw.frozen = { tier: "medium", original_changed_lines: 2, correction_budget: 1 };
 	}
+	if (action === "reconcile_finalize") raw.reconciliation = { required: true };
 	return {
 		contract: "gentle-ai.review-integration/v1",
 		applicability,
@@ -277,6 +288,7 @@ function targetStatusFixture(options: {
 		action,
 		replayability,
 		...(applicability === "current_target" ? { frozen: { tier: "medium" as const, originalChangedLines: 2, correctionBudget: 1 } } : {}),
+		...(action === "reconcile_finalize" ? { reconciliation: { required: true as const } } : {}),
 		targetIdentity: sha,
 		projection,
 		candidates: applicability === "ambiguous" ? [lineageId, "other-lineage"] : [],
@@ -601,6 +613,201 @@ test("ambiguous native FINALIZE returns the target-status action without a secon
 	});
 });
 
+test("status reporting finalize reconciliation routes to rerunning the same finalize and never starts a new review", async (t) => {
+	const cwd = repository(t);
+	let starts = 0;
+	const reconcile = targetStatusFixture({ action: "reconcile_finalize", lineageId: "native-lineage" });
+	const { controller } = runtime(fakeNative({
+		start: async () => {
+			starts += 1;
+			throw new Error("reconcile_finalize must never start a new review");
+		},
+		targetStatus: async () => reconcile,
+	}));
+	const result = await controller.execute("reconcile-status", { operation: "status", lineageId: "native-lineage" }, undefined, undefined, context(cwd));
+	assert.deepEqual(result.details, {
+		operation: "status",
+		status: "in-progress",
+		result: reconcile.raw,
+		provider_action: "reconcile_finalize",
+		replayability: "status_required",
+		reconciliation_required: true,
+		lineage_id: "native-lineage",
+		next_action: "rerun-native-finalize-same-lineage",
+		required_status_action: "Finalize reconciliation required: rerun review.finalize for lineage native-lineage with the original content-bound payload; native discovery resumes committed authority. Never start a new review, create a new budget, launch a lens, or fall back to inventory discovery.",
+	});
+	assert.equal(starts, 0);
+});
+
+test("lost FINALIZE reconciled to reconcile_finalize reruns the same facade operation without a new review", async (t) => {
+	const cwd = repository(t);
+	const calls: string[] = [];
+	let starts = 0;
+	let finalizes = 0;
+	const reconcile = targetStatusFixture({ action: "reconcile_finalize", lineageId: "native-lineage" });
+	const { controller } = runtime(fakeNative({
+		start: async () => {
+			starts += 1;
+			throw new Error("reconcile_finalize must never start a new review");
+		},
+		finalize: async () => {
+			calls.push("finalize");
+			finalizes += 1;
+			if (finalizes === 1) throw Object.assign(new Error("interrupted before receipt publication"), { mutationOutcome: "unknown", nextAction: "review.status" });
+			return { lineageId: "native-lineage", state: "approved", action: "approved", storeRevision: "r2" };
+		},
+		targetStatus: async () => {
+			calls.push("status");
+			return reconcile;
+		},
+	}));
+	const interrupted = await controller.execute("reconcile-finalize", { operation: "finalize", lineageId: "native-lineage", input: "{}" }, undefined, undefined, context(cwd));
+	assert.deepEqual(interrupted.details, {
+		operation: "finalize",
+		status: "blocked",
+		outcome: "native-mutation-status-reconciled",
+		mutation_outcome: "unknown",
+		replayability: "status_required",
+		next_action: "rerun-native-finalize-same-lineage",
+		reconciliation: reconcile.raw,
+		authority_applicability: "current_target",
+		provider_action: "reconcile_finalize",
+		reconciliation_required: true,
+		lineage_id: "native-lineage",
+		required_status_action: "Finalize reconciliation required: rerun review.finalize for lineage native-lineage with the original content-bound payload; native discovery resumes committed authority. Never start a new review, create a new budget, launch a lens, or fall back to inventory discovery.",
+	});
+	assert.deepEqual(calls, ["finalize", "status"]);
+	const replay = await controller.execute("reconcile-finalize-replay", { operation: "finalize", lineageId: "native-lineage", input: "{}" }, undefined, undefined, context(cwd));
+	assert.deepEqual(replay.details, { operation: "finalize", result: { lineage_id: "native-lineage", state: "approved", action: "approved", store_revision: "r2" } });
+	assert.equal(finalizes, 2);
+	assert.equal(starts, 0);
+});
+
+test("START consulting a target status already in finalize reconciliation returns the rerun routing without any START", async (t) => {
+	const cwd = repository(t);
+	let starts = 0;
+	const reconcile = targetStatusFixture({ action: "reconcile_finalize", lineageId: "reconcile-start-lineage" });
+	const { controller } = runtime(fakeNative({
+		start: async () => {
+			starts += 1;
+			throw new Error("reconcile_finalize must never start a new review");
+		},
+		targetStatus: async () => reconcile,
+	}));
+	const result = await controller.execute("reconcile-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	const details = result.details as Record<string, unknown>;
+	assert.equal(details.status, "in-progress");
+	assert.equal(details.provider_action, "reconcile_finalize");
+	assert.equal(details.next_action, "rerun-native-finalize-same-lineage");
+	assert.equal(details.lineage_id, "reconcile-start-lineage");
+	assert.equal(details.reconciliation_required, true);
+	assert.equal(starts, 0);
+});
+
+test("START with an explicit lineage fails closed when reconciliation reports a foreign lineage", async (t) => {
+	const cwd = repository(t);
+	let starts = 0;
+	const foreign = targetStatusFixture({ action: "reconcile_finalize", lineageId: "start-mismatch-foreign" });
+	const { controller } = runtime(fakeNative({
+		start: async () => {
+			starts += 1;
+			throw new Error("a mismatched reconciliation must never start a new review");
+		},
+		targetStatus: async () => foreign,
+	}));
+	const result = await controller.execute("start-mismatch", { operation: "start", lineageId: "start-mismatch-requested", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	const details = result.details as Record<string, unknown>;
+	assert.equal(details.status, "blocked");
+	assert.equal(details.provider_action, "reconcile_finalize");
+	assert.equal(details.next_action, "stop-and-report-reconcile-lineage-mismatch");
+	assert.equal(details.requested_lineage_id, "start-mismatch-requested");
+	assert.equal(details.authority_lineage_id, "start-mismatch-foreign");
+	assert.equal(details.lineage_id, undefined);
+	assert.doesNotMatch(JSON.stringify(details), /rerun-native-finalize-same-lineage/);
+	assert.equal(starts, 0);
+});
+
+test("finalize reconciliation for a foreign lineage fails closed without a rerun directive", async (t) => {
+	const cwd = repository(t);
+	let starts = 0;
+	const foreign = targetStatusFixture({ action: "reconcile_finalize", lineageId: "foreign-lineage" });
+	const { controller } = runtime(fakeNative({
+		start: async () => {
+			starts += 1;
+			throw new Error("a mismatched reconciliation must never start a new review");
+		},
+		finalize: async () => {
+			throw Object.assign(new Error("lost finalize response"), { mutationOutcome: "unknown", nextAction: "review.status" });
+		},
+		targetStatus: async () => foreign,
+	}));
+	const reconciled = await controller.execute("mismatch-finalize", { operation: "finalize", lineageId: "native-lineage", input: "{}" }, undefined, undefined, context(cwd));
+	const reconciledDetails = reconciled.details as Record<string, unknown>;
+	assert.equal(reconciledDetails.outcome, "native-mutation-status-reconciled");
+	assert.equal(reconciledDetails.provider_action, "reconcile_finalize");
+	assert.equal(reconciledDetails.next_action, "stop-and-report-reconcile-lineage-mismatch");
+	assert.equal(reconciledDetails.requested_lineage_id, "native-lineage");
+	assert.equal(reconciledDetails.authority_lineage_id, "foreign-lineage");
+	assert.equal(reconciledDetails.lineage_id, undefined);
+	assert.doesNotMatch(JSON.stringify(reconciledDetails), /rerun-native-finalize-same-lineage/);
+	const status = await controller.execute("mismatch-status", { operation: "status", lineageId: "native-lineage" }, undefined, undefined, context(cwd));
+	const statusDetails = status.details as Record<string, unknown>;
+	assert.equal(statusDetails.status, "blocked");
+	assert.equal(statusDetails.next_action, "stop-and-report-reconcile-lineage-mismatch");
+	assert.doesNotMatch(JSON.stringify(statusDetails), /rerun-native-finalize-same-lineage/);
+	assert.equal(starts, 0);
+});
+
+test("repeated status observations of finalize reconciliation never consume the rerun budget", async (t) => {
+	const cwd = repository(t);
+	const reconcile = targetStatusFixture({ action: "reconcile_finalize", lineageId: "observe-lineage" });
+	const { controller } = runtime(fakeNative({ targetStatus: async () => reconcile }));
+	for (let observation = 1; observation <= 6; observation += 1) {
+		const details = (await controller.execute(`observe-${observation}`, { operation: "status", lineageId: "observe-lineage" }, undefined, undefined, context(cwd))).details as Record<string, unknown>;
+		assert.equal(details.next_action, "rerun-native-finalize-same-lineage", `observation ${observation}`);
+		assert.equal(details.status, "in-progress", `observation ${observation}`);
+	}
+});
+
+test("only finalize-driven reruns are counted and escalate to explicit maintainer action at the cap", async (t) => {
+	const cwd = repository(t);
+	const reconcile = targetStatusFixture({ action: "reconcile_finalize", lineageId: "cap-lineage" });
+	const { controller } = runtime(fakeNative({
+		finalize: async () => {
+			throw Object.assign(new Error("interrupted before receipt publication"), { mutationOutcome: "unknown", nextAction: "review.status" });
+		},
+		targetStatus: async () => reconcile,
+	}));
+	for (let attempt = 1; attempt <= 3; attempt += 1) {
+		const details = (await controller.execute(`cap-${attempt}`, { operation: "finalize", lineageId: "cap-lineage", input: "{}" }, undefined, undefined, context(cwd))).details as Record<string, unknown>;
+		assert.equal(details.next_action, "rerun-native-finalize-same-lineage", `attempt ${attempt}`);
+	}
+	const capped = (await controller.execute("cap-4", { operation: "finalize", lineageId: "cap-lineage", input: "{}" }, undefined, undefined, context(cwd))).details as Record<string, unknown>;
+	assert.equal(capped.status, "blocked");
+	assert.equal(capped.provider_action, "reconcile_finalize");
+	assert.equal(capped.next_action, "stop-and-escalate-finalize-reconciliation");
+	assert.match(String(capped.required_status_action), /explicit maintainer action/);
+	assert.doesNotMatch(JSON.stringify(capped), /rerun-native-finalize-same-lineage/);
+	const observedAfterCap = (await controller.execute("cap-observe", { operation: "status", lineageId: "cap-lineage" }, undefined, undefined, context(cwd))).details as Record<string, unknown>;
+	assert.equal(observedAfterCap.next_action, "stop-and-escalate-finalize-reconciliation");
+	assert.equal(observedAfterCap.status, "blocked");
+});
+
+test("status_required outcomes without a reachable target status surface an actionable required status action", async (t) => {
+	const cwd = repository(t);
+	const { controller } = runtime(fakeNative({
+		finalize: async () => {
+			throw Object.assign(new Error("lost finalize response"), { mutationOutcome: "unknown", nextAction: "review.status" });
+		},
+	}));
+	const result = await controller.execute("status-required-finalize", { operation: "finalize", lineageId: "native-lineage", input: "{}" }, undefined, undefined, context(cwd));
+	const details = result.details as Record<string, unknown>;
+	assert.equal(details.outcome, "native-mutation-status-required");
+	assert.equal(details.replayability, "status_required");
+	assert.equal(details.next_action, "review.status");
+	assert.equal(details.required_status_action, "Run target-scoped review.status for lineage native-lineage and follow only its declared action; never start a new review, create a new budget, launch a lens, or fall back to inventory discovery.");
+});
+
 test("fresh registry reload projects a correction state without accepting scope escape", async (t) => {
 	const cwd = repository(t);
 	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
@@ -667,6 +874,7 @@ test("post-finalize projection failure requires native status and never repeats 
 		mutation_outcome: "committed",
 		replayability: "status_required",
 		next_action: "review.status",
+		required_status_action: "Run target-scoped review.status for lineage reload-correction and follow only its declared action; never start a new review, create a new budget, launch a lens, or fall back to inventory discovery.",
 		reconciliation_context: "post-native-finalize",
 		mutation_performed: true,
 		lineage_id: "reload-correction",
@@ -834,7 +1042,7 @@ test("native error has no compact fallback and ambiguous mutation demands target
 	t.after(() => rmSync(cwd, { recursive: true, force: true }));
 	const { controller } = runtime(fakeNative({ start: async () => { throw Object.assign(new Error("lost output"), { mutationOutcome: "unknown", nextAction: "review.status" }); } }));
 	const result = await controller.execute("start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
-	assert.deepEqual(result.details, { operation: "start", status: "blocked", outcome: "native-mutation-status-required", mutation_outcome: "unknown", replayability: "status_required", next_action: "review.status" });
+	assert.deepEqual(result.details, { operation: "start", status: "blocked", outcome: "native-mutation-status-required", mutation_outcome: "unknown", replayability: "status_required", next_action: "review.status", required_status_action: "Run target-scoped review.status and follow only its declared action; never start a new review, create a new budget, launch a lens, or fall back to inventory discovery." });
 });
 
 test("native START preserves a candidate-view diagnostic before native invocation", async (t) => {
@@ -1416,6 +1624,7 @@ test("native bind treats malformed post-call evidence as status-required without
 		mutation_outcome: "unknown",
 		replayability: "status_required",
 		next_action: "review.status",
+		required_status_action: "Run target-scoped review.status for lineage native-lineage and follow only its declared action; never start a new review, create a new budget, launch a lens, or fall back to inventory discovery.",
 	};
 	const mismatched = await controller.execute("mismatched-bind", { operation: "bind-sdd", input }, undefined, undefined, context(cwd));
 	assert.deepEqual(mismatched.details, expected);
