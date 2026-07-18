@@ -2187,6 +2187,10 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 		inputPath: { type: "string", description: "Source path for staged bundle import." },
 		operationId: { type: "string", description: "Identity-bound import or export operation ID." },
 		lineageIds: { type: "string", description: "Optional JSON array of graph lineage IDs to export." },
+		workspaceRoot: {
+			type: "string",
+			description: "Optional absolute Git worktree root that owns this review (for example the SDD apply worktree). It must be an existing worktree root sharing the session repository's Git common directory; validation fails closed otherwise. Absent, the session cwd is used unchanged.",
+		},
 	},
 } as const;
 
@@ -2203,6 +2207,7 @@ interface ReviewControllerParameters {
 	operationId?: string;
 	lineageIds?: string;
 	acknowledgeUntrustedBundleSource?: string;
+	workspaceRoot?: string;
 }
 
 interface SupersessionControllerInput {
@@ -2514,7 +2519,7 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 		operation: value.operation,
 		...(typeof value.lineageId === "string" ? { lineageId: value.lineageId } : {}),
 	};
-	for (const key of ["changeName", "idempotencyKey", "transition", "command", "input", "outputPath", "inputPath", "operationId", "lineageIds", "acknowledgeUntrustedBundleSource"] as const) {
+	for (const key of ["changeName", "idempotencyKey", "transition", "command", "input", "outputPath", "inputPath", "operationId", "lineageIds", "acknowledgeUntrustedBundleSource", "workspaceRoot"] as const) {
 		const optional = value[key];
 		if (optional !== undefined && typeof optional !== "string") {
 			if (value.operation === REVIEW_CONTROLLER_OPERATION.START && key === "input") {
@@ -4702,9 +4707,55 @@ function nativePublicationFailure(operation: ReviewControllerOperation, error: u
 	};
 }
 
+function reviewWorkspaceGitIdentity(cwd: string): { toplevel: string; commonDir: string } {
+	const toplevel = realpathSync(runReviewGit(cwd, ["rev-parse", "--show-toplevel"]));
+	const commonDir = realpathSync(resolve(cwd, runReviewGit(cwd, ["rev-parse", "--git-common-dir"])));
+	return { toplevel, commonDir };
+}
+
+/**
+ * Resolves the workspace root every controller operation binds to. Absent an
+ * explicit workspaceRoot the session cwd is used unchanged (no new Git calls).
+ * An explicit workspaceRoot fails closed unless it is an existing Git worktree
+ * root sharing the session repository's Git common directory, so the model can
+ * never rebind review authority to an arbitrary or foreign filesystem path.
+ */
+function resolveReviewControllerWorkspaceRoot(requested: string | undefined, sessionCwd: string): string {
+	if (requested === undefined) return sessionCwd;
+	if (requested.trim().length === 0 || !isAbsolute(requested)) {
+		throw new Error(`Review controller workspaceRoot must be an absolute path to an existing Git worktree root; received ${JSON.stringify(requested)}`);
+	}
+	let resolved: string;
+	try {
+		resolved = realpathSync(requested);
+		if (!lstatSync(resolved).isDirectory()) throw new Error("not a directory");
+	} catch {
+		throw new Error(`Review controller workspaceRoot ${requested} is not an existing directory; create or adopt the worktree before binding review operations to it`);
+	}
+	let target: { toplevel: string; commonDir: string };
+	try {
+		target = reviewWorkspaceGitIdentity(resolved);
+	} catch {
+		throw new Error(`Review controller workspaceRoot ${resolved} is not inside a Git worktree; review operations bind only to real worktrees of the session repository`);
+	}
+	if (target.toplevel !== resolved) {
+		throw new Error(`Review controller workspaceRoot ${resolved} is not a worktree root (worktree root is ${target.toplevel}); pass the exact root`);
+	}
+	let session: { toplevel: string; commonDir: string };
+	try {
+		session = reviewWorkspaceGitIdentity(sessionCwd);
+	} catch {
+		throw new Error(`Review controller workspaceRoot ${resolved} cannot be validated: the session cwd ${sessionCwd} does not resolve a Git repository identity; run Pi from a worktree of the same repository`);
+	}
+	if (target.commonDir !== session.commonDir) {
+		throw new Error(`Review controller workspaceRoot ${resolved} belongs to a different repository (Git common dir ${target.commonDir}) than the session cwd ${sessionCwd} (Git common dir ${session.commonDir}); use a worktree of the session repository or start Pi from the target repository`);
+	}
+	return resolved;
+}
+
 async function executeReviewControllerOperation(
 	parametersValue: unknown,
-	defaultCwd: string,
+	sessionCwd: string,
 	pendingAuthorizations: Map<string, PendingReviewAuthorization>,
 	nativeReviewCli: NativeReviewCli | null,
 	signal?: AbortSignal,
@@ -4714,6 +4765,7 @@ async function executeReviewControllerOperation(
 	context?: ExtensionContext,
 ): Promise<Record<string, unknown>> {
 	const parameters = parseReviewControllerParameters(parametersValue);
+	const defaultCwd = resolveReviewControllerWorkspaceRoot(parameters.workspaceRoot, sessionCwd);
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.EXPORT) {
 		const outputPath = requiredControllerString(parameters, "outputPath");
 		const operationId = requiredControllerString(parameters, "operationId");
@@ -5089,7 +5141,24 @@ async function executeReviewControllerOperation(
 					else candidateViews.bindCurrent(binding);
 				} else if (candidateView && candidateViews && ((result.action === "created" && result.state === "reviewing") || result.action === "resumed" || result.action === "reuse-receipt")) candidateViews.retain(candidateView.token, result.lineageId);
 				else if (candidateView && candidateViews) candidateViews.cleanup(candidateView.token);
-				return { operation: parameters.operation, result: mapNativeStartResult(result) };
+				// The envelope always names the workspace root the lineage is bound
+				// to, and — when lenses must run — the exact frozen candidate the
+				// actors must read, so the caller can never silently launch review
+				// actors against a stale previously-active worktree (#166, #169).
+				const actorBinding = candidateView !== undefined && result.lensesRequired
+					? {
+						workspace_root: defaultCwd,
+						candidate_root: candidateView.root,
+						candidate_tree: candidateView.candidateTree,
+						candidate_paths: candidateView.paths,
+					}
+					: undefined;
+				return {
+					operation: parameters.operation,
+					result: mapNativeStartResult(result),
+					workspace_root: defaultCwd,
+					...(actorBinding === undefined ? {} : { actor_binding: actorBinding }),
+				};
 			} catch (error) {
 				if (error instanceof CandidateViewError && (error.reason === "base-ref-ambiguous" || error.reason === "base-ref-unresolvable" || error.reason === "base-ref-moved")) return nativeStartRejection(error.reason);
 				const value = error as { mutationOutcome?: unknown; nextAction?: unknown };
@@ -5271,6 +5340,9 @@ async function executeReviewControllerOperation(
 						authoritativeState = raw.state;
 					}
 				}
+				// Fail closed before any native mutation when the frozen projection
+				// belongs to a different worktree than the requested workspace (#169).
+				if (candidateViews && parameters.lineageId && candidateViews.hasProjection(parameters.lineageId)) candidateViews.resolveProjection(parameters.lineageId, defaultCwd);
 				candidateView ??= candidateViews && parameters.lineageId ? (correctionCompletion || validationAttempt) ? candidateViews.createCorrected(parameters.lineageId, defaultCwd, replayKey) : candidateViews.resolveForFinalize(parameters.lineageId) : undefined;
 				if (validationAttempt && candidateView && parameters.lineageId) {
 					if (nativeReviewCli.targetStatus !== undefined) {
