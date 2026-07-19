@@ -643,6 +643,40 @@ test("native review status uses the anticipated v2.1.5 contract, preserves Windo
 	}
 });
 
+test("native review status decodes 2.1.8 released lock residue and keeps unknown lock statuses fail-closed", async () => {
+	// gentle-ai 2.1.8 leaves review-transactions/v2/LOCK behind after ORDINARY
+	// successful operations and reports it as {"status":"released"} without
+	// owner metadata (issue #184; reproduced empirically against the system
+	// binary). The decoder must accept it or reviewStatus dead-ends with
+	// schema-incompatible on every repository that ever completed a review.
+	//
+	// Lock status stays a CLOSED enum extended by exactly `released` — unlike
+	// the cause_category widening in review-integration-v1 (diagnostic
+	// metadata nothing routes on), lock status routes blocking behavior in the
+	// controller, so an unknown future status must keep failing closed rather
+	// than being silently classified as blocking or non-blocking.
+	const releasedLock = { version: "compact-v2", path: "C:\\repo\\.git\\gentle-ai\\review-transactions\\v2\\LOCK", status: "released" };
+	const released = queuedAdapter([STATUS_VERSION, { stdout: JSON.stringify({ ...JSON.parse(REVIEW_STATUS.stdout), status: "approved", locks: [releasedLock] }) }]);
+	const decoded = await new NativeReviewCliV213(released.adapter).reviewStatus({ cwd: "C:\\repo with spaces" });
+	assert.equal(decoded.status, "approved");
+	assert.deepEqual(decoded.locks, [{ version: "compact-v2", path: "C:\\repo\\.git\\gentle-ai\\review-transactions\\v2\\LOCK", status: "released" }]);
+
+	// Residual dead-owner metadata may still accompany a released entry.
+	const releasedWithOwner = queuedAdapter([STATUS_VERSION, { stdout: JSON.stringify({ ...JSON.parse(REVIEW_STATUS.stdout), locks: [{ ...releasedLock, owner: { schema: "gentle-ai.review-store-lock/v1", owner_id: "dead-owner", pid: 1, host: "host", acquired_at: "2026-07-14T00:00:00Z" } }] }) }]);
+	assert.equal((await new NativeReviewCliV213(releasedWithOwner.adapter).reviewStatus({ cwd: "C:\\repo with spaces" })).locks[0]?.owner?.ownerId, "dead-owner");
+
+	for (const status of ["Released", "stale", "unknown-future-status", ""]) {
+		const malformed = queuedAdapter([STATUS_VERSION, { stdout: JSON.stringify({ ...JSON.parse(REVIEW_STATUS.stdout), locks: [{ ...releasedLock, status }] }) }]);
+		await assert.rejects(
+			() => new NativeReviewCliV213(malformed.adapter).reviewStatus({ cwd: "C:\\repo with spaces" }),
+			(error: unknown) => error instanceof NativeReviewCliError
+				&& error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE
+				&& error.operation === "review/status"
+				&& error.mutationOutcome === "none",
+		);
+	}
+});
+
 test("native review status accepts a canonical POSIX symlink repository identity", async (t) => {
 	if (process.platform === "win32") return t.skip("directory symlink creation requires elevated Windows privileges");
 	const repository = await mkdtemp(join(tmpdir(), "gentle-pi-native-status-"));

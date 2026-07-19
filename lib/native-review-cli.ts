@@ -143,6 +143,12 @@ export type NativeReviewAuthorityEntryStatus = NativeReviewAuthorityStatus;
 export const NATIVE_REVIEW_LOCK_STATUS = {
 	OWNED: "owned",
 	AMBIGUOUS: "ambiguous",
+	// gentle-ai 2.1.8 leaves review-transactions/v2/LOCK behind after ordinary
+	// successful operations and inventories it as a released (dead-owner) entry
+	// (#184). This stays a closed enum: lock status routes controller blocking
+	// behavior, so unknown future statuses must keep failing closed instead of
+	// being tolerated like diagnostic-only metadata.
+	RELEASED: "released",
 } as const;
 export type NativeReviewLockStatus = (typeof NATIVE_REVIEW_LOCK_STATUS)[keyof typeof NATIVE_REVIEW_LOCK_STATUS];
 
