@@ -230,9 +230,18 @@ export function deriveNativeValidationRequest(input: NativeValidationRequestInpu
 	const initialCandidateTree = string(initial.candidate_tree, "review/finalize.validation-request.initial_snapshot.candidate_tree");
 	const fix_finding_ids = strings(state.fix_finding_ids, "review/finalize.validation-request.fix_finding_ids");
 	if (!Array.isArray(state.findings)) fail("review/finalize.validation-request.findings", "type", "must be an array");
+	const outcomes = state.outcomes === undefined ? undefined : record(state.outcomes, "review/finalize.validation-request.outcomes");
 	const blocking_finding_ids = state.findings.flatMap((finding, index) => {
 		const row = record(finding, `review/finalize.validation-request.findings[${index}]`);
-		return row.severity === COMPACT_SEVERITY.BLOCKER || row.severity === COMPACT_SEVERITY.CRITICAL ? [string(row.id, `review/finalize.validation-request.findings[${index}].id`)] : [];
+		if (row.severity !== COMPACT_SEVERITY.BLOCKER && row.severity !== COMPACT_SEVERITY.CRITICAL) return [];
+		const id = string(row.id, `review/finalize.validation-request.findings[${index}].id`);
+		// Mirror native FINALIZE semantics (#171): only corroborated severe findings
+		// block correction validation. Severe findings classified pre-existing or
+		// base-only carry the non-blocking `info` outcome, are routed to follow-ups,
+		// and must stay inert in the targeted-validation request.
+		if (outcomes === undefined) return [id];
+		const outcome = outcomes[id] === undefined ? undefined : enumValue(outcomes[id], COMPACT_FINDING_OUTCOME, `review/finalize.validation-request.outcomes.${id}`);
+		return outcome === COMPACT_FINDING_OUTCOME.CORROBORATED ? [id] : [];
 	});
 	if (canonicalJsonV1(fix_finding_ids.toSorted()) !== canonicalJsonV1(blocking_finding_ids.toSorted())) fail("review/finalize.validation-request", "finding-ids", "fix IDs must exactly match frozen blocking findings");
 	const correction_identity = domainHashV1("compact-correction-identity", { initial_candidate_tree: initialCandidateTree, correction_candidate_tree: input.candidateTree });

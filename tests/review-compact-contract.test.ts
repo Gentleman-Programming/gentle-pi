@@ -2,11 +2,64 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	CompactReviewContractError,
+	deriveNativeValidationRequest,
 	parseNativeCompactFinalizeInput,
 	parseCompactStartInput,
 } from "../lib/review-compact-contract.ts";
 
 const POLICY_HASH = "a".repeat(64);
+
+function correctionRequiredState(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		lineage_id: "correction-lineage",
+		state: "correction_required",
+		initial_snapshot: { candidate_tree: "c".repeat(40) },
+		fix_finding_ids: ["R4-001", "R4-002"],
+		findings: [
+			{ id: "R4-001", severity: "CRITICAL" },
+			{ id: "R4-002", severity: "BLOCKER" },
+			{ id: "RISK-XSS-001", severity: "CRITICAL" },
+		],
+		outcomes: { "R4-001": "corroborated", "R4-002": "corroborated", "RISK-XSS-001": "info" },
+		...overrides,
+	};
+}
+
+test("validation request derivation keeps severe pre-existing follow-ups inert (#171)", () => {
+	const request = deriveNativeValidationRequest({
+		lineageId: "correction-lineage",
+		candidateTree: "d".repeat(40),
+		state: correctionRequiredState(),
+	});
+	assert.deepEqual(request.blocking_finding_ids, ["R4-001", "R4-002"]);
+	assert.deepEqual(request.fix_finding_ids, ["R4-001", "R4-002"]);
+});
+
+test("validation request derivation still blocks corroborated severe findings absent from the fix set", () => {
+	assert.throws(
+		() => deriveNativeValidationRequest({
+			lineageId: "correction-lineage",
+			candidateTree: "d".repeat(40),
+			state: correctionRequiredState({
+				fix_finding_ids: ["R4-001"],
+				outcomes: { "R4-001": "corroborated", "R4-002": "corroborated", "RISK-XSS-001": "info" },
+			}),
+		}),
+		(error: unknown) => error instanceof CompactReviewContractError && error.code === "finding-ids",
+	);
+});
+
+test("validation request derivation without native outcomes keeps the severity-derived blocking set", () => {
+	const request = deriveNativeValidationRequest({
+		lineageId: "correction-lineage",
+		candidateTree: "d".repeat(40),
+		state: correctionRequiredState({
+			fix_finding_ids: ["R4-001", "R4-002", "RISK-XSS-001"],
+			outcomes: undefined,
+		}),
+	});
+	assert.deepEqual(request.blocking_finding_ids, ["R4-001", "R4-002", "RISK-XSS-001"]);
+});
 
 test("compact start parser returns canonical input and rejects widened nested projection", () => {
 	assert.deepEqual(parseCompactStartInput({

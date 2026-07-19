@@ -544,6 +544,45 @@ test("fresh negotiated registries reconstruct the frozen candidate before FINALI
 	assert.equal((result.details as { result: { state: string } }).result.state, "approved");
 });
 
+test("forecast-only FINALIZE reconstructs the frozen candidate after a fresh process (#176)", async (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	const frozen = new CandidateViewRegistry().create({ contributorRoot: cwd });
+	const status = targetStatusFixture({ lineageId: "forecast-lineage" });
+	status.projection.baseTree = frozen.baseTree;
+	status.projection.initialReviewTree = frozen.candidateTree;
+	status.projection.currentCandidateTree = frozen.candidateTree;
+	status.projection.paths = frozen.paths;
+	frozen.cleanup();
+	let statusCalls = 0;
+	let finalizedContent = "";
+	const finalizeRequests: Parameters<NativeReviewCli["finalize"]>[0][] = [];
+	const candidateViews = new CandidateViewRegistry();
+	const { controller } = runtime(fakeNative({
+		targetStatus: async () => {
+			statusCalls += 1;
+			return status;
+		},
+		finalize: async (request) => {
+			finalizeRequests.push(request);
+			finalizedContent = readFileSync(join(request.cwd, "app.ts"), "utf8");
+			return { lineageId: "forecast-lineage", state: "fixing", action: "correction-forecast-recorded", storeRevision: "r1" };
+		},
+	}), undefined, undefined, undefined, candidateViews);
+	const result = await controller.execute("forecast-only-finalize", {
+		operation: "finalize",
+		lineageId: "forecast-lineage",
+		input: JSON.stringify({ correction_line_forecast: 3 }),
+	}, undefined, undefined, context(cwd));
+	assert.equal(statusCalls, 1);
+	assert.equal(finalizeRequests.length, 1);
+	assert.equal(finalizeRequests[0]!.correctionLines, 3);
+	assert.notEqual(finalizeRequests[0]!.cwd, cwd);
+	assert.equal(finalizedContent, "export const value = 2;\n");
+	assert.equal((result.details as { result: { state: string } }).result.state, "fixing");
+	candidateViews.cleanupTerminal("forecast-lineage", "escalated");
+});
+
 test("ambiguous native START runs target status first and follows only its declared action", async (t) => {
 	const cwd = repository(t);
 	const candidateViews = new CandidateViewRegistry();
