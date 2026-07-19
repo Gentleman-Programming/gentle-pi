@@ -140,6 +140,7 @@ import {
 	NativeReviewCliError,
 	NATIVE_REVIEW_AUTHORITY_STATUS,
 	NATIVE_REVIEW_ERROR_CODE,
+	NATIVE_REVIEW_LOCK_STATUS,
 	type NativeReviewCli,
 	type NativeFinalizeResult,
 	type NativeStartResult,
@@ -4211,6 +4212,16 @@ async function nativeResetRemediationPreflight(
 	}
 }
 
+// gentle-ai 2.1.8 leaves review-transactions/v2/LOCK behind after ordinary
+// successful operations and inventories it as a `released` dead-owner entry
+// (#184). Only live claims — owned or ambiguous — block; released residue is
+// non-blocking and stays observable through evidence.authority_inventory.
+// The decoder keeps lock status a closed enum, so any unknown status already
+// fails closed before reaching this classification.
+function hasBlockingNativeLock(status: NativeReviewStatusResult): boolean {
+	return status.locks.some((lock) => lock.status !== NATIVE_REVIEW_LOCK_STATUS.RELEASED);
+}
+
 const NATIVE_START_PRECONDITION = {
 	CLEAN_EMPTY: "clean-empty",
 	INCOMPLETE: "incomplete",
@@ -4224,7 +4235,7 @@ function classifyNativeStartPrecondition(status: NativeReviewStatusResult): Nati
 	if (!status.complete || !status.authoritative || status.status === NATIVE_REVIEW_AUTHORITY_STATUS.INVALID || status.status === NATIVE_REVIEW_AUTHORITY_STATUS.SAME_LINEAGE_MIXED_COLLISION) {
 		return NATIVE_START_PRECONDITION.INCOMPLETE;
 	}
-	if (status.locks.length > 0) return NATIVE_START_PRECONDITION.LOCKED;
+	if (hasBlockingNativeLock(status)) return NATIVE_START_PRECONDITION.LOCKED;
 	// Readable historical inventory is not a mutation precondition. Native START
 	// owns current-lineage matching; Pi only blocks corrupt or ambiguous authority.
 	return NATIVE_START_PRECONDITION.CLEAN_EMPTY;
@@ -4260,7 +4271,7 @@ function mapNativeReviewStatus(operation: ReviewControllerOperation, result: Nat
 	if (!result.complete || !result.authoritative || result.status === "invalid") {
 		return { operation, status: "blocked", outcome: "native-authority-inventory-incomplete", mutation_performed: false, inventory_complete: false, next_action: "require-complete-native-authority-inventory", evidence };
 	}
-	if (result.locks.length > 0) {
+	if (hasBlockingNativeLock(result)) {
 		return { operation, status: "blocked", outcome: "native-authority-lock-present", mutation_performed: false, inventory_complete: true, next_action: "wait-for-native-lock-release", evidence };
 	}
 	switch (result.status) {
