@@ -16,7 +16,6 @@ import {
 	SNAPSHOT_CLEANUP_TRIGGER,
 	REVIEW_PROJECTION,
 	captureReviewSnapshot,
-	captureOrdinaryCorrectionSnapshot,
 	captureLiveReviewCandidateBinding,
 	cleanupReviewSnapshot,
 	type CaptureReviewSnapshotOptions,
@@ -310,8 +309,8 @@ test("snapshot rejects unsupported and unresolved projections without changing t
 	assert.deepEqual(readFileSync(indexPath), indexBefore);
 });
 
-test("ordinary snapshots bind canonical genesis paths and corrections cannot expand them", (t) => {
-	const { repository, git } = createRepository(t);
+test("ordinary snapshots bind canonical genesis paths", (t) => {
+	const { repository } = createRepository(t);
 	writeFileSync(join(repository, "requirements.txt"), "package==1\n");
 	writeFileSync(join(repository, "CMakeLists.txt"), "project(example)\n");
 	writeFileSync(join(repository, "guide.mdx"), "export const executable = true;\n");
@@ -328,16 +327,4 @@ test("ordinary snapshots bind canonical genesis paths and corrections cannot exp
 		"guide.mdx",
 		"requirements.txt",
 	]);
-	writeFileSync(join(repository, "requirements.txt"), "package==2\n");
-	git("add", "requirements.txt", "CMakeLists.txt", "guide.mdx", "README.sh");
-	const candidate = git("write-tree");
-	const correction = captureOrdinaryCorrectionSnapshot(snapshot, candidate);
-	assert.deepEqual(correction.changed_paths, ["requirements.txt"]);
-	assert.equal(correction.candidate_tree, candidate);
-	writeFileSync(join(repository, "outside.ts"), "export {};\n");
-	git("add", "outside.ts");
-	assert.throws(
-		() => captureOrdinaryCorrectionSnapshot(snapshot, git("write-tree")),
-		/non-genesis path/i,
-	);
 });

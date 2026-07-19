@@ -51,46 +51,11 @@ import {
 } from "../lib/sdd-status.ts";
 import type { TriggerEvent } from "../lib/review-triggers.ts";
 import { canonicalJsonV1, domainHashV1 } from "../lib/review-canonical.ts";
-import { inspectLegacyReviewAuthorityV1, type LegacyInspectionV1 } from "../lib/review-legacy-detector.ts";
-import { ReviewMutationLockV1 } from "../lib/review-lock.ts";
-import {
-	COMPACT_START_BLOCK_ACTION,
-	GRAPH_V1_ORDINARY_READ_ONLY,
-	CompactReviewStartBlockedError,
-	CompactReviewTerminalAmbiguityError,
-	inspectCompactTerminalApplicability,
-	discoverCompactReview,
-	finalizeCompactReview,
-	startCompactReview,
-} from "../lib/review-facade.ts";
-import { CompactReviewContractError, deriveNativeRefuterRequest, deriveNativeValidationRequest, parseNativeCompactFinalizeInput, toNativeReviewerDocument, toNativeValidatorDocument } from "../lib/review-compact-contract.ts";
+import { CompactReviewContractError, deriveNativeRefuterRequest, parseNativeCompactFinalizeInput, toNativeReviewerDocument, toNativeValidatorDocument } from "../lib/review-compact-contract.ts";
 import { toNativeRefuterDocument } from "../lib/review-refuter-adapter.ts";
-import { validateCompactReviewGate } from "../lib/review-compact-gate.ts";
-import {
-	assertLiveRecoveredSourceBindingV1,
-	assertLiveRecoveredSuccessorBindingV1,
-	createSupersessionEnvelopeV1,
-	hasEligibleGraphV1RecoveryAuthorityV1,
-	inspectApprovedCompactSuccessorV1,
-	inspectRecoverableGraphSourceV1,
-	prepareSupersessionV1,
-	resolveReviewAuthorityForChange,
-	SupersessionStoreV1,
-	type PrepareSupersessionInputV1,
-} from "../lib/review-authority-supersession.ts";
-import {
-	COMPACT_AUTHORITY_OUTCOME,
-	compactV2LineageExists,
-	discoverCompactReviewStores,
-	graphV1LineageExists,
-	hasGraphV1Authority,
-	inspectCompactReviewAuthorityV2,
-	type CompactAuthorityInspectionV2,
-} from "../lib/review-compact-store.ts";
 import {
 	inheritedUnsafeGitEnvironmentKeys,
 	publicationProbeGitEnvironment,
-	ReviewRepositoryError,
 	resolveRepositoryAuthorityV1,
 } from "../lib/review-repository.ts";
 import { captureLiveReviewCandidateBinding } from "../lib/review-snapshot.ts";
@@ -98,13 +63,7 @@ import {
 	EXTERNAL_RELEASE_EVIDENCE,
 	GATE_RESULT,
 	GATE_TARGET_KIND,
-	JOURNAL_STATUS,
 	PUSH_UPDATE_KIND,
-	REVIEW_OPERATION,
-	REVIEW_TRANSITION,
-	ReviewTransactionStore,
-	canonicalHash,
-	createReviewState,
 	evaluateReleaseFastPathV1,
 	projectExactTagCreatePushAsReleaseV1,
 	recheckReleaseFastPathCiStatusV1,
@@ -112,10 +71,18 @@ import {
 	resolveConfiguredPushDestinationV1,
 	resolvePushDestinationRefV1,
 	resolvePushRemoteRefV1,
-	validateAuthoritativeReviewGate,
 	type GateTargetV1,
 	type PushGateTargetV1,
 	type ReleaseFastPathEvidenceV1,
+} from "../lib/review-publication-gate.ts";
+import {
+	JOURNAL_STATUS,
+	REVIEW_OPERATION,
+	REVIEW_TRANSITION,
+	ReviewTransactionStore,
+	canonicalHash,
+	createReviewState,
+	validateAuthoritativeReviewGate,
 	type ReviewBudgetV1,
 	type ReviewReducerInput,
 	type StartOperationResultV1,
@@ -125,29 +92,27 @@ import {
 	REVIEW_MODE,
 	REVIEW_PROJECTION,
 	captureReviewSnapshot,
-	captureOrdinaryCorrectionSnapshot,
 	type ReviewMode,
 	type ReviewProjectionV1,
 } from "../lib/review-snapshot.ts";
 import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
 import { CandidateViewError, CandidateViewRegistry, injectReviewCandidateView, resolveCanonicalCandidateBase } from "../lib/review-candidate-view.ts";
-import { NATIVE_REVIEW_AUTHORITY_APPLICABILITY, classifyNativeReviewRemediation } from "../lib/native-review-remediation.ts";
 import {
 	createNativeReviewCli,
 	isCanonicalProcessString,
+	nativeReviewReconcileAuthorization,
 	NativeReviewCliError,
-	NATIVE_REVIEW_AUTHORITY_STATUS,
 	NATIVE_REVIEW_ERROR_CODE,
-	NATIVE_REVIEW_LOCK_STATUS,
 	sanitizeForeignNativeReviewDiagnostics,
 	type NativeReviewCli,
 	type NativeFinalizeResult,
 	type NativeReviewProcessDiagnostics,
 	type NativeStartResult,
-	type NativeReviewStatusResult,
 	type NativeValidateResult,
 } from "../lib/native-review-cli.ts";
 import type { ReviewStatusV1 } from "../lib/review-integration-v1.ts";
+
+const GRAPH_V1_ORDINARY_READ_ONLY = "Graph-v1 ordinary review authority is read-only; use native compact-v2 review operations";
 import {
 	abandonCommitTransaction,
 	assertNoUnresolvedCommitTransaction,
@@ -2139,8 +2104,7 @@ const REVIEW_CONTROLLER_OPERATION = {
 	RESET: "reset",
 	RECOVER: "recover",
 	RECOVER_LOCK: "recover-lock",
-	PREPARE_SUPERSESSION: "prepare-supersession",
-	SUPERSEDE: "supersede",
+	RECONCILE_AUTHORITY: "reconcile-authority",
 	REPAIR: "repair",
 	BIND_SDD: "bind-sdd",
 } as const;
@@ -2211,16 +2175,6 @@ interface ReviewControllerParameters {
 	workspaceRoot?: string;
 }
 
-interface SupersessionControllerInput {
-	changeName: string;
-	sourceLineageId: string;
-	successorLineageId: string;
-	operationId: string;
-	prepared: PrepareSupersessionInputV1;
-	challenge?: string;
-	request_hash?: string;
-}
-
 interface ReviewControllerStartInput {
 	mode: ReviewMode;
 	projection: ReviewProjectionV1;
@@ -2250,26 +2204,6 @@ interface ReviewControllerValidateInput {
 	release?: ReleaseFastPathEvidenceV1;
 	nativeRelease?: NativeReleaseEvidence;
 	maintainerException?: MaintainerExceptionInput;
-}
-
-interface ReviewResetStateBody {
-	schema: string;
-	reset_id: string;
-	repository_id: string;
-	common_directory_hash: string;
-	authorized_inventory_hash: string;
-	authorization_hash: string;
-	sequence: number;
-	phase: string;
-	quarantine_relative_path: string;
-	moved_roots: string[];
-	deleted_roots: string[];
-	identity_recovery?: boolean;
-}
-
-interface ReviewResetStateEnvelope {
-	body: ReviewResetStateBody;
-	reset_state_hash: string;
 }
 
 interface DerivedReviewGateTarget {
@@ -2512,7 +2446,7 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 	// VALIDATE defers its lineage requirement to execution time: the proven
 	// release-from-protected-main fast path needs no receipt lineage, while
 	// every other validation still requires one before receipt validation.
-	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.FINALIZE, REVIEW_CONTROLLER_OPERATION.STATUS, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.PREPARE_SUPERSESSION, REVIEW_CONTROLLER_OPERATION.SUPERSEDE, REVIEW_CONTROLLER_OPERATION.REPAIR, REVIEW_CONTROLLER_OPERATION.VALIDATE, REVIEW_CONTROLLER_OPERATION.BIND_SDD].includes(value.operation as ReviewControllerOperation);
+	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.FINALIZE, REVIEW_CONTROLLER_OPERATION.STATUS, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY, REVIEW_CONTROLLER_OPERATION.REPAIR, REVIEW_CONTROLLER_OPERATION.VALIDATE, REVIEW_CONTROLLER_OPERATION.BIND_SDD].includes(value.operation as ReviewControllerOperation);
 	if (needsLineage && (typeof value.lineageId !== "string" || value.lineageId.trim().length === 0)) {
 		throw new Error("Review controller requires a lineageId");
 	}
@@ -2576,218 +2510,30 @@ function parseControllerJson(input: string, operation: ReviewControllerOperation
 	return value;
 }
 
-function parseSupersessionControllerInput(value: Record<string, unknown>): SupersessionControllerInput {
-	for (const key of ["changeName", "sourceLineageId", "successorLineageId", "operationId"] as const) {
-		if (typeof value[key] !== "string" || value[key].trim().length === 0) throw new Error(`Review controller supersession requires ${key}`);
-	}
-	if (!isRecord(value.prepared)) throw new Error("Review controller supersession requires the exact prepared request input");
-	return {
-		changeName: value.changeName as string,
-		sourceLineageId: value.sourceLineageId as string,
-		successorLineageId: value.successorLineageId as string,
-		operationId: value.operationId as string,
-		prepared: value.prepared as unknown as PrepareSupersessionInputV1,
-		...(typeof value.challenge === "string" ? { challenge: value.challenge } : {}),
-		...(typeof value.request_hash === "string" ? { request_hash: value.request_hash } : {}),
-	};
-}
-
-function assertSupersessionControllerIdentity(
-	input: SupersessionControllerInput,
-	prepared: ReturnType<typeof prepareSupersessionV1>,
-): void {
-	if (
-		input.operationId !== prepared.body.operation_id ||
-		input.changeName !== prepared.body.change.change_name ||
-		input.sourceLineageId !== prepared.body.source.lineage_id ||
-		input.successorLineageId !== prepared.body.successor.lineage_id ||
-		canonicalJsonV1(input.prepared) !== canonicalJsonV1({
-			operation_id: prepared.body.operation_id,
-			eligibility: input.prepared.eligibility,
-			equivalence: input.prepared.equivalence,
-			...(input.prepared.predecessor_recovery_id === undefined ? {} : { predecessor_recovery_id: input.prepared.predecessor_recovery_id }),
-			...(input.prepared.sequence === undefined ? {} : { sequence: input.prepared.sequence }),
-		})
-	) throw new Error("Review controller supersession identity does not exactly match the prepared request");
-}
-
-const REVIEW_CONTROLLER_OUTCOME = {
-	RESET_STATE_UNAVAILABLE: "reset-state-unavailable",
-} as const;
-
-class ReviewResetStateUnavailableError extends Error {
-	readonly code = REVIEW_CONTROLLER_OUTCOME.RESET_STATE_UNAVAILABLE;
-	readonly statePath: string;
-
-	constructor(statePath: string) {
-		super("Review reset recovery state is unavailable");
-		this.name = "ReviewResetStateUnavailableError";
-		this.statePath = statePath;
-	}
-}
-
-function durableResetRecoveryRequest(cwd: string): LegacyInspectionV1["reset_request"] {
-	const authority = resolveRepositoryAuthorityV1(cwd);
-	const statePath = join(authority.store_root, "control", "reset-state.json");
-	let serialized: string;
-	try {
-		serialized = readFileSync(statePath, "utf8");
-	} catch (error) {
-		if (isRecord(error) && error.code === "ENOENT") throw new ReviewResetStateUnavailableError(statePath);
-		throw error;
-	}
-	const value = JSON.parse(serialized) as unknown;
-	if (!isRecord(value) || !isRecord(value.body)) throw new Error("Review reset recovery state is malformed");
-	const envelope = value as unknown as ReviewResetStateEnvelope;
-	const body = envelope.body;
-	if (
-		body.schema !== "gentle-ai.review-reset-state/v1" ||
-		typeof body.reset_id !== "string" ||
-		typeof body.repository_id !== "string" ||
-		typeof body.common_directory_hash !== "string" ||
-		typeof body.authorized_inventory_hash !== "string" ||
-		typeof body.authorization_hash !== "string" ||
-		!Number.isSafeInteger(body.sequence) ||
-		typeof body.phase !== "string" ||
-		typeof body.quarantine_relative_path !== "string" ||
-		!Array.isArray(body.moved_roots) ||
-		!Array.isArray(body.deleted_roots) ||
-		typeof envelope.reset_state_hash !== "string" ||
-		envelope.reset_state_hash !== domainHashV1("reset-state", body)
-	) {
-		throw new Error("Review reset recovery state failed integrity validation");
-	}
-	const currentCommonDirectoryHash = domainHashV1("common-directory", authority.common_directory);
-	if (
-		body.repository_id !== authority.repository_id ||
-		body.common_directory_hash !== currentCommonDirectoryHash
-	) {
-		throw new Error("Review reset recovery state does not match the current repository authority");
-	}
-	const allowedRoots = new Set([
-		"lineages",
-		"locks",
-		"legacy-evidence",
-		"migration",
-		"migration-operations",
-		"graph-v1",
-		"compact-v2",
-		...(body.identity_recovery === true ? ["IDENTITY"] : []),
-	]);
-	const expectedQuarantinePath = join("reset-quarantine", body.reset_id);
-	if (
-		!/^[0-9a-f]{64}$/.test(body.reset_id) ||
-		body.quarantine_relative_path !== expectedQuarantinePath ||
-		isAbsolute(body.quarantine_relative_path) ||
-		body.moved_roots.some((root) => typeof root !== "string" || !allowedRoots.has(root)) ||
-		body.deleted_roots.some((root) => typeof root !== "string" || !body.moved_roots.includes(root)) ||
-		new Set(body.moved_roots).size !== body.moved_roots.length ||
-		new Set(body.deleted_roots).size !== body.deleted_roots.length
-	) {
-		throw new Error("Review reset recovery state contains unsafe quarantine path semantics");
-	}
-	const confirmation = `DESTROY REVIEW AUTHORITY ${body.repository_id} AT ${body.common_directory_hash} INVENTORY ${body.authorized_inventory_hash}`;
-	if (body.authorization_hash !== domainHashV1("reset-authorization", confirmation)) {
-		throw new Error("Review reset recovery authorization failed integrity validation");
-	}
-	return {
-		repositoryId: body.repository_id,
-		commonDirHash: body.common_directory_hash,
-		inventoryHash: body.authorized_inventory_hash,
-		confirmation,
-	};
-}
-
-interface ControllerReviewAuthorityInspection extends LegacyInspectionV1 {
-	compact_authority?: CompactAuthorityInspectionV2;
-}
-
-type PublicControllerReviewAuthorityInspection = Omit<ControllerReviewAuthorityInspection, "reset_request"> & {
-	reset_request?: LegacyInspectionV1["reset_request"];
-};
-
-function hasPiResetEligibility(inspection: ControllerReviewAuthorityInspection): boolean {
-	return (
-		inspection.outcome !== "reset-in-progress" &&
-		"reset_request" in inspection &&
-		(
-			inspection.outcome !== "clean" ||
-			inspection.compact_authority?.outcome === COMPACT_AUTHORITY_OUTCOME.INVALID
-		)
-	);
-}
-
-function publicReviewAuthorityInspection(
-	inspection: ControllerReviewAuthorityInspection,
-	resetEligible: boolean,
-): PublicControllerReviewAuthorityInspection {
-	if (resetEligible || inspection.outcome === "reset-in-progress") return inspection;
-	const { reset_request: _resetRequest, ...sanitized } = inspection;
-	return sanitized;
-}
-
-function inspectReviewAuthorityForController(cwd: string): ControllerReviewAuthorityInspection {
-	const legacy = inspectLegacyReviewAuthorityV1(cwd);
-	const compact = inspectCompactReviewAuthorityV2(cwd);
-	const inspection = legacy.outcome === "reset-in-progress"
-		? (() => {
-			try {
-				return { ...legacy, reset_request: durableResetRecoveryRequest(cwd) };
-			} catch (error) {
-				if (error instanceof ReviewResetStateUnavailableError) {
-					return { ...legacy, reset_state_outcome: REVIEW_CONTROLLER_OUTCOME.RESET_STATE_UNAVAILABLE };
-				}
-				throw error;
-			}
-		})()
-		: legacy;
-	return compact.outcome === COMPACT_AUTHORITY_OUTCOME.NONE
-		? inspection
-		: { ...inspection, compact_authority: compact };
-}
-
-function compactAuthorityAction(inspection: ControllerReviewAuthorityInspection): string | undefined {
-	switch (inspection.compact_authority?.outcome) {
-		case COMPACT_AUTHORITY_OUTCOME.APPROVED:
-			return COMPACT_START_BLOCK_ACTION.APPROVED;
-		case COMPACT_AUTHORITY_OUTCOME.ESCALATED:
-			return COMPACT_START_BLOCK_ACTION.ESCALATED;
-		case COMPACT_AUTHORITY_OUTCOME.ACTIVE:
-			return "finalize-existing-ordinary-review";
-		case COMPACT_AUTHORITY_OUTCOME.INVALID:
-			return inspection.outcome === "clean"
-				? "request-explicit-reset-authorization"
-				: "stop-and-report-ambiguous-authority";
-		default:
-			return undefined;
-	}
-}
-
 async function authorizeDestructiveReviewOperation(
 	parametersValue: unknown,
 	ctx: ExtensionContext,
 ): Promise<void> {
 	const parameters = parseReviewControllerParameters(parametersValue);
 	const isReset = parameters.operation === REVIEW_CONTROLLER_OPERATION.RESET || parameters.operation === REVIEW_CONTROLLER_OPERATION.RECOVER;
-	const isSupersession = parameters.operation === REVIEW_CONTROLLER_OPERATION.SUPERSEDE;
-	if (!isReset && !isSupersession) return;
+	const isReconciliation = parameters.operation === REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY;
+	if (!isReset && !isReconciliation) return;
 	const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
-	const challengeKey = isSupersession ? "challenge" : "confirmation";
+	if (isReconciliation && missingNativeReconcileInputs(input).length > 0) return;
 	if (isReset) {
 		for (const key of ["repositoryId", "commonDirHash", "inventoryHash"] as const) {
 			if (typeof input[key] !== "string" || input[key].length === 0) throw new Error(`Review controller ${parameters.operation} requires an exact string ${key}`);
 		}
-	}
-	if (typeof input[challengeKey] !== "string" || input[challengeKey].length === 0) {
-		throw new Error(`Review controller ${parameters.operation} requires an exact string ${challengeKey}`);
+		if (typeof input.confirmation !== "string" || input.confirmation.length === 0) throw new Error(`Review controller ${parameters.operation} requires an exact string confirmation`);
 	}
 	if (!ctx.hasUI) {
 		throw new Error(`Review controller ${parameters.operation.toUpperCase()} requires fresh explicit authorization through the interactive Pi UI; headless execution fails closed`);
 	}
+	const reconciliationAuthorization = isReconciliation ? reconcileAuthorizationFromInput(input) : undefined;
 	const approved = await ctx.ui.confirm(
-		isSupersession ? "Authorize review authority SUPERSESSION?" : `Authorize destructive review authority ${parameters.operation.toUpperCase()}?`,
-		isSupersession
-			? ["Operation: SUPERSEDE", `Exact challenge: ${input.challenge}`, "This preserves graph-v1 history and activates only the exact compact-v2 successor."].join("\n")
+		isReconciliation ? "Authorize review authority reconciliation?" : `Authorize destructive review authority ${parameters.operation.toUpperCase()}?`,
+		isReconciliation
+			? ["Operation: RECONCILE_AUTHORITY", "Exact target and revision binding:", reconciliationAuthorization!, "The native command may quarantine only the bound invalid recovery successor; the predecessor stays untouched."].join("\n")
 			: [`Operation: ${parameters.operation.toUpperCase()}`, `Repository: ${input.repositoryId}`, `Exact challenge: ${input.confirmation}`, "This invalidates all prior review authority for this repository."].join("\n"),
 	);
 	if (!approved) throw new Error(`Review controller ${parameters.operation.toUpperCase()} was not explicitly authorized`);
@@ -4038,89 +3784,11 @@ function isReviewTransition(value: string): value is ReviewTransition {
 	return Object.values(REVIEW_TRANSITION).some((transition) => transition === value);
 }
 
-function isKnownPiLegacyLineage(cwd: string, lineageId: string): boolean {
+function isGraphV1JudgmentDayLineage(cwd: string, lineageId: string): boolean {
 	try {
-		return compactV2LineageExists(cwd, lineageId) || graphV1LineageExists(cwd, lineageId);
-	} catch (error) {
-		if (error instanceof ReviewRepositoryError) return false;
-		throw error;
-	}
-}
-
-const COMPACT_NATIVE_START_APPLICABILITY = {
-	UNRELATED_HISTORY: "unrelated-history",
-	COMPATIBLE_RECEIPT: "compatible-receipt",
-	NONTERMINAL: "nonterminal",
-	ESCALATED: "escalated",
-	AMBIGUOUS: "ambiguous",
-	INVALID: "invalid",
-} as const;
-
-type CompactNativeStartApplicability =
-	(typeof COMPACT_NATIVE_START_APPLICABILITY)[keyof typeof COMPACT_NATIVE_START_APPLICABILITY];
-
-interface CompactNativeStartClassification {
-	applicability: CompactNativeStartApplicability;
-	lineageIds: string[];
-}
-
-function isBrokenRepositoryIdentity(error: unknown): error is ReviewRepositoryError {
-	return error instanceof ReviewRepositoryError && /pinned repository identity|root commit authority/i.test(error.message);
-}
-
-function classifyCompactAuthorityApplicability(cwd: string): CompactNativeStartClassification {
-	try {
-		const authority = resolveRepositoryAuthorityV1(cwd);
-		const live = captureLiveReviewCandidateBinding({ cwd, repositoryId: authority.repository_id });
-		const matching = discoverCompactReviewStores(cwd).flatMap((store) => {
-			const record = store.load();
-			const state = record.state;
-			const stateMatches = state.initial_snapshot.base_tree === live.base_tree &&
-				state.initial_snapshot.complete_snapshot_tree === live.complete_snapshot_tree &&
-				state.initial_snapshot.initial_review_tree === live.initial_review_tree &&
-				canonicalJsonV1(state.genesis_paths) === canonicalJsonV1(live.genesis_paths) &&
-				canonicalJsonV1(state.intended_untracked) === canonicalJsonV1(live.intended_untracked);
-			if (state.state !== "approved" && state.state !== "escalated") {
-				return stateMatches ? [{ lineageId: state.lineage_id, state: state.state }] : [];
-			}
-			const { body } = store.loadTerminalReceipt().receipt;
-			const receiptMatches = body.base_tree === live.base_tree &&
-				body.final_candidate_tree === live.complete_snapshot_tree &&
-				body.genesis_paths_hash === domainHashV1("compact-paths", live.genesis_paths) &&
-				body.intended_untracked_hash === domainHashV1("compact-untracked", live.intended_untracked);
-			if (stateMatches && !receiptMatches) throw new CompactReviewStoreError("Compact terminal receipt is incomplete or mismatched for its candidate");
-			return receiptMatches ? [{ lineageId: state.lineage_id, state: state.state }] : [];
-		}).toSorted((left, right) => left.lineageId.localeCompare(right.lineageId));
-		if (matching.length === 0) return { applicability: COMPACT_NATIVE_START_APPLICABILITY.UNRELATED_HISTORY, lineageIds: [] };
-		if (matching.length > 1) return { applicability: COMPACT_NATIVE_START_APPLICABILITY.AMBIGUOUS, lineageIds: matching.map(({ lineageId }) => lineageId) };
-		const match = matching[0]!;
-		return {
-			applicability: match.state === "approved"
-				? COMPACT_NATIVE_START_APPLICABILITY.COMPATIBLE_RECEIPT
-				: match.state === "escalated"
-					? COMPACT_NATIVE_START_APPLICABILITY.ESCALATED
-					: COMPACT_NATIVE_START_APPLICABILITY.NONTERMINAL,
-			lineageIds: [match.lineageId],
-		};
+		return ReviewTransactionStore.forRepository(cwd).read(lineageId).mode === REVIEW_MODE.JUDGMENT_DAY;
 	} catch {
-		return { applicability: COMPACT_NATIVE_START_APPLICABILITY.INVALID, lineageIds: [] };
-	}
-}
-
-function compactApplicabilityNextAction(applicability: CompactNativeStartClassification): string {
-	switch (applicability.applicability) {
-		case COMPACT_NATIVE_START_APPLICABILITY.COMPATIBLE_RECEIPT:
-			return "use-compatible-read-or-gate-route";
-		case COMPACT_NATIVE_START_APPLICABILITY.NONTERMINAL:
-			return "stop-and-resolve-existing-compact-authority";
-		case COMPACT_NATIVE_START_APPLICABILITY.ESCALATED:
-			return "stop-and-report-escalated-compact-authority";
-		case COMPACT_NATIVE_START_APPLICABILITY.AMBIGUOUS:
-			return "stop-and-report-ambiguous-compact-authority";
-		case COMPACT_NATIVE_START_APPLICABILITY.INVALID:
-			return "stop-and-report-invalid-compact-authority";
-		case COMPACT_NATIVE_START_APPLICABILITY.UNRELATED_HISTORY:
-			return "start-native-authoritative";
+		return false;
 	}
 }
 
@@ -4137,17 +3805,6 @@ function nativeStartPreAuthorityRejection(): NativeStartPreAuthorityRejection {
 		mutation_performed: false,
 		mutation_outcome: "none",
 		reset_eligible: false,
-	};
-}
-
-function compactNativeStartBlockedResult(applicability: CompactNativeStartClassification): Record<string, unknown> {
-	return {
-		operation: REVIEW_CONTROLLER_OPERATION.START,
-		status: "blocked",
-		outcome: `compact-authority-${applicability.applicability}`,
-		...nativeStartPreAuthorityRejection(),
-		next_action: compactApplicabilityNextAction(applicability),
-		...(applicability.lineageIds.length === 0 ? {} : { lineage_ids: applicability.lineageIds }),
 	};
 }
 
@@ -4203,7 +3860,57 @@ function nativeStatusFailed(operation: ReviewControllerOperation, error: unknown
 const NATIVE_RECOVERY_INPUT = {
 	reclaim: ["lineage", "actor", "reason"],
 	recover: ["predecessorLineage", "expectedPredecessorRevision", "successorLineage", "disposition", "actor", "reason"],
+	reconcileAuthority: ["predecessorLineage", "expectedPredecessorRevision", "successorLineage", "expectedSuccessorRevision", "actor", "reason"],
 } as const;
+
+function missingNativeReconcileInputs(input: Record<string, unknown>): readonly string[] {
+	return NATIVE_RECOVERY_INPUT.reconcileAuthority.filter((key) => !isCanonicalProcessString(input[key]));
+}
+
+function reconcileAuthorizationFromInput(input: Record<string, unknown>): string {
+	return nativeReviewReconcileAuthorization({
+		predecessorLineage: String(input.predecessorLineage),
+		expectedPredecessorRevision: String(input.expectedPredecessorRevision),
+		successorLineage: String(input.successorLineage),
+		expectedSuccessorRevision: String(input.expectedSuccessorRevision),
+		actor: String(input.actor),
+		reason: String(input.reason),
+	});
+}
+
+async function executeNativeAuthorityReconciliation(
+	operation: ReviewControllerOperation,
+	input: Record<string, unknown>,
+	cwd: string,
+	nativeReviewCli: NativeReviewCli | null,
+	pendingAuthorizations: Map<string, PendingReviewAuthorization>,
+	signal: AbortSignal | undefined,
+): Promise<Record<string, unknown>> {
+	if (nativeReviewCli?.reconcileAuthority === undefined) {
+		return { operation, status: "blocked", outcome: "native-reconciliation-unavailable", native_operation: "review reconcile-authority", mutation_performed: false, mutation_outcome: "none", next_action: "install-package-local-gentle-ai-or-run-native-review-cli-directly" };
+	}
+	const missing = missingNativeReconcileInputs(input);
+	if (missing.length > 0) {
+		return { operation, status: "blocked", outcome: "native-input-required", native_operation: "review reconcile-authority", missing_input: missing, mutation_performed: false, mutation_outcome: "none", next_action: "resubmit-with-exact-native-reconciliation-input" };
+	}
+	pendingAuthorizations.clear();
+	try {
+		const result = await nativeReviewCli.reconcileAuthority({
+			cwd,
+			predecessorLineage: String(input.predecessorLineage),
+			expectedPredecessorRevision: String(input.expectedPredecessorRevision),
+			successorLineage: String(input.successorLineage),
+			expectedSuccessorRevision: String(input.expectedSuccessorRevision),
+			actor: String(input.actor),
+			reason: String(input.reason),
+			maintainerAuthorization: reconcileAuthorizationFromInput(input),
+			...(signal === undefined ? {} : { signal }),
+		});
+		return { operation, native_operation: "review reconcile-authority", result: result.record, mutation_performed: true, mutation_outcome: "committed", next_action: "inspect" };
+	} catch (error) {
+		return nativeOperationFailure(operation, error);
+	}
+}
 
 /**
  * Routes the destructive controller operations to their closest audited native
@@ -4278,89 +3985,6 @@ async function executeNativeRecoveryRoute(
 		};
 	} catch (error) {
 		return nativeOperationFailure(operation, error);
-	}
-}
-
-// gentle-ai 2.1.8 leaves review-transactions/v2/LOCK behind after ordinary
-// successful operations and inventories it as a `released` dead-owner entry
-// (#184). Only live claims — owned or ambiguous — block; released residue is
-// non-blocking and stays observable through evidence.authority_inventory.
-// The decoder keeps lock status a closed enum, so any unknown status already
-// fails closed before reaching this classification.
-function hasBlockingNativeLock(status: NativeReviewStatusResult): boolean {
-	return status.locks.some((lock) => lock.status !== NATIVE_REVIEW_LOCK_STATUS.RELEASED);
-}
-
-const NATIVE_START_PRECONDITION = {
-	CLEAN_EMPTY: "clean-empty",
-	INCOMPLETE: "incomplete",
-	LOCKED: "locked",
-	NON_EMPTY: "non-empty",
-} as const;
-type NativeStartPrecondition = (typeof NATIVE_START_PRECONDITION)[keyof typeof NATIVE_START_PRECONDITION];
-
-function classifyNativeStartPrecondition(status: NativeReviewStatusResult): NativeStartPrecondition {
-	if (status.status === NATIVE_REVIEW_AUTHORITY_STATUS.RESET_IN_PROGRESS) return NATIVE_START_PRECONDITION.NON_EMPTY;
-	if (!status.complete || !status.authoritative || status.status === NATIVE_REVIEW_AUTHORITY_STATUS.INVALID || status.status === NATIVE_REVIEW_AUTHORITY_STATUS.SAME_LINEAGE_MIXED_COLLISION) {
-		return NATIVE_START_PRECONDITION.INCOMPLETE;
-	}
-	if (hasBlockingNativeLock(status)) return NATIVE_START_PRECONDITION.LOCKED;
-	// Readable historical inventory is not a mutation precondition. Native START
-	// owns current-lineage matching; Pi only blocks corrupt or ambiguous authority.
-	return NATIVE_START_PRECONDITION.CLEAN_EMPTY;
-}
-
-function mayRouteIncompleteNativeStartToUnrelatedHistory(
-	status: NativeReviewStatusResult,
-	compact: CompactNativeStartClassification | undefined,
-): boolean {
-	return compact?.applicability === COMPACT_NATIVE_START_APPLICABILITY.UNRELATED_HISTORY &&
-		classifyNativeReviewRemediation(status, compact.lineageIds).applicability === NATIVE_REVIEW_AUTHORITY_APPLICABILITY.UNRELATED_HISTORY;
-}
-
-function nativeStartPreconditionFailure(status: NativeReviewStatusResult): Record<string, unknown> | undefined {
-	const precondition = classifyNativeStartPrecondition(status);
-	if (precondition === NATIVE_START_PRECONDITION.CLEAN_EMPTY) return undefined;
-	const evidence = { native_contract: "gentle-ai/2.1.5", native_status: status.status, authority_inventory: status.raw };
-	if (precondition === NATIVE_START_PRECONDITION.INCOMPLETE) {
-		return { operation: REVIEW_CONTROLLER_OPERATION.START, status: "blocked", outcome: "native-authority-inventory-incomplete", ...nativeStartPreAuthorityRejection(), inventory_complete: false, next_action: "require-complete-native-authority-inventory", evidence };
-	}
-	if (precondition === NATIVE_START_PRECONDITION.LOCKED) {
-		return { operation: REVIEW_CONTROLLER_OPERATION.START, status: "blocked", outcome: "native-authority-lock-present", ...nativeStartPreAuthorityRejection(), inventory_complete: true, next_action: "wait-for-native-lock-release", evidence };
-	}
-	return { operation: REVIEW_CONTROLLER_OPERATION.START, status: "blocked", outcome: "native-authority-reset-in-progress", ...nativeStartPreAuthorityRejection(), inventory_complete: true, next_action: "recover-native-reset", evidence };
-}
-
-function mapNativeReviewStatus(operation: ReviewControllerOperation, result: NativeReviewStatusResult): Record<string, unknown> {
-	const evidence = {
-		native_contract: "gentle-ai/2.1.5",
-		native_status: result.status,
-		authority_inventory: result.raw,
-	};
-	if (!result.complete || !result.authoritative || result.status === "invalid") {
-		return { operation, status: "blocked", outcome: "native-authority-inventory-incomplete", mutation_performed: false, inventory_complete: false, next_action: "require-complete-native-authority-inventory", evidence };
-	}
-	if (hasBlockingNativeLock(result)) {
-		return { operation, status: "blocked", outcome: "native-authority-lock-present", mutation_performed: false, inventory_complete: true, next_action: "wait-for-native-lock-release", evidence };
-	}
-	switch (result.status) {
-		case "clean":
-			return { operation, status: "ready", mutation_performed: false, inventory_complete: true, next_action: "start-native-authoritative", evidence };
-		case "active":
-			return { operation, status: "in-progress", mutation_performed: false, inventory_complete: true, next_action: "finalize-existing-native-review", evidence };
-		case "approved":
-			return { operation, status: "blocked", mutation_performed: false, inventory_complete: true, next_action: "use-compatible-read-or-gate-route", evidence };
-		case "escalated":
-			return { operation, status: "blocked", mutation_performed: false, inventory_complete: true, next_action: "stop-and-report-escalated-native-authority", evidence };
-		case "reset-in-progress":
-			return { operation, status: "blocked", mutation_performed: false, inventory_complete: true, next_action: "recover-native-reset", evidence };
-		case "superseded":
-		case "recovered":
-			return { operation, status: "blocked", mutation_performed: false, inventory_complete: true, next_action: "inspect-native-recovery-provenance", evidence };
-		case "same-lineage-mixed-collision":
-			return { operation, status: "blocked", outcome: "native-authority-inventory-incomplete", mutation_performed: false, inventory_complete: false, next_action: "require-complete-native-authority-inventory", evidence };
-		case "invalid":
-			return { operation, status: "blocked", outcome: "native-authority-inventory-incomplete", mutation_performed: false, inventory_complete: false, next_action: "require-complete-native-authority-inventory", evidence };
 	}
 }
 
@@ -4661,7 +4285,7 @@ function nativeStartRejection(reason: string, field?: string): Record<string, un
 }
 
 function nativeOperationFailure(operation: ReviewControllerOperation, error: unknown): Record<string, unknown> {
-	const value = error as { mutationOutcome?: unknown; nextAction?: unknown; diagnostics?: unknown; launchAttempted?: unknown; candidateViewPreNative?: unknown; failureEnvelope?: { raw?: unknown; mutationOutcome?: unknown; replayability?: unknown; nextAction?: unknown } };
+	const value = error as { mutationOutcome?: unknown; nextAction?: unknown; diagnostics?: unknown; auditRecord?: unknown; launchAttempted?: unknown; candidateViewPreNative?: unknown; failureEnvelope?: { raw?: unknown; mutationOutcome?: unknown; replayability?: unknown; nextAction?: unknown } };
 	if (isRecord(value.failureEnvelope) && isRecord(value.failureEnvelope.raw)) {
 		const mutationOutcome = value.failureEnvelope.mutationOutcome;
 		return {
@@ -4694,6 +4318,7 @@ function nativeOperationFailure(operation: ReviewControllerOperation, error: unk
 				? { lineage_created: false, mutation_performed: false, mutation_outcome: "none" as const }
 				: { mutation_outcome: mutationOutcome }),
 		...(diagnostics === undefined ? {} : { diagnostics }),
+		...(isRecord(value.auditRecord) ? { native_audit_record: value.auditRecord } : {}),
 		...(mutationOutcome === "unknown" || value.nextAction === "review.status"
 			? { replayability: "status_required", next_action: "review.status", required_status_action: requiredStatusActionText() }
 			: { next_action: "resolve-native-operation-failure" }),
@@ -4862,44 +4487,9 @@ async function executeReviewControllerOperation(
 			next_action: "Use the native `gentle-ai review` CLI (start/finalize/validate/status/recover) against the repository review authority; receipts and canonical artifacts live in the Git common-directory store at .git/gentle-ai/reviews and travel with the repository through normal Git replication.",
 		};
 	}
-	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.PREPARE_SUPERSESSION) {
-		const input = parseSupersessionControllerInput(parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation));
-		const prepared = prepareSupersessionV1(input.prepared);
-		assertSupersessionControllerIdentity(input, prepared);
-		return { operation: parameters.operation, change_name: input.changeName, request_hash: prepared.request_hash, challenge: prepared.challenge, body: prepared.body };
-	}
-	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.SUPERSEDE) {
-		const input = parseSupersessionControllerInput(parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation));
-		if (typeof input.challenge !== "string" || typeof input.request_hash !== "string") throw new Error("Review controller SUPERSEDE requires the exact prepared request_hash and challenge");
-		const prepared = prepareSupersessionV1(input.prepared);
-		assertSupersessionControllerIdentity(input, prepared);
-		if (input.request_hash !== prepared.request_hash || input.challenge !== prepared.challenge) throw new Error("Review controller SUPERSEDE prepared request and challenge must exactly match the fresh authorization");
-		const body = { ...prepared.body, authorization_hash: domainHashV1("review-authority-supersession-authorization", { challenge: prepared.challenge, request_hash: prepared.request_hash }) };
-		const envelope = createSupersessionEnvelopeV1(body);
-		const installed = SupersessionStoreV1.forRepository(defaultCwd).install(input.changeName, envelope, {
-			casChecks: [
-				{
-					label: "graph source",
-					expected: canonicalJsonV1(prepared.body.source),
-					observe: () => {
-						assertLiveRecoveredSourceBindingV1(defaultCwd, envelope);
-						return canonicalJsonV1(inspectRecoverableGraphSourceV1(defaultCwd, input.changeName, input.sourceLineageId).source);
-					},
-				},
-				{
-					label: "compact successor",
-					expected: canonicalJsonV1(prepared.body.successor),
-					observe: () => {
-						const successor = inspectApprovedCompactSuccessorV1(defaultCwd, input.successorLineageId);
-						assertLiveRecoveredSuccessorBindingV1(defaultCwd, envelope, discoverCompactReview(defaultCwd, input.successorLineageId, true).record.state);
-						return canonicalJsonV1(successor);
-					},
-				},
-			],
-		});
-		const active = resolveReviewAuthorityForChange(defaultCwd, input.changeName);
-		if (!active || active.recovery.recovery_id !== installed.recovery_id) throw new Error("Review controller SUPERSEDE did not produce one validated active authority");
-		return { operation: parameters.operation, change_name: input.changeName, recovery_id: installed.recovery_id, active_authority_id: active.record.state.lineage_id, next_action: "validate-recovered-authority" };
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY) {
+		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
+		return await executeNativeAuthorityReconciliation(parameters.operation, input, defaultCwd, nativeReviewCli, pendingAuthorizations, signal);
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.INSPECT && nativeReviewCli !== null) {
 		try {
@@ -4907,98 +4497,13 @@ async function executeReviewControllerOperation(
 				const status = await nativeReviewCli.targetStatus({ cwd: defaultCwd, ...(signal === undefined ? {} : { signal }) });
 				return mapNativeTargetStatus(parameters.operation, status);
 			}
-			const inspection = inspectReviewAuthorityForController(defaultCwd);
-			const resetEligible = hasPiResetEligibility(inspection);
-			const publicInspection = publicReviewAuthorityInspection(inspection, resetEligible);
-			if (inspection.outcome !== "clean") return {
-				operation: parameters.operation,
-				status: "blocked",
-				inspection: publicInspection,
-				inventory_complete: false,
-				reset_eligible: resetEligible,
-				next_action: inspection.outcome === "reset-in-progress"
-					? "request-explicit-reset-recovery-authorization"
-					: resetEligible
-						? "request-explicit-reset-authorization"
-						: "resolve-pi-owned-preflight",
-			};
-			const compact = classifyCompactAuthorityApplicability(defaultCwd);
-			const nativeStatus = await nativeReviewCli.reviewStatus({ cwd: defaultCwd, signal });
-			const classification = classifyNativeReviewRemediation(nativeStatus, compact.lineageIds);
-			const native = mapNativeReviewStatus(parameters.operation, nativeStatus);
-			const compactBlocks = compact.applicability !== COMPACT_NATIVE_START_APPLICABILITY.UNRELATED_HISTORY;
-			const response = {
-				...native,
-				...(compactBlocks ? {
-					status: compact.applicability === COMPACT_NATIVE_START_APPLICABILITY.NONTERMINAL ? "in-progress" : "blocked",
-					next_action: compactApplicabilityNextAction(compact),
-				} : {}),
-				pi_authority: inspection.outcome,
-				native_authority: nativeStatus.complete && nativeStatus.authoritative ? nativeStatus.status : "invalid-incomplete",
-				authority_applicability: classification.applicability,
-				reset_eligible: resetEligible,
-				reset_eligibility_reason: "Pi reset authority is independent of read-only native history",
-				lineage_created: false,
-				mutation_performed: false,
-				inspection: publicInspection,
-				compact_authority_applicability: compact.applicability,
-			};
-			return response;
+			return nativeStatusUnsupported(parameters.operation);
 		} catch (error) {
-			if (isBrokenRepositoryIdentity(error)) {
-				return {
-					operation: parameters.operation,
-					status: "blocked",
-					outcome: "compact-authority-invalid",
-					compact_authority_applicability: COMPACT_NATIVE_START_APPLICABILITY.INVALID,
-					inventory_complete: false,
-					next_action: "stop-and-report-invalid-compact-authority",
-				};
-			}
-			if (error instanceof ReviewRepositoryError) return nativeStatusUnsupported(parameters.operation);
 			return nativeStatusFailed(parameters.operation, error);
 		}
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.INSPECT) {
-		const authority = resolveRepositoryAuthorityV1(defaultCwd);
-		const lock = new ReviewMutationLockV1(join(authority.store_root, "control"), authority.repository_id, authority.authority_id);
-		const inspection = inspectReviewAuthorityForController(defaultCwd);
-		const resetEligible = hasPiResetEligibility(inspection);
-		const publicInspection = publicReviewAuthorityInspection(inspection, resetEligible);
-		const input = parameters.input === undefined ? undefined : parseControllerJson(parameters.input, parameters.operation);
-		const policyHash = input?.mode === REVIEW_MODE.ORDINARY && isRecord(input.projection) && input.projection.kind === REVIEW_PROJECTION.COMPLETE && typeof input.policyHash === "string" ? input.policyHash : undefined;
-		const applicability = inspection.outcome === "clean" && (
-			inspection.compact_authority?.outcome === COMPACT_AUTHORITY_OUTCOME.APPROVED ||
-			inspection.compact_authority?.outcome === COMPACT_AUTHORITY_OUTCOME.ESCALATED
-		) ? inspectCompactTerminalApplicability(defaultCwd, policyHash) : undefined;
-		const candidateInspection = applicability === undefined ? publicInspection : {
-			...publicInspection,
-			terminal_applicability: applicability.applicability,
-			terminal_lineage_ids: applicability.lineageIds,
-		};
-		const terminal = applicability?.applicability === "applicable";
-		const terminalAmbiguous = applicability?.applicability === "ambiguous";
-		return {
-			operation: parameters.operation,
-			inspection: candidateInspection,
-			reset_eligible: resetEligible,
-			lock: lock.inspect(),
-			...(inspection.outcome === "clean" && inspection.compact_authority !== undefined
-				? inspection.compact_authority.outcome === COMPACT_AUTHORITY_OUTCOME.INVALID
-					? { status: "blocked", next_action: "request-explicit-reset-authorization" }
-					: inspection.compact_authority.outcome === COMPACT_AUTHORITY_OUTCOME.ACTIVE
-					? { status: "in-progress", next_action: "finalize-existing-ordinary-review" }
-					: terminalAmbiguous
-						? { status: "blocked", next_action: "stop-and-report-ambiguous-compact-terminal-authority" }
-						: terminal
-							? { status: "terminal", next_action: compactAuthorityAction(inspection) }
-						: { status: "ready", next_action: "start-ordinary-review" }
-				: inspection.outcome === "clean"
-					? { status: "ready", next_action: "start-ordinary-review" }
-					: inspection.outcome === "blocked-ambiguous"
-						? { status: "blocked", next_action: "stop-and-report-ambiguous-authority" }
-						: { status: "blocked", next_action: inspection.outcome === "reset-in-progress" ? "request-explicit-reset-recovery-authorization" : "request-explicit-reset-authorization" }),
-		};
+		return nativeStatusUnsupported(parameters.operation);
 	}
 
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK) {
@@ -5018,20 +4523,10 @@ async function executeReviewControllerOperation(
 		return await executeNativeRecoveryRoute(parameters.operation, "reclaim", input, defaultCwd, nativeReviewCli, pendingAuthorizations, signal);
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.REPAIR) {
-		const inspection = inspectReviewAuthorityForController(defaultCwd);
-		if (
-			inspection.outcome === "clean" &&
-			inspection.compact_authority !== undefined &&
-			!hasGraphV1Authority(defaultCwd)
-		) {
-			return {
-				operation: parameters.operation,
-				repaired: false,
-				compact_authority: "immutable-untouched",
-				inspection,
-				next_action: compactAuthorityAction(inspection),
-			};
-		}
+		if (nativeReviewCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
+		const status = await nativeReviewCli.targetStatus({ cwd: defaultCwd, ...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }), ...(signal === undefined ? {} : { signal }) });
+		if (status.authority?.version === "compact-v2") return { operation: parameters.operation, repaired: false, compact_authority: "immutable-untouched", status: mapNativeTargetStatus(parameters.operation, status, parameters.lineageId) };
+		if (status.authority?.version !== "legacy-v1") return mapNativeTargetStatus(parameters.operation, status, parameters.lineageId);
 		const store = ReviewTransactionStore.forRepository(defaultCwd);
 		store.repairCurrentAuthority();
 		return { operation: parameters.operation, repaired: true };
@@ -5095,29 +4590,8 @@ async function executeReviewControllerOperation(
 			requiredControllerString(parameters, "input"),
 			REVIEW_CONTROLLER_OPERATION.START,
 		);
-		if (rawStart.mode === REVIEW_MODE.ORDINARY && nativeReviewCli !== null) {
-			const selectorFree = !("policyPath" in rawStart) && !("baseRef" in rawStart) && !("committedOnly" in rawStart);
-			let compact: CompactNativeStartClassification | undefined;
-			if (nativeReviewCli.targetStatus === undefined && selectorFree) {
-				try {
-					const inspection = inspectReviewAuthorityForController(defaultCwd);
-					if (inspection.outcome !== "clean") {
-						return { operation: parameters.operation, status: "blocked", outcome: "legacy-read-only", ...nativeStartPreAuthorityRejection(), next_action: "use-compatible-read-or-gate-route" };
-					}
-					compact = classifyCompactAuthorityApplicability(defaultCwd);
-				} catch (error) {
-					if (isBrokenRepositoryIdentity(error)) {
-						return compactNativeStartBlockedResult({ applicability: COMPACT_NATIVE_START_APPLICABILITY.INVALID, lineageIds: [] });
-					}
-					if (!(error instanceof ReviewRepositoryError)) throw error;
-				}
-				if (compact !== undefined && compact.applicability !== COMPACT_NATIVE_START_APPLICABILITY.UNRELATED_HISTORY) {
-					return compactNativeStartBlockedResult(compact);
-				}
-			}
-			if (nativeReviewCli.targetStatus === undefined && typeof parameters.lineageId === "string" && isKnownPiLegacyLineage(defaultCwd, parameters.lineageId)) {
-				return { operation: parameters.operation, status: "blocked", outcome: "legacy-read-only", ...nativeStartPreAuthorityRejection(), next_action: "use-compatible-read-or-gate-route" };
-			}
+		if (rawStart.mode === REVIEW_MODE.ORDINARY) {
+			if (nativeReviewCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
 			if ("policyHash" in rawStart) return nativeStartRejection("legacy-policy-hash-unsupported");
 			const unknownField = Object.keys(rawStart).find((field) => !["mode", "baseRef", "committedOnly", "policyPath"].includes(field));
 			if (unknownField !== undefined) return nativeStartRejection("unknown-field", unknownField);
@@ -5139,20 +4613,13 @@ async function executeReviewControllerOperation(
 				}
 			}
 			try {
-				if (nativeReviewCli.targetStatus !== undefined) {
-					const target = await nativeReviewCli.targetStatus({
-						cwd: defaultCwd,
-						...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
-						...(canonicalBaseRef === undefined ? {} : { baseRef: canonicalBaseRef }),
-						...(signal === undefined ? {} : { signal }),
-					});
-					if (target.applicability !== "unrelated" || target.action !== "start") return mapNativeTargetStatus(parameters.operation, target, parameters.lineageId);
-				} else {
-					const nativeStatus = await nativeReviewCli.reviewStatus({ cwd: defaultCwd, ...(signal === undefined ? {} : { signal }) });
-					const preconditionFailure = nativeStartPreconditionFailure(nativeStatus);
-					const routeUnrelatedIncompleteInventory = classifyNativeStartPrecondition(nativeStatus) === NATIVE_START_PRECONDITION.INCOMPLETE && mayRouteIncompleteNativeStartToUnrelatedHistory(nativeStatus, compact);
-					if (preconditionFailure !== undefined && !routeUnrelatedIncompleteInventory) return preconditionFailure;
-				}
+				const target = await nativeReviewCli.targetStatus({
+					cwd: defaultCwd,
+					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
+					...(canonicalBaseRef === undefined ? {} : { baseRef: canonicalBaseRef }),
+					...(signal === undefined ? {} : { signal }),
+				});
+				if (target.applicability !== "unrelated" || target.action !== "start") return mapNativeTargetStatus(parameters.operation, target, parameters.lineageId);
 			} catch (error) {
 				return nativeOperationFailure(parameters.operation, error);
 			}
@@ -5217,63 +4684,8 @@ async function executeReviewControllerOperation(
 				});
 			}
 		}
-		const inspection = inspectReviewAuthorityForController(defaultCwd);
-		if (inspection.outcome !== "clean") {
-			return {
-				operation: parameters.operation,
-				status: "blocked",
-				lineage_created: false,
-				inspection,
-				next_action: inspection.outcome === "blocked-ambiguous"
-					? "stop-and-report-ambiguous-authority"
-					: inspection.outcome === "reset-in-progress"
-						? "request-explicit-reset-recovery-authorization"
-						: "request-explicit-reset-authorization",
-			};
-		}
 		if (rawStart.mode === REVIEW_MODE.ORDINARY) {
-			if (typeof rawStart.policyHash !== "string") {
-				throw new Error("Compact ordinary START requires policyHash");
-			}
-			const projection = rawStart.projection === undefined
-				? { kind: REVIEW_PROJECTION.COMPLETE } as const
-				: isRecord(rawStart.projection) && rawStart.projection.kind === REVIEW_PROJECTION.COMPLETE
-					? { kind: REVIEW_PROJECTION.COMPLETE } as const
-					: undefined;
-			if (!projection) throw new Error("New compact ordinary START requires the complete projection");
-			try {
-				const result = startCompactReview({
-					cwd: defaultCwd,
-					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
-					policyHash: rawStart.policyHash,
-					projection,
-				});
-				const state = discoverCompactReview(defaultCwd, result.lineage_id).record.state;
-				return { operation: parameters.operation, result, state };
-			} catch (error) {
-				if (error instanceof CompactReviewTerminalAmbiguityError) {
-					return {
-						operation: parameters.operation,
-						status: "blocked",
-						lineage_created: false,
-						lineage_ids: error.lineageIds,
-						next_action: "stop-and-report-ambiguous-compact-terminal-authority",
-						inspection: inspectReviewAuthorityForController(defaultCwd),
-					};
-				}
-				if (error instanceof CompactReviewStartBlockedError) {
-					return {
-						operation: parameters.operation,
-						status: "blocked",
-						lineage_created: false,
-						lifecycle: `compact-${error.state}`,
-						lineage_id: error.lineageId,
-						next_action: error.action,
-						inspection: inspectReviewAuthorityForController(defaultCwd),
-					};
-				}
-				throw error;
-			}
+			return nativeStatusUnsupported(parameters.operation);
 		}
 		const idempotencyKey = requiredControllerString(parameters, "idempotencyKey");
 		if (typeof parameters.lineageId !== "string" || parameters.lineageId.trim().length === 0) {
@@ -5333,27 +4745,20 @@ async function executeReviewControllerOperation(
 		if (raw.final_evidence !== undefined && typeof raw.final_evidence !== "string") throw new Error("Review controller finalize final_evidence must be a string");
 		if (raw.final_verification_passed !== undefined && typeof raw.final_verification_passed !== "boolean") throw new Error("Review controller finalize final_verification_passed must be boolean");
 		if (raw.final_evidence !== undefined && raw.final_verification_passed === undefined) throw new Error("Review controller finalize with final_evidence requires an explicit final_verification_passed boolean");
-		if (
-			nativeReviewCli !== null &&
-			nativeReviewCli.targetStatus === undefined &&
-			typeof parameters.lineageId === "string" &&
-			isKnownPiLegacyLineage(defaultCwd, parameters.lineageId)
-		) {
-			return { operation: parameters.operation, status: "blocked", outcome: "legacy-read-only", mutation_performed: false, next_action: "use-compatible-read-or-gate-route" };
-		}
-		if (nativeReviewCli !== null) {
+		if (nativeReviewCli?.targetStatus !== undefined) {
 			const input = parseNativeCompactFinalizeInput({
 				cwd: defaultCwd,
 				...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 				...raw,
 			});
 			let correctionCompletion = false;
-			let authoritativeState: unknown;
 			let negotiatedStatus: ReviewStatusV1 | undefined;
 			let candidateView: ReturnType<CandidateViewRegistry["create"]> | undefined;
 			let nativeResult: NativeFinalizeResult;
 			try {
-				if (candidateViews && parameters.lineageId === undefined) throw new CandidateViewError("Native FINALIZE requires an explicit candidate-view lineage");
+				if (parameters.lineageId === undefined) throw new CandidateViewError("Native FINALIZE requires an explicit lineage");
+				negotiatedStatus = await nativeReviewCli.targetStatus({ cwd: defaultCwd, lineageId: parameters.lineageId, ...(signal === undefined ? {} : { signal }) });
+				if (negotiatedStatus.applicability !== "current_target" || negotiatedStatus.authority?.lineageId !== parameters.lineageId || (negotiatedStatus.action !== "finalize" && negotiatedStatus.action !== "reconcile_finalize")) return mapNativeTargetStatus(parameters.operation, negotiatedStatus, parameters.lineageId);
 				correctionCompletion = input.review_result === undefined && (input.validation !== undefined || input.validation_proof !== undefined) && input.final_evidence !== undefined;
 				const validationAttempt = input.review_result === undefined && input.correction_line_forecast === undefined && input.final_evidence !== undefined;
 				// A correction-forecast-only FINALIZE (the pre-edit forecast step in
@@ -5362,45 +4767,22 @@ async function executeReviewControllerOperation(
 				// an empty in-memory registry without ever invoking native FINALIZE.
 				const correctionForecast = input.review_result === undefined && input.correction_line_forecast !== undefined;
 				const replayKey = JSON.stringify({ cwd: defaultCwd, lineageId: parameters.lineageId ?? null, input: parameters.input ?? null, inputPath: parameters.inputPath ?? null });
-				if ((validationAttempt || input.review_result !== undefined || (correctionForecast && nativeReviewCli.targetStatus !== undefined)) && candidateViews && parameters.lineageId && !candidateViews.hasProjection(parameters.lineageId)) {
-					if (nativeReviewCli.targetStatus !== undefined) {
-						negotiatedStatus = await nativeReviewCli.targetStatus({ cwd: defaultCwd, lineageId: parameters.lineageId, ...(signal === undefined ? {} : { signal }) });
-						if (negotiatedStatus.applicability !== "current_target" || negotiatedStatus.authority?.lineageId !== parameters.lineageId) return mapNativeTargetStatus(parameters.operation, negotiatedStatus, parameters.lineageId);
-						candidateView = validationAttempt
-							? (candidateViews.restoreProjectionFromNative(parameters.lineageId, defaultCwd, negotiatedStatus.projection), undefined)
-							: candidateViews.restoreForFinalizeFromNative(parameters.lineageId, defaultCwd, negotiatedStatus.projection);
-					} else {
-						const raw = JSON.parse(readFileSync(join(resolveRepositoryAuthorityV1(defaultCwd).common_directory, "gentle-ai", "review-transactions", "v2", parameters.lineageId, "review-state.json"), "utf8"));
-						if (!isRecord(raw) || raw.schema !== "gentle-ai.review-state-record/v2" || !isRecord(raw.state) || raw.state.schema !== "gentle-ai.review-state/v2" || raw.state.lineage_id !== parameters.lineageId || raw.state.state !== "correction_required") throw new CandidateViewError("authoritative correction state is invalid");
-						const snapshots = [raw.state.initial_snapshot, raw.state.current_snapshot];
-						if (!snapshots.every((snapshot) => isRecord(snapshot) && snapshot.kind === "current-changes" && typeof snapshot.base_tree === "string" && typeof snapshot.candidate_tree === "string" && typeof snapshot.paths_digest === "string" && Array.isArray(snapshot.paths) && snapshot.paths.every((path) => typeof path === "string")) || snapshots.some((snapshot) => JSON.stringify(snapshot) !== JSON.stringify(snapshots[0]))) throw new CandidateViewError("authoritative correction snapshot is invalid");
-						const snapshot = snapshots[0] as Record<string, unknown>;
-						const head = resolveCanonicalCandidateBase(defaultCwd, "HEAD");
-						if (head.tree !== snapshot.base_tree) throw new CandidateViewError("authoritative correction base no longer matches HEAD");
-						candidateViews.restoreProjection(parameters.lineageId, defaultCwd, head.commit, snapshot.base_tree as string, snapshot.candidate_tree as string, snapshot.paths as string[]);
-						authoritativeState = raw.state;
-					}
+				if ((validationAttempt || input.review_result !== undefined || correctionForecast) && candidateViews && !candidateViews.hasProjection(parameters.lineageId)) {
+					candidateView = validationAttempt
+						? (candidateViews.restoreProjectionFromNative(parameters.lineageId, defaultCwd, negotiatedStatus.projection), undefined)
+						: candidateViews.restoreForFinalizeFromNative(parameters.lineageId, defaultCwd, negotiatedStatus.projection);
 				}
 				// Fail closed before any native mutation when the frozen projection
 				// belongs to a different worktree than the requested workspace (#169).
 				if (candidateViews && parameters.lineageId && candidateViews.hasProjection(parameters.lineageId)) candidateViews.resolveProjection(parameters.lineageId, defaultCwd);
 				candidateView ??= candidateViews && parameters.lineageId ? (correctionCompletion || validationAttempt) ? candidateViews.createCorrected(parameters.lineageId, defaultCwd, replayKey) : candidateViews.resolveForFinalize(parameters.lineageId) : undefined;
 				if (validationAttempt && candidateView && parameters.lineageId) {
-					if (nativeReviewCli.targetStatus !== undefined) {
-						if (input.validation === undefined) {
-							candidateViews.cleanup(candidateView.token);
-							negotiatedStatus ??= await nativeReviewCli.targetStatus({ cwd: defaultCwd, lineageId: parameters.lineageId, ...(signal === undefined ? {} : { signal }) });
-							return mapNativeTargetStatus(parameters.operation, negotiatedStatus, parameters.lineageId);
-						}
-						if (input.validation_proof !== undefined) throw new Error("Negotiated FINALIZE requires the native targeted validation document");
-					} else {
-						const request = deriveNativeValidationRequest({ lineageId: parameters.lineageId, candidateTree: candidateView.candidateTree, state: authoritativeState ?? JSON.parse(readFileSync(join(resolveRepositoryAuthorityV1(defaultCwd).common_directory, "gentle-ai", "review-transactions", "v2", parameters.lineageId, "review-state.json"), "utf8")).state });
-						if (input.validation === undefined) {
-							candidateViews.cleanup(candidateView.token);
-							return { operation: parameters.operation, status: "blocked", outcome: "validation-required", lineage_created: false, mutation_performed: false, mutation_outcome: "none", validation_request: request };
-						}
-						if (input.validation_proof !== undefined || input.validation.request_hash !== request.request_hash || canonicalJsonV1(input.validation.correction_ids) !== canonicalJsonV1(request.fix_finding_ids)) throw new Error("Native FINALIZE validation must exactly match the controller-derived request");
+					if (input.validation === undefined) {
+						candidateViews.cleanup(candidateView.token);
+						negotiatedStatus ??= await nativeReviewCli.targetStatus({ cwd: defaultCwd, lineageId: parameters.lineageId, ...(signal === undefined ? {} : { signal }) });
+						return mapNativeTargetStatus(parameters.operation, negotiatedStatus, parameters.lineageId);
 					}
+					if (input.validation_proof !== undefined) throw new Error("Negotiated FINALIZE requires the native targeted validation document");
 				}
 				if (input.review_result !== undefined) {
 					if (parameters.lineageId === undefined) throw new CandidateViewError("Native FINALIZE requires an explicit lineage for refuter derivation");
@@ -5468,19 +4850,7 @@ async function executeReviewControllerOperation(
 				};
 			}
 		}
-		return {
-			operation: parameters.operation,
-			result: finalizeCompactReview({
-				cwd: defaultCwd,
-				...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
-				...(raw.review_result === undefined ? {} : { review_result: raw.review_result as never }),
-				...(raw.correction_line_forecast === undefined ? {} : { correction_line_forecast: Number(raw.correction_line_forecast) }),
-				...(raw.validation_proof === undefined ? {} : { validation_proof: raw.validation_proof as never }),
-				...(raw.validation === undefined ? {} : { validation: raw.validation as never }),
-				...(raw.final_evidence === undefined ? {} : { final_evidence: raw.final_evidence }),
-				...(raw.final_verification_passed === undefined ? {} : { final_verification_passed: raw.final_verification_passed }),
-			}),
-		};
+		return nativeStatusUnsupported(parameters.operation);
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.ADVANCE) {
 		const idempotencyKey = requiredControllerString(parameters, "idempotencyKey");
@@ -5499,42 +4869,15 @@ async function executeReviewControllerOperation(
 				: readRepositoryControllerInput(requiredControllerString(parameters, "inputPath"), defaultCwd),
 			REVIEW_CONTROLLER_OPERATION.ADVANCE,
 		);
-		if (compactV2LineageExists(defaultCwd, parameters.lineageId!)) {
-			throw new Error("Compact-v2 ordinary reviews mutate only through review finalize");
-		}
 		const store = ReviewTransactionStore.forRepository(defaultCwd);
 		if (store.read(parameters.lineageId!).mode === REVIEW_MODE.ORDINARY) {
 			throw new Error(GRAPH_V1_ORDINARY_READ_ONLY);
-		}
-		let input = rawInput as unknown as ReviewReducerInput;
-		if (transitionValue === REVIEW_TRANSITION.ORDINARY_FIX) {
-			if (typeof rawInput.candidateTree !== "string" || !Array.isArray(rawInput.fixedIds) || rawInput.fixedIds.some((id) => typeof id !== "string")) {
-				throw new Error("Git-derived correction evidence requires candidateTree and fixedIds");
-			}
-			try {
-				const state = store.read(parameters.lineageId);
-				const correction = captureOrdinaryCorrectionSnapshot({
-					mode: state.mode,
-					genesis_paths: state.genesis_paths,
-					repository_root: defaultCwd,
-					initial_review_tree: state.initial_review_tree,
-					object_store: state.snapshot_object_store!,
-				}, rawInput.candidateTree);
-				input = {
-					candidateTree: correction.candidate_tree,
-					fixedIds: rawInput.fixedIds,
-					fixDiff: correction.fix_diff,
-					changedPaths: correction.changed_paths,
-				};
-			} catch (error) {
-				throw new Error(`Git-derived correction evidence could not be captured: ${error instanceof Error ? error.message : String(error)}`);
-			}
 		}
 		const result = store.runReducerOperation({
 			lineageId: parameters.lineageId,
 			transition: transitionValue,
 			idempotencyKey,
-			input,
+			input: rawInput as unknown as ReviewReducerInput,
 		});
 		return {
 			operation: parameters.operation,
@@ -5555,28 +4898,7 @@ async function executeReviewControllerOperation(
 				return nativeOperationFailure(parameters.operation, error);
 			}
 		}
-		if (parameters.lineageId === undefined) return nativeStatusUnsupported(parameters.operation);
-		const compactExists = compactV2LineageExists(defaultCwd, parameters.lineageId!);
-		const graphExists = graphV1LineageExists(defaultCwd, parameters.lineageId!);
-		if (compactExists && graphExists) throw new Error("Review authority is ambiguous across graph-v1 and compact-v2");
-		if (compactExists) {
-			const discovered = discoverCompactReview(defaultCwd, parameters.lineageId);
-			const response: Record<string, unknown> = { operation: parameters.operation, state: discovered.record.state };
-			if (
-				discovered.record.state.state === "approved" ||
-				discovered.record.state.state === "escalated"
-			) response.receipt = discovered.store.loadTerminalReceipt().receipt;
-			return response;
-		}
-		const state = ReviewTransactionStore.forRepository(defaultCwd).read(parameters.lineageId);
-		const response: Record<string, unknown> = {
-			operation: parameters.operation,
-			state,
-		};
-		if (state.terminal_state !== undefined) {
-			response.receipt = ReviewTransactionStore.forRepository(defaultCwd).createAuthoritativeReceipt(parameters.lineageId);
-		}
-		return response;
+		return nativeStatusUnsupported(parameters.operation);
 	}
 	const idempotencyKey = requiredControllerString(parameters, "idempotencyKey");
 	const commandValue = requiredControllerString(parameters, "command");
@@ -5649,9 +4971,7 @@ async function executeReviewControllerOperation(
 	if (
 		nativeReviewCli !== null &&
 		typeof parameters.lineageId === "string" &&
-		(nativeReviewCli.targetStatus !== undefined
-			? !graphV1LineageExists(derived.command.cwd, parameters.lineageId)
-			: !compactV2LineageExists(derived.command.cwd, parameters.lineageId) && !graphV1LineageExists(derived.command.cwd, parameters.lineageId))
+		!isGraphV1JudgmentDayLineage(derived.command.cwd, parameters.lineageId)
 	) {
 		try {
 			const nativeDerived = await deriveNativePublicationTarget(
@@ -5723,69 +5043,7 @@ async function executeReviewControllerOperation(
 			return nativePublicationFailure(parameters.operation, error);
 		}
 	}
-	if (
-		parameters.changeName === undefined &&
-		(parameters.lineageId === undefined || !graphV1LineageExists(derived.command.cwd, parameters.lineageId)) &&
-		hasEligibleGraphV1RecoveryAuthorityV1(derived.command.cwd)
-	) {
-		throw new Error("Review controller validate requires changeName and a valid supersession for eligible graph-v1 recovery authority");
-	}
-	const recoveredAuthority = parameters.changeName === undefined
-		? undefined
-		: resolveReviewAuthorityForChange(derived.command.cwd, parameters.changeName);
-	if (
-		recoveredAuthority !== undefined &&
-		parameters.lineageId !== undefined &&
-		parameters.lineageId !== recoveredAuthority.record.state.lineage_id
-	) {
-		throw new Error("Review controller validate lineageId does not match the change-scoped recovered authority");
-	}
-	let compact = recoveredAuthority !== undefined;
-	if (!compact && typeof parameters.lineageId === "string" && parameters.lineageId.trim().length > 0) {
-		const compactExists = compactV2LineageExists(derived.command.cwd, parameters.lineageId);
-		const graphExists = graphV1LineageExists(derived.command.cwd, parameters.lineageId);
-		if (compactExists && graphExists) throw new Error("Review authority is ambiguous across graph-v1 and compact-v2");
-		compact = compactExists;
-	} else if (!compact) {
-		try {
-			discoverCompactReview(derived.command.cwd, undefined, true);
-			compact = true;
-		} catch (error) {
-			if (!(error instanceof Error) || !/No discoverable compact review lineage/.test(error.message)) throw error;
-		}
-	}
-	if (compact) {
-		const result = validateCompactReviewGate({
-			cwd: derived.command.cwd,
-			...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
-			...(parameters.changeName === undefined ? {} : { changeName: parameters.changeName }),
-			deriveTarget: () => {
-				const rederived = deriveReviewGateTarget(commandValue, defaultCwd);
-				if (rederived.command.cwd !== derived.command.cwd) throw new Error("Lifecycle command repository changed during compact validation");
-				return {
-					target: rederived.target,
-					...(rederived.actualIntendedCommitTree === undefined ? {} : { actualIntendedCommitTree: rederived.actualIntendedCommitTree }),
-				};
-			},
-		});
-		const response: Record<string, unknown> = {
-			operation: parameters.operation,
-			result,
-			derived_target: derived.target,
-		};
-		if (releaseFastPath !== undefined) response.release_fast_path = releaseFastPath;
-		if (result.status === GATE_RESULT.ALLOW) {
-			const commandHash = reviewAuthorizationKey(commandValue, derived.command.cwd);
-			const authorization: PendingReviewAuthorization = {
-				command_hash: commandHash,
-				target_hash: canonicalHash(derived.target),
-				receipt_hash: result.receipt_hash,
-			};
-			pendingAuthorizations.set(commandHash, authorization);
-			response.authorization = authorization;
-		}
-		return response;
-	}
+	if (nativeReviewCli !== null && nativeReviewCli.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
 	if (typeof parameters.lineageId !== "string" || parameters.lineageId.trim().length === 0) {
 		throw new Error("Review controller validate requires a lineageId for native receipt validation");
 	}
@@ -6040,22 +5298,6 @@ async function resolveControllerSddStatus(
 ) {
 	const base = resolveSddStatus({ cwd, changeName, includeInstructions, artifactStore });
 	if (!base.changeName || base.isNonAuthoritative) return base;
-	if (hasRecoveryObligationForChange(cwd, base.changeName)) {
-		return resolveSddStatus({
-			cwd,
-			changeName: base.changeName,
-			includeInstructions,
-			artifactStore,
-			reviewAuthority: {
-				expected: true,
-				resolve: () => {
-					const active = resolveReviewAuthorityForChange(cwd, base.changeName!);
-					if (!active) throw new Error("validated recovered review authority is missing");
-					return { activeAuthorityId: active.record.state.lineage_id };
-				},
-			},
-		});
-	}
 	if (base.applyState !== "all_done" || nativeReviewCli === null) return base;
 	try {
 		const native = await nativeReviewCli.sddStatus({ cwd, change: base.changeName, ...(signal === undefined ? {} : { signal }) });
@@ -6088,17 +5330,6 @@ async function resolveStartupControllerSddStatus(
 	return resolveControllerSddStatus(cwd, changeName, includeInstructions, artifactStore, nativeReviewCli, AbortSignal.timeout(timeoutMs));
 }
 
-function hasRecoveryObligationForChange(cwd: string, changeName: string): boolean {
-	try {
-		return SupersessionStoreV1.forRepository(cwd).hasRecoveryRequiredMarker(changeName) || hasEligibleGraphV1RecoveryAuthorityV1(cwd);
-	} catch (error) {
-		// A non-repository cannot have repository-anchored recovery authority.
-		if (error instanceof Error && error.message === "Unable to resolve Git repository authority") return false;
-		// An unreadable marker, store, or Git authority is recovery-required, never absent.
-		return true;
-	}
-}
-
 export interface GentleAiRuntimeDependencies {
 	nativeReviewCli?: NativeReviewCli | null;
 	candidateViews?: CandidateViewRegistry | null;
@@ -6123,11 +5354,11 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 		name: "gentle_review",
 		label: "Gentle Review Controller",
 		description:
-			"Inspect and recover review authority, run new native ordinary review through start/finalize/validate, preserve legacy compact compatibility reads and graph-v1 Judgment Day, and authorize one exact lifecycle command. FINALIZE input is a JSON string: review_result.lens_results[] entries contain lens, findings, and non-empty evidence exactly once for every lens selected by START; final_evidence and final_verification_passed are paired. This is the Pi wrapper contract, distinct from native CLI --result, --refuter, --validation, and --evidence files. RESET/RECOVER remain destructive and are executed by the audited native CLI: RESET and RECOVER_LOCK map to `gentle-ai review reclaim` and RECOVER maps to `gentle-ai review recover`; missing native inputs are requested through a native-input-required envelope, never invented. prepare-supersession/supersede require fresh interactive authorization and fail closed headlessly. Legacy bundle transport is retired: export/import return a legacy-operation-retired envelope pointing at the native gentle-ai review CLI and the Git common-directory store.",
+			"Inspect and recover review authority, run new native ordinary review through start/finalize/validate, preserve legacy compact compatibility reads and graph-v1 Judgment Day, and authorize one exact lifecycle command. FINALIZE input is a JSON string: review_result.lens_results[] entries contain lens, findings, and non-empty evidence exactly once for every lens selected by START; final_evidence and final_verification_passed are paired. This is the Pi wrapper contract, distinct from native CLI --result, --refuter, --validation, and --evidence files. RESET/RECOVER remain destructive and are executed by the audited native CLI: RESET and RECOVER_LOCK map to `gentle-ai review reclaim` and RECOVER maps to `gentle-ai review recover`; missing native inputs are requested through a native-input-required envelope, never invented. RECONCILE_AUTHORITY maps only to native `gentle-ai review reconcile-authority`, requires fresh UI approval bound to exact predecessor and successor revisions, and fails closed headlessly. Legacy bundle transport is retired: export/import return a legacy-operation-retired envelope pointing at the native gentle-ai review CLI and the Git common-directory store.",
 		promptSnippet: "Inspect authority, then use native start/finalize/validate for a new ordinary review; use graph-v1 only for explicit Judgment Day",
 		promptGuidelines: [
 			'Call {"operation":"inspect"} before START. New native ordinary START uses a JSON string such as "{\\"mode\\":\\"ordinary\\"}"; an explicit baseRef must be paired with committedOnly: true to request a committed range, while policyPath remains repository-local. policyHash is legacy compact-only. The controller derives lineage, Git/untracked scope, tier, lenses, authored lines, and budget.',
-			"For non-destructive legacy recovery, call prepare-supersession with one exact change, source, successor, operation, and prepared evidence input. Call supersede only with the returned request hash and exact English challenge after fresh UI approval; it never falls back to RESET or RECOVER. Headless, stale, conflicting, malformed, or unsupported recovery remains resolve-review blocked; exact retries are idempotent, but semantic retries require a new operation.",
+			"Use RECONCILE_AUTHORITY only to quarantine one invalid native recovery successor. Supply exact predecessorLineage, expectedPredecessorRevision, successorLineage, expectedSuccessorRevision, actor, and reason values; Pi derives and displays the seven-line native authorization binding for fresh UI approval. The predecessor stays untouched, native returns the durable audit record, and Pi never falls back to RESET or RECOVER.",
 			"Run selected lenses once, then call FINALIZE with a JSON string containing review_result.lens_results entries for every START-selected lens. Each entry has lens, findings, and non-empty evidence; clean lenses use findings: []. Pair final_evidence with final_verification_passed. This Pi wrapper shape differs from native CLI --result, --refuter, --validation, and --evidence files. FINALIZE alone records correction forecast, Git-derived correction evidence, targeted validation, and final evidence. Use ADVANCE only for explicit graph-v1 Judgment Day.",
 			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization for the exact reset_request challenge, then call RESET or RECOVER only after authorization. RESET and RECOVER_LOCK route to audited native `gentle-ai review reclaim` and RECOVER routes to native `gentle-ai review recover`; supply the exact native inputs (lineage/actor/reason, or the predecessor, revision, successor, disposition, actor, and reason bindings) and treat a native-input-required envelope as a request for those values, never as permission to invent them. After a committed native recovery record, INSPECT before any fresh ordinary START.",
 			"A reported lineage_created false or pre-authority validation error proves no lineage was created. After ambiguous START or FINALIZE output, the controller calls target-scoped native status first and returns only its declared action. Never infer or prescribe replay unless native explicitly reports exact_replay_safe for the same canonical request and required lineage.",

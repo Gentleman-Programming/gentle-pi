@@ -31,6 +31,7 @@ export const NATIVE_REVIEW_OPERATION = {
 	STATUS: "review/status",
 	RECLAIM: "review/reclaim",
 	RECOVER: "review/recover",
+	RECONCILE_AUTHORITY: "review/reconcile-authority",
 } as const;
 export type NativeReviewOperation = (typeof NATIVE_REVIEW_OPERATION)[keyof typeof NATIVE_REVIEW_OPERATION];
 
@@ -95,6 +96,7 @@ export interface NativeReviewCli {
 	targetStatus?(request: NativeTargetStatusRequest): Promise<ReviewStatusV1>;
 	reclaim?(request: NativeReviewReclaimRequest): Promise<NativeReviewRecoveryResult>;
 	recover?(request: NativeReviewRecoverRequest): Promise<NativeReviewRecoveryResult>;
+	reconcileAuthority?(request: NativeReviewReconcileAuthorityRequest): Promise<NativeReviewRecoveryResult>;
 }
 
 export const NATIVE_REVIEW_RECOVER_DISPOSITION = ["scope_changed", "invalidated", "escalated"] as const;
@@ -117,6 +119,18 @@ export interface NativeReviewRecoverRequest {
 	actor: string;
 	reason: string;
 	maintainerAuthorization?: string;
+	signal?: AbortSignal;
+}
+
+export interface NativeReviewReconcileAuthorityRequest {
+	cwd: string;
+	predecessorLineage: string;
+	expectedPredecessorRevision: string;
+	successorLineage: string;
+	expectedSuccessorRevision: string;
+	actor: string;
+	reason: string;
+	maintainerAuthorization: string;
 	signal?: AbortSignal;
 }
 
@@ -278,11 +292,11 @@ const NATIVE_SDD_NEXT_ACTION = ["apply", "verify", "remediate", "archive", "revi
 const NATIVE_SDD_POST_REVIEW_ACTION = ["verify", "archive"] as const;
 
 export const NATIVE_CLI_CONTRACTS = Object.freeze({
-	"2.1.4": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: false, inventory: false, reclaim: false, recover: false }),
-	"2.1.5": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false }),
-	"2.1.6": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false }),
-	"2.1.7": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false }),
-	"2.1.8": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true }),
+	"2.1.4": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: false, inventory: false, reclaim: false, recover: false, reconcileAuthority: false }),
+	"2.1.5": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, reconcileAuthority: false }),
+	"2.1.6": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, reconcileAuthority: false }),
+	"2.1.7": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, reconcileAuthority: false }),
+	"2.1.8": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, reconcileAuthority: true }),
 });
 type NativeCliCapability = keyof (typeof NATIVE_CLI_CONTRACTS)[keyof typeof NATIVE_CLI_CONTRACTS];
 
@@ -313,7 +327,8 @@ export class NativeReviewCliError extends Error {
 	readonly mutationOutcome: "none" | "unknown";
 	readonly nextAction?: "review.status";
 	readonly diagnostics: NativeReviewProcessDiagnostics;
-	constructor(code: NativeReviewErrorCode, operation: NativeReviewOperation, launchAttempted: boolean, mutating: boolean, message: string, diagnostics?: NativeReviewProcessDiagnostics) {
+	readonly auditRecord?: Record<string, unknown>;
+	constructor(code: NativeReviewErrorCode, operation: NativeReviewOperation, launchAttempted: boolean, mutating: boolean, message: string, diagnostics?: NativeReviewProcessDiagnostics, auditRecord?: Record<string, unknown>) {
 		super(message);
 		this.name = "NativeReviewCliError";
 		this.code = code;
@@ -323,6 +338,7 @@ export class NativeReviewCliError extends Error {
 		this.mutationOutcome = launchAttempted && mutating ? "unknown" : "none";
 		this.nextAction = this.mutationOutcome === "unknown" ? "review.status" : undefined;
 		this.diagnostics = diagnostics ?? { operation, error_code: code, timed_out: false, output_limit_exceeded: false };
+		this.auditRecord = auditRecord;
 	}
 }
 
@@ -663,8 +679,8 @@ function hasValidLensesRequired(action: NativeStartAction, state: string, riskLe
 	return !lensesRequired;
 }
 
-function nativeError(code: NativeReviewErrorCode, operation: NativeReviewOperation, mutating: boolean, message: string, result?: ExecFileResult, launchAttempted = true): NativeReviewCliError {
-	return new NativeReviewCliError(code, operation, launchAttempted, mutating, message, nativeProcessDiagnostics(operation, code, result));
+function nativeError(code: NativeReviewErrorCode, operation: NativeReviewOperation, mutating: boolean, message: string, result?: ExecFileResult, launchAttempted = true, auditRecord?: Record<string, unknown>): NativeReviewCliError {
+	return new NativeReviewCliError(code, operation, launchAttempted, mutating, message, nativeProcessDiagnostics(operation, code, result), auditRecord);
 }
 
 interface NativeJsonExecution {
@@ -714,9 +730,10 @@ export class NativeReviewCliV214 {
 		if (result.outputLimitExceeded) throw nativeError(NATIVE_REVIEW_ERROR_CODE.OUTPUT_LIMIT, operation, mutating, "native process output exceeded limit", result);
 		if (result.signal) throw nativeError(NATIVE_REVIEW_ERROR_CODE.SIGNAL, operation, mutating, "native process was signalled", result);
 		const structuredValidateDenial = operation === NATIVE_REVIEW_OPERATION.VALIDATE && result.exitCode === 1;
-		if (result.exitCode !== 0 && !structuredValidateDenial) throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, operation, mutating, "native process failed", result);
-		if (result.stderr.trim().length > 0 && !structuredValidateDenial) throw nativeError(NATIVE_REVIEW_ERROR_CODE.UNEXPECTED_STDERR, operation, mutating, "native process wrote stderr", result);
-		return { body: parseJson(result.stdout, operation, mutating, diagnostics), exitCode: result.exitCode };
+		const reconcilePartialFailure = operation === NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY && result.exitCode !== 0;
+		if (result.exitCode !== 0 && !structuredValidateDenial && !reconcilePartialFailure) throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, operation, mutating, "native process failed", result);
+		if (result.stderr.trim().length > 0 && !structuredValidateDenial && !reconcilePartialFailure) throw nativeError(NATIVE_REVIEW_ERROR_CODE.UNEXPECTED_STDERR, operation, mutating, "native process wrote stderr", result);
+		return { body: parseJson(result.stdout, operation, mutating, diagnostics), exitCode: result.exitCode, process: result };
 	}
 
 	private async verifyVersion(cwd: string, signal: AbortSignal | undefined, capabilities: readonly NativeCliCapability[]): Promise<void> {
@@ -937,6 +954,50 @@ export class NativeReviewCliV214 {
 		], true, request.signal);
 		return { record: body };
 	}
+
+	async reconcileAuthority(request: NativeReviewReconcileAuthorityRequest): Promise<NativeReviewRecoveryResult> {
+		for (const [name, value] of [
+			["predecessorLineage", request.predecessorLineage],
+			["expectedPredecessorRevision", request.expectedPredecessorRevision],
+			["successorLineage", request.successorLineage],
+			["expectedSuccessorRevision", request.expectedSuccessorRevision],
+			["actor", request.actor],
+			["reason", request.reason],
+		] as const) {
+			if (!isCanonicalProcessString(value)) throw new TypeError(`Native RECONCILE_AUTHORITY ${name} must be a non-empty, trimmed, NUL-free string`);
+		}
+		const expectedAuthorization = nativeReviewReconcileAuthorization(request);
+		if (request.maintainerAuthorization !== expectedAuthorization) {
+			throw new TypeError("Native RECONCILE_AUTHORITY maintainerAuthorization must match the exact target and revision binding");
+		}
+		await this.verifyVersion(request.cwd, request.signal, ["reconcileAuthority"]);
+		const execution = await this.execute(NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY, request.cwd, [
+			"review", "reconcile-authority", "--cwd", request.cwd,
+			"--predecessor-lineage", request.predecessorLineage,
+			"--expected-predecessor-revision", request.expectedPredecessorRevision,
+			"--successor-lineage", request.successorLineage,
+			"--expected-successor-revision", request.expectedSuccessorRevision,
+			"--actor", request.actor,
+			"--reason", request.reason,
+			"--maintainer-authorization", request.maintainerAuthorization,
+		], true, request.signal);
+		if (execution.exitCode !== 0) {
+			throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY, true, "native authority reconciliation partially failed", execution.process, true, execution.body);
+		}
+		return { record: execution.body };
+	}
+}
+
+export function nativeReviewReconcileAuthorization(request: Pick<NativeReviewReconcileAuthorityRequest, "predecessorLineage" | "expectedPredecessorRevision" | "successorLineage" | "expectedSuccessorRevision" | "actor" | "reason">): string {
+	return [
+		"gentle-ai.review-reconcile-authorization/v1",
+		`predecessor_lineage=${request.predecessorLineage}`,
+		`predecessor_revision=${request.expectedPredecessorRevision}`,
+		`successor_lineage=${request.successorLineage}`,
+		`successor_revision=${request.expectedSuccessorRevision}`,
+		`actor=${request.actor}`,
+		`reason=${request.reason}`,
+	].join("\n");
 }
 
 export class NativeReviewIntegrationError extends Error {
@@ -1242,6 +1303,10 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 
 	recover(request: NativeReviewRecoverRequest): Promise<NativeReviewRecoveryResult> {
 		return this.legacy.recover(request);
+	}
+
+	reconcileAuthority(request: NativeReviewReconcileAuthorityRequest): Promise<NativeReviewRecoveryResult> {
+		return this.legacy.reconcileAuthority(request);
 	}
 }
 

@@ -4,9 +4,7 @@ import {
 	chmodSync,
 	mkdtempSync,
 	mkdirSync,
-	readFileSync,
 	rmSync,
-	statSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,11 +12,14 @@ import { join } from "node:path";
 import test from "node:test";
 import { REVIEW_PROJECTION } from "../lib/review-snapshot.ts";
 import {
-	EVIDENCE_CLASS,
 	GATE_RESULT,
 	GATE_TARGET_KIND,
-	JOURNAL_STATUS,
 	PUSH_UPDATE_KIND,
+	resolveConfiguredPushDestinationV1,
+} from "../lib/review-publication-gate.ts";
+import {
+	EVIDENCE_CLASS,
+	JOURNAL_STATUS,
 	REVIEW_MODE,
 	REVIEW_OPERATION,
 	REVIEW_PHASE,
@@ -33,7 +34,6 @@ import {
 	createReceiptEnvelope,
 	createReviewState,
 	evaluateGateTarget,
-	resolveConfiguredPushDestinationV1,
 	type CanonicalFrozenRowV1,
 	type ReceiptBodyV1,
 	type ReviewBudgetV1,
@@ -43,7 +43,7 @@ import {
 	ordinaryValidatorRequest,
 	recordOrdinaryValidation,
 } from "../lib/review-policy-ordinary.ts";
-import { testSnapshot } from "./review-test-fixtures.ts";
+import { qualifiedReviewLockPlatform, testSnapshot } from "./review-test-fixtures.ts";
 
 const TREE = {
 	BASE: "1".repeat(40),
@@ -129,9 +129,16 @@ function receiptBody(): ReceiptBodyV1 {
 }
 
 function temporaryStore(t: test.TestContext): { root: string; store: ReviewTransactionStore } {
-	const root = mkdtempSync(join(tmpdir(), "gentle-pi-review-store-"));
-	t.after(() => rmSync(root, { recursive: true, force: true }));
-	return { root, store: new ReviewTransactionStore({ root }) };
+	const parent = mkdtempSync(join(tmpdir(), "gentle-pi-review-store-"));
+	const root = join(parent, "repo");
+	mkdirSync(root);
+	t.after(() => rmSync(parent, { recursive: true, force: true }));
+	const git = (...args: string[]): string => execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
+	git("init", "-b", "main");
+	writeFileSync(join(root, "fixture.ts"), "export const fixture = true;\n");
+	git("add", ".");
+	git("-c", "user.name=Review", "-c", "user.email=review@example.invalid", "commit", "-m", "fixture");
+	return { root, store: ReviewTransactionStore.forRepository(root, { mutationLockPlatform: qualifiedReviewLockPlatform() }) };
 }
 
 test("canonical frozen rows are ID-sorted and tampering invalidates their hash", () => {
@@ -210,7 +217,7 @@ test("journaled operation replay survives restart and rejects key reuse with a c
 	});
 	assert.equal(first.revision, 1);
 
-	const restarted = new ReviewTransactionStore({ root });
+	const restarted = ReviewTransactionStore.forRepository(root, { mutationLockPlatform: qualifiedReviewLockPlatform() });
 	const replay = restarted.runReducerOperation({
 		lineageId: "lineage-a",
 		transition: REVIEW_TRANSITION.ORDINARY_DISCOVERY,
@@ -233,7 +240,7 @@ test("journaled operation replay survives restart and rejects key reuse with a c
 	);
 });
 
-test("lineage start is journaled and exact replay is stable across restart", (t) => {
+test("lineage start is journaled and duplicate graph creation fails closed across restart", (t) => {
 	const { root, store } = temporaryStore(t);
 	const initialState = state();
 	const first = store.create(initialState, "start-a");
@@ -253,12 +260,12 @@ test("lineage start is journaled and exact replay is stable across restart", (t)
 		canonical_result: first,
 	});
 
-	const restarted = new ReviewTransactionStore({ root });
-	assert.deepEqual(restarted.create(initialState, "start-a"), first);
+	const restarted = ReviewTransactionStore.forRepository(root, { mutationLockPlatform: qualifiedReviewLockPlatform() });
+	assert.throws(() => restarted.create(initialState, "start-a"), /lineage already exists/i);
 	assert.equal(restarted.read("lineage-a").revision, 0);
 	assert.throws(
 		() => restarted.create({ ...initialState, evidence_hash: "c".repeat(64) }, "start-a"),
-		/idempotency key.*different request/i,
+		/lineage already exists/i,
 	);
 	assert.throws(
 		() => restarted.create(initialState, "another-start"),
@@ -277,7 +284,7 @@ test("pending reducer work is crash-completable and exact completion replay is s
 		request,
 		authorization: { actor: "review-risk" },
 	});
-	const restarted = new ReviewTransactionStore({ root });
+	const restarted = ReviewTransactionStore.forRepository(root, { mutationLockPlatform: qualifiedReviewLockPlatform() });
 	assert.equal(restarted.read("lineage-a").request_journal[1]!.status, JOURNAL_STATUS.PENDING);
 	assert.throws(
 		() =>
@@ -299,7 +306,7 @@ test("pending reducer work is crash-completable and exact completion replay is s
 	assert.equal(completed.revision, 2);
 	assert.equal(restarted.read("lineage-a").request_journal[1]!.status, JOURNAL_STATUS.COMPLETED);
 	assert.deepEqual(
-		new ReviewTransactionStore({ root }).completeReducerOperation({
+		ReviewTransactionStore.forRepository(root, { mutationLockPlatform: qualifiedReviewLockPlatform() }).completeReducerOperation({
 			lineageId: "lineage-a",
 			transition: REVIEW_TRANSITION.ORDINARY_DISCOVERY,
 			idempotencyKey: "discover-1",
@@ -310,26 +317,12 @@ test("pending reducer work is crash-completable and exact completion replay is s
 	);
 });
 
-test("lock and fsync-adjacent faults preserve the prior authoritative revision", (t) => {
+test("graph publication faults preserve the prior authoritative revision", (t) => {
 	const { root, store } = temporaryStore(t);
 	store.create(state(), "start-a");
-	mkdirSync(join(root, "locks"), { recursive: true });
-	writeFileSync(join(root, "locks", "lineage-a.lock"), "held");
-	assert.throws(
-		() =>
-			store.runReducerOperation({
-				lineageId: "lineage-a",
-				transition: REVIEW_TRANSITION.ORDINARY_DISCOVERY,
-				idempotencyKey: "verify-locked",
-				input: { rows: [] },
-			}),
-		/locked/i,
-	);
-	rmSync(join(root, "locks", "lineage-a.lock"));
-
 	let injected = false;
-	const faulty = new ReviewTransactionStore({
-		root,
+	const faulty = ReviewTransactionStore.forRepository(root, {
+		mutationLockPlatform: qualifiedReviewLockPlatform(),
 		faultInjector(point) {
 			if (!injected && point === "before-head-rename") {
 				injected = true;
@@ -347,24 +340,7 @@ test("lock and fsync-adjacent faults preserve the prior authoritative revision",
 			}),
 		/injected fsync-adjacent fault/,
 	);
-	assert.equal(new ReviewTransactionStore({ root }).read("lineage-a").revision, 0);
-});
-
-test("state and HEAD tampering fail closed", (t) => {
-	const { root, store } = temporaryStore(t);
-	store.create(state(), "start-a");
-	const revisionPath = join(root, "lineages", "lineage-a", "revisions", "0.json");
-	const revision = JSON.parse(readFileSync(revisionPath, "utf8")) as {
-		state: { evidence_hash: string };
-	};
-	revision.state.evidence_hash = "f".repeat(64);
-	writeFileSync(revisionPath, `${JSON.stringify(revision)}\n`);
-	assert.throws(() => store.read("lineage-a"), ReviewIntegrityError);
-
-	chmodSync(revisionPath, 0o600);
-	store.create(state("lineage-b"), "start-b");
-	writeFileSync(join(root, "lineages", "lineage-b", "HEAD"), "999\n");
-	assert.throws(() => store.read("lineage-b"), ReviewIntegrityError);
+	assert.equal(ReviewTransactionStore.forRepository(root, { mutationLockPlatform: qualifiedReviewLockPlatform() }).read("lineage-a").revision, 0);
 });
 
 test("store exposes only reducer-bound authority transitions", (t) => {

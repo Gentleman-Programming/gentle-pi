@@ -5,21 +5,20 @@ import test from "node:test";
 const README = readFileSync("README.md", "utf8");
 const CONTROLLER = readFileSync("extensions/gentle-ai.ts", "utf8");
 
-test("recovery guidance documents the non-destructive supersession contract", () => {
-	assert.match(README, /non-destructive.*supersession/i);
-	assert.match(README, /eligible.*immutable.*graph-v1/i);
-	assert.match(README, /prepare-supersession.*supersede/i);
-	assert.match(README, /exact retr(?:y|ies).*idempotent/i);
-	assert.match(README, /conflict.*fails closed/i);
+test("recovery guidance documents the narrow native reconciliation contract", () => {
+	assert.match(README, /reconcile-authority.*only Pi route/i);
+	assert.match(README, /predecessor lineage and revision.*successor lineage and revision/i);
+	assert.match(README, /exact seven-line.*fresh interactive approval/i);
+	assert.match(README, /quarantine only the bound invalid compact-v2 recovery successor/i);
+	assert.match(README, /predecessor stays untouched/i);
 	assert.match(README, /RESET.*RECOVER.*destructive/i);
-	assert.match(README, /append-only.*authority-supersession-v1/i);
-	assert.match(README, /rollback.*does not delete/i);
+	assert.match(README, /typed envelopes/i);
 	assert.match(README, /pre-commit.*pre-push.*pre-PR.*release/is);
 });
 
 test("controller help keeps authorization, blocked outcomes, and recovery boundaries explicit", () => {
-	assert.match(CONTROLLER, /prepare-supersession.*fresh UI approval.*never falls back to RESET or RECOVER/is);
+	assert.match(CONTROLLER, /reconcile-authority.*fresh UI approval.*exact predecessor and successor revisions/is);
 	assert.match(CONTROLLER, /headlessly|headless/i);
-	assert.match(CONTROLLER, /exact retr(?:y|ies)|semantic retr(?:y|ies)/i);
-	assert.match(CONTROLLER, /resolve-review/);
+	assert.match(CONTROLLER, /quarantine.*invalid recovery successor/i);
+	assert.match(CONTROLLER, /never.*RESET or RECOVER/is);
 });

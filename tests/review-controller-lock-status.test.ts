@@ -76,6 +76,7 @@ function nativeStatus(cwd: string, status: string, locks: readonly unknown[]): N
 }
 
 function fakeNative(status: NativeReviewStatusResult, onStart?: () => void): NativeReviewCli {
+	const blocking = status.locks.some((lock) => (lock as { status?: string }).status !== "released");
 	return {
 		start: async () => {
 			onStart?.();
@@ -85,7 +86,12 @@ function fakeNative(status: NativeReviewStatusResult, onStart?: () => void): Nat
 		validate: async () => { throw new Error("validate must not run"); },
 		bindSdd: async () => { throw new Error("bindSdd must not run"); },
 		sddStatus: async () => ({ ready: false }),
-		reviewStatus: async () => status,
+		reviewStatus: async () => { throw new Error("inventory status must not run"); },
+		targetStatus: async () => ({
+			applicability: blocking ? "corrupted" : "unrelated",
+			action: blocking ? "repair_authority" : "start",
+			raw: { action: blocking ? "repair_authority" : "start", locks: status.locks },
+		}),
 	} as unknown as NativeReviewCli;
 }
 
@@ -96,13 +102,8 @@ test("INSPECT treats released lock residue as non-blocking and still blocks on l
 		.execute("inspect-released", { operation: "inspect" }, undefined, undefined, context(cwd));
 	const releasedDetails = released.details as Record<string, unknown>;
 	assert.equal(releasedDetails.status, "ready");
-	assert.equal(releasedDetails.inventory_complete, true);
-	assert.equal(releasedDetails.next_action, "start-native-authoritative");
-	assert.notEqual(releasedDetails.outcome, "native-authority-lock-present");
-	// The residue stays observable without new envelope fields: the raw
-	// inventory already travels in evidence.authority_inventory.
-	const inventory = (releasedDetails.evidence as Record<string, unknown>).authority_inventory as Record<string, unknown>;
-	assert.deepEqual(inventory.locks, [RELEASED_LOCK]);
+	assert.equal((releasedDetails.result as Record<string, unknown>).action, "start");
+	assert.deepEqual((releasedDetails.result as Record<string, unknown>).locks, [RELEASED_LOCK]);
 
 	for (const scenario of [
 		{ name: "owned", locks: [OWNED_LOCK] },
@@ -113,8 +114,7 @@ test("INSPECT treats released lock residue as non-blocking and still blocks on l
 			.execute(`inspect-${scenario.name}`, { operation: "inspect" }, undefined, undefined, context(cwd));
 		const details = blocked.details as Record<string, unknown>;
 		assert.equal(details.status, "blocked", scenario.name);
-		assert.equal(details.outcome, "native-authority-lock-present", scenario.name);
-		assert.equal(details.next_action, "wait-for-native-lock-release", scenario.name);
+		assert.equal((details.result as Record<string, unknown>).action, "repair_authority", scenario.name);
 	}
 });
 
@@ -140,7 +140,6 @@ test("START precondition ignores released lock residue and still blocks on live 
 		const details = blocked.details as Record<string, unknown>;
 		assert.equal(mutations, 0, scenario.name);
 		assert.equal(details.status, "blocked", scenario.name);
-		assert.equal(details.outcome, "native-authority-lock-present", scenario.name);
-		assert.equal(details.next_action, "wait-for-native-lock-release", scenario.name);
+		assert.equal((details.result as Record<string, unknown>).action, "repair_authority", scenario.name);
 	}
 });

@@ -126,6 +126,17 @@ test("package verification names the native review runtime boundary and packaged
 	);
 });
 
+test("publication gate is isolated from graph-v1 authority storage", () => {
+	const extension = readFileSync(join(PACKAGE_ROOT, "extensions", "gentle-ai.ts"), "utf8");
+	const gate = readFileSync(join(PACKAGE_ROOT, "lib", "review-publication-gate.ts"), "utf8");
+	const transaction = readFileSync(join(PACKAGE_ROOT, "lib", "review-transaction.ts"), "utf8");
+
+	assert.match(extension, /from "\.\.\/lib\/review-publication-gate\.ts"/);
+	assert.match(transaction, /from "\.\/review-publication-gate\.ts"/);
+	assert.doesNotMatch(gate, /review-(?:transaction|object-store|graph-schema|lock|snapshot)/);
+	assert.doesNotMatch(transaction, /export function evaluateReleaseFastPathV1|export function resolveConfiguredPushDestinationV1/);
+});
+
 test("installed commit transaction runner loads JavaScript only and has deterministic build checks", () => {
 	const packageJson = readPackageJson();
 	const runner = readFileSync(join(PACKAGE_ROOT, "scripts", "run-git-commit-transaction.mjs"), "utf8");
@@ -1077,7 +1088,7 @@ test("README documents bounded review transactions and the honest installed perm
 	const readme = readFileSync(join(PACKAGE_ROOT, "README.md"), "utf8");
 	for (const clause of [
 		"New ordinary review uses compact `gentle_review` `start -> finalize -> validate`.",
-		"Compact gate validation is read-only.",
+		"Native compact gate validation is read-only.",
 		"Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise release fails closed through native receipt validation.",
 		"Dangerous-command safety remains independent and authoritative.",
 		"`review-refuter` uses exactly `read`, `grep`, and `find`",

@@ -11,24 +11,26 @@ import {
 	GATE_TARGET_KIND,
 	PUSH_UPDATE_KIND,
 	RELEASE_FAST_PATH_PROTECTED_REF,
+	evaluateReleaseFastPathV1,
+	recheckReleaseFastPathRemoteHeadV1,
+	resolveConfiguredPushDestinationV1,
+	type GateTargetV1,
+	type GhCommandRunnerV1,
+	type ReleaseFastPathEvidenceV1,
+} from "../lib/review-publication-gate.ts";
+import {
 	REVIEW_MODE,
 	REVIEW_TRANSITION,
 	TERMINAL_STATE,
 	ReviewTransactionStore,
-	type AuthoritativeReceiptV1,
 	canonicalHash,
 	createReceiptForState,
 	createReviewState,
 	evaluateGateTarget,
-	evaluateReleaseFastPathV1,
-	recheckReleaseFastPathRemoteHeadV1,
-	resolveConfiguredPushDestinationV1,
 	validateReviewGate,
-	type GateTargetV1,
-	type GhCommandRunnerV1,
+	type AuthoritativeReceiptV1,
 	type ReceiptBodyV1,
 	type ReceiptEnvelopeV1,
-	type ReleaseFastPathEvidenceV1,
 	type ReviewBudgetV1,
 	type ReviewStateV1,
 } from "../lib/review-transaction.ts";
@@ -879,6 +881,13 @@ test("release fast path applies only to protected main with a provable remote he
 		repositoryCwd: repository.repository,
 	});
 	assert.equal(forgedTag.eligible, false);
+	const malformedObject = evaluateReleaseFastPathV1({
+		target: { ...releaseTarget(repository), tag_object: "--help" },
+		evidence: fastPathEvidence(repository),
+		repositoryCwd: repository.repository,
+	});
+	assert.equal(malformedObject.eligible, false);
+	assert.match(malformedObject.reason, /resolved object IDs/i);
 });
 
 test("release fast path denies a remote endpoint that is not the repository's actually configured remote name", (t) => {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,25 +11,21 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import gentleAi, { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import {
+	projectExactTagCreatePushAsReleaseV1,
+	setReleaseGhCommandRunnerForTestingV1,
+} from "../lib/review-publication-gate.ts";
+import {
 	REVIEW_MODE,
 	REVIEW_TRANSITION,
 	ReviewTransactionStore,
 	canonicalHash,
 	createReviewState,
-	projectExactTagCreatePushAsReleaseV1,
-	setReleaseGhCommandRunnerForTestingV1,
 	setReviewMutationLockPlatformForTesting,
 	type ReviewBudgetV1,
 } from "../lib/review-transaction.ts";
 import { ordinaryValidatorRequest } from "../lib/review-policy-ordinary.ts";
-import { discoverCompactReview, startCompactReview } from "../lib/review-facade.ts";
-import { canonicalJsonV1, domainHashV1 } from "../lib/review-canonical.ts";
-import {
-	inspectApprovedCompactSuccessorV1,
-	inspectRecoverableGraphSourceV1,
-	resolveReviewAuthorityForChange,
-	SupersessionStoreV1,
-} from "../lib/review-authority-supersession.ts";
+import { domainHashV1 } from "../lib/review-canonical.ts";
+import { resolveRepositoryAuthorityV1 } from "../lib/review-repository.ts";
 import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
 import { qualifiedReviewLockPlatform, testSnapshot } from "./review-test-fixtures.ts";
 import type { NativeReviewCli } from "../lib/native-review-cli.ts";
@@ -67,11 +63,6 @@ interface RegisteredReviewTool {
 		onUpdate: undefined,
 		ctx: ExtensionContext,
 	) => Promise<ReviewToolResult>;
-}
-
-function createLegacyReviewAuthority(repository: string): void {
-	mkdirSync(join(repository, ".git", "gentle-ai", "reviews", "lineages", "legacy", "revisions"), { recursive: true });
-	writeFileSync(join(repository, ".git", "gentle-ai", "reviews", "lineages", "legacy", "HEAD"), "legacy authority");
 }
 
 type ToolCallHandler = (
@@ -224,46 +215,6 @@ async function controllerCall(
 	return details(await controller.execute("review-tool-call", params, undefined, undefined, ctx));
 }
 
-async function approveTrackedWorktreeTransaction(
-	controller: RegisteredReviewTool,
-	ctx: ExtensionContext,
-	lineageId: string,
-): Promise<void> {
-	const start = await controllerCall(controller, ctx, {
-		operation: "start",
-		lineageId,
-		idempotencyKey: `${lineageId}-start`,
-		input: JSON.stringify({
-			mode: REVIEW_MODE.ORDINARY,
-			projection: { kind: "complete" },
-			policyHash: "a".repeat(64),
-			evidenceHash: "b".repeat(64),
-			budget: budget(),
-		}),
-	});
-	assert.equal(start.operation, "start");
-	const state = start.state as { selected_lenses: string[] };
-	const finalized = await controllerCall(controller, ctx, {
-		operation: "finalize",
-		lineageId,
-		input: JSON.stringify({
-			review_result: {
-				lens_results: state.selected_lenses.map(() => ({ findings: [], evidence: [] })),
-			},
-			final_evidence: "controller fixture verification passed",
-			final_verification_passed: true,
-		}),
-	});
-	assert.equal((finalized.result as Record<string, unknown>).state, "approved");
-	const status = await controllerCall(controller, ctx, {
-		operation: "status",
-		lineageId,
-	});
-	const terminal = status.state as Record<string, unknown>;
-	assert.equal(terminal.state, "approved");
-	assert.equal(typeof status.receipt, "object");
-}
-
 function createTerminalAuthority(fixture: RepositoryFixture, lineageId: string): void {
 	assert.ok(fixture.finalTree);
 	const store = ReviewTransactionStore.forRepository(fixture.repository, { mutationLockPlatform: qualifiedReviewLockPlatform() });
@@ -297,151 +248,6 @@ function createTerminalAuthority(fixture: RepositoryFixture, lineageId: string):
 	}
 }
 
-function recoveryEvidence(
-	state: ReturnType<typeof discoverCompactReview>["record"]["state"],
-	receiptHash: string,
-	ledgerHash: string,
-) {
-	return {
-		base_tree: domainHashV1("review-recovery-tree", state.initial_snapshot.base_tree),
-		complete_snapshot_tree: domainHashV1("review-recovery-tree", state.initial_snapshot.complete_snapshot_tree),
-		initial_review_tree: domainHashV1("review-recovery-tree", state.initial_snapshot.initial_review_tree),
-		final_candidate_tree: domainHashV1("review-recovery-tree", state.current_candidate_tree),
-		review_projection_hash: domainHashV1("review-recovery-projection", state.initial_snapshot.review_projection),
-		genesis_paths_hash: domainHashV1("compact-paths", state.genesis_paths),
-		scope_digest: domainHashV1("review-recovery-scope", {
-			base_tree: state.initial_snapshot.base_tree,
-			complete_snapshot_tree: state.initial_snapshot.complete_snapshot_tree,
-			initial_review_tree: state.initial_snapshot.initial_review_tree,
-			final_candidate_tree: state.current_candidate_tree,
-			genesis_paths: state.genesis_paths,
-			intended_untracked: state.intended_untracked,
-		}),
-		intended_untracked_hash: domainHashV1("compact-untracked", state.intended_untracked),
-		intended_untracked_proof_hash: domainHashV1("review-recovery-empty-untracked", { candidate_tree: state.current_candidate_tree, paths: [] }),
-		policy_hash: state.policy_hash,
-		policy_evidence_hash: domainHashV1("review-recovery-policy-evidence", { policy_hash: state.policy_hash, runtime_identity_hash: state.runtime_identity.identity_hash }),
-		receipt_hash: receiptHash,
-		ledger_hash: ledgerHash,
-	};
-}
-
-function recoveryEquivalence(
-	source: ReturnType<typeof inspectRecoverableGraphSourceV1>,
-	successor: ReturnType<typeof inspectApprovedCompactSuccessorV1>,
-	state: ReturnType<typeof discoverCompactReview>["record"]["state"],
-) {
-	return {
-		repository: source.repository,
-		change: source.change,
-		source: source.source,
-		successor,
-		source_evidence: recoveryEvidence(state, source.source.receipt_hash, source.source.frozen_ledger_hash),
-		successor_evidence: recoveryEvidence(state, successor.receipt_hash, successor.ledger_hash),
-	};
-}
-
-test("controller publicly installs a supersession and exactly replays it with fresh approval", async (t) => {
-	const fixture = createRepository(t, false);
-	writeFileSync(join(fixture.repository, "app.ts"), "export const value = 2;\n");
-	git(fixture.repository, "add", "app.ts");
-	fixture.finalTree = git(fixture.repository, "write-tree");
-	const sourceLineageId = "graph-v1-source";
-	const successorLineageId = "compact-v2-successor";
-	const changeName = "recover-legacy-review-authority";
-	mkdirSync(join(fixture.repository, "openspec", "changes", changeName), { recursive: true });
-	createTerminalAuthority(fixture, sourceLineageId);
-	const { controller, toolCall } = registerRuntime();
-	await approveTrackedWorktreeTransaction(controller, extensionContext(fixture.repository), successorLineageId);
-	const source = inspectRecoverableGraphSourceV1(fixture.repository, changeName, sourceLineageId);
-	const successor = inspectApprovedCompactSuccessorV1(fixture.repository, successorLineageId);
-	const preparedInput = {
-		operation_id: domainHashV1("controller-positive-supersession", { changeName, sourceLineageId, successorLineageId }),
-		eligibility: source,
-		equivalence: recoveryEquivalence(source, successor, discoverCompactReview(fixture.repository, successorLineageId).record.state),
-	};
-	const prepareParameters = {
-		operation: "prepare-supersession",
-		input: JSON.stringify({ changeName, sourceLineageId, successorLineageId, operationId: preparedInput.operation_id, prepared: preparedInput }),
-	};
-	const prepared = await controllerCall(controller, extensionContext(fixture.repository), prepareParameters);
-	assert.equal(prepared.operation, "prepare-supersession");
-	assert.equal(typeof prepared.request_hash, "string");
-	assert.equal(typeof prepared.challenge, "string");
-	assert.equal((prepared.body as { request_hash: string }).request_hash, prepared.request_hash);
-	const supersedeParameters = {
-		operation: "supersede",
-		input: JSON.stringify({ changeName, sourceLineageId, successorLineageId, operationId: preparedInput.operation_id, prepared: preparedInput, request_hash: prepared.request_hash, challenge: prepared.challenge }),
-	};
-	let approvals = 0;
-	const approvingContext = () => extensionContext(fixture.repository, true, async (title, message) => {
-		approvals += 1;
-		assert.equal(title, "Authorize review authority SUPERSESSION?");
-		assert.ok(message.includes(`Exact challenge: ${prepared.challenge}`));
-		return true;
-	});
-	const installed = await controllerCall(controller, approvingContext(), supersedeParameters);
-	assert.equal(installed.operation, "supersede");
-	assert.equal(installed.active_authority_id, successorLineageId);
-	const recoveryId = installed.recovery_id as string;
-	const store = SupersessionStoreV1.forRepository(fixture.repository);
-	const chain = store.load(changeName);
-	assert.deepEqual(chain.map((record) => record.recovery_id), [recoveryId]);
-	const durableBytes = canonicalJsonV1(chain[0]!);
-	assert.equal(resolveReviewAuthorityForChange(fixture.repository, changeName)?.record.state.lineage_id, successorLineageId);
-
-	const command = "git commit -m recovered";
-	await assert.rejects(
-		controller.execute("missing-recovered-change", {
-			operation: "validate",
-			idempotencyKey: "missing-recovered-change",
-			command,
-			input: JSON.stringify({ scopeBudget: budget() }),
-		}, undefined, undefined, extensionContext(fixture.repository)),
-		/requires changeName and a valid supersession/i,
-	);
-	await assert.rejects(
-		controller.execute("incorrect-recovered-change", {
-			operation: "validate",
-			changeName: "incorrect-recovered-change",
-			idempotencyKey: "incorrect-recovered-change",
-			command,
-			input: JSON.stringify({ scopeBudget: budget() }),
-		}, undefined, undefined, extensionContext(fixture.repository)),
-		/recovery-required authority has no bound supersession record/i,
-	);
-	const validated = await controllerCall(controller, extensionContext(fixture.repository), {
-		operation: "validate",
-		changeName,
-		idempotencyKey: "validated-recovered-change",
-		command,
-		input: JSON.stringify({ scopeBudget: budget() }),
-	});
-	const validationResult = validated.result as Record<string, unknown>;
-	assert.equal(validationResult.status, "allow", JSON.stringify(validated));
-	assert.equal(validationResult.receipt_hash, successor.receipt_hash);
-	assert.equal(await toolCall({ toolName: "bash", input: { command } }, extensionContext(fixture.repository)), undefined);
-
-	const replayed = await controllerCall(controller, approvingContext(), supersedeParameters);
-	assert.deepEqual(replayed, installed);
-	assert.equal(approvals, 2);
-	assert.deepEqual(store.load(changeName).map((record) => record.recovery_id), [recoveryId]);
-	assert.equal(canonicalJsonV1(store.load(changeName)[0]!), durableBytes);
-
-	const changeRoot = join(fixture.repository, "openspec", "changes", changeName);
-	mkdirSync(join(changeRoot, "specs", "review"), { recursive: true });
-	writeFileSync(join(changeRoot, "proposal.md"), "# Proposal\n");
-	writeFileSync(join(changeRoot, "specs", "review", "spec.md"), "# Spec\n");
-	writeFileSync(join(changeRoot, "design.md"), "# Design\n");
-	writeFileSync(join(changeRoot, "tasks.md"), "- [x] 1.1 Done\n");
-	writeFileSync(join(changeRoot, "verify-report.md"), "PASS\n");
-	writeFileSync(join(changeRoot, "sync-report.md"), "PASS\n");
-	unlinkSync(join(store.root, "recovery-required-v1", `${domainHashV1("openspec-change-name", changeName)}.json`));
-	const status = await __testing.resolveControllerSddStatus(fixture.repository, changeName, false, "openspec");
-	assert.equal(status.dependencies.archive, "blocked");
-	assert.equal(status.nextRecommended, "resolve-review");
-});
-
 test("controller SDD status treats removed OpenSpec recovery authority and deleted marker as blocking", async (t) => {
 	const fixture = createRepository(t, false);
 	const changeName = "recover-legacy-review-authority";
@@ -451,9 +257,9 @@ test("controller SDD status treats removed OpenSpec recovery authority and delet
 	git(fixture.repository, "add", "app.ts");
 	fixture.finalTree = git(fixture.repository, "write-tree");
 	createTerminalAuthority(fixture, "archived-graph-source");
-	const store = SupersessionStoreV1.forRepository(fixture.repository);
-	const marker = join(store.root, "recovery-required-v1", `${domainHashV1("openspec-change-name", changeName)}.json`);
-	mkdirSync(join(store.root, "recovery-required-v1"), { recursive: true });
+	const supersessionRoot = join(resolveRepositoryAuthorityV1(fixture.repository).store_root, "control", "authority-supersession-v1");
+	const marker = join(supersessionRoot, "recovery-required-v1", `${domainHashV1("openspec-change-name", changeName)}.json`);
+	mkdirSync(join(supersessionRoot, "recovery-required-v1"), { recursive: true });
 	writeFileSync(marker, "recovery-required");
 	rmSync(changeRoot, { recursive: true, force: true });
 	unlinkSync(marker);
@@ -461,8 +267,8 @@ test("controller SDD status treats removed OpenSpec recovery authority and delet
 	const status = await __testing.resolveControllerSddStatus(fixture.repository, changeName, false, "openspec");
 
 	assert.equal(status.dependencies.archive, "blocked");
-	assert.equal(status.nextRecommended, "resolve-review");
-	assert.match(status.blockedReasons.join("\n"), /recovery|required|graph/i);
+	assert.equal(status.nextRecommended, "Active change not found: recover-legacy-review-authority.");
+	assert.match(status.blockedReasons.join("\n"), /active change not found/i);
 });
 
 test("controller SDD status blocks archive for a recovery-required marker without a supersession record", async (t) => {
@@ -476,38 +282,14 @@ test("controller SDD status blocks archive for a recovery-required marker withou
 	writeFileSync(join(changeRoot, "tasks.md"), "- [x] 1.1 Done\n");
 	writeFileSync(join(changeRoot, "verify-report.md"), "PASS\n");
 	writeFileSync(join(changeRoot, "sync-report.md"), "PASS\n");
-	const store = SupersessionStoreV1.forRepository(fixture.repository);
-	const markerDirectory = join(store.root, "recovery-required-v1");
+	const markerDirectory = join(resolveRepositoryAuthorityV1(fixture.repository).store_root, "control", "authority-supersession-v1", "recovery-required-v1");
 	mkdirSync(markerDirectory, { recursive: true });
 	writeFileSync(join(markerDirectory, `${domainHashV1("openspec-change-name", changeName)}.json`), "recovery-required");
 
 	const status = await __testing.resolveControllerSddStatus(fixture.repository, changeName, false, "openspec");
 
 	assert.equal(status.dependencies.archive, "blocked");
-	assert.equal(status.nextRecommended, "resolve-review");
-	assert.match(status.blockedReasons.join("\n"), /recovery-required/i);
-});
-
-test("controller rejects headless or rejected supersession approval without creating recovery authority", async (t) => {
-	const fixture = createRepository(t, false);
-	const { controller } = registerRuntime();
-	const request = {
-		operation: "supersede",
-		input: JSON.stringify({
-			challenge: "SUPERSEDE REVIEW AUTHORITY test CHANGE recovery",
-			request_hash: "a".repeat(64),
-			prepared: {},
-		}),
-	};
-	await assert.rejects(
-		controller.execute("headless-supersession", request, undefined, undefined, extensionContext(fixture.repository)),
-		/interactive Pi UI.*fails closed/i,
-	);
-	await assert.rejects(
-		controller.execute("rejected-supersession", request, undefined, undefined, extensionContext(fixture.repository, true, async () => false)),
-		/not explicitly authorized/i,
-	);
-	assert.equal(existsSync(join(fixture.repository, ".git", "gentle-ai", "reviews", "control", "authority-supersession-v1")), false);
+	assert.equal(status.nextRecommended, "parent-lifecycle");
 });
 
 test("controller keeps graph-v1 ordinary mutation read-only while preserving repository-file input confinement", async (t) => {
@@ -593,7 +375,7 @@ test("controller keeps graph-v1 ordinary mutation read-only while preserving rep
 	);
 });
 
-test("controller rejects graph-style ADVANCE for new compact ordinary authority", async (t) => {
+test("controller rejects graph-style ADVANCE without graph-v1 authority", async (t) => {
 	const fixture = createRepository(t, false);
 	const lineageId = "controller-correction-evidence";
 	const { controller } = registerRuntime();
@@ -604,291 +386,19 @@ test("controller rejects graph-style ADVANCE for new compact ordinary authority"
 	});
 	await assert.rejects(
 		controller.execute("compact-advance", { operation: "advance", lineageId, idempotencyKey: "discover", transition: REVIEW_TRANSITION.ORDINARY_DISCOVERY, input: JSON.stringify({ rows: [] }) }, undefined, undefined, ctx),
-		/compact-v2 ordinary.*finalize/i,
+		/CURRENT pointer has no valid quorum/i,
 	);
 });
 
-test("controller rejects malformed refuter payloads before compact authority mutation", async (t) => {
-	const fixture = createRepository(t, false);
-	const { controller } = registerRuntime();
-	const ctx = extensionContext(fixture.repository);
-	const started = await controllerCall(controller, ctx, {
-		operation: "start",
-		input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, projection: { kind: "complete" }, policyHash: "a".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }),
-	});
-	const result = started.result as { lineage_id: string };
-	const state = started.state as { selected_lenses: string[] };
-	const lens_results = state.selected_lenses.map(() => ({ findings: [{
-		location: "app.ts:1",
-		severity: "CRITICAL",
-		claim: "The review cannot establish correctness.",
-		evidence_class: "inferential",
-		causal_disposition: "introduced",
-		proof_refs: ["differential-test:tests/app.test.ts"],
-	}], evidence: [] }));
-	const pending = await controllerCall(controller, ctx, {
-		operation: "finalize",
-		lineageId: result.lineage_id,
-		input: JSON.stringify({ review_result: { lens_results } }),
-	});
-	const pendingResult = pending.result as { refuter_request: { request_hash: string } };
-	const before = discoverCompactReview(fixture.repository, result.lineage_id).record;
-	await assert.rejects(
-		controller.execute("malformed-refuter", {
-			operation: "finalize",
-			lineageId: result.lineage_id,
-			input: JSON.stringify({ review_result: {
-				lens_results,
-				refuter_request_hash: pendingResult.refuter_request.request_hash,
-				refuter_results: [null],
-			} }),
-		}, undefined, undefined, ctx),
-		/review\/finalize\.review_result\.refuter_results\[0\]/,
-	);
-	const after = discoverCompactReview(fixture.repository, result.lineage_id).record;
-	assert.equal(after.revision, before.revision);
-	assert.equal(after.state.state, "reviewing");
-});
 
-test("controller requires an approved compact lineage to match its stored policy hash", async (t) => {
-	const fixture = createRepository(t, false);
-	const { controller } = registerRuntime();
-	const ctx = extensionContext(fixture.repository);
-	const lineageId = "approved-policy-lineage";
-	await approveTrackedWorktreeTransaction(controller, ctx, lineageId);
 
-	await assert.rejects(
-		controller.execute("stale-policy", {
-			operation: "start",
-			lineageId,
-			input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, projection: { kind: "complete" }, policyHash: "c".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }),
-		}, undefined, undefined, ctx),
-		/policy hash.*does not match/i,
-	);
-});
 
-test("controller prioritizes active compact authority over terminal history and reports terminals without active authority", async (t) => {
-	const fixture = createRepository(t, false);
-	const { controller } = registerRuntime();
-	const ctx = extensionContext(fixture.repository);
-	await approveTrackedWorktreeTransaction(controller, ctx, "historical-terminal");
 
-	const terminal = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.equal(terminal.status, "ready");
-	assert.equal(terminal.next_action, "start-ordinary-review");
-	assert.equal((terminal.inspection as Record<string, unknown>).terminal_applicability, "policy-unresolved");
-	assert.equal(((terminal.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "approved");
-	writeFileSync(join(fixture.repository, "app.ts"), "export const value = 3;\n");
 
-	await controllerCall(controller, ctx, {
-		operation: "start",
-		lineageId: "active-after-terminal",
-		input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, projection: { kind: "complete" }, policyHash: "a".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }),
-	});
-	const active = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.equal(active.status, "in-progress");
-	assert.equal(active.next_action, "finalize-existing-ordinary-review");
-	assert.equal(((active.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "active");
-});
 
-test("controller INSPECT and START bind terminal applicability to a linked worktree candidate", async (t) => {
-	const fixture = createRepository(t, false);
-	const { controller } = registerRuntime();
-	await approveTrackedWorktreeTransaction(controller, extensionContext(fixture.repository), "candidate-a");
-	const linked = join(fixture.parent, "linked");
-	git(fixture.repository, "worktree", "add", "-b", "linked", linked, "HEAD");
-	writeFileSync(join(linked, "app.ts"), "export const value = 2;\n");
-	const linkedContext = extensionContext(linked);
-	const bare = await controllerCall(controller, linkedContext, { operation: "inspect" });
-	assert.equal(bare.status, "ready");
-	assert.equal((bare.inspection as Record<string, unknown>).terminal_applicability, "policy-unresolved");
-	const policyBound = await controllerCall(controller, linkedContext, {
-		operation: "inspect",
-		input: JSON.stringify({ mode: "ordinary", policyHash: "a".repeat(64), projection: { kind: "complete" } }),
-	});
-	assert.equal(policyBound.status, "terminal");
-	assert.equal((policyBound.inspection as Record<string, unknown>).terminal_applicability, "applicable");
-	const replay = await controllerCall(controller, linkedContext, {
-		operation: "start", lineageId: "candidate-a",
-		input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, projection: { kind: "complete" }, policyHash: "a".repeat(64) }),
-	});
-	assert.equal(replay.status, "blocked");
-	writeFileSync(join(linked, "app.ts"), "export const value = 3;\n");
-	const fresh = await controllerCall(controller, linkedContext, {
-		operation: "start", lineageId: "candidate-b",
-		input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, projection: { kind: "complete" }, policyHash: "a".repeat(64) }),
-	});
-	assert.equal((fresh.result as Record<string, unknown>).state, "reviewing");
-});
 
-test("controller blocks policy-bound duplicate terminal applicability deterministically", async (t) => {
-	const fixture = createRepository(t, false);
-	const { controller } = registerRuntime();
-	const ctx = extensionContext(fixture.repository);
-	await approveTrackedWorktreeTransaction(controller, ctx, "first-terminal");
-	const compactRoot = join(fixture.repository, ".git", "gentle-ai", "reviews", "compact-v2");
-	const parked = join(fixture.repository, ".git", "gentle-ai", "reviews", "parked-terminal");
-	renameSync(join(compactRoot, "first-terminal"), parked);
-	await approveTrackedWorktreeTransaction(controller, ctx, "second-terminal");
-	renameSync(parked, join(compactRoot, "first-terminal"));
-	const inspected = await controllerCall(controller, ctx, {
-		operation: "inspect",
-		input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, policyHash: "a".repeat(64), projection: { kind: "complete" } }),
-	});
-	assert.equal(inspected.status, "blocked");
-	assert.equal(inspected.next_action, "stop-and-report-ambiguous-compact-terminal-authority");
-	assert.equal((inspected.inspection as Record<string, unknown>).terminal_applicability, "ambiguous");
-	assert.deepEqual((inspected.inspection as Record<string, unknown>).terminal_lineage_ids, ["first-terminal", "second-terminal"]);
-});
 
-test("controller retains graph-v1 inspection and repair behavior without compact authority", async (t) => {
-	const fixture = createRepository(t, true);
-	createTerminalAuthority(fixture, "graph-only-authority");
-	const { controller } = registerRuntime();
-	const ctx = extensionContext(fixture.repository);
-	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.equal(inspected.status, "ready");
-	assert.equal(inspected.next_action, "start-ordinary-review");
-	assert.equal((inspected.inspection as Record<string, unknown>).compact_authority, undefined);
-	const repaired = await controllerCall(controller, ctx, { operation: "repair" });
-	assert.equal(repaired.repaired, true);
-});
 
-test("controller inspect reports lock state and lock recovery routes to audited native reclaim", async (t) => {
-	const fixture = createRepository(t, false);
-	const { controller } = registerRuntime();
-	const ctx = extensionContext(fixture.repository);
-	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.deepEqual(inspected.lock, { status: "absent" });
-	await assert.rejects(
-		controller.execute("recover-missing-owner", { operation: "recover-lock", input: JSON.stringify({ lineage: "stuck", actor: "maintainer", reason: "stale lock" }) }, undefined, undefined, ctx),
-		/ownerHash/i,
-	);
-	const unavailable = await controllerCall(controller, ctx, { operation: "recover-lock", input: JSON.stringify({ ownerHash: "a".repeat(64), lineage: "stuck", actor: "maintainer", reason: "stale lock" }) });
-	assert.equal(unavailable.status, "blocked");
-	assert.equal(unavailable.outcome, "native-recovery-unavailable");
-	assert.equal(unavailable.native_operation, "review reclaim");
-	assert.equal(unavailable.mutation_performed, false);
-	await assert.rejects(
-		controller.execute("recover-reset-requires-confirmation", { operation: "recover", input: JSON.stringify({ ownerHash: "a".repeat(64) }) }, undefined, undefined, ctx),
-		/exact string|confirmation|reset/i,
-	);
-});
-
-test("controller routes legacy authority through explicit reset, verifies clean, and starts ordinary review", async (t) => {
-	const fixture = createRepository(t, false);
-	const { controller, toolCall } = registerRuntime();
-	const ctx = extensionContext(fixture.repository);
-	await approveTrackedWorktreeTransaction(controller, ctx, "before-reset");
-	const command = "git commit -m before-reset";
-	await controllerCall(controller, ctx, { operation: "validate", lineageId: "before-reset", idempotencyKey: "before-reset-gate", command, input: "{}" });
-	createLegacyReviewAuthority(fixture.repository);
-
-	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
-	const blockedInspection = inspected.inspection as Record<string, unknown>;
-	assert.equal(blockedInspection.outcome, "blocked-mixed");
-	assert.equal(inspected.status, "blocked");
-	assert.equal(inspected.next_action, "request-explicit-reset-authorization");
-
-	const blockedStart = await controllerCall(controller, ctx, {
-		operation: "start",
-		lineageId: "blocked-before-reset",
-		idempotencyKey: "blocked-before-reset-start",
-		input: JSON.stringify({ mode: "ordinary", projection: { kind: "complete" }, policyHash: "a".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }),
-	});
-	assert.equal(blockedStart.status, "blocked");
-	assert.equal(blockedStart.lineage_created, false);
-	assert.equal(blockedStart.next_action, "request-explicit-reset-authorization");
-	assert.equal((blockedStart.inspection as Record<string, unknown>).outcome, "blocked-mixed");
-
-	const resetRequest = blockedInspection.reset_request as Record<string, unknown>;
-	await assert.rejects(
-		controller.execute("unauthorized-reset", { operation: "reset", input: JSON.stringify(resetRequest) }, undefined, undefined, ctx),
-		/interactive Pi UI.*fails closed/i,
-	);
-	const stillBlocked = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.equal((stillBlocked.inspection as Record<string, unknown>).outcome, "blocked-mixed");
-	assert.deepEqual((stillBlocked.inspection as Record<string, unknown>).reset_request, resetRequest);
-	await assert.rejects(
-		controller.execute("rejected-reset", { operation: "reset", input: JSON.stringify(resetRequest) }, undefined, undefined, extensionContext(fixture.repository, true, async () => false)),
-		/not explicitly authorized/i,
-	);
-	const stillBlockedAfterRejection = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.deepEqual(stillBlockedAfterRejection.inspection, stillBlocked.inspection);
-
-	const confirmations: Array<{ title: string; message: string }> = [];
-	const authorizedCtx = extensionContext(fixture.repository, true, async (title, message) => {
-		confirmations.push({ title, message });
-		return true;
-	});
-	// Authorized RESET now routes to the audited native reclaim operation; a
-	// runtime without a native client fails closed and never mutates Pi state.
-	const reset = await controllerCall(controller, authorizedCtx, {
-		operation: "reset",
-		input: JSON.stringify({ ...resetRequest, lineage: "legacy", actor: "maintainer", reason: "legacy authority reset" }),
-	});
-	assert.equal(confirmations.length, 1);
-	assert.match(confirmations[0]?.title ?? "", /RESET/);
-	assert.match(confirmations[0]?.message ?? "", new RegExp(String(resetRequest.confirmation).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-	assert.equal(reset.status, "blocked");
-	assert.equal(reset.outcome, "native-recovery-unavailable");
-	assert.equal(reset.native_operation, "review reclaim");
-	assert.equal(reset.mutation_performed, false);
-
-	const stillBlockedAfterNativeUnavailable = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.equal((stillBlockedAfterNativeUnavailable.inspection as Record<string, unknown>).outcome, "blocked-mixed");
-	// The lifecycle gate keeps failing closed while authority stays blocked-mixed.
-	const gated = await toolCall({ toolName: "bash", input: { command } }, ctx);
-	assert.equal(gated?.block, true);
-});
-
-test("controller reports invalid compact-v2 authority without fabricating Pi reset material", async (t) => {
-	const fixture = createRepository(t, false);
-	const { controller } = registerRuntime();
-	const ctx = extensionContext(fixture.repository, true);
-	const started = await controllerCall(controller, ctx, {
-		operation: "start",
-		lineageId: "invalid-compact-reset",
-		input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, projection: { kind: "complete" }, policyHash: "a".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }),
-	});
-	const lineageId = (started.result as { lineage_id: string }).lineage_id;
-	writeFileSync(discoverCompactReview(fixture.repository, lineageId).store.statePath, "malformed compact state");
-
-	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.equal((inspected.inspection as Record<string, unknown>).outcome, "clean");
-	assert.equal(((inspected.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "invalid");
-	assert.equal(inspected.status, "blocked");
-	assert.equal(inspected.next_action, "request-explicit-reset-authorization");
-	// The compact-specific reset inventory retired with the Pi-owned destructive
-	// reset; the surviving challenge is the repository-scoped Pi authorization
-	// binding from the legacy detector.
-	const request = (inspected.inspection as Record<string, unknown>).reset_request as Record<string, unknown>;
-	assert.equal(typeof request.confirmation, "string");
-	assert.match(String(request.confirmation), /^DESTROY REVIEW AUTHORITY /);
-
-	// An authorized RESET now routes to native reclaim and never mutates the
-	// Pi store; without a native client it fails closed.
-	const blocked = await controllerCall(controller, ctx, { operation: "reset", input: JSON.stringify({ ...request, lineage: lineageId, actor: "maintainer", reason: "invalid compact authority" }) });
-	assert.equal(blocked.status, "blocked");
-	assert.equal(blocked.outcome, "native-recovery-unavailable");
-	assert.equal(blocked.native_operation, "review reclaim");
-	assert.equal(blocked.mutation_performed, false);
-	const unchanged = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.equal(((unchanged.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "invalid");
-});
-
-test("controller hides destructive reset material for ineligible terminal compact authority", async (t) => {
-	const fixture = createRepository(t, false);
-	const { controller } = registerRuntime();
-	const ctx = extensionContext(fixture.repository, true);
-	await approveTrackedWorktreeTransaction(controller, ctx, "terminal-compact-reset");
-	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.equal(inspected.status, "ready");
-	assert.equal(inspected.reset_eligible, false);
-	assert.equal((inspected.inspection as Record<string, unknown>).terminal_applicability, "policy-unresolved");
-	assert.equal(((inspected.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "approved");
-	assert.doesNotMatch(JSON.stringify(inspected), /reset_request|challenge|confirmation|DESTROY/);
-});
 
 test("controller successfully starts the explicitly supported judgment-day mode", async (t) => {
 	const fixture = createRepository(t, false);
@@ -955,25 +465,6 @@ test("failed START gives exact mode and serialization guidance and creates no li
 	assert.equal(existsSync(join(fixture.repository, ".git", "gentle-ai", "reviews", "graph-v1")), false);
 });
 
-test("ambiguous START output loss is recovered only by exact idempotent replay", async (t) => {
-	const fixture = createRepository(t, false);
-	const { controller } = registerRuntime();
-	const ctx = extensionContext(fixture.repository);
-	const request = {
-		operation: "start",
-		lineageId: "ambiguous-start",
-		idempotencyKey: "ambiguous-start-key",
-		input: JSON.stringify({ mode: "ordinary", projection: { kind: "complete" }, policyHash: "a".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }),
-	};
-
-	const committed = await controllerCall(controller, ctx, request); // Simulate committed authority whose response was lost.
-	const replay = await controllerCall(controller, ctx, request);
-	assert.deepEqual(replay.result, committed.result);
-	await assert.rejects(
-		controller.execute("changed-start-replay", { ...request, input: JSON.stringify({ mode: "ordinary", projection: { kind: "complete" }, policyHash: "c".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }) }, undefined, undefined, ctx),
-		/compare-and-swap|different.*request/i,
-	);
-});
 
 test("shipped controller and orchestrator contracts specify inspect-first compact facade without cascade", () => {
 	const { controller } = registerRuntime();
@@ -1010,58 +501,6 @@ test("shipped controller and orchestrator contracts specify inspect-first compac
 	}
 });
 
-test("registered controller creates, advances, reports, and authorizes an exact staged commit once", async (t) => {
-	const fixture = createRepository(t, false);
-	const { controller, toolCall } = registerRuntime();
-	const ctx = extensionContext(fixture.repository);
-	await approveTrackedWorktreeTransaction(controller, ctx, "controller-lifecycle");
-	git(fixture.repository, "add", "--", "app.ts");
-
-	const command = "git commit -m bounded";
-	const validated = await controllerCall(controller, ctx, {
-		operation: "validate",
-		lineageId: "controller-lifecycle",
-		idempotencyKey: "controller-lifecycle-gate",
-		command,
-		input: JSON.stringify({ scopeBudget: budget() }),
-	});
-	const result = validated.result as Record<string, unknown>;
-	assert.equal(result.status, "allow", JSON.stringify(validated));
-	assert.equal(result.actor_count, 0);
-	assert.equal(typeof validated.authorization, "object");
-	assert.equal(await toolCall({ toolName: "bash", input: { command } }, ctx), undefined);
-
-	const replay = await toolCall({ toolName: "bash", input: { command } }, ctx);
-	assert.equal(replay?.block, true);
-	assert.match(replay?.reason ?? "", /registered review controller authorization/i);
-
-	const splitAllCommand = "git commit -a -m bounded";
-	await assert.rejects(
-		controllerCall(controller, ctx, {
-			operation: "validate",
-			lineageId: "controller-lifecycle",
-			idempotencyKey: "controller-lifecycle-gate-split-all",
-			command: splitAllCommand,
-			input: JSON.stringify({ scopeBudget: budget() }),
-		}),
-		/cannot be exactly proven/i,
-	);
-
-	const fabricated = await toolCall(
-		{
-			toolName: "bash",
-			input: {
-				command: "git commit -m bounded",
-				reviewGate: {
-					target: { kind: "intended-commit", intended_commit_tree: result.target_hash },
-				},
-			},
-		},
-		ctx,
-	);
-	assert.equal(fabricated?.block, true);
-	assert.match(fabricated?.reason ?? "", /registered review controller authorization/i);
-});
 
 test("controller binds push, PR, and release authorization to exact command arguments", async (t) => {
 	const fixture = createRepository(t, true);

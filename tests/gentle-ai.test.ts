@@ -11,8 +11,8 @@ import type {
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
 import gentleAi, { __testing } from "../extensions/gentle-ai.ts";
+import { GATE_TARGET_KIND } from "../lib/review-publication-gate.ts";
 import {
-	GATE_TARGET_KIND,
 	REVIEW_MODE,
 	REVIEW_TRANSITION,
 	ReviewTransactionStore,

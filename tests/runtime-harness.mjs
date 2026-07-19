@@ -212,9 +212,9 @@ async function run() {
 	}
 	assert.ok(tools.has("gentle_review"), "missing registered bounded review controller tool");
 	assert.deepEqual(
-		tools.get("gentle_review").parameters.properties.operation.enum.filter((operation) => operation.includes("supersession") || operation === "supersede"),
-		["prepare-supersession", "supersede"],
-		"runtime controller must expose explicit supersession operations",
+		tools.get("gentle_review").parameters.properties.operation.enum.filter((operation) => operation.includes("supersession") || operation === "supersede" || operation === "reconcile-authority"),
+		["reconcile-authority"],
+		"runtime controller must expose only native authority reconciliation",
 	);
 
 	for (const entry of await readdir(join(ROOT, "assets", "agents"))) {
@@ -349,8 +349,8 @@ async function run() {
 		);
 		const blockedContinueCtx = createCtx(promptCwd, true);
 		await commands.get("sdd-continue").handler("status-demo", blockedContinueCtx);
-		assert.match(blockedContinueCtx.ui.notifications.at(-1).message, /resolve-review:/);
-		assert.match(blockedContinueCtx.ui.notifications.at(-1).message, /nextPhase: resolve-review/);
+		assert.doesNotMatch(blockedContinueCtx.ui.notifications.at(-1).message, /resolve-review:/);
+		assert.match(blockedContinueCtx.ui.notifications.at(-1).message, /nextPhase: sdd-apply/);
 	} finally {
 		await rm(promptCwd, { recursive: true, force: true });
 	}

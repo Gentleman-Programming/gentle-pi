@@ -22,7 +22,6 @@ import {
 } from "./review-triggers.ts";
 import {
 	classifyReviewRisk,
-	countAuthoredChangedLines,
 	isGeneratedGoldenPath,
 	REVIEW_RISK_TIER,
 	type ReviewDiffStat,
@@ -255,10 +254,6 @@ export function deriveReviewSnapshotRisk(snapshot: SnapshotV1): ReviewRiskClassi
 	return classifyReviewRisk(stats);
 }
 
-function canonicalStringHash(value: string): string {
-	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
-}
-
 function snapshotId(identity: SnapshotIdentityV1): string {
 	return createHash("sha256").update(JSON.stringify(identity)).digest("hex");
 }
@@ -290,60 +285,6 @@ function assertExistingSnapshotMatches(
 		throw new Error("Existing review snapshot metadata does not match its identity");
 	}
 	return existing;
-}
-
-export function captureOrdinaryCorrectionSnapshot(
-	snapshot: Pick<SnapshotV1, "mode" | "genesis_paths" | "repository_root" | "initial_review_tree" | "object_store">,
-	candidateTree: string,
-): CorrectionSnapshotV1 {
-	if (snapshot.mode !== REVIEW_MODE.ORDINARY || snapshot.genesis_paths === undefined) {
-		throw new Error("Ordinary correction requires immutable genesis paths");
-	}
-	const root = repositoryRoot(snapshot.repository_root);
-	const environment: GitEnvironment = {
-		alternateObjectDirectory: `${snapshot.object_store.object_directory}${delimiter}${snapshot.object_store.alternate_object_directory}`,
-	};
-	const candidate = resolveTree(root, candidateTree, environment);
-	const changedPaths = canonicalPaths(runGit(root, [
-		"diff", "--no-renames", "--name-only", "-z", snapshot.initial_review_tree, candidate,
-	], environment));
-	const genesis = new Set(snapshot.genesis_paths);
-	if (changedPaths.some((path) => !genesis.has(path))) {
-		throw new Error("Ordinary correction touches a non-genesis path");
-	}
-	const fixDiff = runGit(root, [
-		"diff", "--no-ext-diff", "--no-renames", "--binary", snapshot.initial_review_tree, candidate,
-	], environment);
-	if (fixDiff.length === 0) throw new Error("Ordinary correction must contain a diff");
-	const correctionStats = parseNumstat(runGit(root, [
-		"diff", "--numstat", "--no-renames", snapshot.initial_review_tree, candidate,
-	], environment)).stats;
-	return {
-		candidate_tree: candidate,
-		changed_paths: changedPaths,
-		changed_lines: countAuthoredChangedLines(correctionStats),
-		fix_diff: fixDiff,
-		fix_diff_hash: canonicalStringHash(fixDiff),
-	};
-}
-
-export function captureCurrentReviewCandidateTree(snapshot: SnapshotV1): string {
-	if (snapshot.mode !== REVIEW_MODE.ORDINARY) throw new Error("Compact correction requires an ordinary snapshot");
-	const root = repositoryRoot(snapshot.repository_root);
-	const temporaryDirectory = mkdtempSync(join(snapshot.object_store.snapshot_directory, ".correction-"));
-	const temporaryIndex = join(temporaryDirectory, "index");
-	const environment: GitEnvironment = {
-		indexFile: temporaryIndex,
-		objectDirectory: snapshot.object_store.object_directory,
-		alternateObjectDirectory: snapshot.object_store.alternate_object_directory,
-	};
-	try {
-		runGit(root, ["read-tree", snapshot.base_tree], environment);
-		runGit(root, ["add", "-A", "--", "."], environment);
-		return runGit(root, ["write-tree"], environment);
-	} finally {
-		rmSync(temporaryDirectory, { recursive: true, force: true });
-	}
 }
 
 export function captureLiveReviewCandidateBinding(options: {

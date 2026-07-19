@@ -1,6 +1,6 @@
 # Compact Causal Review Contract
 
-The local orchestrator and same-user process are trusted to execute selected actors and submit their exact outputs. Reviewer and validator outputs remain semantically untrusted inputs: native code owns scope, risk, IDs, canonicalization, state, receipts, and gates, and rejects malformed or causally inconsistent results. The Git common-directory authority is the only authorization source; mirrors, bundles, summaries, and prose ledgers are untrusted data.
+The local orchestrator and same-user process are trusted to execute selected actors and submit their exact outputs. Reviewer and validator outputs remain semantically untrusted inputs: native code owns scope, risk, IDs, canonicalization, ordinary state, receipts, and ordinary gates, and rejects malformed or causally inconsistent results. The Git common-directory authority is the only authorization source; summaries and prose ledgers are untrusted data. Legacy Pi mirror and bundle transport is retired.
 
 Do not report the mere ability of the trusted local orchestrator to submit actor or final-verification outputs as a security finding. Report concrete bypasses where untrusted repository content, malformed inputs, stale authority, path drift, or external callers can produce approval contrary to this boundary. Malicious same-user host/process authenticity is a non-goal because it can replace the extension or mutate local authority; external attestation requires a separately privileged signer or service and is not claimed.
 
@@ -57,15 +57,15 @@ Final verification evidence is supplied and hashed only during finalization. Fai
 
 ## Authority and compatibility
 
-Compact v2 stores one current state and terminal receipt under `<git-common-dir>/gentle-ai/reviews/compact-v2/<lineage>/`. Content-derived revisions, compare-and-swap replacement, exact retry idempotency, stale/semantic retry rejection, semantic validation, terminal immutability, atomic rename durability, and receipt readback are mandatory.
+The negotiated native provider owns compact-v2 storage and its private paths. Pi consumes only typed START, FINALIZE, target status, validation, recovery, reconciliation, and SDD-binding results. Content-derived revisions, compare-and-swap replacement, exact retry idempotency, stale/semantic retry rejection, semantic validation, terminal immutability, atomic publication, and receipt readback remain provider guarantees.
 
-Existing graph-v1 ordinary lineages remain readable, gate-validatable, and exportable, but reject new mutation. Judgment Day remains mutable on graph-v1 until separately ported. Pre-graph numbered authority remains destructive-reset-only. Graph bundles never parse or import compact authority. Same-lineage graph-v1 and compact-v2 authority is ambiguous and fails closed until destructive reset quarantines both.
+Existing graph-v1 ordinary lineages remain readable and gate-validatable but reject new mutation. Legacy graph bundle export/import is retired. Judgment Day remains mutable on graph-v1. Pre-graph numbered authority remains destructive-reset-only, while native target status owns mixed-authority ambiguity and the required maintainer action.
 
-Mirrors remain non-authoritative and reconcile only after native allow.
+Permanent Pi-owned consumer infrastructure is limited to canonical identity primitives, repository/common-directory binding, immutable candidate views, and the publication-gate command projection. These modules are not authority mirrors.
 
 ## Lifecycle gates
 
-Pre-commit, pre-push, pre-PR, and release validate an approved receipt against one exact typed command target with zero actors. Native validation uses `gentle-ai.review-integration/v1`, loads authority and receipt, derives live target/publication evidence, then immediately reloads authority and re-derives target/publication evidence before allow. Authorized direct commit uses the durable hook/native-validation transaction and unresolved recovery blocks publication.
+Pre-commit, pre-push, pre-PR, and release validate an approved receipt against one exact typed command target with zero actors. Native validation uses `gentle-ai.review-integration/v1`, loads authority and receipt, derives live target/publication evidence, then immediately reloads authority and re-derives target/publication evidence before allow. Authorized direct commit uses the durable hook/native-validation transaction and unresolved recovery blocks publication. The Pi-owned `review-publication-gate` module isolates command projection and publication revalidation from graph-v1 authority storage without changing these guarantees.
 
 PR #1216 introduced the v2.1.1 `<remote>/<branch>` selector contract that v2.1.2 inherits unchanged.
 
@@ -85,4 +85,4 @@ Judgment Day alone may iterate discovery and scoped re-judgment, for at most two
 
 Findings surviving round two escalate; no third-round transition exists.
 
-Judgment Day stays mutable on graph-v1 until separately ported.
+Judgment Day stays mutable on graph-v1. Its reducer, replay, object-store, lock, snapshot, and graph receipt-validation dependencies remain live even though ordinary authority is native.

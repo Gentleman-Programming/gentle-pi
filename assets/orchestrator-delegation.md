@@ -227,9 +227,9 @@ Judgment Day alone may iterate discovery and scoped re-judgment, for at most two
 
 Findings surviving round two escalate; no third-round transition exists.
 
-Graph-v1 ordinary authority remains readable/gate-valid/exportable but read-only. Judgment Day remains mutable on graph-v1. Same-lineage graph/compact ambiguity fails closed and reset quarantines both.
+Graph-v1 ordinary authority remains readable and gate-valid but read-only. Legacy graph bundle export/import is retired. Judgment Day remains mutable on graph-v1, and native target status owns mixed-authority ambiguity and maintainer action.
 
-Compact gate validation is read-only and double-checks authority, target, publication refs, and evidence immediately before allow. Pi then registers one exact one-shot command authorization and rederives the target at bash time.
+Native compact gate validation is read-only and double-checks authority, target, publication refs, and evidence immediately before allow. Pi then registers one exact one-shot command authorization and rederives the target at bash time. The Pi-owned publication-gate module isolates typed targets, remote binding, release projection, and publication rechecks from graph-v1 authority storage; graph receipt validation remains reachable only for historical graph authority and explicit Judgment Day.
 Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise release fails closed through native receipt validation.
 Major and post-incident releases require explicit extraordinary review even when fast-path checks pass.
 

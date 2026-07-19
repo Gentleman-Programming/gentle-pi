@@ -83,6 +83,9 @@ function fakeNative(overrides: Partial<NativeReviewCli> = {}): NativeReviewCli {
 		bindSdd: async () => { throw new Error("bind-sdd is not expected in workspace-root tests"); },
 		sddStatus: async () => ({ ready: false }),
 		reviewStatus: async () => ({ schema: "gentle-ai.review-authority-status/v1", repository: "/repo", complete: true, authoritative: true, status: "clean", entries: [], locks: [], diagnostics: [], raw: { schema: "gentle-ai.review-authority-status/v1", operation: "review/status", repository: "/repo", complete: true, authoritative: true, status: "clean", entries: [], locks: [], diagnostics: [] } }),
+		targetStatus: async (request) => request.lineageId === undefined
+			? targetStatusFixture({ applicability: "unrelated", action: "start" })
+			: targetStatusFixture({ lineageId: request.lineageId }),
 		...overrides,
 	};
 }
