@@ -2890,9 +2890,14 @@ test("production tool_call forwards Pi cancellation and enforces one bash-time d
 				context(cwd, mode === "external-cancellation" ? external.signal : undefined),
 			);
 			if (mode === "external-cancellation") external.abort();
+			// Hang guard only (issue #178): cancellation itself is deterministic —
+			// the fake native validation resolves solely when its signal aborts —
+			// so this race merely catches a cancellation that never propagates.
+			// 10s keeps that guarantee without racing loaded CI runners the way a
+			// 500ms wall-clock bound did.
 			const result = await Promise.race([
 				pending,
-				new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("production tool_call did not cancel within its aggregate deadline")), 500)),
+				new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("production tool_call did not cancel within its aggregate deadline")), 10_000)),
 			]) as { block: boolean };
 			assert.equal(result.block, true);
 			assert.equal(receivedSignal?.aborted, true);
@@ -2923,13 +2928,26 @@ test("production post-allow pre-push remote probes obey Pi cancellation and the 
 				'if [ -f "$count_file" ]; then read -r count < "$count_file"; fi',
 				'count=$((count + 1))',
 				'printf "%s\\n" "$count" > "$count_file"',
-				'if [ -f "$stall_file" ] && [ "$count" -eq 3 ]; then exec sleep 1; fi',
+				'if [ -f "$stall_file" ] && [ "$count" -eq 3 ]; then exec sleep 20; fi',
 				`exec git upload-pack ${JSON.stringify(remote)}`,
 				"",
 			].join("\n"), { mode: 0o755 });
 			git(cwd, "config", "protocol.ext.allow", "always");
 			git(cwd, "remote", "set-url", "origin", `ext::${uploadPack}`);
 
+			// Deadline layout (issue #178): a shared 150ms aggregate deadline raced
+			// the real probe/validate process spawns on loaded CI runners and could
+			// fire before the second native validation, so cancellation triggered at
+			// the wrong point and the test flaked.
+			// - external-cancellation: cancellation is driven deterministically by
+			//   external.abort() inside the second native validation; the aggregate
+			//   deadline (30s) and per-probe timeout (30s) are far above the elapsed
+			//   bound so neither can fire first.
+			// - aggregate-deadline: the 2s aggregate deadline is the only bound able
+			//   to end the stalled post-allow probe — the stall (20s) and per-probe
+			//   timeout (30s) are far larger — while still leaving generous headroom
+			//   over pre-deadline spawn overhead on slow runners.
+			const aggregateDeadlineMs = mode === "aggregate-deadline" ? 2_000 : 30_000;
 			const external = new AbortController();
 			let validations = 0;
 			const { controller, toolCall } = runtime(fakeNative({ validate: async () => {
@@ -2938,7 +2956,7 @@ test("production post-allow pre-push remote probes obey Pi cancellation and the 
 				const gateContext = nativeGateContext();
 				gateContext.raw.gate = "pre-push";
 				return { allowed: true, result: "allow", action: "continue", reason: "ok", gateContext };
-			} }), undefined, undefined, 150);
+			} }), undefined, 30_000, aggregateDeadlineMs);
 			const command = "git push origin feature:refs/heads/feature";
 			const authorized = await controller.execute(mode, { operation: "validate", lineageId: "native-lineage", idempotencyKey: mode, command, input: "{}" }, undefined, undefined, context(cwd));
 			assert.notEqual((authorized.details as { authorization?: unknown }).authorization, undefined);
@@ -2948,7 +2966,11 @@ test("production post-allow pre-push remote probes obey Pi cancellation and the 
 			const started = Date.now();
 			const result = await toolCall({ toolName: "bash", input: { command } }, interactiveContext(cwd, external.signal)) as { block: boolean; reason: string };
 			assert.equal(result.block, true);
-			assert.ok(Date.now() - started < 300, "post-allow remote probe exceeded its cancellation deadline");
+			// 10s sits far below the 20s stall and the 30s per-probe timeout, so
+			// finishing under it proves cancellation — external abort or the 2s
+			// aggregate deadline — ended the stalled probe, without racing
+			// CI-runner process-spawn variance the way the old 300ms bound did.
+			assert.ok(Date.now() - started < 10_000, "post-allow remote probe exceeded its cancellation deadline");
 			assert.equal(validations, 2, result.reason);
 		});
 	}

@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import {
 	COMMIT_TRANSACTION_STATE,
 	assertNoUnresolvedCommitTransaction,
@@ -167,12 +168,34 @@ test("a post-commit hook cannot replace the exact commit created by Git", async 
 test("cancellation cannot strand a commit after HEAD advances", async (t) => {
 	const cwd = repository(t);
 	stage(cwd);
-	installHook(cwd, "post-commit", "sleep 1");
+	// Deterministic cancellation ordering (issue #178): a wall-clock
+	// AbortSignal.timeout raced Git's own progress on loaded CI runners and
+	// could abort before HEAD advanced. Git only runs the post-commit hook
+	// after the commit object exists and HEAD has advanced, so the hook
+	// reports that it started and then blocks until the test releases it.
+	// Aborting between those two events guarantees the cancellation lands
+	// while the commit process is still running and strictly after HEAD
+	// advanced, on every runner.
+	const started = join(cwd, ".git", "post-commit-started");
+	const release = join(cwd, ".git", "post-commit-release");
+	installHook(cwd, "post-commit", [
+		`printf '1\\n' > ${JSON.stringify(started)}`,
+		`while [ ! -e ${JSON.stringify(release)} ]; do sleep 0.02; done`,
+	].join("\n"));
 	const before = git(cwd, "rev-parse", "HEAD");
-	const result = await runGitCommitTransaction(invocation(cwd, "commit-cancellation"), {
+	const abort = new AbortController();
+	const pending = runGitCommitTransaction(invocation(cwd, "commit-cancellation"), {
 		nativeReviewCli: native(cwd, "commit-cancellation"),
-		signal: AbortSignal.timeout(100),
+		signal: abort.signal,
 	});
+	let settled = false;
+	void pending.then(() => { settled = true; }, () => { settled = true; });
+	while (!existsSync(started) && !settled) await delay(10);
+	assert.equal(settled, false, "commit transaction finished before the post-commit hook confirmed HEAD advanced");
+	abort.abort();
+	writeFileSync(release, "release\n");
+	const result = await pending;
+	assert.equal(abort.signal.aborted, true);
 	assert.notEqual(result.head, before);
 	assert.equal(result.status, "committed");
 	assert.deepEqual(inspectCommitTransaction(cwd), { status: "clean" });
