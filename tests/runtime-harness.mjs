@@ -247,6 +247,11 @@ async function run() {
 		const promptResult = await promptHook({ systemPrompt: "base" }, createCtx(promptCwd));
 		assert.match(promptResult.systemPrompt, /base/);
 		assert.match(promptResult.systemPrompt, /el Gentleman/);
+		assert.ok(
+			promptResult.systemPrompt.indexOf("el Gentleman Identity and Harness") <
+				promptResult.systemPrompt.indexOf("base"),
+			"stable el Gentleman prompt should be prepended before volatile runtime system context for better prompt-cache reuse",
+		);
 		assert.match(promptResult.systemPrompt + delegationDetail, /do not pass the `model` parameter by default/);
 		assert.match(
 			promptResult.systemPrompt + delegationDetail,

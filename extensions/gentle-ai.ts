@@ -6204,7 +6204,7 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 			? ""
 			: `\n\n${buildGentlePrompt(readPersonaMode(ctx.cwd))}`;
 		return {
-			systemPrompt: `${event.systemPrompt}${gentlePrompt}${sddPrompt}${nativeStatusPrompt}`,
+			systemPrompt: `${gentlePrompt}${event.systemPrompt}${sddPrompt}${nativeStatusPrompt}`,
 		};
 	});
 
