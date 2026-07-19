@@ -50,7 +50,6 @@ import {
 	type SddPhase,
 } from "../lib/sdd-status.ts";
 import type { TriggerEvent } from "../lib/review-triggers.ts";
-import { ReviewBundleExporter, ReviewBundleImporter } from "../lib/review-bundle.ts";
 import { canonicalJsonV1, domainHashV1 } from "../lib/review-canonical.ts";
 import { inspectLegacyReviewAuthorityV1, type LegacyInspectionV1 } from "../lib/review-legacy-detector.ts";
 import { compactResetRequestV1, destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
@@ -2186,10 +2185,10 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 			type: "string",
 			description: "A JSON-serialized object string, not a nested object. New native ordinary START uses {\"mode\":\"ordinary\"}; an explicit baseRef requires committedOnly: true and requests a committed range, while repository-local policyPath remains optional. Legacy compact START retains policyHash. FINALIZE supplies reviewer results, correction forecast, targeted validation, final evidence, and an explicit final_verification_passed boolean. Judgment Day retains graph-v1 input.",
 		},
-		outputPath: { type: "string", description: "Destination path for deterministic bundle export." },
-		inputPath: { type: "string", description: "Source path for staged bundle import." },
-		operationId: { type: "string", description: "Identity-bound import or export operation ID." },
-		lineageIds: { type: "string", description: "Optional JSON array of graph lineage IDs to export." },
+		outputPath: { type: "string", description: "Retired with legacy bundle export; ignored. Export returns legacy-operation-retired." },
+		inputPath: { type: "string", description: "Repository-local JSON input file for finalize/advance (alternative to input). Legacy bundle import is retired." },
+		operationId: { type: "string", description: "Retired with legacy bundle transport; ignored. Export/import return legacy-operation-retired." },
+		lineageIds: { type: "string", description: "Retired with legacy bundle export; ignored. Export returns legacy-operation-retired." },
 		workspaceRoot: {
 			type: "string",
 			description: "Optional absolute Git worktree root that owns this review (for example the SDD apply worktree). It must be an existing worktree root sharing the session repository's Git common directory; validation fails closed otherwise. Absent, the session cwd is used unchanged.",
@@ -4791,17 +4790,20 @@ async function executeReviewControllerOperation(
 ): Promise<Record<string, unknown>> {
 	const parameters = parseReviewControllerParameters(parametersValue);
 	const defaultCwd = resolveReviewControllerWorkspaceRoot(parameters.workspaceRoot, sessionCwd);
-	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.EXPORT) {
-		const outputPath = requiredControllerString(parameters, "outputPath");
-		const operationId = requiredControllerString(parameters, "operationId");
-		const lineageIds = parameters.lineageIds === undefined ? undefined : JSON.parse(parameters.lineageIds) as unknown;
-		if (lineageIds !== undefined && (!Array.isArray(lineageIds) || lineageIds.some((id) => typeof id !== "string"))) throw new Error("Export lineageIds must be a JSON string array");
-		return { operation: parameters.operation, result: new ReviewBundleExporter(defaultCwd).export({ outputPath, operationId, lineageIds }) };
-	}
-	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.IMPORT) {
-		// RISK2-001: adopting a brand-new lineage from a bundle is an experimental,
-		// operator-attested trust decision (see lib/review-bundle.ts import gate).
-		return { operation: parameters.operation, result: new ReviewBundleImporter(defaultCwd).import({ inputPath: requiredControllerString(parameters, "inputPath"), operationId: requiredControllerString(parameters, "operationId"), acknowledgeUntrustedBundleSource: parameters.acknowledgeUntrustedBundleSource === "true" }) };
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.EXPORT || parameters.operation === REVIEW_CONTROLLER_OPERATION.IMPORT) {
+		// Legacy bundle transport rode on the retired pre-integration graph/compact
+		// stores. The native v2.1.8 CLI exposes no bundle equivalent, so both
+		// operations return a structured retirement envelope; the enum members are
+		// kept so the tool schema stays stable for existing callers.
+		return {
+			operation: parameters.operation,
+			status: "blocked",
+			outcome: "legacy-operation-retired",
+			reason: "Legacy review bundle transport (export/import) was retired together with the pre-integration graph/compact stores; gentle-ai v2.1.8 exposes no native bundle equivalent.",
+			mutation_performed: false,
+			mutation_outcome: "none",
+			next_action: "Use the native `gentle-ai review` CLI (start/finalize/validate/status/recover) against the repository review authority; receipts and canonical artifacts live in the Git common-directory store at .git/gentle-ai/reviews and travel with the repository through normal Git replication.",
+		};
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.PREPARE_SUPERSESSION) {
 		const input = parseSupersessionControllerInput(parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation));
@@ -6112,7 +6114,7 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 		name: "gentle_review",
 		label: "Gentle Review Controller",
 		description:
-			"Inspect and recover review authority, run new native ordinary review through start/finalize/validate, preserve legacy compact compatibility reads and graph-v1 Judgment Day, and authorize one exact lifecycle command. FINALIZE input is a JSON string: review_result.lens_results[] entries contain lens, findings, and non-empty evidence exactly once for every lens selected by START; final_evidence and final_verification_passed are paired. This is the Pi wrapper contract, distinct from native CLI --result, --refuter, --validation, and --evidence files. RESET/RECOVER remain destructive; prepare-supersession/supersede require fresh interactive authorization and fail closed headlessly.",
+			"Inspect and recover review authority, run new native ordinary review through start/finalize/validate, preserve legacy compact compatibility reads and graph-v1 Judgment Day, and authorize one exact lifecycle command. FINALIZE input is a JSON string: review_result.lens_results[] entries contain lens, findings, and non-empty evidence exactly once for every lens selected by START; final_evidence and final_verification_passed are paired. This is the Pi wrapper contract, distinct from native CLI --result, --refuter, --validation, and --evidence files. RESET/RECOVER remain destructive; prepare-supersession/supersede require fresh interactive authorization and fail closed headlessly. Legacy bundle transport is retired: export/import return a legacy-operation-retired envelope pointing at the native gentle-ai review CLI and the Git common-directory store.",
 		promptSnippet: "Inspect authority, then use native start/finalize/validate for a new ordinary review; use graph-v1 only for explicit Judgment Day",
 		promptGuidelines: [
 			'Call {"operation":"inspect"} before START. New native ordinary START uses a JSON string such as "{\\"mode\\":\\"ordinary\\"}"; an explicit baseRef must be paired with committedOnly: true to request a committed range, while policyPath remains repository-local. policyHash is legacy compact-only. The controller derives lineage, Git/untracked scope, tier, lenses, authored lines, and budget.',
