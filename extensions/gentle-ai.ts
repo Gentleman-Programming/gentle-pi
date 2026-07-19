@@ -65,7 +65,7 @@ import {
 	finalizeCompactReview,
 	startCompactReview,
 } from "../lib/review-facade.ts";
-import { CompactReviewContractError, deriveNativeRefuterRequest, deriveNativeValidationRequest, parseCompactFinalizeInput, parseNativeCompactFinalizeInput, toNativeReviewerDocument, toNativeValidatorDocument } from "../lib/review-compact-contract.ts";
+import { CompactReviewContractError, deriveNativeRefuterRequest, deriveNativeValidationRequest, parseNativeCompactFinalizeInput, toNativeReviewerDocument, toNativeValidatorDocument } from "../lib/review-compact-contract.ts";
 import { toNativeRefuterDocument } from "../lib/review-refuter-adapter.ts";
 import { validateCompactReviewGate } from "../lib/review-compact-gate.ts";
 import {
