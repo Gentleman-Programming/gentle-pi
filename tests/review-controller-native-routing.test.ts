@@ -11,7 +11,7 @@ import { NATIVE_REVIEW_ERROR_CODE, NATIVE_REVIEW_OPERATION, NativeReviewCliError
 
 // Queued-adapter clients never execute a real process; default to a fixed absolute
 // package-local path so these tests do not depend on an installed binary
-// (unavailable while the pinned v2.1.7 release digests are pending).
+// (for example while a re-pinned release's digests are still pending).
 class NativeReviewCliV214 extends NativeReviewCliV214Production {
 	constructor(...parameters: ConstructorParameters<typeof NativeReviewCliV214Production>) {
 		const [adapter, executable, ...rest] = parameters;

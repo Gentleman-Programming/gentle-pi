@@ -14,7 +14,7 @@ import {
 
 // The queued-adapter unit tests never execute a real process; default to a fixed
 // absolute package-local path so they do not depend on an installed binary
-// (unavailable while the pinned v2.1.7 release digests are pending).
+// (for example while a re-pinned release's digests are still pending).
 class NativeReviewCliV213 extends NativeReviewCliV213Production {
 	constructor(...parameters: ConstructorParameters<typeof NativeReviewCliV213Production>) {
 		const [adapter, executable, ...rest] = parameters;

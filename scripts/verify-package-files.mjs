@@ -93,7 +93,7 @@ const contractHashes = {
   "contracts/review-integration/v1/schemas/result-artifact.schema.json": "91296bd2c261fd2fe03bffd63efe58badd4927e0d0d8480cd4213f651ecacdf6",
   "contracts/review-integration/v1/schemas/start.schema.json": "394035afa39ac928d3d9a95b81411d328c7c188e0024b42a7c91de44883af628",
   "contracts/review-integration/v1/schemas/status.schema.json": "e72f84cfa40c6a0e9f60db74a9b156c965158b3fb434ccf275b02183e76fd43a",
-  "docs/review-integration.md": "1620ace72015d1e6b6324b749ae04e719dc79a83fff580cd0d2dd6c09604c1f3",
+  "docs/review-integration.md": "a37090433949a79c8f66accdfca8bf7e19a6983b0db8537eb7fa30de77870d96",
 };
 
 requiredPaths.push(...Object.keys(contractHashes));
@@ -118,7 +118,7 @@ const driftedContracts = Object.entries(contractHashes).flatMap(([relativePath, 
 });
 
 if (driftedContracts.length > 0) {
-  console.error("gentle-pi packaged review-integration/v1 bytes drifted from Gentle AI v2.1.7:");
+  console.error("gentle-pi packaged review-integration/v1 bytes drifted from Gentle AI v2.1.8:");
   for (const drift of driftedContracts) console.error(`- ${drift.relativePath}: expected ${drift.expected}, got ${drift.actual}`);
   process.exit(1);
 }
@@ -150,9 +150,9 @@ if (generatedRuntimeCheck.status !== 0) {
 
 const installer = readFileSync(join(root, "scripts/gentle-ai-installer.mjs"), "utf8");
 const binaryResolver = readFileSync(join(root, "lib/gentle-ai-binary.ts"), "utf8");
-if (!installer.includes('INSTALLER_VERSION = "2.1.7"') || !binaryResolver.includes('GENTLE_AI_VERSION = "2.1.7"')) {
-  console.error("gentle-pi package-local Gentle AI version pins are not both v2.1.7.");
+if (!installer.includes('INSTALLER_VERSION = "2.1.8"') || !binaryResolver.includes('GENTLE_AI_VERSION = "2.1.8"')) {
+  console.error("gentle-pi package-local Gentle AI version pins are not both v2.1.8.");
   process.exit(1);
 }
 
-console.log(`gentle-pi package resource check passed (${requiredPaths.length} files; ${Object.keys(contractHashes).length} exact v2.1.7 contract artifacts).`);
+console.log(`gentle-pi package resource check passed (${requiredPaths.length} files; ${Object.keys(contractHashes).length} exact v2.1.8 contract artifacts).`);

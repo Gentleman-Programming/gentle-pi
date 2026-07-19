@@ -437,14 +437,20 @@ test("failure accepts v2.1.7 recovery inputs, bounded backoff, bind replay, caus
 	const backoff = clone(source);
 	backoff.next_action = "retry_with_bounded_backoff";
 	assert.equal(decodeReviewFailureV1(backoff).nextAction, "retry_with_bounded_backoff");
-	for (const category of ["inventory_io_or_layout", "lock_ambiguous", "reset_residue", "record_or_graph_invalid", "inventory_incomplete"]) {
+	// cause_category is diagnostic metadata, not a routing key: the v2.1.8 emitter
+	// already produces "incomplete_store_entry" beyond the vendored schema enum, so
+	// the decoder accepts schema values, the known emitter extension, and tolerates
+	// forward-compatible unknown snake_case values while rejecting malformed ones.
+	for (const category of ["inventory_io_or_layout", "lock_ambiguous", "reset_residue", "record_or_graph_invalid", "inventory_incomplete", "incomplete_store_entry", "future_unknown_cause"]) {
 		const candidate = clone(source);
 		candidate.cause_category = category;
 		assert.equal(decodeReviewFailureV1(candidate).causeCategory, category);
 	}
-	const badCategory = clone(source);
-	badCategory.cause_category = "cosmic_rays";
-	assert.throws(() => decodeReviewFailureV1(badCategory), /cause_category/);
+	for (const malformed of ["Cosmic_Rays", "bad-category", "", "with space", 7]) {
+		const badCategory = clone(source);
+		badCategory.cause_category = malformed;
+		assert.throws(() => decodeReviewFailureV1(badCategory), /cause_category/, String(malformed));
+	}
 	const badContext = clone(source);
 	badContext.context = { scope_change: { unexpected: true } };
 	assert.throws(() => decodeReviewFailureV1(badContext), /context/);

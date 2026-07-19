@@ -245,10 +245,14 @@ const FAILURE_REQUIRED_INPUTS = [
 	"actor",
 ] as const;
 const FAILURE_NEXT_ACTIONS = ["correct_request", "retry", "retry_with_bounded_backoff", "review.status", "review.finalize", "review.bind_sdd", "explicit-maintainer-action", "stop"] as const;
-const FAILURE_CAUSE_CATEGORIES = ["inventory_io_or_layout", "lock_ambiguous", "reset_residue", "record_or_graph_invalid", "inventory_incomplete"] as const;
+// Known cause_category values: the vendored failure.schema.json enum plus
+// "incomplete_store_entry", which the v2.1.8 emitter produces beyond that enum.
+// cause_category is diagnostic metadata (nothing routes on it), so unknown
+// snake_case values are tolerated for forward compatibility.
+const FAILURE_CAUSE_CATEGORIES = ["inventory_io_or_layout", "lock_ambiguous", "reset_residue", "record_or_graph_invalid", "inventory_incomplete", "incomplete_store_entry"] as const;
 export type ReviewFailureRequiredInputV1 = (typeof FAILURE_REQUIRED_INPUTS)[number];
 export type ReviewFailureNextActionV1 = (typeof FAILURE_NEXT_ACTIONS)[number];
-export type ReviewFailureCauseCategoryV1 = (typeof FAILURE_CAUSE_CATEGORIES)[number];
+export type ReviewFailureCauseCategoryV1 = (typeof FAILURE_CAUSE_CATEGORIES)[number] | (string & {});
 
 export interface ReviewFailureTargetEvidenceV1 {
 	candidateTree: string;
@@ -669,7 +673,7 @@ export function decodeReviewFailureV1(value: unknown): ReviewFailureV1 {
 		...(body.request_digest === undefined ? {} : { requestDigest: sha256(body.request_digest, "failure.request_digest") }),
 		requiredInputs: enumArray(body.required_inputs, FAILURE_REQUIRED_INPUTS, "failure.required_inputs", { unique: true }),
 		nextAction: enumeration(body.next_action, FAILURE_NEXT_ACTIONS, "failure.next_action"),
-		...(body.cause_category === undefined ? {} : { causeCategory: enumeration(body.cause_category, FAILURE_CAUSE_CATEGORIES, "failure.cause_category") }),
+		...(body.cause_category === undefined ? {} : { causeCategory: text(body.cause_category, "failure.cause_category", { minimum: 1, pattern: /^[a-z0-9]+(?:_[a-z0-9]+)*$/ }) }),
 		...(body.context === undefined ? {} : { context: decodeFailureContext(body.context, "failure.context") }),
 		raw: body,
 	};

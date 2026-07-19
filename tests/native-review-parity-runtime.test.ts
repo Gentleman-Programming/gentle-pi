@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import { GENTLE_AI_VERSION, resolveGentleAiBinary } from "../lib/gentle-ai-binary.ts";
-import { NativeReviewCliV214 } from "../lib/native-review-cli.ts";
+import { NativeReviewCliV216 } from "../lib/native-review-cli.ts";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 import { resolveGentleAiReleaseAsset } from "../scripts/gentle-ai-installer.mjs";
 
@@ -353,7 +353,10 @@ test("registered gentle_review START materializes a safe internal skill symlink 
 
 	const candidateViews = new CandidateViewRegistry();
 	let nativeStartReached = false;
-	const native = new NativeReviewCliV214(async (request) => {
+	// The production controller pairs with the negotiated client; v2.1.8's ordinary
+	// (non-negotiated) START output carries additional facade fields that the
+	// pinned legacy decoder intentionally rejects.
+	const native = new NativeReviewCliV216(async (request) => {
 		if (request.arguments[0] === "review" && request.arguments[1] === "start") nativeStartReached = true;
 		const command = await run(binary, request.arguments, request.cwd, true);
 		return { ...command, signal: null, timedOut: false, outputLimitExceeded: false };
