@@ -30,6 +30,8 @@ export const NATIVE_REVIEW_OPERATION = {
 	BIND_SDD: "review/bind-sdd",
 	SDD_STATUS: "sdd-status",
 	STATUS: "review/status",
+	RECLAIM: "review/reclaim",
+	RECOVER: "review/recover",
 }         ;
 
 
@@ -92,6 +94,34 @@ export const NATIVE_SDD_ARTIFACT_STATE = {
 
 
 
+
+
+
+
+export const NATIVE_REVIEW_RECOVER_DISPOSITION = ["scope_changed", "invalidated", "escalated"]         ;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/** Raw audited native record; Pi relays it verbatim and never reinterprets it. */
 
 
 
@@ -249,11 +279,11 @@ const NATIVE_SDD_NEXT_ACTION = ["apply", "verify", "remediate", "archive", "revi
 const NATIVE_SDD_POST_REVIEW_ACTION = ["verify", "archive"]         ;
 
 export const NATIVE_CLI_CONTRACTS = Object.freeze({
-	"2.1.4": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: false, inventory: false }),
-	"2.1.5": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true }),
-	"2.1.6": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true }),
-	"2.1.7": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true }),
-	"2.1.8": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true }),
+	"2.1.4": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: false, inventory: false, reclaim: false, recover: false }),
+	"2.1.5": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false }),
+	"2.1.6": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false }),
+	"2.1.7": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false }),
+	"2.1.8": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true }),
 });
 
 
@@ -869,6 +899,45 @@ export class NativeReviewCliV214 {
 			};
 		});
 	}
+
+	async reclaim(request                            )                                      {
+		for (const [name, value] of [["lineage", request.lineage], ["actor", request.actor], ["reason", request.reason]]         ) {
+			if (!isCanonicalProcessString(value)) throw new TypeError(`Native RECLAIM ${name} must be a non-empty, trimmed, NUL-free string`);
+		}
+		await this.verifyVersion(request.cwd, request.signal, ["reclaim"]);
+		const { body } = await this.execute(NATIVE_REVIEW_OPERATION.RECLAIM, request.cwd, ["review", "reclaim", "--cwd", request.cwd, "--lineage", request.lineage, "--actor", request.actor, "--reason", request.reason], true, request.signal);
+		return { record: body };
+	}
+
+	async recover(request                            )                                      {
+		for (const [name, value] of [
+			["predecessorLineage", request.predecessorLineage],
+			["expectedPredecessorRevision", request.expectedPredecessorRevision],
+			["successorLineage", request.successorLineage],
+			["actor", request.actor],
+			["reason", request.reason],
+		]         ) {
+			if (!isCanonicalProcessString(value)) throw new TypeError(`Native RECOVER ${name} must be a non-empty, trimmed, NUL-free string`);
+		}
+		// The maintainer authorization is an exact multi-line LF-only binding, so
+		// LF is the only permitted control character.
+		if (request.maintainerAuthorization !== undefined && (request.maintainerAuthorization.length === 0 || /[\u0000-\u0009\u000b-\u001f\u007f]/.test(request.maintainerAuthorization))) {
+			throw new TypeError("Native RECOVER maintainerAuthorization must be a non-empty LF-only binding");
+		}
+		if (!(NATIVE_REVIEW_RECOVER_DISPOSITION                     ).includes(request.disposition)) throw new TypeError("Native RECOVER disposition must be scope_changed, invalidated, or escalated");
+		await this.verifyVersion(request.cwd, request.signal, ["recover"]);
+		const { body } = await this.execute(NATIVE_REVIEW_OPERATION.RECOVER, request.cwd, [
+			"review", "recover", "--cwd", request.cwd,
+			"--predecessor-lineage", request.predecessorLineage,
+			"--expected-predecessor-revision", request.expectedPredecessorRevision,
+			"--successor-lineage", request.successorLineage,
+			"--disposition", request.disposition,
+			"--actor", request.actor,
+			"--reason", request.reason,
+			...(request.maintainerAuthorization === undefined ? [] : ["--maintainer-authorization", request.maintainerAuthorization]),
+		], true, request.signal);
+		return { record: body };
+	}
 }
 
 export class NativeReviewIntegrationError extends Error {
@@ -1164,6 +1233,16 @@ export class NativeReviewCliV216                            {
 
 	sddStatus(request                        )                                 {
 		return this.legacy.sddStatus(request);
+	}
+
+	// Recovery commands are version-gated plain CLI operations outside the
+	// negotiated integration-v1 contract, exactly like reviewStatus/sddStatus.
+	reclaim(request                            )                                      {
+		return this.legacy.reclaim(request);
+	}
+
+	recover(request                            )                                      {
+		return this.legacy.recover(request);
 	}
 }
 

@@ -52,7 +52,6 @@ import {
 import type { TriggerEvent } from "../lib/review-triggers.ts";
 import { canonicalJsonV1, domainHashV1 } from "../lib/review-canonical.ts";
 import { inspectLegacyReviewAuthorityV1, type LegacyInspectionV1 } from "../lib/review-legacy-detector.ts";
-import { compactResetRequestV1, destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
 import { ReviewMutationLockV1 } from "../lib/review-lock.ts";
 import {
 	COMPACT_START_BLOCK_ACTION,
@@ -132,7 +131,7 @@ import {
 } from "../lib/review-snapshot.ts";
 import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
 import { CandidateViewError, CandidateViewRegistry, injectReviewCandidateView, resolveCanonicalCandidateBase } from "../lib/review-candidate-view.ts";
-import { NATIVE_REVIEW_AUTHORITY_APPLICABILITY, classifyNativeReviewRemediation, type NativeReviewRemediationClassification } from "../lib/native-review-remediation.ts";
+import { NATIVE_REVIEW_AUTHORITY_APPLICABILITY, classifyNativeReviewRemediation } from "../lib/native-review-remediation.ts";
 import {
 	createNativeReviewCli,
 	isCanonicalProcessString,
@@ -2741,9 +2740,7 @@ function inspectReviewAuthorityForController(cwd: string): ControllerReviewAutho
 				throw error;
 			}
 		})()
-		: compact.outcome === COMPACT_AUTHORITY_OUTCOME.INVALID
-			? { ...legacy, reset_request: compactResetRequestV1(cwd, legacy) }
-			: legacy;
+		: legacy;
 	return compact.outcome === COMPACT_AUTHORITY_OUTCOME.NONE
 		? inspection
 		: { ...inspection, compact_authority: compact };
@@ -4203,24 +4200,84 @@ function nativeStatusFailed(operation: ReviewControllerOperation, error: unknown
 	};
 }
 
-interface NativeResetRemediationPreflight {
-	classification: NativeReviewRemediationClassification;
-	status: NativeReviewStatusResult;
-}
+const NATIVE_RECOVERY_INPUT = {
+	reclaim: ["lineage", "actor", "reason"],
+	recover: ["predecessorLineage", "expectedPredecessorRevision", "successorLineage", "disposition", "actor", "reason"],
+} as const;
 
-async function nativeResetRemediationPreflight(
-	nativeReviewCli: NativeReviewCli | null,
+/**
+ * Routes the destructive controller operations to their closest audited native
+ * equivalent: RESET and RECOVER_LOCK map to `gentle-ai review reclaim`
+ * (audited quarantine of one incomplete entry) and RECOVER maps to
+ * `gentle-ai review recover` (auditable successor authority). Native inputs
+ * the legacy flow never carried are requested through a structured envelope
+ * instead of being invented. Pi-owned authorization semantics run before this
+ * routing and are unchanged.
+ */
+async function executeNativeRecoveryRoute(
+	operation: ReviewControllerOperation,
+	nativeOperation: "reclaim" | "recover",
+	input: Record<string, unknown>,
 	cwd: string,
+	nativeReviewCli: NativeReviewCli | null,
+	pendingAuthorizations: Map<string, PendingReviewAuthorization> | undefined,
 	signal: AbortSignal | undefined,
-): Promise<NativeResetRemediationPreflight | undefined> {
-	if (nativeReviewCli === null) return undefined;
+): Promise<Record<string, unknown>> {
+	const nativeCommand = `review ${nativeOperation}`;
+	const method = nativeOperation === "reclaim" ? nativeReviewCli?.reclaim : nativeReviewCli?.recover;
+	if (nativeReviewCli === null || method === undefined) {
+		return {
+			operation,
+			status: "blocked",
+			outcome: "native-recovery-unavailable",
+			native_operation: nativeCommand,
+			mutation_performed: false,
+			mutation_outcome: "none",
+			next_action: "install-package-local-gentle-ai-or-run-native-review-cli-directly",
+		};
+	}
+	const missing = NATIVE_RECOVERY_INPUT[nativeOperation].filter((key) =>
+		key === "disposition"
+			? input[key] !== "scope_changed" && input[key] !== "invalidated" && input[key] !== "escalated"
+			: typeof input[key] !== "string" || (input[key] as string).trim().length === 0,
+	);
+	if (missing.length > 0) {
+		return {
+			operation,
+			status: "blocked",
+			outcome: "native-input-required",
+			native_operation: nativeCommand,
+			missing_input: missing,
+			mutation_performed: false,
+			mutation_outcome: "none",
+			next_action: "resubmit-with-exact-native-recovery-input",
+		};
+	}
+	pendingAuthorizations?.clear();
 	try {
-		const status = await nativeReviewCli.reviewStatus({ cwd, ...(signal === undefined ? {} : { signal }) });
-		const compact = classifyCompactAuthorityApplicability(cwd);
-		return { classification: classifyNativeReviewRemediation(status, compact.lineageIds), status };
+		const result = nativeOperation === "reclaim"
+			? await nativeReviewCli.reclaim!({ cwd, lineage: String(input.lineage), actor: String(input.actor), reason: String(input.reason), ...(signal === undefined ? {} : { signal }) })
+			: await nativeReviewCli.recover!({
+				cwd,
+				predecessorLineage: String(input.predecessorLineage),
+				expectedPredecessorRevision: String(input.expectedPredecessorRevision),
+				successorLineage: String(input.successorLineage),
+				disposition: input.disposition as "scope_changed" | "invalidated" | "escalated",
+				actor: String(input.actor),
+				reason: String(input.reason),
+				...(typeof input.maintainerAuthorization === "string" ? { maintainerAuthorization: input.maintainerAuthorization } : {}),
+				...(signal === undefined ? {} : { signal }),
+			});
+		return {
+			operation,
+			native_operation: nativeCommand,
+			result: result.record,
+			mutation_performed: true,
+			mutation_outcome: "committed",
+			next_action: "inspect",
+		};
 	} catch (error) {
-		if (asNativeReviewCliError(error)?.code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE) return undefined;
-		throw error;
+		return nativeOperationFailure(operation, error);
 	}
 }
 
@@ -4947,66 +5004,18 @@ async function executeReviewControllerOperation(
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
 		if (typeof input.ownerHash !== "string") throw new Error("Lock recovery requires an exact ownerHash");
-		const authority = resolveRepositoryAuthorityV1(defaultCwd);
-		const lock = new ReviewMutationLockV1(join(authority.store_root, "control"), authority.repository_id, authority.authority_id);
-		lock.recover(input.ownerHash);
-		return { operation: parameters.operation, recovered_lock: true };
+		// A stuck legacy mutation lock is an incomplete in-flight entry; the
+		// audited native quarantine owns its removal. Lock recovery is not a
+		// destructive authority reset, so pending authorizations survive.
+		return await executeNativeRecoveryRoute(parameters.operation, "reclaim", input, defaultCwd, nativeReviewCli, undefined, signal);
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RECOVER) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
-		try {
-			durableResetRecoveryRequest(defaultCwd);
-		} catch (error) {
-			if (error instanceof ReviewResetStateUnavailableError) {
-				return {
-					operation: parameters.operation,
-					status: "blocked",
-					outcome: REVIEW_CONTROLLER_OUTCOME.RESET_STATE_UNAVAILABLE,
-					mutation_performed: false,
-					next_action: "stop-and-restore-durable-reset-state",
-				};
-			}
-			throw error;
-		}
-		pendingAuthorizations.clear();
-		const result = destructiveResetReviewAuthorityV1({ cwd: defaultCwd, repositoryId: String(input.repositoryId), commonDirHash: String(input.commonDirHash), inventoryHash: String(input.inventoryHash), confirmation: String(input.confirmation), resume: true });
-		const inspection = inspectReviewAuthorityForController(defaultCwd);
-		return { operation: parameters.operation, result, inspection, next_action: inspection.outcome === "clean" ? "start-fresh-ordinary-review-after-verified-clean" : "inspect-reset-recovery" };
+		return await executeNativeRecoveryRoute(parameters.operation, "recover", input, defaultCwd, nativeReviewCli, pendingAuthorizations, signal);
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RESET) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
-		const inspection = inspectReviewAuthorityForController(defaultCwd);
-		const piResetEligible = inspection.outcome !== "clean" && "reset_request" in inspection;
-		let nativePreflight: NativeResetRemediationPreflight | undefined;
-		try {
-			nativePreflight = await nativeResetRemediationPreflight(nativeReviewCli, defaultCwd, signal);
-		} catch (error) {
-			return nativeOperationFailure(parameters.operation, error);
-		}
-		if (nativePreflight?.status.status === NATIVE_REVIEW_AUTHORITY_STATUS.RESET_IN_PROGRESS) {
-			return { operation: parameters.operation, status: "blocked", outcome: "native-authority-reset-in-progress", lineage_created: false, mutation_performed: false, mutation_outcome: "none", next_action: "recover-native-reset" };
-		}
-		if (!piResetEligible && nativeReviewCli !== null) {
-			if (nativePreflight?.classification.applicability === NATIVE_REVIEW_AUTHORITY_APPLICABILITY.APPLICABLE) {
-				return { operation: parameters.operation, status: "blocked", outcome: "native-authority-remediation-unavailable", lineage_created: false, mutation_performed: false, mutation_outcome: "none", next_action: "preserve-native-history-and-resolve-with-native-maintainer" };
-			}
-			return { operation: parameters.operation, status: "blocked", outcome: "native-reset-not-eligible", lineage_created: false, mutation_performed: false, mutation_outcome: "none", next_action: "resolve-native-authority-without-destroy", evidence: { native_status: nativePreflight?.status.status ?? "status-unavailable", authority_applicability: nativePreflight?.classification.applicability ?? "unknown" } };
-		}
-		pendingAuthorizations.clear();
-		let result;
-		try {
-			result = destructiveResetReviewAuthorityV1({ cwd: defaultCwd, repositoryId: String(input.repositoryId), commonDirHash: String(input.commonDirHash), inventoryHash: String(input.inventoryHash), confirmation: String(input.confirmation), resume: false });
-		} catch (error) {
-			if (nativeReviewCli !== null && error instanceof Error && error.message === "Destructive reset requires detected legacy, mixed, or invalid compact authority") {
-				if (nativePreflight?.classification.applicability === NATIVE_REVIEW_AUTHORITY_APPLICABILITY.APPLICABLE) {
-					return { operation: parameters.operation, status: "blocked", outcome: "native-authority-remediation-unavailable", lineage_created: false, mutation_performed: false, mutation_outcome: "none", next_action: "preserve-native-history-and-resolve-with-native-maintainer" };
-				}
-				return { operation: parameters.operation, status: "blocked", outcome: "native-reset-not-eligible", lineage_created: false, mutation_performed: false, mutation_outcome: "none", next_action: "resolve-native-authority-without-destroy", evidence: { native_status: nativePreflight?.status.status ?? "status-unavailable", authority_applicability: nativePreflight?.classification.applicability ?? "unknown" } };
-			}
-			throw error;
-		}
-		const after = inspectReviewAuthorityForController(defaultCwd);
-		return { operation: parameters.operation, result, inspection: after, next_action: after.outcome === "clean" ? "start-fresh-ordinary-review-after-verified-clean" : "inspect-reset-recovery" };
+		return await executeNativeRecoveryRoute(parameters.operation, "reclaim", input, defaultCwd, nativeReviewCli, pendingAuthorizations, signal);
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.REPAIR) {
 		const inspection = inspectReviewAuthorityForController(defaultCwd);
@@ -6114,13 +6123,13 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 		name: "gentle_review",
 		label: "Gentle Review Controller",
 		description:
-			"Inspect and recover review authority, run new native ordinary review through start/finalize/validate, preserve legacy compact compatibility reads and graph-v1 Judgment Day, and authorize one exact lifecycle command. FINALIZE input is a JSON string: review_result.lens_results[] entries contain lens, findings, and non-empty evidence exactly once for every lens selected by START; final_evidence and final_verification_passed are paired. This is the Pi wrapper contract, distinct from native CLI --result, --refuter, --validation, and --evidence files. RESET/RECOVER remain destructive; prepare-supersession/supersede require fresh interactive authorization and fail closed headlessly. Legacy bundle transport is retired: export/import return a legacy-operation-retired envelope pointing at the native gentle-ai review CLI and the Git common-directory store.",
+			"Inspect and recover review authority, run new native ordinary review through start/finalize/validate, preserve legacy compact compatibility reads and graph-v1 Judgment Day, and authorize one exact lifecycle command. FINALIZE input is a JSON string: review_result.lens_results[] entries contain lens, findings, and non-empty evidence exactly once for every lens selected by START; final_evidence and final_verification_passed are paired. This is the Pi wrapper contract, distinct from native CLI --result, --refuter, --validation, and --evidence files. RESET/RECOVER remain destructive and are executed by the audited native CLI: RESET and RECOVER_LOCK map to `gentle-ai review reclaim` and RECOVER maps to `gentle-ai review recover`; missing native inputs are requested through a native-input-required envelope, never invented. prepare-supersession/supersede require fresh interactive authorization and fail closed headlessly. Legacy bundle transport is retired: export/import return a legacy-operation-retired envelope pointing at the native gentle-ai review CLI and the Git common-directory store.",
 		promptSnippet: "Inspect authority, then use native start/finalize/validate for a new ordinary review; use graph-v1 only for explicit Judgment Day",
 		promptGuidelines: [
 			'Call {"operation":"inspect"} before START. New native ordinary START uses a JSON string such as "{\\"mode\\":\\"ordinary\\"}"; an explicit baseRef must be paired with committedOnly: true to request a committed range, while policyPath remains repository-local. policyHash is legacy compact-only. The controller derives lineage, Git/untracked scope, tier, lenses, authored lines, and budget.',
 			"For non-destructive legacy recovery, call prepare-supersession with one exact change, source, successor, operation, and prepared evidence input. Call supersede only with the returned request hash and exact English challenge after fresh UI approval; it never falls back to RESET or RECOVER. Headless, stale, conflicting, malformed, or unsupported recovery remains resolve-review blocked; exact retries are idempotent, but semantic retries require a new operation.",
 			"Run selected lenses once, then call FINALIZE with a JSON string containing review_result.lens_results entries for every START-selected lens. Each entry has lens, findings, and non-empty evidence; clean lenses use findings: []. Pair final_evidence with final_verification_passed. This Pi wrapper shape differs from native CLI --result, --refuter, --validation, and --evidence files. FINALIZE alone records correction forecast, Git-derived correction evidence, targeted validation, and final evidence. Use ADVANCE only for explicit graph-v1 Judgment Day.",
-			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization for the exact reset_request challenge, then call RESET or RECOVER only after authorization. RESET and RECOVER internally INSPECT authority; require their verified clean result and next_action start-fresh-ordinary-review-after-verified-clean before continuing directly to a fresh ordinary START.",
+			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization for the exact reset_request challenge, then call RESET or RECOVER only after authorization. RESET and RECOVER_LOCK route to audited native `gentle-ai review reclaim` and RECOVER routes to native `gentle-ai review recover`; supply the exact native inputs (lineage/actor/reason, or the predecessor, revision, successor, disposition, actor, and reason bindings) and treat a native-input-required envelope as a request for those values, never as permission to invent them. After a committed native recovery record, INSPECT before any fresh ordinary START.",
 			"A reported lineage_created false or pre-authority validation error proves no lineage was created. After ambiguous START or FINALIZE output, the controller calls target-scoped native status first and returns only its declared action. Never infer or prescribe replay unless native explicitly reports exact_replay_safe for the same canonical request and required lineage.",
 			"Use gentle_review for bounded review transaction operations and exact lifecycle validation; never fabricate bash tool metadata or a separate gate target.",
 		],

@@ -21,7 +21,8 @@ class NativeReviewCliV214 extends NativeReviewCliV214Production {
 import { canonicalJsonV1, domainHashV1 } from "../lib/review-canonical.ts";
 import { SupersessionStoreV1 } from "../lib/review-authority-supersession.ts";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
-import { compactResetRequestV1, destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
+import { inspectLegacyReviewAuthorityV1 } from "../lib/review-legacy-detector.ts";
+import { resolveRepositoryAuthorityV1 } from "../lib/review-repository.ts";
 import { NATIVE_REVIEW_REMEDIATION, classifyNativeReviewRemediation } from "../lib/native-review-remediation.ts";
 import type { ReviewStatusV1 } from "../lib/review-integration-v1.ts";
 
@@ -210,6 +211,37 @@ function nativePrePrGateContext(boundary: PrePrBoundaryFixture): Awaited<ReturnT
 		remote_identity: boundary.remoteIdentity,
 	};
 	return gateContext;
+}
+
+/**
+ * Writes the durable Pi reset-state journal exactly as an interrupted legacy
+ * destructive reset left it, and returns the recovery request INSPECT must
+ * surface for it. The writer module retired with the legacy reset; the durable
+ * on-disk contract it produced is still read by INSPECT.
+ */
+function craftDurableResetState(cwd: string): { repositoryId: string; commonDirHash: string; inventoryHash: string; confirmation: string } {
+	const authority = resolveRepositoryAuthorityV1(cwd);
+	const commonDirHash = domainHashV1("common-directory", authority.common_directory);
+	const inventoryHash = "f".repeat(64);
+	const confirmation = `DESTROY REVIEW AUTHORITY ${authority.repository_id} AT ${commonDirHash} INVENTORY ${inventoryHash}`;
+	const resetId = "a".repeat(64);
+	const body = {
+		schema: "gentle-ai.review-reset-state/v1",
+		reset_id: resetId,
+		repository_id: authority.repository_id,
+		common_directory_hash: commonDirHash,
+		authorized_inventory_hash: inventoryHash,
+		authorization_hash: domainHashV1("reset-authorization", confirmation),
+		sequence: 0,
+		phase: "marked",
+		quarantine_relative_path: join("reset-quarantine", resetId),
+		moved_roots: [],
+		deleted_roots: [],
+	};
+	const control = join(authority.store_root, "control");
+	mkdirSync(control, { recursive: true });
+	writeFileSync(join(control, "reset-state.json"), JSON.stringify({ body, reset_state_hash: domainHashV1("reset-state", body) }));
+	return { repositoryId: authority.repository_id, commonDirHash, inventoryHash, confirmation };
 }
 
 function fakeNative(overrides: Partial<NativeReviewCli> = {}): NativeReviewCli {
@@ -3371,7 +3403,7 @@ test("native INSPECT exposes reset material only for exact applicable Pi corrupt
 		const inspected = await controller.execute("eligible-pi-corruption", { operation: "inspect" }, undefined, undefined, context(cwd));
 		const details = inspected.details as Record<string, unknown>;
 		assert.equal(details.reset_eligible, true);
-		assert.deepEqual((details.inspection as Record<string, unknown>).reset_request, compactResetRequestV1(cwd));
+		assert.deepEqual((details.inspection as Record<string, unknown>).reset_request, inspectLegacyReviewAuthorityV1(cwd).reset_request);
 		assert.equal(nativeStatuses, 0);
 	});
 
@@ -3380,11 +3412,7 @@ test("native INSPECT exposes reset material only for exact applicable Pi corrupt
 		const legacyPath = join(cwd, ".git", "gentle-ai", "reviews", "lineages", "legacy");
 		mkdirSync(legacyPath, { recursive: true });
 		writeFileSync(join(legacyPath, "authority.json"), "legacy\n");
-		const request = compactResetRequestV1(cwd);
-		assert.throws(
-			() => destructiveResetReviewAuthorityV1({ cwd, ...request, faultAfterPhase: "quarantining" }),
-			/injected/i,
-		);
+		const request = craftDurableResetState(cwd);
 		const { controller } = runtime(fakeNative());
 		const inspected = await controller.execute("reset-in-progress", { operation: "inspect" }, undefined, undefined, context(cwd));
 		const details = inspected.details as Record<string, unknown>;
@@ -3533,58 +3561,71 @@ test("native invalid inventory authorizes only RESET remediation while unrelated
 		});
 	});
 
-	await t.test("unrelated valid native history does not authorize RESET", async (t) => {
+	await t.test("RESET without the audited native inputs blocks and never invokes a native mutation", async (t) => {
 		const cwd = repository(t);
 		unrelatedHistory(cwd);
+		let reclaims = 0;
 		const { controller } = runtime(fakeNative({
 			reviewStatus: async () => nativeStatus(cwd, "approved", true, true, [{ version: "legacy-v1", path: join(cwd, ".git", "gentle-ai", "reviews", "legacy"), status: "approved", problems: [] }]),
+			reclaim: async () => { reclaims += 1; return { record: {} }; },
 		}));
 		const inspected = await controller.execute("native-valid-inspect", { operation: "inspect" }, undefined, undefined, context(cwd));
 		const inspectionDetails = inspected.details as Record<string, unknown>;
 		assert.equal(inspectionDetails.reset_eligible, false);
 		assertNoPublicResetRequest(inspectionDetails);
-		const reset = await controller.execute("native-valid-reset", { operation: "reset", input: JSON.stringify(compactResetRequestV1(cwd)) }, undefined, undefined, interactiveContext(cwd));
+		const request = inspectLegacyReviewAuthorityV1(cwd).reset_request;
+		const reset = await controller.execute("native-valid-reset", { operation: "reset", input: JSON.stringify(request) }, undefined, undefined, interactiveContext(cwd));
 		assert.deepEqual(reset.details, {
 			operation: "reset",
 			status: "blocked",
-			outcome: "native-reset-not-eligible",
-			lineage_created: false,
+			outcome: "native-input-required",
+			native_operation: "review reclaim",
+			missing_input: ["lineage", "actor", "reason"],
 			mutation_performed: false,
 			mutation_outcome: "none",
-			next_action: "resolve-native-authority-without-destroy",
-			evidence: { native_status: "approved", authority_applicability: "unrelated-history" },
+			next_action: "resubmit-with-exact-native-recovery-input",
 		});
+		assert.equal(reclaims, 0);
 	});
 
-	await t.test("native repository identity mismatch cannot authorize RESET", async (t) => {
+	await t.test("a native reclaim failure surfaces as a typed native operation failure", async (t) => {
 		const cwd = repository(t);
 		unrelatedHistory(cwd);
 		const { controller } = runtime(fakeNative({
-			reviewStatus: async () => { throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.STATUS, true, false, "native repository mismatch"); },
+			reclaim: async () => { throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.RECLAIM, true, true, "native repository mismatch"); },
 		}));
-		const request = compactResetRequestV1(cwd);
+		const request = { ...inspectLegacyReviewAuthorityV1(cwd).reset_request, lineage: "stuck", actor: "maintainer", reason: "invalid authority" };
 		const reset = await controller.execute("native-identity-reset", { operation: "reset", input: JSON.stringify(request) }, undefined, undefined, interactiveContext(cwd));
 		assert.equal((reset.details as Record<string, unknown>).status, "blocked");
 		assert.equal((reset.details as Record<string, unknown>).outcome, "native-operation-failed");
 	});
 });
 
-test("applicable native corruption without Pi corruption fails typed and never invokes a native mutation", async (t) => {
+test("RESET no longer consults status preflight; it either requests native inputs or runs audited native reclaim", async (t) => {
 	const cwd = repository(t);
 	const compact = await import("../lib/review-facade.ts");
 	compact.startCompactReview({ cwd, lineageId: "pi-current", policyHash: "a".repeat(64), projection: { kind: "complete" } });
 	let statusCalls = 0;
-	const { controller } = runtime(fakeNative({ reviewStatus: async () => {
-		statusCalls += 1;
-		return {
-			repository: cwd, complete: false, authoritative: false, status: "invalid",
-			entries: [{ version: "compact-v2", lineageId: "pi-current", path: join(cwd, ".git", "gentle-ai", "review-transactions"), status: "invalid", problems: ["native corruption"] }],
-			locks: [], diagnostics: [], raw: {},
-		};
-	} }));
-	const result = await controller.execute("native-only-corruption", { operation: "reset", input: JSON.stringify(compactResetRequestV1(cwd)) }, undefined, undefined, interactiveContext(cwd));
-	assert.equal((result.details as { outcome?: string }).outcome, "native-authority-remediation-unavailable");
-	assert.equal(statusCalls, 1);
+	const reclaims: Array<Record<string, unknown>> = [];
+	const record = { schema: "gentle-ai.review-reclaim-audit/v1", lineage: "pi-current" };
+	const { controller } = runtime(fakeNative({
+		reviewStatus: async () => { statusCalls += 1; throw new Error("status must not gate native recovery"); },
+		reclaim: async (request) => { reclaims.push(request as unknown as Record<string, unknown>); return { record }; },
+	}));
+	const base = { repositoryId: "repo", commonDirHash: "c".repeat(64), inventoryHash: "d".repeat(64), confirmation: "DESTROY REVIEW AUTHORITY repo" };
+	const missing = await controller.execute("native-missing-input", { operation: "reset", input: JSON.stringify(base) }, undefined, undefined, interactiveContext(cwd));
+	assert.equal((missing.details as { outcome?: string }).outcome, "native-input-required");
+	const reset = await controller.execute("native-reclaim", { operation: "reset", input: JSON.stringify({ ...base, lineage: "pi-current", actor: "maintainer", reason: "invalid authority" }) }, undefined, undefined, interactiveContext(cwd));
+	const details = reset.details as Record<string, unknown>;
+	assert.equal(details.native_operation, "review reclaim");
+	assert.equal(details.mutation_performed, true);
+	assert.equal(details.mutation_outcome, "committed");
+	assert.deepEqual(details.result, record);
+	assert.equal(details.next_action, "inspect");
+	assert.equal(reclaims.length, 1);
+	assert.equal(reclaims[0]?.lineage, "pi-current");
+	assert.equal(reclaims[0]?.actor, "maintainer");
+	assert.equal(statusCalls, 0);
 });
 
 test("independent-verification routing matrix names every native authority contract", () => {
@@ -3595,45 +3636,37 @@ test("independent-verification routing matrix names every native authority contr
 		"4 BIND-SDD native failure => diagnostics",
 		"5 successful START then decoder rejection => unknown/status required",
 		"6 invalid historical inventory + Pi clean/unrelated => reset_eligible:false",
-		"7 applicable corrupt lineage => exact fresh reset request",
+		"7 authorized RESET/RECOVER => audited native reclaim/recover only",
 		"8 FINALIZE failure existing lineage => unknown/status/diagnostics",
-		"9 stale/foreign challenge => zero mutation",
-		"10 reset-in-progress => RECOVER-only/zero destructive calls",
+		"9 missing native recovery input => native-input-required/zero mutation",
+		"10 Pi reset-in-progress => durable RECOVER challenge via INSPECT",
 	] as const;
 	assert.deepEqual(rows, [...new Set(rows)]);
 	assert.equal(rows.length, 10);
 	for (const row of rows) assert.match(row, /^\d+ /);
 });
 
-test("native RESET preflight table rejects every non-corrupt native authority before Pi mutation", async (t) => {
-	const rows = [
-		{ name: "unknown/incomplete", status: "invalid" as const, complete: false, authoritative: false, outcome: "native-reset-not-eligible" },
-		{ name: "unrelated/clean", status: "clean" as const, complete: true, authoritative: true, outcome: "native-reset-not-eligible" },
-		{ name: "active", status: "active" as const, complete: true, authoritative: true, outcome: "native-reset-not-eligible" },
-		{ name: "approved", status: "approved" as const, complete: true, authoritative: true, outcome: "native-reset-not-eligible" },
-		{ name: "reset-in-progress RECOVER-only", status: "reset-in-progress" as const, complete: true, authoritative: true, outcome: "native-authority-reset-in-progress" },
-		{ name: "superseded", status: "superseded" as const, complete: true, authoritative: true, outcome: "native-reset-not-eligible" },
-		{ name: "recovered", status: "recovered" as const, complete: true, authoritative: true, outcome: "native-reset-not-eligible" },
-	] as const;
-	for (const row of rows) await t.test(row.name, async (child) => {
-		const cwd = repository(child); let statusCalls = 0;
-		const native = fakeNative({ reviewStatus: async () => {
-			statusCalls += 1;
-			return {
-				repository: cwd,
-				complete: row.complete,
-				authoritative: row.authoritative,
-				status: row.status,
-				entries: [], locks: [], diagnostics: [],
-				raw: { schema: "gentle-ai.review-authority-status/v1", operation: "review/status", repository: cwd, complete: row.complete, authoritative: row.authoritative, status: row.status, entries: [], locks: [], diagnostics: [] },
-			};
-		} });
-		const { controller } = runtime(native);
-		const result = await controller.execute(`reset-${row.name}`, { operation: "reset", input: JSON.stringify(compactResetRequestV1(cwd)) }, undefined, undefined, interactiveContext(cwd));
-		const details = result.details as Record<string, unknown>;
-		assert.equal(details.outcome, row.outcome);
-		assert.equal(details.mutation_performed, false);
-		assert.equal(statusCalls, 1);
-		if (row.status === "reset-in-progress") assert.equal(details.next_action, "recover-native-reset");
-	});
+test("authorized RECOVER routes to native review recover with the exact successor binding", async (t) => {
+	const cwd = repository(t);
+	const recovers: Array<Record<string, unknown>> = [];
+	const record = { schema: "gentle-ai.review-recovery/v1", successor_lineage: "successor" };
+	const { controller } = runtime(fakeNative({
+		recover: async (request) => { recovers.push(request as unknown as Record<string, unknown>); return { record }; },
+	}));
+	const base = { repositoryId: "repo", commonDirHash: "c".repeat(64), inventoryHash: "d".repeat(64), confirmation: "DESTROY REVIEW AUTHORITY repo" };
+	const missing = await controller.execute("native-recover-missing", { operation: "recover", input: JSON.stringify(base) }, undefined, undefined, interactiveContext(cwd));
+	assert.equal((missing.details as Record<string, unknown>).outcome, "native-input-required");
+	assert.deepEqual((missing.details as Record<string, unknown>).missing_input, ["predecessorLineage", "expectedPredecessorRevision", "successorLineage", "disposition", "actor", "reason"]);
+	assert.equal(recovers.length, 0);
+	const recovered = await controller.execute("native-recover", {
+		operation: "recover",
+		input: JSON.stringify({ ...base, predecessorLineage: "broken", expectedPredecessorRevision: "rev-1", successorLineage: "successor", disposition: "invalidated", actor: "maintainer", reason: "invalid authority" }),
+	}, undefined, undefined, interactiveContext(cwd));
+	const details = recovered.details as Record<string, unknown>;
+	assert.equal(details.native_operation, "review recover");
+	assert.equal(details.mutation_performed, true);
+	assert.deepEqual(details.result, record);
+	assert.equal(recovers.length, 1);
+	assert.equal(recovers[0]?.predecessorLineage, "broken");
+	assert.equal(recovers[0]?.disposition, "invalidated");
 });

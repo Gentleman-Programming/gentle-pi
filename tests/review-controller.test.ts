@@ -30,7 +30,6 @@ import {
 	resolveReviewAuthorityForChange,
 	SupersessionStoreV1,
 } from "../lib/review-authority-supersession.ts";
-import { destructiveResetReviewAuthorityV1 } from "../lib/review-reset.ts";
 import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
 import { qualifiedReviewLockPlatform, testSnapshot } from "./review-test-fixtures.ts";
 import type { NativeReviewCli } from "../lib/native-review-cli.ts";
@@ -73,22 +72,6 @@ interface RegisteredReviewTool {
 function createLegacyReviewAuthority(repository: string): void {
 	mkdirSync(join(repository, ".git", "gentle-ai", "reviews", "lineages", "legacy", "revisions"), { recursive: true });
 	writeFileSync(join(repository, ".git", "gentle-ai", "reviews", "lineages", "legacy", "HEAD"), "legacy authority");
-}
-
-function rewriteResetState(
-	repository: string,
-	mutate: (body: Record<string, unknown>) => void,
-): string {
-	const path = join(repository, ".git", "gentle-ai", "reviews", "control", "reset-state.json");
-	const envelope = JSON.parse(readFileSync(path, "utf8")) as {
-		body: Record<string, unknown>;
-		reset_state_hash: string;
-	};
-	mutate(envelope.body);
-	envelope.reset_state_hash = domainHashV1("reset-state", envelope.body);
-	const serialized = JSON.stringify(envelope);
-	writeFileSync(path, serialized);
-	return serialized;
 }
 
 type ToolCallHandler = (
@@ -771,16 +754,21 @@ test("controller retains graph-v1 inspection and repair behavior without compact
 	assert.equal(repaired.repaired, true);
 });
 
-test("controller inspect reports lock state and recover never force-steals an absent lock", async (t) => {
+test("controller inspect reports lock state and lock recovery routes to audited native reclaim", async (t) => {
 	const fixture = createRepository(t, false);
 	const { controller } = registerRuntime();
 	const ctx = extensionContext(fixture.repository);
 	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
 	assert.deepEqual(inspected.lock, { status: "absent" });
 	await assert.rejects(
-		controller.execute("recover-absent", { operation: "recover-lock", input: JSON.stringify({ ownerHash: "a".repeat(64) }) }, undefined, undefined, ctx),
-		/absent|ambiguous/i,
+		controller.execute("recover-missing-owner", { operation: "recover-lock", input: JSON.stringify({ lineage: "stuck", actor: "maintainer", reason: "stale lock" }) }, undefined, undefined, ctx),
+		/ownerHash/i,
 	);
+	const unavailable = await controllerCall(controller, ctx, { operation: "recover-lock", input: JSON.stringify({ ownerHash: "a".repeat(64), lineage: "stuck", actor: "maintainer", reason: "stale lock" }) });
+	assert.equal(unavailable.status, "blocked");
+	assert.equal(unavailable.outcome, "native-recovery-unavailable");
+	assert.equal(unavailable.native_operation, "review reclaim");
+	assert.equal(unavailable.mutation_performed, false);
 	await assert.rejects(
 		controller.execute("recover-reset-requires-confirmation", { operation: "recover", input: JSON.stringify({ ownerHash: "a".repeat(64) }) }, undefined, undefined, ctx),
 		/exact string|confirmation|reset/i,
@@ -833,33 +821,28 @@ test("controller routes legacy authority through explicit reset, verifies clean,
 		confirmations.push({ title, message });
 		return true;
 	});
+	// Authorized RESET now routes to the audited native reclaim operation; a
+	// runtime without a native client fails closed and never mutates Pi state.
 	const reset = await controllerCall(controller, authorizedCtx, {
 		operation: "reset",
-		input: JSON.stringify(resetRequest),
+		input: JSON.stringify({ ...resetRequest, lineage: "legacy", actor: "maintainer", reason: "legacy authority reset" }),
 	});
 	assert.equal(confirmations.length, 1);
 	assert.match(confirmations[0]?.title ?? "", /RESET/);
 	assert.match(confirmations[0]?.message ?? "", new RegExp(String(resetRequest.confirmation).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-	assert.equal((reset.inspection as Record<string, unknown>).outcome, "clean");
-	assert.equal(reset.next_action, "start-fresh-ordinary-review-after-verified-clean");
-	const revoked = await toolCall({ toolName: "bash", input: { command } }, ctx);
-	assert.equal(revoked?.block, true);
+	assert.equal(reset.status, "blocked");
+	assert.equal(reset.outcome, "native-recovery-unavailable");
+	assert.equal(reset.native_operation, "review reclaim");
+	assert.equal(reset.mutation_performed, false);
 
-	const clean = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.equal((clean.inspection as Record<string, unknown>).outcome, "clean");
-	assert.equal(clean.status, "ready");
-
-	const started = await controllerCall(controller, ctx, {
-		operation: "start",
-		lineageId: "ordinary-after-reset",
-		idempotencyKey: "ordinary-after-reset-start",
-		input: JSON.stringify({ mode: "ordinary", projection: { kind: "complete" }, policyHash: "a".repeat(64), evidenceHash: "b".repeat(64), budget: budget() }),
-	});
-	assert.equal(started.operation, "start");
-	assert.equal((started.state as Record<string, unknown>).mode, "ordinary");
+	const stillBlockedAfterNativeUnavailable = await controllerCall(controller, ctx, { operation: "inspect" });
+	assert.equal((stillBlockedAfterNativeUnavailable.inspection as Record<string, unknown>).outcome, "blocked-mixed");
+	// The lifecycle gate keeps failing closed while authority stays blocked-mixed.
+	const gated = await toolCall({ toolName: "bash", input: { command } }, ctx);
+	assert.equal(gated?.block, true);
 });
 
-test("controller resets only invalid compact-v2 authority after an exact interactive challenge", async (t) => {
+test("controller reports invalid compact-v2 authority without fabricating Pi reset material", async (t) => {
 	const fixture = createRepository(t, false);
 	const { controller } = registerRuntime();
 	const ctx = extensionContext(fixture.repository, true);
@@ -876,43 +859,22 @@ test("controller resets only invalid compact-v2 authority after an exact interac
 	assert.equal(((inspected.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "invalid");
 	assert.equal(inspected.status, "blocked");
 	assert.equal(inspected.next_action, "request-explicit-reset-authorization");
+	// The compact-specific reset inventory retired with the Pi-owned destructive
+	// reset; the surviving challenge is the repository-scoped Pi authorization
+	// binding from the legacy detector.
 	const request = (inspected.inspection as Record<string, unknown>).reset_request as Record<string, unknown>;
-	await assert.rejects(
-		controller.execute("wrong-invalid-compact-reset", { operation: "reset", input: JSON.stringify({ ...request, confirmation: `${String(request.confirmation)} altered` }) }, undefined, undefined, ctx),
-		/exactly match/i,
-	);
-	const reset = await controllerCall(controller, ctx, { operation: "reset", input: JSON.stringify(request) });
-	assert.equal((reset.inspection as Record<string, unknown>).outcome, "clean");
-	assert.equal((reset.inspection as Record<string, unknown>).compact_authority, undefined);
-	assert.equal(reset.next_action, "start-fresh-ordinary-review-after-verified-clean");
-});
+	assert.equal(typeof request.confirmation, "string");
+	assert.match(String(request.confirmation), /^DESTROY REVIEW AUTHORITY /);
 
-test("controller INSPECT treats a completed reset journal as history and routes a fresh compact-invalid reset", async (t) => {
-	const fixture = createRepository(t, false);
-	createLegacyReviewAuthority(fixture.repository);
-	const { controller } = registerRuntime();
-	const ctx = extensionContext(fixture.repository, true);
-	const original = await controllerCall(controller, ctx, { operation: "inspect" });
-	await controllerCall(controller, ctx, {
-		operation: "reset",
-		input: JSON.stringify((original.inspection as Record<string, unknown>).reset_request),
-	});
-	const compact = startCompactReview({ cwd: fixture.repository, lineageId: "completed-journal-invalid", policyHash: "a".repeat(64) });
-	writeFileSync(discoverCompactReview(fixture.repository, compact.lineage_id).store.statePath, "malformed compact state");
-
-	const invalid = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.equal((invalid.inspection as Record<string, unknown>).outcome, "clean");
-	assert.equal(((invalid.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "invalid");
-	assert.equal(invalid.status, "blocked");
-	assert.equal(invalid.next_action, "request-explicit-reset-authorization");
-	assert.notEqual(invalid.next_action, "request-explicit-reset-recovery-authorization");
-
-	const reset = await controllerCall(controller, ctx, {
-		operation: "reset",
-		input: JSON.stringify((invalid.inspection as Record<string, unknown>).reset_request),
-	});
-	assert.equal((reset.inspection as Record<string, unknown>).outcome, "clean");
-	assert.equal(reset.next_action, "start-fresh-ordinary-review-after-verified-clean");
+	// An authorized RESET now routes to native reclaim and never mutates the
+	// Pi store; without a native client it fails closed.
+	const blocked = await controllerCall(controller, ctx, { operation: "reset", input: JSON.stringify({ ...request, lineage: lineageId, actor: "maintainer", reason: "invalid compact authority" }) });
+	assert.equal(blocked.status, "blocked");
+	assert.equal(blocked.outcome, "native-recovery-unavailable");
+	assert.equal(blocked.native_operation, "review reclaim");
+	assert.equal(blocked.mutation_performed, false);
+	const unchanged = await controllerCall(controller, ctx, { operation: "inspect" });
+	assert.equal(((unchanged.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "invalid");
 });
 
 test("controller hides destructive reset material for ineligible terminal compact authority", async (t) => {
@@ -926,183 +888,6 @@ test("controller hides destructive reset material for ineligible terminal compac
 	assert.equal((inspected.inspection as Record<string, unknown>).terminal_applicability, "policy-unresolved");
 	assert.equal(((inspected.inspection as Record<string, unknown>).compact_authority as { outcome: string }).outcome, "approved");
 	assert.doesNotMatch(JSON.stringify(inspected), /reset_request|challenge|confirmation|DESTROY/);
-});
-
-test("controller rejects altered destructive reset bindings without authority mutation", async (t) => {
-	const fixture = createRepository(t, false);
-	createLegacyReviewAuthority(fixture.repository);
-	const { controller } = registerRuntime();
-	const ctx = extensionContext(fixture.repository, true);
-	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
-	const original = (inspected.inspection as Record<string, unknown>).reset_request as Record<string, unknown>;
-
-	for (const altered of [
-		{ ...original, confirmation: `${String(original.confirmation)} altered` },
-		{ ...original, inventoryHash: "0".repeat(64) },
-	]) {
-		await assert.rejects(
-			controller.execute("altered-reset", { operation: "reset", input: JSON.stringify(altered) }, undefined, undefined, ctx),
-			/exactly match/i,
-		);
-		const unchanged = await controllerCall(controller, ctx, { operation: "inspect" });
-		assert.equal((unchanged.inspection as Record<string, unknown>).outcome, "blocked-legacy");
-		assert.deepEqual((unchanged.inspection as Record<string, unknown>).reset_request, original);
-		assert.equal(existsSync(join(fixture.repository, ".git", "gentle-ai", "reviews", "control", "reset-state.json")), false);
-	}
-});
-
-test("controller INSPECT preserves the durable recovery request after interrupted RESET changes inventory", async (t) => {
-	const fixture = createRepository(t, false);
-	const { controller, toolCall } = registerRuntime();
-	const ctx = extensionContext(fixture.repository);
-	await approveTrackedWorktreeTransaction(controller, ctx, "before-recover");
-	const command = "git commit -m before-recover";
-	await controllerCall(controller, ctx, { operation: "validate", lineageId: "before-recover", idempotencyKey: "before-recover-gate", command, input: "{}" });
-	createLegacyReviewAuthority(fixture.repository);
-	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
-	const original = (inspected.inspection as Record<string, unknown>).reset_request as Record<string, unknown>;
-
-	assert.throws(
-		() => destructiveResetReviewAuthorityV1({
-			cwd: fixture.repository,
-			repositoryId: String(original.repositoryId),
-			commonDirHash: String(original.commonDirHash),
-			inventoryHash: String(original.inventoryHash),
-			confirmation: String(original.confirmation),
-			faultAfterPhase: "deleting",
-		}),
-		/injected/i,
-	);
-	const interrupted = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.equal((interrupted.inspection as Record<string, unknown>).outcome, "reset-in-progress");
-	assert.deepEqual((interrupted.inspection as Record<string, unknown>).reset_request, original);
-	await assert.rejects(
-		controller.execute("unauthorized-recover", { operation: "recover", input: JSON.stringify(original) }, undefined, undefined, ctx),
-		/interactive Pi UI.*fails closed/i,
-	);
-	const stillInterrupted = await controllerCall(controller, ctx, { operation: "inspect" });
-	assert.deepEqual(stillInterrupted.inspection, interrupted.inspection);
-
-	const recovered = await controllerCall(controller, extensionContext(fixture.repository, true), {
-		operation: "recover",
-		input: JSON.stringify(original),
-	});
-	assert.equal((recovered.inspection as Record<string, unknown>).outcome, "clean");
-	assert.equal(recovered.next_action, "start-fresh-ordinary-review-after-verified-clean");
-	const revoked = await toolCall({ toolName: "bash", input: { command } }, ctx);
-	assert.equal(revoked?.block, true);
-});
-
-test("controller RECOVER returns a stable zero-mutation result when durable reset state is absent", async (t) => {
-	const fixture = createRepository(t, false);
-	const { controller } = registerRuntime();
-	const ctx = extensionContext(fixture.repository, true);
-	createLegacyReviewAuthority(fixture.repository);
-	const inspected = await controllerCall(controller, ctx, { operation: "inspect" });
-	const request = (inspected.inspection as Record<string, unknown>).reset_request as Record<string, unknown>;
-	assert.throws(() => destructiveResetReviewAuthorityV1({
-		cwd: fixture.repository,
-		repositoryId: String(request.repositoryId),
-		commonDirHash: String(request.commonDirHash),
-		inventoryHash: String(request.inventoryHash),
-		confirmation: String(request.confirmation),
-		faultAfterPhase: "deleting",
-	}), /injected/i);
-	const authorityRoot = join(fixture.repository, ".git", "gentle-ai", "reviews");
-	const statePath = join(authorityRoot, "control", "reset-state.json");
-	unlinkSync(statePath);
-	const inventory = JSON.stringify(execFileSync("find", [authorityRoot, "-type", "f", "-printf", "%P:%s\\n"], { encoding: "utf8" }).trim().split("\n").toSorted());
-	const recover = { operation: "recover", input: JSON.stringify(request) };
-	const first = await controllerCall(controller, ctx, recover);
-	const second = await controllerCall(controller, ctx, recover);
-	assert.deepEqual(first, second);
-	assert.equal(first.status, "blocked");
-	assert.equal(first.outcome, "reset-state-unavailable");
-	assert.equal(first.mutation_performed, false);
-	assert.equal(JSON.stringify(execFileSync("find", [authorityRoot, "-type", "f", "-printf", "%P:%s\\n"], { encoding: "utf8" }).trim().split("\n").toSorted()), inventory);
-});
-
-test("controller RECOVER rejects transplanted reset identity and common-directory hash without mutation", async (t) => {
-	const source = createRepository(t, false);
-	const target = createRepository(t, false);
-	createLegacyReviewAuthority(source.repository);
-	const { controller } = registerRuntime();
-	const sourceCtx = extensionContext(source.repository);
-	const sourceInspection = await controllerCall(controller, sourceCtx, { operation: "inspect" });
-	const sourceRequest = (sourceInspection.inspection as Record<string, unknown>).reset_request as Record<string, unknown>;
-	assert.throws(() => destructiveResetReviewAuthorityV1({
-		cwd: source.repository,
-		repositoryId: String(sourceRequest.repositoryId),
-		commonDirHash: String(sourceRequest.commonDirHash),
-		inventoryHash: String(sourceRequest.inventoryHash),
-		confirmation: String(sourceRequest.confirmation),
-		faultAfterPhase: "deleting",
-	}), /injected/i);
-	const sourceState = readFileSync(join(source.repository, ".git", "gentle-ai", "reviews", "control", "reset-state.json"), "utf8");
-
-	const cleanTarget = await controllerCall(controller, extensionContext(target.repository), { operation: "inspect" });
-	const targetRepositoryId = String((cleanTarget.inspection as Record<string, unknown>).repository_id);
-	const targetControl = join(target.repository, ".git", "gentle-ai", "reviews", "control");
-	mkdirSync(targetControl, { recursive: true });
-	const targetStatePath = join(targetControl, "reset-state.json");
-	writeFileSync(targetStatePath, sourceState);
-	const sentinel = join(target.parent, "transplanted-sentinel.txt");
-	writeFileSync(sentinel, "keep");
-
-	await assert.rejects(
-		controller.execute("transplanted-recovery", { operation: "recover", input: JSON.stringify(sourceRequest) }, undefined, undefined, extensionContext(target.repository, true)),
-		/current repository authority|repository identity|common directory/i,
-	);
-	assert.equal(readFileSync(targetStatePath, "utf8"), sourceState);
-	assert.equal(readFileSync(sentinel, "utf8"), "keep");
-	assert.equal(existsSync(join(target.repository, ".git", "gentle-ai", "reviews", "graph-v1")), false);
-
-	const targetInspection = await controllerCall(controller, extensionContext(target.repository), { operation: "inspect" }).catch(() => undefined);
-	assert.equal(targetInspection, undefined);
-	const foreignCommonHashState = rewriteResetState(target.repository, (body) => {
-		body.repository_id = targetRepositoryId;
-		body.common_directory_hash = "f".repeat(64);
-		const confirmation = `DESTROY REVIEW AUTHORITY ${body.repository_id} AT ${body.common_directory_hash} INVENTORY ${body.authorized_inventory_hash}`;
-		body.authorization_hash = domainHashV1("reset-authorization", confirmation);
-	});
-	await assert.rejects(
-		controller.execute("transplanted-hash-recovery", { operation: "recover", input: JSON.stringify(sourceRequest) }, undefined, undefined, extensionContext(target.repository, true)),
-		/current repository authority|common directory/i,
-	);
-	assert.equal(readFileSync(targetStatePath, "utf8"), foreignCommonHashState);
-	assert.equal(readFileSync(sentinel, "utf8"), "keep");
-});
-
-test("controller RECOVER rejects malicious quarantine paths before external deletion or state mutation", async (t) => {
-	const fixture = createRepository(t, false);
-	createLegacyReviewAuthority(fixture.repository);
-	const { controller } = registerRuntime();
-	const inspected = await controllerCall(controller, extensionContext(fixture.repository), { operation: "inspect" });
-	const request = (inspected.inspection as Record<string, unknown>).reset_request as Record<string, unknown>;
-	assert.throws(() => destructiveResetReviewAuthorityV1({
-		cwd: fixture.repository,
-		repositoryId: String(request.repositoryId),
-		commonDirHash: String(request.commonDirHash),
-		inventoryHash: String(request.inventoryHash),
-		confirmation: String(request.confirmation),
-		faultAfterPhase: "deleting",
-	}), /injected/i);
-	const external = join(fixture.repository, ".git", "gentle-ai", "reviews", "external", "lineages");
-	mkdirSync(external, { recursive: true });
-	const sentinel = join(external, "sentinel");
-	writeFileSync(sentinel, "keep");
-
-	for (const quarantinePath of ["../external", "reset-quarantine/../external"]) {
-		const state = rewriteResetState(fixture.repository, (body) => {
-			body.quarantine_relative_path = quarantinePath;
-		});
-		await assert.rejects(
-			controller.execute("malicious-quarantine-recovery", { operation: "recover", input: JSON.stringify(request) }, undefined, undefined, extensionContext(fixture.repository, true)),
-			/quarantine|recovery path|reset state/i,
-		);
-		assert.equal(readFileSync(sentinel, "utf8"), "keep");
-		assert.equal(readFileSync(join(fixture.repository, ".git", "gentle-ai", "reviews", "control", "reset-state.json"), "utf8"), state);
-	}
 });
 
 test("controller successfully starts the explicitly supported judgment-day mode", async (t) => {
@@ -1203,7 +988,8 @@ test("shipped controller and orchestrator contracts specify inspect-first compac
 	assert.match(toolContract, /ordinary.*Judgment Day/is);
 	assert.match(toolContract, /JSON(?:-serialized object)? string/is);
 	assert.match(toolContract, /blocked-legacy.*explicit.*authorization/is);
-	assert.match(toolContract, /reset.*inspect.*clean.*start/is);
+	assert.match(toolContract, /RESET.*reclaim.*RECOVER.*recover/s);
+	assert.match(toolContract, /native-input-required.*never.*invent/is);
 	assert.match(toolContract, /output.*lost|response.*lost|ambiguous.*START/is);
 	assert.match(toolContract, /ambiguous START or FINALIZE.*target-scoped native status.*declared action/is);
 	assert.doesNotMatch(toolContract, /START throws.*lineage does not exist/is);
@@ -1220,7 +1006,7 @@ test("shipped controller and orchestrator contracts specify inspect-first compac
 	for (const path of ["assets/orchestrator-delegation.md", "skills/gentle-ai/SKILL.md"]) {
 		const recoveryContract = readFileSync(path, "utf8");
 		assert.match(recoveryContract, /blocked-legacy.*explicit.*authoriz/is, path);
-		assert.match(recoveryContract, /RESET.*RECOVER.*internally.*INSPECT|RESET.*RECOVER.*verified.*clean/is, path);
+		assert.match(recoveryContract, /RESET.*RECOVER.*native.*(reclaim|recover)/is, path);
 	}
 });
 

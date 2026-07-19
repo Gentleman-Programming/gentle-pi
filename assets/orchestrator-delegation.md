@@ -191,7 +191,7 @@ When target status is `current_target`, follow its single native action. `ambigu
 
 Preserve the negotiated failure envelope exactly. `mutation_outcome: not_started` proves no mutation. For `unknown` or lost mutating output, the controller immediately calls target-scoped status and returns its exact action; it never emits a generic replay instruction. Replay the exact START or FINALIZE only when that provider result declares `exact_replay_safe` for the same canonical request and required lineage. Never choose a lineage merely because output was lost.
 
-Before authority access, `mutation_outcome: not_started` means no lineage was created. In the historical lane only, RESET and RECOVER internally INSPECT and may proceed only after verified clean authority.
+Before authority access, `mutation_outcome: not_started` means no lineage was created. In the historical lane only, authorized RESET and RECOVER route to the audited native `gentle-ai review reclaim` and `gentle-ai review recover` operations; missing native inputs return `native-input-required` and are never invented, and INSPECT follows every committed native recovery record.
 
 Ordinary review runs the selected zero, one, or four lenses exactly once against `initial_review_tree`.
 

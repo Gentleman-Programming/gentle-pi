@@ -189,9 +189,9 @@ function readPinnedRepositoryIdentityV1(storeRoot: string): ReviewRepositoryIden
 	throw new ReviewRepositoryError("Pinned repository identity is malformed");
 }
 
-// Exported for `destructiveResetReviewAuthorityV1`'s explicit broken-identity
-// recovery path, which must re-pin a fresh IDENTITY after quarantining the
-// stale one. Not intended for ordinary use outside that recovery flow.
+// Pins the repository IDENTITY on first authority resolution and re-pins a
+// fresh IDENTITY during explicit broken-identity recovery. Not intended for
+// ordinary use outside those flows.
 export function writePinnedRepositoryIdentityV1(storeRoot: string, identity: ReviewRepositoryIdentityBodyV1): ReviewRepositoryIdentityBodyV1 {
 	mkdirSync(storeRoot, { recursive: true, mode: 0o700 });
 	const path = pinnedIdentityPathV1(storeRoot);
@@ -304,17 +304,15 @@ export interface RepositoryAuthorityRecoveryV1 extends RepositoryAuthorityV1 {
 // RESL2-001 / RELY2-001 remediation: a pinned root commit removed by an
 // ordinary history rewrite (e.g. `git branch -D` on an orphan root) makes
 // the SUBSET check in `resolveRepositoryAuthorityV1` fail permanently.
-// That is correct, fail-closed behavior for ordinary access — but it also
-// means the one tool meant to recover from this state
-// (`destructiveResetReviewAuthorityV1`) could never even start, because it
-// called that same fail-closed resolver as its first line. This lenient
-// variant runs the identical live probe but never throws on a broken
-// subset: when the pin no longer holds, it reports `identity_broken: true`
-// and computes a fresh, NOT-YET-PERSISTED identity from the CURRENT live
-// root-commit set instead, so an explicit destructive reset can detect the
-// break, quarantine the existing store, and re-pin. This function must
-// never be used by ordinary read/mutation paths — only by the explicit,
-// operator-invoked destructive reset recovery path.
+// That is correct, fail-closed behavior for ordinary access — but recovery
+// inspection could never even start if it called that same fail-closed
+// resolver as its first line. This lenient variant runs the identical live
+// probe but never throws on a broken subset: when the pin no longer holds,
+// it reports `identity_broken: true` and computes a fresh, NOT-YET-PERSISTED
+// identity from the CURRENT live root-commit set instead, so explicit
+// recovery inspection can detect the break and surface it. This function
+// must never be used by ordinary read/mutation paths — only by the explicit
+// recovery-inspection path (legacy authority detection).
 export function resolveRepositoryAuthorityForRecoveryV1(cwd: string): RepositoryAuthorityRecoveryV1 {
 	const probe = probeLiveRepositoryV1(cwd);
 	const pinned = readPinnedRepositoryIdentityV1(probe.storeRoot);
