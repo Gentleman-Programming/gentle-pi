@@ -645,6 +645,11 @@ export async function runGitCommitTransaction(
 		if (record.state === COMMIT_TRANSACTION_STATE.AWAITING_NATIVE || record.state === COMMIT_TRANSACTION_STATE.AWAITING_REVIEW || record.state === COMMIT_TRANSACTION_STATE.VALIDATED) {
 			const currentTree = git(binding.root, ["write-tree"]);
 			if (record.post_hook_tree !== currentTree) throw new Error("commit transaction post-hook tree changed before native validation");
+			if (currentTree !== invocation.authorization.intendedTree) {
+				const mutation = `pre-commit hook mutated the staged candidate: post-hook tree ${currentTree} is not the authorized tree ${invocation.authorization.intendedTree}; the content-bound receipt no longer covers this index; normalize sources and re-run review explicitly, or make the hook convergent, then retry the exact command; transaction ${record.transaction_id} created no commit`;
+				record = transition(binding, record, COMMIT_TRANSACTION_STATE.AWAITING_REVIEW, { error: mutation }, now);
+				throw new Error(mutation);
+			}
 			const nativeReviewCli = dependencies.nativeReviewCli ?? createNativeReviewCli();
 			let nativeResult: NativeValidateResult;
 			try {

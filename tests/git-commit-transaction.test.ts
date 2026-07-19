@@ -12,6 +12,7 @@ import {
 	prepareCommitTransactionInvocation,
 	reconcileCommitTransaction,
 	runGitCommitTransaction,
+	verifyCommitTransactionResult,
 } from "../lib/git-commit-transaction.ts";
 import type { NativeReviewCli, NativeValidateResult } from "../lib/native-review-cli.ts";
 
@@ -101,7 +102,7 @@ test("a mutating hook creates no commit until the post-hook tree is reviewed, th
 	const before = git(cwd, "rev-parse", "HEAD");
 	await assert.rejects(
 		runGitCommitTransaction(invocation(cwd, "before-format"), { nativeReviewCli: native(cwd, "before-format", "scope-changed") }),
-		/post-hook tree/,
+		/not the authorized tree/,
 	);
 	assert.equal(git(cwd, "rev-parse", "HEAD"), before);
 	assert.equal(inspectCommitTransaction(cwd).record?.state, COMMIT_TRANSACTION_STATE.AWAITING_REVIEW);
@@ -119,6 +120,105 @@ test("a failing pre-commit hook creates no commit and leaves explicit recovery s
 	await assert.rejects(runGitCommitTransaction(invocation(cwd, "hook-failure"), { nativeReviewCli: native(cwd, "hook-failure") }), /hook failed/);
 	assert.equal(git(cwd, "rev-parse", "HEAD"), before);
 	assert.equal(inspectCommitTransaction(cwd).record?.state, COMMIT_TRANSACTION_STATE.HOOK_FAILED);
+	assert.match(inspectCommitTransaction(cwd).record?.error ?? "", /exit 23/);
+});
+
+test("a native scope-changed denial on the unmutated authorized tree awaits explicit review", async (t) => {
+	const cwd = repository(t);
+	const authorizedTree = stage(cwd);
+	const before = git(cwd, "rev-parse", "HEAD");
+	let validations = 0;
+	const denying = native(cwd, "scope-changed-denial", "scope-changed");
+	const counting = {
+		async validate(request) {
+			validations += 1;
+			return denying.validate(request);
+		},
+	} as NativeReviewCli;
+	await assert.rejects(
+		runGitCommitTransaction(invocation(cwd, "scope-changed-denial"), { nativeReviewCli: counting }),
+		/native pre-commit validation denied the post-hook tree: scope-changed/,
+	);
+	assert.equal(validations, 1, "the unmutated tree must pass the mutation guard and reach native validation");
+	assert.equal(git(cwd, "rev-parse", "HEAD"), before);
+	assert.equal(git(cwd, "write-tree"), authorizedTree, "the denied index stays exactly as authorized");
+	const inspection = inspectCommitTransaction(cwd);
+	assert.equal(inspection.record?.state, COMMIT_TRANSACTION_STATE.AWAITING_REVIEW);
+	assert.equal(inspection.record?.error, "post-hook tree differs from receipt");
+	assert.equal(typeof inspection.record?.native_result, "object", "the native denial must be recorded on the transaction");
+});
+
+test("a non-scope-changed native denial fails validation and requires explicit recovery", async (t) => {
+	const cwd = repository(t);
+	stage(cwd);
+	const before = git(cwd, "rev-parse", "HEAD");
+	await assert.rejects(
+		runGitCommitTransaction(invocation(cwd, "invalidated-denial"), { nativeReviewCli: native(cwd, "invalidated-denial", "invalidated") }),
+		/native pre-commit validation denied the post-hook tree: invalidated/,
+	);
+	assert.equal(git(cwd, "rev-parse", "HEAD"), before);
+	assert.equal(inspectCommitTransaction(cwd).record?.state, COMMIT_TRANSACTION_STATE.VALIDATION_FAILED);
+	await assert.rejects(
+		runGitCommitTransaction(invocation(cwd, "invalidated-denial"), { nativeReviewCli: native(cwd, "invalidated-denial") }),
+		/requires explicit recovery from state validation-failed/,
+	);
+});
+
+test("a mutating pre-commit hook fails closed even when native validation would allow the post-hook tree", async (t) => {
+	const cwd = repository(t);
+	const authorizedTree = stage(cwd, "unformatted\n");
+	const count = join(cwd, ".git", "hook-count");
+	installHook(cwd, "pre-commit", `printf 'formatted\\n' > tracked.txt\ngit add tracked.txt\nprintf '1\\n' >> ${JSON.stringify(count)}`);
+	const before = git(cwd, "rev-parse", "HEAD");
+	// The fake native CLI allows whatever tree the index holds, so the only
+	// defense against committing the hook-mutated tree is the transaction's
+	// own binding to the invocation's authorized tree.
+	await assert.rejects(
+		runGitCommitTransaction(invocation(cwd, "permissive-native"), { nativeReviewCli: native(cwd, "permissive-native") }),
+		/pre-commit hook mutated the staged candidate/,
+	);
+	assert.equal(git(cwd, "rev-parse", "HEAD"), before, "no commit object may be created from the mutated index");
+	assert.equal(readFileSync(count, "utf8"), "1\n", "the mutating hook must have run exactly once");
+	assert.notEqual(git(cwd, "write-tree"), authorizedTree, "the mutated index is preserved for inspection");
+	const inspection = inspectCommitTransaction(cwd);
+	assert.equal(inspection.record?.state, COMMIT_TRANSACTION_STATE.AWAITING_REVIEW);
+	assert.match(inspection.record?.error ?? "", /normalize sources and re-run review explicitly, or make the hook convergent/);
+	assert.throws(() => assertNoUnresolvedCommitTransaction(cwd), /publication is blocked/);
+});
+
+test("a convergent pre-commit hook runs exactly once and commits the exact authorized tree", async (t) => {
+	const cwd = repository(t);
+	const authorizedTree = stage(cwd, "formatted\n");
+	const count = join(cwd, ".git", "hook-count");
+	installHook(cwd, "pre-commit", `printf 'formatted\\n' > tracked.txt\ngit add tracked.txt\nprintf '1\\n' >> ${JSON.stringify(count)}`);
+	const before = git(cwd, "rev-parse", "HEAD");
+	const result = await runGitCommitTransaction(invocation(cwd, "convergent"), { nativeReviewCli: native(cwd, "convergent") });
+	assert.notEqual(result.head, before);
+	assert.equal(result.tree, authorizedTree);
+	assert.equal(git(cwd, "rev-parse", "HEAD^{tree}"), authorizedTree);
+	assert.equal(readFileSync(count, "utf8"), "1\n", "the convergent hook must have run exactly once");
+	assert.deepEqual(inspectCommitTransaction(cwd), { status: "clean" });
+});
+
+test("a repository with no hooks commits the authorized tree unchanged", async (t) => {
+	const cwd = repository(t);
+	const authorizedTree = stage(cwd);
+	const before = git(cwd, "rev-parse", "HEAD");
+	const result = await runGitCommitTransaction(invocation(cwd, "no-hooks"), { nativeReviewCli: native(cwd, "no-hooks") });
+	assert.notEqual(result.head, before);
+	assert.equal(result.tree, authorizedTree);
+	assert.equal(git(cwd, "rev-parse", "HEAD^{tree}"), authorizedTree);
+	assert.deepEqual(inspectCommitTransaction(cwd), { status: "clean" });
+});
+
+test("the Git-created HEAD tree is proven equal to the authorized tree on success", async (t) => {
+	const cwd = repository(t);
+	const authorizedTree = stage(cwd);
+	const result = await runGitCommitTransaction(invocation(cwd, "head-proof"), { nativeReviewCli: native(cwd, "head-proof") });
+	assert.equal(result.tree, authorizedTree);
+	assert.equal(git(cwd, "rev-parse", "HEAD^{tree}"), authorizedTree);
+	const verified = verifyCommitTransactionResult(cwd, result.transactionId);
+	assert.deepEqual(verified, { transactionId: result.transactionId, status: "committed", head: result.head, tree: authorizedTree });
 });
 
 test("message hooks cannot change the index after native authorization", async (t) => {
