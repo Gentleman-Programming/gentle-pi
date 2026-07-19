@@ -5320,12 +5320,17 @@ async function executeReviewControllerOperation(
 				if (candidateViews && parameters.lineageId === undefined) throw new CandidateViewError("Native FINALIZE requires an explicit candidate-view lineage");
 				correctionCompletion = input.review_result === undefined && (input.validation !== undefined || input.validation_proof !== undefined) && input.final_evidence !== undefined;
 				const validationAttempt = input.review_result === undefined && input.correction_line_forecast === undefined && input.final_evidence !== undefined;
+				// A correction-forecast-only FINALIZE (the pre-edit forecast step in
+				// correction_required) must also participate in fresh-process projection
+				// reconstruction; before #176 it skipped restoration and failed against
+				// an empty in-memory registry without ever invoking native FINALIZE.
+				const correctionForecast = input.review_result === undefined && input.correction_line_forecast !== undefined;
 				const replayKey = JSON.stringify({ cwd: defaultCwd, lineageId: parameters.lineageId ?? null, input: parameters.input ?? null, inputPath: parameters.inputPath ?? null });
-				if ((validationAttempt || input.review_result !== undefined) && candidateViews && parameters.lineageId && !candidateViews.hasProjection(parameters.lineageId)) {
+				if ((validationAttempt || input.review_result !== undefined || (correctionForecast && nativeReviewCli.targetStatus !== undefined)) && candidateViews && parameters.lineageId && !candidateViews.hasProjection(parameters.lineageId)) {
 					if (nativeReviewCli.targetStatus !== undefined) {
 						negotiatedStatus = await nativeReviewCli.targetStatus({ cwd: defaultCwd, lineageId: parameters.lineageId, ...(signal === undefined ? {} : { signal }) });
 						if (negotiatedStatus.applicability !== "current_target" || negotiatedStatus.authority?.lineageId !== parameters.lineageId) return mapNativeTargetStatus(parameters.operation, negotiatedStatus, parameters.lineageId);
-						candidateView = input.review_result === undefined
+						candidateView = validationAttempt
 							? (candidateViews.restoreProjectionFromNative(parameters.lineageId, defaultCwd, negotiatedStatus.projection), undefined)
 							: candidateViews.restoreForFinalizeFromNative(parameters.lineageId, defaultCwd, negotiatedStatus.projection);
 					} else {
