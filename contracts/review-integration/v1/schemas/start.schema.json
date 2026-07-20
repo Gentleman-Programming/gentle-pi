@@ -86,6 +86,8 @@
             "hot_path",
             "large_change",
             "non_executable_only",
+            "process_boundary",
+            "process_scan_limit",
             "service_token",
             "shell_source"
           ]

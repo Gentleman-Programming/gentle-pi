@@ -3468,3 +3468,39 @@ test("authorized RECOVER routes to native review recover with the exact successo
 	assert.equal(recovers[0]?.predecessorLineage, "broken");
 	assert.equal(recovers[0]?.disposition, "invalidated");
 });
+
+test("RECOVER rechecks a committed range against its frozen base instead of the workspace", async (t) => {
+	const cwd = repository(t);
+	const baseRef = git(cwd, "rev-parse", "HEAD");
+	const candidateViews = new CandidateViewRegistry();
+	const statusRequests: Array<Record<string, unknown>> = [];
+	const recovers: Array<Record<string, unknown>> = [];
+	const { controller } = runtime(fakeNative({
+		targetStatus: async (request) => {
+			statusRequests.push(request as Record<string, unknown>);
+			if (request.lineageId === undefined) return targetStatusFixture({ applicability: "unrelated", action: "start" });
+			assert.equal(request.baseRef, baseRef);
+			const status = targetStatusFixture({ lineageId: "native-lineage", action: "recover" });
+			return { ...status, actionDisposition: "invalidated", authority: { ...status.authority!, revision: "rev-1" } };
+		},
+		recover: async (request) => {
+			recovers.push(request as Record<string, unknown>);
+			return { record: { schema: "gentle-ai.review-recovery/v1" } };
+		},
+	}), undefined, undefined, undefined, candidateViews);
+
+	await controller.execute("committed-range-start", {
+		operation: "start",
+		input: JSON.stringify({ mode: "ordinary", baseRef, committedOnly: true }),
+	}, undefined, undefined, context(cwd));
+	const recoveryAuthorization = { repositoryId: "repo", commonDirHash: "c".repeat(64), inventoryHash: "d".repeat(64), confirmation: "DESTROY REVIEW AUTHORITY repo" };
+	const recovered = await controller.execute("committed-range-recover", {
+		operation: "recover",
+		input: JSON.stringify({ ...recoveryAuthorization, predecessorLineage: "native-lineage", expectedPredecessorRevision: "rev-1", successorLineage: "successor", disposition: "invalidated", actor: "maintainer", reason: "invalid authority" }),
+	}, undefined, undefined, interactiveContext(cwd));
+
+	assert.equal((recovered.details as Record<string, unknown>).mutation_outcome, "committed");
+	assert.equal(statusRequests.filter((request) => request.lineageId === "native-lineage")[0]?.baseRef, baseRef);
+	assert.equal(recovers.length, 1);
+	candidateViews.cleanupTerminal("native-lineage", "approved");
+});

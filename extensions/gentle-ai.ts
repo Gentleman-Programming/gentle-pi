@@ -4631,7 +4631,15 @@ async function executeReviewControllerOperation(
 		if (nativeReviewCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
 		let status: ReviewStatusV1;
 		try {
-			status = await nativeReviewCli.targetStatus({ cwd: defaultCwd, lineageId: String(input.predecessorLineage), ...(signal === undefined ? {} : { signal }) });
+			const frozenTarget = candidateViews?.hasProjection(String(input.predecessorLineage))
+				? candidateViews.resolveProjection(String(input.predecessorLineage), defaultCwd)
+				: undefined;
+			status = await nativeReviewCli.targetStatus({
+				cwd: defaultCwd,
+				lineageId: String(input.predecessorLineage),
+				...(frozenTarget?.committedOnly === true ? { baseRef: frozenTarget.baseCommit } : {}),
+				...(signal === undefined ? {} : { signal }),
+			});
 		} catch (error) {
 			return nativeStatusFailed(parameters.operation, error);
 		}

@@ -39,6 +39,7 @@ function queuedAdapter(results: QueuedResult[]): { adapter: ExecFileAdapter; cal
 }
 
 const VERSION_219 = { stdout: "gentle-ai 2.1.9\n" };
+const VERSION_218 = { stdout: "gentle-ai 2.1.8\n" };
 const VERSION_2110 = { stdout: "gentle-ai 2.1.10\n" };
 const RECLAIM_RECORD = { schema: "gentle-ai.review-reclaim-audit/v1", lineage: "stuck-lineage", actor: "maintainer", reason: "incomplete entry" };
 const RECOVER_RECORD = { schema: "gentle-ai.review-recovery/v1", predecessor_lineage: "broken", successor_lineage: "successor" };
@@ -207,6 +208,32 @@ test("native reconcile-authority wrapper binds the exact target revisions and au
 		"--reason", "invalid recovery edge",
 		"--maintainer-authorization", RECONCILE_AUTHORIZATION,
 	]);
+});
+
+test("native v2.1.8 reconcile-authority accepts its raw audit response but modern envelopes remain strict", async () => {
+	const request = {
+		cwd: "/repo",
+		predecessorLineage: "predecessor",
+		expectedPredecessorRevision: "predecessor-revision",
+		successorLineage: "successor",
+		expectedSuccessorRevision: "successor-revision",
+		actor: "maintainer",
+		reason: "invalid recovery edge",
+		maintainerAuthorization: RECONCILE_AUTHORIZATION,
+	};
+	const legacy = queuedAdapter([VERSION_218, { stdout: JSON.stringify(RECONCILE_RECORD) }]);
+	assert.deepEqual((await new NativeReviewCliV214(legacy.adapter).reconcileAuthority!(request)).record, RECONCILE_RECORD);
+
+	for (const [version, response] of [
+		[VERSION_218, { schema: "gentle-ai.review-reconcile-audit/v1", predecessor_lineage: "predecessor" }],
+		[VERSION_219, RECONCILE_RECORD],
+	] as const) {
+		const queue = queuedAdapter([version, { stdout: JSON.stringify(response) }]);
+		await assert.rejects(
+			() => new NativeReviewCliV214(queue.adapter).reconcileAuthority!(request),
+			(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE,
+		);
+	}
 });
 
 test("native v2.1.9 maintenance wrappers use exact argv and published authorization bindings", async () => {
