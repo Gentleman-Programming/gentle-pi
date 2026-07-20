@@ -529,6 +529,12 @@ function decodeNativeMaintenanceResult(value: unknown, expectedOperation: Native
 	if (body.operation !== expectedOperation) throw new Error("wrong native maintenance discriminator");
 	return { record: object(body.record) };
 }
+function decodeLegacyReconcileAudit(value: unknown): NativeReviewRecoveryResult {
+	const record = exactObject(value, ["schema", "predecessor_lineage", "successor_lineage", "outcome"]);
+	if (record.schema !== "gentle-ai.review-reconcile-audit/v1") throw new Error("wrong legacy reconcile audit schema");
+	for (const field of ["predecessor_lineage", "successor_lineage", "outcome"]) requiredString(record[field]);
+	return { record };
+}
 function decode<T>(operation: NativeReviewOperation, mutating: boolean, callback: () => T, diagnostics = nativeProcessDiagnostics(operation, NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE)): T {
 	try { return callback(); } catch (error) { if (error instanceof NativeReviewCliError) throw error; throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE, operation, true, mutating, "native response is schema incompatible", { ...diagnostics, error_code: NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE }); }
 }
@@ -802,7 +808,7 @@ export class NativeReviewCliV214 {
 		return { body: parseJson(result.stdout, operation, mutating, diagnostics), exitCode: result.exitCode, process: result };
 	}
 
-	private async verifyVersion(cwd: string, signal: AbortSignal | undefined, capabilities: readonly NativeCliCapability[]): Promise<void> {
+	private async verifyVersion(cwd: string, signal: AbortSignal | undefined, capabilities: readonly NativeCliCapability[]): Promise<keyof typeof NATIVE_CLI_CONTRACTS> {
 		let result: ExecFileResult;
 		try { result = await this.adapter({ file: this.executablePath(NATIVE_REVIEW_OPERATION.VERSION, false), arguments: ["version"], cwd, timeoutMs: this.timeoutMs, maxBufferBytes: this.maxBufferBytes, signal }); }
 		catch (error) {
@@ -817,6 +823,7 @@ export class NativeReviewCliV214 {
 		const version = /^gentle-ai ([0-9]+\.[0-9]+\.[0-9]+)\n$/.exec(result.stdout.replace(/\r\n$/, "\n"))?.[1];
 		const contract = version === undefined ? undefined : NATIVE_CLI_CONTRACTS[version as keyof typeof NATIVE_CLI_CONTRACTS];
 		if (result.stderr.trim().length > 0 || contract === undefined || capabilities.some((capability) => !contract[capability])) throw nativeError(NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE, NATIVE_REVIEW_OPERATION.VERSION, false, "native gentle-ai lacks required capabilities");
+		return version as keyof typeof NATIVE_CLI_CONTRACTS;
 	}
 
 	async start(request: NativeStartRequest): Promise<NativeStartResult> {
@@ -1079,7 +1086,7 @@ export class NativeReviewCliV214 {
 		if (request.maintainerAuthorization !== expectedAuthorization) {
 			throw new TypeError("Native RECONCILE_AUTHORITY maintainerAuthorization must match the exact target and revision binding");
 		}
-		await this.verifyVersion(request.cwd, request.signal, ["reconcileAuthority"]);
+		const version = await this.verifyVersion(request.cwd, request.signal, ["reconcileAuthority"]);
 		const execution = await this.execute(NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY, request.cwd, [
 			"review", "reconcile-authority", "--cwd", request.cwd,
 			"--predecessor-lineage", request.predecessorLineage,
@@ -1090,7 +1097,9 @@ export class NativeReviewCliV214 {
 			"--reason", request.reason,
 			"--maintainer-authorization", request.maintainerAuthorization,
 		], true, request.signal);
-		const result = decode(NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY, true, () => decodeNativeMaintenanceResult(execution.body, NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY));
+		const result = decode(NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY, true, () => version === "2.1.8"
+			? decodeLegacyReconcileAudit(execution.body)
+			: decodeNativeMaintenanceResult(execution.body, NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY));
 		if (execution.exitCode !== 0) throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY, true, "native authority reconciliation partially failed", execution.process, true, result.record);
 		return result;
 	}

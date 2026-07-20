@@ -15,6 +15,7 @@ import {
 
 const fixtureRoot = join(process.cwd(), "contracts", "review-integration", "v1", "fixtures");
 const fixture = <T = unknown>(name: string): T => JSON.parse(readFileSync(join(fixtureRoot, name), "utf8")) as T;
+const schema = <T = unknown>(name: string): T => JSON.parse(readFileSync(join(process.cwd(), "contracts", "review-integration", "v1", "schemas", name), "utf8")) as T;
 const executableDigest = "dcc846103b16d365eaeeb9d7f289c23fc4f2897f23def1cb3fe7f05557b64705";
 const digest = `sha256:${"a".repeat(64)}`;
 
@@ -247,12 +248,16 @@ test("START accepts every normative enum value and rejects aliases", () => {
 
 test("START enforces required, exact, bounded, and deeply unique payloads", () => {
 	const source = fixture<JsonObject>("start.fixture.json");
+	const startSchema = schema<JsonObject>("start.schema.json");
+	const riskReasonCodes = (((startSchema.$defs as JsonObject).risk_reason as JsonObject).properties as JsonObject).code as JsonObject;
+	const expectedRiskReasonCodes = ["configuration_change", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "process_boundary", "process_scan_limit", "service_token", "shell_source"];
 	assertRequired(decodeReviewStartV1, source, ["schema", "contract", "operation", "action", "lenses_required", "lineage_id", "state", "risk_level", "selected_lenses", "projection", "changed_files", "changed_lines", "correction_budget", "risk_reasons"]);
 	assertAdditionalProperty(decodeReviewStartV1, source);
 	assertAdditionalProperty(decodeReviewStartV1, source, ["risk_reasons", "0"]);
 	assertNestedRequired(decodeReviewStartV1, source, ["risk_reasons", "0"], ["code"]);
 
-	for (const code of ["configuration_change", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "process_boundary", "process_scan_limit", "service_token", "shell_source"]) {
+	assert.deepEqual(riskReasonCodes.enum, expectedRiskReasonCodes);
+	for (const code of expectedRiskReasonCodes) {
 		const candidate = clone(source);
 		candidate.risk_reasons = [{ code }];
 		assert.equal(decodeReviewStartV1(candidate).riskReasons[0]?.code, code);
