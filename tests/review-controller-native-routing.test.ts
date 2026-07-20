@@ -1973,6 +1973,61 @@ test("native pre-PR validation uses and binds the exact advertised ordinary base
 	assert.equal(validates, 2);
 });
 
+test("native pre-PR validation accepts slash-containing head branch names", async (t) => {
+	const cwd = repository(t);
+	const origin = addBareRemote(t, cwd, "origin");
+	const baseCommit = git(cwd, "rev-parse", "main");
+	execFileSync("git", ["checkout", "-b", "feat/slash-head"], { cwd });
+	commitFile(cwd, "feature.ts", "export const feature = true;\n", "feature");
+	const headCommit = git(cwd, "rev-parse", "HEAD");
+	git(cwd, "push", "origin", "feat/slash-head:refs/heads/feat/slash-head");
+	git(cwd, "config", "branch.feat/slash-head.pushRemote", "origin");
+	const requests: Array<{ flags?: readonly string[] }> = [];
+	const boundary = { selector: "origin/main", remote: "origin", remoteRef: "refs/heads/main", commit: baseCommit, remoteIdentity: remoteIdentity(origin) };
+	const { controller, toolCall } = runtime(fakeNative({
+		validate: async (request) => {
+			requests.push(request);
+			return { allowed: true, result: "allow", action: "continue", reason: "ok", gateContext: nativePrePrGateContext(boundary) };
+		},
+	}));
+	const command = "gh pr create --base main --head feat/slash-head";
+	const validated = await controller.execute("slash-head", { operation: "validate", lineageId: "native-lineage", idempotencyKey: "slash-head", command, input: "{}" }, undefined, undefined, context(cwd));
+	assert.notEqual((validated.details as { authorization?: unknown }).authorization, undefined);
+	assert.deepEqual(requests[0]?.flags, ["--base-ref", "origin/main"]);
+	assert.equal(await toolCall({ toolName: "bash", input: { command } }, context(cwd)), undefined);
+	assert.equal(headCommit, git(cwd, "rev-parse", "HEAD"));
+});
+
+test("native pre-PR validation accepts slash head with repo, title, body-file, and label options", async (t) => {
+	const cwd = repository(t);
+	const origin = addBareRemote(t, cwd, "origin");
+	git(cwd, "remote", "set-url", "origin", "git@github.com:agongar-dev/itaas-workbench.git");
+	git(cwd, "config", "remote.origin.gh-resolved", "base");
+	const baseCommit = git(cwd, "rev-parse", "main");
+	execFileSync("git", ["checkout", "-b", "feat/slash-head"], { cwd });
+	commitFile(cwd, "feature.ts", "export const feature = true;\n", "feature");
+	const headCommit = git(cwd, "rev-parse", "HEAD");
+	git(cwd, "push", origin, "feat/slash-head:refs/heads/feat/slash-head");
+	git(cwd, "config", "branch.feat/slash-head.pushRemote", "origin");
+	const requests: Array<{ flags?: readonly string[] }> = [];
+	const boundary = { selector: "origin/main", remote: "origin", remoteRef: "refs/heads/main", commit: baseCommit, remoteIdentity: remoteIdentity("git@github.com:agongar-dev/itaas-workbench.git") };
+	const probe = queuedPublicationProbe({
+		["git@github.com:agongar-dev/itaas-workbench.git refs/heads/main"]: baseCommit,
+		["git@github.com:agongar-dev/itaas-workbench.git refs/heads/feat/slash-head"]: headCommit,
+	});
+	const { controller, toolCall } = runtime(fakeNative({
+		validate: async (request) => {
+			requests.push(request);
+			return { allowed: true, result: "allow", action: "continue", reason: "ok", gateContext: nativePrePrGateContext(boundary) };
+		},
+	}), probe);
+	const command = "gh pr create --repo agongar-dev/itaas-workbench --base main --head feat/slash-head --title \"feat(test): slash head\" --body-file /tmp/body.md --label type:feature";
+	const validated = await controller.execute("slash-head-full", { operation: "validate", lineageId: "native-lineage", idempotencyKey: "slash-head-full", command, input: "{}" }, undefined, undefined, context(cwd));
+	assert.notEqual((validated.details as { authorization?: unknown }).authorization, undefined);
+	assert.deepEqual(requests[0]?.flags, ["--base-ref", "origin/main"]);
+	assert.equal(await toolCall({ toolName: "bash", input: { command } }, context(cwd)), undefined);
+});
+
 test("native pre-PR derives fork and chained bases from the gh repository context", async (t) => {
 	await t.test("fork", async (t) => {
 		const cwd = repository(t);
@@ -2497,7 +2552,10 @@ test("native pre-PR rejects missing, stale, and divergent advertised remote head
 				return { allowed: true, result: "allow", action: "continue", reason: "ok", gateContext: nativeGateContext() };
 			} }));
 			const result = await controller.execute(shape, { operation: "validate", lineageId: "native-lineage", idempotencyKey: shape, command: "gh pr create --base main --head feature", input: "{}" }, undefined, undefined, context(cwd));
-			assert.equal((result.details as { authorization?: unknown }).authorization, undefined);
+			const details = result.details as { authorization?: unknown; diagnostics?: { code?: string; message?: string } };
+			assert.equal(details.authorization, undefined);
+			assert.equal(details.diagnostics?.code, "lifecycle-command-binding-failed");
+			assert.match(details.diagnostics?.message ?? "", /advertised (?:head|pull request head)/i);
 			assert.equal(validates, 0);
 		});
 	}
