@@ -40,7 +40,7 @@ function queuedAdapter(results: QueuedResult[]): { adapter: ExecFileAdapter; cal
 
 const VERSION_219 = { stdout: "gentle-ai 2.1.9\n" };
 const VERSION_218 = { stdout: "gentle-ai 2.1.8\n" };
-const VERSION_2110 = { stdout: "gentle-ai 2.1.10\n" };
+const VERSION_2111 = { stdout: "gentle-ai 2.1.11\n" };
 const RECLAIM_RECORD = { schema: "gentle-ai.review-reclaim-audit/v1", lineage: "stuck-lineage", actor: "maintainer", reason: "incomplete entry" };
 const RECOVER_RECORD = { schema: "gentle-ai.review-recovery/v1", predecessor_lineage: "broken", successor_lineage: "successor" };
 const RECONCILE_RECORD = { schema: "gentle-ai.review-reconcile-audit/v1", predecessor_lineage: "predecessor", successor_lineage: "successor", outcome: "quarantined" };
@@ -253,9 +253,9 @@ test("native v2.1.9 maintenance wrappers use exact argv and published authorizat
 	]);
 });
 
-test("native v2.1.10 repair-legacy-alias uses the exact fixed binding and preserves idempotent audit records", async () => {
+test("native v2.1.11 repair-legacy-alias uses the exact fixed binding and preserves idempotent audit records", async () => {
 	const { adapter, calls } = queuedAdapter([
-		VERSION_2110,
+		VERSION_2111,
 		{ stdout: JSON.stringify({ operation: "review/repair-legacy-alias", record: LEGACY_ALIAS_RECORD }) },
 	]);
 	const cli = new NativeReviewCliV214(adapter);
@@ -294,7 +294,7 @@ test("native repair-legacy-alias fails closed for stale bindings, malformed outp
 		{ stdout: JSON.stringify({ operation: "review/repair-legacy-alias" }) },
 		{ stdout: JSON.stringify({ operation: "review/repair-legacy-alias", record: LEGACY_ALIAS_RECORD }), stderr: "interrupted", exitCode: 1 },
 	]) {
-		const queue = queuedAdapter([VERSION_2110, result]);
+		const queue = queuedAdapter([VERSION_2111, result]);
 		await assert.rejects(
 			() => new NativeReviewCliV214(queue.adapter).repairLegacyAlias!(request),
 			(error: unknown) => error instanceof NativeReviewCliError

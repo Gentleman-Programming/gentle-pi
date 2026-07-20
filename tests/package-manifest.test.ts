@@ -204,14 +204,14 @@ test("package manifest installs pi-pretty through a wrapper without bundling nat
 	);
 });
 
-test("package verification binds the published Gentle AI v2.1.10 runtime pin", () => {
+test("package verification binds the published Gentle AI v2.1.11 runtime pin", () => {
 	const installer = readFileSync(join(PACKAGE_ROOT, "scripts", "gentle-ai-installer.mjs"), "utf8");
 	const binary = readFileSync(join(PACKAGE_ROOT, "lib", "gentle-ai-binary.ts"), "utf8");
 	const verifier = readFileSync(join(PACKAGE_ROOT, "scripts", "verify-package-files.mjs"), "utf8");
 
-	assert.match(installer, /INSTALLER_VERSION = "2\.1\.10"/);
-	assert.match(binary, /GENTLE_AI_VERSION = "2\.1\.10"/);
-	assert.match(verifier, /v2\.1\.10/);
+	assert.match(installer, /INSTALLER_VERSION = "2\.1\.11"/);
+	assert.match(binary, /GENTLE_AI_VERSION = "2\.1\.11"/);
+	assert.match(verifier, /v2\.1\.11/);
 });
 
 

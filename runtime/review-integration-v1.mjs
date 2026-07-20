@@ -241,6 +241,71 @@ const REQUIRED_MANDATORY_FEATURES = Object.freeze(FEATURE_NAMES.filter((name) =>
 
 
 
+const ELIGIBLE_ACTIONS = ["stop", "review.start", "review.finalize", "review.validate", "review.recover"]         ;
+const FORBIDDEN_ACTIONS = ["review.abandon", "review.finalize", "review.invalidate", "review.quarantine-legacy", "review.reclaim", "review.reconcile-authority", "review.recover", "review.start", "review.validate"]         ;
+const NEXT_TRANSITION_OPERATIONS = ["review.start", "review.finalize", "review.recover", "review.validate"]         ;
+
+function decodeTransitionArguments(value         , label        )       {
+	array(value, label, (entry, entryLabel) => {
+		const argument = exactRecord(entry, entryLabel, ["name", "value"]);
+		text(argument.name, `${entryLabel}.name`, { minimum: 1, pattern: /^[a-z0-9_-]+$/ });
+		text(argument.value, `${entryLabel}.value`, { minimum: 1 });
+		return argument;
+	});
+}
+
+function decodeEligibility(value         , label        )       {
+	const eligibility = exactRecord(value, label, ["allowed_actions", "forbidden_actions"]);
+	array(eligibility.allowed_actions, `${label}.allowed_actions`, (entry, entryLabel) => {
+		const action = exactRecord(entry, entryLabel, ["action", "reason_code", "required_inputs"], ["disposition", "binding"]);
+		const selected = enumeration(action.action, ELIGIBLE_ACTIONS, `${entryLabel}.action`);
+		text(action.reason_code, `${entryLabel}.reason_code`, { minimum: 1, pattern: /^[a-z0-9_]+$/ });
+		array(action.required_inputs, `${entryLabel}.required_inputs`, (input, inputLabel) => text(input, inputLabel, { minimum: 1, pattern: /^[a-z0-9_]+$/ }), { unique: true });
+		if (selected === "review.recover") {
+			const binding = exactRecord(action.binding, `${entryLabel}.binding`, ["lineage_id", "revision", "target_identity"]);
+			enumeration(action.disposition, Object.values(REVIEW_STATUS_ACTION_DISPOSITION), `${entryLabel}.disposition`);
+			lineage(binding.lineage_id, `${entryLabel}.binding.lineage_id`);
+			sha256(binding.revision, `${entryLabel}.binding.revision`);
+			sha256(binding.target_identity, `${entryLabel}.binding.target_identity`);
+		} else if (action.disposition !== undefined || action.binding !== undefined) throw new TypeError(`${entryLabel} recovery fields require review.recover`);
+		return action;
+	}, { minimum: 1, maximum: 1 });
+	array(eligibility.forbidden_actions, `${label}.forbidden_actions`, (entry, entryLabel) => {
+		const action = exactRecord(entry, entryLabel, ["action", "reason_code"]);
+		enumeration(action.action, FORBIDDEN_ACTIONS, `${entryLabel}.action`);
+		text(action.reason_code, `${entryLabel}.reason_code`, { minimum: 1, pattern: /^[a-z0-9_]+$/ });
+		return action;
+	});
+}
+
+function decodeNextTransition(value         , label        )       {
+	const transition = exactRecord(value, label, ["kind", "reason_code"], ["execute", "collect"]);
+	const kind = enumeration(transition.kind, ["execute", "collect", "stop"]         , `${label}.kind`);
+	text(transition.reason_code, `${label}.reason_code`, { minimum: 1, pattern: /^[a-z0-9_]+$/ });
+	if (kind === "execute") {
+		const execute = exactRecord(transition.execute, `${label}.execute`, ["operation", "arguments", "preconditions", "binding"], ["artifacts"]);
+		enumeration(execute.operation, NEXT_TRANSITION_OPERATIONS, `${label}.execute.operation`);
+		decodeTransitionArguments(execute.arguments, `${label}.execute.arguments`);
+		decodeTransitionArguments(execute.preconditions, `${label}.execute.preconditions`);
+		const binding = exactRecord(execute.binding, `${label}.execute.binding`, ["target_identity"], ["lineage_id", "revision"]);
+		sha256(binding.target_identity, `${label}.execute.binding.target_identity`);
+		if (binding.lineage_id !== undefined) lineage(binding.lineage_id, `${label}.execute.binding.lineage_id`);
+		if (binding.revision !== undefined) sha256(binding.revision, `${label}.execute.binding.revision`);
+		if (transition.collect !== undefined) throw new TypeError(`${label}.collect is incompatible with execute`);
+	} else if (kind === "collect") {
+		const collect = exactRecord(transition.collect, `${label}.collect`, ["inputs"]);
+		array(collect.inputs, `${label}.collect.inputs`, (entry, entryLabel) => {
+			const input = exactRecord(entry, entryLabel, ["name", "schema", "capture_operation", "arguments"]);
+			text(input.name, `${entryLabel}.name`, { minimum: 1, pattern: /^[a-z0-9_]+$/ });
+			text(input.schema, `${entryLabel}.schema`, { minimum: 1 });
+			text(input.capture_operation, `${entryLabel}.capture_operation`, { minimum: 1 });
+			decodeTransitionArguments(input.arguments, `${entryLabel}.arguments`);
+			return input;
+		}, { minimum: 1 });
+		if (transition.execute !== undefined) throw new TypeError(`${label}.execute is incompatible with collect`);
+	} else if (transition.execute !== undefined || transition.collect !== undefined) throw new TypeError(`${label} stop cannot carry a transition`);
+}
+
 const FAILURE_REQUIRED_INPUTS = [
 	"lineage_id",
 	"change",
@@ -569,7 +634,7 @@ export function decodeReviewProjectionV1(value         )                        
 }
 
 export function decodeReviewStatusV1(value         )                 {
-	const body = exactRecord(value, "status", ["schema", "contract", "operation", "applicability", "receipt", "action", "replayability", "target_identity", "projection", "candidates"], ["authority", "frozen", "reconciliation", "action_disposition"]);
+	const body = exactRecord(value, "status", ["schema", "contract", "operation", "applicability", "receipt", "action", "replayability", "target_identity", "projection", "candidates"], ["authority", "frozen", "reconciliation", "action_disposition", "eligibility", "next_transition"]);
 	requireIdentity(body, "gentle-ai.review-integration.status/v1", REVIEW_INTEGRATION_OPERATION.STATUS);
 	const applicability = enumeration(body.applicability, ["current_target", "unrelated", "ambiguous", "corrupted"]         , "status.applicability");
 	const receiptBody = exactRecord(body.receipt, "status.receipt", ["status"], ["identity"]);
@@ -609,6 +674,8 @@ export function decodeReviewStatusV1(value         )                 {
 		: enumeration(body.action_disposition, Object.values(REVIEW_STATUS_ACTION_DISPOSITION), "status.action_disposition");
 	if (action === "recover" && actionDisposition === undefined) throw new TypeError("recover status requires action_disposition");
 	if (action !== "recover" && actionDisposition !== undefined) throw new TypeError("status.action_disposition is only valid for the recover action");
+	if (body.eligibility !== undefined) decodeEligibility(body.eligibility, "status.eligibility");
+	if (body.next_transition !== undefined) decodeNextTransition(body.next_transition, "status.next_transition");
 	const replayability = enumeration(body.replayability, Object.values(REVIEW_REPLAYABILITY), "status.replayability");
 	let reconciliation                                          ;
 	if (action === "reconcile_finalize") {
@@ -699,12 +766,14 @@ export function decodeReviewOperationV1(value         )                    {
 	const operation = enumeration(body.operation, ["review.finalize", "review.validate", "review.bind_sdd"]         , "operation.operation");
 	let result                         ;
 	if (operation === REVIEW_INTEGRATION_OPERATION.FINALIZE) {
-		result = exactRecord(body.result, "operation.result", ["operation", "lineage_id", "state", "action", "store_revision"]);
+		result = exactRecord(body.result, "operation.result", ["operation", "lineage_id", "state", "action", "store_revision"], ["eligibility", "next_transition"]);
 		if (result.operation !== "review/finalize") throw new TypeError("operation.result does not match review.finalize");
 		nonempty(result.lineage_id, "operation.result.lineage_id");
 		nonempty(result.state, "operation.result.state");
 		nonempty(result.action, "operation.result.action");
 		sha256(result.store_revision, "operation.result.store_revision");
+		if (result.eligibility !== undefined) decodeEligibility(result.eligibility, "operation.result.eligibility");
+		if (result.next_transition !== undefined) decodeNextTransition(result.next_transition, "operation.result.next_transition");
 	} else if (operation === REVIEW_INTEGRATION_OPERATION.VALIDATE) {
 		result = exactRecord(body.result, "operation.result", ["schema", "result", "allowed", "action", "reason", "context"]);
 		if (result.schema !== "gentle-ai.review-gate-result/v1") throw new TypeError("operation.result does not match review.validate");

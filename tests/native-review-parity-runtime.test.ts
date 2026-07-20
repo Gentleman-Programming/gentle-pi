@@ -11,6 +11,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import { GENTLE_AI_VERSION, resolveGentleAiBinary } from "../lib/gentle-ai-binary.ts";
 import { NativeReviewCliV216 } from "../lib/native-review-cli.ts";
+import { NativeReviewCliV216 as RuntimeNativeReviewCliV216 } from "../runtime/native-review-cli.mjs";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 import { resolveGentleAiReleaseAsset } from "../scripts/gentle-ai-installer.mjs";
 
@@ -183,6 +184,11 @@ test("official pinned package runtime authorizes an unchanged linked-view candid
 	await writeFile(join(repository, "tracked.txt"), "base\n");
 	await run("git", ["add", "--", "tracked.txt"], repository);
 	await run("git", ["commit", "-m", "base"], repository);
+	const native = new RuntimeNativeReviewCliV216(async (request) => {
+		const command = await run(binary, request.arguments, request.cwd, true);
+		return { ...command, signal: null, timedOut: false, outputLimitExceeded: false };
+	});
+	assert.equal((await native.reviewStatus({ cwd: repository })).status, "clean");
 	await writeFile(join(repository, "tracked.txt"), "candidate\n");
 	await writeFile(join(repository, "initially-untracked.txt"), "included\n");
 
@@ -271,7 +277,7 @@ test("official pinned package runtime keeps frozen candidate lineages and receip
 	// v2.1.7 terminal replay contract: replay uses the exact explicit lineage with
 	// no mutation inputs; re-sending reviewer results after approval is rejected.
 	const repeatedResults = await finalizeEmptyReview(repository, artifacts, first, "first-evidence.txt").catch((error: NodeJS.ErrnoException & { stderr?: string }) => error);
-	assert.match((repeatedResults as { stderr?: string }).stderr ?? "", /reviewer results are accepted only while the authority is reviewing/, "terminal authority must reject replayed reviewer results");
+	assert.match((repeatedResults as { stderr?: string }).stderr ?? "", /terminal review finalize accepts no review inputs; exact replay requires only --lineage/, "terminal authority must reject replayed reviewer results");
 	const firstFinalizeReplay = JSON.parse((await run(binary, ["review", "finalize", "--cwd", repository, "--lineage", first.lineage_id], repository)).stdout) as ReviewFinalize;
 	const firstFinalizeReplayInventory = authorityInventory(await reviewStatus(repository));
 	assert.equal(firstFinalized.lineage_id, first.lineage_id);

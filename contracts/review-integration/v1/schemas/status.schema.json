@@ -67,10 +67,116 @@
       "additionalProperties": false,
       "required": ["required"],
       "properties": { "required": { "const": true } }
-    }
+    },
+    "eligibility": { "$ref": "#/$defs/action_eligibility" },
+    "next_transition": { "$ref": "#/$defs/next_transition" }
   },
   "$defs": {
-    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "next_transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "reason_code"],
+      "properties": {
+        "kind": { "enum": ["execute", "collect", "stop"] },
+        "reason_code": { "type": "string", "pattern": "^[a-z0-9_]+$" },
+        "execute": { "$ref": "#/$defs/transition_execution" },
+        "collect": { "$ref": "#/$defs/transition_collection" }
+      },
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "execute" } }, "required": ["kind"] }, "then": { "required": ["execute"], "not": { "required": ["collect"] } } },
+        { "if": { "properties": { "kind": { "const": "collect" } }, "required": ["kind"] }, "then": { "required": ["collect"], "not": { "required": ["execute"] } } },
+        { "if": { "properties": { "kind": { "const": "stop" } }, "required": ["kind"] }, "then": { "not": { "anyOf": [{ "required": ["execute"] }, { "required": ["collect"] }] } } }
+      ]
+    },
+    "transition_argument": {
+      "type": "object", "additionalProperties": false, "required": ["name", "value"],
+      "properties": { "name": { "type": "string", "pattern": "^[a-z0-9_-]+$" }, "value": { "type": "string", "minLength": 1 } }
+    },
+    "transition_binding": {
+      "type": "object", "additionalProperties": false, "required": ["target_identity"],
+      "properties": { "lineage_id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" }, "revision": { "$ref": "#/$defs/sha256" }, "target_identity": { "$ref": "#/$defs/sha256" } }
+    },
+    "transition_execution": {
+      "type": "object", "additionalProperties": false, "required": ["operation", "arguments", "preconditions", "binding"],
+      "properties": {
+        "operation": { "enum": ["review.start", "review.finalize", "review.recover", "review.validate"] },
+        "arguments": { "type": "array", "items": { "$ref": "#/$defs/transition_argument" } },
+        "preconditions": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/transition_argument" } },
+        "binding": { "$ref": "#/$defs/transition_binding" },
+        "artifacts": { "type": "array", "items": { "$ref": "#/$defs/transition_artifact" } }
+      }
+    },
+    "transition_artifact": {
+      "type": "object", "additionalProperties": false, "required": ["schema", "capability", "sha256", "lineage_id", "target_identity", "lens", "selected_order"],
+      "properties": {
+        "schema": { "const": "gentle-ai.review-result-artifact/v1" }, "capability": { "const": "review.native_result_artifact" }, "sha256": { "$ref": "#/$defs/sha256" },
+        "lineage_id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" }, "target_identity": { "$ref": "#/$defs/sha256" }, "lens": { "type": "string", "minLength": 1 }, "selected_order": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "transition_collection": {
+      "type": "object", "additionalProperties": false, "required": ["inputs"],
+      "properties": { "inputs": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/transition_input" } } }
+    },
+    "transition_input": {
+      "type": "object", "additionalProperties": false, "required": ["name", "schema", "capture_operation", "arguments"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9_]+$" }, "schema": { "type": "string", "minLength": 1 }, "capture_operation": { "type": "string", "minLength": 1 },
+        "arguments": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/transition_argument" } }
+      }
+    },
+    "action_eligibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed_actions", "forbidden_actions"],
+      "properties": {
+        "allowed_actions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action", "reason_code", "required_inputs"],
+            "properties": {
+              "action": { "enum": ["stop", "review.start", "review.finalize", "review.validate", "review.recover"] },
+              "reason_code": { "type": "string", "pattern": "^[a-z0-9_]+$" },
+              "required_inputs": { "type": "array", "items": { "type": "string", "pattern": "^[a-z0-9_]+$" } },
+              "disposition": { "enum": ["scope_changed", "invalidated", "escalated"] },
+              "binding": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["lineage_id", "revision", "target_identity"],
+                "properties": {
+                  "lineage_id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+                  "revision": { "$ref": "#/$defs/sha256" },
+                  "target_identity": { "$ref": "#/$defs/sha256" }
+                }
+              }
+            },
+            "allOf": [
+              {
+                "if": { "properties": { "action": { "const": "review.recover" } }, "required": ["action"] },
+                "then": { "required": ["disposition", "binding"] },
+                "else": { "not": { "anyOf": [{ "required": ["disposition"] }, { "required": ["binding"] }] } }
+              }
+            ]
+          }
+        },
+        "forbidden_actions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action", "reason_code"],
+            "properties": {
+              "action": { "enum": ["review.abandon", "review.finalize", "review.invalidate", "review.quarantine-legacy", "review.reclaim", "review.reconcile-authority", "review.recover", "review.start", "review.validate"] },
+              "reason_code": { "type": "string", "pattern": "^[a-z0-9_]+$" }
+            }
+          }
+        }
+      }
+    }
   },
   "allOf": [
     {

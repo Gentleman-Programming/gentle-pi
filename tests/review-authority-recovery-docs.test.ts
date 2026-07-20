@@ -6,7 +6,7 @@ const README = readFileSync("README.md", "utf8");
 const CONTROLLER = readFileSync("extensions/gentle-ai.ts", "utf8");
 
 test("recovery guidance documents the narrow published native maintenance contract", () => {
-	assert.match(README, /abandon.*quarantine-legacy.*reconcile-authority.*explicit v2\.1\.10 maintenance/i);
+	assert.match(README, /abandon.*quarantine-legacy.*reconcile-authority.*explicit v2\.1\.11 maintenance/i);
 	assert.match(README, /predecessor lineage and revision.*successor lineage and revision/i);
 	assert.match(README, /exact seven-line.*anomalies=unchanged_target,malformed_recovery_authorization/i);
 	assert.match(README, /fresh interactive approval/i);
@@ -21,7 +21,7 @@ test("recovery guidance documents the narrow published native maintenance contra
 });
 
 test("controller help keeps authorization, blocked outcomes, and recovery boundaries explicit", () => {
-	assert.match(CONTROLLER, /v2\.1\.10 repair-legacy-alias.*fresh native inventory.*fresh UI approval/is);
+	assert.match(CONTROLLER, /v2\.1\.11 repair-legacy-alias.*fresh native inventory.*fresh UI approval/is);
 	assert.match(CONTROLLER, /unchanged_target,malformed_recovery_authorization/);
 	assert.match(CONTROLLER, /provider-selected recovery disposition/);
 	assert.match(CONTROLLER, /headlessly|headless/i);

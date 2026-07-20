@@ -76,25 +76,25 @@ const requiredPaths = [
 ];
 
 const contractHashes = {
-  "contracts/review-integration/v1/fixtures/capabilities-v1.1.fixture.json": "b45c3a99d89288f76b900e17b9900ce846df2c5ecfe590d4064e7bed38e9a754",
+  "contracts/review-integration/v1/fixtures/capabilities-v1.1.fixture.json": "1b3dc40dce7bfb5d3ecc7e92af68d66e71b733ba0b0f71ba94d3c633adc48bcf",
   "contracts/review-integration/v1/fixtures/capabilities.fixture.json": "b3ca822189a236f2d891628c665ca23e308bf5185a1701e1f07231bd970461bb",
   "contracts/review-integration/v1/fixtures/failure.fixture.json": "e72b6ab5e3c529abac47bd324444f84ca90f67ef0a67189f5fd8d24d199a2759",
-  "contracts/review-integration/v1/fixtures/operation.fixture.json": "4ddec04f3d1504b771a87f6a71e04e2b5440019d12a6df4663815fdf7489c9e4",
+  "contracts/review-integration/v1/fixtures/operation.fixture.json": "f867bead654d467319d85ff518b39f145996df6a9494fdbff798516928dacfcd",
   "contracts/review-integration/v1/fixtures/start.fixture.json": "d61267ee2e0a5e4c64cf48f40b4882d2284bfdaad9942a09ee29d7e693012238",
-  "contracts/review-integration/v1/fixtures/status-ambiguous.fixture.json": "4b024e06b791bb9b300403b09e3111220e8bf55cd5fd7617580631b57de86208",
-  "contracts/review-integration/v1/fixtures/status-corrupted.fixture.json": "5fc9191df078ce1e01732b82a88683fef1502f501188c03900367b666da6df62",
-  "contracts/review-integration/v1/fixtures/status-unrelated.fixture.json": "0d68e1e121a73b962f8bda8e48631eee24f4420f5d83402b91d2a12fff632248",
-  "contracts/review-integration/v1/fixtures/status.fixture.json": "39b31b1c2b07ead9e0f21e47169f82f388be91dd3054bcd648e89258fac36c04",
-  "contracts/review-integration/v1/schemas/capabilities-v1.1.schema.json": "5f67e900804065f318f8e0576a882e77814e1a7bf36cb17c596973051e88cf9f",
+  "contracts/review-integration/v1/fixtures/status-ambiguous.fixture.json": "0f2737c2ed67bb2edb184faa8ac7006ef4f9172b9929aaa063432871c2aa945c",
+  "contracts/review-integration/v1/fixtures/status-corrupted.fixture.json": "a9c25d0d0eab2cc91ef095939c650deafadb112e75d0957a21aa8c60b51fdcda",
+  "contracts/review-integration/v1/fixtures/status-unrelated.fixture.json": "e8aa372dfa582e4bf78992757135bc902c28bd9fe946210e40c3edf4c6abfb0b",
+  "contracts/review-integration/v1/fixtures/status.fixture.json": "cf981c5fd715357f817fc9206523284dddd1ede8ceee99e7b4935847327e6adc",
+  "contracts/review-integration/v1/schemas/capabilities-v1.1.schema.json": "2b14162284f375f8563e49d3a28caaa0aabb572094d8d290eb61844b1353af78",
   "contracts/review-integration/v1/schemas/capabilities.schema.json": "ad333177494a251beac153f74bd751fa77126a9968aad69e64fc2abf15cff0f7",
   "contracts/review-integration/v1/schemas/failure.schema.json": "11284601a00e0192c41b1f3aab0b153635e28ad57ec5f1e2e90a69d129296c44",
-  "contracts/review-integration/v1/schemas/operation.schema.json": "e71c7d9f55d3b563e9037f2be9f0aaff26b96e03b51c402943e5f6eefe33588d",
+  "contracts/review-integration/v1/schemas/operation.schema.json": "7673bb168b6df8cee68f4449a9b79f0a1fc349747e5b26009b41d649979f690d",
   "contracts/review-integration/v1/schemas/projection.schema.json": "7168a3eba929dde2b8f0b7723ee51d5a5421102bdeefe892578c263debd08db2",
   "contracts/review-integration/v1/schemas/result-artifact.schema.json": "91296bd2c261fd2fe03bffd63efe58badd4927e0d0d8480cd4213f651ecacdf6",
   "contracts/review-integration/v1/schemas/start.schema.json": "f3390d09cccb5136392e247db780b9415ceba8c49971a1b1a84240fc66694d97",
-  "contracts/review-integration/v1/schemas/status.schema.json": "ce80f052a7537706a2461d0a50a77a3f5f8b9abf3ff01b80f1fa10c1644eea28",
-  "contracts/review-integration/v1/fixtures/status-recover.fixture.json": "400c711884ec41a44e6cc0a77cf59a5b10f98701e0d2d6af0922079e483196cc",
-  "docs/review-integration.md": "07102a38cb755358ff24d39064a220d98ab659d1a6aa3a92984fae81e17bb35c",
+  "contracts/review-integration/v1/schemas/status.schema.json": "11ed3aae66e86534b696df3ed11536c4d1f648e2d33ee05a1cd48412903d5db2",
+  "contracts/review-integration/v1/fixtures/status-recover.fixture.json": "e50893555694944fc904f3c90442c2f4b2855fda1f36f55482c5a7eed884a75a",
+  "docs/review-integration.md": "4bead7c3e3cf7ecfac18941d96ece52a1d6eb263d410ef54f9422aa07eab131c",
 };
 
 requiredPaths.push(...Object.keys(contractHashes));
@@ -119,7 +119,7 @@ const driftedContracts = Object.entries(contractHashes).flatMap(([relativePath, 
 });
 
 if (driftedContracts.length > 0) {
-  console.error("gentle-pi packaged review-integration/v1 bytes drifted from the byte-identical Gentle AI v2.1.10 contract:");
+  console.error("gentle-pi packaged review-integration/v1 bytes drifted from the byte-identical Gentle AI v2.1.11 contract:");
   for (const drift of driftedContracts) console.error(`- ${drift.relativePath}: expected ${drift.expected}, got ${drift.actual}`);
   process.exit(1);
 }
@@ -151,9 +151,9 @@ if (generatedRuntimeCheck.status !== 0) {
 
 const installer = readFileSync(join(root, "scripts/gentle-ai-installer.mjs"), "utf8");
 const binaryResolver = readFileSync(join(root, "lib/gentle-ai-binary.ts"), "utf8");
-if (!installer.includes('INSTALLER_VERSION = "2.1.10"') || !binaryResolver.includes('GENTLE_AI_VERSION = "2.1.10"')) {
-	console.error("gentle-pi package-local Gentle AI version pins are not both v2.1.10.");
+if (!installer.includes('INSTALLER_VERSION = "2.1.11"') || !binaryResolver.includes('GENTLE_AI_VERSION = "2.1.11"')) {
+	console.error("gentle-pi package-local Gentle AI version pins are not both v2.1.11.");
   process.exit(1);
 }
 
-console.log(`gentle-pi package resource check passed (${requiredPaths.length} files; ${Object.keys(contractHashes).length} exact byte-identical v2.1.10 contract artifacts).`);
+console.log(`gentle-pi package resource check passed (${requiredPaths.length} files; ${Object.keys(contractHashes).length} exact byte-identical v2.1.11 contract artifacts).`);
