@@ -353,7 +353,7 @@ test("registered gentle_review START materializes a safe internal skill symlink 
 
 	const candidateViews = new CandidateViewRegistry();
 	let nativeStartReached = false;
-	// The production controller pairs with the negotiated client; v2.1.8's ordinary
+	// The production controller pairs with the negotiated client; v2.1.9's ordinary
 	// (non-negotiated) START output carries additional facade fields that the
 	// pinned legacy decoder intentionally rejects.
 	const native = new NativeReviewCliV216(async (request) => {

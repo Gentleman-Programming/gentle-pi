@@ -40,7 +40,13 @@ Each mutation MUST atomically append `{operation, idempotency_key, request_hash,
 
 ### Requirement: Negotiated native ordinary authority
 
-The consumer MUST resolve the integrity-verified package-local Gentle AI v2.1.8 executable, independently hash it, negotiate `gentle-ai.review-integration/v1` outside repository context, and cache capabilities only by that digest. START, target status, FINALIZE, validation, and SDD binding MUST pass the same contract identifier. Native compact-v2 MUST be the sole mutable ordinary authority; legacy-v1 and Pi authority remain compatibility-read-only. Unknown mandatory behavior, incompatible protocol/schema identity, or executable drift MUST fail closed, while advertised optional additions MAY be ignored without disabling mandatory operations.
+The consumer MUST resolve the integrity-verified package-local Gentle AI v2.1.10 executable, independently hash it, negotiate `gentle-ai.review-integration/v1` outside repository context, and cache capabilities only by that digest. START, target status, FINALIZE, validation, and SDD binding MUST pass the same contract identifier. Native compact-v2 MUST be the sole mutable ordinary authority; legacy-v1 and Pi authority remain compatibility-read-only. Unknown mandatory behavior, incompatible protocol/schema identity, or executable drift MUST fail closed, while advertised optional additions MAY be ignored without disabling mandatory operations.
+
+#### Scenario: Explicit v2.1.10 maintenance
+
+- GIVEN a caller supplies one published maintenance operation and its exact binding inputs
+- WHEN Pi invokes abandon, quarantine-legacy, reconciliation, or repair-legacy-alias
+- THEN Pi requires fresh interactive approval, forwards shell-free exact argv, preserves a native audit record only from a valid response envelope, derives repair repository/revision/diagnostic/disposition from fresh native inventory, and keeps dispose-result unsupported pending design
 
 #### Scenario: Target-scoped restart
 

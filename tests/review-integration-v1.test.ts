@@ -96,9 +96,24 @@ test("every published review integration fixture decodes", () => {
 	assert.equal(failure.mutationOutcome, "not_started");
 	assert.equal(failure.code, "gate_scope_changed");
 	assert.equal(decodeReviewOperationV1(fixture("operation.fixture.json")).operation, "review.finalize");
-	for (const name of ["status.fixture.json", "status-unrelated.fixture.json", "status-ambiguous.fixture.json", "status-corrupted.fixture.json"]) {
+	for (const name of ["status.fixture.json", "status-unrelated.fixture.json", "status-ambiguous.fixture.json", "status-corrupted.fixture.json", "status-recover.fixture.json"]) {
 		assert.equal(decodeReviewStatusV1(fixture(name)).contract, REVIEW_INTEGRATION_CONTRACT);
 	}
+});
+
+test("status accepts a provider-selected recovery disposition only for recover", () => {
+	const recover = fixture<JsonObject>("status-recover.fixture.json");
+	assert.equal(decodeReviewStatusV1(recover).actionDisposition, "scope_changed");
+	for (const disposition of ["invalidated", "escalated"]) {
+		const candidate = clone(recover);
+		candidate.action_disposition = disposition;
+		assert.equal(decodeReviewStatusV1(candidate).actionDisposition, disposition);
+	}
+	for (const candidate of [
+		(() => { const value = clone(recover); delete value.action_disposition; return value; })(),
+		{ ...clone(recover), action_disposition: "unknown" },
+		{ ...fixture<JsonObject>("status.fixture.json"), action_disposition: "scope_changed" },
+	]) assert.throws(() => decodeReviewStatusV1(candidate), /action_disposition/);
 });
 
 test("capabilities enforce every required top-level and nested property", () => {
@@ -237,7 +252,7 @@ test("START enforces required, exact, bounded, and deeply unique payloads", () =
 	assertAdditionalProperty(decodeReviewStartV1, source, ["risk_reasons", "0"]);
 	assertNestedRequired(decodeReviewStartV1, source, ["risk_reasons", "0"], ["code"]);
 
-	for (const code of ["configuration_change", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "service_token", "shell_source"]) {
+	for (const code of ["configuration_change", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "process_boundary", "process_scan_limit", "service_token", "shell_source"]) {
 		const candidate = clone(source);
 		candidate.risk_reasons = [{ code }];
 		assert.equal(decodeReviewStartV1(candidate).riskReasons[0]?.code, code);

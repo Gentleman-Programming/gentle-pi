@@ -6,7 +6,7 @@ import { resolveGentleAiReleaseAsset } from "../scripts/gentle-ai-installer.mjs"
 import { fileURLToPath } from "node:url";
 
 export const GENTLE_AI_BINARY_MISSING_CODE = "package-local-binary-missing";
-export const GENTLE_AI_VERSION = "2.1.8";
+export const GENTLE_AI_VERSION = "2.1.10";
 
 export class PackageLocalGentleAiBinaryMissingError extends Error {
 	         code = GENTLE_AI_BINARY_MISSING_CODE;

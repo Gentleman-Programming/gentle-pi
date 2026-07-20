@@ -53,6 +53,7 @@ function queuedAdapter(results: QueuedResult[]): { adapter: ExecFileAdapter; cal
 
 const VERSION = { stdout: "gentle-ai 2.1.4\n" };
 const STATUS_VERSION = { stdout: "gentle-ai 2.1.5\n" };
+const VERSION_219 = { stdout: "gentle-ai 2.1.9\n" };
 const START = { stdout: JSON.stringify({ operation: "review/start", lineage_id: "lineage-1", state: "reviewing", risk_level: "medium", selected_lenses: ["review-reliability"], changed_files: 1, changed_lines: 2, correction_budget: 1, action: "created", lenses_required: true, projection: "workspace" }) };
 const REVIEW_STATUS = {
 	stdout: JSON.stringify({
@@ -205,6 +206,8 @@ test("native START rejects invalid committed-range combinations before any adapt
 });
 
 test("native client accepts known versions only when they support the requested capability", async () => {
+	const accepted = queuedAdapter([VERSION_219, START]);
+	assert.equal((await new NativeReviewCliV213(accepted.adapter).start({ cwd: "/repo" })).lineageId, "lineage-1");
 	for (const rejectedVersion of ["2.1.1", "2.1.3"]) {
 		const incompatible = queuedAdapter([{ stdout: `gentle-ai ${rejectedVersion}\n` }]);
 		await assert.rejects(
@@ -218,6 +221,28 @@ test("native client accepts known versions only when they support the requested 
 		() => new NativeReviewCliV213(malformed.adapter).validate({ cwd: "/repo", gate: "post-apply", lineageId: "issue136-contract-runtime" }),
 		(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE,
 	);
+});
+
+test("native SDD status accepts an optional non-negative correction budget and preserves legacy absence", async () => {
+	const source = JSON.parse(await fixture("sdd-status")) as Record<string, unknown>;
+	const remediationState = source.remediationState as Record<string, unknown>;
+	for (const correctionBudget of [undefined, 0, 17]) {
+		const queue = queuedAdapter([VERSION_219, {
+			stdout: JSON.stringify({
+				...source,
+				remediationState: {
+					...remediationState,
+					...(correctionBudget === undefined ? {} : { correctionBudget }),
+				},
+			}),
+		}]);
+		const status = await new NativeReviewCliV213(queue.adapter).sddStatus({ cwd: "/repo", change: "native-review-authority-parity" });
+		assert.equal((status.remediationState as Record<string, unknown>).correctionBudget, correctionBudget);
+	}
+	for (const correctionBudget of [-1, 1.5]) {
+		const queue = queuedAdapter([VERSION_219, { stdout: JSON.stringify({ ...source, remediationState: { ...remediationState, correctionBudget } }) }]);
+		await assert.rejects(() => new NativeReviewCliV213(queue.adapter).sddStatus({ cwd: "/repo", change: "native-review-authority-parity" }), NativeReviewCliError);
+	}
 });
 
 test("version process failures retain their typed failure code", async () => {

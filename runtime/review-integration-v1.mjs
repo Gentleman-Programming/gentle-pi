@@ -76,9 +76,15 @@ export const REVIEW_START_STATE = {
 const START_ACTIONS = ["created", "resumed", "reuse-receipt", "blocked-scope-action"]         ;
 const RISK_LEVELS = ["low", "medium", "high"]         ;
 const REVIEW_LENSES = ["review-risk", "review-resilience", "review-readability", "review-reliability"]         ;
-const RISK_REASON_CODES = ["configuration_change", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "service_token", "shell_source"]         ;
+const RISK_REASON_CODES = ["configuration_change", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "process_boundary", "process_scan_limit", "service_token", "shell_source"]         ;
 const RISK_SIGNALS = ["auth", "update", "security", "payments", "permissions", "shell_process"]         ;
 const STATUS_ACTIONS = ["start", "finalize", "validate", "recover", "maintainer_action", "select_lineage", "repair_authority", "reconcile_finalize", "stop"]         ;
+export const REVIEW_STATUS_ACTION_DISPOSITION = {
+	SCOPE_CHANGED: "scope_changed",
+	INVALIDATED: "invalidated",
+	ESCALATED: "escalated",
+}         ;
+
 const RECEIPT_STATUSES = ["expected_missing", "present", "publication_pending", "not_applicable"]         ;
 const REQUIRED_OPERATIONS = Object.freeze(Object.values(REVIEW_INTEGRATION_OPERATION));
 const REQUIRED_GATES = Object.freeze(["post-apply", "pre-commit", "pre-push", "pre-pr", "release"]         );
@@ -124,6 +130,7 @@ const FEATURE_NAMES = Object.freeze([
 	"uniform_failure_envelope",
 ]         );
 const REQUIRED_MANDATORY_FEATURES = Object.freeze(FEATURE_NAMES.filter((name) => !(OPTIONAL_FEATURE_NAMES                     ).includes(name)));
+
 
 
 
@@ -562,7 +569,7 @@ export function decodeReviewProjectionV1(value         )                        
 }
 
 export function decodeReviewStatusV1(value         )                 {
-	const body = exactRecord(value, "status", ["schema", "contract", "operation", "applicability", "receipt", "action", "replayability", "target_identity", "projection", "candidates"], ["authority", "frozen", "reconciliation"]);
+	const body = exactRecord(value, "status", ["schema", "contract", "operation", "applicability", "receipt", "action", "replayability", "target_identity", "projection", "candidates"], ["authority", "frozen", "reconciliation", "action_disposition"]);
 	requireIdentity(body, "gentle-ai.review-integration.status/v1", REVIEW_INTEGRATION_OPERATION.STATUS);
 	const applicability = enumeration(body.applicability, ["current_target", "unrelated", "ambiguous", "corrupted"]         , "status.applicability");
 	const receiptBody = exactRecord(body.receipt, "status.receipt", ["status"], ["identity"]);
@@ -597,6 +604,11 @@ export function decodeReviewStatusV1(value         )                 {
 	if (authority?.version === REVIEW_AUTHORITY_VERSION.LEGACY_V1 && receiptStatus !== "expected_missing" && receiptStatus !== "present") throw new TypeError("legacy status receipt is incompatible");
 
 	const action = enumeration(body.action, STATUS_ACTIONS, "status.action");
+	const actionDisposition = body.action_disposition === undefined
+		? undefined
+		: enumeration(body.action_disposition, Object.values(REVIEW_STATUS_ACTION_DISPOSITION), "status.action_disposition");
+	if (action === "recover" && actionDisposition === undefined) throw new TypeError("recover status requires action_disposition");
+	if (action !== "recover" && actionDisposition !== undefined) throw new TypeError("status.action_disposition is only valid for the recover action");
 	const replayability = enumeration(body.replayability, Object.values(REVIEW_REPLAYABILITY), "status.replayability");
 	let reconciliation                                          ;
 	if (action === "reconcile_finalize") {
@@ -616,6 +628,7 @@ export function decodeReviewStatusV1(value         )                 {
 		...(authority === undefined ? {} : { authority }),
 		receipt,
 		action,
+		...(actionDisposition === undefined ? {} : { actionDisposition }),
 		replayability,
 		...(frozen === undefined ? {} : { frozen }),
 		...(reconciliation === undefined ? {} : { reconciliation }),

@@ -100,9 +100,15 @@ import { CandidateViewError, CandidateViewRegistry, injectReviewCandidateView, r
 import {
 	createNativeReviewCli,
 	isCanonicalProcessString,
+	nativeReviewAbandonAuthorization,
+	nativeReviewLegacyAliasRepairAuthorization,
+	nativeReviewLegacyQuarantineAuthorization,
 	nativeReviewReconcileAuthorization,
 	NativeReviewCliError,
 	NATIVE_REVIEW_ERROR_CODE,
+	NATIVE_REVIEW_LEGACY_QUARANTINE,
+	NATIVE_REVIEW_LEGACY_ALIAS_REPAIR,
+	NATIVE_REVIEW_RECONCILE_ANOMALIES,
 	sanitizeForeignNativeReviewDiagnostics,
 	type NativeReviewCli,
 	type NativeFinalizeResult,
@@ -2104,7 +2110,10 @@ const REVIEW_CONTROLLER_OPERATION = {
 	RESET: "reset",
 	RECOVER: "recover",
 	RECOVER_LOCK: "recover-lock",
+	ABANDON: "abandon",
+	QUARANTINE_LEGACY: "quarantine-legacy",
 	RECONCILE_AUTHORITY: "reconcile-authority",
+	REPAIR_LEGACY_ALIAS: "repair-legacy-alias",
 	REPAIR: "repair",
 	BIND_SDD: "bind-sdd",
 } as const;
@@ -2446,7 +2455,7 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 	// VALIDATE defers its lineage requirement to execution time: the proven
 	// release-from-protected-main fast path needs no receipt lineage, while
 	// every other validation still requires one before receipt validation.
-	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.FINALIZE, REVIEW_CONTROLLER_OPERATION.STATUS, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY, REVIEW_CONTROLLER_OPERATION.REPAIR, REVIEW_CONTROLLER_OPERATION.VALIDATE, REVIEW_CONTROLLER_OPERATION.BIND_SDD].includes(value.operation as ReviewControllerOperation);
+	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.FINALIZE, REVIEW_CONTROLLER_OPERATION.STATUS, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.ABANDON, REVIEW_CONTROLLER_OPERATION.QUARANTINE_LEGACY, REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY, REVIEW_CONTROLLER_OPERATION.REPAIR_LEGACY_ALIAS, REVIEW_CONTROLLER_OPERATION.REPAIR, REVIEW_CONTROLLER_OPERATION.VALIDATE, REVIEW_CONTROLLER_OPERATION.BIND_SDD].includes(value.operation as ReviewControllerOperation);
 	if (needsLineage && (typeof value.lineageId !== "string" || value.lineageId.trim().length === 0)) {
 		throw new Error("Review controller requires a lineageId");
 	}
@@ -2516,10 +2525,10 @@ async function authorizeDestructiveReviewOperation(
 ): Promise<void> {
 	const parameters = parseReviewControllerParameters(parametersValue);
 	const isReset = parameters.operation === REVIEW_CONTROLLER_OPERATION.RESET || parameters.operation === REVIEW_CONTROLLER_OPERATION.RECOVER;
-	const isReconciliation = parameters.operation === REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY;
-	if (!isReset && !isReconciliation) return;
+	const maintenance = nativeMaintenanceOperation(parameters.operation);
+	if (!isReset && maintenance === undefined) return;
 	const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
-	if (isReconciliation && missingNativeReconcileInputs(input).length > 0) return;
+	if (maintenance !== undefined && (missingNativeMaintenanceInputs(maintenance, input).length > 0 || invalidNativeMaintenanceInput(maintenance, input))) return;
 	if (isReset) {
 		for (const key of ["repositoryId", "commonDirHash", "inventoryHash"] as const) {
 			if (typeof input[key] !== "string" || input[key].length === 0) throw new Error(`Review controller ${parameters.operation} requires an exact string ${key}`);
@@ -2529,11 +2538,11 @@ async function authorizeDestructiveReviewOperation(
 	if (!ctx.hasUI) {
 		throw new Error(`Review controller ${parameters.operation.toUpperCase()} requires fresh explicit authorization through the interactive Pi UI; headless execution fails closed`);
 	}
-	const reconciliationAuthorization = isReconciliation ? reconcileAuthorizationFromInput(input) : undefined;
+	const maintenanceAuthorization = maintenance === undefined ? undefined : nativeMaintenanceAuthorization(maintenance, input);
 	const approved = await ctx.ui.confirm(
-		isReconciliation ? "Authorize review authority reconciliation?" : `Authorize destructive review authority ${parameters.operation.toUpperCase()}?`,
-		isReconciliation
-			? ["Operation: RECONCILE_AUTHORITY", "Exact target and revision binding:", reconciliationAuthorization!, "The native command may quarantine only the bound invalid recovery successor; the predecessor stays untouched."].join("\n")
+		maintenance !== undefined ? `Authorize review authority ${parameters.operation.toUpperCase()}?` : `Authorize destructive review authority ${parameters.operation.toUpperCase()}?`,
+		maintenance !== undefined
+			? [`Operation: ${parameters.operation.toUpperCase()}`, "Exact published authorization binding:", maintenanceAuthorization!, maintenance === "abandon" ? "The native command may quarantine only an eligible pristine compact-v2 lineage." : maintenance === "quarantineLegacy" ? "The native command may quarantine only the published malformed freeze-findings legacy diagnostic." : "The native command may quarantine only the bound invalid recovery successor; the predecessor stays untouched."].join("\n")
 			: [`Operation: ${parameters.operation.toUpperCase()}`, `Repository: ${input.repositoryId}`, `Exact challenge: ${input.confirmation}`, "This invalidates all prior review authority for this repository."].join("\n"),
 	);
 	if (!approved) throw new Error(`Review controller ${parameters.operation.toUpperCase()} was not explicitly authorized`);
@@ -3860,53 +3869,134 @@ function nativeStatusFailed(operation: ReviewControllerOperation, error: unknown
 const NATIVE_RECOVERY_INPUT = {
 	reclaim: ["lineage", "actor", "reason"],
 	recover: ["predecessorLineage", "expectedPredecessorRevision", "successorLineage", "disposition", "actor", "reason"],
-	reconcileAuthority: ["predecessorLineage", "expectedPredecessorRevision", "successorLineage", "expectedSuccessorRevision", "actor", "reason"],
 } as const;
 
-function missingNativeReconcileInputs(input: Record<string, unknown>): readonly string[] {
-	return NATIVE_RECOVERY_INPUT.reconcileAuthority.filter((key) => !isCanonicalProcessString(input[key]));
+const NATIVE_MAINTENANCE_INPUT = {
+	abandon: ["lineage", "expectedRevision", "snapshotIdentity", "actor", "reason"],
+	quarantineLegacy: ["repository", "lineage", "expectedRevision", "diagnostic", "disposition", "actor", "reason"],
+	reconcileAuthority: ["predecessorLineage", "expectedPredecessorRevision", "successorLineage", "expectedSuccessorRevision", "actor", "reason"],
+} as const;
+type NativeMaintenanceOperation = keyof typeof NATIVE_MAINTENANCE_INPUT;
+
+function nativeMaintenanceOperation(operation: ReviewControllerOperation): NativeMaintenanceOperation | undefined {
+	if (operation === REVIEW_CONTROLLER_OPERATION.ABANDON) return "abandon";
+	if (operation === REVIEW_CONTROLLER_OPERATION.QUARANTINE_LEGACY) return "quarantineLegacy";
+	if (operation === REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY) return "reconcileAuthority";
+	return undefined;
 }
 
-function reconcileAuthorizationFromInput(input: Record<string, unknown>): string {
-	return nativeReviewReconcileAuthorization({
-		predecessorLineage: String(input.predecessorLineage),
-		expectedPredecessorRevision: String(input.expectedPredecessorRevision),
-		successorLineage: String(input.successorLineage),
-		expectedSuccessorRevision: String(input.expectedSuccessorRevision),
-		actor: String(input.actor),
-		reason: String(input.reason),
-	});
+function missingNativeMaintenanceInputs(operation: NativeMaintenanceOperation, input: Record<string, unknown>): readonly string[] {
+	return NATIVE_MAINTENANCE_INPUT[operation].filter((key) => !isCanonicalProcessString(input[key]));
 }
 
-async function executeNativeAuthorityReconciliation(
+function invalidNativeMaintenanceInput(operation: NativeMaintenanceOperation, input: Record<string, unknown>): boolean {
+	if (operation === "quarantineLegacy") return input.diagnostic !== NATIVE_REVIEW_LEGACY_QUARANTINE.DIAGNOSTIC || input.disposition !== NATIVE_REVIEW_LEGACY_QUARANTINE.DISPOSITION;
+	return operation === "reconcileAuthority" && input.anomalies !== undefined && input.anomalies !== NATIVE_REVIEW_RECONCILE_ANOMALIES.COMBINED;
+}
+
+function nativeMaintenanceAuthorization(operation: NativeMaintenanceOperation, input: Record<string, unknown>): string {
+	if (operation === "abandon") return nativeReviewAbandonAuthorization({ lineage: String(input.lineage), expectedRevision: String(input.expectedRevision), snapshotIdentity: String(input.snapshotIdentity), actor: String(input.actor), reason: String(input.reason) });
+	if (operation === "quarantineLegacy") return nativeReviewLegacyQuarantineAuthorization({ repository: String(input.repository), lineage: String(input.lineage), expectedRevision: String(input.expectedRevision), diagnostic: NATIVE_REVIEW_LEGACY_QUARANTINE.DIAGNOSTIC, disposition: NATIVE_REVIEW_LEGACY_QUARANTINE.DISPOSITION, actor: String(input.actor), reason: String(input.reason) });
+	return nativeReviewReconcileAuthorization({ predecessorLineage: String(input.predecessorLineage), expectedPredecessorRevision: String(input.expectedPredecessorRevision), successorLineage: String(input.successorLineage), expectedSuccessorRevision: String(input.expectedSuccessorRevision), actor: String(input.actor), reason: String(input.reason), ...(input.anomalies === undefined ? {} : { anomalies: NATIVE_REVIEW_RECONCILE_ANOMALIES.COMBINED }) });
+}
+
+async function executeNativeAuthorityMaintenance(
 	operation: ReviewControllerOperation,
+	nativeOperation: NativeMaintenanceOperation,
 	input: Record<string, unknown>,
 	cwd: string,
 	nativeReviewCli: NativeReviewCli | null,
 	pendingAuthorizations: Map<string, PendingReviewAuthorization>,
 	signal: AbortSignal | undefined,
 ): Promise<Record<string, unknown>> {
-	if (nativeReviewCli?.reconcileAuthority === undefined) {
-		return { operation, status: "blocked", outcome: "native-reconciliation-unavailable", native_operation: "review reconcile-authority", mutation_performed: false, mutation_outcome: "none", next_action: "install-package-local-gentle-ai-or-run-native-review-cli-directly" };
+	const method = nativeOperation === "abandon" ? nativeReviewCli?.abandon : nativeOperation === "quarantineLegacy" ? nativeReviewCli?.quarantineLegacy : nativeReviewCli?.reconcileAuthority;
+	const nativeCommand = nativeOperation === "quarantineLegacy" ? "review quarantine-legacy" : nativeOperation === "reconcileAuthority" ? "review reconcile-authority" : "review abandon";
+	if (method === undefined) {
+		return { operation, status: "blocked", outcome: "native-maintenance-unavailable", native_operation: nativeCommand, mutation_performed: false, mutation_outcome: "none", next_action: "install-package-local-gentle-ai-or-run-native-review-cli-directly" };
 	}
-	const missing = missingNativeReconcileInputs(input);
+	const missing = missingNativeMaintenanceInputs(nativeOperation, input);
 	if (missing.length > 0) {
-		return { operation, status: "blocked", outcome: "native-input-required", native_operation: "review reconcile-authority", missing_input: missing, mutation_performed: false, mutation_outcome: "none", next_action: "resubmit-with-exact-native-reconciliation-input" };
+		return { operation, status: "blocked", outcome: "native-input-required", native_operation: nativeCommand, missing_input: missing, mutation_performed: false, mutation_outcome: "none", next_action: "resubmit-with-exact-native-maintenance-input" };
+	}
+	if (invalidNativeMaintenanceInput(nativeOperation, input)) {
+		return { operation, status: "blocked", outcome: "native-input-invalid", native_operation: nativeCommand, mutation_performed: false, mutation_outcome: "none", next_action: "resubmit-with-the-exact-published-native-maintenance-binding" };
 	}
 	pendingAuthorizations.clear();
 	try {
-		const result = await nativeReviewCli.reconcileAuthority({
-			cwd,
-			predecessorLineage: String(input.predecessorLineage),
-			expectedPredecessorRevision: String(input.expectedPredecessorRevision),
-			successorLineage: String(input.successorLineage),
-			expectedSuccessorRevision: String(input.expectedSuccessorRevision),
-			actor: String(input.actor),
-			reason: String(input.reason),
-			maintainerAuthorization: reconcileAuthorizationFromInput(input),
-			...(signal === undefined ? {} : { signal }),
-		});
-		return { operation, native_operation: "review reconcile-authority", result: result.record, mutation_performed: true, mutation_outcome: "committed", next_action: "inspect" };
+		const result = nativeOperation === "abandon"
+			? await nativeReviewCli.abandon!({ cwd, lineage: String(input.lineage), expectedRevision: String(input.expectedRevision), snapshotIdentity: String(input.snapshotIdentity), actor: String(input.actor), reason: String(input.reason), maintainerAuthorization: nativeMaintenanceAuthorization(nativeOperation, input), ...(signal === undefined ? {} : { signal }) })
+			: nativeOperation === "quarantineLegacy"
+				? await nativeReviewCli.quarantineLegacy!({ cwd, repository: String(input.repository), lineage: String(input.lineage), expectedRevision: String(input.expectedRevision), diagnostic: NATIVE_REVIEW_LEGACY_QUARANTINE.DIAGNOSTIC, disposition: NATIVE_REVIEW_LEGACY_QUARANTINE.DISPOSITION, actor: String(input.actor), reason: String(input.reason), maintainerAuthorization: nativeMaintenanceAuthorization(nativeOperation, input), ...(signal === undefined ? {} : { signal }) })
+				: await nativeReviewCli.reconcileAuthority!({ cwd, predecessorLineage: String(input.predecessorLineage), expectedPredecessorRevision: String(input.expectedPredecessorRevision), successorLineage: String(input.successorLineage), expectedSuccessorRevision: String(input.expectedSuccessorRevision), actor: String(input.actor), reason: String(input.reason), ...(input.anomalies === undefined ? {} : { anomalies: NATIVE_REVIEW_RECONCILE_ANOMALIES.COMBINED }), maintainerAuthorization: nativeMaintenanceAuthorization(nativeOperation, input), ...(signal === undefined ? {} : { signal }) });
+		return { operation, native_operation: nativeCommand, result: result.record, mutation_performed: true, mutation_outcome: "committed", next_action: "inspect" };
+	} catch (error) {
+		return nativeOperationFailure(operation, error);
+	}
+}
+
+const NATIVE_LEGACY_ALIAS_REPAIR_INPUT = ["lineage", "actor", "reason"] as const;
+
+async function executeNativeLegacyAliasRepair(
+	input: Record<string, unknown>,
+	cwd: string,
+	nativeReviewCli: NativeReviewCli | null,
+	pendingAuthorizations: Map<string, PendingReviewAuthorization>,
+	signal: AbortSignal | undefined,
+	context: ExtensionContext | undefined,
+): Promise<Record<string, unknown>> {
+	const operation = REVIEW_CONTROLLER_OPERATION.REPAIR_LEGACY_ALIAS;
+	const nativeOperation = "review repair-legacy-alias";
+	if (Object.keys(input).some((key) => !NATIVE_LEGACY_ALIAS_REPAIR_INPUT.includes(key as (typeof NATIVE_LEGACY_ALIAS_REPAIR_INPUT)[number]))) {
+		return { operation, status: "blocked", outcome: "native-input-invalid", native_operation: nativeOperation, mutation_performed: false, mutation_outcome: "none", next_action: "resubmit-with-lineage-actor-and-reason-only" };
+	}
+	const missing = NATIVE_LEGACY_ALIAS_REPAIR_INPUT.filter((key) => !isCanonicalProcessString(input[key]));
+	if (missing.length > 0) {
+		return { operation, status: "blocked", outcome: "native-input-required", native_operation: nativeOperation, missing_input: missing, mutation_performed: false, mutation_outcome: "none", next_action: "resubmit-with-lineage-actor-and-reason" };
+	}
+	if (nativeReviewCli?.reviewStatus === undefined || nativeReviewCli.repairLegacyAlias === undefined) {
+		return { operation, status: "blocked", outcome: "native-maintenance-unavailable", native_operation: nativeOperation, mutation_performed: false, mutation_outcome: "none", next_action: "install-package-local-gentle-ai-v2.1.10-or-run-native-review-cli-directly" };
+	}
+	let inventory;
+	try {
+		inventory = await nativeReviewCli.reviewStatus({ cwd, ...(signal === undefined ? {} : { signal }) });
+	} catch (error) {
+		return nativeOperationFailure(operation, error);
+	}
+	const candidate = inventory.complete
+		? inventory.entries.filter((entry) =>
+			entry.version === "legacy-v1"
+			&& entry.status === "invalid"
+			&& entry.lineageId === input.lineage
+			&& isCanonicalProcessString(entry.revision)
+			&& entry.problems.length === 1
+			&& entry.problems[0] === NATIVE_REVIEW_LEGACY_ALIAS_REPAIR.DIAGNOSTIC,
+		)
+		: [];
+	if (candidate.length !== 1 || !isCanonicalProcessString(inventory.repository)) {
+		return { operation, status: "blocked", outcome: "native-alias-repair-ineligible", native_operation: nativeOperation, mutation_performed: false, mutation_outcome: "none", next_action: "inspect-complete-native-authority-inventory" };
+	}
+	const entry = candidate[0]!;
+	const request = {
+		cwd,
+		repository: inventory.repository,
+		lineage: entry.lineageId!,
+		expectedRevision: entry.revision!,
+		diagnostic: NATIVE_REVIEW_LEGACY_ALIAS_REPAIR.DIAGNOSTIC,
+		disposition: NATIVE_REVIEW_LEGACY_ALIAS_REPAIR.DISPOSITION,
+		actor: input.actor as string,
+		reason: input.reason as string,
+	};
+	const authorization = nativeReviewLegacyAliasRepairAuthorization(request);
+	if (context?.hasUI !== true) throw new Error("Review controller REPAIR_LEGACY_ALIAS requires fresh explicit authorization through the interactive Pi UI; headless execution fails closed");
+	const approved = await context.ui.confirm(
+		"Authorize review authority REPAIR_LEGACY_ALIAS?",
+		["Operation: REPAIR_LEGACY_ALIAS", "Exact published authorization binding:", authorization, "The native command may quarantine only this fresh, invalid legacy-v1 alias lineage; it never rewrites or validates historical authority."].join("\n"),
+	);
+	if (!approved) throw new Error("Review controller REPAIR_LEGACY_ALIAS was not explicitly authorized");
+	pendingAuthorizations.clear();
+	try {
+		const result = await nativeReviewCli.repairLegacyAlias({ ...request, maintainerAuthorization: authorization, ...(signal === undefined ? {} : { signal }) });
+		return { operation, native_operation: nativeOperation, result: result.record, mutation_performed: true, mutation_outcome: "committed", next_action: "inspect" };
 	} catch (error) {
 		return nativeOperationFailure(operation, error);
 	}
@@ -4054,6 +4144,17 @@ function mapNativeTargetStatus(operation: ReviewControllerOperation, status: Rev
 			status: routing.next_action === RECONCILE_FINALIZE_NEXT_ACTION ? "in-progress" : "blocked",
 			result: status.raw,
 			...routing,
+		};
+	}
+	if (status.action === "recover") {
+		return {
+			operation,
+			status: "blocked",
+			result: status.raw,
+			provider_action: "recover",
+			recovery_disposition: status.actionDisposition,
+			next_action: "recover-with-provider-disposition",
+			required_status_action: "Use only the provider-selected recovery disposition; do not substitute scope_changed, invalidated, or escalated.",
 		};
 	}
 	return {
@@ -4474,22 +4575,27 @@ async function executeReviewControllerOperation(
 	const defaultCwd = resolveReviewControllerWorkspaceRoot(parameters.workspaceRoot, sessionCwd);
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.EXPORT || parameters.operation === REVIEW_CONTROLLER_OPERATION.IMPORT) {
 		// Legacy bundle transport rode on the retired pre-integration graph/compact
-		// stores. The native v2.1.8 CLI exposes no bundle equivalent, so both
+		// stores. The native v2.1.10 CLI exposes no bundle equivalent, so both
 		// operations return a structured retirement envelope; the enum members are
 		// kept so the tool schema stays stable for existing callers.
 		return {
 			operation: parameters.operation,
 			status: "blocked",
 			outcome: "legacy-operation-retired",
-			reason: "Legacy review bundle transport (export/import) was retired together with the pre-integration graph/compact stores; gentle-ai v2.1.8 exposes no native bundle equivalent.",
+			reason: "Legacy review bundle transport (export/import) was retired together with the pre-integration graph/compact stores; gentle-ai v2.1.10 exposes no native bundle equivalent.",
 			mutation_performed: false,
 			mutation_outcome: "none",
 			next_action: "Use the native `gentle-ai review` CLI (start/finalize/validate/status/recover) against the repository review authority; receipts and canonical artifacts live in the Git common-directory store at .git/gentle-ai/reviews and travel with the repository through normal Git replication.",
 		};
 	}
-	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY) {
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.REPAIR_LEGACY_ALIAS) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
-		return await executeNativeAuthorityReconciliation(parameters.operation, input, defaultCwd, nativeReviewCli, pendingAuthorizations, signal);
+		return await executeNativeLegacyAliasRepair(input, defaultCwd, nativeReviewCli, pendingAuthorizations, signal, context);
+	}
+	const maintenance = nativeMaintenanceOperation(parameters.operation);
+	if (maintenance !== undefined) {
+		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
+		return await executeNativeAuthorityMaintenance(parameters.operation, maintenance, input, defaultCwd, nativeReviewCli, pendingAuthorizations, signal);
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.INSPECT && nativeReviewCli !== null) {
 		try {
@@ -4516,7 +4622,26 @@ async function executeReviewControllerOperation(
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RECOVER) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
-		return await executeNativeRecoveryRoute(parameters.operation, "recover", input, defaultCwd, nativeReviewCli, pendingAuthorizations, signal);
+		const missing = NATIVE_RECOVERY_INPUT.recover.filter((key) =>
+			key === "disposition"
+				? !["scope_changed", "invalidated", "escalated"].includes(input[key] as string)
+				: !isCanonicalProcessString(input[key]),
+		);
+		if (missing.length > 0) return await executeNativeRecoveryRoute(parameters.operation, "recover", input, defaultCwd, nativeReviewCli, pendingAuthorizations, signal);
+		if (nativeReviewCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
+		let status: ReviewStatusV1;
+		try {
+			status = await nativeReviewCli.targetStatus({ cwd: defaultCwd, lineageId: String(input.predecessorLineage), ...(signal === undefined ? {} : { signal }) });
+		} catch (error) {
+			return nativeStatusFailed(parameters.operation, error);
+		}
+		if (status.action !== "recover" || status.actionDisposition === undefined || status.authority?.lineageId !== input.predecessorLineage || status.authority.revision !== input.expectedPredecessorRevision) {
+			return { operation: parameters.operation, status: "blocked", outcome: "native-recovery-status-mismatch", mutation_performed: false, mutation_outcome: "none", result: status.raw, next_action: "follow-provider-target-status" };
+		}
+		if (input.disposition !== status.actionDisposition) {
+			return { operation: parameters.operation, status: "blocked", outcome: "native-recovery-disposition-mismatch", mutation_performed: false, mutation_outcome: "none", provider_disposition: status.actionDisposition, next_action: "resubmit-with-provider-disposition" };
+		}
+		return await executeNativeRecoveryRoute(parameters.operation, "recover", { ...input, disposition: status.actionDisposition }, defaultCwd, nativeReviewCli, pendingAuthorizations, signal);
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.RESET) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
@@ -5354,13 +5479,14 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 		name: "gentle_review",
 		label: "Gentle Review Controller",
 		description:
-			"Inspect and recover review authority, run new native ordinary review through start/finalize/validate, preserve legacy compact compatibility reads and graph-v1 Judgment Day, and authorize one exact lifecycle command. FINALIZE input is a JSON string: review_result.lens_results[] entries contain lens, findings, and non-empty evidence exactly once for every lens selected by START; final_evidence and final_verification_passed are paired. This is the Pi wrapper contract, distinct from native CLI --result, --refuter, --validation, and --evidence files. RESET/RECOVER remain destructive and are executed by the audited native CLI: RESET and RECOVER_LOCK map to `gentle-ai review reclaim` and RECOVER maps to `gentle-ai review recover`; missing native inputs are requested through a native-input-required envelope, never invented. RECONCILE_AUTHORITY maps only to native `gentle-ai review reconcile-authority`, requires fresh UI approval bound to exact predecessor and successor revisions, and fails closed headlessly. Legacy bundle transport is retired: export/import return a legacy-operation-retired envelope pointing at the native gentle-ai review CLI and the Git common-directory store.",
+			"Inspect and recover review authority, run new native ordinary review through start/finalize/validate, preserve legacy compact compatibility reads and graph-v1 Judgment Day, and authorize one exact lifecycle command. FINALIZE input is a JSON string: review_result.lens_results[] entries contain lens, findings, and non-empty evidence exactly once for every lens selected by START; final_evidence and final_verification_passed are paired. This is the Pi wrapper contract, distinct from native CLI --result, --refuter, --validation, and --evidence files. RESET/RECOVER remain destructive and are executed by the audited native CLI: RESET and RECOVER_LOCK map to `gentle-ai review reclaim` and RECOVER maps to `gentle-ai review recover` with the provider-selected disposition. Published v2.1.10 repair-legacy-alias derives its fixed repository binding from fresh native inventory before fresh UI approval; dispose-result remains unsupported pending design. Legacy bundle transport is retired: export/import return a legacy-operation-retired envelope pointing at the native gentle-ai review CLI and the Git common-directory store.",
 		promptSnippet: "Inspect authority, then use native start/finalize/validate for a new ordinary review; use graph-v1 only for explicit Judgment Day",
 		promptGuidelines: [
 			'Call {"operation":"inspect"} before START. New native ordinary START uses a JSON string such as "{\\"mode\\":\\"ordinary\\"}"; an explicit baseRef must be paired with committedOnly: true to request a committed range, while policyPath remains repository-local. policyHash is legacy compact-only. The controller derives lineage, Git/untracked scope, tier, lenses, authored lines, and budget.',
 			"Use RECONCILE_AUTHORITY only to quarantine one invalid native recovery successor. Supply exact predecessorLineage, expectedPredecessorRevision, successorLineage, expectedSuccessorRevision, actor, and reason values; Pi derives and displays the seven-line native authorization binding for fresh UI approval. The predecessor stays untouched, native returns the durable audit record, and Pi never falls back to RESET or RECOVER.",
+			"Use ABANDON or QUARANTINE_LEGACY only after an explicit user decision and with exact native inputs. ABANDON needs lineage, expectedRevision, snapshotIdentity, actor, and reason; QUARANTINE_LEGACY accepts only the published malformed freeze-findings diagnostic/disposition. A dual reconciliation may supply only anomalies `unchanged_target,malformed_recovery_authorization` in that exact order. Use REPAIR_LEGACY_ALIAS only with lineage, actor, and reason: Pi freshly reads native inventory and derives repository, revision, diagnostic, disposition, and the exact eight-line binding before interactive approval. `review dispose-result` is unsupported pending design.",
 			"Run selected lenses once, then call FINALIZE with a JSON string containing review_result.lens_results entries for every START-selected lens. Each entry has lens, findings, and non-empty evidence; clean lenses use findings: []. Pair final_evidence with final_verification_passed. This Pi wrapper shape differs from native CLI --result, --refuter, --validation, and --evidence files. FINALIZE alone records correction forecast, Git-derived correction evidence, targeted validation, and final evidence. Use ADVANCE only for explicit graph-v1 Judgment Day.",
-			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization for the exact reset_request challenge, then call RESET or RECOVER only after authorization. RESET and RECOVER_LOCK route to audited native `gentle-ai review reclaim` and RECOVER routes to native `gentle-ai review recover`; supply the exact native inputs (lineage/actor/reason, or the predecessor, revision, successor, disposition, actor, and reason bindings) and treat a native-input-required envelope as a request for those values, never as permission to invent them. After a committed native recovery record, INSPECT before any fresh ordinary START.",
+			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization for the exact reset_request challenge, then call RESET or RECOVER only after authorization. RESET and RECOVER_LOCK route to audited native `gentle-ai review reclaim` and RECOVER routes to native `gentle-ai review recover`; negotiated target status supplies the sole accepted recovery disposition, and a caller-supplied substitute is rejected. Treat a native-input-required envelope as a request for exact values, never as permission to invent them. After a committed native recovery record, INSPECT before any fresh ordinary START.",
 			"A reported lineage_created false or pre-authority validation error proves no lineage was created. After ambiguous START or FINALIZE output, the controller calls target-scoped native status first and returns only its declared action. Never infer or prescribe replay unless native explicitly reports exact_replay_safe for the same canonical request and required lineage.",
 			"Use gentle_review for bounded review transaction operations and exact lifecycle validation; never fabricate bash tool metadata or a separate gate target.",
 		],

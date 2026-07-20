@@ -31,7 +31,10 @@ export const NATIVE_REVIEW_OPERATION = {
 	STATUS: "review/status",
 	RECLAIM: "review/reclaim",
 	RECOVER: "review/recover",
+	ABANDON: "review/abandon",
+	QUARANTINE_LEGACY: "review/quarantine-legacy",
 	RECONCILE_AUTHORITY: "review/reconcile-authority",
+	REPAIR_LEGACY_ALIAS: "review/repair-legacy-alias",
 } as const;
 export type NativeReviewOperation = (typeof NATIVE_REVIEW_OPERATION)[keyof typeof NATIVE_REVIEW_OPERATION];
 
@@ -96,7 +99,10 @@ export interface NativeReviewCli {
 	targetStatus?(request: NativeTargetStatusRequest): Promise<ReviewStatusV1>;
 	reclaim?(request: NativeReviewReclaimRequest): Promise<NativeReviewRecoveryResult>;
 	recover?(request: NativeReviewRecoverRequest): Promise<NativeReviewRecoveryResult>;
+	abandon?(request: NativeReviewAbandonRequest): Promise<NativeReviewRecoveryResult>;
+	quarantineLegacy?(request: NativeReviewLegacyQuarantineRequest): Promise<NativeReviewRecoveryResult>;
 	reconcileAuthority?(request: NativeReviewReconcileAuthorityRequest): Promise<NativeReviewRecoveryResult>;
+	repairLegacyAlias?(request: NativeReviewLegacyAliasRepairRequest): Promise<NativeReviewRecoveryResult>;
 }
 
 export const NATIVE_REVIEW_RECOVER_DISPOSITION = ["scope_changed", "invalidated", "escalated"] as const;
@@ -122,12 +128,65 @@ export interface NativeReviewRecoverRequest {
 	signal?: AbortSignal;
 }
 
+export const NATIVE_REVIEW_LEGACY_QUARANTINE = {
+	DIAGNOSTIC: "historical findings freeze changed unrelated transaction state",
+	DISPOSITION: "quarantine-malformed-freeze-event",
+} as const;
+
+export const NATIVE_REVIEW_RECONCILE_ANOMALIES = {
+	COMBINED: "unchanged_target,malformed_recovery_authorization",
+} as const;
+
+export const NATIVE_REVIEW_LEGACY_ALIAS_REPAIR = {
+	DIAGNOSTIC: "unsupported historical v1 operation alias",
+	DISPOSITION: "quarantine-approved-historical-alias",
+} as const;
+export type NativeReviewReconcileAnomalies = (typeof NATIVE_REVIEW_RECONCILE_ANOMALIES)[keyof typeof NATIVE_REVIEW_RECONCILE_ANOMALIES];
+
+export interface NativeReviewAbandonRequest {
+	cwd: string;
+	lineage: string;
+	expectedRevision: string;
+	snapshotIdentity: string;
+	actor: string;
+	reason: string;
+	maintainerAuthorization: string;
+	signal?: AbortSignal;
+}
+
+export interface NativeReviewLegacyQuarantineRequest {
+	cwd: string;
+	repository: string;
+	lineage: string;
+	expectedRevision: string;
+	diagnostic: (typeof NATIVE_REVIEW_LEGACY_QUARANTINE)["DIAGNOSTIC"];
+	disposition: (typeof NATIVE_REVIEW_LEGACY_QUARANTINE)["DISPOSITION"];
+	actor: string;
+	reason: string;
+	maintainerAuthorization: string;
+	signal?: AbortSignal;
+}
+
 export interface NativeReviewReconcileAuthorityRequest {
 	cwd: string;
 	predecessorLineage: string;
 	expectedPredecessorRevision: string;
 	successorLineage: string;
 	expectedSuccessorRevision: string;
+	actor: string;
+	reason: string;
+	anomalies?: NativeReviewReconcileAnomalies;
+	maintainerAuthorization: string;
+	signal?: AbortSignal;
+}
+
+export interface NativeReviewLegacyAliasRepairRequest {
+	cwd: string;
+	repository: string;
+	lineage: string;
+	expectedRevision: string;
+	diagnostic: (typeof NATIVE_REVIEW_LEGACY_ALIAS_REPAIR)["DIAGNOSTIC"];
+	disposition: (typeof NATIVE_REVIEW_LEGACY_ALIAS_REPAIR)["DISPOSITION"];
 	actor: string;
 	reason: string;
 	maintainerAuthorization: string;
@@ -292,11 +351,13 @@ const NATIVE_SDD_NEXT_ACTION = ["apply", "verify", "remediate", "archive", "revi
 const NATIVE_SDD_POST_REVIEW_ACTION = ["verify", "archive"] as const;
 
 export const NATIVE_CLI_CONTRACTS = Object.freeze({
-	"2.1.4": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: false, inventory: false, reclaim: false, recover: false, reconcileAuthority: false }),
-	"2.1.5": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, reconcileAuthority: false }),
-	"2.1.6": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, reconcileAuthority: false }),
-	"2.1.7": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, reconcileAuthority: false }),
-	"2.1.8": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, reconcileAuthority: true }),
+	"2.1.4": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: false, inventory: false, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false }),
+	"2.1.5": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false }),
+	"2.1.6": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false }),
+	"2.1.7": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false }),
+	"2.1.8": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: false, quarantineLegacy: false, reconcileAuthority: true, repairLegacyAlias: false }),
+	"2.1.9": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: false }),
+	"2.1.10": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true }),
 });
 type NativeCliCapability = keyof (typeof NATIVE_CLI_CONTRACTS)[keyof typeof NATIVE_CLI_CONTRACTS];
 
@@ -462,6 +523,11 @@ function nativeProcessDiagnostics(operation: NativeReviewOperation, code: Native
 function parseJson(stdout: string, operation: NativeReviewOperation, mutating: boolean, diagnostics: NativeReviewProcessDiagnostics): Record<string, unknown> {
 	if (stdout.length === 0) throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.EMPTY_OUTPUT, operation, true, mutating, "native command returned empty output", { ...diagnostics, error_code: NATIVE_REVIEW_ERROR_CODE.EMPTY_OUTPUT });
 	try { return object(JSON.parse(stdout)); } catch { throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.MALFORMED_JSON, operation, true, mutating, "native command returned malformed JSON", { ...diagnostics, error_code: NATIVE_REVIEW_ERROR_CODE.MALFORMED_JSON }); }
+}
+function decodeNativeMaintenanceResult(value: unknown, expectedOperation: NativeReviewOperation): NativeReviewRecoveryResult {
+	const body = exactObject(value, ["operation", "record"]);
+	if (body.operation !== expectedOperation) throw new Error("wrong native maintenance discriminator");
+	return { record: object(body.record) };
 }
 function decode<T>(operation: NativeReviewOperation, mutating: boolean, callback: () => T, diagnostics = nativeProcessDiagnostics(operation, NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE)): T {
 	try { return callback(); } catch (error) { if (error instanceof NativeReviewCliError) throw error; throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE, operation, true, mutating, "native response is schema incompatible", { ...diagnostics, error_code: NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE }); }
@@ -730,9 +796,9 @@ export class NativeReviewCliV214 {
 		if (result.outputLimitExceeded) throw nativeError(NATIVE_REVIEW_ERROR_CODE.OUTPUT_LIMIT, operation, mutating, "native process output exceeded limit", result);
 		if (result.signal) throw nativeError(NATIVE_REVIEW_ERROR_CODE.SIGNAL, operation, mutating, "native process was signalled", result);
 		const structuredValidateDenial = operation === NATIVE_REVIEW_OPERATION.VALIDATE && result.exitCode === 1;
-		const reconcilePartialFailure = operation === NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY && result.exitCode !== 0;
-		if (result.exitCode !== 0 && !structuredValidateDenial && !reconcilePartialFailure) throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, operation, mutating, "native process failed", result);
-		if (result.stderr.trim().length > 0 && !structuredValidateDenial && !reconcilePartialFailure) throw nativeError(NATIVE_REVIEW_ERROR_CODE.UNEXPECTED_STDERR, operation, mutating, "native process wrote stderr", result);
+		const maintenancePartialFailure = [NATIVE_REVIEW_OPERATION.ABANDON, NATIVE_REVIEW_OPERATION.QUARANTINE_LEGACY, NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY, NATIVE_REVIEW_OPERATION.REPAIR_LEGACY_ALIAS].includes(operation) && result.exitCode !== 0;
+		if (result.exitCode !== 0 && !structuredValidateDenial && !maintenancePartialFailure) throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, operation, mutating, "native process failed", result);
+		if (result.stderr.trim().length > 0 && !structuredValidateDenial && !maintenancePartialFailure) throw nativeError(NATIVE_REVIEW_ERROR_CODE.UNEXPECTED_STDERR, operation, mutating, "native process wrote stderr", result);
 		return { body: parseJson(result.stdout, operation, mutating, diagnostics), exitCode: result.exitCode, process: result };
 	}
 
@@ -887,9 +953,10 @@ export class NativeReviewCliV214 {
 			if (actionContext.mode !== "repo-local" || requiredString(actionContext.workspaceRoot).length === 0 || stringArray(actionContext.allowedEditRoots).length === 0) throw new Error("invalid action context");
 			const relationships = exactObject(body.relationships, ["dependsOn", "supersedes", "amends", "conflictsWith", "sameDomainActiveChanges"]);
 			for (const field of ["dependsOn", "supersedes", "amends", "conflictsWith", "sameDomainActiveChanges"]) stringArray(relationships[field]);
-			const remediation = exactObject(body.remediationState, ["required", "complete", "failedEvidenceRevision", "lineageId", "generation", "fixBatch", "reason"]);
+			const remediation = exactObject(body.remediationState, ["required", "complete", "failedEvidenceRevision", "lineageId", "generation", "fixBatch", "reason"], ["correctionBudget"]);
 			if (typeof remediation.required !== "boolean" || typeof remediation.complete !== "boolean" || ["failedEvidenceRevision", "lineageId", "reason"].some((field) => typeof remediation[field] !== "string")) throw new Error("invalid remediation state");
 			nonNegativeInteger(remediation.generation); nonNegativeInteger(remediation.fixBatch);
+			if (remediation.correctionBudget !== undefined) nonNegativeInteger(remediation.correctionBudget);
 			let reviewGateResult: string | undefined;
 			if (body.reviewGate !== undefined) {
 				const gate = exactObject(body.reviewGate, ["result", "reason"]);
@@ -955,6 +1022,47 @@ export class NativeReviewCliV214 {
 		return { record: body };
 	}
 
+	async abandon(request: NativeReviewAbandonRequest): Promise<NativeReviewRecoveryResult> {
+		for (const [name, value] of [["lineage", request.lineage], ["expectedRevision", request.expectedRevision], ["snapshotIdentity", request.snapshotIdentity], ["actor", request.actor], ["reason", request.reason]] as const) {
+			if (!isCanonicalProcessString(value)) throw new TypeError(`Native ABANDON ${name} must be a non-empty, trimmed, NUL-free string`);
+		}
+		if (request.maintainerAuthorization !== nativeReviewAbandonAuthorization(request)) throw new TypeError("Native ABANDON maintainerAuthorization must match the exact lineage, revision, snapshot, actor, and reason binding");
+		await this.verifyVersion(request.cwd, request.signal, ["abandon"]);
+		const execution = await this.execute(NATIVE_REVIEW_OPERATION.ABANDON, request.cwd, [
+			"review", "abandon", "--cwd", request.cwd,
+			"--lineage", request.lineage,
+			"--expected-revision", request.expectedRevision,
+			"--actor", request.actor,
+			"--reason", request.reason,
+			"--maintainer-authorization", request.maintainerAuthorization,
+		], true, request.signal);
+		const result = decode(NATIVE_REVIEW_OPERATION.ABANDON, true, () => decodeNativeMaintenanceResult(execution.body, NATIVE_REVIEW_OPERATION.ABANDON));
+		if (execution.exitCode !== 0) throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, NATIVE_REVIEW_OPERATION.ABANDON, true, "native authority abandonment partially failed", execution.process, true, result.record);
+		return result;
+	}
+
+	async quarantineLegacy(request: NativeReviewLegacyQuarantineRequest): Promise<NativeReviewRecoveryResult> {
+		for (const [name, value] of [["repository", request.repository], ["lineage", request.lineage], ["expectedRevision", request.expectedRevision], ["actor", request.actor], ["reason", request.reason]] as const) {
+			if (!isCanonicalProcessString(value)) throw new TypeError(`Native QUARANTINE_LEGACY ${name} must be a non-empty, trimmed, NUL-free string`);
+		}
+		if (request.diagnostic !== NATIVE_REVIEW_LEGACY_QUARANTINE.DIAGNOSTIC || request.disposition !== NATIVE_REVIEW_LEGACY_QUARANTINE.DISPOSITION) throw new TypeError("Native QUARANTINE_LEGACY supports only the published malformed freeze-findings diagnostic and disposition");
+		if (request.maintainerAuthorization !== nativeReviewLegacyQuarantineAuthorization(request)) throw new TypeError("Native QUARANTINE_LEGACY maintainerAuthorization must match the exact repository, lineage, revision, diagnostic, disposition, actor, and reason binding");
+		await this.verifyVersion(request.cwd, request.signal, ["quarantineLegacy"]);
+		const execution = await this.execute(NATIVE_REVIEW_OPERATION.QUARANTINE_LEGACY, request.cwd, [
+			"review", "quarantine-legacy", "--cwd", request.cwd,
+			"--lineage", request.lineage,
+			"--expected-revision", request.expectedRevision,
+			"--diagnostic", request.diagnostic,
+			"--disposition", request.disposition,
+			"--actor", request.actor,
+			"--reason", request.reason,
+			"--maintainer-authorization", request.maintainerAuthorization,
+		], true, request.signal);
+		const result = decode(NATIVE_REVIEW_OPERATION.QUARANTINE_LEGACY, true, () => decodeNativeMaintenanceResult(execution.body, NATIVE_REVIEW_OPERATION.QUARANTINE_LEGACY));
+		if (execution.exitCode !== 0) throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, NATIVE_REVIEW_OPERATION.QUARANTINE_LEGACY, true, "native legacy quarantine partially failed", execution.process, true, result.record);
+		return result;
+	}
+
 	async reconcileAuthority(request: NativeReviewReconcileAuthorityRequest): Promise<NativeReviewRecoveryResult> {
 		for (const [name, value] of [
 			["predecessorLineage", request.predecessorLineage],
@@ -966,6 +1074,7 @@ export class NativeReviewCliV214 {
 		] as const) {
 			if (!isCanonicalProcessString(value)) throw new TypeError(`Native RECONCILE_AUTHORITY ${name} must be a non-empty, trimmed, NUL-free string`);
 		}
+		if (request.anomalies !== undefined && request.anomalies !== NATIVE_REVIEW_RECONCILE_ANOMALIES.COMBINED) throw new TypeError("Native RECONCILE_AUTHORITY anomalies must use the published unchanged_target,malformed_recovery_authorization ordering");
 		const expectedAuthorization = nativeReviewReconcileAuthorization(request);
 		if (request.maintainerAuthorization !== expectedAuthorization) {
 			throw new TypeError("Native RECONCILE_AUTHORITY maintainerAuthorization must match the exact target and revision binding");
@@ -981,20 +1090,79 @@ export class NativeReviewCliV214 {
 			"--reason", request.reason,
 			"--maintainer-authorization", request.maintainerAuthorization,
 		], true, request.signal);
-		if (execution.exitCode !== 0) {
-			throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY, true, "native authority reconciliation partially failed", execution.process, true, execution.body);
+		const result = decode(NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY, true, () => decodeNativeMaintenanceResult(execution.body, NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY));
+		if (execution.exitCode !== 0) throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY, true, "native authority reconciliation partially failed", execution.process, true, result.record);
+		return result;
+	}
+
+	async repairLegacyAlias(request: NativeReviewLegacyAliasRepairRequest): Promise<NativeReviewRecoveryResult> {
+		for (const [name, value] of [["repository", request.repository], ["lineage", request.lineage], ["expectedRevision", request.expectedRevision], ["actor", request.actor], ["reason", request.reason]] as const) {
+			if (!isCanonicalProcessString(value)) throw new TypeError(`Native REPAIR_LEGACY_ALIAS ${name} must be a non-empty, trimmed, NUL-free string`);
 		}
-		return { record: execution.body };
+		if (request.diagnostic !== NATIVE_REVIEW_LEGACY_ALIAS_REPAIR.DIAGNOSTIC || request.disposition !== NATIVE_REVIEW_LEGACY_ALIAS_REPAIR.DISPOSITION) throw new TypeError("Native REPAIR_LEGACY_ALIAS supports only the published historical alias diagnostic and disposition");
+		if (request.maintainerAuthorization !== nativeReviewLegacyAliasRepairAuthorization(request)) throw new TypeError("Native REPAIR_LEGACY_ALIAS maintainerAuthorization must match the exact repository, lineage, revision, diagnostic, disposition, actor, and reason binding");
+		await this.verifyVersion(request.cwd, request.signal, ["repairLegacyAlias"]);
+		const execution = await this.execute(NATIVE_REVIEW_OPERATION.REPAIR_LEGACY_ALIAS, request.cwd, [
+			"review", "repair-legacy-alias", "--cwd", request.cwd,
+			"--lineage", request.lineage,
+			"--expected-revision", request.expectedRevision,
+			"--diagnostic", request.diagnostic,
+			"--disposition", request.disposition,
+			"--actor", request.actor,
+			"--reason", request.reason,
+			"--maintainer-authorization", request.maintainerAuthorization,
+		], true, request.signal);
+		const result = decode(NATIVE_REVIEW_OPERATION.REPAIR_LEGACY_ALIAS, true, () => decodeNativeMaintenanceResult(execution.body, NATIVE_REVIEW_OPERATION.REPAIR_LEGACY_ALIAS));
+		if (execution.exitCode !== 0) throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, NATIVE_REVIEW_OPERATION.REPAIR_LEGACY_ALIAS, true, "native historical alias repair partially failed", execution.process, true, result.record);
+		return result;
 	}
 }
 
-export function nativeReviewReconcileAuthorization(request: Pick<NativeReviewReconcileAuthorityRequest, "predecessorLineage" | "expectedPredecessorRevision" | "successorLineage" | "expectedSuccessorRevision" | "actor" | "reason">): string {
+export function nativeReviewAbandonAuthorization(request: Pick<NativeReviewAbandonRequest, "lineage" | "expectedRevision" | "snapshotIdentity" | "actor" | "reason">): string {
+	return [
+		"gentle-ai.review-abandon-authorization/v1",
+		`lineage=${request.lineage}`,
+		`revision=${request.expectedRevision}`,
+		`snapshot_identity=${request.snapshotIdentity}`,
+		`actor=${request.actor}`,
+		`reason=${request.reason}`,
+	].join("\n");
+}
+
+export function nativeReviewLegacyQuarantineAuthorization(request: Pick<NativeReviewLegacyQuarantineRequest, "repository" | "lineage" | "expectedRevision" | "diagnostic" | "disposition" | "actor" | "reason">): string {
+	return [
+		"gentle-ai.review-legacy-quarantine-authorization/v1",
+		`repository=${request.repository}`,
+		`lineage=${request.lineage}`,
+		`revision=${request.expectedRevision}`,
+		`diagnostic=${request.diagnostic}`,
+		`disposition=${request.disposition}`,
+		`actor=${request.actor}`,
+		`reason=${request.reason}`,
+	].join("\n");
+}
+
+export function nativeReviewReconcileAuthorization(request: Pick<NativeReviewReconcileAuthorityRequest, "predecessorLineage" | "expectedPredecessorRevision" | "successorLineage" | "expectedSuccessorRevision" | "actor" | "reason" | "anomalies">): string {
 	return [
 		"gentle-ai.review-reconcile-authorization/v1",
 		`predecessor_lineage=${request.predecessorLineage}`,
 		`predecessor_revision=${request.expectedPredecessorRevision}`,
 		`successor_lineage=${request.successorLineage}`,
 		`successor_revision=${request.expectedSuccessorRevision}`,
+		`actor=${request.actor}`,
+		`reason=${request.reason}`,
+		...(request.anomalies === NATIVE_REVIEW_RECONCILE_ANOMALIES.COMBINED ? [`anomalies=${request.anomalies}`] : []),
+	].join("\n");
+}
+
+export function nativeReviewLegacyAliasRepairAuthorization(request: Pick<NativeReviewLegacyAliasRepairRequest, "repository" | "lineage" | "expectedRevision" | "diagnostic" | "disposition" | "actor" | "reason">): string {
+	return [
+		"gentle-ai.review-legacy-alias-repair-authorization/v1",
+		`repository=${request.repository}`,
+		`lineage=${request.lineage}`,
+		`revision=${request.expectedRevision}`,
+		`diagnostic=${request.diagnostic}`,
+		`disposition=${request.disposition}`,
 		`actor=${request.actor}`,
 		`reason=${request.reason}`,
 	].join("\n");
@@ -1305,8 +1473,20 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		return this.legacy.recover(request);
 	}
 
+	abandon(request: NativeReviewAbandonRequest): Promise<NativeReviewRecoveryResult> {
+		return this.legacy.abandon(request);
+	}
+
+	quarantineLegacy(request: NativeReviewLegacyQuarantineRequest): Promise<NativeReviewRecoveryResult> {
+		return this.legacy.quarantineLegacy(request);
+	}
+
 	reconcileAuthority(request: NativeReviewReconcileAuthorityRequest): Promise<NativeReviewRecoveryResult> {
 		return this.legacy.reconcileAuthority(request);
+	}
+
+	repairLegacyAlias(request: NativeReviewLegacyAliasRepairRequest): Promise<NativeReviewRecoveryResult> {
+		return this.legacy.repairLegacyAlias(request);
 	}
 }
 

@@ -3441,6 +3441,14 @@ test("authorized RECOVER routes to native review recover with the exact successo
 	const recovers: Array<Record<string, unknown>> = [];
 	const record = { schema: "gentle-ai.review-recovery/v1", successor_lineage: "successor" };
 	const { controller } = runtime(fakeNative({
+		targetStatus: async () => {
+			const status = targetStatusFixture({ lineageId: "broken", action: "recover" });
+			return {
+				...status,
+				actionDisposition: "invalidated",
+				authority: { ...status.authority!, revision: "rev-1" },
+			};
+		},
 		recover: async (request) => { recovers.push(request as unknown as Record<string, unknown>); return { record }; },
 	}));
 	const base = { repositoryId: "repo", commonDirHash: "c".repeat(64), inventoryHash: "d".repeat(64), confirmation: "DESTROY REVIEW AUTHORITY repo" };

@@ -19,16 +19,16 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const RELEASE_BASE_URL = "https://github.com/Gentleman-Programming/gentle-ai/releases/download/v2.1.8/";
+const RELEASE_BASE_URL = "https://github.com/Gentleman-Programming/gentle-ai/releases/download/v2.1.10/";
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const DOWNLOAD_TIMEOUTS = { headers: 10_000, body: 30_000, attempts: 2, retryDelay: 100 };
-const INSTALLER_VERSION = "2.1.8";
+const INSTALLER_VERSION = "2.1.10";
 
 // Sentinel used while a re-pinned gentle-ai release is not yet published. A
 // sentinel digest can never match a real SHA-256, so installation fails closed,
 // and verify-package-files.mjs refuses to pack/publish while any digest below
-// still holds it. The v2.1.8 digests are pinned from the published release:
+// still holds it. The v2.1.10 digests are pinned from the published release:
 // archive sha256 values verified against checksums.txt and freshly computed
 // hashes; binary sha256 values computed from the extracted executables.
 export const GENTLE_AI_PENDING_DIGEST = "PENDING-GENTLE-AI-RELEASE-DIGEST";
@@ -38,12 +38,12 @@ function asset(name, sha256, binarySha256, executable) {
 }
 
 export const GENTLE_AI_RELEASE_ASSETS = Object.freeze({
-	"darwin/amd64": asset("gentle-ai_2.1.8_darwin_amd64.tar.gz", "cafe1e1ab27ebad0f11037b97f1642d940e382df2be36002cf008836b631d1dd", "a9300b10d369007df7ed76c70dcae06f114ec1bbe9042ca730af836356bbd885", "gentle-ai"),
-	"darwin/arm64": asset("gentle-ai_2.1.8_darwin_arm64.tar.gz", "7a7095bf4ff1ca5ab277197256cf7925dfbdb3bb3a69c5b3a83c9d0ca4a75489", "bd4d2600d761ec097f5b621ce10f53c5cf0b54dffed21c808177e279b86008c2", "gentle-ai"),
-	"linux/amd64": asset("gentle-ai_2.1.8_linux_amd64.tar.gz", "9c8004918c2c3bd1c4bb3975b31edd7e272fc1e6ebc71a17327f553265dc59b7", "b57728d1254af966cc39796bcb00cf0d2bbc405df6f174dc872bab4dc2735287", "gentle-ai"),
-	"linux/arm64": asset("gentle-ai_2.1.8_linux_arm64.tar.gz", "28ef653b6d0ecdc47ea43a11af8d51b11865be5d823795557911a3da9c1f0a50", "34fd6ee751af8aa22c2e301c71d202c60664d865da68e7c928b4a6e539803106", "gentle-ai"),
-	"windows/amd64": asset("gentle-ai_2.1.8_windows_amd64.zip", "705cf3570a52165f2e4f79f8d0ac549217a4723ebdfb542bfb7e13882920e61c", "61dbdf465fe57b35bcff0cba246137dd63ebabd3a7a9153c08ebb59e6b032581", "gentle-ai.exe"),
-	"windows/arm64": asset("gentle-ai_2.1.8_windows_arm64.zip", "001036f4e6bd2e3a81139b0dcbd8161c04ffa8f774a0209daf35867096967824", "ad825935dd27f8972a05a073e7df13aa941b408cb4f7782ab084a87fa016ea8d", "gentle-ai.exe"),
+	"darwin/amd64": asset("gentle-ai_2.1.10_darwin_amd64.tar.gz", "61357c0325c3fd752a93b67752b8fc110c75b49168195d0592e7940295ce00d3", "2ef5208e41a7e2a91bcd7ea5dc599cf640c4e416aef5ae93694b1380145d00b1", "gentle-ai"),
+	"darwin/arm64": asset("gentle-ai_2.1.10_darwin_arm64.tar.gz", "560493cd51d63295d9850696764488a5886682a037efb64da8cad16feb53213a", "dfc6393d9bb2a49f8cd332466efa504b88e15a3b262f5bbe563d8e1d4887bedc", "gentle-ai"),
+	"linux/amd64": asset("gentle-ai_2.1.10_linux_amd64.tar.gz", "0b9ea5d6bddaf8440019c39b7f140bc160ea2b366eb5c6d7f06abf102f41e870", "526c3973c3b1b5606a107f2874fbd46476e6e3ded56cd308302b8fff6b88412d", "gentle-ai"),
+	"linux/arm64": asset("gentle-ai_2.1.10_linux_arm64.tar.gz", "27686664d839189bb1ce0541629bcf261831122aa20261ad690ca2947a00bc3b", "afe31a438d06bf5147c54aed9922b268da62758cf61f7a9c23dffdc87d8a8fc6", "gentle-ai"),
+	"windows/amd64": asset("gentle-ai_2.1.10_windows_amd64.zip", "22758698d1211127767e76ef1536db82a18ec36113609825d6cbe90069bc8714", "44320dd4a94213135c14bafed7b9db0dd9e8bdd57c3745a669c7899b5437943e", "gentle-ai.exe"),
+	"windows/arm64": asset("gentle-ai_2.1.10_windows_arm64.zip", "bad5c04a73c7eb614d8624981a0d278cc9bb417d2371f564ddd13c68be6c7b8f", "849a13618cc0b059d87b9f76f00b05e6f340f2791656cd3da0463ac8001a959e", "gentle-ai.exe"),
 });
 
 function upstreamArchitecture(architecture) {

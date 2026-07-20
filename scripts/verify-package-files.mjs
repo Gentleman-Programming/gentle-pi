@@ -92,8 +92,9 @@ const contractHashes = {
   "contracts/review-integration/v1/schemas/projection.schema.json": "7168a3eba929dde2b8f0b7723ee51d5a5421102bdeefe892578c263debd08db2",
   "contracts/review-integration/v1/schemas/result-artifact.schema.json": "91296bd2c261fd2fe03bffd63efe58badd4927e0d0d8480cd4213f651ecacdf6",
   "contracts/review-integration/v1/schemas/start.schema.json": "394035afa39ac928d3d9a95b81411d328c7c188e0024b42a7c91de44883af628",
-  "contracts/review-integration/v1/schemas/status.schema.json": "e72f84cfa40c6a0e9f60db74a9b156c965158b3fb434ccf275b02183e76fd43a",
-  "docs/review-integration.md": "a37090433949a79c8f66accdfca8bf7e19a6983b0db8537eb7fa30de77870d96",
+  "contracts/review-integration/v1/schemas/status.schema.json": "ce80f052a7537706a2461d0a50a77a3f5f8b9abf3ff01b80f1fa10c1644eea28",
+  "contracts/review-integration/v1/fixtures/status-recover.fixture.json": "400c711884ec41a44e6cc0a77cf59a5b10f98701e0d2d6af0922079e483196cc",
+  "docs/review-integration.md": "07102a38cb755358ff24d39064a220d98ab659d1a6aa3a92984fae81e17bb35c",
 };
 
 requiredPaths.push(...Object.keys(contractHashes));
@@ -118,7 +119,7 @@ const driftedContracts = Object.entries(contractHashes).flatMap(([relativePath, 
 });
 
 if (driftedContracts.length > 0) {
-  console.error("gentle-pi packaged review-integration/v1 bytes drifted from Gentle AI v2.1.8:");
+  console.error("gentle-pi packaged review-integration/v1 bytes drifted from the byte-identical Gentle AI v2.1.10 contract:");
   for (const drift of driftedContracts) console.error(`- ${drift.relativePath}: expected ${drift.expected}, got ${drift.actual}`);
   process.exit(1);
 }
@@ -150,9 +151,9 @@ if (generatedRuntimeCheck.status !== 0) {
 
 const installer = readFileSync(join(root, "scripts/gentle-ai-installer.mjs"), "utf8");
 const binaryResolver = readFileSync(join(root, "lib/gentle-ai-binary.ts"), "utf8");
-if (!installer.includes('INSTALLER_VERSION = "2.1.8"') || !binaryResolver.includes('GENTLE_AI_VERSION = "2.1.8"')) {
-  console.error("gentle-pi package-local Gentle AI version pins are not both v2.1.8.");
+if (!installer.includes('INSTALLER_VERSION = "2.1.10"') || !binaryResolver.includes('GENTLE_AI_VERSION = "2.1.10"')) {
+	console.error("gentle-pi package-local Gentle AI version pins are not both v2.1.10.");
   process.exit(1);
 }
 
-console.log(`gentle-pi package resource check passed (${requiredPaths.length} files; ${Object.keys(contractHashes).length} exact v2.1.8 contract artifacts).`);
+console.log(`gentle-pi package resource check passed (${requiredPaths.length} files; ${Object.keys(contractHashes).length} exact byte-identical v2.1.10 contract artifacts).`);
