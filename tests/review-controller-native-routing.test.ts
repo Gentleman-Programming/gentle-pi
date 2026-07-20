@@ -3468,13 +3468,19 @@ test("authorized RECOVER routes to native review recover with the exact successo
 
 	test("base-diff FINALIZE derives <remote>/<current-branch> selector from remote-tracking refs and fails closed on zero or multiple matches", async (t) => {
 		// Helper: build a targetStatus fixture with the given projection trees.
-		const buildStatus = (lid, bt, ct) => {
+		const buildStatus = (lid: string, bt: string, ct: string) => {
 			const f = targetStatusFixture({ lineageId: lid });
 			f.authority!.state = "correction_required";
 			f.projection.kind = "base-diff";
 			f.projection.baseTree = bt;
 			f.projection.initialReviewTree = ct;
 			f.projection.currentCandidateTree = ct;
+			(f.raw.authority as Record<string, unknown>).state = "correction_required";
+			const rawProjection = f.raw.projection as Record<string, unknown>;
+			rawProjection.kind = "base-diff";
+			rawProjection.base_tree = bt;
+			rawProjection.initial_review_tree = ct;
+			rawProjection.current_candidate_tree = ct;
 			return f;
 		};
 		// Helper: write a base-diff correction state.
@@ -3499,7 +3505,10 @@ test("authorized RECOVER routes to native review recover with the exact successo
 		const calls = [];
 		let { controller } = runtime(fakeNative({ targetStatus: async (req) => { calls.push(req.baseRef); return buildStatus("sel-b548", baseTree, candidateTree); } }), undefined, undefined, undefined, new CandidateViewRegistry());
 		let r = await controller.execute("a", { operation: "finalize", lineageId: "sel-b548", input: JSON.stringify({ final_evidence: "ok", final_verification_passed: true }) }, undefined, undefined, context(cwd));
-		assert.equal((r.details as { outcome: string }).outcome, "validation-required");
+		const a = r.details as { status: string; result: { action: string }; validation_request?: unknown };
+		assert.equal(a.status, "in-progress");
+		assert.equal(a.result.action, "finalize");
+		assert.equal(a.validation_request, undefined);
 		assert.equal(calls[0], "origin/main");
 		// Raw SHA must never be forwarded.
 		assert.notEqual(calls[0], baseCommit);
@@ -3511,7 +3520,10 @@ test("authorized RECOVER routes to native review recover with the exact successo
 		calls.length = 0;
 		({ controller } = runtime(fakeNative({ targetStatus: async (req) => { calls.push(req.baseRef); return buildStatus("sel-b548", baseTree, candidateTree); } }), undefined, undefined, undefined, new CandidateViewRegistry()));
 		r = await controller.execute("b", { operation: "finalize", lineageId: "sel-b548", input: JSON.stringify({ final_evidence: "ok", final_verification_passed: true }) }, undefined, undefined, context(cwd));
-		assert.equal((r.details as { outcome: string }).outcome, "validation-required");
+		const b = r.details as { status: string; result: { action: string }; validation_request?: unknown };
+		assert.equal(b.status, "in-progress");
+		assert.equal(b.result.action, "finalize");
+		assert.equal(b.validation_request, undefined);
 		assert.equal(calls[0], "origin/main");
 		// Case C: zero selector (no remote) -> fail closed.
 		const cwd2 = repository(t);

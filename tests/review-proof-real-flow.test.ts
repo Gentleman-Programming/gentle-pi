@@ -1,5 +1,5 @@
-// Real-binary proof: committed-range START → CRITICAL finalize → workspace correction → validation finalize.
-// This test does NOT mock the native binary. It uses the actual v2.1.6 binary in the package-local slot
+// Real-binary proof: committed-range START → CRITICAL finalize → workspace correction → targeted validation finalize.
+// This test does NOT mock the native binary. It uses the actual v2.1.8 binary in the package-local slot
 // and the actual controller in extensions/gentle-ai.ts.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -122,33 +122,25 @@ test("real binary: committed-range START with <remote>/<branch> selector → CRI
 		causal_disposition: "introduced",
 		proof_refs: ["changed-hunk:app.ts:1"],
 	};
-	const finalizeCritical = await execute(
-		"proof-finalize-critical",
-		{
-			operation: "finalize",
-			lineageId,
-			input: JSON.stringify({
-				review_result: {
-					lens_results: [
-						{ lens: "review-reliability", findings: [criticalFinding], evidence: ["changed-hunk:app.ts:1 changes value from 1 to 2."] },
-					],
-				},
-			}),
-		},
-		context(cwd),
-	);
-	const finalizeDetails = (finalizeCritical.details ?? {}) as { result?: { state: string; action: string }; operation: string; status?: string; outcome?: string; native_failure?: { code: string; message: string } };
+	const frozenCandidate = candidateViews.resolveForFinalize(lineageId);
+	const finalizeDetails = await nativeReviewCli.finalize({
+		cwd: frozenCandidate.root,
+		lineageId,
+		lensResults: [{
+			lens: "review-reliability",
+			document: {
+				lens: "reliability",
+				findings: [{ ...criticalFinding, lens: "reliability" }],
+				evidence: ["changed-hunk:app.ts:1 changes value from 1 to 2."],
+			},
+		}],
+	});
 	t.diagnostic(`finalizeDetails: ${JSON.stringify(finalizeDetails)}`);
-	assert.equal(finalizeDetails.operation, "finalize");
-	assert.equal(finalizeDetails.result?.state, "correction_required", `expected correction_required, got state=${finalizeDetails.result?.state} (native failure: ${finalizeDetails.native_failure?.code} - ${finalizeDetails.native_failure?.message})`);
+	assert.equal(finalizeDetails.state, "correction_required");
 	assert.ok(startDetails.result!.correction_budget >= 2);
-	const forecast = await execute(
-		"proof-correction-forecast",
-		{ operation: "finalize", lineageId, input: JSON.stringify({ correction_line_forecast: 2 }) },
-		context(cwd),
-	);
-	const forecastDetails = (forecast.details ?? {}) as { result?: { state: string; action: string } };
-	assert.equal(forecastDetails.result?.state, "correction_required");
+	const forecastDetails = await nativeReviewCli.finalize({ cwd: frozenCandidate.root, lineageId, correctionLines: 2 });
+	assert.equal(forecastDetails.state, "correction_required");
+	frozenCandidate.cleanup();
 
 	// Simulate a controller reload, then apply the correction only in the contributor workspace.
 	writeFileSync(join(cwd, "app.ts"), [
@@ -161,7 +153,7 @@ test("real binary: committed-range START with <remote>/<branch> selector → CRI
 		"",
 	].join("\n"));
 	const statePath = join(cwd, ".git", "gentle-ai", "review-transactions", "v2", lineageId, "review-state.json");
-	const stateAfterFinding = JSON.parse(readFileSync(statePath, "utf8")) as { state: { state: string; current_snapshot: { base_tree: string; candidate_tree: string }; fix_finding_ids: string[] } };
+	const stateAfterFinding = JSON.parse(readFileSync(statePath, "utf8")) as { state: { state: string; initial_snapshot: { base_tree: string; candidate_tree: string }; current_snapshot: { base_tree: string; candidate_tree: string }; fix_finding_ids: string[] } };
 	const statusRequests: NativeTargetStatusRequest[] = [];
 	const statusResponses: ReviewStatusV1[] = [];
 	const reloadedNative = createNativeReviewCli();
@@ -174,24 +166,42 @@ test("real binary: committed-range START with <remote>/<branch> selector → CRI
 	};
 	const reloaded = controllerFor(reloadedNative, new CandidateViewRegistry());
 	const finalResult = await reloaded.execute(
-		"proof-finalize-correction",
+		"proof-finalize-validation",
 		{
 			operation: "finalize",
 			lineageId,
-			input: JSON.stringify({ final_evidence: "Focused correction verification passed.", final_verification_passed: true }),
+			input: JSON.stringify({
+				validation: {
+					request_hash: "a".repeat(64),
+					correction_ids: ["RELIABILITY-001"],
+					original_criteria: { passed: true, evidence: ["The corrected value restores the documented invariant."] },
+					correction_regression: { passed: true, evidence: ["The committed candidate additions remain present."] },
+					fix_caused_findings: [],
+					follow_ups: [],
+				},
+				final_evidence: "Focused correction verification passed.",
+				final_verification_passed: true,
+			}),
 		},
 		context(cwd),
 	);
-	const finalDetails = (finalResult.details ?? {}) as { outcome?: string; validation_request?: { correction_candidate_tree: string; fix_finding_ids: string[]; request_hash: string } };
-	assert.equal(finalDetails.outcome, "validation-required");
+	const finalDetails = (finalResult.details ?? {}) as { result?: { state?: string; action?: string } };
+	t.diagnostic(`finalDetails: ${JSON.stringify(finalDetails)}`);
+	assert.equal(finalDetails.result?.state, "approved");
+	assert.equal(finalDetails.result?.action, "validate delivery with gentle-ai review validate --gate <gate>");
 	assert.equal(statusRequests.length, 1);
 	assert.equal(statusRequests[0]?.baseRef, "origin/main");
 	assert.notEqual(statusRequests[0]?.baseRef, git(cwd, "rev-parse", "origin/main"));
 	assert.equal(statusResponses[0]?.applicability, "current_target");
-	assert.equal(statusResponses[0]?.projection.baseTree, stateAfterFinding.state.current_snapshot.base_tree);
-	assert.equal(stateAfterFinding.state.current_snapshot.base_tree, git(cwd, "rev-parse", "origin/main^{tree}"));
-	assert.deepEqual(finalDetails.validation_request?.fix_finding_ids, ["RELIABILITY-001"]);
-	assert.notEqual(finalDetails.validation_request?.correction_candidate_tree, stateAfterFinding.state.current_snapshot.candidate_tree);
+	assert.equal(statusResponses[0]?.projection.baseTree, stateAfterFinding.state.initial_snapshot.base_tree);
+	assert.equal(stateAfterFinding.state.initial_snapshot.base_tree, git(cwd, "rev-parse", "origin/main^{tree}"));
+	assert.equal(statusResponses[0]?.projection.currentCandidateTree, stateAfterFinding.state.initial_snapshot.candidate_tree);
+	const stateAfterApproval = JSON.parse(readFileSync(statePath, "utf8")) as { state: { state: string; initial_snapshot: { base_tree: string; candidate_tree: string }; current_snapshot: { base_tree: string; candidate_tree: string } } };
+	assert.equal(stateAfterApproval.state.state, "approved");
+	assert.deepEqual(stateAfterApproval.state.initial_snapshot, stateAfterFinding.state.initial_snapshot);
+	assert.equal(stateAfterApproval.state.current_snapshot.base_tree, stateAfterFinding.state.initial_snapshot.candidate_tree);
+	assert.notEqual(stateAfterApproval.state.current_snapshot.candidate_tree, stateAfterFinding.state.initial_snapshot.candidate_tree);
+	const correctedCandidateTree = stateAfterApproval.state.current_snapshot.candidate_tree;
 
 	const proofPath = join(cwd, "e2e-proof.json");
 	writeFileSync(proofPath, `${JSON.stringify({
@@ -200,14 +210,13 @@ test("real binary: committed-range START with <remote>/<branch> selector → CRI
 		lineage: lineageId,
 		selector: statusRequests[0]?.baseRef,
 		selector_is_raw_sha: statusRequests[0]?.baseRef === git(cwd, "rev-parse", "origin/main"),
-		frozen_base_tree: stateAfterFinding.state.current_snapshot.base_tree,
+		frozen_base_tree: stateAfterFinding.state.initial_snapshot.base_tree,
 		remote_base_tree: git(cwd, "rev-parse", "origin/main^{tree}"),
-		initial_candidate_tree: stateAfterFinding.state.current_snapshot.candidate_tree,
-		corrected_candidate_tree: finalDetails.validation_request?.correction_candidate_tree,
-		transitions: ["reviewing", finalizeDetails.result?.state, forecastDetails.result?.state, finalDetails.outcome],
-		final_action: finalDetails.outcome,
+		initial_candidate_tree: stateAfterFinding.state.initial_snapshot.candidate_tree,
+		corrected_candidate_tree: correctedCandidateTree,
+		transitions: ["reviewing", finalizeDetails.state, forecastDetails.state, finalDetails.result?.state],
+		final_action: finalDetails.result?.action,
 		fix_finding_ids: stateAfterFinding.state.fix_finding_ids,
-		validation_request_hash: finalDetails.validation_request?.request_hash,
 	}, null, 2)}\n`);
 	t.diagnostic(`proof artifact: ${proofPath}`);
 });
