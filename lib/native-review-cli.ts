@@ -137,7 +137,7 @@ export interface NativeReviewReconcileAuthorityRequest {
 /** Raw audited native record; Pi relays it verbatim and never reinterprets it. */
 export interface NativeReviewRecoveryResult { record: Record<string, unknown>; }
 
-export interface NativeStartRequest { cwd: string; baseRef?: string; committedOnly?: boolean; lineageId?: string; policyPath?: string; focus?: string; signal?: AbortSignal; }
+export interface NativeStartRequest { cwd: string; baseRef?: string; committedOnly?: boolean; lineageId?: string; policyPath?: string; focus?: string; projection?: "workspace" | "staged"; signal?: AbortSignal; }
 export interface NativeFinalizeLensResult { lens: string; document: unknown; }
 export interface NativeFinalizeRequest {
 	cwd: string;
@@ -1161,12 +1161,14 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		if (request.baseRef !== undefined && !isCanonicalProcessString(request.baseRef)) throw new TypeError("Native START baseRef must be a non-empty, trimmed, NUL-free string");
 		if (request.baseRef !== undefined && request.committedOnly !== true) throw new TypeError("Native START baseRef requires explicit committedOnly acknowledgement");
 		if (request.baseRef === undefined && request.committedOnly !== undefined) throw new TypeError("Native START committedOnly requires an explicit baseRef");
+		if (request.projection !== undefined && request.projection !== "workspace" && request.projection !== "staged") throw new TypeError("Native START projection must be workspace or staged");
 		const execution = await this.negotiated(NATIVE_REVIEW_OPERATION.START, request.cwd, [
 			"review", "start", "--contract", REVIEW_INTEGRATION_CONTRACT, "--cwd", request.cwd,
 			...(request.baseRef === undefined ? [] : ["--base-ref", request.baseRef, "--committed-only"]),
 			...(request.lineageId === undefined ? [] : ["--lineage", request.lineageId]),
 			...(request.policyPath === undefined ? [] : ["--policy", request.policyPath]),
 			...(request.focus === undefined ? [] : ["--focus", request.focus]),
+			...(request.projection === undefined ? [] : ["--projection", request.projection]),
 		], true, request.signal);
 		const result = decode(NATIVE_REVIEW_OPERATION.START, true, () => decodeReviewStartV1(execution.body));
 		if (request.lineageId !== undefined && result.lineageId !== request.lineageId) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native start lineage mismatch");

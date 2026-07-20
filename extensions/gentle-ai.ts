@@ -96,7 +96,7 @@ import {
 	type ReviewProjectionV1,
 } from "../lib/review-snapshot.ts";
 import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
-import { CandidateViewError, CandidateViewRegistry, injectReviewCandidateView, resolveCanonicalCandidateBase } from "../lib/review-candidate-view.ts";
+import { CandidateViewError, CandidateViewRegistry, injectReviewCandidateView, resolveCanonicalCandidateBase, resolveCurrentBranchRemoteTrackingSelector } from "../lib/review-candidate-view.ts";
 import {
 	createNativeReviewCli,
 	isCanonicalProcessString,
@@ -2585,6 +2585,7 @@ function parseStartInput(value: Record<string, unknown>): ReviewControllerStartI
 }
 
 const RELEASE_EVIDENCE_OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const GIT_TREE_OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 function parseNativeReleaseEvidence(value: unknown): NativeReleaseEvidence {
 	if (!isRecord(value)) throw new Error("Native release evidence must be an object");
@@ -4146,6 +4147,18 @@ function assertFrozenPreCommitProjection(
 	return projection.candidateTree;
 }
 
+function nativePreCommitIntendedTree(result: NativeValidateResult, derived: DerivedReviewGateTarget): string | undefined {
+	if (!result.allowed || result.result !== "allow" || derived.command.event !== "pre-commit") return undefined;
+	const candidateTree = result.gateContext.raw.candidate_tree;
+	if (typeof candidateTree !== "string" || !GIT_TREE_OBJECT_ID.test(candidateTree)) {
+		throw new CandidateViewError("native pre-commit allow omitted a valid exact candidate tree");
+	}
+	if (candidateTree !== derived.actualIntendedCommitTree) {
+		throw new CandidateViewError("native pre-commit allow candidate tree does not match the live staged tree");
+	}
+	return candidateTree;
+}
+
 function authorizationTargetHash(derived: DerivedReviewGateTarget): string {
 	return derived.nativePublication === undefined
 		? canonicalHash(derived.target)
@@ -4633,7 +4646,7 @@ async function executeReviewControllerOperation(
 					cwd: candidateView?.root ?? defaultCwd,
 					...(canonicalBaseRef === undefined
 						? {}
-						: { baseRef: candidateView?.baseCommit ?? canonicalBaseRef, committedOnly: true }),
+						: { baseRef: candidateView?.baseCommit ?? canonicalBaseRef, committedOnly: true, projection: "workspace" }),
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 					...(policy.policyPath === undefined ? {} : { policyPath: policy.policyPath }),
 					...(signal === undefined ? {} : { signal }),
@@ -4757,8 +4770,6 @@ async function executeReviewControllerOperation(
 			let nativeResult: NativeFinalizeResult;
 			try {
 				if (parameters.lineageId === undefined) throw new CandidateViewError("Native FINALIZE requires an explicit lineage");
-				negotiatedStatus = await nativeReviewCli.targetStatus({ cwd: defaultCwd, lineageId: parameters.lineageId, ...(signal === undefined ? {} : { signal }) });
-				if (negotiatedStatus.applicability !== "current_target" || negotiatedStatus.authority?.lineageId !== parameters.lineageId || (negotiatedStatus.action !== "finalize" && negotiatedStatus.action !== "reconcile_finalize")) return mapNativeTargetStatus(parameters.operation, negotiatedStatus, parameters.lineageId);
 				correctionCompletion = input.review_result === undefined && (input.validation !== undefined || input.validation_proof !== undefined) && input.final_evidence !== undefined;
 				const validationAttempt = input.review_result === undefined && input.correction_line_forecast === undefined && input.final_evidence !== undefined;
 				// A correction-forecast-only FINALIZE (the pre-edit forecast step in
@@ -4767,6 +4778,21 @@ async function executeReviewControllerOperation(
 				// an empty in-memory registry without ever invoking native FINALIZE.
 				const correctionForecast = input.review_result === undefined && input.correction_line_forecast !== undefined;
 				const replayKey = JSON.stringify({ cwd: defaultCwd, lineageId: parameters.lineageId ?? null, input: parameters.input ?? null, inputPath: parameters.inputPath ?? null });
+				let baseRef: string | undefined;
+				if ((validationAttempt || input.review_result !== undefined || correctionForecast) && candidateViews && !candidateViews.hasProjection(parameters.lineageId)) {
+					try {
+						const rawState = JSON.parse(readFileSync(join(resolveRepositoryAuthorityV1(defaultCwd).common_directory, "gentle-ai", "review-transactions", "v2", parameters.lineageId, "review-state.json"), "utf8"));
+						if (isRecord(rawState) && rawState.schema === "gentle-ai.review-state-record/v2" && isRecord(rawState.state) && rawState.state.lineage_id === parameters.lineageId && rawState.state.state === "correction_required" && isRecord(rawState.state.current_snapshot) && rawState.state.current_snapshot.kind === "base-diff" && typeof rawState.state.current_snapshot.base_tree === "string") {
+							const branchName = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: defaultCwd, encoding: "utf8" }).trim();
+							baseRef = resolveCurrentBranchRemoteTrackingSelector(defaultCwd, branchName, rawState.state.current_snapshot.base_tree);
+							if (baseRef === undefined) return { operation: parameters.operation, status: "blocked", outcome: "selector-unresolved", lineage_created: false, mutation_performed: false, mutation_outcome: "none", next_action: "review-remote-tracker" };
+						}
+					} catch (error) {
+						if (error instanceof CandidateViewError) throw error;
+					}
+				}
+				negotiatedStatus = await nativeReviewCli.targetStatus({ cwd: defaultCwd, lineageId: parameters.lineageId, ...(baseRef === undefined ? {} : { baseRef }), ...(signal === undefined ? {} : { signal }) });
+				if (negotiatedStatus.applicability !== "current_target" || negotiatedStatus.authority?.lineageId !== parameters.lineageId || (negotiatedStatus.action !== "finalize" && negotiatedStatus.action !== "reconcile_finalize")) return mapNativeTargetStatus(parameters.operation, negotiatedStatus, parameters.lineageId);
 				if ((validationAttempt || input.review_result !== undefined || correctionForecast) && candidateViews && !candidateViews.hasProjection(parameters.lineageId)) {
 					candidateView = validationAttempt
 						? (candidateViews.restoreProjectionFromNative(parameters.lineageId, defaultCwd, negotiatedStatus.projection), undefined)
@@ -4985,7 +5011,7 @@ async function executeReviewControllerOperation(
 				if (targetStatus.applicability !== "current_target" || targetStatus.authority?.lineageId !== parameters.lineageId) return mapNativeTargetStatus(parameters.operation, targetStatus, parameters.lineageId);
 				candidateViews.restoreProjectionFromNative(parameters.lineageId, nativeDerived.command.cwd, targetStatus.projection);
 			}
-			const intendedTree = assertFrozenPreCommitProjection(nativeDerived, parameters.lineageId, candidateViews);
+			const localIntendedTree = assertFrozenPreCommitProjection(nativeDerived, parameters.lineageId, candidateViews);
 			const result = await nativeReviewCli.validate({
 				cwd: nativeDerived.command.cwd,
 				gate: requestedNativeGate(nativeDerived),
@@ -5004,7 +5030,11 @@ async function executeReviewControllerOperation(
 					signal,
 				)
 				: nativeDerived;
-			if (result.allowed && result.result === "allow") assertFrozenPreCommitProjection(authorizedDerived, parameters.lineageId, candidateViews);
+			if (result.allowed && result.result === "allow") {
+				assertFrozenPreCommitProjection(authorizedDerived, parameters.lineageId, candidateViews);
+				assertNativePublicationBinding(result, authorizedDerived);
+			}
+			const intendedTree = localIntendedTree ?? (candidateViews === null ? undefined : nativePreCommitIntendedTree(result, authorizedDerived));
 			const response: Record<string, unknown> = {
 				operation: parameters.operation,
 				result: mapNativeValidateResult(result),
@@ -5133,7 +5163,7 @@ async function gateLifecycleCommand(
 		const intendedTree = authorization.native_gate === undefined
 			? undefined
 			: assertFrozenPreCommitProjection(derived, authorization.native_gate.lineage_id, candidateViews);
-		if (authorization.native_gate?.intended_tree !== undefined && intendedTree !== authorization.native_gate.intended_tree) {
+		if (intendedTree !== undefined && authorization.native_gate?.intended_tree !== undefined && intendedTree !== authorization.native_gate.intended_tree) {
 			return {
 				block: true,
 				reason: `Gentle AI ${inspection.event} gate staged projection changed after authorization and failed closed.`,
@@ -5189,8 +5219,9 @@ async function gateLifecycleCommand(
 				signal,
 			);
 			const postNativeIntendedTree = assertFrozenPreCommitProjection(postNativeDerived, authorization.native_gate.lineage_id, candidateViews);
-			if (authorization.native_gate.intended_tree !== undefined && postNativeIntendedTree !== authorization.native_gate.intended_tree) throw new CandidateViewError("staged projection changed during native validation");
 			assertNativePublicationBinding(fresh, postNativeDerived);
+			const provenIntendedTree = postNativeIntendedTree ?? (candidateViews === null ? undefined : nativePreCommitIntendedTree(fresh, postNativeDerived));
+			if (authorization.native_gate.intended_tree !== undefined && provenIntendedTree !== authorization.native_gate.intended_tree) throw new CandidateViewError("staged projection changed during native validation");
 			if (nativeGateFingerprint(fresh, postNativeDerived) !== authorization.native_gate.fingerprint) {
 				return {
 					block: true,

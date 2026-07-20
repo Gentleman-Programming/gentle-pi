@@ -585,6 +585,11 @@ test("fresh negotiated registries reconstruct the frozen candidate before FINALI
 	status.projection.currentCandidateTree = frozen.candidateTree;
 	status.projection.paths = frozen.paths;
 	frozen.cleanup();
+	addBareRemote(t, cwd, "origin");
+	git(cwd, "push", "origin", "main");
+	git(cwd, "fetch", "origin");
+	mkdirSync(join(cwd, ".git", "gentle-ai", "review-transactions", "v2", "restarted-lineage"), { recursive: true });
+	writeFileSync(join(cwd, ".git", "gentle-ai", "review-transactions", "v2", "restarted-lineage", "review-state.json"), JSON.stringify({ schema: "gentle-ai.review-state-record/v2", state: { schema: "gentle-ai.review-state/v2", lineage_id: "restarted-lineage", state: "correction_required", initial_snapshot: { kind: "current-changes", base_tree: frozen.baseTree, candidate_tree: frozen.candidateTree, paths: frozen.paths, paths_digest: "p" }, current_snapshot: { kind: "current-changes", base_tree: frozen.baseTree, candidate_tree: frozen.candidateTree, paths: frozen.paths, paths_digest: "p" }, fix_finding_ids: ["F1"], findings: [{ id: "F1", severity: "CRITICAL" }] } }));
 	let finalizedContent = "";
 	const { controller } = runtime(fakeNative({
 		targetStatus: async () => status,
@@ -593,7 +598,7 @@ test("fresh negotiated registries reconstruct the frozen candidate before FINALI
 			return { lineageId: "restarted-lineage", state: "approved", action: "approved", storeRevision: "r1" };
 		},
 	}), undefined, undefined, undefined, new CandidateViewRegistry());
-	const result = await controller.execute("restarted-finalize", {
+const result = await controller.execute("restarted-finalize", {
 		operation: "finalize",
 		lineageId: "restarted-lineage",
 		input: JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: ["reviewed frozen candidate"] }] } }),
@@ -1275,7 +1280,7 @@ test("native START binds an acknowledged committed range and native identity to 
 		assert.deepEqual(view.paths, ["committed-after-base.ts"]);
 		assert.equal(view.committedOnly, true);
 		assert.equal(view.baseCommit, baseCommit);
-		assert.deepEqual(requests, [{ cwd: view.root, baseRef: view.baseCommit, committedOnly: true }]);
+		assert.deepEqual(requests, [{ cwd: view.root, baseRef: view.baseCommit, committedOnly: true, projection: "workspace" }]);
 	} finally {
 		view.cleanup();
 	}
@@ -1347,7 +1352,7 @@ test("native START forwards an acknowledged base ref and rejects invalid values 
 		},
 	}));
 	await controller.execute("committed-base", { operation: "start", input: JSON.stringify({ mode: "ordinary", baseRef: "refs/heads/main", committedOnly: true }) }, undefined, undefined, context(cwd));
-	assert.deepEqual(requests, [{ cwd, baseRef: git(cwd, "rev-parse", "refs/heads/main"), committedOnly: true }]);
+	assert.deepEqual(requests, [{ cwd, baseRef: git(cwd, "rev-parse", "refs/heads/main"), committedOnly: true, projection: "workspace" }]);
 	for (const baseRef of ["", "   ", " origin/main", "origin/main ", "origin\0main", "origin\nmain", "origin\rmain", "origin\tmain", "origin\u007fmain", 42, [], {}]) {
 		const rejected = await controller.execute("invalid-base", { operation: "start", input: JSON.stringify({ mode: "ordinary", baseRef }) }, undefined, undefined, context(cwd));
 		assert.deepEqual(rejected.details, {
@@ -3460,3 +3465,104 @@ test("authorized RECOVER routes to native review recover with the exact successo
 	assert.equal(recovers[0]?.predecessorLineage, "broken");
 	assert.equal(recovers[0]?.disposition, "invalidated");
 });
+
+	test("base-diff FINALIZE derives <remote>/<current-branch> selector from remote-tracking refs and fails closed on zero or multiple matches", async (t) => {
+		// Helper: build a targetStatus fixture with the given projection trees.
+		const buildStatus = (lid, bt, ct) => {
+			const f = targetStatusFixture({ lineageId: lid });
+			f.authority!.state = "correction_required";
+			f.projection.kind = "base-diff";
+			f.projection.baseTree = bt;
+			f.projection.initialReviewTree = ct;
+			f.projection.currentCandidateTree = ct;
+			return f;
+		};
+		// Helper: write a base-diff correction state.
+		const writeState = (cwd, lid, bt, ct) => {
+			const sp = join(cwd, ".git", "gentle-ai", "review-transactions", "v2", lid, "review-state.json");
+			mkdirSync(dirname(sp), { recursive: true });
+			const snap = { kind: "base-diff", base_tree: bt, candidate_tree: ct, paths: ["app.ts"], paths_digest: "p" };
+			writeFileSync(sp, JSON.stringify({ schema: "gentle-ai.review-state-record/v2", state: { schema: "gentle-ai.review-state/v2", lineage_id: lid, state: "correction_required", initial_snapshot: snap, current_snapshot: snap, fix_finding_ids: ["F1"], findings: [{ id: "F1", severity: "CRITICAL" }] } }));
+		};
+		// Case A: exact current-branch remote tracking selector with matching frozen tree.
+		const cwd = repository(t);
+		addBareRemote(t, cwd, "origin");
+		git(cwd, "push", "origin", "main");
+		git(cwd, "fetch", "origin");
+		const baseCommit = git(cwd, "rev-parse", "origin/main");
+		const baseTree = git(cwd, "rev-parse", `${baseCommit}^{tree}`);
+		commitFile(cwd, "app.ts", "x", "c");
+		writeFileSync(join(cwd, "app.ts"), "y");
+		git(cwd, "add", "-A");
+		const candidateTree = git(cwd, "write-tree");
+		writeState(cwd, "sel-b548", baseTree, candidateTree);
+		const calls = [];
+		let { controller } = runtime(fakeNative({ targetStatus: async (req) => { calls.push(req.baseRef); return buildStatus("sel-b548", baseTree, candidateTree); } }), undefined, undefined, undefined, new CandidateViewRegistry());
+		let r = await controller.execute("a", { operation: "finalize", lineageId: "sel-b548", input: JSON.stringify({ final_evidence: "ok", final_verification_passed: true }) }, undefined, undefined, context(cwd));
+		assert.equal((r.details as { outcome: string }).outcome, "validation-required");
+		assert.equal(calls[0], "origin/main");
+		// Raw SHA must never be forwarded.
+		assert.notEqual(calls[0], baseCommit);
+		assert.ok(calls[0]?.includes("/"), `baseRef must be <remote>/<branch>, got ${calls[0]}`);
+		// Case B: unrelated same-tree remote branch does not cause ambiguity.
+		git(cwd, "branch", "feature", "origin/main");
+		git(cwd, "push", "origin", "feature");
+		git(cwd, "fetch", "origin");
+		calls.length = 0;
+		({ controller } = runtime(fakeNative({ targetStatus: async (req) => { calls.push(req.baseRef); return buildStatus("sel-b548", baseTree, candidateTree); } }), undefined, undefined, undefined, new CandidateViewRegistry()));
+		r = await controller.execute("b", { operation: "finalize", lineageId: "sel-b548", input: JSON.stringify({ final_evidence: "ok", final_verification_passed: true }) }, undefined, undefined, context(cwd));
+		assert.equal((r.details as { outcome: string }).outcome, "validation-required");
+		assert.equal(calls[0], "origin/main");
+		// Case C: zero selector (no remote) -> fail closed.
+		const cwd2 = repository(t);
+		const baseCommit2 = git(cwd2, "rev-parse", "HEAD");
+		const baseTree2 = git(cwd2, "rev-parse", `${baseCommit2}^{tree}`);
+		commitFile(cwd2, "app.ts", "x", "c");
+		const candidateTree2 = git(cwd2, "write-tree");
+		writeState(cwd2, "sel-zero", baseTree2, candidateTree2);
+		const calls2 = [];
+		({ controller } = runtime(fakeNative({ targetStatus: async (req) => { calls2.push(req.baseRef); return buildStatus("sel-zero", baseTree2, candidateTree2); } }), undefined, undefined, undefined, new CandidateViewRegistry()));
+		r = await controller.execute("c", { operation: "finalize", lineageId: "sel-zero", input: JSON.stringify({ final_evidence: "ok", final_verification_passed: true }) }, undefined, undefined, context(cwd2));
+		assert.equal(calls2.length, 0);
+		assert.equal((r.details as { outcome: string }).outcome, "selector-unresolved");
+		// Case D: tree mismatch -> fail closed.
+		// Push the initial commit to origin/main, then create a new local commit.
+		// origin/main stays as the initial commit; local HEAD is the new commit.
+		// The local baseTree is the new commit's tree, which differs from origin/main.
+		const cwd3 = repository(t);
+		addBareRemote(t, cwd3, "origin");
+		git(cwd3, "push", "origin", "main");
+		git(cwd3, "fetch", "origin");
+		writeFileSync(join(cwd3, "app.ts"), "z");
+		git(cwd3, "add", "-A");
+		git(cwd3, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "local");
+		// Do NOT push the new commit. origin/main stays as the initial commit.
+		const baseTree3 = git(cwd3, "rev-parse", `${git(cwd3, "rev-parse", "HEAD")}^{tree}`);
+		const candidateTree3 = git(cwd3, "write-tree");
+		writeState(cwd3, "sel-mismatch", baseTree3, candidateTree3);
+		const calls3 = [];
+		({ controller } = runtime(fakeNative({ targetStatus: async (req) => { calls3.push(req.baseRef); return buildStatus("sel-mismatch", baseTree3, candidateTree3); } }), undefined, undefined, undefined, new CandidateViewRegistry()));
+		r = await controller.execute("d", { operation: "finalize", lineageId: "sel-mismatch", input: JSON.stringify({ final_evidence: "ok", final_verification_passed: true }) }, undefined, undefined, context(cwd3));
+		assert.equal(calls3.length, 0);
+		assert.equal((r.details as { outcome: string }).outcome, "selector-unresolved");
+		// Case E: duplicate same-branch remotes -> fail closed.
+		const cwd4 = repository(t);
+		addBareRemote(t, cwd4, "origin");
+		git(cwd4, "push", "origin", "main");
+		git(cwd4, "fetch", "origin");
+		const baseTree4 = git(cwd4, "rev-parse", `${git(cwd4, "rev-parse", "origin/main")}^{tree}`);
+		commitFile(cwd4, "app.ts", "x", "c");
+		const candidateTree4 = git(cwd4, "write-tree");
+		writeState(cwd4, "sel-multi", baseTree4, candidateTree4);
+		addBareRemote(t, cwd4, "upstream");
+		// Push the initial commit (not the new local commit) to upstream/main so both remotes
+		// have refs with the same tree as the local baseTree4.
+		git(cwd4, "branch", "initial4", "origin/main");
+		git(cwd4, "push", "--force", "upstream", "initial4:main");
+		git(cwd4, "fetch", "upstream");
+		const calls4 = [];
+		({ controller } = runtime(fakeNative({ targetStatus: async (req) => { calls4.push(req.baseRef); return buildStatus("sel-multi", baseTree4, candidateTree4); } }), undefined, undefined, undefined, new CandidateViewRegistry()));
+		r = await controller.execute("e", { operation: "finalize", lineageId: "sel-multi", input: JSON.stringify({ final_evidence: "ok", final_verification_passed: true }) }, undefined, undefined, context(cwd4));
+		assert.equal(calls4.length, 0);
+		assert.equal((r.details as { outcome: string }).outcome, "selector-unresolved");
+	});

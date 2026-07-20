@@ -4,6 +4,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync,
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { REVIEW_PROJECTION_KIND, type ReviewProjectionKind } from "./review-integration-v1.ts";
 
 const REVIEW_LENS = ["review-risk", "review-resilience", "review-readability", "review-reliability"] as const;
 export type ReviewLens = (typeof REVIEW_LENS)[number];
@@ -48,6 +49,7 @@ interface CandidateViewRecord {
 	baseTree: string;
 	candidateTree: string;
 	committedOnly: boolean;
+	baseDiff: boolean;
 	entries: readonly CandidateViewEntry[];
 	gitlinks: readonly CandidateGitlink[];
 	scope: CandidateViewScope;
@@ -77,6 +79,7 @@ export interface FrozenCandidateProjection {
 	baseTree: string;
 	candidateTree: string;
 	committedOnly: boolean;
+	baseDiff: boolean;
 	paths: readonly string[];
 	modes: Readonly<Record<string, string>>;
 	gitlinks: Readonly<Record<string, string>>;
@@ -87,6 +90,7 @@ export interface CreateCandidateViewRequest {
 	contributorRoot: string;
 	baseRef?: string;
 	committedOnly?: boolean;
+	baseDiff?: boolean;
 	replayKey?: string;
 }
 
@@ -103,6 +107,7 @@ export interface AuthoritativeReviewingCandidateState {
 	baseTree: string;
 	candidateTree: string;
 	committedOnly?: boolean;
+	baseDiff?: boolean;
 	paths: readonly string[];
 	modes: Readonly<Record<string, string>>;
 	gitlinks?: Readonly<Record<string, string>>;
@@ -111,6 +116,7 @@ export interface AuthoritativeReviewingCandidateState {
 }
 
 export interface NativeCandidateProjectionDescriptor {
+	kind?: ReviewProjectionKind;
 	baseTree: string;
 	currentCandidateTree: string;
 	paths: readonly string[];
@@ -374,7 +380,7 @@ function resolveCandidateBase(cwd: string, baseRef: string | undefined, env: Nod
 	}
 }
 
-function resolveCandidateBaseTree(cwd: string, baseTree: string, executor: CandidateGitExecutor): ResolvedCandidateBase {
+export function resolveCandidateBaseTree(cwd: string, baseTree: string, executor: CandidateGitExecutor = defaultCandidateGitExecutor): ResolvedCandidateBase {
 	const row = git(cwd, ["log", "--format=%H%x09%T", "HEAD"], process.env, executor)
 		.split("\n")
 		.find((entry) => entry.endsWith(`\t${baseTree}`));
@@ -382,6 +388,24 @@ function resolveCandidateBaseTree(cwd: string, baseTree: string, executor: Candi
 	const base = resolveCandidateBase(cwd, row.slice(0, row.indexOf("\t")), process.env, executor);
 	if (base.tree !== baseTree) throw new CandidateViewError("native projection base tree is inconsistent");
 	return base;
+}
+
+export function resolveCurrentBranchRemoteTrackingSelector(cwd: string, branchName: string, baseTree: string, executor: CandidateGitExecutor = defaultCandidateGitExecutor): string | undefined {
+	if (branchName === "" || branchName === "HEAD") return undefined;
+	const remotes = git(cwd, ["remote"], process.env, executor).split("\n").filter((r) => r.length > 0);
+	let candidate: string | undefined;
+	for (const remote of remotes) {
+		const ref = `refs/remotes/${remote}/${branchName}`;
+		try {
+			const commit = git(cwd, ["rev-parse", "--verify", "--end-of-options", ref], process.env, executor);
+			const tree = git(cwd, ["rev-parse", "--verify", "--end-of-options", `${commit}^{tree}`], process.env, executor);
+			if (tree === baseTree) {
+				if (candidate !== undefined) return undefined;
+				candidate = `${remote}/${branchName}`;
+			}
+		} catch {}
+	}
+	return candidate;
 }
 
 export function resolveCanonicalCandidateBase(contributorRoot: string, baseRef: string): ResolvedCandidateBase {
@@ -408,11 +432,16 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 	const contributorRoot = realpathSync(request.contributorRoot);
 	if (!lstatSync(contributorRoot).isDirectory()) throw new CandidateViewError("contributor root is not a directory");
 	if (request.committedOnly === true && request.baseRef === undefined) throw new CandidateViewError("committed-only candidate views require an explicit base reference", "committed-only-base-required");
+	if (request.baseDiff === true && request.baseRef === undefined) throw new CandidateViewError("base-diff candidate views require an explicit base reference", "base-diff-base-required");
 	const commonDir = resolve(contributorRoot, git(contributorRoot, ["rev-parse", "--git-common-dir"], process.env, executor));
 	const canonicalCommonDir = realpathSync(commonDir);
 	const base = resolveCandidateBase(contributorRoot, request.baseRef, process.env, executor);
-	const committedOnly = request.committedOnly === true;
-	const candidateCommit = committedOnly
+	const baseDiff = request.baseDiff === true;
+	const committedOnly = baseDiff ? false : request.committedOnly === true;
+	// For base-diff, the candidate commit is HEAD so the materialized tree = HEAD + workspace, matching the
+	// frozen currentCandidateTree (which is the workspace tree over a committed range). The base for the
+	// diff scope is the frozen base, supplied via baseRef.
+	const candidateCommit = baseDiff || committedOnly
 		? resolveCandidateBase(contributorRoot, "HEAD", process.env, executor)
 		: base;
 	const parent = candidateViewParent(canonicalCommonDir);
@@ -434,7 +463,7 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 			const scope = deriveChangedScope(contributorRoot, baseCommit, candidateTree, [...tree.entries, ...tree.gitlinks], executor);
 			for (const gitlink of tree.gitlinks) if (lstatSync(join(root, gitlink.path), { throwIfNoEntry: false })) throw new CandidateViewError("candidate view materialized a metadata-only gitlink");
 			makeReadonly(root, entries);
-			return { token: basename(root), root: realpathSync(root), parent, contributorRoot, commonDir: canonicalCommonDir, baseCommit, baseTree: base.tree, candidateTree, committedOnly, entries, gitlinks: tree.gitlinks, scope, gitExecutor: executor };
+			return { token: basename(root), root: realpathSync(root), parent, contributorRoot, commonDir: canonicalCommonDir, baseCommit, baseTree: base.tree, candidateTree, committedOnly, baseDiff, entries, gitlinks: tree.gitlinks, scope, gitExecutor: executor };
 		} catch (error) {
 			try { git(contributorRoot, ["worktree", "remove", "--force", root], process.env, executor); } catch { rmSync(root, { recursive: true, force: true }); }
 			throw error;
@@ -538,7 +567,7 @@ export class CandidateViewRegistry {
 		if (this.current !== undefined) throw new CandidateViewError("candidate view already has a current lineage binding", "current-binding-already-established");
 		if (states.length === 0) throw new CandidateViewError("no authoritative reviewing lineage exactly matches the live candidate", "authoritative-current-match-missing");
 		if (states.length !== 1) throw new CandidateViewError("multiple authoritative reviewing lineages exactly match the live candidate", "authoritative-current-match-ambiguous");
-		const live = materializeCandidateView({ contributorRoot, baseRef: states[0]!.baseCommit, committedOnly: states[0]!.committedOnly === true }, this.gitExecutor);
+		const live = materializeCandidateView({ contributorRoot, baseRef: states[0]!.baseCommit, committedOnly: states[0]!.committedOnly === true, baseDiff: states[0]!.baseDiff === true }, this.gitExecutor);
 		try {
 			const matches = states.filter((state) => this.matchesAuthoritativeState(live, state));
 			if (matches.length === 0) throw new CandidateViewError("no authoritative reviewing lineage exactly matches the live candidate", "authoritative-current-match-missing");
@@ -563,7 +592,7 @@ export class CandidateViewRegistry {
 			assertRecordSafe(existing);
 			return this.expose(existing);
 		}
-		const record = materializeCandidateView({ contributorRoot, baseRef: projection.baseCommit, committedOnly: projection.committedOnly }, this.gitExecutor);
+		const record = materializeCandidateView({ contributorRoot, baseRef: projection.baseCommit, committedOnly: projection.committedOnly, baseDiff: projection.baseDiff }, this.gitExecutor);
 		try {
 			if (record.baseCommit !== projection.baseCommit || record.baseTree !== projection.baseTree) throw new CandidateViewError("corrected candidate base does not match the frozen genesis base");
 			if (!record.scope.paths.every((path) => projection.paths.includes(path))) throw new CandidateViewError("corrected candidate scope escapes the frozen genesis paths");
@@ -594,6 +623,7 @@ export class CandidateViewRegistry {
 			replacement.baseCommit !== projection.baseCommit ||
 			replacement.baseTree !== projection.baseTree ||
 			replacement.committedOnly !== projection.committedOnly ||
+			replacement.baseDiff !== projection.baseDiff ||
 			!replacement.scope.paths.every((path) => projection.paths.includes(path))
 		) {
 			throw new CandidateViewError("corrected candidate replacement does not preserve its frozen lineage projection");
@@ -608,6 +638,7 @@ export class CandidateViewRegistry {
 			baseTree: replacement.baseTree,
 			candidateTree: replacement.candidateTree,
 			committedOnly: replacement.committedOnly,
+			baseDiff: replacement.baseDiff,
 			paths: replacement.scope.paths,
 			modes: replacement.scope.modes,
 			gitlinks: replacement.scope.gitlinks,
@@ -633,6 +664,7 @@ export class CandidateViewRegistry {
 				state.baseTree === record.baseTree &&
 				state.candidateTree === record.candidateTree &&
 				(state.committedOnly ?? false) === record.committedOnly &&
+				(state.baseDiff ?? false) === record.baseDiff &&
 				JSON.stringify(state.paths) === JSON.stringify(record.scope.paths) &&
 				JSON.stringify(state.modes) === JSON.stringify(record.scope.modes) &&
 				gitlinkMapsEqual(state.gitlinks ?? {}, record.scope.gitlinks) &&
@@ -655,6 +687,7 @@ export class CandidateViewRegistry {
 			baseTree: record.baseTree,
 			candidateTree: record.candidateTree,
 			committedOnly: record.committedOnly,
+			baseDiff: record.baseDiff,
 			paths: record.scope.paths,
 			modes: record.scope.modes,
 			gitlinks: record.scope.gitlinks,
@@ -671,7 +704,7 @@ export class CandidateViewRegistry {
 		const root = realpathSync(contributorRoot);
 		const base = resolveCandidateBase(root, baseCommit, process.env, this.gitExecutor);
 		if (!lineageId || this.projections.has(lineageId) || base.commit !== baseCommit || base.tree !== baseTree || !isFullCommitId(candidateTree) || paths.some((path) => !isSafeCandidatePath(path)) || new Set(paths).size !== paths.length) throw new CandidateViewError("frozen correction projection is invalid or already restored");
-		this.projections.set(lineageId, { contributorRoot: root, baseCommit, baseTree, candidateTree, committedOnly: false, paths: [...paths], modes: {}, gitlinks: {}, deletedPaths: [] });
+		this.projections.set(lineageId, { contributorRoot: root, baseCommit, baseTree, candidateTree, committedOnly: false, baseDiff: false, paths: [...paths], modes: {}, gitlinks: {}, deletedPaths: [] });
 	}
 
 	restoreProjectionFromNative(lineageId: string, contributorRoot: string, descriptor: NativeCandidateProjectionDescriptor): void {
@@ -681,8 +714,23 @@ export class CandidateViewRegistry {
 		if (descriptor.intendedUntracked.some((path) => !descriptor.paths.includes(path)) || new Set(descriptor.intendedUntracked).size !== descriptor.intendedUntracked.length) throw new CandidateViewError("native intended-untracked projection is invalid");
 		const head = resolveCandidateBase(root, "HEAD", process.env, this.gitExecutor);
 		const base = head.tree === descriptor.baseTree ? head : resolveCandidateBaseTree(root, descriptor.baseTree, this.gitExecutor);
-		const committedOnly = head.tree === descriptor.currentCandidateTree && base.tree !== head.tree;
-		if (!committedOnly && head.tree !== descriptor.baseTree) throw new CandidateViewError("native projection base no longer matches HEAD");
+		const kind = descriptor.kind ?? REVIEW_PROJECTION_KIND.CURRENT_CHANGES;
+		let committedOnly: boolean;
+		let baseDiff: boolean;
+		if (kind === REVIEW_PROJECTION_KIND.BASE_DIFF) {
+			// base-diff is a committed range with optional uncommitted workspace correction. The base is
+			// frozen (older than HEAD), and the currentCandidateTree is the workspace tree over that
+			// range. HEAD drift is expected and the projection must not be rejected for it.
+			committedOnly = false;
+			baseDiff = true;
+		} else {
+			// Preserve the original committed-only acceptance: when HEAD still matches the candidate tree
+			// and the base is a frozen predecessor, treat the projection as committed-only and skip the
+			// "base no longer matches HEAD" guard. Otherwise the base must equal HEAD.
+			committedOnly = head.tree === descriptor.currentCandidateTree && base.tree !== head.tree;
+			baseDiff = false;
+			if (!committedOnly && head.tree !== descriptor.baseTree) throw new CandidateViewError("native projection base no longer matches HEAD");
+		}
 		const tree = parseTree(root, descriptor.currentCandidateTree, this.gitExecutor);
 		const scope = deriveChangedScope(root, descriptor.baseTree, descriptor.currentCandidateTree, [...tree.entries, ...tree.gitlinks], this.gitExecutor);
 		if (JSON.stringify(scope.paths) !== JSON.stringify([...descriptor.paths].sort())) throw new CandidateViewError("native projection paths do not match Git content");
@@ -692,6 +740,7 @@ export class CandidateViewRegistry {
 			baseTree: descriptor.baseTree,
 			candidateTree: descriptor.currentCandidateTree,
 			committedOnly,
+			baseDiff,
 			paths: scope.paths,
 			modes: scope.modes,
 			gitlinks: scope.gitlinks,
@@ -702,7 +751,7 @@ export class CandidateViewRegistry {
 	restoreForFinalizeFromNative(lineageId: string, contributorRoot: string, descriptor: NativeCandidateProjectionDescriptor): CandidateView {
 		this.restoreProjectionFromNative(lineageId, contributorRoot, descriptor);
 		const projection = this.resolveProjection(lineageId, contributorRoot);
-		const record = materializeCandidateView({ contributorRoot, baseRef: projection.baseCommit, committedOnly: projection.committedOnly }, this.gitExecutor);
+		const record = materializeCandidateView({ contributorRoot, baseRef: projection.baseCommit, committedOnly: projection.committedOnly, baseDiff: projection.baseDiff }, this.gitExecutor);
 		try {
 			if (record.baseTree !== projection.baseTree || record.candidateTree !== projection.candidateTree || JSON.stringify(record.scope.paths) !== JSON.stringify(projection.paths)) {
 				throw new CandidateViewError("live candidate does not match the native frozen projection");
@@ -754,13 +803,14 @@ export class CandidateViewRegistry {
 	}
 
 	private assertCurrentBindingMatchesLiveCandidate(record: CandidateViewRecord): void {
-		const live = materializeCandidateView({ contributorRoot: record.contributorRoot, baseRef: record.baseCommit, committedOnly: record.committedOnly }, this.gitExecutor);
+		const live = materializeCandidateView({ contributorRoot: record.contributorRoot, baseRef: record.baseCommit, committedOnly: record.committedOnly, baseDiff: record.baseDiff }, this.gitExecutor);
 		try {
 			if (
 				live.baseCommit !== record.baseCommit ||
 				live.baseTree !== record.baseTree ||
 				live.candidateTree !== record.candidateTree ||
 				live.committedOnly !== record.committedOnly ||
+				live.baseDiff !== record.baseDiff ||
 				JSON.stringify(live.scope.paths) !== JSON.stringify(record.scope.paths) ||
 				JSON.stringify(live.scope.modes) !== JSON.stringify(record.scope.modes) ||
 				!gitlinkMapsEqual(live.scope.gitlinks, record.scope.gitlinks) ||

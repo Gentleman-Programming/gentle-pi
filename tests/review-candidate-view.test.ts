@@ -603,6 +603,105 @@ test("native projections recover a committed range base from its frozen tree", (
 	assert.equal(projection.committedOnly, true);
 });
 
+test("native projections restore a base-diff committed range plus uncommitted workspace delta without rejecting HEAD drift", (t) => {
+	const contributorRoot = repository(t);
+	const baseCommit = git(contributorRoot, "rev-parse", "HEAD");
+	const baseTree = git(contributorRoot, "rev-parse", `${baseCommit}^{tree}`);
+	writeFileSync(join(contributorRoot, "tracked.txt"), "committed candidate\n");
+	git(contributorRoot, "add", "tracked.txt");
+	git(contributorRoot, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "candidate");
+	writeFileSync(join(contributorRoot, "tracked.txt"), "committed candidate + workspace correction\n");
+	git(contributorRoot, "add", "-A");
+	const candidateTree = git(contributorRoot, "write-tree");
+	const registry = new CandidateViewRegistry();
+	registry.restoreProjectionFromNative("base-diff-projection", contributorRoot, {
+		kind: "base-diff",
+		baseTree,
+		currentCandidateTree: candidateTree,
+		paths: ["tracked.txt"],
+		intendedUntracked: [],
+		projection: "workspace",
+	});
+	const projection = registry.resolveProjection("base-diff-projection", contributorRoot);
+	assert.equal(projection.baseCommit, baseCommit);
+	assert.equal(projection.baseTree, baseTree);
+	assert.equal(projection.candidateTree, candidateTree);
+	assert.equal(projection.committedOnly, false);
+	assert.equal(projection.baseDiff, true);
+	assert.deepEqual(projection.paths, ["tracked.txt"]);
+});
+
+test("restoreForFinalizeFromNative materializes a base-diff projection with workspace delta on top of committed HEAD", (t) => {
+	const contributorRoot = repository(t);
+	const baseCommit = git(contributorRoot, "rev-parse", "HEAD");
+	const baseTree = git(contributorRoot, "rev-parse", `${baseCommit}^{tree}`);
+	writeFileSync(join(contributorRoot, "tracked.txt"), "committed candidate\n");
+	git(contributorRoot, "add", "tracked.txt");
+	git(contributorRoot, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "candidate");
+	writeFileSync(join(contributorRoot, "tracked.txt"), "committed candidate + workspace correction\n");
+	git(contributorRoot, "add", "-A");
+	const candidateTree = git(contributorRoot, "write-tree");
+	const registry = new CandidateViewRegistry();
+	const view = registry.restoreForFinalizeFromNative("base-diff-finalize", contributorRoot, {
+		kind: "base-diff",
+		baseTree,
+		currentCandidateTree: candidateTree,
+		paths: ["tracked.txt"],
+		intendedUntracked: [],
+		projection: "workspace",
+	});
+	try {
+		assert.equal(view.baseCommit, baseCommit);
+		assert.equal(view.baseTree, baseTree);
+		assert.equal(view.candidateTree, candidateTree);
+		assert.equal(view.committedOnly, false);
+		view.verify();
+	} finally {
+		view.cleanup();
+	}
+});
+
+test("restoreForFinalizeFromNative materializes a base-diff projection including committed files HEAD adds over base", (t) => {
+	// Strengthened RED: the committed candidate must add a file that the workspace correction does NOT
+	// touch. The base+workspace materialization (missing baseDiff: true) would seed the worktree at
+	// the base commit and leave the worktree HEAD inconsistent with the frozen base-diff projection.
+	// The baseDiff: true materialization seeds the worktree at HEAD so the candidate view root's HEAD
+	// matches the contributor root's HEAD.
+	const contributorRoot = repository(t);
+	const baseCommit = git(contributorRoot, "rev-parse", "HEAD");
+	const baseTree = git(contributorRoot, "rev-parse", `${baseCommit}^{tree}`);
+	writeFileSync(join(contributorRoot, "committed-extra.txt"), "committed candidate addition\n");
+	git(contributorRoot, "add", "committed-extra.txt");
+	git(contributorRoot, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "candidate adds file");
+	writeFileSync(join(contributorRoot, "tracked.txt"), "tracked with workspace correction\n");
+	git(contributorRoot, "add", "-A");
+	const candidateTree = git(contributorRoot, "write-tree");
+	const registry = new CandidateViewRegistry();
+	const view = registry.restoreForFinalizeFromNative("base-diff-finalize-committed", contributorRoot, {
+		kind: "base-diff",
+		baseTree,
+		currentCandidateTree: candidateTree,
+		paths: ["committed-extra.txt", "tracked.txt"],
+		intendedUntracked: [],
+		projection: "workspace",
+	});
+	try {
+		assert.equal(view.baseCommit, baseCommit);
+		assert.equal(view.baseTree, baseTree);
+		assert.equal(view.candidateTree, candidateTree);
+		assert.equal(view.committedOnly, false);
+		assert.equal(readFileSync(join(view.root, "committed-extra.txt"), "utf8"), "committed candidate addition\n");
+		assert.equal(readFileSync(join(view.root, "tracked.txt"), "utf8"), "tracked with workspace correction\n");
+		// The base+workspace path would seed the detached worktree at base, leaving the candidate view
+		// root's HEAD pointing at the base commit while the contributor HEAD points at the candidate
+		// commit. With baseDiff: true the worktree seeds at HEAD so the candidate view is consistent.
+		assert.equal(git(view.root, "rev-parse", "HEAD"), git(contributorRoot, "rev-parse", "HEAD"));
+		view.verify();
+	} finally {
+		view.cleanup();
+	}
+});
+
 test("fresh registries restore only one exact authoritative reviewing candidate and reject zero or multiple matches", (t) => {
 	const contributorRoot = repository(t);
 	writeFileSync(join(contributorRoot, "tracked.txt"), "reviewing\n");
