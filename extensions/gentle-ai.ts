@@ -4408,7 +4408,9 @@ function nativeOperationFailure(operation: ReviewControllerOperation, error: unk
 		? nativeDiagnostics
 		: operation === REVIEW_CONTROLLER_OPERATION.START && error instanceof CandidateViewError && value.candidateViewPreNative === true
 			? { code: error.reason, message: "candidate view rejected before native START" }
-			: undefined;
+			: operation === REVIEW_CONTROLLER_OPERATION.VALIDATE && mutationOutcome === "none" && error instanceof Error
+				? { code: "lifecycle-command-binding-failed", message: error.message }
+				: undefined;
 	return {
 		operation,
 		status: "blocked",
