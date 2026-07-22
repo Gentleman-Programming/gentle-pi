@@ -1,11 +1,21 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import codeGraphTools, {
+	createCodeGraphRunner,
 	createCodeGraphTool,
 	type CodeGraphRunner,
 } from "../extensions/codegraph-tools.ts";
@@ -17,8 +27,27 @@ function workspace(t: test.TestContext): string {
 	return cwd;
 }
 
+test("runner preserves direct shell-free Unix execution", async () => {
+	const signal = new AbortController().signal;
+	const calls: Array<{ file: string; args: string[]; options: Record<string, unknown> }> = [];
+	const runner = createCodeGraphRunner({
+		execFile: async (file, args, options) => {
+			calls.push({ file, args, options });
+			return { stdout: "ok", stderr: "" };
+		},
+	});
+
+	await runner(["query", "--", "a;b"], { cwd: "/repo", signal, maxBuffer: 99 });
+	assert.deepEqual(calls, [
+		{ file: "codegraph", args: ["query", "--", "a;b"], options: { cwd: "/repo", signal, maxBuffer: 99 } },
+	]);
+	assert.equal(calls[0]?.options.signal, signal);
+});
+
 test("CodeGraph tool rejects non-project, nested-project, HOME, and temporary workspaces before init", async (t) => {
-	const nonProject = mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-non-project-"));
+	const nonProject = mkdtempSync(
+		join(tmpdir(), "gentle-pi-codegraph-non-project-"),
+	);
 	t.after(() => rmSync(nonProject, { recursive: true, force: true }));
 	const root = workspace(t);
 	const nested = join(root, "nested");
@@ -30,7 +59,10 @@ test("CodeGraph tool rejects non-project, nested-project, HOME, and temporary wo
 	});
 	for (const cwd of [nonProject, nested, homedir(), tmpdir()]) {
 		await assert.rejects(
-			() => tool.execute("test", { operation: "init" }, undefined, undefined, { cwd } as ExtensionContext),
+			() =>
+				tool.execute("test", { operation: "init" }, undefined, undefined, {
+					cwd,
+				} as ExtensionContext),
 			/real Git project root equal to the current workspace/i,
 		);
 	}
@@ -52,7 +84,13 @@ test("CodeGraph tool runs only fixed cwd-scoped init, query, and explore command
 		{ operation: "query", query: "buildGentlePrompt", limit: 4 },
 		{ operation: "explore", query: "review gate", limit: 3 },
 	] as const) {
-		const result = await tool.execute("test", parameters, undefined, undefined, ctx);
+		const result = await tool.execute(
+			"test",
+			parameters,
+			undefined,
+			undefined,
+			ctx,
+		);
 		assert.deepEqual(result.content, [{ type: "text", text: "indexed" }]);
 	}
 
@@ -87,7 +125,10 @@ test("CodeGraph tool rejects pre-existing .codegraph symlinks and non-directorie
 		});
 
 		await assert.rejects(
-			() => tool.execute("test", { operation: "init" }, undefined, undefined, { cwd } as ExtensionContext),
+			() =>
+				tool.execute("test", { operation: "init" }, undefined, undefined, {
+					cwd,
+				} as ExtensionContext),
 			/must be a real directory/i,
 		);
 		assert.equal(calls, 0, `${kind} index must not execute CodeGraph`);
@@ -103,7 +144,13 @@ test("CodeGraph tool passes hyphen-leading queries after the option terminator",
 	});
 	const ctx = { cwd } as ExtensionContext;
 
-	await tool.execute("test", { operation: "query", query: "--help" }, undefined, undefined, ctx);
+	await tool.execute(
+		"test",
+		{ operation: "query", query: "--help" },
+		undefined,
+		undefined,
+		ctx,
+	);
 
 	assert.deepEqual(calls, [
 		["query", "--path", cwd, "--limit", "10", "--", "--help"],
@@ -112,22 +159,33 @@ test("CodeGraph tool passes hyphen-leading queries after the option terminator",
 
 test("CodeGraph tool returns structured fallback instructions when the binary is unavailable", async (t) => {
 	const cwd = workspace(t);
-	const unavailable = Object.assign(new Error("spawn codegraph ENOENT"), { code: "ENOENT" });
+	const unavailable = Object.assign(new Error("spawn codegraph ENOENT"), {
+		code: "ENOENT",
+	});
 	const tool = createCodeGraphTool(async () => {
 		throw unavailable;
 	});
 	const ctx = { cwd } as ExtensionContext;
 
-	const result = await tool.execute("test", { operation: "query", query: "symbol" }, undefined, undefined, ctx);
+	const result = await tool.execute(
+		"test",
+		{ operation: "query", query: "symbol" },
+		undefined,
+		undefined,
+		ctx,
+	);
 
-	assert.deepEqual(result.content, [{
-		type: "text",
-		text: "CodeGraph is unavailable because the codegraph binary was not found. Use read, grep, and find for this exploration.",
-	}]);
+	assert.deepEqual(result.content, [
+		{
+			type: "text",
+			text: "CodeGraph is unavailable because the codegraph binary was not found. Use read, grep, and find for this exploration.",
+		},
+	]);
 	assert.deepEqual(result.details, {
 		status: "unavailable",
 		operation: "query",
 		cwd,
+		args: ["query", "--path", cwd, "--limit", "10", "--", "symbol"],
 		fallback: "Use read, grep, and find for this exploration.",
 	});
 });
@@ -139,16 +197,25 @@ test("CodeGraph tool returns fallback instructions when CodeGraph fails", async 
 	});
 	const ctx = { cwd } as ExtensionContext;
 
-	const result = await tool.execute("test", { operation: "explore", query: "call path" }, undefined, undefined, ctx);
+	const result = await tool.execute(
+		"test",
+		{ operation: "explore", query: "call path" },
+		undefined,
+		undefined,
+		ctx,
+	);
 
-	assert.deepEqual(result.content, [{
-		type: "text",
-		text: "CodeGraph failed to run. Use read, grep, and find for this exploration.",
-	}]);
+	assert.deepEqual(result.content, [
+		{
+			type: "text",
+			text: "CodeGraph failed to run. Use read, grep, and find for this exploration.",
+		},
+	]);
 	assert.deepEqual(result.details, {
 		status: "failed",
 		operation: "explore",
 		cwd,
+		args: ["explore", "--path", cwd, "--max-files", "10", "--", "call path"],
 		fallback: "Use read, grep, and find for this exploration.",
 	});
 });
@@ -162,10 +229,19 @@ test("CodeGraph tool configures a process buffer above the returned-output trunc
 	});
 	const ctx = { cwd } as ExtensionContext;
 
-	const result = await tool.execute("test", { operation: "explore", query: "large result" }, undefined, undefined, ctx);
+	const result = await tool.execute(
+		"test",
+		{ operation: "explore", query: "large result" },
+		undefined,
+		undefined,
+		ctx,
+	);
 
 	assert.ok(maxBuffer > 100_000);
-	assert.match(result.content[0]?.text ?? "", /\[CodeGraph output truncated\]$/);
+	assert.match(
+		result.content[0]?.text ?? "",
+		/\[CodeGraph output truncated\]$/,
+	);
 });
 
 test("CodeGraph tool rejects incomplete or oversized query requests before running a process", async (t) => {
@@ -178,18 +254,27 @@ test("CodeGraph tool rejects incomplete or oversized query requests before runni
 	const ctx = { cwd } as ExtensionContext;
 
 	await assert.rejects(
-		() => tool.execute("test", { operation: "query" }, undefined, undefined, ctx),
+		() =>
+			tool.execute("test", { operation: "query" }, undefined, undefined, ctx),
 		/query is required/i,
 	);
 	await assert.rejects(
-		() => tool.execute("test", { operation: "explore", query: "x", limit: 21 }, undefined, undefined, ctx),
+		() =>
+			tool.execute(
+				"test",
+				{ operation: "explore", query: "x", limit: 21 },
+				undefined,
+				undefined,
+				ctx,
+			),
 		/between 1 and 20/i,
 	);
 	assert.equal(calls, 0);
 });
 
 test("CodeGraph tool registration exposes a single constrained custom tool", () => {
-	const tools: Array<{ name: string; parameters: Record<string, unknown> }> = [];
+	const tools: Array<{ name: string; parameters: Record<string, unknown> }> =
+		[];
 	const pi = {
 		registerTool(tool: { name: string; parameters: Record<string, unknown> }) {
 			tools.push(tool);
