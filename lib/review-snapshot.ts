@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import {
 	chmodSync,
 	existsSync,
+	lstatSync,
 	mkdtempSync,
 	mkdirSync,
 	readFileSync,
@@ -153,11 +154,7 @@ export interface CorrectionSnapshotV1 {
 
 const OBJECT_ID = /^[0-9a-f]{40,64}$/;
 
-function runGit(
-	cwd: string,
-	args: readonly string[],
-	environment: GitEnvironment = {},
-): string {
+function gitEnvironment(environment: GitEnvironment): NodeJS.ProcessEnv {
 	const env = reviewGitEnvironment();
 	if (environment.indexFile) env.GIT_INDEX_FILE = environment.indexFile;
 	if (environment.objectDirectory) {
@@ -166,12 +163,34 @@ function runGit(
 	if (environment.alternateObjectDirectory) {
 		env.GIT_ALTERNATE_OBJECT_DIRECTORIES = environment.alternateObjectDirectory;
 	}
+	return env;
+}
+
+function runGit(
+	cwd: string,
+	args: readonly string[],
+	environment: GitEnvironment = {},
+	input?: Uint8Array,
+): string {
 	return execFileSync("git", args, {
 		cwd,
 		encoding: "utf8",
-		stdio: ["ignore", "pipe", "pipe"],
-		env,
+		stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+		env: gitEnvironment(environment),
+		input,
 	}).trim();
+}
+
+function runGitBytes(
+	cwd: string,
+	args: readonly string[],
+	environment: GitEnvironment = {},
+): Buffer {
+	return execFileSync("git", args, {
+		cwd,
+		stdio: ["ignore", "pipe", "pipe"],
+		env: gitEnvironment(environment),
+	});
 }
 
 function repositoryRoot(cwd: string): string {
@@ -243,6 +262,48 @@ export function discoverReviewUntrackedPaths(cwd: string): string[] {
 	return canonicalPaths(runGit(root, ["ls-files", "--others", "--exclude-standard", "-z"]));
 }
 
+function absentLiveIndexGitlinks(root: string): Buffer[] {
+	const output = runGitBytes(root, ["ls-files", "--stage", "-z"]);
+	const records: Buffer[] = [];
+	let start = 0;
+	while (start < output.length) {
+		const end = output.indexOf(0, start);
+		if (end < 0) throw new Error("Git returned a malformed NUL-delimited index entry");
+		const entry = output.subarray(start, end);
+		start = end + 1;
+		const tab = entry.indexOf(0x09);
+		if (tab < 0) throw new Error("Git returned a malformed staged index entry");
+		const header = entry.subarray(0, tab).toString("ascii").split(" ");
+		if (header.length !== 3) throw new Error("Git returned a malformed staged index header");
+		const [mode, oid, stage] = header;
+		const path = entry.subarray(tab + 1);
+		if (mode !== "160000" || stage !== "0") continue;
+		const worktreePath = Buffer.concat([Buffer.from(`${root}${sep}`), path]);
+		if (lstatSync(worktreePath, { throwIfNoEntry: false }) !== undefined) continue;
+		records.push(Buffer.concat([Buffer.from(`${mode} ${oid}\t`), path, Buffer.from([0])]));
+	}
+	return records;
+}
+
+function stageCompleteWorkspace(
+	root: string,
+	baseTree: string,
+	environment: GitEnvironment,
+): string {
+	const absentGitlinks = absentLiveIndexGitlinks(root);
+	runGit(root, ["read-tree", baseTree], environment);
+	runGit(root, ["add", "-A", "--", "."], environment);
+	if (absentGitlinks.length > 0) {
+		runGit(
+			root,
+			["update-index", "-z", "--index-info"],
+			environment,
+			Buffer.concat(absentGitlinks),
+		);
+	}
+	return runGit(root, ["write-tree"], environment);
+}
+
 export function deriveReviewSnapshotRisk(snapshot: SnapshotV1): ReviewRiskClassification {
 	const root = repositoryRoot(snapshot.repository_root);
 	const environment: GitEnvironment = {
@@ -303,9 +364,7 @@ export function captureLiveReviewCandidateBinding(options: {
 	};
 	try {
 		const baseTree = resolveBaseTree(root);
-		runGit(root, ["read-tree", baseTree], environment);
-		runGit(root, ["add", "-A", "--", "."], environment);
-		const completeSnapshotTree = runGit(root, ["write-tree"], environment);
+		const completeSnapshotTree = stageCompleteWorkspace(root, baseTree, environment);
 		return {
 			repository_id: options.repositoryId,
 			base_tree: baseTree,
@@ -345,9 +404,7 @@ export function captureReviewSnapshot(
 		alternateObjectDirectory,
 	};
 	try {
-		runGit(root, ["read-tree", baseTree], gitEnvironment);
-		runGit(root, ["add", "-A", "--", "."], gitEnvironment);
-		const completeSnapshotTree = runGit(root, ["write-tree"], gitEnvironment);
+		const completeSnapshotTree = stageCompleteWorkspace(root, baseTree, gitEnvironment);
 		const intendedUntracked = discoverReviewUntrackedPaths(root);
 		let projection: ReviewProjectionV1;
 		let initialReviewTree: string;
