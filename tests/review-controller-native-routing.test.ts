@@ -1157,6 +1157,36 @@ test("ambiguous native START failure preserves rebuilt sanitized diagnostics acr
 	assert.equal((details.reconciliation_failure as { outcome?: string }).outcome, "native-operation-failed");
 });
 
+test("negotiated unknown START reconciled to start without lineage exposes only sanitized diagnostics", async (t) => {
+	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-native-controller-"));
+	t.after(() => rmSync(cwd, { recursive: true, force: true }));
+	const error = Object.assign(new Error("native negotiated START failed"), {
+		name: "NativeReviewIntegrationError",
+		mutationOutcome: "unknown",
+		nextAction: "review.status",
+		diagnostics: { operation: "review/start", error_code: "non-zero", exit_code: 1, timed_out: false, output_limit_exceeded: false, stderr: "native failure token=super-secret" },
+		failureEnvelope: {
+			raw: { message: "raw negotiated failure token=super-secret", stdout: "must never be public" },
+			mutationOutcome: "unknown",
+			replayability: "status_required",
+			nextAction: "review.status",
+		},
+	});
+	const { controller } = runtime(fakeNative({
+		start: async () => { throw error; },
+		targetStatus: async () => targetStatusFixture({ applicability: "unrelated", action: "start" }),
+	}));
+	const result = await controller.execute("start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	const details = result.details as Record<string, unknown>;
+	assert.equal(details.outcome, "native-mutation-status-reconciled");
+	assert.equal(details.mutation_outcome, "unknown");
+	assert.equal(details.next_action, "start");
+	assert.deepEqual(details.diagnostics, { operation: "review/start", error_code: "non-zero", exit_code: 1, timed_out: false, output_limit_exceeded: false, stderr: "native failure token=[REDACTED]" });
+	assert.equal("native_failure" in details, false);
+	assert.equal(JSON.stringify(details).includes("super-secret"), false);
+	assert.equal(JSON.stringify(details).includes("must never be public"), false);
+});
+
 test("foreign errors with unrecognized diagnostics shapes stay diagnostics-free", async (t) => {
 	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-native-controller-"));
 	t.after(() => rmSync(cwd, { recursive: true, force: true }));

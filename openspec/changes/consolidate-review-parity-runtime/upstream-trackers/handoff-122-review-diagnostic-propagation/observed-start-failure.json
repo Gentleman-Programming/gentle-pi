@@ -1,0 +1,14 @@
+{
+  "provider_diagnostic": {
+    "operation": "review/start",
+    "error_code": "non-zero",
+    "exit_code": 1,
+    "timeout": false,
+    "output_limit": false,
+    "stderr": "Error: The negotiated review operation failed without authoritative mutation evidence. [operation_outcome_unknown]"
+  },
+  "status_reconciliation": {
+    "lineage": null,
+    "action": "start"
+  }
+}
