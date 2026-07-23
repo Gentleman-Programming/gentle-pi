@@ -1,0 +1,166 @@
+diff --git a/extensions/gentle-ai.ts b/extensions/gentle-ai.ts
+index c6c7ac91..dc2f1439 100644
+--- a/extensions/gentle-ai.ts
++++ b/extensions/gentle-ai.ts
+@@ -105,6 +105,7 @@ import {
+ 	nativeReviewLegacyQuarantineAuthorization,
+ 	nativeReviewReconcileAuthorization,
+ 	NativeReviewCliError,
++	NativeReviewIntegrationError,
+ 	NATIVE_REVIEW_ERROR_CODE,
+ 	NATIVE_REVIEW_LEGACY_QUARANTINE,
+ 	NATIVE_REVIEW_LEGACY_ALIAS_REPAIR,
+@@ -3836,11 +3837,13 @@ function nativeStatusUnsupported(operation: ReviewControllerOperation): Record<s
+ // Bundled and source module instances can coexist, making instanceof insufficient.
+ function asNativeReviewCliError(error: unknown): { code: string; diagnostics: NativeReviewProcessDiagnostics } | undefined {
+ 	if (error instanceof NativeReviewCliError) return error;
+-	if (!(error instanceof Error) || error.name !== "NativeReviewCliError") return undefined;
++	if (error instanceof NativeReviewIntegrationError) return { code: error.diagnostics.error_code, diagnostics: error.diagnostics };
++	if (!(error instanceof Error) || !["NativeReviewCliError", "NativeReviewIntegrationError"].includes(error.name)) return undefined;
+ 	const value = error as unknown as { code?: unknown; diagnostics?: unknown };
+-	if (typeof value.code !== "string") return undefined;
+ 	const diagnostics = sanitizeForeignNativeReviewDiagnostics(value.diagnostics);
+-	return diagnostics === undefined || value.code !== diagnostics.error_code ? undefined : { code: value.code, diagnostics };
++	if (diagnostics === undefined) return undefined;
++	if (error.name === "NativeReviewIntegrationError") return { code: diagnostics.error_code, diagnostics };
++	return typeof value.code === "string" && value.code === diagnostics.error_code ? { code: value.code, diagnostics } : undefined;
+ }
+ 
+ function nativeStatusFailed(operation: ReviewControllerOperation, error: unknown): Record<string, unknown> {
+@@ -4387,28 +4390,28 @@ function nativeStartRejection(reason: string, field?: string): Record<string, un
+ 
+ function nativeOperationFailure(operation: ReviewControllerOperation, error: unknown): Record<string, unknown> {
+ 	const value = error as { mutationOutcome?: unknown; nextAction?: unknown; diagnostics?: unknown; auditRecord?: unknown; launchAttempted?: unknown; candidateViewPreNative?: unknown; failureEnvelope?: { raw?: unknown; mutationOutcome?: unknown; replayability?: unknown; nextAction?: unknown } };
++	const nativeDiagnostics = asNativeReviewCliError(error)?.diagnostics;
++	const diagnostics = nativeDiagnostics?.operation === `review/${operation}`
++		? nativeDiagnostics
++		: operation === REVIEW_CONTROLLER_OPERATION.START && error instanceof CandidateViewError && value.candidateViewPreNative === true
++			? { code: error.reason, message: "candidate view rejected before native START" }
++			: undefined;
+ 	if (isRecord(value.failureEnvelope) && isRecord(value.failureEnvelope.raw)) {
+ 		const mutationOutcome = value.failureEnvelope.mutationOutcome;
+ 		return {
+ 			operation,
+ 			status: "blocked",
+-			native_failure: value.failureEnvelope.raw,
+ 			...(mutationOutcome === "committed"
+ 				? { mutation_performed: true, mutation_outcome: "committed" }
+ 				: mutationOutcome === "unknown"
+ 					? { mutation_outcome: "unknown" }
+ 					: { mutation_performed: false, mutation_outcome: "none" }),
++			...(diagnostics === undefined ? {} : { diagnostics }),
+ 			...(typeof value.failureEnvelope.replayability === "string" ? { replayability: value.failureEnvelope.replayability } : {}),
+ 			...(typeof value.failureEnvelope.nextAction === "string" ? { next_action: value.failureEnvelope.nextAction } : {}),
+ 		};
+ 	}
+ 	const mutationOutcome = value.mutationOutcome === "unknown" ? "unknown" : "none";
+-	const nativeDiagnostics = asNativeReviewCliError(error)?.diagnostics;
+-	const diagnostics = nativeDiagnostics?.operation === `review/${operation}`
+-		? nativeDiagnostics
+-		: operation === REVIEW_CONTROLLER_OPERATION.START && error instanceof CandidateViewError && value.candidateViewPreNative === true
+-			? { code: error.reason, message: "candidate view rejected before native START" }
+-			: undefined;
+ 	return {
+ 		operation,
+ 		status: "blocked",
+diff --git a/lib/native-review-cli.ts b/lib/native-review-cli.ts
+index 76846e64..ba49d137 100644
+--- a/lib/native-review-cli.ts
++++ b/lib/native-review-cli.ts
+@@ -1182,13 +1182,15 @@ export class NativeReviewIntegrationError extends Error {
+ 	readonly failureEnvelope: ReviewFailureV1;
+ 	readonly mutationOutcome: ReviewFailureV1["mutationOutcome"];
+ 	readonly nextAction: string;
++	readonly diagnostics: NativeReviewProcessDiagnostics;
+ 	readonly launchAttempted = true;
+-	constructor(failure: ReviewFailureV1) {
++	constructor(failure: ReviewFailureV1, diagnostics: NativeReviewProcessDiagnostics) {
+ 		super(failure.message);
+ 		this.name = "NativeReviewIntegrationError";
+ 		this.failureEnvelope = failure;
+ 		this.mutationOutcome = failure.mutationOutcome;
+ 		this.nextAction = failure.nextAction;
++		this.diagnostics = diagnostics;
+ 	}
+ }
+ 
+@@ -1285,7 +1287,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
+ 		const body = parseJson(result.stdout, operation, mutating, diagnostics);
+ 		if (result.exitCode !== 0) {
+ 			try {
+-				throw new NativeReviewIntegrationError(decodeReviewFailureV1(body));
++				throw new NativeReviewIntegrationError(decodeReviewFailureV1(body), diagnostics);
+ 			} catch (error) {
+ 				if (error instanceof NativeReviewIntegrationError) throw error;
+ 				throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, operation, mutating, "native negotiated operation failed without a valid failure envelope", result);
+diff --git a/runtime/native-review-cli.mjs b/runtime/native-review-cli.mjs
+index 07243444..dc075af4 100644
+--- a/runtime/native-review-cli.mjs
++++ b/runtime/native-review-cli.mjs
+@@ -1183,13 +1183,15 @@ export class NativeReviewIntegrationError extends Error {
+ 	         failureEnvelope                 ;
+ 	         mutationOutcome                                    ;
+ 	         nextAction        ;
++	         diagnostics                                ;
+ 	         launchAttempted = true;
+-	constructor(failure                 ) {
++	constructor(failure                 , diagnostics                                ) {
+ 		super(failure.message);
+ 		this.name = "NativeReviewIntegrationError";
+ 		this.failureEnvelope = failure;
+ 		this.mutationOutcome = failure.mutationOutcome;
+ 		this.nextAction = failure.nextAction;
++		this.diagnostics = diagnostics;
+ 	}
+ }
+ 
+@@ -1286,7 +1288,7 @@ export class NativeReviewCliV216                            {
+ 		const body = parseJson(result.stdout, operation, mutating, diagnostics);
+ 		if (result.exitCode !== 0) {
+ 			try {
+-				throw new NativeReviewIntegrationError(decodeReviewFailureV1(body));
++				throw new NativeReviewIntegrationError(decodeReviewFailureV1(body), diagnostics);
+ 			} catch (error) {
+ 				if (error instanceof NativeReviewIntegrationError) throw error;
+ 				throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, operation, mutating, "native negotiated operation failed without a valid failure envelope", result);
+diff --git a/tests/review-controller-native-routing.test.ts b/tests/review-controller-native-routing.test.ts
+index 8e6261be..797f7b3a 100644
+--- a/tests/review-controller-native-routing.test.ts
++++ b/tests/review-controller-native-routing.test.ts
+@@ -1157,6 +1157,36 @@ test("ambiguous native START failure preserves rebuilt sanitized diagnostics acr
+ 	assert.equal((details.reconciliation_failure as { outcome?: string }).outcome, "native-operation-failed");
+ });
+ 
++test("negotiated unknown START reconciled to start without lineage exposes only sanitized diagnostics", async (t) => {
++	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-native-controller-"));
++	t.after(() => rmSync(cwd, { recursive: true, force: true }));
++	const error = Object.assign(new Error("native negotiated START failed"), {
++		name: "NativeReviewIntegrationError",
++		mutationOutcome: "unknown",
++		nextAction: "review.status",
++		diagnostics: { operation: "review/start", error_code: "non-zero", exit_code: 1, timed_out: false, output_limit_exceeded: false, stderr: "native failure sensitive-value=[REDACTED_TEST_VALUE]" },
++		failureEnvelope: {
++			raw: { message: "raw negotiated failure sensitive-value=[REDACTED_TEST_VALUE]", stdout: "must never be public" },
++			mutationOutcome: "unknown",
++			replayability: "status_required",
++			nextAction: "review.status",
++		},
++	});
++	const { controller } = runtime(fakeNative({
++		start: async () => { throw error; },
++		targetStatus: async () => targetStatusFixture({ applicability: "unrelated", action: "start" }),
++	}));
++	const result = await controller.execute("start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
++	const details = result.details as Record<string, unknown>;
++	assert.equal(details.outcome, "native-mutation-status-reconciled");
++	assert.equal(details.mutation_outcome, "unknown");
++	assert.equal(details.next_action, "start");
++	assert.deepEqual(details.diagnostics, { operation: "review/start", error_code: "non-zero", exit_code: 1, timed_out: false, output_limit_exceeded: false, stderr: "native failure sensitive-value=[REDACTED]" });
++	assert.equal("native_failure" in details, false);
++	assert.equal(JSON.stringify(details).includes("[REDACTED_TEST_VALUE]"), false);
++	assert.equal(JSON.stringify(details).includes("must never be public"), false);
++});
++
+ test("foreign errors with unrecognized diagnostics shapes stay diagnostics-free", async (t) => {
+ 	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-native-controller-"));
+ 	t.after(() => rmSync(cwd, { recursive: true, force: true }));

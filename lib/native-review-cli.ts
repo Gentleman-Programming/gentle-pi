@@ -1182,13 +1182,15 @@ export class NativeReviewIntegrationError extends Error {
 	readonly failureEnvelope: ReviewFailureV1;
 	readonly mutationOutcome: ReviewFailureV1["mutationOutcome"];
 	readonly nextAction: string;
+	readonly diagnostics: NativeReviewProcessDiagnostics;
 	readonly launchAttempted = true;
-	constructor(failure: ReviewFailureV1) {
+	constructor(failure: ReviewFailureV1, diagnostics: NativeReviewProcessDiagnostics) {
 		super(failure.message);
 		this.name = "NativeReviewIntegrationError";
 		this.failureEnvelope = failure;
 		this.mutationOutcome = failure.mutationOutcome;
 		this.nextAction = failure.nextAction;
+		this.diagnostics = diagnostics;
 	}
 }
 
@@ -1285,7 +1287,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		const body = parseJson(result.stdout, operation, mutating, diagnostics);
 		if (result.exitCode !== 0) {
 			try {
-				throw new NativeReviewIntegrationError(decodeReviewFailureV1(body));
+				throw new NativeReviewIntegrationError(decodeReviewFailureV1(body), diagnostics);
 			} catch (error) {
 				if (error instanceof NativeReviewIntegrationError) throw error;
 				throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, operation, mutating, "native negotiated operation failed without a valid failure envelope", result);

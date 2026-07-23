@@ -105,6 +105,7 @@ import {
 	nativeReviewLegacyQuarantineAuthorization,
 	nativeReviewReconcileAuthorization,
 	NativeReviewCliError,
+	NativeReviewIntegrationError,
 	NATIVE_REVIEW_ERROR_CODE,
 	NATIVE_REVIEW_LEGACY_QUARANTINE,
 	NATIVE_REVIEW_LEGACY_ALIAS_REPAIR,
@@ -3836,11 +3837,13 @@ function nativeStatusUnsupported(operation: ReviewControllerOperation): Record<s
 // Bundled and source module instances can coexist, making instanceof insufficient.
 function asNativeReviewCliError(error: unknown): { code: string; diagnostics: NativeReviewProcessDiagnostics } | undefined {
 	if (error instanceof NativeReviewCliError) return error;
-	if (!(error instanceof Error) || error.name !== "NativeReviewCliError") return undefined;
+	if (error instanceof NativeReviewIntegrationError) return { code: error.diagnostics.error_code, diagnostics: error.diagnostics };
+	if (!(error instanceof Error) || !["NativeReviewCliError", "NativeReviewIntegrationError"].includes(error.name)) return undefined;
 	const value = error as unknown as { code?: unknown; diagnostics?: unknown };
-	if (typeof value.code !== "string") return undefined;
 	const diagnostics = sanitizeForeignNativeReviewDiagnostics(value.diagnostics);
-	return diagnostics === undefined || value.code !== diagnostics.error_code ? undefined : { code: value.code, diagnostics };
+	if (diagnostics === undefined) return undefined;
+	if (error.name === "NativeReviewIntegrationError") return { code: diagnostics.error_code, diagnostics };
+	return typeof value.code === "string" && value.code === diagnostics.error_code ? { code: value.code, diagnostics } : undefined;
 }
 
 function nativeStatusFailed(operation: ReviewControllerOperation, error: unknown): Record<string, unknown> {
@@ -4387,28 +4390,28 @@ function nativeStartRejection(reason: string, field?: string): Record<string, un
 
 function nativeOperationFailure(operation: ReviewControllerOperation, error: unknown): Record<string, unknown> {
 	const value = error as { mutationOutcome?: unknown; nextAction?: unknown; diagnostics?: unknown; auditRecord?: unknown; launchAttempted?: unknown; candidateViewPreNative?: unknown; failureEnvelope?: { raw?: unknown; mutationOutcome?: unknown; replayability?: unknown; nextAction?: unknown } };
-	if (isRecord(value.failureEnvelope) && isRecord(value.failureEnvelope.raw)) {
-		const mutationOutcome = value.failureEnvelope.mutationOutcome;
-		return {
-			operation,
-			status: "blocked",
-			native_failure: value.failureEnvelope.raw,
-			...(mutationOutcome === "committed"
-				? { mutation_performed: true, mutation_outcome: "committed" }
-				: mutationOutcome === "unknown"
-					? { mutation_outcome: "unknown" }
-					: { mutation_performed: false, mutation_outcome: "none" }),
-			...(typeof value.failureEnvelope.replayability === "string" ? { replayability: value.failureEnvelope.replayability } : {}),
-			...(typeof value.failureEnvelope.nextAction === "string" ? { next_action: value.failureEnvelope.nextAction } : {}),
-		};
-	}
-	const mutationOutcome = value.mutationOutcome === "unknown" ? "unknown" : "none";
 	const nativeDiagnostics = asNativeReviewCliError(error)?.diagnostics;
 	const diagnostics = nativeDiagnostics?.operation === `review/${operation}`
 		? nativeDiagnostics
 		: operation === REVIEW_CONTROLLER_OPERATION.START && error instanceof CandidateViewError && value.candidateViewPreNative === true
 			? { code: error.reason, message: "candidate view rejected before native START" }
 			: undefined;
+	if (isRecord(value.failureEnvelope) && isRecord(value.failureEnvelope.raw)) {
+		const mutationOutcome = value.failureEnvelope.mutationOutcome;
+		return {
+			operation,
+			status: "blocked",
+			...(mutationOutcome === "committed"
+				? { mutation_performed: true, mutation_outcome: "committed" }
+				: mutationOutcome === "unknown"
+					? { mutation_outcome: "unknown" }
+					: { mutation_performed: false, mutation_outcome: "none" }),
+			...(diagnostics === undefined ? {} : { diagnostics }),
+			...(typeof value.failureEnvelope.replayability === "string" ? { replayability: value.failureEnvelope.replayability } : {}),
+			...(typeof value.failureEnvelope.nextAction === "string" ? { next_action: value.failureEnvelope.nextAction } : {}),
+		};
+	}
+	const mutationOutcome = value.mutationOutcome === "unknown" ? "unknown" : "none";
 	return {
 		operation,
 		status: "blocked",

@@ -16,6 +16,7 @@ const fixture = (name: string): Record<string, unknown> => JSON.parse(readFileSy
 
 interface Result {
 	stdout: string;
+	stderr?: string;
 	exitCode?: number;
 }
 
@@ -27,7 +28,7 @@ function queued(results: Result[]): { adapter: ExecFileAdapter; calls: readonly 
 			calls.push({ arguments: request.arguments, timeoutMs: request.timeoutMs });
 			const result = results.shift();
 			if (result === undefined) throw new Error("unexpected native invocation");
-			return { stdout: result.stdout, stderr: "", exitCode: result.exitCode ?? 0, signal: null, timedOut: false, outputLimitExceeded: false };
+			return { stdout: result.stdout, stderr: result.stderr ?? "", exitCode: result.exitCode ?? 0, signal: null, timedOut: false, outputLimitExceeded: false };
 		},
 	};
 }
@@ -52,17 +53,24 @@ test("v2.1.7 negotiates once per verified digest and binds every operation argv"
 	assert.equal(queue.calls[1]?.timeoutMs, undefined);
 });
 
-test("v2.1.7 preserves the native uniform failure envelope", async () => {
+test("v2.1.7 attaches diagnostics to a non-zero native failure envelope before controller sanitization", async () => {
 	clearNativeReviewCapabilitiesCacheForTesting();
 	const digest = "dcc846103b16d365eaeeb9d7f289c23fc4f2897f23def1cb3fe7f05557b64705";
 	const queue = queued([
 		{ stdout: JSON.stringify(fixture("capabilities.fixture.json")) },
-		{ stdout: JSON.stringify(fixture("failure.fixture.json")), exitCode: 1 },
+		{ stdout: JSON.stringify(fixture("failure.fixture.json")), stderr: "native transport token=super-secret", exitCode: 1 },
 	]);
 	const client = new NativeReviewCliV216(queue.adapter, "/package/gentle-ai", 321, 654, undefined, () => digest);
 	await assert.rejects(
 		() => client.finalize({ cwd: "/repo", lineageId: "review-failure-fixture" }),
-		(error: unknown) => error instanceof NativeReviewIntegrationError && error.failureEnvelope.code === "gate_scope_changed" && error.mutationOutcome === "not_started" && error.nextAction === "explicit-maintainer-action",
+		(error: unknown) => {
+			if (!(error instanceof NativeReviewIntegrationError)) return false;
+			assert.equal(error.failureEnvelope.code, "gate_scope_changed");
+			assert.equal(error.mutationOutcome, "not_started");
+			assert.equal(error.nextAction, "explicit-maintainer-action");
+			assert.deepEqual(error.diagnostics, { operation: "review/finalize", error_code: NATIVE_REVIEW_ERROR_CODE.NON_ZERO, exit_code: 1, timed_out: false, output_limit_exceeded: false, stderr: "native transport token=[REDACTED]", denial: undefined });
+			return true;
+		},
 	);
 });
 

@@ -7,7 +7,7 @@ import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
-import { NATIVE_REVIEW_ERROR_CODE, NATIVE_REVIEW_OPERATION, NativeReviewCliError, NativeReviewCliV214 as NativeReviewCliV214Production, type NativeReviewCli, type NativeReviewStatusResult } from "../lib/native-review-cli.ts";
+import { NATIVE_REVIEW_ERROR_CODE, NATIVE_REVIEW_OPERATION, NativeReviewCliError, NativeReviewIntegrationError, NativeReviewCliV214 as NativeReviewCliV214Production, type NativeReviewCli, type NativeReviewStatusResult } from "../lib/native-review-cli.ts";
 
 // Queued-adapter clients never execute a real process; default to a fixed absolute
 // package-local path so these tests do not depend on an installed binary
@@ -23,7 +23,7 @@ import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 import { inspectLegacyReviewAuthorityV1 } from "../lib/review-legacy-detector.ts";
 import { resolveRepositoryAuthorityV1 } from "../lib/review-repository.ts";
 import { NATIVE_REVIEW_REMEDIATION, classifyNativeReviewRemediation } from "../lib/native-review-remediation.ts";
-import type { ReviewStatusV1 } from "../lib/review-integration-v1.ts";
+import { decodeReviewFailureV1, type ReviewStatusV1 } from "../lib/review-integration-v1.ts";
 
 interface RegisteredTool {
 	execute: (
@@ -1155,6 +1155,38 @@ test("ambiguous native START failure preserves rebuilt sanitized diagnostics acr
 	assert.equal(details.mutation_outcome, "unknown");
 	assert.deepEqual(details.diagnostics, { operation: "review/start", error_code: "timeout", exit_code: 1, timed_out: true, output_limit_exceeded: false, stderr: "projection stalled token=[REDACTED]" });
 	assert.equal((details.reconciliation_failure as { outcome?: string }).outcome, "native-operation-failed");
+});
+
+test("negotiated unknown START reconciled to start without lineage exposes only sanitized diagnostics", async (t) => {
+	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-native-controller-"));
+	t.after(() => rmSync(cwd, { recursive: true, force: true }));
+	const error = new NativeReviewIntegrationError(decodeReviewFailureV1({
+		schema: "gentle-ai.review-integration.failure/v1",
+		contract: "gentle-ai.review-integration/v1",
+		operation: "review.start",
+		phase: "native_running",
+		code: "native_failure",
+		message: "raw negotiated failure token=super-secret",
+		mutation_outcome: "unknown",
+		authority_applicability: "current_target",
+		retry_safe: false,
+		replayability: "status_required",
+		required_inputs: [],
+		next_action: "review.status",
+	}), { operation: "review/start", error_code: "non-zero", exit_code: 1, timed_out: false, output_limit_exceeded: false, stderr: "native failure token=[REDACTED]" });
+	const { controller } = runtime(fakeNative({
+		start: async () => { throw error; },
+		targetStatus: async () => targetStatusFixture({ applicability: "unrelated", action: "start" }),
+	}));
+	const result = await controller.execute("start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	const details = result.details as Record<string, unknown>;
+	assert.equal(details.outcome, "native-mutation-status-reconciled");
+	assert.equal(details.mutation_outcome, "unknown");
+	assert.equal(details.next_action, "start");
+	assert.deepEqual(details.diagnostics, { operation: "review/start", error_code: "non-zero", exit_code: 1, timed_out: false, output_limit_exceeded: false, stderr: "native failure token=[REDACTED]" });
+	assert.equal("native_failure" in details, false);
+	assert.equal(JSON.stringify(details).includes("super-secret"), false);
+	assert.equal(JSON.stringify(details).includes("must never be public"), false);
 });
 
 test("foreign errors with unrecognized diagnostics shapes stay diagnostics-free", async (t) => {

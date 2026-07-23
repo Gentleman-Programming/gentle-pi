@@ -1,0 +1,49 @@
+{
+  "schema": "gentle-pi.maintainer-handoff/v1",
+  "purpose": "Sanitized evidence bundle for review diagnostic propagation",
+  "source": {
+    "base_ref": "v1.2.0",
+    "base_revision": "113906a34c1b527ba2d65806b7638bff32b8e916",
+    "branch": "fix/review-diagnostic-propagation",
+    "head_revision": "4d5214b410d352712be20917e81f9ce5974d039a"
+  },
+  "files": [
+    {
+      "path": "README.md",
+      "sha256": "56841d9ce241ace7ff72e254c21e0eb209f063e77795e9b2b648f056d5369450"
+    },
+    {
+      "path": "reproduction.md",
+      "sha256": "16a7cf27845836964ad1226e83716a633fa91840119e3229c154de5f710aab3c"
+    },
+    {
+      "path": "validation.md",
+      "sha256": "9064474c6af33db2818cc24e615c1ad54c5ce5bbafa59355dbcee80b53b15543"
+    },
+    {
+      "path": "observed-start-failure.json",
+      "sha256": "c2cc93f07cc7a4189a4e041876446cdba7c73551d777963859f997d88849a4ae"
+    },
+    {
+      "path": "patch.diff",
+      "sha256": "04adf42c47708da212ba011b81764782629fa173ce9ee42552cbc8202379cbea"
+    },
+    {
+      "path": "reference/failure.schema.json",
+      "sha256": "11284601a00e0192c41b1f3aab0b153635e28ad57ec5f1e2e90a69d129296c44"
+    },
+    {
+      "path": "reference/failure.fixture.json",
+      "sha256": "e72b6ab5e3c529abac47bd324444f84ca90f67ef0a67189f5fd8d24d199a2759"
+    }
+  ],
+  "exclusions": [
+    "The handoff directory itself is excluded from patch.diff.",
+    "Untracked files and dependency directories are excluded from patch.diff.",
+    "manifest.json is excluded from the digest list because self-hashing is recursive.",
+    "No user paths, Git remotes, private authority data, real snapshots, credentials, or tokens are included.",
+    "The test-only sensitive sentinel in patch.diff is redacted; patch.diff is not apply-ready."
+  ],
+  "expected_invariant": "For a negotiated unknown review/start failure reconciled to start without a lineage, return only sanitized review/start diagnostics and never expose native_failure or raw failure-envelope content.",
+  "installed_validation": "Verified package-local Gentle AI v2.1.11 provisioning permits successful local provider inspection. A fresh ordinary START returned only the sanitized review/start non-zero operation_outcome_unknown diagnostic in observed-start-failure.json; reconciliation reported no lineage and action start. This proves Pi adapter propagation, not the native root cause. No replay is safe and this evidence cannot authorize a commit."
+}
