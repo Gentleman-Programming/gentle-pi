@@ -108,14 +108,17 @@ import {
 	NATIVE_REVIEW_ERROR_CODE,
 	NATIVE_REVIEW_LEGACY_QUARANTINE,
 	NATIVE_REVIEW_LEGACY_ALIAS_REPAIR,
+	NATIVE_REVIEW_MODE_OPERATION,
 	NATIVE_REVIEW_RECONCILE_ANOMALIES,
 	sanitizeForeignNativeReviewDiagnostics,
 	type NativeReviewCli,
 	type NativeFinalizeResult,
+	type NativeReviewModeOperation,
 	type NativeReviewProcessDiagnostics,
 	type NativeStartResult,
 	type NativeValidateResult,
 } from "../lib/native-review-cli.ts";
+import { readReviewConsentLatch, recordReviewConsentLatch } from "../lib/review-consent-latch.ts";
 import type { ReviewStatusV1 } from "../lib/review-integration-v1.ts";
 
 const GRAPH_V1_ORDINARY_READ_ONLY = "Graph-v1 ordinary review authority is read-only; use native compact-v2 review operations";
@@ -3817,6 +3820,40 @@ function nativeStartPreAuthorityRejection(): NativeStartPreAuthorityRejection {
 	};
 }
 
+// Organic-rdd-parity Phase 3 (Design Decision #7): consulted once at the top
+// of the ORDINARY START branch, before targetStatus. Dark until the
+// negotiated version reports the `mode` capability true — `reviewMode`
+// throws VERSION_INCOMPATIBLE in that case, which this treats identically to
+// "capability absent" (today's path unchanged), never as a failure. Any
+// other error (a real native process failure) still surfaces through the
+// caller's existing nativeOperationFailure handling.
+const REVIEW_MODE_DISABLED_OUTCOME = "review-mode-disabled";
+
+function nativeReviewModeSkipped(operation: ReviewControllerOperation): Record<string, unknown> {
+	return {
+		operation,
+		status: "skipped",
+		outcome: REVIEW_MODE_DISABLED_OUTCOME,
+		...nativeStartPreAuthorityRejection(),
+	};
+}
+
+async function resolveReviewModeGate(
+	nativeReviewCli: NativeReviewCli | null,
+	operation: ReviewControllerOperation,
+	cwd: string,
+	signal: AbortSignal | undefined,
+): Promise<Record<string, unknown> | undefined> {
+	if (nativeReviewCli?.reviewMode === undefined) return undefined;
+	try {
+		const mode = await nativeReviewCli.reviewMode({ cwd, operation: NATIVE_REVIEW_MODE_OPERATION.STATUS, ...(signal === undefined ? {} : { signal }) });
+		return mode.status.effective === "off" ? nativeReviewModeSkipped(operation) : undefined;
+	} catch (error) {
+		if (asNativeReviewCliError(error)?.code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE) return undefined;
+		throw error;
+	}
+}
+
 function nativeStatusUnsupported(operation: ReviewControllerOperation): Record<string, unknown> {
 	return {
 		operation,
@@ -4385,6 +4422,73 @@ function nativeStartRejection(reason: string, field?: string): Record<string, un
 	};
 }
 
+// Organic-rdd-parity Phase 4 (Design Decisions #3-#5): Pi's own two-option
+// consent question, distinct from and in addition to gentle-ai's own
+// internal headless notice tolerated in lib/native-review-cli.ts. Pi always
+// spawns gentle-ai without a TTY, so gentle-ai's own interactive prompt never
+// fires from Pi — this is Pi's own UI-layer question, asked once per clone.
+const REVIEW_CONSENT_TITLE = "Run the review now?";
+const REVIEW_CONSENT_VALUE_LINE = "Reviewing takes a bit longer, and it makes the result substantially safer.";
+const REVIEW_CONSENT_ANSWERS_LINE = "Yes = run the review now / No = not now, just this once";
+const REVIEW_CONSENT_OFF_PATH_LINE = "To turn reviews off for good, run /gentle:review-mode disable.";
+const REVIEW_CONSENT_HEADLESS_NOTICE = "Gentle AI reviewed this change without asking, because this session has no interface to answer on. Run /gentle:review-mode disable to turn reviews off, or /gentle:review-mode status to see the current setting.";
+const REVIEW_CONSENT_UNREADABLE_NOTICE = "Gentle AI could not read an answer, so it reviewed this change and will ask again next time.";
+
+function reviewConsentBody(riskEvidence: string): string {
+	return [
+		`Why: ${riskEvidence}`,
+		REVIEW_CONSENT_VALUE_LINE,
+		REVIEW_CONSENT_ANSWERS_LINE,
+		REVIEW_CONSENT_OFF_PATH_LINE,
+	].join("\n");
+}
+
+interface ReviewConsentDecision {
+	proceed: boolean;
+	consentNotice?: string;
+}
+
+// Ask after native START returns, before actor_binding — only when
+// lensesRequired is true AND riskEvidence is present (capability-gated: dark
+// whenever the negotiated version's riskEvidence capability is false).
+// Accept records the per-clone latch and proceeds. Decline persists nothing
+// and withholds actor_binding for this work unit only — the next work unit
+// (even the same candidate re-started) is asked again. Headless and an
+// unreadable answer both proceed with a notice, never blocking and never
+// consuming the latch.
+async function requestReviewConsent(
+	cwd: string,
+	riskEvidence: string,
+	context: ExtensionContext | undefined,
+): Promise<ReviewConsentDecision> {
+	let latched: boolean;
+	try {
+		latched = readReviewConsentLatch(cwd);
+	} catch {
+		// Unresolvable/shallow repository: no latch write, review proceeds
+		// (Threat Matrix, organic-rdd-parity).
+		latched = false;
+	}
+	if (latched) return { proceed: true };
+	if (context?.hasUI !== true) {
+		context?.ui.notify(REVIEW_CONSENT_HEADLESS_NOTICE, "info");
+		return { proceed: true, consentNotice: REVIEW_CONSENT_HEADLESS_NOTICE };
+	}
+	let accepted: boolean;
+	try {
+		accepted = await context.ui.confirm(REVIEW_CONSENT_TITLE, reviewConsentBody(riskEvidence));
+	} catch {
+		return { proceed: true, consentNotice: REVIEW_CONSENT_UNREADABLE_NOTICE };
+	}
+	if (!accepted) return { proceed: false };
+	try {
+		recordReviewConsentLatch(cwd);
+	} catch {
+		// Unresolvable repository: proceed without persisting (Threat Matrix).
+	}
+	return { proceed: true };
+}
+
 function nativeOperationFailure(operation: ReviewControllerOperation, error: unknown): Record<string, unknown> {
 	const value = error as { mutationOutcome?: unknown; nextAction?: unknown; diagnostics?: unknown; auditRecord?: unknown; launchAttempted?: unknown; candidateViewPreNative?: unknown; failureEnvelope?: { raw?: unknown; mutationOutcome?: unknown; replayability?: unknown; nextAction?: unknown } };
 	if (isRecord(value.failureEnvelope) && isRecord(value.failureEnvelope.raw)) {
@@ -4724,6 +4828,12 @@ async function executeReviewControllerOperation(
 			REVIEW_CONTROLLER_OPERATION.START,
 		);
 		if (rawStart.mode === REVIEW_MODE.ORDINARY) {
+			try {
+				const gated = await resolveReviewModeGate(nativeReviewCli, parameters.operation, defaultCwd, signal);
+				if (gated !== undefined) return gated;
+			} catch (error) {
+				return nativeOperationFailure(parameters.operation, error);
+			}
 			if (nativeReviewCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
 			if ("policyHash" in rawStart) return nativeStartRejection("legacy-policy-hash-unsupported");
 			const unknownField = Object.keys(rawStart).find((field) => !["mode", "baseRef", "committedOnly", "policyPath"].includes(field));
@@ -4771,6 +4881,13 @@ async function executeReviewControllerOperation(
 					...(policy.policyPath === undefined ? {} : { policyPath: policy.policyPath }),
 					...(signal === undefined ? {} : { signal }),
 				});
+				let consentNotice: string | undefined;
+				let consentDeclined = false;
+				if (result.lensesRequired && result.riskEvidence !== undefined) {
+					const decision = await requestReviewConsent(candidateView?.root ?? defaultCwd, result.riskEvidence, context);
+					consentNotice = decision.consentNotice;
+					consentDeclined = !decision.proceed;
+				}
 				if (candidateView && candidateViews && result.lensesRequired) {
 					const binding = { token: candidateView.token, lineageId: result.lineageId, selectedLenses: result.selectedLenses };
 					if (result.action === "resumed" && !candidateViews.hasCurrentBinding()) candidateViews.restoreCurrentFromNativeStart(binding);
@@ -4781,7 +4898,10 @@ async function executeReviewControllerOperation(
 				// to, and — when lenses must run — the exact frozen candidate the
 				// actors must read, so the caller can never silently launch review
 				// actors against a stale previously-active worktree (#166, #169).
-				const actorBinding = candidateView !== undefined && result.lensesRequired
+				// A declined organic-parity consent withholds actor_binding for this
+				// work unit only (Design Data Flow, organic-rdd-parity): the native
+				// START already ran and its result is still reported.
+				const actorBinding = candidateView !== undefined && result.lensesRequired && !consentDeclined
 					? {
 						workspace_root: defaultCwd,
 						candidate_root: candidateView.root,
@@ -4794,6 +4914,7 @@ async function executeReviewControllerOperation(
 					result: mapNativeStartResult(result),
 					workspace_root: defaultCwd,
 					...(actorBinding === undefined ? {} : { actor_binding: actorBinding }),
+					...(consentNotice === undefined ? {} : { consent_notice: consentNotice }),
 				};
 			} catch (error) {
 				if (error instanceof CandidateViewError && (error.reason === "base-ref-ambiguous" || error.reason === "base-ref-unresolvable" || error.reason === "base-ref-moved")) return nativeStartRejection(error.reason);
@@ -5394,6 +5515,8 @@ export async function enforceReviewGateAndCommandSafety(
 
 /** @internal */
 export const __testing = {
+	resolveReviewModeGate,
+	requestReviewConsent,
 	listAgentsFromDir,
 	listAgentsFromDirAsync,
 	listDiscoverableAgents,
@@ -5837,6 +5960,31 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 				lines.join("\n"),
 				lines.some((line) => line.startsWith("fail:")) ? "warning" : "info",
 			);
+		},
+	});
+
+	pi.registerCommand("gentle:review-mode", {
+		description: "Show or set the Gentle AI review-driven-development kill switch (status|disable|enable). Every sub-action is user-initiated only; Pi automation never toggles it.",
+		handler: async (args, ctx) => {
+			const subAction = args.trim().length === 0 ? NATIVE_REVIEW_MODE_OPERATION.STATUS : args.trim();
+			if (subAction !== NATIVE_REVIEW_MODE_OPERATION.STATUS && subAction !== NATIVE_REVIEW_MODE_OPERATION.ENABLE && subAction !== NATIVE_REVIEW_MODE_OPERATION.DISABLE) {
+				ctx.ui.notify(`Unknown /gentle:review-mode sub-action "${subAction}". Use status, disable, or enable.`, "warning");
+				return;
+			}
+			if (nativeReviewCli?.reviewMode === undefined) {
+				ctx.ui.notify("Gentle AI review mode is not available with the currently negotiated native version.", "info");
+				return;
+			}
+			try {
+				const result = await nativeReviewCli.reviewMode({ cwd: ctx.cwd, operation: subAction as NativeReviewModeOperation });
+				ctx.ui.notify(`review-driven development: ${result.status.effective} (decided by ${result.status.source})`, "info");
+			} catch (error) {
+				if (asNativeReviewCliError(error)?.code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE) {
+					ctx.ui.notify("Gentle AI review mode is not available with the currently negotiated native version.", "info");
+					return;
+				}
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
 		},
 	});
 

@@ -36,6 +36,7 @@ export const NATIVE_REVIEW_OPERATION = {
 	QUARANTINE_LEGACY: "review/quarantine-legacy",
 	RECONCILE_AUTHORITY: "review/reconcile-authority",
 	REPAIR_LEGACY_ALIAS: "review/repair-legacy-alias",
+	MODE: "review/mode",
 }         ;
 
 
@@ -105,6 +106,70 @@ export const NATIVE_SDD_ARTIFACT_STATE = {
 
 
 
+
+	                                                          
+
+
+
+
+export const NATIVE_REVIEW_MODE_OPERATION = {
+	STATUS: "status",
+	ENABLE: "enable",
+	DISABLE: "disable",
+}         ;
+
+
+export const NATIVE_REVIEW_MODE_VALUE = {
+	UNSET: "",
+	ON: "on",
+	OFF: "off",
+}         ;
+
+
+export const NATIVE_REVIEW_MODE_SOURCE = {
+	DEFAULT: "default",
+	GLOBAL: "global",
+	CLONE_LOCAL: "clone_local",
+}         ;
+
+
+export const NATIVE_REVIEW_MODE_SCOPE = {
+	GLOBAL: "global",
+	CLONE: "clone",
+	BOTH: "both",
+}         ;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// Exact-match tolerated-stderr allowlist for START only, gated on the `mode`
+// capability being true (Design Decision #6, organic-rdd-parity). Byte-exact
+// against gentle-ai's headless notice (internal/cli/review_mode.go
+// reviewConsentSkippedNotice) written when the switch is on but no interactive
+// terminal answered the one-time consent question — which is always true when
+// Pi spawns gentle-ai without a TTY. Any other text still fails closed as
+// UNEXPECTED_STDERR.
+export const REVIEW_CONSENT_NOTICES = Object.freeze([
+	"Gentle AI reviewed this change without asking, because this session has no terminal to answer on. Run 'gentle-ai review mode disable' to turn reviews off, or 'gentle-ai review mode status' to see the current setting.",
+]);
 
 export const NATIVE_REVIEW_RECOVER_DISPOSITION = ["scope_changed", "invalidated", "escalated"]         ;
 
@@ -351,17 +416,36 @@ const NATIVE_GATE = ["post-apply", "pre-commit", "pre-push", "pre-pr", "release"
 const NATIVE_SDD_NEXT_ACTION = ["apply", "verify", "remediate", "archive", "review", "resolve-review", "resolve-blockers", "sdd-new", "select-change", "propose", "spec", "design", "tasks"]         ;
 const NATIVE_SDD_POST_REVIEW_ACTION = ["verify", "archive"]         ;
 
+// Organic-parity columns (mode, riskEvidence, hint, delivery) stay false on
+// every shipped row, including "2.1.11". PI-2 adds the first capability-true
+// row (and bumps the triple pin) in one dedicated commit — never one without
+// the other. See Design Decision #1 (organic-rdd-parity).
+const ORGANIC_PARITY_DARK = { mode: false, riskEvidence: false, hint: false, delivery: false }         ;
+
 export const NATIVE_CLI_CONTRACTS = Object.freeze({
-	"2.1.4": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: false, inventory: false, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false }),
-	"2.1.5": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false }),
-	"2.1.6": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false }),
-	"2.1.7": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false }),
-	"2.1.8": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: false, quarantineLegacy: false, reconcileAuthority: true, repairLegacyAlias: false }),
-	"2.1.9": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: false }),
-	"2.1.10": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true }),
-	"2.1.11": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true }),
+	"2.1.4": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: false, inventory: false, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.5": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.6": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.7": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.8": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: false, quarantineLegacy: false, reconcileAuthority: true, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.9": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.10": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, ...ORGANIC_PARITY_DARK }),
+	"2.1.11": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, ...ORGANIC_PARITY_DARK }),
 });
 
+
+// Testing-only capability overlay: lets tests exercise mode/riskEvidence/hint/
+// delivery decode paths under a synthetic version key without ever making a
+// shipped row (including "2.1.11") capability-true. Production code never
+// calls the setter, so this is inert outside test files.
+const nativeCliContractsTestingOverlay = new Map                                              ();
+export function setNativeCliContractForTesting(version        , contract                                                  )       {
+	if (contract === undefined) nativeCliContractsTestingOverlay.delete(version);
+	else nativeCliContractsTestingOverlay.set(version, contract);
+}
+function resolvedNativeCliContract(version        )                                                   {
+	return nativeCliContractsTestingOverlay.get(version) ?? (NATIVE_CLI_CONTRACTS                                                                    )[version];
+}
 
 
 
@@ -635,6 +719,28 @@ function decodeNativeReviewStatusDiagnostic(value         )                     
 	const diagnostic = exactObject(value, ["path", "problem"]);
 	return { path: requiredString(diagnostic.path), problem: requiredString(diagnostic.problem) };
 }
+function decodeNativeReviewModeStatus(value         )                         {
+	const status = exactObject(value, ["schema", "global", "clone_local", "effective", "source"], ["revision"]);
+	if (status.schema !== "gentle-ai.rdd-mode-status/v1") throw new Error("wrong review mode status schema");
+	return {
+		global: enumString(status.global, Object.values(NATIVE_REVIEW_MODE_VALUE))                         ,
+		cloneLocal: enumString(status.clone_local, Object.values(NATIVE_REVIEW_MODE_VALUE))                         ,
+		effective: enumString(status.effective, ["on", "off"])                ,
+		source: enumString(status.source, Object.values(NATIVE_REVIEW_MODE_SOURCE))                          ,
+		...(status.revision === undefined ? {} : { revision: requiredString(status.revision) }),
+	};
+}
+
+function decodeNativeReviewMode(value         , expectedOperation                           )                         {
+	const body = exactObject(value, ["schema", "operation", "scope", "status"]);
+	if (body.schema !== "gentle-ai.review-mode/v1" || body.operation !== expectedOperation) throw new Error("wrong review mode discriminator");
+	return {
+		operation: expectedOperation,
+		scope: enumString(body.scope, Object.values(NATIVE_REVIEW_MODE_SCOPE))                         ,
+		status: decodeNativeReviewModeStatus(body.status),
+	};
+}
+
 function decodeNativeReviewStatus(value         )                           {
 	const body = exactObject(value, ["schema", "operation", "repository", "complete", "authoritative", "status", "entries", "locks", "diagnostics"]);
 	if (body.schema !== "gentle-ai.review-authority-status/v1" || body.operation !== "review/status") throw new Error("wrong review status discriminator");
@@ -791,7 +897,12 @@ export class NativeReviewCliV214 {
 		}
 	}
 
-	        async execute(operation                       , cwd        , arguments_                   , mutating         , signal              )                               {
+	// toleratedStderr is an exact-match, operation-scoped allowlist (Design
+	// Decision #6, organic-rdd-parity): only START passes a non-empty list, and
+	// only when the negotiated version's `mode` capability is true. A near-miss,
+	// prefixed, or multi-line stderr is never tolerated — only byte-exact
+	// membership in the frozen set.
+	        async execute(operation                       , cwd        , arguments_                   , mutating         , signal              , toleratedStderr                    = [])                               {
 		let result                ;
 		try { result = await this.adapter({ file: this.executablePath(operation, mutating), arguments: arguments_, cwd, timeoutMs: mutating ? undefined : this.timeoutMs, maxBufferBytes: this.maxBufferBytes, signal }); }
 		catch (error) {
@@ -805,8 +916,9 @@ export class NativeReviewCliV214 {
 		if (result.signal) throw nativeError(NATIVE_REVIEW_ERROR_CODE.SIGNAL, operation, mutating, "native process was signalled", result);
 		const structuredValidateDenial = operation === NATIVE_REVIEW_OPERATION.VALIDATE && result.exitCode === 1;
 		const maintenancePartialFailure = [NATIVE_REVIEW_OPERATION.ABANDON, NATIVE_REVIEW_OPERATION.QUARANTINE_LEGACY, NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY, NATIVE_REVIEW_OPERATION.REPAIR_LEGACY_ALIAS].includes(operation) && result.exitCode !== 0;
+		const toleratedNotice = result.stderr.trim().length > 0 && toleratedStderr.includes(result.stderr.trim());
 		if (result.exitCode !== 0 && !structuredValidateDenial && !maintenancePartialFailure) throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, operation, mutating, "native process failed", result);
-		if (result.stderr.trim().length > 0 && !structuredValidateDenial && !maintenancePartialFailure) throw nativeError(NATIVE_REVIEW_ERROR_CODE.UNEXPECTED_STDERR, operation, mutating, "native process wrote stderr", result);
+		if (result.stderr.trim().length > 0 && !structuredValidateDenial && !maintenancePartialFailure && !toleratedNotice) throw nativeError(NATIVE_REVIEW_ERROR_CODE.UNEXPECTED_STDERR, operation, mutating, "native process wrote stderr", result);
 		return { body: parseJson(result.stdout, operation, mutating, diagnostics), exitCode: result.exitCode, process: result };
 	}
 
@@ -823,7 +935,7 @@ export class NativeReviewCliV214 {
 		if (result.signal) throw nativeError(NATIVE_REVIEW_ERROR_CODE.SIGNAL, NATIVE_REVIEW_OPERATION.VERSION, false, "version process was signalled", result);
 		if (result.exitCode !== 0) throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, NATIVE_REVIEW_OPERATION.VERSION, false, "version process failed", result);
 		const version = /^gentle-ai ([0-9]+\.[0-9]+\.[0-9]+)\n$/.exec(result.stdout.replace(/\r\n$/, "\n"))?.[1];
-		const contract = version === undefined ? undefined : NATIVE_CLI_CONTRACTS[version                                     ];
+		const contract = version === undefined ? undefined : resolvedNativeCliContract(version);
 		if (result.stderr.trim().length > 0 || contract === undefined || capabilities.some((capability) => !contract[capability])) throw nativeError(NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE, NATIVE_REVIEW_OPERATION.VERSION, false, "native gentle-ai lacks required capabilities");
 		return version                                     ;
 	}
@@ -833,10 +945,11 @@ export class NativeReviewCliV214 {
 		if (request.committedOnly !== undefined && typeof request.committedOnly !== "boolean") throw new TypeError("Native START committedOnly must be a boolean when supplied");
 		if (request.baseRef !== undefined && request.committedOnly !== true) throw new TypeError("Native START baseRef requires explicit committedOnly acknowledgement");
 		if (request.baseRef === undefined && request.committedOnly !== undefined) throw new TypeError("Native START committedOnly requires an explicit baseRef");
-		await this.verifyVersion(request.cwd, request.signal, ["start"]);
-		const { body: result } = await this.execute(NATIVE_REVIEW_OPERATION.START, request.cwd, ["review", "start", "--cwd", request.cwd, ...(request.baseRef === undefined ? [] : ["--base-ref", request.baseRef, "--committed-only"]), ...(request.lineageId ? ["--lineage", request.lineageId] : []), ...(request.policyPath ? ["--policy", request.policyPath] : []), ...(request.focus ? ["--focus", request.focus] : [])], true, request.signal);
+		const version = await this.verifyVersion(request.cwd, request.signal, ["start"]);
+		const toleratedStderr = resolvedNativeCliContract(version)?.mode === true ? REVIEW_CONSENT_NOTICES : [];
+		const { body: result } = await this.execute(NATIVE_REVIEW_OPERATION.START, request.cwd, ["review", "start", "--cwd", request.cwd, ...(request.baseRef === undefined ? [] : ["--base-ref", request.baseRef, "--committed-only"]), ...(request.lineageId ? ["--lineage", request.lineageId] : []), ...(request.policyPath ? ["--policy", request.policyPath] : []), ...(request.focus ? ["--focus", request.focus] : [])], true, request.signal, toleratedStderr);
 		return decode(NATIVE_REVIEW_OPERATION.START, true, () => {
-			const body = exactObject(result, ["operation", "lineage_id", "state", "risk_level", "selected_lenses", "changed_files", "changed_lines", "correction_budget", "action", "lenses_required", "projection"]);
+			const body = exactObject(result, ["operation", "lineage_id", "state", "risk_level", "selected_lenses", "changed_files", "changed_lines", "correction_budget", "action", "lenses_required", "projection"], ["risk_evidence", "hint"]);
 			if (body.operation !== "review/start" || body.projection !== "workspace" || !(NATIVE_FINALIZE_STATE                     ).includes(stringValue(body.state))) throw new Error("wrong start discriminator");
 			const lineageId = requiredString(body.lineage_id);
 			if (request.lineageId && lineageId !== request.lineageId) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native start lineage mismatch");
@@ -850,7 +963,11 @@ export class NativeReviewCliV214 {
 				!hasCanonicalSelectedLenses(riskLevel, selectedLenses) ||
 				!hasValidLensesRequired(action, body.state          , riskLevel, lensesRequired)
 			) throw new Error("unknown or contradictory start enum");
-			return { lineageId, state: body.state                              , riskLevel, selectedLenses, changedFiles: nonNegativeInteger(body.changed_files), changedLines: nonNegativeInteger(body.changed_lines), correctionBudget: nonNegativeInteger(body.correction_budget), action, lensesRequired };
+			return {
+				lineageId, state: body.state                              , riskLevel, selectedLenses, changedFiles: nonNegativeInteger(body.changed_files), changedLines: nonNegativeInteger(body.changed_lines), correctionBudget: nonNegativeInteger(body.correction_budget), action, lensesRequired,
+				...(body.risk_evidence === undefined ? {} : { riskEvidence: requiredString(body.risk_evidence) }),
+				...(body.hint === undefined ? {} : { hint: requiredString(body.hint) }),
+			};
 		});
 	}
 
@@ -895,18 +1012,29 @@ export class NativeReviewCliV214 {
 		await this.verifyVersion(request.cwd, request.signal, ["validate"]);
 		const execution = await this.execute(NATIVE_REVIEW_OPERATION.VALIDATE, request.cwd, ["review", "validate", "--gate", request.gate, "--cwd", request.cwd, ...(request.lineageId ? ["--lineage", request.lineageId] : []), ...(request.flags ?? [])], false, request.signal);
 		return decode(NATIVE_REVIEW_OPERATION.VALIDATE, false, () => {
-			const body = exactObject(execution.body, ["schema", "result", "allowed", "action", "reason", "context"]);
+			const body = exactObject(execution.body, ["schema", "result", "allowed", "action", "reason", "context"], ["delivery"]);
 			const gateResult = enumString(body.result, NATIVE_GATE_RESULT)                                  ;
 			const action = sanitizeNativeDiagnosticText(requiredString(body.action), NATIVE_REVIEW_DENIAL_TEXT_LIMIT);
 			const reason = sanitizeNativeDiagnosticText(requiredString(body.reason), NATIVE_REVIEW_DENIAL_TEXT_LIMIT);
-			const expectedAction = { allow: "continue", "scope-changed": "create-new-lineage", invalidated: "explicit-maintainer-action", escalated: "stop" }[gateResult];
-			const expectedExitCode = gateResult === "allow" ? 0 : 1;
-			if (body.schema !== "gentle-ai.review-gate-result/v1" || typeof body.allowed !== "boolean" || body.allowed !== (gateResult === "allow") || action !== expectedAction || !isCanonicalProcessString(action) || !isCanonicalProcessString(reason) || execution.exitCode !== expectedExitCode) throw new Error("wrong validate discriminator");
+			// `delivery` (Design Decision #9, organic-rdd-parity) is an alternate
+			// discriminator: when present it must be disabled/unmanaged, paired
+			// exactly with result:invalidated, allowed:false, action:repository-policy,
+			// and exit 0 — never the strict continue/create-new-lineage/
+			// explicit-maintainer-action/stop pairing used when delivery is absent.
+			const delivery = body.delivery === undefined ? undefined : (enumString(body.delivery, ["disabled", "unmanaged"])                                    );
+			if (body.schema !== "gentle-ai.review-gate-result/v1" || !isCanonicalProcessString(action) || !isCanonicalProcessString(reason)) throw new Error("wrong validate discriminator");
+			if (delivery !== undefined) {
+				if (gateResult !== "invalidated" || body.allowed !== false || action !== "repository-policy" || execution.exitCode !== 0) throw new Error("wrong validate delivery discriminator");
+			} else {
+				const expectedAction = { allow: "continue", "scope-changed": "create-new-lineage", invalidated: "explicit-maintainer-action", escalated: "stop" }[gateResult];
+				const expectedExitCode = gateResult === "allow" ? 0 : 1;
+				if (typeof body.allowed !== "boolean" || body.allowed !== (gateResult === "allow") || action !== expectedAction || execution.exitCode !== expectedExitCode) throw new Error("wrong validate discriminator");
+			}
 			const gateContext = decodeGateContext(body.context);
 			const returnedGate = gateContext.raw.gate;
 			if (returnedGate !== request.gate && (gateResult === "allow" || returnedGate !== "")) throw new Error("native gate context does not match the requested gate");
 			if (request.lineageId && returnedGate !== "" && gateContext.lineageId !== request.lineageId) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.VALIDATE, false, "native gate lineage mismatch");
-			return { allowed: body.allowed, result: gateResult, action, reason, gateContext };
+			return { allowed: body.allowed           , result: gateResult, action, reason, gateContext, ...(delivery === undefined ? {} : { delivery }) };
 		});
 	}
 
@@ -937,6 +1065,24 @@ export class NativeReviewCliV214 {
 		const status = decode(NATIVE_REVIEW_OPERATION.STATUS, false, () => decodeNativeReviewStatus(result));
 		if (!await repositoriesMatch(request.cwd, status.repository)) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.STATUS, false, "native review status repository mismatch");
 		return status;
+	}
+
+	// Dark until the negotiated version reports `mode: true` (Design Decision
+	// #7, organic-rdd-parity). `status` is read-only (no timeout suppression,
+	// exact fixed argv per the design's data flow); `enable`/`disable` mutate
+	// and always pass `--scope clone` so Pi's own kill-switch command surface
+	// never mutates the operator's global gentle-ai state across other clones.
+	async reviewMode(request                         )                                  {
+		await this.verifyVersion(request.cwd, request.signal, ["mode"]);
+		const mutating = request.operation !== NATIVE_REVIEW_MODE_OPERATION.STATUS;
+		const { body } = await this.execute(
+			NATIVE_REVIEW_OPERATION.MODE,
+			request.cwd,
+			["review", "mode", request.operation, "--cwd", request.cwd, ...(mutating ? ["--scope", "clone"] : []), "--json"],
+			mutating,
+			request.signal,
+		);
+		return decode(NATIVE_REVIEW_OPERATION.MODE, mutating, () => decodeNativeReviewMode(body, request.operation));
 	}
 
 	async sddStatus(request                        )                                 {
@@ -1472,6 +1618,13 @@ export class NativeReviewCliV216                            {
 
 	sddStatus(request                        )                                 {
 		return this.legacy.sddStatus(request);
+	}
+
+	// Same plain-CLI delegation as reviewStatus/sddStatus above: `review mode`
+	// is dark until the negotiated version reports `mode: true` and stays
+	// outside the negotiated integration-v1 contract.
+	reviewMode(request                         )                                  {
+		return this.legacy.reviewMode(request);
 	}
 
 	// Recovery commands are version-gated plain CLI operations outside the
