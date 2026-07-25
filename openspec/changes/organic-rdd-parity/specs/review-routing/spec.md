@@ -20,16 +20,16 @@ When organic-parity is active, review depth/tier presented to the user MUST be r
 
 ### Requirement: Disabled/unmanaged delivery as success
 
-When the native result reports `delivery: disabled` or `delivery: unmanaged`, the consuming runtime MUST render this as a successful non-delivery outcome, MUST exit with a success status, and MUST NOT report it as a failure.
+When the native result reports the single literal `delivery: "disabled/unmanaged"` (the only value gentle-ai emits), the consuming runtime MUST render this as a successful non-delivery outcome, MUST exit with a success status, and MUST NOT report it as a failure. Any other delivery value MUST fail closed as schema-incompatible.
 
-#### Scenario: Disabled delivery
+#### Scenario: Disabled/unmanaged delivery
 
-- GIVEN the native result reports `delivery: disabled`
+- GIVEN the native result reports `delivery: "disabled/unmanaged"`
 - WHEN the outcome is rendered
 - THEN the runtime exits successfully and communicates a non-delivery choice, not a failure
 
-#### Scenario: Unmanaged delivery
+#### Scenario: Unknown delivery value fails closed
 
-- GIVEN the native result reports `delivery: unmanaged`
-- WHEN the outcome is rendered
-- THEN the runtime exits successfully and communicates a non-delivery choice, not a failure
+- GIVEN the native result reports any other `delivery` value
+- WHEN the result is decoded
+- THEN decoding fails closed as schema-incompatible and no outcome is fabricated
