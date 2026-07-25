@@ -383,8 +383,8 @@ export interface NativeReviewStatusResult {
 }
 export const NATIVE_START_ACTION = { CREATED: "created", RESUMED: "resumed", REUSE_RECEIPT: "reuse-receipt", BLOCKED_SCOPE_ACTION: "blocked-scope-action" } as const;
 export type NativeStartAction = (typeof NATIVE_START_ACTION)[keyof typeof NATIVE_START_ACTION];
-export interface NativeStartResult { lineageId: string; state: ReviewStartState; riskLevel: string; selectedLenses: readonly string[]; changedFiles: number; changedLines: number; correctionBudget: number; action: NativeStartAction; lensesRequired: boolean; riskReasons?: readonly Record<string, unknown>[]; raw?: Readonly<Record<string, unknown>>; riskEvidence?: string; hint?: string; }
-export interface NativeValidateResult { allowed: boolean; result: "allow" | "scope-changed" | "invalidated" | "escalated"; action: string; reason: string; gateContext: NativeGateContext; delivery?: "disabled" | "unmanaged"; }
+export interface NativeStartResult { lineageId: string; state: ReviewStartState; riskLevel: string; selectedLenses: readonly string[]; changedFiles: number; changedLines: number; correctionBudget: number; action: NativeStartAction; lensesRequired: boolean; riskReasons?: readonly Record<string, unknown>[]; raw?: Readonly<Record<string, unknown>>; riskEvidence?: readonly string[]; hint?: string; }
+export interface NativeValidateResult { allowed: boolean; result: "allow" | "scope-changed" | "invalidated" | "escalated"; action: string; reason: string; gateContext: NativeGateContext; delivery?: "disabled/unmanaged"; }
 export interface NativeFinalizeResult { lineageId: string; state: string; action: string; storeRevision: string; receiptPath?: string; }
 export interface NativeBindSddResult {
 	revision: string;
@@ -948,7 +948,14 @@ export class NativeReviewCliV214 {
 		const toleratedStderr = resolvedNativeCliContract(version)?.mode === true ? REVIEW_CONSENT_NOTICES : [];
 		const { body: result } = await this.execute(NATIVE_REVIEW_OPERATION.START, request.cwd, ["review", "start", "--cwd", request.cwd, ...(request.baseRef === undefined ? [] : ["--base-ref", request.baseRef, "--committed-only"]), ...(request.lineageId ? ["--lineage", request.lineageId] : []), ...(request.policyPath ? ["--policy", request.policyPath] : []), ...(request.focus ? ["--focus", request.focus] : [])], true, request.signal, toleratedStderr);
 		return decode(NATIVE_REVIEW_OPERATION.START, true, () => {
-			const body = exactObject(result, ["operation", "lineage_id", "state", "risk_level", "selected_lenses", "changed_files", "changed_lines", "correction_budget", "action", "lenses_required", "projection"], ["risk_evidence", "hint"]);
+			// `target_identity` and `lens_bindings` are real, unconditionally-present
+			// fields on gentle-ai's plain (non-negotiated) `review start` JSON output
+			// (confirmed against the pinned v2.1.11 Go source and live against a dev
+			// build during Phase 6 dev-binary ground-truthing, organic-rdd-parity) —
+			// tolerated here but not consumed: Pi's negotiated-contract client
+			// (NativeReviewCliV216, the production default) carries lineage/target
+			// identity through its own `review-integration/v1` decoder instead.
+			const body = exactObject(result, ["operation", "lineage_id", "state", "risk_level", "selected_lenses", "changed_files", "changed_lines", "correction_budget", "action", "lenses_required", "projection"], ["risk_evidence", "hint", "target_identity", "lens_bindings"]);
 			if (body.operation !== "review/start" || body.projection !== "workspace" || !(NATIVE_FINALIZE_STATE as readonly string[]).includes(stringValue(body.state))) throw new Error("wrong start discriminator");
 			const lineageId = requiredString(body.lineage_id);
 			if (request.lineageId && lineageId !== request.lineageId) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native start lineage mismatch");
@@ -964,7 +971,7 @@ export class NativeReviewCliV214 {
 			) throw new Error("unknown or contradictory start enum");
 			return {
 				lineageId, state: body.state as NativeStartResult["state"], riskLevel, selectedLenses, changedFiles: nonNegativeInteger(body.changed_files), changedLines: nonNegativeInteger(body.changed_lines), correctionBudget: nonNegativeInteger(body.correction_budget), action, lensesRequired,
-				...(body.risk_evidence === undefined ? {} : { riskEvidence: requiredString(body.risk_evidence) }),
+				...(body.risk_evidence === undefined ? {} : { riskEvidence: stringArray(body.risk_evidence) }),
 				...(body.hint === undefined ? {} : { hint: requiredString(body.hint) }),
 			};
 		});
@@ -1016,11 +1023,13 @@ export class NativeReviewCliV214 {
 			const action = sanitizeNativeDiagnosticText(requiredString(body.action), NATIVE_REVIEW_DENIAL_TEXT_LIMIT);
 			const reason = sanitizeNativeDiagnosticText(requiredString(body.reason), NATIVE_REVIEW_DENIAL_TEXT_LIMIT);
 			// `delivery` (Design Decision #9, organic-rdd-parity) is an alternate
-			// discriminator: when present it must be disabled/unmanaged, paired
+			// discriminator: when present it must be the single literal
+			// "disabled/unmanaged" (gentle-ai's RDDDeliveryDisabledUnmanaged — the
+			// kill switch is off and no receipt governs the candidate), paired
 			// exactly with result:invalidated, allowed:false, action:repository-policy,
 			// and exit 0 — never the strict continue/create-new-lineage/
 			// explicit-maintainer-action/stop pairing used when delivery is absent.
-			const delivery = body.delivery === undefined ? undefined : (enumString(body.delivery, ["disabled", "unmanaged"]) as NativeValidateResult["delivery"]);
+			const delivery = body.delivery === undefined ? undefined : (enumString(body.delivery, ["disabled/unmanaged"]) as NativeValidateResult["delivery"]);
 			if (body.schema !== "gentle-ai.review-gate-result/v1" || !isCanonicalProcessString(action) || !isCanonicalProcessString(reason)) throw new Error("wrong validate discriminator");
 			if (delivery !== undefined) {
 				if (gateResult !== "invalidated" || body.allowed !== false || action !== "repository-policy" || execution.exitCode !== 0) throw new Error("wrong validate delivery discriminator");

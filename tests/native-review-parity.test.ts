@@ -141,11 +141,11 @@ test("reviewMode rejects a response whose operation discriminator does not match
 	);
 });
 
-test("native START decodes optional riskEvidence and hint only when present", async () => {
+test("native START decodes optional riskEvidence (a phrase array, matching gentle-ai's []string wire shape) and hint only when present", async () => {
 	const start = JSON.parse(START.stdout) as Record<string, unknown>;
-	const withEvidence = queuedAdapter([CAPABLE_VERSION_LINE, { stdout: JSON.stringify({ ...start, risk_evidence: "this change touches service credentials in .env.example.", hint: "no reviewable candidate: every changed path is documentation." }) }]);
+	const withEvidence = queuedAdapter([CAPABLE_VERSION_LINE, { stdout: JSON.stringify({ ...start, risk_evidence: ["service credentials in .env.example"], hint: "no reviewable candidate: every changed path is documentation." }) }]);
 	const result = await new NativeReviewCliV213(withEvidence.adapter).start({ cwd: "/repo" });
-	assert.equal(result.riskEvidence, "this change touches service credentials in .env.example.");
+	assert.deepEqual(result.riskEvidence, ["service credentials in .env.example"]);
 	assert.equal(result.hint, "no reviewable candidate: every changed path is documentation.");
 
 	const withoutEvidence = queuedAdapter([CAPABLE_VERSION_LINE, { stdout: START.stdout }]);
@@ -154,14 +154,25 @@ test("native START decodes optional riskEvidence and hint only when present", as
 	assert.equal(bare.hint, undefined);
 });
 
+test("native START rejects a scalar risk_evidence: the wire shape is always a phrase array, even with one phrase", async () => {
+	const start = JSON.parse(START.stdout) as Record<string, unknown>;
+	const queue = queuedAdapter([CAPABLE_VERSION_LINE, { stdout: JSON.stringify({ ...start, risk_evidence: "not an array" }) }]);
+	await assert.rejects(
+		() => new NativeReviewCliV213(queue.adapter).start({ cwd: "/repo" }),
+		(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE,
+	);
+});
+
 test("native VALIDATE decodes the disabled/unmanaged delivery alternate discriminator at exit 0", async () => {
 	const body = {
 		schema: "gentle-ai.review-gate-result/v1",
 		result: "invalidated",
 		allowed: false,
 		action: "repository-policy",
-		reason: "review-driven development is disabled and no receipt governs this candidate",
-		delivery: "disabled",
+		reason: "review-driven development is disabled and no receipt governs this candidate, so delivery follows ordinary repository policy",
+		// gentle-ai's RDDDeliveryDisabledUnmanaged is a single literal
+		// "disabled/unmanaged" — never split into two separate enum values.
+		delivery: "disabled/unmanaged",
 		context: { gate: "pre-commit", lineage_id: "", generation: 0, base_tree: "", candidate_tree: "", paths_digest: "", fix_delta_hash: "", policy_hash: "", ledger_hash: "", evidence_hash: "", base_relationship_valid: true },
 	};
 	const queue = queuedAdapter([CAPABLE_VERSION_LINE, { stdout: JSON.stringify(body), exitCode: 0 }]);
@@ -169,7 +180,24 @@ test("native VALIDATE decodes the disabled/unmanaged delivery alternate discrimi
 	assert.equal(result.result, "invalidated");
 	assert.equal(result.allowed, false);
 	assert.equal(result.action, "repository-policy");
-	assert.equal(result.delivery, "disabled");
+	assert.equal(result.delivery, "disabled/unmanaged");
+});
+
+test("native VALIDATE rejects a split disabled-only or unmanaged-only delivery value: the wire literal is always the combined string", async () => {
+	for (const delivery of ["disabled", "unmanaged"]) {
+		const body = {
+			schema: "gentle-ai.review-gate-result/v1", result: "invalidated", allowed: false, action: "repository-policy",
+			reason: "review-driven development is disabled and no receipt governs this candidate, so delivery follows ordinary repository policy",
+			delivery,
+			context: { gate: "pre-commit", lineage_id: "", generation: 0, base_tree: "", candidate_tree: "", paths_digest: "", fix_delta_hash: "", policy_hash: "", ledger_hash: "", evidence_hash: "", base_relationship_valid: true },
+		};
+		const queue = queuedAdapter([CAPABLE_VERSION_LINE, { stdout: JSON.stringify(body), exitCode: 0 }]);
+		await assert.rejects(
+			() => new NativeReviewCliV213(queue.adapter).validate({ cwd: "/repo", gate: "pre-commit" }),
+			(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE,
+			`delivery ${JSON.stringify(delivery)} must still fail closed`,
+		);
+	}
 });
 
 test("native VALIDATE without delivery keeps the strict exit-code/action pairing unchanged", async () => {
@@ -294,7 +322,8 @@ interface FakeOrganicNativeOptions {
 	reviewModeEffective?: "on" | "off";
 	reviewModeThrows?: boolean;
 	lensesRequired?: boolean;
-	riskEvidence?: string;
+	riskEvidence?: readonly string[];
+	hint?: string;
 }
 
 function fakeOrganicNative(options: FakeOrganicNativeOptions = {}): { native: NativeReviewCli; state: { startCalls: number } } {
@@ -309,6 +338,7 @@ function fakeOrganicNative(options: FakeOrganicNativeOptions = {}): { native: Na
 				changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created",
 				lensesRequired: options.lensesRequired ?? true,
 				...(options.riskEvidence === undefined ? {} : { riskEvidence: options.riskEvidence }),
+				...(options.hint === undefined ? {} : { hint: options.hint }),
 			};
 		},
 		async finalize(): Promise<never> { throw new Error("finalize not used in this test"); },
@@ -414,7 +444,7 @@ test("kill-switch: an unexpected reviewMode failure maps to the existing native-
 test("consent: an existing latch skips the prompt and proceeds with actor_binding", async (t) => {
 	const cwd = repository(t);
 	recordReviewConsentLatch(cwd);
-	const { native } = fakeOrganicNative({ riskEvidence: "this change touches shell scripting in deploy.sh." });
+	const { native } = fakeOrganicNative({ riskEvidence: ["shell scripting in deploy.sh"] });
 	const { controller } = runtime(native);
 	const result = await execStart(controller, "consent-latched", confirmContext(cwd, false));
 	assert.ok(result.actor_binding, "an existing latch must not block actor_binding even though confirm() would decline");
@@ -423,7 +453,7 @@ test("consent: an existing latch skips the prompt and proceeds with actor_bindin
 
 test("consent: headless never blocks, always surfaces a notice, and leaves the latch untouched", async (t) => {
 	const cwd = repository(t);
-	const { native } = fakeOrganicNative({ riskEvidence: "this change touches service credentials in .env.example." });
+	const { native } = fakeOrganicNative({ riskEvidence: ["service credentials in .env.example"] });
 	const { controller } = runtime(native);
 	const notices: Array<{ message: string; type?: string }> = [];
 	const result = await execStart(controller, "consent-headless", headlessContext(cwd, notices));
@@ -435,7 +465,7 @@ test("consent: headless never blocks, always surfaces a notice, and leaves the l
 
 test("consent: accepting the prompt records the latch and proceeds with actor_binding", async (t) => {
 	const cwd = repository(t);
-	const { native } = fakeOrganicNative({ riskEvidence: "this change touches payments in billing.ts." });
+	const { native } = fakeOrganicNative({ riskEvidence: ["payments in billing.ts"] });
 	const { controller } = runtime(native);
 	assert.equal(readReviewConsentLatch(cwd), false);
 	const result = await execStart(controller, "consent-accept", confirmContext(cwd, true));
@@ -445,7 +475,7 @@ test("consent: accepting the prompt records the latch and proceeds with actor_bi
 
 test("consent: declining persists nothing, applies only to this work unit, and withholds actor_binding", async (t) => {
 	const cwd = repository(t);
-	const { native } = fakeOrganicNative({ riskEvidence: "this change touches authentication in auth.ts." });
+	const { native } = fakeOrganicNative({ riskEvidence: ["authentication in auth.ts"] });
 	const { controller } = runtime(native);
 	const result = await execStart(controller, "consent-decline", confirmContext(cwd, false));
 	assert.equal(result.actor_binding, undefined, "declining must withhold actor dispatch for this work unit");
@@ -455,7 +485,7 @@ test("consent: declining persists nothing, applies only to this work unit, and w
 
 test("consent: an unreadable answer (confirm throws) still runs the review, leaves the latch untouched, and surfaces a notice", async (t) => {
 	const cwd = repository(t);
-	const { native } = fakeOrganicNative({ riskEvidence: "this change touches an executable permission change in run.sh." });
+	const { native } = fakeOrganicNative({ riskEvidence: ["an executable permission change in run.sh"] });
 	const { controller } = runtime(native);
 	const result = await execStart(controller, "consent-throw", throwingConfirmContext(cwd));
 	assert.ok(result.actor_binding, "an unreadable answer must still run the review");
@@ -472,6 +502,46 @@ test("consent stays dark (capability-gated) when the native start result carries
 	const result = await execStart(controller, "consent-dark", ctx);
 	assert.equal(confirmed, false, "no riskEvidence (dark riskEvidence capability) must never trigger the consent prompt");
 	assert.ok(result.actor_binding);
+});
+
+// ---------------------------------------------------------------------------
+// Phase 5 (tier/hint/delivery passthrough): mapNativeStartResult renders
+// risk_tier/risk_evidence/hint verbatim from the native start result, with
+// zero local derivation (Design Decision #8, organic-rdd-parity).
+// ---------------------------------------------------------------------------
+
+test("mapNativeStartResult passes risk_evidence through verbatim as the native phrase array, alongside the unmodified risk_tier passthrough", async (t) => {
+	const cwd = repository(t);
+	const { native } = fakeOrganicNative({ riskEvidence: ["shell scripting in .github/workflows/deploy.yml"] });
+	const { controller } = runtime(native);
+	const result = await execStart(controller, "risk-evidence-passthrough", confirmContext(cwd, true));
+	const rendered = result.result as Record<string, unknown>;
+	assert.equal(rendered.risk_tier, "high", "risk_tier is native's riskLevel, verbatim, with no local recomputation");
+	assert.deepEqual(rendered.risk_evidence, ["shell scripting in .github/workflows/deploy.yml"]);
+});
+
+test("mapNativeStartResult surfaces the empty-candidate hint verbatim and omits risk_evidence when the native result carries none", async (t) => {
+	const cwd = repository(t);
+	const { native } = fakeOrganicNative({
+		lensesRequired: false,
+		riskEvidence: undefined,
+		hint: "the candidate has no pending changes; already-committed work can be reviewed by rerunning review start with --base-ref <commit> naming the base to compare against",
+	});
+	const { controller } = runtime(native);
+	const result = await execStart(controller, "hint-passthrough", headlessContext(cwd));
+	const rendered = result.result as Record<string, unknown>;
+	assert.equal(rendered.hint, "the candidate has no pending changes; already-committed work can be reviewed by rerunning review start with --base-ref <commit> naming the base to compare against");
+	assert.equal(rendered.risk_evidence, undefined, "no local risk_evidence is ever fabricated when the native result omits it");
+});
+
+test("mapNativeStartResult never fabricates risk_evidence or hint when the native result omits both", async (t) => {
+	const cwd = repository(t);
+	const { native } = fakeOrganicNative({ riskEvidence: undefined });
+	const { controller } = runtime(native);
+	const result = await execStart(controller, "no-evidence-no-hint", confirmContext(cwd, true));
+	const rendered = result.result as Record<string, unknown>;
+	assert.equal(rendered.risk_evidence, undefined);
+	assert.equal(rendered.hint, undefined);
 });
 
 test("gentle:review-mode command reports status, disables, and enables through explicit user invocation", async (t) => {

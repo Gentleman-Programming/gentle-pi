@@ -4127,6 +4127,12 @@ function mapNativeStartResult(result: NativeStartResult): Record<string, unknown
 		action: result.action,
 		lenses_required: result.lensesRequired,
 		...(result.riskReasons === undefined ? {} : { risk_reasons: result.riskReasons }),
+		// Organic-parity passthrough (Design Decision #8, organic-rdd-parity):
+		// risk_evidence/hint are rendered verbatim from the native start result,
+		// with zero local derivation; both stay absent whenever the negotiated
+		// version's capability is dark (every shipped row today).
+		...(result.riskEvidence === undefined ? {} : { risk_evidence: result.riskEvidence }),
+		...(result.hint === undefined ? {} : { hint: result.hint }),
 	};
 }
 
@@ -4218,6 +4224,7 @@ function mapNativeValidateResult(result: NativeValidateResult): Record<string, u
 		action: result.action,
 		reason: result.reason,
 		context: result.gateContext.raw,
+		...(result.delivery === undefined ? {} : { delivery: result.delivery }),
 	};
 }
 
@@ -4434,9 +4441,9 @@ const REVIEW_CONSENT_OFF_PATH_LINE = "To turn reviews off for good, run /gentle:
 const REVIEW_CONSENT_HEADLESS_NOTICE = "Gentle AI reviewed this change without asking, because this session has no interface to answer on. Run /gentle:review-mode disable to turn reviews off, or /gentle:review-mode status to see the current setting.";
 const REVIEW_CONSENT_UNREADABLE_NOTICE = "Gentle AI could not read an answer, so it reviewed this change and will ask again next time.";
 
-function reviewConsentBody(riskEvidence: string): string {
+function reviewConsentBody(riskEvidence: readonly string[]): string {
 	return [
-		`Why: ${riskEvidence}`,
+		`Why: ${riskEvidence.join(", ")}`,
 		REVIEW_CONSENT_VALUE_LINE,
 		REVIEW_CONSENT_ANSWERS_LINE,
 		REVIEW_CONSENT_OFF_PATH_LINE,
@@ -4458,7 +4465,7 @@ interface ReviewConsentDecision {
 // consuming the latch.
 async function requestReviewConsent(
 	cwd: string,
-	riskEvidence: string,
+	riskEvidence: readonly string[],
 	context: ExtensionContext | undefined,
 ): Promise<ReviewConsentDecision> {
 	let latched: boolean;
@@ -5264,6 +5271,16 @@ async function executeReviewControllerOperation(
 				result: mapNativeValidateResult(result),
 				derived_target: nativeDerived.target,
 			};
+			// Organic-parity delivery passthrough (Design Decision #9, Spec
+			// "Disabled/unmanaged delivery as success", organic-rdd-parity): a
+			// receiptless candidate under a disabled kill switch is a successful
+			// non-delivery outcome at exit 0, never a failure. This returns before
+			// the maintainer-exception check below so an honest native
+			// disabled/unmanaged emission never mints a maintainer exception
+			// request or an authorization.
+			if (result.delivery !== undefined) {
+				return { ...response, status: "skipped", outcome: "review-disabled-unmanaged-delivery" };
+			}
 			if (!result.allowed && result.result === "invalidated" && result.action === "explicit-maintainer-action" && (nativeDerived.command.event === "pre-release" || (nativeDerived.target.kind === GATE_TARGET_KIND.PUSH && nativeDerived.target.updates.length === 1 && nativeDerived.target.updates[0]?.kind === PUSH_UPDATE_KIND.CREATE && nativeDerived.target.updates[0]?.destination_ref.startsWith("refs/tags/")))) {
 				const commandHash = reviewAuthorizationKey(commandValue, nativeDerived.command.cwd);
 				const denial = { result: "invalidated" as const, action: "explicit-maintainer-action" as const, reason: result.reason, context_fingerprint: nativeGateFingerprint(result, nativeDerived) };

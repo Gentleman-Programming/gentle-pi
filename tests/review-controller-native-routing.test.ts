@@ -1555,6 +1555,35 @@ test("native allow registers one authorization and bash-time revalidation consum
 	assert.equal(validates, 2);
 });
 
+test("native VALIDATE delivery disabled/unmanaged renders as a successful skipped envelope before the maintainer-exception check, minting no authorization", async (t) => {
+	const cwd = repository(t);
+	let validations = 0;
+	const { controller } = runtime(fakeNative({
+		validate: async () => {
+			validations += 1;
+			return {
+				allowed: false,
+				result: "invalidated",
+				action: "repository-policy",
+				reason: "review-driven development is disabled and no receipt governs this candidate, so delivery follows ordinary repository policy",
+				gateContext: nativeGateContext("native-lineage", "r1", git(cwd, "write-tree")),
+				delivery: "disabled/unmanaged",
+			};
+		},
+		targetStatus: async () => targetStatusFixture({ lineageId: "native-lineage", baseTree: git(cwd, "rev-parse", "HEAD^{tree}"), currentCandidateTree: git(cwd, "write-tree"), paths: [] }),
+	}), undefined, undefined, undefined, new CandidateViewRegistry());
+	const command = "git commit -m native";
+	const validated = await controller.execute("disabled-delivery", { operation: "validate", lineageId: "native-lineage", idempotencyKey: "disabled-delivery", command, input: "{}" }, undefined, undefined, context(cwd));
+	const details = validated.details as Record<string, unknown>;
+	assert.equal(validations, 1);
+	assert.equal(details.status, "skipped");
+	assert.equal(details.outcome, "review-disabled-unmanaged-delivery");
+	assert.equal((details.result as Record<string, unknown>).delivery, "disabled/unmanaged");
+	assert.equal((details.result as Record<string, unknown>).allowed, false);
+	assert.equal(details.maintainer_exception_request, undefined, "a repository-policy delivery skip must never mint a maintainer-exception request");
+	assert.equal(details.authorization, undefined, "a repository-policy delivery skip must never mint an authorization");
+});
+
 test("fresh candidate registry binds a resumed zero-lens native START through FINALIZE and pre-commit", async (t) => {
 	const cwd = repository(t);
 	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
