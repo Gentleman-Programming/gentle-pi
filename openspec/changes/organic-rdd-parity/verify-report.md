@@ -248,3 +248,70 @@ None of the four risks blocks this change. All four are correctly scoped by the 
 ### Verdict
 
 **FAIL** — one CRITICAL: the `review-routing` spec text names wire values (`delivery: disabled`, `delivery: unmanaged`) that the implementation provably rejects and that a passing test asserts must fail closed; archiving would freeze a contradicted contract. Everything else is green — all 19 tasks verified with independent evidence, all four gates exit 0 (`pnpm test` 829/829, `verify-package-files.mjs`, `check:transaction-runner`, 5/5 dev-binary), the DARK invariant holds across all 8 shipped rows and all four byte-pinned paths, and the zero-work-routing-vocabulary invariant holds across all 20 touched files. The blocker is a one-line spec amendment with **zero code change**; re-verify after the edit, then archive.
+
+---
+
+## Addendum — 2026-07-25 Scoped Re-verification (CRITICAL resolved)
+
+**Scope**: Re-verify only the single CRITICAL blocker from the FAIL verdict above (stale `delivery: disabled` / `delivery: unmanaged` wire values in the `review-routing` spec). All other gates and invariants from the prior full verify PASSED and were not re-run.
+
+**Branch**: `feat/organic-rdd-parity` @ `52379898` (docs(sdd): align the delivery spec with the single wire literal; working tree clean).
+
+### 1. Spec text confirmed corrected
+
+`openspec/changes/organic-rdd-parity/specs/review-routing/spec.md`, requirement "Disabled/unmanaged delivery as success" (lines 21-35):
+
+- Names the single literal exactly: *"When the native result reports the single literal `delivery: \"disabled/unmanaged\"` (the only value gentle-ai emits)... Any other delivery value MUST fail closed as schema-incompatible."*
+- Scenario "Disabled/unmanaged delivery" (25-29) is keyed on `delivery: "disabled/unmanaged"` only.
+- New scenario "Unknown delivery value fails closed" (31-35) explicitly requires fail-closed schema-incompatible decoding for any other value.
+- No remaining reference to the rejected two-value form (`delivery: disabled` / `delivery: unmanaged` as separate values) anywhere in the file.
+
+CRITICAL finding #1 is resolved by spec text alone; the finding always held the implementation to be correct.
+
+### 2. Implementation/test agreement re-confirmed
+
+`lib/native-review-cli.ts:1032`:
+```ts
+const delivery = body.delivery === undefined ? undefined : (enumString(body.delivery, ["disabled/unmanaged"]) as NativeValidateResult["delivery"]);
+```
+Accepts exactly the one-element enum `["disabled/unmanaged"]`.
+
+`tests/native-review-parity.test.ts:186-199`, test *"native VALIDATE rejects a split disabled-only or unmanaged-only delivery value: the wire literal is always the combined string"*:
+```ts
+for (const delivery of ["disabled", "unmanaged"]) {
+    ...
+    await assert.rejects(
+        () => new NativeReviewCliV213(queue.adapter).validate({ cwd: "/repo", gate: "pre-commit" }),
+        (error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE,
+        `delivery ${JSON.stringify(delivery)} must still fail closed`,
+    );
+}
+```
+Both `"disabled"` and `"unmanaged"` (split values) assert `SCHEMA_INCOMPATIBLE`, matching the spec's new "Unknown delivery value fails closed" scenario. The positive scenario is covered by the adjacent test *"native VALIDATE decodes the disabled/unmanaged delivery alternate discriminator at exit 0"* (lines 166-184), which asserts `result.delivery === "disabled/unmanaged"` at exit 0.
+
+### 3. Targeted test run
+
+```text
+$ node --experimental-strip-types --test tests/native-review-parity.test.ts
+...
+ℹ tests 26
+ℹ suites 0
+ℹ pass 26
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1310.6946
+```
+26/26 pass, 0 fail. Delivery-related tests pass:
+`✔ native VALIDATE decodes the disabled/unmanaged delivery alternate discriminator at exit 0`
+`✔ native VALIDATE rejects a split disabled-only or unmanaged-only delivery value: the wire literal is always the combined string`
+`✔ native VALIDATE without delivery keeps the strict exit-code/action pairing unchanged`
+
+### 4. Updated Verdict
+
+**PASS-WITH-NOTES.**
+
+The sole CRITICAL is resolved by a one-line, zero-code-change spec amendment: the `review-routing` requirement now names the single literal `"disabled/unmanaged"`, includes an explicit fail-closed scenario for any other value, and no longer references the rejected two-value form. Implementation and tests were already correct and remain unchanged and passing (26/26 in the targeted file, 0 regressions). Combined with the prior full verify (19/19 tasks, 829/829 tests, all four gates exit 0, DARK invariant and zero-work-routing-vocabulary invariant both holding), this change is now clear to archive.
+
+The 5 prior WARNINGs are unaffected by this scoped fix and remain open as non-blocking follow-ups (not re-verified in this pass, carried forward as-is): missing-tier fail-closed test coverage; `gentle:review-mode disable/enable` gating coverage only via the non-gating devtest; static-only proof for "command-only re-enable"; unrecorded RED evidence for 7/11 TDD tasks; reviewer-attention note on two corrected decode assumptions touching previously-committed code. None are CRITICAL and none block archive.
