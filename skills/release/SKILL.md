@@ -4,7 +4,7 @@ description: "Release gentle-pi through GitHub and npm. Trigger: release, publis
 license: Apache-2.0
 metadata:
   author: gentleman-programming
-  version: "1.0"
+  version: "1.2"
 ---
 
 ## When to Use
@@ -15,6 +15,7 @@ Use this skill when preparing, publishing, or verifying a `gentle-pi` release.
 
 - Do not publish `gentle-pi` to npm from a local machine.
 - npm publishing MUST go through the GitHub Actions workflow `.github/workflows/publish.yml` so provenance, environment protection, and registry credentials are controlled by GitHub.
+- Dispatch the trusted workflow definition from protected default `main`, never from a release tag. Its only caller input is the exact annotated version tag.
 - Use a clean worktree for release commits. Do not package unrelated local files or scratch artifacts.
 - Validate the approved receipt against the exact immutable release target with zero review actors before publication.
 - Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise fail closed through native receipt validation. Never infer the tag target from local `HEAD`. Major and post-incident releases require explicit extraordinary review even when fast-path checks pass.
@@ -40,10 +41,11 @@ Use this skill when preparing, publishing, or verifying a `gentle-pi` release.
 
    ```bash
    pnpm test
-   pnpm publish --dry-run --no-git-checks
+   node scripts/verify-package-files.mjs
+   npm pack --dry-run
    ```
 
-   The dry run is allowed because it does not publish. It verifies package contents and lifecycle scripts.
+   `npm pack --dry-run` verifies package contents and lifecycle scripts without entering a publish path.
 
 4. **Commit and push**
 
@@ -51,27 +53,50 @@ Use this skill when preparing, publishing, or verifying a `gentle-pi` release.
    git add <intended-files>
    git commit -m "<type(scope): release-ready change>"
    git push origin HEAD:main
+   git fetch origin main --tags
    ```
 
-5. **Create the GitHub release**
+5. **Create and verify the exact version tag**
 
    ```bash
-   git tag -a v<version> -m "gentle-pi v<version>"
-   git push origin v<version>
-   gh release create v<version> \
+   version="$(node -p "require('./package.json').version")"
+   tag="v${version}"
+   release_sha="$(git rev-parse 'origin/main^{commit}')"
+
+   test "$(git rev-parse 'HEAD^{commit}')" = "${release_sha}"
+   test -z "$(git ls-remote --tags origin "refs/tags/${tag}")"
+
+   git tag -a "${tag}" "${release_sha}" -m "gentle-pi ${tag}"
+   test "$(git rev-parse "${tag}^{commit}")" = "${release_sha}"
+
+   git fetch origin main
+   test "$(git rev-parse 'origin/main^{commit}')" = "${release_sha}"
+   git push origin "refs/tags/${tag}"
+
+   git fetch --no-tags origin "refs/tags/${tag}"
+   test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "${release_sha}"
+
+   gh release create "${tag}" \
      --repo Gentleman-Programming/gentle-pi \
-     --title "gentle-pi v<version>" \
+     --verify-tag \
+     --title "gentle-pi ${tag}" \
      --notes "<release notes>"
    ```
+
+   Do not retag or overwrite an existing version. The tag target comes from the freshly fetched immutable `origin/main` commit, not an ambient local branch.
 
 6. **Publish npm through GitHub Actions**
 
    ```bash
+   version="$(node -p "require('./package.json').version")"
+   tag="v${version}"
    gh workflow run publish.yml \
      --repo Gentleman-Programming/gentle-pi \
      --ref main \
-     -f dist-tag=latest
+     -f tag="${tag}"
    ```
+
+   The workflow definition always comes from protected default `main`. It accepts only one exact `vSemVer` tag, fetches the remote annotated tag and current remote `main`, and requires the peeled tag commit, dispatch/main workflow commit, checkout, and `package.json` version to match. It re-queries remote tag and `main` immediately before npm publication, derives the dist-tag internally, and uses trusted OIDC with provenance.
 
    Watch the run and fail the release if it fails:
 
@@ -90,7 +115,8 @@ Use this skill when preparing, publishing, or verifying a `gentle-pi` release.
 ## Failure Handling
 
 - A publication failure never reopens the closed review lineage. Diagnose and retry publication separately without resetting review counters.
-- If a local `npm publish` fails, do not retry locally. Use the GitHub workflow instead.
+- Never attempt or retry `npm publish` locally. Re-dispatch from trusted `main` only when the same tag still targets the current remote `main` and the failure was publication-only.
+- If remote `main` advances, do not move or recreate the existing tag. Prepare a new release commit/version and create a new annotated version tag.
 - If the workflow fails, inspect logs with:
 
   ```bash
@@ -104,7 +130,8 @@ Use this skill when preparing, publishing, or verifying a `gentle-pi` release.
 Report:
 
 - Commit SHA pushed to `main`.
+- Exact version tag and its peeled commit SHA.
 - GitHub release URL.
 - Publish workflow run URL and conclusion.
-- npm exact version and `latest` dist-tag.
+- npm exact version and the workflow-derived dist-tag (`latest`, `beta`, or `next`).
 - Any remaining follow-up or warnings.

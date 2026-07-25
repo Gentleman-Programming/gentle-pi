@@ -3,22 +3,30 @@ name: Publish to npm
 on:
   workflow_dispatch:
     inputs:
-      dist-tag:
-        description: "npm dist-tag (latest, next, beta)"
-        required: false
-        default: "latest"
+      tag:
+        description: Exact annotated release tag (for example, v2.2.0)
+        required: true
+        type: string
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   publish:
+    if: github.repository == 'Gentleman-Programming/gentle-pi'
     environment: npm
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          fetch-tags: false
+          persist-credentials: false
+          ref: ${{ github.sha }}
 
       - name: Setup pnpm
         uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
@@ -30,7 +38,146 @@ jobs:
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
-          cache: "pnpm"
+          package-manager-cache: false
+
+      - name: Verify trusted publishing toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          npm_version="$(npm --version)"
+          node --input-type=module - "${npm_version}" <<'NODE'
+          import packageJson from "./package.json" with { type: "json" };
+
+          const npmVersion = process.argv[2];
+          const match = npmVersion.match(/^(\d+)\.(\d+)\.(\d+)(?:-.+)?$/);
+          if (!match) {
+            throw new Error(`Unable to verify npm version: ${npmVersion}`);
+          }
+          const actual = match.slice(1, 4).map(Number);
+          const minimum = [11, 5, 1];
+          for (let index = 0; index < minimum.length; index += 1) {
+            if (actual[index] > minimum[index]) break;
+            if (actual[index] < minimum[index]) {
+              throw new Error(
+                `npm ${npmVersion} cannot use trusted publishing; npm >=11.5.1 is required.`,
+              );
+            }
+          }
+
+          const expectedRepository = {
+            type: "git",
+            url: "git+https://github.com/Gentleman-Programming/gentle-pi.git",
+          };
+          if (
+            packageJson.repository?.type !== expectedRepository.type ||
+            packageJson.repository?.url !== expectedRepository.url
+          ) {
+            throw new Error(
+              "package.json.repository must exactly match Gentleman-Programming/gentle-pi.",
+            );
+          }
+          NODE
+
+      - name: Verify exact release tag and protected main commit
+        id: release
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[
+            "${DEFAULT_BRANCH}" != "main" ||
+            "${GITHUB_REF}" != "refs/heads/main" ||
+            "${GITHUB_REF_TYPE}" != "branch"
+          ]]; then
+            echo "::error::The trusted publish workflow must be dispatched from default main."
+            exit 1
+          fi
+
+          tag="${RELEASE_TAG}"
+          node --input-type=module - "${tag}" <<'NODE'
+          const tag = process.argv[2];
+          const semverTag =
+            /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+          if (!semverTag.test(tag)) {
+            throw new Error(`Release tag is not exact vSemVer: ${tag}`);
+          }
+          NODE
+
+          remote_refs="$(git ls-remote origin \
+            "refs/heads/main" \
+            "refs/tags/${tag}" \
+            "refs/tags/${tag}^{}")"
+          remote_ref() {
+            local ref="$1"
+            local matches=()
+            mapfile -t matches < <(
+              printf '%s\n' "${remote_refs}" |
+                awk -v expected="${ref}" '$2 == expected { print $1 }'
+            )
+            if [[ "${#matches[@]}" -ne 1 ]]; then
+              echo "::error::Remote ref ${ref} must resolve exactly once." >&2
+              return 1
+            fi
+            printf '%s' "${matches[0]}"
+          }
+          remote_main="$(remote_ref "refs/heads/main")"
+          remote_tag_object="$(remote_ref "refs/tags/${tag}")"
+          remote_tag_commit="$(remote_ref "refs/tags/${tag}^{}")"
+
+          git fetch --atomic --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/release-main" \
+            "+refs/tags/${tag}:refs/release-verification/tag"
+
+          if [[ "$(git cat-file -t refs/release-verification/tag)" != "tag" ]]; then
+            echo "::error::Release tag ${tag} must be annotated."
+            exit 1
+          fi
+
+          fetched_main="$(git rev-parse 'refs/remotes/origin/release-main^{commit}')"
+          fetched_tag_object="$(git rev-parse refs/release-verification/tag)"
+          tag_commit="$(git rev-parse 'refs/release-verification/tag^{commit}')"
+          event_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          checkout_commit="$(git rev-parse 'HEAD^{commit}')"
+          if [[
+            "${fetched_main}" != "${remote_main}" ||
+            "${fetched_tag_object}" != "${remote_tag_object}" ||
+            "${tag_commit}" != "${remote_tag_commit}" ||
+            "${tag_commit}" != "${remote_main}" ||
+            "${event_commit}" != "${remote_main}" ||
+            "${checkout_commit}" != "${remote_main}"
+          ]]; then
+            echo "::error::Annotated tag, protected remote main, workflow commit, and checkout must be identical."
+            exit 1
+          fi
+
+          git checkout --detach "${tag_commit}"
+          test "$(git rev-parse 'HEAD^{commit}')" = "${tag_commit}"
+
+          package_version="$(node --input-type=module -e \
+            "import packageJson from './package.json' with { type: 'json' }; process.stdout.write(packageJson.version)")"
+          if [[ "${tag}" != "v${package_version}" ]]; then
+            echo "::error::Release tag ${tag} does not match package.json version ${package_version}."
+            exit 1
+          fi
+
+          if [[ "${package_version}" != *-* ]]; then
+            dist_tag="latest"
+          elif [[ "${package_version#*-}" == "beta" || "${package_version#*-}" == beta.* ]]; then
+            dist_tag="beta"
+          else
+            dist_tag="next"
+          fi
+          {
+            echo "tag=${tag}"
+            echo "tag_object=${remote_tag_object}"
+            echo "tag_commit=${tag_commit}"
+            echo "main_commit=${remote_main}"
+            echo "dist_tag=${dist_tag}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -38,5 +185,50 @@ jobs:
       - name: Verify package contents
         run: node scripts/verify-package-files.mjs
 
-      - name: Publish to npm
-        run: pnpm publish --no-git-checks --access public --tag "${{ inputs.dist-tag }}"
+      - name: Reverify protected release authority and publish
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          EXPECTED_TAG_OBJECT: ${{ steps.release.outputs.tag_object }}
+          EXPECTED_RELEASE_COMMIT: ${{ steps.release.outputs.tag_commit }}
+          EXPECTED_MAIN_COMMIT: ${{ steps.release.outputs.main_commit }}
+          DIST_TAG: ${{ steps.release.outputs.dist_tag }}
+        run: |
+          set -euo pipefail
+
+          remote_refs="$(git ls-remote origin \
+            "refs/heads/main" \
+            "refs/tags/${RELEASE_TAG}" \
+            "refs/tags/${RELEASE_TAG}^{}")"
+          remote_ref() {
+            local ref="$1"
+            local matches=()
+            mapfile -t matches < <(
+              printf '%s\n' "${remote_refs}" |
+                awk -v expected="${ref}" '$2 == expected { print $1 }'
+            )
+            if [[ "${#matches[@]}" -ne 1 ]]; then
+              echo "::error::Remote ref ${ref} must still resolve exactly once." >&2
+              return 1
+            fi
+            printf '%s' "${matches[0]}"
+          }
+
+          remote_main="$(remote_ref "refs/heads/main")"
+          remote_tag_object="$(remote_ref "refs/tags/${RELEASE_TAG}")"
+          remote_tag_commit="$(remote_ref "refs/tags/${RELEASE_TAG}^{}")"
+          package_version="$(node --input-type=module -e \
+            "import packageJson from './package.json' with { type: 'json' }; process.stdout.write(packageJson.version)")"
+          if [[
+            "${remote_main}" != "${EXPECTED_MAIN_COMMIT}" ||
+            "${remote_tag_object}" != "${EXPECTED_TAG_OBJECT}" ||
+            "${remote_tag_commit}" != "${EXPECTED_RELEASE_COMMIT}" ||
+            "$(git rev-parse 'HEAD^{commit}')" != "${EXPECTED_RELEASE_COMMIT}" ||
+            "$(git rev-parse "${GITHUB_SHA}^{commit}")" != "${EXPECTED_RELEASE_COMMIT}" ||
+            "${RELEASE_TAG}" != "v${package_version}"
+          ]]; then
+            echo "::error::Release authority changed after verification; refusing npm publication."
+            exit 1
+          fi
+
+          npm publish --provenance --access public --tag "${DIST_TAG}"

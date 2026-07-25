@@ -85,6 +85,10 @@ interface PackageJson {
 	dependencies?: Record<string, string>;
 	bundledDependencies?: string[];
 	bundleDependencies?: string[];
+	repository?: {
+		type?: string;
+		url?: string;
+	};
 	pi?: PackageJsonPiManifest;
 }
 
@@ -124,6 +128,67 @@ test("package verification names the native review runtime boundary and packaged
 		/createNativeReviewCli\(\)/,
 		"the production extension must construct its native client from the packaged runtime module",
 	);
+});
+
+test("npm publication is bound to the exact package tag and triggering commit", () => {
+	const workflow = readFileSync(join(PACKAGE_ROOT, ".github", "workflows", "publish.yml"), "utf8");
+	const releaseSkill = readFileSync(join(PACKAGE_ROOT, "skills", "release", "SKILL.md"), "utf8");
+	const packageJson = readPackageJson();
+	const dispatchBlock = workflow.match(
+		/^ {2}workflow_dispatch:\n([\s\S]*?)^\npermissions:/m,
+	)?.[1];
+	assert.ok(dispatchBlock);
+	const inputNames = [
+		...dispatchBlock.matchAll(/^ {6}([A-Za-z0-9_-]+):$/gm),
+	].map((match) => match[1]);
+
+	assert.match(workflow, /on:\n\s+workflow_dispatch:\s*\n/);
+	assert.deepEqual(inputNames, ["tag"], "the trusted workflow must expose exactly one caller input");
+	assert.match(workflow, /inputs:\n\s+tag:/, "the trusted main workflow must accept only the release tag");
+	assert.match(workflow, /RELEASE_TAG: \$\{\{ inputs\.tag \}\}/);
+	assert.doesNotMatch(workflow, /checkout-ref|dist-tag.*inputs|inputs\.(?!tag)/, "the release workflow must not accept checkout or dist-tag inputs");
+	assert.match(workflow, /ref: \$\{\{ github\.sha \}\}/, "checkout must use the immutable event SHA");
+	assert.match(workflow, /persist-credentials: false/, "the release checkout must not retain GitHub credentials");
+	assert.match(workflow, /DEFAULT_BRANCH: \$\{\{ github\.event\.repository\.default_branch \}\}/);
+	assert.match(workflow, /\$\{DEFAULT_BRANCH\}" != "main"/);
+	assert.match(workflow, /\$\{GITHUB_REF\}" != "refs\/heads\/main"/);
+	assert.match(workflow, /\$\{GITHUB_REF_TYPE\}" != "branch"/);
+	assert.match(workflow, /Release tag is not exact vSemVer/);
+	assert.match(workflow, /git ls-remote origin[\s\S]*"refs\/heads\/main"[\s\S]*"refs\/tags\/\$\{tag\}"/);
+	assert.match(workflow, /git fetch --atomic --no-tags origin/);
+	assert.match(workflow, /refs\/heads\/main:refs\/remotes\/origin\/release-main/);
+	assert.match(workflow, /refs\/tags\/\$\{tag\}:refs\/release-verification\/tag/);
+	assert.match(workflow, /git cat-file -t refs\/release-verification\/tag/);
+	assert.match(workflow, /git checkout --detach "\$\{tag_commit\}"/);
+	assert.match(workflow, /git rev-parse "\$\{GITHUB_SHA\}\^\{commit\}"/);
+	assert.match(workflow, /git rev-parse ['"]HEAD\^\{commit\}['"]/);
+	assert.match(workflow, /Reverify protected release authority and publish/);
+	assert.match(workflow, /Release authority changed after verification/);
+	assert.match(workflow, /id-token: write/, "trusted publishing requires OIDC");
+	assert.match(workflow, /node-version: "24"/, "trusted publishing must use a supported Node.js version");
+	assert.match(workflow, /const minimum = \[11, 5, 1\]/, "trusted publishing must reject npm versions below 11.5.1");
+	assert.match(workflow, /packageJson\.repository\?\.type !== expectedRepository\.type/);
+	assert.match(workflow, /packageJson\.repository\?\.url !== expectedRepository\.url/);
+	assert.deepEqual(
+		packageJson.repository,
+		{
+			type: "git",
+			url: "git+https://github.com/Gentleman-Programming/gentle-pi.git",
+		},
+		"trusted publishing requires the exact case-sensitive npm repository identity",
+	);
+	assert.match(workflow, /npm publish --provenance --access public/);
+	assert.doesNotMatch(workflow, /pnpm publish|--no-git-checks|NODE_AUTH_TOKEN/);
+
+	assert.match(releaseSkill, /tag="v\$\{version\}"/);
+	assert.match(releaseSkill, /release_sha="\$\(git rev-parse 'origin\/main\^\{commit\}'\)"/);
+	assert.match(releaseSkill, /git rev-parse "\$\{tag\}\^\{commit\}"/);
+	assert.match(releaseSkill, /git fetch --no-tags origin "refs\/tags\/\$\{tag\}"/);
+	assert.match(releaseSkill, /gh release create "\$\{tag\}"[\s\S]*--verify-tag/);
+	assert.match(releaseSkill, /--ref main/);
+	assert.match(releaseSkill, /-f tag="\$\{tag\}"/);
+	assert.match(releaseSkill, /trusted OIDC with provenance/);
+	assert.doesNotMatch(releaseSkill, /--ref "\$\{tag\}"|-f dist-tag=/);
 });
 
 test("publication gate is isolated from graph-v1 authority storage", () => {

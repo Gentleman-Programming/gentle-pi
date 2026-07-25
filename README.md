@@ -704,13 +704,20 @@ npm pack --dry-run
 Publish npm through GitHub Actions only:
 
 ```bash
-gh workflow run publish.yml --repo Gentleman-Programming/gentle-pi --ref main -f dist-tag=latest
+version="$(node -p "require('./package.json').version")"
+tag="v${version}"
+git fetch --no-tags origin "refs/tags/${tag}"
+test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$(git rev-parse "${tag}^{commit}")"
+gh workflow run publish.yml \
+  --repo Gentleman-Programming/gentle-pi \
+  --ref main \
+  -f tag="${tag}"
 gh run watch <run-id> --repo Gentleman-Programming/gentle-pi --exit-status
 npm view gentle-pi@<version> version --registry=https://registry.npmjs.org/
 npm dist-tag ls gentle-pi --registry=https://registry.npmjs.org/
 ```
 
-Do not run `npm publish` locally for `gentle-pi`; the GitHub workflow provides provenance, environment protection, and registry credentials.
+Do not run `npm publish` locally for `gentle-pi`. Dispatch the trusted workflow definition only from protected default `main` and provide its sole `tag` input. The workflow requires an exact annotated `vSemVer` tag whose peeled commit, current remote `main`, dispatch/main workflow commit, checkout, and `package.json` version are identical. It rechecks remote tag and `main` immediately before publishing through OIDC with provenance and environment protection; an advanced `main` requires a new release version, never a moved tag.
 
 ## Principles
 
