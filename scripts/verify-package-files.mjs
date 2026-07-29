@@ -82,7 +82,7 @@ const contractHashes = {
   "contracts/review-integration/v1/fixtures/capabilities-v1.3.fixture.json": "0ec783ea13b4c82c0b002c5caa758f33e2b488537297cc2d0694ec92176ac0cb",
   "contracts/review-integration/v1/fixtures/capabilities-v1.4.fixture.json": "84e0db457b76b97b35c2be772dfc647f9eab66810ea98f64fed85645c3c266ba",
   "contracts/review-integration/v1/fixtures/capabilities.fixture.json": "b3ca822189a236f2d891628c665ca23e308bf5185a1701e1f07231bd970461bb",
-  "contracts/review-integration/v1/fixtures/consent.fixture.json": "e9987a5f90fbee4831cb0dd8851adf4a0a8f40e9a427594cb8916c22aef7044f",
+  "contracts/review-integration/v1/fixtures/consent.fixture.json": "b2ff4809b9eb75a54206800dca13f96396976aca7387e45f765ac6ec98029cd1",
   "contracts/review-integration/v1/fixtures/failure.fixture.json": "e72b6ab5e3c529abac47bd324444f84ca90f67ef0a67189f5fd8d24d199a2759",
   "contracts/review-integration/v1/fixtures/final-verification-incident.fixture.json": "f8bc06549e62b0bee5cf2ecde625e18da178dd18c9d3023b7d7e8fd0ebbba646",
   "contracts/review-integration/v1/fixtures/operation.fixture.json": "3547748a4df57382178064abbdb1cf12f1d58a75c0e9d6452fdd9beb3aaeac3a",
@@ -95,7 +95,7 @@ const contractHashes = {
   "contracts/review-integration/v1/fixtures/status-unrelated.fixture.json": "deab36c877ced3c9b480ca33724c10d88f75c761d6426fa14be850345122891d",
   "contracts/review-integration/v1/fixtures/status-v2-ambiguous.fixture.json": "80a459a7a18d8d933dd42acb6a94a75ac19278e9a6c3b125e3017946768eaa47",
   "contracts/review-integration/v1/fixtures/status-v2-corrupted.fixture.json": "466f1e28b101e95178630f26a90fff96ad3516e2aa6a17f5f357bab9bda2ab52",
-  "contracts/review-integration/v1/fixtures/status-v2-final-verification-retry.fixture.json": "21145377f88349b5e22148cbd15745087acfed6e8c534ba715ad2f24653cdaa3",
+  "contracts/review-integration/v1/fixtures/status-v2-final-verification-retry.fixture.json": "889ede9a84bdbe561df2d2401adda95634582c44db9d1075ba839f33d65c7886",
   "contracts/review-integration/v1/fixtures/status-v2-recover.fixture.json": "178331fc7177d2316fd4f56610ac295f7da2780be96b233b72935d5f476610f2",
   "contracts/review-integration/v1/fixtures/status-v2-repair.fixture.json": "89083cad752fca38da09e919825d0b80641a8a029364ba1869e5b58ef2e59a1d",
   "contracts/review-integration/v1/fixtures/status-v2-unrelated.fixture.json": "c178b338dcd5d30888acef37a9d752bd0932d6dedfffb61b0596a9cceabeb692",
@@ -119,10 +119,10 @@ const contractHashes = {
   "contracts/review-integration/v1/schemas/result-artifact.schema.json": "91296bd2c261fd2fe03bffd63efe58badd4927e0d0d8480cd4213f651ecacdf6",
   "contracts/review-integration/v1/schemas/start-v2.schema.json": "ec8550cd93bbe84af1ce87dfd7abfa9e24692f42b20f8f0bf9cac1d4b88ea46c",
   "contracts/review-integration/v1/schemas/start.schema.json": "4296aebbd4128ce51945a2f6d3228aa77ac7215c802978d559bff5279ec56229",
-  "contracts/review-integration/v1/schemas/status-v2.schema.json": "6af952691c3434f8f292e6590f5d883b98a1c19987eab5032041f48f90032051",
+  "contracts/review-integration/v1/schemas/status-v2.schema.json": "63e8988ce276d948ea8305008a3d27c4e26dff664cf54fffed9e188f465d92d1",
   "contracts/review-integration/v1/schemas/status.schema.json": "67f3bddf5f5feeb3213bce489de8548546163b2e1d49a0e3965c0091dabc8c39",
   "contracts/review-integration/v1/schemas/targeted-validation-request.schema.json": "52b91154693b4dd66983fc91ecf7197503555f2c9e85cac626cffd3035c53d65",
-  "docs/review-integration.md": "8125a97708ac65d5a878ad5523b17ba49c10ae7d32669091dc3b7789b28de8b9",
+  "docs/review-integration.md": "287e43ff55e3bb56e3175574ce26be1dc13f7de5e2fda74eddc769cc70f7e82a",
 };
 
 requiredPaths.push(...Object.keys(contractHashes));
@@ -147,7 +147,7 @@ const driftedContracts = Object.entries(contractHashes).flatMap(([relativePath, 
 });
 
 if (driftedContracts.length > 0) {
-  console.error("gentle-pi packaged review-integration/v1 bytes drifted from the byte-identical Gentle AI v2.2.0 contract:");
+  console.error("gentle-pi packaged review-integration/v1 bytes drifted from the byte-identical Gentle AI v2.2.1 contract:");
   for (const drift of driftedContracts) console.error(`- ${drift.relativePath}: expected ${drift.expected}, got ${drift.actual}`);
   process.exit(1);
 }
@@ -179,9 +179,9 @@ if (generatedRuntimeCheck.status !== 0) {
 
 const installer = readFileSync(join(root, "scripts/gentle-ai-installer.mjs"), "utf8");
 const binaryResolver = readFileSync(join(root, "lib/gentle-ai-binary.ts"), "utf8");
-if (!installer.includes('INSTALLER_VERSION = "2.2.0"') || !binaryResolver.includes('GENTLE_AI_VERSION = "2.2.0"')) {
-	console.error("gentle-pi package-local Gentle AI version pins are not both v2.2.0.");
+if (!installer.includes('INSTALLER_VERSION = "2.2.1"') || !binaryResolver.includes('GENTLE_AI_VERSION = "2.2.1"')) {
+	console.error("gentle-pi package-local Gentle AI version pins are not both v2.2.1.");
   process.exit(1);
 }
 
-console.log(`gentle-pi package resource check passed (${requiredPaths.length} files; ${Object.keys(contractHashes).length} exact byte-identical v2.2.0 contract artifacts).`);
+console.log(`gentle-pi package resource check passed (${requiredPaths.length} files; ${Object.keys(contractHashes).length} exact byte-identical v2.2.1 contract artifacts).`);

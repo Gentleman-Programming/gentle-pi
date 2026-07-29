@@ -19,16 +19,16 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const RELEASE_BASE_URL = "https://github.com/Gentleman-Programming/gentle-ai/releases/download/v2.2.0/";
+const RELEASE_BASE_URL = "https://github.com/Gentleman-Programming/gentle-ai/releases/download/v2.2.1/";
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const DOWNLOAD_TIMEOUTS = { headers: 10_000, body: 30_000, attempts: 2, retryDelay: 100 };
-export const INSTALLER_VERSION = "2.2.0";
+export const INSTALLER_VERSION = "2.2.1";
 
 // Sentinel used while a re-pinned gentle-ai release is not yet published. A
 // sentinel digest can never match a real SHA-256, so installation fails closed,
 // and verify-package-files.mjs refuses to pack/publish while any digest below
-// still holds it. The v2.2.0 digests are pinned from the published release:
+// still holds it. The v2.2.1 digests are pinned from the published release:
 // archive sha256 values verified against the minisign-signed checksums.txt and
 // freshly computed hashes; binary sha256 values computed from the extracted
 // executables.
@@ -39,16 +39,16 @@ function asset(name, sha256, binarySha256, executable) {
 }
 
 // Windows is absent on purpose. gentle-ai stopped distributing Windows builds
-// in c4b764d0 ("omit unsigned Windows distribution"), so v2.2.0 publishes only
+// in c4b764d0 ("omit unsigned Windows distribution"), so v2.2.1 publishes only
 // darwin and linux archives and there is nothing to pin. A Windows caller now
 // gets resolveGentleAiReleaseAsset's unsupported-platform error, which is the
 // truth: Pi cannot install a binary that upstream does not publish. Restore
 // both rows the moment gentle-ai ships signed Windows assets again.
 export const GENTLE_AI_RELEASE_ASSETS = Object.freeze({
-	"darwin/amd64": asset("gentle-ai_2.2.0_darwin_amd64.tar.gz", "e7ff47db874a298589172187aa3b81857ecc0c2875407df86ec99ff4e3abcbeb", "a1949468689a84ba8ef366a327a3d07e5e9648f413a5ece1b883db884caecfaf", "gentle-ai"),
-	"darwin/arm64": asset("gentle-ai_2.2.0_darwin_arm64.tar.gz", "accef4039cb5ea6517b12c602bd6024895fab395a39547e40a15afd73886e2a1", "bfe2f157e85e141dd78b0cf156f27102cf3185953cafc61807a2fa817c8ee8dd", "gentle-ai"),
-	"linux/amd64": asset("gentle-ai_2.2.0_linux_amd64.tar.gz", "56efe0611c2af21913cd7fa768e05a0e6130d026a4157b909a5227e0e0a3b266", "d7554fe0463ecea9e0335202f3f6664278657144e2fce747ddf2a7b877fd93bb", "gentle-ai"),
-	"linux/arm64": asset("gentle-ai_2.2.0_linux_arm64.tar.gz", "d7cfb3b2e6502cd7f1c3478487b86a2da2b0986cb852a896a3d2fcd4b191e3b9", "ad4d6616a27ef42cb763336dc13fbf3186205e4d006e523a4f73f3125022eb38", "gentle-ai"),
+	"darwin/amd64": asset("gentle-ai_2.2.1_darwin_amd64.tar.gz", "aff2184701ab634b64f5b05f1fe6a887c7d9b7920e59459c807c30df55638945", "d098e6776cef15db916a01ca5c17eb04de61e88bd8975b64c155abe133ed461f", "gentle-ai"),
+	"darwin/arm64": asset("gentle-ai_2.2.1_darwin_arm64.tar.gz", "d3963dc15029d713df127c5cb5ff552add862d4e47dee6ab736a8554ffd68bfd", "fd460ff3fef911228e8529275957394ebe27dd61fe3cd2650daff24976a8df01", "gentle-ai"),
+	"linux/amd64": asset("gentle-ai_2.2.1_linux_amd64.tar.gz", "02a72f48cf9d108ed9189eddbfe1dffd27b65a2ed9ebc33925756446a85352e2", "fe007488ad544bfe500dbfb2e4daeb357af54f2b7e43bf806a23b97f724cd18a", "gentle-ai"),
+	"linux/arm64": asset("gentle-ai_2.2.1_linux_arm64.tar.gz", "4eb7887d0c9b555bb976110567bed9491edcc1d54534c81958ae40e879a4091c", "fc9fbb66603d9ce76ebeb2fa0087e8af78e4fc2850ab257c9746dc17bda0ebcd", "gentle-ai"),
 });
 
 function upstreamArchitecture(architecture) {

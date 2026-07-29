@@ -51,8 +51,24 @@ test("2.2.0 lights only the two capabilities its negotiated envelope demonstrabl
 	assert.equal(contract.hint, false);
 });
 
+test("2.2.1 repeats 2.2.0 because the lane Pi speaks did not move", () => {
+	// Ground-truthed against the released v2.2.1 binary. On
+	// review-integration/v1 it advertises capabilities/v1.5 (protocol minor 5),
+	// but the negotiated start envelope is still the closed `start/v2`, so
+	// `risk_evidence` and `hint` still cannot arrive. v2.2.1 does publish a
+	// second contract, review-integration/v2, whose `start/v3` carries frozen
+	// base/candidate trees -- but Pi does not negotiate it yet, and a row
+	// describes the lane in use, not the lane available.
+	const contract = NATIVE_CLI_CONTRACTS["2.2.1"] as Record<string, boolean>;
+	assert.equal(contract.mode, true);
+	assert.equal(contract.delivery, true);
+	assert.equal(contract.riskEvidence, false);
+	assert.equal(contract.hint, false);
+	assert.deepEqual(contract, NATIVE_CLI_CONTRACTS["2.2.0"] as Record<string, boolean>);
+});
+
 test("no shipped version key was added beyond the pin bump", () => {
 	// Rows are promises to consumers, so a new key only ever appears in a
 	// dedicated commit alongside a pin bump, never as a side effect.
-	assert.deepEqual(Object.keys(NATIVE_CLI_CONTRACTS), [...DARK_VERSIONS, "2.2.0"]);
+	assert.deepEqual(Object.keys(NATIVE_CLI_CONTRACTS), [...DARK_VERSIONS, "2.2.0", "2.2.1"]);
 });

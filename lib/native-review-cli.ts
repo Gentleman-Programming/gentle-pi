@@ -538,6 +538,14 @@ export const NATIVE_CLI_CONTRACTS = Object.freeze({
 	// byte-pinned fixture and therefore belongs to a gentle-ai release, not to
 	// a Pi capability flip.
 	"2.2.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	// 2.2.1 repeats 2.2.0 because the wire did not move for the lane Pi speaks.
+	// v2.2.1 advertises capabilities/v1.5 (protocol minor 5) on
+	// review-integration/v1, but the negotiated start envelope is still the
+	// closed `start/v2`, so riskEvidence and hint stay dark for the same reason
+	// they are dark on 2.2.0. The release does publish a second contract,
+	// review-integration/v2, whose `start/v3` carries base/candidate trees --
+	// but Pi does not negotiate it yet, and a row must describe the lane in use.
+	"2.2.1": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 });
 type NativeCliCapability = keyof (typeof NATIVE_CLI_CONTRACTS)[keyof typeof NATIVE_CLI_CONTRACTS];
 
