@@ -166,9 +166,26 @@ export interface NativeReviewModeResult {
 // terminal answered the one-time consent question — which is always true when
 // Pi spawns gentle-ai without a TTY. Any other text still fails closed as
 // UNEXPECTED_STDERR.
+// Each entry is one whole line gentle-ai may write to the console stream while
+// still succeeding. The provenance line rides with the skip notice whenever the
+// resolved mode source is `default`, so a headless START legitimately emits two
+// lines; they are separate Fprintln calls, never one joined string.
 export const REVIEW_CONSENT_NOTICES = Object.freeze([
 	"Gentle AI reviewed this change without asking, because this session has no terminal to answer on. Run 'gentle-ai review mode disable' to turn reviews off, or 'gentle-ai review mode status' to see the current setting.",
+	"Reviews are on by default; this was never explicitly chosen. Run 'gentle-ai review mode enable' to make reviews an explicit choice, or 'gentle-ai review mode disable' to turn them off.",
+	"Gentle AI could not read an answer, so it reviewed this change and will ask again next time.",
+	"Gentle AI did not recognize that answer, so it reviewed this change and will ask again next time.",
+	"Review skipped for this candidate at your request. It will be offered again on the next change.",
 ]);
+
+// Every non-empty line must be allowlisted. Matching the whole stderr blob as
+// one string only worked while exactly one notice could appear; the moment a
+// second legitimate line joined it, an otherwise successful START was reported
+// as unexpected-stderr.
+function stderrIsTolerated(stderr: string, tolerated: readonly string[]): boolean {
+	const lines = stderr.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+	return lines.length > 0 && lines.every((line) => tolerated.includes(line));
+}
 
 export const NATIVE_REVIEW_RECOVER_DISPOSITION = ["scope_changed", "invalidated", "escalated"] as const;
 export type NativeReviewRecoverDisposition = (typeof NATIVE_REVIEW_RECOVER_DISPOSITION)[number];
@@ -261,7 +278,7 @@ export interface NativeReviewLegacyAliasRepairRequest {
 /** Raw audited native record; Pi relays it verbatim and never reinterprets it. */
 export interface NativeReviewRecoveryResult { record: Record<string, unknown>; }
 
-export interface NativeStartRequest { cwd: string; baseRef?: string; committedOnly?: boolean; lineageId?: string; policyPath?: string; focus?: string; signal?: AbortSignal; }
+export interface NativeStartRequest { cwd: string; baseRef?: string; committedOnly?: boolean; lineageId?: string; policyPath?: string; focus?: string; projection?: "workspace" | "staged"; signal?: AbortSignal; }
 export interface NativeFinalizeLensResult { lens: string; document: unknown; }
 export interface NativeFinalizeRequest {
 	cwd: string;
@@ -407,6 +424,76 @@ export function isCanonicalProcessString(value: unknown): value is string {
 }
 
 const NATIVE_RISK_LEVEL = ["low", "medium", "high"] as const;
+
+// gentle-ai's negotiated `start/v2` envelope is a closed schema
+// (`additionalProperties: false`), so the two projections its plain sibling
+// carries cannot be added to it without a new contract version. Both are
+// projections of facts `start/v2` already reports as required fields, so a
+// negotiated caller reconstructs them here instead of ending up with a worse
+// recovery story than a plain one. These are Pi-side renderings of native
+// facts, never a claim that the CLI sent them: the `riskEvidence`/`hint`
+// capability rows stay dark for every version whose envelope omits them.
+//
+// Byte-for-byte mirrors of internal/cli/review_mode.go and review_facade.go.
+// `reviewConsentEvidencePhrases` is documented there as the single phrasing
+// source so its surfaces cannot drift, which makes this a second surface: an
+// unrecognized reason code therefore renders nothing rather than guessing, and
+// nativeRiskEvidencePhrases is pinned against a gentle-ai fixture in
+// tests/native-review-parity.test.ts so a vocabulary change fails loudly.
+const REVIEW_EMPTY_CANDIDATE_HINT =
+	"the candidate has no pending changes; already-committed work can be reviewed by rerunning review start with --base-ref <commit> naming the base to compare against";
+const REVIEW_MEDIUM_RISK_REASON = "this change is not purely passive documentation, so it gets one consolidated review.";
+const REVIEW_EMPTY_CONTENT_CODE = "empty_content";
+const REVIEW_RISK_SUBJECT_BY_CODE: Readonly<Record<string, string>> = Object.freeze({
+	service_token: "service credentials",
+	shell_source: "shell scripting",
+	process_boundary: "code that starts other processes",
+	process_scan_limit: "code that starts other processes",
+	executable_mode: "an executable permission change",
+	executable_change: "an executable change",
+	configuration_change: "a configuration change",
+});
+const REVIEW_RISK_SUBJECT_BY_SIGNAL: Readonly<Record<string, string>> = Object.freeze({
+	auth: "authentication",
+	update: "the update path",
+	security: "security",
+	payments: "payments",
+	data_exposure: "data exposure",
+	data_loss: "data loss",
+	permissions: "permissions",
+	shell_process: "shell or process execution",
+});
+// The Go signal switch has no empty default: every hot_path reason speaks, and
+// an unmapped signal degrades to this rather than dropping the path entirely.
+const REVIEW_RISK_UNKNOWN_SIGNAL_SUBJECT = "a sensitive area";
+
+function nativeRiskEvidenceSubject(reason: Record<string, unknown>): string {
+	const code = typeof reason.code === "string" ? reason.code : "";
+	if (code === "hot_path") {
+		const signal = typeof reason.signal === "string" ? reason.signal : "";
+		return REVIEW_RISK_SUBJECT_BY_SIGNAL[signal] ?? REVIEW_RISK_UNKNOWN_SIGNAL_SUBJECT;
+	}
+	return REVIEW_RISK_SUBJECT_BY_CODE[code] ?? "";
+}
+
+function nativeRiskEvidencePhrase(reason: Record<string, unknown>): string {
+	const path = typeof reason.path === "string" ? reason.path.trim() : "";
+	// An empty file is named first and described second. Every other subject
+	// reads "<what changed> in <path>", which for a file with no bytes would
+	// assert something about content that is not there.
+	if (reason.code === REVIEW_EMPTY_CONTENT_CODE) {
+		return path === "" ? "" : `${path}, an empty file whose type cannot be determined from its content`;
+	}
+	const subject = nativeRiskEvidenceSubject(reason);
+	if (subject === "" || path === "") return subject;
+	return `${subject} in ${path}`;
+}
+
+export function nativeRiskEvidencePhrases(riskLevel: string, reasons: readonly Record<string, unknown>[]): readonly string[] {
+	if (riskLevel !== "high" && riskLevel !== "medium") return [];
+	const phrases = reasons.map((reason) => nativeRiskEvidencePhrase(reason)).filter((phrase) => phrase !== "");
+	return riskLevel === "medium" ? [REVIEW_MEDIUM_RISK_REASON, ...phrases] : phrases;
+}
 const NATIVE_REVIEW_LENS = ["review-risk", "review-resilience", "review-readability", "review-reliability"] as const;
 const NATIVE_FINALIZE_STATE = ["reviewing", "correction_required", "validating", "approved", "escalated"] as const;
 const NATIVE_START_ACTION_VALUES = Object.values(NATIVE_START_ACTION);
@@ -430,6 +517,27 @@ export const NATIVE_CLI_CONTRACTS = Object.freeze({
 	"2.1.9": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
 	"2.1.10": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, ...ORGANIC_PARITY_DARK }),
 	"2.1.11": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, ...ORGANIC_PARITY_DARK }),
+	// First capability-true row, paired with the triple pin bump in this same
+	// commit as Design Decision #1 requires.
+	//
+	// Only two of the four organic-parity columns are lit, because a capability
+	// row is a promise and these are the two whose data was proven to reach the
+	// negotiated path Pi actually consumes:
+	//
+	//   mode      `gentle-ai review mode status` answers the review-mode/v1
+	//             envelope directly.
+	//   delivery  the gate result carries `delivery` ("disabled/unmanaged" when
+	//             the kill switch is off), verified against v2.2.0.
+	//
+	// riskEvidence and hint stay dark deliberately. Both exist in gentle-ai
+	// v2.2.0 but only on the PLAIN start envelope; the negotiated
+	// `review-integration.start/v2` that NativeReviewCliV216 decodes carries
+	// `risk_reasons` instead of `risk_evidence` and omits `hint` entirely.
+	// Lighting them would advertise data that cannot arrive. Closing that gap
+	// needs the negotiated start envelope extended upstream, which moves a
+	// byte-pinned fixture and therefore belongs to a gentle-ai release, not to
+	// a Pi capability flip.
+	"2.2.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 });
 type NativeCliCapability = keyof (typeof NATIVE_CLI_CONTRACTS)[keyof typeof NATIVE_CLI_CONTRACTS];
 
@@ -915,7 +1023,7 @@ export class NativeReviewCliV214 {
 		if (result.signal) throw nativeError(NATIVE_REVIEW_ERROR_CODE.SIGNAL, operation, mutating, "native process was signalled", result);
 		const structuredValidateDenial = operation === NATIVE_REVIEW_OPERATION.VALIDATE && result.exitCode === 1;
 		const maintenancePartialFailure = [NATIVE_REVIEW_OPERATION.ABANDON, NATIVE_REVIEW_OPERATION.QUARANTINE_LEGACY, NATIVE_REVIEW_OPERATION.RECONCILE_AUTHORITY, NATIVE_REVIEW_OPERATION.REPAIR_LEGACY_ALIAS].includes(operation) && result.exitCode !== 0;
-		const toleratedNotice = result.stderr.trim().length > 0 && toleratedStderr.includes(result.stderr.trim());
+		const toleratedNotice = stderrIsTolerated(result.stderr, toleratedStderr);
 		if (result.exitCode !== 0 && !structuredValidateDenial && !maintenancePartialFailure) throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, operation, mutating, "native process failed", result);
 		if (result.stderr.trim().length > 0 && !structuredValidateDenial && !maintenancePartialFailure && !toleratedNotice) throw nativeError(NATIVE_REVIEW_ERROR_CODE.UNEXPECTED_STDERR, operation, mutating, "native process wrote stderr", result);
 		return { body: parseJson(result.stdout, operation, mutating, diagnostics), exitCode: result.exitCode, process: result };
@@ -1425,6 +1533,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		mutating: boolean,
 		signal: AbortSignal | undefined,
 		path: string,
+		toleratedStderr: readonly string[] = [],
 	): Promise<NegotiatedExecution> {
 		let result: ExecFileResult;
 		try {
@@ -1446,7 +1555,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 				throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, operation, mutating, "native negotiated operation failed without a valid failure envelope", result);
 			}
 		}
-		if (result.stderr.trim().length > 0) throw nativeError(NATIVE_REVIEW_ERROR_CODE.UNEXPECTED_STDERR, operation, mutating, "native process wrote stderr", result);
+		if (result.stderr.trim().length > 0 && !stderrIsTolerated(result.stderr, toleratedStderr)) throw nativeError(NATIVE_REVIEW_ERROR_CODE.UNEXPECTED_STDERR, operation, mutating, "native process wrote stderr", result);
 		return { body, exitCode: result.exitCode };
 	}
 
@@ -1480,6 +1589,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		arguments_: readonly string[],
 		mutating: boolean,
 		signal?: AbortSignal,
+		toleratedStderr: readonly string[] = [],
 	): Promise<NegotiatedExecution> {
 		const executable = this.verifiedExecutable(operation, mutating);
 		await this.capabilities({ cwd, ...(signal === undefined ? {} : { signal }) });
@@ -1487,20 +1597,38 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		if (afterNegotiation.path !== executable.path || afterNegotiation.digest !== executable.digest) {
 			throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, operation, mutating, "native executable was replaced after capability negotiation", undefined, false);
 		}
-		return this.invoke(operation, cwd, arguments_, mutating, signal, executable.path);
+		return this.invoke(operation, cwd, arguments_, mutating, signal, executable.path, toleratedStderr);
 	}
 
 	async start(request: NativeStartRequest): Promise<NativeStartResult> {
 		if (request.baseRef !== undefined && !isCanonicalProcessString(request.baseRef)) throw new TypeError("Native START baseRef must be a non-empty, trimmed, NUL-free string");
 		if (request.baseRef !== undefined && request.committedOnly !== true) throw new TypeError("Native START baseRef requires explicit committedOnly acknowledgement");
 		if (request.baseRef === undefined && request.committedOnly !== undefined) throw new TypeError("Native START committedOnly requires an explicit baseRef");
+		// A negotiated START requires exactly one --contract, --target, and
+		// --projection. The target is resolved here, from the same root START is
+		// about to run in, rather than threaded in by the caller: the caller's
+		// root and START's root differ whenever a candidate view is in play, and
+		// a target frozen from the wrong root would name a snapshot this START
+		// never inspects. targetStatus is read-only, so this costs one extra
+		// read and cannot create authority.
+		const projection = request.projection ?? "workspace";
+		const target = await this.targetStatus({
+			cwd: request.cwd,
+			projection,
+			...(request.baseRef === undefined ? {} : { baseRef: request.baseRef }),
+			...(request.lineageId === undefined ? {} : { lineageId: request.lineageId }),
+			...(request.signal === undefined ? {} : { signal: request.signal }),
+		});
 		const execution = await this.negotiated(NATIVE_REVIEW_OPERATION.START, request.cwd, [
 			"review", "start", "--contract", REVIEW_INTEGRATION_CONTRACT, "--cwd", request.cwd,
+			"--target", target.targetIdentity, "--projection", projection,
 			...(request.baseRef === undefined ? [] : ["--base-ref", request.baseRef, "--committed-only"]),
 			...(request.lineageId === undefined ? [] : ["--lineage", request.lineageId]),
 			...(request.policyPath === undefined ? [] : ["--policy", request.policyPath]),
 			...(request.focus === undefined ? [] : ["--focus", request.focus]),
-		], true, request.signal);
+			// A headless START that reviews without asking still succeeds; its
+			// consent notices are console output, never a failure signal.
+		], true, request.signal, REVIEW_CONSENT_NOTICES);
 		const result = decode(NATIVE_REVIEW_OPERATION.START, true, () => decodeReviewStartV1(execution.body));
 		if (request.lineageId !== undefined && result.lineageId !== request.lineageId) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native start lineage mismatch");
 		return {
@@ -1514,6 +1642,19 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 			action: result.action as NativeStartAction,
 			lensesRequired: result.lensesRequired,
 			riskReasons: result.riskReasons.map((reason) => ({ ...reason })),
+			// Derived, not received. `risk_reasons` is a required start/v2 field
+			// already recomputed against the authoritative frozen snapshot, so
+			// these phrases describe the same candidate the lenses will review.
+			...(() => {
+				const evidence = nativeRiskEvidencePhrases(result.riskLevel, result.riskReasons);
+				return evidence.length === 0 ? {} : { riskEvidence: evidence };
+			})(),
+			// Only the empty-candidate recovery is reconstructed. Its sibling
+			// tells a plain caller to rerun under the negotiated contract, which
+			// this client already did, so relaying it would name a step that
+			// changes nothing. A committed-only start (baseRef) is already the
+			// recovery, and reporting zero changes there is a real answer.
+			...(result.changedFiles === 0 && request.baseRef === undefined ? { hint: REVIEW_EMPTY_CANDIDATE_HINT } : {}),
 			raw: result.raw,
 		};
 	}

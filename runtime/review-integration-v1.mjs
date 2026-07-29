@@ -76,19 +76,32 @@ export const REVIEW_START_STATE = {
 const START_ACTIONS = ["created", "resumed", "reuse-receipt", "blocked-scope-action"]         ;
 const RISK_LEVELS = ["low", "medium", "high"]         ;
 const REVIEW_LENSES = ["review-risk", "review-resilience", "review-readability", "review-reliability"]         ;
-const RISK_REASON_CODES = ["configuration_change", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "process_boundary", "process_scan_limit", "service_token", "shell_source"]         ;
+const RISK_REASON_CODES = ["configuration_change", "empty_content", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "process_boundary", "process_scan_limit", "service_token", "shell_source"]         ;
 const RISK_SIGNALS = ["auth", "update", "security", "payments", "permissions", "shell_process"]         ;
-const STATUS_ACTIONS = ["start", "finalize", "validate", "recover", "maintainer_action", "select_lineage", "repair_authority", "reconcile_finalize", "stop"]         ;
+const STATUS_ACTIONS = ["start", "finalize", "validate", "recover", "retry_final_verification", "maintainer_action", "select_lineage", "repair_authority", "reconcile_finalize", "stop"]         ;
 export const REVIEW_STATUS_ACTION_DISPOSITION = {
 	SCOPE_CHANGED: "scope_changed",
 	INVALIDATED: "invalidated",
 	ESCALATED: "escalated",
+	FINAL_VERIFICATION_RETRY: "final_verification_retry",
 }         ;
 
 const RECEIPT_STATUSES = ["expected_missing", "present", "publication_pending", "not_applicable"]         ;
 const REQUIRED_OPERATIONS = Object.freeze(Object.values(REVIEW_INTEGRATION_OPERATION));
 const REQUIRED_GATES = Object.freeze(["post-apply", "pre-commit", "pre-push", "pre-pr", "release"]         );
 const REQUIRED_PROJECTIONS = Object.freeze(Object.values(REVIEW_PROJECTION));
+// Protocol minor 3 REPLACED three payload schemas with their v2 successors
+// instead of listing them alongside the originals: from that minor on, a
+// provider advertises start/v2, status/v2, and review-result-artifact/v2 and
+// never the v1 names. A consumer that keeps demanding the v1 names cannot be
+// satisfied by any provider from minor 3 onward, so this remaps rather than
+// unions. The capabilities schema itself is remapped the same way, one line
+// below, and has been since minor 1.
+const SCHEMA_SUCCESSORS_FROM_MINOR_3                                   = Object.freeze({
+	"gentle-ai.review-integration.start/v1": "gentle-ai.review-integration.start/v2",
+	"gentle-ai.review-integration.status/v1": "gentle-ai.review-integration.status/v2",
+	"gentle-ai.review-result-artifact/v1": "gentle-ai.review-result-artifact/v2",
+});
 const REQUIRED_SCHEMAS = Object.freeze([
 	"gentle-ai.review-authority-status/v1",
 	"gentle-ai.review-gate-request/v1",
@@ -241,15 +254,25 @@ const REQUIRED_MANDATORY_FEATURES = Object.freeze(FEATURE_NAMES.filter((name) =>
 
 
 
-const ELIGIBLE_ACTIONS = ["stop", "review.start", "review.finalize", "review.validate", "review.recover"]         ;
-const FORBIDDEN_ACTIONS = ["review.abandon", "review.finalize", "review.invalidate", "review.quarantine-legacy", "review.reclaim", "review.reconcile-authority", "review.recover", "review.start", "review.validate"]         ;
-const NEXT_TRANSITION_OPERATIONS = ["review.start", "review.finalize", "review.recover", "review.validate"]         ;
+// Mirrored from contracts/review-integration/v1/schemas/status-v2.schema.json.
+// The two vocabularies are deliberately different: eligibility names whole
+// operations (`review.recover`), while status.action names bare transitions
+// (`recover`). Keeping the namespaced list short by hand is what let
+// review.reconcile-authority-batch, review.repair, and
+// review.retry_final_verification go missing.
+const ELIGIBLE_ACTIONS = ["stop", "review.start", "review.finalize", "review.validate", "review.recover", "review.repair", "review.retry_final_verification"]         ;
+const FORBIDDEN_ACTIONS = ["review.abandon", "review.finalize", "review.invalidate", "review.quarantine-legacy", "review.reclaim", "review.reconcile-authority", "review.reconcile-authority-batch", "review.recover", "review.repair", "review.retry_final_verification", "review.start", "review.validate"]         ;
+const NEXT_TRANSITION_OPERATIONS = ["review.start", "review.finalize", "review.recover", "review.repair", "review.retry_final_verification", "review.validate"]         ;
 
 function decodeTransitionArguments(value         , label        )       {
 	array(value, label, (entry, entryLabel) => {
-		const argument = exactRecord(entry, entryLabel, ["name", "value"]);
+		// `token` is the ready-to-pass `--name=value` form of the same binding.
+		// The schema keeps it optional (only name and value are required), so a
+		// consumer must accept it without depending on it.
+		const argument = exactRecord(entry, entryLabel, ["name", "value"], ["token"]);
 		text(argument.name, `${entryLabel}.name`, { minimum: 1, pattern: /^[a-z0-9_-]+$/ });
 		text(argument.value, `${entryLabel}.value`, { minimum: 1 });
+		if (argument.token !== undefined) text(argument.token, `${entryLabel}.token`, { minimum: 1 });
 		return argument;
 	});
 }
@@ -466,8 +489,41 @@ function requireIdentity(value                         , schema        , operati
 	if (operation !== undefined && value.operation !== operation) throw new TypeError(`operation must be ${operation}`);
 }
 
+// Protocol minor 3 replaced the start and status payload schemas with v2
+// successors, and NATIVE_CLI_CONTRACTS still lists rows for providers that
+// predate it. Accepting either identity keeps one decoder honest for both
+// instead of forking the client by pinned version; the returned discriminator
+// lets each decoder require the fields its own revision made mandatory.
+function requireVersionedIdentity(value                         , base        , operation        )        {
+	const revision = value.schema === `${base}/v2` ? 2 : value.schema === `${base}/v1` ? 1 : undefined;
+	if (revision === undefined) throw new TypeError(`schema must be ${base}/v1 or ${base}/v2`);
+	if (value.contract !== REVIEW_INTEGRATION_CONTRACT) throw new TypeError(`contract must be ${REVIEW_INTEGRATION_CONTRACT}`);
+	if (value.operation !== operation) throw new TypeError(`operation must be ${operation}`);
+	return revision;
+}
+
 function assertExactSet(actual                   , expected                   , label        )       {
 	if (actual.length !== expected.length || expected.some((value) => !actual.includes(value))) throw new TypeError(`${label} does not match the required integration surface`);
+}
+
+// An advertised surface is a superset promise, not an exact manifest. Each
+// protocol minor publishes its own capabilities schema with its own
+// cardinalities: minor 3 added review.repair, minor 4 added
+// review.retry_final_verification, and the schema list grew from 14 entries to
+// 20 along the way. A provider speaking minor 4 therefore advertises more than
+// a minor-0 consumer knows about, and demanding an exact match rejects a
+// compatible release outright.
+//
+// That is not hypothetical. gentle-ai v2.2.0 negotiates minor 4 and advertises
+// 8 operations; validating it against the minor-0 shape failed every START
+// before it reached native authority. The pinned runtime exists to stop
+// versions from breaking each other, so the consumer checks what it depends on
+// and ignores the rest, exactly as capabilities.compatibility declares:
+// unknown_optional "ignore", unknown_mandatory "reject".
+function assertSupersetOf(actual                   , required                   , label        )       {
+	const advertised = new Set(actual);
+	const missing = required.filter((value) => !advertised.has(value));
+	if (missing.length > 0) throw new TypeError(`${label} omits the required integration surface: ${missing.join(", ")}`);
 }
 
 function decodeFeature(value         , label        , allowAdditional = false)                  {
@@ -501,7 +557,10 @@ export function decodeReviewCapabilitiesV1(value         , verifiedExecutableDig
 	const body = exactRecord(value, "capabilities", requiredFields, [], allowAdditions);
 	const capabilitiesSchema = protocolMinor === 0 ? "gentle-ai.review-integration.capabilities/v1" : `gentle-ai.review-integration.capabilities/v1.${protocolMinor}`;
 	requireIdentity(body, capabilitiesSchema);
-	const requiredSchemas = REQUIRED_SCHEMAS.map((schema) => (schema === "gentle-ai.review-integration.capabilities/v1" ? capabilitiesSchema : schema));
+	const requiredSchemas = REQUIRED_SCHEMAS.map((schema) => {
+		if (schema === "gentle-ai.review-integration.capabilities/v1") return capabilitiesSchema;
+		return protocolMinor >= 3 ? (SCHEMA_SUCCESSORS_FROM_MINOR_3[schema] ?? schema) : schema;
+	});
 
 	const protocol = exactRecord(body.protocol, "capabilities.protocol", ["major", "minor"], [], allowAdditions);
 	if (protocol.major !== protocolMajor || protocol.minor !== protocolMinor) throw new TypeError("incompatible review integration protocol");
@@ -523,14 +582,20 @@ export function decodeReviewCapabilitiesV1(value         , verifiedExecutableDig
 	const normalizedVerifiedDigest = sha256(verifiedExecutableDigest.startsWith("sha256:") ? verifiedExecutableDigest : `sha256:${verifiedExecutableDigest}`, "verified executable digest");
 	if (selfReportedDigest !== normalizedVerifiedDigest) throw new TypeError("review provider executable digest mismatch");
 
-	const operations = enumArray(body.operations, REQUIRED_OPERATIONS, "capabilities.operations", { minimum: 6, maximum: 6, unique: true });
+	// Decoded as free strings, then checked for the entries this consumer
+	// depends on. Constraining the items to the enum this consumer happens to
+	// know would reject a newer provider's additions before the superset check
+	// ever ran.
+	const advertisedOperations = stringArray(body.operations, "capabilities.operations", { minimum: REQUIRED_OPERATIONS.length, ...(allowAdditions ? {} : { maximum: REQUIRED_OPERATIONS.length }), unique: true });
 	const gates = enumArray(body.gates, REQUIRED_GATES, "capabilities.gates", { minimum: 5, maximum: 5, unique: true });
 	const projections = enumArray(body.projections, REQUIRED_PROJECTIONS, "capabilities.projections", { minimum: 2, maximum: 2, unique: true });
-	const schemas = enumArray(body.schemas, requiredSchemas, "capabilities.schemas", { minimum: 14, maximum: 14, unique: true });
-	assertExactSet(operations, REQUIRED_OPERATIONS, "capabilities operations");
+	const operations = REQUIRED_OPERATIONS;
+	const advertisedSchemas = stringArray(body.schemas, "capabilities.schemas", { minimum: requiredSchemas.length, ...(allowAdditions ? {} : { maximum: requiredSchemas.length }), unique: true });
+	const schemas = requiredSchemas;
+	assertSupersetOf(advertisedOperations, REQUIRED_OPERATIONS, "capabilities operations");
 	assertExactSet(gates, REQUIRED_GATES, "capabilities gates");
 	assertExactSet(projections, REQUIRED_PROJECTIONS, "capabilities projections");
-	assertExactSet(schemas, requiredSchemas, "capabilities schemas");
+	assertSupersetOf(advertisedSchemas, requiredSchemas, "capabilities schemas");
 
 	const features = exactRecord(body.features, "capabilities.features", ["mandatory", "optional"], [], allowAdditions);
 	const mandatory = array(features.mandatory, "capabilities.features.mandatory", (entry, label) => decodeFeature(entry, label, allowAdditions), { minimum: 10, ...(allowAdditions ? {} : { maximum: 10 }) });
@@ -573,8 +638,14 @@ export function decodeReviewCapabilitiesV1(value         , verifiedExecutableDig
 
 export function decodeReviewStartV1(value         )                {
 	const overlayFields = ["target_mode", "target_identity", "base_tree", "candidate_tree"]         ;
-	const body = exactRecord(value, "start", ["schema", "contract", "operation", "action", "lenses_required", "lineage_id", "state", "risk_level", "selected_lenses", "projection", "changed_files", "changed_lines", "correction_budget", "risk_reasons"], [...overlayFields]);
-	requireIdentity(body, "gentle-ai.review-integration.start/v1", REVIEW_INTEGRATION_OPERATION.START);
+	// start/v2 made artifact_subjects mandatory and added the three frozen
+	// candidate carriers a selected lens needs. They travel through `raw`
+	// untyped for now: this decoder's job is to stop rejecting a compatible
+	// provider, not to grow a consumer for fields nothing reads yet.
+	const v2Fields = ["artifact_subjects", "changed_path_manifest", "candidate_diff", "repository_context"]         ;
+	const body = exactRecord(value, "start", ["schema", "contract", "operation", "action", "lenses_required", "lineage_id", "state", "risk_level", "selected_lenses", "projection", "changed_files", "changed_lines", "correction_budget", "risk_reasons"], [...overlayFields, ...v2Fields]);
+	const revision = requireVersionedIdentity(body, "gentle-ai.review-integration.start", REVIEW_INTEGRATION_OPERATION.START);
+	if (revision === 2 && !Array.isArray(body.artifact_subjects)) throw new TypeError("start.artifact_subjects is required by start/v2");
 	const overlayPresent = overlayFields.filter((field) => body[field] !== undefined);
 	if (overlayPresent.length > 0 && overlayPresent.length !== overlayFields.length) throw new TypeError("start workspace-overlay target binding requires target_mode, target_identity, base_tree, and candidate_tree together");
 	let overlay                                                                                      = {};
@@ -634,8 +705,11 @@ export function decodeReviewProjectionV1(value         )                        
 }
 
 export function decodeReviewStatusV1(value         )                 {
-	const body = exactRecord(value, "status", ["schema", "contract", "operation", "applicability", "receipt", "action", "replayability", "target_identity", "projection", "candidates"], ["authority", "frozen", "reconciliation", "action_disposition", "eligibility", "next_transition"]);
-	requireIdentity(body, "gentle-ai.review-integration.status/v1", REVIEW_INTEGRATION_OPERATION.STATUS);
+	// `repair` arrived with status/v2 alongside the review.repair operation.
+	// Like the start/v2 additions it travels through `raw`: rejecting it as an
+	// unknown key is what blocked every negotiated status against v2.2.0.
+	const body = exactRecord(value, "status", ["schema", "contract", "operation", "applicability", "receipt", "action", "replayability", "target_identity", "projection", "candidates"], ["authority", "frozen", "reconciliation", "action_disposition", "eligibility", "next_transition", "repair"]);
+	requireVersionedIdentity(body, "gentle-ai.review-integration.status", REVIEW_INTEGRATION_OPERATION.STATUS);
 	const applicability = enumeration(body.applicability, ["current_target", "unrelated", "ambiguous", "corrupted"]         , "status.applicability");
 	const receiptBody = exactRecord(body.receipt, "status.receipt", ["status"], ["identity"]);
 	const receiptStatus = enumeration(receiptBody.status, RECEIPT_STATUSES, "status.receipt.status");

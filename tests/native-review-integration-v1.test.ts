@@ -35,8 +35,13 @@ function queued(results: Result[]): { adapter: ExecFileAdapter; calls: readonly 
 test("v2.1.7 negotiates once per verified digest and binds every operation argv", async () => {
 	clearNativeReviewCapabilitiesCacheForTesting();
 	const digest = "dcc846103b16d365eaeeb9d7f289c23fc4f2897f23def1cb3fe7f05557b64705";
+	// A negotiated START resolves its own target first: gentle-ai requires
+	// exactly one --contract, --target, and --projection, and the target must be
+	// derived from the same root START runs in. That read-only status is the
+	// second call, before the mutating START itself.
 	const queue = queued([
 		{ stdout: JSON.stringify(fixture("capabilities.fixture.json")) },
+		{ stdout: JSON.stringify(fixture("status.fixture.json")) },
 		{ stdout: JSON.stringify(fixture("start.fixture.json")) },
 		{ stdout: JSON.stringify(fixture("status.fixture.json")) },
 	]);
@@ -45,11 +50,13 @@ test("v2.1.7 negotiates once per verified digest and binds every operation argv"
 	await client.targetStatus({ cwd: "/repo with spaces", lineageId: "review-status-fixture" });
 	assert.deepEqual(queue.calls.map((call) => call.arguments), [
 		["review", "capabilities", "--contract", "gentle-ai.review-integration/v1"],
-		["review", "start", "--contract", "gentle-ai.review-integration/v1", "--cwd", "/repo with spaces"],
+		["review", "status", "--contract", "gentle-ai.review-integration/v1", "--cwd", "/repo with spaces", "--projection", "workspace"],
+		["review", "start", "--contract", "gentle-ai.review-integration/v1", "--cwd", "/repo with spaces", "--target", "sha256:e6faad1cb9ceb2db170e0ec9ea5394b44c3991dff6cbd02fb6787539715968f6", "--projection", "workspace"],
 		["review", "status", "--contract", "gentle-ai.review-integration/v1", "--cwd", "/repo with spaces", "--projection", "workspace", "--lineage", "review-status-fixture"],
 	]);
 	assert.equal(queue.calls[0]?.timeoutMs, 321);
-	assert.equal(queue.calls[1]?.timeoutMs, undefined);
+	assert.equal(queue.calls[1]?.timeoutMs, 321, "resolving the target is a read, so it keeps the read timeout");
+	assert.equal(queue.calls[2]?.timeoutMs, undefined, "the mutating START runs without a timeout");
 });
 
 test("v2.1.7 preserves the native uniform failure envelope", async () => {

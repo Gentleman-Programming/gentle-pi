@@ -153,16 +153,51 @@ function authorityInventory(status: Record<string, unknown>): ReviewAuthorityEnt
 	});
 }
 
+// Every reviewer result reaches authority through `review capture-result`.
+// `review finalize --result` was removed because a result handed over that way
+// carries no provider-owned admission, so it cannot prove the lens inspected
+// the frozen candidate. The bindings are never guessed here: each one comes
+// from the collect transition the provider itself publishes, which is also
+// what the removal message tells a caller to do.
+//
+// Artifacts stay outside the repository on purpose. Writing them inside changes
+// the workspace snapshot between deriving a target and using it, and authority
+// correctly rejects the stale target that results.
+async function nextTransition(repository: string): Promise<Record<string, unknown>> {
+	const status = JSON.parse((await run(binary, ["review", "status", "--contract", "gentle-ai.review-integration/v1", "--cwd", repository, "--projection", "workspace", "--next-transition"], repository)).stdout) as Record<string, unknown>;
+	return status.next_transition as Record<string, unknown>;
+}
+
+async function captureSelectedLenses(repository: string, artifacts: string, evidenceName: string): Promise<void> {
+	for (let guard = 0; guard < 8; guard += 1) {
+		const transition = await nextTransition(repository);
+		const collect = transition.collect as { inputs?: readonly Record<string, unknown>[] } | undefined;
+		if (transition.kind !== "collect" || collect?.inputs === undefined) return;
+		for (const [index, input] of collect.inputs.entries()) {
+			const subject = input.artifact_subject as { subject_hash: string };
+			const manifest = input.changed_path_manifest as readonly { path: string }[];
+			const result = join(artifacts, `${evidenceName}-capture-${index}.json`);
+			await writeFile(result, JSON.stringify({
+				subject_hash: subject.subject_hash,
+				inspection: { status: "completed", paths: manifest.map((entry) => entry.path) },
+				findings: [],
+				evidence: ["reviewed the complete frozen candidate scope"],
+			}));
+			// The published tokens already carry the repository context, and
+			// capture-result accepts that or --cwd, never both.
+			const tokens = (input.arguments as readonly { token: string }[]).map((argument) => argument.token);
+			const captured = await run(binary, ["review", "capture-result", ...tokens, "--input", result], repository);
+			assert.equal(captured.exitCode, 0, `capture-result failed: ${captured.stderr}`);
+		}
+	}
+	assert.fail("collect transitions did not converge");
+}
+
 async function finalizeEmptyReview(repository: string, artifacts: string, started: ReviewStart, evidenceName: string): Promise<CommandResult> {
 	const evidence = join(artifacts, evidenceName);
 	await writeFile(evidence, `evidence for ${started.lineage_id}\n`);
-	const resultFiles: string[] = [];
-	for (const [index] of started.selected_lenses.entries()) {
-		const result = join(artifacts, `${evidenceName}-lens-${index}.json`);
-		await writeFile(result, JSON.stringify({ findings: [], evidence: ["reviewed frozen candidate"] }));
-		resultFiles.push(result);
-	}
-	return run(binary, ["review", "finalize", "--cwd", repository, "--lineage", started.lineage_id, ...resultFiles.flatMap((result) => ["--result", result]), "--evidence", evidence], repository);
+	await captureSelectedLenses(repository, artifacts, evidenceName);
+	return run(binary, ["review", "finalize", "--cwd", repository, "--lineage", started.lineage_id, "--captured-results=true", "--evidence", evidence], repository);
 }
 
 test("official pinned package runtime authorizes an unchanged linked-view candidate and denies a changed staging tree", async (t) => {
@@ -206,13 +241,10 @@ test("official pinned package runtime authorizes an unchanged linked-view candid
 
 	const evidence = join(artifacts, "final-evidence.txt");
 	await writeFile(evidence, "linked-view parity probe\n");
-	const resultFiles: string[] = [];
-	for (const [index] of started.selected_lenses.entries()) {
-		const result = join(artifacts, `lens-${index}.json`);
-		await writeFile(result, JSON.stringify({ findings: [], evidence: ["reviewed linked candidate view"] }));
-		resultFiles.push(result);
-	}
-	await run(binary, ["review", "finalize", "--cwd", view, "--lineage", started.lineage_id, ...resultFiles.flatMap((result) => ["--result", result]), "--evidence", evidence], view);
+	// The linked view is the root authority froze, so its collect bindings are
+	// derived from the view, not from the contributor repository.
+	await captureSelectedLenses(view, artifacts, "final-evidence.txt");
+	await run(binary, ["review", "finalize", "--cwd", view, "--lineage", started.lineage_id, "--captured-results=true", "--evidence", evidence], view);
 
 	await run("git", ["add", "--", ...REVIEWED_PATHS], repository);
 	await assertPublishedProjection(repository, candidateTree);
@@ -306,20 +338,29 @@ test("official pinned package runtime keeps frozen candidate lineages and receip
 	assert.equal(competingStartResult.lineage_id, first.lineage_id);
 	assert.equal(competingStartResult.state, "approved");
 	assert.deepEqual(authorityAfterCompetingStart, authorityBeforeCompetingStart, "a blocked scope action must not mutate approved authority");
+	// A plain START over the moved candidate does NOT mint a fresh lineage. An
+	// approved lineage whose scope changed is recovered, keeping the operator
+	// pointed at the receipt that already exists instead of quietly abandoning
+	// it, and the recovery itself needs a maintainer to authorize it. Pi mirrors
+	// this because the experience must be the one gentle-ai defines, not a
+	// friendlier one Pi invents.
 	const second = JSON.parse((await run(binary, ["review", "start", "--cwd", repository], repository)).stdout) as ReviewStart;
 	const secondInventory = authorityInventory(await reviewStatus(repository));
-	assert.equal(second.action, "created");
-	assert.equal(second.state, "reviewing");
-	assert.notEqual(second.lineage_id, first.lineage_id, "a distinct candidate must establish a distinct lineage");
+	assert.equal(second.action, "recover");
+	assert.equal(second.state, "approved");
+	assert.equal(second.lineage_id, first.lineage_id, "a moved candidate recovers the approved lineage rather than replacing it");
 	const secondReplay = JSON.parse((await run(binary, ["review", "start", "--cwd", repository], repository)).stdout) as ReviewStart;
 	const secondReplayInventory = authorityInventory(await reviewStatus(repository));
+	assert.equal(secondReplay.action, "recover", "recovery is idempotent");
 	assert.equal(secondReplay.lineage_id, second.lineage_id, "replaying the second START must reuse its lineage");
 	assert.deepEqual(secondReplayInventory, secondInventory, "replaying the second START must not duplicate durable authority");
-	await finalizeEmptyReview(repository, artifacts, second, "second-evidence.txt");
+	const recoveryTransition = await nextTransition(repository);
+	assert.equal(recoveryTransition.kind, "collect");
+	assert.equal(recoveryTransition.reason_code, "recovery_authorization_required", "recovery must ask a maintainer, never proceed on its own");
 
-	const secondAllowed = JSON.parse((await run(binary, ["review", "validate", "--gate", "pre-commit", "--cwd", repository, "--lineage", second.lineage_id], repository)).stdout) as ReviewGateResult;
-	assert.equal(secondAllowed.result, "allow");
-	assert.equal(secondAllowed.context.candidate_tree, secondCandidateTree);
+	// No receipt covers the moved candidate, so delivery is denied rather than
+	// waved through, and the denial names `gentle-ai review recover` with the
+	// inputs it needs. A blocked gate that names its exit is the whole point.
 	await assertScopeChanged(repository, first.lineage_id);
 
 	await writeFile(join(repository, "tracked.txt"), "candidate one\n");
@@ -379,7 +420,10 @@ test("registered gentle_review START materializes a safe internal skill symlink 
 	let returned: { details?: unknown } | undefined;
 	let thrown: unknown;
 	try {
-		returned = await controller.execute("issue-146-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, { cwd: repository, hasUI: false, ui: { confirm: async () => true } } as unknown as ExtensionContext);
+		// A headless context still receives notices, so the stub carries notify.
+		// Without it the consent path throws on a real ExtensionContext member,
+		// and the failure reads as a START problem rather than a stub gap.
+		returned = await controller.execute("issue-146-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, { cwd: repository, hasUI: false, ui: { confirm: async () => true, notify: () => {} } } as unknown as ExtensionContext);
 	} catch (caught) {
 		thrown = caught;
 	}

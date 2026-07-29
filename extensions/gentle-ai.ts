@@ -109,11 +109,13 @@ import {
 	NATIVE_REVIEW_LEGACY_QUARANTINE,
 	NATIVE_REVIEW_LEGACY_ALIAS_REPAIR,
 	NATIVE_REVIEW_MODE_OPERATION,
+	NATIVE_REVIEW_MODE_SOURCE,
 	NATIVE_REVIEW_RECONCILE_ANOMALIES,
 	sanitizeForeignNativeReviewDiagnostics,
 	type NativeReviewCli,
 	type NativeFinalizeResult,
 	type NativeReviewModeOperation,
+	type NativeReviewModeSource,
 	type NativeReviewProcessDiagnostics,
 	type NativeStartResult,
 	type NativeValidateResult,
@@ -3829,11 +3831,43 @@ function nativeStartPreAuthorityRejection(): NativeStartPreAuthorityRejection {
 // caller's existing nativeOperationFailure handling.
 const REVIEW_MODE_DISABLED_OUTCOME = "review-mode-disabled";
 
-function nativeReviewModeSkipped(operation: ReviewControllerOperation): Record<string, unknown> {
+// Parity with gentle-ai's reviewModeScopeForSource
+// (internal/reviewtransaction/rdd_mode.go): the continuation is scoped to the
+// source that actually decided, so the operator is not left to work out which
+// of the two independent sources they have to change.
+//
+// The clone-local branch names Pi's own command because that is exactly what
+// it sets. The global branch must NOT: `/gentle:review-mode` always passes
+// `--scope clone` (Design Decision #7 — Pi never mutates the operator's global
+// gentle-ai state), and gentle-ai's cloneLocalRDDOverrideValue maps "on" onto
+// "inherit" because a clone-local override may only ever disable. So a
+// clone-scope enable against a global off exits 0, reports operation "enable",
+// and changes nothing — ground-truthed against a real build. Naming it here
+// would be naming a dead end, which is worse than naming nothing.
+//
+// The default source expresses no opinion and can never be what keeps reviews
+// off, so it gets no guessed continuation — the same reason gentle-ai returns
+// an empty scope for RDDModeSourceDefault.
+function reviewModeContinuation(source: NativeReviewModeSource): string | undefined {
+	if (source === NATIVE_REVIEW_MODE_SOURCE.CLONE_LOCAL) return "Run /gentle:review-mode enable to turn reviews back on for this clone.";
+	if (source === NATIVE_REVIEW_MODE_SOURCE.GLOBAL) return "Run `gentle-ai review mode enable --scope=global` to turn reviews back on; /gentle:review-mode enable only clears the clone-local setting, which cannot override a global off.";
+	return undefined;
+}
+
+// Names the situation before the mechanism, then the mechanism, mirroring
+// gentle-ai's RDDDisabledError.Error(). Pi skips rather than rejects — a
+// disabled switch never blocks here — but it must not discard which source
+// decided, because that is precisely the information the operator needs and
+// the only thing that selects a working way back on.
+function nativeReviewModeSkipped(operation: ReviewControllerOperation, source: NativeReviewModeSource): Record<string, unknown> {
+	const continuation = reviewModeContinuation(source);
 	return {
 		operation,
 		status: "skipped",
 		outcome: REVIEW_MODE_DISABLED_OUTCOME,
+		mode_source: source,
+		reason: `review-driven development is disabled: ${operation} is skipped because the ${source} mode source keeps it off`,
+		...(continuation === undefined ? {} : { next_action: continuation }),
 		...nativeStartPreAuthorityRejection(),
 	};
 }
@@ -3847,7 +3881,7 @@ async function resolveReviewModeGate(
 	if (nativeReviewCli?.reviewMode === undefined) return undefined;
 	try {
 		const mode = await nativeReviewCli.reviewMode({ cwd, operation: NATIVE_REVIEW_MODE_OPERATION.STATUS, ...(signal === undefined ? {} : { signal }) });
-		return mode.status.effective === "off" ? nativeReviewModeSkipped(operation) : undefined;
+		return mode.status.effective === "off" ? nativeReviewModeSkipped(operation, mode.status.source) : undefined;
 	} catch (error) {
 		if (asNativeReviewCliError(error)?.code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE) return undefined;
 		throw error;
@@ -5994,7 +6028,22 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 			}
 			try {
 				const result = await nativeReviewCli.reviewMode({ cwd: ctx.cwd, operation: subAction as NativeReviewModeOperation });
-				ctx.ui.notify(`review-driven development: ${result.status.effective} (decided by ${result.status.source})`, "info");
+				const report = `review-driven development: ${result.status.effective} (decided by ${result.status.source})`;
+				// A mutating sub-action that left the effective mode unchanged did
+				// not do what the user asked, and reporting only the resulting
+				// status reads as if it had. This is reachable for exactly one
+				// shape: `enable` against a global off. Pi always passes
+				// `--scope clone` (Design Decision #7), and a clone-local override
+				// may only ever disable, so the native call exits 0, reports
+				// operation "enable", and changes nothing. Say that, and name the
+				// command that does resolve it — Pi has none, so the honest
+				// continuation is gentle-ai's own global-scope command.
+				const requested = subAction === NATIVE_REVIEW_MODE_OPERATION.ENABLE ? "on" : subAction === NATIVE_REVIEW_MODE_OPERATION.DISABLE ? "off" : result.status.effective;
+				if (result.status.effective !== requested) {
+					ctx.ui.notify(`${report}\nThat did not turn reviews back on: /gentle:review-mode only sets clone scope, and a clone-local setting can never override a global off. Run \`gentle-ai review mode enable --scope=global\` to turn them back on.`, "warning");
+					return;
+				}
+				ctx.ui.notify(report, "info");
 			} catch (error) {
 				if (asNativeReviewCliError(error)?.code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE) {
 					ctx.ui.notify("Gentle AI review mode is not available with the currently negotiated native version.", "info");

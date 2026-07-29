@@ -320,6 +320,7 @@ function unrelatedStartTargetStatus(): ReviewStatusV1 {
 interface FakeOrganicNativeOptions {
 	reviewModeCapable?: boolean;
 	reviewModeEffective?: "on" | "off";
+	reviewModeSource?: "default" | "global" | "clone_local";
 	reviewModeThrows?: boolean;
 	lensesRequired?: boolean;
 	riskEvidence?: readonly string[];
@@ -353,10 +354,17 @@ function fakeOrganicNative(options: FakeOrganicNativeOptions = {}): { native: Na
 			? {
 				async reviewMode(request: { operation: string }) {
 					if (options.reviewModeThrows === true) throw new Error("native review mode process failed");
+					const effective = options.reviewModeEffective ?? "on";
+					const source = options.reviewModeSource ?? "default";
 					return {
 						operation: request.operation,
 						scope: "both",
-						status: { global: "", cloneLocal: "", effective: options.reviewModeEffective ?? "on", source: "default" },
+						status: {
+							global: source === "global" ? effective : "",
+							cloneLocal: source === "clone_local" && effective === "off" ? "off" : "",
+							effective,
+							source,
+						},
 					};
 				},
 			}
@@ -421,6 +429,53 @@ test("kill-switch: effective off returns a non-failure skipped envelope and neve
 	assert.equal(result.outcome, "review-mode-disabled");
 	assert.equal(result.mutation_performed, false);
 	assert.equal(state.startCalls, 0, "native start must not be called once the kill switch reports off");
+});
+
+// Parity with gentle-ai's RDDDisabledError.Error()
+// (internal/reviewtransaction/rdd_mode.go): a refusal names the situation, the
+// source that actually decided, and a continuation scoped to that source. Pi
+// never blocks here — the envelope is a non-failure skip — but it must not
+// throw away which source decided, nor leave the caller without a way back on.
+test("kill-switch: a clone-local off names the deciding source and the Pi command that turns reviews back on", async (t) => {
+	const cwd = repository(t);
+	const { native } = fakeOrganicNative({ reviewModeEffective: "off", reviewModeSource: "clone_local" });
+	const { controller } = runtime(native);
+	const result = await execStart(controller, "kill-switch-clone-local", headlessContext(cwd));
+	assert.equal(result.status, "skipped");
+	assert.equal(result.outcome, "review-mode-disabled");
+	assert.equal(result.mode_source, "clone_local");
+	assert.equal(result.reason, "review-driven development is disabled: start is skipped because the clone_local mode source keeps it off");
+	assert.equal(result.next_action, "Run /gentle:review-mode enable to turn reviews back on for this clone.");
+});
+
+// gentle-ai maps RDDModeSourceGlobal onto `--scope=global`, and a clone-local
+// override may only ever disable (cloneLocalRDDOverrideValue rejects RDDModeOn).
+// Pi's own /gentle:review-mode always passes --scope clone, so it CANNOT clear a
+// global off. Naming it here would be naming a dead end, so the continuation has
+// to be the native command that actually resolves it.
+test("kill-switch: a global off names the native global-scope command, never Pi's clone-scope one", async (t) => {
+	const cwd = repository(t);
+	const { native } = fakeOrganicNative({ reviewModeEffective: "off", reviewModeSource: "global" });
+	const { controller } = runtime(native);
+	const result = await execStart(controller, "kill-switch-global", headlessContext(cwd));
+	assert.equal(result.mode_source, "global");
+	assert.equal(result.reason, "review-driven development is disabled: start is skipped because the global mode source keeps it off");
+	assert.equal(
+		result.next_action,
+		"Run `gentle-ai review mode enable --scope=global` to turn reviews back on; /gentle:review-mode enable only clears the clone-local setting, which cannot override a global off.",
+	);
+	assert.ok(!/\/gentle:review-mode enable to turn/.test(String(result.next_action)), "a global off must never be sent to Pi's clone-scope command");
+});
+
+// Parity with reviewModeScopeForSource: the default source expresses no opinion
+// and can never be what keeps reviews off, so it gets no guessed continuation.
+test("kill-switch: an off with the default source names no continuation rather than guessing one", async (t) => {
+	const cwd = repository(t);
+	const { native } = fakeOrganicNative({ reviewModeEffective: "off", reviewModeSource: "default" });
+	const { controller } = runtime(native);
+	const result = await execStart(controller, "kill-switch-default", headlessContext(cwd));
+	assert.equal(result.mode_source, "default");
+	assert.equal(result.next_action, undefined);
 });
 
 test("kill-switch: capability-absent (no reviewMode) leaves today's path unchanged", async (t) => {
@@ -553,6 +608,38 @@ test("gentle:review-mode command reports status, disables, and enables through e
 	const notices: Array<{ message: string; type?: string }> = [];
 	await command!.handler("status", headlessContext(cwd, notices) as unknown as ExtensionContext);
 	assert.ok(notices.at(-1)?.message.includes("off"));
+});
+
+// Ground-truthed against a real gentle-ai build: with the global source off,
+// `review mode enable --scope clone` exits 0, reports operation "enable", and
+// leaves effective "off" — because cloneLocalRDDOverrideValue maps "on" onto
+// "inherit" and a clone-local override may only ever disable. Pi hard-codes
+// --scope clone by design, so this request can never succeed; reporting the
+// bare status would let the user believe /gentle:review-mode enable is the way
+// back on when it is a dead end.
+test("gentle:review-mode: an enable that cannot take effect says so and names the command that can", async (t) => {
+	const cwd = repository(t);
+	const { native } = fakeOrganicNative({ reviewModeEffective: "off", reviewModeSource: "global" });
+	const { commands } = runtime(native);
+	const command = commands.get("gentle:review-mode")!;
+	const notices: Array<{ message: string; type?: string }> = [];
+	await command.handler("enable", headlessContext(cwd, notices) as unknown as ExtensionContext);
+	const notice = notices.at(-1)!;
+	assert.equal(notice.type, "warning", "a request that did not take effect is not an informational result");
+	assert.equal(
+		notice.message,
+		"review-driven development: off (decided by global)\nThat did not turn reviews back on: /gentle:review-mode only sets clone scope, and a clone-local setting can never override a global off. Run `gentle-ai review mode enable --scope=global` to turn them back on.",
+	);
+});
+
+test("gentle:review-mode: an enable that does take effect keeps the existing informational report", async (t) => {
+	const cwd = repository(t);
+	const { native } = fakeOrganicNative({ reviewModeEffective: "on", reviewModeSource: "default" });
+	const { commands } = runtime(native);
+	const command = commands.get("gentle:review-mode")!;
+	const notices: Array<{ message: string; type?: string }> = [];
+	await command.handler("enable", headlessContext(cwd, notices) as unknown as ExtensionContext);
+	assert.deepEqual(notices, [{ message: "review-driven development: on (decided by default)", type: "info" }]);
 });
 
 test("gentle:review-mode command reports unavailability without throwing when the capability is dark", async (t) => {

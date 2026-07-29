@@ -19,31 +19,36 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const RELEASE_BASE_URL = "https://github.com/Gentleman-Programming/gentle-ai/releases/download/v2.1.11/";
+const RELEASE_BASE_URL = "https://github.com/Gentleman-Programming/gentle-ai/releases/download/v2.2.0/";
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const DOWNLOAD_TIMEOUTS = { headers: 10_000, body: 30_000, attempts: 2, retryDelay: 100 };
-const INSTALLER_VERSION = "2.1.11";
+export const INSTALLER_VERSION = "2.2.0";
 
 // Sentinel used while a re-pinned gentle-ai release is not yet published. A
 // sentinel digest can never match a real SHA-256, so installation fails closed,
 // and verify-package-files.mjs refuses to pack/publish while any digest below
-// still holds it. The v2.1.11 digests are pinned from the published release:
-// archive sha256 values verified against checksums.txt and freshly computed
-// hashes; binary sha256 values computed from the extracted executables.
+// still holds it. The v2.2.0 digests are pinned from the published release:
+// archive sha256 values verified against the minisign-signed checksums.txt and
+// freshly computed hashes; binary sha256 values computed from the extracted
+// executables.
 export const GENTLE_AI_PENDING_DIGEST = "PENDING-GENTLE-AI-RELEASE-DIGEST";
 
 function asset(name, sha256, binarySha256, executable) {
 	return Object.freeze({ name, sha256, binarySha256, executable, url: `${RELEASE_BASE_URL}${name}` });
 }
 
+// Windows is absent on purpose. gentle-ai stopped distributing Windows builds
+// in c4b764d0 ("omit unsigned Windows distribution"), so v2.2.0 publishes only
+// darwin and linux archives and there is nothing to pin. A Windows caller now
+// gets resolveGentleAiReleaseAsset's unsupported-platform error, which is the
+// truth: Pi cannot install a binary that upstream does not publish. Restore
+// both rows the moment gentle-ai ships signed Windows assets again.
 export const GENTLE_AI_RELEASE_ASSETS = Object.freeze({
-	"darwin/amd64": asset("gentle-ai_2.1.11_darwin_amd64.tar.gz", "80c2a6bba981fd0ec1fdc9b21d9b80c03853cacc644b307ca7baf1faa6b376d2", "bffca50cb51b07cc1c428e21616ea1cf7d25970643fed13ab0aa10fd359bbd02", "gentle-ai"),
-	"darwin/arm64": asset("gentle-ai_2.1.11_darwin_arm64.tar.gz", "27e49a5104ff1ab156276e191b845f266135afe9339f111689ddf340b562c926", "4e39e520abf116a53ff5e36a0cd65756b6fadfa528489f21e9c722bfa00af620", "gentle-ai"),
-	"linux/amd64": asset("gentle-ai_2.1.11_linux_amd64.tar.gz", "d115aaf5724a71503150ebf740769e7aa52e41e673ac39bf5b0ff1be4e3324b0", "45788ac6cf37a6165f50aca3503d4af4e7e375e518fc67010064dccf78f98d2d", "gentle-ai"),
-	"linux/arm64": asset("gentle-ai_2.1.11_linux_arm64.tar.gz", "aea3a4b0064b57df5f831fdf6b27b29e9898a8f9393fd648dea4a8ba563e477e", "2bf929993ba03dd02401a3c35d8b0bff7801717e43d17b39e29f3cd389894e63", "gentle-ai"),
-	"windows/amd64": asset("gentle-ai_2.1.11_windows_amd64.zip", "43fb4e66cf36a7f01d2d343f59fe8ff37396fc0e98fb24abcd95bc79c2450e9a", "1c92cdcaf826d4bec6a6560770e5a0edefc09997364a664a5033abc6ab932b2b", "gentle-ai.exe"),
-	"windows/arm64": asset("gentle-ai_2.1.11_windows_arm64.zip", "9c2884075161715f0efac1ce55cd08f2d9313068f125443ade8de3a83645258a", "a903bface64af274a28cfdd08b5c55c67fc554bac9279d7d466fc3f99020bd89", "gentle-ai.exe"),
+	"darwin/amd64": asset("gentle-ai_2.2.0_darwin_amd64.tar.gz", "e7ff47db874a298589172187aa3b81857ecc0c2875407df86ec99ff4e3abcbeb", "a1949468689a84ba8ef366a327a3d07e5e9648f413a5ece1b883db884caecfaf", "gentle-ai"),
+	"darwin/arm64": asset("gentle-ai_2.2.0_darwin_arm64.tar.gz", "accef4039cb5ea6517b12c602bd6024895fab395a39547e40a15afd73886e2a1", "bfe2f157e85e141dd78b0cf156f27102cf3185953cafc61807a2fa817c8ee8dd", "gentle-ai"),
+	"linux/amd64": asset("gentle-ai_2.2.0_linux_amd64.tar.gz", "56efe0611c2af21913cd7fa768e05a0e6130d026a4157b909a5227e0e0a3b266", "d7554fe0463ecea9e0335202f3f6664278657144e2fce747ddf2a7b877fd93bb", "gentle-ai"),
+	"linux/arm64": asset("gentle-ai_2.2.0_linux_arm64.tar.gz", "d7cfb3b2e6502cd7f1c3478487b86a2da2b0986cb852a896a3d2fcd4b191e3b9", "ad4d6616a27ef42cb763336dc13fbf3186205e4d006e523a4f73f3125022eb38", "gentle-ai"),
 });
 
 function upstreamArchitecture(architecture) {

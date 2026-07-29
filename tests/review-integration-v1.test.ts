@@ -250,14 +250,24 @@ test("START enforces required, exact, bounded, and deeply unique payloads", () =
 	const source = fixture<JsonObject>("start.fixture.json");
 	const startSchema = schema<JsonObject>("start.schema.json");
 	const riskReasonCodes = (((startSchema.$defs as JsonObject).risk_reason as JsonObject).properties as JsonObject).code as JsonObject;
-	const expectedRiskReasonCodes = ["configuration_change", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "process_boundary", "process_scan_limit", "service_token", "shell_source"];
+	// The v1 payload schema declares eight codes; start/v2 grew the vocabulary
+	// to eleven. Both lists are asserted because the decoder serves both
+	// revisions, and a hardcoded canary is what makes a vocabulary change a
+	// deliberate edit instead of a silent one.
+	const expectedRiskReasonCodes = ["configuration_change", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "service_token", "shell_source"];
+	const expectedRiskReasonCodesV2 = ["configuration_change", "empty_content", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "process_boundary", "process_scan_limit", "service_token", "shell_source"];
+	const startV2Schema = schema<JsonObject>("start-v2.schema.json");
+	const riskReasonCodesV2 = (((startV2Schema.$defs as JsonObject).risk_reason as JsonObject).properties as JsonObject).code as JsonObject;
+	assert.deepEqual(riskReasonCodesV2.enum, expectedRiskReasonCodesV2);
 	assertRequired(decodeReviewStartV1, source, ["schema", "contract", "operation", "action", "lenses_required", "lineage_id", "state", "risk_level", "selected_lenses", "projection", "changed_files", "changed_lines", "correction_budget", "risk_reasons"]);
 	assertAdditionalProperty(decodeReviewStartV1, source);
 	assertAdditionalProperty(decodeReviewStartV1, source, ["risk_reasons", "0"]);
 	assertNestedRequired(decodeReviewStartV1, source, ["risk_reasons", "0"], ["code"]);
 
 	assert.deepEqual(riskReasonCodes.enum, expectedRiskReasonCodes);
-	for (const code of expectedRiskReasonCodes) {
+	// Exercised over the v2 superset: the decoder serves both revisions, so it
+	// must accept every code the newer vocabulary can put on the wire.
+	for (const code of expectedRiskReasonCodesV2) {
 		const candidate = clone(source);
 		candidate.risk_reasons = [{ code }];
 		assert.equal(decodeReviewStartV1(candidate).riskReasons[0]?.code, code);
