@@ -42,8 +42,8 @@ Chain strategy: size-exception
 
 ### Phase 2: correction lifecycle (pure)
 
-- [ ] 2.1 RED: `tests/review-correction-lifecycle.test.ts` — three outcomes (`passed`→targeted-validation, `verification_failed`→open/no-budget-charge, `procedural_tooling_failed`→escalate); budget-never-consumed-on-`verification_failed` invariant; distinct-immutable-evidence invariant (new `supersedes` identity, prior record byte-unchanged, identical identity ⇒ `correction-evidence-replaced`).
-- [ ] 2.2 GREEN: `lib/review-correction-lifecycle.ts` — `resolveCorrectionStep(status, evidence) → CorrectionStep` pure branch machine (no subprocess).
+- [x] 2.1 RED: `tests/review-correction-lifecycle.test.ts` — three outcomes (`passed`→targeted-validation, `verification_failed`→open/no-budget-charge, `procedural_tooling_failed`→escalate); budget-never-consumed-on-`verification_failed` invariant; distinct-immutable-evidence invariant (new `supersedes` identity, prior record byte-unchanged, identical identity ⇒ `correction-evidence-replaced`).
+- [x] 2.2 GREEN: `lib/review-correction-lifecycle.ts` — `resolveCorrectionStep(status, evidence) → CorrectionStep` pure branch machine (no subprocess).
 
 ### Phase 3: candidate-view manifest binding
 
