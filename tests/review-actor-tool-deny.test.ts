@@ -109,11 +109,26 @@ test("a tool absent from the allowlist resolves to denied under the deny-all rul
 		assert.ok(!refuterActive.includes(omitted), `review-refuter must deny omitted tool ${omitted}`);
 	}
 
-	const riskEntries = readToolEntries(join(ASSETS_AGENTS_DIR, "review-risk.md"));
-	const riskActive = resolveActiveTools(riskEntries, registry);
-	assert.ok(riskActive.includes("bash"), "review-risk must keep its existing explicit bash allowance");
-	assert.ok(!riskActive.includes("mem_save"), "review-risk must deny omitted memory tools");
-	assert.ok(!riskActive.includes("mcp__slack__slack_send_message"), "review-risk must deny omitted MCP-namespaced tools");
+	// The four lenses deny bash, matching gentle-ai's own Claude-runtime lens
+	// agents (`tools: Read, Grep, Glob`) exactly. Contract v2 is explicit: a
+	// runtime that cannot enforce a per-command Git shell boundary exposes no
+	// shell and reports incomplete inspection rather than claiming backend
+	// enforcement. Pi has no per-command scoping layer, so unrestricted bash
+	// would let a reviewer read the LIVE worktree instead of the frozen
+	// candidate -- and approve bytes that are not the ones shipping. The frozen
+	// read-only candidate view Pi already materializes is the sanctioned path;
+	// bash was the one thing making it optional.
+	//
+	// gentle-ai's OpenCode variant does grant bash, but only behind permissions
+	// whose broad deny precedes narrow allows for specific Git shapes. That is
+	// the other half of the same rule, not an exception to it.
+	for (const lens of ["review-risk", "review-resilience", "review-readability", "review-reliability"]) {
+		const lensActive = resolveActiveTools(readToolEntries(join(ASSETS_AGENTS_DIR, `${lens}.md`)), registry);
+		assert.deepEqual(lensActive, ["read", "grep", "glob"], `${lens} must expose exactly read, grep, and glob`);
+		for (const omitted of ["bash", "edit", "write", "mem_save", "codegraph_explore", "mcp__slack__slack_send_message", "subagent_run"]) {
+			assert.ok(!lensActive.includes(omitted), `${lens} must deny ${omitted}`);
+		}
+	}
 });
 
 test("the deny-all rule never enables a tool and never empties the runtime allowlist", () => {
