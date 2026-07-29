@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://gentle-ai.dev/contracts/review-integration/v1/schemas/status.schema.json",
-  "title": "Gentle AI Review Integration Target Status v1",
+  "$id": "https://gentle-ai.dev/contracts/review-integration/v1/schemas/status-v2.schema.json",
+  "title": "Gentle AI Review Integration Target Status v2",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -14,10 +14,11 @@
     "replayability",
     "target_identity",
     "projection",
+    "repair",
     "candidates"
   ],
   "properties": {
-    "schema": { "const": "gentle-ai.review-integration.status/v1" },
+    "schema": { "const": "gentle-ai.review-integration.status/v2" },
     "contract": { "const": "gentle-ai.review-integration/v1" },
     "operation": { "const": "review.status" },
     "applicability": { "enum": ["current_target", "unrelated", "ambiguous", "corrupted"] },
@@ -42,8 +43,8 @@
         "identity": { "$ref": "#/$defs/sha256" }
       }
     },
-    "action": { "enum": ["start", "finalize", "validate", "recover", "maintainer_action", "select_lineage", "repair_authority", "reconcile_finalize", "stop"] },
-    "action_disposition": { "enum": ["scope_changed", "invalidated", "escalated"] },
+    "action": { "enum": ["start", "finalize", "validate", "recover", "retry_final_verification", "maintainer_action", "select_lineage", "repair_authority", "reconcile_finalize", "stop"] },
+    "action_disposition": { "enum": ["scope_changed", "invalidated", "escalated", "final_verification_retry"] },
     "replayability": { "enum": ["not_replayable", "exact_replay_safe", "status_required", "manual_action_required"] },
     "frozen": {
       "type": "object",
@@ -56,7 +57,9 @@
       }
     },
     "target_identity": { "$ref": "#/$defs/sha256" },
+    "authority_target_identity": { "$ref": "#/$defs/sha256" },
     "projection": { "$ref": "projection.schema.json" },
+    "repair": { "$ref": "authority-repair-assessment.schema.json" },
     "candidates": {
       "type": "array",
       "uniqueItems": true,
@@ -70,7 +73,21 @@
     },
     "eligibility": { "$ref": "#/$defs/action_eligibility" },
     "next_transition": { "$ref": "#/$defs/next_transition" },
-    "validation_request": { "$ref": "targeted-validation-request.schema.json" }
+    "validation_request": { "$ref": "targeted-validation-request.schema.json" },
+    "final_verification_retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["incident_schema", "incident_class", "validating_revision", "target_identity", "failed_evidence_hash", "finalize_request_digest"],
+      "properties": {
+        "incident_schema": { "const": "gentle-ai.review-final-verification-incident/v1" },
+        "incident_class": { "const": "procedural_tooling_failure" },
+        "validating_revision": { "$ref": "#/$defs/sha256" },
+        "target_identity": { "$ref": "#/$defs/sha256" },
+        "failed_evidence_hash": { "$ref": "#/$defs/sha256" },
+        "failed_evidence_record_digest": { "$ref": "#/$defs/sha256" },
+        "finalize_request_digest": { "$ref": "#/$defs/sha256" }
+      }
+    }
   },
   "$defs": {
     "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
@@ -107,7 +124,7 @@
     "transition_execution": {
       "type": "object", "additionalProperties": false, "required": ["operation", "arguments", "preconditions", "binding"],
       "properties": {
-        "operation": { "enum": ["review.start", "review.finalize", "review.recover", "review.validate"] },
+        "operation": { "enum": ["review.start", "review.finalize", "review.recover", "review.repair", "review.validate"] },
         "command": { "$comment": "The complete, literally runnable command line for this transition, e.g. \"gentle-ai review start --contract=... --target=...\". Operation alone is a dotted logical name; command is what a caller can paste. Argument words are the execute arguments' own tokens, in order, POSIX-shell-quoted only when a value would otherwise be word-split.", "type": "string", "minLength": 1, "pattern": "^gentle-ai review [a-z][a-z-]*" },
         "arguments": { "type": "array", "items": { "$ref": "#/$defs/executable_transition_argument" } },
         "selector_arguments": { "type": "array", "items": { "$ref": "#/$defs/transition_argument" } },
@@ -133,6 +150,9 @@
       "properties": {
         "name": { "type": "string", "pattern": "^[a-z0-9_]+$" }, "schema": { "type": "string", "minLength": 1 }, "capture_operation": { "type": "string", "minLength": 1 },
         "arguments": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/transition_argument" } },
+        "artifact_subject": { "$ref": "artifact-subject.schema.json" },
+        "candidate_diff": { "$ref": "start-v2.schema.json#/$defs/frozen_candidate_diff" },
+        "changed_path_manifest": { "type": "array", "uniqueItems": true, "items": { "$ref": "start-v2.schema.json#/$defs/changed_path" } },
         "validation_request": { "$ref": "targeted-validation-request.schema.json" }
       },
       "allOf": [
@@ -140,6 +160,17 @@
           "if": { "properties": { "capture_operation": { "const": "external.run_targeted_validation" } }, "required": ["capture_operation"] },
           "then": { "required": ["validation_request"], "properties": { "schema": { "const": "gentle-ai.review-targeted-validation-request/v1" } } },
           "else": { "not": { "required": ["validation_request"] } }
+        },
+        {
+          "if": { "properties": { "capture_operation": { "const": "review.capture-result" } }, "required": ["capture_operation"] },
+          "then": { "required": ["artifact_subject", "candidate_diff", "changed_path_manifest"], "properties": { "schema": { "const": "https://gentle-ai.dev/schema/review/reviewer/v1" } } },
+          "else": {
+            "allOf": [
+              { "not": { "required": ["artifact_subject"] } },
+              { "not": { "required": ["candidate_diff"] } },
+              { "not": { "required": ["changed_path_manifest"] } }
+            ]
+          }
         }
       ]
     },
@@ -157,10 +188,10 @@
             "additionalProperties": false,
             "required": ["action", "reason_code", "required_inputs"],
             "properties": {
-              "action": { "enum": ["stop", "review.start", "review.finalize", "review.validate", "review.recover"] },
+              "action": { "enum": ["stop", "review.start", "review.finalize", "review.validate", "review.recover", "review.repair", "review.retry_final_verification"] },
               "reason_code": { "type": "string", "pattern": "^[a-z0-9_]+$" },
               "required_inputs": { "type": "array", "items": { "type": "string", "pattern": "^[a-z0-9_]+$" } },
-              "disposition": { "enum": ["scope_changed", "invalidated", "escalated"] },
+              "disposition": { "enum": ["scope_changed", "invalidated", "escalated", "final_verification_retry"] },
               "binding": {
                 "type": "object",
                 "additionalProperties": false,
@@ -174,7 +205,7 @@
             },
             "allOf": [
               {
-                "if": { "properties": { "action": { "const": "review.recover" } }, "required": ["action"] },
+                "if": { "properties": { "action": { "enum": ["review.recover", "review.retry_final_verification"] } }, "required": ["action"] },
                 "then": { "required": ["disposition", "binding"] },
                 "else": { "not": { "anyOf": [{ "required": ["disposition"] }, { "required": ["binding"] }] } }
               }
@@ -188,7 +219,7 @@
             "additionalProperties": false,
             "required": ["action", "reason_code"],
             "properties": {
-              "action": { "enum": ["review.abandon", "review.finalize", "review.invalidate", "review.quarantine-legacy", "review.reclaim", "review.reconcile-authority", "review.reconcile-authority-batch", "review.recover", "review.start", "review.validate"] },
+              "action": { "enum": ["review.abandon", "review.finalize", "review.invalidate", "review.quarantine-legacy", "review.reclaim", "review.reconcile-authority", "review.reconcile-authority-batch", "review.recover", "review.repair", "review.retry_final_verification", "review.start", "review.validate"] },
               "reason_code": { "type": "string", "pattern": "^[a-z0-9_]+$" }
             }
           }
@@ -209,14 +240,14 @@
       "else": { "not": { "required": ["reconciliation"] } }
     },
     {
-      "if": { "properties": { "action": { "const": "recover" } }, "required": ["action"] },
+      "if": { "properties": { "action": { "enum": ["recover", "retry_final_verification"] } }, "required": ["action"] },
       "then": { "required": ["action_disposition"] },
       "else": { "not": { "required": ["action_disposition"] } }
     },
     {
       "if": { "properties": { "applicability": { "const": "current_target" } } },
       "then": { "required": ["authority"] },
-      "else": { "not": { "anyOf": [{ "required": ["authority"] }, { "required": ["frozen"] }] } }
+      "else": { "not": { "anyOf": [{ "required": ["authority"] }, { "required": ["frozen"] }, { "required": ["authority_target_identity"] }] } }
     },
     {
       "if": {
@@ -243,7 +274,7 @@
         }
       },
       "then": {
-        "not": { "required": ["frozen"] },
+        "not": { "anyOf": [{ "required": ["frozen"] }, { "required": ["authority_target_identity"] }] },
         "properties": {
           "receipt": {
             "properties": { "status": { "enum": ["expected_missing", "present"] } }
@@ -259,6 +290,24 @@
           "authority": { "properties": { "state": { "const": "correction_required" } }, "required": ["state"] }
         }
       }
+    },
+    {
+      "if": { "properties": { "action": { "const": "retry_final_verification" } }, "required": ["action"] },
+      "then": {
+        "required": ["final_verification_retry"],
+        "properties": {
+          "applicability": { "const": "current_target" },
+          "authority": {
+            "required": ["version", "state"],
+            "properties": {
+              "version": { "const": "compact-v2" },
+              "state": { "const": "escalated" }
+            }
+          },
+          "action_disposition": { "const": "final_verification_retry" }
+        }
+      },
+      "else": { "not": { "required": ["final_verification_retry"] } }
     }
   ]
 }

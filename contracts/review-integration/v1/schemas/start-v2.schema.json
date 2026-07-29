@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://gentle-ai.dev/contracts/review-integration/v1/schemas/start.schema.json",
+  "$id": "https://gentle-ai.dev/contracts/review-integration/v1/schemas/start-v2.schema.json",
   "title": "Gentle AI negotiated review START response",
   "type": "object",
   "additionalProperties": false,
@@ -46,10 +46,11 @@
     "changed_files",
     "changed_lines",
     "correction_budget",
-    "risk_reasons"
+    "risk_reasons",
+    "artifact_subjects"
   ],
   "properties": {
-    "schema": {"const": "gentle-ai.review-integration.start/v1"},
+    "schema": {"const": "gentle-ai.review-integration.start/v2"},
     "contract": {"const": "gentle-ai.review-integration/v1"},
     "operation": {"const": "review.start"},
     "action": {"enum": ["created", "resumed", "reuse-receipt", "blocked-scope-action"]},
@@ -65,6 +66,8 @@
         "fix_required",
         "fixing",
         "fix_validating",
+        "correction_required",
+        "validating",
         "ready_final_verification",
         "final_verifying",
         "approved",
@@ -93,6 +96,11 @@
       "uniqueItems": true,
       "items": {"$ref": "#/$defs/risk_reason"}
     },
+    "artifact_subjects": {
+      "type": "array",
+      "maxItems": 4,
+      "items": {"$ref": "#/$defs/artifact_subject"}
+    },
     "candidate_diff": {"$ref": "#/$defs/frozen_candidate_diff"},
     "changed_path_manifest": {
       "type": "array",
@@ -112,6 +120,33 @@
     }
   },
   "$defs": {
+    "artifact_subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "subject_hash",
+        "lineage_id",
+        "authority_revision",
+        "target_identity",
+        "candidate_diff_sha256",
+        "changed_path_manifest_sha256",
+        "lens",
+        "selected_order"
+      ],
+      "properties": {
+        "schema": {"const": "gentle-ai.review-artifact-subject/v1"},
+        "subject_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "lineage_id": {"type": "string", "minLength": 1},
+        "authority_revision": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "target_identity": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "candidate_diff_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "changed_path_manifest_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "lens": {"enum": ["review-risk", "review-resilience", "review-readability", "review-reliability"]},
+        "selected_order": {"type": "integer", "minimum": 0, "maximum": 3},
+        "correction_target_identity": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
     "frozen_candidate_diff": {
       "type": "object",
       "additionalProperties": false,
@@ -159,11 +194,14 @@
         "code": {
           "enum": [
             "configuration_change",
+            "empty_content",
             "executable_change",
             "executable_mode",
             "hot_path",
             "large_change",
             "non_executable_only",
+            "process_boundary",
+            "process_scan_limit",
             "service_token",
             "shell_source"
           ]

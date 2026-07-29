@@ -1,5 +1,5 @@
 {
-  "schema": "gentle-ai.review-integration.status/v1",
+  "schema": "gentle-ai.review-integration.status/v2",
   "contract": "gentle-ai.review-integration/v1",
   "operation": "review.status",
   "applicability": "current_target",
@@ -37,6 +37,25 @@
     "intended_untracked_proof": "sha256:b97229718d4c7fe50a8892eb474ae5aa6491697bccb400e3e31dbaca4894d2f3",
     "initial_snapshot_identity": "sha256:e6faad1cb9ceb2db170e0ec9ea5394b44c3991dff6cbd02fb6787539715968f6",
     "current_snapshot_identity": "sha256:e6faad1cb9ceb2db170e0ec9ea5394b44c3991dff6cbd02fb6787539715968f6"
+  },
+  "repair": {
+    "schema": "gentle-ai.review-authority-repair-assessment/v1",
+    "status": "unsupported",
+    "counts": {
+      "lineages": 0,
+      "compact_lineages": 0,
+      "legacy_lineages": 0,
+      "events": 0,
+      "bytes": 0,
+      "eligible_candidates": 0,
+      "unsupported_lineages": 0,
+      "conflicts": 0
+    },
+    "supported_operations": [
+      "review/complete-fix",
+      "review/validate-fix"
+    ],
+    "authorization_schema": "gentle-ai.review-repair-authorization/v1"
   },
   "candidates": [],
   "eligibility": {
@@ -88,6 +107,14 @@
       },
       {
         "action": "review.reconcile-authority-batch",
+        "reason_code": "forbidden_not_selected_by_native_status"
+      },
+      {
+        "action": "review.repair",
+        "reason_code": "forbidden_not_selected_by_native_status"
+      },
+      {
+        "action": "review.retry_final_verification",
         "reason_code": "forbidden_not_selected_by_native_status"
       },
       {
