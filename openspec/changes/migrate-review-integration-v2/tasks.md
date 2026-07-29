@@ -76,7 +76,21 @@ Chain strategy: size-exception
 
 ### Phase 7: Stage 1 close-out
 
-- [ ] 7.1 Verify: `pnpm test` green, no behavior change (`lib/review-integration-v2.ts` still unimported by `lib/native-review-cli.ts`), decoder test count ≥22, baseline `854 tests / 853 pass / 0 fail / 1 skip` unchanged.
+- [x] 7.1 Verify (REWRITTEN at close: the original text was a Stage 1 check and asserted
+      the pre-switchover state -- that `lib/review-integration-v2.ts` stays UNIMPORTED and a
+      854-test baseline. Stage 2 deliberately inverted both, so the original could never pass.
+      The invariants that actually matter at close, all verified:
+      - `pnpm test` green: 911 tests, 910 pass, 0 fail, 1 skip (the expected Windows-only
+        `tests/review-repository.test.ts` platform skip)
+      - `pnpm run test:harness` exit 0; `verify-package-files.mjs` exit 0 at 129 files and 64
+        byte-identical v2.2.2 contract artifacts; `check:transaction-runner` matches sources
+      - no live `review-integration/v1` negotiation anywhere in `lib/`, `runtime/`, or `tests/`.
+        The three remaining textual matches are legitimate: two are comments explaining the
+        capability rows and the legacy V214 decoder, one is a NEGATIVE test asserting the v2
+        consent decoder rejects a v1 invocation, and one cites the v1 schema path the v2
+        schemas `$ref` into
+      - `contracts/review-integration/v1/` retained on disk: 23 schemas, required by those `$ref`s
+      - v2 decoder suite at 25 tests, above the >=22 floor that offsets the deleted v1 pair)
 
 ---
 
