@@ -139,7 +139,7 @@ const contractHashes = {
   "contracts/review-integration/v2/schemas/repair.schema.json": "9e842d1ded797a91ede16b2054a38708b2d1fc7a0d6217541f84c0f2f5a2e73e",
   "contracts/review-integration/v2/schemas/start.schema.json": "86ddfcfe1912489abef7461613d692ea53a4d7d73d444d5f6dbbd7f9866a2c37",
   "contracts/review-integration/v2/schemas/status.schema.json": "132b15dd7a0514aa451373bd4b3c02a1491b7b11cf5b9ce43bc300b549397ac9",
-  "docs/review-integration.md": "287e43ff55e3bb56e3175574ce26be1dc13f7de5e2fda74eddc769cc70f7e82a",
+  "docs/review-integration.md": "4ee3493303b03c7cb761f35865722b1691f164f72e6f94574512c42832ff04f2",
 };
 
 requiredPaths.push(...Object.keys(contractHashes));
@@ -265,7 +265,7 @@ async function main() {
   });
 
   if (driftedContracts.length > 0) {
-    console.error("gentle-pi packaged review-integration/v1 and review-integration/v2 contract bytes drifted from the byte-identical Gentle AI v2.2.1 contract:");
+    console.error("gentle-pi packaged review-integration/v1 and review-integration/v2 contract bytes drifted from the byte-identical Gentle AI v2.2.2 contract:");
     for (const drift of driftedContracts) console.error(`- ${drift.relativePath}: expected ${drift.expected}, got ${drift.actual}`);
     process.exit(1);
   }
@@ -297,12 +297,12 @@ async function main() {
 
   const installer = readFileSync(join(root, "scripts/gentle-ai-installer.mjs"), "utf8");
   const binaryResolver = readFileSync(join(root, "lib/gentle-ai-binary.ts"), "utf8");
-  if (!installer.includes('INSTALLER_VERSION = "2.2.1"') || !binaryResolver.includes('GENTLE_AI_VERSION = "2.2.1"')) {
-    console.error("gentle-pi package-local Gentle AI version pins are not both v2.2.1.");
+  if (!installer.includes('INSTALLER_VERSION = "2.2.2"') || !binaryResolver.includes('GENTLE_AI_VERSION = "2.2.2"')) {
+    console.error("gentle-pi package-local Gentle AI version pins are not both v2.2.2.");
     process.exit(1);
   }
 
-  console.log(`gentle-pi package resource check passed (${requiredPaths.length} files; ${Object.keys(contractHashes).length} exact byte-identical v2.2.1 contract artifacts).`);
+  console.log(`gentle-pi package resource check passed (${requiredPaths.length} files; ${Object.keys(contractHashes).length} exact byte-identical v2.2.2 contract artifacts).`);
 }
 
 const isMainModule = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;

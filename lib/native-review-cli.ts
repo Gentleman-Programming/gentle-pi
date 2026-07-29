@@ -546,6 +546,11 @@ export const NATIVE_CLI_CONTRACTS = Object.freeze({
 	// review-integration/v2, whose `start/v3` carries base/candidate trees --
 	// but Pi does not negotiate it yet, and a row must describe the lane in use.
 	"2.2.1": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	// 2.2.2 repeats 2.2.1 for the same reason, confirmed against the released
+	// v2.2.2 binary rather than assumed: on review-integration/v1 it still
+	// advertises capabilities/v1.5 and the negotiated start envelope is still
+	// the closed `start/v2`, so riskEvidence and hint still cannot arrive.
+	"2.2.2": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 });
 type NativeCliCapability = keyof (typeof NATIVE_CLI_CONTRACTS)[keyof typeof NATIVE_CLI_CONTRACTS];
 

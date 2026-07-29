@@ -18,14 +18,14 @@ import {
 	trustedSystemExtractor,
 } from "../scripts/gentle-ai-installer.mjs";
 
-// v2.2.1 digests pinned from the published release: archive sha256 values match
+// v2.2.2 digests pinned from the published release: archive sha256 values match
 // checksums.txt and freshly computed hashes; binary sha256 values were computed
 // from the extracted executables of each verified archive.
 const EXPECTED_ASSETS = {
-	"darwin/amd64": { name: "gentle-ai_2.2.1_darwin_amd64.tar.gz", sha256: "aff2184701ab634b64f5b05f1fe6a887c7d9b7920e59459c807c30df55638945", binarySha256: "d098e6776cef15db916a01ca5c17eb04de61e88bd8975b64c155abe133ed461f" },
-	"darwin/arm64": { name: "gentle-ai_2.2.1_darwin_arm64.tar.gz", sha256: "d3963dc15029d713df127c5cb5ff552add862d4e47dee6ab736a8554ffd68bfd", binarySha256: "fd460ff3fef911228e8529275957394ebe27dd61fe3cd2650daff24976a8df01" },
-	"linux/amd64": { name: "gentle-ai_2.2.1_linux_amd64.tar.gz", sha256: "02a72f48cf9d108ed9189eddbfe1dffd27b65a2ed9ebc33925756446a85352e2", binarySha256: "fe007488ad544bfe500dbfb2e4daeb357af54f2b7e43bf806a23b97f724cd18a" },
-	"linux/arm64": { name: "gentle-ai_2.2.1_linux_arm64.tar.gz", sha256: "4eb7887d0c9b555bb976110567bed9491edcc1d54534c81958ae40e879a4091c", binarySha256: "fc9fbb66603d9ce76ebeb2fa0087e8af78e4fc2850ab257c9746dc17bda0ebcd" },
+	"darwin/amd64": { name: "gentle-ai_2.2.2_darwin_amd64.tar.gz", sha256: "5ca67829903bf4c6b14665664f80f9d8216c84b10c8e50870d297f452cefb9dc", binarySha256: "9b239423450562d026384f482bbd2f1e3f2820431a84f0921743ac3df9d632de" },
+	"darwin/arm64": { name: "gentle-ai_2.2.2_darwin_arm64.tar.gz", sha256: "0193e1a284444dccee2863d31b8dbb76a982e8f9111955908d6a9131c1a5490e", binarySha256: "149b97248552c5e03ebc4d991f86b1360fb847a40fc315555a8aa256f95baca0" },
+	"linux/amd64": { name: "gentle-ai_2.2.2_linux_amd64.tar.gz", sha256: "b85bbb20eb2236de97b261df16cfc8d8394dfd07a137e885c4889b62d0c20fa1", binarySha256: "00d5732e8dd3945956800217a4f60213c2d9ca63351092a2cb7f4e5f9ece54f9" },
+	"linux/arm64": { name: "gentle-ai_2.2.2_linux_arm64.tar.gz", sha256: "61e7077342448273f0c43af49ce4d182594bab5e4f86f812975af2fbe69e3b0b", binarySha256: "a92685aa7dbea0cc4297d016569b3defe9bb30a7374a620021e245b74f50eb68" },
 } as const;
 
 test("default installer package root is the package containing scripts, not its parent", () => {
@@ -36,15 +36,15 @@ test("default installer package root is the package containing scripts, not its 
 	assert.notEqual(resolveGentleAiInstallerPackageRoot(), dirname(expectedPackageRoot));
 });
 
-test("release mapping selects only the supported official v2.2.1 archive and pinned digests", () => {
+test("release mapping selects only the supported official v2.2.2 archive and pinned digests", () => {
 	assert.deepEqual(
 		Object.fromEntries(Object.entries(GENTLE_AI_RELEASE_ASSETS).map(([key, asset]) => [key, { name: asset.name, sha256: asset.sha256, binarySha256: asset.binarySha256 }])),
 		EXPECTED_ASSETS,
 	);
-	assert.equal(resolveGentleAiReleaseAsset("linux", "x64").name, "gentle-ai_2.2.1_linux_amd64.tar.gz");
-	assert.equal(resolveGentleAiReleaseAsset("darwin", "arm64").name, "gentle-ai_2.2.1_darwin_arm64.tar.gz");
+	assert.equal(resolveGentleAiReleaseAsset("linux", "x64").name, "gentle-ai_2.2.2_linux_amd64.tar.gz");
+	assert.equal(resolveGentleAiReleaseAsset("darwin", "arm64").name, "gentle-ai_2.2.2_darwin_arm64.tar.gz");
 	for (const asset of Object.values(GENTLE_AI_RELEASE_ASSETS)) {
-		assert.match(asset.url, /^https:\/\/github\.com\/Gentleman-Programming\/gentle-ai\/releases\/download\/v2\.2\.1\//);
+		assert.match(asset.url, /^https:\/\/github\.com\/Gentleman-Programming\/gentle-ai\/releases\/download\/v2\.2\.2\//);
 	}
 });
 
@@ -65,12 +65,12 @@ test("release digests are all-or-none and install fails closed while any digest 
 			}),
 			/checksum mismatch/,
 		);
-		assert.equal(existsSync(join(packageRoot, ".gentle-ai", "v2.2.1", "gentle-ai")), false);
+		assert.equal(existsSync(join(packageRoot, ".gentle-ai", "v2.2.2", "gentle-ai")), false);
 	}
 });
 
 test("win32 is rejected with the same clear error as any other unsupported platform", () => {
-	// v2.2.1 publishes no Windows archive, so there is nothing honest to
+	// v2.2.2 publishes no Windows archive, so there is nothing honest to
 	// resolve. Failing here, by name, beats resolving an asset that would 404
 	// at download time and blame the network for a packaging decision.
 	for (const arch of ["x64", "arm64"]) {
@@ -144,7 +144,7 @@ test("checksum mismatch cleans temporary state without promoting a binary", asyn
 		}),
 		/checksum mismatch/,
 	);
-	assert.equal(existsSync(join(packageRoot, ".gentle-ai", "v2.2.1", "gentle-ai")), false);
+	assert.equal(existsSync(join(packageRoot, ".gentle-ai", "v2.2.2", "gentle-ai")), false);
 	assert.deepEqual((await readdir(packageRoot)).filter((entry) => entry.startsWith(".gentle-ai-install-")), []);
 });
 
@@ -166,7 +166,7 @@ test("installer promotes only the expected regular executable with executable PO
 			await chmod(extracted, 0o700);
 		},
 	});
-	const binary = join(packageRoot, ".gentle-ai", "v2.2.1", "gentle-ai");
+	const binary = join(packageRoot, ".gentle-ai", "v2.2.2", "gentle-ai");
 	assert.equal(existsSync(binary), true);
 	assert.equal(await readFile(binary, "utf8"), "native executable");
 	assert.ok(((await stat(binary)).mode & 0o111) !== 0);
@@ -197,7 +197,7 @@ test("installer rejects an extracted binary that differs from its pinned digest"
 		}),
 		/binary checksum mismatch/,
 	);
-	assert.equal(existsSync(join(packageRoot, ".gentle-ai", "v2.2.1", "gentle-ai")), false);
+	assert.equal(existsSync(join(packageRoot, ".gentle-ai", "v2.2.2", "gentle-ai")), false);
 });
 
 test("installer repairs a valid non-executable POSIX binary instead of reusing it", async (t) => {
@@ -220,7 +220,7 @@ test("installer repairs a valid non-executable POSIX binary instead of reusing i
 		},
 	};
 	await installGentleAi(options);
-	const binary = join(packageRoot, ".gentle-ai", "v2.2.1", "gentle-ai");
+	const binary = join(packageRoot, ".gentle-ai", "v2.2.2", "gentle-ai");
 	await chmod(binary, 0o600);
 	const repaired = await installGentleAi(options);
 	assert.equal(repaired.installed, true);
@@ -257,7 +257,7 @@ test("installer rejects archives with multiple expected executable entries", asy
 		}),
 		/exactly one regular gentle-ai/,
 	);
-	assert.equal(existsSync(join(packageRoot, ".gentle-ai", "v2.2.1", "gentle-ai")), false);
+	assert.equal(existsSync(join(packageRoot, ".gentle-ai", "v2.2.2", "gentle-ai")), false);
 });
 
 test("installer rejects an archive without the expected regular executable", async () => {
@@ -275,5 +275,5 @@ test("installer rejects an archive without the expected regular executable", asy
 		}),
 		/non-regular gentle-ai/,
 	);
-	assert.equal(existsSync(join(packageRoot, ".gentle-ai", "v2.2.1", "gentle-ai")), false);
+	assert.equal(existsSync(join(packageRoot, ".gentle-ai", "v2.2.2", "gentle-ai")), false);
 });

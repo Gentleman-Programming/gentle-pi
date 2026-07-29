@@ -67,8 +67,21 @@ test("2.2.1 repeats 2.2.0 because the lane Pi speaks did not move", () => {
 	assert.deepEqual(contract, NATIVE_CLI_CONTRACTS["2.2.0"] as Record<string, boolean>);
 });
 
+test("2.2.2 repeats 2.2.1 because the lane Pi speaks still did not move", () => {
+	// Ground-truthed against the released v2.2.2 binary: on
+	// review-integration/v1 it advertises capabilities/v1.5 and the negotiated
+	// start envelope is still the closed `start/v2`, so risk_evidence and hint
+	// still cannot arrive on the lane Pi negotiates.
+	const contract = NATIVE_CLI_CONTRACTS["2.2.2"] as Record<string, boolean>;
+	assert.equal(contract.mode, true);
+	assert.equal(contract.delivery, true);
+	assert.equal(contract.riskEvidence, false);
+	assert.equal(contract.hint, false);
+	assert.deepEqual(contract, NATIVE_CLI_CONTRACTS["2.2.1"] as Record<string, boolean>);
+});
+
 test("no shipped version key was added beyond the pin bump", () => {
 	// Rows are promises to consumers, so a new key only ever appears in a
 	// dedicated commit alongside a pin bump, never as a side effect.
-	assert.deepEqual(Object.keys(NATIVE_CLI_CONTRACTS), [...DARK_VERSIONS, "2.2.0", "2.2.1"]);
+	assert.deepEqual(Object.keys(NATIVE_CLI_CONTRACTS), [...DARK_VERSIONS, "2.2.0", "2.2.1", "2.2.2"]);
 });
