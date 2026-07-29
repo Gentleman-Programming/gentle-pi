@@ -31,14 +31,14 @@ Chain strategy: size-exception
 
 ### Phase 1: v2 decoder module
 
-- [ ] 1.1 RED: `tests/review-integration-v2.test.ts` — rejection test per decoder (missing required key, extra key, wrong identity) for capabilities/v2, start/v3, status/v3, projection/v1, failure/v2, operation/v2 (module does not exist yet, must fail).
-- [ ] 1.2 GREEN: `lib/review-integration-v2.ts` — port verbatim primitives (`record`, `exactRecord`, `text`, `nonempty`, `boolean`, `integer`, `enumeration`, `canonicalJson`, `array`, `stringArray`, `enumArray`, `sha256`, `gitTree`, `lineage`, `safePath`, `assertExactSet`, `assertSupersetOf`); add `requireIdentity` (v2 const) and `decodeReviewCapabilitiesV2` (22-schema superset: 10 mandatory + 17 optional).
-- [ ] 1.3 GREEN: `lib/review-integration-v2.ts` — implement `decodeReviewStartV3`, `decodeReviewStatusV3`, `decodeReviewProjectionV1`, `decodeReviewFailureV2`, `decodeReviewOperationV2`; pass 1.1's rejection tests plus 4-fixture round-trip against `contracts/review-integration/v2/fixtures/`.
-- [ ] 1.4 RED: `tests/review-integration-v2.test.ts` — net-new decoders `decodeReviewConsentV2`, `decodeReviewNextTransitionV3`, `decodeReviewArtifactSubjectV2`: rejection tests (no provider fixture required for consent/next-transition).
-- [ ] 1.5 GREEN: `lib/review-integration-v2.ts` — implement `decodeReviewConsentV2`, `decodeReviewNextTransitionV3`, `decodeReviewArtifactSubjectV2`.
-- [ ] 1.6 RED: `tests/review-integration-v2.test.ts` — `decodeReviewRepairV2` hand-built payloads: execute-without-`execution` rejected; eligible-preflight with wrong `required_inputs` order rejected (both `allOf` invariants from v1 `repair.schema.json:53-157`).
-- [ ] 1.7 GREEN: `lib/review-integration-v2.ts` — implement `decodeReviewRepairV2` (mode, assessment, provider_inputs, required_inputs, execution) and `decodeAuthorityRepairAssessmentV1`.
-- [ ] 1.8 Verify: `tests/review-integration-v2.test.ts` has ≥22 tests total (offsets the 22 tests the two Stage-2-deleted v1 test files carry); module stays unimported by `lib/native-review-cli.ts`.
+- [x] 1.1 RED: `tests/review-integration-v2.test.ts` — rejection test per decoder (missing required key, extra key, wrong identity) for capabilities/v2, start/v3, status/v3, projection/v1, failure/v2, operation/v2 (module does not exist yet, must fail).
+- [x] 1.2 GREEN: `lib/review-integration-v2.ts` — port verbatim primitives (`record`, `exactRecord`, `text`, `nonempty`, `boolean`, `integer`, `enumeration`, `canonicalJson`, `array`, `stringArray`, `enumArray`, `sha256`, `gitTree`, `lineage`, `safePath`, `assertExactSet`, `assertSupersetOf`); add `requireIdentity` (v2 const) and `decodeReviewCapabilitiesV2` (22-schema superset: 10 mandatory + 17 optional).
+- [x] 1.3 GREEN: `lib/review-integration-v2.ts` — implement `decodeReviewStartV3`, `decodeReviewStatusV3`, `decodeReviewProjectionV1`, `decodeReviewFailureV2`, `decodeReviewOperationV2`; pass 1.1's rejection tests plus 4-fixture round-trip against `contracts/review-integration/v2/fixtures/`.
+- [x] 1.4 RED: `tests/review-integration-v2.test.ts` — net-new decoders `decodeReviewConsentV2`, `decodeReviewNextTransitionV3`, `decodeReviewArtifactSubjectV2`: rejection tests (no provider fixture required for consent/next-transition).
+- [x] 1.5 GREEN: `lib/review-integration-v2.ts` — implement `decodeReviewConsentV2`, `decodeReviewNextTransitionV3`, `decodeReviewArtifactSubjectV2`.
+- [x] 1.6 RED: `tests/review-integration-v2.test.ts` — `decodeReviewRepairV2` hand-built payloads: execute-without-`execution` rejected; eligible-preflight with wrong `required_inputs` order rejected (both `allOf` invariants from v1 `repair.schema.json:53-157`).
+- [x] 1.7 GREEN: `lib/review-integration-v2.ts` — implement `decodeReviewRepairV2` (mode, assessment, provider_inputs, required_inputs, execution) and `decodeAuthorityRepairAssessmentV1`.
+- [x] 1.8 Verify: `tests/review-integration-v2.test.ts` has ≥22 tests total (offsets the 22 tests the two Stage-2-deleted v1 test files carry); module stays unimported by `lib/native-review-cli.ts`.
 
 ### Phase 2: correction lifecycle (pure)
 
