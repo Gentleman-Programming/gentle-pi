@@ -116,6 +116,9 @@ export interface NativeCandidateProjectionDescriptor {
 	paths: readonly string[];
 	intendedUntracked: readonly string[];
 	projection: "workspace" | "staged";
+	// Optional so Phase 3 stays additive: existing callers keep the legacy
+	// sorted-path behavior until the v2 switchover supplies a manifest.
+	manifest?: readonly ChangedPathEntry[];
 }
 
 export class CandidateViewError extends Error {
@@ -231,6 +234,79 @@ function parseTree(cwd: string, tree: string, executor: CandidateGitExecutor): P
 function gitPathTokens(cwd: string, arguments_: readonly string[], executor: CandidateGitExecutor): Buffer[] {
 	const raw = candidateGit(cwd, arguments_, process.env, "buffer", executor) as Buffer;
 	return splitNulTerminated(raw, "candidate scope Git output is not NUL-terminated");
+}
+
+// One manifest entry per changed path, carrying the state contract v2 ships in
+// `changed_path_manifest`. `deriveChangedScope` cannot produce this: it runs
+// `--name-status`, which reports a status and a path but never an old mode, so
+// a mode-only or type change is invisible to it. `--raw` carries both modes and
+// both blob ids, which is what makes `modeOnly` decidable at all.
+export interface ChangedPathEntry {
+	readonly path: string;
+	readonly status: string;
+	readonly oldMode: string;
+	readonly newMode: string;
+	readonly deleted: boolean;
+	readonly typeChanged: boolean;
+	readonly modeOnly: boolean;
+}
+
+export function deriveChangedPathManifest(cwd: string, baseTree: string, candidateTree: string, executor: CandidateGitExecutor = defaultCandidateGitExecutor): readonly ChangedPathEntry[] {
+	const tokens = gitPathTokens(cwd, ["diff", "--raw", "-z", "--abbrev=40", "--no-ext-diff", "--find-renames=100%", baseTree, candidateTree], executor);
+	const entries: ChangedPathEntry[] = [];
+	for (let index = 0; index < tokens.length;) {
+		const header = tokens[index++]?.toString("ascii");
+		if (header === undefined) break;
+		// `:<old_mode> <new_mode> <old_sha> <new_sha> <status>`
+		const match = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{7,64}) ([0-9a-f]{7,64}) ([AMDT]|R[0-9]{3})$/.exec(header);
+		if (match === null) throw new CandidateViewError("candidate manifest Git output contains an unsafe raw header", "manifest-derivation-invalid");
+		const [, oldMode, newMode, oldSha, newSha, status] = match;
+		const firstPath = tokens[index++];
+		if (firstPath === undefined) throw new CandidateViewError("candidate manifest Git output is incomplete", "manifest-derivation-invalid");
+		// A rename emits both the old and the new path; the new one is the scope.
+		const path = status.startsWith("R") ? decodeCanonicalPath(tokens[index++] ?? firstPath) : decodeCanonicalPath(firstPath);
+		entries.push(Object.freeze({
+			path,
+			status: status.startsWith("R") ? "A" : status,
+			oldMode,
+			newMode,
+			deleted: status === "D",
+			typeChanged: status === "T",
+			// Identical blob on both sides with different modes is the case the
+			// sorted-path comparison could never see.
+			modeOnly: oldSha === newSha && oldMode !== newMode,
+		}));
+	}
+	return Object.freeze([...entries].sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0)));
+}
+
+function assertManifestMatchesGit(descriptor: NativeCandidateProjectionDescriptor, derived: readonly ChangedPathEntry[]): void {
+	const claimed = descriptor.manifest;
+	if (claimed === undefined) return;
+
+	// First: is the provider's own input self-consistent? A manifest that does
+	// not describe the descriptor's paths is not a drift observation, it is a
+	// malformed input, and saying so separately keeps the diagnosis honest.
+	const claimedPaths = [...claimed.map((entry) => entry.path)].sort();
+	if (JSON.stringify(claimedPaths) !== JSON.stringify([...descriptor.paths].sort())) {
+		throw new CandidateViewError("native manifest does not describe the same paths as its own projection", "manifest-input-divergence");
+	}
+
+	const derivedByPath = new Map(derived.map((entry) => [entry.path, entry]));
+	if (JSON.stringify(claimedPaths) !== JSON.stringify(derived.map((entry) => entry.path))) {
+		throw new CandidateViewError("native manifest paths do not match Git content", "manifest-path-set-drift");
+	}
+
+	for (const entry of claimed) {
+		const actual = derivedByPath.get(entry.path);
+		if (actual === undefined) throw new CandidateViewError("native manifest paths do not match Git content", "manifest-path-set-drift");
+		if (entry.status !== actual.status || entry.deleted !== actual.deleted) {
+			throw new CandidateViewError(`native manifest status for ${entry.path} does not match Git content`, "manifest-status-drift");
+		}
+		if (entry.oldMode !== actual.oldMode || entry.newMode !== actual.newMode || entry.modeOnly !== actual.modeOnly || entry.typeChanged !== actual.typeChanged) {
+			throw new CandidateViewError(`native manifest mode state for ${entry.path} does not match Git content`, "manifest-mode-drift");
+		}
+	}
 }
 
 function deriveChangedScope(cwd: string, baseCommit: string, candidateTree: string, entries: readonly CandidateTreeEntry[], executor: CandidateGitExecutor): CandidateViewScope {
@@ -685,7 +761,15 @@ export class CandidateViewRegistry {
 		if (!committedOnly && head.tree !== descriptor.baseTree) throw new CandidateViewError("native projection base no longer matches HEAD");
 		const tree = parseTree(root, descriptor.currentCandidateTree, this.gitExecutor);
 		const scope = deriveChangedScope(root, descriptor.baseTree, descriptor.currentCandidateTree, [...tree.entries, ...tree.gitlinks], this.gitExecutor);
-		if (JSON.stringify(scope.paths) !== JSON.stringify([...descriptor.paths].sort())) throw new CandidateViewError("native projection paths do not match Git content");
+		// A manifest SUBSUMES the sorted-path comparison rather than stacking on
+		// top of it: it checks the same path set plus the mode, status, and
+		// type state the path set cannot express, and it names which of those
+		// drifted. Descriptors without a manifest keep the legacy check.
+		if (descriptor.manifest !== undefined) {
+			assertManifestMatchesGit(descriptor, deriveChangedPathManifest(root, descriptor.baseTree, descriptor.currentCandidateTree, this.gitExecutor));
+		} else if (JSON.stringify(scope.paths) !== JSON.stringify([...descriptor.paths].sort())) {
+			throw new CandidateViewError("native projection paths do not match Git content");
+		}
 		this.projections.set(lineageId, {
 			contributorRoot: root,
 			baseCommit: base.commit,

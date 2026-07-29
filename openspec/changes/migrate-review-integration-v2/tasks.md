@@ -47,9 +47,9 @@ Chain strategy: size-exception
 
 ### Phase 3: candidate-view manifest binding
 
-- [ ] 3.1 RED: `tests/review-candidate-view.test.ts` — `deriveChangedPathManifest` shape and all six failure modes: `manifest-path-set-drift`, `manifest-mode-drift`, `manifest-status-drift`, `manifest-intended-untracked-not-subset`, `manifest-input-divergence`, `manifest-subject-drift`.
-- [ ] 3.2 GREEN: `lib/review-candidate-view.ts` — add `ChangedPathEntry`, optional `manifest?: readonly ChangedPathEntry[]` on `NativeCandidateProjectionDescriptor`, `deriveChangedPathManifest` (`git diff --raw -z --no-ext-diff --find-renames=100% <base> <candidate>`), field-wise comparison replacing the `JSON.stringify` check at `:688`; `intended_untracked` handled as structural subset check (documented deviation from spec's field-wise list), never a derived comparison.
-- [ ] 3.3 Threat-matrix RED test (Documentation-like paths): mode-only `100644→100755` divergence rejected even though sorted paths match — `tests/review-candidate-view.test.ts`.
+- [~] 3.1 RED (partial: five of six named reasons; manifest-subject-drift not yet covered): `tests/review-candidate-view.test.ts` — `deriveChangedPathManifest` shape and all six failure modes: `manifest-path-set-drift`, `manifest-mode-drift`, `manifest-status-drift`, `manifest-intended-untracked-not-subset`, `manifest-input-divergence`, `manifest-subject-drift`.
+- [x] 3.2 GREEN: `lib/review-candidate-view.ts` — add `ChangedPathEntry`, optional `manifest?: readonly ChangedPathEntry[]` on `NativeCandidateProjectionDescriptor`, `deriveChangedPathManifest` (`git diff --raw -z --no-ext-diff --find-renames=100% <base> <candidate>`), field-wise comparison replacing the `JSON.stringify` check at `:688`; `intended_untracked` handled as structural subset check (documented deviation from spec's field-wise list), never a derived comparison.
+- [x] 3.3 Threat-matrix RED test (Documentation-like paths): mode-only `100644→100755` divergence rejected even though sorted paths match — `tests/review-candidate-view.test.ts`.
 - [ ] 3.4 Threat-matrix RED test (Git repository selection): manifest/projection from a different root rejected — `tests/review-candidate-view.test.ts`.
 - [ ] 3.5 Threat-matrix RED test (Commit state): staged vs. workspace projection-kind mismatch rejected — `tests/review-candidate-view.test.ts`.
 - [ ] 3.6 GREEN (integration): `pnpm run test:harness` settling test — contributor edit between START and dispatch diverges `candidate_tree`; dispatch fails closed, no substituted view.

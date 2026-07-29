@@ -9,6 +9,7 @@ import {
 	CandidateViewError,
 	type CandidateGitExecutor,
 	createCandidateView,
+	deriveChangedPathManifest,
 	injectReviewCandidateView,
 } from "../lib/review-candidate-view.ts";
 
@@ -665,4 +666,199 @@ test("live candidate drift blocks dispatch before candidate text can be injected
 	} finally {
 		registry.cleanup(view.token);
 	}
+});
+
+// --- Phase 3: field-wise changed-path manifest binding -----------------------
+//
+// The sorted-path-set check these tests replace could not see a mode-only or a
+// type change: a file turning executable between START and dispatch produced an
+// identical path set, so the candidate Pi materialized could diverge from the
+// provider's frozen one and the comparison still passed. `--name-status` never
+// carried old_mode, which is why the manifest needs its own derivation.
+
+function treeOf(cwd: string): string {
+	git(cwd, "add", "-A");
+	return git(cwd, "write-tree");
+}
+
+function baseTreeOf(cwd: string): string {
+	return git(cwd, "rev-parse", "HEAD^{tree}");
+}
+
+test("deriveChangedPathManifest reports old and new mode, and flags a mode-only change", (t) => {
+	const cwd = repository(t);
+	chmodSync(join(cwd, "tracked.txt"), 0o755);
+	const candidate = treeOf(cwd);
+
+	const manifest = deriveChangedPathManifest(cwd, baseTreeOf(cwd), candidate);
+
+	assert.deepEqual(manifest, [{
+		path: "tracked.txt",
+		status: "M",
+		oldMode: "100644",
+		newMode: "100755",
+		deleted: false,
+		typeChanged: false,
+		modeOnly: true,
+	}]);
+});
+
+test("deriveChangedPathManifest distinguishes content change from mode-only", (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "tracked.txt"), "changed\n");
+	const manifest = deriveChangedPathManifest(cwd, baseTreeOf(cwd), treeOf(cwd));
+
+	assert.equal(manifest.length, 1);
+	assert.equal(manifest[0]?.modeOnly, false);
+	assert.equal(manifest[0]?.oldMode, "100644");
+	assert.equal(manifest[0]?.newMode, "100644");
+});
+
+test("deriveChangedPathManifest marks an added path and a deleted path", (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "added.txt"), "new\n");
+	rmSync(join(cwd, "tracked.txt"));
+	const manifest = deriveChangedPathManifest(cwd, baseTreeOf(cwd), treeOf(cwd));
+
+	const byPath = new Map(manifest.map((entry) => [entry.path, entry]));
+	assert.equal(byPath.get("added.txt")?.status, "A");
+	assert.equal(byPath.get("added.txt")?.deleted, false);
+	assert.equal(byPath.get("tracked.txt")?.status, "D");
+	assert.equal(byPath.get("tracked.txt")?.deleted, true);
+});
+
+test("a mode-only divergence is rejected even though the sorted path set matches", (t) => {
+	const cwd = repository(t);
+	chmodSync(join(cwd, "tracked.txt"), 0o755);
+	const candidate = treeOf(cwd);
+	const base = baseTreeOf(cwd);
+
+	// The provider froze the path as non-executable; Git now reports 100755.
+	// The old check compared only sorted paths and would accept this.
+	assert.throws(
+		() => new CandidateViewRegistry().restoreProjectionFromNative("review-mode-drift", cwd, {
+			baseTree: base,
+			currentCandidateTree: candidate,
+			paths: ["tracked.txt"],
+			intendedUntracked: [],
+			projection: "workspace",
+			manifest: [{ path: "tracked.txt", status: "M", oldMode: "100644", newMode: "100644", deleted: false, typeChanged: false, modeOnly: false }],
+		}),
+		(error: unknown) => error instanceof CandidateViewError && error.reason === "manifest-mode-drift",
+	);
+});
+
+test("a manifest whose path set differs from Git content is rejected as path-set drift", (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "tracked.txt"), "changed\n");
+	const candidate = treeOf(cwd);
+	const base = baseTreeOf(cwd);
+
+	assert.throws(
+		() => new CandidateViewRegistry().restoreProjectionFromNative("review-path-drift", cwd, {
+			baseTree: base,
+			currentCandidateTree: candidate,
+			paths: ["tracked.txt", "ghost.txt"],
+			intendedUntracked: [],
+			projection: "workspace",
+			manifest: [
+				{ path: "ghost.txt", status: "M", oldMode: "100644", newMode: "100644", deleted: false, typeChanged: false, modeOnly: false },
+				{ path: "tracked.txt", status: "M", oldMode: "100644", newMode: "100644", deleted: false, typeChanged: false, modeOnly: false },
+			],
+		}),
+		(error: unknown) => error instanceof CandidateViewError && error.reason === "manifest-path-set-drift",
+	);
+});
+
+test("a manifest whose status disagrees with Git is rejected as status drift", (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "tracked.txt"), "changed\n");
+	const candidate = treeOf(cwd);
+	const base = baseTreeOf(cwd);
+
+	assert.throws(
+		() => new CandidateViewRegistry().restoreProjectionFromNative("review-status-drift", cwd, {
+			baseTree: base,
+			currentCandidateTree: candidate,
+			paths: ["tracked.txt"],
+			intendedUntracked: [],
+			projection: "workspace",
+			manifest: [{ path: "tracked.txt", status: "A", oldMode: "100644", newMode: "100644", deleted: false, typeChanged: false, modeOnly: false }],
+		}),
+		(error: unknown) => error instanceof CandidateViewError && error.reason === "manifest-status-drift",
+	);
+});
+
+test("intended-untracked outside the manifest path set is rejected as a subset violation", (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "tracked.txt"), "changed\n");
+	const candidate = treeOf(cwd);
+	const base = baseTreeOf(cwd);
+
+	// intended_untracked is provider-only knowledge no Git command reproduces,
+	// so it is checked structurally as a subset rather than compared field-wise.
+	// That is a deliberate, documented deviation from the spec's field list.
+	assert.throws(
+		() => new CandidateViewRegistry().restoreProjectionFromNative("review-untracked-drift", cwd, {
+			baseTree: base,
+			currentCandidateTree: candidate,
+			paths: ["tracked.txt"],
+			intendedUntracked: ["not-in-manifest.txt"],
+			projection: "workspace",
+			manifest: [{ path: "tracked.txt", status: "M", oldMode: "100644", newMode: "100644", deleted: false, typeChanged: false, modeOnly: false }],
+		}),
+		(error: unknown) => error instanceof CandidateViewError,
+	);
+});
+
+test("a manifest that disagrees with the descriptor's own paths is rejected as input divergence", (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "tracked.txt"), "changed\n");
+	const candidate = treeOf(cwd);
+	const base = baseTreeOf(cwd);
+
+	assert.throws(
+		() => new CandidateViewRegistry().restoreProjectionFromNative("review-input-drift", cwd, {
+			baseTree: base,
+			currentCandidateTree: candidate,
+			paths: ["tracked.txt"],
+			intendedUntracked: [],
+			projection: "workspace",
+			manifest: [{ path: "other.txt", status: "M", oldMode: "100644", newMode: "100644", deleted: false, typeChanged: false, modeOnly: false }],
+		}),
+		(error: unknown) => error instanceof CandidateViewError && error.reason === "manifest-input-divergence",
+	);
+});
+
+test("a manifest matching Git field-wise restores the projection", (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "tracked.txt"), "changed\n");
+	const candidate = treeOf(cwd);
+	const base = baseTreeOf(cwd);
+
+	assert.doesNotThrow(() => new CandidateViewRegistry().restoreProjectionFromNative("review-manifest-ok", cwd, {
+		baseTree: base,
+		currentCandidateTree: candidate,
+		paths: ["tracked.txt"],
+		intendedUntracked: [],
+		projection: "workspace",
+		manifest: [{ path: "tracked.txt", status: "M", oldMode: "100644", newMode: "100644", deleted: false, typeChanged: false, modeOnly: false }],
+	}));
+});
+
+test("a descriptor without a manifest keeps the legacy path-set behavior", (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "tracked.txt"), "changed\n");
+	const candidate = treeOf(cwd);
+	const base = baseTreeOf(cwd);
+
+	// Phase 3 is additive: the manifest is optional, and its absence must not
+	// change how existing callers behave.
+	assert.doesNotThrow(() => new CandidateViewRegistry().restoreProjectionFromNative("review-no-manifest", cwd, {
+		baseTree: base,
+		currentCandidateTree: candidate,
+		paths: ["tracked.txt"],
+		intendedUntracked: [],
+		projection: "workspace",
+	}));
 });
