@@ -14,6 +14,7 @@ import { NativeReviewCliV216 } from "../lib/native-review-cli.ts";
 import { NativeReviewCliV216 as RuntimeNativeReviewCliV216 } from "../runtime/native-review-cli.mjs";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 import { resolveGentleAiReleaseAsset } from "../scripts/gentle-ai-installer.mjs";
+import { requireNativeBinary } from "./support/native-binary-gate.ts";
 
 const execFileAsync = promisify(execFile);
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -27,7 +28,9 @@ const resolvedBinary = (() => {
 		return undefined;
 	}
 })();
-const test = resolvedBinary === undefined ? baseTest.skip : baseTest;
+const nativeBinaryGate = requireNativeBinary({ resolvedBinary, digestsPinned: true, env: process.env });
+if (!nativeBinaryGate.run) console.log(`native-review-parity-runtime: ${nativeBinaryGate.reason}`);
+const test = nativeBinaryGate.run ? baseTest : baseTest.skip;
 const binary = resolvedBinary ?? "";
 const OFFICIAL_BINARY_SHA256 = resolveGentleAiReleaseAsset(process.platform, process.arch).binarySha256;
 const REVIEWED_PATHS = ["tracked.txt", "initially-untracked.txt"] as const;

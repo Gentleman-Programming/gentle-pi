@@ -67,7 +67,7 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | **Skill creation workflow**    | Provides the `gentle-ai-skill-creator`/`gentle-ai-skill-improver` skills, `/skill-creation` prompt, and packaged style guide for LLM-first skills. |
 | **Delivery skills**            | Includes issue-first PRs, chained PRs, work-unit commits, cognitive docs, comment writing, and Judgment Day review.                           |
 | **Bounded native review**      | Freezes one candidate, dispatches only controller-selected lenses, records native authority, and reuses the same content-bound receipt at delivery gates. |
-| **Verified native runtime**    | Provisions the exact package-local Gentle AI v2.1.11 binary, verifies pinned archive/binary integrity, negotiates `review-integration/v1`, and rejects PATH, global, sibling, symlink, and mode fallbacks. |
+| **Verified native runtime**    | Provisions the exact package-local Gentle AI v2.2.1 binary, verifies pinned archive/binary integrity, negotiates `review-integration/v1` today, and rejects PATH, global, sibling, symlink, and mode fallbacks. `review-integration/v2`'s immutable `base_tree`/`candidate_tree` transport is staged for a separate release-gated cutover (see [Native Authority Architecture](docs/native-authority-architecture.md)). |
 | **Runtime safety**             | Blocks destructive shell commands, asks for confirmation for sensitive operations, and blocks direct read/write/edit access to sensitive paths. |
 
 ## Install
@@ -264,11 +264,13 @@ Lifecycle gates never launch review actors. They rederive Git and publication ta
 
 Native contract pairing is exact: this adapter resolves only the integrity-verified package-local Gentle AI v2.1.11 executable, independently hashes it, then negotiates `gentle-ai.review-integration/v1` outside the repository. Capabilities are cached by that executable digest. Every START, target status, FINALIZE, validate, and BIND-SDD request passes the same contract identifier. Current protocol 1.0 envelopes decode exactly against the vendored schemas; `recover` routes only the provider-selected `action_disposition`, and optional additions require a future compatible schema/minor that the provider explicitly advertises and the consumer negotiates.
 
+Gentle AI also publishes a second negotiated contract, `gentle-ai.review-integration/v2`, which replaces the Base64 `candidate_diff` reviewer transport with immutable `base_tree`/`candidate_tree` plus an ordered `changed_path_manifest` and never an inline patch. `gentle-pi` is migrating to `/v2` only, with no dual-lane fallback; the cutover is release-gated on the pinned runtime confirming it serves contract v2 (already true for the currently pinned v2.2.1) and lands as one atomic commit, tracked by the `migrate-review-integration-v2` change. This provider contract version is unrelated to Pi's own internal "compact-v2" review-authority naming used below — the shared digit is coincidental, not a version pairing.
+
 Target status owns `current_target`, `unrelated`, `ambiguous`, and `corrupted` applicability and returns one native action. Pi does not reconstruct ordinary authority from provider-private files or choose a lineage from repository-wide history. Restart recovery rebuilds only the derived candidate view from the native Git/content projection, including intended-untracked paths, symlinks, and immutable gitlink identities. Native failure envelopes retain their exact mutation outcome, replayability, required inputs, request digest, and next action. After an unknown or lost mutating result, Pi calls target status before any replay decision and returns only the provider-declared action.
 
 Direct authorized `git commit` commands use a durable recovery record under the Git common directory. The package runs the effective pre-commit hook once, captures the post-hook index, performs final native validation against that tree, suppresses only the already-completed pre-commit hook while preserving message/post hooks through proxies, and proves `HEAD^{tree}` before the tool result succeeds. Any unresolved, interrupted, failed, or mismatched transaction blocks push, PR, and release. Recovery never resets HEAD or the index automatically.
 
-Once v2.1.11 has written review authority, rollback MUST preserve every native store and receipt and MUST NOT run a downgraded binary against that repository. Disable the Pi route or roll forward to a compatible authority-aware release instead; deleting authority data or reinstalling an older binary is not a rollback path.
+Once the pinned gentle-ai runtime (currently v2.2.1) has written review authority, rollback MUST preserve every native store and receipt and MUST NOT run a downgraded binary against that repository. Disable the Pi route or roll forward to a compatible authority-aware release instead; deleting authority data or reinstalling an older binary is not a rollback path.
 
 ### FINALIZE wrapper input
 
@@ -661,14 +663,16 @@ Memory contract for SDD delegation:
 | ------------------------------ | ---------------------------------------------------------------------------------------------------------- |
 | `extensions/gentle-ai.ts`      | Injects identity, orchestrates native review authority and lifecycle gates, refreshes global SDD assets, registers commands, applies model/persona config, and enforces runtime safety. |
 | `lib/native-review-cli.ts`     | Strict package-local adapter for Gentle AI START, FINALIZE, VALIDATE, SDD binding, and status contracts.     |
-| `lib/review-integration-v1.ts` | Strict consumer decoder for negotiated capabilities, operations, target status, projections, and failures.  |
+| `lib/review-integration-v1.ts` | Strict consumer decoder for negotiated capabilities, operations, target status, projections, and failures against contract `review-integration/v1` (active today).  |
+| `lib/review-integration-v2.ts` | Strict consumer decoder for contract `review-integration/v2`; staged and unimported until the release-gated cutover lands.  |
 | `lib/git-commit-transaction.ts` | Durable hook/native-validation/commit/recovery transaction with publication blocking and HEAD proof.        |
 | `lib/review-candidate-view.ts` | Builds immutable changed-scope actor views while preserving full-tree, path, mode, symlink, and index integrity. |
 | `lib/review-canonical.ts`      | Permanent Pi-owned canonical JSON and domain-hash primitives for consumer-side identities.                   |
 | `lib/review-repository.ts`     | Permanent Pi-owned Git common-directory identity, safe Git environment, and authority-root binding.          |
 | `lib/gentle-ai-binary.ts`      | Resolves and verifies the confined package-local Gentle AI runtime without global or PATH fallback.          |
 | `scripts/gentle-ai-installer.mjs` | Downloads, verifies, extracts, and atomically promotes the pinned native runtime for six platform targets. |
-| `contracts/review-integration/v1/` | Byte-identical v2.1.11 provider schemas and conformance fixtures, hash-checked before packaging.       |
+| `contracts/review-integration/v1/` | Byte-identical provider schemas and conformance fixtures for contract `review-integration/v1`, hash-checked before packaging; retained on disk permanently because `/v2`'s schemas `$ref` into these fragments. |
+| `contracts/review-integration/v2/` | Byte-identical provider schemas and conformance fixtures for contract `review-integration/v2` (immutable `base_tree`/`candidate_tree`, ordered `changed_path_manifest`, no inline candidate diff), hash-checked before packaging. |
 | `extensions/startup-banner.ts` | Shows and configures the startup intro, color presets, compact runtime panel, and collaboration credit.     |
 | `extensions/sdd-init.ts`       | Registers `/sdd-init` for OpenSpec initialization.                                                         |
 | `extensions/skill-registry.ts` | Maintains `.atl/skill-registry.md` from project/user skills and closes file watchers on shutdown.          |
@@ -679,7 +683,7 @@ Memory contract for SDD delegation:
 | `skills/`                      | Gentle AI delivery and collaboration skills.                                                               |
 | `prompts/`                     | Gentle-prefixed prompt templates, including `/skill-creation`.                                             |
 | `docs/skill-style-guide.md`    | Normative style guide used by the packaged skill creation/improvement skills.                              |
-| `docs/native-authority-architecture.md` | Post-U8 ownership boundary, reproducible slimming metrics, Windows evidence, and exact #191 seam.     |
+| `docs/native-authority-architecture.md` | Post-U8 ownership boundary, reproducible slimming metrics, Windows evidence, exact #191 seam, and the `review-integration/v1`→`v2` migration status, including the "compact-v2" naming disambiguation.     |
 | `docs/review-integration.md`   | Negotiated provider/consumer contract and the current Gentle Pi adoption boundary.                         |
 
 ## Development

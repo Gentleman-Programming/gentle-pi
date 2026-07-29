@@ -47,32 +47,32 @@ Chain strategy: size-exception
 
 ### Phase 3: candidate-view manifest binding
 
-- [~] 3.1 RED (partial: five of six named reasons; manifest-subject-drift not yet covered): `tests/review-candidate-view.test.ts` — `deriveChangedPathManifest` shape and all six failure modes: `manifest-path-set-drift`, `manifest-mode-drift`, `manifest-status-drift`, `manifest-intended-untracked-not-subset`, `manifest-input-divergence`, `manifest-subject-drift`.
+- [x] 3.1 RED: `tests/review-candidate-view.test.ts` — `deriveChangedPathManifest` shape and all six failure modes: `manifest-path-set-drift`, `manifest-mode-drift`, `manifest-status-drift`, `manifest-intended-untracked-not-subset`, `manifest-input-divergence`, `manifest-subject-drift`. `manifest-subject-drift` completed: the v2 `artifact-subject.schema.json` requires `changed_path_manifest_sha256`; `digestChangedPathManifest` computes Pi's own canonical digest of a manifest (sorted by path, wire snake_case field names) and `assertManifestMatchesGit` rejects a manifest whose digest disagrees with the descriptor's `manifestSha256` claim before any Git comparison.
 - [x] 3.2 GREEN: `lib/review-candidate-view.ts` — add `ChangedPathEntry`, optional `manifest?: readonly ChangedPathEntry[]` on `NativeCandidateProjectionDescriptor`, `deriveChangedPathManifest` (`git diff --raw -z --no-ext-diff --find-renames=100% <base> <candidate>`), field-wise comparison replacing the `JSON.stringify` check at `:688`; `intended_untracked` handled as structural subset check (documented deviation from spec's field-wise list), never a derived comparison.
 - [x] 3.3 Threat-matrix RED test (Documentation-like paths): mode-only `100644→100755` divergence rejected even though sorted paths match — `tests/review-candidate-view.test.ts`.
-- [ ] 3.4 Threat-matrix RED test (Git repository selection): manifest/projection from a different root rejected — `tests/review-candidate-view.test.ts`.
-- [ ] 3.5 Threat-matrix RED test (Commit state): staged vs. workspace projection-kind mismatch rejected — `tests/review-candidate-view.test.ts`.
-- [ ] 3.6 GREEN (integration): `pnpm run test:harness` settling test — contributor edit between START and dispatch diverges `candidate_tree`; dispatch fails closed, no substituted view.
-- [ ] 3.7 GREEN (integration): `pnpm run test:harness` settling test — review dispatch grants lens agents no shell/Bash tool, candidate reachable only via `Read`.
+- [x] 3.4 Threat-matrix RED test (Git repository selection): manifest/projection from a different root rejected — `tests/review-candidate-view.test.ts`. Confirms the pre-existing `resolveProjection` root guard (`realpathSync(contributorRoot) !== projection.contributorRoot`) still rejects a mismatched root now that manifest binding exists — the manifest never widens scope.
+- [x] 3.5 Threat-matrix RED test (Commit state): staged vs. workspace projection-kind mismatch rejected — `tests/review-candidate-view.test.ts`. Found and closed a real gap: `restoreProjectionFromNative` derived `committedOnly` from Git facts but never cross-checked it against the descriptor's own `projection` ("staged"|"workspace") label — a mislabeled descriptor would previously be silently accepted with the label ignored. Added a `projection-kind-drift` rejection. Also corrected a pre-existing test ("native projections recover a committed range base from its frozen tree") whose descriptor labeled a genuinely committed range as `"workspace"`; relabeled to `"staged"` to reflect what it actually is.
+- [x] 3.6 GREEN (integration): `pnpm run test:harness` settling test — contributor edit between START and dispatch diverges `candidate_tree`; dispatch fails closed, no substituted view. Implemented by driving the real `createGentleAiExtension` tool_call wiring (not the bare library call already covered at the unit layer) with an injected `CandidateViewRegistry`, binding a candidate, editing the contributor's tracked file, then asserting the `subagent_run` dispatch blocks and never mutates the child task text.
+- [ ] 3.7 GREEN (integration): `pnpm run test:harness` settling test — review dispatch grants lens agents no shell/Bash tool, candidate reachable only via `Read`. BLOCKED, not implemented: `assets/agents/review-risk.md`, `review-resilience.md`, `review-readability.md`, and `review-reliability.md` all currently declare `bash` in their tool list, and `tests/review-actor-tool-deny.test.ts:112-116` explicitly asserts `review-risk` "must keep its existing explicit bash allowance" — a pre-existing, deliberately tested design decision. Pi's `subagent_run` dispatch input also has no per-call tool-restriction field (`SUBAGENT_RUN_KEYS` is `agent, agents, task, context, mode`), so there is no dynamic gating path either. Satisfying this ADDED requirement as worded requires either revising the spec's "No-shell dispatch" scope or reconciling it with the existing bash-retention test/design — sdd-apply should not resolve that conflict unilaterally by silently removing tested, intentional tool access.
 
 ### Phase 4: loud-skip gate
 
-- [ ] 4.1 RED: `tests/support/native-binary-gate.test.ts` — `requireNativeBinary()` throws when `GENTLE_PI_REQUIRE_NATIVE_BINARY=1` and the binary is unresolved or its digest is unpinned; otherwise returns a printed skip reason.
-- [ ] 4.2 GREEN: `tests/support/native-binary-gate.ts` — implement `requireNativeBinary()`.
-- [ ] 4.3 `tests/native-review-parity-runtime.test.ts:30` — replace the `resolvedBinary === undefined ? baseTest.skip : baseTest` ternary with `requireNativeBinary()`.
-- [ ] 4.4 `tests/gentle-ai-binary.test.ts:23` — replace the `releaseDigestsPinned && existsSync(...)` ternary with `requireNativeBinary()`.
-- [ ] 4.5 `.github/workflows/ci.yml` — export `GENTLE_PI_REQUIRE_NATIVE_BINARY=1`.
-- [ ] 4.6 Verify: `GENTLE_PI_REQUIRE_NATIVE_BINARY=1` with the binary removed (temp package root) → both suites FAIL, not skip.
-- [ ] 4.7 Verify: with the binary installed, both suites still run for real (12 tests, 12 pass, 0 skipped); overall baseline skip count stays 1 (`tests/review-repository.test.ts:52`, Windows-only).
+- [x] 4.1 RED: `tests/native-binary-gate.test.ts` — `requireNativeBinary()` throws when `GENTLE_PI_REQUIRE_NATIVE_BINARY=1` and the binary is unresolved or its digest is unpinned; otherwise returns a printed skip reason. (Test file lives at the top level, not under `tests/support/`, because the runner glob is `tests/*.test.ts` and `tests/support/` is excluded from collection — the RED test was already placed correctly before this batch.)
+- [x] 4.2 GREEN: `tests/support/native-binary-gate.ts` — implement `requireNativeBinary()`.
+- [x] 4.3 `tests/native-review-parity-runtime.test.ts:30` — replace the `resolvedBinary === undefined ? baseTest.skip : baseTest` ternary with `requireNativeBinary()`.
+- [x] 4.4 `tests/gentle-ai-binary.test.ts:23` — replace the `releaseDigestsPinned && existsSync(...)` ternary with `requireNativeBinary()`.
+- [x] 4.5 `.github/workflows/ci.yml` — export `GENTLE_PI_REQUIRE_NATIVE_BINARY=1`.
+- [x] 4.6 Verify: `GENTLE_PI_REQUIRE_NATIVE_BINARY=1` with the binary removed (temp package root) → both suites FAIL, not skip.
+- [x] 4.7 Verify: with the binary installed, both suites still run for real (12 tests, 12 pass, 0 skipped); overall baseline skip count stays 1 (`tests/review-repository.test.ts:52`, Windows-only).
 
 ### Phase 5: package-files reconciliation
 
-- [ ] 5.1 RED: fixture-driven test for `scripts/verify-package-files.mjs` — an unlisted `contracts/**` file fails; a `runtime/*.mjs` absent from `sources` fails; a `sources` entry absent from `requiredPaths` fails.
-- [ ] 5.2 GREEN: `scripts/verify-package-files.mjs` — `contracts/` ↔ `contractHashes` walk (`unlisted-on-disk` / `listed-but-missing`, `docs/review-integration.md` stays outside the walk root); `sources` ↔ `runtime/*.mjs` ↔ `requiredPaths` three-way walk; add the 13 v2 `contractHashes` entries (9 schemas + 4 fixtures); reword the `:150` drift message to name both lanes.
+- [x] 5.1 RED: fixture-driven test for `scripts/verify-package-files.mjs` — an unlisted `contracts/**` file fails; a `runtime/*.mjs` absent from `sources` fails; a `sources` entry absent from `requiredPaths` fails.
+- [x] 5.2 GREEN: `scripts/verify-package-files.mjs` — `contracts/` ↔ `contractHashes` walk (`unlisted-on-disk` / `listed-but-missing`, `docs/review-integration.md` stays outside the walk root); `sources` ↔ `runtime/*.mjs` ↔ `requiredPaths` three-way walk; add the 13 v2 `contractHashes` entries (9 schemas + 4 fixtures) plus 4 previously-unlisted v1 entries discovered by the walk (`capabilities-v1.5` + `verification-evidence`, fixture + schema each); reword the `:150` drift message to name both lanes.
 
 ### Phase 6: docs
 
-- [ ] 6.1 `docs/native-authority-architecture.md`, `README.md`, `skills/gentle-ai/SKILL.md`, `skills/_shared/review-ledger-contract.md` — v2 vocabulary; disambiguate Pi's internal "compact-v2" from provider v2. Do not touch `docs/review-integration.md` (hash-pinned, mirrored).
+- [~] 6.1 (partial: `docs/native-authority-architecture.md` and `README.md` done; `skills/gentle-ai/SKILL.md` and `skills/_shared/review-ledger-contract.md` deliberately untouched — see note) `docs/native-authority-architecture.md`, `README.md`, `skills/gentle-ai/SKILL.md`, `skills/_shared/review-ledger-contract.md` — v2 vocabulary; disambiguate Pi's internal "compact-v2" from provider v2. Do not touch `docs/review-integration.md` (hash-pinned, mirrored). **Note**: `skills/gentle-ai/SKILL.md` and `skills/_shared/review-ledger-contract.md` mirror gentle-ai assets; gentle-ai v2.2.2 already changed `review-ledger-contract.md` upstream and Pi will re-mirror both during the v2.2.2 pin bump, so editing them now would conflict with that re-sync. Also: `README.md`'s "Native contract pairing is exact" paragraph and the "explicit v2.1.11 maintenance"/"compact-v2 recovery successor" phrasing are byte-locked by `tests/review-ledger-contract.test.ts` and `tests/review-authority-recovery-docs.test.ts` (not in scope for this SDD change's task list) — those exact strings were left untouched; a disambiguation note was added alongside instead.
 
 ### Phase 7: Stage 1 close-out
 
@@ -89,14 +89,14 @@ All tasks in Phases 8–12 land in one atomic commit (per design.md's atomicity 
 
 ### Phase 8 [RELEASE-GATED]: pin bump
 
-- [ ] 8.0 Gate check: run the capabilities probe above; STOP if it fails.
-- [ ] 8.1 `scripts/gentle-ai-installer.mjs:22,26` — `RELEASE_BASE_URL` → `.../v2.2.1/`, `INSTALLER_VERSION = "2.2.1"`.
-- [ ] 8.2 `scripts/gentle-ai-installer.mjs:47-52` — `GENTLE_AI_RELEASE_ASSETS`: 4 targets × (`name`, `sha256` from signed `checksums.txt`, `binarySha256` computed from extracted executables) = 12 literals.
-- [ ] 8.3 `lib/gentle-ai-binary.ts:8` — `GENTLE_AI_VERSION = "2.2.1"`.
-- [ ] 8.4 `lib/native-review-cli.ts:540-541` — add `NATIVE_CLI_CONTRACTS["2.2.1"]` row (copy `"2.2.0"` column).
-- [ ] 8.5 `scripts/verify-package-files.mjs:182` — both `2.2.0` literals → `2.2.1`.
-- [ ] 8.6 `tests/gentle-ai-installer.test.ts:25-28` — update EXPECTED asset table (12 digest literals).
-- [ ] 8.7 `tests/package-manifest.test.ts:277-278` — regexes → `2\.2\.1`.
+- [x] 8.0 Gate check: run the capabilities probe above; STOP if it fails.
+- [x] 8.1 `scripts/gentle-ai-installer.mjs:22,26` — `RELEASE_BASE_URL` → `.../v2.2.1/`, `INSTALLER_VERSION = "2.2.1"`.
+- [x] 8.2 `scripts/gentle-ai-installer.mjs:47-52` — `GENTLE_AI_RELEASE_ASSETS`: 4 targets × (`name`, `sha256` from signed `checksums.txt`, `binarySha256` computed from extracted executables) = 12 literals.
+- [x] 8.3 `lib/gentle-ai-binary.ts:8` — `GENTLE_AI_VERSION = "2.2.1"`.
+- [x] 8.4 `lib/native-review-cli.ts:540-541` — add `NATIVE_CLI_CONTRACTS["2.2.1"]` row (copy `"2.2.0"` column).
+- [x] 8.5 `scripts/verify-package-files.mjs:182` — both `2.2.0` literals → `2.2.1`.
+- [x] 8.6 `tests/gentle-ai-installer.test.ts:25-28` — update EXPECTED asset table (12 digest literals).
+- [x] 8.7 `tests/package-manifest.test.ts:277-278` — regexes → `2\.2\.1`.
 
 ### Phase 9 [RELEASE-GATED]: import flip, six `--contract` sites, v1 deletion
 

@@ -13,6 +13,7 @@ import {
 } from "../lib/gentle-ai-binary.ts";
 import { NativeReviewCliV213, createNativeReviewCli, type ExecFileAdapter } from "../lib/native-review-cli.ts";
 import { resolveGentleAiReleaseAsset } from "../scripts/gentle-ai-installer.mjs";
+import { requireNativeBinary } from "./support/native-binary-gate.ts";
 
 const VERSION = { stdout: `gentle-ai ${GENTLE_AI_VERSION}\n`, stderr: "", exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false } as const;
 const RUNTIME_DIRECTORY = `v${GENTLE_AI_VERSION}`;
@@ -20,7 +21,13 @@ const repoRuntimeBinary = join(import.meta.dirname, "..", ".gentle-ai", RUNTIME_
 const releaseDigestsPinned = /^[0-9a-f]{64}$/.test(resolveGentleAiReleaseAsset(process.platform, process.arch).sha256);
 // These integrity tests need the published official binary; they skip while a
 // re-pinned release's archives and digest table are still pending.
-const verifiedBinaryTest = releaseDigestsPinned && existsSync(repoRuntimeBinary) ? test : test.skip;
+const nativeBinaryGate = requireNativeBinary({
+	resolvedBinary: existsSync(repoRuntimeBinary) ? repoRuntimeBinary : undefined,
+	digestsPinned: releaseDigestsPinned,
+	env: process.env,
+});
+if (!nativeBinaryGate.run) console.log(`gentle-ai-binary: ${nativeBinaryGate.reason}`);
+const verifiedBinaryTest = nativeBinaryGate.run ? test : test.skip;
 
 async function writeVerifiedBinary(packageRoot: string, platform = process.platform): Promise<string> {
 	const asset = resolveGentleAiReleaseAsset(platform, process.arch);

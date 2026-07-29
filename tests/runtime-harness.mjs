@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
@@ -169,6 +170,10 @@ function readAgentDefinition(source) {
 
 function sha256(content) {
 	return createHash("sha256").update(content).digest("hex");
+}
+
+function gitSync(cwd, ...arguments_) {
+	return execFileSync("git", arguments_, { cwd, encoding: "utf8" }).trim();
 }
 
 async function tempWorkspace() {
@@ -401,6 +406,67 @@ async function run() {
 		assert.match(commitGate.reason, /exactly derive/i);
 	} finally {
 		await rm(toolCwd, { recursive: true, force: true });
+	}
+
+	// review-candidate-view Phase 3.6 settling test: a contributor edit landing
+	// strictly between the controller-owned candidate binding and reviewer
+	// dispatch must diverge the live candidate tree from the frozen one, and
+	// dispatch must fail closed rather than expose a substituted view to the
+	// lens sub-agent. This drives the real `createGentleAiExtension` tool_call
+	// wiring (not the bare library function tested in
+	// tests/review-candidate-view.test.ts) with an injected candidate-view
+	// registry, so the actual production dispatch path is exercised.
+	const candidateDriftCwd = await tempWorkspace();
+	try {
+		const { createGentleAiExtension } = await import(
+			pathToFileURL(join(ROOT, "extensions/gentle-ai.ts")).href
+		);
+		const { CandidateViewRegistry } = await import(
+			pathToFileURL(join(ROOT, "lib/review-candidate-view.ts")).href
+		);
+
+		gitSync(candidateDriftCwd, "init", "-b", "main");
+		await writeFile(join(candidateDriftCwd, "tracked.txt"), "base\n");
+		gitSync(candidateDriftCwd, "add", "tracked.txt");
+		gitSync(
+			candidateDriftCwd,
+			"-c", "user.name=Runtime Harness",
+			"-c", "user.email=runtime-harness@example.invalid",
+			"commit", "-m", "base",
+		);
+
+		const registry = new CandidateViewRegistry();
+		const view = registry.create({ contributorRoot: candidateDriftCwd });
+		registry.bindCurrent({ token: view.token, lineageId: "harness-candidate-drift", selectedLenses: ["review-risk"] });
+
+		const dispatchPi = createPi();
+		createGentleAiExtension({ candidateViews: registry })(dispatchPi.pi);
+		const dispatchToolHook = dispatchPi.hooks.get("tool_call")[0];
+
+		// The contributor edits the tracked file strictly after the candidate
+		// view was bound (START) and strictly before dispatch would run.
+		await writeFile(join(candidateDriftCwd, "tracked.txt"), "drifted after bind, before dispatch\n");
+
+		const dispatchInput = { agent: "review-risk", task: "review", mode: "task" };
+		const dispatchResult = await dispatchToolHook(
+			{ toolName: "subagent_run", input: dispatchInput },
+			createCtx(candidateDriftCwd),
+		);
+		assert.equal(dispatchResult?.block, true, "dispatch must fail closed when the candidate tree diverges between bind and dispatch");
+		assert.match(dispatchResult.reason, /live candidate|drift/i);
+		assert.equal(
+			dispatchInput.task,
+			"review",
+			"a failed-closed dispatch must never mutate the child dispatch input",
+		);
+		assert.doesNotMatch(
+			dispatchInput.task,
+			/Controller-owned review lineage/,
+			"a failed-closed dispatch must never inject a substituted candidate view into the lens sub-agent's task",
+		);
+		registry.cleanup(view.token);
+	} finally {
+		await rm(candidateDriftCwd, { recursive: true, force: true });
 	}
 
 	const bannerCwd = await tempWorkspace();

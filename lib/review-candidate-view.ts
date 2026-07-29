@@ -119,6 +119,12 @@ export interface NativeCandidateProjectionDescriptor {
 	// Optional so Phase 3 stays additive: existing callers keep the legacy
 	// sorted-path behavior until the v2 switchover supplies a manifest.
 	manifest?: readonly ChangedPathEntry[];
+	// The provider artifact-subject's `changed_path_manifest_sha256` claim
+	// (contracts/review-integration/v2/schemas/artifact-subject.schema.json).
+	// Optional and additive like `manifest`: checked against Pi's own
+	// canonical digest of `manifest` (see `digestChangedPathManifest`), never
+	// against the provider's undocumented on-wire canonicalization.
+	manifestSha256?: string;
 }
 
 export class CandidateViewError extends Error {
@@ -280,9 +286,39 @@ export function deriveChangedPathManifest(cwd: string, baseTree: string, candida
 	return Object.freeze([...entries].sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0)));
 }
 
+// Pi's own canonical digest of a changed-path manifest: sorted by path, with
+// the wire (snake_case) field names the v2 `changed_path` schema uses. This
+// is deliberately NOT an attempt to reproduce the provider's undocumented
+// `changed_path_manifest_sha256` canonicalization byte-for-byte (design.md's
+// open question). It is Pi's own self-consistency check: does the manifest a
+// descriptor carries digest to the same value the descriptor claims for it?
+// A caller (or a corrupted transport) that supplies a manifest and a claimed
+// digest that disagree with each other is caught here, independent of and
+// before any comparison against live Git content.
+export function digestChangedPathManifest(manifest: readonly ChangedPathEntry[]): string {
+	const canonical = [...manifest]
+		.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0))
+		.map((entry) => ({
+			path: entry.path,
+			status: entry.status,
+			old_mode: entry.oldMode,
+			new_mode: entry.newMode,
+			deleted: entry.deleted,
+			type_changed: entry.typeChanged,
+			mode_only: entry.modeOnly,
+		}));
+	return `sha256:${createHash("sha256").update(JSON.stringify(canonical)).digest("hex")}`;
+}
+
 function assertManifestMatchesGit(descriptor: NativeCandidateProjectionDescriptor, derived: readonly ChangedPathEntry[]): void {
 	const claimed = descriptor.manifest;
 	if (claimed === undefined) return;
+
+	// Self-consistency: does the manifest digest to what the subject claims
+	// for it? Checked before any Git comparison, same as input-divergence.
+	if (descriptor.manifestSha256 !== undefined && digestChangedPathManifest(claimed) !== descriptor.manifestSha256) {
+		throw new CandidateViewError("native manifest does not digest to its own artifact-subject claim", "manifest-subject-drift");
+	}
 
 	// First: is the provider's own input self-consistent? A manifest that does
 	// not describe the descriptor's paths is not a drift observation, it is a
@@ -759,6 +795,13 @@ export class CandidateViewRegistry {
 		const base = head.tree === descriptor.baseTree ? head : resolveCandidateBaseTree(root, descriptor.baseTree, this.gitExecutor);
 		const committedOnly = head.tree === descriptor.currentCandidateTree && base.tree !== head.tree;
 		if (!committedOnly && head.tree !== descriptor.baseTree) throw new CandidateViewError("native projection base no longer matches HEAD");
+		// The descriptor's own `projection` label ("staged" = a committed range,
+		// "workspace" = dirty-inclusive) must agree with what Pi independently
+		// derives from the base/candidate/HEAD relationship. Neither trusting
+		// nor silently overriding a mislabeled claim is safe: fail closed.
+		if ((descriptor.projection === "staged") !== committedOnly) {
+			throw new CandidateViewError("native projection commit-state does not match its declared projection kind", "projection-kind-drift");
+		}
 		const tree = parseTree(root, descriptor.currentCandidateTree, this.gitExecutor);
 		const scope = deriveChangedScope(root, descriptor.baseTree, descriptor.currentCandidateTree, [...tree.entries, ...tree.gitlinks], this.gitExecutor);
 		// A manifest SUBSUMES the sorted-path comparison rather than stacking on

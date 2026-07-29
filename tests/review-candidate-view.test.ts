@@ -10,6 +10,7 @@ import {
 	type CandidateGitExecutor,
 	createCandidateView,
 	deriveChangedPathManifest,
+	digestChangedPathManifest,
 	injectReviewCandidateView,
 } from "../lib/review-candidate-view.ts";
 
@@ -597,7 +598,8 @@ test("native projections recover a committed range base from its frozen tree", (
 		currentCandidateTree: candidateTree,
 		paths: ["tracked.txt"],
 		intendedUntracked: [],
-		projection: "workspace",
+		// A committed range: HEAD moved past base with no dirty overlay.
+		projection: "staged",
 	});
 	const projection = registry.resolveProjection("committed-projection", contributorRoot);
 	assert.equal(projection.baseCommit, baseCommit);
@@ -861,4 +863,136 @@ test("a descriptor without a manifest keeps the legacy path-set behavior", (t) =
 		intendedUntracked: [],
 		projection: "workspace",
 	}));
+});
+
+// --- 3.1 completion: manifest-subject-drift ---------------------------------
+//
+// The v2 artifact-subject schema (contracts/review-integration/v2/schemas/
+// artifact-subject.schema.json) requires `changed_path_manifest_sha256` on
+// every subject. That is the provider's own claim about what the manifest it
+// handed the dispatch digests to. A manifest that does not digest to that
+// claim is a self-consistency failure Pi can catch without touching Git at
+// all: the descriptor disagrees with itself before any content comparison.
+
+test("a manifest whose digest disagrees with the subject's claim is rejected as subject drift", (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "tracked.txt"), "changed\n");
+	const candidate = treeOf(cwd);
+	const base = baseTreeOf(cwd);
+	const manifest = [{ path: "tracked.txt", status: "M", oldMode: "100644", newMode: "100644", deleted: false, typeChanged: false, modeOnly: false }];
+
+	assert.throws(
+		() => new CandidateViewRegistry().restoreProjectionFromNative("review-subject-drift", cwd, {
+			baseTree: base,
+			currentCandidateTree: candidate,
+			paths: ["tracked.txt"],
+			intendedUntracked: [],
+			projection: "workspace",
+			manifest,
+			// A subject claim that cannot possibly match any real digest.
+			manifestSha256: `sha256:${"0".repeat(64)}`,
+		}),
+		(error: unknown) => error instanceof CandidateViewError && error.reason === "manifest-subject-drift",
+	);
+});
+
+test("a manifest digest matching the subject's claim restores the projection", (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "tracked.txt"), "changed\n");
+	const candidate = treeOf(cwd);
+	const base = baseTreeOf(cwd);
+	const manifest = [{ path: "tracked.txt", status: "M", oldMode: "100644", newMode: "100644", deleted: false, typeChanged: false, modeOnly: false }];
+
+	assert.doesNotThrow(() => new CandidateViewRegistry().restoreProjectionFromNative("review-subject-ok", cwd, {
+		baseTree: base,
+		currentCandidateTree: candidate,
+		paths: ["tracked.txt"],
+		intendedUntracked: [],
+		projection: "workspace",
+		manifest,
+		manifestSha256: digestChangedPathManifest(manifest),
+	}));
+});
+
+test("a descriptor without a subject digest keeps validating the manifest without a subject-drift check", (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "tracked.txt"), "changed\n");
+	const candidate = treeOf(cwd);
+	const base = baseTreeOf(cwd);
+	const manifest = [{ path: "tracked.txt", status: "M", oldMode: "100644", newMode: "100644", deleted: false, typeChanged: false, modeOnly: false }];
+
+	// `manifestSha256` is additive, mirroring `manifest` itself: its absence
+	// must not change existing manifest-bound behavior.
+	assert.doesNotThrow(() => new CandidateViewRegistry().restoreProjectionFromNative("review-no-subject-digest", cwd, {
+		baseTree: base,
+		currentCandidateTree: candidate,
+		paths: ["tracked.txt"],
+		intendedUntracked: [],
+		projection: "workspace",
+		manifest,
+	}));
+});
+
+// --- 3.4 threat matrix: Git repository selection ----------------------------
+//
+// A manifest binding must never widen the existing root-scoping guarantee:
+// a projection frozen against one contributor root stays rejected when
+// resolved against a different one, exactly as it was before manifests
+// existed.
+
+test("a manifest-bound projection is rejected when resolved against a different contributor root", (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "tracked.txt"), "changed\n");
+	const candidate = treeOf(cwd);
+	const base = baseTreeOf(cwd);
+	const manifest = [{ path: "tracked.txt", status: "M", oldMode: "100644", newMode: "100644", deleted: false, typeChanged: false, modeOnly: false }];
+	const registry = new CandidateViewRegistry();
+	registry.restoreProjectionFromNative("review-root-scope", cwd, {
+		baseTree: base,
+		currentCandidateTree: candidate,
+		paths: ["tracked.txt"],
+		intendedUntracked: [],
+		projection: "workspace",
+		manifest,
+	});
+
+	const otherRoot = repository(t);
+	assert.throws(
+		() => registry.resolveProjection("review-root-scope", otherRoot),
+		(error: unknown) => error instanceof CandidateViewError && /different contributor root/.test(error.message),
+	);
+	// The root guard still resolves correctly against the true root.
+	assert.equal(registry.resolveProjection("review-root-scope", cwd).candidateTree, candidate);
+});
+
+// --- 3.5 threat matrix: Commit state ----------------------------------------
+//
+// `projection` on the descriptor claims "staged" (a committed range) or
+// "workspace" (dirty-inclusive). `restoreProjectionFromNative` independently
+// derives `committedOnly` from the descriptor's own base/candidate
+// relationship to HEAD; the claimed label must agree with that derivation, or
+// the request is rejected rather than silently trusting — or silently
+// overriding — a mislabeled projection kind.
+
+test("a projection labeled workspace but derived as a genuinely committed range is rejected as a projection-kind mismatch", (t) => {
+	const cwd = repository(t);
+	const baseTree = baseTreeOf(cwd);
+	writeFileSync(join(cwd, "tracked.txt"), "committed candidate\n");
+	git(cwd, "add", "tracked.txt");
+	git(cwd, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "candidate");
+	const candidateTree = git(cwd, "rev-parse", "HEAD^{tree}");
+
+	assert.throws(
+		() => new CandidateViewRegistry().restoreProjectionFromNative("review-projection-kind-drift", cwd, {
+			baseTree,
+			currentCandidateTree: candidateTree,
+			paths: ["tracked.txt"],
+			intendedUntracked: [],
+			// Git facts derive committedOnly=true (HEAD moved past base with no
+			// dirty overlay), but the descriptor mislabels it as a workspace
+			// snapshot.
+			projection: "workspace",
+		}),
+		(error: unknown) => error instanceof CandidateViewError && error.reason === "projection-kind-drift",
+	);
 });

@@ -32,6 +32,8 @@ jobs:
 
       - name: Run tests
         run: pnpm test
+        env:
+          GENTLE_PI_REQUIRE_NATIVE_BINARY: "1"
 
       - name: Verify package contents
         run: node scripts/verify-package-files.mjs

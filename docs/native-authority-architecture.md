@@ -8,7 +8,7 @@ U8 closed the U1-U7 slimming work. Issue [#191](https://github.com/Gentleman-Pro
 
 | Surface | Owner after #191 |
 | --- | --- |
-| Ordinary START, FINALIZE, target status, validation, SDD binding, recovery, and reconciliation | Package-local Gentle AI v2.1.11 through `gentle-ai.review-integration/v1` |
+| Ordinary START, FINALIZE, target status, validation, SDD binding, recovery, and reconciliation | Package-local Gentle AI v2.2.1 through `gentle-ai.review-integration/v1` (migrating to `/v2`, see below) |
 | Canonical consumer identities | Permanent Pi module `lib/review-canonical.ts` |
 | Git common-directory and repository identity | Permanent Pi module `lib/review-repository.ts` |
 | Immutable reviewer candidate views | Permanent Pi module `lib/review-candidate-view.ts` |
@@ -18,6 +18,21 @@ U8 closed the U1-U7 slimming work. Issue [#191](https://github.com/Gentleman-Pro
 | Historical graph receipt validation | Pi graph-v1 transaction, reachable only for historical graph authority and explicit Judgment Day |
 
 Pi no longer owns an ordinary compact store, compact gate, compatibility facade, supersession writer, graph bundle transport, mirror, checkpoint, reset writer, graph reducer mirror, or standalone revision/HEAD transaction backend.
+
+## Naming note: "compact-v2" is not contract v2
+
+This document and `gentle_review`'s recovery/maintenance commands use "compact-v2" to name Pi's own internal review-authority storage generation (`lib/review-compact.ts`, `lib/review-compact-contract.ts`), predating and unrelated to gentle-ai's negotiated protocol contract `gentle-ai.review-integration/v2`. The two share a digit and nothing else: "compact-v2" is Pi-internal authority-state vocabulary; `review-integration/v2` is gentle-ai's wire contract replacing the Base64 `candidate_diff` transport with immutable `base_tree`/`candidate_tree` and an ordered `changed_path_manifest`. Do not conflate them when reading the maintenance-boundary section below.
+
+## Contract migration status: `review-integration/v1` → `/v2`
+
+gentle-ai now publishes two negotiated contracts side by side: `gentle-ai.review-integration/v1` (the Base64 candidate-diff transport Pi has always spoken) and `gentle-ai.review-integration/v2` (immutable `base_tree`/`candidate_tree`, an ordered `changed_path_manifest`, mandatory `artifact_subjects`, and an evidence-first correction lifecycle). gentle-pi is migrating to `/v2` only, with no dual-lane fallback — the pinned binary always answers exactly one exact version, so negotiating a version range would buy nothing and double the decoder surface permanently.
+
+The migration (tracked as the `migrate-review-integration-v2` OpenSpec change) is split into a fixture-testable stage and a release-gated stage:
+
+- **Stage 1 (authorable without an external dependency):** the new `lib/review-integration-v2.ts` decoder module, a pure evidence-first correction-lifecycle module, and a field-wise candidate-view manifest check are authored and unit-tested against the mirrored `contracts/review-integration/v2/` fixtures, but stay unimported — `lib/native-review-cli.ts` keeps negotiating `/v1` and behavior does not change.
+- **Stage 2 (gated on the pinned gentle-ai release advertising contract v2):** one atomic commit flips the import, adds the net-new negotiated `review repair` call site, deletes `lib/review-integration-v1.ts` and its generated runtime and tests, and regenerates `runtime/*.mjs`. `contracts/review-integration/v1/**` stays on disk permanently because the `/v2` JSON schemas `$ref` into its fragments.
+
+Under `/v2`, reviewers inspect the frozen candidate through read-only Git against the exact frozen trees; a runtime that cannot enforce a per-command shell boundary exposes no shell and reports incomplete inspection rather than substituting live files. Pi already satisfies this by materializing a chmod-read-only worktree scoped to the manifest and pointing lens agents at it through `Read` — they get no Git shell at all.
 
 ## Dependency Boundary
 
@@ -75,11 +90,11 @@ U1-U8 retire nine review modules present on `origin/main`:
 
 U8 found no additional zero-consumer code module. Remaining graph, ordinary-policy, compact-contract, runtime-contract, snapshot, trigger, risk, and refuter modules retain production, contract, or semantic-replay consumers.
 
-The packaged `contracts/review-integration/v1/` schemas and fixtures plus `docs/review-integration.md` are byte-identical v2.1.11 provider artifacts, not dead Pi compatibility documentation. Package verification proves their hashes.
+The packaged `contracts/review-integration/v1/` schemas and fixtures plus `docs/review-integration.md` are byte-identical provider artifacts for negotiated contract `review-integration/v1`, not dead Pi compatibility documentation; the newer `contracts/review-integration/v2/` schemas and fixtures are a second byte-identical mirror, for contract `review-integration/v2`, whose schemas `$ref` into the `/v1` fragments — which is why the `/v1` directory stays packaged even after Pi migrates its active decoder. Package verification proves both directories' hashes.
 
 ## Published Maintenance Boundary
 
-Gentle AI v2.1.11 exposes explicit, audited maintenance commands outside negotiated ordinary review. Pi invokes `review abandon`, `review quarantine-legacy`, and `review reconcile-authority` only after fresh interactive approval of exact LF-only authorization text; headless execution and absent, malformed, or stale bindings fail closed.
+Gentle AI has exposed explicit, audited maintenance commands outside negotiated ordinary review since v2.1.11; the currently pinned v2.2.1 keeps them available under the same legacy version table. Pi invokes `review abandon`, `review quarantine-legacy`, and `review reconcile-authority` only after fresh interactive approval of exact LF-only authorization text; headless execution and absent, malformed, or stale bindings fail closed.
 
 `abandon` is restricted by native re-derivation to a caller-named pristine compact-v2 reviewing or invalidated lineage. `quarantine-legacy` accepts only the published malformed freeze-findings diagnostic and disposition. Reconciliation accepts the exact dual anomaly suffix `anomalies=unchanged_target,malformed_recovery_authorization` only in that order. `repair-legacy-alias` derives repository, revision, diagnostic, and disposition from freshly read native inventory before its own approval and can only quarantine one qualified historical alias chain. `review dispose-result` remains unexposed pending design. Recovery routes only the provider-selected negotiated `action_disposition`.
 

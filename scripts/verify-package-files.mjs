@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { join, relative, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = join(fileURLToPath(new URL("..", import.meta.url)));
 
@@ -81,6 +81,7 @@ const contractHashes = {
   "contracts/review-integration/v1/fixtures/capabilities-v1.2.fixture.json": "2970d21cd95a7fcaea6547c47a591a5151046e7ede658b3e8c5b9a9c5d106b65",
   "contracts/review-integration/v1/fixtures/capabilities-v1.3.fixture.json": "0ec783ea13b4c82c0b002c5caa758f33e2b488537297cc2d0694ec92176ac0cb",
   "contracts/review-integration/v1/fixtures/capabilities-v1.4.fixture.json": "84e0db457b76b97b35c2be772dfc647f9eab66810ea98f64fed85645c3c266ba",
+  "contracts/review-integration/v1/fixtures/capabilities-v1.5.fixture.json": "0cc952af3767c393bde9e4785e4071615a529fd672bc94da4fcc204780524a27",
   "contracts/review-integration/v1/fixtures/capabilities.fixture.json": "b3ca822189a236f2d891628c665ca23e308bf5185a1701e1f07231bd970461bb",
   "contracts/review-integration/v1/fixtures/consent.fixture.json": "b2ff4809b9eb75a54206800dca13f96396976aca7387e45f765ac6ec98029cd1",
   "contracts/review-integration/v1/fixtures/failure.fixture.json": "e72b6ab5e3c529abac47bd324444f84ca90f67ef0a67189f5fd8d24d199a2759",
@@ -101,6 +102,7 @@ const contractHashes = {
   "contracts/review-integration/v1/fixtures/status-v2-unrelated.fixture.json": "c178b338dcd5d30888acef37a9d752bd0932d6dedfffb61b0596a9cceabeb692",
   "contracts/review-integration/v1/fixtures/status-v2.fixture.json": "5410d8bbae1b7152a43b3a5c4c880e9e98a5e47b76d910456f5ef13f19836f3a",
   "contracts/review-integration/v1/fixtures/status.fixture.json": "555054d8046a896162995dcb117752f9cd1ef903fb9ebaad29af1b7e7f319bb3",
+  "contracts/review-integration/v1/fixtures/verification-evidence.fixture.json": "b30e3863548845b90e256d92193435d02da458bf8f15a4c33d023cd1f6894a5f",
   "contracts/review-integration/v1/schemas/admitted-result.schema.json": "7796e8dbba331434594108c902dfab7ec46f691fa447a9259a78f2448111b0de",
   "contracts/review-integration/v1/schemas/artifact-subject.schema.json": "f7dcd934e27e8f3735a37f3d0ec8048dd8ccc1811b9df61124a1dcbf8a03f40e",
   "contracts/review-integration/v1/schemas/authority-repair-assessment.schema.json": "232591670009f99c53a68e91d1e7e60465c294f1721f493ab1e7ae182842cfb5",
@@ -108,6 +110,7 @@ const contractHashes = {
   "contracts/review-integration/v1/schemas/capabilities-v1.2.schema.json": "df1722adcd9c999edbef090bfd5d9a9713f6852a9bc9cb79684ef7c9c91c0d62",
   "contracts/review-integration/v1/schemas/capabilities-v1.3.schema.json": "3401a062fa8a034ef7743f84adbfdd2ceadaf81bee8a7e62115fd4e18afacfcd",
   "contracts/review-integration/v1/schemas/capabilities-v1.4.schema.json": "926b61c8ac0f870f09214f6bd8af1b035c5b72f14f0b83c0d4a7bdbb277f5447",
+  "contracts/review-integration/v1/schemas/capabilities-v1.5.schema.json": "abc783821524dcc33339495284805a85f79b3352efb7358c95016ed164bd7f24",
   "contracts/review-integration/v1/schemas/capabilities.schema.json": "ad333177494a251beac153f74bd751fa77126a9968aad69e64fc2abf15cff0f7",
   "contracts/review-integration/v1/schemas/consent.schema.json": "f8f2edec17568124488482c2aee399909111fe0cce2cba426fb29efd2c7c1cd0",
   "contracts/review-integration/v1/schemas/failure.schema.json": "0ce29f61408fc21d72640fffdb215a608a820c29f3e5ff62d9cc295ed0451937",
@@ -122,66 +125,187 @@ const contractHashes = {
   "contracts/review-integration/v1/schemas/status-v2.schema.json": "63e8988ce276d948ea8305008a3d27c4e26dff664cf54fffed9e188f465d92d1",
   "contracts/review-integration/v1/schemas/status.schema.json": "67f3bddf5f5feeb3213bce489de8548546163b2e1d49a0e3965c0091dabc8c39",
   "contracts/review-integration/v1/schemas/targeted-validation-request.schema.json": "52b91154693b4dd66983fc91ecf7197503555f2c9e85cac626cffd3035c53d65",
+  "contracts/review-integration/v1/schemas/verification-evidence.schema.json": "fd15890bf2ef1db95d771ee7f468e9e64014351d7940f65604eb24f41e68a22f",
+  "contracts/review-integration/v2/fixtures/capabilities.fixture.json": "17c150d851c15b3f0c20d18c2e2741eb2232ffa24f35aa71d6d30e90a85e42b7",
+  "contracts/review-integration/v2/fixtures/consent.fixture.json": "a6d3ddc979d3dba202e4bf4ea5ca468ade1284f564f9325c313f4f9a9796f0ad",
+  "contracts/review-integration/v2/fixtures/start.fixture.json": "34b21328fa910e03af2fac8e816c5b510ba146201da0cd4ef1693d39a6344ba0",
+  "contracts/review-integration/v2/fixtures/status.fixture.json": "d5438578f2969f17635fecea94c7ef46d14c78fa668e50df48c4254254d5e935",
+  "contracts/review-integration/v2/schemas/admitted-result.schema.json": "c6a9c880191d65c46d9cfc8a0812af16b636573a8f6e57ea34aa16d6f6bb9735",
+  "contracts/review-integration/v2/schemas/artifact-subject.schema.json": "3e71a81340ea6149b03afa71530d10ce654c415fa21d4e07f0c9c25b3d2d70a3",
+  "contracts/review-integration/v2/schemas/capabilities.schema.json": "7ab061ed27bd3b929d6033cc20f56097e851f4454ca14a815255748b50191248",
+  "contracts/review-integration/v2/schemas/consent.schema.json": "b2b4465338497f11927de91cb2e5da12b6cb4a1039afe05aebe1abbf53b21858",
+  "contracts/review-integration/v2/schemas/failure.schema.json": "1c53da8c543cc5e03fbbfc700d4fc80cadb3b0e5e72c6d77a7790008671d0962",
+  "contracts/review-integration/v2/schemas/operation.schema.json": "beee02046ec1d5b8c89e3d7de35f897c275830e43c67ecd162886bfd0138ace6",
+  "contracts/review-integration/v2/schemas/repair.schema.json": "9e842d1ded797a91ede16b2054a38708b2d1fc7a0d6217541f84c0f2f5a2e73e",
+  "contracts/review-integration/v2/schemas/start.schema.json": "86ddfcfe1912489abef7461613d692ea53a4d7d73d444d5f6dbbd7f9866a2c37",
+  "contracts/review-integration/v2/schemas/status.schema.json": "132b15dd7a0514aa451373bd4b3c02a1491b7b11cf5b9ce43bc300b549397ac9",
   "docs/review-integration.md": "287e43ff55e3bb56e3175574ce26be1dc13f7de5e2fda74eddc769cc70f7e82a",
 };
 
 requiredPaths.push(...Object.keys(contractHashes));
 
-const missing = requiredPaths.filter((relativePath) => {
-  const absolutePath = join(root, relativePath);
-  return !existsSync(absolutePath) || !statSync(absolutePath).isFile();
-});
+function listFilesRecursively(directory) {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const absolutePath = join(directory, entry.name);
+    if (entry.isDirectory()) return listFilesRecursively(absolutePath);
+    return entry.isFile() ? [absolutePath] : [];
+  });
+}
 
-if (missing.length > 0) {
-  console.error("gentle-pi package is missing required Pi resources:");
-  for (const relativePath of missing) {
-    console.error(`- ${relativePath}`);
+// Walks `contracts/` on disk and reconciles it against `contractHashes`
+// (restricted to `contracts/**` keys — `docs/review-integration.md` is a
+// byte-pinned contract artifact but lives outside this walk root). Reports
+// the two drift directions separately so a new unlisted file and a stale
+// hash-map entry are both visible.
+export function reconcileContractsOnDisk(packageRoot, hashes) {
+  const contractsRoot = join(packageRoot, "contracts");
+  const walked = existsSync(contractsRoot)
+    ? listFilesRecursively(contractsRoot).map((absolutePath) =>
+        relative(packageRoot, absolutePath).split(sep).join("/"),
+      )
+    : [];
+  const listed = Object.keys(hashes).filter((relativePath) => relativePath.startsWith("contracts/"));
+  const walkedSet = new Set(walked);
+  const listedSet = new Set(listed);
+
+  return {
+    unlistedOnDisk: walked.filter((relativePath) => !listedSet.has(relativePath)).sort(),
+    listedButMissing: listed.filter((relativePath) => !walkedSet.has(relativePath)).sort(),
+  };
+}
+
+// Reads the generator's `sources` array by regex rather than importing it,
+// so this script never needs the generator to export anything it doesn't
+// already export for its own `--write`/`--check` CLI use.
+export function extractGeneratedRuntimeSources(packageRoot) {
+  const generatorPath = join(packageRoot, "scripts/build-git-commit-transaction-runner.mjs");
+  const generatorSource = readFileSync(generatorPath, "utf8");
+  const sourcesMatch = generatorSource.match(/const sources = \[([\s\S]*?)\];/);
+  if (!sourcesMatch) {
+    throw new Error(`${generatorPath} does not declare a "sources" array`);
   }
-  console.error("\nRefusing to pack/publish an incomplete npm package.");
-  process.exit(1);
+  return [...sourcesMatch[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]);
 }
 
-const driftedContracts = Object.entries(contractHashes).flatMap(([relativePath, expected]) => {
-  const actual = createHash("sha256").update(readFileSync(join(root, relativePath))).digest("hex");
-  return actual === expected ? [] : [{ relativePath, expected, actual }];
-});
+// Three-way reconciliation: the generator's `sources` names must equal the
+// `.mjs` basenames on disk in `runtime/`, which must equal the `runtime/`
+// entries in `requiredPaths`. Deliberately not a `lib/`-driven walk: most
+// `lib/` modules are intentionally unpaired with a generated runtime file.
+export function reconcileGeneratedRuntimeSources(packageRoot, sources, paths) {
+  const runtimeRoot = join(packageRoot, "runtime");
+  const runtimeBasenames = existsSync(runtimeRoot)
+    ? readdirSync(runtimeRoot)
+        .filter((name) => name.endsWith(".mjs"))
+        .map((name) => name.slice(0, -".mjs".length))
+    : [];
+  const requiredRuntimeBasenames = paths
+    .filter((relativePath) => relativePath.startsWith("runtime/") && relativePath.endsWith(".mjs"))
+    .map((relativePath) => relativePath.slice("runtime/".length, -".mjs".length));
 
-if (driftedContracts.length > 0) {
-  console.error("gentle-pi packaged review-integration/v1 bytes drifted from the byte-identical Gentle AI v2.2.1 contract:");
-  for (const drift of driftedContracts) console.error(`- ${drift.relativePath}: expected ${drift.expected}, got ${drift.actual}`);
-  process.exit(1);
+  const sourceSet = new Set(sources);
+  const runtimeSet = new Set(runtimeBasenames);
+  const requiredSet = new Set(requiredRuntimeBasenames);
+  const names = new Set([...sourceSet, ...runtimeSet, ...requiredSet]);
+
+  const drifted = [...names]
+    .filter((name) => !(sourceSet.has(name) && runtimeSet.has(name) && requiredSet.has(name)))
+    .sort()
+    .map((name) => ({
+      name,
+      inSources: sourceSet.has(name),
+      inRuntimeDir: runtimeSet.has(name),
+      inRequiredPaths: requiredSet.has(name),
+    }));
+
+  return { drifted };
 }
 
-// Release guard: refuse to pack/publish while any installer digest is not a real
-// pinned SHA-256 (for example the pre-release pending sentinel).
-const { GENTLE_AI_RELEASE_ASSETS } = await import(new URL("./gentle-ai-installer.mjs", import.meta.url));
-const unpinnedDigests = Object.entries(GENTLE_AI_RELEASE_ASSETS).flatMap(([target, asset]) =>
-  [["sha256", asset.sha256], ["binarySha256", asset.binarySha256]]
-    .filter(([, digest]) => !/^[0-9a-f]{64}$/.test(digest))
-    .map(([field]) => `${target}.${field}`));
-if (unpinnedDigests.length > 0) {
-  console.error("gentle-pi Gentle AI release digests are not pinned SHA-256 values:");
-  for (const entry of unpinnedDigests) console.error(`- ${entry}`);
-  console.error("Refusing to pack/publish until scripts/gentle-ai-installer.mjs pins the published checksums.txt archive digests and extracted binary digests.");
-  process.exit(1);
+async function main() {
+  const missing = requiredPaths.filter((relativePath) => {
+    const absolutePath = join(root, relativePath);
+    return !existsSync(absolutePath) || !statSync(absolutePath).isFile();
+  });
+
+  if (missing.length > 0) {
+    console.error("gentle-pi package is missing required Pi resources:");
+    for (const relativePath of missing) {
+      console.error(`- ${relativePath}`);
+    }
+    console.error("\nRefusing to pack/publish an incomplete npm package.");
+    process.exit(1);
+  }
+
+  const { unlistedOnDisk, listedButMissing } = reconcileContractsOnDisk(root, contractHashes);
+  if (unlistedOnDisk.length > 0 || listedButMissing.length > 0) {
+    console.error("gentle-pi packaged contracts/ tree has drifted from contractHashes:");
+    for (const relativePath of unlistedOnDisk) console.error(`- unlisted-on-disk: ${relativePath}`);
+    for (const relativePath of listedButMissing) console.error(`- listed-but-missing: ${relativePath}`);
+    console.error("\nRefusing to pack/publish an unreconciled contracts/ tree.");
+    process.exit(1);
+  }
+
+  const generatedRuntimeSources = extractGeneratedRuntimeSources(root);
+  const { drifted } = reconcileGeneratedRuntimeSources(root, generatedRuntimeSources, requiredPaths);
+  if (drifted.length > 0) {
+    console.error("gentle-pi generated commit transaction runtime sources, runtime/*.mjs, and requiredPaths have drifted apart:");
+    for (const entry of drifted) {
+      const where = [];
+      if (!entry.inSources) where.push("missing from generator sources");
+      if (!entry.inRuntimeDir) where.push("missing from runtime/*.mjs");
+      if (!entry.inRequiredPaths) where.push("missing from requiredPaths");
+      console.error(`- ${entry.name}: ${where.join(", ")}`);
+    }
+    console.error("\nRefusing to pack/publish an unreconciled generated runtime.");
+    process.exit(1);
+  }
+
+  const driftedContracts = Object.entries(contractHashes).flatMap(([relativePath, expected]) => {
+    const actual = createHash("sha256").update(readFileSync(join(root, relativePath))).digest("hex");
+    return actual === expected ? [] : [{ relativePath, expected, actual }];
+  });
+
+  if (driftedContracts.length > 0) {
+    console.error("gentle-pi packaged review-integration/v1 and review-integration/v2 contract bytes drifted from the byte-identical Gentle AI v2.2.1 contract:");
+    for (const drift of driftedContracts) console.error(`- ${drift.relativePath}: expected ${drift.expected}, got ${drift.actual}`);
+    process.exit(1);
+  }
+
+  // Release guard: refuse to pack/publish while any installer digest is not a real
+  // pinned SHA-256 (for example the pre-release pending sentinel).
+  const { GENTLE_AI_RELEASE_ASSETS } = await import(new URL("./gentle-ai-installer.mjs", import.meta.url));
+  const unpinnedDigests = Object.entries(GENTLE_AI_RELEASE_ASSETS).flatMap(([target, asset]) =>
+    [["sha256", asset.sha256], ["binarySha256", asset.binarySha256]]
+      .filter(([, digest]) => !/^[0-9a-f]{64}$/.test(digest))
+      .map(([field]) => `${target}.${field}`));
+  if (unpinnedDigests.length > 0) {
+    console.error("gentle-pi Gentle AI release digests are not pinned SHA-256 values:");
+    for (const entry of unpinnedDigests) console.error(`- ${entry}`);
+    console.error("Refusing to pack/publish until scripts/gentle-ai-installer.mjs pins the published checksums.txt archive digests and extracted binary digests.");
+    process.exit(1);
+  }
+
+  const generatedRuntimeCheck = spawnSync(process.execPath, [join(root, "scripts/build-git-commit-transaction-runner.mjs"), "--check"], {
+    cwd: root,
+    encoding: "utf8",
+    env: { ...process.env, NODE_NO_WARNINGS: "1" },
+  });
+  if (generatedRuntimeCheck.status !== 0) {
+    console.error("gentle-pi generated commit transaction runtime does not match its TypeScript sources:");
+    console.error((generatedRuntimeCheck.stderr || generatedRuntimeCheck.stdout || "unknown generator failure").trim());
+    process.exit(1);
+  }
+
+  const installer = readFileSync(join(root, "scripts/gentle-ai-installer.mjs"), "utf8");
+  const binaryResolver = readFileSync(join(root, "lib/gentle-ai-binary.ts"), "utf8");
+  if (!installer.includes('INSTALLER_VERSION = "2.2.1"') || !binaryResolver.includes('GENTLE_AI_VERSION = "2.2.1"')) {
+    console.error("gentle-pi package-local Gentle AI version pins are not both v2.2.1.");
+    process.exit(1);
+  }
+
+  console.log(`gentle-pi package resource check passed (${requiredPaths.length} files; ${Object.keys(contractHashes).length} exact byte-identical v2.2.1 contract artifacts).`);
 }
 
-const generatedRuntimeCheck = spawnSync(process.execPath, [join(root, "scripts/build-git-commit-transaction-runner.mjs"), "--check"], {
-  cwd: root,
-  encoding: "utf8",
-  env: { ...process.env, NODE_NO_WARNINGS: "1" },
-});
-if (generatedRuntimeCheck.status !== 0) {
-  console.error("gentle-pi generated commit transaction runtime does not match its TypeScript sources:");
-  console.error((generatedRuntimeCheck.stderr || generatedRuntimeCheck.stdout || "unknown generator failure").trim());
-  process.exit(1);
+const isMainModule = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+  await main();
 }
-
-const installer = readFileSync(join(root, "scripts/gentle-ai-installer.mjs"), "utf8");
-const binaryResolver = readFileSync(join(root, "lib/gentle-ai-binary.ts"), "utf8");
-if (!installer.includes('INSTALLER_VERSION = "2.2.1"') || !binaryResolver.includes('GENTLE_AI_VERSION = "2.2.1"')) {
-	console.error("gentle-pi package-local Gentle AI version pins are not both v2.2.1.");
-  process.exit(1);
-}
-
-console.log(`gentle-pi package resource check passed (${requiredPaths.length} files; ${Object.keys(contractHashes).length} exact byte-identical v2.2.1 contract artifacts).`);
