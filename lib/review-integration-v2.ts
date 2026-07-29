@@ -1090,11 +1090,20 @@ export function decodeReviewNextTransitionV3(value: unknown): ReviewNextTransiti
 		// which only exercises the `collect` variant of this envelope. Carried
 		// through untyped-but-validated rather than dropped, matching how this
 		// module already treats every other provider-owned convenience field.
-		const execute = exactRecord(transition.execute, "next_transition.execute", ["operation", "arguments", "preconditions", "binding"], ["command"]);
+		// status-v2.schema.json $defs.transition_execution declares optional
+		// `command`, `selector_arguments`, AND `artifacts`. Declaring only the
+		// first rejected two real transitions -- captured_results_ready carries
+		// artifacts, approved_receipt_ready carries selector_arguments -- while
+		// every native call had already succeeded and authority had advanced.
+		const execute = exactRecord(transition.execute, "next_transition.execute", ["operation", "arguments", "preconditions", "binding"], ["command", "selector_arguments", "artifacts"]);
 		const operation = enumeration(execute.operation, NEXT_TRANSITION_OPERATIONS, "next_transition.execute.operation");
 		const argumentsList = decodeTransitionArguments(execute.arguments, "next_transition.execute.arguments");
 		const preconditions = decodeTransitionArguments(execute.preconditions, "next_transition.execute.preconditions");
-		const binding = exactRecord(execute.binding, "next_transition.execute.binding", ["target_identity"], ["lineage_id", "revision"]);
+		// The schema gives `binding` no declared properties and no required list:
+		// it is an OPEN object. Closing it here made Pi stricter than the
+		// contract it implements and rejected the provider's repository_context.
+		// target_identity stays required because Pi reads it.
+		const binding = exactRecord(execute.binding, "next_transition.execute.binding", ["target_identity"], ["lineage_id", "revision"], true);
 		const targetIdentity = sha256(binding.target_identity, "next_transition.execute.binding.target_identity");
 		const lineageId = binding.lineage_id === undefined ? undefined : lineage(binding.lineage_id, "next_transition.execute.binding.lineage_id");
 		const revision = binding.revision === undefined ? undefined : sha256(binding.revision, "next_transition.execute.binding.revision");

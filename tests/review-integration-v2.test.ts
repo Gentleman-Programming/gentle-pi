@@ -490,3 +490,50 @@ test("repair eligible preflight with wrong required_inputs order is rejected", (
 	};
 	assert.throws(() => decodeReviewRepairV2(wrongOrder), /required_inputs/);
 });
+
+// Three decode defects the after-bench found by driving the real v2.2.2 binary.
+// Every native call exited 0 and authority advanced; Pi threw locally on the
+// RESPONSE. The mirrored fixture never caught them because it only exercises
+// the `collect` transition kind, so no `execute` payload was ever decoded.
+//
+// The authority here is contracts/review-integration/v1/schemas/status-v2.schema.json
+// $defs.transition_execution, which declares optional `command`,
+// `selector_arguments`, and `artifacts`, and a `binding` with NO declared
+// properties and no required list -- an OPEN object. Pi had closed execute to
+// `command` alone and binding to three keys, making it stricter than the
+// contract it implements.
+
+test("next_transition.execute accepts the optional selector_arguments and artifacts the schema declares", () => {
+	const base = {
+		kind: "execute" as const,
+		reason_code: "captured_results_ready",
+		execute: {
+			operation: "review.finalize",
+			command: "gentle-ai review finalize --lineage=review-96f29cbd865e77a9 --captured-results=true",
+			arguments: [{ name: "lineage", value: "review-96f29cbd865e77a9", token: "--lineage=review-96f29cbd865e77a9" }],
+			preconditions: [{ name: "target_identity", value: "sha256:" + "9".repeat(64) }],
+			binding: { target_identity: "sha256:" + "9".repeat(64) },
+		},
+	};
+
+	assert.doesNotThrow(() => decodeReviewNextTransitionV3(base));
+	assert.doesNotThrow(() => decodeReviewNextTransitionV3({ ...base, execute: { ...base.execute, artifacts: [{ name: "receipt", path: "review-receipt.json" }] } }));
+	assert.doesNotThrow(() => decodeReviewNextTransitionV3({ ...base, execute: { ...base.execute, selector_arguments: [{ name: "projection", value: "workspace", token: "--projection=workspace" }] } }));
+});
+
+test("next_transition.execute.binding stays open, as its schema declares no properties", () => {
+	const withContext = {
+		kind: "execute" as const,
+		reason_code: "approved_receipt_ready",
+		execute: {
+			operation: "review.validate",
+			arguments: [{ name: "gate", value: "pre-commit", token: "--gate=pre-commit" }],
+			preconditions: [{ name: "target_identity", value: "sha256:" + "8".repeat(64) }],
+			// The provider sends this. The schema constrains nothing here, so Pi
+			// closing the object was stricter than the contract.
+			binding: { target_identity: "sha256:" + "8".repeat(64), repository_context: "rctx1_" + "c".repeat(64) },
+		},
+	};
+
+	assert.doesNotThrow(() => decodeReviewNextTransitionV3(withContext));
+});

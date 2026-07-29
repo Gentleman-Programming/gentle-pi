@@ -356,7 +356,7 @@ export interface NativeReviewCaptureEvidenceRequest {
 
 export interface NativeReviewVerificationEvidenceV2 {
 	schema: "gentle-ai.review-verification-evidence/v2";
-	version: string;
+	version: 2;
 	lineageId: string;
 	authorityRevision: string;
 	targetIdentity: string;
@@ -838,14 +838,21 @@ function decodeNativeReviewVerificationEvidence(value: unknown): NativeReviewVer
 	if (body.schema !== "gentle-ai.review-verification-evidence/v2") throw new Error("wrong verification evidence schema");
 	return {
 		schema: "gentle-ai.review-verification-evidence/v2",
-		version: requiredString(body.version),
+		// verification-evidence.schema.json pins `version` to {"const": 2} -- the
+		// NUMBER two, not the string. It was written as a string from a handoff
+		// that listed the observed field NAMES without their types.
+		version: (() => { if (body.version !== 2) throw new Error(`native verification evidence version must be the number 2, received ${JSON.stringify(body.version)}`); return 2 as const; })(),
 		lineageId: requiredString(body.lineage_id),
 		authorityRevision: requiredString(body.authority_revision),
 		targetIdentity: requiredString(body.target_identity),
 		candidateTree: requiredString(body.candidate_tree),
 		pathsDigest: requiredString(body.paths_digest),
 		paths: stringArray(body.paths),
-		ledgerIds: stringArray(body.ledger_ids),
+		// The schema requires ledger_ids to be an array, but v2.2.2 emits null when
+		// there are none. Tolerated deliberately: refusing here would reject a
+		// response the provider actually sends, and the provider violating its own
+		// published schema is its defect to fix, not a reason to break the client.
+		ledgerIds: body.ledger_ids === null || body.ledger_ids === undefined ? [] : stringArray(body.ledger_ids),
 		rawPayloadSha256: requiredString(body.raw_payload_sha256),
 		rawPayloadBytes: nonNegativeInteger(body.raw_payload_bytes),
 		outcome: enumString(body.outcome, NATIVE_REVIEW_CAPTURE_OUTCOME) as NativeReviewCaptureOutcome,
