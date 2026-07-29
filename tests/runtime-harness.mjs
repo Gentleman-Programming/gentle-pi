@@ -11,6 +11,7 @@ import { matchesKey } from "@earendil-works/pi-tui";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { domainHashV1 } from "../lib/review-canonical.ts";
+import { NativeReviewCliV216, NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError } from "../lib/native-review-cli.ts";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const EXTENSIONS = [
@@ -467,6 +468,87 @@ async function run() {
 		registry.cleanup(view.token);
 	} finally {
 		await rm(candidateDriftCwd, { recursive: true, force: true });
+	}
+
+	// Task 11.2 (migrate-review-integration-v2): an unimplemented
+	// next_transition.execute.operation (e.g. a future "dispose-result") must
+	// raise a typed, named unsupported-transition-operation refusal and stop —
+	// never fall through to a generic schema-incompatible error, and never
+	// synthesize an invocation for it. Drives the real negotiated STATUS decode
+	// path (NativeReviewCliV216.targetStatus) against a stubbed adapter, so no
+	// live binary needs to advertise the unimplemented operation to prove this.
+	{
+		const capabilitiesFixturePath = join(
+			ROOT, "contracts", "review-integration", "v2", "fixtures", "capabilities.fixture.json",
+		);
+		const capabilitiesFixture = JSON.parse(await readFile(capabilitiesFixturePath, "utf8"));
+		const executableDigest = "dcc846103b16d365eaeeb9d7f289c23fc4f2897f23def1cb3fe7f05557b64705";
+		const capabilitiesBody = {
+			...capabilitiesFixture,
+			package: { ...capabilitiesFixture.package, version: "2.2.2" },
+		};
+		const statusBody = {
+			schema: "gentle-ai.review-integration.status/v3",
+			contract: "gentle-ai.review-integration/v2",
+			operation: "review.status",
+			applicability: "unrelated",
+			receipt: { status: "not_applicable" },
+			action: "start",
+			replayability: "not_replayable",
+			target_identity: `sha256:${"a".repeat(64)}`,
+			repair: {
+				schema: "gentle-ai.review-authority-repair-assessment/v1",
+				status: "unsupported",
+				counts: { lineages: 0, compact_lineages: 0, legacy_lineages: 0, events: 0, bytes: 0, eligible_candidates: 0, unsupported_lineages: 0, conflicts: 0 },
+				supported_operations: ["review/complete-fix", "review/validate-fix"],
+				authorization_schema: "gentle-ai.review-repair-authorization/v1",
+			},
+			projection: {
+				schema: "gentle-ai.review-integration.projection/v1",
+				kind: "current-changes",
+				projection: "workspace",
+				base_tree: "b".repeat(40),
+				initial_review_tree: "b".repeat(40),
+				current_candidate_tree: "b".repeat(40),
+				paths_digest: `sha256:${"a".repeat(64)}`,
+				paths: [],
+				intended_untracked: [],
+				intended_untracked_proof: `sha256:${"a".repeat(64)}`,
+				initial_snapshot_identity: `sha256:${"a".repeat(64)}`,
+				current_snapshot_identity: `sha256:${"a".repeat(64)}`,
+			},
+			candidates: [],
+			next_transition: {
+				kind: "execute",
+				reason_code: "disposable_result_pending",
+				execute: {
+					operation: "review.dispose-result",
+					arguments: [],
+					preconditions: [],
+					binding: { target_identity: `sha256:${"a".repeat(64)}` },
+				},
+			},
+		};
+		const calls = [];
+		const adapter = async (request) => {
+			calls.push(request.arguments);
+			const body = calls.length === 1 ? capabilitiesBody : statusBody;
+			return { stdout: JSON.stringify(body), stderr: "", exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false };
+		};
+		const client = new NativeReviewCliV216(
+			adapter, "/package/.gentle-ai/gentle-ai", 30_000, 1024 * 1024,
+			async () => undefined, () => executableDigest,
+		);
+		let thrown;
+		try {
+			await client.targetStatus({ cwd: "/repo" });
+		} catch (error) {
+			thrown = error;
+		}
+		assert.ok(thrown instanceof NativeReviewCliError, "an unimplemented next_transition.execute.operation must raise a typed NativeReviewCliError");
+		assert.equal(thrown.code, NATIVE_REVIEW_ERROR_CODE.UNSUPPORTED_TRANSITION_OPERATION);
+		assert.match(thrown.message, /review\.dispose-result/, "the refusal must name the specific unimplemented operation");
+		assert.equal(calls.length, 2, "capabilities negotiation plus one STATUS call — never a third call synthesizing the unimplemented operation");
 	}
 
 	const bannerCwd = await tempWorkspace();

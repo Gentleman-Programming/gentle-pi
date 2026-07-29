@@ -73,7 +73,7 @@ because the archive and binary digests cannot be pinned without the tarballs.
       key list.
 - [x] 13.11 Regenerate `runtime/*.mjs` with
       `node scripts/build-git-commit-transaction-runner.mjs --write`. Never hand-edit.
-- [~] 13.12 Terminology, INVESTIGATED — the occurrences are not comments, they are
+- [x] 13.12 (COMPLETE — folded into tasks.md Phase 13; see there for the fix) Terminology, INVESTIGATED — the occurrences are not comments, they are
       assertions on strings gentle-ai emits, and the string DID change:
       `v2.2.1: "review-driven development: on (decided by global)"` became
       `v2.2.2: "receipt-driven development: on (decided by global)"`.
@@ -87,7 +87,7 @@ because the archive and binary digests cannot be pinned without the tarballs.
         real binary no longer produces. Fidelity rot, not a failure.
       Remaining work: update all eight, and extend the loud-skip gate to the devbinary
       suite so this class of rot cannot hide again.
-- [~] 13.13 Archive deadlock, INVESTIGATED — Pi DOES have its own version, and separately
+- [x] 13.13 (COMPLETE — folded into tasks.md Phase 13; see there for the fix) Archive deadlock, INVESTIGATED — Pi DOES have its own version, and separately
       a pre-existing decode bug:
       - `lib/native-review-cli.ts:1265` gates `ready` on `reviewGateResult === "allow"`
         with no relaxation, so with the kill switch off `ready` can never become true —

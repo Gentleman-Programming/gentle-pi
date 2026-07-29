@@ -121,7 +121,7 @@ import {
 	type NativeValidateResult,
 } from "../lib/native-review-cli.ts";
 import { readReviewConsentLatch, recordReviewConsentLatch } from "../lib/review-consent-latch.ts";
-import type { ReviewStatusV1 } from "../lib/review-integration-v1.ts";
+import type { ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 
 const GRAPH_V1_ORDINARY_READ_ONLY = "Graph-v1 ordinary review authority is read-only; use native compact-v2 review operations";
 import {
@@ -3866,7 +3866,7 @@ function nativeReviewModeSkipped(operation: ReviewControllerOperation, source: N
 		status: "skipped",
 		outcome: REVIEW_MODE_DISABLED_OUTCOME,
 		mode_source: source,
-		reason: `review-driven development is disabled: ${operation} is skipped because the ${source} mode source keeps it off`,
+		reason: `receipt-driven development is disabled: ${operation} is skipped because the ${source} mode source keeps it off`,
 		...(continuation === undefined ? {} : { next_action: continuation }),
 		...nativeStartPreAuthorityRejection(),
 	};
@@ -4183,7 +4183,7 @@ function requiredStatusActionText(lineageId?: string): string {
 	return `Run target-scoped review.status${lineageId === undefined ? "" : ` for lineage ${lineageId}`} and follow only its declared action; never start a new review, create a new budget, launch a lens, or fall back to inventory discovery.`;
 }
 
-function reconcileFinalizeRouting(status: ReviewStatusV1, requestedLineageId?: string, countRerunAttempt = false): Record<string, unknown> {
+function reconcileFinalizeRouting(status: ReviewStatusV3, requestedLineageId?: string, countRerunAttempt = false): Record<string, unknown> {
 	const lineageId = status.authority?.lineageId;
 	const base = { provider_action: "reconcile_finalize", replayability: status.replayability, reconciliation_required: true };
 	if (status.applicability !== "current_target" || lineageId === undefined || (requestedLineageId !== undefined && lineageId !== requestedLineageId)) {
@@ -4213,7 +4213,7 @@ function reconcileFinalizeRouting(status: ReviewStatusV1, requestedLineageId?: s
 	};
 }
 
-function mapNativeTargetStatus(operation: ReviewControllerOperation, status: ReviewStatusV1, requestedLineageId?: string): Record<string, unknown> {
+function mapNativeTargetStatus(operation: ReviewControllerOperation, status: ReviewStatusV3, requestedLineageId?: string): Record<string, unknown> {
 	if (status.action === "reconcile_finalize") {
 		const routing = reconcileFinalizeRouting(status, requestedLineageId);
 		return {
@@ -4774,7 +4774,7 @@ async function executeReviewControllerOperation(
 		);
 		if (missing.length > 0) return await executeNativeRecoveryRoute(parameters.operation, "recover", input, defaultCwd, nativeReviewCli, pendingAuthorizations, signal);
 		if (nativeReviewCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
-		let status: ReviewStatusV1;
+		let status: ReviewStatusV3;
 		try {
 			const frozenTarget = candidateViews?.hasProjection(String(input.predecessorLineage))
 				? candidateViews.resolveProjection(String(input.predecessorLineage), defaultCwd)
@@ -5047,7 +5047,7 @@ async function executeReviewControllerOperation(
 				...raw,
 			});
 			let correctionCompletion = false;
-			let negotiatedStatus: ReviewStatusV1 | undefined;
+			let negotiatedStatus: ReviewStatusV3 | undefined;
 			let candidateView: ReturnType<CandidateViewRegistry["create"]> | undefined;
 			let nativeResult: NativeFinalizeResult;
 			try {
@@ -6028,7 +6028,7 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 			}
 			try {
 				const result = await nativeReviewCli.reviewMode({ cwd: ctx.cwd, operation: subAction as NativeReviewModeOperation });
-				const report = `review-driven development: ${result.status.effective} (decided by ${result.status.source})`;
+				const report = `receipt-driven development: ${result.status.effective} (decided by ${result.status.source})`;
 				// A mutating sub-action that left the effective mode unchanged did
 				// not do what the user asked, and reporting only the resulting
 				// status reads as if it had. This is reachable for exactly one

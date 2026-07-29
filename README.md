@@ -663,8 +663,7 @@ Memory contract for SDD delegation:
 | ------------------------------ | ---------------------------------------------------------------------------------------------------------- |
 | `extensions/gentle-ai.ts`      | Injects identity, orchestrates native review authority and lifecycle gates, refreshes global SDD assets, registers commands, applies model/persona config, and enforces runtime safety. |
 | `lib/native-review-cli.ts`     | Strict package-local adapter for Gentle AI START, FINALIZE, VALIDATE, SDD binding, and status contracts.     |
-| `lib/review-integration-v1.ts` | Strict consumer decoder for negotiated capabilities, operations, target status, projections, and failures against contract `review-integration/v1` (active today).  |
-| `lib/review-integration-v2.ts` | Strict consumer decoder for contract `review-integration/v2`; staged and unimported until the release-gated cutover lands.  |
+| `lib/review-integration-v2.ts` | Strict consumer decoder for negotiated capabilities, operations, target status, projections, repair, and failures against contract `review-integration/v2` (active today).  |
 | `lib/git-commit-transaction.ts` | Durable hook/native-validation/commit/recovery transaction with publication blocking and HEAD proof.        |
 | `lib/review-candidate-view.ts` | Builds immutable changed-scope actor views while preserving full-tree, path, mode, symlink, and index integrity. |
 | `lib/review-canonical.ts`      | Permanent Pi-owned canonical JSON and domain-hash primitives for consumer-side identities.                   |

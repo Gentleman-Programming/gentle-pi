@@ -676,7 +676,7 @@ test("native review status decodes 2.1.8 released lock residue and keeps unknown
 	// schema-incompatible on every repository that ever completed a review.
 	//
 	// Lock status stays a CLOSED enum extended by exactly `released` — unlike
-	// the cause_category widening in review-integration-v1 (diagnostic
+	// the cause_category widening in review-integration-v2 (diagnostic
 	// metadata nothing routes on), lock status routes blocking behavior in the
 	// controller, so an unknown future status must keep failing closed rather
 	// than being silently classified as blocking or non-blocking.
@@ -827,6 +827,49 @@ test("native SDD readiness requires an unblocked post-review action with publish
 		const queue = queuedAdapter([VERSION, { stdout: JSON.stringify(body) }]);
 		assert.equal((await new NativeReviewCliV213(queue.adapter).sddStatus({ cwd: "/repo", change: "native-review-authority-parity" })).ready, false);
 	}
+});
+
+// Phase 13.13 (migrate-review-integration-v2): with the kill switch off,
+// gentle-ai's gate result can never become "allow" (delivery follows ordinary
+// repository policy instead), so gating `ready` on result==="allow" alone
+// deadlocked readiness forever. `delivery` also arrived on the reviewGate
+// struct itself (json:"delivery,omitempty") without a corresponding optional
+// key on the decoder, so that payload was previously rejected outright rather
+// than merely read as not-ready.
+test("native SDD readiness unblocks on disabled/unmanaged delivery instead of deadlocking on a permanently non-allow gate result", async () => {
+	const openspec = JSON.parse(await fixture("sdd-status")) as Record<string, unknown>;
+
+	for (const nextRecommended of ["verify", "archive"] as const) {
+		const body = {
+			...openspec,
+			nextRecommended,
+			blockedReasons: [],
+			reviewGate: { result: "invalidated", reason: "review-driven development is disabled and no receipt governs this candidate, so delivery follows ordinary repository policy", delivery: "disabled/unmanaged" },
+		};
+		const queue = queuedAdapter([VERSION, { stdout: JSON.stringify(body) }]);
+		const status = await new NativeReviewCliV213(queue.adapter).sddStatus({ cwd: "/repo", change: "native-review-authority-parity" });
+		assert.equal(status.ready, true, `${nextRecommended} must be ready under disabled/unmanaged delivery even though result is not "allow"`);
+	}
+
+	// Blocked reasons still take priority over a legitimate unmanaged delivery.
+	const stillBlocked = {
+		...openspec, nextRecommended: "verify", blockedReasons: ["stale authority"],
+		reviewGate: { result: "invalidated", reason: "delivery follows ordinary repository policy", delivery: "disabled/unmanaged" },
+	};
+	const blockedQueue = queuedAdapter([VERSION, { stdout: JSON.stringify(stillBlocked) }]);
+	assert.equal((await new NativeReviewCliV213(blockedQueue.adapter).sddStatus({ cwd: "/repo", change: "native-review-authority-parity" })).ready, false);
+
+	// An unrecognized delivery value must still fail closed (exact enum, not a
+	// free string).
+	const unknownDelivery = {
+		...openspec, nextRecommended: "verify", blockedReasons: [],
+		reviewGate: { result: "invalidated", reason: "delivery follows ordinary repository policy", delivery: "unmanaged" },
+	};
+	const unknownQueue = queuedAdapter([VERSION, { stdout: JSON.stringify(unknownDelivery) }]);
+	await assert.rejects(
+		() => new NativeReviewCliV213(unknownQueue.adapter).sddStatus({ cwd: "/repo", change: "native-review-authority-parity" }),
+		(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE,
+	);
 });
 
 test("native client decodes the exact v2.1.3 Engram artifact map", async () => {

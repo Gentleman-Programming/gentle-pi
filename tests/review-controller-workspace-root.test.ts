@@ -8,7 +8,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import type { NativeReviewCli } from "../lib/native-review-cli.ts";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
-import type { ReviewStatusV1 } from "../lib/review-integration-v1.ts";
+import type { AuthorityRepairAssessmentV1, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 
 interface RegisteredTool {
 	execute: (
@@ -90,11 +90,19 @@ function fakeNative(overrides: Partial<NativeReviewCli> = {}): NativeReviewCli {
 	};
 }
 
+const UNSUPPORTED_REPAIR_ASSESSMENT: AuthorityRepairAssessmentV1 = {
+	schema: "gentle-ai.review-authority-repair-assessment/v1",
+	status: "unsupported",
+	counts: { lineages: 0, compactLineages: 0, legacyLineages: 0, events: 0, bytes: 0, eligibleCandidates: 0, unsupportedLineages: 0, conflicts: 0 },
+	supportedOperations: ["review/complete-fix", "review/validate-fix"],
+	authorizationSchema: "gentle-ai.review-repair-authorization/v1",
+};
+
 function targetStatusFixture(options: {
 	applicability?: "current_target" | "unrelated";
-	action?: ReviewStatusV1["action"];
+	action?: ReviewStatusV3["action"];
 	lineageId?: string;
-} = {}): ReviewStatusV1 {
+} = {}): ReviewStatusV3 {
 	const applicability = options.applicability ?? "current_target";
 	const action = options.action ?? (applicability === "current_target" ? "finalize" : "start");
 	const lineageId = options.lineageId ?? "native-lineage";
@@ -114,15 +122,26 @@ function targetStatusFixture(options: {
 		initialSnapshotIdentity: sha,
 		currentSnapshotIdentity: sha,
 	};
+	const rawRepair = {
+		schema: UNSUPPORTED_REPAIR_ASSESSMENT.schema,
+		status: UNSUPPORTED_REPAIR_ASSESSMENT.status,
+		counts: {
+			lineages: 0, compact_lineages: 0, legacy_lineages: 0, events: 0, bytes: 0,
+			eligible_candidates: 0, unsupported_lineages: 0, conflicts: 0,
+		},
+		supported_operations: UNSUPPORTED_REPAIR_ASSESSMENT.supportedOperations,
+		authorization_schema: UNSUPPORTED_REPAIR_ASSESSMENT.authorizationSchema,
+	};
 	const raw: Record<string, unknown> = {
-		schema: "gentle-ai.review-integration.status/v1",
-		contract: "gentle-ai.review-integration/v1",
+		schema: "gentle-ai.review-integration.status/v3",
+		contract: "gentle-ai.review-integration/v2",
 		operation: "review.status",
 		applicability,
 		receipt: { status: applicability === "current_target" ? "expected_missing" : "not_applicable" },
 		action,
 		replayability: "not_replayable",
 		target_identity: sha,
+		repair: rawRepair,
 		projection: {
 			schema: projection.schema,
 			kind: projection.kind,
@@ -144,7 +163,7 @@ function targetStatusFixture(options: {
 		raw.frozen = { tier: "medium", original_changed_lines: 2, correction_budget: 1 };
 	}
 	return {
-		contract: "gentle-ai.review-integration/v1",
+		contract: "gentle-ai.review-integration/v2",
 		applicability,
 		...(applicability === "current_target" ? { authority: { version: "compact-v2" as const, lineageId, state: "reviewing", generation: 1, revision: sha } } : {}),
 		receipt: { status: applicability === "current_target" ? "expected_missing" : "not_applicable" },
@@ -153,6 +172,7 @@ function targetStatusFixture(options: {
 		...(applicability === "current_target" ? { frozen: { tier: "medium" as const, originalChangedLines: 2, correctionBudget: 1 } } : {}),
 		targetIdentity: sha,
 		projection,
+		repair: UNSUPPORTED_REPAIR_ASSESSMENT,
 		candidates: [],
 		raw,
 	};

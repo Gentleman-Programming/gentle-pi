@@ -15,7 +15,8 @@ import {
 } from "../../lib/native-review-cli.ts";
 import { CandidateViewRegistry } from "../../lib/review-candidate-view.ts";
 import { readReviewConsentLatch } from "../../lib/review-consent-latch.ts";
-import type { ReviewStatusV1 } from "../../lib/review-integration-v1.ts";
+import type { AuthorityRepairAssessmentV1, ReviewStatusV3 } from "../../lib/review-integration-v2.ts";
+import { requireDevBinary } from "../support/native-binary-gate.ts";
 
 // Organic RDD Parity, Phase 6: non-gating dev-binary journey.
 //
@@ -26,13 +27,21 @@ import type { ReviewStatusV1 } from "../../lib/review-integration-v1.ts";
 // 2.1.11 pins (lib/gentle-ai-binary.ts, scripts/gentle-ai-installer.mjs) —
 // every capability stays negotiated per-process through the executable
 // override seam below, exactly like every other native-review-cli test.
+//
+// Gated through the same loud-skip machinery as the two `tests/*.test.ts`
+// binary-verified suites (Phase 4), extended here to cover this THIRD
+// self-skipping suite (Phase 13.12/13.13 follow-up): under
+// GENTLE_PI_REQUIRE_DEV_BINARY=1 a missing/invalid dev binary throws instead
+// of silently reporting 5 tests / 0 pass / 0 fail, which is exactly how the
+// v2.2.2 "receipt-driven development" terminology rot went unnoticed.
 const DEV_BINARY = process.env.GENTLE_AI_DEV_BINARY;
-const RUNNABLE = typeof DEV_BINARY === "string" && DEV_BINARY.length > 0 && DEV_BINARY.startsWith("/") && existsSync(DEV_BINARY);
-if (!RUNNABLE) {
-	console.log(
-		"tests/devbinary/native-review-parity.devtest.ts: skipping — set GENTLE_AI_DEV_BINARY to an existing absolute gentle-ai binary path to run this journey.",
-	);
-}
+const devBinaryGate = requireDevBinary({
+	devBinaryPath: DEV_BINARY,
+	exists: typeof DEV_BINARY === "string" && DEV_BINARY.length > 0 && DEV_BINARY.startsWith("/") && existsSync(DEV_BINARY),
+	env: process.env,
+});
+if (!devBinaryGate.run) console.log(`tests/devbinary/native-review-parity.devtest.ts: ${devBinaryGate.reason}`);
+const RUNNABLE = devBinaryGate.run;
 
 // A synthetic capable version, exactly like native-review-parity.test.ts's
 // CAPABLE_VERSION overlay. Real dev binaries never carry a pinned three-part
@@ -57,10 +66,9 @@ function bridgeAdapter(binary: string): ExecFileAdapter {
 
 // A NativeReviewCli backed by the real dev binary for reviewMode/start/
 // validate (the organic-parity surface under test), with a synthetic
-// targetStatus fixture standing in for the negotiated review-integration/v1
-// contract, which is untouched/frozen for this change (Design File Changes,
-// organic-rdd-parity — only lib/native-review-cli.ts's plain-CLI decode path
-// gained the new optional keys; review-integration-v1.ts did not).
+// targetStatus fixture standing in for the negotiated review-integration/v2
+// contract; the plain-CLI decode path in lib/native-review-cli.ts (reviewMode,
+// start, validate here) stays independent of the negotiated status shape.
 function journeyNative(binary: string): NativeReviewCli {
 	const bridge = new NativeReviewCliV214(bridgeAdapter(binary), binary);
 	return {
@@ -91,7 +99,25 @@ function repository(t: test.TestContext): string {
 	return cwd;
 }
 
-function unrelatedStartTargetStatus(): ReviewStatusV1 {
+const UNSUPPORTED_REPAIR_ASSESSMENT: AuthorityRepairAssessmentV1 = {
+	schema: "gentle-ai.review-authority-repair-assessment/v1",
+	status: "unsupported",
+	counts: { lineages: 0, compactLineages: 0, legacyLineages: 0, events: 0, bytes: 0, eligibleCandidates: 0, unsupportedLineages: 0, conflicts: 0 },
+	supportedOperations: ["review/complete-fix", "review/validate-fix"],
+	authorizationSchema: "gentle-ai.review-repair-authorization/v1",
+};
+const RAW_UNSUPPORTED_REPAIR_ASSESSMENT = {
+	schema: UNSUPPORTED_REPAIR_ASSESSMENT.schema,
+	status: UNSUPPORTED_REPAIR_ASSESSMENT.status,
+	counts: {
+		lineages: 0, compact_lineages: 0, legacy_lineages: 0, events: 0, bytes: 0,
+		eligible_candidates: 0, unsupported_lineages: 0, conflicts: 0,
+	},
+	supported_operations: UNSUPPORTED_REPAIR_ASSESSMENT.supportedOperations,
+	authorization_schema: UNSUPPORTED_REPAIR_ASSESSMENT.authorizationSchema,
+};
+
+function unrelatedStartTargetStatus(): ReviewStatusV3 {
 	const sha = `sha256:${"a".repeat(64)}`;
 	const tree = "b".repeat(40);
 	const projection = {
@@ -100,18 +126,19 @@ function unrelatedStartTargetStatus(): ReviewStatusV1 {
 		intendedUntrackedProof: sha, initialSnapshotIdentity: sha, currentSnapshotIdentity: sha,
 	};
 	return {
-		contract: "gentle-ai.review-integration/v1", applicability: "unrelated", receipt: { status: "not_applicable" }, action: "start",
-		replayability: "not_replayable", targetIdentity: sha, projection, candidates: [],
+		contract: "gentle-ai.review-integration/v2", applicability: "unrelated", receipt: { status: "not_applicable" }, action: "start",
+		replayability: "not_replayable", targetIdentity: sha, projection, repair: UNSUPPORTED_REPAIR_ASSESSMENT, candidates: [],
 		raw: {
-			schema: "gentle-ai.review-integration.status/v1", contract: "gentle-ai.review-integration/v1", operation: "review.status",
+			schema: "gentle-ai.review-integration.status/v3", contract: "gentle-ai.review-integration/v2", operation: "review.status",
 			applicability: "unrelated", receipt: { status: "not_applicable" }, action: "start", replayability: "not_replayable", target_identity: sha,
+			repair: RAW_UNSUPPORTED_REPAIR_ASSESSMENT,
 			projection: { schema: projection.schema, kind: projection.kind, projection: projection.projection, base_tree: tree, initial_review_tree: tree, current_candidate_tree: tree, paths_digest: sha, paths: [], intended_untracked: [], intended_untracked_proof: sha, initial_snapshot_identity: sha, current_snapshot_identity: sha },
 			candidates: [],
 		},
 	};
 }
 
-function currentTargetStatusFixture(lineageId: string, cwd: string): ReviewStatusV1 {
+function currentTargetStatusFixture(lineageId: string, cwd: string): ReviewStatusV3 {
 	const sha = `sha256:${"a".repeat(64)}`;
 	const baseTree = git(cwd, "rev-parse", "HEAD^{tree}");
 	const candidateTree = git(cwd, "write-tree");
@@ -121,16 +148,17 @@ function currentTargetStatusFixture(lineageId: string, cwd: string): ReviewStatu
 		intendedUntrackedProof: sha, initialSnapshotIdentity: sha, currentSnapshotIdentity: sha,
 	};
 	return {
-		contract: "gentle-ai.review-integration/v1", applicability: "current_target",
+		contract: "gentle-ai.review-integration/v2", applicability: "current_target",
 		authority: { version: "compact-v2", lineageId, state: "reviewing", generation: 1, revision: sha },
 		receipt: { status: "expected_missing" }, action: "finalize", replayability: "not_replayable",
 		frozen: { tier: "medium", originalChangedLines: 1, correctionBudget: 1 },
-		targetIdentity: sha, projection, candidates: [],
+		targetIdentity: sha, projection, repair: UNSUPPORTED_REPAIR_ASSESSMENT, candidates: [],
 		raw: {
-			schema: "gentle-ai.review-integration.status/v1", contract: "gentle-ai.review-integration/v1", operation: "review.status",
+			schema: "gentle-ai.review-integration.status/v3", contract: "gentle-ai.review-integration/v2", operation: "review.status",
 			applicability: "current_target", receipt: { status: "expected_missing" }, action: "finalize", replayability: "not_replayable", target_identity: sha,
 			authority: { version: "compact-v2", lineage_id: lineageId, state: "reviewing", generation: 1, revision: sha },
 			frozen: { tier: "medium", original_changed_lines: 1, correction_budget: 1 },
+			repair: RAW_UNSUPPORTED_REPAIR_ASSESSMENT,
 			projection: { schema: projection.schema, kind: projection.kind, projection: projection.projection, base_tree: baseTree, initial_review_tree: candidateTree, current_candidate_tree: candidateTree, paths_digest: sha, paths: ["app.ts"], intended_untracked: [], intended_untracked_proof: sha, initial_snapshot_identity: sha, current_snapshot_identity: sha },
 			candidates: [],
 		},
@@ -183,16 +211,16 @@ test("dev-binary: gentle:review-mode round-trips status, disable, and enable aga
 	const notices: Array<{ message: string; type?: string }> = [];
 
 	await command.handler("status", headlessContext(cwd, notices));
-	assert.match(notices.at(-1)!.message, /review-driven development: on \(decided by \w+\)/);
+	assert.match(notices.at(-1)!.message, /receipt-driven development: on \(decided by \w+\)/);
 
 	await command.handler("disable", headlessContext(cwd, notices));
-	assert.match(notices.at(-1)!.message, /review-driven development: off \(decided by \w+\)/);
+	assert.match(notices.at(-1)!.message, /receipt-driven development: off \(decided by \w+\)/);
 
 	await command.handler("status", headlessContext(cwd, notices));
-	assert.match(notices.at(-1)!.message, /review-driven development: off \(decided by \w+\)/);
+	assert.match(notices.at(-1)!.message, /receipt-driven development: off \(decided by \w+\)/);
 
 	await command.handler("enable", headlessContext(cwd, notices));
-	assert.match(notices.at(-1)!.message, /review-driven development: on \(decided by \w+\)/);
+	assert.match(notices.at(-1)!.message, /receipt-driven development: on \(decided by \w+\)/);
 });
 
 // ---------------------------------------------------------------------------

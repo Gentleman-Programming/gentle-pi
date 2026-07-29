@@ -167,7 +167,7 @@ function authorityInventory(status: Record<string, unknown>): ReviewAuthorityEnt
 // the workspace snapshot between deriving a target and using it, and authority
 // correctly rejects the stale target that results.
 async function nextTransition(repository: string): Promise<Record<string, unknown>> {
-	const status = JSON.parse((await run(binary, ["review", "status", "--contract", "gentle-ai.review-integration/v1", "--cwd", repository, "--projection", "workspace", "--next-transition"], repository)).stdout) as Record<string, unknown>;
+	const status = JSON.parse((await run(binary, ["review", "status", "--contract", "gentle-ai.review-integration/v2", "--cwd", repository, "--projection", "workspace", "--next-transition"], repository)).stdout) as Record<string, unknown>;
 	return status.next_transition as Record<string, unknown>;
 }
 

@@ -16,7 +16,7 @@ import {
 } from "../lib/native-review-cli.ts";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 import { readReviewConsentLatch, recordReviewConsentLatch } from "../lib/review-consent-latch.ts";
-import type { ReviewStatusV1 } from "../lib/review-integration-v1.ts";
+import type { AuthorityRepairAssessmentV1, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 
 // Queued-adapter clients never execute a real process; default to a fixed
 // absolute package-local path so these tests do not depend on an installed
@@ -169,7 +169,7 @@ test("native VALIDATE decodes the disabled/unmanaged delivery alternate discrimi
 		result: "invalidated",
 		allowed: false,
 		action: "repository-policy",
-		reason: "review-driven development is disabled and no receipt governs this candidate, so delivery follows ordinary repository policy",
+		reason: "receipt-driven development is disabled and no receipt governs this candidate, so delivery follows ordinary repository policy",
 		// gentle-ai's RDDDeliveryDisabledUnmanaged is a single literal
 		// "disabled/unmanaged" — never split into two separate enum values.
 		delivery: "disabled/unmanaged",
@@ -187,7 +187,7 @@ test("native VALIDATE rejects a split disabled-only or unmanaged-only delivery v
 	for (const delivery of ["disabled", "unmanaged"]) {
 		const body = {
 			schema: "gentle-ai.review-gate-result/v1", result: "invalidated", allowed: false, action: "repository-policy",
-			reason: "review-driven development is disabled and no receipt governs this candidate, so delivery follows ordinary repository policy",
+			reason: "receipt-driven development is disabled and no receipt governs this candidate, so delivery follows ordinary repository policy",
 			delivery,
 			context: { gate: "pre-commit", lineage_id: "", generation: 0, base_tree: "", candidate_tree: "", paths_digest: "", fix_delta_hash: "", policy_hash: "", ledger_hash: "", evidence_hash: "", base_relationship_valid: true },
 		};
@@ -282,7 +282,15 @@ function repository(t: test.TestContext): string {
 	return cwd;
 }
 
-function unrelatedStartTargetStatus(): ReviewStatusV1 {
+const UNSUPPORTED_REPAIR_ASSESSMENT: AuthorityRepairAssessmentV1 = {
+	schema: "gentle-ai.review-authority-repair-assessment/v1",
+	status: "unsupported",
+	counts: { lineages: 0, compactLineages: 0, legacyLineages: 0, events: 0, bytes: 0, eligibleCandidates: 0, unsupportedLineages: 0, conflicts: 0 },
+	supportedOperations: ["review/complete-fix", "review/validate-fix"],
+	authorizationSchema: "gentle-ai.review-repair-authorization/v1",
+};
+
+function unrelatedStartTargetStatus(): ReviewStatusV3 {
 	const sha = `sha256:${"a".repeat(64)}`;
 	const tree = "b".repeat(40);
 	const projection = {
@@ -299,18 +307,30 @@ function unrelatedStartTargetStatus(): ReviewStatusV1 {
 		initialSnapshotIdentity: sha,
 		currentSnapshotIdentity: sha,
 	};
+	const rawRepair = {
+		schema: UNSUPPORTED_REPAIR_ASSESSMENT.schema,
+		status: UNSUPPORTED_REPAIR_ASSESSMENT.status,
+		counts: {
+			lineages: 0, compact_lineages: 0, legacy_lineages: 0, events: 0, bytes: 0,
+			eligible_candidates: 0, unsupported_lineages: 0, conflicts: 0,
+		},
+		supported_operations: UNSUPPORTED_REPAIR_ASSESSMENT.supportedOperations,
+		authorization_schema: UNSUPPORTED_REPAIR_ASSESSMENT.authorizationSchema,
+	};
 	return {
-		contract: "gentle-ai.review-integration/v1",
+		contract: "gentle-ai.review-integration/v2",
 		applicability: "unrelated",
 		receipt: { status: "not_applicable" },
 		action: "start",
 		replayability: "not_replayable",
 		targetIdentity: sha,
 		projection,
+		repair: UNSUPPORTED_REPAIR_ASSESSMENT,
 		candidates: [],
 		raw: {
-			schema: "gentle-ai.review-integration.status/v1", contract: "gentle-ai.review-integration/v1", operation: "review.status",
+			schema: "gentle-ai.review-integration.status/v3", contract: "gentle-ai.review-integration/v2", operation: "review.status",
 			applicability: "unrelated", receipt: { status: "not_applicable" }, action: "start", replayability: "not_replayable", target_identity: sha,
+			repair: rawRepair,
 			projection: { schema: projection.schema, kind: projection.kind, projection: projection.projection, base_tree: tree, initial_review_tree: tree, current_candidate_tree: tree, paths_digest: sha, paths: ["app.ts"], intended_untracked: [], intended_untracked_proof: sha, initial_snapshot_identity: sha, current_snapshot_identity: sha },
 			candidates: [],
 		},
@@ -444,7 +464,7 @@ test("kill-switch: a clone-local off names the deciding source and the Pi comman
 	assert.equal(result.status, "skipped");
 	assert.equal(result.outcome, "review-mode-disabled");
 	assert.equal(result.mode_source, "clone_local");
-	assert.equal(result.reason, "review-driven development is disabled: start is skipped because the clone_local mode source keeps it off");
+	assert.equal(result.reason, "receipt-driven development is disabled: start is skipped because the clone_local mode source keeps it off");
 	assert.equal(result.next_action, "Run /gentle:review-mode enable to turn reviews back on for this clone.");
 });
 
@@ -459,7 +479,7 @@ test("kill-switch: a global off names the native global-scope command, never Pi'
 	const { controller } = runtime(native);
 	const result = await execStart(controller, "kill-switch-global", headlessContext(cwd));
 	assert.equal(result.mode_source, "global");
-	assert.equal(result.reason, "review-driven development is disabled: start is skipped because the global mode source keeps it off");
+	assert.equal(result.reason, "receipt-driven development is disabled: start is skipped because the global mode source keeps it off");
 	assert.equal(
 		result.next_action,
 		"Run `gentle-ai review mode enable --scope=global` to turn reviews back on; /gentle:review-mode enable only clears the clone-local setting, which cannot override a global off.",
@@ -628,7 +648,7 @@ test("gentle:review-mode: an enable that cannot take effect says so and names th
 	assert.equal(notice.type, "warning", "a request that did not take effect is not an informational result");
 	assert.equal(
 		notice.message,
-		"review-driven development: off (decided by global)\nThat did not turn reviews back on: /gentle:review-mode only sets clone scope, and a clone-local setting can never override a global off. Run `gentle-ai review mode enable --scope=global` to turn them back on.",
+		"receipt-driven development: off (decided by global)\nThat did not turn reviews back on: /gentle:review-mode only sets clone scope, and a clone-local setting can never override a global off. Run `gentle-ai review mode enable --scope=global` to turn them back on.",
 	);
 });
 
@@ -639,7 +659,7 @@ test("gentle:review-mode: an enable that does take effect keeps the existing inf
 	const command = commands.get("gentle:review-mode")!;
 	const notices: Array<{ message: string; type?: string }> = [];
 	await command.handler("enable", headlessContext(cwd, notices) as unknown as ExtensionContext);
-	assert.deepEqual(notices, [{ message: "review-driven development: on (decided by default)", type: "info" }]);
+	assert.deepEqual(notices, [{ message: "receipt-driven development: on (decided by default)", type: "info" }]);
 });
 
 test("gentle:review-mode command reports unavailability without throwing when the capability is dark", async (t) => {

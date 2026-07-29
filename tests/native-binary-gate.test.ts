@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	NativeBinaryUnavailableError,
+	REQUIRE_DEV_BINARY_ENV,
 	REQUIRE_NATIVE_BINARY_ENV,
+	requireDevBinary,
 	requireNativeBinary,
 } from "./support/native-binary-gate.ts";
 
@@ -77,6 +79,55 @@ test("only an exact \"1\" arms the gate, so a stray value cannot silently disarm
 		assert.equal(gate.run, false, `${JSON.stringify(value)} must not arm the gate`);
 	}
 	assert.throws(() => requireNativeBinary({ resolvedBinary: undefined, digestsPinned: true, env: { GENTLE_PI_REQUIRE_NATIVE_BINARY: "1" } }), NativeBinaryUnavailableError);
+});
+
+// Phase 13.12/13.13 follow-up: the same loud-skip gate, extended to the
+// third self-skipping suite (tests/devbinary/native-review-parity.devtest.ts),
+// gated behind its OWN env var so ordinary CI (no dev binary provisioned)
+// keeps skipping silently by default.
+
+test("the dev-binary env var name is distinct from the pinned-binary one", () => {
+	assert.equal(REQUIRE_DEV_BINARY_ENV, "GENTLE_PI_REQUIRE_DEV_BINARY");
+	assert.notEqual(REQUIRE_DEV_BINARY_ENV, REQUIRE_NATIVE_BINARY_ENV);
+});
+
+test("an existing dev binary path runs, and names no skip reason", () => {
+	for (const env of [{}, { GENTLE_PI_REQUIRE_DEV_BINARY: "1" }]) {
+		const gate = requireDevBinary({ devBinaryPath: "/opt/dev/gentle-ai", exists: true, env });
+		assert.equal(gate.run, true);
+		assert.equal(Object.hasOwn(gate, "reason"), false);
+	}
+});
+
+test("without the env var a missing GENTLE_AI_DEV_BINARY yields a skip carrying a concrete reason", () => {
+	const gate = requireDevBinary({ devBinaryPath: undefined, exists: false, env: {} });
+	assert.equal(gate.run, false);
+	assert.match(gate.reason as string, /GENTLE_AI_DEV_BINARY/);
+	assert.match(gate.reason as string, new RegExp(REQUIRE_DEV_BINARY_ENV));
+});
+
+test("without the env var a set but non-existent dev binary path yields a distinct skip reason", () => {
+	const missingVar = requireDevBinary({ devBinaryPath: undefined, exists: false, env: {} });
+	const badPath = requireDevBinary({ devBinaryPath: "/no/such/gentle-ai", exists: false, env: {} });
+	assert.equal(badPath.run, false);
+	assert.match(badPath.reason as string, /\/no\/such\/gentle-ai/);
+	assert.notEqual(badPath.reason, missingVar.reason, "the two causes must be distinguishable in output");
+});
+
+test("under the env var a missing dev binary throws instead of skipping", () => {
+	assert.throws(
+		() => requireDevBinary({ devBinaryPath: undefined, exists: false, env: { GENTLE_PI_REQUIRE_DEV_BINARY: "1" } }),
+		(error: unknown) => error instanceof NativeBinaryUnavailableError && /GENTLE_AI_DEV_BINARY/.test((error as Error).message),
+	);
+	assert.throws(
+		() => requireDevBinary({ devBinaryPath: "/no/such/gentle-ai", exists: false, env: { GENTLE_PI_REQUIRE_DEV_BINARY: "1" } }),
+		(error: unknown) => error instanceof NativeBinaryUnavailableError && /\/no\/such\/gentle-ai/.test((error as Error).message),
+	);
+});
+
+test("GENTLE_PI_REQUIRE_NATIVE_BINARY never arms the dev-binary gate, and vice versa", () => {
+	assert.equal(requireDevBinary({ devBinaryPath: undefined, exists: false, env: { GENTLE_PI_REQUIRE_NATIVE_BINARY: "1" } }).run, false);
+	assert.equal(requireNativeBinary({ resolvedBinary: undefined, digestsPinned: true, env: { GENTLE_PI_REQUIRE_DEV_BINARY: "1" } }).run, false);
 });
 
 test("the gate reads the passed env, never the ambient process env", () => {

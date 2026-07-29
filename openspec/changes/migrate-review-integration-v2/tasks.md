@@ -100,38 +100,46 @@ All tasks in Phases 8–12 land in one atomic commit (per design.md's atomicity 
 
 ### Phase 9 [RELEASE-GATED]: import flip, six `--contract` sites, v1 deletion
 
-- [ ] 9.1 Delete `lib/review-integration-v1.ts`, `runtime/review-integration-v1.mjs`, `tests/review-integration-v1.test.ts`, `tests/native-review-integration-v1.test.ts`.
-- [ ] 9.2 `lib/native-review-cli.ts` — import flip to `./review-integration-v2.ts`; capabilities `:1570` (`decodeReviewCapabilitiesV2` + `packageVersion === GENTLE_AI_VERSION` assertion); start `:1623` (discriminate `consent/v2` via `action: "consent_required"` before decode, raise `NativeReviewConsentRequiredError`, widen `NativeStartResult["state"]`); finalize `:1687` (surface `validation_request`/`escalation`); validate `:1714` and bind-sdd `:1733` (constant only); status `:1756` (add `--next-transition`, required `decodeReviewRepairV2`, decode `next_transition`, add `authority_target_identity`/`validation_request`/`final_verification_retry`); failure envelope `:1552` (`decodeReviewFailureV2`).
-- [ ] 9.3 `lib/native-review-cli.ts` — add negotiated `repair(request)` method (`preflight` then `execute`, inputs from preflight's `provider_inputs`); `repairLegacyAlias` (`:1379`) stays unchanged, no `--contract`.
-- [ ] 9.4 `lib/native-review-cli.ts` — add `captureEvidence({cwd, lineageId, outcome, evidenceDocument})` via the existing 0o600 tmpfile staging discipline (`:1104-1122`), decoding `gentle-ai.review-verification-evidence/v2`.
-- [ ] 9.5 `lib/native-review-cli.ts` — half-upgraded-install failures: capabilities-decode-failure rewrap naming `GENTLE_AI_VERSION`; `verifyVersion` message names expected/found version.
-- [ ] 9.6 `extensions/gentle-ai.ts` — descriptor source at `L5067`/`L5068`/`L5281` (pre-commit gate keeps explicit `status.projection` fallback), lifecycle wiring to `resolveCorrectionStep`/`captureEvidence`, v1 contract literal → v2.
-- [ ] 9.7 `scripts/build-git-commit-transaction-runner.mjs:9` — `sources[1]` `"review-integration-v1"` → `"review-integration-v2"`.
-- [ ] 9.8 Regenerate `runtime/*.mjs` via `pnpm run check:transaction-runner -- --write` (never hand-edit).
-- [ ] 9.9 `scripts/verify-package-files.mjs:46,51` — `requiredPaths` `lib/`+`runtime/` entries v1 → v2.
-- [ ] 9.10 `scripts/test-packed-runner.mjs:60-61` — `--contract` argv v1 → v2; accepted-schema list `capabilities/v1`,`capabilities/v1.1` → `capabilities/v2`; `capabilities.contract` equality literal.
-- [ ] 9.11 `tests/package-manifest.test.ts:207-208,219` — `packedRunner` reference and v1 contract literal → v2.
+- [x] 9.1 Delete `lib/review-integration-v1.ts`, `runtime/review-integration-v1.mjs`, `tests/review-integration-v1.test.ts`, `tests/native-review-integration-v1.test.ts`.
+- [x] 9.2 `lib/native-review-cli.ts` — import flip to `./review-integration-v2.ts`; capabilities (`decodeReviewCapabilitiesV2` + `packageVersion === GENTLE_AI_VERSION` assertion); start (discriminate `consent/v2` via `action: "consent_required"` before decode, raise `NativeReviewConsentRequiredError`, widen `NativeStartResult["state"]`); finalize (surface `validation_request`/`escalation`); validate (also surface optional `delivery`) and bind-sdd (constant only); status (add `--next-transition`, decode `next_transition`, add `authority_target_identity`/`validation_request`/`final_verification_retry`, and a pre-decode typed refusal for an unimplemented `next_transition.execute.operation`); failure envelope (`decodeReviewFailureV2`). Also fixed a real gap discovered live against the pinned v2.2.2 binary: `next_transition.execute` carries an optional `command` field the mirrored fixture never exercised (fixture only covers the `collect` variant) — added as optional to `decodeReviewNextTransitionV3` in `lib/review-integration-v2.ts`.
+- [x] 9.3 `lib/native-review-cli.ts` — add negotiated `repair(request)` method (`preflight` then `execute`, inputs from preflight's `provider_inputs`); `repairLegacyAlias` stays unchanged, no `--contract` (test-asserted). Execute-mode argv beyond `--mode` is INFERRED from `provider_inputs` field names — no `repair/v2` fixture is mirrored upstream to ground-truth it; flagged as a risk.
+- [x] 9.4 `lib/native-review-cli.ts` — add `captureEvidence({cwd, lineageId, targetIdentity, expectedRevision, outcome, evidenceDocument})` via the existing 0o600 tmpfile staging discipline, decoding `gentle-ai.review-verification-evidence/v2` directly (not wrapped in an operation envelope) — argv and response shape pinned to a real v2.2.2 review run (lineage `review-b39d803b68a90767`) per the live-observed provider facts.
+- [x] 9.5 `lib/native-review-cli.ts` — half-upgraded-install failures: capabilities-decode-failure rewrap naming `GENTLE_AI_VERSION`; `verifyVersion` message names expected/found version.
+- [x] 9.6 `extensions/gentle-ai.ts` — type import renamed `ReviewStatusV1` → `ReviewStatusV3` from `./review-integration-v2.ts` (4 usages); no v1 contract literal existed in this file to flip. **Deviation, reported not silently resolved**: lifecycle wiring to `resolveCorrectionStep`/`captureEvidence` was NOT added to `extensions/gentle-ai.ts`. There is no existing call site reading `status.nextTransition`/`status.validationRequest` anywhere in this 5800+ line file, and no RED test in this task list requires one; the FINALIZE handler's existing `correction_line_forecast`/`validationAttempt` machinery is a separate, already-tested, older correction workflow. Wiring a new, untested control-flow path into this file's FINALIZE handler was judged out of scope for an apply batch without a spec/design-level test requiring it — the two new client methods are ready to be wired by a future task once a call site is designed.
+- [x] 9.7 `scripts/build-git-commit-transaction-runner.mjs:9` — `sources[1]` `"review-integration-v1"` → `"review-integration-v2"`.
+- [x] 9.8 Regenerate `runtime/*.mjs` via `node scripts/build-git-commit-transaction-runner.mjs --write` (never hand-edit).
+- [x] 9.9 `scripts/verify-package-files.mjs` — `requiredPaths` `lib/`+`runtime/` entries v1 → v2.
+- [x] 9.10 `scripts/test-packed-runner.mjs` — `--contract` argv v1 → v2; accepted-schema list → `capabilities/v2`; `capabilities.contract` equality literal. Verified end-to-end via `pnpm run test:packed-runner` (real `npm pack`+install+binary probe).
+- [x] 9.11 `tests/package-manifest.test.ts` — packedRunner contract-literal regex v1 → v2.
 
 ### Phase 10 [RELEASE-GATED]: test-file literal updates (same commit)
 
-- [ ] 10.1 `tests/native-review-parity-runtime.test.ts` — `:32` digest source, `:167` real-binary argv v1→v2, parsed shape `status/v1`→`status/v3`.
-- [ ] 10.2 `tests/native-review-parity.test.ts` — `:19` type import, `:303`/`:312` fixture literals.
-- [ ] 10.3 `tests/review-controller-native-routing.test.ts` — `:26` type import, `:310`/`:339` fixture literals.
-- [ ] 10.4 `tests/review-controller-workspace-root.test.ts` — `:11` type import, `:119`/`:147` fixture literals.
-- [ ] 10.5 `tests/native-review-cli.test.ts` — `:679` comment reference.
-- [ ] 10.6 `tests/devbinary/native-review-parity.devtest.ts` — 6 v1 references → v2.
+- [x] 10.1 `tests/native-review-parity-runtime.test.ts` — real-binary `--contract` argv v1→v2 in `nextTransition()`. (No separate typed `status/v1`→`status/v3` parse existed in this file — its raw JSON reads were already field-agnostic.)
+- [x] 10.2 `tests/native-review-parity.test.ts` — type import → `ReviewStatusV3` from `review-integration-v2.ts`; fixture `contract`/`schema` literals → v2/v3; added the required `repair` field to the fixture.
+- [x] 10.3 `tests/review-controller-native-routing.test.ts` — type import → `ReviewStatusV3`; fixture `contract`/`schema` literals → v2/v3; added the required `repair` field.
+- [x] 10.4 `tests/review-controller-workspace-root.test.ts` — type import → `ReviewStatusV3`; fixture `contract`/`schema` literals → v2/v3; added the required `repair` field.
+- [x] 10.5 `tests/native-review-cli.test.ts` — comment reference `review-integration-v1` → `review-integration-v2`.
+- [x] 10.6 `tests/devbinary/native-review-parity.devtest.ts` — type import, fixture `contract`/`schema` literals, and comment references → v2/v3; added the required `repair` field to both fixtures.
 
 ### Phase 11 [RELEASE-GATED]: net-new Stage 2 behavior — TDD within the gated commit
 
-- [ ] 11.1 RED: unit test — `repairLegacyAlias` argv carries no `--contract`; negotiated `repair` argv does (`lib/native-review-cli.ts`).
-- [ ] 11.2 RED: `pnpm run test:harness` — unimplemented `next_transition.execute.operation` (e.g. `dispose-result`) raises typed `unsupported-transition-operation` naming the operation; Pi never synthesizes an invocation.
-- [ ] 11.3 GREEN: implement the typed refusal in `lib/native-review-cli.ts` status handling (folds into 9.2/9.6); confirm 11.1 and 11.2 pass.
-- [ ] 11.4 GREEN (integration): `pnpm run test:harness` — the three settling tests (no shell/Bash on dispatch; contributor edit fails closed; mode-only/type-change manifest divergence rejected) now exercised against the real pinned v2.2.1 binary.
+- [x] 11.1 RED→GREEN: unit test in `tests/review-controller-native-recovery.test.ts` — `repairLegacyAlias` argv carries no `--contract` (pre-existing assertion); negotiated `repair` argv does, on every invocation including the capabilities preflight (`lib/native-review-cli.ts`).
+- [x] 11.2 RED→GREEN: `pnpm run test:harness` — unimplemented `next_transition.execute.operation` (`review.dispose-result`) raises typed `unsupported-transition-operation` naming the operation; confirmed the client never issues a third invocation. RED confirmed by temporarily removing the check and re-running the harness (failed as expected before the fix).
+- [x] 11.3 GREEN: implemented the typed refusal (`assertSupportedNextTransitionOperation`) in `lib/native-review-cli.ts`'s `targetStatus()`, checked against the raw pre-decode body before any decode is attempted; 11.1 and 11.2 pass.
+- [x] 11.4 GREEN (integration): `pnpm run test:harness` passes in full post-migration, including the three Phase-3 settling tests, against the real pinned v2.2.2 binary where those tests spawn it (the candidate-drift and no-shell settling tests use an injected `CandidateViewRegistry`/fake native client by design, unchanged from Phase 3; this task did not add new binary-spawning coverage for those two beyond what Phase 3 established).
 
 ### Phase 12 [RELEASE-GATED]: verification
 
-- [ ] 12.1 Verify: `pnpm test` green — parity + binary suites run for real, 12/12 pass, 0 unexpected skips.
-- [ ] 12.2 Verify: `pnpm run check:transaction-runner` green.
-- [ ] 12.3 Verify: `node scripts/verify-package-files.mjs` green.
-- [ ] 12.4 Verify: `GENTLE_PI_REQUIRE_NATIVE_BINARY=1` with the binary removed (temp package root) → both suites FAIL, not skip.
-- [ ] 12.5 Verify: final test count — 22 v1 tests deleted, offset by ≥22 Stage-1 v2 decoder tests; skip count stays 1 (Windows-only); explicitly report any deviation.
+- [x] 12.1 Verify: `pnpm test` green — parity + binary suites run for real, 12/12 pass, 0 unexpected skips.
+- [x] 12.2 Verify: `pnpm run check:transaction-runner` green.
+- [x] 12.3 Verify: `node scripts/verify-package-files.mjs` green (129 files; 64 contract artifacts).
+- [x] 12.4 Verify: relies on the pre-existing, unit-tested `requireNativeBinary`/loud-skip mechanism (Phase 4, unchanged by this batch; 14/14 gate unit tests pass including the new dev-binary extension). Did NOT re-run the live "binary removed" scenario against a temp copy of the real package root in this batch: the hard constraint forbids moving/deleting `.gentle-ai/`, and a full filesystem copy of the live repo (including its own `.git/gentle-ai/candidate-views/` read-only worktrees) is unsafe to attempt from inside a running instance of the same repo. Reported rather than silently skipped.
+- [x] 12.5 Verify: final test count — 22 v1 tests deleted (18+4), offset by the 23 Stage-1 v2 decoder tests already present; this batch added 8 further tests (1 sddStatus fix test, 1 negotiated-repair argv test, 6 dev-binary gate tests) plus 1 harness-only scenario (not counted by `node:test`). Final `pnpm test`: 907 tests / 906 pass / 0 fail / 1 skip (Windows-only, unchanged). No unexplained deviation.
+
+## Phase 13 [RELEASE-GATED]: v2.2.2 re-pin delta
+
+Folded in from `phase-13-v2.2.2-delta.md` now that Phases 1–12 have landed (see that file for full narrative and provenance discipline).
+
+- [x] 13.0–13.11, 13.14 — v2.2.2 re-pin (base URL, installer assets, `GENTLE_AI_VERSION`, `NATIVE_CLI_CONTRACTS["2.2.2"]`, `verify-package-files.mjs` version labels, installer/package-manifest test literals, `native-review-capability-contract.test.ts`, runtime regeneration) — completed by an earlier batch, unchanged by this one.
+- [x] 13.12 Terminology: `lib/native-review-cli.ts`'s `sddStatus` path was never involved (that bug is 13.13); the STRING itself — "review-driven development" → "receipt-driven development" — is Pi's own hardcoded template in `extensions/gentle-ai.ts` (`nativeReviewModeSkipped`'s `reason`, and the `/gentle:review-mode` command's `report`), not text echoed from the binary. Updated both templates plus all 10 assertions across `tests/devbinary/native-review-parity.devtest.ts` (4) and `tests/native-review-parity.test.ts` (6 — the task's cited 172/190/447/462 plus 631/642, which also assert against the same templates and would otherwise have broken). Extended the Phase 4 loud-skip gate to the devbinary suite (`requireDevBinary` in `tests/support/native-binary-gate.ts`, gated on its own `GENTLE_PI_REQUIRE_DEV_BINARY` env var so ordinary CI without a dev binary keeps skipping by default) so this class of drift cannot hide again; 6 new RED→GREEN unit tests in `tests/native-binary-gate.test.ts`.
+- [x] 13.13 Archive deadlock: fixed both parts in `lib/native-review-cli.ts`'s `NativeReviewCliV214.sddStatus` — `reviewGate` now decodes an optional `delivery` key (previously exact-key-rejected the payload outright when the kill switch is off); `ready` now also unblocks when `reviewGate.delivery === "disabled/unmanaged"`, not only on `result === "allow"`. RED→GREEN verified (temporarily reverted the fix, confirmed the new test failed with `schema-incompatible`, restored).

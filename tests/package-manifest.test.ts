@@ -216,7 +216,7 @@ test("installed commit transaction runner loads JavaScript only and has determin
 	assert.match(packedRunner, /execFileSync\("where\.exe", \["npm"\]/);
 	assert.match(packedRunner, /could not resolve npm-cli\.js without a command shell/);
 	assert.doesNotMatch(packedRunner, /ComSpec|cmd\.exe/);
-	assert.match(packedRunner, /review", "capabilities", "--contract", "gentle-ai\.review-integration\/v1"/);
+	assert.match(packedRunner, /review", "capabilities", "--contract", "gentle-ai\.review-integration\/v2"/);
 	assert.match(runner, /\.\.\/runtime\/git-commit-transaction\.mjs/);
 	assert.doesNotMatch(runner, /\.ts["']/);
 	assert.doesNotMatch(runner, /experimental-strip-types/);

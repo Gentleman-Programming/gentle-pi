@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,10 +9,16 @@ import {
 	NATIVE_REVIEW_ERROR_CODE,
 	NativeReviewCliError,
 	NativeReviewCliV214 as NativeReviewCliV214Production,
+	NativeReviewCliV216,
+	clearNativeReviewCapabilitiesCacheForTesting,
 	nativeReviewLegacyAliasRepairAuthorization,
 	type ExecFileAdapter,
 	type NativeReviewCli,
 } from "../lib/native-review-cli.ts";
+import { GENTLE_AI_VERSION } from "../lib/gentle-ai-binary.ts";
+
+const v2FixtureRoot = join(process.cwd(), "contracts", "review-integration", "v2", "fixtures");
+const v2Fixture = <T = unknown>(name: string): T => JSON.parse(readFileSync(join(v2FixtureRoot, name), "utf8")) as T;
 
 // Queued-adapter clients never execute a real process; a fixed absolute
 // package-local path keeps these tests independent of an installed binary.
@@ -280,6 +286,45 @@ test("native v2.2.0 repair-legacy-alias uses the exact fixed binding and preserv
 		"--actor", "maintainer", "--reason", "quarantine approved historical alias",
 		"--maintainer-authorization", LEGACY_ALIAS_AUTHORIZATION,
 	]);
+});
+
+// Task 11.1 (migrate-review-integration-v2): `repairLegacyAlias` above stays
+// unnegotiated and carries no --contract (asserted at :281-288). The net-new
+// negotiated `repair()` is a DIFFERENT operation and must carry --contract on
+// every invocation, including the capabilities preflight `negotiated()` runs
+// first. A non-eligible preflight assessment lets this test stop after one
+// repair call, without needing a second queued execute-mode response.
+test("negotiated repair carries --contract on every invocation, unlike repair-legacy-alias", async (t) => {
+	t.after(() => clearNativeReviewCapabilitiesCacheForTesting());
+	const capabilities = v2Fixture<Record<string, unknown>>("capabilities.fixture.json");
+	const executableDigest = "dcc846103b16d365eaeeb9d7f289c23fc4f2897f23def1cb3fe7f05557b64705";
+	const capabilitiesBody = { ...capabilities, package: { ...(capabilities.package as Record<string, unknown>), version: GENTLE_AI_VERSION } };
+	const preflightResult = {
+		schema: "gentle-ai.review-integration.repair/v2",
+		contract: "gentle-ai.review-integration/v2",
+		operation: "review.repair",
+		mode: "preflight",
+		assessment: {
+			schema: "gentle-ai.review-authority-repair-assessment/v1",
+			status: "unsupported",
+			counts: { lineages: 0, compact_lineages: 0, legacy_lineages: 0, events: 0, bytes: 0, eligible_candidates: 0, unsupported_lineages: 0, conflicts: 0 },
+			supported_operations: ["review/complete-fix", "review/validate-fix"],
+			authorization_schema: "gentle-ai.review-repair-authorization/v1",
+		},
+		required_inputs: [],
+	};
+	const { adapter, calls } = queuedAdapter([
+		{ stdout: JSON.stringify(capabilitiesBody) },
+		{ stdout: JSON.stringify(preflightResult) },
+	]);
+	const cli = new NativeReviewCliV216(adapter, "/package/.gentle-ai/gentle-ai", 30_000, 1024 * 1024, async () => undefined, () => executableDigest);
+	const result = await cli.repair!({ cwd: "/repo", actor: "maintainer", reason: "quarantine approved historical alias", maintainerAuthorization: "irrelevant-for-non-eligible-preflight" });
+	assert.equal(result.mode, "preflight");
+	assert.equal(result.assessment.status, "unsupported");
+	assert.equal(calls.length, 2, "a non-eligible preflight must never issue an execute-mode call");
+	assert.deepEqual(calls[0]?.arguments, ["review", "capabilities", "--contract", "gentle-ai.review-integration/v2"]);
+	assert.deepEqual(calls[1]?.arguments, ["review", "repair", "--contract", "gentle-ai.review-integration/v2", "--cwd", "/repo", "--mode", "preflight"]);
+	for (const call of calls) assert.ok(call.arguments.includes("--contract"), "every negotiated repair() invocation must carry --contract");
 });
 
 test("native repair-legacy-alias fails closed for stale bindings, malformed output, cancellation, and partial failure", async () => {

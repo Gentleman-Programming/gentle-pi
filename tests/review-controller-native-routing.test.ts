@@ -23,7 +23,7 @@ import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 import { inspectLegacyReviewAuthorityV1 } from "../lib/review-legacy-detector.ts";
 import { resolveRepositoryAuthorityV1 } from "../lib/review-repository.ts";
 import { NATIVE_REVIEW_REMEDIATION, classifyNativeReviewRemediation } from "../lib/native-review-remediation.ts";
-import type { ReviewStatusV1 } from "../lib/review-integration-v1.ts";
+import type { AuthorityRepairAssessmentV1, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 
 interface RegisteredTool {
 	execute: (
@@ -268,18 +268,26 @@ function fakeNative(overrides: Partial<NativeReviewCli> = {}): NativeReviewCli {
 	};
 }
 
+const UNSUPPORTED_REPAIR_ASSESSMENT: AuthorityRepairAssessmentV1 = {
+	schema: "gentle-ai.review-authority-repair-assessment/v1",
+	status: "unsupported",
+	counts: { lineages: 0, compactLineages: 0, legacyLineages: 0, events: 0, bytes: 0, eligibleCandidates: 0, unsupportedLineages: 0, conflicts: 0 },
+	supportedOperations: ["review/complete-fix", "review/validate-fix"],
+	authorizationSchema: "gentle-ai.review-repair-authorization/v1",
+};
+
 function targetStatusFixture(options: {
 	applicability?: "current_target" | "unrelated" | "ambiguous" | "corrupted";
-	action?: ReviewStatusV1["action"];
-	replayability?: ReviewStatusV1["replayability"];
+	action?: ReviewStatusV3["action"];
+	replayability?: ReviewStatusV3["replayability"];
 	lineageId?: string;
 	authorityVersion?: "compact-v2" | "legacy-v1";
-	authorityState?: NonNullable<ReviewStatusV1["authority"]>["state"];
-	receiptStatus?: ReviewStatusV1["receipt"]["status"];
+	authorityState?: NonNullable<ReviewStatusV3["authority"]>["state"];
+	receiptStatus?: ReviewStatusV3["receipt"]["status"];
 	baseTree?: string;
 	currentCandidateTree?: string;
 	paths?: readonly string[];
-} = {}): ReviewStatusV1 {
+} = {}): ReviewStatusV3 {
 	const applicability = options.applicability ?? "current_target";
 	const action = options.action ?? (applicability === "current_target" ? "finalize" : applicability === "unrelated" ? "start" : applicability === "ambiguous" ? "select_lineage" : "repair_authority");
 	const replayability = options.replayability ?? (action === "reconcile_finalize" ? "status_required" : applicability === "ambiguous" ? "status_required" : applicability === "corrupted" ? "manual_action_required" : "not_replayable");
@@ -305,15 +313,26 @@ function targetStatusFixture(options: {
 		initialSnapshotIdentity: sha,
 		currentSnapshotIdentity: sha,
 	};
+	const rawRepair = {
+		schema: UNSUPPORTED_REPAIR_ASSESSMENT.schema,
+		status: UNSUPPORTED_REPAIR_ASSESSMENT.status,
+		counts: {
+			lineages: 0, compact_lineages: 0, legacy_lineages: 0, events: 0, bytes: 0,
+			eligible_candidates: 0, unsupported_lineages: 0, conflicts: 0,
+		},
+		supported_operations: UNSUPPORTED_REPAIR_ASSESSMENT.supportedOperations,
+		authorization_schema: UNSUPPORTED_REPAIR_ASSESSMENT.authorizationSchema,
+	};
 	const raw: Record<string, unknown> = {
-		schema: "gentle-ai.review-integration.status/v1",
-		contract: "gentle-ai.review-integration/v1",
+		schema: "gentle-ai.review-integration.status/v3",
+		contract: "gentle-ai.review-integration/v2",
 		operation: "review.status",
 		applicability,
 		receipt: { status: receiptStatus },
 		action,
 		replayability,
 		target_identity: sha,
+		repair: rawRepair,
 		projection: {
 			schema: projection.schema,
 			kind: projection.kind,
@@ -336,7 +355,7 @@ function targetStatusFixture(options: {
 	}
 	if (action === "reconcile_finalize") raw.reconciliation = { required: true };
 	return {
-		contract: "gentle-ai.review-integration/v1",
+		contract: "gentle-ai.review-integration/v2",
 		applicability,
 		...(applicability === "current_target" ? { authority: { version: authorityVersion, lineageId, state: authorityState, generation: 1, revision: sha } } : {}),
 		receipt: { status: receiptStatus },
@@ -346,6 +365,7 @@ function targetStatusFixture(options: {
 		...(action === "reconcile_finalize" ? { reconciliation: { required: true as const } } : {}),
 		targetIdentity: sha,
 		projection,
+		repair: UNSUPPORTED_REPAIR_ASSESSMENT,
 		candidates: applicability === "ambiguous" ? [lineageId, "other-lineage"] : [],
 		raw,
 	};
