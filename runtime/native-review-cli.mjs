@@ -43,6 +43,7 @@ export const NATIVE_REVIEW_OPERATION = {
 	MODE: "review/mode",
 	REPAIR: "review/repair",
 	CAPTURE_EVIDENCE: "review/capture-evidence",
+	CAPTURE_RESULT: "review/capture-result",
 }         ;
 
 
@@ -310,6 +311,38 @@ export const NATIVE_REVIEW_LEGACY_ALIAS_REPAIR = {
 // --contract, and the `gentle-ai.review-verification-evidence/v2` record
 // returned directly (not wrapped in an operation/v2 envelope).
 export const NATIVE_REVIEW_CAPTURE_OUTCOME = ["passed", "verification_failed", "procedural_tooling_failed"]         ;
+
+
+// `capture-result` is an additive headless command, NOT a negotiated
+// repository operation: it accepts no --contract, and the provider's own
+// transition tokens already carry the repository context -- it takes that or
+// --cwd, never both. So Pi passes the tokens through verbatim and adds only
+// --input. Reconstructing them would mean re-deriving a lineage, revision,
+// target, lens slot, and subject hash the provider already issued.
+// Added for the v2 finalize transport. `capturedResults` asks the provider to
+// discover every manifest it already admitted; `resultArtifactFiles` hands them
+// over explicitly in lens order. Both replace the retired `--result`.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1616,6 +1649,31 @@ function defaultExecutableDigest(path        )         {
 
 
 
+function decodeNativeAdmittedResultManifest(value         )                                     {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("native capture-result manifest must be an object");
+	const body = value                           ;
+	const text = (key        )         => {
+		const found = body[key];
+		if (typeof found !== "string" || found.trim() !== found || found.length === 0) throw new TypeError(`native capture-result manifest ${key} must be a non-empty trimmed string`);
+		return found;
+	};
+	const schema = text("schema");
+	if (schema !== "gentle-ai.review-result-artifact/v2") throw new TypeError(`native capture-result manifest schema must be gentle-ai.review-result-artifact/v2, received ${schema}`);
+	const admission = text("admission_decision");
+	if (admission !== "completed") throw new TypeError(`native capture-result manifest admission_decision must be completed, received ${admission}`);
+	// Exactly one locator: a provider-owned path OR an opaque reference. Both or
+	// neither means the manifest cannot be handed to FINALIZE.
+	const hasPath = body.path !== undefined, hasReference = body.reference !== undefined;
+	if (hasPath === hasReference) throw new TypeError("native capture-result manifest must carry exactly one of path or reference");
+	return Object.freeze({
+		schema,
+		subjectHash: text("subject_hash"),
+		admissionDecision: admission,
+		...(body.lens === undefined ? {} : { lens: text("lens") }),
+		...(hasPath ? { path: text("path") } : { reference: text("reference") }),
+	});
+}
+
 export class NativeReviewCliV216                            {
 	                 legacy                     ;
 	                 adapter                 ;
@@ -1845,7 +1903,13 @@ export class NativeReviewCliV216                            {
 			const execution = await this.negotiated(NATIVE_REVIEW_OPERATION.FINALIZE, request.cwd, [
 				"review", "finalize", "--contract", REVIEW_INTEGRATION_CONTRACT, "--cwd", request.cwd,
 				...(request.lineageId === undefined ? [] : ["--lineage", request.lineageId]),
-				...resultFiles.flatMap((path) => ["--result", path]),
+				// `--result` is RETIRED. A reviewer result supplied that way carries
+				// no provider-owned admission, so it cannot prove the lens inspected
+				// the frozen candidate. Results reach authority through
+				// `review capture-result`, and FINALIZE either discovers them
+				// (`--captured-results`) or is handed each manifest in lens order.
+				...(request.capturedResults === true ? ["--captured-results=true"] : []),
+				...(request.resultArtifactFiles ?? []).flatMap((path) => ["--result-artifact-file", path]),
 				...(refuterFile === undefined ? [] : ["--refuter", refuterFile]),
 				...(request.correctionLines === undefined ? [] : ["--correction-lines", String(request.correctionLines)]),
 				...(validationFile === undefined ? [] : ["--validation", validationFile]),
@@ -1964,6 +2028,31 @@ export class NativeReviewCliV216                            {
 	// --contract, and the verification-evidence/v2 record returned DIRECTLY —
 	// not wrapped in an operation/v2 envelope. Evidence is staged through the
 	// same 0o600 tmpfile discipline FINALIZE uses.
+	async captureResult(request                                  )                                              {
+		if (request.argumentTokens.length === 0) throw new TypeError("Native CAPTURE_RESULT requires the provider-issued argument tokens");
+		if (request.argumentTokens.some((token) => typeof token !== "string" || token.length === 0)) throw new TypeError("Native CAPTURE_RESULT argument tokens must all be non-empty strings");
+		if (request.resultDocument.length === 0) throw new TypeError("Native CAPTURE_RESULT result document must contain at least one byte");
+		const carriesContext = request.argumentTokens.some((token) => token === "--repository-context" || token.startsWith("--repository-context="));
+		if (carriesContext && request.cwd !== undefined) throw new TypeError("Native CAPTURE_RESULT takes a repository context or --cwd, never both");
+		const directory = await mkdtemp(join(tmpdir(), "gentle-ai-capture-result-"));
+		try {
+			await chmod(directory, 0o700);
+			const resultFile = join(directory, "result.json");
+			await writeFile(resultFile, request.resultDocument, { encoding: "utf8", mode: 0o600 });
+			await chmod(resultFile, 0o600);
+			const executable = this.verifiedExecutable(NATIVE_REVIEW_OPERATION.CAPTURE_RESULT, true);
+			const execution = await this.invoke(NATIVE_REVIEW_OPERATION.CAPTURE_RESULT, request.cwd ?? process.cwd(), [
+				"review", "capture-result",
+				...request.argumentTokens,
+				...(carriesContext || request.cwd === undefined ? [] : ["--cwd", request.cwd]),
+				"--input", resultFile,
+			], true, request.signal, executable.path);
+			return decode(NATIVE_REVIEW_OPERATION.CAPTURE_RESULT, true, () => decodeNativeAdmittedResultManifest(execution.body));
+		} finally {
+			await this.cleanupDirectory(directory).catch(() => undefined);
+		}
+	}
+
 	async captureEvidence(request                                    )                                              {
 		if (!(NATIVE_REVIEW_CAPTURE_OUTCOME                     ).includes(request.outcome)) throw new TypeError("Native CAPTURE_EVIDENCE outcome must be passed, verification_failed, or procedural_tooling_failed");
 		if (request.evidenceDocument.length === 0) throw new TypeError("Native CAPTURE_EVIDENCE evidence must contain at least one byte");

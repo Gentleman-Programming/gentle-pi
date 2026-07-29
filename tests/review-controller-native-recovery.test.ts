@@ -829,3 +829,81 @@ test("REPAIR_LEGACY_ALIAS derives fixed inputs from fresh inventory and requires
 	assert.equal(injected.outcome, "native-input-invalid");
 	await assert.rejects(runControllerOperation({ operation: "dispose-result", input: "{}" }, native), /operation/);
 });
+
+// The capture-result gap, found by benchmarking Pi's client against the real
+// binary: `finalize()` emitted `--result <file>` per lens, a flag gentle-ai
+// retired because "a reviewer result supplied this way carries no
+// provider-owned admission, so it cannot prove the lens inspected the frozen
+// candidate". There was no capture-result surface at all, so Pi could only
+// finalize a zero-lens low-risk candidate. The suite never caught it because
+// it mocks the finalize response.
+//
+// Two inverse contracts meet here. `repair()` above MUST carry --contract.
+// `capture-result` MUST NOT: it is an additive headless command, not a
+// negotiated repository operation, and the provider's own tokens already
+// carry the repository context -- it accepts that or --cwd, never both. So
+// Pi passes the transition's tokens through verbatim and adds only --input.
+test("captureResult passes the provider tokens through verbatim and carries no --contract", async (t) => {
+	t.after(() => clearNativeReviewCapabilitiesCacheForTesting());
+	const manifest = {
+		schema: "gentle-ai.review-result-artifact/v2",
+		capability: "review.native_result_artifact",
+		subject_hash: "sha256:" + "a".repeat(64),
+		admission_decision: "completed",
+		lens: "review-reliability",
+		reference: "rref1_" + "b".repeat(64),
+	};
+	const { adapter, calls } = queuedAdapter([{ stdout: JSON.stringify(manifest) }]);
+	const cli = new NativeReviewCliV216(adapter, "/package/.gentle-ai/gentle-ai", 30_000, 1024 * 1024, async () => undefined, () => "dcc846103b16d365eaeeb9d7f289c23fc4f2897f23def1cb3fe7f05557b64705");
+
+	const tokens = [
+		"--lineage=review-1d5aadacc600e167",
+		"--expected-revision=sha256:" + "c".repeat(64),
+		"--target=sha256:" + "d".repeat(64),
+		"--repository-context=rctx1_" + "e".repeat(64),
+		"--lens=review-reliability",
+		"--order=0",
+		"--subject-hash=" + manifest.subject_hash,
+	];
+	const captured = await cli.captureResult({ argumentTokens: tokens, resultDocument: JSON.stringify({ subject_hash: manifest.subject_hash, inspection: { status: "completed", paths: ["a.ts"] }, findings: [], evidence: ["reviewed the complete frozen candidate scope"] }) });
+
+	assert.equal(captured.subjectHash, manifest.subject_hash);
+	assert.equal(captured.admissionDecision, "completed");
+
+	// Exactly one invocation: capture-result is headless and never negotiates,
+	// so it must not drag a capabilities preflight along with it.
+	assert.equal(calls.length, 1);
+	const argv = calls[0]!.arguments;
+	assert.deepEqual(argv.slice(0, 2), ["review", "capture-result"]);
+	assert.equal(argv.includes("--contract"), false, "capture-result accepts no --contract");
+	assert.equal(argv.includes("--cwd"), false, "the provider tokens already carry the repository context");
+	// Tokens pass through in order, untouched, and --input is the only addition.
+	assert.deepEqual(argv.slice(2, 2 + tokens.length), tokens);
+	assert.equal(argv.at(-2), "--input");
+	assert.match(argv.at(-1) as string, /\S/);
+	assert.equal(argv.length, 2 + tokens.length + 2);
+});
+
+test("negotiated finalize never emits the retired --result flag", async (t) => {
+	t.after(() => clearNativeReviewCapabilitiesCacheForTesting());
+	const capabilities = v2Fixture<Record<string, unknown>>("capabilities.fixture.json");
+	const capabilitiesBody = { ...capabilities, package: { ...(capabilities.package as Record<string, unknown>), version: GENTLE_AI_VERSION } };
+	const finalizeBody = {
+		schema: "gentle-ai.review-integration.operation/v2",
+		contract: "gentle-ai.review-integration/v2",
+		operation: "review.finalize",
+		result: { operation: "review/finalize", lineage_id: "review-1d5aadacc600e167", state: "approved", action: "validate delivery", store_revision: "sha256:" + "f".repeat(64) },
+	};
+	const { adapter, calls } = queuedAdapter([
+		{ stdout: JSON.stringify(capabilitiesBody) },
+		{ stdout: JSON.stringify(finalizeBody) },
+	]);
+	const cli = new NativeReviewCliV216(adapter, "/package/.gentle-ai/gentle-ai", 30_000, 1024 * 1024, async () => undefined, () => "dcc846103b16d365eaeeb9d7f289c23fc4f2897f23def1cb3fe7f05557b64705");
+
+	await cli.finalize({ cwd: "/repo", lineageId: "review-1d5aadacc600e167", capturedResults: true });
+
+	const argv = calls[1]!.arguments;
+	assert.equal(argv.includes("--result"), false, "--result is retired; results reach authority through capture-result");
+	assert.ok(argv.some((token) => token === "--captured-results" || token.startsWith("--captured-results=")), "finalize must tell the provider to discover the captured results");
+	assert.ok(argv.includes("--contract"), "finalize IS negotiated, unlike capture-result");
+});
