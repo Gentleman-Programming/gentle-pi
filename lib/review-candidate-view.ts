@@ -119,12 +119,15 @@ export interface NativeCandidateProjectionDescriptor {
 	// Optional so Phase 3 stays additive: existing callers keep the legacy
 	// sorted-path behavior until the v2 switchover supplies a manifest.
 	manifest?: readonly ChangedPathEntry[];
-	// The provider artifact-subject's `changed_path_manifest_sha256` claim
-	// (contracts/review-integration/v2/schemas/artifact-subject.schema.json).
-	// Optional and additive like `manifest`: checked against Pi's own
-	// canonical digest of `manifest` (see `digestChangedPathManifest`), never
-	// against the provider's undocumented on-wire canonicalization.
+	// The provider artifact-subject's `changed_path_manifest_sha256` claim.
+	// Production callers verify this field across all collect inputs and their
+	// artifact subjects; hand-built descriptors may still use Pi's local digest
+	// as a self-consistency check.
 	manifestSha256?: string;
+	// Set only by the production status adapter after it has checked every
+	// provider-issued collect input and artifact subject for one identical hash.
+	// Provider canonicalization is intentionally not reimplemented here.
+	providerManifestHashVerified?: true;
 }
 
 export class CandidateViewError extends Error {
@@ -316,7 +319,7 @@ function assertManifestMatchesGit(descriptor: NativeCandidateProjectionDescripto
 
 	// Self-consistency: does the manifest digest to what the subject claims
 	// for it? Checked before any Git comparison, same as input-divergence.
-	if (descriptor.manifestSha256 !== undefined && digestChangedPathManifest(claimed) !== descriptor.manifestSha256) {
+	if (descriptor.manifestSha256 !== undefined && descriptor.providerManifestHashVerified !== true && digestChangedPathManifest(claimed) !== descriptor.manifestSha256) {
 		throw new CandidateViewError("native manifest does not digest to its own artifact-subject claim", "manifest-subject-drift");
 	}
 

@@ -121,6 +121,11 @@ test("compact finalize parser rejects malformed nested findings and incomplete f
 test("native finalize preserves arbitrary non-empty evidence text and binds refuter batches", () => {
 	const evidence = " \tleading evidence\nterminal newlines\n\n";
 	assert.equal(parseNativeCompactFinalizeInput({ cwd: "/repo", final_evidence: evidence, final_verification_passed: true }).final_evidence, evidence);
+	for (const outcome of ["passed", "verification_failed", "procedural_tooling_failed"] as const) {
+		assert.equal(parseNativeCompactFinalizeInput({ cwd: "/repo", final_evidence: evidence, final_verification_outcome: outcome }).final_verification_outcome, outcome);
+	}
+	assert.throws(() => parseNativeCompactFinalizeInput({ cwd: "/repo", final_evidence: evidence, final_verification_outcome: "failed" }), CompactReviewContractError);
+	assert.throws(() => parseNativeCompactFinalizeInput({ cwd: "/repo", final_evidence: evidence, final_verification_passed: true, final_verification_outcome: "passed" }), CompactReviewContractError);
 	assert.throws(() => parseNativeCompactFinalizeInput({ cwd: "/repo", final_evidence: "", final_verification_passed: true }), CompactReviewContractError);
 
 	const proof = "differential-test:candidate still fails";

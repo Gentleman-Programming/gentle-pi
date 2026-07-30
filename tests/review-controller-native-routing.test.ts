@@ -19,7 +19,7 @@ class NativeReviewCliV214 extends NativeReviewCliV214Production {
 	}
 }
 import { canonicalJsonV1, domainHashV1 } from "../lib/review-canonical.ts";
-import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
+import { CandidateViewRegistry, deriveChangedPathManifest } from "../lib/review-candidate-view.ts";
 import { inspectLegacyReviewAuthorityV1 } from "../lib/review-legacy-detector.ts";
 import { resolveRepositoryAuthorityV1 } from "../lib/review-repository.ts";
 import { NATIVE_REVIEW_REMEDIATION, classifyNativeReviewRemediation } from "../lib/native-review-remediation.ts";
@@ -371,6 +371,110 @@ function targetStatusFixture(options: {
 	};
 }
 
+function bindReviewerManifest(status: ReviewStatusV3, cwd: string, manifestHash = `sha256:${"7".repeat(64)}`): ReviewStatusV3 {
+	const manifest = deriveChangedPathManifest(cwd, status.projection.baseTree, status.projection.currentCandidateTree).map((entry) => ({
+		...entry,
+		status: entry.status as "A" | "D" | "M" | "T",
+		intendedUntracked: status.projection.intendedUntracked.includes(entry.path),
+	}));
+	const subject = {
+		schema: "gentle-ai.review-artifact-subject/v2" as const,
+		subjectHash: `sha256:${"8".repeat(64)}`,
+		lineageId: status.authority!.lineageId,
+		authorityRevision: status.authority!.revision,
+		targetIdentity: status.targetIdentity,
+		baseTree: status.projection.baseTree,
+		candidateTree: status.projection.currentCandidateTree,
+		changedPathManifestSha256: manifestHash,
+		lens: "review-reliability" as const,
+		selectedOrder: 0,
+	};
+	status.nextTransition = {
+		kind: "collect",
+		reasonCode: "reviewer_results_required",
+		collect: { inputs: [{
+			name: "reviewer_result",
+			schema: "https://gentle-ai.dev/schema/review/reviewer/v1",
+			captureOperation: "review.capture-result",
+			arguments: [
+				{ name: "lineage", value: subject.lineageId, token: `--lineage=${subject.lineageId}` },
+				{ name: "expected-revision", value: subject.authorityRevision, token: `--expected-revision=${subject.authorityRevision}` },
+				{ name: "target", value: subject.targetIdentity, token: `--target=${subject.targetIdentity}` },
+				{ name: "lens", value: subject.lens, token: `--lens=${subject.lens}` },
+				{ name: "order", value: "0", token: "--order=0" },
+				{ name: "subject-hash", value: subject.subjectHash, token: `--subject-hash=${subject.subjectHash}` },
+			],
+			artifactSubject: subject,
+			baseTree: subject.baseTree,
+			candidateTree: subject.candidateTree,
+			changedPathManifest: manifest,
+		}] },
+	};
+	return status;
+}
+
+function bindCorrectionCollection(status: ReviewStatusV3): ReviewStatusV3 {
+	status.nextTransition = {
+		kind: "collect",
+		reasonCode: "verification_evidence_required",
+		collect: { inputs: [{
+			name: "verification_evidence",
+			schema: "gentle-ai.review-verification-evidence/v2",
+			captureOperation: "review.capture-evidence",
+			arguments: [{ name: "lineage", value: status.authority!.lineageId }],
+		}] },
+	};
+	delete status.validationRequest;
+	return status;
+}
+
+function bindTargetedValidation(status: ReviewStatusV3, requestHash = `sha256:${"9".repeat(64)}`): ReviewStatusV3 {
+	const request = {
+		schema: "gentle-ai.review-targeted-validation-request/v1" as const,
+		requestHash,
+		lineageId: status.authority!.lineageId,
+		expectedRevision: status.authority!.revision,
+		targetIdentity: status.targetIdentity,
+		fixFindingIds: [],
+		projection: "workspace" as const,
+		correctionCandidateTree: status.projection.currentCandidateTree,
+		correctionTargetIdentity: status.targetIdentity,
+		correctionPaths: status.projection.paths,
+		correctionPathsDigest: status.projection.pathsDigest,
+	};
+	status.validationRequest = request;
+	status.nextTransition = {
+		kind: "collect",
+		reasonCode: "targeted_validation_required",
+		collect: { inputs: [{
+			name: "targeted_validation",
+			schema: request.schema,
+			captureOperation: "external.run_targeted_validation",
+			arguments: [{ name: "lineage", value: request.lineageId }],
+			validationRequest: request,
+		}] },
+	};
+	return status;
+}
+
+function capturedCorrectionEvidence(status: ReviewStatusV3, outcome: "passed" | "verification_failed" | "procedural_tooling_failed", identityDigit: string) {
+	return {
+		schema: "gentle-ai.review-verification-evidence/v2" as const,
+		version: 2 as const,
+		lineageId: status.authority!.lineageId,
+		authorityRevision: status.authority!.revision,
+		targetIdentity: status.targetIdentity,
+		candidateTree: status.projection.currentCandidateTree,
+		pathsDigest: status.projection.pathsDigest,
+		paths: status.projection.paths,
+		ledgerIds: [],
+		rawPayloadSha256: `sha256:${identityDigit.repeat(64)}`,
+		rawPayloadBytes: 8,
+		outcome,
+		recordDigest: `sha256:${identityDigit.repeat(64)}`,
+	};
+}
+
 function findResetRequests(value: unknown): unknown[] {
 	if (Array.isArray(value)) return value.flatMap(findResetRequests);
 	if (!value || typeof value !== "object") return [];
@@ -604,6 +708,7 @@ test("fresh negotiated registries reconstruct the frozen candidate before FINALI
 	status.projection.initialReviewTree = frozen.candidateTree;
 	status.projection.currentCandidateTree = frozen.candidateTree;
 	status.projection.paths = frozen.paths;
+	bindReviewerManifest(status, cwd);
 	frozen.cleanup();
 	let finalizedContent = "";
 	const { controller } = runtime(fakeNative({
@@ -620,6 +725,85 @@ test("fresh negotiated registries reconstruct the frozen candidate before FINALI
 	}, undefined, undefined, context(cwd));
 	assert.equal(finalizedContent, "export const value = 2;\n");
 	assert.equal((result.details as { result: { state: string } }).result.state, "approved");
+});
+
+test("fresh FINALIZE restores the provider manifest binding and rejects mode drift on the production path", async (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	const frozen = new CandidateViewRegistry().create({ contributorRoot: cwd });
+	const status = targetStatusFixture({ lineageId: "manifest-lineage", baseTree: frozen.baseTree, currentCandidateTree: frozen.candidateTree, paths: frozen.paths });
+	bindReviewerManifest(status, cwd);
+	const collect = status.nextTransition!.collect!;
+	const input = collect.inputs[0]!;
+	const changed = input.changedPathManifest![0]!;
+	status.nextTransition = { ...status.nextTransition!, collect: { inputs: [{
+		...input,
+		changedPathManifest: [{
+		...changed,
+		newMode: "100755",
+		modeOnly: true,
+		}],
+	}] } };
+	frozen.cleanup();
+	let finalizes = 0;
+	const { controller } = runtime(fakeNative({
+		targetStatus: async () => status,
+		finalize: async () => {
+			finalizes += 1;
+			return { lineageId: "manifest-lineage", state: "approved", action: "approved", storeRevision: "r1" };
+		},
+	}), undefined, undefined, undefined, new CandidateViewRegistry());
+	const result = await controller.execute("manifest-mode-drift", {
+		operation: "finalize",
+		lineageId: "manifest-lineage",
+		input: JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: ["reviewed frozen candidate"] }] } }),
+	}, undefined, undefined, context(cwd));
+	assert.equal((result.details as { outcome?: string }).outcome, "native-operation-failed");
+	assert.equal(((result.details as { diagnostics?: { code?: string } }).diagnostics?.code), "manifest-mode-drift");
+	assert.equal(finalizes, 0, "manifest drift must stop before native FINALIZE");
+});
+
+test("fresh FINALIZE rejects inconsistent provider manifest hashes before production dispatch", async (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	const frozen = new CandidateViewRegistry().create({ contributorRoot: cwd });
+	const status = bindReviewerManifest(targetStatusFixture({ lineageId: "manifest-hash-lineage", baseTree: frozen.baseTree, currentCandidateTree: frozen.candidateTree, paths: frozen.paths }), cwd);
+	const first = status.nextTransition!.collect!.inputs[0]!;
+	const secondSubjectHash = `sha256:${"a".repeat(64)}`;
+	status.nextTransition = { ...status.nextTransition!, collect: { inputs: [first, {
+		...first,
+		arguments: first.arguments.map((argument) => argument.name === "lens"
+			? { ...argument, value: "review-risk", token: "--lens=review-risk" }
+			: argument.name === "order"
+				? { ...argument, value: "1", token: "--order=1" }
+				: argument.name === "subject-hash"
+					? { ...argument, value: secondSubjectHash, token: `--subject-hash=${secondSubjectHash}` }
+					: argument),
+		artifactSubject: {
+			...first.artifactSubject!,
+			subjectHash: secondSubjectHash,
+			changedPathManifestSha256: `sha256:${"b".repeat(64)}`,
+			lens: "review-risk",
+			selectedOrder: 1,
+		},
+	}] } };
+	frozen.cleanup();
+	let finalizes = 0;
+	const { controller } = runtime(fakeNative({
+		targetStatus: async () => status,
+		finalize: async () => {
+			finalizes += 1;
+			return { lineageId: "manifest-hash-lineage", state: "approved", action: "approved", storeRevision: "r1" };
+		},
+	}), undefined, undefined, undefined, new CandidateViewRegistry());
+	const result = await controller.execute("manifest-hash-drift", {
+		operation: "finalize",
+		lineageId: "manifest-hash-lineage",
+		input: JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: ["reviewed frozen candidate"] }] } }),
+	}, undefined, undefined, context(cwd));
+	assert.equal((result.details as { outcome?: string }).outcome, "native-operation-failed");
+	assert.equal(((result.details as { diagnostics?: { code?: string } }).diagnostics?.code), "manifest-input-divergence");
+	assert.equal(finalizes, 0);
 });
 
 test("forecast-only FINALIZE reconstructs the frozen candidate after a fresh process (#176)", async (t) => {
@@ -944,10 +1128,16 @@ test("fresh registry reload ignores raw correction state and follows the native 
 	const frozen = new CandidateViewRegistry().create({ contributorRoot: cwd });
 	mkdirSync(dirname(join(cwd, ".git", "gentle-ai", "review-transactions", "v2", "correction-lineage", "review-state.json")), { recursive: true });
 	writeFileSync(join(cwd, ".git", "gentle-ai", "review-transactions", "v2", "correction-lineage", "review-state.json"), JSON.stringify({ schema: "gentle-ai.review-state-record/v2", state: { schema: "gentle-ai.review-state/v2", lineage_id: "correction-lineage", state: "correction_required", initial_snapshot: { kind: "current-changes", base_tree: frozen.baseTree, candidate_tree: frozen.candidateTree, paths: frozen.paths, paths_digest: "paths" }, current_snapshot: { kind: "current-changes", base_tree: frozen.baseTree, candidate_tree: frozen.candidateTree, paths: frozen.paths, paths_digest: "paths" }, fix_finding_ids: ["RELIABILITY-001"], findings: [{ id: "RELIABILITY-001", severity: "CRITICAL" }] } }));
-	const status = targetStatusFixture({ lineageId: "correction-lineage", baseTree: frozen.baseTree, currentCandidateTree: frozen.candidateTree, paths: frozen.paths });
+	const status = bindCorrectionCollection(targetStatusFixture({ lineageId: "correction-lineage", authorityState: "correction_required", baseTree: frozen.baseTree, currentCandidateTree: frozen.candidateTree, paths: frozen.paths }));
+	const validationStatus = bindTargetedValidation(targetStatusFixture({ lineageId: "correction-lineage", authorityState: "validating", baseTree: frozen.baseTree, currentCandidateTree: frozen.candidateTree, paths: frozen.paths }));
 	frozen.cleanup();
 	let finalizes = 0;
-	const { controller } = runtime(fakeNative({ finalize: async () => { finalizes += 1; return { lineageId: "correction-lineage", state: "approved", action: "approved", storeRevision: "r2" }; }, targetStatus: async () => status }), undefined, undefined, undefined, new CandidateViewRegistry());
+	let statuses = 0;
+	const { controller } = runtime(fakeNative({
+		finalize: async () => { finalizes += 1; return { lineageId: "correction-lineage", state: "approved", action: "approved", storeRevision: "r2" }; },
+		targetStatus: async () => { statuses += 1; return statuses === 1 ? status : validationStatus; },
+		captureEvidence: async () => capturedCorrectionEvidence(status, "passed", "6"),
+	}), undefined, undefined, undefined, new CandidateViewRegistry());
 	const required = await controller.execute("correction-validation-request", { operation: "finalize", lineageId: "correction-lineage", input: JSON.stringify({ final_evidence: "focused tests passed", final_verification_passed: true }) }, undefined, undefined, context(cwd));
 	const request = required.details as { status: string; result: Record<string, unknown> };
 	assert.equal(request.status, "in-progress");
@@ -956,6 +1146,140 @@ test("fresh registry reload ignores raw correction state and follows the native 
 	writeFileSync(join(cwd, "escape.ts"), "export const escape = true;\n");
 	assert.equal(((await controller.execute("correction-scope-escape", { operation: "finalize", lineageId: "correction-lineage", input: JSON.stringify({ final_evidence: "focused tests passed", final_verification_passed: true }) }, undefined, undefined, context(cwd))).details as { outcome: string }).outcome, "native-operation-failed");
 	assert.equal(finalizes, 0);
+});
+
+test("production correction routing captures evidence before validation and enforces all three outcomes", async (t) => {
+	for (const [outcome, expectedKind] of [
+		["passed", "run-targeted-validation"],
+		["verification_failed", "recapture-required"],
+		["procedural_tooling_failed", "terminal-escalation"],
+	] as const) {
+		await t.test(outcome, async (scenario) => {
+			const cwd = repository(scenario);
+			writeFileSync(join(cwd, "app.ts"), `export const outcome = ${JSON.stringify(outcome)};\n`);
+			const frozen = new CandidateViewRegistry().create({ contributorRoot: cwd });
+			const beforeCapture = bindCorrectionCollection(targetStatusFixture({
+				lineageId: `correction-${outcome.replaceAll("_", "-")}`,
+				authorityState: "correction_required",
+				baseTree: frozen.baseTree,
+				currentCandidateTree: frozen.candidateTree,
+				paths: frozen.paths,
+			}));
+			const afterCapture = targetStatusFixture({
+				lineageId: beforeCapture.authority!.lineageId,
+				authorityState: outcome === "procedural_tooling_failed" ? "escalated" : outcome === "passed" ? "validating" : "correction_required",
+				action: outcome === "procedural_tooling_failed" ? "stop" : "finalize",
+				baseTree: frozen.baseTree,
+				currentCandidateTree: frozen.candidateTree,
+				paths: frozen.paths,
+			});
+			if (outcome === "passed") bindTargetedValidation(afterCapture);
+			else if (outcome === "verification_failed") bindCorrectionCollection(afterCapture);
+			frozen.cleanup();
+			const calls: string[] = [];
+			let statuses = 0;
+			let finalizes = 0;
+			const { controller } = runtime(fakeNative({
+				targetStatus: async () => {
+					calls.push("status");
+					statuses += 1;
+					return statuses === 1 ? beforeCapture : afterCapture;
+				},
+				captureEvidence: async (request) => {
+					calls.push("capture-evidence");
+					assert.equal(request.outcome, outcome);
+					return capturedCorrectionEvidence(beforeCapture, outcome, outcome === "passed" ? "1" : outcome === "verification_failed" ? "2" : "3");
+				},
+				finalize: async () => {
+					calls.push("finalize");
+					finalizes += 1;
+					return { lineageId: beforeCapture.authority!.lineageId, state: "approved", action: "approved", storeRevision: "r-final" };
+				},
+			}), undefined, undefined, undefined, new CandidateViewRegistry());
+			const validation = outcome === "passed" ? {
+				request_hash: "9".repeat(64), correction_ids: [],
+				original_criteria: { passed: true, evidence: ["acceptance passes"] },
+				correction_regression: { passed: true, evidence: ["regression passes"] },
+				fix_caused_findings: [], follow_ups: [],
+			} : undefined;
+			const result = await controller.execute(`correction-${outcome}`, {
+				operation: "finalize",
+				lineageId: beforeCapture.authority!.lineageId,
+				input: JSON.stringify({ final_evidence: `evidence: ${outcome}`, final_verification_outcome: outcome, ...(validation === undefined ? {} : { validation }) }),
+			}, undefined, undefined, context(cwd));
+			const details = result.details as Record<string, unknown>;
+			assert.deepEqual(calls.slice(0, 3), ["status", "capture-evidence", "status"], "STATUS must collect evidence before targeted validation can run");
+			assert.equal((details.correction_step as { kind?: string } | undefined)?.kind, expectedKind);
+			assert.equal(finalizes, outcome === "passed" ? 1 : 0);
+			if (outcome === "passed") assert.deepEqual(calls, ["status", "capture-evidence", "status", "finalize"]);
+			else assert.deepEqual(calls, ["status", "capture-evidence", "status"]);
+		});
+	}
+});
+
+test("production correction routing fails closed when targeted validation is offered before evidence capture", async (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "app.ts"), "export const corrected = true;\n");
+	const frozen = new CandidateViewRegistry().create({ contributorRoot: cwd });
+	const premature = bindTargetedValidation(targetStatusFixture({ lineageId: "premature-validation", authorityState: "validating", baseTree: frozen.baseTree, currentCandidateTree: frozen.candidateTree, paths: frozen.paths }));
+	frozen.cleanup();
+	let captures = 0;
+	let finalizes = 0;
+	const { controller } = runtime(fakeNative({
+		targetStatus: async () => premature,
+		captureEvidence: async () => { captures += 1; return capturedCorrectionEvidence(premature, "passed", "4"); },
+		finalize: async () => { finalizes += 1; return { lineageId: "premature-validation", state: "approved", action: "approved", storeRevision: "r1" }; },
+	}), undefined, undefined, undefined, new CandidateViewRegistry());
+	const result = await controller.execute("premature-targeted-validation", {
+		operation: "finalize",
+		lineageId: "premature-validation",
+		input: JSON.stringify({
+			final_evidence: "evidence first",
+			final_verification_outcome: "passed",
+			validation: { request_hash: "9".repeat(64), correction_ids: [], original_criteria: { passed: true, evidence: ["passes"] }, correction_regression: { passed: true, evidence: ["passes"] }, fix_caused_findings: [], follow_ups: [] },
+		}),
+	}, undefined, undefined, context(cwd));
+	assert.equal((result.details as { outcome?: string }).outcome, "native-operation-failed");
+	assert.equal(captures, 0);
+	assert.equal(finalizes, 0);
+});
+
+test("production correction routing rejects a second capture that reuses failed evidence identity", async (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "app.ts"), "export const corrected = 1;\n");
+	const frozen = new CandidateViewRegistry().create({ contributorRoot: cwd });
+	const status = bindCorrectionCollection(targetStatusFixture({ lineageId: "distinct-evidence", authorityState: "correction_required", baseTree: frozen.baseTree, currentCandidateTree: frozen.candidateTree, paths: frozen.paths }));
+	frozen.cleanup();
+	let captures = 0;
+	let finalizes = 0;
+	const candidateViews = new CandidateViewRegistry();
+	const { controller } = runtime(fakeNative({
+		targetStatus: async () => status,
+		captureEvidence: async () => {
+			captures += 1;
+			return capturedCorrectionEvidence(status, "verification_failed", "5");
+		},
+		finalize: async () => { finalizes += 1; return { lineageId: "distinct-evidence", state: "approved", action: "approved", storeRevision: "r1" }; },
+	}), undefined, undefined, undefined, candidateViews);
+	const request = {
+		operation: "finalize",
+		lineageId: "distinct-evidence",
+		input: JSON.stringify({ final_evidence: "verification failed", final_verification_outcome: "verification_failed" }),
+	};
+	const first = await controller.execute("distinct-first", request, undefined, undefined, context(cwd));
+	assert.equal(((first.details as { correction_step?: { kind?: string } }).correction_step?.kind), "recapture-required");
+	writeFileSync(join(cwd, "app.ts"), "export const corrected = 2;\n");
+	const changed = new CandidateViewRegistry().create({ contributorRoot: cwd });
+	status.projection.currentCandidateTree = changed.candidateTree;
+	status.projection.paths = changed.paths;
+	changed.cleanup();
+	const second = await controller.execute("distinct-second", request, undefined, undefined, context(cwd));
+	assert.equal((second.details as { outcome?: string }).outcome, "native-operation-failed");
+	assert.match(JSON.stringify(second.details), /correction-evidence-replaced/);
+	assert.equal(captures, 2);
+	assert.equal(finalizes, 0);
+	candidateViews.cleanupTerminal("distinct-evidence", "escalated");
+	execFileSync("chmod", ["-R", "u+w", cwd]);
 });
 
 test("native FINALIZE derives and requires the trusted refuter request before invoking native FINALIZE", async (t) => {

@@ -13,6 +13,7 @@ import {
 import { REVIEW_LENS } from "./review-triggers.ts";
 import { canonicalJsonV1, domainHashV1 } from "./review-canonical.ts";
 import { normalizeRefuterBatch, type RefuterBatch } from "./review-refuter-adapter.ts";
+import { CORRECTION_OUTCOMES, type CorrectionOutcome } from "./review-correction-lifecycle.ts";
 
 const DIGEST = /^[0-9a-f]{64}$/;
 const LINEAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -45,6 +46,7 @@ export interface CompactFinalizeContractInput {
 	validation?: CompactTargetedValidationInput;
 	final_evidence?: string;
 	final_verification_passed?: boolean;
+	final_verification_outcome?: CorrectionOutcome;
 	refuter_batch?: unknown;
 }
 
@@ -263,14 +265,21 @@ export function parseCompactStartInput(value: unknown): CompactStartContractInpu
 }
 
 function parseCompactFinalizeInputValue(value: unknown, preserveFinalEvidence: boolean): CompactFinalizeContractInput {
-	const input = exact(value, "review/finalize", ["cwd"], ["lineageId", "review_result", "correction_line_forecast", "validation_proof", "validation", "final_evidence", "final_verification_passed", "refuter_batch"]);
-	if ((input.final_evidence === undefined) !== (input.final_verification_passed === undefined)) fail("review/finalize", "field-pair", "final evidence and result must appear together");
+	const input = exact(value, "review/finalize", ["cwd"], ["lineageId", "review_result", "correction_line_forecast", "validation_proof", "validation", "final_evidence", "final_verification_passed", "final_verification_outcome", "refuter_batch"]);
+	const outcomeFields = Number(input.final_verification_passed !== undefined) + Number(input.final_verification_outcome !== undefined);
+	if ((input.final_evidence === undefined && outcomeFields !== 0) || (input.final_evidence !== undefined && outcomeFields !== 1)) fail("review/finalize", "field-pair", "final evidence requires exactly one verification result or outcome");
 	let correction_line_forecast: number | undefined;
 	if (input.correction_line_forecast !== undefined) {
 		if (!Number.isSafeInteger(input.correction_line_forecast) || input.correction_line_forecast <= 0) fail("review/finalize.correction_line_forecast", "range", "must be a positive safe integer");
 		correction_line_forecast = input.correction_line_forecast;
 	}
 	if (input.final_verification_passed !== undefined && typeof input.final_verification_passed !== "boolean") fail("review/finalize.final_verification_passed", "type", "must be boolean");
+	let final_verification_outcome: CorrectionOutcome | undefined;
+	if (input.final_verification_outcome !== undefined) {
+		const outcome = string(input.final_verification_outcome, "review/finalize.final_verification_outcome");
+		if (!(CORRECTION_OUTCOMES as readonly string[]).includes(outcome)) fail("review/finalize.final_verification_outcome", "enum", "contains an unsupported value");
+		final_verification_outcome = outcome as CorrectionOutcome;
+	}
 	let final_evidence: string | undefined;
 	if (input.final_evidence !== undefined) {
 		if (preserveFinalEvidence) {
@@ -280,7 +289,7 @@ function parseCompactFinalizeInputValue(value: unknown, preserveFinalEvidence: b
 			final_evidence = string(input.final_evidence, "review/finalize.final_evidence");
 		}
 	}
-	return { cwd: string(input.cwd, "review/finalize.cwd"), ...(optionalLineage(input.lineageId, "review/finalize.lineageId") === undefined ? {} : { lineageId: optionalLineage(input.lineageId, "review/finalize.lineageId")! }), ...(input.review_result === undefined ? {} : { review_result: parseReviewResult(input.review_result, "review/finalize.review_result") }), ...(correction_line_forecast === undefined ? {} : { correction_line_forecast }), ...(input.validation_proof === undefined ? {} : { validation_proof: parseValidationProof(input.validation_proof, "review/finalize.validation_proof") }), ...(input.validation === undefined ? {} : { validation: parseValidation(input.validation, "review/finalize.validation") }), ...(final_evidence === undefined ? {} : { final_evidence }), ...(input.final_verification_passed === undefined ? {} : { final_verification_passed: input.final_verification_passed }), ...(input.refuter_batch === undefined ? {} : { refuter_batch: input.refuter_batch }) };
+	return { cwd: string(input.cwd, "review/finalize.cwd"), ...(optionalLineage(input.lineageId, "review/finalize.lineageId") === undefined ? {} : { lineageId: optionalLineage(input.lineageId, "review/finalize.lineageId")! }), ...(input.review_result === undefined ? {} : { review_result: parseReviewResult(input.review_result, "review/finalize.review_result") }), ...(correction_line_forecast === undefined ? {} : { correction_line_forecast }), ...(input.validation_proof === undefined ? {} : { validation_proof: parseValidationProof(input.validation_proof, "review/finalize.validation_proof") }), ...(input.validation === undefined ? {} : { validation: parseValidation(input.validation, "review/finalize.validation") }), ...(final_evidence === undefined ? {} : { final_evidence }), ...(input.final_verification_passed === undefined ? {} : { final_verification_passed: input.final_verification_passed }), ...(final_verification_outcome === undefined ? {} : { final_verification_outcome }), ...(input.refuter_batch === undefined ? {} : { refuter_batch: input.refuter_batch }) };
 }
 
 export function parseCompactFinalizeInput(value: unknown): CompactFinalizeContractInput {

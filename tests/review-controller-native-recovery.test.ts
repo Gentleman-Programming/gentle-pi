@@ -884,6 +884,58 @@ test("captureResult passes the provider tokens through verbatim and carries no -
 	assert.equal(argv.length, 2 + tokens.length + 2);
 });
 
+test("captureEvidence stages exact bytes, uses the closed outcome argv, and decodes the native record", async (t) => {
+	t.after(() => clearNativeReviewCapabilitiesCacheForTesting());
+	const capabilities = v2Fixture<Record<string, unknown>>("capabilities.fixture.json");
+	const capabilitiesBody = { ...capabilities, package: { ...(capabilities.package as Record<string, unknown>), version: GENTLE_AI_VERSION } };
+	const record = {
+		schema: "gentle-ai.review-verification-evidence/v2",
+		version: 2,
+		lineage_id: "review-evidence-lineage",
+		authority_revision: `sha256:${"a".repeat(64)}`,
+		target_identity: `sha256:${"b".repeat(64)}`,
+		candidate_tree: "c".repeat(40),
+		paths_digest: `sha256:${"d".repeat(64)}`,
+		paths: ["app.ts"],
+		ledger_ids: [],
+		raw_payload_sha256: `sha256:${"e".repeat(64)}`,
+		raw_payload_bytes: 24,
+		outcome: "verification_failed",
+		record_digest: `sha256:${"f".repeat(64)}`,
+	};
+	let staged = "";
+	const calls: Array<{ arguments: readonly string[] }> = [];
+	const cli = new NativeReviewCliV216(async (request) => {
+		calls.push({ arguments: request.arguments });
+		if (request.arguments[1] === "capabilities") return { stdout: JSON.stringify(capabilitiesBody), stderr: "", exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false };
+		const inputIndex = request.arguments.indexOf("--input");
+		assert.ok(inputIndex >= 0);
+		staged = readFileSync(request.arguments[inputIndex + 1]!, "utf8");
+		return { stdout: JSON.stringify(record), stderr: "", exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false };
+	}, "/package/.gentle-ai/gentle-ai", 30_000, 1024 * 1024, async () => undefined, () => "dcc846103b16d365eaeeb9d7f289c23fc4f2897f23def1cb3fe7f05557b64705");
+	const evidence = "focused verification failed\n";
+	const captured = await cli.captureEvidence({
+		cwd: "/repo",
+		lineageId: record.lineage_id,
+		targetIdentity: record.target_identity,
+		expectedRevision: record.authority_revision,
+		outcome: "verification_failed",
+		evidenceDocument: evidence,
+	});
+	assert.equal(staged, evidence);
+	assert.equal(captured.recordDigest, record.record_digest);
+	assert.equal(captured.outcome, "verification_failed");
+	const argv = calls[1]!.arguments;
+	assert.deepEqual(argv.slice(0, 2), ["review", "capture-evidence"]);
+	assert.equal(argv.includes("--contract"), false);
+	assert.equal(argv[argv.indexOf("--outcome") + 1], "verification_failed");
+	await assert.rejects(
+		cli.captureEvidence({ cwd: "/repo", lineageId: record.lineage_id, targetIdentity: record.target_identity, expectedRevision: record.authority_revision, outcome: "failed" as never, evidenceDocument: evidence }),
+		/outcome must be passed, verification_failed, or procedural_tooling_failed/,
+	);
+	assert.equal(calls.length, 2, "outside-domain outcomes must fail before another native launch");
+});
+
 test("negotiated finalize never emits the retired --result flag", async (t) => {
 	t.after(() => clearNativeReviewCapabilitiesCacheForTesting());
 	const capabilities = v2Fixture<Record<string, unknown>>("capabilities.fixture.json");

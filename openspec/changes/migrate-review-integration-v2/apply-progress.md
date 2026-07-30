@@ -1,85 +1,96 @@
 # Apply Progress: migrate gentle-pi to `review-integration/v2`
 
-**Scope of this batch**: Stage 1, Phase 1 only (tasks 1.1–1.8). Stage 2 and Phases 2–7 are untouched.
+**Cumulative state**: Phases 1–5 and 7–14 complete; Phase 6.1 remains historically partial as recorded in `tasks.md` because two mirrored skill assets were deliberately left to their upstream sync. This file merges the original Phase-1 OpenSpec report, cumulative Engram progress through Stage 2/Phase 13, and corrective attempt 11.
 
 **Mode**: Strict TDD
+**Delivery**: accepted `size:exception`
+**Corrective objectives**: 4/4 complete
 
-## Completed Tasks
+## Completed Work
 
-- [x] 1.1 RED: `tests/review-integration-v2.test.ts` created, importing decoders from a not-yet-existing `lib/review-integration-v2.ts`. Confirmed failure by running `node --experimental-strip-types --test tests/review-integration-v2.test.ts` → `ERR_MODULE_NOT_FOUND`.
-- [x] 1.2 GREEN: `lib/review-integration-v2.ts` created with primitives ported verbatim from `lib/review-integration-v1.ts` (`record`, `exactRecord`, `text`, `nonempty`, `boolean`, `integer`, `enumeration`, `canonicalJson`, `array`, `stringArray`, `enumArray`, `sha256`, `gitTree`, `lineage`, `safePath`, `assertExactSet`, `assertSupersetOf`), a v2-only `requireIdentity` (const-schema identity, no `requireVersionedIdentity` needed since v2 protocol minor is a fixed `const 0`), and `decodeReviewCapabilitiesV2` (22-schema superset check via `assertSupersetOf`, 10 exact mandatory features via `assertExactSet`, 17 optional features tolerated forward-compatibly).
-- [x] 1.3 GREEN: implemented `decodeReviewStartV3`, `decodeReviewStatusV3`, `decodeReviewProjectionV1` (kept the v1 name — the v2 capabilities schema still advertises `gentle-ai.review-integration.projection/v1`), `decodeReviewFailureV2`, `decodeReviewOperationV2`. All 4 mirrored fixtures (`capabilities.fixture.json`, `start.fixture.json`, `status.fixture.json`, `consent.fixture.json`) round-trip.
-- [x] 1.4 RED: added rejection tests for the net-new `decodeReviewConsentV2`, `decodeReviewNextTransitionV3`, `decodeReviewArtifactSubjectV2` (no provider fixture needed for next-transition/artifact-subject beyond what's embedded in the status/start fixtures; consent has its own fixture).
-- [x] 1.5 GREEN: implemented `decodeReviewConsentV2`, `decodeReviewNextTransitionV3` (returns a typed value, unlike v1's void-returning `decodeNextTransition`), `decodeReviewArtifactSubjectV2`.
-- [x] 1.6 RED: added hand-built repair payload tests — execute-mode-without-`execution` rejected; eligible-preflight with `required_inputs` out of order rejected. No provider fixture exists for `repair/v2` (confirmed: only 4 fixtures ship — capabilities, start, status, consent).
-- [x] 1.7 GREEN: implemented `decodeReviewRepairV2` (both `allOf` invariants from v1 `repair.schema.json:53-157`: execute mode requires `execution`, forbids `provider_inputs`, requires empty `required_inputs`; eligible preflight requires `provider_inputs` and `required_inputs` exactly `[actor, reason, maintainer_authorization]` in order) and `decodeAuthorityRepairAssessmentV1` (consumed both by `status.repair`, which is now required, and by `repair.assessment`).
-- [x] 1.8 Verify: `tests/review-integration-v2.test.ts` has **23 tests** (≥22 required). Confirmed `lib/review-integration-v2.ts` is not imported by `lib/native-review-cli.ts`, `extensions/gentle-ai.ts`, or `scripts/build-git-commit-transaction-runner.mjs` (`rg -n "review-integration-v2" lib/native-review-cli.ts extensions/gentle-ai.ts scripts/build-git-commit-transaction-runner.mjs` → no matches).
+- [x] Phase 1 — v2 exact-key decoder module and 23+ replacement tests.
+- [x] Phase 2 — pure correction outcome resolver and distinct-evidence invariant.
+- [x] Phase 3 — field-wise candidate manifest derivation/comparison and no-shell lens dispatch.
+- [x] Phase 4 — loud native/dev-binary skip gates.
+- [x] Phase 5 — bidirectional contract and generated-runtime package reconciliation.
+- [~] Phase 6.1 — README/native architecture docs complete; mirrored skill assets intentionally deferred as documented in `tasks.md`.
+- [x] Phase 7 — Stage-1 close-out.
+- [x] Phases 8–12 — v2 switchover, v1 deletion, client call sites, capture-result/evidence surfaces, generated runtime, and Stage-2 verification.
+- [x] Phase 13 — final v2.2.2 pin, terminology correction, and SDD readiness fix.
+- [x] 14.1 — production reviewer projection now consumes v2 `next_transition.collect.inputs[]`; each capture-result input must bind canonical lineage/revision/target/lens/order/subject arguments to its `artifact_subject`, the projection trees, one identical manifest, and one identical provider manifest hash. Fresh-process reviewer FINALIZE requires this descriptor and runs field-wise Git validation.
+- [x] 14.2 — correction FINALIZE now requires STATUS to offer exactly one `review.capture-evidence` input before validation; premature `external.run_targeted_validation` fails closed. After capture, STATUS is re-queried before any validator document can reach native FINALIZE.
+- [x] 14.3 — the production decision point now calls `resolveCorrectionStep`: `passed` requires one provider-bound targeted-validation request, `verification_failed` returns an open zero-charge recapture step, and `procedural_tooling_failed` requires terminal escalated authority. Reused failed evidence identity is rejected through `assertDistinctCorrectionEvidence`.
+- [x] 14.4 — direct `captureEvidence` test covers exact staged bytes, closed outcome argv, direct v2 record decoding, and pre-launch rejection. All delta-spec v2.2.1 references now name the actual v2.2.2 pin.
+- [x] 14.5 — focused and full gates green.
+
+## Corrective Files Changed
+
+| File | Action | Correction |
+|---|---|---|
+| `extensions/gentle-ai.ts` | Modified | Provider manifest adapter, evidence-first orchestration, three production outcome branches, distinct-evidence state, fail-closed diagnostics, and closed wrapper outcome input. |
+| `lib/review-candidate-view.ts` | Modified | Distinguish production provider-hash verification from local hand-built descriptor digest checks. |
+| `lib/review-compact-contract.ts` | Modified | Add exact-key `final_verification_outcome` with the three-value closed domain while retaining the paired boolean compatibility input. |
+| `tests/review-controller-native-routing.test.ts` | Modified | Production caller tests for manifest/hash enforcement, ordering, three branches, fail-closed premature validation, and evidence identity reuse. |
+| `tests/review-controller-native-recovery.test.ts` | Modified | Direct `captureEvidence` boundary test. |
+| `tests/review-compact-contract.test.ts` | Modified | Exact outcome parsing and invalid/ambiguous input tests. |
+| `tests/runtime-harness.mjs` | Modified | Real extension/controller ordering scenario. |
+| `openspec/changes/migrate-review-integration-v2/specs/review-transaction/spec.md` | Modified | Five v2.2.1 references corrected to v2.2.2. |
+| `openspec/changes/migrate-review-integration-v2/tasks.md` | Modified | Added completed corrective Phase 14. |
+| `openspec/changes/migrate-review-integration-v2/apply-progress.md` | Reconciled | Replaced stale Phase-1-only copy with this cumulative hybrid record. |
+
+The historical failed `verify-report.md` remains untracked and byte-untouched.
 
 ## TDD Cycle Evidence
 
-| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
-|------|-----------|-------|------------|-----|-------|-------------|----------|
-| 1.1 | `tests/review-integration-v2.test.ts` | Unit | N/A (new file) | ✅ Written — module import fails (`ERR_MODULE_NOT_FOUND`) | N/A (RED-only step) | N/A | N/A |
-| 1.2–1.3 | `tests/review-integration-v2.test.ts` | Unit | N/A (new file) | ✅ 13 tests written against capabilities/v2, start/v3, status/v3, projection/v1, failure/v2, operation/v2 before the implementing module existed | ✅ 13/13 passed after `lib/review-integration-v2.ts` implemented (one bug found and fixed mid-cycle: initial `target_mode`/`target_identity`/`base_tree`/`candidate_tree` all-or-nothing bundling was wrong — the mirrored schema's `dependentRequired` binds `base_tree<->candidate_tree` and `target_mode<->target_identity` as two independent pairs, not one 4-field bundle; fixed and re-ran to green) | ✅ 10 additional tests added for exact-set/superset boundaries, independent overlay-pair binding, status authority/frozen/receipt conditionals, validation_request/retry_final_verification preconditions, operation validate/bind_sdd/retry_final_verification variants, failure context oneOf(scope_change, binding_revision) | ✅ No structural changes needed after the overlay-pair fix; primitives kept identical to v1's proven shape |
-| 1.4–1.5 | `tests/review-integration-v2.test.ts` | Unit | N/A (new decoders) | ✅ Written — consent/next-transition/artifact-subject rejection tests | ✅ Passed on first implementation | ✅ Additional tests for consent choice-order/invocation-pattern rejection, next-transition execute-variant decode + stop-cannot-carry-transition rejection, artifact-subject optional `correction_target_identity` | ➖ None needed |
-| 1.6–1.7 | `tests/review-integration-v2.test.ts` | Unit | N/A (new decoder) | ✅ Written — execute-without-execution and eligible-preflight-wrong-order hand-built payloads | ✅ Passed on first implementation | ✅ Additional test for committed execute-result decode and non-eligible-preflight-with-provider_inputs rejection | ➖ None needed |
-| 1.8 | `tests/review-integration-v2.test.ts` | Unit | N/A | N/A (verification step) | ✅ 23/23 tests pass | N/A | N/A |
+| Work | Test file / layer | Safety net | RED | GREEN | Triangulate | Refactor |
+|---|---|---|---|---|---|---|
+| Prior Phases 1–13 | Decoder, candidate, lifecycle, CLI, and harness suites | Prior cumulative Engram report: 907/906/0/1 at Stage-2 close, later 911/910/0/1 after Phase 13 | Recorded per prior batches | Recorded green | Multiple exact-key and branch cases | Runtime regenerated where required |
+| 14.1 manifest production binding | `tests/review-controller-native-routing.test.ts` / integration | 238/238 across routing, recovery, candidate, lifecycle baseline | Production accepted mode drift and hash divergence; focused RED contained both failures | Mode drift and inconsistent provider hashes block before FINALIZE | Matching provider manifest dispatch remains green | Provider canonical hash is cross-input bound instead of incorrectly re-derived |
+| 14.2 evidence-first ordering | routing test + `tests/runtime-harness.mjs` / integration-runtime | Harness baseline exit 0 | Controller lacked the new outcome field/capture call; node RED and harness exit 1 | Exact trace `status → capture-evidence → status → finalize`; premature validation blocks | Passed and premature-targeted branches | Ordering helpers extracted from controller body |
+| 14.3 three production branches | `tests/review-controller-native-routing.test.ts` / integration | Same 238/238 safety net | All three controller subtests failed before production wiring | Passed, verification-failed, tooling-failed, and reused-identity cases green | Three distinct outcomes plus reused identity | Pure resolver retained; controller performs only orchestration and binding checks |
+| 14.4 capture boundary/outcome parser | recovery + compact-contract tests / unit | Existing capture-result/finalize tests green | Explicit outcome was rejected as an unknown exact key | Direct capture and all closed parser values green | Invalid outcome and dual boolean/outcome rejected | No runtime generator change required |
 
-### Test Summary
+### RED Evidence
 
-- **Total tests written**: 23
-- **Total tests passing**: 23
-- **Layers used**: Unit (23), Integration (0 — Phase 1 has no integration/harness task), E2E (0)
-- **Approval tests** (refactoring): None — no refactoring tasks in this batch (new module, no existing behavior to preserve)
-- **Pure functions created**: all decoders in `lib/review-integration-v2.ts` are pure (no I/O, no subprocess); primitives (`text`, `enumeration`, `array`, etc.) are pure
+`node --experimental-strip-types --test tests/review-controller-native-routing.test.ts tests/review-controller-native-recovery.test.ts tests/review-compact-contract.test.ts` → **exit 1**, 197 tests, 188 pass, **9 fail**. Failures were the new exact outcome parser, two production manifest tests, three outcome subtests, premature-validation ordering, reused evidence identity, and their parent aggregation.
+
+`CI=1 pnpm run test:harness` → **exit 1** at the new correction scenario because production still required only `final_verification_passed` and never called `captureEvidence`.
+
+### GREEN Evidence
+
+`node --experimental-strip-types --test tests/review-controller-native-routing.test.ts tests/review-controller-native-recovery.test.ts tests/review-compact-contract.test.ts tests/review-candidate-view.test.ts tests/review-correction-lifecycle.test.ts` → **exit 0**, 253 tests, 253 pass, 0 fail, 0 skip.
+
+`CI=1 pnpm run test:harness` → **exit 0**, including the production ordering scenario.
 
 ## Work Unit Evidence
 
-| Evidence | Value |
+| Evidence | Result |
 |---|---|
-| Focused test command and exact result | `node --experimental-strip-types --test tests/review-integration-v2.test.ts` → `tests 23, pass 23, fail 0` |
-| Runtime harness command/scenario and exact result | N/A — Phase 1 tasks 1.1–1.8 are pure decoder unit tests only; no runtime/harness boundary is exercised until Phase 3 (candidate-view manifest binding, out of scope this batch) |
-| Rollback boundary | Revert `lib/review-integration-v2.ts` and `tests/review-integration-v2.test.ts` alone. Both are net-new, unimported files — no other file was touched, so rollback removes zero unrelated work. |
+| Focused tests | 253/253 pass after a confirmed 9-failure RED. |
+| Runtime harness | Exit 0; real `createGentleAiExtension` controller trace proves capture precedes targeted validation. |
+| Rollback boundary | Revert Phase-14 edits in `extensions/gentle-ai.ts`, `lib/review-candidate-view.ts`, `lib/review-compact-contract.ts`, their four test files, and the v2.2.2 spec correction. Earlier v2 migration work remains intact. |
 
-## Files Changed
+## Final Gates
 
-| File | Action | What Was Done |
-|------|--------|---------------|
-| `lib/review-integration-v2.ts` | Created | v2 decoder module: primitives ported verbatim, `decodeReviewCapabilitiesV2`, `decodeReviewStartV3`, `decodeReviewStatusV3`, `decodeReviewProjectionV1`, `decodeReviewFailureV2`, `decodeReviewOperationV2`, `decodeReviewConsentV2`, `decodeReviewNextTransitionV3`, `decodeReviewArtifactSubjectV2`, `decodeReviewRepairV2`, `decodeAuthorityRepairAssessmentV1`. Unimported by any other module. |
-| `tests/review-integration-v2.test.ts` | Created | 23 unit tests: rejection tests per decoder, 4-fixture round-trips, and triangulation coverage for conditional branches (authority/frozen/receipt, validation_request, retry_final_verification, repair invariants, consent, next-transition). |
-| `openspec/changes/migrate-review-integration-v2/tasks.md` | Modified | Marked tasks 1.1–1.8 `[x]`. |
+| Command | Exit | Result |
+|---|---:|---|
+| `node --experimental-strip-types --test tests/*.test.ts` | 0 | 920 tests; 919 pass, 0 fail, 1 Windows-only skip |
+| `CI=1 pnpm run test:harness` | 0 | Runtime harness passed |
+| `node scripts/verify-package-files.mjs` | 0 | 129 package files; 64 exact v2.2.2 contract artifacts |
+| `node scripts/build-git-commit-transaction-runner.mjs --check` | 0 | TypeScript sources match all 4 generated runtime modules; no regeneration required |
+| `pnpm test` | 0 | Same 920/919/0/1 unit result plus harness pass |
 
-## Deviations from Design
+## Changed-Line Evidence
 
-1. **Overlay field grouping** (bug found and fixed during GREEN, not a design deviation but worth recording): the mirrored `start.schema.json`'s `dependentRequired` binds `base_tree<->candidate_tree` and `target_mode<->target_identity` as two **independent** pairs (target_mode/target_identity additionally require base_tree+candidate_tree present, but base_tree/candidate_tree can appear alone — e.g. when `selected_lenses` is non-empty). My first implementation incorrectly bundled all four fields as one all-or-nothing group (copying v1's simpler pattern, where only the workspace-overlay 4-field bundle exists). Fixed before considering GREEN complete; the real fixture (`start.fixture.json`, which has `base_tree`/`candidate_tree` but no `target_mode`/`target_identity`) exposed this immediately.
-2. **`decodeEligibility` correction beyond v1**: v1's `decodeEligibility` only accepted `disposition`/`binding` for `review.recover`, but the mirrored `status-v2.schema.json`'s `action_eligibility` definition (which v2's `status.schema.json` also `$ref`s) requires `disposition`+`binding` for **both** `review.recover` and `review.retry_final_verification`. This looks like a latent gap in the ported v1 decoder. Fixed in v2 to match the mirrored schema faithfully, since v2 has a first-class `retry_final_verification` status action.
-3. **`decodeFailureContext` extended beyond v1**: v1's `decodeFailureContext` only ever implemented the `scope_change` branch, even though the mirrored `gate_context` `$defs` is `oneOf [scope_change, binding_revision]`. v2's decoder implements both branches so a legitimate `binding_revision` failure payload (used by bind-sdd replay flows) is not silently rejected.
-4. **`FAILURE_NEXT_ACTIONS` includes `review.repair`**: v1's lib-level constant was missing `review.repair` even though the mirrored v1 schema's `next_action` enum includes it. v2's `FAILURE_NEXT_ACTIONS` includes it, matching the schema v2 `$ref`s directly.
-5. **No decoder for `admitted-result/v2`**: per design, this schema gets a `REQUIRED_SCHEMAS` entry (string literal, free) but no decoder — Pi has no call site consuming a provider-admitted reviewer result in this stage. Matches design exactly.
+Correction diff excluding the preserved untracked historical verify report: 723 additions + 91 deletions = **814 changed lines**, under the accepted 1200-line size exception.
 
-None of these deviate from `design.md`'s intent; items 2–4 are corrections of latent v1 gaps discovered while porting against the mirrored schemas, made because a v2 decoder that silently drops a legitimate provider payload is exactly the failure mode `design.md` calls out as highest-risk.
+## Deviations and Risks
 
-## Issues Found
-
-None blocking. See Deviations above for the one implementation bug (found and fixed within this batch, before GREEN was called done).
-
-## Remaining Tasks
-
-- [ ] Phase 2 (2.1–2.2): correction lifecycle (pure) — `lib/review-correction-lifecycle.ts`
-- [ ] Phase 3 (3.1–3.7): candidate-view manifest binding — `lib/review-candidate-view.ts`
-- [ ] Phase 4 (4.1–4.7): loud-skip gate — `tests/support/native-binary-gate.ts`
-- [ ] Phase 5 (5.1–5.2): package-files reconciliation — `scripts/verify-package-files.mjs`
-- [ ] Phase 6 (6.1): docs
-- [ ] Phase 7 (7.1): Stage 1 close-out verification
-- [ ] Stage 2 (Phases 8–12): RELEASE-GATED, blocked on gentle-ai v2.2.1 publish + pin
-
-## Workload / PR Boundary
-
-- Mode: `size:exception` (accepted per tasks.md forecast, 1200-line review budget)
-- Current work unit: Unit 1 — Stage 1 (this batch covers only its Phase 1 slice)
-- Boundary: This batch starts from a clean Stage-1-untouched tree and ends with `lib/review-integration-v2.ts` + `tests/review-integration-v2.test.ts` created, additive-only, `pnpm test` green, `pnpm run check:transaction-runner` untouched-green.
-- Estimated review budget impact: ~1,050 changed lines added this batch (test file ~360 lines, lib file ~690 lines) — within the accepted 1200-line `size:exception` budget for the full Stage 1 + Stage 2 PR; more Stage 1 phases remain to be added before Stage 2.
+- No specification was weakened. The wrapper adds `final_verification_outcome` because the old boolean could not represent `procedural_tooling_failed`; legacy boolean callers still map `true → passed` and `false → verification_failed`.
+- Provider manifest canonicalization remains provider-owned. Pi enforces the provider hash across all collect inputs/artifact subjects and verifies every manifest field against Git; it does not fabricate a second canonicalization algorithm.
+- Distinct evidence identity is enforced for repeated captures within the active Pi controller. Provider-owned immutable storage remains the cross-process source of truth.
+- No generated runtime source changed, so regeneration was unnecessary and the required `--check` gate passed.
 
 ## Status
 
-8/8 Phase 1 tasks complete (1.1–1.8). 0/34 remaining Stage 1 + Stage 2 tasks (Phases 2–12) started. Ready for next batch (Phase 2: correction lifecycle) or `sdd-verify` if the orchestrator wants to checkpoint Phase 1 alone first.
+All four corrective objectives are complete. The implementation is ready for a fresh `sdd-verify`; the existing failed `verify-report.md` remains historical evidence and was not rewritten.

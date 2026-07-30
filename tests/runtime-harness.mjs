@@ -470,6 +470,45 @@ async function run() {
 		await rm(candidateDriftCwd, { recursive: true, force: true });
 	}
 
+	// Corrective v2 lifecycle settling test: the real controller must call the
+	// native evidence surface before it accepts a targeted-validation document.
+	// This is intentionally controller-level rather than a pure resolver test;
+	// the ordered call trace proves production wiring and the fail-closed gate.
+	const correctionCwd = await tempWorkspace();
+	try {
+		const { createGentleAiExtension } = await import(pathToFileURL(join(ROOT, "extensions/gentle-ai.ts")).href);
+		const { CandidateViewRegistry } = await import(pathToFileURL(join(ROOT, "lib/review-candidate-view.ts")).href);
+		gitSync(correctionCwd, "init", "-b", "main");
+		await writeFile(join(correctionCwd, "app.ts"), "export const value = 1;\n");
+		gitSync(correctionCwd, "add", "app.ts");
+		gitSync(correctionCwd, "-c", "user.name=Runtime Harness", "-c", "user.email=runtime-harness@example.invalid", "commit", "-m", "base");
+		await writeFile(join(correctionCwd, "app.ts"), "export const value = 2;\n");
+		const frozen = new CandidateViewRegistry().create({ contributorRoot: correctionCwd });
+		const sha = (digit) => `sha256:${digit.repeat(64)}`;
+		const repair = { schema: "gentle-ai.review-authority-repair-assessment/v1", status: "unsupported", counts: { lineages: 0, compactLineages: 0, legacyLineages: 0, events: 0, bytes: 0, eligibleCandidates: 0, unsupportedLineages: 0, conflicts: 0 }, supportedOperations: ["review/complete-fix", "review/validate-fix"], authorizationSchema: "gentle-ai.review-repair-authorization/v1" };
+		const projection = { schema: "gentle-ai.review-integration.projection/v1", kind: "current-changes", projection: "workspace", baseTree: frozen.baseTree, initialReviewTree: frozen.candidateTree, currentCandidateTree: frozen.candidateTree, pathsDigest: sha("a"), paths: frozen.paths, intendedUntracked: [], intendedUntrackedProof: sha("b"), initialSnapshotIdentity: sha("c"), currentSnapshotIdentity: sha("c") };
+		const status = { contract: "gentle-ai.review-integration/v2", applicability: "current_target", authority: { version: "compact-v2", lineageId: "runtime-correction", state: "correction_required", generation: 1, revision: sha("d") }, receipt: { status: "expected_missing" }, action: "finalize", replayability: "not_replayable", frozen: { tier: "medium", originalChangedLines: 1, correctionBudget: 1 }, targetIdentity: sha("e"), projection, repair, candidates: [], nextTransition: { kind: "collect", reasonCode: "verification_evidence_required", collect: { inputs: [{ name: "verification_evidence", schema: "gentle-ai.review-verification-evidence/v2", captureOperation: "review.capture-evidence", arguments: [{ name: "lineage", value: "runtime-correction" }] }] } }, raw: {} };
+		const validationRequest = { schema: "gentle-ai.review-targeted-validation-request/v1", requestHash: sha("f"), lineageId: "runtime-correction", expectedRevision: sha("d"), targetIdentity: sha("e"), fixFindingIds: [], projection: "workspace", correctionCandidateTree: frozen.candidateTree, correctionTargetIdentity: sha("e"), correctionPaths: frozen.paths, correctionPathsDigest: sha("a") };
+		const afterCapture = { ...status, authority: { ...status.authority, state: "validating" }, validationRequest, nextTransition: { kind: "collect", reasonCode: "targeted_validation_required", collect: { inputs: [{ name: "targeted_validation", schema: validationRequest.schema, captureOperation: "external.run_targeted_validation", arguments: [{ name: "lineage", value: "runtime-correction" }], validationRequest }] } } };
+		frozen.cleanup();
+		const calls = [];
+		let statuses = 0;
+		const nativeReviewCli = {
+			async targetStatus() { calls.push("status"); statuses += 1; return statuses === 1 ? status : afterCapture; },
+			async captureEvidence(request) { calls.push("capture-evidence"); return { schema: "gentle-ai.review-verification-evidence/v2", version: 2, lineageId: "runtime-correction", authorityRevision: sha("d"), targetIdentity: sha("e"), candidateTree: frozen.candidateTree, pathsDigest: sha("a"), paths: frozen.paths, ledgerIds: [], rawPayloadSha256: sha("1"), rawPayloadBytes: request.evidenceDocument.length, outcome: "passed", recordDigest: sha("2") }; },
+			async finalize() { calls.push("finalize"); return { lineageId: "runtime-correction", state: "approved", action: "approved", storeRevision: sha("3") }; },
+			async start() { throw new Error("not expected"); }, async validate() { throw new Error("not expected"); }, async bindSdd() { throw new Error("not expected"); }, async sddStatus() { return { ready: false }; }, async reviewStatus() { throw new Error("not expected"); },
+		};
+		const correctionPi = createPi();
+		createGentleAiExtension({ nativeReviewCli, candidateViews: new CandidateViewRegistry() })(correctionPi.pi);
+		const controller = correctionPi.tools.get("gentle_review");
+		const response = await controller.execute("runtime-correction", { operation: "finalize", lineageId: "runtime-correction", input: JSON.stringify({ final_evidence: "focused verification passed", final_verification_outcome: "passed", validation: { request_hash: "f".repeat(64), correction_ids: [], original_criteria: { passed: true, evidence: ["acceptance passes"] }, correction_regression: { passed: true, evidence: ["regression passes"] }, fix_caused_findings: [], follow_ups: [] } }) }, undefined, undefined, createCtx(correctionCwd));
+		assert.deepEqual(calls, ["status", "capture-evidence", "status", "finalize"]);
+		assert.equal(response.details.result.state, "approved");
+	} finally {
+		await rm(correctionCwd, { recursive: true, force: true });
+	}
+
 	// Task 11.2 (migrate-review-integration-v2): an unimplemented
 	// next_transition.execute.operation (e.g. a future "dispose-result") must
 	// raise a typed, named unsupported-transition-operation refusal and stop —
