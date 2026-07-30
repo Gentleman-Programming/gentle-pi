@@ -4412,13 +4412,14 @@ interface NativePreCommitReceiptConsumption {
 async function consumeNativePreCommitReceipt(
 	command: string,
 	defaultCwd: string,
+	derivedTarget: DerivedReviewGateTarget,
 	nativeReviewCli: NativeReviewCli,
 	publicationProbe: PublicationProbe,
 	publicationProbeTimeoutMs: number,
 	signal?: AbortSignal,
 ): Promise<NativePreCommitReceiptConsumption> {
 	const derived = await deriveNativePublicationTarget(
-		deriveReviewGateTarget(command, defaultCwd),
+		derivedTarget,
 		publicationProbe,
 		publicationProbeTimeoutMs,
 		signal,
@@ -6084,10 +6085,19 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 		}
 		let unmanagedPreCommit = false;
 		if (inspection.command?.event === "pre-commit" && commandAuthorizationKey !== undefined && nativeCommitAuthorization === undefined && nativeReviewCli !== null) {
+			let derived: DerivedReviewGateTarget;
+			try {
+				derived = deriveReviewGateTarget(originalCommand, ctx.cwd);
+			} catch (error) {
+				return {
+					block: true,
+					reason: `Gentle AI pre-commit gate could not exactly derive the command target and failed closed: ${error instanceof Error ? error.message : String(error)}`,
+				};
+			}
 			const deadline = AbortSignal.timeout(bashTimeRevalidationTimeoutMs);
 			const signal = ctx.signal === undefined ? deadline : AbortSignal.any([ctx.signal, deadline]);
 			try {
-				const consumed = await consumeNativePreCommitReceipt(originalCommand, ctx.cwd, nativeReviewCli, publicationProbe, publicationProbeTimeoutMs, signal);
+				const consumed = await consumeNativePreCommitReceipt(originalCommand, ctx.cwd, derived, nativeReviewCli, publicationProbe, publicationProbeTimeoutMs, signal);
 				nativeCommitAuthorization = consumed.authorization;
 				unmanagedPreCommit = consumed.delivery === "disabled/unmanaged";
 				authorizationConsumptionIdentity = nativeAuthorizationConsumptionIdentity(nativeCommitAuthorization);
