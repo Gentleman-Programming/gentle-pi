@@ -58,7 +58,7 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | **Skill creation workflow**    | Provides the `gentle-ai-skill-creator`/`gentle-ai-skill-improver` skills, `/skill-creation` prompt, and packaged style guide for LLM-first skills. |
 | **Delivery skills**            | Includes issue-first PRs, chained PRs, work-unit commits, cognitive docs, comment writing, and Judgment Day review.                           |
 | **Bounded native review**      | Freezes one candidate, dispatches only controller-selected lenses, records native authority, and reuses the same content-bound receipt at delivery gates. |
-| **Verified native runtime**    | Provisions the exact package-local Gentle AI v2.2.1 binary, verifies pinned archive/binary integrity, negotiates `review-integration/v1` today, and rejects PATH, global, sibling, symlink, and mode fallbacks. `review-integration/v2`'s immutable `base_tree`/`candidate_tree` transport is staged for a separate release-gated cutover (see [Native Authority Architecture](docs/native-authority-architecture.md)). |
+| **Verified native runtime**    | Provisions package-local Gentle AI v2.2.2 from signed release assets on macOS/Linux or pinned source on Windows x64, and rejects global, sibling, symlink, and identity fallbacks. |
 | **Runtime safety**             | Blocks destructive shell commands, asks for confirmation for sensitive operations, and blocks direct read/write/edit access to sensitive paths. |
 
 ## Install
@@ -79,7 +79,7 @@ pi install npm:gentle-pi@0.14.0
 pi install npm:gentle-pi@latest
 ```
 
-The latest RDD package downloads its pinned platform-specific Gentle AI binary into the package's private `.gentle-ai/` directory and verifies archive and executable SHA-256 values before extraction. It never uses `PATH` or a global `gentle-ai` installation. For development or offline installs only, set `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1`; native review operations then fail closed with an actionable `package-local-binary-missing` error until the package is reinstalled normally.
+The latest RDD package installs Gentle AI into the package's private `.gentle-ai/` directory and never accepts a global `gentle-ai` executable. macOS and Linux use pinned signed release assets and verify archive and executable SHA-256 values. Windows x64 requires a trusted local Go 1.25.10 or newer: postinstall downloads the exact `github.com/gentleman-programming/gentle-ai/v2@v2.2.2` module, verifies its pinned Go module checksum, and builds it with `GOTOOLCHAIN=local` so Go cannot silently download another toolchain. If Go is not discoverable through a safe absolute `go.exe` on `PATH`, set `GENTLE_PI_GO` to an absolute local `go.exe` path. The resulting local bytes are recorded in the package-local source manifest and rechecked before every use; package upgrades remain owned by `gentle-pi`, and the locally built executable has no release updater trust key, so Gentle AI self-update fails closed. For development or offline installs only, set `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1`; native review operations then fail closed with an actionable `package-local-binary-missing` error until the package is reinstalled normally.
 
 Recommended companion packages:
 

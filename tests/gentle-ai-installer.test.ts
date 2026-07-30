@@ -3,13 +3,15 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { chmod, mkdtemp, mkdir, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
 	GENTLE_AI_PENDING_DIGEST,
+	GENTLE_AI_GO_MODULE,
+	GENTLE_AI_GO_MODULE_SUM,
 	GENTLE_AI_RELEASE_ASSETS,
 	downloadGentleAiAsset,
 	installGentleAi,
@@ -69,23 +71,95 @@ test("release digests are all-or-none and install fails closed while any digest 
 	}
 });
 
-test("win32 is rejected with the same clear error as any other unsupported platform", () => {
+test("release asset resolution rejects Windows while the installer selects its separate source route", () => {
 	// v2.2.2 publishes no Windows archive, so there is nothing honest to
 	// resolve. Failing here, by name, beats resolving an asset that would 404
 	// at download time and blame the network for a packaging decision.
 	for (const arch of ["x64", "arm64"]) {
-		assert.throws(() => resolveGentleAiReleaseAsset("win32", arch), /unsupported Gentle AI platform\/architecture/);
-		assert.throws(() => resolveGentleAiReleaseAsset("windows", arch), /unsupported Gentle AI platform\/architecture/);
+		assert.throws(() => resolveGentleAiReleaseAsset("win32", arch), /unsupported Gentle AI release asset platform\/architecture/);
+		assert.throws(() => resolveGentleAiReleaseAsset("windows", arch), /unsupported Gentle AI release asset platform\/architecture/);
 	}
+});
+
+async function windowsGoFixture(t: test.TestContext, overrides: { version?: string; download?: string; failBuild?: boolean } = {}) {
+	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-windows-source-"));
+	const source = join(packageRoot, "module-source");
+	const go = join(packageRoot, "go.exe");
+	await mkdir(source);
+	await writeFile(go, "go fixture");
+	const calls: Array<{ file: string; arguments: string[]; options: Record<string, unknown> }> = [];
+	const execFile = async (file: string, arguments_: string[], options: Record<string, unknown>) => {
+		calls.push({ file, arguments: arguments_, options });
+		if (arguments_[0] === "version") return { stdout: overrides.version ?? "go version go1.25.10 windows/amd64\n", stderr: "" };
+		if (arguments_[0] === "mod") return { stdout: overrides.download ?? JSON.stringify({ Path: GENTLE_AI_GO_MODULE, Version: "v2.2.2", Dir: source, Sum: GENTLE_AI_GO_MODULE_SUM }), stderr: "" };
+		if (overrides.failBuild) throw new Error("build failed");
+		await writeFile(arguments_[arguments_.indexOf("-o") + 1], "locally built executable");
+		return { stdout: "", stderr: "" };
+	};
+	t.after(async () => rm(packageRoot, { recursive: true, force: true }));
+	return { packageRoot, go, calls, execFile };
+}
+
+test("Windows x64 builds the pinned module with a local Go toolchain and source manifest", async (t) => {
+	const fixture = await windowsGoFixture(t);
+	const result = await installGentleAi({ packageRoot: fixture.packageRoot, platform: "win32", arch: "x64", env: { GENTLE_PI_GO: fixture.go }, execFile: fixture.execFile });
+	assert.equal(await readFile(result.binaryPath, "utf8"), "locally built executable");
+	const manifest = JSON.parse(await readFile(join(dirname(result.binaryPath), "integrity.json"), "utf8"));
+	assert.deepEqual(Object.keys(manifest), ["version", "provenance", "module", "moduleVersion", "moduleSum", "goVersion", "binarySha256"]);
+	assert.equal(manifest.moduleSum, GENTLE_AI_GO_MODULE_SUM);
+	assert.deepEqual(fixture.calls.map((call) => call.arguments), [
+		["version"],
+		["mod", "download", "-json", `${GENTLE_AI_GO_MODULE}@v2.2.2`],
+		["build", "-mod=readonly", "-trimpath", "-buildvcs=false", "-ldflags", "-s -w -X main.version=2.2.2", "-o", fixture.calls[2].arguments[7], "./cmd/gentle-ai"],
+	]);
+	for (const call of fixture.calls) {
+		assert.equal(call.file, fixture.go);
+		assert.equal(call.options.shell, false);
+		assert.equal(call.options.windowsHide, true);
+		assert.equal((call.options.env as Record<string, string>).GOTOOLCHAIN, "local");
+		assert.equal((call.options.env as Record<string, string>).GOWORK, "off");
+		assert.equal((call.options.env as Record<string, string>).CGO_ENABLED, "0");
+	}
+	assert.equal((await installGentleAi({ packageRoot: fixture.packageRoot, platform: "win32", arch: "x64", env: { GENTLE_PI_GO: fixture.go }, execFile: fixture.execFile })).installed, false);
+	await writeFile(result.binaryPath, "tampered");
+	assert.equal((await installGentleAi({ packageRoot: fixture.packageRoot, platform: "win32", arch: "x64", env: { GENTLE_PI_GO: fixture.go }, execFile: fixture.execFile })).installed, true);
+	assert.equal(await readFile(result.binaryPath, "utf8"), "locally built executable");
+	assert.deepEqual((await readdir(dirname(result.binaryPath))).filter((entry) => entry.endsWith(".bak") || entry.endsWith(".tmp")), []);
+});
+
+test("Windows source installation rejects unsafe or old Go and malformed or mismatched module metadata", async (t) => {
+	const unsafe = await windowsGoFixture(t);
+	await assert.rejects(() => installGentleAi({ packageRoot: unsafe.packageRoot, platform: "win32", arch: "x64", env: { GENTLE_PI_GO: "go.exe" }, execFile: unsafe.execFile }), /absolute local path/);
+	for (const [overrides, expected] of [
+		[{ version: "go version go1.25.9 windows/amd64\n" }, /requires Go 1\.25\.10/],
+		[{ download: "{" }, /malformed JSON/],
+		[{ download: JSON.stringify({ Path: GENTLE_AI_GO_MODULE, Version: "v2.2.2", Dir: unsafe.packageRoot, Sum: "h1:wrong" }) }, /checksum mismatch/],
+	] as const) {
+		const fixture = await windowsGoFixture(t, overrides);
+		await assert.rejects(() => installGentleAi({ packageRoot: fixture.packageRoot, platform: "win32", arch: "x64", env: { GENTLE_PI_GO: fixture.go }, execFile: fixture.execFile }), expected);
+		assert.equal(existsSync(join(fixture.packageRoot, ".gentle-ai", "v2.2.2", "gentle-ai.exe")), false);
+		assert.deepEqual((await readdir(fixture.packageRoot)).filter((entry) => entry.startsWith(".gentle-ai-install-")), []);
+	}
+});
+
+test("Windows build failure cleans temporary state and never promotes a partial executable", async (t) => {
+	const fixture = await windowsGoFixture(t, { failBuild: true });
+	await assert.rejects(() => installGentleAi({ packageRoot: fixture.packageRoot, platform: "win32", arch: "x64", env: { GENTLE_PI_GO: fixture.go }, execFile: fixture.execFile }), /build failed/);
+	assert.equal(existsSync(join(fixture.packageRoot, ".gentle-ai", "v2.2.2", "gentle-ai.exe")), false);
+	assert.deepEqual((await readdir(fixture.packageRoot)).filter((entry) => entry.startsWith(".gentle-ai-install-")), []);
 });
 
 test("unsupported platform pairs fail clearly before download", () => {
 	for (const [platform, arch] of [["freebsd", "x64"], ["linux", "ia32"], ["darwin", "ppc64"]]) {
-		assert.throws(() => resolveGentleAiReleaseAsset(platform, arch), /unsupported Gentle AI platform\/architecture/);
+		assert.throws(() => resolveGentleAiReleaseAsset(platform, arch), /unsupported Gentle AI release asset platform\/architecture/);
 	}
 });
 
-test("extractors use only absolute trusted system paths, never lifecycle PATH or SystemRoot", () => {
+test("extractors use only absolute trusted system paths, never lifecycle PATH or SystemRoot", (t) => {
+	if (process.platform === "win32") {
+		t.skip("POSIX path simulation is not meaningful with Windows path semantics");
+		return;
+	}
 	const extractor = trustedSystemExtractor("archive.tar.gz", "linux", (path) => path === "/usr/bin/tar");
 	assert.equal(extractor.command, "/usr/bin/tar");
 	assert.ok(extractor.command.startsWith("/"));
@@ -169,8 +243,8 @@ test("installer promotes only the expected regular executable with executable PO
 	const binary = join(packageRoot, ".gentle-ai", "v2.2.2", "gentle-ai");
 	assert.equal(existsSync(binary), true);
 	assert.equal(await readFile(binary, "utf8"), "native executable");
-	assert.ok(((await stat(binary)).mode & 0o111) !== 0);
-	assert.equal((await installGentleAi({ packageRoot, platform: "linux", arch: "x64", releaseAssets: { "linux/amd64": asset } })).installed, false);
+	if (process.platform !== "win32") assert.ok(((await stat(binary)).mode & 0o111) !== 0);
+	if (process.platform !== "win32") assert.equal((await installGentleAi({ packageRoot, platform: "linux", arch: "x64", releaseAssets: { "linux/amd64": asset } })).installed, false);
 });
 
 test("installer rejects an extracted binary that differs from its pinned digest", async () => {

@@ -301,6 +301,10 @@ async function main() {
     console.error("gentle-pi package-local Gentle AI version pins are not both v2.2.2.");
     process.exit(1);
   }
+  if (!installer.includes('GENTLE_AI_GO_MODULE = "github.com/gentleman-programming/gentle-ai/v2"') || !installer.includes('GENTLE_AI_GO_MODULE_SUM = "h1:YZcI5dRvoHm82I2CULvgBkB2M3UQQGarYO/u/Nt5LSc="')) {
+    console.error("gentle-pi Windows source installation module identity is not pinned.");
+    process.exit(1);
+  }
 
   console.log(`gentle-pi package resource check passed (${requiredPaths.length} files; ${Object.keys(contractHashes).length} exact byte-identical v2.2.2 contract artifacts).`);
 }

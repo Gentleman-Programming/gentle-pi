@@ -2,7 +2,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { resolveGentleAiReleaseAsset } from "../scripts/gentle-ai-installer.mjs";
+import { GENTLE_AI_GO_MODULE, GENTLE_AI_GO_MODULE_SUM, resolveGentleAiReleaseAsset } from "../scripts/gentle-ai-installer.mjs";
 import { fileURLToPath } from "node:url";
 
 export const GENTLE_AI_BINARY_MISSING_CODE = "package-local-binary-missing";
@@ -69,18 +69,21 @@ export function resolveGentleAiBinary(
 		assertRegularNonSymlink(manifestPath);
 		const before = lstatSync(binaryPath);
 		const manifest = JSON.parse(readFileSync(manifestPath, "utf8"))                           ;
-		const asset = resolveGentleAiReleaseAsset(platform, process.arch);
-		if (
-			Object.keys(manifest).length !== 4 ||
-			["version", "asset", "assetSha256", "binarySha256"].some((key) => !(key in manifest)) ||
-			manifest.version !== GENTLE_AI_VERSION ||
-			manifest.asset !== asset.name ||
-			manifest.assetSha256 !== asset.sha256 ||
-			typeof manifest.binarySha256 !== "string" ||
-			manifest.binarySha256 !== asset.binarySha256 ||
-			!/^[0-9a-f]{64}$/.test(manifest.binarySha256) ||
-			sha256(readBinary(binaryPath)) !== manifest.binarySha256
-		) throw new Error("invalid runtime integrity manifest");
+		const sourceManifest = platform === "win32" && Object.keys(manifest).length === 7
+			&& ["version", "provenance", "module", "moduleVersion", "moduleSum", "goVersion", "binarySha256"].every((key) => key in manifest)
+			&& manifest.version === GENTLE_AI_VERSION && manifest.provenance === "go-source"
+			&& manifest.module === GENTLE_AI_GO_MODULE && manifest.moduleVersion === `v${GENTLE_AI_VERSION}`
+			&& manifest.moduleSum === GENTLE_AI_GO_MODULE_SUM && typeof manifest.goVersion === "string"
+			&& /^\d+\.\d+\.\d+$/.test(manifest.goVersion);
+		let releaseManifest = false;
+		if (platform !== "win32") {
+			const asset = resolveGentleAiReleaseAsset(platform, process.arch);
+			releaseManifest = Object.keys(manifest).length === 4
+				&& ["version", "asset", "assetSha256", "binarySha256"].every((key) => key in manifest)
+				&& manifest.version === GENTLE_AI_VERSION && manifest.asset === asset.name
+				&& manifest.assetSha256 === asset.sha256 && manifest.binarySha256 === asset.binarySha256;
+		}
+		if (!(sourceManifest || releaseManifest) || typeof manifest.binarySha256 !== "string" || !/^[0-9a-f]{64}$/.test(manifest.binarySha256) || sha256(readBinary(binaryPath)) !== manifest.binarySha256) throw new Error("invalid runtime integrity manifest");
 		const after = lstatSync(binaryPath);
 		if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs) throw new Error("runtime replaced during verification");
 		assertPosixExecutable(binaryPath, platform);

@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import test from "node:test";
 import {
 	GENTLE_AI_BINARY_MISSING_CODE,
@@ -13,12 +13,13 @@ import {
 } from "../lib/gentle-ai-binary.ts";
 import { NativeReviewCliV213, createNativeReviewCli, type ExecFileAdapter } from "../lib/native-review-cli.ts";
 import { resolveGentleAiReleaseAsset } from "../scripts/gentle-ai-installer.mjs";
+import { GENTLE_AI_GO_MODULE, GENTLE_AI_GO_MODULE_SUM } from "../scripts/gentle-ai-installer.mjs";
 import { requireNativeBinary } from "./support/native-binary-gate.ts";
 
 const VERSION = { stdout: `gentle-ai ${GENTLE_AI_VERSION}\n`, stderr: "", exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false } as const;
 const RUNTIME_DIRECTORY = `v${GENTLE_AI_VERSION}`;
 const repoRuntimeBinary = join(import.meta.dirname, "..", ".gentle-ai", RUNTIME_DIRECTORY, process.platform === "win32" ? "gentle-ai.exe" : "gentle-ai");
-const releaseDigestsPinned = /^[0-9a-f]{64}$/.test(resolveGentleAiReleaseAsset(process.platform, process.arch).sha256);
+const releaseDigestsPinned = process.platform === "win32" || /^[0-9a-f]{64}$/.test(resolveGentleAiReleaseAsset(process.platform, process.arch).sha256);
 // These integrity tests need the published official binary; they skip while a
 // re-pinned release's archives and digest table are still pending.
 const nativeBinaryGate = requireNativeBinary({
@@ -30,6 +31,15 @@ if (!nativeBinaryGate.run) console.log(`gentle-ai-binary: ${nativeBinaryGate.rea
 const verifiedBinaryTest = nativeBinaryGate.run ? test : test.skip;
 
 async function writeVerifiedBinary(packageRoot: string, platform = process.platform): Promise<string> {
+	if (platform === "win32") {
+		const binaryPath = join(packageRoot, ".gentle-ai", RUNTIME_DIRECTORY, "gentle-ai.exe");
+		const source = join(import.meta.dirname, "..", ".gentle-ai", RUNTIME_DIRECTORY, "gentle-ai.exe");
+		await mkdir(join(packageRoot, ".gentle-ai", RUNTIME_DIRECTORY), { recursive: true });
+		await writeFile(binaryPath, readFileSync(source));
+		const binarySha256 = createHash("sha256").update(readFileSync(binaryPath)).digest("hex");
+		await writeFile(join(packageRoot, ".gentle-ai", RUNTIME_DIRECTORY, "integrity.json"), JSON.stringify({ version: GENTLE_AI_VERSION, provenance: "go-source", module: GENTLE_AI_GO_MODULE, moduleVersion: `v${GENTLE_AI_VERSION}`, moduleSum: GENTLE_AI_GO_MODULE_SUM, goVersion: "1.25.10", binarySha256 }));
+		return binaryPath;
+	}
 	const asset = resolveGentleAiReleaseAsset(platform, process.arch);
 	const binaryPath = join(packageRoot, ".gentle-ai", RUNTIME_DIRECTORY, asset.executable);
 	await mkdir(join(packageRoot, ".gentle-ai", RUNTIME_DIRECTORY), { recursive: true });
@@ -96,7 +106,11 @@ verifiedBinaryTest("runtime rejects malformed, unknown, wrong, and symlinked int
 	assert.throws(() => resolveGentleAiBinary(directoryRoot, process.platform), /package-local-binary-missing/);
 });
 
-verifiedBinaryTest("runtime rejects an arbitrary binary even when a forged manifest matches its digest", async () => {
+verifiedBinaryTest("runtime rejects an arbitrary release binary even when a forged manifest matches its digest", async (t) => {
+	if (process.platform === "win32") {
+		t.skip("Windows source builds pin source identity and the recorded local binary hash, not universal binary bytes");
+		return;
+	}
 	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-binary-forged-manifest-"));
 	const binaryPath = await writeVerifiedBinary(packageRoot);
 	const asset = resolveGentleAiReleaseAsset(process.platform, process.arch);
@@ -127,6 +141,34 @@ test("runtime fails closed when the package-local binary is missing", async () =
 			&& error.code === GENTLE_AI_BINARY_MISSING_CODE
 			&& error.message.includes("package-local-binary-missing"),
 	);
+});
+
+async function writeWindowsSourceBinary(packageRoot: string): Promise<string> {
+	const binaryPath = join(packageRoot, ".gentle-ai", RUNTIME_DIRECTORY, "gentle-ai.exe");
+	await mkdir(join(packageRoot, ".gentle-ai", RUNTIME_DIRECTORY), { recursive: true });
+	await writeFile(binaryPath, "windows source binary");
+	const binarySha256 = createHash("sha256").update("windows source binary").digest("hex");
+	await writeFile(join(packageRoot, ".gentle-ai", RUNTIME_DIRECTORY, "integrity.json"), JSON.stringify({ version: GENTLE_AI_VERSION, provenance: "go-source", module: GENTLE_AI_GO_MODULE, moduleVersion: `v${GENTLE_AI_VERSION}`, moduleSum: GENTLE_AI_GO_MODULE_SUM, goVersion: "1.25.10", binarySha256 }));
+	return binaryPath;
+}
+
+test("runtime pins and reuses a valid Windows source identity, then rejects manifest or binary tampering", async () => {
+	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-windows-runtime-"));
+	const binaryPath = await writeWindowsSourceBinary(packageRoot);
+	assert.equal(resolveGentleAiBinary(packageRoot, "win32"), binaryPath);
+	const manifestPath = join(dirname(binaryPath), "integrity.json");
+	const valid = JSON.parse(readFileSync(manifestPath, "utf8"));
+	for (const invalid of [
+		{ ...valid, module: "example.invalid/forged" },
+		{ ...valid, moduleSum: "h1:wrong" },
+		{ ...valid, asset: "fake.zip" },
+	]) {
+		writeFileSync(manifestPath, JSON.stringify(invalid));
+		assert.throws(() => resolveGentleAiBinary(packageRoot, "win32"), /package-local-binary-missing/);
+	}
+	writeFileSync(manifestPath, JSON.stringify(valid));
+	writeFileSync(binaryPath, "tampered");
+	assert.throws(() => resolveGentleAiBinary(packageRoot, "win32"), /package-local-binary-missing/);
 });
 
 verifiedBinaryTest("runtime rejects a valid but non-executable POSIX binary", async (t) => {

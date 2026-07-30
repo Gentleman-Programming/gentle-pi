@@ -18,9 +18,9 @@ import { requireNativeBinary } from "./support/native-binary-gate.ts";
 
 const execFileAsync = promisify(execFile);
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-// The parity suite exercises the published official binary; it skips while a
-// re-pinned release's archives and digest table are still pending, because the
-// pinned package-local binary cannot be installed or integrity-verified yet.
+// The parity suite exercises the integrity-verified package-local binary. On
+// Darwin/Linux that is the published release binary; Windows uses the pinned
+// source-build manifest and its recorded local binary digest.
 const resolvedBinary = (() => {
 	try {
 		return resolveGentleAiBinary(packageRoot, process.platform);
@@ -32,7 +32,7 @@ const nativeBinaryGate = requireNativeBinary({ resolvedBinary, digestsPinned: tr
 if (!nativeBinaryGate.run) console.log(`native-review-parity-runtime: ${nativeBinaryGate.reason}`);
 const test = nativeBinaryGate.run ? baseTest : baseTest.skip;
 const binary = resolvedBinary ?? "";
-const OFFICIAL_BINARY_SHA256 = resolveGentleAiReleaseAsset(process.platform, process.arch).binarySha256;
+const RELEASE_BINARY_SHA256 = process.platform === "win32" ? undefined : resolveGentleAiReleaseAsset(process.platform, process.arch).binarySha256;
 const REVIEWED_PATHS = ["tracked.txt", "initially-untracked.txt"] as const;
 // Golden captured by the clean external-artifact differential fixture for v2.1.3.
 // This is released runtime output, not a locally reconstructed authority digest.
@@ -204,7 +204,7 @@ async function finalizeEmptyReview(repository: string, artifacts: string, starte
 }
 
 test("official pinned package runtime authorizes an unchanged linked-view candidate and denies a changed staging tree", async (t) => {
-	assert.equal(createHash("sha256").update(await readFile(binary)).digest("hex"), OFFICIAL_BINARY_SHA256);
+	if (RELEASE_BINARY_SHA256 !== undefined) assert.equal(createHash("sha256").update(await readFile(binary)).digest("hex"), RELEASE_BINARY_SHA256);
 	assert.deepEqual(await run(binary, ["version"], packageRoot), { exitCode: 0, stdout: `gentle-ai ${GENTLE_AI_VERSION}\n`, stderr: "" });
 
 	const workspace = await mkdtemp(join(tmpdir(), "gentle-pi-v216-parity-"));
@@ -238,8 +238,8 @@ test("official pinned package runtime authorizes an unchanged linked-view candid
 	await run("git", ["read-tree", candidateTree], view);
 	await run("git", ["checkout-index", "--all", "--force"], view);
 
-	assert.equal((await readFile(join(view, "tracked.txt"), "utf8")), "candidate\n");
-	assert.equal((await readFile(join(view, "initially-untracked.txt"), "utf8")), "included\n");
+	assert.equal((await readFile(join(view, "tracked.txt"), "utf8")).replace(/\r\n/g, "\n"), "candidate\n");
+	assert.equal((await readFile(join(view, "initially-untracked.txt"), "utf8")).replace(/\r\n/g, "\n"), "included\n");
 	const started = JSON.parse((await run(binary, ["review", "start", "--cwd", view], view)).stdout) as ReviewStart;
 
 	const evidence = join(artifacts, "final-evidence.txt");
@@ -379,6 +379,10 @@ test("official pinned package runtime keeps frozen candidate lineages and receip
 });
 
 test("registered gentle_review START materializes a safe internal skill symlink before invoking native authority", async (t) => {
+	if (process.platform === "win32") {
+		t.skip("Git for Windows does not preserve this POSIX directory-symlink candidate shape");
+		return;
+	}
 	const workspace = await mkdtemp(join(tmpdir(), "gentle-pi-v215-symlink-candidate-"));
 	const repository = join(workspace, "repository");
 	t.after(async () => rm(workspace, { recursive: true, force: true }));

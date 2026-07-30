@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createWriteStream, existsSync } from "node:fs";
 import {
 	chmod,
@@ -19,11 +19,15 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+const MAX_GO_OUTPUT_BYTES = 1024 * 1024;
 const RELEASE_BASE_URL = "https://github.com/Gentleman-Programming/gentle-ai/releases/download/v2.2.2/";
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const DOWNLOAD_TIMEOUTS = { headers: 10_000, body: 30_000, attempts: 2, retryDelay: 100 };
 export const INSTALLER_VERSION = "2.2.2";
+export const GENTLE_AI_GO_MODULE = "github.com/gentleman-programming/gentle-ai/v2";
+export const GENTLE_AI_GO_MODULE_SUM = "h1:YZcI5dRvoHm82I2CULvgBkB2M3UQQGarYO/u/Nt5LSc=";
+export const GENTLE_AI_MINIMUM_GO_VERSION = "1.25.10";
 
 // Sentinel used while a re-pinned gentle-ai release is not yet published. A
 // sentinel digest can never match a real SHA-256, so installation fails closed,
@@ -62,8 +66,75 @@ function upstreamPlatform(platform) {
 export function resolveGentleAiReleaseAsset(platform = process.platform, architecture = process.arch, releaseAssets = GENTLE_AI_RELEASE_ASSETS) {
 	const key = `${upstreamPlatform(platform)}/${upstreamArchitecture(architecture)}`;
 	const resolved = releaseAssets[key];
-	if (!resolved) throw new Error(`unsupported Gentle AI platform/architecture: ${platform}/${architecture}; supported pairs are darwin, linux, or windows with x64 or arm64`);
+	if (!resolved) throw new Error(`unsupported Gentle AI release asset platform/architecture: ${platform}/${architecture}; supported release asset pairs are ${Object.keys(releaseAssets).join(", ")}`);
 	return resolved;
+}
+
+function safeWindowsExecutable(path) {
+	return typeof path === "string" && /^[A-Za-z]:\\[^\0\r\n"|<>*?]+\\go\.exe$/i.test(path) && win32.isAbsolute(path);
+}
+
+async function assertRegularNonSymlink(path, label) {
+	const details = await lstat(path);
+	if (!details.isFile() || details.isSymbolicLink()) throw new Error(`${label} must be a regular non-symlink file`);
+}
+
+async function resolveWindowsGo(env, run) {
+	const override = env.GENTLE_PI_GO;
+	if (override !== undefined) {
+		if (!safeWindowsExecutable(override)) throw new Error("GENTLE_PI_GO must be an absolute local path ending in go.exe");
+		await assertRegularNonSymlink(override, "GENTLE_PI_GO");
+		return override;
+	}
+	const where = "C:\\Windows\\System32\\where.exe";
+	await assertRegularNonSymlink(where, "System32 where.exe");
+	const result = await run(where, ["go.exe"], { shell: false, windowsHide: true, maxBuffer: MAX_GO_OUTPUT_BYTES, env });
+	const candidates = result.stdout.split(/\r?\n/u).filter(Boolean);
+	if (candidates.length === 0) throw new Error("Gentle AI Windows installation requires Go 1.25.10 or newer on PATH, or an absolute GENTLE_PI_GO override");
+	for (const candidate of candidates) {
+		if (!safeWindowsExecutable(candidate)) continue;
+		try { await assertRegularNonSymlink(candidate, "PATH go.exe"); return candidate; } catch { /* Try the next absolute PATH result. */ }
+	}
+	throw new Error("PATH did not resolve to a safe absolute go.exe");
+}
+
+function parseGoVersion(stdout) {
+	const match = /^go version go(\d+)\.(\d+)\.(\d+)(?:\s|$)/u.exec(stdout.trim());
+	if (!match) throw new Error("Unable to parse local Go version");
+	return { text: `${match[1]}.${match[2]}.${match[3]}`, parts: match.slice(1).map(Number) };
+}
+
+function versionAtLeast(actual, minimum) {
+	const expected = minimum.split(".").map(Number);
+	return actual.every((value, index) => value === expected[index] ? true : value > expected[index] || actual.slice(0, index).some((part, prior) => part > expected[prior]));
+}
+
+function parseDownloadedModule(stdout) {
+	let value;
+	try { value = JSON.parse(stdout); } catch { throw new Error("Go module download returned malformed JSON"); }
+	if (typeof value !== "object" || value === null || Array.isArray(value) || Object.keys(value).some((key) => !["Path", "Version", "Info", "GoMod", "Zip", "Dir", "Sum", "GoModSum", "Origin", "Reuse"].includes(key))) throw new Error("Go module download returned an unexpected JSON object");
+	if (value.Path !== GENTLE_AI_GO_MODULE || value.Version !== `v${INSTALLER_VERSION}` || value.Sum !== GENTLE_AI_GO_MODULE_SUM) throw new Error("Go module download identity or checksum mismatch");
+	if (typeof value.Dir !== "string" || !win32.isAbsolute(value.Dir) || /[\0\r\n]/u.test(value.Dir)) throw new Error("Go module download returned an unsafe source directory");
+	return value.Dir;
+}
+
+async function buildGentleAiForWindows({ temporaryDirectory, env, run }) {
+	const go = await resolveWindowsGo(env, run);
+	const goEnv = { ...env, GOTOOLCHAIN: "local", GOWORK: "off", CGO_ENABLED: "0" };
+	const versionResult = await run(go, ["version"], { shell: false, windowsHide: true, maxBuffer: MAX_GO_OUTPUT_BYTES, env: goEnv });
+	const goVersion = parseGoVersion(versionResult.stdout);
+	if (!versionAtLeast(goVersion.parts, GENTLE_AI_MINIMUM_GO_VERSION)) throw new Error(`Gentle AI Windows installation requires Go ${GENTLE_AI_MINIMUM_GO_VERSION} or newer; found ${goVersion.text}`);
+	const moduleVersion = `v${INSTALLER_VERSION}`;
+	const downloaded = await run(go, ["mod", "download", "-json", `${GENTLE_AI_GO_MODULE}@${moduleVersion}`], { shell: false, windowsHide: true, maxBuffer: MAX_GO_OUTPUT_BYTES, env: goEnv });
+	const sourceDirectory = parseDownloadedModule(downloaded.stdout);
+	const sourceBefore = await lstat(sourceDirectory);
+	if (!sourceBefore.isDirectory() || sourceBefore.isSymbolicLink()) throw new Error("Go module source must be a real directory");
+	const output = join(temporaryDirectory, `gentle-ai-${process.pid}-${Date.now()}-${randomBytes(8).toString("hex")}.exe`);
+	await run(go, ["build", "-mod=readonly", "-trimpath", "-buildvcs=false", "-ldflags", `-s -w -X main.version=${INSTALLER_VERSION}`, "-o", output, "./cmd/gentle-ai"], { cwd: sourceDirectory, shell: false, windowsHide: true, maxBuffer: MAX_GO_OUTPUT_BYTES, env: goEnv });
+	const sourceAfter = await lstat(sourceDirectory);
+	if (sourceBefore.dev !== sourceAfter.dev || sourceBefore.ino !== sourceAfter.ino || sourceBefore.mtimeMs !== sourceAfter.mtimeMs) throw new Error("Go module source changed during build");
+	await assertRegularNonSymlink(output, "built Gentle AI executable");
+	return { output, goVersion: goVersion.text };
 }
 
 export function resolveGentleAiInstallerPackageRoot() {
@@ -181,23 +252,52 @@ async function existingBinaryMatches(binaryPath, manifestPath, asset, platform) 
 			lstat(packageRuntimeDirectory), lstat(runtimeDirectory), lstat(binaryPath), lstat(manifestPath), readFile(manifestPath, "utf8"),
 		]);
 		const parsed = JSON.parse(manifest);
+		const releaseManifest = asset && Object.keys(parsed).length === 4
+			&& ["version", "asset", "assetSha256", "binarySha256"].every((key) => key in parsed)
+			&& parsed.asset === asset.name && parsed.assetSha256 === asset.sha256
+			&& (!asset.binarySha256 || parsed.binarySha256 === asset.binarySha256);
+		const sourceManifest = platform === "win32" && Object.keys(parsed).length === 7
+			&& ["version", "provenance", "module", "moduleVersion", "moduleSum", "goVersion", "binarySha256"].every((key) => key in parsed)
+			&& parsed.provenance === "go-source" && parsed.module === GENTLE_AI_GO_MODULE
+			&& parsed.moduleVersion === `v${INSTALLER_VERSION}` && parsed.moduleSum === GENTLE_AI_GO_MODULE_SUM
+			&& typeof parsed.goVersion === "string" && /^\d+\.\d+\.\d+$/u.test(parsed.goVersion);
 		return parent.isDirectory() && !parent.isSymbolicLink()
 			&& runtime.isDirectory() && !runtime.isSymbolicLink()
 			&& binary.isFile() && !binary.isSymbolicLink()
 			&& (platform === "win32" || (binary.mode & 0o111) !== 0)
 			&& manifestFile.isFile() && !manifestFile.isSymbolicLink()
 			&& typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-			&& Object.keys(parsed).length === 4
-			&& ["version", "asset", "assetSha256", "binarySha256"].every((key) => key in parsed)
 			&& parsed.version === INSTALLER_VERSION
-			&& parsed.asset === asset.name
-			&& parsed.assetSha256 === asset.sha256
+			&& (releaseManifest || sourceManifest)
 			&& typeof parsed.binarySha256 === "string"
 			&& /^[0-9a-f]{64}$/.test(parsed.binarySha256)
-			&& (!asset.binarySha256 || parsed.binarySha256 === asset.binarySha256)
+			&& (!asset?.binarySha256 || parsed.binarySha256 === asset.binarySha256)
 			&& parsed.binarySha256 === await sha256File(binaryPath);
 	} catch {
 		return false;
+	}
+}
+
+async function promoteWindowsRuntime(temporaryBinary, binaryPath, temporaryManifest, manifestPath) {
+	const nonce = `${process.pid}.${Date.now()}.${randomBytes(8).toString("hex")}`;
+	const backupBinary = `${binaryPath}.${nonce}.bak`;
+	const backupManifest = `${manifestPath}.${nonce}.bak`;
+	let binaryBackedUp = false;
+	let manifestBackedUp = false;
+	try {
+		if (existsSync(binaryPath)) { await rename(binaryPath, backupBinary); binaryBackedUp = true; }
+		if (existsSync(manifestPath)) { await rename(manifestPath, backupManifest); manifestBackedUp = true; }
+		await rename(temporaryBinary, binaryPath);
+		await rename(temporaryManifest, manifestPath);
+	} catch (error) {
+		await rm(binaryPath, { force: true }).catch(() => undefined);
+		await rm(manifestPath, { force: true }).catch(() => undefined);
+		if (binaryBackedUp) await rename(backupBinary, binaryPath).catch(() => undefined);
+		if (manifestBackedUp) await rename(backupManifest, manifestPath).catch(() => undefined);
+		throw error;
+	} finally {
+		await rm(backupBinary, { force: true }).catch(() => undefined);
+		await rm(backupManifest, { force: true }).catch(() => undefined);
 	}
 }
 
@@ -206,9 +306,10 @@ export async function installGentleAi(options = {}) {
 	const platform = options.platform ?? process.platform;
 	const arch = options.arch ?? process.arch;
 	const releaseAssets = options.releaseAssets ?? GENTLE_AI_RELEASE_ASSETS;
-	const asset = resolveGentleAiReleaseAsset(platform, arch, releaseAssets);
+	const windowsSourceBuild = platform === "win32" && arch === "x64";
+	const asset = windowsSourceBuild ? undefined : resolveGentleAiReleaseAsset(platform, arch, releaseAssets);
 	const installDirectory = join(packageRoot, ".gentle-ai", `v${INSTALLER_VERSION}`);
-	const binaryPath = join(installDirectory, asset.executable);
+	const binaryPath = join(installDirectory, windowsSourceBuild ? "gentle-ai.exe" : asset.executable);
 	const manifestPath = join(installDirectory, "integrity.json");
 	await assertRuntimeDirectory(join(packageRoot, ".gentle-ai"));
 	await assertRuntimeDirectory(installDirectory);
@@ -218,6 +319,27 @@ export async function installGentleAi(options = {}) {
 	const temporaryDirectory = await mkdtemp(join(packageRoot, ".gentle-ai-install-"));
 	try {
 		await chmod(temporaryDirectory, 0o700);
+		if (windowsSourceBuild) {
+			const run = options.execFile ?? execFileAsync;
+			const built = await buildGentleAiForWindows({ temporaryDirectory, env: options.env ?? process.env, run });
+			await mkdir(installDirectory, { recursive: true, mode: 0o700 });
+			await assertRuntimeDirectory(join(packageRoot, ".gentle-ai"));
+			await assertRuntimeDirectory(installDirectory);
+			const nonce = `${process.pid}.${Date.now()}`;
+			const temporaryBinary = join(installDirectory, `.gentle-ai.exe.${nonce}.tmp`);
+			const temporaryManifest = join(installDirectory, `.integrity.${nonce}.tmp`);
+			await copyFile(built.output, temporaryBinary);
+			await assertRegularNonSymlink(temporaryBinary, "temporary Gentle AI executable");
+			const binarySha256 = await sha256File(temporaryBinary);
+			await writeFile(temporaryManifest, `${JSON.stringify({ version: INSTALLER_VERSION, provenance: "go-source", module: GENTLE_AI_GO_MODULE, moduleVersion: `v${INSTALLER_VERSION}`, moduleSum: GENTLE_AI_GO_MODULE_SUM, goVersion: built.goVersion, binarySha256 })}\n`, { mode: 0o600 });
+			try {
+				await promoteWindowsRuntime(temporaryBinary, binaryPath, temporaryManifest, manifestPath);
+			} finally {
+				await rm(temporaryBinary, { force: true }).catch(() => undefined);
+				await rm(temporaryManifest, { force: true }).catch(() => undefined);
+			}
+			return { installed: true, binaryPath, asset: { provenance: "go-source", module: GENTLE_AI_GO_MODULE } };
+		}
 		const archive = join(temporaryDirectory, asset.name);
 		await (options.download ?? downloadGentleAiAsset)(asset.url, archive);
 		const digest = await sha256File(archive);
