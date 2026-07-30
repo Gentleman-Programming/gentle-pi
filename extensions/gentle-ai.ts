@@ -4326,10 +4326,31 @@ function assertFrozenPreCommitProjection(
 	return projection.candidateTree;
 }
 
+function reproveNativePreCommitTree(
+	derived: DerivedReviewGateTarget,
+	lineageId: string,
+	candidateViews: CandidateViewRegistry | null,
+): string | undefined {
+	return assertFrozenPreCommitProjection(derived, lineageId, candidateViews) ??
+		(derived.command.event === "pre-commit" ? derived.actualIntendedCommitTree : undefined);
+}
+
 function authorizationTargetHash(derived: DerivedReviewGateTarget): string {
 	return derived.nativePublication === undefined
 		? canonicalHash(derived.target)
 		: canonicalHash({ target: derived.target, native_publication: derived.nativePublication });
+}
+
+function nativeAuthorizationConsumptionIdentity(authorization: PendingReviewAuthorization | undefined): string | undefined {
+	if (authorization?.native_gate === undefined) return undefined;
+	return canonicalHash({
+		command_hash: authorization.command_hash,
+		target_hash: authorization.target_hash,
+		lineage_id: authorization.native_gate.lineage_id,
+		store_revision: authorization.native_gate.store_revision,
+		fingerprint: authorization.native_gate.fingerprint,
+		intended_tree: authorization.native_gate.intended_tree ?? null,
+	});
 }
 
 function assertNativePublicationBinding(result: NativeValidateResult, derived: DerivedReviewGateTarget): void {
@@ -4381,6 +4402,63 @@ async function rederiveNativePublicationTarget(
 	const fresh = await deriveNativePublicationTarget({ ...rederived, ...(expected.nativeRelease === undefined ? {} : { nativeRelease: expected.nativeRelease }) }, probe, timeoutMs, signal);
 	assertNativePublicationUnchanged(expected, fresh);
 	return fresh;
+}
+
+interface NativePreCommitReceiptConsumption {
+	authorization?: PendingReviewAuthorization;
+	delivery?: "disabled/unmanaged";
+}
+
+async function consumeNativePreCommitReceipt(
+	command: string,
+	defaultCwd: string,
+	nativeReviewCli: NativeReviewCli,
+	publicationProbe: PublicationProbe,
+	publicationProbeTimeoutMs: number,
+	signal?: AbortSignal,
+): Promise<NativePreCommitReceiptConsumption> {
+	const derived = await deriveNativePublicationTarget(
+		deriveReviewGateTarget(command, defaultCwd),
+		publicationProbe,
+		publicationProbeTimeoutMs,
+		signal,
+	);
+	if (derived.command.event !== "pre-commit" || derived.actualIntendedCommitTree === undefined) return {};
+	const result = await nativeReviewCli.validate({
+		cwd: derived.command.cwd,
+		gate: "pre-commit",
+		...(signal === undefined ? {} : { signal }),
+	});
+	assertNativePublicationBinding(result, derived);
+	const fresh = await rederiveNativePublicationTarget(
+		derived,
+		command,
+		defaultCwd,
+		publicationProbe,
+		publicationProbeTimeoutMs,
+		signal,
+	);
+	if (result.delivery === "disabled/unmanaged") return { delivery: result.delivery };
+	if (!result.allowed || result.result !== "allow") return {};
+	if (
+		result.gateContext.lineageId.length === 0 ||
+		result.gateContext.raw.candidate_tree !== derived.actualIntendedCommitTree ||
+		fresh.actualIntendedCommitTree !== derived.actualIntendedCommitTree
+	) throw new Error("Native approved receipt does not bind the exact current pre-commit tree");
+	const commandHash = reviewAuthorizationKey(command, fresh.command.cwd);
+	return {
+		authorization: {
+			command_hash: commandHash,
+			target_hash: authorizationTargetHash(fresh),
+			receipt_hash: null,
+			native_gate: {
+				lineage_id: result.gateContext.lineageId,
+				store_revision: result.gateContext.storeRevision,
+				fingerprint: nativeGateFingerprint(result, fresh),
+				intended_tree: derived.actualIntendedCommitTree,
+			},
+		},
+	};
 }
 
 interface NativeStartPolicyValidation {
@@ -5616,7 +5694,7 @@ async function gateLifecycleCommand(
 	try {
 		const intendedTree = authorization.native_gate === undefined
 			? undefined
-			: assertFrozenPreCommitProjection(derived, authorization.native_gate.lineage_id, candidateViews);
+			: reproveNativePreCommitTree(derived, authorization.native_gate.lineage_id, candidateViews);
 		if (authorization.native_gate?.intended_tree !== undefined && intendedTree !== authorization.native_gate.intended_tree) {
 			return {
 				block: true,
@@ -5672,7 +5750,7 @@ async function gateLifecycleCommand(
 				publicationProbeTimeoutMs,
 				signal,
 			);
-			const postNativeIntendedTree = assertFrozenPreCommitProjection(postNativeDerived, authorization.native_gate.lineage_id, candidateViews);
+			const postNativeIntendedTree = reproveNativePreCommitTree(postNativeDerived, authorization.native_gate.lineage_id, candidateViews);
 			if (authorization.native_gate.intended_tree !== undefined && postNativeIntendedTree !== authorization.native_gate.intended_tree) throw new CandidateViewError("staged projection changed during native validation");
 			assertNativePublicationBinding(fresh, postNativeDerived);
 			if (nativeGateFingerprint(fresh, postNativeDerived) !== authorization.native_gate.fingerprint) {
@@ -5833,6 +5911,7 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 	if (!Number.isSafeInteger(bashTimeRevalidationTimeoutMs) || bashTimeRevalidationTimeoutMs <= 0) throw new TypeError("Bash-time revalidation timeout must be a positive safe integer");
 	return function gentleAi(pi: ExtensionAPI): void {
 	const pendingReviewAuthorizations = new Map<string, PendingReviewAuthorization>();
+	const consumedNativeAuthorizations = new Set<string>();
 	const pendingCommitTransactions = new Map<string, { cwd: string; transactionId: string }>();
 	const correctionEvidenceByLineage = new Map<string, CorrectionEvidence>();
 	const candidateViews = dependencies.candidateViews === undefined ? new CandidateViewRegistry() : dependencies.candidateViews;
@@ -5991,12 +6070,41 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 			return undefined;
 		const originalCommand = event.input.command;
 		const inspection = inspectReviewLifecycleCommand(originalCommand, ctx.cwd);
-		const nativeCommitAuthorization = inspection.command?.event === "pre-commit"
-			? pendingReviewAuthorizations.get(reviewAuthorizationKey(originalCommand, inspection.command.cwd))
+		const commandAuthorizationKey = inspection.command?.event === "pre-commit"
+			? reviewAuthorizationKey(originalCommand, inspection.command.cwd)
 			: undefined;
+		let nativeCommitAuthorization = commandAuthorizationKey === undefined
+			? undefined
+			: pendingReviewAuthorizations.get(commandAuthorizationKey);
+		let authorizationConsumptionIdentity = nativeAuthorizationConsumptionIdentity(nativeCommitAuthorization);
+		if (authorizationConsumptionIdentity !== undefined && consumedNativeAuthorizations.has(authorizationConsumptionIdentity)) {
+			if (commandAuthorizationKey !== undefined) pendingReviewAuthorizations.delete(commandAuthorizationKey);
+			nativeCommitAuthorization = undefined;
+			authorizationConsumptionIdentity = undefined;
+		}
+		let unmanagedPreCommit = false;
+		if (inspection.command?.event === "pre-commit" && commandAuthorizationKey !== undefined && nativeCommitAuthorization === undefined && nativeReviewCli !== null) {
+			const deadline = AbortSignal.timeout(bashTimeRevalidationTimeoutMs);
+			const signal = ctx.signal === undefined ? deadline : AbortSignal.any([ctx.signal, deadline]);
+			try {
+				const consumed = await consumeNativePreCommitReceipt(originalCommand, ctx.cwd, nativeReviewCli, publicationProbe, publicationProbeTimeoutMs, signal);
+				nativeCommitAuthorization = consumed.authorization;
+				unmanagedPreCommit = consumed.delivery === "disabled/unmanaged";
+				authorizationConsumptionIdentity = nativeAuthorizationConsumptionIdentity(nativeCommitAuthorization);
+				if (authorizationConsumptionIdentity !== undefined && consumedNativeAuthorizations.has(authorizationConsumptionIdentity)) {
+					nativeCommitAuthorization = undefined;
+					authorizationConsumptionIdentity = undefined;
+				} else if (nativeCommitAuthorization !== undefined) {
+					pendingReviewAuthorizations.set(nativeCommitAuthorization.command_hash, nativeCommitAuthorization);
+				}
+			} catch (error) {
+				return { block: true, reason: `Gentle AI pre-commit receipt consumption failed closed: ${error instanceof Error ? error.message : String(error)}` };
+			}
+		}
 		const gateResult = await enforceReviewGateAndCommandSafety(
 			originalCommand,
 			(command) => {
+				if (unmanagedPreCommit) return Promise.resolve(undefined);
 				const deadline = AbortSignal.timeout(bashTimeRevalidationTimeoutMs);
 				const signal = ctx.signal === undefined ? deadline : AbortSignal.any([ctx.signal, deadline]);
 				return gateLifecycleCommand(command, ctx.cwd, pendingReviewAuthorizations, nativeReviewCli, publicationProbe, publicationProbeTimeoutMs, signal, candidateViews);
@@ -6004,6 +6112,7 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 			(command) => confirmCommand(command, ctx),
 		);
 		if (gateResult) return gateResult;
+		if (authorizationConsumptionIdentity !== undefined) consumedNativeAuthorizations.add(authorizationConsumptionIdentity);
 		if (inspection.command?.event !== "pre-commit" || nativeCommitAuthorization?.native_gate === undefined) return undefined;
 		if (nativeReviewCli?.targetStatus === undefined) return undefined;
 		if (nativeCommitAuthorization.native_gate.intended_tree === undefined) {

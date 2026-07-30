@@ -584,6 +584,49 @@ test("native projections reconstruct symlink, intended-untracked, and gitlink id
 	assert.deepEqual(projection.gitlinks, { "vendor/dependency": gitlinkCommit });
 });
 
+test("native staged projections restore the exact current index over HEAD", (t) => {
+	const contributorRoot = repository(t);
+	const baseTree = git(contributorRoot, "rev-parse", "HEAD^{tree}");
+	writeFileSync(join(contributorRoot, "tracked.txt"), "staged candidate\n");
+	git(contributorRoot, "add", "tracked.txt");
+	const candidateTree = git(contributorRoot, "write-tree");
+	const registry = new CandidateViewRegistry();
+
+	registry.restoreProjectionFromNative("staged-index-projection", contributorRoot, {
+		baseTree,
+		currentCandidateTree: candidateTree,
+		paths: ["tracked.txt"],
+		intendedUntracked: [],
+		projection: "staged",
+	});
+
+	const projection = registry.resolveProjection("staged-index-projection", contributorRoot);
+	assert.equal(projection.baseTree, baseTree);
+	assert.equal(projection.candidateTree, candidateTree);
+	assert.equal(projection.committedOnly, false);
+});
+
+test("native staged projections reject a workspace snapshot that differs from the current index", (t) => {
+	const contributorRoot = repository(t);
+	const baseTree = git(contributorRoot, "rev-parse", "HEAD^{tree}");
+	writeFileSync(join(contributorRoot, "tracked.txt"), "workspace candidate\n");
+	const workspace = new CandidateViewRegistry().create({ contributorRoot });
+	try {
+		assert.throws(
+			() => new CandidateViewRegistry().restoreProjectionFromNative("workspace-as-staged", contributorRoot, {
+				baseTree,
+				currentCandidateTree: workspace.candidateTree,
+				paths: ["tracked.txt"],
+				intendedUntracked: [],
+				projection: "staged",
+			}),
+			(error: unknown) => error instanceof CandidateViewError && error.reason === "projection-kind-drift",
+		);
+	} finally {
+		workspace.cleanup();
+	}
+});
+
 test("native projections recover a committed range base from its frozen tree", (t) => {
 	const contributorRoot = repository(t);
 	const baseCommit = git(contributorRoot, "rev-parse", "HEAD");

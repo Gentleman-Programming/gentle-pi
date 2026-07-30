@@ -10,7 +10,7 @@ import type {
 	Theme,
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
-import gentleAi, { __testing } from "../extensions/gentle-ai.ts";
+import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import { GATE_TARGET_KIND } from "../lib/review-publication-gate.ts";
 import {
 	REVIEW_MODE,
@@ -242,7 +242,7 @@ test("runtime lifecycle gates reject fabricated metadata while compound and wrap
 		registerCommand() {},
 		registerTool() {},
 	} as unknown as ExtensionAPI;
-	gentleAi(pi);
+	createGentleAiExtension({ nativeReviewCli: null })(pi);
 	const toolCall = handlers.get("tool_call");
 	assert.equal(typeof toolCall, "function");
 	const authority = runtimeAuthority(t);

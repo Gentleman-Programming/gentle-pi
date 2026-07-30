@@ -798,11 +798,15 @@ export class CandidateViewRegistry {
 		const base = head.tree === descriptor.baseTree ? head : resolveCandidateBaseTree(root, descriptor.baseTree, this.gitExecutor);
 		const committedOnly = head.tree === descriptor.currentCandidateTree && base.tree !== head.tree;
 		if (!committedOnly && head.tree !== descriptor.baseTree) throw new CandidateViewError("native projection base no longer matches HEAD");
-		// The descriptor's own `projection` label ("staged" = a committed range,
-		// "workspace" = dirty-inclusive) must agree with what Pi independently
-		// derives from the base/candidate/HEAD relationship. Neither trusting
-		// nor silently overriding a mislabeled claim is safe: fail closed.
-		if ((descriptor.projection === "staged") !== committedOnly) {
+		// Native `staged` covers both a committed HEAD range and the exact current
+		// index over HEAD. Re-derive the latter from Git instead of trusting the
+		// label; this also rejects dirty-inclusive snapshots mislabeled as staged.
+		const stagedIndex = !committedOnly && descriptor.baseTree === head.tree &&
+			git(root, ["write-tree"], process.env, this.gitExecutor) === descriptor.currentCandidateTree;
+		if (
+			(descriptor.projection === "staged" && !committedOnly && !stagedIndex) ||
+			(descriptor.projection === "workspace" && committedOnly)
+		) {
 			throw new CandidateViewError("native projection commit-state does not match its declared projection kind", "projection-kind-drift");
 		}
 		const tree = parseTree(root, descriptor.currentCandidateTree, this.gitExecutor);

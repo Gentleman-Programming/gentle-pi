@@ -287,6 +287,7 @@ function targetStatusFixture(options: {
 	baseTree?: string;
 	currentCandidateTree?: string;
 	paths?: readonly string[];
+	projection?: "workspace" | "staged";
 } = {}): ReviewStatusV3 {
 	const applicability = options.applicability ?? "current_target";
 	const action = options.action ?? (applicability === "current_target" ? "finalize" : applicability === "unrelated" ? "start" : applicability === "ambiguous" ? "select_lineage" : "repair_authority");
@@ -302,7 +303,7 @@ function targetStatusFixture(options: {
 	const projection = {
 		schema: "gentle-ai.review-integration.projection/v1" as const,
 		kind: "current-changes" as const,
-		projection: "workspace" as const,
+		projection: options.projection ?? "workspace",
 		baseTree,
 		initialReviewTree: tree,
 		currentCandidateTree: tree,
@@ -1896,7 +1897,181 @@ test("native allow registers one authorization and bash-time revalidation consum
 	assert.equal(await toolCall({ toolName: "bash", input: { command } }, interactiveContext(cwd)), undefined);
 	const replay = await toolCall({ toolName: "bash", input: { command } }, context(cwd)) as { block: boolean };
 	assert.equal(replay.block, true);
-	assert.equal(validates, 2);
+	assert.equal(validates, 3, "the replay discovers but cannot remint the consumed binding");
+});
+
+test("fresh pre-commit consumes an exact approved native receipt without START or projection restoration", async (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	git(cwd, "add", "--", "app.ts");
+	const tree = git(cwd, "write-tree");
+	let starts = 0;
+	const requests: Parameters<NativeReviewCli["validate"]>[0][] = [];
+	const { toolCall } = runtime(fakeNative({
+		start: async () => {
+			starts += 1;
+			throw new Error("an approved exact candidate must not start another review");
+		},
+		validate: async (request) => {
+			requests.push(request);
+			return { allowed: true, result: "allow", action: "continue", reason: "approved receipt binds the index", gateContext: nativeGateContext("approved-lineage", "r1", tree) };
+		},
+		targetStatus: async () => { throw new Error("approved receipt consumption must not reconstruct an unrelated projection"); },
+	}), undefined, undefined, undefined, new CandidateViewRegistry());
+	const command = "git commit -m approved";
+	const input = { command };
+
+	assert.equal(await toolCall({ toolName: "bash", input }, context(cwd)), undefined);
+	assert.equal(starts, 0);
+	assert.equal(requests.length, 2, "authorization and bash-time TOCTOU validation must both run");
+	assert.equal(requests[0]?.lineageId, undefined, "fresh receipt discovery is candidate-bound, not caller-selected");
+	assert.equal(requests[1]?.lineageId, "approved-lineage");
+	assert.notEqual(input.command, command, "the approved pre-commit must use the durable commit transaction");
+});
+
+test("a consumed native receipt binding cannot remint authorization for the same exact command", async (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	git(cwd, "add", "--", "app.ts");
+	const tree = git(cwd, "write-tree");
+	let validations = 0;
+	const { toolCall } = runtime(fakeNative({
+		validate: async () => {
+			validations += 1;
+			return { allowed: true, result: "allow", action: "continue", reason: "same approved receipt", gateContext: nativeGateContext("same-lineage", "same-revision", tree) };
+		},
+	}));
+	const command = "git commit -m same-binding";
+
+	assert.equal(await toolCall({ toolName: "bash", input: { command } }, context(cwd)), undefined);
+	const replayInput = { command };
+	const replay = await toolCall({ toolName: "bash", input: replayInput }, context(cwd)) as { block: boolean };
+	assert.equal(replay.block, true);
+	assert.equal(replayInput.command, command);
+	assert.equal(validations, 3, "the replay may discover the binding once but must not revalidate or authorize it");
+});
+
+test("a new approved candidate binding may authorize the same command and cwd later in the session", async (t) => {
+	const cwd = repository(t);
+	const command = "git commit -m reusable-command";
+	const requests: Parameters<NativeReviewCli["validate"]>[0][] = [];
+	const { toolCall } = runtime(fakeNative({
+		validate: async (request) => {
+			requests.push(request);
+			const tree = git(cwd, "write-tree");
+			const suffix = tree.slice(0, 8);
+			return { allowed: true, result: "allow", action: "continue", reason: "candidate-bound receipt", gateContext: nativeGateContext(`lineage-${suffix}`, `revision-${suffix}`, tree) };
+		},
+	}));
+	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	git(cwd, "add", "--", "app.ts");
+	const firstInput = { command };
+	assert.equal(await toolCall({ toolName: "bash", input: firstInput }, context(cwd)), undefined);
+	assert.notEqual(firstInput.command, command);
+
+	writeFileSync(join(cwd, "app.ts"), "export const value = 3;\n");
+	git(cwd, "add", "--", "app.ts");
+	const secondInput = { command };
+	assert.equal(await toolCall({ toolName: "bash", input: secondInput }, context(cwd)), undefined);
+	assert.notEqual(secondInput.command, command);
+	assert.equal(requests.length, 4);
+	assert.equal(requests[0]?.lineageId, undefined);
+	assert.equal(requests[1]?.lineageId?.startsWith("lineage-"), true);
+	assert.equal(requests[2]?.lineageId, undefined);
+	assert.equal(requests[3]?.lineageId?.startsWith("lineage-"), true);
+});
+
+test("a denied native discovery does not prevent a later valid receipt for the same command", async (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	git(cwd, "add", "--", "app.ts");
+	const tree = git(cwd, "write-tree");
+	let validations = 0;
+	const { toolCall } = runtime(fakeNative({
+		validate: async () => {
+			validations += 1;
+			return validations === 1
+				? { allowed: false, result: "scope-changed", action: "create-new-lineage", reason: "not approved yet", gateContext: nativeGateContext("", "denied", tree) }
+				: { allowed: true, result: "allow", action: "continue", reason: "now approved", gateContext: nativeGateContext("later-lineage", "later-revision", tree) };
+		},
+	}));
+	const command = "git commit -m later-approved";
+
+	assert.equal((await toolCall({ toolName: "bash", input: { command } }, context(cwd)) as { block: boolean }).block, true);
+	const approvedInput = { command };
+	assert.equal(await toolCall({ toolName: "bash", input: approvedInput }, context(cwd)), undefined);
+	assert.notEqual(approvedInput.command, command);
+	assert.equal(validations, 3);
+});
+
+test("a blocked bash-time native gate does not consume its receipt binding", async (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	git(cwd, "add", "--", "app.ts");
+	const tree = git(cwd, "write-tree");
+	let validations = 0;
+	const { toolCall } = runtime(fakeNative({
+		validate: async () => {
+			validations += 1;
+			if (validations === 2) return { allowed: false, result: "invalidated", action: "explicit-maintainer-action", reason: "transient authority block", gateContext: nativeGateContext("retry-lineage", "retry-revision", tree) };
+			return { allowed: true, result: "allow", action: "continue", reason: "approved", gateContext: nativeGateContext("retry-lineage", "retry-revision", tree) };
+		},
+	}));
+	const command = "git commit -m retry-binding";
+
+	assert.equal((await toolCall({ toolName: "bash", input: { command } }, context(cwd)) as { block: boolean }).block, true);
+	const retryInput = { command };
+	assert.equal(await toolCall({ toolName: "bash", input: retryInput }, context(cwd)), undefined);
+	assert.notEqual(retryInput.command, command);
+	assert.equal(validations, 4);
+});
+
+test("fresh pre-commit rejects an approved receipt for a different index tree", async (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	git(cwd, "add", "--", "app.ts");
+	let validations = 0;
+	const { toolCall } = runtime(fakeNative({
+		validate: async () => {
+			validations += 1;
+			return { allowed: true, result: "allow", action: "continue", reason: "stale receipt", gateContext: nativeGateContext("stale-lineage", "r1", "f".repeat(40)) };
+		},
+	}));
+	const command = "git commit -m stale";
+	const input = { command };
+
+	const result = await toolCall({ toolName: "bash", input }, context(cwd)) as { block: boolean; reason: string };
+	assert.equal(result.block, true);
+	assert.match(result.reason, /does not bind the exact current pre-commit tree/);
+	assert.equal(validations, 1);
+	assert.equal(input.command, command);
+});
+
+test("fresh pre-commit honors native disabled/unmanaged delivery without restoring stale authority", async (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	git(cwd, "add", "--", "app.ts");
+	let validations = 0;
+	const { toolCall } = runtime(fakeNative({
+		validate: async () => {
+			validations += 1;
+			return {
+				allowed: false,
+				result: "invalidated",
+				action: "repository-policy",
+				reason: "receipt-driven development is disabled",
+				gateContext: nativeGateContext("", "r1", git(cwd, "write-tree")),
+				delivery: "disabled/unmanaged",
+			};
+		},
+		targetStatus: async () => { throw new Error("disabled delivery must not restore stale authority"); },
+	}));
+	const command = "git commit -m unmanaged";
+	const input = { command };
+
+	assert.equal(await toolCall({ toolName: "bash", input }, context(cwd)), undefined);
+	assert.equal(validations, 1);
+	assert.equal(input.command, command, "unmanaged delivery must remain an ordinary repository command");
 });
 
 test("native VALIDATE delivery disabled/unmanaged renders as a successful skipped envelope before the maintainer-exception check, minting no authorization", async (t) => {
@@ -1965,7 +2140,7 @@ test("native pre-commit after reload delegates exact-tree validation when no loc
 			validations += 1;
 			return { allowed: true, result: "allow", action: "continue", reason: "native receipt matches", gateContext: nativeGateContext("reloaded-lineage", "r1", git(cwd, "write-tree")) };
 		},
-		targetStatus: async () => targetStatusFixture({ lineageId: "reloaded-lineage", baseTree: git(cwd, "rev-parse", "HEAD^{tree}"), currentCandidateTree: git(cwd, "write-tree"), paths: ["app.ts"] }),
+		targetStatus: async () => targetStatusFixture({ lineageId: "reloaded-lineage", baseTree: git(cwd, "rev-parse", "HEAD^{tree}"), currentCandidateTree: git(cwd, "write-tree"), paths: ["app.ts"], projection: "staged" }),
 	}), undefined, undefined, undefined, new CandidateViewRegistry());
 	const validated = await controller.execute("reload-pre-commit", { operation: "validate", lineageId: "reloaded-lineage", idempotencyKey: "reload", command: "git commit -m reload", input: "{}" }, undefined, undefined, context(cwd));
 	assert.equal(validations, 1);
@@ -3236,7 +3411,7 @@ test("native deny, target drift, and bash-time errors never restore an authoriza
 	await drifting.controller.execute("allow", { operation: "validate", lineageId: "native-lineage", idempotencyKey: "key", command, input: "{}" }, undefined, undefined, context(cwd));
 	assert.equal((await drifting.toolCall({ toolName: "bash", input: { command } }, context(cwd)) as { block: boolean }).block, true);
 	assert.equal((await drifting.toolCall({ toolName: "bash", input: { command } }, context(cwd)) as { block: boolean }).block, true);
-	assert.equal(calls, 2);
+	assert.equal(calls, 3, "a blocked gate is not consumed, so the retry performs one fresh fail-closed discovery");
 
 	const failing = runtime(fakeNative({
 		validate: async () => { throw new Error("native connection lost"); },
