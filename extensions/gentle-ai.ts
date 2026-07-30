@@ -6133,7 +6133,7 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 		const originalCommand = event.input.command;
 		const inspection = inspectReviewLifecycleCommand(originalCommand, ctx.cwd);
 		let reviewModeDisabled = false;
-		if (inspection.command !== undefined && inspection.command !== null && nativeReviewCli?.reviewMode !== undefined) {
+		if (inspection.command?.event === "pre-commit" && nativeReviewCli?.reviewMode !== undefined) {
 			try {
 				const mode = await nativeReviewCli.reviewMode({ cwd: inspection.command.cwd, operation: NATIVE_REVIEW_MODE_OPERATION.STATUS, ...(ctx.signal === undefined ? {} : { signal: ctx.signal }) });
 				reviewModeDisabled = mode.status.effective === "off";

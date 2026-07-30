@@ -4059,6 +4059,27 @@ test("RECOVER rechecks a committed range against its frozen base instead of the 
 	candidateViews.cleanupTerminal("native-lineage", "approved");
 });
 
+test("dangerous push confirmation precedes mode reconsult outside a repository", async (t) => {
+	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-non-repository-push-"));
+	t.after(() => rmSync(cwd, { recursive: true, force: true }));
+	let modeCalls = 0;
+	const { toolCall } = runtime(fakeNative({
+		reviewMode: async () => {
+			modeCalls += 1;
+			throw new Error("mode lookup must not precede dangerous-command confirmation");
+		},
+	}));
+	const interactive = interactiveContext(cwd);
+	const deniedContext = { ...interactive, ui: { ...interactive.ui, confirm: async () => false } };
+	const result = await toolCall(
+		{ toolName: "bash", input: { command: "git push" } },
+		deniedContext,
+	) as { block: boolean; reason: string };
+	assert.equal(result.block, true);
+	assert.match(result.reason, /not confirmed/);
+	assert.equal(modeCalls, 0);
+});
+
 test("out-of-band review-mode disable discards stale lifecycle authorization and proceeds organically", async (t) => {
 	const cwd = repository(t);
 	let effective: "on" | "off" = "on";
