@@ -363,6 +363,7 @@ async function run() {
 
 	const toolCwd = await tempWorkspace();
 	try {
+		execFileSync("git", ["init"], { cwd: toolCwd, stdio: "ignore" });
 		const toolHook = hooks.get("tool_call")[0];
 		assert.equal(await toolHook({ toolName: "bash", input: { command: "git status" } }, createCtx(toolCwd)), undefined);
 		const receiptGate = await toolHook(
