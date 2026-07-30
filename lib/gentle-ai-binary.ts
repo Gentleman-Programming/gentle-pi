@@ -1,7 +1,16 @@
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { resolveGentleAiReleaseAsset } from "../scripts/gentle-ai-installer.mjs";
+import {
+	GENTLE_AI_INSTALL_METHOD,
+	GENTLE_AI_WINDOWS_SOURCE_MODULE,
+	GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM,
+	GENTLE_AI_WINDOWS_SOURCE_PACKAGE_PATH,
+	GENTLE_AI_WINDOWS_SOURCE_TAG,
+	isGentleAiWindowsGoVersionSupported,
+	isWindowsGoSumdbSourceTarget,
+	resolveGentleAiReleaseAsset,
+} from "../scripts/gentle-ai-installer.mjs";
 import { fileURLToPath } from "node:url";
 
 export const GENTLE_AI_BINARY_MISSING_CODE = "package-local-binary-missing";
@@ -49,6 +58,50 @@ function assertPosixExecutable(path: string, platform: string): void {
 	}
 }
 
+function signedReleaseManifest(asset: { name: string; sha256: string; binarySha256: string }): Record<string, string> {
+	return { version: GENTLE_AI_VERSION, asset: asset.name, assetSha256: asset.sha256, binarySha256: asset.binarySha256 };
+}
+
+function windowsSourceManifest(manifest: Record<string, unknown>, binarySha256: string, platform: string): Record<string, string> {
+	if (!isWindowsGoSumdbSourceTarget(platform, process.arch)) throw new Error("unsupported Windows source architecture");
+	const architecture = process.arch === "x64" ? "x64" : "arm64";
+	const goVersion = manifest.goVersion;
+	if (manifest.moduleChecksum !== GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM || typeof goVersion !== "string" || !isGentleAiWindowsGoVersionSupported(goVersion)) throw new Error("invalid Windows source provenance");
+	return {
+		version: GENTLE_AI_VERSION,
+		method: GENTLE_AI_INSTALL_METHOD.GO_SUMDB_SOURCE_BUILD,
+		package: GENTLE_AI_WINDOWS_SOURCE_PACKAGE_PATH,
+		module: GENTLE_AI_WINDOWS_SOURCE_MODULE,
+		tag: GENTLE_AI_WINDOWS_SOURCE_TAG,
+		architecture,
+		binarySha256,
+		moduleChecksum: GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM,
+		goVersion,
+		goos: "windows",
+		goarch: process.arch === "x64" ? "amd64" : "arm64",
+		buildMode: "exe",
+		compiler: "gc",
+		cgoEnabled: "0",
+	};
+}
+
+function expectedRuntimeManifest(platform: string, binarySha256: string, manifest: Record<string, unknown>): Record<string, string> {
+	if (platform === "win32") return windowsSourceManifest(manifest, binarySha256, platform);
+	const asset = resolveGentleAiReleaseAsset(platform, process.arch);
+	if (binarySha256 !== asset.binarySha256) throw new Error("runtime binary does not match pinned release digest");
+	return signedReleaseManifest(asset);
+}
+
+function isCanonicalManifest(contents: string, manifest: Record<string, unknown>, expected: Record<string, string>): boolean {
+	return contents === `${JSON.stringify(expected)}\n`
+		&& Object.keys(manifest).length === Object.keys(expected).length
+		&& Object.entries(expected).every(([key, value]) => manifest[key] === value);
+}
+
+function sameFile(before: ReturnType<typeof lstatSync>, after: ReturnType<typeof lstatSync>): boolean {
+	return before.dev === after.dev && before.ino === after.ino && before.size === after.size && before.mtimeMs === after.mtimeMs;
+}
+
 export function resolveGentleAiBinary(
 	packageRoot = dirname(dirname(fileURLToPath(import.meta.url))),
 	platform = process.platform,
@@ -66,22 +119,16 @@ export function resolveGentleAiBinary(
 		assertRegularNonSymlink(binaryPath);
 		assertPosixExecutable(binaryPath, platform);
 		assertRegularNonSymlink(manifestPath);
-		const before = lstatSync(binaryPath);
-		const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
-		const asset = resolveGentleAiReleaseAsset(platform, process.arch);
-		if (
-			Object.keys(manifest).length !== 4 ||
-			["version", "asset", "assetSha256", "binarySha256"].some((key) => !(key in manifest)) ||
-			manifest.version !== GENTLE_AI_VERSION ||
-			manifest.asset !== asset.name ||
-			manifest.assetSha256 !== asset.sha256 ||
-			typeof manifest.binarySha256 !== "string" ||
-			manifest.binarySha256 !== asset.binarySha256 ||
-			!/^[0-9a-f]{64}$/.test(manifest.binarySha256) ||
-			sha256(readBinary(binaryPath)) !== manifest.binarySha256
-		) throw new Error("invalid runtime integrity manifest");
-		const after = lstatSync(binaryPath);
-		if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs) throw new Error("runtime replaced during verification");
+		const beforeBinary = lstatSync(binaryPath);
+		const beforeManifest = lstatSync(manifestPath);
+		const manifestContents = readFileSync(manifestPath, "utf8");
+		const manifest = JSON.parse(manifestContents) as Record<string, unknown>;
+		const binarySha256 = sha256(readBinary(binaryPath));
+		const expected = expectedRuntimeManifest(platform, binarySha256, manifest);
+		if (!isCanonicalManifest(manifestContents, manifest, expected)) throw new Error("invalid runtime integrity manifest");
+		const afterBinary = lstatSync(binaryPath);
+		const afterManifest = lstatSync(manifestPath);
+		if (!sameFile(beforeBinary, afterBinary) || !sameFile(beforeManifest, afterManifest)) throw new Error("runtime replaced during verification");
 		assertPosixExecutable(binaryPath, platform);
 		return binaryPath;
 	} catch {

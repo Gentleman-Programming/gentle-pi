@@ -58,7 +58,7 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | **Skill creation workflow**    | Provides the `gentle-ai-skill-creator`/`gentle-ai-skill-improver` skills, `/skill-creation` prompt, and packaged style guide for LLM-first skills. |
 | **Delivery skills**            | Includes issue-first PRs, chained PRs, work-unit commits, cognitive docs, comment writing, and Judgment Day review.                           |
 | **Bounded native review**      | Freezes one candidate, dispatches only controller-selected lenses, records native authority, and reuses the same content-bound receipt at delivery gates. |
-| **Verified native runtime**    | Provisions the exact package-local Gentle AI v2.2.1 binary, verifies pinned archive/binary integrity, negotiates `review-integration/v1` today, and rejects PATH, global, sibling, symlink, and mode fallbacks. `review-integration/v2`'s immutable `base_tree`/`candidate_tree` transport is staged for a separate release-gated cutover (see [Native Authority Architecture](docs/native-authority-architecture.md)). |
+| **Verified native runtime**    | Provisions the exact package-local Gentle AI v2.2.2 runtime: signed archives on Darwin/Linux and a Go SumDB-verified source build on Windows x64/arm64. It validates package-local integrity and rejects PATH, global, sibling, symlink, and mode fallbacks. |
 | **Runtime safety**             | Blocks destructive shell commands, asks for confirmation for sensitive operations, and blocks direct read/write/edit access to sensitive paths. |
 
 ## Install
@@ -79,7 +79,7 @@ pi install npm:gentle-pi@0.14.0
 pi install npm:gentle-pi@latest
 ```
 
-The latest RDD package downloads its pinned platform-specific Gentle AI binary into the package's private `.gentle-ai/` directory and verifies archive and executable SHA-256 values before extraction. It never uses `PATH` or a global `gentle-ai` installation. For development or offline installs only, set `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1`; native review operations then fail closed with an actionable `package-local-binary-missing` error until the package is reinstalled normally.
+The latest RDD package installs Gentle AI only into its private `.gentle-ai/` directory. Darwin and Linux use pinned signed archives with archive and executable SHA-256 verification. Windows x64 and arm64 build the exact `v2.2.2` source tag with a local Go 1.25.10+ toolchain, a sealed Go environment, `GOTOOLCHAIN=local`, and `GOSUMDB=sum.golang.org`; it does not download Go automatically. Windows provenance is Go-toolchain plus SumDB evidence and postinstall tamper detection, **not** Authenticode or protection against a malicious joint binary-and-manifest replacement. Package-private locks coordinate cooperative concurrent or crashed installers; their tombstones fail closed. A malicious same-user process with write access to package-private `node_modules` is outside that protocol because it can already replace package code, binary, or manifest, and portable Node has no pathname-delete CAS. It never uses `PATH` or a global `gentle-ai` installation. For development or offline installs only, set `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1`; native review operations then fail closed with an actionable `package-local-binary-missing` error until the package is reinstalled normally.
 
 Recommended companion packages:
 
@@ -660,7 +660,7 @@ Memory contract for SDD delegation:
 | `lib/review-canonical.ts`      | Permanent Pi-owned canonical JSON and domain-hash primitives for consumer-side identities.                   |
 | `lib/review-repository.ts`     | Permanent Pi-owned Git common-directory identity, safe Git environment, and authority-root binding.          |
 | `lib/gentle-ai-binary.ts`      | Resolves and verifies the confined package-local Gentle AI runtime without global or PATH fallback.          |
-| `scripts/gentle-ai-installer.mjs` | Downloads, verifies, extracts, and atomically promotes the pinned native runtime for six platform targets. |
+| `scripts/gentle-ai-installer.mjs` | Installs signed Darwin/Linux archives or exact Go SumDB-verified Windows source builds into the package-local runtime. |
 | `contracts/review-integration/v1/` | Byte-identical provider schemas and conformance fixtures for contract `review-integration/v1`, hash-checked before packaging; retained on disk permanently because `/v2`'s schemas `$ref` into these fragments. |
 | `contracts/review-integration/v2/` | Byte-identical provider schemas and conformance fixtures for contract `review-integration/v2` (immutable `base_tree`/`candidate_tree`, ordered `changed_path_manifest`, no inline candidate diff), hash-checked before packaging. |
 | `extensions/startup-banner.ts` | Shows and configures the startup intro, color presets, compact runtime panel, and collaboration credit.     |

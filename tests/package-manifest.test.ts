@@ -212,7 +212,8 @@ test("installed commit transaction runner loads JavaScript only and has determin
 	assert.equal(packageJson.scripts?.["test:packed-runner"], "node scripts/test-packed-runner.mjs");
 	assert.match(packageJson.scripts?.prepublishOnly ?? "", /pnpm run test:packed-runner/);
 	assert.match(ci, /pnpm run test:packed-runner/);
-	assert.doesNotMatch(packedRunner, /\["install"[^\]]*"--ignore-scripts"/s);
+	assert.match(packedRunner, /\["install"[^\]]*"--ignore-scripts=false"/s, "packed install must explicitly enable postinstall");
+	assert.doesNotMatch(packedRunner, /\["install"[^\]]*"--ignore-scripts"(?!\=false)/s);
 	assert.match(packedRunner, /execFileSync\("where\.exe", \["npm"\]/);
 	assert.match(packedRunner, /could not resolve npm-cli\.js without a command shell/);
 	assert.doesNotMatch(packedRunner, /ComSpec|cmd\.exe/);
@@ -275,7 +276,13 @@ test("package verification binds the published Gentle AI v2.2.2 runtime pin", ()
 	const verifier = readFileSync(join(PACKAGE_ROOT, "scripts", "verify-package-files.mjs"), "utf8");
 
 	assert.match(installer, /INSTALLER_VERSION = "2\.2\.2"/);
+	assert.match(installer, /GENTLE_AI_WINDOWS_SOURCE_PACKAGE.*GENTLE_AI_WINDOWS_SOURCE_MODULE/);
+	assert.match(installer, /GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM = "h1:YZcI5dRvoHm82I2CULvgBkB2M3UQQGarYO\/u\/Nt5LSc="/);
+	assert.match(installer, /GOTOOLCHAIN: "local"/);
+	assert.match(installer, /GOSUMDB: "sum\.golang\.org"/);
 	assert.match(binary, /GENTLE_AI_VERSION = "2\.2\.2"/);
+	assert.match(binary, /GO_SUMDB_SOURCE_BUILD/);
+	assert.match(binary, /GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM/);
 	assert.match(verifier, /v2\.2\.2/);
 });
 

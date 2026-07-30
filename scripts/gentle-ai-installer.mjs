@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createWriteStream, existsSync } from "node:fs";
 import {
 	chmod,
@@ -13,7 +13,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import https from "node:https";
-import { dirname, isAbsolute, join, relative, win32 } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -23,7 +23,34 @@ const RELEASE_BASE_URL = "https://github.com/Gentleman-Programming/gentle-ai/rel
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const DOWNLOAD_TIMEOUTS = { headers: 10_000, body: 30_000, attempts: 2, retryDelay: 100 };
+const GO_COMMAND_TIMEOUT_MS = 120_000;
+const GO_COMMAND_MAX_BUFFER = 1024 * 1024;
+const WINDOWS_SYSTEM_ROOT = "C:\\Windows";
 export const INSTALLER_VERSION = "2.2.2";
+export const GENTLE_AI_INSTALL_METHOD = Object.freeze({
+	SIGNED_RELEASE_ASSET: "signed-release-asset",
+	GO_SUMDB_SOURCE_BUILD: "go-sumdb-source-build",
+});
+export const GENTLE_AI_WINDOWS_SOURCE_PACKAGE_PATH = "github.com/gentleman-programming/gentle-ai/v2/cmd/gentle-ai";
+export const GENTLE_AI_WINDOWS_SOURCE_MODULE = "github.com/gentleman-programming/gentle-ai/v2";
+export const GENTLE_AI_WINDOWS_SOURCE_TAG = "v2.2.2";
+// `go mod download -json github.com/gentleman-programming/gentle-ai/v2@v2.2.2`
+// with GOSUMDB=sum.golang.org reports this exact module SumDB checksum.
+export const GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM = "h1:YZcI5dRvoHm82I2CULvgBkB2M3UQQGarYO/u/Nt5LSc=";
+export const GENTLE_AI_WINDOWS_SOURCE_PACKAGE = `${GENTLE_AI_WINDOWS_SOURCE_PACKAGE_PATH}@${GENTLE_AI_WINDOWS_SOURCE_TAG}`;
+export const GENTLE_AI_WINDOWS_MINIMUM_GO_VERSION = "1.25.10";
+export const GENTLE_AI_GO_TOOLCHAIN_UNAVAILABLE_CODE = "GENTLE_AI_GO_TOOLCHAIN_UNAVAILABLE";
+export const GENTLE_AI_GO_TOOLCHAIN_TOO_OLD_CODE = "GENTLE_AI_GO_TOOLCHAIN_TOO_OLD";
+export const GENTLE_AI_GO_INSTALL_FAILED_CODE = "GENTLE_AI_GO_INSTALL_FAILED";
+export const GENTLE_AI_VERSION_MISMATCH_CODE = "GENTLE_AI_VERSION_MISMATCH";
+
+export class GentleAiInstallerError extends Error {
+	constructor(code, message, cause) {
+		super(message, cause === undefined ? undefined : { cause });
+		this.code = code;
+		this.name = "GentleAiInstallerError";
+	}
+}
 
 // Sentinel used while a re-pinned gentle-ai release is not yet published. A
 // sentinel digest can never match a real SHA-256, so installation fails closed,
@@ -38,12 +65,11 @@ function asset(name, sha256, binarySha256, executable) {
 	return Object.freeze({ name, sha256, binarySha256, executable, url: `${RELEASE_BASE_URL}${name}` });
 }
 
-// Windows is absent on purpose. gentle-ai stopped distributing Windows builds
-// in c4b764d0 ("omit unsigned Windows distribution"), so v2.2.2 publishes only
-// darwin and linux archives and there is nothing to pin. A Windows caller now
-// gets resolveGentleAiReleaseAsset's unsupported-platform error, which is the
-// truth: Pi cannot install a binary that upstream does not publish. Restore
-// both rows the moment gentle-ai ships signed Windows assets again.
+// Windows is absent from signed release archives on purpose. gentle-ai stopped
+// distributing unsigned Windows builds in c4b764d0, so v2.2.2 publishes signed
+// Darwin/Linux archives only. Windows x64/arm64 uses the separately verified
+// exact-tag Go SumDB source-build path below; restore archive rows only when
+// upstream ships signed Windows assets.
 export const GENTLE_AI_RELEASE_ASSETS = Object.freeze({
 	"darwin/amd64": asset("gentle-ai_2.2.2_darwin_amd64.tar.gz", "5ca67829903bf4c6b14665664f80f9d8216c84b10c8e50870d297f452cefb9dc", "9b239423450562d026384f482bbd2f1e3f2820431a84f0921743ac3df9d632de", "gentle-ai"),
 	"darwin/arm64": asset("gentle-ai_2.2.2_darwin_arm64.tar.gz", "0193e1a284444dccee2863d31b8dbb76a982e8f9111955908d6a9131c1a5490e", "149b97248552c5e03ebc4d991f86b1360fb847a40fc315555a8aa256f95baca0", "gentle-ai"),
@@ -59,10 +85,19 @@ function upstreamPlatform(platform) {
 	return platform === "win32" ? "windows" : platform;
 }
 
+export function isWindowsGoSumdbSourceTarget(platform = process.platform, architecture = process.arch) {
+	return platform === "win32" && ["x64", "arm64"].includes(architecture);
+}
+
 export function resolveGentleAiReleaseAsset(platform = process.platform, architecture = process.arch, releaseAssets = GENTLE_AI_RELEASE_ASSETS) {
 	const key = `${upstreamPlatform(platform)}/${upstreamArchitecture(architecture)}`;
 	const resolved = releaseAssets[key];
-	if (!resolved) throw new Error(`unsupported Gentle AI platform/architecture: ${platform}/${architecture}; supported pairs are darwin, linux, or windows with x64 or arm64`);
+	if (!resolved) {
+		const windowsSource = isWindowsGoSumdbSourceTarget(platform, architecture)
+			? "; Windows x64/arm64 use Go SumDB source installation because no signed Windows archive is published"
+			: "";
+		throw new Error(`unsupported Gentle AI platform/architecture: ${platform}/${architecture}; signed archive pairs are darwin/x64, darwin/arm64, linux/x64, and linux/arm64${windowsSource}`);
+	}
 	return resolved;
 }
 
@@ -172,73 +207,421 @@ function isConfined(path, directory) {
 	return value !== "" && !value.startsWith("..") && !isAbsolute(value);
 }
 
-async function existingBinaryMatches(binaryPath, manifestPath, asset, platform) {
-	try {
-		const runtimeDirectory = dirname(binaryPath);
-		const packageRuntimeDirectory = dirname(runtimeDirectory);
-		if (!isConfined(binaryPath, runtimeDirectory) || !isConfined(manifestPath, runtimeDirectory)) return false;
-		const [parent, runtime, binary, manifestFile, manifest] = await Promise.all([
-			lstat(packageRuntimeDirectory), lstat(runtimeDirectory), lstat(binaryPath), lstat(manifestPath), readFile(manifestPath, "utf8"),
-		]);
-		const parsed = JSON.parse(manifest);
-		return parent.isDirectory() && !parent.isSymbolicLink()
-			&& runtime.isDirectory() && !runtime.isSymbolicLink()
-			&& binary.isFile() && !binary.isSymbolicLink()
-			&& (platform === "win32" || (binary.mode & 0o111) !== 0)
-			&& manifestFile.isFile() && !manifestFile.isSymbolicLink()
-			&& typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-			&& Object.keys(parsed).length === 4
-			&& ["version", "asset", "assetSha256", "binarySha256"].every((key) => key in parsed)
-			&& parsed.version === INSTALLER_VERSION
-			&& parsed.asset === asset.name
-			&& parsed.assetSha256 === asset.sha256
-			&& typeof parsed.binarySha256 === "string"
-			&& /^[0-9a-f]{64}$/.test(parsed.binarySha256)
-			&& (!asset.binarySha256 || parsed.binarySha256 === asset.binarySha256)
-			&& parsed.binarySha256 === await sha256File(binaryPath);
-	} catch {
-		return false;
+function signedReleaseManifest(asset, binarySha256) {
+	return { version: INSTALLER_VERSION, asset: asset.name, assetSha256: asset.sha256, binarySha256 };
+}
+
+function windowsSourceManifest(metadata, binarySha256, architecture) {
+	return {
+		version: INSTALLER_VERSION,
+		method: GENTLE_AI_INSTALL_METHOD.GO_SUMDB_SOURCE_BUILD,
+		package: GENTLE_AI_WINDOWS_SOURCE_PACKAGE_PATH,
+		module: GENTLE_AI_WINDOWS_SOURCE_MODULE,
+		tag: GENTLE_AI_WINDOWS_SOURCE_TAG,
+		architecture,
+		binarySha256,
+		moduleChecksum: GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM,
+		goVersion: metadata.goVersion,
+		goos: metadata.goos,
+		goarch: metadata.goarch,
+		buildMode: metadata.buildMode,
+		compiler: metadata.compiler,
+		cgoEnabled: metadata.cgoEnabled,
+	};
+}
+
+function canonicalManifest(manifest) { return `${JSON.stringify(manifest)}\n`; }
+
+function isCanonicalManifest(contents, parsed, expected) {
+	return contents === canonicalManifest(expected)
+		&& typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+		&& Object.keys(parsed).length === Object.keys(expected).length
+		&& Object.entries(expected).every(([key, value]) => parsed[key] === value);
+}
+
+function commandOutput(result) { return typeof result?.stdout === "string" ? result.stdout : ""; }
+
+function commandOptions(env, cwd) {
+	return { cwd, env, shell: false, windowsHide: true, timeout: GO_COMMAND_TIMEOUT_MS, maxBuffer: GO_COMMAND_MAX_BUFFER };
+}
+
+function outputVersion(output) {
+	const match = /^go version go(\d+)\.(\d+)\.(\d+)(?:\s|$)/.exec(output);
+	return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : undefined;
+}
+
+function isVersionAtLeast(actual, minimum) {
+	return actual[0] > minimum[0] || (actual[0] === minimum[0] && (actual[1] > minimum[1] || (actual[1] === minimum[1] && actual[2] >= minimum[2])));
+}
+
+export function isGentleAiWindowsGoVersionSupported(goVersion) {
+	const match = /^go(\d+)\.(\d+)\.(\d+)$/.exec(goVersion);
+	return match !== null && isVersionAtLeast(match.slice(1).map(Number), GENTLE_AI_WINDOWS_MINIMUM_GO_VERSION.split(".").map(Number));
+}
+
+function expectedGoArchitecture(architecture) { return architecture === "x64" ? "amd64" : "arm64"; }
+
+function sealedGoEnvironment(goPath, buildDirectory, architecture) {
+	const goDirectory = dirname(goPath);
+	const tempDirectory = join(buildDirectory, "tmp");
+	return {
+		GOENV: "off", GOFLAGS: "", GOWORK: "off", GOTOOLCHAIN: "local", GOSUMDB: "sum.golang.org",
+		GONOSUMDB: "", GOPRIVATE: "", GONOPROXY: "", GOINSECURE: "", GOPROXY: "https://proxy.golang.org",
+		GOOS: "windows", GOARCH: expectedGoArchitecture(architecture), CGO_ENABLED: "0",
+		GOBIN: join(buildDirectory, "gobin"), GOPATH: join(buildDirectory, "gopath"), GOMODCACHE: join(buildDirectory, "gomodcache"), GOCACHE: join(buildDirectory, "gocache"),
+		SystemRoot: WINDOWS_SYSTEM_ROOT, WINDIR: WINDOWS_SYSTEM_ROOT, ComSpec: join(WINDOWS_SYSTEM_ROOT, "System32", "cmd.exe"),
+		TEMP: tempDirectory, TMP: tempDirectory, PATHEXT: ".COM;.EXE;.BAT;.CMD",
+		PATH: [goDirectory, join(WINDOWS_SYSTEM_ROOT, "System32"), WINDOWS_SYSTEM_ROOT].join(";"),
+	};
+}
+
+async function runCommand(execute, file, arguments_, options) { return execute(file, arguments_, options); }
+
+async function resolveWindowsGoExecutable(options) {
+	let resolved;
+	if (options.resolveGoExecutable) resolved = await options.resolveGoExecutable();
+	else {
+		try {
+			const result = await execFileAsync(join(WINDOWS_SYSTEM_ROOT, "System32", "where.exe"), ["go.exe"], { shell: false, windowsHide: true, timeout: GO_COMMAND_TIMEOUT_MS, maxBuffer: GO_COMMAND_MAX_BUFFER });
+			resolved = commandOutput(result).split(/\r?\n/).find((value) => isAbsolute(value));
+		} catch (error) {
+			throw new GentleAiInstallerError(GENTLE_AI_GO_TOOLCHAIN_UNAVAILABLE_CODE, `Windows source installation requires local Go ${GENTLE_AI_WINDOWS_MINIMUM_GO_VERSION} or newer; install Go and retry (automatic Go toolchain download is disabled).`, error);
+		}
 	}
+	if (typeof resolved !== "string" || !isAbsolute(resolved)) throw new GentleAiInstallerError(GENTLE_AI_GO_TOOLCHAIN_UNAVAILABLE_CODE, "Windows source installation could not resolve an absolute local Go executable.");
+	try {
+		const details = await lstat(resolved);
+		if (!details.isFile() || details.isSymbolicLink()) throw new Error("not a regular non-symlink file");
+	} catch (error) {
+		throw new GentleAiInstallerError(GENTLE_AI_GO_TOOLCHAIN_UNAVAILABLE_CODE, "Windows source installation requires a regular non-symlink local Go executable.", error);
+	}
+	return resolved;
+}
+
+async function assertGoToolchain(execute, goPath, environment, cwd) {
+	let result;
+	try { result = await runCommand(execute, goPath, ["version"], commandOptions(environment, cwd)); }
+	catch (error) { throw new GentleAiInstallerError(GENTLE_AI_GO_TOOLCHAIN_UNAVAILABLE_CODE, `Windows source installation requires local Go ${GENTLE_AI_WINDOWS_MINIMUM_GO_VERSION} or newer; install Go and retry (automatic Go toolchain download is disabled).`, error); }
+	const version = outputVersion(commandOutput(result));
+	const minimum = GENTLE_AI_WINDOWS_MINIMUM_GO_VERSION.split(".").map(Number);
+	if (!version || !isVersionAtLeast(version, minimum)) throw new GentleAiInstallerError(GENTLE_AI_GO_TOOLCHAIN_TOO_OLD_CODE, `Windows source installation requires local Go ${GENTLE_AI_WINDOWS_MINIMUM_GO_VERSION} or newer; found ${commandOutput(result).trim() || "an unrecognized Go version"}.`);
+}
+
+function parseGoBuildMetadata(output, architecture) {
+	const fields = new Map();
+	const lines = output.split(/\r?\n/).filter(Boolean);
+	const goVersion = /:\s+(go\d+\.\d+\.\d+)$/.exec(lines[0] ?? "")?.[1];
+	for (const line of lines.slice(1)) {
+		const [kind, ...values] = line.trimStart().split(/\s+/);
+		if (kind === "path") fields.set("path", values[0]);
+		else if (kind === "mod") { fields.set("module", values[0]); fields.set("tag", values[1]); fields.set("moduleChecksum", values[2]); }
+		else if (kind === "build") { const [key, value] = (values[0] ?? "").split("="); fields.set(key, value); }
+	}
+	const metadata = {
+		goVersion, path: fields.get("path"), module: fields.get("module"), tag: fields.get("tag"), moduleChecksum: fields.get("moduleChecksum"),
+		goos: fields.get("GOOS"), goarch: fields.get("GOARCH"), buildMode: fields.get("-buildmode"), compiler: fields.get("-compiler"), cgoEnabled: fields.get("CGO_ENABLED"),
+	};
+	if (metadata.path !== GENTLE_AI_WINDOWS_SOURCE_PACKAGE_PATH || metadata.module !== GENTLE_AI_WINDOWS_SOURCE_MODULE || metadata.tag !== GENTLE_AI_WINDOWS_SOURCE_TAG || metadata.moduleChecksum !== GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM || !isGentleAiWindowsGoVersionSupported(metadata.goVersion ?? "") || metadata.goos !== "windows" || metadata.goarch !== expectedGoArchitecture(architecture) || metadata.buildMode !== "exe" || metadata.compiler !== "gc" || metadata.cgoEnabled !== "0") throw new GentleAiInstallerError(GENTLE_AI_GO_INSTALL_FAILED_CODE, "Gentle AI source build metadata does not match the pinned Windows provenance.");
+	return metadata;
+}
+
+async function verifyGoBuildMetadata(execute, goPath, binaryPath, environment, cwd, architecture) {
+	try { return parseGoBuildMetadata(commandOutput(await runCommand(execute, goPath, ["version", "-m", binaryPath], commandOptions(environment, cwd))), architecture); }
+	catch (error) { if (error instanceof GentleAiInstallerError) throw error; throw new GentleAiInstallerError(GENTLE_AI_GO_INSTALL_FAILED_CODE, "Gentle AI source build metadata could not be verified.", error); }
+}
+
+async function assertExactGentleAiVersion(execute, binaryPath, environment, cwd) {
+	let result;
+	try { result = await runCommand(execute, binaryPath, ["version"], commandOptions(environment, cwd)); }
+	catch (error) { throw new GentleAiInstallerError(GENTLE_AI_VERSION_MISMATCH_CODE, `Gentle AI source build at ${binaryPath} could not report its version.`, error); }
+	if (!/^gentle-ai 2\.2\.2\r?\n?$/.test(commandOutput(result))) throw new GentleAiInstallerError(GENTLE_AI_VERSION_MISMATCH_CODE, `Gentle AI source build reported ${JSON.stringify(commandOutput(result).trim())}; expected gentle-ai ${INSTALLER_VERSION}.`);
+}
+
+function sameFile(before, after) { return before.dev === after.dev && before.ino === after.ino && before.size === after.size && before.mtimeMs === after.mtimeMs; }
+
+async function safeRemoveDirectory(path) {
+	try {
+		const details = await lstat(path);
+		if (!details.isDirectory() || details.isSymbolicLink()) throw new Error("not a real directory");
+		await rm(path, { recursive: true, force: true });
+	} catch (error) { if (!(error && typeof error === "object" && error.code === "ENOENT")) throw error; }
+}
+
+async function existingSignedBundleMatches(directory, asset, platform) {
+	try {
+		const binaryPath = join(directory, asset.executable), manifestPath = join(directory, "integrity.json");
+		const [bundle, binary, manifestFile, contents] = await Promise.all([lstat(directory), lstat(binaryPath), lstat(manifestPath), readFile(manifestPath, "utf8")]);
+		const binarySha256 = await sha256File(binaryPath);
+		return bundle.isDirectory() && !bundle.isSymbolicLink() && binary.isFile() && !binary.isSymbolicLink() && (platform === "win32" || (binary.mode & 0o111) !== 0) && manifestFile.isFile() && !manifestFile.isSymbolicLink() && (!asset.binarySha256 || asset.binarySha256 === binarySha256) && isCanonicalManifest(contents, JSON.parse(contents), signedReleaseManifest(asset, binarySha256));
+	} catch { return false; }
+}
+
+async function existingWindowsSourceBundleMatches(directory, execute, goPath, environment, architecture) {
+	try {
+		const binaryPath = join(directory, "gentle-ai.exe"), manifestPath = join(directory, "integrity.json");
+		const [bundle, binary, manifestFile, contents] = await Promise.all([lstat(directory), lstat(binaryPath), lstat(manifestPath), readFile(manifestPath, "utf8")]);
+		if (!bundle.isDirectory() || bundle.isSymbolicLink() || !binary.isFile() || binary.isSymbolicLink() || !manifestFile.isFile() || manifestFile.isSymbolicLink()) return false;
+		const parsed = JSON.parse(contents);
+		if (typeof parsed?.binarySha256 !== "string" || !/^[0-9a-f]{64}$/.test(parsed.binarySha256)) return false;
+		const beforeBinary = await lstat(binaryPath), beforeManifest = await lstat(manifestPath);
+		const metadata = await verifyGoBuildMetadata(execute, goPath, binaryPath, environment, directory, architecture);
+		if ((await sha256File(binaryPath)) !== parsed.binarySha256 || !isCanonicalManifest(contents, parsed, windowsSourceManifest(metadata, parsed.binarySha256, architecture))) return false;
+		await assertExactGentleAiVersion(execute, binaryPath, environment, directory);
+		return sameFile(beforeBinary, await lstat(binaryPath)) && sameFile(beforeManifest, await lstat(manifestPath));
+	} catch { return false; }
+}
+
+function lockIdentity(details) { return `${details.dev}:${details.ino}`; }
+
+function validInstallLockOwner(owner) {
+	return typeof owner === "object" && owner !== null
+		&& Number.isSafeInteger(owner.createdAt)
+		&& typeof owner.nonce === "string"
+		&& /^[0-9a-f]{64}$/.test(owner.nonce);
+}
+
+async function inspectInstallLock(lockPath) {
+	const details = await lstat(lockPath);
+	if (!details.isDirectory() || details.isSymbolicLink()) throw new Error("Gentle AI install lock is not a real directory");
+	let owner;
+	try {
+		const ownerPath = join(lockPath, "owner.json");
+		const ownerDetails = await lstat(ownerPath);
+		if (ownerDetails.isFile() && !ownerDetails.isSymbolicLink()) {
+			const parsed = JSON.parse(await readFile(ownerPath, "utf8"));
+			if (validInstallLockOwner(parsed)) owner = parsed;
+		}
+	} catch (error) {
+		if (!(error && typeof error === "object" && error.code === "ENOENT") && !(error instanceof SyntaxError)) throw error;
+	}
+	return { details, identity: lockIdentity(details), owner };
+}
+
+function installLockBlockedError(path) {
+	return new Error(`Gentle AI package-private installation lock or tombstone exists at ${path}. Confirm no installer is active, then remove this package-private path manually before retrying.`);
+}
+
+function installTombstonePrefix() { return `.v${INSTALLER_VERSION}.install.tombstone-`; }
+
+function installTombstonePath(runtimeRoot, nonce) {
+	const path = join(runtimeRoot, `${installTombstonePrefix()}${nonce}`);
+	if (!isConfined(path, runtimeRoot)) throw new Error("Gentle AI install tombstone escaped the package-private runtime directory");
+	return path;
+}
+
+async function existingInstallTombstone(runtimeRoot) {
+	for (const entry of await readdir(runtimeRoot, { withFileTypes: true })) {
+		if (!entry.name.startsWith(installTombstonePrefix())) continue;
+		const path = join(runtimeRoot, entry.name);
+		const details = await lstat(path);
+		if (!details.isDirectory() || details.isSymbolicLink()) throw installLockBlockedError(path);
+		return path;
+	}
+	return undefined;
+}
+
+async function assertNoInstallTombstones(runtimeRoot) {
+	const tombstone = await existingInstallTombstone(runtimeRoot);
+	if (tombstone) throw installLockBlockedError(tombstone);
+}
+
+async function releaseInstallLock(runtimeRoot, lockPath, owner, options) {
+	try {
+		const observed = await inspectInstallLock(lockPath);
+		if (observed.identity !== owner.identity || observed.owner?.nonce !== owner.owner?.nonce) return;
+		await options.beforeInstallLockReleaseRename?.(lockPath);
+		const tombstonePath = installTombstonePath(runtimeRoot, randomBytes(32).toString("hex"));
+		await (options.rename ?? rename)(lockPath, tombstonePath);
+		const tombstone = await inspectInstallLock(tombstonePath);
+		if (tombstone.identity !== owner.identity || tombstone.owner?.nonce !== owner.owner?.nonce) throw installLockBlockedError(tombstonePath);
+		await safeRemoveDirectory(tombstonePath);
+	} catch (error) {
+		if (!(error && typeof error === "object" && error.code === "ENOENT")) throw error;
+	}
+}
+
+// This coordinates cooperative installers only. A malicious same-user package
+// writer can already replace package code, binaries, or manifests; Node has no
+// pathname-delete CAS. Tombstones make rename auditable: only a matching owned
+// tombstone is deleted automatically. Any other tombstone requires a maintainer
+// to confirm no installer is active before manual package-private cleanup.
+async function acquireInstallLock(runtimeRoot, options) {
+	const lockPath = join(runtimeRoot, `.v${INSTALLER_VERSION}.install.lock`);
+	await assertNoInstallTombstones(runtimeRoot);
+	await options.afterInstallLockFirstTombstoneScan?.(runtimeRoot);
+	const nonce = randomBytes(32).toString("hex");
+	try {
+		await mkdir(lockPath, { mode: 0o700 });
+		await writeFile(join(lockPath, "owner.json"), canonicalManifest({ createdAt: (options.now ?? Date.now)(), nonce }), { mode: 0o600, flag: "wx" });
+	} catch (error) {
+		if (error && typeof error === "object" && error.code === "EEXIST") throw installLockBlockedError(lockPath);
+		throw error;
+	}
+	const owner = await inspectInstallLock(lockPath);
+	if (owner.owner?.nonce !== nonce) throw installLockBlockedError(lockPath);
+	try {
+		await assertNoInstallTombstones(runtimeRoot);
+	} catch (error) {
+		await releaseInstallLock(runtimeRoot, lockPath, owner, options);
+		throw error;
+	}
+	return async () => releaseInstallLock(runtimeRoot, lockPath, owner, options);
+}
+
+function bundleRecoveryError(runtimeRoot, reason) {
+	return new Error(`Gentle AI package-local bundle recovery requires manual intervention in ${runtimeRoot}: ${reason}. Confirm no installer is active before changing package-private bundle paths.`);
+}
+
+function versionBundlePath(runtimeRoot) { return join(runtimeRoot, `v${INSTALLER_VERSION}`); }
+function bundleBackupPrefix() { return `.v${INSTALLER_VERSION}.backup-`; }
+function bundleStagingPrefix() { return `.v${INSTALLER_VERSION}.staging-`; }
+
+async function realBundleDirectory(path, runtimeRoot, label) {
+	if (!isConfined(path, runtimeRoot)) throw bundleRecoveryError(runtimeRoot, `${label} escaped the version parent`);
+	try {
+		const details = await lstat(path);
+		if (!details.isDirectory() || details.isSymbolicLink()) throw bundleRecoveryError(runtimeRoot, `${label} is not a real directory at ${path}`);
+		return true;
+	} catch (error) {
+		if (error && typeof error === "object" && error.code === "ENOENT") return false;
+		throw error;
+	}
+}
+
+async function backupBundlePaths(runtimeRoot) {
+	const backups = [];
+	for (const entry of await readdir(runtimeRoot, { withFileTypes: true })) {
+		if (!entry.name.startsWith(bundleBackupPrefix())) continue;
+		const path = join(runtimeRoot, entry.name);
+		if (!await realBundleDirectory(path, runtimeRoot, "backup bundle")) throw bundleRecoveryError(runtimeRoot, `backup bundle disappeared at ${path}`);
+		backups.push(path);
+	}
+	return backups;
+}
+
+async function recoverInterruptedPublication(runtimeRoot, bundleIsValid, options) {
+	const backups = await backupBundlePaths(runtimeRoot);
+	if (backups.length === 0) return;
+	if (backups.length !== 1) throw bundleRecoveryError(runtimeRoot, `found ${backups.length} backup bundle candidates`);
+	const [backup] = backups;
+	if (!await bundleIsValid(backup)) throw bundleRecoveryError(runtimeRoot, `backup bundle is invalid at ${backup}`);
+	const live = versionBundlePath(runtimeRoot);
+	const liveExists = await realBundleDirectory(live, runtimeRoot, "live bundle");
+	if (!liveExists) {
+		try { await (options.rename ?? rename)(backup, live); }
+		catch (error) { throw bundleRecoveryError(runtimeRoot, `could not restore valid backup ${backup}: ${error instanceof Error ? error.message : String(error)}`); }
+		return;
+	}
+	if (!await bundleIsValid(live)) throw bundleRecoveryError(runtimeRoot, `live bundle is invalid while valid backup remains at ${backup}`);
+	await safeRemoveDirectory(backup);
+}
+
+async function cleanupStaleStagingBundles(runtimeRoot) {
+	for (const entry of await readdir(runtimeRoot, { withFileTypes: true })) {
+		if (!entry.name.startsWith(bundleStagingPrefix())) continue;
+		const path = join(runtimeRoot, entry.name);
+		if (!await realBundleDirectory(path, runtimeRoot, "staging bundle")) throw bundleRecoveryError(runtimeRoot, `staging bundle disappeared at ${path}`);
+		await safeRemoveDirectory(path);
+	}
+}
+
+async function publishBundle(runtimeRoot, stagingDirectory, options) {
+	const versionDirectory = join(runtimeRoot, `v${INSTALLER_VERSION}`), renameFile = options.rename ?? rename;
+	const backupDirectory = join(runtimeRoot, `.v${INSTALLER_VERSION}.backup-${process.pid}-${Date.now()}`);
+	let movedPrior = false;
+	try {
+		try {
+			const current = await lstat(versionDirectory);
+			if (!current.isDirectory() || current.isSymbolicLink()) throw new Error("Gentle AI package-local version directory must be a real directory");
+			await renameFile(versionDirectory, backupDirectory);
+			movedPrior = true;
+		} catch (error) { if (!(error && typeof error === "object" && error.code === "ENOENT")) throw error; }
+		await renameFile(stagingDirectory, versionDirectory);
+	} catch (error) {
+		if (movedPrior) {
+			try { await renameFile(backupDirectory, versionDirectory); }
+			catch (rollbackError) { throw new Error("Gentle AI bundle publication failed and rollback could not restore the prior bundle", { cause: rollbackError }); }
+		}
+		throw error;
+	}
+	if (movedPrior) await safeRemoveDirectory(backupDirectory);
+	return versionDirectory;
+}
+
+async function withInstallLock(packageRoot, options, install) {
+	const runtimeRoot = join(packageRoot, ".gentle-ai");
+	await mkdir(packageRoot, { recursive: true });
+	await mkdir(runtimeRoot, { recursive: true, mode: 0o700 });
+	await assertRuntimeDirectory(runtimeRoot);
+	const release = await acquireInstallLock(runtimeRoot, options);
+	try { return await install(runtimeRoot); }
+	finally { await release(); }
+}
+
+async function installWindowsGentleAiFromGoSumdb(options, packageRoot, architecture) {
+	const execute = options.execFile ?? execFileAsync;
+	return withInstallLock(packageRoot, options, async (runtimeRoot) => {
+		await cleanupStaleStagingBundles(runtimeRoot);
+		const stagingDirectory = await mkdtemp(join(runtimeRoot, `.v${INSTALLER_VERSION}.staging-`));
+		try {
+			await chmod(stagingDirectory, 0o700);
+			const buildDirectory = join(stagingDirectory, ".build");
+			await mkdir(buildDirectory, { recursive: true, mode: 0o700 });
+			const goPath = await resolveWindowsGoExecutable(options);
+			const environment = sealedGoEnvironment(goPath, buildDirectory, architecture);
+			for (const directory of [environment.GOBIN, environment.GOPATH, environment.GOMODCACHE, environment.GOCACHE, environment.TEMP]) await mkdir(directory, { recursive: true, mode: 0o700 });
+			await recoverInterruptedPublication(runtimeRoot, (directory) => existingWindowsSourceBundleMatches(directory, execute, goPath, environment, architecture), options);
+			const existing = versionBundlePath(runtimeRoot);
+			if (await existingWindowsSourceBundleMatches(existing, execute, goPath, environment, architecture)) return { installed: false, binaryPath: join(existing, "gentle-ai.exe"), method: GENTLE_AI_INSTALL_METHOD.GO_SUMDB_SOURCE_BUILD };
+			await assertGoToolchain(execute, goPath, environment, stagingDirectory);
+			try { await runCommand(execute, goPath, ["install", GENTLE_AI_WINDOWS_SOURCE_PACKAGE], commandOptions(environment, stagingDirectory)); }
+			catch (error) { throw new GentleAiInstallerError(GENTLE_AI_GO_INSTALL_FAILED_CODE, `Gentle AI Go SumDB source installation failed for ${GENTLE_AI_WINDOWS_SOURCE_PACKAGE}.`, error); }
+			const builtBinary = join(environment.GOBIN, "gentle-ai.exe"), binaryPath = join(stagingDirectory, "gentle-ai.exe");
+			const details = await lstat(builtBinary);
+			if (!details.isFile() || details.isSymbolicLink()) throw new GentleAiInstallerError(GENTLE_AI_GO_INSTALL_FAILED_CODE, "Gentle AI Go installation produced a non-regular gentle-ai.exe.");
+			await copyFile(builtBinary, binaryPath);
+			const metadata = await verifyGoBuildMetadata(execute, goPath, binaryPath, environment, stagingDirectory, architecture);
+			await assertExactGentleAiVersion(execute, binaryPath, environment, stagingDirectory);
+			const binarySha256 = await sha256File(binaryPath);
+			await writeFile(join(stagingDirectory, "integrity.json"), canonicalManifest(windowsSourceManifest(metadata, binarySha256, architecture)), { mode: 0o600 });
+			await safeRemoveDirectory(buildDirectory);
+			const published = await publishBundle(runtimeRoot, stagingDirectory, options);
+			return { installed: true, binaryPath: join(published, "gentle-ai.exe"), method: GENTLE_AI_INSTALL_METHOD.GO_SUMDB_SOURCE_BUILD };
+		} finally { await safeRemoveDirectory(stagingDirectory); }
+	});
+}
+
+async function installSignedRelease(options, packageRoot, platform, arch, asset) {
+	return withInstallLock(packageRoot, options, async (runtimeRoot) => {
+		await recoverInterruptedPublication(runtimeRoot, (directory) => existingSignedBundleMatches(directory, asset, platform), options);
+		await cleanupStaleStagingBundles(runtimeRoot);
+		const existing = versionBundlePath(runtimeRoot);
+		if (await existingSignedBundleMatches(existing, asset, platform)) return { installed: false, binaryPath: join(existing, asset.executable), asset };
+		const stagingDirectory = await mkdtemp(join(runtimeRoot, `.v${INSTALLER_VERSION}.staging-`));
+		try {
+			const archive = join(stagingDirectory, asset.name);
+			await (options.download ?? downloadGentleAiAsset)(asset.url, archive);
+			if ((await sha256File(archive)) !== asset.sha256) throw new Error(`Gentle AI archive checksum mismatch for ${asset.name}`);
+			const extracted = join(stagingDirectory, "extracted");
+			await (options.extractArchive ?? extractGentleAiArchive)(archive, extracted);
+			const source = await expectedRegularFile(extracted, asset.executable);
+			if (asset.binarySha256 && (await sha256File(source)) !== asset.binarySha256) throw new Error(`Gentle AI binary checksum mismatch for ${asset.name}`);
+			const binaryPath = join(stagingDirectory, asset.executable);
+			await copyFile(source, binaryPath);
+			if (platform !== "win32") await chmod(binaryPath, 0o700);
+			await writeFile(join(stagingDirectory, "integrity.json"), canonicalManifest(signedReleaseManifest(asset, await sha256File(binaryPath))), { mode: 0o600 });
+			await safeRemoveDirectory(extracted);
+			await rm(archive, { force: true });
+			const published = await publishBundle(runtimeRoot, stagingDirectory, options);
+			return { installed: true, binaryPath: join(published, asset.executable), asset };
+		} finally { await safeRemoveDirectory(stagingDirectory); }
+	});
 }
 
 export async function installGentleAi(options = {}) {
 	const packageRoot = options.packageRoot ?? resolveGentleAiInstallerPackageRoot();
-	const platform = options.platform ?? process.platform;
-	const arch = options.arch ?? process.arch;
-	const releaseAssets = options.releaseAssets ?? GENTLE_AI_RELEASE_ASSETS;
-	const asset = resolveGentleAiReleaseAsset(platform, arch, releaseAssets);
-	const installDirectory = join(packageRoot, ".gentle-ai", `v${INSTALLER_VERSION}`);
-	const binaryPath = join(installDirectory, asset.executable);
-	const manifestPath = join(installDirectory, "integrity.json");
-	await assertRuntimeDirectory(join(packageRoot, ".gentle-ai"));
-	await assertRuntimeDirectory(installDirectory);
-	if (await existingBinaryMatches(binaryPath, manifestPath, asset, platform)) return { installed: false, binaryPath, asset };
-
-	await mkdir(packageRoot, { recursive: true });
-	const temporaryDirectory = await mkdtemp(join(packageRoot, ".gentle-ai-install-"));
-	try {
-		await chmod(temporaryDirectory, 0o700);
-		const archive = join(temporaryDirectory, asset.name);
-		await (options.download ?? downloadGentleAiAsset)(asset.url, archive);
-		const digest = await sha256File(archive);
-		if (digest !== asset.sha256) throw new Error(`Gentle AI archive checksum mismatch for ${asset.name}`);
-		const extracted = join(temporaryDirectory, "extracted");
-		await (options.extractArchive ?? extractGentleAiArchive)(archive, extracted);
-		const source = await expectedRegularFile(extracted, asset.executable);
-		if (asset.binarySha256 && (await sha256File(source)) !== asset.binarySha256) throw new Error(`Gentle AI binary checksum mismatch for ${asset.name}`);
-		await mkdir(installDirectory, { recursive: true, mode: 0o700 });
-		await assertRuntimeDirectory(join(packageRoot, ".gentle-ai"));
-		await assertRuntimeDirectory(installDirectory);
-		const temporaryBinary = join(installDirectory, `.${asset.executable}.${process.pid}.${Date.now()}.tmp`);
-		const temporaryManifest = join(installDirectory, `.integrity.${process.pid}.${Date.now()}.tmp`);
-		await copyFile(source, temporaryBinary);
-		if (platform !== "win32") await chmod(temporaryBinary, 0o700);
-		const binarySha256 = await sha256File(temporaryBinary);
-		await writeFile(temporaryManifest, `${JSON.stringify({ version: INSTALLER_VERSION, asset: asset.name, assetSha256: asset.sha256, binarySha256 })}\n`, { mode: 0o600 });
-		await rename(temporaryBinary, binaryPath);
-		await rename(temporaryManifest, manifestPath);
-		return { installed: true, binaryPath, asset };
-	} finally {
-		await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => undefined);
-	}
+	const platform = options.platform ?? process.platform, arch = options.arch ?? process.arch;
+	if (isWindowsGoSumdbSourceTarget(platform, arch)) return installWindowsGentleAiFromGoSumdb(options, packageRoot, arch);
+	const asset = resolveGentleAiReleaseAsset(platform, arch, options.releaseAssets ?? GENTLE_AI_RELEASE_ASSETS);
+	return installSignedRelease(options, packageRoot, platform, arch, asset);
 }
