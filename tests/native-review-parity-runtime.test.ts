@@ -378,7 +378,7 @@ test("official pinned package runtime keeps frozen candidate lineages and receip
 	t.diagnostic("pre-push, pre-pr, and release require remote/publication evidence; their network-aware gate contracts remain covered by dedicated gate integration tests rather than this hermetic binary E2E.");
 });
 
-test("registered gentle_review START materializes a safe internal skill symlink before invoking native authority", async (t) => {
+test("registered gentle_review START materializes a safe internal skill symlink and cleans pending consent on session shutdown", async (t) => {
 	if (process.platform === "win32") {
 		t.skip("Git for Windows does not preserve this POSIX directory-symlink candidate shape");
 		return;
@@ -416,8 +416,9 @@ test("registered gentle_review START materializes a safe internal skill symlink 
 		return { ...command, signal: null, timedOut: false, outputLimitExceeded: false };
 	});
 	const tools = new Map<string, RegisteredController>();
+	let sessionShutdown: ((event: unknown, context: ExtensionContext) => Promise<void> | void) | undefined;
 	createGentleAiExtension({ nativeReviewCli: native, candidateViews } as Parameters<typeof createGentleAiExtension>[0])({
-		on() {},
+		on(name: string, handler: (event: unknown, context: ExtensionContext) => Promise<void> | void) { if (name === "session_shutdown") sessionShutdown = handler; },
 		registerTool(definition: RegisteredController & { name: string }) { tools.set(definition.name, definition); },
 		registerCommand() {},
 	} as unknown as ExtensionAPI);
@@ -438,8 +439,16 @@ test("registered gentle_review START materializes a safe internal skill symlink 
 	t.diagnostic(JSON.stringify({ returned: returned?.details, error, nativeStartReached }));
 	assert.equal(thrown, undefined, "safe internal symlink materialization must not throw before START");
 	assert.equal(nativeStartReached, true, "safe internal symlink materialization must reach native START");
-	const result = (returned?.details as { result?: Record<string, unknown> } | undefined)?.result;
-	assert.equal(typeof result?.lineage_id, "string", "safe internal symlink materialization must return native review authority");
-	assert.equal(result?.state, "reviewing");
-	candidateViews.cleanup(candidateViews.resolveForLens(result!.lineage_id as string, "review-reliability").token);
+	const result = returned?.details as Record<string, unknown> | undefined;
+	assert.equal(result?.status, "blocked");
+	assert.equal(result?.outcome, "native-review-consent-required");
+	assert.equal(typeof result?.consent_binding, "string");
+	assert.equal(result?.lineage_created, false);
+	assert.ok(sessionShutdown, "extension must register session_shutdown cleanup");
+	const context = { cwd: repository, hasUI: false, ui: { notify: () => {} } } as unknown as ExtensionContext;
+	await sessionShutdown({}, context);
+	await assert.rejects(
+		controller.execute("answer-after-shutdown", { operation: "answer-consent", input: JSON.stringify({ consentBinding: result!.consent_binding, answer: "granted" }) }, undefined, undefined, context),
+		/unknown, expired, or already consumed/,
+	);
 });

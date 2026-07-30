@@ -9,14 +9,16 @@ import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import {
 	NATIVE_REVIEW_ERROR_CODE,
 	NativeReviewCliError,
+	NativeReviewConsentRequiredError,
 	NativeReviewCliV213 as NativeReviewCliV213Production,
 	setNativeCliContractForTesting,
 	type ExecFileAdapter,
 	type NativeReviewCli,
+	type NativeReviewConsentAnswer,
 } from "../lib/native-review-cli.ts";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
-import { readReviewConsentLatch, recordReviewConsentLatch } from "../lib/review-consent-latch.ts";
-import type { AuthorityRepairAssessmentV1, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
+import { recordReviewConsentLatch } from "../lib/review-consent-latch.ts";
+import type { AuthorityRepairAssessmentV1, ReviewConsentV2, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 
 // Queued-adapter clients never execute a real process; default to a fixed
 // absolute package-local path so these tests do not depend on an installed
@@ -407,18 +409,23 @@ interface RegisteredCommandFixture {
 	handler: (args: string, ctx: ExtensionContext) => Promise<void>;
 }
 
-function runtime(nativeReviewCli: NativeReviewCli | null): { controller: RegisteredTool; commands: Map<string, RegisteredCommandFixture> } {
+interface RegisteredEventFixture {
+	(event: unknown, ctx: ExtensionContext): Promise<unknown> | unknown;
+}
+
+function runtime(nativeReviewCli: NativeReviewCli | null): { controller: RegisteredTool; commands: Map<string, RegisteredCommandFixture>; events: Map<string, RegisteredEventFixture> } {
 	const tools = new Map<string, RegisteredTool>();
 	const commands = new Map<string, RegisteredCommandFixture>();
+	const events = new Map<string, RegisteredEventFixture>();
 	const dependencies = { nativeReviewCli, candidateViews: new CandidateViewRegistry() } as unknown as Parameters<typeof createGentleAiExtension>[0];
 	createGentleAiExtension(dependencies)({
-		on() {},
+		on(name: string, handler: RegisteredEventFixture) { events.set(name, handler); },
 		registerTool(definition: RegisteredTool & { name: string }) { tools.set(definition.name, definition); },
 		registerCommand(name: string, definition: RegisteredCommandFixture) { commands.set(name, definition); },
 	} as unknown as ExtensionAPI);
 	const controller = tools.get("gentle_review");
 	assert.ok(controller);
-	return { controller: controller!, commands };
+	return { controller: controller!, commands, events };
 }
 
 function headlessContext(cwd: string, notices: Array<{ message: string; type?: string }> = []): ExtensionContext {
@@ -447,6 +454,7 @@ test("kill-switch: effective off returns a non-failure skipped envelope and neve
 	const result = await execStart(controller, "kill-switch-off", headlessContext(cwd));
 	assert.equal(result.status, "skipped");
 	assert.equal(result.outcome, "review-mode-disabled");
+	assert.equal(result.delivery, "disabled/unmanaged");
 	assert.equal(result.mutation_performed, false);
 	assert.equal(state.startCalls, 0, "native start must not be called once the kill switch reports off");
 });
@@ -516,67 +524,168 @@ test("kill-switch: an unexpected reviewMode failure maps to the existing native-
 	assert.equal(result.outcome, "native-operation-failed");
 });
 
-test("consent: an existing latch skips the prompt and proceeds with actor_binding", async (t) => {
+function candidateConsent(cwd: string): ReviewConsentV2 {
+	const targetIdentity = `sha256:${"a".repeat(64)}`;
+	const choices = [
+		{ answer: "granted" as const, label: "Run the review now", effect: "Review this exact candidate only.", invocation: `gentle-ai review start --contract gentle-ai.review-integration/v2 --cwd ${cwd} --target ${targetIdentity} --projection workspace --lineage native-lineage --consent granted` },
+		{ answer: "declined" as const, label: "Not now, just this once", effect: "Create no authority and ask again next candidate.", invocation: `gentle-ai review start --contract gentle-ai.review-integration/v2 --cwd ${cwd} --target ${targetIdentity} --projection workspace --lineage native-lineage --consent declined` },
+	] as const;
+	const raw = { schema: "gentle-ai.review-integration.consent/v2", contract: "gentle-ai.review-integration/v2", operation: "review.start", action: "consent_required", blocking: true, target_identity: targetIdentity, projection: "workspace", risk_level: "high", changed_files: 1, changed_lines: 1, headline: "Review this candidate", reason: "It changes a process boundary.", value: "Review catches regressions.", risk_evidence: ["shell process"], choices: choices.map((choice) => ({ ...choice })), off_path: { note: "Disable reviews separately.", command: "gentle-ai review mode disable" } };
+	return { schema: "gentle-ai.review-integration.consent/v2", contract: "gentle-ai.review-integration/v2", operation: "review.start", action: "consent_required", blocking: true, targetIdentity, projection: "workspace", riskLevel: "high", changedFiles: 1, changedLines: 1, headline: "Review this candidate", reason: "It changes a process boundary.", value: "Review catches regressions.", riskEvidence: ["shell process"], choices, offPath: { note: "Disable reviews separately.", command: "gentle-ai review mode disable" }, raw };
+}
+
+function relayedConsentNative(cwd: string): { native: NativeReviewCli; answers: NativeReviewConsentAnswer[] } {
+	const { native } = fakeOrganicNative();
+	const consent = candidateConsent(cwd);
+	const answers: NativeReviewConsentAnswer[] = [];
+	native.start = async () => { throw new NativeReviewConsentRequiredError(consent); };
+	native.answerConsent = async (request) => {
+		answers.push(request.answer);
+		if (request.answer === "declined") return { kind: "declined", targetIdentity: consent.targetIdentity, projection: "workspace", riskLevel: "high", changedFiles: 1, changedLines: 1, consent: "declined_this_candidate", raw: { operation: "review/start", action: "declined", consent: "declined_this_candidate" } };
+		return { kind: "started", start: { lineageId: "native-lineage", state: "reviewing", riskLevel: "high", selectedLenses: ["review-risk", "review-resilience", "review-readability", "review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true } };
+	};
+	return { native, answers };
+}
+
+async function answerConsent(controller: RegisteredTool, binding: unknown, answer: unknown, ctx: ExtensionContext): Promise<Record<string, unknown>> {
+	const { details } = await controller.execute("consent-answer", { operation: "answer-consent", input: JSON.stringify({ consentBinding: binding, answer }) }, undefined, undefined, ctx);
+	return details as Record<string, unknown>;
+}
+
+async function blockedConsent(controller: RegisteredTool, id: string, ctx: ExtensionContext): Promise<Record<string, unknown>> {
+	const result = await execStart(controller, id, ctx);
+	assert.equal(result.status, "blocked");
+	assert.equal(result.outcome, "native-review-consent-required");
+	assert.equal(typeof result.consent_binding, "string");
+	return result;
+}
+
+test("consent relay returns the identical complete parent-visible envelope with or without UI and never answers internally", async (t) => {
 	const cwd = repository(t);
 	recordReviewConsentLatch(cwd);
-	const { native } = fakeOrganicNative({ riskEvidence: ["shell scripting in deploy.sh"] });
-	const { controller } = runtime(native);
-	const result = await execStart(controller, "consent-latched", confirmContext(cwd, false));
-	assert.ok(result.actor_binding, "an existing latch must not block actor_binding even though confirm() would decline");
-	assert.equal(result.consent_notice, undefined);
+	for (const ctx of [
+		{ cwd, hasUI: true, ui: { select: async () => { throw new Error("internal consent UI must not run"); }, notify: () => {} } } as unknown as ExtensionContext,
+		headlessContext(cwd),
+	]) {
+		const { native, answers } = relayedConsentNative(cwd);
+		const result = await blockedConsent(runtime(native).controller, "consent-blocked", ctx);
+		assert.deepEqual(result.consent, candidateConsent(cwd).raw);
+		assert.deepEqual(answers, []);
+		assert.equal(result.lineage_created, false);
+	}
 });
 
-test("consent: headless never blocks, always surfaces a notice, and leaves the latch untouched", async (t) => {
+test("explicit consent follow-up grants or declines exactly once", async (t) => {
 	const cwd = repository(t);
-	const { native } = fakeOrganicNative({ riskEvidence: ["service credentials in .env.example"] });
-	const { controller } = runtime(native);
-	const notices: Array<{ message: string; type?: string }> = [];
-	const result = await execStart(controller, "consent-headless", headlessContext(cwd, notices));
-	assert.ok(result.actor_binding, "headless must still run the review");
-	assert.equal(typeof result.consent_notice, "string");
-	assert.ok(notices.some((notice) => notice.type === "info" && notice.message === result.consent_notice));
-	assert.equal(readReviewConsentLatch(cwd), false, "headless must never consume/persist the one-time question");
+	for (const answer of ["granted", "declined"] as const) {
+		const { native, answers } = relayedConsentNative(cwd);
+		const { controller } = runtime(native);
+		const blocked = await blockedConsent(controller, `consent-${answer}`, headlessContext(cwd));
+		const result = await answerConsent(controller, blocked.consent_binding, answer, headlessContext(cwd));
+		assert.deepEqual(answers, [answer]);
+		if (answer === "granted") assert.ok(result.actor_binding);
+		else {
+			assert.equal(result.outcome, "consent-declined-this-candidate");
+			assert.equal(result.lineage_created, false);
+			assert.equal(result.actor_binding, undefined);
+		}
+		await assert.rejects(() => answerConsent(controller, blocked.consent_binding, answer, headlessContext(cwd)), /unknown, expired, or already consumed/);
+	}
 });
 
-test("consent: accepting the prompt records the latch and proceeds with actor_binding", async (t) => {
+test("consent follow-up rejects invalid token, unknown id, changed cwd, and changed target binding", async (t) => {
 	const cwd = repository(t);
-	const { native } = fakeOrganicNative({ riskEvidence: ["payments in billing.ts"] });
+	const consent = candidateConsent(cwd);
+	const { native, answers } = relayedConsentNative(cwd);
+	native.start = async () => { throw new NativeReviewConsentRequiredError(consent); };
 	const { controller } = runtime(native);
-	assert.equal(readReviewConsentLatch(cwd), false);
-	const result = await execStart(controller, "consent-accept", confirmContext(cwd, true));
-	assert.ok(result.actor_binding);
-	assert.equal(readReviewConsentLatch(cwd), true);
+	const blocked = await blockedConsent(controller, "consent-invalid", headlessContext(cwd));
+	await assert.rejects(() => controller.execute("malformed", { operation: "answer-consent", input: "not-json" }, undefined, undefined, headlessContext(cwd)), /input is not valid JSON/);
+	await assert.rejects(() => controller.execute("extra", { operation: "answer-consent", input: JSON.stringify({ consentBinding: blocked.consent_binding, answer: "granted", target: "substitute" }) }, undefined, undefined, headlessContext(cwd)), /exactly consentBinding and answer/);
+	await assert.rejects(() => answerConsent(controller, blocked.consent_binding, "yes", headlessContext(cwd)), /answer must be granted or declined/);
+	await assert.rejects(() => answerConsent(controller, "missing", "granted", headlessContext(cwd)), /unknown, expired, or already consumed/);
+	const other = repository(t);
+	await assert.rejects(() => answerConsent(controller, blocked.consent_binding, "granted", headlessContext(other)), /repository binding changed/);
+	const originalTarget = consent.targetIdentity;
+	(consent as { targetIdentity: string }).targetIdentity = `sha256:${"b".repeat(64)}`;
+	await assert.rejects(() => answerConsent(controller, blocked.consent_binding, "granted", headlessContext(cwd)), /consent envelope binding changed/);
+	(consent as { targetIdentity: string }).targetIdentity = originalTarget;
+	(consent as { projection: string }).projection = "staged";
+	await assert.rejects(() => answerConsent(controller, blocked.consent_binding, "granted", headlessContext(cwd)), /consent envelope binding changed/);
+	(consent as { projection: string }).projection = "workspace";
+	(consent.choices[0] as { invocation: string }).invocation = consent.choices[0].invocation.replace("native-lineage", "changed-lineage");
+	await assert.rejects(() => answerConsent(controller, blocked.consent_binding, "granted", headlessContext(cwd)), /consent envelope binding changed/);
+	assert.deepEqual(answers, []);
 });
 
-test("consent: declining persists nothing, applies only to this work unit, and withholds actor_binding", async (t) => {
+test("ambiguous consent mutation consumes the one-shot binding and requires status instead of blind replay", async (t) => {
 	const cwd = repository(t);
-	const { native } = fakeOrganicNative({ riskEvidence: ["authentication in auth.ts"] });
+	const { native } = relayedConsentNative(cwd);
+	let statusCalls = 0;
+	const targetStatus = native.targetStatus!;
+	native.targetStatus = async (request) => { statusCalls += 1; return await targetStatus(request); };
+	native.answerConsent = async () => { throw Object.assign(new Error("ambiguous"), { mutationOutcome: "unknown", nextAction: "review.status" }); };
 	const { controller } = runtime(native);
-	const result = await execStart(controller, "consent-decline", confirmContext(cwd, false));
-	assert.equal(result.actor_binding, undefined, "declining must withhold actor dispatch for this work unit");
-	assert.equal(readReviewConsentLatch(cwd), false, "declining must never persist anything");
-	assert.ok(result.result, "the native start result itself is still reported");
+	const blocked = await blockedConsent(controller, "consent-ambiguous", headlessContext(cwd));
+	await answerConsent(controller, blocked.consent_binding, "granted", headlessContext(cwd));
+	assert.equal(statusCalls, 2, "ambiguous consent must reconcile through target status");
+	await assert.rejects(() => answerConsent(controller, blocked.consent_binding, "granted", headlessContext(cwd)), /unknown, expired, or already consumed/);
 });
 
-test("consent: an unreadable answer (confirm throws) still runs the review, leaves the latch untouched, and surfaces a notice", async (t) => {
+test("session shutdown clears pending candidate consent bindings and is idempotent", async (t) => {
 	const cwd = repository(t);
-	const { native } = fakeOrganicNative({ riskEvidence: ["an executable permission change in run.sh"] });
-	const { controller } = runtime(native);
-	const result = await execStart(controller, "consent-throw", throwingConfirmContext(cwd));
-	assert.ok(result.actor_binding, "an unreadable answer must still run the review");
-	assert.equal(typeof result.consent_notice, "string");
-	assert.equal(readReviewConsentLatch(cwd), false);
+	const { native, answers } = relayedConsentNative(cwd);
+	const { controller, events } = runtime(native);
+	const blocked = await blockedConsent(controller, "consent-before-shutdown", headlessContext(cwd));
+	const shutdown = events.get("session_shutdown");
+	assert.ok(shutdown);
+	await shutdown({}, headlessContext(cwd));
+	await shutdown({}, headlessContext(cwd));
+	await assert.rejects(() => answerConsent(controller, blocked.consent_binding, "granted", headlessContext(cwd)), /unknown, expired, or already consumed/);
+	assert.deepEqual(answers, []);
 });
 
-test("consent stays dark (capability-gated) when the native start result carries no riskEvidence", async (t) => {
+test("successful explicit disable clears pending candidate consent binding even after re-enable", async (t) => {
 	const cwd = repository(t);
-	const { native } = fakeOrganicNative({ riskEvidence: undefined, lensesRequired: true });
+	const { native, answers } = relayedConsentNative(cwd);
+	let effective: "on" | "off" = "on";
+	native.reviewMode = async (request) => {
+		if (request.operation === "disable") effective = "off";
+		if (request.operation === "enable") effective = "on";
+		return { operation: request.operation, scope: "clone", status: { global: "", cloneLocal: effective === "off" ? "off" : "", effective, source: effective === "off" ? "clone_local" : "default" } };
+	};
+	const { controller, commands } = runtime(native);
+	const blocked = await blockedConsent(controller, "consent-before-disable", headlessContext(cwd));
+	const command = commands.get("gentle:review-mode")!;
+	await command.handler("disable", headlessContext(cwd));
+	await command.handler("enable", headlessContext(cwd));
+	await assert.rejects(() => answerConsent(controller, blocked.consent_binding, "granted", headlessContext(cwd)), /unknown, expired, or already consumed/);
+	assert.deepEqual(answers, []);
+});
+
+test("candidate-scoped decline creates no authority and the next candidate asks again", async (t) => {
+	const cwd = repository(t);
+	const { native, answers } = relayedConsentNative(cwd);
 	const { controller } = runtime(native);
-	let confirmed = false;
-	const ctx = { cwd, hasUI: true, ui: { confirm: async () => { confirmed = true; return true; }, notify: () => {} } } as unknown as ExtensionContext;
-	const result = await execStart(controller, "consent-dark", ctx);
-	assert.equal(confirmed, false, "no riskEvidence (dark riskEvidence capability) must never trigger the consent prompt");
-	assert.ok(result.actor_binding);
+	for (const id of ["decline-one", "decline-two"]) {
+		const blocked = await blockedConsent(controller, id, headlessContext(cwd));
+		const result = await answerConsent(controller, blocked.consent_binding, "declined", headlessContext(cwd));
+		assert.equal(result.outcome, "consent-declined-this-candidate");
+		assert.equal(result.lineage_created, false);
+		assert.equal(result.actor_binding, undefined);
+	}
+	assert.deepEqual(answers, ["declined", "declined"]);
+});
+
+test("low-risk zero-lens START remains silent", async (t) => {
+	const cwd = repository(t);
+	const { native } = fakeOrganicNative({ riskEvidence: undefined, lensesRequired: false });
+	const { controller } = runtime(native);
+	let selected = false;
+	const ctx = { cwd, hasUI: true, ui: { select: async () => { selected = true; return undefined; }, notify: () => {} } } as unknown as ExtensionContext;
+	const result = await execStart(controller, "consent-low-risk", ctx);
+	assert.equal(selected, false);
+	assert.ok(result.result);
 });
 
 // ---------------------------------------------------------------------------

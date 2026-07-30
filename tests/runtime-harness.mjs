@@ -364,13 +364,19 @@ async function run() {
 	const toolCwd = await tempWorkspace();
 	try {
 		const toolHook = hooks.get("tool_call")[0];
+		const ghPrCwd = await tempWorkspace();
+		try {
+			execFileSync("git", ["init"], { cwd: ghPrCwd, stdio: "ignore" });
+			const receiptGate = await toolHook(
+				{ toolName: "bash", input: { command: "gh pr create --draft" } },
+				createCtx(ghPrCwd, true, "receipt-gate-session"),
+			);
+			assert.equal(receiptGate.block, true);
+			assert.match(receiptGate.reason, /exactly derive.*--base/i);
+		} finally {
+			await rm(ghPrCwd, { recursive: true, force: true });
+		}
 		assert.equal(await toolHook({ toolName: "bash", input: { command: "git status" } }, createCtx(toolCwd)), undefined);
-		const receiptGate = await toolHook(
-			{ toolName: "bash", input: { command: "gh pr create --draft" } },
-			createCtx(toolCwd, true, "receipt-gate-session"),
-		);
-		assert.equal(receiptGate.block, true);
-		assert.match(receiptGate.reason, /exactly derive.*--base/i);
 		const denied = await toolHook({ toolName: "bash", input: { command: "rm -rf /" } }, createCtx(toolCwd));
 		assert.equal(denied.block, true);
 		assert.match(denied.reason, /destructive/);
@@ -399,12 +405,18 @@ async function run() {
 			0,
 			"receipt validation must not launch or announce review actors",
 		);
-		const commitGate = await toolHook(
-			{ toolName: "bash", input: { command: "git commit -m bounded" } },
-			createCtx(toolCwd),
-		);
-		assert.equal(commitGate.block, true);
-		assert.match(commitGate.reason, /exactly derive/i);
+		const commitCwd = await tempWorkspace();
+		try {
+			execFileSync("git", ["init"], { cwd: commitCwd, stdio: "ignore" });
+			const commitGate = await toolHook(
+				{ toolName: "bash", input: { command: "git commit -m bounded tracked.txt" } },
+				createCtx(commitCwd),
+			);
+			assert.equal(commitGate.block, true);
+			assert.match(commitGate.reason, /exactly derive/i);
+		} finally {
+			await rm(commitCwd, { recursive: true, force: true });
+		}
 	} finally {
 		await rm(toolCwd, { recursive: true, force: true });
 	}
