@@ -5,6 +5,7 @@ import test from "node:test";
 import { GENTLE_AI_VERSION } from "../lib/gentle-ai-binary.ts";
 import {
 	NativeReviewCliV216,
+	NativeReviewConsentBindingError,
 	NativeReviewConsentRequiredError,
 	clearNativeReviewCapabilitiesCacheForTesting,
 	type ExecFileAdapter,
@@ -98,6 +99,66 @@ test("consent follow-up executes the provider-named invocation exactly once and 
 		() => native.answerConsent!({ cwd: "/repo", consent: changed, answer: "declined" }),
 		/target|binding/,
 	);
+});
+
+// A binding mismatch is decided entirely inside Pi, before the provider is
+// launched, so it must not be reported as a provider failure (issue #247).
+test("a consent invocation binding mismatch is a typed pre-native error that never launches the provider", async () => {
+	const consent = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV2(fixture<Record<string, unknown>>("consent.fixture.json"));
+	const queue = queuedAdapter([]);
+	await assert.rejects(
+		() => client(queue.adapter).answerConsent!({ cwd: "/repo/.git/gentle-ai/candidate-views/a1c7fdae", consent, answer: "granted" }),
+		(error: unknown) => {
+			assert.ok(error instanceof NativeReviewConsentBindingError);
+			assert.equal(error.name, "NativeReviewConsentBindingError");
+			assert.equal(error.reason, "consent-invocation-cwd-changed");
+			assert.equal(error.launchAttempted, false);
+			assert.equal(error.mutationOutcome, "none");
+			assert.match(error.message, /repository binding changed/);
+			return true;
+		},
+	);
+	assert.deepEqual(queue.calls, []);
+});
+
+// `decodeReviewConsentV2` already rejects a malformed invocation, so these
+// guards defend against a consent object that drifted after decoding. Each one
+// must still name itself rather than collapse into a generic failure.
+test("every consent invocation binding guard reports its own reason without launching the provider", async () => {
+	const decoded = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV2(fixture<Record<string, unknown>>("consent.fixture.json"));
+	const drifted = (mutate: (consent: ReviewConsentV2) => void): ReviewConsentV2 => {
+		const value = structuredClone(decoded);
+		mutate(value);
+		return value;
+	};
+	const rewriteGranted = (consent: ReviewConsentV2, replace: (invocation: string) => string): void => {
+		const choice = consent.choices.find((candidate) => candidate.answer === "granted") as { invocation: string };
+		choice.invocation = replace(choice.invocation);
+	};
+	const cases = [
+		{
+			reason: "consent-answer-unknown",
+			consent: drifted((consent) => { (consent as { choices: unknown }).choices = consent.choices.filter((choice) => choice.answer !== "granted"); }),
+		},
+		{ reason: "consent-invocation-not-start", consent: drifted((consent) => rewriteGranted(consent, (value) => value.replace("review start", "review finalize"))) },
+		{ reason: "consent-invocation-contract-changed", consent: drifted((consent) => rewriteGranted(consent, (value) => value.replace("gentle-ai.review-integration/v2", "gentle-ai.review-integration/v1"))) },
+		{ reason: "consent-invocation-target-changed", consent: drifted((consent) => { (consent as { targetIdentity: string }).targetIdentity = `sha256:${"c".repeat(64)}`; }) },
+		{ reason: "consent-invocation-projection-changed", consent: drifted((consent) => { (consent as { projection: string }).projection = "staged"; }) },
+		{ reason: "consent-invocation-answer-changed", consent: drifted((consent) => rewriteGranted(consent, (value) => value.replace("--consent granted", "--consent declined"))) },
+		{ reason: "consent-invocation-option-invalid", consent: drifted((consent) => rewriteGranted(consent, (value) => `${value} --consent granted`)) },
+	] as const;
+	for (const scenario of cases) {
+		const queue = queuedAdapter([]);
+		await assert.rejects(
+			() => client(queue.adapter).answerConsent!({ cwd: "/repo", consent: scenario.consent, answer: "granted" }),
+			(error: unknown) => {
+				assert.ok(error instanceof NativeReviewConsentBindingError, `${scenario.reason} must be a typed binding error`);
+				assert.equal(error.reason, scenario.reason);
+				return true;
+			},
+		);
+		assert.deepEqual(queue.calls, [], `${scenario.reason} must not launch the provider`);
+	}
 });
 
 test("declined consent decodes the provider's explicit empty authority fields without creating a lineage", async () => {

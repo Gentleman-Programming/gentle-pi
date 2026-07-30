@@ -9,6 +9,7 @@ import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import {
 	NATIVE_REVIEW_ERROR_CODE,
 	NativeReviewCliError,
+	NativeReviewConsentBindingError,
 	NativeReviewConsentRequiredError,
 	NativeReviewCliV213 as NativeReviewCliV213Production,
 	setNativeCliContractForTesting,
@@ -591,6 +592,28 @@ test("explicit consent follow-up grants or declines exactly once", async (t) => 
 		}
 		await assert.rejects(() => answerConsent(controller, blocked.consent_binding, answer, headlessContext(cwd)), /unknown, expired, or already consumed/);
 	}
+});
+
+// Issue #247: a local binding mismatch was indistinguishable from a provider
+// outage, so the reporter diagnosed a missing --cwd that Pi does forward.
+test("a consent binding mismatch surfaces as an actionable local failure, not an opaque native operation failure", async (t) => {
+	const cwd = repository(t);
+	const { native, answers } = relayedConsentNative(cwd);
+	native.answerConsent = async () => {
+		throw new NativeReviewConsentBindingError("consent-invocation-cwd-changed", "Native consent invocation repository binding changed");
+	};
+	const { controller } = runtime(native);
+	const blocked = await blockedConsent(controller, "consent-binding", headlessContext(cwd));
+	const result = await answerConsent(controller, blocked.consent_binding, "granted", headlessContext(cwd));
+	assert.equal(result.status, "blocked");
+	assert.equal(result.outcome, "consent-binding-invalid");
+	assert.deepEqual(result.diagnostics, { code: "consent-invocation-cwd-changed", message: "Native consent invocation repository binding changed" });
+	assert.equal(result.native_invocation_attempted, false);
+	assert.equal(result.lineage_created, false);
+	assert.equal(result.mutation_performed, false);
+	assert.equal(result.mutation_outcome, "none");
+	assert.equal(result.next_action, "resolve-consent-binding");
+	assert.deepEqual(answers, []);
 });
 
 test("consent follow-up rejects invalid token, unknown id, changed cwd, and changed target binding", async (t) => {

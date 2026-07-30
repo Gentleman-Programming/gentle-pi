@@ -105,6 +105,7 @@ import {
 	nativeReviewLegacyQuarantineAuthorization,
 	nativeReviewReconcileAuthorization,
 	NativeReviewCliError,
+	NativeReviewConsentBindingError,
 	NativeReviewConsentRequiredError,
 	NATIVE_REVIEW_ERROR_CODE,
 	NATIVE_REVIEW_LEGACY_QUARANTINE,
@@ -3917,6 +3918,14 @@ function asNativeReviewCliError(error: unknown): { code: string; diagnostics: Na
 	return diagnostics === undefined || value.code !== diagnostics.error_code ? undefined : { code: value.code, diagnostics };
 }
 
+// Same coexisting-module-instance caveat as asNativeReviewCliError above.
+function asNativeReviewConsentBindingError(error: unknown): { reason: string; message: string } | undefined {
+	if (error instanceof NativeReviewConsentBindingError) return { reason: error.reason, message: error.message };
+	if (!(error instanceof Error) || error.name !== "NativeReviewConsentBindingError") return undefined;
+	const reason = (error as unknown as { reason?: unknown }).reason;
+	return typeof reason !== "string" || reason.length === 0 ? undefined : { reason, message: error.message };
+}
+
 function nativeStatusFailed(operation: ReviewControllerOperation, error: unknown): Record<string, unknown> {
 	const cliError = asNativeReviewCliError(error);
 	if (cliError?.code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE) return nativeStatusUnsupported(operation);
@@ -4621,6 +4630,23 @@ function nativeOperationFailure(operation: ReviewControllerOperation, error: unk
 					: { mutation_performed: false, mutation_outcome: "none" }),
 			...(typeof value.failureEnvelope.replayability === "string" ? { replayability: value.failureEnvelope.replayability } : {}),
 			...(typeof value.failureEnvelope.nextAction === "string" ? { next_action: value.failureEnvelope.nextAction } : {}),
+		};
+	}
+	// Every consent binding guard runs before the provider is launched, so this
+	// is a local mismatch with nothing to reconcile. Reporting it as a native
+	// operation failure hides the one fact that makes it fixable.
+	const consentBinding = asNativeReviewConsentBindingError(error);
+	if (consentBinding !== undefined) {
+		return {
+			operation,
+			status: "blocked",
+			outcome: "consent-binding-invalid",
+			native_invocation_attempted: false,
+			lineage_created: false,
+			mutation_performed: false,
+			mutation_outcome: "none" as const,
+			diagnostics: { code: consentBinding.reason, message: consentBinding.message },
+			next_action: "resolve-consent-binding",
 		};
 	}
 	const mutationOutcome = value.mutationOutcome === "unknown" ? "unknown" : "none";

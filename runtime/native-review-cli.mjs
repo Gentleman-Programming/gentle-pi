@@ -1655,6 +1655,23 @@ export class NativeReviewConsentRequiredError extends Error {
 	}
 }
 
+// Raised when the provider-issued consent invocation no longer matches the
+// binding Pi is answering for. Every one of these guards runs before the
+// provider is launched, so the failure is local and nothing was mutated. It
+// carries its own identity precisely so callers never report it as a provider
+// outage: an opaque `native-operation-failed` here sent issue #247 chasing a
+// missing `--cwd` that Pi does forward.
+export class NativeReviewConsentBindingError extends Error {
+	         reason        ;
+	         launchAttempted = false;
+	         mutationOutcome = "none";
+	constructor(reason        , message        ) {
+		super(message);
+		this.name = "NativeReviewConsentBindingError";
+		this.reason = reason;
+	}
+}
+
 function splitNativeConsentInvocation(invocation        )                    {
 	const words           = [];
 	let current = "";
@@ -1706,26 +1723,26 @@ function exactConsentOption(arguments_                   , name        )        
 		const token = arguments_[index] ;
 		if (token === name) {
 			const value = arguments_[index + 1];
-			if (value === undefined) throw new TypeError(`Native consent invocation ${name} is missing its value`);
+			if (value === undefined) throw new NativeReviewConsentBindingError("consent-invocation-option-invalid", `Native consent invocation ${name} is missing its value`);
 			values.push(value);
 			index += 1;
 		} else if (token.startsWith(`${name}=`)) values.push(token.slice(name.length + 1));
 	}
-	if (values.length !== 1) throw new TypeError(`Native consent invocation requires exactly one ${name}`);
+	if (values.length !== 1) throw new NativeReviewConsentBindingError("consent-invocation-option-invalid", `Native consent invocation requires exactly one ${name}`);
 	return values[0] ;
 }
 
 function consentInvocationArguments(request                                  )                    {
 	const choice = request.consent.choices.find((candidate) => candidate.answer === request.answer);
-	if (choice === undefined) throw new TypeError("Native consent answer must be granted or declined");
+	if (choice === undefined) throw new NativeReviewConsentBindingError("consent-answer-unknown", "Native consent answer must be granted or declined");
 	const words = splitNativeConsentInvocation(choice.invocation);
-	if (words[0] !== "gentle-ai" || words[1] !== "review" || words[2] !== "start") throw new TypeError("Native consent invocation is not a provider review START");
+	if (words[0] !== "gentle-ai" || words[1] !== "review" || words[2] !== "start") throw new NativeReviewConsentBindingError("consent-invocation-not-start", "Native consent invocation is not a provider review START");
 	const arguments_ = words.slice(1);
-	if (exactConsentOption(arguments_, "--contract") !== REVIEW_INTEGRATION_CONTRACT) throw new TypeError("Native consent invocation contract changed");
-	if (exactConsentOption(arguments_, "--cwd") !== request.cwd) throw new TypeError("Native consent invocation repository binding changed");
-	if (exactConsentOption(arguments_, "--target") !== request.consent.targetIdentity) throw new TypeError("Native consent invocation target binding changed");
-	if (exactConsentOption(arguments_, "--projection") !== request.consent.projection) throw new TypeError("Native consent invocation projection binding changed");
-	if (exactConsentOption(arguments_, "--consent") !== request.answer || arguments_.at(-1) !== request.answer) throw new TypeError("Native consent invocation answer binding changed");
+	if (exactConsentOption(arguments_, "--contract") !== REVIEW_INTEGRATION_CONTRACT) throw new NativeReviewConsentBindingError("consent-invocation-contract-changed", "Native consent invocation contract changed");
+	if (exactConsentOption(arguments_, "--cwd") !== request.cwd) throw new NativeReviewConsentBindingError("consent-invocation-cwd-changed", "Native consent invocation repository binding changed");
+	if (exactConsentOption(arguments_, "--target") !== request.consent.targetIdentity) throw new NativeReviewConsentBindingError("consent-invocation-target-changed", "Native consent invocation target binding changed");
+	if (exactConsentOption(arguments_, "--projection") !== request.consent.projection) throw new NativeReviewConsentBindingError("consent-invocation-projection-changed", "Native consent invocation projection binding changed");
+	if (exactConsentOption(arguments_, "--consent") !== request.answer || arguments_.at(-1) !== request.answer) throw new NativeReviewConsentBindingError("consent-invocation-answer-changed", "Native consent invocation answer binding changed");
 	return arguments_;
 }
 
