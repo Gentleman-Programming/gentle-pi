@@ -405,12 +405,18 @@ async function run() {
 			0,
 			"receipt validation must not launch or announce review actors",
 		);
-		const commitGate = await toolHook(
-			{ toolName: "bash", input: { command: "git commit -m bounded" } },
-			createCtx(toolCwd),
-		);
-		assert.equal(commitGate.block, true);
-		assert.match(commitGate.reason, /exactly derive/i);
+		const commitCwd = await tempWorkspace();
+		try {
+			execFileSync("git", ["init"], { cwd: commitCwd, stdio: "ignore" });
+			const commitGate = await toolHook(
+				{ toolName: "bash", input: { command: "git commit -m bounded tracked.txt" } },
+				createCtx(commitCwd),
+			);
+			assert.equal(commitGate.block, true);
+			assert.match(commitGate.reason, /exactly derive/i);
+		} finally {
+			await rm(commitCwd, { recursive: true, force: true });
+		}
 	} finally {
 		await rm(toolCwd, { recursive: true, force: true });
 	}
