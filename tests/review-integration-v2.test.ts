@@ -387,15 +387,24 @@ test("failure context accepts scope_change or binding_revision but rejects both 
 	assert.throws(() => decodeReviewFailureV2(both), /exactly one|not allowed/);
 });
 
-test("consent rejects a swapped choice order and an invocation missing the exact answer suffix", () => {
+test("consent rejects a swapped choice order, invalid answer domain, or invocation outside the frozen target", () => {
 	const source = fixture<JsonObject>("consent.fixture.json");
 	const swapped = clone(source);
 	swapped.choices = [(source.choices as JsonObject[])[1], (source.choices as JsonObject[])[0]];
 	assert.throws(() => decodeReviewConsentV2(swapped), /answer/);
 
+	const badAnswer = clone(source);
+	(badAnswer.choices as JsonObject[])[0].answer = "yes";
+	assert.throws(() => decodeReviewConsentV2(badAnswer), /answer/);
+
 	const badInvocation = clone(source);
 	(badInvocation.choices as JsonObject[])[0].invocation = "gentle-ai review start --contract gentle-ai.review-integration/v1 --consent granted";
 	assert.throws(() => decodeReviewConsentV2(badInvocation), /invocation/);
+
+	const differentTarget = clone(source);
+	(differentTarget.choices as JsonObject[])[0].invocation = String((differentTarget.choices as JsonObject[])[0].invocation)
+		.replace(String(differentTarget.target_identity), `sha256:${"b".repeat(64)}`);
+	assert.throws(() => decodeReviewConsentV2(differentTarget), /target|invocation/);
 });
 
 test("next_transition decodes an execute variant and rejects a stop that carries a transition", () => {

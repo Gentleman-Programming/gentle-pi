@@ -106,6 +106,7 @@ export interface NativeReviewCli {
 	reviewStatus(request: NativeReviewStatusRequest): Promise<NativeReviewStatusResult>;
 	capabilities?(request?: NativeCapabilitiesRequest): Promise<ReviewCapabilitiesV2>;
 	targetStatus?(request: NativeTargetStatusRequest): Promise<ReviewStatusV3>;
+	answerConsent?(request: NativeReviewConsentAnswerRequest): Promise<NativeReviewConsentAnswerResult>;
 	reclaim?(request: NativeReviewReclaimRequest): Promise<NativeReviewRecoveryResult>;
 	recover?(request: NativeReviewRecoverRequest): Promise<NativeReviewRecoveryResult>;
 	abandon?(request: NativeReviewAbandonRequest): Promise<NativeReviewRecoveryResult>;
@@ -371,6 +372,21 @@ export interface NativeReviewVerificationEvidenceV2 {
 }
 
 export interface NativeStartRequest { cwd: string; baseRef?: string; committedOnly?: boolean; lineageId?: string; policyPath?: string; focus?: string; projection?: "workspace" | "staged"; signal?: AbortSignal; }
+export const NATIVE_REVIEW_CONSENT_ANSWER = { GRANTED: "granted", DECLINED: "declined" } as const;
+export type NativeReviewConsentAnswer = (typeof NATIVE_REVIEW_CONSENT_ANSWER)[keyof typeof NATIVE_REVIEW_CONSENT_ANSWER];
+export interface NativeReviewConsentAnswerRequest { cwd: string; consent: ReviewConsentV2; answer: NativeReviewConsentAnswer; signal?: AbortSignal; }
+export interface NativeReviewConsentDeclinedResult {
+	kind: "declined";
+	targetIdentity: string;
+	projection: "workspace" | "staged";
+	riskLevel: "medium" | "high";
+	changedFiles: number;
+	changedLines: number;
+	consent: "declined_this_candidate";
+	raw: Readonly<Record<string, unknown>>;
+}
+export interface NativeReviewConsentStartedResult { kind: "started"; start: NativeStartResult; }
+export type NativeReviewConsentAnswerResult = NativeReviewConsentStartedResult | NativeReviewConsentDeclinedResult;
 export interface NativeFinalizeLensResult { lens: string; document: unknown; }
 export interface NativeFinalizeRequest extends NativeReviewFinalizeCapturedResults {
 	cwd: string;
@@ -559,7 +575,13 @@ const REVIEW_RISK_SUBJECT_BY_SIGNAL: Readonly<Record<string, string>> = Object.f
 // an unmapped signal degrades to this rather than dropping the path entirely.
 const REVIEW_RISK_UNKNOWN_SIGNAL_SUBJECT = "a sensitive area";
 
-function nativeRiskEvidenceSubject(reason: Record<string, unknown>): string {
+interface NativeRiskEvidenceReason {
+	readonly code?: string;
+	readonly signal?: string;
+	readonly path?: string;
+}
+
+function nativeRiskEvidenceSubject(reason: NativeRiskEvidenceReason): string {
 	const code = typeof reason.code === "string" ? reason.code : "";
 	if (code === "hot_path") {
 		const signal = typeof reason.signal === "string" ? reason.signal : "";
@@ -568,7 +590,7 @@ function nativeRiskEvidenceSubject(reason: Record<string, unknown>): string {
 	return REVIEW_RISK_SUBJECT_BY_CODE[code] ?? "";
 }
 
-function nativeRiskEvidencePhrase(reason: Record<string, unknown>): string {
+function nativeRiskEvidencePhrase(reason: NativeRiskEvidenceReason): string {
 	const path = typeof reason.path === "string" ? reason.path.trim() : "";
 	// An empty file is named first and described second. Every other subject
 	// reads "<what changed> in <path>", which for a file with no bytes would
@@ -581,7 +603,7 @@ function nativeRiskEvidencePhrase(reason: Record<string, unknown>): string {
 	return `${subject} in ${path}`;
 }
 
-export function nativeRiskEvidencePhrases(riskLevel: string, reasons: readonly Record<string, unknown>[]): readonly string[] {
+export function nativeRiskEvidencePhrases(riskLevel: string, reasons: readonly NativeRiskEvidenceReason[]): readonly string[] {
 	if (riskLevel !== "high" && riskLevel !== "medium") return [];
 	const phrases = reasons.map((reason) => nativeRiskEvidencePhrase(reason)).filter((phrase) => phrase !== "");
 	return riskLevel === "medium" ? [REVIEW_MEDIUM_RISK_REASON, ...phrases] : phrases;
@@ -1121,6 +1143,7 @@ function nativeError(code: NativeReviewErrorCode, operation: NativeReviewOperati
 interface NativeJsonExecution {
 	body: Record<string, unknown>;
 	exitCode: number;
+	process: ExecFileResult;
 }
 
 export class NativeReviewCliV214 {
@@ -1617,17 +1640,112 @@ export class NativeReviewIntegrationError extends Error {
 }
 
 // Raised when negotiated START answers `consent/v2` (action:
-// "consent_required") instead of `start/v3`. Pi stays headless and never
-// sends `--consent relay`, so this is a blocking question surfaced to the
-// caller rather than answered on its behalf.
+// "consent_required") instead of `start/v3`. The provider has frozen no
+// authority yet: Pi must relay this complete candidate-scoped question and may
+// answer only through one of the exact invocations carried by the envelope.
 export class NativeReviewConsentRequiredError extends Error {
 	readonly consent: ReviewConsentV2;
 	readonly launchAttempted = true;
+	readonly mutationOutcome = "none";
 	constructor(consent: ReviewConsentV2) {
 		super(consent.headline);
 		this.name = "NativeReviewConsentRequiredError";
 		this.consent = consent;
 	}
+}
+
+function splitNativeConsentInvocation(invocation: string): readonly string[] {
+	const words: string[] = [];
+	let current = "";
+	let quote: "'" | '"' | undefined;
+	let escaping = false;
+	let started = false;
+	for (const character of invocation.trim()) {
+		if (escaping) {
+			current += character;
+			escaping = false;
+			started = true;
+			continue;
+		}
+		if (character === "\\" && quote !== "'") {
+			escaping = true;
+			started = true;
+			continue;
+		}
+		if (quote !== undefined) {
+			if (character === quote) quote = undefined;
+			else current += character;
+			started = true;
+			continue;
+		}
+		if (character === "'" || character === '"') {
+			quote = character;
+			started = true;
+			continue;
+		}
+		if (/\s/.test(character)) {
+			if (started) {
+				words.push(current);
+				current = "";
+				started = false;
+			}
+			continue;
+		}
+		current += character;
+		started = true;
+	}
+	if (quote !== undefined || escaping) throw new TypeError("Native consent invocation has invalid quoting");
+	if (started) words.push(current);
+	return words;
+}
+
+function exactConsentOption(arguments_: readonly string[], name: string): string {
+	const values: string[] = [];
+	for (let index = 0; index < arguments_.length; index += 1) {
+		const token = arguments_[index]!;
+		if (token === name) {
+			const value = arguments_[index + 1];
+			if (value === undefined) throw new TypeError(`Native consent invocation ${name} is missing its value`);
+			values.push(value);
+			index += 1;
+		} else if (token.startsWith(`${name}=`)) values.push(token.slice(name.length + 1));
+	}
+	if (values.length !== 1) throw new TypeError(`Native consent invocation requires exactly one ${name}`);
+	return values[0]!;
+}
+
+function consentInvocationArguments(request: NativeReviewConsentAnswerRequest): readonly string[] {
+	const choice = request.consent.choices.find((candidate) => candidate.answer === request.answer);
+	if (choice === undefined) throw new TypeError("Native consent answer must be granted or declined");
+	const words = splitNativeConsentInvocation(choice.invocation);
+	if (words[0] !== "gentle-ai" || words[1] !== "review" || words[2] !== "start") throw new TypeError("Native consent invocation is not a provider review START");
+	const arguments_ = words.slice(1);
+	if (exactConsentOption(arguments_, "--contract") !== REVIEW_INTEGRATION_CONTRACT) throw new TypeError("Native consent invocation contract changed");
+	if (exactConsentOption(arguments_, "--cwd") !== request.cwd) throw new TypeError("Native consent invocation repository binding changed");
+	if (exactConsentOption(arguments_, "--target") !== request.consent.targetIdentity) throw new TypeError("Native consent invocation target binding changed");
+	if (exactConsentOption(arguments_, "--projection") !== request.consent.projection) throw new TypeError("Native consent invocation projection binding changed");
+	if (exactConsentOption(arguments_, "--consent") !== request.answer || arguments_.at(-1) !== request.answer) throw new TypeError("Native consent invocation answer binding changed");
+	return arguments_;
+}
+
+function decodeDeclinedConsentStart(value: unknown, expected: NativeReviewConsentAnswerRequest): NativeReviewConsentDeclinedResult {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Native declined consent result must be an object");
+	const body = value as Record<string, unknown>;
+	if (body.operation !== "review/start" || body.action !== "declined" || body.consent !== "declined_this_candidate") throw new TypeError("Native declined consent result has an invalid identity");
+	if (body.target_identity !== expected.consent.targetIdentity || body.projection !== expected.consent.projection || body.risk_level !== expected.consent.riskLevel) throw new TypeError("Native declined consent result target binding changed");
+	if (body.lenses_required !== false || !Array.isArray(body.selected_lenses) || body.selected_lenses.length !== 0 || !Array.isArray(body.lens_bindings) || body.lens_bindings.length !== 0) throw new TypeError("Native declined consent result must create no review authority");
+	if (typeof body.changed_files !== "number" || !Number.isSafeInteger(body.changed_files) || body.changed_files < 0 || typeof body.changed_lines !== "number" || !Number.isSafeInteger(body.changed_lines) || body.changed_lines < 0) throw new TypeError("Native declined consent result has invalid change counts");
+	if (body.lineage_id !== "" || body.state !== "" || body.correction_budget !== 0) throw new TypeError("Native declined consent result cannot carry review authority");
+	return {
+		kind: "declined",
+		targetIdentity: expected.consent.targetIdentity,
+		projection: expected.consent.projection,
+		riskLevel: expected.consent.riskLevel,
+		changedFiles: body.changed_files,
+		changedLines: body.changed_lines,
+		consent: "declined_this_candidate",
+		raw: body,
+	};
 }
 
 type NativeExecutableDigestResolver = (path: string) => string;
@@ -1841,14 +1959,12 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 			...(request.lineageId === undefined ? [] : ["--lineage", request.lineageId]),
 			...(request.policyPath === undefined ? [] : ["--policy", request.policyPath]),
 			...(request.focus === undefined ? [] : ["--focus", request.focus]),
-			// A headless START that reviews without asking still succeeds; its
-			// consent notices are console output, never a failure signal.
-		], true, request.signal, REVIEW_CONSENT_NOTICES);
+			"--consent", "relay",
+		], true, request.signal);
 		// A negotiated v2 START may answer `consent/v2` (action:
 		// "consent_required") instead of `start/v3` when the provider needs an
-		// explicit answer it cannot infer. Discriminated BEFORE decode: the two
-		// envelopes share no required shape, and Pi never sends `--consent
-		// relay`, so this is always surfaced to the caller, never answered here.
+		// explicit answer it cannot infer. Discriminate before decode and surface
+		// the complete envelope; only the caller can map a human answer.
 		if (execution.body.action === "consent_required") {
 			throw new NativeReviewConsentRequiredError(decode(NATIVE_REVIEW_OPERATION.START, true, () => decodeReviewConsentV2(execution.body)));
 		}
@@ -1880,6 +1996,36 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 			...(result.changedFiles === 0 && request.baseRef === undefined ? { hint: REVIEW_EMPTY_CANDIDATE_HINT } : {}),
 			raw: result.raw,
 		};
+	}
+
+	async answerConsent(request: NativeReviewConsentAnswerRequest): Promise<NativeReviewConsentAnswerResult> {
+		const arguments_ = consentInvocationArguments(request);
+		const execution = await this.negotiated(NATIVE_REVIEW_OPERATION.START, request.cwd, arguments_, true, request.signal);
+		if (request.answer === NATIVE_REVIEW_CONSENT_ANSWER.DECLINED) {
+			return decode(NATIVE_REVIEW_OPERATION.START, true, () => decodeDeclinedConsentStart(execution.body, request));
+		}
+		const result = decode(NATIVE_REVIEW_OPERATION.START, true, () => decodeReviewStartV3(execution.body));
+		const answeredTarget = result.targetIdentity ?? result.repositoryContext?.targetIdentity;
+		if (answeredTarget !== request.consent.targetIdentity) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native consent answer target mismatch");
+		const lineageId = exactConsentOption(arguments_, "--lineage");
+		if (result.lineageId !== lineageId) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native consent answer lineage mismatch");
+		return { kind: "started", start: {
+			lineageId: result.lineageId,
+			state: result.state as NativeStartResult["state"],
+			riskLevel: result.riskLevel,
+			selectedLenses: result.selectedLenses,
+			changedFiles: result.changedFiles,
+			changedLines: result.changedLines,
+			correctionBudget: result.correctionBudget,
+			action: result.action as NativeStartAction,
+			lensesRequired: result.lensesRequired,
+			riskReasons: result.riskReasons.map((reason) => ({ ...reason })),
+			...(() => {
+				const evidence = nativeRiskEvidencePhrases(result.riskLevel, result.riskReasons);
+				return evidence.length === 0 ? {} : { riskEvidence: evidence };
+			})(),
+			raw: result.raw,
+		} };
 	}
 
 	private async stageDocument(directory: string, name: string, document: unknown): Promise<string> {

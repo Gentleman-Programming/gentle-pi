@@ -40,9 +40,14 @@ type ToolCallHandler = (
 	ctx: ExtensionContext,
 ) => Promise<unknown>;
 
+interface RegisteredCommandFixture {
+	handler: (args: string, ctx: ExtensionContext) => Promise<void>;
+}
+
 interface Runtime {
 	controller: RegisteredTool;
 	toolCall: ToolCallHandler;
+	commands: Map<string, RegisteredCommandFixture>;
 }
 
 interface PublicationProbeRequestFixture {
@@ -74,6 +79,7 @@ function runtime(
 	candidateViews: CandidateViewRegistry | null = null,
 ): Runtime {
 	const tools = new Map<string, RegisteredTool>();
+	const commands = new Map<string, RegisteredCommandFixture>();
 	let toolCall: ToolCallHandler | undefined;
 	const dependencies = { nativeReviewCli, publicationProbe, publicationProbeTimeoutMs, bashTimeRevalidationTimeoutMs, candidateViews } as unknown as Parameters<typeof createGentleAiExtension>[0];
 	createGentleAiExtension(dependencies)({
@@ -81,12 +87,12 @@ function runtime(
 		if (name === "tool_call") toolCall = handler;
 	},
 		registerTool(definition: RegisteredTool & { name: string }) { tools.set(definition.name, definition); },
-		registerCommand() {},
+		registerCommand(name: string, definition: RegisteredCommandFixture) { commands.set(name, definition); },
 	} as unknown as ExtensionAPI);
 	const controller = tools.get("gentle_review");
 	assert.ok(controller);
 	assert.ok(toolCall);
-	return { controller, toolCall };
+	return { controller, toolCall, commands };
 }
 
 function context(cwd: string, signal?: AbortSignal): ExtensionContext {
@@ -4051,4 +4057,43 @@ test("RECOVER rechecks a committed range against its frozen base instead of the 
 	assert.equal(statusRequests.filter((request) => request.lineageId === "native-lineage")[0]?.baseRef, baseRef);
 	assert.equal(recovers.length, 1);
 	candidateViews.cleanupTerminal("native-lineage", "approved");
+});
+
+test("out-of-band review-mode disable discards stale lifecycle authorization and proceeds organically", async (t) => {
+	const cwd = repository(t);
+	let effective: "on" | "off" = "on";
+	let validations = 0;
+	const command = "git commit -m native";
+	const { controller, toolCall } = runtime(fakeNative({
+		reviewMode: async () => ({ operation: "status", scope: "both", status: { global: effective, cloneLocal: "", effective, source: effective === "off" ? "global" : "default" } }),
+		validate: async () => { validations += 1; return { allowed: true, result: "allow", action: "continue", reason: "ok", gateContext: nativeGateContext() }; },
+		targetStatus: async () => targetStatusFixture({ lineageId: "native-lineage", baseTree: git(cwd, "rev-parse", "HEAD^{tree}"), currentCandidateTree: git(cwd, "write-tree"), paths: [] }),
+	}));
+	const authorized = await controller.execute("authorize-before-disable", { operation: "validate", lineageId: "native-lineage", idempotencyKey: "disable-race", command, input: "{}" }, undefined, undefined, context(cwd));
+	assert.notEqual((authorized.details as Record<string, unknown>).authorization, undefined);
+	effective = "off";
+	assert.equal(await toolCall({ toolName: "bash", input: { command } }, context(cwd)), undefined);
+	assert.equal(validations, 1, "disabled organic delivery must not reuse or revalidate stale review authority");
+});
+
+test("successful /gentle:review-mode disable clears pending authorizations even after mode is re-enabled", async (t) => {
+	const cwd = repository(t);
+	let effective: "on" | "off" = "on";
+	const command = "git commit -m native";
+	const { controller, toolCall, commands } = runtime(fakeNative({
+		reviewMode: async (request) => {
+			if (request.operation === "disable") effective = "off";
+			if (request.operation === "enable") effective = "on";
+			return { operation: request.operation, scope: "clone", status: { global: "", cloneLocal: effective === "off" ? "off" : "", effective, source: effective === "off" ? "clone_local" : "default" } };
+		},
+		validate: async () => ({ allowed: true, result: "allow", action: "continue", reason: "ok", gateContext: nativeGateContext() }),
+		targetStatus: async () => targetStatusFixture({ lineageId: "native-lineage", baseTree: git(cwd, "rev-parse", "HEAD^{tree}"), currentCandidateTree: git(cwd, "write-tree"), paths: [] }),
+	}));
+	await controller.execute("authorize-before-command-disable", { operation: "validate", lineageId: "native-lineage", idempotencyKey: "command-disable", command, input: "{}" }, undefined, undefined, context(cwd));
+	const commandContext = { ...interactiveContext(cwd), ui: { confirm: async () => true, notify: () => {} } } as unknown as ExtensionContext;
+	await commands.get("gentle:review-mode")!.handler("disable", commandContext);
+	await commands.get("gentle:review-mode")!.handler("enable", commandContext);
+	const result = await toolCall({ toolName: "bash", input: { command } }, context(cwd)) as { block: boolean; reason: string };
+	assert.equal(result.block, true);
+	assert.match(result.reason, /receipt consumption failed closed/, "re-enabled delivery must perform fresh receipt discovery rather than reuse the pre-disable authorization");
 });

@@ -1304,10 +1304,14 @@ export function decodeReviewConsentV2(value         )                  {
 	if (body.action !== "consent_required") throw new TypeError("consent.action must be consent_required");
 	if (body.blocking !== true) throw new TypeError("consent.blocking must be true");
 
+	const targetIdentity = sha256(body.target_identity, "consent.target_identity");
 	const choicesArray = body.choices;
 	if (!Array.isArray(choicesArray) || choicesArray.length !== 2) throw new TypeError("consent.choices must have exactly 2 items");
 	const granted = decodeConsentChoice(choicesArray[0], "consent.choices[0]", "granted");
 	const declined = decodeConsentChoice(choicesArray[1], "consent.choices[1]", "declined");
+	for (const choice of [granted, declined]) {
+		if (!choice.invocation.includes(` --target ${targetIdentity} `)) throw new TypeError(`consent choice ${choice.answer} invocation must bind consent.target_identity`);
+	}
 
 	const offPathSource = exactRecord(body.off_path, "consent.off_path", ["note", "command"]);
 	if (offPathSource.command !== "gentle-ai review mode disable") throw new TypeError("consent.off_path.command is unsupported");
@@ -1318,7 +1322,7 @@ export function decodeReviewConsentV2(value         )                  {
 		operation: "review.start",
 		action: "consent_required",
 		blocking: true,
-		targetIdentity: sha256(body.target_identity, "consent.target_identity"),
+		targetIdentity,
 		projection: enumeration(body.projection, REQUIRED_PROJECTIONS, "consent.projection"),
 		riskLevel: enumeration(body.risk_level, ["medium", "high"]         , "consent.risk_level"),
 		changedFiles: integer(body.changed_files, "consent.changed_files"),
