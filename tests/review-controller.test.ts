@@ -482,7 +482,7 @@ test("shipped controller and orchestrator contracts specify inspect-first compac
 	assert.match(toolContract, /RESET.*reclaim.*RECOVER.*recover/s);
 	assert.match(toolContract, /native-input-required.*never.*invent/is);
 	assert.match(toolContract, /output.*lost|response.*lost|ambiguous.*START/is);
-	assert.match(toolContract, /ambiguous START or FINALIZE.*target-scoped native status.*declared action/is);
+	assert.match(toolContract, /ambiguous START, answer-consent, or FINALIZE.*target-scoped native status.*declared action/is);
 	assert.doesNotMatch(toolContract, /START throws.*lineage does not exist/is);
 
 	for (const path of ["assets/orchestrator-delegation.md", "skills/gentle-ai/SKILL.md"]) {

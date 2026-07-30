@@ -434,8 +434,9 @@ test("registered gentle_review START materializes a safe internal skill symlink 
 	t.diagnostic(JSON.stringify({ returned: returned?.details, error, nativeStartReached }));
 	assert.equal(thrown, undefined, "safe internal symlink materialization must not throw before START");
 	assert.equal(nativeStartReached, true, "safe internal symlink materialization must reach native START");
-	const result = (returned?.details as { result?: Record<string, unknown> } | undefined)?.result;
-	assert.equal(typeof result?.lineage_id, "string", "safe internal symlink materialization must return native review authority");
-	assert.equal(result?.state, "reviewing");
-	candidateViews.cleanup(candidateViews.resolveForLens(result!.lineage_id as string, "review-reliability").token);
+	const result = returned?.details as Record<string, unknown> | undefined;
+	assert.equal(result?.status, "blocked");
+	assert.equal(result?.outcome, "native-review-consent-required");
+	assert.equal(typeof result?.consent_binding, "string");
+	assert.equal(result?.lineage_created, false);
 });
