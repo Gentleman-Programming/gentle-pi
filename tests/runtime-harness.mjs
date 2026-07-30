@@ -363,15 +363,20 @@ async function run() {
 
 	const toolCwd = await tempWorkspace();
 	try {
-		execFileSync("git", ["init"], { cwd: toolCwd, stdio: "ignore" });
 		const toolHook = hooks.get("tool_call")[0];
+		const ghPrCwd = await tempWorkspace();
+		try {
+			execFileSync("git", ["init"], { cwd: ghPrCwd, stdio: "ignore" });
+			const receiptGate = await toolHook(
+				{ toolName: "bash", input: { command: "gh pr create --draft" } },
+				createCtx(ghPrCwd, true, "receipt-gate-session"),
+			);
+			assert.equal(receiptGate.block, true);
+			assert.match(receiptGate.reason, /exactly derive.*--base/i);
+		} finally {
+			await rm(ghPrCwd, { recursive: true, force: true });
+		}
 		assert.equal(await toolHook({ toolName: "bash", input: { command: "git status" } }, createCtx(toolCwd)), undefined);
-		const receiptGate = await toolHook(
-			{ toolName: "bash", input: { command: "gh pr create --draft" } },
-			createCtx(toolCwd, true, "receipt-gate-session"),
-		);
-		assert.equal(receiptGate.block, true);
-		assert.match(receiptGate.reason, /exactly derive.*--base/i);
 		const denied = await toolHook({ toolName: "bash", input: { command: "rm -rf /" } }, createCtx(toolCwd));
 		assert.equal(denied.block, true);
 		assert.match(denied.reason, /destructive/);
