@@ -4554,6 +4554,22 @@ interface PendingReviewConsent {
 	consent: ReviewConsentV2;
 	consentDigest: string;
 	expiresAt: number;
+	expiry?: ReturnType<typeof setTimeout>;
+}
+
+function consumePendingReviewConsent(pending: PendingReviewConsent, pendingReviewConsents: Map<string, PendingReviewConsent>): void {
+	if (pending.expiry !== undefined) clearTimeout(pending.expiry);
+	pending.expiry = undefined;
+	if (pendingReviewConsents.get(pending.id) === pending) pendingReviewConsents.delete(pending.id);
+}
+
+function cleanupPendingReviewConsent(pending: PendingReviewConsent, pendingReviewConsents: Map<string, PendingReviewConsent>, candidateViews: CandidateViewRegistry | null): void {
+	consumePendingReviewConsent(pending, pendingReviewConsents);
+	if (![...pendingReviewConsents.values()].some((current) => current.candidateView.token === pending.candidateView.token)) candidateViews?.cleanup(pending.candidateView.token);
+}
+
+function cleanupAllPendingReviewConsents(pendingReviewConsents: Map<string, PendingReviewConsent>, candidateViews: CandidateViewRegistry | null): void {
+	for (const pending of [...pendingReviewConsents.values()]) cleanupPendingReviewConsent(pending, pendingReviewConsents, candidateViews);
 }
 
 function reviewConsentDigest(consent: ReviewConsentV2): string {
@@ -5041,10 +5057,7 @@ async function executeReviewControllerOperation(
 		if (input.answer !== "granted" && input.answer !== "declined") throw new Error("Review controller answer-consent answer must be granted or declined");
 		const pending = pendingReviewConsents.get(input.consentBinding);
 		if (pending === undefined || pending.expiresAt <= Date.now()) {
-			if (pending !== undefined) {
-				pendingReviewConsents.delete(input.consentBinding);
-				candidateViews?.cleanup(pending.candidateView.token);
-			}
+			if (pending !== undefined) cleanupPendingReviewConsent(pending, pendingReviewConsents, candidateViews);
 			throw new Error("Review controller consent binding is unknown, expired, or already consumed");
 		}
 		if (realpathSync(defaultCwd) !== pending.repositoryCwd) throw new Error("Review controller consent repository binding changed");
@@ -5054,8 +5067,7 @@ async function executeReviewControllerOperation(
 		try {
 			const gated = await resolveReviewModeGate(nativeReviewCli, parameters.operation, defaultCwd, signal);
 			if (gated !== undefined) {
-				pendingReviewConsents.delete(pending.id);
-				candidateViews?.cleanup(pending.candidateView.token);
+				cleanupPendingReviewConsent(pending, pendingReviewConsents, candidateViews);
 				return gated;
 			}
 		} catch (error) {
@@ -5063,7 +5075,7 @@ async function executeReviewControllerOperation(
 		}
 		// The one-shot binding is consumed before the provider mutation. Any
 		// ambiguous result reconciles through STATUS and can never be replayed.
-		pendingReviewConsents.delete(pending.id);
+		consumePendingReviewConsent(pending, pendingReviewConsents);
 		try {
 			const answered = await nativeReviewCli.answerConsent({
 				cwd: pending.candidateView.root,
@@ -5160,17 +5172,13 @@ async function executeReviewControllerOperation(
 					const repositoryCwd = realpathSync(defaultCwd);
 					const consentDigest = reviewConsentDigest(error.consent);
 					const existing = [...pendingReviewConsents.values()].find((pending) => pending.repositoryCwd === repositoryCwd && pending.candidateView.token === consentCandidateView.token && pending.consentDigest === consentDigest && pending.expiresAt > Date.now());
-					if (existing === undefined) for (const pending of pendingReviewConsents.values()) if (pending.candidateView.token === consentCandidateView.token) pendingReviewConsents.delete(pending.id);
+					if (existing === undefined) for (const pending of [...pendingReviewConsents.values()]) if (pending.candidateView.token === consentCandidateView.token) consumePendingReviewConsent(pending, pendingReviewConsents);
 					const id = existing?.id ?? randomUUID();
 					if (existing === undefined) {
-						const pending = { id, repositoryCwd, candidateView: consentCandidateView, consent: error.consent, consentDigest, expiresAt: Date.now() + PENDING_REVIEW_CONSENT_TTL_MS };
+						const pending: PendingReviewConsent = { id, repositoryCwd, candidateView: consentCandidateView, consent: error.consent, consentDigest, expiresAt: Date.now() + PENDING_REVIEW_CONSENT_TTL_MS };
 						pendingReviewConsents.set(id, pending);
-						const expiry = setTimeout(() => {
-							if (pendingReviewConsents.get(id) !== pending) return;
-							pendingReviewConsents.delete(id);
-							if (![...pendingReviewConsents.values()].some((current) => current.candidateView.token === consentCandidateView.token)) candidateViews?.cleanup(consentCandidateView.token);
-						}, PENDING_REVIEW_CONSENT_TTL_MS);
-						expiry.unref();
+						pending.expiry = setTimeout(() => cleanupPendingReviewConsent(pending, pendingReviewConsents, candidateViews), PENDING_REVIEW_CONSENT_TTL_MS);
+						pending.expiry.unref();
 					}
 					return {
 						operation: parameters.operation,
@@ -5965,6 +5973,10 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 	const correctionEvidenceByLineage = new Map<string, CorrectionEvidence>();
 	const candidateViews = dependencies.candidateViews === undefined ? new CandidateViewRegistry() : dependencies.candidateViews;
 
+	pi.on("session_shutdown", () => {
+		cleanupAllPendingReviewConsents(pendingReviewConsents, candidateViews);
+	});
+
 	pi.registerTool({
 		name: "gentle_review",
 		label: "Gentle Review Controller",
@@ -6389,8 +6401,7 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 				const result = await nativeReviewCli.reviewMode({ cwd: ctx.cwd, operation: subAction as NativeReviewModeOperation });
 				if (subAction === NATIVE_REVIEW_MODE_OPERATION.DISABLE && result.status.effective === "off") {
 					pendingReviewAuthorizations.clear();
-					for (const pending of pendingReviewConsents.values()) candidateViews?.cleanup(pending.candidateView.token);
-					pendingReviewConsents.clear();
+					cleanupAllPendingReviewConsents(pendingReviewConsents, candidateViews);
 				}
 				const report = `receipt-driven development: ${result.status.effective} (decided by ${result.status.source})`;
 				// A mutating sub-action that left the effective mode unchanged did

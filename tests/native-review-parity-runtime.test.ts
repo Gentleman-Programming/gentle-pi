@@ -378,7 +378,7 @@ test("official pinned package runtime keeps frozen candidate lineages and receip
 	t.diagnostic("pre-push, pre-pr, and release require remote/publication evidence; their network-aware gate contracts remain covered by dedicated gate integration tests rather than this hermetic binary E2E.");
 });
 
-test("registered gentle_review START materializes a safe internal skill symlink before invoking native authority", async (t) => {
+test("registered gentle_review START materializes a safe internal skill symlink and cleans pending consent on session shutdown", async (t) => {
 	const workspace = await mkdtemp(join(tmpdir(), "gentle-pi-v215-symlink-candidate-"));
 	const repository = join(workspace, "repository");
 	t.after(async () => rm(workspace, { recursive: true, force: true }));
@@ -412,8 +412,9 @@ test("registered gentle_review START materializes a safe internal skill symlink 
 		return { ...command, signal: null, timedOut: false, outputLimitExceeded: false };
 	});
 	const tools = new Map<string, RegisteredController>();
+	let sessionShutdown: ((event: unknown, context: ExtensionContext) => Promise<void> | void) | undefined;
 	createGentleAiExtension({ nativeReviewCli: native, candidateViews } as Parameters<typeof createGentleAiExtension>[0])({
-		on() {},
+		on(name: string, handler: (event: unknown, context: ExtensionContext) => Promise<void> | void) { if (name === "session_shutdown") sessionShutdown = handler; },
 		registerTool(definition: RegisteredController & { name: string }) { tools.set(definition.name, definition); },
 		registerCommand() {},
 	} as unknown as ExtensionAPI);
@@ -439,4 +440,11 @@ test("registered gentle_review START materializes a safe internal skill symlink 
 	assert.equal(result?.outcome, "native-review-consent-required");
 	assert.equal(typeof result?.consent_binding, "string");
 	assert.equal(result?.lineage_created, false);
+	assert.ok(sessionShutdown, "extension must register session_shutdown cleanup");
+	const context = { cwd: repository, hasUI: false, ui: { notify: () => {} } } as unknown as ExtensionContext;
+	await sessionShutdown({}, context);
+	await assert.rejects(
+		controller.execute("answer-after-shutdown", { operation: "answer-consent", input: JSON.stringify({ consentBinding: result!.consent_binding, answer: "granted" }) }, undefined, undefined, context),
+		/unknown, expired, or already consumed/,
+	);
 });

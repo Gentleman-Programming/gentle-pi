@@ -409,18 +409,23 @@ interface RegisteredCommandFixture {
 	handler: (args: string, ctx: ExtensionContext) => Promise<void>;
 }
 
-function runtime(nativeReviewCli: NativeReviewCli | null): { controller: RegisteredTool; commands: Map<string, RegisteredCommandFixture> } {
+interface RegisteredEventFixture {
+	(event: unknown, ctx: ExtensionContext): Promise<unknown> | unknown;
+}
+
+function runtime(nativeReviewCli: NativeReviewCli | null): { controller: RegisteredTool; commands: Map<string, RegisteredCommandFixture>; events: Map<string, RegisteredEventFixture> } {
 	const tools = new Map<string, RegisteredTool>();
 	const commands = new Map<string, RegisteredCommandFixture>();
+	const events = new Map<string, RegisteredEventFixture>();
 	const dependencies = { nativeReviewCli, candidateViews: new CandidateViewRegistry() } as unknown as Parameters<typeof createGentleAiExtension>[0];
 	createGentleAiExtension(dependencies)({
-		on() {},
+		on(name: string, handler: RegisteredEventFixture) { events.set(name, handler); },
 		registerTool(definition: RegisteredTool & { name: string }) { tools.set(definition.name, definition); },
 		registerCommand(name: string, definition: RegisteredCommandFixture) { commands.set(name, definition); },
 	} as unknown as ExtensionAPI);
 	const controller = tools.get("gentle_review");
 	assert.ok(controller);
-	return { controller: controller!, commands };
+	return { controller: controller!, commands, events };
 }
 
 function headlessContext(cwd: string, notices: Array<{ message: string; type?: string }> = []): ExtensionContext {
@@ -625,6 +630,19 @@ test("ambiguous consent mutation consumes the one-shot binding and requires stat
 	await answerConsent(controller, blocked.consent_binding, "granted", headlessContext(cwd));
 	assert.equal(statusCalls, 2, "ambiguous consent must reconcile through target status");
 	await assert.rejects(() => answerConsent(controller, blocked.consent_binding, "granted", headlessContext(cwd)), /unknown, expired, or already consumed/);
+});
+
+test("session shutdown clears pending candidate consent bindings and is idempotent", async (t) => {
+	const cwd = repository(t);
+	const { native, answers } = relayedConsentNative(cwd);
+	const { controller, events } = runtime(native);
+	const blocked = await blockedConsent(controller, "consent-before-shutdown", headlessContext(cwd));
+	const shutdown = events.get("session_shutdown");
+	assert.ok(shutdown);
+	await shutdown({}, headlessContext(cwd));
+	await shutdown({}, headlessContext(cwd));
+	await assert.rejects(() => answerConsent(controller, blocked.consent_binding, "granted", headlessContext(cwd)), /unknown, expired, or already consumed/);
+	assert.deepEqual(answers, []);
 });
 
 test("successful explicit disable clears pending candidate consent binding even after re-enable", async (t) => {
