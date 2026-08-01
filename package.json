@@ -42,6 +42,8 @@
 	"check:transaction-runner": "node scripts/build-git-commit-transaction-runner.mjs --check",
 	"build:gentle-ai-baselines": "node scripts/build-gentle-ai-baselines.mjs --write",
 	"check:gentle-ai-baselines": "node scripts/build-gentle-ai-baselines.mjs --check",
+	"build:skill-overlays": "node scripts/build-skill-overlays.mjs --write",
+	"check:skill-overlays": "node scripts/build-skill-overlays.mjs --check",
     "postinstall": "node scripts/install-gentle-ai.mjs",
     "test": "node --experimental-strip-types --test tests/*.test.ts && pnpm run test:harness",
     "test:harness": "node --experimental-strip-types tests/runtime-harness.mjs",

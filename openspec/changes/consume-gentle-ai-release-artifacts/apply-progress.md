@@ -1,7 +1,7 @@
 # Apply Progress: consume-gentle-ai-release-artifacts
 
-> Cumulative across batches: **PR 1 / P1a** (tasks 1.1-1.8, complete) and **PR 2 / P1b**
-> (tasks 2.1-2.10, complete). PR 3 (P2a) and later are NOT started.
+> Cumulative across batches: **PR 1 / P1a** through **PR 6 / P3b**, all complete
+> (tasks 1.1-6.8). PR 7 (P3c) and later are NOT started.
 
 ## Completed Tasks
 
@@ -695,3 +695,172 @@ of this tracker, cascading into the one documented `tests/native-review-cli.test
 10/10 tasks in PR 5 (P3a) complete. 47/47 tasks total across P1a+P1b+P2a+P2b+P3a. Ready for `sdd-verify`,
 or for `sdd-apply` to continue with PR 6 (P3b) in a fresh batch, on a new branch based on this one
 (`feat/release-artifact-generators`).
+
+---
+
+# PR 6 / P3b: Skill vendor + overlay
+
+Worktree `gentle-pi-worktrees/p3b`, branch `feat/skill-vendor-overlay`, based on P3a's
+`feat/release-artifact-generators`. Implements tasks 6.1-6.8 (design.md D8).
+
+## Completed Tasks
+
+- [x] 6.1 RED: overlay anchor missing upstream fails the exact message `edit the overlay, not the vendored file: skills/_vendor/<name>/overlay.md` (fixture pair `tests/fixtures/skill-overlays/stale-anchor/{vendored.SKILL.md,overlay.md}`).
+- [x] 6.2 RED: hand-edit of a vendored `skills/_vendor/**` file detected by the digest drift gate against `skills/_vendor/manifest.json`.
+- [x] 6.3 GREEN: created `scripts/build-skill-overlays.mjs` (`--write`/`--check`).
+- [x] 6.4 GREEN (5 independent revertible admissions): first-tier candidates compared and admitted — `comment-writer`, `work-unit-commits`, `branch-pr`, `chained-pr`, `cognitive-doc-design`.
+- [x] 6.5 GREEN (4 candidates compared, 2 admitted): second-tier — `skill-improver` and `skill-registry` admitted; `judgment-day` and `skill-creator` rejected.
+- [x] 6.6 GREEN: confirmed `skills/issue-creation/SKILL.md` stays excluded entirely — not vendored, no gate.
+- [x] 6.7 GREEN: `.github/workflows/ci.yml` — added `build-skill-overlays.mjs --check` to the per-PR gate.
+- [x] 6.8 Verify: `pnpm test` equivalent (`node --experimental-strip-types --test tests/*.test.ts`) and `node scripts/build-skill-overlays.mjs --check` both pass.
+
+## The overlay mechanism (design D8)
+
+```
+skills/_vendor/<name>/SKILL.md     written only by the sync script; read-only to humans.
+skills/_vendor/<name>/overlay.md   hand-authored, ordered <!-- overlay:block --> anchor/replace pairs.
+skills/_vendor/manifest.json       { skills: { <name>: { path, sha256 } } } -- the recorded digest
+                                    each vendored file must still match; the drift gate's anchor.
+skills/<name>/SKILL.md             scripts/build-skill-overlays.mjs's output: vendored body with
+                                    every overlay block applied, in file order.
+```
+
+`applyOverlay` requires each anchor to occur in the vendored body **exactly once** (`body.split(anchor).length - 1 === 1`); zero occurrences (upstream reworded it away) and more than one occurrence (now ambiguous) both fail with the identical message from task 6.1, since both point at the same remediation: edit the overlay, never the vendored file. `main()` iterates `Object.keys(manifest.skills)`, not a hardcoded name list, so each admission's manifest entry is independently addable/revertible without the generator needing to know the final admitted set in advance.
+
+## Vendored-body seeding: a scope note, not a deviation
+
+Design's data-flow diagram shows `sync-gentle-ai-release.mjs --write` producing `skills/_vendor/**` (D8, alongside contracts/lock/mirrors from P1b). None of tasks 6.1-6.8 asks for that wiring, and the release archive fixture (`tests/fixtures/release-artifact/artifact-manifest.fixture.json`) confirms skills are not part of the release asset tree at all — gentle-ai's skills live in its own repository checkout (`internal/assets/skills/`), a separate source from the signed release artifact P1/P2 already consume. Wiring a live provider-repository sync (git-based, not archive-based) is therefore out of this unit's task list and this sandbox's no-network reach; it is left for a follow-up unit (see Remaining Tasks). For this PR, `skills/_vendor/<name>/SKILL.md` was seeded as a byte-for-byte, manually verified copy of the provider's current `internal/assets/skills/<name>/SKILL.md` at `/home/gentleman/work/gentle-ai` — functionally identical to what a real sync run would write, with each byte and its recorded `sha256` cross-checked (`skills/<name>/SKILL.md` after `--write` was diffed against the pre-existing checked-in file for every one-line/zero-line-delta candidate, confirming an exact match; work-unit-commits' and skill-improver's expected deltas were confirmed via `git diff` on the generated output, see per-admission commits).
+
+## Per-skill portability comparison (task 6.4 + 6.5) — full results
+
+Every candidate on the maintainer's allowlist was compared file-by-file against gentle-ai's copy at
+`/home/gentleman/work/gentle-ai/internal/assets/skills/<name>/SKILL.md` before any admission. Being on the
+list never admitted a skill by itself.
+
+### First tier (task 6.4) — 5/5 admitted
+
+| Candidate | Diff vs. gentle-ai | Repository identity encoded? | Result | Overlay |
+|---|---|---|---|---|
+| `comment-writer` | +1 sentence in the "Match target context language" rule ("Do not use the active persona as the source of truth for public comments.") | No | **Admitted** | 1 anchor block |
+| `work-unit-commits` | gentle-pi's checked-in copy was *missing* 3 Work Unit Checklist items and the "implementation evidence MUST include" paragraph gentle-ai already had | No | **Admitted** | 0 blocks — vendored (fuller) body flows straight through; this repo already requires the same evidence via `skills/sdd-apply`'s Work Unit Evidence hard gate, so gentle-pi was simply stale |
+| `branch-pr` | Only `name: branch-pr` (upstream) vs `name: gentle-ai-branch-pr` (gentle-pi, pre-existing collision-prefix fix, `tests/skill-collision-prefixes.test.ts`) | No | **Admitted** | 1 anchor block (name) |
+| `chained-pr` | Only the same name-prefix pattern as `branch-pr` | No | **Admitted** | 1 anchor block (name) |
+| `cognitive-doc-design` | Byte-identical | No | **Admitted** | 0 blocks |
+
+### Second tier (task 6.5) — 2/4 admitted, 2 rejected
+
+| Candidate | Diff vs. gentle-ai | Repository identity encoded? | Result | Reason |
+|---|---|---|---|---|
+| `skill-improver` | 17 of 54 lines differ, across 7 bounded, nameable points: the name prefix plus 6 self-contained wording deltas (skill-style-guide fallback chain, `.atl/skill-registry.md` availability note, `/skill-registry:refresh` vs `gentle-ai skill-registry refresh`) | No | **Admitted** | Every delta is a self-contained sentence/bullet, genuinely overlay-representable — 7 anchor blocks |
+| `skill-registry` | Byte-identical | No | **Admitted** | 0 blocks |
+| `judgment-day` | 96 of 52/76 lines differ: near-total section rewrite (Hard Rules → Transaction Rules, Decision Gates removed, Execution Steps expanded 6→9 steps, an entirely new Fix Boundary section, an entirely new Lifecycle Boundary section referencing gentle-pi's own receipt/lineage/native-RAR architecture with no upstream counterpart); version numbers even diverge in the *opposite* direction (gentle-ai 1.6, gentle-pi 1.4) | No literal repo name/labels, but the body encodes gentle-pi's own bounded-review lifecycle architecture that has no upstream shape | **Rejected** | Too extensive for an anchored overlay — admitting it would need one anchor spanning almost the entire body, which is functionally the "full fork" representation design.md D8 explicitly rejected ("makes what Pi actually changed invisible in review") |
+| `skill-creator` | 106 of 104/86 lines differ: Hard Rules, Decision Gates, and Execution Steps every row reworded/reordered; an "Inline Fallback Rules" section removed entirely; a new gentle-pi-specific `scripts/verify-package-files.mjs` registration step added | No | **Rejected** | Same reasoning as `judgment-day` — near-total rewrite, not a bounded set of anchors |
+
+### Excluded entirely (task 6.6) — no comparison run, no gate
+
+`issue-creation` was not compared and is not vendored. Confirmed via two tests
+(`issue-creation is excluded entirely...`, `issue-creation carries no skills/_vendor directory...`): the two
+repositories' copies describe genuinely different repositories by design (gentle-pi links its own
+Discussions URL/generic Affected-Area taxonomy; gentle-ai names its own repo, labels, and templates) — the
+task's own diff between the two copies (149 vs. 223 lines, almost nothing shared) confirms this is identity,
+not drift to reconcile.
+
+### `assets/agents/**` / `assets/chains/**`
+
+Untouched by this unit, confirmed by inspection — no byte-vendoring, no gate added here; that phase-coverage
+gate is explicitly PR 7 / P3c's task 7.3/7.4, not this one's.
+
+## Files Changed
+
+| File | Action | What Was Done |
+|---|---|---|
+| `scripts/build-skill-overlays.mjs` | Created | `--write`/`--check` generator: `parseOverlayBlocks`, `applyOverlay` (exact-one-occurrence anchor discipline), `sha256Hex`/digest drift gate, `VENDORED_SKILLS`/`REJECTED_CANDIDATES`/`EXCLUDED_SKILLS` documentation constants. |
+| `skills/_vendor/manifest.json` | Created | `{ skills: { <name>: { path, sha256 } } }` for the 7 admitted candidates — the drift gate's recorded-digest source of truth. |
+| `skills/_vendor/{comment-writer,work-unit-commits,branch-pr,chained-pr,cognitive-doc-design,skill-improver,skill-registry}/SKILL.md` | Created | Byte-for-byte vendored copies of gentle-ai's current skill bodies. |
+| `skills/_vendor/{comment-writer,work-unit-commits,branch-pr,chained-pr,cognitive-doc-design,skill-improver,skill-registry}/overlay.md` | Created | Ordered `<!-- overlay:block -->` anchor/replace pairs (or an explicit zero-block note) per admitted candidate. |
+| `skills/work-unit-commits/SKILL.md` | Modified (generated) | Grew by 11 lines — Pi catching up to gentle-ai's fuller content (see portability table). |
+| `skills/{comment-writer,branch-pr,chained-pr,cognitive-doc-design,skill-improver,skill-registry}/SKILL.md` | Regenerated, byte-identical | `--write` reproduced the pre-existing checked-in bytes exactly — proves the vendored+overlay content matches what was already hand-maintained there. |
+| `tests/build-skill-overlays.test.ts` | Created | 15 tests: `parseOverlayBlocks`/`applyOverlay` unit coverage, the 6.1/6.2 RED fixture-pair and full-CLI failure scenarios, real-repo `--check`/`--write` idempotency, admission-list and rejection-list assertions, issue-creation exclusion. |
+| `tests/fixtures/skill-overlays/stale-anchor/{vendored.SKILL.md,overlay.md}` | Created | Self-contained fixture pair for the 6.1 anchor-missing scenario. |
+| `.github/workflows/ci.yml` | Modified | Added "Verify generated skill overlays" step running `node scripts/build-skill-overlays.mjs --check`, offline, after the gentle-ai baselines check. |
+| `package.json` | Modified | Added `build:skill-overlays`/`check:skill-overlays` convenience scripts, mirroring the existing generator pairs. |
+| `openspec/changes/consume-gentle-ai-release-artifacts/tasks.md` | Modified | Ticked `[x]` for tasks 6.1-6.8. |
+
+## TDD Cycle Evidence (P3b)
+
+| Task | RED | GREEN | REFACTOR |
+|---|---|---|---|
+| 6.1 | `applyOverlay fails with the exact overlay-not-vendored message...` against the `stale-anchor` fixture pair, plus a full-CLI `--check` scenario reproducing the same failure through a temp fixture root — both written and run before `scripts/build-skill-overlays.mjs` existed (`ERR_MODULE_NOT_FOUND` on the whole test file) | `applyOverlay`'s exact-one-occurrence check implemented; both tests pass | `applyOverlay fails the same way when an anchor now occurs more than once` added to prove the ambiguous-match branch shares the identical remediation message, not a silent guess |
+| 6.2 | `build-skill-overlays.mjs --check fails when a vendored file has been hand-edited (digest drift)` via a self-contained fixture (recorded digest vs. hand-edited bytes) | `buildOneSkill`'s digest comparison against `manifest.json`, checked before the overlay is even parsed | Clean — one guard, one message |
+| 6.3 | Covered by 6.1/6.2's `ERR_MODULE_NOT_FOUND` baseline (whole-module RED) plus `parseOverlayBlocks extracts anchor/replace pairs in file order` and `applyOverlay replaces every anchor exactly once, in order` written against the not-yet-existing exports | `parseOverlayBlocks`/`applyOverlay`/`sha256Hex`/`main()` implemented; `--check` against the real repo passes with an empty manifest (`0 skills`) | `applyOverlay is a no-op over an empty block list` added to lock in the zero-delta admission case used by 3 of the 7 candidates |
+| 6.4/6.5 | Each admission commit ran the full `tests/build-skill-overlays.test.ts` + `tests/skill-collision-prefixes.test.ts` suite against the growing manifest before committing (see per-commit evidence below) | `node scripts/build-skill-overlays.mjs --write` after each manifest entry; `git status`/`git diff` inspected per admission to confirm only the intended file(s) changed | N/A — no refactor, additive by design (manifest-key-driven iteration needed no generator changes across all 7 admissions) |
+| 6.6 | `issue-creation is excluded entirely...` + `...carries no skills/_vendor directory and no overlay` written alongside the 6.1-6.3 test file (both passed immediately — nothing to vendor, nothing to break) | N/A — confirmatory, no production code | N/A |
+| 6.7 | N/A — CI wiring | `.github/workflows/ci.yml` step added; `node scripts/build-skill-overlays.mjs --check` re-run locally to confirm the exact command the step runs | N/A |
+| 6.8 | N/A — verification task | Full suite + all four offline generators pass (see Work Unit Evidence) | N/A |
+
+## Work Unit Evidence (P3b)
+
+| Evidence | Value |
+|---|---|
+| Focused test command and exact result | `node --experimental-strip-types --test tests/build-skill-overlays.test.ts tests/skill-collision-prefixes.test.ts tests/skill-registry.test.ts` -> `pass 44 fail 0` (final state, all 7 admissions applied). RED baseline proven twice: (a) the whole test file failed with `ERR_MODULE_NOT_FOUND` before `scripts/build-skill-overlays.mjs` existed; (b) `node scripts/build-skill-overlays.mjs --check` genuinely failed with `generated skill file is stale: skills/work-unit-commits/SKILL.md` before the first `--write`, proving the check actually detects the pre-existing, stale, hand-maintained copy rather than trivially passing. |
+| Runtime harness command/scenario and exact result | `node scripts/build-skill-overlays.mjs --check` -> `skill overlays match their checked-in sources (7 skills: branch-pr, chained-pr, cognitive-doc-design, comment-writer, skill-improver, skill-registry, work-unit-commits)` (this unit's own harness command per tasks.md's Suggested Work Units table). Also: `node scripts/build-gentle-ai-baselines.mjs --check`, `node scripts/build-git-commit-transaction-runner.mjs --check`, and `node scripts/verify-package-files.mjs` all still pass unmodified. |
+| Rollback boundary | Each admission is independently revertible via its own commit: `git revert <sha>` for any one of the 7 `feat(skills): vendor <name>...` commits removes exactly that skill's `skills/_vendor/<name>/**` and its manifest entry, and (except for `work-unit-commits`, whose content actually changed) leaves `skills/<name>/SKILL.md` unaffected since `build-skill-overlays.mjs` iterates only the manifest's present keys. Reverting the whole PR restores every `skills/<name>/SKILL.md` to its prior hand-maintained state (the diff shows only `work-unit-commits/SKILL.md` net-changed) and deletes `scripts/build-skill-overlays.mjs`, `skills/_vendor/**`, the two convenience scripts, the CI step, and the test file — P1/P2/P3a trust and generator code is entirely untouched by this unit. |
+
+## Full-suite proof (`node --experimental-strip-types --test tests/*.test.ts`)
+
+`tests 1130 / pass 1117 / fail 1 / skipped 12` (1115 pre-existing + 15 new in `tests/build-skill-overlays.test.ts`).
+The 1 failure is the same pre-existing, sandbox-only, no-network `tests/native-review-cli.test.ts` "native
+output limits dominate killed timeout signals..." failure documented in every prior unit of this tracker
+(`.gentle-ai/v2.2.3/gentle-ai` was never installed by `postinstall`, `HTTP 404`, no network in this sandbox).
+Not new, not related to this unit. `pnpm test`/`pnpm run test:harness` fail for the same documented reason
+(`pnpm install`'s dependency-status recheck needs network) — ran the direct `node --experimental-strip-types
+--test` invocation instead, matching every prior unit's documented workaround.
+
+## Deviations from Design
+
+1. **Vendored-body seeding is manual for this PR, not wired through `scripts/sync-gentle-ai-release.mjs`.**
+   See "Vendored-body seeding: a scope note, not a deviation" above — none of tasks 6.1-6.8 asks for that
+   wiring, the release archive does not contain skill files at all (confirmed against the fixture manifest),
+   and gentle-ai's skills live in a separate repository checkout reachable only via a git-based sync this
+   sandbox cannot perform (no network). The generator, drift gate, and anchor discipline are exactly as
+   designed; only the *initial write* of `skills/_vendor/**` bytes came from a manual, cross-checked copy
+   instead of a live `sync-gentle-ai-release.mjs --write` run.
+2. **`REJECTED_CANDIDATES`/`EXCLUDED_SKILLS` are exported documentation constants**, not literal design.md
+   text — added so the rejection/exclusion reasoning is enforced by a real assertion (`main()` refuses to
+   let either set appear in the manifest) rather than living only in prose.
+
+## Issues Found
+
+None new. Same `node_modules`/`postinstall` HTTP 404 environment condition documented in every prior unit;
+`pnpm install` still succeeds from the local pnpm store, only the `.gentle-ai/v2.2.3` binary download fails.
+
+## Remaining Tasks
+
+- [ ] PR 7 -- P3c (phase-coverage gate + generic evidence harness) through PR 8 -- P4: not started.
+- [ ] Follow-up (not in this unit's task list): wire live skill mirroring into `scripts/sync-gentle-ai-release.mjs`
+  so `skills/_vendor/**` is written by a real network sync rather than this PR's manual seed. Until then, a
+  future re-sync of an admitted skill still requires a human to re-copy the vendored bytes and re-run
+  `--write`; the drift gate correctly still catches a hand-edit of the vendored file itself.
+
+## Workload / PR Boundary (P3b)
+
+- Mode: feature-branch-chain, `size:exception` (tasks.md: `Delivery strategy: exception-ok`)
+- Current work unit: P3b (PR 6, base: P3a's branch `feat/release-artifact-generators`)
+- Boundary: `scripts/build-skill-overlays.mjs` (new), `skills/_vendor/**` (new, 7 skills), `tests/build-skill-overlays.test.ts`
+  + its fixtures (new). `skills/work-unit-commits/SKILL.md` net-changed (+11 lines); every other
+  `skills/<name>/SKILL.md` regenerated byte-identical. `.github/workflows/ci.yml` gains one offline check
+  step; `package.json` gains two convenience scripts. No P1/P2/P3a file touched.
+- Estimated review budget impact: tasks.md forecast ~280 changed lines for P3b. Actual diff is 1201
+  insertions across 22 files (`git diff --stat` against P3a's tip), well above the estimate — the vendored
+  `skills/_vendor/<name>/SKILL.md` mirrors (~609 lines) are byte-for-byte copies of already-existing,
+  already-reviewed upstream content, functionally equivalent to the "generated goldens" the review workload
+  guard excludes from authored risk count. Authored new content (generator ~181, overlay.md deltas ~117,
+  tests + fixtures ~241, manifest ~32, CI/package.json ~10, work-unit-commits diff ~11) is ~592 lines,
+  still above 400 — already covered by the tracker-wide `Delivery strategy: exception-ok` (tasks.md:
+  `400-line budget risk: High`, `Decision needed before apply: No`), same policy P3a operated under.
+
+## Status (P3b)
+
+8/8 tasks in PR 6 (P3b) complete. 55/55 tasks total across P1a+P1b+P2a+P2b+P3a+P3b. Ready for `sdd-verify`,
+or for `sdd-apply` to continue with PR 7 (P3c) in a fresh batch, on a new branch based on this one
+(`feat/skill-vendor-overlay`).

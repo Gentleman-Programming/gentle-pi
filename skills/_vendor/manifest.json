@@ -1,0 +1,32 @@
+{
+	"skills": {
+		"comment-writer": {
+			"path": "skills/_vendor/comment-writer/SKILL.md",
+			"sha256": "cb980612f7237b31a4afea87899275ba20f1f621ba237ecd4a3b440f0cf2e6da"
+		},
+		"work-unit-commits": {
+			"path": "skills/_vendor/work-unit-commits/SKILL.md",
+			"sha256": "9b4e9914d612ea11c86747d3fcd4e42bc7ef5cc5e6ab9179c3de7148b015c4ac"
+		},
+		"branch-pr": {
+			"path": "skills/_vendor/branch-pr/SKILL.md",
+			"sha256": "8553fdde3397c7dc1c2fda2b4ca848baf5d9185d0db65635b151755c4e627dc8"
+		},
+		"chained-pr": {
+			"path": "skills/_vendor/chained-pr/SKILL.md",
+			"sha256": "865f2e78db039797eabfe46d80589677c1420c052ed2b993c4435b487b17e83b"
+		},
+		"cognitive-doc-design": {
+			"path": "skills/_vendor/cognitive-doc-design/SKILL.md",
+			"sha256": "80dcaeca45c35e830939ef5440ca270b147f6370e4afcb47cdab762097f8cde0"
+		},
+		"skill-improver": {
+			"path": "skills/_vendor/skill-improver/SKILL.md",
+			"sha256": "4b71aa7f242259a3e4ef8f5c87c591e154b2fe1ef5277c9d7428ba2fa678a151"
+		},
+		"skill-registry": {
+			"path": "skills/_vendor/skill-registry/SKILL.md",
+			"sha256": "06b49f63bd311218618d79cbdaeed63f49c5853fda552ffe2c3e81e42e94f189"
+		}
+	}
+}
