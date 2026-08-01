@@ -884,6 +884,58 @@ test("captureResult passes the provider tokens through verbatim and carries no -
 	assert.equal(argv.length, 2 + tokens.length + 2);
 });
 
+test("captureResult forwards a documentation-like admitted path byte-identical and refuses a dual-locator manifest (Wave 1, threat: Documentation-like paths)", async (t) => {
+	t.after(() => clearNativeReviewCapabilitiesCacheForTesting());
+	const tokens = [
+		"--lineage=review-1d5aadacc600e167",
+		"--expected-revision=sha256:" + "c".repeat(64),
+		"--target=sha256:" + "d".repeat(64),
+		"--repository-context=rctx1_" + "e".repeat(64),
+		"--lens=review-reliability",
+		"--order=0",
+		"--subject-hash=sha256:" + "a".repeat(64),
+	];
+	const resultDocument = JSON.stringify({ subject_hash: "sha256:" + "a".repeat(64), inspection: { status: "completed", paths: ["a.ts"] }, findings: [], evidence: ["reviewed the complete frozen candidate scope"] });
+
+	// A locator containing "..", an absolute path, or an executable-looking
+	// name is opaque provider data returned to the same provider that issued
+	// it — Pi never opens, stats, classifies, or executes it, and forwards it
+	// byte-identical. None of these locators exist on disk in this test.
+	for (const dangerousPath of ["../../../../etc/passwd", "/etc/shadow", "/usr/bin/env sh -c 'rm -rf /'"]) {
+		const manifest = {
+			schema: "gentle-ai.review-result-artifact/v2",
+			capability: "review.native_result_artifact",
+			subject_hash: "sha256:" + "a".repeat(64),
+			admission_decision: "completed",
+			lens: "review-reliability",
+			path: dangerousPath,
+		};
+		const { adapter } = queuedAdapter([{ stdout: JSON.stringify(manifest) }]);
+		const cli = new NativeReviewCliV216(adapter, "/package/.gentle-ai/gentle-ai", 30_000, 1024 * 1024, async () => undefined, () => "dcc846103b16d365eaeeb9d7f289c23fc4f2897f23def1cb3fe7f05557b64705");
+		const captured = await cli.captureResult({ argumentTokens: tokens, resultDocument });
+		assert.equal(captured.path, dangerousPath, "the locator must be forwarded byte-identical, unexamined");
+		assert.equal(captured.reference, undefined);
+	}
+
+	// A manifest carrying both a `path` and a `reference` is refused: Pi
+	// cannot forward two locators to FINALIZE for one slot.
+	const dualLocator = {
+		schema: "gentle-ai.review-result-artifact/v2",
+		capability: "review.native_result_artifact",
+		subject_hash: "sha256:" + "a".repeat(64),
+		admission_decision: "completed",
+		lens: "review-reliability",
+		path: "../escape.json",
+		reference: "rref1_" + "b".repeat(64),
+	};
+	const { adapter: dualAdapter } = queuedAdapter([{ stdout: JSON.stringify(dualLocator) }]);
+	const dualCli = new NativeReviewCliV216(dualAdapter, "/package/.gentle-ai/gentle-ai", 30_000, 1024 * 1024, async () => undefined, () => "dcc846103b16d365eaeeb9d7f289c23fc4f2897f23def1cb3fe7f05557b64705");
+	await assert.rejects(
+		dualCli.captureResult({ argumentTokens: tokens, resultDocument }),
+		(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE,
+	);
+});
+
 test("captureEvidence stages exact bytes, uses the closed outcome argv, and decodes the native record", async (t) => {
 	t.after(() => clearNativeReviewCapabilitiesCacheForTesting());
 	const capabilities = v2Fixture<Record<string, unknown>>("capabilities.fixture.json");
@@ -958,4 +1010,34 @@ test("negotiated finalize never emits the retired --result flag", async (t) => {
 	assert.equal(argv.includes("--result"), false, "--result is retired; results reach authority through capture-result");
 	assert.ok(argv.some((token) => token === "--captured-results" || token.startsWith("--captured-results=")), "finalize must tell the provider to discover the captured results");
 	assert.ok(argv.includes("--contract"), "finalize IS negotiated, unlike capture-result");
+});
+
+test("negotiated finalize no longer stages lensResults into a reviewer-document tmp file (Wave 1, dead-staging removal)", async (t) => {
+	t.after(() => clearNativeReviewCapabilitiesCacheForTesting());
+	const capabilities = v2Fixture<Record<string, unknown>>("capabilities.fixture.json");
+	const capabilitiesBody = { ...capabilities, package: { ...(capabilities.package as Record<string, unknown>), version: GENTLE_AI_VERSION } };
+	const finalizeBody = {
+		schema: "gentle-ai.review-integration.operation/v2",
+		contract: "gentle-ai.review-integration/v2",
+		operation: "review.finalize",
+		result: { operation: "review/finalize", lineage_id: "review-1d5aadacc600e167", state: "approved", action: "validate delivery", store_revision: "sha256:" + "f".repeat(64) },
+	};
+	const { adapter, calls } = queuedAdapter([
+		{ stdout: JSON.stringify(capabilitiesBody) },
+		{ stdout: JSON.stringify(finalizeBody) },
+	]);
+	let cleanupInvocations = 0;
+	const cli = new NativeReviewCliV216(adapter, "/package/.gentle-ai/gentle-ai", 30_000, 1024 * 1024, async () => { cleanupInvocations += 1; }, () => "dcc846103b16d365eaeeb9d7f289c23fc4f2897f23def1cb3fe7f05557b64705");
+
+	// `lensResults` is accepted only for the legacy plain-CLI client
+	// (NativeReviewCliV214); the negotiated V216 client must not stage it into
+	// a tmp document, must not create a staging directory for it at all
+	// (proven here by the cleanup hook never firing), and must not reference
+	// it in argv — it is dead input here.
+	await cli.finalize({ cwd: "/repo", lineageId: "review-1d5aadacc600e167", lensResults: [{ lens: "review-risk", document: { id: "risk" } }], capturedResults: true });
+
+	assert.equal(cleanupInvocations, 0, "lensResults alone must not create any staging directory to clean up");
+	const argv = calls[1]!.arguments;
+	assert.equal(argv.includes("--result"), false);
+	assert.equal(argv.some((token) => token.startsWith("--result=")), false);
 });

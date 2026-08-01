@@ -135,6 +135,10 @@ export interface NativeReviewCli {
 	// evidence-first correction lifecycle's collection step.
 	repair?(request: NativeReviewRepairRequest): Promise<ReviewRepairV2>;
 	captureEvidence?(request: NativeReviewCaptureEvidenceRequest): Promise<NativeReviewVerificationEvidenceV2>;
+	// `review capture-result`: the FINALIZE capture phase's collection step
+	// (Wave 1, #2028 host behavior, Design Decision 1). Optional, exactly like
+	// captureEvidence above, since older negotiated clients may not implement it.
+	captureResult?(request: NativeReviewCaptureResultRequest): Promise<NativeReviewAdmittedResultManifest>;
 	// Dark until a negotiated version reports the `mode` capability true
 	// (Design Decision #7, organic-rdd-parity). Plain versioned CLI operation,
 	// outside the negotiated review-integration protocol — same shape as
@@ -2148,11 +2152,19 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 
 	async finalize(request: NativeFinalizeRequest): Promise<NativeFinalizeResult> {
 		if (request.evidenceDocument !== undefined && request.evidenceDocument.length === 0) throw new TypeError("Native FINALIZE evidence must contain at least one byte");
-		const needsStaging = request.lensResults !== undefined || request.refuterDocument !== undefined || request.validationDocument !== undefined || request.evidenceDocument !== undefined;
+		// `lensResults`/`resultFiles` are accepted only by the legacy plain-CLI
+		// client (NativeReviewCliV214) and its retired `--result` argv. The
+		// negotiated V216 client never had a caller for them (Wave 1, #2028 host
+		// behavior): reviewer results reach authority exclusively through
+		// `review capture-result`, and FINALIZE either discovers them
+		// (`--captured-results`) or is handed each admitted manifest explicitly
+		// (`--result-artifact-file`). Staging `lensResults` into a tmp document
+		// here would write candidate-derived content to disk for an argv that
+		// never consumes it, so it is intentionally ignored.
+		const needsStaging = request.refuterDocument !== undefined || request.validationDocument !== undefined || request.evidenceDocument !== undefined;
 		const directory = needsStaging ? await mkdtemp(join(tmpdir(), "gentle-ai-finalize-")) : undefined;
 		try {
 			if (directory !== undefined) await chmod(directory, 0o700);
-			const resultFiles = directory !== undefined && request.lensResults !== undefined ? await Promise.all(request.lensResults.map((entry, index) => this.stageDocument(directory, `result-${index}`, entry.document))) : request.resultFiles ?? [];
 			const refuterFile = directory !== undefined && request.refuterDocument !== undefined ? await this.stageDocument(directory, "refuter", request.refuterDocument) : request.refuterFile;
 			const validationFile = directory !== undefined && request.validationDocument !== undefined ? await this.stageDocument(directory, "validation", request.validationDocument) : request.validationFile;
 			const evidenceFile = directory !== undefined && request.evidenceDocument !== undefined ? await this.stageEvidence(directory, request.evidenceDocument) : request.evidenceFile;

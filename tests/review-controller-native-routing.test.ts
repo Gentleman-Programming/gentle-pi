@@ -23,7 +23,7 @@ import { CandidateViewRegistry, deriveChangedPathManifest } from "../lib/review-
 import { inspectLegacyReviewAuthorityV1 } from "../lib/review-legacy-detector.ts";
 import { resolveRepositoryAuthorityV1 } from "../lib/review-repository.ts";
 import { NATIVE_REVIEW_REMEDIATION, classifyNativeReviewRemediation } from "../lib/native-review-remediation.ts";
-import type { AuthorityRepairAssessmentV1, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
+import type { AuthorityRepairAssessmentV1, ReviewArtifactSubjectV2, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 
 interface RegisteredTool {
 	execute: (
@@ -279,6 +279,7 @@ function fakeNative(overrides: Partial<NativeReviewCli> = {}): NativeReviewCli {
 				? candidateStartTargetStatus(request)
 				: candidateFinalizeTargetStatus(request, lineageId);
 		},
+		captureResult: defaultCaptureResult,
 		...overrides,
 	};
 }
@@ -427,28 +428,40 @@ function candidateFinalizeTargetStatus(request: Parameters<NonNullable<NativeRev
 	}
 }
 
-function bindReviewerManifest(status: ReviewStatusV3, cwd: string, manifestHash = `sha256:${"7".repeat(64)}`): ReviewStatusV3 {
+interface ReviewerManifestSlotFixture {
+	lens?: ReviewArtifactSubjectV2["lens"];
+	selectedOrder?: number;
+	subjectHash?: string;
+}
+
+/**
+ * Binds `status.nextTransition` to one `review.capture-result` collect input
+ * per requested slot, matching the exact-slot binding `deriveCaptureSlots`
+ * (lib/review-result-capture.ts) validates: lineage, target, authority
+ * revision, base/candidate tree, changed-path manifest hash, lens, order,
+ * subject hash. Every slot shares the same manifest, mirroring one candidate
+ * reviewed by every selected lens.
+ */
+function bindReviewerManifests(status: ReviewStatusV3, cwd: string, slots: readonly ReviewerManifestSlotFixture[] = [{}], manifestHash = `sha256:${"7".repeat(64)}`): ReviewStatusV3 {
 	const manifest = deriveChangedPathManifest(cwd, status.projection.baseTree, status.projection.currentCandidateTree).map((entry) => ({
 		...entry,
 		status: entry.status as "A" | "D" | "M" | "T",
 		intendedUntracked: status.projection.intendedUntracked.includes(entry.path),
 	}));
-	const subject = {
-		schema: "gentle-ai.review-artifact-subject/v2" as const,
-		subjectHash: `sha256:${"8".repeat(64)}`,
-		lineageId: status.authority!.lineageId,
-		authorityRevision: status.authority!.revision,
-		targetIdentity: status.targetIdentity,
-		baseTree: status.projection.baseTree,
-		candidateTree: status.projection.currentCandidateTree,
-		changedPathManifestSha256: manifestHash,
-		lens: "review-reliability" as const,
-		selectedOrder: 0,
-	};
-	status.nextTransition = {
-		kind: "collect",
-		reasonCode: "reviewer_results_required",
-		collect: { inputs: [{
+	const inputs = slots.map((slot, index) => {
+		const subject = {
+			schema: "gentle-ai.review-artifact-subject/v2" as const,
+			subjectHash: slot.subjectHash ?? `sha256:${"89abcdef01234567"[index % 16]!.repeat(64)}`,
+			lineageId: status.authority!.lineageId,
+			authorityRevision: status.authority!.revision,
+			targetIdentity: status.targetIdentity,
+			baseTree: status.projection.baseTree,
+			candidateTree: status.projection.currentCandidateTree,
+			changedPathManifestSha256: manifestHash,
+			lens: slot.lens ?? "review-reliability",
+			selectedOrder: slot.selectedOrder ?? index,
+		};
+		return {
 			name: "reviewer_result",
 			schema: "https://gentle-ai.dev/schema/review/reviewer/v1",
 			captureOperation: "review.capture-result",
@@ -457,16 +470,44 @@ function bindReviewerManifest(status: ReviewStatusV3, cwd: string, manifestHash 
 				{ name: "expected-revision", value: subject.authorityRevision, token: `--expected-revision=${subject.authorityRevision}` },
 				{ name: "target", value: subject.targetIdentity, token: `--target=${subject.targetIdentity}` },
 				{ name: "lens", value: subject.lens, token: `--lens=${subject.lens}` },
-				{ name: "order", value: "0", token: "--order=0" },
+				{ name: "order", value: String(subject.selectedOrder), token: `--order=${subject.selectedOrder}` },
 				{ name: "subject-hash", value: subject.subjectHash, token: `--subject-hash=${subject.subjectHash}` },
 			],
 			artifactSubject: subject,
 			baseTree: subject.baseTree,
 			candidateTree: subject.candidateTree,
 			changedPathManifest: manifest,
-		}] },
-	};
+		};
+	});
+	status.nextTransition = { kind: "collect", reasonCode: "reviewer_results_required", collect: { inputs } };
 	return status;
+}
+
+function bindReviewerManifest(status: ReviewStatusV3, cwd: string, manifestHash = `sha256:${"7".repeat(64)}`): ReviewStatusV3 {
+	return bindReviewerManifests(status, cwd, [{ lens: "review-reliability", selectedOrder: 0, subjectHash: `sha256:${"8".repeat(64)}` }], manifestHash);
+}
+
+/**
+ * Decodes the provider-issued `--name=value` argument tokens `captureResult`
+ * receives verbatim, and returns a matching admitted manifest. This mirrors
+ * exactly what a real `gentle-ai review capture-result` invocation would
+ * admit for the fixtures `bindReviewerManifests` produces above.
+ */
+function defaultCaptureResult(request: Parameters<NonNullable<NativeReviewCli["captureResult"]>>[0]): ReturnType<NonNullable<NativeReviewCli["captureResult"]>> extends Promise<infer T> ? Promise<T> : never {
+	const decoded = new Map(request.argumentTokens.map((token) => {
+		const withoutPrefix = token.replace(/^--/, "");
+		const separator = withoutPrefix.indexOf("=");
+		return [withoutPrefix.slice(0, separator), withoutPrefix.slice(separator + 1)] as const;
+	}));
+	const lens = decoded.get("lens")!;
+	const subjectHash = decoded.get("subject-hash")!;
+	return Promise.resolve({
+		schema: "gentle-ai.review-result-artifact/v2",
+		subjectHash,
+		admissionDecision: "completed",
+		lens,
+		path: `/opaque/capture/${lens}`,
+	});
 }
 
 function bindCorrectionCollection(status: ReviewStatusV3): ReviewStatusV3 {
@@ -566,8 +607,7 @@ function assertNoPublicDestructiveResetMaterial(value: unknown): void {
 }
 
 test("new ordinary START and native-lineage FINALIZE use exactly one native call and stable envelopes", async (t) => {
-	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-native-controller-"));
-	t.after(() => rmSync(cwd, { recursive: true, force: true }));
+	const cwd = repository(t);
 	let starts = 0;
 	let finalizes = 0;
 	const { controller } = runtime(fakeNative({
@@ -575,6 +615,9 @@ test("new ordinary START and native-lineage FINALIZE use exactly one native call
 			starts += 1;
 			return { lineageId: "native-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 2, changedLines: 7, correctionBudget: 4, action: "created", lensesRequired: true };
 		},
+		targetStatus: async (request) => request.lineageId === undefined
+			? candidateStartTargetStatus(request)
+			: bindReviewerManifests(candidateFinalizeTargetStatus(request, "native-lineage"), request.cwd),
 		finalize: async () => {
 			finalizes += 1;
 			return { lineageId: "native-lineage", state: "approved", action: "approved", storeRevision: "r1", receiptPath: "/opaque/receipt" };
@@ -582,7 +625,7 @@ test("new ordinary START and native-lineage FINALIZE use exactly one native call
 	}));
 	const start = await controller.execute("start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
 	assert.deepEqual(start.details, { operation: "start", result: { lineage_id: "native-lineage", state: "reviewing", risk_tier: "medium", selected_lenses: ["review-reliability"], changed_files: 2, original_changed_lines: 7, correction_budget: 4, action: "created", lenses_required: true }, workspace_root: cwd });
-	const finalize = await controller.execute("finalize", { operation: "finalize", lineageId: "native-lineage", input: JSON.stringify({ review_result: { lens_results: [{ findings: [], evidence: ["complete candidate reviewed"] }] } }) }, undefined, undefined, context(cwd));
+	const finalize = await controller.execute("finalize", { operation: "finalize", lineageId: "native-lineage", input: JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: ["complete candidate reviewed"] }] } }) }, undefined, undefined, context(cwd));
 	assert.deepEqual(finalize.details, { operation: "finalize", result: { lineage_id: "native-lineage", state: "approved", action: "approved", store_revision: "r1", receipt_path: "/opaque/receipt" } });
 	assert.equal(starts, 1);
 	assert.equal(finalizes, 1);
@@ -600,12 +643,12 @@ test("native FINALIZE resolves STATUS and mutation against the verified frozen c
 			statusRoots.push(request.cwd);
 			if (request.cwd === cwd) return targetStatusFixture({ applicability: "unrelated", action: "start" });
 			const candidate = candidateViews.resolveForFinalize(request.lineageId);
-			return targetStatusFixture({
+			return bindReviewerManifests(targetStatusFixture({
 				lineageId: request.lineageId,
 				baseTree: candidate.baseTree,
 				currentCandidateTree: candidate.candidateTree,
 				paths: candidate.paths,
-			});
+			}), request.cwd);
 		},
 		start: async () => ({
 			lineageId: "candidate-root-finalize",
@@ -629,7 +672,7 @@ test("native FINALIZE resolves STATUS and mutation against the verified frozen c
 	const result = await controller.execute("candidate-root-finalize", {
 		operation: "finalize",
 		lineageId: "candidate-root-finalize",
-		input: JSON.stringify({ review_result: { lens_results: [{ findings: [], evidence: ["candidate reviewed"] }] } }),
+		input: JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: ["candidate reviewed"] }] } }),
 	}, undefined, undefined, context(cwd));
 	assert.deepEqual(statusRoots, [candidateRoot]);
 	assert.equal(finalizeRoot, candidateRoot);
@@ -1393,6 +1436,9 @@ test("native FINALIZE derives and requires the trusted refuter request before in
 	let finalizes = 0;
 	const { controller } = runtime(fakeNative({
 		start: async () => ({ lineageId: "native-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-risk"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+		targetStatus: async (request) => request.lineageId === undefined
+			? candidateStartTargetStatus(request)
+			: bindReviewerManifests(candidateFinalizeTargetStatus(request, "native-lineage"), request.cwd, [{ lens: "review-risk", selectedOrder: 0 }]),
 		finalize: async () => {
 			finalizes += 1;
 			return { lineageId: "native-lineage", state: "validating", action: "continue", storeRevision: "r1" };
@@ -1421,6 +1467,9 @@ test("native FINALIZE emits exact v2.1.4 process documents and failed verificati
 	const requests: Parameters<NativeReviewCli["finalize"]>[0][] = [];
 	const { controller } = runtime(fakeNative({
 		start: async () => ({ lineageId: "native-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-risk"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+		targetStatus: async (request) => request.lineageId === undefined
+			? candidateStartTargetStatus(request)
+			: bindReviewerManifests(candidateFinalizeTargetStatus(request, "native-lineage"), request.cwd, [{ lens: "review-risk", selectedOrder: 0 }]),
 		finalize: async (request) => {
 			requests.push(request);
 			return { lineageId: "native-lineage", state: "approved", action: "approved", storeRevision: "r1" };
@@ -1442,12 +1491,128 @@ test("native FINALIZE emits exact v2.1.4 process documents and failed verificati
 	assert.deepEqual(requests, [{
 		cwd,
 		lineageId: "native-lineage",
-		lensResults: [{ lens: "review-risk", document: { lens: "risk", findings: [{ ...finding, lens: "risk" }], evidence: ["complete candidate reviewed"] } }],
+		// Reviewer results now reach FINALIZE only as admitted capture
+		// manifests (Wave 1, #2028 host behavior) — never as `lensResults`.
+		resultArtifactFiles: ["/opaque/capture/review-risk"],
 		refuterDocument: { results: refuterBatch.results },
 		validationDocument: { original_criteria: { passed: false, evidence: ["acceptance still fails"] }, correction_regression: { passed: true, evidence: ["regression suite passes"] }, follow_ups: [{ observation: "Track the remaining failure", proof_refs: ["differential-test:candidate still fails"] }] },
 		evidenceDocument: "  focused verification failed\n\n",
 		failed: true,
 	}]);
+});
+
+test("FINALIZE capture phase fails closed on a missing, extra, or duplicate lens before any capture runs (Wave 1, lens/slot bijection)", async (t) => {
+	const cwd = repository(t);
+	let captures = 0;
+	let finalizes = 0;
+	const { controller } = runtime(fakeNative({
+		start: async () => ({ lineageId: "native-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+		targetStatus: async (request) => request.lineageId === undefined
+			? candidateStartTargetStatus(request)
+			: bindReviewerManifests(candidateFinalizeTargetStatus(request, "native-lineage"), request.cwd, [{ lens: "review-reliability", selectedOrder: 0 }]),
+		captureResult: async (request) => { captures += 1; return defaultCaptureResult(request); },
+		finalize: async () => { finalizes += 1; return { lineageId: "native-lineage", state: "approved", action: "approved", storeRevision: "r1" }; },
+	}));
+	await controller.execute("bijection-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	for (const lensResults of [
+		[{ lens: "review-risk", findings: [], evidence: ["reviewed"] }], // extra/mismatched lens, no slot offered for it
+		[{ lens: "review-reliability", findings: [], evidence: ["a"] }, { lens: "review-reliability", findings: [], evidence: ["b"] }], // duplicate lens
+		[], // missing lens: one outstanding slot, zero submitted results
+	]) {
+		const result = await controller.execute("bijection-attempt", { operation: "finalize", lineageId: "native-lineage", input: JSON.stringify({ review_result: { lens_results: lensResults } }) }, undefined, undefined, context(cwd));
+		const details = result.details as { outcome?: string };
+		assert.equal(details.outcome, "native-operation-failed", JSON.stringify(details));
+	}
+	assert.equal(captures, 0, "no capture may run before the lens/slot bijection is proven");
+	assert.equal(finalizes, 0);
+});
+
+test("FINALIZE capture phase binds cwd to the candidate root and forwards provider tokens verbatim in ascending order (Wave 1, threat: Git repository selection)", async (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	const candidateViews = new CandidateViewRegistry();
+	const captureRequests: Parameters<NonNullable<NativeReviewCli["captureResult"]>>[0][] = [];
+	const { controller } = runtime(fakeNative({
+		start: async () => ({ lineageId: "capture-cwd-lineage", state: "reviewing", riskLevel: "high", selectedLenses: ["review-risk", "review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+		targetStatus: async (request) => {
+			if (request.lineageId === undefined) return candidateStartTargetStatus(request);
+			const candidate = candidateViews.resolveForFinalize(request.lineageId);
+			return bindReviewerManifests(targetStatusFixture({
+				lineageId: request.lineageId,
+				baseTree: candidate.baseTree,
+				currentCandidateTree: candidate.candidateTree,
+				paths: candidate.paths,
+			}), request.cwd, [
+				{ lens: "review-reliability", selectedOrder: 1 },
+				{ lens: "review-risk", selectedOrder: 0 },
+			]);
+		},
+		captureResult: async (request) => { captureRequests.push(request); return defaultCaptureResult(request); },
+		finalize: async () => ({ lineageId: "capture-cwd-lineage", state: "approved", action: "approved", storeRevision: "r1" }),
+	}), undefined, undefined, undefined, candidateViews);
+	await controller.execute("capture-cwd-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	const candidateRoot = candidateViews.resolveForFinalize("capture-cwd-lineage").root;
+	// Submitted in descending lens order; capture must still run ascending by
+	// the provider's own selectedOrder (review-risk=0 before review-reliability=1).
+	await controller.execute("capture-cwd-finalize", {
+		operation: "finalize",
+		lineageId: "capture-cwd-lineage",
+		input: JSON.stringify({ review_result: { lens_results: [
+			{ lens: "review-reliability", findings: [], evidence: ["reviewed"] },
+			{ lens: "review-risk", findings: [], evidence: ["reviewed"] },
+		] } }),
+	}, undefined, undefined, context(cwd));
+	assert.equal(captureRequests.length, 2);
+	assert.deepEqual(captureRequests.map((request) => request.cwd), [candidateRoot, candidateRoot]);
+	for (const request of captureRequests) {
+		assert.ok(request.argumentTokens.every((token) => typeof token === "string" && token.length > 0));
+	}
+	assert.deepEqual(captureRequests.map((request) => request.argumentTokens.find((token) => token.startsWith("--lens="))), ["--lens=review-risk", "--lens=review-reliability"]);
+});
+
+test("FINALIZE selects resultArtifactFiles when every admitted manifest carries a path, ascending by selectedOrder, and capturedResults when any carries a reference (Wave 1, transport selection)", async (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	const pathTransportRequests: Parameters<NativeReviewCli["finalize"]>[0][] = [];
+	const { controller: pathController } = runtime(fakeNative({
+		start: async () => ({ lineageId: "transport-path-lineage", state: "reviewing", riskLevel: "high", selectedLenses: ["review-risk", "review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+		targetStatus: async (request) => request.lineageId === undefined
+			? candidateStartTargetStatus(request)
+			: bindReviewerManifests(candidateFinalizeTargetStatus(request, "transport-path-lineage"), request.cwd, [
+				{ lens: "review-reliability", selectedOrder: 1 },
+				{ lens: "review-risk", selectedOrder: 0 },
+			]),
+		finalize: async (request) => { pathTransportRequests.push(request); return { lineageId: "transport-path-lineage", state: "approved", action: "approved", storeRevision: "r1" }; },
+	}));
+	await pathController.execute("transport-path-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	await pathController.execute("transport-path-finalize", {
+		operation: "finalize",
+		lineageId: "transport-path-lineage",
+		input: JSON.stringify({ review_result: { lens_results: [
+			{ lens: "review-reliability", findings: [], evidence: ["reviewed"] },
+			{ lens: "review-risk", findings: [], evidence: ["reviewed"] },
+		] } }),
+	}, undefined, undefined, context(cwd));
+	assert.deepEqual(pathTransportRequests[0]?.resultArtifactFiles, ["/opaque/capture/review-risk", "/opaque/capture/review-reliability"]);
+	assert.equal(pathTransportRequests[0]?.capturedResults, undefined);
+
+	const referenceTransportRequests: Parameters<NativeReviewCli["finalize"]>[0][] = [];
+	const { controller: referenceController } = runtime(fakeNative({
+		start: async () => ({ lineageId: "transport-reference-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+		targetStatus: async (request) => request.lineageId === undefined
+			? candidateStartTargetStatus(request)
+			: bindReviewerManifests(candidateFinalizeTargetStatus(request, "transport-reference-lineage"), request.cwd, [{ lens: "review-reliability", selectedOrder: 0 }]),
+		captureResult: async () => ({ schema: "gentle-ai.review-result-artifact/v2", subjectHash: `sha256:${"8".repeat(64)}`, admissionDecision: "completed", lens: "review-reliability", reference: `rref1_${"c".repeat(64)}` }),
+		finalize: async (request) => { referenceTransportRequests.push(request); return { lineageId: "transport-reference-lineage", state: "approved", action: "approved", storeRevision: "r1" }; },
+	}));
+	await referenceController.execute("transport-reference-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	await referenceController.execute("transport-reference-finalize", {
+		operation: "finalize",
+		lineageId: "transport-reference-lineage",
+		input: JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: ["reviewed"] }] } }),
+	}, undefined, undefined, context(cwd));
+	assert.equal(referenceTransportRequests[0]?.capturedResults, true);
+	assert.equal(referenceTransportRequests[0]?.resultArtifactFiles, undefined);
 });
 
 test("native FINALIZE rejects unpublished reviewer enums and empty arrays before native calls", async (t) => {
@@ -1530,14 +1695,24 @@ test("controller rejects zero-length final evidence before native calls", async 
 test("repeated native FINALIZE keeps initial lenses one-shot", async (t) => {
 	const cwd = repository(t);
 	const requests: Parameters<NativeReviewCli["finalize"]>[0][] = [];
-	const { controller } = runtime(fakeNative({ finalize: async (request) => {
-		requests.push(request);
-		return { lineageId: "native-lineage", state: "correction_required", action: "continue correction", storeRevision: `r${requests.length}` };
-	} }));
-	await controller.execute("initial", { operation: "finalize", lineageId: "native-lineage", input: JSON.stringify({ review_result: { lens_results: [{ findings: [], evidence: ["complete candidate reviewed"] }] } }) }, undefined, undefined, context(cwd));
+	const { controller } = runtime(fakeNative({
+		targetStatus: async (request) => request.lineageId === undefined
+			? candidateStartTargetStatus(request)
+			: bindReviewerManifests(candidateFinalizeTargetStatus(request, "native-lineage"), request.cwd),
+		finalize: async (request) => {
+			requests.push(request);
+			return { lineageId: "native-lineage", state: "correction_required", action: "continue correction", storeRevision: `r${requests.length}` };
+		},
+	}));
+	await controller.execute("initial", { operation: "finalize", lineageId: "native-lineage", input: JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: ["complete candidate reviewed"] }] } }) }, undefined, undefined, context(cwd));
 	await controller.execute("retry", { operation: "finalize", lineageId: "native-lineage", input: JSON.stringify({ correction_line_forecast: 1 }) }, undefined, undefined, context(cwd));
-	assert.equal(requests[0]?.lensResults?.length, 1);
-	assert.equal(requests[1]?.lensResults, undefined);
+	// Reviewer results now reach FINALIZE only through admitted capture
+	// manifests (Wave 1, #2028 host behavior) — one-shot initial lenses means
+	// the second (correction) FINALIZE carries no capture transport at all.
+	assert.deepEqual(requests[0]?.resultArtifactFiles, ["/opaque/capture/review-reliability"]);
+	assert.equal(requests[0]?.capturedResults, undefined);
+	assert.equal(requests[1]?.resultArtifactFiles, undefined);
+	assert.equal(requests[1]?.capturedResults, undefined);
 });
 
 test("native error has no compact fallback and ambiguous mutation demands target status", async (t) => {
@@ -2734,6 +2909,9 @@ test("native pre-commit rejects an unproven staged projection before native auth
 	const candidateViews = new CandidateViewRegistry();
 	let validations = 0;
 	const { controller } = runtime(fakeNative({
+		targetStatus: async (request) => request.lineageId === undefined
+			? candidateStartTargetStatus(request)
+			: bindReviewerManifests(candidateFinalizeTargetStatus(request, request.lineageId), request.cwd),
 		validate: async () => {
 			validations += 1;
 			return { allowed: true, result: "allow", action: "continue", reason: "native allow must not bypass Pi projection checks", gateContext: nativeGateContext() };
@@ -2741,7 +2919,7 @@ test("native pre-commit rejects an unproven staged projection before native auth
 	}), undefined, undefined, undefined, candidateViews);
 	const started = await controller.execute("start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
 	const lineageId = (started.details as { result: { lineage_id: string } }).result.lineage_id;
-	await controller.execute("finalize", { operation: "finalize", lineageId, input: JSON.stringify({ review_result: { lens_results: [{ findings: [], evidence: ["candidate reviewed"] }] } }) }, undefined, undefined, context(cwd));
+	await controller.execute("finalize", { operation: "finalize", lineageId, input: JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: ["candidate reviewed"] }] } }) }, undefined, undefined, context(cwd));
 	writeFileSync(join(cwd, "app.ts"), "export const value = 3;\n");
 	git(cwd, "add", "--", "app.ts", "initially-untracked.ts");
 	const result = await controller.execute("validate", { operation: "validate", lineageId, idempotencyKey: "projection-drift", command: "git commit -m native", input: "{}" }, undefined, undefined, context(cwd));
@@ -2756,6 +2934,9 @@ test("native pre-commit binds the exact tracked and initially-untracked projecti
 	const candidateViews = new CandidateViewRegistry();
 	let validations = 0;
 	const native = fakeNative({
+		targetStatus: async (request) => request.lineageId === undefined
+			? candidateStartTargetStatus(request)
+			: bindReviewerManifests(candidateFinalizeTargetStatus(request, request.lineageId), request.cwd),
 		validate: async () => {
 			validations += 1;
 			return { allowed: true, result: "allow", action: "continue", reason: "ok", gateContext: nativeGateContext("native-lineage", "r1", git(cwd, "write-tree")) };
@@ -2764,7 +2945,7 @@ test("native pre-commit binds the exact tracked and initially-untracked projecti
 	const { controller, toolCall } = runtime(native, undefined, undefined, undefined, candidateViews);
 	const started = await controller.execute("start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
 	const lineageId = (started.details as { result: { lineage_id: string } }).result.lineage_id;
-	await controller.execute("finalize", { operation: "finalize", lineageId, input: JSON.stringify({ review_result: { lens_results: [{ findings: [], evidence: ["candidate reviewed"] }] } }) }, undefined, undefined, context(cwd));
+	await controller.execute("finalize", { operation: "finalize", lineageId, input: JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: ["candidate reviewed"] }] } }) }, undefined, undefined, context(cwd));
 	git(cwd, "add", "--", "app.ts", "initially-untracked.ts");
 	const command = "git commit -m exact-projection";
 	const allowed = await controller.execute("validate", { operation: "validate", lineageId, idempotencyKey: "exact-projection", command, input: "{}" }, undefined, undefined, context(cwd));
