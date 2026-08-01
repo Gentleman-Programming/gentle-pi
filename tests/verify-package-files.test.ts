@@ -9,6 +9,8 @@ import {
 	gentleAiVersionPinMismatches,
 	mirrorDigestDrift,
 	mirrorDigestsFromLock,
+	phaseCoverageBindings,
+	phaseCoverageGate,
 	reconcileContractsOnDisk,
 	reconcileGeneratedRuntimeSources,
 } from "../scripts/verify-package-files.mjs";
@@ -214,6 +216,109 @@ test("lock release version pin mismatch is reported naming the authoritative INS
 		/gentle-ai-release\.lock\.json/,
 	);
 	assert.doesNotThrow(() => assertLockReleaseVersionPin({ release: { version: INSTALLER_VERSION } }, INSTALLER_VERSION));
+});
+
+// --- phase-coverage gate (design D9, task 7.1/7.2) --------------------------
+//
+// Maintainer decision superseding tasks.md 7.1's "fails" wording for the
+// forward direction (recorded in apply-progress.md): a provider-declared
+// phase with no Pi binding WARNS, naming the missing phase, and does NOT
+// fail CI -- the reverse direction (a Pi binding naming no declared phase,
+// not listed Pi-only) still fails, since that is a real inconsistency in
+// Pi's own configuration rather than provider release cadence.
+
+test("phase coverage: a provider-declared phase with no Pi binding is reported as missing, not as an unknown binding", () => {
+	const { missingBindings, unknownBindings } = phaseCoverageGate(
+		{ declaredPhases: ["sdd-apply", "sdd-brand-new-phase"], alias: {}, piOnly: [] },
+		{ agentNames: ["sdd-apply"], chainNames: [] },
+	);
+
+	assert.deepEqual(missingBindings, ["sdd-brand-new-phase"]);
+	assert.deepEqual(unknownBindings, []);
+});
+
+test("phase coverage: a Pi agent binding naming no declared phase and not listed Pi-only is an unknown binding", () => {
+	const { missingBindings, unknownBindings } = phaseCoverageGate(
+		{ declaredPhases: ["sdd-apply"], alias: {}, piOnly: [] },
+		{ agentNames: ["sdd-apply", "gentle-ai-rogue"], chainNames: [] },
+	);
+
+	assert.deepEqual(missingBindings, []);
+	assert.deepEqual(unknownBindings, ["gentle-ai-rogue"]);
+});
+
+test("phase coverage: a Pi-only binding names no declared phase but is never reported unknown", () => {
+	const { missingBindings, unknownBindings } = phaseCoverageGate(
+		{ declaredPhases: ["sdd-apply"], alias: {}, piOnly: ["sdd-status"] },
+		{ agentNames: ["sdd-apply", "sdd-status"], chainNames: [] },
+	);
+
+	assert.deepEqual(missingBindings, []);
+	assert.deepEqual(unknownBindings, []);
+});
+
+test("phase coverage: the sdd-proposal <-> sdd-propose alias resolves in both directions", () => {
+	const phaseCoverage = { declaredPhases: ["sdd-propose"], alias: { "sdd-proposal": "sdd-propose" }, piOnly: [] };
+
+	assert.deepEqual(
+		phaseCoverageGate(phaseCoverage, { agentNames: ["sdd-proposal"], chainNames: [] }),
+		{ missingBindings: [], unknownBindings: [] },
+	);
+});
+
+test("phase coverage: a chain binding satisfies the forward check for a declared phase", () => {
+	const { missingBindings } = phaseCoverageGate(
+		{ declaredPhases: ["sdd-verify"], alias: {}, piOnly: [] },
+		{ agentNames: [], chainNames: ["sdd-verify"] },
+	);
+
+	assert.deepEqual(missingBindings, []);
+});
+
+test("phase coverage: a chain naming no declared phase is never reported as an unknown binding (reverse check only walks assets/agents/**)", () => {
+	const { missingBindings, unknownBindings } = phaseCoverageGate(
+		{ declaredPhases: ["sdd-apply"], alias: {}, piOnly: [] },
+		{ agentNames: ["sdd-apply"], chainNames: ["4r-review"] },
+	);
+
+	assert.deepEqual(missingBindings, []);
+	assert.deepEqual(unknownBindings, []);
+});
+
+test("phase coverage: skills/issue-creation/SKILL.md is never read or flagged -- the gate only walks assets/agents/** and assets/chains/**", () => {
+	const fixtureRoot = makeFixtureRoot();
+	try {
+		mkdirSync(join(fixtureRoot, "assets/agents"), { recursive: true });
+		mkdirSync(join(fixtureRoot, "assets/chains"), { recursive: true });
+		mkdirSync(join(fixtureRoot, "skills/issue-creation"), { recursive: true });
+		writeFileSync(join(fixtureRoot, "assets/agents/sdd-apply.md"), "agent\n");
+		writeFileSync(join(fixtureRoot, "assets/chains/sdd-plan.chain.md"), "chain\n");
+		writeFileSync(join(fixtureRoot, "skills/issue-creation/SKILL.md"), "repo-identity, not drift\n");
+
+		const bindings = phaseCoverageBindings(fixtureRoot);
+
+		assert.deepEqual(bindings.agentNames, ["sdd-apply"]);
+		assert.deepEqual(bindings.chainNames, ["sdd-plan"]);
+
+		const { unknownBindings } = phaseCoverageGate(
+			{ declaredPhases: ["sdd-apply"], alias: {}, piOnly: [] },
+			bindings,
+		);
+		assert.deepEqual(unknownBindings, []);
+	} finally {
+		rmSync(fixtureRoot, { recursive: true, force: true });
+	}
+});
+
+test("phase coverage: the real assets/phase-coverage.json fully reconciles against the real assets/agents and assets/chains trees", async () => {
+	const PACKAGE_ROOT = join(import.meta.dirname, "..");
+	const phaseCoverage = JSON.parse(readFileSync(join(PACKAGE_ROOT, "assets/phase-coverage.json"), "utf8"));
+	const bindings = phaseCoverageBindings(PACKAGE_ROOT);
+
+	const { missingBindings, unknownBindings } = phaseCoverageGate(phaseCoverage, bindings);
+
+	assert.deepEqual(missingBindings, []);
+	assert.deepEqual(unknownBindings, []);
 });
 
 test("both walks report no drift when sources, runtime/*.mjs, requiredPaths, and contractHashes fully agree", () => {

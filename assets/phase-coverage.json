@@ -1,0 +1,34 @@
+{
+  "schema": "gentle-pi.phase-coverage/v1",
+  "declaredPhases": [
+    "jd-fix-agent",
+    "jd-judge-a",
+    "jd-judge-b",
+    "review-readability",
+    "review-refuter",
+    "review-reliability",
+    "review-resilience",
+    "review-risk",
+    "sdd-apply",
+    "sdd-archive",
+    "sdd-design",
+    "sdd-explore",
+    "sdd-init",
+    "sdd-onboard",
+    "sdd-propose",
+    "sdd-spec",
+    "sdd-tasks",
+    "sdd-verify"
+  ],
+  "alias": {
+    "sdd-proposal": "sdd-propose"
+  },
+  "piOnly": [
+    "gentle-ai-explore",
+    "gentle-ai-verify",
+    "gentle-ai-worker",
+    "review-validator",
+    "sdd-status",
+    "sdd-sync"
+  ]
+}
