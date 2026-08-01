@@ -46,16 +46,16 @@ Chain strategy: feature-branch-chain
 
 ## PR 2 — P1b: Signed sync path + mirrors + canonical lock (Req: "Offline mirrors and a canonical lock bind provider identity"; "Bootstrap snapshot evidence never substitutes for release evidence")
 
-- [ ] 2.1 RED: `scripts/sync-gentle-ai-release.mjs` tests (threat-matrix: network trust boundary) — forged minisign signature rejected; wrong trusted-comment repo/tag binding rejected; missing checksum line rejected; duplicate checksum line rejected.
-- [ ] 2.2 GREEN: create `scripts/sync-gentle-ai-release.mjs` (`--write`, pin-bump job only, network) — downloads `checksums.txt`/`.minisig`/archive, runs D1 trust order via `lib/release-artifact.ts`, writes mirrors + lock.
-- [ ] 2.3 GREEN: write mirrors — `contracts/review-integration/{v1,v2}/**`, `contracts/release-artifact/v1/schemas/artifact-manifest.schema.json`, `capabilities/review-integration-v2.semantic.json`, `docs/gentle-ai/review-integration.md`.
-- [ ] 2.4 GREEN: create `capabilities/gentle-ai-release.lock.json` (canonical LF, 2-space, path-sorted, one trailing LF); assert `lock.release.version === INSTALLER_VERSION`.
-- [ ] 2.5 RED: `scripts/verify-package-files.mjs` reconciliation tests — unlisted-on-disk mirror file, listed-but-missing file, and digest drift each fail naming the exact file.
-- [ ] 2.6 GREEN: `scripts/verify-package-files.mjs` — delete the ~60-entry `contractHashes` map; reconcile on-disk mirrors against `lock.entries` via `reconcileContractsOnDisk`.
-- [ ] 2.7 RED: evidence-S/R labeling test — a sync result run against `--bootstrap-archive` is labeled `development/bootstrap` and never relabeled as release evidence.
-- [ ] 2.8 GREEN: wire evidence labeling into `sync-gentle-ai-release.mjs` (plan §12 ledger shape).
-- [ ] 2.9 GREEN: `.github/workflows/ci.yml` — add offline mirror/lock reconciliation to the per-PR gate; only the pin-bump job invokes `sync-gentle-ai-release.mjs --write` with network.
-- [ ] 2.10 Verify: `pnpm test`; `node scripts/verify-package-files.mjs --check` offline, no network access.
+- [x] 2.1 RED: `scripts/sync-gentle-ai-release.mjs` tests (threat-matrix: network trust boundary) — forged minisign signature rejected; wrong trusted-comment repo/tag binding rejected; missing checksum line rejected; duplicate checksum line rejected.
+- [x] 2.2 GREEN: create `scripts/sync-gentle-ai-release.mjs` (`--write`, pin-bump job only, network) — downloads `checksums.txt`/`.minisig`/archive, runs D1 trust order via `lib/release-artifact.ts`, writes mirrors + lock.
+- [x] 2.3 GREEN: write mirrors — `contracts/review-integration/{v1,v2}/**`, `contracts/release-artifact/v1/schemas/artifact-manifest.schema.json`, `capabilities/review-integration-v2.semantic.json`, `docs/gentle-ai/review-integration.md`.
+- [x] 2.4 GREEN: create `capabilities/gentle-ai-release.lock.json` (canonical LF, 2-space, path-sorted, one trailing LF); assert `lock.release.version === INSTALLER_VERSION`.
+- [x] 2.5 RED: `scripts/verify-package-files.mjs` reconciliation tests — unlisted-on-disk mirror file, listed-but-missing file, and digest drift each fail naming the exact file.
+- [x] 2.6 GREEN: `scripts/verify-package-files.mjs` — delete the ~60-entry `contractHashes` map; reconcile on-disk mirrors against `lock.entries` via `reconcileContractsOnDisk`.
+- [x] 2.7 RED: evidence-S/R labeling test — a sync result run against `--bootstrap-archive` is labeled `development/bootstrap` and never relabeled as release evidence.
+- [x] 2.8 GREEN: wire evidence labeling into `sync-gentle-ai-release.mjs` (plan §12 ledger shape).
+- [x] 2.9 GREEN: `.github/workflows/ci.yml` — add offline mirror/lock reconciliation to the per-PR gate; only the pin-bump job invokes `sync-gentle-ai-release.mjs --write` with network.
+- [x] 2.10 Verify: `pnpm test`; `node scripts/verify-package-files.mjs --check` offline, no network access.
 
 ## PR 3 — P2a: POSIX assets install + integrity manifest + resolver (depends: sibling `consolidate-review-parity-runtime` archived)
 

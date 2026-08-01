@@ -35,6 +35,11 @@ jobs:
         env:
           GENTLE_PI_REQUIRE_NATIVE_BINARY: "1"
 
+      # Offline mirror + capabilities/gentle-ai-release.lock.json reconciliation
+      # (contracts/, docs/gentle-ai/, capabilities/*.semantic.json) runs here,
+      # fully offline. Only scripts/sync-gentle-ai-release.mjs --write, invoked
+      # exclusively by the not-yet-landed pin-bump job, ever downloads or
+      # verifies a minisign signature; no job in this workflow does.
       - name: Verify package contents
         run: node scripts/verify-package-files.mjs
 
