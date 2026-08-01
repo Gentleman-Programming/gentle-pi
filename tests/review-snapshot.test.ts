@@ -86,6 +86,32 @@ function createRepository(t: test.TestContext): {
 	return { repository, git };
 }
 
+function commitGitlinks(
+	git: (...args: string[]) => string,
+	entries: ReadonlyArray<{ path: string; oid: string }>,
+): void {
+	for (const entry of entries) {
+		git("update-index", "--add", "--cacheinfo", "160000", entry.oid, entry.path);
+	}
+	git(
+		"-c",
+		"user.name=Gentle Pi Tests",
+		"-c",
+		"user.email=gentle-pi@example.invalid",
+		"commit",
+		"-m",
+		"add gitlinks",
+	);
+}
+
+function treeEntry(
+	git: (...args: string[]) => string,
+	tree: string,
+	path: string,
+): string {
+	return git("ls-tree", tree, "--", path);
+}
+
 test("complete snapshot captures the repository root from a nested cwd without mutating index or worktree", (t) => {
 	const { repository, git } = createRepository(t);
 	const nested = join(repository, "packages", "app");
@@ -126,6 +152,114 @@ test("complete snapshot captures the repository root from a nested cwd without m
 	);
 	assert.deepEqual(readFileSync(indexPath), indexBefore);
 	assert.equal(git("status", "--porcelain=v1", "--untracked-files=all"), statusBefore);
+});
+
+test("complete snapshot retains multiple absent clean gitlinks without reporting them as changed", (t) => {
+	const { repository, git } = createRepository(t);
+	const gitlinkOid = git("rev-parse", "HEAD");
+	commitGitlinks(git, [
+		{ path: "vendor/alpha", oid: gitlinkOid },
+		{ path: "vendor/path with spaces", oid: gitlinkOid },
+	]);
+	writeFileSync(join(repository, "tracked.txt"), "working tree\n");
+	const indexPath = join(git("rev-parse", "--absolute-git-dir"), "index");
+	const indexBefore = readFileSync(indexPath);
+
+	const snapshot = captureReviewSnapshot({
+		cwd: repository,
+		mode: REVIEW_MODE.ORDINARY,
+		projection: { kind: REVIEW_PROJECTION.COMPLETE },
+		policyHash: "1".repeat(64),
+	});
+
+	assert.equal(
+		treeEntry(snapshotGit.bind(undefined, snapshot), snapshot.complete_snapshot_tree, "vendor/alpha"),
+		`160000 commit ${gitlinkOid}\tvendor/alpha`,
+	);
+	assert.equal(
+		treeEntry(snapshotGit.bind(undefined, snapshot), snapshot.complete_snapshot_tree, "vendor/path with spaces"),
+		`160000 commit ${gitlinkOid}\tvendor/path with spaces`,
+	);
+	assert.deepEqual(snapshot.genesis_paths, ["tracked.txt"]);
+	assert.deepEqual(readFileSync(indexPath), indexBefore);
+});
+
+test("ephemeral live candidate binding retains absent clean gitlinks", (t) => {
+	const { repository, git } = createRepository(t);
+	const gitlinkOid = git("rev-parse", "HEAD");
+	commitGitlinks(git, [
+		{ path: "vendor/alpha", oid: gitlinkOid },
+		{ path: "vendor/path with spaces", oid: gitlinkOid },
+	]);
+	const indexPath = join(git("rev-parse", "--absolute-git-dir"), "index");
+	const indexBefore = readFileSync(indexPath);
+
+	const binding = captureLiveReviewCandidateBinding({
+		cwd: repository,
+		repositoryId: "repository-authority-id",
+	});
+
+	assert.equal(binding.complete_snapshot_tree, binding.base_tree);
+	assert.deepEqual(binding.genesis_paths, []);
+	assert.deepEqual(readFileSync(indexPath), indexBefore);
+});
+
+test("staged deletion of an absent gitlink remains deleted in the complete snapshot", (t) => {
+	const { repository, git } = createRepository(t);
+	const gitlinkOid = git("rev-parse", "HEAD");
+	commitGitlinks(git, [{ path: "vendor/deleted", oid: gitlinkOid }]);
+	git("update-index", "--force-remove", "vendor/deleted");
+
+	const snapshot = captureReviewSnapshot({
+		cwd: repository,
+		mode: REVIEW_MODE.ORDINARY,
+		projection: { kind: REVIEW_PROJECTION.COMPLETE },
+		policyHash: "2".repeat(64),
+	});
+
+	assert.equal(treeEntry(snapshotGit.bind(undefined, snapshot), snapshot.complete_snapshot_tree, "vendor/deleted"), "");
+	assert.deepEqual(snapshot.genesis_paths, ["vendor/deleted"]);
+});
+
+test("present submodule checkout at another commit captures the worktree gitlink OID", (t) => {
+	const { repository, git } = createRepository(t);
+	const originalOid = git("rev-parse", "HEAD");
+	commitGitlinks(git, [{ path: "vendor/present", oid: originalOid }]);
+	const submodule = join(repository, "vendor", "present");
+	mkdirSync(submodule, { recursive: true });
+	const submoduleGit = (...args: string[]): string =>
+		execFileSync("git", args, {
+			cwd: submodule,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+		}).trim();
+	submoduleGit("init", "-b", "main");
+	writeFileSync(join(submodule, "content.txt"), "new commit\n");
+	submoduleGit("add", "content.txt");
+	submoduleGit(
+		"-c",
+		"user.name=Gentle Pi Tests",
+		"-c",
+		"user.email=gentle-pi@example.invalid",
+		"commit",
+		"-m",
+		"new submodule commit",
+	);
+	const newOid = submoduleGit("rev-parse", "HEAD");
+
+	const snapshot = captureReviewSnapshot({
+		cwd: repository,
+		mode: REVIEW_MODE.ORDINARY,
+		projection: { kind: REVIEW_PROJECTION.COMPLETE },
+		policyHash: "3".repeat(64),
+	});
+
+	assert.notEqual(newOid, originalOid);
+	assert.equal(
+		treeEntry(snapshotGit.bind(undefined, snapshot), snapshot.complete_snapshot_tree, "vendor/present"),
+		`160000 commit ${newOid}\tvendor/present`,
+	);
+	assert.deepEqual(snapshot.genesis_paths, ["vendor/present"]);
 });
 
 test("ephemeral live candidate binding derives the complete candidate without retaining a snapshot", (t) => {
