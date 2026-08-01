@@ -19,6 +19,10 @@
 		"cognitive-doc-design": {
 			"path": "skills/_vendor/cognitive-doc-design/SKILL.md",
 			"sha256": "80dcaeca45c35e830939ef5440ca270b147f6370e4afcb47cdab762097f8cde0"
+		},
+		"skill-improver": {
+			"path": "skills/_vendor/skill-improver/SKILL.md",
+			"sha256": "4b71aa7f242259a3e4ef8f5c87c591e154b2fe1ef5277c9d7428ba2fa678a151"
 		}
 	}
 }
