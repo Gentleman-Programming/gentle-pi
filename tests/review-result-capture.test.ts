@@ -2,7 +2,20 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { CandidateViewError } from "../lib/review-candidate-view.ts";
 import type { ReviewArtifactSubjectV2, ReviewCollectInputV3, ReviewStatusV3, ReviewTransitionArgumentV3 } from "../lib/review-integration-v2.ts";
-import { CAPTURE_SLOT_ARGUMENT, type CaptureSlot, assertLensSlotBijection, deriveCaptureSlots } from "../lib/review-result-capture.ts";
+import {
+	ADMISSION_DIAGNOSTIC_CODE,
+	CAPTURE_SLOT_ARGUMENT,
+	CAPTURE_SLOT_STATE,
+	type CaptureSlot,
+	type CaptureSlotRecord,
+	assertLensSlotBijection,
+	captureSlotKey,
+	clearCaptureSlotRecordsForLineage,
+	decodeSafeAdmissionDiagnostic,
+	deriveCaptureSlots,
+	isCaptureSlotCommitted,
+	sha256Hex,
+} from "../lib/review-result-capture.ts";
 
 const LINEAGE = "capture-lineage";
 const REVISION = `sha256:${"1".repeat(64)}`;
@@ -325,4 +338,151 @@ test("assertLensSlotBijection rejects a slot count larger than lens_results (an 
 		() => assertLensSlotBijection(["review-risk"], slots),
 		(error: unknown) => error instanceof CandidateViewError && error.reason === "capture-lens-bijection-violation",
 	);
+});
+
+// ---------------------------------------------------------------------------
+// W2.1/W2.2 — decodeSafeAdmissionDiagnostic (Wave 1, threat: Privacy egress)
+// ---------------------------------------------------------------------------
+
+function admissionDiagnostic(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		code: ADMISSION_DIAGNOSTIC_CODE.INVALID_FINDING_LOCATION,
+		finding_id: "RISK-001",
+		reason: "location does not resolve inside the frozen candidate scope",
+		...overrides,
+	};
+}
+
+test("decodeSafeAdmissionDiagnostic accepts the exact known shape for each allowlisted code", () => {
+	for (const code of [ADMISSION_DIAGNOSTIC_CODE.INVALID_FINDING_LOCATION, ADMISSION_DIAGNOSTIC_CODE.CANDIDATE_CAUSALITY_UNPROVEN]) {
+		const decoded = decodeSafeAdmissionDiagnostic(admissionDiagnostic({ code }));
+		assert.deepEqual(decoded, { code, findingId: "RISK-001", reason: "location does not resolve inside the frozen candidate scope" });
+	}
+});
+
+test("decodeSafeAdmissionDiagnostic accepts an optional repository-relative location", () => {
+	const decoded = decodeSafeAdmissionDiagnostic(admissionDiagnostic({ location: "lib/a.ts:10" }));
+	assert.equal(decoded?.location, "lib/a.ts:10");
+});
+
+test("decodeSafeAdmissionDiagnostic rejects a non-object value, including raw prose", () => {
+	for (const value of [undefined, null, "the candidate causality could not be proven for RISK-001", 42, []]) {
+		assert.equal(decodeSafeAdmissionDiagnostic(value), undefined, `expected undefined for ${JSON.stringify(value)}`);
+	}
+});
+
+test("decodeSafeAdmissionDiagnostic rejects an unknown code", () => {
+	assert.equal(decodeSafeAdmissionDiagnostic(admissionDiagnostic({ code: "unknown_code" })), undefined);
+	assert.equal(decodeSafeAdmissionDiagnostic(admissionDiagnostic({ code: undefined })), undefined);
+});
+
+test("decodeSafeAdmissionDiagnostic rejects an extra key beyond the exact-record shape", () => {
+	assert.equal(decodeSafeAdmissionDiagnostic(admissionDiagnostic({ raw_prose: "unstructured native explanation" })), undefined);
+	assert.equal(decodeSafeAdmissionDiagnostic(admissionDiagnostic({ stack_trace: "at native.go:42" })), undefined);
+});
+
+test("decodeSafeAdmissionDiagnostic rejects a missing required key", () => {
+	for (const key of ["code", "finding_id", "reason"]) {
+		const value = admissionDiagnostic();
+		delete value[key];
+		assert.equal(decodeSafeAdmissionDiagnostic(value), undefined, `expected undefined with ${key} missing`);
+	}
+});
+
+test("decodeSafeAdmissionDiagnostic rejects a malformed findingId", () => {
+	for (const findingId of ["", "RISK 001", "RISK/001", "x".repeat(65), "../../etc/passwd"]) {
+		assert.equal(decodeSafeAdmissionDiagnostic(admissionDiagnostic({ finding_id: findingId })), undefined, `expected undefined for finding_id ${JSON.stringify(findingId)}`);
+	}
+});
+
+test("decodeSafeAdmissionDiagnostic rejects an absolute or private location", () => {
+	for (const location of ["/etc/passwd", "/home/user/.ssh/id_rsa", "~/secrets.env", "~root/.bash_history"]) {
+		assert.equal(decodeSafeAdmissionDiagnostic(admissionDiagnostic({ location })), undefined, `expected undefined for location ${JSON.stringify(location)}`);
+	}
+});
+
+test("decodeSafeAdmissionDiagnostic rejects a location escaping the repository with .. or a Windows-style backslash", () => {
+	for (const location of ["../../../etc/shadow", "lib/../../etc/passwd", "lib\\a.ts", "..\\..\\secrets"]) {
+		assert.equal(decodeSafeAdmissionDiagnostic(admissionDiagnostic({ location })), undefined, `expected undefined for location ${JSON.stringify(location)}`);
+	}
+});
+
+test("decodeSafeAdmissionDiagnostic rejects a location or reason containing control characters, including newlines", () => {
+	assert.equal(decodeSafeAdmissionDiagnostic(admissionDiagnostic({ location: "lib/a.ts\n../../etc/passwd" })), undefined);
+	assert.equal(decodeSafeAdmissionDiagnostic(admissionDiagnostic({ location: "lib/a.ts " })), undefined);
+	assert.equal(decodeSafeAdmissionDiagnostic(admissionDiagnostic({ reason: "multi-line\nprose with an embedded control byte " })), undefined);
+});
+
+test("decodeSafeAdmissionDiagnostic rejects an over-length reason or location", () => {
+	assert.equal(decodeSafeAdmissionDiagnostic(admissionDiagnostic({ reason: "x".repeat(121) })), undefined);
+	assert.equal(decodeSafeAdmissionDiagnostic(admissionDiagnostic({ location: `lib/${"a".repeat(256)}.ts` })), undefined);
+});
+
+test("decodeSafeAdmissionDiagnostic rejects untrimmed or raw-prose reasons", () => {
+	assert.equal(decodeSafeAdmissionDiagnostic(admissionDiagnostic({ reason: "  padded on both sides  " })), undefined);
+	assert.equal(
+		decodeSafeAdmissionDiagnostic(admissionDiagnostic({
+			reason: "The native reviewer engine attempted to resolve the finding location against the candidate tree, but the location pointed outside every path in the frozen changed-path manifest, so admission was declined for causal-safety reasons",
+		})),
+		undefined,
+	);
+});
+
+// ---------------------------------------------------------------------------
+// W2.9 (partial, pure half) — a stale grant cannot be reused because
+// `slotKey` embeds `authorityRevision` and `subjectHash` (Decision 5,
+// structural guarantee).
+// ---------------------------------------------------------------------------
+
+test("captureSlotKey differs whenever authorityRevision or subjectHash differs, so a stale grant can never collide with a fresh one", () => {
+	const base = { lineageId: LINEAGE, authorityRevision: REVISION, targetIdentity: TARGET, lens: "review-reliability", order: 0, subjectHash: `sha256:${"4".repeat(64)}` };
+	const baseline = captureSlotKey(base.lineageId, base.authorityRevision, base.targetIdentity, base.lens, base.order, base.subjectHash);
+	const newRevision = captureSlotKey(base.lineageId, `sha256:${"5".repeat(64)}`, base.targetIdentity, base.lens, base.order, base.subjectHash);
+	const newSubjectHash = captureSlotKey(base.lineageId, base.authorityRevision, base.targetIdentity, base.lens, base.order, `sha256:${"6".repeat(64)}`);
+	assert.notEqual(newRevision, baseline, "a new authority revision must never reuse a stale slotKey");
+	assert.notEqual(newSubjectHash, baseline, "a new candidate subject hash must never reuse a stale slotKey");
+	assert.notEqual(newRevision, newSubjectHash);
+});
+
+test("clearCaptureSlotRecordsForLineage removes only the targeted lineage's records", () => {
+	const records = new Map<string, CaptureSlotRecord>([
+		["a", { slotKey: "a", lineageId: "lineage-a", state: CAPTURE_SLOT_STATE.RELAUNCH_GRANTED, rejectedDocumentHashes: new Set([sha256Hex("doc")]) }],
+		["b", { slotKey: "b", lineageId: "lineage-b", state: CAPTURE_SLOT_STATE.ADMITTED, rejectedDocumentHashes: new Set() }],
+	]);
+	clearCaptureSlotRecordsForLineage(records, "lineage-a");
+	assert.equal(records.has("a"), false);
+	assert.equal(records.has("b"), true);
+});
+
+// ---------------------------------------------------------------------------
+// W2.7 (pure half) — isCaptureSlotCommitted (Decision 4)
+// ---------------------------------------------------------------------------
+
+test("isCaptureSlotCommitted proves commitment only when authority is unchanged and the slot is no longer offered", () => {
+	const slot = slotFixture();
+	const committed = status([]);
+	assert.equal(isCaptureSlotCommitted(slot, committed), true);
+});
+
+test("isCaptureSlotCommitted is not proven when the slot is still offered", () => {
+	const slot = slotFixture();
+	const stillOffered = status([collectInput({ subjectOverrides: { lens: slot.lens, selectedOrder: slot.selectedOrder } })]);
+	assert.equal(isCaptureSlotCommitted(slot, stillOffered), false);
+});
+
+test("isCaptureSlotCommitted is not proven when the authority lineage or revision changed", () => {
+	const slot = slotFixture();
+	const changedRevision = status([]);
+	changedRevision.authority = { version: "compact-v2", lineageId: LINEAGE, state: "reviewing", generation: 2, revision: `sha256:${"9".repeat(64)}` };
+	assert.equal(isCaptureSlotCommitted(slot, changedRevision), false);
+	const changedLineage = status([]);
+	changedLineage.authority = { version: "compact-v2", lineageId: "other-lineage", state: "reviewing", generation: 1, revision: REVISION };
+	assert.equal(isCaptureSlotCommitted(slot, changedLineage), false);
+});
+
+test("isCaptureSlotCommitted is not proven (ambiguous) when authority is absent entirely", () => {
+	const slot = slotFixture();
+	const noAuthority = status([]);
+	delete noAuthority.authority;
+	assert.equal(isCaptureSlotCommitted(slot, noAuthority), false);
 });

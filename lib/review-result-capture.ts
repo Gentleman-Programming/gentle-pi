@@ -6,6 +6,7 @@
 // (extensions/gentle-ai.ts) and the FINALIZE capture phase both consume this
 // module instead of re-validating the binding themselves, so exactly one
 // validator exists.
+import { createHash } from "node:crypto";
 import { isCanonicalProcessString } from "./native-review-cli.ts";
 import { CandidateViewError } from "./review-candidate-view.ts";
 import type { ReviewArtifactSubjectV2, ReviewCollectInputV3, ReviewStatusV3 } from "./review-integration-v2.ts";
@@ -144,4 +145,143 @@ export function assertLensSlotBijection(lensLabels: readonly string[], slots: re
 	if (seen.size !== slotLenses.size) {
 		throw new CandidateViewError("review result is missing a capture slot for a selected lens", "capture-lens-bijection-violation");
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Wave 1, #2028 host behavior, Design Decision 2: admission diagnostics.
+//
+// `decodeSafeAdmissionDiagnostic` is an ALLOWLIST decoder: it returns a value
+// only for its exact known shape, and `undefined` for anything it cannot
+// fully prove — unknown code, an extra key, an absolute or private location,
+// `..`/`~`/control characters, an over-length reason, or raw prose all yield
+// `undefined`. A denylist or sanitize-then-forward default was explicitly
+// rejected (design.md Decision 2): a wrong default here is exactly how
+// private paths and user content leak into an issue report. The raw provider
+// failure envelope keeps flowing through the existing opaque
+// `nativeOperationFailure` path unchanged, and never through this decoder.
+export const ADMISSION_DIAGNOSTIC_CODE = {
+	INVALID_FINDING_LOCATION: "invalid_finding_location",
+	CANDIDATE_CAUSALITY_UNPROVEN: "candidate_causality_unproven",
+} as const;
+export type AdmissionDiagnosticCode = (typeof ADMISSION_DIAGNOSTIC_CODE)[keyof typeof ADMISSION_DIAGNOSTIC_CODE];
+
+export interface SafeAdmissionDiagnostic {
+	readonly code: AdmissionDiagnosticCode;
+	readonly findingId: string;
+	readonly reason: string;
+	readonly location?: string;
+}
+
+const ADMISSION_DIAGNOSTIC_REQUIRED_KEYS = ["code", "finding_id", "reason"] as const;
+const ADMISSION_DIAGNOSTIC_OPTIONAL_KEYS = ["location"] as const;
+const ADMISSION_FINDING_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+// Printable ASCII, space (0x20) through tilde (0x7e). Excludes every control
+// character (including NUL and newline) and every non-ASCII byte by
+// construction — no separate control-character check is needed.
+const ADMISSION_PRINTABLE_ASCII_PATTERN = /^[\x20-\x7e]+$/;
+const ADMISSION_LOCATION_MAX_LENGTH = 256;
+const ADMISSION_REASON_MAX_LENGTH = 120;
+
+function isSafeAdmissionLocation(value: string): boolean {
+	if (value.length === 0 || value.length > ADMISSION_LOCATION_MAX_LENGTH) return false;
+	if (!ADMISSION_PRINTABLE_ASCII_PATTERN.test(value)) return false;
+	if (value.startsWith("/") || value.startsWith("~") || value.includes("\\")) return false;
+	return !value.split("/").some((segment) => segment === "..");
+}
+
+function isSafeAdmissionReason(value: string): boolean {
+	return value.length > 0 && value.length <= ADMISSION_REASON_MAX_LENGTH && value.trim() === value && ADMISSION_PRINTABLE_ASCII_PATTERN.test(value);
+}
+
+/**
+ * Decodes a raw, untrusted admission-diagnostic envelope into its safe,
+ * bounded shape, or `undefined` when anything about it cannot be fully
+ * proven safe. Exact-record discipline (the same discipline
+ * `lib/review-integration-v2.ts` applies via its own `exactRecord` helper):
+ * every required key must be present and every key must be allowlisted, or
+ * decoding fails closed.
+ */
+export function decodeSafeAdmissionDiagnostic(value: unknown): SafeAdmissionDiagnostic | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const body = value as Record<string, unknown>;
+	const allowedKeys = new Set<string>([...ADMISSION_DIAGNOSTIC_REQUIRED_KEYS, ...ADMISSION_DIAGNOSTIC_OPTIONAL_KEYS]);
+	for (const key of ADMISSION_DIAGNOSTIC_REQUIRED_KEYS) if (!Object.hasOwn(body, key)) return undefined;
+	for (const key of Object.keys(body)) if (!allowedKeys.has(key)) return undefined;
+	const code = body.code;
+	if (code !== ADMISSION_DIAGNOSTIC_CODE.INVALID_FINDING_LOCATION && code !== ADMISSION_DIAGNOSTIC_CODE.CANDIDATE_CAUSALITY_UNPROVEN) return undefined;
+	const findingId = body.finding_id;
+	if (typeof findingId !== "string" || !ADMISSION_FINDING_ID_PATTERN.test(findingId)) return undefined;
+	const reason = body.reason;
+	if (typeof reason !== "string" || !isSafeAdmissionReason(reason)) return undefined;
+	if (body.location !== undefined) {
+		if (typeof body.location !== "string" || !isSafeAdmissionLocation(body.location)) return undefined;
+	}
+	return Object.freeze({
+		code,
+		findingId,
+		reason,
+		...(body.location === undefined ? {} : { location: body.location as string }),
+	});
+}
+
+// ---------------------------------------------------------------------------
+// Wave 1, #2028 host behavior, Design Decisions 3, 4, 5: one relaunch grant
+// per slot key, committed-capture proof, and cleanup. State lives in a
+// parameter-injected `Map<string, CaptureSlotRecord>`, created beside
+// `correctionEvidenceByLineage` and threaded through
+// `executeReviewControllerOperation` the same way (extensions/gentle-ai.ts).
+export const CAPTURE_SLOT_STATE = {
+	ADMITTED: "admitted",
+	COMMITTED: "committed",
+	RELAUNCH_GRANTED: "relaunch-granted",
+} as const;
+export type CaptureSlotStateValue = (typeof CAPTURE_SLOT_STATE)[keyof typeof CAPTURE_SLOT_STATE];
+
+export interface CaptureSlotRecord {
+	readonly slotKey: string;
+	readonly lineageId: string;
+	readonly state: CaptureSlotStateValue;
+	// sha256 of every rejected submission for this slot, never the bytes
+	// themselves — unreplayability is enforced by digest membership, not by
+	// keeping candidate-derived content across turns.
+	readonly rejectedDocumentHashes: ReadonlySet<string>;
+	readonly manifest?: { readonly path?: string; readonly reference?: string };
+}
+
+/** `sha256:<hex>` of `value`, the repository-wide canonical digest format. */
+export function sha256Hex(value: string): string {
+	return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+/**
+ * Removes every record belonging to `lineageId`. Used by all three cleanup
+ * triggers (Decision 5): all slots for a lineage admitted/committed, FINALIZE
+ * terminal, and — for the whole map, one lineage at a time — session
+ * shutdown. A stale grant can never be reused after this: `slotKey` embeds
+ * `authorityRevision` and `subjectHash`, so even a record that somehow
+ * survived would never match a fresh STATUS reoffer for a new revision or a
+ * new candidate.
+ */
+export function clearCaptureSlotRecordsForLineage(records: Map<string, CaptureSlotRecord>, lineageId: string): void {
+	for (const [key, record] of records) if (record.lineageId === lineageId) records.delete(key);
+}
+
+/**
+ * Proof of commitment (Decision 4): under an UNCHANGED authority lineage and
+ * revision, `slot` is no longer offered as a `review.capture-result` collect
+ * input for its exact lens/order pair. This is the only Pi-observable proof
+ * that requires zero provider-topology reconstruction. A changed authority,
+ * a missing authority (non-`current_target` applicability), or the slot
+ * still being offered are all "not proven" — the caller must fail closed.
+ */
+export function isCaptureSlotCommitted(slot: CaptureSlot, freshStatus: ReviewStatusV3): boolean {
+	const authority = freshStatus.authority;
+	if (authority === undefined || authority.lineageId !== slot.lineageId || authority.revision !== slot.authorityRevision) return false;
+	const inputs = freshStatus.nextTransition?.kind === "collect" ? freshStatus.nextTransition.collect?.inputs ?? [] : [];
+	const stillOffered = inputs.some((input) =>
+		input.captureOperation === "review.capture-result" &&
+		input.artifactSubject?.lens === slot.lens &&
+		input.artifactSubject?.selectedOrder === slot.selectedOrder,
+	);
+	return !stillOffered;
 }

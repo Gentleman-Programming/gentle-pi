@@ -128,7 +128,17 @@ import {
 } from "../lib/native-review-cli.ts";
 import type { ReviewConsentV2, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { assertDistinctCorrectionEvidence, resolveCorrectionStep, type CorrectionEvidence, type CorrectionOutcome, type CorrectionStep } from "../lib/review-correction-lifecycle.ts";
-import { assertLensSlotBijection, deriveCaptureSlots } from "../lib/review-result-capture.ts";
+import {
+	CAPTURE_SLOT_STATE,
+	type CaptureSlot,
+	type CaptureSlotRecord,
+	assertLensSlotBijection,
+	clearCaptureSlotRecordsForLineage,
+	decodeSafeAdmissionDiagnostic,
+	deriveCaptureSlots,
+	isCaptureSlotCommitted,
+	sha256Hex,
+} from "../lib/review-result-capture.ts";
 
 const GRAPH_V1_ORDINARY_READ_ONLY = "Graph-v1 ordinary review authority is read-only; use native compact-v2 review operations";
 import {
@@ -4771,10 +4781,16 @@ async function reconcileNativeMutationFailure(
 	error: unknown,
 	nativeReviewCli: NativeReviewCli,
 	target: { cwd: string; lineageId?: string; baseRef?: string; projection?: "workspace" | "staged" },
+	// Wave 1 (#2028 host behavior, Design Decision 4): the FINALIZE capture
+	// phase's lost-output recovery already ran its own fresh target-scoped
+	// STATUS query to test commit-proof before concluding the proof was
+	// absent. Reusing that already-fetched status here keeps "one fresh
+	// STATUS query" true instead of issuing a second one for the same failure.
+	prefetchedStatus?: ReviewStatusV3,
 ): Promise<Record<string, unknown>> {
 	const failure = nativeOperationFailure(operation, error);
 	if (!nativeMutationRequiresStatus(error)) return failure;
-	if (nativeReviewCli.targetStatus === undefined) {
+	if (nativeReviewCli.targetStatus === undefined && prefetchedStatus === undefined) {
 		return {
 			...failure,
 			outcome: "native-mutation-status-required",
@@ -4784,7 +4800,7 @@ async function reconcileNativeMutationFailure(
 		};
 	}
 	try {
-		const status = await nativeReviewCli.targetStatus(target);
+		const status = prefetchedStatus ?? await nativeReviewCli.targetStatus!(target);
 		const { required_status_action: staleStatusDirective, ...reconciledBase } = failure;
 		void staleStatusDirective;
 		if (status.action === "reconcile_finalize") {
@@ -4918,24 +4934,56 @@ function providerReviewerProjection(status: ReviewStatusV3): NativeCandidateProj
 	};
 }
 
+// Wave 1 (#2028 host behavior, Design Decisions 3 and 4): thrown to signal
+// that the capture phase already resolved the FINALIZE outcome itself — a
+// one-shot relaunch grant, a terminal exhaustion/unavailability, or a
+// proven-lost-output reconciliation — and the controller must return this
+// exact envelope without ever calling `nativeReviewCli.finalize()`.
+class CaptureOutcomeEnvelope extends Error {
+	readonly envelope: Record<string, unknown>;
+	constructor(envelope: Record<string, unknown>) {
+		super("capture outcome resolved before finalize");
+		this.name = "CaptureOutcomeEnvelope";
+		this.envelope = envelope;
+	}
+}
+
+function captureRelaunchEnvelope(outcome: "capture-relaunch-required" | "exhausted" | "unavailable", lens: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+	return { operation: REVIEW_CONTROLLER_OPERATION.FINALIZE, status: "blocked", outcome, lens, mutation_performed: false, mutation_outcome: "none" as const, ...extra };
+}
+
 /**
- * FINALIZE capture phase (Wave 1, #2028 host behavior, Design Decisions 1
+ * FINALIZE capture phase (Wave 1, #2028 host behavior, Design Decisions 1, 3,
  * and 4). Pi has no `tool.execute.after` analogue, so capture is
  * status-mediated at FINALIZE entry instead of host-hook-time: each
  * `review_result.lens_results[]` entry is bound to exactly one outstanding
  * `review.capture-result` slot (fail-closed bijection, before any capture
  * runs), captured in ascending `selectedOrder` with the provider's own
  * argument tokens forwarded byte-identical, then re-checked against the
- * admitted manifest's subject hash and lens. Transport is selected per run:
- * every admitted manifest carrying `path` selects `resultArtifactFiles` in
- * ascending order; any manifest carrying `reference` selects
- * `capturedResults: true`. The retired `--result` transport is never used.
+ * admitted manifest's subject hash and lens.
+ *
+ * A rejected capture carrying a safe admission diagnostic grants exactly one
+ * relaunch per `slotKey` (Decision 3): the controller never launches the
+ * reviewer itself, it returns a `blocked: capture-relaunch-required`
+ * envelope for the parent to act on. Re-submitting the identical rejected
+ * bytes is refused before any native call (unreplayability, digest-only). A
+ * capture failure whose mutation outcome is ambiguous (`lost output`,
+ * Decision 4) is recovered with one fresh target-scoped STATUS query: proof
+ * that the slot is no longer offered under unchanged authority marks it
+ * `COMMITTED` (no recapture, no lens rerun); otherwise only the existing
+ * `reconcileNativeMutationFailure` reconciliation is surfaced.
+ *
+ * Transport is selected per run: every slot that produced an admitted
+ * manifest carrying `path` (and no slot was merely `COMMITTED`) selects
+ * `resultArtifactFiles` in ascending order; otherwise `capturedResults:
+ * true`. The retired `--result` transport is never used.
  */
 async function captureReviewerResults(
 	nativeReviewCli: NativeReviewCli,
 	status: ReviewStatusV3,
 	lensResults: NonNullable<ReturnType<typeof parseNativeCompactFinalizeInput>["review_result"]>["lens_results"],
 	cwd: string,
+	captureSlotRecords: Map<string, CaptureSlotRecord>,
 	signal: AbortSignal | undefined,
 ): Promise<NativeReviewFinalizeCapturedResults> {
 	if (nativeReviewCli.captureResult === undefined) {
@@ -4949,18 +4997,104 @@ async function captureReviewerResults(
 	for (const slot of orderedSlots) {
 		const index = lensLabels.indexOf(slot.lens);
 		const document = toNativeReviewerDocument(lensResults[index]!);
-		const manifest = await nativeReviewCli.captureResult({
-			argumentTokens: slot.argumentTokens,
-			resultDocument: JSON.stringify(document),
-			cwd,
-			...(signal === undefined ? {} : { signal }),
-		});
-		if (manifest.subjectHash !== slot.subjectHash || (manifest.lens !== undefined && manifest.lens !== slot.lens)) {
-			throw new CandidateViewError("admitted capture manifest does not match the requested capture slot", "capture-manifest-binding-drift");
+		const documentBytes = JSON.stringify(document);
+		const existing = captureSlotRecords.get(slot.slotKey);
+		// Unreplayability (Decision 3): membership is checked before any
+		// relaunch capture runs. A digest, never the bytes, is kept across turns.
+		if (existing?.state === CAPTURE_SLOT_STATE.RELAUNCH_GRANTED && existing.rejectedDocumentHashes.has(sha256Hex(documentBytes))) {
+			throw new CaptureOutcomeEnvelope(captureRelaunchEnvelope("exhausted", slot.lens));
 		}
-		manifests.push(manifest);
+		try {
+			const manifest = await nativeReviewCli.captureResult({
+				argumentTokens: slot.argumentTokens,
+				resultDocument: documentBytes,
+				cwd,
+				...(signal === undefined ? {} : { signal }),
+			});
+			if (manifest.subjectHash !== slot.subjectHash || (manifest.lens !== undefined && manifest.lens !== slot.lens)) {
+				throw new CandidateViewError("admitted capture manifest does not match the requested capture slot", "capture-manifest-binding-drift");
+			}
+			manifests.push(manifest);
+			captureSlotRecords.set(slot.slotKey, {
+				slotKey: slot.slotKey,
+				lineageId: slot.lineageId,
+				state: CAPTURE_SLOT_STATE.ADMITTED,
+				rejectedDocumentHashes: existing?.rejectedDocumentHashes ?? new Set(),
+				manifest,
+			});
+		} catch (error) {
+			if (error instanceof CaptureOutcomeEnvelope || error instanceof CandidateViewError) throw error;
+			// Decision 3: a diagnostic-shaped payload attached to the failure
+			// signals an explicit provider rejection, distinct from an ambiguous
+			// "lost output" mutation failure below. Only a *validly decoded* safe
+			// diagnostic enters the relaunch sequence; an unsafe or malformed one
+			// is terminal `unavailable` (sequence step 1).
+			const rawDiagnostic = (error as { admissionDiagnostic?: unknown }).admissionDiagnostic;
+			if (rawDiagnostic !== undefined) {
+				const diagnostic = decodeSafeAdmissionDiagnostic(rawDiagnostic);
+				if (diagnostic === undefined) throw new CaptureOutcomeEnvelope(captureRelaunchEnvelope("unavailable", slot.lens));
+				if (nativeReviewCli.targetStatus === undefined) throw new CaptureOutcomeEnvelope(captureRelaunchEnvelope("unavailable", slot.lens));
+				let reofferedSlots: readonly CaptureSlot[] = [];
+				try {
+					const reoffer = await nativeReviewCli.targetStatus({ cwd, lineageId: slot.lineageId, ...(signal === undefined ? {} : { signal }) });
+					reofferedSlots = deriveCaptureSlots(reoffer).slots;
+				} catch {
+					reofferedSlots = [];
+				}
+				if (!reofferedSlots.some((candidate) => candidate.slotKey === slot.slotKey)) {
+					throw new CaptureOutcomeEnvelope(captureRelaunchEnvelope("unavailable", slot.lens));
+				}
+				if (existing?.state === CAPTURE_SLOT_STATE.RELAUNCH_GRANTED) {
+					throw new CaptureOutcomeEnvelope(captureRelaunchEnvelope("exhausted", slot.lens));
+				}
+				const rejectedDocumentHashes = new Set(existing?.rejectedDocumentHashes ?? []);
+				rejectedDocumentHashes.add(sha256Hex(documentBytes));
+				captureSlotRecords.set(slot.slotKey, { slotKey: slot.slotKey, lineageId: slot.lineageId, state: CAPTURE_SLOT_STATE.RELAUNCH_GRANTED, rejectedDocumentHashes });
+				throw new CaptureOutcomeEnvelope(captureRelaunchEnvelope("capture-relaunch-required", slot.lens, {
+					admission_diagnostic: {
+						code: diagnostic.code,
+						finding_id: diagnostic.findingId,
+						reason: diagnostic.reason,
+						...(diagnostic.location === undefined ? {} : { location: diagnostic.location }),
+					},
+					relaunch_slot: { lens: slot.lens, selected_order: slot.selectedOrder },
+				}));
+			}
+			if (nativeMutationRequiresStatus(error)) {
+				if (nativeReviewCli.targetStatus === undefined) throw error;
+				let freshStatus: ReviewStatusV3;
+				try {
+					freshStatus = await nativeReviewCli.targetStatus({ cwd, lineageId: slot.lineageId, ...(signal === undefined ? {} : { signal }) });
+				} catch {
+					throw error;
+				}
+				if (isCaptureSlotCommitted(slot, freshStatus)) {
+					captureSlotRecords.set(slot.slotKey, {
+						slotKey: slot.slotKey,
+						lineageId: slot.lineageId,
+						state: CAPTURE_SLOT_STATE.COMMITTED,
+						rejectedDocumentHashes: existing?.rejectedDocumentHashes ?? new Set(),
+					});
+					continue;
+				}
+				// Proof absent or ambiguous: fails closed. Follow only the
+				// declared reconciliation action, reusing the status already
+				// fetched above so no second query is made for this failure.
+				throw new CaptureOutcomeEnvelope(await reconcileNativeMutationFailure(REVIEW_CONTROLLER_OPERATION.FINALIZE, error, nativeReviewCli, { cwd, lineageId: slot.lineageId, projection: "workspace" }, freshStatus));
+			}
+			throw error;
+		}
 	}
-	return manifests.every((manifest) => manifest.path !== undefined)
+	// Decision 5, trigger 1: once every slot for this lineage reached a
+	// terminal per-slot outcome (admitted or committed) within this single
+	// capture invocation, its records serve no further purpose.
+	if (orderedSlots.every((slot) => {
+		const record = captureSlotRecords.get(slot.slotKey);
+		return record?.state === CAPTURE_SLOT_STATE.ADMITTED || record?.state === CAPTURE_SLOT_STATE.COMMITTED;
+	})) {
+		clearCaptureSlotRecordsForLineage(captureSlotRecords, orderedSlots[0]!.lineageId);
+	}
+	return manifests.length === orderedSlots.length && manifests.every((manifest) => manifest.path !== undefined)
 		? { resultArtifactFiles: manifests.map((manifest) => manifest.path!) }
 		: { capturedResults: true };
 }
@@ -5017,6 +5151,11 @@ async function executeReviewControllerOperation(
 	context?: ExtensionContext,
 	correctionEvidenceByLineage: Map<string, CorrectionEvidence> = new Map(),
 	pendingReviewConsents: Map<string, PendingReviewConsent> = new Map(),
+	// Wave 1 (#2028 host behavior, Design Decision 3/5): one grant per
+	// `slotKey`, parameter-injected beside `correctionEvidenceByLineage` the
+	// same way, so relaunch/lost-output/cleanup state stays testable without
+	// global state.
+	captureSlotRecords: Map<string, CaptureSlotRecord> = new Map(),
 ): Promise<Record<string, unknown>> {
 	const parameters = parseReviewControllerParameters(parametersValue);
 	const defaultCwd = resolveReviewControllerWorkspaceRoot(parameters.workspaceRoot, sessionCwd);
@@ -5554,7 +5693,7 @@ async function executeReviewControllerOperation(
 				}
 				const capturedTransport: NativeReviewFinalizeCapturedResults | undefined = input.review_result === undefined
 					? undefined
-					: await captureReviewerResults(nativeReviewCli, negotiatedStatus!, input.review_result.lens_results, candidateView?.root ?? defaultCwd, signal);
+					: await captureReviewerResults(nativeReviewCli, negotiatedStatus!, input.review_result.lens_results, candidateView?.root ?? defaultCwd, captureSlotRecords, signal);
 				nativeResult = await nativeReviewCli.finalize({
 					cwd: candidateView?.root ?? defaultCwd,
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
@@ -5571,6 +5710,10 @@ async function executeReviewControllerOperation(
 					provisionalCandidateView = undefined;
 					candidateView = undefined;
 				}
+				if (error instanceof CaptureOutcomeEnvelope) {
+					if (correctionCompletion && candidateView && candidateViews) candidateViews.cleanup(candidateView.token);
+					return error.envelope;
+				}
 				if (correctionCompletion && candidateView && candidateViews && !nativeMutationRequiresStatus(error)) candidateViews.cleanup(candidateView.token);
 				return reconcileNativeMutationFailure(parameters.operation, error, nativeReviewCli, {
 					cwd: candidateView?.root ?? defaultCwd,
@@ -5581,6 +5724,11 @@ async function executeReviewControllerOperation(
 			try {
 				if (correctionCompletion && candidateViews && parameters.lineageId) candidateViews.promoteCorrected(parameters.lineageId, candidateView!.token);
 				candidateViews?.cleanupTerminal(nativeResult.lineageId, nativeResult.state);
+				// Decision 5, trigger 2: FINALIZE reaching a terminal state clears
+				// every capture-slot record for the lineage, mirroring the same
+				// approved/escalated gate `cleanupTerminal` applies above — a stale
+				// grant must not survive past the lineage it was issued for.
+				if (nativeResult.state === "approved" || nativeResult.state === "escalated") clearCaptureSlotRecordsForLineage(captureSlotRecords, nativeResult.lineageId);
 				reconcileFinalizeRerunAttemptsByLineage.delete(nativeResult.lineageId);
 				return { operation: parameters.operation, result: mapNativeFinalizeResult(nativeResult), ...(correctionStep === undefined ? {} : { correction_step: correctionStep }) };
 			} catch (error) {
@@ -6128,10 +6276,17 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 	const consumedNativeAuthorizations = new Set<string>();
 	const pendingCommitTransactions = new Map<string, { cwd: string; transactionId: string }>();
 	const correctionEvidenceByLineage = new Map<string, CorrectionEvidence>();
+	// Wave 1 (#2028 host behavior, Design Decision 3/5): one grant per
+	// `slotKey`, created beside `correctionEvidenceByLineage` and threaded
+	// through `executeReviewControllerOperation` the same way.
+	const captureSlotRecords = new Map<string, CaptureSlotRecord>();
 	const candidateViews = dependencies.candidateViews === undefined ? new CandidateViewRegistry() : dependencies.candidateViews;
 
 	pi.on("session_shutdown", () => {
 		cleanupAllPendingReviewConsents(pendingReviewConsents, candidateViews);
+		// Decision 5, trigger 3: session shutdown clears the whole map, not just
+		// one lineage's records.
+		captureSlotRecords.clear();
 	});
 
 	pi.registerTool({
@@ -6179,6 +6334,7 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 				ctx,
 				correctionEvidenceByLineage,
 				pendingReviewConsents,
+				captureSlotRecords,
 			);
 			return {
 				content: [{ type: "text", text: JSON.stringify(details) }],
