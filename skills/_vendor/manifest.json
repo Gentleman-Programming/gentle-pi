@@ -7,6 +7,10 @@
 		"work-unit-commits": {
 			"path": "skills/_vendor/work-unit-commits/SKILL.md",
 			"sha256": "9b4e9914d612ea11c86747d3fcd4e42bc7ef5cc5e6ab9179c3de7148b015c4ac"
+		},
+		"branch-pr": {
+			"path": "skills/_vendor/branch-pr/SKILL.md",
+			"sha256": "8553fdde3397c7dc1c2fda2b4ca848baf5d9185d0db65635b151755c4e627dc8"
 		}
 	}
 }
