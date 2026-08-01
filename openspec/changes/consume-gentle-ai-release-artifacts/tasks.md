@@ -59,16 +59,16 @@ Chain strategy: feature-branch-chain
 
 ## PR 3 — P2a: POSIX assets install + integrity manifest + resolver (depends: sibling `consolidate-review-parity-runtime` archived)
 
-- [ ] 3.1 **Guard (first task)**: assert `openspec/specs/package-runtime/spec.md` exists; fail loudly naming `consolidate-review-parity-runtime` if it is still `archive: pending`. Do not proceed past this task until it passes.
-- [ ] 3.2 RED: `assetsTreeSha256` test — order-independent, mode-sensitive digest over sorted manifest entries.
-- [ ] 3.3 RED: manifest/assets tests (threat-matrix: documentation-like paths) — extra file in installed tree rejected; symlinked asset rejected; asset with mode `0755` rejected; asset named `install.sh`/`README.sh` lands non-executable.
-- [ ] 3.4 RED: TOCTOU replacement mid-verify across the whole file set plus manifest detected.
-- [ ] 3.5 RED: `resolveGentleAiBinary` still rejects a forged assets digest.
-- [ ] 3.6 RED: assets missing ⇒ bundle invalid ⇒ `recoverInterruptedPublication` restores prior backup (fake `rename` seam).
-- [ ] 3.7 GREEN: `lib/gentle-ai-binary.ts` (+ runtime) — add manifest keys `assetsAsset`, `assetsArchiveSha256`, `assetsTreeSha256`, `contractMajor`, `layoutVersion`; `isCanonicalManifest` key-count/string-equality discipline extended, not weakened.
-- [ ] 3.8 GREEN: exported `resolveGentleAiAssets(packageRoot, platform)` — exact path-set equality against manifest entries first, then per-file `lstat`/confinement/mode checks, then whole-set `sameFile` TOCTOU re-check.
-- [ ] 3.9 GREEN: `scripts/gentle-ai-installer.mjs` — assets descriptor; stage assets extraction into `.gentle-ai/v<version>/assets/` via the `lib/release-artifact.ts` extractor; extend `existingSignedBundleMatches` to validate the assets tree (covers `recoverInterruptedPublication` for free; no new publish operation).
-- [ ] 3.10 Verify: `pnpm test -- gentle-ai-binary gentle-ai-installer`; `pnpm run test:harness`.
+- [x] 3.1 **Guard (first task)**: assert `openspec/specs/package-runtime/spec.md` exists; fail loudly naming `consolidate-review-parity-runtime` if it is still `archive: pending`. Do not proceed past this task until it passes.
+- [x] 3.2 RED: `assetsTreeSha256` test — order-independent, mode-sensitive digest over sorted manifest entries.
+- [x] 3.3 RED: manifest/assets tests (threat-matrix: documentation-like paths) — extra file in installed tree rejected; symlinked asset rejected; asset with mode `0755` rejected; asset named `install.sh`/`README.sh` lands non-executable.
+- [x] 3.4 RED: TOCTOU replacement mid-verify across the whole file set plus manifest detected.
+- [x] 3.5 RED: `resolveGentleAiBinary` still rejects a forged assets digest.
+- [x] 3.6 RED: assets missing ⇒ bundle invalid ⇒ `recoverInterruptedPublication` restores prior backup (fake `rename` seam).
+- [x] 3.7 GREEN: `lib/gentle-ai-binary.ts` (+ runtime) — add manifest keys `assetsAsset`, `assetsArchiveSha256`, `assetsTreeSha256`, `contractMajor`, `layoutVersion`; `isCanonicalManifest` key-count/string-equality discipline extended, not weakened.
+- [x] 3.8 GREEN: exported `resolveGentleAiAssets(packageRoot, platform)` — exact path-set equality against manifest entries first, then per-file `lstat`/confinement/mode checks, then whole-set `sameFile` TOCTOU re-check.
+- [x] 3.9 GREEN: `scripts/gentle-ai-installer.mjs` — assets descriptor; stage assets extraction into `.gentle-ai/v<version>/assets/` via the `lib/release-artifact.ts` extractor; extend `existingSignedBundleMatches` to validate the assets tree (covers `recoverInterruptedPublication` for free; no new publish operation).
+- [x] 3.10 Verify: `pnpm test -- gentle-ai-binary gentle-ai-installer`; `pnpm run test:harness`.
 
 ## PR 4 — P2b: Windows split provenance + cross-check + bundle lifecycle (depends: PR 3)
 

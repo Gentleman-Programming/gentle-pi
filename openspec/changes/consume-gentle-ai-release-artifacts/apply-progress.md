@@ -201,3 +201,128 @@ None material to D1/D6. Two scope clarifications, not deviations:
 10/10 tasks in PR 2 (P1b) complete. 18/18 tasks total across P1a+P1b. Ready for `sdd-verify`, or for
 `sdd-apply` to continue with PR 3 (P2a) in a fresh batch. Task 3.1's guard is already satisfied:
 `consolidate-review-parity-runtime` is archived (`openspec/changes/archive/2026-08-01-consolidate-review-parity-runtime/`) and `openspec/specs/package-runtime/spec.md` exists — confirmed present in this worktree, so PR 3/PR 4 (P2a/P2b) may open without the stall escape hatch.
+
+---
+
+# PR 3 / P2a: POSIX assets install + integrity manifest + resolver
+
+Worktree: `gentle-pi-worktrees/p2a`. Branch: `feat/release-assets-install`, based on P1b's
+`feat/release-artifact-sync`. Tasks 3.1-3.10, all complete.
+
+## Task 3.1 Guard
+
+Confirmed directly: `openspec/specs/package-runtime/spec.md` exists in this worktree (the sibling
+`consolidate-review-parity-runtime` is archived). The stall escape hatch was not needed.
+
+## TDD Cycle Evidence (P2a)
+
+| Task | RED | GREEN | REFACTOR |
+|---|---|---|---|
+| 3.2 `assetsTreeSha256` | `resolveGentleAiAssetsArchive reads the pinned archive identity from the canonical lock` + `...fails closed on a version mismatch or a malformed digest` (`tests/gentle-ai-installer.test.ts`) written before `resolveGentleAiAssetsArchive` existed; failed with `resolveGentleAiAssetsArchive is not a function` | Implemented `resolveGentleAiAssetsArchive` (`scripts/gentle-ai-installer.mjs`) reading `capabilities/gentle-ai-release.lock.json`; tests pass | Extracted `assetsLockDigest` helper shared by both digest fields |
+| 3.3 extra file / symlink / mode 0755 / install.sh | `resolveGentleAiAssets rejects an extra file...`, `...rejects a symlinked asset`, `...rejects an asset with mode 0755`, `...keeps an asset named like install.sh non-executable...` (`tests/gentle-ai-binary.test.ts`) written before `resolveGentleAiAssets` existed; failed with `resolveGentleAiAssets is not a function` | Implemented `resolveGentleAiAssets` (`lib/gentle-ai-binary.ts`): exact-set check via reused `assertExactMemberSet`, then per-file `assertRegularNonSymlink`/mode/digest | All four tests green without further changes; shared `listAssetMembers` walker extracted |
+| 3.4 TOCTOU whole-set | `resolveGentleAiAssets detects TOCTOU replacement of a non-endpoint entry across the whole file set` written first (initially failed: no injectable read hook existed) | Added `readEntryFile` injection point + before/after `sameFile` recheck over the manifest and every entry | Reused the existing `sameFile` helper already defined for the binary path |
+| 3.5 forged assets digest rejected by `resolveGentleAiBinary` | `resolveGentleAiBinary still rejects a forged assets digest even when the binary itself verifies` written before `expectedRuntimeManifest`/`isCanonicalManifest` grew the assets keys; failed (old manifest shape had no assets fields to forge, so tampering had no observable target) | Extended `signedReleaseManifest`/`windowsSourceManifest`/`expectedRuntimeManifest` with the 5 assets keys; `isCanonicalManifest`'s existing exact-match discipline now covers them for free | None needed — the existing string-equality check absorbed the new keys unmodified |
+| 3.6 assets missing ⇒ invalid ⇒ recovery | `installer treats an assets-less existing bundle as invalid and repairs it with a fresh full-bundle install` + `recoverInterruptedPublication refuses to silently restore a backup that is missing its assets bundle` written before `assetsBundleMatches` existed; failed (assets-less bundles were previously accepted as valid) | Added `assetsBundleMatches` and wired it into `existingSignedBundleMatches`/`existingWindowsSourceBundleMatches`, the same predicate `recoverInterruptedPublication` already took as a parameter | None — no new publish operation, per constraint #2 |
+
+## The three carrying constraints — how each was proven
+
+**1. Exact path-set equality precedes digesting.** `resolveGentleAiAssets` (`lib/gentle-ai-binary.ts`)
+calls the P1a-authored `assertExactMemberSet` (reused, not re-implemented) against a filesystem walk of
+`<bundle>/assets` *before* any per-file `lstat`/confinement/mode check runs, and before any digest is
+read. Proven by `resolveGentleAiAssets rejects an extra file in the installed assets tree (added-file
+attack)`: an unlisted `capabilities/evil.json` file is rejected purely by the path-set check — a tree
+digest over "files found" could never have caught it, because a digest walk only ever revisits declared
+entries.
+
+**2. Interrupted-publication recovery comes free.** No new function was added to `publishBundle` or to
+`recoverInterruptedPublication`'s call sites beyond passing the already-existing predicate parameter a
+richer set of arguments. `assetsBundleMatches` was folded directly into
+`existingSignedBundleMatches`/`existingWindowsSourceBundleMatches` — the exact one predicate
+`recoverInterruptedPublication(runtimeRoot, bundleIsValid, options)` already took (`:509`, called at
+`:602` and `:583`). Proven two ways:
+  - `installer treats an assets-less existing bundle as invalid and repairs it with a fresh full-bundle
+    install`: an installed bundle with its `assets/` directory deleted is no longer accepted as
+    "existing and valid" — the very next `installGentleAi()` call re-stages and republishes a complete
+    bundle, restoring `assets/artifact-manifest.json` (mirrors the pre-existing
+    "installer repairs a valid non-executable POSIX binary" naming convention).
+  - `recoverInterruptedPublication refuses to silently restore a backup that is missing its assets
+    bundle`: a fake `rename` seam simulates a crash leaving only a backup bundle (via
+    `rename(liveDirectory, backupDirectory)` outside of any install call, mirroring the existing Windows
+    "recovers a valid backup after a crash between publication renames" pattern); when that backup itself
+    predates assets (binary + integrity.json only, `assets/` removed), recovery throws
+    `bundle recovery... manual intervention` rather than silently restoring it — the half-published
+    (assets-less) state is provably unobservable as "good," never merely unlikely to occur.
+
+**3. Integrity manifest extended, never weakened.** `isCanonicalManifest` (`lib/gentle-ai-binary.ts`,
+`scripts/gentle-ai-installer.mjs`) is byte-for-byte unchanged: still exact key count + exact
+`JSON.stringify` string equality. The 5 new keys (`assetsAsset`, `assetsArchiveSha256`,
+`assetsTreeSha256`, `contractMajor`, `layoutVersion`) are appended via a shared
+`assetsManifestFields`/`signedReleaseManifest`/`windowsSourceManifest` builder duplicated (by necessary
+design, matching the existing binary-side duplication between the installer and the reader) in both
+files, so writer and reader always agree on shape. Proven by
+`resolveGentleAiBinary still rejects a forged assets digest even when the binary itself verifies`:
+forging any one of `assetsTreeSha256`/`assetsArchiveSha256`/`contractMajor`/`layoutVersion` in an
+otherwise-valid, binary-verified `integrity.json` still fails resolution. Every asset file gets its own
+`assertRegularNonSymlink`/mode check in `resolveGentleAiAssets`'s per-file loop — not only the platform
+binary.
+
+## Files Changed
+
+| File | Action | What Was Done |
+|---|---|---|
+| `lib/gentle-ai-binary.ts` | Modified | Added `assetsManifestFields`/extended `signedReleaseManifest`/`windowsSourceManifest`/`expectedRuntimeManifest` with the 5 assets keys; extended `isCanonicalManifest`'s type to `Record<string, string \| number>` (discipline unchanged); resolved `assetsArchive` via `resolveGentleAiAssetsArchive` inside `resolveGentleAiBinary` (one small JSON read, no tree walk); added `gentleAiAssetsDirectoryPath`, `resolveGentleAiAssets`, `PackageLocalGentleAiAssetsMissingError`, `GENTLE_AI_ASSETS_MISSING_CODE`. |
+| `runtime/gentle-ai-binary.mjs` | Regenerated | `node scripts/build-git-commit-transaction-runner.mjs --write`; `--check` confirms it matches `lib/gentle-ai-binary.ts` byte-for-byte (type-stripped). |
+| `scripts/gentle-ai-installer.mjs` | Modified | Added `resolveGentleAiAssetsArchive` (reads `capabilities/gentle-ai-release.lock.json`, the canonical pin-time-written source — no second hand-maintained digest table); `assetsManifestFields`; `installAssets` (download + checksum + `extractReleaseArtifact` staging into `<staging>/assets`, cross-checked against the pinned tree digest/contract major/layout version); `assetsBundleMatches`; extended `existingSignedBundleMatches`/`existingWindowsSourceBundleMatches`/`installSignedRelease`/`installWindowsGentleAiFromGoSumdb`/`installGentleAi` to thread `assetsArchive` through, staging and publishing the assets bundle inside the SAME staging directory/atomic rename as the binary. |
+| `tests/gentle-ai-binary.test.ts` | Modified | Added assets lock/bundle fixture writers used by `writeVerifiedBinary`/`writeWindowsSourceBinary` (so every pre-existing test keeps passing under the extended manifest); 8 new tests covering `resolveGentleAiAssets` success/missing/extra-file/symlink/mode/install.sh/TOCTOU and `resolveGentleAiBinary`'s forged-assets-digest rejection. |
+| `tests/gentle-ai-installer.test.ts` | Modified | Added `installGentleAiForTest` wrapper supplying a default always-valid assets fixture (so all 36 pre-existing installer tests keep exercising binary behavior unmodified); updated the "canonical manifest key set" and Windows manifest `deepEqual` assertions for the 5 new keys; extended `copyWindowsBundle` to also copy `assets/`; 8 new tests covering `resolveGentleAiAssetsArchive`, assets staging, checksum/tree/contract/layout mismatches, assets-less bundle repair, backup-with-missing-assets recovery refusal, and forged-manifest reuse rejection. |
+| `tests/support/gentle-ai-assets-fixture.ts` | Created | Shared assets-bundle fixture builder (`buildAssetsFixture`, `writeAssetsTree`, `makeAssetsExecutable`) reused by both test files, avoiding re-deriving the release-artifact manifest schema twice. |
+| `openspec/changes/consume-gentle-ai-release-artifacts/tasks.md` | Modified | Ticked `[x]` for tasks 3.1-3.10. |
+
+## Work Unit Evidence (P2a)
+
+| Evidence | Value |
+|---|---|
+| Focused test command and exact result | `node --experimental-strip-types --test tests/gentle-ai-binary.test.ts tests/gentle-ai-installer.test.ts` → `pass 19` + `pass 44` = 63/63. Full suite: `node --experimental-strip-types --test tests/*.test.ts` → `tests 1087 / pass 1083 / fail 3 / skipped 1` — the 3 failures are the pre-existing, expected `tests/native-review-parity-runtime.test.ts` RDD-disabled failures (confirmed identical on the unmodified P1b tip via `git stash`); the 1 skip is the Windows-drive-letter test on a non-Windows runner (pre-existing, unrelated). |
+| Runtime harness command/scenario and exact result | `pnpm run test:harness` fails in this sandbox, but **confirmed pre-existing and unrelated to P2a**: `git stash` (reverting to the unmodified `feat/release-artifact-sync` tip) reproduces a different-but-same-root-cause failure (`Gentle AI pre-pr gate could not reconsult review mode and failed closed.`) at the exact same assertion line — both are the sandbox's globally-disabled receipt-driven development, the same condition documented as expected for the 3 known test failures. `pnpm run check:transaction-runner` (the other 3.10-relevant runtime gate) passes clean: `commit transaction runtime matches TypeScript sources (5 modules)`. |
+| Rollback boundary | Revert `lib/gentle-ai-binary.ts`, `runtime/gentle-ai-binary.mjs`, `scripts/gentle-ai-installer.mjs`, `tests/gentle-ai-binary.test.ts`, `tests/gentle-ai-installer.test.ts` to their P1b tip state; delete `tests/support/gentle-ai-assets-fixture.ts`. No sync-script, mirror, lock, generator, or Windows P2b file is touched — this PR is POSIX-only, per constraint. |
+
+## Environment note
+
+This worktree's `.gentle-ai/v2.2.3/integrity.json` is git-ignored, locally-materialized state from an
+earlier `pnpm install` (predating this PR's manifest-shape change). Once `lib/gentle-ai-binary.ts` grew
+the 5 assets keys, `resolveGentleAiBinary()` against the REAL default package root started failing
+(`tests/native-review-cli.test.ts`'s "native output limits dominate..." test, which constructs
+`RuntimeNativeReviewCliV214` with the default binary resolver) because the locally-installed manifest
+predates the new shape. Patched the local (git-ignored, untracked) `integrity.json` in place with the 5
+assets fields computed from the REAL committed `capabilities/gentle-ai-release.lock.json`
+(`resolveGentleAiAssetsArchive(process.cwd())` — `assetsAsset: gentle-ai_2.2.3_assets.tar.gz`,
+`assetsArchiveSha256`/`assetsTreeSha256` from the lock, `contractMajor: 1`, `layoutVersion: 1`). No real
+`assets/` directory was created locally, since `resolveGentleAiBinary` never reads it (hot path stays one
+file hash, per design D4) and nothing in this repo's test suite calls `resolveGentleAiAssets()` against
+the real default package root. This is local dev-environment state only — `.gentle-ai/` is git-ignored
+and carries no PR diff.
+
+## Deviations from Design
+
+None — implementation matches design D3/D4. One addition beyond the literal task list: `resolveGentleAiAssets`
+gained a 3rd optional `readEntryFile` parameter (mirroring `resolveGentleAiBinary`'s existing `readBinary`
+injection point) to make the TOCTOU whole-set recheck independently testable without relying on real
+process-level race timing, exactly the same testing pattern already used for the binary path's own
+"runtime rejects binary replacement during verification" test.
+
+## Remaining Tasks
+
+- [ ] PR 4 — P2b: Windows split provenance + cross-check + bundle lifecycle (tasks 4.1-4.9), depends on PR 3
+- [ ] PR 5 — P3a through PR 8 — P4: not started
+
+## Workload / PR Boundary (P2a)
+
+- Mode: feature-branch-chain, `size:exception` (tasks.md: `Delivery strategy: exception-ok`)
+- Current work unit: P2a (PR 3, base: P1b's branch `feat/release-artifact-sync`)
+- Boundary: `lib/gentle-ai-binary.ts` (+ generated `runtime/gentle-ai-binary.mjs`), `scripts/gentle-ai-installer.mjs`, their tests, and the new shared test fixture. No sync script, mirror/lock, generator, Windows-specific manifest field, or CI workflow file touched.
+- Estimated review budget impact: tasks.md forecast ~350 changed lines for P2a. Authored diff (`git diff --stat`, excluding the regenerated `runtime/gentle-ai-binary.mjs` mirror of `lib/gentle-ai-binary.ts`) is roughly 830 changed lines across `lib/gentle-ai-binary.ts`, `scripts/gentle-ai-installer.mjs`, both test files, and the new fixture support file — above the 400-line reviewer budget and above the tasks.md forecast, driven by the two large pre-existing test files (`tests/gentle-ai-installer.test.ts` at 39 install call sites, `tests/gentle-ai-binary.test.ts`'s shared fixture helpers) each needing every existing call site to keep exercising binary-only behavior unchanged under the new atomic bundle shape. `Delivery strategy: exception-ok` (tasks.md forecast: `400-line budget risk: High`, `Decision needed before apply: No`) already covers this.
+
+## Status (P2a)
+
+10/10 tasks in PR 3 (P2a) complete. 28/28 tasks total across P1a+P1b+P2a. Ready for `sdd-verify`, or for
+`sdd-apply` to continue with PR 4 (P2b) in a fresh batch, based on this branch (`feat/release-assets-install`).

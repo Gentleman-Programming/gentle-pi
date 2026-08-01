@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { createWriteStream, existsSync } from "node:fs";
+import { createWriteStream, existsSync, readFileSync } from "node:fs";
 import {
 	chmod,
 	copyFile,
@@ -17,6 +17,12 @@ import { dirname, isAbsolute, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import {
+	RELEASE_ARTIFACT_MANIFEST_FILE_NAME,
+	createSystemReleaseArtifactExtractor,
+	decodeArtifactManifest,
+	extractReleaseArtifact,
+} from "../lib/release-artifact.ts";
 
 const execFileAsync = promisify(execFile);
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
@@ -108,6 +114,47 @@ export function resolveGentleAiReleaseAsset(platform = process.platform, archite
 
 export function resolveGentleAiInstallerPackageRoot() {
 	return dirname(dirname(fileURLToPath(import.meta.url)));
+}
+
+// The lock is the canonical, sync-script-written source for the assets
+// archive's pinned identity (design D6). Reading it at install time keeps a
+// pin bump a single-write operation (regenerate the lock, nothing else to
+// hand-update) instead of reintroducing the duplicated-literal drift #262
+// eliminated for the binary version.
+export const GENTLE_AI_ASSETS_LOCK_RELATIVE_PATH = "capabilities/gentle-ai-release.lock.json";
+
+function assetsLockDigest(value, label, lockPath) {
+	const match = typeof value === "string" ? /^sha256:([0-9a-f]{64})$/.exec(value) : null;
+	if (!match) throw new Error(`${lockPath} has an invalid ${label}: ${JSON.stringify(value)}`);
+	return match[1];
+}
+
+export function resolveGentleAiAssetsArchive(packageRoot, installerVersion = INSTALLER_VERSION, readLockFile = (path) => readFileSync(path, "utf8")) {
+	const lockPath = join(packageRoot, GENTLE_AI_ASSETS_LOCK_RELATIVE_PATH);
+	let lock;
+	try {
+		lock = JSON.parse(readLockFile(lockPath));
+	} catch (error) {
+		throw new Error(`Gentle AI assets archive requires a valid ${GENTLE_AI_ASSETS_LOCK_RELATIVE_PATH} at ${lockPath}`, { cause: error });
+	}
+	if (lock?.release?.version !== installerVersion) {
+		throw new Error(`${lockPath} release.version ${JSON.stringify(lock?.release?.version)} does not match the authoritative INSTALLER_VERSION ${JSON.stringify(installerVersion)}`);
+	}
+	const name = lock?.archive?.asset;
+	if (typeof name !== "string" || name.length === 0) throw new Error(`${lockPath} is missing archive.asset`);
+	const contractMajor = lock?.contract?.major;
+	const layoutVersion = lock?.contract?.layoutVersion;
+	if (!Number.isInteger(contractMajor) || !Number.isInteger(layoutVersion)) {
+		throw new Error(`${lockPath} is missing contract.major or contract.layoutVersion`);
+	}
+	return Object.freeze({
+		name,
+		sha256: assetsLockDigest(lock.archive?.sha256, "archive.sha256", lockPath),
+		treeSha256: assetsLockDigest(lock.tree?.digest, "tree.digest", lockPath),
+		contractMajor,
+		layoutVersion,
+		url: `${RELEASE_BASE_URL}${name}`,
+	});
 }
 
 async function sha256File(path) {
@@ -212,11 +259,26 @@ function isConfined(path, directory) {
 	return value !== "" && !value.startsWith("..") && !isAbsolute(value);
 }
 
-function signedReleaseManifest(asset, binarySha256) {
-	return { version: INSTALLER_VERSION, asset: asset.name, assetSha256: asset.sha256, binarySha256 };
+// Extends the manifest with the assets provenance (design D3/D4): the same
+// `isCanonicalManifest` exact-key-count/string-equality discipline below
+// applies unmodified to the grown key set, so a missing or forged assets
+// field fails resolution exactly like a missing or forged binary field
+// always has.
+function assetsManifestFields(assetsArchive) {
+	return {
+		assetsAsset: assetsArchive.name,
+		assetsArchiveSha256: assetsArchive.sha256,
+		assetsTreeSha256: assetsArchive.treeSha256,
+		contractMajor: assetsArchive.contractMajor,
+		layoutVersion: assetsArchive.layoutVersion,
+	};
 }
 
-function windowsSourceManifest(metadata, binarySha256, architecture) {
+function signedReleaseManifest(asset, binarySha256, assetsArchive) {
+	return { version: INSTALLER_VERSION, asset: asset.name, assetSha256: asset.sha256, binarySha256, ...assetsManifestFields(assetsArchive) };
+}
+
+function windowsSourceManifest(metadata, binarySha256, architecture, assetsArchive) {
 	return {
 		version: INSTALLER_VERSION,
 		method: GENTLE_AI_INSTALL_METHOD.GO_SUMDB_SOURCE_BUILD,
@@ -232,6 +294,7 @@ function windowsSourceManifest(metadata, binarySha256, architecture) {
 		buildMode: metadata.buildMode,
 		compiler: metadata.compiler,
 		cgoEnabled: metadata.cgoEnabled,
+		...assetsManifestFields(assetsArchive),
 	};
 }
 
@@ -346,6 +409,63 @@ async function assertExactGentleAiVersion(execute, binaryPath, environment, cwd)
 
 function sameFile(before, after) { return before.dev === after.dev && before.ino === after.ino && before.size === after.size && before.mtimeMs === after.mtimeMs; }
 
+// --- assets bundle staging (design D2/D3) -----------------------------------
+
+function assetsTreeDigestHex(treeDigest, label, source) {
+	const match = typeof treeDigest === "string" ? /^sha256:([0-9a-f]{64})$/.exec(treeDigest) : null;
+	if (!match) throw new Error(`Gentle AI assets archive ${label} has an invalid tree digest for ${source}`);
+	return match[1];
+}
+
+async function defaultExtractAssets(archivePath, destinationDir) {
+	return extractReleaseArtifact(archivePath, destinationDir, { extractor: createSystemReleaseArtifactExtractor() });
+}
+
+// Stages the same signed assets archive consumed on every platform (design
+// D5: assets carry no goos/goarch axis) into `<staging>/assets`, reusing
+// `lib/release-artifact.ts`'s bounded, exact-set-verified extractor (D2) —
+// this module re-authors no extraction or decode logic, only the download +
+// pinned-digest cross-check around it.
+async function installAssets(options, stagingDirectory, assetsArchive) {
+	const archivePath = join(stagingDirectory, assetsArchive.name);
+	await (options.downloadAssets ?? downloadGentleAiAsset)(assetsArchive.url, archivePath);
+	if ((await sha256File(archivePath)) !== assetsArchive.sha256) {
+		throw new Error(`Gentle AI assets archive checksum mismatch for ${assetsArchive.name}`);
+	}
+	const assetsDirectory = join(stagingDirectory, "assets");
+	const { manifest } = await (options.extractAssets ?? defaultExtractAssets)(archivePath, assetsDirectory);
+	const treeSha256 = assetsTreeDigestHex(manifest.tree.digest, "manifest tree.digest", assetsArchive.name);
+	if (treeSha256 !== assetsArchive.treeSha256) throw new Error(`Gentle AI assets tree digest mismatch for ${assetsArchive.name}`);
+	if (manifest.contract.major !== assetsArchive.contractMajor) throw new Error(`Gentle AI assets contract major mismatch for ${assetsArchive.name}`);
+	if (manifest.layout.version !== assetsArchive.layoutVersion) throw new Error(`Gentle AI assets layout version mismatch for ${assetsArchive.name}`);
+	await rm(archivePath, { force: true });
+	return assetsDirectory;
+}
+
+// Cheap existence/shape check reused by both `existingSignedBundleMatches`
+// and `existingWindowsSourceBundleMatches` (design D3: extending the ONE
+// bundle-validity predicate that `recoverInterruptedPublication` already
+// takes covers interrupted-publication recovery for the assets tree with no
+// new publish operation). Deliberately does not walk or digest every asset
+// file — that N-file work is `resolveGentleAiAssets`'s job, reserved for lazy
+// snapshot readers (D4) — but a missing or shape-invalid assets directory,
+// or one that disagrees with the pinned contract/layout/tree digest, is
+// enough to make a binary-without-assets bundle invalid by construction.
+async function assetsBundleMatches(directory, assetsArchive) {
+	try {
+		const assetsDirectory = join(directory, "assets");
+		const manifestPath = join(assetsDirectory, RELEASE_ARTIFACT_MANIFEST_FILE_NAME);
+		const [assetsDetails, manifestDetails] = await Promise.all([lstat(assetsDirectory), lstat(manifestPath)]);
+		if (!assetsDetails.isDirectory() || assetsDetails.isSymbolicLink() || !manifestDetails.isFile() || manifestDetails.isSymbolicLink()) return false;
+		const manifest = decodeArtifactManifest(await readFile(manifestPath));
+		return manifest.contract.major === assetsArchive.contractMajor
+			&& manifest.layout.version === assetsArchive.layoutVersion
+			&& manifest.tree.digest === `sha256:${assetsArchive.treeSha256}`;
+	} catch {
+		return false;
+	}
+}
+
 async function safeRemoveDirectory(path) {
 	try {
 		const details = await lstat(path);
@@ -354,16 +474,16 @@ async function safeRemoveDirectory(path) {
 	} catch (error) { if (!(error && typeof error === "object" && error.code === "ENOENT")) throw error; }
 }
 
-async function existingSignedBundleMatches(directory, asset, platform) {
+async function existingSignedBundleMatches(directory, asset, platform, assetsArchive) {
 	try {
 		const binaryPath = join(directory, asset.executable), manifestPath = join(directory, "integrity.json");
 		const [bundle, binary, manifestFile, contents] = await Promise.all([lstat(directory), lstat(binaryPath), lstat(manifestPath), readFile(manifestPath, "utf8")]);
 		const binarySha256 = await sha256File(binaryPath);
-		return bundle.isDirectory() && !bundle.isSymbolicLink() && binary.isFile() && !binary.isSymbolicLink() && (platform === "win32" || (binary.mode & 0o111) !== 0) && manifestFile.isFile() && !manifestFile.isSymbolicLink() && (!asset.binarySha256 || asset.binarySha256 === binarySha256) && isCanonicalManifest(contents, JSON.parse(contents), signedReleaseManifest(asset, binarySha256));
+		return bundle.isDirectory() && !bundle.isSymbolicLink() && binary.isFile() && !binary.isSymbolicLink() && (platform === "win32" || (binary.mode & 0o111) !== 0) && manifestFile.isFile() && !manifestFile.isSymbolicLink() && (!asset.binarySha256 || asset.binarySha256 === binarySha256) && isCanonicalManifest(contents, JSON.parse(contents), signedReleaseManifest(asset, binarySha256, assetsArchive)) && await assetsBundleMatches(directory, assetsArchive);
 	} catch { return false; }
 }
 
-async function existingWindowsSourceBundleMatches(directory, execute, goPath, environment, architecture) {
+async function existingWindowsSourceBundleMatches(directory, execute, goPath, environment, architecture, assetsArchive) {
 	try {
 		const binaryPath = join(directory, "gentle-ai.exe"), manifestPath = join(directory, "integrity.json");
 		const [bundle, binary, manifestFile, contents] = await Promise.all([lstat(directory), lstat(binaryPath), lstat(manifestPath), readFile(manifestPath, "utf8")]);
@@ -372,9 +492,10 @@ async function existingWindowsSourceBundleMatches(directory, execute, goPath, en
 		if (typeof parsed?.binarySha256 !== "string" || !/^[0-9a-f]{64}$/.test(parsed.binarySha256)) return false;
 		const beforeBinary = await lstat(binaryPath), beforeManifest = await lstat(manifestPath);
 		const metadata = await verifyGoBuildMetadata(execute, goPath, binaryPath, environment, directory, architecture);
-		if ((await sha256File(binaryPath)) !== parsed.binarySha256 || !isCanonicalManifest(contents, parsed, windowsSourceManifest(metadata, parsed.binarySha256, architecture))) return false;
+		if ((await sha256File(binaryPath)) !== parsed.binarySha256 || !isCanonicalManifest(contents, parsed, windowsSourceManifest(metadata, parsed.binarySha256, architecture, assetsArchive))) return false;
 		await assertExactGentleAiVersion(execute, binaryPath, environment, directory);
-		return sameFile(beforeBinary, await lstat(binaryPath)) && sameFile(beforeManifest, await lstat(manifestPath));
+		if (!(sameFile(beforeBinary, await lstat(binaryPath)) && sameFile(beforeManifest, await lstat(manifestPath)))) return false;
+		return await assetsBundleMatches(directory, assetsArchive);
 	} catch { return false; }
 }
 
@@ -565,7 +686,7 @@ async function withInstallLock(packageRoot, options, install) {
 	finally { await release(); }
 }
 
-async function installWindowsGentleAiFromGoSumdb(options, packageRoot, architecture) {
+async function installWindowsGentleAiFromGoSumdb(options, packageRoot, architecture, assetsArchive) {
 	const execute = options.execFile ?? execFileAsync;
 	return withInstallLock(packageRoot, options, async (runtimeRoot) => {
 		await cleanupStaleStagingBundles(runtimeRoot);
@@ -577,9 +698,9 @@ async function installWindowsGentleAiFromGoSumdb(options, packageRoot, architect
 			const goPath = await resolveWindowsGoExecutable(options);
 			const environment = sealedGoEnvironment(goPath, buildDirectory, architecture);
 			for (const directory of [environment.GOBIN, environment.GOPATH, environment.GOMODCACHE, environment.GOCACHE, environment.TEMP]) await mkdir(directory, { recursive: true, mode: 0o700 });
-			await recoverInterruptedPublication(runtimeRoot, (directory) => existingWindowsSourceBundleMatches(directory, execute, goPath, environment, architecture), options);
+			await recoverInterruptedPublication(runtimeRoot, (directory) => existingWindowsSourceBundleMatches(directory, execute, goPath, environment, architecture, assetsArchive), options);
 			const existing = versionBundlePath(runtimeRoot);
-			if (await existingWindowsSourceBundleMatches(existing, execute, goPath, environment, architecture)) return { installed: false, binaryPath: join(existing, "gentle-ai.exe"), method: GENTLE_AI_INSTALL_METHOD.GO_SUMDB_SOURCE_BUILD };
+			if (await existingWindowsSourceBundleMatches(existing, execute, goPath, environment, architecture, assetsArchive)) return { installed: false, binaryPath: join(existing, "gentle-ai.exe"), method: GENTLE_AI_INSTALL_METHOD.GO_SUMDB_SOURCE_BUILD };
 			await assertGoToolchain(execute, goPath, environment, stagingDirectory);
 			try { await runCommand(execute, goPath, ["install", GENTLE_AI_WINDOWS_SOURCE_PACKAGE], commandOptions(environment, stagingDirectory)); }
 			catch (error) { throw new GentleAiInstallerError(GENTLE_AI_GO_INSTALL_FAILED_CODE, `Gentle AI Go SumDB source installation failed for ${GENTLE_AI_WINDOWS_SOURCE_PACKAGE}.`, error); }
@@ -590,7 +711,10 @@ async function installWindowsGentleAiFromGoSumdb(options, packageRoot, architect
 			const metadata = await verifyGoBuildMetadata(execute, goPath, binaryPath, environment, stagingDirectory, architecture);
 			await assertExactGentleAiVersion(execute, binaryPath, environment, stagingDirectory);
 			const binarySha256 = await sha256File(binaryPath);
-			await writeFile(join(stagingDirectory, "integrity.json"), canonicalManifest(windowsSourceManifest(metadata, binarySha256, architecture)), { mode: 0o600 });
+			// D5: the same signed assets archive as POSIX, bound in the one
+			// atomic bundle and integrity manifest below.
+			await installAssets(options, stagingDirectory, assetsArchive);
+			await writeFile(join(stagingDirectory, "integrity.json"), canonicalManifest(windowsSourceManifest(metadata, binarySha256, architecture, assetsArchive)), { mode: 0o600 });
 			await safeRemoveDirectory(buildDirectory);
 			const published = await publishBundle(runtimeRoot, stagingDirectory, options);
 			return { installed: true, binaryPath: join(published, "gentle-ai.exe"), method: GENTLE_AI_INSTALL_METHOD.GO_SUMDB_SOURCE_BUILD };
@@ -598,12 +722,12 @@ async function installWindowsGentleAiFromGoSumdb(options, packageRoot, architect
 	});
 }
 
-async function installSignedRelease(options, packageRoot, platform, arch, asset) {
+async function installSignedRelease(options, packageRoot, platform, arch, asset, assetsArchive) {
 	return withInstallLock(packageRoot, options, async (runtimeRoot) => {
-		await recoverInterruptedPublication(runtimeRoot, (directory) => existingSignedBundleMatches(directory, asset, platform), options);
+		await recoverInterruptedPublication(runtimeRoot, (directory) => existingSignedBundleMatches(directory, asset, platform, assetsArchive), options);
 		await cleanupStaleStagingBundles(runtimeRoot);
 		const existing = versionBundlePath(runtimeRoot);
-		if (await existingSignedBundleMatches(existing, asset, platform)) return { installed: false, binaryPath: join(existing, asset.executable), asset };
+		if (await existingSignedBundleMatches(existing, asset, platform, assetsArchive)) return { installed: false, binaryPath: join(existing, asset.executable), asset };
 		const stagingDirectory = await mkdtemp(join(runtimeRoot, `.v${INSTALLER_VERSION}.staging-`));
 		try {
 			const archive = join(stagingDirectory, asset.name);
@@ -616,7 +740,11 @@ async function installSignedRelease(options, packageRoot, platform, arch, asset)
 			const binaryPath = join(stagingDirectory, asset.executable);
 			await copyFile(source, binaryPath);
 			if (platform !== "win32") await chmod(binaryPath, 0o700);
-			await writeFile(join(stagingDirectory, "integrity.json"), canonicalManifest(signedReleaseManifest(asset, await sha256File(binaryPath))), { mode: 0o600 });
+			// D3: one staging tree, one atomic rename below covers both the
+			// binary (above) and the assets bundle (here) — no second publish
+			// operation.
+			await installAssets(options, stagingDirectory, assetsArchive);
+			await writeFile(join(stagingDirectory, "integrity.json"), canonicalManifest(signedReleaseManifest(asset, await sha256File(binaryPath), assetsArchive)), { mode: 0o600 });
 			await safeRemoveDirectory(extracted);
 			await rm(archive, { force: true });
 			const published = await publishBundle(runtimeRoot, stagingDirectory, options);
@@ -628,7 +756,8 @@ async function installSignedRelease(options, packageRoot, platform, arch, asset)
 export async function installGentleAi(options = {}) {
 	const packageRoot = options.packageRoot ?? resolveGentleAiInstallerPackageRoot();
 	const platform = options.platform ?? process.platform, arch = options.arch ?? process.arch;
-	if (isWindowsGoSumdbSourceTarget(platform, arch)) return installWindowsGentleAiFromGoSumdb(options, packageRoot, arch);
+	const assetsArchive = options.assetsArchive ?? resolveGentleAiAssetsArchive(packageRoot);
+	if (isWindowsGoSumdbSourceTarget(platform, arch)) return installWindowsGentleAiFromGoSumdb(options, packageRoot, arch, assetsArchive);
 	const asset = resolveGentleAiReleaseAsset(platform, arch, options.releaseAssets ?? GENTLE_AI_RELEASE_ASSETS);
-	return installSignedRelease(options, packageRoot, platform, arch, asset);
+	return installSignedRelease(options, packageRoot, platform, arch, asset, assetsArchive);
 }
