@@ -1,4 +1,8 @@
 {
+  "evidence": {
+    "class": "development/bootstrap",
+    "signatureStatus": "not-applicable/local-unsigned"
+  },
   "release": {
     "repository": "Gentleman-Programming/gentle-ai",
     "tag": "v2.2.3",

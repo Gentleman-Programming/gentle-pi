@@ -168,8 +168,14 @@ function byRawPath(a, b) {
 	return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
 }
 
-export function buildGentleAiReleaseLock(manifest, generatedEntries, { archiveSha256 }) {
+// The evidence class is persisted into the lock rather than only carried on the
+// in-memory sync result. A reader that only has the file on disk must still be
+// able to refuse it as pin or final-acceptance evidence: a bootstrap lock whose
+// `release.commit` is a placeholder and whose `archive.digestSource` reads
+// "signed-checksums.txt" is otherwise indistinguishable from a real one.
+export function buildGentleAiReleaseLock(manifest, generatedEntries, { archiveSha256, evidenceClass, signatureStatus }) {
 	return {
+		evidence: { class: evidenceClass, signatureStatus },
 		release: { ...manifest.release },
 		contract: {
 			id: manifest.contract.id,
@@ -308,7 +314,7 @@ export async function syncGentleAiRelease(options) {
 				writtenPaths.push(entry.path);
 			}
 
-			const lock = buildGentleAiReleaseLock(manifest, generated, { archiveSha256 });
+			const lock = buildGentleAiReleaseLock(manifest, generated, { archiveSha256, evidenceClass, signatureStatus });
 			assertLockVersionPin(lock, installerVersion);
 			lockPath = join(packageRoot, GENTLE_AI_RELEASE_LOCK_RELATIVE_PATH);
 			await mkdir(dirname(lockPath), { recursive: true });

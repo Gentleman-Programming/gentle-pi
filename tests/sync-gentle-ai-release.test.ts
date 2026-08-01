@@ -318,3 +318,38 @@ test("syncGentleAiRelease against --bootstrap-archive never labels its result re
 		await rm(archivePath, { force: true });
 	}
 });
+
+test("the persisted lock records its evidence class, so a bootstrap-derived lock cannot be mistaken for release evidence", () => {
+	const manifest = buildTestManifest([{ path: "a.json", type: "file", mode: "0644", size: 1, digest: `sha256:${"a".repeat(64)}` }]);
+	const generated = [{ path: "a.json", sha256: `sha256:${"a".repeat(64)}` }];
+
+	const bootstrapLock = buildGentleAiReleaseLock(manifest, generated, {
+		archiveSha256: `sha256:${"c".repeat(64)}`,
+		evidenceClass: "development/bootstrap",
+		signatureStatus: "not-applicable/local-unsigned",
+	});
+	assert.equal(bootstrapLock.evidence.class, "development/bootstrap");
+	assert.equal(bootstrapLock.evidence.signatureStatus, "not-applicable/local-unsigned");
+
+	// The whole point: a reader that only has the file on disk must still be able
+	// to refuse it as pin or final-acceptance evidence. In-memory labelling that
+	// never reaches the artifact would leave a bootstrap lock indistinguishable
+	// from a real one, which is exactly what the spec forbids.
+	assert.throws(
+		() => assertReleaseAcceptanceEvidence({ evidenceClass: bootstrapLock.evidence.class }),
+		/cannot serve as pin or final-acceptance evidence/,
+	);
+
+	const releaseLock = buildGentleAiReleaseLock(manifest, generated, {
+		archiveSha256: `sha256:${"c".repeat(64)}`,
+		evidenceClass: "release",
+		signatureStatus: "verified",
+	});
+	assert.doesNotThrow(() => assertReleaseAcceptanceEvidence({ evidenceClass: releaseLock.evidence.class }));
+});
+
+test("the checked-in lock on disk is labelled bootstrap and is refused as acceptance evidence", async () => {
+	const onDisk = JSON.parse(await readFile(new URL("../capabilities/gentle-ai-release.lock.json", import.meta.url), "utf8"));
+	assert.equal(onDisk.evidence.class, "development/bootstrap");
+	assert.throws(() => assertReleaseAcceptanceEvidence({ evidenceClass: onDisk.evidence.class }));
+});
