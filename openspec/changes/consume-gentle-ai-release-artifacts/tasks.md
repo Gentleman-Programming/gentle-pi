@@ -97,14 +97,14 @@ Chain strategy: feature-branch-chain
 
 ## PR 6 — P3b: Skill vendor + overlay (depends: PR 5)
 
-- [ ] 6.1 RED: overlay anchor missing upstream ⇒ fails the exact message `edit the overlay, not the vendored file: skills/_vendor/<name>/overlay.md` (fixture pair).
-- [ ] 6.2 RED: hand-edit of a vendored `skills/_vendor/**` file detected by the drift gate.
-- [ ] 6.3 GREEN: create `scripts/build-skill-overlays.mjs` (`--write`/`--check`) — vendored body + ordered anchored `[anchor]/[replace]` blocks in `overlay.md` → `skills/<name>/SKILL.md`.
-- [ ] 6.4 GREEN (5 independent revertible admissions): per-file portability comparison then admit first-tier candidates — `comment-writer`, `work-unit-commits`, `branch-pr`, `chained-pr`, `cognitive-doc-design`.
-- [ ] 6.5 GREEN (4 independent revertible admissions): per-file portability comparison then admit second-tier candidates — `judgment-day`, `skill-creator`, `skill-improver`, `skill-registry`.
-- [ ] 6.6 GREEN: confirm `skills/issue-creation/SKILL.md` is excluded entirely from vendoring and carries no gate.
-- [ ] 6.7 GREEN: `.github/workflows/ci.yml` — add `build-skill-overlays.mjs --check` to the per-PR gate.
-- [ ] 6.8 Verify: `pnpm test`; `node scripts/build-skill-overlays.mjs --check`.
+- [x] 6.1 RED: overlay anchor missing upstream ⇒ fails the exact message `edit the overlay, not the vendored file: skills/_vendor/<name>/overlay.md` (fixture pair).
+- [x] 6.2 RED: hand-edit of a vendored `skills/_vendor/**` file detected by the drift gate.
+- [x] 6.3 GREEN: create `scripts/build-skill-overlays.mjs` (`--write`/`--check`) — vendored body + ordered anchored `[anchor]/[replace]` blocks in `overlay.md` → `skills/<name>/SKILL.md`.
+- [x] 6.4 GREEN (5 independent revertible admissions): per-file portability comparison then admit first-tier candidates — `comment-writer`, `work-unit-commits`, `branch-pr`, `chained-pr`, `cognitive-doc-design`. All five passed and were admitted.
+- [x] 6.5 GREEN (4 independent revertible admissions): per-file portability comparison then admit second-tier candidates — `judgment-day`, `skill-creator`, `skill-improver`, `skill-registry`. Only `skill-improver` and `skill-registry` passed; `judgment-day` and `skill-creator` diverged far beyond an anchored overlay (near-total section rewrites) and were rejected — see apply-progress.md.
+- [x] 6.6 GREEN: confirm `skills/issue-creation/SKILL.md` is excluded entirely from vendoring and carries no gate.
+- [x] 6.7 GREEN: `.github/workflows/ci.yml` — add `build-skill-overlays.mjs --check` to the per-PR gate.
+- [x] 6.8 Verify: `pnpm test`; `node scripts/build-skill-overlays.mjs --check`.
 
 ## PR 7 — P3c: Phase-coverage gate + generic evidence harness (depends: PR 6)
 
