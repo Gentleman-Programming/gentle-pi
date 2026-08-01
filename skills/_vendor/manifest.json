@@ -23,6 +23,10 @@
 		"skill-improver": {
 			"path": "skills/_vendor/skill-improver/SKILL.md",
 			"sha256": "4b71aa7f242259a3e4ef8f5c87c591e154b2fe1ef5277c9d7428ba2fa678a151"
+		},
+		"skill-registry": {
+			"path": "skills/_vendor/skill-registry/SKILL.md",
+			"sha256": "06b49f63bd311218618d79cbdaeed63f49c5853fda552ffe2c3e81e42e94f189"
 		}
 	}
 }
