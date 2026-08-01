@@ -1,3 +1,5 @@
+import { REQUIRED_GATES, REQUIRED_OPERATIONS, REQUIRED_PROJECTIONS } from "./gentle-ai-required-floor.generated.ts";
+
 export const REVIEW_INTEGRATION_CONTRACT = "gentle-ai.review-integration/v2";
 
 export const REVIEW_INTEGRATION_OPERATION = {
@@ -92,9 +94,13 @@ export const REVIEW_STATUS_ACTION_DISPOSITION = {
 } as const;
 export type ReviewStatusActionDisposition = (typeof REVIEW_STATUS_ACTION_DISPOSITION)[keyof typeof REVIEW_STATUS_ACTION_DISPOSITION];
 const RECEIPT_STATUSES = ["expected_missing", "present", "publication_pending", "not_applicable"] as const;
-const REQUIRED_OPERATIONS = Object.freeze(Object.values(REVIEW_INTEGRATION_OPERATION));
-const REQUIRED_GATES = Object.freeze(["post-apply", "pre-commit", "pre-push", "pre-pr", "release"] as const);
-const REQUIRED_PROJECTIONS = Object.freeze(Object.values(REVIEW_PROJECTION));
+// REQUIRED_OPERATIONS/REQUIRED_GATES/REQUIRED_PROJECTIONS are generated (D7,
+// scripts/build-gentle-ai-baselines.mjs) from the checked-in semantic
+// snapshot: monotone floors that `--write` may only grow, never silently
+// shrink. REQUIRED_SCHEMAS stays hand-authored below -- the checked-in
+// semantic snapshot mirror carries no `schemas` array (that field exists only
+// on the live negotiated `review.capabilities` response this module decodes,
+// a strictly larger runtime surface the offline generator does not consume).
 const REQUIRED_SCHEMAS = Object.freeze([
 	"gentle-ai.review-admitted-result/v2",
 	"gentle-ai.review-artifact-subject/v2",
@@ -167,6 +173,13 @@ const FEATURE_NAMES = Object.freeze([
 	"uniform_failure_envelope",
 	"validating_result_reopen",
 ] as const);
+// Exact set, no tolerance (unlike the monotone floors above): FEATURE_NAMES/
+// OPTIONAL_FEATURE_NAMES/REQUIRED_MANDATORY_FEATURES stay hand-authored, not
+// generated. A mandatory feature needs client decode code before Pi can
+// support it, so an advertised mandatory name is never auto-added here --
+// scripts/build-gentle-ai-baselines.mjs independently validates the same
+// exact-set discipline offline against its own PI_SUPPORTED_MANDATORY_FEATURES
+// (a deliberate duplicate decision, not a shared source, per D7).
 const REQUIRED_MANDATORY_FEATURES = Object.freeze(FEATURE_NAMES.filter((name) => !(OPTIONAL_FEATURE_NAMES as readonly string[]).includes(name)));
 
 type StartAction = (typeof START_ACTIONS)[number];

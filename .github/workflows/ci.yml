@@ -43,5 +43,12 @@ jobs:
       - name: Verify package contents
         run: node scripts/verify-package-files.mjs
 
+      # Generated NATIVE_CLI_CONTRACTS row + REQUIRED_* floors (D7): offline,
+      # reads only the checked-in semantic snapshot, lock, and
+      # capabilities/native-cli-history.json. Only scripts/bump-gentle-ai-pin.mjs
+      # (P4) ever runs this with --write.
+      - name: Verify generated gentle-ai baselines
+        run: node scripts/build-gentle-ai-baselines.mjs --check
+
       - name: Verify packed installation
         run: pnpm run test:packed-runner
