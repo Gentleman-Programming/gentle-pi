@@ -15,6 +15,10 @@
 		"chained-pr": {
 			"path": "skills/_vendor/chained-pr/SKILL.md",
 			"sha256": "865f2e78db039797eabfe46d80589677c1420c052ed2b993c4435b487b17e83b"
+		},
+		"cognitive-doc-design": {
+			"path": "skills/_vendor/cognitive-doc-design/SKILL.md",
+			"sha256": "80dcaeca45c35e830939ef5440ca270b147f6370e4afcb47cdab762097f8cde0"
 		}
 	}
 }
