@@ -116,7 +116,9 @@ import {
 	NATIVE_REVIEW_MODE_SOURCE,
 	NATIVE_REVIEW_RECONCILE_ANOMALIES,
 	sanitizeForeignNativeReviewDiagnostics,
+	type NativeReviewAdmittedResultManifest,
 	type NativeReviewCli,
+	type NativeReviewFinalizeCapturedResults,
 	type NativeFinalizeResult,
 	type NativeReviewModeOperation,
 	type NativeReviewModeSource,
@@ -126,6 +128,7 @@ import {
 } from "../lib/native-review-cli.ts";
 import type { ReviewConsentV2, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { assertDistinctCorrectionEvidence, resolveCorrectionStep, type CorrectionEvidence, type CorrectionOutcome, type CorrectionStep } from "../lib/review-correction-lifecycle.ts";
+import { assertLensSlotBijection, deriveCaptureSlots } from "../lib/review-result-capture.ts";
 
 const GRAPH_V1_ORDINARY_READ_ONLY = "Graph-v1 ordinary review authority is read-only; use native compact-v2 review operations";
 import {
@@ -4884,60 +4887,24 @@ function resolveReviewControllerWorkspaceRoot(requested: string | undefined, ses
 	return resolved;
 }
 
-function providerArgumentValue(name: string, input: NonNullable<NonNullable<ReviewStatusV3["nextTransition"]>["collect"]>["inputs"][number]): string {
-	const matches = input.arguments.filter((argument) => argument.name === name);
-	if (matches.length !== 1 || !isCanonicalProcessString(matches[0]?.value)) {
-		throw new CandidateViewError(`provider reviewer collect input requires exactly one canonical ${name} argument`, "manifest-input-divergence");
-	}
-	return matches[0]!.value;
-}
-
+// The six-field capture-slot binding (lineage, target, authority revision,
+// repository context, subject hash, lens, order) is validated exactly once,
+// by `deriveCaptureSlots` (lib/review-result-capture.ts, Design Decision 1).
+// This projection only reads the already-validated `first` collect input to
+// build the candidate manifest descriptor; it performs no binding comparison
+// of its own beyond the intended-untracked subset check below, which is
+// specific to `NativeCandidateProjectionDescriptor` construction and not part
+// of the capture-slot binding.
 function providerReviewerProjection(status: ReviewStatusV3): NativeCandidateProjectionDescriptor {
-	const authority = status.authority;
-	const inputs = status.nextTransition?.kind === "collect"
-		? status.nextTransition.collect?.inputs.filter((input) => input.captureOperation === "review.capture-result") ?? []
-		: [];
-	if (authority === undefined || inputs.length === 0) {
-		throw new CandidateViewError("provider status did not supply reviewer collect inputs for the frozen candidate", "manifest-input-divergence");
-	}
-	const first = inputs[0]!;
-	if (first.artifactSubject === undefined || first.baseTree === undefined || first.candidateTree === undefined || first.changedPathManifest === undefined) {
-		throw new CandidateViewError("provider reviewer collect input omitted its frozen artifact subject or manifest", "manifest-input-divergence");
-	}
-	const manifestBytes = JSON.stringify(first.changedPathManifest);
-	const manifestHash = first.artifactSubject.changedPathManifestSha256;
-	const seenLenses = new Set<string>();
-	const seenOrders = new Set<number>();
-	const seenSubjects = new Set<string>();
-	for (const input of inputs) {
-		const subject = input.artifactSubject;
-		if (
-			subject === undefined || input.baseTree === undefined || input.candidateTree === undefined || input.changedPathManifest === undefined ||
-			input.baseTree !== status.projection.baseTree || input.candidateTree !== status.projection.currentCandidateTree ||
-			subject.baseTree !== input.baseTree || subject.candidateTree !== input.candidateTree ||
-			subject.lineageId !== authority.lineageId || subject.authorityRevision !== authority.revision || subject.targetIdentity !== status.targetIdentity ||
-			subject.changedPathManifestSha256 !== manifestHash || JSON.stringify(input.changedPathManifest) !== manifestBytes ||
-			providerArgumentValue("lineage", input) !== subject.lineageId ||
-			providerArgumentValue("expected-revision", input) !== subject.authorityRevision ||
-			providerArgumentValue("target", input) !== subject.targetIdentity ||
-			providerArgumentValue("lens", input) !== subject.lens ||
-			providerArgumentValue("order", input) !== String(subject.selectedOrder) ||
-			providerArgumentValue("subject-hash", input) !== subject.subjectHash ||
-			seenLenses.has(subject.lens) || seenOrders.has(subject.selectedOrder) || seenSubjects.has(subject.subjectHash)
-		) {
-			throw new CandidateViewError("provider reviewer collect inputs disagree on their frozen manifest binding", "manifest-input-divergence");
-		}
-		seenLenses.add(subject.lens);
-		seenOrders.add(subject.selectedOrder);
-		seenSubjects.add(subject.subjectHash);
-	}
-	const intendedUntracked = first.changedPathManifest.filter((entry) => entry.intendedUntracked).map((entry) => entry.path).sort();
+	const { first } = deriveCaptureSlots(status);
+	const manifest = first.changedPathManifest!;
+	const intendedUntracked = manifest.filter((entry) => entry.intendedUntracked).map((entry) => entry.path).sort();
 	if (JSON.stringify(intendedUntracked) !== JSON.stringify([...status.projection.intendedUntracked].sort())) {
 		throw new CandidateViewError("provider manifest intended-untracked fields disagree with its projection", "manifest-intended-untracked-not-subset");
 	}
 	return {
 		...status.projection,
-		manifest: first.changedPathManifest.map((entry) => ({
+		manifest: manifest.map((entry) => ({
 			path: entry.path,
 			status: entry.status,
 			oldMode: entry.oldMode,
@@ -4946,9 +4913,56 @@ function providerReviewerProjection(status: ReviewStatusV3): NativeCandidateProj
 			typeChanged: entry.typeChanged,
 			modeOnly: entry.modeOnly,
 		})),
-		manifestSha256: manifestHash,
+		manifestSha256: first.artifactSubject!.changedPathManifestSha256,
 		providerManifestHashVerified: true,
 	};
+}
+
+/**
+ * FINALIZE capture phase (Wave 1, #2028 host behavior, Design Decisions 1
+ * and 4). Pi has no `tool.execute.after` analogue, so capture is
+ * status-mediated at FINALIZE entry instead of host-hook-time: each
+ * `review_result.lens_results[]` entry is bound to exactly one outstanding
+ * `review.capture-result` slot (fail-closed bijection, before any capture
+ * runs), captured in ascending `selectedOrder` with the provider's own
+ * argument tokens forwarded byte-identical, then re-checked against the
+ * admitted manifest's subject hash and lens. Transport is selected per run:
+ * every admitted manifest carrying `path` selects `resultArtifactFiles` in
+ * ascending order; any manifest carrying `reference` selects
+ * `capturedResults: true`. The retired `--result` transport is never used.
+ */
+async function captureReviewerResults(
+	nativeReviewCli: NativeReviewCli,
+	status: ReviewStatusV3,
+	lensResults: NonNullable<ReturnType<typeof parseNativeCompactFinalizeInput>["review_result"]>["lens_results"],
+	cwd: string,
+	signal: AbortSignal | undefined,
+): Promise<NativeReviewFinalizeCapturedResults> {
+	if (nativeReviewCli.captureResult === undefined) {
+		throw new CandidateViewError("native reviewer result capture is unavailable", "capture-unavailable");
+	}
+	const { slots } = deriveCaptureSlots(status);
+	const lensLabels = lensResults.map((document, index) => document.lens ?? `lens-${index}`);
+	assertLensSlotBijection(lensLabels, slots);
+	const orderedSlots = [...slots].sort((left, right) => left.selectedOrder - right.selectedOrder);
+	const manifests: NativeReviewAdmittedResultManifest[] = [];
+	for (const slot of orderedSlots) {
+		const index = lensLabels.indexOf(slot.lens);
+		const document = toNativeReviewerDocument(lensResults[index]!);
+		const manifest = await nativeReviewCli.captureResult({
+			argumentTokens: slot.argumentTokens,
+			resultDocument: JSON.stringify(document),
+			cwd,
+			...(signal === undefined ? {} : { signal }),
+		});
+		if (manifest.subjectHash !== slot.subjectHash || (manifest.lens !== undefined && manifest.lens !== slot.lens)) {
+			throw new CandidateViewError("admitted capture manifest does not match the requested capture slot", "capture-manifest-binding-drift");
+		}
+		manifests.push(manifest);
+	}
+	return manifests.every((manifest) => manifest.path !== undefined)
+		? { resultArtifactFiles: manifests.map((manifest) => manifest.path!) }
+		: { capturedResults: true };
 }
 
 function correctionOutcome(input: ReturnType<typeof parseNativeCompactFinalizeInput>): CorrectionOutcome | undefined {
@@ -5538,10 +5552,13 @@ async function executeReviewControllerOperation(
 						throw new Error("Native FINALIZE refuter material is invalid without inferential candidate-caused severe findings");
 					}
 				}
+				const capturedTransport: NativeReviewFinalizeCapturedResults | undefined = input.review_result === undefined
+					? undefined
+					: await captureReviewerResults(nativeReviewCli, negotiatedStatus!, input.review_result.lens_results, candidateView?.root ?? defaultCwd, signal);
 				nativeResult = await nativeReviewCli.finalize({
 					cwd: candidateView?.root ?? defaultCwd,
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
-					...(input.review_result === undefined ? {} : { lensResults: input.review_result.lens_results.map((document, index) => ({ lens: document.lens ?? `lens-${index}`, document: toNativeReviewerDocument(document) })) }),
+					...(capturedTransport ?? {}),
 					...(input.refuter_batch === undefined ? {} : { refuterDocument: toNativeRefuterDocument(input.refuter_batch) }),
 					...(input.correction_line_forecast === undefined ? {} : { correctionLines: input.correction_line_forecast }),
 					...(input.validation === undefined && input.validation_proof === undefined ? {} : { validationDocument: toNativeValidatorDocument(input.validation ?? input.validation_proof!) }),

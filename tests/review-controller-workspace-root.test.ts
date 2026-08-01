@@ -7,7 +7,7 @@ import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import type { NativeReviewCli } from "../lib/native-review-cli.ts";
-import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
+import { CandidateViewRegistry, deriveChangedPathManifest } from "../lib/review-candidate-view.ts";
 import type { AuthorityRepairAssessmentV1, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 
 interface RegisteredTool {
@@ -86,8 +86,67 @@ function fakeNative(overrides: Partial<NativeReviewCli> = {}): NativeReviewCli {
 		targetStatus: async (request) => request.lineageId === undefined
 			? candidateStartTargetStatus(request)
 			: candidateFinalizeTargetStatus(request, request.lineageId),
+		captureResult: defaultCaptureResult,
 		...overrides,
 	};
+}
+
+/**
+ * Binds `status.nextTransition` to one `review.capture-result` collect input
+ * for lens `review-reliability`, matching the exact-slot binding
+ * `deriveCaptureSlots` (lib/review-result-capture.ts) validates.
+ */
+function bindReviewerManifest(status: ReviewStatusV3, cwd: string): ReviewStatusV3 {
+	const manifest = deriveChangedPathManifest(cwd, status.projection.baseTree, status.projection.currentCandidateTree).map((entry) => ({
+		...entry,
+		status: entry.status as "A" | "D" | "M" | "T",
+		intendedUntracked: status.projection.intendedUntracked.includes(entry.path),
+	}));
+	const subject = {
+		schema: "gentle-ai.review-artifact-subject/v2" as const,
+		subjectHash: `sha256:${"8".repeat(64)}`,
+		lineageId: status.authority!.lineageId,
+		authorityRevision: status.authority!.revision,
+		targetIdentity: status.targetIdentity,
+		baseTree: status.projection.baseTree,
+		candidateTree: status.projection.currentCandidateTree,
+		changedPathManifestSha256: `sha256:${"7".repeat(64)}`,
+		lens: "review-reliability" as const,
+		selectedOrder: 0,
+	};
+	status.nextTransition = {
+		kind: "collect",
+		reasonCode: "reviewer_results_required",
+		collect: { inputs: [{
+			name: "reviewer_result",
+			schema: "https://gentle-ai.dev/schema/review/reviewer/v1",
+			captureOperation: "review.capture-result",
+			arguments: [
+				{ name: "lineage", value: subject.lineageId, token: `--lineage=${subject.lineageId}` },
+				{ name: "expected-revision", value: subject.authorityRevision, token: `--expected-revision=${subject.authorityRevision}` },
+				{ name: "target", value: subject.targetIdentity, token: `--target=${subject.targetIdentity}` },
+				{ name: "lens", value: subject.lens, token: `--lens=${subject.lens}` },
+				{ name: "order", value: "0", token: "--order=0" },
+				{ name: "subject-hash", value: subject.subjectHash, token: `--subject-hash=${subject.subjectHash}` },
+			],
+			artifactSubject: subject,
+			baseTree: subject.baseTree,
+			candidateTree: subject.candidateTree,
+			changedPathManifest: manifest,
+		}] },
+	};
+	return status;
+}
+
+function defaultCaptureResult(request: Parameters<NonNullable<NativeReviewCli["captureResult"]>>[0]): ReturnType<NonNullable<NativeReviewCli["captureResult"]>> extends Promise<infer T> ? Promise<T> : never {
+	const decoded = new Map(request.argumentTokens.map((token) => {
+		const withoutPrefix = token.replace(/^--/, "");
+		const separator = withoutPrefix.indexOf("=");
+		return [withoutPrefix.slice(0, separator), withoutPrefix.slice(separator + 1)] as const;
+	}));
+	const lens = decoded.get("lens")!;
+	const subjectHash = decoded.get("subject-hash")!;
+	return Promise.resolve({ schema: "gentle-ai.review-result-artifact/v2", subjectHash, admissionDecision: "completed", lens, path: `/opaque/capture/${lens}` });
 }
 
 const UNSUPPORTED_REPAIR_ASSESSMENT: AuthorityRepairAssessmentV1 = {
@@ -360,6 +419,9 @@ test("FINALIZE fails closed when the frozen projection belongs to a different wo
 	let finalizes = 0;
 	const { controller } = runtime(fakeNative({
 		start: async () => ({ lineageId: "finalize-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+		targetStatus: async (request) => request.lineageId === undefined
+			? candidateStartTargetStatus(request)
+			: bindReviewerManifest(candidateFinalizeTargetStatus(request, request.lineageId), request.cwd),
 		finalize: async () => {
 			finalizes += 1;
 			return { lineageId: "finalize-lineage", state: "approved", action: "approved", storeRevision: "r1" };
