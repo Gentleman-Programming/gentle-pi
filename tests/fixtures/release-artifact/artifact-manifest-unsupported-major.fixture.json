@@ -1,0 +1,63 @@
+{
+  "schema": "gentle-ai.release-artifact-manifest/v2",
+  "contract": {
+    "id": "gentle-ai.release-artifact",
+    "major": 2,
+    "minor": 0,
+    "schema_id": "https://gentle-ai.dev/contracts/release-artifact/v2/schemas/artifact-manifest.schema.json",
+    "schema_path": "contracts/release-artifact/v2/schemas/artifact-manifest.schema.json"
+  },
+  "release": {
+    "repository": "Gentleman-Programming/gentle-ai",
+    "tag": "v2.3.0",
+    "version": "2.3.0",
+    "commit": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "layout": { "version": 1 },
+  "archive": {
+    "asset": "gentle-ai_2.3.0_assets.tar.gz",
+    "digest_source": "signed-checksums.txt"
+  },
+  "references": {
+    "semantic_snapshots": [
+      {
+        "contract": "gentle-ai.review-integration/v2",
+        "path": "capabilities/review-integration-v2.semantic.json",
+        "schema": "gentle-ai.release-semantic-capabilities/v1"
+      }
+    ],
+    "contracts": [
+      { "id": "gentle-ai.review-integration/v1", "root": "contracts/review-integration/v1" },
+      { "id": "gentle-ai.review-integration/v2", "root": "contracts/review-integration/v2" }
+    ]
+  },
+  "tree": {
+    "algorithm": "sha256",
+    "canonicalization": "gentle-ai.release-artifact-tree/v1",
+    "manifest_included": false,
+    "digest": "sha256:2f4f2adad5eca6ce59b38a44ea88682827b430e70d843ed830c2f095d69fa645"
+  },
+  "compatibility": {
+    "minimum_contract_major": 1,
+    "maximum_contract_major": 1,
+    "additive_minor_policy": "optional-fields-only",
+    "unknown_mandatory": "reject",
+    "unknown_optional": "ignore"
+  },
+  "entries": [
+    {
+      "path": "capabilities/review-integration-v2.semantic.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 128,
+      "digest": "sha256:b78faae1fd74197a64a757d9535bb27dfdddff2b54089d300b6c2a5079b40c05"
+    },
+    {
+      "path": "contracts/release-artifact/v1/schemas/artifact-manifest.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 256,
+      "digest": "sha256:160414be7f99faec1b12c8c0def67b454172bc31bd3a0f6afb6e7f885faefa95"
+    }
+  ]
+}

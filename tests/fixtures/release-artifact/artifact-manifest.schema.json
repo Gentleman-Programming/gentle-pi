@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gentle-ai.dev/contracts/release-artifact/v1/schemas/artifact-manifest.schema.json",
+  "title": "Gentle AI release artifact manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "contract", "release", "layout", "archive", "references", "tree", "compatibility", "entries"
+  ],
+  "properties": {
+    "schema": {"const": "gentle-ai.release-artifact-manifest/v1"},
+    "contract": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "major", "minor", "schema_id", "schema_path"],
+      "properties": {
+        "id": {"const": "gentle-ai.release-artifact"},
+        "major": {"type": "integer", "minimum": 1},
+        "minor": {"type": "integer", "minimum": 0},
+        "schema_id": {"type": "string", "minLength": 1},
+        "schema_path": {"type": "string", "minLength": 1}
+      }
+    },
+    "release": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository", "tag", "version", "commit"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1},
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      }
+    },
+    "layout": {
+      "type": "object", "additionalProperties": false,
+      "required": ["version"],
+      "properties": {"version": {"type": "integer", "minimum": 1}}
+    },
+    "archive": {
+      "type": "object", "additionalProperties": false,
+      "required": ["asset", "digest_source"],
+      "properties": {
+        "asset": {"type": "string", "minLength": 1},
+        "digest_source": {"const": "signed-checksums.txt"}
+      }
+    },
+    "references": {
+      "type": "object", "additionalProperties": false,
+      "required": ["semantic_snapshots", "contracts"],
+      "properties": {
+        "semantic_snapshots": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["contract", "path", "schema"],
+            "properties": {
+              "contract": {"type": "string", "minLength": 1},
+              "path": {"type": "string", "minLength": 1},
+              "schema": {"const": "gentle-ai.release-semantic-capabilities/v1"}
+            }
+          }
+        },
+        "contracts": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["id", "root"],
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "root": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    },
+    "tree": {
+      "type": "object", "additionalProperties": false,
+      "required": ["algorithm", "canonicalization", "manifest_included", "digest"],
+      "properties": {
+        "algorithm": {"const": "sha256"},
+        "canonicalization": {"const": "gentle-ai.release-artifact-tree/v1"},
+        "manifest_included": {"const": false},
+        "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "compatibility": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "minimum_contract_major", "maximum_contract_major", "additive_minor_policy", "unknown_mandatory",
+        "unknown_optional"
+      ],
+      "properties": {
+        "minimum_contract_major": {"type": "integer", "minimum": 1},
+        "maximum_contract_major": {"type": "integer", "minimum": 1},
+        "additive_minor_policy": {"const": "optional-fields-only"},
+        "unknown_mandatory": {"const": "reject"},
+        "unknown_optional": {"const": "ignore"}
+      }
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["path", "type", "mode", "size", "digest"],
+        "properties": {
+          "path": {"type": "string", "minLength": 1, "maxLength": 1024},
+          "type": {"const": "file"},
+          "mode": {"const": "0644"},
+          "size": {"type": "integer", "minimum": 0},
+          "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}
