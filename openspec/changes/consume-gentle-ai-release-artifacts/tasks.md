@@ -84,16 +84,16 @@ Chain strategy: feature-branch-chain
 
 ## PR 5 — P3a: Generators — baselines, generated floor, capability row (depends: PR 4)
 
-- [ ] 5.1 RED: generator test — `--write` may ADD a required name to `lib/gentle-ai-required-floor.generated.ts`.
-- [ ] 5.2 RED: generator test — a name disappearing from the snapshot's `required` block makes `--write`/`--check` FAIL naming it (monotone regeneration; no silent removal).
-- [ ] 5.3 RED: an advertised mandatory feature absent from Pi's set fails naming it (never auto-added).
-- [ ] 5.4 RED: unmapped-operation test — exact message `gentle-ai <v> advertises operation "<op>" with no NativeCliCapability column...`.
-- [ ] 5.5 RED: pinned version missing `envelopeFlags` in `capabilities/native-cli-history.json` fails generation.
-- [ ] 5.6 GREEN: create `capabilities/native-cli-history.json` — 12 frozen rows moved verbatim, prose re-emitted as `notes` comments.
-- [ ] 5.7 GREEN: create `scripts/build-gentle-ai-baselines.mjs` (`--write`/`--check`, CLI shape of `build-git-commit-transaction-runner.mjs:34-60`) — emits `lib/gentle-ai-required-floor.generated.ts` and the next `NATIVE_CLI_CONTRACTS` row (13 of 17 flags mapped via `review.<op>`, 4 envelope flags from history).
-- [ ] 5.8 GREEN: `lib/review-integration-v2.ts`, `lib/native-review-cli.ts` (+ runtime) consume the generated floor/row instead of hand-authored constants.
-- [ ] 5.9 GREEN: `.github/workflows/ci.yml` — add `build-gentle-ai-baselines.mjs --check` to the per-PR gate.
-- [ ] 5.10 Verify: `pnpm test`; `node scripts/build-gentle-ai-baselines.mjs --check`.
+- [x] 5.1 RED: generator test — `--write` may ADD a required name to `lib/gentle-ai-required-floor.generated.ts`.
+- [x] 5.2 RED: generator test — a name disappearing from the snapshot's `required` block makes `--write`/`--check` FAIL naming it (monotone regeneration; no silent removal).
+- [x] 5.3 RED: an advertised mandatory feature absent from Pi's set fails naming it (never auto-added).
+- [x] 5.4 RED: unmapped-operation test — exact message `gentle-ai <v> advertises operation "<op>" with no NativeCliCapability column...`.
+- [x] 5.5 RED: pinned version missing `envelopeFlags` in `capabilities/native-cli-history.json` fails generation.
+- [x] 5.6 GREEN: create `capabilities/native-cli-history.json` — 12 frozen rows moved verbatim, prose re-emitted as `notes` comments.
+- [x] 5.7 GREEN: create `scripts/build-gentle-ai-baselines.mjs` (`--write`/`--check`, CLI shape of `build-git-commit-transaction-runner.mjs:34-60`) — emits `lib/gentle-ai-required-floor.generated.ts` and the next `NATIVE_CLI_CONTRACTS` row (13 of 17 flags mapped via `review.<op>`, 4 envelope flags from history).
+- [x] 5.8 GREEN: `lib/review-integration-v2.ts`, `lib/native-review-cli.ts` (+ runtime) consume the generated floor/row instead of hand-authored constants.
+- [x] 5.9 GREEN: `.github/workflows/ci.yml` — add `build-gentle-ai-baselines.mjs --check` to the per-PR gate.
+- [x] 5.10 Verify: `pnpm test`; `node scripts/build-gentle-ai-baselines.mjs --check`.
 
 ## PR 6 — P3b: Skill vendor + overlay (depends: PR 5)
 

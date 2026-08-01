@@ -486,3 +486,212 @@ identical on the unmodified P2a tip via `git stash` — not introduced by this P
 9/9 tasks in PR 4 (P2b) complete. 37/37 tasks total across P1a+P1b+P2a+P2b. Ready for `sdd-verify`, or for
 `sdd-apply` to continue with PR 5 (P3a) in a fresh batch, on a new branch based on this one
 (`feat/release-assets-windows`).
+
+---
+
+# PR 5 / P3a: Generators — baselines, generated floor, capability row
+
+Worktree: `gentle-pi-worktrees/p3a`. Branch: `feat/release-artifact-generators`, based on P2b's
+`feat/release-assets-windows`. Tasks 5.1-5.10, all complete.
+
+## The paradox this unit resolves, and how (design.md D7)
+
+The spec requires `REQUIRED_*` to be generated; the plan requires the floor to stay frozen so a removal
+stays visible. Resolved via **monotone regeneration**, implemented as a self-referential fixed point:
+`monotoneFloor(previousRequired, advertised, label)` reads `previousRequired` from the CHECKED-IN
+`lib/gentle-ai-required-floor.generated.ts` itself (parsed via regex, `parseRequiredFloorModule`, never
+executed — same "read the generator's own emitted shape without importing it" convention already used by
+`extractGeneratedRuntimeSources` in `scripts/verify-package-files.mjs`). `--write` computes
+`union(previousRequired, advertisedCurrent)` — names can only be ADDED. If any name in `previousRequired`
+is absent from the current snapshot, generation FAILS naming it (`monotoneFloor` in
+`scripts/build-gentle-ai-baselines.mjs`). There is no code path that removes an entry automatically: to
+retire a requirement, a human hand-edits the checked-in generated `.ts` file to delete that line — a
+visible, reviewable diff on a file whose header says "Do not edit" is exactly the signal a reviewer needs.
+The NEXT `--write` then continues forward from that smaller, human-approved baseline (the file re-reads
+itself). Proven directly by `tests/build-gentle-ai-baselines.test.ts`:
+- `monotoneFloor accepts a snapshot that adds a new required name` (5.1)
+- `monotoneFloor rejects a snapshot that drops a previously required name` (5.2)
+- `build-gentle-ai-baselines.mjs --write fails naming a required entry that disappeared from a shrunk
+  snapshot` — end-to-end subprocess proof against a real fixture repo copy, not only the pure function.
+
+Same discipline for mandatory features, but via a DIFFERENT mechanism (design.md explicitly separates
+these: "Mandatory features | Exact set, no tolerance", distinct from the monotone floors). An advertised
+mandatory feature absent from Pi's set fails naming it and is never auto-added:
+`assertMandatoryFeaturesSupported` checks the snapshot's `features.mandatory[].name` against
+`PI_SUPPORTED_MANDATORY_FEATURES` — a constant hand-authored **inside the generator script itself**,
+deliberately NOT derived from the snapshot (a provider superset must never silently become Pi's
+requirement) and NOT derived from `lib/review-integration-v2.ts`'s own `REQUIRED_MANDATORY_FEATURES`
+constant (a generator that read its own consumer's hand-authored answer to grade that exact answer would
+prove nothing — Pi's supported set is a decision, not a mirror, per this unit's own brief).
+`lib/review-integration-v2.ts`'s `FEATURE_NAMES`/`OPTIONAL_FEATURE_NAMES`/`REQUIRED_MANDATORY_FEATURES`
+therefore stay hand-authored and untouched; a comment now explains why they are the one exact-set
+exception to D7's "generated" list.
+
+## Only 13 of the 17 capability flags derive from the snapshot — and only 5 of those 13 map by name
+
+`capabilities/review-integration-v2.semantic.json`'s real `operations[]` for the pinned v2.2.3 release is
+`[bind_sdd, capabilities, finalize, repair, retry_final_verification, start, status, validate]` (8 items).
+Only 5 of `NATIVE_CLI_CONTRACTS`'s 13 non-envelope columns (`start`, `finalize`, `validate`, `bindSdd`,
+`status`) correspond to a `review.<op>` operation by name. The other 8 columns
+(`sddStatus`, `inventory`, `reclaim`, `recover`, `abandon`, `quarantineLegacy`, `reconcileAuthority`,
+`repairLegacyAlias`) are pre-negotiated-contract CLI subcommands with no `operations[]` counterpart at
+all — the negotiated review-integration/v2 snapshot has never advertised them and structurally cannot.
+`OPERATION_COLUMN_MAP` in `scripts/build-gentle-ai-baselines.mjs` is therefore a hand-maintained,
+explicit `review.<op> -> column | null` map (5 real mappings + 3 explicit `null` entries for
+`review.capabilities`/`review.repair`/`review.retry_final_verification`, which Pi has decided are not
+version-gated boolean capabilities); the 8 columns with no map entry at all use `CARRY_FORWARD_COLUMNS`,
+sourced from the immediately preceding frozen historical row (`findPreviousHistoricalRow`). This is an
+interpretation of design.md's "13 of 17 flags derive from snapshot operations[]" wording, documented
+rather than silently narrowed — the design's own file-changes table does not enumerate the exact map, and
+the real snapshot only supports 5 direct name matches. **Proof this cannot silently pass an unmodeled
+operation**: `deriveCapabilityRow fails with the exact unmapped-operation message when a snapshot operation
+has no client mapping` constructs a synthetic operation absent from `OPERATION_COLUMN_MAP` entirely (not
+even as `null`) and asserts the exact spec-mandated message
+(`gentle-ai <v> advertises operation "<op>" with no NativeCliCapability column. Add the column and its
+decoder in lib/native-review-cli.ts, then re-run --write.`).
+
+## The 12 frozen rows move verbatim — proven by self-consistency, not merely asserted
+
+`capabilities/native-cli-history.json` carries the 12 pre-existing `NATIVE_CLI_CONTRACTS` rows
+(`2.1.4`-`2.2.3`) byte-for-byte, with their original inline comments re-emitted as JSON `notes` arrays.
+Rows strictly older than the pinned version are copied verbatim into the generated output, untouched. The
+row for the CURRENTLY PINNED version (`2.2.3`, which happens to already be the last historical entry
+today, since no real pin bump has landed yet) is always **recomputed** fresh from the snapshot + history's
+`envelopeFlags`, then cross-checked (`deriveCapabilityRow`'s `knownRow` parameter) against history's own
+recorded `2.2.3` entry — a disagreement throws naming the mismatched columns rather than silently
+overwriting. Running `node scripts/build-gentle-ai-baselines.mjs --write` against the real repository
+reproduced the original 12 rows **byte-identical** to what was previously hand-authored in
+`lib/native-review-cli.ts` (confirmed via `git diff`-free re-run — see Work Unit Evidence below) — the
+generator's derivation is provably correct against known-good historical data, not merely internally
+self-consistent.
+
+## Only 4 of the 17 capability flags stay hand-declared (envelope shape)
+
+`mode`/`riskEvidence`/`hint`/`delivery` have no snapshot data source (design.md: "envelope-shape flags with
+no data source in the snapshot"). They come from `capabilities/native-cli-history.json`'s `envelopeFlags`
+for the pinned version, which `deriveCapabilityRow` requires to exist and be all-boolean — proven by
+`deriveCapabilityRow fails naming the version when envelopeFlags is missing` (5.5) and
+`...fails when an envelopeFlags column is not a boolean`.
+
+## REQUIRED_SCHEMAS and mandatory features stay hand-authored (documented scope boundary)
+
+The checked-in `capabilities/review-integration-v2.semantic.json` mirror carries `operations`, `gates`,
+`projections`, `features` — but no `schemas` array (that field exists only on the LIVE negotiated
+`review.capabilities` response `lib/review-integration-v2.ts` decodes at runtime, a strictly larger
+surface than the offline pack-time mirror; this exact gap was already documented in P2b's design D5 note).
+`REQUIRED_SCHEMAS` therefore stays hand-authored in `lib/review-integration-v2.ts`, unlike
+`REQUIRED_OPERATIONS`/`REQUIRED_GATES`/`REQUIRED_PROJECTIONS`, which now come from
+`lib/gentle-ai-required-floor.generated.ts`. Both boundaries are commented in place, not silently applied.
+
+## Files Changed
+
+| File | Action | What Was Done |
+|---|---|---|
+| `capabilities/native-cli-history.json` | Created | 12 frozen historical `NATIVE_CLI_CONTRACTS` rows moved verbatim (13 capability flags + 4 envelope flags each), original inline comments re-emitted as `notes` arrays. |
+| `scripts/build-gentle-ai-baselines.mjs` | Created | `--write`/`--check` generator (CLI shape of `build-git-commit-transaction-runner.mjs:34-60`, plus an `isMainModule` guard — see Deviations) emitting `lib/gentle-ai-required-floor.generated.ts`: monotone `REQUIRED_OPERATIONS`/`REQUIRED_GATES`/`REQUIRED_PROJECTIONS`, exact-set mandatory-feature validation, and the derived/cross-checked `NATIVE_CLI_CONTRACTS`. |
+| `lib/gentle-ai-required-floor.generated.ts` (+ `runtime/gentle-ai-required-floor.generated.mjs`) | Created (generated) | `REQUIRED_OPERATIONS`/`REQUIRED_GATES`/`REQUIRED_PROJECTIONS`/`NATIVE_CLI_CONTRACTS`/`NativeCliCapability`, written by `--write`, verified by `--check`. Registered as `"gentle-ai-required-floor.generated"` in `scripts/build-git-commit-transaction-runner.mjs`'s `sources` list for its own `.ts` -> `.mjs` transpile. |
+| `lib/review-integration-v2.ts` (+ runtime) | Modified | Imports `REQUIRED_OPERATIONS`/`REQUIRED_GATES`/`REQUIRED_PROJECTIONS` from the generated floor instead of defining them inline; `REQUIRED_SCHEMAS`/`REQUIRED_MANDATORY_FEATURES`/`FEATURE_NAMES`/`OPTIONAL_FEATURE_NAMES` unchanged, with an explanatory comment on why each stays hand-authored. |
+| `lib/native-review-cli.ts` (+ runtime) | Modified | Imports `NATIVE_CLI_CONTRACTS`/`NativeCliCapability` from the generated floor and re-exports `NATIVE_CLI_CONTRACTS` (public API preserved); the ~55-line hand-authored table + `ORGANIC_PARITY_DARK` helper deleted. |
+| `scripts/verify-package-files.mjs` | Modified | `requiredPaths` gains `lib/gentle-ai-required-floor.generated.ts`, `runtime/gentle-ai-required-floor.generated.mjs`, `scripts/build-gentle-ai-baselines.mjs`. |
+| `.github/workflows/ci.yml` | Modified | Added "Verify generated gentle-ai baselines" step running `node scripts/build-gentle-ai-baselines.mjs --check`, offline, after "Verify package contents". |
+| `package.json` | Modified | Added `build:gentle-ai-baselines`/`check:gentle-ai-baselines` convenience scripts, mirroring the existing `*-transaction-runner` pair. |
+| `tests/build-gentle-ai-baselines.test.ts` | Created | 19 tests: pure-function coverage for every RED scenario in 5.1-5.5, carry-forward/disagreement cross-check coverage, a render/parse round trip, and 3 real-subprocess end-to-end tests (`--check` against the real repo, `--write` idempotency, `--write` failing a shrunk fixture). |
+| `openspec/changes/consume-gentle-ai-release-artifacts/tasks.md` | Modified | Ticked `[x]` for tasks 5.1-5.10. |
+
+## TDD Cycle Evidence (P3a)
+
+| Task | RED | GREEN | REFACTOR |
+|---|---|---|---|
+| 5.1 | `monotoneFloor accepts a snapshot that adds a new required name` written before `scripts/build-gentle-ai-baselines.mjs` existed; whole test file failed with `ERR_MODULE_NOT_FOUND` (proven by temporarily moving the script aside and re-running -- see Work Unit Evidence) | `monotoneFloor` implemented; test passes | Shared by 5.2 (same function, opposite branch) |
+| 5.2 | `monotoneFloor rejects a snapshot that drops a previously required name` + `...names every disappeared entry, not only the first` | Same `monotoneFloor` implementation | Clean -- one function, no duplication |
+| 5.3 | `assertMandatoryFeaturesSupported fails naming an advertised mandatory feature Pi does not support, never auto-adding it` | `assertMandatoryFeaturesSupported` implemented against `PI_SUPPORTED_MANDATORY_FEATURES` | Clean |
+| 5.4 | `deriveCapabilityRow fails with the exact unmapped-operation message...` asserts the byte-exact spec message | `deriveCapabilityRow`'s unmapped-operation guard, checked against every advertised operation before any column is populated | `OPERATION_COLUMN_MAP` extracted as a named, documented constant rather than an inline literal |
+| 5.5 | `deriveCapabilityRow fails naming the version when envelopeFlags is missing...` + `...fails when an envelopeFlags column is not a boolean` | `deriveCapabilityRow`'s envelope-flags presence/shape guard, checked first | Clean |
+| 5.6/5.7 | N/A -- generator/data creation tasks, not themselves behaviors under test | `capabilities/native-cli-history.json` + `scripts/build-gentle-ai-baselines.mjs` created; `--write` against the real repo reproduces the 12 original rows byte-identical | `renderGeneratedFloorModule`/`parseRequiredFloorModule` factored out and round-trip tested independently |
+| 5.8 | Pre-existing test `tests/native-review-capability-contract.test.ts` (unmodified) is the regression lock: it already asserted exact row values/order/dark-column invariants against `NATIVE_CLI_CONTRACTS` imported from `lib/native-review-cli.ts` | Rewiring `lib/native-review-cli.ts`/`lib/review-integration-v2.ts` to import from the generated floor; all 8 pre-existing tests in that file still pass unmodified | `ORGANIC_PARITY_DARK` helper and the 55-line inline table deleted entirely from `lib/native-review-cli.ts` |
+| 5.9 | N/A -- CI wiring | `.github/workflows/ci.yml` step added | N/A |
+| 5.10 | N/A -- verification task | `pnpm test` (minus the one documented environmental failure) and `node scripts/build-gentle-ai-baselines.mjs --check` both pass | N/A |
+
+## Work Unit Evidence (P3a)
+
+| Evidence | Value |
+|---|---|
+| Focused test command and exact result | `node --experimental-strip-types --test tests/build-gentle-ai-baselines.test.ts tests/native-review-capability-contract.test.ts` -> `pass 26 fail 0`. RED baseline proven by temporarily moving `scripts/build-gentle-ai-baselines.mjs` aside and re-running the same command: `ERR_MODULE_NOT_FOUND`, 1 file failing, 0 passing -- then restored and all 19 new tests plus the 7 pre-existing capability-contract tests passed on the very first implementation (no fix-forward iterations were needed once the design's operation/carry-forward/cross-check model was written down). |
+| Runtime harness command/scenario and exact result | `node scripts/build-gentle-ai-baselines.mjs --check` -> `gentle-ai baselines match their checked-in sources (lib/gentle-ai-required-floor.generated.ts)` (this unit's own harness command per tasks.md's Suggested Work Units table). Also: `node scripts/build-git-commit-transaction-runner.mjs --check` -> `commit transaction runtime matches TypeScript sources (6 modules)`; `node scripts/verify-package-files.mjs` -> `gentle-pi package resource check passed (72 files; 66 lock-pinned mirror artifacts at release v2.2.3).` |
+| Rollback boundary | Delete `capabilities/native-cli-history.json`, `scripts/build-gentle-ai-baselines.mjs`, `lib/gentle-ai-required-floor.generated.ts`, `runtime/gentle-ai-required-floor.generated.mjs`, `tests/build-gentle-ai-baselines.test.ts`; revert the one-line `sources` entry in `scripts/build-git-commit-transaction-runner.mjs`; restore the hand-authored `REQUIRED_OPERATIONS`/`REQUIRED_GATES`/`REQUIRED_PROJECTIONS` in `lib/review-integration-v2.ts` and the hand-authored `NATIVE_CLI_CONTRACTS` table in `lib/native-review-cli.ts` (both fully preserved in this diff's removed lines); revert the CI step, the two requiredPaths entries, and the two package.json scripts. No P1/P2 trust code (decoder, sync, installer, assets resolution) is touched by this unit. |
+
+## Full-suite proof (`pnpm test`)
+
+`node --experimental-strip-types --test tests/*.test.ts` -> `tests 1115 / pass 1102 / fail 1 / skipped 12`.
+The 1 failure is `tests/native-review-cli.test.ts`'s "native output limits dominate killed timeout
+signals..." test -- the same pre-existing, sandbox-only failure already documented in P2b's evidence (no
+network access here, so `.gentle-ai/v2.2.3/gentle-ai` was never installed by `postinstall`). Confirmed
+identical on the unmodified P2b tip via `git stash -u`: the same command fails the exact same way before
+any of this unit's changes exist. `pnpm run test:harness` (chained by `pnpm test`) also fails in this
+sandbox with the same documented cause as P2a/P2b (`pnpm install`'s dependency-status recheck needs
+network); reproduced identically via `git stash -u` against the unmodified tip. Neither failure is new or
+related to this unit.
+
+## Deviations from Design
+
+1. **`isMainModule` guard, not an unconditional top-level `main()` call.** `build-git-commit-transaction-runner.mjs`
+   runs `main()` unconditionally at module load; `scripts/build-gentle-ai-baselines.mjs` instead uses the
+   `isMainModule` guard pattern already established in `scripts/verify-package-files.mjs`. This is required,
+   not stylistic: `tests/build-gentle-ai-baselines.test.ts` imports the script's pure functions directly
+   (`monotoneFloor`, `deriveCapabilityRow`, etc.), and an unconditional `main()` would attempt real
+   filesystem/process side effects (and set `process.exitCode`) as a side effect of merely importing the
+   module for testing.
+2. **`OPERATION_COLUMN_MAP` is a hand-maintained allowlist with explicit `null` entries**, not a pure
+   `review.<op> -> column` total function over the snapshot's operations. See "Only 13 of the 17... " above
+   -- the real snapshot only supports 5 direct name matches; the design's "13 of 17" figure describes the
+   column count needing derivation, not a 1:1 name correspondence with today's actual operations list.
+3. **`CARRY_FORWARD_COLUMNS`** for the 8 legacy CLI columns with no `operations[]` counterpart at all is an
+   addition beyond the design's literal text (which describes only the operation-mapped and
+   history-envelope-sourced parts). Documented here rather than silently introduced; proven by
+   `deriveCapabilityRow carries legacy CLI columns forward...` and
+   `...fails when a carry-forward column has no prior frozen row to carry from`.
+4. **`knownRow` cross-check** in `deriveCapabilityRow` (comparing the freshly derived current-version row
+   against history.json's own recorded entry for that version, when one exists) is an addition beyond the
+   literal task list -- a defense-in-depth self-consistency proof, not a requirement any RED test names
+   directly, though `deriveCapabilityRow fails when the freshly derived row disagrees with its known
+   historical record` covers it.
+
+## Issues Found
+
+None. This worktree's `node_modules` did not exist at session start (fresh worktree, no prior `pnpm
+install`); running `pnpm install` succeeded from the local pnpm store with no network access needed for
+dependencies themselves, but its `postinstall` step still failed to download the `.gentle-ai/v2.2.3`
+binary (`HTTP 404`, no network) -- the same environment condition already documented in every prior unit
+of this tracker, cascading into the one documented `tests/native-review-cli.test.ts` failure above.
+
+## Remaining Tasks
+
+- [ ] PR 6 -- P3b through PR 8 -- P4: not started.
+
+## Workload / PR Boundary (P3a)
+
+- Mode: feature-branch-chain, `size:exception` (tasks.md: `Delivery strategy: exception-ok`)
+- Current work unit: P3a (PR 5, base: P2b's branch `feat/release-assets-windows`)
+- Boundary: `scripts/build-gentle-ai-baselines.mjs` (new), `capabilities/native-cli-history.json` (new),
+  the generated floor pair (new), its test file (new), and the `lib/review-integration-v2.ts`/
+  `lib/native-review-cli.ts` rewiring (+ their generated runtime counterparts). `scripts/verify-package-files.mjs`
+  gains three `requiredPaths` entries; `.github/workflows/ci.yml` gains one offline check step; `package.json`
+  gains two convenience scripts. No installer, binary-resolution, assets, sync-script, mirror/lock, or
+  Windows-provenance file touched -- P1/P2 trust code is entirely untouched by this unit.
+- Estimated review budget impact: tasks.md forecast ~300 changed lines for P3a. Authored diff across
+  existing files (`git diff --stat`, excluding generated `.ts`/`.mjs` goldens) is ~71 insertions / ~126
+  deletions (net negative -- deleting the 55-line hand-authored table more than offsets the new imports).
+  New authored files add `scripts/build-gentle-ai-baselines.mjs` (303 lines), `tests/build-gentle-ai-baselines.test.ts`
+  (255 lines), and `capabilities/native-cli-history.json` (271 lines, mechanically restructured from
+  pre-existing hand-authored data, not newly invented content). `lib/gentle-ai-required-floor.generated.ts`
+  (35 lines) and `runtime/gentle-ai-required-floor.generated.mjs` (35 lines) are generated goldens, excluded
+  from authored risk count per the review workload guard. Total authored new-file lines (~829) plus the
+  existing-file diff push this unit above the 400-line budget, already covered by the tracker-wide
+  `Delivery strategy: exception-ok` (tasks.md: `400-line budget risk: High`, `Decision needed before apply:
+  No`).
+
+## Status (P3a)
+
+10/10 tasks in PR 5 (P3a) complete. 47/47 tasks total across P1a+P1b+P2a+P2b+P3a. Ready for `sdd-verify`,
+or for `sdd-apply` to continue with PR 6 (P3b) in a fresh batch, on a new branch based on this one
+(`feat/release-artifact-generators`).

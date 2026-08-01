@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, posix, win32 } from "node:path";
 import { promisify } from "node:util";
 import { GENTLE_AI_VERSION, PackageLocalGentleAiBinaryMissingError, resolveGentleAiBinary } from "./gentle-ai-binary.mjs";
+import { NATIVE_CLI_CONTRACTS,                          } from "./gentle-ai-required-floor.generated.mjs";
 import {
 	REVIEW_INTEGRATION_CONTRACT,
 	decodeReviewCapabilitiesV2,
@@ -635,61 +636,13 @@ const NATIVE_GATE = ["post-apply", "pre-commit", "pre-push", "pre-pr", "release"
 const NATIVE_SDD_NEXT_ACTION = ["apply", "verify", "remediate", "archive", "review", "resolve-review", "resolve-blockers", "sdd-new", "select-change", "propose", "spec", "design", "tasks"]         ;
 const NATIVE_SDD_POST_REVIEW_ACTION = ["verify", "archive"]         ;
 
-// Organic-parity columns (mode, riskEvidence, hint, delivery) stay false on
-// every shipped row, including "2.1.11". PI-2 adds the first capability-true
-// row (and bumps the triple pin) in one dedicated commit — never one without
-// the other. See Design Decision #1 (organic-rdd-parity).
-const ORGANIC_PARITY_DARK = { mode: false, riskEvidence: false, hint: false, delivery: false }         ;
-
-export const NATIVE_CLI_CONTRACTS = Object.freeze({
-	"2.1.4": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: false, inventory: false, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.5": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.6": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.7": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.8": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: false, quarantineLegacy: false, reconcileAuthority: true, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.9": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.10": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, ...ORGANIC_PARITY_DARK }),
-	"2.1.11": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, ...ORGANIC_PARITY_DARK }),
-	// First capability-true row, paired with the triple pin bump in this same
-	// commit as Design Decision #1 requires.
-	//
-	// Only two of the four organic-parity columns are lit, because a capability
-	// row is a promise and these are the two whose data was proven to reach the
-	// negotiated path Pi actually consumes:
-	//
-	//   mode      `gentle-ai review mode status` answers the review-mode/v1
-	//             envelope directly.
-	//   delivery  the gate result carries `delivery` ("disabled/unmanaged" when
-	//             the kill switch is off), verified against v2.2.0.
-	//
-	// riskEvidence and hint stay dark deliberately. Both exist in gentle-ai
-	// v2.2.0 but only on the PLAIN start envelope; the negotiated
-	// `review-integration.start/v2` that NativeReviewCliV216 decodes carries
-	// `risk_reasons` instead of `risk_evidence` and omits `hint` entirely.
-	// Lighting them would advertise data that cannot arrive. Closing that gap
-	// needs the negotiated start envelope extended upstream, which moves a
-	// byte-pinned fixture and therefore belongs to a gentle-ai release, not to
-	// a Pi capability flip.
-	"2.2.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
-	// 2.2.1 repeats 2.2.0 because the wire did not move for the lane Pi speaks.
-	// v2.2.1 advertises capabilities/v1.5 (protocol minor 5) on
-	// review-integration/v1, but the negotiated start envelope is still the
-	// closed `start/v2`, so riskEvidence and hint stay dark for the same reason
-	// they are dark on 2.2.0. The release does publish a second contract,
-	// review-integration/v2, whose `start/v3` carries base/candidate trees --
-	// but Pi does not negotiate it yet, and a row must describe the lane in use.
-	"2.2.1": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
-	// 2.2.2 repeats 2.2.1 for the same reason, confirmed against the released
-	// v2.2.2 binary rather than assumed: on review-integration/v1 it still
-	// advertises capabilities/v1.5 and the negotiated start envelope is still
-	// the closed `start/v2`, so riskEvidence and hint still cannot arrive.
-	"2.2.2": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
-	// Ground-truthed against the released v2.2.3 binary: the v2 lane remains
-	// protocol 2.0 with the same operation set and closed START fields consumed
-	// by Pi, so the existing capability columns are unchanged.
-	"2.2.3": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
-});
-
+// NATIVE_CLI_CONTRACTS is generated (D7, scripts/build-gentle-ai-baselines.mjs)
+// from capabilities/native-cli-history.json (12 frozen historical rows,
+// moved verbatim, never recomputed) plus the currently pinned version's row,
+// derived fresh each generation from the checked-in semantic capability
+// snapshot's `operations[]` and native-cli-history.json's `envelopeFlags`.
+// See lib/gentle-ai-required-floor.generated.ts and design.md D7.
+export { NATIVE_CLI_CONTRACTS };
 
 // Testing-only capability overlay: lets tests exercise mode/riskEvidence/hint/
 // delivery decode paths under a synthetic version key without ever making a
