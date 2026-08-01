@@ -3,7 +3,10 @@ import { lstatSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 
 const CODEGRAPH_OPERATION = {
 	INIT: "init",
@@ -18,8 +21,7 @@ const CODEGRAPH_STATUS = {
 
 type CodeGraphOperation =
 	(typeof CODEGRAPH_OPERATION)[keyof typeof CODEGRAPH_OPERATION];
-type CodeGraphStatus =
-	(typeof CODEGRAPH_STATUS)[keyof typeof CODEGRAPH_STATUS];
+type CodeGraphStatus = (typeof CODEGRAPH_STATUS)[keyof typeof CODEGRAPH_STATUS];
 
 export interface CodeGraphToolParameters {
 	operation: CodeGraphOperation;
@@ -42,6 +44,7 @@ interface CodeGraphFallbackDetails {
 	status: CodeGraphStatus;
 	operation: CodeGraphOperation;
 	cwd: string;
+	args: string[];
 	fallback: string;
 }
 
@@ -68,27 +71,65 @@ const PROCESS_MAX_BUFFER = MAX_OUTPUT_CHARS * 2;
 const FALLBACK_INSTRUCTIONS = "Use read, grep, and find for this exploration.";
 const execFileAsync = promisify(execFile);
 
+type ExecFileResult = Promise<CodeGraphCommandResult>;
+type ExecFileFunction = (
+	file: string,
+	args: string[],
+	options: { cwd: string; signal?: AbortSignal; maxBuffer: number },
+) => ExecFileResult;
+
+interface CodeGraphRunnerDependencies {
+	execFile?: ExecFileFunction;
+}
+
+export function createCodeGraphRunner(
+	dependencies: CodeGraphRunnerDependencies = {},
+): CodeGraphRunner {
+	const execute =
+		dependencies.execFile ?? (execFileAsync as unknown as ExecFileFunction);
+	return async (args, options) =>
+		execute("codegraph", [...args], {
+			cwd: options.cwd,
+			signal: options.signal,
+			maxBuffer: options.maxBuffer,
+		});
+}
+
 function resolveWorkspaceCwd(cwd: string): string {
 	const resolved = realpathSync(cwd);
 	if (!lstatSync(resolved).isDirectory()) {
-		throw new Error("CodeGraph can run only in the current workspace directory.");
+		throw new Error(
+			"CodeGraph can run only in the current workspace directory.",
+		);
 	}
-	if (resolved === realpathSync(homedir()) || resolved === realpathSync(tmpdir())) {
-		throw new Error("CodeGraph requires a real Git project root equal to the current workspace, not HOME or a temporary directory.");
+	if (
+		resolved === realpathSync(homedir()) ||
+		resolved === realpathSync(tmpdir())
+	) {
+		throw new Error(
+			"CodeGraph requires a real Git project root equal to the current workspace, not HOME or a temporary directory.",
+		);
 	}
 	try {
-		const root = realpathSync(execFileSync("git", ["rev-parse", "--show-toplevel"], {
-			cwd: resolved,
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "ignore"],
-		}).trim());
+		const root = realpathSync(
+			execFileSync("git", ["rev-parse", "--show-toplevel"], {
+				cwd: resolved,
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "ignore"],
+			}).trim(),
+		);
 		if (root !== resolved) {
-			throw new Error("CodeGraph requires a real Git project root equal to the current workspace.");
+			throw new Error(
+				"CodeGraph requires a real Git project root equal to the current workspace.",
+			);
 		}
 		return resolved;
 	} catch (error) {
-		if (error instanceof Error && /real Git project root/.test(error.message)) throw error;
-		throw new Error("CodeGraph requires a real Git project root equal to the current workspace.");
+		if (error instanceof Error && /real Git project root/.test(error.message))
+			throw error;
+		throw new Error(
+			"CodeGraph requires a real Git project root equal to the current workspace.",
+		);
 	}
 }
 
@@ -96,10 +137,18 @@ function assertSafeIndexDirectory(cwd: string): void {
 	try {
 		const index = lstatSync(join(cwd, ".codegraph"));
 		if (index.isSymbolicLink() || !index.isDirectory()) {
-			throw new Error("CodeGraph .codegraph must be a real directory when it already exists.");
+			throw new Error(
+				"CodeGraph .codegraph must be a real directory when it already exists.",
+			);
 		}
 	} catch (error: unknown) {
-		if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return;
+		if (
+			typeof error === "object" &&
+			error !== null &&
+			"code" in error &&
+			error.code === "ENOENT"
+		)
+			return;
 		throw error;
 	}
 }
@@ -107,14 +156,18 @@ function assertSafeIndexDirectory(cwd: string): void {
 function resolveLimit(limit: number | undefined): number {
 	if (limit === undefined) return DEFAULT_LIMIT;
 	if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
-		throw new Error(`CodeGraph limit must be an integer between 1 and ${MAX_LIMIT}.`);
+		throw new Error(
+			`CodeGraph limit must be an integer between 1 and ${MAX_LIMIT}.`,
+		);
 	}
 	return limit;
 }
 
 function requireQuery(query: string | undefined): string {
 	if (typeof query !== "string" || query.trim().length === 0) {
-		throw new Error("CodeGraph query is required for query and explore operations.");
+		throw new Error(
+			"CodeGraph query is required for query and explore operations.",
+		);
 	}
 	if (query.length > 2_000) {
 		throw new Error("CodeGraph query must not exceed 2000 characters.");
@@ -122,7 +175,10 @@ function requireQuery(query: string | undefined): string {
 	return query;
 }
 
-function commandArguments(parameters: CodeGraphToolParameters, cwd: string): string[] {
+function commandArguments(
+	parameters: CodeGraphToolParameters,
+	cwd: string,
+): string[] {
 	switch (parameters.operation) {
 		case CODEGRAPH_OPERATION.INIT:
 			return [CODEGRAPH_OPERATION.INIT, cwd];
@@ -163,12 +219,22 @@ function codeGraphFailureDetails(
 	error: unknown,
 	operation: CodeGraphOperation,
 	cwd: string,
+	args: readonly string[],
 ): CodeGraphFallbackDetails {
 	const status =
-		typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT"
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		error.code === "ENOENT"
 			? CODEGRAPH_STATUS.UNAVAILABLE
 			: CODEGRAPH_STATUS.FAILED;
-	return { status, operation, cwd, fallback: FALLBACK_INSTRUCTIONS };
+	return {
+		status,
+		operation,
+		cwd,
+		args: [...args],
+		fallback: FALLBACK_INSTRUCTIONS,
+	};
 }
 
 function codeGraphFailureMessage(status: CodeGraphStatus): string {
@@ -177,22 +243,18 @@ function codeGraphFailureMessage(status: CodeGraphStatus): string {
 		: `CodeGraph failed to run. ${FALLBACK_INSTRUCTIONS}`;
 }
 
-const runCodeGraphCommand: CodeGraphRunner = async (args, options) => {
-	const result = await execFileAsync("codegraph", [...args], {
-		cwd: options.cwd,
-		signal: options.signal,
-		maxBuffer: options.maxBuffer,
-	});
-	return { stdout: result.stdout, stderr: result.stderr };
-};
+const runCodeGraphCommand = createCodeGraphRunner();
 
-export function createCodeGraphTool(runner: CodeGraphRunner = runCodeGraphCommand) {
+export function createCodeGraphTool(
+	runner: CodeGraphRunner = runCodeGraphCommand,
+) {
 	return {
 		name: "codegraph",
 		label: "CodeGraph",
 		description:
 			"Initialize, search, or explore the CodeGraph index for the current Pi workspace only. This tool never accepts a project path or shell command.",
-		promptSnippet: "Initialize and query CodeGraph for the current workspace without shell access",
+		promptSnippet:
+			"Initialize and query CodeGraph for the current workspace without shell access",
 		promptGuidelines: [
 			"Use operation init before querying when the current workspace has no .codegraph index.",
 			"Use query for symbol search and explore for source plus call paths. Do not use this tool to run arbitrary commands or target another directory.",
@@ -210,16 +272,37 @@ export function createCodeGraphTool(runner: CodeGraphRunner = runCodeGraphComman
 			assertSafeIndexDirectory(cwd);
 			const args = commandArguments(parameters, cwd);
 			try {
-				const result = await runner(args, { cwd, signal, maxBuffer: PROCESS_MAX_BUFFER });
-				const output = truncateOutput([result.stdout, result.stderr].filter(Boolean).join("\n"));
+				const result = await runner(args, {
+					cwd,
+					signal,
+					maxBuffer: PROCESS_MAX_BUFFER,
+				});
+				const output = truncateOutput(
+					[result.stdout, result.stderr].filter(Boolean).join("\n"),
+				);
 				return {
-					content: [{ type: "text" as const, text: output || "CodeGraph completed without output." }],
+					content: [
+						{
+							type: "text" as const,
+							text: output || "CodeGraph completed without output.",
+						},
+					],
 					details: { operation: parameters.operation, cwd, args },
 				};
 			} catch (error: unknown) {
-				const details = codeGraphFailureDetails(error, parameters.operation, cwd);
+				const details = codeGraphFailureDetails(
+					error,
+					parameters.operation,
+					cwd,
+					args,
+				);
 				return {
-					content: [{ type: "text" as const, text: codeGraphFailureMessage(details.status) }],
+					content: [
+						{
+							type: "text" as const,
+							text: codeGraphFailureMessage(details.status),
+						},
+					],
 					details,
 				};
 			}
