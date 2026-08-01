@@ -35,28 +35,36 @@ jobs:
         env:
           GENTLE_PI_REQUIRE_NATIVE_BINARY: "1"
 
-      # Offline mirror + capabilities/gentle-ai-release.lock.json reconciliation
-      # (contracts/, docs/gentle-ai/, capabilities/*.semantic.json) runs here,
-      # fully offline. Only scripts/sync-gentle-ai-release.mjs --write, invoked
-      # exclusively by the not-yet-landed pin-bump job, ever downloads or
-      # verifies a minisign signature; no job in this workflow does.
-      - name: Verify package contents
-        run: node scripts/verify-package-files.mjs
-
-      # Generated NATIVE_CLI_CONTRACTS row + REQUIRED_* floors (D7): offline,
-      # reads only the checked-in semantic snapshot, lock, and
-      # capabilities/native-cli-history.json. Only scripts/bump-gentle-ai-pin.mjs
-      # (P4) ever runs this with --write.
-      - name: Verify generated gentle-ai baselines
-        run: node scripts/build-gentle-ai-baselines.mjs --check
-
-      # Skill vendor + overlay reconciliation (D8): offline, reads only the
-      # checked-in vendored bodies (skills/_vendor/**), their recorded
-      # digests (skills/_vendor/manifest.json), and each overlay.md. Catches
-      # a hand-edited vendored file and a stale overlay anchor before either
-      # reaches skills/<name>/SKILL.md.
-      - name: Verify generated skill overlays
-        run: node scripts/build-skill-overlays.mjs --check
+      # The complete offline `--check` set (design.md "Data Flow" — "EVERY PR
+      # (offline)"), assembled as one integration gate. Every command here
+      # reads only checked-in state and never touches the network:
+      #
+      #   1. mirrors + lock — contracts/, docs/gentle-ai/,
+      #      capabilities/*.semantic.json reconciled against
+      #      capabilities/gentle-ai-release.lock.json, PLUS the phase-coverage
+      #      gate (D9): assets/agents/** and assets/chains/** reconciled
+      #      against assets/phase-coverage.json. A provider-declared phase
+      #      with no Pi binding WARNS (named, non-fatal — the provider's fast
+      #      release cadence adds phases regularly); a Pi agent binding
+      #      naming no declared phase and not listed Pi-only FAILS (a real
+      #      inconsistency in Pi's own configuration).
+      #   2. baselines (D7) — generated NATIVE_CLI_CONTRACTS row + REQUIRED_*
+      #      floors, reads only the checked-in semantic snapshot, lock, and
+      #      capabilities/native-cli-history.json.
+      #   3. skill overlays (D8) — checked-in vendored bodies
+      #      (skills/_vendor/**), their recorded digests
+      #      (skills/_vendor/manifest.json), and each overlay.md. Catches a
+      #      hand-edited vendored file and a stale overlay anchor before
+      #      either reaches skills/<name>/SKILL.md.
+      #
+      # Only scripts/sync-gentle-ai-release.mjs --write (the not-yet-landed
+      # pin-bump job, P4) ever downloads or verifies a minisign signature; no
+      # step in this workflow does.
+      - name: Verify offline checks (mirrors/lock, phase coverage, baselines, skill overlays)
+        run: |
+          node scripts/verify-package-files.mjs --check
+          node scripts/build-gentle-ai-baselines.mjs --check
+          node scripts/build-skill-overlays.mjs --check
 
       - name: Verify packed installation
         run: pnpm run test:packed-runner

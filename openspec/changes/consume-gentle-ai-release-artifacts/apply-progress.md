@@ -1,7 +1,7 @@
 # Apply Progress: consume-gentle-ai-release-artifacts
 
-> Cumulative across batches: **PR 1 / P1a** through **PR 6 / P3b**, all complete
-> (tasks 1.1-6.8). PR 7 (P3c) and later are NOT started.
+> Cumulative across batches: **PR 1 / P1a** through **PR 7 / P3c**, all complete
+> (tasks 1.1-7.8). PR 8 (P4) is NOT started.
 
 ## Completed Tasks
 
@@ -864,3 +864,168 @@ None new. Same `node_modules`/`postinstall` HTTP 404 environment condition docum
 8/8 tasks in PR 6 (P3b) complete. 55/55 tasks total across P1a+P1b+P2a+P2b+P3a+P3b. Ready for `sdd-verify`,
 or for `sdd-apply` to continue with PR 7 (P3c) in a fresh batch, on a new branch based on this one
 (`feat/skill-vendor-overlay`).
+
+---
+
+# PR 7 / P3c — Phase-coverage gate + generic evidence harness
+
+**Worktree**: `gentle-pi-worktrees/p3c`, **branch**: `feat/phase-coverage-evidence`, based on P3b's
+`feat/skill-vendor-overlay`.
+
+## Maintainer decision superseding tasks.md 7.1 (recorded, not silently deviated)
+
+Task 7.1's wording says a provider-declared phase with no Pi binding "fails". **The maintainer decided it
+WARNS instead**, naming the missing phase, and does **not** fail CI. Reasoning, as given: under the
+provider's fast release cadence new phases appear regularly, and blocking the build for a phase nobody has
+decided to implement yet trains people to ignore the gate — a gate that cries wolf gets muted, and then it
+protects nothing.
+
+**The reverse direction is unchanged and still fails**: a Pi agent binding naming no declared phase, and not
+listed Pi-only, is a real inconsistency in Pi's own configuration (not a provider-cadence problem) and
+breaks the build.
+
+Implemented as `phaseCoverageGate()` in `scripts/verify-package-files.mjs`: `missingBindings` (forward
+direction) are reported with `console.warn` and never reach a `process.exit(1)` branch; `unknownBindings`
+(reverse direction) are reported with `console.error` and do reach `process.exit(1)`. The two arrays are
+computed and handled through entirely separate code paths — there is no shared branch that could
+accidentally promote a warning into a failure or vice versa.
+
+## Design interpretation note: reverse check scope is `assets/agents/**` only
+
+`design.md` D9 titles the gate "for `assets/agents/**` and `assets/chains/**`" and task 7.1 says "a Pi
+binding naming no declared phase … fails" without restricting that to agents. In practice, reconciling the
+**real** trees settles this: gentle-ai (`~/work/gentle-ai`, `internal/assets/claude/agents/`) declares
+exactly 18 phases (`jd-fix-agent`, `jd-judge-a`, `jd-judge-b`, `review-readability`, `review-refuter`,
+`review-reliability`, `review-resilience`, `review-risk`, `sdd-apply`, `sdd-archive`, `sdd-design`,
+`sdd-explore`, `sdd-init`, `sdd-onboard`, `sdd-propose`, `sdd-spec`, `sdd-tasks`, `sdd-verify`) and **has no
+`chains/` directory at all** (confirmed by direct filesystem check, matching design.md's "upstream has no
+chains/ directory at all"). Pi's `assets/agents/**` has 24 files: those 18 (with `sdd-proposal` ↔
+`sdd-propose` aliased) plus the 6 declared-Pi-only names from task 7.3 — an exact 18+6=24 reconciliation with
+**zero** extra Pi-only entries needed. Pi's `assets/chains/**` has 4 files (`4r-review`, `sdd-full`,
+`sdd-plan`, `sdd-verify`); 3 of those 4 names match no declared phase and aren't in task 7.3's fixed Pi-only
+list. Since task 7.3 gives an exact, closed Pi-only set (not "at least"), the only interpretation that
+reconciles the real tree without inventing unauthorized Pi-only entries is: the **reverse** check walks only
+`assets/agents/**` (chains compose multiple phases into Pi-only workflows and are not themselves
+single-phase bindings), while the **forward** check (does a declared phase have *some* binding) accepts
+either an agent or a chain name, per the task's literal "Pi agent/chain binding" wording. This is documented
+in `scripts/verify-package-files.mjs`'s gate comment, not just here.
+
+## `issue-creation` is never touched (task 7.2)
+
+`phaseCoverageBindings()` reads only `assets/agents/**` and `assets/chains/**` — it never lists or opens
+anything under `skills/`. Proven directly: a fixture test
+(`tests/verify-package-files.test.ts` "skills/issue-creation/SKILL.md is never read or flagged") builds a
+temp tree with `assets/agents/sdd-apply.md`, `assets/chains/sdd-plan.chain.md`, and
+`skills/issue-creation/SKILL.md` side by side, and asserts `issue-creation` appears in neither
+`agentNames`/`chainNames` nor any gate output.
+
+## Generic S/R evidence ledger harness (tasks 7.5/7.6)
+
+`tests/evidence/ledger.ts` — reuses the **exact** `evidence.class` discipline
+`lib/release-artifact.ts`'s `RELEASE_ARTIFACT_EVIDENCE_CLASS` already carries (`development/bootstrap` = S,
+`release` = R — the same values persisted into the checked-in `capabilities/gentle-ai-release.lock.json`'s
+`evidence.class` field), rather than inventing a parallel S/R vocabulary. It is deliberately generic — no
+gentle-ai-specific fields (no signature, no repository, no tag) — so Wave 1 changes can build their own S-vs-R
+evidence ledgers directly on `EvidenceLedger`/`createEvidenceRecord`/`assertNeverRelabeledFromBootstrap`
+without reimplementing the shape. The invariant (an S-class record can never be relabeled R) is enforced
+twice: once as a standalone assertion function, and once on `EvidenceLedger.record()`'s own mutation path (a
+rejected S→R attempt never mutates the ledger — proven by
+`tests/evidence.test.ts` "EvidenceLedger.record enforces the invariant on the mutation path itself").
+
+## TDD Cycle Evidence
+
+| Task | Test File | RED | GREEN | REFACTOR |
+|------|-----------|-----|-------|----------|
+| 7.1 | `tests/verify-package-files.test.ts` | ✅ Written referencing `phaseCoverageGate`/`phaseCoverageBindings` before they existed → whole-module `SyntaxError: ... does not provide an export named 'phaseCoverageBindings'` (`node --test tests/verify-package-files.test.ts` failed 1/1) | ✅ 8 new phase-coverage cases pass (21/21 in the file) | ✅ Clean — `bindingNamesFromDirectory` shared by both directory reads, `phaseCoverageGate` kept pure (no I/O), `phaseCoverageBindings` is the sole I/O boundary |
+| 7.2 | `tests/verify-package-files.test.ts` | ✅ Same RED (whole-module failure covers this case too — the fixture test importing the not-yet-existing exports) | ✅ "skills/issue-creation/SKILL.md is never read or flagged" passes | N/A |
+| 7.3 | `assets/phase-coverage.json` | N/A — data file | ✅ created; the "real assets/phase-coverage.json fully reconciles" test passes against the actual `assets/agents`/`assets/chains` trees | N/A |
+| 7.4 | `scripts/verify-package-files.mjs` | (covered by 7.1 RED) | ✅ `main()` wired: `console.warn` per missing binding, `process.exit(1)` only when `unknownBindings.length > 0` | ✅ Clean — reuses the file's existing "one gate, exact messages, never a silent boolean" pattern |
+| 7.5 | `tests/evidence.test.ts` | ✅ Written referencing `./evidence/ledger.ts` before it existed → `ERR_MODULE_NOT_FOUND` (`node --test tests/evidence.test.ts` failed 1/1) | ✅ 7/7 cases pass | ✅ Clean |
+| 7.6 | `tests/evidence/ledger.ts` | (covered by 7.5 RED) | ✅ `EVIDENCE_LEDGER_CLASS`, `createEvidenceRecord`, `assertNeverRelabeledFromBootstrap`, `EvidenceLedger` created | ✅ Clean — single-purpose module, no gentle-ai-specific coupling |
+| 7.7 | `.github/workflows/ci.yml` | N/A — CI config | ✅ 3 separate offline-check steps consolidated into one "Verify offline checks" step (`verify-package-files.mjs --check` now includes phase coverage; `build-gentle-ai-baselines.mjs --check`; `build-skill-overlays.mjs --check`) | N/A |
+| 7.8 | full suite | — | ✅ `node --experimental-strip-types --test tests/*.test.ts`: 1145/1145 collected, 1132 pass, 1 known pre-existing environmental fail, 12 skipped. `node scripts/verify-package-files.mjs --check` exits 0 against the real tree with zero warnings (full coverage already exists) | N/A |
+
+## Work Unit Evidence
+
+| Evidence | Value |
+|---|---|
+| Focused test command and exact result | `node --experimental-strip-types --test tests/verify-package-files.test.ts tests/evidence.test.ts` → 28/28 pass (21 pre-existing/updated `verify-package-files` cases including 8 new phase-coverage cases, 7 new `evidence.test.ts` cases) |
+| Runtime harness command/scenario and exact result | `node scripts/verify-package-files.mjs --check` against the real repository tree → exit 0, `gentle-pi package resource check passed (73 files; 66 lock-pinned mirror artifacts at release v2.2.3).`, zero phase-coverage warnings (full 18/18 declared-phase coverage already exists). Combined offline gate exactly as `ci.yml` runs it (`verify-package-files.mjs --check && build-gentle-ai-baselines.mjs --check && build-skill-overlays.mjs --check`) → exit 0. |
+| Rollback boundary | `git revert` of this unit's commits removes `assets/phase-coverage.json`, the phase-coverage gate block in `scripts/verify-package-files.mjs` (and its `requiredPaths` entry), `tests/evidence/**` + `tests/evidence.test.ts`, the phase-coverage test cases in `tests/verify-package-files.test.ts`, and reverts `.github/workflows/ci.yml`'s single combined step back to 3 separate steps — restoring exactly the P3b end state. No P1/P2/P3a/P3b file or behavior is touched by this unit. |
+
+## Proof: WARN path never fails CI, FAIL path does
+
+Direct inspection of `phaseCoverageGate()`'s two return arrays and `main()`'s two handling branches
+(`console.warn` only for `missingBindings`, `process.exit(1)` gated strictly on
+`unknownBindings.length > 0`), confirmed by calling the exported function directly:
+
+```
+WARN-only case:  {"missingBindings":["sdd-brand-new-phase"],"unknownBindings":[]}   -> would process.exit(1)? false
+FAIL case:       {"missingBindings":[],"unknownBindings":["gentle-ai-rogue"]}        -> would process.exit(1)? true
+```
+
+Also proven end-to-end against the real tree: `node scripts/verify-package-files.mjs --check` exits 0 with
+no output beyond the final success line, because the real tree currently has zero missing bindings and zero
+unknown bindings (18/18 declared phases bound, 24/24 Pi agent names accounted for).
+
+## Full-suite proof (`node --experimental-strip-types --test tests/*.test.ts`)
+
+`tests 1145 / pass 1132 / fail 1 / skipped 12` (1130 pre-existing + 15 new: 8 in
+`tests/verify-package-files.test.ts`, 7 in `tests/evidence.test.ts`). The 1 failure is the same
+pre-existing, sandbox-only, no-network `tests/native-review-cli.test.ts` "native output limits dominate
+killed timeout signals..." failure documented in every prior unit of this tracker. Not new, not related to
+this unit.
+
+`pnpm run test:harness` (`tests/runtime-harness.mjs`) also fails in this sandbox with an unrelated
+pre-existing environmental symptom of the same root cause (no native `.gentle-ai/v2.2.3/gentle-ai` binary
+installed, no network): "Gentle AI pre-pr gate could not reconsult review mode and failed closed." —
+confirmed via `git stash` to reproduce identically on the clean P3b tip before any P3c change, so it is not
+introduced by this unit. `pnpm test`/`pnpm install` still fail their own network step in this sandbox
+(`postinstall` HTTP 404 fetching the binary) exactly as documented in every prior unit; `pnpm install`
+still succeeds far enough to populate `node_modules` from the local pnpm store, so the direct
+`node --experimental-strip-types --test tests/*.test.ts` invocation was used, matching every prior unit's
+documented workaround.
+
+## Deviations from Design
+
+1. **Task 7.1's forward-direction "fails" wording is superseded by an explicit maintainer decision** (see
+   above) — the design's own D9 prose ("Failure names the missing binding") is ambiguous about severity for
+   the forward direction; the maintainer's instruction resolves it to WARN, non-fatal. The reverse direction
+   is unchanged (still fails).
+2. **The reverse ("Pi binding naming no declared phase") check is scoped to `assets/agents/**` only**, not
+   `assets/chains/**` — a design-interpretation choice forced by reconciling the real tree against task
+   7.3's exact, closed Pi-only list (see "Design interpretation note" above). The forward check still
+   accepts either an agent or a chain binding, per task 7.1's literal wording.
+
+## Issues Found
+
+None new. Same `node_modules`/`postinstall` HTTP 404 environment condition documented in every prior unit,
+plus the `tests/runtime-harness.mjs` pre-existing failure newly confirmed (via `git stash`) to also
+reproduce on the clean P3b tip — both are sandbox-only, no-network symptoms of the same missing native
+binary, neither introduced by this unit.
+
+## Remaining Tasks
+
+- [ ] PR 8 — P4 (`scripts/bump-gentle-ai-pin.mjs` + `gentle-ai-release-received.yml` receiver): not started.
+
+## Workload / PR Boundary (P3c)
+
+- Mode: feature-branch-chain, `size:exception` (tasks.md: `Delivery strategy: exception-ok`)
+- Current work unit: P3c (PR 7, base: P3b's branch `feat/skill-vendor-overlay`)
+- Boundary: `assets/phase-coverage.json` (new), the phase-coverage gate block in
+  `scripts/verify-package-files.mjs` (new exports + `main()` wiring + one new `requiredPaths` entry),
+  `tests/evidence/**` (new: `ledger.ts`), `tests/evidence.test.ts` (new), phase-coverage test cases appended
+  to `tests/verify-package-files.test.ts`, and `.github/workflows/ci.yml`'s three offline-check steps
+  consolidated into one. No P1/P2/P3a/P3b file touched.
+- Estimated review budget impact: tracked-file diff is 241 insertions / 30 deletions across 4 files
+  (`git diff --stat`), plus 168 lines across 3 new untracked files (`assets/phase-coverage.json` 34,
+  `tests/evidence.test.ts` 65, `tests/evidence/ledger.ts` 69) — 439 total changed lines, all authored (no
+  vendored/golden content in this unit, unlike P3b). Above the 400-line budget, already covered by the
+  tracker-wide `Delivery strategy: exception-ok` (tasks.md: `400-line budget risk: High`,
+  `Decision needed before apply: No`), same policy every prior unit operated under.
+
+## Status (P3c)
+
+8/8 tasks in PR 7 (P3c) complete. 63/68 tasks total across P1a+P1b+P2a+P2b+P3a+P3b+P3c. Ready for
+`sdd-verify`, or for `sdd-apply` to continue with PR 8 (P4) in a fresh batch, on a new branch based on this
+one (`feat/phase-coverage-evidence`).

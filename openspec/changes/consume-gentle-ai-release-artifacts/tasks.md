@@ -108,14 +108,14 @@ Chain strategy: feature-branch-chain
 
 ## PR 7 — P3c: Phase-coverage gate + generic evidence harness (depends: PR 6)
 
-- [ ] 7.1 RED: phase-coverage gate — a provider-declared phase with no Pi agent/chain binding fails naming it; a Pi binding naming no declared phase (and not listed Pi-only) fails.
-- [ ] 7.2 RED: `skills/issue-creation/SKILL.md` is never flagged by the phase-coverage gate (repo-identity, not drift).
-- [ ] 7.3 GREEN: create `assets/phase-coverage.json` — declared alias `sdd-proposal` ↔ `sdd-propose`; declared Pi-only bindings `gentle-ai-explore`, `gentle-ai-worker`, `gentle-ai-verify`, `sdd-status`, `sdd-sync`, `review-validator`.
-- [ ] 7.4 GREEN: `scripts/verify-package-files.mjs` — add the phase-coverage gate, driven by the snapshot mirror plus `assets/phase-coverage.json`.
-- [ ] 7.5 RED: generic evidence-harness test — an S-class (bootstrap) record can never be relabeled R; an R-class record requires live signed-release inputs.
-- [ ] 7.6 GREEN: create `tests/evidence/**` — generic immutable-evidence harness implementing the plan §12 ledger shape (S vs R classes), reusable by later changes.
-- [ ] 7.7 GREEN: `.github/workflows/ci.yml` — assemble the full offline `--check` set (mirrors/lock, baselines, skill overlays, phase-coverage) as one integration gate.
-- [ ] 7.8 Verify: `pnpm test`; `node scripts/verify-package-files.mjs --check` (phase-coverage included).
+- [x] 7.1 RED: phase-coverage gate — a provider-declared phase with no Pi agent/chain binding fails naming it; a Pi binding naming no declared phase (and not listed Pi-only) fails. **Superseded by maintainer decision** (see apply-progress.md P3c): the forward direction (declared phase with no binding) WARNS, naming the missing phase, and does NOT fail CI — under the provider's fast release cadence, failing the build for a phase nobody decided to implement yet trains people to ignore the gate. The reverse direction (Pi binding naming no declared phase, not Pi-only) still fails, unchanged.
+- [x] 7.2 RED: `skills/issue-creation/SKILL.md` is never flagged by the phase-coverage gate (repo-identity, not drift).
+- [x] 7.3 GREEN: create `assets/phase-coverage.json` — declared alias `sdd-proposal` ↔ `sdd-propose`; declared Pi-only bindings `gentle-ai-explore`, `gentle-ai-worker`, `gentle-ai-verify`, `sdd-status`, `sdd-sync`, `review-validator`.
+- [x] 7.4 GREEN: `scripts/verify-package-files.mjs` — add the phase-coverage gate, driven by the snapshot mirror plus `assets/phase-coverage.json`.
+- [x] 7.5 RED: generic evidence-harness test — an S-class (bootstrap) record can never be relabeled R; an R-class record requires live signed-release inputs.
+- [x] 7.6 GREEN: create `tests/evidence/**` — generic immutable-evidence harness implementing the plan §12 ledger shape (S vs R classes), reusable by later changes.
+- [x] 7.7 GREEN: `.github/workflows/ci.yml` — assemble the full offline `--check` set (mirrors/lock, baselines, skill overlays, phase-coverage) as one integration gate.
+- [x] 7.8 Verify: `pnpm test`; `node scripts/verify-package-files.mjs --check` (phase-coverage included).
 
 ## PR 8 — P4: Pin-bump automation + default-branch receiver (depends: PR 7)
 

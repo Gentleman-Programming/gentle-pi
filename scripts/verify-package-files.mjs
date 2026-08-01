@@ -13,6 +13,7 @@ const requiredPaths = [
   "assets/orchestrator-delegation.md",
   "assets/orchestrator-memory.md",
   "assets/orchestrator-skills.md",
+  "assets/phase-coverage.json",
   "assets/agents/sdd-apply.md",
   "assets/agents/sdd-archive.md",
   "assets/agents/sdd-design.md",
@@ -238,6 +239,87 @@ export function reconcileGeneratedRuntimeSources(packageRoot, sources, paths) {
   return { drifted };
 }
 
+// --- phase-coverage gate (design D9) ----------------------------------------
+//
+// assets/agents/** and assets/chains/** are Pi's binding layer over the
+// provider's declared SDD/review phases. They are never byte-vendored
+// (verified dialect difference: `tools:` is a comma string upstream and a
+// lowercase YAML list in Pi, upstream templates `{{CLAUDE_MODEL}}`, and
+// upstream has no `chains/` directory at all -- design.md D9). Instead this
+// gate cross-checks Pi's binding names on disk against the declared-phase
+// snapshot checked in at assets/phase-coverage.json.
+//
+// Two directions, two different severities -- a maintainer decision that
+// supersedes tasks.md 7.1's "fails" wording for the forward direction (see
+// apply-progress.md P3c evidence for the recorded reasoning):
+//
+//   - forward (declared phase -> Pi binding): WARN, never fail CI. Under the
+//     provider's fast release cadence new phases appear regularly; failing
+//     the build for a phase nobody has decided to implement yet trains
+//     people to ignore the gate, and a gate that cries wolf gets muted.
+//   - reverse (Pi agent binding -> declared phase): FAIL. A Pi agent naming
+//     no declared phase, and not listed Pi-only, is a real inconsistency in
+//     Pi's own configuration, not a provider-cadence problem.
+//
+// The reverse check walks only assets/agents/**. assets/chains/** compose
+// multiple phases into Pi-only workflows (upstream has no chains/ concept at
+// all), so a chain is not itself a single-phase binding and is not
+// reverse-checked -- it still counts toward the forward "is this phase bound
+// anywhere" search, since a chain naming a phase is still a binding of it.
+const PHASE_COVERAGE_RELATIVE_PATH = "assets/phase-coverage.json";
+const PHASE_AGENTS_DIR_RELATIVE_PATH = "assets/agents";
+const PHASE_CHAINS_DIR_RELATIVE_PATH = "assets/chains";
+const PHASE_CHAIN_FILE_SUFFIX = ".chain.md";
+const PHASE_AGENT_FILE_SUFFIX = ".md";
+
+function bindingNamesFromDirectory(packageRoot, relativeDir, suffix) {
+  const absoluteDir = join(packageRoot, relativeDir);
+  if (!existsSync(absoluteDir)) return [];
+  return readdirSync(absoluteDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(suffix))
+    .map((entry) => entry.name.slice(0, -suffix.length))
+    .sort();
+}
+
+// Reads only assets/agents/** and assets/chains/** -- never skills/**, so a
+// same-named or unrelated skill (e.g. skills/issue-creation/SKILL.md, which
+// is repo-identity content, not drift -- task 7.2) can never be read or
+// flagged by this gate.
+export function phaseCoverageBindings(packageRoot) {
+  return {
+    agentNames: bindingNamesFromDirectory(packageRoot, PHASE_AGENTS_DIR_RELATIVE_PATH, PHASE_AGENT_FILE_SUFFIX),
+    chainNames: bindingNamesFromDirectory(packageRoot, PHASE_CHAINS_DIR_RELATIVE_PATH, PHASE_CHAIN_FILE_SUFFIX),
+  };
+}
+
+// Pure reconciliation: given the checked-in declared-phase snapshot and the
+// on-disk binding names, returns the two drift directions separately so the
+// caller can apply a different severity to each -- never a single aggregate
+// boolean.
+export function phaseCoverageGate(phaseCoverage, { agentNames, chainNames }) {
+  const { declaredPhases, alias, piOnly } = phaseCoverage;
+  const piOnlySet = new Set(piOnly);
+  const allBindingNames = new Set([...agentNames, ...chainNames]);
+
+  const bindsPhase = (phase) => {
+    for (const bindingName of allBindingNames) {
+      if (bindingName === phase || alias[bindingName] === phase) return true;
+    }
+    return false;
+  };
+
+  const namesDeclaredPhase = (bindingName) => {
+    if (declaredPhases.includes(bindingName)) return true;
+    const aliased = alias[bindingName];
+    return aliased !== undefined && declaredPhases.includes(aliased);
+  };
+
+  const missingBindings = declaredPhases.filter((phase) => !bindsPhase(phase)).sort();
+  const unknownBindings = agentNames.filter((name) => !namesDeclaredPhase(name) && !piOnlySet.has(name)).sort();
+
+  return { missingBindings, unknownBindings };
+}
+
 async function main() {
   const missing = requiredPaths.filter((relativePath) => {
     const absolutePath = join(root, relativePath);
@@ -333,6 +415,22 @@ async function main() {
   if (versionMismatches.length > 0) {
     console.error("gentle-pi Gentle AI version pins have drifted from the authoritative INSTALLER_VERSION:");
     for (const mismatch of versionMismatches) console.error(`- ${mismatch}`);
+    process.exit(1);
+  }
+
+  const phaseCoverage = JSON.parse(readFileSync(join(root, PHASE_COVERAGE_RELATIVE_PATH), "utf8"));
+  const { missingBindings, unknownBindings } = phaseCoverageGate(phaseCoverage, phaseCoverageBindings(root));
+  for (const phase of missingBindings) {
+    console.warn(
+      `gentle-pi phase coverage: provider-declared phase "${phase}" has no Pi agent/chain binding yet (see ${PHASE_COVERAGE_RELATIVE_PATH}); not failing CI -- bind it when ready.`,
+    );
+  }
+  if (unknownBindings.length > 0) {
+    console.error(
+      `gentle-pi phase coverage: the following Pi agent bindings name no provider-declared phase and are not listed "piOnly" in ${PHASE_COVERAGE_RELATIVE_PATH}:`,
+    );
+    for (const name of unknownBindings) console.error(`- ${PHASE_AGENTS_DIR_RELATIVE_PATH}/${name}.md`);
+    console.error("\nRefusing to pack/publish an inconsistent phase binding.");
     process.exit(1);
   }
 
