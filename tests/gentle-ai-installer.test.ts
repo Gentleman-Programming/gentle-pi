@@ -14,6 +14,7 @@ import {
 	GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM,
 	downloadGentleAiAsset,
 	installGentleAi as installGentleAiProduction,
+	pruneSupersededBundles,
 	resolveGentleAiAssetsArchive,
 	resolveGentleAiInstallerPackageRoot,
 	resolveGentleAiReleaseAsset,
@@ -1121,4 +1122,68 @@ test("resolveGentleAiAssetsArchive-pinned digest is enforced even when an existi
 	assert.equal(reinstalled.installed, true);
 	const repairedManifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
 	assert.equal(repairedManifest.assetsTreeSha256, DEFAULT_ASSETS_ARCHIVE.treeSha256);
+});
+
+// --- superseded bundle pruning (P2b, design D3, task 4.4) -------------------
+
+test("pruneSupersededBundles keeps the live bundle and the single immediately-previous version, removing every older one", async () => {
+	const runtimeRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-prune-"));
+	await mkdir(join(runtimeRoot, "v2.2.3"), { recursive: true }); // live
+	await mkdir(join(runtimeRoot, "v2.2.2"), { recursive: true }); // immediately previous — kept for rollback
+	await mkdir(join(runtimeRoot, "v2.1.0"), { recursive: true }); // older — removed
+	await mkdir(join(runtimeRoot, ".v2.2.3.backup-x"), { recursive: true });
+	await mkdir(join(runtimeRoot, ".v2.2.3.staging-y"), { recursive: true });
+	await mkdir(join(runtimeRoot, ".v2.2.3.install.lock"), { recursive: true });
+	await pruneSupersededBundles(runtimeRoot);
+	assert.equal(existsSync(join(runtimeRoot, "v2.2.3")), true, "live bundle must never be pruned");
+	assert.equal(existsSync(join(runtimeRoot, "v2.2.2")), true, "the immediately-previous bundle must be kept for rollback");
+	assert.equal(existsSync(join(runtimeRoot, "v2.1.0")), false, "older-than-immediately-previous bundles must be pruned");
+	assert.equal(existsSync(join(runtimeRoot, ".v2.2.3.backup-x")), true, "dotted backup paths are never bundle directories and must never be touched");
+	assert.equal(existsSync(join(runtimeRoot, ".v2.2.3.staging-y")), true, "dotted staging paths are never bundle directories and must never be touched");
+	assert.equal(existsSync(join(runtimeRoot, ".v2.2.3.install.lock")), true, "the install lock is never a bundle directory and must never be touched");
+});
+
+test("pruneSupersededBundles logs and continues when a removal fails, never touching the live or kept-for-rollback bundle, and never throwing", async () => {
+	const runtimeRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-prune-fail-"));
+	await mkdir(join(runtimeRoot, "v2.2.3"), { recursive: true }); // live
+	await mkdir(join(runtimeRoot, "v2.2.2"), { recursive: true }); // kept for rollback — never attempted
+	await mkdir(join(runtimeRoot, "v2.1.0"), { recursive: true }); // the only candidate whose removal is attempted (and fails)
+	const warnings: string[] = [];
+	const removalAttempts: string[] = [];
+	await pruneSupersededBundles(runtimeRoot, {
+		removeSupersededBundle: async (path: string) => { removalAttempts.push(path); throw new Error("simulated permission denial"); },
+		logPruneWarning: (message: string) => warnings.push(message),
+	});
+	assert.equal(existsSync(join(runtimeRoot, "v2.2.3")), true);
+	assert.equal(existsSync(join(runtimeRoot, "v2.2.2")), true);
+	assert.equal(existsSync(join(runtimeRoot, "v2.1.0")), true, "removal failed, so the directory is deliberately left in place");
+	assert.deepEqual(removalAttempts, [join(runtimeRoot, "v2.1.0")], "only the older-than-kept bundle is ever a removal candidate");
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0], /simulated permission denial/);
+});
+
+test("pruneSupersededBundles is wired to run only after a fresh publish succeeds: keeps the prior version for rollback, removes anything older, never the live bundle", async () => {
+	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-prune-wired-"));
+	const runtimeRoot = join(packageRoot, ".gentle-ai");
+	await mkdir(join(runtimeRoot, "v2.2.2"), { recursive: true }); // becomes "immediately previous" once v2.2.3 publishes
+	await writeFile(join(runtimeRoot, "v2.2.2", "gentle-ai"), "prior rollback-eligible binary");
+	await mkdir(join(runtimeRoot, "v2.2.1"), { recursive: true }); // older than the kept-for-rollback version
+	const result = await installGentleAiForTest(linuxBinaryOptions(packageRoot));
+	assert.equal(result.installed, true);
+	assert.equal(existsSync(join(runtimeRoot, "v2.2.3")), true, "the freshly published bundle is the live one");
+	assert.equal(existsSync(join(runtimeRoot, "v2.2.2")), true, "the immediately-previous bundle is kept for rollback");
+	assert.equal(existsSync(join(runtimeRoot, "v2.2.1")), false, "anything older than the kept-for-rollback bundle is pruned");
+});
+
+test("pruneSupersededBundles does not run when an existing bundle is reused without a fresh publish", async () => {
+	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-prune-reuse-"));
+	const options = linuxBinaryOptions(packageRoot);
+	await installGentleAiForTest(options);
+	const runtimeRoot = join(packageRoot, ".gentle-ai");
+	// Simulate a directory left behind by an older pin that a fresh publish
+	// would prune; a pure reuse (no publish) must leave it untouched.
+	await mkdir(join(runtimeRoot, "v2.2.1"), { recursive: true });
+	const reused = await installGentleAiForTest(options);
+	assert.equal(reused.installed, false);
+	assert.equal(existsSync(join(runtimeRoot, "v2.2.1")), true);
 });

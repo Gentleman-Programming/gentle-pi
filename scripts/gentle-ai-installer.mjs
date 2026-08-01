@@ -766,6 +766,56 @@ async function publishBundle(runtimeRoot, stagingDirectory, options) {
 	return versionDirectory;
 }
 
+const BUNDLE_VERSION_DIRECTORY_PATTERN = /^v(\d+)\.(\d+)\.(\d+)$/;
+
+function bundleVersionOf(name) {
+	const match = BUNDLE_VERSION_DIRECTORY_PATTERN.exec(name);
+	return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : undefined;
+}
+
+function compareBundleVersionsDescending(a, b) {
+	return b.version[0] - a.version[0] || b.version[1] - a.version[1] || b.version[2] - a.version[2];
+}
+
+// D3: prunes superseded `v<other-version>` bundle directories. Called ONLY
+// after the new bundle's rename in `publishBundle` has already succeeded,
+// from nowhere else, and it never touches `v<INSTALLER_VERSION>` — the live
+// bundle just published. Deliberately conservative: it keeps exactly the
+// single immediately-previous bundle (the highest-versioned directory that
+// is not live) for rollback, and removes every other superseded version —
+// neither "keep everything" nor "keep only the current one". A pin bump is
+// the only way a superseded directory can exist at all. Its own failure is
+// deliberately non-fatal: a locked or otherwise unremovable old bundle must
+// not fail an install that already succeeded — it is only logged for a
+// maintainer to clean up later.
+export async function pruneSupersededBundles(runtimeRoot, options = {}) {
+	const log = options.logPruneWarning ?? ((message) => console.warn(message));
+	const remove = options.removeSupersededBundle ?? safeRemoveDirectory;
+	let entries;
+	try {
+		entries = await readdir(runtimeRoot, { withFileTypes: true });
+	} catch (error) {
+		log(`Gentle AI could not list ${runtimeRoot} to prune superseded bundles: ${error instanceof Error ? error.message : String(error)}`);
+		return;
+	}
+	const live = `v${INSTALLER_VERSION}`;
+	const superseded = entries
+		.filter((entry) => entry.isDirectory() && entry.name !== live)
+		.map((entry) => ({ name: entry.name, version: bundleVersionOf(entry.name) }))
+		.filter((candidate) => candidate.version !== undefined)
+		.sort(compareBundleVersionsDescending);
+	const [, ...toPrune] = superseded; // keep index 0 (the immediately-previous bundle) for rollback
+	for (const { name } of toPrune) {
+		const path = join(runtimeRoot, name);
+		if (!isConfined(path, runtimeRoot)) continue;
+		try {
+			await remove(path);
+		} catch (error) {
+			log(`Gentle AI could not prune superseded bundle at ${path}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+}
+
 async function withInstallLock(packageRoot, options, install) {
 	const runtimeRoot = join(packageRoot, ".gentle-ai");
 	await mkdir(packageRoot, { recursive: true });
@@ -812,6 +862,7 @@ async function installWindowsGentleAiFromGoSumdb(options, packageRoot, architect
 			await writeFile(join(stagingDirectory, "integrity.json"), canonicalManifest(windowsSourceManifest(metadata, binarySha256, architecture, assetsArchive)), { mode: 0o600 });
 			await safeRemoveDirectory(buildDirectory);
 			const published = await publishBundle(runtimeRoot, stagingDirectory, options);
+			await pruneSupersededBundles(runtimeRoot, options);
 			return { installed: true, binaryPath: join(published, "gentle-ai.exe"), method: GENTLE_AI_INSTALL_METHOD.GO_SUMDB_SOURCE_BUILD };
 		} finally { await safeRemoveDirectory(stagingDirectory); }
 	});
@@ -843,6 +894,7 @@ async function installSignedRelease(options, packageRoot, platform, arch, asset,
 			await safeRemoveDirectory(extracted);
 			await rm(archive, { force: true });
 			const published = await publishBundle(runtimeRoot, stagingDirectory, options);
+			await pruneSupersededBundles(runtimeRoot, options);
 			return { installed: true, binaryPath: join(published, asset.executable), asset };
 		} finally { await safeRemoveDirectory(stagingDirectory); }
 	});
