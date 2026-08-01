@@ -35,14 +35,14 @@ Chain strategy: feature-branch-chain
 
 ## PR 1 — P1a: Bootstrap decoder + tree digest (Req: "Archive verified with existing integrity discipline, unweakened"; "Unsupported contract major fails closed before layout is trusted")
 
-- [ ] 1.1 Rebase the tracker branch onto `main` after PR #262 and PR #263 merge; verify `INSTALLER_VERSION` is the sole pin literal and gate/projection floor verification is already additive-tolerant — do not re-implement either.
-- [ ] 1.2 RED: `lib/release-artifact.ts` decoder tests — unsupported major rejected naming it against a structurally-valid `artifact-manifest-unsupported-major.fixture.json`; unknown key; `tree.manifest_included:true`; absolute/`..`/backslash/NUL/over-length/duplicate/unsorted path; non-`file` type; non-`0644` mode; bad digest shape; missing bundled schema; `$id` mismatch; `compatibility.unknown_mandatory` not `reject`.
-- [ ] 1.3 RED: tree digest tests — known-vector preimage `"gentle-ai.release-artifact-tree/v1\x00"` + entry lines, input-order independence, manifest exclusion.
-- [ ] 1.4 RED: bounded-extraction tests (threat-matrix: archive extraction) — listing exceeding `MAX_ASSET_ENTRIES`/`MAX_ASSET_FILE_BYTES`/`MAX_ASSETS_UNPACKED_BYTES` rejected with zero bytes written; extra archive member; missing member; listed-size vs `entries[].size` disagreement; link/device/dir member rejected.
-- [ ] 1.5 RED: `--bootstrap-archive` test — must be passed explicitly (never auto-discovered), records `signature_status: not-applicable/local-unsigned`, and is barred from pin/acceptance evidence.
-- [ ] 1.6 GREEN: create `lib/release-artifact.ts` — `decodeArtifactManifest`, `treeDigest`, `SUPPORTED_CONTRACT_MAJOR = 1`, D1 steps 1-11 in order, D2 staged extractor (stage0 listing → stage3 exact path-set equality → stage4 extract → stage5 per-file recheck).
-- [ ] 1.7 GREEN: add generated `runtime/release-artifact.mjs`; register it in the `sources` list, `scripts/build-git-commit-transaction-runner.mjs:9-14`.
-- [ ] 1.8 Verify: `pnpm test -- release-artifact`; `pnpm run check:transaction-runner`.
+- [x] 1.1 Rebase the tracker branch onto `main` after PR #262 and PR #263 merge; verify `INSTALLER_VERSION` is the sole pin literal and gate/projection floor verification is already additive-tolerant — do not re-implement either.
+- [x] 1.2 RED: `lib/release-artifact.ts` decoder tests — unsupported major rejected naming it against a structurally-valid `artifact-manifest-unsupported-major.fixture.json`; unknown key; `tree.manifest_included:true`; absolute/`..`/backslash/NUL/over-length/duplicate/unsorted path; non-`file` type; non-`0644` mode; bad digest shape; missing bundled schema; `$id` mismatch; `compatibility.unknown_mandatory` not `reject`.
+- [x] 1.3 RED: tree digest tests — known-vector preimage `"gentle-ai.release-artifact-tree/v1\x00"` + entry lines, input-order independence, manifest exclusion.
+- [x] 1.4 RED: bounded-extraction tests (threat-matrix: archive extraction) — listing exceeding `MAX_ASSET_ENTRIES`/`MAX_ASSET_FILE_BYTES`/`MAX_ASSETS_UNPACKED_BYTES` rejected with zero bytes written; extra archive member; missing member; listed-size vs `entries[].size` disagreement; link/device/dir member rejected.
+- [x] 1.5 RED: `--bootstrap-archive` test — must be passed explicitly (never auto-discovered), records `signature_status: not-applicable/local-unsigned`, and is barred from pin/acceptance evidence.
+- [x] 1.6 GREEN: create `lib/release-artifact.ts` — `decodeArtifactManifest`, `treeDigest`, `SUPPORTED_CONTRACT_MAJOR = 1`, D1 steps 1-11 in order, D2 staged extractor (stage0 listing → stage3 exact path-set equality → stage4 extract → stage5 per-file recheck).
+- [x] 1.7 GREEN: add generated `runtime/release-artifact.mjs`; register it in the `sources` list, `scripts/build-git-commit-transaction-runner.mjs:9-14`.
+- [x] 1.8 Verify: `pnpm test -- release-artifact`; `pnpm run check:transaction-runner`.
 
 ## PR 2 — P1b: Signed sync path + mirrors + canonical lock (Req: "Offline mirrors and a canonical lock bind provider identity"; "Bootstrap snapshot evidence never substitutes for release evidence")
 
