@@ -11,6 +11,10 @@
 		"branch-pr": {
 			"path": "skills/_vendor/branch-pr/SKILL.md",
 			"sha256": "8553fdde3397c7dc1c2fda2b4ca848baf5d9185d0db65635b151755c4e627dc8"
+		},
+		"chained-pr": {
+			"path": "skills/_vendor/chained-pr/SKILL.md",
+			"sha256": "865f2e78db039797eabfe46d80589677c1420c052ed2b993c4435b487b17e83b"
 		}
 	}
 }
