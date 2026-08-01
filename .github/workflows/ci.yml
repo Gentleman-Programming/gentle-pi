@@ -50,5 +50,13 @@ jobs:
       - name: Verify generated gentle-ai baselines
         run: node scripts/build-gentle-ai-baselines.mjs --check
 
+      # Skill vendor + overlay reconciliation (D8): offline, reads only the
+      # checked-in vendored bodies (skills/_vendor/**), their recorded
+      # digests (skills/_vendor/manifest.json), and each overlay.md. Catches
+      # a hand-edited vendored file and a stale overlay anchor before either
+      # reaches skills/<name>/SKILL.md.
+      - name: Verify generated skill overlays
+        run: node scripts/build-skill-overlays.mjs --check
+
       - name: Verify packed installation
         run: pnpm run test:packed-runner
