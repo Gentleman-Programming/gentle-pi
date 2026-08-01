@@ -1,0 +1,756 @@
+{
+  "release": {
+    "repository": "Gentleman-Programming/gentle-ai",
+    "tag": "v2.2.3",
+    "version": "2.2.3",
+    "commit": "0000000000000000000000000000000000000000"
+  },
+  "contract": {
+    "id": "gentle-ai.release-artifact",
+    "major": 1,
+    "minor": 0,
+    "schemaId": "https://gentle-ai.dev/contracts/release-artifact/v1/schemas/artifact-manifest.schema.json",
+    "schemaPath": "contracts/release-artifact/v1/schemas/artifact-manifest.schema.json",
+    "layoutVersion": 1
+  },
+  "archive": {
+    "asset": "gentle-ai_2.2.3_assets.tar.gz",
+    "sha256": "sha256:f7c263dc6c459cbf8a7bdfe32924733ac121fbeac7dacbd3ae8643c6ef7d93be",
+    "digestSource": "signed-checksums.txt"
+  },
+  "tree": {
+    "algorithm": "sha256",
+    "canonicalization": "gentle-ai.release-artifact-tree/v1",
+    "digest": "sha256:4c4c5c6ef640e86dc26fc94a115f9c7f1878294d7103d1cc9b613492d3481399"
+  },
+  "entries": [
+    {
+      "path": "capabilities/review-integration-v2.semantic.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 4054,
+      "digest": "sha256:d626daf0bca02326373bfddf62e858f7392edac26f6927abd217ff9a3e8a187a"
+    },
+    {
+      "path": "contracts/release-artifact/v1/schemas/artifact-manifest.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 4309,
+      "digest": "sha256:9fe23ab8dea0fb0a0d687d119e88c08ee9b9bc4ed3b3c9fd1d122399e7e577de"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/binding-revision-conflict.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 792,
+      "digest": "sha256:c2e294843cee5185324cb7a41702574ef94852517239d99e7493a1414a60b363"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/capabilities-v1.1.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 5839,
+      "digest": "sha256:1b3dc40dce7bfb5d3ecc7e92af68d66e71b733ba0b0f71ba94d3c633adc48bcf"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/capabilities-v1.2.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 6443,
+      "digest": "sha256:2970d21cd95a7fcaea6547c47a591a5151046e7ede658b3e8c5b9a9c5d106b65"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/capabilities-v1.3.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 7490,
+      "digest": "sha256:0ec783ea13b4c82c0b002c5caa758f33e2b488537297cc2d0694ec92176ac0cb"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/capabilities-v1.4.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 7816,
+      "digest": "sha256:84e0db457b76b97b35c2be772dfc647f9eab66810ea98f64fed85645c3c266ba"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/capabilities-v1.5.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 8065,
+      "digest": "sha256:0cc952af3767c393bde9e4785e4071615a529fd672bc94da4fcc204780524a27"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/capabilities.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 4535,
+      "digest": "sha256:b3ca822189a236f2d891628c665ca23e308bf5185a1701e1f07231bd970461bb"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/consent.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 1869,
+      "digest": "sha256:b2ff4809b9eb75a54206800dca13f96396976aca7387e45f765ac6ec98029cd1"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/failure.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 1671,
+      "digest": "sha256:e72b6ab5e3c529abac47bd324444f84ca90f67ef0a67189f5fd8d24d199a2759"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/final-verification-incident.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 626,
+      "digest": "sha256:f8bc06549e62b0bee5cf2ecde625e18da178dd18c9d3023b7d7e8fd0ebbba646"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/operation.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 2064,
+      "digest": "sha256:3547748a4df57382178064abbdb1cf12f1d58a75c0e9d6452fdd9beb3aaeac3a"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/repair-preflight.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 1915,
+      "digest": "sha256:7168cb53ad470066d0b3edc3b7911d1aebff91abd41ecc3d822f8ffa5cea6cb1"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/start-v2.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 4541,
+      "digest": "sha256:388c7c21374b89afe2d42d64bd1987d17ec0e2c7151cab1c56a08969ffb2ea0e"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/start.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 1744,
+      "digest": "sha256:f369160ac26eb3427b57de2dd01c9d8c81e51c8a2bd546446780129d31b1945b"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-ambiguous.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 2627,
+      "digest": "sha256:ee695fd58ba72adfb3b51dfd16432a177498173a45bfcb594d6bdc53bfa32e6e"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-corrupted.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 2602,
+      "digest": "sha256:4cfc0048c28a39cec8a32fecfaad66e56e5c1248263ceb4ce66b6717981880b2"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-recover.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 3508,
+      "digest": "sha256:714f762f72380ce93d567626cafbaa536ab3aae02af73d3d40ca123f1f30d8b0"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-unrelated.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 2443,
+      "digest": "sha256:deab36c877ced3c9b480ca33724c10d88f75c761d6426fa14be850345122891d"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-v2-ambiguous.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 3361,
+      "digest": "sha256:80a459a7a18d8d933dd42acb6a94a75ac19278e9a6c3b125e3017946768eaa47"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-v2-corrupted.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 3336,
+      "digest": "sha256:466f1e28b101e95178630f26a90fff96ad3516e2aa6a17f5f357bab9bda2ab52"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-v2-final-verification-retry.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 7082,
+      "digest": "sha256:889ede9a84bdbe561df2d2401adda95634582c44db9d1075ba839f33d65c7886"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-v2-recover.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 4262,
+      "digest": "sha256:178331fc7177d2316fd4f56610ac295f7da2780be96b233b72935d5f476610f2"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-v2-repair.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 5169,
+      "digest": "sha256:89083cad752fca38da09e919825d0b80641a8a029364ba1869e5b58ef2e59a1d"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-v2-unrelated.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 3171,
+      "digest": "sha256:c178b338dcd5d30888acef37a9d752bd0932d6dedfffb61b0596a9cceabeb692"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-v2.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 7055,
+      "digest": "sha256:5410d8bbae1b7152a43b3a5c4c880e9e98a5e47b76d910456f5ef13f19836f3a"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 4656,
+      "digest": "sha256:555054d8046a896162995dcb117752f9cd1ef903fb9ebaad29af1b7e7f319bb3"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/verification-evidence.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 724,
+      "digest": "sha256:b30e3863548845b90e256d92193435d02da458bf8f15a4c33d023cd1f6894a5f"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/admitted-result.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 1430,
+      "digest": "sha256:7796e8dbba331434594108c902dfab7ec46f691fa447a9259a78f2448111b0de"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/artifact-subject.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 1272,
+      "digest": "sha256:f7dcd934e27e8f3735a37f3d0ec8048dd8ccc1811b9df61124a1dcbf8a03f40e"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/authority-repair-assessment.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 5396,
+      "digest": "sha256:232591670009f99c53a68e91d1e7e60465c294f1721f493ab1e7ae182842cfb5"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/capabilities-v1.1.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 7923,
+      "digest": "sha256:2b14162284f375f8563e49d3a28caaa0aabb572094d8d290eb61844b1353af78"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/capabilities-v1.2.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 8126,
+      "digest": "sha256:df1722adcd9c999edbef090bfd5d9a9713f6852a9bc9cb79684ef7c9c91c0d62"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/capabilities-v1.3.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 10332,
+      "digest": "sha256:3401a062fa8a034ef7743f84adbfdd2ceadaf81bee8a7e62115fd4e18afacfcd"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/capabilities-v1.4.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 10487,
+      "digest": "sha256:926b61c8ac0f870f09214f6bd8af1b035c5b72f14f0b83c0d4a7bdbb277f5447"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/capabilities-v1.5.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 4915,
+      "digest": "sha256:abc783821524dcc33339495284805a85f79b3352efb7358c95016ed164bd7f24"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/capabilities.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 6717,
+      "digest": "sha256:ad333177494a251beac153f74bd751fa77126a9968aad69e64fc2abf15cff0f7"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/consent.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 3123,
+      "digest": "sha256:f8f2edec17568124488482c2aee399909111fe0cce2cba426fb29efd2c7c1cd0"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/failure.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 5647,
+      "digest": "sha256:0ce29f61408fc21d72640fffdb215a608a820c29f3e5ff62d9cc295ed0451937"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/final-verification-incident.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 1226,
+      "digest": "sha256:39b1ec178b1d3bc8da9a3d92dadd8092385000f2a6930b5bfcb4a84dbc6493ca"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/operation.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 5593,
+      "digest": "sha256:6cf15b54977fea7301b9a5c766e709f8a912fda33560365de6dfcab4d2ecbce0"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/projection.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 1678,
+      "digest": "sha256:7168a3eba929dde2b8f0b7723ee51d5a5421102bdeefe892578c263debd08db2"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/repair.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 5383,
+      "digest": "sha256:febb747dc68f8ded5974b6dd94051ec3cfdb5a886ccb853b1ce53aaf2e41efc0"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/result-artifact-v2.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 1413,
+      "digest": "sha256:38895aae2f6ca4980b1a8e157fee8503920820d5f6be3c757c0fa04e8430cd6b"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/result-artifact.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 878,
+      "digest": "sha256:91296bd2c261fd2fe03bffd63efe58badd4927e0d0d8480cd4213f651ecacdf6"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/start-v2.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 7476,
+      "digest": "sha256:ec8550cd93bbe84af1ce87dfd7abfa9e24692f42b20f8f0bf9cac1d4b88ea46c"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/start.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 5945,
+      "digest": "sha256:4296aebbd4128ce51945a2f6d3228aa77ac7215c802978d559bff5279ec56229"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/status-v2.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 16215,
+      "digest": "sha256:63e8988ce276d948ea8305008a3d27c4e26dff664cf54fffed9e188f465d92d1"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/status.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 13366,
+      "digest": "sha256:67f3bddf5f5feeb3213bce489de8548546163b2e1d49a0e3965c0091dabc8c39"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/targeted-validation-request.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 1575,
+      "digest": "sha256:52b91154693b4dd66983fc91ecf7197503555f2c9e85cac626cffd3035c53d65"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/verification-evidence.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 1751,
+      "digest": "sha256:fd15890bf2ef1db95d771ee7f468e9e64014351d7940f65604eb24f41e68a22f"
+    },
+    {
+      "path": "contracts/review-integration/v2/fixtures/capabilities.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 6545,
+      "digest": "sha256:17c150d851c15b3f0c20d18c2e2741eb2232ffa24f35aa71d6d30e90a85e42b7"
+    },
+    {
+      "path": "contracts/review-integration/v2/fixtures/consent.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 1947,
+      "digest": "sha256:203cc96d5c29ba0f27b5c4db04c2e88566e0a923d3a0cdb317f78d9065349075"
+    },
+    {
+      "path": "contracts/review-integration/v2/fixtures/start.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 4257,
+      "digest": "sha256:34b21328fa910e03af2fac8e816c5b510ba146201da0cd4ef1693d39a6344ba0"
+    },
+    {
+      "path": "contracts/review-integration/v2/fixtures/status.fixture.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 5098,
+      "digest": "sha256:d5438578f2969f17635fecea94c7ef46d14c78fa668e50df48c4254254d5e935"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/admitted-result.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 620,
+      "digest": "sha256:c6a9c880191d65c46d9cfc8a0812af16b636573a8f6e57ea34aa16d6f6bb9735"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/artifact-subject.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 1415,
+      "digest": "sha256:3e71a81340ea6149b03afa71530d10ce654c415fa21d4e07f0c9c25b3d2d70a3"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/capabilities.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 5909,
+      "digest": "sha256:7ab061ed27bd3b929d6033cc20f56097e851f4454ca14a815255748b50191248"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/consent.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 2771,
+      "digest": "sha256:b2b4465338497f11927de91cb2e5da12b6cb4a1039afe05aebe1abbf53b21858"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/failure.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 2206,
+      "digest": "sha256:1c53da8c543cc5e03fbbfc700d4fc80cadb3b0e5e72c6d77a7790008671d0962"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/operation.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 1963,
+      "digest": "sha256:beee02046ec1d5b8c89e3d7de35f897c275830e43c67ecd162886bfd0138ace6"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/repair.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 1197,
+      "digest": "sha256:9e842d1ded797a91ede16b2054a38708b2d1fc7a0d6217541f84c0f2f5a2e73e"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/start.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 5053,
+      "digest": "sha256:86ddfcfe1912489abef7461613d692ea53a4d7d73d444d5f6dbbd7f9866a2c37"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/status.schema.json",
+      "type": "file",
+      "mode": "0644",
+      "size": 5980,
+      "digest": "sha256:132b15dd7a0514aa451373bd4b3c02a1491b7b11cf5b9ce43bc300b549397ac9"
+    },
+    {
+      "path": "docs/gentle-ai/review-integration.md",
+      "type": "file",
+      "mode": "0644",
+      "size": 1484,
+      "digest": "sha256:c8d3189e66aa0cfb9a2ed3856f816e14cb88a474e4242e37306fab603eabe2ba"
+    }
+  ],
+  "generated": [
+    {
+      "path": "capabilities/review-integration-v2.semantic.json",
+      "sha256": "sha256:d626daf0bca02326373bfddf62e858f7392edac26f6927abd217ff9a3e8a187a"
+    },
+    {
+      "path": "contracts/release-artifact/v1/schemas/artifact-manifest.schema.json",
+      "sha256": "sha256:9fe23ab8dea0fb0a0d687d119e88c08ee9b9bc4ed3b3c9fd1d122399e7e577de"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/binding-revision-conflict.fixture.json",
+      "sha256": "sha256:c2e294843cee5185324cb7a41702574ef94852517239d99e7493a1414a60b363"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/capabilities-v1.1.fixture.json",
+      "sha256": "sha256:1b3dc40dce7bfb5d3ecc7e92af68d66e71b733ba0b0f71ba94d3c633adc48bcf"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/capabilities-v1.2.fixture.json",
+      "sha256": "sha256:2970d21cd95a7fcaea6547c47a591a5151046e7ede658b3e8c5b9a9c5d106b65"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/capabilities-v1.3.fixture.json",
+      "sha256": "sha256:0ec783ea13b4c82c0b002c5caa758f33e2b488537297cc2d0694ec92176ac0cb"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/capabilities-v1.4.fixture.json",
+      "sha256": "sha256:84e0db457b76b97b35c2be772dfc647f9eab66810ea98f64fed85645c3c266ba"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/capabilities-v1.5.fixture.json",
+      "sha256": "sha256:0cc952af3767c393bde9e4785e4071615a529fd672bc94da4fcc204780524a27"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/capabilities.fixture.json",
+      "sha256": "sha256:b3ca822189a236f2d891628c665ca23e308bf5185a1701e1f07231bd970461bb"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/consent.fixture.json",
+      "sha256": "sha256:b2ff4809b9eb75a54206800dca13f96396976aca7387e45f765ac6ec98029cd1"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/failure.fixture.json",
+      "sha256": "sha256:e72b6ab5e3c529abac47bd324444f84ca90f67ef0a67189f5fd8d24d199a2759"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/final-verification-incident.fixture.json",
+      "sha256": "sha256:f8bc06549e62b0bee5cf2ecde625e18da178dd18c9d3023b7d7e8fd0ebbba646"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/operation.fixture.json",
+      "sha256": "sha256:3547748a4df57382178064abbdb1cf12f1d58a75c0e9d6452fdd9beb3aaeac3a"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/repair-preflight.fixture.json",
+      "sha256": "sha256:7168cb53ad470066d0b3edc3b7911d1aebff91abd41ecc3d822f8ffa5cea6cb1"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/start-v2.fixture.json",
+      "sha256": "sha256:388c7c21374b89afe2d42d64bd1987d17ec0e2c7151cab1c56a08969ffb2ea0e"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/start.fixture.json",
+      "sha256": "sha256:f369160ac26eb3427b57de2dd01c9d8c81e51c8a2bd546446780129d31b1945b"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-ambiguous.fixture.json",
+      "sha256": "sha256:ee695fd58ba72adfb3b51dfd16432a177498173a45bfcb594d6bdc53bfa32e6e"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-corrupted.fixture.json",
+      "sha256": "sha256:4cfc0048c28a39cec8a32fecfaad66e56e5c1248263ceb4ce66b6717981880b2"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-recover.fixture.json",
+      "sha256": "sha256:714f762f72380ce93d567626cafbaa536ab3aae02af73d3d40ca123f1f30d8b0"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-unrelated.fixture.json",
+      "sha256": "sha256:deab36c877ced3c9b480ca33724c10d88f75c761d6426fa14be850345122891d"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-v2-ambiguous.fixture.json",
+      "sha256": "sha256:80a459a7a18d8d933dd42acb6a94a75ac19278e9a6c3b125e3017946768eaa47"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-v2-corrupted.fixture.json",
+      "sha256": "sha256:466f1e28b101e95178630f26a90fff96ad3516e2aa6a17f5f357bab9bda2ab52"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-v2-final-verification-retry.fixture.json",
+      "sha256": "sha256:889ede9a84bdbe561df2d2401adda95634582c44db9d1075ba839f33d65c7886"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-v2-recover.fixture.json",
+      "sha256": "sha256:178331fc7177d2316fd4f56610ac295f7da2780be96b233b72935d5f476610f2"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-v2-repair.fixture.json",
+      "sha256": "sha256:89083cad752fca38da09e919825d0b80641a8a029364ba1869e5b58ef2e59a1d"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-v2-unrelated.fixture.json",
+      "sha256": "sha256:c178b338dcd5d30888acef37a9d752bd0932d6dedfffb61b0596a9cceabeb692"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status-v2.fixture.json",
+      "sha256": "sha256:5410d8bbae1b7152a43b3a5c4c880e9e98a5e47b76d910456f5ef13f19836f3a"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/status.fixture.json",
+      "sha256": "sha256:555054d8046a896162995dcb117752f9cd1ef903fb9ebaad29af1b7e7f319bb3"
+    },
+    {
+      "path": "contracts/review-integration/v1/fixtures/verification-evidence.fixture.json",
+      "sha256": "sha256:b30e3863548845b90e256d92193435d02da458bf8f15a4c33d023cd1f6894a5f"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/admitted-result.schema.json",
+      "sha256": "sha256:7796e8dbba331434594108c902dfab7ec46f691fa447a9259a78f2448111b0de"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/artifact-subject.schema.json",
+      "sha256": "sha256:f7dcd934e27e8f3735a37f3d0ec8048dd8ccc1811b9df61124a1dcbf8a03f40e"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/authority-repair-assessment.schema.json",
+      "sha256": "sha256:232591670009f99c53a68e91d1e7e60465c294f1721f493ab1e7ae182842cfb5"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/capabilities-v1.1.schema.json",
+      "sha256": "sha256:2b14162284f375f8563e49d3a28caaa0aabb572094d8d290eb61844b1353af78"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/capabilities-v1.2.schema.json",
+      "sha256": "sha256:df1722adcd9c999edbef090bfd5d9a9713f6852a9bc9cb79684ef7c9c91c0d62"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/capabilities-v1.3.schema.json",
+      "sha256": "sha256:3401a062fa8a034ef7743f84adbfdd2ceadaf81bee8a7e62115fd4e18afacfcd"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/capabilities-v1.4.schema.json",
+      "sha256": "sha256:926b61c8ac0f870f09214f6bd8af1b035c5b72f14f0b83c0d4a7bdbb277f5447"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/capabilities-v1.5.schema.json",
+      "sha256": "sha256:abc783821524dcc33339495284805a85f79b3352efb7358c95016ed164bd7f24"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/capabilities.schema.json",
+      "sha256": "sha256:ad333177494a251beac153f74bd751fa77126a9968aad69e64fc2abf15cff0f7"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/consent.schema.json",
+      "sha256": "sha256:f8f2edec17568124488482c2aee399909111fe0cce2cba426fb29efd2c7c1cd0"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/failure.schema.json",
+      "sha256": "sha256:0ce29f61408fc21d72640fffdb215a608a820c29f3e5ff62d9cc295ed0451937"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/final-verification-incident.schema.json",
+      "sha256": "sha256:39b1ec178b1d3bc8da9a3d92dadd8092385000f2a6930b5bfcb4a84dbc6493ca"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/operation.schema.json",
+      "sha256": "sha256:6cf15b54977fea7301b9a5c766e709f8a912fda33560365de6dfcab4d2ecbce0"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/projection.schema.json",
+      "sha256": "sha256:7168a3eba929dde2b8f0b7723ee51d5a5421102bdeefe892578c263debd08db2"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/repair.schema.json",
+      "sha256": "sha256:febb747dc68f8ded5974b6dd94051ec3cfdb5a886ccb853b1ce53aaf2e41efc0"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/result-artifact-v2.schema.json",
+      "sha256": "sha256:38895aae2f6ca4980b1a8e157fee8503920820d5f6be3c757c0fa04e8430cd6b"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/result-artifact.schema.json",
+      "sha256": "sha256:91296bd2c261fd2fe03bffd63efe58badd4927e0d0d8480cd4213f651ecacdf6"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/start-v2.schema.json",
+      "sha256": "sha256:ec8550cd93bbe84af1ce87dfd7abfa9e24692f42b20f8f0bf9cac1d4b88ea46c"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/start.schema.json",
+      "sha256": "sha256:4296aebbd4128ce51945a2f6d3228aa77ac7215c802978d559bff5279ec56229"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/status-v2.schema.json",
+      "sha256": "sha256:63e8988ce276d948ea8305008a3d27c4e26dff664cf54fffed9e188f465d92d1"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/status.schema.json",
+      "sha256": "sha256:67f3bddf5f5feeb3213bce489de8548546163b2e1d49a0e3965c0091dabc8c39"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/targeted-validation-request.schema.json",
+      "sha256": "sha256:52b91154693b4dd66983fc91ecf7197503555f2c9e85cac626cffd3035c53d65"
+    },
+    {
+      "path": "contracts/review-integration/v1/schemas/verification-evidence.schema.json",
+      "sha256": "sha256:fd15890bf2ef1db95d771ee7f468e9e64014351d7940f65604eb24f41e68a22f"
+    },
+    {
+      "path": "contracts/review-integration/v2/fixtures/capabilities.fixture.json",
+      "sha256": "sha256:17c150d851c15b3f0c20d18c2e2741eb2232ffa24f35aa71d6d30e90a85e42b7"
+    },
+    {
+      "path": "contracts/review-integration/v2/fixtures/consent.fixture.json",
+      "sha256": "sha256:203cc96d5c29ba0f27b5c4db04c2e88566e0a923d3a0cdb317f78d9065349075"
+    },
+    {
+      "path": "contracts/review-integration/v2/fixtures/start.fixture.json",
+      "sha256": "sha256:34b21328fa910e03af2fac8e816c5b510ba146201da0cd4ef1693d39a6344ba0"
+    },
+    {
+      "path": "contracts/review-integration/v2/fixtures/status.fixture.json",
+      "sha256": "sha256:d5438578f2969f17635fecea94c7ef46d14c78fa668e50df48c4254254d5e935"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/admitted-result.schema.json",
+      "sha256": "sha256:c6a9c880191d65c46d9cfc8a0812af16b636573a8f6e57ea34aa16d6f6bb9735"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/artifact-subject.schema.json",
+      "sha256": "sha256:3e71a81340ea6149b03afa71530d10ce654c415fa21d4e07f0c9c25b3d2d70a3"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/capabilities.schema.json",
+      "sha256": "sha256:7ab061ed27bd3b929d6033cc20f56097e851f4454ca14a815255748b50191248"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/consent.schema.json",
+      "sha256": "sha256:b2b4465338497f11927de91cb2e5da12b6cb4a1039afe05aebe1abbf53b21858"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/failure.schema.json",
+      "sha256": "sha256:1c53da8c543cc5e03fbbfc700d4fc80cadb3b0e5e72c6d77a7790008671d0962"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/operation.schema.json",
+      "sha256": "sha256:beee02046ec1d5b8c89e3d7de35f897c275830e43c67ecd162886bfd0138ace6"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/repair.schema.json",
+      "sha256": "sha256:9e842d1ded797a91ede16b2054a38708b2d1fc7a0d6217541f84c0f2f5a2e73e"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/start.schema.json",
+      "sha256": "sha256:86ddfcfe1912489abef7461613d692ea53a4d7d73d444d5f6dbbd7f9866a2c37"
+    },
+    {
+      "path": "contracts/review-integration/v2/schemas/status.schema.json",
+      "sha256": "sha256:132b15dd7a0514aa451373bd4b3c02a1491b7b11cf5b9ce43bc300b549397ac9"
+    },
+    {
+      "path": "docs/gentle-ai/review-integration.md",
+      "sha256": "sha256:c8d3189e66aa0cfb9a2ed3856f816e14cb88a474e4242e37306fab603eabe2ba"
+    }
+  ]
+}
