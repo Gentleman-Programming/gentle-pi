@@ -54,6 +54,7 @@ export const GENTLE_AI_GO_TOOLCHAIN_UNAVAILABLE_CODE = "GENTLE_AI_GO_TOOLCHAIN_U
 export const GENTLE_AI_GO_TOOLCHAIN_TOO_OLD_CODE = "GENTLE_AI_GO_TOOLCHAIN_TOO_OLD";
 export const GENTLE_AI_GO_INSTALL_FAILED_CODE = "GENTLE_AI_GO_INSTALL_FAILED";
 export const GENTLE_AI_VERSION_MISMATCH_CODE = "GENTLE_AI_VERSION_MISMATCH";
+export const GENTLE_AI_CAPABILITIES_CROSS_CHECK_FAILED_CODE = "GENTLE_AI_CAPABILITIES_CROSS_CHECK_FAILED";
 
 export class GentleAiInstallerError extends Error {
 	constructor(code, message, cause) {
@@ -466,6 +467,95 @@ async function assetsBundleMatches(directory, assetsArchive) {
 	}
 }
 
+// --- Windows capability cross-check (design D5) -----------------------------
+
+// D5: Windows has no goreleaser-built binary archive — the release builds
+// linux and darwin only, and Windows builds the binary from Go SumDB source
+// at the exact pinned tag (above). This is the checked-in mirror every
+// platform's assets bundle is already verified against; the cross-check
+// below only ever READS it, exactly like `resolveGentleAiAssetsArchive`
+// reads the lock, and never writes or regenerates it.
+export const GENTLE_AI_CAPABILITIES_SNAPSHOT_RELATIVE_PATH = "capabilities/review-integration-v2.semantic.json";
+const GENTLE_AI_CAPABILITIES_CONTRACT = "gentle-ai.review-integration/v2";
+
+function readGentleAiCapabilitiesSnapshot(packageRoot, readSnapshotFile) {
+	const path = join(packageRoot, GENTLE_AI_CAPABILITIES_SNAPSHOT_RELATIVE_PATH);
+	try {
+		return JSON.parse(readSnapshotFile(path));
+	} catch (error) {
+		throw new Error(`Gentle AI Windows capability cross-check requires a valid ${GENTLE_AI_CAPABILITIES_SNAPSHOT_RELATIVE_PATH} at ${path}`, { cause: error });
+	}
+}
+
+function capabilityNameSets(payload, label) {
+	const operations = Array.isArray(payload?.operations) ? payload.operations : null;
+	const gates = Array.isArray(payload?.gates) ? payload.gates : null;
+	const projections = Array.isArray(payload?.projections) ? payload.projections : null;
+	const mandatory = Array.isArray(payload?.features?.mandatory) ? payload.features.mandatory : null;
+	const optional = Array.isArray(payload?.features?.optional) ? payload.features.optional : null;
+	if (!operations || !gates || !projections || !mandatory || !optional) throw new Error(`${label} is missing operations, gates, projections, or features.mandatory/features.optional`);
+	const featureNames = [...mandatory, ...optional].map((feature) => feature?.name);
+	if ([...operations, ...gates, ...projections, ...featureNames].some((value) => typeof value !== "string" || value.length === 0)) {
+		throw new Error(`${label} has a non-string or empty operation, gate, projection, or feature name`);
+	}
+	return {
+		contract: typeof payload.contract === "string" ? payload.contract : undefined,
+		operations: new Set(operations),
+		gates: new Set(gates),
+		projections: new Set(projections),
+		features: new Set(featureNames),
+	};
+}
+
+function sameNameSet(a, b) {
+	return a.size === b.size && [...a].every((value) => b.has(value));
+}
+
+function capabilitiesCrossCheckMismatch(observed, expected) {
+	return observed.contract !== expected.contract
+		|| !sameNameSet(observed.operations, expected.operations)
+		|| !sameNameSet(observed.gates, expected.gates)
+		|| !sameNameSet(observed.projections, expected.projections)
+		|| !sameNameSet(observed.features, expected.features);
+}
+
+// A live `gentle-ai.exe review capabilities --contract gentle-ai.review-integration/v2`
+// call MAY cross-check that the source-built Windows binary is semantically
+// compatible with the signed snapshot every platform already trusts. Fixed
+// argv, no shell, bounded output (the same `commandOptions`/`maxBuffer` seam
+// `go install`/`go version -m` already use above), sealed environment. Every
+// failure mode below — non-zero exit, oversized output, non-JSON output, or a
+// semantic mismatch — fails closed with the caller publishing nothing: this
+// function has no write path at all, so it can never regenerate the snapshot
+// or create a second authority. The signed artifact stays authoritative.
+async function crossCheckWindowsCapabilities(options, execute, binaryPath, environment, cwd, packageRoot) {
+	const expected = capabilityNameSets(
+		options.capabilitiesSnapshot ?? readGentleAiCapabilitiesSnapshot(packageRoot, options.readCapabilitiesSnapshot ?? ((path) => readFileSync(path, "utf8"))),
+		GENTLE_AI_CAPABILITIES_SNAPSHOT_RELATIVE_PATH,
+	);
+	let result;
+	try {
+		result = await runCommand(execute, binaryPath, ["review", "capabilities", "--contract", GENTLE_AI_CAPABILITIES_CONTRACT], commandOptions(environment, cwd));
+	} catch (error) {
+		throw new GentleAiInstallerError(GENTLE_AI_CAPABILITIES_CROSS_CHECK_FAILED_CODE, "Gentle AI Windows capability cross-check subprocess failed.", error);
+	}
+	let parsed;
+	try {
+		parsed = JSON.parse(commandOutput(result));
+	} catch (error) {
+		throw new GentleAiInstallerError(GENTLE_AI_CAPABILITIES_CROSS_CHECK_FAILED_CODE, "Gentle AI Windows capability cross-check produced non-JSON output.", error);
+	}
+	let observed;
+	try {
+		observed = capabilityNameSets(parsed, "Windows capability cross-check output");
+	} catch (error) {
+		throw new GentleAiInstallerError(GENTLE_AI_CAPABILITIES_CROSS_CHECK_FAILED_CODE, "Gentle AI Windows capability cross-check produced a malformed capabilities payload.", error);
+	}
+	if (capabilitiesCrossCheckMismatch(observed, expected)) {
+		throw new GentleAiInstallerError(GENTLE_AI_CAPABILITIES_CROSS_CHECK_FAILED_CODE, "Gentle AI Windows-built binary capabilities do not match the signed release snapshot.");
+	}
+}
+
 async function safeRemoveDirectory(path) {
 	try {
 		const details = await lstat(path);
@@ -710,6 +800,11 @@ async function installWindowsGentleAiFromGoSumdb(options, packageRoot, architect
 			await copyFile(builtBinary, binaryPath);
 			const metadata = await verifyGoBuildMetadata(execute, goPath, binaryPath, environment, stagingDirectory, architecture);
 			await assertExactGentleAiVersion(execute, binaryPath, environment, stagingDirectory);
+			// D5: a live capability call MAY cross-check that the source-built
+			// binary is semantically compatible with the signed snapshot every
+			// platform already trusts. It must never create authority, so it
+			// runs strictly before anything below is staged or published.
+			await crossCheckWindowsCapabilities(options, execute, binaryPath, environment, stagingDirectory, packageRoot);
 			const binarySha256 = await sha256File(binaryPath);
 			// D5: the same signed assets archive as POSIX, bound in the one
 			// atomic bundle and integrity manifest below.
