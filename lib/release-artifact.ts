@@ -1,0 +1,641 @@
+// Bootstrap decoder, tree digest, and bounded extractor for gentle-ai's
+// `gentle-ai.release-artifact` contract (design D1, D2). This module
+// decodes and verifies the provider's envelope exactly as declared — it
+// re-authors no part of the manifest shape, canonicalization, or archive
+// layout, which are owned upstream by `publish-gentle-ai-release-artifacts`.
+//
+// Scope (P1a): decode + validate an already-downloaded manifest, recompute
+// the non-self-referential tree digest, and stage-bound archive extraction
+// so size is checked before any byte is written. Network download, minisign
+// signature verification, and the checksum-line match (D1 steps 1-5) are
+// out of scope here — they are orchestrated by
+// `scripts/sync-gentle-ai-release.mjs`, which calls into this module for
+// steps 6-11.
+
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { lstat, mkdir, readFile } from "node:fs/promises";
+import { isAbsolute, join, relative } from "node:path";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+
+export const RELEASE_ARTIFACT_CONTRACT_ID = "gentle-ai.release-artifact";
+export const SUPPORTED_CONTRACT_MAJOR = 1;
+export const RELEASE_ARTIFACT_TREE_CANONICALIZATION = "gentle-ai.release-artifact-tree/v1";
+export const RELEASE_ARTIFACT_MANIFEST_FILE_NAME = "artifact-manifest.json";
+export const ENTRY_TYPE = Object.freeze({ FILE: "file" });
+export const ENTRY_MODE = "0644";
+
+export interface ArtifactEntry {
+	path: string;
+	type: typeof ENTRY_TYPE.FILE;
+	mode: typeof ENTRY_MODE;
+	size: number;
+	digest: string;
+}
+
+export interface ArtifactManifest {
+	schema: string;
+	contract: { id: string; major: number; minor: number; schemaId: string; schemaPath: string };
+	release: { repository: string; tag: string; version: string; commit: string };
+	layout: { version: number };
+	archive: { asset: string; digestSource: string };
+	references: {
+		semanticSnapshots: Array<{ contract: string; path: string; schema: string }>;
+		contracts: Array<{ id: string; root: string }>;
+	};
+	tree: { algorithm: string; canonicalization: string; manifestIncluded: boolean; digest: string };
+	compatibility: {
+		minimumContractMajor: number;
+		maximumContractMajor: number;
+		additiveMinorPolicy: string;
+		unknownMandatory: string;
+		unknownOptional: string;
+	};
+	entries: ArtifactEntry[];
+}
+
+export class ReleaseArtifactManifestError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "ReleaseArtifactManifestError";
+	}
+}
+
+export class UnsupportedReleaseArtifactMajorError extends ReleaseArtifactManifestError {
+	readonly major: number;
+	constructor(major: number) {
+		super(`release artifact contract major ${major} is not supported; this consumer supports major ${SUPPORTED_CONTRACT_MAJOR}`);
+		this.name = "UnsupportedReleaseArtifactMajorError";
+		this.major = major;
+	}
+}
+
+export class ReleaseArtifactExtractionError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "ReleaseArtifactExtractionError";
+	}
+}
+
+// --- structural (key-shape) validation ------------------------------------
+
+function assertPlainObject(value: unknown, label: string): asserts value is Record<string, unknown> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw new ReleaseArtifactManifestError(`release artifact manifest ${label} must be an object`);
+	}
+}
+
+function assertExactKeys(value: Record<string, unknown>, keys: readonly string[], label: string): void {
+	const actual = Object.keys(value);
+	if (actual.length !== keys.length || !keys.every((key) => key in value)) {
+		throw new ReleaseArtifactManifestError(`release artifact manifest ${label} has an unexpected key set: ${actual.toSorted().join(", ")}`);
+	}
+}
+
+const TOP_LEVEL_KEYS = ["schema", "contract", "release", "layout", "archive", "references", "tree", "compatibility", "entries"];
+const CONTRACT_KEYS = ["id", "major", "minor", "schema_id", "schema_path"];
+const RELEASE_KEYS = ["repository", "tag", "version", "commit"];
+const LAYOUT_KEYS = ["version"];
+const ARCHIVE_KEYS = ["asset", "digest_source"];
+const REFERENCES_KEYS = ["semantic_snapshots", "contracts"];
+const SEMANTIC_SNAPSHOT_KEYS = ["contract", "path", "schema"];
+const CONTRACT_REF_KEYS = ["id", "root"];
+const TREE_KEYS = ["algorithm", "canonicalization", "manifest_included", "digest"];
+const COMPATIBILITY_KEYS = ["minimum_contract_major", "maximum_contract_major", "additive_minor_policy", "unknown_mandatory", "unknown_optional"];
+const ENTRY_KEYS = ["path", "type", "mode", "size", "digest"];
+
+// --- entry path confinement (design D3, mirrors provider ValidateEntryPath) --
+
+const ENTRY_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+const MAX_ENTRY_PATH_BYTES = 1024;
+const MAX_ENTRY_PATH_SEGMENT_BYTES = 255;
+
+function assertConfinedEntryPath(path: string): void {
+	if (path.length === 0) throw new ReleaseArtifactManifestError("release artifact entry path must not be empty");
+	if (Buffer.byteLength(path, "utf8") > MAX_ENTRY_PATH_BYTES) {
+		throw new ReleaseArtifactManifestError(`release artifact entry path exceeds ${MAX_ENTRY_PATH_BYTES} bytes: ${JSON.stringify(path)}`);
+	}
+	if (path.startsWith("/")) throw new ReleaseArtifactManifestError(`release artifact entry path must be relative: ${JSON.stringify(path)}`);
+	if (path.includes("\\")) throw new ReleaseArtifactManifestError(`release artifact entry path must use forward slashes only: ${JSON.stringify(path)}`);
+	for (let index = 0; index < path.length; index += 1) {
+		const code = path.charCodeAt(index);
+		if (code === 0 || code < 0x20 || code === 0x7f) {
+			throw new ReleaseArtifactManifestError(`release artifact entry path contains a control byte: ${JSON.stringify(path)}`);
+		}
+	}
+	for (const segment of path.split("/")) {
+		if (segment.length === 0) throw new ReleaseArtifactManifestError(`release artifact entry path has an empty segment: ${JSON.stringify(path)}`);
+		if (segment === "." || segment === "..") throw new ReleaseArtifactManifestError(`release artifact entry path contains a traversal segment: ${JSON.stringify(path)}`);
+		if (Buffer.byteLength(segment, "utf8") > MAX_ENTRY_PATH_SEGMENT_BYTES) {
+			throw new ReleaseArtifactManifestError(`release artifact entry path segment exceeds ${MAX_ENTRY_PATH_SEGMENT_BYTES} bytes: ${JSON.stringify(path)}`);
+		}
+	}
+}
+
+function decodeEntry(raw: unknown): ArtifactEntry {
+	assertPlainObject(raw, "entries[]");
+	assertExactKeys(raw, ENTRY_KEYS, "entries[]");
+	const { path, type, mode, size, digest } = raw;
+	if (typeof path !== "string") throw new ReleaseArtifactManifestError("release artifact entry path must be a string");
+	assertConfinedEntryPath(path);
+	if (type !== ENTRY_TYPE.FILE) {
+		throw new ReleaseArtifactManifestError(`release artifact entry ${JSON.stringify(path)} has disallowed type ${JSON.stringify(type)}; only ${JSON.stringify(ENTRY_TYPE.FILE)} is admitted`);
+	}
+	if (mode !== ENTRY_MODE) {
+		throw new ReleaseArtifactManifestError(`release artifact entry ${JSON.stringify(path)} has disallowed mode ${JSON.stringify(mode)}; only ${JSON.stringify(ENTRY_MODE)} is admitted`);
+	}
+	if (typeof size !== "number" || !Number.isInteger(size) || size < 0) {
+		throw new ReleaseArtifactManifestError(`release artifact entry ${JSON.stringify(path)} has an invalid size`);
+	}
+	if (typeof digest !== "string" || !ENTRY_DIGEST_PATTERN.test(digest)) {
+		throw new ReleaseArtifactManifestError(`release artifact entry ${JSON.stringify(path)} has a malformed digest ${JSON.stringify(digest)}; want sha256:<64 lowercase hex>`);
+	}
+	return { path, type: ENTRY_TYPE.FILE, mode: ENTRY_MODE, size, digest };
+}
+
+function decodeEntries(rawEntries: unknown): ArtifactEntry[] {
+	if (!Array.isArray(rawEntries)) throw new ReleaseArtifactManifestError("release artifact manifest entries must be an array");
+	const entries = rawEntries.map((raw) => decodeEntry(raw));
+	const seen = new Set<string>();
+	for (const entry of entries) {
+		if (seen.has(entry.path)) throw new ReleaseArtifactManifestError(`release artifact entries contain a duplicate path: ${JSON.stringify(entry.path)}`);
+		seen.add(entry.path);
+	}
+	for (let index = 1; index < entries.length; index += 1) {
+		if (!(entries[index - 1].path < entries[index].path)) {
+			throw new ReleaseArtifactManifestError(`release artifact entries are not sorted in ascending path order at ${JSON.stringify(entries[index].path)}`);
+		}
+	}
+	return entries;
+}
+
+// --- tree digest (design D1 step 10, provider tree.go, verbatim preimage) --
+
+export function treeDigest(entries: readonly ArtifactEntry[]): string {
+	const sorted = [...entries].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+	const hash = createHash("sha256");
+	hash.update(Buffer.from(RELEASE_ARTIFACT_TREE_CANONICALIZATION, "utf8"));
+	hash.update(Buffer.from([0]));
+	for (const entry of sorted) {
+		hash.update(Buffer.from(`${entry.path}\0${entry.type}\0${entry.mode}\0${entry.size}\0${entry.digest}\n`, "utf8"));
+	}
+	return `sha256:${hash.digest("hex")}`;
+}
+
+// --- manifest decode (design D1 steps 7-11, in order; major fails first) --
+
+export function decodeArtifactManifest(bytes: Buffer): ArtifactManifest {
+	let raw: unknown;
+	try {
+		raw = JSON.parse(bytes.toString("utf8"));
+	} catch {
+		throw new ReleaseArtifactManifestError("release artifact manifest is not valid JSON");
+	}
+	assertPlainObject(raw, "root");
+	assertExactKeys(raw, TOP_LEVEL_KEYS, "root");
+
+	const contractRaw = raw.contract;
+	assertPlainObject(contractRaw, "contract");
+	assertExactKeys(contractRaw, CONTRACT_KEYS, "contract");
+
+	const releaseRaw = raw.release;
+	assertPlainObject(releaseRaw, "release");
+	assertExactKeys(releaseRaw, RELEASE_KEYS, "release");
+
+	const layoutRaw = raw.layout;
+	assertPlainObject(layoutRaw, "layout");
+	assertExactKeys(layoutRaw, LAYOUT_KEYS, "layout");
+
+	const archiveRaw = raw.archive;
+	assertPlainObject(archiveRaw, "archive");
+	assertExactKeys(archiveRaw, ARCHIVE_KEYS, "archive");
+
+	const referencesRaw = raw.references;
+	assertPlainObject(referencesRaw, "references");
+	assertExactKeys(referencesRaw, REFERENCES_KEYS, "references");
+	if (!Array.isArray(referencesRaw.semantic_snapshots)) throw new ReleaseArtifactManifestError("release artifact manifest references.semantic_snapshots must be an array");
+	for (const entry of referencesRaw.semantic_snapshots) {
+		assertPlainObject(entry, "references.semantic_snapshots[]");
+		assertExactKeys(entry, SEMANTIC_SNAPSHOT_KEYS, "references.semantic_snapshots[]");
+	}
+	if (!Array.isArray(referencesRaw.contracts)) throw new ReleaseArtifactManifestError("release artifact manifest references.contracts must be an array");
+	for (const entry of referencesRaw.contracts) {
+		assertPlainObject(entry, "references.contracts[]");
+		assertExactKeys(entry, CONTRACT_REF_KEYS, "references.contracts[]");
+	}
+
+	const treeRaw = raw.tree;
+	assertPlainObject(treeRaw, "tree");
+	assertExactKeys(treeRaw, TREE_KEYS, "tree");
+
+	const compatibilityRaw = raw.compatibility;
+	assertPlainObject(compatibilityRaw, "compatibility");
+	assertExactKeys(compatibilityRaw, COMPATIBILITY_KEYS, "compatibility");
+
+	if (!Array.isArray(raw.entries)) throw new ReleaseArtifactManifestError("release artifact manifest entries must be an array");
+	for (const entry of raw.entries) {
+		assertPlainObject(entry, "entries[]");
+		assertExactKeys(entry, ENTRY_KEYS, "entries[]");
+	}
+
+	// Semantic validation begins here. The unsupported-major check MUST run
+	// first, before any entry/tree semantics are interpreted (spec
+	// "Unsupported contract major fails closed before layout is trusted").
+	const major = contractRaw.major;
+	if (typeof major !== "number" || !Number.isInteger(major)) {
+		throw new ReleaseArtifactManifestError("release artifact manifest contract.major must be an integer");
+	}
+	if (major !== SUPPORTED_CONTRACT_MAJOR) {
+		throw new UnsupportedReleaseArtifactMajorError(major);
+	}
+
+	const contractId = contractRaw.id;
+	if (contractId !== RELEASE_ARTIFACT_CONTRACT_ID) {
+		throw new ReleaseArtifactManifestError(`release artifact contract id ${JSON.stringify(contractId)} is not supported; want ${JSON.stringify(RELEASE_ARTIFACT_CONTRACT_ID)}`);
+	}
+	const minor = contractRaw.minor;
+	if (typeof minor !== "number" || !Number.isInteger(minor) || minor < 0) {
+		throw new ReleaseArtifactManifestError("release artifact manifest contract.minor must be a non-negative integer");
+	}
+	const schemaId = contractRaw.schema_id;
+	const schemaPath = contractRaw.schema_path;
+	if (typeof schemaId !== "string" || schemaId.length === 0) throw new ReleaseArtifactManifestError("release artifact manifest contract.schema_id must be a non-empty string");
+	if (typeof schemaPath !== "string" || schemaPath.length === 0) throw new ReleaseArtifactManifestError("release artifact manifest contract.schema_path must be a non-empty string");
+
+	const repository = releaseRaw.repository;
+	const tag = releaseRaw.tag;
+	const version = releaseRaw.version;
+	const commit = releaseRaw.commit;
+	if ([repository, tag, version, commit].some((value) => typeof value !== "string" || value.length === 0)) {
+		throw new ReleaseArtifactManifestError("release artifact manifest release identity field group is incomplete");
+	}
+
+	const layoutVersion = layoutRaw.version;
+	if (typeof layoutVersion !== "number" || !Number.isInteger(layoutVersion) || layoutVersion < 1) {
+		throw new ReleaseArtifactManifestError("release artifact manifest is missing the mandatory layout identity field group");
+	}
+
+	const asset = archiveRaw.asset;
+	const digestSource = archiveRaw.digest_source;
+	if (typeof asset !== "string" || asset.length === 0) throw new ReleaseArtifactManifestError("release artifact manifest archive.asset must be a non-empty string");
+	if (digestSource !== "signed-checksums.txt") throw new ReleaseArtifactManifestError(`release artifact manifest archive.digest_source ${JSON.stringify(digestSource)} is not supported`);
+
+	const entries = decodeEntries(raw.entries);
+	if (entries.length === 0) throw new ReleaseArtifactManifestError("release artifact manifest is missing the mandatory entries list");
+
+	const semanticSnapshotsRaw = referencesRaw.semantic_snapshots as Array<Record<string, unknown>>;
+	const contractRefsRaw = referencesRaw.contracts as Array<Record<string, unknown>>;
+	if (semanticSnapshotsRaw.length === 0) throw new ReleaseArtifactManifestError("release artifact manifest is missing the mandatory semantic snapshot references");
+	if (contractRefsRaw.length === 0) throw new ReleaseArtifactManifestError("release artifact manifest is missing the mandatory contract references");
+
+	const unknownMandatory = compatibilityRaw.unknown_mandatory;
+	if (unknownMandatory !== "reject") {
+		throw new ReleaseArtifactManifestError(`release artifact manifest compatibility.unknown_mandatory = ${JSON.stringify(unknownMandatory)}, must be "reject"`);
+	}
+
+	const entryPaths = new Set(entries.map((entry) => entry.path));
+	if (!entryPaths.has(schemaPath)) {
+		throw new ReleaseArtifactManifestError(`release artifact manifest contract.schema_path ${JSON.stringify(schemaPath)} does not resolve into entries`);
+	}
+	const semanticSnapshots = semanticSnapshotsRaw.map((snapshot) => {
+		const contract = snapshot.contract;
+		const path = snapshot.path;
+		const schema = snapshot.schema;
+		if (typeof path !== "string" || !entryPaths.has(path)) {
+			throw new ReleaseArtifactManifestError(`release artifact manifest semantic snapshot reference ${JSON.stringify(path)} does not resolve into entries`);
+		}
+		if (typeof contract !== "string" || contract.length === 0) throw new ReleaseArtifactManifestError("release artifact manifest semantic snapshot reference is missing its contract id");
+		if (schema !== "gentle-ai.release-semantic-capabilities/v1") throw new ReleaseArtifactManifestError(`release artifact manifest semantic snapshot reference schema ${JSON.stringify(schema)} is not supported`);
+		return { contract, path, schema };
+	});
+	const contractRefs = contractRefsRaw.map((ref) => {
+		const id = ref.id;
+		const root = ref.root;
+		if (typeof id !== "string" || id.length === 0) throw new ReleaseArtifactManifestError("release artifact manifest contract reference is missing its id");
+		if (typeof root !== "string" || root.length === 0) throw new ReleaseArtifactManifestError("release artifact manifest contract reference is missing its root");
+		return { id, root };
+	});
+
+	const manifestIncluded = treeRaw.manifest_included;
+	if (manifestIncluded !== false) {
+		throw new ReleaseArtifactManifestError("release artifact tree.manifest_included must be false; true is an unknown layout");
+	}
+	const algorithm = treeRaw.algorithm;
+	if (algorithm !== "sha256") throw new ReleaseArtifactManifestError(`release artifact tree algorithm ${JSON.stringify(algorithm)} is not supported; want "sha256"`);
+	const canonicalization = treeRaw.canonicalization;
+	if (canonicalization !== RELEASE_ARTIFACT_TREE_CANONICALIZATION) {
+		throw new ReleaseArtifactManifestError(`release artifact tree canonicalization ${JSON.stringify(canonicalization)} is not supported; want ${JSON.stringify(RELEASE_ARTIFACT_TREE_CANONICALIZATION)}`);
+	}
+	const declaredDigest = treeRaw.digest;
+	const recomputedDigest = treeDigest(entries);
+	if (declaredDigest !== recomputedDigest) {
+		throw new ReleaseArtifactManifestError(`release artifact tree digest mismatch: declared ${JSON.stringify(declaredDigest)}, recomputed ${JSON.stringify(recomputedDigest)}`);
+	}
+
+	return {
+		schema: raw.schema as string,
+		contract: { id: contractId, major, minor, schemaId, schemaPath },
+		release: { repository, tag, version, commit } as ArtifactManifest["release"],
+		layout: { version: layoutVersion },
+		archive: { asset, digestSource },
+		references: { semanticSnapshots, contracts: contractRefs },
+		tree: { algorithm, canonicalization, manifestIncluded, digest: declaredDigest as string },
+		compatibility: {
+			minimumContractMajor: compatibilityRaw.minimum_contract_major as number,
+			maximumContractMajor: compatibilityRaw.maximum_contract_major as number,
+			additiveMinorPolicy: compatibilityRaw.additive_minor_policy as string,
+			unknownMandatory,
+			unknownOptional: compatibilityRaw.unknown_optional as string,
+		},
+		entries,
+	};
+}
+
+// --- bundled schema identity/digest (design D1 step 9) --------------------
+
+export function assertBundledSchemaMatches(manifest: ArtifactManifest, schemaBytes: Buffer): void {
+	const entry = manifest.entries.find((candidate) => candidate.path === manifest.contract.schemaPath);
+	if (!entry) {
+		throw new ReleaseArtifactManifestError(`release artifact manifest bundled schema entry is missing: ${manifest.contract.schemaPath}`);
+	}
+	const digest = `sha256:${createHash("sha256").update(schemaBytes).digest("hex")}`;
+	if (digest !== entry.digest) {
+		throw new ReleaseArtifactManifestError(`release artifact bundled schema ${manifest.contract.schemaPath} digest mismatch: got ${digest}, want ${entry.digest}`);
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(schemaBytes.toString("utf8"));
+	} catch {
+		throw new ReleaseArtifactManifestError(`release artifact bundled schema ${manifest.contract.schemaPath} is not valid JSON`);
+	}
+	const id = typeof parsed === "object" && parsed !== null && "$id" in parsed ? (parsed as Record<string, unknown>).$id : undefined;
+	if (id !== manifest.contract.schemaId) {
+		throw new ReleaseArtifactManifestError(`release artifact bundled schema ${manifest.contract.schemaPath} $id ${JSON.stringify(id)} does not match contract.schema_id ${JSON.stringify(manifest.contract.schemaId)}`);
+	}
+}
+
+// --- bootstrap archive evidence (design D1 step 2/3, spec "Bootstrap
+// snapshot evidence never substitutes for release evidence") --------------
+
+export const RELEASE_ARTIFACT_EVIDENCE_CLASS = Object.freeze({
+	BOOTSTRAP: "development/bootstrap",
+	RELEASE: "release",
+});
+
+export interface ReleaseArtifactSource {
+	archivePath: string;
+	evidenceClass: typeof RELEASE_ARTIFACT_EVIDENCE_CLASS.BOOTSTRAP;
+	signatureStatus: "not-applicable/local-unsigned";
+}
+
+// A bootstrap archive must be passed explicitly via --bootstrap-archive; it
+// is never auto-discovered (no default path, no directory scan). This keeps
+// the only local-unsigned input path opt-in and clearly labeled.
+export function resolveBootstrapArtifactSource(bootstrapArchivePath: unknown): ReleaseArtifactSource {
+	if (typeof bootstrapArchivePath !== "string" || bootstrapArchivePath.length === 0) {
+		throw new ReleaseArtifactManifestError("a bootstrap archive path must be passed explicitly via --bootstrap-archive; it is never auto-discovered");
+	}
+	return {
+		archivePath: bootstrapArchivePath,
+		evidenceClass: RELEASE_ARTIFACT_EVIDENCE_CLASS.BOOTSTRAP,
+		signatureStatus: "not-applicable/local-unsigned",
+	};
+}
+
+export function assertReleaseAcceptanceEvidence(source: { evidenceClass: string }): void {
+	if (source.evidenceClass !== RELEASE_ARTIFACT_EVIDENCE_CLASS.RELEASE) {
+		throw new ReleaseArtifactManifestError(`release artifact evidence class ${JSON.stringify(source.evidenceClass)} cannot serve as pin or final-acceptance evidence; only ${JSON.stringify(RELEASE_ARTIFACT_EVIDENCE_CLASS.RELEASE)} evidence is accepted`);
+	}
+}
+
+// --- bounded extraction (design D2) ---------------------------------------
+
+export interface ExtractionLimits {
+	maxEntries: number;
+	maxFileBytes: number;
+	maxTotalBytes: number;
+}
+
+export const DEFAULT_EXTRACTION_LIMITS: ExtractionLimits = Object.freeze({
+	maxEntries: 512,
+	maxFileBytes: 8 * 1024 * 1024,
+	maxTotalBytes: 64 * 1024 * 1024,
+});
+
+// The only archive member type admitted anywhere in the pipeline. Matches
+// the leading type character in `tar -tv` verbose listings ('-' = regular).
+export const REGULAR_FILE_TYPE_CHAR = "-";
+
+export interface ArchiveMember {
+	readonly path: string;
+	readonly size: number;
+	readonly typeChar: string;
+}
+
+// Stage 0 (design D2): listing-only bound checks, before any byte is
+// written. Pure and synchronous so it is trivially testable without any
+// filesystem or archive fake.
+export function enforceExtractionCaps(members: readonly ArchiveMember[], limits: ExtractionLimits = DEFAULT_EXTRACTION_LIMITS): void {
+	if (members.length > limits.maxEntries) {
+		throw new ReleaseArtifactExtractionError(`release artifact archive lists ${members.length} members, exceeding the ${limits.maxEntries} member cap (MAX_ASSET_ENTRIES)`);
+	}
+	let total = 0;
+	for (const member of members) {
+		if (member.typeChar !== REGULAR_FILE_TYPE_CHAR) {
+			throw new ReleaseArtifactExtractionError(`release artifact archive member ${JSON.stringify(member.path)} has disallowed type ${JSON.stringify(member.typeChar)}; only regular files are admitted`);
+		}
+		if (member.size > limits.maxFileBytes) {
+			throw new ReleaseArtifactExtractionError(`release artifact archive member ${JSON.stringify(member.path)} size ${member.size} exceeds the ${limits.maxFileBytes} byte per-file cap (MAX_ASSET_FILE_BYTES)`);
+		}
+		total += member.size;
+		if (total > limits.maxTotalBytes) {
+			throw new ReleaseArtifactExtractionError(`release artifact archive listing exceeds the ${limits.maxTotalBytes} byte total unpacked cap (MAX_ASSETS_UNPACKED_BYTES)`);
+		}
+	}
+}
+
+// Stage 3 (design D2): exact path-set equality against {manifest file} U
+// entries[], and listed size vs entries[].size agreement. This MUST run
+// before stage 4 (extractAll) — an extra archive member, a missing one, or
+// a size disagreement is rejected here, before any bulk write. A tree
+// digest alone cannot detect an added file: a digest walk only ever
+// revisits declared entries, so an extra file that nobody asks about never
+// influences the digest. Exact-set equality is the only check that catches
+// it, which is why it must run before any per-file digesting.
+export function assertExactMemberSet(members: readonly ArchiveMember[], manifestFileName: string, entries: readonly ArtifactEntry[]): void {
+	const expectedSizes = new Map<string, number | undefined>();
+	expectedSizes.set(manifestFileName, undefined);
+	for (const entry of entries) expectedSizes.set(entry.path, entry.size);
+
+	const seen = new Set<string>();
+	for (const member of members) {
+		if (!expectedSizes.has(member.path)) {
+			throw new ReleaseArtifactExtractionError(`release artifact archive contains an unlisted member: ${JSON.stringify(member.path)}`);
+		}
+		if (seen.has(member.path)) {
+			throw new ReleaseArtifactExtractionError(`release artifact archive contains a duplicate member: ${JSON.stringify(member.path)}`);
+		}
+		seen.add(member.path);
+		const expectedSize = expectedSizes.get(member.path);
+		if (member.path !== manifestFileName && expectedSize !== member.size) {
+			throw new ReleaseArtifactExtractionError(`release artifact archive member ${JSON.stringify(member.path)} size ${member.size} disagrees with the manifest entry size ${expectedSize}`);
+		}
+	}
+	for (const path of expectedSizes.keys()) {
+		if (!seen.has(path)) {
+			throw new ReleaseArtifactExtractionError(`release artifact archive is missing a manifest-declared member: ${JSON.stringify(path)}`);
+		}
+	}
+}
+
+function isConfined(candidatePath: string, directory: string): boolean {
+	const relativePath = relative(directory, candidatePath);
+	return relativePath !== "" && !relativePath.startsWith("..") && !isAbsolute(relativePath);
+}
+
+export interface ReleaseArtifactExtractorPorts {
+	listMembers(archivePath: string): Promise<ArchiveMember[]>;
+	extractMember(archivePath: string, memberPath: string, destinationDir: string): Promise<void>;
+	extractAll(archivePath: string, destinationDir: string): Promise<void>;
+}
+
+export interface ExtractReleaseArtifactOptions {
+	extractor: ReleaseArtifactExtractorPorts;
+	limits?: ExtractionLimits;
+	manifestFileName?: string;
+	readFile?: (path: string) => Promise<Buffer>;
+	lstat?: (path: string) => Promise<{ isFile(): boolean; isSymbolicLink(): boolean; size: number; mode: number }>;
+}
+
+export interface ExtractedReleaseArtifact {
+	manifest: ArtifactManifest;
+	destinationDir: string;
+}
+
+// Orchestrates the full design D2 staged pipeline:
+//   stage 0  list members, enforce caps                    (no bytes written)
+//   stage 1  extract only the manifest member                (one file)
+//   stage 2  decode + validate the manifest                   (design D1 7-11)
+//   stage 3  exact path-set equality against manifest entries (load-bearing)
+//   stage 4  extract everything                                (only now)
+//   stage 5  per-file lstat/confinement/size/digest/mode recheck
+export async function extractReleaseArtifact(
+	archivePath: string,
+	destinationDir: string,
+	options: ExtractReleaseArtifactOptions,
+): Promise<ExtractedReleaseArtifact> {
+	const {
+		extractor,
+		limits = DEFAULT_EXTRACTION_LIMITS,
+		manifestFileName = RELEASE_ARTIFACT_MANIFEST_FILE_NAME,
+		readFile: readFilePort = (path: string) => readFile(path),
+		lstat: lstatPort = (path: string) => lstat(path),
+	} = options;
+
+	// stage 0
+	const members = await extractor.listMembers(archivePath);
+	enforceExtractionCaps(members, limits);
+
+	// stage 1 + 2
+	await extractor.extractMember(archivePath, manifestFileName, destinationDir);
+	const manifestPath = join(destinationDir, manifestFileName);
+	if (!isConfined(manifestPath, destinationDir)) {
+		throw new ReleaseArtifactExtractionError("release artifact manifest member escapes the extraction root");
+	}
+	const manifestStat = await lstatPort(manifestPath);
+	if (!manifestStat.isFile() || manifestStat.isSymbolicLink()) {
+		throw new ReleaseArtifactExtractionError("release artifact manifest member is not a regular non-symlink file");
+	}
+	const manifestBytes = await readFilePort(manifestPath);
+	const manifest = decodeArtifactManifest(manifestBytes);
+
+	// stage 3 — load-bearing: must run before stage 4 writes anything else.
+	assertExactMemberSet(members, manifestFileName, manifest.entries);
+
+	// stage 4
+	await extractor.extractAll(archivePath, destinationDir);
+
+	// stage 5
+	for (const entry of manifest.entries) {
+		const entryPath = join(destinationDir, entry.path);
+		if (!isConfined(entryPath, destinationDir)) {
+			throw new ReleaseArtifactExtractionError(`release artifact entry escapes the extraction root: ${entry.path}`);
+		}
+		const stats = await lstatPort(entryPath);
+		if (!stats.isFile() || stats.isSymbolicLink()) {
+			throw new ReleaseArtifactExtractionError(`release artifact entry is not a regular non-symlink file: ${entry.path}`);
+		}
+		if (stats.size !== entry.size) {
+			throw new ReleaseArtifactExtractionError(`release artifact entry ${entry.path} extracted size ${stats.size} disagrees with the manifest size ${entry.size}`);
+		}
+		if ((stats.mode & 0o111) !== 0) {
+			throw new ReleaseArtifactExtractionError(`release artifact entry ${entry.path} is executable; only mode 0644 is admitted`);
+		}
+		const bytes = await readFilePort(entryPath);
+		const digest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+		if (digest !== entry.digest) {
+			throw new ReleaseArtifactExtractionError(`release artifact entry ${entry.path} digest mismatch after extraction: got ${digest}, want ${entry.digest}`);
+		}
+	}
+
+	return { manifest, destinationDir };
+}
+
+// --- production system-tar wiring ------------------------------------------
+//
+// Reuses only a trusted system `tar` binary (never a second JS tar
+// implementation, per design D2's rejected-alternatives table). The verbose
+// listing parser is tuned to GNU tar's `-tv` column layout and fails closed
+// (rejects the whole listing) on any line it cannot confidently parse,
+// rather than risk silently misreading a member's type or size.
+
+const TAR_VERBOSE_LISTING_LINE = /^([-bcdlps])[-rwxXsStT]{9}\s+\S+\s+(\d+)\s+\S+\s+\S+\s+(.+)$/;
+
+function parseTarVerboseListing(output: string): ArchiveMember[] {
+	const members: ArchiveMember[] = [];
+	for (const line of output.split("\n")) {
+		if (line.length === 0) continue;
+		const match = TAR_VERBOSE_LISTING_LINE.exec(line);
+		if (!match) throw new ReleaseArtifactExtractionError(`release artifact archive listing produced an unrecognized line: ${JSON.stringify(line)}`);
+		const [, typeChar, sizeText, rawPath] = match;
+		const size = Number(sizeText);
+		if (!Number.isSafeInteger(size) || size < 0) {
+			throw new ReleaseArtifactExtractionError(`release artifact archive listing has an invalid size: ${JSON.stringify(line)}`);
+		}
+		const path = rawPath.split(" -> ")[0];
+		members.push({ path, size, typeChar });
+	}
+	return members;
+}
+
+function trustedTarBinary(platform: string, exists: (path: string) => boolean): string {
+	if (platform === "win32") {
+		const command = "C:\\Windows\\System32\\tar.exe";
+		if (exists(command)) return command;
+		throw new ReleaseArtifactExtractionError("release artifact extraction requires the System32 tar.exe extractor");
+	}
+	const command = [join("/usr/bin", "tar"), join("/bin", "tar")].find((path) => exists(path));
+	if (!command) throw new ReleaseArtifactExtractionError("release artifact extraction requires a trusted system tar extractor");
+	return command;
+}
+
+export function createSystemReleaseArtifactExtractor(platform = process.platform, exists = existsSync): ReleaseArtifactExtractorPorts {
+	const command = trustedTarBinary(platform, exists);
+	return {
+		async listMembers(archivePath: string): Promise<ArchiveMember[]> {
+			const { stdout } = await execFileAsync(command, ["-tvzf", archivePath], { shell: false, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
+			return parseTarVerboseListing(stdout);
+		},
+		async extractMember(archivePath: string, memberPath: string, destinationDir: string): Promise<void> {
+			await mkdir(destinationDir, { recursive: true, mode: 0o700 });
+			await execFileAsync(command, ["-xzf", archivePath, "-C", destinationDir, memberPath], { shell: false, windowsHide: true, maxBuffer: 1024 * 1024 });
+		},
+		async extractAll(archivePath: string, destinationDir: string): Promise<void> {
+			await mkdir(destinationDir, { recursive: true, mode: 0o700 });
+			await execFileAsync(command, ["-xzf", archivePath, "-C", destinationDir], { shell: false, windowsHide: true, maxBuffer: 1024 * 1024 });
+		},
+	};
+}
