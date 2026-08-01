@@ -3,6 +3,10 @@
 		"comment-writer": {
 			"path": "skills/_vendor/comment-writer/SKILL.md",
 			"sha256": "cb980612f7237b31a4afea87899275ba20f1f621ba237ecd4a3b440f0cf2e6da"
+		},
+		"work-unit-commits": {
+			"path": "skills/_vendor/work-unit-commits/SKILL.md",
+			"sha256": "9b4e9914d612ea11c86747d3fcd4e42bc7ef5cc5e6ab9179c3de7148b015c4ac"
 		}
 	}
 }
