@@ -1,0 +1,91 @@
+name: gentle-ai release received
+
+# Pin-bump receiver (design.md "P4" / proposal.md P4). This workflow is the
+# sole `repository_dispatch` receiver for a published gentle-ai release and
+# hosts the ONLY job in this repository, in any workflow, that gentle-pi
+# lets download a gentle-ai release (design D1/D6: "every per-PR check is
+# offline; only the pin-bump job downloads").
+#
+# WHY THIS RECEIVER IS INERT UNTIL IT REACHES `main` (expected state, not a
+# defect -- do not "fix" it):
+#
+#   GitHub only triggers `repository_dispatch` for a workflow file that
+#   already exists on the repository's DEFAULT branch. A `repository_dispatch`
+#   event fired against gentle-pi cannot invoke this workflow at all until
+#   this exact file is merged to `main`. Before that point, this workflow
+#   simply never runs -- there is no bug to chase and nothing to debug.
+#
+#   This is also why future bump PRs must always target `main`, never a
+#   temporary feature/tracker branch: once this file lands on `main`, the
+#   live event source is the provider's `main`-branch-triggered publish, and
+#   a bump PR against a non-default branch would never be reachable by it.
+#
+# Maintainer decision: the dispatch payload is the TAG ONLY (see
+# scripts/bump-gentle-ai-pin.mjs for why -- a richer payload would be a
+# second source of truth). The tag is passed to the bump script through an
+# environment variable (`DISPATCHED_TAG` below), never interpolated directly
+# into a `run:` script body -- interpolating `${{ github.event.* }}` straight
+# into shell text is GitHub Actions' own well-known script-injection vector.
+# scripts/bump-gentle-ai-pin.mjs then validates it against ^v\d+\.\d+\.\d+$
+# before any use (see that file's threat-matrix comment).
+#
+# Maintainer decision: this job NEVER merges the PR it opens. A human always
+# reviews and merges a pin bump. Do not add a merge or auto-merge step here.
+
+on:
+  repository_dispatch:
+    types: [gentle-ai-release-published]
+
+permissions:
+  contents: read
+
+jobs:
+  pin-bump:
+    # The ONLY job, in the ONLY workflow, that gentle-pi lets download a
+    # gentle-ai release. Every job in .github/workflows/ci.yml stays fully
+    # offline against checked-in mirrors and the lock (design D6); this job's
+    # own `pnpm install` step still reaches the npm registry for dependency
+    # installation, which is a separate, pre-existing surface unrelated to
+    # the gentle-ai release trust boundary this design adds.
+    if: github.repository == 'Gentleman-Programming/gentle-pi'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      DISPATCHED_TAG: ${{ github.event.client_payload.tag }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: main
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.1.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Configure git identity for the automated pin-bump commit
+        run: |
+          git config user.name "gentle-ai-release-bot"
+          git config user.email "gentle-ai-release-bot@users.noreply.github.com"
+
+      - name: Bump gentle-ai pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # DISPATCHED_TAG is read from the environment (set above from the
+        # dispatch payload), never interpolated into this script body.
+        # scripts/bump-gentle-ai-pin.mjs validates it before any use and
+        # always opens the PR against the explicit literal base "main" --
+        # never auto-merging it. See that script for the full threat-matrix
+        # rationale.
+        run: node scripts/bump-gentle-ai-pin.mjs --tag "$DISPATCHED_TAG"
