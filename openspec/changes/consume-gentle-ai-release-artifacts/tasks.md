@@ -72,15 +72,15 @@ Chain strategy: feature-branch-chain
 
 ## PR 4 — P2b: Windows split provenance + cross-check + bundle lifecycle (depends: PR 3)
 
-- [ ] 4.1 RED: Windows subprocess cross-check tests (threat-matrix: subprocess invocation) — non-zero exit, oversized output, non-JSON output each fail closed with no bundle published.
-- [ ] 4.2 RED: split-provenance test — one manifest records both SumDB binary provenance and signed-archive assets provenance.
-- [ ] 4.3 RED: cross-check mismatch fails closed and never writes the snapshot, never creates authority.
-- [ ] 4.4 RED: `pruneSupersededBundles` never touches the live bundle, runs only after the new bundle's rename succeeds, and its failure is non-fatal and logged.
-- [ ] 4.5 RED: `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1` skips binary and assets symmetrically with the same loud disposition; no partially configured bundle directory is created.
-- [ ] 4.6 GREEN: `windowsSourceManifest` gains the assets keys; Windows downloads the same signed archive and verifies against locked digests exactly as POSIX (D5).
-- [ ] 4.7 GREEN: sealed `gentle-ai.exe review capabilities --contract gentle-ai.review-integration/v2` cross-check — fixed argv, no shell, bounded output, sealed environment (reuses the existing `go install` invocation seam); fails closed on mismatch.
-- [ ] 4.8 GREEN: `pruneSupersededBundles(runtimeRoot)` — removes `v<other-version>` directories only after the new rename succeeds; never the live bundle.
-- [ ] 4.9 Verify: `pnpm test -- gentle-ai-binary gentle-ai-installer`; `pnpm run test:harness` (Windows fixture path).
+- [x] 4.1 RED: Windows subprocess cross-check tests (threat-matrix: subprocess invocation) — non-zero exit, oversized output, non-JSON output each fail closed with no bundle published.
+- [x] 4.2 RED: split-provenance test — one manifest records both SumDB binary provenance and signed-archive assets provenance.
+- [x] 4.3 RED: cross-check mismatch fails closed and never writes the snapshot, never creates authority.
+- [x] 4.4 RED: `pruneSupersededBundles` never touches the live bundle, runs only after the new bundle's rename succeeds, and its failure is non-fatal and logged.
+- [x] 4.5 RED: `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1` skips binary and assets symmetrically with the same loud disposition; no partially configured bundle directory is created.
+- [x] 4.6 GREEN: `windowsSourceManifest` gains the assets keys; Windows downloads the same signed archive and verifies against locked digests exactly as POSIX (D5).
+- [x] 4.7 GREEN: sealed `gentle-ai.exe review capabilities --contract gentle-ai.review-integration/v2` cross-check — fixed argv, no shell, bounded output, sealed environment (reuses the existing `go install` invocation seam); fails closed on mismatch.
+- [x] 4.8 GREEN: `pruneSupersededBundles(runtimeRoot)` — removes `v<other-version>` directories only after the new rename succeeds; never the live bundle.
+- [x] 4.9 Verify: `pnpm test -- gentle-ai-binary gentle-ai-installer`; `pnpm run test:harness` (Windows fixture path).
 
 ## PR 5 — P3a: Generators — baselines, generated floor, capability row (depends: PR 4)
 
