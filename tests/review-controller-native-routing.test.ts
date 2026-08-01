@@ -1615,6 +1615,287 @@ test("FINALIZE selects resultArtifactFiles when every admitted manifest carries 
 	assert.equal(referenceTransportRequests[0]?.resultArtifactFiles, undefined);
 });
 
+// ---------------------------------------------------------------------------
+// Wave 1, W2: diagnostics, one-shot relaunch, lost-output recovery, cleanup
+// (design.md Decisions 2-5). These tests exercise the FINALIZE capture phase
+// through the full registered controller so the parameter-injected
+// `captureSlotRecords` map persists across sequential FINALIZE calls, the
+// same way `correctionEvidenceByLineage` already does above.
+// ---------------------------------------------------------------------------
+
+function rejectedAdmission(overrides: Partial<{ code: string; finding_id: string; reason: string; location: string }> = {}): Error {
+	return Object.assign(new Error("native declined admission"), {
+		admissionDiagnostic: {
+			code: "invalid_finding_location",
+			finding_id: "RISK-001",
+			reason: "location escapes the frozen candidate scope",
+			...overrides,
+		},
+	});
+}
+
+test("FINALIZE capture phase grants exactly one relaunch per slotKey on a safe rejection diagnostic, then reports exhausted on a second rejection (Wave 1, W2.3, one-shot relaunch)", async (t) => {
+	const cwd = repository(t);
+	let captureAttempts = 0;
+	let finalizes = 0;
+	const { controller } = runtime(fakeNative({
+		start: async () => ({ lineageId: "relaunch-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+		targetStatus: async (request) => request.lineageId === undefined
+			? candidateStartTargetStatus(request)
+			: bindReviewerManifests(candidateFinalizeTargetStatus(request, "relaunch-lineage"), request.cwd, [{ lens: "review-reliability", selectedOrder: 0 }]),
+		captureResult: async (request) => {
+			captureAttempts += 1;
+			if (captureAttempts <= 2) throw rejectedAdmission();
+			return defaultCaptureResult(request);
+		},
+		finalize: async () => { finalizes += 1; return { lineageId: "relaunch-lineage", state: "approved", action: "approved", storeRevision: "r1" }; },
+	}));
+	await controller.execute("relaunch-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	const attempt = (id: string, evidence: string) => controller.execute(id, {
+		operation: "finalize",
+		lineageId: "relaunch-lineage",
+		input: JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: [evidence] }] } }),
+	}, undefined, undefined, context(cwd));
+
+	const first = await attempt("relaunch-first", "first submission");
+	const firstDetails = first.details as Record<string, unknown>;
+	assert.equal(firstDetails.status, "blocked");
+	assert.equal(firstDetails.outcome, "capture-relaunch-required");
+	assert.equal(firstDetails.lens, "review-reliability");
+	assert.deepEqual(firstDetails.admission_diagnostic, { code: "invalid_finding_location", finding_id: "RISK-001", reason: "location escapes the frozen candidate scope" });
+	assert.deepEqual(firstDetails.relaunch_slot, { lens: "review-reliability", selected_order: 0 });
+	assert.equal(finalizes, 0);
+
+	// A different resubmission (distinct evidence bytes) still consumes the
+	// one-shot grant: a SECOND rejection for the same slotKey is exhausted.
+	const second = await attempt("relaunch-second", "second submission");
+	const secondDetails = second.details as Record<string, unknown>;
+	assert.equal(secondDetails.status, "blocked");
+	assert.equal(secondDetails.outcome, "exhausted");
+	assert.equal(finalizes, 0);
+	assert.equal(captureAttempts, 2);
+});
+
+test("FINALIZE capture phase reports unavailable when the reoffered STATUS drifts from the rejected slotKey, or the diagnostic itself is unsafe (Wave 1, W2.3, one-shot relaunch)", async (t) => {
+	// Case A: the reoffered slot carries a different subjectHash than the
+	// slot that was rejected -- the six-field slotKey no longer matches.
+	{
+		const cwd = repository(t);
+		let captureCalls = 0;
+		let statusCallsWithLineage = 0;
+		const { controller } = runtime(fakeNative({
+			start: async () => ({ lineageId: "unavailable-lineage-a", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+			targetStatus: async (request) => {
+				if (request.lineageId === undefined) return candidateStartTargetStatus(request);
+				statusCallsWithLineage += 1;
+				const subjectHash = statusCallsWithLineage === 1 ? `sha256:${"1".repeat(64)}` : `sha256:${"2".repeat(64)}`;
+				return bindReviewerManifests(candidateFinalizeTargetStatus(request, "unavailable-lineage-a"), request.cwd, [{ lens: "review-reliability", selectedOrder: 0, subjectHash }]);
+			},
+			captureResult: async () => { captureCalls += 1; throw rejectedAdmission({ code: "candidate_causality_unproven", finding_id: "RISK-002" }); },
+			finalize: async () => { throw new Error("finalize must not run"); },
+		}));
+		await controller.execute("unavailable-start-a", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+		const result = await controller.execute("unavailable-attempt-a", {
+			operation: "finalize",
+			lineageId: "unavailable-lineage-a",
+			input: JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: ["reviewed"] }] } }),
+		}, undefined, undefined, context(cwd));
+		const details = result.details as Record<string, unknown>;
+		assert.equal(details.status, "blocked");
+		assert.equal(details.outcome, "unavailable");
+		assert.equal(captureCalls, 1, "the drifted reoffer must never be retried");
+	}
+	// Case B: the diagnostic itself does not decode -- terminal unavailable
+	// before any reoffer STATUS query.
+	{
+		const cwd = repository(t);
+		let statusCallsWithLineage = 0;
+		const { controller } = runtime(fakeNative({
+			start: async () => ({ lineageId: "unavailable-lineage-b", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+			targetStatus: async (request) => {
+				if (request.lineageId === undefined) return candidateStartTargetStatus(request);
+				statusCallsWithLineage += 1;
+				return bindReviewerManifests(candidateFinalizeTargetStatus(request, "unavailable-lineage-b"), request.cwd, [{ lens: "review-reliability", selectedOrder: 0 }]);
+			},
+			captureResult: async () => {
+				throw Object.assign(new Error("native declined admission"), { admissionDiagnostic: { code: "invalid_finding_location", reason: "missing finding id" } });
+			},
+			finalize: async () => { throw new Error("finalize must not run"); },
+		}));
+		await controller.execute("unavailable-start-b", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+		const result = await controller.execute("unavailable-attempt-b", {
+			operation: "finalize",
+			lineageId: "unavailable-lineage-b",
+			input: JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: ["reviewed"] }] } }),
+		}, undefined, undefined, context(cwd));
+		const details = result.details as Record<string, unknown>;
+		assert.equal(details.status, "blocked");
+		assert.equal(details.outcome, "unavailable");
+		assert.equal(statusCallsWithLineage, 1, "an unsafe diagnostic fails before any additional reoffer STATUS query beyond the one FINALIZE already made");
+	}
+});
+
+test("FINALIZE capture phase refuses to relaunch the exact rejected document bytes a second time (Wave 1, W2.5, unreplayability)", async (t) => {
+	const cwd = repository(t);
+	let captureAttempts = 0;
+	const { controller } = runtime(fakeNative({
+		start: async () => ({ lineageId: "replay-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+		targetStatus: async (request) => request.lineageId === undefined
+			? candidateStartTargetStatus(request)
+			: bindReviewerManifests(candidateFinalizeTargetStatus(request, "replay-lineage"), request.cwd, [{ lens: "review-reliability", selectedOrder: 0 }]),
+		captureResult: async () => { captureAttempts += 1; throw rejectedAdmission({ finding_id: "RISK-003" }); },
+		finalize: async () => { throw new Error("finalize must not run"); },
+	}));
+	await controller.execute("replay-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	const input = JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: ["reviewed"] }] } });
+	const first = await controller.execute("replay-first", { operation: "finalize", lineageId: "replay-lineage", input }, undefined, undefined, context(cwd));
+	assert.equal((first.details as Record<string, unknown>).outcome, "capture-relaunch-required");
+	assert.equal(captureAttempts, 1);
+	// Resubmitting the exact same bytes is refused without ever reaching
+	// native capture-result a second time.
+	const second = await controller.execute("replay-second", { operation: "finalize", lineageId: "replay-lineage", input }, undefined, undefined, context(cwd));
+	const secondDetails = second.details as Record<string, unknown>;
+	assert.equal(secondDetails.status, "blocked");
+	assert.equal(secondDetails.outcome, "exhausted");
+	assert.equal(captureAttempts, 1, "resubmitting the identical rejected bytes must never reach native capture-result again");
+});
+
+test("FINALIZE capture phase treats a lost-output capture failure as committed only when fresh STATUS proves consumption under unchanged authority (Wave 1, W2.7, Decision 4)", async (t) => {
+	// Proven case: one fresh STATUS query shows the slot no longer offered
+	// under the same authority -- committed, no recapture, finalize proceeds.
+	{
+		const cwd = repository(t);
+		let finalizes = 0;
+		let statusCalls = 0;
+		const { controller } = runtime(fakeNative({
+			start: async () => ({ lineageId: "lost-lineage-a", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+			targetStatus: async (request) => {
+				if (request.lineageId === undefined) return candidateStartTargetStatus(request);
+				statusCalls += 1;
+				return statusCalls === 1
+					? bindReviewerManifests(candidateFinalizeTargetStatus(request, "lost-lineage-a"), request.cwd, [{ lens: "review-reliability", selectedOrder: 0 }])
+					: candidateFinalizeTargetStatus(request, "lost-lineage-a"); // no collect inputs offered anymore, same authority
+			},
+			captureResult: async () => { throw Object.assign(new Error("connection dropped"), { mutationOutcome: "unknown", nextAction: "review.status" }); },
+			finalize: async (request) => {
+				finalizes += 1;
+				assert.equal(request.capturedResults, true, "a COMMITTED slot yields no manifest, so transport falls back to capturedResults");
+				assert.equal(request.resultArtifactFiles, undefined);
+				return { lineageId: "lost-lineage-a", state: "approved", action: "approved", storeRevision: "r1" };
+			},
+		}));
+		await controller.execute("lost-start-a", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+		const result = await controller.execute("lost-attempt-a", {
+			operation: "finalize",
+			lineageId: "lost-lineage-a",
+			input: JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: ["reviewed"] }] } }),
+		}, undefined, undefined, context(cwd));
+		assert.equal((result.details as { result?: { state?: string } }).result?.state, "approved");
+		assert.equal(finalizes, 1);
+		assert.equal(statusCalls, 2, "exactly one fresh STATUS query recovers the lost-output failure, on top of FINALIZE's own initial status call");
+	}
+	// Unproven case: the slot is still offered on the fresh query -- only the
+	// declared reconciliation action is surfaced; finalize never runs.
+	{
+		const cwd = repository(t);
+		let finalizes = 0;
+		const { controller } = runtime(fakeNative({
+			start: async () => ({ lineageId: "lost-lineage-b", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+			targetStatus: async (request) => request.lineageId === undefined
+				? candidateStartTargetStatus(request)
+				: bindReviewerManifests(candidateFinalizeTargetStatus(request, "lost-lineage-b"), request.cwd, [{ lens: "review-reliability", selectedOrder: 0 }]),
+			captureResult: async () => { throw Object.assign(new Error("connection dropped"), { mutationOutcome: "unknown", nextAction: "review.status" }); },
+			finalize: async () => { finalizes += 1; throw new Error("finalize must not run"); },
+		}));
+		await controller.execute("lost-start-b", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+		const result = await controller.execute("lost-attempt-b", {
+			operation: "finalize",
+			lineageId: "lost-lineage-b",
+			input: JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: ["reviewed"] }] } }),
+		}, undefined, undefined, context(cwd));
+		const details = result.details as Record<string, unknown>;
+		assert.equal(details.outcome, "native-mutation-status-reconciled");
+		assert.equal(finalizes, 0);
+	}
+});
+
+test("FINALIZE clears a lineage's outstanding relaunch grant once it reaches a terminal state (Wave 1, W2.9, cleanup Decision 5)", async (t) => {
+	const cwd = repository(t);
+	let captureAttempts = 0;
+	let finalizes = 0;
+	const { controller } = runtime(fakeNative({
+		start: async () => ({ lineageId: "cleanup-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+		targetStatus: async (request) => request.lineageId === undefined
+			? candidateStartTargetStatus(request)
+			: bindReviewerManifests(candidateFinalizeTargetStatus(request, "cleanup-lineage"), request.cwd, [{ lens: "review-reliability", selectedOrder: 0 }]),
+		captureResult: async () => { captureAttempts += 1; throw rejectedAdmission({ finding_id: "RISK-004" }); },
+		finalize: async () => { finalizes += 1; return { lineageId: "cleanup-lineage", state: "approved", action: "approved", storeRevision: "r1" }; },
+	}));
+	await controller.execute("cleanup-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	const first = await controller.execute("cleanup-first", {
+		operation: "finalize",
+		lineageId: "cleanup-lineage",
+		input: JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: ["reviewed"] }] } }),
+	}, undefined, undefined, context(cwd));
+	assert.equal((first.details as Record<string, unknown>).outcome, "capture-relaunch-required");
+	assert.equal(captureAttempts, 1);
+	// Initial lenses stay one-shot: a later FINALIZE reaching a terminal state
+	// resupplies no lens_results at all, so it never re-enters the capture
+	// phase, yet the still-outstanding relaunch grant must be cleared once
+	// FINALIZE goes terminal rather than left dangling in the map.
+	const terminal = await controller.execute("cleanup-terminal", {
+		operation: "finalize",
+		lineageId: "cleanup-lineage",
+		input: JSON.stringify({ correction_line_forecast: 1 }),
+	}, undefined, undefined, context(cwd));
+	assert.equal((terminal.details as { result?: { state?: string } }).result?.state, "approved");
+	assert.equal(finalizes, 1);
+	assert.equal(captureAttempts, 1, "no recapture happened for the terminal round");
+});
+
+test("session_shutdown clears the whole capture-slot record map (Wave 1, W2.9, cleanup Decision 5)", async (t) => {
+	const cwd = repository(t);
+	let captureAttempts = 0;
+	const tools = new Map<string, RegisteredTool>();
+	let shutdown: (() => void) | undefined;
+	const pi = {
+		on(name: string, handler: () => void) { if (name === "session_shutdown") shutdown = handler; },
+		registerTool(definition: RegisteredTool & { name: string }) { tools.set(definition.name, definition); },
+		registerCommand() {},
+	} as unknown as ExtensionAPI;
+	createGentleAiExtension({ nativeReviewCli: fakeNative({
+		start: async () => ({ lineageId: "shutdown-lineage", state: "reviewing", riskLevel: "medium", selectedLenses: ["review-reliability"], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: true }),
+		targetStatus: async (request) => request.lineageId === undefined
+			? candidateStartTargetStatus(request)
+			: bindReviewerManifests(candidateFinalizeTargetStatus(request, "shutdown-lineage"), request.cwd, [{ lens: "review-reliability", selectedOrder: 0 }]),
+		captureResult: async (request) => {
+			captureAttempts += 1;
+			if (captureAttempts === 1) throw rejectedAdmission({ finding_id: "RISK-005" });
+			return defaultCaptureResult(request);
+		},
+		finalize: async () => ({ lineageId: "shutdown-lineage", state: "approved", action: "approved", storeRevision: "r1" }),
+	}) })(pi);
+	const controller = tools.get("gentle_review");
+	assert.ok(controller);
+	assert.ok(shutdown);
+	await controller.execute("shutdown-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
+	const input = JSON.stringify({ review_result: { lens_results: [{ lens: "review-reliability", findings: [], evidence: ["reviewed"] }] } });
+	const first = await controller.execute("shutdown-first", { operation: "finalize", lineageId: "shutdown-lineage", input }, undefined, undefined, context(cwd));
+	assert.equal((first.details as Record<string, unknown>).outcome, "capture-relaunch-required");
+	// Resubmitting the identical bytes before shutdown is refused without a
+	// second native call (unreplayability, W2.5) -- proves the grant is live.
+	const beforeShutdown = await controller.execute("shutdown-replay-before", { operation: "finalize", lineageId: "shutdown-lineage", input }, undefined, undefined, context(cwd));
+	assert.equal((beforeShutdown.details as Record<string, unknown>).outcome, "exhausted");
+	assert.equal(captureAttempts, 1);
+	shutdown!();
+	// After shutdown clears the whole map, the identical resubmission is no
+	// longer short-circuited: it reaches native capture-result again, and
+	// this time it is admitted.
+	const afterShutdown = await controller.execute("shutdown-replay-after", { operation: "finalize", lineageId: "shutdown-lineage", input }, undefined, undefined, context(cwd));
+	assert.equal((afterShutdown.details as { result?: { state?: string } }).result?.state, "approved");
+	assert.equal(captureAttempts, 2);
+});
+
 test("native FINALIZE rejects unpublished reviewer enums and empty arrays before native calls", async (t) => {
 	const cwd = repository(t);
 	let finalizes = 0;
