@@ -119,11 +119,11 @@ Chain strategy: feature-branch-chain
 
 ## PR 8 — P4: Pin-bump automation + default-branch receiver (depends: PR 7)
 
-- [ ] 8.1 RED: PR-command tests (threat-matrix: PR commands) — a dispatched tag carrying shell metacharacters is rejected; a `--head` injection attempt is rejected; an implicit base (no explicit `--base main`) is rejected.
-- [ ] 8.2 GREEN: create `scripts/bump-gentle-ai-pin.mjs` — validate the dispatched tag against `^v\d+\.\d+\.\d+$` before any use; explicit `--base main`; head branch derived only from the validated tag; no payload interpolation into a composed command; runs `sync-gentle-ai-release.mjs --write`, `build-gentle-ai-baselines.mjs --write`, `build-skill-overlays.mjs --write`.
-- [ ] 8.3 GREEN: create `.github/workflows/gentle-ai-release-received.yml` — default-branch `repository_dispatch` receiver; stays inactive until this workflow itself is merged to `main`.
-- [ ] 8.4 GREEN: `.github/workflows/ci.yml` — confirm the pin-bump job remains the only job with network access.
-- [ ] 8.5 Verify: `pnpm test -- bump-gentle-ai-pin`; dry-run dispatch against a fixture tag; confirm a real bump PR opens targeting `main` (never a temporary tracker) only once this receiver has landed there.
+- [x] 8.1 RED: PR-command tests (threat-matrix: PR commands) — a dispatched tag carrying shell metacharacters is rejected; a `--head` injection attempt is rejected; an implicit base (no explicit `--base main`) is rejected.
+- [x] 8.2 GREEN: create `scripts/bump-gentle-ai-pin.mjs` — validate the dispatched tag against `^v\d+\.\d+\.\d+$` before any use; explicit `--base main`; head branch derived only from the validated tag; no payload interpolation into a composed command; runs `sync-gentle-ai-release.mjs --write`, `build-gentle-ai-baselines.mjs --write`, `build-skill-overlays.mjs --write`.
+- [x] 8.3 GREEN: create `.github/workflows/gentle-ai-release-received.yml` — default-branch `repository_dispatch` receiver; stays inactive until this workflow itself is merged to `main`.
+- [x] 8.4 GREEN: `.github/workflows/ci.yml` — confirm the pin-bump job remains the only job with network access.
+- [x] 8.5 Verify: `pnpm test -- bump-gentle-ai-pin`; dry-run dispatch against a fixture tag; confirm a real bump PR opens targeting `main` (never a temporary tracker) only once this receiver has landed there.
 
 ## Ordering Notes
 
