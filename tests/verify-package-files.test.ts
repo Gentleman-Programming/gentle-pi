@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+	assertLockReleaseVersionPin,
 	gentleAiVersionPinMismatches,
+	mirrorDigestDrift,
+	mirrorDigestsFromLock,
 	reconcileContractsOnDisk,
 	reconcileGeneratedRuntimeSources,
 } from "../scripts/verify-package-files.mjs";
@@ -135,6 +139,81 @@ test("Gentle AI version pin agrees across the installer version, the release URL
 	});
 
 	assert.deepEqual(mismatches, []);
+});
+
+// --- lock-based mirror reconciliation (task 2.5, replaces contractHashes) --
+
+test("mirror walk fails on a file that exists on disk under docs/gentle-ai but is unlisted in the lock", () => {
+	const fixtureRoot = makeFixtureRoot();
+	try {
+		mkdirSync(join(fixtureRoot, "docs/gentle-ai"), { recursive: true });
+		writeFileSync(join(fixtureRoot, "docs/gentle-ai/review-integration.md"), "known\n");
+		writeFileSync(join(fixtureRoot, "docs/gentle-ai/unlisted.md"), "unlisted\n");
+
+		const { unlistedOnDisk, listedButMissing } = reconcileContractsOnDisk(fixtureRoot, {
+			"docs/gentle-ai/review-integration.md": "irrelevant-for-this-walk",
+		});
+
+		assert.deepEqual(unlistedOnDisk, ["docs/gentle-ai/unlisted.md"]);
+		assert.deepEqual(listedButMissing, []);
+	} finally {
+		rmSync(fixtureRoot, { recursive: true, force: true });
+	}
+});
+
+test("mirror walk fails on a lock entry with no file on disk under capabilities/, excluding the lock itself and hand-authored files", () => {
+	const fixtureRoot = makeFixtureRoot();
+	try {
+		mkdirSync(join(fixtureRoot, "capabilities"), { recursive: true });
+		writeFileSync(join(fixtureRoot, "capabilities/gentle-ai-release.lock.json"), "{}\n");
+		writeFileSync(join(fixtureRoot, "capabilities/native-cli-history.json"), "[]\n");
+
+		const { unlistedOnDisk, listedButMissing } = reconcileContractsOnDisk(fixtureRoot, {
+			"capabilities/review-integration-v2.semantic.json": "irrelevant-for-this-walk",
+		});
+
+		assert.deepEqual(unlistedOnDisk, []);
+		assert.deepEqual(listedButMissing, ["capabilities/review-integration-v2.semantic.json"]);
+	} finally {
+		rmSync(fixtureRoot, { recursive: true, force: true });
+	}
+});
+
+test("mirror digest drift names the exact drifted file", () => {
+	const fixtureRoot = makeFixtureRoot();
+	try {
+		mkdirSync(join(fixtureRoot, "contracts/release-artifact/v1/schemas"), { recursive: true });
+		const path = "contracts/release-artifact/v1/schemas/artifact-manifest.schema.json";
+		writeFileSync(join(fixtureRoot, path), "{}\n");
+		const actualDigest = `sha256:${createHash("sha256").update(readFileSync(join(fixtureRoot, path))).digest("hex")}`;
+		const staleDigest = `sha256:${"0".repeat(64)}`;
+
+		const drift = mirrorDigestDrift(fixtureRoot, { [path]: staleDigest });
+
+		assert.deepEqual(drift, [{ relativePath: path, expected: staleDigest, actual: actualDigest }]);
+		assert.deepEqual(mirrorDigestDrift(fixtureRoot, { [path]: actualDigest }), []);
+	} finally {
+		rmSync(fixtureRoot, { recursive: true, force: true });
+	}
+});
+
+test("mirror digests are derived from capabilities/gentle-ai-release.lock.json entries, not a hand-maintained map", () => {
+	const lockEntries = [
+		{ path: "docs/gentle-ai/review-integration.md", digest: `sha256:${"a".repeat(64)}` },
+		{ path: "contracts/x.schema.json", digest: `sha256:${"b".repeat(64)}` },
+	];
+	assert.deepEqual(mirrorDigestsFromLock({ entries: lockEntries }), {
+		"docs/gentle-ai/review-integration.md": `sha256:${"a".repeat(64)}`,
+		"contracts/x.schema.json": `sha256:${"b".repeat(64)}`,
+	});
+});
+
+test("lock release version pin mismatch is reported naming the authoritative INSTALLER_VERSION", () => {
+	assert.throws(
+		() => assertLockReleaseVersionPin({ release: { version: "9.9.9" } }, INSTALLER_VERSION),
+		/gentle-ai-release\.lock\.json/,
+	);
+	assert.doesNotThrow(() => assertLockReleaseVersionPin({ release: { version: INSTALLER_VERSION } }, INSTALLER_VERSION));
 });
 
 test("both walks report no drift when sources, runtime/*.mjs, requiredPaths, and contractHashes fully agree", () => {

@@ -24,6 +24,7 @@
   },
   "files": [
     "assets/",
+    "capabilities/",
     "contracts/",
     "docs/",
     "extensions/",
