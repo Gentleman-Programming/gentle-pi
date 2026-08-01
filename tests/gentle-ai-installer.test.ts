@@ -14,6 +14,7 @@ import {
 	GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM,
 	downloadGentleAiAsset,
 	installGentleAi as installGentleAiProduction,
+	pruneSupersededBundles,
 	resolveGentleAiAssetsArchive,
 	resolveGentleAiInstallerPackageRoot,
 	resolveGentleAiReleaseAsset,
@@ -55,11 +56,29 @@ async function defaultExtractAssets(_archivePath: string, destination: string) {
 	};
 }
 
+// Windows capability cross-check fixture (design D5, P2b tasks 4.1-4.3). The
+// installer only ever READS this shape — from the real
+// `capabilities/review-integration-v2.semantic.json` mirror in production, or
+// from `options.capabilitiesSnapshot` here — and compares it against the
+// live subprocess output below; it never writes either.
+const DEFAULT_CAPABILITIES_SNAPSHOT = Object.freeze({
+	contract: "gentle-ai.review-integration/v2",
+	operations: ["review.capabilities", "review.start", "review.status"],
+	gates: ["pre-commit", "pre-push"],
+	projections: ["staged", "workspace"],
+	features: {
+		mandatory: [{ name: "compact_v2_authority", supported: true, requires: [] }],
+		optional: [{ name: "risk_reasons", supported: true, requires: [] }],
+	},
+});
+const DEFAULT_CAPABILITIES_OUTPUT = `${JSON.stringify(DEFAULT_CAPABILITIES_SNAPSHOT)}\n`;
+
 async function installGentleAiForTest(options: Record<string, unknown> = {}) {
 	return installGentleAiProduction({
 		assetsArchive: DEFAULT_ASSETS_ARCHIVE,
 		downloadAssets: defaultDownloadAssets,
 		extractAssets: defaultExtractAssets,
+		capabilitiesSnapshot: DEFAULT_CAPABILITIES_SNAPSHOT,
 		...options,
 	});
 }
@@ -132,6 +151,8 @@ interface WindowsGoFixtureOptions {
 	reportedVersion?: string;
 	installError?: Error;
 	goArchitecture?: "amd64" | "arm64";
+	capabilitiesOutput?: string;
+	capabilitiesError?: Error;
 }
 
 function windowsGoFixture(fixtureOptions: WindowsGoFixtureOptions = {}) {
@@ -145,6 +166,10 @@ function windowsGoFixture(fixtureOptions: WindowsGoFixtureOptions = {}) {
 	].join("\n");
 	const run = async (file: string, arguments_: string[], options: WindowsGoCall["options"]) => {
 		calls.push({ file, arguments_, options });
+		if (arguments_[0] === "review" && arguments_[1] === "capabilities") {
+			if (fixtureOptions.capabilitiesError) throw fixtureOptions.capabilitiesError;
+			return { stdout: fixtureOptions.capabilitiesOutput ?? DEFAULT_CAPABILITIES_OUTPUT, stderr: "" };
+		}
 		if (file === goExecutable && arguments_.length === 1 && arguments_[0] === "version") {
 			if (fixtureOptions.goVersionError) throw fixtureOptions.goVersionError;
 			return { stdout: fixtureOptions.goVersion ?? "go version go1.25.10 windows/amd64\n", stderr: "" };
@@ -257,6 +282,8 @@ interface HardenedGoFixtureOptions {
 	architecture?: GoArchitecture;
 	blockInstall?: boolean;
 	metadataOverride?: string;
+	capabilitiesOutput?: string;
+	capabilitiesError?: Error;
 }
 
 async function hardenedWindowsGoFixture(packageRoot: string, fixtureOptions: HardenedGoFixtureOptions = {}) {
@@ -284,6 +311,10 @@ async function hardenedWindowsGoFixture(packageRoot: string, fixtureOptions: Har
 	].join("\n");
 	const run = async (file: string, arguments_: string[], options: HardenedGoCall["options"]) => {
 		calls.push({ file, arguments_, options });
+		if (arguments_[0] === "review" && arguments_[1] === "capabilities") {
+			if (fixtureOptions.capabilitiesError) throw fixtureOptions.capabilitiesError;
+			return { stdout: fixtureOptions.capabilitiesOutput ?? DEFAULT_CAPABILITIES_OUTPUT, stderr: "" };
+		}
 		if (file === goPath && arguments_.length === 1 && arguments_[0] === "version") return { stdout: "go version go1.25.10 windows/amd64\n", stderr: "" };
 		if (file === goPath && arguments_[0] === "install") {
 			signalInstallStarted?.();
@@ -645,6 +676,74 @@ test("Windows source publication rolls back a prior bundle when final directory 
 		/simulated final swap failure/,
 	);
 	assert.equal(await readFile(join(versionDirectory, "old.txt"), "utf8"), "previous bundle");
+});
+
+// --- Windows split provenance + capability cross-check (P2b, design D5, tasks 4.1-4.3) ---
+
+test("Windows fresh install publishes one manifest carrying both SumDB binary provenance and signed-archive assets provenance", async () => {
+	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-windows-split-provenance-"));
+	const fixture = await hardenedWindowsGoFixture(packageRoot);
+	const result = await installGentleAiForTest({ packageRoot, platform: "win32", arch: "x64", execFile: fixture.run, resolveGoExecutable: fixture.resolveGoExecutable });
+	assert.equal(result.installed, true);
+	const manifest = JSON.parse(await readFile(join(packageRoot, ".gentle-ai", "v2.2.3", "integrity.json"), "utf8")) as Record<string, unknown>;
+	const sumdbProvenanceKeys = ["method", "package", "module", "tag", "architecture", "binarySha256", "moduleChecksum", "goVersion", "goos", "goarch", "buildMode", "compiler", "cgoEnabled"];
+	const assetsProvenanceKeys = ["assetsAsset", "assetsArchiveSha256", "assetsTreeSha256", "contractMajor", "layoutVersion"];
+	for (const key of sumdbProvenanceKeys) assert.ok(key in manifest, `manifest is missing SumDB binary provenance key ${key}`);
+	for (const key of assetsProvenanceKeys) assert.ok(key in manifest, `manifest is missing signed-archive assets provenance key ${key}`);
+	assert.equal(manifest.method, "go-sumdb-source-build");
+	// D5: Windows carries no separate assets archive or digest — it is the
+	// exact same signed archive every other platform verifies.
+	assert.equal(manifest.assetsAsset, DEFAULT_ASSETS_ARCHIVE.name);
+	assert.equal(manifest.assetsArchiveSha256, DEFAULT_ASSETS_ARCHIVE.sha256);
+});
+
+test("Windows capability cross-check fails closed on subprocess failure, oversized output, or non-JSON output, publishing nothing", async () => {
+	for (const fixtureOptions of [
+		{ capabilitiesError: Object.assign(new Error("Command failed: gentle-ai.exe review capabilities"), { code: 1 }) },
+		{ capabilitiesError: Object.assign(new Error("stdout maxBuffer length exceeded"), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }) },
+		{ capabilitiesOutput: "not json output" },
+	] as const) {
+		const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-windows-capabilities-fail-"));
+		const fixture = await hardenedWindowsGoFixture(packageRoot, fixtureOptions);
+		await assert.rejects(
+			() => installGentleAiForTest({ packageRoot, platform: "win32", arch: "x64", execFile: fixture.run, resolveGoExecutable: fixture.resolveGoExecutable }),
+			(error: unknown) => error instanceof Error && "code" in error && error.code === "GENTLE_AI_CAPABILITIES_CROSS_CHECK_FAILED",
+		);
+		assert.ok(fixture.calls.some((call) => call.arguments_[0] === "install"), "go install must have run before the cross-check can even attempt");
+		const runtimeDirectory = join(packageRoot, ".gentle-ai", "v2.2.3");
+		assert.equal(existsSync(join(runtimeDirectory, "gentle-ai.exe")), false);
+		assert.equal(existsSync(join(runtimeDirectory, "integrity.json")), false);
+		assert.equal(existsSync(join(runtimeDirectory, "assets")), false);
+	}
+});
+
+test("Windows capability cross-check mismatch fails closed and publishes nothing, never regenerating the signed snapshot", async () => {
+	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-windows-capabilities-mismatch-"));
+	// The live subprocess output stays the DEFAULT snapshot (unchanged); only
+	// the pinned "expected" snapshot passed to the installer differs. The
+	// installer only ever reads `capabilitiesSnapshot` (or the real mirror
+	// file in production) — it never derives or writes one, so a mismatch can
+	// only be produced by varying the input, never by the cross-check itself.
+	const mismatchedSnapshot = { ...DEFAULT_CAPABILITIES_SNAPSHOT, operations: [...DEFAULT_CAPABILITIES_SNAPSHOT.operations, "review.repair"] };
+	const fixture = await hardenedWindowsGoFixture(packageRoot);
+	await assert.rejects(
+		() => installGentleAiForTest({ packageRoot, platform: "win32", arch: "x64", execFile: fixture.run, resolveGoExecutable: fixture.resolveGoExecutable, capabilitiesSnapshot: mismatchedSnapshot }),
+		(error: unknown) => error instanceof Error && "code" in error && error.code === "GENTLE_AI_CAPABILITIES_CROSS_CHECK_FAILED" && /do not match the signed release snapshot/.test(error.message),
+	);
+	const runtimeDirectory = join(packageRoot, ".gentle-ai", "v2.2.3");
+	assert.equal(existsSync(join(runtimeDirectory, "gentle-ai.exe")), false);
+	assert.equal(existsSync(join(runtimeDirectory, "integrity.json")), false);
+	assert.equal(existsSync(join(runtimeDirectory, "assets")), false);
+});
+
+test("Windows capability cross-check never runs on a pure reuse — the published bundle is trusted without re-invoking the binary", async () => {
+	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-windows-capabilities-reuse-"));
+	const initial = await hardenedWindowsGoFixture(packageRoot);
+	await installGentleAiForTest({ packageRoot, platform: "win32", arch: "x64", execFile: initial.run, resolveGoExecutable: initial.resolveGoExecutable });
+	const reuse = await hardenedWindowsGoFixture(packageRoot, { capabilitiesError: new Error("cross-check must not run again on a verified reuse") });
+	const reused = await installGentleAiForTest({ packageRoot, platform: "win32", arch: "x64", execFile: reuse.run, resolveGoExecutable: reuse.resolveGoExecutable });
+	assert.equal(reused.installed, false);
+	assert.equal(reuse.calls.some((call) => call.arguments_[0] === "review"), false);
 });
 
 test("Darwin/Linux signed bundles retain their canonical manifest key set and reusable compatibility", async () => {
@@ -1023,4 +1122,68 @@ test("resolveGentleAiAssetsArchive-pinned digest is enforced even when an existi
 	assert.equal(reinstalled.installed, true);
 	const repairedManifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
 	assert.equal(repairedManifest.assetsTreeSha256, DEFAULT_ASSETS_ARCHIVE.treeSha256);
+});
+
+// --- superseded bundle pruning (P2b, design D3, task 4.4) -------------------
+
+test("pruneSupersededBundles keeps the live bundle and the single immediately-previous version, removing every older one", async () => {
+	const runtimeRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-prune-"));
+	await mkdir(join(runtimeRoot, "v2.2.3"), { recursive: true }); // live
+	await mkdir(join(runtimeRoot, "v2.2.2"), { recursive: true }); // immediately previous — kept for rollback
+	await mkdir(join(runtimeRoot, "v2.1.0"), { recursive: true }); // older — removed
+	await mkdir(join(runtimeRoot, ".v2.2.3.backup-x"), { recursive: true });
+	await mkdir(join(runtimeRoot, ".v2.2.3.staging-y"), { recursive: true });
+	await mkdir(join(runtimeRoot, ".v2.2.3.install.lock"), { recursive: true });
+	await pruneSupersededBundles(runtimeRoot);
+	assert.equal(existsSync(join(runtimeRoot, "v2.2.3")), true, "live bundle must never be pruned");
+	assert.equal(existsSync(join(runtimeRoot, "v2.2.2")), true, "the immediately-previous bundle must be kept for rollback");
+	assert.equal(existsSync(join(runtimeRoot, "v2.1.0")), false, "older-than-immediately-previous bundles must be pruned");
+	assert.equal(existsSync(join(runtimeRoot, ".v2.2.3.backup-x")), true, "dotted backup paths are never bundle directories and must never be touched");
+	assert.equal(existsSync(join(runtimeRoot, ".v2.2.3.staging-y")), true, "dotted staging paths are never bundle directories and must never be touched");
+	assert.equal(existsSync(join(runtimeRoot, ".v2.2.3.install.lock")), true, "the install lock is never a bundle directory and must never be touched");
+});
+
+test("pruneSupersededBundles logs and continues when a removal fails, never touching the live or kept-for-rollback bundle, and never throwing", async () => {
+	const runtimeRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-prune-fail-"));
+	await mkdir(join(runtimeRoot, "v2.2.3"), { recursive: true }); // live
+	await mkdir(join(runtimeRoot, "v2.2.2"), { recursive: true }); // kept for rollback — never attempted
+	await mkdir(join(runtimeRoot, "v2.1.0"), { recursive: true }); // the only candidate whose removal is attempted (and fails)
+	const warnings: string[] = [];
+	const removalAttempts: string[] = [];
+	await pruneSupersededBundles(runtimeRoot, {
+		removeSupersededBundle: async (path: string) => { removalAttempts.push(path); throw new Error("simulated permission denial"); },
+		logPruneWarning: (message: string) => warnings.push(message),
+	});
+	assert.equal(existsSync(join(runtimeRoot, "v2.2.3")), true);
+	assert.equal(existsSync(join(runtimeRoot, "v2.2.2")), true);
+	assert.equal(existsSync(join(runtimeRoot, "v2.1.0")), true, "removal failed, so the directory is deliberately left in place");
+	assert.deepEqual(removalAttempts, [join(runtimeRoot, "v2.1.0")], "only the older-than-kept bundle is ever a removal candidate");
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0], /simulated permission denial/);
+});
+
+test("pruneSupersededBundles is wired to run only after a fresh publish succeeds: keeps the prior version for rollback, removes anything older, never the live bundle", async () => {
+	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-prune-wired-"));
+	const runtimeRoot = join(packageRoot, ".gentle-ai");
+	await mkdir(join(runtimeRoot, "v2.2.2"), { recursive: true }); // becomes "immediately previous" once v2.2.3 publishes
+	await writeFile(join(runtimeRoot, "v2.2.2", "gentle-ai"), "prior rollback-eligible binary");
+	await mkdir(join(runtimeRoot, "v2.2.1"), { recursive: true }); // older than the kept-for-rollback version
+	const result = await installGentleAiForTest(linuxBinaryOptions(packageRoot));
+	assert.equal(result.installed, true);
+	assert.equal(existsSync(join(runtimeRoot, "v2.2.3")), true, "the freshly published bundle is the live one");
+	assert.equal(existsSync(join(runtimeRoot, "v2.2.2")), true, "the immediately-previous bundle is kept for rollback");
+	assert.equal(existsSync(join(runtimeRoot, "v2.2.1")), false, "anything older than the kept-for-rollback bundle is pruned");
+});
+
+test("pruneSupersededBundles does not run when an existing bundle is reused without a fresh publish", async () => {
+	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-prune-reuse-"));
+	const options = linuxBinaryOptions(packageRoot);
+	await installGentleAiForTest(options);
+	const runtimeRoot = join(packageRoot, ".gentle-ai");
+	// Simulate a directory left behind by an older pin that a fresh publish
+	// would prune; a pure reuse (no publish) must leave it untouched.
+	await mkdir(join(runtimeRoot, "v2.2.1"), { recursive: true });
+	const reused = await installGentleAiForTest(options);
+	assert.equal(reused.installed, false);
+	assert.equal(existsSync(join(runtimeRoot, "v2.2.1")), true);
 });

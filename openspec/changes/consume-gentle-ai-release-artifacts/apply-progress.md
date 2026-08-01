@@ -326,3 +326,163 @@ process-level race timing, exactly the same testing pattern already used for the
 
 10/10 tasks in PR 3 (P2a) complete. 28/28 tasks total across P1a+P1b+P2a. Ready for `sdd-verify`, or for
 `sdd-apply` to continue with PR 4 (P2b) in a fresh batch, based on this branch (`feat/release-assets-install`).
+
+---
+
+# PR 4 / P2b: Windows split provenance + cross-check + bundle lifecycle
+
+Worktree: `gentle-pi-worktrees/p2b`. Branch: `feat/release-assets-windows`, based on P2a's
+`feat/release-assets-install`. Tasks 4.1-4.9, all complete.
+
+## Scope discovery: D5's read-side and manifest threading were already complete
+
+Before writing any RED test, `codegraph_explore` + direct reads of `scripts/gentle-ai-installer.mjs` and
+`lib/gentle-ai-binary.ts` confirmed P2a had already threaded `assetsArchive` through
+`installWindowsGentleAiFromGoSumdb`/`existingWindowsSourceBundleMatches`/`windowsSourceManifest` (both the
+installer's copy and `lib/gentle-ai-binary.ts`'s read-side copy) as an unavoidable consequence of sharing
+one atomic-bundle code path across POSIX and Windows in P2a. This means **task 4.6 ("`windowsSourceManifest`
+gains the assets keys") was already GREEN going into this PR** — proven by the pre-existing P2a test
+"Windows source manifest binds verified Go metadata and architecture" (`tests/gentle-ai-installer.test.ts`),
+which already `deepEqual`s a manifest containing both provenance groups. This is noted here rather than
+silently re-claimed: P2b's actual new production surface is the capability cross-check (4.7) and bundle
+pruning (4.8), not the manifest shape itself.
+
+## TDD Cycle Evidence (P2b)
+
+| Task | RED | GREEN | REFACTOR |
+|---|---|---|---|
+| 4.1 subprocess cross-check failure modes | `Windows capability cross-check fails closed on subprocess failure, oversized output, or non-JSON output, publishing nothing` written before `crossCheckWindowsCapabilities`/`GENTLE_AI_CAPABILITIES_CROSS_CHECK_FAILED_CODE` existed; failed with `pruneSupersededBundles`/import errors and `unexpected command: ... review capabilities` from the fixture | Implemented `crossCheckWindowsCapabilities` — subprocess rejection (non-zero exit, simulated maxBuffer overflow) and `JSON.parse` failure both caught and rethrown as `GENTLE_AI_CAPABILITIES_CROSS_CHECK_FAILED`; wired after `assertExactGentleAiVersion`, before `installAssets`/publish | Shared `capabilityNameSets`/`sameNameSet`/`capabilitiesCrossCheckMismatch` helpers reused for both the mismatch path (4.3) and the parse-and-compare path |
+| 4.2 split-provenance | `Windows fresh install publishes one manifest carrying both SumDB binary provenance and signed-archive assets provenance` — a regression-locking test, since the underlying manifest shape was already GREEN from P2a (see Scope Discovery above); it asserts both key groups' presence and `assetsArchiveSha256` equality to the pinned archive digest in one manifest | Already satisfied; no new production code | N/A |
+| 4.3 cross-check mismatch fails closed | `Windows capability cross-check mismatch fails closed and publishes nothing, never regenerating the signed snapshot` — varies only `options.capabilitiesSnapshot` (the "expected" input the installer only ever reads) while the fixture's live subprocess output stays the unchanged default, isolating the mismatch to the comparison itself | `capabilitiesCrossCheckMismatch` throws `GENTLE_AI_CAPABILITIES_CROSS_CHECK_FAILED` naming "do not match the signed release snapshot"; asserted no `gentle-ai.exe`/`integrity.json`/`assets/` published | Same helper as 4.1 |
+| 4.4 prune retention/failure policy | Three tests written before `pruneSupersededBundles` existed (import-time `SyntaxError`): retention (keep live + immediately-previous, prune older), failure-is-logged-and-non-fatal, and reuse-never-prunes | Implemented `pruneSupersededBundles(runtimeRoot, options)` — sorts superseded `v<x>.<y>.<z>` directories descending, keeps index 0 (immediately previous), prunes the rest; injectable `removeSupersededBundle`/`logPruneWarning` seams | `bundleVersionOf`/`compareBundleVersionsDescending` extracted as small pure helpers |
+| 4.5 skip symmetry | `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1 skips binary and assets symmetrically...` (`tests/install-gentle-ai.test.ts`, new file) — passed on first run; see "Task 4.5" section below for why | Already satisfied; no new production code | N/A |
+| 4.6 `windowsSourceManifest` assets keys | N/A — already GREEN from P2a (see Scope Discovery) | N/A | N/A |
+| 4.7 sealed capability cross-check | Same RED as 4.1/4.3 | `crossCheckWindowsCapabilities` — fixed argv (`["review", "capabilities", "--contract", "gentle-ai.review-integration/v2"]`), `shell:false` via the existing `runCommand`/`commandOptions` seam, bounded output via the same `GO_COMMAND_MAX_BUFFER` `maxBuffer` `go install` already uses, sealed `environment` object already built by `sealedGoEnvironment` | See "How the cross-check cannot create authority" below |
+| 4.8 `pruneSupersededBundles` wiring | Same RED as 4.4, plus `pruneSupersededBundles is wired to run only after a fresh publish succeeds...` and `...does not run when an existing bundle is reused...` | Called immediately after the `publishBundle` rename succeeds in BOTH `installWindowsGentleAiFromGoSumdb` and `installSignedRelease` (D3's "P2" scope spans both platforms; P2a had not wired it yet) | N/A |
+| 4.9 Verify | — | `node --experimental-strip-types --test tests/gentle-ai-installer.test.ts tests/gentle-ai-binary.test.ts tests/install-gentle-ai.test.ts` → `pass 72 fail 0`; full suite `pass 1083 / fail 1 (pre-existing)`; `pnpm run test:harness` fails for the same pre-existing reason as P1b/P2a (see Issues Found) | — |
+
+## How the cross-check cannot create authority (proof, not assertion)
+
+`crossCheckWindowsCapabilities` (`scripts/gentle-ai-installer.mjs`) has **zero write side effects** —
+grep-verifiable: the function contains no `writeFile`/`rename`/`mkdir` call anywhere in its body. It only:
+
+1. Reads the "expected" snapshot — from `options.capabilitiesSnapshot` (test injection point) or, in
+   production, from the checked-in `capabilities/review-integration-v2.semantic.json` mirror via
+   `readGentleAiCapabilitiesSnapshot` (a plain `JSON.parse(readFileSync(...))`, no write path, mirroring
+   `resolveGentleAiAssetsArchive`'s existing lock-read pattern).
+2. Invokes the freshly-built `gentle-ai.exe` with `["review", "capabilities", "--contract", ...]` to get
+   the "observed" live output.
+3. Compares `contract`/`operations`/`gates`/`projections`/feature-name sets, and either returns (no
+   observable effect) or throws.
+
+Placement is the other half of the proof: the call sits strictly **between** `assertExactGentleAiVersion`
+and `installAssets`/`writeFile(integrity.json)`/`publishBundle` inside `installWindowsGentleAiFromGoSumdb`
+— every write in the install happens strictly after it, so a thrown `GENTLE_AI_CAPABILITIES_CROSS_CHECK_FAILED`
+guarantees none of them ran. `Windows capability cross-check fails closed on subprocess failure, oversized
+output, or non-JSON output, publishing nothing` and `...mismatch fails closed and publishes nothing...`
+both assert this directly: `gentle-ai.exe`, `integrity.json`, AND `assets/` are all absent from the runtime
+directory after every failure mode. `Windows capability cross-check never runs on a pure reuse` additionally
+proves the cross-check does not even execute on a verified-reuse path (no re-invocation of the binary), so
+it can never regenerate or re-stamp anything on an already-trusted bundle either.
+
+## Interpreting design D5's "compare operation/gate/projection/schema/feature name sets"
+
+The checked-in `capabilities/review-integration-v2.semantic.json` mirror carries `contract`, `operations`,
+`gates`, `projections`, and `features.{mandatory,optional}` — it has **no separate `schemas` array** (that
+field exists only in the runtime's own negotiated-capabilities JSON shape, `lib/review-integration-v2.ts`'s
+`ReviewCapabilitiesV2.schemas`, which is a different, larger contract-negotiation surface this install-time
+cross-check deliberately does not import or depend on). `capabilityNameSets`/`capabilitiesCrossCheckMismatch`
+therefore compare the four fields both shapes genuinely share (`operations`/`gates`/`projections`/feature
+names) plus the top-level `contract` identity string as the closest available analog to "schema" identity.
+This is a documented interpretation, not a silent narrowing — flagged here per the "note it, don't
+silently deviate" rule.
+
+## Pruning policy actually implemented (and why it differs from a literal reading of design.md)
+
+design.md's D3 section says `pruneSupersededBundles(runtimeRoot)` "removes `v<other-version>` directories
+... never the live one." Read alone, that could mean "prune every non-live version." The task prompt for
+this PR was more specific: **keep exactly the immediately-previous bundle for rollback and remove the
+rest** — not keep everything, not keep only the current one. Implemented accordingly:
+`pruneSupersededBundles` sorts every `v<major>.<minor>.<patch>`-named sibling directory (excluding live)
+descending by parsed version, keeps index 0 (the highest-versioned survivor — "the immediately previous
+bundle"), and prunes every other one. Proven by three tests: retention (`v2.2.2` kept, `v2.1.0` pruned,
+live `v2.2.3` untouched, and non-versioned dotted paths — backups/staging/lock — never even considered
+candidates), failure-is-non-fatal-and-logged (only the one older-than-kept candidate is ever attempted;
+its simulated failure is logged via an injectable `logPruneWarning` seam and does not throw), and
+reuse-never-prunes (a pure cache-hit reuse, with no `publishBundle` rename, leaves a stale sibling directory
+completely untouched — pruning is causally tied to a successful rename, not to every `installGentleAi`
+call).
+
+## Task 4.5: why the RED test passed immediately
+
+`scripts/install-gentle-ai.mjs`'s `GENTLE_PI_SKIP_GENTLE_AI_INSTALL === "1"` check is a single guard
+wrapping the ONE call site (`installGentleAi()`) that would otherwise install both the binary and the
+assets bundle as one atomic staged bundle (P2a's D3). There is no second, independent skip check for
+"assets only" or "binary only" that could disagree with the first — skipping the call skips both by
+construction. `tests/install-gentle-ai.test.ts` spawns the real script as a subprocess with
+`GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1`, snapshots `.gentle-ai/` directory entries before and after via
+`readdir`, and asserts they are byte-for-byte identical (in this sandbox, both empty — no network access
+to complete a real install even without the flag), plus asserts the exact warning text on stderr. The test
+passed on its first run because the symmetric-skip property was already true by construction from an
+earlier PR (#262/#263), not something P2b needed to build; the test locks the invariant rather than driving
+new production code, and is reported here as such rather than mischaracterized as a driven RED→GREEN cycle.
+
+## Files Changed
+
+| File | Action | What Was Done |
+|---|---|---|
+| `scripts/gentle-ai-installer.mjs` | Modified | Added `GENTLE_AI_CAPABILITIES_CROSS_CHECK_FAILED_CODE`, `GENTLE_AI_CAPABILITIES_SNAPSHOT_RELATIVE_PATH`, `readGentleAiCapabilitiesSnapshot`, `capabilityNameSets`, `sameNameSet`, `capabilitiesCrossCheckMismatch`, `crossCheckWindowsCapabilities` (wired into `installWindowsGentleAiFromGoSumdb` between `assertExactGentleAiVersion` and `installAssets`); added `bundleVersionOf`, `compareBundleVersionsDescending`, exported `pruneSupersededBundles` (wired after `publishBundle` succeeds in BOTH `installWindowsGentleAiFromGoSumdb` and `installSignedRelease`). |
+| `tests/gentle-ai-installer.test.ts` | Modified | Added `DEFAULT_CAPABILITIES_SNAPSHOT`/`DEFAULT_CAPABILITIES_OUTPUT` fixtures threaded through `installGentleAiForTest` (mirrors P2a's `DEFAULT_ASSETS_ARCHIVE` pattern); extended `windowsGoFixture`/`hardenedWindowsGoFixture` to answer `["review","capabilities",...]` subprocess calls (with `capabilitiesOutput`/`capabilitiesError` override points) so all pre-existing Windows fresh-install tests keep passing unmodified; 4 new cross-check tests (4.1/4.2/4.3 + a reuse-never-cross-checks regression test) and 4 new `pruneSupersededBundles` tests (4.4/4.8). |
+| `tests/install-gentle-ai.test.ts` | Created | Subprocess-spawn test for the `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1` symmetric-skip guarantee (task 4.5), against the real `scripts/install-gentle-ai.mjs` entrypoint. |
+| `openspec/changes/consume-gentle-ai-release-artifacts/tasks.md` | Modified | Ticked `[x]` for tasks 4.1-4.9. |
+
+## Work Unit Evidence (P2b)
+
+| Evidence | Value |
+|---|---|
+| Focused test command and exact result | `node --experimental-strip-types --test tests/gentle-ai-installer.test.ts tests/gentle-ai-binary.test.ts tests/install-gentle-ai.test.ts` → `tests 72 / pass 64 / fail 0 / skipped 8`. Full suite: `node --experimental-strip-types --test tests/*.test.ts` → `tests 1097 / pass 1083 / fail 1 / skipped 12` — the 1 failure is `tests/native-review-cli.test.ts`'s "native output limits dominate..." test, confirmed pre-existing and identical before/after this PR's diff via `git stash` (root cause: this sandbox has no network access at all, so no real `.gentle-ai/v2.2.3/gentle-ai` binary was ever installed here — a stricter version of the same "sandbox has no working native binary" condition P1b/P2a already documented for the 3 `tests/native-review-parity-runtime.test.ts` failures, which in this sandbox specifically SKIP rather than FAIL for the identical reason). |
+| Runtime harness command/scenario and exact result | `pnpm run test:harness` fails with the same message already documented as pre-existing/expected in P2a (`Gentle AI pre-pr gate could not reconsult review mode and failed closed.` — globally-disabled receipt-driven development); confirmed identical via `git stash` against the unmodified P2a tip. `node scripts/build-git-commit-transaction-runner.mjs --check` (the runtime-generation gate this PR's changes could plausibly have broken, since `scripts/gentle-ai-installer.mjs` is plain `.mjs`, not a `sources`-listed TypeScript module) passes clean: `commit transaction runtime matches TypeScript sources (5 modules)`. |
+| Rollback boundary | Revert `scripts/gentle-ai-installer.mjs`, `tests/gentle-ai-installer.test.ts` to their P2a tip state; delete `tests/install-gentle-ai.test.ts`. No `lib/gentle-ai-binary.ts`, `runtime/gentle-ai-binary.mjs`, sync script, mirror/lock, or CI workflow file is touched by this PR — the Windows cross-check and prune wiring are fully contained inside `scripts/gentle-ai-installer.mjs`, and the POSIX install path (already complete from P2a) is unaffected: the only POSIX-visible change is `pruneSupersededBundles` now also running after `installSignedRelease`'s publish, itself independently revertible by deleting that one added line. |
+
+## Deviations from Design
+
+1. **Pruning retention policy** — see "Pruning policy actually implemented" above: keeps the
+   immediately-previous bundle, not "every non-live version." This is a refinement of design.md's D3
+   wording (which is compatible with, but does not explicitly state, this policy) driven by this PR's
+   explicit task instructions; documented rather than silently applied.
+2. **"Schema" cross-check field** — see "Interpreting design D5's..." above: compared via the top-level
+   `contract` identity string, since the checked-in semantic mirror carries no separate `schemas` array.
+
+## Issues Found
+
+None new. Confirmed via `git stash` (both before implementing and after) that this sandbox has no network
+access at all (`pnpm install`'s `postinstall` step fails with `HTTP 404` against GitHub releases), so
+`.gentle-ai/v2.2.3/gentle-ai` is never installed here — a stricter version of the same environment
+condition already documented in P1b/P2a. This surfaces as one additional pre-existing failure beyond the
+3 already-known `tests/native-review-parity-runtime.test.ts` failures: `tests/native-review-cli.test.ts`'s
+"native output limits dominate killed timeout signals..." test now fails (rather than skips) with
+`package-local-binary-missing` instead of reaching the RDD-disabled assertion it expects. Confirmed
+identical on the unmodified P2a tip via `git stash` — not introduced by this PR.
+
+## Remaining Tasks
+
+- [ ] PR 5 — P3a through PR 8 — P4: not started.
+
+## Workload / PR Boundary (P2b)
+
+- Mode: feature-branch-chain, `size:exception` (tasks.md: `Delivery strategy: exception-ok`)
+- Current work unit: P2b (PR 4, base: P2a's branch `feat/release-assets-install`)
+- Boundary: `scripts/gentle-ai-installer.mjs` (capability cross-check + bundle pruning only — no manifest
+  shape change, that was already P2a), its test file, and one new test file for the skip-symmetry guarantee.
+  No `lib/gentle-ai-binary.ts`, generated runtime, sync script, mirror/lock, or CI workflow file touched.
+- Estimated review budget impact: tasks.md forecast ~260 changed lines for P2b. Authored diff
+  (`git diff --stat` plus the new `tests/install-gentle-ai.test.ts` file) is ~360 changed lines — above the
+  400-line budget's midpoint but within the same `exception-ok`/`size:exception` delivery strategy already
+  in force for this entire tracker (tasks.md: `400-line budget risk: High`, `Decision needed before apply:
+  No`).
+
+## Status (P2b)
+
+9/9 tasks in PR 4 (P2b) complete. 37/37 tasks total across P1a+P1b+P2a+P2b. Ready for `sdd-verify`, or for
+`sdd-apply` to continue with PR 5 (P3a) in a fresh batch, on a new branch based on this one
+(`feat/release-assets-windows`).
