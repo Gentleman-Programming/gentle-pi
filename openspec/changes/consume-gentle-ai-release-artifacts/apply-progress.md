@@ -1,7 +1,8 @@
 # Apply Progress: consume-gentle-ai-release-artifacts
 
-> Cumulative across batches: **PR 1 / P1a** through **PR 7 / P3c**, all complete
-> (tasks 1.1-7.8). PR 8 (P4) is NOT started.
+> Cumulative across batches: **PR 1 / P1a** through **PR 8 / P4**, all complete
+> (tasks 1.1-8.5). This is the tracker's FINAL work unit — all 68 tasks across
+> P1a+P1b+P2a+P2b+P3a+P3b+P3c+P4 are now checked.
 
 ## Completed Tasks
 
@@ -1004,9 +1005,10 @@ plus the `tests/runtime-harness.mjs` pre-existing failure newly confirmed (via `
 reproduce on the clean P3b tip — both are sandbox-only, no-network symptoms of the same missing native
 binary, neither introduced by this unit.
 
-## Remaining Tasks
+## Remaining Tasks (as of P3c)
 
-- [ ] PR 8 — P4 (`scripts/bump-gentle-ai-pin.mjs` + `gentle-ai-release-received.yml` receiver): not started.
+- [x] PR 8 — P4 (`scripts/bump-gentle-ai-pin.mjs` + `gentle-ai-release-received.yml` receiver): complete — see
+  "PR 8 — P4" section below. Nothing remains; this was the tracker's last work unit.
 
 ## Workload / PR Boundary (P3c)
 
@@ -1029,3 +1031,302 @@ binary, neither introduced by this unit.
 8/8 tasks in PR 7 (P3c) complete. 63/68 tasks total across P1a+P1b+P2a+P2b+P3a+P3b+P3c. Ready for
 `sdd-verify`, or for `sdd-apply` to continue with PR 8 (P4) in a fresh batch, on a new branch based on this
 one (`feat/phase-coverage-evidence`).
+
+---
+
+# PR 8 — P4: Pin-bump automation + default-branch receiver
+
+> Worktree `gentle-pi-worktrees/p4`, branch `feat/pin-bump-automation`, based on P3c's
+> `feat/phase-coverage-evidence`. Tasks 8.1-8.5. **This completes the consumer tracker's 68 tasks —
+> all of P1a+P1b+P2a+P2b+P3a+P3b+P3c+P4 are now checked.**
+
+## Completed Tasks
+
+- [x] 8.1 RED: `tests/bump-gentle-ai-pin.test.ts` — threat-matrix "PR commands": a dispatched tag carrying
+  shell metacharacters is rejected (10 cases: `;`, `&&`, `|`, backtick, `$()`, embedded newline, quotes,
+  `>`, `&`); a `--head`/`--base` injection attempt is rejected (5 cases, including a bare `--head` and a
+  tag with an embedded space followed by `--head evil-branch`); an implicit (omitted) base is rejected, and
+  any alternate non-`main` base is rejected.
+- [x] 8.2 GREEN: created `scripts/bump-gentle-ai-pin.mjs` — `validateDispatchedTag` (anchored
+  `^v\d+\.\d+\.\d+$`, runs before any other code touches the value), `deriveBumpHeadBranch` (derives
+  `bump/gentle-ai-<tag>` only from an already-validated tag, and defensively re-validates even if called
+  directly), `buildPullRequestArguments` (flat `gh` argv array; base must be the exact literal `"main"`;
+  head must match the exact derived-prefix shape), `buildPullRequestBody`, and `runGentleAiPinBump`
+  orchestrating, in order: `git checkout -b <head>` → `sync-gentle-ai-release.mjs --write` →
+  `build-gentle-ai-baselines.mjs --write` → `build-skill-overlays.mjs --write` → `git add -A` → `git status
+  --porcelain` (short-circuits with no commit/push/PR if empty) → `git commit` → `git push --set-upstream`
+  → `gh pr create --base main --head <branch> ...`. Every subprocess call goes through `execFile` with a
+  fixed argv array (`shell: false`); nowhere does the script compose a shell string by interpolating the
+  tag, the branch name, or any other external payload.
+- [x] 8.3 GREEN: created `.github/workflows/gentle-ai-release-received.yml` — `on: repository_dispatch:
+  types: [gentle-ai-release-published]`; single `pin-bump` job with `contents: write` +
+  `pull-requests: write`; the dispatch payload's tag is read into `DISPATCHED_TAG` via `env:` (never
+  interpolated directly into a `run:` script body — GitHub Actions' own well-known script-injection
+  vector); the bump step runs `node scripts/bump-gentle-ai-pin.mjs --tag "$DISPATCHED_TAG"`. The workflow's
+  header comment explains, in detail, why this receiver is inert until it reaches `main` (see "Why the
+  receiver is inert for now" below) so nobody "fixes" it.
+- [x] 8.4 GREEN: `.github/workflows/ci.yml` — replaced the stale "not-yet-landed pin-bump job, P4" comment
+  with one naming the actual receiver workflow and job, and explicitly scoping the "only job with network
+  access" boundary to the gentle-ai release download (not `pnpm install`'s pre-existing, unrelated npm
+  registry access — see "Network access boundary, precisely scoped" below for why that distinction matters
+  and is not a loophole).
+- [x] 8.5 Verify: `pnpm test -- bump-gentle-ai-pin` (`node --experimental-strip-types --test
+  tests/bump-gentle-ai-pin.test.ts`) → `pass 33 fail 0`. Dry-run dispatch against a fixture tag proven two
+  ways (both below): (a) a real local git repo + a stub `gh` on `PATH`, exercising the REAL `execFile`
+  subprocess path end to end; (b) direct CLI invocation with a shell-metacharacter tag, proving rejection
+  happens before a single subprocess is spawned. `repository_dispatch` activation itself cannot be proven
+  in this sandbox (no network, no GitHub API, and by design this workflow cannot fire until merged to
+  `main` — see below); that is the one remaining real-world step, documented under "What remains before
+  this automation can actually run."
+
+## TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|------|-----------|-------|------------|-----|-------|-------------|----------|
+| 8.1/8.2 | `tests/bump-gentle-ai-pin.test.ts` | Unit | N/A (new file) | ✅ Written first — referenced `validateDispatchedTag`/`deriveBumpHeadBranch`/`buildPullRequestArguments`/`buildPullRequestBody`/`parseArguments`/`runGentleAiPinBump` before `scripts/bump-gentle-ai-pin.mjs` existed → confirmed `ERR_MODULE_NOT_FOUND` (ran the whole suite before writing any production code) | ✅ 33/33 pass on the first implementation pass | ✅ 10 shell-metacharacter tag variants, 5 `--head`/`--base` injection variants, implicit-base AND alternate-base rejection, head-branch-shape rejection, an argv-shape assertion (tokens are separate strings, never a composed string), an explicit "never `--auto`" assertion, plus 4 orchestration-level tests (reject-before-any-command, stop-after-sync-failure, full happy-path-in-order, no-changes-short-circuit) | ✅ Clean — one pure validation function is the single point every other function and the orchestration re-uses; no duplicated regex or ad hoc string checks anywhere else in the file |
+
+## Test Summary
+
+- **Total tests written**: 33 (in `tests/bump-gentle-ai-pin.test.ts`)
+- **Total tests passing**: 33/33
+- **Layers used**: Unit (29, pure functions), orchestration with an injected command fake (4)
+- **Pure functions created**: `validateDispatchedTag`, `deriveBumpHeadBranch`, `buildPullRequestArguments`,
+  `buildPullRequestBody`, `parseArguments` — `runGentleAiPinBump` is the only function with I/O, and that
+  I/O (`runCommand`) is fully injectable, exactly matching the seam pattern already used by
+  `syncGentleAiRelease`'s `fetchText`/`downloadArchive`/`extractor` options.
+
+## RED-then-GREEN evidence (exact commands)
+
+RED (before `scripts/bump-gentle-ai-pin.mjs` existed):
+
+```
+$ node --experimental-strip-types --test tests/bump-gentle-ai-pin.test.ts
+Error [ERR_MODULE_NOT_FOUND]: Cannot find module
+'/home/gentleman/work/gentle-pi-worktrees/p4/scripts/bump-gentle-ai-pin.mjs' imported from
+tests/bump-gentle-ai-pin.test.ts
+✖ tests/bump-gentle-ai-pin.test.ts (71.2ms)
+ℹ tests 1 / pass 0 / fail 1
+```
+
+GREEN (after implementation):
+
+```
+$ node --experimental-strip-types --test tests/bump-gentle-ai-pin.test.ts
+ℹ tests 33
+ℹ pass 33
+ℹ fail 0
+```
+
+## How each injection vector is proven rejected
+
+1. **Shell metacharacters** — `validateDispatchedTag` is exercised with 10 payloads: `; rm -rf /`,
+   `&& rm -rf /`, `| cat /etc/passwd`, a backtick command substitution, a `$()` command substitution, an
+   embedded newline followed by `rm -rf /`, a single quote, a double quote, an output redirection (`>
+   /tmp/pwned`), and a background operator (`&`). Every one fails the anchored `^v\d+\.\d+\.\d+$` pattern
+   and throws before any other code runs. Proven twice: once as a `node:test` table-driven case, and once
+   live against the real CLI (`node scripts/bump-gentle-ai-pin.mjs --tag 'v1.2.3; touch
+   /tmp/pwned-marker'`) — exit code 1, the exact rejection message, and no `/tmp/pwned-marker` file created.
+2. **`--head` injection attempt** — 5 payloads: a tag with an embedded space followed by `--head
+   evil-branch`; a tag with an embedded tab followed by `--head=evil-branch`; a bare `--head`; a bare
+   `--head evil-branch`; and a tag with an embedded space followed by `--base evil-base` (the same vector
+   applied to `--base`, since the design's own threat row names both). All 5 fail the same anchored
+   pattern (it permits only digits and dots — no spaces, tabs, or dashes at all), so an attacker cannot
+   smuggle an extra CLI flag inside the tag value under any circumstance, structurally, not just by
+   coincidence of the test cases chosen.
+3. **Implicit base** — `buildPullRequestArguments({ base: undefined, ... })` throws
+   `gentle-ai pin-bump PR base must be the explicit literal "main"; refusing an implicit or alternate base
+   undefined`. A second test proves an explicitly-supplied alternate base (`"develop"`) is rejected with
+   the identical message — the function does not merely default a missing base to `main`, it requires the
+   caller to pass the literal `"main"` and refuses anything else, including `undefined`.
+
+None of these three checks live only in tests: `runGentleAiPinBump`'s only path to `buildPullRequestArguments`
+passes the hardcoded `GENTLE_AI_BUMP_BASE_BRANCH` constant, so the implicit-base guard is unreachable from
+production code by construction — it exists to keep the function safe for any future caller, not because
+today's one caller could trigger it.
+
+## Confirmation that no auto-merge path exists
+
+- `buildPullRequestArguments` returns exactly `["pr", "create", "--base", base, "--head", head, "--title",
+  title, "--body", body]` — 10 tokens, no more. A dedicated test
+  (`buildPullRequestArguments never includes an auto-merge flag`) asserts `--auto`, `--admin`, `--squash`,
+  and `merge` are all absent from that array.
+- The happy-path orchestration test additionally scans **every** recorded subprocess call across the whole
+  `runGentleAiPinBump` run (not just the `gh` call) and asserts none of them is `gh pr merge` and none of
+  them includes an `--auto` token anywhere.
+- `scripts/bump-gentle-ai-pin.mjs` contains exactly one `gh` invocation in its entire source: the
+  `pr create` call inside `runGentleAiPinBump`. Grepped and confirmed: `rg -n '"gh"' scripts/bump-gentle-ai-pin.mjs`
+  returns one match.
+- `.github/workflows/gentle-ai-release-received.yml` has exactly one job and one `gh`-invoking step (the
+  `Bump gentle-ai pin` step); there is no merge, auto-merge, or auto-approve step anywhere in the workflow.
+- The PR body itself (`buildPullRequestBody`) states, verbatim: "**This PR requires human review and is
+  never auto-merged**, even when every check is green" — so the intent is visible to the human reviewer
+  inside the PR, not only enforced in code.
+
+## Dry-run dispatch proof (task 8.5)
+
+Two independent proofs, neither touching the real repository, the network, or a real GitHub API:
+
+**(a) Real subprocess path against a throwaway local git repo.** Built a temp bare "origin" + a work clone,
+with stub `sync-gentle-ai-release.mjs`/`build-gentle-ai-baselines.mjs`/`build-skill-overlays.mjs` that each
+write a marker file, and a stub `gh` executable on `PATH` that logs its argv and exits 0. Called
+`runGentleAiPinBump({ rawTag: "v9.9.9", packageRoot: workDir })` with the REAL (non-injected)
+`defaultRunCommand` — i.e. real `execFile`, real `git`. Result:
+
+```
+result: { tag: 'v9.9.9', headBranch: 'bump/gentle-ai-v9.9.9', prOpened: true }
+gh invocation log: pr create --base main --head bump/gentle-ai-v9.9.9 --title chore(gentle-ai): bump pin to v9.9.9 --body ...
+branch on origin: bump/gentle-ai-v9.9.9
+last commit message on branch: chore(gentle-ai): bump pin to v9.9.9
+DRY RUN OK: real git subprocess path + stub gh argv handoff both verified.
+```
+
+This proves the real `git checkout -b` / `git commit` / `git push` / `gh` argv handoff all work together,
+end to end, exactly as the injected-fake unit tests assert in isolation — a real branch landed on the
+local "origin", with the right commit message, and `gh` received the exact expected `--base main --head
+bump/gentle-ai-v9.9.9` tokens.
+
+**(b) Direct CLI rejection proof.** `node scripts/bump-gentle-ai-pin.mjs --tag 'v1.2.3; touch
+/tmp/pwned-marker'` → exit code 1, the exact `does not match` rejection message, and (confirmed via `test
+-f /tmp/pwned-marker`) no injected command ever executed.
+
+Neither proof is checked into the repository as a permanent test (they require a real local git repo /
+`PATH` manipulation not appropriate for `tests/*.test.ts`); they are throwaway verification evidence,
+matching how `pnpm run test:harness`-style scenarios in prior units of this tracker were also documented
+as manual/scripted proof rather than promoted into `node:test`.
+
+## Why the receiver is inert for now
+
+`repository_dispatch` only invokes a workflow file that ALREADY EXISTS on the repository's default branch.
+`.github/workflows/gentle-ai-release-received.yml` cannot receive a single event until this exact file is
+merged to `main` — this branch (`feat/pin-bump-automation`), the tracker branch, and every other
+non-default branch will never see a `repository_dispatch` event fire this workflow, no matter how the
+provider dispatches it. This is documented at length in the workflow file's own header comment specifically
+so a future maintainer does not mistake "the workflow never runs here" for a bug and try to "fix" it by,
+for example, changing the trigger or adding a workaround. It also explains, in the same comment, why every
+future bump PR must target `main` and never a temporary tracker branch: once this file is on `main`, the
+live event source is the provider's own `main`-branch-triggered publish, and a PR against a non-default
+branch would never be reachable by a subsequent dispatch.
+
+## Network access boundary, precisely scoped
+
+The instruction "the pin-bump job must remain the only job with network access; every other check stays
+offline" is design D6's existing invariant ("every per-PR check is offline; only the pin-bump job
+downloads") applied to P4. Read literally against *every* kind of network access, it would also indict
+`ci.yml`'s pre-existing `pnpm install --frozen-lockfile` step (npm registry) and the new receiver's own
+`pnpm install` step — both of which predate this design entirely and are unrelated to the gentle-ai release
+trust boundary D1-D6 establish. The scoped, design-consistent reading — and the one implemented and
+documented in both workflow files' comments — is: **no job other than the pin-bump job in
+`gentle-ai-release-received.yml` ever downloads a gentle-ai release or invokes `scripts/sync-gentle-ai-release.mjs
+--write`.** Dependency installation via `pnpm install` remains a separate, pre-existing, package-manager-level
+concern present in every job of every workflow in this repository, before and after this change, and
+altering that would be out of this change's scope. This is stated explicitly, not silently narrowed, in
+both `ci.yml`'s comment (task 8.4) and the new receiver workflow's job-level comment.
+
+## Rollback boundary
+
+Delete `scripts/bump-gentle-ai-pin.mjs`, `tests/bump-gentle-ai-pin.test.ts`, and
+`.github/workflows/gentle-ai-release-received.yml`; revert the one comment edit in
+`.github/workflows/ci.yml`. No P1/P2/P3 file is touched by this unit. Manual, human-verified pin bumps
+(the process every prior release used) resume exactly as before — nothing in P1-P3's trust, generation, or
+gate code depends on this automation existing.
+
+## Work Unit Evidence (P4)
+
+| Evidence | Value |
+|---|---|
+| Focused test command and exact result | `node --experimental-strip-types --test tests/bump-gentle-ai-pin.test.ts` → `pass 33 fail 0` |
+| Runtime harness command/scenario and exact result | No `pnpm run test:harness`/`--check` runtime boundary applies to this unit's own new code (it has no generated-runtime or offline-gate surface of its own). Instead: manual `workflow_dispatch`-equivalent dry-run replay against a fixture tag (`v9.9.9`), against a real local git repo with a stub `gh`, proving the real subprocess path end to end — see "Dry-run dispatch proof" above. `pnpm run test:harness` was still re-run as part of the full-suite proof below to confirm this unit introduces no regression there. |
+| Rollback boundary | See "Rollback boundary" above. |
+
+## Full-suite proof (`node --experimental-strip-types --test tests/*.test.ts`)
+
+`tests 1178 / pass 1165 / fail 1 / skipped 12` (1145 pre-existing + 33 new, all in
+`tests/bump-gentle-ai-pin.test.ts`). The 1 failure is the same pre-existing, sandbox-only, no-network
+`tests/native-review-cli.test.ts` "native output limits dominate killed timeout signals..." failure
+documented in every prior unit of this tracker — word-for-word identical failure message and stack
+(`package-local-binary-missing: Gentle AI v2.2.3 is not installed`) to P3c's documented occurrence. Not
+new, not related to this unit.
+
+`node --experimental-strip-types tests/runtime-harness.mjs` also fails in this sandbox, with the exact same
+message P3c already documented and attributed to the identical root cause (no native
+`.gentle-ai/v2.2.3/gentle-ai` binary, no network): "Gentle AI pre-pr gate could not reconsult review mode
+and failed closed." Word-for-word identical to the P3c record — not introduced by this unit.
+
+`pnpm install` still fails its own `postinstall` network step in this sandbox (HTTP 404 fetching the
+binary), exactly as documented in every prior unit; it still succeeds far enough to populate `node_modules`
+from the local pnpm store, so the direct `node --experimental-strip-types --test tests/*.test.ts`
+invocation was used, matching every prior unit's documented workaround.
+
+Offline generator/gate checks, all passing against the real tree after this unit's changes:
+
+```
+$ node scripts/verify-package-files.mjs --check
+gentle-pi package resource check passed (73 files; 66 lock-pinned mirror artifacts at release v2.2.3).
+
+$ node scripts/build-gentle-ai-baselines.mjs --check
+gentle-ai baselines match their checked-in sources (lib/gentle-ai-required-floor.generated.ts)
+
+$ node scripts/build-skill-overlays.mjs --check
+skill overlays match their checked-in sources (7 skills: branch-pr, chained-pr, cognitive-doc-design,
+comment-writer, skill-improver, skill-registry, work-unit-commits)
+```
+
+## Deviations from Design
+
+None — implementation matches design.md D1/D6's network-boundary invariant and the threat-matrix "PR
+commands" row exactly. The one interpretive choice made explicit above ("Network access boundary, precisely
+scoped") is a scoping clarification of an instruction that, read maximally literally, would contradict this
+repository's own pre-existing, unrelated `pnpm install` steps — not a deviation from design.md, which never
+mentions dependency-installation network access at all.
+
+## Issues Found
+
+None new. Same `node_modules`/`postinstall` HTTP 404 sandbox environment condition documented in every
+prior unit of this tracker, plus the same `tests/runtime-harness.mjs` pre-existing failure P3c already
+confirmed reproduces on a clean tip — neither introduced by this unit.
+
+## What remains before this automation can actually run
+
+1. **This branch chain must merge to `main`.** `repository_dispatch` cannot invoke
+   `.github/workflows/gentle-ai-release-received.yml` until that exact file is present on the default
+   branch (see "Why the receiver is inert for now" above) — this is a GitHub platform restriction, not
+   something any code change here can work around.
+2. **The provider must publish a real signed gentle-ai release and dispatch it.** `GENTLE_AI_RELEASE_TRUSTED_PUBLIC_KEY`
+   in `scripts/sync-gentle-ai-release.mjs` is still the `PENDING-GENTLE-AI-RELEASE-MINISIGN-PUBLIC-KEY`
+   sentinel (documented since P1b); a live `--write` run fails closed while it remains pending, by design —
+   this is out of scope for the consumer tracker and tracked entirely on the provider side
+   (`publish-gentle-ai-release-artifacts`).
+3. **The provider must dispatch the `gentle-ai-release-published` event type** with `client_payload.tag`
+   set to the published tag. The exact event type name (`gentle-ai-release-published`) is this change's own
+   choice, not previously pinned anywhere in design.md/tasks.md/proposal.md; if the provider side settles on
+   a different name, only the one `types:` line in `gentle-ai-release-received.yml` needs to change.
+4. **A GitHub Actions bot identity and token permissions must be confirmed at merge time** — the workflow
+   requests `contents: write` + `pull-requests: write` and configures a bot git identity
+   (`gentle-ai-release-bot`) for the automated commit; this has not been exercised against real GitHub
+   Actions permissions in this sandbox (no network, no GitHub API access here).
+
+None of these are code-completeness gaps in this unit — they are the real-world activation steps that can
+only happen once this code lands on `main`, matching the design's own stated rollout: "Live
+`repository_dispatch` activates only after P4's receiver reaches `main`."
+
+## Workload / PR Boundary (P4)
+
+- Mode: feature-branch-chain, `size:exception` (tasks.md: `Delivery strategy: exception-ok`)
+- Current work unit: P4 (PR 8, base: P3c's branch `feat/phase-coverage-evidence`)
+- Boundary: `scripts/bump-gentle-ai-pin.mjs` (new), `tests/bump-gentle-ai-pin.test.ts` (new),
+  `.github/workflows/gentle-ai-release-received.yml` (new), one comment edit in
+  `.github/workflows/ci.yml`. No P1/P2/P3 file touched.
+- Estimated review budget impact: `git diff --stat` shows 1 tracked file changed
+  (`.github/workflows/ci.yml`: 7 insertions/3 deletions), plus 3 new untracked files —
+  `scripts/bump-gentle-ai-pin.mjs` (195 lines), `tests/bump-gentle-ai-pin.test.ts` (283 lines),
+  `.github/workflows/gentle-ai-release-received.yml` (91 lines) — 576 total authored lines, all new/net-new
+  logic (no vendored/golden content in this unit). Above the tracker's estimated ~180-line P4 forecast but
+  still within the tracker-wide `Delivery strategy: exception-ok` (tasks.md: `400-line budget risk: High`,
+  `Decision needed before apply: No`) that every prior unit operated under; the excess over the forecast is
+  almost entirely the RED test file (8.1) and the threat-matrix injection-vector coverage it demands, plus
+  the extensively-commented threat-model rationale in both new files, not scope creep.
+
+## Status (P4 / FINAL)
+
+5/5 tasks in PR 8 (P4) complete. **68/68 tasks total across P1a+P1b+P2a+P2b+P3a+P3b+P3c+P4 — the consumer
+tracker is complete.** Ready for `sdd-verify`. No further `sdd-apply` batches remain for this change.

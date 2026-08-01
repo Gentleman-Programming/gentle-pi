@@ -57,9 +57,13 @@ jobs:
       #      hand-edited vendored file and a stale overlay anchor before
       #      either reaches skills/<name>/SKILL.md.
       #
-      # Only scripts/sync-gentle-ai-release.mjs --write (the not-yet-landed
-      # pin-bump job, P4) ever downloads or verifies a minisign signature; no
-      # step in this workflow does.
+      # scripts/sync-gentle-ai-release.mjs --write only ever runs in the
+      # pin-bump job of .github/workflows/gentle-ai-release-received.yml
+      # (design D1/D6/P4) -- no step in THIS workflow downloads a gentle-ai
+      # release or verifies a minisign signature. (This job's own `pnpm
+      # install` above still reaches the npm registry for dependency
+      # installation; that is a separate, pre-existing surface unrelated to
+      # the gentle-ai release trust boundary this design adds.)
       - name: Verify offline checks (mirrors/lock, phase coverage, baselines, skill overlays)
         run: |
           node scripts/verify-package-files.mjs --check
