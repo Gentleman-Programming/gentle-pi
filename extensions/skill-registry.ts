@@ -74,6 +74,25 @@ function userSkillDirs(): string[] {
 	];
 }
 
+async function discoverNpmPackageSkillDirs(): Promise<string[]> {
+	const home = homedir();
+	const nodeModules = join(home, ".pi/agent/npm/node_modules");
+	if (!(await pathExists(nodeModules))) return [];
+	let entries;
+	try {
+		entries = await readdir(nodeModules, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+	const out: string[] = [];
+	for (const entry of entries) {
+		if (!entry.isDirectory()) continue;
+		const skillsDir = join(nodeModules, entry.name, "skills");
+		if (await pathExists(skillsDir)) out.push(skillsDir);
+	}
+	return out;
+}
+
 function projectSkillDirs(cwd: string): string[] {
 	return [
 		join(cwd, "skills"),
@@ -229,9 +248,11 @@ function dedupeBySkillName(entries: SkillEntry[], cwd: string): SkillEntry[] {
 }
 
 function scopeForPath(cwd: string, path: string): string {
+	const cleanPath = comparablePath(path);
+	if (cleanPath.includes(`${sep}node_modules${sep}`)) return "package";
 	const cleanCwd = comparablePath(cwd);
 	const projectPrefix = cleanCwd.endsWith(sep) ? cleanCwd : `${cleanCwd}${sep}`;
-	return comparablePath(path).startsWith(projectPrefix) ? "project" : "user";
+	return cleanPath.startsWith(projectPrefix) ? "project" : "user";
 }
 
 function markdownCell(value: string): string {
@@ -371,6 +392,7 @@ async function regenerateRegistry(
 	const existingDirs = await uniqueExistingDirs([
 		...projectSkillDirs(cwd),
 		...userSkillDirs(),
+		...(await discoverNpmPackageSkillDirs()),
 	]);
 	const files: string[] = [];
 	for (const dir of existingDirs) {
@@ -489,6 +511,7 @@ async function startSkillRegistryWatcher(
 	const dirs = await uniqueExistingDirs([
 		...projectSkillDirs(cwd),
 		...userSkillDirs(),
+		...(await discoverNpmPackageSkillDirs()),
 	]);
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const refresh = () => {
