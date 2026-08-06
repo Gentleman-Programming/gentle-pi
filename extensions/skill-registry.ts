@@ -10,7 +10,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join, normalize, relative, sep } from "node:path";
+import { basename, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -93,8 +93,10 @@ async function piSkillsDirs(cwd: string): Promise<string[]> {
 		if (typeof entry !== "string" || entry === "") continue;
 		const candidate = join(cwd, entry);
 		// Confine to the project so a malformed entry cannot traverse outside cwd.
+		// Component-level: reject exact parent, parent traversal, and absolute entries,
+		// but allow legitimate names that merely start with ".." (e.g. "..design").
 		const rel = relative(cwd, candidate);
-		if (rel === "" || rel.startsWith("..")) continue;
+		if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(entry)) continue;
 		out.push(candidate);
 	}
 	return out;
