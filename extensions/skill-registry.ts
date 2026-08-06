@@ -556,17 +556,30 @@ async function startSkillRegistryWatcher(
 			// Some filesystems do not support recursive watches; session_start/manual refresh still work.
 		}
 	}
-	// Also watch the npm package root (non-recursive) so newly installed or removed
-	// packages trigger discoverNpmPackageSkillDirs again via regenerateRegistry. The
-	// discovered skill directories above are captured once at start; without this root
-	// watch, a package installed mid-session would not refresh the registry.
+	// Also watch the npm package root and each existing scope directory (non-recursive)
+	// so newly installed or removed packages trigger discoverNpmPackageSkillDirs again
+	// via regenerateRegistry. The root watch catches new unscoped packages and brand-new
+	// scopes; each scope-directory watch catches packages added under an existing @scope,
+	// which do not appear as direct children of the npm root.
 	const npmRoot = join(homedir(), ".pi/agent/npm/node_modules");
 	if (await pathExists(npmRoot)) {
+		const watchRoots = [npmRoot];
 		try {
-			const rootWatcher = watch(npmRoot, { recursive: false }, refresh);
-			activeWatchers.add(rootWatcher);
+			for (const entry of await readdir(npmRoot, { withFileTypes: true })) {
+				if (entry.isDirectory() && entry.name.startsWith("@")) {
+					watchRoots.push(join(npmRoot, entry.name));
+				}
+			}
 		} catch {
-			// Best-effort; some platforms limit watchers on large directories.
+			// Best-effort; proceed with at least the npm root.
+		}
+		for (const root of watchRoots) {
+			try {
+				const rootWatcher = watch(root, { recursive: false }, refresh);
+				activeWatchers.add(rootWatcher);
+			} catch {
+				// Best-effort; some platforms limit watchers on large directories.
+			}
 		}
 	}
 }
