@@ -10,7 +10,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join, normalize, relative, sep } from "node:path";
+import { basename, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -72,6 +72,34 @@ function userSkillDirs(): string[] {
 		join(home, ".kiro/skills"),
 		join(home, ".openclaw/skills"),
 	];
+}
+
+async function piSkillsDirs(cwd: string): Promise<string[]> {
+	// Read the pi.skills multi-path array from the project package.json so projects
+	// that declare skills via package.json (e.g. "./penpot-design/skills") are indexed,
+	// not only fixed convention dirs like cwd/skills or cwd/.pi/skills.
+	const pkgPath = join(cwd, "package.json");
+	if (!(await pathExists(pkgPath))) return [];
+	let pkg: { pi?: { skills?: unknown } };
+	try {
+		pkg = JSON.parse(await readFile(pkgPath, "utf8"));
+	} catch {
+		return [];
+	}
+	const skills = pkg?.pi?.skills;
+	if (!Array.isArray(skills)) return [];
+	const out: string[] = [];
+	for (const entry of skills) {
+		if (typeof entry !== "string" || entry === "") continue;
+		const candidate = join(cwd, entry);
+		// Confine to the project so a malformed entry cannot traverse outside cwd.
+		// Component-level: reject exact parent, parent traversal, and absolute entries,
+		// but allow legitimate names that merely start with ".." (e.g. "..design").
+		const rel = relative(cwd, candidate);
+		if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(entry)) continue;
+		out.push(candidate);
+	}
+	return out;
 }
 
 function projectSkillDirs(cwd: string): string[] {
@@ -371,6 +399,7 @@ async function regenerateRegistry(
 	const existingDirs = await uniqueExistingDirs([
 		...projectSkillDirs(cwd),
 		...userSkillDirs(),
+		...(await piSkillsDirs(cwd)),
 	]);
 	const files: string[] = [];
 	for (const dir of existingDirs) {
@@ -489,6 +518,7 @@ async function startSkillRegistryWatcher(
 	const dirs = await uniqueExistingDirs([
 		...projectSkillDirs(cwd),
 		...userSkillDirs(),
+		...(await piSkillsDirs(cwd)),
 	]);
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const refresh = () => {
