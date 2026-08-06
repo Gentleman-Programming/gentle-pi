@@ -87,8 +87,27 @@ async function discoverNpmPackageSkillDirs(): Promise<string[]> {
 	const out: string[] = [];
 	for (const entry of entries) {
 		if (!entry.isDirectory()) continue;
-		const skillsDir = join(nodeModules, entry.name, "skills");
-		if (await pathExists(skillsDir)) out.push(skillsDir);
+		if (entry.name.startsWith("@")) {
+			// Scoped package layout: node_modules/@scope/<pkg>/skills.
+			// The scope directory itself is never a package, so descend one level
+			// and inspect each scoped package for a skills directory.
+			let scopedEntries;
+			try {
+				scopedEntries = await readdir(join(nodeModules, entry.name), {
+					withFileTypes: true,
+				});
+			} catch {
+				continue;
+			}
+			for (const scopedEntry of scopedEntries) {
+				if (!scopedEntry.isDirectory()) continue;
+				const skillsDir = join(nodeModules, entry.name, scopedEntry.name, "skills");
+				if (await pathExists(skillsDir)) out.push(skillsDir);
+			}
+		} else {
+			const skillsDir = join(nodeModules, entry.name, "skills");
+			if (await pathExists(skillsDir)) out.push(skillsDir);
+		}
 	}
 	return out;
 }
@@ -535,6 +554,19 @@ async function startSkillRegistryWatcher(
 			activeWatchers.add(watcher);
 		} catch {
 			// Some filesystems do not support recursive watches; session_start/manual refresh still work.
+		}
+	}
+	// Also watch the npm package root (non-recursive) so newly installed or removed
+	// packages trigger discoverNpmPackageSkillDirs again via regenerateRegistry. The
+	// discovered skill directories above are captured once at start; without this root
+	// watch, a package installed mid-session would not refresh the registry.
+	const npmRoot = join(homedir(), ".pi/agent/npm/node_modules");
+	if (await pathExists(npmRoot)) {
+		try {
+			const rootWatcher = watch(npmRoot, { recursive: false }, refresh);
+			activeWatchers.add(rootWatcher);
+		} catch {
+			// Best-effort; some platforms limit watchers on large directories.
 		}
 	}
 }
