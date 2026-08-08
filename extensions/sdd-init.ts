@@ -775,11 +775,29 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Auto-detect project stack and bootstrap openspec/config.yaml for SDD.",
 		handler: async (_args: unknown, ctx: any) => {
-			await ensureSddPreflight(ctx, {
+			const prefs = await ensureSddPreflight(ctx, {
 				pi,
 				installAssets: (cwd) => installSddAssets(cwd, false),
 				applyModelConfig: () => applySavedModelConfig(ctx),
 			});
+
+			const detection = detectProject(ctx.cwd);
+			const testSummary = detection.testCommand
+				? `strict TDD enabled with \`${detection.testCommand}\``
+				: "strict TDD disabled because no test runner was detected";
+			const layerSummary = `unit: ${detection.commands.unit.length}, integration: ${detection.commands.integration.length}, e2e: ${detection.commands.e2e.length}`;
+
+			const shouldCreateOpenSpec =
+				prefs.artifactStore === "openspec" ||
+				prefs.artifactStore === "both";
+			if (!shouldCreateOpenSpec) {
+				ctx.ui.notify(
+					`SDD initialized for ${prefs.artifactStore}: detected ${detection.stack.join(", ") || "project"}; ${testSummary}; tests found: ${layerSummary}.`,
+					"info",
+				);
+				return;
+			}
+
 			const configPath = join(ctx.cwd, CONFIG_REL_PATH);
 			if (existsSync(configPath)) {
 				ctx.ui.notify(
@@ -789,15 +807,10 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const detection = detectProject(ctx.cwd);
 			ensureOpenSpecDirs(ctx.cwd);
 			mkdirSync(dirname(configPath), { recursive: true });
 			writeFileSync(configPath, renderConfig(detection));
 
-			const testSummary = detection.testCommand
-				? `strict TDD enabled with \`${detection.testCommand}\``
-				: "strict TDD disabled because no test runner was detected";
-			const layerSummary = `unit: ${detection.commands.unit.length}, integration: ${detection.commands.integration.length}, e2e: ${detection.commands.e2e.length}`;
 			ctx.ui.notify(
 				`Wrote ${CONFIG_REL_PATH}: detected ${detection.stack.join(", ") || "project"}; ${testSummary}; tests found: ${layerSummary}.`,
 				"info",

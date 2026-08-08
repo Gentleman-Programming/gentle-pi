@@ -13,7 +13,7 @@ output: init.md
 outputMode: file-only
 progress: true
 
-Initialize SDD context for {task} before any planning or implementation. If `openspec/config.yaml` is missing, inspect the project and create it automatically. If it already exists, read it, refresh only safe derived context when appropriate, and report the current SDD/testing configuration without blocking the chain.
+Initialize SDD context for {task} before any planning or implementation. If the artifact store is `openspec` or `both` and `openspec/config.yaml` is missing, inspect the project and create it automatically. If the artifact store is `engram` or `none`, skip OpenSpec file creation. If `openspec/config.yaml` already exists, read it, refresh only safe derived context when appropriate, and report the current SDD/testing configuration without blocking the chain.
 
 ## sdd-explore
 
