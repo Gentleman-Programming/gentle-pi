@@ -5,7 +5,7 @@ model: openai-codex/gpt-5.3-codex
 tools:
   - read
   - grep
-  - glob
+  - find
   - write
   - edit
   - bash

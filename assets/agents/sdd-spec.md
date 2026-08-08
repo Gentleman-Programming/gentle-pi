@@ -4,7 +4,7 @@ description: Write SDD delta specs with requirements and scenarios.
 tools:
   - read
   - grep
-  - glob
+  - find
   - write
   - edit
   - mem_search

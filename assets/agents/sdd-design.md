@@ -4,7 +4,7 @@ description: Design the technical approach for an SDD change.
 tools:
   - read
   - grep
-  - glob
+  - find
   - write
   - edit
   - mem_search

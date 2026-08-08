@@ -4,7 +4,7 @@ description: Show read-only structured SDD status for an active change.
 tools:
   - read
   - grep
-  - glob
+  - find
   - bash
   - mem_search
   - mem_get_observation

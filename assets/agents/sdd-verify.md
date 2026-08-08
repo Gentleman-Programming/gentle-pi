@@ -4,7 +4,7 @@ description: Verify implementation against SDD specs, tasks, strict TDD evidence
 tools:
   - read
   - grep
-  - glob
+  - find
   - bash
   - write
   - edit

@@ -4,7 +4,7 @@ description: Archive a verified SDD change into OpenSpec source specs.
 tools:
   - read
   - grep
-  - glob
+  - find
   - write
   - edit
   - bash
