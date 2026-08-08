@@ -4,7 +4,7 @@ description: Break SDD design/specs into implementation tasks with review worklo
 tools:
   - read
   - grep
-  - glob
+  - find
   - write
   - edit
   - mem_search

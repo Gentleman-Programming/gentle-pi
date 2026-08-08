@@ -4,7 +4,7 @@ description: Implement SDD tasks with strict TDD evidence and review workload gu
 tools:
   - read
   - grep
-  - glob
+  - find
   - edit
   - write
   - bash

@@ -4,7 +4,7 @@ description: Write an SDD proposal for an approved change idea.
 tools:
   - read
   - grep
-  - glob
+  - find
   - write
   - edit
   - mem_search

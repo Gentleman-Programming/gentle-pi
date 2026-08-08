@@ -4,7 +4,7 @@ description: Sync verified SDD delta specs into OpenSpec canonical specs without
 tools:
   - read
   - grep
-  - glob
+  - find
   - write
   - edit
   - bash

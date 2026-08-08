@@ -4,7 +4,7 @@ description: Guide a user through a complete SDD cycle on a small real project c
 tools:
   - read
   - grep
-  - glob
+  - find
   - write
   - edit
   - bash
