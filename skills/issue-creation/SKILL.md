@@ -32,7 +32,7 @@ Use this skill when:
 ```
 0. Pre-publication Discovery (repo capabilities, templates, labels, Discussions)
 1. Search existing open AND closed issues for duplicates
-2. Choose the correct template (from discovered templates, or fall back to blank)
+2. Classify discovered templates from declared metadata, then choose a confirmed match or permitted blank fallback
 3. Fill in ALL required fields
 4. Check pre-flight checkboxes
 5. Privacy-scrub title and body before submission
@@ -66,10 +66,18 @@ gh api repos/{owner}/{repo}/issue_templates
 # Markdown templates (optional; inspect the HTTP status)
 gh api --include repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE
 
+# For each Markdown template, fetch its exact discovered path
+DISCOVERED_TEMPLATE_PATH="<path-returned-by-discovery>"
+gh api "repos/{owner}/{repo}/contents/$DISCOVERED_TEMPLATE_PATH" --jq '.content' | base64 -d
+
 # Blank-issue policy (optional; inspect the HTTP status)
 gh api --include repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE/config.yml
 ```
 
+- Read each discovered template's declared metadata before selection. For form/YAML templates, use the metadata returned by `issue_templates` discovery. For every Markdown template, fetch the exact discovered path and inspect its frontmatter metadata, including fields such as `name` and `about`.
+- Classify every candidate as `bug`, `feature`, or `other` from its declared purpose/metadata; never classify or select from a guessed filename.
+- Assign `TEMPLATE_ID` only from a confirmed matching candidate whose metadata classification matches the issue.
+- If no candidate matches, use the documented blank-issue path only when blank issues are allowed; otherwise stop for maintainer guidance.
 - Both `.github/ISSUE_TEMPLATE` and `.github/ISSUE_TEMPLATE/config.yml` are optional lookups. For either lookup, HTTP 404 means "not configured"; continue to the blank-issue fallback policy.
 - Any non-404 failure (including authentication, authorization, rate-limit, network, 5xx, malformed, or unknown failures) is blocking: surface the failure and stop. Never suppress it.
 - On HTTP 200 for `config.yml`, decode the response body's `.content` field from base64 before reading the policy.
@@ -80,7 +88,7 @@ gh api --include repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE/config.yml
 ### Discover labels
 
 ```bash
-gh api repos/{owner}/{repo}/labels --jq '.[].name'
+gh api --paginate 'repos/{owner}/{repo}/labels?per_page=100' --jq '.[].name'
 ```
 
 - Apply only labels that appear in this discovered set.
@@ -117,7 +125,7 @@ gh issue comment <existing-number> --body "Occurrence: <scrubbed description and
 
 ## Label Policy
 
-- Apply only labels that exist in the discovered label set (`gh api repos/{owner}/{repo}/labels`).
+- Apply only labels that exist in the discovered label set returned by complete paginated discovery.
 - Never invent or assume label names.
 - Respect auto-labeling from templates when present (a template may apply `bug`, `enhancement`, etc.).
 - Respect maintainer-only labels — `status:approved`, `priority:high`, `priority:medium`, `priority:low` are maintainer-applied when they exist.
@@ -160,7 +168,7 @@ The templates below are **examples**. They only apply when the discovered repo e
 
 ### Bug Report (example template)
 
-Template identifier (when present): select the matching bug-report identifier from discovery.
+Template identifier (when present): select it only after declared metadata classifies it as a bug match.
 Auto-labels (when the template applies them): `bug`, `status:needs-review`
 
 #### Required Fields
@@ -186,8 +194,8 @@ Auto-labels (when the template applies them): `bug`, `status:needs-review`
 #### Example — Bug Report via CLI (only when the template exists)
 
 ```bash
-# Select the matching identifier returned by template discovery.
-TEMPLATE_ID="<discovered-template-identifier>"
+# Assign only after declared metadata confirms a matching bug candidate.
+TEMPLATE_ID="<confirmed-matching-template-identifier>"
 gh issue create --template "$TEMPLATE_ID" \
   --title "fix(scripts): setup.sh fails on zsh with glob error" \
   --body "
@@ -229,7 +237,7 @@ zsh: no matches found: skills/*
 
 ### Feature Request (example template)
 
-Template identifier (when present): select the matching feature-request identifier from discovery.
+Template identifier (when present): select it only after declared metadata classifies it as a feature match.
 Auto-labels (when the template applies them): `enhancement`, `status:needs-review`
 
 #### Required Fields
@@ -251,8 +259,8 @@ Auto-labels (when the template applies them): `enhancement`, `status:needs-revie
 #### Example — Feature Request via CLI (only when the template exists)
 
 ```bash
-# Select the matching identifier returned by template discovery.
-TEMPLATE_ID="<discovered-template-identifier>"
+# Assign only after declared metadata confirms a matching feature candidate.
+TEMPLATE_ID="<confirmed-matching-template-identifier>"
 gh issue create --template "$TEMPLATE_ID" \
   --title "feat(scripts): add Codex support to setup.sh" \
   --body "
@@ -338,14 +346,20 @@ gh api repos/{owner}/{repo}/issue_templates
 # Markdown templates (optional; inspect the HTTP status)
 gh api --include repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE
 
+# For each Markdown template, fetch its exact discovered path
+DISCOVERED_TEMPLATE_PATH="<path-returned-by-discovery>"
+gh api "repos/{owner}/{repo}/contents/$DISCOVERED_TEMPLATE_PATH" --jq '.content' | base64 -d
+
 # Blank-issue policy (optional; inspect the HTTP status)
 gh api --include repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE/config.yml
 
 # Labels (discovered set)
-gh api repos/{owner}/{repo}/labels --jq '.[].name'
+gh api --paginate 'repos/{owner}/{repo}/labels?per_page=100' --jq '.[].name'
 ```
 
 Both `.github/ISSUE_TEMPLATE` and `.github/ISSUE_TEMPLATE/config.yml` are optional lookups. For either lookup, HTTP 404 means "not configured"; continue to the blank-issue fallback policy. Any non-404 failure (including authentication, authorization, rate-limit, network, 5xx, malformed, or unknown failures) is blocking: surface the failure and stop. Never suppress it. On HTTP 200 for `config.yml`, decode the response body's `.content` field from base64 before reading the policy.
+
+Before selection, inspect every candidate's declared metadata: use form/YAML metadata returned by `issue_templates`, and fetch each discovered Markdown path to inspect frontmatter such as `name` and `about`. Classify each candidate as `bug`, `feature`, or `other` from that declared purpose, never from its filename. Assign `TEMPLATE_ID` only from a confirmed matching candidate. If none matches, use the blank-issue path only when allowed; otherwise stop for maintainer guidance.
 
 ### Duplicate search (open AND closed)
 
@@ -356,8 +370,8 @@ gh issue list --state all --limit 1000 --search "keywords"
 ### Create
 
 ```bash
-# Select the matching identifier returned by template discovery.
-TEMPLATE_ID="<discovered-template-identifier>"
+# Assign only from a candidate whose declared metadata confirms a match.
+TEMPLATE_ID="<confirmed-matching-template-identifier>"
 
 # Bug report (only when the selected template matches)
 gh issue create --template "$TEMPLATE_ID" --title "fix(scope): description"
@@ -365,8 +379,9 @@ gh issue create --template "$TEMPLATE_ID" --title "fix(scope): description"
 # Feature request (only when the selected template matches)
 gh issue create --template "$TEMPLATE_ID" --title "feat(scope): description"
 
-# Blank issue (when no templates exist)
+# No confirmed metadata match: blank issue only when blank_issues_enabled allows it
 gh issue create --title "fix(scope): description" --body "..."
+# Otherwise stop for maintainer guidance.
 ```
 
 Apply a label only after confirming an exact matching label exists in the discovered label set; when the template drives auto-labeling, no manual --label is needed.
@@ -387,9 +402,10 @@ gh issue edit <number> --add-label "priority:high"
 
 ```
 Repo has_issues = false?          → Stop: repo does not accept issues
-blank_issues_enabled = false?     → Use a discovered template, or stop for maintainer guidance
-Is it a bug?                     → Bug Report template (or blank with bug fields)
-Is it a new feature/improvement?  → Feature Request template (or blank with feature fields)
+blank_issues_enabled = false?     → Use a confirmed matching template, or stop for maintainer guidance
+Metadata classification = bug?   → Use a confirmed matching bug template
+Metadata classification = feature? → Use a confirmed matching feature template
+No metadata-confirmed match?     → Blank only when allowed; otherwise stop for maintainer guidance
 Is it a question?                → Discussions, only when has_discussions = true
 Is it a duplicate (open/closed)?  → Add occurrence comment to existing issue
 ```

@@ -19,8 +19,8 @@ test("Pre-publication Discovery section contains required discovery commands", (
 	);
 	assert.match(
 		skill,
-		/## Pre-publication Discovery[\s\S]*?gh api repos\/\{owner\}\/\{repo\}\/labels/,
-		"Discovery section must reference gh api repos/{owner}/{repo}/labels",
+		/## Pre-publication Discovery[\s\S]*?gh api --paginate 'repos\/\{owner\}\/\{repo\}\/labels\?per_page=100' --jq '\.\[\]\.name'/,
+		"Discovery section must paginate the complete label set",
 	);
 	assert.match(
 		skill,
@@ -220,6 +220,51 @@ test("both discovery presentations continue only for 404 on optional template pa
 	}
 });
 
+test("template selection requires declared metadata and a confirmed matching classification", () => {
+	const discoveryStart = skill.indexOf("### Discover issue templates");
+	assert.ok(discoveryStart !== -1, "Discover issue templates section must exist");
+	const discoveryEnd = skill.indexOf("\n### Discover labels", discoveryStart + 1);
+	const discovery = skill.slice(
+		discoveryStart,
+		discoveryEnd === -1 ? undefined : discoveryEnd,
+	);
+	assert.match(
+		discovery,
+		/form\/YAML templates[\s\S]*?metadata returned by `issue_templates` discovery/,
+		"form/YAML candidates must use metadata returned by discovery",
+	);
+	assert.match(
+		discovery,
+		/Markdown template[\s\S]*?fetch the exact discovered path[\s\S]*?frontmatter metadata[\s\S]*?`name` and `about`/,
+		"Markdown candidates must be fetched and inspected for frontmatter metadata",
+	);
+	assert.match(
+		discovery,
+		/Classify every candidate as `bug`, `feature`, or `other` from its declared purpose\/metadata; never classify or select from a guessed filename/,
+		"candidate classification must use declared purpose rather than filenames",
+	);
+	assert.match(
+		discovery,
+		/Assign `TEMPLATE_ID` only from a confirmed matching candidate/,
+		"TEMPLATE_ID must come only from a confirmed matching candidate",
+	);
+	assert.match(
+		discovery,
+		/If no candidate matches[\s\S]*?blank-issue path only when blank issues are allowed; otherwise stop for maintainer guidance/,
+		"no-match flow must use an allowed blank issue or stop for maintainer guidance",
+	);
+});
+
+test("both label discovery commands paginate exactly 100 labels per page", () => {
+	const command =
+		"gh api --paginate 'repos/{owner}/{repo}/labels?per_page=100' --jq '.[].name'";
+	assert.equal(
+		skill.split(command).length - 1,
+		2,
+		"the complete paginated label discovery command must appear exactly twice",
+	);
+});
+
 test("both duplicate-search commands use --limit 1000", () => {
 	const commands = skill.match(
 		/gh issue list --state all --limit 1000 --search/g,
@@ -230,7 +275,7 @@ test("both duplicate-search commands use --limit 1000", () => {
 	);
 });
 
-test("template gh issue create commands use a discovered identifier and do not pass --label", () => {
+test("template gh issue create commands use a confirmed matching identifier and do not pass --label", () => {
 	const section = (() => {
 		const start = skill.indexOf("### Create");
 		assert.ok(start !== -1, "Create section must exist");
@@ -239,8 +284,8 @@ test("template gh issue create commands use a discovered identifier and do not p
 	})();
 	assert.match(
 		section,
-		/TEMPLATE_ID="<discovered-template-identifier>"[\s\S]*?gh issue create --template "\$TEMPLATE_ID"/,
-		"Create section must select the discovered template identifier before use",
+		/TEMPLATE_ID="<confirmed-matching-template-identifier>"[\s\S]*?gh issue create --template "\$TEMPLATE_ID"/,
+		"Create section must assign a confirmed matching template identifier before use",
 	);
 
 	const templateCreates = [
