@@ -1427,24 +1427,15 @@ test("native FINALIZE emits exact v2.1.4 process documents and failed verificati
 		},
 	}));
 	await controller.execute("finalize-v212-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
-	const finding = { id: "RISK-001", lens: "review-risk", location: "lib/a.ts:1", severity: "CRITICAL", claim: "Candidate fails", evidence_class: "inferential", causal_disposition: "introduced", proof_refs: ["differential-test:candidate still fails"] };
-	const review_result = { lens_results: [{ lens: "review-risk", findings: [finding], evidence: ["complete candidate reviewed"] }] };
-	const requested = await controller.execute("finalize-v212-request", { operation: "finalize", lineageId: "native-lineage", input: JSON.stringify({ review_result }) }, undefined, undefined, context(cwd));
-	const request_hash = (requested.details as { refuter_request: { request_hash: string } }).refuter_request.request_hash;
-	const refuterBatch = { schema: "gentle-ai.refuter-result-batch/v1", request_hash, results: [{ finding_id: "RISK-001", outcome: "inconclusive", proof_refs: ["differential-test:candidate still fails"] }] };
 	await controller.execute("finalize-v212", { operation: "finalize", lineageId: "native-lineage", input: JSON.stringify({
-		review_result: { ...review_result, refuter_request_hash: request_hash },
-		refuter_batch: refuterBatch,
-		validation: { request_hash: "b".repeat(64), correction_ids: ["RISK-001"], original_criteria: { passed: false, evidence: ["acceptance still fails"] }, correction_regression: { passed: true, evidence: ["regression suite passes"] }, fix_caused_findings: [], follow_ups: [{ finding_id: "RISK-001", location: "lib/a.ts:1", summary: "Track the remaining failure", proof_refs: ["differential-test:candidate still fails"] }] },
+		validation_proof: { original_criteria: { passed: false, evidence: ["acceptance still fails"] }, correction_regression: { passed: true, evidence: ["regression suite passes"] } },
 		final_evidence: "  focused verification failed\n\n",
 		final_verification_passed: false,
 	}) }, undefined, undefined, context(cwd));
 	assert.deepEqual(requests, [{
 		cwd,
 		lineageId: "native-lineage",
-		lensResults: [{ lens: "review-risk", document: { lens: "risk", findings: [{ ...finding, lens: "risk" }], evidence: ["complete candidate reviewed"] } }],
-		refuterDocument: { results: refuterBatch.results },
-		validationDocument: { original_criteria: { passed: false, evidence: ["acceptance still fails"] }, correction_regression: { passed: true, evidence: ["regression suite passes"] }, follow_ups: [{ observation: "Track the remaining failure", proof_refs: ["differential-test:candidate still fails"] }] },
+		validationDocument: { original_criteria: { passed: false, evidence: ["acceptance still fails"] }, correction_regression: { passed: true, evidence: ["regression suite passes"] }, follow_ups: [] },
 		evidenceDocument: "  focused verification failed\n\n",
 		failed: true,
 	}]);

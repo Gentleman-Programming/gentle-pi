@@ -96,21 +96,28 @@ const RECEIPT_STATUSES = ["expected_missing", "present", "publication_pending", 
 const REQUIRED_OPERATIONS = Object.freeze(Object.values(REVIEW_INTEGRATION_OPERATION));
 const REQUIRED_GATES = Object.freeze(["post-apply", "pre-commit", "pre-push", "pre-pr", "release"]         );
 const REQUIRED_PROJECTIONS = Object.freeze(Object.values(REVIEW_PROJECTION));
-const REQUIRED_SCHEMAS = Object.freeze([
+const REVIEW_INTEGRATION_SCHEMA_CAPABILITIES_V2 = "gentle-ai.review-integration.capabilities/v2"         ;
+const REVIEW_INTEGRATION_SCHEMA_CAPABILITIES_V2_2 = "gentle-ai.review-integration.capabilities/v2.2"         ;
+const REVIEW_INTEGRATION_SCHEMA_STATUS_V3 = "gentle-ai.review-integration.status/v3"         ;
+const REVIEW_INTEGRATION_SCHEMA_STATUS_V5 = "gentle-ai.review-integration.status/v5"         ;
+const REVIEW_INTEGRATION_SCHEMA_CONSENT_V2 = "gentle-ai.review-integration.consent/v2"         ;
+const REVIEW_INTEGRATION_SCHEMA_CONSENT_V3 = "gentle-ai.review-integration.consent/v3"         ;
+
+const LEGACY_REQUIRED_SCHEMAS = Object.freeze([
 	"gentle-ai.review-admitted-result/v2",
 	"gentle-ai.review-artifact-subject/v2",
 	"gentle-ai.review-authority-repair-assessment/v1",
 	"gentle-ai.review-authority-status/v1",
 	"gentle-ai.review-gate-request/v1",
-	"gentle-ai.review-integration.capabilities/v2",
-	"gentle-ai.review-integration.consent/v2",
+	REVIEW_INTEGRATION_SCHEMA_CAPABILITIES_V2,
+	REVIEW_INTEGRATION_SCHEMA_CONSENT_V2,
 	"gentle-ai.review-integration.failure/v2",
 	"gentle-ai.review-final-verification-incident/v1",
 	"gentle-ai.review-integration.operation/v2",
 	"gentle-ai.review-integration.projection/v1",
 	"gentle-ai.review-integration.repair/v2",
 	"gentle-ai.review-integration.start/v3",
-	"gentle-ai.review-integration.status/v3",
+	REVIEW_INTEGRATION_SCHEMA_STATUS_V3,
 	"gentle-ai.review-receipt/v1",
 	"gentle-ai.review-receipt/v2",
 	"gentle-ai.review-result-artifact/v2",
@@ -120,6 +127,38 @@ const REQUIRED_SCHEMAS = Object.freeze([
 	"https://gentle-ai.dev/schema/review/reviewer/v1",
 	"https://gentle-ai.dev/schema/review/validator/v1",
 ]         );
+
+const MAJOR_MINOR_2_2_REQUIRED_SCHEMAS = Object.freeze([
+	"gentle-ai.review-admitted-result/v2",
+	"gentle-ai.review-artifact-subject/v2",
+	"gentle-ai.review-authority-repair-assessment/v1",
+	"gentle-ai.review-authority-status/v1",
+	"gentle-ai.review-gate-request/v1",
+	REVIEW_INTEGRATION_SCHEMA_CAPABILITIES_V2_2,
+	REVIEW_INTEGRATION_SCHEMA_CONSENT_V3,
+	"gentle-ai.review-integration.failure/v2",
+	"gentle-ai.review-final-verification-incident/v1",
+	"gentle-ai.review-integration.operation/v2",
+	"gentle-ai.review-integration.projection/v1",
+	"gentle-ai.review-integration.repair/v2",
+	"gentle-ai.review-integration.start/v3",
+	REVIEW_INTEGRATION_SCHEMA_STATUS_V5,
+	"gentle-ai.review-receipt/v1",
+	"gentle-ai.review-receipt/v2",
+	"gentle-ai.review-result-artifact/v2",
+	"gentle-ai.review-targeted-validation-request/v1",
+	"gentle-ai.review-verification-evidence/v2",
+	"https://gentle-ai.dev/schema/review/refuter/v1",
+	"https://gentle-ai.dev/schema/review/reviewer/v1",
+	"https://gentle-ai.dev/schema/review/validator/v1",
+]         );
+
+const REQUIRED_SCHEMAS_BY_PROTOCOL_MINOR = {
+	0: LEGACY_REQUIRED_SCHEMAS,
+	2: MAJOR_MINOR_2_2_REQUIRED_SCHEMAS,
+}         ;
+
+const MIXED_MANIFEST_2_2_MARKERS                    = Object.freeze([REVIEW_INTEGRATION_SCHEMA_CAPABILITIES_V2, REVIEW_INTEGRATION_SCHEMA_STATUS_V3, REVIEW_INTEGRATION_SCHEMA_CONSENT_V2]);
 const OPTIONAL_FEATURE_NAMES = Object.freeze([
 	"base_ref_workspace_overlay",
 	"bounded_process_waits",
@@ -652,6 +691,23 @@ function requireIdentity(value                         , schema        , operati
 	if (operation !== undefined && value.operation !== operation) throw new TypeError(`operation must be ${operation}`);
 }
 
+function decodeProtocol(value                         , label        )        {
+	const protocol = exactRecord(value.protocol, `${label}.protocol`, ["major", "minor"]);
+	if (protocol.major !== 2) throw new TypeError("incompatible review integration protocol");
+	if (protocol.minor !== 0 && protocol.minor !== 2) throw new TypeError("incompatible review integration protocol");
+	if (!Number.isInteger(protocol.minor)) throw new TypeError("incompatible review integration protocol");
+	return protocol.minor         ;
+}
+
+function disallowMixedManifestSchemas(advertisedSchemas                   , protocolMinor       , label        )       {
+	const hasLegacy = advertisedSchemas.some((manifestSchema) => MIXED_MANIFEST_2_2_MARKERS.includes(manifestSchema));
+	const hasModern = protocolMinor === 2
+		? advertisedSchemas.includes(REVIEW_INTEGRATION_SCHEMA_STATUS_V5)
+		|| advertisedSchemas.includes(REVIEW_INTEGRATION_SCHEMA_CONSENT_V3)
+		: advertisedSchemas.includes(REVIEW_INTEGRATION_SCHEMA_CAPABILITIES_V2_2);
+	if (protocolMinor === 2 && hasLegacy) throw new TypeError(`${label} is mixed with legacy schema identities`);
+	if (protocolMinor !== 2 && hasModern) throw new TypeError(`${label} is mixed with v2.2 schema identities`);
+}
 function assertExactSet(actual                   , expected                   , label        )       {
 	if (actual.length !== expected.length || expected.some((value) => !actual.includes(value))) throw new TypeError(`${label} does not match the required integration surface`);
 }
@@ -690,10 +746,11 @@ function decodeOptionalFeature(value         , label        )                   
 export function decodeReviewCapabilitiesV2(value         , verifiedExecutableDigest        )                       {
 	const requiredFields = ["schema", "contract", "protocol", "package", "build", "executable", "operations", "gates", "projections", "schemas", "features", "compatibility"]         ;
 	const body = exactRecord(value, "capabilities", requiredFields, ["bootstrap"]);
-	requireIdentity(body, "gentle-ai.review-integration.capabilities/v2");
-
-	const protocol = exactRecord(body.protocol, "capabilities.protocol", ["major", "minor"]);
-	if (protocol.major !== 2 || protocol.minor !== 0) throw new TypeError("incompatible review integration protocol");
+	const protocolMinor = decodeProtocol(body, "capabilities");
+	const requiredIdentity = protocolMinor === 2
+		? REVIEW_INTEGRATION_SCHEMA_CAPABILITIES_V2_2
+		: REVIEW_INTEGRATION_SCHEMA_CAPABILITIES_V2;
+	requireIdentity(body, requiredIdentity);
 
 	const packageIdentity = exactRecord(body.package, "capabilities.package", ["name", "version", "release_channel"]);
 	if (packageIdentity.name !== "gentle-ai") throw new TypeError("capabilities package identity mismatch");
@@ -720,11 +777,13 @@ export function decodeReviewCapabilitiesV2(value         , verifiedExecutableDig
 	// unknown addition is not rejected before assertSupersetOf can even run.
 	const advertisedGates = stringArray(body.gates, "capabilities.gates", { minimum: REQUIRED_GATES.length, unique: true });
 	const advertisedProjections = stringArray(body.projections, "capabilities.projections", { minimum: REQUIRED_PROJECTIONS.length, unique: true });
-	const advertisedSchemas = stringArray(body.schemas, "capabilities.schemas", { minimum: REQUIRED_SCHEMAS.length, unique: true });
+	const requiredSchemas = REQUIRED_SCHEMAS_BY_PROTOCOL_MINOR[protocolMinor];
+	const advertisedSchemas = stringArray(body.schemas, "capabilities.schemas", { minimum: requiredSchemas.length, unique: true });
+	disallowMixedManifestSchemas(advertisedSchemas, protocolMinor, "capabilities.schemas");
 	assertSupersetOf(advertisedOperations, REQUIRED_OPERATIONS, "capabilities operations");
 	assertSupersetOf(advertisedGates, REQUIRED_GATES, "capabilities gates");
 	assertSupersetOf(advertisedProjections, REQUIRED_PROJECTIONS, "capabilities projections");
-	assertSupersetOf(advertisedSchemas, REQUIRED_SCHEMAS, "capabilities schemas");
+	assertSupersetOf(advertisedSchemas, requiredSchemas, "capabilities schemas");
 
 	const features = exactRecord(body.features, "capabilities.features", ["mandatory", "optional"]);
 	const mandatory = array(features.mandatory, "capabilities.features.mandatory", (entry, label) => decodeFeature(entry, label), { minimum: 10 });
@@ -772,7 +831,7 @@ export function decodeReviewCapabilitiesV2(value         , verifiedExecutableDig
 		operations: new Set(REQUIRED_OPERATIONS),
 		gates: new Set(REQUIRED_GATES),
 		projections: new Set(REQUIRED_PROJECTIONS),
-		schemas: new Set(REQUIRED_SCHEMAS),
+		schemas: new Set(requiredSchemas),
 		mandatoryFeatures: new Set(mandatoryNames),
 		optionalFeatures: new Set(optional.filter((feature) => feature.supported && (FEATURE_NAMES                     ).includes(feature.name)).map((feature) => feature.name)),
 		raw: body,
@@ -1180,14 +1239,18 @@ function decodeFinalVerificationRetry(value         , label        )            
 }
 
 // ---------------------------------------------------------------------------
-// status/v3
+// status/v3-or-v5
 // ---------------------------------------------------------------------------
 
 export function decodeReviewStatusV3(value         )                 {
 	const body = exactRecord(value, "status", [
 		"schema", "contract", "operation", "applicability", "receipt", "action", "replayability", "target_identity", "projection", "repair", "candidates",
 	], ["authority", "frozen", "reconciliation", "action_disposition", "eligibility", "next_transition", "authority_target_identity", "validation_request", "final_verification_retry"]);
-	requireIdentity(body, "gentle-ai.review-integration.status/v3", REVIEW_INTEGRATION_OPERATION.STATUS);
+	if (body.schema !== REVIEW_INTEGRATION_SCHEMA_STATUS_V3 && body.schema !== REVIEW_INTEGRATION_SCHEMA_STATUS_V5) {
+		throw new TypeError(`status.schema must be ${REVIEW_INTEGRATION_SCHEMA_STATUS_V3} or ${REVIEW_INTEGRATION_SCHEMA_STATUS_V5}`);
+	}
+	if (body.contract !== REVIEW_INTEGRATION_CONTRACT) throw new TypeError(`contract must be ${REVIEW_INTEGRATION_CONTRACT}`);
+	if (body.operation !== REVIEW_INTEGRATION_OPERATION.STATUS) throw new TypeError(`operation must be ${REVIEW_INTEGRATION_OPERATION.STATUS}`);
 
 	const applicability = enumeration(body.applicability, ["current_target", "unrelated", "ambiguous", "corrupted"]         , "status.applicability");
 	const receiptBody = exactRecord(body.receipt, "status.receipt", ["status"], ["identity"]);
@@ -1302,12 +1365,25 @@ function decodeConsentChoice(value         , label        , answer              
 }
 
 export function decodeReviewConsentV2(value         )                  {
-	const body = exactRecord(value, "consent", [
-		"schema", "contract", "operation", "action", "blocking", "target_identity", "projection", "risk_level", "changed_files", "changed_lines", "headline", "reason", "value", "risk_evidence", "choices", "off_path",
-	]);
-	requireIdentity(body, "gentle-ai.review-integration.consent/v2", "review.start");
+	const body = exactRecord(
+		value,
+		"consent",
+		[
+			"schema", "contract", "operation", "action", "blocking", "target_identity", "projection", "risk_level", "changed_files", "changed_lines", "headline", "reason", "value", "risk_evidence", "choices", "off_path",
+		],
+		["agent"],
+	);
+	if (body.schema !== REVIEW_INTEGRATION_SCHEMA_CONSENT_V2 && body.schema !== REVIEW_INTEGRATION_SCHEMA_CONSENT_V3) {
+		throw new TypeError(`consent.schema must be ${REVIEW_INTEGRATION_SCHEMA_CONSENT_V2} or ${REVIEW_INTEGRATION_SCHEMA_CONSENT_V3}`);
+	}
+	if (body.contract !== REVIEW_INTEGRATION_CONTRACT) throw new TypeError(`contract must be ${REVIEW_INTEGRATION_CONTRACT}`);
+	if (body.operation !== "review.start") throw new TypeError("operation must be review.start");
 	if (body.action !== "consent_required") throw new TypeError("consent.action must be consent_required");
 	if (body.blocking !== true) throw new TypeError("consent.blocking must be true");
+	if (body.schema === REVIEW_INTEGRATION_SCHEMA_CONSENT_V2 && body.agent !== undefined) throw new TypeError("v2 consent must not include agent");
+	if (body.schema === REVIEW_INTEGRATION_SCHEMA_CONSENT_V3 && body.agent === undefined) throw new TypeError("v3 consent requires agent");
+	const agent = body.agent === undefined ? undefined : nonempty(body.agent, "consent.agent");
+	if (agent !== undefined && !/^[a-zA-Z0-9._-]+$/.test(agent)) throw new TypeError("consent.agent must be a process identifier");
 
 	const targetIdentity = sha256(body.target_identity, "consent.target_identity");
 	const choicesArray = body.choices;
@@ -1322,7 +1398,7 @@ export function decodeReviewConsentV2(value         )                  {
 	if (offPathSource.command !== "gentle-ai review mode disable") throw new TypeError("consent.off_path.command is unsupported");
 
 	return {
-		schema: "gentle-ai.review-integration.consent/v2",
+		schema: REVIEW_INTEGRATION_SCHEMA_CONSENT_V2,
 		contract: REVIEW_INTEGRATION_CONTRACT,
 		operation: "review.start",
 		action: "consent_required",

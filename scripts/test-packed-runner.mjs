@@ -10,6 +10,7 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const temporary = mkdtempSync(join(tmpdir(), "gentle-pi-packed-runner-"));
 const packDirectory = join(temporary, "pack");
 const installDirectory = join(temporary, "install");
+const strictSemverWithOptionalPrerelease = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
 
 function windowsNpmInvocation() {
 	const candidates = [];
@@ -54,11 +55,12 @@ try {
 	if (result.schema !== "gentle-pi.git-commit-transaction-runner-self-test/v1" || !Array.isArray(result.states) || !result.states.includes("prepared") || !result.states.includes("committed")) {
 		throw new Error("installed transaction runner self-test returned an incompatible result");
 	}
-	const versions = readdirSync(join(packageRoot, ".gentle-ai"), { withFileTypes: true }).filter((entry) => entry.isDirectory() && /^v\d+\.\d+\.\d+$/.test(entry.name));
+	const versions = readdirSync(join(packageRoot, ".gentle-ai"), { withFileTypes: true }).filter((entry) => entry.isDirectory() && strictSemverWithOptionalPrerelease.test(entry.name));
 	if (versions.length !== 1) throw new Error("packed install did not contain exactly one package-local Gentle AI version");
+	const discoveredVersion = versions[0].name.slice(1);
 	const executable = join(packageRoot, ".gentle-ai", versions[0].name, process.platform === "win32" ? "gentle-ai.exe" : "gentle-ai");
 	const capabilities = JSON.parse(execFileSync(executable, ["review", "capabilities", "--contract", "gentle-ai.review-integration/v2"], { cwd: installDirectory, encoding: "utf8" }));
-	if (!["gentle-ai.review-integration.capabilities/v2"].includes(capabilities.schema) || capabilities.contract !== "gentle-ai.review-integration/v2" || capabilities.package?.version !== versions[0].name.slice(1)) throw new Error("package-local Gentle AI returned incompatible capabilities");
+	if (capabilities.schema !== "gentle-ai.review-integration.capabilities/v2.2" || capabilities.contract !== "gentle-ai.review-integration/v2" || capabilities.package?.version !== discoveredVersion) throw new Error("package-local Gentle AI returned incompatible capabilities");
 	const packageManifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
 	process.stdout.write(`packed runner E2E passed (gentle-pi ${packageManifest.version ?? "unknown"}; Gentle AI ${capabilities.package?.version ?? "unknown"}; ${result.states.length} states)\n`);
 } finally {

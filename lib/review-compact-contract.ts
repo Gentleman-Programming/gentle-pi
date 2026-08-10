@@ -11,12 +11,14 @@ import {
 	type CompactTargetedValidationInput,
 } from "./review-compact.ts";
 import { REVIEW_LENS } from "./review-triggers.ts";
+import type { ReviewTargetedValidationRequestV1 } from "./review-integration-v2.ts";
 import { canonicalJsonV1, domainHashV1 } from "./review-canonical.ts";
 import { normalizeRefuterBatch, type RefuterBatch } from "./review-refuter-adapter.ts";
 import { CORRECTION_OUTCOMES, type CorrectionOutcome } from "./review-correction-lifecycle.ts";
 
 const DIGEST = /^[0-9a-f]{64}$/;
 const LINEAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const PROVIDER_IDENTITY = /^sha256:[0-9a-f]{64}$/;
 
 export class CompactReviewContractError extends Error {
 	readonly area: string;
@@ -175,6 +177,12 @@ function parseValidationProof(value: unknown, area: string): CompactValidationPr
 	};
 	return { original_criteria: check(input.original_criteria, `${area}.original_criteria`), correction_regression: check(input.correction_regression, `${area}.correction_regression`) };
 }
+
+const assertProviderIdentity = (value: string, area: string) => {
+	if (!PROVIDER_IDENTITY.test(value)) {
+		fail(area, "digest", "must match sha256:[0-9a-f]{64}");
+	}
+};
 
 function parseValidation(value: unknown, area: string): CompactTargetedValidationInput {
 	const input = exact(value, area, ["request_hash", "correction_ids", "original_criteria", "correction_regression", "fix_caused_findings", "follow_ups"]);
@@ -355,10 +363,27 @@ export function toNativeReviewerDocument(input: CompactLensResultInput) {
 	};
 }
 
-export function toNativeValidatorDocument(input: CompactValidationProofInput | CompactTargetedValidationInput) {
+export function toNativeValidatorDocument(
+	input: CompactValidationProofInput | CompactTargetedValidationInput,
+	validationRequest?: Pick<ReviewTargetedValidationRequestV1, "requestHash" | "correctionTargetIdentity">
+) {
+	if ("request_hash" in input) {
+		if (validationRequest === undefined) {
+			throw new CompactReviewContractError("review/finalize.validation", "targeted-validation", "requires provider validationRequest from status");
+		}
+		assertProviderIdentity(validationRequest.requestHash, "review/finalize.validation.requested_validation_request_hash");
+		assertProviderIdentity(validationRequest.correctionTargetIdentity, "review/finalize.validation.correction_target_identity");
+		return {
+			targeted_validation_request_hash: validationRequest.requestHash,
+			correction_target_identity: validationRequest.correctionTargetIdentity,
+			original_criteria: input.original_criteria,
+			correction_regression: input.correction_regression,
+			follow_ups: input.follow_ups.map((row) => ({ observation: row.summary, proof_refs: [...row.proof_refs] })),
+		};
+	}
 	return {
 		original_criteria: input.original_criteria,
 		correction_regression: input.correction_regression,
-		follow_ups: "follow_ups" in input ? input.follow_ups.map((row) => ({ observation: row.summary, proof_refs: [...row.proof_refs] })) : [],
+		follow_ups: [],
 	};
 }

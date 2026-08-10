@@ -5,6 +5,7 @@ import {
 	deriveNativeValidationRequest,
 	parseNativeCompactFinalizeInput,
 	parseCompactStartInput,
+	toNativeValidatorDocument,
 } from "../lib/review-compact-contract.ts";
 
 const POLICY_HASH = "a".repeat(64);
@@ -144,5 +145,62 @@ test("native finalize preserves arbitrary non-empty evidence text and binds refu
 	assert.deepEqual(parseNativeCompactFinalizeInput({ cwd: "/repo", review_result, refuter_batch: independent }).refuter_batch, independent);
 	for (const proof_refs of [[], [""], [" malformed"]]) {
 		assert.throws(() => parseNativeCompactFinalizeInput({ cwd: "/repo", review_result, refuter_batch: { ...batch, results: [{ ...batch.results[0], proof_refs }] } }), CompactReviewContractError);
+	}
+});
+
+test("native validator document keeps legacy three fields for legacy finalizer inputs", () => {
+	const legacy = {
+		original_criteria: { passed: true, evidence: ["proof"] },
+		correction_regression: { passed: false, evidence: ["failed"] },
+	};
+	assert.deepEqual(toNativeValidatorDocument(legacy), {
+		original_criteria: legacy.original_criteria,
+		correction_regression: legacy.correction_regression,
+		follow_ups: [],
+	});
+});
+
+test("targeted validator document uses canonical provider request identities and follow-up projections", () => {
+	const targeted = {
+		original_criteria: { passed: true, evidence: ["proof"] },
+		correction_regression: { passed: false, evidence: ["failed"] },
+		request_hash: "1".repeat(64),
+		correction_ids: ["RISK-1"],
+		follow_ups: [{ summary: "Proof observed", proof_refs: ["candidate:line"] }],
+	};
+	const validationRequest = { requestHash: `sha256:${"2".repeat(64)}`, correctionTargetIdentity: `sha256:${"3".repeat(64)}` };
+	assert.deepEqual(toNativeValidatorDocument(targeted, validationRequest), {
+		targeted_validation_request_hash: validationRequest.requestHash,
+		correction_target_identity: validationRequest.correctionTargetIdentity,
+		original_criteria: targeted.original_criteria,
+		correction_regression: targeted.correction_regression,
+		follow_ups: [{ observation: "Proof observed", proof_refs: ["candidate:line"] }],
+	});
+});
+
+test("targeted validator document requires provider validationRequest binding", () => {
+	const targeted = {
+		original_criteria: { passed: true, evidence: ["proof"] },
+		correction_regression: { passed: false, evidence: ["failed"] },
+		request_hash: "1".repeat(64),
+		correction_ids: ["RISK-1"],
+		follow_ups: [{ summary: "Proof observed", proof_refs: ["candidate:line"] }],
+	};
+	assert.throws(() => toNativeValidatorDocument(targeted), /requires provider validationRequest/);
+});
+
+test("targeted validator document rejects malformed provider identities", () => {
+	const targeted = {
+		original_criteria: { passed: true, evidence: ["proof"] },
+		correction_regression: { passed: false, evidence: ["failed"] },
+		request_hash: "1".repeat(64),
+		correction_ids: ["RISK-1"],
+		follow_ups: [{ summary: "Proof observed", proof_refs: ["candidate:line"] }],
+	};
+	for (const validationRequest of [
+		{ requestHash: "sha256:bad", correctionTargetIdentity: `sha256:${"3".repeat(64)}` },
+		{ requestHash: `sha256:${"2".repeat(64)}`, correctionTargetIdentity: "sha256:bad" },
+	]) {
+		assert.throws(() => toNativeValidatorDocument(targeted, validationRequest), CompactReviewContractError);
 	}
 });

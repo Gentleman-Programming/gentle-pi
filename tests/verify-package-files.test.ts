@@ -101,28 +101,28 @@ test("sources <-> runtime/*.mjs walk fails when a sources entry is absent from r
 // only verifies a string appears in a file, not that two values agree.
 test("Gentle AI version pin mismatch is reported with a specific message when a derived location disagrees with the authoritative constant", () => {
 	const mismatches = gentleAiVersionPinMismatches({
-		installerVersion: "2.2.3",
-		releaseBaseUrl: "https://github.com/Gentleman-Programming/gentle-ai/releases/download/v2.2.3/",
-		windowsSourceTag: "v2.2.3",
+		installerVersion: "2.3.0-rc.2",
+		releaseBaseUrl: "https://github.com/Gentleman-Programming/gentle-ai/releases/download/v2.3.0-rc.2/",
+		windowsSourceTag: "v2.3.0-rc.2",
 		libGentleAiVersion: "2.2.0",
 	});
 
 	assert.deepEqual(mismatches, [
-		'lib/gentle-ai-binary.ts GENTLE_AI_VERSION ("2.2.0") does not match the authoritative scripts/gentle-ai-installer.mjs INSTALLER_VERSION ("2.2.3")',
+		'lib/gentle-ai-binary.ts GENTLE_AI_VERSION ("2.2.0") does not match the authoritative scripts/gentle-ai-installer.mjs INSTALLER_VERSION ("2.3.0-rc.2")',
 	]);
 });
 
 test("Gentle AI version pin mismatch also flags a drifted release URL and a drifted Windows source tag", () => {
 	const mismatches = gentleAiVersionPinMismatches({
-		installerVersion: "2.2.3",
+		installerVersion: "2.3.0-rc.2",
 		releaseBaseUrl: "https://github.com/Gentleman-Programming/gentle-ai/releases/download/v2.2.0/",
 		windowsSourceTag: "v2.1.11",
-		libGentleAiVersion: "2.2.3",
+		libGentleAiVersion: "2.3.0-rc.2",
 	});
 
 	assert.deepEqual(mismatches, [
-		'RELEASE_BASE_URL ("https://github.com/Gentleman-Programming/gentle-ai/releases/download/v2.2.0/") does not pin the authoritative v2.2.3',
-		'GENTLE_AI_WINDOWS_SOURCE_TAG ("v2.1.11") does not match the authoritative v2.2.3',
+		'RELEASE_BASE_URL ("https://github.com/Gentleman-Programming/gentle-ai/releases/download/v2.2.0/") does not pin the authoritative v2.3.0-rc.2',
+		'GENTLE_AI_WINDOWS_SOURCE_TAG ("v2.1.11") does not match the authoritative v2.3.0-rc.2',
 	]);
 });
 

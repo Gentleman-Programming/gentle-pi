@@ -417,6 +417,7 @@ export interface NativeFinalizeRequest extends NativeReviewFinalizeCapturedResul
 	validationDocument?: unknown;
 	evidenceFile?: string;
 	evidenceDocument?: string;
+	capturedEvidence?: boolean;
 	failed?: boolean;
 	signal?: AbortSignal;
 }
@@ -687,6 +688,10 @@ export const NATIVE_CLI_CONTRACTS = Object.freeze({
 	// protocol 2.0 with the same operation set and closed START fields consumed
 	// by Pi, so the existing capability columns are unchanged.
 	"2.2.3": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	// Ground-truthed against the released v2.3.0-rc.2 binary: this row describes V2.1.4
+	// plain non-empty operation compatibility, not a negotiated `start/v2` envelope. Empty
+	// candidate routing belongs to negotiated STATUS/preflight and is not fabricated here.
+	"2.3.0-rc.2": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: true, hint: true, delivery: true }),
 });
 type NativeCliCapability = keyof (typeof NATIVE_CLI_CONTRACTS)[keyof typeof NATIVE_CLI_CONTRACTS];
 
@@ -774,6 +779,12 @@ function exactObject(value: unknown, required: readonly string[], optional: read
 function requiredString(value: unknown): string { if (typeof value !== "string" || value.length === 0) throw new Error("expected string"); return value; }
 function stringValue(value: unknown): string { if (typeof value !== "string") throw new Error("expected string"); return value; }
 function sha256Identity(value: unknown): string { const parsed = requiredString(value); if (!/^sha256:[0-9a-f]{64}$/.test(parsed)) throw new Error("expected canonical SHA-256 identity"); return parsed; }
+function canonicalSha256(value: unknown, name: string): string {
+	const parsed = requiredString(value);
+	if (/^sha256:[0-9a-f]{64}$/.test(parsed)) return parsed;
+	if (/^[0-9a-f]{64}$/.test(parsed)) return `sha256:${parsed}`;
+	throw new TypeError(`${name} must be a canonical or bare SHA-256 identity`);
+}
 function booleanValue(value: unknown): boolean { if (typeof value !== "boolean") throw new Error("expected boolean"); return value; }
 function nonNegativeInteger(value: unknown): number { if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error("expected safe non-negative integer"); return value; }
 function positiveInteger(value: unknown): number { if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) throw new Error("expected safe positive integer"); return value; }
@@ -911,17 +922,17 @@ function decodeNativeReviewVerificationEvidence(value: unknown): NativeReviewVer
 		// that listed the observed field NAMES without their types.
 		version: (() => { if (body.version !== 2) throw new Error(`native verification evidence version must be the number 2, received ${JSON.stringify(body.version)}`); return 2 as const; })(),
 		lineageId: requiredString(body.lineage_id),
-		authorityRevision: requiredString(body.authority_revision),
-		targetIdentity: requiredString(body.target_identity),
+		authorityRevision: canonicalSha256(body.authority_revision, "authority_revision"),
+		targetIdentity: canonicalSha256(body.target_identity, "target_identity"),
 		candidateTree: requiredString(body.candidate_tree),
-		pathsDigest: requiredString(body.paths_digest),
+		pathsDigest: canonicalSha256(body.paths_digest, "paths_digest"),
 		paths: stringArray(body.paths),
 		// The schema requires ledger_ids to be an array, but v2.2.2 emits null when
 		// there are none. Tolerated deliberately: refusing here would reject a
 		// response the provider actually sends, and the provider violating its own
 		// published schema is its defect to fix, not a reason to break the client.
 		ledgerIds: body.ledger_ids === null || body.ledger_ids === undefined ? [] : stringArray(body.ledger_ids),
-		rawPayloadSha256: requiredString(body.raw_payload_sha256),
+		rawPayloadSha256: canonicalSha256(body.raw_payload_sha256, "raw_payload_sha256"),
 		rawPayloadBytes: nonNegativeInteger(body.raw_payload_bytes),
 		outcome: enumString(body.outcome, NATIVE_REVIEW_CAPTURE_OUTCOME) as NativeReviewCaptureOutcome,
 		recordDigest: requiredString(body.record_digest),
@@ -1274,7 +1285,7 @@ export class NativeReviewCliV214 {
 		if (result.timedOut) throw nativeError(NATIVE_REVIEW_ERROR_CODE.TIMEOUT, NATIVE_REVIEW_OPERATION.VERSION, false, "version process timed out", result);
 		if (result.signal) throw nativeError(NATIVE_REVIEW_ERROR_CODE.SIGNAL, NATIVE_REVIEW_OPERATION.VERSION, false, "version process was signalled", result);
 		if (result.exitCode !== 0) throw nativeError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, NATIVE_REVIEW_OPERATION.VERSION, false, "version process failed", result);
-		const version = /^gentle-ai ([0-9]+\.[0-9]+\.[0-9]+)\n$/.exec(result.stdout.replace(/\r\n$/, "\n"))?.[1];
+		const version = /^gentle-ai ([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)\n$/.exec(result.stdout.replace(/\r\n$/, "\n"))?.[1];
 		const contract = version === undefined ? undefined : resolvedNativeCliContract(version);
 		if (result.stderr.trim().length > 0 || contract === undefined || capabilities.some((capability) => !contract[capability])) throw nativeError(NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE, NATIVE_REVIEW_OPERATION.VERSION, false, `native gentle-ai lacks required capabilities: expected v${GENTLE_AI_VERSION}, found v${version ?? "unparseable"}`);
 		return version as keyof typeof NATIVE_CLI_CONTRACTS;
@@ -2148,6 +2159,9 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 
 	async finalize(request: NativeFinalizeRequest): Promise<NativeFinalizeResult> {
 		if (request.evidenceDocument !== undefined && request.evidenceDocument.length === 0) throw new TypeError("Native FINALIZE evidence must contain at least one byte");
+		if (request.capturedEvidence === true && (request.evidenceDocument !== undefined || request.evidenceFile !== undefined)) {
+			throw new TypeError("Native FINALIZE capturedEvidence cannot be combined with evidenceDocument/evidenceFile");
+		}
 		const needsStaging = request.lensResults !== undefined || request.refuterDocument !== undefined || request.validationDocument !== undefined || request.evidenceDocument !== undefined;
 		const directory = needsStaging ? await mkdtemp(join(tmpdir(), "gentle-ai-finalize-")) : undefined;
 		try {
@@ -2166,6 +2180,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 				// (`--captured-results`) or is handed each manifest in lens order.
 				...(request.capturedResults === true ? ["--captured-results=true"] : []),
 				...(request.resultArtifactFiles ?? []).flatMap((path) => ["--result-artifact-file", path]),
+				...(request.capturedEvidence === true ? ["--captured-evidence=true"] : []),
 				...(refuterFile === undefined ? [] : ["--refuter", refuterFile]),
 				...(request.correctionLines === undefined ? [] : ["--correction-lines", String(request.correctionLines)]),
 				...(validationFile === undefined ? [] : ["--validation", validationFile]),

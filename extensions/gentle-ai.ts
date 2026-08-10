@@ -4967,6 +4967,8 @@ function requireEvidenceCollection(status: ReviewStatusV3): void {
 	}
 }
 
+const CANONICAL_SHA256 = /^sha256:[0-9a-f]{64}$/;
+
 function requireTargetedValidationAfterEvidence(status: ReviewStatusV3): NonNullable<ReviewStatusV3["validationRequest"]> {
 	const inputs = status.nextTransition?.kind === "collect" ? status.nextTransition.collect?.inputs ?? [] : [];
 	const targeted = inputs.filter((input) => input.captureOperation === "external.run_targeted_validation");
@@ -4977,9 +4979,10 @@ function requireTargetedValidationAfterEvidence(status: ReviewStatusV3): NonNull
 		request.expectedRevision !== status.authority.revision || request.targetIdentity !== status.targetIdentity ||
 		request.correctionCandidateTree !== status.projection.currentCandidateTree ||
 		JSON.stringify([...request.correctionPaths].sort()) !== JSON.stringify([...status.projection.paths].sort()) ||
-		request.correctionPathsDigest !== status.projection.pathsDigest
+		request.correctionPathsDigest !== status.projection.pathsDigest ||
+		!CANONICAL_SHA256.test(request.requestHash) || !CANONICAL_SHA256.test(request.correctionTargetIdentity)
 	) {
-		throw new CandidateViewError("passed evidence did not produce one provider-bound targeted validation request", "evidence-first-ordering");
+		throw new CandidateViewError("passed evidence did not produce one provider-bound targeted validation request", "targeted-validation-binding-drift");
 	}
 	return request;
 }
@@ -5401,6 +5404,8 @@ async function executeReviewControllerOperation(
 			let provisionalCandidateView: ReturnType<CandidateViewRegistry["create"]> | undefined;
 			let nativeResult: NativeFinalizeResult;
 			let correctionStep: CorrectionStep | undefined;
+			let validationRequest: ReviewStatusV3["validationRequest"];
+			let useCapturedEvidence = false;
 			try {
 				if (parameters.lineageId === undefined) throw new CandidateViewError("Native FINALIZE requires an explicit lineage");
 				correctionCompletion = input.review_result === undefined && (input.validation !== undefined || input.validation_proof !== undefined) && input.final_evidence !== undefined;
@@ -5503,7 +5508,8 @@ async function executeReviewControllerOperation(
 						candidateViews.cleanupTerminal(parameters.lineageId, "escalated");
 						return { operation: parameters.operation, status: "blocked", outcome: "terminal-escalation", correction_step: correctionStep, result: afterEvidence.raw };
 					}
-					const validationRequest = requireTargetedValidationAfterEvidence(afterEvidence);
+					validationRequest = requireTargetedValidationAfterEvidence(afterEvidence);
+					useCapturedEvidence = true;
 					correctionEvidenceByLineage.delete(parameters.lineageId);
 					negotiatedStatus = afterEvidence;
 					if (input.validation === undefined) {
@@ -5514,6 +5520,13 @@ async function executeReviewControllerOperation(
 					if (input.validation.request_hash !== validationRequest.requestHash.replace(/^sha256:/, "") || JSON.stringify([...input.validation.correction_ids].sort()) !== JSON.stringify([...validationRequest.fixFindingIds].sort())) {
 						throw new CandidateViewError("targeted validation document does not match the provider request", "targeted-validation-binding-drift");
 					}
+				}
+				if (input.validation !== undefined && input.final_evidence === undefined && !validationAttempt) {
+					validationRequest = requireTargetedValidationAfterEvidence(negotiatedStatus);
+					if (input.validation.request_hash !== validationRequest.requestHash.replace(/^sha256:/, "") || JSON.stringify([...input.validation.correction_ids].sort()) !== JSON.stringify([...validationRequest.fixFindingIds].sort())) {
+						throw new CandidateViewError("targeted validation document does not match the provider request", "targeted-validation-binding-drift");
+					}
+					useCapturedEvidence = true;
 				}
 				if (input.review_result !== undefined) {
 					if (parameters.lineageId === undefined) throw new CandidateViewError("Native FINALIZE requires an explicit lineage for refuter derivation");
@@ -5544,8 +5557,8 @@ async function executeReviewControllerOperation(
 					...(input.review_result === undefined ? {} : { lensResults: input.review_result.lens_results.map((document, index) => ({ lens: document.lens ?? `lens-${index}`, document: toNativeReviewerDocument(document) })) }),
 					...(input.refuter_batch === undefined ? {} : { refuterDocument: toNativeRefuterDocument(input.refuter_batch) }),
 					...(input.correction_line_forecast === undefined ? {} : { correctionLines: input.correction_line_forecast }),
-					...(input.validation === undefined && input.validation_proof === undefined ? {} : { validationDocument: toNativeValidatorDocument(input.validation ?? input.validation_proof!) }),
-					...(input.final_evidence === undefined ? {} : { evidenceDocument: input.final_evidence, failed: input.final_verification_passed === false }),
+					...(input.validation === undefined && input.validation_proof === undefined ? {} : { validationDocument: toNativeValidatorDocument(input.validation ?? input.validation_proof!, useCapturedEvidence ? validationRequest : undefined) }),
+					...(useCapturedEvidence ? { capturedEvidence: true } : input.final_evidence === undefined ? {} : { evidenceDocument: input.final_evidence, failed: input.final_verification_passed === false }),
 					...(signal === undefined ? {} : { signal }),
 				});
 			} catch (error) {

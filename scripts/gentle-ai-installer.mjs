@@ -30,7 +30,7 @@ const WINDOWS_SYSTEM_ROOT = "C:\\Windows";
 // version check below) derives from this constant instead of repeating the
 // literal, so a pin bump cannot leave a stale copy behind. See
 // scripts/install-gentle-ai.mjs for the incident that motivated this.
-export const INSTALLER_VERSION = "2.2.3";
+export const INSTALLER_VERSION = "2.3.0-rc.2";
 export const RELEASE_BASE_URL = `https://github.com/Gentleman-Programming/gentle-ai/releases/download/v${INSTALLER_VERSION}/`;
 export const GENTLE_AI_INSTALL_METHOD = Object.freeze({
 	SIGNED_RELEASE_ASSET: "signed-release-asset",
@@ -39,9 +39,9 @@ export const GENTLE_AI_INSTALL_METHOD = Object.freeze({
 export const GENTLE_AI_WINDOWS_SOURCE_PACKAGE_PATH = "github.com/gentleman-programming/gentle-ai/v2/cmd/gentle-ai";
 export const GENTLE_AI_WINDOWS_SOURCE_MODULE = "github.com/gentleman-programming/gentle-ai/v2";
 export const GENTLE_AI_WINDOWS_SOURCE_TAG = `v${INSTALLER_VERSION}`;
-// `go mod download -json github.com/gentleman-programming/gentle-ai/v2@v2.2.3`
+// `go mod download -json github.com/gentleman-programming/gentle-ai/v2@v2.3.0-rc.2`
 // with GOSUMDB=sum.golang.org reports this exact module SumDB checksum.
-export const GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM = "h1:GWFPqNIgPDv82BiCceWQBV6p9VKbFm51W//sKTKNn5c=";
+export const GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM = "h1:0p9VPrZR7wes0ZfLH08rrvvX9TkZv+fmlgBdYilgS9Y=";
 export const GENTLE_AI_WINDOWS_SOURCE_PACKAGE = `${GENTLE_AI_WINDOWS_SOURCE_PACKAGE_PATH}@${GENTLE_AI_WINDOWS_SOURCE_TAG}`;
 export const GENTLE_AI_WINDOWS_MINIMUM_GO_VERSION = "1.25.10";
 export const GENTLE_AI_GO_TOOLCHAIN_UNAVAILABLE_CODE = "GENTLE_AI_GO_TOOLCHAIN_UNAVAILABLE";
@@ -66,20 +66,19 @@ export class GentleAiInstallerError extends Error {
 // executables.
 export const GENTLE_AI_PENDING_DIGEST = "PENDING-GENTLE-AI-RELEASE-DIGEST";
 
-function asset(name, sha256, binarySha256, executable) {
-	return Object.freeze({ name, sha256, binarySha256, executable, url: `${RELEASE_BASE_URL}${name}` });
+function asset(name, sha256, binarySha256, executable, format = "archive") {
+	return Object.freeze({ name, sha256, binarySha256, executable, format, url: `${RELEASE_BASE_URL}${name}` });
 }
 
-// Windows is absent from signed release archives on purpose. gentle-ai stopped
-// distributing unsigned Windows builds in c4b764d0, so v2.2.3 publishes signed
-// Darwin/Linux archives only. Windows x64/arm64 uses the separately verified
-// exact-tag Go SumDB source-build path below; restore archive rows only when
-// upstream ships signed Windows assets.
+// v2.3.0-rc.2 publishes raw Darwin/Linux release assets (no tar.gz
+// wrappers), so `signed-release-asset` now receives the exact binary bytes and
+// keeps the executable name stable as `gentle-ai`. Windows x64/arm64 is still
+// handled by the separately verified Go SumDB source-build path below.
 export const GENTLE_AI_RELEASE_ASSETS = Object.freeze({
-	"darwin/amd64": asset("gentle-ai_2.2.3_darwin_amd64.tar.gz", "1622e283d53192aaa195ca2a7c6f63d41475dcdadda1949fac248015081c88ca", "f3505695bd135dfdcc64adfeb3385f3aea40033a7c3c02a7b387a26bc10b4a39", "gentle-ai"),
-	"darwin/arm64": asset("gentle-ai_2.2.3_darwin_arm64.tar.gz", "28517e136df6208e0225c51ffc986cb65af1f4fc6e6b173ddc4d0f2d0e402a30", "638a7ef64fa5d2657cbe52fc0a033a5f6ddfce190961e845042ef166f116c70f", "gentle-ai"),
-	"linux/amd64": asset("gentle-ai_2.2.3_linux_amd64.tar.gz", "8ef700fb4d8e097f98a70cbb53edaa854ee39c09c0a998c53866b93c45b51d36", "5af38452caf057215628e0f0c8cb87647b0f0a1506feacc39a3f487d6471b7cc", "gentle-ai"),
-	"linux/arm64": asset("gentle-ai_2.2.3_linux_arm64.tar.gz", "9f4eba7184d2b70e05685e99ffbf2ad4e8df3d8f64519043f08d0bbe5e93d399", "48f55abf9347e9db191469b1daf2265b4d267b3a61db3a548ae269f3407a4b9a", "gentle-ai"),
+	"darwin/amd64": asset("gentle-ai_2.3.0-rc.2_darwin_amd64", "bdfef58648818468c3e0abcda85055c25cf028a2de3dc2d6447021463ae3effa", "bdfef58648818468c3e0abcda85055c25cf028a2de3dc2d6447021463ae3effa", "gentle-ai", "raw-binary"),
+	"darwin/arm64": asset("gentle-ai_2.3.0-rc.2_darwin_arm64", "e1c5f3389147b00b46bb3cffb4dc7ebe3751ef1775576ed1338fc429ae08a5e3", "e1c5f3389147b00b46bb3cffb4dc7ebe3751ef1775576ed1338fc429ae08a5e3", "gentle-ai", "raw-binary"),
+	"linux/amd64": asset("gentle-ai_2.3.0-rc.2_linux_amd64", "528d7d3eb0b9decfafd2e23d408bdbc18559d58092951533fb272f1da23b33ac", "528d7d3eb0b9decfafd2e23d408bdbc18559d58092951533fb272f1da23b33ac", "gentle-ai", "raw-binary"),
+	"linux/arm64": asset("gentle-ai_2.3.0-rc.2_linux_arm64", "cf5de6e3af7439e32a6dcb9f1ac0a41c81892aa774411ae80faf9f2f02cede0b", "cf5de6e3af7439e32a6dcb9f1ac0a41c81892aa774411ae80faf9f2f02cede0b", "gentle-ai", "raw-binary"),
 });
 
 function upstreamArchitecture(architecture) {
@@ -605,19 +604,23 @@ async function installSignedRelease(options, packageRoot, platform, arch, asset)
 		const existing = versionBundlePath(runtimeRoot);
 		if (await existingSignedBundleMatches(existing, asset, platform)) return { installed: false, binaryPath: join(existing, asset.executable), asset };
 		const stagingDirectory = await mkdtemp(join(runtimeRoot, `.v${INSTALLER_VERSION}.staging-`));
+		let extracted;
 		try {
 			const archive = join(stagingDirectory, asset.name);
 			await (options.download ?? downloadGentleAiAsset)(asset.url, archive);
-			if ((await sha256File(archive)) !== asset.sha256) throw new Error(`Gentle AI archive checksum mismatch for ${asset.name}`);
-			const extracted = join(stagingDirectory, "extracted");
-			await (options.extractArchive ?? extractGentleAiArchive)(archive, extracted);
-			const source = await expectedRegularFile(extracted, asset.executable);
+			let source = await expectedRegularFile(stagingDirectory, asset.name);
+			if ((await sha256File(source)) !== asset.sha256) throw new Error(`Gentle AI release asset checksum mismatch for ${asset.name}`);
+			if (asset.format !== "raw-binary") {
+				extracted = join(stagingDirectory, "extracted");
+				await (options.extractArchive ?? extractGentleAiArchive)(archive, extracted);
+				source = await expectedRegularFile(extracted, asset.executable);
+			}
 			if (asset.binarySha256 && (await sha256File(source)) !== asset.binarySha256) throw new Error(`Gentle AI binary checksum mismatch for ${asset.name}`);
 			const binaryPath = join(stagingDirectory, asset.executable);
 			await copyFile(source, binaryPath);
 			if (platform !== "win32") await chmod(binaryPath, 0o700);
 			await writeFile(join(stagingDirectory, "integrity.json"), canonicalManifest(signedReleaseManifest(asset, await sha256File(binaryPath))), { mode: 0o600 });
-			await safeRemoveDirectory(extracted);
+			if (extracted) await safeRemoveDirectory(extracted);
 			await rm(archive, { force: true });
 			const published = await publishBundle(runtimeRoot, stagingDirectory, options);
 			return { installed: true, binaryPath: join(published, asset.executable), asset };

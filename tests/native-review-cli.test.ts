@@ -9,6 +9,7 @@ import {
 	NativeReviewCliError,
 	NativeReviewCliV213 as NativeReviewCliV213Production,
 	NativeReviewCliV216,
+	clearNativeReviewCapabilitiesCacheForTesting,
 	createNodeExecFileAdapter,
 	type ExecFileAdapter,
 	type NativeStartRequest,
@@ -16,6 +17,7 @@ import {
 import {
 	NativeReviewCliV214 as RuntimeNativeReviewCliV214,
 	NativeReviewCliV216 as RuntimeNativeReviewCliV216,
+	clearNativeReviewCapabilitiesCacheForTesting as clearRuntimeNativeReviewCapabilitiesCacheForTesting,
 } from "../runtime/native-review-cli.mjs";
 
 // The queued-adapter unit tests never execute a real process; default to a fixed
@@ -229,6 +231,20 @@ test("native client accepts known versions only when they support the requested 
 	);
 });
 
+test("NativeReviewCliV214 accepts exact 2.3.0-rc.2 and rejects unknown prerelease/stable versions", async () => {
+	const start = JSON.parse(START.stdout) as Record<string, unknown>;
+	const accepted = queuedAdapter([ { stdout: "gentle-ai 2.3.0-rc.2\n" }, { stdout: JSON.stringify(start) }]);
+	const result = await new RuntimeNativeReviewCliV214(accepted.adapter, () => "/package/.gentle-ai/gentle-ai").start({ cwd: "/repo" });
+	assert.equal(result.lineageId, "lineage-1");
+	for (const version of ["2.3.0", "2.3.0-rc.1", "2.3.0-rc.foo", "3.0.0", "2.3.0-rc", "2.3.0-"]) {
+		const incompatible = queuedAdapter([{ stdout: `gentle-ai ${version}\n` }]);
+		await assert.rejects(
+			() => new RuntimeNativeReviewCliV214(incompatible.adapter, () => "/package/.gentle-ai/gentle-ai").start({ cwd: "/repo" }),
+			(error: unknown) => error instanceof Error && (error as { code?: string }).code === NATIVE_REVIEW_ERROR_CODE.VERSION_INCOMPATIBLE,
+		);
+	}
+});
+
 test("native SDD status accepts an optional non-negative correction budget and preserves legacy absence", async () => {
 	const source = JSON.parse(await fixture("sdd-status")) as Record<string, unknown>;
 	const remediationState = source.remediationState as Record<string, unknown>;
@@ -280,7 +296,7 @@ test("native output limits dominate killed timeout signals and expose the bounde
 	const queue = queuedAdapter([VERSION, { stdout: "", timedOut: true, outputLimitExceeded: true }]);
 	await assert.rejects(() => new NativeReviewCliV213(queue.adapter).start({ cwd: "/repo" }), assertOutputLimit);
 	const runtimeQueue = queuedAdapter([VERSION, { stdout: "", timedOut: true, outputLimitExceeded: true }]);
-	await assert.rejects(() => new RuntimeNativeReviewCliV214(runtimeQueue.adapter).start({ cwd: "/repo" }), assertOutputLimit);
+	await assert.rejects(() => new RuntimeNativeReviewCliV214(runtimeQueue.adapter, process.execPath).start({ cwd: "/repo" }), assertOutputLimit);
 });
 
 test("native mutation uncertainty requires target status before any replay decision", async () => {
@@ -811,6 +827,53 @@ async function fixture(name: string): Promise<string> {
 	return readFile(new URL(`./fixtures/native-review-cli/v2.1.3/${name}.json`, import.meta.url), "utf8");
 }
 
+const TEST_EXECUTABLE = "/package/.gentle-ai/gentle-ai";
+const TEST_EXECUTABLE_DIGEST = "sha256:" + "1".repeat(64);
+
+async function v216CapabilitiesFixture(): Promise<Record<string, unknown>> {
+	const body = JSON.parse(await readFile(new URL("../contracts/review-integration/v2/fixtures/capabilities.fixture.json", import.meta.url), "utf8")) as Record<string, unknown>;
+	(body.package as Record<string, unknown>).version = "2.3.0-rc.2";
+	(body.executable as Record<string, unknown>).sha256 = TEST_EXECUTABLE_DIGEST;
+	return body;
+}
+
+function v216Client(adapter: ExecFileAdapter): NativeReviewCliV216 {
+	return new NativeReviewCliV216(
+		adapter,
+		TEST_EXECUTABLE,
+		30_000,
+		NATIVE_REVIEW_DEFAULT_MAX_BUFFER_BYTES,
+		undefined,
+		() => TEST_EXECUTABLE_DIGEST,
+	);
+}
+
+function runtimeV216Client(adapter: ExecFileAdapter): RuntimeNativeReviewCliV216 {
+	return new RuntimeNativeReviewCliV216(
+		adapter,
+		TEST_EXECUTABLE,
+		30_000,
+		NATIVE_REVIEW_DEFAULT_MAX_BUFFER_BYTES,
+		undefined,
+		() => TEST_EXECUTABLE_DIGEST,
+	);
+}
+
+function v216FinalizeResponse(): Record<string, unknown> {
+	return {
+		schema: "gentle-ai.review-integration.operation/v2",
+		contract: "gentle-ai.review-integration/v2",
+		operation: "review.finalize",
+		result: {
+			operation: "review/finalize",
+			lineage_id: "lineage-1",
+			state: "approved",
+			action: "validate delivery with gentle-ai review validate --gate <gate>",
+			store_revision: TEST_EXECUTABLE_DIGEST,
+		},
+	};
+}
+
 test("finalize ignores injected cleanup failures after native completion", async () => {
 	for (const native of [{ stdout: await fixture("finalize") }, { stdout: "{" }]) {
 		let cleanupAttempts = 0;
@@ -1069,6 +1132,147 @@ test("native finalize rejects only zero-length staged evidence before launch", a
 		() => new NativeReviewCliV213(queue.adapter).finalize({ cwd: "/repo", evidenceDocument: "" }),
 		TypeError,
 	);
+	assert.equal(queue.calls.length, 0);
+});
+
+test("native FINALIZE emits captured-evidence transport when requested", async () => {
+	clearNativeReviewCapabilitiesCacheForTesting();
+	const queue = queuedAdapter([
+		{ stdout: JSON.stringify(await v216CapabilitiesFixture()) },
+		{ stdout: JSON.stringify(v216FinalizeResponse()) },
+	]);
+	await v216Client(queue.adapter).finalize({ cwd: "/repo", lineageId: "lineage-1", capturedEvidence: true });
+	const finalizeArguments = queue.calls.at(1)?.arguments ?? [];
+	assert.equal(finalizeArguments.includes("--captured-evidence=true"), true);
+});
+
+
+test("native CAPTURE_EVIDENCE canonicalizes plain SHA-256 identities while preserving git tree digest", async () => {
+	clearNativeReviewCapabilitiesCacheForTesting();
+	const response = {
+		schema: "gentle-ai.review-verification-evidence/v2",
+		version: 2,
+		lineage_id: "lineage-1",
+		authority_revision: "a".repeat(64),
+		target_identity: "b".repeat(64),
+		candidate_tree: "c".repeat(40),
+		paths_digest: "d".repeat(64),
+		paths: ["README.md"],
+		ledger_ids: null,
+		raw_payload_sha256: "e".repeat(64),
+		raw_payload_bytes: 1234,
+		outcome: "passed",
+		record_digest: "f".repeat(64),
+	};
+	const queue = queuedAdapter([{ stdout: JSON.stringify(await v216CapabilitiesFixture()) }, { stdout: JSON.stringify(response) }]);
+	const result = await v216Client(queue.adapter).captureEvidence({
+		cwd: "/repo",
+		lineageId: "lineage-1",
+		targetIdentity: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+		expectedRevision: "0000000000000000000000000000000000000000",
+		outcome: "passed",
+		evidenceDocument: "capture text",
+	});
+	assert.equal(result.authorityRevision, `sha256:${"a".repeat(64)}`);
+	assert.equal(result.targetIdentity, `sha256:${"b".repeat(64)}`);
+	assert.equal(result.pathsDigest, `sha256:${"d".repeat(64)}`);
+	assert.equal(result.rawPayloadSha256, `sha256:${"e".repeat(64)}`);
+	assert.equal(result.candidateTree, "c".repeat(40));
+});
+
+test("native CAPTURE_EVIDENCE rejects malformed identities and non-tree hash lengths before accepting", async () => {
+	const base = {
+		lineage_id: "lineage-1",
+		authority_revision: "a".repeat(64),
+		target_identity: "b".repeat(64),
+		candidate_tree: "c".repeat(40),
+		paths_digest: "d".repeat(64),
+		paths: ["README.md"],
+		ledger_ids: null,
+		raw_payload_sha256: "e".repeat(64),
+		raw_payload_bytes: 12,
+		outcome: "passed",
+		record_digest: "f".repeat(64),
+	};
+	for (const malformed of [
+		{ field: "authority_revision", value: "A".repeat(64) },
+		{ field: "target_identity", value: "B".repeat(63) },
+		{ field: "paths_digest", value: "c".repeat(65) },
+		{ field: "raw_payload_sha256", value: "short" },
+	]) {
+		const body = {
+			schema: "gentle-ai.review-verification-evidence/v2",
+			version: 2,
+			...base,
+			[malformed.field]: malformed.value,
+		};
+		const queue = queuedAdapter([{ stdout: JSON.stringify(await v216CapabilitiesFixture()) }, { stdout: JSON.stringify(body) }]);
+		await assert.rejects(
+			() => v216Client(queue.adapter).captureEvidence({
+				cwd: "/repo",
+				lineageId: "lineage-1",
+				targetIdentity: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+				expectedRevision: "0000000000000000000000000000000000000000",
+				outcome: "passed",
+				evidenceDocument: "capture text",
+			}),
+			(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE,
+		);
+	}
+});
+
+test("native CAPTURE_EVIDENCE cannot combine captured Evidence mode with explicit evidence payload", async () => {
+	const queue = queuedAdapter([]);
+	await assert.rejects(() => v216Client(queue.adapter).finalize({ cwd: "/repo", capturedEvidence: true, evidenceDocument: "explicit" }), TypeError);
+	await assert.rejects(() => v216Client(queue.adapter).finalize({ cwd: "/repo", capturedEvidence: true, evidenceFile: "/tmp/evidence.txt" }), TypeError);
+	assert.equal(queue.calls.length, 0);
+});
+
+test("runtime CAPTURE_EVIDENCE canonicalizes bare SHA-256 identities", async () => {
+	const response = {
+		schema: "gentle-ai.review-verification-evidence/v2",
+		version: 2,
+		lineage_id: "lineage-1",
+		authority_revision: "a".repeat(64),
+		target_identity: "b".repeat(64),
+		candidate_tree: "c".repeat(40),
+		paths_digest: "d".repeat(64),
+		paths: ["README.md"],
+		ledger_ids: null,
+		raw_payload_sha256: "e".repeat(64),
+		raw_payload_bytes: 12,
+		outcome: "passed",
+		record_digest: "f".repeat(64),
+	};
+	const queue = queuedAdapter([{ stdout: JSON.stringify(await v216CapabilitiesFixture()) }, { stdout: JSON.stringify(response) }]);
+	const result = await runtimeV216Client(queue.adapter).captureEvidence({
+		cwd: "/repo",
+		lineageId: "lineage-1",
+		targetIdentity: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+		expectedRevision: "0000000000000000000000000000000000000000",
+		outcome: "passed",
+		evidenceDocument: "runtime evidence",
+	});
+	assert.equal(result.authorityRevision, `sha256:${"a".repeat(64)}`);
+	assert.equal(result.targetIdentity, `sha256:${"b".repeat(64)}`);
+	assert.equal(result.pathsDigest, `sha256:${"d".repeat(64)}`);
+	assert.equal(result.rawPayloadSha256, `sha256:${"e".repeat(64)}`);
+});
+
+test("runtime FINALIZE emits captured-evidence transport when requested", async () => {
+	clearRuntimeNativeReviewCapabilitiesCacheForTesting();
+	const queue = queuedAdapter([
+		{ stdout: JSON.stringify(await v216CapabilitiesFixture()) },
+		{ stdout: JSON.stringify(v216FinalizeResponse()) },
+	]);
+	await runtimeV216Client(queue.adapter).finalize({ cwd: "/repo", lineageId: "lineage-1", capturedEvidence: true });
+	const finalizeArguments = queue.calls.at(1)?.arguments ?? [];
+	assert.equal(finalizeArguments.includes("--captured-evidence=true"), true);
+});
+
+test("runtime CAPTURE_EVIDENCE mode conflicts with explicit finalization evidence payload", async () => {
+	const queue = queuedAdapter([]);
+	await assert.rejects(() => runtimeV216Client(queue.adapter).finalize({ cwd: "/repo", capturedEvidence: true, evidenceFile: "/tmp/evidence.txt" }), TypeError);
 	assert.equal(queue.calls.length, 0);
 });
 

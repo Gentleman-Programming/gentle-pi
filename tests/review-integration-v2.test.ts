@@ -17,6 +17,11 @@ import {
 	decodeReviewStartV3,
 	decodeReviewStatusV3,
 } from "../lib/review-integration-v2.ts";
+import {
+	decodeReviewCapabilitiesV2 as decodeRuntimeReviewCapabilitiesV2,
+	decodeReviewStatusV3 as decodeRuntimeReviewStatusV3,
+	decodeReviewConsentV2 as decodeRuntimeReviewConsentV3,
+} from "../runtime/review-integration-v2.mjs";
 
 const fixtureRoot = join(process.cwd(), "contracts", "review-integration", "v2", "fixtures");
 const fixture = <T = unknown>(name: string): T => JSON.parse(readFileSync(join(fixtureRoot, name), "utf8")) as T;
@@ -56,11 +61,32 @@ function assertAdditionalProperty(decoder: Decoder, source: JsonObject, path: re
 	assert.throws(() => decoder(candidate), /not allowed/, path.length === 0 ? "top-level" : path.join("."));
 }
 
+function withSchema(source: JsonObject, schema: string): JsonObject {
+	const copy = clone(source);
+	copy.schema = schema;
+	return copy;
+}
+
 test("every published review integration v2 fixture decodes", () => {
-	assert.equal(decodeReviewCapabilitiesV2(fixture("capabilities.fixture.json"), executableDigest).contract, REVIEW_INTEGRATION_CONTRACT);
+	const capabilities = fixture<JsonObject>("capabilities.fixture.json");
+	const status = fixture<JsonObject>("status.fixture.json");
+	const consent = fixture<JsonObject>("consent.fixture.json");
+
+	assert.equal(decodeReviewCapabilitiesV2(capabilities, executableDigest).contract, REVIEW_INTEGRATION_CONTRACT);
 	assert.equal(decodeReviewStartV3(fixture("start.fixture.json")).riskLevel, "high");
-	assert.equal(decodeReviewStatusV3(fixture("status.fixture.json")).contract, REVIEW_INTEGRATION_CONTRACT);
-	assert.equal(decodeReviewConsentV2(fixture("consent.fixture.json")).action, "consent_required");
+	assert.equal(decodeReviewStatusV3(status).contract, REVIEW_INTEGRATION_CONTRACT);
+	assert.equal(decodeReviewConsentV2(consent).action, "consent_required");
+
+	assert.throws(() => decodeReviewStatusV3(withSchema(status, "gentle-ai.review-integration.status/v99")), /status\.schema/);
+	assert.throws(() => decodeReviewConsentV2(withSchema(consent, "gentle-ai.review-integration.consent/v99")), /schema/);
+	assert.equal(decodeRuntimeReviewStatusV3(withSchema(status, "gentle-ai.review-integration.status/v5")).replayability, decodeReviewStatusV3(withSchema(status, "gentle-ai.review-integration.status/v5")).replayability);
+
+	const consentWithAgent = clone(consent) as JsonObject;
+	consentWithAgent.agent = "native-review";
+	assert.deepEqual(
+		decodeRuntimeReviewConsentV3(withSchema(consentWithAgent, "gentle-ai.review-integration.consent/v3")),
+		decodeReviewConsentV2(withSchema(consentWithAgent, "gentle-ai.review-integration.consent/v3")),
+	);
 });
 
 test("capabilities enforce every required top-level and nested property", () => {
@@ -86,13 +112,41 @@ test("capabilities reject additional properties at every exact object boundary",
 test("capabilities reject an incompatible protocol identity", () => {
 	const source = fixture<JsonObject>("capabilities.fixture.json");
 	const decode: Decoder = (value) => decodeReviewCapabilitiesV2(value, executableDigest);
-	const wrongMajor = clone(source);
-	(wrongMajor.protocol as JsonObject).major = 1;
-	assert.throws(() => decode(wrongMajor), /incompatible/);
-	const wrongMinor = clone(source);
-	(wrongMinor.protocol as JsonObject).minor = 1;
-	assert.throws(() => decode(wrongMinor), /incompatible/);
+	for (const [field, value] of [["major", 1], ["major", 3], ["minor", 1], ["minor", 9]] as const) {
+		const candidate = clone(source);
+		(candidate.protocol as JsonObject)[field] = value;
+		assert.throws(() => decode(candidate), /incompatible/);
+	}
 	assert.throws(() => decode({ ...clone(source), schema: "gentle-ai.review-integration.capabilities/v1" }), /schema/);
+});
+
+test("capabilities accept protocol 2.2 with modern manifest set", () => {
+	const source = fixture<JsonObject>("capabilities.fixture.json");
+	const decode: Decoder = (value) => decodeReviewCapabilitiesV2(value, executableDigest);
+	const modernSchemas = (source.schemas as string[]).map((schema) =>
+		schema === "gentle-ai.review-integration.capabilities/v2"
+			? "gentle-ai.review-integration.capabilities/v2.2"
+			: schema === "gentle-ai.review-integration.consent/v2"
+				? "gentle-ai.review-integration.consent/v3"
+				: schema === "gentle-ai.review-integration.status/v3"
+					? "gentle-ai.review-integration.status/v5"
+					: schema,
+	);
+	const modern = withSchema(clone(source), "gentle-ai.review-integration.capabilities/v2.2");
+	modern.protocol = { ...(modern.protocol as JsonObject), minor: 2 };
+	modern.schemas = modernSchemas;
+	assert.doesNotThrow(() => decode(modern));
+	assert.deepEqual(decodeRuntimeReviewCapabilitiesV2(source, executableDigest), decode(source));
+
+	for (const mixedLegacy of ["gentle-ai.review-integration.capabilities/v2", "gentle-ai.review-integration.status/v3"] as const) {
+		const candidate = withSchema({
+			...clone(source),
+			schema: "gentle-ai.review-integration.capabilities/v2.2",
+			protocol: { ...(source.protocol as JsonObject), minor: 2 },
+			schemas: [...modernSchemas.filter((schema) => schema !== mixedLegacy), mixedLegacy],
+		}, "gentle-ai.review-integration.capabilities/v2.2");
+		assert.throws(() => decode(candidate), /mixed with legacy/);
+	}
 });
 
 test("START enforces required, exact, and enum-bounded payloads", () => {
@@ -433,6 +487,12 @@ test("failure context accepts scope_change or binding_revision but rejects both 
 
 test("consent rejects a swapped choice order, invalid answer domain, or invocation outside the frozen target", () => {
 	const source = fixture<JsonObject>("consent.fixture.json");
+	const v3WithoutAgent = clone(source);
+	assert.throws(() => decodeReviewConsentV2(withSchema(v3WithoutAgent, "gentle-ai.review-integration.consent/v3")), /v3 consent requires agent/);
+	const v2WithAgent = withSchema(clone(source), "gentle-ai.review-integration.consent/v2");
+	v2WithAgent.agent = "native-review";
+	assert.throws(() => decodeReviewConsentV2(v2WithAgent), /must not include agent/);
+
 	const swapped = clone(source);
 	swapped.choices = [(source.choices as JsonObject[])[1], (source.choices as JsonObject[])[0]];
 	assert.throws(() => decodeReviewConsentV2(swapped), /answer/);

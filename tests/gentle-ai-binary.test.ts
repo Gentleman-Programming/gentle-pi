@@ -50,7 +50,7 @@ async function writeWindowsSourceBinary(packageRoot: string): Promise<{ binaryPa
 		method: "go-sumdb-source-build",
 		package: "github.com/gentleman-programming/gentle-ai/v2/cmd/gentle-ai",
 		module: "github.com/gentleman-programming/gentle-ai/v2",
-		tag: "v2.2.3",
+		tag: `v${GENTLE_AI_VERSION}`,
 		architecture: process.arch === "x64" ? "x64" : "arm64",
 		binarySha256: createHash("sha256").update(binary).digest("hex"),
 		moduleChecksum: GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM,
@@ -121,7 +121,7 @@ test("runtime rejects an unverified binary, a symlinked manifest, and ambient ex
 	assert.throws(() => resolveGentleAiBinary(packageRoot, process.platform), /package-local-binary-missing/);
 	const binarySha256 = createHash("sha256").update("native").digest("hex");
 	const manifestTarget = join(packageRoot, "manifest-target.json");
-	await writeFile(manifestTarget, `${JSON.stringify({ version: GENTLE_AI_VERSION, asset: `gentle-ai_${GENTLE_AI_VERSION}_${process.platform}_${process.arch === "x64" ? "amd64" : process.arch}.tar.gz`, assetSha256: "a".repeat(64), binarySha256 })}\n`);
+	await writeFile(manifestTarget, `${JSON.stringify({ version: GENTLE_AI_VERSION, asset: resolveGentleAiReleaseAsset(process.platform, process.arch).name, assetSha256: "a".repeat(64), binarySha256 })}\n`);
 	await symlink(manifestTarget, manifestPath);
 	assert.throws(() => resolveGentleAiBinary(packageRoot, process.platform), /package-local-binary-missing/);
 	assert.throws(() => new NativeReviewCliV213(async () => VERSION, "gentle-ai"), /absolute package-local executable/);
