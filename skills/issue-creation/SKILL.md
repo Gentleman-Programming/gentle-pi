@@ -18,7 +18,7 @@ Use this skill when:
 
 ## Critical Rules
 
-1. **Discover blank-issue policy before creating** — never assume blank issues are disabled or that a specific template exists
+1. **Discover blank-issue policy before creating** — never assume blank issues are disabled or that a specific template exists; honor `blank_issues_enabled` from `.github/ISSUE_TEMPLATE/config.yml` when present
 2. **Discover Discussions support** — never assume a Discussions URL; route questions to Discussions only when the repo's `has_discussions` flag is true
 3. **Search BOTH open AND closed issues for duplicates** — never create a duplicate of an existing issue
 4. **Apply only discovered, policy-permitted labels** — never invent or assume label names
@@ -65,9 +65,13 @@ gh api repos/{owner}/{repo}/issue_templates
 
 # Markdown templates
 gh api repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE
+
+# Blank-issue policy (config.yml), when present
+gh api repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE/config.yml --jq '.content' | base64 -d
 ```
 
-- Fall back gracefully when templates are absent. Many repos (including gentle-pi) ship **no** `.github/ISSUE_TEMPLATE/` directory; in that case create a blank issue with the sections below as a guide, not a hard template.
+- Read `.github/ISSUE_TEMPLATE/config.yml` when it exists and honor its `blank_issues_enabled` flag: when `blank_issues_enabled: false`, do not create a blank issue — use a discovered template that fits, or stop and request maintainer guidance when no template fits.
+- When `config.yml` is absent or `blank_issues_enabled` is true/unset, fall back gracefully when templates are absent. Many repos (including gentle-pi) ship **no** `.github/ISSUE_TEMPLATE/` directory; in that case create a blank issue with the sections below as a guide, not a hard template.
 - The template examples in this skill only apply when the discovered repo actually exposes those templates. Do not pass `--template bug_report.yml` to a repo that does not define it.
 
 ### Discover labels
@@ -93,7 +97,7 @@ gh api repos/{owner}/{repo}/labels --jq '.[].name'
 Before creating a new issue, search BOTH open and closed issues:
 
 ```bash
-gh issue list --state all --search "keywords from title and body"
+gh issue list --state all --limit 1000 --search "keywords from title and body"
 ```
 
 - An equivalent issue may be open OR closed.
@@ -324,6 +328,9 @@ gh api repos/{owner}/{repo} --jq '{allow_issues: .has_issues, has_discussions: .
 # Issue templates
 gh api repos/{owner}/{repo}/issue_templates
 
+# Blank-issue policy (config.yml), when present
+gh api repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE/config.yml --jq '.content' | base64 -d
+
 # Labels (discovered set)
 gh api repos/{owner}/{repo}/labels --jq '.[].name'
 ```
@@ -331,23 +338,23 @@ gh api repos/{owner}/{repo}/labels --jq '.[].name'
 ### Duplicate search (open AND closed)
 
 ```bash
-gh issue list --state all --search "keywords"
+gh issue list --state all --limit 1000 --search "keywords"
 ```
 
 ### Create
 
 ```bash
 # Bug report (only when the template was discovered)
-gh issue create --template "bug_report.yml" --title "fix(scope): description" --label "bug"
+gh issue create --template "bug_report.yml" --title "fix(scope): description"
 
 # Feature request (only when the template was discovered)
-gh issue create --template "feature_request.yml" --title "feat(scope): description" --label "enhancement"
+gh issue create --template "feature_request.yml" --title "feat(scope): description"
 
 # Blank issue (when no templates exist)
 gh issue create --title "fix(scope): description" --body "..."
 ```
 
-Pass `--label` only with labels that exist in the discovered label set.
+Apply a label only after confirming an exact matching label exists in the discovered label set; when the template drives auto-labeling, no manual --label is needed.
 
 ### Maintainer actions (only when those labels exist)
 
@@ -365,6 +372,7 @@ gh issue edit <number> --add-label "priority:high"
 
 ```
 Repo has_issues = false?          → Stop: repo does not accept issues
+blank_issues_enabled = false?     → Use a discovered template, or stop for maintainer guidance
 Is it a bug?                     → Bug Report template (or blank with bug fields)
 Is it a new feature/improvement?  → Feature Request template (or blank with feature fields)
 Is it a question?                → Discussions, only when has_discussions = true

@@ -145,6 +145,91 @@ test("Workflow places discovery as step 0 and privacy scrub before submission", 
 test("Commands section lists discovery, duplicate search, and maintainer actions", () => {
 	assert.match(skill, /### Discovery/);
 	assert.match(skill, /### Duplicate search/);
-	assert.match(skill, /--state all --search/);
+	assert.match(skill, /--state all --limit 1000 --search/);
 	assert.match(skill, /gh issue edit <number> --add-label "status:approved"/);
+});
+
+test("Discover issue templates reads config.yml and honors blank_issues_enabled", () => {
+	const section = (() => {
+		const start = skill.indexOf("### Discover issue templates");
+		assert.ok(start !== -1, "Discover issue templates section must exist");
+		const nextHeader = skill.indexOf("\n### ", start + 1);
+		return skill.slice(start, nextHeader === -1 ? undefined : nextHeader);
+	})();
+
+	assert.match(
+		section,
+		/gh api repos\/\{owner\}\/\{repo\}\/contents\/\.github\/ISSUE_TEMPLATE\/config\.yml --jq '\.content' \| base64 -d/,
+		"Discover section must read and decode .github/ISSUE_TEMPLATE/config.yml",
+	);
+	assert.ok(
+		section.includes("blank_issues_enabled"),
+		"Discover section must reference blank_issues_enabled",
+	);
+	assert.match(
+		section,
+		/blank_issues_enabled: false[\s\S]*?do not create a blank issue/,
+		"Discover section must forbid a blank issue when blank_issues_enabled is false",
+	);
+	assert.match(
+		section,
+		/(use a discovered template|maintainer guidance)/,
+		"Discover section must direct to a discovered template or maintainer guidance",
+	);
+});
+
+test("both duplicate-search commands use --limit 1000", () => {
+	const commands = skill.match(
+		/gh issue list --state all --limit 1000 --search/g,
+	);
+	assert.ok(
+		commands && commands.length >= 2,
+		`expected at least 2 duplicate-search commands with --limit 1000, found ${commands ? commands.length : 0}`,
+	);
+});
+
+test("template gh issue create commands do not pass --label", () => {
+	const section = (() => {
+		const start = skill.indexOf("### Create");
+		assert.ok(start !== -1, "Create section must exist");
+		const nextHeader = skill.indexOf("\n### ", start + 1);
+		return skill.slice(start, nextHeader === -1 ? undefined : nextHeader);
+	})();
+
+	assert.match(
+		section,
+		/gh issue create --template "bug_report\.yml" --title "fix\(scope\): description"/,
+		"bug report template command must exist without a fixed --label",
+	);
+	assert.match(
+		section,
+		/gh issue create --template "feature_request\.yml" --title "feat\(scope\): description"/,
+		"feature request template command must exist without a fixed --label",
+	);
+
+	const templateCreates = [
+		...section.matchAll(/gh issue create --template[^\n]*/g),
+	].map((m) => m[0]);
+	assert.ok(
+		templateCreates.length >= 2,
+		`expected at least 2 template create commands, found ${templateCreates.length}`,
+	);
+	for (const command of templateCreates) {
+		assert.doesNotMatch(
+			command,
+			/--label/,
+			"template create commands must not pass --label",
+		);
+	}
+
+	assert.match(
+		section,
+		/gh issue create --title "fix\(scope\): description" --body "\.\.\."/,
+		"blank-issue create command must remain intact",
+	);
+	assert.match(
+		section,
+		/Apply a label only after confirming an exact matching label exists in the discovered label set/,
+		"Create section must note the discovered-label rule for manual --label",
+	);
 });
