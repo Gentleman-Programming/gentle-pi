@@ -24,8 +24,13 @@ test("Pre-publication Discovery section contains required discovery commands", (
 	);
 	assert.match(
 		skill,
-		/## Pre-publication Discovery[\s\S]*?gh api repos\/\{owner\}\/\{repo\}\/issue_templates/,
-		"Discovery section must reference gh api repos/{owner}/{repo}/issue_templates",
+		/## Pre-publication Discovery[\s\S]*?gh api --include repos\/\{owner\}\/\{repo\}\/contents\/\.github\/ISSUE_TEMPLATE/,
+		"Discovery section must enumerate the Contents API template directory",
+	);
+	assert.doesNotMatch(
+		skill,
+		/\/issue_templates\b/,
+		"skill must not rely on the deprecated issue_templates endpoint",
 	);
 });
 
@@ -215,7 +220,7 @@ test("Discover issue templates reads config.yml and honors blank_issues_enabled"
 	);
 });
 
-test("both discovery presentations continue only for 404 on optional template paths", () => {
+test("both discovery presentations use Contents inventory and preserve optional 404 handling", () => {
 	const sections = [
 		["### Discover issue templates", "\n### Discover labels"],
 		["### Discovery (run before creating any issue)", "\n### Duplicate search"],
@@ -239,6 +244,33 @@ test("both discovery presentations continue only for 404 on optional template pa
 			),
 			"discovery must inspect the optional .github/ISSUE_TEMPLATE/config.yml path",
 		);
+		assert.ok(
+			section.includes(
+				'DISCOVERED_TEMPLATE_PATH="<exact-path-returned-by-contents-inventory>"',
+			),
+			"discovery must retain each exact Contents inventory path",
+		);
+		assert.ok(
+			section.includes(
+				'gh api "repos/{owner}/{repo}/contents/$DISCOVERED_TEMPLATE_PATH" --jq \'.content\' | base64 -d',
+			),
+			"discovery must fetch and decode each exact discovered path",
+		);
+		assert.match(
+			section,
+			/every exact discovered `\.yml` or `\.yaml` path[\s\S]*?decoded content from the shared fetch command[\s\S]*?YAML issue-form metadata `name` and `description`/i,
+			"YAML forms must require decoded name and description metadata",
+		);
+		assert.match(
+			section,
+			/every exact discovered `\.md` path[\s\S]*?decoded content from the shared fetch command[\s\S]*?Markdown frontmatter metadata `name` and `about`/i,
+			"Markdown templates must require decoded name and about frontmatter",
+		);
+		assert.match(
+			section,
+			/Other extensions remain unroutable template types/,
+			"other extensions must remain unroutable",
+		);
 		assert.match(
 			section,
 			/HTTP 404 means "not configured"; continue to the blank-issue fallback policy/,
@@ -252,7 +284,7 @@ test("both discovery presentations continue only for 404 on optional template pa
 	}
 });
 
-test("template selection requires declared type, purpose metadata, and a confirmed route", () => {
+test("template selection uses decoded extension-specific metadata and a confirmed route", () => {
 	const discoveryStart = skill.indexOf("### Discover issue templates");
 	assert.ok(discoveryStart !== -1, "Discover issue templates section must exist");
 	const discoveryEnd = skill.indexOf("\n### Discover labels", discoveryStart + 1);
@@ -262,18 +294,18 @@ test("template selection requires declared type, purpose metadata, and a confirm
 	);
 	assert.match(
 		discovery,
-		/form\/YAML templates[\s\S]*?metadata returned by `issue_templates` discovery/,
-		"form/YAML candidates must use metadata returned by discovery",
+		/Contents API directory response as the authoritative template inventory/,
+		"Contents directory enumeration must be the authoritative inventory",
 	);
 	assert.match(
 		discovery,
-		/Markdown template[\s\S]*?fetch the exact discovered path[\s\S]*?frontmatter metadata[\s\S]*?`name` and `about`/,
-		"Markdown candidates must be fetched and inspected for frontmatter metadata",
+		/exact discovered `\.yml` or `\.yaml` path[\s\S]*?YAML issue-form metadata `name` and `description`/,
+		"YAML candidates must be decoded and inspected for name and description metadata",
 	);
 	assert.match(
 		discovery,
-		/Classify each candidate's delivery type as `form\/YAML`, `Markdown`, or `other` from its discovered representation/,
-		"candidate delivery type must distinguish form/YAML, Markdown, and other",
+		/exact discovered `\.md` path[\s\S]*?Markdown frontmatter metadata `name` and `about`/,
+		"Markdown candidates must be decoded and inspected for name and about frontmatter",
 	);
 	assert.match(
 		discovery,

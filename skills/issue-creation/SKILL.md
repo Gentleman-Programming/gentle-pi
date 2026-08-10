@@ -60,22 +60,21 @@ gh api repos/{owner}/{repo} --jq '{allow_issues: .has_issues, has_discussions: .
 ### Discover issue templates
 
 ```bash
-# Form-based templates (YAML)
-gh api repos/{owner}/{repo}/issue_templates
-
-# Markdown templates (optional; inspect the HTTP status)
+# Authoritative template inventory (optional; inspect the HTTP status)
 gh api --include repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE
 
-# For each Markdown template, fetch its exact discovered path
-DISCOVERED_TEMPLATE_PATH="<path-returned-by-discovery>"
+# Fetch each exact discovered metadata-bearing path, then decode its contents
+DISCOVERED_TEMPLATE_PATH="<exact-path-returned-by-contents-inventory>"
 gh api "repos/{owner}/{repo}/contents/$DISCOVERED_TEMPLATE_PATH" --jq '.content' | base64 -d
 
 # Blank-issue policy (optional; inspect the HTTP status)
 gh api --include repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE/config.yml
 ```
 
-- Classify each candidate's delivery type as `form/YAML`, `Markdown`, or `other` from its discovered representation.
-- Read each discovered template's declared metadata before selection. For form/YAML templates, use the metadata returned by `issue_templates` discovery. For every Markdown template, fetch the exact discovered path and inspect its frontmatter metadata, including fields such as `name` and `about`.
+- Treat the Contents API directory response as the authoritative template inventory.
+- For every exact discovered `.yml` or `.yaml` path, classify delivery type as `form/YAML`, use the decoded content from the shared fetch command, and inspect YAML issue-form metadata `name` and `description` before classifying purpose and routing through the web chooser.
+- For every exact discovered `.md` path, classify delivery type as `Markdown`, use the decoded content from the shared fetch command, and inspect Markdown frontmatter metadata `name` and `about` before classifying purpose and assigning a confirmed `TEMPLATE_ID`.
+- Other extensions remain unroutable template types and are classified as `other`.
 - Classify each candidate's purpose as `bug`, `feature`, or `other` from declared metadata; never classify purpose or select from a guessed filename.
 - Route a confirmed matching form/YAML candidate through `gh issue create --web` so its controls remain in the discovered web chooser. Never pass a form/YAML identifier to `--template`.
 - Assign `TEMPLATE_ID` only from a confirmed matching Markdown candidate, then use `gh issue create --template "$TEMPLATE_ID"`.
@@ -298,14 +297,11 @@ The labels above are **discovered patterns**, not assumptions. When a repo does 
 # Repo capabilities (blank-issue policy, Discussions support)
 gh api repos/{owner}/{repo} --jq '{allow_issues: .has_issues, has_discussions: .has_discussions}'
 
-# Issue templates
-gh api repos/{owner}/{repo}/issue_templates
-
-# Markdown templates (optional; inspect the HTTP status)
+# Authoritative template inventory (optional; inspect the HTTP status)
 gh api --include repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE
 
-# For each Markdown template, fetch its exact discovered path
-DISCOVERED_TEMPLATE_PATH="<path-returned-by-discovery>"
+# Fetch each exact discovered metadata-bearing path, then decode its contents
+DISCOVERED_TEMPLATE_PATH="<exact-path-returned-by-contents-inventory>"
 gh api "repos/{owner}/{repo}/contents/$DISCOVERED_TEMPLATE_PATH" --jq '.content' | base64 -d
 
 # Blank-issue policy (optional; inspect the HTTP status)
@@ -317,7 +313,7 @@ gh api --paginate 'repos/{owner}/{repo}/labels?per_page=100' --jq '.[].name'
 
 Both `.github/ISSUE_TEMPLATE` and `.github/ISSUE_TEMPLATE/config.yml` are optional lookups. For either lookup, HTTP 404 means "not configured"; continue to the blank-issue fallback policy. Any non-404 failure (including authentication, authorization, rate-limit, network, 5xx, malformed, or unknown failures) is blocking: surface the failure and stop. Never suppress it. On HTTP 200 for `config.yml`, decode the response body's `.content` field from base64 before reading the policy.
 
-Before selection, classify candidate type as `form/YAML`, `Markdown`, or `other`, and inspect declared purpose metadata as `bug`, `feature`, or `other`. Use form/YAML metadata returned by `issue_templates`; fetch each discovered Markdown path and inspect frontmatter such as `name` and `about`. Route a confirmed form/YAML match through the web chooser, assign `TEMPLATE_ID` only from a confirmed Markdown match, and never route other types through `--template`. If none matches, use the blank-issue path only when allowed; otherwise stop for maintainer guidance.
+Treat the Contents API directory response as the authoritative template inventory. For every exact discovered `.yml` or `.yaml` path, classify delivery type as `form/YAML`, use the decoded content from the shared fetch command, and inspect YAML issue-form metadata `name` and `description` before classifying purpose and routing through the web chooser. For every exact discovered `.md` path, classify delivery type as `Markdown`, use the decoded content from the shared fetch command, and inspect Markdown frontmatter metadata `name` and `about` before classifying purpose and assigning a confirmed `TEMPLATE_ID`. Other extensions remain unroutable template types and are classified as `other`. Classify purpose as `bug`, `feature`, or `other` only from that declared metadata. If none matches, use the blank-issue path only when allowed; otherwise stop for maintainer guidance.
 
 ### Duplicate search (open AND closed)
 
