@@ -63,16 +63,19 @@ gh api repos/{owner}/{repo} --jq '{allow_issues: .has_issues, has_discussions: .
 # Form-based templates (YAML)
 gh api repos/{owner}/{repo}/issue_templates
 
-# Markdown templates
-gh api repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE
+# Markdown templates (optional; inspect the HTTP status)
+gh api --include repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE
 
-# Blank-issue policy (config.yml), when present
-gh api repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE/config.yml --jq '.content' | base64 -d
+# Blank-issue policy (optional; inspect the HTTP status)
+gh api --include repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE/config.yml
 ```
 
+- Both `.github/ISSUE_TEMPLATE` and `.github/ISSUE_TEMPLATE/config.yml` are optional lookups. For either lookup, HTTP 404 means "not configured"; continue to the blank-issue fallback policy.
+- Any non-404 failure (including authentication, authorization, rate-limit, network, 5xx, malformed, or unknown failures) is blocking: surface the failure and stop. Never suppress it.
+- On HTTP 200 for `config.yml`, decode the response body's `.content` field from base64 before reading the policy.
 - Read `.github/ISSUE_TEMPLATE/config.yml` when it exists and honor its `blank_issues_enabled` flag: when `blank_issues_enabled: false`, do not create a blank issue — use a discovered template that fits, or stop and request maintainer guidance when no template fits.
-- When `config.yml` is absent or `blank_issues_enabled` is true/unset, fall back gracefully when templates are absent. Many repos (including gentle-pi) ship **no** `.github/ISSUE_TEMPLATE/` directory; in that case create a blank issue with the sections below as a guide, not a hard template.
-- The template examples in this skill only apply when the discovered repo actually exposes those templates. Do not pass `--template bug_report.yml` to a repo that does not define it.
+- When the `config.yml` lookup returns HTTP 404 or `blank_issues_enabled` is true/unset, fall back gracefully when templates are absent. Many repos (including gentle-pi) ship **no** `.github/ISSUE_TEMPLATE/` directory; in that case create a blank issue with the sections below as a guide, not a hard template.
+- The template examples in this skill only apply when the discovered repo actually exposes those templates. Do not pass a guessed filename.
 
 ### Discover labels
 
@@ -157,7 +160,7 @@ The templates below are **examples**. They only apply when the discovered repo e
 
 ### Bug Report (example template)
 
-Template (when present): `.github/ISSUE_TEMPLATE/bug_report.yml`
+Template identifier (when present): select the matching bug-report identifier from discovery.
 Auto-labels (when the template applies them): `bug`, `status:needs-review`
 
 #### Required Fields
@@ -183,7 +186,9 @@ Auto-labels (when the template applies them): `bug`, `status:needs-review`
 #### Example — Bug Report via CLI (only when the template exists)
 
 ```bash
-gh issue create --template "bug_report.yml" \
+# Select the matching identifier returned by template discovery.
+TEMPLATE_ID="<discovered-template-identifier>"
+gh issue create --template "$TEMPLATE_ID" \
   --title "fix(scripts): setup.sh fails on zsh with glob error" \
   --body "
 ### Pre-flight Checks
@@ -224,7 +229,7 @@ zsh: no matches found: skills/*
 
 ### Feature Request (example template)
 
-Template (when present): `.github/ISSUE_TEMPLATE/feature_request.yml`
+Template identifier (when present): select the matching feature-request identifier from discovery.
 Auto-labels (when the template applies them): `enhancement`, `status:needs-review`
 
 #### Required Fields
@@ -246,7 +251,9 @@ Auto-labels (when the template applies them): `enhancement`, `status:needs-revie
 #### Example — Feature Request via CLI (only when the template exists)
 
 ```bash
-gh issue create --template "feature_request.yml" \
+# Select the matching identifier returned by template discovery.
+TEMPLATE_ID="<discovered-template-identifier>"
+gh issue create --template "$TEMPLATE_ID" \
   --title "feat(scripts): add Codex support to setup.sh" \
   --body "
 ### Pre-flight Checks
@@ -328,12 +335,17 @@ gh api repos/{owner}/{repo} --jq '{allow_issues: .has_issues, has_discussions: .
 # Issue templates
 gh api repos/{owner}/{repo}/issue_templates
 
-# Blank-issue policy (config.yml), when present
-gh api repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE/config.yml --jq '.content' | base64 -d
+# Markdown templates (optional; inspect the HTTP status)
+gh api --include repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE
+
+# Blank-issue policy (optional; inspect the HTTP status)
+gh api --include repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE/config.yml
 
 # Labels (discovered set)
 gh api repos/{owner}/{repo}/labels --jq '.[].name'
 ```
+
+Both `.github/ISSUE_TEMPLATE` and `.github/ISSUE_TEMPLATE/config.yml` are optional lookups. For either lookup, HTTP 404 means "not configured"; continue to the blank-issue fallback policy. Any non-404 failure (including authentication, authorization, rate-limit, network, 5xx, malformed, or unknown failures) is blocking: surface the failure and stop. Never suppress it. On HTTP 200 for `config.yml`, decode the response body's `.content` field from base64 before reading the policy.
 
 ### Duplicate search (open AND closed)
 
@@ -344,11 +356,14 @@ gh issue list --state all --limit 1000 --search "keywords"
 ### Create
 
 ```bash
-# Bug report (only when the template was discovered)
-gh issue create --template "bug_report.yml" --title "fix(scope): description"
+# Select the matching identifier returned by template discovery.
+TEMPLATE_ID="<discovered-template-identifier>"
 
-# Feature request (only when the template was discovered)
-gh issue create --template "feature_request.yml" --title "feat(scope): description"
+# Bug report (only when the selected template matches)
+gh issue create --template "$TEMPLATE_ID" --title "fix(scope): description"
+
+# Feature request (only when the selected template matches)
+gh issue create --template "$TEMPLATE_ID" --title "feat(scope): description"
 
 # Blank issue (when no templates exist)
 gh issue create --title "fix(scope): description" --body "..."

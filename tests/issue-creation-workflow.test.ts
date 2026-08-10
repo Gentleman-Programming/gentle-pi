@@ -159,8 +159,13 @@ test("Discover issue templates reads config.yml and honors blank_issues_enabled"
 
 	assert.match(
 		section,
-		/gh api repos\/\{owner\}\/\{repo\}\/contents\/\.github\/ISSUE_TEMPLATE\/config\.yml --jq '\.content' \| base64 -d/,
-		"Discover section must read and decode .github/ISSUE_TEMPLATE/config.yml",
+		/gh api --include repos\/\{owner\}\/\{repo\}\/contents\/\.github\/ISSUE_TEMPLATE\/config\.yml/,
+		"Discover section must inspect the HTTP status for .github/ISSUE_TEMPLATE/config.yml",
+	);
+	assert.match(
+		section,
+		/On HTTP 200 for `config\.yml`, decode the response body's `\.content` field from base64/,
+		"Discover section must decode config.yml content after a successful lookup",
 	);
 	assert.ok(
 		section.includes("blank_issues_enabled"),
@@ -178,6 +183,43 @@ test("Discover issue templates reads config.yml and honors blank_issues_enabled"
 	);
 });
 
+test("both discovery presentations continue only for 404 on optional template paths", () => {
+	const sections = [
+		["### Discover issue templates", "\n### Discover labels"],
+		["### Discovery (run before creating any issue)", "\n### Duplicate search"],
+	].map(([heading, nextHeading]) => {
+		const start = skill.indexOf(heading);
+		assert.ok(start !== -1, `${heading} section must exist`);
+		const end = skill.indexOf(nextHeading, start + 1);
+		return skill.slice(start, end === -1 ? undefined : end);
+	});
+
+	for (const section of sections) {
+		assert.ok(
+			section.includes(
+				"gh api --include repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE\n",
+			),
+			"discovery must inspect the optional .github/ISSUE_TEMPLATE path",
+		);
+		assert.ok(
+			section.includes(
+				"gh api --include repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE/config.yml",
+			),
+			"discovery must inspect the optional .github/ISSUE_TEMPLATE/config.yml path",
+		);
+		assert.match(
+			section,
+			/HTTP 404 means "not configured"; continue to the blank-issue fallback policy/,
+			"HTTP 404 must continue to the blank-issue fallback policy",
+		);
+		assert.match(
+			section,
+			/Any non-404 failure \(including authentication, authorization, rate-limit, network, 5xx, malformed, or unknown failures\) is blocking: surface the failure and stop/,
+			"authentication, authorization, rate-limit, network, 5xx, malformed, and unknown failures must remain blocking",
+		);
+	}
+});
+
 test("both duplicate-search commands use --limit 1000", () => {
 	const commands = skill.match(
 		/gh issue list --state all --limit 1000 --search/g,
@@ -188,33 +230,37 @@ test("both duplicate-search commands use --limit 1000", () => {
 	);
 });
 
-test("template gh issue create commands do not pass --label", () => {
+test("template gh issue create commands use a discovered identifier and do not pass --label", () => {
 	const section = (() => {
 		const start = skill.indexOf("### Create");
 		assert.ok(start !== -1, "Create section must exist");
 		const nextHeader = skill.indexOf("\n### ", start + 1);
 		return skill.slice(start, nextHeader === -1 ? undefined : nextHeader);
 	})();
-
 	assert.match(
 		section,
-		/gh issue create --template "bug_report\.yml" --title "fix\(scope\): description"/,
-		"bug report template command must exist without a fixed --label",
-	);
-	assert.match(
-		section,
-		/gh issue create --template "feature_request\.yml" --title "feat\(scope\): description"/,
-		"feature request template command must exist without a fixed --label",
+		/TEMPLATE_ID="<discovered-template-identifier>"[\s\S]*?gh issue create --template "\$TEMPLATE_ID"/,
+		"Create section must select the discovered template identifier before use",
 	);
 
 	const templateCreates = [
-		...section.matchAll(/gh issue create --template[^\n]*/g),
+		...skill.matchAll(/gh issue create --template[^\n]*/g),
 	].map((m) => m[0]);
 	assert.ok(
-		templateCreates.length >= 2,
-		`expected at least 2 template create commands, found ${templateCreates.length}`,
+		templateCreates.length >= 4,
+		`expected at least 4 template create commands, found ${templateCreates.length}`,
+	);
+	assert.doesNotMatch(
+		skill,
+		/(?:bug_report|feature_request)\.ya?ml/,
+		"skill must not require repository-specific template filenames",
 	);
 	for (const command of templateCreates) {
+		assert.match(
+			command,
+			/--template "\$TEMPLATE_ID"/,
+			"template create commands must pass the identifier selected from discovery",
+		);
 		assert.doesNotMatch(
 			command,
 			/--label/,
