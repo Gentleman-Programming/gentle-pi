@@ -37,9 +37,9 @@ Delegation is not optional once complexity appears. If a task crosses the trigge
 
 Route work through the smallest harness that is safe. Three tiers:
 
-1. **Inline Direct** — small, mechanical, parent has context (typo, one-file edit, read-only check of 1-3 known files, bash for state). No SDD ceremony; stop when it is no longer small.
-2. **Simple Delegation** — generic non-SDD exploration → `gentle-ai-explore`; bounded implementation → `gentle-ai-worker`; command-running generic non-SDD verification → `gentle-ai-verify`. Try its package role; if missing/unusable, use native `Agent` under the same read-only mapping/verification constraints and report fallback. SDD roles stay inside SDD; review lenses inside reviews.
-3. **SDD** — large, ambiguous, architectural, product-facing, multi-area, or high-review-risk work, or an explicit `/sdd-new`/`/sdd-ff`/`/sdd-continue` request. Do not jump to implementation; create artifacts and gate for approval.
+1. **Inline Direct** — small mechanical work with parent context; no SDD.
+2. **Simple Delegation** — generic non-SDD exploration → `gentle-ai-explore`; bounded implementation → `gentle-ai-worker`; generic non-SDD verification → `gentle-ai-verify`. If missing/unusable, use native `Agent` under the same read-only constraints and report the fallback. SDD roles stay inside SDD; review lenses inside reviews.
+3. **SDD** — explicit requests or substantial ambiguity where durable artifacts reduce risk; size or risk alone never selects it.
 
 ## Delegation Rules
 
@@ -57,13 +57,13 @@ Core question: does this inflate parent context without need?
 
 Mandatory Delegation Triggers — stop rules; once fired, delegate through the best available subagent runtime (prefer `subagent_run`, else Pi's native `Agent`):
 
-1. **4-file rule** — 4+ files to understand → delegate a scout/mapping task.
-2. **Multi-file write rule** — 2+ non-trivial files touched → delegate one writer.
-3. **Lifecycle gate rule** — commit/push/PR/release validates one receipt and exact target with zero actors. Direct commit uses the durable native-validated transaction; unresolved state blocks publication. Changed authority fails closed.
-4. **Incident rule** — diagnose wrong cwd/worktree/git/tooling incidents separately. An incident never reopens a closed review lineage or resets its budget.
-5. **Verification rule** — executing/delegating verification commands → `gentle-ai-verify`; only the 1-3-file read-only check stays inline.
-6. **Long-session rule** — ~20 tool calls, 5 exploratory reads, or 2 non-mechanical edits without delegation → pause and delegate.
-7. **Review actor rule** — review lenses run only when selected by ordinary transaction start; explicit Judgment Day uses its two named judges. Lifecycle and SDD boundaries launch zero review actors.
+1. **4-file rule** — map 4+ files through one scout.
+2. **Multi-file write rule** — delegate one writer for 2+ non-trivial files.
+3. **Lifecycle gate rule** — commit/push/PR/release use durable native validation for the exact target; unresolved or changed authority blocks.
+4. **Incident rule** — isolate cwd/worktree/git/tooling failures; never reopen or reset review.
+5. **Verification rule** — executing/delegating verification commands → `gentle-ai-verify`; only 1-3-file read-only checks stay inline.
+6. **Long-session rule** — delegate after ~20 calls, 5 reads, or 2 non-mechanical edits.
+7. **Review actor rule** — ordinary START selects lenses; Judgment Day alone uses two judges; lifecycle and SDD launch zero review actors.
 
 Full table, Work Routing Ladder examples/model-routing detail, Cost and Context Balance, Canonical Workflows, and Review Lens Selection detail: `{{GENTLE_PI_DELEGATION_PATH}}`.
 
