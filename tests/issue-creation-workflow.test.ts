@@ -87,6 +87,38 @@ test("Privacy Scrub section forbids publishing raw argv, paths, and env values",
 	);
 });
 
+test("Privacy Scrub covers cross-platform home and non-home absolute paths safely", () => {
+	const start = skill.indexOf("## Privacy Scrub");
+	assert.ok(start !== -1, "Privacy Scrub section must exist");
+	const end = skill.indexOf("\n## ", start + 1);
+	const section = skill.slice(start, end === -1 ? undefined : end);
+	for (const value of [
+		"/home/<username>/work/<private-project>",
+		"/Users/<username>/work/<private-project>",
+		"<home-path>/work/<private-project>",
+		"C:\\Users\\<username>\\work\\<private-project>",
+		"<home-path>\\work\\<private-project>",
+		"/var/lib/<private-project>/...",
+	]) {
+		assert.ok(section.includes(value), `Privacy Scrub must include safe path example ${value}`);
+	}
+	assert.doesNotMatch(
+		section,
+		/\/(?:home|Users)\/(?!<username>)[^/\s`]+/,
+		"Unix home examples must not contain raw usernames",
+	);
+	assert.doesNotMatch(
+		section,
+		/[A-Z]:\\Users\\(?!<username>)[^\\\s`]+/,
+		"Windows home examples must not contain raw usernames",
+	);
+	assert.doesNotMatch(
+		section,
+		/\/var\/lib\/(?!<private-project>)[^/\s`]+/,
+		"non-home absolute path examples must not expose private components",
+	);
+});
+
 test("Questions vs Issues routes to Discussions only when has_discussions is true", () => {
 	assert.match(
 		skill,
@@ -220,7 +252,7 @@ test("both discovery presentations continue only for 404 on optional template pa
 	}
 });
 
-test("template selection requires declared metadata and a confirmed matching classification", () => {
+test("template selection requires declared type, purpose metadata, and a confirmed route", () => {
 	const discoveryStart = skill.indexOf("### Discover issue templates");
 	assert.ok(discoveryStart !== -1, "Discover issue templates section must exist");
 	const discoveryEnd = skill.indexOf("\n### Discover labels", discoveryStart + 1);
@@ -240,19 +272,74 @@ test("template selection requires declared metadata and a confirmed matching cla
 	);
 	assert.match(
 		discovery,
-		/Classify every candidate as `bug`, `feature`, or `other` from its declared purpose\/metadata; never classify or select from a guessed filename/,
-		"candidate classification must use declared purpose rather than filenames",
+		/Classify each candidate's delivery type as `form\/YAML`, `Markdown`, or `other` from its discovered representation/,
+		"candidate delivery type must distinguish form/YAML, Markdown, and other",
 	);
 	assert.match(
 		discovery,
-		/Assign `TEMPLATE_ID` only from a confirmed matching candidate/,
-		"TEMPLATE_ID must come only from a confirmed matching candidate",
+		/Classify each candidate's purpose as `bug`, `feature`, or `other` from declared metadata; never classify purpose or select from a guessed filename/,
+		"candidate purpose must use declared metadata rather than filenames",
+	);
+	assert.match(
+		discovery,
+		/Assign `TEMPLATE_ID` only from a confirmed matching Markdown candidate/,
+		"TEMPLATE_ID must come only from a confirmed matching Markdown candidate",
 	);
 	assert.match(
 		discovery,
 		/If no candidate matches[\s\S]*?blank-issue path only when blank issues are allowed; otherwise stop for maintainer guidance/,
 		"no-match flow must use an allowed blank issue or stop for maintainer guidance",
 	);
+});
+
+test("form/YAML routes use the web chooser while Markdown routes use --template", () => {
+	const formStart = skill.indexOf("### Form/YAML Issue Forms");
+	assert.ok(formStart !== -1, "Form/YAML Issue Forms section must exist");
+	const formEnd = skill.indexOf("\n### Bug Report", formStart + 1);
+	const formGuidance = skill.slice(formStart, formEnd === -1 ? undefined : formEnd);
+	assert.match(formGuidance, /gh issue create --web/);
+	assert.doesNotMatch(formGuidance, /gh issue create --template/);
+
+	const createStart = skill.indexOf("### Create");
+	assert.ok(createStart !== -1, "Create section must exist");
+	const createEnd = skill.indexOf("\n### ", createStart + 1);
+	const create = skill.slice(createStart, createEnd === -1 ? undefined : createEnd);
+	const formRouteStart = create.indexOf("# Confirmed matching form/YAML candidate");
+	const markdownRouteStart = create.indexOf("# Confirmed matching Markdown candidate");
+	const blankRouteStart = create.indexOf("# Other type or no confirmed metadata match");
+	assert.ok(formRouteStart !== -1 && markdownRouteStart > formRouteStart);
+	assert.ok(blankRouteStart > markdownRouteStart);
+	const formRoute = create.slice(formRouteStart, markdownRouteStart);
+	const markdownRoute = create.slice(markdownRouteStart, blankRouteStart);
+	assert.match(formRoute, /gh issue create --web/);
+	assert.doesNotMatch(formRoute, /gh issue create --template/);
+	assert.match(
+		markdownRoute,
+		/TEMPLATE_ID="<confirmed-matching-markdown-template-identifier>"[\s\S]*?gh issue create --template "\$TEMPLATE_ID"/,
+	);
+	assert.doesNotMatch(markdownRoute, /--web|--body/);
+});
+
+test("decision tree checks questions and duplicates before template or blank routing", () => {
+	const start = skill.indexOf("## Decision Tree");
+	assert.ok(start !== -1, "Decision Tree section must exist");
+	const tree = skill.slice(start);
+	const question = tree.indexOf("Is it a question?");
+	const duplicate = tree.indexOf("Is it a duplicate (open/closed)?");
+	assert.ok(question !== -1 && duplicate !== -1);
+	assert.match(tree, /Is it a question\?[\s\S]*?Discussions, only when has_discussions = true/);
+	assert.match(tree, /Is it a duplicate \(open\/closed\)\?[\s\S]*?Add occurrence comment to existing issue/);
+	for (const branch of [
+		"Purpose metadata matches issue?",
+		"Confirmed candidate type = form/YAML?",
+		"Confirmed candidate type = Markdown?",
+		"Other type or no confirmed match?",
+	]) {
+		const position = tree.indexOf(branch);
+		assert.ok(position !== -1, `Decision Tree must include ${branch}`);
+		assert.ok(question < position, `question routing must precede ${branch}`);
+		assert.ok(duplicate < position, `duplicate reuse must precede ${branch}`);
+	}
 });
 
 test("both label discovery commands paginate exactly 100 labels per page", () => {
@@ -275,7 +362,7 @@ test("both duplicate-search commands use --limit 1000", () => {
 	);
 });
 
-test("template gh issue create commands use a confirmed matching identifier and do not pass --label", () => {
+test("Markdown template commands use a confirmed identifier and blank creation owns CLI body", () => {
 	const section = (() => {
 		const start = skill.indexOf("### Create");
 		assert.ok(start !== -1, "Create section must exist");
@@ -284,8 +371,8 @@ test("template gh issue create commands use a confirmed matching identifier and 
 	})();
 	assert.match(
 		section,
-		/TEMPLATE_ID="<confirmed-matching-template-identifier>"[\s\S]*?gh issue create --template "\$TEMPLATE_ID"/,
-		"Create section must assign a confirmed matching template identifier before use",
+		/TEMPLATE_ID="<confirmed-matching-markdown-template-identifier>"[\s\S]*?gh issue create --template "\$TEMPLATE_ID"/,
+		"Create section must assign a confirmed matching Markdown identifier before use",
 	);
 
 	const templateCreates = [
@@ -317,6 +404,14 @@ test("template gh issue create commands use a confirmed matching identifier and 
 		section,
 		/gh issue create --title "fix\(scope\): description" --body "\.\.\."/,
 		"blank-issue create command must remain intact",
+	);
+	const issueTemplatesStart = skill.indexOf("## Issue Templates");
+	const issueTemplatesEnd = skill.indexOf("\n## Label System", issueTemplatesStart + 1);
+	const issueTemplates = skill.slice(issueTemplatesStart, issueTemplatesEnd);
+	assert.doesNotMatch(
+		issueTemplates,
+		/--body/,
+		"form/YAML and Markdown template examples must not create CLI bodies",
 	);
 	assert.match(
 		section,

@@ -32,7 +32,7 @@ Use this skill when:
 ```
 0. Pre-publication Discovery (repo capabilities, templates, labels, Discussions)
 1. Search existing open AND closed issues for duplicates
-2. Classify discovered templates from declared metadata, then choose a confirmed match or permitted blank fallback
+2. Classify discovered templates by type and declared purpose, then choose the matching web, Markdown, or permitted blank route
 3. Fill in ALL required fields
 4. Check pre-flight checkboxes
 5. Privacy-scrub title and body before submission
@@ -74,9 +74,12 @@ gh api "repos/{owner}/{repo}/contents/$DISCOVERED_TEMPLATE_PATH" --jq '.content'
 gh api --include repos/{owner}/{repo}/contents/.github/ISSUE_TEMPLATE/config.yml
 ```
 
+- Classify each candidate's delivery type as `form/YAML`, `Markdown`, or `other` from its discovered representation.
 - Read each discovered template's declared metadata before selection. For form/YAML templates, use the metadata returned by `issue_templates` discovery. For every Markdown template, fetch the exact discovered path and inspect its frontmatter metadata, including fields such as `name` and `about`.
-- Classify every candidate as `bug`, `feature`, or `other` from its declared purpose/metadata; never classify or select from a guessed filename.
-- Assign `TEMPLATE_ID` only from a confirmed matching candidate whose metadata classification matches the issue.
+- Classify each candidate's purpose as `bug`, `feature`, or `other` from declared metadata; never classify purpose or select from a guessed filename.
+- Route a confirmed matching form/YAML candidate through `gh issue create --web` so its controls remain in the discovered web chooser. Never pass a form/YAML identifier to `--template`.
+- Assign `TEMPLATE_ID` only from a confirmed matching Markdown candidate, then use `gh issue create --template "$TEMPLATE_ID"`.
+- Treat other candidate types as no routable template match; never pass them to `--template`.
 - If no candidate matches, use the documented blank-issue path only when blank issues are allowed; otherwise stop for maintainer guidance.
 - Both `.github/ISSUE_TEMPLATE` and `.github/ISSUE_TEMPLATE/config.yml` are optional lookups. For either lookup, HTTP 404 means "not configured"; continue to the blank-issue fallback policy.
 - Any non-404 failure (including authentication, authorization, rate-limit, network, 5xx, malformed, or unknown failures) is blocking: surface the failure and stop. Never suppress it.
@@ -143,7 +146,9 @@ Before public publication, replace every private identifier with an explicit pla
 | Private project names | `<private-project>` |
 | Usernames | `<username>` |
 | Hostnames | `<hostname>` |
-| Home paths (`/Users/xxx/...`, `/home/xxx/...`) | `<home-path>/...` |
+| Unix home paths (`/home/<username>/...`, `/Users/<username>/...`) | `<home-path>/...` |
+| Windows home paths (`C:\Users\<username>\...`) | `<home-path>\...` |
+| Non-home absolute paths | Preserve the generic root and replace private components with established placeholders, for example `/var/lib/<private-project>/...` |
 | Credentials, API keys, tokens | `<credential>` |
 | Internal endpoints / URLs | `<internal-endpoint>` |
 
@@ -153,12 +158,12 @@ Rules:
 - Scrub error messages that echo a private path or hostname.
 - When in doubt, scrub. A redacted issue can be amended later; a leaked credential cannot be un-leaked.
 
-Example scrub:
+Safe path scrub examples:
 
-```
-Raw:    /Users/alice/dev/secret-project/.env leaked token sk-1234 on internal-ci.example.com
-Scrubbed: <home-path>/dev/<private-project>/.env leaked token <credential> on <internal-endpoint>
-```
+- `/home/<username>/work/<private-project>` → `<home-path>/work/<private-project>`
+- `/Users/<username>/work/<private-project>` → `<home-path>/work/<private-project>`
+- `C:\Users\<username>\work\<private-project>` → `<home-path>\work\<private-project>`
+- For a non-home absolute path, preserve only its generic root and replace private segments, for example `/var/lib/<private-project>/...`.
 
 ---
 
@@ -166,9 +171,19 @@ Scrubbed: <home-path>/dev/<private-project>/.env leaked token <credential> on <i
 
 The templates below are **examples**. They only apply when the discovered repo exposes those exact templates. When the repo has no `.github/ISSUE_TEMPLATE/` directory (gentle-pi does not), create a blank issue using the field lists as a guide, not as enforced form fields.
 
-### Bug Report (example template)
+### Form/YAML Issue Forms
 
-Template identifier (when present): select it only after declared metadata classifies it as a bug match.
+When declared metadata confirms a matching form/YAML candidate, preserve its controls by opening the discovered web chooser. Do not assign `TEMPLATE_ID` or pass `--template` for an issue form.
+
+```bash
+gh issue create --web
+```
+
+Stop for human completion in the web form.
+
+### Bug Report (example Markdown template)
+
+Markdown template identifier (when present): select it only after declared metadata classifies it as a bug match.
 Auto-labels (when the template applies them): `bug`, `status:needs-review`
 
 #### Required Fields
@@ -191,53 +206,19 @@ Auto-labels (when the template applies them): `bug`, `status:needs-review`
 | **Relevant Logs** | Scrubbed log output (auto-formatted as code block) |
 | **Additional Context** | Screenshots, workarounds, extra info |
 
-#### Example — Bug Report via CLI (only when the template exists)
+#### Example — Bug Report via CLI (confirmed Markdown only)
 
 ```bash
-# Assign only after declared metadata confirms a matching bug candidate.
-TEMPLATE_ID="<confirmed-matching-template-identifier>"
-gh issue create --template "$TEMPLATE_ID" \
-  --title "fix(scripts): setup.sh fails on zsh with glob error" \
-  --body "
-### Pre-flight Checks
-- [x] I searched open AND closed issues and this is not a duplicate
-- [x] I understand this issue needs status:approved before a PR can be opened
-
-### Bug Description
-Running setup.sh on zsh throws a glob error when no matching files exist.
-
-### Steps to Reproduce
-1. Clone the repo
-2. Run \`./scripts/setup.sh\` in zsh
-3. See error: \`zsh: no matches found: skills/*\`
-
-### Expected Behavior
-The script should handle missing glob matches gracefully.
-
-### Actual Behavior
-Script crashes with glob error.
-
-### Operating System
-macOS
-
-### Agent / Client
-Claude Code
-
-### Shell
-zsh
-
-### Relevant Logs
-\`\`\`
-zsh: no matches found: skills/*
-\`\`\`
-"
+# Assign only after declared metadata confirms a matching Markdown bug candidate.
+TEMPLATE_ID="<confirmed-matching-markdown-template-identifier>"
+gh issue create --template "$TEMPLATE_ID" --title "fix(scripts): setup.sh fails on zsh with glob error"
 ```
 
 ---
 
-### Feature Request (example template)
+### Feature Request (example Markdown template)
 
-Template identifier (when present): select it only after declared metadata classifies it as a feature match.
+Markdown template identifier (when present): select it only after declared metadata classifies it as a feature match.
 Auto-labels (when the template applies them): `enhancement`, `status:needs-review`
 
 #### Required Fields
@@ -256,35 +237,12 @@ Auto-labels (when the template applies them): `enhancement`, `status:needs-revie
 | **Alternatives Considered** | Other approaches or workarounds |
 | **Additional Context** | Mockups, examples, references |
 
-#### Example — Feature Request via CLI (only when the template exists)
+#### Example — Feature Request via CLI (confirmed Markdown only)
 
 ```bash
-# Assign only after declared metadata confirms a matching feature candidate.
-TEMPLATE_ID="<confirmed-matching-template-identifier>"
-gh issue create --template "$TEMPLATE_ID" \
-  --title "feat(scripts): add Codex support to setup.sh" \
-  --body "
-### Pre-flight Checks
-- [x] I searched open AND closed issues and this is not a duplicate
-- [x] I understand this issue needs status:approved before a PR can be opened
-
-### Problem Description
-The setup script only configures Claude Code, Gemini CLI, and OpenCode. Codex users have to manually copy skills.
-
-### Proposed Solution
-Add a Codex option to setup.sh that links skills to the .codex/ directory.
-
-Example:
-\`\`\`bash
-./scripts/setup.sh --agent codex
-\`\`\`
-
-### Affected Area
-Scripts (setup, installation)
-
-### Alternatives Considered
-Manually symlinking, but that defeats the purpose of the setup script.
-"
+# Assign only after declared metadata confirms a matching Markdown feature candidate.
+TEMPLATE_ID="<confirmed-matching-markdown-template-identifier>"
+gh issue create --template "$TEMPLATE_ID" --title "feat(scripts): add Codex support to setup.sh"
 ```
 
 ---
@@ -325,8 +283,8 @@ The labels above are **discovered patterns**, not assumptions. When a repo does 
 
 ## Questions vs Issues
 
-- Is it a bug? → Use Bug Report template (or blank issue with bug fields when no template exists)
-- Is it a new feature/improvement? → Use Feature Request template (or blank issue with feature fields)
+- Is it a bug? → After question and duplicate checks, route a confirmed form/YAML match to the web chooser, a confirmed Markdown match to `--template`, or use a permitted blank issue with bug fields.
+- Is it a new feature/improvement? → After question and duplicate checks, route a confirmed form/YAML match to the web chooser, a confirmed Markdown match to `--template`, or use a permitted blank issue with feature fields.
 - Is it a question? → Route to Discussions **only when `has_discussions` is true** (discovered, not assumed). When Discussions is not enabled, note that the repo does not support it and ask the user how to proceed.
 - Is it a duplicate? → Link to the existing open or closed issue and add an occurrence comment.
 
@@ -359,7 +317,7 @@ gh api --paginate 'repos/{owner}/{repo}/labels?per_page=100' --jq '.[].name'
 
 Both `.github/ISSUE_TEMPLATE` and `.github/ISSUE_TEMPLATE/config.yml` are optional lookups. For either lookup, HTTP 404 means "not configured"; continue to the blank-issue fallback policy. Any non-404 failure (including authentication, authorization, rate-limit, network, 5xx, malformed, or unknown failures) is blocking: surface the failure and stop. Never suppress it. On HTTP 200 for `config.yml`, decode the response body's `.content` field from base64 before reading the policy.
 
-Before selection, inspect every candidate's declared metadata: use form/YAML metadata returned by `issue_templates`, and fetch each discovered Markdown path to inspect frontmatter such as `name` and `about`. Classify each candidate as `bug`, `feature`, or `other` from that declared purpose, never from its filename. Assign `TEMPLATE_ID` only from a confirmed matching candidate. If none matches, use the blank-issue path only when allowed; otherwise stop for maintainer guidance.
+Before selection, classify candidate type as `form/YAML`, `Markdown`, or `other`, and inspect declared purpose metadata as `bug`, `feature`, or `other`. Use form/YAML metadata returned by `issue_templates`; fetch each discovered Markdown path and inspect frontmatter such as `name` and `about`. Route a confirmed form/YAML match through the web chooser, assign `TEMPLATE_ID` only from a confirmed Markdown match, and never route other types through `--template`. If none matches, use the blank-issue path only when allowed; otherwise stop for maintainer guidance.
 
 ### Duplicate search (open AND closed)
 
@@ -370,16 +328,19 @@ gh issue list --state all --limit 1000 --search "keywords"
 ### Create
 
 ```bash
-# Assign only from a candidate whose declared metadata confirms a match.
-TEMPLATE_ID="<confirmed-matching-template-identifier>"
+# Confirmed matching form/YAML candidate: open the web chooser; never use --template.
+gh issue create --web
 
-# Bug report (only when the selected template matches)
+# Confirmed matching Markdown candidate: assign its identifier for CLI template use.
+TEMPLATE_ID="<confirmed-matching-markdown-template-identifier>"
+
+# Markdown bug report (only when the selected template matches)
 gh issue create --template "$TEMPLATE_ID" --title "fix(scope): description"
 
-# Feature request (only when the selected template matches)
+# Markdown feature request (only when the selected template matches)
 gh issue create --template "$TEMPLATE_ID" --title "feat(scope): description"
 
-# No confirmed metadata match: blank issue only when blank_issues_enabled allows it
+# Other type or no confirmed metadata match: CLI body only when blank_issues_enabled allows it
 gh issue create --title "fix(scope): description" --body "..."
 # Otherwise stop for maintainer guidance.
 ```
@@ -402,10 +363,10 @@ gh issue edit <number> --add-label "priority:high"
 
 ```
 Repo has_issues = false?          → Stop: repo does not accept issues
-blank_issues_enabled = false?     → Use a confirmed matching template, or stop for maintainer guidance
-Metadata classification = bug?   → Use a confirmed matching bug template
-Metadata classification = feature? → Use a confirmed matching feature template
-No metadata-confirmed match?     → Blank only when allowed; otherwise stop for maintainer guidance
 Is it a question?                → Discussions, only when has_discussions = true
 Is it a duplicate (open/closed)?  → Add occurrence comment to existing issue
+Purpose metadata matches issue?  → Continue by candidate type
+Confirmed candidate type = form/YAML? → Open the discovered web chooser
+Confirmed candidate type = Markdown? → Use confirmed TEMPLATE_ID with --template
+Other type or no confirmed match? → Blank only when allowed; otherwise stop for maintainer guidance
 ```
