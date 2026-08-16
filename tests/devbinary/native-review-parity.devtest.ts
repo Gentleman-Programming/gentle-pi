@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createGentleAiExtension } from "../../extensions/gentle-ai.ts";
+import { deriveChangedPathManifest } from "../../lib/review-candidate-view.ts";
 import {
 	NativeReviewCliV214,
 	createNodeExecFileAdapter,
@@ -77,7 +78,7 @@ function journeyNative(binary: string): NativeReviewCli {
 		reviewMode: (request) => bridge.reviewMode(request),
 		async targetStatus(request) {
 			return request.lineageId === undefined
-				? unrelatedStartTargetStatus()
+				? unrelatedStartTargetStatus(request.cwd)
 				: currentTargetStatusFixture(request.lineageId, request.cwd);
 		},
 	} as unknown as NativeReviewCli;
@@ -117,12 +118,34 @@ const RAW_UNSUPPORTED_REPAIR_ASSESSMENT = {
 	authorization_schema: UNSUPPORTED_REPAIR_ASSESSMENT.authorizationSchema,
 };
 
-function unrelatedStartTargetStatus(): ReviewStatusV3 {
+// The candidate-view guard (assertNativeStartCandidateBinding) compares this
+// fixture's projection against the trees and paths gentle-pi derives from the
+// real workspace, so the fixture cannot invent them. It mirrors exactly what
+// lib/review-candidate-view.ts does: read HEAD into a scratch index, stage
+// everything, and write that tree. Hardcoded placeholders can never match, and
+// a mismatch surfaces as candidate-target-projection-drift long before the
+// binary under test is ever asked anything.
+function realProjectionFacts(cwd: string): { baseTree: string; candidateTree: string; paths: readonly string[] } {
+	const baseTree = git(cwd, "rev-parse", "HEAD^{tree}");
+	const index = mkdtempSync(join(tmpdir(), "gentle-pi-devtest-index-"));
+	try {
+		const environment = { ...process.env, GIT_INDEX_FILE: join(index, "index") };
+		execFileSync("git", ["read-tree", "HEAD"], { cwd, env: environment });
+		execFileSync("git", ["add", "-A"], { cwd, env: environment });
+		const candidateTree = execFileSync("git", ["write-tree"], { cwd, env: environment, encoding: "utf8" }).trim();
+		const paths = deriveChangedPathManifest(cwd, baseTree, candidateTree).map((entry) => entry.path);
+		return { baseTree, candidateTree, paths };
+	} finally {
+		rmSync(index, { recursive: true, force: true });
+	}
+}
+
+function unrelatedStartTargetStatus(cwd: string): ReviewStatusV3 {
 	const sha = `sha256:${"a".repeat(64)}`;
-	const tree = "b".repeat(40);
+	const { baseTree, candidateTree, paths } = realProjectionFacts(cwd);
 	const projection = {
 		schema: "gentle-ai.review-integration.projection/v1" as const, kind: "current-changes" as const, projection: "workspace" as const,
-		baseTree: tree, initialReviewTree: tree, currentCandidateTree: tree, pathsDigest: sha, paths: [], intendedUntracked: [],
+		baseTree, initialReviewTree: candidateTree, currentCandidateTree: candidateTree, pathsDigest: sha, paths, intendedUntracked: [],
 		intendedUntrackedProof: sha, initialSnapshotIdentity: sha, currentSnapshotIdentity: sha,
 	};
 	return {
@@ -132,7 +155,7 @@ function unrelatedStartTargetStatus(): ReviewStatusV3 {
 			schema: "gentle-ai.review-integration.status/v3", contract: "gentle-ai.review-integration/v2", operation: "review.status",
 			applicability: "unrelated", receipt: { status: "not_applicable" }, action: "start", replayability: "not_replayable", target_identity: sha,
 			repair: RAW_UNSUPPORTED_REPAIR_ASSESSMENT,
-			projection: { schema: projection.schema, kind: projection.kind, projection: projection.projection, base_tree: tree, initial_review_tree: tree, current_candidate_tree: tree, paths_digest: sha, paths: [], intended_untracked: [], intended_untracked_proof: sha, initial_snapshot_identity: sha, current_snapshot_identity: sha },
+			projection: { schema: projection.schema, kind: projection.kind, projection: projection.projection, base_tree: baseTree, initial_review_tree: candidateTree, current_candidate_tree: candidateTree, paths_digest: sha, paths, intended_untracked: [], intended_untracked_proof: sha, initial_snapshot_identity: sha, current_snapshot_identity: sha },
 			candidates: [],
 		},
 	};
