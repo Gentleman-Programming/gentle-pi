@@ -25,6 +25,16 @@ If a subagent reports `skill_resolution`, interpret it as project/user skill res
 
 If any subagent reports a fallback instead of `paths-injected`, treat it as an orchestration gap and correct future delegations by passing exact indexed paths directly.
 
+## Inline Registry Skill Execution
+
+When the parent selects a registry-indexed skill and executes inline (no subagent delegation), the same `paths-injected` discipline applies to the parent itself:
+
+1. read the exact indexed `SKILL.md` before acting;
+2. follow that skill's Output Contract exactly; and
+3. report `skill_resolution: paths-injected` with the exact injected path(s) in the response.
+
+This is generic: the inline contract applies to any registry-indexed skill, never to a specific skill by name. The delegation path semantics above are unchanged — a subagent still reports `skill_resolution` when the parent delegates, and the parent reports it when it executes inline.
+
 ## Intent-Driven Skill Discovery
 
 For skill-shaped requests, do not treat injected `<available_skills>` as complete. Use the registry and filesystem only as a discovery aid; do not let a trigger table override the user's concrete request or turn a small request into a larger workflow.
