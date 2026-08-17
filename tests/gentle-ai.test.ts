@@ -12,7 +12,7 @@ import type {
 	Theme,
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
-import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
+import { __testing, applyModelConfig, createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import type { NativeReviewCli } from "../lib/native-review-cli.ts";
 import type { ReviewCollectInputV3, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
@@ -422,6 +422,45 @@ test("discoverable model agents include installed Judgment Day agents", (t) => {
 	assert.deepEqual(
 		discovered.filter((name) => name.startsWith("jd-")),
 		["jd-judge-a", "jd-judge-b", "jd-fix-agent"],
+	);
+});
+
+test("per-JD-agent model assignment keeps judge-a and judge-b profiles divergent", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-jd-diversity-"));
+	const previousHome = process.env.GENTLE_PI_AGENT_HOME;
+	process.env.GENTLE_PI_AGENT_HOME = root;
+	t.after(() => {
+		if (previousHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousHome;
+		rmSync(root, { recursive: true, force: true });
+	});
+	writeMarkdown(join(root, "agents", "jd-judge-a.md"), "name: jd-judge-a\n");
+	writeMarkdown(join(root, "agents", "jd-judge-b.md"), "name: jd-judge-b\n");
+	writeMarkdown(join(root, "agents", "jd-fix-agent.md"), "name: jd-fix-agent\n");
+
+	const result = applyModelConfig(root, {
+		"jd-judge-a": { model: "anthropic/claude-3-7-sonnet", thinking: "high" },
+		"jd-judge-b": { model: "openai/gpt-4o", thinking: "low" },
+	});
+	assert.equal(result.updated, 2, "both JD judges must be routed");
+
+	const profiles = JSON.parse(
+		readFileSync(join(root, "subagents.json"), "utf8"),
+	);
+	assert.equal(
+		profiles.model_profiles["jd-judge-a"].model,
+		"anthropic/claude-3-7-sonnet",
+	);
+	assert.equal(profiles.model_profiles["jd-judge-a"].effort, "high");
+	assert.equal(
+		profiles.model_profiles["jd-judge-b"].model,
+		"openai/gpt-4o",
+	);
+	assert.equal(profiles.model_profiles["jd-judge-b"].effort, "low");
+	assert.notEqual(
+		profiles.model_profiles["jd-judge-a"].model,
+		profiles.model_profiles["jd-judge-b"].model,
+		"judge-a and judge-b must be able to run with different models in one JD run",
 	);
 });
 
