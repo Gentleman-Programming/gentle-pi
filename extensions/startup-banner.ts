@@ -342,6 +342,13 @@ type LetterStroke = { orderMap: Map<string, number>; maxOrder: number };
 
 const WRITING_START_TICK = 6;
 const FALLBACK_LETTER_TICKS = 8;
+// The rose pulse advances one step every N ticks instead of every tick.
+// The pulse repaints every rose cell per step, which drives the TUI diff to
+// redraw the whole header region and teleport the hardware cursor on every
+// render. On fast terminals (ghostty) that churn shows as flicker/ghosting.
+// Quantizing the step to ~100ms keeps the gentle wave look while cutting
+// repaints by 4x after the fade-in/flash phases settle.
+const ROSE_PULSE_TICKS = 4;
 
 const LETTER_STROKES: Array<LetterStroke | null> = LETTER_SPANS.map(() => null);
 const LETTER_TICKS: number[] = LETTER_SPANS.map(() => FALLBACK_LETTER_TICKS);
@@ -605,6 +612,12 @@ export default function (pi: ExtensionAPI) {
       !process.argv.every((arg) => arg.startsWith("-") || arg.endsWith(".ts"));
     if (isCLICommand) return;
 
+    // On /reload, session.reload() re-fires session_start with reason
+    // "reload". The intro must not run there: the raw screen clear and a
+    // second overlay splash interleave with the reload's own rendering and
+    // left the editor region blank (TUI cursor model diverged from the
+    // terminal). The splash is a first-start experience only.
+    if ((_event as { reason?: string })?.reason === "reload") return;
     if (currentIntroMode() === "skip") return;
 
     // Fire-and-forget: el setup geométrico de cada letra corre en background
@@ -698,7 +711,7 @@ export default function (pi: ExtensionAPI) {
     };
 
     setTimeout(() => {
-      ctx.ui.setHeader((tui, theme) => {
+      void ctx.ui.custom((tui, theme, _keybindings, done) => {
         if (state.timer) clearInterval(state.timer);
 
         const animStart = Date.now();
@@ -711,12 +724,20 @@ export default function (pi: ExtensionAPI) {
             allStrokesReady() && tick > WRITING_END_TICK + 22;
           if (finishedAnimation || elapsed > HARD_TIMEOUT_MS) {
             cleanup();
+            done(undefined);
             return;
           }
-          try {
-            tui.requestRender();
-          } catch {
-            cleanup();
+          // Render on every other tick (~20fps instead of 40fps): the intro
+          // still reads as smooth while halving the per-tick full-header
+          // repaints and hardware-cursor teleports that ghostty shows as
+          // flicker/ghosting (ghostty#12685). Timing stays tick-based, so
+          // the animation duration is unchanged.
+          if (tick % 2 === 0) {
+            try {
+              tui.requestRender();
+            } catch {
+              cleanup();
+            }
           }
         }, 25);
 
@@ -732,6 +753,7 @@ export default function (pi: ExtensionAPI) {
             state.mode = next;
             if (next === "skip") {
               cleanup();
+              done(undefined);
               process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
               return;
             }
@@ -755,7 +777,7 @@ export default function (pi: ExtensionAPI) {
               tick >= flashStartTick
                 ? Math.max(0, 1 - (tick - flashStartTick) / 12)
                 : 0;
-            const frame = Math.floor(tick / 2);
+            const frame = Math.floor(tick / ROSE_PULSE_TICKS);
 
             const sideBySideMinWidth = roseBase.width + 3 + logoBase.width + 4;
             const wideStatsMinWidth = 122;
@@ -1076,10 +1098,30 @@ export default function (pi: ExtensionAPI) {
             return out;
           },
           invalidate() {
+            // pi-tui invalidates all components on theme changes, resizes and
+            // the terminal cell-size report (CSI 6;H;W t) that arrives right
+            // after startup. Killing the ticker here froze the intro mid-flight
+            // (logo half-written, rose stuck invisible). Keep the animation
+            // running; the ticker self-cleans once the intro finishes.
+          },
+          dispose() {
+            // Real teardown when the header is replaced by another extension.
             cleanup();
           },
         };
-      });
+      }, {
+        overlay: true,
+        // Splash: full-width overlay anchored to the center of the terminal,
+        // rendered on top of the chat. Non-capturing so the editor keeps
+        // focus; the overlay hides itself once the intro finishes.
+        overlayOptions: () => ({
+          width: "100%",
+          maxHeight: "100%",
+          anchor: "center",
+          nonCapturing: true,
+          visible: (w, h) => pickIntroMode(h, w) !== "skip",
+        }),
+      }).catch(() => {});
     }, 50);
   });
 }
