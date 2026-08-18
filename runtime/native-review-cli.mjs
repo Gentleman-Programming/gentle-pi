@@ -2131,6 +2131,9 @@ function consentInvocationArguments(request                                  )  
 	if (exactConsentOption(arguments_, "--target") !== request.consent.targetIdentity) throw new NativeReviewConsentBindingError("consent-invocation-target-changed", "Native consent invocation target binding changed");
 	if (exactConsentOption(arguments_, "--projection") !== request.consent.projection) throw new NativeReviewConsentBindingError("consent-invocation-projection-changed", "Native consent invocation projection binding changed");
 	const lineageId = optionalConsentLineageOption(arguments_);
+	if (request.consent.schema === "gentle-ai.review-integration.consent/v3" && request.consent.agent === "pi" && exactConsentOption(arguments_, "--agent") !== "pi") {
+		throw new NativeReviewConsentBindingError("consent-invocation-agent-changed", "Native Pi consent invocation agent binding changed");
+	}
 	if (exactConsentOption(arguments_, "--consent") !== request.answer || arguments_.at(-1) !== request.answer) throw new NativeReviewConsentBindingError("consent-invocation-answer-changed", "Native consent invocation answer binding changed");
 	return { arguments_, ...(lineageId === undefined ? {} : { lineageId }) };
 }
@@ -2370,6 +2373,8 @@ export class NativeReviewCliV216                            {
 		if (request.baseRef !== undefined && request.committedOnly !== true) throw new TypeError("Native START baseRef requires explicit committedOnly acknowledgement");
 		if (request.baseRef === undefined && request.committedOnly !== undefined) throw new TypeError("Native START committedOnly requires an explicit baseRef");
 		if (request.targetIdentity !== undefined && !/^sha256:[0-9a-f]{64}$/.test(request.targetIdentity)) throw new TypeError("Native START targetIdentity must be a canonical sha256 identity");
+		const agent = Object.prototype.hasOwnProperty.call(request, "agent") ? request.agent : "pi";
+		if (agent !== undefined && agent !== "pi") throw new TypeError("Native START agent is unsupported");
 		// STATUS owns the candidate binding and renders the only executable START
 		// vector. Callers may supply a previously observed identity only to detect
 		// drift; Pi never rebuilds that vector from request fields.
@@ -2381,7 +2386,7 @@ export class NativeReviewCliV216                            {
 			...(request.baseRef === undefined ? {} : { baseRef: request.baseRef }),
 			...(request.lineageId === undefined ? {} : { lineageId: request.lineageId }),
 			...selection,
-			agent: "pi",
+			...(agent === undefined ? {} : { agent }),
 			...(request.signal === undefined ? {} : { signal: request.signal }),
 		});
 		const transition = status.nextTransition?.kind === "execute" && status.nextTransition.execute?.operation === "review.start"
@@ -2410,7 +2415,7 @@ export class NativeReviewCliV216                            {
 			const consent = decode(NATIVE_REVIEW_OPERATION.START, true, () => (
 				execution.body.schema === "gentle-ai.review-integration.consent/v2"
 					? decodeReviewConsentV2(execution.body)
-					: decodeReviewConsentV3(execution.body, "pi")
+					: decodeReviewConsentV3(execution.body, agent)
 			));
 			if (consent.targetIdentity !== targetIdentity || consent.projection !== projection) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native consent target binding mismatch");
 			throw new NativeReviewConsentRequiredError(consent);

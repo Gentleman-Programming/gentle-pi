@@ -306,3 +306,15 @@ test("ordinary non-lifecycle STATUS inspection remains agent-less", async (t) =>
 	assert.deepEqual(agents, [undefined], "ordinary STATUS must retain its public agent-less route");
 	assert.equal(result.operation, "status");
 });
+
+test("a fresh controller provider instance probes the Pi transport again", async (t) => {
+	const cwd = repository(t);
+	const first = transportAwareNative({ refusePiAgent: true });
+	await runFinalize(cwd, first.native, "fresh-probe-lineage");
+	assert.equal(first.agents.filter((agent) => agent === "pi").length, 1);
+
+	const fresh = transportAwareNative({ refusePiAgent: true });
+	await runFinalize(cwd, fresh.native, "fresh-probe-lineage");
+	assert.equal(fresh.agents.filter((agent) => agent === "pi").length, 1,
+		"transport refusal caching must not leak across fresh controller provider instances");
+});

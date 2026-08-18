@@ -3509,7 +3509,7 @@ async function reconcileNativeMutationFailure(
 	error: unknown,
 	nativeReviewCli: NativeReviewCli,
 	target: Parameters<NonNullable<NativeReviewCli["targetStatus"]>>[0],
-	preOperationRevision?: string,
+	preOperationRevision?:
 	canonicalRetentionRoot = target.cwd,
 ): Promise<Record<string, unknown>> {
 	const failure = nativeOperationFailure(operation, error);
@@ -4157,6 +4157,24 @@ async function negotiatedStatusForHostTransport(
 	}
 }
 
+/**
+ * START first requests Pi's provider-issued transport. Unlike the immutable
+ * review relay, a typed unsupported-agent refusal may safely use the provider's
+ * agentless START route; the selected transport is retained for reconciliation.
+ */
+async function negotiatedStartStatus(
+	nativeReviewCli: NativeReviewCli,
+	request: NativeTargetStatusRequest,
+): Promise<{ status: ReviewStatusV3; agent: "pi" | undefined }> {
+	try {
+		return { status: await nativeReviewCli.targetStatus!({ ...request, agent: REVIEW_HOST_AGENT }), agent: REVIEW_HOST_AGENT };
+	} catch (error) {
+		const code = error instanceof NativeReviewIntegrationError ? error.failureEnvelope.code : undefined;
+		if (code === undefined || !REVIEW_TRANSPORT_REFUSAL_CODES.has(code)) throw error;
+		return { status: await nativeReviewCli.targetStatus!(request), agent: undefined };
+	}
+}
+
 type DispatchHydrationOutcome =
 	| { hydrated: true; lineage_id: string; lenses: readonly string[] }
 	| { hydrated: false; lineage_id: string; reason: string; message: string }
@@ -4478,10 +4496,11 @@ async function executeReviewControllerOperation(
 			const value = error as { mutationOutcome?: unknown };
 			if (value.mutationOutcome === "none") pending.cleanupCandidate();
 			return await reconcileNativeMutationFailure(parameters.operation, error, nativeReviewCli, {
-				cwd: pending.authorityCwd,
-				...(pending.candidateView.committedOnly ? { baseRef: pending.candidateView.baseCommit } : {}),
-				projection: "workspace",
-			});
+					cwd: pending.authorityCwd,
+					...(pending.candidateView.committedOnly ? { baseRef: pending.candidateView.baseCommit } : {}),
+					projection: "workspace",
+					...(pending.consent.schema === "gentle-ai.review-integration.consent/v3" && pending.consent.agent === REVIEW_HOST_AGENT ? { agent: REVIEW_HOST_AGENT } : {}),
+				});
 		}
 		if (input.answer === "granted") {
 			try {
@@ -4534,14 +4553,17 @@ async function executeReviewControllerOperation(
 			}
 			if (nativeReviewCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
 			let target: ReviewStatusV3;
+			let startAgent: "pi" | undefined;
 			try {
-				target = await nativeReviewCli.targetStatus({
+				const negotiated = await negotiatedStartStatus(nativeReviewCli, {
 					cwd: defaultCwd,
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 					...(canonicalBaseRef === undefined ? {} : { baseRef: canonicalBaseRef }),
 					...(untrackedSelection.untrackedScope === undefined ? {} : untrackedSelection),
 					...(signal === undefined ? {} : { signal }),
 				});
+				target = negotiated.status;
+				startAgent = negotiated.agent;
 				if (target.nextTransition?.kind === "collect" || target.applicability !== "unrelated" || target.action !== "start") return mapNativeTargetStatus(parameters.operation, target, parameters.lineageId);
 			} catch (error) {
 				return nativeOperationFailure(parameters.operation, error);
@@ -4569,6 +4591,7 @@ async function executeReviewControllerOperation(
 						targetIdentity: target.targetIdentity,
 						projection: target.projection.projection,
 						...(untrackedSelection.untrackedScope === undefined ? {} : untrackedSelection),
+						agent: startAgent,
 						...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 						...(policy.policyPath === undefined ? {} : { policyPath: policy.policyPath }),
 						...(focus === undefined ? {} : { focus }),
@@ -4648,6 +4671,7 @@ async function executeReviewControllerOperation(
 					...(canonicalBaseRef === undefined ? {} : { baseRef: candidateView?.baseCommit ?? canonicalBaseRef }),
 					...(untrackedSelection.untrackedScope === undefined ? {} : untrackedSelection),
 					projection: "workspace",
+					agent: startAgent,
 				});
 			}
 		}

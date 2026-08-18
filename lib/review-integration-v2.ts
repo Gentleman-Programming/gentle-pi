@@ -1893,19 +1893,21 @@ export function decodeReviewConsentV2(value: unknown): ReviewConsentV2 {
 // `agent` runtime binding. Ground truth is the captured envelope from a
 // 2.4.0-main binary (tests/fixtures/devbinary/consent-v3.captured.json) plus
 // gentle-ai main contracts/review-integration/v2/schemas/consent-v3.schema.json.
-// The choice-invocation shape deliberately stays the shared v2 pattern: the
-// published v3 schema demands an `--agent claude-code` token that the live
-// emitter omits when the caller declared no --agent, so the capture is
-// authoritative and Pi replays whichever provider-owned invocation arrived.
+// Agentless fallbacks retain the provider-owned invocation, while Pi-bound
+// envelopes must carry the provider-issued Pi binding exactly.
 export function decodeReviewConsentV3(value: unknown, expectedAgent?: ReviewConsentAgentV3): ReviewConsentV3 {
 	const body = exactRecord(value, "consent", [...CONSENT_KEYS_V2, "agent"]);
 	requireIdentity(body, "gentle-ai.review-integration.consent/v3", "review.start");
 	const agent = enumeration(body.agent, Object.values(REVIEW_CONSENT_AGENT_V3), "consent.agent") as ReviewConsentAgentV3;
 	if (expectedAgent !== undefined && agent !== expectedAgent) throw new TypeError("consent.agent does not match the expected runtime binding");
+	const semantics = decodeConsentSemantics(body);
+	if (agent === "pi" && semantics.choices.some((choice) => !choice.invocation.includes(" --agent pi "))) {
+		throw new TypeError("consent Pi invocation must bind agent");
+	}
 	return {
 		schema: "gentle-ai.review-integration.consent/v3",
 		agent,
-		...decodeConsentSemantics(body),
+		...semantics,
 		raw: body,
 	};
 }

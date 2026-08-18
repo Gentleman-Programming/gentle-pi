@@ -2272,8 +2272,8 @@ test("native START uses the default policy or a canonical safe policy path, and 
 	await controller.execute("default-policy", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
 	await controller.execute("custom-policy", { operation: "start", input: JSON.stringify({ mode: "ordinary", policyPath: ".gentle-ai/policies/team policy.json" }) }, undefined, undefined, context(cwd));
 	assert.deepEqual(requests, [
-		{ cwd, targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" },
-		{ cwd, policyPath, targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" },
+		{ cwd, agent: "pi", targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" },
+		{ cwd, agent: "pi", policyPath, targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" },
 	]);
 	for (const [input, outcome, reason] of [
 		[{ mode: "ordinary", policyHash: "legacy" }, "native-start-legacy-policy-hash-unsupported", "legacy-policy-hash-unsupported"],
@@ -2312,8 +2312,8 @@ test("native ordinary START forwards every allowed focus and leaves the native d
 	}
 	await controller.execute("default-focus", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
 	assert.deepEqual(requests, [
-		...(["risk", "resilience", "readability", "reliability"] as const).map((focus) => ({ cwd, focus, targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" as const })),
-		{ cwd, targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" },
+		...(["risk", "resilience", "readability", "reliability"] as const).map((focus) => ({ cwd, agent: "pi", focus, targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" as const })),
+		{ cwd, agent: "pi", targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" },
 	]);
 });
 
@@ -2472,7 +2472,7 @@ test("native START preserves the default dirty-inclusive candidate without base 
 	try {
 		assert.deepEqual(view.paths, ["app.ts", "untracked.ts"]);
 		assert.equal(view.committedOnly, false);
-		assert.deepEqual(requests, [{ cwd, targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" }]);
+		assert.deepEqual(requests, [{ cwd, agent: "pi", targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" }]);
 		const actorBinding = (started.details as { actor_binding: { workspace_root: string; candidate_root: string; candidate_tree: string; candidate_paths: readonly string[] } }).actor_binding;
 		assert.equal(actorBinding.workspace_root, cwd);
 		assert.equal(actorBinding.candidate_root, view.root);
@@ -2504,7 +2504,7 @@ test("native START binds an acknowledged committed range and native identity to 
 		assert.deepEqual(view.paths, ["committed-after-base.ts"]);
 		assert.equal(view.committedOnly, true);
 		assert.equal(view.baseCommit, baseCommit);
-		assert.deepEqual(requests, [{ cwd, baseRef: view.baseCommit, committedOnly: true, targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" }]);
+		assert.deepEqual(requests, [{ cwd, agent: "pi", baseRef: view.baseCommit, committedOnly: true, targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" }]);
 	} finally {
 		view.cleanup();
 	}
@@ -2541,7 +2541,7 @@ test("native START binds a default dirty-inclusive candidate on an unborn reposi
 		assert.deepEqual(view.paths, ["staged.txt", "untracked.ts"]);
 		// No baseRef is sent to native START: the unborn default uses the
 		// workspace projection only, exactly as the provider expects.
-		assert.deepEqual(requests, [{ cwd, targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" }]);
+		assert.deepEqual(requests, [{ cwd, agent: "pi", targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" }]);
 		const actorBinding = (started.details as { actor_binding: { workspace_root: string; candidate_root: string; candidate_tree: string; candidate_paths: readonly string[] } }).actor_binding;
 		assert.equal(actorBinding.workspace_root, cwd);
 		assert.equal(actorBinding.candidate_tree, view.candidateTree);
@@ -2719,7 +2719,7 @@ test("native START forwards an acknowledged base ref and rejects invalid values 
 		},
 	}));
 	await controller.execute("committed-base", { operation: "start", input: JSON.stringify({ mode: "ordinary", baseRef: "refs/heads/main", committedOnly: true }) }, undefined, undefined, context(cwd));
-	assert.deepEqual(requests, [{ cwd, baseRef: git(cwd, "rev-parse", "refs/heads/main"), committedOnly: true, targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" }]);
+	assert.deepEqual(requests, [{ cwd, agent: "pi", baseRef: git(cwd, "rev-parse", "refs/heads/main"), committedOnly: true, targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" }]);
 	for (const baseRef of ["", "   ", " origin/main", "origin/main ", "origin\0main", "origin\nmain", "origin\rmain", "origin\tmain", "origin\u007fmain", 42, [], {}]) {
 		const rejected = await controller.execute("invalid-base", { operation: "start", input: JSON.stringify({ mode: "ordinary", baseRef }) }, undefined, undefined, context(cwd));
 		assert.deepEqual(rejected.details, {

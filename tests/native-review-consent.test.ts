@@ -14,7 +14,7 @@ import {
 	NativeReviewCliV216 as RuntimeNativeReviewCliV216,
 	clearNativeReviewCapabilitiesCacheForTesting as clearRuntimeNativeReviewCapabilitiesCacheForTesting,
 } from "../runtime/native-review-cli.mjs";
-import type { ReviewConsentV2 } from "../lib/review-integration-v2.ts";
+import type { ReviewConsentV2, ReviewConsentV3 } from "../lib/review-integration-v2.ts";
 
 const fixtureRoot = join(process.cwd(), "contracts", "review-integration", "v2", "fixtures");
 const fixture = <T = Record<string, unknown>>(name: string): T => JSON.parse(readFileSync(join(fixtureRoot, name), "utf8")) as T;
@@ -338,6 +338,15 @@ test("declined consent decodes the provider's explicit empty authority fields wi
 const devbinaryFixtureRoot = join(process.cwd(), "tests", "fixtures", "devbinary");
 const devbinaryFixture = <T = Record<string, unknown>>(name: string): T => JSON.parse(readFileSync(join(devbinaryFixtureRoot, name), "utf8")) as T;
 
+function piConsent(): Record<string, unknown> {
+	const consent = devbinaryFixture<Record<string, unknown>>("consent-v3.captured.json");
+	consent.agent = "pi";
+	for (const choice of consent.choices as Array<Record<string, unknown>>) {
+		choice.invocation = String(choice.invocation).replace(" --consent ", " --agent pi --consent ");
+	}
+	return consent;
+}
+
 test("Pi START rejects a foreign consent/v3 envelope and only relays a Pi-bound clone", async () => {
 	const consent = devbinaryFixture<Record<string, unknown>>("consent-v3.captured.json");
 	const target = String(consent.target_identity);
@@ -353,14 +362,14 @@ test("Pi START rejects a foreign consent/v3 envelope and only relays a Pi-bound 
 			},
 		);
 		assert.deepEqual(foreignQueue.calls.at(-1), ["review", "start", ...tokens]);
-		const piConsent = { ...structuredClone(consent), agent: "pi" };
-		const piQueue = queuedAdapter([capabilities(), executableStartStatus(target), piConsent]);
+		const piBoundConsent = piConsent();
+		const piQueue = queuedAdapter([capabilities(), executableStartStatus(target), piBoundConsent]);
 		await assert.rejects(
 			() => createClient(piQueue.adapter).start({ cwd: "/repo" }),
 			(error: unknown) => {
 				assert.equal((error as { name?: string }).name, "NativeReviewConsentRequiredError");
 				const required = error as { consent: { raw: Record<string, unknown>; schema: string; targetIdentity: string; agent?: string } };
-				assert.deepEqual(required.consent.raw, piConsent);
+				assert.deepEqual(required.consent.raw, piBoundConsent);
 				assert.equal(required.consent.schema, "gentle-ai.review-integration.consent/v3");
 				assert.equal(required.consent.targetIdentity, target);
 				assert.equal(required.consent.agent, "pi");
@@ -400,4 +409,22 @@ test("a declined consent/v3 answer accepts the captured declined result and crea
 	assert.ok(result.kind === "declined");
 	assert.equal(result.consent, "declined_this_candidate");
 	assert.equal(result.targetIdentity, decoded.targetIdentity);
+});
+
+test("Pi granted and declined consent replay the provider-issued agent invocation once", async () => {
+	const decoded = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV3(piConsent()) as ReviewConsentV3;
+	const cwd = decoded.choices[0].invocation.split(" --cwd ")[1]!.split(" ")[0]!;
+	const started = devbinaryFixture<Record<string, unknown>>("start-v3-consent-granted.captured.json");
+	const grantedQueue = queuedAdapter([capabilities(), started]);
+	const granted = await client(grantedQueue.adapter).answerConsent!({ cwd, consent: decoded, answer: "granted" });
+	assert.equal(granted.kind, "started");
+	assert.deepEqual(grantedQueue.calls.at(-1), decoded.choices[0].invocation.split(" ").slice(1));
+	assert.equal(grantedQueue.calls.filter((arguments_) => arguments_.includes("--agent") && arguments_.includes("pi")).length, 1);
+
+	const declined = devbinaryFixture<Record<string, unknown>>("start-v3-consent-declined.captured.json");
+	const declinedQueue = queuedAdapter([capabilities(), declined]);
+	const declinedResult = await client(declinedQueue.adapter).answerConsent!({ cwd, consent: decoded, answer: "declined" });
+	assert.equal(declinedResult.kind, "declined");
+	assert.deepEqual(declinedQueue.calls.at(-1), decoded.choices[1].invocation.split(" ").slice(1));
+	assert.equal(declinedQueue.calls.filter((arguments_) => arguments_.includes("--agent") && arguments_.includes("pi")).length, 1);
 });

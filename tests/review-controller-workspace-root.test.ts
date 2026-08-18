@@ -305,7 +305,7 @@ test("START freezes the candidate from the explicit workspace root and returns t
 	const view = candidateViews.resolveForLens("worktree-lineage", "review-reliability");
 	assert.equal(details.actor_binding.candidate_root, view.root);
 	assert.equal(details.actor_binding.candidate_tree, view.candidateTree);
-	assert.deepEqual(startRequests, [{ cwd: root, targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" }]);
+	assert.deepEqual(startRequests, [{ cwd: root, agent: "pi", targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" }]);
 	assert.notEqual(startRequests[0]?.cwd, view.root);
 	assert.equal(readFileSync(join(view.root, "app.ts"), "utf8"), "export const value = 2; // worktree candidate\n");
 	assert.equal(view.paths.includes("unrelated.ts"), false);
@@ -343,7 +343,7 @@ test("an omitted workspaceRoot canonicalizes a nested same-worktree session befo
 	assert.equal(details.actor_binding.workspace_root, root);
 	assert.equal((status.details as { workspace_root: string }).workspace_root, root);
 	assert.deepEqual(details.actor_binding.candidate_paths, ["app.ts"]);
-	assert.deepEqual(startRequests, [{ cwd: root, targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" }]);
+	assert.deepEqual(startRequests, [{ cwd: root, agent: "pi", targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" }]);
 	const view = candidateViews.resolveForLens("session-lineage", "review-reliability");
 	assert.equal(details.actor_binding.candidate_root, view.root);
 	const finalized = await controller.execute("finalize-session", { operation: "finalize", lineageId: "session-lineage", input: JSON.stringify({}) }, undefined, undefined, ctx);

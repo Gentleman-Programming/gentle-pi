@@ -143,7 +143,7 @@ test("START precondition ignores released lock residue and still blocks on live 
 	const proceeded = await runtime(fakeNative(nativeStatus(cwd, "clean", [RELEASED_LOCK]), (request) => { startRequests.push(request); }))
 		.execute("start-released", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, context(cwd));
 	const proceededDetails = proceeded.details as Record<string, unknown>;
-	assert.deepEqual(startRequests, [{ cwd, targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" }]);
+	assert.deepEqual(startRequests, [{ cwd, agent: "pi", targetIdentity: `sha256:${"a".repeat(64)}`, projection: "workspace" }]);
 	assert.equal((proceededDetails.result as Record<string, unknown>).lineage_id, "native-lineage");
 	assert.notEqual(proceededDetails.outcome, "native-authority-lock-present");
 

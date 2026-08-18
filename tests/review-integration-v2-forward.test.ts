@@ -448,6 +448,23 @@ test("the generic consent/v3 decoder accepts every runtime while a Pi-bound deco
 	}
 });
 
+test("Pi consent/v3 requires provider-issued Pi invocation bindings", () => {
+	const piConsent = clone(fixture<JsonObject>("consent-v3.captured.json"));
+	piConsent.agent = "pi";
+	for (const choice of piConsent.choices as JsonObject[]) {
+		choice.invocation = String(choice.invocation).replace(" --consent ", " --agent pi --consent ");
+	}
+	const decoded = decodeReviewConsentV3(piConsent);
+	assert.equal(decoded.agent, "pi");
+	assert.ok(decoded.choices.every((choice) => choice.invocation.includes(" --agent pi ")));
+
+	const missingInvocationBinding = clone(piConsent);
+	for (const choice of missingInvocationBinding.choices as JsonObject[]) {
+		choice.invocation = String(choice.invocation).replace(" --agent pi", "");
+	}
+	assert.throws(() => decodeReviewConsentV3(missingInvocationBinding), /agent/);
+});
+
 test("consent identities never cross-decode", () => {
 	const v3 = fixture<JsonObject>("consent-v3.captured.json");
 	const v2 = v2Fixture<JsonObject>("consent.fixture.json");
