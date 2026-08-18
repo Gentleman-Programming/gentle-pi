@@ -4671,7 +4671,7 @@ async function executeReviewControllerOperation(
 					...(canonicalBaseRef === undefined ? {} : { baseRef: candidateView?.baseCommit ?? canonicalBaseRef }),
 					...(untrackedSelection.untrackedScope === undefined ? {} : untrackedSelection),
 					projection: "workspace",
-					agent: startAgent,
+					...(startAgent === undefined ? {} : { agent: startAgent }),
 				});
 			}
 		}
