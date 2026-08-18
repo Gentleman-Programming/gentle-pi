@@ -5177,7 +5177,7 @@ async function reconcileNativeMutationFailure(
 	operation: ReviewControllerOperation,
 	error: unknown,
 	nativeReviewCli: NativeReviewCli,
-	target: { cwd: string; lineageId?: string; baseRef?: string; projection?: "workspace" | "staged" },
+	target: { cwd: string; lineageId?: string; baseRef?: string; projection?: "workspace" | "staged"; agent?: "pi" },
 	preOperationRevision?: string,
 ): Promise<Record<string, unknown>> {
 	const failure = nativeOperationFailure(operation, error);
@@ -6085,10 +6085,11 @@ async function executeReviewControllerOperation(
 			const value = error as { mutationOutcome?: unknown };
 			if (value.mutationOutcome === "none") candidateViews?.cleanup(pending.candidateView.token);
 			return await reconcileNativeMutationFailure(parameters.operation, error, nativeReviewCli, {
-				cwd: pending.authorityCwd,
-				...(pending.candidateView.committedOnly ? { baseRef: pending.candidateView.baseCommit } : {}),
-				projection: "workspace",
-			});
+					cwd: pending.authorityCwd,
+					...(pending.candidateView.committedOnly ? { baseRef: pending.candidateView.baseCommit } : {}),
+					projection: "workspace",
+					...(pending.consent.schema === "gentle-ai.review-integration.consent/v3" && pending.consent.agent === REVIEW_HOST_AGENT ? { agent: REVIEW_HOST_AGENT } : {}),
+				});
 		}
 		if (input.answer === "granted") {
 			try {
@@ -6138,13 +6139,16 @@ async function executeReviewControllerOperation(
 			}
 			if (nativeReviewCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
 			let target: ReviewStatusV3;
+			let startAgent: "pi" | undefined;
 			try {
-				target = await nativeReviewCli.targetStatus({
+				const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
 					cwd: defaultCwd,
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 					...(canonicalBaseRef === undefined ? {} : { baseRef: canonicalBaseRef }),
 					...(signal === undefined ? {} : { signal }),
 				});
+				target = negotiated.status;
+				startAgent = negotiated.transport === undefined ? REVIEW_HOST_AGENT : undefined;
 				if (target.applicability !== "unrelated" || target.action !== "start") return mapNativeTargetStatus(parameters.operation, target, parameters.lineageId);
 			} catch (error) {
 				return nativeOperationFailure(parameters.operation, error);
@@ -6171,6 +6175,7 @@ async function executeReviewControllerOperation(
 							: { baseRef: candidateView?.baseCommit ?? canonicalBaseRef, committedOnly: true }),
 						targetIdentity: target.targetIdentity,
 						projection: target.projection.projection,
+						...(startAgent === undefined ? {} : { agent: startAgent }),
 						...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 						...(policy.policyPath === undefined ? {} : { policyPath: policy.policyPath }),
 						...(focus === undefined ? {} : { focus }),

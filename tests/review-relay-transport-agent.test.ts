@@ -247,3 +247,15 @@ test("the pi transport is probed once per provider and the refusal is remembered
 	assert.equal(afterFirst, 1, "the first flow probes the pi transport exactly once");
 	assert.equal(afterSecond, 1, "a remembered refusal is never re-probed for the same provider");
 });
+
+test("a fresh controller provider instance probes the Pi transport again", async (t) => {
+	const cwd = repository(t);
+	const first = transportAwareNative({ refusePiAgent: true });
+	await runFinalize(cwd, first.native, "fresh-probe-lineage");
+	assert.equal(first.agents.filter((agent) => agent === "pi").length, 1);
+
+	const fresh = transportAwareNative({ refusePiAgent: true });
+	await runFinalize(cwd, fresh.native, "fresh-probe-lineage");
+	assert.equal(fresh.agents.filter((agent) => agent === "pi").length, 1,
+		"transport refusal caching must not leak across fresh controller provider instances");
+});
