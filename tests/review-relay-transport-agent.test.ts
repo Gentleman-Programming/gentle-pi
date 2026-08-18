@@ -154,6 +154,81 @@ async function runFinalize(cwd: string, native: NativeReviewCli, lineageId: stri
 	) as Record<string, unknown>;
 }
 
+function startStatus(lineageId: string): ReviewStatusV3 {
+	return {
+		...recoveredStatus(lineageId, false),
+		applicability: "unrelated",
+		action: "start",
+	} as ReviewStatusV3;
+}
+
+function ambiguousStartFailureNative(options: { refusePiAgent?: boolean } = {}): { native: NativeReviewCli; calls: Array<{ operation: "start" | "status"; agent: string | undefined }> } {
+	const calls: Array<{ operation: "start" | "status"; agent: string | undefined }> = [];
+	const native = {
+		targetStatus: async (request: { lineageId?: string; agent?: string }) => {
+			calls.push({ operation: "status", agent: request.agent });
+			if (request.agent === "pi" && options.refusePiAgent === true) {
+				throw new NativeReviewIntegrationError({
+					schema: "gentle-ai.review-integration.failure/v2",
+					contract: "gentle-ai.review-integration/v2",
+					operation: "review.status",
+					phase: "pre_native",
+					code: TRANSPORT_REFUSAL_CODE,
+					message: "supported immutable review runtimes: claude-code, opencode, codex",
+					mutationOutcome: "none",
+					authorityApplicability: "current_target",
+					retrySafe: true,
+					replayability: "not_replayable",
+					nextAction: "stop",
+					raw: {},
+				} as never);
+			}
+			return startStatus(request.lineageId ?? "start-lineage");
+		},
+		start: async (request: { agent?: string }) => {
+			calls.push({ operation: "start", agent: request.agent });
+			throw new Error("ambiguous native START failure");
+		},
+	} as unknown as NativeReviewCli;
+	return { native, calls };
+}
+
+async function runAmbiguousStart(cwd: string, native: NativeReviewCli, lineageId: string): Promise<Record<string, unknown>> {
+	return await __testing.executeReviewControllerOperation(
+		{ operation: "start", input: JSON.stringify({ mode: "ordinary" }), lineageId },
+		cwd, new Map(), native, undefined, undefined, undefined, null,
+	) as Record<string, unknown>;
+}
+
+test("START reconciliation preserves the negotiated pi transport after an ambiguous failure", async (t) => {
+	const cwd = repository(t);
+	const { native, calls } = ambiguousStartFailureNative();
+
+	const result = await runAmbiguousStart(cwd, native, "start-pi-lineage");
+
+	assert.deepEqual(calls, [
+		{ operation: "status", agent: "pi" },
+		{ operation: "start", agent: "pi" },
+		{ operation: "status", agent: "pi" },
+	]);
+	assert.equal(result.outcome, "native-mutation-status-reconciled");
+});
+
+test("START reconciliation remains agent-less after a typed pi transport refusal", async (t) => {
+	const cwd = repository(t);
+	const { native, calls } = ambiguousStartFailureNative({ refusePiAgent: true });
+
+	const result = await runAmbiguousStart(cwd, native, "start-legacy-lineage");
+
+	assert.deepEqual(calls, [
+		{ operation: "status", agent: "pi" },
+		{ operation: "status", agent: undefined },
+		{ operation: "start", agent: undefined },
+		{ operation: "status", agent: undefined },
+	]);
+	assert.equal(result.outcome, "native-mutation-status-reconciled");
+});
+
 test("the negotiated status asks for the pi agent so the provider offers its materialize relay slot", async (t) => {
 	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
 	const cwd = repository(t);

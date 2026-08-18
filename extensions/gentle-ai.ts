@@ -6226,6 +6226,7 @@ async function executeReviewControllerOperation(
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 					...(canonicalBaseRef === undefined ? {} : { baseRef: candidateView?.baseCommit ?? canonicalBaseRef }),
 					projection: "workspace",
+					...(startAgent === undefined ? {} : { agent: startAgent }),
 				});
 			}
 		}
