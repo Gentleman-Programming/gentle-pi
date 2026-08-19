@@ -154,6 +154,81 @@ async function runFinalize(cwd: string, native: NativeReviewCli, lineageId: stri
 	) as Record<string, unknown>;
 }
 
+function startStatus(lineageId: string): ReviewStatusV3 {
+	return {
+		...recoveredStatus(lineageId, false),
+		applicability: "unrelated",
+		action: "start",
+	} as ReviewStatusV3;
+}
+
+function ambiguousStartFailureNative(options: { refusePiAgent?: boolean } = {}): { native: NativeReviewCli; calls: Array<{ operation: "start" | "status"; agent: string | undefined }> } {
+	const calls: Array<{ operation: "start" | "status"; agent: string | undefined }> = [];
+	const native = {
+		targetStatus: async (request: { lineageId?: string; agent?: string }) => {
+			calls.push({ operation: "status", agent: request.agent });
+			if (request.agent === "pi" && options.refusePiAgent === true) {
+				throw new NativeReviewIntegrationError({
+					schema: "gentle-ai.review-integration.failure/v2",
+					contract: "gentle-ai.review-integration/v2",
+					operation: "review.status",
+					phase: "pre_native",
+					code: TRANSPORT_REFUSAL_CODE,
+					message: "supported immutable review runtimes: claude-code, opencode, codex",
+					mutationOutcome: "none",
+					authorityApplicability: "current_target",
+					retrySafe: true,
+					replayability: "not_replayable",
+					nextAction: "stop",
+					raw: {},
+				} as never);
+			}
+			return startStatus(request.lineageId ?? "start-lineage");
+		},
+		start: async (request: { agent?: string }) => {
+			calls.push({ operation: "start", agent: request.agent });
+			throw new Error("ambiguous native START failure");
+		},
+	} as unknown as NativeReviewCli;
+	return { native, calls };
+}
+
+async function runAmbiguousStart(cwd: string, native: NativeReviewCli, lineageId: string): Promise<Record<string, unknown>> {
+	return await __testing.executeReviewControllerOperation(
+		{ operation: "start", input: JSON.stringify({ mode: "ordinary" }), lineageId },
+		cwd, new Map(), native, undefined, undefined, undefined, null,
+	) as Record<string, unknown>;
+}
+
+test("START reconciliation preserves the negotiated pi transport after an ambiguous failure", async (t) => {
+	const cwd = repository(t);
+	const { native, calls } = ambiguousStartFailureNative();
+
+	const result = await runAmbiguousStart(cwd, native, "start-pi-lineage");
+
+	assert.deepEqual(calls, [
+		{ operation: "status", agent: "pi" },
+		{ operation: "start", agent: "pi" },
+		{ operation: "status", agent: "pi" },
+	]);
+	assert.equal(result.outcome, "native-mutation-status-reconciled");
+});
+
+test("START reconciliation remains agent-less after a typed pi transport refusal", async (t) => {
+	const cwd = repository(t);
+	const { native, calls } = ambiguousStartFailureNative({ refusePiAgent: true });
+
+	const result = await runAmbiguousStart(cwd, native, "start-legacy-lineage");
+
+	assert.deepEqual(calls, [
+		{ operation: "status", agent: "pi" },
+		{ operation: "status", agent: undefined },
+		{ operation: "start", agent: undefined },
+		{ operation: "status", agent: undefined },
+	]);
+	assert.equal(result.outcome, "native-mutation-status-reconciled");
+});
+
 test("the negotiated status asks for the pi agent so the provider offers its materialize relay slot", async (t) => {
 	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
 	const cwd = repository(t);
@@ -246,4 +321,16 @@ test("the pi transport is probed once per provider and the refusal is remembered
 	const afterSecond = agents.filter((agent) => agent === "pi").length;
 	assert.equal(afterFirst, 1, "the first flow probes the pi transport exactly once");
 	assert.equal(afterSecond, 1, "a remembered refusal is never re-probed for the same provider");
+});
+
+test("a fresh controller provider instance probes the Pi transport again", async (t) => {
+	const cwd = repository(t);
+	const first = transportAwareNative({ refusePiAgent: true });
+	await runFinalize(cwd, first.native, "fresh-probe-lineage");
+	assert.equal(first.agents.filter((agent) => agent === "pi").length, 1);
+
+	const fresh = transportAwareNative({ refusePiAgent: true });
+	await runFinalize(cwd, fresh.native, "fresh-probe-lineage");
+	assert.equal(fresh.agents.filter((agent) => agent === "pi").length, 1,
+		"transport refusal caching must not leak across fresh controller provider instances");
 });

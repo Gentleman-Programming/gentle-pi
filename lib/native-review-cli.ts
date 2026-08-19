@@ -481,7 +481,7 @@ export interface NativeReviewVerificationEvidenceV2 {
 	recordDigest: string;
 }
 
-export interface NativeStartRequest { cwd: string; baseRef?: string; committedOnly?: boolean; lineageId?: string; policyPath?: string; focus?: string; targetIdentity?: string; projection?: "workspace" | "staged"; signal?: AbortSignal; }
+export interface NativeStartRequest { cwd: string; baseRef?: string; committedOnly?: boolean; lineageId?: string; policyPath?: string; focus?: string; targetIdentity?: string; projection?: "workspace" | "staged"; agent?: "pi"; signal?: AbortSignal; }
 export const NATIVE_REVIEW_CONSENT_ANSWER = { GRANTED: "granted", DECLINED: "declined" } as const;
 export type NativeReviewConsentAnswer = (typeof NATIVE_REVIEW_CONSENT_ANSWER)[keyof typeof NATIVE_REVIEW_CONSENT_ANSWER];
 export interface NativeReviewConsentAnswerRequest { cwd: string; consent: ReviewConsentEnvelope; answer: NativeReviewConsentAnswer; signal?: AbortSignal; }
@@ -2039,6 +2039,9 @@ function consentInvocationArguments(request: NativeReviewConsentAnswerRequest): 
 	if (exactConsentOption(arguments_, "--target") !== request.consent.targetIdentity) throw new NativeReviewConsentBindingError("consent-invocation-target-changed", "Native consent invocation target binding changed");
 	if (exactConsentOption(arguments_, "--projection") !== request.consent.projection) throw new NativeReviewConsentBindingError("consent-invocation-projection-changed", "Native consent invocation projection binding changed");
 	const lineageId = optionalConsentLineageOption(arguments_);
+	if (request.consent.schema === "gentle-ai.review-integration.consent/v3" && request.consent.agent === "pi" && exactConsentOption(arguments_, "--agent") !== "pi") {
+		throw new NativeReviewConsentBindingError("consent-invocation-agent-changed", "Native Pi consent invocation agent binding changed");
+	}
 	if (exactConsentOption(arguments_, "--consent") !== request.answer || arguments_.at(-1) !== request.answer) throw new NativeReviewConsentBindingError("consent-invocation-answer-changed", "Native consent invocation answer binding changed");
 	return { arguments_, ...(lineageId === undefined ? {} : { lineageId }) };
 }
@@ -2278,6 +2281,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		if (request.baseRef !== undefined && request.committedOnly !== true) throw new TypeError("Native START baseRef requires explicit committedOnly acknowledgement");
 		if (request.baseRef === undefined && request.committedOnly !== undefined) throw new TypeError("Native START committedOnly requires an explicit baseRef");
 		if (request.targetIdentity !== undefined && !/^sha256:[0-9a-f]{64}$/.test(request.targetIdentity)) throw new TypeError("Native START targetIdentity must be a canonical sha256 identity");
+		if (request.agent !== undefined && request.agent !== "pi") throw new TypeError("Native START agent is unsupported");
 		// The controller supplies the target it already projected from the
 		// authority workspace after proving its immutable actor view is identical.
 		// Direct adapter callers may omit it and retain the same-root projection.
@@ -2287,11 +2291,13 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 			projection,
 			...(request.baseRef === undefined ? {} : { baseRef: request.baseRef }),
 			...(request.lineageId === undefined ? {} : { lineageId: request.lineageId }),
+			...(request.agent === undefined ? {} : { agent: request.agent }),
 			...(request.signal === undefined ? {} : { signal: request.signal }),
 		})).targetIdentity;
 		const execution = await this.negotiated(NATIVE_REVIEW_OPERATION.START, request.cwd, [
 			"review", "start", "--contract", REVIEW_INTEGRATION_CONTRACT, "--cwd", request.cwd,
 			"--target", targetIdentity, "--projection", projection,
+			...(request.agent === undefined ? [] : ["--agent", request.agent]),
 			...(request.baseRef === undefined ? [] : ["--base-ref", request.baseRef, "--committed-only"]),
 			...(request.lineageId === undefined ? [] : ["--lineage", request.lineageId]),
 			...(request.policyPath === undefined ? [] : ["--policy", request.policyPath]),
@@ -2313,6 +2319,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 					: decodeReviewConsentV3(execution.body)
 			));
 			if (consent.targetIdentity !== targetIdentity || consent.projection !== projection) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native consent target binding mismatch");
+			if (request.agent !== undefined && consent.schema === "gentle-ai.review-integration.consent/v3" && consent.agent !== request.agent) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native consent agent binding mismatch");
 			throw new NativeReviewConsentRequiredError(consent);
 		}
 		const result = decode(NATIVE_REVIEW_OPERATION.START, true, () => decodeReviewStartV3(execution.body));

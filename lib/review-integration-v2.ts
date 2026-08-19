@@ -568,7 +568,7 @@ export interface ReviewConsentV2 {
 // consumers of either identity read one structural surface.
 export interface ReviewConsentV3 extends Omit<ReviewConsentV2, "schema"> {
 	schema: "gentle-ai.review-integration.consent/v3";
-	agent: "claude-code";
+	agent: "claude-code" | "pi";
 }
 
 // Either accepted consent identity. Consumers that relay the envelope (rather
@@ -1766,22 +1766,21 @@ export function decodeReviewConsentV2(value: unknown): ReviewConsentV2 {
 	};
 }
 
-// consent/v3 (gentle-ai >= 2.3.0): the v2 surface plus the required, fixed
-// `agent` runtime binding. Ground truth is the captured envelope from a
-// 2.4.0-main binary (tests/fixtures/devbinary/consent-v3.captured.json) plus
-// gentle-ai main contracts/review-integration/v2/schemas/consent-v3.schema.json.
-// The choice-invocation shape deliberately stays the shared v2 pattern: the
-// published v3 schema demands an `--agent claude-code` token that the live
-// emitter omits when the caller declared no --agent, so the capture is
-// authoritative and Pi replays whichever provider-owned invocation arrived.
+// consent/v3 (gentle-ai >= 2.3.0): the v2 surface plus the required runtime
+// binding. Historical agentless Claude invocations remain compatible with their
+// captured envelope; Pi invocations are provider-issued and must bind Pi exactly.
 export function decodeReviewConsentV3(value: unknown): ReviewConsentV3 {
 	const body = exactRecord(value, "consent", [...CONSENT_KEYS_V2, "agent"]);
 	requireIdentity(body, "gentle-ai.review-integration.consent/v3", "review.start");
-	if (body.agent !== "claude-code") throw new TypeError("consent.agent must be claude-code");
+	if (body.agent !== "claude-code" && body.agent !== "pi") throw new TypeError("consent.agent is unsupported");
+	const semantics = decodeConsentSemantics(body);
+	if (body.agent === "pi" && semantics.choices.some((choice) => !choice.invocation.includes(" --agent pi "))) {
+		throw new TypeError("consent Pi invocation must bind agent");
+	}
 	return {
 		schema: "gentle-ai.review-integration.consent/v3",
-		agent: "claude-code",
-		...decodeConsentSemantics(body),
+		agent: body.agent,
+		...semantics,
 		raw: body,
 	};
 }
