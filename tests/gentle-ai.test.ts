@@ -300,3 +300,104 @@ test("runtime lifecycle gates reject fabricated metadata while compound and wrap
 	assert.match(destructive?.reason ?? "", /safety policy blocked a destructive shell command/i);
 	assert.doesNotMatch(destructive?.reason ?? "", /approved receipt/i);
 });
+
+test("intercom project panes require one exact session-scoped authorization", async (t) => {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-pane-guard-"));
+	const authorizedCwd = join(root, "authorized");
+	const otherCwd = join(root, "other");
+	mkdirSync(authorizedCwd);
+	mkdirSync(otherCwd);
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+
+	const handlers = new Map<string, (...args: any[]) => unknown>();
+	const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
+	const notifications: Array<{ message: string; level: string }> = [];
+	const pi = {
+		on(name: string, handler: (...args: any[]) => unknown) {
+			handlers.set(name, handler);
+		},
+		registerCommand(name: string, command: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) {
+			commands.set(name, command);
+		},
+		registerTool() {},
+	} as unknown as ExtensionAPI;
+	createGentleAiExtension({ nativeReviewCli: null })(pi);
+
+	const toolCall = handlers.get("tool_call") as (
+		event: { toolName: string; input: unknown },
+		ctx: ExtensionContext,
+	) => Promise<ToolCallEventResult | undefined>;
+	const command = commands.get("gentle:allow-project-pane-once");
+	assert.ok(command);
+	const session = (id: string) => ({
+		cwd: root,
+		hasUI: true,
+		sessionManager: { getSessionId: () => id },
+		ui: { notify: (message: string, level: string) => notifications.push({ message, level }) },
+	}) as unknown as ExtensionContext;
+	const owner = session("owner-session");
+	const otherSession = session("other-session");
+	const paneCall = (action: "send" | "ask", cwd: unknown = authorizedCwd) => toolCall(
+		{ toolName: "intercom", input: { action, cwd, openProjectPaneIfMissing: true } },
+		owner,
+	);
+
+	for (const action of ["send", "ask"] as const) {
+		const blocked = await paneCall(action);
+		assert.equal(blocked?.block, true);
+		assert.match(blocked?.reason ?? "", /allow-project-pane-once/i);
+	}
+	assert.equal(await toolCall({ toolName: "intercom", input: { action: "send", cwd: authorizedCwd, openProjectPaneIfMissing: false } }, owner), undefined);
+	assert.equal(await toolCall({ toolName: "intercom", input: { action: "send", cwd: authorizedCwd } }, owner), undefined);
+	assert.equal(await toolCall({ toolName: "intercom", input: { action: "list", openProjectPaneIfMissing: true } }, owner), undefined);
+	assert.equal(await toolCall({ toolName: "read", input: { action: "send", cwd: authorizedCwd, openProjectPaneIfMissing: true } }, owner), undefined);
+	for (const input of [
+		{ action: "send", openProjectPaneIfMissing: true },
+		{ action: "send", cwd: "", openProjectPaneIfMissing: true },
+		{ action: "send", cwd: 42, openProjectPaneIfMissing: true },
+	]) {
+		const blocked = await toolCall({ toolName: "intercom", input }, owner);
+		assert.equal(blocked?.block, true);
+		assert.match(blocked?.reason ?? "", /cwd/i);
+	}
+
+	await command!.handler("", owner);
+	await command!.handler("relative-path", owner);
+	assert.match(notifications.at(-1)?.message ?? "", /absolute/i);
+	await command!.handler(`${authorizedCwd}/.`, owner);
+	assert.match(notifications.at(-1)?.message ?? "", /one intercom pane creation/i);
+	assert.equal(await paneCall("send"), undefined);
+	assert.equal((await paneCall("ask"))?.block, true, "authorization is consumed before execution");
+
+	await command!.handler(authorizedCwd, owner);
+	assert.equal(await paneCall("ask"), undefined, "one authorization also permits ask");
+	assert.equal((await paneCall("send"))?.block, true, "ask consumes authorization before execution");
+
+	await command!.handler(authorizedCwd, owner);
+	assert.equal((await paneCall("send", otherCwd))?.block, true, "mismatched cwd remains blocked");
+	assert.equal(await paneCall("send"), undefined, "mismatch does not consume matching authorization");
+
+	await command!.handler(authorizedCwd, owner);
+	const wrongSession = await toolCall(
+		{ toolName: "intercom", input: { action: "send", cwd: authorizedCwd, openProjectPaneIfMissing: true } },
+		otherSession,
+	);
+	assert.equal(wrongSession?.block, true);
+	assert.equal(await paneCall("send"), undefined, "wrong session does not consume owner authorization");
+
+	await command!.handler(authorizedCwd, owner);
+	const shutdown = handlers.get("session_shutdown");
+	assert.equal(typeof shutdown, "function");
+	await shutdown!({}, owner);
+	assert.equal((await paneCall("send"))?.block, true, "session shutdown invalidates authorization");
+});
+
+test("orchestrator policy forbids automatic pane fallbacks and documents the one-shot command", () => {
+	const policy = readFileSync("assets/orchestrator-delegation.md", "utf8");
+	const renderedPrompt = __testing.buildGentlePrompt("gentleman", process.cwd(), ["subagent_run"]);
+	for (const content of [policy, renderedPrompt]) {
+		assert.doesNotMatch(content, /openProjectPaneIfMissing\s*:\s*true/);
+		assert.match(content, /never open.*visible.*pane.*automatic/i);
+		assert.match(content, /gentle:allow-project-pane-once <cwd>/);
+	}
+});

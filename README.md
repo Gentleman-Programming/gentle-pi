@@ -598,6 +598,7 @@ Legacy string entries are still accepted and treated as `model`-only config.
 | `/gentle:models`                 | Opens global model + effort assignment UI. Press `x` to export and `r` to restore saved routing. |
 | `/gentle:persona`                | Switches global persona mode, with project override support.        |
 | `/gentle:background-subagents`   | Shows or sets the managed background-subagents policy (`status\|enable\|disable`), naming the source that decided it. |
+| `/gentle:allow-project-pane-once <cwd>` | Authorizes one matching intercom send or ask to open a missing project pane for an exact absolute cwd in the current session. |
 | `/gentle:banner`                 | Configures startup banner rose, text logo, and color preset.        |
 | `/gentle:toggle-rose`            | Toggles the startup rose.                                           |
 | `/gentle:toggle-text-logo`       | Toggles the startup text logo.                                      |
@@ -632,6 +633,10 @@ Four sources can decide the policy, and the first hit wins:
 Both files use the strict shape `{"schema":"gentle-pi.background-subagents/v1","policy":"on"}`. A file that is present but malformed fails closed to `off` and is **not** skipped in favor of a lower-priority source, so a typo in the project file disables background subagents rather than silently handing the decision to the global file. The command reports that case as a warning instead of an ordinary `off`.
 
 Because the project file outranks the global one, `enable` still writes the global file but reports plainly when a project file keeps the effective policy unchanged. The resolved capability (`ready` or `absent`) reports whether `subagent_run` is actually callable in this session; a policy of `on` with capability `absent` means the subagents package is not installed.
+
+### One-shot project-pane authorization
+
+Automatic delegation never opens a visible project pane. For an explicit persistent peer conversation, the owner may run `/gentle:allow-project-pane-once <absolute-cwd>`. The authorization is session-local, bound to that normalized cwd, consumed before the next matching intercom `send` or `ask` runs, and cleared on session shutdown. A failed intercom call does not restore it.
 
 Startup banner settings are global and default to the current pink rose + text logo. Supported color presets are `pink`, `cyan`, `yellow`, and `green`.
 

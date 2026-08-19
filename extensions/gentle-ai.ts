@@ -680,6 +680,7 @@ Harness principles:
 - If tests exist, use strict TDD evidence: RED, GREEN, TRIANGULATE, REFACTOR.
 - Protect the human reviewer: avoid oversized changes, surface review workload risk, and ask before turning one task into a large multi-area change.
 - Never claim persistent memory is available because of this package. Memory is provided by separate packages or MCP tools when installed and callable.
+- Never open a visible project pane as an automatic delegation, retry, remediation, verification, or cross-worktree fallback. An explicit persistent peer conversation requires ${PROJECT_PANE_AUTHORIZATION_COMMAND} first and consumes one matching intercom send or ask authorization in the owner session.
 
 ${getOrchestratorPrompt(cwd, activeTools)}`;
 }
@@ -1119,6 +1120,84 @@ async function confirmCommand(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+type ProjectPaneAuthorization = {
+	sessionId: string;
+	cwd: string;
+};
+
+type ProjectPaneAuthorizationDecision = {
+	blocked?: ToolCallEventResult;
+	consume: boolean;
+};
+
+const PROJECT_PANE_AUTHORIZATION_COMMAND = "/gentle:allow-project-pane-once <cwd>";
+
+function normalizeProjectPaneCwd(value: unknown): string | undefined {
+	if (typeof value !== "string" || value.trim().length === 0 || !isAbsolute(value)) return undefined;
+	try {
+		const cwd = realpathSync(value);
+		return lstatSync(cwd).isDirectory() ? cwd : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function sessionIdForProjectPaneAuthorization(ctx: ExtensionContext): string | undefined {
+	try {
+		const sessionId = ctx.sessionManager.getSessionId();
+		return typeof sessionId === "string" && sessionId.length > 0 ? sessionId : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function evaluateProjectPaneAuthorization(
+	input: unknown,
+	sessionId: string | undefined,
+	authorization: ProjectPaneAuthorization | undefined,
+): ProjectPaneAuthorizationDecision {
+	if (!isRecord(input) || input.openProjectPaneIfMissing !== true) return { consume: false };
+	if (input.action !== "send" && input.action !== "ask") return { consume: false };
+	const cwd = normalizeProjectPaneCwd(input.cwd);
+	if (cwd === undefined) {
+		return {
+			blocked: {
+				block: true,
+				reason: `Gentle AI blocked intercom project-pane creation: send or ask requires a valid existing absolute cwd. Run ${PROJECT_PANE_AUTHORIZATION_COMMAND} from the owner session before retrying.`,
+			},
+			consume: false,
+		};
+	}
+	if (authorization === undefined) {
+		return {
+			blocked: {
+				block: true,
+				reason: `Gentle AI blocked intercom project-pane creation for cwd ${JSON.stringify(cwd)}: no one-shot authorization exists for session ${sessionId ?? "unknown"}. Run ${PROJECT_PANE_AUTHORIZATION_COMMAND} from the owner session before retrying.`,
+			},
+			consume: false,
+		};
+	}
+	if (sessionId === undefined || authorization.sessionId !== sessionId) {
+		return {
+			blocked: {
+				block: true,
+				reason: `Gentle AI blocked intercom project-pane creation for cwd ${JSON.stringify(cwd)}: authorization belongs to session ${authorization.sessionId}, not ${sessionId ?? "unknown"}.`,
+			},
+			consume: false,
+		};
+	}
+	if (authorization.cwd !== cwd) {
+		return {
+			blocked: {
+				block: true,
+				reason: `Gentle AI blocked intercom project-pane creation: session ${sessionId} authorized cwd ${JSON.stringify(authorization.cwd)}, not ${JSON.stringify(cwd)}.`,
+			},
+			consume: false,
+		};
+	}
+	return { consume: true };
 }
 
 function gentleAiConfigHome(): string {
@@ -7224,6 +7303,9 @@ export const __testing = {
 	listDiscoverableAgents,
 	orderDiscoverableAgents,
 	classifyGuardedCommand,
+	normalizeProjectPaneCwd,
+	sessionIdForProjectPaneAuthorization,
+	evaluateProjectPaneAuthorization,
 	loadRuntimeGuardrailsConfig,
 	buildGentlePrompt,
 	classifyReviewEvent,
@@ -7336,8 +7418,10 @@ function createGentleAiExtensionForTesting(
 	const pendingCommitTransactions = new Map<string, { cwd: string; transactionId: string }>();
 	const correctionEvidenceByLineage = new Map<string, CorrectionEvidence>();
 	const candidateViews = dependencies.candidateViews === undefined ? new CandidateViewRegistry() : dependencies.candidateViews;
+	let pendingProjectPaneAuthorization: ProjectPaneAuthorization | undefined;
 
 	pi.on("session_shutdown", () => {
+		pendingProjectPaneAuthorization = undefined;
 		cleanupAllPendingReviewConsents(pendingReviewConsents, candidateViews);
 	});
 
@@ -7500,6 +7584,15 @@ function createGentleAiExtensionForTesting(
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
+		if (event.toolName === "intercom") {
+			const projectPaneDecision = evaluateProjectPaneAuthorization(
+				event.input,
+				sessionIdForProjectPaneAuthorization(ctx),
+				pendingProjectPaneAuthorization,
+			);
+			if (projectPaneDecision.blocked !== undefined) return projectPaneDecision.blocked;
+			if (projectPaneDecision.consume) pendingProjectPaneAuthorization = undefined;
+		}
 		const sensitivePathDenied = evaluateSensitivePathTool(
 			event.toolName,
 			event.input,
@@ -7626,6 +7719,26 @@ function createGentleAiExtensionForTesting(
 				],
 			};
 		}
+	});
+
+	pi.registerCommand("gentle:allow-project-pane-once", {
+		description: "Authorize one intercom send or ask to open a missing project pane for an exact absolute cwd in this session.",
+		handler: async (args, ctx) => {
+			const cwd = normalizeProjectPaneCwd(args.trim());
+			const sessionId = sessionIdForProjectPaneAuthorization(ctx);
+			if (cwd === undefined || sessionId === undefined) {
+				ctx.ui.notify(
+					`Project-pane authorization was not granted. Provide one existing absolute directory: ${PROJECT_PANE_AUTHORIZATION_COMMAND}.`,
+					"error",
+				);
+				return;
+			}
+			pendingProjectPaneAuthorization = { sessionId, cwd };
+			ctx.ui.notify(
+				`Authorized one intercom pane creation for cwd ${cwd} in owner session ${sessionId}. The authorization is consumed before intercom runs.`,
+				"info",
+			);
+		},
 	});
 
 	pi.registerCommand("gentle:install-sdd", {
