@@ -268,6 +268,26 @@ test("orchestrator documents path injection protocol", () => {
 	assert.doesNotMatch(source, /Use matching compact rules based on code context and task intent/);
 });
 
+test("orchestrator-skills asset enforces inline registry skill output contract", () => {
+	const source = readFileSync(join(import.meta.dirname, "..", "assets", "orchestrator-skills.md"), "utf8");
+	// Generic inline-execution paragraph: when the parent selects a
+	// registry-indexed skill and executes inline (no subagent delegation),
+	// the three obligations below apply. Anchored by a dedicated heading so
+	// the contract is not silently merged into the delegation-shaped section.
+	assert.match(source, /## Inline Registry Skill Execution/);
+	// Obligation 1: read the exact indexed SKILL.md before acting.
+	assert.match(source, /read the exact indexed `SKILL\.md` before acting/);
+	// Obligation 2: follow that skill's Output Contract exactly.
+	assert.match(source, /follow that skill's Output Contract exactly/);
+	// Obligation 3: report skill_resolution: paths-injected with the injected path(s).
+	assert.match(source, /skill_resolution: paths-injected/);
+	assert.match(source, /injected path/);
+	// Delegation path semantics are preserved: subagent reporting of
+	// skill_resolution stays distinct from the inline contract.
+	assert.match(source, /fallback-registry/);
+	assert.match(source, /fallback-path/);
+});
+
 test("non-forced regeneration invalidates cache when skill bytes change but path, size, and mtime are restored", async () => {
 	const cwd = join(tmpdir(), `gentle-pi-fingerprint-${Date.now()}`);
 	const skillPath = join(cwd, "skills", "alpha", "SKILL.md");
