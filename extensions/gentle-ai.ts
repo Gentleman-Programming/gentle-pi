@@ -151,6 +151,22 @@ import {
 import type { ReviewCollectInputV3, ReviewConsentEnvelope, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { assertDistinctCorrectionEvidence, resolveCorrectionStep, type CorrectionEvidence, type CorrectionOutcome, type CorrectionStep } from "../lib/review-correction-lifecycle.ts";
 import { recordReviewConsentLatch } from "../lib/review-consent-latch.ts";
+import {
+	agentModelProfileConfigPath, modelConfigPath,
+	normalizeModelConfig,
+	normalizeModelId,
+	normalizeRoutingEntry,
+	readModelConfig,
+	readModelConfigAsync,
+	readSavedModelConfig,
+	readSavedModelConfigAsync,
+	writeModelConfig, writeModelConfigAsync, atomicSync, atomic,
+	THINKING_LEVELS,
+	type AgentModelConfig,
+	type AgentRoutingEntry,
+	type AgentSource,
+	type ThinkingLevel,
+} from "../lib/model-routing-authority.ts";
 
 const GRAPH_V1_ORDINARY_READ_ONLY = "Graph-v1 ordinary review authority is read-only; use native compact-v2 review operations";
 import {
@@ -927,27 +943,6 @@ const CORE_MODEL_AGENT_NAMES = [
 ] as const;
 const CORE_MODEL_AGENT_NAME_SET = new Set<string>(CORE_MODEL_AGENT_NAMES);
 
-const THINKING_LEVELS = [
-	"off",
-	"minimal",
-	"low",
-	"medium",
-	"high",
-	"xhigh",
-	"max",
-] as const;
-type ThinkingLevel = (typeof THINKING_LEVELS)[number];
-interface AgentRoutingEntry {
-	model?: string;
-	thinking?: ThinkingLevel;
-}
-type AgentModelConfig = Record<string, AgentRoutingEntry>;
-type ModelConfigFileResult =
-	| { status: "missing" }
-	| { status: "invalid"; path: string }
-	| { status: "valid"; config: AgentModelConfig };
-type AgentSource = "project" | "user" | "builtin";
-
 interface AgentEntry {
 	name: string;
 	source: AgentSource;
@@ -1125,20 +1120,12 @@ function gentleAiConfigHome(): string {
 	return process.env.GENTLE_PI_CONFIG_HOME ?? join(homedir(), ".pi", "gentle-ai");
 }
 
-function modelConfigPath(_cwd: string): string {
-	return join(gentleAiConfigHome(), "models.json");
-}
-
 function modelExportPath(_cwd: string): string {
 	return join(gentleAiConfigHome(), "models.export.json");
 }
 
 const MODEL_EXPORT_KIND = "gentle-pi.agent_model_routing";
 const MODEL_EXPORT_VERSION = 1;
-
-function legacyProjectModelConfigPath(cwd: string): string {
-	return join(cwd, ".pi", "gentle-ai", "models.json");
-}
 
 function projectPersonaConfigPath(cwd: string): string {
 	return join(cwd, ".pi", "gentle-ai", "persona.json");
@@ -1176,128 +1163,6 @@ function writePersonaMode(cwd: string, mode: PersonaMode): string[] {
 		writeFileSync(path, `${JSON.stringify({ mode }, null, 2)}\n`);
 	}
 	return paths;
-}
-
-function isThinkingLevel(value: unknown): value is ThinkingLevel {
-	return (
-		typeof value === "string" &&
-		(THINKING_LEVELS as readonly string[]).includes(value)
-	);
-}
-
-const SAFE_MODEL_ID_PATTERN = /^[A-Za-z0-9._~:@/+%-]+$/;
-
-function normalizeModelId(value: unknown): string | undefined {
-	if (typeof value !== "string") return undefined;
-	const model = value.trim();
-	if (model.length === 0) return undefined;
-	if (!SAFE_MODEL_ID_PATTERN.test(model)) return undefined;
-	return model;
-}
-
-function normalizeRoutingEntry(value: unknown): AgentRoutingEntry | undefined {
-	if (typeof value === "string") {
-		const model = normalizeModelId(value);
-		return model ? { model } : undefined;
-	}
-	if (!isRecord(value)) return undefined;
-	const model = normalizeModelId(value.model);
-	const thinking = isThinkingLevel(value.thinking) ? value.thinking : undefined;
-	if (!model && !thinking) {
-		return Object.keys(value).length === 0 ? {} : undefined;
-	}
-	return { model, thinking };
-}
-
-function readModelConfigFile(path: string): ModelConfigFileResult {
-	if (!existsSync(path)) return { status: "missing" };
-	try {
-		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-		if (!isRecord(parsed)) return { status: "invalid", path };
-		const config: AgentModelConfig = {};
-		for (const [name, value] of Object.entries(parsed)) {
-			const entry = normalizeRoutingEntry(value);
-			if (entry) config[name] = entry;
-		}
-		return { status: "valid", config };
-	} catch {
-		return { status: "invalid", path };
-	}
-}
-
-async function readModelConfigFileAsync(
-	path: string,
-): Promise<ModelConfigFileResult> {
-	if (!(await pathExists(path))) return { status: "missing" };
-	try {
-		const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
-		if (!isRecord(parsed)) return { status: "invalid", path };
-		const config: AgentModelConfig = {};
-		for (const [name, value] of Object.entries(parsed)) {
-			const entry = normalizeRoutingEntry(value);
-			if (entry) config[name] = entry;
-		}
-		return { status: "valid", config };
-	} catch {
-		return { status: "invalid", path };
-	}
-}
-
-function readSavedModelConfig(cwd: string): ModelConfigFileResult {
-	const globalResult = readModelConfigFile(modelConfigPath(cwd));
-	if (globalResult.status !== "missing") return globalResult;
-	const legacyResult = readModelConfigFile(legacyProjectModelConfigPath(cwd));
-	if (legacyResult.status === "invalid") return { status: "valid", config: {} };
-	return legacyResult;
-}
-
-async function readSavedModelConfigAsync(
-	cwd: string,
-): Promise<ModelConfigFileResult> {
-	const globalResult = await readModelConfigFileAsync(modelConfigPath(cwd));
-	if (globalResult.status !== "missing") return globalResult;
-	const legacyResult = await readModelConfigFileAsync(
-		legacyProjectModelConfigPath(cwd),
-	);
-	if (legacyResult.status === "invalid") return { status: "valid", config: {} };
-	return legacyResult;
-}
-
-export function readModelConfig(cwd: string): AgentModelConfig {
-	const result = readSavedModelConfig(cwd);
-	return result.status === "valid" ? result.config : {};
-}
-
-export async function readModelConfigAsync(
-	cwd: string,
-): Promise<AgentModelConfig> {
-	const result = await readSavedModelConfigAsync(cwd);
-	return result.status === "valid" ? result.config : {};
-}
-
-function normalizeModelConfig(value: unknown): AgentModelConfig | undefined {
-	if (!isRecord(value)) return undefined;
-	const cleaned: AgentModelConfig = {};
-	for (const [name, entryValue] of Object.entries(value)) {
-		if (!/^[A-Za-z0-9._:@/+%-]+$/.test(name)) continue;
-		const entry = normalizeRoutingEntry(entryValue);
-		if (entry) cleaned[name] = entry;
-	}
-	return cleaned;
-}
-
-function writeModelConfig(cwd: string, config: AgentModelConfig): void {
-	const path = modelConfigPath(cwd);
-	mkdirSync(dirname(path), { recursive: true });
-	const cleaned = normalizeModelConfig(config) ?? {};
-	writeFileSync(path, `${JSON.stringify(cleaned, null, 2)}\n`);
-}
-
-async function writeModelConfigAsync(cwd: string, config: AgentModelConfig): Promise<void> {
-	const path = modelConfigPath(cwd);
-	await mkdir(dirname(path), { recursive: true });
-	const cleaned = normalizeModelConfig(config) ?? {};
-	await writeFile(path, `${JSON.stringify(cleaned, null, 2)}\n`);
 }
 
 function parseModelExport(value: unknown): AgentModelConfig | undefined {
@@ -1541,12 +1406,6 @@ function isClearRoutingEntry(entry: AgentRoutingEntry): boolean {
 	return entry.model === undefined && entry.thinking === undefined;
 }
 
-function agentModelProfileConfigPath(cwd: string, source: AgentSource): string {
-	return source === "project"
-		? join(cwd, ".pi", "subagents.json")
-		: join(gentlePiAgentHome(), "subagents.json");
-}
-
 function modelProfileForRoutingEntry(
 	entry: AgentRoutingEntry | undefined,
 ): Record<string, string> | undefined {
@@ -1567,23 +1426,30 @@ function updateSubagentModelProfileAtPath(
 	if (existsSync(path)) {
 		try {
 			const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-			if (isRecord(parsed)) config = { ...parsed };
-		} catch {
-			config = {};
+			if (!isRecord(parsed)) throw new Error("document must be an object");
+			config = { ...parsed };
+		} catch (error) {
+			throw new Error(`Invalid subagent config ${path}: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
-	const modelProfiles = isRecord(config.model_profiles)
-		? { ...config.model_profiles }
-		: {};
+	const modelProfiles = config.model_profiles === undefined
+		? {}
+		: isRecord(config.model_profiles)
+			? { ...config.model_profiles }
+			: (() => { throw new Error(`Invalid subagent config ${path}: model_profiles must be an object`); })();
 	const profile = modelProfileForRoutingEntry(entry);
 	if (profile) {
 		if (options.preserveExisting && isRecord(modelProfiles[name])) return false;
-		modelProfiles[name] = profile;
+		const next = isRecord(modelProfiles[name]) ? { ...modelProfiles[name] } : {};
+		Object.assign(next, profile);
+		if (!entry?.model) delete next.model;
+		if (!entry?.thinking) delete next.effort;
+		modelProfiles[name] = next;
 	} else delete modelProfiles[name];
 	if (Object.keys(modelProfiles).length > 0) config.model_profiles = modelProfiles;
 	else delete config.model_profiles;
 	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+	atomicSync(path, `${JSON.stringify(config, null, 2)}\n`);
 	return true;
 }
 
@@ -1597,23 +1463,30 @@ async function updateSubagentModelProfileAtPathAsync(
 	if (await pathExists(path)) {
 		try {
 			const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
-			if (isRecord(parsed)) config = { ...parsed };
-		} catch {
-			config = {};
+			if (!isRecord(parsed)) throw new Error("document must be an object");
+			config = { ...parsed };
+		} catch (error) {
+			throw new Error(`Invalid subagent config ${path}: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
-	const modelProfiles = isRecord(config.model_profiles)
-		? { ...config.model_profiles }
-		: {};
+	const modelProfiles = config.model_profiles === undefined
+		? {}
+		: isRecord(config.model_profiles)
+			? { ...config.model_profiles }
+			: (() => { throw new Error(`Invalid subagent config ${path}: model_profiles must be an object`); })();
 	const profile = modelProfileForRoutingEntry(entry);
 	if (profile) {
 		if (options.preserveExisting && isRecord(modelProfiles[name])) return false;
-		modelProfiles[name] = profile;
+		const next = isRecord(modelProfiles[name]) ? { ...modelProfiles[name] } : {};
+		Object.assign(next, profile);
+		if (!entry?.model) delete next.model;
+		if (!entry?.thinking) delete next.effort;
+		modelProfiles[name] = next;
 	} else delete modelProfiles[name];
 	if (Object.keys(modelProfiles).length > 0) config.model_profiles = modelProfiles;
 	else delete config.model_profiles;
 	await mkdir(dirname(path), { recursive: true });
-	await writeFile(path, `${JSON.stringify(config, null, 2)}\n`);
+	await atomic(path, `${JSON.stringify(config, null, 2)}\n`);
 	return true;
 }
 
