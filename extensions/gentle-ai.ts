@@ -1062,6 +1062,95 @@ function hasWritableEngramTool(pi: ExtensionAPI): boolean {
 	}
 }
 
+type ExecutionSurfaceClassification =
+	| { kind: "unrecognized" }
+	| { kind: "malformed" }
+	| {
+			kind: "recognized";
+			action: string;
+			targetCwd: string;
+			transitionClass: "legacy-send" | "legacy-ask" | "execution-surface";
+		};
+
+const EXECUTION_SURFACE_CONFIRM_TIMEOUT_MS = 30_000;
+const EXECUTION_SURFACE_REASON_PREFIX = "gentle-ai.execution-surface";
+
+function executionSurfaceInputString(
+	input: Record<string, unknown>,
+	key: string,
+): string | undefined {
+	const value = input[key];
+	return typeof value === "string" && value.trim().length > 0
+		? value.trim()
+		: undefined;
+}
+
+/** Recognizes only the package-owned execution-surface capability shape. */
+function classifyExecutionSurfaceCall(
+	_toolName: string,
+	input: unknown,
+	contextCwd: string,
+): ExecutionSurfaceClassification {
+	if (!isRecord(input) || !Object.prototype.hasOwnProperty.call(input, "openProjectPaneIfMissing")) {
+		return { kind: "unrecognized" };
+	}
+	if (input.openProjectPaneIfMissing === false) return { kind: "unrecognized" };
+	if (input.openProjectPaneIfMissing !== true) return { kind: "malformed" };
+	const action = executionSurfaceInputString(input, "action");
+	const cwd = executionSurfaceInputString(input, "cwd");
+	if (action === undefined || cwd === undefined) return { kind: "malformed" };
+	return {
+		kind: "recognized",
+		action,
+		targetCwd: resolve(contextCwd, cwd),
+		transitionClass:
+			action === "send"
+				? "legacy-send"
+				: action === "ask"
+					? "legacy-ask"
+					: "execution-surface",
+	};
+}
+
+function renderExecutionSurfaceDiagnostic(
+	toolName: string,
+	classification: Exclude<ExecutionSurfaceClassification, { kind: "unrecognized" | "malformed" }>,
+): string {
+	return [
+		`action=${sanitizeTerminalText(classification.action)}`,
+		`target-cwd=${sanitizeTerminalText(classification.targetCwd)}`,
+		`tool=${sanitizeTerminalText(toolName)}`,
+		`transition=${classification.transitionClass}`,
+	].join("; ");
+}
+
+async function confirmExecutionSurfaceCall(
+	toolName: string,
+	input: unknown,
+	ctx: ExtensionContext,
+): Promise<ToolCallEventResult | undefined> {
+	const classification = classifyExecutionSurfaceCall(toolName, input, ctx.cwd);
+	if (classification.kind === "unrecognized") return undefined;
+	if (classification.kind === "malformed") {
+		return { block: true, reason: `${EXECUTION_SURFACE_REASON_PREFIX}.malformed: invalid execution-surface capability input.` };
+	}
+	const diagnostic = renderExecutionSurfaceDiagnostic(toolName, classification);
+	if (!ctx.hasUI) {
+		return { block: true, reason: `${EXECUTION_SURFACE_REASON_PREFIX}.interactive-required: ${diagnostic}` };
+	}
+	try {
+		const approved = await ctx.ui.confirm(
+			"Allow execution-surface transition?",
+			diagnostic,
+			{ timeout: EXECUTION_SURFACE_CONFIRM_TIMEOUT_MS },
+		);
+		if (approved) return undefined;
+		return { block: true, reason: `${EXECUTION_SURFACE_REASON_PREFIX}.denied-or-timeout: ${diagnostic}` };
+	} catch {
+		return { block: true, reason: `${EXECUTION_SURFACE_REASON_PREFIX}.confirmation-failed: ${diagnostic}` };
+	}
+}
+
 function evaluateSensitivePathTool(
 	toolName: string,
 	input: unknown,
@@ -7247,6 +7336,8 @@ export const __testing = {
 	resolveBackgroundSubagentsCapability,
 	readActiveToolNames,
 	renderBackgroundSubagentsStatusLine,
+	classifyExecutionSurfaceCall,
+	renderExecutionSurfaceDiagnostic,
 	resolveControllerSddStatus,
 	resolveStartupControllerSddStatus,
 	repositoryLocationIdentity,
@@ -7505,6 +7596,12 @@ function createGentleAiExtensionForTesting(
 			event.input,
 		);
 		if (sensitivePathDenied) return sensitivePathDenied;
+		const executionSurfaceResult = await confirmExecutionSurfaceCall(
+			event.toolName,
+			event.input,
+			ctx,
+		);
+		if (executionSurfaceResult) return executionSurfaceResult;
 		if (event.toolName === "subagent_run") {
 			try {
 				injectReviewCandidateView(event.input, candidateViews);

@@ -105,7 +105,8 @@ test("generic delegation contract instructs the same `## Key Learnings` closing 
 	for (const [label, regex] of KL_SEMANTICS) {
 		assert.match(section, regex, `delegation missing semantic: ${label}`);
 	}
-	assert.match(section, /native `Agent`/, "must cover native Agent fallback");
+	assert.match(section, /selected runtime/, "must preserve the selected runtime");
+	assert.doesNotMatch(section, /(?:Pi's native|native) `Agent`/i, "must not describe a cross-runtime fallback");
 	assert.match(section, /strict JSON/i, "must exclude strict-JSON agents");
 	assert.match(section, /layers on after/, "must state the block layers on after the envelope");
 });

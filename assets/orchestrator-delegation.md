@@ -90,20 +90,19 @@ These are parent-orchestrator routing boundaries. Use the smallest useful topolo
 
 ##### Pi Trigger Runtime Bindings
 
-These are parent-orchestrator stop rules. Once any trigger fires, the parent MUST delegate through the best available subagent runtime. Prefer `subagent_run` when present; otherwise use Pi's native `Agent` or another available delegation mechanism. Do not replace a required delegation with inline execution. Do not inject these as child-agent permission to spawn subagents; children receive concrete role work and must not orchestrate.
+These are parent-orchestrator stop rules. Once any trigger fires, the parent MUST delegate through the selected subagent runtime. Do not replace a required delegation with inline execution or another runtime. Do not inject these as child-agent permission to spawn subagents; children receive concrete role work and must not orchestrate.
 
-The bounded multi-file writer precedence in rule 2 overrides that general runtime preference. If no delegation mechanism is available, stop and explain the blocker.
+The bounded multi-file writer precedence in rule 2 selects the runtime. Selected-runtime exhaustion returns an actionable stop that identifies how to restore it; retry only through that runtime's existing bounded policy.
 
-1. **4-file rule**: if understanding requires reading 4+ files, launch `scout`, `context-builder`, or the closest read-only mapping subagent with fresh context and a narrow mapping task. State the fallback agent/runtime if the preferred one is unavailable.
-   Route generic non-SDD exploration to `gentle-ai-explore`; if missing or unusable, use native `Agent` with the same read-only mapping task and report the fallback.
+1. **4-file rule**: if understanding requires reading 4+ files, launch `scout`, `context-builder`, or the closest read-only mapping subagent with fresh context and a narrow mapping task. Route generic non-SDD exploration to the selected `gentle-ai-explore` runtime; if it is unavailable or unusable, stop with the action needed to restore that runtime.
 2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, delegate one writer; inline writing is allowed only for trivial/mechanical edits. Any review work remains inside the already-bound transaction budget.
-   For bounded multi-file writes, prefer the installed package-owned `gentle-ai-worker`, then a user-configured `worker`. If neither worker definition exists, fall back to the native `Agent` even when `subagent_*` tools are available. If no delegation mechanism is available, stop and explain the blocker.
+   For bounded multi-file writes, use the selected installed package-owned `gentle-ai-worker` or user-configured `worker`. If neither selected runtime is available, return an actionable stop that identifies how to restore the selected runtime; do not switch runtimes.
 
 3. **Lifecycle gate rule**: commit/push/PR/release validates an approved receipt and exact typed target with zero actors. If authority is missing or scope changed, fail closed; do not launch a lifecycle review. Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; major and post-incident releases require explicit extraordinary review.
 4. **Incident rule**: after wrong `cwd`, accidental repo/worktree mutation, failed merge recovery, confusing test command, or environment workaround, stop and diagnose the incident separately without reopening a closed lineage or resetting its budget.
 5. **Long-session rule**: if accumulating work is no longer clearly local — roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without delegation — pause and delegate the remaining work instead of silently continuing monolithically.
 6. **Review actor rule**: use review lens subagents only when selected at ordinary transaction start. Explicit Judgment Day uses the named judges; lifecycle and SDD boundaries launch zero review actors.
-7. **Verification rule**: delegate generic non-SDD verification that executes or delegates commands to `gentle-ai-verify`. If that role is missing or unusable, use native `Agent` with the same read-only verification task and exact parent-authorized commands, and report the fallback. Only truly local read-only checking of 1-3 known files stays inline.
+7. **Verification rule**: delegate generic non-SDD verification that executes or delegates commands to the selected `gentle-ai-verify` runtime. If it is missing or unusable, stop with the action needed to restore that runtime; do not switch runtimes. Only truly local read-only checking of 1-3 known files stays inline.
 
 <!-- pi-binding:end -->
 
@@ -255,7 +254,7 @@ The generic role precedence below is the explicit exception to this general runt
 <!-- gentle-pi:background-subagents -->
 #### Background Subagent Policy
 
-Background execution is policy-gated: the always-on orchestrator prompt renders one status line, `Background subagent policy: on|off (capability: ready|absent)`. If the policy is off OR the `subagent_run` tool is unavailable, run every delegation in the foreground — `mode: "task"` when `subagent_*` tools exist, otherwise the native `Agent` fallback — always.
+Background execution is policy-gated: the always-on orchestrator prompt renders one status line, `Background subagent policy: on|off (capability: ready|absent)`. If the policy is off, run every delegation in the selected runtime's foreground `mode: "task"`. If that runtime is unavailable, stop with the action needed to restore it; do not switch runtimes.
 
 When the policy is on and `subagent_run` is available:
 
@@ -267,11 +266,11 @@ When the policy is on and `subagent_run` is available:
 - Background jobs are process-local and non-durable. A restart loses them; make no recovery claim.
 <!-- /gentle-pi:background-subagents -->
 
-For generic non-SDD exploration and mapping, first attempt the installed package-owned `gentle-ai-explore`. If that individual role is missing or unusable, fall back to Pi's native `Agent` with the same read-only mapping constraints and report the fallback.
+For generic non-SDD exploration and mapping, use the installed package-owned `gentle-ai-explore` runtime. If it is unavailable or unusable, stop with the action needed to restore that runtime; do not switch runtimes.
 
-For bounded multi-file writes, prefer the installed package-owned `gentle-ai-worker`, then a user-configured `worker`. If neither worker definition exists, fall back to the native `Agent` even when `subagent_*` tools are available. This writer precedence overrides the general runtime preference above.
+For bounded multi-file writes, use the selected installed package-owned `gentle-ai-worker` or user-configured `worker`. If neither selected runtime is available, return an actionable stop that identifies how to restore the selected runtime; do not switch runtimes.
 
-For generic non-SDD technical verification that executes or delegates commands, first attempt the installed package-owned `gentle-ai-verify`. If that individual role is missing or unusable, fall back to Pi's native `Agent` with the same read-only verification constraints, exact parent-authorized commands, and fallback reporting. Truly local read-only checking of 1-3 known files may remain inline.
+For generic non-SDD technical verification that executes or delegates commands, use the installed package-owned `gentle-ai-verify` runtime. If it is unavailable or unusable, stop with the action needed to restore that runtime; do not switch runtimes. Truly local read-only checking of 1-3 known files may remain inline.
 
 Use `sdd-explore` and `sdd-verify` only inside SDD. Use review lenses only inside explicit review transactions.
 
@@ -279,7 +278,7 @@ Use `sdd-explore` and `sdd-verify` only inside SDD. Use review lenses only insid
 
 The bounded writer refuses to write outside the exact allowed edit surfaces and stops with `status: interaction_required` when they are missing. The parent owns that input. Deriving it is part of planning the delegation, not something the writer or the human can be left to supply.
 
-Before launching a bounded writer (`gentle-ai-worker`, a user-configured `worker`, or the native `Agent` fallback), derive the allowed edit surface from the task being delegated — the files the planned change must touch, plus the directories where the task authorizes new files — and pass it in the delegated prompt under an `## Allowed edit surfaces` heading, in the same exact-path form as `## Skills to load before work`:
+Before launching a bounded writer (`gentle-ai-worker` or a user-configured `worker` in the selected runtime), derive the allowed edit surface from the task being delegated — the files the planned change must touch, plus the directories where the task authorizes new files — and pass it in the delegated prompt under an `## Allowed edit surfaces` heading, in the same exact-path form as `## Skills to load before work`:
 
 - exact repository-relative paths or narrow globs, one per line; never `.` and never a bare repository root;
 - pre-existing untracked targets the writer may write, listed explicitly;
@@ -292,11 +291,11 @@ Relay a writer's `interaction_required` payload about edit surfaces the same way
 
 #### Key Learnings closing block
 
-When delegating to a generic Explore/general worker (`gentle-ai-explore`, `gentle-ai-worker`, `gentle-ai-verify`) or their native `Agent` fallback, include the same `## Key Learnings` closing instruction in the delegated prompt: after the worker returns its normal result envelope or handoff, it closes its final response text with a `## Key Learnings` block of 1–5 numbered items, each a standalone factual sentence of at least 20 characters and at least 4 words, omitting the block when there is genuinely no reusable learning. The block layers on after the structured Return contract and does not alter its fields. This applies to final response text only — not intermediate tool output. The Engram memory provider automatically extracts and persists these items as passive capture; the worker does not parse the block or invoke passive-capture tools itself. This is separate from explicit `mem_save` artifact/decision persistence. Agents that must return strict JSON (review lenses, `review-refuter`, `review-validator`, Judgment Day judges and fix agent) never receive this closing instruction; their strict output shape is unchanged.
+When delegating to a generic Explore/general worker (`gentle-ai-explore`, `gentle-ai-worker`, `gentle-ai-verify`) in the selected runtime, include the same `## Key Learnings` closing instruction in the delegated prompt: after the worker returns its normal result envelope or handoff, it closes its final response text with a `## Key Learnings` block of 1–5 numbered items, each a standalone factual sentence of at least 20 characters and at least 4 words, omitting the block when there is genuinely no reusable learning. The block layers on after the structured Return contract and does not alter its fields. This applies to final response text only — not intermediate tool output. The Engram memory provider automatically extracts and persists these items as passive capture; the worker does not parse the block or invoke passive-capture tools itself. This is separate from explicit `mem_save` artifact/decision persistence. Agents that must return strict JSON (review lenses, `review-refuter`, `review-validator`, Judgment Day judges and fix agent) never receive this closing instruction; their strict output shape is unchanged.
 
-For delegation other than bounded multi-file writes, use the generic fallback:
+For delegation other than bounded multi-file writes, preserve the selected runtime:
 
-If `subagent_*` tools are unavailable, fall back to Pi's native `Agent` tool or another available delegation mechanism. The delegation trigger remains mandatory; the fallback changes the runtime, not the requirement to delegate. If no delegation mechanism is available, stop the complex work and explain the blocker instead of silently continuing inline.
+If the selected runtime is unavailable, return an actionable stop that identifies how to restore it instead of silently continuing inline or switching runtimes. Retry only through that runtime's existing bounded policy.
 
 ### Pi Subagent Model Routing
 

@@ -38,7 +38,7 @@ Delegation is not optional once complexity appears. If a task crosses the trigge
 Route work through the smallest harness that is safe. Three tiers:
 
 1. **Inline Direct** — small, mechanical, parent has context (typo, one-file edit, read-only check of 1-3 known files, bash for state). No SDD ceremony; stop when it is no longer small.
-2. **Simple Delegation** — generic non-SDD exploration → `gentle-ai-explore`; bounded implementation → `gentle-ai-worker`; command-running generic non-SDD verification → `gentle-ai-verify`. Try its package role; if missing/unusable, use native `Agent` under the same read-only mapping/verification constraints and report fallback. SDD roles stay inside SDD; review lenses inside reviews.
+2. **Simple Delegation** — generic non-SDD exploration → `gentle-ai-explore`; bounded implementation → `gentle-ai-worker`; command-running generic non-SDD verification → `gentle-ai-verify`. Selected runtime exhaustion returns an actionable stop. SDD roles stay inside SDD; review lenses inside reviews.
 3. **SDD (optional)** — selected only by an explicit request (`/sdd-new`/`/sdd-ff`/`/sdd-continue` or a direct ask) or an accepted proposal; size, file count, or risk alone never selects SDD. Suggest it organically when durable proposal/spec/design/tasks would materially reduce substantial ambiguity. Once selected, do not jump to implementation; create artifacts and gate for approval.
 
 ## Delegation Rules
@@ -47,7 +47,7 @@ Core question: does this inflate parent context without need?
 
 The canonical per-action table is the mirrored gentle-ai canon Delegation Rules table in `{{GENTLE_PI_DELEGATION_PATH}}`.
 
-Mandatory Delegation Triggers — stop rules; once fired, delegate through the best available subagent runtime (prefer `subagent_run`, else Pi's native `Agent`):
+Mandatory Delegation Triggers — stop rules; once fired, delegate through the selected subagent runtime. Selected-runtime exhaustion returns an actionable stop that identifies how to restore it; do not switch runtimes:
 
 1. **4-file rule** — 4+ files to understand → delegate a scout/mapping task.
 2. **Multi-file write rule** — 2+ non-trivial files touched → delegate one writer.
