@@ -423,6 +423,8 @@ test("active delegation documentation preserves managed-runtime containment", ()
 	]) {
 		const source = readFileSync(file, "utf8");
 		assert.doesNotMatch(source, /(?:Pi's native|native) `Agent`/i, `${file} must not switch delegation runtimes`);
+		assert.match(source, /do not switch runtimes/i, `${file} must explicitly prohibit runtime switching`);
+		assert.doesNotMatch(source, /platform'?s native bounded worker/i, `${file} must not route delegation through a platform-native worker`);
 		assert.match(source, /selected (?:managed )?runtime[\s\S]{0,160}actionable stop/i, `${file} must make exhaustion actionable`);
 		assert.match(source, /target-cwd capability[\s\S]{0,240}stop actionably/i, `${file} must stop when target cwd is unavailable`);
 		assert.match(source, /#376/, `${file} must retain #376 as the positive target-cwd feature`);

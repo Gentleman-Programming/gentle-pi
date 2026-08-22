@@ -71,7 +71,7 @@ Core principle: **does this inflate the parent context without need?** If yes, u
 | Bash for state (`git`, `gh`) | ✅ | — |
 | Tests, builds, installs, or native review actions | allowed as a bounded action | ✅ fresh per-action worker without changing route |
 
-Use the platform's native bounded worker for delegated-direct work; reserve `sdd-*` agents for a selected SDD route.
+Use the bounded worker provided by the selected managed subagent runtime for delegated-direct work; reserve `sdd-*` agents for a selected SDD route.
 
 Keep one writer and a short synthesized handoff. Delegation is mandatory at the mapping, write, preparation, and broad-research boundaries, but it remains a direct implementation route and must not synthesize SDD artifacts.
 
