@@ -40,6 +40,18 @@ import {
 	updatePackageManagedSddAgentOwnership,
 } from "../lib/sdd-preflight.ts";
 import {
+	THINKING_LEVELS,
+	normalizeModelConfig,
+	normalizeModelId,
+	normalizeRoutingEntry,
+	readSavedModelConfig as readModelRoutingAuthority,
+	readSavedModelConfigAsync as readModelRoutingAuthorityAsync,
+	type AgentModelConfig,
+	type AgentRoutingEntry,
+	type ModelConfigFileResult,
+	type ThinkingLevel,
+} from "../lib/model-routing-authority.ts";
+import {
 	parseSddStatusCommandArgs,
 	renderNativeSddPhasePrompt,
 	renderSddDispatcherMarkdown,
@@ -889,25 +901,6 @@ const CORE_MODEL_AGENT_NAMES = [
 ] as const;
 const CORE_MODEL_AGENT_NAME_SET = new Set<string>(CORE_MODEL_AGENT_NAMES);
 
-const THINKING_LEVELS = [
-	"off",
-	"minimal",
-	"low",
-	"medium",
-	"high",
-	"xhigh",
-	"max",
-] as const;
-type ThinkingLevel = (typeof THINKING_LEVELS)[number];
-interface AgentRoutingEntry {
-	model?: string;
-	thinking?: ThinkingLevel;
-}
-type AgentModelConfig = Record<string, AgentRoutingEntry>;
-type ModelConfigFileResult =
-	| { status: "missing" }
-	| { status: "invalid"; path: string }
-	| { status: "valid"; config: AgentModelConfig };
 type AgentSource = "project" | "user" | "builtin";
 
 interface AgentEntry {
@@ -1140,89 +1133,22 @@ function writePersonaMode(cwd: string, mode: PersonaMode): string[] {
 	return paths;
 }
 
-function isThinkingLevel(value: unknown): value is ThinkingLevel {
-	return (
-		typeof value === "string" &&
-		(THINKING_LEVELS as readonly string[]).includes(value)
-	);
-}
-
-const SAFE_MODEL_ID_PATTERN = /^[A-Za-z0-9._~:@/+%-]+$/;
-
-function normalizeModelId(value: unknown): string | undefined {
-	if (typeof value !== "string") return undefined;
-	const model = value.trim();
-	if (model.length === 0) return undefined;
-	if (!SAFE_MODEL_ID_PATTERN.test(model)) return undefined;
-	return model;
-}
-
-function normalizeRoutingEntry(value: unknown): AgentRoutingEntry | undefined {
-	if (typeof value === "string") {
-		const model = normalizeModelId(value);
-		return model ? { model } : undefined;
-	}
-	if (!isRecord(value)) return undefined;
-	const model = normalizeModelId(value.model);
-	const thinking = isThinkingLevel(value.thinking) ? value.thinking : undefined;
-	if (!model && !thinking) {
-		return Object.keys(value).length === 0 ? {} : undefined;
-	}
-	return { model, thinking };
-}
-
-function readModelConfigFile(path: string): ModelConfigFileResult {
-	if (!existsSync(path)) return { status: "missing" };
-	try {
-		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-		if (!isRecord(parsed)) return { status: "invalid", path };
-		const config: AgentModelConfig = {};
-		for (const [name, value] of Object.entries(parsed)) {
-			const entry = normalizeRoutingEntry(value);
-			if (entry) config[name] = entry;
-		}
-		return { status: "valid", config };
-	} catch {
-		return { status: "invalid", path };
-	}
-}
-
-async function readModelConfigFileAsync(
-	path: string,
-): Promise<ModelConfigFileResult> {
-	if (!(await pathExists(path))) return { status: "missing" };
-	try {
-		const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
-		if (!isRecord(parsed)) return { status: "invalid", path };
-		const config: AgentModelConfig = {};
-		for (const [name, value] of Object.entries(parsed)) {
-			const entry = normalizeRoutingEntry(value);
-			if (entry) config[name] = entry;
-		}
-		return { status: "valid", config };
-	} catch {
-		return { status: "invalid", path };
-	}
-}
-
 function readSavedModelConfig(cwd: string): ModelConfigFileResult {
-	const globalResult = readModelConfigFile(modelConfigPath(cwd));
-	if (globalResult.status !== "missing") return globalResult;
-	const legacyResult = readModelConfigFile(legacyProjectModelConfigPath(cwd));
-	if (legacyResult.status === "invalid") return { status: "valid", config: {} };
-	return legacyResult;
+	const projectPath = legacyProjectModelConfigPath(cwd);
+	const result = readModelRoutingAuthority(modelConfigPath(cwd), projectPath);
+	return result.status === "invalid" && result.path === projectPath
+		? { status: "valid", config: {} }
+		: result;
 }
 
 async function readSavedModelConfigAsync(
 	cwd: string,
 ): Promise<ModelConfigFileResult> {
-	const globalResult = await readModelConfigFileAsync(modelConfigPath(cwd));
-	if (globalResult.status !== "missing") return globalResult;
-	const legacyResult = await readModelConfigFileAsync(
-		legacyProjectModelConfigPath(cwd),
-	);
-	if (legacyResult.status === "invalid") return { status: "valid", config: {} };
-	return legacyResult;
+	const projectPath = legacyProjectModelConfigPath(cwd);
+	const result = await readModelRoutingAuthorityAsync(modelConfigPath(cwd), projectPath);
+	return result.status === "invalid" && result.path === projectPath
+		? { status: "valid", config: {} }
+		: result;
 }
 
 export function readModelConfig(cwd: string): AgentModelConfig {
@@ -1235,17 +1161,6 @@ export async function readModelConfigAsync(
 ): Promise<AgentModelConfig> {
 	const result = await readSavedModelConfigAsync(cwd);
 	return result.status === "valid" ? result.config : {};
-}
-
-function normalizeModelConfig(value: unknown): AgentModelConfig | undefined {
-	if (!isRecord(value)) return undefined;
-	const cleaned: AgentModelConfig = {};
-	for (const [name, entryValue] of Object.entries(value)) {
-		if (!/^[A-Za-z0-9._:@/+%-]+$/.test(name)) continue;
-		const entry = normalizeRoutingEntry(entryValue);
-		if (entry) cleaned[name] = entry;
-	}
-	return cleaned;
 }
 
 function writeModelConfig(cwd: string, config: AgentModelConfig): void {
