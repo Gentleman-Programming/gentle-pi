@@ -5,6 +5,7 @@ import quietTools, {
 	countNonEmptyLines,
 	extractTextContent,
 	formatToolResultOutput,
+	gentleAiRoutineCommand,
 	tailLines,
 } from "../extensions/quiet-tools.ts";
 
@@ -205,6 +206,68 @@ test("quiet tool rendering keeps compact collapsed summaries for search and list
 	assert.equal(formatToolResultOutput("write", textResult("wrote") as any, { expanded: false }), "\nwrote");
 	assert.equal(formatToolResultOutput("grep", textResult("a\nb\n") as any, { expanded: true }), "\na\nb\n");
 	assert.equal(formatToolResultOutput("read", textResult("ENOENT: missing file") as any, { expanded: false, isError: true }), "\nENOENT: missing file");
+});
+
+test("quiet tool rendering identifies only routine Gentle AI SDD and RDD commands", () => {
+	assert.equal(gentleAiRoutineCommand({ command: "gentle-ai sdd-status fix-rose --json" }), "sdd-status");
+	assert.equal(gentleAiRoutineCommand({ command: "env FOO=bar gentle-ai sdd-continue fix-rose" }), "sdd-continue");
+	assert.equal(gentleAiRoutineCommand({ command: "/package/.gentle-ai/v2.2.0/gentle-ai review status --next-transition" }), "review");
+	assert.equal(gentleAiRoutineCommand({ command: "./.gentle-ai/v2.2.0/gentle-ai sdd-status rose --json" }), "sdd-status");
+	assert.equal(gentleAiRoutineCommand({ command: ".\\.gentle-ai\\v2.2.0\\gentle-ai.exe review status --next-transition" }), "review");
+	assert.equal(gentleAiRoutineCommand({ command: "C:\\package\\.gentle-ai\\v2.2.0\\gentle-ai.exe sdd-continue rose" }), "sdd-continue");
+	assert.equal(gentleAiRoutineCommand({ command: "gentle-ai sdd-attempt acquire --change fix-rose" }), "sdd-attempt");
+	assert.equal(gentleAiRoutineCommand({ command: "gentle-ai sdd-attempt settle --change fix-rose" }), "sdd-attempt");
+	assert.equal(gentleAiRoutineCommand({ command: "gentle-ai review status --next-transition" }), "review");
+	assert.equal(gentleAiRoutineCommand({ command: "gentle-ai version" }), undefined);
+	assert.equal(gentleAiRoutineCommand({ command: "gentle-ai sdd-attempt inspect" }), undefined);
+	assert.equal(gentleAiRoutineCommand({ command: "/package/.gentle-ai/v2.2.0/gentle-ai-copy review status" }), undefined);
+	assert.equal(gentleAiRoutineCommand({ command: "echo gentle-ai review status" }), undefined);
+});
+
+test("quiet tool rendering refuses to compact composed Gentle AI shell commands", () => {
+	const { pi, tools } = createPi();
+	withEnv({ GENTLE_PI_QUIET_TOOLS: undefined }, () => quietTools(pi as any));
+	const commands = [
+		"gentle-ai review status --next-transition && rm -rf target",
+		"gentle-ai review status; rm -rf target",
+		"gentle-ai review status || rm -rf target",
+		"gentle-ai review status | tee status.json",
+		"gentle-ai review status & rm -rf target",
+		"gentle-ai review status\nrm -rf target",
+		"gentle-ai review status --next-transition $(rm -rf target)",
+		"gentle-ai review status --next-transition `rm -rf target`",
+		"gentle-ai review status --next-transition <(cat target)",
+		"gentle-ai review status --next-transition >(tee target)",
+		"gentle-ai review status --next-transition > status.json",
+		"gentle-ai review status --next-transition < status.json",
+	];
+
+	for (const command of commands) {
+		assert.equal(gentleAiRoutineCommand({ command }), undefined, command);
+		const call = renderToString(tools.get("bash").renderCall({ command }, passthroughTheme, {}));
+		const output = renderToString(tools.get("bash").renderResult(textResult("command output"), { expanded: true, isPartial: false }, passthroughTheme, { args: { command } }));
+		assert.equal(call.replace(/[ \t]+$/gm, "").trimEnd(), `$ ${command}`);
+		assert.match(output, /command output/);
+	}
+});
+
+test("quiet tool rendering compacts successful routine Gentle AI calls but preserves failures", () => {
+	const { pi, tools } = createPi();
+	withEnv({ GENTLE_PI_QUIET_TOOLS: undefined }, () => quietTools(pi as any));
+	const command = "gentle-ai review status --next-transition";
+	const textRose = "\u{1F339}\uFE0E";
+	const tool = tools.get("bash");
+
+	const call = renderToString(tool.renderCall({ command }, passthroughTheme, {}));
+	const collapsed = renderToString(tool.renderResult(textResult('{"next_transition":"stop"}'), { expanded: false, isPartial: false }, passthroughTheme, { args: { command } }));
+	const expanded = renderToString(tool.renderResult(textResult('{"next_transition":"stop"}'), { expanded: true, isPartial: false }, passthroughTheme, { args: { command } }));
+	const failure = renderToString(tool.renderResult(textResult("review status failed: authority unavailable"), { expanded: false, isPartial: false, isError: true }, passthroughTheme, { args: { command } }));
+
+	assert.equal([...textRose].length, 2);
+	assert.equal(call.trimEnd(), `${textRose} Gentle AI review …`);
+	assert.equal(collapsed, "");
+	assert.match(expanded, /"next_transition":"stop"/);
+	assert.match(failure, /review status failed: authority unavailable/);
 });
 
 test("quiet tool rendering keeps collapsed git bash result tails", () => {

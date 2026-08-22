@@ -103,6 +103,28 @@ function isGitCommand(args: Record<string, unknown> | undefined): boolean {
 	return /^(?:env\s+\S+=\S+\s+|command\s+|\w+=\S+\s+)*git(?:\s|$)/.test(command);
 }
 
+export type GentleAiRoutineCommand = "sdd-status" | "sdd-continue" | "sdd-attempt" | "review";
+
+const SHELL_COMMAND_PREFIX = String.raw`(?:env\s+\S+=\S+\s+|command\s+|\w+=\S+\s+)*`;
+const GENTLE_AI_EXECUTABLE = String.raw`(?:gentle-ai|(?:\.{1,2}[\\/]|(?:[A-Za-z]:)?(?:[\\/][^\\/\s]+)*[\\/])\.gentle-ai[\\/]v\d+\.\d+\.\d+[\\/]gentle-ai(?:\.exe)?)`;
+const GENTLE_AI_ROUTINE_COMMAND = new RegExp(String.raw`^${SHELL_COMMAND_PREFIX}${GENTLE_AI_EXECUTABLE}\s+(sdd-status|sdd-continue|sdd-attempt|review)(?:\s|$)`);
+const GENTLE_AI_SDD_ATTEMPT = new RegExp(String.raw`^${SHELL_COMMAND_PREFIX}${GENTLE_AI_EXECUTABLE}\s+sdd-attempt\s+(?:acquire|settle)(?:\s|$)`);
+const SHELL_EXPANSION_OR_COMPOSITION = /[;&|`<>\r\n]|\$\(/;
+
+/**
+ * Matches only supported routine Gentle AI CLI calls, including bounded
+ * package-local paths, not arbitrary shell output that merely mentions
+ * gentle-ai. These commands otherwise emit machine-readable SDD/RDD data.
+ */
+export function gentleAiRoutineCommand(args: Record<string, unknown> | undefined): GentleAiRoutineCommand | undefined {
+	const command = typeof args?.command === "string" ? args.command.trim() : "";
+	if (SHELL_EXPANSION_OR_COMPOSITION.test(command)) return undefined;
+	const match = GENTLE_AI_ROUTINE_COMMAND.exec(command);
+	if (!match) return undefined;
+	if (match[1] === "sdd-attempt" && !GENTLE_AI_SDD_ATTEMPT.test(command)) return undefined;
+	return match[1] as GentleAiRoutineCommand;
+}
+
 interface ToolResultFormatOptions {
 	expanded: boolean;
 	isError?: boolean;
@@ -116,6 +138,7 @@ export function formatToolResultOutput(
 ): string {
 	const text = safeText(extractTextContent(result));
 	if (expanded || isError) return text ? `\n${text}` : "";
+	if (toolName === "bash" && gentleAiRoutineCommand(args)) return "";
 
 	if (toolName === "bash" && isGitCommand(args)) {
 		const tail = tailLines(text, COLLAPSED_TAIL_LINE_LIMIT);
@@ -149,6 +172,11 @@ function formatToolCall(toolName: QuietToolName, args: Record<string, unknown>, 
 			return `${theme.fg("toolTitle", theme.bold("read"))} ${theme.fg("accent", path)}${lineRangeSuffix(args, theme)}`;
 		}
 		case "bash": {
+			const gentleAiCommand = gentleAiRoutineCommand(args);
+			if (gentleAiCommand) {
+				const label = gentleAiCommand === "sdd-attempt" ? "SDD attempt" : gentleAiCommand.replace("-", " ");
+				return theme.fg("toolTitle", theme.bold(`🌹︎ Gentle AI ${label} …`));
+			}
 			const command = safeText(asString(args.command, "..."));
 			const timeout = typeof args.timeout === "number" ? theme.fg("muted", ` (timeout ${args.timeout}s)`) : "";
 			return `${theme.fg("toolTitle", theme.bold(`$ ${command}`))}${timeout}`;
