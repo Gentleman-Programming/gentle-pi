@@ -301,7 +301,7 @@ test("runtime lifecycle gates reject fabricated metadata while compound and wrap
 	assert.doesNotMatch(destructive?.reason ?? "", /approved receipt/i);
 });
 
-test("execution-surface containment confirms only a validated pending TUI/RPC call", async () => {
+test("execution-surface containment hard-blocks cross-surface requests without UI approval", async () => {
 	type ToolCallHandler = (
 		event: { toolName: string; input: unknown },
 		ctx: ExtensionContext,
@@ -340,47 +340,15 @@ test("execution-surface containment confirms only a validated pending TUI/RPC ca
 			{ kind: "malformed" },
 		);
 	}
-	assert.deepEqual(
-		__testing.classifyExecutionSurfaceCall(
-			"arbitrary_tool",
-			{ action: "send", cwd: "../target", openProjectPaneIfMissing: true },
-			"/workspace/project",
-		),
-		{
-			kind: "recognized",
-			action: "send",
-			targetCwd: "/workspace/target",
-			transitionClass: "legacy-send",
-		},
-	);
-	for (const [action, transitionClass] of [
-		["ask", "legacy-ask"],
-		["delegate", "execution-surface"],
-	] as const) {
-		assert.deepEqual(
-			__testing.classifyExecutionSurfaceCall(
-				"arbitrary_tool",
-				{ action, cwd: "relative", openProjectPaneIfMissing: true },
-				"/workspace/project",
-			),
-			{
-				kind: "recognized",
-				action,
-				targetCwd: "/workspace/project/relative",
-				transitionClass,
-			},
-		);
-	}
 
 	const confirmations: unknown[][] = [];
-	const context = (approval: boolean | Error, hasUI = true) => ({
+	const context = (hasUI: boolean) => ({
 		cwd: "/workspace/project",
 		hasUI,
 		ui: {
 			confirm: async (...args: unknown[]) => {
 				confirmations.push(args);
-				if (approval instanceof Error) throw approval;
-				return approval;
+				return true;
 			},
 		},
 	}) as unknown as ExtensionContext;
@@ -388,46 +356,50 @@ test("execution-surface containment confirms only a validated pending TUI/RPC ca
 		action: "send",
 		cwd: "/workspace/project/../target",
 		openProjectPaneIfMissing: true,
-		mode: "SENTINEL_MODE",
-		selectedRuntime: "SENTINEL_RUNTIME",
-		capability: "SENTINEL_CAPABILITY",
 		message: "SENTINEL_MESSAGE",
 		task: "SENTINEL_TASK",
 		parent: { cwd: "/SENTINEL_PARENT", action: "SENTINEL_PARENT_ACTION" },
 		ancestry: ["SENTINEL_ANCESTRY"],
 	};
 
-	for (const [channel, toolName, action] of [
-		["TUI", "arbitrary_tool", "send"],
-		["RPC", "arbitrary_tool", "send"],
-		["TUI", "pi-intercom", "ask"],
+	for (const [toolName, action, transitionClass] of [
+		["legacy-send-tool", "send", "legacy-send"],
+		["legacy-ask-tool", "ask", "legacy-ask"],
+		["generic-tool", "delegate", "execution-surface"],
 	] as const) {
-		const allowed = await toolCall!(
-			{ toolName, input: { ...recognizedInput, action } },
-			context(true),
-		);
-		assert.equal(allowed, undefined, `${channel} approval must allow only this call`);
+		for (const [channel, hasUI] of [["TUI", true], ["RPC", true], ["print/json/headless", false]] as const) {
+			const blocked = await toolCall!(
+				{ toolName, input: { ...recognizedInput, action } },
+				context(hasUI),
+			);
+			assert.equal(blocked?.block, true, `${channel} must hard-block ${toolName}`);
+			assert.match(
+				blocked?.reason ?? "",
+				/^gentle-ai\.execution-surface\.external-fallback-prohibited:/,
+			);
+			assert.match(
+				blocked?.reason ?? "",
+				/already-selected managed runtime or stop actionably/i,
+			);
+			const diagnostic = (blocked?.reason ?? "").slice((blocked?.reason ?? "").indexOf("action="));
+			assert.equal(
+				diagnostic,
+				`action=${action}; target-cwd=/workspace/target; tool=${toolName}; transition=${transitionClass}`,
+			);
+			assert.doesNotMatch(blocked?.reason ?? "", /SENTINEL/);
+		}
 	}
-	assert.equal(confirmations.length, 3, "each approved invocation must ask freshly");
-	for (const confirmation of confirmations) {
-		assert.deepEqual(confirmation[2], { timeout: 30_000 });
-	}
-	const diagnostic = confirmations[0]?.slice(0, 2).join(" ") ?? "";
-	assert.match(diagnostic, /action=send; target-cwd=\/workspace\/target; tool=arbitrary_tool; transition=legacy-send/);
-	assert.match(confirmations[2]?.slice(0, 2).join(" ") ?? "", /transition=legacy-ask/);
-	assert.doesNotMatch(diagnostic, /SENTINEL/);
-	assert.equal(diagnostic.split("; ").length, 4, "confirmation renders only four diagnostic fields");
+	assert.equal(confirmations.length, 0, "no UI context may authorize an execution-surface fallback");
 
-	for (const runtime of ["json", "print", "headless"]) {
-		const blocked = await toolCall!({ toolName: "arbitrary_tool", input: recognizedInput }, context(true, false));
-		assert.equal(blocked?.block, true, `${runtime} must block without confirmation`);
-		assert.match(blocked?.reason ?? "", /^gentle-ai\.execution-surface\.interactive-required:/);
-		assert.doesNotMatch(blocked?.reason ?? "", /SENTINEL/);
-	}
-	const deniedOrTimedOut = await toolCall!({ toolName: "arbitrary_tool", input: recognizedInput }, context(false));
-	assert.match(deniedOrTimedOut?.reason ?? "", /^gentle-ai\.execution-surface\.denied-or-timeout:/);
-	const rejected = await toolCall!({ toolName: "arbitrary_tool", input: recognizedInput }, context(new Error("cancelled")));
-	assert.match(rejected?.reason ?? "", /^gentle-ai\.execution-surface\.confirmation-failed:/);
+	const first = await toolCall!(
+		{ toolName: "generic-tool", input: recognizedInput },
+		context(true),
+	);
+	const second = await toolCall!(
+		{ toolName: "generic-tool", input: { ...recognizedInput, history: ["SENTINEL_HISTORY"] } },
+		context(true),
+	);
+	assert.equal(second?.reason, first?.reason, "history, parent, and ancestry metadata must not bypass the hard block");
 
 	for (const input of [
 		{ openProjectPaneIfMissing: true, action: "send" },
@@ -437,12 +409,12 @@ test("execution-surface containment confirms only a validated pending TUI/RPC ca
 		const malformed = await toolCall!({ toolName: "arbitrary_tool", input }, context(false));
 		assert.match(malformed?.reason ?? "", /^gentle-ai\.execution-surface\.malformed:/);
 	}
-	for (const input of [{}, { openProjectPaneIfMissing: false }]) {
-		assert.equal(await toolCall!({ toolName: "subagent_run", input }, context(false, false)), undefined);
+	for (const input of [{}, { openProjectPaneIfMissing: false }, { task: "ordinary", mode: "task" }]) {
+		assert.equal(await toolCall!({ toolName: "subagent_run", input }, context(false)), undefined);
 	}
 });
 
-test("active delegation documentation contains selected-runtime actionable stops", () => {
+test("active delegation documentation preserves managed-runtime containment", () => {
 	for (const file of [
 		"assets/orchestrator.md",
 		"assets/orchestrator-delegation.md",
@@ -451,9 +423,17 @@ test("active delegation documentation contains selected-runtime actionable stops
 	]) {
 		const source = readFileSync(file, "utf8");
 		assert.doesNotMatch(source, /(?:Pi's native|native) `Agent`/i, `${file} must not switch delegation runtimes`);
-		assert.match(source, /selected runtime[\s\S]{0,160}actionable stop/i, `${file} must make exhaustion actionable`);
+		assert.match(source, /selected (?:managed )?runtime[\s\S]{0,160}actionable stop/i, `${file} must make exhaustion actionable`);
+		assert.match(source, /target-cwd capability[\s\S]{0,240}stop actionably/i, `${file} must stop when target cwd is unavailable`);
+		assert.match(source, /#376/, `${file} must retain #376 as the positive target-cwd feature`);
 	}
+	const delegation = readFileSync("assets/orchestrator-delegation.md", "utf8");
+	assert.match(delegation, /Background execution is policy-gated/);
+	assert.match(delegation, /mode: "background"[\s\S]{0,160}ONLY for independent/i);
+	assert.doesNotMatch(delegation, /prompt[^\n]{0,80}\bcd\b/i);
 	const readme = readFileSync("README.md", "utf8");
 	assert.doesNotMatch(readme, /pi install npm:pi-intercom/);
 	assert.match(readme, /pi remove npm:pi-intercom/);
+	const runtime = readFileSync("extensions/gentle-ai.ts", "utf8");
+	assert.doesNotMatch(runtime, /pi-intercom/);
 });

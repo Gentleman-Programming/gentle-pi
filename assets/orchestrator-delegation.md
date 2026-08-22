@@ -251,6 +251,8 @@ Use the configured subagent runtime when available. Prefer the `subagent_*` tool
 
 The generic role precedence below is the explicit exception to this general runtime preference.
 
+Execution-surface containment: selected managed `subagent_run` inherits the parent cwd and has no target-cwd capability. If another worktree is required, stop actionably; never switch sessions, processes, windows, panes, or remote surfaces. #376 owns positive managed target-cwd execution.
+
 <!-- gentle-pi:background-subagents -->
 #### Background Subagent Policy
 

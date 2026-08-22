@@ -1072,7 +1072,6 @@ type ExecutionSurfaceClassification =
 			transitionClass: "legacy-send" | "legacy-ask" | "execution-surface";
 		};
 
-const EXECUTION_SURFACE_CONFIRM_TIMEOUT_MS = 30_000;
 const EXECUTION_SURFACE_REASON_PREFIX = "gentle-ai.execution-surface";
 
 function executionSurfaceInputString(
@@ -1099,16 +1098,14 @@ function classifyExecutionSurfaceCall(
 	const action = executionSurfaceInputString(input, "action");
 	const cwd = executionSurfaceInputString(input, "cwd");
 	if (action === undefined || cwd === undefined) return { kind: "malformed" };
+	let transitionClass: "legacy-send" | "legacy-ask" | "execution-surface" = "execution-surface";
+	if (action === "send") transitionClass = "legacy-send";
+	else if (action === "ask") transitionClass = "legacy-ask";
 	return {
 		kind: "recognized",
 		action,
 		targetCwd: resolve(contextCwd, cwd),
-		transitionClass:
-			action === "send"
-				? "legacy-send"
-				: action === "ask"
-					? "legacy-ask"
-					: "execution-surface",
+		transitionClass,
 	};
 }
 
@@ -1124,31 +1121,21 @@ function renderExecutionSurfaceDiagnostic(
 	].join("; ");
 }
 
-async function confirmExecutionSurfaceCall(
+function blockExecutionSurfaceCall(
 	toolName: string,
 	input: unknown,
 	ctx: ExtensionContext,
-): Promise<ToolCallEventResult | undefined> {
+): ToolCallEventResult | undefined {
 	const classification = classifyExecutionSurfaceCall(toolName, input, ctx.cwd);
 	if (classification.kind === "unrecognized") return undefined;
 	if (classification.kind === "malformed") {
 		return { block: true, reason: `${EXECUTION_SURFACE_REASON_PREFIX}.malformed: invalid execution-surface capability input.` };
 	}
 	const diagnostic = renderExecutionSurfaceDiagnostic(toolName, classification);
-	if (!ctx.hasUI) {
-		return { block: true, reason: `${EXECUTION_SURFACE_REASON_PREFIX}.interactive-required: ${diagnostic}` };
-	}
-	try {
-		const approved = await ctx.ui.confirm(
-			"Allow execution-surface transition?",
-			diagnostic,
-			{ timeout: EXECUTION_SURFACE_CONFIRM_TIMEOUT_MS },
-		);
-		if (approved) return undefined;
-		return { block: true, reason: `${EXECUTION_SURFACE_REASON_PREFIX}.denied-or-timeout: ${diagnostic}` };
-	} catch {
-		return { block: true, reason: `${EXECUTION_SURFACE_REASON_PREFIX}.confirmation-failed: ${diagnostic}` };
-	}
+	return {
+		block: true,
+		reason: `${EXECUTION_SURFACE_REASON_PREFIX}.external-fallback-prohibited: external execution-surface fallback is prohibited; caller must use the already-selected managed runtime or stop actionably. ${diagnostic}`,
+	};
 }
 
 function evaluateSensitivePathTool(
@@ -7596,7 +7583,7 @@ function createGentleAiExtensionForTesting(
 			event.input,
 		);
 		if (sensitivePathDenied) return sensitivePathDenied;
-		const executionSurfaceResult = await confirmExecutionSurfaceCall(
+		const executionSurfaceResult = blockExecutionSurfaceCall(
 			event.toolName,
 			event.input,
 			ctx,

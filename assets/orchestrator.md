@@ -47,7 +47,7 @@ Core question: does this inflate parent context without need?
 
 The canonical per-action table is the mirrored gentle-ai canon Delegation Rules table in `{{GENTLE_PI_DELEGATION_PATH}}`.
 
-Mandatory Delegation Triggers — stop rules; once fired, delegate through the selected subagent runtime. Selected-runtime exhaustion returns an actionable stop that identifies how to restore it; do not switch runtimes:
+Mandatory delegation triggers require the selected runtime; exhaustion returns an actionable stop; do not switch runtimes:
 
 1. **4-file rule** — 4+ files to understand → delegate a scout/mapping task.
 2. **Multi-file write rule** — 2+ non-trivial files touched → delegate one writer.
@@ -56,6 +56,8 @@ Mandatory Delegation Triggers — stop rules; once fired, delegate through the s
 5. **Verification rule** — executing/delegating verification commands → `gentle-ai-verify`; only the 1-3-file read-only check stays inline.
 6. **Long-session rule** — ~20 tool calls, 5 exploratory reads, or 2 non-mechanical edits without delegation → pause and delegate.
 7. **Review actor rule** — review lenses run only when selected by ordinary transaction start; explicit Judgment Day uses its two named judges. Lifecycle and SDD boundaries launch zero review actors.
+
+Selected managed runtime: target-cwd capability absent; stop actionably. #376 owns positive target-cwd capability.
 
 {{GENTLE_PI_BACKGROUND_POLICY}}; rules: the background-subagents block in the delegation contract.
 

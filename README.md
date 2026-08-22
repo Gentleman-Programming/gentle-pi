@@ -94,7 +94,7 @@ pi install npm:@juicesharp/rpiv-ask-user-question
 
 ### Remove the legacy `pi-intercom` extension
 
-`gentle-pi` contains the execution-surface confirmation policy. If you previously installed `pi-intercom`, inspect the installed extensions, remove it from the scope where it is installed, then restart Pi:
+`gentle-pi` contains execution-surface containment, not a runtime integration. If you previously installed `pi-intercom`, inspect the installed extensions, remove it from the scope where it is installed, then restart Pi:
 
 ```bash
 pi list
@@ -157,7 +157,7 @@ The goal is not ceremony. The goal is to avoid accidental chaos. Once a task sto
 
 ### Delegation triggers
 
-`gentle-pi` keeps the parent session thin and delegates at the narrowest useful point. The selected runtime is the `subagent_*` tool family when it runs the user's configured project/global subagent definitions and preserves history/background behavior. Use waiting/task mode when the parent must consume the result and continue the workflow; use background mode only for independent work where parent continuation is not required. Selected-runtime exhaustion returns an actionable stop that identifies how to restore it; do not switch runtimes.
+`gentle-pi` keeps the parent session thin and delegates at the narrowest useful point. The selected managed runtime is the `subagent_*` tool family when it runs the user's configured project/global subagent definitions and preserves history/background behavior. Use waiting/task mode when the parent must consume the result and continue the workflow; use background mode only for independent work where parent continuation is not required. Selected-runtime exhaustion returns an actionable stop that identifies how to restore it; do not switch runtimes. The selected managed runtime has no target-cwd capability: when another worktree is required, stop actionably rather than switching sessions, processes, windows, panes, or remote surfaces. #376 owns positive managed target-cwd execution.
 
 | Trigger                                                                                                                     | Required behavior                                                             |
 | --------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |

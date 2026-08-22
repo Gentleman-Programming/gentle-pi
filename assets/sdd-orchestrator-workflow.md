@@ -224,7 +224,7 @@ The Automatic Mode Gatekeeper one-rerun rule above is a quality gate, not a laun
 
 ## SDD Phase Delegation Mode
 
-Launch SDD phase subagents with `subagent_run` `mode: "task"` when the parent needs the phase result to route the next step. SDD phases, writers, dependent verify evidence, and archive are foreground-mandatory under the background subagent policy block in the delegation contract; background completion is a notification/history mechanism, not an orchestration resume guarantee.
+Launch SDD phase subagents with `subagent_run` `mode: "task"` when the parent needs the phase result to route the next step. SDD phases, writers, dependent verify evidence, and archive are foreground-mandatory under the background subagent policy block in the delegation contract; background completion is a notification/history mechanism, not an orchestration resume guarantee. The selected managed runtime has no target-cwd capability: when another worktree is required, stop actionably rather than switching sessions, processes, windows, panes, or remote surfaces. #376 owns positive managed target-cwd execution.
 
 ## Model Assignments
 
