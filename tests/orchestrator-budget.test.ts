@@ -158,7 +158,13 @@ const DISPOSITION_MAP: DispositionRange[] = [
 	{ lines: [25, 29], target: "delegation", label: "Language Boundary LB5 (exceptions)" },
 	{ lines: [31, 40], target: "core", label: "Mental Model" },
 	{ lines: [42, 42], target: "core", label: "Work Routing Ladder heading" },
-	{ lines: [44, 97], target: "delegation", label: "Work Routing Ladder body + Pi Subagent Model Routing" },
+	{ lines: [44, 78], target: "delegation", label: "Work Routing Ladder body + Pi Subagent Model Routing" },
+	{
+		lines: [79, 79],
+		target: "obsolete",
+		label: "Fallback to Pi native Agent or other delegation mechanism removed by execution-surface containment (#379)",
+	},
+	{ lines: [80, 97], target: "delegation", label: "Pi Subagent Model Routing" },
 	{
 		lines: [98, 107],
 		target: "obsolete",
@@ -178,9 +184,20 @@ const DISPOSITION_MAP: DispositionRange[] = [
 		label: "Pre-canon delegation table replaced by the mirrored gentle-ai canon table (#312)",
 	},
 	{
-		lines: [128, 132],
+		lines: [128, 129],
 		target: "delegation",
-		label: "Mandatory Triggers heading + Pi trigger preamble + 4-file binding",
+		label: "Mandatory Triggers heading + Pi trigger preamble",
+	},
+	{
+		lines: [130, 130],
+		target: "obsolete",
+		label: "Best-available delegation-runtime fallback removed by execution-surface containment (#379)",
+	},
+	{ lines: [131, 131], target: "delegation", label: "4-file binding" },
+	{
+		lines: [132, 132],
+		target: "obsolete",
+		label: "Fallback agent/runtime instruction removed by execution-surface containment (#379)",
 	},
 	{
 		lines: [133, 133],

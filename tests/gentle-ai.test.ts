@@ -300,3 +300,142 @@ test("runtime lifecycle gates reject fabricated metadata while compound and wrap
 	assert.match(destructive?.reason ?? "", /safety policy blocked a destructive shell command/i);
 	assert.doesNotMatch(destructive?.reason ?? "", /approved receipt/i);
 });
+
+test("execution-surface containment hard-blocks cross-surface requests without UI approval", async () => {
+	type ToolCallHandler = (
+		event: { toolName: string; input: unknown },
+		ctx: ExtensionContext,
+	) => Promise<ToolCallEventResult | undefined>;
+	const handlers = new Map<string, ToolCallHandler>();
+	const pi = {
+		on(name: string, handler: ToolCallHandler) {
+			handlers.set(name, handler);
+		},
+		registerCommand() {},
+		registerTool() {},
+	} as unknown as ExtensionAPI;
+	createGentleAiExtension({ nativeReviewCli: null })(pi);
+	const toolCall = handlers.get("tool_call");
+	assert.equal(typeof toolCall, "function");
+
+	for (const input of [{}, { openProjectPaneIfMissing: false }]) {
+		assert.deepEqual(
+			__testing.classifyExecutionSurfaceCall("arbitrary_tool", input, "/workspace/project"),
+			{ kind: "unrecognized" },
+		);
+	}
+	for (const input of [
+		{ openProjectPaneIfMissing: "false" },
+		{ openProjectPaneIfMissing: null },
+		{ openProjectPaneIfMissing: true },
+		{ openProjectPaneIfMissing: true, action: "send" },
+		{ openProjectPaneIfMissing: true, cwd: "/workspace/target" },
+		{ openProjectPaneIfMissing: true, action: 1, cwd: "/workspace/target" },
+		{ openProjectPaneIfMissing: true, action: "send", cwd: 1 },
+		{ openProjectPaneIfMissing: true, action: "", cwd: "/workspace/target" },
+		{ openProjectPaneIfMissing: true, action: "send", cwd: "" },
+	]) {
+		assert.deepEqual(
+			__testing.classifyExecutionSurfaceCall("arbitrary_tool", input, "/workspace/project"),
+			{ kind: "malformed" },
+		);
+	}
+
+	const confirmations: unknown[][] = [];
+	const context = (hasUI: boolean) => ({
+		cwd: "/workspace/project",
+		hasUI,
+		ui: {
+			confirm: async (...args: unknown[]) => {
+				confirmations.push(args);
+				return true;
+			},
+		},
+	}) as unknown as ExtensionContext;
+	const recognizedInput = {
+		action: "send",
+		cwd: "/workspace/project/../target",
+		openProjectPaneIfMissing: true,
+		message: "SENTINEL_MESSAGE",
+		task: "SENTINEL_TASK",
+		parent: { cwd: "/SENTINEL_PARENT", action: "SENTINEL_PARENT_ACTION" },
+		ancestry: ["SENTINEL_ANCESTRY"],
+	};
+
+	for (const [toolName, action, transitionClass] of [
+		["legacy-send-tool", "send", "legacy-send"],
+		["legacy-ask-tool", "ask", "legacy-ask"],
+		["generic-tool", "delegate", "execution-surface"],
+	] as const) {
+		for (const [channel, hasUI] of [["TUI", true], ["RPC", true], ["print/json/headless", false]] as const) {
+			const blocked = await toolCall!(
+				{ toolName, input: { ...recognizedInput, action } },
+				context(hasUI),
+			);
+			assert.equal(blocked?.block, true, `${channel} must hard-block ${toolName}`);
+			assert.match(
+				blocked?.reason ?? "",
+				/^gentle-ai\.execution-surface\.external-fallback-prohibited:/,
+			);
+			assert.match(
+				blocked?.reason ?? "",
+				/already-selected managed runtime or stop actionably/i,
+			);
+			const diagnostic = (blocked?.reason ?? "").slice((blocked?.reason ?? "").indexOf("action="));
+			assert.equal(
+				diagnostic,
+				`action=${action}; target-cwd=/workspace/target; tool=${toolName}; transition=${transitionClass}`,
+			);
+			assert.doesNotMatch(blocked?.reason ?? "", /SENTINEL/);
+		}
+	}
+	assert.equal(confirmations.length, 0, "no UI context may authorize an execution-surface fallback");
+
+	const first = await toolCall!(
+		{ toolName: "generic-tool", input: recognizedInput },
+		context(true),
+	);
+	const second = await toolCall!(
+		{ toolName: "generic-tool", input: { ...recognizedInput, history: ["SENTINEL_HISTORY"] } },
+		context(true),
+	);
+	assert.equal(second?.reason, first?.reason, "history, parent, and ancestry metadata must not bypass the hard block");
+
+	for (const input of [
+		{ openProjectPaneIfMissing: true, action: "send" },
+		{ openProjectPaneIfMissing: true, action: "send", cwd: "" },
+		{ openProjectPaneIfMissing: "true" },
+	]) {
+		const malformed = await toolCall!({ toolName: "arbitrary_tool", input }, context(false));
+		assert.match(malformed?.reason ?? "", /^gentle-ai\.execution-surface\.malformed:/);
+	}
+	for (const input of [{}, { openProjectPaneIfMissing: false }, { task: "ordinary", mode: "task" }]) {
+		assert.equal(await toolCall!({ toolName: "subagent_run", input }, context(false)), undefined);
+	}
+});
+
+test("active delegation documentation preserves managed-runtime containment", () => {
+	for (const file of [
+		"assets/orchestrator.md",
+		"assets/orchestrator-delegation.md",
+		"assets/sdd-orchestrator-workflow.md",
+		"README.md",
+	]) {
+		const source = readFileSync(file, "utf8");
+		assert.doesNotMatch(source, /(?:Pi's native|native) `Agent`/i, `${file} must not switch delegation runtimes`);
+		assert.match(source, /do not switch runtimes/i, `${file} must explicitly prohibit runtime switching`);
+		assert.doesNotMatch(source, /platform'?s native bounded worker/i, `${file} must not route delegation through a platform-native worker`);
+		assert.match(source, /selected (?:managed )?runtime[\s\S]{0,160}actionable stop/i, `${file} must make exhaustion actionable`);
+		assert.match(source, /target-cwd capability[\s\S]{0,240}stop actionably/i, `${file} must stop when target cwd is unavailable`);
+		assert.match(source, /#376/, `${file} must retain #376 as the positive target-cwd feature`);
+	}
+	const delegation = readFileSync("assets/orchestrator-delegation.md", "utf8");
+	assert.match(delegation, /Background execution is policy-gated/);
+	assert.match(delegation, /mode: "background"[\s\S]{0,160}ONLY for independent/i);
+	assert.doesNotMatch(delegation, /prompt[^\n]{0,80}\bcd\b/i);
+	const readme = readFileSync("README.md", "utf8");
+	assert.doesNotMatch(readme, /pi install npm:pi-intercom/);
+	assert.match(readme, /pi remove npm:pi-intercom/);
+	const runtime = readFileSync("extensions/gentle-ai.ts", "utf8");
+	assert.doesNotMatch(runtime, /pi-intercom/);
+});

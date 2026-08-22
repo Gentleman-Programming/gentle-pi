@@ -85,7 +85,6 @@ Recommended companion packages:
 
 ```bash
 pi install npm:pi-subagents-j0k3r
-pi install npm:pi-intercom
 pi install npm:gentle-engram
 pi install npm:pi-web-access
 pi install npm:pi-lens
@@ -93,7 +92,17 @@ pi install npm:@juicesharp/rpiv-todo
 pi install npm:@juicesharp/rpiv-ask-user-question
 ```
 
-Then start Pi in a project:
+### Remove the legacy `pi-intercom` extension
+
+`gentle-pi` contains execution-surface containment, not a runtime integration. If you previously installed `pi-intercom`, inspect the installed extensions, remove it from the scope where it is installed, then restart Pi:
+
+```bash
+pi list
+pi remove npm:pi-intercom      # global installation
+pi remove -l npm:pi-intercom   # local installation
+```
+
+Then restart Pi in a project:
 
 ```bash
 pi
@@ -148,12 +157,12 @@ The goal is not ceremony. The goal is to avoid accidental chaos. Once a task sto
 
 ### Delegation triggers
 
-`gentle-pi` keeps the parent session thin and delegates at the narrowest useful point. When the Pi Subagents extension is installed, the preferred runtime is the `subagent_*` tool family because it runs the user's configured project/global subagent definitions and preserves history/background behavior. Use waiting/task mode when the parent must consume the result and continue the workflow; use background mode only for independent work where parent continuation is not required. If those tools are unavailable, the parent should fall back to Pi's native `Agent` tool or another available delegation mechanism. The requirement is delegation; the runtime is capability-dependent.
+`gentle-pi` keeps the parent session thin and delegates at the narrowest useful point. The selected managed runtime is the `subagent_*` tool family when it runs the user's configured project/global subagent definitions and preserves history/background behavior. Use waiting/task mode when the parent must consume the result and continue the workflow; use background mode only for independent work where parent continuation is not required. Selected-runtime exhaustion returns an actionable stop that identifies how to restore it; do not switch runtimes. The selected managed runtime has no target-cwd capability: when another worktree is required, stop actionably rather than switching sessions, processes, windows, panes, or remote surfaces. #376 owns positive managed target-cwd execution.
 
 | Trigger                                                                                                                     | Required behavior                                                             |
 | --------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
 | Reading 4+ files to understand a flow                                                                                       | Launch `scout`, `context-builder`, or the closest read-only mapping subagent. |
-| Touching 2+ non-trivial code files                                                                                          | Delegate one writer; do not continue inline unless delegation is unavailable. |
+| Touching 2+ non-trivial code files                                                                                          | Delegate one writer in the selected runtime; exhaustion returns an actionable stop. |
 | Commit, push, or PR after code changes                                                                                      | Validate the approved receipt and exact typed target with zero actors.        |
 | Wrong cwd, worktree/git accident, merge recovery, confusing test/env issue                                                  | Stop, preserve the frozen scope, investigate separately, and validate the existing receipt; never launch a fresh review lens or reopen review as incident handling. |
 | Long monolithic session with accumulating complexity, roughly 20 tool calls, 5 exploratory reads, or 2 non-mechanical edits | Pause and delegate the remaining work, or stop and explain the exact blocker. |
