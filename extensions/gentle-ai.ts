@@ -108,6 +108,7 @@ import {
 import {
 	createNativeReviewCli,
 	createNodeExecFileAdapter,
+	validateNativeReviewConsentAgentBinding,
 	isCanonicalProcessString,
 	nativeReviewAbandonAuthorization,
 	nativeReviewLegacyAliasRepairAuthorization,
@@ -4605,6 +4606,7 @@ async function executeReviewControllerOperation(
 					try {
 						if (error.consent.schema === "gentle-ai.review-integration.consent/v3") {
 							const decodedConsent = decodeReviewConsentV3(error.consent.raw, startAgent);
+							validateNativeReviewConsentAgentBinding(decodedConsent, startAgent);
 							if (decodedConsent.agent !== REVIEW_HOST_AGENT) throw new TypeError("consent.agent does not match the Pi host binding");
 						}
 					} catch (cause) {

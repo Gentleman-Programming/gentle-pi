@@ -754,7 +754,7 @@ test("typed Pi transport refusal relays agentless v3 consent and keeps granted a
 	}
 });
 
-test("pending consent bindings do not dedupe across Pi and agentless START transports", async (t) => {
+test("agentless fallback rejects an agent-bound v3 route before pending-consent creation", async (t) => {
 	const cwd = repository(t);
 	const consent = foreignOrUnboundV3Consent(cwd, "unbound");
 	for (const choice of consent.choices) choice.invocation = choice.invocation.replace(" --consent ", " --agent pi --consent ");
@@ -763,9 +763,8 @@ test("pending consent bindings do not dedupe across Pi and agentless START trans
 	const targetStatus = native.targetStatus!;
 	const startRequests: NativeStartRequest[] = [];
 	const answerRequests: NativeReviewConsentAnswerRequest[] = [];
-	let piStatusCalls = 0;
 	native.targetStatus = async (request) => {
-		if (request.agent === "pi" && piStatusCalls++ > 0) {
+		if (request.agent === "pi") {
 			throw new NativeReviewIntegrationError({
 				schema: "gentle-ai.review-integration.failure/v2",
 				contract: "gentle-ai.review-integration/v2",
@@ -789,27 +788,16 @@ test("pending consent bindings do not dedupe across Pi and agentless START trans
 	};
 	native.answerConsent = async (request) => {
 		answerRequests.push(request);
-		return {
-			kind: "declined",
-			targetIdentity: consent.targetIdentity,
-			projection: consent.projection,
-			riskLevel: consent.riskLevel,
-			changedFiles: 1,
-			changedLines: 1,
-			consent: "declined_this_candidate",
-			raw: { operation: "review/start", action: "declined", consent: "declined_this_candidate" },
-		};
+		throw new Error("agent-bound fallback consent must never reach the answer provider");
 	};
 
-	const controller = runtime(native).controller;
-	const context = headlessContext(cwd);
-	const piBinding = await blockedConsent(controller, "pending-pi", context);
-	const agentlessBinding = await blockedConsent(controller, "pending-agentless", context);
-	assert.notEqual(piBinding.consent_binding, agentlessBinding.consent_binding, "a fallback route must replace, not reuse, the Pi-bound pending consent");
-	assert.deepEqual(startRequests.map((request) => request.agent), ["pi", undefined]);
-	await assert.rejects(() => answerConsent(controller, piBinding.consent_binding, "granted", context), /unknown, expired, or already consumed/);
-	await answerConsent(controller, agentlessBinding.consent_binding, "declined", context);
-	assert.equal(answerRequests[0]?.startAgent, undefined, "the surviving binding retains the fallback transport");
+	const result = await execStart(runtime(native).controller, "agent-bound-fallback", headlessContext(cwd));
+	assert.equal(result.status, "blocked");
+	assert.equal(result.outcome, "native-mutation-status-reconciled");
+	assert.equal("consent" in result, false, "an invalid fallback route must not be exposed");
+	assert.equal("consent_binding" in result, false, "an invalid fallback route must not create pending consent");
+	assert.deepEqual(startRequests.map((request) => request.agent), [undefined]);
+	assert.deepEqual(answerRequests, []);
 });
 
 test("consent relay returns the identical complete parent-visible envelope with or without UI and never answers internally", async (t) => {

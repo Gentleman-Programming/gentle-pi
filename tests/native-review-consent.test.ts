@@ -449,7 +449,7 @@ test("Pi START rejects a foreign consent/v3 envelope and only relays a Pi-bound 
 });
 
 test("a granted consent/v3 answer decodes the captured start/v3 result with its event binding", async () => {
-	const decoded = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV3(devbinaryFixture<Record<string, unknown>>("consent-v3.captured.json"));
+	const decoded = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV3(agentlessPiConsent());
 	const cwd = decoded.choices[0].invocation.split(" --cwd ")[1]!.split(" ")[0]!;
 	const started = devbinaryFixture<Record<string, unknown>>("start-v3-consent-granted.captured.json");
 	const queue = queuedAdapter([capabilities(), started]);
@@ -468,7 +468,7 @@ test("a granted consent/v3 answer decodes the captured start/v3 result with its 
 });
 
 test("a declined consent/v3 answer accepts the captured declined result and creates no authority", async () => {
-	const decoded = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV3(devbinaryFixture<Record<string, unknown>>("consent-v3.captured.json"));
+	const decoded = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV3(agentlessPiConsent());
 	const cwd = decoded.choices[1].invocation.split(" --cwd ")[1]!.split(" ")[0]!;
 	const declined = devbinaryFixture<Record<string, unknown>>("start-v3-consent-declined.captured.json");
 	const queue = queuedAdapter([capabilities(), declined]);
@@ -477,6 +477,68 @@ test("a declined consent/v3 answer accepts the captured declined result and crea
 	assert.ok(result.kind === "declined");
 	assert.equal(result.consent, "declined_this_candidate");
 	assert.equal(result.targetIdentity, decoded.targetIdentity);
+});
+
+test("agentless v3 consent rejects every tokenized agent option before provider launch", async () => {
+	const decoded = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV3(agentlessPiConsent()) as ReviewConsentV3;
+	const drifted = (replace: (invocation: string) => string): ReviewConsentV3 => {
+		const consent = structuredClone(decoded);
+		for (const choice of consent.choices) choice.invocation = replace(choice.invocation);
+		return consent;
+	};
+	const cases = [
+		["separate Pi", drifted((invocation) => invocation.replace(" --consent ", " --agent pi --consent "))],
+		["equals Pi", drifted((invocation) => invocation.replace(" --consent ", " --agent=pi --consent "))],
+		["foreign", drifted((invocation) => invocation.replace(" --consent ", " --agent claude-code --consent "))],
+		["duplicate", drifted((invocation) => invocation.replace(" --consent ", " --agent pi --agent pi --consent "))],
+		["conflicting", drifted((invocation) => invocation.replace(" --consent ", " --agent pi --agent=claude-code --consent "))],
+	] as const;
+	const cwd = decoded.choices[0].invocation.split(" --cwd ")[1]!.split(" ")[0]!;
+	for (const [label, consent] of cases) {
+		for (const createClient of [client, runtimeClient]) {
+			const queue = queuedAdapter([]);
+			await assert.rejects(
+				() => createClient(queue.adapter).answerConsent({ cwd, consent, answer: "granted", startAgent: undefined }),
+				(error: unknown) => {
+					assert.equal((error as { name?: string }).name, "NativeReviewConsentBindingError", `${label} must be rejected locally`);
+					assert.equal((error as { reason?: string }).reason, "consent-invocation-agent-changed");
+					assert.equal((error as { launchAttempted?: boolean }).launchAttempted, false);
+					assert.equal((error as { mutationOutcome?: string }).mutationOutcome, "none");
+					return true;
+				},
+			);
+			assert.deepEqual(queue.calls, [], `${label} must not launch the provider`);
+		}
+	}
+});
+
+test("Pi v3 consent validates every choice before provider launch", async () => {
+	const decoded = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV3(piConsent(), "pi") as ReviewConsentV3;
+	const declined = decoded.choices.find((choice) => choice.answer === "declined")!;
+	declined.invocation = declined.invocation.replace("--agent pi", "--agent pi --agent pi");
+	const cwd = decoded.choices[0].invocation.split(" --cwd ")[1]!.split(" ")[0]!;
+	const queue = queuedAdapter([]);
+	await assert.rejects(
+		() => client(queue.adapter).answerConsent({ cwd, consent: decoded, answer: "granted", startAgent: "pi" }),
+		(error: unknown) => (error as { reason?: string }).reason === "consent-invocation-agent-changed",
+	);
+	assert.deepEqual(queue.calls, [], "an invalid unselected choice must still prevent provider launch");
+});
+
+test("agentless v3 consent ignores quoted or embedded --agent text", async () => {
+	const decoded = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV3(agentlessPiConsent()) as ReviewConsentV3;
+	const cwd = decoded.choices[0].invocation.split(" --cwd ")[1]!.split(" ")[0]!;
+	for (const replace of [
+		(invocation: string) => invocation.replace(" --consent ", " --note \"--agent pi\" --consent "),
+		(invocation: string) => invocation.replace(" --consent ", " --note=--agent\\ pi --consent "),
+	]) {
+		const consent = structuredClone(decoded);
+		for (const choice of consent.choices) choice.invocation = replace(choice.invocation);
+		const queue = queuedAdapter([capabilities(), devbinaryFixture<Record<string, unknown>>("start-v3-consent-granted.captured.json")]);
+		const result = await client(queue.adapter).answerConsent({ cwd, consent, answer: "granted", startAgent: undefined });
+		assert.equal(result.kind, "started");
+		assert.equal(queue.calls.filter((arguments_) => arguments_[0] === "review" && arguments_[1] === "start").length, 1);
+	}
 });
 
 test("agentless v3 Pi consent replays its exact provider invocation when the START transport fell back", async () => {

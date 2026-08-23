@@ -2065,6 +2065,34 @@ function exactConsentOption(arguments_                   , name        )        
 	}
 }
 
+function consentInvocationAgentOptions(arguments_                   )                    {
+	const values           = [];
+	for (let index = 0; index < arguments_.length; index += 1) {
+		const token = arguments_[index] ;
+		if (token === "--agent") {
+			const value = arguments_[index + 1];
+			if (value === undefined || value.length === 0 || value.startsWith("--")) throw new NativeReviewConsentBindingError("consent-invocation-agent-changed", "Native consent invocation agent binding changed");
+			values.push(value);
+			index += 1;
+		} else if (token.startsWith("--agent=")) values.push(token.slice("--agent=".length));
+	}
+	return values;
+}
+
+/** Validates every v3 provider choice against the negotiated START transport. */
+export function validateNativeReviewConsentAgentBinding(consent                       , startAgent                  )       {
+	if (consent.schema !== "gentle-ai.review-integration.consent/v3") return;
+	if (consent.agent !== "pi") throw new NativeReviewConsentBindingError("consent-invocation-agent-changed", "Native Pi consent envelope agent binding changed");
+	for (const choice of consent.choices) {
+		const agentOptions = consentInvocationAgentOptions(splitNativeConsentInvocation(choice.invocation));
+		if (startAgent === "pi") {
+			if (agentOptions.length !== 1 || agentOptions[0] !== "pi") throw new NativeReviewConsentBindingError("consent-invocation-agent-changed", "Native Pi consent invocation agent binding changed");
+		} else if (agentOptions.length !== 0) {
+			throw new NativeReviewConsentBindingError("consent-invocation-agent-changed", "Native agentless consent invocation must not bind an agent");
+		}
+	}
+}
+
 function optionalConsentLineageOption(arguments_                   )                     {
 	const values           = [];
 	for (let index = 0; index < arguments_.length; index += 1) {
@@ -2090,6 +2118,7 @@ function optionalConsentLineageOption(arguments_                   )            
 
 function consentInvocationArguments(request                                  )                    {
 	if (request.startAgent !== undefined && request.startAgent !== "pi") throw new TypeError("Native consent START transport is unsupported");
+	validateNativeReviewConsentAgentBinding(request.consent, request.startAgent);
 	const choice = request.consent.choices.find((candidate) => candidate.answer === request.answer);
 	if (choice === undefined) throw new NativeReviewConsentBindingError("consent-answer-unknown", "Native consent answer must be granted or declined");
 	const words = splitNativeConsentInvocation(choice.invocation);
@@ -2100,9 +2129,6 @@ function consentInvocationArguments(request                                  )  
 	if (exactConsentOption(arguments_, "--target") !== request.consent.targetIdentity) throw new NativeReviewConsentBindingError("consent-invocation-target-changed", "Native consent invocation target binding changed");
 	if (exactConsentOption(arguments_, "--projection") !== request.consent.projection) throw new NativeReviewConsentBindingError("consent-invocation-projection-changed", "Native consent invocation projection binding changed");
 	const lineageId = optionalConsentLineageOption(arguments_);
-	if (request.consent.schema === "gentle-ai.review-integration.consent/v3" && request.startAgent === "pi" && exactConsentOption(arguments_, "--agent") !== "pi") {
-		throw new NativeReviewConsentBindingError("consent-invocation-agent-changed", "Native Pi consent invocation agent binding changed");
-	}
 	if (exactConsentOption(arguments_, "--consent") !== request.answer || arguments_.at(-1) !== request.answer) throw new NativeReviewConsentBindingError("consent-invocation-answer-changed", "Native consent invocation answer binding changed");
 	return { arguments_, ...(lineageId === undefined ? {} : { lineageId }) };
 }
