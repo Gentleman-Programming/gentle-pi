@@ -174,6 +174,7 @@ function startStatus(lineageId: string): ReviewStatusV3 {
 		...recoveredStatus(lineageId, false),
 		applicability: "unrelated",
 		action: "start",
+		nextTransition: undefined,
 	} as ReviewStatusV3;
 }
 
@@ -211,7 +212,7 @@ function ambiguousStartFailureNative(options: { refusePiAgent?: boolean } = {}):
 async function runAmbiguousStart(cwd: string, native: NativeReviewCli, lineageId: string): Promise<Record<string, unknown>> {
 	return await __testing.executeReviewControllerOperation(
 		{ operation: "start", input: JSON.stringify({ mode: "ordinary" }), lineageId },
-		cwd, new Map(), native, undefined, undefined, undefined, null,
+		cwd, native, undefined, null,
 	) as Record<string, unknown>;
 }
 
@@ -384,11 +385,11 @@ test("ordinary non-lifecycle STATUS inspection remains agent-less", async (t) =>
 
 test("a fresh controller provider instance probes the Pi transport again", async (t) => {
 	const cwd = repository(t);
-	const first = transportAwareNative({ refusePiAgent: true });
+	const first = transportAwareNative({ refusalCode: TRANSPORT_REFUSAL_CODE });
 	await runFinalize(cwd, first.native, "fresh-probe-lineage");
 	assert.equal(first.agents.filter((agent) => agent === "pi").length, 1);
 
-	const fresh = transportAwareNative({ refusePiAgent: true });
+	const fresh = transportAwareNative({ refusalCode: TRANSPORT_REFUSAL_CODE });
 	await runFinalize(cwd, fresh.native, "fresh-probe-lineage");
 	assert.equal(fresh.agents.filter((agent) => agent === "pi").length, 1,
 		"transport refusal caching must not leak across fresh controller provider instances");

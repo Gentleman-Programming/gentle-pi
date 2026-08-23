@@ -442,7 +442,12 @@ test("the generic consent/v3 decoder accepts every runtime while a Pi-bound deco
 		}
 		assert.equal(consent.offPath.command, "gentle-ai review mode disable");
 	}
-	assert.equal(decodeReviewConsentV3({ ...clone(source), agent: "pi" }, "pi").agent, "pi");
+	const piConsent = clone(source);
+	piConsent.agent = "pi";
+	for (const choice of piConsent.choices as JsonObject[]) {
+		choice.invocation = String(choice.invocation).replace(" --consent ", " --agent pi --consent ");
+	}
+	assert.equal(decodeReviewConsentV3(piConsent, "pi").agent, "pi");
 	for (const agent of ["claude-code", "opencode", "codex"] as const) {
 		assert.throws(() => decodeReviewConsentV3({ ...clone(source), agent }, "pi"), /consent\.agent/);
 	}
@@ -454,7 +459,7 @@ test("Pi consent/v3 requires provider-issued Pi invocation bindings", () => {
 	for (const choice of piConsent.choices as JsonObject[]) {
 		choice.invocation = String(choice.invocation).replace(" --consent ", " --agent pi --consent ");
 	}
-	const decoded = decodeReviewConsentV3(piConsent);
+	const decoded = decodeReviewConsentV3(piConsent, "pi");
 	assert.equal(decoded.agent, "pi");
 	assert.ok(decoded.choices.every((choice) => choice.invocation.includes(" --agent pi ")));
 
@@ -462,7 +467,7 @@ test("Pi consent/v3 requires provider-issued Pi invocation bindings", () => {
 	for (const choice of missingInvocationBinding.choices as JsonObject[]) {
 		choice.invocation = String(choice.invocation).replace(" --agent pi", "");
 	}
-	assert.throws(() => decodeReviewConsentV3(missingInvocationBinding), /agent/);
+	assert.throws(() => decodeReviewConsentV3(missingInvocationBinding, "pi"), /agent/);
 });
 
 test("consent identities never cross-decode", () => {

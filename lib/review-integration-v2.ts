@@ -1901,7 +1901,7 @@ export function decodeReviewConsentV3(value: unknown, expectedAgent?: ReviewCons
 	const agent = enumeration(body.agent, Object.values(REVIEW_CONSENT_AGENT_V3), "consent.agent") as ReviewConsentAgentV3;
 	if (expectedAgent !== undefined && agent !== expectedAgent) throw new TypeError("consent.agent does not match the expected runtime binding");
 	const semantics = decodeConsentSemantics(body);
-	if (agent === "pi" && semantics.choices.some((choice) => !choice.invocation.includes(" --agent pi "))) {
+	if (expectedAgent === "pi" && semantics.choices.some((choice) => !choice.invocation.includes(" --agent pi "))) {
 		throw new TypeError("consent Pi invocation must bind agent");
 	}
 	return {

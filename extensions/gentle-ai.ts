@@ -3509,7 +3509,7 @@ async function reconcileNativeMutationFailure(
 	error: unknown,
 	nativeReviewCli: NativeReviewCli,
 	target: Parameters<NonNullable<NativeReviewCli["targetStatus"]>>[0],
-	preOperationRevision?:
+	preOperationRevision?: string,
 	canonicalRetentionRoot = target.cwd,
 ): Promise<Record<string, unknown>> {
 	const failure = nativeOperationFailure(operation, error);
