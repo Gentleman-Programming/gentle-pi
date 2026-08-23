@@ -29,7 +29,7 @@
 //                  statusCalls, finalizeCalls } as JSON for the parent.
 
 import { join } from "node:path";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, realpath, writeFile } from "node:fs/promises";
 
 const cwd = process.argv[2];
 const statusFile = process.argv[3];
@@ -40,6 +40,7 @@ if (!cwd || !statusFile || !mode || !outFile) {
 }
 
 const { __testing } = await import(join(import.meta.dirname, "..", "..", "extensions", "gentle-ai.ts"));
+const { CandidateViewRegistry } = await import(join(import.meta.dirname, "..", "..", "lib", "review-candidate-view.ts"));
 const { ReviewHostRelayError, REVIEW_HOST_RELAY_FAILURE } = await import(join(import.meta.dirname, "..", "..", "lib", "review-host-relay.ts"));
 
 const statusQueue = JSON.parse(await readFile(statusFile, "utf8"));
@@ -95,7 +96,7 @@ const parameters = mode === "inspect"
 let result;
 let error;
 try {
-	result = await __testing.executeReviewControllerOperation(parameters, cwd, new Map(), nativeReviewCli);
+	result = await __testing.executeReviewControllerOperation(parameters, await realpath(cwd), nativeReviewCli, undefined, new CandidateViewRegistry());
 } catch (caught) {
 	error = caught instanceof Error ? { name: caught.name, message: caught.message } : String(caught);
 }

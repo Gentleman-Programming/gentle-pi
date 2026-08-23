@@ -347,6 +347,30 @@ function piConsent(): Record<string, unknown> {
 	return consent;
 }
 
+test("decodeReviewConsentV3 accepts exact Pi agent tokens and rejects missing, embedded, duplicate, or conflicting bindings", async () => {
+	const { decodeReviewConsentV3 } = await import("../lib/review-integration-v2.ts");
+	const mutateInvocations = (replace: (invocation: string) => string): Record<string, unknown> => {
+		const consent = piConsent();
+		for (const choice of consent.choices as Array<Record<string, unknown>>) choice.invocation = replace(String(choice.invocation));
+		return consent;
+	};
+
+	assert.doesNotThrow(() => decodeReviewConsentV3(piConsent(), "pi"), "the separate --agent pi form is Pi-bound");
+	assert.doesNotThrow(
+		() => decodeReviewConsentV3(mutateInvocations((invocation) => invocation.replace("--agent pi", "--agent=pi")), "pi"),
+		"the --agent=pi form is Pi-bound",
+	);
+	for (const [label, consent] of [
+		["quoted text", mutateInvocations((invocation) => invocation.replace("--agent pi", "--note \"--agent pi\""))],
+		["another argument value", mutateInvocations((invocation) => invocation.replace("--agent pi", "--note=--agent\\ pi"))],
+		["missing", mutateInvocations((invocation) => invocation.replace(" --agent pi", ""))],
+		["duplicate", mutateInvocations((invocation) => invocation.replace("--agent pi", "--agent pi --agent pi"))],
+		["conflicting", mutateInvocations((invocation) => invocation.replace("--agent pi", "--agent pi --agent claude"))],
+	] as const) {
+		assert.throws(() => decodeReviewConsentV3(consent, "pi"), /Pi invocation must bind agent/, `${label} --agent text must not satisfy the Pi binding`);
+	}
+});
+
 test("Pi START rejects a foreign consent/v3 envelope and only relays a Pi-bound clone", async () => {
 	const consent = devbinaryFixture<Record<string, unknown>>("consent-v3.captured.json");
 	const target = String(consent.target_identity);

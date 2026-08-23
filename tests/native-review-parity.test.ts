@@ -23,7 +23,7 @@ import {
 } from "../lib/native-review-cli.ts";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 import { readReviewConsentLatch, recordReviewConsentLatch } from "../lib/review-consent-latch.ts";
-import type { AuthorityRepairAssessmentV1, ReviewConsentV2, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
+import type { AuthorityRepairAssessmentV1, ReviewConsentV2, ReviewConsentV3, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 
 // Queued-adapter clients never execute a real process; default to a fixed
 // absolute package-local path so these tests do not depend on an installed
@@ -620,6 +620,29 @@ function candidateConsent(cwd: string): ReviewConsentV2 {
 	return { schema: "gentle-ai.review-integration.consent/v2", contract: "gentle-ai.review-integration/v2", operation: "review.start", action: "consent_required", blocking: true, targetIdentity, projection: "workspace", riskLevel: "high", changedFiles: 1, changedLines: 1, headline: "Review this candidate", reason: "It changes a process boundary.", value: "Review catches regressions.", riskEvidence: ["shell process"], choices, offPath: { note: "Disable reviews separately.", command: "gentle-ai review mode disable" }, raw };
 }
 
+function foreignOrUnboundV3Consent(cwd: string, agent: "claude-code" | "unbound"): ReviewConsentV3 {
+	const v2 = candidateConsent(cwd);
+	const choices = v2.choices.map((choice) => ({
+		...choice,
+		invocation: agent === "claude-code"
+			? choice.invocation.replace(" --consent ", " --agent claude-code --consent ")
+			: choice.invocation,
+	})) as [ReviewConsentV2["choices"][0], ReviewConsentV2["choices"][1]];
+	const raw = {
+		...v2.raw,
+		schema: "gentle-ai.review-integration.consent/v3",
+		agent: agent === "claude-code" ? "claude-code" : "pi",
+		choices: choices.map((choice) => ({ ...choice })),
+	};
+	return {
+		...v2,
+		schema: "gentle-ai.review-integration.consent/v3",
+		agent: agent === "claude-code" ? "claude-code" : "pi",
+		choices,
+		raw,
+	};
+}
+
 function relayedConsentNative(cwd: string): { native: NativeReviewCli; consent: ReviewConsentV2; answers: NativeReviewConsentAnswer[]; startRequests: NativeStartRequest[]; answerRequests: NativeReviewConsentAnswerRequest[] } {
 	const { native } = fakeOrganicNative();
 	const consent = candidateConsent(cwd);
@@ -651,6 +674,32 @@ async function blockedConsent(controller: RegisteredTool, id: string, ctx: Exten
 	assert.equal(typeof result.consent_binding, "string");
 	return result;
 }
+
+test("Pi reconciles Claude-bound or agentless v3 consent without exposing a foreign question or invocation", async (t) => {
+	for (const agent of ["claude-code", "unbound"] as const) {
+		const cwd = repository(t);
+		const { native } = fakeOrganicNative();
+		const consent = foreignOrUnboundV3Consent(cwd, agent);
+		const answers: NativeReviewConsentAnswer[] = [];
+		let starts = 0;
+		native.start = async () => {
+			starts += 1;
+			throw new NativeReviewConsentRequiredError(consent);
+		};
+		native.answerConsent = async (request) => {
+			answers.push(request.answer);
+			throw new Error("foreign consent answer must never be invoked");
+		};
+
+		const result = await execStart(runtime(native).controller, `foreign-${agent}`, headlessContext(cwd));
+		assert.equal(result.status, "blocked");
+		assert.equal(result.outcome, "native-mutation-status-reconciled");
+		assert.equal("consent" in result, false, `${agent} v3 consent must not reach the user`);
+		assert.equal("consent_binding" in result, false, `${agent} v3 consent must not create a Pi answer binding`);
+		assert.equal(starts, 1, `${agent} v3 response follows the one negotiated Pi START attempt`);
+		assert.deepEqual(answers, [], `${agent} v3 invocation must never be answered by Pi`);
+	}
+});
 
 test("consent relay returns the identical complete parent-visible envelope with or without UI and never answers internally", async (t) => {
 	const cwd = repository(t);

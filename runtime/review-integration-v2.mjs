@@ -1890,6 +1890,77 @@ export function decodeReviewConsentV2(value         )                  {
 	};
 }
 
+// Tokenize the provider-owned shell-like invocation without executing it. This
+// parser is shared with the native CLI so consent/v3 decode and follow-up use
+// the same exact option-boundary and duplicate semantics.
+export function splitReviewConsentInvocation(invocation        )                    {
+	const words           = [];
+	let current = "";
+	let quote                       ;
+	let escaping = false;
+	let started = false;
+	for (const character of invocation.trim()) {
+		if (escaping) {
+			current += character;
+			escaping = false;
+			started = true;
+			continue;
+		}
+		if (character === "\\" && quote !== "'") {
+			escaping = true;
+			started = true;
+			continue;
+		}
+		if (quote !== undefined) {
+			if (character === quote) quote = undefined;
+			else current += character;
+			started = true;
+			continue;
+		}
+		if (character === "'" || character === '"') {
+			quote = character;
+			started = true;
+			continue;
+		}
+		if (/\s/.test(character)) {
+			if (started) {
+				words.push(current);
+				current = "";
+				started = false;
+			}
+			continue;
+		}
+		current += character;
+		started = true;
+	}
+	if (quote !== undefined || escaping) throw new TypeError("Review consent invocation has invalid quoting");
+	if (started) words.push(current);
+	return words;
+}
+
+export function exactReviewConsentOption(arguments_                   , name        )         {
+	const values           = [];
+	for (let index = 0; index < arguments_.length; index += 1) {
+		const token = arguments_[index] ;
+		if (token === name) {
+			const value = arguments_[index + 1];
+			if (value === undefined) throw new TypeError(`Review consent invocation ${name} is missing its value`);
+			values.push(value);
+			index += 1;
+		} else if (token.startsWith(`${name}=`)) values.push(token.slice(name.length + 1));
+	}
+	if (values.length !== 1) throw new TypeError(`Review consent invocation requires exactly one ${name}`);
+	return values[0] ;
+}
+
+function hasExactReviewConsentOption(invocation        , name        , expected        )          {
+	try {
+		return exactReviewConsentOption(splitReviewConsentInvocation(invocation).slice(1), name) === expected;
+	} catch {
+		return false;
+	}
+}
+
 // consent/v3 (gentle-ai >= 2.3.0): the v2 surface plus the required, fixed
 // `agent` runtime binding. Ground truth is the captured envelope from a
 // 2.4.0-main binary (tests/fixtures/devbinary/consent-v3.captured.json) plus
@@ -1902,7 +1973,7 @@ export function decodeReviewConsentV3(value         , expectedAgent             
 	const agent = enumeration(body.agent, Object.values(REVIEW_CONSENT_AGENT_V3), "consent.agent")                        ;
 	if (expectedAgent !== undefined && agent !== expectedAgent) throw new TypeError("consent.agent does not match the expected runtime binding");
 	const semantics = decodeConsentSemantics(body);
-	if (expectedAgent === "pi" && semantics.choices.some((choice) => !choice.invocation.includes(" --agent pi "))) {
+	if (expectedAgent === "pi" && semantics.choices.some((choice) => !hasExactReviewConsentOption(choice.invocation, "--agent", "pi"))) {
 		throw new TypeError("consent Pi invocation must bind agent");
 	}
 	return {

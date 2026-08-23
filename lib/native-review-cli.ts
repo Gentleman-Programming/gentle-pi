@@ -14,6 +14,8 @@ import {
 	decodeReviewConsentV2,
 	decodeReviewConsentV3,
 	decodeReviewAdvisoryFindingsV1,
+	exactReviewConsentOption,
+	splitReviewConsentInvocation,
 	decodeReviewFailureV2,
 	decodeReviewOperationV2,
 	decodeReviewRepairV2,
@@ -86,6 +88,7 @@ export const NATIVE_REVIEW_ERROR_CODE = {
 	CANCELLED: "cancelled",
 	PACKAGE_BINARY_MISSING: "package-local-binary-missing",
 	UNSUPPORTED_TRANSITION_OPERATION: "unsupported-transition-operation",
+	IMMUTABLE_REVIEW_TRANSPORT_UNSUPPORTED: "immutable_review_transport_unsupported",
 } as const;
 export type NativeReviewErrorCode = (typeof NATIVE_REVIEW_ERROR_CODE)[keyof typeof NATIVE_REVIEW_ERROR_CODE];
 
@@ -2039,63 +2042,19 @@ export class NativeReviewConsentBindingError extends Error {
 }
 
 function splitNativeConsentInvocation(invocation: string): readonly string[] {
-	const words: string[] = [];
-	let current = "";
-	let quote: "'" | '"' | undefined;
-	let escaping = false;
-	let started = false;
-	for (const character of invocation.trim()) {
-		if (escaping) {
-			current += character;
-			escaping = false;
-			started = true;
-			continue;
-		}
-		if (character === "\\" && quote !== "'") {
-			escaping = true;
-			started = true;
-			continue;
-		}
-		if (quote !== undefined) {
-			if (character === quote) quote = undefined;
-			else current += character;
-			started = true;
-			continue;
-		}
-		if (character === "'" || character === '"') {
-			quote = character;
-			started = true;
-			continue;
-		}
-		if (/\s/.test(character)) {
-			if (started) {
-				words.push(current);
-				current = "";
-				started = false;
-			}
-			continue;
-		}
-		current += character;
-		started = true;
+	try {
+		return splitReviewConsentInvocation(invocation);
+	} catch (cause) {
+		throw new NativeReviewConsentBindingError("consent-invocation-option-invalid", cause instanceof Error ? cause.message : "Native consent invocation has invalid quoting");
 	}
-	if (quote !== undefined || escaping) throw new TypeError("Native consent invocation has invalid quoting");
-	if (started) words.push(current);
-	return words;
 }
 
 function exactConsentOption(arguments_: readonly string[], name: string): string {
-	const values: string[] = [];
-	for (let index = 0; index < arguments_.length; index += 1) {
-		const token = arguments_[index]!;
-		if (token === name) {
-			const value = arguments_[index + 1];
-			if (value === undefined) throw new NativeReviewConsentBindingError("consent-invocation-option-invalid", `Native consent invocation ${name} is missing its value`);
-			values.push(value);
-			index += 1;
-		} else if (token.startsWith(`${name}=`)) values.push(token.slice(name.length + 1));
+	try {
+		return exactReviewConsentOption(arguments_, name);
+	} catch (cause) {
+		throw new NativeReviewConsentBindingError("consent-invocation-option-invalid", cause instanceof Error ? cause.message : `Native consent invocation requires exactly one ${name}`);
 	}
-	if (values.length !== 1) throw new NativeReviewConsentBindingError("consent-invocation-option-invalid", `Native consent invocation requires exactly one ${name}`);
-	return values[0]!;
 }
 
 function optionalConsentLineageOption(arguments_: readonly string[]): string | undefined {

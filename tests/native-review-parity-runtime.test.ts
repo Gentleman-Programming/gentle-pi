@@ -457,7 +457,7 @@ test("official pinned package runtime keeps frozen candidate lineages and receip
 	t.diagnostic("pre-push, pre-pr, and release require remote/publication evidence; their network-aware gate contracts remain covered by dedicated gate integration tests rather than this hermetic binary E2E.");
 });
 
-test("registered gentle_review surfaces the package-pinned Pi transport refusal before native START for a safe internal symlink candidate", async (t) => {
+test("registered gentle_review rejects a foreign consent envelope and reconciles before it can reach Pi", async (t) => {
 	await reviewEnabledHome(t);
 	const workspace = await mkdtemp(join(tmpdir(), "gentle-pi-v215-symlink-candidate-"));
 	const repository = join(workspace, "repository");
@@ -516,12 +516,12 @@ test("registered gentle_review surfaces the package-pinned Pi transport refusal 
 	t.diagnostic(JSON.stringify({ returned: returned?.details, error, nativeStartReached }));
 	assert.equal(thrown, undefined, "the Pi transport refusal must be returned, not thrown");
 	const result = returned?.details as Record<string, unknown> | undefined;
-	const nativeFailure = result?.native_failure as Record<string, unknown> | undefined;
+	const diagnostics = result?.diagnostics as Record<string, unknown> | undefined;
 	assert.equal(result?.status, "blocked");
 	assert.equal(result?.outcome, "native-mutation-status-reconciled");
-	assert.equal(nativeFailure?.code, "immutable_review_transport_unsupported");
-	assert.equal(result?.mutation_performed, false);
-	assert.equal(result?.mutation_outcome, "none");
-	if (result !== undefined && "lineage_created" in result) assert.equal(result.lineage_created, false);
-	assert.equal(nativeStartReached, false, "negotiated Pi transport refusal must preclude native START and any agent-less fallback");
+	assert.equal(diagnostics?.error_code, "immutable_review_transport_unsupported");
+	assert.equal("consent" in (result ?? {}), false, "a foreign consent envelope must never reach the Pi relay");
+	assert.equal(result?.mutation_performed, undefined);
+	assert.equal(result?.mutation_outcome, "unknown");
+	assert.equal(nativeStartReached, true, "the foreign provider response is reconciled after the attempted Pi-bound START rather than relayed");
 });

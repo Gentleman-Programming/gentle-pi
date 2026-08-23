@@ -136,7 +136,7 @@ import {
 	type NativeReviewProcessDiagnostics,
 	type NativeStartResult,
 } from "../lib/native-review-cli.ts";
-import type { ReviewCollectInputV3, ReviewConsentEnvelope, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
+import { decodeReviewConsentV3, type ReviewCollectInputV3, type ReviewConsentEnvelope, type ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { assertDistinctCorrectionEvidence, resolveCorrectionStep, type CorrectionEvidence, type CorrectionOutcome, type CorrectionStep } from "../lib/review-correction-lifecycle.ts";
 import { recordReviewConsentLatch } from "../lib/review-consent-latch.ts";
 
@@ -4599,6 +4599,22 @@ async function executeReviewControllerOperation(
 					});
 				} catch (error) {
 					if (!(error instanceof NativeReviewConsentRequiredError)) throw error;
+					try {
+						if (error.consent.schema === "gentle-ai.review-integration.consent/v3") {
+							decodeReviewConsentV3(error.consent.raw, REVIEW_HOST_AGENT);
+						}
+					} catch (cause) {
+						// A provider response that cannot prove the Pi binding is not a
+						// candidate-scoped question Pi may expose or answer. Its prior
+						// mutation claim is untrusted too, so reconcile through STATUS.
+						throw new NativeReviewCliError(
+							NATIVE_REVIEW_ERROR_CODE.IMMUTABLE_REVIEW_TRANSPORT_UNSUPPORTED,
+							NATIVE_REVIEW_OPERATION.START,
+							true,
+							true,
+							`native Pi consent binding is invalid: ${cause instanceof Error ? cause.message : String(cause)}`,
+						);
+					}
 					if (candidateView === undefined) throw new CandidateViewError("native consent requires a frozen candidate view");
 					const consentCandidateView = candidateView;
 					const repositoryCwd = realpathSync(defaultCwd);
