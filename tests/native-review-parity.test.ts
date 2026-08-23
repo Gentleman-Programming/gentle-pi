@@ -12,6 +12,7 @@ import {
 	NativeReviewCliError,
 	NativeReviewConsentBindingError,
 	NativeReviewConsentRequiredError,
+	NativeReviewIntegrationError,
 	NativeReviewCliV213 as NativeReviewCliV213Production,
 	normalizeNativeReviewCwd,
 	setNativeCliContractForTesting,
@@ -675,8 +676,8 @@ async function blockedConsent(controller: RegisteredTool, id: string, ctx: Exten
 	return result;
 }
 
-test("Pi reconciles Claude-bound or agentless v3 consent without exposing a foreign question or invocation", async (t) => {
-	for (const agent of ["claude-code", "unbound"] as const) {
+test("Pi reconciles a foreign v3 consent without exposing its question or invocation", async (t) => {
+	for (const agent of ["claude-code"] as const) {
 		const cwd = repository(t);
 		const { native } = fakeOrganicNative();
 		const consent = foreignOrUnboundV3Consent(cwd, agent);
@@ -699,6 +700,116 @@ test("Pi reconciles Claude-bound or agentless v3 consent without exposing a fore
 		assert.equal(starts, 1, `${agent} v3 response follows the one negotiated Pi START attempt`);
 		assert.deepEqual(answers, [], `${agent} v3 invocation must never be answered by Pi`);
 	}
+});
+
+test("typed Pi transport refusal relays agentless v3 consent and keeps granted and declined reconciliation agentless", async (t) => {
+	for (const answer of ["granted", "declined"] as const) {
+		const cwd = repository(t);
+		const consent = foreignOrUnboundV3Consent(cwd, "unbound");
+		const { native } = fakeOrganicNative();
+		const targetStatus = native.targetStatus!;
+		const statusAgents: Array<string | undefined> = [];
+		const startRequests: NativeStartRequest[] = [];
+		const answerRequests: NativeReviewConsentAnswerRequest[] = [];
+		native.targetStatus = async (request) => {
+			statusAgents.push(request.agent);
+			if (request.agent === "pi") {
+				throw new NativeReviewIntegrationError({
+					schema: "gentle-ai.review-integration.failure/v2",
+					contract: "gentle-ai.review-integration/v2",
+					operation: "review.status",
+					phase: "pre_native",
+					code: "unsupported_agent",
+					message: "Pi transport is unsupported",
+					mutationOutcome: "none",
+					authorityApplicability: "current_target",
+					retrySafe: true,
+					replayability: "not_replayable",
+					nextAction: "stop",
+					raw: {},
+				} as never);
+			}
+			return targetStatus(request);
+		};
+		native.start = async (request) => {
+			startRequests.push(request);
+			throw new NativeReviewConsentRequiredError(consent);
+		};
+		native.answerConsent = async (request) => {
+			answerRequests.push(request);
+			throw Object.assign(new Error("ambiguous consent answer"), { mutationOutcome: "unknown", nextAction: "review.status" });
+		};
+
+		const controller = runtime(native).controller;
+		const blocked = await blockedConsent(controller, `agentless-${answer}`, headlessContext(cwd));
+		assert.deepEqual(blocked.consent, consent.raw, "the complete agentless Pi envelope must reach the relay");
+		assert.deepEqual(statusAgents, ["pi", undefined], "typed Pi refusal retries only the START STATUS agentless");
+		await answerConsent(controller, blocked.consent_binding, answer, headlessContext(cwd));
+		assert.equal(startRequests[0]?.agent, undefined, "the fallback START stays agentless");
+		assert.equal(answerRequests.length, 1, "the exact provider answer is submitted once");
+		assert.equal(answerRequests[0]?.startAgent, undefined, "answer validation receives the selected agentless transport");
+		assert.deepEqual(answerRequests[0]?.consent.choices, consent.choices, "Pi replays the provider-owned choices without rewriting them");
+		assert.equal(answerRequests[0]?.consent.choices.some((choice) => /(?:^| )--agent(?:=| )/.test(choice.invocation)), false, "Pi must not synthesize --agent into agentless choices");
+		assert.deepEqual(statusAgents, ["pi", undefined, undefined], "ambiguous reconciliation must retain the agentless fallback transport");
+	}
+});
+
+test("pending consent bindings do not dedupe across Pi and agentless START transports", async (t) => {
+	const cwd = repository(t);
+	const consent = foreignOrUnboundV3Consent(cwd, "unbound");
+	for (const choice of consent.choices) choice.invocation = choice.invocation.replace(" --consent ", " --agent pi --consent ");
+	(consent.raw as { choices: unknown }).choices = consent.choices.map((choice) => ({ ...choice }));
+	const { native } = fakeOrganicNative();
+	const targetStatus = native.targetStatus!;
+	const startRequests: NativeStartRequest[] = [];
+	const answerRequests: NativeReviewConsentAnswerRequest[] = [];
+	let piStatusCalls = 0;
+	native.targetStatus = async (request) => {
+		if (request.agent === "pi" && piStatusCalls++ > 0) {
+			throw new NativeReviewIntegrationError({
+				schema: "gentle-ai.review-integration.failure/v2",
+				contract: "gentle-ai.review-integration/v2",
+				operation: "review.status",
+				phase: "pre_native",
+				code: "unsupported_agent",
+				message: "Pi transport is unsupported",
+				mutationOutcome: "none",
+				authorityApplicability: "current_target",
+				retrySafe: true,
+				replayability: "not_replayable",
+				nextAction: "stop",
+				raw: {},
+			} as never);
+		}
+		return targetStatus(request);
+	};
+	native.start = async (request) => {
+		startRequests.push(request);
+		throw new NativeReviewConsentRequiredError(consent);
+	};
+	native.answerConsent = async (request) => {
+		answerRequests.push(request);
+		return {
+			kind: "declined",
+			targetIdentity: consent.targetIdentity,
+			projection: consent.projection,
+			riskLevel: consent.riskLevel,
+			changedFiles: 1,
+			changedLines: 1,
+			consent: "declined_this_candidate",
+			raw: { operation: "review/start", action: "declined", consent: "declined_this_candidate" },
+		};
+	};
+
+	const controller = runtime(native).controller;
+	const context = headlessContext(cwd);
+	const piBinding = await blockedConsent(controller, "pending-pi", context);
+	const agentlessBinding = await blockedConsent(controller, "pending-agentless", context);
+	assert.notEqual(piBinding.consent_binding, agentlessBinding.consent_binding, "a fallback route must replace, not reuse, the Pi-bound pending consent");
+	assert.deepEqual(startRequests.map((request) => request.agent), ["pi", undefined]);
+	await assert.rejects(() => answerConsent(controller, piBinding.consent_binding, "granted", context), /unknown, expired, or already consumed/);
+	await answerConsent(controller, agentlessBinding.consent_binding, "declined", context);
+	assert.equal(answerRequests[0]?.startAgent, undefined, "the surviving binding retains the fallback transport");
 });
 
 test("consent relay returns the identical complete parent-visible envelope with or without UI and never answers internally", async (t) => {

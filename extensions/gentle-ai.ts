@@ -3282,6 +3282,8 @@ interface PendingReviewConsent {
 	cleanupCandidate: () => void;
 	untrackedSelection?: RetainedNativeUntrackedSelection;
 	consent: ReviewConsentEnvelope;
+	/** The transport selected for the START that issued this consent. */
+	startAgent: "pi" | undefined;
 	consentDigest: string;
 	expiresAt: number;
 	expiry?: ReturnType<typeof setTimeout>;
@@ -4478,6 +4480,7 @@ async function executeReviewControllerOperation(
 				cwd: pending.authorityCwd,
 				consent: pending.consent,
 				answer: input.answer,
+				startAgent: pending.startAgent,
 				...(signal === undefined ? {} : { signal }),
 			});
 			if (answered.kind === "declined") {
@@ -4499,7 +4502,7 @@ async function executeReviewControllerOperation(
 					cwd: pending.authorityCwd,
 					...(pending.candidateView.committedOnly ? { baseRef: pending.candidateView.baseCommit } : {}),
 					projection: "workspace",
-					...(pending.consent.schema === "gentle-ai.review-integration.consent/v3" && pending.consent.agent === REVIEW_HOST_AGENT ? { agent: REVIEW_HOST_AGENT } : {}),
+					...(pending.startAgent === undefined ? {} : { agent: pending.startAgent }),
 				});
 		}
 		if (input.answer === "granted") {
@@ -4601,7 +4604,8 @@ async function executeReviewControllerOperation(
 					if (!(error instanceof NativeReviewConsentRequiredError)) throw error;
 					try {
 						if (error.consent.schema === "gentle-ai.review-integration.consent/v3") {
-							decodeReviewConsentV3(error.consent.raw, REVIEW_HOST_AGENT);
+							const decodedConsent = decodeReviewConsentV3(error.consent.raw, startAgent);
+							if (decodedConsent.agent !== REVIEW_HOST_AGENT) throw new TypeError("consent.agent does not match the Pi host binding");
 						}
 					} catch (cause) {
 						// A provider response that cannot prove the Pi binding is not a
@@ -4620,7 +4624,7 @@ async function executeReviewControllerOperation(
 					const repositoryCwd = realpathSync(defaultCwd);
 					const consentDigest = reviewConsentDigest(error.consent);
 					const pendingReviewConsents = pendingReviewConsentRegistry.get(pendingReviewConsentSession);
-					const existing = [...(pendingReviewConsents?.values() ?? [])].find((pending) => pending.repositoryCwd === repositoryCwd && pending.candidateView.token === consentCandidateView.token && pending.consentDigest === consentDigest && pending.expiresAt > reviewConsentNow());
+					const existing = [...(pendingReviewConsents?.values() ?? [])].find((pending) => pending.repositoryCwd === repositoryCwd && pending.candidateView.token === consentCandidateView.token && pending.consentDigest === consentDigest && pending.startAgent === startAgent && pending.expiresAt > reviewConsentNow());
 					if (existing === undefined) {
 						for (const pending of [...(pendingReviewConsents?.values() ?? [])]) {
 							if (pending.candidateView.token === consentCandidateView.token) {
@@ -4645,6 +4649,7 @@ async function executeReviewControllerOperation(
 							},
 							...(retainedUntrackedSelection === undefined ? {} : { untrackedSelection: retainedUntrackedSelection }),
 							consent: error.consent,
+							startAgent,
 							consentDigest,
 							expiresAt: reviewConsentNow() + PENDING_REVIEW_CONSENT_TTL_MS,
 						};

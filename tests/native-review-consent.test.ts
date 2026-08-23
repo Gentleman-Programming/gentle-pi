@@ -148,7 +148,7 @@ test("consent follow-up executes the provider-named invocation exactly once and 
 	started.artifact_subjects = [];
 	const queue = queuedAdapter([capabilities(), started]);
 	const native = client(queue.adapter);
-	const result = await native.answerConsent!({ cwd: "/repo", consent: decodedConsent, answer: "granted" });
+	const result = await native.answerConsent!({ cwd: "/repo", consent: decodedConsent, answer: "granted", startAgent: undefined });
 	assert.equal(result.kind, "started");
 	assert.ok(result.kind === "started");
 	assert.equal(result.start.lineageId, preboundLineage);
@@ -156,7 +156,7 @@ test("consent follow-up executes the provider-named invocation exactly once and 
 	assert.equal(queue.calls.filter((arguments_) => arguments_.includes("granted")).length, 1);
 
 	const runtimeQueue = queuedAdapter([capabilities(), structuredClone(started)]);
-	const runtimeResult = await runtimeClient(runtimeQueue.adapter).answerConsent({ cwd: "/repo", consent: decodedConsent, answer: "granted" });
+	const runtimeResult = await runtimeClient(runtimeQueue.adapter).answerConsent({ cwd: "/repo", consent: decodedConsent, answer: "granted", startAgent: undefined });
 	assert.equal(runtimeResult.kind, "started");
 	assert.ok(runtimeResult.kind === "started");
 	assert.equal(runtimeResult.start.lineageId, preboundLineage);
@@ -165,7 +165,7 @@ test("consent follow-up executes the provider-named invocation exactly once and 
 	const changedLineage = JSON.parse(JSON.stringify(started).replaceAll(preboundLineage, "different-lineage")) as Record<string, unknown>;
 	const lineageQueue = queuedAdapter([capabilities(), changedLineage]);
 	await assert.rejects(
-		() => client(lineageQueue.adapter).answerConsent!({ cwd: "/repo", consent: decodedConsent, answer: "granted" }),
+		() => client(lineageQueue.adapter).answerConsent!({ cwd: "/repo", consent: decodedConsent, answer: "granted", startAgent: undefined }),
 		/lineage mismatch/,
 	);
 	assert.equal(lineageQueue.calls.filter((arguments_) => arguments_[0] === "review" && arguments_[1] === "start").length, 1);
@@ -173,9 +173,45 @@ test("consent follow-up executes the provider-named invocation exactly once and 
 	const changed = structuredClone(decodedConsent);
 	changed.targetIdentity = `sha256:${"b".repeat(64)}`;
 	await assert.rejects(
-		() => native.answerConsent!({ cwd: "/repo", consent: changed, answer: "declined" }),
+		() => native.answerConsent!({ cwd: "/repo", consent: changed, answer: "declined", startAgent: undefined }),
 		/target|binding/,
 	);
+});
+
+test("consent/v2 replays agentless provider invocations when negotiated START used Pi", async () => {
+const consent = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV2(fixture<Record<string, unknown>>("consent.fixture.json"));
+const lineageId = "Review.Lineage_42";
+for (const choice of consent.choices) choice.invocation = choice.invocation.replace("review-consent-fixture", lineageId);
+const started = fixture<Record<string, unknown>>("start.fixture.json");
+started.lineage_id = lineageId;
+started.artifact_subjects = [];
+const declined = {
+operation: "review/start",
+action: "declined",
+lenses_required: false,
+lineage_id: "",
+state: "",
+risk_level: consent.riskLevel,
+selected_lenses: [],
+lens_bindings: [],
+projection: consent.projection,
+target_identity: consent.targetIdentity,
+changed_files: 1,
+changed_lines: 1,
+correction_budget: 0,
+risk_evidence: [],
+consent: "declined_this_candidate",
+};
+for (const [answer, outcome] of [["granted", started], ["declined", declined]] as const) {
+for (const createClient of [client, runtimeClient]) {
+const queue = queuedAdapter([capabilities(), structuredClone(outcome)]);
+const result = await createClient(queue.adapter).answerConsent({ cwd: "/repo", consent, answer, startAgent: "pi" });
+assert.equal(result.kind, answer === "granted" ? "started" : "declined");
+assert.deepEqual(queue.calls.at(-1), consent.choices.find((choice) => choice.answer === answer)!.invocation.split(" ").slice(1));
+assert.equal(queue.calls.at(-1)?.some((token) => token === "--agent" || token.startsWith("--agent=")), false, "v2 provider invocations stay agentless");
+assert.equal(queue.calls.filter((arguments_) => arguments_.at(-1) === answer).length, 1, "the provider-owned invocation replays exactly once");
+}
+}
 });
 
 // A binding mismatch is decided entirely inside Pi, before the provider is
@@ -184,7 +220,7 @@ test("a consent invocation binding mismatch is a typed pre-native error that nev
 	const consent = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV2(fixture<Record<string, unknown>>("consent.fixture.json"));
 	const queue = queuedAdapter([]);
 	await assert.rejects(
-		() => client(queue.adapter).answerConsent!({ cwd: "/repo/.git/gentle-ai/candidate-views/a1c7fdae", consent, answer: "granted" }),
+		() => client(queue.adapter).answerConsent!({ cwd: "/repo/.git/gentle-ai/candidate-views/a1c7fdae", consent, answer: "granted", startAgent: undefined }),
 		(error: unknown) => {
 			assert.ok(error instanceof NativeReviewConsentBindingError);
 			assert.equal(error.name, "NativeReviewConsentBindingError");
@@ -227,7 +263,7 @@ test("every consent invocation binding guard reports its own reason without laun
 	for (const scenario of cases) {
 		const queue = queuedAdapter([]);
 		await assert.rejects(
-			() => client(queue.adapter).answerConsent!({ cwd: "/repo", consent: scenario.consent, answer: "granted" }),
+			() => client(queue.adapter).answerConsent!({ cwd: "/repo", consent: scenario.consent, answer: "granted", startAgent: undefined }),
 			(error: unknown) => {
 				assert.ok(error instanceof NativeReviewConsentBindingError, `${scenario.reason} must be a typed binding error`);
 				assert.equal(error.reason, scenario.reason);
@@ -247,7 +283,7 @@ test("fresh consent START accepts the strictly decoded provider-created lineage 
 	const freshStart = JSON.parse(JSON.stringify(fixture<Record<string, unknown>>("start.fixture.json"))
 		.replaceAll("review-start-fixture", "provider-created-lineage")) as Record<string, unknown>;
 	const queue = queuedAdapter([capabilities(), freshStart]);
-	const result = await client(queue.adapter).answerConsent!({ cwd: "/repo", consent: freshConsent, answer: "granted" });
+	const result = await client(queue.adapter).answerConsent!({ cwd: "/repo", consent: freshConsent, answer: "granted", startAgent: undefined });
 	assert.equal(result.kind, "started");
 	assert.ok(result.kind === "started");
 	assert.equal(result.start.lineageId, "provider-created-lineage");
@@ -255,7 +291,7 @@ test("fresh consent START accepts the strictly decoded provider-created lineage 
 	assert.equal(queue.calls.at(-1)?.includes("--lineage"), false);
 
 	const runtimeQueue = queuedAdapter([capabilities(), structuredClone(freshStart)]);
-	const runtimeResult = await runtimeClient(runtimeQueue.adapter).answerConsent({ cwd: "/repo", consent: freshConsent, answer: "granted" });
+	const runtimeResult = await runtimeClient(runtimeQueue.adapter).answerConsent({ cwd: "/repo", consent: freshConsent, answer: "granted", startAgent: undefined });
 	assert.equal(runtimeResult.kind, "started");
 	assert.ok(runtimeResult.kind === "started");
 	assert.equal(runtimeResult.start.lineageId, "provider-created-lineage");
@@ -266,7 +302,7 @@ test("fresh consent START accepts the strictly decoded provider-created lineage 
 	((mismatchedTarget.repository_context as Record<string, unknown>).target_identity as string) = `sha256:${"b".repeat(64)}`;
 	const mismatchQueue = queuedAdapter([capabilities(), mismatchedTarget]);
 	await assert.rejects(
-		() => client(mismatchQueue.adapter).answerConsent!({ cwd: "/repo", consent: freshConsent, answer: "granted" }),
+		() => client(mismatchQueue.adapter).answerConsent!({ cwd: "/repo", consent: freshConsent, answer: "granted", startAgent: undefined }),
 		/target mismatch/,
 	);
 	assert.equal(mismatchQueue.calls.filter((arguments_) => arguments_[0] === "review" && arguments_[1] === "start").length, 1);
@@ -289,7 +325,7 @@ test("duplicate, empty, missing, and malformed consent lineages fail before prov
 	for (const scenario of cases) {
 		const queue = queuedAdapter([]);
 		await assert.rejects(
-			() => client(queue.adapter).answerConsent!({ cwd: "/repo", consent: scenario.consent, answer: "granted" }),
+			() => client(queue.adapter).answerConsent!({ cwd: "/repo", consent: scenario.consent, answer: "granted", startAgent: undefined }),
 			(error: unknown) => {
 				assert.ok(error instanceof NativeReviewConsentBindingError, `${scenario.label} lineage must be a typed binding error`);
 				assert.equal(error.reason, "consent-invocation-option-invalid");
@@ -321,7 +357,7 @@ test("declined consent decodes the provider's explicit empty authority fields wi
 		consent: "declined_this_candidate",
 	};
 	const queue = queuedAdapter([capabilities(), declined]);
-	const result = await client(queue.adapter).answerConsent!({ cwd: "/repo", consent, answer: "declined" });
+	const result = await client(queue.adapter).answerConsent!({ cwd: "/repo", consent, answer: "declined", startAgent: undefined });
 	assert.equal(result.kind, "declined");
 	assert.equal("lineageId" in result, false);
 	assert.deepEqual(queue.calls.at(-1), consent.choices[1].invocation.split(" ").slice(1));
@@ -343,6 +379,14 @@ function piConsent(): Record<string, unknown> {
 	consent.agent = "pi";
 	for (const choice of consent.choices as Array<Record<string, unknown>>) {
 		choice.invocation = String(choice.invocation).replace(" --consent ", " --agent pi --consent ");
+	}
+	return consent;
+}
+
+function agentlessPiConsent(): Record<string, unknown> {
+	const consent = piConsent();
+	for (const choice of consent.choices as Array<Record<string, unknown>>) {
+		choice.invocation = String(choice.invocation).replace(" --agent pi", "");
 	}
 	return consent;
 }
@@ -409,7 +453,7 @@ test("a granted consent/v3 answer decodes the captured start/v3 result with its 
 	const cwd = decoded.choices[0].invocation.split(" --cwd ")[1]!.split(" ")[0]!;
 	const started = devbinaryFixture<Record<string, unknown>>("start-v3-consent-granted.captured.json");
 	const queue = queuedAdapter([capabilities(), started]);
-	const result = await client(queue.adapter).answerConsent!({ cwd, consent: decoded, answer: "granted" });
+	const result = await client(queue.adapter).answerConsent!({ cwd, consent: decoded, answer: "granted", startAgent: undefined });
 	assert.equal(result.kind, "started");
 	assert.ok(result.kind === "started");
 	assert.equal(result.start.lineageId, "review-377c60e10b852cfc");
@@ -419,7 +463,7 @@ test("a granted consent/v3 answer decodes the captured start/v3 result with its 
 	assert.equal(queue.calls.filter((arguments_) => arguments_.includes("granted")).length, 1);
 
 	const runtimeQueue = queuedAdapter([capabilities(), structuredClone(started)]);
-	const runtimeResult = await runtimeClient(runtimeQueue.adapter).answerConsent({ cwd, consent: decoded, answer: "granted" });
+	const runtimeResult = await runtimeClient(runtimeQueue.adapter).answerConsent({ cwd, consent: decoded, answer: "granted", startAgent: undefined });
 	assert.equal(runtimeResult.kind, "started");
 });
 
@@ -428,11 +472,30 @@ test("a declined consent/v3 answer accepts the captured declined result and crea
 	const cwd = decoded.choices[1].invocation.split(" --cwd ")[1]!.split(" ")[0]!;
 	const declined = devbinaryFixture<Record<string, unknown>>("start-v3-consent-declined.captured.json");
 	const queue = queuedAdapter([capabilities(), declined]);
-	const result = await client(queue.adapter).answerConsent!({ cwd, consent: decoded, answer: "declined" });
+	const result = await client(queue.adapter).answerConsent!({ cwd, consent: decoded, answer: "declined", startAgent: undefined });
 	assert.equal(result.kind, "declined");
 	assert.ok(result.kind === "declined");
 	assert.equal(result.consent, "declined_this_candidate");
 	assert.equal(result.targetIdentity, decoded.targetIdentity);
+});
+
+test("agentless v3 Pi consent replays its exact provider invocation when the START transport fell back", async () => {
+	const decoded = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV3(agentlessPiConsent()) as ReviewConsentV3;
+	const cwd = decoded.choices[0].invocation.split(" --cwd ")[1]!.split(" ")[0]!;
+	const outcomes = {
+		granted: devbinaryFixture<Record<string, unknown>>("start-v3-consent-granted.captured.json"),
+		declined: devbinaryFixture<Record<string, unknown>>("start-v3-consent-declined.captured.json"),
+	} as const;
+	for (const [answer, outcome] of Object.entries(outcomes) as Array<["granted" | "declined", Record<string, unknown>]>) {
+		for (const createClient of [client, runtimeClient]) {
+			const queue = queuedAdapter([capabilities(), structuredClone(outcome)]);
+			const result = await createClient(queue.adapter).answerConsent({ cwd, consent: decoded, answer, startAgent: undefined });
+			assert.equal(result.kind, answer === "granted" ? "started" : "declined");
+			assert.deepEqual(queue.calls.at(-1), decoded.choices.find((choice) => choice.answer === answer)!.invocation.split(" ").slice(1));
+			assert.equal(queue.calls.at(-1)?.some((token) => token === "--agent" || token.startsWith("--agent=")), false, "agentless fallback must not synthesize --agent");
+			assert.equal(queue.calls.filter((arguments_) => arguments_.at(-1) === answer).length, 1, "provider-issued invocation replays exactly once");
+		}
+	}
 });
 
 test("Pi granted and declined consent replay the provider-issued agent invocation once", async () => {
@@ -440,14 +503,14 @@ test("Pi granted and declined consent replay the provider-issued agent invocatio
 	const cwd = decoded.choices[0].invocation.split(" --cwd ")[1]!.split(" ")[0]!;
 	const started = devbinaryFixture<Record<string, unknown>>("start-v3-consent-granted.captured.json");
 	const grantedQueue = queuedAdapter([capabilities(), started]);
-	const granted = await client(grantedQueue.adapter).answerConsent!({ cwd, consent: decoded, answer: "granted" });
+	const granted = await client(grantedQueue.adapter).answerConsent!({ cwd, consent: decoded, answer: "granted", startAgent: "pi" });
 	assert.equal(granted.kind, "started");
 	assert.deepEqual(grantedQueue.calls.at(-1), decoded.choices[0].invocation.split(" ").slice(1));
 	assert.equal(grantedQueue.calls.filter((arguments_) => arguments_.includes("--agent") && arguments_.includes("pi")).length, 1);
 
 	const declined = devbinaryFixture<Record<string, unknown>>("start-v3-consent-declined.captured.json");
 	const declinedQueue = queuedAdapter([capabilities(), declined]);
-	const declinedResult = await client(declinedQueue.adapter).answerConsent!({ cwd, consent: decoded, answer: "declined" });
+	const declinedResult = await client(declinedQueue.adapter).answerConsent!({ cwd, consent: decoded, answer: "declined", startAgent: "pi" });
 	assert.equal(declinedResult.kind, "declined");
 	assert.deepEqual(declinedQueue.calls.at(-1), decoded.choices[1].invocation.split(" ").slice(1));
 	assert.equal(declinedQueue.calls.filter((arguments_) => arguments_.includes("--agent") && arguments_.includes("pi")).length, 1);

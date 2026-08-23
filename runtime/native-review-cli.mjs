@@ -554,6 +554,13 @@ export const NATIVE_REVIEW_CONSENT_ANSWER = { GRANTED: "granted", DECLINED: "dec
 
 
 
+
+
+
+
+
+
+
 // gentle-pi#311 P5: the provider-driven FINALIZE. `argumentTokens` are the
 // exact rendered tokens of one provider-returned `review.finalize` execute
 // transition (e.g. `--lineage=<id> --captured-results=true`), passed through
@@ -2082,6 +2089,7 @@ function optionalConsentLineageOption(arguments_                   )            
 
 
 function consentInvocationArguments(request                                  )                    {
+	if (request.startAgent !== undefined && request.startAgent !== "pi") throw new TypeError("Native consent START transport is unsupported");
 	const choice = request.consent.choices.find((candidate) => candidate.answer === request.answer);
 	if (choice === undefined) throw new NativeReviewConsentBindingError("consent-answer-unknown", "Native consent answer must be granted or declined");
 	const words = splitNativeConsentInvocation(choice.invocation);
@@ -2092,7 +2100,7 @@ function consentInvocationArguments(request                                  )  
 	if (exactConsentOption(arguments_, "--target") !== request.consent.targetIdentity) throw new NativeReviewConsentBindingError("consent-invocation-target-changed", "Native consent invocation target binding changed");
 	if (exactConsentOption(arguments_, "--projection") !== request.consent.projection) throw new NativeReviewConsentBindingError("consent-invocation-projection-changed", "Native consent invocation projection binding changed");
 	const lineageId = optionalConsentLineageOption(arguments_);
-	if (request.consent.schema === "gentle-ai.review-integration.consent/v3" && request.consent.agent === "pi" && exactConsentOption(arguments_, "--agent") !== "pi") {
+	if (request.consent.schema === "gentle-ai.review-integration.consent/v3" && request.startAgent === "pi" && exactConsentOption(arguments_, "--agent") !== "pi") {
 		throw new NativeReviewConsentBindingError("consent-invocation-agent-changed", "Native Pi consent invocation agent binding changed");
 	}
 	if (exactConsentOption(arguments_, "--consent") !== request.answer || arguments_.at(-1) !== request.answer) throw new NativeReviewConsentBindingError("consent-invocation-answer-changed", "Native consent invocation answer binding changed");
