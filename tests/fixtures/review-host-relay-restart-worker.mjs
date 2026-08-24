@@ -95,7 +95,7 @@ const parameters = mode === "inspect"
 let result;
 let error;
 try {
-	result = await __testing.executeReviewControllerOperation(parameters, cwd, new Map(), nativeReviewCli);
+	result = await __testing.executeReviewControllerOperation(parameters, cwd, nativeReviewCli);
 } catch (caught) {
 	error = caught instanceof Error ? { name: caught.name, message: caught.message } : String(caught);
 }
