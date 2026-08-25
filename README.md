@@ -61,6 +61,8 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | **Verified native runtime**    | Provisions the exact package-local Gentle AI v2.4.0 runtime: signed archives on Darwin/Linux and a Go SumDB-verified source build on Windows x64/arm64. It validates package-local integrity and rejects PATH, global, sibling, symlink, and mode fallbacks. |
 | **Runtime safety**             | Blocks destructive shell commands, asks for confirmation for sensitive operations, and blocks direct read/write/edit access to sensitive paths. |
 
+**Migration note:** Do not enable `pi-tool-cards` and `quiet-tools` together: Pi rejects duplicate `bash`, `read`, `edit`, and `write` registrations. Disable or remove the standalone package during migration; gentle-pi does not alter user configuration or delete that repository.
+
 ## Install
 
 ```bash

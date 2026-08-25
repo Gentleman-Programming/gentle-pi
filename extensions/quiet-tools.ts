@@ -5,8 +5,9 @@ import {
 	createFindTool,
 	createGrepTool,
 	createLsTool,
-	createReadTool,
+	createReadToolDefinition,
 	createWriteTool,
+	keyHint,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
@@ -21,7 +22,7 @@ type ThemeLike = {
 };
 
 const TOOL_CREATORS = {
-	read: createReadTool,
+	read: createReadToolDefinition,
 	bash: createBashTool,
 	grep: createGrepTool,
 	find: createFindTool,
@@ -36,9 +37,8 @@ const COLLAPSED_COUNT_LABELS: Partial<Record<QuietToolName, string>> = {
 	ls: "entries",
 };
 
-const NO_COLLAPSED_RESULT_TOOLS = new Set<QuietToolName>(["read", "bash"]);
-const COLLAPSED_TAIL_TOOLS = new Set<QuietToolName>(["edit", "write"]);
 const COLLAPSED_TAIL_LINE_LIMIT = 10;
+const PREVIEW_LINE_LIMIT = 3;
 
 const EMPTY_RESULT_MESSAGES: Partial<Record<QuietToolName, string[]>> = {
 	grep: ["No matches found"],
@@ -84,6 +84,19 @@ export function tailLines(text: string, limit: number): string {
 	return lines.slice(Math.max(0, lines.length - limit)).join("\n");
 }
 
+function outputLines(text: string): string[] {
+	const normalized = text.replace(/\r\n/g, "\n").replace(/\n$/, "");
+	return normalized.length > 0 ? normalized.split("\n") : [];
+}
+
+function firstLines(text: string, limit: number): string {
+	return outputLines(text).slice(0, limit).join("\n");
+}
+
+function lastOutputLines(text: string, limit: number): string {
+	return outputLines(text).slice(-limit).join("\n");
+}
+
 export function extractTextContent(result: AgentToolResult<unknown>): string {
 	return result.content
 		.flatMap((content) => (content.type === "text" ? [content.text] : []))
@@ -92,6 +105,27 @@ export function extractTextContent(result: AgentToolResult<unknown>): string {
 
 function safeText(value: string): string {
 	return sanitizeTerminalText(value);
+}
+
+function sanitizeValue(value: unknown): unknown {
+	if (typeof value === "string") return safeText(value);
+	if (Array.isArray(value)) return value.map(sanitizeValue);
+	if (value && typeof value === "object") {
+		return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, sanitizeValue(item)]));
+	}
+	return value;
+}
+
+function sanitizedArgs(args: Record<string, unknown> | undefined): Record<string, unknown> {
+	return (sanitizeValue(args ?? {}) as Record<string, unknown>) ?? {};
+}
+
+function sanitizedResult(result: AgentToolResult<unknown>): AgentToolResult<unknown> {
+	return {
+		...result,
+		content: result.content.map((content) => sanitizeValue(content) as typeof content),
+		details: sanitizeValue(result.details),
+	};
 }
 
 function isEmptyResultMessage(toolName: QuietToolName, text: string): boolean {
@@ -238,31 +272,82 @@ interface ToolResultFormatOptions {
 	args?: Record<string, unknown>;
 }
 
+function detailsRecord(result: AgentToolResult<unknown>): Record<string, unknown> {
+	const details = sanitizeValue(result.details);
+	return details && typeof details === "object" && !Array.isArray(details)
+		? details as Record<string, unknown>
+		: {};
+}
+
+function diffStats(diff: string): { additions: number; removals: number } {
+	let additions = 0;
+	let removals = 0;
+	for (const line of diff.split("\n")) {
+		if (line.startsWith("+") && !line.startsWith("+++")) additions++;
+		if (line.startsWith("-") && !line.startsWith("---")) removals++;
+	}
+	return { additions, removals };
+}
+
+function editSummary(result: AgentToolResult<unknown>): string {
+	const diff = detailsRecord(result).diff;
+	if (typeof diff === "string") {
+		const stats = diffStats(diff);
+		return `✓ +${stats.additions} / -${stats.removals}`;
+	}
+	return "✓ applied";
+}
+
+function writeSummary(text: string): string {
+	const bytes = text.match(/(?:Successfully )?wrote\s+(\d+)\s+bytes/i)?.[1];
+	return `✓ ${bytes ? `wrote ${bytes} bytes` : "written"}`;
+}
+
+function expandedResultText(toolName: QuietToolName, result: AgentToolResult<unknown>, text: string): string {
+	if (toolName === "edit") {
+		const diff = detailsRecord(result).diff;
+		if (typeof diff === "string") return diff;
+	}
+	return text;
+}
+
 export function formatToolResultOutput(
 	toolName: QuietToolName,
 	result: AgentToolResult<unknown>,
 	{ expanded, isError = false, args }: ToolResultFormatOptions,
 ): string {
 	const text = safeText(extractTextContent(result));
-	if (expanded || isError) return text ? `\n${text}` : "";
+	if (expanded) {
+		const detail = expandedResultText(toolName, result, text);
+		return detail ? `\n${detail}` : "";
+	}
+	if (isError) {
+		const tail = lastOutputLines(text, PREVIEW_LINE_LIMIT);
+		return tail ? `\n${tail}` : "";
+	}
+	const summaryLabel = COLLAPSED_COUNT_LABELS[toolName];
+	if (summaryLabel) {
+		if (isEmptyResultMessage(toolName, text)) return "";
+		const count = countNonEmptyLines(text);
+		return count > 0 ? ` → ${count} ${summaryLabel}` : "";
+	}
 	if (toolName === "bash" && isGentleAiDirectCommand(args)) return "";
 
 	if (toolName === "bash" && isGitCommand(args)) {
 		const tail = tailLines(text, COLLAPSED_TAIL_LINE_LIMIT);
 		return tail ? `\n${tail}` : "";
 	}
-	if (NO_COLLAPSED_RESULT_TOOLS.has(toolName)) return "";
-	if (COLLAPSED_TAIL_TOOLS.has(toolName)) {
-		const tail = tailLines(text, COLLAPSED_TAIL_LINE_LIMIT);
+	if (toolName === "read") {
+		const head = firstLines(text, PREVIEW_LINE_LIMIT);
+		return head ? `\n${head}` : "";
+	}
+	if (toolName === "bash") {
+		const tail = lastOutputLines(text, PREVIEW_LINE_LIMIT);
 		return tail ? `\n${tail}` : "";
 	}
-	if (isEmptyResultMessage(toolName, text)) return "";
-
-	const summaryLabel = COLLAPSED_COUNT_LABELS[toolName];
-	if (!summaryLabel) return "";
-
-	const count = countNonEmptyLines(text);
-	return count > 0 ? ` → ${count} ${summaryLabel}` : "";
+	if (toolName === "edit") return `\n${editSummary(result)}`;
+	if (toolName === "write") return `\n${writeSummary(text)}`;
+	return "";
 }
 
 function lineRangeSuffix(args: Record<string, unknown>, theme: ThemeLike): string {
@@ -278,6 +363,8 @@ interface ToolRenderContextLike {
 	isPartial?: boolean;
 	isError?: boolean;
 	lastComponent?: unknown;
+	cwd?: string;
+	[key: string]: unknown;
 }
 
 function formatToolCall(toolName: QuietToolName, args: Record<string, unknown>, theme: ThemeLike): string {
@@ -317,12 +404,36 @@ function formatToolCall(toolName: QuietToolName, args: Record<string, unknown>, 
 	}
 }
 
-function partialLabel(toolName: QuietToolName): string {
-	return toolName === "bash" ? "Running..." : `${toolName}...`;
+function partialLabel(toolName: QuietToolName, text: string): string {
+	const lineCount = outputLines(text).length;
+	return lineCount === 0
+		? `… ${toolName}`
+		: `… ${toolName} · ${lineCount} ${lineCount === 1 ? "line" : "lines"}`;
+}
+
+function hasImageContent(result: AgentToolResult<unknown>): boolean {
+	return result.content.some((content) => content.type === "image");
+}
+
+function hasExpandableContent(toolName: QuietToolName, result: AgentToolResult<unknown>, text: string): boolean {
+	if (COLLAPSED_COUNT_LABELS[toolName] && isEmptyResultMessage(toolName, text)) return false;
+	if (text.length > 0 || hasImageContent(result)) return true;
+	const diff = detailsRecord(result).diff;
+	return toolName === "edit" && typeof diff === "string" && diff.length > 0;
+}
+
+function sanitizedRenderContext(context: ToolRenderContextLike | undefined): ToolRenderContextLike {
+	if (!context) return { args: {} };
+	return {
+		...context,
+		args: sanitizedArgs(context.args),
+		cwd: typeof context.cwd === "string" ? safeText(context.cwd) : context.cwd,
+	};
 }
 
 function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName): void {
 	const registrationTool = getBuiltInTools(process.cwd())[toolName];
+	const officialRenderResult = registrationTool.renderResult;
 
 	pi.registerTool({
 		...registrationTool,
@@ -337,30 +448,43 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName): void {
 				return renderGentleAiLifecycleCall(
 					operationPath,
 					theme,
-					context as GentleAiRenderContext | undefined,
-					isGentleAiGrantCommand(callArgs) ? asString(callArgs.command) : undefined,
+					sanitizedRenderContext(context as ToolRenderContextLike | undefined) as GentleAiRenderContext,
+					isGentleAiGrantCommand(callArgs) ? safeText(asString(callArgs.command)) : undefined,
 				);
 			}
 			return new Text(formatToolCall(toolName, callArgs, theme), 0, 0);
 		},
 		renderResult(result, options, theme, context) {
 			const renderContext = context as ToolRenderContextLike | undefined;
+			const safeResult = sanitizedResult(result);
+			const text = safeText(extractTextContent(safeResult));
 			const isError = renderContext?.isError ?? options.isError ?? false;
 			const directCommand = toolName === "bash" && isGentleAiDirectCommand(renderContext?.args);
 			if (options.isPartial) {
-				if (directCommand && !isError) {
-					if (!options.expanded) return new Text("", 0, 0);
-				} else if (!(directCommand && isError)) {
-					return new Text(theme.fg("warning", partialLabel(toolName)), 0, 0);
-				}
+				if (directCommand && !isError && !options.expanded) return new Text("", 0, 0);
+				const visible = options.expanded ? text : lastOutputLines(text, PREVIEW_LINE_LIMIT);
+				const label = theme.fg("warning", partialLabel(toolName, text));
+				const output = visible ? `${label}\n${theme.fg("muted", visible)}` : label;
+				return new Text(output, 0, 0);
 			}
-			const output = formatToolResultOutput(toolName, result, {
+			if (options.expanded && toolName === "read" && hasImageContent(safeResult) && officialRenderResult) {
+				return officialRenderResult(
+					safeResult,
+					options,
+					theme,
+					sanitizedRenderContext(renderContext) as any,
+				);
+			}
+			const output = formatToolResultOutput(toolName, safeResult, {
 				expanded: options.expanded,
 				isError,
 				args: renderContext?.args,
 			});
+			const hint = !options.expanded && !directCommand && hasExpandableContent(toolName, safeResult, text)
+				? `\n${keyHint("app.tools.expand", "to expand")}`
+				: "";
 			const color = options.expanded ? "toolOutput" : isError ? "error" : "muted";
-			return new Text(output ? theme.fg(color, output) : "", 0, 0);
+			return new Text(output || hint ? theme.fg(color, `${output}${hint}`) : "", 0, 0);
 		},
 	});
 }
