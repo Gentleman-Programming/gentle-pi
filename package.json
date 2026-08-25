@@ -62,7 +62,11 @@
       "./prompts"
     ],
     "skills": [
-      "./skills"
+      "./skills",
+      "-skills/cognitive-doc-design",
+      "-skills/comment-writer",
+      "-skills/skill-registry",
+      "-skills/work-unit-commits"
     ]
   },
   "dependencies": {
