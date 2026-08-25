@@ -18,9 +18,12 @@ const ASSETS_AGENTS_DIR = join(PACKAGE_ROOT, "assets", "agents");
 //   filesystem tools — the failure reported in gentle-pi#62.
 // - `splitToolList` partitions `mcp:`-prefixed entries into MCP direct tools.
 //
-// gentle-pi deliberately does not depend on pi-subagents at build time, so the
-// contract is vendored here. If upstream changes its parsing semantics, update
-// this mirror as a conscious contract decision, not as drift.
+// gentle-pi supports BOTH subagent packages (see SUBAGENTS_PACKAGE_NAMES in
+// extensions/gentle-ai.ts: "pi-subagents-j0k3r" and "pi-subagents"), so the
+// j0k3r parsing rules are mirrored below as well. gentle-pi deliberately does
+// not depend on either package at build time; if either upstream changes its
+// parsing semantics, update these mirrors as a conscious contract decision,
+// not as drift.
 
 function parseFrontmatterList(raw: string | undefined): string[] | undefined {
 	if (raw === undefined) return undefined;
@@ -140,6 +143,66 @@ test("the vendored parsing contract handles YAML blocks, comma scalars, and mcp 
 		if (token.includes("\n")) {
 			assert.match(token, /\n/, "legacy comma-only parsing collapses YAML lines into one token");
 			break;
+		}
+	}
+});
+
+// Mirrors pi-subagents-j0k3r 1.5.6 frontmatter semantics (src/config.ts):
+// `- item` list lines append scalar tokens to the current key; a non-empty
+// `tools:` value means inline comma syntax; declaring BOTH formats on one
+// agent is ambiguous and that package refuses to load the agent.
+function parseJ0k3rTools(frontmatter: string): { tools: string[]; ambiguous: boolean } {
+	const tools: string[] = [];
+	let toolsFormat: "inline" | "multiline" | undefined;
+	let ambiguous = false;
+	let currentKey: string | undefined;
+	for (const line of frontmatter.split("\n")) {
+		if (!line.trim()) continue;
+		const list = line.match(/^\s*-\s+(.+)$/);
+		if (list && currentKey) {
+			if (currentKey === "tools") {
+				if (toolsFormat === "inline") ambiguous = true;
+				toolsFormat ??= "multiline";
+				tools.push(list[1].trim());
+			}
+			continue;
+		}
+		const match = line.match(/^([a-zA-Z0-9_-]+):\s*(.*)$/);
+		if (!match) continue;
+		currentKey = match[1];
+		if (currentKey === "tools") {
+			const format = match[2].trim() ? "inline" : "multiline";
+			if (toolsFormat !== undefined && format !== toolsFormat) ambiguous = true;
+			toolsFormat = format;
+			if (format === "inline") {
+				tools.push(...match[2].split(",").map((item) => item.trim()).filter(Boolean));
+			}
+		}
+	}
+	return { tools, ambiguous };
+}
+
+test("issue #62 regression: packaged agents also satisfy the pi-subagents-j0k3r multiline parsing rules", () => {
+	const agentFiles = readdirSync(ASSETS_AGENTS_DIR).flatMap((entry) =>
+		entry.endsWith(".md") ? [join(ASSETS_AGENTS_DIR, entry)] : [],
+	);
+	assert.ok(agentFiles.length > 0, "gentle-pi must ship packaged agents");
+
+	for (const file of agentFiles) {
+		const source = readFileSync(file, "utf8");
+		const frontmatter = source.match(/^---\n([\s\S]*?)\n---/)?.[1];
+		assert.ok(frontmatter, `${file} must have YAML frontmatter`);
+		const label = file.split("/").pop() ?? file;
+
+		const { tools, ambiguous } = parseJ0k3rTools(frontmatter);
+		assert.ok(!ambiguous, `${label}: j0k3r treats mixed inline+multiline tools as ambiguous and refuses to load the agent`);
+		assert.ok(tools.length > 0, `${label} must parse to a non-empty j0k3r tool list`);
+		assert.ok(tools.includes("read"), `${label} must retain read under j0k3r parsing`);
+		for (const tool of tools) {
+			assert.ok(
+				!tool.includes("\n") && !tool.startsWith("- "),
+				`${label}: j0k3r token ${JSON.stringify(tool)} collapsed YAML lines`,
+			);
 		}
 	}
 });
