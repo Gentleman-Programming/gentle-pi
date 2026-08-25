@@ -97,6 +97,20 @@ function lastOutputLines(text: string, limit: number): string {
 	return outputLines(text).slice(-limit).join("\n");
 }
 
+function semanticJsonPreview(text: string): string | undefined {
+	const trimmed = text.trim();
+	if (!/^[\[{]/.test(trimmed)) return undefined;
+	try {
+		JSON.parse(trimmed);
+	} catch {
+		return undefined;
+	}
+	return outputLines(trimmed)
+		.filter((line) => !/^[\s{}\[\],]*$/.test(line))
+		.slice(0, PREVIEW_LINE_LIMIT)
+		.join("\n");
+}
+
 export function extractTextContent(result: AgentToolResult<unknown>): string {
 	return result.content
 		.flatMap((content) => (content.type === "text" ? [content.text] : []))
@@ -342,7 +356,8 @@ export function formatToolResultOutput(
 		return head ? `\n${head}` : "";
 	}
 	if (toolName === "bash") {
-		const tail = lastOutputLines(text, PREVIEW_LINE_LIMIT);
+		const preview = semanticJsonPreview(text);
+		const tail = preview ?? lastOutputLines(text, PREVIEW_LINE_LIMIT);
 		return tail ? `\n${tail}` : "";
 	}
 	if (toolName === "edit") return `\n${editSummary(result)}`;

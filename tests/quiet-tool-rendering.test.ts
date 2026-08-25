@@ -609,6 +609,32 @@ test("quiet tool rendering keeps shell compositions, expansions, and lookalikes 
 	}
 });
 
+test("quiet Bash previews semantic lines for generic JSON output", () => {
+	const tools = registeredQuietTools();
+	const tool = tools.get("bash");
+	const command = "gentle-ai review capabilities --contract gentle-ai.review-integration/v2 | python3 -m json.tool";
+	const json = (value: unknown) => JSON.stringify(value, null, 2);
+	const object = json({ schema: "gentle-ai.review-integration/v2", contract: "review", protocol: { version: 2 }, payload: { items: [{ value: true }] } });
+	const error = json({ error: "failed", payload: { items: [{ code: 1 }] } });
+	const cases = [
+		[object, '  "schema": "gentle-ai.review-integration/v2",\n  "contract": "review",\n  "protocol": {'],
+		[json(["alpha", "beta", { entry: true }]), '  "alpha",\n  "beta",\n    "entry": true'],
+		['{\n  "schema": "broken",\n  "contract": "partial",\n  "payload": [\n    "value"\n  ]', '  "payload": [\n    "value"\n  ]'],
+	] as const;
+	for (const [text, expected] of cases) {
+		assert.equal(formatToolResultOutput("bash", textResult(text) as any, { expanded: false, args: { command } }), `\n${expected}`);
+	}
+	assert.equal(formatToolResultOutput("bash", textResult(error) as any, { expanded: false, isError: true, args: { command } }), `\n${tailLines(error, 3)}`);
+	const call = renderToString(tool.renderCall({ command }, passthroughTheme, { args: { command } }));
+	const collapsed = renderToolResult(tool, textResult(object), { expanded: false, isPartial: false }, { args: { command } });
+	const expanded = renderToolResult(tool, textResult(object), { expanded: true, isPartial: false }, { args: { command } });
+	assert.equal(call.trimEnd(), `$ ${command}`);
+	assert.doesNotMatch(call, /🌹︎ Gentle AI/);
+	assert.doesNotMatch(collapsed, /^\n\s*[}\]]/);
+	assert.ok(collapsed.includes(keyHint("app.tools.expand", "to expand")));
+	assert.equal(expanded, `\n${object}`);
+});
+
 test("quiet tool rendering keeps collapsed git bash result tails", () => {
 	const text = Array.from({ length: 12 }, (_, index) => `git line ${index + 1}`).join("\n");
 
