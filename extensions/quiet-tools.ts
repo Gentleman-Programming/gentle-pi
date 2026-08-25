@@ -11,6 +11,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
+import { isAbsolute } from "node:path";
+import { resolveGentleAiDevBinaryOverride, type GentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
 import { quietToolsEnabled } from "../lib/quiet-tools-config.ts";
 import { renderGentleAiLifecycleCall, renderGentleAiResult, type GentleAiRenderContext } from "../lib/gentle-ai-renderer.ts";
 import { sanitizeTerminalText } from "../lib/terminal-theme.ts";
@@ -158,6 +160,16 @@ const SHELL_COMMAND_ASSIGNMENT = String.raw`\w+=(?:'[^']*'|"[^"]*"|\S+)`;
 const SHELL_COMMAND_PREFIX = String.raw`(?:env\s+(?:${SHELL_COMMAND_ASSIGNMENT}\s+)?|command(?:\s+--)?\s+|${SHELL_COMMAND_ASSIGNMENT}\s+)*`;
 const GENTLE_AI_EXECUTABLE = String.raw`(?:gentle-ai(?:\.exe)?|'gentle-ai(?:\.exe)?'|"gentle-ai(?:\.exe)?"|gentle\\-ai(?:\.exe|\\\.exe)?|(?:\.{1,2}[\\/]|(?:[A-Za-z]:)?(?:[\\/][^\\/\s]+)*[\\/])\.gentle-ai[\\/]v\d+\.\d+\.\d+[\\/]gentle-ai(?:\.exe)?)`;
 const GENTLE_AI_COMMAND_ARGUMENTS = new RegExp(String.raw`^${SHELL_COMMAND_PREFIX}${GENTLE_AI_EXECUTABLE}(?:\s+(.*))?$`);
+
+function createGentleAiCommandArguments(activeDevBinaryPath?: string): RegExp {
+	if (!activeDevBinaryPath) return GENTLE_AI_COMMAND_ARGUMENTS;
+	const escapedPath = activeDevBinaryPath.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+	const executableForms = [escapedPath];
+	if (!activeDevBinaryPath.includes("'")) executableForms.push(`'${escapedPath}'`);
+	if (!activeDevBinaryPath.includes('"')) executableForms.push(`"${escapedPath}"`);
+	const executable = `(?:${GENTLE_AI_EXECUTABLE}|(?:${executableForms.join("|")}))`;
+	return new RegExp(String.raw`^${SHELL_COMMAND_PREFIX}${executable}(?:\s+(.*))?$`);
+}
 const SHELL_EXPANSION_OR_COMPOSITION = /[;&|`<>\r\n$#]/;
 const SDD_ATTEMPT_VERBS = new Set(["acquire", "settle", "grant"]);
 
@@ -199,11 +211,11 @@ const REVIEW_SCHEMA_NAMES = new Set([
 	"verification-evidence-record",
 ]);
 
-function gentleAiCommandTokens(args: Record<string, unknown> | undefined): string[] | undefined {
+function gentleAiCommandTokens(args: Record<string, unknown> | undefined, commandArguments = GENTLE_AI_COMMAND_ARGUMENTS): string[] | undefined {
 	const rawCommand = typeof args?.command === "string" ? args.command : "";
 	if (SHELL_EXPANSION_OR_COMPOSITION.test(rawCommand)) return undefined;
 	const command = rawCommand.trim();
-	const match = GENTLE_AI_COMMAND_ARGUMENTS.exec(command);
+	const match = commandArguments.exec(command);
 	if (!match) return undefined;
 	const argumentsText = match[1]?.trim();
 	return argumentsText === undefined || argumentsText.length === 0
@@ -245,12 +257,12 @@ function validateGate(tokens: string[]): string | undefined {
  * package-local paths, not arbitrary shell output that merely mentions
  * gentle-ai. These commands otherwise emit machine-readable SDD/RDD data.
  */
-export function isGentleAiDirectCommand(args: Record<string, unknown> | undefined): boolean {
-	return gentleAiCommandTokens(args) !== undefined;
+export function isGentleAiDirectCommand(args: Record<string, unknown> | undefined, commandArguments = GENTLE_AI_COMMAND_ARGUMENTS): boolean {
+	return gentleAiCommandTokens(args, commandArguments) !== undefined;
 }
 
-export function gentleAiRoutineCommand(args: Record<string, unknown> | undefined): GentleAiRoutineCommand | undefined {
-	const tokens = gentleAiCommandTokens(args);
+export function gentleAiRoutineCommand(args: Record<string, unknown> | undefined, commandArguments = GENTLE_AI_COMMAND_ARGUMENTS): GentleAiRoutineCommand | undefined {
+	const tokens = gentleAiCommandTokens(args, commandArguments);
 	if (!tokens) return undefined;
 	if (tokens[0] === "sdd-status") return "sdd-status";
 	if (tokens[0] === "sdd-continue") return "sdd-continue";
@@ -259,8 +271,8 @@ export function gentleAiRoutineCommand(args: Record<string, unknown> | undefined
 	return undefined;
 }
 
-export function gentleAiOperationPath(args: Record<string, unknown> | undefined): string | undefined {
-	const tokens = gentleAiCommandTokens(args);
+export function gentleAiOperationPath(args: Record<string, unknown> | undefined, commandArguments = GENTLE_AI_COMMAND_ARGUMENTS): string | undefined {
+	const tokens = gentleAiCommandTokens(args, commandArguments);
 	if (!tokens) return undefined;
 
 	if (tokens[0] === "sdd-status") return "sdd status";
@@ -295,8 +307,8 @@ export function gentleAiOperationPath(args: Record<string, unknown> | undefined)
 	return REVIEW_DIRECT_OPERATIONS.has(operation) ? `review ${displayToken(operation)}` : "review";
 }
 
-export function isGentleAiGrantCommand(args: Record<string, unknown> | undefined): boolean {
-	const tokens = gentleAiCommandTokens(args);
+export function isGentleAiGrantCommand(args: Record<string, unknown> | undefined, commandArguments = GENTLE_AI_COMMAND_ARGUMENTS): boolean {
+	const tokens = gentleAiCommandTokens(args, commandArguments);
 	return tokens?.[0] === "sdd-attempt" && tokens[1] === "grant";
 }
 
@@ -466,7 +478,13 @@ function sanitizedRenderContext(context: ToolRenderContextLike | undefined): Too
 	};
 }
 
-function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName): void {
+type GentleAiDevBinaryOverrideResolver = () => GentleAiDevBinaryOverride | undefined;
+function resolveQuietToolsDevBinaryPath(resolveOverride: GentleAiDevBinaryOverrideResolver): string | undefined {
+	try { const path = resolveOverride()?.path; return typeof path === "string" && isAbsolute(path) ? path : undefined; }
+	catch { return undefined; }
+}
+
+function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArguments: RegExp): void {
 	const registrationTool = getBuiltInTools(process.cwd())[toolName];
 	const officialRenderResult = registrationTool.renderResult;
 
@@ -478,7 +496,7 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName): void {
 		},
 		renderCall(args, theme, context) {
 			const callArgs = args as Record<string, unknown>;
-			const operationPath = toolName === "bash" ? gentleAiOperationPath(callArgs) : undefined;
+			const operationPath = toolName === "bash" ? gentleAiOperationPath(callArgs, commandArguments) : undefined;
 			if (operationPath) {
 				return renderGentleAiLifecycleCall(
 					operationPath,
@@ -493,7 +511,7 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName): void {
 			const safeResult = sanitizedResult(result);
 			const text = safeText(extractTextContent(safeResult));
 			const isError = renderContext?.isError ?? options.isError ?? false;
-			const directCommand = toolName === "bash" && isGentleAiDirectCommand(renderContext?.args);
+			const directCommand = toolName === "bash" && isGentleAiDirectCommand(renderContext?.args, commandArguments);
 			if (directCommand) {
 				return renderGentleAiResult(safeResult, { expanded: options.expanded });
 			}
@@ -525,9 +543,10 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName): void {
 	});
 }
 
-export default function quietTools(pi: ExtensionAPI): void {
+export default function quietTools(pi: ExtensionAPI, resolveOverride: GentleAiDevBinaryOverrideResolver = () => resolveGentleAiDevBinaryOverride()): void {
 	if (!quietToolsEnabled()) return;
+	const commandArguments = createGentleAiCommandArguments(resolveQuietToolsDevBinaryPath(resolveOverride));
 	for (const toolName of Object.keys(TOOL_CREATORS) as QuietToolName[]) {
-		registerQuietTool(pi, toolName);
+		registerQuietTool(pi, toolName, commandArguments);
 	}
 }

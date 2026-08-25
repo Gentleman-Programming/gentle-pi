@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { gzipSync } from "node:zlib";
+import { initTheme, keyHint } from "@earendil-works/pi-coding-agent";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -15,6 +16,8 @@ import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import type { NativeReviewCli } from "../lib/native-review-cli.ts";
 import type { ReviewCollectInputV3, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
+
+initTheme("dark");
 
 function writeMarkdown(path: string, content: string): void {
 	mkdirSync(dirname(path), { recursive: true });
@@ -145,6 +148,7 @@ test("registered Gentle Review tools preserve result envelopes and redact collap
 	assert.deepEqual(result.details, visibleEnvelope);
 
 	const resultText = "safe result\x1b[31m\nlineage=secret body=private";
+	const expandHint = keyHint("app.tools.expand", "to expand");
 	for (const name of ["gentle_review", "gentle_review_scope", "gentle_review_capture"]) {
 		const tool = tools.get(name);
 		assert.equal(typeof tool?.renderResult, "function", `${name} must define result rendering`);
@@ -154,15 +158,18 @@ test("registered Gentle Review tools preserve result envelopes and redact collap
 			{ expanded: false, isPartial: false, isError: true },
 		]) {
 			const collapsed = renderComponent(tool.renderResult({ content: [{ type: "text", text: resultText }] }, options, lifecycleTheme, {}));
-			assert.equal(collapsed, "", `${name} collapsed output must be empty`);
-			assert.doesNotMatch(collapsed, /lineage=secret|private/);
+			assert.equal(collapsed, `\n${expandHint}`, `${name} collapsed output must contain one expand hint`);
+			assert.doesNotMatch(collapsed, /safe result|lineage=secret|private/);
 		}
 		const expanded = renderComponent(tool.renderResult({ content: [{ type: "text", text: resultText }] }, { expanded: true, isPartial: false, isError: true }, lifecycleTheme, {}));
 		assert.match(expanded, /safe result/);
 		assert.match(expanded, /lineage=secret body=private/);
+		assert.doesNotMatch(expanded, /to expand/);
 		assert.doesNotMatch(expanded, /\x1b\[/);
 		const nonText = renderComponent(tool.renderResult({ content: [{ type: "image", data: "opaque", mimeType: "image/png" }] }, { expanded: true, isPartial: false }, lifecycleTheme, {}));
 		assert.equal(nonText, "");
+		const empty = renderComponent(tool.renderResult({ content: [{ type: "text", text: "" }] }, { expanded: false, isPartial: false }, lifecycleTheme, {}));
+		assert.equal(empty, "");
 	}
 });
 

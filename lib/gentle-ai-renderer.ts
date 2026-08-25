@@ -1,4 +1,4 @@
-import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
+import { keyHint, type AgentToolResult } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { sanitizeTerminalText } from "./terminal-theme.ts";
 
@@ -24,10 +24,11 @@ export function renderGentleAiResult(
 	result: AgentToolResult<unknown>,
 	options: GentleAiResultRenderOptions,
 ): Text {
-	const text = result.content
-		.flatMap((content) => (content.type === "text" ? [sanitizeTerminalText(content.text)] : []))
-		.join("\n");
-	return new Text(options.expanded && text.length > 0 ? `\n${text}` : "", 0, 0);
+	const textItems = result.content.flatMap((content) => (content.type === "text" ? [sanitizeTerminalText(content.text)] : []));
+	const text = textItems.join("\n");
+	const hasExpandableText = textItems.some((item) => item.length > 0);
+	const output = !hasExpandableText ? "" : options.expanded ? `\n${text}` : `\n${keyHint("app.tools.expand", "to expand")}`;
+	return new Text(output, 0, 0);
 }
 
 export function renderGentleAiLifecycleCall(
