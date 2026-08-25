@@ -10,13 +10,9 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import {
-	DefaultResourceLoader,
-	SettingsManager,
-} from "@earendil-works/pi-coding-agent";
 import { applyModelConfig } from "../extensions/gentle-ai.ts";
 import { installSddAssets } from "../lib/sdd-preflight.ts";
 
@@ -76,7 +72,6 @@ function sha256(content: string): string {
 
 interface PackageJsonPiManifest {
 	extensions?: string[];
-	skills?: string[];
 }
 
 interface PackageJson {
@@ -112,76 +107,6 @@ test("package manifest has no obsolete native activation build surface", () => {
 	assert.doesNotMatch(manifest, /build-native-addon|gentle_review_native|review-native-fence/i);
 	assert.doesNotMatch(packageJson.scripts?.prepack ?? "", /native:build/);
 	assert.doesNotMatch(packageJson.scripts?.prepublishOnly ?? "", /native:build/);
-});
-
-const PACKAGE_SKILL_DIRECTORIES = [
-	"branch-pr",
-	"chained-pr",
-	"gentle-ai",
-	"issue-creation",
-	"judgment-day",
-	"rdd-defect-workflow",
-	"release",
-	"skill-creator",
-	"skill-improver",
-] as const;
-const EXCLUDED_PACKAGE_SKILL_DIRECTORIES = [
-	"cognitive-doc-design",
-	"comment-writer",
-	"skill-registry",
-	"work-unit-commits",
-] as const;
-
-async function loadPackageSkillDirectories(): Promise<string[]> {
-	const temporaryAgentDir = mkdtempSync(join(tmpdir(), "gentle-pi-package-skills-"));
-
-	try {
-		const loader = new DefaultResourceLoader({
-			cwd: PACKAGE_ROOT,
-			agentDir: temporaryAgentDir,
-			settingsManager: SettingsManager.inMemory({ packages: [PACKAGE_ROOT] }),
-			noExtensions: true,
-			noPromptTemplates: true,
-			noThemes: true,
-			noContextFiles: true,
-		});
-		await loader.reload();
-
-		return loader
-			.getSkills()
-			.skills.filter(
-				(skill) =>
-					skill.sourceInfo.origin === "package" &&
-					skill.sourceInfo.source === PACKAGE_ROOT,
-			)
-			.map((skill) => basename(dirname(skill.filePath)));
-	} finally {
-		rmSync(temporaryAgentDir, { recursive: true, force: true });
-	}
-}
-
-test("Pi package loader excludes duplicate skills without dropping package skills", async () => {
-	const packageSkillDirectories = await loadPackageSkillDirectories();
-
-	for (const excluded of EXCLUDED_PACKAGE_SKILL_DIRECTORIES) {
-		assert.equal(
-			packageSkillDirectories.filter((directory) => directory === excluded).length,
-			0,
-			`Pi must exclude globally duplicated package skill ${excluded}`,
-		);
-	}
-	for (const retained of PACKAGE_SKILL_DIRECTORIES) {
-		assert.equal(
-			packageSkillDirectories.filter((directory) => directory === retained).length,
-			1,
-			`Pi must load package skill ${retained} exactly once`,
-		);
-	}
-	assert.deepEqual(
-		[...packageSkillDirectories].sort(),
-		[...PACKAGE_SKILL_DIRECTORIES].sort(),
-		"Pi must not silently add or lose a package-provided skill",
-	);
 });
 
 test("package verification names the native review runtime boundary and packaged fixtures", () => {

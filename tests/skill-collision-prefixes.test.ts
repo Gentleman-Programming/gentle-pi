@@ -14,21 +14,18 @@ function readSkillName(dir: string): string | undefined {
 const PREFIXED_NAMES: Record<string, string> = {
 	"branch-pr": "gentle-ai-branch-pr",
 	"chained-pr": "gentle-ai-chained-pr",
+	"cognitive-doc-design": "gentle-ai-cognitive-doc-design",
+	"comment-writer": "gentle-ai-comment-writer",
 	"issue-creation": "gentle-ai-issue-creation",
 	"judgment-day": "gentle-ai-judgment-day",
 	"rdd-defect-workflow": "gentle-ai-rdd-defect-workflow",
 	"skill-creator": "gentle-ai-skill-creator",
 	"skill-improver": "gentle-ai-skill-improver",
+	"skill-registry": "gentle-ai-skill-registry",
+	"work-unit-commits": "gentle-ai-work-unit-commits",
 };
 
-const UNPREFIXED_DIRS = [
-	"skill-registry",
-	"release",
-	"work-unit-commits",
-	"gentle-ai",
-	"comment-writer",
-	"cognitive-doc-design",
-];
+const UNPREFIXED_DIRS = ["gentle-ai", "release"];
 
 for (const [dir, expectedName] of Object.entries(PREFIXED_NAMES)) {
 	test(`skills/${dir}/SKILL.md frontmatter name is prefixed`, () => {
