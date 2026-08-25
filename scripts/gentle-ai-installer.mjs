@@ -615,7 +615,14 @@ async function installWindowsGentleAiFromGoSumdb(options, packageRoot, architect
 			await safeRemoveDirectory(buildDirectory);
 			const published = await publishBundle(runtimeRoot, stagingDirectory, options);
 			return { installed: true, binaryPath: join(published, "gentle-ai.exe"), method: GENTLE_AI_INSTALL_METHOD.GO_SUMDB_SOURCE_BUILD };
-		} finally { await safeRemoveDirectory(stagingDirectory); }
+		} finally {
+			// A straggling build child can keep staging files open on Windows (execFile's
+			// timeout kill terminates go.exe but not its compiler descendants), and an
+			// exception thrown here would mask the primary installer error. Removal
+			// failures degrade to cleanupStaleStagingBundles sweeping the directory on
+			// the next install instead.
+			await safeRemoveDirectory(stagingDirectory).catch(() => {});
+		}
 	});
 }
 
