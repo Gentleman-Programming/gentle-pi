@@ -23,6 +23,12 @@ const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const DOWNLOAD_TIMEOUTS = { headers: 10_000, body: 30_000, attempts: 2, retryDelay: 100 };
 const GO_COMMAND_TIMEOUT_MS = 120_000;
+// The pinned source build compiles the full Gentle AI module tree from a cold
+// cache, and a clean Windows x64 build has been measured at ~232s (#400) — well
+// past the 120s bound that every other (fast) go command keeps. The build gets
+// its own bound with headroom for slower disks; it stays finite so a wedged
+// build cannot hang the package postinstall forever.
+const GO_SOURCE_BUILD_TIMEOUT_MS = 600_000;
 const GO_COMMAND_MAX_BUFFER = 1024 * 1024;
 const WINDOWS_SYSTEM_ROOT = "C:\\Windows";
 // The one authoritative pinned Gentle AI version. Every other location in this
@@ -50,6 +56,7 @@ export const GENTLE_AI_WINDOWS_MINIMUM_GO_VERSION = "1.25.10";
 export const GENTLE_AI_GO_TOOLCHAIN_UNAVAILABLE_CODE = "GENTLE_AI_GO_TOOLCHAIN_UNAVAILABLE";
 export const GENTLE_AI_GO_TOOLCHAIN_TOO_OLD_CODE = "GENTLE_AI_GO_TOOLCHAIN_TOO_OLD";
 export const GENTLE_AI_GO_INSTALL_FAILED_CODE = "GENTLE_AI_GO_INSTALL_FAILED";
+export const GENTLE_AI_GO_INSTALL_TIMEOUT_CODE = "GENTLE_AI_GO_INSTALL_TIMEOUT";
 export const GENTLE_AI_VERSION_MISMATCH_CODE = "GENTLE_AI_VERSION_MISMATCH";
 
 export class GentleAiInstallerError extends Error {
@@ -249,8 +256,16 @@ function isCanonicalManifest(contents, parsed, expected) {
 
 function commandOutput(result) { return typeof result?.stdout === "string" ? result.stdout : ""; }
 
-function commandOptions(env, cwd) {
-	return { cwd, env, shell: false, windowsHide: true, timeout: GO_COMMAND_TIMEOUT_MS, maxBuffer: GO_COMMAND_MAX_BUFFER };
+function commandOptions(env, cwd, timeout = GO_COMMAND_TIMEOUT_MS) {
+	return { cwd, env, shell: false, windowsHide: true, timeout, maxBuffer: GO_COMMAND_MAX_BUFFER };
+}
+
+// execFile reports a timeout kill as killed=true with the kill signal and a null
+// exit code; a maxBuffer kill carries ERR_CHILD_PROCESS_STDIO_MAXBUFFER instead,
+// so requiring a nullish code keeps that (and real build failures) out.
+function isCommandTimeoutError(error) {
+	if (error?.code === "ETIMEDOUT") return true;
+	return error?.killed === true && typeof error?.signal === "string" && error?.code == null;
 }
 
 function outputVersion(output) {
@@ -584,8 +599,11 @@ async function installWindowsGentleAiFromGoSumdb(options, packageRoot, architect
 			const existing = versionBundlePath(runtimeRoot);
 			if (await existingWindowsSourceBundleMatches(existing, execute, goPath, environment, architecture)) return { installed: false, binaryPath: join(existing, "gentle-ai.exe"), method: GENTLE_AI_INSTALL_METHOD.GO_SUMDB_SOURCE_BUILD };
 			await assertGoToolchain(execute, goPath, environment, stagingDirectory);
-			try { await runCommand(execute, goPath, ["install", GENTLE_AI_WINDOWS_SOURCE_PACKAGE], commandOptions(environment, stagingDirectory)); }
-			catch (error) { throw new GentleAiInstallerError(GENTLE_AI_GO_INSTALL_FAILED_CODE, `Gentle AI Go SumDB source installation failed for ${GENTLE_AI_WINDOWS_SOURCE_PACKAGE}.`, error); }
+			try { await runCommand(execute, goPath, ["install", GENTLE_AI_WINDOWS_SOURCE_PACKAGE], commandOptions(environment, stagingDirectory, GO_SOURCE_BUILD_TIMEOUT_MS)); }
+			catch (error) {
+				if (isCommandTimeoutError(error)) throw new GentleAiInstallerError(GENTLE_AI_GO_INSTALL_TIMEOUT_CODE, `Gentle AI source build for ${GENTLE_AI_WINDOWS_SOURCE_PACKAGE} exceeded the ${GO_SOURCE_BUILD_TIMEOUT_MS / 1000}s build bound. This is a build-duration limit, not a checksum or SumDB verification failure; re-run the installation, ideally with fewer concurrent workloads.`, error);
+				throw new GentleAiInstallerError(GENTLE_AI_GO_INSTALL_FAILED_CODE, `Gentle AI Go SumDB source installation failed for ${GENTLE_AI_WINDOWS_SOURCE_PACKAGE}.`, error);
+			}
 			const builtBinary = join(environment.GOBIN, "gentle-ai.exe"), binaryPath = join(stagingDirectory, "gentle-ai.exe");
 			const details = await lstat(builtBinary);
 			if (!details.isFile() || details.isSymbolicLink()) throw new GentleAiInstallerError(GENTLE_AI_GO_INSTALL_FAILED_CODE, "Gentle AI Go installation produced a non-regular gentle-ai.exe.");
