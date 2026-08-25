@@ -334,7 +334,7 @@ async function run() {
 	assert.ok(hooks.has("input"), "missing input hook");
 	assert.ok(hooks.has("before_agent_start"), "missing before_agent_start hook");
 	assert.ok(hooks.has("tool_call"), "missing tool_call hook");
-	for (const toolName of ["read", "bash", "grep", "find", "ls", "edit", "write"]) {
+	for (const toolName of ["read", "grep", "find", "ls", "edit", "write"]) {
 		assert.ok(tools.has(toolName), `missing quiet built-in tool renderer ${toolName}`);
 	}
 	assert.ok(tools.has("gentle_review"), "missing registered bounded review controller tool");

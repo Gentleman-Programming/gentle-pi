@@ -3,6 +3,7 @@ import test from "node:test";
 import piPretty from "../extensions/pi-pretty.ts";
 import quietTools, {
 	countNonEmptyLines,
+	createQuietToolRenderer,
 	extractTextContent,
 	formatToolResultOutput,
 	gentleAiRoutineCommand,
@@ -55,27 +56,26 @@ function textResult(text: string) {
 	};
 }
 
-function createPi(options: { throwOnToolConflict?: boolean } = {}) {
+function createPi(options: { throwOnToolConflict?: boolean; nativeBash?: boolean } = {}) {
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
 	const hooks = new Map<string, any[]>();
-	return {
-		tools,
-		pi: {
-			registerTool(tool: any) {
-				if (options.throwOnToolConflict && tools.has(tool.name)) {
-					throw new Error(`Tool ${tool.name} already registered`);
-				}
-				tools.set(tool.name, tool);
-			},
-			registerCommand(name: string, command: any) {
-				commands.set(name, command);
-			},
-			on(name: string, handler: any) {
-				hooks.set(name, [...(hooks.get(name) ?? []), handler]);
-			},
+	const pi = {
+		registerTool(tool: any) {
+			if (options.throwOnToolConflict && tools.has(tool.name)) {
+				throw new Error(`Tool ${tool.name} already registered`);
+			}
+			tools.set(tool.name, tool);
+		},
+		registerCommand(name: string, command: any) {
+			commands.set(name, command);
+		},
+		on(name: string, handler: any) {
+			hooks.set(name, [...(hooks.get(name) ?? []), handler]);
 		},
 	};
+	if (options.nativeBash !== false) pi.registerTool(createNativeBashTool());
+	return { tools, pi };
 }
 
 function createSdkTool(name: string) {
@@ -85,6 +85,14 @@ function createSdkTool(name: string) {
 		description: `${name} tool`,
 		parameters: { type: "object", properties: {} },
 		execute: async () => textResult(`${name} result`),
+	};
+}
+
+function createNativeBashTool() {
+	return {
+		...createSdkTool("bash"),
+		...createQuietToolRenderer("bash"),
+		shellPath: "C:\\Users\\Admin\\scoop\\apps\\git\\2.54.0\\bin\\bash.exe",
 	};
 }
 
@@ -130,13 +138,16 @@ async function withEnvAsync<T>(updates: Record<string, string | undefined>, run:
 	}
 }
 
-test("quiet tool rendering registers noisy built-in tools", () => {
+test("quiet tools preserve native Bash while registering quiet built-in tools", () => {
 	withEnv({ GENTLE_PI_QUIET_TOOLS: undefined }, () => {
 		const { pi, tools } = createPi();
+		const nativeBash = tools.get("bash");
 
 		quietTools(pi as any);
 
-		for (const toolName of ["read", "bash", "grep", "find", "ls", "edit", "write"]) {
+		assert.strictEqual(tools.get("bash"), nativeBash);
+		assert.equal(tools.get("bash")?.shellPath, nativeBash.shellPath);
+		for (const toolName of ["read", "grep", "find", "ls", "edit", "write"]) {
 			const tool = tools.get(toolName);
 			assert.ok(tool, `missing quiet renderer for ${toolName}`);
 			assert.equal(typeof tool.execute, "function", `${toolName} must delegate execution`);
@@ -148,10 +159,12 @@ test("quiet tool rendering registers noisy built-in tools", () => {
 test("quiet tool rendering can be disabled by env", () => {
 	withEnv({ GENTLE_PI_QUIET_TOOLS: "0" }, () => {
 		const { pi, tools } = createPi();
+		const nativeBash = tools.get("bash");
 
 		quietTools(pi as any);
 
-		assert.equal(tools.size, 0);
+		assert.strictEqual(tools.get("bash"), nativeBash);
+		assert.equal(tools.size, 1);
 	});
 });
 
@@ -159,12 +172,12 @@ test("pi-pretty suppresses overlapping tools before quiet tools register", async
 	await withEnvAsync(
 		{ GENTLE_PI_QUIET_TOOLS: undefined, PRETTY_DISABLE_TOOLS: "multi_grep" },
 		async () => {
-			const { pi, tools } = createPi({ throwOnToolConflict: true });
+			const { pi, tools } = createPi({ throwOnToolConflict: true, nativeBash: false });
 
 			await piPretty(pi as any, fakePiPrettyDeps as any);
 			quietTools(pi as any);
 
-			for (const toolName of ["read", "bash", "grep", "find", "ls", "edit", "write"]) {
+			for (const toolName of ["read", "grep", "find", "ls", "edit", "write"]) {
 				assert.ok(tools.has(toolName), `missing quiet tool ${toolName}`);
 			}
 			assert.equal(process.env.PRETTY_DISABLE_TOOLS, "multi_grep,read,bash,ls,find,grep");

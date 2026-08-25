@@ -1,6 +1,5 @@
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
-	createBashTool,
 	createEditTool,
 	createFindTool,
 	createGrepTool,
@@ -14,7 +13,8 @@ import { quietToolsEnabled } from "../lib/quiet-tools-config.ts";
 import { renderGentleAiLifecycleCall, type GentleAiRenderContext } from "../lib/gentle-ai-renderer.ts";
 import { sanitizeTerminalText } from "../lib/terminal-theme.ts";
 
-type QuietToolName = "read" | "bash" | "grep" | "find" | "ls" | "edit" | "write";
+type QuietToolName = "read" | "grep" | "find" | "ls" | "edit" | "write";
+type ToolName = QuietToolName | "bash";
 type ThemeLike = {
 	bold(value: string): string;
 	fg(color: string, value: string): string;
@@ -22,7 +22,6 @@ type ThemeLike = {
 
 const TOOL_CREATORS = {
 	read: createReadTool,
-	bash: createBashTool,
 	grep: createGrepTool,
 	find: createFindTool,
 	ls: createLsTool,
@@ -30,17 +29,17 @@ const TOOL_CREATORS = {
 	write: createWriteTool,
 } satisfies Record<QuietToolName, (cwd: string) => any>;
 
-const COLLAPSED_COUNT_LABELS: Partial<Record<QuietToolName, string>> = {
+const COLLAPSED_COUNT_LABELS: Partial<Record<ToolName, string>> = {
 	grep: "matches",
 	find: "files",
 	ls: "entries",
 };
 
-const NO_COLLAPSED_RESULT_TOOLS = new Set<QuietToolName>(["read", "bash"]);
-const COLLAPSED_TAIL_TOOLS = new Set<QuietToolName>(["edit", "write"]);
+const NO_COLLAPSED_RESULT_TOOLS = new Set<ToolName>(["read", "bash"]);
+const COLLAPSED_TAIL_TOOLS = new Set<ToolName>(["edit", "write"]);
 const COLLAPSED_TAIL_LINE_LIMIT = 10;
 
-const EMPTY_RESULT_MESSAGES: Partial<Record<QuietToolName, string[]>> = {
+const EMPTY_RESULT_MESSAGES: Partial<Record<ToolName, string[]>> = {
 	grep: ["No matches found"],
 	find: ["No files found matching pattern"],
 	ls: ["Directory is empty"],
@@ -94,7 +93,7 @@ function safeText(value: string): string {
 	return sanitizeTerminalText(value);
 }
 
-function isEmptyResultMessage(toolName: QuietToolName, text: string): boolean {
+function isEmptyResultMessage(toolName: ToolName, text: string): boolean {
 	const normalized = text.trim();
 	return EMPTY_RESULT_MESSAGES[toolName]?.some((message) => normalized.startsWith(message)) ?? false;
 }
@@ -239,7 +238,7 @@ interface ToolResultFormatOptions {
 }
 
 export function formatToolResultOutput(
-	toolName: QuietToolName,
+	toolName: ToolName,
 	result: AgentToolResult<unknown>,
 	{ expanded, isError = false, args }: ToolResultFormatOptions,
 ): string {
@@ -280,7 +279,7 @@ interface ToolRenderContextLike {
 	lastComponent?: unknown;
 }
 
-function formatToolCall(toolName: QuietToolName, args: Record<string, unknown>, theme: ThemeLike): string {
+function formatToolCall(toolName: ToolName, args: Record<string, unknown>, theme: ThemeLike): string {
 	switch (toolName) {
 		case "read": {
 			const path = safeText(shortenPath(args.path) || "...");
@@ -317,20 +316,13 @@ function formatToolCall(toolName: QuietToolName, args: Record<string, unknown>, 
 	}
 }
 
-function partialLabel(toolName: QuietToolName): string {
+function partialLabel(toolName: ToolName): string {
 	return toolName === "bash" ? "Running..." : `${toolName}...`;
 }
 
-function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName): void {
-	const registrationTool = getBuiltInTools(process.cwd())[toolName];
-
-	pi.registerTool({
-		...registrationTool,
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const runtimeTool = getBuiltInTools(ctx.cwd)[toolName];
-			return runtimeTool.execute(toolCallId, params, signal, onUpdate, ctx);
-		},
-		renderCall(args, theme, context) {
+export function createQuietToolRenderer(toolName: ToolName) {
+	return {
+		renderCall(args: any, theme: ThemeLike, context: any) {
 			const callArgs = args as Record<string, unknown>;
 			const operationPath = toolName === "bash" ? gentleAiOperationPath(callArgs) : undefined;
 			if (operationPath) {
@@ -343,7 +335,7 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName): void {
 			}
 			return new Text(formatToolCall(toolName, callArgs, theme), 0, 0);
 		},
-		renderResult(result, options, theme, context) {
+		renderResult(result: AgentToolResult<unknown>, options: any, theme: ThemeLike, context: any) {
 			const renderContext = context as ToolRenderContextLike | undefined;
 			const isError = renderContext?.isError ?? options.isError ?? false;
 			const directCommand = toolName === "bash" && isGentleAiDirectCommand(renderContext?.args);
@@ -362,6 +354,19 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName): void {
 			const color = options.expanded ? "toolOutput" : isError ? "error" : "muted";
 			return new Text(output ? theme.fg(color, output) : "", 0, 0);
 		},
+	};
+}
+
+function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName): void {
+	const registrationTool = getBuiltInTools(process.cwd())[toolName];
+
+	pi.registerTool({
+		...registrationTool,
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const runtimeTool = getBuiltInTools(ctx.cwd)[toolName];
+			return runtimeTool.execute(toolCallId, params, signal, onUpdate, ctx);
+		},
+		...createQuietToolRenderer(toolName),
 	});
 }
 
