@@ -119,7 +119,7 @@ test("registered Gentle Review tools render reusable rose lifecycle call rows", 
 	}
 });
 
-test("registered Gentle Review tools preserve result envelopes and default result visibility", async () => {
+test("registered Gentle Review tools preserve result envelopes and redact collapsed result rendering", async () => {
 	const tools = registeredGentleTools();
 	const scope = tools.get("gentle_review_scope");
 	const manifest = { version: 1, scopeByMode: { "100644": ["src/file.ts"] }, gitlinks: {} };
@@ -143,9 +143,27 @@ test("registered Gentle Review tools preserve result envelopes and default resul
 		entries: [{ path: "src/file.ts", mode: "100644" }],
 	});
 	assert.deepEqual(result.details, visibleEnvelope);
-	assert.equal(tools.get("gentle_review")?.renderResult, undefined);
-	assert.equal(scope.renderResult, undefined);
-	assert.equal(tools.get("gentle_review_capture")?.renderResult, undefined);
+
+	const resultText = "safe result\x1b[31m\nlineage=secret body=private";
+	for (const name of ["gentle_review", "gentle_review_scope", "gentle_review_capture"]) {
+		const tool = tools.get(name);
+		assert.equal(typeof tool?.renderResult, "function", `${name} must define result rendering`);
+		for (const options of [
+			{ expanded: false, isPartial: true, isError: false },
+			{ expanded: false, isPartial: false, isError: false },
+			{ expanded: false, isPartial: false, isError: true },
+		]) {
+			const collapsed = renderComponent(tool.renderResult({ content: [{ type: "text", text: resultText }] }, options, lifecycleTheme, {}));
+			assert.equal(collapsed, "", `${name} collapsed output must be empty`);
+			assert.doesNotMatch(collapsed, /lineage=secret|private/);
+		}
+		const expanded = renderComponent(tool.renderResult({ content: [{ type: "text", text: resultText }] }, { expanded: true, isPartial: false, isError: true }, lifecycleTheme, {}));
+		assert.match(expanded, /safe result/);
+		assert.match(expanded, /lineage=secret body=private/);
+		assert.doesNotMatch(expanded, /\x1b\[/);
+		const nonText = renderComponent(tool.renderResult({ content: [{ type: "image", data: "opaque", mimeType: "image/png" }] }, { expanded: true, isPartial: false }, lifecycleTheme, {}));
+		assert.equal(nonText, "");
+	}
 });
 
 test("session startup reports invalid project routing without mutating the profile", async (t) => {

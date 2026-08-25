@@ -12,7 +12,7 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
 import { quietToolsEnabled } from "../lib/quiet-tools-config.ts";
-import { renderGentleAiLifecycleCall, type GentleAiRenderContext } from "../lib/gentle-ai-renderer.ts";
+import { renderGentleAiLifecycleCall, renderGentleAiResult, type GentleAiRenderContext } from "../lib/gentle-ai-renderer.ts";
 import { sanitizeTerminalText } from "../lib/terminal-theme.ts";
 
 type QuietToolName = "read" | "bash" | "grep" | "find" | "ls" | "edit" | "write";
@@ -215,6 +215,22 @@ function displayToken(token: string): string {
 	return token.replace(/-/g, " ");
 }
 
+function authorizationRootCount(tokens: string[]): number {
+	let count = 0;
+	for (let index = 0; index < tokens.length; index += 1) {
+		const token = tokens[index]!;
+		if (token === "--authorization-root") {
+			const value = tokens[index + 1];
+			if (value !== undefined && !value.startsWith("-")) count += 1;
+			continue;
+		}
+		if (token.startsWith("--authorization-root=") && token.slice("--authorization-root=".length).length > 0) {
+			count += 1;
+		}
+	}
+	return count;
+}
+
 function validateGate(tokens: string[]): string | undefined {
 	const gateFlag = tokens.findIndex((token) => token === "--gate" || token.startsWith("--gate="));
 	if (gateFlag < 0) return undefined;
@@ -250,9 +266,13 @@ export function gentleAiOperationPath(args: Record<string, unknown> | undefined)
 	if (tokens[0] === "sdd-status") return "sdd status";
 	if (tokens[0] === "sdd-continue") return "sdd continue";
 	if (tokens[0] === "sdd-attempt") {
-		return SDD_ATTEMPT_VERBS.has(tokens[1] ?? "")
-			? `sdd attempt ${tokens[1]}`
-			: "sdd attempt";
+		const verb = tokens[1] ?? "";
+		if (!SDD_ATTEMPT_VERBS.has(verb)) return "sdd attempt";
+		if (verb !== "grant") return `sdd attempt ${verb}`;
+		const rootCount = authorizationRootCount(tokens);
+		return rootCount > 0
+			? `sdd attempt grant · ${rootCount} root${rootCount === 1 ? "" : "s"}`
+			: "sdd attempt grant";
 	}
 	if (tokens[0] === "version") return "version";
 	if (tokens[0] !== "review") return "command";
@@ -464,7 +484,6 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName): void {
 					operationPath,
 					theme,
 					sanitizedRenderContext(context as ToolRenderContextLike | undefined) as GentleAiRenderContext,
-					isGentleAiGrantCommand(callArgs) ? safeText(asString(callArgs.command)) : undefined,
 				);
 			}
 			return new Text(formatToolCall(toolName, callArgs, theme), 0, 0);
@@ -475,8 +494,10 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName): void {
 			const text = safeText(extractTextContent(safeResult));
 			const isError = renderContext?.isError ?? options.isError ?? false;
 			const directCommand = toolName === "bash" && isGentleAiDirectCommand(renderContext?.args);
+			if (directCommand) {
+				return renderGentleAiResult(safeResult, { expanded: options.expanded });
+			}
 			if (options.isPartial) {
-				if (directCommand && !isError && !options.expanded) return new Text("", 0, 0);
 				const visible = options.expanded ? text : lastOutputLines(text, PREVIEW_LINE_LIMIT);
 				const label = theme.fg("warning", partialLabel(toolName, text));
 				const output = visible ? `${label}\n${theme.fg("muted", visible)}` : label;

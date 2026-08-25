@@ -318,23 +318,28 @@ test("quiet tool rendering refuses to compact composed Gentle AI shell commands"
 	}
 });
 
-test("quiet tool rendering compacts successful routine Gentle AI calls but preserves failures", () => {
+test("quiet tool rendering hides every collapsed direct Gentle AI result and preserves expanded errors", () => {
 	const { pi, tools } = createPi();
 	withEnv({ GENTLE_PI_QUIET_TOOLS: undefined }, () => quietTools(pi as any));
 	const command = "gentle-ai review status --next-transition";
 	const textRose = "\u{1F339}\uFE0E";
 	const tool = tools.get("bash");
+	const failureText = "review status failed: authority unavailable\x1b[31m\nlineage=secret";
 
 	const call = renderToString(tool.renderCall({ command }, passthroughTheme, {}));
 	const collapsed = renderToString(tool.renderResult(textResult('{"next_transition":"stop"}'), { expanded: false, isPartial: false }, passthroughTheme, { args: { command } }));
 	const expanded = renderToString(tool.renderResult(textResult('{"next_transition":"stop"}'), { expanded: true, isPartial: false }, passthroughTheme, { args: { command } }));
-	const failure = renderToString(tool.renderResult(textResult("review status failed: authority unavailable"), { expanded: false, isPartial: false, isError: true }, passthroughTheme, { args: { command } }));
+	const failure = renderToString(tool.renderResult(textResult(failureText), { expanded: false, isPartial: false, isError: true }, passthroughTheme, { args: { command } }));
+	const expandedFailure = renderToString(tool.renderResult(textResult(failureText), { expanded: true, isPartial: false, isError: true }, passthroughTheme, { args: { command } }));
 
 	assert.equal([...textRose].length, 2);
 	assert.equal(call.trimEnd(), `${textRose} Gentle AI · running · review status`);
 	assert.equal(collapsed, "");
 	assert.match(expanded, /"next_transition":"stop"/);
-	assert.match(failure, /review status failed: authority unavailable/);
+	assert.equal(failure, "");
+	assert.match(expandedFailure, /review status failed: authority unavailable/);
+	assert.match(expandedFailure, /lineage=secret/);
+	assert.doesNotMatch(expandedFailure, /\x1b\[/);
 });
 
 test("quiet tool rendering transitions one Gentle AI header through lifecycle states", () => {
@@ -540,15 +545,25 @@ test("quiet tool rendering hides the routine partial result because the header o
 
 	assert.equal(partial, "");
 	assert.match(partialExpanded, /"status":"running"/);
-	assert.match(partialFailure, /review status failed: authority unavailable/);
+	assert.equal(partialFailure, "");
+
+	const partialExpandedFailure = renderToString(
+		tool.renderResult(
+			textResult("review status failed: authority unavailable\x1b[31m"),
+			{ expanded: true, isPartial: true },
+			passthroughTheme,
+			{ ...routineRenderContext({ args: { command } }), isError: true },
+		),
+	);
+	assert.match(partialExpandedFailure, /review status failed: authority unavailable/);
+	assert.doesNotMatch(partialExpandedFailure, /\x1b\[/);
 });
 
-test("quiet tool rendering keeps grant invocation auditing separate from the safe lifecycle path", () => {
+test("quiet tool rendering collapses grant calls to action and authorization-root cardinality", () => {
 	const { pi, tools } = createPi();
 	withEnv({ GENTLE_PI_QUIET_TOOLS: undefined }, () => quietTools(pi as any));
 	const tool = tools.get("bash");
 	const command = "gentle-ai sdd-attempt grant --authorization-root /repo/root --authorization-root /other/root --change secret-change\x1b[31m";
-	const expectedAudit = command.replace("\x1b[31m", "");
 
 	const initial = tool.renderCall(
 		{ command },
@@ -574,13 +589,52 @@ test("quiet tool rendering keeps grant invocation auditing separate from the saf
 	assert.strictEqual(initial, running);
 	assert.strictEqual(running, completed);
 	assert.strictEqual(completed, failed);
-	const lines = renderToString(failed).split("\n").map((line) => line.replace(/[ \t]+$/g, ""));
-	assert.equal(lines[0], "<error>🌹︎ Gentle AI · failed · sdd attempt grant</error>");
-	const audit = lines.slice(1).join(" ").replace(/<\/?dim>/g, "").replace(/\s+/g, " ").trim();
-	assert.equal(audit, `audit: ${expectedAudit}`);
-	assert.match(audit, /--authorization-root \/repo\/root --authorization-root \/other\/root/);
-	assert.doesNotMatch(lines[0], /authorization-root|secret-change|other\/root/);
-	assert.doesNotMatch(audit, /\x1b\[/);
+	const rendered = renderToString(failed);
+	assert.equal(rendered, "<error>🌹︎ Gentle AI · failed · sdd attempt grant · 2 roots</error>");
+	assert.doesNotMatch(rendered, /authorization-root|secret-change|repo\/root|other\/root|audit:|\x1b\[/);
+});
+
+test("quiet tool rendering counts grant authorization roots without rendering values", () => {
+	const { pi, tools } = createPi();
+	withEnv({ GENTLE_PI_QUIET_TOOLS: undefined }, () => quietTools(pi as any));
+	const tool = tools.get("bash");
+	const cases = [
+		["gentle-ai sdd-attempt grant --change change", "sdd attempt grant"],
+		["gentle-ai sdd-attempt grant --authorization-root /repo/root", "sdd attempt grant · 1 root"],
+		["gentle-ai sdd-attempt grant --authorization-root=/repo/root", "sdd attempt grant · 1 root"],
+		["gentle-ai sdd-attempt grant --authorization-root --change change", "sdd attempt grant"],
+		["gentle-ai sdd-attempt grant --authorization-root /one --authorization-root=/two --authorization-root /three", "sdd attempt grant · 3 roots"],
+		["gentle-ai sdd-attempt grant --authorization-root= --authorization-root /one", "sdd attempt grant · 1 root"],
+	] as const;
+
+	for (const [command, expected] of cases) {
+		const rendered = renderToString(tool.renderCall({ command }, passthroughTheme, { args: { command } }));
+		assert.equal(rendered.trimEnd(), `🌹︎ Gentle AI · running · ${expected}`, command);
+		assert.doesNotMatch(rendered, /authorization-root|\/repo\/root|\/one|\/two|\/three|change/);
+	}
+});
+
+test("quiet tool rendering hides invocation secrets from collapsed Gentle AI calls and results", () => {
+	const { pi, tools } = createPi();
+	withEnv({ GENTLE_PI_QUIET_TOOLS: undefined }, () => quietTools(pi as any));
+	const tool = tools.get("bash");
+	const command = "gentle-ai review finalize --prompt hidden-prompt --lineage lineage-secret --body private-body --authorization-root /private/root";
+	const call = renderToString(tool.renderCall({ command }, passthroughTheme, { args: { command } }));
+	const collapsed = renderToString(
+		tool.renderResult(
+			textResult("audit: lineage-secret body=private-body prompt=hidden-prompt root=/private/root"),
+			{ expanded: false, isPartial: false, isError: true },
+			passthroughTheme,
+			{ args: { command }, isError: true },
+		),
+	);
+
+	assert.equal(call.trimEnd(), "🌹︎ Gentle AI · running · review finalize");
+	assert.equal(collapsed, "");
+	for (const forbidden of ["hidden-prompt", "lineage-secret", "private-body", "/private/root", "audit:"]) {
+		assert.doesNotMatch(call, new RegExp(forbidden));
+		assert.doesNotMatch(collapsed, new RegExp(forbidden));
+	}
 });
 
 test("quiet tool rendering keeps shell compositions, expansions, and lookalikes generic", () => {
@@ -594,6 +648,8 @@ test("quiet tool rendering keeps shell compositions, expansions, and lookalikes 
 		"gentle-ai version $HOME",
 		"gentle-ai version $(printf nested)",
 		"gentle-ai sdd-attempt grant --change secret-change # ignored comment",
+		"gentle-ai sdd-attempt grant --authorization-root /private/root && echo done",
+		"gentle-ai sdd-attempt grant --authorization-root=/private/root | tee output",
 		"/package/.gentle-ai/v2.2.0/gentle-ai-copy version",
 		"echo gentle-ai version",
 	];
