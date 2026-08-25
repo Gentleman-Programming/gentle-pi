@@ -601,7 +601,7 @@ async function installWindowsGentleAiFromGoSumdb(options, packageRoot, architect
 			await assertGoToolchain(execute, goPath, environment, stagingDirectory);
 			try { await runCommand(execute, goPath, ["install", GENTLE_AI_WINDOWS_SOURCE_PACKAGE], commandOptions(environment, stagingDirectory, GO_SOURCE_BUILD_TIMEOUT_MS)); }
 			catch (error) {
-				if (isCommandTimeoutError(error)) throw new GentleAiInstallerError(GENTLE_AI_GO_INSTALL_TIMEOUT_CODE, `Gentle AI source build for ${GENTLE_AI_WINDOWS_SOURCE_PACKAGE} exceeded the ${GO_SOURCE_BUILD_TIMEOUT_MS / 1000}s build bound. This is a build-duration limit, not a checksum or SumDB verification failure; re-run the installation, ideally with fewer concurrent workloads.`, error);
+				if (isCommandTimeoutError(error)) throw new GentleAiInstallerError(GENTLE_AI_GO_INSTALL_TIMEOUT_CODE, `Gentle AI source installation for ${GENTLE_AI_WINDOWS_SOURCE_PACKAGE} did not finish within its ${GO_SOURCE_BUILD_TIMEOUT_MS / 1000}s time limit and was stopped; re-run the installation to retry (slow disks, cold module caches, or concurrent workloads can extend the build).`, error);
 				throw new GentleAiInstallerError(GENTLE_AI_GO_INSTALL_FAILED_CODE, `Gentle AI Go SumDB source installation failed for ${GENTLE_AI_WINDOWS_SOURCE_PACKAGE}.`, error);
 			}
 			const builtBinary = join(environment.GOBIN, "gentle-ai.exe"), binaryPath = join(stagingDirectory, "gentle-ai.exe");
