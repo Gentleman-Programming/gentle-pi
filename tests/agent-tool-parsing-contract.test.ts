@@ -1,0 +1,145 @@
+import assert from "node:assert/strict";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import test from "node:test";
+
+const PACKAGE_ROOT = join(process.cwd());
+const ASSETS_AGENTS_DIR = join(PACKAGE_ROOT, "assets", "agents");
+
+// The helpers below mirror the pi-subagents agent-frontmatter parsing contract
+// that turned gentle-pi's YAML tool blocks into real child allowlists.
+//
+// Upstream contract (pin deliberately if it changes):
+// - pi-subagents >= 0.35.0 (2026-07-17), nicobailon/pi-subagents#507:
+//   `parseFrontmatterList` accepts simple-scalar newline block lists for
+//   `tools` (and reads/skills/...) while preserving comma-separated syntax.
+// - pi-subagents <= 0.34.0 split `tools` on commas only, so a YAML block
+//   collapsed into one garbage token and packaged agents started with no
+//   filesystem tools — the failure reported in gentle-pi#62.
+// - `splitToolList` partitions `mcp:`-prefixed entries into MCP direct tools.
+//
+// gentle-pi deliberately does not depend on pi-subagents at build time, so the
+// contract is vendored here. If upstream changes its parsing semantics, update
+// this mirror as a conscious contract decision, not as drift.
+
+function parseFrontmatterList(raw: string | undefined): string[] | undefined {
+	if (raw === undefined) return undefined;
+	return raw
+		.split("\n")
+		.flatMap((line) => {
+			const value = line.trim();
+			const listItem = value.match(/^-\s+(.+)$/);
+			return (listItem?.[1] ?? value).split(",");
+		})
+		.map((value) => value.trim())
+		.filter(Boolean);
+}
+
+function splitToolList(rawTools: string[] | undefined): { tools: string[]; mcpDirectTools: string[] } {
+	const mcpDirectTools: string[] = [];
+	const tools: string[] = [];
+	for (const tool of rawTools ?? []) {
+		if (tool.startsWith("mcp:")) {
+			mcpDirectTools.push(tool.slice(4));
+		} else {
+			tools.push(tool);
+		}
+	}
+	return { tools, mcpDirectTools };
+}
+
+const DENY_ALL_MARKER = '"*": false';
+
+interface ParsedAgentTools {
+	builtinTools: string[];
+	mcpDirectTools: string[];
+	declaresDenyAll: boolean;
+}
+
+function parsePackagedAgentTools(file: string): ParsedAgentTools {
+	const source = readFileSync(file, "utf8");
+	const frontmatter = source.match(/^---\n([\s\S]*?)\n---/)?.[1];
+	assert.ok(frontmatter, `${file} must have YAML frontmatter`);
+	const lines = frontmatter.split("\n");
+	const toolsIndex = lines.findIndex((line) => line === "tools:");
+	assert.notEqual(toolsIndex, -1, `${file} must declare tools`);
+
+	const blockLines: string[] = [];
+	for (const line of lines.slice(toolsIndex + 1)) {
+		if (!line.startsWith("  - ") && line.trim() !== "") break;
+		if (line.trim() !== "") blockLines.push(line);
+	}
+	assert.ok(blockLines.length > 0, `${file} must declare a YAML tools block`);
+
+	const parsed = parseFrontmatterList(blockLines.join("\n"));
+	assert.ok(parsed !== undefined, `${file} tools block must parse`);
+	const { tools, mcpDirectTools } = splitToolList(parsed);
+	return {
+		builtinTools: tools,
+		mcpDirectTools,
+		declaresDenyAll: tools.includes(DENY_ALL_MARKER),
+	};
+}
+
+test("issue #62 regression: packaged YAML tool blocks parse to real allowlists under the pi-subagents parsing contract (>= 0.35.0)", () => {
+	const agentFiles = readdirSync(ASSETS_AGENTS_DIR).flatMap((entry) =>
+		entry.endsWith(".md") ? [join(ASSETS_AGENTS_DIR, entry)] : [],
+	);
+	assert.ok(agentFiles.length > 0, "gentle-pi must ship packaged agents");
+
+	for (const file of agentFiles) {
+		const { builtinTools, declaresDenyAll } = parsePackagedAgentTools(file);
+		const label = file.split("/").pop() ?? file;
+
+		// The #62 failure signature: a comma-only parser collapses the whole
+		// block into one token carrying embedded newlines or list markers.
+		for (const tool of builtinTools) {
+			assert.ok(
+				!tool.includes("\n") && !tool.startsWith("- "),
+				`${label}: tool token ${JSON.stringify(tool)} collapsed YAML lines — the parsing contract regressed (gentle-pi#62)`,
+			);
+		}
+
+		assert.ok(builtinTools.length > 0, `${label} must parse to a non-empty allowlist`);
+		assert.ok(
+			builtinTools.includes("read"),
+			`${label} must retain the read tool after parsing`,
+		);
+
+		if (declaresDenyAll) {
+			// The `"*": false` deny-all prefix must survive as its own inert
+			// token and never swallow the tools declared after it.
+			const toolsAfterMarker = builtinTools.filter((tool) => tool !== DENY_ALL_MARKER);
+			assert.ok(
+				toolsAfterMarker.length > 0,
+				`${label}: the "*": false marker swallowed every following tool`,
+			);
+			assert.ok(
+				toolsAfterMarker.includes("read"),
+				`${label}: read must survive after the "*": false marker`,
+			);
+		}
+	}
+});
+
+test("the vendored parsing contract handles YAML blocks, comma scalars, and mcp partitioning identically", () => {
+	const yamlBlock = ["  - read", "  - grep", "  - find", "  - mcp:engram"].join("\n");
+	const commaScalar = "read, grep, find, mcp:engram";
+
+	const fromBlock = splitToolList(parseFrontmatterList(yamlBlock));
+	const fromScalar = splitToolList(parseFrontmatterList(commaScalar));
+
+	assert.deepEqual(fromBlock.tools, ["read", "grep", "find"]);
+	assert.deepEqual(fromBlock.mcpDirectTools, ["engram"]);
+	assert.deepEqual(fromBlock, fromScalar, "block and scalar forms must parse identically");
+
+	// Documents why the mirror exists: the pre-0.35.0 comma-only split
+	// collapses a YAML block into exactly the garbage this suite rejects.
+	const commaOnlyLegacy = (yamlBlock ?? "").split(",");
+	for (const token of commaOnlyLegacy) {
+		if (token.includes("\n")) {
+			assert.match(token, /\n/, "legacy comma-only parsing collapses YAML lines into one token");
+			break;
+		}
+	}
+});
