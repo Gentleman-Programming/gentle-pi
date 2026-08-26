@@ -156,7 +156,7 @@ function isGitCommand(args: Record<string, unknown> | undefined): boolean {
 
 export type GentleAiRoutineCommand = "sdd-status" | "sdd-continue" | "sdd-attempt" | "review";
 
-const GENTLE_AI_EXECUTABLE = String.raw`(?:gentle-ai(?:\.exe)?|(?:\.{1,2}[\\/]|(?:[A-Za-z]:)?(?:[\\/][^\\/\s]+)*[\\/])\.gentle-ai[\\/]v\d+\.\d+\.\d+[\\/]gentle-ai(?:\.exe)?)`;
+const GENTLE_AI_EXECUTABLE = String.raw`(?:gentle-ai(?:\.exe)?|(?:\.{1,2}[\\/]|(?:[A-Za-z]:)?(?:[\\/][^\\/\r\n]+)*[\\/])\.gentle-ai[\\/]v\d+\.\d+\.\d+[\\/]gentle-ai(?:\.exe)?)`;
 const GENTLE_AI_COMMAND_ARGUMENTS = new RegExp(`^${GENTLE_AI_EXECUTABLE}$`);
 
 function createGentleAiCommandArguments(activeDevBinaryPath?: string): RegExp {
@@ -206,6 +206,8 @@ function shellTokens(command: string): string[] | undefined {
 			tokenStarted = true;
 			continue;
 		}
+		if ("*?~{}".includes(character)) return undefined;
+		if (character === "[" && command.indexOf("]", index + 1) >= 0) return undefined;
 		if (";&|<>`()".includes(character) || character === "$" || character === "`") return undefined;
 		if (character === "#" && !tokenStarted) return undefined;
 		token += character;
@@ -265,15 +267,15 @@ function gentleAiCommandTokens(args: Record<string, unknown> | undefined, comman
 	if (!tokens) return undefined;
 	let index = 0;
 	while (isAssignment(tokens[index] ?? "")) index += 1;
-	if (tokens[index] === "env") {
-		index += 1;
-		while (isAssignment(tokens[index] ?? "")) index += 1;
-		if ((tokens[index] ?? "").startsWith("-")) return undefined;
-	}
 	if (tokens[index] === "command") {
 		index += 1;
 		if (tokens[index] === "--") index += 1;
 		else if ((tokens[index] ?? "").startsWith("-")) return undefined;
+	}
+	if (tokens[index] === "env") {
+		index += 1;
+		while (isAssignment(tokens[index] ?? "")) index += 1;
+		if ((tokens[index] ?? "").startsWith("-")) return undefined;
 	}
 	if (!commandArguments.test(tokens[index] ?? "")) return undefined;
 	return tokens.slice(index + 1);
@@ -507,18 +509,39 @@ function formatToolCall(toolName: QuietToolName, args: Record<string, unknown>, 
 	}
 }
 
-class BoundedRows implements Component {
-	private readonly sections: readonly { text: string; rows: number }[];
+interface BoundedRowSection {
+	text: string;
+	rows: number;
+	tail?: boolean;
+}
 
-	constructor(sections: readonly { text: string; rows: number }[]) {
+class BoundedRows implements Component {
+	private readonly sections: readonly BoundedRowSection[];
+
+	constructor(sections: readonly BoundedRowSection[]) {
 		this.sections = sections;
 	}
 
 	render(width: number): string[] {
-		return this.sections.flatMap(({ text, rows }) => new Text(text, 0, 0).render(width).slice(0, rows));
+		return this.sections.flatMap(({ text, rows, tail = false }) => {
+			if (rows <= 0) return [];
+			const rendered = new Text(text, 0, 0).render(width);
+			return tail ? rendered.slice(-rows) : rendered.slice(0, rows);
+		});
 	}
 
 	invalidate(): void {}
+}
+
+function shouldRenderPreviewTail(
+	toolName: QuietToolName,
+	text: string,
+	isError: boolean,
+	args: Record<string, unknown> | undefined,
+): boolean {
+	if (isError) return true;
+	if (toolName !== "bash") return false;
+	return isGitCommand(args) || semanticJsonPreview(text) === undefined;
 }
 
 function partialLabel(toolName: QuietToolName, text: string): string {
@@ -590,7 +613,7 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArg
 				const visible = lastOutputLines(text, PREVIEW_LINE_LIMIT);
 				return new BoundedRows([
 					{ text: theme.fg("warning", partialLabel(toolName, text)), rows: 1 },
-					...(visible ? [{ text: theme.fg("muted", visible), rows: PREVIEW_LINE_LIMIT }] : []),
+					...(visible ? [{ text: theme.fg("muted", visible), rows: PREVIEW_LINE_LIMIT, tail: true }] : []),
 				]);
 			}
 			if (options.expanded && toolName === "read" && hasImageContent(safeResult) && officialRenderResult) {
@@ -612,8 +635,9 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArg
 			const color = options.expanded ? "toolOutput" : isError ? "error" : "muted";
 			if (options.expanded) return new Text(output ? theme.fg(color, output) : "", 0, 0);
 			if (output) {
+				const tail = shouldRenderPreviewTail(toolName, text, isError, renderContext?.args);
 				return new BoundedRows([
-					{ text: theme.fg(color, output.replace(/^\n/, "")), rows: PREVIEW_LINE_LIMIT },
+					{ text: theme.fg(color, output.replace(/^\n/, "")), rows: PREVIEW_LINE_LIMIT, tail },
 					...(hint ? [{ text: theme.fg(color, hint.slice(1)), rows: 1 }] : []),
 				]);
 			}

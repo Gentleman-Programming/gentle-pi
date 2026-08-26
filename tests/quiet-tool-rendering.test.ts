@@ -962,3 +962,136 @@ test("quiet tool rendering preserves complete expanded text and delegates saniti
 	assert.ok(image.includes(imageFallback("image/png")));
 	assert.doesNotMatch(image, /\x1b/);
 });
+
+test("quiet tool rendering preserves directional visual preview rows at narrow widths", () => {
+	const tools = registeredQuietTools();
+	const bash = tools.get("bash");
+	const readTool = tools.get("read");
+	const narrowWidth = 12;
+	const renderCollapsed = (
+		text: string,
+		options: { expanded: false; isPartial: boolean; isError?: boolean },
+		context: Record<string, unknown>,
+	) => renderLines(bash.renderResult(textResult(text), options, passthroughTheme, context), narrowWidth);
+	const renderRead = (text: string) => renderLines(
+		readTool.renderResult(textResult(text), { expanded: false, isPartial: false }, passthroughTheme, {}),
+		narrowWidth,
+	);
+	const oldText = "older wrapped text ".repeat(16);
+
+	const partial = renderCollapsed(`${oldText}\nPARTIAL-NEW`, { expanded: false, isPartial: true }, { args: { command: "printf output" } });
+	const growingPartial = renderCollapsed(`${oldText}GROW-SUFFIX`, { expanded: false, isPartial: true }, { args: { command: "printf output" } });
+	const completedBash = renderCollapsed(`${oldText}\nBASH-NEW`, { expanded: false, isPartial: false }, { args: { command: "printf output" } });
+	const error = renderCollapsed(`${oldText}\nERROR-NEW`, { expanded: false, isPartial: false, isError: true }, { args: { command: "false" }, isError: true });
+	const git = renderCollapsed(`${oldText}\nGIT-NEW`, { expanded: false, isPartial: false }, { args: { command: "git diff" } });
+
+	for (const [lines, marker] of [
+		[partial, "PARTIAL-NEW"],
+		[growingPartial, "GROW-SUFFIX"],
+		[completedBash, "BASH-NEW"],
+		[error, "ERROR-NEW"],
+		[git, "GIT-NEW"],
+	] as const) {
+		assert.ok(lines.length <= 4, `expected fixed preview budget, got ${lines.length}`);
+		assert.match(lines.join("\n"), new RegExp(marker));
+	}
+	assert.match(partial[0] ?? "", /… bash/);
+	assert.match(completedBash.join("\n"), /to expand/);
+
+	const read = renderRead(`READ-FIRST\n${oldText}\nREAD-NEW`);
+	const semanticJson = renderCollapsed(
+		JSON.stringify({ first: "x".repeat(80), newest: "JSON-NEW" }, null, 2),
+		{ expanded: false, isPartial: false },
+		{ args: { command: "printf output" } },
+	);
+	assert.match(read.join("\n"), /READ-FIRST/);
+	assert.doesNotMatch(read.join("\n"), /READ-NEW/);
+	assert.match(semanticJson.join("\n"), /first/);
+	assert.doesNotMatch(semanticJson.join("\n"), /JSON-NEW/);
+	assert.match(
+		renderToolResult(bash, textResult(`${oldText}\nBASH-NEW`), { expanded: true, isPartial: false }, { args: { command: "printf output" } }),
+		/BASH-NEW/,
+	);
+});
+
+test("quiet tool rendering fails closed on unquoted shell expansions", () => {
+	const bash = registeredQuietTools().get("bash");
+	for (const command of [
+		"gentle-ai review status *",
+		"gentle-ai review status ?",
+		"gentle-ai review status [a-z]",
+		"gentle-ai review status ~",
+		"gentle-ai review status {one,two}",
+	]) {
+		assert.equal(gentleAiRoutineCommand({ command }), undefined, command);
+		assertGenericBash(bash, command);
+	}
+
+	for (const command of [
+		"gentle-ai review status '*'",
+		"gentle-ai review status \"?\"",
+		"gentle-ai review status '[a-z]'",
+		"gentle-ai review status \"~\"",
+		"gentle-ai review status '{one,two}'",
+		"gentle-ai review status \\*",
+		"gentle-ai review status \\?",
+		"gentle-ai review status \\[a-z\\]",
+		"gentle-ai review status \\~",
+		"gentle-ai review status \\{one,two\\}",
+	]) {
+		const call = renderToString(bash.renderCall({ command }, passthroughTheme, { args: { command } }));
+		const collapsed = renderToolResult(bash, textResult("dummy-secret"), { expanded: false, isPartial: false }, { args: { command } });
+		assert.equal(gentleAiRoutineCommand({ command }), "review", command);
+		assert.match(call, /🌹︎ Gentle AI · running · review status/, command);
+		assert.doesNotMatch(collapsed, /dummy-secret/, command);
+	}
+});
+
+test("quiet tool rendering redacts only exact package-local executable paths with spaces", () => {
+	const bash = registeredQuietTools().get("bash");
+	const validCommands = [
+		"'/opt/Gentle Package/.gentle-ai/v2.2.0/gentle-ai' review status --token single-secret",
+		'"/opt/Gentle Package/.gentle-ai/v2.2.0/gentle-ai" review status --token double-secret',
+		"/opt/Gentle\\ Package/.gentle-ai/v2.2.0/gentle-ai review status --token escaped-secret",
+	] as const;
+	for (const command of validCommands) {
+		const call = renderToString(bash.renderCall({ command }, passthroughTheme, { args: { command } }));
+		const collapsed = renderToolResult(bash, textResult("dummy-secret"), { expanded: false, isPartial: false }, { args: { command } });
+		assert.equal(gentleAiRoutineCommand({ command }), "review", command);
+		assert.match(call, /🌹︎ Gentle AI · running · review status/, command);
+		assert.doesNotMatch(call, /Gentle Package|secret/, command);
+		assert.doesNotMatch(collapsed, /dummy-secret/, command);
+	}
+
+	for (const command of [
+		"'/opt/Gentle Package/.gentle-ai/v2.2.0/gentle-ai-copy' review status --token copy-secret",
+		'"/opt/Gentle Package/.gentle-ai/v2.2.0/gentle-ai.exe.bak" review status --token backup-secret',
+		"/opt/Gentle\\ Package/.gentle-ai/v2.2.0/not-gentle-ai review status --token sibling-secret",
+	]) {
+		const call = renderToString(bash.renderCall({ command }, passthroughTheme, { args: { command } }));
+		const collapsed = renderToolResult(bash, textResult("dummy-secret"), { expanded: false, isPartial: false }, { args: { command } });
+		assert.equal(gentleAiRoutineCommand({ command }), undefined, command);
+		assert.equal(call.trimEnd(), `$ ${command}`, command);
+		assert.match(collapsed, /dummy-secret/, command);
+	}
+});
+
+test("quiet tool rendering respects command and env wrapper order", () => {
+	const bash = registeredQuietTools().get("bash");
+	for (const command of [
+		"FOO=bar command -- env BAR=baz gentle-ai review status",
+		"command -- env FOO=bar gentle-ai review status",
+		"env FOO=bar gentle-ai review status",
+		"command -- gentle-ai review status",
+	]) {
+		const call = renderToString(bash.renderCall({ command }, passthroughTheme, { args: { command } }));
+		const collapsed = renderToolResult(bash, textResult("dummy-secret"), { expanded: false, isPartial: false }, { args: { command } });
+		assert.equal(gentleAiRoutineCommand({ command }), "review", command);
+		assert.match(call, /🌹︎ Gentle AI · running · review status/, command);
+		assert.doesNotMatch(collapsed, /dummy-secret/, command);
+	}
+
+	const command = "env FOO=bar command -- gentle-ai review status";
+	assert.equal(gentleAiRoutineCommand({ command }), undefined);
+	assertGenericBash(bash, command);
+});
