@@ -61,6 +61,16 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | **Verified native runtime**    | Provisions the exact package-local Gentle AI v2.4.0 runtime: signed archives on Darwin/Linux and a Go SumDB-verified source build on Windows x64/arm64. It validates package-local integrity and rejects PATH, global, sibling, symlink, and mode fallbacks. |
 | **Runtime safety**             | Blocks destructive shell commands, asks for confirmation for sensitive operations, and blocks direct read/write/edit access to sensitive paths. |
 
+### Gentle-owned agent activity projection
+
+`gentle-pi` ships the internal `gentle-pi.agent-activity/v1` contract and event seam from [#432](https://github.com/Gentleman-Programming/gentle-pi/issues/432).
+
+- **Ownership:** [#419](https://github.com/Gentleman-Programming/gentle-pi/issues/419) remains the sole task-manager producer; this seam retains only the latest bounded snapshot.
+- **Boundary:** consumers use Pi's documented request/changed event bus; they receive snapshots only and cannot create, control, or cancel tasks.
+- **Unavailable behavior:** consumers remain unavailable before registration, during `starting`/`replacing`, after `shutdown`, or after malformed input; stale snapshots are cleared.
+- **Safety:** this is observational and never authorizes [#347](https://github.com/Gentleman-Programming/gentle-pi/issues/347) worktree/session switching. [#430](https://github.com/Gentleman-Programming/gentle-pi/issues/430) is the later presentation-only consumer.
+- **Provenance and order:** the seam is independently authored from #419 requirements and Pi's public extension/event API, with no third-party runtime source; delivery is contract first, manager integration second, and UI consumer last.
+
 ## Install
 
 ```bash
