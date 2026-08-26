@@ -158,10 +158,12 @@ test("registered Gentle Review tools preserve result envelopes and redact collap
 			{ expanded: false, isPartial: false, isError: true },
 		]) {
 			const collapsed = renderComponent(tool.renderResult({ content: [{ type: "text", text: resultText }] }, options, lifecycleTheme, {}));
-			assert.equal(collapsed, `\n${expandHint}`, `${name} collapsed output must contain one expand hint`);
+			assert.equal(collapsed, expandHint, `${name} collapsed output must contain one expand hint`);
+			assert.equal(collapsed.split("\n")[0], expandHint, `${name} collapsed output must start with the hint`);
 			assert.doesNotMatch(collapsed, /safe result|lineage=secret|private/);
 		}
 		const expanded = renderComponent(tool.renderResult({ content: [{ type: "text", text: resultText }] }, { expanded: true, isPartial: false, isError: true }, lifecycleTheme, {}));
+		assert.equal(expanded.split("\n")[0], "safe result");
 		assert.match(expanded, /safe result/);
 		assert.match(expanded, /lineage=secret body=private/);
 		assert.doesNotMatch(expanded, /to expand/);

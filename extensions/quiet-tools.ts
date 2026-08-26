@@ -14,7 +14,7 @@ import { homedir } from "node:os";
 import { isAbsolute } from "node:path";
 import { resolveGentleAiDevBinaryOverride, type GentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
 import { quietToolsEnabled } from "../lib/quiet-tools-config.ts";
-import { renderGentleAiLifecycleCall, renderGentleAiResult, type GentleAiRenderContext } from "../lib/gentle-ai-renderer.ts";
+import { getGentleAiRenderState, renderGentleAiLifecycleCall, renderGentleAiResult, type GentleAiRenderContext } from "../lib/gentle-ai-renderer.ts";
 import { sanitizeTerminalText } from "../lib/terminal-theme.ts";
 
 type QuietToolName = "read" | "bash" | "grep" | "find" | "ls" | "edit" | "write";
@@ -182,7 +182,11 @@ function createGentleAiCommandArguments(activeDevBinaryPath?: string): RegExp {
 	return new RegExp(`^(?:${GENTLE_AI_EXECUTABLE}|${escapedPath})$`);
 }
 
-function shellTokens(command: string): string[] | undefined {
+type ShellTokenization =
+	| { kind: "complete" | "incomplete"; tokens: string[] }
+	| { kind: "generic" };
+
+function shellTokens(command: string): ShellTokenization {
 	const tokens: string[] = [];
 	let token = "";
 	let quote: "single" | "double" | undefined;
@@ -194,7 +198,7 @@ function shellTokens(command: string): string[] | undefined {
 	};
 	for (let index = 0; index < command.length; index += 1) {
 		const character = command[index]!;
-		if (character === "\r" || character === "\n") return undefined;
+		if (character === "\r" || character === "\n") return { kind: "generic" };
 		if (quote === "single") {
 			if (character === "'") quote = undefined;
 			else token += character;
@@ -204,11 +208,11 @@ function shellTokens(command: string): string[] | undefined {
 			if (character === '"') { quote = undefined; continue; }
 			if (character === "\\") {
 				const next = command[++index];
-				if (next === undefined || next === "\r" || next === "\n") return undefined;
+				if (next === undefined || next === "\r" || next === "\n") return { kind: "incomplete", tokens };
 				token += "$`\"\\".includes(next) ? next : `\\${next}`;
 				continue;
 			}
-			if (character === "$" || character === "`") return undefined;
+			if (character === "$" || character === "`") return { kind: "generic" };
 			token += character;
 			continue;
 		}
@@ -217,22 +221,22 @@ function shellTokens(command: string): string[] | undefined {
 		if (character === '"') { quote = "double"; tokenStarted = true; continue; }
 		if (character === "\\") {
 			const next = command[++index];
-			if (next === undefined || next === "\r" || next === "\n") return undefined;
+			if (next === undefined || next === "\r" || next === "\n") return { kind: "incomplete", tokens };
 			const windowsPath = token === "." || /^[A-Za-z]:$/.test(token) || token.includes("\\");
 			token += windowsPath ? `\\${next}` : next;
 			tokenStarted = true;
 			continue;
 		}
-		if ("*?~{}".includes(character)) return undefined;
-		if (character === "[" && command.indexOf("]", index + 1) >= 0) return undefined;
-		if (";&|<>`()".includes(character) || character === "$" || character === "`") return undefined;
-		if (character === "#" && !tokenStarted) return undefined;
+		if ("*?~{}".includes(character)) return { kind: "generic" };
+		if (character === "[" && command.indexOf("]", index + 1) >= 0) return { kind: "generic" };
+		if (";&|<>`()".includes(character) || character === "$" || character === "`") return { kind: "generic" };
+		if (character === "#" && !tokenStarted) return { kind: "generic" };
 		token += character;
 		tokenStarted = true;
 	}
-	if (quote) return undefined;
+	if (quote) return { kind: "incomplete", tokens };
 	push();
-	return tokens;
+	return { kind: "complete", tokens };
 }
 
 function isAssignment(token: string): boolean {
@@ -278,10 +282,7 @@ const REVIEW_SCHEMA_NAMES = new Set([
 	"verification-evidence-record",
 ]);
 
-function gentleAiCommandTokens(args: Record<string, unknown> | undefined, commandArguments = GENTLE_AI_COMMAND_ARGUMENTS): string[] | undefined {
-	const rawCommand = typeof args?.command === "string" ? args.command : "";
-	const tokens = shellTokens(rawCommand);
-	if (!tokens) return undefined;
+function gentleAiCommandTokensFrom(tokens: string[], commandArguments: RegExp): string[] | undefined {
 	let index = 0;
 	while (isAssignment(tokens[index] ?? "")) index += 1;
 	if (tokens[index] === "command") {
@@ -296,6 +297,11 @@ function gentleAiCommandTokens(args: Record<string, unknown> | undefined, comman
 	}
 	if (!commandArguments.test(tokens[index] ?? "")) return undefined;
 	return tokens.slice(index + 1);
+}
+
+function gentleAiCommandTokens(args: Record<string, unknown> | undefined, commandArguments = GENTLE_AI_COMMAND_ARGUMENTS): string[] | undefined {
+	const shell = shellTokens(typeof args?.command === "string" ? args.command : "");
+	return shell.kind === "complete" ? gentleAiCommandTokensFrom(shell.tokens, commandArguments) : undefined;
 }
 
 function displayToken(token: string): string {
@@ -346,10 +352,7 @@ export function gentleAiRoutineCommand(args: Record<string, unknown> | undefined
 	return undefined;
 }
 
-export function gentleAiOperationPath(args: Record<string, unknown> | undefined, commandArguments = GENTLE_AI_COMMAND_ARGUMENTS): string | undefined {
-	const tokens = gentleAiCommandTokens(args, commandArguments);
-	if (!tokens) return undefined;
-
+function gentleAiOperationPathFrom(tokens: string[]): string {
 	if (tokens[0] === "sdd-status") return "sdd status";
 	if (tokens[0] === "sdd-continue") return "sdd continue";
 	if (tokens[0] === "sdd-attempt") {
@@ -380,6 +383,11 @@ export function gentleAiOperationPath(args: Record<string, unknown> | undefined,
 		return schema !== undefined && REVIEW_SCHEMA_NAMES.has(schema) ? `review schema ${displayToken(schema)}` : "review schema";
 	}
 	return REVIEW_DIRECT_OPERATIONS.has(operation) ? `review ${displayToken(operation)}` : "review";
+}
+
+export function gentleAiOperationPath(args: Record<string, unknown> | undefined, commandArguments = GENTLE_AI_COMMAND_ARGUMENTS): string | undefined {
+	const tokens = gentleAiCommandTokens(args, commandArguments);
+	return tokens ? gentleAiOperationPathFrom(tokens) : undefined;
 }
 
 export function isGentleAiGrantCommand(args: Record<string, unknown> | undefined, commandArguments = GENTLE_AI_COMMAND_ARGUMENTS): boolean {
@@ -452,8 +460,6 @@ export function formatToolResultOutput(
 		const count = toolName === "grep" ? grepMatchCount(text, args) : countNonEmptyLines(text);
 		return count > 0 ? ` → ${count} ${summaryLabel}` : "";
 	}
-	if (toolName === "bash" && isGentleAiDirectCommand(args)) return "";
-
 	if (toolName === "bash" && isGitCommand(args)) {
 		const tail = tailLines(text, COLLAPSED_TAIL_LINE_LIMIT);
 		return tail ? `\n${tail}` : "";
@@ -481,10 +487,12 @@ function lineRangeSuffix(args: Record<string, unknown>, theme: ThemeLike): strin
 
 interface ToolRenderContextLike {
 	args?: Record<string, unknown>;
+	argsComplete?: boolean;
 	executionStarted?: boolean;
 	isPartial?: boolean;
 	isError?: boolean;
 	lastComponent?: unknown;
+	state?: unknown;
 	cwd?: string;
 	[key: string]: unknown;
 }
@@ -562,7 +570,7 @@ function shouldRenderPreviewTail(
 }
 
 function partialLabel(toolName: QuietToolName, text: string): string {
-	const lineCount = outputLines(text).length;
+	const lineCount = countNonEmptyLines(text);
 	return lineCount === 0
 		? `… ${toolName}`
 		: `… ${toolName} · ${lineCount} ${lineCount === 1 ? "line" : "lines"}`;
@@ -594,6 +602,26 @@ function resolveQuietToolsDevBinaryPath(resolveOverride: GentleAiDevBinaryOverri
 	catch { return undefined; }
 }
 
+function gentleAiRenderTransition(
+	args: Record<string, unknown> | undefined, context: ToolRenderContextLike | undefined,
+	commandArguments: RegExp, options: { result?: boolean; isPartial?: boolean } = {},
+): { operationPath?: string; directResult: boolean } {
+	const state = getGentleAiRenderState(context?.state);
+	const tokenization = shellTokens(typeof args?.command === "string" ? args.command : "");
+	const directTokens = tokenization.kind === "generic" ? undefined : gentleAiCommandTokensFrom(tokenization.tokens, commandArguments);
+	const operationPath = directTokens ? gentleAiOperationPathFrom(directTokens) : undefined;
+	const argsComplete = context?.argsComplete === true;
+	const forResult = options.result === true;
+	const isPartial = options.isPartial === true || context?.isPartial === true;
+	if (operationPath && (tokenization.kind === "complete" || !argsComplete) && state?.genericLocked !== true) {
+		return { operationPath, directResult: forResult };
+	}
+	if (state && (tokenization.kind === "generic" || argsComplete || (forResult && !isPartial))) {
+		state.genericLocked = true; state.lifecycleComponent = false;
+	}
+	return { directResult: false };
+}
+
 function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArguments: RegExp): void {
 	const registrationTool = getBuiltInTools(process.cwd())[toolName];
 	const officialRenderResult = registrationTool.renderResult;
@@ -606,13 +634,13 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArg
 		},
 		renderCall(args, theme, context) {
 			const callArgs = args as Record<string, unknown>;
-			const operationPath = toolName === "bash" ? gentleAiOperationPath(callArgs, commandArguments) : undefined;
+			const renderContext = sanitizedRenderContext(context as ToolRenderContextLike | undefined);
+			const operationPath = toolName === "bash"
+				? gentleAiRenderTransition(callArgs, renderContext, commandArguments).operationPath
+				: undefined;
 			if (operationPath) {
-				return renderGentleAiLifecycleCall(
-					operationPath,
-					theme,
-					sanitizedRenderContext(context as ToolRenderContextLike | undefined) as GentleAiRenderContext,
-				);
+				const detail = renderContext.expanded === true && typeof callArgs.command === "string" ? `$ ${callArgs.command}` : undefined;
+				return renderGentleAiLifecycleCall(operationPath, theme, renderContext as GentleAiRenderContext, detail);
 			}
 			return new Text(formatToolCall(toolName, callArgs, theme), 0, 0);
 		},
@@ -621,8 +649,13 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArg
 			const safeResult = sanitizedResult(result);
 			const text = safeText(extractTextContent(safeResult));
 			const isError = renderContext?.isError ?? options.isError ?? false;
-			const directCommand = toolName === "bash" && isGentleAiDirectCommand(renderContext?.args, commandArguments);
-			if (directCommand) {
+			const directResult = toolName === "bash" && gentleAiRenderTransition(
+				renderContext?.args,
+				renderContext,
+				commandArguments,
+				{ result: true, isPartial: options.isPartial },
+			).directResult;
+			if (directResult) {
 				return renderGentleAiResult(safeResult, { expanded: options.expanded });
 			}
 			if (options.isPartial) {
@@ -646,7 +679,7 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArg
 				isError,
 				args: renderContext?.args,
 			});
-			const hint = !options.expanded && !directCommand && hasExpandableContent(toolName, safeResult, text)
+			const hint = !options.expanded && !directResult && hasExpandableContent(toolName, safeResult, text)
 				? `\n${keyHint("app.tools.expand", "to expand")}`
 				: "";
 			const color = options.expanded ? "toolOutput" : isError ? "error" : "muted";

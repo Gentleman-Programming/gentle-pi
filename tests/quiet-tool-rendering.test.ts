@@ -37,7 +37,6 @@ function routineRenderContext(overrides: Record<string, unknown> = {}) {
 		toolCallId: "tool-call",
 		invalidate() {},
 		lastComponent: undefined,
-		state: {},
 		cwd: "/repo",
 		executionStarted: false,
 		argsComplete: true,
@@ -472,11 +471,13 @@ test("quiet tool rendering hides every collapsed direct Gentle AI result and pre
 
 	assert.equal([...textRose].length, 2);
 	assert.equal(call.trimEnd(), `${textRose} Gentle AI · running · review status`);
-	assert.equal(collapsed, `\n${expandHint}`);
+	assert.equal(collapsed, expandHint);
+	assert.equal(collapsed.split("\n")[0], expandHint);
 	assert.doesNotMatch(collapsed, /next_transition|stop/);
+	assert.equal(expanded.split("\n")[0], '{"next_transition":"stop"}');
 	assert.match(expanded, /"next_transition":"stop"/);
 	assert.doesNotMatch(expanded, /to expand/);
-	assert.equal(failure, `\n${expandHint}`);
+	assert.equal(failure, expandHint);
 	assert.doesNotMatch(failure, /review status failed|authority unavailable|lineage=secret/);
 	assert.match(expandedFailure, /review status failed: authority unavailable/);
 	assert.match(expandedFailure, /lineage=secret/);
@@ -530,6 +531,43 @@ test("quiet tool rendering transitions one Gentle AI header through lifecycle st
 	assert.equal(completedText, "<success>🌹︎ Gentle AI · completed · review status</success>");
 	assert.equal(failedText, "<error>🌹︎ Gentle AI · failed · review status</error>");
 	assert.doesNotMatch(failedText, /private-change/);
+});
+
+test("quiet Bash keeps direct Gentle AI calls seamless while streaming", () => {
+	const tool = registeredQuietTools().get("bash");
+	const rose = /🌹︎/;
+	const render = (command: string, state: Record<string, unknown>, overrides: Record<string, unknown> = {}) => {
+		const component = tool.renderCall({ command }, passthroughTheme, routineRenderContext({ args: { command }, state, argsComplete: false, ...overrides }));
+		return [component, renderToString(component)] as const;
+	};
+	const command = "gentle-ai review status --token 'lineage-secret";
+	const state = {};
+	const [preparing, collapsed] = render(command, state);
+	assert.equal(collapsed, "🌹︎ Gentle AI · preparing · review status");
+	assert.doesNotMatch(collapsed, /token|lineage-secret/);
+	const expanded = render(command, state, { expanded: true, lastComponent: preparing })[1];
+	assert.match(expanded, /^🌹︎ Gentle AI · preparing · review status\n\$ gentle-ai review status --token 'lineage-secret$/);
+
+	const direct = "gentle-ai review status";
+	const [running, runningText] = render(direct, state, { argsComplete: true, executionStarted: true, lastComponent: preparing });
+	assert.strictEqual(running, preparing); assert.equal(runningText, "🌹︎ Gentle AI · running · review status");
+	const genericState = {};
+	const [generic, genericText] = render("gentle-ai review status | cat", genericState);
+	assert.doesNotMatch(genericText, rose); assert.match(genericText, /\| cat/);
+	assert.doesNotMatch(render(direct, genericState, { argsComplete: true, lastComponent: generic })[1], rose);
+	assert.match(render(direct, {}, { argsComplete: true })[1], rose);
+
+	for (const malformed of ["gentle-ai\x1b[31m review status", 'gentle-ai review status "unfinished']) {
+		const text = render(malformed, {}, { argsComplete: true })[1];
+		assert.doesNotMatch(text, rose); assert.match(text, /\$ gentle-ai.*review status/);
+	}
+	for (const bracket of ["[", "]"]) assert.match(render(`${direct} ${bracket}`, {})[1], rose);
+
+	const genericResult = renderToolResult(tool, textResult("generic result"), { expanded: false, isPartial: false }, { args: { command: direct }, state: genericState, argsComplete: true });
+	assert.equal(genericResult.split("\n")[0], "generic result");
+	const directState = {}; render(direct, directState, { argsComplete: true });
+	const directResult = renderToolResult(tool, textResult("direct result"), { expanded: false, isPartial: false }, { args: { command: direct }, state: directState, argsComplete: true });
+	assert.equal(directResult, keyHint("app.tools.expand", "to expand"));
 });
 
 test("quiet tool rendering displays only finite safe Gentle AI operation paths", () => {
@@ -681,7 +719,7 @@ test("quiet tool rendering recognizes only the exact resolved dev binary", () =>
 	const collapsed = renderToolResult(tool, textResult(text), { expanded: false, isPartial: false, isError: true }, { args: { command }, isError: true });
 	const expanded = renderToolResult(tool, textResult(text), { expanded: true, isPartial: false, isError: true }, { args: { command }, isError: true });
 	const hint = keyHint("app.tools.expand", "to expand");
-	assert.equal(collapsed, `\n${hint}`);
+	assert.equal(collapsed, hint);
 	assert.equal(collapsed.split(hint).length - 1, 1);
 	assert.doesNotMatch(collapsed, /private|lineage|secret|hidden|error/);
 	assert.match(expanded, /private failure|lineage=secret body=hidden/);
@@ -746,12 +784,12 @@ test("quiet tool rendering hides the routine partial result because the header o
 		),
 	);
 
-	assert.equal(partial, `\n${expandHint}`);
+	assert.equal(partial, expandHint);
 	assert.equal(partial.split(expandHint).length - 1, 1);
 	assert.match(partialExpanded, /"status":"running"/);
 	assert.doesNotMatch(partialExpanded, /to expand/);
-	assert.equal(partialFailure, `\n${expandHint}`);
-	assert.equal(completed, `\n${expandHint}`);
+	assert.equal(partialFailure, expandHint);
+	assert.equal(completed, expandHint);
 
 	const partialExpandedFailure = renderToString(
 		tool.renderResult(
@@ -836,7 +874,7 @@ test("quiet tool rendering hides invocation secrets from collapsed Gentle AI cal
 	);
 
 	assert.equal(call.trimEnd(), "🌹︎ Gentle AI · running · review finalize");
-	assert.equal(collapsed, `\n${keyHint("app.tools.expand", "to expand")}`);
+	assert.equal(collapsed, keyHint("app.tools.expand", "to expand"));
 	for (const forbidden of ["hidden-prompt", "lineage-secret", "private-body", "/private/root", "audit:"]) {
 		assert.doesNotMatch(call, new RegExp(forbidden));
 		assert.doesNotMatch(collapsed, new RegExp(forbidden));
@@ -1020,6 +1058,7 @@ test("quiet tool rendering bounds and sanitizes partial text without a completio
 	assert.doesNotMatch(collapsed, /to expand|Ctrl\+O/);
 	assert.match(expanded, /first\nsecond\nthird\nfourth/);
 	assert.doesNotMatch(expanded, /to expand|Ctrl\+O/);
+	assert.match(renderToolResult(tool, textResult("first\n\nsecond\n\n"), { expanded: false, isPartial: true }, { args: { command: "printf output" } }), /… bash · 2 lines/);
 
 	const sanitized = renderToolResult(tool, textResult("safe\x1b]52;c;Y2xpcGJvYXJk\x07\x1b[2Jdone"), { expanded: true, isPartial: true }, { args: { command: "echo safe" } });
 	assert.match(sanitized, /safedone/);
