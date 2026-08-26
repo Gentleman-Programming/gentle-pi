@@ -290,6 +290,123 @@ test("quiet tool rendering keeps compact collapsed summaries for search and list
 	assert.equal(formatToolResultOutput("read", textResult("ENOENT: missing file") as any, { expanded: false, isError: true }), "\nENOENT: missing file");
 });
 
+test("quiet search and placeholder summaries preserve exact-result behavior", async (t) => {
+	const grepRows = [["one", 12, "first"], ["two", 20, "second"], ["three", 28, "third"], ["four", 36, "fourth"], ["five", 44, "fifth"]] as const;
+	const contextText = grepRows.flatMap(([file, line, ordinal]) => [
+		`src/${file}.ts:${line}: ${ordinal} match`,
+		`src/${file}.ts-${line - 1}- context before`,
+		`src/${file}.ts-${line + 1}- context after`,
+	]).join("\n");
+	assert.deepEqual([grepRows.length, contextText.split("\n").length, contextText.split("\n").filter((line) => /:\d+:/.test(line)).length, contextText.split("\n").filter((line) => /-\d+-/.test(line)).length], [5, 15, 5, 10]);
+
+	const lsCollisionText = "(empty directory)\nreal-entry.txt";
+	const bashCollisionText = "(no output)\nreal output";
+	const tools = registeredQuietTools();
+	const hint = keyHint("app.tools.expand", "to expand");
+	const cases = [
+		["grep", "context rows count only match rows", "grep", contextText, { context: 1 }, " → 5 matches", undefined, /5 matches/, /15 matches/, 1],
+		["grep", "no-context output counts every non-empty row", "grep", "src/a.ts:1:match\nsrc/b.ts:2:match", {}, " → 2 matches", undefined, /2 matches/, undefined, 1],
+		["exact", "current empty-directory marker", "ls", "(empty directory)", {}, "", undefined, /^$/, /entries|to expand/, 0],
+		["exact", "legacy empty-directory marker", "ls", "Directory is empty", {}, "", undefined, /^$/, /entries|to expand/, 0],
+		["exact", "no-output marker", "bash", "(no output)", { command: "true" }, "\n(no output)", undefined, /^\(no output\)$/, /to expand/, 0],
+		["collision", "empty-directory marker with a real entry", "ls", lsCollisionText, {}, " → 2 entries", `\n${lsCollisionText}`, /2 entries/, /empty directory|real-entry\.txt/, 1],
+		["collision", "no-output marker with real output", "bash", bashCollisionText, { command: "printf output" }, `\n${bashCollisionText}`, `\n${bashCollisionText}`, /\(no output\)\nreal output/, undefined, 1],
+	] as const;
+	assert.equal(cases.length, 7);
+
+	const assertSummaryCase = (current: (typeof cases)[number]) => {
+		const [, name, toolName, text, args, collapsed, expanded, rendered, forbidden, hintCount] = current;
+		const result = textResult(text) as any;
+		const tool = tools.get(toolName);
+		assert.ok(tool, `${name}: missing ${toolName} renderer`);
+		assert.equal(formatToolResultOutput(toolName, result, { expanded: false, args }), collapsed, name);
+		if (expanded !== undefined) assert.equal(formatToolResultOutput(toolName, result, { expanded: true, args }), expanded, `${name} expanded output`);
+		const output = renderToolResult(tool, result, { expanded: false, isPartial: false }, { args });
+		assert.match(output, rendered, name);
+		if (forbidden) assert.doesNotMatch(output, forbidden, name);
+		assert.equal(output.split(hint).length - 1, hintCount, `${name}: hint count`);
+	};
+
+	for (const [section, count] of [["grep", 2], ["exact", 3], ["collision", 2]] as const) await t.test(section, () => {
+		const selected = cases.filter(([currentSection]) => currentSection === section);
+		assert.equal(selected.length, count, `${section}: case count`);
+		for (const current of selected) assertSummaryCase(current);
+	});
+});
+
+test("quiet Bash errors preserve meaningful rows for both public output orderings", () => {
+	const tool = registeredQuietTools().get("bash");
+	const hint = keyHint("app.tools.expand", "to expand");
+	const stripAnsi = (text: string) => text.replace(/\x1b\[[0-9;]*m/g, "");
+	const cases = [
+		["Pi session event", [
+			["    B3 stdout before failure", []],
+			["    B3 stderr detail that should require expansion", ["    ", "    "]],
+			["    Command exited with code 7", []],
+		]],
+		["registered execution probe", [
+			["probe stdout before failure", ["", ""]],
+			["probe stderr detail \x1b[31mwith terminal color\x1b[0m", ["", ""]],
+			["probe exit status: 7", []],
+		]],
+	] as const;
+	assert.equal(cases.length, 2);
+	const args = { command: "false" };
+	const renderResult = (result: any, expanded: boolean) => tool.renderResult(result, { expanded, isPartial: false, isError: true }, passthroughTheme, { args, isError: true });
+
+	for (const [name, rows] of cases) {
+		assert.equal(rows.length, 3, `${name}: three meaningful source rows`);
+		const text = rows.flatMap(([row, gaps]) => [row, ...gaps]).join("\n");
+		const previewRows = rows.map(([row]) => stripAnsi(row));
+		assert.ok(previewRows.every((row) => row.trim().length > 0), `${name}: preview rows are meaningful`);
+		const expandedText = stripAnsi(text);
+		const renderedExpandedText = expandedText.split("\n").map((line) => line.trimEnd()).join("\n");
+		const result = textResult(text) as any;
+		assert.equal(formatToolResultOutput("bash", result, { expanded: false, isError: true, args }), `\n${previewRows.join("\n")}`, name);
+		assert.equal(formatToolResultOutput("bash", result, { expanded: true, isError: true, args }), `\n${expandedText}`, `${name} expanded output`);
+
+		const collapsedLines = renderLines(renderResult(result, false), 120);
+		assert.ok(collapsedLines.length <= 4, `${name}: expected at most 4 visual rows, got ${collapsedLines.length}`);
+		assert.deepEqual(collapsedLines.slice(0, 3), previewRows, `${name}: preview rows`);
+		assert.equal(collapsedLines.filter((line) => line.trim().length === 0).length, 0, `${name}: no blank preview rows`);
+		assert.equal(collapsedLines.filter((line) => line.includes(hint)).length, 1, `${name}: one expansion hint`);
+		const expanded = renderToString(renderResult(result, true), 1000);
+		assert.equal(expanded, `\n${renderedExpandedText}`, `${name}: complete expanded sanitized text`);
+		assert.doesNotMatch(expanded, /\x1b\[/, `${name}: expanded output is ANSI-free`);
+	}
+});
+
+test("quiet Bash normalizes compact JSON for bounded previews while keeping expanded text complete", () => {
+	const compactJson = JSON.stringify({
+		schema: "review",
+		contract: "compact",
+		nested: { longTail: "this must stay out of the collapsed preview", deeper: { value: true } },
+	});
+	const result = textResult(compactJson) as any;
+	const commandArgs = { command: "printf json" };
+	const previewRows = [
+		'  "schema": "review",',
+		'  "contract": "compact",',
+		'  "nested": {',
+	];
+	const expectedPreview = `\n${previewRows.join("\n")}`;
+	const tool = registeredQuietTools().get("bash");
+
+	assert.equal(formatToolResultOutput("bash", result, { expanded: false, args: commandArgs }), expectedPreview);
+	assert.equal(formatToolResultOutput("bash", result, { expanded: true, args: commandArgs }), `\n${compactJson}`);
+
+	const collapsedLines = renderLines(tool.renderResult(result, { expanded: false, isPartial: false }, passthroughTheme, { args: commandArgs }), 120);
+	const collapsed = collapsedLines.join("\n");
+	assert.equal(previewRows.length, 3);
+	assert.ok(collapsedLines.length <= 4, `expected at most 4 visual rows, got ${collapsedLines.length}`);
+	assert.deepEqual(collapsedLines.slice(0, 3), previewRows);
+	assert.equal(collapsedLines.filter((line) => line.includes(keyHint("app.tools.expand", "to expand"))).length, 1);
+	assert.doesNotMatch(collapsed, /longTail|this must stay out of the collapsed preview|deeper/);
+
+	const expanded = renderToString(tool.renderResult(result, { expanded: true, isPartial: false }, passthroughTheme, { args: commandArgs }), 1000);
+	assert.equal(expanded, `\n${compactJson}`);
+});
+
 test("quiet tool rendering identifies only routine Gentle AI SDD and RDD commands", () => {
 	assert.equal(gentleAiRoutineCommand({ command: "gentle-ai sdd-status fix-rose --json" }), "sdd-status");
 	assert.equal(gentleAiRoutineCommand({ command: "env FOO=bar gentle-ai sdd-continue fix-rose" }), "sdd-continue");

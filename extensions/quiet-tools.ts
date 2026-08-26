@@ -45,7 +45,8 @@ const PREVIEW_LINE_LIMIT = 3;
 const EMPTY_RESULT_MESSAGES: Partial<Record<QuietToolName, string[]>> = {
 	grep: ["No matches found"],
 	find: ["No files found matching pattern"],
-	ls: ["Directory is empty"],
+	ls: ["Directory is empty", "(empty directory)"],
+	bash: ["(no output)"],
 };
 
 const toolCache = new Map<string, Record<QuietToolName, any>>();
@@ -99,15 +100,25 @@ function lastOutputLines(text: string, limit: number): string {
 	return outputLines(text).slice(-limit).join("\n");
 }
 
+function lastMeaningfulOutputLines(text: string, limit: number): string {
+	return outputLines(text)
+		.filter((line) => line.trim().length > 0)
+		.slice(-limit)
+		.join("\n");
+}
+
 function semanticJsonPreview(text: string): string | undefined {
 	const trimmed = text.trim();
 	if (!/^[\[{]/.test(trimmed)) return undefined;
+	let parsed: unknown;
 	try {
-		JSON.parse(trimmed);
+		parsed = JSON.parse(trimmed);
 	} catch {
 		return undefined;
 	}
-	return outputLines(trimmed)
+	const normalized = JSON.stringify(parsed, null, 2);
+	if (normalized === undefined) return undefined;
+	return outputLines(normalized)
 		.filter((line) => !/^[\s{}\[\],]*$/.test(line))
 		.slice(0, PREVIEW_LINE_LIMIT)
 		.join("\n");
@@ -146,7 +157,13 @@ function sanitizedResult(result: AgentToolResult<unknown>): AgentToolResult<unkn
 
 function isEmptyResultMessage(toolName: QuietToolName, text: string): boolean {
 	const normalized = text.trim();
-	return EMPTY_RESULT_MESSAGES[toolName]?.some((message) => normalized.startsWith(message)) ?? false;
+	return EMPTY_RESULT_MESSAGES[toolName]?.some((message) => normalized === message) ?? false;
+}
+
+function grepMatchCount(text: string, args: Record<string, unknown> | undefined): number {
+	const context = args?.context;
+	if (typeof context !== "number" || context <= 0) return countNonEmptyLines(text);
+	return outputLines(text).filter((line) => /^\s*.+:\d+:\s?/.test(line)).length;
 }
 
 function isGitCommand(args: Record<string, unknown> | undefined): boolean {
@@ -426,13 +443,13 @@ export function formatToolResultOutput(
 		return detail ? `\n${detail}` : "";
 	}
 	if (isError) {
-		const tail = lastOutputLines(text, PREVIEW_LINE_LIMIT);
+		const tail = lastMeaningfulOutputLines(text, PREVIEW_LINE_LIMIT);
 		return tail ? `\n${tail}` : "";
 	}
 	const summaryLabel = COLLAPSED_COUNT_LABELS[toolName];
 	if (summaryLabel) {
 		if (isEmptyResultMessage(toolName, text)) return "";
-		const count = countNonEmptyLines(text);
+		const count = toolName === "grep" ? grepMatchCount(text, args) : countNonEmptyLines(text);
 		return count > 0 ? ` → ${count} ${summaryLabel}` : "";
 	}
 	if (toolName === "bash" && isGentleAiDirectCommand(args)) return "";
@@ -556,7 +573,7 @@ function hasImageContent(result: AgentToolResult<unknown>): boolean {
 }
 
 function hasExpandableContent(toolName: QuietToolName, result: AgentToolResult<unknown>, text: string): boolean {
-	if (COLLAPSED_COUNT_LABELS[toolName] && isEmptyResultMessage(toolName, text)) return false;
+	if (isEmptyResultMessage(toolName, text)) return false;
 	if (text.length > 0 || hasImageContent(result)) return true;
 	const diff = detailsRecord(result).diff;
 	return toolName === "edit" && typeof diff === "string" && diff.length > 0;
