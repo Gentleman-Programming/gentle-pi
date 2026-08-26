@@ -23,9 +23,9 @@ const TOOL_NAMES = new Set(["read", "bash", "powershell", "edit", "write", "grep
 type Specification = {
 	ownerCwd: string;
 	systemPrompt: string;
-	model: object;
-	modelRegistry: object;
-	thinkingLevel: string;
+	model: NonNullable<CreateAgentSessionOptions["model"]>;
+	modelRegistry: NonNullable<CreateAgentSessionOptions["modelRegistry"]>;
+	thinkingLevel: NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
 	tools: string[];
 };
 type CreateSession = (options: CreateAgentSessionOptions) => Promise<unknown>;
@@ -91,7 +91,14 @@ function readSpecification(value: unknown): Specification | undefined {
 		if (typeof thinkingLevel !== "string" || !THINKING_LEVELS.has(thinkingLevel)) return undefined;
 		const tools = readTools(suppliedTools);
 		if (tools === undefined) return undefined;
-		return { ownerCwd, systemPrompt, model, modelRegistry, thinkingLevel, tools };
+		return {
+			ownerCwd,
+			systemPrompt,
+			model: model as Specification["model"],
+			modelRegistry: modelRegistry as Specification["modelRegistry"],
+			thinkingLevel: thinkingLevel as Specification["thinkingLevel"],
+			tools,
+		};
 	} catch {
 		return undefined;
 	}
