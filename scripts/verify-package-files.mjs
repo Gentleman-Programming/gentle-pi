@@ -52,6 +52,7 @@ const requiredPaths = [
   "extensions/gentle-ai.ts",
   "extensions/sdd-init.ts",
   "extensions/skill-registry.ts",
+  "lib/agent-activity-projection.ts",
   "lib/gentle-ai-binary.ts",
   "lib/native-review-cli.ts",
   "lib/provider-contract-bundle.ts",
