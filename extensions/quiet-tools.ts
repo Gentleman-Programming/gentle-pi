@@ -136,10 +136,6 @@ function safeText(value: string): string {
 
 function sanitizeValue(value: unknown): unknown {
 	if (typeof value === "string") return safeText(value);
-	if (Array.isArray(value)) return value.map(sanitizeValue);
-	if (value && typeof value === "object") {
-		return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, sanitizeValue(item)]));
-	}
 	return value;
 }
 
@@ -150,7 +146,7 @@ function sanitizedArgs(args: Record<string, unknown> | undefined): Record<string
 function sanitizedResult(result: AgentToolResult<unknown>): AgentToolResult<unknown> {
 	return {
 		...result,
-		content: result.content.map((content) => sanitizeValue(content) as typeof content),
+		content: result.content.map((content) => content.type === "text" ? { ...content, text: safeText(content.text) } : content.type === "image" ? { ...content, mimeType: safeText(content.mimeType) } : content),
 		details: sanitizeValue(result.details),
 	};
 }
@@ -435,7 +431,7 @@ function writeSummary(text: string): string {
 function expandedResultText(toolName: QuietToolName, result: AgentToolResult<unknown>, text: string): string {
 	if (toolName === "edit") {
 		const diff = detailsRecord(result).diff;
-		if (typeof diff === "string") return diff;
+		if (typeof diff === "string") return safeText(diff);
 	}
 	return text;
 }
@@ -616,13 +612,14 @@ function gentleAiRenderTransition(
 	if (operationPath && (tokenization.kind === "complete" || !argsComplete) && state?.genericLocked !== true) {
 		return { operationPath, directResult: forResult };
 	}
+	if (forResult && state?.lifecycleComponent === true && state.genericLocked !== true) return { directResult: true };
 	if (state && (tokenization.kind === "generic" || argsComplete || (forResult && !isPartial))) {
 		state.genericLocked = true; state.lifecycleComponent = false;
 	}
 	return { directResult: false };
 }
 
-function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArguments: RegExp): void {
+function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArguments: () => RegExp): void {
 	const registrationTool = getBuiltInTools(process.cwd())[toolName];
 	const officialRenderResult = registrationTool.renderResult;
 
@@ -636,7 +633,7 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArg
 			const callArgs = args as Record<string, unknown>;
 			const renderContext = sanitizedRenderContext(context as ToolRenderContextLike | undefined);
 			const operationPath = toolName === "bash"
-				? gentleAiRenderTransition(callArgs, renderContext, commandArguments).operationPath
+				? gentleAiRenderTransition(callArgs, renderContext, commandArguments()).operationPath
 				: undefined;
 			if (operationPath) {
 				const detail = renderContext.expanded === true && typeof callArgs.command === "string" ? `$ ${callArgs.command}` : undefined;
@@ -652,7 +649,7 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArg
 			const directResult = toolName === "bash" && gentleAiRenderTransition(
 				renderContext?.args,
 				renderContext,
-				commandArguments,
+				commandArguments(),
 				{ result: true, isPartial: options.isPartial },
 			).directResult;
 			if (directResult) {
@@ -698,8 +695,7 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArg
 
 export default function quietTools(pi: ExtensionAPI, resolveOverride: GentleAiDevBinaryOverrideResolver = () => resolveGentleAiDevBinaryOverride()): void {
 	if (!quietToolsEnabled()) return;
-	const commandArguments = createGentleAiCommandArguments(resolveQuietToolsDevBinaryPath(resolveOverride));
 	for (const toolName of Object.keys(TOOL_CREATORS) as QuietToolName[]) {
-		registerQuietTool(pi, toolName, commandArguments);
+		registerQuietTool(pi, toolName, () => createGentleAiCommandArguments(resolveQuietToolsDevBinaryPath(resolveOverride)));
 	}
 }

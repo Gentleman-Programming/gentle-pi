@@ -695,7 +695,7 @@ test("quiet tool rendering recognizes exact quoted, escaped, Windows, and comman
 });
 
 test("quiet tool rendering recognizes only the exact resolved dev binary", () => {
-	const devPath = "/home/devel/projects/gentle-ai/dist/gentle-ai-main";
+	let devPath = "/home/devel/projects/gentle-ai/dist/gentle-ai-main";
 	let resolutions = 0;
 	const tools = registeredQuietToolsWithResolver(() => {
 		resolutions += 1;
@@ -715,16 +715,24 @@ test("quiet tool rendering recognizes only the exact resolved dev binary", () =>
 		assert.doesNotMatch(call, /gentle-ai-main|private|secret|hidden/);
 	}
 	const command = `${devPath} review status --prompt hidden-prompt --lineage lineage-secret --body private-body`;
+	const lifecycleContext = routineRenderContext({ args: { command }, state: {} });
+	assert.match(renderToString(tool.renderCall({ command }, passthroughTheme, lifecycleContext)), /Gentle AI · running · review status/);
+	devPath = "/new/dev/gentle-ai-main";
+	const refreshedCommand = `${devPath} review status --token token-secret`;
+	assert.match(renderToString(tool.renderCall({ command: refreshedCommand }, passthroughTheme, routineRenderContext({ args: { command: refreshedCommand } }))), /Gentle AI · running · review status/);
+	assertGenericBash(tool, cases[2][0]);
 	const text = "error: private failure\nlineage=secret body=hidden\x1b[31m";
-	const collapsed = renderToolResult(tool, textResult(text), { expanded: false, isPartial: false, isError: true }, { args: { command }, isError: true });
-	const expanded = renderToolResult(tool, textResult(text), { expanded: true, isPartial: false, isError: true }, { args: { command }, isError: true });
+	const collapsed = renderToolResult(tool, textResult(text), { expanded: false, isPartial: false, isError: true }, lifecycleContext);
+	const expanded = renderToolResult(tool, textResult(text), { expanded: true, isPartial: false, isError: true }, lifecycleContext);
+	const refreshed = renderToolResult(tool, textResult("result-secret"), { expanded: false, isPartial: false }, { args: { command: refreshedCommand } });
 	const hint = keyHint("app.tools.expand", "to expand");
 	assert.equal(collapsed, hint);
 	assert.equal(collapsed.split(hint).length - 1, 1);
 	assert.doesNotMatch(collapsed, /private|lineage|secret|hidden|error/);
 	assert.match(expanded, /private failure|lineage=secret body=hidden/);
 	assert.doesNotMatch(expanded, /to expand|\x1b\[/);
-	assert.equal(resolutions, 1);
+	assert.doesNotMatch(refreshed, /result-secret/);
+	assert.ok(resolutions > 1);
 });
 test("quiet tool rendering keeps unregistered dev lookalikes and composed calls generic", () => {
 	const devPath = "/home/devel/projects/gentle-ai/dist/gentle-ai-main";
@@ -961,9 +969,22 @@ test("quiet tool rendering sanitizes collapsed output and call rows", () => {
 	);
 	const call = renderToString(tools.get("bash").renderCall({ command: "echo \x1b[31mred\x1b[0m" }, passthroughTheme, {}));
 
+	const carriageReturn = renderToolResult(tools.get("bash"), textResult("prefix\rSECRET\r\nnext"), { expanded: false, isPartial: false }, { args: { command: "printf output" } });
 	assert.match(collapsed, /safered/);
 	assert.doesNotMatch(collapsed, /\x1b\[31m|\x1b\[0m/);
 	assert.equal(call.trimEnd(), "$ echo red");
+	assert.match(carriageReturn, /prefixSECRET\nnext/);
+	assert.doesNotMatch(carriageReturn, /\r/);
+});
+
+test("quiet tool rendering sanitizes only rendered fields", () => {
+	let argsReads = 0, detailReads = 0;
+	const counted = (record: Record<string, unknown>, increment: () => void) => Object.defineProperties(record, Object.fromEntries(Array.from({ length: 1000 }, (_, index) => [`unused${index}`, { enumerable: true, get() { increment(); return "ignored"; } }])));
+	const args = counted({ command: "printf output" }, () => argsReads++);
+	const details = counted({}, () => detailReads++);
+	renderToolResult(registeredQuietTools().get("bash"), textResult("first\nsecond", details), { expanded: false, isPartial: false }, { args });
+	assert.equal(argsReads, 0);
+	assert.equal(detailReads, 0);
 });
 
 test("quiet tool rendering call rows show tool calls without result output", () => {
