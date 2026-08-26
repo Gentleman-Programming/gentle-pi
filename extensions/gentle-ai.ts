@@ -3207,6 +3207,13 @@ interface RetainedNativeUntrackedSelection {
 	readonly intendedUntracked: readonly string[];
 }
 
+interface RetainedNativeCaptureRoute { readonly workspaceRoot: string; readonly lineageId: string; readonly baseRef?: string; readonly committedOnly?: true; }
+
+type RetainedNativeStatusSelection = RetainedNativeUntrackedSelection | RetainedNativeCaptureRoute;
+
+const MAX_RETAINED_NATIVE_STATUS_SELECTIONS = 64;
+class NativeCaptureRouteRegistrationError extends Error {}
+
 function isNativeStartUntrackedPath(value: unknown): value is string {
 	return isCanonicalProcessString(value)
 		&& !isAbsolute(value)
@@ -3328,7 +3335,7 @@ export class PendingReviewConsentRegistry {
 }
 
 const processPendingReviewConsentRegistry = new PendingReviewConsentRegistry();
-const processRetainedUntrackedSelections = new Map<PendingReviewConsentSessionKey, Map<string, RetainedNativeUntrackedSelection>>();
+const processRetainedNativeStatusSelections = new Map<PendingReviewConsentSessionKey, Map<string, RetainedNativeStatusSelection>>();
 
 function pendingReviewConsentSessionKey(context: ExtensionContext | undefined, fallbackKey: symbol): PendingReviewConsentSessionKey {
 	try {
@@ -3452,6 +3459,15 @@ function nativeOperationFailure(operation: ReviewControllerOperation | "gentle_r
 			next_action: "resolve-consent-binding",
 		};
 	}
+	if (error instanceof NativeCaptureRouteRegistrationError) {
+		return {
+			operation,
+			status: "blocked",
+			outcome: "capture-route-registration-rejected",
+			mutation_performed: false,
+			mutation_outcome: "none",
+		};
+	}
 	const mutationOutcome = value.mutationOutcome === "unknown" ? "unknown" : "none";
 	const nativeCliError = asNativeReviewCliError(error);
 	if (nativeCliError?.code === NATIVE_REVIEW_ERROR_CODE.PACKAGE_BINARY_MISSING) return nativeStatusPackageBinaryMissing(operation, nativeCliError.diagnostics);
@@ -3502,6 +3518,7 @@ async function reconcileNativeMutationFailure(
 	error: unknown,
 	nativeReviewCli: NativeReviewCli,
 	target: Parameters<NonNullable<NativeReviewCli["targetStatus"]>>[0],
+	retainedSelections: Map<string, RetainedNativeStatusSelection>,
 	preOperationRevision?: string,
 	canonicalRetentionRoot = target.cwd,
 ): Promise<Record<string, unknown>> {
@@ -3518,7 +3535,7 @@ async function reconcileNativeMutationFailure(
 	}
 	try {
 		const status = await nativeReviewCli.targetStatus(target);
-		clearRetainedNativeUntrackedSelectionOnTerminal(retainedUntrackedSelectionsByNativeReviewCli.get(nativeReviewCli)!, canonicalRetentionRoot, status.authority?.lineageId, status.authority?.state);
+		syncRetainedNativeStatusSelections(retainedSelections, canonicalRetentionRoot, status, target.baseRef);
 		const { required_status_action: staleStatusDirective, ...reconciledBase } = failure;
 		void staleStatusDirective;
 		// Field defect (fambig, 2026-08-16): an envelope-less mutating failure
@@ -3613,6 +3630,10 @@ function reviewLifecycleStorageKey(workspaceRoot: string, lineageId: string): st
 	return `${workspaceRoot}\u0000${lineageId}`;
 }
 
+function reviewCaptureSelectionStorageKey(collectBinding: string): string {
+	return `capture\u0000${collectBinding}`;
+}
+
 function cloneRetainedNativeUntrackedSelection(selection: NativeStartUntrackedSelection): RetainedNativeUntrackedSelection | undefined {
 	if (selection.untrackedScope === undefined || selection.expectedUntrackedInventory === undefined) return undefined;
 	return Object.freeze({
@@ -3622,13 +3643,24 @@ function cloneRetainedNativeUntrackedSelection(selection: NativeStartUntrackedSe
 	});
 }
 
-function retainNativeUntrackedSelection(selections: Map<string, RetainedNativeUntrackedSelection>, workspaceRoot: string, lineageId: string, selection: RetainedNativeUntrackedSelection | undefined): void {
-	if (selection !== undefined) selections.set(reviewLifecycleStorageKey(workspaceRoot, lineageId), selection);
+function retainNativeStatusSelection(selections: Map<string, RetainedNativeStatusSelection>, key: string, selection: RetainedNativeStatusSelection): void {
+	if (!selections.has(key)) {
+		while (selections.size >= MAX_RETAINED_NATIVE_STATUS_SELECTIONS) {
+			const oldestKey = selections.keys().next().value;
+			if (oldestKey === undefined) return;
+			selections.delete(oldestKey);
+		}
+	}
+	selections.set(key, selection);
 }
 
-function readRetainedNativeUntrackedSelection(selections: Map<string, RetainedNativeUntrackedSelection>, workspaceRoot: string, lineageId: string): NativeStartUntrackedSelection {
+function retainNativeUntrackedSelection(selections: Map<string, RetainedNativeStatusSelection>, workspaceRoot: string, lineageId: string, selection: RetainedNativeUntrackedSelection | undefined): void {
+	if (selection !== undefined) retainNativeStatusSelection(selections, reviewLifecycleStorageKey(workspaceRoot, lineageId), selection);
+}
+
+function readRetainedNativeUntrackedSelection(selections: Map<string, RetainedNativeStatusSelection>, workspaceRoot: string, lineageId: string): NativeStartUntrackedSelection {
 	const selection = selections.get(reviewLifecycleStorageKey(workspaceRoot, lineageId));
-	return selection === undefined
+	return selection === undefined || "baseRef" in selection
 		? {}
 		: {
 			untrackedScope: selection.untrackedScope,
@@ -3637,8 +3669,39 @@ function readRetainedNativeUntrackedSelection(selections: Map<string, RetainedNa
 		};
 }
 
-function clearRetainedNativeUntrackedSelectionOnTerminal(selections: Map<string, RetainedNativeUntrackedSelection>, workspaceRoot: string, lineageId: string | undefined, state: string | undefined): void {
-	if (lineageId !== undefined && (state === "approved" || state === "escalated")) selections.delete(reviewLifecycleStorageKey(workspaceRoot, lineageId));
+function isRetainedNativeCaptureRoute(selection: RetainedNativeStatusSelection | undefined): selection is RetainedNativeCaptureRoute {
+	return selection !== undefined && "workspaceRoot" in selection;
+}
+
+function retainNativeCaptureRoutes(selections: Map<string, RetainedNativeStatusSelection>, workspaceRoot: string, status: ReviewStatusV3, baseRef: string | undefined): void {
+	const lineageId = status.authority?.lineageId;
+	if (status.applicability !== "current_target" || !isCanonicalProcessString(lineageId) || isTerminalReviewAuthorityState(status.authority?.state)) return;
+	const routes = (status.nextTransition?.kind === "collect" ? status.nextTransition.collect?.inputs ?? [] : []).map((input) => ({ key: reviewCaptureSelectionStorageKey(canonicalReviewCaptureBinding(input)), route: Object.freeze({ workspaceRoot, lineageId, ...(baseRef === undefined ? {} : { baseRef, committedOnly: true as const }) }) }));
+	for (const { key, route } of routes) {
+		const existing = selections.get(key);
+		if (isRetainedNativeCaptureRoute(existing) && (existing.workspaceRoot !== route.workspaceRoot || existing.lineageId !== route.lineageId || existing.baseRef !== route.baseRef || existing.committedOnly !== route.committedOnly)) throw new NativeCaptureRouteRegistrationError("Provider collectBinding collides with a different registered route");
+	}
+	const current = new Set(routes.map(({ key }) => key));
+	for (const [key, selection] of selections) if (isRetainedNativeCaptureRoute(selection) && selection.workspaceRoot === workspaceRoot && selection.lineageId === lineageId && !current.has(key)) selections.delete(key);
+	for (const { key, route } of routes) if (!selections.has(key)) retainNativeStatusSelection(selections, key, route);
+}
+
+function readRetainedNativeCaptureRoute(selections: Map<string, RetainedNativeStatusSelection>, collectBinding: string): RetainedNativeCaptureRoute | undefined {
+	const selection = selections.get(reviewCaptureSelectionStorageKey(collectBinding));
+	return isRetainedNativeCaptureRoute(selection) ? selection : undefined;
+}
+
+function isTerminalReviewAuthorityState(state: string | undefined): boolean { return state === "invalidated" || state === "approved" || state === "escalated"; }
+
+function clearRetainedNativeStatusSelectionsOnTerminal(selections: Map<string, RetainedNativeStatusSelection>, workspaceRoot: string, lineageId: string | undefined, state: string | undefined): void {
+	if (lineageId === undefined || !isTerminalReviewAuthorityState(state)) return;
+	selections.delete(reviewLifecycleStorageKey(workspaceRoot, lineageId));
+	for (const [key, selection] of selections) if (isRetainedNativeCaptureRoute(selection) && selection.workspaceRoot === workspaceRoot && selection.lineageId === lineageId) selections.delete(key);
+}
+
+function syncRetainedNativeStatusSelections(selections: Map<string, RetainedNativeStatusSelection>, workspaceRoot: string, status: ReviewStatusV3, baseRef: string | undefined): void {
+	clearRetainedNativeStatusSelectionsOnTerminal(selections, workspaceRoot, status.authority?.lineageId, status.authority?.state);
+	retainNativeCaptureRoutes(selections, workspaceRoot, status, baseRef);
 }
 
 function requiresExplicitTargetLifecycleRoot(requested: string | undefined, sessionCwd: string, workspaceRoot: string): boolean {
@@ -3708,6 +3771,17 @@ function mapLastEventClosure(
 	};
 }
 
+function mapAndClearLastEventClosure(
+	closure: ReviewLastEventClosureV1,
+	binding: ReviewLastEventClosureBinding,
+	selections: Map<string, RetainedNativeStatusSelection>,
+	workspaceRoot: string,
+): Record<string, unknown> {
+	const mapped = mapLastEventClosure(closure, binding);
+	clearRetainedNativeStatusSelectionsOnTerminal(selections, workspaceRoot, closure.lineageId, closure.state);
+	return mapped;
+}
+
 function decodeRelayLastEventClosure(submission: string): ReviewLastEventClosureV1 | undefined {
 	let body: unknown;
 	try { body = JSON.parse(submission); } catch { throw new CandidateViewError("host relay submission returned malformed JSON", "last-event-closure-decode-failed"); }
@@ -3720,11 +3794,14 @@ async function reconcileUnknownReviewCaptureFailure(
 	nativeReviewCli: NativeReviewCli,
 	cwd: string,
 	binding: ReviewLastEventClosureBinding,
+	selections: Map<string, RetainedNativeStatusSelection>,
+	route: RetainedNativeCaptureRoute | undefined,
 ): Promise<Record<string, unknown>> {
 	const failure = nativeOperationFailure("gentle_review_capture", error);
 	if (!nativeMutationRequiresStatus(error)) return failure;
 	try {
-		const status = await reconcileUnknownReviewLastEventCapture(nativeReviewCli, cwd, binding);
+		const status = await reconcileUnknownReviewLastEventCapture(nativeReviewCli, cwd, binding, route);
+		syncRetainedNativeStatusSelections(selections, cwd, status, route?.baseRef);
 		return {
 			tool: "gentle_review_capture",
 			status: "reconciled",
@@ -3750,6 +3827,8 @@ async function executeReviewHostRelayCapture(
 	nativeReviewCli: NativeReviewCli,
 	cwd: string,
 	binding: ReviewLastEventClosureBinding,
+	selections: Map<string, RetainedNativeStatusSelection>,
+	route: RetainedNativeCaptureRoute | undefined,
 	signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
 	try {
@@ -3767,7 +3846,7 @@ async function executeReviewHostRelayCapture(
 			...(signal === undefined ? {} : { signal }),
 		});
 		const closure = decodeRelayLastEventClosure(result.submission);
-		if (closure !== undefined) return mapLastEventClosure(closure, binding);
+		if (closure !== undefined) return mapAndClearLastEventClosure(closure, binding, selections, cwd);
 		return {
 			tool: "gentle_review_capture",
 			status: "captured",
@@ -3784,8 +3863,8 @@ async function executeReviewHostRelayCapture(
 			},
 		};
 	} catch (error) {
-		if (!(error instanceof ReviewHostRelayError)) return await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding);
-		if (error.mutationOutcome === "unknown") return await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding);
+		if (!(error instanceof ReviewHostRelayError)) return await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding, selections, route);
+		if (error.mutationOutcome === "unknown") return await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding, selections, route);
 		if (error.kind === REVIEW_HOST_RELAY_FAILURE.RELAY_UNAVAILABLE) {
 			return {
 				tool: "gentle_review_capture",
@@ -3830,6 +3909,8 @@ async function executeProviderRoleVectorCapture(
 	nativeReviewCli: NativeReviewCli,
 	cwd: string,
 	binding: ReviewLastEventClosureBinding,
+	selections: Map<string, RetainedNativeStatusSelection>,
+	route: RetainedNativeCaptureRoute | undefined,
 	signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
 	if (nativeReviewCli.captureProviderRole === undefined) {
@@ -3849,7 +3930,7 @@ async function executeProviderRoleVectorCapture(
 			cwd,
 			...(signal === undefined ? {} : { signal }),
 		});
-		if ("operation" in artifact) return mapLastEventClosure(artifact, binding);
+		if ("operation" in artifact) return mapAndClearLastEventClosure(artifact, binding, selections, cwd);
 		return {
 			tool: "gentle_review_capture",
 			status: "captured",
@@ -3864,7 +3945,7 @@ async function executeProviderRoleVectorCapture(
 			},
 		};
 	} catch (error) {
-		const outcome = await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding);
+		const outcome = await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding, selections, route);
 		return {
 			...outcome,
 			...(outcome.status === "reconciled" ? {} : { retry_discipline: REVIEW_PROVIDER_ROLE_RETRY_ACTION }),
@@ -3926,7 +4007,6 @@ interface NegotiatedHostTransportStatus {
 	transport?: ReviewTransportRefusal;
 }
 const reviewTransportRefusalByProvider = new WeakMap<object, ReviewTransportRefusal>();
-const retainedUntrackedSelectionsByNativeReviewCli = new WeakMap<NativeReviewCli, Map<string, RetainedNativeUntrackedSelection>>();
 
 function clearReviewTransportProbeForTesting(nativeReviewCli: NativeReviewCli | null): void {
 	if (nativeReviewCli !== null) reviewTransportRefusalByProvider.delete(nativeReviewCli as unknown as object);
@@ -3956,6 +4036,7 @@ function hostTransportUnavailable(
 async function negotiatedStatusForHostTransport(
 	nativeReviewCli: NativeReviewCli,
 	request: NativeTargetStatusRequest,
+	retainedSelections: Map<string, RetainedNativeStatusSelection>,
 	canonicalRetentionRoot = request.cwd,
 ): Promise<NegotiatedHostTransportStatus> {
 	const provider = nativeReviewCli as unknown as object;
@@ -3963,7 +4044,7 @@ async function negotiatedStatusForHostTransport(
 	if (remembered !== undefined) return { transport: remembered };
 	try {
 		const status = await nativeReviewCli.targetStatus!({ ...request, agent: REVIEW_HOST_AGENT });
-		clearRetainedNativeUntrackedSelectionOnTerminal(retainedUntrackedSelectionsByNativeReviewCli.get(nativeReviewCli)!, canonicalRetentionRoot, status.authority?.lineageId, status.authority?.state);
+		syncRetainedNativeStatusSelections(retainedSelections, canonicalRetentionRoot, status, request.baseRef);
 		return { status };
 	} catch (error) {
 		const code = error instanceof NativeReviewIntegrationError ? error.failureEnvelope.code : undefined;
@@ -4082,7 +4163,8 @@ async function executeReviewCaptureOperation(
 	nativeReviewCli: NativeReviewCli | null,
 	signal?: AbortSignal,
 	candidateViews: CandidateViewRegistry | null = new CandidateViewRegistry(),
-	retainedUntrackedSelections: Map<string, RetainedNativeUntrackedSelection> = new Map(),
+	retainedUntrackedSelections: Map<string, RetainedNativeStatusSelection> = new Map(),
+	requireRegisteredRoute = false,
 ): Promise<Record<string, unknown>> {
 	const parameters = parseReviewCaptureParameters(parametersValue);
 	if (nativeReviewCli === null || nativeReviewCli.targetStatus === undefined) {
@@ -4094,17 +4176,21 @@ async function executeReviewCaptureOperation(
 			mutation_outcome: "none",
 		};
 	}
-	retainedUntrackedSelectionsByNativeReviewCli.set(nativeReviewCli, retainedUntrackedSelections);
 	const canonicalBinding = parseCanonicalReviewCaptureBinding(parameters.collectBinding);
 	const cwd = resolveReviewControllerWorkspaceRoot(parameters.workspaceRoot, sessionCwd, candidateViews, parameters.lineageId);
+	const route = readRetainedNativeCaptureRoute(retainedUntrackedSelections, canonicalBinding);
+	if (requireRegisteredRoute && (route === undefined || route.workspaceRoot !== cwd || route.lineageId !== parameters.lineageId)) {
+		return captureBindingRejected("collectBinding is unknown, expired, or belongs to a different session route");
+	}
 	let status: ReviewStatusV3;
 	try {
 		const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
 			cwd,
 			lineageId: parameters.lineageId,
+			...(route?.baseRef === undefined ? {} : { baseRef: route.baseRef, committedOnly: true }),
 			...readRetainedNativeUntrackedSelection(retainedUntrackedSelections, cwd, parameters.lineageId),
 			...(signal === undefined ? {} : { signal }),
-		}, cwd);
+		}, retainedUntrackedSelections, cwd);
 		if (negotiated.transport !== undefined) return hostTransportUnavailable("gentle_review_capture", negotiated.transport);
 		status = negotiated.status!;
 	} catch (error) {
@@ -4130,7 +4216,7 @@ async function executeReviewCaptureOperation(
 				mutation_outcome: "none",
 			};
 		}
-		return await executeReviewHostRelayCapture(hostRelaySlots[0]!, nativeReviewCli, cwd, selected.binding, signal);
+		return await executeReviewHostRelayCapture(hostRelaySlots[0]!, nativeReviewCli, cwd, selected.binding, retainedUntrackedSelections, route, signal);
 	}
 
 	if (selected.input.captureOperation === "review.capture-correction-plan") {
@@ -4160,9 +4246,9 @@ async function executeReviewCaptureOperation(
 				cwd,
 				...(signal === undefined ? {} : { signal }),
 			});
-			return mapLastEventClosure(closure, selected.binding);
+			return mapAndClearLastEventClosure(closure, selected.binding, retainedUntrackedSelections, cwd);
 		} catch (error) {
-			return await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, selected.binding);
+			return await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, selected.binding, retainedUntrackedSelections, route);
 		}
 	}
 
@@ -4171,7 +4257,7 @@ async function executeReviewCaptureOperation(
 		if (parameters.reviewerRunAcknowledged !== undefined || parameters.correctionLines !== undefined) {
 			return captureBindingRejected("reviewerRunAcknowledged and correctionLines are not valid for a provider role capture");
 		}
-		return await executeProviderRoleVectorCapture(providerRoleSlots[0]!, nativeReviewCli, cwd, selected.binding, signal);
+		return await executeProviderRoleVectorCapture(providerRoleSlots[0]!, nativeReviewCli, cwd, selected.binding, retainedUntrackedSelections, route, signal);
 	}
 	return captureBindingRejected(`unsupported provider capture operation: ${selected.input.captureOperation}`);
 }
@@ -4210,7 +4296,7 @@ async function executeReviewControllerOperation(
 	signal?: AbortSignal,
 	candidateViews: CandidateViewRegistry | null = new CandidateViewRegistry(),
 	context?: ExtensionContext,
-	retainedUntrackedSelections: Map<string, RetainedNativeUntrackedSelection> = new Map(),
+	retainedUntrackedSelections: Map<string, RetainedNativeStatusSelection> = new Map(),
 	pendingReviewConsentRegistry: PendingReviewConsentRegistry = processPendingReviewConsentRegistry,
 	pendingReviewConsentFallbackKey: symbol = Symbol("pending-review-consent-fallback"),
 	writeReviewConsentLatch: typeof recordReviewConsentLatch = recordReviewConsentLatch,
@@ -4218,7 +4304,6 @@ async function executeReviewControllerOperation(
 	reviewConsentScheduleTimer: (callback: () => void, delayMs: number) => { unref: () => void } = setTimeout,
 ): Promise<Record<string, unknown>> {
 	const parameters = parseReviewControllerParameters(parametersValue);
-	if (nativeReviewCli !== null) retainedUntrackedSelectionsByNativeReviewCli.set(nativeReviewCli, retainedUntrackedSelections);
 	const defaultCwd = resolveReviewControllerWorkspaceRoot(parameters.workspaceRoot, sessionCwd, candidateViews, parameters.lineageId);
 	const pendingReviewConsentSession = pendingReviewConsentSessionKey(context, pendingReviewConsentFallbackKey);
 	const useTargetLifecycleRoot = requiresExplicitTargetLifecycleRoot(parameters.workspaceRoot, sessionCwd, defaultCwd);
@@ -4253,7 +4338,7 @@ async function executeReviewControllerOperation(
 				const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
 					cwd: defaultCwd,
 					...(signal === undefined ? {} : { signal }),
-				}, defaultCwd);
+				}, retainedUntrackedSelections, defaultCwd);
 				if (negotiated.transport !== undefined) {
 					return {
 						...hostTransportUnavailable(parameters.operation, negotiated.transport),
@@ -4308,7 +4393,7 @@ async function executeReviewControllerOperation(
 		const statusRequest = {
 			cwd: defaultCwd,
 			lineageId: String(input.predecessorLineage),
-			...(frozenTarget?.committedOnly === true ? { baseRef: frozenTarget.baseCommit } : {}),
+			...(frozenTarget?.committedOnly === true ? { baseRef: frozenTarget.baseCommit, committedOnly: true } : {}),
 			...(signal === undefined ? {} : { signal }),
 		};
 		let status: ReviewStatusV3;
@@ -4379,12 +4464,14 @@ async function executeReviewControllerOperation(
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.REPAIR) {
 		if (nativeReviewCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
+		const frozenTarget = parameters.lineageId === undefined || !candidateViews?.hasProjection(parameters.lineageId, defaultCwd) ? undefined : candidateViews.resolveProjection(parameters.lineageId, defaultCwd);
 		let status: ReviewStatusV3;
 		try {
-			status = await nativeReviewCli.targetStatus({ cwd: defaultCwd, ...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }), ...(signal === undefined ? {} : { signal }) });
+			status = await nativeReviewCli.targetStatus({ cwd: defaultCwd, ...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }), ...(frozenTarget?.committedOnly === true ? { baseRef: frozenTarget.baseCommit, committedOnly: true } : {}), ...(signal === undefined ? {} : { signal }) });
 		} catch (error) {
 			return nativeStatusFailed(parameters.operation, error);
 		}
+		clearRetainedNativeStatusSelectionsOnTerminal(retainedUntrackedSelections, defaultCwd, status.authority?.lineageId, status.authority?.state); retainNativeCaptureRoutes(retainedUntrackedSelections, defaultCwd, status, frozenTarget?.committedOnly === true ? frozenTarget.baseCommit : undefined);
 		if (status.authority?.version === "compact-v2") return { operation: parameters.operation, repaired: false, compact_authority: "immutable-untouched", status: mapNativeTargetStatus(parameters.operation, status, parameters.lineageId) };
 		if (status.authority?.version !== "legacy-v1") return mapNativeTargetStatus(parameters.operation, status, parameters.lineageId);
 		const store = ReviewTransactionStore.forRepository(defaultCwd);
@@ -4442,9 +4529,9 @@ async function executeReviewControllerOperation(
 			if (value.mutationOutcome === "none") pending.cleanupCandidate();
 			return await reconcileNativeMutationFailure(parameters.operation, error, nativeReviewCli, {
 				cwd: pending.authorityCwd,
-				...(pending.candidateView.committedOnly ? { baseRef: pending.candidateView.baseCommit } : {}),
+				...(pending.candidateView.committedOnly ? { baseRef: pending.candidateView.baseCommit, committedOnly: true } : {}),
 				projection: "workspace",
-			});
+			}, retainedUntrackedSelections);
 		}
 		if (input.answer === "granted") {
 			try {
@@ -4501,10 +4588,10 @@ async function executeReviewControllerOperation(
 				const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
 					cwd: defaultCwd,
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
-					...(canonicalBaseRef === undefined ? {} : { baseRef: canonicalBaseRef }),
+					...(canonicalBaseRef === undefined ? {} : { baseRef: canonicalBaseRef, committedOnly: true }),
 					...(untrackedSelection.untrackedScope === undefined ? {} : untrackedSelection),
 					...(signal === undefined ? {} : { signal }),
-				}, defaultCwd);
+				}, retainedUntrackedSelections, defaultCwd);
 				if (negotiated.transport !== undefined) return hostTransportUnavailable(parameters.operation, negotiated.transport);
 				target = negotiated.status!;
 				if (target.nextTransition?.kind === "collect" || target.applicability !== "unrelated" || target.action !== "start") return mapNativeTargetStatus(parameters.operation, target, parameters.lineageId);
@@ -4610,10 +4697,10 @@ async function executeReviewControllerOperation(
 				return reconcileNativeMutationFailure(parameters.operation, failure, nativeReviewCli, {
 					cwd: defaultCwd,
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
-					...(canonicalBaseRef === undefined ? {} : { baseRef: candidateView?.baseCommit ?? canonicalBaseRef }),
+					...(canonicalBaseRef === undefined ? {} : { baseRef: candidateView?.baseCommit ?? canonicalBaseRef, committedOnly: true }),
 					...(untrackedSelection.untrackedScope === undefined ? {} : untrackedSelection),
 					projection: "workspace",
-				});
+				}, retainedUntrackedSelections);
 			}
 		}
 		if (rawStart.mode === REVIEW_MODE.ORDINARY) {
@@ -4700,12 +4787,16 @@ async function executeReviewControllerOperation(
 			: parseControllerJson(parameters.input, REVIEW_CONTROLLER_OPERATION.STATUS);
 		const unknownField = rawStatus === undefined
 			? undefined
-			: Object.keys(rawStatus).find((field) => !["untrackedScope", "expectedUntrackedInventory", "intendedUntracked"].includes(field));
+			: Object.keys(rawStatus).find((field) => !["baseRef", "committedOnly", "untrackedScope", "expectedUntrackedInventory", "intendedUntracked"].includes(field));
 		if (unknownField !== undefined) return nativeStatusInputRejection("unknown-field", unknownField);
+		const baseRef = rawStatus?.baseRef;
+		if (baseRef !== undefined && !isCanonicalProcessString(baseRef)) return nativeStatusInputRejection("base-ref-invalid");
+		if (baseRef !== undefined && rawStatus?.committedOnly !== true) return nativeStatusInputRejection("committed-only-required");
+		if (baseRef === undefined && rawStatus !== undefined && "committedOnly" in rawStatus) return nativeStatusInputRejection("committed-only-invalid");
 		const untrackedSelection = rawStatus === undefined ? {} : validateNativeStartUntrackedSelection(rawStatus);
 		if (
 			rawStatus !== undefined &&
-			(untrackedSelection.reason !== undefined || untrackedSelection.untrackedScope === undefined)
+			(untrackedSelection.reason !== undefined || (baseRef === undefined && untrackedSelection.untrackedScope === undefined))
 		) return nativeStatusInputRejection(untrackedSelection.reason ?? "untracked-selection-invalid");
 		const retainedUntrackedSelection = cloneRetainedNativeUntrackedSelection(untrackedSelection);
 		if (nativeReviewCli?.targetStatus !== undefined) {
@@ -4713,9 +4804,10 @@ async function executeReviewControllerOperation(
 				const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
 					cwd: defaultCwd,
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
+					...(baseRef === undefined ? {} : { baseRef, committedOnly: true }),
 					...(untrackedSelection.untrackedScope === undefined ? {} : untrackedSelection),
 					...(signal === undefined ? {} : { signal }),
-				}, defaultCwd);
+				}, retainedUntrackedSelections, defaultCwd);
 				if (negotiated.transport !== undefined) {
 					return {
 						...hostTransportUnavailable(parameters.operation, negotiated.transport),
@@ -4729,7 +4821,7 @@ async function executeReviewControllerOperation(
 					status.applicability === "current_target" &&
 					status.authority?.lineageId === parameters.lineageId
 				) retainNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, parameters.lineageId, retainedUntrackedSelection);
-				clearRetainedNativeUntrackedSelectionOnTerminal(retainedUntrackedSelections, defaultCwd, status.authority?.lineageId, status.authority?.state);
+				clearRetainedNativeStatusSelectionsOnTerminal(retainedUntrackedSelections, defaultCwd, status.authority?.lineageId, status.authority?.state);
 				hydrateDispatchBindingFromStatus(candidateViews, defaultCwd, status);
 				return { ...mapNativeTargetStatus(parameters.operation, status, parameters.lineageId, defaultCwd), ...(includeWorkspaceRoot ? { workspace_root: defaultCwd } : {}) };
 			} catch (error) {
@@ -4849,7 +4941,7 @@ function createGentleAiExtensionForTesting(
 	pi.on("session_shutdown", (_event, context) => {
 		const sessionKey = pendingReviewConsentSessionKey(context, pendingReviewConsentFallbackKey);
 		cleanupAllPendingReviewConsents(pendingReviewConsentRegistry, sessionKey);
-		processRetainedUntrackedSelections.delete(sessionKey);
+		processRetainedNativeStatusSelections.delete(sessionKey);
 	});
 
 	pi.registerTool({
@@ -4899,7 +4991,8 @@ function createGentleAiExtensionForTesting(
 				nativeReviewCli,
 				signal,
 				candidateViews,
-				((sessionKey: PendingReviewConsentSessionKey) => processRetainedUntrackedSelections.get(sessionKey) ?? processRetainedUntrackedSelections.set(sessionKey, new Map()).get(sessionKey)!)(pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey)),
+				((sessionKey: PendingReviewConsentSessionKey) => processRetainedNativeStatusSelections.get(sessionKey) ?? processRetainedNativeStatusSelections.set(sessionKey, new Map()).get(sessionKey)!)(pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey)),
+				true,
 			);
 			return {
 				content: [{ type: "text", text: JSON.stringify(details) }],
@@ -4942,7 +5035,7 @@ function createGentleAiExtensionForTesting(
 				signal,
 				candidateViews,
 				ctx,
-				((sessionKey: PendingReviewConsentSessionKey) => processRetainedUntrackedSelections.get(sessionKey) ?? processRetainedUntrackedSelections.set(sessionKey, new Map()).get(sessionKey)!)(pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey)),
+				((sessionKey: PendingReviewConsentSessionKey) => processRetainedNativeStatusSelections.get(sessionKey) ?? processRetainedNativeStatusSelections.set(sessionKey, new Map()).get(sessionKey)!)(pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey)),
 				pendingReviewConsentRegistry,
 				pendingReviewConsentFallbackKey,
 				writeReviewConsentLatch,

@@ -332,15 +332,20 @@ test("terminal capture closes directly, nonterminal capture does not auto-follow
 });
 
 test("unknown-capture reconciliation validates the target-scoped lineage without replay", async () => {
-	let calls = 0;
+	const calls: Array<Record<string, unknown>> = [];
 	const native = {
-		targetStatus: async (request: { cwd: string; lineageId?: string }) => {
-			calls += 1;
+		targetStatus: async (request: Record<string, unknown>) => {
+			calls.push(request);
 			assert.equal(request.lineageId, "reconcile-lineage");
 			return { targetIdentity: SHA, authority: { lineageId: "reconcile-lineage" } } as ReviewStatusV3;
 		},
 	} as unknown as NativeReviewCli;
 	const result = await reconcileUnknownReviewLastEventCapture(native, "/repo", { lineageId: "reconcile-lineage", targetIdentity: SHA });
-	assert.equal(calls, 1);
+	await reconcileUnknownReviewLastEventCapture(native, "/repo", { lineageId: "reconcile-lineage", targetIdentity: SHA }, { baseRef: "refs/heads/main", committedOnly: true });
+	assert.deepEqual(calls, [{ cwd: "/repo", lineageId: "reconcile-lineage" }, { cwd: "/repo", lineageId: "reconcile-lineage", baseRef: "refs/heads/main", committedOnly: true }]);
 	assert.equal(result.targetIdentity, SHA);
+	let launches = 0;
+	const strictNative = new nativeReviewCliModule.NativeReviewCliV216(async () => { launches += 1; throw new Error("must not launch"); }, "/package/.gentle-ai/gentle-ai");
+	for (const selector of [{ committedOnly: true }, { baseRef: "refs/heads/main" }, { baseRef: "refs/heads/main", committedOnly: false }] as unknown as readonly Parameters<typeof reconcileUnknownReviewLastEventCapture>[3][]) await assert.rejects(() => reconcileUnknownReviewLastEventCapture(strictNative, "/repo", { lineageId: "reconcile-lineage", targetIdentity: SHA }, selector));
+	assert.equal(launches, 0);
 });

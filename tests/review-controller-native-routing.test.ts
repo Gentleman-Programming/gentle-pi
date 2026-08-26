@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
+import { __testing, createGentleAiExtension, PendingReviewConsentRegistry } from "../extensions/gentle-ai.ts";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError, NativeReviewConsentRequiredError, type NativeReviewCli } from "../lib/native-review-cli.ts";
 import { decodeReviewConsentV3, type ReviewCollectInputV3, type ReviewStatusV3 } from "../lib/review-integration-v2.ts";
@@ -48,12 +48,15 @@ function collectInput(lineageId: string): ReviewCollectInputV3 {
 	};
 }
 
-function status(lineageId: string): ReviewStatusV3 {
-	const input = collectInput(lineageId);
+function status(
+	lineageId: string,
+	inputs: readonly ReviewCollectInputV3[] = [collectInput(lineageId)],
+	authorityState = "reviewing",
+): ReviewStatusV3 {
 	return {
 		contract: "gentle-ai.review-integration/v2",
 		applicability: "current_target",
-		authority: { version: "compact-v2", lineageId, state: "reviewing", generation: 1, revision: SHA },
+		authority: { version: "compact-v2", lineageId, state: authorityState, generation: 1, revision: SHA },
 		receipt: { status: "expected_missing" },
 		action: "stop",
 		replayability: "not_replayable",
@@ -74,9 +77,18 @@ function status(lineageId: string): ReviewStatusV3 {
 		},
 		repair: { schema: "gentle-ai.review-authority-repair-assessment/v1", status: "unsupported", counts: { lineages: 0, compactLineages: 0, legacyLineages: 0, events: 0, bytes: 0, eligibleCandidates: 0, unsupportedLineages: 0, conflicts: 0 }, supportedOperations: ["review/complete-fix", "review/validate-fix"], authorizationSchema: "gentle-ai.review-repair-authorization/v1" },
 		candidates: [],
-		nextTransition: { kind: "collect", reasonCode: "capture_required", collect: { inputs: [input] } },
+		nextTransition: { kind: "collect", reasonCode: "capture_required", collect: { inputs } },
 		raw: { schema: "gentle-ai.review-integration.status/v5" },
 	} as unknown as ReviewStatusV3;
+}
+
+function correctionPlanInput(lineageId: string): ReviewCollectInputV3 {
+	const arguments_ = [{ name: "lineage", value: lineageId, token: `--lineage=${lineageId}` }, { name: "target", value: SHA, token: `--target=${SHA}` }];
+	return { name: "correction_plan", schema: "https://gentle-ai.dev/schema/review/correction-plan/v1", captureOperation: "review.capture-correction-plan", arguments: arguments_, submission: { operationToken: "capture-correction-plan", argumentTokens: [`--lineage=${lineageId}`, "--correction-lines={{value}}"], values: [{ slot: "correction_lines", domain: "integer", substitutionLocation: 1, minimum: 1, maximum: 200 }] } } as unknown as ReviewCollectInputV3;
+}
+
+function bindingOf(result: Record<string, unknown>): string {
+	return (result.collectBindings as readonly { collectBinding: string }[])[0]!.collectBinding;
 }
 
 test("public STATUS exposes one opaque current collect binding without advancing authority", async () => {
@@ -87,6 +99,8 @@ test("public STATUS exposes one opaque current collect binding without advancing
 			statusCalls += 1;
 			assert.equal(request.lineageId, lineageId);
 			assert.equal(request.agent, "pi");
+			assert.equal("baseRef" in request, false);
+			assert.equal("committedOnly" in request, false);
 			return status(lineageId);
 		},
 	} as unknown as NativeReviewCli;
@@ -100,6 +114,85 @@ test("public STATUS exposes one opaque current collect binding without advancing
 	const collectBindings = result.collectBindings as readonly { collectBinding: string }[];
 	assert.equal(collectBindings.length, 1);
 	assert.deepEqual(JSON.parse(collectBindings[0]!.collectBinding), collectInput(lineageId));
+});
+
+test("interleaved sessions sharing a CLI retain only their own capture routes", async () => {
+	const [a, b] = ["interleaved-a", "interleaved-b"];
+	const inputs = new Map([[a, correctionPlanInput(a)], [b, correctionPlanInput(b)]]);
+	const requests: Array<Record<string, unknown>> = [];
+	let releaseA!: () => void, releaseB!: () => void, readyA!: () => void, readyB!: () => void;
+	const waits = [new Promise<void>((resolve) => { releaseA = resolve; }), new Promise<void>((resolve) => { releaseB = resolve; })];
+	const ready = [new Promise<void>((resolve) => { readyA = resolve; }), new Promise<void>((resolve) => { readyB = resolve; })];
+	let captures = 0;
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => {
+			requests.push(request);
+			const index = requests.length - 1;
+			if (index < 2) { [readyA, readyB][index]!(); await waits[index]!; }
+			const lineageId = String(request.lineageId);
+			return status(lineageId, [inputs.get(lineageId)!]);
+		},
+		captureCorrectionPlan: async ({ argumentTokens }: { argumentTokens: readonly string[] }) => {
+			captures += 1;
+			const lineageId = argumentTokens.find((token) => token.startsWith("--lineage="))!.slice("--lineage=".length);
+			return { schema: "gentle-ai.review-last-event-closure/v1", operation: "review.capture-correction-plan", lineageId, state: "correction_required", storeRevision: SHA };
+		},
+	} as unknown as NativeReviewCli;
+	const { controller, capture, sessionShutdown } = reviewRuntime(native, new CandidateViewRegistry());
+	const contexts = [a, b].map((id) => ({ ...reviewContext(process.cwd()), sessionManager: { getSessionId: () => id } } as unknown as ExtensionContext));
+	const listedA = controller.execute("", { operation: "status", lineageId: a, input: JSON.stringify({ baseRef: "base-a", committedOnly: true }) }, undefined, undefined, contexts[0]!);
+	await ready[0];
+	const listedB = controller.execute("", { operation: "status", lineageId: b, input: JSON.stringify({ baseRef: "base-b", committedOnly: true }) }, undefined, undefined, contexts[1]!);
+	await ready[1]; releaseA(); await listedA; releaseB();
+	const [resultA, resultB] = await Promise.all([listedA, listedB]);
+	const ownA = await capture.execute("", { lineageId: a, collectBinding: bindingOf(resultA.details as Record<string, unknown>), correctionLines: 1 }, undefined, undefined, contexts[0]!);
+	const ownB = await capture.execute("", { lineageId: b, collectBinding: bindingOf(resultB.details as Record<string, unknown>), correctionLines: 1 }, undefined, undefined, contexts[1]!);
+	const foreign = await capture.execute("", { lineageId: a, collectBinding: bindingOf(resultA.details as Record<string, unknown>), correctionLines: 1 }, undefined, undefined, contexts[1]!);
+	await sessionShutdown({}, contexts[0]!);
+	const cleaned = await capture.execute("", { lineageId: a, collectBinding: bindingOf(resultA.details as Record<string, unknown>), correctionLines: 1 }, undefined, undefined, contexts[0]!);
+	assert.deepEqual({
+		outcomes: [ownA, ownB, foreign, cleaned].map(({ details }) => (details as { outcome?: string }).outcome),
+		revalidationCalls: requests.length - 2,
+		captures,
+	}, { outcomes: ["native-last-event-closure", "native-last-event-closure", "capture-binding-rejected", "capture-binding-rejected"], revalidationCalls: 2, captures: 2 });
+});
+
+test("REPAIR retains frozen committed collect selectors and leaves workspace routes unselected", async (t) => {
+	const candidateViews = new CandidateViewRegistry(); t.after(() => candidateViews.cleanupAll());
+	const cwd = repository(t), lineageId = "repair-committed", input = correctionPlanInput(lineageId); const view = candidateViews.create({ contributorRoot: cwd, baseRef: execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim(), committedOnly: true });
+	candidateViews.retain(view.token, lineageId); const frozenTarget = candidateViews.resolveProjection(lineageId, cwd), selections = new Map(), requests: Array<Record<string, unknown>> = [];
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => { requests.push(request); return requests.length === 3 ? status(lineageId, [], "approved") : status(lineageId, [input]); },
+		captureCorrectionPlan: async () => { throw Object.assign(new Error("lost response"), { mutationOutcome: "unknown", nextAction: "review.status" }); },
+	} as unknown as NativeReviewCli;
+	await __testing.executeReviewControllerOperation({ operation: "repair", lineageId }, cwd, native, undefined, candidateViews, undefined, selections);
+	const result = await __testing.executeReviewCaptureOperation({ lineageId, collectBinding: JSON.stringify(input), correctionLines: 1 }, cwd, native, undefined, candidateViews, selections, true);
+	const workspaceLineage = "repair-workspace", workspaceRequests: Array<Record<string, unknown>> = [];
+	await __testing.executeReviewControllerOperation({ operation: "repair", lineageId: workspaceLineage }, cwd, { targetStatus: async (request: Record<string, unknown>) => { workspaceRequests.push(request); return status(workspaceLineage); } } as unknown as NativeReviewCli, undefined, candidateViews);
+	assert.deepEqual({ outcome: result.outcome, routes: selections.size, selectors: requests.map(({ cwd: requestCwd, lineageId: id, baseRef, committedOnly }) => ({ cwd: requestCwd, lineageId: id, baseRef, committedOnly })) }, { outcome: "native-capture-outcome-unknown", routes: 0, selectors: Array.from({ length: 3 }, () => ({ cwd, lineageId, baseRef: frozenTarget.baseCommit, committedOnly: true })) });
+	assert.deepEqual(workspaceRequests, [{ cwd, lineageId: workspaceLineage }]);
+});
+
+test("route retention caps, rejects collisions and invalid selectors, and clears every terminal state", async () => {
+	const native = { targetStatus: async (request: Record<string, unknown>) => status(String(request.lineageId)) } as unknown as NativeReviewCli;
+	const selections = new Map();
+	for (let index = 0; index <= 64; index += 1) await __testing.executeReviewControllerOperation({ operation: "status", lineageId: `bounded-${index}`, input: JSON.stringify({ baseRef: `base-${index}`, committedOnly: true }) }, process.cwd(), native, undefined, undefined, undefined, selections);
+	const evicted = await __testing.executeReviewCaptureOperation({ lineageId: "bounded-0", collectBinding: JSON.stringify(collectInput("bounded-0")) }, process.cwd(), native, undefined, undefined, selections, true);
+	const collision = new Map(), lineageId = "route-collision", input = correctionPlanInput(lineageId);
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId, input: JSON.stringify({ baseRef: "base-a", committedOnly: true }) }, process.cwd(), { targetStatus: async () => status(lineageId, [input]) } as unknown as NativeReviewCli, undefined, undefined, undefined, collision);
+	const rejected = await __testing.executeReviewControllerOperation({ operation: "status", lineageId, input: JSON.stringify({ baseRef: "base-b", committedOnly: true }) }, process.cwd(), { targetStatus: async () => status(lineageId, [input]) } as unknown as NativeReviewCli, undefined, undefined, undefined, collision);
+	for (const state of ["invalidated", "approved", "escalated"]) {
+		const routes = new Map(), id = `terminal-${state}`;
+		await __testing.executeReviewControllerOperation({ operation: "status", lineageId: id, input: JSON.stringify({ baseRef: "base", committedOnly: true }) }, process.cwd(), { targetStatus: async () => status(id, [input]) } as unknown as NativeReviewCli, undefined, undefined, undefined, routes);
+		await __testing.executeReviewControllerOperation({ operation: "status", lineageId: id }, process.cwd(), { targetStatus: async () => status(id, [], state) } as unknown as NativeReviewCli, undefined, undefined, undefined, routes);
+		assert.equal(routes.size, 0, state);
+	}
+	let calls = 0;
+	for (const value of [{ baseRef: "", committedOnly: true }, { committedOnly: true }, { baseRef: "base" }, { baseRef: "base", committedOnly: false }]) {
+		const result = await __testing.executeReviewControllerOperation({ operation: "status", input: JSON.stringify(value) }, process.cwd(), { targetStatus: async () => { calls += 1; return status("unreachable"); } } as unknown as NativeReviewCli);
+		assert.equal(result.outcome, "native-status-input-invalid");
+	}
+	assert.deepEqual({ routes: selections.size, evicted: evicted.outcome, collision: rejected.outcome, calls }, { routes: 64, evicted: "capture-binding-rejected", collision: "capture-route-registration-rejected", calls: 0 });
 });
 
 test("public INSPECT and STATUS publish the exact pi-bound binding that capture revalidates", async () => {
@@ -199,24 +292,31 @@ interface RegisteredControllerTool {
 function reviewRuntime(nativeReviewCli: NativeReviewCli, candidateViews: CandidateViewRegistry) {
 	const tools = new Map<string, RegisteredControllerTool>();
 	let toolCall: ((event: { toolName: string; input: unknown }, ctx: ExtensionContext) => Promise<unknown>) | undefined;
+	let sessionShutdown: ((event: unknown, ctx: ExtensionContext) => unknown) | undefined;
 	createGentleAiExtension({ nativeReviewCli, candidateViews })({
-		on(name: string, handler: (event: { toolName: string; input: unknown }, ctx: ExtensionContext) => Promise<unknown>) { if (name === "tool_call") toolCall = handler; },
+		on(name: string, handler: (event: { toolName: string; input: unknown }, ctx: ExtensionContext) => Promise<unknown>) {
+			if (name === "tool_call") toolCall = handler;
+			if (name === "session_shutdown") sessionShutdown = handler as unknown as (event: unknown, ctx: ExtensionContext) => unknown;
+		},
 		registerTool(definition: RegisteredControllerTool & { name: string }) { tools.set(definition.name, definition); },
 		registerCommand() {},
 	} as unknown as ExtensionAPI);
 	const controller = tools.get("gentle_review");
+	const capture = tools.get("gentle_review_capture");
 	assert.ok(controller);
+	assert.ok(capture);
 	assert.ok(toolCall);
-	return { controller, toolCall };
+	assert.ok(sessionShutdown);
+	return { controller, capture, toolCall, sessionShutdown };
 }
 
 function reviewContext(cwd: string): ExtensionContext {
 	return { cwd, hasUI: false, ui: { confirm: async () => true } } as unknown as ExtensionContext;
 }
 
-function startStatus(cwd: string): ReviewStatusV3 {
+function startStatus(cwd: string, baseRef?: string): ReviewStatusV3 {
 	const candidateViews = new CandidateViewRegistry();
-	const view = candidateViews.create({ contributorRoot: cwd });
+	const view = candidateViews.create({ contributorRoot: cwd, ...(baseRef === undefined ? {} : { baseRef, committedOnly: true }) });
 	try {
 		return {
 			contract: "gentle-ai.review-integration/v2",
@@ -622,6 +722,39 @@ test("ordinary START keeps default and explicit base selection fail-closed befor
 		assert.equal(rejected.mutation_outcome, "none");
 	}
 	assert.equal(targetCalls, 0);
+});
+
+test("START and consent ambiguity reconciliation register their returned committed collect route", async (t) => {
+	const cwd = repository(t), baseRef = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim();
+	const lineageId = "reconciled-collect", input = correctionPlanInput(lineageId), unknown = () => { throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, "review/start", true, true, "unknown mutation"); };
+	const selectors = (requests: readonly Record<string, unknown>[]) => requests.map(({ baseRef: base, committedOnly }) => ({ baseRef: base, committedOnly }));
+	const directRequests: Array<Record<string, unknown>> = [], directRoutes = new Map();
+	const directNative = {
+		targetStatus: async (request: Record<string, unknown>) => { directRequests.push(request); return directRequests.length === 1 ? startStatus(cwd, baseRef) : status(lineageId, [input]); },
+		start: unknown,
+		captureCorrectionPlan: async () => ({ schema: "gentle-ai.review-last-event-closure/v1", operation: "review.capture-correction-plan", lineageId, state: "correction_required", storeRevision: SHA }),
+	} as unknown as NativeReviewCli;
+	await __testing.executeReviewControllerOperation({ operation: "start", input: JSON.stringify({ mode: "ordinary", baseRef, committedOnly: true }) }, cwd, directNative, undefined, undefined, undefined, directRoutes);
+	const directCapture = await __testing.executeReviewCaptureOperation({ lineageId, collectBinding: JSON.stringify(input), correctionLines: 1 }, cwd, directNative, undefined, undefined, directRoutes, true);
+	const consent = decodeReviewConsentV3(JSON.parse(readFileSync(join(process.cwd(), "tests", "fixtures", "devbinary", "consent-v3.captured.json"), "utf8")));
+	const consentRequests: Array<Record<string, unknown>> = [], consentRoutes = new Map(), registry = new PendingReviewConsentRegistry(), session = Symbol("consent-session");
+	const consentNative = {
+		targetStatus: async (request: Record<string, unknown>) => { consentRequests.push(request); return consentRequests.length === 1 ? startStatus(cwd, baseRef) : status(lineageId, [input]); },
+		start: async () => { throw new NativeReviewConsentRequiredError(consent); },
+		answerConsent: unknown,
+		captureCorrectionPlan: directNative.captureCorrectionPlan,
+	} as unknown as NativeReviewCli;
+	const run = (parameters: Record<string, unknown>) => __testing.executeReviewControllerOperation(parameters, cwd, consentNative, undefined, undefined, undefined, consentRoutes, registry, session);
+	const pending = await run({ operation: "start", input: JSON.stringify({ mode: "ordinary", baseRef, committedOnly: true }) });
+	await run({ operation: "answer-consent", input: JSON.stringify({ consentBinding: pending.consent_binding, answer: "granted" }) });
+	const consentCapture = await __testing.executeReviewCaptureOperation({ lineageId, collectBinding: JSON.stringify(input), correctionLines: 1 }, cwd, consentNative, undefined, undefined, consentRoutes, true);
+	assert.deepEqual({
+		outcomes: [directCapture.outcome, consentCapture.outcome],
+		selectors: [selectors(directRequests), selectors(consentRequests)],
+	}, {
+		outcomes: ["native-last-event-closure", "native-last-event-closure"],
+		selectors: [Array.from({ length: 3 }, () => ({ baseRef, committedOnly: true })), Array.from({ length: 3 }, () => ({ baseRef, committedOnly: true }))],
+	});
 });
 
 test("ordinary START refuses a target projection that no longer matches the frozen candidate", async (t) => {

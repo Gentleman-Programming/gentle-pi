@@ -467,6 +467,7 @@ export interface NativeTargetStatusRequest extends NativeUntrackedSelectionReque
 	cwd: string;
 	lineageId?: string;
 	baseRef?: string;
+	committedOnly?: boolean;
 	projection?: "workspace" | "staged";
 	/**
 	 * The immutable reviewer runtime this host provides. Measured against the
@@ -1867,7 +1868,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		const status = await this.targetStatus({
 			cwd: request.cwd,
 			projection,
-			...(request.baseRef === undefined ? {} : { baseRef: request.baseRef }),
+			...(request.baseRef === undefined ? {} : { baseRef: request.baseRef, committedOnly: true }),
 			...(request.lineageId === undefined ? {} : { lineageId: request.lineageId }),
 			...selection,
 			agent: "pi",
@@ -1966,12 +1967,15 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 	}
 
 	async targetStatus(request: NativeTargetStatusRequest): Promise<ReviewStatusV3> {
+		if (request.baseRef !== undefined && !isCanonicalProcessString(request.baseRef)) throw new TypeError("Native STATUS baseRef must be a non-empty, trimmed, NUL-free string");
+		if (request.baseRef !== undefined && request.committedOnly !== true) throw new TypeError("Native STATUS baseRef requires explicit committedOnly acknowledgement");
+		if (request.baseRef === undefined && request.committedOnly !== undefined) throw new TypeError("Native STATUS committedOnly requires an explicit baseRef");
 		const selection = nativeUntrackedSelection(request);
 		const execution = await this.negotiated(NATIVE_REVIEW_OPERATION.STATUS, request.cwd, [
 			"review", "status", "--contract", REVIEW_INTEGRATION_CONTRACT, "--cwd", request.cwd,
 			"--projection", request.projection ?? "workspace",
 			...nativeUntrackedSelectionArguments(selection),
-			...(request.baseRef === undefined ? [] : ["--base-ref", request.baseRef]),
+			...(request.baseRef === undefined ? [] : ["--base-ref", request.baseRef, "--committed-only"]),
 			...(request.lineageId === undefined ? [] : ["--lineage", request.lineageId]),
 			...(request.agent === undefined ? [] : ["--agent", request.agent]),
 			"--next-transition",

@@ -184,6 +184,7 @@ test("negotiated STATUS forwards its exact ordered workspace, base, lineage, and
 		cwd: "/repo with spaces",
 		projection: "staged",
 		baseRef: "origin/main",
+		committedOnly: true,
 		lineageId: "review-current",
 		agent: "pi",
 		untrackedScope: "select",
@@ -194,10 +195,38 @@ test("negotiated STATUS forwards its exact ordered workspace, base, lineage, and
 	assert.deepEqual(queue.calls[0]?.arguments, [
 		"review", "status", "--contract", "gentle-ai.review-integration/v2", "--cwd", "/repo with spaces",
 		"--projection", "staged", "--untracked-scope=select", "--expected-untracked-inventory=inventory-sha256",
-		"--intended-untracked=new.txt", "--intended-untracked=nested/other.txt", "--base-ref", "origin/main",
+		"--intended-untracked=new.txt", "--intended-untracked=nested/other.txt", "--base-ref", "origin/main", "--committed-only",
 		"--lineage", "review-current", "--agent", "pi", "--next-transition",
 	]);
 	assert.equal(queue.calls[0]?.timeoutMs, 30_000);
+});
+
+test("negotiated STATUS emits the explicit committed selector argv", async () => {
+	const queue = queuedAdapter([{ stdout: JSON.stringify(currentStatusFixture()) }]);
+	await client(queue.adapter).targetStatus({
+		cwd: "/repo",
+		baseRef: "refs/heads/main",
+		committedOnly: true,
+	});
+	assert.deepEqual(queue.calls[0]?.arguments, [
+		"review", "status", "--contract", "gentle-ai.review-integration/v2", "--cwd", "/repo",
+		"--projection", "workspace", "--base-ref", "refs/heads/main", "--committed-only", "--next-transition",
+	]);
+});
+
+test("negotiated STATUS rejects malformed committed selectors before launching a process", async () => {
+	for (const request of [
+		{ cwd: "/repo", baseRef: "", committedOnly: true },
+		{ cwd: "/repo", baseRef: 42, committedOnly: true },
+		{ cwd: "/repo", committedOnly: true },
+		{ cwd: "/repo", baseRef: "refs/heads/main" },
+		{ cwd: "/repo", baseRef: "refs/heads/main", committedOnly: false },
+		{ cwd: "/repo", baseRef: "refs/heads/main", committedOnly: "true" },
+	]) {
+		const queue = queuedAdapter([]);
+		await assert.rejects(() => client(queue.adapter).targetStatus(request), TypeError);
+		assert.equal(queue.calls.length, 0);
+	}
 });
 
 test("negotiated STATUS rejects malformed untracked selection before launching a process", async () => {
