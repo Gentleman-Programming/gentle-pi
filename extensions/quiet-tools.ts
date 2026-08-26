@@ -9,7 +9,7 @@ import {
 	createWriteTool,
 	keyHint,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, type Component } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
 import { isAbsolute } from "node:path";
 import { resolveGentleAiDevBinaryOverride, type GentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
@@ -156,21 +156,69 @@ function isGitCommand(args: Record<string, unknown> | undefined): boolean {
 
 export type GentleAiRoutineCommand = "sdd-status" | "sdd-continue" | "sdd-attempt" | "review";
 
-const SHELL_COMMAND_ASSIGNMENT = String.raw`\w+=(?:'[^']*'|"[^"]*"|\S+)`;
-const SHELL_COMMAND_PREFIX = String.raw`(?:env\s+(?:${SHELL_COMMAND_ASSIGNMENT}\s+)?|command(?:\s+--)?\s+|${SHELL_COMMAND_ASSIGNMENT}\s+)*`;
-const GENTLE_AI_EXECUTABLE = String.raw`(?:gentle-ai(?:\.exe)?|'gentle-ai(?:\.exe)?'|"gentle-ai(?:\.exe)?"|gentle\\-ai(?:\.exe|\\\.exe)?|(?:\.{1,2}[\\/]|(?:[A-Za-z]:)?(?:[\\/][^\\/\s]+)*[\\/])\.gentle-ai[\\/]v\d+\.\d+\.\d+[\\/]gentle-ai(?:\.exe)?)`;
-const GENTLE_AI_COMMAND_ARGUMENTS = new RegExp(String.raw`^${SHELL_COMMAND_PREFIX}${GENTLE_AI_EXECUTABLE}(?:\s+(.*))?$`);
+const GENTLE_AI_EXECUTABLE = String.raw`(?:gentle-ai(?:\.exe)?|(?:\.{1,2}[\\/]|(?:[A-Za-z]:)?(?:[\\/][^\\/\s]+)*[\\/])\.gentle-ai[\\/]v\d+\.\d+\.\d+[\\/]gentle-ai(?:\.exe)?)`;
+const GENTLE_AI_COMMAND_ARGUMENTS = new RegExp(`^${GENTLE_AI_EXECUTABLE}$`);
 
 function createGentleAiCommandArguments(activeDevBinaryPath?: string): RegExp {
 	if (!activeDevBinaryPath) return GENTLE_AI_COMMAND_ARGUMENTS;
 	const escapedPath = activeDevBinaryPath.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
-	const executableForms = [escapedPath];
-	if (!activeDevBinaryPath.includes("'")) executableForms.push(`'${escapedPath}'`);
-	if (!activeDevBinaryPath.includes('"')) executableForms.push(`"${escapedPath}"`);
-	const executable = `(?:${GENTLE_AI_EXECUTABLE}|(?:${executableForms.join("|")}))`;
-	return new RegExp(String.raw`^${SHELL_COMMAND_PREFIX}${executable}(?:\s+(.*))?$`);
+	return new RegExp(`^(?:${GENTLE_AI_EXECUTABLE}|${escapedPath})$`);
 }
-const SHELL_EXPANSION_OR_COMPOSITION = /[;&|`<>\r\n$#]/;
+
+function shellTokens(command: string): string[] | undefined {
+	const tokens: string[] = [];
+	let token = "";
+	let quote: "single" | "double" | undefined;
+	let tokenStarted = false;
+	const push = () => {
+		if (tokenStarted) tokens.push(token);
+		token = "";
+		tokenStarted = false;
+	};
+	for (let index = 0; index < command.length; index += 1) {
+		const character = command[index]!;
+		if (character === "\r" || character === "\n") return undefined;
+		if (quote === "single") {
+			if (character === "'") quote = undefined;
+			else token += character;
+			continue;
+		}
+		if (quote === "double") {
+			if (character === '"') { quote = undefined; continue; }
+			if (character === "\\") {
+				const next = command[++index];
+				if (next === undefined || next === "\r" || next === "\n") return undefined;
+				token += "$`\"\\".includes(next) ? next : `\\${next}`;
+				continue;
+			}
+			if (character === "$" || character === "`") return undefined;
+			token += character;
+			continue;
+		}
+		if (/\s/.test(character)) { push(); continue; }
+		if (character === "'") { quote = "single"; tokenStarted = true; continue; }
+		if (character === '"') { quote = "double"; tokenStarted = true; continue; }
+		if (character === "\\") {
+			const next = command[++index];
+			if (next === undefined || next === "\r" || next === "\n") return undefined;
+			const windowsPath = token === "." || /^[A-Za-z]:$/.test(token) || token.includes("\\");
+			token += windowsPath ? `\\${next}` : next;
+			tokenStarted = true;
+			continue;
+		}
+		if (";&|<>`()".includes(character) || character === "$" || character === "`") return undefined;
+		if (character === "#" && !tokenStarted) return undefined;
+		token += character;
+		tokenStarted = true;
+	}
+	if (quote) return undefined;
+	push();
+	return tokens;
+}
+
+function isAssignment(token: string): boolean {
+	return /^[A-Za-z_][A-Za-z0-9_]*=/.test(token);
+}
 const SDD_ATTEMPT_VERBS = new Set(["acquire", "settle", "grant"]);
 
 const REVIEW_DIRECT_OPERATIONS = new Set([
@@ -213,14 +261,22 @@ const REVIEW_SCHEMA_NAMES = new Set([
 
 function gentleAiCommandTokens(args: Record<string, unknown> | undefined, commandArguments = GENTLE_AI_COMMAND_ARGUMENTS): string[] | undefined {
 	const rawCommand = typeof args?.command === "string" ? args.command : "";
-	if (SHELL_EXPANSION_OR_COMPOSITION.test(rawCommand)) return undefined;
-	const command = rawCommand.trim();
-	const match = commandArguments.exec(command);
-	if (!match) return undefined;
-	const argumentsText = match[1]?.trim();
-	return argumentsText === undefined || argumentsText.length === 0
-		? []
-		: argumentsText.split(/\s+/);
+	const tokens = shellTokens(rawCommand);
+	if (!tokens) return undefined;
+	let index = 0;
+	while (isAssignment(tokens[index] ?? "")) index += 1;
+	if (tokens[index] === "env") {
+		index += 1;
+		while (isAssignment(tokens[index] ?? "")) index += 1;
+		if ((tokens[index] ?? "").startsWith("-")) return undefined;
+	}
+	if (tokens[index] === "command") {
+		index += 1;
+		if (tokens[index] === "--") index += 1;
+		else if ((tokens[index] ?? "").startsWith("-")) return undefined;
+	}
+	if (!commandArguments.test(tokens[index] ?? "")) return undefined;
+	return tokens.slice(index + 1);
 }
 
 function displayToken(token: string): string {
@@ -451,6 +507,20 @@ function formatToolCall(toolName: QuietToolName, args: Record<string, unknown>, 
 	}
 }
 
+class BoundedRows implements Component {
+	private readonly sections: readonly { text: string; rows: number }[];
+
+	constructor(sections: readonly { text: string; rows: number }[]) {
+		this.sections = sections;
+	}
+
+	render(width: number): string[] {
+		return this.sections.flatMap(({ text, rows }) => new Text(text, 0, 0).render(width).slice(0, rows));
+	}
+
+	invalidate(): void {}
+}
+
 function partialLabel(toolName: QuietToolName, text: string): string {
 	const lineCount = outputLines(text).length;
 	return lineCount === 0
@@ -516,10 +586,12 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArg
 				return renderGentleAiResult(safeResult, { expanded: options.expanded });
 			}
 			if (options.isPartial) {
-				const visible = options.expanded ? text : lastOutputLines(text, PREVIEW_LINE_LIMIT);
-				const label = theme.fg("warning", partialLabel(toolName, text));
-				const output = visible ? `${label}\n${theme.fg("muted", visible)}` : label;
-				return new Text(output, 0, 0);
+				if (options.expanded) return new Text(`${theme.fg("warning", partialLabel(toolName, text))}\n${theme.fg("muted", text)}`, 0, 0);
+				const visible = lastOutputLines(text, PREVIEW_LINE_LIMIT);
+				return new BoundedRows([
+					{ text: theme.fg("warning", partialLabel(toolName, text)), rows: 1 },
+					...(visible ? [{ text: theme.fg("muted", visible), rows: PREVIEW_LINE_LIMIT }] : []),
+				]);
 			}
 			if (options.expanded && toolName === "read" && hasImageContent(safeResult) && officialRenderResult) {
 				return officialRenderResult(
@@ -538,7 +610,14 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArg
 				? `\n${keyHint("app.tools.expand", "to expand")}`
 				: "";
 			const color = options.expanded ? "toolOutput" : isError ? "error" : "muted";
-			return new Text(output || hint ? theme.fg(color, `${output}${hint}`) : "", 0, 0);
+			if (options.expanded) return new Text(output ? theme.fg(color, output) : "", 0, 0);
+			if (output) {
+				return new BoundedRows([
+					{ text: theme.fg(color, output.replace(/^\n/, "")), rows: PREVIEW_LINE_LIMIT },
+					...(hint ? [{ text: theme.fg(color, hint.slice(1)), rows: 1 }] : []),
+				]);
+			}
+			return new Text(hint ? theme.fg(color, hint.slice(1)) : "", 0, 0);
 		},
 	});
 }

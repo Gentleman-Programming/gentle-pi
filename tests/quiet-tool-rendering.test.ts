@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { initTheme, keyHint } from "@earendil-works/pi-coding-agent";
-import { imageFallback } from "@earendil-works/pi-tui";
+import { imageFallback, visibleWidth } from "@earendil-works/pi-tui";
 import piPretty from "../extensions/pi-pretty.ts";
 import quietTools, {
 	countNonEmptyLines,
@@ -49,8 +49,12 @@ function routineRenderContext(overrides: Record<string, unknown> = {}) {
 	};
 }
 
-function renderToString(component: { render(width: number): string[] }): string {
-	return component.render(120).map((line) => line.trimEnd()).join("\n");
+function renderLines(component: { render(width: number): string[] }, width = 120): string[] {
+	return component.render(width).map((line) => line.trimEnd());
+}
+
+function renderToString(component: { render(width: number): string[] }, width = 120): string {
+	return renderLines(component, width).join("\n");
 }
 
 function textResult(text: string, details?: unknown) {
@@ -819,6 +823,73 @@ test("quiet tool rendering call rows show tool calls without result output", () 
 	assert.match(bashCall, /\$ printf noisy \(timeout 5s\)/);
 	assert.match(grepCall, /grep \/needle\/ in src \(\*\.ts\)/);
     });
+
+test("quiet tool rendering limits collapsed visual rows at the actual width", () => {
+	const tools = registeredQuietTools();
+	const bash = tools.get("bash");
+	const hint = keyHint("app.tools.expand", "to expand");
+	const narrowWidth = 12;
+	const cases = [
+		[textResult("x".repeat(80)), { expanded: false, isPartial: true }, { args: { command: "printf output" } }, 4],
+		[textResult("界".repeat(40)), { expanded: false, isPartial: false }, { args: { command: "printf output" } }, 4],
+		[textResult("e\u0301".repeat(40)), { expanded: false, isPartial: false, isError: true }, { args: { command: "false" }, isError: true }, 4],
+	] as const;
+	for (const [result, options, context, maxRows] of cases) {
+		const lines = renderLines(bash.renderResult(result, options, passthroughTheme, context), narrowWidth);
+		assert.ok(lines.length <= maxRows, `expected at most ${maxRows} rows, got ${lines.length}`);
+		assert.ok(lines.every((line) => visibleWidth(line) <= narrowWidth));
+	}
+	const completed = renderLines(bash.renderResult(textResult("😀".repeat(40)), { expanded: false, isPartial: false }, passthroughTheme, { args: { command: "printf output" } }), narrowWidth);
+	assert.equal(completed.filter((line) => line.includes(hint)).length, 1);
+	assert.ok(completed.every((line) => visibleWidth(line) <= narrowWidth));
+});
+
+test("quiet tool rendering classifies quoted and escaped literal shell metacharacters as direct Gentle AI calls", () => {
+	const tool = registeredQuietTools().get("bash");
+	for (const command of [
+		"gentle-ai review status '--note=$|#;'",
+		'"gentle-ai" review status "literal \\$|#;"',
+		"gentle\\-ai review status escaped\\ space",
+	]) {
+		const call = renderToString(tool.renderCall({ command }, passthroughTheme, { args: { command } }));
+		const collapsed = renderToolResult(tool, textResult("private output"), { expanded: false, isPartial: false }, { args: { command } });
+		assert.match(call, /🌹︎ Gentle AI · running · review status/, command);
+		assert.doesNotMatch(collapsed, /private output/, command);
+	}
+});
+
+test("quiet tool rendering keeps unescaped expansions inside double quotes generic", () => {
+	const tool = registeredQuietTools().get("bash");
+	const commands = [
+		'gentle-ai review status "$VALUE"',
+		'gentle-ai review status "$(printf nested)"',
+		'gentle-ai review status "`printf nested`"',
+	] as const;
+
+	for (const command of commands) {
+		const call = renderToString(tool.renderCall({ command }, passthroughTheme, { args: { command } }));
+		const collapsed = renderToolResult(
+			tool,
+			textResult("original command output"),
+			{ expanded: false, isPartial: false },
+			{ args: { command } },
+		);
+		assert.equal(gentleAiRoutineCommand({ command }), undefined, command);
+		assert.equal(call.trimEnd(), `$ ${command}`, command);
+		assert.match(collapsed, /original command output/, command);
+	}
+});
+
+test("quiet tool rendering recognizes a quoted exact dev override path containing spaces", () => {
+	const devPath = "/opt/Gentle AI/gentle-ai";
+	const tool = registeredQuietToolsWithResolver(() => ({ path: devPath })).get("bash");
+	const command = `"${devPath}" review status "literal \\$|#;"`;
+	const call = renderToString(tool.renderCall({ command }, passthroughTheme, { args: { command } }));
+	const collapsed = renderToolResult(tool, textResult("private result"), { expanded: false, isPartial: false }, { args: { command } });
+	assert.equal(call.trimEnd(), "🌹︎ Gentle AI · running · review status");
+	assert.doesNotMatch(call, /\/opt\/Gentle AI\/gentle-ai|literal/);
+	assert.doesNotMatch(collapsed, /private result/);
+});
 
 test("quiet tool rendering bounds and sanitizes partial text without a completion hint", () => {
 	const tool = registeredQuietTools().get("bash");
