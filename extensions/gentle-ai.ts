@@ -4551,7 +4551,17 @@ async function executeReviewControllerOperation(
 		const pending = pendingReviewConsentRegistry.get(pendingReviewConsentSession)?.get(input.consentBinding);
 		if (pending === undefined || pending.expiresAt <= reviewConsentNow()) {
 			if (pending !== undefined) cleanupPendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession);
-			throw new Error("Review controller consent binding is unknown, expired, or already consumed");
+			if (nativeReviewCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
+			try {
+				const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
+					cwd: defaultCwd,
+					...(signal === undefined ? {} : { signal }),
+				}, retainedUntrackedSelections, defaultCwd);
+				if (negotiated.transport !== undefined) return hostTransportUnavailable(parameters.operation, negotiated.transport);
+				return mapNativeTargetStatus(parameters.operation, negotiated.status!);
+			} catch (error) {
+				return nativeStatusFailed(parameters.operation, error);
+			}
 		}
 		if (realpathSync(defaultCwd) !== pending.repositoryCwd) throw new Error("Review controller consent repository binding changed");
 		if (reviewConsentDigest(pending.consent) !== pending.consentDigest) throw new Error("Review controller consent envelope binding changed");

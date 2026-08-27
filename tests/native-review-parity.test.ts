@@ -10,8 +10,10 @@ import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 import {
 	NATIVE_REVIEW_ERROR_CODE,
 	NATIVE_REVIEW_MODE_OPERATION,
+	NATIVE_REVIEW_OPERATION,
 	NativeReviewCliError,
 	NativeReviewCliV216,
+	NativeReviewIntegrationError,
 	NativeReviewConsentRequiredError,
 	nativeRiskEvidencePhrases,
 	normalizeNativeReviewCwd,
@@ -20,6 +22,7 @@ import {
 } from "../lib/native-review-cli.ts";
 import {
 	decodeReviewConsentV3,
+	decodeReviewFailureV2,
 	decodeReviewLastEventClosureV1,
 	decodeReviewStartV3,
 	type ReviewStatusV3,
@@ -392,29 +395,26 @@ test("public consent relay is session-bound, one-shot, and candidate-scoped", as
 
 	const blockedA = await beginConsent(first, cwd, "session-a");
 	assert.deepEqual(blockedA.consent, decodeReviewConsentV3(captured("consent-v3.captured.json")).raw);
-	await assert.rejects(
-		() => answerConsent(second, cwd, blockedA.consent_binding, "declined", "session-b"),
-		/unknown, expired, or already consumed/,
-	);
+	const staleOtherSession = await answerConsent(second, cwd, blockedA.consent_binding, "declined", "session-b");
+	assert.equal(staleOtherSession.operation, "answer-consent");
+	assert.equal(staleOtherSession.status, "ready");
 	assert.deepEqual(fixture.answers, ["declined"]);
 	const blockedB = await beginConsent(second, cwd, "session-b");
 	const declined = await answerConsent(second, cwd, blockedB.consent_binding, "declined", "session-b");
 	assert.equal(declined.outcome, "consent-declined-this-candidate");
 	assert.equal(declined.lineage_created, false);
-	await assert.rejects(
-		() => answerConsent(second, cwd, blockedB.consent_binding, "declined", "session-b"),
-		/unknown, expired, or already consumed/,
-	);
+	const staleConsumed = await answerConsent(second, cwd, blockedB.consent_binding, "declined", "session-b");
+	assert.equal(staleConsumed.operation, "answer-consent");
+	assert.equal(staleConsumed.status, "ready");
 	assert.deepEqual(fixture.answers, ["declined", "declined"]);
 
 	const shutdown = first.events.get("session_shutdown");
 	assert.ok(shutdown);
 	await shutdown!({}, context(cwd, "session-a"));
 	await shutdown!({}, context(cwd, "session-a"));
-	await assert.rejects(
-		() => answerConsent(first, cwd, blockedA.consent_binding, "declined", "session-a"),
-		/unknown, expired, or already consumed/,
-	);
+	const staleShutdown = await answerConsent(first, cwd, blockedA.consent_binding, "declined", "session-a");
+	assert.equal(staleShutdown.operation, "answer-consent");
+	assert.equal(staleShutdown.status, "ready");
 
 	writeFileSync(join(cwd, "app.ts"), "export const value = 3;\n");
 	const nextCandidate = await beginConsent(second, cwd, "session-b");
@@ -427,11 +427,118 @@ test("public consent relay is session-bound, one-shot, and candidate-scoped", as
 	const disable = second.commands.get("gentle:review-mode");
 	assert.ok(disable);
 	await disable!.handler("disable", context(cwd, "session-b"));
-	await assert.rejects(
-		() => answerConsent(second, cwd, nextCandidate.consent_binding, "declined", "session-b"),
-		/unknown, expired, or already consumed/,
-	);
+	const staleModeCleared = await answerConsent(second, cwd, nextCandidate.consent_binding, "declined", "session-b");
+	assert.equal(staleModeCleared.operation, "answer-consent");
+	assert.equal(staleModeCleared.status, "ready");
 	assert.equal(fixture.starts.count, 4);
+});
+
+test("stale local consent bindings reconcile exactly once with the native status transition", async (t) => {
+	const cwd = repository(t);
+	const fixture = consentNative(cwd);
+	const nextTransition = {
+		kind: "execute",
+		reason_code: "fresh_start_available",
+		execute: { operation: "review.start", arguments: ["opaque-native-start-token"] },
+	};
+	const reconciledStatus = {
+		...startStatus(cwd),
+		raw: { schema: "gentle-ai.review-integration.status/v5", next_transition: nextTransition },
+	} as ReviewStatusV3;
+	const statusRequests: Array<{ agent?: string }> = [];
+	fixture.native.targetStatus = async (request) => {
+		statusRequests.push(request);
+		return reconciledStatus;
+	};
+	const runtime = parityRuntime(fixture.native);
+	const blocked = await beginConsent(runtime, cwd);
+	await answerConsent(runtime, cwd, blocked.consent_binding, "declined");
+
+	const reconciled = await answerConsent(runtime, cwd, blocked.consent_binding, "declined");
+	assert.equal(reconciled.operation, "answer-consent");
+	assert.equal(reconciled.status, "ready");
+	assert.deepEqual(reconciled.result, reconciledStatus.raw);
+	assert.deepEqual((reconciled.result as { next_transition?: unknown }).next_transition, nextTransition);
+	assert.equal(statusRequests.length, 2, "the stale binding performs one reconciliation after the initial START status");
+	assert.equal(statusRequests[1]?.agent, "pi", "stale binding reconciliation must retain the Pi host transport identity");
+	assert.equal(fixture.starts.count, 1, "stale binding recovery must not start a new review automatically");
+	assert.deepEqual(fixture.answers, ["declined"], "stale binding recovery must not replay answer-consent");
+});
+
+test("stale local consent bindings preserve a typed native STATUS failure", async (t) => {
+	const cwd = repository(t);
+	const fixture = consentNative(cwd);
+	const runtime = parityRuntime(fixture.native);
+	const blocked = await beginConsent(runtime, cwd);
+	await answerConsent(runtime, cwd, blocked.consent_binding, "declined");
+	fixture.native.targetStatus = async () => {
+		throw new NativeReviewCliError(
+			NATIVE_REVIEW_ERROR_CODE.TIMEOUT,
+			NATIVE_REVIEW_OPERATION.STATUS,
+			true,
+			false,
+			"native STATUS timed out",
+		);
+	};
+
+	const failed = await answerConsent(runtime, cwd, blocked.consent_binding, "declined");
+	assert.equal(failed.operation, "answer-consent");
+	assert.equal(failed.status, "blocked");
+	assert.equal(failed.outcome, "native-status-unavailable");
+	assert.deepEqual(failed.diagnostics, {
+		operation: NATIVE_REVIEW_OPERATION.STATUS,
+		error_code: NATIVE_REVIEW_ERROR_CODE.TIMEOUT,
+		timed_out: false,
+		output_limit_exceeded: false,
+	});
+	assert.equal(fixture.starts.count, 1, "native STATUS failure must not start a new review");
+	assert.deepEqual(fixture.answers, ["declined"], "native STATUS failure must not replay answer-consent");
+
+	delete fixture.native.targetStatus;
+	const unsupported = await answerConsent(runtime, cwd, blocked.consent_binding, "declined");
+	assert.equal(unsupported.operation, "answer-consent");
+	assert.equal(unsupported.status, "blocked");
+	assert.equal(unsupported.outcome, "native-status-unsupported");
+	assert.equal(fixture.starts.count, 1, "unavailable native STATUS must not start a new review");
+	assert.deepEqual(fixture.answers, ["declined"], "unavailable native STATUS must not replay answer-consent");
+});
+
+test("stale local consent bindings retain typed Pi transport refusal without an agentless retry", async (t) => {
+	const cwd = repository(t);
+	const fixture = consentNative(cwd);
+	const statusRequests: Array<{ agent?: string }> = [];
+	fixture.native.targetStatus = async (request) => {
+		statusRequests.push(request);
+		throw new NativeReviewIntegrationError(decodeReviewFailureV2({
+			schema: "gentle-ai.review-integration.failure/v2",
+			contract: "gentle-ai.review-integration/v2",
+			operation: "review.status",
+			phase: "preflight",
+			code: "unsupported_agent",
+			message: "The native provider does not support Pi host transport.",
+			mutation_outcome: "not_started",
+			authority_applicability: "not_evaluated",
+			retry_safe: true,
+			replayability: "not_replayable",
+			required_inputs: [],
+			next_action: "review.status",
+		}));
+	};
+	const runtime = parityRuntime(fixture.native);
+
+	const refused = await answerConsent(runtime, cwd, "missing-consent-binding", "declined");
+	assert.equal(refused.operation, "answer-consent");
+	assert.equal(refused.status, "blocked");
+	assert.equal(refused.outcome, "pi-host-relay-transport-unavailable");
+	assert.deepEqual(refused.relay_transport, {
+		supported: false,
+		code: "unsupported_agent",
+		message: "The native provider does not support Pi host transport.",
+	});
+	assert.equal(statusRequests.length, 1, "typed Pi transport refusal must not retry STATUS without an agent");
+	assert.equal(statusRequests[0]?.agent, "pi");
+	assert.equal(fixture.starts.count, 0, "stale binding transport refusal must not start a review");
+	assert.deepEqual(fixture.answers, [], "stale binding transport refusal must not replay answer-consent");
 });
 
 test("unavailable and ambiguous consent follow-ups never replay a consumed binding", async (t) => {
@@ -460,10 +567,11 @@ test("unavailable and ambiguous consent follow-ups never replay a consumed bindi
 	const outcome = await answerConsent(ambiguousRuntime, cwd, ambiguous.consent_binding, "granted");
 	assert.equal(outcome.operation, "answer-consent");
 	assert.ok(statusCalls >= 2, "ambiguous consent re-enters read-only STATUS after the initial START status");
-	await assert.rejects(
-		() => answerConsent(ambiguousRuntime, cwd, ambiguous.consent_binding, "granted"),
-		/unknown, expired, or already consumed/,
-	);
+	const callsBeforeStaleReconciliation = statusCalls;
+	const stale = await answerConsent(ambiguousRuntime, cwd, ambiguous.consent_binding, "granted");
+	assert.equal(stale.operation, "answer-consent");
+	assert.equal(stale.status, "ready");
+	assert.equal(statusCalls, callsBeforeStaleReconciliation + 1, "stale binding reconciliation performs exactly one additional STATUS call");
 });
 
 test("pending public consent expiry is synchronous and a fresh registry never replays lost state", async (t) => {
@@ -486,10 +594,9 @@ test("pending public consent expiry is synchronous and a fresh registry never re
 	const second = await beginConsent(runtime, cwd);
 	assert.notEqual(second.consent_binding, first.consent_binding);
 	assert.equal(scheduled.length, 2);
-	await assert.rejects(
-		() => answerConsent(runtime, cwd, first.consent_binding, "declined"),
-		/unknown, expired, or already consumed/,
-	);
+	const expired = await answerConsent(runtime, cwd, first.consent_binding, "declined");
+	assert.equal(expired.operation, "answer-consent");
+	assert.equal(expired.status, "ready");
 
 	const reloaded = parityRuntime(fixture.native, { pendingReviewConsentRegistry: new PendingReviewConsentRegistry() });
 	const afterReload = await beginConsent(reloaded, cwd);
