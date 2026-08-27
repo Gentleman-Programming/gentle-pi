@@ -3379,10 +3379,16 @@ interface PendingReviewConsent {
 	expiry?: ReturnType<typeof setTimeout>;
 }
 
+interface PendingReviewConsentClaim {
+	sessionKey: PendingReviewConsentSessionKey;
+	pending: PendingReviewConsent;
+}
+
 /**
  * Process-memory-only pending consent partitions. A loaded extension module
- * shares this registry across registrations, while exact Pi session IDs remain
- * the only continuity boundary. It intentionally has no persistence surface.
+ * shares this registry across registrations. Session buckets own cleanup, while
+ * an opaque binding can be claimed once by any active session. It intentionally
+ * has no persistence surface.
  */
 export class PendingReviewConsentRegistry {
 	private readonly sessions = new Map<PendingReviewConsentSessionKey, Map<string, PendingReviewConsent>>();
@@ -3405,6 +3411,16 @@ export class PendingReviewConsentRegistry {
 		if (session?.get(pending.id) !== pending) return;
 		session.delete(pending.id);
 		if (session.size === 0) this.sessions.delete(sessionKey);
+	}
+
+	claim(id: string): PendingReviewConsentClaim | undefined {
+		for (const [sessionKey, session] of this.sessions) {
+			const pending = session.get(id);
+			if (pending === undefined) continue;
+			consumePendingReviewConsent(pending, this, sessionKey);
+			return { sessionKey, pending };
+		}
+		return undefined;
 	}
 
 	take(sessionKey: PendingReviewConsentSessionKey): PendingReviewConsent[] {
@@ -4564,9 +4580,11 @@ async function executeReviewControllerOperation(
 		if (Object.keys(input).some((key) => key !== "consentBinding" && key !== "answer") || Object.keys(input).length !== 2) throw new Error("Review controller answer-consent input must contain exactly consentBinding and answer");
 		if (typeof input.consentBinding !== "string" || input.consentBinding.length === 0) throw new Error("Review controller answer-consent requires an opaque consentBinding");
 		if (input.answer !== "granted" && input.answer !== "declined") throw new Error("Review controller answer-consent answer must be granted or declined");
-		const pending = pendingReviewConsentRegistry.get(pendingReviewConsentSession)?.get(input.consentBinding);
+		const pendingClaim = pendingReviewConsentRegistry.claim(input.consentBinding);
+		const pending = pendingClaim?.pending;
+		const pendingSession = pendingClaim?.sessionKey;
 		if (pending === undefined || pending.expiresAt <= reviewConsentNow()) {
-			if (pending !== undefined) cleanupPendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession);
+			if (pending !== undefined && pendingSession !== undefined) cleanupPendingReviewConsent(pending, pendingReviewConsentRegistry, pendingSession);
 			if (nativeReviewCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
 			try {
 				const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
@@ -4586,7 +4604,7 @@ async function executeReviewControllerOperation(
 		try {
 			const gated = await resolveReviewModeGate(nativeReviewCli, parameters.operation, defaultCwd, signal);
 			if (gated !== undefined) {
-				cleanupPendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession);
+				cleanupPendingReviewConsent(pending, pendingReviewConsentRegistry, pendingSession!);
 				return gated;
 			}
 		} catch (error) {
@@ -4594,7 +4612,6 @@ async function executeReviewControllerOperation(
 		}
 		// The one-shot binding is consumed before the provider mutation. Any
 		// ambiguous result reconciles through STATUS and can never be replayed.
-		consumePendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession);
 		let completed: Record<string, unknown>;
 		try {
 			const answered = await nativeReviewCli.answerConsent({

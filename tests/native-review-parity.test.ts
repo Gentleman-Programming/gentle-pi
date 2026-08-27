@@ -383,7 +383,7 @@ test("public gentle:review-mode handler reports current operations, global-off w
 	assert.deepEqual(unavailableNotices, [{ message: "Gentle AI review mode is not available with the currently negotiated native version.", type: "info" }]);
 });
 
-test("public consent relay is session-bound, one-shot, and candidate-scoped", async (t) => {
+test("public consent relay is one-shot and candidate-scoped across active sessions", async (t) => {
 	const cwd = repository(t);
 	const sharedRegistry = new PendingReviewConsentRegistry();
 	const fixture = consentNative(cwd);
@@ -395,10 +395,9 @@ test("public consent relay is session-bound, one-shot, and candidate-scoped", as
 
 	const blockedA = await beginConsent(first, cwd, "session-a");
 	assert.deepEqual(blockedA.consent, decodeReviewConsentV3(captured("consent-v3.captured.json")).raw);
-	const staleOtherSession = await answerConsent(second, cwd, blockedA.consent_binding, "declined", "session-b");
-	assert.equal(staleOtherSession.operation, "answer-consent");
-	assert.equal(staleOtherSession.status, "ready");
-	assert.deepEqual(fixture.answers, ["declined"]);
+	const crossSessionDeclined = await answerConsent(second, cwd, blockedA.consent_binding, "declined", "session-b");
+	assert.equal(crossSessionDeclined.outcome, "consent-declined-this-candidate");
+	assert.deepEqual(fixture.answers, ["declined", "declined"]);
 	const blockedB = await beginConsent(second, cwd, "session-b");
 	const declined = await answerConsent(second, cwd, blockedB.consent_binding, "declined", "session-b");
 	assert.equal(declined.outcome, "consent-declined-this-candidate");
@@ -406,7 +405,7 @@ test("public consent relay is session-bound, one-shot, and candidate-scoped", as
 	const staleConsumed = await answerConsent(second, cwd, blockedB.consent_binding, "declined", "session-b");
 	assert.equal(staleConsumed.operation, "answer-consent");
 	assert.equal(staleConsumed.status, "ready");
-	assert.deepEqual(fixture.answers, ["declined", "declined"]);
+	assert.deepEqual(fixture.answers, ["declined", "declined", "declined"]);
 
 	const shutdown = first.events.get("session_shutdown");
 	assert.ok(shutdown);
@@ -431,6 +430,51 @@ test("public consent relay is session-bound, one-shot, and candidate-scoped", as
 	assert.equal(staleModeCleared.operation, "answer-consent");
 	assert.equal(staleModeCleared.status, "ready");
 	assert.equal(fixture.starts.count, 4);
+});
+
+test("active shared consent bindings continue across session boundaries exactly once", async (t) => {
+	const cwd = repository(t);
+	const candidateViews = new CandidateViewRegistry();
+	const sharedRegistry = new PendingReviewConsentRegistry();
+	const fixture = consentNative(cwd);
+	const answer = fixture.native.answerConsent!;
+	fixture.native.answerConsent = async (request) => {
+		const result = await answer(request);
+		return { ...result, start: { ...result.start!, state: "reviewing", action: "created", lensesRequired: true, selectedLenses: ["review-risk"] } };
+	};
+	const expiry = { registered: 0, fired: 0 };
+	const sessionA = parityRuntime(fixture.native, {
+		candidateViews,
+		pendingReviewConsentRegistry: sharedRegistry,
+		scheduleTimer: (callback) => {
+			expiry.registered += 1;
+			return setTimeout(() => {
+				expiry.fired += 1;
+				callback();
+			}, 0);
+		},
+	});
+	const sessionB = parityRuntime(fixture.native, { pendingReviewConsentRegistry: sharedRegistry });
+	const blocked = await beginConsent(sessionA, cwd, "session-a");
+	const completed = await answerConsent(sessionB, cwd, blocked.consent_binding, "granted", "session-b");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.deepEqual(expiry, { registered: 1, fired: 0 });
+
+	assert.deepEqual(
+		{
+			answers: fixture.answers,
+			lineageId: (completed.result as { lineage_id?: string }).lineage_id,
+			activeLineageId: candidateViews.currentLineageId(cwd),
+			status: completed.status,
+		},
+		{
+			answers: ["granted"],
+			lineageId: "consent-lineage",
+			activeLineageId: "consent-lineage",
+			status: undefined,
+		},
+	);
+	candidateViews.cleanupAll();
 });
 
 test("stale local consent bindings reconcile exactly once with the native status transition", async (t) => {
