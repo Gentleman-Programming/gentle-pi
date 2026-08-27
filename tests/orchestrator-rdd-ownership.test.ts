@@ -63,6 +63,16 @@ test("static prompts retain normal SDD and delegated-work guidance", () => {
 	}
 });
 
+test("always-on parent prompt requires a narrow writer edit surface before launch", () => {
+	assert.match(core, /Before launching (?:a )?bounded writer/i);
+	assert.match(core, /`gentle-ai-worker`/);
+	assert.match(core, /`worker`/);
+	assert.match(core, /## Allowed edit surfaces/);
+	assert.match(core, /repository-relative/i);
+	assert.match(core, /never `\.`|never a bare repository root/i);
+	assert.match(core, /do not ask the human to author paths or globs/i);
+});
+
 test("review integration documents the opaque Pi adapter and Go-owned authority boundary", () => {
 	const docs = read("docs/review-integration.md");
 	for (const marker of [

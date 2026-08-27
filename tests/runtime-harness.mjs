@@ -509,6 +509,64 @@ async function run() {
 		assert.equal(missingReviewView.block, true);
 		assert.match(missingReviewView.reason, /candidate view/i);
 		assert.equal(reviewDispatch.task, "review", "blocked review dispatch must not mutate child input");
+
+		for (const [agent, label, task] of [
+			["gentle-ai-worker", "missing", "Implement the requested change."],
+			["gentle-ai-worker", "absolute", "## Allowed edit surfaces\n/tmp/outside.ts"],
+			["gentle-ai-worker", "Windows absolute", "## Allowed edit surfaces\nC:\\outside.ts"],
+			["gentle-ai-worker", "prose instead of paths", "## Allowed edit surfaces\nThe parent will determine the paths."],
+			["gentle-ai-worker", "repository root", "## Allowed edit surfaces\n."],
+			["gentle-ai-worker", "bare repository root", "## Allowed edit surfaces\n./"],
+			["gentle-ai-worker", "normalized bare repository root", "## Allowed edit surfaces\n.//"],
+			["gentle-ai-worker", "equivalent normalized bare repository root", "## Allowed edit surfaces\n././/"],
+			["worker", "generic writer missing", "Implement the requested change."],
+		]) {
+			const writerDispatch = { agent, task, mode: "task" };
+			const writerResult = await toolHook(
+				{ toolName: "subagent_run", input: writerDispatch },
+				createCtx(toolCwd),
+			);
+			assert.equal(writerResult?.block, true, `${label} writer scope must be blocked before dispatch`);
+			assert.match(writerResult?.reason ?? "", /derive|map/i);
+			assert.match(writerResult?.reason ?? "", /relaunch/i);
+			assert.match(writerResult?.reason ?? "", /do not ask.*human.*paths or globs/i);
+			assert.equal(writerDispatch.task, task, "writer guard must not mutate child input");
+		}
+
+		const scopedWriterDispatch = {
+			agent: "gentle-ai-worker",
+			task: "Implement the requested change.\n\n## Allowed edit surfaces\nextensions/gentle-ai.ts\ntests/runtime-harness.mjs",
+			mode: "task",
+		};
+		assert.equal(
+			await toolHook({ toolName: "subagent_run", input: scopedWriterDispatch }, createCtx(toolCwd)),
+			undefined,
+			"a writer may dispatch with narrow task-scoped repository-relative paths",
+		);
+		assert.equal(
+			await toolHook(
+				{
+					toolName: "subagent_run",
+					input: {
+						agent: "worker",
+						task: "Implement the requested change.",
+						context: "## Allowed edit surfaces\n- assets/orchestrator.md",
+						mode: "task",
+					},
+				},
+				createCtx(toolCwd),
+			),
+			undefined,
+			"a writer may dispatch when context carries narrow task-scoped repository-relative paths",
+		);
+		assert.equal(
+			await toolHook(
+				{ toolName: "subagent_run", input: { agent: "scout", task: "Map the repository.", mode: "task" } },
+				createCtx(toolCwd),
+			),
+			undefined,
+			"non-writer subagents must remain unaffected",
+		);
 		const sensitiveRead = await toolHook({ toolName: "read", input: { path: join(toolCwd, ".env.local") } }, createCtx(toolCwd));
 		assert.equal(sensitiveRead.block, true);
 		assert.match(sensitiveRead.reason, /sensitive path/);

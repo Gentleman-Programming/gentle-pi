@@ -976,6 +976,10 @@ test("gentle-ai-worker packages the exact scoped writer contract", () => {
 	const contextContract = readMarkdownSection(source, "Context contract");
 	assert.match(contextContract, /pre-existing untracked targets explicitly listed by the parent/);
 	assert.match(contextContract, /new files required by the delegated task/);
+	assert.match(contextContract, /derived candidate set the human can approve or narrow/);
+	assert.match(contextContract, /never an open request for the human to author paths or globs/);
+	assert.match(interactionContract, /closed set the human can approve, decline, or select from/);
+	assert.match(interactionContract, /never ask the human to author paths, globs, identifiers, or commands as free text/);
 
 	const implementationRules = readMarkdownSection(source, "Implementation rules");
 	assert.match(implementationRules, /`blocked` only for a non-human technical blocker/);

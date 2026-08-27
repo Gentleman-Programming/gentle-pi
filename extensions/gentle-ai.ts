@@ -455,6 +455,71 @@ function renderBackgroundSubagentsReport(
 
 const SUBAGENTS_PACKAGE_NAMES = ["pi-subagents-j0k3r", "pi-subagents"] as const;
 const SUBAGENT_RUN_TOOL = "subagent_run";
+const BOUNDED_WRITER_AGENT_NAMES = ["gentle-ai-worker", "worker"] as const;
+const ALLOWED_EDIT_SURFACES_HEADING = /^## Allowed edit surfaces[ \t]*$/gim;
+const WRITER_EDIT_SURFACE_REJECTION =
+	"Parent must derive or map narrow repository-relative allowed edit surfaces from the delegated task and relaunch the writer. Do not ask the human to author paths or globs.";
+
+function isTaskScopedRepositoryRelativePath(value: string): boolean {
+	const normalized = value.replace(/\\/g, "/");
+	if (
+		normalized.length === 0 ||
+		isAbsolute(value) ||
+		/^(?:[A-Za-z]:|\/|~)/.test(normalized)
+	) {
+		return false;
+	}
+
+	const withoutCurrentDirectory = normalized.replace(/^(?:\.\/)+/, "");
+	if (
+		withoutCurrentDirectory.length === 0 ||
+		withoutCurrentDirectory === "." ||
+		withoutCurrentDirectory.startsWith("/") ||
+		/\s/.test(withoutCurrentDirectory) ||
+		withoutCurrentDirectory.split("/").some((segment) => segment === "..")
+	) {
+		return false;
+	}
+
+	return !/[?*\[\]{}]/.test(withoutCurrentDirectory.split("/")[0]);
+}
+
+function hasTaskScopedAllowedEditSurfaces(value: unknown): boolean {
+	if (typeof value !== "string") return false;
+
+	const headings = value.matchAll(ALLOWED_EDIT_SURFACES_HEADING);
+	for (const heading of headings) {
+		const bodyStart = (heading.index ?? 0) + heading[0].length;
+		const following = value.slice(bodyStart);
+		const nextHeading = following.search(/\n#{1,2}\s+/);
+		const section = following.slice(0, nextHeading === -1 ? undefined : nextHeading);
+		const entries = section
+			.split(/\r?\n/)
+			.map((line) => line.trim().replace(/^(?:[-*+]|\d+[.)])\s+/, ""))
+			.filter((line) => line.length > 0)
+			.map((line) => {
+				const codePath = line.match(/^`(.+)`$/);
+				return codePath?.[1] ?? line;
+			});
+		if (entries.length > 0 && entries.every(isTaskScopedRepositoryRelativePath)) return true;
+	}
+
+	return false;
+}
+
+function rejectUnscopedBoundedWriterDispatch(input: unknown): { block: true; reason: string } | undefined {
+	if (
+		!isRecord(input) ||
+		typeof input.agent !== "string" ||
+		!(BOUNDED_WRITER_AGENT_NAMES as readonly string[]).includes(input.agent)
+	) {
+		return undefined;
+	}
+	if (hasTaskScopedAllowedEditSurfaces(input.task) || hasTaskScopedAllowedEditSurfaces(input.context)) {
+		return undefined;
+	}
+	return { block: true, reason: WRITER_EDIT_SURFACE_REJECTION };
+}
 
 /**
  * Roots where an installed subagents package may live. These are the same
@@ -5145,6 +5210,8 @@ function createGentleAiExtensionForTesting(
 		);
 		if (sensitivePathDenied) return sensitivePathDenied;
 		if (event.toolName === "subagent_run") {
+			const writerScopeDenied = rejectUnscopedBoundedWriterDispatch(event.input);
+			if (writerScopeDenied) return writerScopeDenied;
 			try {
 				injectReviewCandidateView(event.input, candidateViews);
 				return undefined;
