@@ -484,27 +484,43 @@ function isTaskScopedRepositoryRelativePath(value: string): boolean {
 	return !/[?*\[\]{}]/.test(withoutCurrentDirectory.split("/")[0]);
 }
 
-function hasTaskScopedAllowedEditSurfaces(value: unknown): boolean {
-	if (typeof value !== "string") return false;
+function hasTaskScopedAllowedEditSurfaces(...values: unknown[]): boolean {
+	let expectedEntries: string[] | undefined;
+	let hasSection = false;
 
-	const headings = value.matchAll(ALLOWED_EDIT_SURFACES_HEADING);
-	for (const heading of headings) {
-		const bodyStart = (heading.index ?? 0) + heading[0].length;
-		const following = value.slice(bodyStart);
-		const nextHeading = following.search(/\n#{1,2}\s+/);
-		const section = following.slice(0, nextHeading === -1 ? undefined : nextHeading);
-		const entries = section
-			.split(/\r?\n/)
-			.map((line) => line.trim().replace(/^(?:[-*+]|\d+[.)])\s+/, ""))
-			.filter((line) => line.length > 0)
-			.map((line) => {
-				const codePath = line.match(/^`(.+)`$/);
-				return codePath?.[1] ?? line;
-			});
-		if (entries.length > 0 && entries.every(isTaskScopedRepositoryRelativePath)) return true;
+	for (const value of values) {
+		if (typeof value !== "string") continue;
+
+		const headings = value.matchAll(ALLOWED_EDIT_SURFACES_HEADING);
+		for (const heading of headings) {
+			const bodyStart = (heading.index ?? 0) + heading[0].length;
+			const following = value.slice(bodyStart);
+			const nextHeading = following.search(/\n#{1,2}\s+/);
+			const section = following.slice(0, nextHeading === -1 ? undefined : nextHeading);
+			const entries = section
+				.split(/\r?\n/)
+				.map((line) => line.trim().replace(/^(?:[-*+]|\d+[.)])\s+/, ""))
+				.filter((line) => line.length > 0)
+				.map((line) => {
+					const codePath = line.match(/^`(.+)`$/);
+					return codePath?.[1] ?? line;
+				});
+			if (entries.length === 0 || !entries.every(isTaskScopedRepositoryRelativePath)) return false;
+
+			const uniqueEntries = [...new Set(entries)].sort();
+			if (
+				expectedEntries &&
+				(expectedEntries.length !== uniqueEntries.length ||
+					expectedEntries.some((entry, index) => entry !== uniqueEntries[index]))
+			) {
+				return false;
+			}
+			expectedEntries = uniqueEntries;
+			hasSection = true;
+		}
 	}
 
-	return false;
+	return hasSection;
 }
 
 function rejectUnscopedBoundedWriterDispatch(input: unknown): { block: true; reason: string } | undefined {
@@ -515,7 +531,7 @@ function rejectUnscopedBoundedWriterDispatch(input: unknown): { block: true; rea
 	) {
 		return undefined;
 	}
-	if (hasTaskScopedAllowedEditSurfaces(input.task) || hasTaskScopedAllowedEditSurfaces(input.context)) {
+	if (hasTaskScopedAllowedEditSurfaces(input.task, input.context)) {
 		return undefined;
 	}
 	return { block: true, reason: WRITER_EDIT_SURFACE_REJECTION };

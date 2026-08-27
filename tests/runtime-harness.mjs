@@ -559,6 +559,52 @@ async function run() {
 			undefined,
 			"a writer may dispatch when context carries narrow task-scoped repository-relative paths",
 		);
+		for (const [label, input] of [
+			[
+				"valid scope followed by a repository-root scope",
+				{
+					agent: "gentle-ai-worker",
+					task: "## Allowed edit surfaces\nextensions/gentle-ai.ts\n\n## Allowed edit surfaces\n.",
+					mode: "task",
+				},
+			],
+			[
+				"valid task scope plus invalid context scope",
+				{
+					agent: "gentle-ai-worker",
+					task: "## Allowed edit surfaces\nextensions/gentle-ai.ts",
+					context: "## Allowed edit surfaces\n.",
+					mode: "task",
+				},
+			],
+			[
+				"conflicting valid task and context scopes",
+				{
+					agent: "gentle-ai-worker",
+					task: "## Allowed edit surfaces\nextensions/gentle-ai.ts",
+					context: "## Allowed edit surfaces\ntests/runtime-harness.mjs",
+					mode: "task",
+				},
+			],
+		]) {
+			const writerResult = await toolHook({ toolName: "subagent_run", input }, createCtx(toolCwd));
+			assert.equal(writerResult?.block, true, `${label} must block writer dispatch`);
+		}
+		assert.equal(
+			await toolHook(
+				{
+					toolName: "subagent_run",
+					input: {
+						agent: "gentle-ai-worker",
+						task: "## Allowed edit surfaces\nextensions/gentle-ai.ts\ntests/runtime-harness.mjs\n\n## Allowed edit surfaces\n- `tests/runtime-harness.mjs`\n- `extensions/gentle-ai.ts`",
+						mode: "task",
+					},
+				},
+				createCtx(toolCwd),
+			),
+			undefined,
+			"a writer may dispatch when multiple allowed edit surface sections are compatible",
+		);
 		assert.equal(
 			await toolHook(
 				{ toolName: "subagent_run", input: { agent: "scout", task: "Map the repository.", mode: "task" } },
