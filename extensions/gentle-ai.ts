@@ -98,6 +98,7 @@ import {
 import { renderGentleAiLifecycleCall, renderGentleAiResult, type GentleAiRenderContext } from "../lib/gentle-ai-renderer.ts";
 import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
 import { CandidateViewError, CandidateViewRegistry, injectReviewCandidateView, readCandidateContextManifestPage, resolveCanonicalCandidateBase, type CandidateView } from "../lib/review-candidate-view.ts";
+import { admitDelegation } from "../lib/agent-runtime/delegation-admission.ts";
 import {
 	GentleAiDevBinaryOverrideError,
 	registerGentleAiDevBinary,
@@ -5155,15 +5156,16 @@ function createGentleAiExtensionForTesting(
 		);
 		if (sensitivePathDenied) return sensitivePathDenied;
 		if (event.toolName === "subagent_run") {
-			try {
-				injectReviewCandidateView(event.input, candidateViews);
-				return undefined;
-			} catch (error) {
-				return {
-					block: true,
-					reason: error instanceof Error ? error.message : "review subagent dispatch is invalid",
-				};
+			const delegation = admitDelegation({
+				toolName: event.toolName,
+				input: event.input,
+				candidateViews,
+				injectReviewCandidateView,
+			});
+			if (delegation.kind === "block") {
+				return { block: true, reason: delegation.reason };
 			}
+			return undefined;
 		}
 		if (event.toolName !== "bash") return undefined;
 		if (!isRecord(event.input) || typeof event.input.command !== "string") {
