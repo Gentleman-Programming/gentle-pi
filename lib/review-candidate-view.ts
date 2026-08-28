@@ -1,6 +1,6 @@
 import { execFileSync, type ExecFileSyncOptions } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -103,6 +103,7 @@ interface CandidateViewRecord {
 	baseTree: string;
 	candidateTree: string;
 	committedOnly: boolean;
+	intendedUntracked?: readonly string[];
 	entries: readonly CandidateViewEntry[];
 	gitlinks: readonly CandidateGitlink[];
 	scope: CandidateViewScope;
@@ -114,10 +115,12 @@ interface CandidateViewRecord {
 export interface CandidateView {
 	token: string;
 	root: string;
+	contributorRoot: string;
 	baseCommit: string;
 	baseTree: string;
 	candidateTree: string;
 	committedOnly: boolean;
+	intendedUntracked?: readonly string[];
 	paths: readonly string[];
 	modes: Readonly<Record<string, string>>;
 	gitlinks: Readonly<Record<string, string>>;
@@ -159,6 +162,7 @@ export interface FrozenCandidateProjection {
 	baseTree: string;
 	candidateTree: string;
 	committedOnly: boolean;
+	intendedUntracked?: readonly string[];
 	paths: readonly string[];
 	modes: Readonly<Record<string, string>>;
 	gitlinks: Readonly<Record<string, string>>;
@@ -169,6 +173,8 @@ export interface CreateCandidateViewRequest {
 	contributorRoot: string;
 	baseRef?: string;
 	committedOnly?: boolean;
+	/** Undefined keeps legacy all-untracked capture; [] excludes untracked files. */
+	intendedUntracked?: readonly string[];
 	replayKey?: string;
 }
 
@@ -185,6 +191,7 @@ export interface AuthoritativeReviewingCandidateState {
 	baseTree: string;
 	candidateTree: string;
 	committedOnly?: boolean;
+	intendedUntracked?: readonly string[];
 	paths: readonly string[];
 	modes: Readonly<Record<string, string>>;
 	gitlinks?: Readonly<Record<string, string>>;
@@ -758,6 +765,34 @@ function addUnbornWorktree(cwd: string, root: string, branch: string, env: NodeJ
 	git(root, ["symbolic-ref", "HEAD", `refs/heads/${branch}`], env, executor);
 }
 
+function normalizeIntendedUntracked(paths: readonly string[] | undefined): readonly string[] | undefined {
+	if (paths === undefined) return undefined;
+	if (!Array.isArray(paths) || paths.some((path) => !isSafeCandidatePath(path)) || new Set(paths).size !== paths.length) {
+		throw new CandidateViewError("candidate intended-untracked selection is invalid");
+	}
+	return Object.freeze([...paths]);
+}
+
+function isErrnoCode(error: unknown, code: string): boolean {
+	return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
+function seedPrivateIndexFromLiveIndex(cwd: string, indexPath: string, executor: CandidateGitExecutor): boolean {
+	const liveIndex = resolve(cwd, git(cwd, ["rev-parse", "--path-format=absolute", "--git-path", "index"], process.env, executor));
+	const entry = lstatSync(liveIndex, { throwIfNoEntry: false });
+	if (entry === undefined) return false; if (!entry.isFile()) throw new CandidateViewError("candidate live Git index is not a regular file");
+	copyFileSync(liveIndex, indexPath);
+	for (const name of readdirSync(dirname(liveIndex))) if (/^sharedindex\.[0-9a-f]+$/.test(name)) {
+		try {
+			const sharedIndex = join(dirname(liveIndex), name);
+			if (lstatSync(sharedIndex).isFile()) copyFileSync(sharedIndex, join(dirname(indexPath), name));
+		} catch (error) {
+			if (!isErrnoCode(error, "ENOENT")) throw error;
+		}
+	}
+	return true;
+}
+
 function materializeCandidateView(request: CreateCandidateViewRequest, executor: CandidateGitExecutor): CandidateViewRecord {
 	const contributorRoot = realpathSync(request.contributorRoot);
 	if (!lstatSync(contributorRoot).isDirectory()) throw new CandidateViewError("contributor root is not a directory");
@@ -766,6 +801,7 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 	const canonicalCommonDir = realpathSync(commonDir);
 	const base = resolveCandidateBase(contributorRoot, request.baseRef, process.env, executor);
 	const committedOnly = request.committedOnly === true;
+	const intendedUntracked = normalizeIntendedUntracked(request.intendedUntracked);
 	const candidateCommit = committedOnly
 		? resolveCandidateBase(contributorRoot, "HEAD", process.env, executor)
 		: base;
@@ -776,11 +812,21 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 	try {
 		const baseCommit = base.commit;
 		const unborn = baseCommit === "HEAD";
-		// For an unborn repository the base tree is Git's empty tree, so seed the
-		// private candidate index from `--empty` instead of a non-existent commit.
-		if (unborn) git(contributorRoot, ["read-tree", "--empty"], environment, executor);
-		else git(contributorRoot, ["read-tree", candidateCommit.commit], environment, executor);
-		if (!committedOnly) git(contributorRoot, ["add", "-A"], environment, executor);
+		// Workspace candidates seed their isolated index from the resolved live index; missing indexes use the frozen base.
+		const seededFromLiveIndex = !committedOnly && intendedUntracked !== undefined && seedPrivateIndexFromLiveIndex(contributorRoot, indexPath, executor);
+		if (!seededFromLiveIndex) {
+			// For an unborn repository the base tree is Git's empty tree, so seed the
+			// private candidate index from `--empty` instead of a non-existent commit.
+			if (unborn) git(contributorRoot, ["read-tree", "--empty"], environment, executor);
+			else git(contributorRoot, ["read-tree", candidateCommit.commit], environment, executor);
+		}
+		if (!committedOnly) {
+			if (intendedUntracked === undefined) git(contributorRoot, ["add", "-A"], environment, executor);
+			else {
+				git(contributorRoot, ["add", "-u"], environment, executor);
+				if (intendedUntracked.length > 0) git(contributorRoot, ["add", "--", ...intendedUntracked], { ...environment, GIT_LITERAL_PATHSPECS: "1" }, executor);
+			}
+		}
 		const candidateTree = git(contributorRoot, ["write-tree"], environment, executor);
 		const root = join(parent, randomUUID());
 		// The worktree is created under the same try/catch cleanup boundary as
@@ -803,7 +849,7 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 			const scope = deriveChangedScope(contributorRoot, base.tree, candidateTree, [...tree.entries, ...tree.gitlinks], executor);
 			for (const gitlink of tree.gitlinks) if (lstatSync(join(root, gitlink.path), { throwIfNoEntry: false })) throw new CandidateViewError("candidate view materialized a metadata-only gitlink");
 			makeReadonly(root, entries);
-			return { token: basename(root), root: realpathSync(root), parent, contributorRoot, commonDir: canonicalCommonDir, baseCommit, baseTree: base.tree, candidateTree, committedOnly, entries, gitlinks: tree.gitlinks, scope, gitExecutor: executor };
+			return { token: basename(root), root: realpathSync(root), parent, contributorRoot, commonDir: canonicalCommonDir, baseCommit, baseTree: base.tree, candidateTree, committedOnly, intendedUntracked, entries, gitlinks: tree.gitlinks, scope, gitExecutor: executor };
 		} catch (error) {
 			try { git(contributorRoot, ["worktree", "remove", "--force", root], process.env, executor); } catch { rmSync(root, { recursive: true, force: true }); }
 			throw error;
@@ -814,6 +860,20 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 }
 
 function assertRecordSafe(record: CandidateViewRecord): void {
+	try {
+		const contributor = lstatSync(record.contributorRoot);
+		if (!contributor.isDirectory() || contributor.isSymbolicLink() || realpathSync(record.contributorRoot) !== record.contributorRoot) {
+			throw new CandidateViewError("candidate contributor root identity changed", "contributor-root-drift");
+		}
+		const toplevel = realpathSync(git(record.contributorRoot, ["rev-parse", "--show-toplevel"], process.env, record.gitExecutor));
+		const commonDir = realpathSync(resolve(record.contributorRoot, git(record.contributorRoot, ["rev-parse", "--git-common-dir"], process.env, record.gitExecutor)));
+		if (toplevel !== record.contributorRoot || commonDir !== record.commonDir) {
+			throw new CandidateViewError("candidate contributor root Git identity changed", "contributor-root-drift");
+		}
+	} catch (error) {
+		if (error instanceof CandidateViewError) throw error;
+		throw new CandidateViewError("candidate contributor root identity cannot be verified", "contributor-root-drift");
+	}
 	const root = record.root;
 	if (!isWithin(record.parent, root) || !existsSync(root)) throw new CandidateViewError("candidate view is missing or moved");
 	const rootStat = lstatSync(root);
@@ -853,27 +913,111 @@ export class CandidateViewRegistry {
 	constructor(gitExecutor: CandidateGitExecutor = defaultCandidateGitExecutor) {
 		this.gitExecutor = gitExecutor;
 	}
+	// Lifecycle state is scoped to the canonical target worktree as well as the
+	// provider lineage. Lineage text is repository-local and may legitimately be
+	// identical in two repositories owned by one Pi session.
 	private readonly lineages = new Map<string, string>();
 	private readonly projections = new Map<string, FrozenCandidateProjection>();
 	private readonly replays = new Map<string, string>();
-	private current: { lineageId: string; token: string } | undefined;
+	private readonly current = new Map<string, { lineageId: string; token: string }>();
 	// The last dispatch-binding hydration that was attempted and failed. A
 	// swallowed hydration failure is its own defect (field report 2026-08-16):
 	// without it the later dispatch refusal claims no binding was ever
 	// available instead of naming the attempt and its typed cause.
-	private lastHydrationFailure: { lineageId: string; reason: string; message: string } | undefined;
+	private readonly lastHydrationFailures = new Map<string, { lineageId: string; reason: string; message: string }>();
+
+	private canonicalRoot(contributorRoot: string): string {
+		try {
+			return realpathSync(contributorRoot);
+		} catch {
+			throw new CandidateViewError("candidate contributor root could not be resolved", "contributor-root-unresolvable");
+		}
+	}
+
+	private lineageKey(contributorRoot: string, lineageId: string): string {
+		return `${this.canonicalRoot(contributorRoot)}\u0000${lineageId}`;
+	}
+
+	private replayKey(contributorRoot: string, replayKey: string): string {
+		return `${this.canonicalRoot(contributorRoot)}\u0000${replayKey}`;
+	}
+
+	private uniqueKey(
+		entries: ReadonlyMap<string, unknown>,
+		lineageId: string,
+		contributorRoot: string | undefined,
+	): string | undefined {
+		if (contributorRoot !== undefined) {
+			const key = this.lineageKey(contributorRoot, lineageId);
+			return entries.has(key) ? key : undefined;
+		}
+		const suffix = `\u0000${lineageId}`;
+		const matches = [...entries.keys()].filter((key) => key.endsWith(suffix));
+		if (matches.length === 0) return undefined;
+		if (matches.length !== 1) {
+			throw new CandidateViewError(`candidate lifecycle lineage ${lineageId} is ambiguous across target roots; pass an explicit workspaceRoot`, "lineage-root-ambiguous");
+		}
+		return matches[0]!;
+	}
+
+	private requireKey(
+		entries: ReadonlyMap<string, unknown>,
+		lineageId: string,
+		contributorRoot: string | undefined,
+		missing: string,
+	): string {
+		return this.uniqueKey(entries, lineageId, contributorRoot)
+			?? (() => { throw new CandidateViewError(missing); })();
+	}
+
+	/**
+	 * Returns the one active target root bound to a lineage, or undefined.
+	 * Throws when that lineage is bound across multiple roots; callers must pass
+	 * an explicit workspaceRoot to resolve the ambiguity.
+	 */
+	resolveWorkspaceRoot(lineageId: string): string | undefined {
+		const key = this.uniqueKey(this.lineages, lineageId, undefined);
+		return key === undefined ? undefined : key.slice(0, key.lastIndexOf("\u0000"));
+	}
+
+	assertWorkspaceRoot(lineageId: string, contributorRoot: string): void {
+		const root = this.canonicalRoot(contributorRoot);
+		const exactKey = this.lineageKey(root, lineageId);
+		if (this.lineages.has(exactKey)) {
+			this.assertLineageRootIdentity(lineageId, root);
+			return;
+		}
+		const bound = this.resolveWorkspaceRoot(lineageId);
+		if (bound !== undefined) {
+			throw new CandidateViewError(`candidate lifecycle lineage ${lineageId} is bound to ${bound}, not the requested workspaceRoot ${root}`, "lineage-root-drift");
+		}
+	}
+
+	private assertLineageRootIdentity(lineageId: string, contributorRoot: string): void {
+		const key = this.lineageKey(contributorRoot, lineageId);
+		const token = this.lineages.get(key);
+		const record = token === undefined ? undefined : this.records.get(token);
+		if (record !== undefined) assertRecordSafe(record);
+	}
 
 	create(request: CreateCandidateViewRequest): CandidateView {
 		return this.createOrReuse(request);
 	}
 
+	cleanupAll(): void {
+		for (const token of [...this.records.keys()]) this.cleanup(token);
+	}
+
 	createOrReuse(request: CreateCandidateViewRequest): CandidateView {
-		const token = request.replayKey === undefined ? undefined : this.replays.get(request.replayKey);
+		const contributorRoot = this.canonicalRoot(request.contributorRoot);
+		const normalizedRequest = { ...request, contributorRoot };
+		const scopedReplayKey = normalizedRequest.replayKey === undefined ? undefined : this.replayKey(contributorRoot, normalizedRequest.replayKey);
+		const token = scopedReplayKey === undefined ? undefined : this.replays.get(scopedReplayKey);
 		const existing = token === undefined ? undefined : this.records.get(token);
 		if (existing) { assertRecordSafe(existing); return this.expose(existing); }
-		const record = materializeCandidateView(request, this.gitExecutor);
+		const record = materializeCandidateView(normalizedRequest, this.gitExecutor);
 		this.records.set(record.token, record);
-		if (request.replayKey !== undefined) this.replays.set(request.replayKey, record.token);
+		if (scopedReplayKey !== undefined) this.replays.set(scopedReplayKey, record.token);
 		return this.expose(record);
 	}
 
@@ -883,36 +1027,37 @@ export class CandidateViewRegistry {
 
 	bindCurrent(request: BindCandidateViewRequest): void {
 		const selectedLenses = this.validateSelectedLenses(request.selectedLenses);
-		this.bindRecord(request.token, request.lineageId, selectedLenses);
-		this.current = { lineageId: request.lineageId, token: request.token };
+		const record = this.bindRecord(request.token, request.lineageId, selectedLenses);
+		this.current.set(record.contributorRoot, { lineageId: request.lineageId, token: request.token });
 	}
 
 	retain(token: string, lineageId: string): void {
-		this.bindRecord(token, lineageId, []);
-		this.current = { lineageId, token };
+		const record = this.bindRecord(token, lineageId, []);
+		this.current.set(record.contributorRoot, { lineageId, token });
 	}
 
 	restoreCurrentFromNativeStart(request: BindCandidateViewRequest): void {
-		if (this.current !== undefined) throw new CandidateViewError("candidate view already has a current lineage binding", "current-binding-already-established");
 		const record = this.records.get(request.token);
 		if (!record || record.lineageId !== undefined) throw new CandidateViewError("native reviewing candidate view is missing or already bound", "authoritative-current-match-missing");
+		if (this.current.has(record.contributorRoot)) throw new CandidateViewError("candidate view already has a current lineage binding", "current-binding-already-established");
 		assertRecordSafe(record);
 		this.assertCurrentBindingMatchesLiveCandidate(record);
 		this.bindCurrent(request);
 	}
 
-	hasCurrentBinding(): boolean {
-		return this.current !== undefined;
+	hasCurrentBinding(contributorRoot?: string): boolean {
+		return contributorRoot === undefined ? this.current.size > 0 : this.current.has(this.canonicalRoot(contributorRoot));
 	}
 
 	restoreCurrentFromAuthoritativeReviewingStates(
 		contributorRoot: string,
 		states: readonly AuthoritativeReviewingCandidateState[],
 	): void {
-		if (this.current !== undefined) throw new CandidateViewError("candidate view already has a current lineage binding", "current-binding-already-established");
+		const root = this.canonicalRoot(contributorRoot);
+		if (this.current.has(root)) throw new CandidateViewError("candidate view already has a current lineage binding", "current-binding-already-established");
 		if (states.length === 0) throw new CandidateViewError("no authoritative reviewing lineage exactly matches the live candidate", "authoritative-current-match-missing");
 		if (states.length !== 1) throw new CandidateViewError("multiple authoritative reviewing lineages exactly match the live candidate", "authoritative-current-match-ambiguous");
-		const live = materializeCandidateView({ contributorRoot, baseRef: states[0]!.baseCommit, committedOnly: states[0]!.committedOnly === true }, this.gitExecutor);
+		const live = materializeCandidateView({ contributorRoot: root, baseRef: states[0]!.baseCommit, committedOnly: states[0]!.committedOnly === true, ...(states[0]!.intendedUntracked === undefined ? {} : { intendedUntracked: states[0]!.intendedUntracked }) }, this.gitExecutor);
 		try {
 			const matches = states.filter((state) => this.matchesAuthoritativeState(live, state));
 			if (matches.length === 0) throw new CandidateViewError("no authoritative reviewing lineage exactly matches the live candidate", "authoritative-current-match-missing");
@@ -921,28 +1066,31 @@ export class CandidateViewRegistry {
 			const selectedLenses = this.validateSelectedLenses(state.selectedLenses);
 			this.records.set(live.token, live);
 			this.bindRecord(live.token, state.lineageId, selectedLenses);
-			this.current = { lineageId: state.lineageId, token: live.token };
+			this.current.set(root, { lineageId: state.lineageId, token: live.token });
 		} catch (error) {
-			if (!this.records.has(live.token)) this.remove(live);
+			this.records.delete(live.token);
+			this.remove(live);
 			throw error;
 		}
 	}
 
 	createCorrected(lineageId: string, contributorRoot: string, replayKey: string): CandidateView {
-		const projection = this.resolveProjection(lineageId, contributorRoot);
-		const existingToken = this.replays.get(replayKey);
+		const root = this.canonicalRoot(contributorRoot);
+		const projection = this.resolveProjection(lineageId, root);
+		const scopedReplayKey = this.replayKey(root, replayKey);
+		const existingToken = this.replays.get(scopedReplayKey);
 		const existing = existingToken === undefined ? undefined : this.records.get(existingToken);
 		if (existing) {
 			if (existing.lineageId !== undefined) throw new CandidateViewError("corrected candidate replay is no longer pending");
 			assertRecordSafe(existing);
 			return this.expose(existing);
 		}
-		const record = materializeCandidateView({ contributorRoot, baseRef: projection.baseCommit, committedOnly: projection.committedOnly }, this.gitExecutor);
+		const record = materializeCandidateView({ contributorRoot: root, baseRef: projection.baseCommit, committedOnly: projection.committedOnly, ...(projection.intendedUntracked === undefined ? {} : { intendedUntracked: projection.intendedUntracked }) }, this.gitExecutor);
 		try {
 			if (record.baseCommit !== projection.baseCommit || record.baseTree !== projection.baseTree) throw new CandidateViewError("corrected candidate base does not match the frozen genesis base");
 			if (!record.scope.paths.every((path) => projection.paths.includes(path))) throw new CandidateViewError("corrected candidate scope escapes the frozen genesis paths");
 			this.records.set(record.token, record);
-			this.replays.set(replayKey, record.token);
+			this.replays.set(scopedReplayKey, record.token);
 			return this.expose(record);
 		} catch (error) {
 			this.remove(record);
@@ -950,15 +1098,18 @@ export class CandidateViewRegistry {
 		}
 	}
 
-	promoteCorrected(lineageId: string, token: string): void {
+	promoteCorrected(lineageId: string, token: string, contributorRoot?: string): void {
 		const replacement = this.records.get(token);
-		const projection = this.projections.get(lineageId);
-		const currentToken = this.lineages.get(lineageId);
+		const root = contributorRoot === undefined ? replacement?.contributorRoot : this.canonicalRoot(contributorRoot);
+		const key = root === undefined ? undefined : this.uniqueKey(this.projections, lineageId, root);
+		const projection = key === undefined ? undefined : this.projections.get(key);
+		const currentToken = key === undefined ? undefined : this.lineages.get(key);
 		const current = currentToken === undefined ? undefined : this.records.get(currentToken);
-		if (!replacement || replacement.lineageId !== undefined || !projection || (currentToken !== undefined && (!current || current.lineageId !== lineageId))) {
+		if (!replacement || replacement.lineageId !== undefined || !key || !projection || (currentToken !== undefined && (!current || current.lineageId !== lineageId))) {
 			throw new CandidateViewError("corrected candidate replacement is missing or ambiguous");
 		}
-		if (this.current !== undefined && this.current.lineageId !== lineageId) {
+		const currentBinding = this.current.get(root);
+		if (currentBinding !== undefined && currentBinding.lineageId !== lineageId) {
 			throw new CandidateViewError("corrected candidate replacement conflicts with the current lineage binding");
 		}
 		assertRecordSafe(replacement);
@@ -968,26 +1119,28 @@ export class CandidateViewRegistry {
 			replacement.baseCommit !== projection.baseCommit ||
 			replacement.baseTree !== projection.baseTree ||
 			replacement.committedOnly !== projection.committedOnly ||
+			JSON.stringify(replacement.intendedUntracked ?? null) !== JSON.stringify(projection.intendedUntracked ?? null) ||
 			!replacement.scope.paths.every((path) => projection.paths.includes(path))
 		) {
 			throw new CandidateViewError("corrected candidate replacement does not preserve its frozen lineage projection");
 		}
 		replacement.lineageId = lineageId;
 		replacement.selectedLenses = [];
-		this.lineages.set(lineageId, token);
-		for (const [key, pendingToken] of this.replays) if (pendingToken === token) this.replays.delete(key);
-		this.projections.set(lineageId, {
+		this.lineages.set(key, token);
+		for (const [pendingKey, pendingToken] of this.replays) if (pendingToken === token) this.replays.delete(pendingKey);
+		this.projections.set(key, {
 			contributorRoot: replacement.contributorRoot,
 			baseCommit: replacement.baseCommit,
 			baseTree: replacement.baseTree,
 			candidateTree: replacement.candidateTree,
 			committedOnly: replacement.committedOnly,
+			intendedUntracked: replacement.intendedUntracked,
 			paths: replacement.scope.paths,
 			modes: replacement.scope.modes,
 			gitlinks: replacement.scope.gitlinks,
 			deletedPaths: replacement.scope.deletedPaths,
 		});
-		this.current = { lineageId, token };
+		this.current.set(root, { lineageId, token });
 		if (current) {
 			this.remove(current);
 			this.forget(current);
@@ -1007,6 +1160,7 @@ export class CandidateViewRegistry {
 				state.baseTree === record.baseTree &&
 				state.candidateTree === record.candidateTree &&
 				(state.committedOnly ?? false) === record.committedOnly &&
+				(state.intendedUntracked === undefined || JSON.stringify(state.intendedUntracked) === JSON.stringify(record.intendedUntracked)) &&
 				JSON.stringify(state.paths) === JSON.stringify(record.scope.paths) &&
 				JSON.stringify(state.modes) === JSON.stringify(record.scope.modes) &&
 				gitlinkMapsEqual(state.gitlinks ?? {}, record.scope.gitlinks) &&
@@ -1016,41 +1170,46 @@ export class CandidateViewRegistry {
 		}
 	}
 
-	private bindRecord(token: string, lineageId: string, selectedLenses: readonly ReviewLens[]): void {
+	private bindRecord(token: string, lineageId: string, selectedLenses: readonly ReviewLens[]): CandidateViewRecord {
 		const record = this.records.get(token);
-		if (!record || record.lineageId !== undefined || this.lineages.has(lineageId)) throw new CandidateViewError("candidate view lineage binding is missing or ambiguous");
+		const key = record === undefined ? undefined : this.lineageKey(record.contributorRoot, lineageId);
+		if (!record || record.lineageId !== undefined || !key || this.lineages.has(key)) throw new CandidateViewError("candidate view lineage binding is missing or ambiguous");
 		assertRecordSafe(record);
 		record.lineageId = lineageId;
 		record.selectedLenses = selectedLenses;
-		this.lineages.set(lineageId, record.token);
-		this.projections.set(lineageId, {
+		this.lineages.set(key, record.token);
+		this.projections.set(key, {
 			contributorRoot: record.contributorRoot,
 			baseCommit: record.baseCommit,
 			baseTree: record.baseTree,
 			candidateTree: record.candidateTree,
 			committedOnly: record.committedOnly,
+			intendedUntracked: record.intendedUntracked,
 			paths: record.scope.paths,
 			modes: record.scope.modes,
 			gitlinks: record.scope.gitlinks,
 			deletedPaths: record.scope.deletedPaths,
 		});
-		for (const [key, pendingToken] of this.replays) if (pendingToken === token) this.replays.delete(key);
+		for (const [replayKey, pendingToken] of this.replays) if (pendingToken === token) this.replays.delete(replayKey);
+		return record;
 	}
 
-	hasProjection(lineageId: string): boolean {
-		return this.projections.has(lineageId);
+	hasProjection(lineageId: string, contributorRoot?: string): boolean {
+		return this.uniqueKey(this.projections, lineageId, contributorRoot) !== undefined;
 	}
 
 	restoreProjection(lineageId: string, contributorRoot: string, baseCommit: string, baseTree: string, candidateTree: string, paths: readonly string[]): void {
-		const root = realpathSync(contributorRoot);
+		const root = this.canonicalRoot(contributorRoot);
+		const key = this.lineageKey(root, lineageId);
 		const base = resolveCandidateBase(root, baseCommit, process.env, this.gitExecutor);
-		if (!lineageId || this.projections.has(lineageId) || base.commit !== baseCommit || base.tree !== baseTree || !isFullCommitId(candidateTree) || paths.some((path) => !isSafeCandidatePath(path)) || new Set(paths).size !== paths.length) throw new CandidateViewError("frozen correction projection is invalid or already restored");
-		this.projections.set(lineageId, { contributorRoot: root, baseCommit, baseTree, candidateTree, committedOnly: false, paths: [...paths], modes: {}, gitlinks: {}, deletedPaths: [] });
+		if (!lineageId || this.projections.has(key) || base.commit !== baseCommit || base.tree !== baseTree || !isFullCommitId(candidateTree) || paths.some((path) => !isSafeCandidatePath(path)) || new Set(paths).size !== paths.length) throw new CandidateViewError("frozen correction projection is invalid or already restored");
+		this.projections.set(key, { contributorRoot: root, baseCommit, baseTree, candidateTree, committedOnly: false, paths: [...paths], modes: {}, gitlinks: {}, deletedPaths: [] });
 	}
 
 	restoreProjectionFromNative(lineageId: string, contributorRoot: string, descriptor: NativeCandidateProjectionDescriptor): void {
-		const root = realpathSync(contributorRoot);
-		if (!lineageId || this.projections.has(lineageId) || !isFullCommitId(descriptor.baseTree) || !isFullCommitId(descriptor.currentCandidateTree)) throw new CandidateViewError("native frozen projection is invalid or already restored");
+		const root = this.canonicalRoot(contributorRoot);
+		const key = this.lineageKey(root, lineageId);
+		if (!lineageId || this.projections.has(key) || !isFullCommitId(descriptor.baseTree) || !isFullCommitId(descriptor.currentCandidateTree)) throw new CandidateViewError("native frozen projection is invalid or already restored");
 		if (descriptor.paths.some((path) => !isSafeCandidatePath(path)) || new Set(descriptor.paths).size !== descriptor.paths.length) throw new CandidateViewError("native frozen projection paths are invalid");
 		if (descriptor.intendedUntracked.some((path) => !descriptor.paths.includes(path)) || new Set(descriptor.intendedUntracked).size !== descriptor.intendedUntracked.length) throw new CandidateViewError("native intended-untracked projection is invalid");
 		const head = resolveCandidateBase(root, "HEAD", process.env, this.gitExecutor);
@@ -1079,12 +1238,13 @@ export class CandidateViewRegistry {
 		} else if (JSON.stringify(scope.paths) !== JSON.stringify([...descriptor.paths].sort())) {
 			throw new CandidateViewError("native projection paths do not match Git content");
 		}
-		this.projections.set(lineageId, {
+		this.projections.set(key, {
 			contributorRoot: root,
 			baseCommit: base.commit,
 			baseTree: descriptor.baseTree,
 			candidateTree: descriptor.currentCandidateTree,
 			committedOnly,
+			intendedUntracked: Object.freeze([...descriptor.intendedUntracked]),
 			paths: scope.paths,
 			modes: scope.modes,
 			gitlinks: scope.gitlinks,
@@ -1113,30 +1273,45 @@ export class CandidateViewRegistry {
 	 * correction.
 	 */
 	rebindForFinalizeFromNative(lineageId: string, contributorRoot: string, descriptor: NativeCandidateProjectionDescriptor): CandidateView {
-		const staleToken = this.lineages.get(lineageId);
+		const root = this.canonicalRoot(contributorRoot);
+		const key = this.lineageKey(root, lineageId);
+		const staleToken = this.lineages.get(key);
 		const stale = staleToken === undefined ? undefined : this.records.get(staleToken);
-		this.projections.delete(lineageId);
+		this.projections.delete(key);
 		if (stale !== undefined) {
 			this.remove(stale);
 			this.forget(stale);
 		}
-		return this.restoreForFinalizeFromNative(lineageId, contributorRoot, descriptor);
+		return this.restoreForFinalizeFromNative(lineageId, root, descriptor);
 	}
 
 	restoreForFinalizeFromNative(lineageId: string, contributorRoot: string, descriptor: NativeCandidateProjectionDescriptor): CandidateView {
-		this.restoreProjectionFromNative(lineageId, contributorRoot, descriptor);
-		const projection = this.resolveProjection(lineageId, contributorRoot);
-		const record = materializeCandidateView({ contributorRoot, baseRef: projection.baseCommit, committedOnly: projection.committedOnly }, this.gitExecutor);
+		const root = this.canonicalRoot(contributorRoot);
+		const key = this.lineageKey(root, lineageId);
+		let projectionRestored = false;
+		let record: CandidateViewRecord | undefined;
 		try {
-			if (record.baseTree !== projection.baseTree || record.candidateTree !== projection.candidateTree || JSON.stringify(record.scope.paths) !== JSON.stringify(projection.paths)) {
-				throw new CandidateViewError("live candidate does not match the native frozen projection");
+			this.restoreProjectionFromNative(lineageId, root, descriptor);
+			projectionRestored = true;
+			const projection = this.resolveProjection(lineageId, root);
+			const matchesProjection = (candidate: CandidateViewRecord): boolean => candidate.baseTree === projection.baseTree && candidate.candidateTree === projection.candidateTree && JSON.stringify(candidate.scope.paths) === JSON.stringify(projection.paths);
+			const emptyIntendedUntracked = projection.intendedUntracked?.length === 0;
+			record = materializeCandidateView({ contributorRoot: root, baseRef: projection.baseCommit, committedOnly: projection.committedOnly, ...(!emptyIntendedUntracked && projection.intendedUntracked !== undefined ? { intendedUntracked: projection.intendedUntracked } : {}) }, this.gitExecutor);
+			if (!matchesProjection(record) && emptyIntendedUntracked) {
+				this.remove(record);
+				record = undefined;
+				record = materializeCandidateView({ contributorRoot: root, baseRef: projection.baseCommit, committedOnly: projection.committedOnly, intendedUntracked: [] }, this.gitExecutor);
 			}
+			if (!matchesProjection(record)) throw new CandidateViewError("live candidate does not match the native frozen projection");
 			this.records.set(record.token, record);
 			this.bindRecord(record.token, lineageId, []);
 			return this.expose(record);
 		} catch (error) {
-			this.projections.delete(lineageId);
-			this.remove(record);
+			if (projectionRestored) this.projections.delete(key);
+			if (record !== undefined) {
+				this.forget(record);
+				this.remove(record);
+			}
 			throw error;
 		}
 	}
@@ -1151,55 +1326,62 @@ export class CandidateViewRegistry {
 	 * pending lenses.
 	 */
 	restoreCurrentForDispatchFromNative(lineageId: string, contributorRoot: string, descriptor: NativeCandidateProjectionDescriptor, selectedLenses: readonly string[]): void {
-		if (this.current !== undefined) throw new CandidateViewError("candidate view already has a current lineage binding", "current-binding-already-established");
+		const root = this.canonicalRoot(contributorRoot);
+		const key = this.lineageKey(root, lineageId);
+		if (this.current.has(root)) throw new CandidateViewError("candidate view already has a current lineage binding", "current-binding-already-established");
+		let projectionRestored = false;
+		let record: CandidateViewRecord | undefined;
 		try {
 			const lenses = this.validateSelectedLenses(selectedLenses);
-			this.restoreProjectionFromNative(lineageId, contributorRoot, descriptor);
-			const projection = this.resolveProjection(lineageId, contributorRoot);
-			const record = materializeCandidateView({ contributorRoot, baseRef: projection.baseCommit, committedOnly: projection.committedOnly }, this.gitExecutor);
-			try {
-				if (record.baseTree !== projection.baseTree || record.candidateTree !== projection.candidateTree || JSON.stringify(record.scope.paths) !== JSON.stringify(projection.paths)) {
-					throw new CandidateViewError("live candidate does not match the native frozen projection");
-				}
-				this.records.set(record.token, record);
-				this.bindRecord(record.token, lineageId, lenses);
-				this.current = { lineageId, token: record.token };
-			} catch (error) {
-				this.projections.delete(lineageId);
-				this.records.delete(record.token);
-				this.remove(record);
-				throw error;
+			this.restoreProjectionFromNative(lineageId, root, descriptor);
+			projectionRestored = true;
+			const projection = this.resolveProjection(lineageId, root);
+			record = materializeCandidateView({ contributorRoot: root, baseRef: projection.baseCommit, committedOnly: projection.committedOnly, ...(projection.intendedUntracked === undefined ? {} : { intendedUntracked: projection.intendedUntracked }) }, this.gitExecutor);
+			if (record.baseTree !== projection.baseTree || record.candidateTree !== projection.candidateTree || JSON.stringify(record.scope.paths) !== JSON.stringify(projection.paths)) {
+				throw new CandidateViewError("live candidate does not match the native frozen projection");
 			}
-			this.lastHydrationFailure = undefined;
+			this.records.set(record.token, record);
+			this.bindRecord(record.token, lineageId, lenses);
+			this.current.set(root, { lineageId, token: record.token });
+			this.lastHydrationFailures.delete(root);
 		} catch (error) {
-			this.lastHydrationFailure = {
+			if (projectionRestored) this.projections.delete(key);
+			if (record !== undefined) {
+				this.forget(record);
+				this.remove(record);
+			}
+			this.lastHydrationFailures.set(root, {
 				lineageId,
 				reason: error instanceof CandidateViewError ? error.reason : "candidate-view-invalid",
 				message: error instanceof Error ? error.message : String(error),
-			};
+			});
 			throw error;
 		}
 	}
 
 	resolveProjection(lineageId: string, contributorRoot: string): FrozenCandidateProjection {
-		const projection = this.projections.get(lineageId);
-		if (!projection || realpathSync(contributorRoot) !== projection.contributorRoot) {
-			throw new CandidateViewError("candidate projection is missing, ambiguous, or belongs to a different contributor root");
-		}
+		const key = this.lineageKey(contributorRoot, lineageId);
+		const projection = this.projections.get(key);
+		if (!projection) throw new CandidateViewError("candidate projection is missing, ambiguous, or belongs to a different contributor root");
+		this.assertLineageRootIdentity(lineageId, contributorRoot);
 		return projection;
 	}
 
-	resolveForLens(lineageId: string, lens: string): CandidateView {
-		const token = this.lineages.get(lineageId);
+	resolveForLens(lineageId: string, lens: string, contributorRoot?: string): CandidateView {
+		const key = this.requireKey(this.lineages, lineageId, contributorRoot, "candidate view context is missing, ambiguous, stale, or lens-unselected");
+		const token = this.lineages.get(key);
 		const record = token === undefined ? undefined : this.records.get(token);
 		if (!record || record.lineageId !== lineageId || !record.selectedLenses?.includes(lens as ReviewLens)) throw new CandidateViewError("candidate view context is missing, ambiguous, stale, or lens-unselected");
 		assertRecordSafe(record);
 		return this.expose(record);
 	}
 
-	currentLineageId(): string {
-		if (this.current === undefined) {
-			const failure = this.lastHydrationFailure;
+	private currentBinding(contributorRoot?: string): { root: string; lineageId: string; token: string } {
+		if (contributorRoot !== undefined) {
+			const root = this.canonicalRoot(contributorRoot);
+			const binding = this.current.get(root);
+			if (binding !== undefined) return { root, ...binding };
+			const failure = this.lastHydrationFailures.get(root);
 			if (failure !== undefined) {
 				throw new CandidateViewError(
 					`review subagent dispatch has no current controller-owned candidate view lineage binding: hydration for lineage ${failure.lineageId} was attempted from authoritative native status and failed (${failure.reason}): ${failure.message}`,
@@ -1208,23 +1390,39 @@ export class CandidateViewRegistry {
 			}
 			throw new CandidateViewError("review subagent dispatch has no current controller-owned candidate view lineage binding", "current-binding-missing");
 		}
-		return this.current.lineageId;
+		if (this.current.size !== 1) {
+			if (this.current.size > 1) throw new CandidateViewError("review subagent dispatch has multiple current lineage bindings across target roots; pass an explicit workspaceRoot", "current-binding-root-ambiguous");
+			const failure = [...this.lastHydrationFailures.values()][0];
+			if (failure !== undefined) {
+				throw new CandidateViewError(
+					`review subagent dispatch has no current controller-owned candidate view lineage binding: hydration for lineage ${failure.lineageId} was attempted from authoritative native status and failed (${failure.reason}): ${failure.message}`,
+					"current-binding-hydration-failed",
+				);
+			}
+			throw new CandidateViewError("review subagent dispatch has no current controller-owned candidate view lineage binding", "current-binding-missing");
+		}
+		const [root, binding] = this.current.entries().next().value as [string, { lineageId: string; token: string }];
+		return { root, ...binding };
+	}
+
+	currentLineageId(contributorRoot?: string): string {
+		return this.currentBinding(contributorRoot).lineageId;
 	}
 
 	/** The last failed dispatch-binding hydration, for controller envelopes. */
-	lastDispatchHydrationFailure(): Readonly<{ lineageId: string; reason: string; message: string }> | undefined {
-		return this.lastHydrationFailure;
+	lastDispatchHydrationFailure(contributorRoot?: string): Readonly<{ lineageId: string; reason: string; message: string }> | undefined {
+		if (contributorRoot !== undefined) return this.lastHydrationFailures.get(this.canonicalRoot(contributorRoot));
+		return this.lastHydrationFailures.size === 1 ? [...this.lastHydrationFailures.values()][0] : undefined;
 	}
 
-	resolveCurrentForLens(lens: string): CandidateView {
-		return this.resolveCurrentForLenses([lens])[0]!;
+	resolveCurrentForLens(lens: string, contributorRoot?: string): CandidateView {
+		return this.resolveCurrentForLenses([lens], contributorRoot)[0]!;
 	}
 
-	resolveCurrentForLenses(lenses: readonly string[]): CandidateView[] {
-		const lineageId = this.currentLineageId();
-		const token = this.current?.token;
-		const record = token === undefined ? undefined : this.records.get(token);
-		if (!record || record.lineageId !== lineageId || this.lineages.get(lineageId) !== token) throw new CandidateViewError("review subagent dispatch current lineage binding is stale or ambiguous", "current-binding-stale");
+	resolveCurrentForLenses(lenses: readonly string[], contributorRoot?: string): CandidateView[] {
+		const current = this.currentBinding(contributorRoot);
+		const record = this.records.get(current.token);
+		if (!record || record.lineageId !== current.lineageId || this.lineages.get(this.lineageKey(current.root, current.lineageId)) !== current.token) throw new CandidateViewError("review subagent dispatch current lineage binding is stale or ambiguous", "current-binding-stale");
 		assertRecordSafe(record);
 		this.assertCurrentBindingMatchesLiveCandidate(record);
 		if (!lenses.every((lens) => record.selectedLenses?.includes(lens as ReviewLens))) throw new CandidateViewError("candidate view context is missing, ambiguous, stale, or lens-unselected", "current-binding-lens-unselected");
@@ -1232,7 +1430,7 @@ export class CandidateViewRegistry {
 	}
 
 	private assertCurrentBindingMatchesLiveCandidate(record: CandidateViewRecord): void {
-		const live = materializeCandidateView({ contributorRoot: record.contributorRoot, baseRef: record.baseCommit, committedOnly: record.committedOnly }, this.gitExecutor);
+		const live = materializeCandidateView({ contributorRoot: record.contributorRoot, baseRef: record.baseCommit, committedOnly: record.committedOnly, ...(record.intendedUntracked === undefined ? {} : { intendedUntracked: record.intendedUntracked }) }, this.gitExecutor);
 		try {
 			if (
 				live.baseCommit !== record.baseCommit ||
@@ -1249,8 +1447,9 @@ export class CandidateViewRegistry {
 		}
 	}
 
-	resolveForFinalize(lineageId: string): CandidateView {
-		const token = this.lineages.get(lineageId);
+	resolveForFinalize(lineageId: string, contributorRoot?: string): CandidateView {
+		const key = this.requireKey(this.lineages, lineageId, contributorRoot, "candidate view context is missing or ambiguous for FINALIZE");
+		const token = this.lineages.get(key);
 		const record = token === undefined ? undefined : this.records.get(token);
 		if (!record || record.lineageId !== lineageId) throw new CandidateViewError("candidate view context is missing or ambiguous for FINALIZE");
 		assertRecordSafe(record);
@@ -1264,40 +1463,47 @@ export class CandidateViewRegistry {
 		this.forget(record);
 	}
 
-	cleanupTerminal(lineageId: string, state: string): void {
+	cleanupTerminal(lineageId: string, state: string, contributorRoot?: string): void {
 		if (state !== "approved" && state !== "escalated") return;
-		const token = this.lineages.get(lineageId); if (token) this.cleanup(token);
-		if (state === "escalated") this.projections.delete(lineageId);
+		const key = this.uniqueKey(this.lineages, lineageId, contributorRoot);
+		const token = key === undefined ? undefined : this.lineages.get(key);
+		if (token) this.cleanup(token);
+		if (state === "escalated" && key !== undefined) this.projections.delete(key);
 	}
 
 	private remove(record: CandidateViewRecord): void {
 		if (!isWithin(record.parent, record.root)) throw new CandidateViewError("candidate view cleanup escaped its owned parent");
 		try { makeWritableForCleanup(record.root); } catch {}
-		try { git(record.contributorRoot, ["worktree", "remove", "--force", record.root], process.env, record.gitExecutor); } catch {
-			try { makeWritableForCleanup(record.root); } catch {}
-			rmSync(record.root, { recursive: true, force: true });
-		}
+		try { git(record.contributorRoot, ["worktree", "remove", "--force", record.root], process.env, record.gitExecutor); } catch {}
+		// Git removes worktree metadata; physical removal remains this owner's duty.
+		rmSync(record.root, { recursive: true, force: true });
 	}
 
 	private forget(record: CandidateViewRecord): void {
 		this.records.delete(record.token);
-		if (record.lineageId && this.lineages.get(record.lineageId) === record.token) this.lineages.delete(record.lineageId);
-		if (this.current?.token === record.token) this.current = undefined;
-		for (const [key, pendingToken] of this.replays) if (pendingToken === record.token) this.replays.delete(key);
+		if (record.lineageId) {
+			const key = this.lineageKey(record.contributorRoot, record.lineageId);
+			if (this.lineages.get(key) === record.token) this.lineages.delete(key);
+		}
+		if (this.current.get(record.contributorRoot)?.token === record.token) this.current.delete(record.contributorRoot);
+		for (const [replayKey, pendingToken] of this.replays) if (pendingToken === record.token) this.replays.delete(replayKey);
 	}
 
-	consumeProjection(lineageId: string): void {
-		this.projections.delete(lineageId);
+	consumeProjection(lineageId: string, contributorRoot?: string): void {
+		const key = this.uniqueKey(this.projections, lineageId, contributorRoot);
+		if (key !== undefined) this.projections.delete(key);
 	}
 
 	private expose(record: CandidateViewRecord): CandidateView {
 		return {
 			token: record.token,
 			root: record.root,
+			contributorRoot: record.contributorRoot,
 			baseCommit: record.baseCommit,
 			baseTree: record.baseTree,
 			candidateTree: record.candidateTree,
 			committedOnly: record.committedOnly,
+			intendedUntracked: record.intendedUntracked,
 			paths: record.scope.paths,
 			modes: record.scope.modes,
 			gitlinks: record.scope.gitlinks,

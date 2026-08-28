@@ -4,6 +4,8 @@
 
 This design replaces mutable numbered review snapshots as historical authority with an immutable, predecessor-linked, content-addressed event graph. Its reset mechanism follows the logical-retirement contract in `specs/review-graph/spec.md`.
 
+> **Superseded delivery-gate context:** the graph storage, reset, and candidate-integrity rationale below is retained as historical design context. Any language that makes a receipt, lifecycle gate, or validation outcome decide commit, push, pull-request, release, publication, or archive is obsolete. Review and Judgment Day evidence is review-only; ordinary repository policy owns delivery.
+
 The design MUST provide:
 
 - deterministic graph-v1 event identity and deterministic state reduction;
@@ -18,14 +20,14 @@ The design MUST provide:
 - immutable treatment of legacy bytes as in-place, inspection-only evidence;
 - authority entry points that never read retired bytes as authority and never let retired-byte drift affect current graph authority;
 - rejection of every receipt, bundle, checkpoint, root, and event from a retired epoch/incarnation; and
-- gates that remain denied until a fresh review in the current incarnation produces an approved receipt for the exact typed target.
+- review-lifecycle inspections that report no current review approval until a fresh review in the current incarnation produces an approved receipt for the exact typed candidate; those inspections never affect delivery.
 
 The design MUST NOT:
 
 - translate legacy revisions or state into graph events;
 - mutate legacy files or directories during reset, initialization, recovery, import, or normal graph operation;
 - enumerate or traverse the contents of legacy directory trees;
-- retain legacy state as fallback, parallel, or gate-bearing authority;
+- retain legacy state as fallback, parallel, or delivery-gate-bearing authority;
 - initialize graph-v1 over detected legacy authority without exact reset confirmation;
 - infer reset consent from startup, review start, resume, import, inspection, or another command;
 - silently continue an interrupted reset;
@@ -523,7 +525,7 @@ A transfer checkpoint binds:
 
 Checkpoint reuse requires exact equality with the selected incarnation. Reducer-version changes invalidate reducer-dependent work but never change graph authority or budgets.
 
-## 13. Mirrors, receipts, and lifecycle gates
+## 13. Mirrors, receipts, and review-lifecycle inspections
 
 ### 13.1 Authority capabilities
 
@@ -533,7 +535,7 @@ An authoritative receipt carries a separate private runtime brand plus the recei
 
 ### 13.2 Receipt invalidation
 
-A compatibility helper may still create a plain receipt envelope, but a lifecycle gate requires a live authoritative receipt.
+A compatibility helper may still create a plain receipt envelope, but a review-lifecycle inspection requires a live authoritative receipt and remains review-only.
 
 After logical reset:
 
@@ -549,17 +551,17 @@ After logical reset:
 Every authority-bearing entry point uses one guard:
 
 1. resolve the exact repository/common-directory capability through the sanitized Git policy;
-2. acquire the control lock when a consistent mutation or gate window is required;
+2. acquire the control lock when a consistent mutation or lifecycle inspection window is required;
 3. read and validate graph-v1 reset state and authority-selector quorum;
 4. if no selector exists, run the bounded fixed-root probe and either permit virgin bootstrap or deny;
 5. if a clean-bootstrap or bundle-adopted selector exists without a complete retirement marker, run the same fixed-root probe before authority use and deny on legacy or mixed state;
 6. if a complete retirement marker exactly binds the selected reset-initialized store, do not access retired roots;
 7. verify selected `STORE`, epoch, incarnation, reset binding, root quorum, and complete one-incarnation closure;
-8. validate operation-specific request, receipt, bundle, checkpoint, and exact typed target bindings;
-9. repeat repository and selected graph checks before issuing one-shot authorization; and
+8. validate operation-specific request, receipt, bundle, checkpoint, and review-candidate bindings;
+9. repeat repository and selected graph checks before completing the review-only operation; and
 10. deny on any graph-v1 ambiguity.
 
-A lifecycle gate runs zero review actors. Old-byte drift is outside this algorithm.
+A read-only lifecycle inspection runs zero review actors and has no delivery effect. Old-byte drift is outside this algorithm.
 
 ## 14. CLI and tool surface
 
@@ -590,13 +592,13 @@ There is no migration operation. Start, import, repair, recovery, and gate valid
 | Reset crash | Process stops between marker, graph initialization, selector publication, and completion | Successor authority is incomplete or ambiguous | Durable monotonic phases, selector quorum, explicit resume, complete-marker binding | Gates deny until forward recovery |
 | Incarnation path redirection | Crafted graph-v1 path escapes managed root | Wrong files become authority | Incarnation ID-derived paths, no-follow checks, private repository capability | `failed-closed` |
 | Partial initialization | New graph is partly published | Invalid authority could be selected | Immutable objects, root quorum, selector quorum, reset remains active until verification | Deny |
-| Receipt replay | Legacy or prior-incarnation receipt passes | Delivery is authorized by retired authority | Runtime brand, selector generation, epoch/incarnation, current root/head, exact target | `REVIEW_RECEIPT_EPOCH_MISMATCH`; zero actors |
+| Receipt replay | Legacy or prior-incarnation receipt passes | Obsolete delivery-gate logic could mistake retired review evidence for delivery authority | Runtime brand, selector generation, epoch/incarnation, current root/head, exact review candidate; ordinary repository policy ignores review evidence for delivery | `REVIEW_RECEIPT_EPOCH_MISMATCH`; zero actors |
 | Lock contention | Reset races graph mutation/import | Corrupt roots or inconsistent selection | One control mutation lock | Contended or ambiguous |
 | Lock recovery | Stale owner is misclassified | Concurrent mutation | Exact owner hash/token and proof-based recovery | Fail closed |
 | Bundle graph | Missing, cyclic, forked, or conflicting closure | Forged or incomplete authority | Complete staged validation before locked publication | Import aborts unchanged |
 | Prior bundle replay | Approved old graph is imported after reset | Retirement is bypassed | Exact selector generation and incarnation on manifest, objects, roots, and receipt | `REVIEW_BUNDLE_EPOCH_MISMATCH` |
 | Incarnation rebinding | Caller edits manifest or receipt fields around old objects | Old authority appears current | Content identities commit incarnation; private capability and complete closure | Reject mismatch |
-| Mirror | Cache mints receipt or gate proof | Stale data authorizes delivery | Separate API/private brand/live selected-graph verification | Deny authority operation |
+| Mirror | Cache mints receipt or review-lifecycle proof | Stale data is mistaken for current review evidence; it cannot affect delivery | Separate API/private brand/live selected-graph verification | Deny authority operation |
 | Resume | Retired checkpoint resets budget or skips work | Bounded contract is violated | Exact selector, epoch, incarnation, input, and reducer binding | Reject checkpoint |
 | Publication | Crash exposes a partial root or selector | Partial authority | Immutable object first, then two-of-three pointer quorum | Exact prior or successor selection; otherwise deny |
 | Drift diagnostic coupling | Informational retired-byte change alters authority result | Current reviews become externally controllable | Separate diagnostic API and tests proving zero authority-state dependencies | Treat as diagnostic only |

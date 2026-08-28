@@ -1,0 +1,8 @@
+{
+  "schema": "gentle-ai.review-last-event-closure/v1",
+  "operation": "review.capture-refuter",
+  "lineage_id": "review-2c1f3ae8139e6fe3",
+  "state": "correction_required",
+  "action": "candidate-caused severe findings require one bounded correction",
+  "store_revision": "sha256:de7f54f5c7eca7c1095ab6d8fcd8a3eb05f4a01733129d3e2fa0f32db30b5457"
+}

@@ -1,5 +1,5 @@
 ---
-name: skill-registry
+name: gentle-ai-skill-registry
 description: "Trigger: update skills, skill registry, actualizar skills, after skill changes. Index available skills by trigger and path."
 license: MIT
 metadata:

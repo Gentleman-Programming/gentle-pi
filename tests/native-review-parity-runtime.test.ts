@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtempSync, rmSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import baseTest from "node:test";
@@ -9,21 +9,35 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
-import { GENTLE_AI_VERSION, resolveGentleAiBinary } from "../lib/gentle-ai-binary.ts";
+import {
+	GENTLE_AI_DEV_BINARY_ENV,
+	resolveGentleAiBinary,
+	type GentleAiDevBinaryEnvironment,
+} from "../lib/gentle-ai-binary.ts";
 import { NativeReviewCliV216 } from "../lib/native-review-cli.ts";
-import { NativeReviewCliV216 as RuntimeNativeReviewCliV216 } from "../runtime/native-review-cli.mjs";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
-import { resolveGentleAiReleaseAsset } from "../scripts/gentle-ai-installer.mjs";
+import { decodeReviewLastEventClosureV1 } from "../lib/review-integration-v2.ts";
+import { decodeReviewLastEventClosureV1 as decodeRuntimeReviewLastEventClosureV1 } from "../runtime/review-integration-v2.mjs";
 import { requireNativeBinary } from "./support/native-binary-gate.ts";
 
 const execFileAsync = promisify(execFile);
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const pinnedBinaryHome = mkdtempSync(join(tmpdir(), "gentle-pi-pinned-runtime-home-"));
+const pinnedBinaryEnvironment: GentleAiDevBinaryEnvironment = {
+	env: { ...process.env },
+	home: pinnedBinaryHome,
+};
+delete pinnedBinaryEnvironment.env[GENTLE_AI_DEV_BINARY_ENV];
+delete pinnedBinaryEnvironment.env.GENTLE_PI_CONFIG_HOME;
+baseTest.after(() => rmSync(pinnedBinaryHome, { recursive: true, force: true }));
 // The parity suite exercises the published official binary; it skips while a
 // re-pinned release's archives and digest table are still pending, because the
 // pinned package-local binary cannot be installed or integrity-verified yet.
+// Dev-binary override state is intentionally excluded: these assertions verify
+// the package pin, while explicit dev-binary behavior belongs to its own suite.
 const resolvedBinary = (() => {
 	try {
-		return resolveGentleAiBinary(packageRoot, process.platform);
+		return resolveGentleAiBinary(packageRoot, process.platform, undefined, pinnedBinaryEnvironment);
 	} catch {
 		return undefined;
 	}
@@ -32,12 +46,6 @@ const nativeBinaryGate = requireNativeBinary({ resolvedBinary, digestsPinned: tr
 if (!nativeBinaryGate.run) console.log(`native-review-parity-runtime: ${nativeBinaryGate.reason}`);
 const test = nativeBinaryGate.run ? baseTest : baseTest.skip;
 const binary = resolvedBinary ?? "";
-const OFFICIAL_BINARY_SHA256 = resolveGentleAiReleaseAsset(process.platform, process.arch).binarySha256;
-const REVIEWED_PATHS = ["tracked.txt", "initially-untracked.txt"] as const;
-// Golden captured by the clean external-artifact differential fixture for v2.1.3.
-// This is released runtime output, not a locally reconstructed authority digest.
-const CLEAN_DIFFERENTIAL_PUBLISHED_PATHS_DIGEST = "sha256:5d91d7650fcbd1165e9cd88c144bf28d82913e3537abd7b4fdc8ad0adb9eab9c";
-const REVIEWED_MODES = ["100644", "100644"];
 
 interface CommandResult {
 	exitCode: number;
@@ -47,46 +55,6 @@ interface CommandResult {
 
 interface RegisteredController {
 	execute: (toolCallId: string, params: unknown, signal: AbortSignal | undefined, onUpdate: undefined, ctx: ExtensionContext) => Promise<{ details?: unknown }>;
-}
-
-interface ReviewStart {
-	lineage_id: string;
-	selected_lenses: string[];
-	action?: string;
-	state?: string;
-}
-
-interface ReviewFinalize {
-	lineage_id: string;
-	state: string;
-	store_revision: string;
-	receipt_path: string;
-}
-
-interface ReviewAuthorityEntry {
-	version: string;
-	lineage_id: string;
-	status: string;
-	state: string;
-	revision: string;
-	problems: unknown[];
-}
-
-interface ReviewGateContext {
-	candidate_tree: string;
-	paths_digest: string;
-	denial?: ReviewDenial;
-}
-
-interface ReviewDenial {
-	stage: string;
-	code: string;
-}
-
-interface ReviewGateResult {
-	result: string;
-	allowed: boolean;
-	context: ReviewGateContext;
 }
 
 // Every test in this file drives the real pinned binary through a full review
@@ -103,19 +71,46 @@ interface ReviewGateResult {
 //
 // So each test owns a sandbox HOME and opts in the same way a user does,
 // exactly as gentle-ai did for its own lifecycle fixtures in the commit that
-// flipped the default. The process-wide HOME is what the extension-registered
-// controller path needs, because it spawns the CLI with the inherited
-// environment rather than an explicit one; it is restored afterwards.
+// flipped the default. The extension-registered controller path inherits this
+// process environment, so HOME and XDG state are restored afterwards. The
+// global enable runs from a disposable repository: this package worktree may
+// intentionally have clone-local mode off, which must never participate in the
+// fixture's lifecycle.
 async function reviewEnabledHome(t: baseTest.TestContext): Promise<string> {
 	const home = await mkdtemp(join(tmpdir(), "gentle-pi-review-home-"));
+	const lifecycleCwd = await mkdtemp(join(tmpdir(), "gentle-pi-review-lifecycle-"));
+	const xdgConfigHome = join(home, ".config");
+	const xdgDataHome = join(home, ".local", "share");
+	const xdgCacheHome = join(home, ".cache");
 	const previousHome = process.env.HOME;
+	const previousXdgConfigHome = process.env.XDG_CONFIG_HOME;
+	const previousXdgDataHome = process.env.XDG_DATA_HOME;
+	const previousXdgCacheHome = process.env.XDG_CACHE_HOME;
 	process.env.HOME = home;
+	process.env.XDG_CONFIG_HOME = xdgConfigHome;
+	process.env.XDG_DATA_HOME = xdgDataHome;
+	process.env.XDG_CACHE_HOME = xdgCacheHome;
+	const environment = {
+		...process.env,
+		HOME: home,
+		XDG_CONFIG_HOME: xdgConfigHome,
+		XDG_DATA_HOME: xdgDataHome,
+		XDG_CACHE_HOME: xdgCacheHome,
+	};
 	t.after(async () => {
 		if (previousHome === undefined) delete process.env.HOME;
 		else process.env.HOME = previousHome;
+		if (previousXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+		else process.env.XDG_CONFIG_HOME = previousXdgConfigHome;
+		if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+		else process.env.XDG_DATA_HOME = previousXdgDataHome;
+		if (previousXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+		else process.env.XDG_CACHE_HOME = previousXdgCacheHome;
 		await rm(home, { recursive: true, force: true });
+		await rm(lifecycleCwd, { recursive: true, force: true });
 	});
-	const enabled = await run(binary, ["review", "mode", "enable", "--scope", "global", "--json"], packageRoot, false, { ...process.env, HOME: home });
+	await run("git", ["init", "--quiet"], lifecycleCwd, false, environment);
+	const enabled = await run(binary, ["review", "mode", "enable", "--scope", "global", "--cwd", lifecycleCwd, "--json"], lifecycleCwd, false, environment);
 	// Assert the opt-in landed rather than assuming it. A silently ineffective
 	// enable would put these tests straight back to depending on ambient state,
 	// which is the exact failure this helper exists to remove.
@@ -134,291 +129,25 @@ async function run(command: string, arguments_: readonly string[], cwd: string, 
 	}
 }
 
-async function stagedEntries(repository: string): Promise<string[]> {
-	const output = (await run("git", ["ls-files", "--stage"], repository)).stdout.trim();
-	return output === "" ? [] : output.split("\n");
-}
-
-async function assertPublishedProjection(repository: string, candidateTree: string): Promise<void> {
-	const stagedTree = (await run("git", ["write-tree"], repository)).stdout.trim();
-	const entries = await stagedEntries(repository);
-	const stagedPaths = entries.map((entry) => entry.split("\t", 2)[1]);
-	const stagedModes = entries.map((entry) => entry.split(" ", 1)[0]);
-	assert.equal(stagedTree, candidateTree, `staged tree must match frozen candidate; entries: ${entries.join(", ")}`);
-	assert.deepEqual(stagedPaths, [...REVIEWED_PATHS].toSorted());
-	assert.deepEqual(stagedModes, REVIEWED_MODES);
-}
-
-async function assertScopeChanged(repository: string, lineageId: string): Promise<void> {
-	const deniedCommand = await run(binary, ["review", "validate", "--gate", "pre-commit", "--cwd", repository, "--lineage", lineageId], repository, true);
-	const denied = JSON.parse(deniedCommand.stdout) as ReviewGateResult;
-	assert.equal(deniedCommand.exitCode, 1);
-	assert.equal(denied.result, "scope-changed");
-	assert.equal(denied.allowed, false);
-	assert.deepEqual(denied.context.denial, { stage: "receipt-binding", code: "candidate-or-paths-mismatch" });
-}
-
-async function restoreCandidate(repository: string, candidateTree: string): Promise<void> {
-	await writeFile(join(repository, "tracked.txt"), "candidate\n");
-	await rm(join(repository, "extra-reviewed-path.txt"), { force: true });
-	await run("git", ["reset", "--", "extra-reviewed-path.txt"], repository);
-	await run("git", ["add", "--", ...REVIEWED_PATHS], repository);
-	await assertPublishedProjection(repository, candidateTree);
-}
-
-async function reviewStatus(repository: string): Promise<Record<string, unknown>> {
-	return JSON.parse((await run(binary, ["review", "status", "--cwd", repository], repository)).stdout) as Record<string, unknown>;
-}
-
-function authorityInventory(status: Record<string, unknown>): ReviewAuthorityEntry[] {
-	assert.ok(Array.isArray(status.entries), "review status must expose authority entries");
-	return status.entries.map((entry) => {
-		assert.ok(entry !== null && typeof entry === "object", "authority entry must be an object");
-		const candidate = entry as Record<string, unknown>;
-		for (const key of ["version", "lineage_id", "status", "state", "revision"] as const) {
-			assert.equal(typeof candidate[key], "string", `authority entry ${key} must be stable text`);
-		}
-		assert.ok(Array.isArray(candidate.problems), "authority entry problems must be an array");
-		return {
-			version: candidate.version as string,
-			lineage_id: candidate.lineage_id as string,
-			status: candidate.status as string,
-			state: candidate.state as string,
-			revision: candidate.revision as string,
-			problems: candidate.problems,
-		};
-	});
-}
-
-// Every reviewer result reaches authority through `review capture-result`.
-// `review finalize --result` was removed because a result handed over that way
-// carries no provider-owned admission, so it cannot prove the lens inspected
-// the frozen candidate. The bindings are never guessed here: each one comes
-// from the collect transition the provider itself publishes, which is also
-// what the removal message tells a caller to do.
-//
-// Artifacts stay outside the repository on purpose. Writing them inside changes
-// the workspace snapshot between deriving a target and using it, and authority
-// correctly rejects the stale target that results.
-async function nextTransition(repository: string): Promise<Record<string, unknown>> {
-	const status = JSON.parse((await run(binary, ["review", "status", "--contract", "gentle-ai.review-integration/v2", "--cwd", repository, "--projection", "workspace", "--next-transition"], repository)).stdout) as Record<string, unknown>;
-	return status.next_transition as Record<string, unknown>;
-}
-
-async function captureSelectedLenses(repository: string, artifacts: string, evidenceName: string): Promise<void> {
-	for (let guard = 0; guard < 8; guard += 1) {
-		const transition = await nextTransition(repository);
-		const collect = transition.collect as { inputs?: readonly Record<string, unknown>[] } | undefined;
-		if (transition.kind !== "collect" || collect?.inputs === undefined) return;
-		for (const [index, input] of collect.inputs.entries()) {
-			const subject = input.artifact_subject as { subject_hash: string };
-			const manifest = input.changed_path_manifest as readonly { path: string }[];
-			const result = join(artifacts, `${evidenceName}-capture-${index}.json`);
-			await writeFile(result, JSON.stringify({
-				subject_hash: subject.subject_hash,
-				inspection: { status: "completed", paths: manifest.map((entry) => entry.path) },
-				findings: [],
-				evidence: ["reviewed the complete frozen candidate scope"],
-			}));
-			// The published tokens already carry the repository context, and
-			// capture-result accepts that or --cwd, never both.
-			const tokens = (input.arguments as readonly { token: string }[]).map((argument) => argument.token);
-			const captured = await run(binary, ["review", "capture-result", ...tokens, "--input", result], repository);
-			assert.equal(captured.exitCode, 0, `capture-result failed: ${captured.stderr}`);
-		}
-	}
-	assert.fail("collect transitions did not converge");
-}
-
-async function finalizeEmptyReview(repository: string, artifacts: string, started: ReviewStart, evidenceName: string): Promise<CommandResult> {
-	const evidence = join(artifacts, evidenceName);
-	await writeFile(evidence, `evidence for ${started.lineage_id}\n`);
-	await captureSelectedLenses(repository, artifacts, evidenceName);
-	return run(binary, ["review", "finalize", "--cwd", repository, "--lineage", started.lineage_id, "--captured-results=true", "--evidence", evidence], repository);
-}
-
-test("official pinned package runtime authorizes an unchanged linked-view candidate and denies a changed staging tree", async (t) => {
-	await reviewEnabledHome(t);
-	assert.equal(createHash("sha256").update(await readFile(binary)).digest("hex"), OFFICIAL_BINARY_SHA256);
-	assert.deepEqual(await run(binary, ["version"], packageRoot), { exitCode: 0, stdout: `gentle-ai ${GENTLE_AI_VERSION}\n`, stderr: "" });
-
-	const workspace = await mkdtemp(join(tmpdir(), "gentle-pi-v216-parity-"));
-	const repository = join(workspace, "repository");
-	const view = join(workspace, "candidate-view");
-	const artifacts = join(workspace, "artifacts");
-	const temporaryIndex = join(workspace, "controller.index");
-	t.after(async () => rm(workspace, { recursive: true, force: true }));
-
-	await mkdir(repository);
-	await mkdir(artifacts);
-	await run("git", ["init", "--initial-branch=main"], repository);
-	await run("git", ["config", "user.email", "test@example.invalid"], repository);
-	await run("git", ["config", "user.name", "Gentle Pi test"], repository);
-	await writeFile(join(repository, "tracked.txt"), "base\n");
-	await run("git", ["add", "--", "tracked.txt"], repository);
-	await run("git", ["commit", "-m", "base"], repository);
-	const native = new RuntimeNativeReviewCliV216(async (request) => {
-		const command = await run(binary, request.arguments, request.cwd, true);
-		return { ...command, signal: null, timedOut: false, outputLimitExceeded: false };
-	});
-	assert.equal((await native.reviewStatus({ cwd: repository })).status, "clean");
-	await writeFile(join(repository, "tracked.txt"), "candidate\n");
-	await writeFile(join(repository, "initially-untracked.txt"), "included\n");
-
-	const temporaryIndexEnvironment = { ...process.env, GIT_INDEX_FILE: temporaryIndex };
-	await run("git", ["read-tree", "HEAD"], repository, false, temporaryIndexEnvironment);
-	await run("git", ["add", "--", ...REVIEWED_PATHS], repository, false, temporaryIndexEnvironment);
-	const candidateTree = (await run("git", ["write-tree"], repository, false, temporaryIndexEnvironment)).stdout.trim();
-	await run("git", ["worktree", "add", "--detach", view, "HEAD"], repository);
-	await run("git", ["read-tree", candidateTree], view);
-	await run("git", ["checkout-index", "--all", "--force"], view);
-
-	assert.equal((await readFile(join(view, "tracked.txt"), "utf8")), "candidate\n");
-	assert.equal((await readFile(join(view, "initially-untracked.txt"), "utf8")), "included\n");
-	const started = JSON.parse((await run(binary, ["review", "start", "--cwd", view], view)).stdout) as ReviewStart;
-
-	const evidence = join(artifacts, "final-evidence.txt");
-	await writeFile(evidence, "linked-view parity probe\n");
-	// The linked view is the root authority froze, so its collect bindings are
-	// derived from the view, not from the contributor repository.
-	await captureSelectedLenses(view, artifacts, "final-evidence.txt");
-	await run(binary, ["review", "finalize", "--cwd", view, "--lineage", started.lineage_id, "--captured-results=true", "--evidence", evidence], view);
-
-	await run("git", ["add", "--", ...REVIEWED_PATHS], repository);
-	await assertPublishedProjection(repository, candidateTree);
-	const allowed = JSON.parse((await run(binary, ["review", "validate", "--gate", "pre-commit", "--cwd", repository, "--lineage", started.lineage_id], repository)).stdout) as ReviewGateResult;
-	assert.equal(allowed.result, "allow");
-	assert.equal(allowed.allowed, true);
-	assert.equal(allowed.context.candidate_tree, candidateTree);
-	assert.equal(allowed.context.paths_digest, CLEAN_DIFFERENTIAL_PUBLISHED_PATHS_DIGEST);
-	t.diagnostic(JSON.stringify({ candidateTree, publishedPathsDigest: CLEAN_DIFFERENTIAL_PUBLISHED_PATHS_DIGEST, reviewedPaths: REVIEWED_PATHS, reviewedModes: REVIEWED_MODES, binary, startCwd: view, finalizeCwd: view, artifacts }));
-
-	await writeFile(join(repository, "tracked.txt"), "changed-after-review\n");
-	await run("git", ["add", "--", "tracked.txt"], repository);
-	assert.notEqual((await run("git", ["write-tree"], repository)).stdout.trim(), candidateTree);
-	await assertScopeChanged(repository, started.lineage_id);
-	await restoreCandidate(repository, candidateTree);
-
-	await writeFile(join(repository, "extra-reviewed-path.txt"), "not in the frozen candidate\n");
-	await run("git", ["add", "extra-reviewed-path.txt"], repository);
-	assert.notEqual((await run("git", ["write-tree"], repository)).stdout.trim(), candidateTree);
-	assert.deepEqual((await stagedEntries(repository)).map((entry) => entry.split("\t", 2)[1]), [...REVIEWED_PATHS, "extra-reviewed-path.txt"].toSorted());
-	await assertScopeChanged(repository, started.lineage_id);
-	await restoreCandidate(repository, candidateTree);
-
-	await chmod(join(repository, "tracked.txt"), 0o755);
-	await run("git", ["add", "--", "tracked.txt"], repository);
-	const modeDrifted = (await stagedEntries(repository)).some((entry) => entry === "100755" || entry.startsWith("100755 "));
-	if (modeDrifted) {
-		assert.notEqual((await run("git", ["write-tree"], repository)).stdout.trim(), candidateTree);
-		await assertScopeChanged(repository, started.lineage_id);
-	} else {
-		t.diagnostic("skipped native mode-drift denial because this repository/platform does not stage executable-bit changes");
-	}
-	await chmod(join(repository, "tracked.txt"), 0o644);
-	await restoreCandidate(repository, candidateTree);
+test("generated runtime decoder consumes the captured terminal closure directly", async () => {
+	const fixture = JSON.parse(await readFile(join(packageRoot, "tests", "fixtures", "devbinary", "last-event-capture-result-approved.captured.json"), "utf8"));
+	const source = decodeReviewLastEventClosureV1(fixture);
+	const runtime = decodeRuntimeReviewLastEventClosureV1(fixture);
+	assert.deepEqual(runtime, source);
+	assert.equal(runtime.operation, "review/capture-result");
+	assert.equal(runtime.state, "approved");
 });
 
-test("official pinned package runtime keeps frozen candidate lineages and receipts isolated across replay and replacement", async (t) => {
-	await reviewEnabledHome(t);
-	const workspace = await mkdtemp(join(tmpdir(), "gentle-pi-v215-lineage-"));
-	const repository = join(workspace, "repository");
-	const artifacts = join(workspace, "artifacts");
-	t.after(async () => rm(workspace, { recursive: true, force: true }));
-
-	await mkdir(repository);
-	await mkdir(artifacts);
-	await run("git", ["init", "--initial-branch=main"], repository);
-	await run("git", ["config", "user.email", "test@example.invalid"], repository);
-	await run("git", ["config", "user.name", "Gentle Pi test"], repository);
-	await writeFile(join(repository, "tracked.txt"), "base\n");
-	await run("git", ["add", "--", "tracked.txt"], repository);
-	await run("git", ["commit", "-m", "base"], repository);
-
-	await writeFile(join(repository, "tracked.txt"), "candidate one\n");
-	const first = JSON.parse((await run(binary, ["review", "start", "--cwd", repository], repository)).stdout) as ReviewStart;
-	const firstInventory = authorityInventory(await reviewStatus(repository));
-	const firstReplay = JSON.parse((await run(binary, ["review", "start", "--cwd", repository], repository)).stdout) as ReviewStart;
-	const firstReplayInventory = authorityInventory(await reviewStatus(repository));
-	assert.equal(firstReplay.lineage_id, first.lineage_id, "replaying an exact START must reuse the frozen lineage");
-	assert.deepEqual(firstReplayInventory, firstInventory, "replaying an exact START must not create durable authority");
-
-	const firstFinalized = JSON.parse((await finalizeEmptyReview(repository, artifacts, first, "first-evidence.txt")).stdout) as ReviewFinalize;
-	const firstFinalizedInventory = authorityInventory(await reviewStatus(repository));
-	// v2.1.7 terminal replay contract: replay uses the exact explicit lineage with
-	// no mutation inputs; re-sending reviewer results after approval is rejected.
-	const repeatedResults = await finalizeEmptyReview(repository, artifacts, first, "first-evidence.txt").catch((error: NodeJS.ErrnoException & { stderr?: string }) => error);
-	assert.match((repeatedResults as { stderr?: string }).stderr ?? "", /terminal review finalize accepts no review inputs; exact replay requires only --lineage/, "terminal authority must reject replayed reviewer results");
-	const firstFinalizeReplay = JSON.parse((await run(binary, ["review", "finalize", "--cwd", repository, "--lineage", first.lineage_id], repository)).stdout) as ReviewFinalize;
-	const firstFinalizeReplayInventory = authorityInventory(await reviewStatus(repository));
-	assert.equal(firstFinalized.lineage_id, first.lineage_id);
-	assert.equal(firstFinalized.state, "approved");
-	assert.match(firstFinalized.store_revision, /^sha256:[a-f0-9]{64}$/);
-	assert.equal(firstFinalizeReplay.store_revision, firstFinalized.store_revision, "replaying an exact FINALIZE must reuse its receipt revision");
-	assert.equal(firstFinalizeReplay.receipt_path, firstFinalized.receipt_path, "replaying an exact FINALIZE must reuse its receipt location");
-	assert.deepEqual(firstFinalizeReplayInventory, firstFinalizedInventory, "replaying an exact FINALIZE must not create a durable receipt or authority");
-	assert.deepEqual(firstFinalizedInventory, [{ version: "compact-v2", lineage_id: first.lineage_id, status: "approved", state: "approved", revision: firstFinalized.store_revision, problems: [] }]);
-
-	await run("git", ["add", "--", "tracked.txt"], repository);
-	const firstCandidateTree = (await run("git", ["write-tree"], repository)).stdout.trim();
-	const firstAllowed = JSON.parse((await run(binary, ["review", "validate", "--gate", "pre-commit", "--cwd", repository, "--lineage", first.lineage_id], repository)).stdout) as ReviewGateResult;
-	assert.equal(firstAllowed.result, "allow");
-	assert.equal(firstAllowed.context.candidate_tree, firstCandidateTree);
-
-	await writeFile(join(repository, "tracked.txt"), "candidate two\n");
-	await run("git", ["add", "--", "tracked.txt"], repository);
-	const secondCandidateTree = (await run("git", ["write-tree"], repository)).stdout.trim();
-	assert.notEqual(secondCandidateTree, firstCandidateTree);
-	const authorityBeforeCompetingStart = authorityInventory(await reviewStatus(repository));
-	const competingStart = await run(binary, ["review", "start", "--cwd", repository, "--lineage", first.lineage_id], repository);
-	const competingStartResult = JSON.parse(competingStart.stdout) as ReviewStart;
-	const authorityAfterCompetingStart = authorityInventory(await reviewStatus(repository));
-	assert.equal(competingStartResult.action, "blocked-scope-action", "a frozen lineage must return a structured scope-action block for a competing candidate");
-	assert.equal(competingStartResult.lineage_id, first.lineage_id);
-	assert.equal(competingStartResult.state, "approved");
-	assert.deepEqual(authorityAfterCompetingStart, authorityBeforeCompetingStart, "a blocked scope action must not mutate approved authority");
-	// A plain START over the moved candidate does NOT mint a fresh lineage. An
-	// approved lineage whose scope changed is recovered, keeping the operator
-	// pointed at the receipt that already exists instead of quietly abandoning
-	// it, and the recovery itself needs a maintainer to authorize it. Pi mirrors
-	// this because the experience must be the one gentle-ai defines, not a
-	// friendlier one Pi invents.
-	const second = JSON.parse((await run(binary, ["review", "start", "--cwd", repository], repository)).stdout) as ReviewStart;
-	const secondInventory = authorityInventory(await reviewStatus(repository));
-	assert.equal(second.action, "recover");
-	assert.equal(second.state, "approved");
-	assert.equal(second.lineage_id, first.lineage_id, "a moved candidate recovers the approved lineage rather than replacing it");
-	const secondReplay = JSON.parse((await run(binary, ["review", "start", "--cwd", repository], repository)).stdout) as ReviewStart;
-	const secondReplayInventory = authorityInventory(await reviewStatus(repository));
-	assert.equal(secondReplay.action, "recover", "recovery is idempotent");
-	assert.equal(secondReplay.lineage_id, second.lineage_id, "replaying the second START must reuse its lineage");
-	assert.deepEqual(secondReplayInventory, secondInventory, "replaying the second START must not duplicate durable authority");
-	const recoveryTransition = await nextTransition(repository);
-	assert.equal(recoveryTransition.kind, "collect");
-	assert.equal(recoveryTransition.reason_code, "recovery_authorization_required", "recovery must ask a maintainer, never proceed on its own");
-
-	// No receipt covers the moved candidate, so delivery is denied rather than
-	// waved through, and the denial names `gentle-ai review recover` with the
-	// inputs it needs. A blocked gate that names its exit is the whole point.
-	await assertScopeChanged(repository, first.lineage_id);
-
-	await writeFile(join(repository, "tracked.txt"), "candidate one\n");
-	await run("git", ["add", "--", "tracked.txt"], repository);
-	assert.equal((await run("git", ["write-tree"], repository)).stdout.trim(), firstCandidateTree);
-	const firstRestored = JSON.parse((await run(binary, ["review", "validate", "--gate", "pre-commit", "--cwd", repository, "--lineage", first.lineage_id], repository)).stdout) as ReviewGateResult;
-	assert.equal(firstRestored.result, "allow", "the old receipt must remain valid for its exact frozen candidate");
-
-	await writeFile(join(repository, "tracked.txt"), "candidate two\n");
-	await run("git", ["add", "--", "tracked.txt"], repository);
-	assert.equal((await run("git", ["write-tree"], repository)).stdout.trim(), secondCandidateTree);
-	t.diagnostic("pre-push, pre-pr, and release require remote/publication evidence; their network-aware gate contracts remain covered by dedicated gate integration tests rather than this hermetic binary E2E.");
-});
-
-test("registered gentle_review START materializes a safe internal skill symlink and cleans pending consent on session shutdown", async (t) => {
+test("registered gentle_review surfaces the package-pinned Pi transport refusal before native START for a safe internal symlink candidate", async (t) => {
 	await reviewEnabledHome(t);
 	const workspace = await mkdtemp(join(tmpdir(), "gentle-pi-v215-symlink-candidate-"));
 	const repository = join(workspace, "repository");
-	t.after(async () => rm(workspace, { recursive: true, force: true }));
+	t.after(async () => {
+		// Candidate views are intentionally read-only. Restore test-workspace write
+		// permissions before cleanup when transport refusal stops before START.
+		await run("chmod", ["-R", "u+w", workspace], workspace, true);
+		await rm(workspace, { recursive: true, force: true });
+	});
 
 	await mkdir(join(repository, ".agents", "skills", "example"), { recursive: true });
 	await mkdir(join(repository, ".agent", "skills"), { recursive: true });
@@ -440,18 +169,17 @@ test("registered gentle_review START materializes a safe internal skill symlink 
 
 	const candidateViews = new CandidateViewRegistry();
 	let nativeStartReached = false;
-	// The production controller pairs with the negotiated client; v2.1.9's ordinary
-	// (non-negotiated) START output carries additional facade fields that the
-	// pinned legacy decoder intentionally rejects.
+	// Materialization and lexical symlink escape rejection have dedicated
+	// candidate-view coverage. This safe shape proves negotiated Pi transport
+	// refusal happens before native START, regardless of candidate materialization.
 	const native = new NativeReviewCliV216(async (request) => {
 		if (request.arguments[0] === "review" && request.arguments[1] === "start") nativeStartReached = true;
 		const command = await run(binary, request.arguments, request.cwd, true);
 		return { ...command, signal: null, timedOut: false, outputLimitExceeded: false };
 	});
 	const tools = new Map<string, RegisteredController>();
-	let sessionShutdown: ((event: unknown, context: ExtensionContext) => Promise<void> | void) | undefined;
 	createGentleAiExtension({ nativeReviewCli: native, candidateViews } as Parameters<typeof createGentleAiExtension>[0])({
-		on(name: string, handler: (event: unknown, context: ExtensionContext) => Promise<void> | void) { if (name === "session_shutdown") sessionShutdown = handler; },
+		on() {},
 		registerTool(definition: RegisteredController & { name: string }) { tools.set(definition.name, definition); },
 		registerCommand() {},
 	} as unknown as ExtensionAPI);
@@ -461,27 +189,20 @@ test("registered gentle_review START materializes a safe internal skill symlink 
 	let returned: { details?: unknown } | undefined;
 	let thrown: unknown;
 	try {
-		// A headless context still receives notices, so the stub carries notify.
-		// Without it the consent path throws on a real ExtensionContext member,
-		// and the failure reads as a START problem rather than a stub gap.
-		returned = await controller.execute("issue-146-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, { cwd: repository, hasUI: false, ui: { confirm: async () => true, notify: () => {} } } as unknown as ExtensionContext);
+		returned = await controller.execute("issue-146-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, { cwd: repository, hasUI: false, ui: { notify: () => {} } } as unknown as ExtensionContext);
 	} catch (caught) {
 		thrown = caught;
 	}
 	const error = thrown instanceof Error ? { name: thrown.name, message: thrown.message } : thrown === undefined ? undefined : String(thrown);
 	t.diagnostic(JSON.stringify({ returned: returned?.details, error, nativeStartReached }));
-	assert.equal(thrown, undefined, "safe internal symlink materialization must not throw before START");
-	assert.equal(nativeStartReached, true, "safe internal symlink materialization must reach native START");
+	assert.equal(thrown, undefined, "the Pi transport refusal must be returned, not thrown");
 	const result = returned?.details as Record<string, unknown> | undefined;
+	const relayTransport = result?.relay_transport as Record<string, unknown> | undefined;
 	assert.equal(result?.status, "blocked");
-	assert.equal(result?.outcome, "native-review-consent-required");
-	assert.equal(typeof result?.consent_binding, "string");
-	assert.equal(result?.lineage_created, false);
-	assert.ok(sessionShutdown, "extension must register session_shutdown cleanup");
-	const context = { cwd: repository, hasUI: false, ui: { notify: () => {} } } as unknown as ExtensionContext;
-	await sessionShutdown({}, context);
-	await assert.rejects(
-		controller.execute("answer-after-shutdown", { operation: "answer-consent", input: JSON.stringify({ consentBinding: result!.consent_binding, answer: "granted" }) }, undefined, undefined, context),
-		/unknown, expired, or already consumed/,
-	);
+	assert.equal(result?.outcome, "pi-host-relay-transport-unavailable");
+	assert.equal(relayTransport?.code, "immutable_review_transport_unsupported");
+	assert.equal(result?.mutation_performed, false);
+	assert.equal(result?.mutation_outcome, "none");
+	if (result !== undefined && "lineage_created" in result) assert.equal(result.lineage_created, false);
+	assert.equal(nativeStartReached, false, "negotiated Pi transport refusal must preclude native START and any agent-less fallback");
 });

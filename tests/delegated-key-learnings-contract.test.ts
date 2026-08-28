@@ -87,13 +87,14 @@ test("no SDD phase executor infers Key Learnings through `standard phase envelop
 
 test("SDD executor coverage is exhaustive against actual agent files", () => {
 	const actual = sddAgents();
-	// Allowlist: the 12 known phase executors. A new sdd-*.md without a
+	// Allowlist: the 13 known phase executors. A new sdd-*.md without a
 	// Key Learnings Closing section fails the first test; this test proves
 	// the allowlist matches reality so coverage cannot silently drift.
 	const expected = [
 		"sdd-apply.md", "sdd-archive.md", "sdd-design.md", "sdd-explore.md",
-		"sdd-init.md", "sdd-onboard.md", "sdd-proposal.md", "sdd-spec.md",
-		"sdd-status.md", "sdd-sync.md", "sdd-tasks.md", "sdd-verify.md",
+		"sdd-init.md", "sdd-onboard.md", "sdd-proposal.md", "sdd-research.md",
+		"sdd-spec.md", "sdd-status.md", "sdd-sync.md", "sdd-tasks.md",
+		"sdd-verify.md",
 	];
 	assert.deepEqual(actual, expected, "SDD agent set must match the known allowlist");
 });
@@ -229,9 +230,10 @@ test("modified SDD agents are packaged and installed by the existing installer",
 		"assets/agents/sdd-apply.md", "assets/agents/sdd-archive.md",
 		"assets/agents/sdd-design.md", "assets/agents/sdd-explore.md",
 		"assets/agents/sdd-init.md", "assets/agents/sdd-onboard.md",
-		"assets/agents/sdd-proposal.md", "assets/agents/sdd-spec.md",
-		"assets/agents/sdd-status.md", "assets/agents/sdd-sync.md",
-		"assets/agents/sdd-tasks.md", "assets/agents/sdd-verify.md",
+		"assets/agents/sdd-proposal.md", "assets/agents/sdd-research.md",
+		"assets/agents/sdd-spec.md", "assets/agents/sdd-status.md",
+		"assets/agents/sdd-sync.md", "assets/agents/sdd-tasks.md",
+		"assets/agents/sdd-verify.md",
 	];
 	for (const path of expected) {
 		assert.match(verifier, new RegExp(path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `${path} must be in the package verifier`);

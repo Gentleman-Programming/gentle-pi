@@ -125,40 +125,41 @@ Explicit Judgment Day replaces ordinary, uses two blind judges, zero refuters, a
 - WHEN evaluated
 - THEN no third round runs and the transaction escalates
 
-### Requirement: Receipt-only boundaries
+### Requirement: Review-only boundaries
 
-PR #1216 introduced the v2.1.1 `<remote>/<branch>` selector contract that v2.1.2 inherits unchanged.
+Review and Judgment Day evidence is scoped to review. Pi MUST NOT mint delivery authority from receipts, lineages, candidate identity, validation, or any other review artifact. Ordinary commit, push, PR, and release always follow the repository's own policy.
 
-Gates MUST accept only typed exact targets: intended commit tree; ordered push ref updates; PR base/head ref/commit/tree; or release tag/object/commit/tree. Native pre-push to an existing branch MUST require the effective push URL and repository identity to equal the fetch URL and identity used by the exact `<remote>/<branch>` selector, bind command remote, destination ref, old/new objects, selector, and advertised commit in one fingerprint, and rederive that fingerprint at bash time. Split fetch/push pre-push is an upstream contract limitation because v2.1.1 resolves `<remote>/<branch>` through fetch-side remote-tracking state; probing `pushurl` MUST NOT be treated as changing selector resolution, and this topology MUST fail closed before native validation with a typed unsupported next action. Native pre-PR MUST preserve fetch-side repository/base/head query semantics, MAY continue using advertised remote selectors, MUST bind the target repository selected by `--repo`, then `GH_REPO`, then unambiguous local inference, plus the exact advertised remote head commit equal to reviewed local HEAD, and MUST rederive the full publication target after each native allow before registering or consuming authorization. Native first-push authorization remains unsupported until a separate follow-up adds a persisted explicit advertised-base source; a missing destination MUST fail closed without upstream, default-branch, or nearest-ancestor inference. An authorizing allow response MUST return the exact requested gate and, for pre-PR, the exact `pre_pr_boundary`. A non-authorizing denial MAY return an empty gate and no `pre_pr_boundary`; any non-empty returned gate MUST equal the requested gate, its structured result/action/reason MUST be preserved, and no denial can register authorization. Network publication probes MUST use fixed argv without a shell, short time/output bounds, and available cancellation. Complete publication/native revalidation MUST use one aggregate bash-time deadline combined safely with any Pi cancellation signal. Every identity MUST resolve and match receipt base/final semantics; otherwise fail closed. Journaled results bind target hash and launch zero actors. SDD adds no review; transactions deliver nothing.
+#### Scenario: Review evidence is available
 
-#### Scenario: Unchanged target
-
-- GIVEN an approved receipt and resolved target
-- WHEN validated
-- THEN matching base/final semantics allow with zero actors
+- GIVEN an approved receipt and a resolved target
+- WHEN review completes
+- THEN the receipt remains review evidence only
+- AND ordinary delivery follows repository policy without Pi authorization
 
 #### Scenario: Incident after approval
 
 - GIVEN a post-approval incident
 - WHEN recovery starts
-- THEN the lineage remains closed and performs no delivery
+- THEN the lineage remains closed and has no delivery effect
 
-### Requirement: Durable pre-commit transaction
+### Requirement: Ordinary repository delivery remains independent
 
-An authorized direct `git commit` MUST be replaced by one package-owned Git-common-dir transaction. It MUST bind command intent, repository/worktree identity, original HEAD/index, lineage, and recovery state; execute the effective pre-commit hook once; derive and natively validate the exact post-hook tree; preserve applicable message/post hooks through proxies without rerunning pre-commit; and prove the resulting `HEAD^{tree}` equals native authorization. Hook/validation/commit failure or interruption MUST create no silently publishable result, MUST NOT reset Git content automatically, and MUST block push, PR, and release until deterministic reconciliation or explicit safe abandonment. Amend, signing arguments, cancellation, stale locks, and exact post-hook retry MUST remain bound to the same transaction.
+Pi MUST NOT replace, wrap, validate, authorize, block, or recover direct `git commit`, push, PR, or release operations. Hooks, command retries, failures, and recovery for those operations remain repository-policy concerns and must not consume or depend on Pi review evidence.
 
 #### Scenario: Mutating pre-commit hook
 
-- GIVEN a reviewed staged tree and a hook that formats and stages content
+- GIVEN a repository hook that formats and stages content
 - WHEN direct commit runs
-- THEN the hook runs once, native validation evaluates the formatted tree, and scope change creates no commit until that tree is reviewed; exact retry skips the completed hook
+- THEN the repository hook and commit follow repository policy
+- AND Pi review evidence does not authorize or block the commit
 
 #### Scenario: Commit proof or crash
 
-- GIVEN native allowed the post-hook tree
-- WHEN Git returns or the runner restarts after an uncertain boundary
-- THEN the transaction proves or reconciles `HEAD^{tree}` against that tree, and any mismatch remains a publication-blocking incident
+- GIVEN Git returns or the runner restarts after an uncertain delivery boundary
+- WHEN repository recovery runs
+- THEN repository policy determines reconciliation
+- AND Pi review evidence has no publication effect
 
 ## Acceptance Criteria
 
-Tests MUST cover every binding, replay/budget, integrity, exact-gate, reducer, and forbidden-transition invariant.
+Tests MUST cover every review binding, replay/budget, integrity, reducer, and forbidden-transition invariant without asserting Pi delivery authority.

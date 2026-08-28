@@ -1,13 +1,9 @@
 export const REVIEW_INTEGRATION_CONTRACT = "gentle-ai.review-integration/v2";
 
 export const REVIEW_INTEGRATION_OPERATION = {
-	BIND_SDD: "review.bind_sdd",
-	CAPABILITIES: "review.capabilities",
-	FINALIZE: "review.finalize",
 	REPAIR: "review.repair",
 	START: "review.start",
 	STATUS: "review.status",
-	VALIDATE: "review.validate",
 } as const;
 export type ReviewIntegrationOperation = (typeof REVIEW_INTEGRATION_OPERATION)[keyof typeof REVIEW_INTEGRATION_OPERATION];
 
@@ -78,30 +74,25 @@ export const REVIEW_START_STATE = {
 } as const;
 export type ReviewStartState = (typeof REVIEW_START_STATE)[keyof typeof REVIEW_START_STATE];
 
-const START_ACTIONS = ["created", "resumed", "reuse-receipt", "blocked-scope-action"] as const;
+const START_ACTIONS = ["created", "resumed", "closed", "blocked-scope-action"] as const;
 const RISK_LEVELS = ["low", "medium", "high"] as const;
 const REVIEW_LENSES = ["review-risk", "review-resilience", "review-readability", "review-reliability"] as const;
 const RISK_REASON_CODES = ["configuration_change", "empty_content", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "process_boundary", "process_scan_limit", "service_token", "shell_source"] as const;
 const RISK_SIGNALS = ["auth", "update", "security", "payments", "permissions", "shell_process"] as const;
-const STATUS_ACTIONS = ["start", "finalize", "validate", "recover", "retry_final_verification", "maintainer_action", "select_lineage", "repair_authority", "reconcile_finalize", "stop"] as const;
+const STATUS_ACTIONS = ["start", "recover", "maintainer_action", "select_lineage", "repair_authority", "stop"] as const;
 export const REVIEW_STATUS_ACTION_DISPOSITION = {
 	SCOPE_CHANGED: "scope_changed",
 	INVALIDATED: "invalidated",
 	ESCALATED: "escalated",
-	FINAL_VERIFICATION_RETRY: "final_verification_retry",
 } as const;
 export type ReviewStatusActionDisposition = (typeof REVIEW_STATUS_ACTION_DISPOSITION)[keyof typeof REVIEW_STATUS_ACTION_DISPOSITION];
-const RECEIPT_STATUSES = ["expected_missing", "present", "publication_pending", "not_applicable"] as const;
 const REQUIRED_OPERATIONS = Object.freeze(Object.values(REVIEW_INTEGRATION_OPERATION));
-// failure/v2 operations: the capability floor plus the four collect-capture
-// verbs that emit typed refusals on the gentle-ai main line (commit a2d57117,
-// fix/capture-evidence-typed-refusal; exact strings from that branch's
-// published failure.schema.json 12-value operation enum). Additive forward
-// surface: every operation outside the published enum still rejects.
+// Typed failures are accepted only for the supported start, status, repair,
+// and last-event capture operations. Retired lifecycle verbs fail closed.
 const FAILURE_OPERATIONS = Object.freeze([
 	...REQUIRED_OPERATIONS,
 	"review.capture-result",
-	"review.capture-evidence",
+	"review.capture-correction-plan",
 	"review.capture-refuter",
 	"review.capture-validation",
 ] as const);
@@ -204,7 +195,6 @@ type ReviewLens = (typeof REVIEW_LENSES)[number];
 type RiskReasonCode = (typeof RISK_REASON_CODES)[number];
 type RiskSignal = (typeof RISK_SIGNALS)[number];
 type ReviewStatusAction = (typeof STATUS_ACTIONS)[number];
-type ReviewReceiptStatus = (typeof RECEIPT_STATUSES)[number];
 
 export interface ReviewFeatureV2 {
 	name: (typeof FEATURE_NAMES)[number];
@@ -323,11 +313,6 @@ export interface ReviewStatusAuthorityV1 {
 	revision: string;
 }
 
-export interface ReviewStatusReceiptV1 {
-	status: ReviewReceiptStatus;
-	identity?: string;
-}
-
 export interface ReviewStatusFrozenV1 {
 	tier: RiskLevel;
 	originalChangedLines: number;
@@ -369,6 +354,8 @@ export interface ReviewCaptureSubmissionValueV1 {
 	 * array rows never carry it and existing consumers stay untouched.
 	 */
 	schema?: string;
+	minimum?: number;
+	maximum?: number;
 }
 
 export interface ReviewCaptureSubmissionV1 {
@@ -411,27 +398,6 @@ export interface ReviewProviderTaskV1 {
 	prompt: string;
 }
 
-export interface ReviewSubmissionDescriptorValueV5 {
-	slot: string;
-	domain: string;
-	substitutionLocation: number;
-	schema?: string;
-	minimum?: number;
-	maximum?: number;
-	allowedValues?: readonly string[];
-}
-
-// The two v5 Go-owned submission descriptor forms (finalize carries one
-// singular `value`; capture-evidence carries an outcome/input `values` pair).
-// Distinct from the host-relay ReviewCaptureSubmissionV1 form, which stays
-// exactly as it is.
-export interface ReviewSubmissionDescriptorV5 {
-	operationToken: "finalize" | "capture-evidence";
-	argumentTokens: readonly string[];
-	value?: ReviewSubmissionDescriptorValueV5;
-	values?: readonly ReviewSubmissionDescriptorValueV5[];
-}
-
 export interface ReviewCorrectionPlanFindingV1 {
 	id: string;
 	lens: "risk" | "resilience" | "readability" | "reliability";
@@ -455,6 +421,41 @@ export interface ReviewCorrectionPlanRequestV1 {
 	findings: readonly ReviewCorrectionPlanFindingV1[];
 }
 
+export interface ReviewTargetedValidationFindingV1 {
+	id: string;
+	lens: "risk" | "resilience" | "readability" | "reliability";
+	location: string;
+	severity: "BLOCKER" | "CRITICAL";
+	claim: string;
+	proofRefs: readonly string[];
+	evidenceClass: "deterministic" | "inferential";
+	causalDisposition: "introduced" | "behavior-activated" | "worsened";
+}
+
+export interface ReviewTargetedValidationClassificationV1 {
+	findingId: string;
+	class: "deterministic" | "inferential";
+	causalDisposition: "introduced" | "behavior-activated" | "worsened";
+	proof: string;
+}
+
+export interface ReviewTargetedValidationRequestV1 {
+	schema: "gentle-ai.review-targeted-validation-request/v1";
+	requestHash: string;
+	lineageId: string;
+	expectedRevision: string;
+	targetIdentity: string;
+	fixFindingIds: readonly string[];
+	policyContent: string;
+	fixFindings: readonly ReviewTargetedValidationFindingV1[];
+	fixClassifications: readonly ReviewTargetedValidationClassificationV1[];
+	projection: ReviewProjection;
+	correctionCandidateTree: string;
+	correctionTargetIdentity: string;
+	correctionPaths: readonly string[];
+	correctionPathsDigest: string;
+}
+
 export interface ReviewCollectInputV3 {
 	name: string;
 	schema: string;
@@ -464,12 +465,11 @@ export interface ReviewCollectInputV3 {
 	baseTree?: string;
 	candidateTree?: string;
 	changedPathManifest?: readonly ChangedPathEntry[];
-	validationRequest?: ReviewTargetedValidationRequestV1;
 	submission?: ReviewCaptureSubmissionV1;
-	/** status/v5 only: the finalize/capture-evidence descriptor forms. */
-	submissionDescriptor?: ReviewSubmissionDescriptorV5;
 	/** status/v5 only: the self-contained external.run_provider_role task. */
 	providerTask?: ReviewProviderTaskV1;
+	/** status/v5 only: the provider-owned request for a Go-owned targeted validator. */
+	validationRequest?: ReviewTargetedValidationRequestV1;
 }
 
 export interface ReviewNextTransitionV3 {
@@ -481,35 +481,10 @@ export interface ReviewNextTransitionV3 {
 	correctionRequest?: ReviewCorrectionPlanRequestV1;
 }
 
-export interface ReviewTargetedValidationRequestV1 {
-	schema: "gentle-ai.review-targeted-validation-request/v1";
-	requestHash: string;
-	lineageId: string;
-	expectedRevision: string;
-	targetIdentity: string;
-	fixFindingIds: readonly string[];
-	projection: ReviewProjection;
-	correctionCandidateTree: string;
-	correctionTargetIdentity: string;
-	correctionPaths: readonly string[];
-	correctionPathsDigest: string;
-}
-
-export interface ReviewFinalVerificationRetryV1 {
-	incidentSchema: "gentle-ai.review-final-verification-incident/v1";
-	incidentClass: "procedural_tooling_failure";
-	validatingRevision: string;
-	targetIdentity: string;
-	failedEvidenceHash: string;
-	failedEvidenceRecordDigest?: string;
-	finalizeRequestDigest: string;
-}
-
 export interface ReviewStatusV3 {
 	contract: typeof REVIEW_INTEGRATION_CONTRACT;
 	applicability: Exclude<ReviewAuthorityApplicability, "not_evaluated">;
 	authority?: ReviewStatusAuthorityV1;
-	receipt: ReviewStatusReceiptV1;
 	action: ReviewStatusAction;
 	actionDisposition?: ReviewStatusActionDisposition;
 	replayability: ReviewReplayability;
@@ -521,8 +496,6 @@ export interface ReviewStatusV3 {
 	repair: AuthorityRepairAssessmentV1;
 	candidates: readonly string[];
 	nextTransition?: ReviewNextTransitionV3;
-	validationRequest?: ReviewTargetedValidationRequestV1;
-	finalVerificationRetry?: ReviewFinalVerificationRetryV1;
 	/** status/v5 only: the descriptive, non-routing transition preview. */
 	forecast?: ReviewForecastV1;
 	/**
@@ -532,6 +505,8 @@ export interface ReviewStatusV3 {
 	 * published status-v5.schema.json omits it (capture is authoritative).
 	 */
 	repositoryContext?: ReviewRepositoryContextV2;
+	/** status/v5 only: the provider-owned request mirrored by the targeted-validator collect input. */
+	validationRequest?: ReviewTargetedValidationRequestV1;
 	raw: Readonly<Record<string, unknown>>;
 }
 
@@ -566,9 +541,17 @@ export interface ReviewConsentV2 {
 // blocking question with one net-new required member, the provider-fixed
 // `agent` runtime binding. Everything shared with v2 keeps its exact shape so
 // consumers of either identity read one structural surface.
+export const REVIEW_CONSENT_AGENT_V3 = {
+	CLAUDE_CODE: "claude-code",
+	OPENCODE: "opencode",
+	CODEX: "codex",
+	PI: "pi",
+} as const;
+export type ReviewConsentAgentV3 = (typeof REVIEW_CONSENT_AGENT_V3)[keyof typeof REVIEW_CONSENT_AGENT_V3];
+
 export interface ReviewConsentV3 extends Omit<ReviewConsentV2, "schema"> {
 	schema: "gentle-ai.review-integration.consent/v3";
-	agent: "claude-code";
+	agent: ReviewConsentAgentV3;
 }
 
 // Either accepted consent identity. Consumers that relay the envelope (rather
@@ -585,12 +568,11 @@ const FAILURE_REQUIRED_INPUTS = [
 	"disposition",
 	"reason",
 	"actor",
-	"incident",
 	"maintainer_authorization",
 	"base_ref",
 ] as const;
 export type ReviewFailureRequiredInputV2 = (typeof FAILURE_REQUIRED_INPUTS)[number];
-const FAILURE_NEXT_ACTIONS = ["correct_request", "retry", "retry_with_bounded_backoff", "review.status", "review.finalize", "review.repair", "review.bind_sdd", "explicit-maintainer-action", "stop"] as const;
+const FAILURE_NEXT_ACTIONS = ["correct_request", "retry", "retry_with_bounded_backoff", "review.status", "review.repair", "explicit-maintainer-action", "stop"] as const;
 export type ReviewFailureNextActionV2 = (typeof FAILURE_NEXT_ACTIONS)[number];
 // Known cause_category values: the vendored failure.schema.json enum plus
 // "incomplete_store_entry", which the v2.1.8 emitter produces beyond that enum.
@@ -625,7 +607,7 @@ export interface ReviewFailureContextV2 {
 	bindingRevision?: ReviewFailureBindingRevisionV1;
 }
 
-export type ReviewFailureOperation = ReviewIntegrationOperation | "review.capture-result" | "review.capture-evidence" | "review.capture-refuter" | "review.capture-validation";
+export type ReviewFailureOperation = ReviewIntegrationOperation | "review.capture-result" | "review.capture-correction-plan" | "review.capture-refuter" | "review.capture-validation";
 
 export interface ReviewFailureV2 {
 	schema: "gentle-ai.review-integration.failure/v2";
@@ -649,11 +631,32 @@ export interface ReviewFailureV2 {
 	raw: Readonly<Record<string, unknown>>;
 }
 
-export interface ReviewOperationV2 {
-	contract: typeof REVIEW_INTEGRATION_CONTRACT;
-	operation: "review.finalize" | "review.validate" | "review.bind_sdd" | "review.retry_final_verification";
-	result: Readonly<Record<string, unknown>>;
-	raw: Readonly<Record<string, unknown>>;
+export const REVIEW_ADVISORY_FINDING_SEVERITY = {
+	BLOCKER: "BLOCKER",
+	CRITICAL: "CRITICAL",
+	WARNING: "WARNING",
+	SUGGESTION: "SUGGESTION",
+} as const;
+export type ReviewAdvisoryFindingSeverity = (typeof REVIEW_ADVISORY_FINDING_SEVERITY)[keyof typeof REVIEW_ADVISORY_FINDING_SEVERITY];
+
+export const REVIEW_ADVISORY_FINDING_DISPOSITION = {
+	INFORMATIONAL: "informational",
+	FOLLOW_UP: "follow_up",
+	REFUTED: "refuted",
+} as const;
+export type ReviewAdvisoryFindingDisposition = (typeof REVIEW_ADVISORY_FINDING_DISPOSITION)[keyof typeof REVIEW_ADVISORY_FINDING_DISPOSITION];
+
+export interface ReviewAdvisoryFindingV1 {
+	id: string;
+	lens?: string;
+	location?: string;
+	severity: ReviewAdvisoryFindingSeverity;
+	disposition: ReviewAdvisoryFindingDisposition;
+}
+
+export interface ReviewAdvisoryFindingsV1 {
+	statement: string;
+	findings: readonly ReviewAdvisoryFindingV1[];
 }
 
 export interface AuthorityRepairAssessmentCandidateV1 {
@@ -1188,35 +1191,12 @@ export function decodeAuthorityRepairAssessmentV1(value: unknown): AuthorityRepa
 }
 
 // ---------------------------------------------------------------------------
-// targeted-validation-request/v1 — reused for status.validation_request,
-// operation.result.validation_request, and next_transition collect inputs.
-// ---------------------------------------------------------------------------
-
-function decodeTargetedValidationRequestV1(value: unknown, label: string): ReviewTargetedValidationRequestV1 {
-	const body = exactRecord(value, label, ["schema", "request_hash", "lineage_id", "expected_revision", "target_identity", "fix_finding_ids", "projection", "correction_candidate_tree", "correction_target_identity", "correction_paths", "correction_paths_digest"]);
-	if (body.schema !== "gentle-ai.review-targeted-validation-request/v1") throw new TypeError(`${label}.schema must be gentle-ai.review-targeted-validation-request/v1`);
-	return {
-		schema: "gentle-ai.review-targeted-validation-request/v1",
-		requestHash: sha256(body.request_hash, `${label}.request_hash`),
-		lineageId: lineage(body.lineage_id, `${label}.lineage_id`),
-		expectedRevision: sha256(body.expected_revision, `${label}.expected_revision`),
-		targetIdentity: sha256(body.target_identity, `${label}.target_identity`),
-		fixFindingIds: stringArray(body.fix_finding_ids, `${label}.fix_finding_ids`, { minimum: 1, unique: true }),
-		projection: enumeration(body.projection, REQUIRED_PROJECTIONS, `${label}.projection`),
-		correctionCandidateTree: gitTree(body.correction_candidate_tree, `${label}.correction_candidate_tree`),
-		correctionTargetIdentity: sha256(body.correction_target_identity, `${label}.correction_target_identity`),
-		correctionPaths: stringArray(body.correction_paths, `${label}.correction_paths`, { minimum: 1, unique: true }),
-		correctionPathsDigest: sha256(body.correction_paths_digest, `${label}.correction_paths_digest`),
-	};
-}
-
-// ---------------------------------------------------------------------------
 // next-transition/v3 — net-new; unlike v1's decodeNextTransition (void),
 // this decoder returns a typed value so callers can read the manifest-bound
 // collect inputs and the execute binding.
 // ---------------------------------------------------------------------------
 
-const NEXT_TRANSITION_OPERATIONS = ["review.start", "review.finalize", "review.recover", "review.repair", "review.validate"] as const;
+const NEXT_TRANSITION_OPERATIONS = ["review.start", "review.recover", "review.repair"] as const;
 
 function decodeTransitionArguments(value: unknown, label: string): readonly ReviewTransitionArgumentV3[] {
 	return array(value, label, (entry, entryLabel) => {
@@ -1239,16 +1219,22 @@ function decodeCaptureSubmission(value: unknown, label: string, v5: boolean): Re
 	// through to the legacy decoder, which rejects the unknown `value` key.
 	if (v5 && typeof value === "object" && value !== null && "value" in value && !("values" in value)) {
 		const submission = exactRecord(value, label, ["operation_token", "argument_tokens", "value"]);
-		if (submission.operation_token !== "capture-result") throw new TypeError(`${label}.operation_token must be capture-result for the singular value form`);
+		const operationToken = enumeration(submission.operation_token, ["capture-result", "capture-correction-plan"] as const, `${label}.operation_token`);
 		const argumentTokens = stringArray(submission.argument_tokens, `${label}.argument_tokens`, { minimum: 1 });
-		const row = exactRecord(submission.value, `${label}.value`, ["slot", "domain", "schema", "substitution_location"]);
+		const row = operationToken === "capture-result"
+			? exactRecord(submission.value, `${label}.value`, ["slot", "domain", "schema", "substitution_location"])
+			: exactRecord(submission.value, `${label}.value`, ["slot", "domain", "minimum", "maximum", "substitution_location"]);
 		return {
-			operationToken: "capture-result",
+			operationToken,
 			argumentTokens,
 			values: [{
-				slot: enumeration(row.slot, ["reviewer_result"] as const, `${label}.value.slot`),
+				slot: operationToken === "capture-result"
+					? enumeration(row.slot, ["reviewer_result"] as const, `${label}.value.slot`)
+					: enumeration(row.slot, ["correction_lines"] as const, `${label}.value.slot`),
 				domain: nonempty(row.domain, `${label}.value.domain`),
-				schema: nonempty(row.schema, `${label}.value.schema`),
+				...(row.schema === undefined ? {} : { schema: nonempty(row.schema, `${label}.value.schema`) }),
+				...(row.minimum === undefined ? {} : { minimum: integer(row.minimum, `${label}.value.minimum`, 1, 200) }),
+				...(row.maximum === undefined ? {} : { maximum: integer(row.maximum, `${label}.value.maximum`, 1, 200) }),
 				substitutionLocation: integer(row.substitution_location, `${label}.value.substitution_location`, 0, argumentTokens.length - 1),
 			}],
 		};
@@ -1279,40 +1265,6 @@ function decodeProviderTask(value: unknown, label: string): ReviewProviderTaskV1
 	};
 }
 
-function decodeSubmissionDescriptorV5(value: unknown, label: string, operationToken: "finalize" | "capture-evidence"): ReviewSubmissionDescriptorV5 {
-	if (operationToken === "finalize") {
-		const descriptor = exactRecord(value, label, ["operation_token", "argument_tokens", "value"]);
-		const argumentTokens = stringArray(descriptor.argument_tokens, `${label}.argument_tokens`, { minimum: 7 });
-		const source = exactRecord(descriptor.value, `${label}.value`, ["slot", "domain", "substitution_location"], ["schema", "minimum", "maximum"]);
-		const slot = enumeration(source.slot, ["correction_lines", "validation"] as const, `${label}.value.slot`);
-		return {
-			operationToken,
-			argumentTokens,
-			value: {
-				slot,
-				domain: nonempty(source.domain, `${label}.value.domain`),
-				substitutionLocation: integer(source.substitution_location, `${label}.value.substitution_location`, 0, argumentTokens.length - 1),
-				...(source.schema === undefined ? {} : { schema: nonempty(source.schema, `${label}.value.schema`) }),
-				...(source.minimum === undefined ? {} : { minimum: integer(source.minimum, `${label}.value.minimum`, 1, 200) }),
-				...(source.maximum === undefined ? {} : { maximum: integer(source.maximum, `${label}.value.maximum`, 1, 200) }),
-			},
-		};
-	}
-	const descriptor = exactRecord(value, label, ["operation_token", "argument_tokens", "values"]);
-	const argumentTokens = stringArray(descriptor.argument_tokens, `${label}.argument_tokens`, { minimum: 6, maximum: 6 });
-	const values = array(descriptor.values, `${label}.values`, (entry, entryLabel) => {
-		const source = exactRecord(entry, entryLabel, ["slot", "domain", "substitution_location"], ["schema", "allowed_values"]);
-		return {
-			slot: nonempty(source.slot, `${entryLabel}.slot`),
-			domain: nonempty(source.domain, `${entryLabel}.domain`),
-			substitutionLocation: integer(source.substitution_location, `${entryLabel}.substitution_location`, 0, argumentTokens.length - 1),
-			...(source.schema === undefined ? {} : { schema: nonempty(source.schema, `${entryLabel}.schema`) }),
-			...(source.allowed_values === undefined ? {} : { allowedValues: stringArray(source.allowed_values, `${entryLabel}.allowed_values`, { minimum: 1, unique: true }) }),
-		};
-	}, { minimum: 2, maximum: 2 });
-	return { operationToken, argumentTokens, values };
-}
-
 function decodeCorrectionPlanRequestV1(value: unknown, label: string): ReviewCorrectionPlanRequestV1 {
 	const body = exactRecord(value, label, ["schema", "request_hash", "lineage_id", "expected_revision", "target_identity", "correction_budget", "fix_finding_ids", "findings"]);
 	if (body.schema !== "gentle-ai.review-correction-plan-request/v1") throw new TypeError(`${label}.schema must be gentle-ai.review-correction-plan-request/v1`);
@@ -1341,6 +1293,57 @@ function decodeCorrectionPlanRequestV1(value: unknown, label: string): ReviewCor
 	};
 }
 
+export function decodeReviewTargetedValidationRequestV1(value: unknown, label = "targeted_validation_request"): ReviewTargetedValidationRequestV1 {
+	const body = exactRecord(value, label, [
+		"schema", "request_hash", "lineage_id", "expected_revision", "target_identity", "fix_finding_ids", "policy_content", "fix_findings", "fix_classifications",
+		"projection", "correction_candidate_tree", "correction_target_identity", "correction_paths", "correction_paths_digest",
+	]);
+	if (body.schema !== "gentle-ai.review-targeted-validation-request/v1") throw new TypeError(`${label}.schema must be gentle-ai.review-targeted-validation-request/v1`);
+	const fixFindingIds = stringArray(body.fix_finding_ids, `${label}.fix_finding_ids`, { minimum: 1, unique: true });
+	const fixFindings = array(body.fix_findings, `${label}.fix_findings`, (entry, entryLabel): ReviewTargetedValidationFindingV1 => {
+		const finding = exactRecord(entry, entryLabel, ["id", "lens", "location", "severity", "claim", "proof_refs", "evidence_class", "causal_disposition"]);
+		return {
+			id: nonempty(finding.id, `${entryLabel}.id`),
+			lens: enumeration(finding.lens, ["risk", "resilience", "readability", "reliability"] as const, `${entryLabel}.lens`),
+			location: nonempty(finding.location, `${entryLabel}.location`),
+			severity: enumeration(finding.severity, ["BLOCKER", "CRITICAL"] as const, `${entryLabel}.severity`),
+			claim: nonempty(finding.claim, `${entryLabel}.claim`),
+			proofRefs: stringArray(finding.proof_refs, `${entryLabel}.proof_refs`, { minimum: 1 }),
+			evidenceClass: enumeration(finding.evidence_class, ["deterministic", "inferential"] as const, `${entryLabel}.evidence_class`),
+			causalDisposition: enumeration(finding.causal_disposition, ["introduced", "behavior-activated", "worsened"] as const, `${entryLabel}.causal_disposition`),
+		};
+	}, { minimum: 1 });
+	const fixClassifications = array(body.fix_classifications, `${label}.fix_classifications`, (entry, entryLabel): ReviewTargetedValidationClassificationV1 => {
+		const classification = exactRecord(entry, entryLabel, ["finding_id", "class", "causal_disposition", "proof"]);
+		return {
+			findingId: nonempty(classification.finding_id, `${entryLabel}.finding_id`),
+			class: enumeration(classification.class, ["deterministic", "inferential"] as const, `${entryLabel}.class`),
+			causalDisposition: enumeration(classification.causal_disposition, ["introduced", "behavior-activated", "worsened"] as const, `${entryLabel}.causal_disposition`),
+			proof: nonempty(classification.proof, `${entryLabel}.proof`),
+		};
+	}, { minimum: 1 });
+	const findingIds = fixFindings.map((finding) => finding.id);
+	const classificationFindingIds = fixClassifications.map((classification) => classification.findingId);
+	assertExactSet(findingIds, fixFindingIds, `${label}.fix_findings`);
+	assertExactSet(classificationFindingIds, fixFindingIds, `${label}.fix_classifications`);
+	return {
+		schema: "gentle-ai.review-targeted-validation-request/v1",
+		requestHash: sha256(body.request_hash, `${label}.request_hash`),
+		lineageId: lineage(body.lineage_id, `${label}.lineage_id`),
+		expectedRevision: sha256(body.expected_revision, `${label}.expected_revision`),
+		targetIdentity: sha256(body.target_identity, `${label}.target_identity`),
+		fixFindingIds,
+		policyContent: nonempty(body.policy_content, `${label}.policy_content`),
+		fixFindings,
+		fixClassifications,
+		projection: enumeration(body.projection, REQUIRED_PROJECTIONS, `${label}.projection`),
+		correctionCandidateTree: gitTree(body.correction_candidate_tree, `${label}.correction_candidate_tree`),
+		correctionTargetIdentity: sha256(body.correction_target_identity, `${label}.correction_target_identity`),
+		correctionPaths: stringArray(body.correction_paths, `${label}.correction_paths`, { minimum: 1, unique: true }),
+		correctionPathsDigest: sha256(body.correction_paths_digest, `${label}.correction_paths_digest`),
+	};
+}
+
 export function decodeReviewForecastV1(value: unknown, label = "status.forecast"): ReviewForecastV1 {
 	const body = exactRecord(value, label, ["horizon", "steps"]);
 	const horizon = enumeration(body.horizon, ["partial", "terminal"] as const, `${label}.horizon`);
@@ -1364,23 +1367,14 @@ export function decodeReviewForecastV1(value: unknown, label = "status.forecast"
 // request; every other reason code must not.
 const CORRECTION_REQUEST_REASON_CODES = Object.freeze(["correction_plan_required", "corrected_candidate_unavailable"] as const);
 // v5 capture operations that must carry a submission descriptor.
-const V5_SUBMISSION_CAPTURE_OPERATIONS = Object.freeze(["external.plan_correction", "external.run_targeted_validation", "review.capture-evidence"] as const);
+const V5_SUBMISSION_CAPTURE_OPERATIONS = Object.freeze(["review.capture-correction-plan"] as const);
 
 function decodeCollectInput(value: unknown, label: string, v5: boolean): ReviewCollectInputV3 {
-	const input = exactRecord(value, label, ["name", "schema", "capture_operation", "arguments"], ["artifact_subject", "base_tree", "candidate_tree", "changed_path_manifest", "validation_request", "submission", ...(v5 ? ["provider_task"] : [])]);
+	const input = exactRecord(value, label, ["name", "schema", "capture_operation", "arguments"], ["artifact_subject", "base_tree", "candidate_tree", "changed_path_manifest", "submission", ...(v5 ? ["provider_task", "validation_request"] : [])]);
 	const name = text(input.name, `${label}.name`, { minimum: 1, pattern: /^[a-z0-9_]+$/ });
 	const schema = nonempty(input.schema, `${label}.schema`);
 	const captureOperation = nonempty(input.capture_operation, `${label}.capture_operation`);
 	const argumentsList = decodeTransitionArguments(input.arguments, `${label}.arguments`);
-
-	if (captureOperation === "external.run_targeted_validation") {
-		if (input.validation_request === undefined) throw new TypeError(`${label}.validation_request is required`);
-		if (schema !== "gentle-ai.review-targeted-validation-request/v1") throw new TypeError(`${label}.schema must be gentle-ai.review-targeted-validation-request/v1`);
-	} else if (captureOperation === REVIEW_PROVIDER_ROLE_CAPTURE_OPERATION.CAPTURE_VALIDATION) {
-		if (input.validation_request === undefined) throw new TypeError(`${label}.validation_request is required`);
-	} else if (input.validation_request !== undefined) {
-		throw new TypeError(`${label}.validation_request is only valid for external.run_targeted_validation or review.capture-validation`);
-	}
 
 	// v5-only surfaces (vendored status-v5.schema.json): the provider role task
 	// rides exactly the external.run_provider_role vector, and the finalize/
@@ -1393,8 +1387,7 @@ function decodeCollectInput(value: unknown, label: string, v5: boolean): ReviewC
 		}
 		if ((V5_SUBMISSION_CAPTURE_OPERATIONS as readonly string[]).includes(captureOperation)) {
 			if (input.submission === undefined) throw new TypeError(`${label}.submission is required for ${captureOperation}`);
-			if (captureOperation === "external.plan_correction" && schema !== "gentle-ai.review-correction-plan/v1") throw new TypeError(`${label}.schema must be gentle-ai.review-correction-plan/v1`);
-			if (captureOperation === "review.capture-evidence" && schema !== "https://gentle-ai.dev/schema/review/verification-evidence/v1") throw new TypeError(`${label}.schema must be https://gentle-ai.dev/schema/review/verification-evidence/v1`);
+			if (captureOperation === "review.capture-correction-plan" && schema !== "gentle-ai.review-correction-plan/v1") throw new TypeError(`${label}.schema must be gentle-ai.review-correction-plan/v1`);
 		}
 	}
 
@@ -1411,6 +1404,30 @@ function decodeCollectInput(value: unknown, label: string, v5: boolean): ReviewC
 	if (captureOperation === REVIEW_PROVIDER_ROLE_CAPTURE_OPERATION.CAPTURE_VALIDATION && schema !== "https://gentle-ai.dev/schema/review/validator/v1") {
 		throw new TypeError(`${label}.schema must be https://gentle-ai.dev/schema/review/validator/v1`);
 	}
+	const targetedValidatorInput = v5
+		&& name === "provider_targeted_validator"
+		&& captureOperation === REVIEW_PROVIDER_ROLE_CAPTURE_OPERATION.CAPTURE_VALIDATION
+		&& schema === "https://gentle-ai.dev/schema/review/validator/v1";
+	if (input.validation_request !== undefined && !targetedValidatorInput) {
+		throw new TypeError(`${label}.validation_request is only valid for the v5 provider-targeted-validator capture input`);
+	}
+	if (targetedValidatorInput && input.validation_request === undefined) {
+		throw new TypeError(`${label}.validation_request is required for the v5 provider-targeted-validator capture input`);
+	}
+	const validationRequest = input.validation_request === undefined
+		? undefined
+		: decodeReviewTargetedValidationRequestV1(input.validation_request, `${label}.validation_request`);
+	if (validationRequest !== undefined) {
+		const providerArgument = (argumentName: string): string => {
+			const matches = argumentsList.filter((argument) => argument.name === argumentName);
+			if (matches.length !== 1) throw new TypeError(`${label}.arguments must carry exactly one ${argumentName} binding`);
+			return matches[0]!.value;
+		};
+		if (providerArgument("lineage") !== validationRequest.lineageId) throw new TypeError(`${label}.arguments lineage must bind validation_request.lineage_id`);
+		if (providerArgument("expected-revision") !== validationRequest.expectedRevision) throw new TypeError(`${label}.arguments expected-revision must bind validation_request.expected_revision`);
+		if (providerArgument("target") !== validationRequest.correctionTargetIdentity) throw new TypeError(`${label}.arguments target must bind validation_request.correction_target_identity`);
+		if (providerArgument("request-hash") !== validationRequest.requestHash) throw new TypeError(`${label}.arguments request-hash must bind validation_request.request_hash`);
+	}
 	if (input.submission !== undefined && (REVIEW_PROVIDER_ROLE_CAPTURE_OPERATIONS as readonly string[]).includes(captureOperation)) {
 		throw new TypeError(`${label}.submission is not allowed on the self-contained ${captureOperation} vector`);
 	}
@@ -1423,23 +1440,16 @@ function decodeCollectInput(value: unknown, label: string, v5: boolean): ReviewC
 	} else if (input.artifact_subject !== undefined || input.base_tree !== undefined || input.candidate_tree !== undefined || input.changed_path_manifest !== undefined) {
 		throw new TypeError(`${label} carries capture-result fields without review.capture-result`);
 	}
-	const submissionOperations: readonly string[] = v5 ? ["review.capture-result", ...V5_SUBMISSION_CAPTURE_OPERATIONS] : ["review.capture-result"];
+	const submissionOperations: readonly string[] = v5 ? ["review.capture-result", "review.capture-correction-plan"] : ["review.capture-result"];
 	if (input.submission !== undefined && !submissionOperations.includes(captureOperation)) {
 		throw new TypeError(v5 ? `${label}.submission is only valid for ${submissionOperations.join(", ")}` : `${label}.submission is only valid for review.capture-result`);
 	}
 
 	// The v5 descriptor forms are discriminated by their closed operation
 	// tokens; every other submission stays the host-relay completing form.
-	let submission: ReviewCaptureSubmissionV1 | undefined;
-	let submissionDescriptor: ReviewSubmissionDescriptorV5 | undefined;
-	if (input.submission !== undefined) {
-		const operationToken = (input.submission as Record<string, unknown> | null)?.operation_token;
-		if (v5 && (operationToken === "finalize" || operationToken === "capture-evidence")) {
-			submissionDescriptor = decodeSubmissionDescriptorV5(input.submission, `${label}.submission`, operationToken);
-		} else {
-			submission = decodeCaptureSubmission(input.submission, `${label}.submission`, v5);
-		}
-	}
+	const submission = input.submission === undefined
+		? undefined
+		: decodeCaptureSubmission(input.submission, `${label}.submission`, v5);
 
 	return {
 		name,
@@ -1450,10 +1460,9 @@ function decodeCollectInput(value: unknown, label: string, v5: boolean): ReviewC
 		...(input.base_tree === undefined ? {} : { baseTree: gitTree(input.base_tree, `${label}.base_tree`) }),
 		...(input.candidate_tree === undefined ? {} : { candidateTree: gitTree(input.candidate_tree, `${label}.candidate_tree`) }),
 		...(input.changed_path_manifest === undefined ? {} : { changedPathManifest: array(input.changed_path_manifest, `${label}.changed_path_manifest`, decodeChangedPathEntry, { unique: true }) }),
-		...(input.validation_request === undefined ? {} : { validationRequest: decodeTargetedValidationRequestV1(input.validation_request, `${label}.validation_request`) }),
 		...(submission === undefined ? {} : { submission }),
-		...(submissionDescriptor === undefined ? {} : { submissionDescriptor }),
 		...(v5 && input.provider_task !== undefined ? { providerTask: decodeProviderTask(input.provider_task, `${label}.provider_task`) } : {}),
+		...(validationRequest === undefined ? {} : { validationRequest }),
 	};
 }
 
@@ -1519,8 +1528,8 @@ export function decodeReviewNextTransitionV3(value: unknown, options: { v5?: boo
 // status-v2.schema.json action_eligibility definition v2 also $refs.
 // ---------------------------------------------------------------------------
 
-const ELIGIBLE_ACTIONS = ["stop", "review.start", "review.finalize", "review.validate", "review.recover", "review.repair", "review.retry_final_verification"] as const;
-const FORBIDDEN_ACTIONS = ["review.abandon", "review.finalize", "review.invalidate", "review.quarantine-legacy", "review.reclaim", "review.reconcile-authority", "review.reconcile-authority-batch", "review.recover", "review.repair", "review.retry_final_verification", "review.start", "review.validate"] as const;
+const ELIGIBLE_ACTIONS = ["stop", "review.start", "review.recover", "review.repair"] as const;
+const FORBIDDEN_ACTIONS = ["review.abandon", "review.invalidate", "review.quarantine-legacy", "review.reclaim", "review.reconcile-authority", "review.reconcile-authority-batch", "review.recover", "review.repair", "review.start"] as const;
 
 function decodeEligibility(value: unknown, label: string): void {
 	const eligibility = exactRecord(value, label, ["allowed_actions", "forbidden_actions"]);
@@ -1529,14 +1538,14 @@ function decodeEligibility(value: unknown, label: string): void {
 		const selected = enumeration(action.action, ELIGIBLE_ACTIONS, `${entryLabel}.action`);
 		text(action.reason_code, `${entryLabel}.reason_code`, { minimum: 1, pattern: /^[a-z0-9_]+$/ });
 		array(action.required_inputs, `${entryLabel}.required_inputs`, (input, inputLabel) => text(input, inputLabel, { minimum: 1, pattern: /^[a-z0-9_]+$/ }), { unique: true });
-		if (selected === "review.recover" || selected === "review.retry_final_verification") {
+		if (selected === "review.recover") {
 			const binding = exactRecord(action.binding, `${entryLabel}.binding`, ["lineage_id", "revision", "target_identity"]);
 			enumeration(action.disposition, Object.values(REVIEW_STATUS_ACTION_DISPOSITION), `${entryLabel}.disposition`);
 			lineage(binding.lineage_id, `${entryLabel}.binding.lineage_id`);
 			sha256(binding.revision, `${entryLabel}.binding.revision`);
 			sha256(binding.target_identity, `${entryLabel}.binding.target_identity`);
 		} else if (action.disposition !== undefined || action.binding !== undefined) {
-			throw new TypeError(`${entryLabel} recovery fields require review.recover or review.retry_final_verification`);
+			throw new TypeError(`${entryLabel} recovery fields require review.recover`);
 		}
 		return action;
 	}, { minimum: 1, maximum: 1 });
@@ -1546,21 +1555,6 @@ function decodeEligibility(value: unknown, label: string): void {
 		text(action.reason_code, `${entryLabel}.reason_code`, { minimum: 1, pattern: /^[a-z0-9_]+$/ });
 		return action;
 	});
-}
-
-function decodeFinalVerificationRetry(value: unknown, label: string): ReviewFinalVerificationRetryV1 {
-	const body = exactRecord(value, label, ["incident_schema", "incident_class", "validating_revision", "target_identity", "failed_evidence_hash", "finalize_request_digest"], ["failed_evidence_record_digest"]);
-	if (body.incident_schema !== "gentle-ai.review-final-verification-incident/v1") throw new TypeError(`${label}.incident_schema is unsupported`);
-	if (body.incident_class !== "procedural_tooling_failure") throw new TypeError(`${label}.incident_class is unsupported`);
-	return {
-		incidentSchema: "gentle-ai.review-final-verification-incident/v1",
-		incidentClass: "procedural_tooling_failure",
-		validatingRevision: sha256(body.validating_revision, `${label}.validating_revision`),
-		targetIdentity: sha256(body.target_identity, `${label}.target_identity`),
-		failedEvidenceHash: sha256(body.failed_evidence_hash, `${label}.failed_evidence_hash`),
-		...(body.failed_evidence_record_digest === undefined ? {} : { failedEvidenceRecordDigest: sha256(body.failed_evidence_record_digest, `${label}.failed_evidence_record_digest`) }),
-		finalizeRequestDigest: sha256(body.finalize_request_digest, `${label}.finalize_request_digest`),
-	};
 }
 
 // ---------------------------------------------------------------------------
@@ -1574,15 +1568,11 @@ export function decodeReviewStatusV3(value: unknown): ReviewStatusV3 {
 	// surfaces. The v3 identity keeps rejecting every v5-only field.
 	const v5 = typeof value === "object" && value !== null && (value as Record<string, unknown>).schema === "gentle-ai.review-integration.status/v5";
 	const body = exactRecord(value, "status", [
-		"schema", "contract", "operation", "applicability", "receipt", "action", "replayability", "target_identity", "projection", "repair", "candidates",
-	], ["authority", "frozen", "reconciliation", "action_disposition", "eligibility", "next_transition", "authority_target_identity", "validation_request", "final_verification_retry", ...(v5 ? ["forecast", "repository_context"] : [])]);
+		"schema", "contract", "operation", "applicability", "action", "replayability", "target_identity", "projection", "repair", "candidates",
+	], ["authority", "frozen", "action_disposition", "eligibility", "next_transition", "authority_target_identity", ...(v5 ? ["forecast", "repository_context", "validation_request"] : [])]);
 	requireIdentity(body, v5 ? "gentle-ai.review-integration.status/v5" : "gentle-ai.review-integration.status/v3", REVIEW_INTEGRATION_OPERATION.STATUS);
 
 	const applicability = enumeration(body.applicability, ["current_target", "unrelated", "ambiguous", "corrupted"] as const, "status.applicability");
-	const receiptBody = exactRecord(body.receipt, "status.receipt", ["status"], ["identity"]);
-	const receiptStatus = enumeration(receiptBody.status, RECEIPT_STATUSES, "status.receipt.status");
-	const receipt: ReviewStatusReceiptV1 = { status: receiptStatus, ...(receiptBody.identity === undefined ? {} : { identity: sha256(receiptBody.identity, "status.receipt.identity") }) };
-
 	let authority: ReviewStatusAuthorityV1 | undefined;
 	if (body.authority !== undefined) {
 		const source = exactRecord(body.authority, "status.authority", ["version", "lineage_id", "state", "generation", "revision"]);
@@ -1610,51 +1600,28 @@ export function decodeReviewStatusV3(value: unknown): ReviewStatusV3 {
 	}
 	if (authority?.version === REVIEW_AUTHORITY_VERSION.COMPACT_V2 && frozen === undefined) throw new TypeError("compact-v2 status requires frozen metadata");
 	if (authority?.version === REVIEW_AUTHORITY_VERSION.LEGACY_V1 && (frozen !== undefined || body.authority_target_identity !== undefined)) throw new TypeError("legacy status cannot expose frozen metadata or authority_target_identity");
-	if (authority?.version === REVIEW_AUTHORITY_VERSION.LEGACY_V1 && receiptStatus !== "expected_missing" && receiptStatus !== "present") throw new TypeError("legacy status receipt is incompatible");
 
 	const action = enumeration(body.action, STATUS_ACTIONS, "status.action");
 	const actionDisposition = body.action_disposition === undefined ? undefined : enumeration(body.action_disposition, Object.values(REVIEW_STATUS_ACTION_DISPOSITION), "status.action_disposition");
-	if ((action === "recover" || action === "retry_final_verification") && actionDisposition === undefined) throw new TypeError(`${action} status requires action_disposition`);
-	if (action !== "recover" && action !== "retry_final_verification" && actionDisposition !== undefined) throw new TypeError("status.action_disposition is only valid for the recover or retry_final_verification action");
+	if (action === "recover" && actionDisposition === undefined) throw new TypeError("recover status requires action_disposition");
+	if (action !== "recover" && actionDisposition !== undefined) throw new TypeError("status.action_disposition is only valid for the recover action");
 	if (body.eligibility !== undefined) decodeEligibility(body.eligibility, "status.eligibility");
 	const nextTransition = body.next_transition === undefined ? undefined : decodeReviewNextTransitionV3(body.next_transition, { v5 });
+	const validationRequest = v5 && body.validation_request !== undefined
+		? decodeReviewTargetedValidationRequestV1(body.validation_request, "status.validation_request")
+		: undefined;
+	if (validationRequest !== undefined) {
+		const collectInputs = nextTransition?.kind === "collect" ? nextTransition.collect?.inputs ?? [] : [];
+		const matchingInputs = collectInputs.filter((input) => input.validationRequest !== undefined);
+		if (matchingInputs.length !== 1 || canonicalJson(matchingInputs[0]!.validationRequest) !== canonicalJson(validationRequest)) {
+			throw new TypeError("status.validation_request must exactly match the provider-targeted-validator collect input");
+		}
+	}
 	// status/v5 dependentRequired: a forecast previews the transition head, so
 	// it can only accompany an actual next_transition.
 	const forecast = v5 && body.forecast !== undefined ? decodeReviewForecastV1(body.forecast) : undefined;
 	if (forecast !== undefined && nextTransition === undefined) throw new TypeError("status.forecast requires status.next_transition");
 	const replayability = enumeration(body.replayability, Object.values(REVIEW_REPLAYABILITY), "status.replayability");
-
-	let reconciliation: ReviewStatusReconciliationV1 | undefined;
-	if (action === "reconcile_finalize") {
-		if (body.reconciliation === undefined) throw new TypeError("reconcile_finalize status requires reconciliation");
-		const source = exactRecord(body.reconciliation, "status.reconciliation", ["required"]);
-		if (source.required !== true) throw new TypeError("status.reconciliation.required must be true");
-		if (applicability !== REVIEW_AUTHORITY_APPLICABILITY.CURRENT_TARGET) throw new TypeError("reconcile_finalize status requires current_target applicability");
-		if (replayability !== REVIEW_REPLAYABILITY.STATUS_REQUIRED) throw new TypeError("reconcile_finalize status requires status_required replayability");
-		reconciliation = { required: true };
-	} else if (body.reconciliation !== undefined) {
-		throw new TypeError("status.reconciliation is only valid for the reconcile_finalize action");
-	}
-
-	let validationRequest: ReviewTargetedValidationRequestV1 | undefined;
-	if (body.validation_request !== undefined) {
-		if (applicability !== REVIEW_AUTHORITY_APPLICABILITY.CURRENT_TARGET || authority?.state !== "correction_required") {
-			throw new TypeError("status.validation_request requires current_target applicability and correction_required authority state");
-		}
-		validationRequest = decodeTargetedValidationRequestV1(body.validation_request, "status.validation_request");
-	}
-
-	let finalVerificationRetry: ReviewFinalVerificationRetryV1 | undefined;
-	if (action === "retry_final_verification") {
-		if (body.final_verification_retry === undefined) throw new TypeError("retry_final_verification status requires final_verification_retry");
-		if (applicability !== REVIEW_AUTHORITY_APPLICABILITY.CURRENT_TARGET || authority?.version !== REVIEW_AUTHORITY_VERSION.COMPACT_V2 || authority?.state !== "escalated") {
-			throw new TypeError("retry_final_verification status requires current_target compact-v2 escalated authority");
-		}
-		if (actionDisposition !== REVIEW_STATUS_ACTION_DISPOSITION.FINAL_VERIFICATION_RETRY) throw new TypeError("retry_final_verification status requires final_verification_retry disposition");
-		finalVerificationRetry = decodeFinalVerificationRetry(body.final_verification_retry, "status.final_verification_retry");
-	} else if (body.final_verification_retry !== undefined) {
-		throw new TypeError("status.final_verification_retry is only valid for the retry_final_verification action");
-	}
 
 	// status/v5 additive top-level repository context reference (captured
 	// 2026-08-16 from 2.4.0-main.b1afef46; missing from the published
@@ -1678,22 +1645,19 @@ export function decodeReviewStatusV3(value: unknown): ReviewStatusV3 {
 		contract: REVIEW_INTEGRATION_CONTRACT,
 		applicability,
 		...(authority === undefined ? {} : { authority }),
-		receipt,
 		action,
 		...(actionDisposition === undefined ? {} : { actionDisposition }),
 		replayability,
 		...(frozen === undefined ? {} : { frozen }),
-		...(reconciliation === undefined ? {} : { reconciliation }),
 		targetIdentity: sha256(body.target_identity, "status.target_identity"),
 		...(body.authority_target_identity === undefined ? {} : { authorityTargetIdentity: sha256(body.authority_target_identity, "status.authority_target_identity") }),
 		projection: decodeReviewProjectionV1(body.projection),
 		repair: decodeAuthorityRepairAssessmentV1(body.repair),
 		candidates: stringArray(body.candidates, "status.candidates", { unique: true, pattern: /^[a-z0-9]+(?:-[a-z0-9]+)*$/ }),
 		...(nextTransition === undefined ? {} : { nextTransition }),
-		...(validationRequest === undefined ? {} : { validationRequest }),
-		...(finalVerificationRetry === undefined ? {} : { finalVerificationRetry }),
 		...(forecast === undefined ? {} : { forecast }),
 		...(repositoryContext === undefined ? {} : { repositoryContext }),
+		...(validationRequest === undefined ? {} : { validationRequest }),
 		raw: body,
 	};
 }
@@ -1774,13 +1738,14 @@ export function decodeReviewConsentV2(value: unknown): ReviewConsentV2 {
 // published v3 schema demands an `--agent claude-code` token that the live
 // emitter omits when the caller declared no --agent, so the capture is
 // authoritative and Pi replays whichever provider-owned invocation arrived.
-export function decodeReviewConsentV3(value: unknown): ReviewConsentV3 {
+export function decodeReviewConsentV3(value: unknown, expectedAgent?: ReviewConsentAgentV3): ReviewConsentV3 {
 	const body = exactRecord(value, "consent", [...CONSENT_KEYS_V2, "agent"]);
 	requireIdentity(body, "gentle-ai.review-integration.consent/v3", "review.start");
-	if (body.agent !== "claude-code") throw new TypeError("consent.agent must be claude-code");
+	const agent = enumeration(body.agent, Object.values(REVIEW_CONSENT_AGENT_V3), "consent.agent") as ReviewConsentAgentV3;
+	if (expectedAgent !== undefined && agent !== expectedAgent) throw new TypeError("consent.agent does not match the expected runtime binding");
 	return {
 		schema: "gentle-ai.review-integration.consent/v3",
-		agent: "claude-code",
+		agent,
 		...decodeConsentSemantics(body),
 		raw: body,
 	};
@@ -1882,56 +1847,21 @@ export function decodeReviewFailureV2(value: unknown): ReviewFailureV2 {
 // operation/v2
 // ---------------------------------------------------------------------------
 
-export function decodeReviewOperationV2(value: unknown): ReviewOperationV2 {
-	const body = exactRecord(value, "operation", ["schema", "contract", "operation", "result"]);
-	requireIdentity(body, "gentle-ai.review-integration.operation/v2");
-	const operation = enumeration(body.operation, ["review.finalize", "review.validate", "review.bind_sdd", "review.retry_final_verification"] as const, "operation.operation");
-	let result: Record<string, unknown>;
-	if (operation === REVIEW_INTEGRATION_OPERATION.FINALIZE) {
-		result = exactRecord(body.result, "operation.result", ["operation", "lineage_id", "state", "action", "store_revision"], ["eligibility", "next_transition", "validation_request", "escalation"]);
-		if (result.operation !== "review/finalize") throw new TypeError("operation.result does not match review.finalize");
-		nonempty(result.lineage_id, "operation.result.lineage_id");
-		nonempty(result.state, "operation.result.state");
-		nonempty(result.action, "operation.result.action");
-		sha256(result.store_revision, "operation.result.store_revision");
-		if (result.eligibility !== undefined) decodeEligibility(result.eligibility, "operation.result.eligibility");
-		if (result.next_transition !== undefined) decodeReviewNextTransitionV3(result.next_transition);
-		if (result.validation_request !== undefined) {
-			decodeTargetedValidationRequestV1(result.validation_request, "operation.result.validation_request");
-			if (result.state !== "correction_required") throw new TypeError("operation.result.validation_request requires state correction_required");
-		}
-		if (result.escalation !== undefined) nonempty(result.escalation, "operation.result.escalation");
-	} else if (operation === REVIEW_INTEGRATION_OPERATION.VALIDATE) {
-		result = exactRecord(body.result, "operation.result", ["schema", "result", "allowed", "action", "reason", "context"], ["delivery"]);
-		if (result.schema !== "gentle-ai.review-gate-result/v1") throw new TypeError("operation.result does not match review.validate");
-		enumeration(result.result, ["allow", "scope-changed", "invalidated", "escalated"] as const, "operation.result.result");
-		boolean(result.allowed, "operation.result.allowed");
-		nonempty(result.action, "operation.result.action");
-		nonempty(result.reason, "operation.result.reason");
-		record(result.context, "operation.result.context");
-		if (result.delivery !== undefined && result.delivery !== "disabled/unmanaged") throw new TypeError("operation.result.delivery is unsupported");
-	} else if (operation === REVIEW_INTEGRATION_OPERATION.BIND_SDD) {
-		result = exactRecord(body.result, "operation.result", ["schema", "revision", "change", "lineage", "authority_revision", "receipt_hash", "gate_context"]);
-		if (result.schema !== "gentle-ai.sdd-review-binding/v1") throw new TypeError("operation.result does not match review.bind_sdd");
-		sha256(result.revision, "operation.result.revision");
-		nonempty(result.change, "operation.result.change");
-		nonempty(result.lineage, "operation.result.lineage");
-		sha256(result.authority_revision, "operation.result.authority_revision");
-		sha256(result.receipt_hash, "operation.result.receipt_hash");
-		record(result.gate_context, "operation.result.gate_context");
-	} else {
-		result = exactRecord(body.result, "operation.result", ["operation", "predecessor_lineage_id", "predecessor_revision", "lineage_id", "state", "store_revision", "target_identity", "incident_digest", "recovery_disposition"]);
-		if (result.operation !== "review.retry_final_verification") throw new TypeError("operation.result does not match review.retry_final_verification");
-		lineage(result.predecessor_lineage_id, "operation.result.predecessor_lineage_id");
-		sha256(result.predecessor_revision, "operation.result.predecessor_revision");
-		lineage(result.lineage_id, "operation.result.lineage_id");
-		if (result.state !== "validating") throw new TypeError("operation.result.state must be validating");
-		sha256(result.store_revision, "operation.result.store_revision");
-		sha256(result.target_identity, "operation.result.target_identity");
-		sha256(result.incident_digest, "operation.result.incident_digest");
-		if (result.recovery_disposition !== "final_verification_retry") throw new TypeError("operation.result.recovery_disposition must be final_verification_retry");
-	}
-	return { contract: REVIEW_INTEGRATION_CONTRACT, operation, result, raw: body };
+export function decodeReviewAdvisoryFindingsV1(value: unknown, label: string): ReviewAdvisoryFindingsV1 {
+	const body = exactRecord(value, label, ["statement", "findings"]);
+	return {
+		statement: nonempty(body.statement, `${label}.statement`),
+		findings: array(body.findings, `${label}.findings`, (entry, itemLabel) => {
+			const finding = exactRecord(entry, itemLabel, ["id", "severity", "disposition"], ["lens", "location"]);
+			return {
+				id: nonempty(finding.id, `${itemLabel}.id`),
+				...(finding.lens === undefined ? {} : { lens: nonempty(finding.lens, `${itemLabel}.lens`) }),
+				...(finding.location === undefined ? {} : { location: nonempty(finding.location, `${itemLabel}.location`) }),
+				severity: enumeration(finding.severity, Object.values(REVIEW_ADVISORY_FINDING_SEVERITY), `${itemLabel}.severity`),
+				disposition: enumeration(finding.disposition, Object.values(REVIEW_ADVISORY_FINDING_DISPOSITION), `${itemLabel}.disposition`),
+			};
+		}, { minimum: 1 }),
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -2065,4 +1995,86 @@ export function decodeReviewResultArtifactV2(value: unknown): ReviewResultArtifa
 		...(body.reference === undefined ? {} : { reference: text(body.reference, "result_artifact.reference", { pattern: /^rart1_[0-9a-f]{64}$/ }) }),
 		raw: body,
 	};
+}
+
+// Terminal capture answers are emitted directly by the native provider. Pi
+// validates their closed shape and identity, then treats all lifecycle meaning
+// as opaque provider-owned state.
+export const REVIEW_LAST_EVENT_CLOSURE_SCHEMA = "gentle-ai.review-last-event-closure/v1";
+export const REVIEW_LAST_EVENT_CLOSURE_OPERATION = {
+	CAPTURE_RESULT: "review/capture-result",
+	CAPTURE_CORRECTION_PLAN: "review.capture-correction-plan",
+	CAPTURE_REFUTER: "review.capture-refuter",
+	CAPTURE_VALIDATION: "review/capture-validation",
+} as const;
+export type ReviewLastEventClosureOperation = (typeof REVIEW_LAST_EVENT_CLOSURE_OPERATION)[keyof typeof REVIEW_LAST_EVENT_CLOSURE_OPERATION];
+
+const REVIEW_LAST_EVENT_TERMINAL_STATES = ["approved", "correction_required", "escalated"] as const;
+export type ReviewLastEventClosureState = (typeof REVIEW_LAST_EVENT_TERMINAL_STATES)[number];
+
+export interface ReviewLastEventClosureV1 {
+	schema: typeof REVIEW_LAST_EVENT_CLOSURE_SCHEMA;
+	operation: ReviewLastEventClosureOperation;
+	lineageId: string;
+	state: ReviewLastEventClosureState;
+	storeRevision: string;
+	action?: string;
+	targetIdentity?: string;
+	requestHash?: string;
+	correctionLines?: number;
+	advisoryFindings?: ReviewAdvisoryFindingsV1;
+}
+
+export interface ReviewLastEventClosureBinding {
+	lineageId: string;
+	targetIdentity?: string;
+	requestHash?: string;
+}
+
+export function decodeReviewLastEventClosureV1(value: unknown): ReviewLastEventClosureV1 {
+	const body = exactRecord(value, "last_event_closure", ["schema", "operation", "lineage_id", "state", "store_revision"], ["target_identity", "request_hash", "correction_lines", "action", "advisory_findings"]);
+	if (body.schema !== REVIEW_LAST_EVENT_CLOSURE_SCHEMA) throw new TypeError(`last_event_closure.schema must be ${REVIEW_LAST_EVENT_CLOSURE_SCHEMA}`);
+	const operation = enumeration(body.operation, Object.values(REVIEW_LAST_EVENT_CLOSURE_OPERATION), "last_event_closure.operation") as ReviewLastEventClosureOperation;
+	const state = enumeration(body.state, REVIEW_LAST_EVENT_TERMINAL_STATES, "last_event_closure.state") as ReviewLastEventClosureState;
+	const shared = {
+		schema: REVIEW_LAST_EVENT_CLOSURE_SCHEMA,
+		operation,
+		lineageId: lineage(body.lineage_id, "last_event_closure.lineage_id"),
+		state,
+		storeRevision: sha256(body.store_revision, "last_event_closure.store_revision"),
+	};
+	if (operation === REVIEW_LAST_EVENT_CLOSURE_OPERATION.CAPTURE_CORRECTION_PLAN) {
+		if (body.action !== undefined || body.advisory_findings !== undefined) throw new TypeError("last_event_closure correction-plan cannot carry action or advisory_findings");
+		if (state !== "correction_required") throw new TypeError("last_event_closure correction-plan requires correction_required state");
+		return {
+			...shared,
+			targetIdentity: sha256(body.target_identity, "last_event_closure.target_identity"),
+			requestHash: sha256(body.request_hash, "last_event_closure.request_hash"),
+			correctionLines: integer(body.correction_lines, "last_event_closure.correction_lines", 1, 200),
+		};
+	}
+	if (body.target_identity !== undefined || body.request_hash !== undefined || body.correction_lines !== undefined) throw new TypeError("last_event_closure terminal capture cannot carry correction-plan fields");
+	const action = nonempty(body.action, "last_event_closure.action");
+	const advisoryFindings = body.advisory_findings === undefined
+		? undefined
+		: decodeReviewAdvisoryFindingsV1(body.advisory_findings, "last_event_closure.advisory_findings");
+	if (advisoryFindings !== undefined && state !== "approved") throw new TypeError("last_event_closure advisory_findings requires approved state");
+	return {
+		...shared,
+		action,
+		...(advisoryFindings === undefined ? {} : { advisoryFindings }),
+	};
+}
+
+export function assertReviewLastEventClosureBinding(
+	closure: ReviewLastEventClosureV1,
+	binding: ReviewLastEventClosureBinding,
+): void {
+	if (closure.lineageId !== binding.lineageId) throw new TypeError("last_event_closure lineage does not match its provider binding");
+	if (binding.targetIdentity !== undefined && closure.targetIdentity !== undefined && closure.targetIdentity !== binding.targetIdentity) {
+		throw new TypeError("last_event_closure target does not match its provider binding");
+	}
+	if (binding.requestHash !== undefined && closure.requestHash !== undefined && closure.requestHash !== binding.requestHash) {
+		throw new TypeError("last_event_closure request hash does not match its provider binding");
+	}
 }

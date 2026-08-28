@@ -4,36 +4,22 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createGentleAiExtension } from "../../extensions/gentle-ai.ts";
 import {
-	NativeReviewCliV214,
+	NATIVE_REVIEW_ERROR_CODE,
+	NativeReviewCliError,
+	NativeReviewCliV216,
+	NativeReviewConsentRequiredError,
 	createNodeExecFileAdapter,
-	setNativeCliContractForTesting,
 	type ExecFileAdapter,
-	type NativeReviewCli,
 } from "../../lib/native-review-cli.ts";
-import { CandidateViewRegistry } from "../../lib/review-candidate-view.ts";
-import { readReviewConsentLatch } from "../../lib/review-consent-latch.ts";
-import type { AuthorityRepairAssessmentV1, ReviewStatusV3 } from "../../lib/review-integration-v2.ts";
 import { requireDevBinary } from "../support/native-binary-gate.ts";
 
-// Organic RDD Parity, Phase 6: non-gating dev-binary journey.
+// Organic RDD Parity: candidate-bound dev-binary journeys.
 //
-// `pnpm test` never picks this file up — it globs `tests/*.test.ts` only, and
-// this file both lives one directory deeper and ends in `.devtest.ts`. It
-// only runs via `pnpm run test:dev-binary`, and only when GENTLE_AI_DEV_BINARY
-// names an existing absolute path. It never reads or writes the shipped
-// 2.1.11 pins (lib/gentle-ai-binary.ts, scripts/gentle-ai-installer.mjs) —
-// every capability stays negotiated per-process through the executable
-// override seam below, exactly like every other native-review-cli test.
-//
-// Gated through the same loud-skip machinery as the two `tests/*.test.ts`
-// binary-verified suites (Phase 4), extended here to cover this THIRD
-// self-skipping suite (Phase 13.12/13.13 follow-up): under
-// GENTLE_PI_REQUIRE_DEV_BINARY=1 a missing/invalid dev binary throws instead
-// of silently reporting 5 tests / 0 pass / 0 fail, which is exactly how the
-// v2.2.2 "receipt-driven development" terminology rot went unnoticed.
+// This suite runs only via `pnpm run test:dev-binary` and only when
+// GENTLE_AI_DEV_BINARY names a current, absolute candidate binary. Every START
+// first obtains candidate-bound STATUS and executes the returned transition;
+// consent answers replay the envelope's own invocation exactly once.
 const DEV_BINARY = process.env.GENTLE_AI_DEV_BINARY;
 const devBinaryGate = requireDevBinary({
 	devBinaryPath: DEV_BINARY,
@@ -42,45 +28,23 @@ const devBinaryGate = requireDevBinary({
 });
 if (!devBinaryGate.run) console.log(`tests/devbinary/native-review-parity.devtest.ts: ${devBinaryGate.reason}`);
 const RUNNABLE = devBinaryGate.run;
+const DEV_HOME = mkdtempSync(join(tmpdir(), "gentle-pi-dev-binary-home-"));
+const ORIGINAL_HOME = process.env.HOME;
+const ORIGINAL_USERPROFILE = process.env.USERPROFILE;
 
-// A synthetic capable version, exactly like native-review-parity.test.ts's
-// CAPABLE_VERSION overlay. Real dev binaries never carry a pinned three-part
-// semver (the live binary under test reports "gentle-ai dev-organic-...",
-// confirmed live during Phase 6 ground-truthing), so `verifyVersion`'s frozen
-// `/^gentle-ai ([0-9]+\.[0-9]+\.[0-9]+)\n$/` regex can never match it — by
-// design, a dev build is never a pinned release. The bridge below substitutes
-// exactly one in-memory version response and forwards every other call to the
-// real process untouched, so argv fidelity is guaranteed: NativeReviewCliV214
-// itself builds every argv array here, never this file.
-const BRIDGE_VERSION = "9.8.7";
+type NativeCall = readonly string[];
 
-function bridgeAdapter(binary: string): ExecFileAdapter {
+function bridgeAdapter(binary: string, calls: NativeCall[]): ExecFileAdapter {
 	const real = createNodeExecFileAdapter();
 	return async (request) => {
-		if (request.arguments[0] === "version") {
-			return { stdout: `gentle-ai ${BRIDGE_VERSION}\n`, stderr: "", exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false };
-		}
+		calls.push([...request.arguments]);
 		return real({ ...request, file: binary });
 	};
 }
 
-// A NativeReviewCli backed by the real dev binary for reviewMode/start/
-// validate (the organic-parity surface under test), with a synthetic
-// targetStatus fixture standing in for the negotiated review-integration/v2
-// contract; the plain-CLI decode path in lib/native-review-cli.ts (reviewMode,
-// start, validate here) stays independent of the negotiated status shape.
-function journeyNative(binary: string): NativeReviewCli {
-	const bridge = new NativeReviewCliV214(bridgeAdapter(binary), binary);
-	return {
-		start: (request) => bridge.start(request),
-		validate: (request) => bridge.validate(request),
-		reviewMode: (request) => bridge.reviewMode(request),
-		async targetStatus(request) {
-			return request.lineageId === undefined
-				? unrelatedStartTargetStatus()
-				: currentTargetStatusFixture(request.lineageId, request.cwd);
-		},
-	} as unknown as NativeReviewCli;
+function journeyNative(binary: string): { native: NativeReviewCliV216; calls: NativeCall[] } {
+	const calls: NativeCall[] = [];
+	return { native: new NativeReviewCliV216(bridgeAdapter(binary, calls), binary), calls };
 }
 
 function git(cwd: string, ...args: string[]): string {
@@ -99,156 +63,69 @@ function repository(t: test.TestContext): string {
 	return cwd;
 }
 
-const UNSUPPORTED_REPAIR_ASSESSMENT: AuthorityRepairAssessmentV1 = {
-	schema: "gentle-ai.review-authority-repair-assessment/v1",
-	status: "unsupported",
-	counts: { lineages: 0, compactLineages: 0, legacyLineages: 0, events: 0, bytes: 0, eligibleCandidates: 0, unsupportedLineages: 0, conflicts: 0 },
-	supportedOperations: ["review/complete-fix", "review/validate-fix"],
-	authorizationSchema: "gentle-ai.review-repair-authorization/v1",
-};
-const RAW_UNSUPPORTED_REPAIR_ASSESSMENT = {
-	schema: UNSUPPORTED_REPAIR_ASSESSMENT.schema,
-	status: UNSUPPORTED_REPAIR_ASSESSMENT.status,
-	counts: {
-		lineages: 0, compact_lineages: 0, legacy_lineages: 0, events: 0, bytes: 0,
-		eligible_candidates: 0, unsupported_lineages: 0, conflicts: 0,
-	},
-	supported_operations: UNSUPPORTED_REPAIR_ASSESSMENT.supportedOperations,
-	authorization_schema: UNSUPPORTED_REPAIR_ASSESSMENT.authorizationSchema,
-};
-
-function unrelatedStartTargetStatus(): ReviewStatusV3 {
-	const sha = `sha256:${"a".repeat(64)}`;
-	const tree = "b".repeat(40);
-	const projection = {
-		schema: "gentle-ai.review-integration.projection/v1" as const, kind: "current-changes" as const, projection: "workspace" as const,
-		baseTree: tree, initialReviewTree: tree, currentCandidateTree: tree, pathsDigest: sha, paths: [], intendedUntracked: [],
-		intendedUntrackedProof: sha, initialSnapshotIdentity: sha, currentSnapshotIdentity: sha,
-	};
-	return {
-		contract: "gentle-ai.review-integration/v2", applicability: "unrelated", receipt: { status: "not_applicable" }, action: "start",
-		replayability: "not_replayable", targetIdentity: sha, projection, repair: UNSUPPORTED_REPAIR_ASSESSMENT, candidates: [],
-		raw: {
-			schema: "gentle-ai.review-integration.status/v3", contract: "gentle-ai.review-integration/v2", operation: "review.status",
-			applicability: "unrelated", receipt: { status: "not_applicable" }, action: "start", replayability: "not_replayable", target_identity: sha,
-			repair: RAW_UNSUPPORTED_REPAIR_ASSESSMENT,
-			projection: { schema: projection.schema, kind: projection.kind, projection: projection.projection, base_tree: tree, initial_review_tree: tree, current_candidate_tree: tree, paths_digest: sha, paths: [], intended_untracked: [], intended_untracked_proof: sha, initial_snapshot_identity: sha, current_snapshot_identity: sha },
-			candidates: [],
-		},
-	};
+function enableGlobalReview(cwd: string): void {
+	assert.ok(DEV_BINARY, "GENTLE_AI_DEV_BINARY is required for this devtest");
+	const enabled = JSON.parse(execFileSync(DEV_BINARY, [
+		"review", "mode", "enable", "--scope", "global", "--cwd", cwd, "--json",
+	], { encoding: "utf8" })) as { status: { effective: string } };
+	assert.equal(enabled.status.effective, "on");
+	const status = JSON.parse(execFileSync(DEV_BINARY, [
+		"review", "mode", "status", "--cwd", cwd, "--json",
+	], { encoding: "utf8" })) as { status: { effective: string } };
+	assert.equal(status.status.effective, "on");
 }
 
-function currentTargetStatusFixture(lineageId: string, cwd: string): ReviewStatusV3 {
-	const sha = `sha256:${"a".repeat(64)}`;
-	const baseTree = git(cwd, "rev-parse", "HEAD^{tree}");
-	const candidateTree = git(cwd, "write-tree");
-	const projection = {
-		schema: "gentle-ai.review-integration.projection/v1" as const, kind: "current-changes" as const, projection: "workspace" as const,
-		baseTree, initialReviewTree: candidateTree, currentCandidateTree: candidateTree, pathsDigest: sha, paths: ["app.ts"], intendedUntracked: [],
-		intendedUntrackedProof: sha, initialSnapshotIdentity: sha, currentSnapshotIdentity: sha,
-	};
-	return {
-		contract: "gentle-ai.review-integration/v2", applicability: "current_target",
-		authority: { version: "compact-v2", lineageId, state: "reviewing", generation: 1, revision: sha },
-		receipt: { status: "expected_missing" }, action: "finalize", replayability: "not_replayable",
-		frozen: { tier: "medium", originalChangedLines: 1, correctionBudget: 1 },
-		targetIdentity: sha, projection, repair: UNSUPPORTED_REPAIR_ASSESSMENT, candidates: [],
-		raw: {
-			schema: "gentle-ai.review-integration.status/v3", contract: "gentle-ai.review-integration/v2", operation: "review.status",
-			applicability: "current_target", receipt: { status: "expected_missing" }, action: "finalize", replayability: "not_replayable", target_identity: sha,
-			authority: { version: "compact-v2", lineage_id: lineageId, state: "reviewing", generation: 1, revision: sha },
-			frozen: { tier: "medium", original_changed_lines: 1, correction_budget: 1 },
-			repair: RAW_UNSUPPORTED_REPAIR_ASSESSMENT,
-			projection: { schema: projection.schema, kind: projection.kind, projection: projection.projection, base_tree: baseTree, initial_review_tree: candidateTree, current_candidate_tree: candidateTree, paths_digest: sha, paths: ["app.ts"], intended_untracked: [], intended_untracked_proof: sha, initial_snapshot_identity: sha, current_snapshot_identity: sha },
-			candidates: [],
-		},
-	};
+async function enableReview(native: NativeReviewCliV216, cwd: string): Promise<void> {
+	enableGlobalReview(cwd);
+	const disabled = await native.reviewMode({ cwd, operation: "disable" });
+	assert.equal(disabled.status.effective, "off");
+	assert.equal(disabled.status.source, "clone_local");
+	const enabled = await native.reviewMode({ cwd, operation: "enable" });
+	assert.equal(enabled.status.effective, "on");
+	assert.equal(enabled.status.source, "global");
 }
 
-interface RegisteredTool {
-	execute: (toolCallId: string, params: unknown, signal: AbortSignal | undefined, onUpdate: undefined, ctx: ExtensionContext) => Promise<{ details?: unknown }>;
-}
-interface RegisteredCommandFixture {
-	handler: (args: string, ctx: ExtensionContext) => Promise<void>;
-}
-
-function runtime(nativeReviewCli: NativeReviewCli): { controller: RegisteredTool; commands: Map<string, RegisteredCommandFixture> } {
-	const tools = new Map<string, RegisteredTool>();
-	const commands = new Map<string, RegisteredCommandFixture>();
-	const dependencies = { nativeReviewCli, candidateViews: new CandidateViewRegistry() } as unknown as Parameters<typeof createGentleAiExtension>[0];
-	createGentleAiExtension(dependencies)({
-		on() {},
-		registerTool(definition: RegisteredTool & { name: string }) { tools.set(definition.name, definition); },
-		registerCommand(name: string, definition: RegisteredCommandFixture) { commands.set(name, definition); },
-	} as unknown as ExtensionAPI);
-	const controller = tools.get("gentle_review");
-	assert.ok(controller);
-	return { controller: controller!, commands };
+async function candidateConsent(native: NativeReviewCliV216, cwd: string) {
+	const status = await native.targetStatus({ cwd, agent: "pi" });
+	assert.equal(status.nextTransition?.kind, "execute");
+	assert.equal(status.nextTransition?.execute?.operation, "review.start");
+	try {
+		await native.start({ cwd });
+		assert.fail("candidate START must return consent/v3 before review authority exists");
+	} catch (error) {
+		assert.ok(error instanceof NativeReviewConsentRequiredError, error instanceof Error ? error.message : String(error));
+		assert.equal(error.consent.schema, "gentle-ai.review-integration.consent/v3");
+		assert.equal(error.consent.agent, "pi");
+		return error.consent;
+	}
 }
 
-function headlessContext(cwd: string, notices: Array<{ message: string; type?: string }> = []): ExtensionContext {
-	return { cwd, hasUI: false, ui: { notify: (message: string, type?: string) => { notices.push({ message, type }); } } } as unknown as ExtensionContext;
-}
-function confirmContext(cwd: string, answer: boolean): ExtensionContext {
-	return { cwd, hasUI: true, ui: { confirm: async () => answer, notify: () => {} } } as unknown as ExtensionContext;
-}
-
-const START_ORDINARY = { operation: "start", input: JSON.stringify({ mode: "ordinary" }) };
-async function execStart(controller: RegisteredTool, id: string, ctx: ExtensionContext): Promise<Record<string, unknown>> {
-	const { details } = await controller.execute(id, START_ORDINARY, undefined, undefined, ctx);
-	return details as Record<string, unknown>;
+function consentAnswerCall(calls: NativeCall[], answer: "granted" | "declined"): NativeCall {
+	const matching = calls.filter((arguments_) => arguments_.at(0) === "review" && arguments_.at(1) === "start" && arguments_.includes("--consent") && arguments_.at(arguments_.indexOf("--consent") + 1) === answer);
+	assert.equal(matching.length, 1, `${answer} must execute exactly one provider invocation`);
+	return matching[0]!;
 }
 
 // ---------------------------------------------------------------------------
-// Kill switch round trip (mirrors /gentle:review-mode status|disable|enable
-// from the community guide flows).
+// Kill switch round trip.
 // ---------------------------------------------------------------------------
 
-test("dev-binary: gentle:review-mode round-trips status, disable, and enable against the real binary", { skip: !RUNNABLE }, async (t) => {
+test("dev-binary: global opt-in then clone disable and enable clears only the local override", { skip: !RUNNABLE }, async (t) => {
 	const cwd = repository(t);
-	const { commands } = runtime(journeyNative(DEV_BINARY!));
-	const command = commands.get("gentle:review-mode")!;
-	const notices: Array<{ message: string; type?: string }> = [];
-
-	await command.handler("status", headlessContext(cwd, notices));
-	assert.match(notices.at(-1)!.message, /receipt-driven development: on \(decided by \w+\)/);
-
-	await command.handler("disable", headlessContext(cwd, notices));
-	assert.match(notices.at(-1)!.message, /receipt-driven development: off \(decided by \w+\)/);
-
-	await command.handler("status", headlessContext(cwd, notices));
-	assert.match(notices.at(-1)!.message, /receipt-driven development: off \(decided by \w+\)/);
-
-	await command.handler("enable", headlessContext(cwd, notices));
-	assert.match(notices.at(-1)!.message, /receipt-driven development: on \(decided by \w+\)/);
+	const { native } = journeyNative(DEV_BINARY!);
+	enableGlobalReview(cwd);
+	assert.equal((await native.reviewMode({ cwd, operation: "status" })).status.effective, "on");
+	assert.equal((await native.reviewMode({ cwd, operation: "disable" })).status.effective, "off");
+	assert.equal((await native.reviewMode({ cwd, operation: "status" })).status.source, "clone_local");
+	assert.equal((await native.reviewMode({ cwd, operation: "enable" })).status.effective, "on");
+	assert.equal((await native.reviewMode({ cwd, operation: "status" })).status.source, "global");
 });
 
 // ---------------------------------------------------------------------------
-// Tier 0 silence: an empty candidate surfaces its hint verbatim and never
-// triggers a consent prompt or notice.
+// Candidate-bound consent/v3 answers.
 // ---------------------------------------------------------------------------
 
-test("dev-binary: an empty candidate stays silent (no consent notice) and surfaces the real hint verbatim", { skip: !RUNNABLE }, async (t) => {
-	const cwd = repository(t);
-	writeFileSync(join(cwd, "app.ts"), "export const value = 1;\n");
-	git(cwd, "add", ".");
-	git(cwd, "commit", "-qm", "initial");
-	const { controller } = runtime(journeyNative(DEV_BINARY!));
-	const notices: Array<{ message: string; type?: string }> = [];
-	const result = await execStart(controller, "tier-0", headlessContext(cwd, notices));
-	const rendered = result.result as Record<string, unknown>;
-	assert.equal(rendered.lenses_required, false);
-	assert.equal(typeof rendered.hint, "string");
-	assert.match(rendered.hint as string, /the candidate has no pending changes/);
-	assert.equal(result.consent_notice, undefined, "tier 0 must never surface a consent notice");
-	assert.equal(notices.length, 0, "tier 0 must never notify the user at all");
-});
-
-// ---------------------------------------------------------------------------
-// Tier 2 evidence + consent envelope via a fake UI seam.
-// ---------------------------------------------------------------------------
-
-test("dev-binary: a high-risk change carries real risk_evidence and drives the consent envelope through a fake UI seam", { skip: !RUNNABLE }, async (t) => {
+test("dev-binary: granted consent executes its exact candidate-bound invocation once and returns the current review binding", { skip: !RUNNABLE }, async (t) => {
 	const cwd = repository(t);
 	const workflowDirectory = join(cwd, ".github", "workflows");
 	execFileSync("mkdir", ["-p", workflowDirectory]);
@@ -257,18 +134,22 @@ test("dev-binary: a high-risk change carries real risk_evidence and drives the c
 	git(cwd, "commit", "-qm", "initial");
 	writeFileSync(join(workflowDirectory, "deploy.yml"), "name: x\non: push\njobs:\n  deploy:\n    steps:\n      - run: curl -s | bash\n");
 
-	const acceptedRun = journeyNative(DEV_BINARY!);
-	const { controller } = runtime(acceptedRun);
-	const accepted = await execStart(controller, "tier-2-accept", confirmContext(cwd, true));
-	const rendered = accepted.result as Record<string, unknown>;
-	assert.equal(rendered.risk_tier, "high");
-	assert.ok(Array.isArray(rendered.risk_evidence) && (rendered.risk_evidence as unknown[]).length > 0, "high risk must carry a non-empty risk_evidence phrase array");
-	assert.ok((rendered.risk_evidence as string[])[0]!.includes("deploy.yml"));
-	assert.ok(accepted.actor_binding, "accepting consent must proceed to actor_binding");
-	assert.equal(readReviewConsentLatch(cwd), true, "accepting consent must record the per-clone latch");
+	const { native, calls } = journeyNative(DEV_BINARY!);
+	await enableReview(native, cwd);
+	const consent = await candidateConsent(native, cwd);
+	const answered = await native.answerConsent({ cwd, consent, answer: "granted" });
+	assert.equal(answered.kind, "started");
+	if (answered.kind === "started") {
+		assert.ok(answered.start.lineageId.length > 0);
+		assert.ok(answered.start.selectedLenses.length > 0);
+		assert.equal(answered.start.raw?.repository_context !== undefined, true);
+	}
+	const grantedChoice = consent.choices.find((choice) => choice.answer === "granted");
+	assert.ok(grantedChoice, "consent must include a granted choice");
+	assert.deepEqual(consentAnswerCall(calls, "granted"), grantedChoice.invocation.split(" ").slice(1));
 });
 
-test("dev-binary: declining the fake-UI consent prompt withholds actor_binding for this work unit only, against the real binary's own evidence", { skip: !RUNNABLE }, async (t) => {
+test("dev-binary: declined consent executes its exact candidate-bound invocation once and creates no lineage, result, or actor", { skip: !RUNNABLE }, async (t) => {
 	const cwd = repository(t);
 	const workflowDirectory = join(cwd, ".github", "workflows");
 	execFileSync("mkdir", ["-p", workflowDirectory]);
@@ -277,72 +158,74 @@ test("dev-binary: declining the fake-UI consent prompt withholds actor_binding f
 	git(cwd, "commit", "-qm", "initial");
 	writeFileSync(join(workflowDirectory, "deploy.yml"), "name: x\non: push\njobs:\n  deploy:\n    steps:\n      - run: curl -s | bash\n");
 
-	const { controller } = runtime(journeyNative(DEV_BINARY!));
-	const declined = await execStart(controller, "tier-2-decline", confirmContext(cwd, false));
-	assert.equal(declined.actor_binding, undefined, "declining must withhold actor dispatch for this work unit");
-	assert.equal(readReviewConsentLatch(cwd), false, "declining must never persist the latch");
-	assert.ok(declined.result, "the native start result itself is still reported even on decline");
+	const { native, calls } = journeyNative(DEV_BINARY!);
+	await enableReview(native, cwd);
+	const consent = await candidateConsent(native, cwd);
+	const answered = await native.answerConsent({ cwd, consent, answer: "declined" });
+	assert.equal(answered.kind, "declined");
+	if (answered.kind === "declined") {
+		assert.equal(answered.consent, "declined_this_candidate");
+		assert.equal("lineageId" in answered, false);
+		assert.equal("start" in answered, false);
+		assert.equal("actor" in answered.raw, false);
+	}
+	const declinedChoice = consent.choices.find((choice) => choice.answer === "declined");
+	assert.ok(declinedChoice, "consent must include a declined choice");
+	assert.deepEqual(consentAnswerCall(calls, "declined"), declinedChoice.invocation.split(" ").slice(1));
+	const after = await native.targetStatus({ cwd, agent: "pi" });
+	assert.equal(after.authority, undefined);
+	assert.equal("receipt" in after, false, "last-event STATUS no longer exposes receipt state");
 });
 
 // ---------------------------------------------------------------------------
-// Disabled/unmanaged delivery renders as a successful skip, never a failure.
+// Truthful non-authority responses.
 // ---------------------------------------------------------------------------
 
-// IMPORTANT reachability finding (Phase 6 ground-truthing): gentle-ai only
-// emits the disabled/unmanaged delivery envelope through lineage
-// AUTO-DISCOVERY (`review validate --gate <gate>` with no `--lineage`) — its
-// Go source (internal/cli/review_facade.go:2412-2433,1904-1916) routes an
-// explicit `--lineage <id>` through discoverCompactFacadeReview's
-// lineage-specific branch, whose failures are plain `fmt.Errorf` values, never
-// the `*ReviewReceiptDiscoveryError` the disabled/unmanaged check requires —
-// confirmed live against both a nonexistent lineage id ("load compact facade
-// review lineage: ... no such file or directory", exit 1) and a real
-// previously-started lineage under a disabled switch ("facade review receipt
-// is not available", exit 1). Neither is the structured JSON envelope.
-// Pi's `gentle_review` VALIDATE operation always binds an explicit
-// lineageId (extensions/gentle-ai.ts throws "Review controller validate
-// requires a lineageId" otherwise), so this envelope is structurally
-// unreachable through today's controller wiring — this is a pre-existing
-// property of the VALIDATE contract, not something Phase 5.2 introduced.
-// This is flagged as a risk for a future design revision, not silently
-// papered over here. What Phase 6 CAN and does prove against the real binary
-// is that Pi's decoder correctly decodes the envelope gentle-ai actually
-// sends via auto-discovery; the controller-level mapping/early-return
-// (mapNativeValidateResult + the skip response) is proven separately with a
-// synthetic fixture in tests/review-controller-native-routing.test.ts,
-// because gentle-ai's own explicit-lineage code path can never supply it.
-test("dev-binary: VALIDATE via lineage auto-discovery decodes the real disabled/unmanaged delivery envelope", { skip: !RUNNABLE }, async (t) => {
+test("dev-binary: an empty candidate exposes the current STATUS refusal and never reconstructs START", { skip: !RUNNABLE }, async (t) => {
 	const cwd = repository(t);
 	writeFileSync(join(cwd, "app.ts"), "export const value = 1;\n");
 	git(cwd, "add", ".");
 	git(cwd, "commit", "-qm", "initial");
-	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
-	git(cwd, "add", "--", "app.ts");
 
-	// Each journey uses its own throwaway temp repository (deleted in
-	// repository(t)'s cleanup), so there is no shared clone-local state to
-	// restore afterward.
-	const native = journeyNative(DEV_BINARY!);
-	await native.reviewMode!({ cwd, operation: "disable" });
+	const { native, calls } = journeyNative(DEV_BINARY!);
+	await enableReview(native, cwd);
+	const status = await native.targetStatus({ cwd, agent: "pi" });
+	assert.equal(status.nextTransition?.kind, "collect");
+	assert.equal(status.nextTransition?.reasonCode, "empty_candidate_base_ref_required");
+	await assert.rejects(
+		() => native.start({ cwd }),
+		(error: unknown) => error instanceof NativeReviewCliError
+			&& error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE
+			&& error.mutationOutcome === "none",
+	);
+	assert.equal(calls.filter((arguments_) => arguments_.at(0) === "review" && arguments_.at(1) === "start").length, 0);
+});
 
-	// No lineageId: this is the one shape gentle-ai actually routes through
-	// its disabled/unmanaged discovery branch.
-	const result = await native.validate({ cwd, gate: "pre-commit" });
-	assert.equal(result.delivery, "disabled/unmanaged");
-	assert.equal(result.allowed, false);
-	assert.equal(result.result, "invalidated");
-	assert.equal(result.action, "repository-policy");
+test("dev-binary: a low-risk START closes the review with no receipt or follow-up capture", { skip: !RUNNABLE }, async (t) => {
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "guide.md"), "# Guide\n\nBase\n");
+	git(cwd, "add", "guide.md");
+	git(cwd, "commit", "-qm", "docs: base guide");
+	writeFileSync(join(cwd, "guide.md"), "# Guide\n\nBase\n\nPassive update\n");
+
+	const { native } = journeyNative(DEV_BINARY!);
+	await enableReview(native, cwd);
+	const status = await native.targetStatus({ cwd, agent: "pi" });
+	const started = await native.start({ cwd, targetIdentity: status.targetIdentity });
+	assert.equal(started.action, "closed");
+	assert.equal(started.state, "approved");
+	assert.deepEqual(started.selectedLenses, []);
+	assert.equal(started.lensesRequired, false);
 });
 
 test.before(() => {
-	if (RUNNABLE) {
-		setNativeCliContractForTesting(BRIDGE_VERSION, {
-			start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true,
-			reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true,
-			mode: true, riskEvidence: true, hint: true, delivery: true,
-		});
-	}
+	process.env.HOME = DEV_HOME;
+	process.env.USERPROFILE = DEV_HOME;
 });
 test.after(() => {
-	if (RUNNABLE) setNativeCliContractForTesting(BRIDGE_VERSION, undefined);
+	if (ORIGINAL_HOME === undefined) delete process.env.HOME;
+	else process.env.HOME = ORIGINAL_HOME;
+	if (ORIGINAL_USERPROFILE === undefined) delete process.env.USERPROFILE;
+	else process.env.USERPROFILE = ORIGINAL_USERPROFILE;
+	rmSync(DEV_HOME, { recursive: true, force: true });
 });

@@ -58,51 +58,49 @@ At ordinary start, non-trivial hot paths or over 400 changed lines MUST select `
 - WHEN start routes
 - THEN route remains zero-lens `trivial`
 
-### Requirement: Pre-commit and pre-push ceiling
+### Requirement: Commit and push are outside review routing
 
-Pre-commit/pre-push MUST NOT classify or review. Pre-commit MUST resolve the exact intended commit tree. Pre-push MUST consume the complete stable-ordered ref-update set, binding each source/destination ref and exact object/peeled-commit/tree IDs—never `HEAD` as proxy. Const-tagged `create` binds absent-old plus new identity; `update` binds both sides. New/update trees MUST match receipt final/base semantics; deletion, unsupported, ambiguous, or unresolved forms fail closed.
-(Previously: these events rerouted full 4R to one standard lens.)
+Pre-commit and pre-push MUST NOT classify, start, resume, validate, or otherwise invoke review. Pi has no commit or push delivery gate. Ordinary commit and push always follow repository policy.
 
-#### Scenario: Pre-delivery validation
+#### Scenario: Commit or push is requested
 
-- GIVEN a resolved commit or push target and receipt
-- WHEN gated
-- THEN exact semantics MUST be checked with zero actors
+- GIVEN a repository commit or push command
+- WHEN it is requested
+- THEN Pi review routing does not inspect it as a delivery target
+- AND repository policy determines execution
 
-### Requirement: Non-blocking safety composition
+### Requirement: Review-only safety composition
 
-All lifecycle gates MUST use `GateTargetV1` and receipts only. PR targets bind base/head refs, commits, and trees; release targets bind tag ref/object, peeled commit, and commit tree. Every identity MUST resolve. Target hash and result MUST be journaled. Post-apply MAY explicitly start ordinary without a receipt, never Judgment Day. Dangerous-command confirmation remains authoritative.
-(Previously: routing emitted non-blocking advice without requiring receipts.)
+Review routing binds only review candidates, findings, and evidence. It MUST NOT derive delivery targets, journal delivery authorization, or turn a receipt into commit, push, PR, or release authority. Post-apply MAY explicitly start ordinary review without a receipt, never Judgment Day. Dangerous-command confirmation remains authoritative under repository policy.
 
-#### Scenario: Same-lineage gate
+#### Scenario: Review result is available
 
-- GIVEN a resolved target matches an approved receipt
-- WHEN gated
-- THEN it MUST allow with zero actors
+- GIVEN a resolved candidate matches an approved receipt
+- WHEN routing completes
+- THEN the receipt remains review evidence only
+- AND ordinary delivery follows repository policy
 
 #### Scenario: Changed scope
 
-- GIVEN target semantics differ
-- WHEN validated
-- THEN return `scope-changed` with zero actors
-- AND parent+target MUST identify one claimed child with one fresh explicit budget
+- GIVEN review candidate semantics differ
+- WHEN review routing evaluates the candidate
+- THEN it returns the review-specific next action with zero actors until an explicit review starts
 
 #### Scenario: Dangerous command
 
 - GIVEN command safety requires confirmation
-- WHEN a receipt allows
-- THEN command safety MUST still control execution
+- WHEN a command is requested
+- THEN command safety remains authoritative under repository policy
 
 ### Requirement: Delivery boundary
 
-Routing/validation MUST perform no delivery, publication, or publication-only version change.
-(Previously: the boundary covered routing advice but not receipt validation.)
+Routing and validation MUST perform no delivery, publication, publication-only version change, or delivery authorization. Pi mints no delivery authority: ordinary commit, push, PR, and release always follow repository policy.
 
 #### Scenario: Validation completes without delivery
 
-- GIVEN a routing/validation result
+- GIVEN a routing or validation result
 - WHEN complete
-- THEN no delivery/publication action occurs
+- THEN no delivery or publication action is authorized or performed
 
 ## Acceptance Criteria
 

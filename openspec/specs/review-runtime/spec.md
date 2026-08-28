@@ -22,27 +22,28 @@ The controller MUST provide every selected reviewer with a read-only, resolvable
 - WHEN dispatch is requested
 - THEN dispatch is denied before actor execution and the failure identifies snapshot resolution or identity verification
 
-### Requirement: Start, finalize, and pre-commit validate the same supported candidate projection
+### Requirement: START and FINALIZE use the same supported candidate projection
 
-The supported review path MUST derive candidate identity and intended paths using the released runtime contract consistently across START, FINALIZE, and pre-commit VALIDATE. Unchanged intended content, including supported staged initially-untracked files, MUST be authorizable. A genuine candidate or path change MUST be denied. No reset, direct object writing, store deletion, force option, or lifecycle bypass MAY be used as recovery.
+The supported review path MUST derive candidate identity and intended paths using the released runtime contract consistently across START and FINALIZE. A genuine candidate or path change MUST remain review-specific evidence, not delivery authority. No reset, direct object writing, store deletion, force option, or lifecycle bypass MAY be used as review recovery.
 
-#### Scenario: Unchanged intended content is committed
+#### Scenario: Unchanged intended content is reviewed
 
 - GIVEN a review is finalized for an intended candidate and its supported path set
-- WHEN the same candidate, including staged initially-untracked content, is validated for pre-commit
-- THEN validation authorizes the lifecycle command
+- WHEN the same candidate, including supported staged initially-untracked content, is inspected for review
+- THEN its projection remains consistent with the finalized review evidence
+- AND any commit follows repository policy without Pi authorization
 
 #### Scenario: Candidate content or paths changed
 
-- GIVEN the validated candidate or intended path set differs from the approved receipt
-- WHEN pre-commit validation runs
-- THEN validation denies authorization, preserves the existing authority, and requires a new supported lineage or other released recovery action
+- GIVEN the review candidate or intended path set differs from the approved receipt
+- WHEN review status runs
+- THEN it reports the review mismatch, preserves existing authority, and requires a supported review recovery action
 
 #### Scenario: Projection support is unavailable
 
-- GIVEN the installed runtime does not expose a released projection/reconciliation contract required by the flow
+- GIVEN the installed runtime does not expose a released projection/reconciliation contract required by review
 - WHEN the operation would require a fabricated mirror, hash, tree, or envelope
-- THEN the operation fails closed and reports an upstream dependency instead of creating security-relevant data locally
+- THEN the review operation fails closed and reports an upstream dependency instead of creating security-relevant data locally
 
 ### Requirement: Genuine candidate mismatches have honest diagnostics
 
@@ -92,21 +93,16 @@ The supported native ordinary START path MUST obtain policy identity only throug
 - WHEN START would require an invented hash
 - THEN START fails closed without creating authority
 
-### Requirement: Fork heads bind to one exact remote commit
+### Requirement: Pull-request delivery is outside review authority
 
-Pre-PR validation MUST support both branch and owner-qualified `owner:branch` heads. An owner-qualified head MUST resolve through exactly one matching configured GitHub remote and bind authorization to the exact advertised remote commit. Malformed syntax, missing or ambiguous owner remotes, and divergent advertised commits MUST fail closed.
+Pi MUST NOT validate, resolve, or authorize pull-request delivery targets. Branch and owner-qualified `owner:branch` head semantics for a pull request remain repository-policy concerns; review evidence has no pull-request delivery effect.
 
-#### Scenario: Valid fork head
+#### Scenario: Pull request is requested
 
-- GIVEN one configured remote matches the requested owner and its branch resolves
-- WHEN the pre-PR gate validates the owner-qualified head
-- THEN it authorizes only the exact resolved commit
-
-#### Scenario: Fork head is malformed, ambiguous, missing, or divergent
-
-- GIVEN the owner-qualified head cannot be uniquely resolved or its commit differs from the advertised target
-- WHEN the pre-PR gate validates it
-- THEN validation denies publication and reports the resolution or commit mismatch
+- GIVEN a configured remote and pull-request head
+- WHEN pull-request delivery is requested
+- THEN repository policy determines its resolution and execution
+- AND Pi review evidence does not authorize or deny publication
 
 ### Requirement: Lifecycle discovery is filtered by candidate identity
 
@@ -140,12 +136,12 @@ Release evidence MUST assign exactly one terminal work-unit disposition to each 
 - WHEN the work unit is finalized
 - THEN the issue remains truthfully upstream-blocked with a concrete tracker URL and no fabricated mirror or reset
 
-### Requirement: Lifecycle gates preserve fail-closed guarantees
+### Requirement: Review evidence has no delivery authority
 
-Candidate parity corrections MUST preserve lifecycle authorization, receipt integrity, actor distrust, and content-bound gate validation. The implementation MUST NOT authorize commands by wrapping them, bypassing inspection, or weakening the supported gate.
+Candidate parity corrections MUST preserve receipt integrity and actor distrust while keeping review evidence separate from delivery. The implementation MUST NOT authorize, deny, wrap, inspect, or otherwise interpose on commit, push, PR, or release commands.
 
-#### Scenario: Unapproved lifecycle command is attempted
+#### Scenario: Delivery command is attempted
 
-- GIVEN no valid authorization exists for the exact candidate
-- WHEN a lifecycle command is requested
-- THEN the gate denies it regardless of command wrapping or actor output
+- GIVEN a commit, push, PR, or release command is requested
+- WHEN Pi review evidence exists or is absent
+- THEN ordinary repository policy controls the command regardless of that evidence

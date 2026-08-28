@@ -37,8 +37,6 @@
     "README.md"
   ],
   "scripts": {
-	"build:transaction-runner": "node scripts/build-git-commit-transaction-runner.mjs --write",
-	"check:transaction-runner": "node scripts/build-git-commit-transaction-runner.mjs --check",
 	"check:provider-contract": "node scripts/check-provider-contract.mjs",
     "postinstall": "node scripts/install-gentle-ai.mjs",
     "test": "node --experimental-strip-types --test tests/*.test.ts && pnpm run check:provider-contract && pnpm run test:harness",
@@ -46,9 +44,11 @@
     "test:dev-binary": "node --experimental-strip-types --test tests/devbinary/*.devtest.ts",
     "test:cross-lane": "node tests/crosslane/cross-lane.mjs",
     "test:maintainer": "node --experimental-strip-types --test tests/maintainer/*.maintest.ts",
-	"test:packed-runner": "node scripts/test-packed-runner.mjs",
-    "prepack": "pnpm test && node scripts/verify-package-files.mjs",
-    "prepublishOnly": "pnpm test && node scripts/verify-package-files.mjs && pnpm run test:packed-runner"
+    "build:runtime-modules": "node scripts/build-runtime-modules.mjs --write",
+    "check:runtime-modules": "node scripts/build-runtime-modules.mjs --check",
+    "test:packed-package": "node scripts/test-packed-runner.mjs",
+    "prepack": "pnpm test && pnpm run check:runtime-modules && node scripts/verify-package-files.mjs",
+    "prepublishOnly": "pnpm test && pnpm run check:runtime-modules && node scripts/verify-package-files.mjs && pnpm run test:packed-package"
   },
   "pi": {
     "image": "https://cdn.jsdelivr.net/npm/gentle-pi/assets/gentle-logo-only.png",
@@ -70,7 +70,8 @@
     "@heyhuynhgiabuu/pi-pretty": "0.6.14"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": {

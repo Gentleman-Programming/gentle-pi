@@ -24,7 +24,7 @@ The forecast is below the requested 2,000-line ceiling. The High 400-line risk i
 - Keep production code and its tests in the same work unit/commit; use conventional commits and do not commit by file type.
 - Before implementation, record protected uncommitted paths/hunks with `git diff --stat` and targeted `git diff`; after each unit, verify those hunks are unchanged.
 - Use targeted edits and existing seams. Do not modify `lib/review-repository.ts` or the pinned `IDENTITY` file unless a narrow, unavoidable import seam is proven.
-- Do not change operation names, states, lens-selection policy, correction limits, graph-v1 mutation rules, delivery gates, or persisted schemas.
+- Do not change operation names, states, lens-selection policy, correction limits, graph-v1 mutation rules, ordinary repository-delivery policy, or persisted schemas.
 - Run focused tests after each unit; run `pnpm test` and `pnpm run prepack` before release readiness.
 
 ## Work Units

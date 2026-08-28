@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define the authoritative, portable, recoverable, and fail-closed persistence contract for bounded review transactions while preserving existing review policy, lifecycle outcomes, and delivery boundaries.
+Define the authoritative, portable, recoverable, and fail-closed persistence contract for bounded review transactions while preserving review policy and keeping delivery outside Pi authority.
 
 ## Requirements
 
@@ -42,10 +42,10 @@ The system MUST resolve authoritative event objects, heads, indexes, journals, l
 - THEN both resolve the same exact common-directory paths
 - AND a mutation from one worktree is visible to the other through the authoritative graph
 
-#### Scenario: Worktree-local state cannot authorize
+#### Scenario: Worktree-local state cannot become review authority
 
 - GIVEN a worktree-local cache or presentation copy that differs from common-directory authority
-- WHEN a lifecycle mutation or gate checks review state
+- WHEN a review mutation or inspection checks review state
 - THEN the local copy is ignored as authority
 - AND the operation requires valid common-directory authority
 
@@ -72,18 +72,18 @@ Every authoritative mutation, reset, import, and recovery operation MUST hold an
 - GIVEN a process crashes at a publication boundary
 - WHEN the next process opens the store
 - THEN it observes the previous valid authority or the next fully valid authority
-- AND idempotent recovery does not consume review, refutation, validation, fix, or lifecycle budget
+- AND idempotent recovery does not consume review, refutation, validation, or fix budget
 
 ### Requirement: Legacy state is detected before authority use
 
-The system MUST detect legacy review authority and authority-bearing legacy artifacts beneath the exact Git common-directory boundary before graph-v1 initialization and before every graph-v1 read, mutation, resume, import, receipt issuance, or gate validation. Detection MUST fail closed without silently initializing, selecting, translating, or treating either legacy or partially initialized graph-v1 state as authority.
+The system MUST detect legacy review authority and authority-bearing legacy artifacts beneath the exact Git common-directory boundary before graph-v1 initialization and before every graph-v1 read, mutation, resume, import, or receipt issuance. Detection MUST fail closed without silently initializing, selecting, translating, or treating either legacy or partially initialized graph-v1 state as authority.
 
 #### Scenario: Legacy detection blocks operations
 
-- GIVEN any legacy authority, receipt, approval, ledger, finding, frozen hash, lineage, journal, consumed counter, or gate evidence is present
+- GIVEN any legacy authority, receipt, approval, ledger, finding, frozen hash, lineage, journal, consumed counter, or review evidence is present
 - WHEN an authority-bearing graph-v1 operation starts
 - THEN the operation is denied with target-specific diagnostics identifying the detected legacy state and required destructive reset
-- AND no graph-v1 authority or gate result is created
+- AND no graph-v1 authority or review result is created
 
 #### Scenario: Detection is shared across worktrees
 
@@ -101,7 +101,7 @@ The system MUST provide an explicit logical reset that is never silent, implicit
 - GIVEN legacy state is detected
 - WHEN an operator does not provide explicit confirmation bound to the exact target
 - THEN reset does not run
-- AND all legacy state and gates remain blocked and unchanged
+- AND all legacy state and review evidence remain blocked and unchanged
 
 #### Scenario: Successful reset establishes sole new authority
 
@@ -109,8 +109,8 @@ The system MUST provide an explicit logical reset that is never silent, implicit
 - WHEN the reset marker and new store epoch/incarnation are durably published
 - THEN the new empty graph-v1 store is initialized from genesis under that epoch
 - AND legacy bytes remain untouched and are inert audit evidence only
-- AND no legacy lineage, receipt, approval, ledger, finding, frozen hash, journal, counter, bundle, or gate evidence is usable
-- AND no approval, receipt, or passing gate is created by reset
+- AND no legacy lineage, receipt, approval, ledger, finding, frozen hash, journal, counter, bundle, or review evidence is usable
+- AND no approval or receipt is created by reset
 
 #### Scenario: Legacy paths are never recursively removed or traversed
 
@@ -122,7 +122,7 @@ The system MUST provide an explicit logical reset that is never silent, implicit
 #### Scenario: Retired-byte writers cannot affect graph authority
 
 - GIVEN an old writer modifies bytes in a retired legacy path after reset
-- WHEN graph-v1 authority or a lifecycle gate is read
+- WHEN graph-v1 authority is read
 - THEN the current store epoch/incarnation and graph authority remain unchanged
 - AND diagnostics MAY report drift or modification of retired audit evidence
 - AND the old bytes do not become authority or invalidate the current graph
@@ -137,16 +137,17 @@ The system MUST provide an explicit logical reset that is never silent, implicit
 
 #### Scenario: Retired receipts and bundles are denied
 
-- GIVEN a receipt, bundle, gate, or other authority-bearing artifact belongs to a prior store epoch/incarnation
-- WHEN it is presented to graph-v1 or a lifecycle gate
+- GIVEN a receipt, bundle, or other authority-bearing artifact belongs to a prior store epoch/incarnation
+- WHEN it is presented to graph-v1
 - THEN it is rejected as retired regardless of its bytes or apparent validity
-- AND no authority, budget, or gate result changes
+- AND no authority, budget, or review result changes
 
-#### Scenario: Fresh review is required after reset
+#### Scenario: Fresh review evidence is required after reset
 
 - GIVEN reset completed and the new graph-v1 store is empty
-- WHEN a lifecycle or delivery gate evaluates a target
-- THEN the gate denies until a completely fresh graph-v1 review from genesis issues a new approved receipt bound to the current epoch/incarnation and exact typed target
+- WHEN a fresh review is requested
+- THEN it starts from genesis and issues review evidence bound to the current epoch/incarnation and exact candidate
+- AND ordinary commit, push, PR, and release continue to follow repository policy
 
 ### Requirement: Validated atomic bundle transfer
 
@@ -194,32 +195,33 @@ The system MUST persist identity-bound progress sufficient to resume interrupted
 
 ### Requirement: Mirrors are non-authoritative
 
-The system MUST represent mirrors through authority-distinct types or capabilities. Mirrors MAY cache, inspect, replicate, or transport verified graph-v1 objects and report declared-root freshness/completeness, but MUST NOT advance heads, authorize transitions, fixes, approvals, escalations, receipts, gates, delivery, or publication. Promotion MUST use the locked authoritative import validation path.
+The system MUST represent mirrors through authority-distinct types or capabilities. Mirrors MAY cache, inspect, replicate, or transport verified graph-v1 objects and report declared-root freshness/completeness, but MUST NOT advance heads, transitions, fixes, approvals, escalations, or receipts. Promotion MUST use the locked authoritative import validation path. Mirrors and authoritative graphs are review evidence only and never delivery authority.
 
-#### Scenario: Mirror cannot pass a gate
+#### Scenario: Mirror remains review-only
 
 - GIVEN a mirror contains a seemingly approved receipt or complete graph
-- WHEN a commit, push, PR, release, or publication gate evaluates it
-- THEN the gate rejects mirror-only authority
-- AND performs no review actor invocation
+- WHEN it is inspected
+- THEN it remains non-authoritative review evidence
+- AND it cannot affect commit, push, PR, release, or publication
 
 #### Scenario: Verified mirror promotion
 
 - GIVEN mirror objects are promoted through authoritative import
-- WHEN closure, identities, lifecycle state, and locks validate successfully
-- THEN only the resulting authoritative graph may support a gate
+- WHEN closure, identities, review state, and locks validate successfully
+- THEN the resulting authoritative graph may support review operations
 - AND the mirror remains non-authoritative
 
-### Requirement: Lifecycle receipts and gates remain bounded
+### Requirement: Review receipts remain bounded
 
-Authoritative graph validation MUST preserve the existing bounded review contract: frozen claims are immutable and hash-bound, actor output is untrusted, budgets are monotonic across retry/resume/import/restart, ordinary review ends only as approved or escalated, Judgment Day remains explicitly distinct, no-fix paths run no validator, fix paths use only the permitted scoped validator, and final verification occurs exactly once per ordinary lineage. Lifecycle gates MUST validate an approved authoritative graph-v1 receipt against the exact typed target with zero review actors. Review execution MUST NOT commit, push, create PRs, release, or publish.
+Authoritative graph validation MUST preserve the existing bounded review contract: frozen claims are immutable and hash-bound, actor output is untrusted, budgets are monotonic across retry/resume/import/restart, ordinary review ends only as approved or escalated, Judgment Day remains explicitly distinct, no-fix paths run no validator, fix paths use only the permitted scoped validator, and final verification occurs exactly once per ordinary lineage. A graph-v1 receipt remains review evidence only. Review execution MUST NOT commit, push, create PRs, release, publish, or authorize delivery.
 
-#### Scenario: Receipt and gate validation
+#### Scenario: Receipt remains review-only
 
-- GIVEN an approved authoritative graph-v1 receipt bound to an exact typed target
-- WHEN a lifecycle gate validates it
-- THEN the gate succeeds only if graph closure, receipt, lineage, and target all match
+- GIVEN an approved authoritative graph-v1 receipt bound to an exact candidate
+- WHEN review state is inspected
+- THEN graph closure, receipt, lineage, and candidate identity remain verifiable review evidence
 - AND no review actor is launched
+- AND ordinary commit, push, PR, and release follow repository policy
 
 #### Scenario: Terminal state is closed
 
@@ -256,9 +258,9 @@ The system MUST define and test supported filesystem and operating-system behavi
 - Linked worktrees share exact common-directory authority and lock paths; local mirrors cannot authorize.
 - Lock recovery and interrupted publication fail closed or expose only a valid old/new authority.
 - Legacy detection blocks every authority-bearing operation before initialization or use and reports the required target-bound reset.
-- Reset never runs silently; it durably retires legacy authority under a new store epoch/incarnation, preserves legacy bytes as inert audit evidence without recursively deleting or traversing legacy paths, initializes empty graph-v1, and creates no approval or gate evidence.
+- Reset never runs silently; it durably retires legacy authority under a new store epoch/incarnation, preserves legacy bytes as inert audit evidence without recursively deleting or traversing legacy paths, initializes empty graph-v1, and creates no approval or delivery authority.
 - Interrupted reset remains detectably blocked and explicitly recoverable without treating either format as authority.
-- No gate passes until a fresh post-reset graph-v1 review issues a new approved receipt for the exact typed target.
+- A fresh post-reset graph-v1 review issues new review evidence for the exact candidate without affecting delivery.
 - Export/import validates closure and lifecycle invariants before atomic, idempotent installation; resume preserves identities, claims, receipts, and budgets.
-- Mirror-only data cannot satisfy lifecycle or delivery gates.
+- Mirror-only data cannot affect review state or delivery.
 - No signing, network transport, distributed consensus, automatic conflict merging, or review-policy expansion is required.

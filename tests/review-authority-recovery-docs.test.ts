@@ -17,11 +17,10 @@ test("recovery guidance documents the narrow published native maintenance contra
 	assert.match(README, /review dispose-result.*unsupported.*pending.*design/i);
 	assert.match(README, /RESET.*RECOVER.*destructive/i);
 	assert.match(README, /typed envelopes/i);
-	assert.match(README, /pre-commit.*pre-push.*pre-PR.*release/is);
 });
 
 test("controller help keeps authorization, blocked outcomes, and recovery boundaries explicit", () => {
-	assert.match(CONTROLLER, /v2\.1\.11 repair-legacy-alias.*fresh native inventory.*fresh UI approval/is);
+	assert.match(CONTROLLER, /REPAIR_LEGACY_ALIAS.*freshly reads native inventory.*interactive approval/is);
 	assert.match(CONTROLLER, /unchanged_target,malformed_recovery_authorization/);
 	assert.match(CONTROLLER, /provider-selected recovery disposition/);
 	assert.match(CONTROLLER, /headlessly|headless/i);

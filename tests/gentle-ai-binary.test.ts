@@ -1,17 +1,23 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import test from "node:test";
 import {
 	GENTLE_AI_BINARY_MISSING_CODE,
+	GENTLE_AI_DEV_BINARY_ENV,
 	GENTLE_AI_VERSION,
+	gentleAiDevBinaryRegistrationPath,
 	PackageLocalGentleAiBinaryMissingError,
+	registerGentleAiDevBinary,
 	resolveGentleAiBinary,
+	setGentleAiDevBinaryEnvironmentForTesting,
+	unregisterGentleAiDevBinary,
+	type GentleAiDevBinaryEnvironment,
 } from "../lib/gentle-ai-binary.ts";
-import { NativeReviewCliV213, createNativeReviewCli, type ExecFileAdapter } from "../lib/native-review-cli.ts";
+import { NativeReviewCliV216, createNativeReviewCli, type ExecFileAdapter } from "../lib/native-review-cli.ts";
 import { GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM, resolveGentleAiReleaseAsset } from "../scripts/gentle-ai-installer.mjs";
 import { requireNativeBinary } from "./support/native-binary-gate.ts";
 
@@ -28,6 +34,47 @@ const nativeBinaryGate = requireNativeBinary({
 });
 if (!nativeBinaryGate.run) console.log(`gentle-ai-binary: ${nativeBinaryGate.reason}`);
 const verifiedBinaryTest = nativeBinaryGate.run && process.platform !== "win32" ? test : test.skip;
+
+interface PinnedBinaryIsolation {
+	environment: GentleAiDevBinaryEnvironment;
+	savedEnvironmentValue: string | undefined;
+	savedRegistration: string | undefined;
+}
+
+let pinnedBinaryIsolation: PinnedBinaryIsolation | undefined;
+
+test.beforeEach((t) => {
+	const home = mkdtempSync(join(tmpdir(), "gentle-pi-pinned-binary-home-"));
+	const environment: GentleAiDevBinaryEnvironment = { env: { ...process.env }, home };
+	delete environment.env.GENTLE_PI_CONFIG_HOME;
+	const savedEnvironmentValue = environment.env[GENTLE_AI_DEV_BINARY_ENV];
+	const registrationPath = gentleAiDevBinaryRegistrationPath(environment);
+	const savedRegistration = existsSync(registrationPath)
+		? readFileSync(registrationPath, "utf8")
+		: undefined;
+
+	delete environment.env[GENTLE_AI_DEV_BINARY_ENV];
+	unregisterGentleAiDevBinary(environment);
+	setGentleAiDevBinaryEnvironmentForTesting(environment);
+	pinnedBinaryIsolation = { environment, savedEnvironmentValue, savedRegistration };
+
+	t.after(() => {
+		if (savedEnvironmentValue === undefined) {
+			delete environment.env[GENTLE_AI_DEV_BINARY_ENV];
+		} else {
+			environment.env[GENTLE_AI_DEV_BINARY_ENV] = savedEnvironmentValue;
+		}
+		if (savedRegistration === undefined) {
+			unregisterGentleAiDevBinary(environment);
+		} else {
+			mkdirSync(dirname(registrationPath), { recursive: true });
+			writeFileSync(registrationPath, savedRegistration);
+		}
+		setGentleAiDevBinaryEnvironmentForTesting(undefined);
+		pinnedBinaryIsolation = undefined;
+		rmSync(home, { recursive: true, force: true });
+	});
+});
 
 async function writeVerifiedBinary(packageRoot: string, platform = process.platform): Promise<string> {
 	const asset = resolveGentleAiReleaseAsset(platform, process.arch);
@@ -64,13 +111,34 @@ async function writeWindowsSourceBinary(packageRoot: string): Promise<{ binaryPa
 	return { binaryPath, manifestPath };
 }
 
-verifiedBinaryTest("runtime resolves an absolute package-local binary path without PATH fallback", async () => {
+verifiedBinaryTest("runtime resolves an absolute package-local binary path without PATH fallback or ambient dev contamination", async () => {
 	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-binary-"));
 	const executable = process.platform === "win32" ? "gentle-ai.exe" : "gentle-ai";
 	const binaryPath = await writeVerifiedBinary(packageRoot);
+	const devBinary = join(packageRoot, "maintainer-dev-binary");
+	await writeFile(devBinary, "maintainer dev binary");
+	if (process.platform !== "win32") await chmod(devBinary, 0o700);
+	const isolation = pinnedBinaryIsolation;
+	assert.ok(isolation, "the pinned-binary fixture must install its isolated environment");
+
+	const ambientValue = process.env[GENTLE_AI_DEV_BINARY_ENV];
+	process.env[GENTLE_AI_DEV_BINARY_ENV] = devBinary;
+	try {
+		assert.equal(resolveGentleAiBinary(packageRoot, process.platform), binaryPath, "a maintainer's ambient override must not contaminate a pinned-package case");
+	} finally {
+		if (ambientValue === undefined) delete process.env[GENTLE_AI_DEV_BINARY_ENV];
+		else process.env[GENTLE_AI_DEV_BINARY_ENV] = ambientValue;
+	}
+
+	isolation.environment.env[GENTLE_AI_DEV_BINARY_ENV] = devBinary;
+	assert.equal(resolveGentleAiBinary(packageRoot, process.platform), devBinary, "an explicit dev-binary test may opt in through the isolated environment seam");
+	delete isolation.environment.env[GENTLE_AI_DEV_BINARY_ENV];
+	registerGentleAiDevBinary(devBinary, isolation.environment);
+	assert.equal(resolveGentleAiBinary(packageRoot, process.platform), devBinary, "an explicit persistent dev registration may opt in through the isolated environment seam");
+	assert.equal(unregisterGentleAiDevBinary(isolation.environment), true);
 
 	const resolved = resolveGentleAiBinary(packageRoot, process.platform);
-	assert.equal(resolved, binaryPath);
+	assert.equal(resolved, binaryPath, "clearing the explicit registration restores the pinned resolver");
 	assert.equal(isAbsolute(resolved), true);
 	assert.equal(basename(resolved), executable);
 	assert.doesNotMatch(resolved, /(^|[/\\])PATH($|[/\\])/i);
@@ -124,7 +192,7 @@ test("runtime rejects an unverified binary, a symlinked manifest, and ambient ex
 	await writeFile(manifestTarget, `${JSON.stringify({ version: GENTLE_AI_VERSION, asset: `gentle-ai_${GENTLE_AI_VERSION}_${process.platform}_${process.arch === "x64" ? "amd64" : process.arch}.tar.gz`, assetSha256: "a".repeat(64), binarySha256 })}\n`);
 	await symlink(manifestTarget, manifestPath);
 	assert.throws(() => resolveGentleAiBinary(packageRoot, process.platform), /package-local-binary-missing/);
-	assert.throws(() => new NativeReviewCliV213(async () => VERSION, "gentle-ai"), /absolute package-local executable/);
+	assert.throws(() => new NativeReviewCliV216(async () => VERSION, "gentle-ai"), /absolute package-local executable/);
 });
 
 verifiedBinaryTest("runtime rejects malformed, unknown, wrong, and symlinked integrity paths", async () => {
@@ -224,16 +292,18 @@ verifiedBinaryTest("production native client never invokes a global gentle-ai ex
 	const calls: string[] = [];
 	const adapter: ExecFileAdapter = async (request) => {
 		calls.push(request.file);
-		if (request.arguments[0] === "version") return VERSION;
 		return {
 			...VERSION,
-			stdout: JSON.stringify({ operation: "review/start", lineage_id: "lineage", state: "reviewing", risk_level: "low", selected_lenses: [], changed_files: 0, changed_lines: 0, correction_budget: 0, action: "created", lenses_required: false, projection: "workspace" }),
+			stdout: readFileSync(join(import.meta.dirname, "..", "contracts", "review-integration", "v2", "fixtures", "status.fixture.json"), "utf8"),
 		};
 	};
 
-	await createNativeReviewCli(adapter, () => resolveGentleAiBinary(packageRoot, process.platform)).start({ cwd: packageRoot });
-	assert.deepEqual(calls, [binaryPath, binaryPath]);
+	await assert.rejects(
+		() => createNativeReviewCli(adapter, () => resolveGentleAiBinary(packageRoot, process.platform)).targetStatus!({ cwd: packageRoot, lineageId: "review-status-fixture" }),
+		/schema incompatible/,
+	);
+	assert.deepEqual(calls, [binaryPath]);
 	assert.ok(calls.every((file) => file !== "gentle-ai"));
-	assert.throws(() => new NativeReviewCliV213(adapter, "gentle-ai"), /absolute package-local executable/);
-	assert.throws(() => new NativeReviewCliV213(adapter, "./gentle-ai"), /absolute package-local executable/);
+	assert.throws(() => new NativeReviewCliV216(adapter, "gentle-ai"), /absolute package-local executable/);
+	assert.throws(() => new NativeReviewCliV216(adapter, "./gentle-ai"), /absolute package-local executable/);
 });

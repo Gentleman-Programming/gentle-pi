@@ -4,9 +4,9 @@
 
 Bring Gentle Pi's durable review transaction storage into truthful architectural parity with the bounded-review graph model represented by Gentleman-Programming/gentle-ai PR #1093.
 
-The change will replace mutable snapshot history as the authority with an immutable, predecessor-linked, content-addressed event graph. It will establish an exact Git common-directory authority boundary, crash-safe single-writer mutation, validated portable bundle export/import, durable graph-v1 resume semantics, explicit non-authoritative mirrors, and enforceable lifecycle and gate invariants.
+The change will replace mutable snapshot history as the authority with an immutable, predecessor-linked, content-addressed event graph. It will establish an exact Git common-directory authority boundary, crash-safe single-writer mutation, validated portable bundle export/import, durable graph-v1 resume semantics, explicit non-authoritative mirrors, and enforceable review-evidence invariants.
 
-Legacy review authority will not be translated or preserved as authority. When legacy state is detected, review operations fail closed until an operator explicitly confirms a logical reset. That reset durably retires legacy authority with a marker, creates a fresh graph-v1 store epoch/incarnation, leaves legacy bytes untouched as inert audit evidence, rejects legacy and prior-incarnation receipts and bundles, and requires a completely fresh review before any gate can pass.
+Legacy review authority will not be translated or preserved as authority. When legacy state is detected, review operations fail closed until an operator explicitly confirms a logical reset. That reset durably retires legacy authority with a marker, creates a fresh graph-v1 store epoch/incarnation, leaves legacy bytes untouched as inert audit evidence, rejects legacy and prior-incarnation receipts and bundles, and requires a completely fresh review before new review evidence can be current. Ordinary repository delivery remains independent.
 
 This proposal defines product and architectural outcomes only; it does not implement them or promise compatibility with legacy storage layouts, authority, receipts, or native interfaces.
 
@@ -23,10 +23,10 @@ As a result:
 - review history cannot be exported and imported as a fully validated portable closure;
 - local idempotent retry does not provide portable, durable graph-v1 synchronization resume;
 - mirror data has no explicit type or authority restriction;
-- lifecycle and delivery gates cannot yet prove that their decisions came from a complete authoritative graph; and
-- legacy authority has no explicit fail-closed retirement path that prevents old receipts or approvals from being reused after graph-v1 activation.
+- review evidence cannot yet prove that it came from a complete authoritative graph; and
+- legacy authority has no explicit fail-closed retirement path that prevents old review evidence from being reused after graph-v1 activation.
 
-This gap matters because review approval, escalation, and delivery gates are authority-bearing operations. Their history must survive process failure, worktree changes, and controlled transfer without silently changing the reviewed lineage or granting authority to incomplete, cached, or retired data.
+This gap matters because review approval, escalation, and review evidence are authority-bearing review operations. Their history must survive process failure, worktree changes, and controlled transfer without silently changing the reviewed lineage or granting review authority to incomplete, cached, or retired data. Commit, push, PR, and release remain ordinary repository delivery.
 
 ## Product outcome
 
@@ -36,7 +36,7 @@ After this change, a caller using graph-v1 review transactions can:
 2. reopen or resume the same graph-v1 lineage after interruption without rerunning completed review actors, resetting bounded budgets, or changing frozen claims;
 3. use linked worktrees while sharing exactly one authoritative review graph and lock domain in the repository's Git common directory;
 4. export a portable bundle and import it elsewhere only after the complete required object closure and all invariants have been validated;
-5. use mirrors for verified caching or transport without allowing mirror state to authorize transitions, receipts, fixes, gates, or delivery; and
+5. use mirrors for verified caching or transport without allowing mirror state to authorize transitions, receipts, fixes, review evidence, or ordinary repository delivery; and
 6. receive clear diagnostics when legacy state blocks operation, explicitly retire that authority through a target-bound logical reset, retain the legacy bytes as inert audit evidence, and then begin a completely fresh review in a new epoch/incarnation with no inherited authority.
 
 ## Scope
@@ -55,7 +55,7 @@ The first slice includes:
 - deterministic state reduction and state-hash verification; and
 - a bounded, authoritative head/index publication mechanism that never rewrites event objects.
 
-The existing bounded-review policy—frozen ledger rules, receipts, request identity, bounded actor/refuter/validator counts, terminal states, and gate bindings—remains the behavioral source for new graph-v1 reviews. No legacy authority or consumed budget is carried into graph-v1.
+The existing bounded-review policy—frozen ledger rules, receipts, request identity, bounded actor/refuter/validator counts, terminal states, and content bindings—remains the behavioral source for new graph-v1 reviews. No legacy authority or consumed budget is carried into graph-v1.
 
 ### 2. Exact Git common-directory boundary
 
@@ -75,7 +75,7 @@ Before graph-v1 activation, use bounded detection at the exact Git common-direct
 
 When legacy authority is detected:
 
-- fail closed before graph-v1 initialization or gate evaluation;
+- fail closed before graph-v1 initialization or review-evidence evaluation;
 - report what legacy authority was found, why it cannot be trusted by graph-v1, which authority-bearing artifacts will be retired, and the exact explicit reset action required;
 - never run the reset implicitly, during startup, as a side effect of another command, or from ambiguous confirmation;
 - require a deliberate logical reset request with clear confirmation tied to the exact repository/common-directory target;
@@ -85,8 +85,8 @@ When legacy authority is detected:
 - leave every legacy file and directory untouched in place as inert, inspection-only audit evidence, with no recursive deletion, quarantine, enumeration, traversal, or other legacy filesystem mutation;
 - ensure authority-bearing graph-v1 operations never consult retired bytes and that later retired-byte drift cannot select, block, invalidate, or advance current authority;
 - record enough non-authoritative reset diagnostics to explain the authority transition without preserving reusable approvals, receipts, ledgers, bundles, checkpoints, or counters;
-- reject all legacy and prior-incarnation receipts, approvals, escalations, ledgers, findings, frozen hashes, lifecycle state, request journals, review/refuter/validator/fix counters, bundles, checkpoints, roots, events, and gate evidence; and
-- require a completely fresh graph-v1 review from genesis in the current epoch/incarnation before any lifecycle or delivery gate can pass.
+- reject all legacy and prior-incarnation receipts, approvals, escalations, ledgers, findings, frozen hashes, lifecycle state, request journals, review/refuter/validator/fix counters, bundles, checkpoints, roots, events, and review evidence; and
+- require a completely fresh graph-v1 review from genesis in the current epoch/incarnation before current review evidence can be recorded; that evidence does not decide ordinary repository delivery.
 
 A reset never derives graph events from legacy revisions, never preserves lineage continuity, never credits prior review work, never restores authority from retired data, and never mutates legacy files or directories.
 
@@ -112,7 +112,7 @@ The following remain stable across graph-v1 resume:
 - actor selection and invocation counts;
 - refuter, validator, and fix-round consumption;
 - approved or escalated terminal outcome;
-- graph-v1 receipts and exact typed gate targets; and
+- graph-v1 receipts and exact typed review-evidence targets; and
 - import/export validation progress where safely reusable.
 
 A checkpoint may skip only work whose inputs and validated content identities still match. Ambiguous, conflicting, or tampered progress fails closed; it cannot silently reset budgets or create a replacement lineage. Resume applies only to graph-v1 state created after reset or in a repository with no legacy authority.
@@ -124,14 +124,14 @@ Define mirrors as a separate capability and data boundary. A mirror may cache, r
 A mirror cannot:
 
 - advance an authoritative head;
-- authorize lifecycle transitions, fixes, approvals, escalations, receipts, gates, delivery, or publication;
+- authorize lifecycle transitions, fixes, approvals, escalations, receipts, or review evidence, or influence ordinary repository delivery or publication;
 - satisfy completeness solely from an unverified cache claim;
 - overwrite or conflict with an authoritative object; or
 - preserve, restore, or reactivate retired legacy authority.
 
 Promotion from mirror data requires the same authoritative graph-v1 import validation and locking path as any other bundle. Types and call paths must make authority explicit rather than relying on naming or documentation alone.
 
-### 8. Lifecycle and gate invariants
+### 8. Lifecycle and review-evidence invariants
 
 Encode and enforce at least these invariants:
 
@@ -147,11 +147,11 @@ Encode and enforce at least these invariants:
 - imported or resumed terminal graph-v1 state cannot reopen or mutate;
 - mirrors never establish authority;
 - pre-activation legacy detection blocks every authority-bearing graph-v1 operation until explicit logical reset completes;
-- logical reset durably retires prior authority under a fresh epoch/incarnation, leaves legacy bytes untouched, and cannot itself create an approval, receipt, or passing gate;
-- legacy and prior-incarnation receipts, bundles, checkpoints, roots, and events are denied as authority;
-- no gate passes until a fresh post-reset graph-v1 review in the current incarnation produces a valid approved receipt for the exact typed target;
-- lifecycle gates validate an approved authoritative graph-v1 receipt against the exact typed target with zero review actors; and
-- commit, push, PR, release, and publication remain outside review transaction execution.
+- logical reset durably retires prior authority under a fresh epoch/incarnation, leaves legacy bytes untouched, and cannot itself create an approval, receipt, or current review evidence;
+- legacy and prior-incarnation receipts, bundles, checkpoints, roots, and events are denied as review authority;
+- no post-reset review evidence is current until a fresh graph-v1 review in the current incarnation produces a valid approved receipt for the exact typed target;
+- review evidence is content-bound and recorded with zero additional review actors; and
+- commit, push, PR, release, and publication remain outside review transaction execution and follow ordinary repository policy.
 
 ## Legacy transition contract
 
@@ -163,8 +163,8 @@ The legacy transition is logical authority retirement, not conversion, erasure, 
 4. confirmed reset durably publishes a retirement marker and selects a fresh empty graph-v1 epoch/incarnation under exclusive mutation control;
 5. legacy bytes remain untouched in their original locations and are never recursively deleted, quarantined, enumerated, traversed, or used by authority-bearing operations;
 6. incomplete marker, initialization, or selector publication leaves all authority-bearing operations blocked and recoverable only through explicit forward operator action;
-7. successful reset permanently rejects every legacy or prior-incarnation receipt, bundle, approval, ledger, lineage, journal, checkpoint, root, event, and counter as gate evidence; and
-8. the first passing gate after reset requires an entirely new graph-v1 review and a new receipt bound to the current epoch/incarnation and exact target.
+7. successful reset permanently rejects every legacy or prior-incarnation receipt, bundle, approval, ledger, lineage, journal, checkpoint, root, event, and counter as review evidence; and
+8. a current post-reset review record requires an entirely new graph-v1 review and a new receipt bound to the current epoch/incarnation and exact target; ordinary repository delivery remains independent.
 
 There is no compatibility window, parallel authority, automatic conversion, authority-preserving fallback reader, or downgrade path that restores retired review authority. Retained legacy bytes are inspection-only audit evidence, not a rollback source or alternative authority.
 
@@ -178,7 +178,7 @@ There is no compatibility window, parallel authority, automatic conversion, auth
 - bounded legacy-root detection and inspection-only drift diagnostics with no recursive traversal or mutation;
 - bundle serialization, validation, staging, installation, export, and resume checkpoints;
 - mirror-facing APIs and authority-typed call paths;
-- lifecycle receipts and commit/push/PR/release gate validation;
+- content-bound review evidence and documentation of ordinary repository delivery;
 - rejection of legacy and prior-incarnation receipts, bundles, checkpoints, and other authority-bearing artifacts after confirmed reset;
 - fault-injection, concurrency, linked-worktree, portability, corruption, logical-reset, legacy-byte immutability, and lifecycle invariant tests; and
 - operator/user documentation for storage location, logical-retirement consequences, retained audit evidence, recovery, bundles, and the requirement for fresh review.
@@ -186,11 +186,11 @@ There is no compatibility window, parallel authority, automatic conversion, auth
 ## Out of scope / non-goals
 
 - translating legacy revisions, lineages, approvals, receipts, ledgers, findings, journals, or counters into graph-v1;
-- retaining legacy authority as a read-authoritative fallback, rollback source, parallel store, or gate input;
+- retaining legacy authority as a read-authoritative fallback, rollback source, parallel store, or review-evidence input;
 - silently resetting legacy state or inferring consent from startup, import, resume, or another operation;
-- preserving review credit, approval status, consumed budgets, lineage identity, or gate eligibility across logical reset;
+- preserving review credit, approval status, consumed budgets, lineage identity, or review-evidence eligibility across logical reset;
 - promising compatibility with legacy private storage layouts, direct filesystem consumers, native interfaces, or older writers;
-- changing the intended ordinary graph-v1 review policy, actor counts, refuter policy, validator scope, terminal outcomes, or delivery-gate behavior;
+- changing the intended ordinary graph-v1 review policy, actor counts, refuter policy, validator scope, terminal outcomes, or ordinary repository-delivery behavior;
 - adding extra review passes merely because SDD, reset, export, import, or resume occurred, except that logical reset necessarily requires one entirely fresh review because prior authority is retired;
 - allowing review transactions to perform commit, push, PR creation, release, or publication;
 - replacing independent dangerous-command safety;
@@ -208,18 +208,18 @@ There is no compatibility window, parallel authority, automatic conversion, auth
 | --- | --- | --- |
 | Operator resets the wrong repository or misunderstands the authority-retirement impact | Valid review authority and review credit become permanently unusable, although legacy bytes remain | Bind confirmation to the canonical repository/common-directory identity; identify retired artifact classes and retained audit evidence; require an explicit target-bound logical-reset action |
 | Reset is interrupted between marker publication and fresh-incarnation activation | The repository has no usable review authority | Keep all authority-bearing operations blocked, emit precise recovery diagnostics, and make explicit forward completion idempotent without restoring retired authority |
-| A legacy or prior-incarnation receipt or bundle remains accepted after reset | Delivery could be authorized by retired authority | Bind receipts and bundles to the exact epoch/incarnation, reject retired artifacts at every authority entry point, and require a fresh approved graph-v1 receipt for the exact target |
+| A legacy or prior-incarnation receipt or bundle remains accepted after reset | Obsolete data could be confused with current review evidence | Bind receipts and bundles to the exact epoch/incarnation, reject retired artifacts at every authority entry point, and require a fresh approved graph-v1 receipt for the exact target |
 | Pre-activation legacy detection misses a known root in the shared worktree store | Old and new authority could coexist or be selected inconsistently | Use one versioned, bounded fixed-root probe at the canonical Git common-directory boundary before activation; after retirement, gate every entry point on the marker, selector, and current incarnation rather than retired paths |
 | Lock recovery permits competing mutation | Authoritative graph-v1 state or reset state could be corrupted | Use OS-backed exclusive mutation, conservative recovery, atomic publication, and fail closed on ambiguous ownership |
 | Import publishes before complete validation | Corrupt or incomplete history becomes authoritative | Stage and validate closure and lifecycle fully, then install immutable objects and atomically publish roots under lock |
 | Resume replays actor work or resets counters | Review cost and bounded guarantees are violated | Persist monotonic graph-v1 consumption and stable identities; reuse checkpoints only on exact input identity match |
-| Mirror APIs leak authority | Cached or stale data could approve delivery | Separate authority types/capabilities and require authoritative import for promotion |
+| Mirror APIs leak authority | Cached or stale data could be confused with current review evidence | Separate authority types/capabilities and require authoritative import for promotion |
 | Logical retirement increases operational burden | Teams must rerun review and cannot reuse prior authority, even though audit bytes remain available | Make consequences explicit, keep non-authoritative reset diagnostics, document the fresh-review requirement, and reject any shortcut that restores retired authority |
 | A reset or graph-v1 operation mutates or recursively traverses legacy paths | Audit evidence may be damaged, leaked, or turned into an availability hazard | Give graph-v1 no write-capable legacy path; use bounded root-only detection before activation; prove byte immutability and no recursive traversal with fault-injection tests |
 | An obsolete writer changes retired bytes after reset | Audit evidence drifts or operators suspect current authority changed | Keep retired paths outside every authority-bearing code path; allow only separate informational drift diagnostics that cannot alter current authority |
 | Content-addressed history increases storage and complexity | More implementation and operational burden | Keep immutable object format minimal; defer garbage collection and network synchronization |
 | Cross-platform filesystem semantics differ | Crash safety may be overstated on some platforms | Specify supported guarantees by platform/filesystem and fail closed where required primitives are unavailable |
-| Scope exceeds a reviewable single PR | Reviewer fatigue and hidden integration defects | Plan reviewable slices before apply; keep each slice in a valid fail-closed state and do not activate graph-v1 gates until the complete invariant set is present |
+| Scope exceeds a reviewable single PR | Reviewer fatigue and hidden integration defects | Plan reviewable slices before apply; keep each slice in a valid fail-closed state and do not record graph-v1 review evidence until the complete invariant set is present |
 
 ## Rollback and recovery
 
@@ -227,7 +227,7 @@ Before logical-reset authorization is durably marked, rollback is removal or dis
 
 After logical reset begins, rollback cannot restore retired review authority. A reset failure must leave authority-bearing operations blocked, preserve clear diagnostics about the incomplete marker/incarnation transition, and support explicit forward recovery to the same fresh empty graph-v1 incarnation. Legacy paths remain untouched throughout recovery. Backups and retained legacy bytes may support external inspection or disaster analysis, but the product must not automatically ingest them, translate them into graph-v1, or treat them as authority.
 
-After graph-v1 activation, software rollback is supported only to a version that understands graph-v1 selectors, retirement markers, epoch/incarnation invalidation, and retired-byte isolation. Older authority readers or writers must not be allowed to reactivate retired state or authorize a gate. Recovery favors forward repair of the current graph-v1 incarnation or completion of an interrupted logical reset, never restoration of prior approvals, receipts, bundles, ledgers, or counters.
+After graph-v1 activation, software rollback is supported only to a version that understands graph-v1 selectors, retirement markers, epoch/incarnation invalidation, and retired-byte isolation. Older authority readers or writers must not be allowed to reactivate retired state or present review evidence as current. Recovery favors forward repair of the current graph-v1 incarnation or completion of an interrupted logical reset, never restoration of prior approvals, receipts, bundles, ledgers, or counters.
 
 Bundle import failure leaves graph-v1 authoritative roots unchanged. Crash recovery may clean validated staging state or resume from an identity-bound graph-v1 checkpoint. It must never delete reachable graph-v1 objects or reset graph-v1 lifecycle budgets.
 
@@ -243,25 +243,25 @@ The proposal is successful when the implemented change can demonstrate all of th
 6. Malformed, incomplete, conflicting, cyclic, wrong-lineage, unsupported, or authority-forging bundles are rejected with no authoritative mutation.
 7. Repeating an identical graph-v1 import is idempotent, and an interrupted import/export resumes without repeating validated work unnecessarily.
 8. Restarting or resuming a graph-v1 review transaction does not rerun completed actors, alter frozen claims, reset any budget, add a validator to a no-fix path, or repeat final verification.
-9. Mirror-only data cannot produce an authoritative receipt or pass any commit, push, PR, release, or publication gate.
+9. Mirror-only data cannot produce authoritative review evidence or influence commit, push, PR, release, or publication, which follow ordinary repository policy.
 10. Before activation, bounded legacy-root detection blocks graph-v1 initialization and authority use with clear target-specific diagnostics and no legacy-path mutation; after retirement, authority-bearing operations do not consult retired paths.
 11. Logical reset never runs silently, requires explicit confirmation bound to the exact repository/common-directory target, durably publishes a retirement marker, and selects a fresh store epoch/incarnation without translating legacy state.
 12. A successful reset leaves legacy bytes untouched as inert audit evidence, initializes an empty graph-v1 store in a separate incarnation namespace, and makes every legacy or prior-incarnation receipt, bundle, approval, escalation, ledger, finding, frozen hash, lineage, journal, checkpoint, root, event, and counter unusable as authority.
 13. Reset, initialization, recovery, import, and normal graph-v1 operation never recursively delete, quarantine, enumerate, traverse, rewrite, or otherwise mutate legacy filesystem trees; retired-byte drift cannot affect current authority.
-14. An interrupted reset leaves all gates blocked and can be completed explicitly forward without restoring retired authority or creating partial graph-v1 authority.
-15. No lifecycle or delivery gate passes after reset until a completely fresh graph-v1 review in the current epoch/incarnation produces a new approved receipt bound to the exact typed target.
+14. An interrupted reset leaves all review-evidence operations blocked and can be completed explicitly forward without restoring retired authority or creating partial graph-v1 authority.
+15. No post-reset review evidence is current until a completely fresh graph-v1 review in the current epoch/incarnation produces a new approved receipt bound to the exact typed target; commit, push, PR, release, and publication follow ordinary repository policy.
 16. Fault-injection and concurrency tests cover locking, event/object publication, head/index and selector publication, bounded legacy detection, logical-reset marker/incarnation phases, legacy-byte immutability, bundle import, resume, retired receipt/bundle rejection, and terminal lifecycle behavior.
 
 ## Delivery and review workload forecast
 
-The logical-retirement decision removes conversion, coexistence, authority-preservation, legacy-erasure, quarantine, and compatibility-window work. It avoids recursive legacy filesystem mutation, but the remaining change still spans core event persistence, schemas, Git common-directory resolution, mutation locking, crash-safe retirement markers and epoch/incarnation selection, bundles, graph-v1 resume, mirror authority typing, gate enforcement, and extensive fault-injection tests.
+The logical-retirement decision removes conversion, coexistence, authority-preservation, legacy-erasure, quarantine, and compatibility-window work. It avoids recursive legacy filesystem mutation, but the remaining change still spans core event persistence, schemas, Git common-directory resolution, mutation locking, crash-safe retirement markers and epoch/incarnation selection, bundles, graph-v1 resume, mirror authority typing, review-evidence enforcement, and extensive fault-injection tests.
 
 - **Estimated changed lines:** likely more than 1,000, including tests.
 - **400-line budget risk:** High.
 - **Chained PRs recommended:** Yes.
-- **Decision needed before apply:** Yes—define reviewable implementation slices and an activation boundary that keeps all gates fail-closed until graph-v1, reset invalidation, and receipt validation are complete.
+- **Decision needed before apply:** Yes—define reviewable implementation slices and an activation boundary that keeps review-evidence recording fail-closed until graph-v1, reset invalidation, and receipt validation are complete.
 
-A likely sequence is: (1) graph-v1 object model/common-directory store and bounded legacy detection; (2) explicit logical reset with durable retirement marker, fresh epoch/incarnation, legacy-byte isolation, and gate/receipt/bundle invalidation; (3) graph-v1 transaction reduction/resume and lifecycle integration; and (4) bundles and mirrors. Each slice must preserve a deterministic blocked or valid state; no intermediate slice may accept retired authority or pass a gate from incomplete graph-v1 state.
+A likely sequence is: (1) graph-v1 object model/common-directory store and bounded legacy detection; (2) explicit logical reset with durable retirement marker, fresh epoch/incarnation, legacy-byte isolation, and review-evidence/receipt/bundle invalidation; (3) graph-v1 transaction reduction/resume and lifecycle integration; and (4) bundles and mirrors. Each slice must preserve a deterministic review state; no intermediate slice may accept retired authority or present incomplete graph-v1 data as current review evidence. Delivery remains ordinary repository policy throughout.
 
 ## Proposal question round
 

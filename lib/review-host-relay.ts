@@ -1,16 +1,16 @@
 // The thin Pi host relay (gentle-pi#311 P4; provider contract gentle-ai#3249).
 //
 // gentle-ai owns prompt materialization, role and schema selection, byte
-// budgets, parsing, admission, immutable capture, retry and correction
-// accounting, receipts, and delivery gates. This host boundary is
+// budgets, parsing, admission, immutable capture, retry, correction
+// accounting, and receipt state. This host boundary is
 // intentionally narrow:
 //
 //   1. Run the exact provider-issued capture binding with `--agent pi
 //      --materialize` and take stdout as opaque prompt BYTES, verbatim.
-//   2. Launch a brand-new locked-down print-mode `pi` subprocess in a fresh
-//      empty scratch directory, pipe the prompt through stdin, and take
-//      stdout as raw final bytes. Model/provider/profile selection stays
-//      user-owned: no --model, no --provider, environment untouched.
+//   2. Pass those prompt bytes to the pure opaque Pi adapter, which owns its
+//      locked-down print-mode subprocess and fresh empty scratch directory;
+//      take its stdout as raw final bytes. Model/provider/profile selection
+//      stays user-owned: no --model, no --provider, environment untouched.
 //   3. Submit those bytes untouched through the provider-owned `submission`
 //      form carried by the collect input: execute its exact operation and
 //      argument tokens with only the tempfile path substituted into the
@@ -30,25 +30,18 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { resolveGentleAiBinary } from "./gentle-ai-binary.ts";
+import {
+	OPAQUE_PI_REVIEWER_TRANSPORT_FAILURE,
+	OpaquePiReviewerTransportError,
+	runOpaquePiReviewer,
+	type OpaquePiReviewerResult,
+} from "./opaque-pi-reviewer-adapter.ts";
 import { REVIEW_PROVIDER_ROLE_CAPTURE_OPERATION, REVIEW_PROVIDER_ROLE_CAPTURE_OPERATIONS, type ReviewCaptureSubmissionV1, type ReviewCollectInputV3 } from "./review-integration-v2.ts";
 import { GENTLE_PI_REVIEW_RELAY_CONTRACT, GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV } from "./review-relay-contract.ts";
 
-// The complete pinned lockdown argv for the reviewer `pi` subprocess: print
-// mode, text output, and every discovery surface disabled. Nothing may be
-// added or removed here without a new relay contract — in particular no
-// --model/--provider/--profile, which remain user-owned.
-export const REVIEW_HOST_RELAY_PI_ARGV = Object.freeze([
-	"--print",
-	"--mode", "text",
-	"--no-session",
-	"--no-tools",
-	"--no-extensions",
-	"--no-skills",
-	"--no-prompt-templates",
-	"--no-themes",
-	"--no-context-files",
-	"--no-approve",
-] as const);
+// Compatibility export for existing relay consumers. The pure adapter owns the
+// fixed Pi process boundary and its locked-down argv.
+export { OPAQUE_PI_REVIEWER_ARGV as REVIEW_HOST_RELAY_PI_ARGV } from "./opaque-pi-reviewer-adapter.ts";
 
 export const REVIEW_HOST_RELAY_UNAVAILABLE_MESSAGE =
 	"provider relay requires a gentle-ai build with the pi host relay surface";
@@ -250,6 +243,8 @@ export function resolveReviewHostRelaySubmission(submission: ReviewCaptureSubmis
 
 export interface ReviewHostRelayRequest {
 	readonly captureArgumentTokens: readonly string[];
+	/** Canonical target worktree for coordinator-only native materialize/submit calls. */
+	readonly targetCwd?: string;
 	/** The provider-owned completing form; absent means contract mismatch. */
 	readonly submission?: ReviewCaptureSubmissionV1;
 	/** Absolute path; defaults to the verified package-local binary. */
@@ -338,7 +333,7 @@ interface ProcessCapture {
 	elapsedMs: number;
 }
 
-function collectProcess(
+function collectGentleAiProcess(
 	file: string,
 	arguments_: readonly string[],
 	options: { cwd: string; env: NodeJS.ProcessEnv; stdin?: Buffer; timeoutMs: number; signal?: AbortSignal },
@@ -387,6 +382,45 @@ function collectProcess(
 	});
 }
 
+function relayPiTransportError(error: unknown, promptByteLength: number, piTimeoutMs: number): ReviewHostRelayError {
+	if (!(error instanceof OpaquePiReviewerTransportError)) {
+		return new ReviewHostRelayError(
+			REVIEW_HOST_RELAY_FAILURE.PI_LAUNCH_FAILED,
+			"pi",
+			`pi subprocess could not start: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	const details = {
+		exitCode: error.exitCode,
+		stderr: error.stderr.toString("utf8"),
+		timedOut: error.timedOut,
+		...(error.elapsedMs === null ? {} : { elapsedMs: error.elapsedMs }),
+		...(error.timeoutMs === null ? {} : { timeoutMs: error.timeoutMs }),
+	};
+	if (
+		error.kind === OPAQUE_PI_REVIEWER_TRANSPORT_FAILURE.TIMED_OUT
+		&& error.elapsedMs !== null
+		&& error.timeoutMs !== null
+	) {
+		return new ReviewHostRelayError(
+			REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT,
+			"pi",
+			reviewHostRelayPiTimeoutMessage(error.elapsedMs, error.timeoutMs, promptByteLength),
+			{ ...details, timedOut: true, elapsedMs: error.elapsedMs, timeoutMs: error.timeoutMs },
+		);
+	}
+	if (error.kind === OPAQUE_PI_REVIEWER_TRANSPORT_FAILURE.EMPTY_OUTPUT) {
+		return new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_EMPTY_OUTPUT, "pi", "pi subprocess produced no output bytes", details);
+	}
+	if (
+		error.kind === OPAQUE_PI_REVIEWER_TRANSPORT_FAILURE.LAUNCH_FAILED
+		|| error.kind === OPAQUE_PI_REVIEWER_TRANSPORT_FAILURE.SCRATCH_FAILED
+	) {
+		return new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_LAUNCH_FAILED, "pi", `pi subprocess could not start: ${error.message}`, details);
+	}
+	return new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_FAILED, "pi", "pi subprocess failed", details);
+}
+
 function assertTokens(name: string, tokens: readonly string[]): void {
 	if (tokens.length === 0) throw new TypeError(`Pi host relay requires the provider-issued ${name} tokens`);
 	if (tokens.some((token) => typeof token !== "string" || token.length === 0)) {
@@ -396,7 +430,7 @@ function assertTokens(name: string, tokens: readonly string[]): void {
 
 /**
  * Runs one complete host-relay capture for one provider-bound slot:
- * materialize → fresh locked-down pi subprocess → submit. Throws a typed
+ * materialize → opaque Pi adapter → submit. Throws a typed
  * {@link ReviewHostRelayError} on every failure leg and submits nothing after
  * a failure; the caller re-queries negotiated STATUS instead of retrying.
  */
@@ -413,6 +447,7 @@ export async function runReviewHostRelaySlot(request: ReviewHostRelayRequest): P
 	// pi subprocess environment stays exactly as the user configured it.
 	const gentleAiEnvironment = { ...baseEnvironment, [GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV]: GENTLE_PI_REVIEW_RELAY_CONTRACT };
 	const gentleAiTimeoutMs = request.gentleAiTimeoutMs ?? DEFAULT_GENTLE_AI_TIMEOUT_MS;
+	const targetCwd = request.targetCwd ?? process.cwd();
 
 	// (a) Materialize the Go-issued opaque prompt. This invocation is also the
 	// capability detection: an old binary's unknown-flag refusal proves the
@@ -420,8 +455,8 @@ export async function runReviewHostRelaySlot(request: ReviewHostRelayRequest): P
 	// verbatim. No version sniffing.
 	let materialized: ProcessCapture;
 	try {
-		materialized = await collectProcess(gentleAi, ["review", "capture-result", ...request.captureArgumentTokens], {
-			cwd: process.cwd(),
+		materialized = await collectGentleAiProcess(gentleAi, ["review", "capture-result", ...request.captureArgumentTokens], {
+			cwd: targetCwd,
 			env: gentleAiEnvironment,
 			timeoutMs: gentleAiTimeoutMs,
 			...(request.signal === undefined ? {} : { signal: request.signal }),
@@ -452,41 +487,29 @@ export async function runReviewHostRelaySlot(request: ReviewHostRelayRequest): P
 	// timeout (the test seam) still wins over both the override and the scale.
 	const piTimeoutMs = request.piTimeoutMs ?? resolveReviewHostRelayPiTimeoutMs(promptBytes.length, baseEnvironment);
 
-	// (b)/(c) Fresh locked-down pi subprocess in an empty scratch directory.
-	const scratchDirectory = await mkdtemp(join(tmpdir(), "gentle-pi-host-relay-scratch-"));
-	const stagingDirectory = await mkdtemp(join(tmpdir(), "gentle-pi-host-relay-result-"));
+	// (b) The pure adapter owns the fresh isolated Pi process. Its input and
+	// output are opaque bytes; this coordinator only maps transport failures to
+	// the established relay boundary.
+	let piResult: OpaquePiReviewerResult;
 	try {
-		await chmod(scratchDirectory, 0o700);
-		await chmod(stagingDirectory, 0o700);
-		let piRun: ProcessCapture;
-		try {
-			piRun = await collectProcess(request.piExecutable ?? "pi", REVIEW_HOST_RELAY_PI_ARGV, {
-				cwd: scratchDirectory,
-				env: baseEnvironment,
-				stdin: promptBytes,
-				timeoutMs: piTimeoutMs,
-				...(request.signal === undefined ? {} : { signal: request.signal }),
-			});
-		} catch (error) {
-			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_LAUNCH_FAILED, "pi", `pi subprocess could not start: ${error instanceof Error ? error.message : String(error)}`);
-		}
-		const piTiming = { elapsedMs: piRun.elapsedMs, timeoutMs: piTimeoutMs };
-		// A reviewer that ran out of time is reported as exactly that, with both
-		// measurements, and never as an unexplained crash.
-		if (piRun.timedOut) {
-			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT, "pi", reviewHostRelayPiTimeoutMessage(piRun.elapsedMs, piTimeoutMs, promptBytes.length), { exitCode: piRun.exitCode, stderr: piRun.stderr.toString("utf8"), timedOut: true, ...piTiming });
-		}
-		if (piRun.exitCode !== 0) {
-			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_FAILED, "pi", "pi subprocess failed", { exitCode: piRun.exitCode, stderr: piRun.stderr.toString("utf8"), timedOut: false, ...piTiming });
-		}
-		const resultBytes = piRun.stdout;
-		if (resultBytes.length === 0) {
-			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_EMPTY_OUTPUT, "pi", "pi subprocess produced no output bytes", { exitCode: 0, stderr: piRun.stderr.toString("utf8"), ...piTiming });
-		}
+		piResult = await runOpaquePiReviewer(promptBytes, {
+			...(request.piExecutable === undefined ? {} : { piExecutable: request.piExecutable }),
+			environment: baseEnvironment,
+			timeoutMs: piTimeoutMs,
+			...(request.signal === undefined ? {} : { signal: request.signal }),
+		});
+	} catch (error) {
+		throw relayPiTransportError(error, promptBytes.length, piTimeoutMs);
+	}
+	const resultBytes = piResult.stdout;
 
-		// (d) Submit the raw final bytes untouched through the provider-owned
-		// completing form: its exact operation and argument tokens, with only
-		// the artifact path substituted into the declared {{value}} slot.
+	// (c) Submit the raw final bytes untouched through the provider-owned
+	// completing form: its exact operation and argument tokens, with only the
+	// artifact path substituted into the declared {{value}} slot.
+	const stagingDirectory = await mkdtemp(join(tmpdir(), "gentle-pi-host-relay-result-"));
+	let primaryFailure = false;
+	try {
+		await chmod(stagingDirectory, 0o700);
 		const resultFile = join(stagingDirectory, "result.raw");
 		await writeFile(resultFile, resultBytes, { mode: 0o600 });
 		await chmod(resultFile, 0o600);
@@ -495,8 +518,8 @@ export async function runReviewHostRelaySlot(request: ReviewHostRelayRequest): P
 		);
 		let submission: ProcessCapture;
 		try {
-			submission = await collectProcess(gentleAi, ["review", submissionBinding.operationToken, ...submitTokens], {
-				cwd: process.cwd(),
+			submission = await collectGentleAiProcess(gentleAi, ["review", submissionBinding.operationToken, ...submitTokens], {
+				cwd: targetCwd,
 				env: gentleAiEnvironment,
 				timeoutMs: gentleAiTimeoutMs,
 				...(request.signal === undefined ? {} : { signal: request.signal }),
@@ -509,11 +532,23 @@ export async function runReviewHostRelaySlot(request: ReviewHostRelayRequest): P
 		}
 		return {
 			promptByteLength: promptBytes.length,
-			resultByteLength: resultBytes.length,
+			resultByteLength: piResult.stdoutByteLength,
 			submission: submission.stdout.toString("utf8"),
 		};
+	} catch (error) {
+		primaryFailure = true;
+		throw error;
 	} finally {
-		await rm(scratchDirectory, { recursive: true, force: true }).catch(() => undefined);
-		await rm(stagingDirectory, { recursive: true, force: true }).catch(() => undefined);
+		try {
+			await rm(stagingDirectory, { recursive: true, force: true });
+		} catch (error) {
+			if (!primaryFailure) {
+				throw new ReviewHostRelayError(
+					REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED,
+					"submit",
+					`Pi host relay result staging cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
 	}
 }

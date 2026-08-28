@@ -58,7 +58,7 @@ For persistence operations owned by the package, the system MUST support Windows
 
 ### Requirement: Package verification provides release evidence
 
-The package MUST verify its runtime contents and record focused platform, installer, review, lifecycle, and runtime-harness evidence before release. Full `pnpm test` and package-content verification MUST pass on the supported Node.js 24 environment; a size exception MUST NOT waive correctness or lifecycle gates.
+The package MUST verify its runtime contents and record focused, full-suite, runtime-harness, and package-content verification evidence before release. Full `pnpm test` and package-content verification MUST pass on the supported Node.js 24 environment. RDD review is independent evidence: its absence or presence never governs ordinary delivery.
 
 #### Scenario: Release verification succeeds
 
@@ -68,6 +68,6 @@ The package MUST verify its runtime contents and record focused platform, instal
 
 #### Scenario: Verification fails
 
-- GIVEN any required test, package-content check, runtime compatibility check, bounded review, or lifecycle receipt validation fails
-- WHEN delivery is evaluated
-- THEN delivery is blocked and no size exception or CodeRabbit absence can override the failure
+- GIVEN any required test, package-content check, or runtime compatibility check fails
+- WHEN package verification is evaluated
+- THEN the failed package verification is recorded, while ordinary delivery remains governed by repository policy independently of RDD review evidence

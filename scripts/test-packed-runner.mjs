@@ -50,11 +50,6 @@ try {
 		stdio: "inherit",
 	});
 	const packageRoot = join(installDirectory, "node_modules", "gentle-pi");
-	const runner = join(packageRoot, "scripts", "run-git-commit-transaction.mjs");
-	const result = JSON.parse(execFileSync(process.execPath, [runner, "self-test"], { cwd: installDirectory, encoding: "utf8" }));
-	if (result.schema !== "gentle-pi.git-commit-transaction-runner-self-test/v1" || !Array.isArray(result.states) || !result.states.includes("prepared") || !result.states.includes("committed")) {
-		throw new Error("installed transaction runner self-test returned an incompatible result");
-	}
 	const versions = readdirSync(join(packageRoot, ".gentle-ai"), { withFileTypes: true }).filter((entry) => entry.isDirectory() && /^v\d+\.\d+\.\d+$/.test(entry.name));
 	if (versions.length !== 1) throw new Error("packed install did not contain exactly one package-local Gentle AI version");
 	const executable = join(packageRoot, ".gentle-ai", versions[0].name, process.platform === "win32" ? "gentle-ai.exe" : "gentle-ai");
@@ -74,7 +69,7 @@ try {
 	const decoded = decodeReviewCapabilitiesV2(capabilities, executableDigest);
 	if (decoded.contract !== "gentle-ai.review-integration/v2" || decoded.packageVersion !== versions[0].name.slice(1)) throw new Error("package-local Gentle AI returned incompatible capabilities");
 	const packageManifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
-	process.stdout.write(`packed runner E2E passed (gentle-pi ${packageManifest.version ?? "unknown"}; Gentle AI ${capabilities.package?.version ?? "unknown"}; ${result.states.length} states)\n`);
+	process.stdout.write(`packed package E2E passed (gentle-pi ${packageManifest.version ?? "unknown"}; Gentle AI ${decoded.packageVersion ?? "unknown"})\n`);
 } finally {
 	rmSync(temporary, { recursive: true, force: true });
 }

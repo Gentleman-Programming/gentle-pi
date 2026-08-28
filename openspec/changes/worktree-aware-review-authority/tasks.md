@@ -88,7 +88,7 @@ The expanded same-PR scope is explicitly approved. No artificial line cap or new
 - [x] **GREEN:** Require `sdd-tasks` to mark every generated checkbox exactly once, keep parent lifecycle prose separate, and never assign bounded review to implementation work. <!-- sdd-owner: implementation -->
 - [x] **GREEN:** Require `sdd-apply` to select/check/report only implementation rows, preserve parent rows, stop on artifact errors, and return `parent-lifecycle` after implementation completion. <!-- sdd-owner: implementation -->
 - [x] **GREEN:** Document the shared marker grammar, additive status shape, route table, and marker-independent review obligation in status/support contracts. <!-- sdd-owner: implementation -->
-- [x] **TRIANGULATE:** Assert apply prohibition on review/refutation/correction/validation actors, receipt creation/approval, and all delivery-gate validation. <!-- sdd-owner: implementation -->
+- [x] **TRIANGULATE:** Assert apply prohibition on review/refutation/correction/validation actors and receipt creation/approval; ordinary delivery remains repository policy. <!-- sdd-owner: implementation -->
 
 ## 7. Update full-chain routing and verification contracts
 
@@ -96,7 +96,7 @@ The expanded same-PR scope is explicitly approved. No artificial line cap or new
 
 - [x] **RED:** Add chain and artifact-language regressions proving completed implementation yields to the parent boundary and no review actor is added to the chain. <!-- sdd-owner: implementation -->
 - [x] **GREEN:** Amend the full chain so every completed apply yields to parent lifecycle unless authoritative approved receipt evidence already exists; resume independent verification only after approval. <!-- sdd-owner: implementation -->
-- [x] **GREEN:** Keep sync/archive behind verification readiness and preserve parent ownership of native lifecycle gates. <!-- sdd-owner: implementation -->
+- [x] **GREEN:** Keep sync/archive behind verification readiness and keep ordinary delivery outside Pi review authority. <!-- sdd-owner: implementation -->
 - [x] **TRIANGULATE:** Cover no parent markers, checked/unchecked parent markers, missing/approved/invalidated/scope-changed/escalated/ambiguous receipt authority, and archive blockers. <!-- sdd-owner: implementation -->
 
 ## 8. Cross-cutting implementation verification
@@ -107,18 +107,18 @@ The expanded same-PR scope is explicitly approved. No artificial line cap or new
 - [x] **REFACTOR:** Remove test-only switches, worktree identity, schema changes, duplicated comparison logic, and unrelated edits; confirm pure code/asset rollback. <!-- sdd-owner: implementation -->
 - [x] **TRIANGULATE:** Record the acceptance matrix, exact implementation checkbox updates, untouched parent lifecycle prose, receipt-preservation evidence, and unresolved warnings in apply/verification artifacts. <!-- sdd-owner: implementation -->
 
-## Parent post-apply lifecycle
+## Parent post-apply review evidence
 
-This section is mandatory parent/orchestrator procedure, not apply work and not part of implementation progress. It intentionally contains no implementation checkbox. After all implementation-owned rows and verification evidence are complete, the parent must yield at this boundary. The parent/orchestrator must start or reuse native bounded review using authority-first rules: reuse only an authoritatively approved receipt valid for the live candidate; otherwise explicitly run `review/start`; fail closed for scope-changed, invalidated, escalated, ambiguous, invalid, or missing authority. The parent must not infer approval from task text or checkbox state.
+This section is mandatory parent/orchestrator procedure, not apply work and not part of implementation progress. It intentionally contains no implementation checkbox. After all implementation-owned rows and verification evidence are complete, the parent must yield at this boundary. The parent/orchestrator may start or reuse native bounded review using authority-first review rules: reuse only an authoritatively approved receipt valid for the live candidate; otherwise explicitly run `review/start`; preserve review evidence for scope-changed, invalidated, escalated, ambiguous, invalid, or missing authority. The parent must not infer review approval from task text or checkbox state.
 
-After review approval, the parent validates the same content-bound receipt at each applicable lifecycle gate (`pre-commit`, `pre-push`, `pre-pr`, release, or other native gate). Independent SDD verification may proceed only after authoritative receipt approval; sync/archive additionally require verification readiness. The parent marks any explicit parent lifecycle rows only when it actually performs those actions. `sdd-apply` must never perform this section.
+After review approval, the receipt remains review-only evidence. Independent SDD verification may proceed according to its own requirements; sync/archive additionally require verification readiness. Ordinary commit, push, PR, and release always follow repository policy and never depend on Pi review authority. The parent marks any explicit parent review rows only when it actually performs those actions. `sdd-apply` must never perform this section.
 
 ## Verification Matrix
 
 | Requirement | Evidence target |
 |---|---|
 | Complete candidate binding and provenance | Per-dimension facade/controller regressions and authority tuple tests |
-| Receipt preservation | Byte/hash and gate-validity checks before/after another candidate START |
+| Receipt preservation | Byte/hash and review-evidence checks before/after another candidate START |
 | Same-lineage idempotency | Exact replay, explicit mismatch, ambiguity, and CAS tests |
 | SDD ownership | Parser/status/apply/asset/chain tests with canonical markers |
 | Parent boundary | Status and chain tests proving unconditional post-apply handoff and no apply review actors |

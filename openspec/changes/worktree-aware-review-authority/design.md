@@ -330,6 +330,8 @@ Tests should use existing repository/worktree fixtures, `CompactReviewStoreV2.lo
 - INSPECT is advisory and read-only. START always re-derives the live snapshot and does not trust prior INSPECT applicability.
 - Sorted matching lineage IDs make ambiguity and retry output deterministic.
 
+> **Historical design record — superseded delivery-authority rollout (scope: the complete `## Rollout and rollback` and `## Verification checklist` sections below, ending immediately before `# Historical amendment: Separate implementation progress from parent lifecycle actions`):** The retained rollout and verification text below describes the former model that made bounded review and receipt validation prerequisites for delivery. It is not active guidance. Review is non-deciding evidence; commit, push, PR, release, and archive delivery follow ordinary repository policy.
+
 ## Rollout and rollback
 
 This is a single-PR controller/facade change with no artificial delivery line cap. Rollout requires strict-TDD evidence from `pnpm test`, followed by the mandatory native bounded implementation review and receipt validation before delivery.
@@ -352,11 +354,13 @@ Rollback is a code revert of the controller routing, comparator, ephemeral captu
 
 ---
 
-# Amendment: Separate implementation progress from parent lifecycle actions
+# Historical amendment: Separate implementation progress from parent lifecycle actions
+
+> **Historical design record — superseded delivery-authority and archive-gate claims:** The original amendment treated RDD receipts and lifecycle gates as delivery authority and as prerequisites for archive routing. That model is obsolete. The active `specs/sdd-orchestration/spec.md` requires bounded review as non-deciding evidence and routes commit, push, PR, release, and archive through ordinary repository policy. The retained detail below documents the prior design without prescribing current delivery or archive behavior.
 
 ## Amendment decision summary
 
-This amendment adds the smallest ownership boundary required by `specs/sdd-orchestration/spec.md`; it does not alter the validated issue #118 review-authority design above.
+This historical amendment adds the smallest ownership boundary required by the prior `specs/sdd-orchestration/spec.md`; it does not alter the validated issue #118 review-authority design above.
 
 - Every newly generated task checkbox ends with exactly one ownership comment: `<!-- sdd-owner: implementation -->` or `<!-- sdd-owner: parent -->`.
 - An unmarked legacy checkbox remains implementation-owned. A line that mentions `sdd-owner` but does not contain exactly one supported terminal marker is malformed, remains unresolved in implementation accounting, and blocks with a visible task-artifact error.
@@ -374,13 +378,13 @@ The marker is a terminal HTML comment on the same line as the Markdown checkbox:
 
 ```markdown
 - [ ] Add parser regression coverage. <!-- sdd-owner: implementation -->
-- [ ] Start or reuse native bounded review. <!-- sdd-owner: parent -->
-- [ ] Validate the same receipt at the pre-commit gate. <!-- sdd-owner: parent -->
+- [ ] Record bounded-review evidence. <!-- sdd-owner: parent -->
+- [ ] Hand delivery to ordinary repository policy. <!-- sdd-owner: parent -->
 ```
 
 Only the two lowercase values above are supported. This is one marker with two values, not a generic taxonomy. The marker carries ownership only; it does not encode phase, gate type, review mode, ordering, actor, or delivery state.
 
-`sdd-tasks` MUST emit exactly one canonical marker on every generated checkbox. Implementation tasks use `implementation`. Bounded-review and lifecycle-gate actions use `parent` and remain explicit checkboxes so they stay visible until the parent performs them. Parent-owned tasks should be grouped under a clearly named parent lifecycle section and ordered according to the existing review/gate workflow; status does not parse their prose to infer semantics.
+`sdd-tasks` MUST emit exactly one canonical marker on every generated checkbox. Implementation tasks use `implementation`. Bounded-review evidence and ordinary repository-delivery handoff actions use `parent` and remain explicit checkboxes so they stay visible until the parent performs them. Parent-owned tasks should be grouped under a clearly named parent section and ordered according to the review-evidence and ordinary-delivery workflow; status does not parse their prose to infer semantics.
 
 ### Deterministic parsing
 
@@ -478,7 +482,7 @@ Before selecting work, `sdd-apply` consumes the status ownership fields and inde
 - stops on `taskArtifactErrors` or a malformed marker;
 - never treats review or gate evidence as apply completion evidence.
 
-Add an explicit prohibition covering bounded-review, refutation, correction, and validation actors; receipt creation/approval; and pre-commit, pre-push, pre-PR, release, or other delivery-gate validation. This prohibition applies even when a parent-owned checkbox is the only unchecked line and even in automatic/full-chain mode.
+Add an explicit prohibition covering bounded-review, refutation, correction, and validation actors; receipt creation/approval; and commit, push, PR, release, or other ordinary repository-delivery actions. This prohibition applies even when a parent-owned checkbox is the only unchecked line and even in automatic/full-chain mode. Review evidence is non-deciding and cannot authorize or block delivery.
 
 ### `assets/agents/sdd-status.md` and `assets/support/sdd-status-contract.md`
 
@@ -486,7 +490,7 @@ Document the exact marker grammar, legacy default, malformed behavior, additive 
 
 ### `assets/chains/sdd-full.chain.md`
 
-A change is required because the current linear chain places `sdd-verify` immediately after `sdd-apply` without naming the parent boundary. Amend the chain contract so every transition out of completed implementation yields control to the parent/orchestrator unless authoritative routing already proves an approved receipt for the live candidate. This yield is mandatory even when no parent marker exists. The apply agent does not execute that step. The parent explicitly starts bounded review when no receipt exists, reuses only a valid approved receipt, and fails closed on scope-changed, invalidated, escalated, ambiguous, or invalid authority. It resumes the chain at independent verification only after receipt approval; sync/archive routing requires verification readiness as well. Future delivery gates remain parent-owned and execute only at their native gates.
+A change is required because the current linear chain places `sdd-verify` immediately after `sdd-apply` without naming the parent boundary. Amend the chain contract so every transition out of completed implementation yields control to the parent/orchestrator unless review evidence already exists for the live candidate. This yield is mandatory even when no parent marker exists. The apply agent does not execute that step. The parent explicitly starts bounded review when evidence is missing, reuses only matching evidence, and records scope-changed, invalidated, escalated, ambiguous, or invalid authority as review outcomes. It resumes the chain at independent verification after review evidence is available; sync/archive routing requires verification readiness as well. Commit, push, PR, and release remain ordinary repository delivery, never receipt- or gate-authorized.
 
 This is a control-boundary clarification, not a new chain actor or review phase. Do not add a review agent section to the chain and do not let chain execution imply a receipt or gate result.
 
@@ -504,14 +508,14 @@ sdd-tasks
        -> malformed marker? fix-task-ownership-marker
        -> implementation complete? mandatory parent-lifecycle boundary
             -> explicit markers, when present, provide visibility only
-            -> missing receipt: parent explicitly starts bounded review
-            -> valid approved receipt: parent reuses it
-            -> scope-changed / invalidated / escalated / ambiguous / invalid: fail closed
-            -> approved receipt: independent sdd-verify may run
+            -> missing review evidence: parent explicitly starts bounded review
+            -> matching review evidence: parent reuses it
+            -> scope-changed / invalidated / escalated / ambiguous / invalid: record the review outcome
+            -> recorded review evidence: independent sdd-verify may run
             -> verified readiness: existing sync/archive flow may continue
-            -> parent validates the same receipt at each applicable delivery gate
+            -> parent hands commit, push, PR, and release to ordinary repository policy
             -> parent marks only the actions it actually performed
-       -> no downstream route bypasses receipt approval or independent verification
+       -> no downstream route treats a receipt as delivery approval or bypasses independent verification
 ```
 
 For Engram/none modes, the status remains non-authoritative as before. The apply/status agent prompt uses the same marker grammar against the retrieved task artifact; it must not reinterpret parent tasks as implementation or silently tolerate malformed markers. The parent/orchestrator therefore applies the same marker-independent fallback itself: completed implementation yields to bounded-review authority resolution before verification, even when no explicit parent marker exists.

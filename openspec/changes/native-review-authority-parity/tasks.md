@@ -25,7 +25,7 @@ The single-PR size exception is accepted by delivery constraints. Work-unit comm
 - [x] **RED:** Add `tests/native-review-cli.test.ts` coverage for injected `ExecFileAdapter`, explicit `cwd`, argument-array invocation, `shell: false` production behavior, timeout/max-buffer handling, and no shell interpolation. <!-- sdd-owner: implementation -->
 - [x] **RED:** Add version/capability tests for exact `gentle-ai 2.1.0\n`, rejected dev/older/newer/suffixed/stderr output, immutable capability caching, and disabled general status/inventory. <!-- sdd-owner: implementation -->
 - [x] **GREEN:** Create `lib/native-review-cli.ts` with const-derived operation/error types, flat executor interfaces, `createNodeExecFileAdapter`, `NATIVE_CLI_CONTRACTS`, `NativeReviewCliError`, and `createNativeReviewCli`. <!-- sdd-owner: implementation -->
-- [x] **GREEN:** Implement `NativeReviewCliV210` request types and exact argv builders for `review start`, `review finalize`, `review validate`, `review bind-sdd`, and exact bound `sdd-status`; preserve opaque native paths and identity fields. <!-- sdd-owner: implementation -->
+- [x] **GREEN:** Implement `NativeReviewCliV210` request types and exact argv builders for `review start`, `review finalize`, `review bind-sdd`, and exact bound `sdd-status`; preserve opaque native paths and identity fields, with no Pi delivery validation route. <!-- sdd-owner: implementation -->
 - [x] **TRIANGULATE:** Verify every adapter call uses one operation, explicit working directory, typed argv values, and no native authority-file read/write or status-via-mutation probe. <!-- sdd-owner: implementation -->
 - [x] **REFACTOR:** Keep external inputs `unknown`, use strict TypeScript types/const objects, and ensure no `any`, inline nested interfaces, semver-range inference, or duplicate process boundary. <!-- sdd-owner: implementation -->
 
@@ -44,7 +44,7 @@ The single-PR size exception is accepted by delivery constraints. Work-unit comm
 
 - [x] **RED:** Extend `tests/review-controller.test.ts` and `tests/gentle-ai.test.ts` with injected native start/finalize/validate success, typed failure, ambiguous replay, stable envelope, and no-fallback cases. <!-- sdd-owner: implementation -->
 - [x] **GREEN:** Refactor `extensions/gentle-ai.ts` to add `GentleAiRuntimeDependencies`, `createGentleAiExtension`, asynchronous controller execution, route resolution, and native result/error mappers while preserving the default package wrapper. <!-- sdd-owner: implementation -->
-- [x] **GREEN:** Route new ordinary `START`/`FINALIZE`/`VALIDATE` to exactly one matching native operation; map only decoded fields into existing envelopes, retaining native ownership of canonicalization, transitions, revisions, receipts, and gates. <!-- sdd-owner: implementation -->
+- [x] **GREEN:** Route new ordinary `START` and `FINALIZE` to exactly one matching native review operation; map only decoded review fields into existing envelopes, retaining native ownership of canonicalization, transitions, revisions, and receipts. <!-- sdd-owner: implementation -->
 - [x] **RED:** Add tests proving native non-zero, malformed, unavailable, timeout, or ambiguous results never enter compact-v2/graph-v1 mutation or create a second lineage. <!-- sdd-owner: implementation -->
 - [x] **TRIANGULATE:** Verify operation names, blocked/action semantics, opaque receipt paths, risk/changed-line mappings, and cancellation behavior remain stable for existing callers. <!-- sdd-owner: implementation -->
 
@@ -61,34 +61,34 @@ The single-PR size exception is accepted by delivery constraints. Work-unit comm
 
 - [x] **RED:** Add controller tests for general ordinary `STATUS`, `INSPECT`/complete mixed claimant inventory, and native-absence decisions requiring native evidence; assert zero native adapter calls and zero local mutations. <!-- sdd-owner: implementation -->
 - [x] **GREEN:** Add stable `nativeStatusUnsupported` result in `extensions/gentle-ai.ts` with `inventory_complete: false`, follow-up-required action, native contract evidence, and unchanged public outer envelope. <!-- sdd-owner: implementation -->
-- [x] **GREEN:** Route unsupported status before version probing; prohibit native file parsing, mutating probes, claimant selection, legacy fallback, binding, approval, receipt creation, and lifecycle authorization. <!-- sdd-owner: implementation -->
+- [x] **GREEN:** Route unsupported status before version probing; prohibit native file parsing, mutating probes, claimant selection, legacy fallback, binding, review-approval mirroring, receipt creation, and delivery authority. <!-- sdd-owner: implementation -->
 - [x] **TRIANGULATE:** Verify future status capability is not implied by 2.1.0 and any Pi-local diagnostics remain explicitly incomplete and cannot claim clean/absence/winner. <!-- sdd-owner: implementation -->
 
 ### 6. Preserve legacy compact/graph/Judgment Day compatibility without fallback mutation
 
-- [x] **RED:** Extend existing compact/graph suites (`tests/review-compact-gate.test.ts`, `tests/review-transaction.test.ts`, and graph/receipt suites) with read/export/gate preservation and typed ordinary mutation rejection. <!-- sdd-owner: implementation -->
-- [x] **GREEN:** Update route precedence so explicit Judgment Day remains graph-v1, known Pi compact-v2/graph-v1 lineages use existing compatible readers/gates, and ordinary mutation returns `legacy-read-only` without native or Pi mutation. <!-- sdd-owner: implementation -->
+- [x] **RED:** Extend existing compact/graph suites (`tests/review-compact-gate.test.ts`, `tests/review-transaction.test.ts`, and graph/receipt suites) with review read/export preservation and typed ordinary mutation rejection. <!-- sdd-owner: implementation -->
+- [x] **GREEN:** Update route precedence so explicit Judgment Day remains graph-v1, known Pi compact-v2/graph-v1 lineages use existing compatible readers, and ordinary mutation returns `legacy-read-only` without native or Pi mutation. <!-- sdd-owner: implementation -->
 - [x] **RED:** Add mixed-authority and cross-mode tests proving state, counters, receipts, and formats remain unchanged; native success/failure never mirrors or falls through to legacy stores. <!-- sdd-owner: implementation -->
 - [x] **TRIANGULATE:** Run compatibility fixtures against current issue #118 seams and verify no existing issue #118 behavior, files, receipts, or authority ownership is rewritten. <!-- sdd-owner: implementation -->
 - [x] **REFACTOR:** Keep legacy compatibility routing isolated from the single native adapter and preserve existing graph-v1 Judgment Day mutation rules. <!-- sdd-owner: implementation -->
 
-### 7. Enforce native validation as exact one-shot authorization
+### 7. Keep delivery outside Pi review authority
 
-- [x] **RED:** Add authorization regressions for native allow, deny/error/malformed/version mismatch, actor/process success without validation, duplicate registration, replay, consume-before-await, stale context, changed candidate/target, worktree mismatch, and dangerous-command precedence. <!-- sdd-owner: implementation -->
-- [x] **GREEN:** Extend `PendingReviewAuthorization`, `gateLifecycleCommand`, and `ReviewGateEvaluator` in `extensions/gentle-ai.ts` with native gate context, lineage/revision fingerprint, asynchronous bash-time revalidation, and one-shot consumption. <!-- sdd-owner: implementation -->
-- [x] **GREEN:** Register authorization only after exit-zero strict native allow for the exact typed target; reload and rederive cwd/target/receipt evidence before execution and fail closed on any mismatch without restoring consumed authorization. <!-- sdd-owner: implementation -->
-- [x] **TRIANGULATE:** Prove exactly one authorization is registered/executed, zero actors authorize lifecycle work, and native approval cannot override independent dangerous-command safety. <!-- sdd-owner: implementation -->
+- [x] **RED:** Add regressions proving review and Judgment Day evidence cannot authorize, deny, wrap, or otherwise control commit, push, PR, or release delivery. <!-- sdd-owner: implementation -->
+- [x] **GREEN:** Remove `PendingReviewAuthorization`, `gateLifecycleCommand`, `ReviewGateEvaluator`, and all bash-time native delivery revalidation from `extensions/gentle-ai.ts`. <!-- sdd-owner: implementation -->
+- [x] **GREEN:** Keep review receipts, lineages, and candidate evidence review-only; ordinary commit, push, PR, and release always follow repository policy. <!-- sdd-owner: implementation -->
+- [x] **TRIANGULATE:** Prove no Pi review output mints delivery authority and dangerous-command handling remains outside review authority. <!-- sdd-owner: implementation -->
 
 ### 8. Package/runtime assets and full verification
 
 - [x] **RED:** Add package/runtime tests covering inclusion of `lib/native-review-cli.ts`, fixtures, controller exports, injected dependencies, and production asset loading from the packaged runtime rather than source-only paths. <!-- sdd-owner: implementation -->
 - [x] **GREEN:** Update package/runtime manifests or asset-copy rules only where required so native adapter and fixture/test support are available in the supported runtime; do not alter unrelated issue #118 assets. <!-- sdd-owner: implementation -->
-- [x] **TRIANGULATE:** Run focused native, controller, SDD, compact/graph, receipt/gate, Judgment Day, dispatcher, release-fast-path, and issue #118 seam suites, then run `pnpm test` and type/package checks. <!-- sdd-owner: implementation -->
+- [x] **TRIANGULATE:** Run focused native, controller, SDD, compact/graph, receipt, Judgment Day, dispatcher, release-fast-path, and issue #118 seam suites, then run `pnpm test` and type/package checks. <!-- sdd-owner: implementation -->
 - [x] **REFACTOR:** Remove only proven duplication after tests pass; retain strict decoders, typed errors, no-fallback guarantees, and the explicit upstream status/inventory follow-up. <!-- sdd-owner: implementation -->
 
-## Parent-Owned Review and Delivery Gates
+## Parent-Owned Review Evidence
 
-After implementation, the parent must perform the ordinary post-apply review/bind/gate workflow in prose. The parent must bind only the expanded candidate to a fresh native review after independent verification; the historical issue #118 Pi receipt remains read-only and is not imported or relabelled. The parent must validate the exact content-bound receipt at lifecycle gates, preserve the single-PR size exception, and record any scope-change or ambiguous native mutation as fail-closed evidence. No parent review, binding, authorization, or gate operation is represented as an implementation checkbox.
+After implementation, the parent may perform post-apply review and binding in prose. The parent binds only the expanded candidate to a fresh native review after independent verification; the historical issue #118 Pi receipt remains read-only and is not imported or relabelled. That evidence remains review-only: Pi mints no delivery authority, and ordinary commit, push, PR, and release always follow repository policy. No parent review or binding operation is represented as an implementation checkbox.
 
 ## Post-completion correction evidence: native START policy boundary
 

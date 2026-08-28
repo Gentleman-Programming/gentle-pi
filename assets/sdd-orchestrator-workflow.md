@@ -7,12 +7,13 @@ This is the lazy-loaded SDD workflow surface for el Gentleman on Pi. Read this f
 SDD phases:
 
 ```text
-init → explore → proposal → spec → design → tasks → apply → verify → sync → archive
+init → explore → research (optional) → proposal → spec → design → tasks → apply → verify → sync → archive
 ```
 
 Dependency graph:
 
 ```text
+explore → research (optional) → proposal
 proposal → spec ─┬→ tasks → apply → verify → sync → archive
 proposal → design ┘
 ```
@@ -57,21 +58,15 @@ Do not guess the active change. If change selection is ambiguous, ask the user a
 
 Do not ask SDD setup questions on session start. The first time the user initiates an SDD process in a Pi session, run the SDD preflight once and keep those choices for the rest of that session. Runtime trigger detection is intentionally deterministic: slash SDD flows and `/sdd-init` run preflight automatically; for natural-language requests, the parent/orchestrator decides semantically whether SDD is needed and must run/reuse `/gentle:sdd-preflight` before continuing.
 
-**Hard gate:** `openspec/config.yaml`, existing SDD changes, installed `.pi`/global SDD assets, or a todo named "preflight" are not session preflight. They are project context only. Do not mark SDD preflight complete, start `sdd-init`, launch SDD subagents/chains, or move to explore/proposal/spec/design/tasks until this session has either:
+**Hard gate:** `openspec/config.yaml`, existing SDD changes, installed `.pi`/global SDD assets, or a todo named "preflight" are not session preflight. They are project context only. Do not mark SDD preflight complete, start `sdd-init`, launch SDD subagents/chains, or move to explore/proposal/spec/design/tasks until this session has an injected `## SDD Session Preflight` block or an equivalent resolution from the canonical authority order below.
 
-1. an injected `## SDD Session Preflight` block, or
-2. an explicit user answer in the current conversation covering all four preflight choices below.
+Resolve each field in this order: (1) explicit current user/session choice, (2) valid persisted preference, (3) capability or already-selected strategy constraint, (4) canonical documented default, and (5) ask only when the field is genuinely unresolved. If `/gentle:sdd-preflight` cannot be invoked, resolve the same order inline; do not recreate a four-question setup prompt. Missing Engram is a capability constraint that resolves the artifact store to `openspec` unless the user has made an incompatible explicit request, which remains a human decision.
 
-If neither exists and `/gentle:sdd-preflight` cannot be invoked from the current context, ask the four choices manually with `ask_user_question` before any SDD phase work. Treat missing Engram availability as a reason to ask/confirm artifact store, not as permission to assume defaults.
+Preflight canonical defaults are execution `auto`, artifact store `openspec`, delivery strategy `ask-on-risk`, and review budget `400`; capability and already-selected constraints may narrow them.
 
-The preflight captures:
+Selectors/inputs appear only for genuinely unresolved fields. Defaulted and one-option fields do not prompt; persisted/session values are reused, and an explicit current choice overrides them when presented. `chain_strategy` remains deferred, and `exception-ok` requires explicit `size:exception` acceptance and is never inferred.
 
-- execution mode: `interactive` or `auto`;
-- artifact store: `openspec`, `engram`, or `both` when callable memory tools are available;
-- chained PR strategy: the canonical `delivery_strategy` — `ask-on-risk`, `auto-chain`, `single-pr`, or `exception-ok`. The preflight menu offers the first three; `exception-ok` is reachable only when the user explicitly accepts `size:exception`, either up front or when `ask-on-risk` stops to ask;
-- review budget in changed lines.
-
-Those four PR values are exactly the `delivery_strategy` domain `sdd-tasks` and `sdd-apply` accept; never emit a value outside it. The preflight offers no separate chained option because `delivery_strategy` is only consulted once the tasks forecast flags review-budget risk: below that line there is nothing to chain, and above it `auto-chain` already resolves without asking again.
+The exact `delivery_strategy` domain accepted by `sdd-tasks` and `sdd-apply` is `ask-on-risk`, `auto-chain`, `single-pr`, or `exception-ok`; above the review threshold, `auto-chain` resolves without asking again.
 
 The package should ensure SDD assets are present as global Pi runtime assets without the user needing to remember per-project setup commands. If assets are missing, install them non-destructively into:
 
@@ -124,6 +119,18 @@ In interactive mode, between phases:
 Interactive approval is phase-scoped. A user response such as "continue", "dale", or "go on" approves only the immediate next phase, not the rest of the SDD pipeline. Do not treat a generated artifact as approved until the user has had a chance to review or explicitly delegate that review.
 
 Before `sdd-proposal` in interactive mode, offer the user a proposal question round instead of silently deciding whether the proposal is clear enough. Explain that the questions are meant to improve the PRD/proposal by uncovering business understanding, business rules, implications, impact, edge cases, and product tradeoffs. Prefer 3–5 concrete product questions per round, then summarize the resulting assumptions and ask whether the user wants to correct anything or run a second question round. Cover business/product/PRD decisions: business problem, target users and situations, business rules, product outcome, current-state gap, implications and impact, edge cases, decision gaps, first-slice scope boundaries, non-goals, product constraints, and business tradeoffs. Do not ask about test commands, PR shape, changed-line budget, or other harness mechanics at proposal time unless the user explicitly asks to discuss delivery.
+
+## Research and Pre-Proposal Gate
+
+This gate is MANDATORY and applies in both execution modes; in interactive mode it runs alongside the proposal question round above, and the two never contradict: the question round shapes the proposal, the gate decides whether `sdd-proposal` may launch at all.
+
+- Offer `sdd-research` immediately after `sdd-explore`. Research is optional until selected; selection makes completion mandatory.
+- Before every proposal, invoke `sdd-proposal` only when selected research is `done` or research is unselected, product decisions are `confirmed`, evidence references are valid, and the selected artifact-store state is ready.
+- The orchestrator owns product discovery. In automatic mode, unresolved product choices require one lossless grouped prompt with all context, options, consequences, allowed answers, and exact tokens; the orchestrator MUST persist the pending pre-proposal state before prompting, then STOP without invoking `sdd-proposal`.
+- The proposer receives a confirmed pre-proposal handoff and MUST NOT interview the user or infer consent.
+- Pi's native `gentle-pi.sdd-status` contract remains the sole status contract. Research and pre-proposal state are orchestrator-owned prose and artifacts (`sdd/{change}/research`, `sdd/{change}/preproposal`, `openspec/changes/{change}/research.md`) layered on top — never a native status field.
+
+Runtime note: this runtime declares no evidence grants (`documentation=[]; open-web=[]`), so a SELECTED research lane fail-closes to a `blocked` outcome and blocks proposal readiness until the user deselects research or evidence capability arrives. SDD chains treat research as unselected.
 
 ## Delivery Strategy
 
@@ -180,7 +187,7 @@ Check every phase result against the Result Contract:
 
 Use cost-aware validation:
 
-- For lower-risk phases (`sdd-explore`, `sdd-spec`, `sdd-tasks`, `sdd-sync`, `sdd-archive`), the parent may validate inline by reading artifacts back and checking claims.
+- For lower-risk phases (`sdd-explore`, `sdd-research`, `sdd-spec`, `sdd-tasks`, `sdd-sync`, `sdd-archive`), the parent may validate inline by reading artifacts back and checking claims.
 - For higher-risk phases (`sdd-design`, `sdd-apply`), validate the artifact, declared paths, task state, and focused test evidence directly before continuing because errors there compound downstream.
 - If a gate finds any smell — missing artifact, status mismatch, unresolved path, likely drift, or critical risk — rerun the same SDD phase once with corrective feedback. SDD phase validation does not start ordinary review or Judgment Day.
 
@@ -237,6 +244,7 @@ On Pi, phase model routing is user-owned and persisted, not prompt-passed: `/gen
 | Phase        | Default tier   | Reason                                     |
 | ------------ | -------------- | ------------------------------------------ |
 | sdd-explore  | balanced       | Reads code, structural - not architectural |
+| sdd-research | balanced       | Fail-closed evidence record keeping        |
 | sdd-proposal | deep-reasoning | Architectural decisions                    |
 | sdd-spec     | balanced       | Structured writing                         |
 | sdd-design   | deep-reasoning | Architecture decisions                     |
@@ -308,19 +316,4 @@ Automatic mode does not override reviewer burnout protection.
 
 ## Provider Defect Handoff
 
-This section applies when an SDD phase or review lifecycle operation appears blocked by a Gentle AI provider defect. The full contract lives in `assets/orchestrator-delegation.md` under `#### Gentle AI Provider Defect Handoff (MANDATORY)`; it ports Gentle AI's v2.4.0-rc.8 handoff consent contract (the `gentle-ai.review-integration.consent/v3` envelope; canonical source `internal/assets/generic/sdd-orchestrator.md` at tag `v2.4.0-rc.8`, a prerelease not present in v2.3.0 stable). Pi review commands use `gentle_review`.
-
-Concise rules:
-
-- Classify admissibility before relaying: offer the handoff only when a Gentle AI invocation produced the failure, not when its runtime merely hosted it.
-- Never offer to switch to, inspect, modify, or directly repair the Gentle AI repository from this SDD workflow. If an upstream envelope offers direct repair, reject it as semantically inadmissible and issue the orchestrator-owned handoff envelope instead.
-- Ask the user first, in the active conversation language, for explicit consent to report the apparent defect. Present one single-select blocking envelope with exactly three semantic choices in this order. Its exact internal answer tokens are `report_and_continue`, `continue_without_reporting`, `stop_here`. Do not expose machine or internal codes in user-facing labels.
-- Privacy scrub immediately before the first GitHub operation: exclude raw argv, absolute paths, private project names, usernames, hostnames, credentials, diffs, source contents, and environment values.
-- Complete a definitive lookup across open and closed issues in `Gentleman-Programming/gentle-ai` before any write; only a definitive lookup may branch to GitHub mutation.
-- Derive the evidence channel only from the installed build string: recognized prerelease tags are `-rc.` and `-main.`; every other build is stable. A fix counts only in the installed build's channel. A fix published only to the other channel gets one occurrence comment naming where it is published; never recommend switching channels.
-- If the installed build predates the relevant published fix, recommend installing it and reproducing; do not create or comment for that occurrence yet. If the installed build demonstrably contains the fix and still reproduces, treat it as a possible regression: comment on a suitable canonical tracker or create a linked regression issue; never reopen automatically.
-- Confirmed creation requires the GitHub create operation to confirm a newly-created issue identity/URL; never infer creation from output text alone.
-- On search, comment, or creation failure/ambiguity/timeout/permission/unknown: perform no further GitHub mutation and no blind retry; preserve all consumer state, then execute the exact captured provider-owned decline invocation exactly once, validate it, re-enter native negotiated STATUS, and resume the already-held consumer continuation.
-- Both continue choices execute that exact captured decline invocation exactly once; never synthesize the decline command, target, token, or consumer continuation from prose. If unavailable or ambiguous, fail closed.
-- Do not invoke `gentle-ai review mode disable` at clone or global scope within this handoff. Do not turn RDD off or on within this handoff.
-- Resume after an installed published fix or an explicit maintainer-authorized, documented native recovery or reset that the runtime contract supports; then re-enter through native status. Never resume against unpublished code.
+When an SDD task encounters a possible Gentle AI provider defect, the full contract lives in `assets/orchestrator-delegation.md` under `#### Gentle AI Provider Defect Handoff (MANDATORY)`. This workflow intentionally provides no summary, alternate report route, or RDD lifecycle instruction.

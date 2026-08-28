@@ -4,7 +4,6 @@ import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { __testing } from "../extensions/gentle-ai.ts";
 import {
 	EXTERNAL_RELEASE_EVIDENCE,
 	GATE_RESULT,
@@ -174,14 +173,6 @@ function temporaryAuthority(t: test.TestContext): GateRepository & {
 	const state = store.read("approved-lineage");
 	return { ...repository, store, receipt: receiptFor(state), authoritativeReceipt: store.createAuthoritativeReceipt("approved-lineage") };
 }
-
-test("lifecycle command classification identifies gates but never runs review routing", () => {
-	assert.equal(__testing.classifyReviewEvent("git commit -m fix"), "pre-commit");
-	assert.equal(__testing.classifyReviewEvent("git -C /repo push origin main"), "pre-push");
-	assert.equal(__testing.classifyReviewEvent("gh pr create --draft"), "pre-pr");
-	assert.equal(__testing.classifyReviewEvent("gh release create v1.2.3"), "pre-release");
-	assert.equal(__testing.classifyReviewEvent("git status"), null);
-});
 
 test("unbranded receipts are rejected before lifecycle gate evaluation", (t) => {
 	const { repository, finalTree, store, receipt } = temporaryAuthority(t);
@@ -587,42 +578,6 @@ test("scope child claim and parent gate journal publish atomically across faults
 		target_tree: changedTree,
 	}));
 	assert.equal(store.read(receipt.body.lineage_id).child_claims?.length, 1);
-});
-
-test("receipt gate cannot bypass independent dangerous-command safety", async () => {
-	let safetyCalls = 0;
-	let gateCalls = 0;
-	const safetyBlock = { block: true, reason: "dangerous command denied" };
-	const result = await __testing.enforceReviewGateAndCommandSafety(
-		"git push origin main",
-		() => {
-			gateCalls += 1;
-			return undefined;
-		},
-		async () => {
-			safetyCalls += 1;
-			return safetyBlock;
-		},
-	);
-	assert.deepEqual(result, safetyBlock);
-	assert.equal(safetyCalls, 1);
-	assert.equal(gateCalls, 0);
-
-	const gateBlock = { block: true, reason: "exact receipt required" };
-	const blocked = await __testing.enforceReviewGateAndCommandSafety(
-		"git push origin main",
-		() => {
-			gateCalls += 1;
-			return gateBlock;
-		},
-		async () => {
-			safetyCalls += 1;
-			return undefined;
-		},
-	);
-	assert.deepEqual(blocked, gateBlock);
-	assert.equal(safetyCalls, 2);
-	assert.equal(gateCalls, 1);
 });
 
 function releaseTarget(repository: GateRepository): GateTargetV1 {

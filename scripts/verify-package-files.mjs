@@ -30,6 +30,7 @@ const requiredPaths = [
   "assets/agents/sdd-init.md",
   "assets/agents/sdd-onboard.md",
   "assets/agents/sdd-proposal.md",
+  "assets/agents/sdd-research.md",
   "assets/agents/sdd-spec.md",
   "assets/agents/sdd-status.md",
   "assets/agents/sdd-sync.md",
@@ -52,7 +53,6 @@ const requiredPaths = [
   "extensions/sdd-init.ts",
   "extensions/skill-registry.ts",
   "lib/gentle-ai-binary.ts",
-  "lib/git-commit-transaction.ts",
   "lib/native-review-cli.ts",
   "lib/provider-contract-bundle.ts",
   "lib/review-host-relay.ts",
@@ -60,17 +60,13 @@ const requiredPaths = [
   "lib/review-relay-contract.ts",
   "lib/sdd-preflight.ts",
 	"runtime/gentle-ai-binary.mjs",
-	"runtime/git-commit-transaction.mjs",
 	"runtime/native-review-cli.mjs",
 	"runtime/review-integration-v2.mjs",
 	"runtime/review-relay-contract.mjs",
-	"scripts/build-git-commit-transaction-runner.mjs",
   "scripts/check-provider-contract.mjs",
   "scripts/gentle-ai-installer.mjs",
   "scripts/install-gentle-ai.mjs",
   "scripts/mirror-provider-contract.mjs",
-  "scripts/run-git-commit-transaction.mjs",
-	"scripts/test-packed-runner.mjs",
   "tests/fixtures/native-review-cli/v2.1.3/start.json",
   "tests/fixtures/provider-contract-bundle/v1.1.0/README.md",
   "tests/fixtures/provider-contract-bundle/v1.1.0/manifest.json",
@@ -172,11 +168,13 @@ const contractHashes = {
   "contracts/review-integration/v2/schemas/capabilities.schema.json": "7ab061ed27bd3b929d6033cc20f56097e851f4454ca14a815255748b50191248",
   "contracts/review-integration/v2/schemas/consent.schema.json": "b2b4465338497f11927de91cb2e5da12b6cb4a1039afe05aebe1abbf53b21858",
   "contracts/review-integration/v2/schemas/failure.schema.json": "a56a2f715c3138d6f2cee37257cd6e758a15d4e0b1215745951d85831d148967",
+  "contracts/review-integration/v2/schemas/last-event-closure.schema.json": "3e58a4207e54ac955dbef227d2f1a2adcdf8c34f230009785c85b3895023c52a",
+  "contracts/review-integration/v2/schemas/opencode-provider-role.schema.json": "c6b9f216f89c044f8e844b55e7200114850cfbc16642bca0677f30a399d8aa9b",
   "contracts/review-integration/v2/schemas/operation.schema.json": "1c0128a0576064d4338ee0a1945e9d0d0569c1a7a2140217b2539af5d1a9ed1e",
   "contracts/review-integration/v2/schemas/repair.schema.json": "98a85fd45a8ae7f6211ffeeb3f9c478fa1dd1c17f385751f15f2111e6c3ab167",
   "contracts/review-integration/v2/schemas/start.schema.json": "2991e3fcca672d9257d61b6a336fb34e58b15a8e03f8a09a7adf892cae6a8085",
   "contracts/review-integration/v2/schemas/status.schema.json": "c4dcc736cfc6300560a3c4262d2d982368529d5c49d58d499552a3b0beef9212",
-  "docs/review-integration.md": "189f9b128cafaf225d2b6be53111f893ca46eb687fb9e5e051a84727b6a34bbc",
+  "docs/review-integration.md": "0a2a415e8bd24be61f5c6090bd0efccde0ed1b4561261be11bba197aa081f336",
 };
 
 requiredPaths.push(...Object.keys(contractHashes));
@@ -247,7 +245,7 @@ export function gentleAiVersionPinMismatches({ installerVersion, releaseBaseUrl,
 // so this script never needs the generator to export anything it doesn't
 // already export for its own `--write`/`--check` CLI use.
 export function extractGeneratedRuntimeSources(packageRoot) {
-  const generatorPath = join(packageRoot, "scripts/build-git-commit-transaction-runner.mjs");
+  const generatorPath = join(packageRoot, "scripts/build-runtime-modules.mjs");
   const generatorSource = readFileSync(generatorPath, "utf8");
   const sourcesMatch = generatorSource.match(/const sources = \[([\s\S]*?)\];/);
   if (!sourcesMatch) {
@@ -316,7 +314,7 @@ async function main() {
   const generatedRuntimeSources = extractGeneratedRuntimeSources(root);
   const { drifted } = reconcileGeneratedRuntimeSources(root, generatedRuntimeSources, requiredPaths);
   if (drifted.length > 0) {
-    console.error("gentle-pi generated commit transaction runtime sources, runtime/*.mjs, and requiredPaths have drifted apart:");
+    console.error("gentle-pi generated runtime sources, runtime/*.mjs, and requiredPaths have drifted apart:");
     for (const entry of drifted) {
       const where = [];
       if (!entry.inSources) where.push("missing from generator sources");
@@ -355,13 +353,13 @@ async function main() {
     process.exit(1);
   }
 
-  const generatedRuntimeCheck = spawnSync(process.execPath, [join(root, "scripts/build-git-commit-transaction-runner.mjs"), "--check"], {
+  const generatedRuntimeCheck = spawnSync(process.execPath, [join(root, "scripts/build-runtime-modules.mjs"), "--check"], {
     cwd: root,
     encoding: "utf8",
     env: { ...process.env, NODE_NO_WARNINGS: "1" },
   });
   if (generatedRuntimeCheck.status !== 0) {
-    console.error("gentle-pi generated commit transaction runtime does not match its TypeScript sources:");
+    console.error("gentle-pi generated runtime does not match its TypeScript sources:");
     console.error((generatedRuntimeCheck.stderr || generatedRuntimeCheck.stdout || "unknown generator failure").trim());
     process.exit(1);
   }

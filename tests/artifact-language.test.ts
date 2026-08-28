@@ -67,14 +67,15 @@ test("rendered SDD preflight prompt is English artifact copy", () => {
 	const prefs: SddPreflightPreferences = {
 		executionMode: "interactive",
 		artifactStore: "openspec",
-		chainedPrStrategy: "ask-always",
+		chainedPrStrategy: "ask-on-risk",
 		reviewBudgetLines: 400,
 		engramAvailable: false,
 		prompted: true,
 	};
 	const prompt = renderSddPreflightPrompt(prefs);
 
-	assert.match(prompt, /The user already chose these SDD preferences/);
+	assert.match(prompt, /These SDD preferences are explicit current-session choices/);
+	assert.match(prompt, /Delivery strategy: ask-on-risk/);
 	assert.match(prompt, /Review budget: 400 changed lines/);
 	assert.match(prompt, /complete only the current SDD phase/i);
 	assert.match(prompt, /Do not start the next SDD phase/i);
@@ -82,9 +83,15 @@ test("rendered SDD preflight prompt is English artifact copy", () => {
 	assert.match(prompt, /offer the user a proposal question round/i);
 	assert.match(prompt, /business rules, implications, impact, edge cases/i);
 	assert.match(prompt, /second question round/i);
+	assert.match(prompt, /explicit acceptance of `size:exception`/);
+	assert.match(prompt, /human-controlled consent, authorization, security, destructive\/publishing/);
 	for (const pattern of SPANISH_PREFLIGHT_COPY) {
 		assert.doesNotMatch(prompt, pattern);
 	}
+
+	const headless = renderSddPreflightPrompt({ ...prefs, executionMode: "auto", prompted: false });
+	assert.match(headless, /canonical defaults or persisted choices/);
+	assert.match(headless, /ambiguous-scope/);
 });
 
 test("orchestrator Memory Contract carries the Engram memory lifecycle rule", async () => {
@@ -159,7 +166,12 @@ test("orchestrator lazy-loads detailed SDD workflow", async () => {
 	const workflow = await readFile(join(ROOT, "assets/sdd-orchestrator-workflow.md"), "utf8");
 
 	assert.match(orchestrator, /## SDD Workflow \(lazy-loaded\)/);
-	assert.match(orchestrator, /\{\{GENTLE_PI_SDD_WORKFLOW_PATH\}\}/);
+	assert.match(orchestrator, /Package assets root: `\{\{GENTLE_PI_ASSETS_ROOT\}\}`\. Lazy asset paths below are relative to this root\./);
+	assert.match(orchestrator, /`sdd-orchestrator-workflow\.md`/);
+	assert.doesNotMatch(orchestrator, /\{\{GENTLE_PI_SDD_WORKFLOW_PATH\}\}/);
+	assert.match(orchestrator, /injected `## SDD Session Preflight` block or a canonical-authority resolution/);
+	assert.match(orchestrator, /Defaults and capability constraints may resolve fields without confirmation prompts/);
+	assert.doesNotMatch(orchestrator, /or an explicit user answer covering the preflight choices/);
 	assert.doesNotMatch(orchestrator, /## Native SDD Dispatcher/);
 	assert.match(workflow, /## Native SDD Dispatcher/);
 	assert.match(workflow, /## SDD Status Contract/);

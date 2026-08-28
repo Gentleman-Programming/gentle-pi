@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
@@ -11,8 +11,6 @@ import { matchesKey } from "@earendil-works/pi-tui";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { domainHashV1 } from "../lib/review-canonical.ts";
-import { resolveGentleAiBinary } from "../lib/gentle-ai-binary.ts";
-import { NativeReviewCliV216, NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError } from "../lib/native-review-cli.ts";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const EXTENSIONS = [
@@ -66,10 +64,28 @@ function createPi() {
 	const commands = new Map();
 	const flags = new Map();
 	const tools = new Map();
+	const eventHandlers = new Map();
+	const emittedEvents = [];
 	const flagValues = new Map([["no-skill-registry", true]]);
+	const events = {
+		emit(channel, data) {
+			emittedEvents.push({ channel, data });
+			for (const handler of eventHandlers.get(channel) ?? []) handler(data);
+		},
+		on(channel, handler) {
+			const handlers = eventHandlers.get(channel) ?? new Set();
+			handlers.add(handler);
+			eventHandlers.set(channel, handlers);
+			return () => {
+				handlers.delete(handler);
+				if (handlers.size === 0) eventHandlers.delete(channel);
+			};
+		},
+	};
 	let activeTools = ["read", "bash", "edit", "write"];
 
 	const pi = {
+		events,
 		on(name, handler) {
 			const list = hooks.get(name) ?? [];
 			list.push(handler);
@@ -110,7 +126,7 @@ function createPi() {
 		},
 	};
 
-	return { pi, hooks, commands, flags, tools };
+	return { pi, hooks, commands, flags, tools, emittedEvents };
 }
 
 function createUi() {
@@ -182,6 +198,15 @@ async function tempWorkspace() {
 	return mkdtemp(join(tmpdir(), "gentle-pi-runtime-"));
 }
 
+function restoreWorkspaceWritePermissions(cwd) {
+	if (process.platform === "win32") return;
+	try {
+		execFileSync("chmod", ["-R", "u+w", cwd], { stdio: "ignore" });
+	} catch {
+		// A prior candidate-view cleanup may already have removed the workspace.
+	}
+}
+
 async function loadExtensions(pi) {
 	for (const [index, rel] of EXTENSIONS.entries()) {
 		const mod = await import(`${pathToFileURL(join(ROOT, rel)).href}?runtime-harness=${index}`);
@@ -197,27 +222,123 @@ async function run() {
 	process.env.GENTLE_PI_CONFIG_HOME = globalConfigHome;
 	process.env.GENTLE_PI_AGENT_HOME = globalAgentHome;
 	process.env.GENTLE_PI_TEST_ASSETS_DIR = ambientTestAssetsDir;
-	// The harness already sandboxes its config and agent homes; the review kill
-	// switch is the one piece of machine state it was still inheriting. Several
-	// lifecycle-gate assertions below only reach their subject while
-	// receipt-driven development is on — with it off, gateLifecycleCommand
-	// returns undefined before deriving any target, which is correct behavior
-	// but not what those assertions are about.
-	//
-	// gentle-ai v2.4.0 made the switch opt-in, so an unconfigured machine now
-	// resolves to off. Until then the harness passed or failed on whatever the
-	// operator happened to have set, which made it green locally and red on a
-	// fresh CI runner from identical bytes. It now owns a sandbox HOME and opts
-	// in explicitly, the same way a user does, so the gates are what is under
-	// test rather than the machine.
-	const reviewHome = await tempWorkspace();
-	process.env.HOME = reviewHome;
-	const reviewModeEnable = execFileSync(resolveGentleAiBinary(ROOT, process.platform), ["review", "mode", "enable", "--scope", "global", "--json"], { cwd: ROOT, encoding: "utf8", env: { ...process.env, HOME: reviewHome } });
-	assert.match(reviewModeEnable, /"effective": "on"/, "the harness sandbox HOME must have receipt-driven development explicitly enabled");
 	const globalModelsPath = join(globalConfigHome, "models.json");
 	const globalSubagentsPath = join(globalAgentHome, "subagents.json");
-	const { pi, hooks, commands, flags, tools } = createPi();
+	const { pi, hooks, commands, flags, tools, emittedEvents } = createPi();
 	await loadExtensions(pi);
+
+	// gentle-pi#404: a collect binding that returns the native last-event
+	// closure must terminate after one capture. It must not re-enter a public
+	// lifecycle mutation or synthesize a follow-up transition.
+	{
+		const lineageId = "runtime-last-event";
+		const sha = `sha256:${"a".repeat(64)}`;
+		const tree = "b".repeat(40);
+		const repositoryContext = `rctx1_${"c".repeat(64)}`;
+		const calls = [];
+		const arguments_ = [
+			{ name: "lineage", value: lineageId, token: `--lineage=${lineageId}` },
+			{ name: "expected-revision", value: sha, token: `--expected-revision=${sha}` },
+			{ name: "target", value: sha, token: `--target=${sha}` },
+			{ name: "repository-context", value: repositoryContext, token: `--repository-context=${repositoryContext}` },
+			{ name: "lens", value: "review-risk", token: "--lens=review-risk" },
+			{ name: "order", value: "0", token: "--order=0" },
+			{ name: "subject-hash", value: sha, token: `--subject-hash=${sha}` },
+		];
+		const input = {
+			name: "correction_plan",
+			schema: "gentle-ai.review-correction-plan/v1",
+			captureOperation: "review.capture-correction-plan",
+			arguments: arguments_,
+			submission: {
+				operationToken: "capture-correction-plan",
+				argumentTokens: [...arguments_.map((argument) => argument.token), "--correction-lines={{value}}"],
+				values: [{ slot: "correction_lines", domain: "positive_integer", substitutionLocation: 7, minimum: 1, maximum: 1 }],
+			},
+		};
+		const status = {
+			contract: "gentle-ai.review-integration/v2",
+			applicability: "current_target",
+			authority: { version: "compact-v2", lineageId, state: "correction_required", generation: 1, revision: sha },
+			receipt: { status: "expected_missing" },
+			action: "stop",
+			replayability: "not_replayable",
+			targetIdentity: sha,
+			projection: {
+				schema: "gentle-ai.review-candidate-projection/v1",
+				kind: "current-changes",
+				projection: "workspace",
+				baseTree: tree,
+				initialReviewTree: tree,
+				currentCandidateTree: tree,
+				pathsDigest: sha,
+				paths: ["app.ts"],
+				intendedUntracked: [],
+				intendedUntrackedProof: sha,
+				initialSnapshotIdentity: sha,
+				currentSnapshotIdentity: sha,
+			},
+			repair: { schema: "gentle-ai.review-authority-repair-assessment/v1", status: "unsupported", counts: { lineages: 0, compactLineages: 0, legacyLineages: 0, events: 0, bytes: 0, eligibleCandidates: 0, unsupportedLineages: 0, conflicts: 0 }, supportedOperations: ["review/complete-fix", "review/validate-fix"], authorizationSchema: "gentle-ai.review-repair-authorization/v1" },
+			candidates: [],
+			nextTransition: { kind: "collect", reasonCode: "correction_plan_required", collect: { inputs: [input] } },
+			raw: { schema: "gentle-ai.review-integration.status/v5" },
+		};
+		const nativeReviewCli = {
+			async targetStatus(request) {
+				calls.push({ operation: "status", request });
+				return status;
+			},
+			async captureCorrectionPlan(request) {
+				calls.push({ operation: "capture-correction-plan", request });
+				return {
+					schema: "gentle-ai.review-last-event-closure/v1",
+					operation: "review.capture-correction-plan",
+					lineageId,
+					state: "correction_required",
+					targetIdentity: sha,
+					requestHash: sha,
+					correctionLines: 1,
+					storeRevision: sha,
+				};
+			},
+		};
+		const lastEventPi = createPi();
+		const { createGentleAiExtension } = await import(pathToFileURL(join(ROOT, "extensions/gentle-ai.ts")).href);
+		createGentleAiExtension({ nativeReviewCli })(lastEventPi.pi);
+		const controller = lastEventPi.tools.get("gentle_review");
+		const capture = lastEventPi.tools.get("gentle_review_capture");
+		assert.ok(controller, "runtime must register the public status controller");
+		assert.ok(capture, "runtime must register the one-slot capture tool");
+		assert.equal(controller.parameters.properties.operation.enum.includes("finalize"), false);
+		assert.equal(controller.parameters.properties.operation.enum.includes("validate"), false);
+
+		const publicStatus = await controller.execute(
+			"runtime-status",
+			{ operation: "status", lineageId },
+			undefined,
+			undefined,
+			createCtx(ROOT, false, lineageId),
+		);
+		const collectBindings = publicStatus.details.collectBindings;
+		assert.equal(publicStatus.details.status, "blocked");
+		assert.equal(collectBindings.length, 1);
+
+		const captured = await capture.execute(
+			"runtime-capture",
+			{ lineageId, collectBinding: collectBindings[0].collectBinding, correctionLines: 1 },
+			undefined,
+			undefined,
+			createCtx(ROOT, false, lineageId),
+		);
+		assert.equal(captured.details.status, "closed");
+		assert.equal(captured.details.outcome, "native-last-event-closure");
+		assert.equal(captured.details.closure.operation, "review.capture-correction-plan");
+		assert.deepEqual(
+			calls.map(({ operation }) => operation),
+			["status", "status", "capture-correction-plan"],
+			"last-event closure must make no follow-up lifecycle mutation",
+		);
+	}
 
 	for (const name of EXPECTED_COMMANDS) {
 		assert.ok(commands.has(name), `missing command ${name}`);
@@ -281,10 +402,13 @@ async function run() {
 		assert.doesNotMatch(promptResult.systemPrompt, /default\s*\|\s*sonnet\s*\|\s*Non-SDD general delegation/);
 		assert.match(promptResult.systemPrompt, /openspec\/config\.yaml.*not session preflight/s);
 		assert.match(promptResult.systemPrompt, /Do not mark SDD preflight complete/);
-		assert.match(
-			promptResult.systemPrompt,
-			new RegExp(`${ROOT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*assets.*sdd-orchestrator-workflow\\.md`),
+		assert.ok(
+			promptResult.systemPrompt.includes(
+				`Package assets root: \`${join(ROOT, "assets")}\`. Lazy asset paths below are relative to this root.`,
+			),
+			"parent prompt must declare the one absolute root for relative lazy asset paths",
 		);
+		assert.match(promptResult.systemPrompt, /`sdd-orchestrator-workflow\.md`/);
 		assert.doesNotMatch(
 			promptResult.systemPrompt,
 			new RegExp(ambientTestAssetsDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
@@ -386,12 +510,11 @@ async function run() {
 		const ghPrCwd = await tempWorkspace();
 		try {
 			execFileSync("git", ["init"], { cwd: ghPrCwd, stdio: "ignore" });
-			const receiptGate = await toolHook(
+			const deliveryResult = await toolHook(
 				{ toolName: "bash", input: { command: "gh pr create --draft" } },
-				createCtx(ghPrCwd, true, "receipt-gate-session"),
+				createCtx(ghPrCwd, true, "ordinary-delivery-session"),
 			);
-			assert.equal(receiptGate.block, true);
-			assert.match(receiptGate.reason, /exactly derive.*--base/i);
+			assert.equal(deliveryResult, undefined, "ordinary delivery policy, not review authority, governs pull-request creation");
 		} finally {
 			await rm(ghPrCwd, { recursive: true, force: true });
 		}
@@ -404,6 +527,110 @@ async function run() {
 		assert.equal(missingReviewView.block, true);
 		assert.match(missingReviewView.reason, /candidate view/i);
 		assert.equal(reviewDispatch.task, "review", "blocked review dispatch must not mutate child input");
+
+		for (const [agent, label, task] of [
+			["gentle-ai-worker", "missing", "Implement the requested change."],
+			["gentle-ai-worker", "absolute", "## Allowed edit surfaces\n/tmp/outside.ts"],
+			["gentle-ai-worker", "Windows absolute", "## Allowed edit surfaces\nC:\\outside.ts"],
+			["gentle-ai-worker", "prose instead of paths", "## Allowed edit surfaces\nThe parent will determine the paths."],
+			["gentle-ai-worker", "repository root", "## Allowed edit surfaces\n."],
+			["gentle-ai-worker", "bare repository root", "## Allowed edit surfaces\n./"],
+			["gentle-ai-worker", "normalized bare repository root", "## Allowed edit surfaces\n.//"],
+			["gentle-ai-worker", "equivalent normalized bare repository root", "## Allowed edit surfaces\n././/"],
+			["worker", "generic writer missing", "Implement the requested change."],
+		]) {
+			const writerDispatch = { agent, task, mode: "task" };
+			const writerResult = await toolHook(
+				{ toolName: "subagent_run", input: writerDispatch },
+				createCtx(toolCwd),
+			);
+			assert.equal(writerResult?.block, true, `${label} writer scope must be blocked before dispatch`);
+			assert.match(writerResult?.reason ?? "", /derive|map/i);
+			assert.match(writerResult?.reason ?? "", /relaunch/i);
+			assert.match(writerResult?.reason ?? "", /do not ask.*human.*paths or globs/i);
+			assert.equal(writerDispatch.task, task, "writer guard must not mutate child input");
+		}
+
+		const scopedWriterDispatch = {
+			agent: "gentle-ai-worker",
+			task: "Implement the requested change.\n\n## Allowed edit surfaces\nextensions/gentle-ai.ts\ntests/runtime-harness.mjs",
+			mode: "task",
+		};
+		assert.equal(
+			await toolHook({ toolName: "subagent_run", input: scopedWriterDispatch }, createCtx(toolCwd)),
+			undefined,
+			"a writer may dispatch with narrow task-scoped repository-relative paths",
+		);
+		assert.equal(
+			await toolHook(
+				{
+					toolName: "subagent_run",
+					input: {
+						agent: "worker",
+						task: "Implement the requested change.",
+						context: "## Allowed edit surfaces\n- assets/orchestrator.md",
+						mode: "task",
+					},
+				},
+				createCtx(toolCwd),
+			),
+			undefined,
+			"a writer may dispatch when context carries narrow task-scoped repository-relative paths",
+		);
+		for (const [label, input] of [
+			[
+				"valid scope followed by a repository-root scope",
+				{
+					agent: "gentle-ai-worker",
+					task: "## Allowed edit surfaces\nextensions/gentle-ai.ts\n\n## Allowed edit surfaces\n.",
+					mode: "task",
+				},
+			],
+			[
+				"valid task scope plus invalid context scope",
+				{
+					agent: "gentle-ai-worker",
+					task: "## Allowed edit surfaces\nextensions/gentle-ai.ts",
+					context: "## Allowed edit surfaces\n.",
+					mode: "task",
+				},
+			],
+			[
+				"conflicting valid task and context scopes",
+				{
+					agent: "gentle-ai-worker",
+					task: "## Allowed edit surfaces\nextensions/gentle-ai.ts",
+					context: "## Allowed edit surfaces\ntests/runtime-harness.mjs",
+					mode: "task",
+				},
+			],
+		]) {
+			const writerResult = await toolHook({ toolName: "subagent_run", input }, createCtx(toolCwd));
+			assert.equal(writerResult?.block, true, `${label} must block writer dispatch`);
+		}
+		assert.equal(
+			await toolHook(
+				{
+					toolName: "subagent_run",
+					input: {
+						agent: "gentle-ai-worker",
+						task: "## Allowed edit surfaces\nextensions/gentle-ai.ts\ntests/runtime-harness.mjs\n\n## Allowed edit surfaces\n- `tests/runtime-harness.mjs`\n- `extensions/gentle-ai.ts`",
+						mode: "task",
+					},
+				},
+				createCtx(toolCwd),
+			),
+			undefined,
+			"a writer may dispatch when multiple allowed edit surface sections are compatible",
+		);
+		assert.equal(
+			await toolHook(
+				{ toolName: "subagent_run", input: { agent: "scout", task: "Map the repository.", mode: "task" } },
+				createCtx(toolCwd),
+			),
+			undefined,
+			"non-writer subagents must remain unaffected",
+		);
 		const sensitiveRead = await toolHook({ toolName: "read", input: { path: join(toolCwd, ".env.local") } }, createCtx(toolCwd));
 		assert.equal(sensitiveRead.block, true);
 		assert.match(sensitiveRead.reason, /sensitive path/);
@@ -419,20 +646,74 @@ async function run() {
 		);
 		assert.equal(needsConfirm.block, true);
 		assert.match(needsConfirm.reason, /not confirmed/);
+		assert.deepEqual(
+			emittedEvents.map(({ channel, data }) => ({
+				channel,
+				state: data.state,
+				active: data.active,
+				label: data.label,
+			})),
+			[
+				{
+					channel: "pi-permission-system:permission-request",
+					state: "waiting",
+					active: undefined,
+					label: undefined,
+				},
+				{
+					channel: "herdr:blocked",
+					state: undefined,
+					active: true,
+					label: "Guarded command confirmation",
+				},
+				{
+					channel: "pi-permission-system:permission-request",
+					state: "denied",
+					active: undefined,
+					label: undefined,
+				},
+				{
+					channel: "herdr:blocked",
+					state: undefined,
+					active: false,
+					label: undefined,
+				},
+			],
+			"guarded confirmation emits both lifecycle channels in order",
+		);
+		assert.equal(emittedEvents[0].data.requestId, emittedEvents[2].data.requestId);
+		emittedEvents.length = 0;
+		pi.events.emit("rpiv:ask-user:blocked", {
+			active: true,
+			question: "private runtime questionnaire",
+			answer: "private runtime answer",
+			path: "/private/runtime-path",
+			command: "private runtime command",
+		});
+		pi.events.emit("rpiv:ask-user:blocked", { active: true, duplicate: true });
+		pi.events.emit("rpiv:ask-user:blocked", { active: "true" });
+		pi.events.emit("rpiv:ask-user:other", { active: false });
+		pi.events.emit("rpiv:ask-user:blocked", { active: false });
+		const rpivHerdrEvents = emittedEvents.filter(({ channel }) => channel === "herdr:blocked");
+		assert.deepEqual(rpivHerdrEvents, [
+			{ channel: "herdr:blocked", data: { active: true, label: "Questionnaire awaiting input" } },
+			{ channel: "herdr:blocked", data: { active: false } },
+		]);
+		assert.doesNotMatch(JSON.stringify(rpivHerdrEvents), /private runtime/i);
+		emittedEvents.length = 0;
 		assert.equal(
 			dangerousReviewCtx.ui.notifications.length,
 			0,
-			"receipt validation must not launch or announce review actors",
+			"dangerous-command confirmation must not launch or announce review actors",
 		);
 		const commitCwd = await tempWorkspace();
 		try {
 			execFileSync("git", ["init"], { cwd: commitCwd, stdio: "ignore" });
-			const commitGate = await toolHook(
+			const deliveryResult = await toolHook(
 				{ toolName: "bash", input: { command: "git commit -m bounded tracked.txt" } },
 				createCtx(commitCwd),
 			);
-			assert.equal(commitGate.block, true);
-			assert.match(commitGate.reason, /exactly derive/i);
+			assert.equal(deliveryResult, undefined, "ordinary delivery policy, not review authority, governs commits");
 		} finally {
 			await rm(commitCwd, { recursive: true, force: true });
 		}
@@ -496,129 +777,11 @@ async function run() {
 			/Controller-owned review lineage/,
 			"a failed-closed dispatch must never inject a substituted candidate view into the lens sub-agent's task",
 		);
+		await chmod(view.root, 0o700);
 		registry.cleanup(view.token);
 	} finally {
+		restoreWorkspaceWritePermissions(candidateDriftCwd);
 		await rm(candidateDriftCwd, { recursive: true, force: true });
-	}
-
-	// Corrective v2 lifecycle settling test: the real controller must call the
-	// native evidence surface before it accepts a targeted-validation document.
-	// This is intentionally controller-level rather than a pure resolver test;
-	// the ordered call trace proves production wiring and the fail-closed gate.
-	const correctionCwd = await tempWorkspace();
-	try {
-		const { createGentleAiExtension } = await import(pathToFileURL(join(ROOT, "extensions/gentle-ai.ts")).href);
-		const { CandidateViewRegistry } = await import(pathToFileURL(join(ROOT, "lib/review-candidate-view.ts")).href);
-		gitSync(correctionCwd, "init", "-b", "main");
-		await writeFile(join(correctionCwd, "app.ts"), "export const value = 1;\n");
-		gitSync(correctionCwd, "add", "app.ts");
-		gitSync(correctionCwd, "-c", "user.name=Runtime Harness", "-c", "user.email=runtime-harness@example.invalid", "commit", "-m", "base");
-		await writeFile(join(correctionCwd, "app.ts"), "export const value = 2;\n");
-		const frozen = new CandidateViewRegistry().create({ contributorRoot: correctionCwd });
-		const sha = (digit) => `sha256:${digit.repeat(64)}`;
-		const repair = { schema: "gentle-ai.review-authority-repair-assessment/v1", status: "unsupported", counts: { lineages: 0, compactLineages: 0, legacyLineages: 0, events: 0, bytes: 0, eligibleCandidates: 0, unsupportedLineages: 0, conflicts: 0 }, supportedOperations: ["review/complete-fix", "review/validate-fix"], authorizationSchema: "gentle-ai.review-repair-authorization/v1" };
-		const projection = { schema: "gentle-ai.review-integration.projection/v1", kind: "current-changes", projection: "workspace", baseTree: frozen.baseTree, initialReviewTree: frozen.candidateTree, currentCandidateTree: frozen.candidateTree, pathsDigest: sha("a"), paths: frozen.paths, intendedUntracked: [], intendedUntrackedProof: sha("b"), initialSnapshotIdentity: sha("c"), currentSnapshotIdentity: sha("c") };
-		const status = { contract: "gentle-ai.review-integration/v2", applicability: "current_target", authority: { version: "compact-v2", lineageId: "runtime-correction", state: "correction_required", generation: 1, revision: sha("d") }, receipt: { status: "expected_missing" }, action: "finalize", replayability: "not_replayable", frozen: { tier: "medium", originalChangedLines: 1, correctionBudget: 1 }, targetIdentity: sha("e"), projection, repair, candidates: [], nextTransition: { kind: "collect", reasonCode: "verification_evidence_required", collect: { inputs: [{ name: "verification_evidence", schema: "gentle-ai.review-verification-evidence/v2", captureOperation: "review.capture-evidence", arguments: [{ name: "lineage", value: "runtime-correction" }] }] } }, raw: {} };
-		const validationRequest = { schema: "gentle-ai.review-targeted-validation-request/v1", requestHash: sha("f"), lineageId: "runtime-correction", expectedRevision: sha("d"), targetIdentity: sha("e"), fixFindingIds: [], projection: "workspace", correctionCandidateTree: frozen.candidateTree, correctionTargetIdentity: sha("e"), correctionPaths: frozen.paths, correctionPathsDigest: sha("a") };
-		const afterCapture = { ...status, authority: { ...status.authority, state: "validating" }, validationRequest, nextTransition: { kind: "collect", reasonCode: "targeted_validation_required", collect: { inputs: [{ name: "targeted_validation", schema: validationRequest.schema, captureOperation: "external.run_targeted_validation", arguments: [{ name: "lineage", value: "runtime-correction" }], validationRequest }] } } };
-		frozen.cleanup();
-		const calls = [];
-		let statuses = 0;
-		const nativeReviewCli = {
-			async targetStatus() { calls.push("status"); statuses += 1; return statuses === 1 ? status : afterCapture; },
-			async captureEvidence(request) { calls.push("capture-evidence"); return { schema: "gentle-ai.review-verification-evidence/v2", version: 2, lineageId: "runtime-correction", authorityRevision: sha("d"), targetIdentity: sha("e"), candidateTree: frozen.candidateTree, pathsDigest: sha("a"), paths: frozen.paths, ledgerIds: [], rawPayloadSha256: sha("1"), rawPayloadBytes: request.evidenceDocument.length, outcome: "passed", recordDigest: sha("2") }; },
-			async finalize() { calls.push("finalize"); return { lineageId: "runtime-correction", state: "approved", action: "approved", storeRevision: sha("3") }; },
-			async start() { throw new Error("not expected"); }, async validate() { throw new Error("not expected"); }, async bindSdd() { throw new Error("not expected"); }, async sddStatus() { return { ready: false }; }, async reviewStatus() { throw new Error("not expected"); },
-		};
-		const correctionPi = createPi();
-		createGentleAiExtension({ nativeReviewCli, candidateViews: new CandidateViewRegistry() })(correctionPi.pi);
-		const controller = correctionPi.tools.get("gentle_review");
-		const response = await controller.execute("runtime-correction", { operation: "finalize", lineageId: "runtime-correction", input: JSON.stringify({ final_evidence: "focused verification passed", final_verification_outcome: "passed", validation: { request_hash: "f".repeat(64), correction_ids: [], original_criteria: { passed: true, evidence: ["acceptance passes"] }, correction_regression: { passed: true, evidence: ["regression passes"] }, fix_caused_findings: [], follow_ups: [] } }) }, undefined, undefined, createCtx(correctionCwd));
-		assert.deepEqual(calls, ["status", "capture-evidence", "status", "finalize"]);
-		assert.equal(response.details.result.state, "approved");
-	} finally {
-		await rm(correctionCwd, { recursive: true, force: true });
-	}
-
-	// Task 11.2 (migrate-review-integration-v2): an unimplemented
-	// next_transition.execute.operation (e.g. a future "dispose-result") must
-	// raise a typed, named unsupported-transition-operation refusal and stop —
-	// never fall through to a generic schema-incompatible error, and never
-	// synthesize an invocation for it. Drives the real negotiated STATUS decode
-	// path (NativeReviewCliV216.targetStatus) against a stubbed adapter, so no
-	// live binary needs to advertise the unimplemented operation to prove this.
-	{
-		const capabilitiesFixturePath = join(
-			ROOT, "contracts", "review-integration", "v2", "fixtures", "capabilities.fixture.json",
-		);
-		const capabilitiesFixture = JSON.parse(await readFile(capabilitiesFixturePath, "utf8"));
-		const executableDigest = "dcc846103b16d365eaeeb9d7f289c23fc4f2897f23def1cb3fe7f05557b64705";
-		const capabilitiesBody = {
-			...capabilitiesFixture,
-			package: { ...capabilitiesFixture.package, version: "2.4.0" },
-		};
-		const statusBody = {
-			schema: "gentle-ai.review-integration.status/v3",
-			contract: "gentle-ai.review-integration/v2",
-			operation: "review.status",
-			applicability: "unrelated",
-			receipt: { status: "not_applicable" },
-			action: "start",
-			replayability: "not_replayable",
-			target_identity: `sha256:${"a".repeat(64)}`,
-			repair: {
-				schema: "gentle-ai.review-authority-repair-assessment/v1",
-				status: "unsupported",
-				counts: { lineages: 0, compact_lineages: 0, legacy_lineages: 0, events: 0, bytes: 0, eligible_candidates: 0, unsupported_lineages: 0, conflicts: 0 },
-				supported_operations: ["review/complete-fix", "review/validate-fix"],
-				authorization_schema: "gentle-ai.review-repair-authorization/v1",
-			},
-			projection: {
-				schema: "gentle-ai.review-integration.projection/v1",
-				kind: "current-changes",
-				projection: "workspace",
-				base_tree: "b".repeat(40),
-				initial_review_tree: "b".repeat(40),
-				current_candidate_tree: "b".repeat(40),
-				paths_digest: `sha256:${"a".repeat(64)}`,
-				paths: [],
-				intended_untracked: [],
-				intended_untracked_proof: `sha256:${"a".repeat(64)}`,
-				initial_snapshot_identity: `sha256:${"a".repeat(64)}`,
-				current_snapshot_identity: `sha256:${"a".repeat(64)}`,
-			},
-			candidates: [],
-			next_transition: {
-				kind: "execute",
-				reason_code: "disposable_result_pending",
-				execute: {
-					operation: "review.dispose-result",
-					arguments: [],
-					preconditions: [],
-					binding: { target_identity: `sha256:${"a".repeat(64)}` },
-				},
-			},
-		};
-		const calls = [];
-		const adapter = async (request) => {
-			calls.push(request.arguments);
-			const body = calls.length === 1 ? capabilitiesBody : statusBody;
-			return { stdout: JSON.stringify(body), stderr: "", exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false };
-		};
-		const client = new NativeReviewCliV216(
-			adapter, "/package/.gentle-ai/gentle-ai", 30_000, 1024 * 1024,
-			async () => undefined, () => executableDigest,
-		);
-		let thrown;
-		try {
-			await client.targetStatus({ cwd: "/repo" });
-		} catch (error) {
-			thrown = error;
-		}
-		assert.ok(thrown instanceof NativeReviewCliError, "an unimplemented next_transition.execute.operation must raise a typed NativeReviewCliError");
-		assert.equal(thrown.code, NATIVE_REVIEW_ERROR_CODE.UNSUPPORTED_TRANSITION_OPERATION);
-		assert.match(thrown.message, /review\.dispose-result/, "the refusal must name the specific unimplemented operation");
-		assert.equal(calls.length, 2, "capabilities negotiation plus one STATUS call — never a third call synthesizing the unimplemented operation");
 	}
 
 	const bannerCwd = await tempWorkspace();
@@ -925,17 +1088,13 @@ async function run() {
 		assert.equal(existsSync(join(globalAgentHome, "agents", "sdd-sync.md")), true);
 		assert.equal(existsSync(join(globalAgentHome, "gentle-ai", "support", "sdd-status-contract.md")), true);
 		assert.equal(existsSync(join(globalAgentHome, "chains", "sdd-full.chain.md")), true);
-		assert.equal(ctx.ui.selections.length, 3);
-		assert.equal(ctx.ui.selections[0].label, "SDD execution mode");
-		assert.equal(ctx.ui.selections[1].label, "SDD artifact store");
-		assert.deepEqual(ctx.ui.selections[1].options, ["openspec"]);
-		assert.equal(ctx.ui.selections[2].label, "SDD PR chaining");
-		assert.match(ctx.ui.notifications.at(-1).message, /Preference source: user prompt/);
+		assert.equal(ctx.ui.selections.length, 0, "automatic SDD triggers must not render confirmation-only selectors");
+		assert.match(ctx.ui.notifications.at(-1).message, /Preference source: canonical default or persisted preference/);
 		assert.deepEqual(
 			await inputHook({ text: "please use sdd for this change", source: "interactive" }, ctx),
 			{ action: "continue" },
 		);
-		assert.equal(ctx.ui.selections.length, 3, "natural SDD trigger should reuse session choices");
+		assert.equal(ctx.ui.selections.length, 0, "natural SDD triggers reuse preferences without prompts");
 		assert.deepEqual(
 			await inputHook({ text: "/sdd", source: "interactive" }, ctx),
 			{ action: "continue" },
@@ -948,7 +1107,7 @@ async function run() {
 			await inputHook({ text: "/sdd:plan", source: "interactive" }, ctx),
 			{ action: "continue" },
 		);
-		assert.equal(ctx.ui.selections.length, 3);
+		assert.equal(ctx.ui.selections.length, 0, "slash SDD triggers use automatic defaults without prompts");
 
 		assert.deepEqual(
 			await inputHook({ text: "/sdd-plan this change", source: "interactive" }, ctx),
@@ -976,19 +1135,18 @@ async function run() {
 				"global SDD model routing must be materialized in agent frontmatter, not project settings overrides",
 			);
 		}
-		assert.equal(ctx.ui.selections.length, 3);
-		assert.deepEqual(ctx.ui.selections[1].options, ["openspec"]);
-		assert.match(ctx.ui.notifications.at(-1).message, /SDD preflight complete/);
+		assert.equal(ctx.ui.selections.length, 0, "automatic SDD routing must not render confirmation-only selectors");
+		assert.match(ctx.ui.notifications.at(-1).message, /Preference source: canonical default or persisted preference/);
 		await commands.get("gentle:status").handler("", ctx);
 		assert.match(ctx.ui.notifications.at(-1).message, /Global SDD assets stale: 0 file\(s\)/);
 		assert.doesNotMatch(ctx.ui.notifications.at(-1).message, /install-sdd --force/);
 
 		await inputHook({ text: "/sdd-plan another change", source: "interactive" }, ctx);
-		assert.equal(ctx.ui.selections.length, 3, "preflight should run only once per session");
+		assert.equal(ctx.ui.selections.length, 0, "automatic preflight should remain prompt-free for the session");
 		const promptHook = hooks.get("before_agent_start")[0];
 		const promptResult = await promptHook({ systemPrompt: "base" }, ctx);
 		assert.match(promptResult.systemPrompt, /SDD Session Preflight/);
-		assert.match(promptResult.systemPrompt, /Execution mode: interactive/);
+		assert.match(promptResult.systemPrompt, /Execution mode: auto/);
 		const workerPromptResult = await promptHook(
 			{ agentName: "worker", systemPrompt: "worker base" },
 			ctx,
@@ -1013,7 +1171,7 @@ async function run() {
 			});
 			assert.equal(existsSync(join(slashSddCwd, ".pi", "agents", "sdd-apply.md")), false);
 			assert.equal(existsSync(join(globalAgentHome, "agents", "sdd-apply.md")), true);
-			assert.equal(ctx.ui.selections.length, 3, `${text} should run canonical preflight`);
+			assert.equal(ctx.ui.selections.length, 0, `${text} should use automatic preflight without selectors`);
 		} finally {
 			await rm(slashSddCwd, { recursive: true, force: true });
 		}
@@ -1025,9 +1183,11 @@ async function run() {
 		await commands.get("gentle:sdd-preflight").handler("", ctx);
 		assert.equal(existsSync(join(commandSddCwd, ".pi", "agents", "sdd-apply.md")), false);
 		assert.equal(existsSync(join(globalAgentHome, "agents", "sdd-apply.md")), true);
-		assert.equal(ctx.ui.selections.length, 3);
+		assert.equal(ctx.ui.selections.length, 2, "explicit preflight prompts intentional choice fields");
+		assert.equal(ctx.ui.selections.some(({ label }) => label === "SDD artifact store"), false, "one-option artifact store must be elided");
+		assert.match(ctx.ui.notifications.at(-1).message, /Preference source: explicit session choice/);
 		await commands.get("gentle:sdd-preflight").handler("", ctx);
-		assert.equal(ctx.ui.selections.length, 3, "manual preflight command should reuse session choices");
+		assert.equal(ctx.ui.selections.length, 4, "explicit preflight remains an intentional re-prompt");
 	} finally {
 		await rm(commandSddCwd, { recursive: true, force: true });
 	}
@@ -1046,7 +1206,7 @@ async function run() {
 		assert.equal(existsSync(join(sddAgentGuardCwd, ".pi", "chains", "sdd-full.chain.md")), false);
 		assert.equal(existsSync(join(globalAgentHome, "agents", "sdd-apply.md")), true);
 		assert.equal(existsSync(join(globalAgentHome, "chains", "sdd-full.chain.md")), true);
-		assert.equal(ctx.ui.selections.length, 3);
+		assert.equal(ctx.ui.selections.length, 0, "automatic SDD-agent startup must not render selectors");
 		assert.match(promptResult.systemPrompt, /SDD Session Preflight/);
 		assert.doesNotMatch(
 			promptResult.systemPrompt,
@@ -1067,7 +1227,7 @@ async function run() {
 			},
 			ctx,
 		);
-		assert.equal(ctx.ui.selections.length, 3, "SDD agent guard should reuse session choices");
+		assert.equal(ctx.ui.selections.length, 0, "SDD-agent startup should reuse automatic preferences");
 		assert.doesNotMatch(
 			reusedPromptResult.systemPrompt,
 			/el Gentleman Identity and Harness/,
@@ -1089,7 +1249,7 @@ async function run() {
 			ctx,
 		);
 		assert.match(promptResult.systemPrompt, /SDD Session Preflight/);
-		assert.match(promptResult.systemPrompt, /No interactive UI was available/);
+		assert.match(promptResult.systemPrompt, /canonical defaults or persisted choices/);
 		assert.equal(ctx.ui.selections.length, 0);
 		assert.equal(existsSync(join(noUiSddAgentCwd, ".pi", "agents", "sdd-apply.md")), false);
 		assert.equal(existsSync(join(globalAgentHome, "agents", "sdd-apply.md")), true);
@@ -1115,7 +1275,7 @@ async function run() {
 		pi.setActiveTools(["read", "bash", "edit", "write", "mem_save"]);
 		const ctx = createCtx(engramSddCwd, true, "engram-session");
 		await commands.get("gentle:sdd-preflight").handler("", ctx);
-		assert.deepEqual(ctx.ui.selections[1].options, ["openspec", "engram", "both"]);
+		assert.deepEqual(ctx.ui.selections[1].options, ["openspec", "engram", "hybrid"]);
 	} finally {
 		pi.setActiveTools(["read", "bash", "edit", "write"]);
 		await rm(engramSddCwd, { recursive: true, force: true });
@@ -1166,7 +1326,7 @@ async function run() {
 		pi.setActiveTools(["read", "bash", "edit", "write", "mem_save"]);
 		const ctx = createCtx(bothSddInitCwd, true, "both-sdd-init-session");
 		ctx.ui.select = async (label, options) => {
-			if (label === "SDD artifact store") return "both";
+			if (label === "SDD artifact store") return "hybrid";
 			return options[0];
 		};
 		await commands.get("gentle:sdd-preflight").handler("", ctx);
@@ -1202,7 +1362,7 @@ async function run() {
 		pi.setActiveTools(["read", "bash", "edit", "write", "engram_mem_save"]);
 		const ctx = createCtx(directEngramToolCwd, true, "direct-engram-session");
 		await commands.get("gentle:sdd-preflight").handler("", ctx);
-		assert.deepEqual(ctx.ui.selections[1].options, ["openspec"]);
+		assert.equal(ctx.ui.selections.some(({ label }) => label === "SDD artifact store"), false, "unrecognized Engram capability must elide the artifact selector");
 	} finally {
 		pi.setActiveTools(["read", "bash", "edit", "write"]);
 		await rm(directEngramToolCwd, { recursive: true, force: true });
@@ -1260,12 +1420,12 @@ async function run() {
 		assert.equal(existsSync(join(globalAgentHome, "agents", "sdd-sync.md")), true);
 		assert.equal(existsSync(join(globalAgentHome, "gentle-ai", "support", "sdd-status-contract.md")), true);
 		assert.equal(existsSync(join(globalAgentHome, "chains", "sdd-full.chain.md")), true);
-		assert.equal(ctx.ui.selections.length, 3);
+		assert.equal(ctx.ui.selections.length, 0, "sdd-init uses automatic preflight defaults");
 		assert.match(ctx.ui.notifications[0].message, /SDD preflight complete/);
 		assert.match(ctx.ui.notifications.at(-1).message, /Wrote openspec\/config\.yaml/);
 
 		await commands.get("gentle:sdd-preflight").handler("", ctx);
-		assert.equal(ctx.ui.selections.length, 3, "/sdd-init preflight should be reused by later manual preflight");
+		assert.equal(ctx.ui.selections.length, 2, "explicit preflight prompts after automatic sdd-init");
 	} finally {
 		await rm(sddCwd, { recursive: true, force: true });
 	}

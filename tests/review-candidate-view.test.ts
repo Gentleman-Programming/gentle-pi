@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -351,6 +353,66 @@ test("candidate view materializes exact tracked and initially-untracked content 
 	view.cleanup();
 });
 
+test("candidate view preserves staged additions with explicit intended-untracked selection in its private index", (t) => {
+	const contributorRoot = repository(t);
+	writeFileSync(join(contributorRoot, "tracked.txt"), "tracked selection\n");
+	writeFileSync(join(contributorRoot, "staged-addition.txt"), "staged addition\n");
+	git(contributorRoot, "add", "staged-addition.txt");
+	git(contributorRoot, "update-index", "--split-index");
+	writeFileSync(join(contributorRoot, "selected.txt"), "selected\n");
+	writeFileSync(join(contributorRoot, "excluded.txt"), "excluded\n");
+	const indexBefore = readFileSync(join(contributorRoot, ".git", "index"));
+	const all = createCandidateView({ contributorRoot });
+	const excluded = createCandidateView({ contributorRoot, intendedUntracked: [] });
+	const selected = createCandidateView({ contributorRoot, intendedUntracked: ["selected.txt"] });
+	try {
+		assert.deepEqual(all.paths, ["excluded.txt", "selected.txt", "staged-addition.txt", "tracked.txt"]);
+		assert.deepEqual(excluded.paths, ["staged-addition.txt", "tracked.txt"]);
+		assert.deepEqual(selected.paths, ["selected.txt", "staged-addition.txt", "tracked.txt"]);
+		assert.equal(readFileSync(join(selected.root, "staged-addition.txt"), "utf8"), "staged addition\n");
+		assert.equal(lstatSync(join(selected.root, "excluded.txt"), { throwIfNoEntry: false }), undefined);
+		assert.deepEqual(readFileSync(join(contributorRoot, ".git", "index")), indexBefore);
+	} finally {
+		all.cleanup();
+		excluded.cleanup();
+		selected.cleanup();
+	}
+});
+
+test("candidate view skips a shared index that disappears during stat or copy", (t) => {
+	const contributorRoot = repository(t);
+	writeFileSync(join(contributorRoot, "tracked.txt"), "tracked selection\n");
+	writeFileSync(join(contributorRoot, "staged-addition.txt"), "staged addition\n");
+	git(contributorRoot, "add", "staged-addition.txt");
+	git(contributorRoot, "update-index", "--split-index");
+	const sharedIndexName = readdirSync(join(contributorRoot, ".git")).find((name) => /^sharedindex\.[0-9a-f]+$/.test(name));
+	assert.ok(sharedIndexName, "split index must create a shared index fixture");
+	const sharedIndexPath = join(contributorRoot, ".git", sharedIndexName);
+	for (const phase of ["stat", "copy"] as const) {
+		const originalLstatSync = fs.lstatSync;
+		const originalCopyFileSync = fs.copyFileSync;
+		fs.lstatSync = ((path: string | Buffer, options?: Parameters<typeof lstatSync>[1]) => {
+			if (phase === "stat" && path === sharedIndexPath) throw Object.assign(new Error("shared index disappeared"), { code: "ENOENT" });
+			return originalLstatSync(path, options);
+		}) as typeof fs.lstatSync;
+		fs.copyFileSync = ((source: string | Buffer, destination: string | Buffer) => {
+			if (phase === "copy" && source === sharedIndexPath) throw Object.assign(new Error("shared index disappeared"), { code: "ENOENT" });
+			return originalCopyFileSync(source, destination);
+		}) as typeof fs.copyFileSync;
+		syncBuiltinESMExports();
+		let view: ReturnType<typeof createCandidateView> | undefined;
+		try {
+			view = createCandidateView({ contributorRoot, intendedUntracked: [] });
+			assert.equal(view.paths.includes("staged-addition.txt"), true, phase);
+		} finally {
+			fs.lstatSync = originalLstatSync;
+			fs.copyFileSync = originalCopyFileSync;
+			syncBuiltinESMExports();
+			view?.cleanup();
+		}
+	}
+});
+
 test("candidate view recursively protects nested content and worktree metadata, and rejects injected untracked entries", (t) => {
 	const contributorRoot = repository(t);
 	mkdirSync(join(contributorRoot, "nested", "deeper"), { recursive: true });
@@ -395,6 +457,56 @@ test("candidate view registry rejects unsafe, moved, writable, stale, and unsele
 	registry.cleanup(view.token);
 });
 
+test("candidate registry isolates replay, projection, current, and cleanup state by target root plus lineage", (t) => {
+	const rootA = repository(t);
+	const rootB = repository(t);
+	writeFileSync(join(rootA, "tracked.txt"), "candidate A\n");
+	writeFileSync(join(rootB, "tracked.txt"), "candidate B\n");
+	const registry = new CandidateViewRegistry();
+	t.after(() => registry.cleanupAll());
+	const viewA = registry.createOrReuse({ contributorRoot: rootA, replayKey: "same-replay" });
+	const viewB = registry.createOrReuse({ contributorRoot: rootB, replayKey: "same-replay" });
+	assert.notEqual(viewA.token, viewB.token);
+	registry.bindCurrent({ token: viewA.token, lineageId: "same-lineage", selectedLenses: ["review-reliability"] });
+	registry.bindCurrent({ token: viewB.token, lineageId: "same-lineage", selectedLenses: ["review-reliability"] });
+	assert.equal(registry.resolveForLens("same-lineage", "review-reliability", rootA).root, viewA.root);
+	assert.equal(registry.resolveForLens("same-lineage", "review-reliability", rootB).root, viewB.root);
+	assert.equal(registry.resolveForFinalize("same-lineage", rootA).root, viewA.root);
+	assert.equal(registry.resolveForFinalize("same-lineage", rootB).root, viewB.root);
+	writeFileSync(join(rootA, "tracked.txt"), "corrected A\n");
+	writeFileSync(join(rootB, "tracked.txt"), "corrected B\n");
+	const correctedA = registry.createCorrected("same-lineage", rootA, "same-correction-replay");
+	const correctedB = registry.createCorrected("same-lineage", rootB, "same-correction-replay");
+	assert.notEqual(correctedA.token, correctedB.token);
+	registry.promoteCorrected("same-lineage", correctedA.token, rootA);
+	registry.promoteCorrected("same-lineage", correctedB.token, rootB);
+	assert.equal(registry.resolveForFinalize("same-lineage", rootA).root, correctedA.root);
+	assert.equal(registry.resolveForFinalize("same-lineage", rootB).root, correctedB.root);
+	assert.throws(() => registry.resolveForLens("same-lineage", "review-reliability"), /workspaceRoot/);
+	assert.throws(() => registry.resolveWorkspaceRoot("same-lineage"), /workspaceRoot/);
+	registry.cleanupTerminal("same-lineage", "approved", rootB);
+	assert.equal(registry.resolveWorkspaceRoot("same-lineage"), realpathSync(rootA));
+	assert.equal(registry.resolveForFinalize("same-lineage", rootA).root, correctedA.root);
+	registry.cleanupTerminal("same-lineage", "approved", rootA);
+});
+
+test("candidate registry rejects a lineage target whose authorized symlink was replaced", (t) => {
+	const root = repository(t);
+	const replacement = repository(t);
+	const alias = join(tmpdir(), `gentle-pi-candidate-alias-${process.pid}-${Date.now()}`);
+	t.after(() => rmSync(alias, { recursive: true, force: true }));
+	symlinkSync(root, alias, "dir");
+	const registry = new CandidateViewRegistry();
+	t.after(() => registry.cleanupAll());
+	const view = registry.create({ contributorRoot: root });
+	registry.bindCurrent({ token: view.token, lineageId: "symlink-lineage", selectedLenses: ["review-reliability"] });
+	assert.doesNotThrow(() => registry.assertWorkspaceRoot("symlink-lineage", alias));
+	rmSync(alias, { recursive: true, force: true });
+	symlinkSync(replacement, alias, "dir");
+	assert.throws(() => registry.assertWorkspaceRoot("symlink-lineage", alias), /workspaceRoot|bound to/);
+	registry.cleanupTerminal("symlink-lineage", "approved", root);
+});
+
 test("review subagent dispatch rejects missing candidate views and uses the explicitly current overlapping lens", (t) => {
 	const missing = new CandidateViewRegistry();
 	assert.throws(
@@ -431,6 +543,16 @@ test("candidate view cleanup is confined and idempotent", (t) => {
 	registry.cleanup(view.token);
 	registry.cleanup(view.token);
 	assert.equal(readFileSync(outside, "utf8"), "preserve\n");
+	assert.equal(lstatSync(view.root, { throwIfNoEntry: false }), undefined);
+});
+
+test("candidate cleanup removes a readonly root when Git reports success without deleting it", (t) => {
+	const registry = new CandidateViewRegistry((file, arguments_, options) =>
+		arguments_[0] === "worktree" && arguments_[1] === "remove" ? "" : execFileSync(file, arguments_, options));
+	const view = registry.create({ contributorRoot: repository(t) });
+	assert.equal(lstatSync(view.root).mode & 0o222, 0);
+	view.cleanup();
+	view.cleanup();
 	assert.equal(lstatSync(view.root, { throwIfNoEntry: false }), undefined);
 });
 
@@ -832,6 +954,30 @@ test("candidate views freeze gitlinks as immutable metadata without materializin
 	}
 });
 
+test("native projection reconstruction retains its selected untracked subset", (t) => {
+	const contributorRoot = repository(t);
+	writeFileSync(join(contributorRoot, "tracked.txt"), "tracked selection\n");
+	writeFileSync(join(contributorRoot, "selected.txt"), "selected\n");
+	writeFileSync(join(contributorRoot, "excluded.txt"), "excluded\n");
+	const source = new CandidateViewRegistry();
+	const selected = source.create({ contributorRoot, intendedUntracked: ["selected.txt"] });
+	const restored = new CandidateViewRegistry();
+	try {
+		const view = restored.restoreForFinalizeFromNative("selected-native", contributorRoot, {
+			baseTree: selected.baseTree,
+			currentCandidateTree: selected.candidateTree,
+			paths: selected.paths,
+			intendedUntracked: ["selected.txt"],
+			projection: "workspace",
+		});
+		assert.deepEqual(view.paths, ["selected.txt", "tracked.txt"]);
+		assert.equal(lstatSync(join(view.root, "excluded.txt"), { throwIfNoEntry: false }), undefined);
+		view.cleanup();
+	} finally {
+		selected.cleanup();
+	}
+});
+
 test("native projections reconstruct symlink, intended-untracked, and gitlink identity from Git objects", (t) => {
 	const contributorRoot = repository(t);
 	const baseTree = git(contributorRoot, "rev-parse", "HEAD^{tree}");
@@ -958,6 +1104,229 @@ test("fresh registries restore only one exact authoritative reviewing candidate 
 		const resolved = restored.resolveCurrentForLens("review-reliability");
 		restored.cleanup(resolved.token);
 	}
+});
+
+interface CandidateViewRegistryInternals {
+	records: Map<string, unknown>;
+	bindRecord: (token: string, lineageId: string, selectedLenses: readonly unknown[]) => unknown;
+}
+
+function bindingFailureRegistry(t: test.TestContext): { registry: CandidateViewRegistry; materializedRoot: () => string | undefined; internals: CandidateViewRegistryInternals } {
+	let root: string | undefined;
+	const registry = new CandidateViewRegistry((file, arguments_, options) => {
+		if (arguments_[0] === "worktree" && arguments_[1] === "add") root = arguments_[arguments_.indexOf("--no-checkout") + 1];
+		return execFileSync(file, arguments_, options);
+	});
+	t.after(() => registry.cleanupAll());
+	return { registry, materializedRoot: () => root, internals: registry as unknown as CandidateViewRegistryInternals };
+}
+
+test("failed authoritative restores remove the inserted registry record and readonly worktree", (t) => {
+	const contributorRoot = repository(t);
+	writeFileSync(join(contributorRoot, "tracked.txt"), "reviewing\n");
+	const source = new CandidateViewRegistry();
+	const frozen = source.create({ contributorRoot });
+	const state = {
+		lineageId: "restore-bind-failure",
+		contributorRoot,
+		baseCommit: frozen.baseCommit,
+		baseTree: frozen.baseTree,
+		candidateTree: frozen.candidateTree,
+		paths: frozen.paths,
+		modes: frozen.modes,
+		deletedPaths: frozen.deletedPaths,
+		selectedLenses: ["review-reliability"],
+	};
+	const { registry, materializedRoot, internals } = bindingFailureRegistry(t);
+	const originalBindRecord = internals.bindRecord;
+	internals.bindRecord = (token) => {
+		assert.equal(internals.records.has(token), true, "the failure must occur after insertion");
+		throw new CandidateViewError("test-only bind failure");
+	};
+	try {
+		assert.throws(
+			() => registry.restoreCurrentFromAuthoritativeReviewingStates(contributorRoot, [state]),
+			CandidateViewError,
+		);
+	} finally {
+		internals.bindRecord = originalBindRecord;
+		source.cleanup(frozen.token);
+	}
+	assert.equal(internals.records.size, 0);
+	assert.ok(materializedRoot(), "the restore must have created a candidate worktree");
+	assert.equal(existsSync(materializedRoot()!), false);
+});
+
+test("failed finalize restores remove the inserted registry record and readonly worktree", (t) => {
+	const contributorRoot = repository(t);
+	writeFileSync(join(contributorRoot, "tracked.txt"), "candidate\n");
+	const source = new CandidateViewRegistry();
+	const frozen = source.create({ contributorRoot });
+	const { registry, materializedRoot, internals } = bindingFailureRegistry(t);
+	const originalBindRecord = internals.bindRecord;
+	internals.bindRecord = (token) => {
+		assert.equal(internals.records.has(token), true, "the failure must occur after insertion");
+		throw new CandidateViewError("test-only bind failure");
+	};
+	try {
+		assert.throws(
+			() => registry.restoreForFinalizeFromNative("finalize-bind-failure", contributorRoot, {
+				baseTree: frozen.baseTree,
+				currentCandidateTree: frozen.candidateTree,
+				paths: frozen.paths,
+				intendedUntracked: [],
+				projection: "workspace",
+			}),
+			CandidateViewError,
+		);
+	} finally {
+		internals.bindRecord = originalBindRecord;
+		source.cleanup(frozen.token);
+	}
+	assert.equal(internals.records.size, 0);
+	assert.ok(materializedRoot(), "the restore must have created a candidate worktree");
+	assert.equal(existsSync(materializedRoot()!), false);
+});
+
+function materializationFailureRegistry(t: test.TestContext, failureAt: number): { registry: CandidateViewRegistry; roots: () => readonly string[]; removalAttempts: (root: string) => number; internals: CandidateViewRegistryInternals } {
+	const roots: string[] = [];
+	const removalAttempts = new Map<string, number>();
+	let materializations = 0;
+	let failPending = true;
+	const registry = new CandidateViewRegistry((file, arguments_, options) => {
+		if (arguments_[0] === "worktree" && arguments_[1] === "add") {
+			const root = arguments_[arguments_.indexOf("--no-checkout") + 1];
+			assert.equal(typeof root, "string", "worktree add must name its candidate root");
+			roots.push(root);
+			materializations += 1;
+		}
+		if (arguments_[0] === "worktree" && arguments_[1] === "remove") {
+			const root = arguments_[arguments_.indexOf("--force") + 1];
+			assert.equal(typeof root, "string", "worktree remove must name its candidate root");
+			removalAttempts.set(root, (removalAttempts.get(root) ?? 0) + 1);
+		}
+		if (failPending && materializations === failureAt && options.cwd === roots.at(-1) && arguments_[0] === "read-tree") {
+			failPending = false;
+			throw Object.assign(new Error("test-only materialization failure"), { status: 1 });
+		}
+		return execFileSync(file, arguments_, options);
+	});
+	t.after(() => registry.cleanupAll());
+	return { registry, roots: () => roots, removalAttempts: (root) => removalAttempts.get(root) ?? 0, internals: registry as unknown as CandidateViewRegistryInternals };
+}
+
+test("finalize restore removes a registered projection when its first materialization fails and retries cleanly", (t) => {
+	const contributorRoot = repository(t);
+	writeFileSync(join(contributorRoot, "tracked.txt"), "candidate\n");
+	const source = new CandidateViewRegistry();
+	const frozen = source.create({ contributorRoot });
+	const lineageId = "finalize-materialization-failure";
+	const descriptor = {
+		baseTree: frozen.baseTree,
+		currentCandidateTree: frozen.candidateTree,
+		paths: frozen.paths,
+		intendedUntracked: [],
+		projection: "workspace" as const,
+	};
+	const baselineWorktrees = git(contributorRoot, "worktree", "list", "--porcelain");
+	const { registry, roots, internals } = materializationFailureRegistry(t, 1);
+	try {
+		assert.throws(() => registry.restoreForFinalizeFromNative(lineageId, contributorRoot, descriptor), CandidateViewError);
+		assert.equal(registry.hasProjection(lineageId, contributorRoot), false);
+		assert.equal(internals.records.size, 0);
+		assert.equal(git(contributorRoot, "worktree", "list", "--porcelain"), baselineWorktrees);
+		assert.equal(existsSync(roots()[0]!), false);
+
+		const restored = registry.restoreForFinalizeFromNative(lineageId, contributorRoot, descriptor);
+		assert.equal(registry.resolveForFinalize(lineageId, contributorRoot).token, restored.token);
+		registry.cleanup(restored.token);
+	} finally {
+		source.cleanup(frozen.token);
+	}
+});
+
+test("finalize restore does not re-remove its first fallback record when the empty-untracked retry materialization fails", (t) => {
+	const contributorRoot = repository(t);
+	writeFileSync(join(contributorRoot, "tracked.txt"), "candidate\n");
+	writeFileSync(join(contributorRoot, "excluded.txt"), "excluded\n");
+	const source = new CandidateViewRegistry();
+	const frozen = source.create({ contributorRoot, intendedUntracked: [] });
+	const lineageId = "finalize-fallback-materialization-failure";
+	const descriptor = {
+		baseTree: frozen.baseTree,
+		currentCandidateTree: frozen.candidateTree,
+		paths: frozen.paths,
+		intendedUntracked: [],
+		projection: "workspace" as const,
+	};
+	const baselineWorktrees = git(contributorRoot, "worktree", "list", "--porcelain");
+	const { registry, roots, removalAttempts, internals } = materializationFailureRegistry(t, 2);
+	try {
+		assert.throws(() => registry.restoreForFinalizeFromNative(lineageId, contributorRoot, descriptor), CandidateViewError);
+		assert.equal(removalAttempts(roots()[0]!), 1, "the first mismatched record must receive exactly one physical worktree removal");
+		assert.equal(registry.hasProjection(lineageId, contributorRoot), false);
+		assert.equal(internals.records.size, 0);
+		assert.equal(git(contributorRoot, "worktree", "list", "--porcelain"), baselineWorktrees);
+		assert.equal(existsSync(roots()[0]!), false);
+		assert.equal(existsSync(roots()[1]!), false);
+
+		const restored = registry.restoreForFinalizeFromNative(lineageId, contributorRoot, descriptor);
+		assert.equal(registry.resolveForFinalize(lineageId, contributorRoot).token, restored.token);
+		registry.cleanup(restored.token);
+	} finally {
+		source.cleanup(frozen.token);
+	}
+});
+
+test("dispatch restore removes a registered projection when materialization fails and records the hydration failure before retrying", (t) => {
+	const contributorRoot = repository(t);
+	writeFileSync(join(contributorRoot, "tracked.txt"), "candidate\n");
+	const source = new CandidateViewRegistry();
+	const frozen = source.create({ contributorRoot });
+	const lineageId = "dispatch-materialization-failure";
+	const descriptor = {
+		baseTree: frozen.baseTree,
+		currentCandidateTree: frozen.candidateTree,
+		paths: frozen.paths,
+		intendedUntracked: [],
+		projection: "workspace" as const,
+	};
+	const baselineWorktrees = git(contributorRoot, "worktree", "list", "--porcelain");
+	const { registry, roots, internals } = materializationFailureRegistry(t, 1);
+	try {
+		let failure: unknown;
+		try {
+			registry.restoreCurrentForDispatchFromNative(lineageId, contributorRoot, descriptor, ["review-reliability"]);
+		} catch (error) {
+			failure = error;
+		}
+		assert.ok(failure instanceof CandidateViewError);
+		assert.equal(registry.hasProjection(lineageId, contributorRoot), false);
+		assert.equal(registry.hasCurrentBinding(contributorRoot), false);
+		assert.equal(internals.records.size, 0);
+		assert.equal(git(contributorRoot, "worktree", "list", "--porcelain"), baselineWorktrees);
+		assert.equal(existsSync(roots()[0]!), false);
+		assert.deepEqual(registry.lastDispatchHydrationFailure(contributorRoot), {
+			lineageId,
+			reason: failure.reason,
+			message: failure.message,
+		});
+
+		registry.restoreCurrentForDispatchFromNative(lineageId, contributorRoot, descriptor, ["review-reliability"]);
+		const restored = registry.resolveCurrentForLens("review-reliability", contributorRoot);
+		assert.equal(registry.lastDispatchHydrationFailure(contributorRoot), undefined);
+		registry.cleanup(restored.token);
+	} finally {
+		source.cleanup(frozen.token);
+	}
+});
+
+test("candidate root resolution drift is exposed as a typed candidate-view error", () => {
+	const missingRoot = join(tmpdir(), `gentle-pi-missing-root-${process.pid}-${Date.now()}`);
+	assert.throws(
+		() => new CandidateViewRegistry().hasCurrentBinding(missingRoot),
+		(error: unknown) => error instanceof CandidateViewError && error.reason === "contributor-root-unresolvable",
+	);
 });
 
 test("live candidate drift blocks dispatch before candidate text can be injected", (t) => {

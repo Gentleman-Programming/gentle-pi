@@ -2,106 +2,52 @@
 
 ## Purpose
 
-Bring gentle-ai's organic review-mode behaviors (kill switch, consent, risk-evidence presentation, empty-candidate hint) to Pi's non-interactive runtime, gated behind capability negotiation so the parity code stays inert until a compatible gentle-ai release ships.
+Keep Gentle Pi aligned with the provider-owned native review lifecycle while preserving Pi's role as a typed consumer and opaque transport adapter.
 
 ## Requirements
 
-### Requirement: Capability-gated activation
+### Requirement: Native review mode ownership
 
-The system MUST treat every organic-parity behavior (kill-switch consultation, native consent, `risk_evidence` presentation, empty-candidate hint) as inert unless `NATIVE_CLI_CONTRACTS` for the negotiated gentle-ai version reports the corresponding capability key (`mode`, `riskEvidence`, `hint`, `delivery`) as `true`. Every shipped `NATIVE_CLI_CONTRACTS` row, including 2.1.11, MUST report these keys `false` or absent.
+The system MUST treat native review mode as user-owned provider state. Pi MUST NOT enable review mode implicitly and MUST NOT use review mode or review authority to decide a delivery command.
 
-#### Scenario: Pinned 2.1.11 stays inert
+#### Scenario: Mode is off
 
-- GIVEN the negotiated gentle-ai version is the pinned 2.1.11
-- WHEN a review flow starts
-- THEN no organic-parity behavior activates and existing review behavior is unchanged
+- GIVEN native review mode is off
+- WHEN a review lifecycle operation is considered
+- THEN Pi reports the provider-owned lifecycle state and does not create authority or enable mode
 
-#### Scenario: Future capable version activates parity
+#### Scenario: Delivery command
 
-- GIVEN a negotiated version's contract row reports `mode`, `riskEvidence`, `hint`, and `delivery` as `true`
-- WHEN a review flow starts
-- THEN the corresponding organic-parity behavior activates
+- GIVEN a commit, push, pull-request, or release command
+- WHEN the command is evaluated
+- THEN ordinary repository policy decides delivery without an RDD mode or receipt authorization check
 
-### Requirement: Kill-switch consultation
+### Requirement: Candidate-scoped provider consent
 
-Before any review flow that would consult consent or present risk evidence, the system MUST consult `review mode status` and MUST NOT proceed as if review were enabled unless status reports enabled. No code path may silently re-enable review mode once disabled; enabling review mode MUST occur only through the explicit `gentle:review-mode enable` command.
+When native START returns a consent envelope, Pi MUST present the complete provider-issued envelope losslessly, preserving its machine tokens, commands, target identity, and invocation. Pi MUST execute only the returned follow-up invocation for the explicit answer.
 
-#### Scenario: Disabled by prior decision
+#### Scenario: Consent is granted or declined
 
-- GIVEN `review mode status` reports disabled
-- WHEN a review-eligible flow runs
-- THEN the flow does not enable review mode implicitly and honors the disabled state
+- GIVEN a provider-issued consent envelope for one candidate
+- WHEN the user explicitly answers `granted` or `declined`
+- THEN Pi executes the matching exact provider invocation once for that candidate
 
-#### Scenario: Command-only re-enable
+#### Scenario: No persistent Pi latch
 
-- GIVEN review mode is disabled
-- WHEN no explicit `gentle:review-mode enable` command has run
-- THEN automation MUST NOT toggle review mode to enabled
+- GIVEN a consent outcome
+- WHEN later candidates are considered
+- THEN Pi does not use a clone-local consent latch to suppress provider-owned consent behavior
 
-### Requirement: Kill-switch command surface
+### Requirement: Opaque native transport
 
-The system MUST expose a `gentle:review-mode` command supporting `status`, `disable`, and `enable` sub-actions, each requiring explicit user invocation.
+Pi MUST relay provider-selected lifecycle transitions and provider-materialized reviewer transport without reconstructing authority, prompts, or reviewer output.
 
-#### Scenario: Status query
+#### Scenario: Materialized reviewer slot
 
-- GIVEN the user runs `gentle:review-mode status`
-- WHEN the command executes
-- THEN the current enabled/disabled state is reported without mutation
-
-#### Scenario: Explicit disable
-
-- GIVEN the user runs `gentle:review-mode disable`
-- WHEN the command executes
-- THEN review mode is recorded disabled for the current clone
-
-#### Scenario: Explicit enable (recovery path)
-
-- GIVEN the user runs `gentle:review-mode enable`
-- WHEN the command executes
-- THEN review mode is recorded enabled for the current clone
-
-### Requirement: Native two-option consent
-
-When review mode is enabled and no persisted per-clone consent latch exists, the system MUST ask the user a two-option consent question via `ctx.ui.confirm` (or the headless equivalent), presenting the native `risk_evidence` as the Why. Accepting MUST persist a per-clone (git common dir) latch that suppresses future prompts. Declining MUST NOT persist anything and MUST apply only to the current work unit.
-
-#### Scenario: First-time accept
-
-- GIVEN no consent latch exists for the current clone
-- WHEN the user accepts the consent prompt
-- THEN a per-clone latch is recorded and no further prompt occurs for this clone
-
-#### Scenario: Decline is scoped
-
-- GIVEN no consent latch exists for the current clone
-- WHEN the user declines the consent prompt
-- THEN nothing is persisted and the current work unit proceeds without the accepted behavior
-
-#### Scenario: Existing latch skips the prompt
-
-- GIVEN a persisted accept latch exists for the current clone
-- WHEN a subsequent review-eligible flow runs
-- THEN no consent prompt is shown
-
-### Requirement: Headless consent semantics
-
-When `ctx.hasUI === false`, the system MUST run the review, MUST NOT consume or persist the one-time consent question, and MUST surface a notice through Pi's logging/output channel. The system MUST NOT block on headless invocations and MUST NOT silently skip the review.
-
-#### Scenario: Headless invocation
-
-- GIVEN `ctx.hasUI` is `false` and no consent latch exists
-- WHEN a review-eligible flow runs
-- THEN the review runs, the consent question remains unconsumed, and a notice is logged
-
-### Requirement: Empty-candidate hint surfaced
-
-When the native start result reports an empty candidate with a `hint`, the system MUST surface that hint verbatim to the user rather than reporting only an empty/failure result.
-
-#### Scenario: Empty candidate with hint
-
-- GIVEN the native start result has an empty candidate and a non-empty `hint`
-- WHEN the result is rendered
-- THEN the hint text is shown to the user alongside the empty-candidate outcome
+- GIVEN a provider `review.capture-result` slot with materialize and submission inputs
+- WHEN Pi runs the host relay
+- THEN it submits untouched output only through the supplied provider submission form
 
 ## Acceptance Criteria
 
-All scenarios MUST be verifiable through automated tests against gating behavior, kill-switch state, consent persistence, headless notice emission, and hint rendering.
+Automated tests MUST cover isolated mode fixtures, candidate-scoped consent relay, opaque lifecycle/transport routing, and ordinary delivery policy.

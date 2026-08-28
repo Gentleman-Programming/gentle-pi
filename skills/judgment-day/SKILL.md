@@ -11,9 +11,11 @@ metadata:
 
 Load this skill only when the user explicitly requests Judgment Day, Judgement Day, dual/adversarial review, or an equivalent trigger. Resolve one exact target before starting.
 
-Judgment Day is a standalone developer tool: judges run whenever asked, on any runtime, and need no review transaction, runtime identity, or delivery-receipt machinery to start. It replaces ordinary 4R as the adversarial method for that target; never run both.
+Judgment Day is a standalone developer tool: judges run whenever asked, on any runtime, and need no review transaction, runtime identity, or delivery-receipt machinery to start. It neither enables nor replaces an ordinary 4R lifecycle; a separately requested ordinary review remains independent.
 
-Judgment Day starts only when explicitly requested and replaces ordinary review for that lineage.
+Judgment Day starts only when explicitly requested. It does not start, configure, or consume ordinary review for that lineage.
+
+Historical compatibility note (obsolete): Judgment Day starts only when explicitly requested and replaces ordinary review for that lineage. Current behavior is the independent lifecycle above.
 
 ## Transaction Rules
 
@@ -63,11 +65,7 @@ Each scoped fix returns candidate-tree and fix-diff evidence. It cannot mint aut
 
 ## Lifecycle Boundary
 
-A judgment issues no receipt and carries no delivery authority: it satisfies no commit, push, PR, or release gate. When the caller explicitly wants delivery authority for the same target, run the ordinary negotiated review lifecycle as its own step; a runtime that cannot uphold receipt guarantees loses the receipt, not the judgment.
-
-Pre-commit, pre-push, and PR gates validate approved receipts and exact typed targets with zero actors.
-Release from protected `main` may bypass receipt validation only when the tag targets the current immutable `origin/main` SHA, required CI for that exact SHA is successful, the remote head is rechecked before tag push, and no fresh risk evidence exists; otherwise release fails closed through native receipt validation.
-Major and post-incident releases require explicit extraordinary review even when fast-path checks pass.
+Judgment Day is independent: it creates no delivery authority, enables no ordinary review, and changes no commit, push, PR, or release policy. A separately requested ordinary review remains an independent lifecycle and cannot consume a Judgment Day result as a receipt or authority. Ordinary repository policy owns delivery.
 
 Dangerous-command safety remains independent and authoritative.
 

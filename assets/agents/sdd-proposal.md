@@ -44,6 +44,8 @@ Read your own input artifacts directly from the active backend before doing the 
 
 Inputs to read (`engram`/`both`: use the injected Engram memory read tools for the topic key, then fetch the full observation; `openspec`: read the file under `openspec/changes/{change}/`):
 - Exploration (optional): `sdd/{change}/explore`
+- Research + pre-proposal state (optional, present only when research was selected): `sdd/{change}/research` and `sdd/{change}/preproposal` (openspec: `openspec/changes/{change}/research.md`)
+- The proposer receives the confirmed pre-proposal handoff from the orchestrator and MUST NOT interview the user about those confirmed product decisions or infer consent; the orchestrator owns product discovery.
 
 Persist this phase's artifact to the active backend before returning (mandatory):
 - `engram`/`both`: call the injected Engram save tool with title and `topic_key` `"sdd/{change}/proposal"`, `type: "architecture"`, `project` from context, and `capture_prompt: false` when the tool schema supports it (omit the field if an older schema rejects it).

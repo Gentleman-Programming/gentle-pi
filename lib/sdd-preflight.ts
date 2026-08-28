@@ -23,19 +23,36 @@ function gentlePiAgentHome(): string {
 }
 
 export type SddExecutionMode = "interactive" | "auto";
+export type SddDeliveryStrategy =
+	| "ask-on-risk"
+	| "auto-chain"
+	| "single-pr"
+	| "exception-ok";
+/** @deprecated Use SddDeliveryStrategy; legacy values normalize at persistence boundaries. */
 export type SddChainedPrStrategy =
+	| SddDeliveryStrategy
 	| "auto-forecast"
 	| "ask-always"
 	| "single-pr-default"
 	| "force-chained";
+export type SddPreflightField = "executionMode" | "artifactStore" | "chainedPrStrategy" | "reviewBudgetLines";
+export const SDD_PREFLIGHT_FIELDS = ["executionMode", "artifactStore", "chainedPrStrategy", "reviewBudgetLines"] as const;
 
 export interface SddPreflightPreferences {
 	executionMode: SddExecutionMode;
 	artifactStore: SddArtifactStore;
+	/** Runtime values are canonical; legacy assignments normalize at persistence/render boundaries. */
 	chainedPrStrategy: SddChainedPrStrategy;
 	reviewBudgetLines: number;
 	engramAvailable: boolean;
 	prompted: boolean;
+	sizeExceptionAccepted?: true;
+}
+
+export interface SddPreflightResolutionOptions {
+	persisted?: Partial<SddPreflightPreferences>;
+	promptFields?: readonly SddPreflightField[];
+	acceptSizeException?: true;
 }
 
 interface SddPreflightCallbacks {
@@ -69,20 +86,83 @@ interface LegacyManagedAssetsManifest extends ManagedAssetsManifest {
 	packageVersion: string;
 }
 
-const DEFAULT_SDD_PREFLIGHT: SddPreflightPreferences = {
-	executionMode: "interactive",
+export const DEFAULT_SDD_PREFLIGHT: SddPreflightPreferences = Object.freeze({
+	executionMode: "auto",
 	artifactStore: "openspec",
-	chainedPrStrategy: "auto-forecast",
+	chainedPrStrategy: "ask-on-risk",
 	reviewBudgetLines: 400,
 	engramAvailable: false,
 	prompted: false,
-};
+});
 
 const sddPreflightBySession = new Map<string, SddPreflightPreferences>();
 const sddPreflightInFlight = new Map<string, Promise<SddPreflightPreferences>>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isSddExecutionMode(value: unknown): value is SddExecutionMode {
+	return value === "interactive" || value === "auto";
+}
+
+function isSddArtifactStore(value: unknown): value is SddArtifactStore {
+	return value === "openspec" || value === "engram" || value === "hybrid" || value === "none";
+}
+
+// normalizeSddArtifactStore accepts the canonical names and the legacy "both"
+// spelling of the dual-store mode. Operator preflight files written before the
+// rename carry "both" on disk; rejecting it would silently drop the operator's
+// choice back to the default, so it maps forward instead.
+export function normalizeSddArtifactStore(value: unknown): SddArtifactStore | undefined {
+	if (value === "both") return "hybrid";
+	return isSddArtifactStore(value) ? value : undefined;
+}
+
+function normalizeReviewBudgetValue(value: unknown): number | undefined {
+	const parsed = typeof value === "number"
+		? value
+		: typeof value === "string"
+			? Number.parseInt(value.trim(), 10)
+			: Number.NaN;
+	return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : undefined;
+}
+
+function normalizeSddStrategySelection(
+	value: unknown,
+	allowExceptionOk: boolean,
+): SddDeliveryStrategy | undefined {
+	if (value === "exception-ok") return allowExceptionOk ? value : undefined;
+	if (value === "auto-forecast" || value === "ask-always") return "ask-on-risk";
+	if (value === "single-pr-default") return "single-pr";
+	if (value === "force-chained") return "auto-chain";
+	return value === "ask-on-risk" || value === "auto-chain" || value === "single-pr"
+		? value
+		: undefined;
+}
+
+export function normalizeSddChainedPrStrategy(
+	value: unknown,
+	allowExceptionOk = false,
+): SddDeliveryStrategy {
+	return normalizeSddStrategySelection(value, allowExceptionOk) ?? "ask-on-risk";
+}
+
+function normalizedSelections(
+	value: Partial<Record<SddPreflightField, unknown>> | undefined,
+	engramAvailable: boolean,
+	allowExceptionOk: boolean,
+): Partial<Record<SddPreflightField, unknown>> {
+	if (!value) return {};
+	const result: Partial<Record<SddPreflightField, unknown>> = {};
+	if (isSddExecutionMode(value.executionMode)) result.executionMode = value.executionMode;
+	const artifactStore = normalizeSddArtifactStore(value.artifactStore);
+	if (artifactStore !== undefined && (engramAvailable || artifactStore === "openspec" || artifactStore === "none")) result.artifactStore = artifactStore;
+	const strategy = normalizeSddStrategySelection(value.chainedPrStrategy, allowExceptionOk);
+	if (strategy) result.chainedPrStrategy = strategy;
+	const reviewBudgetLines = normalizeReviewBudgetValue(value.reviewBudgetLines);
+	if (reviewBudgetLines !== undefined) result.reviewBudgetLines = reviewBudgetLines;
+	return result;
 }
 
 function emptyManagedAssetsManifest(): ManagedAssetsManifest {
@@ -273,28 +353,28 @@ export function readSddPreflightFromDisk(cwd: string): SddPreflightPreferences |
 	try {
 		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
 		if (!isRecord(parsed)) return undefined;
-		// Validate required fields to guard against stale/corrupt writes
+		// Validate required fields to guard against stale/corrupt writes.
 		const { executionMode, artifactStore, chainedPrStrategy, reviewBudgetLines, engramAvailable, prompted } = parsed;
+		// Normalize before validating: a preflight file written before the
+		// dual-store rename carries "both", and discarding it would silently
+		// drop the operator's choice back to the default.
+		const canonicalArtifactStore = normalizeSddArtifactStore(artifactStore);
 		if (
-			(executionMode !== "interactive" && executionMode !== "auto") ||
-			(artifactStore !== "openspec" && artifactStore !== "engram" && artifactStore !== "both" && artifactStore !== "none") ||
+			!isSddExecutionMode(executionMode) ||
+			canonicalArtifactStore === undefined ||
 			typeof reviewBudgetLines !== "number" ||
+			!Number.isFinite(reviewBudgetLines) ||
+			reviewBudgetLines <= 0 ||
 			typeof engramAvailable !== "boolean" ||
 			typeof prompted !== "boolean"
 		) {
 			return undefined;
 		}
-		const normalizedChain: SddChainedPrStrategy =
-			chainedPrStrategy === "ask-always" ||
-			chainedPrStrategy === "single-pr-default" ||
-			chainedPrStrategy === "force-chained"
-				? (chainedPrStrategy as SddChainedPrStrategy)
-				: "auto-forecast";
 		return {
 			executionMode,
-			artifactStore,
-			chainedPrStrategy: normalizedChain,
-			reviewBudgetLines,
+			artifactStore: canonicalArtifactStore,
+			chainedPrStrategy: normalizeSddChainedPrStrategy(chainedPrStrategy),
+			reviewBudgetLines: normalizeReviewBudgetValue(reviewBudgetLines) ?? DEFAULT_SDD_PREFLIGHT.reviewBudgetLines,
 			engramAvailable,
 			prompted,
 		};
@@ -306,8 +386,19 @@ export function readSddPreflightFromDisk(cwd: string): SddPreflightPreferences |
 export function writeSddPreflightToDisk(cwd: string, prefs: SddPreflightPreferences): void {
 	try {
 		const path = sddPreflightDiskPath(cwd);
+		const prompted = prefs.prompted === true;
+		const canonical: SddPreflightPreferences = {
+			executionMode: isSddExecutionMode(prefs.executionMode) ? prefs.executionMode : DEFAULT_SDD_PREFLIGHT.executionMode,
+			artifactStore: normalizeSddArtifactStore(prefs.artifactStore) ?? DEFAULT_SDD_PREFLIGHT.artifactStore,
+			chainedPrStrategy: normalizeSddChainedPrStrategy(prefs.chainedPrStrategy),
+			reviewBudgetLines:
+				normalizeReviewBudgetValue(prefs.reviewBudgetLines) ??
+				DEFAULT_SDD_PREFLIGHT.reviewBudgetLines,
+			engramAvailable: prefs.engramAvailable === true,
+			prompted,
+		};
 		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, JSON.stringify(prefs, null, 2));
+		writeFileSync(path, JSON.stringify(canonical, null, 2));
 	} catch {
 		// Disk write failures are non-fatal; in-memory cache is the primary store
 	}
@@ -550,56 +641,67 @@ function hasWritableEngramTool(pi: ExtensionAPI): boolean {
 	}
 }
 
-function normalizeSddReviewBudget(value: string): number {
-	const parsed = Number.parseInt(value.trim(), 10);
-	return Number.isFinite(parsed) && parsed > 0 ? parsed : 400;
-}
-
-async function collectSddPreflightPreferences(
+export async function collectSddPreflightPreferences(
 	ctx: ExtensionContext,
 	engramAvailable: boolean,
+	options: SddPreflightResolutionOptions = {},
 ): Promise<SddPreflightPreferences> {
-	if (!ctx.hasUI) return { ...DEFAULT_SDD_PREFLIGHT, engramAvailable };
-	const executionMode = await ctx.ui.select("SDD execution mode", [
-		"interactive",
-		"auto",
-	]);
-	const artifactOptions = engramAvailable
-		? ["openspec", "engram", "both"]
-		: ["openspec"];
-	const artifactStore = await ctx.ui.select("SDD artifact store", artifactOptions);
-	const chainedPrStrategy = await ctx.ui.select("SDD PR chaining", [
-		"auto-forecast",
-		"ask-always",
-		"single-pr-default",
-		"force-chained",
-	]);
-	const reviewBudgetLines = normalizeSddReviewBudget(
-		(await ctx.ui.input("SDD review budget lines", "400")) ?? "400",
-	);
+	const persistedPrompted = options.persisted?.prompted === true;
+	const allowExceptionOk = options.acceptSizeException === true;
+	const persisted = normalizedSelections(options.persisted, engramAvailable, allowExceptionOk);
+	const resolved: Partial<Record<SddPreflightField, unknown>> = { ...persisted };
+	let prompted = persistedPrompted;
+	let sizeExceptionAccepted = allowExceptionOk && persisted.chainedPrStrategy === "exception-ok";
+	const promptFields = new Set(options.promptFields ?? []);
+
+	const usePromptedValue = (
+		field: SddPreflightField,
+		value: unknown,
+	): void => {
+		const candidate = normalizedSelections({ [field]: value }, engramAvailable, allowExceptionOk);
+		if (candidate[field] !== undefined) {
+			resolved[field] = candidate[field];
+			if (field === "chainedPrStrategy" && candidate[field] === "exception-ok") sizeExceptionAccepted = true;
+			prompted = true;
+		}
+	};
+
+	const promptField = async (
+		field: SddPreflightField,
+		read: () => Promise<unknown>,
+		enabled = true,
+	): Promise<void> => {
+		if (ctx.hasUI && enabled && promptFields.has(field)) {
+			usePromptedValue(field, await read());
+		}
+	};
+	const artifactOptions = engramAvailable ? ["openspec", "engram", "hybrid"] : ["openspec"];
+	await promptField("executionMode", () => ctx.ui.select("SDD execution mode", ["interactive", "auto"]));
+	await promptField("artifactStore", () => ctx.ui.select("SDD artifact store", artifactOptions), artifactOptions.length > 1);
+	await promptField("chainedPrStrategy", () => ctx.ui.select("SDD delivery strategy", ["ask-on-risk", "auto-chain", "single-pr"]));
+	await promptField("reviewBudgetLines", () => ctx.ui.input("SDD review budget lines", String(DEFAULT_SDD_PREFLIGHT.reviewBudgetLines)));
+
+	const resolvedValue = <T>(field: SddPreflightField, fallback: T): T =>
+		(resolved[field] as T | undefined) ?? fallback;
 	return {
-		executionMode:
-			executionMode === "auto" ? "auto" : DEFAULT_SDD_PREFLIGHT.executionMode,
-		artifactStore:
-			artifactStore === "engram" || artifactStore === "both"
-				? artifactStore
-				: DEFAULT_SDD_PREFLIGHT.artifactStore,
-		chainedPrStrategy:
-			chainedPrStrategy === "ask-always" ||
-			chainedPrStrategy === "single-pr-default" ||
-			chainedPrStrategy === "force-chained"
-				? chainedPrStrategy
-				: DEFAULT_SDD_PREFLIGHT.chainedPrStrategy,
-		reviewBudgetLines,
+		executionMode: resolvedValue("executionMode", DEFAULT_SDD_PREFLIGHT.executionMode),
+		artifactStore: resolvedValue("artifactStore", DEFAULT_SDD_PREFLIGHT.artifactStore),
+		chainedPrStrategy: resolvedValue("chainedPrStrategy", DEFAULT_SDD_PREFLIGHT.chainedPrStrategy),
+		reviewBudgetLines: resolvedValue("reviewBudgetLines", DEFAULT_SDD_PREFLIGHT.reviewBudgetLines),
 		engramAvailable,
-		prompted: true,
+		prompted,
+		...(sizeExceptionAccepted ? { sizeExceptionAccepted: true as const } : {}),
 	};
 }
 
 export function renderSddPreflightPrompt(prefs: SddPreflightPreferences): string {
+	const deliveryStrategy = normalizeSddChainedPrStrategy(
+		prefs.chainedPrStrategy,
+		prefs.sizeExceptionAccepted === true,
+	);
 	const sourceLine = prefs.prompted
-		? "The user already chose these SDD preferences for this Pi session. Reuse them unless the user explicitly changes them."
-		: "No interactive UI was available for SDD preflight, so these default preferences were applied for this Pi session. Ask the user before making delivery decisions that depend on them.";
+		? "These SDD preferences are explicit current-session choices. Reuse them unless the user explicitly changes them."
+		: "These SDD preferences are canonical defaults or persisted choices. Treat them as authoritative; do not revisit dependent decisions unless a genuine human-control gate is reached.";
 	const interactiveRules =
 		prefs.executionMode === "interactive"
 			? [
@@ -615,25 +717,34 @@ export function renderSddPreflightPrompt(prefs: SddPreflightPreferences): string
 		sourceLine,
 		`- Execution mode: ${prefs.executionMode}`,
 		`- Artifact store: ${prefs.artifactStore}${prefs.engramAvailable ? "" : " (Engram unavailable in this session)"}`,
-		`- Chained PR strategy: ${prefs.chainedPrStrategy}`,
-		`- Review budget: ${prefs.reviewBudgetLines} changed lines`,
+		`- Delivery strategy: ${deliveryStrategy}`,
+		"- Delivery strategy domain: `ask-on-risk` | `auto-chain` | `single-pr` | `exception-ok`",
+		`- Review budget: ${prefs.reviewBudgetLines} changed lines (400 is the canonical threshold unless explicitly changed)`,
+		"- Chain strategy: deferred until chaining is selected.",
+		"- `exception-ok` is never inferred; it requires explicit acceptance of `size:exception`.",
 		...interactiveRules,
-		"- If task/workload forecasts conflict with these preferences, pause before sdd-apply and ask the user for a delivery decision.",
+		"- Preserve human-controlled consent, authorization, security, destructive/publishing, ambiguous-scope, and `size:exception` gates.",
+		"- When review-budget risk requires a delivery decision, use `ask-on-risk` to pause and ask; do not invent a chain strategy or an exception.",
 	].join("\n");
 }
 
 export async function ensureSddPreflight(
 	ctx: ExtensionContext,
 	callbacks: SddPreflightCallbacks,
+	resolutionOptions: SddPreflightResolutionOptions = {},
 ): Promise<SddPreflightPreferences> {
 	const sessionKey = sddPreflightSessionKey(ctx);
 	const existing = sddPreflightBySession.get(sessionKey);
-	if (existing) return existing;
+	if (existing && !(resolutionOptions.promptFields?.length ?? 0)) return existing;
 	const inFlight = sddPreflightInFlight.get(sessionKey);
-	if (inFlight) return inFlight;
+	if (inFlight && !(resolutionOptions.promptFields?.length ?? 0)) return inFlight;
 	const promise = (async () => {
 		const engramAvailable = hasWritableEngramTool(callbacks.pi);
-		const prefs = await collectSddPreflightPreferences(ctx, engramAvailable);
+		const persisted = resolutionOptions.persisted ?? readSddPreflightFromDisk(ctx.cwd);
+		const prefs = await collectSddPreflightPreferences(ctx, engramAvailable, {
+			...resolutionOptions,
+			persisted,
+		});
 		const result =
 			(await callbacks.installAssets?.(ctx.cwd)) ??
 			installSddAssets(ctx.cwd, false);
@@ -650,9 +761,9 @@ export async function ensureSddPreflight(
 					"Gentle AI SDD preflight complete.",
 					`Mode: ${prefs.executionMode}`,
 					`Artifacts: ${prefs.artifactStore}`,
-					`PR chaining: ${prefs.chainedPrStrategy}`,
+					`Delivery strategy: ${prefs.chainedPrStrategy}`,
 					`Review budget: ${prefs.reviewBudgetLines} changed lines`,
-					`Preference source: ${prefs.prompted ? "user prompt" : "defaults (no interactive UI available)"}`,
+					`Preference source: ${prefs.prompted ? "explicit session choice" : "canonical default or persisted preference"}`,
 					`Global SDD assets ready: ${result.agents} agent(s), ${result.chains} chain(s), ${result.support} support file(s), ${result.skipped} already present.`,
 					modelRoutingLine,
 				].join("\n"),

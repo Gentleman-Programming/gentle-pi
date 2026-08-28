@@ -2,34 +2,34 @@
 
 ## ADDED Requirements
 
-### Requirement: Verbatim tier reflection
+### Requirement: Native lifecycle transition routing
 
-When organic-parity is active, review depth/tier presented to the user MUST be rendered verbatim from the native start result's reported tier and MUST NOT be re-derived or recomputed by the consuming runtime.
+The consuming runtime MUST route ordinary review only from the provider's current typed status and returned transition. It MUST NOT recreate removed local authorization state or infer a replacement lifecycle route.
 
-#### Scenario: Tier passthrough
+#### Scenario: Provider transition
 
-- GIVEN the native start result reports a tier
-- WHEN the result is rendered
-- THEN the displayed tier equals the native result's tier with no local recomputation
+- GIVEN native status returns an executable or collection transition
+- WHEN the controller continues review
+- THEN it follows the exact provider-selected operation and arguments
 
-#### Scenario: Missing tier fails closed
+#### Scenario: Recovery or hydration
 
-- GIVEN organic-parity is active and the native start result omits tier
-- WHEN the result is rendered
-- THEN no tier is fabricated locally
+- GIVEN native status discovers a recovered lineage with pending review work
+- WHEN the controller receives that status
+- THEN it hydrates only the required candidate view and preserves provider-selected routing
 
-### Requirement: Disabled/unmanaged delivery as success
+### Requirement: Informational validation and ordinary delivery
 
-When the native result reports the single literal `delivery: "disabled/unmanaged"` (the only value gentle-ai emits), the consuming runtime MUST render this as a successful non-delivery outcome, MUST exit with a success status, and MUST NOT report it as a failure. Any other delivery value MUST fail closed as schema-incompatible.
+Controller VALIDATE MUST report review information without authorizing, blocking, consuming, or rewriting a later delivery command. Commit, push, pull-request, and release delivery MUST remain ordinary repository-policy operations.
 
-#### Scenario: Disabled/unmanaged delivery
+#### Scenario: Informational VALIDATE
 
-- GIVEN the native result reports `delivery: "disabled/unmanaged"`
-- WHEN the outcome is rendered
-- THEN the runtime exits successfully and communicates a non-delivery choice, not a failure
+- GIVEN an explicit controller VALIDATE request
+- WHEN the controller responds
+- THEN it returns an informational result and invokes no delivery authorization path
 
-#### Scenario: Unknown delivery value fails closed
+#### Scenario: Later delivery
 
-- GIVEN the native result reports any other `delivery` value
-- WHEN the result is decoded
-- THEN decoding fails closed as schema-incompatible and no outcome is fabricated
+- GIVEN a prior review outcome or receipt
+- WHEN a later delivery command is evaluated
+- THEN the command is not decided by review mode, receipt state, or a one-shot publication authorization

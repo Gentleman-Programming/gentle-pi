@@ -7,13 +7,9 @@ import {
 	NativeReviewCliV216,
 	NativeReviewConsentBindingError,
 	NativeReviewConsentRequiredError,
-	clearNativeReviewCapabilitiesCacheForTesting,
 	type ExecFileAdapter,
 } from "../lib/native-review-cli.ts";
-import {
-	NativeReviewCliV216 as RuntimeNativeReviewCliV216,
-	clearNativeReviewCapabilitiesCacheForTesting as clearRuntimeNativeReviewCapabilitiesCacheForTesting,
-} from "../runtime/native-review-cli.mjs";
+import { NativeReviewCliV216 as RuntimeNativeReviewCliV216 } from "../runtime/native-review-cli.mjs";
 import type { ReviewConsentV2 } from "../lib/review-integration-v2.ts";
 
 const fixtureRoot = join(process.cwd(), "contracts", "review-integration", "v2", "fixtures");
@@ -29,7 +25,7 @@ function capabilities(): Record<string, unknown> {
 function unrelatedStatus(targetIdentity: string): Record<string, unknown> {
 	const status = fixture<Record<string, unknown>>("status.fixture.json");
 	status.applicability = "unrelated";
-	status.receipt = { status: "not_applicable" };
+	delete status.receipt;
 	status.action = "start";
 	status.replayability = "not_replayable";
 	status.target_identity = targetIdentity;
@@ -43,8 +39,41 @@ function unrelatedStatus(targetIdentity: string): Record<string, unknown> {
 	return status;
 }
 
+function startTransitionTokens(targetIdentity: string): readonly string[] {
+	return [
+		"--contract=gentle-ai.review-integration/v2",
+		"--cwd=/repo",
+		`--target=${targetIdentity}`,
+		"--projection=workspace",
+		"--agent=pi",
+		"--consent=relay",
+	] as const;
+}
+
+function executableStartStatus(targetIdentity: string): Record<string, unknown> {
+	const status = unrelatedStatus(targetIdentity);
+	const tokens = startTransitionTokens(targetIdentity);
+	status.next_transition = {
+		kind: "execute",
+		reason_code: "review_start_required",
+		execute: {
+			operation: "review.start",
+			arguments: tokens.map((token) => {
+				const separator = token.indexOf("=");
+				return { name: token.slice(2, separator), value: token.slice(separator + 1), token };
+			}),
+			preconditions: [],
+			binding: { target_identity: targetIdentity },
+		},
+	};
+	return status;
+}
+
 function queuedAdapter(outputs: readonly Record<string, unknown>[]): { adapter: ExecFileAdapter; calls: Array<readonly string[]> } {
-	const queue = [...outputs];
+	// V216 no longer probes capabilities before negotiated STATUS. Keep the
+	// historical queue construction below, but discard only its obsolete probe
+	// response so every remaining entry binds the current invocation.
+	const queue = outputs.filter((body) => body.schema !== "gentle-ai.review-integration.capabilities/v2");
 	const calls: Array<readonly string[]> = [];
 	return {
 		calls,
@@ -58,52 +87,49 @@ function queuedAdapter(outputs: readonly Record<string, unknown>[]): { adapter: 
 }
 
 function client(adapter: ExecFileAdapter): NativeReviewCliV216 {
-	clearNativeReviewCapabilitiesCacheForTesting();
 	return new NativeReviewCliV216(adapter, "/package/.gentle-ai/gentle-ai", 30_000, 1024 * 1024, async () => undefined, () => executableDigest);
 }
 
 function runtimeClient(adapter: ExecFileAdapter): RuntimeNativeReviewCliV216 {
-	clearRuntimeNativeReviewCapabilitiesCacheForTesting();
 	return new RuntimeNativeReviewCliV216(adapter, "/package/.gentle-ai/gentle-ai", 30_000, 1024 * 1024, async () => undefined, () => executableDigest);
 }
 
-test("negotiated ordinary START declares relay and preserves the complete target-bound consent envelope", async () => {
+test("negotiated ordinary START executes the complete STATUS-rendered relay vector and preserves the consent envelope", async () => {
 	const consent = fixture<Record<string, unknown>>("consent.fixture.json");
 	const target = String(consent.target_identity);
-	const queue = queuedAdapter([
-		capabilities(),
-		unrelatedStatus(target),
-		consent,
-	]);
-	await assert.rejects(
-		() => client(queue.adapter).start({ cwd: "/repo" }),
-		(error: unknown) => {
-			assert.ok(error instanceof NativeReviewConsentRequiredError);
-			assert.deepEqual(error.consent.raw, consent);
-			assert.equal(error.consent.targetIdentity, target);
-			return true;
-		},
-	);
-	assert.deepEqual(queue.calls.at(-1), [
-		"review", "start", "--contract", "gentle-ai.review-integration/v2", "--cwd", "/repo",
-		"--target", target, "--projection", "workspace", "--consent", "relay",
-	]);
-	assert.equal(queue.calls.some((arguments_) => arguments_[1] === "status"), true);
+	const tokens = startTransitionTokens(target);
+	for (const createClient of [client, runtimeClient]) {
+		const queue = queuedAdapter([capabilities(), executableStartStatus(target), structuredClone(consent)]);
+		await assert.rejects(
+			() => createClient(queue.adapter).start({ cwd: "/repo" }),
+			(error: unknown) => {
+				assert.equal((error as { name?: string }).name, "NativeReviewConsentRequiredError");
+				const required = error as { consent: { raw: Record<string, unknown>; targetIdentity: string } };
+				assert.deepEqual(required.consent.raw, consent);
+				assert.equal(required.consent.targetIdentity, target);
+				return true;
+			},
+		);
+		assert.deepEqual(queue.calls, [
+			["review", "status", "--contract", "gentle-ai.review-integration/v2", "--cwd", "/repo", "--projection", "workspace", "--agent", "pi", "--next-transition"],
+			["review", "start", ...tokens],
+		]);
+	}
 });
 
-test("controller-prebound START target is used without projecting a second workspace candidate", async () => {
+test("controller-prebound START target checks STATUS once and executes its exact matching transition", async () => {
 	const consent = fixture<Record<string, unknown>>("consent.fixture.json");
 	const target = String(consent.target_identity);
-	const queue = queuedAdapter([capabilities(), consent]);
-	await assert.rejects(
-		() => client(queue.adapter).start({ cwd: "/repo", targetIdentity: target, projection: "workspace" }),
-		(error: unknown) => error instanceof NativeReviewConsentRequiredError,
-	);
-	assert.deepEqual(queue.calls.at(-1), [
-		"review", "start", "--contract", "gentle-ai.review-integration/v2", "--cwd", "/repo",
-		"--target", target, "--projection", "workspace", "--consent", "relay",
-	]);
-	assert.equal(queue.calls.some((arguments_) => arguments_[1] === "status"), false, "a prebound START target must not be projected again");
+	const tokens = startTransitionTokens(target);
+	for (const createClient of [client, runtimeClient]) {
+		const queue = queuedAdapter([capabilities(), executableStartStatus(target), structuredClone(consent)]);
+		await assert.rejects(
+			() => createClient(queue.adapter).start({ cwd: "/repo", targetIdentity: target, projection: "workspace" }),
+			(error: unknown) => (error as { name?: string }).name === "NativeReviewConsentRequiredError",
+		);
+		assert.equal(queue.calls.filter((arguments_) => arguments_[1] === "status").length, 1, "a prebound target is a drift check, never a STATUS bypass");
+		assert.deepEqual(queue.calls.at(-1), ["review", "start", ...tokens]);
+	}
 });
 
 test("consent follow-up executes the provider-named invocation exactly once and refuses changed lineage or target bindings", async () => {
@@ -308,30 +334,37 @@ test("declined consent decodes the provider's explicit empty authority fields wi
 const devbinaryFixtureRoot = join(process.cwd(), "tests", "fixtures", "devbinary");
 const devbinaryFixture = <T = Record<string, unknown>>(name: string): T => JSON.parse(readFileSync(join(devbinaryFixtureRoot, name), "utf8")) as T;
 
-test("negotiated START surfaces the captured consent/v3 envelope instead of failing schema-incompatible", async () => {
+test("Pi START rejects a foreign consent/v3 envelope and only relays a Pi-bound clone", async () => {
 	const consent = devbinaryFixture<Record<string, unknown>>("consent-v3.captured.json");
 	const target = String(consent.target_identity);
-	const queue = queuedAdapter([capabilities(), unrelatedStatus(target), consent]);
-	await assert.rejects(
-		() => client(queue.adapter).start({ cwd: "/repo" }),
-		(error: unknown) => {
-			assert.ok(error instanceof NativeReviewConsentRequiredError, `expected NativeReviewConsentRequiredError, got ${String(error)}`);
-			assert.deepEqual(error.consent.raw, consent);
-			assert.equal(error.consent.schema, "gentle-ai.review-integration.consent/v3");
-			assert.equal(error.consent.targetIdentity, target);
-			return true;
-		},
-	);
-	assert.deepEqual(queue.calls.at(-1), [
-		"review", "start", "--contract", "gentle-ai.review-integration/v2", "--cwd", "/repo",
-		"--target", target, "--projection", "workspace", "--consent", "relay",
-	]);
-
-	const runtimeQueue = queuedAdapter([capabilities(), unrelatedStatus(target), structuredClone(consent)]);
-	await assert.rejects(
-		() => runtimeClient(runtimeQueue.adapter).start({ cwd: "/repo" }),
-		(error: unknown) => (error as Error).name === "NativeReviewConsentRequiredError",
-	);
+	const tokens = startTransitionTokens(target);
+	for (const createClient of [client, runtimeClient]) {
+		const foreignQueue = queuedAdapter([capabilities(), executableStartStatus(target), structuredClone(consent)]);
+		await assert.rejects(
+			() => createClient(foreignQueue.adapter).start({ cwd: "/repo" }),
+			(error: unknown) => {
+				assert.equal((error as { name?: string }).name, "NativeReviewCliError");
+				assert.equal((error as { code?: string }).code, "schema-incompatible");
+				return true;
+			},
+		);
+		assert.deepEqual(foreignQueue.calls.at(-1), ["review", "start", ...tokens]);
+		const piConsent = { ...structuredClone(consent), agent: "pi" };
+		const piQueue = queuedAdapter([capabilities(), executableStartStatus(target), piConsent]);
+		await assert.rejects(
+			() => createClient(piQueue.adapter).start({ cwd: "/repo" }),
+			(error: unknown) => {
+				assert.equal((error as { name?: string }).name, "NativeReviewConsentRequiredError");
+				const required = error as { consent: { raw: Record<string, unknown>; schema: string; targetIdentity: string; agent?: string } };
+				assert.deepEqual(required.consent.raw, piConsent);
+				assert.equal(required.consent.schema, "gentle-ai.review-integration.consent/v3");
+				assert.equal(required.consent.targetIdentity, target);
+				assert.equal(required.consent.agent, "pi");
+				return true;
+			},
+		);
+		assert.deepEqual(piQueue.calls.at(-1), ["review", "start", ...tokens]);
+	}
 });
 
 test("a granted consent/v3 answer decodes the captured start/v3 result with its event binding", async () => {

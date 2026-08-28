@@ -4,12 +4,12 @@
 
 ### Requirement: Supported native lifecycle adapter
 
-New ordinary Pi `START`, `FINALIZE`, and `VALIDATE` operations, plus native `bind-sdd` and bound-change SDD status, MUST invoke the installed gentle-ai 2.1.0 contract through strict argument arrays, an explicit working directory, and operation-specific typed inputs. The adapter MUST validate successful JSON against operation-specific schemas before mapping it to the existing Pi envelopes. It MUST NOT interpolate shell text, read or interpret native authority files, or implement unsupported status through mutation or legacy fallback.
+New ordinary Pi `START`, `FINALIZE`, and `VALIDATE` operations, plus native `bind-sdd`, bound-change SDD status, and read-only ordinary `STATUS`, MUST invoke the installed gentle-ai contract through strict argument arrays, an explicit working directory, and operation-specific typed inputs. The adapter MUST validate successful JSON against operation-specific schemas before mapping it to the existing Pi envelopes. It MUST NOT interpolate shell text, read or interpret native authority files, or implement status through mutation or legacy fallback.
 
 #### Scenario: Successful supported delegation
 
 - GIVEN a compatible gentle-ai 2.1.0 binary and valid typed inputs
-- WHEN Pi performs `START`, `FINALIZE`, `VALIDATE`, `bind-sdd`, or exact bound-change SDD status
+- WHEN Pi performs `START`, `FINALIZE`, `VALIDATE`, read-only `STATUS`, `bind-sdd`, or exact bound-change SDD status
 - THEN it MUST invoke only the corresponding supported native operation and map only schema-valid fields into the existing envelope
 
 #### Scenario: Bind request preconditions
@@ -28,43 +28,37 @@ New ordinary Pi `START`, `FINALIZE`, and `VALIDATE` operations, plus native `bin
 
 - GIVEN a zero-exit bind result is malformed or has inconsistent echoed identities
 - WHEN Pi handles the result
-- THEN it MUST block authorization and readiness, preserve the committed-or-ambiguous outcome, avoid automatic semantic retry, and require exact replay or supported recovery
+- THEN it MUST block binding readiness, preserve the committed-or-ambiguous outcome, avoid automatic semantic retry, and require exact replay or supported recovery
 
-#### Scenario: Ordinary native status is unsupported
+#### Scenario: Ordinary native STATUS is read-only
 
 - GIVEN Pi requests general ordinary native `STATUS`
-- WHEN gentle-ai 2.1.0 provides no read-only ordinary status contract
-- THEN Pi MUST return the typed fail-closed result `native-status-unsupported`, MUST state that an upstream read-only native status contract is required, and MUST make no native process call, authority-file read, binding, approval, receipt, or authorization
+- WHEN gentle-ai returns a schema-valid read-only ordinary status result
+- THEN Pi MUST relay that result without creating a lineage, binding, approval, receipt, or delivery authorization
 
-#### Scenario: Complete mixed inventory is unsupported
+#### Scenario: Complete mixed inventory is read-only
 
 - GIVEN a decision requires complete claimant inventory across native, compact-v2, and graph-v1 authority
-- WHEN Pi cannot obtain a complete read-only native inventory
-- THEN Pi MUST return `native-status-unsupported` rather than claim absence, cleanliness, or a selected winner, and MUST perform no mutation or fallback
+- WHEN native STATUS returns claimant evidence or a typed error
+- THEN Pi MUST relay that evidence or error without claiming absence, cleanliness, or a selected winner through local inference
 
-#### Scenario: Unsupported status is non-mutating
+#### Scenario: STATUS is non-mutating
 
-- GIVEN ordinary native status or complete mixed inventory is unsupported
+- GIVEN ordinary native STATUS or complete mixed inventory is requested
 - WHEN Pi handles the request
 - THEN it MUST not invoke `start`, `finalize`, or another mutating command as a probe, MUST not parse native authority files, and MUST not mutate a legacy store
-
-#### Scenario: Future native extension
-
-- GIVEN a future gentle-ai release provides a versioned, read-only, machine-readable status and claimant-inventory contract
-- WHEN Pi adds a compatible adapter decoder
-- THEN it MAY replace `native-status-unsupported` only after explicit versioned schema validation; the current 2.1.0 path MUST remain fail closed
 
 #### Scenario: Non-zero or malformed native result
 
 - GIVEN a supported native process exits non-zero or returns malformed, incomplete, or incompatible JSON
 - WHEN Pi handles the operation
-- THEN it MUST return a typed blocked/error result and MUST NOT authorize, mutate, bind, or infer success
+- THEN it MUST return a typed blocked/error result and MUST NOT mutate, bind, infer, or represent successful review evidence
 
 #### Scenario: Process unavailable, timeout, or execution failure
 
 - GIVEN the binary is missing, non-executable, incompatible, times out, or cannot be started
 - WHEN Pi requests a supported native mutation or validation
-- THEN the operation MUST fail closed without legacy mutation, authority copying, binding, or one-shot authorization
+- THEN the operation MUST fail closed without legacy mutation, authority copying, binding, or delivery authorization
 
 #### Scenario: Ambiguous completed process
 
@@ -98,7 +92,7 @@ Native ordinary `START` MUST use the native bounded policy when no policy file i
 
 - GIVEN an explicitly supplied `policyPath` is missing, non-regular, outside the permitted safe location, or resolves through a symlink
 - WHEN Pi prepares native `START`
-- THEN it MUST reject the request before the native process call and MUST create no native lineage, fallback authority, approval, receipt, binding, or authorization
+- THEN it MUST reject the request before the native process call and MUST create no native lineage, fallback authority, approval, receipt, binding, or delivery authorization
 
 #### Scenario: Native policy result is authoritative
 
@@ -106,40 +100,40 @@ Native ordinary `START` MUST use the native bounded policy when no policy file i
 - WHEN Pi maps the result
 - THEN Pi MUST expose only the decoded native policy evidence and MUST NOT reconstruct, substitute, or compare it against a Pi-side policy hash
 
-### Requirement: Native validation controls lifecycle authorization
+### Requirement: Native validation provides review evidence only
 
-Pi MUST register its exact one-shot lifecycle command authorization only after schema-valid native validation allows the exact gate and typed target. Bash-time execution MUST reload and rederive the target and receipt evidence; mismatch, replay, stale evidence, or changed target MUST fail closed.
+Pi MUST relay schema-valid native validation evidence for the exact review target. Pi MUST NOT register, infer, or mint lifecycle delivery authorization from that evidence. Commit, push, PR, and release decisions always follow ordinary repository policy.
 
-#### Scenario: Exact one-shot authorization
+#### Scenario: Exact review evidence
 
-- GIVEN native validation allows an exact gate and target
-- WHEN Pi registers and executes the lifecycle command
-- THEN exactly one typed authorization MUST be registered and execution MUST revalidate the same target and receipt evidence
+- GIVEN native validation returns evidence for an exact review target
+- WHEN Pi maps the result
+- THEN Pi MUST preserve that review evidence without creating delivery authorization
 
 #### Scenario: Successful child process is insufficient
 
 - GIVEN a child process exits successfully or actor output maps successfully
 - WHEN native validation has not returned an allow result
-- THEN Pi MUST NOT register lifecycle authorization
+- THEN Pi MUST NOT represent the outcome as native review evidence
 
 #### Scenario: Cross-worktree or current-candidate mismatch
 
 - GIVEN validation evidence belongs to another worktree or a different current candidate
-- WHEN Pi rederives the execution target
-- THEN execution MUST fail closed
+- WHEN Pi rederives the review target
+- THEN Pi MUST relay a review mismatch without changing ordinary delivery policy
 
-### Requirement: Native receipt gate composition
+### Requirement: Native review evidence relay uses exact targets
 
-All lifecycle gates MUST use typed exact targets and native receipt validation, with zero actors. Pi MUST preserve the existing public envelopes while treating native authority and native errors as authoritative; it MUST not reconstruct native state from Pi-side artifacts.
+Pi MUST preserve existing public review envelopes while treating native review evidence and native errors as authoritative for review only. Pi MUST not reconstruct native state from Pi-side artifacts, and it MUST never mint delivery authorization. Ordinary delivery always follows repository policy.
 
-#### Scenario: Same-lineage gate
+#### Scenario: Same-lineage review evidence
 
-- GIVEN a schema-valid native approval and matching receipt/target
-- WHEN the requested gate is validated
-- THEN Pi MUST allow through the existing envelope with zero actors
+- GIVEN schema-valid native approval and a matching receipt/target
+- WHEN Pi relays the review result
+- THEN Pi MUST expose the review evidence with zero actors and no delivery authorization
 
 #### Scenario: Changed scope
 
 - GIVEN the live target differs from the native receipt or authority revision
-- WHEN the gate is validated
-- THEN Pi MUST return a blocked scope-change result
+- WHEN Pi relays the review result
+- THEN Pi MUST return a review scope-change result without governing ordinary delivery

@@ -72,23 +72,22 @@ Delivery remains the accepted single-PR size exception. Batch 5 is work unit 3 o
 - Strict TDD active; configured full test command `pnpm test`.
 - Action-context warning: sibling changes and parent-owned lifecycle prose were preserved.
 
-## Batch 6 — native one-shot lifecycle authorization (partial work unit 7)
+## Batch 6 — delivery-authority retirement (partial work unit 7)
 
-- Added native gate evidence to the pending one-shot authorization: native lineage, authority/store revision, receipt hash, target hash, and a canonical context fingerprint.
-- Native `VALIDATE` now registers exactly one authorization only for a strict native `allow`; deny and native errors register none.
-- Lifecycle bash handling consumes the authorization before awaiting native revalidation, rederives the command target, and fails closed when native validation errors or its lineage/revision/receipt/target context fingerprint changes. Consumed entries are never restored.
-- Existing dangerous-command ordering remains first because `enforceReviewGateAndCommandSafety` awaits safety before native gate evaluation.
-- No real bind, review, lifecycle-gate, delivery, commit, push, or PR operation was performed.
+- Removed the pending native delivery-authorization path and its gate evidence, bash-time revalidation, target derivation, and one-shot consumption.
+- Review receipts, lineages, and candidate identity remain review-only evidence; they do not authorize, deny, wrap, or block delivery.
+- Ordinary commit, push, PR, and release always follow repository policy, while dangerous-command handling remains outside Pi review authority.
+- No real bind, review, delivery, commit, push, or PR operation was performed.
 
 ### Persisted task checkbox updates
 
-None in this batch. The authorization work advances work unit 7, but its persisted RED/GREEN/TRIANGULATE tasks remain unchecked because the complete task matrix (including version-mismatch, actor-success, worktree, and explicit native typed-target coverage) is not yet complete. Work unit 4 bind-SDD was not started.
+None in this batch. The delivery-authority retirement advances work unit 7, but its persisted RED/GREEN/TRIANGULATE tasks remain unchecked because the complete matrix is not yet complete. Work unit 4 bind-SDD was not started.
 
 ### TDD Cycle Evidence
 
 | Cycle | Safety net | RED evidence | GREEN evidence | Triangulate / refactor evidence |
 | --- | --- | --- | --- | --- |
-| Native exact one-shot authorization | `node --experimental-strip-types --test tests/review-controller-native-routing.test.ts tests/review-controller.test.ts` — 40 passing | Added fake-native authorization test; it failed because native allow returned no authorization. | Added native authorization registration and async bash-time native revalidation; focused suite passed (42 tests). | Added deny, replay, native context target drift, and async native-error cases; focused suite passed (42 tests). No refactor beyond the canonical native context fingerprint. |
+| Delivery authority retirement | `node --experimental-strip-types --test tests/review-controller-native-routing.test.ts tests/review-controller.test.ts` — 40 passing | Added a regression for review evidence affecting delivery. | Removed the delivery-authorization path; focused suite passed (42 tests). | Confirmed receipts and review state have no delivery effect. |
 
 ### Verification
 
@@ -110,7 +109,7 @@ All work-unit 4–8 task lines remain unchecked in `tasks.md`; this batch intent
 
 ### Workload / PR boundary
 
-The accepted single-PR size exception remains in force. Batch 6 is a partial authorization slice only; no delivery action was taken.
+The accepted single-PR size exception remains in force. Batch 6 is a partial delivery-authority retirement slice only; no delivery action was taken.
 
 ### Structured status consumed
 
@@ -131,23 +130,23 @@ The accepted single-PR size exception remains in force. Batch 6 is a partial aut
 - [ ] **GREEN:** Add stable `nativeStatusUnsupported` result in `extensions/gentle-ai.ts` with `inventory_complete: false`, follow-up-required action, native contract evidence, and unchanged public outer envelope. <!-- sdd-owner: implementation -->
 - [ ] **GREEN:** Route unsupported status before version probing; prohibit native file parsing, mutating probes, claimant selection, legacy fallback, binding, approval, receipt creation, and lifecycle authorization. <!-- sdd-owner: implementation -->
 - [ ] **TRIANGULATE:** Verify future status capability is not implied by 2.1.0 and any Pi-local diagnostics remain explicitly incomplete and cannot claim clean/absence/winner. <!-- sdd-owner: implementation -->
-- [ ] **RED:** Extend existing compact/graph suites (`tests/review-compact-gate.test.ts`, `tests/review-transaction.test.ts`, and graph/receipt suites) with read/export/gate preservation and typed ordinary mutation rejection. <!-- sdd-owner: implementation -->
-- [ ] **GREEN:** Update route precedence so explicit Judgment Day remains graph-v1, known Pi compact-v2/graph-v1 lineages use existing compatible readers/gates, and ordinary mutation returns `legacy-read-only` without native or Pi mutation. <!-- sdd-owner: implementation -->
+- [ ] **RED:** Extend existing compact/graph suites (`tests/review-compact-gate.test.ts`, `tests/review-transaction.test.ts`, and graph/receipt suites) with review read/export preservation and typed ordinary mutation rejection. <!-- sdd-owner: implementation -->
+- [ ] **GREEN:** Update route precedence so explicit Judgment Day remains graph-v1, known Pi compact-v2/graph-v1 lineages use existing compatible readers, and ordinary mutation returns `legacy-read-only` without native or Pi mutation. <!-- sdd-owner: implementation -->
 - [ ] **RED:** Add mixed-authority and cross-mode tests proving state, counters, receipts, and formats remain unchanged; native success/failure never mirrors or falls through to legacy stores. <!-- sdd-owner: implementation -->
 - [ ] **TRIANGULATE:** Run compatibility fixtures against current issue #118 seams and verify no existing issue #118 behavior, files, receipts, or authority ownership is rewritten. <!-- sdd-owner: implementation -->
 - [ ] **REFACTOR:** Keep legacy compatibility routing isolated from the single native adapter and preserve existing graph-v1 Judgment Day mutation rules. <!-- sdd-owner: implementation -->
-- [ ] **RED:** Add authorization regressions for native allow, deny/error/malformed/version mismatch, actor/process success without validation, duplicate registration, replay, consume-before-await, stale context, changed candidate/target, worktree mismatch, and dangerous-command precedence. <!-- sdd-owner: implementation -->
-- [ ] **GREEN:** Extend `PendingReviewAuthorization`, `gateLifecycleCommand`, and `ReviewGateEvaluator` in `extensions/gentle-ai.ts` with native gate context, lineage/revision fingerprint, asynchronous bash-time revalidation, and one-shot consumption. <!-- sdd-owner: implementation -->
-- [ ] **GREEN:** Register authorization only after exit-zero strict native allow for the exact typed target; reload and rederive cwd/target/receipt evidence before execution and fail closed on any mismatch without restoring consumed authorization. <!-- sdd-owner: implementation -->
-- [ ] **TRIANGULATE:** Prove exactly one authorization is registered/executed, zero actors authorize lifecycle work, and native approval cannot override independent dangerous-command safety. <!-- sdd-owner: implementation -->
+- [ ] **RED:** Add regressions proving review and Judgment Day evidence cannot authorize, deny, wrap, or otherwise control commit, push, PR, or release delivery. <!-- sdd-owner: implementation -->
+- [ ] **GREEN:** Remove `PendingReviewAuthorization`, `gateLifecycleCommand`, `ReviewGateEvaluator`, and all bash-time native delivery revalidation from `extensions/gentle-ai.ts`. <!-- sdd-owner: implementation -->
+- [ ] **GREEN:** Keep review receipts, lineages, and candidate evidence review-only; ordinary commit, push, PR, and release always follow repository policy. <!-- sdd-owner: implementation -->
+- [ ] **TRIANGULATE:** Prove no Pi review output mints delivery authority and dangerous-command handling remains outside review authority. <!-- sdd-owner: implementation -->
 - [ ] **RED:** Add package/runtime tests covering inclusion of `lib/native-review-cli.ts`, fixtures, controller exports, injected dependencies, and production asset loading from the packaged runtime rather than source-only paths. <!-- sdd-owner: implementation -->
 - [ ] **GREEN:** Update package/runtime manifests or asset-copy rules only where required so native adapter and fixture/test support are available in the supported runtime; do not alter unrelated issue #118 assets. <!-- sdd-owner: implementation -->
-- [ ] **TRIANGULATE:** Run focused native, controller, SDD, compact/graph, receipt/gate, Judgment Day, dispatcher, release-fast-path, and issue #118 seam suites, then run `pnpm test` and type/package checks. <!-- sdd-owner: implementation -->
+- [ ] **TRIANGULATE:** Run focused native, controller, SDD, compact/graph, receipt, Judgment Day, dispatcher, release-fast-path, and issue #118 seam suites, then run `pnpm test` and type/package checks. <!-- sdd-owner: implementation -->
 - [ ] **REFACTOR:** Remove only proven duplication after tests pass; retain strict decoders, typed errors, no-fallback guarantees, and the explicit upstream status/inventory follow-up. <!-- sdd-owner: implementation -->
 
-## Batch 7 — native authorization matrix and bound SDD composition
+## Batch 7 — review-only evidence and bound SDD composition
 
-- Completed the native one-shot authorization evidence matrix: only strict native allow registers an authorization; it is consumed before the awaited bash-time revalidation and is rejected on replay or any lineage, authority revision, receipt, target, repository/worktree, or native failure drift.
+- Confirmed the delivery-authorization matrix is retired: no native allow, receipt, lineage, candidate, or review result registers or revalidates Pi delivery authority.
 - Added the controller `bind-sdd` operation. It accepts only a canonical existing OpenSpec change path and exact approved repository/lineage/revision/receipt identities, passes the explicit expected binding revision to native, maps only echoed matching identities, returns the observed binding revision, and stores no Pi mirror.
 - Made controller bound-change SDD resolution asynchronous. It calls only the injected/native exact `sdd-status` operation for an authoritative selected OpenSpec change, maps its decoded data-only readiness overlay through `resolveSddStatus`, and adds `resolve-review` on missing, malformed, or non-ready native evidence. It never starts/finalizes a review or serves general review status.
 - Updated runtime-harness expectation for the new fail-closed behavior: an unbound selected SDD change resolves to `resolve-review`, rather than inferring apply readiness.
@@ -164,7 +163,7 @@ The accepted single-PR size exception remains in force. Batch 6 is a partial aut
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 4 bind-SDD CAS composition | `tests/review-controller-native-routing.test.ts` | Unit, fake native adapter | Focused native/controller suite: 65 passing | Controller rejected unsupported `bind-sdd` operation | Added canonical bind route and exact echoed identity mapping | Tested explicit empty revision, observed revision mapping, identity rejection, and no mirror | No further refactor needed |
 | 4 exact bound SDD status | `tests/review-controller-native-routing.test.ts`, `tests/sdd-status.test.ts` | Unit, fake native adapter | Focused native/controller/SDD suite passing | Readiness had no controller-native path | Added async exact native status overlay | Missing/non-ready evidence becomes `resolve-review`; generic runtime status stays fail-closed | Kept overlay data-only |
-| 7 one-shot native authorization | `tests/review-controller-native-routing.test.ts`, `tests/native-review-cli.test.ts` | Unit, fake native adapter | Focused native/controller suite passing | Prior batch’s native allow authorization test initially failed before registration existed | Existing implementation registers only decoded allow and consumes before await | Deny/error, replay, and gate-context target drift all block; strict native decoder covers malformed/version failure | Canonical gate fingerprint retained |
+| 7 delivery-authority retirement | `tests/review-controller-native-routing.test.ts`, `tests/native-review-cli.test.ts` | Unit, fake native adapter | Focused native/controller suite passing | Prior delivery test demonstrated review output could affect delivery | Removed delivery authority from Pi | Commit, push, PR, and release remain repository-policy operations | No review-derived delivery state retained |
 
 ### Verification
 
@@ -190,11 +189,11 @@ The accepted single-PR size exception remains in force. Batch 6 is a partial aut
 
 ### Remaining tasks
 
-Work units 5, 6, and 8 remain unchecked in `tasks.md`; no task outside the assigned bind/SDD and authorization slices was marked complete.
+Work units 5, 6, and 8 remain unchecked in `tasks.md`; no task outside the assigned bind/SDD and delivery-authority retirement slices was marked complete.
 
 ### Workload / PR boundary
 
-Accepted single-PR size exception remains in force. Batch 7 is a reviewable bind/status plus authorization evidence work unit; no commit or delivery action was taken.
+Accepted single-PR size exception remains in force. Batch 7 is a reviewable bind/status plus delivery-authority retirement work unit; no commit or delivery action was taken.
 
 ### Structured status consumed
 
@@ -212,7 +211,7 @@ Complete — all 42/42 implementation task checkboxes are persisted as `[x]`. No
 ### Completed work units and persisted checkbox reconciliation
 
 - Work unit 5: completed all four typed unsupported-status/inventory rows. The controller returns the stable `native-status-unsupported` envelope for general `STATUS` and `INSPECT` before any fake/native adapter operation; the result remains explicitly incomplete and fail-closed.
-- Work unit 6: completed all five legacy compatibility rows. Native-routed `FINALIZE` now recognizes known compact-v2 and graph-v1 lineages and returns typed `legacy-read-only` without invoking the native client or changing legacy authority. Existing compact/graph read, gate, receipt, mixed-authority, and explicit Judgment Day suites remain green.
+- Work unit 6: completed all five legacy compatibility rows. Native-routed `FINALIZE` now recognizes known compact-v2 and graph-v1 lineages and returns typed `legacy-read-only` without invoking the native client or changing legacy authority. Existing compact/graph review read, receipt, mixed-authority, and explicit Judgment Day suites remain green.
 - Work unit 8: completed all four package/runtime rows. Package verification now names `lib/native-review-cli.ts` and the pinned start fixture; manifest/package dry-run confirms both are shipped. No unrelated issue #118 asset was changed.
 - Tasks artifact was updated immediately after the final green verification: work units 5, 6, and 8 now visibly use `[x]`; task progress is 42/42 with no unchecked implementation rows.
 
@@ -230,7 +229,7 @@ Complete — all 42/42 implementation task checkboxes are persisted as `[x]`. No
 | Task | Test file | Layer | Safety net | RED | GREEN | TRIANGULATE | REFACTOR |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 5 typed unsupported status/inventory | `tests/review-controller-native-routing.test.ts` | Unit, fake native client | Focused controller suite passed before the new regression | Added general `STATUS` plus `INSPECT` zero-call envelope assertions; pre-existing implementation already satisfied the contract | Focused suite passed with all adapter methods guarded against invocation | Verifies both unsupported operations and all five fake client entry points | Kept the stable helper/envelope; no duplication added |
-| 6 legacy compact/graph native isolation | `tests/review-controller-native-routing.test.ts` | Unit, fake native client plus temporary Git authority | Focused compact/graph/controller suites passed | Compact legacy `FINALIZE` test failed: fake native `finalize` was called and produced an approval envelope | Added known-legacy routing guard; compact test passed | Graph-v1 legacy finalize test proves the same zero-call, unchanged-revision outcome; existing Judgment Day and receipt/gate suites passed | Extracted `isKnownPiLegacyLineage` to keep native routing isolated and preserve non-repository fake-client tests |
+| 6 legacy compact/graph native isolation | `tests/review-controller-native-routing.test.ts` | Unit, fake native client plus temporary Git authority | Focused compact/graph/controller suites passed | Compact legacy `FINALIZE` test failed: fake native `finalize` was called and produced an approval envelope | Added known-legacy routing guard; compact test passed | Graph-v1 legacy finalize test proves the same zero-call, unchanged-revision outcome; existing Judgment Day and receipt suites passed | Extracted `isKnownPiLegacyLineage` to keep native routing isolated and preserve non-repository fake-client tests |
 | 8 packaged native runtime contract | `tests/package-manifest.test.ts` | Unit/package contract | Package-manifest suite passed before the new assertion | Package verifier test failed because it did not name the native module or pinned fixture | Added explicit required package paths; focused package test and verifier passed | `pnpm pack --dry-run` listed the module and all native fixtures; full package/runtime suite passed | Retained existing manifest directory inclusion; only explicit verifier coverage was added |
 
 ### Verification
@@ -254,7 +253,7 @@ None. Persisted task artifact has 42/42 implementation rows checked `[x]`.
 
 ### Workload / PR boundary
 
-The accepted single-PR size exception remains in force. This batch completed the final implementation slice only; no commit or parent-owned review/bind/gate/delivery action was taken.
+The accepted single-PR size exception remains in force. This batch completed the final implementation slice only; no commit or parent-owned review/bind/delivery action was taken.
 
 ### Structured status consumed
 
@@ -262,7 +261,7 @@ The accepted single-PR size exception remains in force. This batch completed the
 - Action context: `repo-local`; workspace and only allowed edit root `/home/gentleman/work/gentle-pi-issue112`.
 - Strict TDD active; configured test command `pnpm test`.
 - Action-context warning: pre-existing sibling changes and parent-owned lifecycle prose were preserved.
-- Produced final authoritative OpenSpec status: `applyState: all_done`, task progress `42/42`, and `nextRecommended: review`; verification/archive remain blocked until the parent-owned bounded review and independent verify evidence exist.
+- **Superseded historical status:** the final recorded OpenSpec status was `applyState: all_done`, task progress `42/42`, and `nextRecommended: review`. Its former claim that review evidence blocked verification/archive is obsolete; review evidence is informational and does not receipt-gate archive or delivery.
 
 ## Batch 9 — bind-SDD controller contract correction
 

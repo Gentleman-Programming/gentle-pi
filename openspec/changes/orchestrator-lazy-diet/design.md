@@ -120,6 +120,8 @@ Route work through the smallest harness that is safe. Three tiers:
 Full examples, model-routing detail, and canonical workflows: `{{GENTLE_PI_DELEGATION_PATH}}`.
 ```
 
+> **Historical design record — superseded review-before-delivery directives (scope: the complete `### Delegation Rules` excerpt and its explanatory paragraph below, ending immediately before `### Memory Contract`):** This retained excerpt records the earlier model that required a fresh review before commit, push, or PR creation. It is not active guidance. Review is non-deciding evidence; commit, push, and PR delivery follow ordinary repository policy.
+
 ### Delegation Rules — 1,468 B
 
 ```text
@@ -187,19 +189,19 @@ Fallback-report semantics (`paths-injected`/`fallback-registry`/`fallback-path`/
 For skill-shaped requests, do not treat injected `<available_skills>` as complete; use the registry/filesystem only as a discovery aid, never to override a small request or a user's concrete ask. Discovery order, the common intent-hint table, and fallback behavior when no skill matches: `{{GENTLE_PI_SKILLS_PATH}}`.
 ```
 
-### 4R Review Triggers — 825 B
+### 4R Review Triggers — 954 B
 
 ```text
 ## 4R Review Triggers
 
-`extensions/gentle-ai.ts` gates `bash` calls that look like git/gh workflow events. **pre-commit**/**pre-push**: advisory only — notify to consider `review-readability`, do not block. **pre-pr** (`gh pr create`): strong gate — blocks when changed paths match hot globs (`**/auth/**`, `**/update/**`, `**/security/**`, `**/payments/**`) or the diff exceeds 400 changed lines; the reason names all four agents to run first. **post-sdd-phase** (design, apply): strong gate for `judgment-day`, handled by SDD phase orchestration.
+`extensions/gentle-ai.ts` MUST NOT gate, authorize, rederive, or validate Bash delivery commands that look like git/gh workflow events. Commit, push, pull-request, release, and archive follow ordinary repository policy; review and Judgment Day evidence remain review-only.
 
-When blocked, launch the `4r-review` chain or run `review-risk`, `review-reliability`, `review-resilience`, `review-readability` individually and wait for their reports before retrying.
+**Superseded historical trigger model:** earlier prompt text treated **pre-commit**/**pre-push** as advisory review prompts, **pre-pr** (`gh pr create`) as a strong gate for hot globs or large diffs, and **post-sdd-phase** as a Judgment Day gate. It also directed `4r-review` or `review-risk`, `review-reliability`, `review-resilience`, and `review-readability` before retrying. That Pi-side Bash delivery-gating model is obsolete and must not be restored.
 
-Full rationale and `lib/review-triggers.ts` detail: `{{GENTLE_PI_DELEGATION_PATH}}`.
+Current review instructions are runtime-owned; Pi does not infer a delivery route from a Bash command. Full historical rationale and `lib/review-triggers.ts` detail: `{{GENTLE_PI_DELEGATION_PATH}}`.
 ```
 
-The four lens names required by the JD-007 core-alone assertion (`review-risk`, `review-reliability`, `review-resilience`, `review-readability`) are present verbatim in the second paragraph.
+The four lens names required by the JD-007 core-alone assertion (`review-risk`, `review-reliability`, `review-resilience`, `review-readability`) are retained verbatim in the superseded historical trigger paragraph.
 
 ### Reserved: Review Execution Contract — representative rendering, 573 B
 

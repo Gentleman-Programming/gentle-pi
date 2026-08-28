@@ -9,10 +9,9 @@ import type { NativeReviewCli } from "../lib/native-review-cli.ts";
 import { REVIEW_HOST_RELAY_FAILURE, REVIEW_HOST_RELAY_PI_TIMEOUT_ENV, REVIEW_HOST_RELAY_PI_TIMEOUT_MAX_MS, REVIEW_HOST_RELAY_SUBMISSION_MISSING_MESSAGE, REVIEW_HOST_RELAY_UNAVAILABLE_MESSAGE, ReviewHostRelayError, type ReviewHostRelayRequest } from "../lib/review-host-relay.ts";
 import type { ReviewCaptureSubmissionV1, ReviewCollectInputV3, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 
-// Wiring contract (gentle-pi#311 P4): the compact controller FINALIZE lane
-// routes pi-slot capture inputs through the host relay ONLY when the
+// One-slot capture routing: the host relay runs only when the selected
 // provider-returned collect input carries the --materialize token. Every
-// other lane and slot stays untouched.
+// other capture form stays untouched.
 
 const SHA = `sha256:${"1".repeat(64)}`;
 const TREE = "2".repeat(40);
@@ -69,8 +68,7 @@ function finalizeStatus(lineageId: string, inputs?: readonly ReviewCollectInputV
 		contract: "gentle-ai.review-integration/v2",
 		applicability: "current_target",
 		authority: { version: "compact-v2", lineageId, state: "reviewing", generation: 1, revision: SHA },
-		receipt: { status: "none" },
-		action: "finalize",
+		action: "stop",
 		replayability: "unknown",
 		targetIdentity: SHA,
 		projection: {
@@ -89,14 +87,13 @@ function finalizeStatus(lineageId: string, inputs?: readonly ReviewCollectInputV
 		},
 		candidates: [],
 		...(inputs === undefined ? {} : { nextTransition: { kind: "collect", reasonCode: "reviewer_results_required", collect: { inputs: [...inputs] } } }),
-		raw: { schema: "gentle-ai.review-integration.status/v3", action: "finalize", lineage_id: lineageId },
+		raw: { schema: "gentle-ai.review-integration.status/v3", action: "stop", lineage_id: lineageId },
 	} as unknown as ReviewStatusV3;
 }
 
 interface RoutingHarness {
 	statusQueue: ReviewStatusV3[];
 	statusCalls: Array<{ cwd: string; lineageId?: string }>;
-	finalizeCalls: number;
 	native: NativeReviewCli;
 }
 
@@ -104,19 +101,9 @@ function nativeHarness(statuses: readonly ReviewStatusV3[]): RoutingHarness {
 	const harness: RoutingHarness = {
 		statusQueue: [...statuses],
 		statusCalls: [],
-		finalizeCalls: 0,
 		native: undefined as unknown as NativeReviewCli,
 	};
 	harness.native = {
-		start: async () => { throw new Error("unexpected start"); },
-		finalize: async () => {
-			harness.finalizeCalls += 1;
-			return { lineageId: "relay-lineage", state: "approved", action: "approved", storeRevision: "r1" };
-		},
-		validate: async () => { throw new Error("unexpected validate"); },
-		bindSdd: async () => { throw new Error("unexpected bindSdd"); },
-		sddStatus: async () => ({ ready: false, artifactStore: "none", artifacts: {} as never, nextRecommended: "" }),
-		reviewStatus: async () => { throw new Error("unexpected reviewStatus"); },
 		targetStatus: async (request) => {
 			harness.statusCalls.push({ cwd: request.cwd, ...(request.lineageId === undefined ? {} : { lineageId: request.lineageId }) });
 			const next = harness.statusQueue.shift();
@@ -127,63 +114,41 @@ function nativeHarness(statuses: readonly ReviewStatusV3[]): RoutingHarness {
 	return harness;
 }
 
-function finalizeParameters(lineageId: string, input: Record<string, unknown> = {}): Record<string, unknown> {
-	return { operation: "finalize", lineageId, input: JSON.stringify(input) };
-}
-
-// Relay ROUTING is the subject here, not spend authorization: a host-relay
-// finalize now forecasts its reviewer model runs and spends nothing until the
-// caller acknowledges them (see review-relay-transport-agent.test.ts), so these
-// routing cases authorize the run up front and keep asserting where the slots
-// go. A case that must observe the forecast passes the acknowledgement off.
-async function runFinalize(cwd: string, harness: RoutingHarness, lineageId: string, input: Record<string, unknown> = { reviewer_run_acknowledged: true }): Promise<Record<string, unknown>> {
-	return await __testing.executeReviewControllerOperation(
-		finalizeParameters(lineageId, input),
+async function runCapture(cwd: string, harness: RoutingHarness, lineageId: string, input: Record<string, unknown> = { reviewerRunAcknowledged: true }): Promise<Record<string, unknown>> {
+	const selected = harness.statusQueue[0]?.nextTransition?.collect?.inputs[0];
+	if (selected === undefined) throw new Error("capture test requires one current collect input");
+	return await __testing.executeReviewCaptureOperation(
+		{ lineageId, collectBinding: JSON.stringify(selected), ...input },
 		cwd,
-		new Map(),
 		harness.native,
 	) as Record<string, unknown>;
 }
 
-test("materialize-marked pi slots route through the host relay in provider order and re-query STATUS", async (t) => {
+test("one materialize binding routes exactly one provider slot through the host relay", async (t) => {
 	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
 	const cwd = repository(t);
 	const lineageId = "relay-lineage";
-	const inputs = [
-		relayCollectInput(lineageId, "review-risk", 0),
-		relayCollectInput(lineageId, "review-reliability", 1),
-	];
-	const harness = nativeHarness([finalizeStatus(lineageId, inputs), finalizeStatus(lineageId)]);
+	const input = relayCollectInput(lineageId, "review-risk", 0);
+	const harness = nativeHarness([finalizeStatus(lineageId, [input])]);
 	const relayed: ReviewHostRelayRequest[] = [];
 	__testing.setReviewHostRelayRunnerForTesting(async (request: ReviewHostRelayRequest) => {
 		relayed.push(request);
 		return { promptByteLength: 64, resultByteLength: 32, submission: '{"admission_decision":"completed"}' };
 	});
 
-	const result = await runFinalize(cwd, harness, lineageId);
+	const result = await runCapture(cwd, harness, lineageId);
 
-	assert.equal(relayed.length, 2);
-	assert.deepEqual(relayed[0]!.captureArgumentTokens, inputs[0]!.arguments.map((argument) => argument.token));
-	// The provider-owned completing form reaches the relay verbatim.
+	assert.equal(relayed.length, 1);
+	assert.deepEqual(relayed[0]!.captureArgumentTokens, input.arguments.map((argument) => argument.token));
 	assert.deepEqual(relayed[0]!.submission, providerSubmission(lineageId, "review-risk", 0));
-	assert.deepEqual(relayed[1]!.captureArgumentTokens, inputs[1]!.arguments.map((argument) => argument.token));
-	assert.deepEqual(relayed[1]!.submission, providerSubmission(lineageId, "review-reliability", 1));
-
-	assert.equal(harness.finalizeCalls, 0, "the relay never invokes native finalize itself");
-	assert.equal(harness.statusCalls.length, 2, "STATUS is re-queried after all slots are captured");
-	assert.deepEqual(harness.statusCalls[1], { cwd, lineageId });
-
-	const hostRelay = result.host_relay as { transport: string; captured_slots: Array<Record<string, unknown>> };
-	assert.equal(hostRelay.transport, "pi_host_relay");
-	assert.equal(hostRelay.captured_slots.length, 2);
-	assert.deepEqual(hostRelay.captured_slots.map((slot) => slot.lens), ["review-risk", "review-reliability"]);
-	assert.equal(result.status, "in-progress");
+	assert.equal(harness.statusCalls.length, 1, "a nonterminal capture does not auto-follow STATUS");
+	assert.equal(result.status, "captured");
+	assert.equal((result.host_relay as { transport: string }).transport, "pi_host_relay");
 });
 
-test("Pi-authored review documents are rejected at the FINALIZE input boundary", async (t) => {
-	// gentle-pi#311 P5: `review_result` is no longer a legal FINALIZE input at
-	// all — the parse fails closed before any relay launch or native call, so
-	// a Pi-authored reviewer document can never race a host-mediated slot.
+test("Pi-authored review documents are rejected at the capture input boundary", async (t) => {
+	// The narrow capture schema rejects a caller-authored reviewer document
+	// before any relay launch or native call.
 	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
 	const cwd = repository(t);
 	const lineageId = "relay-lineage";
@@ -195,11 +160,10 @@ test("Pi-authored review documents are rejected at the FINALIZE input boundary",
 	});
 
 	await assert.rejects(
-		() => runFinalize(cwd, harness, lineageId, { review_result: { lens_results: [{ findings: [], evidence: ["reviewed"] }] } }),
-		/unknown field review_result/,
+		() => runCapture(cwd, harness, lineageId, { review_result: { lens_results: [{ findings: [], evidence: ["reviewed"] }] } }),
+		/does not accept review_result/,
 	);
 	assert.equal(relayCalls, 0);
-	assert.equal(harness.finalizeCalls, 0);
 });
 
 test("an old binary reports the relay as unavailable without touching existing behavior", async (t) => {
@@ -211,14 +175,13 @@ test("an old binary reports the relay as unavailable without touching existing b
 		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.RELAY_UNAVAILABLE, "materialize", REVIEW_HOST_RELAY_UNAVAILABLE_MESSAGE, { exitCode: 2, stderr: "flag provided but not defined: -materialize" });
 	});
 
-	const result = await runFinalize(cwd, harness, lineageId);
+	const result = await runCapture(cwd, harness, lineageId);
 
 	assert.equal(result.status, "blocked");
 	assert.equal(result.outcome, "pi-host-relay-unavailable");
 	assert.equal(result.reason, REVIEW_HOST_RELAY_UNAVAILABLE_MESSAGE);
 	assert.equal(result.mutation_performed, false);
 	assert.equal(result.mutation_outcome, "none");
-	assert.equal(harness.finalizeCalls, 0);
 });
 
 test("a handshake refusal surfaces the provider refusal verbatim through the controller envelope", async (t) => {
@@ -231,60 +194,37 @@ test("a handshake refusal surfaces the provider refusal verbatim through the con
 		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.HANDSHAKE_REFUSED, "materialize", refusal, { exitCode: 1, stderr: refusal });
 	});
 
-	const result = await runFinalize(cwd, harness, lineageId);
+	const result = await runCapture(cwd, harness, lineageId);
 
 	assert.equal(result.outcome, "pi-host-relay-handshake-refused");
 	assert.equal(result.reason, refusal);
 	assert.equal(result.refusal, refusal);
 });
 
-test("a transport failure mid-collection stops immediately and directs STATUS re-query", async (t) => {
+test("a transport failure stops the selected capture without auto-follow", async (t) => {
 	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
 	const cwd = repository(t);
 	const lineageId = "relay-lineage";
-	const inputs = [
-		relayCollectInput(lineageId, "review-risk", 0),
-		relayCollectInput(lineageId, "review-reliability", 1),
-	];
-	const harness = nativeHarness([finalizeStatus(lineageId, inputs)]);
-	let calls = 0;
+	const harness = nativeHarness([finalizeStatus(lineageId, [relayCollectInput(lineageId, "review-risk", 0)])]);
 	__testing.setReviewHostRelayRunnerForTesting(async () => {
-		calls += 1;
-		if (calls === 1) return { promptByteLength: 8, resultByteLength: 8, submission: '{"admission_decision":"completed"}' };
 		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_FAILED, "pi", "pi subprocess failed", { exitCode: 4 });
 	});
 
-	const result = await runFinalize(cwd, harness, lineageId);
+	const result = await runCapture(cwd, harness, lineageId);
 
-	assert.equal(calls, 2);
 	assert.equal(result.status, "blocked");
 	assert.equal(result.outcome, "pi-host-relay-transport-failure");
 	assert.deepEqual(result.failure, { kind: "pi-failed", stage: "pi", exit_code: 4, timed_out: false });
-	assert.equal((result.captured_slots as unknown[]).length, 1);
-	assert.equal(result.mutation_performed, true);
-	assert.match(String(result.next_action), /Re-query negotiated STATUS/);
-	assert.match(String(result.next_action), /exact same bound slot/);
-	assert.equal(harness.finalizeCalls, 0);
+	assert.match(String(result.next_action), /fresh STATUS/);
 	assert.equal(harness.statusCalls.length, 1, "no automatic relaunch after transport failure");
 });
 
-// gentle-pi#367: a reviewer killed by the relay bound is deterministic, so the
-// generic "relaunch the same slot" continuation would re-spend model tokens to
-// buy the identical failure. It gets its own outcome, its own measurements, and
-// a continuation that names what must change — while staying blocked.
-test("a relay timeout reports elapsed and limit and refuses to encourage an unchanged relaunch", async (t) => {
+test("a relay timeout reports its one-slot measurements and no auto-follow", async (t) => {
 	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
 	const cwd = repository(t);
 	const lineageId = "relay-lineage";
-	const inputs = [
-		relayCollectInput(lineageId, "review-risk", 0),
-		relayCollectInput(lineageId, "review-reliability", 1),
-	];
-	const harness = nativeHarness([finalizeStatus(lineageId, inputs)]);
-	let calls = 0;
+	const harness = nativeHarness([finalizeStatus(lineageId, [relayCollectInput(lineageId, "review-risk", 0)])]);
 	__testing.setReviewHostRelayRunnerForTesting(async () => {
-		calls += 1;
-		if (calls === 1) return { promptByteLength: 8, resultByteLength: 8, submission: '{"admission_decision":"completed"}' };
 		throw new ReviewHostRelayError(
 			REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT,
 			"pi",
@@ -293,35 +233,13 @@ test("a relay timeout reports elapsed and limit and refuses to encourage an unch
 		);
 	});
 
-	const result = await runFinalize(cwd, harness, lineageId);
-
-	assert.equal(result.status, "blocked", "a timeout is never reported as a completed capture");
+	const result = await runCapture(cwd, harness, lineageId);
+	assert.equal(result.status, "blocked");
 	assert.equal(result.outcome, "pi-host-relay-timeout");
-	assert.deepEqual(result.failure, {
-		kind: "pi-timed-out",
-		stage: "pi",
-		exit_code: null,
-		timed_out: true,
-		elapsed_ms: 2_256_004,
-		timeout_ms: 2_256_000,
-	});
-	// The lens that did complete stays admitted; only the outstanding one is
-	// outstanding.
-	assert.equal((result.captured_slots as unknown[]).length, 1);
-	assert.equal(result.mutation_performed, true);
-	assert.equal(result.mutation_outcome, "committed");
-
-	const nextAction = String(result.next_action);
-	assert.match(nextAction, /Do not relaunch this slot unchanged/);
-	assert.match(nextAction, /2256004ms against a 2256000ms bound/);
-	assert.match(nextAction, new RegExp(`${REVIEW_HOST_RELAY_PI_TIMEOUT_ENV}=<milliseconds>`));
-	assert.match(nextAction, new RegExp(String(REVIEW_HOST_RELAY_PI_TIMEOUT_MAX_MS)));
-	assert.match(nextAction, /reduce the candidate scope/);
-	assert.equal(/relaunch only if the exact same bound slot is reoffered/.test(nextAction), false,
-		"the unconditional retry continuation must not be offered for a deterministic timeout");
-
-	assert.equal(harness.finalizeCalls, 0);
-	assert.equal(harness.statusCalls.length, 1, "no automatic relaunch after a relay timeout");
+	assert.deepEqual(result.failure, { kind: "pi-timed-out", stage: "pi", exit_code: null, timed_out: true, elapsed_ms: 2_256_004, timeout_ms: 2_256_000 });
+	assert.match(String(result.next_action), new RegExp(`${REVIEW_HOST_RELAY_PI_TIMEOUT_ENV}=<milliseconds>`));
+	assert.match(String(result.next_action), new RegExp(String(REVIEW_HOST_RELAY_PI_TIMEOUT_MAX_MS)));
+	assert.equal(harness.statusCalls.length, 1);
 });
 
 test("a non-timeout transport failure keeps its generic continuation and now carries its measurements", async (t) => {
@@ -333,11 +251,11 @@ test("a non-timeout transport failure keeps its generic continuation and now car
 		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_FAILED, "pi", "pi subprocess failed", { exitCode: 4, elapsedMs: 1_200, timeoutMs: 900_000 });
 	});
 
-	const result = await runFinalize(cwd, harness, lineageId);
+	const result = await runCapture(cwd, harness, lineageId);
 
 	assert.equal(result.outcome, "pi-host-relay-transport-failure");
 	assert.deepEqual(result.failure, { kind: "pi-failed", stage: "pi", exit_code: 4, timed_out: false, elapsed_ms: 1_200, timeout_ms: 900_000 });
-	assert.match(String(result.next_action), /Re-query negotiated STATUS/);
+	assert.match(String(result.next_action), /fresh STATUS/);
 });
 
 test("materialize tokens without a provider submission fail closed as a typed contract mismatch", async (t) => {
@@ -351,7 +269,7 @@ test("materialize tokens without a provider submission fail closed as a typed co
 		return { promptByteLength: 1, resultByteLength: 1, submission: "{}" };
 	});
 
-	const result = await runFinalize(cwd, harness, lineageId);
+	const result = await runCapture(cwd, harness, lineageId);
 
 	assert.equal(relayCalls, 0, "the completing form is never synthesized, so nothing launches");
 	assert.equal(result.status, "blocked");
@@ -360,7 +278,6 @@ test("materialize tokens without a provider submission fail closed as a typed co
 	assert.equal(result.reason, REVIEW_HOST_RELAY_SUBMISSION_MISSING_MESSAGE);
 	assert.equal(result.mutation_performed, false);
 	assert.equal(result.mutation_outcome, "none");
-	assert.equal(harness.finalizeCalls, 0);
 	assert.equal(harness.statusCalls.length, 1, "no relaunch and no post-capture STATUS after the contract mismatch");
 });
 
@@ -381,7 +298,7 @@ test("collect inputs without the provider-issued materialize token never reach t
 	// The existing lane may fail on the synthetic projection; only the relay
 	// boundary is under test here: it must never be consulted.
 	try {
-		await runFinalize(cwd, harness, lineageId);
+		await runCapture(cwd, harness, lineageId);
 	} catch {
 		// Existing-lane behavior for this synthetic fixture is out of scope.
 	}

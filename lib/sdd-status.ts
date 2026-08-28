@@ -6,7 +6,10 @@ import {
 	type DomainCollision,
 } from "./openspec-guardrails.ts";
 
-export type SddArtifactStore = "openspec" | "engram" | "both" | "none";
+// Canonical names match gentle-ai, which owns this contract. The dual-store
+// mode was called "both" here; "hybrid" is the provider's name for the same
+// thing, and normalizeSddArtifactStore keeps already-persisted "both" loading.
+export type SddArtifactStore = "openspec" | "engram" | "hybrid" | "none";
 export type ArtifactState = "missing" | "done" | "partial";
 export type DependencyState = "blocked" | "ready" | "all_done" | "not_applicable";
 export type ApplyState = "blocked" | "ready" | "all_done" | "not_applicable";
@@ -482,7 +485,7 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 	//   - store engram or none: always non-authoritative (no disk backing)
 	//   - store both, no openspec/ dir: non-authoritative (no disk to scan)
 	// The both-with-openspec cases are handled below after listing active changes.
-	if (store === "engram" || store === "none" || (store === "both" && !hasOpenSpecDir)) {
+	if (store === "engram" || store === "none" || (store === "hybrid" && !hasOpenSpecDir)) {
 		const changeName = options.changeName?.trim() || null;
 		return nonAuthoritativeStatus(options.cwd, changeName, store, options.includeInstructions);
 	}
@@ -500,7 +503,7 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 			// store both + openspec/ present + zero active changes + no changeName:
 			// The change may live only in Engram — non-authoritative, not a false block.
 			// Pure openspec with zero changes is a real block (run sdd-new).
-			if (store === "both") {
+			if (store === "hybrid") {
 				return nonAuthoritativeStatus(options.cwd, null, store, options.includeInstructions);
 			}
 			return emptyStatus(root, null, ["No active SDD changes found."], store, false, options.reviewAuthority);
@@ -517,7 +520,7 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 		// store both + openspec/ present + named change NOT found on disk:
 		// The change may live only in Engram — non-authoritative.
 		// Pure openspec still blocks (legit "run sdd-new").
-		if (store === "both") {
+		if (store === "hybrid") {
 			return nonAuthoritativeStatus(options.cwd, changeName, store, options.includeInstructions);
 		}
 		return emptyStatus(root, changeName, [`Active change not found: ${changeName}.`], store, false, options.reviewAuthority);

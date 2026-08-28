@@ -428,13 +428,13 @@ test("resolveSddStatus with artifactStore none returns non-authoritative status 
 	assert.equal(status.nextRecommended, "resolve-via-engram");
 });
 
-test("resolveSddStatus with artifactStore both uses disk scan and reflects store", async () => {
+test("resolveSddStatus with artifactStore hybrid uses disk scan and reflects store", async () => {
 	const cwd = await workspace();
 	seedChange(cwd);
 
-	const status = resolveSddStatus({ cwd, artifactStore: "both", changeName: "add-auth" });
+	const status = resolveSddStatus({ cwd, artifactStore: "hybrid", changeName: "add-auth" });
 
-	assert.equal(status.artifactStore, "both");
+	assert.equal(status.artifactStore, "hybrid");
 	assert.equal(status.changeName, "add-auth");
 	assert.notEqual(status.nextRecommended, "resolve-via-engram");
 });
@@ -484,13 +484,13 @@ test("parseSddStatusCommandArgs extracts change and json flag", () => {
 	});
 });
 
-test("resolveSddStatus with artifactStore both and NO openspec dir returns non-authoritative status", async () => {
+test("resolveSddStatus with artifactStore hybrid and NO openspec dir returns non-authoritative status", async () => {
 	const cwd = await workspace();
-	// No openspec directory — both store without disk backing is non-authoritative
+	// No openspec directory — the hybrid store without disk backing is non-authoritative
 
-	const status = resolveSddStatus({ cwd, artifactStore: "both", changeName: "my-change" });
+	const status = resolveSddStatus({ cwd, artifactStore: "hybrid", changeName: "my-change" });
 
-	assert.equal(status.artifactStore, "both");
+	assert.equal(status.artifactStore, "hybrid");
 	assert.equal(status.changeName, "my-change");
 	assert.deepEqual(status.blockedReasons, []);
 	assert.equal(status.nextRecommended, "resolve-via-engram");
@@ -499,13 +499,13 @@ test("resolveSddStatus with artifactStore both and NO openspec dir returns non-a
 	assert.equal(status.dependencies.archive, "not_applicable");
 });
 
-test("resolveSddStatus with artifactStore both and existing openspec dir runs authoritative disk scan", async () => {
+test("resolveSddStatus with artifactStore hybrid and existing openspec dir runs authoritative disk scan", async () => {
 	const cwd = await workspace();
 	seedChange(cwd);
 
-	const status = resolveSddStatus({ cwd, artifactStore: "both", changeName: "add-auth" });
+	const status = resolveSddStatus({ cwd, artifactStore: "hybrid", changeName: "add-auth" });
 
-	assert.equal(status.artifactStore, "both");
+	assert.equal(status.artifactStore, "hybrid");
 	assert.equal(status.changeName, "add-auth");
 	assert.notEqual(status.nextRecommended, "resolve-via-engram");
 	assert.equal(status.artifacts.proposal, "done");
@@ -526,13 +526,13 @@ test("isNonAuthoritativeStatus reads typed isNonAuthoritative field and matches 
 	assert.equal(isNonAuthoritativeStatus(none), true);
 	assert.equal(none.nextRecommended, "resolve-via-engram");
 
-	const bothWithoutOpenspec = resolveSddStatus({ cwd, artifactStore: "both", changeName: "x" });
+	const bothWithoutOpenspec = resolveSddStatus({ cwd, artifactStore: "hybrid", changeName: "x" });
 	assert.equal(bothWithoutOpenspec.isNonAuthoritative, true);
 	assert.equal(isNonAuthoritativeStatus(bothWithoutOpenspec), true);
 	assert.equal(bothWithoutOpenspec.nextRecommended, "resolve-via-engram");
 
 	seedChange(cwd);
-	const bothWithOpenspec = resolveSddStatus({ cwd, artifactStore: "both", changeName: "add-auth" });
+	const bothWithOpenspec = resolveSddStatus({ cwd, artifactStore: "hybrid", changeName: "add-auth" });
 	assert.equal(bothWithOpenspec.isNonAuthoritative, false);
 	assert.equal(isNonAuthoritativeStatus(bothWithOpenspec), false);
 	assert.notEqual(bothWithOpenspec.nextRecommended, "resolve-via-engram");
@@ -551,12 +551,12 @@ test("isNonAuthoritative boolean field is set correctly across all store/disk co
 	assert.equal(none.isNonAuthoritative, true);
 
 	// both without openspec/ → non-authoritative
-	const bothWithout = resolveSddStatus({ cwd, artifactStore: "both", changeName: "x" });
+	const bothWithout = resolveSddStatus({ cwd, artifactStore: "hybrid", changeName: "x" });
 	assert.equal(bothWithout.isNonAuthoritative, true);
 
 	// both WITH openspec/ and seeded change → authoritative
 	seedChange(cwd);
-	const bothWith = resolveSddStatus({ cwd, artifactStore: "both", changeName: "add-auth" });
+	const bothWith = resolveSddStatus({ cwd, artifactStore: "hybrid", changeName: "add-auth" });
 	assert.equal(bothWith.isNonAuthoritative, false);
 
 	// openspec (default disk scan, seeded) → authoritative
@@ -565,30 +565,30 @@ test("isNonAuthoritative boolean field is set correctly across all store/disk co
 });
 
 // Fix 4 item 1 — both + openspec/ dir present + change NOT on disk → non-authoritative
-test("resolveSddStatus with artifactStore both, openspec dir present but change not on disk returns non-authoritative", async () => {
+test("resolveSddStatus with artifactStore hybrid, openspec dir present but change not on disk returns non-authoritative", async () => {
 	const cwd = await workspace();
 	// Create an openspec/changes dir with a different change — not the requested one
 	mkdirSync(join(cwd, "openspec", "changes", "other-change"), { recursive: true });
 
-	const status = resolveSddStatus({ cwd, artifactStore: "both", changeName: "missing-change" });
+	const status = resolveSddStatus({ cwd, artifactStore: "hybrid", changeName: "missing-change" });
 
 	assert.equal(status.isNonAuthoritative, true);
 	assert.equal(status.nextRecommended, "resolve-via-engram");
 	assert.deepEqual(status.blockedReasons, []);
 	assert.equal(status.applyState, "not_applicable");
-	assert.equal(status.artifactStore, "both");
+	assert.equal(status.artifactStore, "hybrid");
 	// Must NOT be treated as blocked
 	assert.notEqual(status.applyState, "blocked");
 });
 
 // Fix 4 item 2 — strengthen existing both-with-openspec-and-seeded-change test
-test("resolveSddStatus with artifactStore both, openspec dir present and change on disk is authoritative", async () => {
+test("resolveSddStatus with artifactStore hybrid, openspec dir present and change on disk is authoritative", async () => {
 	const cwd = await workspace();
 	seedChange(cwd);
 
-	const status = resolveSddStatus({ cwd, artifactStore: "both", changeName: "add-auth" });
+	const status = resolveSddStatus({ cwd, artifactStore: "hybrid", changeName: "add-auth" });
 
-	assert.equal(status.artifactStore, "both");
+	assert.equal(status.artifactStore, "hybrid");
 	assert.equal(status.changeName, "add-auth");
 	// Must be authoritative
 	assert.equal(isNonAuthoritativeStatus(status), false);
@@ -618,7 +618,7 @@ test("renderSddDispatcherMarkdown for both-without-openspec does NOT render Read
 	const cwd = await workspace();
 	// No openspec directory — both store is non-authoritative
 
-	const status = resolveSddStatus({ cwd, artifactStore: "both", changeName: "fix-x" });
+	const status = resolveSddStatus({ cwd, artifactStore: "hybrid", changeName: "fix-x" });
 	const markdown = renderSddDispatcherMarkdown(status);
 
 	assert.doesNotMatch(markdown, /### Ready/);
@@ -628,7 +628,7 @@ test("renderSddDispatcherMarkdown for both-without-openspec does NOT render Read
 test("renderNativeSddPhasePrompt for both-without-openspec emits non-authoritative line", async () => {
 	const cwd = await workspace();
 
-	const status = resolveSddStatus({ cwd, artifactStore: "both", changeName: "fix-x" });
+	const status = resolveSddStatus({ cwd, artifactStore: "hybrid", changeName: "fix-x" });
 	const prompt = renderNativeSddPhasePrompt(status, "apply");
 
 	assert.match(prompt, /non-authoritative/);
@@ -646,17 +646,17 @@ test("renderPhaseInstructions for not_applicable applyState emits neutral line",
 });
 
 // Fix 4 item 1 — both + openspec/ + ZERO changes + no changeName → non-authoritative
-test("resolveSddStatus both + openspec/ dir + zero active changes + no changeName returns non-authoritative", async () => {
+test("resolveSddStatus hybrid + openspec/ dir + zero active changes + no changeName returns non-authoritative", async () => {
 	const cwd = await workspace();
 	// openspec/ dir exists but holds no active changes (only the changes/ subdir)
 	mkdirSync(join(cwd, "openspec", "changes"), { recursive: true });
 
-	const status = resolveSddStatus({ cwd, artifactStore: "both" });
+	const status = resolveSddStatus({ cwd, artifactStore: "hybrid" });
 
 	assert.equal(status.isNonAuthoritative, true);
 	assert.equal(status.nextRecommended, "resolve-via-engram");
 	assert.deepEqual(status.blockedReasons, []);
-	assert.equal(status.artifactStore, "both");
+	assert.equal(status.artifactStore, "hybrid");
 	assert.equal(status.applyState, "not_applicable");
 	assert.equal(status.dependencies.apply, "not_applicable");
 	assert.equal(status.dependencies.archive, "not_applicable");
@@ -665,12 +665,12 @@ test("resolveSddStatus both + openspec/ dir + zero active changes + no changeNam
 });
 
 // Fix 4 item 2 — both + openspec/ + MULTIPLE changes + no changeName → authoritative select-change
-test("resolveSddStatus both + openspec/ dir + multiple active changes + no changeName stays authoritative", async () => {
+test("resolveSddStatus hybrid + openspec/ dir + multiple active changes + no changeName stays authoritative", async () => {
 	const cwd = await workspace();
 	mkdirSync(join(cwd, "openspec", "changes", "alpha"), { recursive: true });
 	mkdirSync(join(cwd, "openspec", "changes", "beta"), { recursive: true });
 
-	const status = resolveSddStatus({ cwd, artifactStore: "both" });
+	const status = resolveSddStatus({ cwd, artifactStore: "hybrid" });
 
 	// Authoritative ambiguous-selection behavior must be preserved
 	assert.equal(status.isNonAuthoritative, false);
@@ -679,16 +679,16 @@ test("resolveSddStatus both + openspec/ dir + multiple active changes + no chang
 });
 
 // Fix 4 item 3 — both + openspec/ + ONE resolvable change → authoritative
-test("resolveSddStatus both + openspec/ dir + exactly one active change is authoritative", async () => {
+test("resolveSddStatus hybrid + openspec/ dir + exactly one active change is authoritative", async () => {
 	const cwd = await workspace();
 	seedChange(cwd);
 
 	// No changeName supplied — should auto-select the single change
-	const status = resolveSddStatus({ cwd, artifactStore: "both" });
+	const status = resolveSddStatus({ cwd, artifactStore: "hybrid" });
 
 	assert.equal(status.isNonAuthoritative, false);
 	assert.equal(status.changeName, "add-auth");
-	assert.equal(status.artifactStore, "both");
+	assert.equal(status.artifactStore, "hybrid");
 	assert.notEqual(status.applyState, "not_applicable");
 	assert.notEqual(status.nextRecommended, "resolve-via-engram");
 	assert.equal(status.artifacts.proposal, "done");
@@ -723,10 +723,10 @@ test("resolveSddStatus openspec + named change missing still blocks", async () =
 test("renderSddDispatcherMarkdown for non-authoritative both status shows artifact store 'both'", async () => {
 	const cwd = await workspace();
 
-	const status = resolveSddStatus({ cwd, artifactStore: "both", changeName: "fix-x" });
+	const status = resolveSddStatus({ cwd, artifactStore: "hybrid", changeName: "fix-x" });
 	const markdown = renderSddDispatcherMarkdown(status);
 
-	assert.match(markdown, /artifact store: both/);
+	assert.match(markdown, /artifact store: hybrid/);
 	assert.doesNotMatch(markdown, /Engram or none/);
 	assert.match(markdown, /resolve via Engram/i);
 });

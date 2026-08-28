@@ -122,17 +122,17 @@ Orchestration MAY implement/verify but MUST NOT deliver/publish. SDD adds no rev
 
 ### Requirement: Native SDD readiness evidence
 
-For both OpenSpec and Engram native status, adapter readiness MUST be true only when `nextRecommended` is `verify` or `archive`, `blockedReasons` is empty, and published `reviewGate.result` is `allow`. Missing gate evidence, `review`, `resolve-review`, blockers, and every non-allow or stale gate result MUST remain false.
+For both OpenSpec and Engram native status, adapter readiness MUST be true only when `nextRecommended` is `verify` or `archive` and `blockedReasons` is empty. Published review evidence, including `reviewGate.result`, is informational and MUST NOT authorize, deny, or block verification, archive, or delivery. Missing, stale, or non-allow review evidence does not change readiness; ordinary repository policy owns delivery.
 
-#### Scenario: Post-review allow
+#### Scenario: Readiness with review evidence
 
-- GIVEN OpenSpec or Engram status recommends verify/archive with no blockers and an allow gate
+- GIVEN OpenSpec or Engram status recommends verify/archive with no blockers and any review-evidence state
 - WHEN readiness is decoded
 - THEN readiness is true
 
-#### Scenario: Missing, stale, or blocked evidence
+#### Scenario: Blocked status
 
-- GIVEN any other action, blocker, missing gate, or non-allow gate
+- GIVEN any other action or blocker
 - WHEN readiness is decoded
 - THEN readiness is false
 

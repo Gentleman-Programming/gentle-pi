@@ -37,7 +37,9 @@ When any material value in the complete candidate binding differs, controller ro
 
 ### Requirement: Non-blocking safety composition
 
-All lifecycle gates MUST use `GateTargetV1` and receipts only. PR targets bind base/head refs, commits, and trees; release targets bind tag ref/object, peeled commit, and commit tree. Every identity MUST resolve. Target hash and result MUST be journaled. Post-apply MAY explicitly start ordinary without a receipt, never Judgment Day. Dangerous-command confirmation remains authoritative. Controller candidate-aware routing MUST specialize only terminal compact applicability; graph-v1, legacy, mixed, ambiguous, and reset-in-progress authority inspection MUST remain authoritative and fail closed.
+**Superseded delivery-gate context:** this requirement formerly used `GateTargetV1` and receipts to bind PR/release delivery targets and journal a delivery-gate result. That model is obsolete and retained only to explain the candidate-applicability rationale.
+
+For review-only compatibility inspection, controller candidate-aware routing MAY use `GateTargetV1` and receipt fields to associate an exact frozen review candidate with its review evidence. Those fields MUST NOT rederive or validate a PR/release delivery target, journal delivery authorization, or authorize, deny, or block commit, push, pull-request, release, or archive. Post-apply MAY explicitly start ordinary review without a receipt, never Judgment Day. Dangerous-command confirmation remains authoritative under ordinary repository policy. Controller candidate-aware routing MUST specialize only terminal compact applicability; graph-v1, legacy, mixed, ambiguous, and reset-in-progress authority inspection MUST remain authoritative and fail closed.
 (Previously: routing/validation used receipt-only safety composition without candidate-aware shared-terminal applicability or the stated compatibility boundary.)
 
 #### Scenario: Legacy or ambiguous shared authority
