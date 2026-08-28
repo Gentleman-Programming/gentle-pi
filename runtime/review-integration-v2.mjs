@@ -2013,6 +2013,9 @@ export const REVIEW_LAST_EVENT_CLOSURE_OPERATION = {
 const REVIEW_LAST_EVENT_TERMINAL_STATES = ["approved", "correction_required", "escalated"]         ;
 
 
+const REVIEW_STATUS_CONTINUATION_OPERATION = {
+	STATUS: "review.status",
+}         ;
 
 
 
@@ -2031,9 +2034,98 @@ const REVIEW_LAST_EVENT_TERMINAL_STATES = ["approved", "correction_required", "e
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function decodeReviewStatusContinuationArtifactV1(value         , label        )                                     {
+	const artifact = exactRecord(value, label, ["schema", "capability", "sha256", "lineage_id", "target_identity", "lens", "selected_order", "subject_hash", "admission_decision"]);
+	if (artifact.schema !== "gentle-ai.review-result-artifact/v2") throw new TypeError(`${label}.schema must be gentle-ai.review-result-artifact/v2`);
+	if (artifact.capability !== "review.native_result_artifact") throw new TypeError(`${label}.capability must be review.native_result_artifact`);
+	if (artifact.admission_decision !== "completed") throw new TypeError(`${label}.admission_decision must be completed`);
+	return {
+		schema: "gentle-ai.review-result-artifact/v2",
+		capability: "review.native_result_artifact",
+		sha256: sha256(artifact.sha256, `${label}.sha256`),
+		lineageId: lineage(artifact.lineage_id, `${label}.lineage_id`),
+		targetIdentity: sha256(artifact.target_identity, `${label}.target_identity`),
+		lens: nonempty(artifact.lens, `${label}.lens`),
+		selectedOrder: integer(artifact.selected_order, `${label}.selected_order`, 0),
+		subjectHash: sha256(artifact.subject_hash, `${label}.subject_hash`),
+		admissionDecision: "completed",
+	};
+}
+
+function decodeReviewStatusContinuationV1(value         )                             {
+	const body = exactRecord(value, "last_event_closure.status_continuation", ["operation", "arguments", "preconditions", "binding"], ["command", "selector_arguments", "artifacts"]);
+	if (body.operation !== REVIEW_STATUS_CONTINUATION_OPERATION.STATUS) throw new TypeError("last_event_closure.status_continuation.operation must be review.status");
+	const argumentsList = decodeTransitionArguments(body.arguments, "last_event_closure.status_continuation.arguments");
+	if (argumentsList.some((argument) => argument.token === undefined)) throw new TypeError("last_event_closure.status_continuation.arguments require exact tokens");
+	const preconditions = decodeTransitionArguments(body.preconditions, "last_event_closure.status_continuation.preconditions");
+	if (preconditions.length === 0) throw new TypeError("last_event_closure.status_continuation.preconditions requires at least one entry");
+	const sourceBinding = exactRecord(body.binding, "last_event_closure.status_continuation.binding", ["target_identity"], ["lineage_id", "revision", "repository_context"]);
+	const lineageId = sourceBinding.lineage_id === undefined ? undefined : lineage(sourceBinding.lineage_id, "last_event_closure.status_continuation.binding.lineage_id");
+	const revision = sourceBinding.revision === undefined ? undefined : sha256(sourceBinding.revision, "last_event_closure.status_continuation.binding.revision");
+	const repositoryContext = sourceBinding.repository_context === undefined
+		? undefined
+		: text(sourceBinding.repository_context, "last_event_closure.status_continuation.binding.repository_context", { pattern: /^rctx1_[0-9a-f]{64}$/ });
+	const selectorArguments = body.selector_arguments === undefined
+		? undefined
+		: decodeTransitionArguments(body.selector_arguments, "last_event_closure.status_continuation.selector_arguments");
+	const artifacts = body.artifacts === undefined
+		? undefined
+		: array(body.artifacts, "last_event_closure.status_continuation.artifacts", decodeReviewStatusContinuationArtifactV1);
+	const command = body.command === undefined
+		? undefined
+		: text(body.command, "last_event_closure.status_continuation.command", { minimum: 1, pattern: /^gentle-ai review [a-z][a-z-]*/ });
+	return {
+		operation: REVIEW_STATUS_CONTINUATION_OPERATION.STATUS,
+		arguments: argumentsList,
+		...(selectorArguments === undefined ? {} : { selectorArguments }),
+		preconditions,
+		binding: {
+			targetIdentity: sha256(sourceBinding.target_identity, "last_event_closure.status_continuation.binding.target_identity"),
+			...(lineageId === undefined ? {} : { lineageId }),
+			...(revision === undefined ? {} : { revision }),
+			...(repositoryContext === undefined ? {} : { repositoryContext }),
+		},
+		...(artifacts === undefined ? {} : { artifacts }),
+		...(command === undefined ? {} : { command }),
+		raw: body,
+	};
+}
 
 export function decodeReviewLastEventClosureV1(value         )                           {
-	const body = exactRecord(value, "last_event_closure", ["schema", "operation", "lineage_id", "state", "store_revision"], ["target_identity", "request_hash", "correction_lines", "action", "advisory_findings"]);
+	const body = exactRecord(value, "last_event_closure", ["schema", "operation", "lineage_id", "state", "store_revision"], ["target_identity", "request_hash", "correction_lines", "action", "advisory_findings", "status_continuation"]);
 	if (body.schema !== REVIEW_LAST_EVENT_CLOSURE_SCHEMA) throw new TypeError(`last_event_closure.schema must be ${REVIEW_LAST_EVENT_CLOSURE_SCHEMA}`);
 	const operation = enumeration(body.operation, Object.values(REVIEW_LAST_EVENT_CLOSURE_OPERATION), "last_event_closure.operation")                                   ;
 	const state = enumeration(body.state, REVIEW_LAST_EVENT_TERMINAL_STATES, "last_event_closure.state")                               ;
@@ -2045,7 +2137,7 @@ export function decodeReviewLastEventClosureV1(value         )                  
 		storeRevision: sha256(body.store_revision, "last_event_closure.store_revision"),
 	};
 	if (operation === REVIEW_LAST_EVENT_CLOSURE_OPERATION.CAPTURE_CORRECTION_PLAN) {
-		if (body.action !== undefined || body.advisory_findings !== undefined) throw new TypeError("last_event_closure correction-plan cannot carry action or advisory_findings");
+		if (body.action !== undefined || body.advisory_findings !== undefined || body.status_continuation !== undefined) throw new TypeError("last_event_closure correction-plan cannot carry action, advisory_findings, or status_continuation");
 		if (state !== "correction_required") throw new TypeError("last_event_closure correction-plan requires correction_required state");
 		return {
 			...shared,
@@ -2055,6 +2147,24 @@ export function decodeReviewLastEventClosureV1(value         )                  
 		};
 	}
 	if (body.target_identity !== undefined || body.request_hash !== undefined || body.correction_lines !== undefined) throw new TypeError("last_event_closure terminal capture cannot carry correction-plan fields");
+	const requiresStatusContinuation = state === "correction_required" && (
+		operation === REVIEW_LAST_EVENT_CLOSURE_OPERATION.CAPTURE_RESULT || operation === REVIEW_LAST_EVENT_CLOSURE_OPERATION.CAPTURE_REFUTER
+	);
+	if (requiresStatusContinuation && body.status_continuation === undefined) throw new TypeError("last_event_closure requires status_continuation for correction-required result or refuter capture");
+	if (!requiresStatusContinuation && body.status_continuation !== undefined) throw new TypeError("last_event_closure status_continuation is only valid for correction-required result or refuter capture");
+	const statusContinuation = body.status_continuation === undefined ? undefined : decodeReviewStatusContinuationV1(body.status_continuation);
+	if (statusContinuation !== undefined) {
+		if (statusContinuation.binding.lineageId !== shared.lineageId) {
+			throw new TypeError("last_event_closure status continuation lineage does not match its enclosing closure");
+		}
+		if (statusContinuation.binding.revision !== shared.storeRevision) {
+			throw new TypeError("last_event_closure status continuation revision does not match its enclosing closure");
+		}
+		const lineageArguments = statusContinuation.arguments.filter((argument) => argument.name === "lineage");
+		if (lineageArguments.length !== 1 || lineageArguments[0]?.value !== shared.lineageId || lineageArguments[0]?.token !== `--lineage=${shared.lineageId}`) {
+			throw new TypeError("last_event_closure status continuation lineage argument does not match its enclosing closure");
+		}
+	}
 	const action = nonempty(body.action, "last_event_closure.action");
 	const advisoryFindings = body.advisory_findings === undefined
 		? undefined
@@ -2064,6 +2174,7 @@ export function decodeReviewLastEventClosureV1(value         )                  
 		...shared,
 		action,
 		...(advisoryFindings === undefined ? {} : { advisoryFindings }),
+		...(statusContinuation === undefined ? {} : { statusContinuation }),
 	};
 }
 
@@ -2074,6 +2185,9 @@ export function assertReviewLastEventClosureBinding(
 	if (closure.lineageId !== binding.lineageId) throw new TypeError("last_event_closure lineage does not match its provider binding");
 	if (binding.targetIdentity !== undefined && closure.targetIdentity !== undefined && closure.targetIdentity !== binding.targetIdentity) {
 		throw new TypeError("last_event_closure target does not match its provider binding");
+	}
+	if (binding.targetIdentity !== undefined && closure.statusContinuation !== undefined && closure.statusContinuation.binding.targetIdentity !== binding.targetIdentity) {
+		throw new TypeError("last_event_closure status continuation target does not match its provider binding");
 	}
 	if (binding.requestHash !== undefined && closure.requestHash !== undefined && closure.requestHash !== binding.requestHash) {
 		throw new TypeError("last_event_closure request hash does not match its provider binding");

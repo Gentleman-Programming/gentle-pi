@@ -618,6 +618,17 @@ test("dev-binary: Pi controller keeps an explicit B root and selected-untracked 
 			assert.equal(reviewerClosure.schema, "gentle-ai.review-last-event-closure/v1");
 			assert.equal(reviewerClosure.operation, "review/capture-result");
 			assert.equal(reviewerClosure.state, "correction_required", "the deterministic reviewer finding must open correction_required");
+			const statusContinuation = record(reviewerClosure.status_continuation, "reviewer status continuation");
+			assert.equal(statusContinuation.operation, "review.status", "correction-required closure must carry its provider-owned STATUS re-entry");
+			assert.ok(Array.isArray(statusContinuation.arguments), "reviewer status continuation must carry ordered arguments");
+			const statusContinuationTokens = statusContinuation.arguments.map((entry) => stringValue(record(entry, "reviewer status continuation argument").token, "reviewer status continuation token"));
+			assert.match(statusContinuationTokens[0]!, /^--cwd=/);
+			assert.deepEqual(statusContinuationTokens.slice(1), [
+				"--contract=gentle-ai.review-integration/v2",
+				"--next-transition=true",
+				`--lineage=${lineage}`,
+				"--agent=pi",
+			]);
 			correctionOpened = true;
 			break;
 		}

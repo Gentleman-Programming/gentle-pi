@@ -3999,6 +3999,7 @@ function mapLastEventClosure(
 			...(closure.requestHash === undefined ? {} : { request_hash: closure.requestHash }),
 			...(closure.correctionLines === undefined ? {} : { correction_lines: closure.correctionLines }),
 			...(closure.advisoryFindings === undefined ? {} : { advisory_findings: closure.advisoryFindings }),
+			...(closure.statusContinuation === undefined ? {} : { status_continuation: closure.statusContinuation.raw }),
 		},
 		lineage_id: closure.lineageId,
 		state: closure.state,
