@@ -30,9 +30,17 @@ interface ChoiceTool {
 	execute: (...args: unknown[]) => Promise<ChoiceResult>;
 }
 
+interface ChoiceLifecycleEvent {
+	channel: string;
+	data: { active: boolean };
+}
+
 type BeforeAgentStart = (event: unknown, ctx: { mode: string }) => void | Promise<void>;
 
-function registerChoiceTool(initialTools: string[] = []) {
+function registerChoiceTool(
+	initialTools: string[] = [],
+	onLifecycleEvent?: (event: ChoiceLifecycleEvent) => void,
+) {
 	let activeTools = initialTools;
 	let runtimeActionsAllowed = false;
 	let getActiveToolsCalls = 0;
@@ -40,6 +48,7 @@ function registerChoiceTool(initialTools: string[] = []) {
 	let tool: ChoiceTool | undefined;
 	const hooks: BeforeAgentStart[] = [];
 	const registeredToolNames: string[] = [];
+	const emittedEvents: ChoiceLifecycleEvent[] = [];
 	const pi = {
 		getActiveTools: () => {
 			getActiveToolsCalls++;
@@ -62,6 +71,13 @@ function registerChoiceTool(initialTools: string[] = []) {
 		on: (event: string, handler: BeforeAgentStart) => {
 			if (event === "before_agent_start") hooks.push(handler);
 		},
+		events: {
+			emit(channel: string, data: { active: boolean }) {
+				const event = { channel, data };
+				emittedEvents.push(event);
+				onLifecycleEvent?.(event);
+			},
+		},
 	};
 	askUserChoice(pi as never);
 	assert.ok(tool, "ask_user_choice must register");
@@ -70,6 +86,7 @@ function registerChoiceTool(initialTools: string[] = []) {
 		tool,
 		registeredToolNames,
 		activeTools: () => [...activeTools],
+		emittedEvents: () => [...emittedEvents],
 		runtimeActionCalls: () => ({ getActiveTools: getActiveToolsCalls, setActiveTools: setActiveToolsCalls }),
 		allowRuntimeActions: () => {
 			runtimeActionsAllowed = true;
@@ -146,6 +163,94 @@ test("ask_user_choice cancels without a value and remains unavailable outside th
 		() => tool.execute("call", { question: "Proceed?", options }, new AbortController().signal, undefined, { mode: "print" }),
 		/unavailable outside the interactive TUI/,
 	);
+});
+
+test("ask_user_choice emits a private balanced lifecycle around selection and cancellation", async () => {
+	const sequence: string[] = [];
+	const selectedRegistration = registerChoiceTool([], ({ data }) => {
+		sequence.push(data.active ? "active" : "inactive");
+	});
+	const selected = await selectedRegistration.tool.execute(
+		"call",
+		{ question: "private choice question", options },
+		new AbortController().signal,
+		undefined,
+		{
+			mode: "tui",
+			ui: {
+				custom: async () => {
+					sequence.push("custom");
+					return { value: "preserve_requested_hash", label: "Preserve requested hash", index: 2 };
+				},
+			},
+		},
+	);
+	assert.equal(selected.details.selection?.value, "preserve_requested_hash");
+	assert.deepEqual(sequence, ["active", "custom", "inactive"]);
+	assert.deepEqual(selectedRegistration.emittedEvents(), [
+		{ channel: "gentle-pi:ask-user-choice:blocked", data: { active: true } },
+		{ channel: "gentle-pi:ask-user-choice:blocked", data: { active: false } },
+	]);
+	assert.doesNotMatch(
+		JSON.stringify(selectedRegistration.emittedEvents()),
+		/private choice question|Authorize observed hash|Accept the baseline hash|preserve_requested_hash/,
+	);
+
+	const cancelledRegistration = registerChoiceTool();
+	const cancelled = await cancelledRegistration.tool.execute(
+		"call",
+		{ question: "Proceed?", options },
+		new AbortController().signal,
+		undefined,
+		{ mode: "tui", ui: { custom: async () => undefined } },
+	);
+	assert.equal(cancelled.details.cancelled, true);
+	assert.deepEqual(cancelledRegistration.emittedEvents(), [
+		{ channel: "gentle-pi:ask-user-choice:blocked", data: { active: true } },
+		{ channel: "gentle-pi:ask-user-choice:blocked", data: { active: false } },
+	]);
+});
+
+test("ask_user_choice settles its lifecycle after a custom UI error and emits nothing outside the TUI", async () => {
+	const failedRegistration = registerChoiceTool();
+	const customError = new Error("custom UI failed");
+	await assert.rejects(
+		failedRegistration.tool.execute(
+			"call",
+			{ question: "Proceed?", options },
+			new AbortController().signal,
+			undefined,
+			{ mode: "tui", ui: { custom: async () => { throw customError; } } },
+		),
+		(error) => error === customError,
+	);
+	assert.deepEqual(failedRegistration.emittedEvents(), [
+		{ channel: "gentle-pi:ask-user-choice:blocked", data: { active: true } },
+		{ channel: "gentle-pi:ask-user-choice:blocked", data: { active: false } },
+	]);
+
+	const nonTuiRegistration = registerChoiceTool();
+	let customCalled = false;
+	await assert.rejects(
+		nonTuiRegistration.tool.execute(
+			"call",
+			{ question: "Proceed?", options },
+			new AbortController().signal,
+			undefined,
+			{
+				mode: "print",
+				ui: {
+					custom: async () => {
+						customCalled = true;
+						return undefined;
+					},
+				},
+			},
+		),
+		/unavailable outside the interactive TUI/,
+	);
+	assert.equal(customCalled, false);
+	assert.deepEqual(nonTuiRegistration.emittedEvents(), []);
 });
 
 test("ask_user_choice is offered only for interactive TUI turns and preserves the open questionnaire", async () => {

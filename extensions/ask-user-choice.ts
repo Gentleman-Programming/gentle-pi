@@ -4,6 +4,7 @@ import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi
 import { type Static, Type } from "typebox";
 
 const CHOICE_TOOL_NAME = "ask_user_choice";
+const ASK_USER_CHOICE_BLOCKED_EVENT = "gentle-pi:ask-user-choice:blocked";
 
 const ChoiceOptionSchema = Type.Object(
 	{
@@ -76,34 +77,40 @@ export default function askUserChoice(pi: ExtensionAPI): void {
 				label: option.label,
 				description: option.description,
 			}));
-			const selection = await ctx.ui.custom<ChoiceSelection | undefined>((tui, theme, _keybindings, done) => {
-				const container = new Container();
-				container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-				container.addChild(new Text(theme.fg("accent", theme.bold(params.question)), 1, 0));
-				const list = new SelectList(items, items.length, {
-					selectedPrefix: (text) => theme.fg("accent", text),
-					selectedText: (text) => theme.fg("accent", text),
-					description: (text) => theme.fg("muted", text),
-					scrollInfo: (text) => theme.fg("dim", text),
-					noMatch: (text) => theme.fg("warning", text),
+			let selection: ChoiceSelection | undefined;
+			try {
+				pi.events.emit(ASK_USER_CHOICE_BLOCKED_EVENT, { active: true });
+				selection = await ctx.ui.custom<ChoiceSelection | undefined>((tui, theme, _keybindings, done) => {
+					const container = new Container();
+					container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+					container.addChild(new Text(theme.fg("accent", theme.bold(params.question)), 1, 0));
+					const list = new SelectList(items, items.length, {
+						selectedPrefix: (text) => theme.fg("accent", text),
+						selectedText: (text) => theme.fg("accent", text),
+						description: (text) => theme.fg("muted", text),
+						scrollInfo: (text) => theme.fg("dim", text),
+						noMatch: (text) => theme.fg("warning", text),
+					});
+					list.onSelect = (item) => {
+						const index = items.indexOf(item);
+						done({ value: item.value, label: item.label, index: index + 1 });
+					};
+					list.onCancel = () => done(undefined);
+					container.addChild(list);
+					container.addChild(new Text(theme.fg("dim", "↑↓ navigate • Enter select • Esc cancel"), 1, 0));
+					container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+					return {
+						render: (width) => container.render(width),
+						invalidate: () => container.invalidate(),
+						handleInput: (data) => {
+							list.handleInput(data);
+							tui.requestRender();
+						},
+					};
 				});
-				list.onSelect = (item) => {
-					const index = items.indexOf(item);
-					done({ value: item.value, label: item.label, index: index + 1 });
-				};
-				list.onCancel = () => done(undefined);
-				container.addChild(list);
-				container.addChild(new Text(theme.fg("dim", "↑↓ navigate • Enter select • Esc cancel"), 1, 0));
-				container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-				return {
-					render: (width) => container.render(width),
-					invalidate: () => container.invalidate(),
-					handleInput: (data) => {
-						list.handleInput(data);
-						tui.requestRender();
-					},
-				};
-			});
+			} finally {
+				pi.events.emit(ASK_USER_CHOICE_BLOCKED_EVENT, { active: false });
+			}
 
 			if (selection === undefined) {
 				return {

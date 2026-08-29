@@ -764,7 +764,8 @@ test("RPIV questionnaire blockers emit only a private, balanced Herdr projection
 		registerTool() {},
 	} as unknown as ExtensionAPI;
 	createGentleAiExtension({ nativeReviewCli: null })(pi);
-	assert.equal(eventHandlers.size, 1);
+	assert.equal(eventHandlers.size, 2);
+	assert.equal(eventHandlers.has("gentle-pi:ask-user-choice:blocked"), true);
 	assert.equal(eventHandlers.has("rpiv:ask-user:blocked"), true);
 
 	const source = {
@@ -872,6 +873,73 @@ test("Herdr coordinates guarded confirmations and RPIV labels without inactive r
 	await questionnaireRequest;
 	assert.deepEqual(questionnaireFirst.herdrEvents, [
 		{ active: true, label: "Questionnaire awaiting input" },
+		{ active: true, label: "Guarded command confirmation" },
+		{ active: false },
+	]);
+});
+
+test("closed choice blockers retain the visible choice label through guarded-confirmation overlap", async () => {
+	type ToolCallHandler = (
+		event: { toolName: string; input: unknown },
+		ctx: ExtensionContext,
+	) => Promise<ToolCallEventResult | undefined>;
+	type HerdrBlockedEvent = { active: boolean; label?: string };
+	const handlers = new Map<string, ToolCallHandler>();
+	const eventHandlers = new Map<string, (data: unknown) => void>();
+	const herdrEvents: HerdrBlockedEvent[] = [];
+	const choiceEvents: Array<{ active: boolean }> = [];
+	const confirmations: Array<(approved: boolean) => void> = [];
+	const pi = {
+		on(name: string, handler: ToolCallHandler) {
+			handlers.set(name, handler);
+		},
+		events: {
+			emit(channel: string, data: unknown) {
+				if (channel === "herdr:blocked") herdrEvents.push(data as HerdrBlockedEvent);
+				if (channel === "gentle-pi:ask-user-choice:blocked") choiceEvents.push(data as { active: boolean });
+				eventHandlers.get(channel)?.(data);
+			},
+			on(channel: string, handler: (data: unknown) => void) {
+				eventHandlers.set(channel, handler);
+				return () => eventHandlers.delete(channel);
+			},
+		},
+		registerCommand() {},
+		registerTool() {},
+	} as unknown as ExtensionAPI;
+	createGentleAiExtension({ nativeReviewCli: null })(pi);
+	assert.equal(eventHandlers.has("gentle-pi:ask-user-choice:blocked"), true);
+
+	pi.events.emit("gentle-pi:ask-user-choice:blocked", { active: true });
+	assert.deepEqual(choiceEvents, [{ active: true }]);
+	assert.deepEqual(herdrEvents, [{ active: true, label: "Choice awaiting input" }]);
+
+	const guardedRequest = handlers.get("tool_call")!(
+		{ toolName: "bash", input: { command: "git rebase main" } },
+		{
+			cwd: process.cwd(),
+			hasUI: true,
+			ui: {
+				confirm: async () => new Promise<boolean>((resolve) => { confirmations.push(resolve); }),
+			},
+		} as ExtensionContext,
+	);
+	await Promise.resolve();
+	assert.equal(confirmations.length, 1);
+	assert.deepEqual(herdrEvents, [{ active: true, label: "Choice awaiting input" }]);
+
+	pi.events.emit("gentle-pi:ask-user-choice:blocked", { active: false });
+	assert.deepEqual(choiceEvents, [{ active: true }, { active: false }]);
+	assert.deepEqual(herdrEvents, [
+		{ active: true, label: "Choice awaiting input" },
+		{ active: true, label: "Guarded command confirmation" },
+	]);
+	assert.equal(herdrEvents.some((event) => event.active === false), false);
+
+	confirmations[0]!(true);
+	assert.equal(await guardedRequest, undefined);
+	assert.deepEqual(herdrEvents, [
+		{ active: true, label: "Choice awaiting input" },
 		{ active: true, label: "Guarded command confirmation" },
 		{ active: false },
 	]);
