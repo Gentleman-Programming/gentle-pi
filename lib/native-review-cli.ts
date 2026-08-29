@@ -57,6 +57,7 @@ export const NATIVE_REVIEW_OPERATION = {
 	CAPTURE_RESULT: "review/capture-result",
 	CAPTURE_CORRECTION_PLAN: "review/capture-correction-plan",
 	CAPTURE_PROVIDER_ROLE: "review/capture-provider-role",
+	ACKNOWLEDGE_APPROVED: "review/acknowledge-approved",
 } as const;
 export type NativeReviewOperation = (typeof NATIVE_REVIEW_OPERATION)[keyof typeof NATIVE_REVIEW_OPERATION];
 
@@ -385,6 +386,16 @@ export interface NativeReviewAdmittedResultManifest {
 
 /** A non-final reviewer capture acknowledges an admitted artifact; final captures close natively. */
 export type NativeReviewCaptureResultOutcome = NativeReviewAdmittedResultManifest | ReviewLastEventClosureV1;
+
+// The one continuation that burns approved authority. Its tokens are rendered
+// by the provider in a closed order and are relayed verbatim: Pi never builds,
+// reorders, or substitutes one, because a synthesized acknowledgement would be
+// Pi deciding that a review is over.
+export interface NativeReviewAcknowledgeApprovedRequest {
+	readonly argumentTokens: readonly string[];
+	readonly cwd: string;
+	readonly signal?: AbortSignal;
+}
 
 export interface NativeReviewCorrectionPlanCaptureRequest {
 	readonly argumentTokens: readonly string[];
@@ -958,7 +969,7 @@ function decodeLegacyReconcileAudit(value: unknown): NativeReviewRecoveryResult 
 // named, typed refusal instead of a generic schema-incompatible error, and
 // before any client ever tries to build an invocation for it (Design
 // Decision #6, migrate-review-integration-v2).
-const NATIVE_REVIEW_SUPPORTED_TRANSITION_OPERATIONS = new Set(["review.start", "review.recover", "review.repair"]);
+const NATIVE_REVIEW_SUPPORTED_TRANSITION_OPERATIONS = new Set(["review.start", "review.recover", "review.repair", "review.acknowledge-approved"]);
 function assertSupportedNextTransitionOperation(body: Record<string, unknown>): void {
 	const nextTransition = body.next_transition;
 	if (typeof nextTransition !== "object" || nextTransition === null || Array.isArray(nextTransition)) return;
@@ -1840,6 +1851,11 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		signal: AbortSignal | undefined,
 		path: string,
 		toleratedStderr: readonly string[] = [],
+		// A successful acknowledgement burns its authority and prints nothing:
+		// there is no receipt left to describe. Only that shape opts out of the
+		// body, and only for a zero exit; a non-zero exit still has to produce
+		// its typed failure envelope like every other operation.
+		expectsBody = true,
 	): Promise<NegotiatedExecution> {
 		let result: ExecFileResult;
 		try {
@@ -1852,6 +1868,11 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		if (result.timedOut) throw nativeError(NATIVE_REVIEW_ERROR_CODE.TIMEOUT, operation, mutating, "native process timed out", result);
 		if (result.signal) throw nativeError(NATIVE_REVIEW_ERROR_CODE.SIGNAL, operation, mutating, "native process was signalled", result);
 		const diagnostics = nativeProcessDiagnostics(operation, NATIVE_REVIEW_ERROR_CODE.NON_ZERO, result);
+		if (!expectsBody && result.exitCode === 0) {
+			if (result.stdout.trim().length > 0) throw nativeError(NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE, operation, mutating, "native bodyless operation returned output", result);
+			if (result.stderr.trim().length > 0 && !stderrIsTolerated(result.stderr, toleratedStderr)) throw nativeError(NATIVE_REVIEW_ERROR_CODE.UNEXPECTED_STDERR, operation, mutating, "native process wrote stderr", result);
+			return { body: {}, exitCode: result.exitCode };
+		}
 		const body = parseJson(result.stdout, operation, mutating, diagnostics);
 		if (result.exitCode !== 0) {
 			try {
@@ -2072,6 +2093,20 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		} finally {
 			await this.cleanupDirectory(directory).catch(() => undefined);
 		}
+	}
+
+	// Relays the provider-issued acknowledgement exactly as rendered. A success
+	// burns the authority and its artifacts and prints nothing, so there is no
+	// body to decode and nothing survives to describe; a refusal still arrives
+	// as the ordinary typed failure envelope.
+	async acknowledgeApproved(request: NativeReviewAcknowledgeApprovedRequest): Promise<void> {
+		if (request.argumentTokens.length === 0) throw new TypeError("Native ACKNOWLEDGE_APPROVED requires the provider-issued argument tokens");
+		if (request.argumentTokens.some((token) => typeof token !== "string" || token.length === 0)) throw new TypeError("Native ACKNOWLEDGE_APPROVED argument tokens must all be non-empty strings");
+		if (request.argumentTokens.some((token) => token.includes("{{value}}"))) throw new TypeError("Native ACKNOWLEDGE_APPROVED argument tokens carry no caller-substituted value");
+		const executable = this.executablePath(NATIVE_REVIEW_OPERATION.ACKNOWLEDGE_APPROVED, true);
+		await this.invoke(NATIVE_REVIEW_OPERATION.ACKNOWLEDGE_APPROVED, request.cwd, [
+			"review", "acknowledge-approved", ...request.argumentTokens,
+		], true, request.signal, executable, [], false);
 	}
 
 	async captureCorrectionPlan(request: NativeReviewCorrectionPlanCaptureRequest): Promise<ReviewLastEventClosureV1> {

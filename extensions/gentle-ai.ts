@@ -3924,6 +3924,10 @@ function mapLastEventClosure(
 			...(closure.correctionLines === undefined ? {} : { correction_lines: closure.correctionLines }),
 			...(closure.advisoryFindings === undefined ? {} : { advisory_findings: closure.advisoryFindings }),
 			...(closure.statusContinuation === undefined ? {} : { status_continuation: closure.statusContinuation.raw }),
+			// The host has to see the acknowledgement to run it: approval now
+			// waits for that exact invocation instead of burning on its own, so
+			// dropping it here would strand the lineage as approved forever.
+			...(closure.acknowledgement === undefined ? {} : { acknowledgement: closure.acknowledgement.raw }),
 		},
 		lineage_id: closure.lineageId,
 		state: closure.state,
