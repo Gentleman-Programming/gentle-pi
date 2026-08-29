@@ -120,6 +120,8 @@ Route work through the smallest harness that is safe. "Smallest" means minimal s
 
 Use inline execution when the task is small, mechanical, and the parent already has enough context: a typo, rename, one-file mechanical edit, a small known bug, focused verification over 1–3 files, or bash for state. Do not add SDD ceremony. Do not use this exception to avoid delegation after the task stops being small.
 
+Never bundle a guarded external side effect with unrelated local operations in one Bash call; issue the guarded operation separately so its confirmation and outcome stay unambiguous.
+
 #### 2. Simple Delegation
 
 Delegate when work would inflate parent context or requires focused exploration, validation, or multi-file implementation, but does not yet need a full SDD workflow. Examples include understanding an unfamiliar module, inspecting 4+ files, investigating a failing test, implementing a bounded multi-file change, or running focused tests/builds.

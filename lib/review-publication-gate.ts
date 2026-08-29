@@ -1,5 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { isAbsolute, posix } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
 	publicationProbeGitEnvironment,
 	reviewGitEnvironment,
@@ -186,6 +189,114 @@ export function resolveConfiguredPushDestinationV1(cwd: string, remote: string):
 		throw publicationError(`Configured remote "${remote}" has multiple pushurl destinations`);
 	}
 	return { remote, url: urls[0]!, destination_id: createHash("sha256").update(urls[0]!).digest("hex") };
+}
+
+export const FORK_FIRST_PUSH_ACTION = { ALLOW: "allow", CONFIRM: "confirm", BLOCK: "block" } as const;
+export type ForkFirstPushAction = (typeof FORK_FIRST_PUSH_ACTION)[keyof typeof FORK_FIRST_PUSH_ACTION];
+
+type PushInvocation = { remote?: string; branch?: string; bare: boolean };
+
+function currentBranchName(cwd: string): string | undefined {
+	const result = spawnSync("git", ["-C", cwd, "symbolic-ref", "--quiet", "--short", "HEAD"], {
+		encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: publicationProbeGitEnvironment(),
+	});
+	return result.status === 0 && result.stdout.trim() ? result.stdout.trim() : undefined;
+}
+
+function oneConfiguredValue(cwd: string, key: string): string | undefined {
+	const values = configuredRemoteValues(cwd, key);
+	if (values.length > 1) throw publicationError(`Configured Git value "${key}" is ambiguous`);
+	return values[0];
+}
+
+function effectivePushRemote(cwd: string, branch: string): string | undefined {
+	return oneConfiguredValue(cwd, `branch.${branch}.pushRemote`) ??
+		oneConfiguredValue(cwd, "remote.pushDefault") ??
+		oneConfiguredValue(cwd, `branch.${branch}.remote`) ??
+		(listConfiguredRemotes(cwd).includes("origin") ? "origin" : undefined);
+}
+
+/** Supports only bare pushes and the exact explicit current-branch form. */
+function parsePushInvocationV1(command: string): PushInvocation | undefined {
+	if (/[;&|`$<>(){}\\'\"]/.test(command)) return undefined;
+	const tokens = command.trim().split(/\s+/);
+	if (tokens[0] !== "git" || tokens[1] !== "push") return undefined;
+	let index = 2;
+	if (tokens[index] === "-u" || tokens[index] === "--set-upstream") index += 1;
+	if (tokens.slice(index).some((token) => token.startsWith("-"))) return undefined;
+	const args = tokens.slice(index);
+	if (args.length === 0) return { bare: true };
+	if (args.length === 1 && CONFIGURED_REMOTE_NAME.test(args[0]!)) return { remote: args[0], bare: false };
+	if (args.length !== 2 || !CONFIGURED_REMOTE_NAME.test(args[0]!) || args[1]!.includes(":")) return undefined;
+	return { remote: args[0], branch: args[1], bare: false };
+}
+
+function remoteUrl(cwd: string, remote: string): string {
+	if (!CONFIGURED_REMOTE_NAME.test(remote) || !listConfiguredRemotes(cwd).includes(remote)) throw publicationError("Configured remote could not be resolved");
+	const result = spawnSync("git", ["-C", cwd, "remote", "get-url", "--all", remote], {
+		encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: publicationProbeGitEnvironment(),
+	});
+	const urls = result.stdout.split(/\r?\n/).filter(Boolean);
+	if (result.error || result.status !== 0 || urls.length !== 1) throw publicationError("Configured remote is ambiguous");
+	return urls[0]!;
+}
+
+function canonicalPushIdentity(url: string): string | undefined {
+	try {
+		if (isAbsolute(url)) return `file:${realpathSync(url)}`;
+		if (url.startsWith("file://")) {
+			const fileUrl = new URL(url);
+			if (fileUrl.hostname && fileUrl.hostname.toLowerCase() !== "localhost") return undefined;
+			return `file:${realpathSync(fileURLToPath(fileUrl))}`;
+		}
+		if (/[?#\\%]/.test(url)) return undefined;
+		let host: string, path: string, port = "", protocol = "";
+		if (/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) {
+			const parsed = new URL(url);
+			protocol = parsed.protocol.slice(0, -1).toLowerCase(); host = parsed.hostname.toLowerCase().replace(/\.$/, ""); path = parsed.pathname; port = parsed.port;
+			if (!host || !["https", "http", "ssh", "git"].includes(protocol)) return undefined;
+			if (port && ({ https: "443", http: "80", ssh: "22", git: "9418" } as Record<string, string>)[protocol] !== port) return undefined;
+		} else {
+			const parsed = /^(?:[^@/:]+@)?([a-z0-9.-]+):([^:]+)$/i.exec(url);
+			if (!parsed) return undefined;
+			host = parsed[1]!.toLowerCase().replace(/\.$/, ""); path = parsed[2]!;
+		}
+		path = posix.normalize(`/${path}`).replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
+		return path && path !== "/" && !path.startsWith("/../") ? `net:${host}${path}` : undefined;
+	} catch { return undefined; }
+}
+
+function safeBranch(cwd: string, branch: string | undefined): branch is string {
+	return !!branch && branch === currentBranchName(cwd) && branch !== "main" && branch !== "master" &&
+		!branch.startsWith("refs/") && !/[\s~^:?*\\[\]|]|\.\.|(?:^|\/)\.|\/$/.test(branch);
+}
+
+function networkIdentityHost(identity: string): string { return identity.startsWith("net:") ? identity.slice(4, identity.indexOf("/", 4)) : ""; }
+
+function topologyIsProven(cwd: string, remote: string): boolean {
+	if (configuredRemoteValues(cwd, "remote.upstream.pushurl").length !== 1 || oneConfiguredValue(cwd, "remote.upstream.pushurl") !== "DISABLED") return false;
+	if (configuredRemoteValues(cwd, `remote.${remote}.push`).length || configuredRemoteValues(cwd, `remote.${remote}.mirror`).length) return false;
+	const destination = canonicalPushIdentity(resolveConfiguredPushDestinationV1(cwd, remote).url);
+	const upstream = canonicalPushIdentity(remoteUrl(cwd, "upstream"));
+	if (destination === undefined || upstream === undefined || destination === upstream) return false;
+	return networkIdentityHost(destination) === networkIdentityHost(upstream);
+}
+
+export function classifyForkFirstPushV1(cwd: string | undefined, command: string): ForkFirstPushAction {
+	const parsed = parsePushInvocationV1(command);
+	if (!cwd || !parsed) return FORK_FIRST_PUSH_ACTION.CONFIRM;
+	try {
+		const branch = currentBranchName(cwd);
+		const remote = parsed.bare && branch ? effectivePushRemote(cwd, branch) : parsed.remote;
+		if (remote === "upstream") return FORK_FIRST_PUSH_ACTION.BLOCK;
+		if (!remote || !safeBranch(cwd, parsed.bare ? branch : parsed.branch) || !topologyIsProven(cwd, remote)) return FORK_FIRST_PUSH_ACTION.CONFIRM;
+		if (!parsed.bare) return FORK_FIRST_PUSH_ACTION.ALLOW;
+		const pushDefault = oneConfiguredValue(cwd, "push.default") ?? "simple";
+		if (pushDefault === "current") return FORK_FIRST_PUSH_ACTION.ALLOW;
+		return pushDefault === "simple" && oneConfiguredValue(cwd, `branch.${branch}.remote`) === remote &&
+			oneConfiguredValue(cwd, `branch.${branch}.merge`) === `refs/heads/${branch}`
+			? FORK_FIRST_PUSH_ACTION.ALLOW : FORK_FIRST_PUSH_ACTION.CONFIRM;
+	} catch { return FORK_FIRST_PUSH_ACTION.CONFIRM; }
 }
 
 export function resolvePushRemoteRefV1(

@@ -144,6 +144,7 @@ import {
 } from "../lib/review-integration-v2.ts";
 import { reconcileUnknownReviewLastEventCapture } from "../lib/review-last-event-controller.ts";
 import { recordReviewConsentLatch } from "../lib/review-consent-latch.ts";
+import { classifyForkFirstPushV1 } from "../lib/review-publication-gate.ts";
 
 const GRAPH_V1_ORDINARY_READ_ONLY = "Graph-v1 ordinary review authority is read-only; use native compact-v2 review operations";
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -761,6 +762,12 @@ const GUARD_ACTION = {
 type GuardAction = (typeof GUARD_ACTION)[keyof typeof GUARD_ACTION];
 type GuardClassification = GuardAction | "not-guarded";
 
+interface GuardEvaluation {
+	action: GuardClassification;
+	key?: GuardedCommandKey;
+	triggerIndex: number;
+}
+
 const GUARDED_COMMAND_KEY = {
 	GIT_PUSH: "gitPush",
 	GIT_REBASE: "gitRebase",
@@ -799,6 +806,14 @@ const AUTONOMOUS_DEFAULT_ACTIONS: Record<GuardedCommandKey, GuardAction> = {
 	piRemove: "confirm",
 };
 
+const GUARDED_COMMAND_LABELS: Record<GuardedCommandKey, string> = {
+	gitPush: "git push",
+	gitRebase: "git rebase",
+	gitBranchDeleteForce: "forced git branch deletion",
+	npmPublish: "npm publish",
+	piRemove: "pi remove",
+};
+
 const SAFE_GUARDRAILS_CONFIG: RuntimeGuardrailsConfig = {
 	autonomousMode: false,
 	guardedCommands: {},
@@ -809,36 +824,95 @@ const SAFE_GUARDRAILS_CONFIG: RuntimeGuardrailsConfig = {
  *
  * Ordering (non-negotiable):
  *   1. Hard-deny patterns → "block" (always, cannot be overridden by config)
- *   2. If autonomousMode is false → mirror the legacy CONFIRM_BASH_PATTERNS result
- *   3. If autonomousMode is true → use configured GuardAction for the matched key
- *      (applying AUTONOMOUS_DEFAULT_ACTIONS for any key not set in guardedCommands)
+ *   2. Push commands apply fork-first topology before any configured action
+ *   3. Other guarded keys use autonomous config or per-invocation confirmation
  *   4. No match → "not-guarded"
  */
+function forkFirstGuardAction(
+	command: string,
+	config: RuntimeGuardrailsConfig,
+	cwd?: string,
+): GuardAction {
+	const topology = classifyForkFirstPushV1(cwd, command);
+	const configured = config.autonomousMode
+		? (config.guardedCommands.gitPush ?? AUTONOMOUS_DEFAULT_ACTIONS.gitPush)
+		: undefined;
+	if (topology === "block" || configured === "block") return "block";
+	if (topology === "allow" && configured !== "confirm") return "allow";
+	return "confirm";
+}
+
+function hasShellComposition(command: string): boolean {
+	let quote = "";
+	for (let index = 0; index < command.length; index++) {
+		const character = command[index];
+		if (quote === "'") { if (character === "'") quote = ""; continue; }
+		if (quote === '"') { if (character === '"') quote = ""; else if (character === "\\") index++; else if (character === "`" || character === "$" && command[index + 1] === "(") return true; continue; }
+		if (character === "\\") { index++; continue; }
+		if (character === "'" || character === '"') { quote = character; continue; }
+		if (";&|()\n`".includes(character) || character === "$" && command[index + 1] === "(") return true;
+	}
+	return false;
+}
+
+function evaluateGuardedCommand(
+	command: string,
+	config: RuntimeGuardrailsConfig,
+	cwd?: string,
+): GuardEvaluation {
+	for (const pattern of DENIED_BASH_PATTERNS) {
+		const match = pattern.exec(command);
+		if (match) {
+			const pushMatch = GIT_PUSH_RE.exec(command);
+			return {
+				action: "block",
+				key: pushMatch ? GUARDED_COMMAND_KEY.GIT_PUSH : undefined,
+				triggerIndex: pushMatch?.index ?? match.index,
+			};
+		}
+	}
+	for (const [key, pattern] of Object.entries(GUARDED_KEY_PATTERNS) as [
+		GuardedCommandKey,
+		RegExp,
+	][]) {
+		const match = pattern.exec(command);
+		if (!match) continue;
+		if (hasShellComposition(command)) {
+			return { action: "block", key, triggerIndex: match.index };
+		}
+		if (key === GUARDED_COMMAND_KEY.GIT_PUSH) {
+			return {
+				action: forkFirstGuardAction(command, config, cwd),
+				key,
+				triggerIndex: match.index,
+			};
+		}
+		return {
+			action: config.autonomousMode
+				? (config.guardedCommands[key] ?? AUTONOMOUS_DEFAULT_ACTIONS[key])
+				: "confirm",
+			key,
+			triggerIndex: match.index,
+		};
+	}
+	return { action: "not-guarded", triggerIndex: 0 };
+}
+
 function classifyGuardedCommand(
 	command: string,
 	config: RuntimeGuardrailsConfig,
+	cwd?: string,
 ): GuardClassification {
-	// Step 1: hard-deny always wins, regardless of any config
-	for (const pattern of DENIED_BASH_PATTERNS) {
-		if (pattern.test(command)) return "block";
-	}
+	return evaluateGuardedCommand(command, config, cwd).action;
+}
 
-	// Step 2 & 3: find which guarded key (if any) this command matches
-	for (const [key, pattern] of Object.entries(GUARDED_KEY_PATTERNS) as [GuardedCommandKey, RegExp][]) {
-		if (!pattern.test(command)) continue;
-
-		// Matched a guarded key
-		if (!config.autonomousMode) {
-			// Legacy behavior: any match → confirm
-			return "confirm";
-		}
-
-		// Autonomous mode: use configured action, fall back to sensible defaults
-		const configuredAction = config.guardedCommands[key];
-		return configuredAction ?? AUTONOMOUS_DEFAULT_ACTIONS[key];
-	}
-
-	return "not-guarded";
+function guardedCommandPreview(
+	command: string,
+	triggerIndex = Math.max(0, command.search(GIT_PUSH_RE)),
+): string {
+	const start = Math.max(0, triggerIndex - 60);
+	const prefix = start > 0 ? "…" : "";
+	return `${prefix}${truncateToWidth(command.slice(start).replace(/\s+/g, " ").trim(), 180 - prefix.length, "…")}`;
 }
 
 function parseGuardrailsConfigFile(
@@ -1158,7 +1232,8 @@ async function confirmCommand(
 	herdrLifecycle: HerdrConfirmationLifecycle,
 ): Promise<ToolCallEventResult | undefined> {
 	const guardrailsConfig = loadRuntimeGuardrailsConfig(ctx.cwd);
-	const classification = classifyGuardedCommand(command, guardrailsConfig);
+	const evaluation = evaluateGuardedCommand(command, guardrailsConfig, ctx.cwd);
+	const { action: classification } = evaluation;
 
 	if (classification === "block") {
 		return {
@@ -1181,11 +1256,11 @@ async function confirmCommand(
 				"Gentle AI safety policy requires interactive confirmation before this command.",
 		};
 	}
-	const preview = truncateToWidth(
-		command.replace(/\s+/g, " ").trim(),
-		180,
-		"…",
-	);
+	const preview = guardedCommandPreview(command, evaluation.triggerIndex);
+	const title =
+		evaluation.key === undefined
+			? "Allow guarded command?"
+			: `Allow guarded ${GUARDED_COMMAND_LABELS[evaluation.key]}?`;
 	const requestId = randomUUID();
 	const emitPermissionRequest = (
 		state: "waiting" | "approved" | "denied",
@@ -1204,7 +1279,7 @@ async function confirmCommand(
 	emitPermissionRequest("waiting");
 	herdrLifecycle.begin();
 	try {
-		approved = await ctx.ui.confirm("Allow guarded command?", preview);
+		approved = await ctx.ui.confirm(title, preview);
 	} catch (error) {
 		confirmationFailed = true;
 		confirmationError = error;
@@ -5010,6 +5085,7 @@ export const __testing = {
 	listDiscoverableAgents,
 	orderDiscoverableAgents,
 	classifyGuardedCommand,
+	guardedCommandPreview,
 	loadRuntimeGuardrailsConfig,
 	buildGentlePrompt,
 	nativeStatusUnsupported,
