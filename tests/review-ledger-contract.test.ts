@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import test from "node:test";
 import { REVIEW_LENS_PARITY_PATTERNS } from "./support/review-lens-parity.ts";
 
@@ -129,13 +129,67 @@ for (const path of REVIEW_LENSES) {
 	});
 }
 
-test("ordinary lens prompts are self-contained and name no unpackaged rule sources", () => {
-	for (const path of REVIEW_LENSES) {
-		const content = read(path);
-		assert.doesNotMatch(content, /^Rule sources:/m, `${path} must not depend on unavailable source files`);
-		assert.doesNotMatch(content, /\bai-course-2\b/, `${path} must not name an unpackaged course`);
-		assert.doesNotMatch(content, /`\d{2}-[a-z0-9-]+\.md`/, `${path} must not name unpackaged markdown sources`);
-	}
+function packagePaths(): string[] {
+	const manifest = JSON.parse(read("package.json")) as { files?: unknown };
+	if (!Array.isArray(manifest.files)) throw new Error("package.json must declare package files");
+	return manifest.files.map((entry) => {
+		if (typeof entry !== "string") throw new Error("package.json files entries must be strings");
+		return entry.replace(/\/+$/, "");
+	});
+}
+
+function projectPath(absolutePath: string): string | undefined {
+	const path = relative(ROOT, absolutePath);
+	if (path === "" || path === ".." || path.startsWith(`..${sep}`)) return undefined;
+	return path.split(sep).join("/");
+}
+
+function isPackagedFile(path: string, packageRoots: readonly string[]): boolean {
+	const absolutePath = resolve(ROOT, path);
+	const projectRelativePath = projectPath(absolutePath);
+	if (!projectRelativePath || !existsSync(absolutePath) || !statSync(absolutePath).isFile()) return false;
+	return packageRoots.some((root) => projectRelativePath === root || projectRelativePath.startsWith(`${root}/`));
+}
+
+function packagedOrdinaryReviewLenses(): string[] {
+	const packageRoots = packagePaths();
+	return readdirSync(join(ROOT, "assets", "agents"), { withFileTypes: true })
+		.filter((entry) => entry.isFile() && entry.name.startsWith("review-") && entry.name.endsWith(".md"))
+		.map((entry) => `assets/agents/${entry.name}`)
+		.filter((path) => isPackagedFile(path, packageRoots))
+		.sort();
+}
+
+const MARKDOWN_FILE_REFERENCE = /(?:https?:\/\/[^\s)`\]]+|(?:\.{1,2}\/)?[A-Za-z0-9][A-Za-z0-9_./-]*)\.md\b/g;
+
+function assertMarkdownFileDependenciesResolve(path: string, content: string, packageRoots: readonly string[]): void {
+	const sourceDirectory = dirname(join(ROOT, path));
+	const unresolved = [...content.matchAll(MARKDOWN_FILE_REFERENCE)]
+		.map((match) => match[0])
+		.filter((reference) => {
+			if (reference.startsWith("http://") || reference.startsWith("https://")) return true;
+			return ![resolve(ROOT, reference), resolve(sourceDirectory, reference)].some((candidate) => {
+				const candidatePath = projectPath(candidate);
+				return candidatePath !== undefined && isPackagedFile(candidatePath, packageRoots);
+			});
+		});
+	assert.deepEqual(unresolved, [], `${path} names unavailable Markdown dependencies: ${unresolved.join(", ")}`);
+}
+
+test("packaged ordinary review lenses resolve their Markdown file dependencies", () => {
+	const packageRoots = packagePaths();
+	const lenses = packagedOrdinaryReviewLenses();
+	assert.ok(lenses.length > 0, "package must ship at least one ordinary review lens");
+	for (const path of lenses) assertMarkdownFileDependenciesResolve(path, read(path), packageRoots);
+});
+
+test("ordinary review dependencies allow packaged files and reject unresolved paths", () => {
+	const packageRoots = packagePaths();
+	assertMarkdownFileDependenciesResolve("assets/agents/review-risk.md", "Sources: docs/native-authority-architecture.md", packageRoots);
+	assert.throws(
+		() => assertMarkdownFileDependenciesResolve("assets/agents/review-risk.md", "Sources: docs/nonexistent/security.md", packageRoots),
+		/unavailable Markdown dependencies: docs\/nonexistent\/security\.md/,
+	);
 });
 
 test("ordinary lens prompts contain the literal compact-v2 native result envelope", () => {
