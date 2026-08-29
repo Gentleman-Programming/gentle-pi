@@ -200,7 +200,7 @@ test("persistent harness prompt assets do not hardcode Spanish SDD artifact copy
 	assert.deepEqual(failures, []);
 });
 
-test("SDD assets define ownership markers and yield post-apply lifecycle to the parent", async () => {
+test("SDD assets route completed implementation directly through verify, sync, and archive", async () => {
 	const [tasks, apply, status, contract, chain] = await Promise.all([
 		readFile(join(ROOT, "assets/agents/sdd-tasks.md"), "utf8"),
 		readFile(join(ROOT, "assets/agents/sdd-apply.md"), "utf8"),
@@ -208,15 +208,16 @@ test("SDD assets define ownership markers and yield post-apply lifecycle to the 
 		readFile(join(ROOT, "assets/support/sdd-status-contract.md"), "utf8"),
 		readFile(join(ROOT, "assets/chains/sdd-full.chain.md"), "utf8"),
 	]);
+	const assets = [tasks, apply, status, contract, chain].join("\n");
 
 	assert.match(tasks, /<!-- sdd-owner: implementation -->/);
-	assert.match(tasks, /<!-- sdd-owner: parent -->/);
-	assert.match(apply, /only implementation-owned/);
-	assert.match(apply, /MUST NOT start bounded-review/);
-	assert.match(status, /malformed/i);
-	assert.match(contract, /deferredParentActions/);
-	assert.match(contract, /parent-lifecycle/);
-	assert.match(chain, /parent.lifecycle/i);
+	assert.match(apply, /next_recommended: "sdd-verify"/);
+	assert.match(status, /verify.*ready/i);
+	assert.match(contract, /apply.*verify.*sync.*archive/is);
+	assert.match(chain, /apply.*verification/is);
+	assert.doesNotMatch(assets, /<!-- sdd-owner: parent -->/);
+	assert.doesNotMatch(assets, /parent-lifecycle/);
+	assert.doesNotMatch(assets, /approved receipt|bounded review/i);
 	assert.doesNotMatch(chain, /## sdd-review/);
 });
 

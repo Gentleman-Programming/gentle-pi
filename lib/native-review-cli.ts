@@ -44,7 +44,6 @@ function resolveNativeReviewMaxBufferBytes(environment: NodeJS.ProcessEnv = proc
 
 export const NATIVE_REVIEW_OPERATION = {
 	START: "review/start",
-	SDD_STATUS: "sdd-status",
 	STATUS: "review/status",
 	RECLAIM: "review/reclaim",
 	RECOVER: "review/recover",
@@ -83,51 +82,8 @@ export interface ExecFileRequest { file: string; arguments: readonly string[]; c
 export interface ExecFileResult { stdout: string; stderr: string; exitCode: number; signal: NodeJS.Signals | null; timedOut: boolean; outputLimitExceeded: boolean; }
 export type ExecFileAdapter = (request: ExecFileRequest) => Promise<ExecFileResult>;
 
-export const NATIVE_SDD_ARTIFACT_STORE = {
-	OPENSPEC: "openspec",
-	ENGRAM: "engram",
-	// HYBRID reaches the wire with gentle-ai #3814/#3636. It previously existed
-	// only in prompt prose while the provider reported such a workspace as
-	// openspec. Note the vocabulary difference from Pi's own preflight type in
-	// lib/sdd-status.ts, which now uses the same name: the operator-facing
-	// choice was reconciled to the provider's vocabulary, and already-persisted
-	// "both" normalizes forward.
-	HYBRID: "hybrid",
-	NONE: "none",
-} as const;
-
-// The status identities this decoder admits. gentle-ai 3c4c7fb6 replaced v1
-// with v2; the object shape is key-identical across the two, so one decoder
-// spans both rather than duplicating it. Anything outside this set is an
-// identity mismatch, in either direction.
-export const NATIVE_SDD_STATUS_VERSIONS = [1, 2] as const;
-export type NativeSddArtifactStore = (typeof NATIVE_SDD_ARTIFACT_STORE)[keyof typeof NATIVE_SDD_ARTIFACT_STORE];
-
-export const NATIVE_SDD_ARTIFACT_STATE = {
-	MISSING: "missing",
-	DONE: "done",
-	PARTIAL: "partial",
-} as const;
-export type NativeSddArtifactState = (typeof NATIVE_SDD_ARTIFACT_STATE)[keyof typeof NATIVE_SDD_ARTIFACT_STATE];
-
-export interface NativeSddArtifactStates {
-	proposal: NativeSddArtifactState;
-	specs: NativeSddArtifactState;
-	design: NativeSddArtifactState;
-	tasks: NativeSddArtifactState;
-	applyProgress: NativeSddArtifactState;
-	verifyReport: NativeSddArtifactState;
-	reviewPolicy?: NativeSddArtifactState;
-	reviewLedger: NativeSddArtifactState;
-	reviewReceipt: NativeSddArtifactState;
-	reviewBundle: NativeSddArtifactState;
-	reviewContext: NativeSddArtifactState;
-	reviewState: NativeSddArtifactState;
-}
-
 export interface NativeReviewCli {
 	start(request: NativeStartRequest): Promise<NativeStartResult>;
-	sddStatus(request: NativeSddStatusRequest): Promise<NativeSddStatusResult>;
 	reviewStatus(request: NativeReviewStatusRequest): Promise<NativeReviewStatusResult>;
 	targetStatus?(request: NativeTargetStatusRequest): Promise<ReviewStatusV3>;
 	answerConsent?(request: NativeReviewConsentAnswerRequest): Promise<NativeReviewConsentAnswerResult>;
@@ -144,7 +100,7 @@ export interface NativeReviewCli {
 	// Dark until a negotiated version reports the `mode` capability true
 	// (Design Decision #7, organic-rdd-parity). Plain versioned CLI operation,
 	// outside the negotiated review-integration protocol — same shape as
-	// reviewStatus/sddStatus/reclaim above.
+	// reviewStatus/reclaim above.
 	reviewMode?(request: NativeReviewModeRequest): Promise<NativeReviewModeResult>;
 }
 
@@ -485,7 +441,6 @@ export interface NativeReviewConsentDeclinedResult {
 }
 export interface NativeReviewConsentStartedResult { kind: "started"; start: NativeStartResult; }
 export type NativeReviewConsentAnswerResult = NativeReviewConsentStartedResult | NativeReviewConsentDeclinedResult;
-export interface NativeSddStatusRequest { cwd: string; change: string; signal?: AbortSignal; }
 export interface NativeReviewStatusRequest { cwd: string; signal?: AbortSignal; }
 export interface NativeTargetStatusRequest extends NativeUntrackedSelectionRequest {
 	cwd: string;
@@ -604,14 +559,6 @@ export interface NativeReviewStatusResult {
 export const NATIVE_START_ACTION = { CREATED: "created", RESUMED: "resumed", CLOSED: "closed", BLOCKED_SCOPE_ACTION: "blocked-scope-action" } as const;
 export type NativeStartAction = (typeof NATIVE_START_ACTION)[keyof typeof NATIVE_START_ACTION];
 export interface NativeStartResult { lineageId: string; state: ReviewStartState; riskLevel: string; selectedLenses: readonly string[]; changedFiles: number; changedLines: number; correctionBudget: number; action: NativeStartAction; lensesRequired: boolean; riskReasons?: readonly Record<string, unknown>[]; raw?: Readonly<Record<string, unknown>>; riskEvidence?: readonly string[]; hint?: string; }
-export interface NativeSddStatusResult {
-	ready: boolean;
-	artifactStore: NativeSddArtifactStore;
-	artifacts: NativeSddArtifactStates;
-	nextRecommended: string;
-	[key: string]: unknown;
-}
-
 export function isCanonicalProcessString(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value);
 }
@@ -744,22 +691,20 @@ export function nativeRiskEvidencePhrases(riskLevel: string, reasons: readonly N
 }
 const NATIVE_REVIEW_LENS = ["review-risk", "review-resilience", "review-readability", "review-reliability"] as const;
 const NATIVE_START_ACTION_VALUES = Object.values(NATIVE_START_ACTION);
-const NATIVE_SDD_NEXT_ACTION = ["apply", "verify", "remediate", "archive", "review", "resolve-review", "resolve-blockers", "sdd-new", "select-change", "propose", "spec", "design", "tasks"] as const;
-
 // The pin table is intentionally preserved unchanged while #3587 is
 // unpublished. Last-event capture support is exercised through the explicit
 // dev-binary override; no source-level pin or contract-row mutation is allowed.
 const ORGANIC_PARITY_DARK = { mode: false, riskEvidence: false, hint: false, delivery: false } as const;
 
 export const NATIVE_CLI_CONTRACTS = Object.freeze({
-	"2.1.4": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: false, inventory: false, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.5": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.6": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.7": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.8": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: false, quarantineLegacy: false, reconcileAuthority: true, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.9": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.10": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, ...ORGANIC_PARITY_DARK }),
-	"2.1.11": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, ...ORGANIC_PARITY_DARK }),
+	"2.1.4": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: false, inventory: false, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.5": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.6": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.7": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.8": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: false, quarantineLegacy: false, reconcileAuthority: true, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.9": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.10": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, ...ORGANIC_PARITY_DARK }),
+	"2.1.11": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, ...ORGANIC_PARITY_DARK }),
 	// First capability-true row, paired with the triple pin bump in this same
 	// commit as Design Decision #1 requires.
 	//
@@ -780,7 +725,7 @@ export const NATIVE_CLI_CONTRACTS = Object.freeze({
 	// needs the negotiated start envelope extended upstream, which moves a
 	// byte-pinned fixture and therefore belongs to a gentle-ai release, not to
 	// a Pi capability flip.
-	"2.2.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	"2.2.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 	// 2.2.1 repeats 2.2.0 because the wire did not move for the lane Pi speaks.
 	// v2.2.1 advertises capabilities/v1.5 (protocol minor 5) on
 	// review-integration/v1, but the negotiated start envelope is still the
@@ -788,16 +733,16 @@ export const NATIVE_CLI_CONTRACTS = Object.freeze({
 	// they are dark on 2.2.0. The release does publish a second contract,
 	// review-integration/v2, whose `start/v3` carries base/candidate trees --
 	// but Pi does not negotiate it yet, and a row must describe the lane in use.
-	"2.2.1": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	"2.2.1": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 	// 2.2.2 repeats 2.2.1 for the same reason, confirmed against the released
 	// v2.2.2 binary rather than assumed: on review-integration/v1 it still
 	// advertises capabilities/v1.5 and the negotiated start envelope is still
 	// the closed `start/v2`, so riskEvidence and hint still cannot arrive.
-	"2.2.2": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	"2.2.2": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 	// Ground-truthed against the released v2.2.3 binary: the v2 lane remains
 	// protocol 2.0 with the same operation set and closed START fields consumed
 	// by Pi, so the existing capability columns are unchanged.
-	"2.2.3": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	"2.2.3": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 	// Ground-truthed against the released v2.4.0 binary: the v2 lane advertises
 	// capabilities/v2.2 and answers status/v5 and consent/v3, all of which the
 	// existing decoders already read, and the START envelope Pi consumes is
@@ -807,7 +752,7 @@ export const NATIVE_CLI_CONTRACTS = Object.freeze({
 	// envelope reports, not whether it reports it. v2.2.4 and v2.3.0 shipped
 	// while Pi stayed on 2.2.3; they were never pinned or probed, so they get
 	// no row.
-	"2.4.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	"2.4.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 });
 
 export interface NativeReviewProcessDiagnostics {
@@ -1326,61 +1271,6 @@ class NativeReviewPlainCli {
 			request.signal,
 		);
 		return decode(NATIVE_REVIEW_OPERATION.MODE, mutating, () => decodeNativeReviewMode(body, request.operation));
-	}
-
-	async sddStatus(request: NativeSddStatusRequest): Promise<NativeSddStatusResult> {
-		const { body: result } = await this.execute(NATIVE_REVIEW_OPERATION.SDD_STATUS, request.cwd, ["sdd-status", request.change, "--cwd", request.cwd, "--json", "--instructions"], false, request.signal);
-		return decode(NATIVE_REVIEW_OPERATION.SDD_STATUS, false, () => {
-			const body = exactObject(result, ["schemaName", "schemaVersion", "changeName", "artifactStore", "planningHome", "changeRoot", "artifactPaths", "contextFiles", "artifacts", "taskProgress", "dependencies", "applyState", "actionContext", "relationships", "remediationState", "nextRecommended", "blockedReasons"], ["reviewGate", "reviewTransaction", "phaseInstructions"]);
-			if (body.schemaName !== "gentle-ai.sdd-status" || !(NATIVE_SDD_STATUS_VERSIONS as readonly number[]).includes(body.schemaVersion as number) || body.changeName !== request.change || !(Object.values(NATIVE_SDD_ARTIFACT_STORE) as string[]).includes(body.artifactStore as string) || !["blocked", "all_done", "ready"].includes(body.applyState as string)) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.SDD_STATUS, false, "native status identity mismatch");
-			// v2 removed review lineage state from the SDD status document: the
-			// review* artifacts and their paths are gone, because review authority
-			// no longer projects here. v1 still carries them, so the expected key
-			// sets are gated on the identity rather than merged.
-			const v2 = body.schemaVersion === 2;
-			const sddPaths = ["proposal", "specs", "design", "tasks", "applyProgress", "verifyReport"];
-			const paths = v2 ? sddPaths : [...sddPaths, "reviewPolicy", "reviewLedger", "reviewReceipt", "reviewBundle", "reviewContext", "reviewState"];
-			const pathMap = (value: unknown) => { const parsed = exactObject(value, paths); for (const path of paths) stringArray(parsed[path]); };
-			const planningHome = exactObject(body.planningHome, ["mode", "path"]);
-			if (planningHome.mode !== "repo-local") throw new Error("invalid planning home");
-			requiredString(planningHome.path); requiredString(body.changeRoot); pathMap(body.artifactPaths); pathMap(body.contextFiles);
-			const artifactStates = v2 ? paths : paths.filter((path) => path !== "reviewPolicy" || body.artifactStore === NATIVE_SDD_ARTIFACT_STORE.ENGRAM);
-			const artifacts = exactObject(body.artifacts, artifactStates);
-			for (const path of artifactStates) if (!Object.values(NATIVE_SDD_ARTIFACT_STATE).includes(artifacts[path] as NativeSddArtifactState)) throw new Error("invalid artifact state");
-			const taskProgress = exactObject(body.taskProgress, ["total", "completed", "pending", "allComplete"]);
-			const total = nonNegativeInteger(taskProgress.total), completed = nonNegativeInteger(taskProgress.completed), pending = nonNegativeInteger(taskProgress.pending);
-			if (typeof taskProgress.allComplete !== "boolean" || completed + pending !== total || taskProgress.allComplete !== (pending === 0)) throw new Error("invalid task progress");
-			const dependencies = exactObject(body.dependencies, ["proposal", "specs", "design", "tasks", "apply", "verify", "archive"]);
-			for (const phase of ["proposal", "specs", "design", "tasks", "apply", "verify", "archive"]) if (!["blocked", "ready", "all_done"].includes(dependencies[phase] as string)) throw new Error("invalid dependency state");
-			const actionContext = exactObject(body.actionContext, ["mode", "workspaceRoot", "allowedEditRoots"]);
-			if (actionContext.mode !== "repo-local" || requiredString(actionContext.workspaceRoot).length === 0 || stringArray(actionContext.allowedEditRoots).length === 0) throw new Error("invalid action context");
-			const relationships = exactObject(body.relationships, ["dependsOn", "supersedes", "amends", "conflictsWith", "sameDomainActiveChanges"]);
-			for (const field of ["dependsOn", "supersedes", "amends", "conflictsWith", "sameDomainActiveChanges"]) stringArray(relationships[field]);
-			// Same identity gate: v2 dropped lineageId/generation/fixBatch from
-			// remediationState along with the review lineage projection.
-			const remediationStrings = v2 ? ["failedEvidenceRevision", "reason"] : ["failedEvidenceRevision", "lineageId", "reason"];
-			const remediation = exactObject(body.remediationState, v2 ? ["required", "complete", "failedEvidenceRevision", "reason"] : ["required", "complete", "failedEvidenceRevision", "lineageId", "generation", "fixBatch", "reason"], ["correctionBudget"]);
-			if (typeof remediation.required !== "boolean" || typeof remediation.complete !== "boolean" || remediationStrings.some((field) => typeof remediation[field] !== "string")) throw new Error("invalid remediation state");
-			if (!v2) { nonNegativeInteger(remediation.generation); nonNegativeInteger(remediation.fixBatch); }
-			if (remediation.correctionBudget !== undefined) nonNegativeInteger(remediation.correctionBudget);
-			if (body.phaseInstructions !== undefined) {
-				const instructions = exactObject(body.phaseInstructions, ["apply", "verify", "remediate", "archive"]);
-				for (const phase of ["apply", "verify", "remediate", "archive"]) stringArray(instructions[phase]);
-			}
-			const nextRecommended = requiredString(body.nextRecommended);
-			if (!(NATIVE_SDD_NEXT_ACTION as readonly string[]).includes(nextRecommended)) throw new Error("unknown SDD next action");
-			const blockedReasons = stringArray(body.blockedReasons);
-			const { reviewGate: _reviewGate, reviewTransaction: _reviewTransaction, ...status } = body;
-			void _reviewGate;
-			void _reviewTransaction;
-			return {
-				...status,
-				artifactStore: body.artifactStore as NativeSddArtifactStore,
-				artifacts: artifacts as unknown as NativeSddArtifactStates,
-				nextRecommended,
-				ready: (nextRecommended === "verify" || nextRecommended === "archive") && blockedReasons.length === 0,
-			};
-		});
 	}
 
 	async reclaim(request: NativeReviewReclaimRequest): Promise<NativeReviewRecoveryResult> {
@@ -2198,10 +2088,6 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		return status;
 	}
 
-	sddStatus(request: NativeSddStatusRequest): Promise<NativeSddStatusResult> {
-		return this.plain.sddStatus(request);
-	}
-
 	async reviewMode(request: NativeReviewModeRequest): Promise<NativeReviewModeResult> {
 		const cwd = await canonicalNativeReviewCwd(request.cwd);
 		const mutating = request.operation !== NATIVE_REVIEW_MODE_OPERATION.STATUS;
@@ -2217,7 +2103,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 	}
 
 	// Recovery commands are version-gated plain CLI operations outside the
-	// negotiated integration-v1 contract, exactly like reviewStatus/sddStatus.
+	// negotiated integration-v1 contract, exactly like reviewStatus.
 	reclaim(request: NativeReviewReclaimRequest): Promise<NativeReviewRecoveryResult> {
 		return this.plain.reclaim(request);
 	}

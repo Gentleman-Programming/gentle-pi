@@ -5198,48 +5198,22 @@ export const __testing = {
 	createGentleAiExtension: createGentleAiExtensionForTesting,
 };
 
-const NATIVE_SDD_STATUS_STARTUP_TIMEOUT_MS = 1_000;
-
-async function resolveControllerSddStatus(
+function resolveControllerSddStatus(
 	cwd: string,
 	changeName: string | undefined,
 	includeInstructions: boolean,
 	artifactStore: SddPreflightPreferences["artifactStore"] | undefined,
-	nativeReviewCli: NativeReviewCli | null = null,
-	signal?: AbortSignal,
 ) {
-	const base = resolveSddStatus({ cwd, changeName, includeInstructions, artifactStore });
-	if (!base.changeName || base.isNonAuthoritative) return base;
-	if (base.applyState !== "all_done" || nativeReviewCli === null) return base;
-	try {
-		const native = await nativeReviewCli.sddStatus({ cwd, change: base.changeName, ...(signal === undefined ? {} : { signal }) });
-		return resolveSddStatus({
-			cwd,
-			changeName: base.changeName,
-			includeInstructions,
-			artifactStore,
-			nativeReviewReadiness: { expected: true, ready: native.ready },
-		});
-	} catch (error) {
-		return resolveSddStatus({
-			cwd,
-			changeName: base.changeName,
-			includeInstructions,
-			artifactStore,
-			nativeReviewReadiness: { expected: true, ready: false, reason: error instanceof Error ? error.message : "native bound status failed" },
-		});
-	}
+	return resolveSddStatus({ cwd, changeName, includeInstructions, artifactStore });
 }
 
-async function resolveStartupControllerSddStatus(
+function resolveStartupControllerSddStatus(
 	cwd: string,
 	changeName: string | undefined,
 	includeInstructions: boolean,
 	artifactStore: SddPreflightPreferences["artifactStore"] | undefined,
-	nativeReviewCli: NativeReviewCli | null,
-	timeoutMs = NATIVE_SDD_STATUS_STARTUP_TIMEOUT_MS,
 ) {
-	return resolveControllerSddStatus(cwd, changeName, includeInstructions, artifactStore, nativeReviewCli, AbortSignal.timeout(timeoutMs));
+	return resolveControllerSddStatus(cwd, changeName, includeInstructions, artifactStore);
 }
 
 export interface GentleAiRuntimeDependencies {
@@ -5457,12 +5431,11 @@ function createGentleAiExtensionForTesting(
 				: "";
 		const phase = isSddAgent ? sddPhaseFromAgentStartEvent(event) : undefined;
 		const nativeStatusPrompt = phase
-			? `\n\n${renderNativeSddPhasePrompt(await resolveStartupControllerSddStatus(
+			? `\n\n${renderNativeSddPhasePrompt(resolveStartupControllerSddStatus(
 				ctx.cwd,
 				undefined,
 				true,
 				prefs?.artifactStore,
-				nativeReviewCli,
 			), phase)}`
 			: "";
 		const gentlePrompt = isNamedAgent || isSddAgent
@@ -5522,12 +5495,11 @@ function createGentleAiExtensionForTesting(
 
 	const handleSddStatusCommand = async (args: string, ctx: ExtensionContext) => {
 		const parsed = parseSddStatusCommandArgs(args);
-		const status = await resolveControllerSddStatus(
+		const status = resolveControllerSddStatus(
 			ctx.cwd,
 			parsed.changeName,
 			true,
 			getSddPreflightPreferences(ctx)?.artifactStore,
-			nativeReviewCli,
 		);
 		ctx.ui.notify(
 			parsed.json ? JSON.stringify(status, null, 2) : renderSddStatusMarkdown(status),
@@ -5544,12 +5516,11 @@ function createGentleAiExtensionForTesting(
 
 	const handleSddContinueCommand = async (args: string, ctx: ExtensionContext) => {
 		const parsed = parseSddStatusCommandArgs(args);
-		const status = await resolveControllerSddStatus(
+		const status = resolveControllerSddStatus(
 			ctx.cwd,
 			parsed.changeName,
 			true,
 			getSddPreflightPreferences(ctx)?.artifactStore,
-			nativeReviewCli,
 		);
 		ctx.ui.notify(
 			parsed.json ? JSON.stringify(status, null, 2) : renderSddDispatcherMarkdown(status),
