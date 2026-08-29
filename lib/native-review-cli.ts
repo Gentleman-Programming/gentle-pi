@@ -1592,6 +1592,19 @@ function exactConsentOption(arguments_: readonly string[], name: string): string
 	return values[0]!;
 }
 
+// A Pi consent envelope is bound to Pi only when every exact provider replay
+// path carries exactly one `--agent pi` option. The outer envelope agent alone
+// cannot bind an omitted, embedded, duplicated, or conflicting invocation.
+function validatePiConsentChoiceAgentBindings(consent: ReviewConsentEnvelope): void {
+	if (!("agent" in consent) || consent.agent !== "pi") return;
+	for (const choice of consent.choices) {
+		const arguments_ = splitNativeConsentInvocation(choice.invocation).slice(1);
+		if (exactConsentOption(arguments_, "--agent") !== "pi") {
+			throw new NativeReviewConsentBindingError("consent-invocation-agent-changed", "Native Pi consent invocation agent binding changed");
+		}
+	}
+}
+
 function optionalConsentLineageOption(arguments_: readonly string[]): string | undefined {
 	const values: string[] = [];
 	for (let index = 0; index < arguments_.length; index += 1) {
@@ -1616,6 +1629,7 @@ interface ConsentInvocation {
 }
 
 function consentInvocationArguments(request: NativeReviewConsentAnswerRequest): ConsentInvocation {
+	validatePiConsentChoiceAgentBindings(request.consent);
 	const choice = request.consent.choices.find((candidate) => candidate.answer === request.answer);
 	if (choice === undefined) throw new NativeReviewConsentBindingError("consent-answer-unknown", "Native consent answer must be granted or declined");
 	const words = splitNativeConsentInvocation(choice.invocation);
@@ -1830,11 +1844,12 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		// v2.1+) emits consent/v3, and any other identity fails closed inside
 		// the v3 decoder's exact identity gate.
 		if (execution.body.action === "consent_required") {
-			const consent = decode(NATIVE_REVIEW_OPERATION.START, true, () => (
-				execution.body.schema === "gentle-ai.review-integration.consent/v2"
-					? decodeReviewConsentV2(execution.body)
-					: decodeReviewConsentV3(execution.body, "pi")
-			));
+			const consent = decode(NATIVE_REVIEW_OPERATION.START, true, () => {
+				if (execution.body.schema === "gentle-ai.review-integration.consent/v2") return decodeReviewConsentV2(execution.body);
+				const decoded = decodeReviewConsentV3(execution.body, "pi");
+				validatePiConsentChoiceAgentBindings(decoded);
+				return decoded;
+			});
 			if (consent.targetIdentity !== targetIdentity || consent.projection !== projection) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native consent target binding mismatch");
 			throw new NativeReviewConsentRequiredError(consent);
 		}
