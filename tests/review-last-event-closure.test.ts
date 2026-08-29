@@ -349,3 +349,60 @@ test("unknown-capture reconciliation validates the target-scoped lineage without
 	for (const selector of [{ committedOnly: true }, { baseRef: "refs/heads/main" }, { baseRef: "refs/heads/main", committedOnly: false }] as unknown as readonly Parameters<typeof reconcileUnknownReviewLastEventCapture>[3][]) await assert.rejects(() => reconcileUnknownReviewLastEventCapture(strictNative, "/repo", { lineageId: "reconcile-lineage", targetIdentity: SHA }, selector));
 	assert.equal(launches, 0);
 });
+
+// One approved terminal closure carrying the exact continuation the provider
+// renders: closed positional arguments, the single approved precondition, and a
+// binding that names the candidate being burned.
+function approvedClosureWithAcknowledgement(): Record<string, unknown> {
+	const lineageId = "review-acknowledgement-fixture";
+	const body = closure("review/capture-result", lineageId);
+	body.acknowledgement = {
+		operation: "review.acknowledge-approved",
+		command: "gentle-ai review acknowledge-approved",
+		arguments: [
+			{ name: "cwd", value: "/repo", token: "--cwd=/repo" },
+			{ name: "lineage", value: lineageId, token: `--lineage=${lineageId}` },
+			{ name: "target", value: SHA, token: `--target=${SHA}` },
+			{ name: "expected-revision", value: SHA, token: `--expected-revision=${SHA}` },
+			{ name: "token", value: "a".repeat(64), token: `--token=${"a".repeat(64)}` },
+		],
+		preconditions: [{ name: "state", value: "approved" }],
+		binding: { lineage_id: lineageId, revision: SHA, target_identity: SHA },
+	};
+	return body;
+}
+
+test("the approved acknowledgement fixture decodes as a runnable continuation", () => {
+	const decoded = decodeReviewLastEventClosureV1(approvedClosureWithAcknowledgement());
+	assert.equal(decoded.acknowledgement?.operation, "review.acknowledge-approved");
+	assert.equal(decoded.acknowledgementUndecodable, undefined);
+});
+
+test("an approved acknowledgement must prove the target its relayed token burns", () => {
+	const closure = approvedClosureWithAcknowledgement();
+	const acknowledgement = closure.acknowledgement as Record<string, unknown>;
+	const args = (acknowledgement.arguments as Record<string, unknown>[]).map((argument) => ({ ...argument }));
+	// The relayed token now names a different candidate than the binding does.
+	const decoyTarget = `sha256:${"b".repeat(64)}`;
+	args[2] = { name: "target", value: decoyTarget, token: `--target=${decoyTarget}` };
+	acknowledgement.arguments = args;
+	assert.throws(
+		() => decodeReviewLastEventClosureV1(closure),
+		/acknowledgement target argument does not match its binding/,
+		"a relayed target the binding does not commit to must be refused",
+	);
+});
+
+test("an unreadable acknowledgement degrades the continuation, never the approval", () => {
+	const closure = approvedClosureWithAcknowledgement();
+	// One extra provider-side argument is enough to miss the closed shape.
+	const acknowledgement = closure.acknowledgement as Record<string, unknown>;
+	acknowledgement.arguments = [
+		...(acknowledgement.arguments as unknown[]),
+		{ name: "future", value: "1", token: "--future=1" },
+	];
+	const decoded = decodeReviewLastEventClosureV1(closure);
+	assert.equal(decoded.state, "approved", "the approval outcome must survive an unreadable continuation");
+	assert.equal(decoded.acknowledgement, undefined, "an unreadable continuation must not be offered as runnable");
+	assert.equal(decoded.acknowledgementUndecodable, true, "the host must be told the continuation exists and could not be read");
+});

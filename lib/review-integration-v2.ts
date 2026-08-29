@@ -2089,6 +2089,11 @@ export interface ReviewLastEventClosureV1 {
 	advisoryFindings?: ReviewAdvisoryFindingsV1;
 	statusContinuation?: ReviewStatusContinuationV1;
 	acknowledgement?: ReviewApprovedAcknowledgementV1;
+	// Set when the provider sent an acknowledgement this decoder could not
+	// read. It is deliberately distinct from an absent one: the host must be
+	// able to tell "approved, nothing to run" from "approved, and the thing
+	// that ends this is present but unreadable here".
+	acknowledgementUndecodable?: true;
 }
 
 export interface ReviewLastEventClosureBinding {
@@ -2245,9 +2250,28 @@ export function decodeReviewLastEventClosureV1(value: unknown): ReviewLastEventC
 	// provider that emits one is decoded strictly; a provider that does not is
 	// still the contract this build ships against. Requiring it belongs with
 	// the pin bump that makes it always present.
-	const acknowledgement = body.acknowledgement === undefined
-		? undefined
-		: decodeReviewApprovedAcknowledgementV1(body.acknowledgement, "last_event_closure.acknowledgement");
+	// Decoded defensively on purpose. This decoder pins the acknowledgement to a
+	// closed positional shape, and the same patch that added it already shows
+	// what strictness costs when the provider moves: rejecting one omitempty
+	// field made every targeted-validation STATUS that carried it undecodable.
+	// Here the blast radius would be worse than a lost field. Throwing would
+	// fail the whole approved closure, so the host would lose the approval
+	// outcome AND the only invocation that burns the authority, leaving the
+	// lineage approved and un-burnable at once. An unreadable continuation
+	// degrades to a flag; everything else about the approval still arrives.
+	let acknowledgement: ReviewApprovedAcknowledgementV1 | undefined;
+	let acknowledgementUndecodable = false;
+	if (body.acknowledgement !== undefined) {
+		try {
+			acknowledgement = decodeReviewApprovedAcknowledgementV1(body.acknowledgement, "last_event_closure.acknowledgement");
+		} catch {
+			acknowledgement = undefined;
+			acknowledgementUndecodable = true;
+		}
+	}
+	if (acknowledgementUndecodable && state !== "approved") {
+		throw new TypeError("last_event_closure acknowledgement requires approved state");
+	}
 	if (acknowledgement !== undefined) {
 		if (state !== "approved") throw new TypeError("last_event_closure acknowledgement requires approved state");
 		if (acknowledgement.binding.lineageId !== shared.lineageId) {
@@ -2259,6 +2283,16 @@ export function decodeReviewLastEventClosureV1(value: unknown): ReviewLastEventC
 		const lineageArguments = acknowledgement.arguments.filter((argument) => argument.name === "lineage");
 		if (lineageArguments.length !== 1 || lineageArguments[0]?.value !== shared.lineageId || lineageArguments[0]?.token !== `--lineage=${shared.lineageId}`) {
 			throw new TypeError("last_event_closure acknowledgement lineage argument does not match its enclosing closure");
+		}
+		// The target is the other half of what this invocation burns, and it is
+		// relayed verbatim. A terminal closure carries no target of its own, so
+		// the acknowledgement's binding is the only statement of which candidate
+		// is being burned: pinning lineage and revision while leaving the
+		// relayed target token free of it proves nothing about what runs.
+		const targetArguments = acknowledgement.arguments.filter((argument) => argument.name === "target");
+		if (targetArguments.length !== 1 || targetArguments[0]?.value !== acknowledgement.binding.targetIdentity
+			|| targetArguments[0]?.token !== `--target=${acknowledgement.binding.targetIdentity}`) {
+			throw new TypeError("last_event_closure acknowledgement target argument does not match its binding");
 		}
 	}
 	const action = nonempty(body.action, "last_event_closure.action");
@@ -2272,6 +2306,7 @@ export function decodeReviewLastEventClosureV1(value: unknown): ReviewLastEventC
 		...(advisoryFindings === undefined ? {} : { advisoryFindings }),
 		...(statusContinuation === undefined ? {} : { statusContinuation }),
 		...(acknowledgement === undefined ? {} : { acknowledgement }),
+		...(acknowledgementUndecodable ? { acknowledgementUndecodable: true as const } : {}),
 	};
 }
 

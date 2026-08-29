@@ -3928,6 +3928,10 @@ function mapLastEventClosure(
 			// waits for that exact invocation instead of burning on its own, so
 			// dropping it here would strand the lineage as approved forever.
 			...(closure.acknowledgement === undefined ? {} : { acknowledgement: closure.acknowledgement.raw }),
+			// A present-but-unreadable continuation is not the same as none: the
+			// host is approved and cannot end it here, and silence would read as
+			// nothing left to do.
+			...(closure.acknowledgementUndecodable === undefined ? {} : { acknowledgement_undecodable: true }),
 		},
 		lineage_id: closure.lineageId,
 		state: closure.state,
