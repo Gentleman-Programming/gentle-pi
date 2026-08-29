@@ -15,8 +15,8 @@ Any phase that selects, continues, applies, verifies, syncs, or archives an SDD 
 
 ## Native Engine
 
-- When the session artifact store is `openspec` or `both` (with an `openspec/` directory) and the `gentle-ai` binary is available, prefer `gentle-ai sdd-status [change] --cwd <repo> --json --instructions` for read-only status and `gentle-ai sdd-continue [change] --cwd <repo>` for dispatcher output, and treat their native status JSON as authoritative over prompt inference or manually reconstructed state.
-- For non-authoritative stores (`engram`, `none`, and `both` without an `openspec/` directory), do not treat dispatcher output as authoritative; follow Engine Authority by Store below.
+- For file-backed `openspec` or `both` sessions with an `openspec/` directory, use Gentle Pi's local SDD status engine as the artifact-state authority. It resolves the local artifact graph without consulting RDD authority or receipts.
+- For non-authoritative stores (`engram`, `none`, and `both` without an `openspec/` directory), do not treat disk status output as authoritative; follow Engine Authority by Store below.
 - Runtime-attempt authority is different from artifact dispatch: normal runtime-bearing OpenSpec and Engram continuations MUST bracket external execution with `gentle-ai sdd-attempt acquire|settle --cwd <repo> --change <change>`. Their bounded result contains only `proceed`, `blocked`, or `complete` plus an opaque continuation token when required, and MAY carry `settle_obligation` on a `proceed`. The Git-common-dir immutable chain remains the sole authority for ordinals, cumulative attempt/line budgets, runtime evidence, and atomic bound remediation.
 - A phase actor launched BY a parent that already holds a `proceed`-state acquire for that exact work unit is a distinct call/process, not a fresh continuation: it MUST NOT `acquire` again blind. Colliding with its own parent's active attempt is not a genuine `blocked: active_attempt` (#2291). It authenticates as that SAME attempt by passing the parent's returned token on its own `acquire --token <token>` call: a token matching the ledger's live active attempt returns `proceed` with that same token and zero mutation, while a non-matching token gets the ordinary `blocked: active_attempt` naming the real active token.
 - When `blockedReasons` is non-empty, do not proceed to terminal, archive, or apply work. Return or report `blockedReasons` and stop unless `nextRecommended` is `verify`, in which case verification may run only to remediate or refresh evidence for the blockers. When `nextRecommended` is `resolve-blockers`, always report `blockedReasons` and stop. When `nextRecommended` is a planning token (`propose`, `spec`, `design`, or `tasks`), launch the corresponding planning phase — missing planning artifacts are the expected output of those phases, not genuine blockers.
@@ -87,7 +87,7 @@ isNonAuthoritative: false  # boolean; true when the native engine is not authori
 
 ## Task Ownership
 
-Each checkbox may end with one terminal marker: `<!-- sdd-owner: implementation -->` or `<!-- sdd-owner: parent -->`. An unmarked legacy checkbox is implementation-owned. Any line containing `sdd-owner` that is unsupported, duplicated, or non-terminal is malformed: add its exact line to `taskArtifactErrors` and `blockedReasons`, and count it as unresolved implementation work even when checked. `taskProgress` reports implementation work; `deferredParentActions` reports valid parent actions separately.
+New task checkboxes end with the terminal marker `<!-- sdd-owner: implementation -->`. An unmarked legacy checkbox is implementation-owned. Supported legacy non-implementation rows are informational only. Any line containing `sdd-owner` that is unsupported, duplicated, or non-terminal is malformed: add its exact line to `taskArtifactErrors` and `blockedReasons`, and count it as unresolved implementation work even when checked. `taskProgress` reports implementation work.
 
 ## Apply State
 
@@ -99,9 +99,9 @@ Each checkbox may end with one terminal marker: `<!-- sdd-owner: implementation 
 ## Dependency States
 
 - `apply` is `ready` only when specs, design, and tasks are available and task progress is not all done.
-- `verify` is ready only after implementation completion and authoritative parent review approval. Without that approval, the route is `parent-lifecycle`; missing receipt requires the parent to explicitly start bounded review and invalid authority fails closed. Unchecked implementation tasks remain CRITICAL blockers for full archive readiness.
+- `verify` is ready after implementation completion when tasks are complete or apply-progress exists. RDD authority and receipts never gate the apply -> verify -> sync -> archive route. Unchecked implementation tasks remain CRITICAL blockers for full archive readiness.
 - `sync` is `ready` only when verify-report exists and has no unresolved `FAIL`, `BLOCKED`, `CRITICAL`, or verification blockers. `engram`/`none` modes may mark sync `not_applicable`.
-- `archive` is `ready` only when verify-report exists, sync is complete or not applicable, implementation tasks are complete, and explicit deferred mandatory parent actions are reconciled at their native lifecycle boundaries. CRITICAL verification issues have no override. Explicit recorded exceptions are limited to non-critical partial archives or stale-checkbox reconciliation when apply-progress/verify-report prove completion.
+- `archive` is `ready` only when verify-report exists, sync is complete or not applicable, and implementation tasks are complete. CRITICAL verification issues have no override. Explicit recorded exceptions are limited to non-critical partial archives or stale-checkbox reconciliation when apply-progress/verify-report prove completion.
 - `not_applicable`: emitted for non-authoritative stores (engram, none, and both when no `openspec/` directory exists) when `nextRecommended: "resolve-via-engram"` is active. `not_applicable` is NOT a gate failure — readiness must be resolved from Engram instead of from these fields.
 
 ## Action Context Guard
@@ -114,8 +114,8 @@ The orchestrator MUST carry `actionContext` into any phase launch.
 
 ## Engine Authority by Store
 
-- `openspec` and `both` (when `openspec/` directory exists): the native status engine resolves artifact state from disk and is authoritative. Phase executors must obey it.
-- `engram`, `none`, and `both` (when `openspec/` directory does NOT exist): the native status engine cannot read Engram artifacts. It returns `nextRecommended: "resolve-via-engram"` and empty `blockedReasons`. This output is **non-authoritative**. The orchestrator must resolve readiness directly from Engram using the Engram memory tools injected by the memory provider on the change topic keys (`sdd/{change-name}/proposal`, `sdd/{change-name}/spec`, etc.) instead of relying on the engine's dependency states. The `artifactStore` field still reflects the real chosen store value (e.g. `"both"`) and must not be rewritten.
+- `openspec` and `both` (when `openspec/` directory exists): the local SDD status engine resolves artifact state from disk and is authoritative. Phase executors must obey it.
+- `engram`, `none`, and `both` (when `openspec/` directory does NOT exist): the local engine cannot read Engram artifacts. It returns `nextRecommended: "resolve-via-engram"` and empty `blockedReasons`. This output is **non-authoritative**. The orchestrator must resolve readiness directly from Engram using the Engram memory tools injected by the memory provider on the change topic keys (`sdd/{change-name}/proposal`, `sdd/{change-name}/spec`, etc.) instead of relying on the engine's dependency states. The `artifactStore` field still reflects the real chosen store value (e.g. `"both"`) and must not be rewritten.
 
 ## Native Runtime Attempt Authority
 

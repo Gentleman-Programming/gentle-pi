@@ -81,6 +81,8 @@ const REVIEW_LENSES = ["review-risk", "review-resilience", "review-readability",
 const RISK_REASON_CODES = ["configuration_change", "empty_content", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "process_boundary", "process_scan_limit", "service_token", "shell_source"]         ;
 const RISK_SIGNALS = ["auth", "update", "security", "payments", "permissions", "shell_process"]         ;
 const STATUS_ACTIONS = ["start", "recover", "maintainer_action", "select_lineage", "repair_authority", "stop"]         ;
+const RECEIPT_STATUSES = ["expected_missing", "present", "publication_pending", "not_applicable"]         ;
+
 export const REVIEW_STATUS_ACTION_DISPOSITION = {
 	SCOPE_CHANGED: "scope_changed",
 	INVALIDATED: "invalidated",
@@ -338,6 +340,11 @@ const REPOSITORY_CONTEXT_OUTCOMES = ["applied", "pending", "blocked_conflict", "
 
 
 
+
+
+
+
+
 // Provider-owned completing form for a host-mediated capture slot
 // (gentle-pi#311 P4). The provider issues the exact operation and argument
 // tokens that submit the captured bytes; the host substitutes only the
@@ -381,6 +388,8 @@ export const REVIEW_PROVIDER_ROLE_CAPTURE_OPERATIONS = Object.freeze(Object.valu
 // decoded strictly (exact key sets per the vendored status-v5.schema.json and
 // correction-plan-request.schema.json on gentle-ai main) and carried through
 // so a v5 provider payload is never rejected for being newer than v3.
+
+
 
 
 
@@ -1514,8 +1523,10 @@ export function decodeReviewNextTransitionV3(value         , options            
 		const lineageId = binding.lineage_id === undefined ? undefined : lineage(binding.lineage_id, "next_transition.execute.binding.lineage_id");
 		const revision = binding.revision === undefined ? undefined : sha256(binding.revision, "next_transition.execute.binding.revision");
 		const command = execute.command === undefined ? undefined : nonempty(execute.command, "next_transition.execute.command");
+		const decodedExecute                                = { operation, arguments: argumentsList, preconditions, binding: { targetIdentity, ...(lineageId === undefined ? {} : { lineageId }), ...(revision === undefined ? {} : { revision }) }, ...(command === undefined ? {} : { command }) };
+		if (operation === "review.acknowledge-approved") assertReviewApprovedAcknowledgementExecuteV1(decodedExecute);
 		if (transition.collect !== undefined) throw new TypeError("next_transition.collect is incompatible with execute");
-		return { kind, reasonCode, execute: { operation, arguments: argumentsList, preconditions, binding: { targetIdentity, ...(lineageId === undefined ? {} : { lineageId }), ...(revision === undefined ? {} : { revision }) }, ...(command === undefined ? {} : { command }) }, ...(correctionRequest === undefined ? {} : { correctionRequest }) };
+		return { kind, reasonCode, execute: decodedExecute, ...(correctionRequest === undefined ? {} : { correctionRequest }) };
 	}
 	if (kind === "collect") {
 		const collect = exactRecord(transition.collect, "next_transition.collect", ["inputs"]);
@@ -1576,10 +1587,18 @@ export function decodeReviewStatusV3(value         )                 {
 	const v5 = typeof value === "object" && value !== null && (value                           ).schema === "gentle-ai.review-integration.status/v5";
 	const body = exactRecord(value, "status", [
 		"schema", "contract", "operation", "applicability", "action", "replayability", "target_identity", "projection", "repair", "candidates",
-	], ["authority", "frozen", "action_disposition", "eligibility", "next_transition", "authority_target_identity", ...(v5 ? ["forecast", "repository_context", "validation_request"] : [])]);
+	], ["authority", "frozen", "action_disposition", "eligibility", "next_transition", "authority_target_identity", ...(v5 ? ["receipt", "forecast", "repository_context", "validation_request"] : [])]);
 	requireIdentity(body, v5 ? "gentle-ai.review-integration.status/v5" : "gentle-ai.review-integration.status/v3", REVIEW_INTEGRATION_OPERATION.STATUS);
 
 	const applicability = enumeration(body.applicability, ["current_target", "unrelated", "ambiguous", "corrupted"]         , "status.applicability");
+	let receipt                                   ;
+	if (body.receipt !== undefined) {
+		const source = exactRecord(body.receipt, "status.receipt", ["status"], ["identity"]);
+		receipt = {
+			status: enumeration(source.status, RECEIPT_STATUSES, "status.receipt.status"),
+			...(source.identity === undefined ? {} : { identity: sha256(source.identity, "status.receipt.identity") }),
+		};
+	}
 	let authority                                     ;
 	if (body.authority !== undefined) {
 		const source = exactRecord(body.authority, "status.authority", ["version", "lineage_id", "state", "generation", "revision"]);
@@ -1607,6 +1626,9 @@ export function decodeReviewStatusV3(value         )                 {
 	}
 	if (authority?.version === REVIEW_AUTHORITY_VERSION.COMPACT_V2 && frozen === undefined) throw new TypeError("compact-v2 status requires frozen metadata");
 	if (authority?.version === REVIEW_AUTHORITY_VERSION.LEGACY_V1 && (frozen !== undefined || body.authority_target_identity !== undefined)) throw new TypeError("legacy status cannot expose frozen metadata or authority_target_identity");
+	if (authority?.version === REVIEW_AUTHORITY_VERSION.LEGACY_V1 && receipt !== undefined && receipt.status !== "expected_missing" && receipt.status !== "present") {
+		throw new TypeError("legacy status receipt is incompatible");
+	}
 
 	const action = enumeration(body.action, STATUS_ACTIONS, "status.action");
 	const actionDisposition = body.action_disposition === undefined ? undefined : enumeration(body.action_disposition, Object.values(REVIEW_STATUS_ACTION_DISPOSITION), "status.action_disposition");
@@ -1652,6 +1674,7 @@ export function decodeReviewStatusV3(value         )                 {
 		contract: REVIEW_INTEGRATION_CONTRACT,
 		applicability,
 		...(authority === undefined ? {} : { authority }),
+		...(receipt === undefined ? {} : { receipt }),
 		action,
 		...(actionDisposition === undefined ? {} : { actionDisposition }),
 		replayability,
@@ -2083,6 +2106,41 @@ const REVIEW_APPROVED_ACKNOWLEDGEMENT_ARGUMENTS = ["cwd", "lineage", "target", "
 
 
 
+function assertReviewApprovedAcknowledgementExecuteShapeV1(execute                               )                                              {
+	if (execute.operation !== REVIEW_APPROVED_ACKNOWLEDGEMENT_OPERATION) throw new TypeError(`acknowledgement.execute.operation must be ${REVIEW_APPROVED_ACKNOWLEDGEMENT_OPERATION}`);
+	if (execute.command === undefined) throw new TypeError("acknowledgement.execute.command is required");
+	text(execute.command, "acknowledgement.execute.command", { minimum: 1, pattern: /^gentle-ai review acknowledge-approved(?: |$)/ });
+	if (execute.arguments.length !== REVIEW_APPROVED_ACKNOWLEDGEMENT_ARGUMENTS.length) throw new TypeError(`acknowledgement.execute.arguments must carry exactly ${REVIEW_APPROVED_ACKNOWLEDGEMENT_ARGUMENTS.length} provider-issued arguments`);
+	const values = execute.arguments.map((argument, index) => { const name = REVIEW_APPROVED_ACKNOWLEDGEMENT_ARGUMENTS[index] ; if (argument.name !== name) throw new TypeError(`acknowledgement.execute.arguments[${index}].name must be ${name}`); const value = nonempty(argument.value, `acknowledgement.execute.arguments[${index}].value`); if (nonempty(argument.token, `acknowledgement.execute.arguments[${index}].token`) !== `--${name}=${value}`) throw new TypeError(`acknowledgement.execute.arguments[${index}].token must exactly match ${name}`); return value; });
+	if (execute.preconditions.length !== 1 || execute.preconditions[0]?.name !== "state" || execute.preconditions[0]?.value !== "approved") throw new TypeError("acknowledgement.execute.preconditions must be the single approved state precondition");
+	return { tokens: execute.arguments.map((argument) => argument.token )                                                , values: values                                                     , lineageId: lineage(execute.binding.lineageId, "acknowledgement.execute.binding.lineage_id"), targetIdentity: sha256(execute.binding.targetIdentity, "acknowledgement.execute.binding.target_identity"), revision: sha256(execute.binding.revision, "acknowledgement.execute.binding.revision") };
+}
+
+/**
+ * Proves that an approved-acknowledgement execute vector is the exact closed,
+ * provider-issued burn invocation. Callers can additionally bind its values to
+ * their own current STATUS before invoking the returned tokens.
+ */
+export function assertReviewApprovedAcknowledgementExecuteV1(
+	execute                               ,
+	expected                                                    = {},
+)                                               {
+	const shape = assertReviewApprovedAcknowledgementExecuteShapeV1(execute);
+	if (shape.values[1] !== shape.lineageId) throw new TypeError("acknowledgement lineage argument does not match its binding");
+	if (shape.values[2] !== shape.targetIdentity) throw new TypeError("acknowledgement target argument does not match its binding");
+	if (shape.values[3] !== shape.revision) throw new TypeError("acknowledgement revision argument does not match its binding");
+	if (expected.cwd !== undefined && shape.values[0] !== expected.cwd) throw new TypeError("acknowledgement.execute.cwd does not match the current target");
+	if (expected.lineageId !== undefined && shape.lineageId !== expected.lineageId) throw new TypeError("acknowledgement.execute.lineage does not match the current target");
+	if (expected.targetIdentity !== undefined && shape.targetIdentity !== expected.targetIdentity) throw new TypeError("acknowledgement.execute.target does not match the current target");
+	if (expected.revision !== undefined && shape.revision !== expected.revision) throw new TypeError("acknowledgement.execute.revision does not match the current target"); return shape.tokens;
+}
+
+
+
+
+
+
+
 
 
 
@@ -2121,42 +2179,39 @@ function decodeReviewStatusContinuationArtifactV1(value         , label        )
 	};
 }
 
-// decodeReviewApprovedAcknowledgementV1 decodes the one continuation that burns
-// approved authority. Only this exact invocation ends the lifecycle, so every
-// field is pinned: the closed positional argument list, the single approved
-// precondition, and the fully-bound lineage/revision/target it commits to.
+// decodeReviewApprovedAcknowledgementV1 retains the closure-specific wire
+// boundary with the shared shape validator; its semantic binding stays outside
+// the defensive closure catch in the exported assertion.
 function decodeReviewApprovedAcknowledgementV1(value         , label        )                                  {
 	const body = exactRecord(value, label, ["operation", "command", "arguments", "preconditions", "binding"]);
-	if (body.operation !== REVIEW_APPROVED_ACKNOWLEDGEMENT_OPERATION) {
-		throw new TypeError(`${label}.operation must be ${REVIEW_APPROVED_ACKNOWLEDGEMENT_OPERATION}`);
-	}
-	const command = text(body.command, `${label}.command`, { minimum: 1, pattern: /^gentle-ai review acknowledge-approved(?: |$)/ });
 	const argumentsList = decodeTransitionArguments(body.arguments, `${label}.arguments`);
-	if (argumentsList.length !== REVIEW_APPROVED_ACKNOWLEDGEMENT_ARGUMENTS.length) {
-		throw new TypeError(`${label}.arguments must carry exactly ${REVIEW_APPROVED_ACKNOWLEDGEMENT_ARGUMENTS.length} provider-issued arguments`);
-	}
-	argumentsList.forEach((argument, index) => {
-		const expected = REVIEW_APPROVED_ACKNOWLEDGEMENT_ARGUMENTS[index];
-		if (argument.name !== expected) throw new TypeError(`${label}.arguments[${index}].name must be ${expected}`);
-		if (argument.token === undefined) throw new TypeError(`${label}.arguments[${index}] requires its exact token`);
-	});
 	const preconditions = decodeTransitionArguments(body.preconditions, `${label}.preconditions`);
-	if (preconditions.length !== 1 || preconditions[0].name !== "state" || preconditions[0].value !== "approved") {
-		throw new TypeError(`${label}.preconditions must be the single approved state precondition`);
-	}
 	const sourceBinding = exactRecord(body.binding, `${label}.binding`, ["lineage_id", "revision", "target_identity"], ["repository_context"]);
 	const repositoryContext = sourceBinding.repository_context === undefined
 		? undefined
 		: text(sourceBinding.repository_context, `${label}.binding.repository_context`, { pattern: /^rctx[12]_[0-9a-f]{64}$/ });
-	return {
-		operation: REVIEW_APPROVED_ACKNOWLEDGEMENT_OPERATION,
-		command,
+	const acknowledgement = {
+		operation: body.operation,
+		command: body.command,
 		arguments: argumentsList,
 		preconditions,
 		binding: {
-			lineageId: lineage(sourceBinding.lineage_id, `${label}.binding.lineage_id`),
-			revision: sha256(sourceBinding.revision, `${label}.binding.revision`),
-			targetIdentity: sha256(sourceBinding.target_identity, `${label}.binding.target_identity`),
+			lineageId: sourceBinding.lineage_id,
+			revision: sourceBinding.revision,
+			targetIdentity: sourceBinding.target_identity,
+			...(repositoryContext === undefined ? {} : { repositoryContext }),
+		},
+	}                                            ;
+	const shape = assertReviewApprovedAcknowledgementExecuteShapeV1(acknowledgement);
+	return {
+		operation: REVIEW_APPROVED_ACKNOWLEDGEMENT_OPERATION,
+		command: acknowledgement.command ,
+		arguments: argumentsList,
+		preconditions,
+		binding: {
+			lineageId: shape.lineageId,
+			revision: shape.revision,
+			targetIdentity: shape.targetIdentity,
 			...(repositoryContext === undefined ? {} : { repositoryContext }),
 		},
 		raw: body,
@@ -2275,26 +2330,7 @@ export function decodeReviewLastEventClosureV1(value         )                  
 	}
 	if (acknowledgement !== undefined) {
 		if (state !== "approved") throw new TypeError("last_event_closure acknowledgement requires approved state");
-		if (acknowledgement.binding.lineageId !== shared.lineageId) {
-			throw new TypeError("last_event_closure acknowledgement lineage does not match its enclosing closure");
-		}
-		if (acknowledgement.binding.revision !== shared.storeRevision) {
-			throw new TypeError("last_event_closure acknowledgement revision does not match its enclosing closure");
-		}
-		const lineageArguments = acknowledgement.arguments.filter((argument) => argument.name === "lineage");
-		if (lineageArguments.length !== 1 || lineageArguments[0]?.value !== shared.lineageId || lineageArguments[0]?.token !== `--lineage=${shared.lineageId}`) {
-			throw new TypeError("last_event_closure acknowledgement lineage argument does not match its enclosing closure");
-		}
-		// The target is the other half of what this invocation burns, and it is
-		// relayed verbatim. A terminal closure carries no target of its own, so
-		// the acknowledgement's binding is the only statement of which candidate
-		// is being burned: pinning lineage and revision while leaving the
-		// relayed target token free of it proves nothing about what runs.
-		const targetArguments = acknowledgement.arguments.filter((argument) => argument.name === "target");
-		if (targetArguments.length !== 1 || targetArguments[0]?.value !== acknowledgement.binding.targetIdentity
-			|| targetArguments[0]?.token !== `--target=${acknowledgement.binding.targetIdentity}`) {
-			throw new TypeError("last_event_closure acknowledgement target argument does not match its binding");
-		}
+		assertReviewApprovedAcknowledgementExecuteV1(acknowledgement, { lineageId: shared.lineageId, revision: shared.storeRevision });
 	}
 	const action = nonempty(body.action, "last_event_closure.action");
 	const advisoryFindings = body.advisory_findings === undefined

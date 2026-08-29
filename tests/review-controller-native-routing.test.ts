@@ -82,6 +82,116 @@ function status(
 	} as unknown as ReviewStatusV3;
 }
 
+function approvedAcknowledgementStatus(lineageId: string, cwd = process.cwd()): ReviewStatusV3 {
+	const arguments_ = [{ name: "cwd", value: cwd, token: `--cwd=${cwd}` }, { name: "lineage", value: lineageId, token: `--lineage=${lineageId}` }, { name: "target", value: SHA, token: `--target=${SHA}` }, { name: "expected-revision", value: SHA, token: `--expected-revision=${SHA}` }, { name: "token", value: "provider-issued-once", token: "--token=provider-issued-once" }];
+	const approved = status(lineageId, [], "approved");
+	approved.nextTransition = { kind: "execute", reasonCode: "approved_acknowledgement_required", execute: { operation: "review.acknowledge-approved", command: "gentle-ai review acknowledge-approved --provider-vector", arguments: arguments_, preconditions: [{ name: "state", value: "approved", token: "--state=approved" }], binding: { lineageId, targetIdentity: SHA, revision: SHA } } };
+	return approved;
+}
+
+function burnedAcknowledgementStatus(lineageId: string): ReviewStatusV3 {
+	const burned = status(lineageId, [], "approved");
+	burned.nextTransition = { kind: "stop", reasonCode: "approved_acknowledged" };
+	return burned;
+}
+
+test("public acknowledgement relays one current provider vector and never replays after authority burn", async () => {
+	const lineageId = "acknowledge-approved";
+	const requests: Array<Record<string, unknown>> = [];
+	const acknowledgementRequests: Array<{ argumentTokens: readonly string[]; cwd: string }> = [];
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => {
+			requests.push(request);
+			return requests.length === 1
+				? approvedAcknowledgementStatus(lineageId)
+				: burnedAcknowledgementStatus(lineageId);
+		},
+		acknowledgeApproved: async (request: { argumentTokens: readonly string[]; cwd: string }) => {
+			acknowledgementRequests.push(request);
+		},
+	} as unknown as NativeReviewCli;
+
+	const rejected = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId, input: "{}" }, process.cwd(), native);
+	assert.deepEqual({ outcome: rejected.outcome, calls: requests.length }, { outcome: "native-approved-acknowledgement-input-invalid", calls: 0 });
+	const completed = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId }, process.cwd(), native);
+	assert.deepEqual(completed, { operation: "acknowledge-approved", status: "closed", outcome: "native-approved-acknowledgement-completed", lineage_id: lineageId, target_identity: SHA, authority: "burned", delivery: "ordinary-repository-policy", mutation_performed: true, mutation_outcome: "committed" });
+	assert.deepEqual(requests, [{ cwd: process.cwd(), lineageId }]);
+	assert.deepEqual(acknowledgementRequests, [{ cwd: process.cwd(), argumentTokens: [`--cwd=${process.cwd()}`, `--lineage=${lineageId}`, `--target=${SHA}`, `--expected-revision=${SHA}`, "--token=provider-issued-once"] }]);
+
+	const later = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId }, process.cwd(), native);
+	assert.equal(later.outcome, "native-approved-acknowledgement-not-current");
+	assert.equal(requests.length, 2);
+	assert.equal(acknowledgementRequests.length, 1);
+});
+
+test("ambiguous acknowledgement reconciles STATUS once without replaying the provider vector", async () => {
+	const lineageId = "ambiguous-acknowledgement";
+	let statusCalls = 0;
+	let acknowledgementCalls = 0;
+	const native = {
+		targetStatus: async () => {
+			statusCalls += 1;
+			return statusCalls === 1
+				? approvedAcknowledgementStatus(lineageId)
+				: burnedAcknowledgementStatus(lineageId);
+		},
+		acknowledgeApproved: async () => { acknowledgementCalls += 1; throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, "review/acknowledge-approved", true, true, "acknowledgement outcome unknown"); },
+	} as unknown as NativeReviewCli;
+
+	const result = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId }, process.cwd(), native);
+	assert.equal(result.outcome, "native-mutation-status-reconciled");
+	assert.equal(result.mutation_outcome, "unknown");
+	assert.equal((result.diagnostics as { error_code?: string }).error_code, NATIVE_REVIEW_ERROR_CODE.NON_ZERO);
+	assert.deepEqual(result.reconciliation, { schema: "gentle-ai.review-integration.status/v5" });
+	assert.equal(statusCalls, 2);
+	assert.equal(acknowledgementCalls, 1);
+});
+
+test("public acknowledgement rejects a typed decoy provider vector before invocation", async () => {
+	const lineageId = "decoy-acknowledgement";
+	const decoy = approvedAcknowledgementStatus(lineageId);
+	const target = decoy.nextTransition!.execute!.arguments[2]!;
+	target.value = `sha256:${"b".repeat(64)}`;
+	target.token = `--target=${target.value}`;
+	let statusCalls = 0;
+	let acknowledgementCalls = 0;
+	const native = {
+		targetStatus: async () => { statusCalls += 1; return decoy; },
+		acknowledgeApproved: async () => { acknowledgementCalls += 1; },
+	} as unknown as NativeReviewCli;
+
+	const result = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId }, process.cwd(), native);
+	assert.equal(result.outcome, "native-operation-failed");
+	assert.equal(result.mutation_outcome, "none");
+	assert.equal(statusCalls, 1);
+	assert.equal(acknowledgementCalls, 0);
+});
+
+test("public acknowledgement rejects a mismatched provider cwd before invocation", async () => {
+	let invoked = false;
+	const result = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId: "mismatched-cwd" }, process.cwd(), {
+		targetStatus: async () => approvedAcknowledgementStatus("mismatched-cwd", "/provider/mismatch"),
+		acknowledgeApproved: async () => { invoked = true; },
+	} as unknown as NativeReviewCli);
+	assert.deepEqual({ outcome: result.outcome, invoked }, { outcome: "native-operation-failed", invoked: false });
+});
+
+test("local acknowledgement failure remains pre-launch and does not reconcile STATUS", async () => {
+	const lineageId = "local-acknowledgement-failure";
+	let statusCalls = 0;
+	let acknowledgementCalls = 0;
+	const native = {
+		targetStatus: async () => { statusCalls += 1; return approvedAcknowledgementStatus(lineageId); },
+		acknowledgeApproved: async () => { acknowledgementCalls += 1; throw new TypeError("local acknowledgement validation failed"); },
+	} as unknown as NativeReviewCli;
+
+	const result = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId }, process.cwd(), native);
+	assert.equal(result.outcome, "native-operation-failed");
+	assert.equal(result.mutation_outcome, "none");
+	assert.equal(statusCalls, 1);
+	assert.equal(acknowledgementCalls, 1);
+});
+
 function correctionPlanInput(lineageId: string): ReviewCollectInputV3 {
 	const arguments_ = [{ name: "lineage", value: lineageId, token: `--lineage=${lineageId}` }, { name: "target", value: SHA, token: `--target=${SHA}` }];
 	return { name: "correction_plan", schema: "https://gentle-ai.dev/schema/review/correction-plan/v1", captureOperation: "review.capture-correction-plan", arguments: arguments_, submission: { operationToken: "capture-correction-plan", argumentTokens: [`--lineage=${lineageId}`, "--correction-lines={{value}}"], values: [{ slot: "correction_lines", domain: "integer", substitutionLocation: 1, minimum: 1, maximum: 200 }] } } as unknown as ReviewCollectInputV3;
@@ -171,6 +281,109 @@ test("REPAIR retains frozen committed collect selectors and leaves workspace rou
 	await __testing.executeReviewControllerOperation({ operation: "repair", lineageId: workspaceLineage }, cwd, { targetStatus: async (request: Record<string, unknown>) => { workspaceRequests.push(request); return status(workspaceLineage); } } as unknown as NativeReviewCli, undefined, candidateViews);
 	assert.deepEqual({ outcome: result.outcome, routes: selections.size, selectors: requests.map(({ cwd: requestCwd, lineageId: id, baseRef, committedOnly }) => ({ cwd: requestCwd, lineageId: id, baseRef, committedOnly })) }, { outcome: "native-capture-outcome-unknown", routes: 0, selectors: Array.from({ length: 3 }, () => ({ cwd, lineageId, baseRef: frozenTarget.baseCommit, committedOnly: true })) });
 	assert.deepEqual(workspaceRequests, [{ cwd, lineageId: workspaceLineage }]);
+});
+
+test("STATUS preserves retained intended-untracked selection through selectorless same-lineage replacement collection", async () => {
+	const cwd = process.cwd();
+	const lineageId = "selectorless-replacement";
+	const selectedUntracked = {
+		untrackedScope: "select",
+		expectedUntrackedInventory: "inventory-sha256",
+		intendedUntracked: ["generated/report.json"],
+	};
+	const initial = correctionPlanInput(lineageId);
+	const replacement: ReviewCollectInputV3 = {
+		...correctionPlanInput(lineageId),
+		arguments: [
+			...correctionPlanInput(lineageId).arguments,
+			{ name: "replacement", value: "b", token: "--replacement=b" },
+		],
+	};
+	const selections = new Map();
+	const requests: Array<Record<string, unknown>> = [];
+	let captures = 0;
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => {
+			requests.push(request);
+			return "baseRef" in request
+				? status(lineageId, [])
+				: status(lineageId, [requests.length === 1 ? initial : replacement]);
+		},
+		captureCorrectionPlan: async ({ correctionLines, cwd: captureCwd }: { correctionLines: number; cwd: string }) => {
+			captures += 1;
+			assert.deepEqual({ correctionLines, cwd: captureCwd }, { correctionLines: 1, cwd });
+			return { schema: "gentle-ai.review-last-event-closure/v1", operation: "review.capture-correction-plan", lineageId, state: "correction_required", storeRevision: SHA };
+		},
+	} as unknown as NativeReviewCli;
+
+	const initialStatus = await __testing.executeReviewControllerOperation(
+		{ operation: "status", lineageId, input: JSON.stringify(selectedUntracked) },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		undefined,
+		selections,
+	);
+	assert.equal(selections.size, 2);
+	await __testing.executeReviewControllerOperation(
+		{ operation: "status", lineageId, input: JSON.stringify({ baseRef: "main", committedOnly: true }) },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		undefined,
+		selections,
+	);
+	assert.deepEqual(requests[1], { cwd, lineageId, agent: "pi", baseRef: "main", committedOnly: true });
+	assert.equal(selections.size, 1);
+	const replacementStatus = await __testing.executeReviewControllerOperation(
+		{ operation: "status", lineageId },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		undefined,
+		selections,
+	);
+	assert.equal(selections.size, 2);
+	const bindingA = bindingOf(initialStatus);
+	const bindingB = bindingOf(replacementStatus);
+	assert.notEqual(bindingA, bindingB);
+
+	const stale = await __testing.executeReviewCaptureOperation(
+		{ lineageId, collectBinding: bindingA, correctionLines: 1 },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		selections,
+		true,
+	);
+	assert.deepEqual({ outcome: stale.outcome, requests: requests.length, captures }, { outcome: "capture-binding-rejected", requests: 3, captures: 0 });
+
+	const captured = await __testing.executeReviewCaptureOperation(
+		{ lineageId, collectBinding: bindingB, correctionLines: 1 },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		selections,
+		true,
+	);
+	assert.equal(captured.outcome, "native-last-event-closure");
+	assert.deepEqual(requests, [
+		{ cwd, lineageId, agent: "pi", ...selectedUntracked },
+		{ cwd, lineageId, agent: "pi", baseRef: "main", committedOnly: true },
+		{ cwd, lineageId, agent: "pi", ...selectedUntracked },
+		{ cwd, lineageId, agent: "pi", ...selectedUntracked },
+	]);
+	assert.equal(captures, 1);
+
+	const override = { ...selectedUntracked, expectedUntrackedInventory: "override-inventory", intendedUntracked: ["generated/override.json"] };
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId, input: JSON.stringify(override) }, cwd, native, undefined, undefined, undefined, selections);
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, cwd, native, undefined, undefined, undefined, selections);
+	assert.deepEqual(requests.slice(-2), Array.from({ length: 2 }, () => ({ cwd, lineageId, agent: "pi", ...override })));
 });
 
 test("route retention caps, rejects collisions and invalid selectors, and clears every terminal state", async () => {

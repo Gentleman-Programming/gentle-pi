@@ -56,7 +56,7 @@ Stop with `blocked` before editing if:
 - `actionContext.mode: workspace-planning` and no `allowedEditRoots` are provided;
 - any target file is outside the authoritative workspace or allowed edit roots.
 
-If status says `applyState: all_done`, do not edit. Report that implementation is complete and return `next_recommended: "parent-lifecycle"` unless native authority already proves an approved receipt for the live candidate. Do not recommend apply again because parent-owned actions are pending.
+If status says `applyState: all_done`, do not edit. Report that implementation is complete and return `next_recommended: "sdd-verify"`. Do not recommend apply again after all implementation tasks are complete.
 
 ## Before Writing Code
 
@@ -101,9 +101,9 @@ If strict TDD is active and no external support file is available, follow the RE
 
 ## Task Ownership Boundary
 
-Read ownership markers on every checkbox: absent markers are legacy `implementation`; only terminal `<!-- sdd-owner: implementation -->` and `<!-- sdd-owner: parent -->` markers are valid. A line containing `sdd-owner` with any other, duplicate, or non-terminal form is malformed: stop with `fix-task-ownership-marker` and leave it unchanged. Select, check, and report only implementation-owned rows. Preserve parent-owned rows byte-for-byte and list them as deferred lifecycle actions.
+Read ownership markers on every checkbox: absent markers are legacy `implementation`; only terminal `<!-- sdd-owner: implementation -->` markers are generated for new tasks. For existing task artifacts, follow the structured status for legacy non-implementation rows. A line containing an unsupported, duplicate, or non-terminal `sdd-owner` marker is malformed: stop with `fix-task-ownership-marker` and leave it unchanged. Select, check, and report only implementation-owned rows. Legacy non-implementation rows are informational and never block the SDD route.
 
-`sdd-apply` MUST NOT start bounded-review, refutation, correction, or validation actors; create or approve receipts; or validate pre-commit, pre-push, pre-PR, release, or other delivery gates. After implementation completion it returns `parent-lifecycle`, even when no parent markers exist.
+After implementation completion, `sdd-apply` returns `sdd-verify`. SDD verification, sync, archive, and delivery follow their local contracts without an RDD authority dependency.
 
 ## Persisted Task Checkbox Contract
 

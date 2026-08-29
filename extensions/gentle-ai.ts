@@ -128,6 +128,7 @@ import {
 	NATIVE_REVIEW_RECONCILE_ANOMALIES,
 	sanitizeForeignNativeReviewDiagnostics,
 	type NativeReviewCli,
+	type NativeReviewAcknowledgeApprovedRequest,
 	type NativeTargetStatusRequest,
 	type NativeReviewModeOperation,
 	type NativeReviewModeSource,
@@ -135,6 +136,7 @@ import {
 	type NativeStartResult,
 } from "../lib/native-review-cli.ts";
 import {
+	assertReviewApprovedAcknowledgementExecuteV1,
 	decodeReviewLastEventClosureV1,
 	type ReviewCollectInputV3,
 	type ReviewConsentEnvelope,
@@ -2571,6 +2573,7 @@ const REVIEW_CONTROLLER_OPERATION = {
 	START: "start",
 	ANSWER_CONSENT: "answer-consent",
 	ADVANCE: "advance",
+	ACKNOWLEDGE_APPROVED: "acknowledge-approved",
 	STATUS: "status",
 	EXPORT: "export",
 	IMPORT: "import",
@@ -2710,6 +2713,10 @@ interface ReviewControllerParameters {
 	acknowledgeUntrustedBundleSource?: string;
 	workspaceRoot?: string;
 }
+
+type NativeReviewAcknowledgementCli = NativeReviewCli & {
+	acknowledgeApproved?: (request: NativeReviewAcknowledgeApprovedRequest) => Promise<void>;
+};
 
 interface ReviewControllerStartInput {
 	mode: ReviewMode;
@@ -3691,11 +3698,12 @@ function nativeOperationFailure(operation: ReviewControllerOperation | "gentle_r
 	// Preserve either already-sanitized diagnostic on every controller route rather
 	// than relabeling an actionable failure as an opaque controller failure.
 	const preservesNativeTargetStatusDiagnostic = nativeDiagnostics?.operation === NATIVE_REVIEW_OPERATION.VERSION || nativeDiagnostics?.operation === NATIVE_REVIEW_OPERATION.STATUS;
+	const preservesAnswerConsentStartDiagnostic = operation === REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT && nativeDiagnostics?.operation === NATIVE_REVIEW_OPERATION.START;
 	const diagnostics = operation === REVIEW_CONTROLLER_OPERATION.START && error instanceof CandidateViewError && value.candidateViewPreNative === true
 		? error.diagnostics ?? { code: error.reason, message: "candidate view rejected before native START" }
 		: error instanceof CandidateViewError
 			? { code: error.reason, message: error.message }
-			: nativeDiagnostics?.operation === `review/${operation}` || preservesNativeTargetStatusDiagnostic
+			: nativeDiagnostics?.operation === `review/${operation}` || preservesNativeTargetStatusDiagnostic || preservesAnswerConsentStartDiagnostic
 		? nativeDiagnostics
 		: undefined;
 	return {
@@ -4702,6 +4710,98 @@ async function executeReviewControllerOperation(
 		store.repairCurrentAuthority();
 		return { operation: parameters.operation, repaired: true };
 	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.ACKNOWLEDGE_APPROVED) {
+		const controllerOnlyInput = ["changeName", "idempotencyKey", "transition", "input", "outputPath", "inputPath", "operationId", "lineageIds", "acknowledgeUntrustedBundleSource"]
+			.find((key) => parameters[key as keyof ReviewControllerParameters] !== undefined);
+		if (controllerOnlyInput !== undefined || !isCanonicalProcessString(parameters.lineageId)) {
+			return {
+				operation: parameters.operation,
+				status: "blocked",
+				outcome: "native-approved-acknowledgement-input-invalid",
+				reason: controllerOnlyInput === undefined ? "lineage-invalid" : "controller-only-input",
+				...(controllerOnlyInput === undefined ? {} : { field: controllerOnlyInput }),
+				mutation_performed: false,
+				mutation_outcome: "none",
+				next_action: "resubmit-the-exact-lineage-without-controller-only-input",
+			};
+		}
+		const acknowledgementCli = nativeReviewCli as NativeReviewAcknowledgementCli | null;
+		if (acknowledgementCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
+		if (acknowledgementCli.acknowledgeApproved === undefined) {
+			return {
+				operation: parameters.operation,
+				status: "blocked",
+				outcome: "native-approved-acknowledgement-unsupported",
+				mutation_performed: false,
+				mutation_outcome: "none",
+				next_action: "install-native-acknowledge-approved-support",
+			};
+		}
+		const frozenTarget = candidateViews?.hasProjection(parameters.lineageId, defaultCwd)
+			? candidateViews.resolveProjection(parameters.lineageId, defaultCwd)
+			: undefined;
+		const target = {
+			cwd: defaultCwd,
+			lineageId: parameters.lineageId,
+			...(frozenTarget?.committedOnly === true ? { baseRef: frozenTarget.baseCommit, committedOnly: true } : {}),
+			...(signal === undefined ? {} : { signal }),
+		};
+		let status: ReviewStatusV3;
+		try {
+			status = await acknowledgementCli.targetStatus(target);
+		} catch (error) {
+			return nativeStatusFailed(parameters.operation, error);
+		}
+		const execute = status.nextTransition?.kind === "execute" ? status.nextTransition.execute : undefined;
+		if (
+			status.applicability !== "current_target" ||
+			status.authority?.lineageId !== parameters.lineageId ||
+			status.authority.state !== "approved" ||
+			execute?.operation !== "review.acknowledge-approved"
+		) {
+			return {
+				operation: parameters.operation,
+				status: "blocked",
+				outcome: "native-approved-acknowledgement-not-current",
+				result: status.raw,
+				mutation_performed: false,
+				mutation_outcome: "none",
+				next_action: "follow-provider-target-status",
+			};
+		}
+		let argumentTokens: readonly string[];
+		try {
+			argumentTokens = assertReviewApprovedAcknowledgementExecuteV1(execute, {
+				cwd: defaultCwd,
+				lineageId: parameters.lineageId,
+				targetIdentity: status.targetIdentity,
+				revision: status.authority.revision,
+			});
+		} catch (error) {
+			return nativeOperationFailure(parameters.operation, error);
+		}
+		try {
+			await acknowledgementCli.acknowledgeApproved({
+				argumentTokens,
+				cwd: defaultCwd,
+				...(signal === undefined ? {} : { signal }),
+			});
+			return {
+				operation: parameters.operation,
+				status: "closed",
+				outcome: "native-approved-acknowledgement-completed",
+				lineage_id: parameters.lineageId,
+				target_identity: status.targetIdentity,
+				authority: "burned",
+				delivery: "ordinary-repository-policy",
+				mutation_performed: true,
+				mutation_outcome: "committed",
+			};
+		} catch (error) {
+			if (!nativeMutationRequiresStatus(error)) return nativeOperationFailure(parameters.operation, error);
+			return await reconcileNativeMutationFailure(parameters.operation, error, acknowledgementCli, target, retainedUntrackedSelections);
+		}
+	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
 		if (Object.keys(input).some((key) => key !== "consentBinding" && key !== "answer") || Object.keys(input).length !== 2) throw new Error("Review controller answer-consent input must contain exactly consentBinding and answer");
@@ -5033,13 +5133,16 @@ async function executeReviewControllerOperation(
 			(untrackedSelection.reason !== undefined || (baseRef === undefined && untrackedSelection.untrackedScope === undefined))
 		) return nativeStatusInputRejection(untrackedSelection.reason ?? "untracked-selection-invalid");
 		const retainedUntrackedSelection = cloneRetainedNativeUntrackedSelection(untrackedSelection);
+		const effectiveUntrackedSelection = rawStatus === undefined && parameters.lineageId !== undefined
+			? readRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, parameters.lineageId)
+			: untrackedSelection;
 		if (nativeReviewCli?.targetStatus !== undefined) {
 			try {
 				const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
 					cwd: defaultCwd,
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 					...(baseRef === undefined ? {} : { baseRef, committedOnly: true }),
-					...(untrackedSelection.untrackedScope === undefined ? {} : untrackedSelection),
+					...(effectiveUntrackedSelection.untrackedScope === undefined ? {} : effectiveUntrackedSelection),
 					...(signal === undefined ? {} : { signal }),
 				}, retainedUntrackedSelections, defaultCwd);
 				if (negotiated.transport !== undefined) {
@@ -5098,48 +5201,22 @@ export const __testing = {
 	createGentleAiExtension: createGentleAiExtensionForTesting,
 };
 
-const NATIVE_SDD_STATUS_STARTUP_TIMEOUT_MS = 1_000;
-
-async function resolveControllerSddStatus(
+function resolveControllerSddStatus(
 	cwd: string,
 	changeName: string | undefined,
 	includeInstructions: boolean,
 	artifactStore: SddPreflightPreferences["artifactStore"] | undefined,
-	nativeReviewCli: NativeReviewCli | null = null,
-	signal?: AbortSignal,
 ) {
-	const base = resolveSddStatus({ cwd, changeName, includeInstructions, artifactStore });
-	if (!base.changeName || base.isNonAuthoritative) return base;
-	if (base.applyState !== "all_done" || nativeReviewCli === null) return base;
-	try {
-		const native = await nativeReviewCli.sddStatus({ cwd, change: base.changeName, ...(signal === undefined ? {} : { signal }) });
-		return resolveSddStatus({
-			cwd,
-			changeName: base.changeName,
-			includeInstructions,
-			artifactStore,
-			nativeReviewReadiness: { expected: true, ready: native.ready },
-		});
-	} catch (error) {
-		return resolveSddStatus({
-			cwd,
-			changeName: base.changeName,
-			includeInstructions,
-			artifactStore,
-			nativeReviewReadiness: { expected: true, ready: false, reason: error instanceof Error ? error.message : "native bound status failed" },
-		});
-	}
+	return resolveSddStatus({ cwd, changeName, includeInstructions, artifactStore });
 }
 
-async function resolveStartupControllerSddStatus(
+function resolveStartupControllerSddStatus(
 	cwd: string,
 	changeName: string | undefined,
 	includeInstructions: boolean,
 	artifactStore: SddPreflightPreferences["artifactStore"] | undefined,
-	nativeReviewCli: NativeReviewCli | null,
-	timeoutMs = NATIVE_SDD_STATUS_STARTUP_TIMEOUT_MS,
 ) {
-	return resolveControllerSddStatus(cwd, changeName, includeInstructions, artifactStore, nativeReviewCli, AbortSignal.timeout(timeoutMs));
+	return resolveControllerSddStatus(cwd, changeName, includeInstructions, artifactStore);
 }
 
 export interface GentleAiRuntimeDependencies {
@@ -5357,12 +5434,11 @@ function createGentleAiExtensionForTesting(
 				: "";
 		const phase = isSddAgent ? sddPhaseFromAgentStartEvent(event) : undefined;
 		const nativeStatusPrompt = phase
-			? `\n\n${renderNativeSddPhasePrompt(await resolveStartupControllerSddStatus(
+			? `\n\n${renderNativeSddPhasePrompt(resolveStartupControllerSddStatus(
 				ctx.cwd,
 				undefined,
 				true,
 				prefs?.artifactStore,
-				nativeReviewCli,
 			), phase)}`
 			: "";
 		const gentlePrompt = isNamedAgent || isSddAgent
@@ -5422,12 +5498,11 @@ function createGentleAiExtensionForTesting(
 
 	const handleSddStatusCommand = async (args: string, ctx: ExtensionContext) => {
 		const parsed = parseSddStatusCommandArgs(args);
-		const status = await resolveControllerSddStatus(
+		const status = resolveControllerSddStatus(
 			ctx.cwd,
 			parsed.changeName,
 			true,
 			getSddPreflightPreferences(ctx)?.artifactStore,
-			nativeReviewCli,
 		);
 		ctx.ui.notify(
 			parsed.json ? JSON.stringify(status, null, 2) : renderSddStatusMarkdown(status),
@@ -5444,12 +5519,11 @@ function createGentleAiExtensionForTesting(
 
 	const handleSddContinueCommand = async (args: string, ctx: ExtensionContext) => {
 		const parsed = parseSddStatusCommandArgs(args);
-		const status = await resolveControllerSddStatus(
+		const status = resolveControllerSddStatus(
 			ctx.cwd,
 			parsed.changeName,
 			true,
 			getSddPreflightPreferences(ctx)?.artifactStore,
-			nativeReviewCli,
 		);
 		ctx.ui.notify(
 			parsed.json ? JSON.stringify(status, null, 2) : renderSddDispatcherMarkdown(status),

@@ -26,11 +26,6 @@ function fixture(root: string, name: string): unknown {
 
 function currentStatusFixture(name: string): Record<string, unknown> {
 	const body = structuredClone(fixture(DEV_FIXTURES, name)) as Record<string, unknown>;
-	// The real capture retains the historical receipt field byte-for-byte; the
-	// current decoder correctly refuses that retired surface. Remove only that
-	// retired field from the in-memory assertion subject to preserve coverage of
-	// the still-supported v5 status fields.
-	delete body.receipt;
 	if (body.action === "finalize") {
 		body.action = "stop";
 		const transition = body.next_transition as Record<string, unknown> | undefined;
@@ -51,11 +46,51 @@ test("captured capabilities retain their exact schema identity", () => {
 	assert.equal(capabilities.schemas.has("gentle-ai.review-integration.status/v5"), true);
 });
 
-test("historical published status with a retired receipt is rejected without rewriting fixture bytes", () => {
+test("historical v3 FINALIZE status remains rejected without rewriting fixture bytes", () => {
 	assert.throws(
 		() => decodeReviewStatusV3(fixture(V2_FIXTURES, "status.fixture.json")),
-		/receipt|schema|status/i,
+		/receipt|finalize|status/i,
 	);
+});
+
+test("captured v5 STATUS preserves its strict receipt while routing intended-untracked selection", () => {
+	const body = currentStatusFixture("status-v5.captured.json");
+	(body.next_transition as JsonObject).reason_code = "intended_untracked_selection_required";
+	const decoded = decodeReviewStatusV3(body);
+	assert.deepEqual(decoded.receipt, { status: "not_applicable" });
+	assert.equal(decoded.nextTransition?.kind, "collect");
+	assert.equal(decoded.nextTransition?.reasonCode, "intended_untracked_selection_required");
+});
+
+test("v5 STATUS rejects malformed receipt status, identity, and extra fields", () => {
+	const unsupported = currentStatusFixture("status-v5.captured.json");
+	(unsupported.receipt as JsonObject).status = "retired";
+	assert.throws(() => decodeReviewStatusV3(unsupported), /status\.receipt\.status/);
+
+	const invalidIdentity = currentStatusFixture("status-v5.captured.json");
+	(invalidIdentity.receipt as JsonObject).identity = "not-a-sha256";
+	assert.throws(() => decodeReviewStatusV3(invalidIdentity), /status\.receipt\.identity/);
+
+	const extra = currentStatusFixture("status-v5.captured.json");
+	(extra.receipt as JsonObject).unexpected = true;
+	assert.throws(() => decodeReviewStatusV3(extra), /status\.receipt\.unexpected is not allowed/);
+});
+
+test("legacy-v1 v5 STATUS accepts only its two compatible receipt states", () => {
+	const legacyStatus = (status: string, identity?: string): JsonObject => {
+		const body = currentStatusFixture("status-v5-capture-result-submission.captured.json");
+		(body.authority as JsonObject).version = "legacy-v1";
+		body.receipt = { status, ...(identity === undefined ? {} : { identity }) };
+		delete body.frozen;
+		delete body.authority_target_identity;
+		return body;
+	};
+
+	assert.deepEqual(decodeReviewStatusV3(legacyStatus("expected_missing")).receipt, { status: "expected_missing" });
+	assert.deepEqual(decodeReviewStatusV3(legacyStatus("present", sha("a"))).receipt, { status: "present", identity: sha("a") });
+	for (const status of ["publication_pending", "not_applicable"]) {
+		assert.throws(() => decodeReviewStatusV3(legacyStatus(status)), /legacy status receipt is incompatible/);
+	}
 });
 
 test("captured terminal closure decodes without a compatibility status projection", () => {
@@ -90,6 +125,7 @@ test("captured v5 STATUS preserves its provider forecast and collect binding", (
 test("v3 status identity rejects v5-only forecast fields", () => {
 	const body = currentStatusFixture("status-v5.captured.json");
 	body.schema = "gentle-ai.review-integration.status/v3";
+	delete body.receipt;
 	assert.throws(() => decodeReviewStatusV3(body), /forecast/);
 });
 
@@ -164,6 +200,7 @@ test("the derived capabilities/v2.1 payload decodes with protocol minor 1", () =
 test("a status/v3 payload never carries a top-level repository context", () => {
 	const body = currentStatusFixture("status-v5-repository-context.captured.json");
 	body.schema = "gentle-ai.review-integration.status/v3";
+	delete body.receipt;
 	delete body.forecast;
 	assert.throws(() => decodeReviewStatusV3(body), /repository_context/);
 });
@@ -198,6 +235,7 @@ test("a v5 provider role task input decodes and is confined to external.run_prov
 test("the v3 identity keeps rejecting the singular capture-result value form", () => {
 	const body = currentStatusFixture("status-v5-capture-result-submission.captured.json");
 	body.schema = "gentle-ai.review-integration.status/v3";
+	delete body.receipt;
 	delete body.forecast;
 	delete body.repository_context;
 	assert.throws(() => decodeReviewStatusV3(body), /values is required/);
@@ -206,6 +244,7 @@ test("the v3 identity keeps rejecting the singular capture-result value form", (
 test("the v3 next transition keeps rejecting every v5-only surface", () => {
 	const v5 = currentStatusFixture("status-v5.captured.json");
 	v5.schema = "gentle-ai.review-integration.status/v3";
+	delete v5.receipt;
 	delete v5.forecast;
 	const transition = v5.next_transition as JsonObject;
 	transition.correction_request = { schema: "gentle-ai.review-correction-plan-request/v1", request_hash: sha("a") };

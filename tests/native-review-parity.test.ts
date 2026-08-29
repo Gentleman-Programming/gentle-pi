@@ -465,6 +465,52 @@ test("stale local consent bindings reconcile exactly once with the native status
 	assert.deepEqual(fixture.answers, ["declined"], "stale binding recovery must not replay answer-consent");
 });
 
+test("launched answer-consent failures remain blocked after fresh-target STATUS reconciliation", async (t) => {
+	const cwd = repository(t);
+	const fixture = consentNative(cwd);
+	const statusRequests: Array<{ agent?: string }> = [];
+	const freshTargetStatus = {
+		...startStatus(cwd),
+		raw: { schema: "gentle-ai.review-integration.status/v5", next_transition: { kind: "execute", reason_code: "fresh_start_available" } },
+	} as ReviewStatusV3;
+	fixture.native.targetStatus = async (request) => {
+		statusRequests.push(request);
+		return freshTargetStatus;
+	};
+	let answerCalls = 0;
+	fixture.native.answerConsent = async () => {
+		answerCalls += 1;
+		throw new NativeReviewCliError(
+			NATIVE_REVIEW_ERROR_CODE.NON_ZERO,
+			NATIVE_REVIEW_OPERATION.START,
+			true,
+			true,
+			"native review/start failed after launch",
+		);
+	};
+	const runtime = parityRuntime(fixture.native);
+	const blocked = await beginConsent(runtime, cwd);
+
+	const first = await answerConsent(runtime, cwd, blocked.consent_binding, "granted");
+	assert.equal(first.operation, "answer-consent");
+	assert.equal(first.status, "blocked");
+	assert.equal(first.outcome, "native-mutation-status-reconciled");
+	assert.deepEqual(first.diagnostics, {
+		operation: NATIVE_REVIEW_OPERATION.START,
+		error_code: NATIVE_REVIEW_ERROR_CODE.NON_ZERO,
+		timed_out: false,
+		output_limit_exceeded: false,
+	});
+	assert.deepEqual(first.reconciliation, freshTargetStatus.raw);
+	assert.equal(statusRequests.length, 2, "the launched failure reconciles exactly once after the initial START status");
+	assert.equal(answerCalls, 1, "reconciliation must not replay answer-consent");
+
+	const stale = await answerConsent(runtime, cwd, blocked.consent_binding, "granted");
+	assert.equal(stale.status, "ready");
+	assert.equal(statusRequests.length, 3, "a later stale binding performs one current STATUS read");
+	assert.equal(answerCalls, 1, "the stale binding must not replay answer-consent");
+});
+
 test("stale local consent bindings preserve a typed native STATUS failure", async (t) => {
 	const cwd = repository(t);
 	const fixture = consentNative(cwd);

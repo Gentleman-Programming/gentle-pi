@@ -212,7 +212,7 @@ test("controller SDD status treats removed OpenSpec recovery authority and delet
 	assert.match(status.blockedReasons.join("\n"), /active change not found/i);
 });
 
-test("controller SDD status blocks archive for a recovery-required marker without a supersession record", async (t) => {
+test("controller SDD status ignores recovery-required review markers after terminal burn", async (t) => {
 	const fixture = createRepository(t);
 	const changeName = "recover-legacy-review-authority";
 	const changeRoot = join(fixture.repository, "openspec", "changes", changeName);
@@ -229,8 +229,8 @@ test("controller SDD status blocks archive for a recovery-required marker withou
 
 	const status = await __testing.resolveControllerSddStatus(fixture.repository, changeName, false, "openspec");
 
-	assert.equal(status.dependencies.archive, "blocked");
-	assert.equal(status.nextRecommended, "parent-lifecycle");
+	assert.equal(status.dependencies.archive, "ready");
+	assert.equal(status.nextRecommended, "sdd-archive");
 });
 
 test("controller keeps graph-v1 ordinary mutation read-only while preserving repository-file input confinement", async (t) => {
