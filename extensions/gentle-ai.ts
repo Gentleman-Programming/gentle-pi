@@ -3691,11 +3691,12 @@ function nativeOperationFailure(operation: ReviewControllerOperation | "gentle_r
 	// Preserve either already-sanitized diagnostic on every controller route rather
 	// than relabeling an actionable failure as an opaque controller failure.
 	const preservesNativeTargetStatusDiagnostic = nativeDiagnostics?.operation === NATIVE_REVIEW_OPERATION.VERSION || nativeDiagnostics?.operation === NATIVE_REVIEW_OPERATION.STATUS;
+	const preservesAnswerConsentStartDiagnostic = operation === REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT && nativeDiagnostics?.operation === NATIVE_REVIEW_OPERATION.START;
 	const diagnostics = operation === REVIEW_CONTROLLER_OPERATION.START && error instanceof CandidateViewError && value.candidateViewPreNative === true
 		? error.diagnostics ?? { code: error.reason, message: "candidate view rejected before native START" }
 		: error instanceof CandidateViewError
 			? { code: error.reason, message: error.message }
-			: nativeDiagnostics?.operation === `review/${operation}` || preservesNativeTargetStatusDiagnostic
+			: nativeDiagnostics?.operation === `review/${operation}` || preservesNativeTargetStatusDiagnostic || preservesAnswerConsentStartDiagnostic
 		? nativeDiagnostics
 		: undefined;
 	return {
