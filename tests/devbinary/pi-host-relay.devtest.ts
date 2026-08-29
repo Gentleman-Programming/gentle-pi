@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { __testing, createGentleAiExtension } from "../../extensions/gentle-ai.ts";
@@ -452,8 +452,13 @@ test("dev-binary: Pi controller keeps an explicit B root and selected-untracked 
 
 	const canonicalB = realpathSync(targetB);
 	assert.equal(realpathSync(git(nestedTarget, "rev-parse", "--show-toplevel")), canonicalB, "B/nested must canonicalize to B before controller routing");
-	const activeProjectCommonDir = realpathSync(git(process.cwd(), "rev-parse", "--git-common-dir"));
-	const sandboxCommonDir = realpathSync(git(canonicalB, "rev-parse", "--git-common-dir"));
+	// --git-common-dir answers relative to the repository it was asked about, so
+	// resolving it against the process cwd compared the active project with
+	// itself: the assertion held in a linked worktree and failed in a primary
+	// checkout, and in neither case measured what it names. lib/review-candidate-view.ts
+	// resolves it against the repository root, which is the convention here too.
+	const activeProjectCommonDir = realpathSync(resolve(process.cwd(), git(process.cwd(), "rev-parse", "--git-common-dir")));
+	const sandboxCommonDir = realpathSync(resolve(canonicalB, git(canonicalB, "rev-parse", "--git-common-dir")));
 	assert.notEqual(sandboxCommonDir, activeProjectCommonDir, "the B sandbox must not share the active project's Git common directory");
 	const isolatedHome = join(sessionA, "home");
 	mkdirSync(isolatedHome);
