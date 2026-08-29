@@ -53,16 +53,12 @@ function client(adapter: ExecFileAdapter): NativeReviewCliV216 {
 	return new NativeReviewCliV216(adapter, "/package/.gentle-ai/gentle-ai", 30_000, 1024 * 1024);
 }
 
-test("negotiated STATUS rejects the retired receipt payload before any lifecycle advance", async () => {
-	// The pinned historical status fixture intentionally retains the retired
-	// receipt surface. Keep its bytes unchanged and require an explicit decoder
-	// refusal rather than treating it as a current lifecycle authority.
-	const status = readFileSync(join(process.cwd(), "contracts", "review-integration", "v2", "fixtures", "status.fixture.json"), "utf8");
-	const queue = queuedAdapter([{ stdout: status }]);
-	await assert.rejects(
-		() => client(queue.adapter).targetStatus({ cwd: "/repo", lineageId: "review-status-fixture", agent: "pi" }),
-		(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE,
-	);
+test("negotiated STATUS accepts the pinned v5 receipt before routing its transition", async () => {
+	const status = fixture("status-v5.captured.json");
+	const queue = queuedAdapter([{ stdout: JSON.stringify(status) }]);
+	const result = await client(queue.adapter).targetStatus({ cwd: "/repo", lineageId: "review-status-fixture", agent: "pi" });
+	assert.deepEqual(result.receipt, { status: "not_applicable" });
+	assert.equal(result.nextTransition?.kind, "collect");
 	assert.deepEqual(queue.calls[0]?.arguments, [
 		"review", "status", "--contract", "gentle-ai.review-integration/v2", "--cwd", "/repo",
 		"--projection", "workspace", "--lineage", "review-status-fixture", "--agent", "pi", "--next-transition",
@@ -146,11 +142,7 @@ test("malformed closure output remains a typed schema failure and never authoriz
 });
 
 function currentStatusFixture(): Record<string, unknown> {
-	const status = fixture("status-v5.captured.json");
-	// Preserve the captured historical bytes on disk while excluding the receipt
-	// field that #404 explicitly retired from the current STATUS decoder.
-	delete status.receipt;
-	return status;
+	return fixture("status-v5.captured.json");
 }
 
 function negotiatedStartStatus(targetIdentity: string, tokens: readonly string[]): Record<string, unknown> {

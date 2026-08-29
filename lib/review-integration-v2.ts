@@ -80,6 +80,8 @@ const REVIEW_LENSES = ["review-risk", "review-resilience", "review-readability",
 const RISK_REASON_CODES = ["configuration_change", "empty_content", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "process_boundary", "process_scan_limit", "service_token", "shell_source"] as const;
 const RISK_SIGNALS = ["auth", "update", "security", "payments", "permissions", "shell_process"] as const;
 const STATUS_ACTIONS = ["start", "recover", "maintainer_action", "select_lineage", "repair_authority", "stop"] as const;
+const RECEIPT_STATUSES = ["expected_missing", "present", "publication_pending", "not_applicable"] as const;
+type ReviewReceiptStatus = (typeof RECEIPT_STATUSES)[number];
 export const REVIEW_STATUS_ACTION_DISPOSITION = {
 	SCOPE_CHANGED: "scope_changed",
 	INVALIDATED: "invalidated",
@@ -313,6 +315,11 @@ export interface ReviewStatusAuthorityV1 {
 	revision: string;
 }
 
+export interface ReviewStatusReceiptV1 {
+	status: ReviewReceiptStatus;
+	identity?: string;
+}
+
 export interface ReviewStatusFrozenV1 {
 	tier: RiskLevel;
 	originalChangedLines: number;
@@ -489,6 +496,8 @@ export interface ReviewStatusV3 {
 	contract: typeof REVIEW_INTEGRATION_CONTRACT;
 	applicability: Exclude<ReviewAuthorityApplicability, "not_evaluated">;
 	authority?: ReviewStatusAuthorityV1;
+	/** status/v5 compatibility metadata; it is decoded but never used as routing authority. */
+	receipt?: ReviewStatusReceiptV1;
 	action: ReviewStatusAction;
 	actionDisposition?: ReviewStatusActionDisposition;
 	replayability: ReviewReplayability;
@@ -1575,10 +1584,18 @@ export function decodeReviewStatusV3(value: unknown): ReviewStatusV3 {
 	const v5 = typeof value === "object" && value !== null && (value as Record<string, unknown>).schema === "gentle-ai.review-integration.status/v5";
 	const body = exactRecord(value, "status", [
 		"schema", "contract", "operation", "applicability", "action", "replayability", "target_identity", "projection", "repair", "candidates",
-	], ["authority", "frozen", "action_disposition", "eligibility", "next_transition", "authority_target_identity", ...(v5 ? ["forecast", "repository_context", "validation_request"] : [])]);
+	], ["authority", "frozen", "action_disposition", "eligibility", "next_transition", "authority_target_identity", ...(v5 ? ["receipt", "forecast", "repository_context", "validation_request"] : [])]);
 	requireIdentity(body, v5 ? "gentle-ai.review-integration.status/v5" : "gentle-ai.review-integration.status/v3", REVIEW_INTEGRATION_OPERATION.STATUS);
 
 	const applicability = enumeration(body.applicability, ["current_target", "unrelated", "ambiguous", "corrupted"] as const, "status.applicability");
+	let receipt: ReviewStatusReceiptV1 | undefined;
+	if (body.receipt !== undefined) {
+		const source = exactRecord(body.receipt, "status.receipt", ["status"], ["identity"]);
+		receipt = {
+			status: enumeration(source.status, RECEIPT_STATUSES, "status.receipt.status"),
+			...(source.identity === undefined ? {} : { identity: sha256(source.identity, "status.receipt.identity") }),
+		};
+	}
 	let authority: ReviewStatusAuthorityV1 | undefined;
 	if (body.authority !== undefined) {
 		const source = exactRecord(body.authority, "status.authority", ["version", "lineage_id", "state", "generation", "revision"]);
@@ -1606,6 +1623,9 @@ export function decodeReviewStatusV3(value: unknown): ReviewStatusV3 {
 	}
 	if (authority?.version === REVIEW_AUTHORITY_VERSION.COMPACT_V2 && frozen === undefined) throw new TypeError("compact-v2 status requires frozen metadata");
 	if (authority?.version === REVIEW_AUTHORITY_VERSION.LEGACY_V1 && (frozen !== undefined || body.authority_target_identity !== undefined)) throw new TypeError("legacy status cannot expose frozen metadata or authority_target_identity");
+	if (authority?.version === REVIEW_AUTHORITY_VERSION.LEGACY_V1 && receipt !== undefined && receipt.status !== "expected_missing" && receipt.status !== "present") {
+		throw new TypeError("legacy status receipt is incompatible");
+	}
 
 	const action = enumeration(body.action, STATUS_ACTIONS, "status.action");
 	const actionDisposition = body.action_disposition === undefined ? undefined : enumeration(body.action_disposition, Object.values(REVIEW_STATUS_ACTION_DISPOSITION), "status.action_disposition");
@@ -1651,6 +1671,7 @@ export function decodeReviewStatusV3(value: unknown): ReviewStatusV3 {
 		contract: REVIEW_INTEGRATION_CONTRACT,
 		applicability,
 		...(authority === undefined ? {} : { authority }),
+		...(receipt === undefined ? {} : { receipt }),
 		action,
 		...(actionDisposition === undefined ? {} : { actionDisposition }),
 		replayability,
