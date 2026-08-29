@@ -129,6 +129,15 @@ for (const path of REVIEW_LENSES) {
 	});
 }
 
+test("ordinary lens prompts are self-contained and name no unpackaged rule sources", () => {
+	for (const path of REVIEW_LENSES) {
+		const content = read(path);
+		assert.doesNotMatch(content, /^Rule sources:/m, `${path} must not depend on unavailable source files`);
+		assert.doesNotMatch(content, /\bai-course-2\b/, `${path} must not name an unpackaged course`);
+		assert.doesNotMatch(content, /`\d{2}-[a-z0-9-]+\.md`/, `${path} must not name unpackaged markdown sources`);
+	}
+});
+
 test("ordinary lens prompts contain the literal compact-v2 native result envelope", () => {
 	const expectedLenses = ["review-risk", "review-resilience", "review-readability", "review-reliability"];
 	for (const [index, path] of REVIEW_LENSES.entries()) {
