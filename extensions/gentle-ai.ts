@@ -128,6 +128,7 @@ import {
 	NATIVE_REVIEW_RECONCILE_ANOMALIES,
 	sanitizeForeignNativeReviewDiagnostics,
 	type NativeReviewCli,
+	type NativeReviewAcknowledgeApprovedRequest,
 	type NativeTargetStatusRequest,
 	type NativeReviewModeOperation,
 	type NativeReviewModeSource,
@@ -135,6 +136,7 @@ import {
 	type NativeStartResult,
 } from "../lib/native-review-cli.ts";
 import {
+	assertReviewApprovedAcknowledgementExecuteV1,
 	decodeReviewLastEventClosureV1,
 	type ReviewCollectInputV3,
 	type ReviewConsentEnvelope,
@@ -2571,6 +2573,7 @@ const REVIEW_CONTROLLER_OPERATION = {
 	START: "start",
 	ANSWER_CONSENT: "answer-consent",
 	ADVANCE: "advance",
+	ACKNOWLEDGE_APPROVED: "acknowledge-approved",
 	STATUS: "status",
 	EXPORT: "export",
 	IMPORT: "import",
@@ -2710,6 +2713,10 @@ interface ReviewControllerParameters {
 	acknowledgeUntrustedBundleSource?: string;
 	workspaceRoot?: string;
 }
+
+type NativeReviewAcknowledgementCli = NativeReviewCli & {
+	acknowledgeApproved?: (request: NativeReviewAcknowledgeApprovedRequest) => Promise<void>;
+};
 
 interface ReviewControllerStartInput {
 	mode: ReviewMode;
@@ -4702,6 +4709,98 @@ async function executeReviewControllerOperation(
 		const store = ReviewTransactionStore.forRepository(defaultCwd);
 		store.repairCurrentAuthority();
 		return { operation: parameters.operation, repaired: true };
+	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.ACKNOWLEDGE_APPROVED) {
+		const controllerOnlyInput = ["changeName", "idempotencyKey", "transition", "input", "outputPath", "inputPath", "operationId", "lineageIds", "acknowledgeUntrustedBundleSource"]
+			.find((key) => parameters[key as keyof ReviewControllerParameters] !== undefined);
+		if (controllerOnlyInput !== undefined || !isCanonicalProcessString(parameters.lineageId)) {
+			return {
+				operation: parameters.operation,
+				status: "blocked",
+				outcome: "native-approved-acknowledgement-input-invalid",
+				reason: controllerOnlyInput === undefined ? "lineage-invalid" : "controller-only-input",
+				...(controllerOnlyInput === undefined ? {} : { field: controllerOnlyInput }),
+				mutation_performed: false,
+				mutation_outcome: "none",
+				next_action: "resubmit-the-exact-lineage-without-controller-only-input",
+			};
+		}
+		const acknowledgementCli = nativeReviewCli as NativeReviewAcknowledgementCli | null;
+		if (acknowledgementCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
+		if (acknowledgementCli.acknowledgeApproved === undefined) {
+			return {
+				operation: parameters.operation,
+				status: "blocked",
+				outcome: "native-approved-acknowledgement-unsupported",
+				mutation_performed: false,
+				mutation_outcome: "none",
+				next_action: "install-native-acknowledge-approved-support",
+			};
+		}
+		const frozenTarget = candidateViews?.hasProjection(parameters.lineageId, defaultCwd)
+			? candidateViews.resolveProjection(parameters.lineageId, defaultCwd)
+			: undefined;
+		const target = {
+			cwd: defaultCwd,
+			lineageId: parameters.lineageId,
+			...(frozenTarget?.committedOnly === true ? { baseRef: frozenTarget.baseCommit, committedOnly: true } : {}),
+			...(signal === undefined ? {} : { signal }),
+		};
+		let status: ReviewStatusV3;
+		try {
+			status = await acknowledgementCli.targetStatus(target);
+		} catch (error) {
+			return nativeStatusFailed(parameters.operation, error);
+		}
+		const execute = status.nextTransition?.kind === "execute" ? status.nextTransition.execute : undefined;
+		if (
+			status.applicability !== "current_target" ||
+			status.authority?.lineageId !== parameters.lineageId ||
+			status.authority.state !== "approved" ||
+			execute?.operation !== "review.acknowledge-approved"
+		) {
+			return {
+				operation: parameters.operation,
+				status: "blocked",
+				outcome: "native-approved-acknowledgement-not-current",
+				result: status.raw,
+				mutation_performed: false,
+				mutation_outcome: "none",
+				next_action: "follow-provider-target-status",
+			};
+		}
+		let argumentTokens: readonly string[];
+		try {
+			argumentTokens = assertReviewApprovedAcknowledgementExecuteV1(execute, {
+				cwd: defaultCwd,
+				lineageId: parameters.lineageId,
+				targetIdentity: status.targetIdentity,
+				revision: status.authority.revision,
+			});
+		} catch (error) {
+			return nativeOperationFailure(parameters.operation, error);
+		}
+		try {
+			await acknowledgementCli.acknowledgeApproved({
+				argumentTokens,
+				cwd: defaultCwd,
+				...(signal === undefined ? {} : { signal }),
+			});
+			return {
+				operation: parameters.operation,
+				status: "closed",
+				outcome: "native-approved-acknowledgement-completed",
+				lineage_id: parameters.lineageId,
+				target_identity: status.targetIdentity,
+				authority: "burned",
+				delivery: "ordinary-repository-policy",
+				mutation_performed: true,
+				mutation_outcome: "committed",
+			};
+		} catch (error) {
+			if (!nativeMutationRequiresStatus(error)) return nativeOperationFailure(parameters.operation, error);
+			return await reconcileNativeMutationFailure(parameters.operation, error, acknowledgementCli, target, retainedUntrackedSelections);
+		}
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);

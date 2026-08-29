@@ -82,6 +82,116 @@ function status(
 	} as unknown as ReviewStatusV3;
 }
 
+function approvedAcknowledgementStatus(lineageId: string, cwd = process.cwd()): ReviewStatusV3 {
+	const arguments_ = [{ name: "cwd", value: cwd, token: `--cwd=${cwd}` }, { name: "lineage", value: lineageId, token: `--lineage=${lineageId}` }, { name: "target", value: SHA, token: `--target=${SHA}` }, { name: "expected-revision", value: SHA, token: `--expected-revision=${SHA}` }, { name: "token", value: "provider-issued-once", token: "--token=provider-issued-once" }];
+	const approved = status(lineageId, [], "approved");
+	approved.nextTransition = { kind: "execute", reasonCode: "approved_acknowledgement_required", execute: { operation: "review.acknowledge-approved", command: "gentle-ai review acknowledge-approved --provider-vector", arguments: arguments_, preconditions: [{ name: "state", value: "approved", token: "--state=approved" }], binding: { lineageId, targetIdentity: SHA, revision: SHA } } };
+	return approved;
+}
+
+function burnedAcknowledgementStatus(lineageId: string): ReviewStatusV3 {
+	const burned = status(lineageId, [], "approved");
+	burned.nextTransition = { kind: "stop", reasonCode: "approved_acknowledged" };
+	return burned;
+}
+
+test("public acknowledgement relays one current provider vector and never replays after authority burn", async () => {
+	const lineageId = "acknowledge-approved";
+	const requests: Array<Record<string, unknown>> = [];
+	const acknowledgementRequests: Array<{ argumentTokens: readonly string[]; cwd: string }> = [];
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => {
+			requests.push(request);
+			return requests.length === 1
+				? approvedAcknowledgementStatus(lineageId)
+				: burnedAcknowledgementStatus(lineageId);
+		},
+		acknowledgeApproved: async (request: { argumentTokens: readonly string[]; cwd: string }) => {
+			acknowledgementRequests.push(request);
+		},
+	} as unknown as NativeReviewCli;
+
+	const rejected = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId, input: "{}" }, process.cwd(), native);
+	assert.deepEqual({ outcome: rejected.outcome, calls: requests.length }, { outcome: "native-approved-acknowledgement-input-invalid", calls: 0 });
+	const completed = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId }, process.cwd(), native);
+	assert.deepEqual(completed, { operation: "acknowledge-approved", status: "closed", outcome: "native-approved-acknowledgement-completed", lineage_id: lineageId, target_identity: SHA, authority: "burned", delivery: "ordinary-repository-policy", mutation_performed: true, mutation_outcome: "committed" });
+	assert.deepEqual(requests, [{ cwd: process.cwd(), lineageId }]);
+	assert.deepEqual(acknowledgementRequests, [{ cwd: process.cwd(), argumentTokens: [`--cwd=${process.cwd()}`, `--lineage=${lineageId}`, `--target=${SHA}`, `--expected-revision=${SHA}`, "--token=provider-issued-once"] }]);
+
+	const later = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId }, process.cwd(), native);
+	assert.equal(later.outcome, "native-approved-acknowledgement-not-current");
+	assert.equal(requests.length, 2);
+	assert.equal(acknowledgementRequests.length, 1);
+});
+
+test("ambiguous acknowledgement reconciles STATUS once without replaying the provider vector", async () => {
+	const lineageId = "ambiguous-acknowledgement";
+	let statusCalls = 0;
+	let acknowledgementCalls = 0;
+	const native = {
+		targetStatus: async () => {
+			statusCalls += 1;
+			return statusCalls === 1
+				? approvedAcknowledgementStatus(lineageId)
+				: burnedAcknowledgementStatus(lineageId);
+		},
+		acknowledgeApproved: async () => { acknowledgementCalls += 1; throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, "review/acknowledge-approved", true, true, "acknowledgement outcome unknown"); },
+	} as unknown as NativeReviewCli;
+
+	const result = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId }, process.cwd(), native);
+	assert.equal(result.outcome, "native-mutation-status-reconciled");
+	assert.equal(result.mutation_outcome, "unknown");
+	assert.equal((result.diagnostics as { error_code?: string }).error_code, NATIVE_REVIEW_ERROR_CODE.NON_ZERO);
+	assert.deepEqual(result.reconciliation, { schema: "gentle-ai.review-integration.status/v5" });
+	assert.equal(statusCalls, 2);
+	assert.equal(acknowledgementCalls, 1);
+});
+
+test("public acknowledgement rejects a typed decoy provider vector before invocation", async () => {
+	const lineageId = "decoy-acknowledgement";
+	const decoy = approvedAcknowledgementStatus(lineageId);
+	const target = decoy.nextTransition!.execute!.arguments[2]!;
+	target.value = `sha256:${"b".repeat(64)}`;
+	target.token = `--target=${target.value}`;
+	let statusCalls = 0;
+	let acknowledgementCalls = 0;
+	const native = {
+		targetStatus: async () => { statusCalls += 1; return decoy; },
+		acknowledgeApproved: async () => { acknowledgementCalls += 1; },
+	} as unknown as NativeReviewCli;
+
+	const result = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId }, process.cwd(), native);
+	assert.equal(result.outcome, "native-operation-failed");
+	assert.equal(result.mutation_outcome, "none");
+	assert.equal(statusCalls, 1);
+	assert.equal(acknowledgementCalls, 0);
+});
+
+test("public acknowledgement rejects a mismatched provider cwd before invocation", async () => {
+	let invoked = false;
+	const result = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId: "mismatched-cwd" }, process.cwd(), {
+		targetStatus: async () => approvedAcknowledgementStatus("mismatched-cwd", "/provider/mismatch"),
+		acknowledgeApproved: async () => { invoked = true; },
+	} as unknown as NativeReviewCli);
+	assert.deepEqual({ outcome: result.outcome, invoked }, { outcome: "native-operation-failed", invoked: false });
+});
+
+test("local acknowledgement failure remains pre-launch and does not reconcile STATUS", async () => {
+	const lineageId = "local-acknowledgement-failure";
+	let statusCalls = 0;
+	let acknowledgementCalls = 0;
+	const native = {
+		targetStatus: async () => { statusCalls += 1; return approvedAcknowledgementStatus(lineageId); },
+		acknowledgeApproved: async () => { acknowledgementCalls += 1; throw new TypeError("local acknowledgement validation failed"); },
+	} as unknown as NativeReviewCli;
+
+	const result = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId }, process.cwd(), native);
+	assert.equal(result.outcome, "native-operation-failed");
+	assert.equal(result.mutation_outcome, "none");
+	assert.equal(statusCalls, 1);
+	assert.equal(acknowledgementCalls, 1);
+});
+
 function correctionPlanInput(lineageId: string): ReviewCollectInputV3 {
 	const arguments_ = [{ name: "lineage", value: lineageId, token: `--lineage=${lineageId}` }, { name: "target", value: SHA, token: `--target=${SHA}` }];
 	return { name: "correction_plan", schema: "https://gentle-ai.dev/schema/review/correction-plan/v1", captureOperation: "review.capture-correction-plan", arguments: arguments_, submission: { operationToken: "capture-correction-plan", argumentTokens: [`--lineage=${lineageId}`, "--correction-lines={{value}}"], values: [{ slot: "correction_lines", domain: "integer", substitutionLocation: 1, minimum: 1, maximum: 200 }] } } as unknown as ReviewCollectInputV3;
