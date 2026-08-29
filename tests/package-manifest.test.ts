@@ -109,6 +109,24 @@ test("package manifest has no obsolete native activation build surface", () => {
 	assert.doesNotMatch(packageJson.scripts?.prepublishOnly ?? "", /native:build/);
 });
 
+test("shipped prompt and agent instructions contain no pi-mono repository residue", () => {
+	const instructionDirectories = ["assets/agents", "prompts"] as const;
+	const forbidden = [
+		/\bpackages\//,
+		/\bAGENTS\.md\b/,
+		/github\.com\/earendil-works\/pi-mono\/(?:issues|pull)\//,
+	] as const;
+
+	for (const directory of instructionDirectories) {
+		for (const entry of readdirSync(join(PACKAGE_ROOT, directory), { withFileTypes: true })) {
+			if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+			const path = join(directory, entry.name);
+			const content = readFileSync(join(PACKAGE_ROOT, path), "utf8");
+			for (const pattern of forbidden) assert.doesNotMatch(content, pattern, path);
+		}
+	}
+});
+
 test("package verification names the native review runtime boundary and packaged fixtures", () => {
 	const verifier = readFileSync(join(PACKAGE_ROOT, "scripts", "verify-package-files.mjs"), "utf8");
 	const manifest = readPackageJson();
