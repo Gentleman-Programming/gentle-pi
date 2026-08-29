@@ -5133,13 +5133,16 @@ async function executeReviewControllerOperation(
 			(untrackedSelection.reason !== undefined || (baseRef === undefined && untrackedSelection.untrackedScope === undefined))
 		) return nativeStatusInputRejection(untrackedSelection.reason ?? "untracked-selection-invalid");
 		const retainedUntrackedSelection = cloneRetainedNativeUntrackedSelection(untrackedSelection);
+		const effectiveUntrackedSelection = rawStatus === undefined && parameters.lineageId !== undefined
+			? readRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, parameters.lineageId)
+			: untrackedSelection;
 		if (nativeReviewCli?.targetStatus !== undefined) {
 			try {
 				const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
 					cwd: defaultCwd,
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 					...(baseRef === undefined ? {} : { baseRef, committedOnly: true }),
-					...(untrackedSelection.untrackedScope === undefined ? {} : untrackedSelection),
+					...(effectiveUntrackedSelection.untrackedScope === undefined ? {} : effectiveUntrackedSelection),
 					...(signal === undefined ? {} : { signal }),
 				}, retainedUntrackedSelections, defaultCwd);
 				if (negotiated.transport !== undefined) {

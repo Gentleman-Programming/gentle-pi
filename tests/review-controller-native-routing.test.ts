@@ -283,6 +283,109 @@ test("REPAIR retains frozen committed collect selectors and leaves workspace rou
 	assert.deepEqual(workspaceRequests, [{ cwd, lineageId: workspaceLineage }]);
 });
 
+test("STATUS preserves retained intended-untracked selection through selectorless same-lineage replacement collection", async () => {
+	const cwd = process.cwd();
+	const lineageId = "selectorless-replacement";
+	const selectedUntracked = {
+		untrackedScope: "select",
+		expectedUntrackedInventory: "inventory-sha256",
+		intendedUntracked: ["generated/report.json"],
+	};
+	const initial = correctionPlanInput(lineageId);
+	const replacement: ReviewCollectInputV3 = {
+		...correctionPlanInput(lineageId),
+		arguments: [
+			...correctionPlanInput(lineageId).arguments,
+			{ name: "replacement", value: "b", token: "--replacement=b" },
+		],
+	};
+	const selections = new Map();
+	const requests: Array<Record<string, unknown>> = [];
+	let captures = 0;
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => {
+			requests.push(request);
+			return "baseRef" in request
+				? status(lineageId, [])
+				: status(lineageId, [requests.length === 1 ? initial : replacement]);
+		},
+		captureCorrectionPlan: async ({ correctionLines, cwd: captureCwd }: { correctionLines: number; cwd: string }) => {
+			captures += 1;
+			assert.deepEqual({ correctionLines, cwd: captureCwd }, { correctionLines: 1, cwd });
+			return { schema: "gentle-ai.review-last-event-closure/v1", operation: "review.capture-correction-plan", lineageId, state: "correction_required", storeRevision: SHA };
+		},
+	} as unknown as NativeReviewCli;
+
+	const initialStatus = await __testing.executeReviewControllerOperation(
+		{ operation: "status", lineageId, input: JSON.stringify(selectedUntracked) },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		undefined,
+		selections,
+	);
+	assert.equal(selections.size, 2);
+	await __testing.executeReviewControllerOperation(
+		{ operation: "status", lineageId, input: JSON.stringify({ baseRef: "main", committedOnly: true }) },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		undefined,
+		selections,
+	);
+	assert.deepEqual(requests[1], { cwd, lineageId, agent: "pi", baseRef: "main", committedOnly: true });
+	assert.equal(selections.size, 1);
+	const replacementStatus = await __testing.executeReviewControllerOperation(
+		{ operation: "status", lineageId },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		undefined,
+		selections,
+	);
+	assert.equal(selections.size, 2);
+	const bindingA = bindingOf(initialStatus);
+	const bindingB = bindingOf(replacementStatus);
+	assert.notEqual(bindingA, bindingB);
+
+	const stale = await __testing.executeReviewCaptureOperation(
+		{ lineageId, collectBinding: bindingA, correctionLines: 1 },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		selections,
+		true,
+	);
+	assert.deepEqual({ outcome: stale.outcome, requests: requests.length, captures }, { outcome: "capture-binding-rejected", requests: 3, captures: 0 });
+
+	const captured = await __testing.executeReviewCaptureOperation(
+		{ lineageId, collectBinding: bindingB, correctionLines: 1 },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		selections,
+		true,
+	);
+	assert.equal(captured.outcome, "native-last-event-closure");
+	assert.deepEqual(requests, [
+		{ cwd, lineageId, agent: "pi", ...selectedUntracked },
+		{ cwd, lineageId, agent: "pi", baseRef: "main", committedOnly: true },
+		{ cwd, lineageId, agent: "pi", ...selectedUntracked },
+		{ cwd, lineageId, agent: "pi", ...selectedUntracked },
+	]);
+	assert.equal(captures, 1);
+
+	const override = { ...selectedUntracked, expectedUntrackedInventory: "override-inventory", intendedUntracked: ["generated/override.json"] };
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId, input: JSON.stringify(override) }, cwd, native, undefined, undefined, undefined, selections);
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, cwd, native, undefined, undefined, undefined, selections);
+	assert.deepEqual(requests.slice(-2), Array.from({ length: 2 }, () => ({ cwd, lineageId, agent: "pi", ...override })));
+});
+
 test("route retention caps, rejects collisions and invalid selectors, and clears every terminal state", async () => {
 	const native = { targetStatus: async (request: Record<string, unknown>) => status(String(request.lineageId)) } as unknown as NativeReviewCli;
 	const selections = new Map();
