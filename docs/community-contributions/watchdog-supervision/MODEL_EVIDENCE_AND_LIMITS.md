@@ -14,8 +14,8 @@ La regla metodológica es simple: que un modelo aparezca en un registro de infer
 | Qwen 3.5-35B-A3B | Worker de Pi | Fases acotadas de inspección y validación con estado persistente | Ejecución demostrada. La evidencia pública conservada no contiene un veredicto terminal consolidado para convertirla en aprobación o rechazo de benchmark. | Media |
 | Muse Glimmer 30B | Ejecución local | Tareas de análisis y llamadas a herramientas | Ejecución demostrada. No hay un resultado terminal de benchmark suficientemente conservado para una clasificación pública. | Media |
 | GLM-4.7-Flash | Ejecución local | Sesión de inferencia registrada | Ejecución demostrada. No hay evidencia terminal suficiente para atribuir un resultado de benchmark. | Media |
-| KAT Dev 72B Exp | Ejecución local | Varias sesiones de inferencia | Ejecución demostrada; no se publica una clasificación de rendimiento porque no se conserva un resultado terminal equivalente. | Baja |
-| Qwen 3.8-27B Uncensored | Ejecución local | Varias sesiones de inferencia | Ejecución demostrada; no se publica una clasificación de rendimiento porque no se conserva un resultado terminal equivalente. | Baja |
+| KAT Dev 72B Exp | Ejecución local | Varias sesiones de inferencia | Ejecución demostrada; no se publica una clasificación de rendimiento porque no se conserva un resultado terminal equivalente. | Media |
+| Qwen 3.8-27B Uncensored | Ejecución local | Varias sesiones de inferencia | Ejecución demostrada; no se publica una clasificación de rendimiento porque no se conserva un resultado terminal equivalente. | Media |
 
 ## Inspector y supervisor
 
@@ -49,8 +49,8 @@ The methodological rule is straightforward: a model appearing in an inference lo
 | Qwen 3.5-35B-A3B | Pi worker | Bounded inspection and validation phases with persisted state | Execution is demonstrated. The retained public evidence has no consolidated terminal verdict that would justify classifying it as a benchmark pass or failure. | Medium |
 | Muse Glimmer 30B | Local execution | Analysis tasks and tool calls | Execution is demonstrated. No benchmark terminal result is retained sufficiently to support a public classification. | Medium |
 | GLM-4.7-Flash | Local execution | Recorded inference session | Execution is demonstrated. There is no sufficient terminal evidence to attribute a benchmark result. | Medium |
-| KAT Dev 72B Exp | Local execution | Multiple inference sessions | Execution is demonstrated; no performance classification is published because no equivalent terminal result is retained. | Low |
-| Qwen 3.8-27B Uncensored | Local execution | Multiple inference sessions | Execution is demonstrated; no performance classification is published because no equivalent terminal result is retained. | Low |
+| KAT Dev 72B Exp | Local execution | Multiple inference sessions | Execution is demonstrated; no performance classification is published because no equivalent terminal result is retained. | Medium |
+| Qwen 3.8-27B Uncensored | Local execution | Multiple inference sessions | Execution is demonstrated; no performance classification is published because no equivalent terminal result is retained. | Medium |
 
 ## Inspector and supervisor
 
