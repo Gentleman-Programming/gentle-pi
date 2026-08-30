@@ -158,7 +158,8 @@ And once an external supervisor was introduced:
 
 ## Contenido / Contents
 
-- `src/phase-router.ts` — versión actual del router utilizada en las pruebas.
+- `reference-source/phase-router.ts` — copia de referencia del router utilizada
+  en las pruebas, relativa a la raíz de este paquete.
 - `ORIGIN_AND_EVOLUTION.md` — origen y evolución del sistema: de la reducción de contexto al watchdog activo (español e inglés).
 - `MODEL_EVIDENCE_AND_LIMITS.md` — alcance verificable de las pruebas de modelos y límites de atribución (español e inglés).
 - `docs/` — explicación del problema, arquitectura y cada grupo de cambios.

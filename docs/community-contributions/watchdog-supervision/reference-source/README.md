@@ -1,6 +1,8 @@
 # phase-router.ts
 
-`phase-router.ts` is the exact current router source used for the validation described in this contribution package.
+`reference-source/phase-router.ts`, relative to this contribution package root,
+is the packaged reference copy of the router used for the validation described
+in this contribution package.
 
 It is provided as a reference implementation for upstream review.
 

@@ -69,7 +69,12 @@ Markers:
 - `WATCHDOG_STALE_REVIEW_GUARD_V1`
 - `WATCHDOG_STALE_REVIEW_PRE_ABORT_V1`
 
-Before a destructive action, authoritative cycle state is re-read. If the worker produced additional tool calls after the review snapshot, the non-continue decision is discarded.
+Before a destructive action, authoritative cycle state is re-read. A
+non-continue decision is discarded only when the worker advanced a monotonic
+semantic checkpoint or completed a successful state transition after the review
+snapshot. Repeated calls, failed calls and no-op reads are retained as
+structural evidence; they do not by themselves invalidate the recovery
+decision.
 
 ### Real validation
 

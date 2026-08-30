@@ -16,6 +16,23 @@ The application-specific workload is not part of Gentle-Pi. It was selected beca
 - phase termination;
 - final evidence validation.
 
+## Public provenance and reproducibility boundary
+
+The validation summaries below describe two bounded local runs. Their public
+metadata is intentionally limited so the package remains reproducible at the
+controller level without publishing a private workload, local paths, raw logs
+or commands that identify the private environment.
+
+| Run | Outcome | Controller provenance | Runtime configuration | Timestamp and artifact policy | Scope |
+| --- | --- | --- | --- | --- | --- |
+| `WATCHDOG-TERMINATION-GRACE-SUCCESS` | Accepted | Packaged `reference-source/phase-router.ts`; see [`../SOURCE-SHA256.txt`](../SOURCE-SHA256.txt) | Local worker and external supervisor; model attribution is constrained by [`../MODEL_EVIDENCE_AND_LIMITS.md`](../MODEL_EVIDENCE_AND_LIMITS.md) | The retained log contains local timestamps without a recorded UTC offset; this public package does not invent one. Raw logs and exact commands are deliberately excluded. | One bounded implementation phase, persistence, terminal completion and evidence validation. |
+| `WATCHDOG-PRE-GRACE-ABORT` | Aborted before terminal completion | Same experimental controller lineage | Same controller class; no public claim of identical model/runtime settings | No timezone-qualified timestamp or raw-log artifact is published; the source record did not preserve a publishable offset. Exact commands are deliberately excluded. | Demonstrates the pre-grace failure mode only. |
+
+The public evidence therefore supports the stated controller outcomes and test
+scope, not independent replay of the application workload. A downstream
+reproduction should supply its own workload, runtime configuration, commands,
+timezone-qualified timestamps and raw artifacts.
+
 ## Final successful execution
 
 Observed controller sequence:

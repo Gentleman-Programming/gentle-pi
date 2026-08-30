@@ -14,10 +14,13 @@ Recovery snapshots are useful across fresh worker contexts, but they become dang
 
 Recovery snapshots are bound to the producing task using controller state such as:
 
-- source task ID;
-- source original objective.
+- stable continuation lineage ID;
+- fingerprint of the source original objective.
 
-Snapshots that cannot be matched to the active task are rejected.
+The new execution task ID is deliberately not used as a direct snapshot-match
+key: it is fresh for every worker context. Snapshots whose continuation lineage
+and objective fingerprint cannot both be matched to the active task are
+rejected.
 
 ### Goal
 

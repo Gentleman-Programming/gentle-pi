@@ -4,6 +4,21 @@
 
 Demonstrate that the controller can complete a real bounded implementation phase through persistence, terminal phase completion and final evidence validation.
 
+## Public run record
+
+| Field | Value |
+| --- | --- |
+| Run ID | `WATCHDOG-TERMINATION-GRACE-SUCCESS` |
+| Outcome | Accepted after one completed phase and zero recoveries. |
+| Controller provenance | Packaged `reference-source/phase-router.ts`; integrity record: [`../SOURCE-SHA256.txt`](../SOURCE-SHA256.txt). |
+| Runtime attribution | A local worker plus external supervisor. See [`../MODEL_EVIDENCE_AND_LIMITS.md`](../MODEL_EVIDENCE_AND_LIMITS.md) for the supported model-level claims. |
+| Timestamp handling | The retained log shows local timestamps but did not preserve a publishable UTC offset. This document does not infer one. |
+| Commands and raw artifacts | Deliberately excluded because they identify a private workload and environment. |
+| Test scope | One bounded implementation phase, persistence, terminal completion, evidence validation, two focused suites and syntax diagnostics. |
+
+The evidence below is a sanitised event extract. It is sufficient to support the
+controller outcome stated here; it is not a portable workload replay.
+
 ## Successful terminal sequence
 
 From the real controller log:

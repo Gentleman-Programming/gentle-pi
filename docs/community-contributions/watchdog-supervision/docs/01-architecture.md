@@ -55,7 +55,14 @@ A fresh worker context is not necessarily a fresh engineering task.
 The resume mechanism therefore uses:
 
 - a **new task ID** for the new execution context;
+- a stable **continuation lineage ID** carried forward from the interrupted task;
 - a controller-side fingerprint of the original objective;
-- prior evidence only when the objective binding matches.
+- prior evidence only when both the continuation lineage and objective
+  fingerprint match.
+
+The fresh execution task ID identifies only the new worker context. It is
+explicitly excluded from direct recovery-snapshot matching: using it as the
+binding key would make valid continuation impossible, while accepting it as a
+replacement for lineage would weaken task isolation.
 
 This preserves task isolation without forcing repeated discovery after interruption.
