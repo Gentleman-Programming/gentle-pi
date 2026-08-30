@@ -13,6 +13,7 @@ import {
 	GENTLE_AI_RELEASE_ASSETS,
 	GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM,
 	downloadGentleAiAsset,
+	gentleAiAssetForm,
 	installGentleAi,
 	resolveGentleAiInstallerPackageRoot,
 	resolveGentleAiReleaseAsset,
@@ -47,6 +48,21 @@ test("release mapping selects only the supported official v2.5.0-rc.3 assets and
 	assert.equal(resolveGentleAiReleaseAsset("darwin", "arm64").name, "gentle-ai_2.5.0-rc.3_darwin_arm64");
 	for (const asset of Object.values(GENTLE_AI_RELEASE_ASSETS)) {
 		assert.match(asset.url, /^https:\/\/github\.com\/Gentleman-Programming\/gentle-ai\/releases\/download\/v2\.5\.0-rc\.3\//);
+	}
+});
+
+test("raw release assets are admitted only under a prerelease pin", () => {
+	assert.equal(gentleAiAssetForm("gentle-ai_2.4.0_linux_amd64.tar.gz", "2.4.0"), "archive");
+	assert.equal(gentleAiAssetForm("gentle-ai_2.5.0-rc.3_linux_amd64", "2.5.0-rc.3"), "raw-binary");
+	assert.equal(gentleAiAssetForm("gentle-ai_2.5.0-rc.3_windows_amd64.exe", "2.5.0-rc.3"), "raw-binary");
+	// A raw binary under a stable pin means the pin itself is wrong: stable
+	// releases publish signed archives only, so this fails closed pre-download.
+	assert.throws(() => gentleAiAssetForm("gentle-ai_2.6.0_linux_amd64", "2.6.0"), /only admitted for a prerelease pin/);
+	assert.throws(() => gentleAiAssetForm("gentle-ai.dmg", "2.5.0-rc.3"), /unsupported Gentle AI release asset form/);
+	// The current pin admits every pinned asset row through the same gate the
+	// installer uses at download time (default installerVersion argument).
+	for (const asset of Object.values(GENTLE_AI_RELEASE_ASSETS)) {
+		assert.equal(gentleAiAssetForm(asset.name), "raw-binary");
 	}
 });
 

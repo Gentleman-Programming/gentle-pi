@@ -86,11 +86,17 @@ export const GENTLE_AI_RELEASE_ASSETS = Object.freeze({
 	"linux/arm64": asset("gentle-ai_2.5.0-rc.3_linux_arm64", "e69393bcf337db932a245fc79c87f3877a74b11800c35f4e002614379671b2d9", "e69393bcf337db932a245fc79c87f3877a74b11800c35f4e002614379671b2d9", "gentle-ai"),
 });
 
-// A pinned asset is either a signed archive or, for a prerelease, the raw
-// executable itself. Anything else fails closed before a byte is downloaded.
-export function gentleAiAssetForm(name) {
+// A pinned asset is either a signed archive or, for a prerelease pin only,
+// the raw executable itself: prereleases are hand-built and ship raw binaries,
+// while every stable release publishes signed archives, so a raw asset under a
+// stable pin means the pin itself is wrong. Anything else fails closed before
+// a byte is downloaded.
+export function gentleAiAssetForm(name, installerVersion = INSTALLER_VERSION) {
 	if (name.endsWith(".tar.gz") || name.endsWith(".zip")) return "archive";
-	if (/^gentle-ai_[0-9A-Za-z.+~-]+_(darwin|linux|windows)_(amd64|arm64)(\.exe)?$/.test(name)) return "raw-binary";
+	if (/^gentle-ai_[0-9A-Za-z.+~-]+_(darwin|linux|windows)_(amd64|arm64)(\.exe)?$/.test(name)) {
+		if (!installerVersion.includes("-")) throw new Error(`raw Gentle AI release asset ${name} is only admitted for a prerelease pin; stable pin ${installerVersion} requires a signed archive`);
+		return "raw-binary";
+	}
 	throw new Error(`unsupported Gentle AI release asset form: ${name}`);
 }
 
