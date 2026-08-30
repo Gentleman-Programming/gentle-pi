@@ -127,7 +127,23 @@ const REQUIRED_SCHEMAS_COMMON = Object.freeze([
 	"https://gentle-ai.dev/schema/review/reviewer/v1",
 	"https://gentle-ai.dev/schema/review/validator/v1",
 ]         );
-const CAPABILITIES_SCHEMA_IDENTITIES                                                                                          = Object.freeze({
+// The v2.3 provider contract (first advertised by the pinned v2.5.0-rc.3
+// runtime) retired exact_receipt_replay, five_delivery_gates, and
+// sdd_receipt_binding from the mandatory feature set and
+// exact_gate_receipt_discovery, one_shot_final_verification_retry, and
+// outcome_bound_verification_evidence from the optional set; none of them is
+// consumed by Pi's negotiated v2 lane. Earlier minors keep their frozen
+// requirement sets unchanged.
+const REQUIRED_MANDATORY_FEATURES_V23 = Object.freeze([
+	"compact_v2_authority",
+	"immutable_snapshot",
+	"legacy_v1_target_scoped_read_only",
+	"repository_independent_capabilities",
+	"restart_safe_projection",
+	"target_scoped_status",
+	"uniform_failure_envelope",
+]         );
+const CAPABILITIES_SCHEMA_IDENTITIES                                                                                                                                                                        = Object.freeze({
 	"gentle-ai.review-integration.capabilities/v2": Object.freeze({
 		protocolMinor: 0,
 		requiredSchemas: Object.freeze([...REQUIRED_SCHEMAS_COMMON, "gentle-ai.review-integration.capabilities/v2", "gentle-ai.review-integration.consent/v2", "gentle-ai.review-integration.start/v3", "gentle-ai.review-integration.status/v3"]),
@@ -142,7 +158,16 @@ const CAPABILITIES_SCHEMA_IDENTITIES                                            
 	}),
 	"gentle-ai.review-integration.capabilities/v2.3": Object.freeze({
 		protocolMinor: 3,
-		requiredSchemas: Object.freeze([...REQUIRED_SCHEMAS_COMMON, "gentle-ai.review-integration.capabilities/v2.3", "gentle-ai.review-integration.consent/v3", "gentle-ai.review-integration.start/v4", "gentle-ai.review-integration.status/v5"]),
+		// v2.3 (first advertised by the pinned v2.5.0-rc.3 provider) retired
+		// three v1-era identities from its advertisement:
+		// review-final-verification-incident/v1, review-receipt/v2, and
+		// review-verification-evidence/v2. Pi never decodes those envelopes on
+		// the negotiated v2 lane, so the v2.3 requirement list is the exact set
+		// the v2.3 provider contract defines; earlier minors keep the full
+		// common list unchanged.
+		requiredSchemas: Object.freeze([...REQUIRED_SCHEMAS_COMMON.filter((schema) => !["gentle-ai.review-final-verification-incident/v1", "gentle-ai.review-receipt/v2", "gentle-ai.review-verification-evidence/v2"].includes(schema)), "gentle-ai.review-integration.capabilities/v2.3", "gentle-ai.review-integration.consent/v3", "gentle-ai.review-integration.start/v4", "gentle-ai.review-integration.status/v5"]),
+		requiredMandatoryFeatures: REQUIRED_MANDATORY_FEATURES_V23,
+		optionalFeatureFloor: 14,
 	}),
 });
 const OPTIONAL_FEATURE_NAMES = Object.freeze([
@@ -931,11 +956,12 @@ export function decodeReviewCapabilitiesV2(value         , verifiedExecutableDig
 	assertSupersetOf(advertisedSchemas, identity.requiredSchemas, "capabilities schemas");
 
 	const features = exactRecord(body.features, "capabilities.features", ["mandatory", "optional"]);
-	const mandatory = array(features.mandatory, "capabilities.features.mandatory", (entry, label) => decodeFeature(entry, label), { minimum: 10 });
-	const optional = array(features.optional, "capabilities.features.optional", (entry, label) => decodeOptionalFeature(entry, label), { minimum: 17, unique: true });
+	const requiredMandatoryFeatures = identity.requiredMandatoryFeatures ?? REQUIRED_MANDATORY_FEATURES;
+	const mandatory = array(features.mandatory, "capabilities.features.mandatory", (entry, label) => decodeFeature(entry, label), { minimum: requiredMandatoryFeatures.length });
+	const optional = array(features.optional, "capabilities.features.optional", (entry, label) => decodeOptionalFeature(entry, label), { minimum: identity.optionalFeatureFloor ?? 17, unique: true });
 	const mandatoryNames = mandatory.map((feature) => feature.name);
 	const optionalNames = optional.map((feature) => feature.name);
-	assertExactSet(mandatoryNames, REQUIRED_MANDATORY_FEATURES, "mandatory capabilities");
+	assertExactSet(mandatoryNames, requiredMandatoryFeatures, "mandatory capabilities");
 	if (new Set(optionalNames).size !== optionalNames.length) throw new TypeError("optional capabilities contain duplicate names");
 	if (optionalNames.some((name) => mandatoryNames.includes(name                           ))) throw new TypeError("mandatory and optional capabilities overlap");
 	if (mandatory.some((feature) => !feature.supported)) throw new TypeError("mandatory capability is unsupported");

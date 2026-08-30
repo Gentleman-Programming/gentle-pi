@@ -757,6 +757,15 @@ export const NATIVE_CLI_CONTRACTS = Object.freeze({
 	// while Pi stayed on 2.2.3; they were never pinned or probed, so they get
 	// no row.
 	"2.4.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	// Ground-truthed by driving the exact v2.5.0-rc.3 tagged build through the
+	// gentle-ai-bench driven journey corpus (exit 0), which exercises the
+	// start/status/capture/validate/mode/delivery lifecycles Pi consumes. The
+	// v2 lane advertises capabilities/v2.3 and its reviewing START is the
+	// `start/v4` continuation envelope that #499 already decodes; the closed
+	// fields Pi consumes are unchanged, so the columns match the 2.4.0 row.
+	// riskEvidence and hint stay dark: still not proven to reach the
+	// negotiated path Pi reads.
+	"2.5.0-rc.3": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 });
 
 export interface NativeReviewProcessDiagnostics {

@@ -325,6 +325,11 @@ test("capabilities/v2.3 requires START/v4 and rejects future identities", () => 
 	v23.schemas = (v23.schemas as string[]).map((schema) => schema
 		.replace("capabilities/v2.2", "capabilities/v2.3")
 		.replace("start/v3", "start/v4"));
+	// The v2.3 provider contract retired these three mandatory features; the
+	// pinned v2.5.0-rc.3 runtime no longer advertises them.
+	const features = v23.features as JsonObject;
+	features.mandatory = (features.mandatory as JsonObject[]).filter((feature) =>
+		!["exact_receipt_replay", "five_delivery_gates", "sdd_receipt_binding"].includes(feature.name as string));
 	const decoded = decodeReviewCapabilitiesV2(v23, CAPTURED_DIGEST);
 	assert.equal(decoded.schemas.has("gentle-ai.review-integration.start/v4"), true);
 	assert.equal(decoded.schemas.has("gentle-ai.review-integration.start/v3"), false);

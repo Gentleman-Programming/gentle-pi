@@ -123,11 +123,25 @@ test("2.4.0 repeats 2.2.3 because the START envelope Pi consumes still omits ris
 	assert.deepEqual(contract, NATIVE_CLI_CONTRACTS["2.2.3"] as Record<string, boolean>);
 });
 
+test("2.5.0-rc.3 repeats 2.4.0 because the negotiated lane Pi consumes is unchanged", () => {
+	// Ground-truthed by driving the exact v2.5.0-rc.3 tagged build through the
+	// gentle-ai-bench driven journey corpus (exit 0), which exercises the
+	// start/status/capture/validate/mode/delivery lifecycles Pi consumes. The
+	// lane now advertises capabilities/v2.3 and the reviewing START is the
+	// `start/v4` continuation envelope that #499 already decodes; the closed
+	// fields Pi reads did not change. riskEvidence and hint stay dark: still
+	// not proven to reach the negotiated START path Pi consumes.
+	const contract = NATIVE_CLI_CONTRACTS["2.5.0-rc.3"] as Record<string, boolean>;
+	assert.equal(contract.riskEvidence, false);
+	assert.equal(contract.hint, false);
+	assert.deepEqual(contract, NATIVE_CLI_CONTRACTS["2.4.0"] as Record<string, boolean>);
+});
+
 test("no shipped version key was added beyond the pin bump", () => {
 	// Rows are promises to consumers, so a new key only ever appears in a
 	// dedicated commit alongside a pin bump, never as a side effect. v2.2.4 and
 	// v2.3.0 shipped upstream while Pi stayed on 2.2.3 and were never pinned,
 	// so they get no row: a row asserts ground truth measured against a binary
 	// Pi actually ran, and the table only has to be ascending, not gapless.
-	assert.deepEqual(Object.keys(NATIVE_CLI_CONTRACTS), [...DARK_VERSIONS, "2.2.0", "2.2.1", "2.2.2", "2.2.3", "2.4.0"]);
+	assert.deepEqual(Object.keys(NATIVE_CLI_CONTRACTS), [...DARK_VERSIONS, "2.2.0", "2.2.1", "2.2.2", "2.2.3", "2.4.0", "2.5.0-rc.3"]);
 });
