@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { __testing, createGentleAiExtension } from "../../extensions/gentle-ai.ts";
@@ -452,8 +452,13 @@ test("dev-binary: Pi controller keeps an explicit B root and selected-untracked 
 
 	const canonicalB = realpathSync(targetB);
 	assert.equal(realpathSync(git(nestedTarget, "rev-parse", "--show-toplevel")), canonicalB, "B/nested must canonicalize to B before controller routing");
-	const activeProjectCommonDir = realpathSync(git(process.cwd(), "rev-parse", "--git-common-dir"));
-	const sandboxCommonDir = realpathSync(git(canonicalB, "rev-parse", "--git-common-dir"));
+	// --git-common-dir answers relative to the repository it was asked about, so
+	// resolving it against the process cwd compared the active project with
+	// itself: the assertion held in a linked worktree and failed in a primary
+	// checkout, and in neither case measured what it names. lib/review-candidate-view.ts
+	// resolves it against the repository root, which is the convention here too.
+	const activeProjectCommonDir = realpathSync(resolve(process.cwd(), git(process.cwd(), "rev-parse", "--git-common-dir")));
+	const sandboxCommonDir = realpathSync(resolve(canonicalB, git(canonicalB, "rev-parse", "--git-common-dir")));
 	assert.notEqual(sandboxCommonDir, activeProjectCommonDir, "the B sandbox must not share the active project's Git common directory");
 	const isolatedHome = join(sessionA, "home");
 	mkdirSync(isolatedHome);
@@ -618,6 +623,17 @@ test("dev-binary: Pi controller keeps an explicit B root and selected-untracked 
 			assert.equal(reviewerClosure.schema, "gentle-ai.review-last-event-closure/v1");
 			assert.equal(reviewerClosure.operation, "review/capture-result");
 			assert.equal(reviewerClosure.state, "correction_required", "the deterministic reviewer finding must open correction_required");
+			const statusContinuation = record(reviewerClosure.status_continuation, "reviewer status continuation");
+			assert.equal(statusContinuation.operation, "review.status", "correction-required closure must carry its provider-owned STATUS re-entry");
+			assert.ok(Array.isArray(statusContinuation.arguments), "reviewer status continuation must carry ordered arguments");
+			const statusContinuationTokens = statusContinuation.arguments.map((entry) => stringValue(record(entry, "reviewer status continuation argument").token, "reviewer status continuation token"));
+			assert.match(statusContinuationTokens[0]!, /^--cwd=/);
+			assert.deepEqual(statusContinuationTokens.slice(1), [
+				"--contract=gentle-ai.review-integration/v2",
+				"--next-transition=true",
+				`--lineage=${lineage}`,
+				"--agent=pi",
+			]);
 			correctionOpened = true;
 			break;
 		}
@@ -736,8 +752,20 @@ test("dev-binary: Pi controller keeps an explicit B root and selected-untracked 
 	assert.ok(validatorPrompt.length > 0, "the Go-owned validator must receive a provider-rendered prompt");
 	assert.ok(validatorPrompt.includes(validatorRequestHash), "the Go-owned validator prompt must retain the provider request hash");
 
+	// Approval no longer burns on its own: it commits one pending
+	// acknowledgement and waits for the host to run that exact invocation
+	// (gentle-ai #3851). The lineage is still live here on purpose, and running
+	// the provider's own tokens is what ends it.
+	const pendingAcknowledgement = record(validationClosure.acknowledgement, "approved acknowledgement continuation");
+	assert.equal(pendingAcknowledgement.operation, "review.acknowledge-approved");
+	const acknowledgementTokens = (pendingAcknowledgement.arguments as readonly Record<string, unknown>[])
+		.map((argument) => stringValue(argument.token, "acknowledgement argument token"));
+	const beforeAcknowledgement = await native.targetStatus!({ cwd: canonicalB, lineageId: lineage, agent: "pi", ...selection });
+	assert.equal(beforeAcknowledgement.authority?.state, "approved", "approved authority must survive until its exact acknowledgement runs");
+	await native.acknowledgeApproved!({ cwd: canonicalB, argumentTokens: acknowledgementTokens });
+
 	const terminal = await native.targetStatus!({ cwd: canonicalB, lineageId: lineage, agent: "pi", ...selection });
-	assert.equal(terminal.authority, undefined, "terminal approval must burn the sandbox review authority");
+	assert.equal(terminal.authority, undefined, "the exact acknowledgement must burn the sandbox review authority");
 	assert.equal("evidence" in terminal.raw, false, "terminal STATUS must not retain validation evidence");
 	assert.equal("staging" in terminal.raw, false, "terminal STATUS must not retain staging state");
 	assert.equal("receipt" in terminal.raw, false, "terminal STATUS must not retain a receipt after last-event approval");

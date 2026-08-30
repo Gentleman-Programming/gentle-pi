@@ -64,10 +64,28 @@ function createPi() {
 	const commands = new Map();
 	const flags = new Map();
 	const tools = new Map();
+	const eventHandlers = new Map();
+	const emittedEvents = [];
 	const flagValues = new Map([["no-skill-registry", true]]);
+	const events = {
+		emit(channel, data) {
+			emittedEvents.push({ channel, data });
+			for (const handler of eventHandlers.get(channel) ?? []) handler(data);
+		},
+		on(channel, handler) {
+			const handlers = eventHandlers.get(channel) ?? new Set();
+			handlers.add(handler);
+			eventHandlers.set(channel, handlers);
+			return () => {
+				handlers.delete(handler);
+				if (handlers.size === 0) eventHandlers.delete(channel);
+			};
+		},
+	};
 	let activeTools = ["read", "bash", "edit", "write"];
 
 	const pi = {
+		events,
 		on(name, handler) {
 			const list = hooks.get(name) ?? [];
 			list.push(handler);
@@ -108,7 +126,7 @@ function createPi() {
 		},
 	};
 
-	return { pi, hooks, commands, flags, tools };
+	return { pi, hooks, commands, flags, tools, emittedEvents };
 }
 
 function createUi() {
@@ -206,7 +224,7 @@ async function run() {
 	process.env.GENTLE_PI_TEST_ASSETS_DIR = ambientTestAssetsDir;
 	const globalModelsPath = join(globalConfigHome, "models.json");
 	const globalSubagentsPath = join(globalAgentHome, "subagents.json");
-	const { pi, hooks, commands, flags, tools } = createPi();
+	const { pi, hooks, commands, flags, tools, emittedEvents } = createPi();
 	await loadExtensions(pi);
 
 	// gentle-pi#404: a collect binding that returns the native last-event
@@ -509,6 +527,110 @@ async function run() {
 		assert.equal(missingReviewView.block, true);
 		assert.match(missingReviewView.reason, /candidate view/i);
 		assert.equal(reviewDispatch.task, "review", "blocked review dispatch must not mutate child input");
+
+		for (const [agent, label, task] of [
+			["gentle-ai-worker", "missing", "Implement the requested change."],
+			["gentle-ai-worker", "absolute", "## Allowed edit surfaces\n/tmp/outside.ts"],
+			["gentle-ai-worker", "Windows absolute", "## Allowed edit surfaces\nC:\\outside.ts"],
+			["gentle-ai-worker", "prose instead of paths", "## Allowed edit surfaces\nThe parent will determine the paths."],
+			["gentle-ai-worker", "repository root", "## Allowed edit surfaces\n."],
+			["gentle-ai-worker", "bare repository root", "## Allowed edit surfaces\n./"],
+			["gentle-ai-worker", "normalized bare repository root", "## Allowed edit surfaces\n.//"],
+			["gentle-ai-worker", "equivalent normalized bare repository root", "## Allowed edit surfaces\n././/"],
+			["worker", "generic writer missing", "Implement the requested change."],
+		]) {
+			const writerDispatch = { agent, task, mode: "task" };
+			const writerResult = await toolHook(
+				{ toolName: "subagent_run", input: writerDispatch },
+				createCtx(toolCwd),
+			);
+			assert.equal(writerResult?.block, true, `${label} writer scope must be blocked before dispatch`);
+			assert.match(writerResult?.reason ?? "", /derive|map/i);
+			assert.match(writerResult?.reason ?? "", /relaunch/i);
+			assert.match(writerResult?.reason ?? "", /do not ask.*human.*paths or globs/i);
+			assert.equal(writerDispatch.task, task, "writer guard must not mutate child input");
+		}
+
+		const scopedWriterDispatch = {
+			agent: "gentle-ai-worker",
+			task: "Implement the requested change.\n\n## Allowed edit surfaces\nextensions/gentle-ai.ts\ntests/runtime-harness.mjs",
+			mode: "task",
+		};
+		assert.equal(
+			await toolHook({ toolName: "subagent_run", input: scopedWriterDispatch }, createCtx(toolCwd)),
+			undefined,
+			"a writer may dispatch with narrow task-scoped repository-relative paths",
+		);
+		assert.equal(
+			await toolHook(
+				{
+					toolName: "subagent_run",
+					input: {
+						agent: "worker",
+						task: "Implement the requested change.",
+						context: "## Allowed edit surfaces\n- assets/orchestrator.md",
+						mode: "task",
+					},
+				},
+				createCtx(toolCwd),
+			),
+			undefined,
+			"a writer may dispatch when context carries narrow task-scoped repository-relative paths",
+		);
+		for (const [label, input] of [
+			[
+				"valid scope followed by a repository-root scope",
+				{
+					agent: "gentle-ai-worker",
+					task: "## Allowed edit surfaces\nextensions/gentle-ai.ts\n\n## Allowed edit surfaces\n.",
+					mode: "task",
+				},
+			],
+			[
+				"valid task scope plus invalid context scope",
+				{
+					agent: "gentle-ai-worker",
+					task: "## Allowed edit surfaces\nextensions/gentle-ai.ts",
+					context: "## Allowed edit surfaces\n.",
+					mode: "task",
+				},
+			],
+			[
+				"conflicting valid task and context scopes",
+				{
+					agent: "gentle-ai-worker",
+					task: "## Allowed edit surfaces\nextensions/gentle-ai.ts",
+					context: "## Allowed edit surfaces\ntests/runtime-harness.mjs",
+					mode: "task",
+				},
+			],
+		]) {
+			const writerResult = await toolHook({ toolName: "subagent_run", input }, createCtx(toolCwd));
+			assert.equal(writerResult?.block, true, `${label} must block writer dispatch`);
+		}
+		assert.equal(
+			await toolHook(
+				{
+					toolName: "subagent_run",
+					input: {
+						agent: "gentle-ai-worker",
+						task: "## Allowed edit surfaces\nextensions/gentle-ai.ts\ntests/runtime-harness.mjs\n\n## Allowed edit surfaces\n- `tests/runtime-harness.mjs`\n- `extensions/gentle-ai.ts`",
+						mode: "task",
+					},
+				},
+				createCtx(toolCwd),
+			),
+			undefined,
+			"a writer may dispatch when multiple allowed edit surface sections are compatible",
+		);
+		assert.equal(
+			await toolHook(
+				{ toolName: "subagent_run", input: { agent: "scout", task: "Map the repository.", mode: "task" } },
+				createCtx(toolCwd),
+			),
+			undefined,
+			"non-writer subagents must remain unaffected",
+		);
 		const sensitiveRead = await toolHook({ toolName: "read", input: { path: join(toolCwd, ".env.local") } }, createCtx(toolCwd));
 		assert.equal(sensitiveRead.block, true);
 		assert.match(sensitiveRead.reason, /sensitive path/);
@@ -524,6 +646,61 @@ async function run() {
 		);
 		assert.equal(needsConfirm.block, true);
 		assert.match(needsConfirm.reason, /not confirmed/);
+		assert.deepEqual(
+			emittedEvents.map(({ channel, data }) => ({
+				channel,
+				state: data.state,
+				active: data.active,
+				label: data.label,
+			})),
+			[
+				{
+					channel: "pi-permission-system:permission-request",
+					state: "waiting",
+					active: undefined,
+					label: undefined,
+				},
+				{
+					channel: "herdr:blocked",
+					state: undefined,
+					active: true,
+					label: "Guarded command confirmation",
+				},
+				{
+					channel: "pi-permission-system:permission-request",
+					state: "denied",
+					active: undefined,
+					label: undefined,
+				},
+				{
+					channel: "herdr:blocked",
+					state: undefined,
+					active: false,
+					label: undefined,
+				},
+			],
+			"guarded confirmation emits both lifecycle channels in order",
+		);
+		assert.equal(emittedEvents[0].data.requestId, emittedEvents[2].data.requestId);
+		emittedEvents.length = 0;
+		pi.events.emit("rpiv:ask-user:blocked", {
+			active: true,
+			question: "private runtime questionnaire",
+			answer: "private runtime answer",
+			path: "/private/runtime-path",
+			command: "private runtime command",
+		});
+		pi.events.emit("rpiv:ask-user:blocked", { active: true, duplicate: true });
+		pi.events.emit("rpiv:ask-user:blocked", { active: "true" });
+		pi.events.emit("rpiv:ask-user:other", { active: false });
+		pi.events.emit("rpiv:ask-user:blocked", { active: false });
+		const rpivHerdrEvents = emittedEvents.filter(({ channel }) => channel === "herdr:blocked");
+		assert.deepEqual(rpivHerdrEvents, [
+			{ channel: "herdr:blocked", data: { active: true, label: "Questionnaire awaiting input" } },
+			{ channel: "herdr:blocked", data: { active: false } },
+		]);
+		assert.doesNotMatch(JSON.stringify(rpivHerdrEvents), /private runtime/i);
+		emittedEvents.length = 0;
 		assert.equal(
 			dangerousReviewCtx.ui.notifications.length,
 			0,
@@ -1098,7 +1275,7 @@ async function run() {
 		pi.setActiveTools(["read", "bash", "edit", "write", "mem_save"]);
 		const ctx = createCtx(engramSddCwd, true, "engram-session");
 		await commands.get("gentle:sdd-preflight").handler("", ctx);
-		assert.deepEqual(ctx.ui.selections[1].options, ["openspec", "engram", "both"]);
+		assert.deepEqual(ctx.ui.selections[1].options, ["openspec", "engram", "hybrid"]);
 	} finally {
 		pi.setActiveTools(["read", "bash", "edit", "write"]);
 		await rm(engramSddCwd, { recursive: true, force: true });
@@ -1149,7 +1326,7 @@ async function run() {
 		pi.setActiveTools(["read", "bash", "edit", "write", "mem_save"]);
 		const ctx = createCtx(bothSddInitCwd, true, "both-sdd-init-session");
 		ctx.ui.select = async (label, options) => {
-			if (label === "SDD artifact store") return "both";
+			if (label === "SDD artifact store") return "hybrid";
 			return options[0];
 		};
 		await commands.get("gentle:sdd-preflight").handler("", ctx);

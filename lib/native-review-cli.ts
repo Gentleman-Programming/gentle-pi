@@ -44,7 +44,6 @@ function resolveNativeReviewMaxBufferBytes(environment: NodeJS.ProcessEnv = proc
 
 export const NATIVE_REVIEW_OPERATION = {
 	START: "review/start",
-	SDD_STATUS: "sdd-status",
 	STATUS: "review/status",
 	RECLAIM: "review/reclaim",
 	RECOVER: "review/recover",
@@ -57,6 +56,7 @@ export const NATIVE_REVIEW_OPERATION = {
 	CAPTURE_RESULT: "review/capture-result",
 	CAPTURE_CORRECTION_PLAN: "review/capture-correction-plan",
 	CAPTURE_PROVIDER_ROLE: "review/capture-provider-role",
+	ACKNOWLEDGE_APPROVED: "review/acknowledge-approved",
 } as const;
 export type NativeReviewOperation = (typeof NATIVE_REVIEW_OPERATION)[keyof typeof NATIVE_REVIEW_OPERATION];
 
@@ -82,38 +82,8 @@ export interface ExecFileRequest { file: string; arguments: readonly string[]; c
 export interface ExecFileResult { stdout: string; stderr: string; exitCode: number; signal: NodeJS.Signals | null; timedOut: boolean; outputLimitExceeded: boolean; }
 export type ExecFileAdapter = (request: ExecFileRequest) => Promise<ExecFileResult>;
 
-export const NATIVE_SDD_ARTIFACT_STORE = {
-	OPENSPEC: "openspec",
-	ENGRAM: "engram",
-	NONE: "none",
-} as const;
-export type NativeSddArtifactStore = (typeof NATIVE_SDD_ARTIFACT_STORE)[keyof typeof NATIVE_SDD_ARTIFACT_STORE];
-
-export const NATIVE_SDD_ARTIFACT_STATE = {
-	MISSING: "missing",
-	DONE: "done",
-	PARTIAL: "partial",
-} as const;
-export type NativeSddArtifactState = (typeof NATIVE_SDD_ARTIFACT_STATE)[keyof typeof NATIVE_SDD_ARTIFACT_STATE];
-
-export interface NativeSddArtifactStates {
-	proposal: NativeSddArtifactState;
-	specs: NativeSddArtifactState;
-	design: NativeSddArtifactState;
-	tasks: NativeSddArtifactState;
-	applyProgress: NativeSddArtifactState;
-	verifyReport: NativeSddArtifactState;
-	reviewPolicy?: NativeSddArtifactState;
-	reviewLedger: NativeSddArtifactState;
-	reviewReceipt: NativeSddArtifactState;
-	reviewBundle: NativeSddArtifactState;
-	reviewContext: NativeSddArtifactState;
-	reviewState: NativeSddArtifactState;
-}
-
 export interface NativeReviewCli {
 	start(request: NativeStartRequest): Promise<NativeStartResult>;
-	sddStatus(request: NativeSddStatusRequest): Promise<NativeSddStatusResult>;
 	reviewStatus(request: NativeReviewStatusRequest): Promise<NativeReviewStatusResult>;
 	targetStatus?(request: NativeTargetStatusRequest): Promise<ReviewStatusV3>;
 	answerConsent?(request: NativeReviewConsentAnswerRequest): Promise<NativeReviewConsentAnswerResult>;
@@ -130,7 +100,7 @@ export interface NativeReviewCli {
 	// Dark until a negotiated version reports the `mode` capability true
 	// (Design Decision #7, organic-rdd-parity). Plain versioned CLI operation,
 	// outside the negotiated review-integration protocol — same shape as
-	// reviewStatus/sddStatus/reclaim above.
+	// reviewStatus/reclaim above.
 	reviewMode?(request: NativeReviewModeRequest): Promise<NativeReviewModeResult>;
 }
 
@@ -373,6 +343,16 @@ export interface NativeReviewAdmittedResultManifest {
 /** A non-final reviewer capture acknowledges an admitted artifact; final captures close natively. */
 export type NativeReviewCaptureResultOutcome = NativeReviewAdmittedResultManifest | ReviewLastEventClosureV1;
 
+// The one continuation that burns approved authority. Its tokens are rendered
+// by the provider in a closed order and are relayed verbatim: Pi never builds,
+// reorders, or substitutes one, because a synthesized acknowledgement would be
+// Pi deciding that a review is over.
+export interface NativeReviewAcknowledgeApprovedRequest {
+	readonly argumentTokens: readonly string[];
+	readonly cwd: string;
+	readonly signal?: AbortSignal;
+}
+
 export interface NativeReviewCorrectionPlanCaptureRequest {
 	readonly argumentTokens: readonly string[];
 	readonly correctionLines: number;
@@ -461,7 +441,6 @@ export interface NativeReviewConsentDeclinedResult {
 }
 export interface NativeReviewConsentStartedResult { kind: "started"; start: NativeStartResult; }
 export type NativeReviewConsentAnswerResult = NativeReviewConsentStartedResult | NativeReviewConsentDeclinedResult;
-export interface NativeSddStatusRequest { cwd: string; change: string; signal?: AbortSignal; }
 export interface NativeReviewStatusRequest { cwd: string; signal?: AbortSignal; }
 export interface NativeTargetStatusRequest extends NativeUntrackedSelectionRequest {
 	cwd: string;
@@ -580,14 +559,6 @@ export interface NativeReviewStatusResult {
 export const NATIVE_START_ACTION = { CREATED: "created", RESUMED: "resumed", CLOSED: "closed", BLOCKED_SCOPE_ACTION: "blocked-scope-action" } as const;
 export type NativeStartAction = (typeof NATIVE_START_ACTION)[keyof typeof NATIVE_START_ACTION];
 export interface NativeStartResult { lineageId: string; state: ReviewStartState; riskLevel: string; selectedLenses: readonly string[]; changedFiles: number; changedLines: number; correctionBudget: number; action: NativeStartAction; lensesRequired: boolean; riskReasons?: readonly Record<string, unknown>[]; raw?: Readonly<Record<string, unknown>>; riskEvidence?: readonly string[]; hint?: string; }
-export interface NativeSddStatusResult {
-	ready: boolean;
-	artifactStore: NativeSddArtifactStore;
-	artifacts: NativeSddArtifactStates;
-	nextRecommended: string;
-	[key: string]: unknown;
-}
-
 export function isCanonicalProcessString(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value);
 }
@@ -720,22 +691,20 @@ export function nativeRiskEvidencePhrases(riskLevel: string, reasons: readonly N
 }
 const NATIVE_REVIEW_LENS = ["review-risk", "review-resilience", "review-readability", "review-reliability"] as const;
 const NATIVE_START_ACTION_VALUES = Object.values(NATIVE_START_ACTION);
-const NATIVE_SDD_NEXT_ACTION = ["apply", "verify", "remediate", "archive", "review", "resolve-review", "resolve-blockers", "sdd-new", "select-change", "propose", "spec", "design", "tasks"] as const;
-
 // The pin table is intentionally preserved unchanged while #3587 is
 // unpublished. Last-event capture support is exercised through the explicit
 // dev-binary override; no source-level pin or contract-row mutation is allowed.
 const ORGANIC_PARITY_DARK = { mode: false, riskEvidence: false, hint: false, delivery: false } as const;
 
 export const NATIVE_CLI_CONTRACTS = Object.freeze({
-	"2.1.4": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: false, inventory: false, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.5": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.6": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.7": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.8": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: false, quarantineLegacy: false, reconcileAuthority: true, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.9": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
-	"2.1.10": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, ...ORGANIC_PARITY_DARK }),
-	"2.1.11": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, ...ORGANIC_PARITY_DARK }),
+	"2.1.4": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: false, inventory: false, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.5": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.6": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.7": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: false, recover: false, abandon: false, quarantineLegacy: false, reconcileAuthority: false, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.8": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: false, quarantineLegacy: false, reconcileAuthority: true, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.9": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: false, ...ORGANIC_PARITY_DARK }),
+	"2.1.10": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, ...ORGANIC_PARITY_DARK }),
+	"2.1.11": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, ...ORGANIC_PARITY_DARK }),
 	// First capability-true row, paired with the triple pin bump in this same
 	// commit as Design Decision #1 requires.
 	//
@@ -756,7 +725,7 @@ export const NATIVE_CLI_CONTRACTS = Object.freeze({
 	// needs the negotiated start envelope extended upstream, which moves a
 	// byte-pinned fixture and therefore belongs to a gentle-ai release, not to
 	// a Pi capability flip.
-	"2.2.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	"2.2.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 	// 2.2.1 repeats 2.2.0 because the wire did not move for the lane Pi speaks.
 	// v2.2.1 advertises capabilities/v1.5 (protocol minor 5) on
 	// review-integration/v1, but the negotiated start envelope is still the
@@ -764,16 +733,16 @@ export const NATIVE_CLI_CONTRACTS = Object.freeze({
 	// they are dark on 2.2.0. The release does publish a second contract,
 	// review-integration/v2, whose `start/v3` carries base/candidate trees --
 	// but Pi does not negotiate it yet, and a row must describe the lane in use.
-	"2.2.1": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	"2.2.1": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 	// 2.2.2 repeats 2.2.1 for the same reason, confirmed against the released
 	// v2.2.2 binary rather than assumed: on review-integration/v1 it still
 	// advertises capabilities/v1.5 and the negotiated start envelope is still
 	// the closed `start/v2`, so riskEvidence and hint still cannot arrive.
-	"2.2.2": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	"2.2.2": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 	// Ground-truthed against the released v2.2.3 binary: the v2 lane remains
 	// protocol 2.0 with the same operation set and closed START fields consumed
 	// by Pi, so the existing capability columns are unchanged.
-	"2.2.3": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	"2.2.3": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 	// Ground-truthed against the released v2.4.0 binary: the v2 lane advertises
 	// capabilities/v2.2 and answers status/v5 and consent/v3, all of which the
 	// existing decoders already read, and the START envelope Pi consumes is
@@ -783,7 +752,7 @@ export const NATIVE_CLI_CONTRACTS = Object.freeze({
 	// envelope reports, not whether it reports it. v2.2.4 and v2.3.0 shipped
 	// while Pi stayed on 2.2.3; they were never pinned or probed, so they get
 	// no row.
-	"2.4.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, sddStatus: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	"2.4.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 });
 
 export interface NativeReviewProcessDiagnostics {
@@ -945,7 +914,7 @@ function decodeLegacyReconcileAudit(value: unknown): NativeReviewRecoveryResult 
 // named, typed refusal instead of a generic schema-incompatible error, and
 // before any client ever tries to build an invocation for it (Design
 // Decision #6, migrate-review-integration-v2).
-const NATIVE_REVIEW_SUPPORTED_TRANSITION_OPERATIONS = new Set(["review.start", "review.recover", "review.repair"]);
+const NATIVE_REVIEW_SUPPORTED_TRANSITION_OPERATIONS = new Set(["review.start", "review.recover", "review.repair", "review.acknowledge-approved"]);
 function assertSupportedNextTransitionOperation(body: Record<string, unknown>): void {
 	const nextTransition = body.next_transition;
 	if (typeof nextTransition !== "object" || nextTransition === null || Array.isArray(nextTransition)) return;
@@ -1304,52 +1273,6 @@ class NativeReviewPlainCli {
 		return decode(NATIVE_REVIEW_OPERATION.MODE, mutating, () => decodeNativeReviewMode(body, request.operation));
 	}
 
-	async sddStatus(request: NativeSddStatusRequest): Promise<NativeSddStatusResult> {
-		const { body: result } = await this.execute(NATIVE_REVIEW_OPERATION.SDD_STATUS, request.cwd, ["sdd-status", request.change, "--cwd", request.cwd, "--json", "--instructions"], false, request.signal);
-		return decode(NATIVE_REVIEW_OPERATION.SDD_STATUS, false, () => {
-			const body = exactObject(result, ["schemaName", "schemaVersion", "changeName", "artifactStore", "planningHome", "changeRoot", "artifactPaths", "contextFiles", "artifacts", "taskProgress", "dependencies", "applyState", "actionContext", "relationships", "remediationState", "nextRecommended", "blockedReasons"], ["reviewGate", "reviewTransaction", "phaseInstructions"]);
-			if (body.schemaName !== "gentle-ai.sdd-status" || body.schemaVersion !== 1 || body.changeName !== request.change || !["openspec", "engram", "none"].includes(body.artifactStore as string) || !["blocked", "all_done", "ready"].includes(body.applyState as string)) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.SDD_STATUS, false, "native status identity mismatch");
-			const paths = ["proposal", "specs", "design", "tasks", "applyProgress", "verifyReport", "reviewPolicy", "reviewLedger", "reviewReceipt", "reviewBundle", "reviewContext", "reviewState"];
-			const pathMap = (value: unknown) => { const parsed = exactObject(value, paths); for (const path of paths) stringArray(parsed[path]); };
-			const planningHome = exactObject(body.planningHome, ["mode", "path"]);
-			if (planningHome.mode !== "repo-local") throw new Error("invalid planning home");
-			requiredString(planningHome.path); requiredString(body.changeRoot); pathMap(body.artifactPaths); pathMap(body.contextFiles);
-			const artifactStates = paths.filter((path) => path !== "reviewPolicy" || body.artifactStore === NATIVE_SDD_ARTIFACT_STORE.ENGRAM);
-			const artifacts = exactObject(body.artifacts, artifactStates);
-			for (const path of artifactStates) if (!Object.values(NATIVE_SDD_ARTIFACT_STATE).includes(artifacts[path] as NativeSddArtifactState)) throw new Error("invalid artifact state");
-			const taskProgress = exactObject(body.taskProgress, ["total", "completed", "pending", "allComplete"]);
-			const total = nonNegativeInteger(taskProgress.total), completed = nonNegativeInteger(taskProgress.completed), pending = nonNegativeInteger(taskProgress.pending);
-			if (typeof taskProgress.allComplete !== "boolean" || completed + pending !== total || taskProgress.allComplete !== (pending === 0)) throw new Error("invalid task progress");
-			const dependencies = exactObject(body.dependencies, ["proposal", "specs", "design", "tasks", "apply", "verify", "archive"]);
-			for (const phase of ["proposal", "specs", "design", "tasks", "apply", "verify", "archive"]) if (!["blocked", "ready", "all_done"].includes(dependencies[phase] as string)) throw new Error("invalid dependency state");
-			const actionContext = exactObject(body.actionContext, ["mode", "workspaceRoot", "allowedEditRoots"]);
-			if (actionContext.mode !== "repo-local" || requiredString(actionContext.workspaceRoot).length === 0 || stringArray(actionContext.allowedEditRoots).length === 0) throw new Error("invalid action context");
-			const relationships = exactObject(body.relationships, ["dependsOn", "supersedes", "amends", "conflictsWith", "sameDomainActiveChanges"]);
-			for (const field of ["dependsOn", "supersedes", "amends", "conflictsWith", "sameDomainActiveChanges"]) stringArray(relationships[field]);
-			const remediation = exactObject(body.remediationState, ["required", "complete", "failedEvidenceRevision", "lineageId", "generation", "fixBatch", "reason"], ["correctionBudget"]);
-			if (typeof remediation.required !== "boolean" || typeof remediation.complete !== "boolean" || ["failedEvidenceRevision", "lineageId", "reason"].some((field) => typeof remediation[field] !== "string")) throw new Error("invalid remediation state");
-			nonNegativeInteger(remediation.generation); nonNegativeInteger(remediation.fixBatch);
-			if (remediation.correctionBudget !== undefined) nonNegativeInteger(remediation.correctionBudget);
-			if (body.phaseInstructions !== undefined) {
-				const instructions = exactObject(body.phaseInstructions, ["apply", "verify", "remediate", "archive"]);
-				for (const phase of ["apply", "verify", "remediate", "archive"]) stringArray(instructions[phase]);
-			}
-			const nextRecommended = requiredString(body.nextRecommended);
-			if (!(NATIVE_SDD_NEXT_ACTION as readonly string[]).includes(nextRecommended)) throw new Error("unknown SDD next action");
-			const blockedReasons = stringArray(body.blockedReasons);
-			const { reviewGate: _reviewGate, reviewTransaction: _reviewTransaction, ...status } = body;
-			void _reviewGate;
-			void _reviewTransaction;
-			return {
-				...status,
-				artifactStore: body.artifactStore as NativeSddArtifactStore,
-				artifacts: artifacts as unknown as NativeSddArtifactStates,
-				nextRecommended,
-				ready: (nextRecommended === "verify" || nextRecommended === "archive") && blockedReasons.length === 0,
-			};
-		});
-	}
-
 	async reclaim(request: NativeReviewReclaimRequest): Promise<NativeReviewRecoveryResult> {
 		for (const [name, value] of [["lineage", request.lineage], ["actor", request.actor], ["reason", request.reason]] as const) {
 			if (!isCanonicalProcessString(value)) throw new TypeError(`Native RECLAIM ${name} must be a non-empty, trimmed, NUL-free string`);
@@ -1669,6 +1592,19 @@ function exactConsentOption(arguments_: readonly string[], name: string): string
 	return values[0]!;
 }
 
+// A Pi consent envelope is bound to Pi only when every exact provider replay
+// path carries exactly one `--agent pi` option. The outer envelope agent alone
+// cannot bind an omitted, embedded, duplicated, or conflicting invocation.
+function validatePiConsentChoiceAgentBindings(consent: ReviewConsentEnvelope): void {
+	if (!("agent" in consent) || consent.agent !== "pi") return;
+	for (const choice of consent.choices) {
+		const arguments_ = splitNativeConsentInvocation(choice.invocation).slice(1);
+		if (exactConsentOption(arguments_, "--agent") !== "pi") {
+			throw new NativeReviewConsentBindingError("consent-invocation-agent-changed", "Native Pi consent invocation agent binding changed");
+		}
+	}
+}
+
 function optionalConsentLineageOption(arguments_: readonly string[]): string | undefined {
 	const values: string[] = [];
 	for (let index = 0; index < arguments_.length; index += 1) {
@@ -1693,6 +1629,7 @@ interface ConsentInvocation {
 }
 
 function consentInvocationArguments(request: NativeReviewConsentAnswerRequest): ConsentInvocation {
+	validatePiConsentChoiceAgentBindings(request.consent);
 	const choice = request.consent.choices.find((candidate) => candidate.answer === request.answer);
 	if (choice === undefined) throw new NativeReviewConsentBindingError("consent-answer-unknown", "Native consent answer must be granted or declined");
 	const words = splitNativeConsentInvocation(choice.invocation);
@@ -1818,6 +1755,11 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		signal: AbortSignal | undefined,
 		path: string,
 		toleratedStderr: readonly string[] = [],
+		// A successful acknowledgement burns its authority and prints nothing:
+		// there is no receipt left to describe. Only that shape opts out of the
+		// body, and only for a zero exit; a non-zero exit still has to produce
+		// its typed failure envelope like every other operation.
+		expectsBody = true,
 	): Promise<NegotiatedExecution> {
 		let result: ExecFileResult;
 		try {
@@ -1830,6 +1772,11 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		if (result.timedOut) throw nativeError(NATIVE_REVIEW_ERROR_CODE.TIMEOUT, operation, mutating, "native process timed out", result);
 		if (result.signal) throw nativeError(NATIVE_REVIEW_ERROR_CODE.SIGNAL, operation, mutating, "native process was signalled", result);
 		const diagnostics = nativeProcessDiagnostics(operation, NATIVE_REVIEW_ERROR_CODE.NON_ZERO, result);
+		if (!expectsBody && result.exitCode === 0) {
+			if (result.stdout.trim().length > 0) throw nativeError(NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE, operation, mutating, "native bodyless operation returned output", result);
+			if (result.stderr.trim().length > 0 && !stderrIsTolerated(result.stderr, toleratedStderr)) throw nativeError(NATIVE_REVIEW_ERROR_CODE.UNEXPECTED_STDERR, operation, mutating, "native process wrote stderr", result);
+			return { body: {}, exitCode: result.exitCode };
+		}
 		const body = parseJson(result.stdout, operation, mutating, diagnostics);
 		if (result.exitCode !== 0) {
 			try {
@@ -1897,11 +1844,12 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		// v2.1+) emits consent/v3, and any other identity fails closed inside
 		// the v3 decoder's exact identity gate.
 		if (execution.body.action === "consent_required") {
-			const consent = decode(NATIVE_REVIEW_OPERATION.START, true, () => (
-				execution.body.schema === "gentle-ai.review-integration.consent/v2"
-					? decodeReviewConsentV2(execution.body)
-					: decodeReviewConsentV3(execution.body, "pi")
-			));
+			const consent = decode(NATIVE_REVIEW_OPERATION.START, true, () => {
+				if (execution.body.schema === "gentle-ai.review-integration.consent/v2") return decodeReviewConsentV2(execution.body);
+				const decoded = decodeReviewConsentV3(execution.body, "pi");
+				validatePiConsentChoiceAgentBindings(decoded);
+				return decoded;
+			});
 			if (consent.targetIdentity !== targetIdentity || consent.projection !== projection) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native consent target binding mismatch");
 			throw new NativeReviewConsentRequiredError(consent);
 		}
@@ -2052,6 +2000,20 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		}
 	}
 
+	// Relays the provider-issued acknowledgement exactly as rendered. A success
+	// burns the authority and its artifacts and prints nothing, so there is no
+	// body to decode and nothing survives to describe; a refusal still arrives
+	// as the ordinary typed failure envelope.
+	async acknowledgeApproved(request: NativeReviewAcknowledgeApprovedRequest): Promise<void> {
+		if (request.argumentTokens.length === 0) throw new TypeError("Native ACKNOWLEDGE_APPROVED requires the provider-issued argument tokens");
+		if (request.argumentTokens.some((token) => typeof token !== "string" || token.length === 0)) throw new TypeError("Native ACKNOWLEDGE_APPROVED argument tokens must all be non-empty strings");
+		if (request.argumentTokens.some((token) => token.includes("{{value}}"))) throw new TypeError("Native ACKNOWLEDGE_APPROVED argument tokens carry no caller-substituted value");
+		const executable = this.executablePath(NATIVE_REVIEW_OPERATION.ACKNOWLEDGE_APPROVED, true);
+		await this.invoke(NATIVE_REVIEW_OPERATION.ACKNOWLEDGE_APPROVED, request.cwd, [
+			"review", "acknowledge-approved", ...request.argumentTokens,
+		], true, request.signal, executable, [], false);
+	}
+
 	async captureCorrectionPlan(request: NativeReviewCorrectionPlanCaptureRequest): Promise<ReviewLastEventClosureV1> {
 		if (request.argumentTokens.length === 0) throw new TypeError("Native CAPTURE_CORRECTION_PLAN requires the provider-issued argument tokens");
 		if (request.argumentTokens.some((token) => typeof token !== "string" || token.length === 0)) throw new TypeError("Native CAPTURE_CORRECTION_PLAN argument tokens must all be non-empty strings");
@@ -2141,10 +2103,6 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		return status;
 	}
 
-	sddStatus(request: NativeSddStatusRequest): Promise<NativeSddStatusResult> {
-		return this.plain.sddStatus(request);
-	}
-
 	async reviewMode(request: NativeReviewModeRequest): Promise<NativeReviewModeResult> {
 		const cwd = await canonicalNativeReviewCwd(request.cwd);
 		const mutating = request.operation !== NATIVE_REVIEW_MODE_OPERATION.STATUS;
@@ -2160,7 +2118,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 	}
 
 	// Recovery commands are version-gated plain CLI operations outside the
-	// negotiated integration-v1 contract, exactly like reviewStatus/sddStatus.
+	// negotiated integration-v1 contract, exactly like reviewStatus.
 	reclaim(request: NativeReviewReclaimRequest): Promise<NativeReviewRecoveryResult> {
 		return this.plain.reclaim(request);
 	}

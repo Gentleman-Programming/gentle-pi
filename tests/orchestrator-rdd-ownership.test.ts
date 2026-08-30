@@ -33,6 +33,20 @@ test("static prompts omit stale native RDD lifecycle mirrors", () => {
 	}
 });
 
+test("lossless blocking prompts route every closed single-select envelope through the native closed tool", () => {
+	for (const clause of [
+		"For every strictly closed single-select envelope",
+		"ask_user_choice",
+		"envelope-owned canonical option token as opaque `value`",
+		"returns exactly one `value`",
+		"externally owned open/free-text questionnaire",
+		"never for a closed domain",
+		"exact captured provider-owned choice invocation",
+	]) {
+		assert.ok(delegation.includes(clause), `lossless prompt is missing: ${clause}`);
+	}
+});
+
 test("static prompts declare one dynamic Gentle AI RDD ownership boundary", () => {
 	assert.equal(staticPrompts.split(BOUNDARY).length - 1, 1, "expected one dynamic RDD ownership boundary");
 	assert.ok(core.includes(BOUNDARY), "the Pi parent prompt owns the single boundary");
@@ -61,6 +75,16 @@ test("static prompts retain normal SDD and delegated-work guidance", () => {
 	]) {
 		assert.ok(delegation.includes(heading), `delegation lost ${heading}`);
 	}
+});
+
+test("always-on parent prompt requires a narrow writer edit surface before launch", () => {
+	assert.match(core, /Before launching (?:a )?bounded writer/i);
+	assert.match(core, /`gentle-ai-worker`/);
+	assert.match(core, /`worker`/);
+	assert.match(core, /## Allowed edit surfaces/);
+	assert.match(core, /repository-relative/i);
+	assert.match(core, /never `\.`|never a bare repository root/i);
+	assert.match(core, /do not ask the human to author paths or globs/i);
 });
 
 test("review integration documents the opaque Pi adapter and Go-owned authority boundary", () => {

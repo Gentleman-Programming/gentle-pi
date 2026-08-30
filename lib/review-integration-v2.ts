@@ -80,6 +80,8 @@ const REVIEW_LENSES = ["review-risk", "review-resilience", "review-readability",
 const RISK_REASON_CODES = ["configuration_change", "empty_content", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "process_boundary", "process_scan_limit", "service_token", "shell_source"] as const;
 const RISK_SIGNALS = ["auth", "update", "security", "payments", "permissions", "shell_process"] as const;
 const STATUS_ACTIONS = ["start", "recover", "maintainer_action", "select_lineage", "repair_authority", "stop"] as const;
+const RECEIPT_STATUSES = ["expected_missing", "present", "publication_pending", "not_applicable"] as const;
+type ReviewReceiptStatus = (typeof RECEIPT_STATUSES)[number];
 export const REVIEW_STATUS_ACTION_DISPOSITION = {
 	SCOPE_CHANGED: "scope_changed",
 	INVALIDATED: "invalidated",
@@ -313,6 +315,11 @@ export interface ReviewStatusAuthorityV1 {
 	revision: string;
 }
 
+export interface ReviewStatusReceiptV1 {
+	status: ReviewReceiptStatus;
+	identity?: string;
+}
+
 export interface ReviewStatusFrozenV1 {
 	tier: RiskLevel;
 	originalChangedLines: number;
@@ -434,6 +441,10 @@ export interface ReviewTargetedValidationFindingV1 {
 
 export interface ReviewTargetedValidationClassificationV1 {
 	findingId: string;
+	// The provider's FindingEvidence carries severity as an omitempty field, so
+	// a classification may or may not name one. Rejecting it made every
+	// targeted-validation STATUS that carried one undecodable.
+	severity?: string;
 	class: "deterministic" | "inferential";
 	causalDisposition: "introduced" | "behavior-activated" | "worsened";
 	proof: string;
@@ -485,6 +496,8 @@ export interface ReviewStatusV3 {
 	contract: typeof REVIEW_INTEGRATION_CONTRACT;
 	applicability: Exclude<ReviewAuthorityApplicability, "not_evaluated">;
 	authority?: ReviewStatusAuthorityV1;
+	/** status/v5 compatibility metadata; it is decoded but never used as routing authority. */
+	receipt?: ReviewStatusReceiptV1;
 	action: ReviewStatusAction;
 	actionDisposition?: ReviewStatusActionDisposition;
 	replayability: ReviewReplayability;
@@ -1009,7 +1022,7 @@ export function decodeReviewStartV3(value: unknown): ReviewStartV3 {
 	const body = exactRecord(value, "start", [
 		"schema", "contract", "operation", "action", "lenses_required", "lineage_id", "state", "risk_level",
 		"selected_lenses", "projection", "changed_files", "changed_lines", "correction_budget", "risk_reasons", "artifact_subjects",
-	], [...overlayFields, "changed_path_manifest", "repository_context"]);
+	], [...overlayFields, "changed_path_manifest", "repository_context", "acknowledgement"]);
 	requireIdentity(body, "gentle-ai.review-integration.start/v3", REVIEW_INTEGRATION_OPERATION.START);
 
 	// dependentRequired binds base_tree<->candidate_tree bidirectionally, and
@@ -1048,7 +1061,7 @@ export function decodeReviewStartV3(value: unknown): ReviewStartV3 {
 		if (source.capability !== "review.opaque_repository_context") throw new TypeError("start.repository_context.capability is unsupported");
 		repositoryContext = {
 			capability: "review.opaque_repository_context",
-			handle: text(source.handle, "start.repository_context.handle", { pattern: /^rctx1_[0-9a-f]{64}$/ }),
+			handle: text(source.handle, "start.repository_context.handle", { pattern: /^rctx[12]_[0-9a-f]{64}$/ }),
 			revision: sha256(source.revision, "start.repository_context.revision"),
 			targetIdentity: sha256(source.target_identity, "start.repository_context.target_identity"),
 			...(source.event_id === undefined ? {} : { eventId: sha256(source.event_id, "start.repository_context.event_id") }),
@@ -1196,7 +1209,7 @@ export function decodeAuthorityRepairAssessmentV1(value: unknown): AuthorityRepa
 // collect inputs and the execute binding.
 // ---------------------------------------------------------------------------
 
-const NEXT_TRANSITION_OPERATIONS = ["review.start", "review.recover", "review.repair"] as const;
+const NEXT_TRANSITION_OPERATIONS = ["review.start", "review.recover", "review.repair", "review.acknowledge-approved"] as const;
 
 function decodeTransitionArguments(value: unknown, label: string): readonly ReviewTransitionArgumentV3[] {
 	return array(value, label, (entry, entryLabel) => {
@@ -1314,9 +1327,11 @@ export function decodeReviewTargetedValidationRequestV1(value: unknown, label = 
 		};
 	}, { minimum: 1 });
 	const fixClassifications = array(body.fix_classifications, `${label}.fix_classifications`, (entry, entryLabel): ReviewTargetedValidationClassificationV1 => {
-		const classification = exactRecord(entry, entryLabel, ["finding_id", "class", "causal_disposition", "proof"]);
+		const classification = exactRecord(entry, entryLabel, ["finding_id", "class", "causal_disposition", "proof"], ["severity"]);
+		const severity = classification.severity === undefined ? undefined : nonempty(classification.severity, `${entryLabel}.severity`);
 		return {
 			findingId: nonempty(classification.finding_id, `${entryLabel}.finding_id`),
+			...(severity === undefined ? {} : { severity }),
 			class: enumeration(classification.class, ["deterministic", "inferential"] as const, `${entryLabel}.class`),
 			causalDisposition: enumeration(classification.causal_disposition, ["introduced", "behavior-activated", "worsened"] as const, `${entryLabel}.causal_disposition`),
 			proof: nonempty(classification.proof, `${entryLabel}.proof`),
@@ -1507,8 +1522,10 @@ export function decodeReviewNextTransitionV3(value: unknown, options: { v5?: boo
 		const lineageId = binding.lineage_id === undefined ? undefined : lineage(binding.lineage_id, "next_transition.execute.binding.lineage_id");
 		const revision = binding.revision === undefined ? undefined : sha256(binding.revision, "next_transition.execute.binding.revision");
 		const command = execute.command === undefined ? undefined : nonempty(execute.command, "next_transition.execute.command");
+		const decodedExecute: ReviewNextTransitionExecuteV3 = { operation, arguments: argumentsList, preconditions, binding: { targetIdentity, ...(lineageId === undefined ? {} : { lineageId }), ...(revision === undefined ? {} : { revision }) }, ...(command === undefined ? {} : { command }) };
+		if (operation === "review.acknowledge-approved") assertReviewApprovedAcknowledgementExecuteV1(decodedExecute);
 		if (transition.collect !== undefined) throw new TypeError("next_transition.collect is incompatible with execute");
-		return { kind, reasonCode, execute: { operation, arguments: argumentsList, preconditions, binding: { targetIdentity, ...(lineageId === undefined ? {} : { lineageId }), ...(revision === undefined ? {} : { revision }) }, ...(command === undefined ? {} : { command }) }, ...(correctionRequest === undefined ? {} : { correctionRequest }) };
+		return { kind, reasonCode, execute: decodedExecute, ...(correctionRequest === undefined ? {} : { correctionRequest }) };
 	}
 	if (kind === "collect") {
 		const collect = exactRecord(transition.collect, "next_transition.collect", ["inputs"]);
@@ -1569,10 +1586,18 @@ export function decodeReviewStatusV3(value: unknown): ReviewStatusV3 {
 	const v5 = typeof value === "object" && value !== null && (value as Record<string, unknown>).schema === "gentle-ai.review-integration.status/v5";
 	const body = exactRecord(value, "status", [
 		"schema", "contract", "operation", "applicability", "action", "replayability", "target_identity", "projection", "repair", "candidates",
-	], ["authority", "frozen", "action_disposition", "eligibility", "next_transition", "authority_target_identity", ...(v5 ? ["forecast", "repository_context", "validation_request"] : [])]);
+	], ["authority", "frozen", "action_disposition", "eligibility", "next_transition", "authority_target_identity", ...(v5 ? ["receipt", "forecast", "repository_context", "validation_request"] : [])]);
 	requireIdentity(body, v5 ? "gentle-ai.review-integration.status/v5" : "gentle-ai.review-integration.status/v3", REVIEW_INTEGRATION_OPERATION.STATUS);
 
 	const applicability = enumeration(body.applicability, ["current_target", "unrelated", "ambiguous", "corrupted"] as const, "status.applicability");
+	let receipt: ReviewStatusReceiptV1 | undefined;
+	if (body.receipt !== undefined) {
+		const source = exactRecord(body.receipt, "status.receipt", ["status"], ["identity"]);
+		receipt = {
+			status: enumeration(source.status, RECEIPT_STATUSES, "status.receipt.status"),
+			...(source.identity === undefined ? {} : { identity: sha256(source.identity, "status.receipt.identity") }),
+		};
+	}
 	let authority: ReviewStatusAuthorityV1 | undefined;
 	if (body.authority !== undefined) {
 		const source = exactRecord(body.authority, "status.authority", ["version", "lineage_id", "state", "generation", "revision"]);
@@ -1600,6 +1625,9 @@ export function decodeReviewStatusV3(value: unknown): ReviewStatusV3 {
 	}
 	if (authority?.version === REVIEW_AUTHORITY_VERSION.COMPACT_V2 && frozen === undefined) throw new TypeError("compact-v2 status requires frozen metadata");
 	if (authority?.version === REVIEW_AUTHORITY_VERSION.LEGACY_V1 && (frozen !== undefined || body.authority_target_identity !== undefined)) throw new TypeError("legacy status cannot expose frozen metadata or authority_target_identity");
+	if (authority?.version === REVIEW_AUTHORITY_VERSION.LEGACY_V1 && receipt !== undefined && receipt.status !== "expected_missing" && receipt.status !== "present") {
+		throw new TypeError("legacy status receipt is incompatible");
+	}
 
 	const action = enumeration(body.action, STATUS_ACTIONS, "status.action");
 	const actionDisposition = body.action_disposition === undefined ? undefined : enumeration(body.action_disposition, Object.values(REVIEW_STATUS_ACTION_DISPOSITION), "status.action_disposition");
@@ -1633,7 +1661,7 @@ export function decodeReviewStatusV3(value: unknown): ReviewStatusV3 {
 		if (source.capability !== "review.opaque_repository_context") throw new TypeError("status.repository_context.capability is unsupported");
 		repositoryContext = {
 			capability: "review.opaque_repository_context",
-			handle: text(source.handle, "status.repository_context.handle", { pattern: /^rctx1_[0-9a-f]{64}$/ }),
+			handle: text(source.handle, "status.repository_context.handle", { pattern: /^rctx[12]_[0-9a-f]{64}$/ }),
 			revision: sha256(source.revision, "status.repository_context.revision"),
 			targetIdentity: sha256(source.target_identity, "status.repository_context.target_identity"),
 			...(source.event_id === undefined ? {} : { eventId: sha256(source.event_id, "status.repository_context.event_id") }),
@@ -1645,6 +1673,7 @@ export function decodeReviewStatusV3(value: unknown): ReviewStatusV3 {
 		contract: REVIEW_INTEGRATION_CONTRACT,
 		applicability,
 		...(authority === undefined ? {} : { authority }),
+		...(receipt === undefined ? {} : { receipt }),
 		action,
 		...(actionDisposition === undefined ? {} : { actionDisposition }),
 		replayability,
@@ -2012,6 +2041,99 @@ export type ReviewLastEventClosureOperation = (typeof REVIEW_LAST_EVENT_CLOSURE_
 const REVIEW_LAST_EVENT_TERMINAL_STATES = ["approved", "correction_required", "escalated"] as const;
 export type ReviewLastEventClosureState = (typeof REVIEW_LAST_EVENT_TERMINAL_STATES)[number];
 
+const REVIEW_STATUS_CONTINUATION_OPERATION = {
+	STATUS: "review.status",
+} as const;
+
+export interface ReviewStatusContinuationBindingV1 {
+	targetIdentity: string;
+	lineageId?: string;
+	revision?: string;
+	repositoryContext?: string;
+}
+
+export interface ReviewStatusContinuationArtifactV1 {
+	schema: "gentle-ai.review-result-artifact/v2";
+	capability: "review.native_result_artifact";
+	sha256: string;
+	lineageId: string;
+	targetIdentity: string;
+	lens: string;
+	selectedOrder: number;
+	subjectHash: string;
+	admissionDecision: "completed";
+}
+
+export interface ReviewStatusContinuationV1 {
+	operation: typeof REVIEW_STATUS_CONTINUATION_OPERATION.STATUS;
+	arguments: readonly ReviewTransitionArgumentV3[];
+	selectorArguments?: readonly ReviewTransitionArgumentV3[];
+	preconditions: readonly ReviewTransitionArgumentV3[];
+	binding: ReviewStatusContinuationBindingV1;
+	artifacts?: readonly ReviewStatusContinuationArtifactV1[];
+	command?: string;
+	raw: Record<string, unknown>;
+}
+
+const REVIEW_APPROVED_ACKNOWLEDGEMENT_OPERATION = "review.acknowledge-approved" as const;
+
+// The exact ordered argument names the provider renders for one approved
+// acknowledgement. The list is closed and positional on the wire, so decoding
+// by position is what proves the relay is replaying the provider's own
+// invocation rather than one the host assembled.
+const REVIEW_APPROVED_ACKNOWLEDGEMENT_ARGUMENTS = ["cwd", "lineage", "target", "expected-revision", "token"] as const;
+
+export interface ReviewApprovedAcknowledgementBindingV1 {
+	lineageId: string;
+	revision: string;
+	targetIdentity: string;
+	repositoryContext?: string;
+}
+
+export interface ReviewApprovedAcknowledgementV1 {
+	operation: typeof REVIEW_APPROVED_ACKNOWLEDGEMENT_OPERATION;
+	command: string;
+	arguments: readonly ReviewTransitionArgumentV3[];
+	preconditions: readonly ReviewTransitionArgumentV3[];
+	binding: ReviewApprovedAcknowledgementBindingV1;
+	raw: Record<string, unknown>;
+}
+
+export interface ReviewApprovedAcknowledgementExecuteExpectationV1 { cwd?: string; lineageId?: string; targetIdentity?: string; revision?: string; }
+
+export type ReviewApprovedAcknowledgementExecuteTokensV1 = readonly [string, string, string, string, string];
+
+interface ReviewApprovedAcknowledgementExecuteShapeV1 { tokens: ReviewApprovedAcknowledgementExecuteTokensV1; values: readonly [string, string, string, string, string]; lineageId: string; targetIdentity: string; revision: string; }
+
+function assertReviewApprovedAcknowledgementExecuteShapeV1(execute: ReviewNextTransitionExecuteV3): ReviewApprovedAcknowledgementExecuteShapeV1 {
+	if (execute.operation !== REVIEW_APPROVED_ACKNOWLEDGEMENT_OPERATION) throw new TypeError(`acknowledgement.execute.operation must be ${REVIEW_APPROVED_ACKNOWLEDGEMENT_OPERATION}`);
+	if (execute.command === undefined) throw new TypeError("acknowledgement.execute.command is required");
+	text(execute.command, "acknowledgement.execute.command", { minimum: 1, pattern: /^gentle-ai review acknowledge-approved(?: |$)/ });
+	if (execute.arguments.length !== REVIEW_APPROVED_ACKNOWLEDGEMENT_ARGUMENTS.length) throw new TypeError(`acknowledgement.execute.arguments must carry exactly ${REVIEW_APPROVED_ACKNOWLEDGEMENT_ARGUMENTS.length} provider-issued arguments`);
+	const values = execute.arguments.map((argument, index) => { const name = REVIEW_APPROVED_ACKNOWLEDGEMENT_ARGUMENTS[index]!; if (argument.name !== name) throw new TypeError(`acknowledgement.execute.arguments[${index}].name must be ${name}`); const value = nonempty(argument.value, `acknowledgement.execute.arguments[${index}].value`); if (nonempty(argument.token, `acknowledgement.execute.arguments[${index}].token`) !== `--${name}=${value}`) throw new TypeError(`acknowledgement.execute.arguments[${index}].token must exactly match ${name}`); return value; });
+	if (execute.preconditions.length !== 1 || execute.preconditions[0]?.name !== "state" || execute.preconditions[0]?.value !== "approved") throw new TypeError("acknowledgement.execute.preconditions must be the single approved state precondition");
+	return { tokens: execute.arguments.map((argument) => argument.token!) as ReviewApprovedAcknowledgementExecuteTokensV1, values: values as readonly [string, string, string, string, string], lineageId: lineage(execute.binding.lineageId, "acknowledgement.execute.binding.lineage_id"), targetIdentity: sha256(execute.binding.targetIdentity, "acknowledgement.execute.binding.target_identity"), revision: sha256(execute.binding.revision, "acknowledgement.execute.binding.revision") };
+}
+
+/**
+ * Proves that an approved-acknowledgement execute vector is the exact closed,
+ * provider-issued burn invocation. Callers can additionally bind its values to
+ * their own current STATUS before invoking the returned tokens.
+ */
+export function assertReviewApprovedAcknowledgementExecuteV1(
+	execute: ReviewNextTransitionExecuteV3,
+	expected: ReviewApprovedAcknowledgementExecuteExpectationV1 = {},
+): ReviewApprovedAcknowledgementExecuteTokensV1 {
+	const shape = assertReviewApprovedAcknowledgementExecuteShapeV1(execute);
+	if (shape.values[1] !== shape.lineageId) throw new TypeError("acknowledgement lineage argument does not match its binding");
+	if (shape.values[2] !== shape.targetIdentity) throw new TypeError("acknowledgement target argument does not match its binding");
+	if (shape.values[3] !== shape.revision) throw new TypeError("acknowledgement revision argument does not match its binding");
+	if (expected.cwd !== undefined && shape.values[0] !== expected.cwd) throw new TypeError("acknowledgement.execute.cwd does not match the current target");
+	if (expected.lineageId !== undefined && shape.lineageId !== expected.lineageId) throw new TypeError("acknowledgement.execute.lineage does not match the current target");
+	if (expected.targetIdentity !== undefined && shape.targetIdentity !== expected.targetIdentity) throw new TypeError("acknowledgement.execute.target does not match the current target");
+	if (expected.revision !== undefined && shape.revision !== expected.revision) throw new TypeError("acknowledgement.execute.revision does not match the current target"); return shape.tokens;
+}
+
 export interface ReviewLastEventClosureV1 {
 	schema: typeof REVIEW_LAST_EVENT_CLOSURE_SCHEMA;
 	operation: ReviewLastEventClosureOperation;
@@ -2023,6 +2145,13 @@ export interface ReviewLastEventClosureV1 {
 	requestHash?: string;
 	correctionLines?: number;
 	advisoryFindings?: ReviewAdvisoryFindingsV1;
+	statusContinuation?: ReviewStatusContinuationV1;
+	acknowledgement?: ReviewApprovedAcknowledgementV1;
+	// Set when the provider sent an acknowledgement this decoder could not
+	// read. It is deliberately distinct from an absent one: the host must be
+	// able to tell "approved, nothing to run" from "approved, and the thing
+	// that ends this is present but unreadable here".
+	acknowledgementUndecodable?: true;
 }
 
 export interface ReviewLastEventClosureBinding {
@@ -2031,8 +2160,104 @@ export interface ReviewLastEventClosureBinding {
 	requestHash?: string;
 }
 
+function decodeReviewStatusContinuationArtifactV1(value: unknown, label: string): ReviewStatusContinuationArtifactV1 {
+	const artifact = exactRecord(value, label, ["schema", "capability", "sha256", "lineage_id", "target_identity", "lens", "selected_order", "subject_hash", "admission_decision"]);
+	if (artifact.schema !== "gentle-ai.review-result-artifact/v2") throw new TypeError(`${label}.schema must be gentle-ai.review-result-artifact/v2`);
+	if (artifact.capability !== "review.native_result_artifact") throw new TypeError(`${label}.capability must be review.native_result_artifact`);
+	if (artifact.admission_decision !== "completed") throw new TypeError(`${label}.admission_decision must be completed`);
+	return {
+		schema: "gentle-ai.review-result-artifact/v2",
+		capability: "review.native_result_artifact",
+		sha256: sha256(artifact.sha256, `${label}.sha256`),
+		lineageId: lineage(artifact.lineage_id, `${label}.lineage_id`),
+		targetIdentity: sha256(artifact.target_identity, `${label}.target_identity`),
+		lens: nonempty(artifact.lens, `${label}.lens`),
+		selectedOrder: integer(artifact.selected_order, `${label}.selected_order`, 0),
+		subjectHash: sha256(artifact.subject_hash, `${label}.subject_hash`),
+		admissionDecision: "completed",
+	};
+}
+
+// decodeReviewApprovedAcknowledgementV1 retains the closure-specific wire
+// boundary with the shared shape validator; its semantic binding stays outside
+// the defensive closure catch in the exported assertion.
+function decodeReviewApprovedAcknowledgementV1(value: unknown, label: string): ReviewApprovedAcknowledgementV1 {
+	const body = exactRecord(value, label, ["operation", "command", "arguments", "preconditions", "binding"]);
+	const argumentsList = decodeTransitionArguments(body.arguments, `${label}.arguments`);
+	const preconditions = decodeTransitionArguments(body.preconditions, `${label}.preconditions`);
+	const sourceBinding = exactRecord(body.binding, `${label}.binding`, ["lineage_id", "revision", "target_identity"], ["repository_context"]);
+	const repositoryContext = sourceBinding.repository_context === undefined
+		? undefined
+		: text(sourceBinding.repository_context, `${label}.binding.repository_context`, { pattern: /^rctx[12]_[0-9a-f]{64}$/ });
+	const acknowledgement = {
+		operation: body.operation,
+		command: body.command,
+		arguments: argumentsList,
+		preconditions,
+		binding: {
+			lineageId: sourceBinding.lineage_id,
+			revision: sourceBinding.revision,
+			targetIdentity: sourceBinding.target_identity,
+			...(repositoryContext === undefined ? {} : { repositoryContext }),
+		},
+	} as unknown as ReviewNextTransitionExecuteV3;
+	const shape = assertReviewApprovedAcknowledgementExecuteShapeV1(acknowledgement);
+	return {
+		operation: REVIEW_APPROVED_ACKNOWLEDGEMENT_OPERATION,
+		command: acknowledgement.command!,
+		arguments: argumentsList,
+		preconditions,
+		binding: {
+			lineageId: shape.lineageId,
+			revision: shape.revision,
+			targetIdentity: shape.targetIdentity,
+			...(repositoryContext === undefined ? {} : { repositoryContext }),
+		},
+		raw: body,
+	};
+}
+
+function decodeReviewStatusContinuationV1(value: unknown): ReviewStatusContinuationV1 {
+	const body = exactRecord(value, "last_event_closure.status_continuation", ["operation", "arguments", "preconditions", "binding"], ["command", "selector_arguments", "artifacts"]);
+	if (body.operation !== REVIEW_STATUS_CONTINUATION_OPERATION.STATUS) throw new TypeError("last_event_closure.status_continuation.operation must be review.status");
+	const argumentsList = decodeTransitionArguments(body.arguments, "last_event_closure.status_continuation.arguments");
+	if (argumentsList.some((argument) => argument.token === undefined)) throw new TypeError("last_event_closure.status_continuation.arguments require exact tokens");
+	const preconditions = decodeTransitionArguments(body.preconditions, "last_event_closure.status_continuation.preconditions");
+	if (preconditions.length === 0) throw new TypeError("last_event_closure.status_continuation.preconditions requires at least one entry");
+	const sourceBinding = exactRecord(body.binding, "last_event_closure.status_continuation.binding", ["target_identity"], ["lineage_id", "revision", "repository_context"]);
+	const lineageId = sourceBinding.lineage_id === undefined ? undefined : lineage(sourceBinding.lineage_id, "last_event_closure.status_continuation.binding.lineage_id");
+	const revision = sourceBinding.revision === undefined ? undefined : sha256(sourceBinding.revision, "last_event_closure.status_continuation.binding.revision");
+	const repositoryContext = sourceBinding.repository_context === undefined
+		? undefined
+		: text(sourceBinding.repository_context, "last_event_closure.status_continuation.binding.repository_context", { pattern: /^rctx[12]_[0-9a-f]{64}$/ });
+	const selectorArguments = body.selector_arguments === undefined
+		? undefined
+		: decodeTransitionArguments(body.selector_arguments, "last_event_closure.status_continuation.selector_arguments");
+	const artifacts = body.artifacts === undefined
+		? undefined
+		: array(body.artifacts, "last_event_closure.status_continuation.artifacts", decodeReviewStatusContinuationArtifactV1);
+	const command = body.command === undefined
+		? undefined
+		: text(body.command, "last_event_closure.status_continuation.command", { minimum: 1, pattern: /^gentle-ai review [a-z][a-z-]*/ });
+	return {
+		operation: REVIEW_STATUS_CONTINUATION_OPERATION.STATUS,
+		arguments: argumentsList,
+		...(selectorArguments === undefined ? {} : { selectorArguments }),
+		preconditions,
+		binding: {
+			targetIdentity: sha256(sourceBinding.target_identity, "last_event_closure.status_continuation.binding.target_identity"),
+			...(lineageId === undefined ? {} : { lineageId }),
+			...(revision === undefined ? {} : { revision }),
+			...(repositoryContext === undefined ? {} : { repositoryContext }),
+		},
+		...(artifacts === undefined ? {} : { artifacts }),
+		...(command === undefined ? {} : { command }),
+		raw: body,
+	};
+}
+
 export function decodeReviewLastEventClosureV1(value: unknown): ReviewLastEventClosureV1 {
-	const body = exactRecord(value, "last_event_closure", ["schema", "operation", "lineage_id", "state", "store_revision"], ["target_identity", "request_hash", "correction_lines", "action", "advisory_findings"]);
+	const body = exactRecord(value, "last_event_closure", ["schema", "operation", "lineage_id", "state", "store_revision"], ["target_identity", "request_hash", "correction_lines", "action", "advisory_findings", "status_continuation", "acknowledgement"]);
 	if (body.schema !== REVIEW_LAST_EVENT_CLOSURE_SCHEMA) throw new TypeError(`last_event_closure.schema must be ${REVIEW_LAST_EVENT_CLOSURE_SCHEMA}`);
 	const operation = enumeration(body.operation, Object.values(REVIEW_LAST_EVENT_CLOSURE_OPERATION), "last_event_closure.operation") as ReviewLastEventClosureOperation;
 	const state = enumeration(body.state, REVIEW_LAST_EVENT_TERMINAL_STATES, "last_event_closure.state") as ReviewLastEventClosureState;
@@ -2044,7 +2269,7 @@ export function decodeReviewLastEventClosureV1(value: unknown): ReviewLastEventC
 		storeRevision: sha256(body.store_revision, "last_event_closure.store_revision"),
 	};
 	if (operation === REVIEW_LAST_EVENT_CLOSURE_OPERATION.CAPTURE_CORRECTION_PLAN) {
-		if (body.action !== undefined || body.advisory_findings !== undefined) throw new TypeError("last_event_closure correction-plan cannot carry action or advisory_findings");
+		if (body.action !== undefined || body.advisory_findings !== undefined || body.status_continuation !== undefined) throw new TypeError("last_event_closure correction-plan cannot carry action, advisory_findings, or status_continuation");
 		if (state !== "correction_required") throw new TypeError("last_event_closure correction-plan requires correction_required state");
 		return {
 			...shared,
@@ -2054,6 +2279,58 @@ export function decodeReviewLastEventClosureV1(value: unknown): ReviewLastEventC
 		};
 	}
 	if (body.target_identity !== undefined || body.request_hash !== undefined || body.correction_lines !== undefined) throw new TypeError("last_event_closure terminal capture cannot carry correction-plan fields");
+	const requiresStatusContinuation = state === "correction_required" && (
+		operation === REVIEW_LAST_EVENT_CLOSURE_OPERATION.CAPTURE_RESULT || operation === REVIEW_LAST_EVENT_CLOSURE_OPERATION.CAPTURE_REFUTER
+	);
+	if (requiresStatusContinuation && body.status_continuation === undefined) throw new TypeError("last_event_closure requires status_continuation for correction-required result or refuter capture");
+	if (!requiresStatusContinuation && body.status_continuation !== undefined) throw new TypeError("last_event_closure status_continuation is only valid for correction-required result or refuter capture");
+	const statusContinuation = body.status_continuation === undefined ? undefined : decodeReviewStatusContinuationV1(body.status_continuation);
+	if (statusContinuation !== undefined) {
+		if (statusContinuation.binding.lineageId !== shared.lineageId) {
+			throw new TypeError("last_event_closure status continuation lineage does not match its enclosing closure");
+		}
+		if (statusContinuation.binding.revision !== shared.storeRevision) {
+			throw new TypeError("last_event_closure status continuation revision does not match its enclosing closure");
+		}
+		const lineageArguments = statusContinuation.arguments.filter((argument) => argument.name === "lineage");
+		if (lineageArguments.length !== 1 || lineageArguments[0]?.value !== shared.lineageId || lineageArguments[0]?.token !== `--lineage=${shared.lineageId}`) {
+			throw new TypeError("last_event_closure status continuation lineage argument does not match its enclosing closure");
+		}
+	}
+	// Only an approved closure may carry the continuation that burns its
+	// authority: any other state offering an acknowledgement would be inviting
+	// a burn the provider never authorized.
+	//
+	// It stays optional because the pinned installer binary predates it. A
+	// provider that emits one is decoded strictly; a provider that does not is
+	// still the contract this build ships against. Requiring it belongs with
+	// the pin bump that makes it always present.
+	// Decoded defensively on purpose. This decoder pins the acknowledgement to a
+	// closed positional shape, and the same patch that added it already shows
+	// what strictness costs when the provider moves: rejecting one omitempty
+	// field made every targeted-validation STATUS that carried it undecodable.
+	// Here the blast radius would be worse than a lost field. Throwing would
+	// fail the whole approved closure, so the host would lose the approval
+	// outcome AND the only invocation that burns the authority, leaving the
+	// lineage approved and un-burnable at once. An unreadable continuation
+	// degrades to a flag; everything else about the approval still arrives.
+	let acknowledgement: ReviewApprovedAcknowledgementV1 | undefined;
+	let acknowledgementUndecodable = false;
+	if (body.acknowledgement !== undefined) {
+		try {
+			acknowledgement = decodeReviewApprovedAcknowledgementV1(body.acknowledgement, "last_event_closure.acknowledgement");
+		} catch {
+			acknowledgement = undefined;
+			acknowledgementUndecodable = true;
+		}
+	}
+	if (acknowledgementUndecodable && state !== "approved") {
+		throw new TypeError("last_event_closure acknowledgement requires approved state");
+	}
+	if (acknowledgement !== undefined) {
+		if (state !== "approved") throw new TypeError("last_event_closure acknowledgement requires approved state");
+		assertReviewApprovedAcknowledgementExecuteV1(acknowledgement, { lineageId: shared.lineageId, revision: shared.storeRevision });
+	}
 	const action = nonempty(body.action, "last_event_closure.action");
 	const advisoryFindings = body.advisory_findings === undefined
 		? undefined
@@ -2063,6 +2340,9 @@ export function decodeReviewLastEventClosureV1(value: unknown): ReviewLastEventC
 		...shared,
 		action,
 		...(advisoryFindings === undefined ? {} : { advisoryFindings }),
+		...(statusContinuation === undefined ? {} : { statusContinuation }),
+		...(acknowledgement === undefined ? {} : { acknowledgement }),
+		...(acknowledgementUndecodable ? { acknowledgementUndecodable: true as const } : {}),
 	};
 }
 
@@ -2073,6 +2353,9 @@ export function assertReviewLastEventClosureBinding(
 	if (closure.lineageId !== binding.lineageId) throw new TypeError("last_event_closure lineage does not match its provider binding");
 	if (binding.targetIdentity !== undefined && closure.targetIdentity !== undefined && closure.targetIdentity !== binding.targetIdentity) {
 		throw new TypeError("last_event_closure target does not match its provider binding");
+	}
+	if (binding.targetIdentity !== undefined && closure.statusContinuation !== undefined && closure.statusContinuation.binding.targetIdentity !== binding.targetIdentity) {
+		throw new TypeError("last_event_closure status continuation target does not match its provider binding");
 	}
 	if (binding.requestHash !== undefined && closure.requestHash !== undefined && closure.requestHash !== binding.requestHash) {
 		throw new TypeError("last_event_closure request hash does not match its provider binding");

@@ -49,6 +49,8 @@ Core question: does this inflate parent context without need?
 
 The canonical per-action table is the mirrored gentle-ai canon Delegation Rules table in `orchestrator-delegation.md`.
 
+Before launching bounded writer (`gentle-ai-worker` or `worker`), task/context needs nonempty `## Allowed edit surfaces`: narrow repository-relative paths/globs; never `.`, bare repo root, or absolute. Parent derives surfaces, maps unknown targets read-only, shows derived candidates only for genuine scope choices. Do not ask the human to author paths or globs.
+
 Mandatory Delegation Triggers — stop rules; once fired, delegate through the best available subagent runtime (prefer `subagent_run`, else Pi's native `Agent`):
 
 1. **4-file rule** — 4+ files to understand → delegate a scout/mapping task.

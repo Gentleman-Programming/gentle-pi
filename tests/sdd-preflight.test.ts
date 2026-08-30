@@ -251,3 +251,32 @@ test("forced asset refresh migrates only untouched v0.14 package contracts and p
 		rmSync(temporaryAgentHome, { recursive: true, force: true });
 	}
 });
+
+// gentle-ai calls the dual-store mode "hybrid"; this repo called the same
+// operator-facing choice "both". Two names for one concept is how a caller ends
+// up mapping between them by hand. gentle-ai owns the contract, so "hybrid" is
+// canonical here too — but "both" is already persisted in operator preflight
+// files on disk, so it must keep loading rather than fall back to the default.
+test("a persisted legacy 'both' artifact store loads as hybrid", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "sdd-preflight-legacy-"));
+	mkdirSync(join(cwd, ".pi", "gentle-ai"), { recursive: true });
+	writeFileSync(
+		sddPreflightDiskPath(cwd),
+		JSON.stringify({ executionMode: "auto", artifactStore: "hybrid", chainedPrStrategy: "ask-on-risk", reviewBudgetLines: 400, engramAvailable: true, prompted: true }),
+	);
+
+	const loaded = readSddPreflightFromDisk(cwd, true);
+	assert.equal(loaded?.artifactStore, "hybrid", "legacy 'both' must normalize to the canonical name, not be discarded");
+});
+
+test("a persisted canonical 'hybrid' artifact store loads unchanged", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "sdd-preflight-hybrid-"));
+	mkdirSync(join(cwd, ".pi", "gentle-ai"), { recursive: true });
+	writeFileSync(
+		sddPreflightDiskPath(cwd),
+		JSON.stringify({ executionMode: "auto", artifactStore: "hybrid", chainedPrStrategy: "ask-on-risk", reviewBudgetLines: 400, engramAvailable: true, prompted: true }),
+	);
+
+	const loaded = readSddPreflightFromDisk(cwd, true);
+	assert.equal(loaded?.artifactStore, "hybrid");
+});

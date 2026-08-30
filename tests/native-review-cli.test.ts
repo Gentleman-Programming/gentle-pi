@@ -53,16 +53,12 @@ function client(adapter: ExecFileAdapter): NativeReviewCliV216 {
 	return new NativeReviewCliV216(adapter, "/package/.gentle-ai/gentle-ai", 30_000, 1024 * 1024);
 }
 
-test("negotiated STATUS rejects the retired receipt payload before any lifecycle advance", async () => {
-	// The pinned historical status fixture intentionally retains the retired
-	// receipt surface. Keep its bytes unchanged and require an explicit decoder
-	// refusal rather than treating it as a current lifecycle authority.
-	const status = readFileSync(join(process.cwd(), "contracts", "review-integration", "v2", "fixtures", "status.fixture.json"), "utf8");
-	const queue = queuedAdapter([{ stdout: status }]);
-	await assert.rejects(
-		() => client(queue.adapter).targetStatus({ cwd: "/repo", lineageId: "review-status-fixture", agent: "pi" }),
-		(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE,
-	);
+test("negotiated STATUS accepts the pinned v5 receipt before routing its transition", async () => {
+	const status = fixture("status-v5.captured.json");
+	const queue = queuedAdapter([{ stdout: JSON.stringify(status) }]);
+	const result = await client(queue.adapter).targetStatus({ cwd: "/repo", lineageId: "review-status-fixture", agent: "pi" });
+	assert.deepEqual(result.receipt, { status: "not_applicable" });
+	assert.equal(result.nextTransition?.kind, "collect");
 	assert.deepEqual(queue.calls[0]?.arguments, [
 		"review", "status", "--contract", "gentle-ai.review-integration/v2", "--cwd", "/repo",
 		"--projection", "workspace", "--lineage", "review-status-fixture", "--agent", "pi", "--next-transition",
@@ -146,11 +142,7 @@ test("malformed closure output remains a typed schema failure and never authoriz
 });
 
 function currentStatusFixture(): Record<string, unknown> {
-	const status = fixture("status-v5.captured.json");
-	// Preserve the captured historical bytes on disk while excluding the receipt
-	// field that #404 explicitly retired from the current STATUS decoder.
-	delete status.receipt;
-	return status;
+	return fixture("status-v5.captured.json");
 }
 
 function negotiatedStartStatus(targetIdentity: string, tokens: readonly string[]): Record<string, unknown> {
@@ -468,14 +460,8 @@ test("capture-result receives the controller AbortSignal without an automatic mu
 	assert.equal(receivedTimeout, undefined);
 });
 
-test("native SDD status retains its read-only exact argv and current readiness projection", async () => {
-	const document = readFileSync(join(process.cwd(), "tests", "fixtures", "native-review-cli", "v2.1.3", "sdd-status.json"), "utf8");
-	const queue = queuedAdapter([{ stdout: document }]);
-	const result = await client(queue.adapter).sddStatus({ cwd: "/repo", change: "native-review-authority-parity" });
-	assert.equal(result.ready, true);
-	assert.equal(result.artifactStore, "openspec");
-	assert.deepEqual(queue.calls[0]?.arguments, ["sdd-status", "native-review-authority-parity", "--cwd", "/repo", "--json", "--instructions"]);
-	assert.equal(queue.calls[0]?.timeoutMs, 30_000);
+test("native review client leaves SDD status resolution to the local SDD engine", () => {
+	assert.equal("sddStatus" in client(queuedAdapter([]).adapter), false);
 });
 
 test("read-only authority inventory rejects a repository identity mismatch after decoding", async () => {
@@ -490,32 +476,6 @@ test("read-only authority inventory rejects a repository identity mismatch after
 	assert.deepEqual(queue.calls[0]?.arguments, ["review", "status", "--cwd", "/repo"]);
 });
 
-test("native SDD STATUS keeps the published optional correction budget and Engram artifact store", async () => {
-	const source = fixture("../native-review-cli/v2.1.3/sdd-status.json");
-	const remediationState = source.remediationState as Record<string, unknown>;
-	for (const correctionBudget of [undefined, 0, 17]) {
-		const queue = queuedAdapter([{ stdout: JSON.stringify({
-			...source,
-			remediationState: {
-				...remediationState,
-				...(correctionBudget === undefined ? {} : { correctionBudget }),
-			},
-		}) }]);
-		const status = await client(queue.adapter).sddStatus({ cwd: "/repo", change: "native-review-authority-parity" });
-		assert.equal((status.remediationState as Record<string, unknown>).correctionBudget, correctionBudget);
-	}
-	for (const correctionBudget of [-1, 1.5]) {
-		const queue = queuedAdapter([{ stdout: JSON.stringify({ ...source, remediationState: { ...remediationState, correctionBudget } }) }]);
-		await assert.rejects(
-			() => client(queue.adapter).sddStatus({ cwd: "/repo", change: "native-review-authority-parity" }),
-			(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE,
-		);
-	}
-	const engram = queuedAdapter([{ stdout: JSON.stringify(fixture("../native-review-cli/v2.1.3/sdd-status-engram.json")) }]);
-	const engramStatus = await client(engram.adapter).sddStatus({ cwd: "/repo", change: "native-review-authority-parity" });
-	assert.equal(engramStatus.artifactStore, "engram");
-	assert.equal(engramStatus.artifacts.reviewPolicy, "done");
-});
 
 test("current native process boundary preserves caps, timeout classes, and sanitized diagnostics", async () => {
 	const calls: Array<{ timeoutMs: number | undefined; maxBufferBytes: number }> = [];

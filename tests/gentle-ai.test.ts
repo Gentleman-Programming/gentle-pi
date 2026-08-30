@@ -484,6 +484,7 @@ test("delivery commands bypass RDD under every mode outcome while command safety
 			on(name: string, handler: ToolCallHandler) {
 				handlers.set(name, handler);
 			},
+			events: { emit() {} },
 			registerCommand() {},
 			registerTool() {},
 		} as unknown as ExtensionAPI;
@@ -503,6 +504,491 @@ test("delivery commands bypass RDD under every mode outcome while command safety
 	}
 });
 
+test("guarded command confirmation emits a generic correlated permission lifecycle", async () => {
+	type ToolCallHandler = (
+		event: { toolName: string; input: unknown },
+		ctx: ExtensionContext,
+	) => Promise<ToolCallEventResult | undefined>;
+	type PermissionEvent = {
+		channel: string;
+		data: {
+			requestId: string;
+			state: "waiting" | "approved" | "denied";
+			source: "tool_call";
+			message: string;
+			toolName: "bash";
+		};
+	};
+	type HerdrBlockedEvent = {
+		channel: "herdr:blocked";
+		data: { active: boolean; label?: string };
+	};
+	type EmittedEvent = PermissionEvent | HerdrBlockedEvent;
+	const handlers = new Map<string, ToolCallHandler>();
+	const emitted: EmittedEvent[] = [];
+	const sequence: string[] = [];
+	let confirm!: () => Promise<boolean>;
+	const pi = {
+		on(name: string, handler: ToolCallHandler) {
+			handlers.set(name, handler);
+		},
+		events: {
+			emit(channel: string, data: EmittedEvent["data"]) {
+				sequence.push(
+					channel === "herdr:blocked"
+						? `herdr:${"active" in data && data.active ? "active" : "inactive"}`
+						: `event:${data.state}`,
+				);
+				emitted.push({ channel, data } as EmittedEvent);
+			},
+		},
+		registerCommand() {},
+		registerTool() {},
+	} as unknown as ExtensionAPI;
+	createGentleAiExtension({ nativeReviewCli: null })(pi);
+	const toolCall = handlers.get("tool_call");
+	assert.equal(typeof toolCall, "function");
+	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-permission-request-"));
+	try {
+		const ctx = {
+			cwd,
+			hasUI: true,
+			ui: {
+				confirm: async () => {
+					sequence.push("confirm");
+					return confirm();
+				},
+			},
+		} as ExtensionContext;
+		let resolveConfirmation!: (approved: boolean) => void;
+		confirm = () => new Promise<boolean>((resolve) => { resolveConfirmation = resolve; });
+		const denied = toolCall!({
+			toolName: "bash",
+			input: { command: "git rebase main --secret-command-content" },
+		}, ctx);
+
+		await Promise.resolve();
+		assert.equal(emitted[0].channel, "pi-permission-system:permission-request");
+		assert.equal(emitted[0].data.state, "waiting");
+		assert.deepEqual(emitted[1], {
+			channel: "herdr:blocked",
+			data: { active: true, label: "Guarded command confirmation" },
+		});
+		assert.deepEqual(sequence, ["event:waiting", "herdr:active", "confirm"]);
+		const deniedRequestId = emitted[0].data.requestId;
+		assert.match(deniedRequestId, /^[0-9a-f-]{36}$/);
+		assert.deepEqual(emitted[0].data, {
+			requestId: deniedRequestId,
+			state: "waiting",
+			source: "tool_call",
+			message: "Gentle AI safety policy requires confirmation for this tool call.",
+			toolName: "bash",
+		});
+		assert.equal(Object.keys(emitted[0].data).includes("command"), false);
+		assert.equal(Object.keys(emitted[0].data).includes("preview"), false);
+		assert.doesNotMatch(JSON.stringify(emitted), /secret-command-content|git rebase/);
+
+		resolveConfirmation(false);
+		assert.deepEqual(await denied, {
+			block: true,
+			reason: "Gentle AI safety policy blocked the command because it was not confirmed.",
+		});
+		assert.deepEqual(emitted[2], {
+			channel: "pi-permission-system:permission-request",
+			data: {
+				requestId: deniedRequestId,
+				state: "denied",
+				source: "tool_call",
+				message: "Gentle AI safety policy requires confirmation for this tool call.",
+				toolName: "bash",
+			},
+		});
+		assert.deepEqual(emitted[3], {
+			channel: "herdr:blocked",
+			data: { active: false },
+		});
+		assert.deepEqual(sequence, ["event:waiting", "herdr:active", "confirm", "event:denied", "herdr:inactive"]);
+
+		emitted.length = 0;
+		sequence.length = 0;
+		confirm = async () => true;
+		assert.equal(await toolCall!({ toolName: "bash", input: { command: "git rebase main" } }, ctx), undefined);
+		assert.equal(emitted.length, 4);
+		assert.equal(emitted[0].data.state, "waiting");
+		assert.deepEqual(emitted[1], {
+			channel: "herdr:blocked",
+			data: { active: true, label: "Guarded command confirmation" },
+		});
+		assert.equal(emitted[2].data.state, "approved");
+		assert.equal(emitted[0].data.requestId, emitted[2].data.requestId);
+		assert.notEqual(emitted[0].data.requestId, deniedRequestId);
+		assert.deepEqual(emitted[3], {
+			channel: "herdr:blocked",
+			data: { active: false },
+		});
+		assert.deepEqual(sequence, ["event:waiting", "herdr:active", "confirm", "event:approved", "herdr:inactive"]);
+
+		emitted.length = 0;
+		sequence.length = 0;
+		const confirmationError = new Error("confirmation unavailable");
+		confirm = async () => { throw confirmationError; };
+		await assert.rejects(
+			toolCall!({ toolName: "bash", input: { command: "git rebase main" } }, ctx),
+			(error) => error === confirmationError,
+		);
+		assert.equal(emitted.length, 4);
+		assert.equal(emitted[0].data.state, "waiting");
+		assert.deepEqual(emitted[1], {
+			channel: "herdr:blocked",
+			data: { active: true, label: "Guarded command confirmation" },
+		});
+		assert.equal(emitted[2].data.state, "denied");
+		assert.equal(emitted[0].data.requestId, emitted[2].data.requestId);
+		assert.deepEqual(emitted[3], {
+			channel: "herdr:blocked",
+			data: { active: false },
+		});
+		assert.deepEqual(sequence, ["event:waiting", "herdr:active", "confirm", "event:denied", "herdr:inactive"]);
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("concurrent guarded confirmations coalesce the Herdr lifecycle per extension instance", async () => {
+	type ToolCallHandler = (
+		event: { toolName: string; input: unknown },
+		ctx: ExtensionContext,
+	) => Promise<ToolCallEventResult | undefined>;
+	type EmittedEvent = {
+		channel: string;
+		data: {
+			requestId?: string;
+			state?: "waiting" | "approved" | "denied";
+			active?: boolean;
+			label?: string;
+		};
+	};
+	const createHarness = () => {
+		const handlers = new Map<string, ToolCallHandler>();
+		const emitted: EmittedEvent[] = [];
+		const confirmations: Array<(approved: boolean) => void> = [];
+		const pi = {
+			on(name: string, handler: ToolCallHandler) {
+				handlers.set(name, handler);
+			},
+			events: { emit(channel: string, data: EmittedEvent["data"]) { emitted.push({ channel, data }); } },
+			registerCommand() {},
+			registerTool() {},
+		} as unknown as ExtensionAPI;
+		createGentleAiExtension({ nativeReviewCli: null })(pi);
+		return { handlers, emitted, confirmations };
+	};
+	const first = createHarness();
+	const second = createHarness();
+	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-permission-concurrent-"));
+	try {
+		const context = (confirmations: Array<(approved: boolean) => void>) => ({
+			cwd,
+			hasUI: true,
+			ui: {
+				confirm: async () => new Promise<boolean>((resolve) => { confirmations.push(resolve); }),
+			},
+		} as ExtensionContext);
+		const firstRequest = first.handlers.get("tool_call")!({ toolName: "bash", input: { command: "git rebase main" } }, context(first.confirmations));
+		const secondRequest = first.handlers.get("tool_call")!({ toolName: "bash", input: { command: "git rebase main --another-command" } }, context(first.confirmations));
+		await Promise.resolve();
+		assert.deepEqual(first.emitted.map(({ channel, data }) => ({ channel, state: data.state, active: data.active })), [
+			{ channel: "pi-permission-system:permission-request", state: "waiting", active: undefined },
+			{ channel: "herdr:blocked", state: undefined, active: true },
+			{ channel: "pi-permission-system:permission-request", state: "waiting", active: undefined },
+		]);
+		assert.equal(first.confirmations.length, 2);
+		const waitingEvents = first.emitted.filter(({ channel, data }) => channel === "pi-permission-system:permission-request" && data.state === "waiting");
+		assert.notEqual(waitingEvents[0]?.data.requestId, waitingEvents[1]?.data.requestId);
+
+		first.confirmations[0]!(false);
+		assert.deepEqual(await firstRequest, {
+			block: true,
+			reason: "Gentle AI safety policy blocked the command because it was not confirmed.",
+		});
+		assert.deepEqual(first.emitted.map(({ channel, data }) => ({ channel, state: data.state, active: data.active })), [
+			{ channel: "pi-permission-system:permission-request", state: "waiting", active: undefined },
+			{ channel: "herdr:blocked", state: undefined, active: true },
+			{ channel: "pi-permission-system:permission-request", state: "waiting", active: undefined },
+			{ channel: "pi-permission-system:permission-request", state: "denied", active: undefined },
+		]);
+
+		const independentRequest = second.handlers.get("tool_call")!({ toolName: "bash", input: { command: "git rebase main --independent-command" } }, context(second.confirmations));
+		await Promise.resolve();
+		assert.equal(second.emitted.filter(({ channel }) => channel === "herdr:blocked").length, 1);
+		assert.equal(second.emitted.find(({ channel }) => channel === "herdr:blocked")?.data.active, true);
+		assert.equal(second.confirmations.length, 1);
+
+		first.confirmations[1]!(true);
+		assert.equal(await secondRequest, undefined);
+		assert.equal(first.emitted.filter(({ channel, data }) => channel === "herdr:blocked" && data.active === false).length, 1);
+		second.confirmations[0]!(true);
+		assert.equal(await independentRequest, undefined);
+		assert.deepEqual(second.emitted.map(({ channel, data }) => ({ channel, state: data.state, active: data.active })), [
+			{ channel: "pi-permission-system:permission-request", state: "waiting", active: undefined },
+			{ channel: "herdr:blocked", state: undefined, active: true },
+			{ channel: "pi-permission-system:permission-request", state: "approved", active: undefined },
+			{ channel: "herdr:blocked", state: undefined, active: false },
+		]);
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+
+test("RPIV questionnaire blockers emit only a private, balanced Herdr projection", () => {
+	type HerdrBlockedEvent = { active: boolean; label?: string };
+	const eventHandlers = new Map<string, (data: unknown) => void>();
+	const published: Array<{ channel: string; data: unknown }> = [];
+	const herdrEvents: HerdrBlockedEvent[] = [];
+	const pi = {
+		on() {},
+		events: {
+			emit(channel: string, data: unknown) {
+				published.push({ channel, data });
+				if (channel === "herdr:blocked") herdrEvents.push(data as HerdrBlockedEvent);
+				const handler = eventHandlers.get(channel);
+				if (handler) handler(data);
+			},
+			on(channel: string, handler: (data: unknown) => void) {
+				eventHandlers.set(channel, handler);
+				return () => eventHandlers.delete(channel);
+			},
+		},
+		registerCommand() {},
+		registerTool() {},
+	} as unknown as ExtensionAPI;
+	createGentleAiExtension({ nativeReviewCli: null })(pi);
+	assert.equal(eventHandlers.size, 2);
+	assert.equal(eventHandlers.has("gentle-pi:ask-user-choice:blocked"), true);
+	assert.equal(eventHandlers.has("rpiv:ask-user:blocked"), true);
+
+	const source = {
+		active: true,
+		question: "private questionnaire text",
+		answer: "private questionnaire answer",
+		path: "/private/questionnaire-path",
+		command: "private questionnaire command",
+		arbitrary: { nested: "private questionnaire field" },
+	};
+	pi.events.emit("rpiv:ask-user:blocked", source);
+	assert.strictEqual(published[0]?.data, source, "the RPIV event remains the source event");
+	assert.deepEqual(herdrEvents, [{ active: true, label: "Questionnaire awaiting input" }]);
+	assert.doesNotMatch(JSON.stringify(herdrEvents), /private questionnaire|questionnaire-path/i);
+
+	pi.events.emit("rpiv:ask-user:blocked", { active: true, duplicate: true });
+	pi.events.emit("rpiv:ask-user:blocked", { active: "true" });
+	pi.events.emit("rpiv:ask-user:blocked", { active: null });
+	pi.events.emit("rpiv:ask-user:blocked", []);
+	pi.events.emit("rpiv:ask-user:blocked", null);
+	pi.events.emit("rpiv:ask-user:other", { active: false });
+	assert.deepEqual(herdrEvents, [{ active: true, label: "Questionnaire awaiting input" }]);
+
+	pi.events.emit("rpiv:ask-user:blocked", { active: false });
+	pi.events.emit("rpiv:ask-user:blocked", { active: false, duplicate: true });
+	pi.events.emit("rpiv:ask-user:blocked", { active: true });
+	pi.events.emit("rpiv:ask-user:blocked", { active: false });
+	assert.deepEqual(herdrEvents, [
+		{ active: true, label: "Questionnaire awaiting input" },
+		{ active: false },
+		{ active: true, label: "Questionnaire awaiting input" },
+		{ active: false },
+	]);
+});
+
+test("Herdr coordinates guarded confirmations and RPIV labels without inactive relabel pulses", async () => {
+	type ToolCallHandler = (
+		event: { toolName: string; input: unknown },
+		ctx: ExtensionContext,
+	) => Promise<ToolCallEventResult | undefined>;
+	type HerdrBlockedEvent = { active: boolean; label?: string };
+	const createHarness = () => {
+		const handlers = new Map<string, ToolCallHandler>();
+		const eventHandlers = new Map<string, (data: unknown) => void>();
+		const herdrEvents: HerdrBlockedEvent[] = [];
+		const confirmations: Array<(approved: boolean) => void> = [];
+		const pi = {
+			on(name: string, handler: ToolCallHandler) {
+				handlers.set(name, handler);
+			},
+			events: {
+				emit(channel: string, data: unknown) {
+					if (channel === "herdr:blocked") herdrEvents.push(data as HerdrBlockedEvent);
+					const handler = eventHandlers.get(channel);
+					if (handler) handler(data);
+				},
+				on(channel: string, handler: (data: unknown) => void) {
+					eventHandlers.set(channel, handler);
+					return () => eventHandlers.delete(channel);
+				},
+			},
+			registerCommand() {},
+			registerTool() {},
+		} as unknown as ExtensionAPI;
+		createGentleAiExtension({ nativeReviewCli: null })(pi);
+		const context = {
+			cwd: process.cwd(),
+			hasUI: true,
+			ui: {
+				confirm: async () => new Promise<boolean>((resolve) => { confirmations.push(resolve); }),
+			},
+		} as ExtensionContext;
+		return { confirmations, context, herdrEvents, pi, toolCall: handlers.get("tool_call")! };
+	};
+
+	const guardedFirst = createHarness();
+	const guardedRequest = guardedFirst.toolCall(
+		{ toolName: "bash", input: { command: "git rebase main" } },
+		guardedFirst.context,
+	);
+	await Promise.resolve();
+	guardedFirst.pi.events.emit("rpiv:ask-user:blocked", { active: true });
+	guardedFirst.confirmations[0]!(true);
+	assert.equal(await guardedRequest, undefined);
+	assert.deepEqual(guardedFirst.herdrEvents, [
+		{ active: true, label: "Guarded command confirmation" },
+		{ active: true, label: "Questionnaire awaiting input" },
+	]);
+	guardedFirst.pi.events.emit("rpiv:ask-user:blocked", { active: false });
+	assert.deepEqual(guardedFirst.herdrEvents, [
+		{ active: true, label: "Guarded command confirmation" },
+		{ active: true, label: "Questionnaire awaiting input" },
+		{ active: false },
+	]);
+
+	const questionnaireFirst = createHarness();
+	questionnaireFirst.pi.events.emit("rpiv:ask-user:blocked", { active: true });
+	const questionnaireRequest = questionnaireFirst.toolCall(
+		{ toolName: "bash", input: { command: "git rebase main" } },
+		questionnaireFirst.context,
+	);
+	await Promise.resolve();
+	questionnaireFirst.pi.events.emit("rpiv:ask-user:blocked", { active: false });
+	questionnaireFirst.confirmations[0]!(false);
+	await questionnaireRequest;
+	assert.deepEqual(questionnaireFirst.herdrEvents, [
+		{ active: true, label: "Questionnaire awaiting input" },
+		{ active: true, label: "Guarded command confirmation" },
+		{ active: false },
+	]);
+});
+
+test("closed choice blockers retain the visible choice label through guarded-confirmation overlap", async () => {
+	type ToolCallHandler = (
+		event: { toolName: string; input: unknown },
+		ctx: ExtensionContext,
+	) => Promise<ToolCallEventResult | undefined>;
+	type HerdrBlockedEvent = { active: boolean; label?: string };
+	const handlers = new Map<string, ToolCallHandler>();
+	const eventHandlers = new Map<string, (data: unknown) => void>();
+	const herdrEvents: HerdrBlockedEvent[] = [];
+	const choiceEvents: Array<{ active: boolean }> = [];
+	const confirmations: Array<(approved: boolean) => void> = [];
+	const pi = {
+		on(name: string, handler: ToolCallHandler) {
+			handlers.set(name, handler);
+		},
+		events: {
+			emit(channel: string, data: unknown) {
+				if (channel === "herdr:blocked") herdrEvents.push(data as HerdrBlockedEvent);
+				if (channel === "gentle-pi:ask-user-choice:blocked") choiceEvents.push(data as { active: boolean });
+				eventHandlers.get(channel)?.(data);
+			},
+			on(channel: string, handler: (data: unknown) => void) {
+				eventHandlers.set(channel, handler);
+				return () => eventHandlers.delete(channel);
+			},
+		},
+		registerCommand() {},
+		registerTool() {},
+	} as unknown as ExtensionAPI;
+	createGentleAiExtension({ nativeReviewCli: null })(pi);
+	assert.equal(eventHandlers.has("gentle-pi:ask-user-choice:blocked"), true);
+
+	pi.events.emit("gentle-pi:ask-user-choice:blocked", { active: true });
+	assert.deepEqual(choiceEvents, [{ active: true }]);
+	assert.deepEqual(herdrEvents, [{ active: true, label: "Choice awaiting input" }]);
+
+	const guardedRequest = handlers.get("tool_call")!(
+		{ toolName: "bash", input: { command: "git rebase main" } },
+		{
+			cwd: process.cwd(),
+			hasUI: true,
+			ui: {
+				confirm: async () => new Promise<boolean>((resolve) => { confirmations.push(resolve); }),
+			},
+		} as ExtensionContext,
+	);
+	await Promise.resolve();
+	assert.equal(confirmations.length, 1);
+	assert.deepEqual(herdrEvents, [{ active: true, label: "Choice awaiting input" }]);
+
+	pi.events.emit("gentle-pi:ask-user-choice:blocked", { active: false });
+	assert.deepEqual(choiceEvents, [{ active: true }, { active: false }]);
+	assert.deepEqual(herdrEvents, [
+		{ active: true, label: "Choice awaiting input" },
+		{ active: true, label: "Guarded command confirmation" },
+	]);
+	assert.equal(herdrEvents.some((event) => event.active === false), false);
+
+	confirmations[0]!(true);
+	assert.equal(await guardedRequest, undefined);
+	assert.deepEqual(herdrEvents, [
+		{ active: true, label: "Choice awaiting input" },
+		{ active: true, label: "Guarded command confirmation" },
+		{ active: false },
+	]);
+});
+
+test("permission lifecycle is inactive for unguarded and headless commands", async () => {
+	type ToolCallHandler = (
+		event: { toolName: string; input: unknown },
+		ctx: ExtensionContext,
+	) => Promise<ToolCallEventResult | undefined>;
+	const handlers = new Map<string, ToolCallHandler>();
+	const emitted: unknown[] = [];
+	let confirmations = 0;
+	const pi = {
+		on(name: string, handler: ToolCallHandler) {
+			handlers.set(name, handler);
+		},
+		events: { emit(_channel: string, data: unknown) { emitted.push(data); } },
+		registerCommand() {},
+		registerTool() {},
+	} as unknown as ExtensionAPI;
+	createGentleAiExtension({ nativeReviewCli: null })(pi);
+	const toolCall = handlers.get("tool_call");
+	assert.equal(typeof toolCall, "function");
+	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-permission-headless-"));
+	try {
+		const confirm = async () => {
+			confirmations += 1;
+			return true;
+		};
+		assert.equal(await toolCall!({ toolName: "bash", input: { command: "echo safe --secret-command-content" } }, {
+			cwd,
+			hasUI: false,
+			ui: { confirm },
+		} as ExtensionContext), undefined);
+		assert.deepEqual(await toolCall!({ toolName: "bash", input: { command: "git rebase main" } }, {
+			cwd,
+			hasUI: false,
+			ui: { confirm },
+		} as ExtensionContext), {
+			block: true,
+			reason: "Gentle AI safety policy requires interactive confirmation before this command.",
+		});
+		assert.equal(confirmations, 0);
+		assert.deepEqual(emitted, []);
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
 test("bash tool_call confirms a late guarded npm publish and denies on non-approval", async () => {
 	type ToolCallHandler = (
 		event: { toolName: string; input: unknown },
@@ -515,6 +1001,7 @@ test("bash tool_call confirms a late guarded npm publish and denies on non-appro
 		on(name: string, handler: ToolCallHandler) {
 			handlers.set(name, handler);
 		},
+		events: { emit() {} },
 		registerCommand() {},
 		registerTool() {},
 	} as unknown as ExtensionAPI;

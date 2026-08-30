@@ -785,7 +785,7 @@ export default function (pi: ExtensionAPI) {
 
 			const shouldCreateOpenSpec =
 				prefs.artifactStore === "openspec" ||
-				prefs.artifactStore === "both";
+				prefs.artifactStore === "hybrid";
 			if (!shouldCreateOpenSpec) {
 				ctx.ui.notify(
 					`SDD initialized for ${prefs.artifactStore}: detected ${detection.stack.join(", ") || "project"}; ${testSummary}; tests found: ${layerSummary}.`,

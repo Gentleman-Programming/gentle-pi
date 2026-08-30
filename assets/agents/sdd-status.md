@@ -88,10 +88,10 @@ Parse ownership on each task checkbox in `tasks.md`:
 
 - no `sdd-owner` token: legacy `implementation`;
 - exactly one terminal `<!-- sdd-owner: implementation -->`: implementation;
-- exactly one terminal `<!-- sdd-owner: parent -->`: deferred parent action;
-- any other `sdd-owner` occurrence: malformed, fail closed as unresolved implementation work and report the exact line in `taskArtifactErrors`.
+- supported legacy non-implementation rows: informational only;
+- any unsupported, duplicate, or non-terminal `sdd-owner` occurrence: malformed, fail closed as unresolved implementation work and report the exact line in `taskArtifactErrors`.
 
-Return implementation counters in `taskProgress`, valid parent counters in `deferredParentActions`, and exact unchecked implementation lines in `taskProgress.unchecked`. Parent actions are visible but never make apply incomplete.
+Return implementation counters in `taskProgress` and exact unchecked implementation lines in `taskProgress.unchecked`. Informational legacy rows never make apply incomplete or block the SDD route.
 
 ## Action Context
 
@@ -103,7 +103,7 @@ If parent context reports `workspace-planning` and no `allowedEditRoots`, mark a
 
 - `apply` is `ready` only when specs, design, and tasks are present, at least one task is unchecked, and action context is safe.
 - `apply` is `all_done` when tasks exist and no unchecked implementation tasks remain.
-- Completed implementation without authoritative approved receipt evidence routes to `parent-lifecycle`, never another apply or direct verification. Parent markers are visibility only; the parent owns review and gates.
+- Completed implementation routes directly to `sdd-verify`; an RDD receipt or authority never gates verification, sync, archive, or delivery.
 - `verify` is `ready` when tasks exist and apply-progress exists or tasks are all done; unchecked implementation tasks are still CRITICAL archive blockers.
 - `sync` is `ready` when verify-report exists and has no unresolved `FAIL`, `BLOCKED`, `CRITICAL`, or verification blockers; it is `not_applicable` for `engram`/`none` modes.
 - `archive` is `ready` only when verify-report is passing, sync-report exists or sync is not applicable, and no unchecked implementation tasks remain. CRITICAL verification issues have no override. Explicit recorded exceptions are limited to non-critical partial archives or stale-checkbox reconciliation when apply-progress/verify-report prove completion.

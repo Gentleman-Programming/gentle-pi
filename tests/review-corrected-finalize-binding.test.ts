@@ -4,16 +4,95 @@ import { join } from "node:path";
 import test from "node:test";
 import { __testing } from "../extensions/gentle-ai.ts";
 import type { NativeReviewCli } from "../lib/native-review-cli.ts";
-import { decodeReviewLastEventClosureV1, type ReviewStatusV3 } from "../lib/review-integration-v2.ts";
+import { assertReviewLastEventClosureBinding, decodeReviewLastEventClosureV1, type ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 
 const CAPTURED_FIXTURES = join(process.cwd(), "tests", "fixtures", "devbinary");
 
-test("captured correction-required result closes through the last event", () => {
-	const fixture = JSON.parse(readFileSync(join(CAPTURED_FIXTURES, "last-event-capture-result-correction-required.captured.json"), "utf8"));
+function captured(name: string): Record<string, unknown> {
+	return JSON.parse(readFileSync(join(CAPTURED_FIXTURES, name), "utf8")) as Record<string, unknown>;
+}
+
+test("captured correction-required result preserves the provider status continuation", () => {
+	const fixture = captured("last-event-capture-result-correction-required.captured.json");
 	const closure = decodeReviewLastEventClosureV1(fixture);
 	assert.equal(closure.operation, "review/capture-result");
 	assert.equal(closure.state, "correction_required");
 	assert.match(closure.storeRevision, /^sha256:[a-f0-9]{64}$/);
+	assert.equal(closure.statusContinuation?.operation, "review.status");
+	assert.deepEqual(
+		closure.statusContinuation?.arguments.map((argument) => argument.token),
+		[
+			"--cwd=/tmp/repository",
+			"--contract=gentle-ai.review-integration/v2",
+			"--next-transition=true",
+			"--lineage=review-afeed0d5a9aa24a1",
+			"--agent=pi",
+		],
+	);
+	assert.deepEqual(closure.statusContinuation?.raw, fixture.status_continuation);
+});
+
+test("correction status continuation stays bound to its enclosing closure and provider target", () => {
+	const mismatch = `sha256:${"b".repeat(64)}`;
+	const cases = [
+		{
+			name: "missing binding lineage",
+			mutate: (binding: Record<string, unknown>) => { delete binding.lineage_id; },
+			error: /lineage does not match its enclosing closure/,
+		},
+		{
+			name: "different binding lineage",
+			mutate: (binding: Record<string, unknown>) => { binding.lineage_id = "review-different"; },
+			error: /lineage does not match its enclosing closure/,
+		},
+		{
+			name: "missing binding revision",
+			mutate: (binding: Record<string, unknown>) => { delete binding.revision; },
+			error: /revision does not match its enclosing closure/,
+		},
+		{
+			name: "different binding revision",
+			mutate: (binding: Record<string, unknown>) => { binding.revision = mismatch; },
+			error: /revision does not match its enclosing closure/,
+		},
+	];
+	for (const scenario of cases) {
+		const fixture = captured("last-event-capture-result-correction-required.captured.json");
+		const continuation = fixture.status_continuation as Record<string, unknown>;
+		scenario.mutate(continuation.binding as Record<string, unknown>);
+		assert.throws(() => decodeReviewLastEventClosureV1(fixture), scenario.error, scenario.name);
+	}
+
+	const argumentMismatch = captured("last-event-capture-result-correction-required.captured.json");
+	const continuation = argumentMismatch.status_continuation as Record<string, unknown>;
+	const argumentsList = continuation.arguments as Array<Record<string, unknown>>;
+	const lineageArgument = argumentsList.find((argument) => argument.name === "lineage")!;
+	lineageArgument.value = "review-different";
+	lineageArgument.token = "--lineage=review-different";
+	assert.throws(() => decodeReviewLastEventClosureV1(argumentMismatch), /lineage argument does not match its enclosing closure/);
+
+	const closure = decodeReviewLastEventClosureV1(captured("last-event-capture-result-correction-required.captured.json"));
+	assert.throws(
+		() => assertReviewLastEventClosureBinding(closure, { lineageId: closure.lineageId, targetIdentity: mismatch }),
+		/status continuation target does not match its provider binding/,
+	);
+});
+
+test("correction-required result and refuter closures require one status continuation", () => {
+	for (const name of [
+		"last-event-capture-result-correction-required.captured.json",
+		"last-event-capture-refuter-correction-required.captured.json",
+	]) {
+		const fixture = captured(name);
+		delete fixture.status_continuation;
+		assert.throws(() => decodeReviewLastEventClosureV1(fixture), /requires status_continuation/, name);
+	}
+});
+
+test("closures outside result or refuter correction-required forbid a status continuation", () => {
+	const approved = captured("last-event-capture-result-approved.captured.json");
+	approved.status_continuation = captured("last-event-capture-result-correction-required.captured.json").status_continuation;
+	assert.throws(() => decodeReviewLastEventClosureV1(approved), /status_continuation is only valid/, "approved result closure");
 });
 
 test("current capture fails closed when fresh STATUS no longer offers the corrected candidate binding", async () => {

@@ -107,7 +107,16 @@ function isSddExecutionMode(value: unknown): value is SddExecutionMode {
 }
 
 function isSddArtifactStore(value: unknown): value is SddArtifactStore {
-	return value === "openspec" || value === "engram" || value === "both" || value === "none";
+	return value === "openspec" || value === "engram" || value === "hybrid" || value === "none";
+}
+
+// normalizeSddArtifactStore accepts the canonical names and the legacy "both"
+// spelling of the dual-store mode. Operator preflight files written before the
+// rename carry "both" on disk; rejecting it would silently drop the operator's
+// choice back to the default, so it maps forward instead.
+export function normalizeSddArtifactStore(value: unknown): SddArtifactStore | undefined {
+	if (value === "both") return "hybrid";
+	return isSddArtifactStore(value) ? value : undefined;
 }
 
 function normalizeReviewBudgetValue(value: unknown): number | undefined {
@@ -147,7 +156,8 @@ function normalizedSelections(
 	if (!value) return {};
 	const result: Partial<Record<SddPreflightField, unknown>> = {};
 	if (isSddExecutionMode(value.executionMode)) result.executionMode = value.executionMode;
-	if (isSddArtifactStore(value.artifactStore) && (engramAvailable || value.artifactStore === "openspec" || value.artifactStore === "none")) result.artifactStore = value.artifactStore;
+	const artifactStore = normalizeSddArtifactStore(value.artifactStore);
+	if (artifactStore !== undefined && (engramAvailable || artifactStore === "openspec" || artifactStore === "none")) result.artifactStore = artifactStore;
 	const strategy = normalizeSddStrategySelection(value.chainedPrStrategy, allowExceptionOk);
 	if (strategy) result.chainedPrStrategy = strategy;
 	const reviewBudgetLines = normalizeReviewBudgetValue(value.reviewBudgetLines);
@@ -345,9 +355,13 @@ export function readSddPreflightFromDisk(cwd: string): SddPreflightPreferences |
 		if (!isRecord(parsed)) return undefined;
 		// Validate required fields to guard against stale/corrupt writes.
 		const { executionMode, artifactStore, chainedPrStrategy, reviewBudgetLines, engramAvailable, prompted } = parsed;
+		// Normalize before validating: a preflight file written before the
+		// dual-store rename carries "both", and discarding it would silently
+		// drop the operator's choice back to the default.
+		const canonicalArtifactStore = normalizeSddArtifactStore(artifactStore);
 		if (
 			!isSddExecutionMode(executionMode) ||
-			!isSddArtifactStore(artifactStore) ||
+			canonicalArtifactStore === undefined ||
 			typeof reviewBudgetLines !== "number" ||
 			!Number.isFinite(reviewBudgetLines) ||
 			reviewBudgetLines <= 0 ||
@@ -358,7 +372,7 @@ export function readSddPreflightFromDisk(cwd: string): SddPreflightPreferences |
 		}
 		return {
 			executionMode,
-			artifactStore,
+			artifactStore: canonicalArtifactStore,
 			chainedPrStrategy: normalizeSddChainedPrStrategy(chainedPrStrategy),
 			reviewBudgetLines: normalizeReviewBudgetValue(reviewBudgetLines) ?? DEFAULT_SDD_PREFLIGHT.reviewBudgetLines,
 			engramAvailable,
@@ -375,7 +389,7 @@ export function writeSddPreflightToDisk(cwd: string, prefs: SddPreflightPreferen
 		const prompted = prefs.prompted === true;
 		const canonical: SddPreflightPreferences = {
 			executionMode: isSddExecutionMode(prefs.executionMode) ? prefs.executionMode : DEFAULT_SDD_PREFLIGHT.executionMode,
-			artifactStore: isSddArtifactStore(prefs.artifactStore) ? prefs.artifactStore : DEFAULT_SDD_PREFLIGHT.artifactStore,
+			artifactStore: normalizeSddArtifactStore(prefs.artifactStore) ?? DEFAULT_SDD_PREFLIGHT.artifactStore,
 			chainedPrStrategy: normalizeSddChainedPrStrategy(prefs.chainedPrStrategy),
 			reviewBudgetLines:
 				normalizeReviewBudgetValue(prefs.reviewBudgetLines) ??
@@ -661,7 +675,7 @@ export async function collectSddPreflightPreferences(
 			usePromptedValue(field, await read());
 		}
 	};
-	const artifactOptions = engramAvailable ? ["openspec", "engram", "both"] : ["openspec"];
+	const artifactOptions = engramAvailable ? ["openspec", "engram", "hybrid"] : ["openspec"];
 	await promptField("executionMode", () => ctx.ui.select("SDD execution mode", ["interactive", "auto"]));
 	await promptField("artifactStore", () => ctx.ui.select("SDD artifact store", artifactOptions), artifactOptions.length > 1);
 	await promptField("chainedPrStrategy", () => ctx.ui.select("SDD delivery strategy", ["ask-on-risk", "auto-chain", "single-pr"]));

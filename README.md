@@ -19,6 +19,8 @@ Pi already has strong tools. `gentle-pi` adds the discipline for using them well
 
 `gentle-pi` is the Pi-native package from the [Gentle-AI ecosystem](https://github.com/Gentleman-Programming/gentle-ai), built by [Gentleman Programming](https://github.com/Gentleman-Programming): the broader open-source project for turning AI coding agents into disciplined engineering environments with SDD workflows, skills, memory integrations, model routing, and review guardrails across multiple agents.
 
+> **Trademark notice:** The gentle-pi name and logo are trademarks of Alan Buscaglia. The MIT License applies to the code; it does not permit implying endorsement or official affiliation. See [TRADEMARKS.md](TRADEMARKS.md).
+
 Follow the project and the community around it:
 
 - GitHub: [Gentleman-Programming](https://github.com/Gentleman-Programming)

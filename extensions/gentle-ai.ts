@@ -128,6 +128,7 @@ import {
 	NATIVE_REVIEW_RECONCILE_ANOMALIES,
 	sanitizeForeignNativeReviewDiagnostics,
 	type NativeReviewCli,
+	type NativeReviewAcknowledgeApprovedRequest,
 	type NativeTargetStatusRequest,
 	type NativeReviewModeOperation,
 	type NativeReviewModeSource,
@@ -135,6 +136,7 @@ import {
 	type NativeStartResult,
 } from "../lib/native-review-cli.ts";
 import {
+	assertReviewApprovedAcknowledgementExecuteV1,
 	decodeReviewLastEventClosureV1,
 	type ReviewCollectInputV3,
 	type ReviewConsentEnvelope,
@@ -455,6 +457,131 @@ function renderBackgroundSubagentsReport(
 
 const SUBAGENTS_PACKAGE_NAMES = ["pi-subagents-j0k3r", "pi-subagents"] as const;
 const SUBAGENT_RUN_TOOL = "subagent_run";
+const BOUNDED_WRITER_AGENT_NAMES = ["gentle-ai-worker", "worker"] as const;
+const ALLOWED_EDIT_SURFACES_HEADING = /^## Allowed edit surfaces[ \t]*$/gim;
+const MARKDOWN_HEADING_LINE = /^#{1,6}\s/;
+const MARKDOWN_LIST_MARKER = /^(?:[-*+]|\d+[.)])\s+/;
+const WRITER_EDIT_SURFACE_REJECTION =
+	"Parent must derive or map narrow repository-relative allowed edit surfaces from the delegated task and relaunch the writer. Do not ask the human to author paths or globs.";
+
+function isTaskScopedRepositoryRelativePath(value: string): boolean {
+	const normalized = value.replace(/\\/g, "/");
+	if (
+		normalized.length === 0 ||
+		isAbsolute(value) ||
+		/^(?:[A-Za-z]:|\/|~)/.test(normalized)
+	) {
+		return false;
+	}
+
+	const withoutCurrentDirectory = normalized.replace(/^(?:\.\/)+/, "");
+	if (
+		withoutCurrentDirectory.length === 0 ||
+		withoutCurrentDirectory === "." ||
+		withoutCurrentDirectory.startsWith("/") ||
+		/\s/.test(withoutCurrentDirectory) ||
+		withoutCurrentDirectory.split("/").some((segment) => segment === "..")
+	) {
+		return false;
+	}
+
+	return !/[?*\[\]{}]/.test(withoutCurrentDirectory.split("/")[0]);
+}
+
+/** Strips a list marker and surrounding backticks off one surface line. */
+function readSurfaceEntry(line: string): string {
+	const entry = line.replace(MARKDOWN_LIST_MARKER, "");
+	return entry.match(/^`(.+)`$/)?.[1] ?? entry;
+}
+
+/** A line still reads as a surface entry when nothing but a bare path is left. */
+function looksLikeSurfaceEntry(line: string): boolean {
+	return line.length > 0 && !MARKDOWN_HEADING_LINE.test(line) && !/\s/.test(readSurfaceEntry(line));
+}
+
+/**
+ * Reads the surface list that follows an `## Allowed edit surfaces` heading.
+ *
+ * A delegated `task` is a whole prompt: the list is normally followed by deeper
+ * headings (`### Validation commands`, `#### Return`) and by ordinary prose.
+ * Ending the section only at `#`/`##` swallowed all of that, turned prose into
+ * surface entries, and rejected valid authorizations (issue #484). A `context`
+ * value carrying just the heading and its lines had nothing following it, which
+ * is why the identical surfaces were accepted there.
+ *
+ * So the section ends at the next heading of ANY level, and prose closes the
+ * list inside it. Blank lines never close it: an entry is only ever dropped
+ * when nothing below it still reads as a surface entry. A line that a caller
+ * could pass off as a path stays under validation instead of being discarded,
+ * because discarding is what would let `/etc/passwd` sit under a blank line or
+ * a paragraph and reach an accepted dispatch.
+ */
+function readAllowedEditSurfaceEntries(following: string): string[] {
+	const lines = following.split(/\r?\n/).map((line) => line.trim());
+	const headingIndex = lines.findIndex((line) => MARKDOWN_HEADING_LINE.test(line));
+	const section = headingIndex === -1 ? lines : lines.slice(0, headingIndex);
+	const entries: string[] = [];
+
+	for (const [index, line] of section.entries()) {
+		if (line.length === 0) continue;
+		const entry = readSurfaceEntry(line);
+		if (/\s/.test(entry)) {
+			// Prose closes the list only when it is genuinely trailing. Anything
+			// below it that still reads as a path makes the section ambiguous, so
+			// every non-empty line is validated and the ambiguity is rejected.
+			if (section.slice(index + 1).some(looksLikeSurfaceEntry)) {
+				return section.filter((candidate) => candidate.length > 0).map(readSurfaceEntry);
+			}
+			break;
+		}
+		entries.push(entry);
+	}
+
+	return entries;
+}
+
+function hasTaskScopedAllowedEditSurfaces(...values: unknown[]): boolean {
+	let expectedEntries: string[] | undefined;
+	let hasSection = false;
+
+	for (const value of values) {
+		if (typeof value !== "string") continue;
+
+		const headings = value.matchAll(ALLOWED_EDIT_SURFACES_HEADING);
+		for (const heading of headings) {
+			const bodyStart = (heading.index ?? 0) + heading[0].length;
+			const entries = readAllowedEditSurfaceEntries(value.slice(bodyStart));
+			if (entries.length === 0 || !entries.every(isTaskScopedRepositoryRelativePath)) return false;
+
+			const uniqueEntries = [...new Set(entries)].sort();
+			if (
+				expectedEntries &&
+				(expectedEntries.length !== uniqueEntries.length ||
+					expectedEntries.some((entry, index) => entry !== uniqueEntries[index]))
+			) {
+				return false;
+			}
+			expectedEntries = uniqueEntries;
+			hasSection = true;
+		}
+	}
+
+	return hasSection;
+}
+
+function rejectUnscopedBoundedWriterDispatch(input: unknown): { block: true; reason: string } | undefined {
+	if (
+		!isRecord(input) ||
+		typeof input.agent !== "string" ||
+		!(BOUNDED_WRITER_AGENT_NAMES as readonly string[]).includes(input.agent)
+	) {
+		return undefined;
+	}
+	if (hasTaskScopedAllowedEditSurfaces(input.task, input.context)) {
+		return undefined;
+	}
+	return { block: true, reason: WRITER_EDIT_SURFACE_REJECTION };
+}
 
 /**
  * Roots where an installed subagents package may live. These are the same
@@ -1064,9 +1191,70 @@ function evaluateSensitivePathTool(
 	};
 }
 
+const ASK_USER_CHOICE_BLOCKED_EVENT = "gentle-pi:ask-user-choice:blocked";
+
+const HERDR_BLOCKER_LABEL = {
+	CHOICE: "Choice awaiting input",
+	GUARDED_CONFIRMATION: "Guarded command confirmation",
+	QUESTIONNAIRE: "Questionnaire awaiting input",
+} as const;
+
+type HerdrBlockerLabel = (typeof HERDR_BLOCKER_LABEL)[keyof typeof HERDR_BLOCKER_LABEL];
+
+type HerdrConfirmationLifecycle = {
+	begin(): void;
+	settle(): void;
+};
+
+function createHerdrConfirmationLifecycle(events: ExtensionAPI["events"]): HerdrConfirmationLifecycle {
+	let pending = 0;
+	let choiceActive = false;
+	let questionnaireActive = false;
+	let emittedLabel: HerdrBlockerLabel | undefined;
+	const emitEffectiveBlocker = (): void => {
+		const nextLabel = choiceActive
+			? HERDR_BLOCKER_LABEL.CHOICE
+			: questionnaireActive
+				? HERDR_BLOCKER_LABEL.QUESTIONNAIRE
+				: pending > 0
+					? HERDR_BLOCKER_LABEL.GUARDED_CONFIRMATION
+					: undefined;
+		if (nextLabel === emittedLabel) return;
+		emittedLabel = nextLabel;
+		if (nextLabel === undefined) events.emit("herdr:blocked", { active: false });
+		else events.emit("herdr:blocked", { active: true, label: nextLabel });
+	};
+
+	events?.on?.(ASK_USER_CHOICE_BLOCKED_EVENT, (event) => {
+		if (!isRecord(event) || typeof event.active !== "boolean" || event.active === choiceActive) return;
+		choiceActive = event.active;
+		emitEffectiveBlocker();
+	});
+
+	events?.on?.("rpiv:ask-user:blocked", (event) => {
+		if (!isRecord(event) || typeof event.active !== "boolean" || event.active === questionnaireActive) return;
+		questionnaireActive = event.active;
+		emitEffectiveBlocker();
+	});
+
+	return {
+		begin() {
+			pending += 1;
+			emitEffectiveBlocker();
+		},
+		settle() {
+			if (pending === 0) return;
+			pending -= 1;
+			emitEffectiveBlocker();
+		},
+	};
+}
+
 async function confirmCommand(
 	command: string,
 	ctx: ExtensionContext,
+	events: ExtensionAPI["events"],
+	herdrLifecycle: HerdrConfirmationLifecycle,
 ): Promise<ToolCallEventResult | undefined> {
 	const guardrailsConfig = loadRuntimeGuardrailsConfig(ctx.cwd);
 	const evaluation = evaluateGuardedCommand(command, guardrailsConfig);
@@ -1093,9 +1281,38 @@ async function confirmCommand(
 				"Gentle AI safety policy requires interactive confirmation before this command.",
 		};
 	}
-	const preview = guardedCommandPreview(command, evaluation.triggerIndex);
 	const title = guardedCommandTitle(evaluation.key);
-	const approved = await ctx.ui.confirm(title, preview);
+	const preview = guardedCommandPreview(command, evaluation.triggerIndex);
+	const requestId = randomUUID();
+	const emitPermissionRequest = (
+		state: "waiting" | "approved" | "denied",
+	): void => {
+		events.emit("pi-permission-system:permission-request", {
+			requestId,
+			state,
+			source: "tool_call",
+			message: "Gentle AI safety policy requires confirmation for this tool call.",
+			toolName: "bash",
+		});
+	};
+	let approved = false;
+	let confirmationFailed = false;
+	let confirmationError: unknown;
+	emitPermissionRequest("waiting");
+	herdrLifecycle.begin();
+	try {
+		approved = await ctx.ui.confirm(title, preview);
+	} catch (error) {
+		confirmationFailed = true;
+		confirmationError = error;
+	} finally {
+		try {
+			emitPermissionRequest(confirmationFailed || !approved ? "denied" : "approved");
+		} finally {
+			herdrLifecycle.settle();
+		}
+	}
+	if (confirmationFailed) throw confirmationError;
 	if (approved) return undefined;
 	return {
 		block: true,
@@ -2395,6 +2612,7 @@ const REVIEW_CONTROLLER_OPERATION = {
 	START: "start",
 	ANSWER_CONSENT: "answer-consent",
 	ADVANCE: "advance",
+	ACKNOWLEDGE_APPROVED: "acknowledge-approved",
 	STATUS: "status",
 	EXPORT: "export",
 	IMPORT: "import",
@@ -2534,6 +2752,10 @@ interface ReviewControllerParameters {
 	acknowledgeUntrustedBundleSource?: string;
 	workspaceRoot?: string;
 }
+
+type NativeReviewAcknowledgementCli = NativeReviewCli & {
+	acknowledgeApproved?: (request: NativeReviewAcknowledgeApprovedRequest) => Promise<void>;
+};
 
 interface ReviewControllerStartInput {
 	mode: ReviewMode;
@@ -3515,11 +3737,12 @@ function nativeOperationFailure(operation: ReviewControllerOperation | "gentle_r
 	// Preserve either already-sanitized diagnostic on every controller route rather
 	// than relabeling an actionable failure as an opaque controller failure.
 	const preservesNativeTargetStatusDiagnostic = nativeDiagnostics?.operation === NATIVE_REVIEW_OPERATION.VERSION || nativeDiagnostics?.operation === NATIVE_REVIEW_OPERATION.STATUS;
+	const preservesAnswerConsentStartDiagnostic = operation === REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT && nativeDiagnostics?.operation === NATIVE_REVIEW_OPERATION.START;
 	const diagnostics = operation === REVIEW_CONTROLLER_OPERATION.START && error instanceof CandidateViewError && value.candidateViewPreNative === true
 		? error.diagnostics ?? { code: error.reason, message: "candidate view rejected before native START" }
 		: error instanceof CandidateViewError
 			? { code: error.reason, message: error.message }
-			: nativeDiagnostics?.operation === `review/${operation}` || preservesNativeTargetStatusDiagnostic
+			: nativeDiagnostics?.operation === `review/${operation}` || preservesNativeTargetStatusDiagnostic || preservesAnswerConsentStartDiagnostic
 		? nativeDiagnostics
 		: undefined;
 	return {
@@ -3803,6 +4026,15 @@ function mapLastEventClosure(
 			...(closure.requestHash === undefined ? {} : { request_hash: closure.requestHash }),
 			...(closure.correctionLines === undefined ? {} : { correction_lines: closure.correctionLines }),
 			...(closure.advisoryFindings === undefined ? {} : { advisory_findings: closure.advisoryFindings }),
+			...(closure.statusContinuation === undefined ? {} : { status_continuation: closure.statusContinuation.raw }),
+			// The host has to see the acknowledgement to run it: approval now
+			// waits for that exact invocation instead of burning on its own, so
+			// dropping it here would strand the lineage as approved forever.
+			...(closure.acknowledgement === undefined ? {} : { acknowledgement: closure.acknowledgement.raw }),
+			// A present-but-unreadable continuation is not the same as none: the
+			// host is approved and cannot end it here, and silence would read as
+			// nothing left to do.
+			...(closure.acknowledgementUndecodable === undefined ? {} : { acknowledgement_undecodable: true }),
 		},
 		lineage_id: closure.lineageId,
 		state: closure.state,
@@ -4517,6 +4749,98 @@ async function executeReviewControllerOperation(
 		store.repairCurrentAuthority();
 		return { operation: parameters.operation, repaired: true };
 	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.ACKNOWLEDGE_APPROVED) {
+		const controllerOnlyInput = ["changeName", "idempotencyKey", "transition", "input", "outputPath", "inputPath", "operationId", "lineageIds", "acknowledgeUntrustedBundleSource"]
+			.find((key) => parameters[key as keyof ReviewControllerParameters] !== undefined);
+		if (controllerOnlyInput !== undefined || !isCanonicalProcessString(parameters.lineageId)) {
+			return {
+				operation: parameters.operation,
+				status: "blocked",
+				outcome: "native-approved-acknowledgement-input-invalid",
+				reason: controllerOnlyInput === undefined ? "lineage-invalid" : "controller-only-input",
+				...(controllerOnlyInput === undefined ? {} : { field: controllerOnlyInput }),
+				mutation_performed: false,
+				mutation_outcome: "none",
+				next_action: "resubmit-the-exact-lineage-without-controller-only-input",
+			};
+		}
+		const acknowledgementCli = nativeReviewCli as NativeReviewAcknowledgementCli | null;
+		if (acknowledgementCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
+		if (acknowledgementCli.acknowledgeApproved === undefined) {
+			return {
+				operation: parameters.operation,
+				status: "blocked",
+				outcome: "native-approved-acknowledgement-unsupported",
+				mutation_performed: false,
+				mutation_outcome: "none",
+				next_action: "install-native-acknowledge-approved-support",
+			};
+		}
+		const frozenTarget = candidateViews?.hasProjection(parameters.lineageId, defaultCwd)
+			? candidateViews.resolveProjection(parameters.lineageId, defaultCwd)
+			: undefined;
+		const target = {
+			cwd: defaultCwd,
+			lineageId: parameters.lineageId,
+			...(frozenTarget?.committedOnly === true ? { baseRef: frozenTarget.baseCommit, committedOnly: true } : {}),
+			...(signal === undefined ? {} : { signal }),
+		};
+		let status: ReviewStatusV3;
+		try {
+			status = await acknowledgementCli.targetStatus(target);
+		} catch (error) {
+			return nativeStatusFailed(parameters.operation, error);
+		}
+		const execute = status.nextTransition?.kind === "execute" ? status.nextTransition.execute : undefined;
+		if (
+			status.applicability !== "current_target" ||
+			status.authority?.lineageId !== parameters.lineageId ||
+			status.authority.state !== "approved" ||
+			execute?.operation !== "review.acknowledge-approved"
+		) {
+			return {
+				operation: parameters.operation,
+				status: "blocked",
+				outcome: "native-approved-acknowledgement-not-current",
+				result: status.raw,
+				mutation_performed: false,
+				mutation_outcome: "none",
+				next_action: "follow-provider-target-status",
+			};
+		}
+		let argumentTokens: readonly string[];
+		try {
+			argumentTokens = assertReviewApprovedAcknowledgementExecuteV1(execute, {
+				cwd: defaultCwd,
+				lineageId: parameters.lineageId,
+				targetIdentity: status.targetIdentity,
+				revision: status.authority.revision,
+			});
+		} catch (error) {
+			return nativeOperationFailure(parameters.operation, error);
+		}
+		try {
+			await acknowledgementCli.acknowledgeApproved({
+				argumentTokens,
+				cwd: defaultCwd,
+				...(signal === undefined ? {} : { signal }),
+			});
+			return {
+				operation: parameters.operation,
+				status: "closed",
+				outcome: "native-approved-acknowledgement-completed",
+				lineage_id: parameters.lineageId,
+				target_identity: status.targetIdentity,
+				authority: "burned",
+				delivery: "ordinary-repository-policy",
+				mutation_performed: true,
+				mutation_outcome: "committed",
+			};
+		} catch (error) {
+			if (!nativeMutationRequiresStatus(error)) return nativeOperationFailure(parameters.operation, error);
+			return await reconcileNativeMutationFailure(parameters.operation, error, acknowledgementCli, target, retainedUntrackedSelections);
+		}
+	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
 		if (Object.keys(input).some((key) => key !== "consentBinding" && key !== "answer") || Object.keys(input).length !== 2) throw new Error("Review controller answer-consent input must contain exactly consentBinding and answer");
@@ -4525,7 +4849,17 @@ async function executeReviewControllerOperation(
 		const pending = pendingReviewConsentRegistry.get(pendingReviewConsentSession)?.get(input.consentBinding);
 		if (pending === undefined || pending.expiresAt <= reviewConsentNow()) {
 			if (pending !== undefined) cleanupPendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession);
-			throw new Error("Review controller consent binding is unknown, expired, or already consumed");
+			if (nativeReviewCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
+			try {
+				const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
+					cwd: defaultCwd,
+					...(signal === undefined ? {} : { signal }),
+				}, retainedUntrackedSelections, defaultCwd);
+				if (negotiated.transport !== undefined) return hostTransportUnavailable(parameters.operation, negotiated.transport);
+				return mapNativeTargetStatus(parameters.operation, negotiated.status!);
+			} catch (error) {
+				return nativeStatusFailed(parameters.operation, error);
+			}
 		}
 		if (realpathSync(defaultCwd) !== pending.repositoryCwd) throw new Error("Review controller consent repository binding changed");
 		if (reviewConsentDigest(pending.consent) !== pending.consentDigest) throw new Error("Review controller consent envelope binding changed");
@@ -4838,13 +5172,16 @@ async function executeReviewControllerOperation(
 			(untrackedSelection.reason !== undefined || (baseRef === undefined && untrackedSelection.untrackedScope === undefined))
 		) return nativeStatusInputRejection(untrackedSelection.reason ?? "untracked-selection-invalid");
 		const retainedUntrackedSelection = cloneRetainedNativeUntrackedSelection(untrackedSelection);
+		const effectiveUntrackedSelection = rawStatus === undefined && parameters.lineageId !== undefined
+			? readRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, parameters.lineageId)
+			: untrackedSelection;
 		if (nativeReviewCli?.targetStatus !== undefined) {
 			try {
 				const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
 					cwd: defaultCwd,
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 					...(baseRef === undefined ? {} : { baseRef, committedOnly: true }),
-					...(untrackedSelection.untrackedScope === undefined ? {} : untrackedSelection),
+					...(effectiveUntrackedSelection.untrackedScope === undefined ? {} : effectiveUntrackedSelection),
 					...(signal === undefined ? {} : { signal }),
 				}, retainedUntrackedSelections, defaultCwd);
 				if (negotiated.transport !== undefined) {
@@ -4905,48 +5242,22 @@ export const __testing = {
 	createGentleAiExtension: createGentleAiExtensionForTesting,
 };
 
-const NATIVE_SDD_STATUS_STARTUP_TIMEOUT_MS = 1_000;
-
-async function resolveControllerSddStatus(
+function resolveControllerSddStatus(
 	cwd: string,
 	changeName: string | undefined,
 	includeInstructions: boolean,
 	artifactStore: SddPreflightPreferences["artifactStore"] | undefined,
-	nativeReviewCli: NativeReviewCli | null = null,
-	signal?: AbortSignal,
 ) {
-	const base = resolveSddStatus({ cwd, changeName, includeInstructions, artifactStore });
-	if (!base.changeName || base.isNonAuthoritative) return base;
-	if (base.applyState !== "all_done" || nativeReviewCli === null) return base;
-	try {
-		const native = await nativeReviewCli.sddStatus({ cwd, change: base.changeName, ...(signal === undefined ? {} : { signal }) });
-		return resolveSddStatus({
-			cwd,
-			changeName: base.changeName,
-			includeInstructions,
-			artifactStore,
-			nativeReviewReadiness: { expected: true, ready: native.ready },
-		});
-	} catch (error) {
-		return resolveSddStatus({
-			cwd,
-			changeName: base.changeName,
-			includeInstructions,
-			artifactStore,
-			nativeReviewReadiness: { expected: true, ready: false, reason: error instanceof Error ? error.message : "native bound status failed" },
-		});
-	}
+	return resolveSddStatus({ cwd, changeName, includeInstructions, artifactStore });
 }
 
-async function resolveStartupControllerSddStatus(
+function resolveStartupControllerSddStatus(
 	cwd: string,
 	changeName: string | undefined,
 	includeInstructions: boolean,
 	artifactStore: SddPreflightPreferences["artifactStore"] | undefined,
-	nativeReviewCli: NativeReviewCli | null,
-	timeoutMs = NATIVE_SDD_STATUS_STARTUP_TIMEOUT_MS,
 ) {
-	return resolveControllerSddStatus(cwd, changeName, includeInstructions, artifactStore, nativeReviewCli, AbortSignal.timeout(timeoutMs));
+	return resolveControllerSddStatus(cwd, changeName, includeInstructions, artifactStore);
 }
 
 export interface GentleAiRuntimeDependencies {
@@ -4978,6 +5289,7 @@ function createGentleAiExtensionForTesting(
 	return function gentleAi(pi: ExtensionAPI): void {
 	const pendingReviewConsentFallbackKey = Symbol("pending-review-consent-fallback");
 	const candidateViews = dependencies.candidateViews === undefined ? new CandidateViewRegistry() : dependencies.candidateViews;
+	const herdrLifecycle = createHerdrConfirmationLifecycle(pi.events);
 
 	pi.on("session_shutdown", (_event, context) => {
 		const sessionKey = pendingReviewConsentSessionKey(context, pendingReviewConsentFallbackKey);
@@ -5163,12 +5475,11 @@ function createGentleAiExtensionForTesting(
 				: "";
 		const phase = isSddAgent ? sddPhaseFromAgentStartEvent(event) : undefined;
 		const nativeStatusPrompt = phase
-			? `\n\n${renderNativeSddPhasePrompt(await resolveStartupControllerSddStatus(
+			? `\n\n${renderNativeSddPhasePrompt(resolveStartupControllerSddStatus(
 				ctx.cwd,
 				undefined,
 				true,
 				prefs?.artifactStore,
-				nativeReviewCli,
 			), phase)}`
 			: "";
 		const gentlePrompt = isNamedAgent || isSddAgent
@@ -5186,6 +5497,8 @@ function createGentleAiExtensionForTesting(
 		);
 		if (sensitivePathDenied) return sensitivePathDenied;
 		if (event.toolName === "subagent_run") {
+			const writerScopeDenied = rejectUnscopedBoundedWriterDispatch(event.input);
+			if (writerScopeDenied) return writerScopeDenied;
 			try {
 				injectReviewCandidateView(event.input, candidateViews);
 				return undefined;
@@ -5200,7 +5513,7 @@ function createGentleAiExtensionForTesting(
 		if (!isRecord(event.input) || typeof event.input.command !== "string") {
 			return undefined;
 		}
-		return await confirmCommand(event.input.command, ctx);
+		return await confirmCommand(event.input.command, ctx, pi.events, herdrLifecycle);
 	});
 
 	pi.registerCommand("gentle:install-sdd", {
@@ -5226,12 +5539,11 @@ function createGentleAiExtensionForTesting(
 
 	const handleSddStatusCommand = async (args: string, ctx: ExtensionContext) => {
 		const parsed = parseSddStatusCommandArgs(args);
-		const status = await resolveControllerSddStatus(
+		const status = resolveControllerSddStatus(
 			ctx.cwd,
 			parsed.changeName,
 			true,
 			getSddPreflightPreferences(ctx)?.artifactStore,
-			nativeReviewCli,
 		);
 		ctx.ui.notify(
 			parsed.json ? JSON.stringify(status, null, 2) : renderSddStatusMarkdown(status),
@@ -5248,12 +5560,11 @@ function createGentleAiExtensionForTesting(
 
 	const handleSddContinueCommand = async (args: string, ctx: ExtensionContext) => {
 		const parsed = parseSddStatusCommandArgs(args);
-		const status = await resolveControllerSddStatus(
+		const status = resolveControllerSddStatus(
 			ctx.cwd,
 			parsed.changeName,
 			true,
 			getSddPreflightPreferences(ctx)?.artifactStore,
-			nativeReviewCli,
 		);
 		ctx.ui.notify(
 			parsed.json ? JSON.stringify(status, null, 2) : renderSddDispatcherMarkdown(status),

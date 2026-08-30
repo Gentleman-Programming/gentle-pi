@@ -405,6 +405,44 @@ test("next_transition decodes an execute variant and rejects a stop that carries
 	assert.throws(() => decodeReviewNextTransitionV3(stopWithExecute), /stop cannot carry/);
 });
 
+function approvedAcknowledgementTransition(): JsonObject {
+	return {
+		kind: "execute",
+		reason_code: "approved_acknowledgement_required",
+		execute: {
+			operation: "review.acknowledge-approved",
+			command: "gentle-ai review acknowledge-approved --provider-vector",
+			arguments: [
+				{ name: "cwd", value: "/provider/repository", token: "--cwd=/provider/repository" },
+				{ name: "lineage", value: "review-fixture", token: "--lineage=review-fixture" },
+				{ name: "target", value: digest, token: `--target=${digest}` },
+				{ name: "expected-revision", value: digest, token: `--expected-revision=${digest}` },
+				{ name: "token", value: "provider-issued-once", token: "--token=provider-issued-once" },
+			],
+			preconditions: [{ name: "state", value: "approved", token: "--state=approved" }],
+			binding: { lineage_id: "review-fixture", target_identity: digest, revision: digest },
+		},
+	};
+}
+
+test("acknowledgement execute rejects decoy bindings, closed-vector drift, and malformed approval", () => {
+	const valid = approvedAcknowledgementTransition();
+	assert.equal(decodeReviewNextTransitionV3(valid).execute?.operation, "review.acknowledge-approved");
+	const cases: Array<[string, (candidate: JsonObject) => void]> = [
+		["decoy target", (candidate) => { const argument = ((candidate.execute as JsonObject).arguments as JsonObject[])[2]!; argument.value = `sha256:${"b".repeat(64)}`; argument.token = `--target=${argument.value}`; }],
+		["mismatched expected revision", (candidate) => { const argument = ((candidate.execute as JsonObject).arguments as JsonObject[])[3]!; argument.value = `sha256:${"c".repeat(64)}`; argument.token = `--expected-revision=${argument.value}`; }],
+		["wrong argument order", (candidate) => { ((candidate.execute as JsonObject).arguments as JsonObject[]).reverse(); }],
+		["wrong argument name", (candidate) => { const argument = ((candidate.execute as JsonObject).arguments as JsonObject[])[0]!; argument.name = "repository"; argument.token = `--repository=${argument.value}`; }],
+		["malformed approved precondition", (candidate) => { ((candidate.execute as JsonObject).preconditions as JsonObject[])[0]!.value = "burned"; }],
+		["token value mismatch", (candidate) => { ((candidate.execute as JsonObject).arguments as JsonObject[])[4]!.token = "--token=other"; }],
+	];
+	for (const [name, mutate] of cases) {
+		const candidate = clone(valid);
+		mutate(candidate);
+		assert.throws(() => decodeReviewNextTransitionV3(candidate), /acknowledgement|arguments|preconditions|binding/, name);
+	}
+});
+
 test("repair decodes a committed execute result and rejects a non-eligible preflight carrying provider_inputs", () => {
 	const executed: JsonObject = {
 		schema: "gentle-ai.review-integration.repair/v2",

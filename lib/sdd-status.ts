@@ -6,7 +6,10 @@ import {
 	type DomainCollision,
 } from "./openspec-guardrails.ts";
 
-export type SddArtifactStore = "openspec" | "engram" | "both" | "none";
+// Canonical names match gentle-ai, which owns this contract. The dual-store
+// mode was called "both" here; "hybrid" is the provider's name for the same
+// thing, and normalizeSddArtifactStore keeps already-persisted "both" loading.
+export type SddArtifactStore = "openspec" | "engram" | "hybrid" | "none";
 export type ArtifactState = "missing" | "done" | "partial";
 export type DependencyState = "blocked" | "ready" | "all_done" | "not_applicable";
 export type ApplyState = "blocked" | "ready" | "all_done" | "not_applicable";
@@ -111,36 +114,12 @@ export interface SddStatus {
 	isNonAuthoritative: boolean;
 }
 
-export interface ValidatedReviewAuthorityResolution {
-	activeAuthorityId: string;
-}
-
-/**
- * Optional controller-owned recovery overlay. Status never infers authority from
- * OpenSpec artifacts: callers opt in only when a repository review binding exists.
- */
-export interface SddReviewAuthorityOverlay {
-	expected: boolean;
-	resolve: () => ValidatedReviewAuthorityResolution | undefined;
-}
-
-/** Read-only native bound-change evidence supplied by the controller. */
-export interface NativeReviewReadinessOverlay {
-	expected: boolean;
-	ready: boolean;
-	lineageId?: string;
-	bindingRevision?: string;
-	reason?: string;
-}
-
 export interface ResolveSddStatusOptions {
 	cwd: string;
 	changeName?: string;
 	includeInstructions?: boolean;
 	workspaceRoot?: string;
 	artifactStore?: SddArtifactStore;
-	reviewAuthority?: SddReviewAuthorityOverlay;
-	nativeReviewReadiness?: NativeReviewReadinessOverlay;
 }
 
 const EMPTY_PATHS: SddArtifactPaths = {
@@ -273,43 +252,7 @@ function reportIsClearlyPassing(path: string | undefined): boolean {
 	return hasPassSignal && !hasBlocker;
 }
 
-function withRecoveryBlock(status: SddStatus, reviewAuthority?: SddReviewAuthorityOverlay, nativeReviewReadiness?: NativeReviewReadinessOverlay): SddStatus {
-	if (nativeReviewReadiness?.expected && !nativeReviewReadiness.ready) {
-		const reason = `resolve-review: ${nativeReviewReadiness.reason ?? "native bound review readiness is unavailable."}`;
-		return {
-			...status,
-			applyState: "blocked",
-			dependencies: { apply: "blocked", verify: "blocked", sync: "blocked", archive: "blocked" },
-			nextRecommended: "resolve-review",
-			blockedReasons: status.blockedReasons.includes(reason) ? status.blockedReasons : [...status.blockedReasons, reason],
-		};
-	}
-	if (!reviewAuthority?.expected) return status;
-	try {
-		const resolved = reviewAuthority.resolve();
-		if (resolved?.activeAuthorityId) return status;
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		const reason = `resolve-review: ${message}`;
-		return {
-			...status,
-			applyState: "blocked",
-			dependencies: { apply: "blocked", verify: "blocked", sync: "blocked", archive: "blocked" },
-			nextRecommended: "resolve-review",
-			blockedReasons: status.blockedReasons.includes(reason) ? status.blockedReasons : [...status.blockedReasons, reason],
-		};
-	}
-	const reason = "resolve-review: validated active review authority is missing.";
-	return {
-		...status,
-		applyState: "blocked",
-		dependencies: { apply: "blocked", verify: "blocked", sync: "blocked", archive: "blocked" },
-		nextRecommended: "resolve-review",
-		blockedReasons: status.blockedReasons.includes(reason) ? status.blockedReasons : [...status.blockedReasons, reason],
-	};
-}
-
-function emptyStatus(cwd: string, changeName: string | null, blockedReasons: string[], artifactStore: SddArtifactStore = "openspec", isNonAuthoritative = false, reviewAuthority?: SddReviewAuthorityOverlay): SddStatus {
+function emptyStatus(cwd: string, changeName: string | null, blockedReasons: string[], artifactStore: SddArtifactStore = "openspec", isNonAuthoritative = false): SddStatus {
 	const root = resolve(cwd);
 	const changesDir = join(root, "openspec", "changes");
 	const actionContext: SddActionContext = {
@@ -318,7 +261,7 @@ function emptyStatus(cwd: string, changeName: string | null, blockedReasons: str
 		allowedEditRoots: [root],
 		warnings: [],
 	};
-	return withRecoveryBlock({
+	return {
 		schemaName: "gentle-pi.sdd-status",
 		schemaVersion: 1,
 		changeName,
@@ -353,7 +296,7 @@ function emptyStatus(cwd: string, changeName: string | null, blockedReasons: str
 		nextRecommended: blockedReasons[0] ?? "Start an SDD change.",
 		blockedReasons,
 		isNonAuthoritative,
-	}, reviewAuthority, undefined);
+	};
 }
 
 export function listActiveOpenSpecChanges(cwd: string): string[] {
@@ -482,7 +425,7 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 	//   - store engram or none: always non-authoritative (no disk backing)
 	//   - store both, no openspec/ dir: non-authoritative (no disk to scan)
 	// The both-with-openspec cases are handled below after listing active changes.
-	if (store === "engram" || store === "none" || (store === "both" && !hasOpenSpecDir)) {
+	if (store === "engram" || store === "none" || (store === "hybrid" && !hasOpenSpecDir)) {
 		const changeName = options.changeName?.trim() || null;
 		return nonAuthoritativeStatus(options.cwd, changeName, store, options.includeInstructions);
 	}
@@ -500,16 +443,16 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 			// store both + openspec/ present + zero active changes + no changeName:
 			// The change may live only in Engram — non-authoritative, not a false block.
 			// Pure openspec with zero changes is a real block (run sdd-new).
-			if (store === "both") {
+			if (store === "hybrid") {
 				return nonAuthoritativeStatus(options.cwd, null, store, options.includeInstructions);
 			}
-			return emptyStatus(root, null, ["No active SDD changes found."], store, false, options.reviewAuthority);
+			return emptyStatus(root, null, ["No active SDD changes found."], store);
 		} else {
 			// Multiple active changes and no changeName: legit selection prompt (changes DO exist
 			// on disk). Keep the existing authoritative ambiguous-selection behavior for both stores.
 			return emptyStatus(root, null, [
 				`Change selection is ambiguous: ${activeChanges.join(", ")}.`,
-			], store, false, options.reviewAuthority);
+			], store);
 		}
 	}
 
@@ -517,10 +460,10 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 		// store both + openspec/ present + named change NOT found on disk:
 		// The change may live only in Engram — non-authoritative.
 		// Pure openspec still blocks (legit "run sdd-new").
-		if (store === "both") {
+		if (store === "hybrid") {
 			return nonAuthoritativeStatus(options.cwd, changeName, store, options.includeInstructions);
 		}
-		return emptyStatus(root, changeName, [`Active change not found: ${changeName}.`], store, false, options.reviewAuthority);
+		return emptyStatus(root, changeName, [`Active change not found: ${changeName}.`], store);
 	}
 
 	const changeRoot = join(changesDir, changeName);
@@ -587,33 +530,13 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 		blockedReasons.push(`Legacy flat spec is present without domain specs: ${legacyFlatSpec.path}.`);
 	}
 
-	// Planning-only status remains filesystem-read-only: do not invoke a resolver
-	// unless the controller has established that review authority is expected.
-	if (options.reviewAuthority?.expected) {
-		try {
-			const resolved = options.reviewAuthority.resolve();
-			if (!resolved || typeof resolved.activeAuthorityId !== "string" || resolved.activeAuthorityId.length === 0) {
-				blockedReasons.push("resolve-review: validated active review authority is missing.");
-			}
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			blockedReasons.push(`resolve-review: ${message}`);
-		}
-	}
-	if (options.nativeReviewReadiness?.expected && !options.nativeReviewReadiness.ready) {
-		blockedReasons.push(`resolve-review: ${options.nativeReviewReadiness.reason ?? "native bound review readiness is unavailable."}`);
-	}
-
 	const coreArtifactsReady = artifacts.proposal === "done" && artifacts.specs === "done" && artifacts.design === "done" && artifacts.tasks === "done" && taskProgress.total > 0 && !flatOnly;
-	const reviewBlocked = blockedReasons.some((reason) => reason.startsWith("resolve-review:"));
 	const taskArtifactBlocked = taskAccounting.errors.length > 0;
-	const reviewApproved = Boolean((options.reviewAuthority?.expected || options.nativeReviewReadiness?.expected) && !reviewBlocked);
-	const applyState: ApplyState = !coreArtifactsReady || reviewBlocked || taskArtifactBlocked
+	const applyState: ApplyState = !coreArtifactsReady || taskArtifactBlocked
 		? "blocked"
 		: taskProgress.remaining === 0
 			? "all_done"
 			: "ready";
-	const parentLifecycleRequired = applyState === "all_done" && !reviewApproved;
 	const verifyClean = reportIsClearlyPassing(artifactPaths.verifyReport[0]);
 	const syncClean = reportIsClearlyPassing(artifactPaths.syncReport[0]);
 	const syncPrerequisitesReady = coreArtifactsReady && verifyClean && collisions.length === 0 && !flatOnly;
@@ -624,31 +547,27 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 		: "blocked";
 	const verifyState: DependencyState = verifyClean
 		? "all_done"
-		: reviewApproved && artifacts.tasks === "done" && taskProgress.total > 0 && (artifacts.applyProgress === "done" || applyState === "all_done")
+		: artifacts.tasks === "done" && taskProgress.total > 0 && (artifacts.applyProgress === "done" || applyState === "all_done")
 			? "ready"
 			: "blocked";
 	const dependencies: SddStatus["dependencies"] = {
 		apply: applyState === "blocked" ? "blocked" : applyState,
 		verify: verifyState,
 		sync: syncState,
-		archive: coreArtifactsReady && reviewApproved && verifyClean && syncClean && taskProgress.remaining === 0 && taskAccounting.parent.remaining === 0 && !reviewBlocked && !taskArtifactBlocked ? "ready" : "blocked",
+		archive: coreArtifactsReady && verifyClean && syncClean && taskProgress.remaining === 0 && !taskArtifactBlocked ? "ready" : "blocked",
 	};
 	const archiveReady = dependencies.archive === "ready";
-	const nextRecommended = reviewBlocked
-		? "resolve-review"
-		: taskArtifactBlocked
-			? "fix-task-ownership-marker"
-			: parentLifecycleRequired
-				? "parent-lifecycle"
-				: dependencies.apply === "ready"
-					? "sdd-apply"
-					: dependencies.verify === "ready"
-						? "sdd-verify"
-						: dependencies.sync === "ready"
-							? "sdd-sync"
-							: archiveReady
-								? "sdd-archive"
-								: blockedReasons[0] ?? "Resolve blockers.";
+	const nextRecommended = taskArtifactBlocked
+		? "fix-task-ownership-marker"
+		: dependencies.apply === "ready"
+			? "sdd-apply"
+			: dependencies.verify === "ready"
+				? "sdd-verify"
+				: dependencies.sync === "ready"
+					? "sdd-sync"
+					: archiveReady
+						? "sdd-archive"
+						: blockedReasons[0] ?? "Resolve blockers.";
 
 	const status: SddStatus = {
 		schemaName: "gentle-pi.sdd-status",
@@ -681,9 +600,8 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 		blockedReasons,
 		isNonAuthoritative: false,
 	};
-	const resolvedStatus = withRecoveryBlock(status, options.reviewAuthority, options.nativeReviewReadiness);
-	if (options.includeInstructions) resolvedStatus.instructions = renderPhaseInstructions(resolvedStatus);
-	return resolvedStatus;
+	if (options.includeInstructions) status.instructions = renderPhaseInstructions(status);
+	return status;
 }
 
 export function isNonAuthoritativeStatus(status: SddStatus): boolean {
