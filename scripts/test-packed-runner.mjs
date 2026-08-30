@@ -50,7 +50,9 @@ try {
 		stdio: "inherit",
 	});
 	const packageRoot = join(installDirectory, "node_modules", "gentle-pi");
-	const versions = readdirSync(join(packageRoot, ".gentle-ai"), { withFileTypes: true }).filter((entry) => entry.isDirectory() && /^v\d+\.\d+\.\d+$/.test(entry.name));
+	// Accept prerelease pins too: a stable-only pattern here was a second,
+	// silent pin that refused the first prerelease version directory.
+	const versions = readdirSync(join(packageRoot, ".gentle-ai"), { withFileTypes: true }).filter((entry) => entry.isDirectory() && /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.]*)?$/.test(entry.name));
 	if (versions.length !== 1) throw new Error("packed install did not contain exactly one package-local Gentle AI version");
 	const executable = join(packageRoot, ".gentle-ai", versions[0].name, process.platform === "win32" ? "gentle-ai.exe" : "gentle-ai");
 	const capabilities = JSON.parse(execFileSync(executable, ["review", "capabilities", "--contract", "gentle-ai.review-integration/v2"], { cwd: installDirectory, encoding: "utf8" }));
