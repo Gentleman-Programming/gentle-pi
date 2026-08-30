@@ -54,6 +54,12 @@ The phase reported:
 
 These application details demonstrate end-to-end execution only. No application-specific rule is embedded in the controller changes.
 
+## Model-evidence boundary
+
+The validation artifacts distinguish a model being executed from a model passing
+or failing a benchmark. The public, sanitised inventory and its attribution
+limits are documented in [`../MODEL_EVIDENCE_AND_LIMITS.md`](../MODEL_EVIDENCE_AND_LIMITS.md).
+
 ## Watchdog validation observed during the preceding run
 
 The log also showed:
