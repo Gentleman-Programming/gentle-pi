@@ -358,35 +358,18 @@ function readMarkdownSection(source: string, heading: string): string {
 	return lines.slice(start + 1, end).join("\n").trim();
 }
 
-function assertWorkerFallbackRouting(section: string, sectionName: string): void {
+function assertSelectedRuntimeContainment(section: string, sectionName: string): void {
 	const boundedWriterPolicy = section.match(
 		/For bounded multi-file writes,[\s\S]*?(?=\n\n|\n\s*\d+\.|$)/,
 	)?.[0];
 	assert.ok(boundedWriterPolicy, `${sectionName} must define bounded writer routing`);
-
-	const preferred = boundedWriterPolicy.indexOf("`gentle-ai-worker`");
-	const configuredFallback = boundedWriterPolicy.indexOf("user-configured `worker`");
-	const nativeFallback = boundedWriterPolicy.indexOf("native `Agent`");
-
-	assert.ok(preferred >= 0, `${sectionName} must reference exact gentle-ai-worker name`);
-	assert.ok(
-		configuredFallback > preferred,
-		`${sectionName} must prefer the package-owned worker before a user-configured worker`,
-	);
-	assert.ok(
-		nativeFallback > configuredFallback,
-		`${sectionName} must place native Agent after both named worker definitions`,
-	);
+	assert.match(boundedWriterPolicy, /selected installed package-owned `gentle-ai-worker` or user-configured `worker`/);
 	assert.match(
 		boundedWriterPolicy,
-		/If neither (?:worker )?definition exists[^.]*native `Agent`[^.]*even when `subagent_\*` tools are available\./,
-		`${sectionName} must choose native Agent when neither worker definition exists`,
+		/If neither selected runtime is available, return an actionable stop that identifies how to restore the selected runtime; do not switch runtimes\./,
+		`${sectionName} must stop inside the selected runtime`,
 	);
-	assert.match(
-		section,
-		/If no delegation mechanism is available, stop/,
-		`${sectionName} must stop when delegation is impossible`,
-	);
+	assert.doesNotMatch(section, /(?:Pi's native|native) `Agent`/i);
 }
 
 test("Markdown section extraction isolates policy text from sibling sections", () => {
@@ -1106,7 +1089,7 @@ test("normal and forced installation copy generic agents with complete role cont
 	}
 });
 
-test("bounded implementation routing uses the same explicit fallback in both policy sections", () => {
+test("bounded implementation routing contains selected runtimes in both policy sections", () => {
 	const routing = readFileSync(
 		join(PACKAGE_ROOT, "assets", "orchestrator-delegation.md"),
 		"utf8",
@@ -1114,8 +1097,8 @@ test("bounded implementation routing uses the same explicit fallback in both pol
 	const simpleDelegation = readMarkdownSection(routing, "2. Simple Delegation");
 	const mandatoryDelegation = readMarkdownSection(routing, "Mandatory Delegation Triggers");
 
-	assertWorkerFallbackRouting(simpleDelegation, "Simple Delegation");
-	assertWorkerFallbackRouting(mandatoryDelegation, "Mandatory Delegation Triggers");
+	assertSelectedRuntimeContainment(simpleDelegation, "Simple Delegation");
+	assertSelectedRuntimeContainment(mandatoryDelegation, "Mandatory Delegation Triggers");
 	assert.doesNotMatch(
 		routing,
 		/non-normative compatibility quotation|former wording is retained|no-runtime inline exception|superseded by the stop requirement/,
@@ -1140,8 +1123,8 @@ test("orchestrator routes generic roles without static RDD lens routing", () => 
 		assert.match(routing, /SDD roles stay inside SDD|Use `sdd-explore` and `sdd-verify` only inside SDD/);
 		assert.match(routing, /(?:truly local )?read-only check(?:ing)? of (?:known )?1[-–]3 known files|1[-–]3-file read-only check/);
 		assert.match(routing, /(?:verification that |verification commands →).*executes? or delegates?|executing\/delegating verification commands/);
-		assert.match(routing, /missing(?: or |\/)unusable[\s\S]*native `Agent`[\s\S]*(?:the )?same read-only/);
-		assert.match(routing, /report (?:the )?fallback/);
+		assert.match(routing, /selected runtime[\s\S]{0,160}actionable stop/i);
+		assert.doesNotMatch(routing, /(?:Pi's native|native) `Agent`/i);
 		assert.doesNotMatch(routing, /review lenses? (?:inside|only inside)|review lens routing/i);
 	}
 

@@ -329,6 +329,13 @@ test("core-alone: load-bearing direct-delegation tokens remain without lazy unio
 	assert.match(core, /Long-session rule/);
 });
 
+test("direct-delegation surfaces retain selected-runtime containment", () => {
+	const content = `${readRealAsset("orchestrator.md")}\n${readRealAsset("orchestrator-delegation.md")}`;
+	assert.match(content, /selected runtime[\s\S]{0,160}actionable stop/i);
+	assert.match(content, /no target-cwd capability/);
+	assert.doesNotMatch(content, /(?:Pi's native|native) `Agent`/i);
+});
+
 test("core-alone: dynamic Gentle AI ownership replaces package lifecycle instructions", () => {
 	const core = readRealAsset("orchestrator.md");
 	assert.match(core, /dynamically supplies runtime-specific RDD instructions via generated Pi APPEND_SYSTEM composition/);

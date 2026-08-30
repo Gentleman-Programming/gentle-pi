@@ -231,7 +231,7 @@ The Automatic Mode Gatekeeper one-rerun rule above is a quality gate, not a laun
 
 ## SDD Phase Delegation Mode
 
-Launch SDD phase subagents with `subagent_run` `mode: "task"` when the parent needs the phase result to route the next step. SDD phases, writers, dependent verify evidence, and archive are foreground-mandatory under the background subagent policy block in the delegation contract; background completion is a notification/history mechanism, not an orchestration resume guarantee.
+Launch SDD phase subagents with `subagent_run` `mode: "task"` when the parent needs the phase result to route the next step. SDD phases, writers, dependent verify evidence, and archive are foreground-mandatory under the background subagent policy block in the delegation contract; background completion is a notification/history mechanism, not an orchestration resume guarantee. The selected managed runtime has no target-cwd capability: when another worktree is required, stop actionably rather than switching sessions, processes, windows, panes, or remote surfaces. #376 owns positive managed target-cwd execution.
 
 ## Model Assignments
 
@@ -271,7 +271,7 @@ Pre-flight before every SDD/Judgment-Day phase launch:
 3. Resolve matching skill paths once per session from the registry and pass exact `SKILL.md` paths under `## Skills to load before work`.
 4. If a delegated result reports `skill_resolution` as `fallback-registry`, `fallback-path`, or `none`, re-read the registry before subsequent delegations.
 
-**Key Learnings closing (generic delegations):** when delegating to generic agents (`gentle-ai-explore`, `gentle-ai-worker`, `gentle-ai-verify`, scout/worker roles, or the native `Agent` fallback), apply the rule exactly as stated under "Key Learnings closing block" in `assets/orchestrator-delegation.md`. That file is the single statement of the rule; do not restate or paraphrase it here. SDD phase launch prompts need no such injection: every installed SDD phase executor already carries the effective contract in its own prompt (see "Key Learnings closing block (routing)" above).
+**Key Learnings closing (generic delegations):** when delegating to generic agents (`gentle-ai-explore`, `gentle-ai-worker`, `gentle-ai-verify`, or scout/worker roles) in the selected runtime, apply the rule exactly as stated under "Key Learnings closing block" in `assets/orchestrator-delegation.md`. Selected-runtime exhaustion returns an actionable stop that identifies how to restore it; do not switch runtimes. That file is the single statement of the rule; do not restate or paraphrase it here. SDD phase launch prompts need no such injection: every installed SDD phase executor already carries the effective contract in its own prompt (see "Key Learnings closing block (routing)" above).
 
 ## Strict TDD Forwarding
 

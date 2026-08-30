@@ -83,7 +83,7 @@ Core principle: **does this inflate the parent context without need?** If yes, u
 | Bash for state (`git`, `gh`) | ✅ | — |
 | Tests, builds, or installs | allowed as a bounded action | ✅ fresh per-action worker without changing route |
 
-Use the platform's native bounded worker for delegated-direct work; reserve `sdd-*` agents for a selected SDD route.
+Use the bounded worker provided by the selected managed subagent runtime for delegated-direct work; reserve `sdd-*` agents for a selected SDD route.
 
 Keep one writer and a short synthesized handoff. Delegation is mandatory at the mapping, write, preparation, and broad-research boundaries, but it remains a direct implementation route and must not synthesize SDD artifacts.
 
@@ -98,19 +98,19 @@ These are parent-orchestrator routing boundaries. Use the smallest useful topolo
 5. **Per-action rule**: tests, builds, and installs may use fresh workers without changing the implementation route or creating SDD state.
 6. **Optional SDD rule**: propose SDD only when durable proposal/spec/design/tasks materially reduce substantial ambiguity. Select SDD only after an explicit request or accepted proposal; risk alone never forces SDD.
 
-For bounded multi-file writes, prefer the installed package-owned `gentle-ai-worker`, then a user-configured `worker`. If neither worker definition exists, fall back to the native `Agent` even when `subagent_*` tools are available. If no delegation mechanism is available, stop and explain the blocker.
+For bounded multi-file writes, use the selected installed package-owned `gentle-ai-worker` or user-configured `worker`. If neither selected runtime is available, return an actionable stop that identifies how to restore the selected runtime; do not switch runtimes.
 
 #### Pi Trigger Runtime Bindings
 
-Once a trigger fires, the parent MUST delegate through the best available subagent runtime. Prefer `subagent_run` when present; otherwise use Pi's native `Agent` or another available delegation mechanism. Do not replace a required delegation with inline execution. Do not inject these as child-agent permission to spawn subagents; children receive concrete role work and must not orchestrate.
+Once a trigger fires, the parent MUST delegate through the selected subagent runtime. Do not replace a required delegation with inline execution or another runtime. Do not inject these as child-agent permission to spawn subagents; children receive concrete role work and must not orchestrate.
 
-The bounded multi-file writer precedence in rule 3 overrides that general runtime preference. If no delegation mechanism is available, stop and explain the blocker.
+The bounded multi-file writer precedence in rule 3 selects the runtime. Selected-runtime exhaustion returns an actionable stop that identifies how to restore it; retry only through that runtime's existing bounded policy.
 
-1. **4-file rule**: launch `scout`, `context-builder`, or the closest read-only mapping subagent with fresh context and a narrow mapping task. Route generic non-SDD exploration to `gentle-ai-explore`; if missing or unusable, use native `Agent` with the same read-only mapping task and report the fallback.
-2. **Multi-file write rule**: for bounded multi-file writes, prefer the installed package-owned `gentle-ai-worker`, then a user-configured `worker`. If neither worker definition exists, fall back to the native `Agent` even when `subagent_*` tools are available. If no delegation mechanism is available, stop and explain the blocker.
+1. **4-file rule**: launch `scout`, `context-builder`, or the closest read-only mapping subagent with fresh context and a narrow mapping task. Route generic non-SDD exploration to the selected `gentle-ai-explore` runtime; if it is unavailable or unusable, stop with the action needed to restore that runtime.
+2. **Multi-file write rule**: for bounded multi-file writes, use the selected installed package-owned `gentle-ai-worker` or user-configured `worker`. If neither selected runtime is available, return an actionable stop that identifies how to restore the selected runtime; do not switch runtimes.
 3. **Incident rule**: after wrong `cwd`, accidental repository/worktree mutation, failed merge recovery, confusing test command, or environment workaround, stop and diagnose the incident separately before resuming.
 4. **Long-session rule**: if accumulating work is no longer clearly local — roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without delegation — pause and delegate the remaining work instead of silently continuing monolithically.
-5. **Verification rule**: delegate generic non-SDD verification that executes or delegates commands to `gentle-ai-verify`. If that role is missing or unusable, use native `Agent` with the same read-only verification task and exact parent-authorized commands. Only truly local read-only checking of 1–3 known files stays inline.
+5. **Verification rule**: delegate generic non-SDD verification that executes or delegates commands to the selected `gentle-ai-verify` runtime. If it is missing or unusable, stop with the action needed to restore that runtime; do not switch runtimes. Only truly local read-only checking of 1–3 known files stays inline.
 
 ### Work Routing Ladder
 
@@ -126,12 +126,14 @@ Delegate when work would inflate parent context or requires focused exploration,
 
 Use the configured subagent runtime when available. Prefer the `subagent_*` tools (`subagent_run`, status/result helpers) when the Pi Subagents extension is installed, because they run the user's configured project/global subagent definitions and preserve history/background behavior.
 
-For bounded multi-file writes, prefer the installed package-owned `gentle-ai-worker`, then a user-configured `worker`. If neither worker definition exists, fall back to the native `Agent` even when `subagent_*` tools are available. If no delegation mechanism is available, stop and explain the blocker.
+Execution-surface containment: selected managed `subagent_run` inherits the parent cwd and has no target-cwd capability. If another worktree is required, stop actionably; never switch sessions, processes, windows, panes, or remote surfaces. #376 owns positive managed target-cwd execution.
+
+For bounded multi-file writes, use the selected installed package-owned `gentle-ai-worker` or user-configured `worker`. If neither selected runtime is available, return an actionable stop that identifies how to restore the selected runtime; do not switch runtimes.
 
 <!-- gentle-pi:background-subagents -->
 #### Background Subagent Policy
 
-Background execution is policy-gated: the always-on orchestrator prompt renders one status line, `Background subagent policy: on|off (capability: ready|absent)`. If the policy is off OR the `subagent_run` tool is unavailable, run every delegation in the foreground — `mode: "task"` when `subagent_*` tools exist, otherwise the native `Agent` fallback — always.
+Background execution is policy-gated: the always-on orchestrator prompt renders one status line, `Background subagent policy: on|off (capability: ready|absent)`. If the policy is off, run every delegation in the selected runtime's foreground `mode: "task"`. If that runtime is unavailable, stop with the action needed to restore it; do not switch runtimes.
 
 When the policy is on and `subagent_run` is available:
 
@@ -143,11 +145,11 @@ When the policy is on and `subagent_run` is available:
 - Background jobs are process-local and non-durable. A restart loses them; make no recovery claim.
 <!-- /gentle-pi:background-subagents -->
 
-For generic non-SDD exploration and mapping, first attempt the installed package-owned `gentle-ai-explore`. If that individual role is missing or unusable, fall back to Pi's native `Agent` with the same read-only mapping constraints and report the fallback.
+For generic non-SDD exploration and mapping, use the installed package-owned `gentle-ai-explore` runtime. If it is unavailable or unusable, stop with the action needed to restore that runtime; do not switch runtimes.
 
-For bounded multi-file writes, prefer the installed package-owned `gentle-ai-worker`, then a user-configured `worker`. If neither worker definition exists, fall back to the native `Agent` even when `subagent_*` tools are available. If no delegation mechanism is available, stop and explain the blocker. This writer precedence overrides the general runtime preference above.
+For bounded multi-file writes, use the selected installed package-owned `gentle-ai-worker` or user-configured `worker`. If neither selected runtime is available, return an actionable stop that identifies how to restore the selected runtime; do not switch runtimes.
 
-For generic non-SDD technical verification that executes or delegates commands, first attempt the installed package-owned `gentle-ai-verify`. If that individual role is missing or unusable, fall back to Pi's native `Agent` with the same read-only verification constraints, exact parent-authorized commands, and fallback reporting. Truly local read-only checking of 1–3 known files may remain inline.
+For generic non-SDD technical verification that executes or delegates commands, use the installed package-owned `gentle-ai-verify` runtime. If it is unavailable or unusable, stop with the action needed to restore that runtime; do not switch runtimes. Truly local read-only checking of 1–3 known files may remain inline.
 
 Use `sdd-explore` and `sdd-verify` only inside SDD.
 
@@ -155,7 +157,7 @@ Use `sdd-explore` and `sdd-verify` only inside SDD.
 
 The bounded writer refuses to write outside the exact allowed edit surfaces and stops with `status: interaction_required` when they are missing. The parent owns that input. Deriving it is part of planning the delegation, not something the writer or the human can be left to supply.
 
-Before launching a bounded writer (`gentle-ai-worker`, a user-configured `worker`, or the native `Agent` fallback), derive the allowed edit surface from the task being delegated — the files the planned change must touch, plus the directories where the task authorizes new files — and pass it in the delegated prompt under an `## Allowed edit surfaces` heading, in the same exact-path form as `## Skills to load before work`:
+Before launching a bounded writer (`gentle-ai-worker` or a user-configured `worker` in the selected runtime), derive the allowed edit surface from the task being delegated — the files the planned change must touch, plus the directories where the task authorizes new files — and pass it in the delegated prompt under an `## Allowed edit surfaces` heading, in the same exact-path form as `## Skills to load before work`:
 
 - exact repository-relative paths or narrow globs, one per line; never `.` and never a bare repository root;
 - pre-existing untracked targets the writer may write, listed explicitly;
@@ -168,9 +170,9 @@ Relay a writer's `interaction_required` payload about edit surfaces the same way
 
 #### Key Learnings closing block
 
-When delegating to a generic Explore/general worker (`gentle-ai-explore`, `gentle-ai-worker`, `gentle-ai-verify`) or their native `Agent` fallback, include the same `## Key Learnings` closing instruction in the delegated prompt: after the worker returns its normal result envelope or handoff, it closes its final response text with a `## Key Learnings` block of 1–5 numbered items, each a standalone factual sentence of at least 20 characters and at least 4 words, omitting the block when there is genuinely no reusable learning. The block layers on after the structured Return contract and does not alter its fields. This applies to final response text only — not intermediate tool output. The Engram memory provider automatically extracts and persists these items as passive capture; the worker does not parse the block or invoke passive-capture tools itself. This is separate from explicit `mem_save` artifact/decision persistence. Agents that must return strict JSON never receive this closing instruction; their required output shape remains unchanged.
+When delegating to a generic Explore/general worker (`gentle-ai-explore`, `gentle-ai-worker`, `gentle-ai-verify`) in the selected runtime, include the same `## Key Learnings` closing instruction in the delegated prompt: after the worker returns its normal result envelope or handoff, it closes its final response text with a `## Key Learnings` block of 1–5 numbered items, each a standalone factual sentence of at least 20 characters and at least 4 words, omitting the block when there is genuinely no reusable learning. The block layers on after the structured Return contract and does not alter its fields. This applies to final response text only — not intermediate tool output. The Engram memory provider automatically extracts and persists these items as passive capture; the worker does not parse the block or invoke passive-capture tools itself. This is separate from explicit `mem_save` artifact/decision persistence. Agents that must return strict JSON never receive this closing instruction; their required output shape remains unchanged.
 
-For delegation other than bounded multi-file writes, use the generic fallback: if `subagent_*` tools are unavailable, fall back to Pi's native `Agent` tool or another available delegation mechanism. The delegation trigger remains mandatory; the fallback changes the runtime, not the requirement to delegate. If no delegation mechanism is available, stop the complex work and explain the blocker instead of silently continuing inline.
+For delegation other than bounded multi-file writes, preserve the selected runtime: if the selected runtime is unavailable, return an actionable stop that identifies how to restore it instead of silently continuing inline or switching runtimes. Retry only through that runtime's existing bounded policy.
 
 #### Pi Subagent Model Routing
 
