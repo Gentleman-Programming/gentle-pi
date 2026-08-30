@@ -261,7 +261,6 @@ export interface NativeReviewAbandonRequest {
 	snapshotIdentity: string;
 	capturedLensResults: readonly string[];
 	findingsPresent: boolean;
-	evidenceRecordsPresent: boolean;
 	actor: string;
 	reason: string;
 	maintainerAuthorization: string;
@@ -1372,9 +1371,7 @@ class NativeReviewPlainCli {
 			if (!isCanonicalProcessString(value)) throw new TypeError(`Native ABANDON ${name} must be a non-empty, trimmed, NUL-free string`);
 		}
 		if (!Array.isArray(request.capturedLensResults) || request.capturedLensResults.some((entry) => !isCanonicalProcessString(entry))) throw new TypeError("Native ABANDON capturedLensResults must be an array of non-empty, trimmed, NUL-free strings");
-		for (const [name, value] of [["findingsPresent", request.findingsPresent], ["evidenceRecordsPresent", request.evidenceRecordsPresent]] as const) {
-			if (typeof value !== "boolean") throw new TypeError(`Native ABANDON ${name} must be a boolean`);
-		}
+		if (typeof request.findingsPresent !== "boolean") throw new TypeError("Native ABANDON findingsPresent must be a boolean");
 		if (request.maintainerAuthorization !== nativeReviewAbandonAuthorization(request)) throw new TypeError("Native ABANDON maintainerAuthorization must match the exact lineage, revision, snapshot, reason, discarded-work, and actor binding");
 		const execution = await this.execute(NATIVE_REVIEW_OPERATION.ABANDON, request.cwd, [
 			"review", "abandon", "--cwd", request.cwd,
@@ -1463,7 +1460,11 @@ class NativeReviewPlainCli {
 	}
 }
 
-export function nativeReviewAbandonAuthorization(request: Pick<NativeReviewAbandonRequest, "lineage" | "expectedRevision" | "snapshotIdentity" | "capturedLensResults" | "findingsPresent" | "evidenceRecordsPresent" | "actor" | "reason">): string {
+export function nativeReviewAbandonAuthorization(request: Pick<NativeReviewAbandonRequest, "lineage" | "expectedRevision" | "snapshotIdentity" | "capturedLensResults" | "findingsPresent" | "actor" | "reason">): string {
+	// gentle-ai 0ed9225f removed evidence records from the discarded-work summary,
+	// so the native v2 gate verifies an exact eight-line binding (schema, lineage,
+	// revision, snapshot_identity, reason, captured_lens_results, findings_present,
+	// actor) — there is no evidence_records_present line to derive or relay.
 	return [
 		"gentle-ai.review-abandon-authorization/v2",
 		`lineage=${request.lineage}`,
@@ -1472,7 +1473,6 @@ export function nativeReviewAbandonAuthorization(request: Pick<NativeReviewAband
 		`reason=${request.reason}`,
 		`captured_lens_results=${request.capturedLensResults.join(",")}`,
 		`findings_present=${request.findingsPresent}`,
-		`evidence_records_present=${request.evidenceRecordsPresent}`,
 		`actor=${request.actor.trim()}`,
 	].join("\n");
 }
