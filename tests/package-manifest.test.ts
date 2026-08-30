@@ -129,9 +129,12 @@ test("shipped prompt and agent instructions contain no pi-mono repository residu
 		for (const pattern of forbidden) assert.doesNotMatch(content, pattern, path);
 	}
 
-	assert.ok(scannedPaths.includes("assets/orchestrator.md"), "scan must cover root asset instructions");
 	assert.ok(
-		scannedPaths.includes("assets/chains/4r-review.chain.md"),
+		scannedPaths.includes(join("assets", "orchestrator.md")),
+		"scan must cover root asset instructions",
+	);
+	assert.ok(
+		scannedPaths.includes(join("assets", "chains", "4r-review.chain.md")),
 		"scan must cover nested asset instructions",
 	);
 });
