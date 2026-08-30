@@ -788,10 +788,7 @@ function classifyGuardedCommand(
 	return evaluateGuardedCommand(command, config).action;
 }
 
-function guardedCommandPreview(
-	command: string,
-	triggerIndex = Math.max(0, command.search(GIT_PUSH_RE)),
-): string {
+function guardedCommandPreview(command: string, triggerIndex: number): string {
 	const start = Math.max(0, triggerIndex - 60);
 	const prefix = start > 0 ? "…" : "";
 	return `${prefix}${truncateToWidth(command.slice(start).replace(/\s+/g, " ").trim(), 180 - prefix.length, "…")}`;

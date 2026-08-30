@@ -161,9 +161,9 @@ test("classifyGuardedCommand: configured push allow is remote-agnostic and uncha
 test("guardedCommandPreview: long late matched action stays visible in preview", () => {
 	const prefix = "noise ".repeat(80);
 	const command = `${prefix}git push origin feature/test`;
-	// Production always passes the matched action's trigger index explicitly
-	// (confirmCommand hands over evaluation.triggerIndex; the default git-push-only
-	// search is never used on the confirm path), so exercise the two-argument form.
+	// Contract: the caller owns the trigger index. confirmCommand hands over
+	// evaluation.triggerIndex, so the preview always centers on the matched
+	// action supplied by the evaluator.
 	const triggerIndex = command.indexOf("git push");
 	const preview = guardedCommandPreview(command, triggerIndex);
 	assert.match(preview, /git push origin feature\/test/);
