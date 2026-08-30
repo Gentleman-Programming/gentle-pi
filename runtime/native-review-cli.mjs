@@ -15,7 +15,11 @@ import {
 	decodeReviewRepairV2,
 	decodeReviewResultArtifactV2,
 	decodeReviewStartV3,
+	decodeReviewStartV4,
 	decodeReviewStatusV3,
+
+
+
 
 
 
@@ -557,7 +561,7 @@ export const NATIVE_REVIEW_RECOVERY_DISPOSITION = {
 
 
 
-export const NATIVE_START_ACTION = { CREATED: "created", RESUMED: "resumed", CLOSED: "closed", BLOCKED_SCOPE_ACTION: "blocked-scope-action" }         ;
+export const NATIVE_START_ACTION = { CREATED: "created", RESUMED: "resumed", REPLAYED: "replayed", CLOSED: "closed", BLOCKED_SCOPE_ACTION: "blocked-scope-action" }         ;
 
 
 export function isCanonicalProcessString(value         )                  {
@@ -928,6 +932,12 @@ function assertSupportedNextTransitionOperation(body                         )  
 }
 function decode   (operation                       , mutating         , callback         , diagnostics = nativeProcessDiagnostics(operation, NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE))    {
 	try { return callback(); } catch (error) { if (error instanceof NativeReviewCliError) throw error; throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE, operation, true, mutating, "native response is schema incompatible", { ...diagnostics, error_code: NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE }); }
+}
+function decodeReviewStartResponse(value         )                                {
+	const body = object(value);
+	return body.schema === "gentle-ai.review-integration.start/v4"
+		? decodeReviewStartV4(body)
+		: decodeReviewStartV3(body);
 }
 function decodeReleaseEvidence(value         )       {
 	const release = exactObject(value, ["release_tree", "configuration_hash", "generated_artifact_hash", "provenance_hash", "publication_boundary_hash", "publication_state", "evidence_freshness_hash", "evidence_freshness_state"]);
@@ -1854,7 +1864,7 @@ export class NativeReviewCliV216                            {
 			if (consent.targetIdentity !== targetIdentity || consent.projection !== projection) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native consent target binding mismatch");
 			throw new NativeReviewConsentRequiredError(consent);
 		}
-		const result = decode(NATIVE_REVIEW_OPERATION.START, true, () => decodeReviewStartV3(execution.body));
+		const result = decode(NATIVE_REVIEW_OPERATION.START, true, () => decodeReviewStartResponse(execution.body));
 		if (request.lineageId !== undefined && result.lineageId !== request.lineageId) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native start lineage mismatch");
 		const resultTarget = result.targetIdentity ?? result.repositoryContext?.targetIdentity;
 		if (resultTarget !== undefined && resultTarget !== targetIdentity) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native start target mismatch");
@@ -1869,6 +1879,7 @@ export class NativeReviewCliV216                            {
 			action: result.action                     ,
 			lensesRequired: result.lensesRequired,
 			riskReasons: result.riskReasons.map((reason) => ({ ...reason })),
+			...("nextTransition" in result && result.nextTransition !== undefined ? { nextTransition: result.nextTransition } : {}),
 			// Derived, not received. `risk_reasons` is a required start/v2 field
 			// already recomputed against the authoritative frozen snapshot, so
 			// these phrases describe the same candidate the lenses will review.
@@ -1892,7 +1903,7 @@ export class NativeReviewCliV216                            {
 		if (request.answer === NATIVE_REVIEW_CONSENT_ANSWER.DECLINED) {
 			return decode(NATIVE_REVIEW_OPERATION.START, true, () => decodeDeclinedConsentStart(execution.body, request));
 		}
-		const result = decode(NATIVE_REVIEW_OPERATION.START, true, () => decodeReviewStartV3(execution.body));
+		const result = decode(NATIVE_REVIEW_OPERATION.START, true, () => decodeReviewStartResponse(execution.body));
 		const answeredTarget = result.targetIdentity ?? result.repositoryContext?.targetIdentity;
 		if (answeredTarget !== request.consent.targetIdentity) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native consent answer target mismatch");
 		if (invocation.lineageId !== undefined && result.lineageId !== invocation.lineageId) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native consent answer lineage mismatch");
@@ -1907,6 +1918,7 @@ export class NativeReviewCliV216                            {
 			action: result.action                     ,
 			lensesRequired: result.lensesRequired,
 			riskReasons: result.riskReasons.map((reason) => ({ ...reason })),
+			...("nextTransition" in result && result.nextTransition !== undefined ? { nextTransition: result.nextTransition } : {}),
 			...(() => {
 				const evidence = nativeRiskEvidencePhrases(result.riskLevel, result.riskReasons);
 				return evidence.length === 0 ? {} : { riskEvidence: evidence };

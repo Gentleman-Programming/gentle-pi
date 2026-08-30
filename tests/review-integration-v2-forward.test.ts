@@ -9,6 +9,7 @@ import {
 	decodeReviewLastEventClosureV1,
 	decodeReviewResultArtifactV2,
 	decodeReviewStartV3,
+	decodeReviewStartV4,
 	decodeReviewStatusV3,
 } from "../lib/review-integration-v2.ts";
 
@@ -287,4 +288,72 @@ test("a result artifact rejects unknown keys and weakened bindings", () => {
 	const foreignLocator = clone(base);
 	foreignLocator.reference = `rref1_${"b".repeat(64)}`;
 	assert.throws(() => decodeReviewResultArtifactV2(foreignLocator), /reference/);
+});
+
+function reviewingStartV4(action: "created" | "replayed" = "created"): JsonObject {
+	const body = clone(fixture(DEV_FIXTURES, "start-v3-consent-granted.captured.json") as JsonObject);
+	body.schema = "gentle-ai.review-integration.start/v4";
+	body.action = action;
+	const targetIdentity = (body.repository_context as JsonObject).target_identity as string;
+	body.next_transition = {
+		kind: "execute",
+		reason_code: "review_status_required",
+		execute: {
+			operation: "review.status",
+			arguments: [
+				{ name: "lineage", value: body.lineage_id, token: `--lineage=${body.lineage_id}` },
+				{ name: "target", value: targetIdentity, token: `--target=${targetIdentity}` },
+			],
+			preconditions: [],
+			binding: { target_identity: targetIdentity },
+		},
+	};
+	return body;
+}
+
+test("capabilities/v2.3 requires START/v4 and rejects future identities", () => {
+	const v23 = clone(fixture(DEV_FIXTURES, "capabilities-v2.2.captured.json") as JsonObject);
+	v23.schema = "gentle-ai.review-integration.capabilities/v2.3";
+	(v23.protocol as JsonObject).minor = 3;
+	v23.schemas = (v23.schemas as string[]).map((schema) => schema
+		.replace("capabilities/v2.2", "capabilities/v2.3")
+		.replace("start/v3", "start/v4"));
+	const decoded = decodeReviewCapabilitiesV2(v23, CAPTURED_DIGEST);
+	assert.equal(decoded.schemas.has("gentle-ai.review-integration.start/v4"), true);
+	assert.equal(decoded.schemas.has("gentle-ai.review-integration.start/v3"), false);
+
+	const future = clone(v23);
+	future.schema = "gentle-ai.review-integration.capabilities/v2.4";
+	(future.protocol as JsonObject).minor = 4;
+	future.schemas = (future.schemas as string[]).map((schema) => schema.replace("capabilities/v2.3", "capabilities/v2.4"));
+	assert.throws(() => decodeReviewCapabilitiesV2(future, CAPTURED_DIGEST), /schema must be one of/);
+});
+
+test("START/v4 accepts only its reviewing status continuation and preserves v3 strictness", () => {
+	for (const action of ["created", "replayed"] as const) {
+		const decoded = decodeReviewStartV4(reviewingStartV4(action));
+		assert.equal(decoded.nextTransition?.execute?.operation, "review.status");
+		assert.deepEqual(decoded.nextTransition?.execute?.arguments.map((argument) => argument.token), [
+			`--lineage=${decoded.lineageId}`,
+			`--target=${decoded.repositoryContext?.targetIdentity}`,
+		]);
+	}
+
+	const v3 = reviewingStartV4();
+	v3.schema = "gentle-ai.review-integration.start/v3";
+	assert.throws(() => decodeReviewStartV3(v3), /next_transition is not allowed/);
+
+	const wrongOperation = reviewingStartV4();
+	((wrongOperation.next_transition as JsonObject).execute as JsonObject).operation = "review.start";
+	assert.throws(() => decodeReviewStartV4(wrongOperation), /review.status/);
+});
+
+test("START/v4 closed approval keeps acknowledgement but forbids a continuation", () => {
+	const closed = clone(fixture(DEV_FIXTURES, "start-v3-zero-lens-closed.captured.json") as JsonObject);
+	closed.schema = "gentle-ai.review-integration.start/v4";
+	closed.acknowledgement = { provider_owned: true };
+	assert.deepEqual(decodeReviewStartV4(closed).raw.acknowledgement, { provider_owned: true });
+
+	closed.next_transition = (reviewingStartV4().next_transition as JsonObject);
+	assert.throws(() => decodeReviewStartV4(closed), /closed approved zero-lens START cannot carry next_transition/);
 });

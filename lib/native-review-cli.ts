@@ -14,11 +14,15 @@ import {
 	decodeReviewRepairV2,
 	decodeReviewResultArtifactV2,
 	decodeReviewStartV3,
+	decodeReviewStartV4,
 	decodeReviewStatusV3,
 	type ReviewConsentEnvelope,
 	type ReviewFailureV2,
 	type ReviewRepairV2,
+	type ReviewNextTransitionV3,
 	type ReviewStartState,
+	type ReviewStartV3,
+	type ReviewStartV4,
 	type ReviewStatusV3,
 	type ReviewLastEventClosureV1,
 } from "./review-integration-v2.ts";
@@ -556,9 +560,9 @@ export interface NativeReviewStatusResult {
 	diagnostics: readonly NativeReviewAuthorityDiagnostic[];
 	raw: Record<string, unknown>;
 }
-export const NATIVE_START_ACTION = { CREATED: "created", RESUMED: "resumed", CLOSED: "closed", BLOCKED_SCOPE_ACTION: "blocked-scope-action" } as const;
+export const NATIVE_START_ACTION = { CREATED: "created", RESUMED: "resumed", REPLAYED: "replayed", CLOSED: "closed", BLOCKED_SCOPE_ACTION: "blocked-scope-action" } as const;
 export type NativeStartAction = (typeof NATIVE_START_ACTION)[keyof typeof NATIVE_START_ACTION];
-export interface NativeStartResult { lineageId: string; state: ReviewStartState; riskLevel: string; selectedLenses: readonly string[]; changedFiles: number; changedLines: number; correctionBudget: number; action: NativeStartAction; lensesRequired: boolean; riskReasons?: readonly Record<string, unknown>[]; raw?: Readonly<Record<string, unknown>>; riskEvidence?: readonly string[]; hint?: string; }
+export interface NativeStartResult { lineageId: string; state: ReviewStartState; riskLevel: string; selectedLenses: readonly string[]; changedFiles: number; changedLines: number; correctionBudget: number; action: NativeStartAction; lensesRequired: boolean; riskReasons?: readonly Record<string, unknown>[]; nextTransition?: ReviewNextTransitionV3; raw?: Readonly<Record<string, unknown>>; riskEvidence?: readonly string[]; hint?: string; }
 export function isCanonicalProcessString(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value);
 }
@@ -927,6 +931,12 @@ function assertSupportedNextTransitionOperation(body: Record<string, unknown>): 
 }
 function decode<T>(operation: NativeReviewOperation, mutating: boolean, callback: () => T, diagnostics = nativeProcessDiagnostics(operation, NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE)): T {
 	try { return callback(); } catch (error) { if (error instanceof NativeReviewCliError) throw error; throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE, operation, true, mutating, "native response is schema incompatible", { ...diagnostics, error_code: NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE }); }
+}
+function decodeReviewStartResponse(value: unknown): ReviewStartV3 | ReviewStartV4 {
+	const body = object(value);
+	return body.schema === "gentle-ai.review-integration.start/v4"
+		? decodeReviewStartV4(body)
+		: decodeReviewStartV3(body);
 }
 function decodeReleaseEvidence(value: unknown): void {
 	const release = exactObject(value, ["release_tree", "configuration_hash", "generated_artifact_hash", "provenance_hash", "publication_boundary_hash", "publication_state", "evidence_freshness_hash", "evidence_freshness_state"]);
@@ -1853,7 +1863,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 			if (consent.targetIdentity !== targetIdentity || consent.projection !== projection) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native consent target binding mismatch");
 			throw new NativeReviewConsentRequiredError(consent);
 		}
-		const result = decode(NATIVE_REVIEW_OPERATION.START, true, () => decodeReviewStartV3(execution.body));
+		const result = decode(NATIVE_REVIEW_OPERATION.START, true, () => decodeReviewStartResponse(execution.body));
 		if (request.lineageId !== undefined && result.lineageId !== request.lineageId) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native start lineage mismatch");
 		const resultTarget = result.targetIdentity ?? result.repositoryContext?.targetIdentity;
 		if (resultTarget !== undefined && resultTarget !== targetIdentity) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native start target mismatch");
@@ -1868,6 +1878,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 			action: result.action as NativeStartAction,
 			lensesRequired: result.lensesRequired,
 			riskReasons: result.riskReasons.map((reason) => ({ ...reason })),
+			...("nextTransition" in result && result.nextTransition !== undefined ? { nextTransition: result.nextTransition } : {}),
 			// Derived, not received. `risk_reasons` is a required start/v2 field
 			// already recomputed against the authoritative frozen snapshot, so
 			// these phrases describe the same candidate the lenses will review.
@@ -1891,7 +1902,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		if (request.answer === NATIVE_REVIEW_CONSENT_ANSWER.DECLINED) {
 			return decode(NATIVE_REVIEW_OPERATION.START, true, () => decodeDeclinedConsentStart(execution.body, request));
 		}
-		const result = decode(NATIVE_REVIEW_OPERATION.START, true, () => decodeReviewStartV3(execution.body));
+		const result = decode(NATIVE_REVIEW_OPERATION.START, true, () => decodeReviewStartResponse(execution.body));
 		const answeredTarget = result.targetIdentity ?? result.repositoryContext?.targetIdentity;
 		if (answeredTarget !== request.consent.targetIdentity) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native consent answer target mismatch");
 		if (invocation.lineageId !== undefined && result.lineageId !== invocation.lineageId) throw nativeError(NATIVE_REVIEW_ERROR_CODE.IDENTITY_MISMATCH, NATIVE_REVIEW_OPERATION.START, true, "native consent answer lineage mismatch");
@@ -1906,6 +1917,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 			action: result.action as NativeStartAction,
 			lensesRequired: result.lensesRequired,
 			riskReasons: result.riskReasons.map((reason) => ({ ...reason })),
+			...("nextTransition" in result && result.nextTransition !== undefined ? { nextTransition: result.nextTransition } : {}),
 			...(() => {
 				const evidence = nativeRiskEvidencePhrases(result.riskLevel, result.riskReasons);
 				return evidence.length === 0 ? {} : { riskEvidence: evidence };

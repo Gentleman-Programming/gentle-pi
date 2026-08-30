@@ -4,6 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+	decodeReviewConsentV3,
+} from "../lib/review-integration-v2.ts";
+import {
 	NATIVE_REVIEW_DEFAULT_MAX_BUFFER_BYTES,
 	NATIVE_REVIEW_ERROR_CODE,
 	NativeReviewCliError,
@@ -170,6 +173,26 @@ function negotiatedStartStatus(targetIdentity: string, tokens: readonly string[]
 const TARGET = `sha256:${"b".repeat(64)}`;
 const REPOSITORY_CONTEXT = `rctx1_${"c".repeat(64)}`;
 
+function reviewingStartV4(targetIdentity: string): Record<string, unknown> {
+	const start = fixture("start-v3-consent-granted.captured.json");
+	start.schema = "gentle-ai.review-integration.start/v4";
+	(start.repository_context as Record<string, unknown>).target_identity = targetIdentity;
+	start.next_transition = {
+		kind: "execute",
+		reason_code: "review_status_required",
+		execute: {
+			operation: "review.status",
+			arguments: [
+				{ name: "lineage", value: start.lineage_id, token: `--lineage=${start.lineage_id}` },
+				{ name: "target", value: targetIdentity, token: `--target=${targetIdentity}` },
+			],
+			preconditions: [],
+			binding: { target_identity: targetIdentity },
+		},
+	};
+	return start;
+}
+
 test("negotiated STATUS forwards its exact ordered workspace, base, lineage, and untracked selection argv", async () => {
 	const queue = queuedAdapter([{ stdout: JSON.stringify(currentStatusFixture()) }]);
 	const result = await client(queue.adapter).targetStatus({
@@ -261,6 +284,41 @@ test("native START queries STATUS then executes only the provider-rendered order
 		["review", "status", "--contract", "gentle-ai.review-integration/v2", "--cwd", "/repo", "--projection", "workspace", "--agent", "pi", "--next-transition"],
 		["review", "start", ...tokens],
 	]);
+});
+
+test("native START retains the provider-owned START/v4 status transition in exact argument order", async () => {
+	const tokens = [
+		"--contract=gentle-ai.review-integration/v2", "--cwd=/repo", `--target=${TARGET}`,
+		"--projection=workspace", "--agent=pi", "--consent=relay",
+	];
+	const start = reviewingStartV4(TARGET);
+	const queue = queuedAdapter([
+		{ stdout: JSON.stringify(negotiatedStartStatus(TARGET, tokens)) },
+		{ stdout: JSON.stringify(start) },
+	]);
+	const result = await client(queue.adapter).start({ cwd: "/repo", targetIdentity: TARGET });
+	assert.deepEqual(result.nextTransition?.execute?.arguments.map((argument) => argument.token), [
+		`--lineage=${result.lineageId}`,
+		`--target=${TARGET}`,
+	]);
+	assert.deepEqual(queue.calls[1]?.arguments, ["review", "start", ...tokens]);
+});
+
+test("native consent completion decodes START/v4 and replays its provider argv unchanged", async () => {
+	const rawConsent = fixture("consent-v3.captured.json");
+	rawConsent.agent = "pi";
+	for (const choice of rawConsent.choices as Record<string, unknown>[]) {
+		choice.invocation = String(choice.invocation)
+			.replace(/--cwd \S+ --target/, "--cwd /repo --target")
+			.replace(" --consent ", " --agent pi --consent ");
+	}
+	const consent = decodeReviewConsentV3(rawConsent, "pi");
+	const queue = queuedAdapter([{ stdout: JSON.stringify(reviewingStartV4(consent.targetIdentity)) }]);
+	const answered = await client(queue.adapter).answerConsent({ cwd: "/repo", consent, answer: "granted" });
+	assert.equal(answered.kind, "started");
+	if (answered.kind !== "started") throw new Error("expected started consent result");
+	assert.equal(answered.start.nextTransition?.execute?.operation, "review.status");
+	assert.deepEqual(queue.calls[0]?.arguments, consent.choices[0].invocation.split(" ").slice(1));
 });
 
 test("native START refuses invalid committed-range and target bindings before STATUS", async () => {

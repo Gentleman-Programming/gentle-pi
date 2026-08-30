@@ -118,7 +118,6 @@ const REQUIRED_SCHEMAS_COMMON = Object.freeze([
 	"gentle-ai.review-integration.operation/v2",
 	"gentle-ai.review-integration.projection/v1",
 	"gentle-ai.review-integration.repair/v2",
-	"gentle-ai.review-integration.start/v3",
 	"gentle-ai.review-receipt/v1",
 	"gentle-ai.review-receipt/v2",
 	"gentle-ai.review-result-artifact/v2",
@@ -131,15 +130,19 @@ const REQUIRED_SCHEMAS_COMMON = Object.freeze([
 const CAPABILITIES_SCHEMA_IDENTITIES                                                                                          = Object.freeze({
 	"gentle-ai.review-integration.capabilities/v2": Object.freeze({
 		protocolMinor: 0,
-		requiredSchemas: Object.freeze([...REQUIRED_SCHEMAS_COMMON, "gentle-ai.review-integration.capabilities/v2", "gentle-ai.review-integration.consent/v2", "gentle-ai.review-integration.status/v3"]),
+		requiredSchemas: Object.freeze([...REQUIRED_SCHEMAS_COMMON, "gentle-ai.review-integration.capabilities/v2", "gentle-ai.review-integration.consent/v2", "gentle-ai.review-integration.start/v3", "gentle-ai.review-integration.status/v3"]),
 	}),
 	"gentle-ai.review-integration.capabilities/v2.1": Object.freeze({
 		protocolMinor: 1,
-		requiredSchemas: Object.freeze([...REQUIRED_SCHEMAS_COMMON, "gentle-ai.review-integration.capabilities/v2.1", "gentle-ai.review-integration.consent/v3", "gentle-ai.review-integration.status/v3"]),
+		requiredSchemas: Object.freeze([...REQUIRED_SCHEMAS_COMMON, "gentle-ai.review-integration.capabilities/v2.1", "gentle-ai.review-integration.consent/v3", "gentle-ai.review-integration.start/v3", "gentle-ai.review-integration.status/v3"]),
 	}),
 	"gentle-ai.review-integration.capabilities/v2.2": Object.freeze({
 		protocolMinor: 2,
-		requiredSchemas: Object.freeze([...REQUIRED_SCHEMAS_COMMON, "gentle-ai.review-integration.capabilities/v2.2", "gentle-ai.review-integration.consent/v3", "gentle-ai.review-integration.status/v5"]),
+		requiredSchemas: Object.freeze([...REQUIRED_SCHEMAS_COMMON, "gentle-ai.review-integration.capabilities/v2.2", "gentle-ai.review-integration.consent/v3", "gentle-ai.review-integration.start/v3", "gentle-ai.review-integration.status/v5"]),
+	}),
+	"gentle-ai.review-integration.capabilities/v2.3": Object.freeze({
+		protocolMinor: 3,
+		requiredSchemas: Object.freeze([...REQUIRED_SCHEMAS_COMMON, "gentle-ai.review-integration.capabilities/v2.3", "gentle-ai.review-integration.consent/v3", "gentle-ai.review-integration.start/v4", "gentle-ai.review-integration.status/v5"]),
 	}),
 });
 const OPTIONAL_FEATURE_NAMES = Object.freeze([
@@ -268,6 +271,11 @@ const REQUIRED_MANDATORY_FEATURES = Object.freeze(FEATURE_NAMES.filter((name) =>
 
 
 const REPOSITORY_CONTEXT_OUTCOMES = ["applied", "pending", "blocked_conflict", "durability_limited"]         ;
+
+
+
+
+
 
 
 
@@ -1107,6 +1115,27 @@ export function decodeReviewStartV3(value         )                {
 	};
 }
 
+export function decodeReviewStartV4(value         )                {
+	const overlayFields = ["target_mode", "target_identity", "base_tree", "candidate_tree"]         ;
+	const body = exactRecord(value, "start", [
+		"schema", "contract", "operation", "action", "lenses_required", "lineage_id", "state", "risk_level",
+		"selected_lenses", "projection", "changed_files", "changed_lines", "correction_budget", "risk_reasons", "artifact_subjects",
+	], [...overlayFields, "changed_path_manifest", "repository_context", "acknowledgement", "next_transition"]);
+	requireIdentity(body, "gentle-ai.review-integration.start/v4", REVIEW_INTEGRATION_OPERATION.START);
+	const action = enumeration(body.action, ["created", "replayed", "closed", "blocked-scope-action"]         , "start.action");
+	const v3Action = action === "replayed" ? "resumed" : action;
+	const nextTransition = body.next_transition === undefined ? undefined : decodeReviewNextTransitionV3(body.next_transition);
+	const reviewing = (action === "created" || action === "replayed") && body.state === REVIEW_START_STATE.REVIEWING;
+	if (reviewing && nextTransition?.kind !== "execute") throw new TypeError("reviewing created/replayed START requires next_transition.execute");
+	if (reviewing && nextTransition.execute?.operation !== "review.status") throw new TypeError("reviewing created/replayed START next_transition.execute.operation must be review.status");
+	const closedApprovedZeroLens = action === "closed" && body.state === REVIEW_START_STATE.APPROVED && Array.isArray(body.selected_lenses) && body.selected_lenses.length === 0;
+	if (closedApprovedZeroLens && nextTransition !== undefined) throw new TypeError("closed approved zero-lens START cannot carry next_transition");
+	const v3Body = { ...body };
+	delete v3Body.next_transition;
+	const decoded = decodeReviewStartV3({ ...v3Body, schema: "gentle-ai.review-integration.start/v3", action: v3Action });
+	return { ...decoded, action, ...(nextTransition === undefined ? {} : { nextTransition }), raw: body };
+}
+
 // ---------------------------------------------------------------------------
 // projection/v1 — reused verbatim; the v2 capabilities schema still advertises
 // gentle-ai.review-integration.projection/v1, so renaming this decoder would
@@ -1210,7 +1239,7 @@ export function decodeAuthorityRepairAssessmentV1(value         )               
 // collect inputs and the execute binding.
 // ---------------------------------------------------------------------------
 
-const NEXT_TRANSITION_OPERATIONS = ["review.start", "review.recover", "review.repair", "review.acknowledge-approved"]         ;
+const NEXT_TRANSITION_OPERATIONS = ["review.start", "review.status", "review.recover", "review.repair", "review.acknowledge-approved"]         ;
 
 function decodeTransitionArguments(value         , label        )                                        {
 	return array(value, label, (entry, entryLabel) => {

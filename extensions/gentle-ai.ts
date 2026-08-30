@@ -3304,6 +3304,7 @@ function mapNativeStartResult(result: NativeStartResult): Record<string, unknown
 		// version's capability is dark (every shipped row today).
 		...(result.riskEvidence === undefined ? {} : { risk_evidence: result.riskEvidence }),
 		...(result.hint === undefined ? {} : { hint: result.hint }),
+		...(result.nextTransition === undefined ? {} : { next_transition: result.nextTransition }),
 	};
 }
 

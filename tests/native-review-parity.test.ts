@@ -652,6 +652,16 @@ test("pending public consent expiry is synchronous and a fresh registry never re
 
 test("native START maps only provider facts and omits absent evidence", async (t) => {
 	const cwd = repository(t);
+	const nextTransition = {
+		kind: "execute" as const,
+		reasonCode: "review_status_required",
+		execute: {
+			operation: "review.status",
+			arguments: [{ name: "lineage", value: "closed-lineage", token: "--lineage=closed-lineage" }],
+			preconditions: [],
+			binding: { targetIdentity: `sha256:${"d".repeat(64)}` },
+		},
+	};
 	const native = {
 		targetStatus: async () => startStatus(cwd),
 		start: async () => ({
@@ -665,6 +675,7 @@ test("native START maps only provider facts and omits absent evidence", async (t
 			action: "closed",
 			lensesRequired: false,
 			riskReasons: [],
+			nextTransition,
 			hint: "provider empty-candidate hint",
 		}),
 	} as unknown as NativeReviewCli;
@@ -672,6 +683,7 @@ test("native START maps only provider facts and omits absent evidence", async (t
 	const rendered = result.result as Record<string, unknown>;
 	assert.equal(rendered.hint, "provider empty-candidate hint");
 	assert.equal(rendered.risk_evidence, undefined);
+	assert.equal(rendered.next_transition, nextTransition);
 });
 
 test("consent completion stays authoritative when local latch recording fails", async (t) => {
