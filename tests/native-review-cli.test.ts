@@ -177,14 +177,20 @@ function reviewingStartV4(targetIdentity: string): Record<string, unknown> {
 	const start = fixture("start-v3-consent-granted.captured.json");
 	start.schema = "gentle-ai.review-integration.start/v4";
 	(start.repository_context as Record<string, unknown>).target_identity = targetIdentity;
+	for (const subject of start.artifact_subjects as Record<string, unknown>[]) subject.target_identity = targetIdentity;
+	const baseTree = start.base_tree as string;
 	start.next_transition = {
 		kind: "execute",
 		reason_code: "review_status_required",
 		execute: {
 			operation: "review.status",
 			arguments: [
+				{ name: "contract", value: "gentle-ai.review-integration/v2", token: "--contract=gentle-ai.review-integration/v2" },
+				{ name: "next-transition", value: "true", token: "--next-transition=true" },
 				{ name: "lineage", value: start.lineage_id, token: `--lineage=${start.lineage_id}` },
-				{ name: "target", value: targetIdentity, token: `--target=${targetIdentity}` },
+				{ name: "agent", value: "pi", token: "--agent=pi" },
+				{ name: "base-ref", value: baseTree, token: `--base-ref=${baseTree}` },
+				{ name: "committed-only", value: "true", token: "--committed-only=true" },
 			],
 			preconditions: [],
 			binding: { target_identity: targetIdentity },
@@ -298,8 +304,12 @@ test("native START retains the provider-owned START/v4 status transition in exac
 	]);
 	const result = await client(queue.adapter).start({ cwd: "/repo", targetIdentity: TARGET });
 	assert.deepEqual(result.nextTransition?.execute?.arguments.map((argument) => argument.token), [
+		"--contract=gentle-ai.review-integration/v2",
+		"--next-transition=true",
 		`--lineage=${result.lineageId}`,
-		`--target=${TARGET}`,
+		"--agent=pi",
+		`--base-ref=${start.base_tree}`,
+		"--committed-only=true",
 	]);
 	assert.deepEqual(queue.calls[1]?.arguments, ["review", "start", ...tokens]);
 });
