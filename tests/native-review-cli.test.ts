@@ -196,6 +196,8 @@ function reviewingStartV4(targetIdentity: string): Record<string, unknown> {
 			binding: { target_identity: targetIdentity },
 		},
 	};
+	const execute = (start.next_transition as Record<string, unknown>).execute as Record<string, unknown>;
+	execute.selector_arguments = (execute.arguments as Record<string, unknown>[]).slice(-2).map((argument) => ({ ...argument }));
 	return start;
 }
 
@@ -308,6 +310,10 @@ test("native START retains the provider-owned START/v4 status transition in exac
 		"--next-transition=true",
 		`--lineage=${result.lineageId}`,
 		"--agent=pi",
+		`--base-ref=${start.base_tree}`,
+		"--committed-only=true",
+	]);
+	assert.deepEqual(result.nextTransition?.execute?.selectorArguments?.map((argument) => argument.token), [
 		`--base-ref=${start.base_tree}`,
 		"--committed-only=true",
 	]);

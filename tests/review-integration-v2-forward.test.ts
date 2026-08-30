@@ -313,6 +313,8 @@ function reviewingStartV4(action: "created" | "replayed" = "created"): JsonObjec
 			binding: { target_identity: targetIdentity },
 		},
 	};
+	const execute = (body.next_transition as JsonObject).execute as JsonObject;
+	execute.selector_arguments = (execute.arguments as JsonObject[]).slice(-2).map(clone);
 	return body;
 }
 
@@ -344,6 +346,10 @@ test("START/v4 accepts only its reviewing status continuation and preserves v3 s
 			{ name: "next-transition", value: "true", token: "--next-transition=true" },
 			{ name: "lineage", value: decoded.lineageId, token: `--lineage=${decoded.lineageId}` },
 			{ name: "agent", value: "pi", token: "--agent=pi" },
+			{ name: "base-ref", value: decoded.baseTree, token: `--base-ref=${decoded.baseTree}` },
+			{ name: "committed-only", value: "true", token: "--committed-only=true" },
+		]);
+		assert.deepEqual(decoded.nextTransition?.execute?.selectorArguments, [
 			{ name: "base-ref", value: decoded.baseTree, token: `--base-ref=${decoded.baseTree}` },
 			{ name: "committed-only", value: "true", token: "--committed-only=true" },
 		]);
@@ -394,6 +400,33 @@ test("START/v4 rejects status vectors that drift from frozen bindings", () => {
 	const arguments_ = ((duplicate.next_transition as JsonObject).execute as JsonObject).arguments as JsonObject[];
 	arguments_.push(clone(arguments_.find((argument) => argument.name === "lineage")!));
 	assert.throws(() => decodeReviewStartV4(duplicate), /binding/);
+});
+
+test("START/v4 rejects incomplete or incoherent provider-owned status selectors", () => {
+	const execute = (start: JsonObject) => (start.next_transition as JsonObject).execute as JsonObject;
+	const rows = (start: JsonObject, field: "arguments" | "selector_arguments") => execute(start)[field] as JsonObject[];
+	for (const change of [
+		(start: JsonObject) => delete execute(start).selector_arguments,
+		(start: JsonObject) => rows(start, "selector_arguments").splice(1, 1),
+		(start: JsonObject) => {
+			for (const field of ["arguments", "selector_arguments"] as const) rows(start, field).find((row) => row.name === "committed-only")!.value = "false";
+		},
+		(start: JsonObject) => rows(start, "selector_arguments")[1]!.token = "--committed-only",
+	]) {
+		const start = reviewingStartV4();
+		change(start);
+		assert.throws(() => decodeReviewStartV4(start), /selector|binding/);
+	}
+	for (const [name, value] of [["contract", "other"], ["next-transition", "false"], ["lineage", "review-other"], ["agent", "other"]] as const) {
+		const missing = reviewingStartV4();
+		rows(missing, "arguments").splice(rows(missing, "arguments").findIndex((row) => row.name === name), 1);
+		assert.throws(() => decodeReviewStartV4(missing), /binding/);
+		const wrong = reviewingStartV4();
+		rows(wrong, "arguments").find((row) => row.name === name)!.value = value;
+		assert.throws(() => decodeReviewStartV4(wrong), /binding/);
+	}
+	const controlToken = reviewingStartV4(); rows(controlToken, "arguments")[0]!.token = "--contract=other";
+	assert.throws(() => decodeReviewStartV4(controlToken), /binding/);
 });
 
 test("START/v4 closed approval keeps acknowledgement but forbids a continuation", () => {

@@ -347,6 +347,7 @@ export interface ReviewTransitionArgumentV3 {
 export interface ReviewNextTransitionExecuteV3 {
 	operation: string;
 	arguments: readonly ReviewTransitionArgumentV3[];
+	selectorArguments?: readonly ReviewTransitionArgumentV3[];
 	preconditions: readonly ReviewTransitionArgumentV3[];
 	binding: { targetIdentity: string; lineageId?: string; revision?: string };
 	command?: string;
@@ -1136,6 +1137,32 @@ function assertReviewStartV4StatusBinding(execute: ReviewNextTransitionExecuteV3
 		if (Object.hasOwn(optionalSelectors, argument.name) && argument.value !== optionalSelectors[argument.name]) throw new TypeError(`START/v4 status ${argument.name} binding conflicts with frozen START`);
 	}
 	if (argumentsByName.get("lineage") !== start.lineageId) throw new TypeError("START/v4 status requires exactly one lineage binding for the frozen START");
+	if (execute.arguments.find((argument) => argument.name === "lineage")?.token !== `--lineage=${start.lineageId}`) throw new TypeError("START/v4 status lineage binding conflicts with frozen START");
+	for (const [name, value] of [["contract", REVIEW_INTEGRATION_CONTRACT], ["next-transition", "true"], ["agent", "pi"]]) {
+		if (argumentsByName.get(name) !== value || execute.arguments.find((argument) => argument.name === name)?.token !== `--${name}=${value}`) throw new TypeError(`START/v4 status ${name} binding conflicts with frozen START`);
+	}
+	const selectorArguments = execute.selectorArguments;
+	if (selectorArguments === undefined || selectorArguments.length === 0) throw new TypeError("START/v4 status selector arguments are required");
+	const selectorsByName = new Map<string, ReviewTransitionArgumentV3>();
+	for (const selector of selectorArguments) {
+		const full = execute.arguments.find((argument) => argument.name === selector.name);
+		if (selectorsByName.has(selector.name) || full === undefined || full.value !== selector.value || full.token !== selector.token) throw new TypeError(`START/v4 status selector ${selector.name} binding conflicts with full arguments`);
+		selectorsByName.set(selector.name, selector);
+	}
+	const selector = (name: string, value: string): void => {
+		if (selectorsByName.get(name)?.value !== value || selectorsByName.get(name)?.token !== `--${name}=${value}` || execute.arguments.find((argument) => argument.name === name)?.token !== `--${name}=${value}`) throw new TypeError(`START/v4 status selector ${name} binding conflicts with frozen START`);
+	};
+	const baseRef = argumentsByName.get("base-ref");
+	if (start.targetMode === "base-workspace-overlay") {
+		if (baseRef !== start.baseTree || argumentsByName.has("committed-only")) throw new TypeError("START/v4 status workspace overlay binding conflicts with frozen START");
+		selector("base-ref", start.baseTree!); selector("workspace-overlay", "true");
+	} else if (baseRef !== undefined) {
+		if (baseRef !== start.baseTree || argumentsByName.has("workspace-overlay")) throw new TypeError("START/v4 status committed range binding conflicts with frozen START");
+		selector("base-ref", start.baseTree!); selector("committed-only", "true");
+	} else {
+		if (argumentsByName.has("committed-only") || argumentsByName.has("workspace-overlay")) throw new TypeError("START/v4 status current projection binding conflicts with frozen START");
+		selector("projection", start.projection);
+	}
 }
 
 export function decodeReviewStartV4(value: unknown): ReviewStartV4 {
@@ -1566,6 +1593,7 @@ export function decodeReviewNextTransitionV3(value: unknown, options: { v5?: boo
 		const execute = exactRecord(transition.execute, "next_transition.execute", ["operation", "arguments", "preconditions", "binding"], ["command", "selector_arguments", "artifacts"]);
 		const operation = enumeration(execute.operation, NEXT_TRANSITION_OPERATIONS, "next_transition.execute.operation");
 		const argumentsList = decodeTransitionArguments(execute.arguments, "next_transition.execute.arguments");
+		const selectorArguments = execute.selector_arguments === undefined ? undefined : decodeTransitionArguments(execute.selector_arguments, "next_transition.execute.selector_arguments");
 		const preconditions = decodeTransitionArguments(execute.preconditions, "next_transition.execute.preconditions");
 		// The schema gives `binding` no declared properties and no required list:
 		// it is an OPEN object. Closing it here made Pi stricter than the
@@ -1576,7 +1604,7 @@ export function decodeReviewNextTransitionV3(value: unknown, options: { v5?: boo
 		const lineageId = binding.lineage_id === undefined ? undefined : lineage(binding.lineage_id, "next_transition.execute.binding.lineage_id");
 		const revision = binding.revision === undefined ? undefined : sha256(binding.revision, "next_transition.execute.binding.revision");
 		const command = execute.command === undefined ? undefined : nonempty(execute.command, "next_transition.execute.command");
-		const decodedExecute: ReviewNextTransitionExecuteV3 = { operation, arguments: argumentsList, preconditions, binding: { targetIdentity, ...(lineageId === undefined ? {} : { lineageId }), ...(revision === undefined ? {} : { revision }) }, ...(command === undefined ? {} : { command }) };
+		const decodedExecute: ReviewNextTransitionExecuteV3 = { operation, arguments: argumentsList, ...(selectorArguments === undefined ? {} : { selectorArguments }), preconditions, binding: { targetIdentity, ...(lineageId === undefined ? {} : { lineageId }), ...(revision === undefined ? {} : { revision }) }, ...(command === undefined ? {} : { command }) };
 		if (operation === "review.acknowledge-approved") assertReviewApprovedAcknowledgementExecuteV1(decodedExecute);
 		if (transition.collect !== undefined) throw new TypeError("next_transition.collect is incompatible with execute");
 		return { kind, reasonCode, execute: decodedExecute, ...(correctionRequest === undefined ? {} : { correctionRequest }) };
