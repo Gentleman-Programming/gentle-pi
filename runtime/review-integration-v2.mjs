@@ -1115,6 +1115,30 @@ export function decodeReviewStartV3(value         )                {
 	};
 }
 
+function assertReviewStartV4StatusBinding(execute                               , start               )       {
+	const expectedTargetIdentity = start.repositoryContext?.targetIdentity;
+	const targetIdentityConflicts = expectedTargetIdentity === undefined || execute.binding.targetIdentity !== expectedTargetIdentity
+		|| (start.targetIdentity !== undefined && start.targetIdentity !== expectedTargetIdentity)
+		|| start.artifactSubjects.some((subject) => subject.targetIdentity !== expectedTargetIdentity);
+	if (targetIdentityConflicts) throw new TypeError("START/v4 status target identity binding conflicts with frozen START");
+	if (execute.binding.lineageId !== undefined && execute.binding.lineageId !== start.lineageId) {
+		throw new TypeError("START/v4 status lineage binding conflicts with frozen START");
+	}
+	const optionalSelectors                                               = {
+		"base-ref": start.baseTree,
+		"base-tree": start.baseTree,
+		projection: start.projection,
+		target: expectedTargetIdentity,
+	};
+	const argumentsByName = new Map                ();
+	for (const argument of execute.arguments) {
+		if (argumentsByName.has(argument.name)) throw new TypeError(`START/v4 status arguments duplicate ${argument.name} binding`);
+		argumentsByName.set(argument.name, argument.value);
+		if (Object.hasOwn(optionalSelectors, argument.name) && argument.value !== optionalSelectors[argument.name]) throw new TypeError(`START/v4 status ${argument.name} binding conflicts with frozen START`);
+	}
+	if (argumentsByName.get("lineage") !== start.lineageId) throw new TypeError("START/v4 status requires exactly one lineage binding for the frozen START");
+}
+
 export function decodeReviewStartV4(value         )                {
 	const overlayFields = ["target_mode", "target_identity", "base_tree", "candidate_tree"]         ;
 	const body = exactRecord(value, "start", [
@@ -1133,6 +1157,7 @@ export function decodeReviewStartV4(value         )                {
 	const v3Body = { ...body };
 	delete v3Body.next_transition;
 	const decoded = decodeReviewStartV3({ ...v3Body, schema: "gentle-ai.review-integration.start/v3", action: v3Action });
+	if (reviewing) assertReviewStartV4StatusBinding(nextTransition .execute , decoded);
 	return { ...decoded, action, ...(nextTransition === undefined ? {} : { nextTransition }), raw: body };
 }
 

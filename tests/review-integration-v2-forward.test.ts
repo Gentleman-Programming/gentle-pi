@@ -295,14 +295,19 @@ function reviewingStartV4(action: "created" | "replayed" = "created"): JsonObjec
 	body.schema = "gentle-ai.review-integration.start/v4";
 	body.action = action;
 	const targetIdentity = (body.repository_context as JsonObject).target_identity as string;
+	const baseTree = body.base_tree as string;
 	body.next_transition = {
 		kind: "execute",
 		reason_code: "review_status_required",
 		execute: {
 			operation: "review.status",
 			arguments: [
+				{ name: "contract", value: "gentle-ai.review-integration/v2", token: "--contract=gentle-ai.review-integration/v2" },
+				{ name: "next-transition", value: "true", token: "--next-transition=true" },
 				{ name: "lineage", value: body.lineage_id, token: `--lineage=${body.lineage_id}` },
-				{ name: "target", value: targetIdentity, token: `--target=${targetIdentity}` },
+				{ name: "agent", value: "pi", token: "--agent=pi" },
+				{ name: "base-ref", value: baseTree, token: `--base-ref=${baseTree}` },
+				{ name: "committed-only", value: "true", token: "--committed-only=true" },
 			],
 			preconditions: [],
 			binding: { target_identity: targetIdentity },
@@ -331,11 +336,16 @@ test("capabilities/v2.3 requires START/v4 and rejects future identities", () => 
 
 test("START/v4 accepts only its reviewing status continuation and preserves v3 strictness", () => {
 	for (const action of ["created", "replayed"] as const) {
-		const decoded = decodeReviewStartV4(reviewingStartV4(action));
+		const start = reviewingStartV4(action);
+		const decoded = decodeReviewStartV4(start);
 		assert.equal(decoded.nextTransition?.execute?.operation, "review.status");
-		assert.deepEqual(decoded.nextTransition?.execute?.arguments.map((argument) => argument.token), [
-			`--lineage=${decoded.lineageId}`,
-			`--target=${decoded.repositoryContext?.targetIdentity}`,
+		assert.deepEqual(decoded.nextTransition?.execute?.arguments, [
+			{ name: "contract", value: "gentle-ai.review-integration/v2", token: "--contract=gentle-ai.review-integration/v2" },
+			{ name: "next-transition", value: "true", token: "--next-transition=true" },
+			{ name: "lineage", value: decoded.lineageId, token: `--lineage=${decoded.lineageId}` },
+			{ name: "agent", value: "pi", token: "--agent=pi" },
+			{ name: "base-ref", value: decoded.baseTree, token: `--base-ref=${decoded.baseTree}` },
+			{ name: "committed-only", value: "true", token: "--committed-only=true" },
 		]);
 	}
 
@@ -346,6 +356,44 @@ test("START/v4 accepts only its reviewing status continuation and preserves v3 s
 	const wrongOperation = reviewingStartV4();
 	((wrongOperation.next_transition as JsonObject).execute as JsonObject).operation = "review.start";
 	assert.throws(() => decodeReviewStartV4(wrongOperation), /review.status/);
+});
+
+test("START/v4 rejects status vectors that drift from frozen bindings", () => {
+	const bindingTarget = reviewingStartV4();
+	(((bindingTarget.next_transition as JsonObject).execute as JsonObject).binding as JsonObject).target_identity = sha("d");
+	assert.throws(() => decodeReviewStartV4(bindingTarget), /binding/);
+
+	for (const [name, value] of [["lineage", "review-other"], ["base-ref", "a".repeat(40)]] as const) {
+		const start = reviewingStartV4();
+		const arguments_ = ((start.next_transition as JsonObject).execute as JsonObject).arguments as JsonObject[];
+		arguments_.find((argument) => argument.name === name)!.value = value;
+		assert.throws(() => decodeReviewStartV4(start), /binding/);
+	}
+
+	for (const [name, value, token] of [["projection", "staged", "--projection=staged"], ["target", sha("d"), `--target=${sha("d")}`]] as const) {
+		const start = reviewingStartV4();
+		const arguments_ = ((start.next_transition as JsonObject).execute as JsonObject).arguments as JsonObject[];
+		arguments_.push({ name, value, token });
+		assert.throws(() => decodeReviewStartV4(start), /binding/);
+	}
+
+	const bindingLineage = reviewingStartV4();
+	(((bindingLineage.next_transition as JsonObject).execute as JsonObject).binding as JsonObject).lineage_id = "review-other";
+	assert.throws(() => decodeReviewStartV4(bindingLineage), /binding/);
+
+	const outerTarget = reviewingStartV4();
+	outerTarget.target_mode = "base-workspace-overlay";
+	outerTarget.target_identity = sha("d");
+	assert.throws(() => decodeReviewStartV4(outerTarget), /binding/);
+
+	const artifactTarget = reviewingStartV4();
+	(artifactTarget.artifact_subjects as JsonObject[])[0]!.target_identity = sha("d");
+	assert.throws(() => decodeReviewStartV4(artifactTarget), /binding/);
+
+	const duplicate = reviewingStartV4();
+	const arguments_ = ((duplicate.next_transition as JsonObject).execute as JsonObject).arguments as JsonObject[];
+	arguments_.push(clone(arguments_.find((argument) => argument.name === "lineage")!));
+	assert.throws(() => decodeReviewStartV4(duplicate), /binding/);
 });
 
 test("START/v4 closed approval keeps acknowledgement but forbids a continuation", () => {
