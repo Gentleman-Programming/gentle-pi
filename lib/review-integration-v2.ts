@@ -1026,7 +1026,7 @@ function decodeChangedPathEntry(value: unknown, label: string): ChangedPathEntry
 // start/v3
 // ---------------------------------------------------------------------------
 
-export function decodeReviewStartV3(value: unknown): ReviewStartV3 {
+export function decodeReviewStartV3(value: unknown, overlayIdentitySatisfiesRepositoryContext = false): ReviewStartV3 {
 	const overlayFields = ["target_mode", "target_identity", "base_tree", "candidate_tree"] as const;
 	const body = exactRecord(value, "start", [
 		"schema", "contract", "operation", "action", "lenses_required", "lineage_id", "state", "risk_level",
@@ -1060,9 +1060,12 @@ export function decodeReviewStartV3(value: unknown): ReviewStartV3 {
 		throw new TypeError("start with selected_lenses requires base_tree, candidate_tree, and changed_path_manifest");
 	}
 
-	const requiresRepositoryContext = (action === "created" || action === "resumed") && state === REVIEW_START_STATE.REVIEWING;
+	const reviewingCreatedOrResumed = (action === "created" || action === "resumed") && state === REVIEW_START_STATE.REVIEWING;
+	// START/v4 may render the frozen target as the overlay identity instead of
+	// repository_context; absence is only excused when that identity is present.
+	const requiresRepositoryContext = reviewingCreatedOrResumed && !(overlayIdentitySatisfiesRepositoryContext && targetIdentity !== undefined);
 	if (requiresRepositoryContext && body.repository_context === undefined) throw new TypeError("start.repository_context is required when action is created/resumed and state is reviewing");
-	if (!requiresRepositoryContext && body.repository_context !== undefined) throw new TypeError("start.repository_context is only valid when action is created/resumed and state is reviewing");
+	if (!reviewingCreatedOrResumed && body.repository_context !== undefined) throw new TypeError("start.repository_context is only valid when action is created/resumed and state is reviewing");
 
 	let repositoryContext: ReviewRepositoryContextV2 | undefined;
 	if (body.repository_context !== undefined) {
@@ -1116,7 +1119,7 @@ export function decodeReviewStartV3(value: unknown): ReviewStartV3 {
 }
 
 function assertReviewStartV4StatusBinding(execute: ReviewNextTransitionExecuteV3, start: ReviewStartV3): void {
-	const expectedTargetIdentity = start.repositoryContext?.targetIdentity;
+	const expectedTargetIdentity = start.repositoryContext?.targetIdentity ?? start.targetIdentity;
 	const targetIdentityConflicts = expectedTargetIdentity === undefined || execute.binding.targetIdentity !== expectedTargetIdentity
 		|| (start.targetIdentity !== undefined && start.targetIdentity !== expectedTargetIdentity)
 		|| start.artifactSubjects.some((subject) => subject.targetIdentity !== expectedTargetIdentity);
@@ -1182,7 +1185,7 @@ export function decodeReviewStartV4(value: unknown): ReviewStartV4 {
 	if (closedApprovedZeroLens && nextTransition !== undefined) throw new TypeError("closed approved zero-lens START cannot carry next_transition");
 	const v3Body = { ...body };
 	delete v3Body.next_transition;
-	const decoded = decodeReviewStartV3({ ...v3Body, schema: "gentle-ai.review-integration.start/v3", action: v3Action });
+	const decoded = decodeReviewStartV3({ ...v3Body, schema: "gentle-ai.review-integration.start/v3", action: v3Action }, true);
 	if (reviewing) assertReviewStartV4StatusBinding(nextTransition!.execute!, decoded);
 	return { ...decoded, action, ...(nextTransition === undefined ? {} : { nextTransition }), raw: body };
 }

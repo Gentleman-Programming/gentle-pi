@@ -364,6 +364,30 @@ test("START/v4 accepts only its reviewing status continuation and preserves v3 s
 	assert.throws(() => decodeReviewStartV4(wrongOperation), /review.status/);
 });
 
+test("START/v4 falls back to the frozen overlay target when repository_context is absent", () => {
+	// A replayed reviewing START must not carry repository_context, so the
+	// binding assert has to derive the frozen target from the overlay identity.
+	const start = reviewingStartV4("replayed");
+	const execute = (start.next_transition as JsonObject).execute as JsonObject;
+	const targetIdentity = (start.repository_context as JsonObject).target_identity as string;
+	delete start.repository_context;
+	start.target_mode = "base-workspace-overlay";
+	start.target_identity = targetIdentity;
+	const arguments_ = execute.arguments as JsonObject[];
+	const committedOnly = arguments_.find((argument) => argument.name === "committed-only")!;
+	committedOnly.name = "workspace-overlay";
+	committedOnly.token = "--workspace-overlay=true";
+	execute.selector_arguments = arguments_.slice(-2).map(clone);
+	const decoded = decodeReviewStartV4(start);
+	assert.equal(decoded.targetIdentity, targetIdentity);
+	assert.equal(decoded.repositoryContext, undefined);
+	assert.equal(decoded.nextTransition?.execute?.binding.targetIdentity, targetIdentity);
+
+	const unbound = reviewingStartV4("replayed");
+	delete unbound.repository_context;
+	assert.throws(() => decodeReviewStartV4(unbound), /repository_context is required/);
+});
+
 test("START/v4 rejects status vectors that drift from frozen bindings", () => {
 	const bindingTarget = reviewingStartV4();
 	(((bindingTarget.next_transition as JsonObject).execute as JsonObject).binding as JsonObject).target_identity = sha("d");
