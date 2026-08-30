@@ -110,21 +110,30 @@ test("package manifest has no obsolete native activation build surface", () => {
 });
 
 test("shipped prompt and agent instructions contain no pi-mono repository residue", () => {
-	const instructionDirectories = ["assets/agents", "prompts"] as const;
+	const instructionDirectories = ["assets", "prompts"] as const;
 	const forbidden = [
 		/\bpackages\//,
 		/\bAGENTS\.md\b/,
 		/github\.com\/earendil-works\/pi-mono\/(?:issues|pull)\//,
 	] as const;
-
-	for (const directory of instructionDirectories) {
-		for (const entry of readdirSync(join(PACKAGE_ROOT, directory), { withFileTypes: true })) {
-			if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+	const listMarkdownPaths = (directory: string): string[] =>
+		readdirSync(join(PACKAGE_ROOT, directory), { withFileTypes: true }).flatMap((entry) => {
 			const path = join(directory, entry.name);
-			const content = readFileSync(join(PACKAGE_ROOT, path), "utf8");
-			for (const pattern of forbidden) assert.doesNotMatch(content, pattern, path);
-		}
+			if (entry.isDirectory()) return listMarkdownPaths(path);
+			return entry.isFile() && entry.name.endsWith(".md") ? [path] : [];
+		});
+	const scannedPaths = instructionDirectories.flatMap(listMarkdownPaths);
+
+	for (const path of scannedPaths) {
+		const content = readFileSync(join(PACKAGE_ROOT, path), "utf8");
+		for (const pattern of forbidden) assert.doesNotMatch(content, pattern, path);
 	}
+
+	assert.ok(scannedPaths.includes("assets/orchestrator.md"), "scan must cover root asset instructions");
+	assert.ok(
+		scannedPaths.includes("assets/chains/4r-review.chain.md"),
+		"scan must cover nested asset instructions",
+	);
 });
 
 test("package verification names the native review runtime boundary and packaged fixtures", () => {
