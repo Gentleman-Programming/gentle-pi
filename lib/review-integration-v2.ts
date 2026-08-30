@@ -142,6 +142,22 @@ const REQUIRED_MANDATORY_FEATURES_V23 = Object.freeze([
 	"target_scoped_status",
 	"uniform_failure_envelope",
 ] as const);
+// v2.3 (first advertised by the pinned v2.5.0-rc.3 provider) retired three
+// v1-era identities from its advertisement. Pi never decodes those envelopes
+// on the negotiated v2 lane, so the v2.3 requirement list is the exact set the
+// v2.3 provider contract defines; earlier minors keep the full common list.
+// The load-time length assertion keeps this filter honest: if the common-list
+// identifier form ever drifts away from these bare identifiers, the module
+// fails loudly instead of silently requiring schemas the provider retired.
+const RETIRED_SCHEMAS_V23: readonly string[] = Object.freeze([
+	"gentle-ai.review-final-verification-incident/v1",
+	"gentle-ai.review-receipt/v2",
+	"gentle-ai.review-verification-evidence/v2",
+]);
+const REQUIRED_SCHEMAS_COMMON_V23 = Object.freeze(REQUIRED_SCHEMAS_COMMON.filter((schema) => !RETIRED_SCHEMAS_V23.includes(schema)));
+if (REQUIRED_SCHEMAS_COMMON_V23.length !== REQUIRED_SCHEMAS_COMMON.length - RETIRED_SCHEMAS_V23.length) {
+	throw new TypeError("v2.3 retired-schema filter must remove exactly the retired identities from the common schema list");
+}
 const CAPABILITIES_SCHEMA_IDENTITIES: Readonly<Record<string, { protocolMinor: number; requiredSchemas: readonly string[]; requiredMandatoryFeatures?: readonly string[]; optionalFeatureFloor?: number }>> = Object.freeze({
 	"gentle-ai.review-integration.capabilities/v2": Object.freeze({
 		protocolMinor: 0,
@@ -157,14 +173,7 @@ const CAPABILITIES_SCHEMA_IDENTITIES: Readonly<Record<string, { protocolMinor: n
 	}),
 	"gentle-ai.review-integration.capabilities/v2.3": Object.freeze({
 		protocolMinor: 3,
-		// v2.3 (first advertised by the pinned v2.5.0-rc.3 provider) retired
-		// three v1-era identities from its advertisement:
-		// review-final-verification-incident/v1, review-receipt/v2, and
-		// review-verification-evidence/v2. Pi never decodes those envelopes on
-		// the negotiated v2 lane, so the v2.3 requirement list is the exact set
-		// the v2.3 provider contract defines; earlier minors keep the full
-		// common list unchanged.
-		requiredSchemas: Object.freeze([...REQUIRED_SCHEMAS_COMMON.filter((schema) => !["gentle-ai.review-final-verification-incident/v1", "gentle-ai.review-receipt/v2", "gentle-ai.review-verification-evidence/v2"].includes(schema)), "gentle-ai.review-integration.capabilities/v2.3", "gentle-ai.review-integration.consent/v3", "gentle-ai.review-integration.start/v4", "gentle-ai.review-integration.status/v5"]),
+		requiredSchemas: Object.freeze([...REQUIRED_SCHEMAS_COMMON_V23, "gentle-ai.review-integration.capabilities/v2.3", "gentle-ai.review-integration.consent/v3", "gentle-ai.review-integration.start/v4", "gentle-ai.review-integration.status/v5"]),
 		requiredMandatoryFeatures: REQUIRED_MANDATORY_FEATURES_V23,
 		optionalFeatureFloor: 14,
 	}),

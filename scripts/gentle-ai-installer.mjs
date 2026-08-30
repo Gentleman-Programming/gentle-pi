@@ -68,8 +68,39 @@ export class GentleAiInstallerError extends Error {
 // and the executable are the same bytes, so both pinned digests are equal.
 export const GENTLE_AI_PENDING_DIGEST = "PENDING-GENTLE-AI-RELEASE-DIGEST";
 
+// A raw prerelease asset is less durable than a signed stable archive, and the
+// install path has no other Darwin/Linux source, so the gentle-pi repository
+// hosts a byte-identical mirror of the pinned prerelease assets under its own
+// release tag. The mirror is only a second download source: every byte from
+// either source must still match the same pinned SHA-256 digests, and a
+// checksum mismatch never falls through to the other source.
+export const GENTLE_AI_MIRROR_RELEASE_BASE_URL = `https://github.com/Gentleman-Programming/gentle-pi/releases/download/gentle-ai-mirror-v${INSTALLER_VERSION}/`;
+export const GENTLE_AI_ASSET_UNAVAILABLE_CODE = "GENTLE_AI_ASSET_UNAVAILABLE";
+
 function asset(name, sha256, binarySha256, executable) {
-	return Object.freeze({ name, sha256, binarySha256, executable, url: `${RELEASE_BASE_URL}${name}` });
+	const mirrorUrl = INSTALLER_VERSION.includes("-") ? `${GENTLE_AI_MIRROR_RELEASE_BASE_URL}${name}` : undefined;
+	return Object.freeze({ name, sha256, binarySha256, executable, url: `${RELEASE_BASE_URL}${name}`, ...(mirrorUrl === undefined ? {} : { mirrorUrl }) });
+}
+
+// Download failure (not integrity failure) is the only condition that falls
+// through to the mirror; when both sources are unavailable the error names the
+// documented recovery instead of leaving a dead end until the next repin.
+async function downloadPinnedGentleAiAsset(asset, destination, options) {
+	const download = options.download ?? downloadGentleAiAsset;
+	try {
+		await download(asset.url, destination);
+	} catch (primaryError) {
+		if (asset.mirrorUrl === undefined) throw primaryError;
+		try {
+			await download(asset.mirrorUrl, destination);
+		} catch (mirrorError) {
+			throw new GentleAiInstallerError(
+				GENTLE_AI_ASSET_UNAVAILABLE_CODE,
+				`Gentle AI ${asset.name} is unavailable from the pinned release and its gentle-pi mirror. Retry later, or set GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1 and register a locally built v${INSTALLER_VERSION} binary through ~/.pi/gentle-ai/dev-binary.json.`,
+				mirrorError,
+			);
+		}
+	}
 }
 
 // Windows is absent from the pinned release assets on purpose. gentle-ai
@@ -626,7 +657,7 @@ async function installSignedRelease(options, packageRoot, platform, arch, asset)
 		try {
 			const form = gentleAiAssetForm(asset.name);
 			const archive = join(stagingDirectory, asset.name);
-			await (options.download ?? downloadGentleAiAsset)(asset.url, archive);
+			await downloadPinnedGentleAiAsset(asset, archive, options);
 			if ((await sha256File(archive)) !== asset.sha256) throw new Error(`Gentle AI archive checksum mismatch for ${asset.name}`);
 			let source = archive;
 			const extracted = join(stagingDirectory, "extracted");

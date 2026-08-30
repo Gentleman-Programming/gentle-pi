@@ -626,6 +626,49 @@ test("Darwin/Linux signed bundles retain their four-field manifest and reusable 
 	assert.equal((await installGentleAi({ ...options, download: async () => { throw new Error("signed bundle must be reused"); } })).installed, false);
 });
 
+test("a raw prerelease asset falls back to the gentle-pi mirror only on download failure", async () => {
+	const payload = Buffer.from("raw prerelease binary");
+	const digest = createHash("sha256").update(payload).digest("hex");
+	const baseAsset = { name: "gentle-ai_2.5.0-rc.3_linux_amd64", sha256: digest, binarySha256: digest, url: "https://example.invalid/upstream", mirrorUrl: "https://example.invalid/mirror", executable: "gentle-ai" };
+
+	const attempted: string[] = [];
+	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-mirror-"));
+	const result = await installGentleAi({
+		packageRoot, platform: "linux", arch: "x64",
+		releaseAssets: { "linux/amd64": baseAsset },
+		download: async (url: string, destination: string) => {
+			attempted.push(url);
+			if (url === baseAsset.url) throw new Error("upstream asset deleted");
+			await writeFile(destination, payload);
+		},
+	});
+	assert.equal(result.installed, true);
+	assert.deepEqual(attempted, [baseAsset.url, baseAsset.mirrorUrl]);
+
+	// Integrity beats availability: wrong bytes from the upstream source fail
+	// immediately and the mirror is never consulted.
+	const mismatched: string[] = [];
+	await assert.rejects(installGentleAi({
+		packageRoot: await mkdtemp(join(tmpdir(), "gentle-pi-installer-mirror-mismatch-")), platform: "linux", arch: "x64",
+		releaseAssets: { "linux/amd64": baseAsset },
+		download: async (url: string, destination: string) => { mismatched.push(url); await writeFile(destination, "tampered bytes"); },
+	}), /checksum mismatch/);
+	assert.deepEqual(mismatched, [baseAsset.url]);
+
+	// Both sources unavailable: the failure names the documented recovery.
+	await assert.rejects(installGentleAi({
+		packageRoot: await mkdtemp(join(tmpdir(), "gentle-pi-installer-mirror-unavailable-")), platform: "linux", arch: "x64",
+		releaseAssets: { "linux/amd64": baseAsset },
+		download: async () => { throw new Error("gone"); },
+	}), (error: unknown) => error instanceof Error && /GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1/.test(error.message) && (error as { code?: string }).code === "GENTLE_AI_ASSET_UNAVAILABLE");
+
+	// Every pinned prerelease row carries the gentle-pi mirror as its second
+	// source; the digests stay identical for both.
+	for (const pinned of Object.values(GENTLE_AI_RELEASE_ASSETS)) {
+		assert.match((pinned as { mirrorUrl?: string }).mirrorUrl ?? "", /^https:\/\/github\.com\/Gentleman-Programming\/gentle-pi\/releases\/download\/gentle-ai-mirror-v2\.5\.0-rc\.3\//);
+	}
+});
+
 test("Windows archive lookup remains unsupported and names Go SumDB source installation", () => {
 	for (const arch of ["x64", "arm64"]) {
 		assert.throws(() => resolveGentleAiReleaseAsset("win32", arch), /Go SumDB source installation/);

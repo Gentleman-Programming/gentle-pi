@@ -339,6 +339,23 @@ test("capabilities/v2.3 requires START/v4 and rejects future identities", () => 
 	(future.protocol as JsonObject).minor = 4;
 	future.schemas = (future.schemas as string[]).map((schema) => schema.replace("capabilities/v2.3", "capabilities/v2.4"));
 	assert.throws(() => decodeReviewCapabilitiesV2(future, CAPTURED_DIGEST), /schema must be one of/);
+
+	// Distinguishing case for the v2.3 retired-schema filter: the real rc.3
+	// provider no longer advertises these three identities, so a v2.3
+	// advertisement WITHOUT them must still negotiate. A no-op filter would
+	// keep requiring them and fail the superset assertion here.
+	const retiredSchemas = ["gentle-ai.review-final-verification-incident/v1", "gentle-ai.review-receipt/v2", "gentle-ai.review-verification-evidence/v2"];
+	const retiredRemoved = clone(v23);
+	retiredRemoved.schemas = (retiredRemoved.schemas as string[]).filter((schema) => !retiredSchemas.includes(schema));
+	assert.equal((v23.schemas as string[]).length - (retiredRemoved.schemas as string[]).length, 3, "fixture must actually carry and then remove the three retired identities");
+	const relaxed = decodeReviewCapabilitiesV2(retiredRemoved, CAPTURED_DIGEST);
+	for (const schema of retiredSchemas) assert.equal(relaxed.schemas.has(schema), false);
+
+	// Earlier minors keep the full common requirement: the same removal under
+	// the v2.2 identity must fail closed.
+	const v22Retired = clone(fixture(DEV_FIXTURES, "capabilities-v2.2.captured.json") as JsonObject);
+	v22Retired.schemas = (v22Retired.schemas as string[]).filter((schema) => !retiredSchemas.includes(schema));
+	assert.throws(() => decodeReviewCapabilitiesV2(v22Retired, CAPTURED_DIGEST), /schema/);
 });
 
 test("START/v4 accepts only its reviewing status continuation and preserves v3 strictness", () => {
