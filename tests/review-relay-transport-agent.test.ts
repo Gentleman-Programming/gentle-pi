@@ -244,6 +244,35 @@ test("a provider that refuses the pi transport blocks immediately without an age
 	assert.doesNotMatch(JSON.stringify(result), /"status":"(?:approved|allowed)"/);
 });
 
+test("a transport refusal names the runnable wrapper continuation, never a raw CLI command as the only exit", async (t) => {
+	// #535: a provider-printed raw `gentle-ai review ...` continuation is a dead
+	// end in this runtime — Pi is not in the provider's immutable review runtime
+	// list — so the refusal envelope itself must name the exit that runs in this
+	// surface: the gentle_review / gentle_review_capture wrapper tools. The
+	// provider's diagnostic stays intact as evidence alongside the runnable exit.
+	const captureCwd = repository(t);
+	const { native: captureNative } = transportAwareNative({ refusalCode: TRANSPORT_REFUSAL_CODE });
+	const capture = await runCapture(captureCwd, captureNative, "continuation-capture-lineage");
+	__testing.clearReviewTransportProbeForTesting(captureNative);
+	assert.equal(capture.outcome, "pi-host-relay-transport-unavailable");
+	const captureNextAction = String(capture.next_action);
+	assert.match(captureNextAction, /gentle_review \{"operation":"inspect"\}/, "the capture refusal re-enters negotiated STATUS through the wrapper controller");
+	assert.match(captureNextAction, /gentle_review_capture/, "the capture refusal names the wrapper resubmission, not a CLI command");
+	assert.doesNotMatch(captureNextAction, /gentle-ai review/, "a raw `gentle-ai review ...` invocation is not a runnable exit in this runtime");
+	assert.deepEqual(capture.wrapper_continuation, { tool: "gentle_review", operation: "inspect", then: "gentle_review_capture" });
+	assert.match(String((capture.relay_transport as { message: string }).message), /immutable review runtimes/i, "the provider diagnostic remains intact in the envelope");
+
+	const statusCwd = repository(t);
+	const { native: statusNative } = transportAwareNative({ refusalCode: TRANSPORT_REFUSAL_CODE });
+	const status = await runStatus(statusCwd, statusNative, "continuation-status-lineage");
+	__testing.clearReviewTransportProbeForTesting(statusNative);
+	assert.equal(status.outcome, "pi-host-relay-transport-unavailable");
+	const statusNextAction = String(status.next_action);
+	assert.match(statusNextAction, /gentle_review \{"operation":"inspect"\}/, "the controller refusal re-enters negotiated STATUS through the wrapper controller");
+	assert.doesNotMatch(statusNextAction, /gentle-ai review/, "a raw `gentle-ai review ...` invocation is not a runnable exit in this runtime");
+	assert.deepEqual(status.wrapper_continuation, { tool: "gentle_review", operation: "inspect" });
+});
+
 test("a remembered pi transport refusal remains blocked without re-probing or lifecycle continuation", async (t) => {
 	const cwd = repository(t);
 	const { native, agents } = transportAwareNative({ refusalCode: TRANSPORT_REFUSAL_CODE });

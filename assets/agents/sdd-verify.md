@@ -102,7 +102,27 @@ If a partial slice is approved, report unchecked lines as remaining scope and st
 
 ## Report
 
-Write `openspec/changes/{change}/verify-report.md` with:
+The report's first non-empty content MUST be this exact fenced YAML envelope, with every field exactly once and counts taken from the actual retrieved specs (no front matter, `~~~` fences, untagged fences, or any content before the fence):
+
+```yaml
+schema: gentle-ai.verify-result/v1
+evidence_revision: sha256:{current-evidence-digest}
+verdict: pass
+blockers: 0
+critical_findings: 0
+requirements: {complete}/{actual-total}
+scenarios: {complete}/{actual-total}
+test_command: {exact command}
+test_exit_code: 0
+test_output_hash: sha256:{exact-output-digest}
+build_command: {exact command}
+build_exit_code: 0
+build_output_hash: sha256:{exact-output-digest}
+```
+
+Before the first persistence attempt, hold the complete report as exact candidate bytes and run `gentle-ai sdd-verify-validate --input <path|-> --requirements <n> --scenarios <n>` before any OpenSpec or Engram write. If the validator is unavailable or denies admission, make zero writes and preserve the prior report; otherwise persist the same bytes, including a valid `fail`.
+
+The report is `openspec/changes/{change}/verify-report.md`. After the envelope, it continues with:
 
 - pass/fail status;
 - spec coverage;

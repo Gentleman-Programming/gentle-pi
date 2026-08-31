@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -223,6 +223,45 @@ test("public acknowledgement reports the burn from the review-acknowledged/v1 en
 		argumentTokens: [`--cwd=${process.cwd()}`, `--lineage=${lineageId}`, `--target=${SHA}`, `--expected-revision=${SHA}`, "--token=provider-issued-once"],
 		binding: { lineageId, targetIdentity: SHA, revision: SHA },
 	}]);
+});
+
+function candidateRepository(t: test.TestContext): string {
+	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-native-routing-"));
+	// The registry's views are 0555 dirs / 0444 files; restore writability before
+	// the fixture teardown so a surviving view never breaks rmSync.
+	t.after(() => { try { execFileSync("chmod", ["-R", "u+w", cwd]); } catch {} rmSync(cwd, { recursive: true, force: true }); });
+	const git = (...arguments_: string[]) => execFileSync("git", arguments_, { cwd, encoding: "utf8" });
+	git("init", "-b", "main");
+	writeFileSync(join(cwd, "tracked.txt"), "base\n");
+	git("add", "tracked.txt");
+	git("-c", "user.name=Routing Test", "-c", "user.email=routing@example.invalid", "commit", "-m", "base");
+	return realpathSync(cwd);
+}
+
+test("approved acknowledgement burn tears down the retained candidate view and keeps its projection", async (t) => {
+	const lineageId = "acknowledge-approved-view-teardown";
+	const contributorRoot = candidateRepository(t);
+	writeFileSync(join(contributorRoot, "tracked.txt"), "candidate\n");
+	const registry = new CandidateViewRegistry();
+	t.after(() => registry.cleanupAll());
+	const view = registry.create({ contributorRoot });
+	registry.retain(view.token, lineageId);
+	assert.ok(existsSync(view.root));
+	let approved = false;
+	const native = {
+		targetStatus: async () => approved ? approvedAcknowledgementStatus(lineageId, contributorRoot) : status(lineageId),
+		acknowledgeApproved: async () => {},
+	} as unknown as NativeReviewCli;
+
+	const blocked = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId }, contributorRoot, native, undefined, registry);
+	assert.equal(blocked.outcome, "native-approved-acknowledgement-not-current");
+	assert.ok(existsSync(view.root), "a refused acknowledgement proves no burn; the view must survive");
+
+	approved = true;
+	const completed = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId }, contributorRoot, native, undefined, registry);
+	assert.equal(completed.outcome, "native-approved-acknowledgement-completed");
+	assert.equal(existsSync(view.root), false, "the burn must tear down the immutable candidate view worktree");
+	assert.ok(registry.hasProjection(lineageId, contributorRoot), "terminal approved cleanup keeps the lineage projection");
 });
 
 test("ambiguous acknowledgement reconciles STATUS once without replaying the provider vector", async () => {
@@ -889,6 +928,59 @@ test("targeted-validator provider vectors preserve their nonuniform native closu
 	const result = await __testing.executeReviewCaptureOperation({ lineageId: closureLineage, collectBinding: JSON.stringify(input) }, process.cwd(), native);
 	assert.equal(result.status, "closed");
 	assert.equal(result.outcome, "native-last-event-closure");
+	assert.equal("correction_target_identity" in result, false);
+});
+
+test("targeted-validator captures echo the distinct provider correction target identity", async () => {
+	const closureLineage = "review-validator-correction-target";
+	const correctionTarget = `sha256:${"d".repeat(64)}`;
+	const baseInput = collectInput(closureLineage);
+	const { submission: _submission, artifactSubject: _artifactSubject, ...roleInput } = baseInput;
+	void _submission;
+	void _artifactSubject;
+	const input = {
+		...roleInput,
+		name: "provider_targeted_validator",
+		schema: "https://gentle-ai.dev/schema/review/targeted-validator/v1",
+		captureOperation: "review.capture-validation",
+		arguments: [
+			{ name: "lineage", value: closureLineage, token: `--lineage=${closureLineage}` },
+			{ name: "target", value: correctionTarget, token: `--target=${correctionTarget}` },
+			{ name: "agent", value: "pi", token: "--agent=pi" },
+			{ name: "execute", value: "true", token: "--execute=true" },
+		],
+		validationRequest: { correctionTargetIdentity: correctionTarget },
+	} as unknown as ReviewCollectInputV3;
+	const roleStatus = { ...status(closureLineage), nextTransition: { kind: "collect", reasonCode: "provider_role_required", collect: { inputs: [input] } } } as ReviewStatusV3;
+	const native = {
+		targetStatus: async () => roleStatus,
+		captureProviderRole: async () => ({ schema: "gentle-ai.review-last-event-closure/v1", operation: "review/capture-validation", lineageId: closureLineage, state: "approved", storeRevision: SHA }),
+	} as unknown as NativeReviewCli;
+	const result = await __testing.executeReviewCaptureOperation({ lineageId: closureLineage, collectBinding: JSON.stringify(input) }, process.cwd(), native);
+	assert.equal(result.outcome, "native-last-event-closure");
+	assert.equal(result.correction_target_identity, correctionTarget);
+});
+
+test("capture schema and guidance name diff-line units apart from the frozen logical correction budget", () => {
+	const tools = new Map<string, { description: string; promptGuidelines?: readonly string[]; parameters: unknown }>();
+	createGentleAiExtension({ nativeReviewCli: null })({
+		on() {},
+		registerTool(definition: { name: string; description: string; promptGuidelines?: readonly string[]; parameters: unknown }) { tools.set(definition.name, definition); },
+		registerCommand() {},
+	} as unknown as ExtensionAPI);
+	const capture = tools.get("gentle_review_capture");
+	const controller = tools.get("gentle_review");
+	assert.ok(capture);
+	assert.ok(controller);
+	const schema = JSON.stringify(capture.parameters);
+	assert.match(schema, /diff lines/);
+	assert.match(schema, /logical correction budget/);
+	const captureGuidance = (capture.promptGuidelines ?? []).join("\n");
+	assert.match(captureGuidance, /diff lines/);
+	assert.match(captureGuidance, /logical correction budget/);
+	const controllerGuidance = (controller.promptGuidelines ?? []).join("\n");
+	assert.match(controllerGuidance, /logical correction/);
+	assert.match(controllerGuidance, /diff lines/);
 });
 
 test("correction-plan collection demands provider-bounded lines, then returns its terminal closure", async () => {

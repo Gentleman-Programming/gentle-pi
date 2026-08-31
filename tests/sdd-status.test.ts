@@ -659,6 +659,65 @@ test("resolveSddStatus openspec + named change missing still blocks", async () =
 	assert.notEqual(status.nextRecommended, "resolve-via-engram");
 });
 
+// Issue #535 — post-archive status exposes explicit completion and the archived artifact location
+test("resolveSddStatus projects archived terminal state when the change lives in the archive", async () => {
+	const cwd = await workspace();
+	mkdirSync(join(cwd, "openspec", "changes"), { recursive: true });
+	write(
+		join(cwd, "openspec", "changes", "archive", "2026-01-02-add-auth", "proposal.md"),
+		"# Proposal\n",
+	);
+
+	const status = resolveSddStatus({ cwd, changeName: "add-auth" });
+
+	assert.equal(status.changeName, "add-auth");
+	assert.equal(status.nextRecommended, "archived");
+	assert.deepEqual(status.archived, {
+		path: join("openspec", "changes", "archive", "2026-01-02-add-auth"),
+	});
+	assert.deepEqual(status.blockedReasons, []);
+	assert.equal(status.dependencies.archive, "all_done");
+	assert.doesNotMatch(status.nextRecommended, /sdd-new|Start an SDD change|not found/i);
+});
+
+test("resolveSddStatus archived projection prefers the newest archive date", async () => {
+	const cwd = await workspace();
+	mkdirSync(join(cwd, "openspec", "changes"), { recursive: true });
+	mkdirSync(join(cwd, "openspec", "changes", "archive", "2026-01-01-add-auth"), { recursive: true });
+	mkdirSync(join(cwd, "openspec", "changes", "archive", "2026-03-04-add-auth"), { recursive: true });
+
+	const status = resolveSddStatus({ cwd, changeName: "add-auth" });
+
+	assert.equal(status.nextRecommended, "archived");
+	assert.deepEqual(status.archived, {
+		path: join("openspec", "changes", "archive", "2026-03-04-add-auth"),
+	});
+});
+
+test("resolveSddStatus still blocks a change that never existed and has no archive entry", async () => {
+	const cwd = await workspace();
+	mkdirSync(join(cwd, "openspec", "changes"), { recursive: true });
+	mkdirSync(join(cwd, "openspec", "changes", "archive", "2026-01-01-unrelated"), { recursive: true });
+
+	const status = resolveSddStatus({ cwd, changeName: "ghost" });
+
+	assert.equal(status.archived, undefined);
+	assert.match(status.blockedReasons.join("\n"), /Active change not found/);
+	assert.notEqual(status.nextRecommended, "archived");
+});
+
+test("resolveSddStatus archive matching requires the exact change-name suffix", async () => {
+	const cwd = await workspace();
+	mkdirSync(join(cwd, "openspec", "changes"), { recursive: true });
+	mkdirSync(join(cwd, "openspec", "changes", "archive", "2026-01-01-foo-bar-baz"), { recursive: true });
+
+	const status = resolveSddStatus({ cwd, changeName: "foo-bar" });
+
+	assert.equal(status.archived, undefined);
+	assert.match(status.blockedReasons.join("\n"), /Active change not found/);
+	assert.notEqual(status.nextRecommended, "archived");
+});
+
 // Fix 4 render test — non-authoritative both status → dispatcher shows "both" not "Engram or none"
 test("renderSddDispatcherMarkdown for non-authoritative both status shows artifact store 'both'", async () => {
 	const cwd = await workspace();
