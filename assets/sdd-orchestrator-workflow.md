@@ -18,11 +18,11 @@ proposal → spec ─┬→ tasks → apply → verify → sync → archive
 proposal → design ┘
 ```
 
-`/sdd-status [change]` is the read-only status action for resolving the active change, artifact paths, task progress, dependency readiness, and action context before apply/verify/sync/archive.
+`/gentle-sdd-status [change]` is the read-only status action for resolving the active change, artifact paths, task progress, dependency readiness, and action context before apply/verify/sync/archive.
 
 ## Native SDD Dispatcher
 
-The user expresses intent; they should not have to administer phases manually. For natural-language SDD requests and `/sdd-continue`, the parent/orchestrator must use the native status engine as the state authority, decide the next phase, and delegate only the phase that status marks ready.
+The user expresses intent; they should not have to administer phases manually. For natural-language SDD requests and `/gentle-sdd-continue`, the parent/orchestrator must use the native status engine as the state authority, decide the next phase, and delegate only the phase that status marks ready.
 
 Flow:
 
@@ -32,8 +32,8 @@ user intent → preflight/init guard → native status engine → phase decision
 
 Rules:
 
-- `/sdd-status` is a debug/status command, not the main UX.
-- `/sdd-continue` is the native dispatcher command: resolve status, choose the next ready phase, and carry status/instructions into the subagent prompt.
+- `/gentle-sdd-status` is a debug/status command, not the main UX.
+- `/gentle-sdd-continue` is the native dispatcher command: resolve status, choose the next ready phase, and carry status/instructions into the subagent prompt.
 - `sdd-apply`, `sdd-verify`, `sdd-sync`, and `sdd-archive` must obey parent-provided native status; they must not reconstruct readiness from prompt inference when status JSON is present.
 - Do not launch a phase when native status marks that dependency `blocked`.
 - `sdd-archive` cannot proceed unless native status says `dependencies.archive` is `ready` or `all_done` — UNLESS the store carve-out is active (`nextRecommended: "resolve-via-engram"`), in which case resolve archive readiness from Engram instead of treating `not_applicable` as a gate failure.
@@ -41,7 +41,7 @@ Rules:
 
 ## SDD Status Contract
 
-Before `/sdd-continue`, `sdd-apply`, `sdd-verify`, `sdd-sync`, or `sdd-archive`, resolve and carry structured status. Lookup order: parent-provided status, then project override `.pi/gentle-ai/support/sdd-status-contract.md`, then globally installed `~/.pi/agent/gentle-ai/support/sdd-status-contract.md`, then the embedded `sdd-status` prompt contract. Do not use `assets/support/...` as a runtime path; that is only the package source path before installation.
+Before `/gentle-sdd-continue`, `sdd-apply`, `sdd-verify`, `sdd-sync`, or `sdd-archive`, resolve and carry structured status. Lookup order: parent-provided status, then project override `.pi/gentle-ai/support/sdd-status-contract.md`, then globally installed `~/.pi/agent/gentle-ai/support/sdd-status-contract.md`, then the embedded `sdd-status` prompt contract. Do not use `assets/support/...` as a runtime path; that is only the package source path before installation.
 
 Status must include:
 
@@ -56,7 +56,7 @@ Do not guess the active change. If change selection is ambiguous, ask the user a
 
 ## Lazy SDD Preflight
 
-Do not ask SDD setup questions on session start. The first time the user initiates an SDD process in a Pi session, run the SDD preflight once and keep those choices for the rest of that session. Runtime trigger detection is intentionally deterministic: slash SDD flows and `/sdd-init` run preflight automatically; for natural-language requests, the parent/orchestrator decides semantically whether SDD is needed and must run/reuse `/gentle:sdd-preflight` before continuing.
+Do not ask SDD setup questions on session start. The first time the user initiates an SDD process in a Pi session, run the SDD preflight once and keep those choices for the rest of that session. Runtime trigger detection is intentionally deterministic: slash SDD flows and `/gentle-sdd-init` run preflight automatically; for natural-language requests, the parent/orchestrator decides semantically whether SDD is needed and must run/reuse `/gentle:sdd-preflight` before continuing.
 
 **Hard gate:** `openspec/config.yaml`, existing SDD changes, installed `.pi`/global SDD assets, or a todo named "preflight" are not session preflight. They are project context only. Do not mark SDD preflight complete, start `sdd-init`, launch SDD subagents/chains, or move to explore/proposal/spec/design/tasks until this session has an injected `## SDD Session Preflight` block or an equivalent resolution from the canonical authority order below.
 
@@ -87,9 +87,9 @@ When the store is `openspec` or `both`, the local artifact is:
 openspec/config.yaml
 ```
 
-If it is missing, ask the user for the minimal information needed or run `/sdd-init` if available.
+If it is missing, ask the user for the minimal information needed or run `/gentle-sdd-init` if available.
 
-When the store is `engram` or `none`, `/sdd-init` never writes that file, so its absence is expected and is not a missing init. Never re-trigger `/sdd-init` over it. Resolve project context from the Engram `sdd-init/{project}` topic for `engram`, or inline from the session for `none`, and ask the user only when that context is genuinely absent.
+When the store is `engram` or `none`, `/gentle-sdd-init` never writes that file, so its absence is expected and is not a missing init. Never re-trigger `/gentle-sdd-init` over it. Resolve project context from the Engram `sdd-init/{project}` topic for `engram`, or inline from the session for `none`, and ask the user only when that context is genuinely absent.
 
 This init guard runs after the session preflight gate above; project config presence or absence never substitutes for session preflight choices. Do not proceed with a substantial SDD flow while pretending project context, testing capability, or session preflight choices are known.
 

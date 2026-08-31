@@ -586,7 +586,7 @@ export function installSddAssets(
 
 export function isSddPreflightTrigger(text: string): boolean {
 	const trimmed = text.trim();
-	if (/^\/sdd(?:[-:][^\s]*)?(?:\s|$)/i.test(trimmed)) return true;
+	if (/^\/(?:gentle-)?sdd(?:[-:][^\s]*)?(?:\s|$)/i.test(trimmed)) return true;
 	if (/[?？]\s*$/.test(trimmed)) return false;
 	if (
 		/\b(?:don't|do\s+not|not\s+use|never\s+use|without\s+using|sin\s+usar|no\s+(?:quiero|queremos|vamos\s+a)?\s*usar)\s+sdd\b/i.test(
