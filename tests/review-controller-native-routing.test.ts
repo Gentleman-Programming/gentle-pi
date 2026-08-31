@@ -124,6 +124,61 @@ test("public acknowledgement relays one current provider vector and never replay
 	assert.equal(acknowledgementRequests.length, 1);
 });
 
+test("approved acknowledgement reuses an explicit STATUS excluded-untracked selection and clears it after consumption", async () => {
+	const cwd = process.cwd();
+	const lineageId = "acknowledge-approved-excluded-untracked";
+	const selection = {
+		untrackedScope: "exclude",
+		expectedUntrackedInventory: "inventory-sha256",
+		intendedUntracked: [],
+	};
+	const selections = new Map();
+	const requests: Array<Record<string, unknown>> = [];
+	let acknowledgements = 0;
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => {
+			requests.push(request);
+			return approvedAcknowledgementStatus(lineageId);
+		},
+		acknowledgeApproved: async () => { acknowledgements += 1; },
+	} as unknown as NativeReviewCli;
+
+	await __testing.executeReviewControllerOperation(
+		{ operation: "status", lineageId, input: JSON.stringify(selection) },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		undefined,
+		selections,
+	);
+	const acknowledged = await __testing.executeReviewControllerOperation(
+		{ operation: "acknowledge-approved", lineageId },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		undefined,
+		selections,
+	);
+	assert.equal(acknowledged.outcome, "native-approved-acknowledgement-completed");
+	await __testing.executeReviewControllerOperation(
+		{ operation: "status", lineageId },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		undefined,
+		selections,
+	);
+	assert.deepEqual(requests, [
+		{ cwd, lineageId, agent: "pi", ...selection },
+		{ cwd, lineageId, ...selection },
+		{ cwd, lineageId, agent: "pi" },
+	]);
+	assert.equal(acknowledgements, 1);
+});
+
 test("public acknowledgement reports the burn from the review-acknowledged/v1 envelope when the provider prints one", async () => {
 	const lineageId = "acknowledge-approved-envelope";
 	let statusCalls = 0;

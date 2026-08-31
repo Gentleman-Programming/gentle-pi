@@ -463,7 +463,7 @@ const ALLOWED_EDIT_SURFACES_HEADING = /^## Allowed edit surfaces[ \t]*$/gim;
 const MARKDOWN_HEADING_LINE = /^#{1,6}\s/;
 const MARKDOWN_LIST_MARKER = /^(?:[-*+]|\d+[.)])\s+/;
 const WRITER_EDIT_SURFACE_REJECTION =
-	"Parent must derive or map narrow repository-relative allowed edit surfaces from the delegated task and relaunch the writer. Do not ask the human to author paths or globs.";
+	"Writer tasks must include the exact Markdown heading `## Allowed edit surfaces` with narrow repository-relative paths or narrow globs, one per line. The parent must derive or map that canonical block from the delegated task and relaunch the writer; do not accept aliases, and do not ask the human to author paths or globs.";
 
 function isTaskScopedRepositoryRelativePath(value: string): boolean {
 	const normalized = value.replace(/\\/g, "/");
@@ -3958,9 +3958,13 @@ function readRetainedNativeCaptureRoute(selections: Map<string, RetainedNativeSt
 
 function isTerminalReviewAuthorityState(state: string | undefined): boolean { return state === "invalidated" || state === "approved" || state === "escalated"; }
 
+function clearRetainedNativeUntrackedSelection(selections: Map<string, RetainedNativeStatusSelection>, workspaceRoot: string, lineageId: string): void {
+	selections.delete(reviewLifecycleStorageKey(workspaceRoot, lineageId));
+}
+
 function clearRetainedNativeStatusSelectionsOnTerminal(selections: Map<string, RetainedNativeStatusSelection>, workspaceRoot: string, lineageId: string | undefined, state: string | undefined): void {
 	if (lineageId === undefined || !isTerminalReviewAuthorityState(state)) return;
-	selections.delete(reviewLifecycleStorageKey(workspaceRoot, lineageId));
+	if (state !== "approved") clearRetainedNativeUntrackedSelection(selections, workspaceRoot, lineageId);
 	for (const [key, selection] of selections) if (isRetainedNativeCaptureRoute(selection) && selection.workspaceRoot === workspaceRoot && selection.lineageId === lineageId) selections.delete(key);
 }
 
@@ -4806,6 +4810,7 @@ async function executeReviewControllerOperation(
 			cwd: defaultCwd,
 			lineageId: parameters.lineageId,
 			...(frozenTarget?.committedOnly === true ? { baseRef: frozenTarget.baseCommit, committedOnly: true } : {}),
+			...readRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, parameters.lineageId),
 			...(signal === undefined ? {} : { signal }),
 		};
 		let status: ReviewStatusV3;
@@ -4854,6 +4859,7 @@ async function executeReviewControllerOperation(
 				binding: { lineageId: parameters.lineageId, targetIdentity: status.targetIdentity, revision: status.authority.revision },
 				...(signal === undefined ? {} : { signal }),
 			});
+			clearRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, parameters.lineageId);
 			return {
 				operation: parameters.operation,
 				status: "closed",
