@@ -65,22 +65,35 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 
 **Migration note:** Do not enable `pi-tool-cards` and `quiet-tools` together: Pi rejects duplicate `bash`, `read`, `edit`, and `write` registrations. Disable or remove the standalone package during migration; gentle-pi does not alter user configuration or delete that repository.
 
+## How it works
+
+el Gentleman is a state machine around a coding agent, not a prompt. Work moves through explicit states with an audited authority boundary:
+
+```text
+clarify → explore → proposal → spec → design → tasks → apply → verify → sync → archive
+```
+
+- **Clarify** is a gate, not a step list: scope, constraints, acceptance criteria, and non-goals are settled before implementation—accepted before `apply`.
+- **Spec-driven phases** persist durable artifacts in `openspec/changes/<change>/` (proposal, spec, design, tasks); phase agents never jump ahead of the dependency graph.
+- **Apply and verify** record strict-TDD evidence (RED → GREEN → …) and run the declared test command; the orchestrator gatekeeper validates artifacts after each phase before launching the next.
+- **Review authority is a native boundary:** the package-local `gentle-ai` CLI (provisioned and integrity-verified at install) owns review state, receipts, and evidence; Pi never fabricates them. Review outcomes are informational—commit, push, and PR follow ordinary repository policy.
+- **Delivery stays human-controlled:** `apply` forecasts review workload and stops before exceeding budget (`ask-on-risk`) rather than silently shipping an oversized diff.
+
+Every row in the capability table below maps to this mechanism: per-agent model assignment feeds the phase agents, skill discovery feeds `clarify`/`apply`, reviewer protection is the workload gate, and bounded native review is the authority boundary.
+
 ## Install
 
 ```bash
-pi install npm:gentle-pi@0.14.0
+pi install npm:gentle-pi
 ```
 
-### RDD version policy
+### Version policy
 
-Native RDD started in `gentle-pi` `v0.15.0` on 2026-07-10 with bounded review transactions. Every release from `v0.15.0` onward is part of the unstable RDD development line. New releases will continue improving RDD until the project declares the line stable. The stable version for normal use without native RDD is the last preceding release, `v0.14.0`.
+Native RDD (review-driven development) has been the default review line since `v0.15.0` (2026-07-10) and is stable in the current 2.x series. The last pre-RDD release, `v0.14.0`, remains installable for legacy setups that want the pre-RDD review behavior:
 
 ```bash
-# Stable version without native RDD
+# Legacy (pre-RDD review line)
 pi install npm:gentle-pi@0.14.0
-
-# Latest released RDD build (unstable)
-pi install npm:gentle-pi@latest
 ```
 
 The latest RDD package installs Gentle AI only into its private `.gentle-ai/` directory. Darwin and Linux use pinned signed archives with archive and executable SHA-256 verification. Windows x64 and arm64 build the exact `v2.4.0` source tag with a local Go 1.25.10+ toolchain, a sealed Go environment, `GOTOOLCHAIN=local`, and `GOSUMDB=sum.golang.org`; it does not download Go automatically. Windows provenance is Go-toolchain plus SumDB evidence and postinstall tamper detection, **not** Authenticode or protection against a malicious joint binary-and-manifest replacement. Package-private locks coordinate cooperative concurrent or crashed installers; their tombstones fail closed. A malicious same-user process with write access to package-private `node_modules` is outside that protocol because it can already replace package code, binary, or manifest, and portable Node has no pathname-delete CAS. It never uses `PATH` or a global `gentle-ai` installation. For development or offline installs only, set `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1`; native review operations then fail closed with an actionable `package-local-binary-missing` error until the package is reinstalled normally.
