@@ -436,6 +436,16 @@ test("status/v6 decodes and enforces the intended-untracked selection submission
 		Object.assign(collectInput(body), { capture_operation: captureOperation, ...fields });
 		assert.throws(() => decodeReviewStatusV3(body), /operation_token/, captureOperation);
 	}
+
+	const mismatchedBindings: ReadonlyArray<readonly [string, string]> = [
+		["name", "renamed_selection"],
+		["schema", "gentle-ai.review-intended-untracked-selection/v0"],
+	];
+	for (const [field, value] of mismatchedBindings) {
+		const body = initialIntendedUntrackedStatusV6();
+		collectInput(body)[field] = value;
+		assert.throws(() => decodeReviewStatusV3(body), /intended_untracked_selection binding/, field);
+	}
 });
 
 test("START/v4 accepts only its reviewing status continuation and preserves v3 strictness", () => {

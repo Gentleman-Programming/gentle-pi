@@ -1557,6 +1557,9 @@ function decodeCollectInput(value: unknown, label: string, v5: boolean, v6: bool
 		&& name === "intended_untracked_selection"
 		&& schema === "gentle-ai.review-intended-untracked-selection/v1"
 		&& captureOperation === "external.select_intended_untracked";
+	if (captureOperation === "external.select_intended_untracked" && (name !== "intended_untracked_selection" || schema !== "gentle-ai.review-intended-untracked-selection/v1")) {
+		throw new TypeError(`${label} external.select_intended_untracked requires the intended_untracked_selection binding`);
+	}
 	if (intendedUntracked) {
 		const expectedNames = ["target_identity", "projection", "base_tree", "candidate_tree", "eligible_paths_json", "expected_untracked_inventory"] as const;
 		if (argumentsList.length !== expectedNames.length || argumentsList.some((argument, index) => argument.name !== expectedNames[index] || argument.token !== undefined)) {
