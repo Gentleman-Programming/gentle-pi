@@ -12,8 +12,11 @@
 // fresh, and prints the rendered prompt's UTF-8 byte length to stdout.
 
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
-const { __testing } = await import(join(import.meta.dirname, "..", "..", "extensions", "gentle-ai.ts"));
+// Node rejects bare absolute paths in dynamic import() on Windows
+// (ERR_UNSUPPORTED_ESM_URL_SCHEME); always go through a file:// specifier.
+const { __testing } = await import(pathToFileURL(join(import.meta.dirname, "..", "..", "extensions", "gentle-ai.ts")).href);
 const assetsDir = process.argv[2];
 if (!assetsDir) {
 	throw new Error("usage: measure-orchestrator-prompt.mjs <assets-dir>");

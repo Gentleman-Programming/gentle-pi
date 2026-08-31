@@ -4,6 +4,8 @@ import { mkdtempSync, mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { sandboxGitEnv, scrubInheritedGitEnvironment } from "./support/env.ts";
+scrubInheritedGitEnvironment();
 import { createReviewEventV1 } from "../lib/review-graph-schema.ts";
 import { ReviewGraphObjectStoreV1, ReviewObjectStoreError, type ReviewObjectStoreFaultPoint } from "../lib/review-object-store.ts";
 
@@ -22,12 +24,12 @@ test("repository factory resolves the graph object path beneath the exact common
 	const repository = join(parent, "repository");
 	try {
 		mkdirSync(repository);
-		execFileSync("git", ["init", "-b", "main"], { cwd: repository });
+		execFileSync("git", ["init", "-b", "main"], { env: sandboxGitEnv(), cwd: repository });
 		writeFileSync(join(repository, "README.md"), "foundation\n");
-		execFileSync("git", ["add", "README.md"], { cwd: repository });
-		execFileSync("git", ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "foundation"], { cwd: repository });
+		execFileSync("git", ["add", "README.md"], { env: sandboxGitEnv(), cwd: repository });
+		execFileSync("git", ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "foundation"], { env: sandboxGitEnv(), cwd: repository });
 		const store = ReviewGraphObjectStoreV1.forRepository(repository);
-		const commonDirectory = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: repository, encoding: "utf8" }).trim();
+		const commonDirectory = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { env: sandboxGitEnv(), cwd: repository, encoding: "utf8" }).trim();
 		assert.equal(store.root, join(commonDirectory, "gentle-ai", "reviews", "graph-v1"));
 	} finally {
 		rmSync(parent, { recursive: true, force: true });

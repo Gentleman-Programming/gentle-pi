@@ -8,6 +8,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { gzipSync } from "node:zlib";
+import { scrubInheritedGitEnvironment } from "./support/env.ts";
+import { skipOnWindows, skipWhenNoGitExecutableMode } from "./support/platform.ts";
+scrubInheritedGitEnvironment();
 import {
 	CandidateViewRegistry,
 	CandidateViewError,
@@ -528,7 +531,7 @@ test("review subagent dispatch rejects missing candidate views and uses the expl
 	registry.cleanup(second.token);
 });
 
-test("candidate view rejects control-character paths before prompt construction", (t) => {
+test("candidate view rejects control-character paths before prompt construction", { skip: skipOnWindows("NTFS filenames cannot contain control characters; fixture cannot create the path") }, (t) => {
 	const contributorRoot = repository(t);
 	writeFileSync(join(contributorRoot, "unsafe\npath.txt"), "candidate\n");
 	assert.throws(() => createCandidateView({ contributorRoot }), CandidateViewError);
@@ -622,7 +625,7 @@ test("candidate view exposes a compact 45-path changed scope for a 293-entry can
 	registry.cleanup(view.token);
 });
 
-test("candidate view derives deletion, rename, executable, and symlink scope from the frozen Git trees", (t) => {
+test("candidate view derives deletion, rename, executable, and symlink scope from the frozen Git trees", { skip: skipOnWindows("symlink scope requires Windows symlink privileges; exec-bit scope requires git filemode support") }, (t) => {
 	const contributorRoot = repository(t);
 	writeFileSync(join(contributorRoot, "deleted.txt"), "delete me\n");
 	writeFileSync(join(contributorRoot, "script.sh"), "#!/bin/sh\necho base\n");
@@ -835,7 +838,7 @@ test("candidate view fails closed when an incompressible compact scope exceeds 4
 	}
 });
 
-test("candidate view accepts internal relative symlink targets and rejects unsafe lexical targets", (t) => {
+test("candidate view accepts internal relative symlink targets and rejects unsafe lexical targets", { skip: skipOnWindows("symlink creation and checkout require Windows symlink privileges") }, (t) => {
 	const acceptedRoot = repository(t);
 	const acceptedTarget = "../../.agents/skills/example";
 	const acceptedLink = join(acceptedRoot, ".agent", "skills", "example");
@@ -878,7 +881,7 @@ test("candidate view accepts internal relative symlink targets and rejects unsaf
 	}
 });
 
-test("candidate view detects symlink target-byte tampering after materialization", (t) => {
+test("candidate view detects symlink target-byte tampering after materialization", { skip: skipOnWindows("symlink creation and checkout require Windows symlink privileges") }, (t) => {
 	const contributorRoot = repository(t);
 	const link = join(contributorRoot, "candidate-link");
 	try {
@@ -900,7 +903,7 @@ test("candidate view detects symlink target-byte tampering after materialization
 	}
 });
 
-test("candidate view retains a valid dangling symlink through bind and finalize resolution", (t) => {
+test("candidate view retains a valid dangling symlink through bind and finalize resolution", { skip: skipOnWindows("symlink creation and checkout require Windows symlink privileges") }, (t) => {
 	const contributorRoot = repository(t);
 	try {
 		symlinkSync("missing-target", join(contributorRoot, "dangling-link"));
@@ -1406,7 +1409,7 @@ function baseTreeOf(cwd: string): string {
 	return git(cwd, "rev-parse", "HEAD^{tree}");
 }
 
-test("deriveChangedPathManifest reports old and new mode, and flags a mode-only change", (t) => {
+test("deriveChangedPathManifest reports old and new mode, and flags a mode-only change", { skip: skipWhenNoGitExecutableMode("git cannot report executable-bit changes on Windows (core.filemode=false)") }, (t) => {
 	const cwd = repository(t);
 	chmodSync(join(cwd, "tracked.txt"), 0o755);
 	const candidate = treeOf(cwd);
@@ -1448,7 +1451,7 @@ test("deriveChangedPathManifest marks an added path and a deleted path", (t) => 
 	assert.equal(byPath.get("tracked.txt")?.deleted, true);
 });
 
-test("a mode-only divergence is rejected even though the sorted path set matches", (t) => {
+test("a mode-only divergence is rejected even though the sorted path set matches", { skip: skipWhenNoGitExecutableMode("git cannot report executable-bit changes on Windows (core.filemode=false)") }, (t) => {
 	const cwd = repository(t);
 	chmodSync(join(cwd, "tracked.txt"), 0o755);
 	const candidate = treeOf(cwd);

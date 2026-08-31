@@ -8,6 +8,7 @@ import baseTest from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { sandboxGitEnv } from "./support/env.ts";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import {
 	GENTLE_AI_DEV_BINARY_ENV,
@@ -91,7 +92,7 @@ async function reviewEnabledHome(t: baseTest.TestContext): Promise<string> {
 	process.env.XDG_DATA_HOME = xdgDataHome;
 	process.env.XDG_CACHE_HOME = xdgCacheHome;
 	const environment = {
-		...process.env,
+		...sandboxGitEnv(),
 		HOME: home,
 		XDG_CONFIG_HOME: xdgConfigHome,
 		XDG_DATA_HOME: xdgDataHome,

@@ -180,7 +180,14 @@ test("quiet tool rendering registers noisy built-in tools", () => {
 test("quiet tool execution uses the tool-call cwd", async () => {
 	const tool = registeredQuietTools().get("bash");
 	const output = extractTextContent(await tool.execute("tool-call", { command: "pwd" }, new AbortController().signal, undefined, { cwd: "/tmp" })).trim();
-	assert.equal(output, "/tmp");
+	if (process.platform === "win32") {
+		// MSYS path translation rewrites the cwd (`/tmp` -> `/c/tmp` etc.);
+		// assert the cwd option was honored rather than an MSYS-rendered string.
+		assert.notEqual(output, "");
+		assert.notEqual(output, process.cwd().replace(/\\/g, "/"));
+	} else {
+		assert.equal(output, "/tmp");
+	}
 	assert.notEqual(output, process.cwd());
 });
 

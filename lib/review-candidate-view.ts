@@ -312,8 +312,31 @@ function candidateGit(cwd: string, arguments_: readonly string[], env: NodeJS.Pr
 	}
 }
 
-function git(cwd: string, arguments_: readonly string[], env: NodeJS.ProcessEnv = process.env, executor: CandidateGitExecutor = defaultCandidateGitExecutor): string {
+function git(cwd: string, arguments_: readonly string[], env: NodeJS.ProcessEnv = candidateGitEnvironment(), executor: CandidateGitExecutor = defaultCandidateGitExecutor): string {
 	return (candidateGit(cwd, arguments_, env, "utf8", executor) as string).trim();
+}
+
+/**
+ * Deterministic git environment for candidate materialization.
+ *
+ * Candidate views are frozen-then-verified: `checkout-index` must reproduce the
+ * frozen tree bytes exactly, so git must not inherit the machine's
+ * `core.autocrlf`, filters, or scoped config (CRLF conversion would corrupt the
+ * materialized bytes and trip the hash verification). Non-git variables
+ * (including GENTLE_PI_* timeout configuration) are preserved.
+ */
+function candidateGitEnvironment(parent: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+	const environment: NodeJS.ProcessEnv = { ...parent };
+	for (const key of Object.keys(environment)) {
+		if (key.toUpperCase().startsWith("GIT_")) delete environment[key];
+	}
+	environment.GIT_CONFIG_NOSYSTEM = "1";
+	environment.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
+	environment.GIT_CONFIG_SYSTEM = process.platform === "win32" ? "NUL" : "/dev/null";
+	environment.GIT_OPTIONAL_LOCKS = "0";
+	environment.LC_ALL = "C";
+	environment.LANG = "C";
+	return environment;
 }
 
 function isWithin(parent: string, path: string): boolean {
@@ -382,7 +405,7 @@ function splitNulTerminated(raw: Buffer, errorMessage: string): Buffer[] {
 }
 
 function parseTree(cwd: string, tree: string, executor: CandidateGitExecutor): ParsedCandidateTree {
-	const raw = candidateGit(cwd, ["ls-tree", "-r", "-z", tree], process.env, "buffer", executor) as Buffer;
+	const raw = candidateGit(cwd, ["ls-tree", "-r", "-z", tree], candidateGitEnvironment(), "buffer", executor) as Buffer;
 	const entries: CandidateTreeEntry[] = [];
 	const gitlinks: CandidateGitlink[] = [];
 	const paths = new Set<string>();
@@ -404,7 +427,7 @@ function parseTree(cwd: string, tree: string, executor: CandidateGitExecutor): P
 }
 
 function gitPathTokens(cwd: string, arguments_: readonly string[], executor: CandidateGitExecutor): Buffer[] {
-	const raw = candidateGit(cwd, arguments_, process.env, "buffer", executor) as Buffer;
+	const raw = candidateGit(cwd, arguments_, candidateGitEnvironment(), "buffer", executor) as Buffer;
 	return splitNulTerminated(raw, "candidate scope Git output is not NUL-terminated");
 }
 
@@ -708,30 +731,31 @@ function resolveCandidateBase(cwd: string, baseRef: string | undefined, env: Nod
 }
 
 function resolveCandidateBaseTree(cwd: string, baseTree: string, executor: CandidateGitExecutor): ResolvedCandidateBase {
-	const row = git(cwd, ["log", "--format=%H%x09%T", "HEAD"], process.env, executor)
+	const row = git(cwd, ["log", "--format=%H%x09%T", "HEAD"], candidateGitEnvironment(), executor)
 		.split("\n")
 		.find((entry) => entry.endsWith(`\t${baseTree}`));
 	if (row === undefined) throw new CandidateViewError("native projection base is not reachable from HEAD");
-	const base = resolveCandidateBase(cwd, row.slice(0, row.indexOf("\t")), process.env, executor);
+	const base = resolveCandidateBase(cwd, row.slice(0, row.indexOf("\t")), candidateGitEnvironment(), executor);
 	if (base.tree !== baseTree) throw new CandidateViewError("native projection base tree is inconsistent");
 	return base;
 }
 
 export function resolveCanonicalCandidateBase(contributorRoot: string, baseRef: string): ResolvedCandidateBase {
-	return resolveCandidateBase(realpathSync(contributorRoot), baseRef, process.env, defaultCandidateGitExecutor);
+	return resolveCandidateBase(realpathSync(contributorRoot), baseRef, candidateGitEnvironment(), defaultCandidateGitExecutor);
 }
 
 function checkoutMaterializedEntries(root: string, entries: readonly CandidateTreeEntry[], executor: CandidateGitExecutor): void {
 	let batch: string[] = [];
 	let bytes = 0;
+	const CHECKOUT_INDEX_BATCH_BYTES = process.platform === "win32" ? 2_048 : 16_384;
 	const flush = (): void => {
 		if (batch.length === 0) return;
-		git(root, ["checkout-index", "-f", "--", ...batch], process.env, executor);
+		git(root, ["-c", "core.longpaths=true", "checkout-index", "-f", "--", ...batch], candidateGitEnvironment(), executor);
 		batch = []; bytes = 0;
 	};
 	for (const entry of entries) {
 		const size = Buffer.byteLength(entry.path, "utf8") + 1;
-		if (batch.length > 0 && bytes + size > 16_384) flush();
+		if (batch.length > 0 && bytes + size > CHECKOUT_INDEX_BATCH_BYTES) flush();
 		batch.push(entry.path); bytes += size;
 	}
 	flush();
@@ -781,7 +805,7 @@ function isErrnoCode(error: unknown, code: string): boolean {
 }
 
 function seedPrivateIndexFromLiveIndex(cwd: string, indexPath: string, executor: CandidateGitExecutor): boolean {
-	const liveIndex = resolve(cwd, git(cwd, ["rev-parse", "--path-format=absolute", "--git-path", "index"], process.env, executor));
+	const liveIndex = resolve(cwd, git(cwd, ["rev-parse", "--path-format=absolute", "--git-path", "index"], candidateGitEnvironment(), executor));
 	const entry = lstatSync(liveIndex, { throwIfNoEntry: false });
 	if (entry === undefined) return false; if (!entry.isFile()) throw new CandidateViewError("candidate live Git index is not a regular file");
 	copyFileSync(liveIndex, indexPath);
@@ -800,18 +824,18 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 	const contributorRoot = realpathSync(request.contributorRoot);
 	if (!lstatSync(contributorRoot).isDirectory()) throw new CandidateViewError("contributor root is not a directory");
 	if (request.committedOnly === true && request.baseRef === undefined) throw new CandidateViewError("committed-only candidate views require an explicit base reference", "committed-only-base-required");
-	const commonDir = resolve(contributorRoot, git(contributorRoot, ["rev-parse", "--git-common-dir"], process.env, executor));
+	const commonDir = resolve(contributorRoot, git(contributorRoot, ["rev-parse", "--git-common-dir"], candidateGitEnvironment(), executor));
 	const canonicalCommonDir = realpathSync(commonDir);
-	const base = resolveCandidateBase(contributorRoot, request.baseRef, process.env, executor);
+	const base = resolveCandidateBase(contributorRoot, request.baseRef, candidateGitEnvironment(), executor);
 	const committedOnly = request.committedOnly === true;
 	const intendedUntracked = normalizeIntendedUntracked(request.intendedUntracked);
 	const candidateCommit = committedOnly
-		? resolveCandidateBase(contributorRoot, "HEAD", process.env, executor)
+		? resolveCandidateBase(contributorRoot, "HEAD", candidateGitEnvironment(), executor)
 		: base;
 	const parent = candidateViewParent(canonicalCommonDir);
 	const index = mkdtempSync(join(tmpdir(), "gentle-ai-candidate-index-"));
 	const indexPath = join(index, "index");
-	const environment = { ...process.env, GIT_INDEX_FILE: indexPath };
+	const environment = { ...candidateGitEnvironment(), GIT_INDEX_FILE: indexPath };
 	try {
 		const baseCommit = base.commit;
 		const unborn = baseCommit === "HEAD";
@@ -843,9 +867,9 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 			// creates an orphan worktree (unborn branch, no commit, no ref) to host the
 			// materialized candidate tree without a phantom commit, with a fallback for
 			// Git versions older than 2.42 that do not support --orphan.
-			if (unborn) addUnbornWorktree(contributorRoot, root, `gentle-ai-candidate-${randomUUID()}`, process.env, executor);
-			else git(contributorRoot, ["worktree", "add", "--detach", "--no-checkout", root, candidateCommit.commit], process.env, executor);
-			git(root, ["read-tree", candidateTree], process.env, executor);
+			if (unborn) addUnbornWorktree(contributorRoot, root, `gentle-ai-candidate-${randomUUID()}`, candidateGitEnvironment(), executor);
+			else git(contributorRoot, ["worktree", "add", "--detach", "--no-checkout", root, candidateCommit.commit], candidateGitEnvironment(), executor);
+			git(root, ["read-tree", candidateTree], candidateGitEnvironment(), executor);
 			const tree = parseTree(root, candidateTree, executor);
 			checkoutMaterializedEntries(root, tree.entries, executor);
 			const entries = tree.entries.map((entry) => ({ ...entry, contentHash: entryContentHash(root, entry) }));
@@ -854,7 +878,7 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 			makeReadonly(root, entries);
 			return { token: basename(root), root: realpathSync(root), parent, contributorRoot, commonDir: canonicalCommonDir, baseCommit, baseTree: base.tree, candidateTree, committedOnly, intendedUntracked, entries, gitlinks: tree.gitlinks, scope, gitExecutor: executor };
 		} catch (error) {
-			try { git(contributorRoot, ["worktree", "remove", "--force", root], process.env, executor); } catch { rmSync(root, { recursive: true, force: true }); }
+			try { git(contributorRoot, ["worktree", "remove", "--force", root], candidateGitEnvironment(), executor); } catch { rmSync(root, { recursive: true, force: true }); }
 			throw error;
 		}
 	} finally {
@@ -868,8 +892,8 @@ function assertRecordSafe(record: CandidateViewRecord): void {
 		if (!contributor.isDirectory() || contributor.isSymbolicLink() || realpathSync(record.contributorRoot) !== record.contributorRoot) {
 			throw new CandidateViewError("candidate contributor root identity changed", "contributor-root-drift");
 		}
-		const toplevel = realpathSync(git(record.contributorRoot, ["rev-parse", "--show-toplevel"], process.env, record.gitExecutor));
-		const commonDir = realpathSync(resolve(record.contributorRoot, git(record.contributorRoot, ["rev-parse", "--git-common-dir"], process.env, record.gitExecutor)));
+		const toplevel = realpathSync(git(record.contributorRoot, ["rev-parse", "--show-toplevel"], candidateGitEnvironment(), record.gitExecutor));
+		const commonDir = realpathSync(resolve(record.contributorRoot, git(record.contributorRoot, ["rev-parse", "--git-common-dir"], candidateGitEnvironment(), record.gitExecutor)));
 		if (toplevel !== record.contributorRoot || commonDir !== record.commonDir) {
 			throw new CandidateViewError("candidate contributor root Git identity changed", "contributor-root-drift");
 		}
@@ -888,7 +912,7 @@ function assertRecordSafe(record: CandidateViewRecord): void {
 	const gitFile = lstatSync(join(root, ".git"));
 	if (!gitFile.isFile() || gitFile.isSymbolicLink() || (gitFile.mode & 0o222) !== 0) throw new CandidateViewError("candidate worktree metadata is unsafe or writable");
 	if (gitPathTokens(root, ["ls-files", "--others", "--exclude-standard", "-z"], record.gitExecutor).length !== 0) throw new CandidateViewError("candidate view contains injected untracked entries");
-	const tree = git(root, ["write-tree"], process.env, record.gitExecutor);
+	const tree = git(root, ["write-tree"], candidateGitEnvironment(), record.gitExecutor);
 	if (tree !== record.candidateTree) throw new CandidateViewError("candidate view index no longer matches its frozen tree");
 	for (const gitlink of record.gitlinks) {
 		if (!isSafeCandidatePath(gitlink.path) || gitlink.mode !== "160000" || !isCanonicalObjectId(gitlink.objectId)) throw new CandidateViewError("candidate view gitlink metadata is unsafe");
@@ -1204,7 +1228,7 @@ export class CandidateViewRegistry {
 	restoreProjection(lineageId: string, contributorRoot: string, baseCommit: string, baseTree: string, candidateTree: string, paths: readonly string[]): void {
 		const root = this.canonicalRoot(contributorRoot);
 		const key = this.lineageKey(root, lineageId);
-		const base = resolveCandidateBase(root, baseCommit, process.env, this.gitExecutor);
+		const base = resolveCandidateBase(root, baseCommit, candidateGitEnvironment(), this.gitExecutor);
 		if (!lineageId || this.projections.has(key) || base.commit !== baseCommit || base.tree !== baseTree || !isFullCommitId(candidateTree) || paths.some((path) => !isSafeCandidatePath(path)) || new Set(paths).size !== paths.length) throw new CandidateViewError("frozen correction projection is invalid or already restored");
 		this.projections.set(key, { contributorRoot: root, baseCommit, baseTree, candidateTree, committedOnly: false, paths: [...paths], modes: {}, gitlinks: {}, deletedPaths: [] });
 	}
@@ -1215,7 +1239,7 @@ export class CandidateViewRegistry {
 		if (!lineageId || this.projections.has(key) || !isFullCommitId(descriptor.baseTree) || !isFullCommitId(descriptor.currentCandidateTree)) throw new CandidateViewError("native frozen projection is invalid or already restored");
 		if (descriptor.paths.some((path) => !isSafeCandidatePath(path)) || new Set(descriptor.paths).size !== descriptor.paths.length) throw new CandidateViewError("native frozen projection paths are invalid");
 		if (descriptor.intendedUntracked.some((path) => !descriptor.paths.includes(path)) || new Set(descriptor.intendedUntracked).size !== descriptor.intendedUntracked.length) throw new CandidateViewError("native intended-untracked projection is invalid");
-		const head = resolveCandidateBase(root, "HEAD", process.env, this.gitExecutor);
+		const head = resolveCandidateBase(root, "HEAD", candidateGitEnvironment(), this.gitExecutor);
 		const base = head.tree === descriptor.baseTree ? head : resolveCandidateBaseTree(root, descriptor.baseTree, this.gitExecutor);
 		const committedOnly = head.tree === descriptor.currentCandidateTree && base.tree !== head.tree;
 		if (!committedOnly && head.tree !== descriptor.baseTree) throw new CandidateViewError("native projection base no longer matches HEAD");
@@ -1223,7 +1247,7 @@ export class CandidateViewRegistry {
 		// index over HEAD. Re-derive the latter from Git instead of trusting the
 		// label; this also rejects dirty-inclusive snapshots mislabeled as staged.
 		const stagedIndex = !committedOnly && descriptor.baseTree === head.tree &&
-			git(root, ["write-tree"], process.env, this.gitExecutor) === descriptor.currentCandidateTree;
+			git(root, ["write-tree"], candidateGitEnvironment(), this.gitExecutor) === descriptor.currentCandidateTree;
 		if (
 			(descriptor.projection === "staged" && !committedOnly && !stagedIndex) ||
 			(descriptor.projection === "workspace" && committedOnly)
@@ -1477,7 +1501,7 @@ export class CandidateViewRegistry {
 	private remove(record: CandidateViewRecord): void {
 		if (!isWithin(record.parent, record.root)) throw new CandidateViewError("candidate view cleanup escaped its owned parent");
 		try { makeWritableForCleanup(record.root); } catch {}
-		try { git(record.contributorRoot, ["worktree", "remove", "--force", record.root], process.env, record.gitExecutor); } catch {}
+		try { git(record.contributorRoot, ["worktree", "remove", "--force", record.root], candidateGitEnvironment(), record.gitExecutor); } catch {}
 		// Git removes worktree metadata; physical removal remains this owner's duty.
 		rmSync(record.root, { recursive: true, force: true });
 	}

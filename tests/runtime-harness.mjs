@@ -11,6 +11,7 @@ import { matchesKey } from "@earendil-works/pi-tui";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { domainHashV1 } from "../lib/review-canonical.ts";
+import { sandboxGitEnv } from "./support/env.ts";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const EXTENSIONS = [
@@ -196,7 +197,7 @@ function sha256(content) {
 }
 
 function gitSync(cwd, ...arguments_) {
-	return execFileSync("git", arguments_, { cwd, encoding: "utf8" }).trim();
+	return execFileSync("git", arguments_, { cwd, encoding: "utf8", env: sandboxGitEnv() }).trim();
 }
 
 async function tempWorkspace() {
@@ -494,7 +495,7 @@ async function run() {
 		assert.match(continueCtx.ui.notifications.at(-1).message, /Native SDD Dispatcher/);
 		assert.match(continueCtx.ui.notifications.at(-1).message, /nextPhase: sdd-apply/);
 		const { execFileSync } = await import("node:child_process");
-		execFileSync("git", ["init"], { cwd: promptCwd, stdio: "ignore" });
+		execFileSync("git", ["init"], { env: sandboxGitEnv(), cwd: promptCwd, stdio: "ignore" });
 		const recoveryRequiredDirectory = join(promptCwd, ".git", "gentle-ai", "reviews", "control", "recovery-required-v1");
 		await mkdir(recoveryRequiredDirectory, { recursive: true });
 		await writeFile(
@@ -514,7 +515,7 @@ async function run() {
 		const toolHook = hooks.get("tool_call")[0];
 		const ghPrCwd = await tempWorkspace();
 		try {
-			execFileSync("git", ["init"], { cwd: ghPrCwd, stdio: "ignore" });
+			execFileSync("git", ["init"], { env: sandboxGitEnv(), cwd: ghPrCwd, stdio: "ignore" });
 			const deliveryResult = await toolHook(
 				{ toolName: "bash", input: { command: "gh pr create --draft" } },
 				createCtx(ghPrCwd, true, "ordinary-delivery-session"),
@@ -713,7 +714,7 @@ async function run() {
 		);
 		const commitCwd = await tempWorkspace();
 		try {
-			execFileSync("git", ["init"], { cwd: commitCwd, stdio: "ignore" });
+			execFileSync("git", ["init"], { env: sandboxGitEnv(), cwd: commitCwd, stdio: "ignore" });
 			const deliveryResult = await toolHook(
 				{ toolName: "bash", input: { command: "git commit -m bounded tracked.txt" } },
 				createCtx(commitCwd),

@@ -11,6 +11,12 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { sandboxGitEnv, scrubInheritedGitEnvironment } from "./support/env.ts";
+
+function normalizePathForCompare(path: string): string {
+	return path.replace(/\\/g, "/");
+}
+scrubInheritedGitEnvironment();
 import {
 	SNAPSHOT_CLEANUP_ACTION,
 	SNAPSHOT_CLEANUP_TRIGGER,
@@ -43,7 +49,7 @@ function judgmentDayBudget(): ReviewBudgetV1 {
 }
 
 function snapshotGit(snapshot: SnapshotV1, ...args: string[]): string {
-	return execFileSync("git", args, {
+	return execFileSync("git", args, { env: sandboxGitEnv(), 
 		cwd: snapshot.repository_root,
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "pipe"],
@@ -65,7 +71,7 @@ function createRepository(t: test.TestContext): {
 	mkdirSync(repository);
 	t.after(() => rmSync(parent, { recursive: true, force: true }));
 	const git = (...args: string[]): string =>
-		execFileSync("git", args, {
+		execFileSync("git", args, { env: sandboxGitEnv(), 
 			cwd: repository,
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "pipe"],
@@ -106,7 +112,7 @@ test("complete snapshot captures the repository root from a nested cwd without m
 		policyHash: "a".repeat(64),
 	});
 
-	assert.equal(snapshot.repository_root, repository);
+	assert.equal(snapshot.repository_root, normalizePathForCompare(repository));
 	assert.equal(snapshot.base_tree, git("rev-parse", "HEAD^{tree}"));
 	assert.equal(snapshot.initial_review_tree, snapshot.complete_snapshot_tree);
 	assert.deepEqual(snapshot.review_projection, { kind: "complete" });

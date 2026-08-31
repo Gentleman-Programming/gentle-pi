@@ -118,6 +118,10 @@ interface RelayHarness {
 }
 
 function harness(t: test.TestContext, overrides: Record<string, string> = {}): RelayHarness {
+	// The fake gentle-ai/pi CLIs are shebang node scripts; Windows cannot
+	// spawn script files without a native executable, so these subprocess
+	// transport tests run on POSIX only.
+	if (process.platform === "win32") return t.skip("windows: script-file subprocess fixtures need a native executable") as unknown as RelayHarness;
 	const directory = mkdtempSync(join(tmpdir(), "gentle-pi-relay-harness-"));
 	t.after(() => rmSync(directory, { recursive: true, force: true }));
 	const gentleAi = join(directory, "gentle-ai");
@@ -216,9 +220,7 @@ async function rejectsWithRelayError(promise: Promise<unknown>, kind: string, st
 
 test("the central native CLI runner declares the relay contract on every gentle-ai spawn", async (t) => {
 	const fixture = harness(t);
-	const probe = join(fixture.directory, "env-probe");
-	writeFileSync(probe, `#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({ contract: process.env.${GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV} ?? null }));\n`);
-	chmodSync(probe, 0o755);
+	const probe = writeExecutableScript(fixture.directory, "env-probe", `#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({ contract: process.env.${GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV} ?? null }));\n`).path;
 	const hadContract = Object.prototype.hasOwnProperty.call(process.env, GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV);
 	const previous = process.env[GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV];
 	delete process.env[GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV];

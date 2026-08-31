@@ -4,6 +4,8 @@ import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { sandboxGitEnv, scrubInheritedGitEnvironment } from "./support/env.ts";
+scrubInheritedGitEnvironment();
 import {
 	EXTERNAL_RELEASE_EVIDENCE,
 	GATE_RESULT,
@@ -68,7 +70,7 @@ function createGateRepository(t: test.TestContext): GateRepository {
 	mkdirSync(repository);
 	t.after(() => rmSync(parent, { recursive: true, force: true }));
 	const git = (...args: string[]): string =>
-		execFileSync("git", args, { cwd: repository, encoding: "utf8" }).trim();
+		execFileSync("git", args, { env: sandboxGitEnv(), cwd: repository, encoding: "utf8" }).trim();
 	git("init", "-b", "main");
 	writeFileSync(join(repository, "app.ts"), "export const value = 1;\n");
 	git("add", ".");
@@ -89,11 +91,11 @@ function createGateRepository(t: test.TestContext): GateRepository {
 	git("-c", "user.name=Gate Test", "-c", "user.email=gate@example.invalid", "commit", "-m", "changed");
 	const changedTree = git("rev-parse", "HEAD^{tree}");
 	const remote = join(parent, "remote.git");
-	execFileSync("git", ["clone", "--bare", repository, remote], {
+	execFileSync("git", ["clone", "--bare", repository, remote], { env: sandboxGitEnv(), 
 		cwd: parent,
 		stdio: ["ignore", "pipe", "pipe"],
 	});
-	execFileSync("git", ["--git-dir", remote, "update-ref", "refs/heads/main", baseCommit], {
+	execFileSync("git", ["--git-dir", remote, "update-ref", "refs/heads/main", baseCommit], { env: sandboxGitEnv(), 
 		cwd: parent,
 	});
 	git("remote", "add", "origin", remote);
@@ -176,7 +178,7 @@ function temporaryAuthority(t: test.TestContext): GateRepository & {
 
 test("unbranded receipts are rejected before lifecycle gate evaluation", (t) => {
 	const { repository, finalTree, store, receipt } = temporaryAuthority(t);
-	execFileSync("git", ["read-tree", finalTree], { cwd: repository });
+	execFileSync("git", ["read-tree", finalTree], { env: sandboxGitEnv(), cwd: repository });
 	assert.throws(() => validateReviewGate({
 		store,
 		receipt,
@@ -202,7 +204,7 @@ test("authoritative receipts cannot be validated through another repository stor
 
 test("exact intended commit target allows with zero actors and journal replay is stable", (t) => {
 	const { repository, finalTree, store, receipt, authoritativeReceipt } = temporaryAuthority(t);
-	execFileSync("git", ["read-tree", finalTree], { cwd: repository });
+	execFileSync("git", ["read-tree", finalTree], { env: sandboxGitEnv(), cwd: repository });
 	const target = {
 		kind: GATE_TARGET_KIND.INTENDED_COMMIT,
 		intended_commit_tree: finalTree,
@@ -232,7 +234,7 @@ test("exact intended commit target allows with zero actors and journal replay is
 
 test("exact gate retries replay before stale receipt binding while new requests still deny", (t) => {
 	const { repository, finalTree, store, authoritativeReceipt } = temporaryAuthority(t);
-	execFileSync("git", ["read-tree", finalTree], { cwd: repository });
+	execFileSync("git", ["read-tree", finalTree], { env: sandboxGitEnv(), cwd: repository });
 	const target = { kind: GATE_TARGET_KIND.INTENDED_COMMIT, intended_commit_tree: finalTree } as const;
 	const first = validateReviewGate({ store, receipt: authoritativeReceipt, target, repositoryCwd: repository, idempotencyKey: "stale-retry", scopeBudget: budget() });
 	const replay = validateReviewGate({ store, receipt: authoritativeReceipt, target, repositoryCwd: repository, idempotencyKey: "stale-retry", scopeBudget: budget() });
@@ -243,7 +245,7 @@ test("exact gate retries replay before stale receipt binding while new requests 
 test("intended commit target denies when the actual staged tree drifted after approval", (t) => {
 	const { repository, finalTree, changedTree, receipt } = temporaryAuthority(t);
 	assert.equal(
-		execFileSync("git", ["write-tree"], { cwd: repository, encoding: "utf8" }).trim(),
+		execFileSync("git", ["write-tree"], { env: sandboxGitEnv(), cwd: repository, encoding: "utf8" }).trim(),
 		changedTree,
 	);
 
@@ -377,8 +379,8 @@ test("push gate allows normal same-name updates while preserving exact-old and c
 		GATE_RESULT.DENY,
 	);
 	const changedDestination = join(authority.repository, "changed-destination.git");
-	execFileSync("git", ["init", "--bare", changedDestination], { stdio: ["ignore", "pipe", "pipe"] });
-	execFileSync("git", ["remote", "set-url", "--add", "--push", remote, changedDestination], { cwd: repository });
+	execFileSync("git", ["init", "--bare", changedDestination], { env: sandboxGitEnv(), stdio: ["ignore", "pipe", "pipe"] });
+	execFileSync("git", ["remote", "set-url", "--add", "--push", remote, changedDestination], { env: sandboxGitEnv(), cwd: repository });
 	assert.equal(
 		evaluateGateTarget(receipt, target, repository).status,
 		GATE_RESULT.DENY,
@@ -407,6 +409,10 @@ test("push gate treats only successful empty output as absent and fails closed o
 		}],
 	} as const;
 	assert.equal(evaluateGateTarget(receipt, target, repository).status, GATE_RESULT.ALLOW);
+	// The probe-failure matrix shadows git with a POSIX `#!/bin/sh` script on
+	// PATH; Windows cannot resolve scripts as executables (and has no `which`),
+	// so this part of the probe-failure matrix is POSIX-only.
+	if (process.platform === "win32") return t.skip("windows: fake-git PATH interception needs POSIX script execution");
 	const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
 	const originalPath = process.env.PATH;
 	for (const [name, body] of [
@@ -435,7 +441,7 @@ test("push CREATE rejects unreviewed ancestor history", (t) => {
 	const authority = temporaryAuthority(t);
 	const { repository, remote, baseTree, finalTree, baseCommit, receipt } = authority;
 	const git = (...args: string[]): string =>
-		execFileSync("git", args, { cwd: repository, encoding: "utf8" }).trim();
+		execFileSync("git", args, { env: sandboxGitEnv(), cwd: repository, encoding: "utf8" }).trim();
 	git("checkout", "--force", "--detach", baseCommit);
 	writeFileSync(join(repository, "ancestor.ts"), "export const unreviewed = true;\n");
 	git("add", ".");
@@ -445,7 +451,7 @@ test("push CREATE rejects unreviewed ancestor history", (t) => {
 	git("-c", "user.name=Gate Test", "-c", "user.email=gate@example.invalid", "commit", "-m", "reviewed tree");
 	const newCommit = git("rev-parse", "HEAD");
 	git("branch", "unsafe-first-push", newCommit);
-	execFileSync("git", ["--git-dir", authority.remotePath, "fetch", repository, `${unreviewedParent}:refs/heads/unreviewed`], {
+	execFileSync("git", ["--git-dir", authority.remotePath, "fetch", repository, `${unreviewedParent}:refs/heads/unreviewed`], { env: sandboxGitEnv(), 
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 	const destination = resolveConfiguredPushDestinationV1(repository, remote);
@@ -605,7 +611,7 @@ function fastPathEvidence(
 }
 
 function setRemoteMain(repository: GateRepository, commit: string): void {
-	execFileSync("git", ["--git-dir", repository.remotePath, "update-ref", "refs/heads/main", commit]);
+	execFileSync("git", ["--git-dir", repository.remotePath, "update-ref", "refs/heads/main", commit], { env: sandboxGitEnv() });
 }
 
 // A stub `gh` command runner that only reports success when the exact SHA
@@ -671,7 +677,7 @@ test("release fast path proves the immutable origin/main SHA and ignores local b
 	const repository = createGateRepository(t);
 	setRemoteMain(repository, repository.finalCommit);
 	// Local publication inputs must be irrelevant: detached HEAD at an older commit plus a dirty worktree.
-	execFileSync("git", ["checkout", "--force", "--detach", repository.baseCommit], {
+	execFileSync("git", ["checkout", "--force", "--detach", repository.baseCommit], { env: sandboxGitEnv(), 
 		cwd: repository.repository,
 		stdio: ["ignore", "pipe", "pipe"],
 	});
@@ -739,7 +745,7 @@ test("major, post-incident, and unprovable-version releases always require expli
 	const repository = createGateRepository(t);
 	setRemoteMain(repository, repository.finalCommit);
 	const git = (...args: string[]): string =>
-		execFileSync("git", args, { cwd: repository.repository, encoding: "utf8" }).trim();
+		execFileSync("git", args, { env: sandboxGitEnv(), cwd: repository.repository, encoding: "utf8" }).trim();
 
 	const postIncident = evaluateReleaseFastPathV1({
 		target: releaseTarget(repository),
@@ -774,7 +780,7 @@ test("release fast path treats vX.0.0 and pre-1.0 v0.Y.0 minor bumps as major-eq
 	const repository = createGateRepository(t);
 	setRemoteMain(repository, repository.finalCommit);
 	const git = (...args: string[]): string =>
-		execFileSync("git", args, { cwd: repository.repository, encoding: "utf8" }).trim();
+		execFileSync("git", args, { env: sandboxGitEnv(), cwd: repository.repository, encoding: "utf8" }).trim();
 	const tagRelease = (name: string): GateTargetV1 => {
 		git("-c", "user.name=Gate Test", "-c", "user.email=gate@example.invalid", "tag", "-a", name, "-m", name, repository.finalCommit);
 		const tagObject = git("rev-parse", `refs/tags/${name}^{object}`);
@@ -820,7 +826,7 @@ test("release fast path applies only to protected main with a provable remote he
 	assert.equal(wrongRef.eligible, false);
 	assert.match(wrongRef.reason, /protected refs\/heads\/main/i);
 
-	execFileSync("git", ["--git-dir", repository.remotePath, "update-ref", "-d", "refs/heads/main"]);
+	execFileSync("git", ["--git-dir", repository.remotePath, "update-ref", "-d", "refs/heads/main"], { env: sandboxGitEnv() });
 	const missingRemoteHead = evaluateReleaseFastPathV1({
 		target: releaseTarget(repository),
 		evidence: fastPathEvidence(repository),
@@ -945,7 +951,7 @@ test("release fast path remote head recheck detects an advanced or unresolvable 
 	});
 	assert.equal(advanced.advanced, true);
 
-	execFileSync("git", ["--git-dir", repository.remotePath, "update-ref", "-d", "refs/heads/main"]);
+	execFileSync("git", ["--git-dir", repository.remotePath, "update-ref", "-d", "refs/heads/main"], { env: sandboxGitEnv() });
 	const missing = recheckReleaseFastPathRemoteHeadV1({
 		repositoryCwd: repository.repository,
 		remote: repository.remote,
