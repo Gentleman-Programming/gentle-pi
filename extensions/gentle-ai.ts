@@ -3605,6 +3605,34 @@ function reviewConsentDigest(consent: ReviewConsentEnvelope): string {
 	return createHash("sha256").update(JSON.stringify(consent)).digest("hex");
 }
 
+// gentle-pi#516: a binding this session does not hold (already answered,
+// expired, or issued by another Pi session or process) used to fall through
+// to the plain negotiated STATUS, which reads exactly like a healthy pre-start
+// "ready" and sent the model back into START for a second consent prompt. The
+// fact is local and proven before any provider call, so the outcome names the
+// binding and the exit; the current STATUS rides along as context only.
+function staleConsentBindingDiagnostics(binding: string, expired: boolean): { code: "consent-binding-expired" | "consent-binding-unknown"; message: string } {
+	const exit = "Run START again for this candidate to obtain a fresh consent envelope and answer that envelope's binding once; do not resend this binding.";
+	return expired
+		? { code: "consent-binding-expired", message: `consent binding ${binding} expired after ${PENDING_REVIEW_CONSENT_TTL_MS / 60_000} minutes without an answer. ${exit}` }
+		: { code: "consent-binding-unknown", message: `consent binding ${binding} is not held by this Pi session: it was already answered, expired, or was issued by another Pi session or process. ${exit}` };
+}
+
+function staleConsentBindingOutcome(operation: ReviewControllerOperation, binding: string, diagnostics: ReturnType<typeof staleConsentBindingDiagnostics>, status: ReviewStatusV3): Record<string, unknown> {
+	const mapped = mapNativeTargetStatus(operation, status);
+	return {
+		...mapped,
+		status: "blocked",
+		outcome: "consent-binding-stale",
+		consent_binding: binding,
+		diagnostics,
+		native_invocation_attempted: false,
+		...nativeStartPreAuthorityRejection(),
+		provider_action: status.action,
+		...(status.action === "start" ? { next_action: "restart-for-fresh-consent" } : mapped.next_action === undefined ? { next_action: status.action } : {}),
+	};
+}
+
 function assertNativeStartCandidateBinding(candidateView: CandidateView, target: ReviewStatusV3): void {
 	candidateView.verify();
 	if (
@@ -3946,6 +3974,14 @@ function setReviewHostRelayRunnerForTesting(runner?: ReviewHostRelayRunner): voi
 const REVIEW_HOST_RELAY_RETRY_ACTION =
 	"Call fresh STATUS and submit only an exact reoffered one-slot binding; never replay this capture from transcript inference.";
 
+// gentle-pi#522 / #524: gentle-ai refused the submission at admission and
+// stated that the lens slot was not consumed. The refused bytes are the
+// problem, so the continuation is a fresh reviewer run on the reoffered slot,
+// not a replay and not an unknown-outcome reconciliation.
+const REVIEW_HOST_RELAY_REFUSED_ACTION =
+	"gentle-ai refused this submission at admission and did not consume the lens slot; the reason is in failure.stderr. "
+	+ "Call fresh STATUS and run only the exact slot it reoffers so the reviewer produces a new result that satisfies that refusal; never resubmit the refused bytes.";
+
 function reviewHostRelayTimeoutNextAction(error: ReviewHostRelayError): string {
 	const measured = error.elapsedMs === null || error.timeoutMs === null
 		? ""
@@ -3963,6 +3999,10 @@ function reviewHostRelayFailureReport(error: ReviewHostRelayError): Record<strin
 		timed_out: error.timedOut,
 		...(error.elapsedMs === null ? {} : { elapsed_ms: error.elapsedMs }),
 		...(error.timeoutMs === null ? {} : { timeout_ms: error.timeoutMs }),
+		// The captured native stderr is the only place the provider's exact
+		// refusal reason lives (gentle-pi#524); dropping it hid every admission
+		// refusal behind "submission-refused".
+		...(error.stderr.length === 0 ? {} : { stderr: error.stderr }),
 	};
 }
 
@@ -4098,7 +4138,13 @@ async function executeReviewHostRelayCapture(
 		};
 	} catch (error) {
 		if (!(error instanceof ReviewHostRelayError)) return await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding, selections, route);
-		if (error.mutationOutcome === "unknown") return await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding, selections, route);
+		if (error.mutationOutcome === "unknown") {
+			return {
+				...(await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding, selections, route)),
+				failure: reviewHostRelayFailureReport(error),
+				reason: error.message,
+			};
+		}
 		if (error.kind === REVIEW_HOST_RELAY_FAILURE.RELAY_UNAVAILABLE) {
 			return {
 				tool: "gentle_review_capture",
@@ -4130,7 +4176,9 @@ async function executeReviewHostRelayCapture(
 			mutation_outcome: "none",
 			next_action: error.kind === REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT
 				? reviewHostRelayTimeoutNextAction(error)
-				: REVIEW_HOST_RELAY_RETRY_ACTION,
+				: error.kind === REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED
+					? REVIEW_HOST_RELAY_REFUSED_ACTION
+					: REVIEW_HOST_RELAY_RETRY_ACTION,
 		};
 	}
 }
@@ -4819,6 +4867,7 @@ async function executeReviewControllerOperation(
 		if (input.answer !== "granted" && input.answer !== "declined") throw new Error("Review controller answer-consent answer must be granted or declined");
 		const pending = pendingReviewConsentRegistry.get(pendingReviewConsentSession)?.get(input.consentBinding);
 		if (pending === undefined || pending.expiresAt <= reviewConsentNow()) {
+			const stale = staleConsentBindingDiagnostics(input.consentBinding, pending !== undefined);
 			if (pending !== undefined) cleanupPendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession);
 			if (nativeReviewCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
 			try {
@@ -4827,7 +4876,7 @@ async function executeReviewControllerOperation(
 					...(signal === undefined ? {} : { signal }),
 				}, retainedUntrackedSelections, defaultCwd);
 				if (negotiated.transport !== undefined) return hostTransportUnavailable(parameters.operation, negotiated.transport);
-				return mapNativeTargetStatus(parameters.operation, negotiated.status!);
+				return staleConsentBindingOutcome(parameters.operation, input.consentBinding, stale, negotiated.status!);
 			} catch (error) {
 				return nativeStatusFailed(parameters.operation, error);
 			}

@@ -640,17 +640,54 @@ test("candidate view derives deletion, rename, executable, and symlink scope fro
 	const registry = new CandidateViewRegistry();
 	const view = registry.create({ contributorRoot });
 	try {
-		assert.deepEqual(view.paths, ["deleted.txt", "linked.sh", "renamed.txt", "script.sh"]);
-		assert.deepEqual(view.deletedPaths, ["deleted.txt"]);
+		// The rename source (tracked.txt) is frozen as a deletion next to its
+		// destination: native STATUS projects the rename as both paths
+		// (gentle-pi#518), and the reviewer scope carries the same identity.
+		assert.deepEqual(view.paths, ["deleted.txt", "linked.sh", "renamed.txt", "script.sh", "tracked.txt"]);
+		assert.deepEqual(view.deletedPaths, ["deleted.txt", "tracked.txt"]);
 		assert.deepEqual(view.modes, { "linked.sh": "120000", "renamed.txt": "100644", "script.sh": "100755" });
 		registry.bind({ token: view.token, lineageId: "scope-kinds", selectedLenses: ["review-risk"] });
 		const dispatch = { agent: "review-risk", task: "review", mode: "task" };
 		injectReviewCandidateView(dispatch, registry);
-		assert.match(dispatch.task, /Frozen changed scope by mode: .*"deleted":\["deleted\.txt"\]/);
+		assert.match(dispatch.task, /Frozen changed scope by mode: .*"deleted":\["deleted\.txt","tracked\.txt"\]/);
 		assert.doesNotMatch(dispatch.task, /Frozen paths:|Frozen modes:/);
 		view.verify();
 	} finally {
 		registry.cleanup(view.token);
+	}
+});
+
+// gentle-pi#518: native STATUS projects every path whose state changed between
+// the frozen trees (Go diffs with --no-renames), so a staged exact rename is
+// its source deletion plus its destination addition. The candidate view must
+// project the same identity or ordinary START is rejected before native
+// admission with candidate-target-projection-drift.
+test("candidate view projects a staged exact rename as its source and destination, matching the native no-renames projection", (t) => {
+	const contributorRoot = repository(t);
+	mkdirSync(join(contributorRoot, "active"));
+	writeFileSync(join(contributorRoot, "active", "document.md"), "line one\nline two\n");
+	git(contributorRoot, "add", "active/document.md");
+	git(contributorRoot, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "rename base");
+	mkdirSync(join(contributorRoot, "archive"));
+	git(contributorRoot, "mv", "active/document.md", "archive/document.md");
+	writeFileSync(join(contributorRoot, "report.md"), "report\n");
+	git(contributorRoot, "add", "-A");
+	const view = createCandidateView({ contributorRoot });
+	try {
+		const nativeProjection = git(contributorRoot, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--no-renames", view.baseTree, view.candidateTree)
+			.split("\0").filter((path) => path.length > 0).sort();
+		assert.deepEqual(nativeProjection, ["active/document.md", "archive/document.md", "report.md"]);
+		assert.deepEqual(view.paths, nativeProjection);
+		assert.deepEqual(view.deletedPaths, ["active/document.md"]);
+		assert.deepEqual(view.modes, { "archive/document.md": "100644", "report.md": "100644" });
+		const manifest = deriveChangedPathManifest(contributorRoot, view.baseTree, view.candidateTree);
+		assert.deepEqual(manifest.map((entry) => [entry.path, entry.status, entry.deleted]), [
+			["active/document.md", "D", true],
+			["archive/document.md", "A", false],
+			["report.md", "A", false],
+		]);
+	} finally {
+		view.cleanup();
 	}
 });
 

@@ -9,7 +9,7 @@ import { __testing, createGentleAiExtension } from "../../extensions/gentle-ai.t
 import { resolveGentleAiBinary } from "../../lib/gentle-ai-binary.ts";
 import { OPAQUE_PI_REVIEWER_ARGV } from "../../lib/opaque-pi-reviewer-adapter.ts";
 import { NativeReviewCliV216, type ExecFileAdapter, type NativeReviewCli } from "../../lib/native-review-cli.ts";
-import { reviewHostRelaySlots, runReviewHostRelaySlot } from "../../lib/review-host-relay.ts";
+import { REVIEW_HOST_RELAY_FAILURE, ReviewHostRelayError, reviewHostRelaySlots, runReviewHostRelaySlot } from "../../lib/review-host-relay.ts";
 import { GENTLE_PI_REVIEW_RELAY_CONTRACT, GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV } from "../../lib/review-relay-contract.ts";
 import { decodeReviewStatusV3 } from "../../lib/review-integration-v2.ts";
 import { requireDevBinary } from "../support/native-binary-gate.ts";
@@ -430,6 +430,87 @@ test("dev-binary: POSIX Pi host relay captures one real B-target slot from an A-
 	const sessionStatus = candidateStatus(RELAY_DEV_BINARY!, sessionA, sessionA, environment);
 	assert.equal(sessionStatus.authority, undefined, "A must remain without B's review authority");
 	assert.notEqual(sessionStatus.targetIdentity, advanced.targetIdentity, "A must remain unrelated to B's candidate binding");
+});
+
+// gentle-pi#522 / #524: a reviewer whose bytes gentle-ai refuses at admission
+// is a proven non-mutation. The real binary states that the lens slot was not
+// consumed; the host must relay that refusal and its continuation instead of
+// an unknown outcome the contract forbids replaying.
+test("dev-binary: a garbage reviewer result is refused at admission as a proven non-mutation and the same slot is reoffered", { skip: !RUNNABLE }, async (t) => {
+	const cwd = repository(t, "gentle-pi-relay-refused-");
+	const workflowDirectory = join(cwd, ".github", "workflows");
+	mkdirSync(workflowDirectory, { recursive: true });
+	const workflow = join(workflowDirectory, "relay.yml");
+	writeFileSync(workflow, "name: relay\non: push\n");
+	git(cwd, "add", ".github/workflows/relay.yml");
+	git(cwd, "commit", "-qm", "workflow baseline");
+	writeFileSync(workflow, "name: relay\non: push\njobs:\n  relay:\n    runs-on: ubuntu-latest\n");
+	const canonical = realpathSync(cwd);
+	// The isolated home and the fake reviewer live outside the candidate so
+	// the repository stays free of untracked paths and START needs no
+	// intended-untracked selection.
+	const scratch = mkdtempSync(join(tmpdir(), "gentle-pi-relay-refused-scratch-"));
+	t.after(() => rmSync(scratch, { recursive: true, force: true }));
+	const isolatedHome = join(scratch, "home");
+	mkdirSync(isolatedHome);
+	const environment = reviewEnvironment(isolatedHome);
+	assert.ok(RELAY_DEV_BINARY, "GENTLE_PI_GENTLE_AI_DEV_BINARY is required for this devtest");
+	enableGlobalReview(RELAY_DEV_BINARY!, cwd, canonical, environment);
+
+	const nativeCalls: NativeProcessCall[] = [];
+	const native = devNativeCli(RELAY_DEV_BINARY!, environment, nativeCalls);
+	const { controller, capture } = reviewToolsForNative(native);
+	const prompted = record((await controller.execute("refused-start", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, sessionContext(cwd))).details, "refused start consent");
+	assert.equal(prompted.outcome, "native-review-consent-required");
+	const consentBinding = stringValue(prompted.consent_binding, "refused consent binding");
+	const started = record((await controller.execute("refused-answer-consent", { operation: "answer-consent", input: JSON.stringify({ consentBinding, answer: "granted" }) }, undefined, undefined, sessionContext(cwd))).details, "refused granted start");
+	const lineage = stringValue(record(started.result, "refused start result").lineage_id, "refused lineage");
+
+	const status = record((await controller.execute("refused-status", { operation: "status", lineageId: lineage }, undefined, undefined, sessionContext(cwd))).details, "refused STATUS");
+	const reviewerBinding = collectBindingsFor(status, "review.capture-result")[0];
+	assert.ok(reviewerBinding, "current STATUS must publish a reviewer capture binding");
+	const subjectHash = collectBindingArgument(reviewerBinding!, "subject-hash");
+	const fakePi = join(scratch, "fake-pi");
+	writeFileSync(fakePi, "#!/usr/bin/env node\nprocess.stdin.resume();\nprocess.stdin.on('end', () => { process.stdout.write('not json at all'); });\n");
+	chmodSync(fakePi, 0o755);
+	let relayError: unknown;
+	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
+	__testing.setReviewHostRelayRunnerForTesting(async (request) => {
+		try {
+			return await runReviewHostRelaySlot({ ...request, gentleAiExecutable: RELAY_DEV_BINARY!, piExecutable: fakePi, environment, gentleAiTimeoutMs: 30_000, piTimeoutMs: 30_000 });
+		} catch (error) {
+			relayError = error;
+			throw error;
+		}
+	});
+	const forecast = record((await capture.execute("refused-forecast", { lineageId: lineage, collectBinding: reviewerBinding }, undefined, undefined, sessionContext(cwd))).details, "refused forecast");
+	const captured = forecast.outcome === "reviewer-model-run-forecast"
+		? record((await capture.execute("refused-capture", { lineageId: lineage, collectBinding: reviewerBinding, reviewerRunAcknowledged: true }, undefined, undefined, sessionContext(cwd))).details, "refused capture")
+		: forecast;
+
+	assert.ok(relayError instanceof ReviewHostRelayError, `the relay must fail with a typed error: ${String(relayError)}`);
+	assert.equal(relayError.kind, REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED);
+	assert.equal(relayError.stage, "submit");
+	assert.equal(relayError.exitCode, 1);
+	assert.equal(relayError.mutationOutcome, "none", "gentle-ai's typed admission refusal proves the slot was not consumed");
+	assert.match(relayError.stderr, /reviewer payload contains no complete JSON object/);
+	assert.match(relayError.stderr, /\[invalid_request\]/);
+
+	assert.equal(captured.status, "blocked", JSON.stringify(captured));
+	assert.equal(captured.outcome, "pi-host-relay-transport-failure");
+	const failure = record(captured.failure, "refused capture failure");
+	assert.equal(failure.kind, "submission-refused");
+	assert.equal(failure.exit_code, 1);
+	assert.match(stringValue(failure.stderr, "refused capture stderr"), /\[invalid_request\]/);
+	assert.match(stringValue(captured.reason, "refused capture reason"), /no complete JSON object/);
+	assert.equal(captured.mutation_performed, false);
+	assert.equal(captured.mutation_outcome, "none");
+	assert.match(stringValue(captured.next_action, "refused capture next action"), /did not consume the lens slot/);
+
+	const after = await native.targetStatus({ cwd: canonical, agent: "pi", lineageId: lineage });
+	assert.equal(after.authority?.state, "reviewing", "the refused submission must leave the lineage reviewing");
+	const reoffered = reviewHostRelaySlots(after.nextTransition?.collect?.inputs ?? []).some((slot) => slot.subjectHash === subjectHash);
+	assert.equal(reoffered, true, "the unconsumed slot must be reoffered by fresh STATUS");
 });
 
 // This completes the same organic A -> B path through correction evidence,

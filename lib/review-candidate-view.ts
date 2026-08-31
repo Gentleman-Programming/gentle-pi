@@ -423,23 +423,30 @@ export interface ChangedPathEntry {
 	readonly modeOnly: boolean;
 }
 
+//
+// gentle-pi#518: both derivations diff with `--no-renames`, exactly as the
+// native provider does. A rename is then its source deletion plus its
+// destination addition, one path each, so the projection identity Pi freezes
+// is the identity native STATUS projects. Rename detection here previously
+// kept only the destination, and an exact staged rename was rejected before
+// native admission with candidate-target-projection-drift.
 export function deriveChangedPathManifest(cwd: string, baseTree: string, candidateTree: string, executor: CandidateGitExecutor = defaultCandidateGitExecutor): readonly ChangedPathEntry[] {
-	const tokens = gitPathTokens(cwd, ["diff", "--raw", "-z", "--abbrev=40", "--no-ext-diff", "--find-renames=100%", baseTree, candidateTree], executor);
+	const tokens = gitPathTokens(cwd, ["diff", "--raw", "-z", "--abbrev=40", "--no-ext-diff", "--no-renames", baseTree, candidateTree], executor);
 	const entries: ChangedPathEntry[] = [];
 	for (let index = 0; index < tokens.length;) {
 		const header = tokens[index++]?.toString("ascii");
 		if (header === undefined) break;
-		// `:<old_mode> <new_mode> <old_sha> <new_sha> <status>`
-		const match = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{7,64}) ([0-9a-f]{7,64}) ([AMDT]|R[0-9]{3})$/.exec(header);
+		// `:<old_mode> <new_mode> <old_sha> <new_sha> <status>`; with rename
+		// detection off, Git never emits a two-path R or C record here.
+		const match = /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{7,64}) ([0-9a-f]{7,64}) ([AMDT])$/.exec(header);
 		if (match === null) throw new CandidateViewError("candidate manifest Git output contains an unsafe raw header", "manifest-derivation-invalid");
 		const [, oldMode, newMode, oldSha, newSha, status] = match;
-		const firstPath = tokens[index++];
-		if (firstPath === undefined) throw new CandidateViewError("candidate manifest Git output is incomplete", "manifest-derivation-invalid");
-		// A rename emits both the old and the new path; the new one is the scope.
-		const path = status.startsWith("R") ? decodeCanonicalPath(tokens[index++] ?? firstPath) : decodeCanonicalPath(firstPath);
+		const rawPath = tokens[index++];
+		if (rawPath === undefined) throw new CandidateViewError("candidate manifest Git output is incomplete", "manifest-derivation-invalid");
+		const path = decodeCanonicalPath(rawPath);
 		entries.push(Object.freeze({
 			path,
-			status: status.startsWith("R") ? "A" : status,
+			status,
 			oldMode,
 			newMode,
 			deleted: status === "D",
@@ -515,20 +522,16 @@ function deriveChangedScope(cwd: string, baseTree: string, candidateTree: string
 	const present = new Map(entries.map((entry) => [entry.path, entry]));
 	const paths = new Set<string>();
 	const deleted = new Set<string>();
-	const tokens = gitPathTokens(cwd, ["diff", "--name-status", "-z", "--no-ext-diff", "--find-renames=100%", baseTree, candidateTree], executor);
+	// `--no-renames` mirrors the native projection: a rename is one deleted
+	// path plus one added path (gentle-pi#518), and every record carries
+	// exactly one path.
+	const tokens = gitPathTokens(cwd, ["diff", "--name-status", "-z", "--no-ext-diff", "--no-renames", baseTree, candidateTree], executor);
 	for (let index = 0; index < tokens.length;) {
 		const status = tokens[index++]?.toString("ascii");
-		if (status === undefined || !/^(?:[AMDT]|R[0-9]{3})$/.test(status)) throw new CandidateViewError("candidate scope Git output contains an unsafe status");
-		const oldPath = tokens[index++];
-		if (oldPath === undefined) throw new CandidateViewError("candidate scope Git output is incomplete");
-		const firstPath = decodeCanonicalPath(oldPath);
-		const path = status.startsWith("R")
-			? (() => {
-				const newPath = tokens[index++];
-				if (newPath === undefined) throw new CandidateViewError("candidate scope rename output is incomplete");
-				return decodeCanonicalPath(newPath);
-			})()
-			: firstPath;
+		if (status === undefined || !/^[AMDT]$/.test(status)) throw new CandidateViewError("candidate scope Git output contains an unsafe status");
+		const rawPath = tokens[index++];
+		if (rawPath === undefined) throw new CandidateViewError("candidate scope Git output is incomplete");
+		const path = decodeCanonicalPath(rawPath);
 		if (paths.has(path) || deleted.has(path)) throw new CandidateViewError("candidate scope Git output contains duplicate paths");
 		if (status === "D") {
 			if (present.has(path)) throw new CandidateViewError("candidate scope deletion is present in the candidate tree");

@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { __testing } from "../../extensions/gentle-ai.ts";
 import {
 	NATIVE_REVIEW_ERROR_CODE,
 	NativeReviewCliError,
@@ -216,6 +217,39 @@ test("dev-binary: a low-risk START closes the review with no receipt or follow-u
 	assert.equal(started.state, "approved");
 	assert.deepEqual(started.selectedLenses, []);
 	assert.equal(started.lensesRequired, false);
+});
+
+// gentle-pi#518: native STATUS projects a staged exact rename as its source
+// and its destination. The Pi controller freezes the same identity, so
+// ordinary START reaches native admission instead of being rejected locally
+// with candidate-target-projection-drift.
+test("dev-binary: ordinary START through the Pi controller admits a staged exact rename plus an addition", { skip: !RUNNABLE }, async (t) => {
+	const cwd = repository(t);
+	mkdirSync(join(cwd, "active"));
+	writeFileSync(join(cwd, "active", "document.md"), "# Document\n\nline one\nline two\n");
+	git(cwd, "add", "active/document.md");
+	git(cwd, "commit", "-qm", "docs: base document");
+	mkdirSync(join(cwd, "archive"));
+	git(cwd, "mv", "active/document.md", "archive/document.md");
+	writeFileSync(join(cwd, "report.md"), "# Report\n\nPassive report\n");
+	git(cwd, "add", "-A");
+	assert.match(git(cwd, "diff", "--cached", "--name-status", "--find-renames=100%"), /^R100\tactive\/document\.md\tarchive\/document\.md$/m, "the candidate must stage an exact rename");
+
+	const { native, calls } = journeyNative(DEV_BINARY!);
+	await enableReview(native, cwd);
+	const status = await native.targetStatus({ cwd, agent: "pi" });
+	assert.deepEqual([...status.projection.paths].sort(), ["active/document.md", "archive/document.md", "report.md"], "native STATUS projects the rename as both of its paths");
+
+	const started = await __testing.executeReviewControllerOperation({ operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, cwd, native);
+	assert.notEqual(started.outcome, "native-operation-failed", `START must reach native admission: ${JSON.stringify(started)}`);
+	assert.equal(started.operation, "start");
+	const result = started.result as Record<string, unknown>;
+	assert.equal(typeof result.lineage_id, "string", "native START must create a lineage");
+	// Documentation-only candidate: native admission closes it approved with
+	// no lenses, exactly as the low-risk journey above.
+	assert.equal(result.action, "closed");
+	assert.equal(result.state, "approved");
+	assert.equal(calls.filter((arguments_) => arguments_.at(0) === "review" && arguments_.at(1) === "start").length, 1, "exactly one native START runs");
 });
 
 test.before(() => {
