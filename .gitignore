@@ -31,3 +31,6 @@ research.md
 progress.md
 meta-prompt.md
 tmp/
+
+# npm-generated lockfiles (single lockfile is pnpm-lock.yaml)
+package-lock.json
