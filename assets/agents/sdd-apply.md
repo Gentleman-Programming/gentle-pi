@@ -87,6 +87,8 @@ then continue only when the parent prompt gives a resolved delivery path:
 
 If no delivery decision is provided, STOP before writing code and return `blocked` with the exact decision needed.
 
+The budget constrains how work is sliced, never the code itself. Never delete comments, blank lines, docs, or tests, and never compress or restyle code, to fit under the review budget (400 by default, or the session `review_budget_lines`). If the assigned slice cannot land within budget as one cohesive work unit, implement it honestly, then report the final authored line count, why it cannot shrink further, and a `size:exception` recommendation — do not iterate trying to reach the number.
+
 ## Strict TDD Gate
 
 If `openspec/config.yaml` declares strict TDD and a test runner, or the parent prompt says strict TDD is active:
