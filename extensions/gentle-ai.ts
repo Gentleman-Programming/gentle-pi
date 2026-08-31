@@ -3548,6 +3548,15 @@ interface PendingReviewConsent {
 	expiry?: ReturnType<typeof setTimeout>;
 }
 
+const PENDING_REVIEW_CONSENT_DISPOSITION = {
+	EXPIRED: "expired",
+	CONSUMED: "consumed",
+} as const;
+
+type PendingReviewConsentDisposition = (typeof PENDING_REVIEW_CONSENT_DISPOSITION)[keyof typeof PENDING_REVIEW_CONSENT_DISPOSITION];
+
+const PENDING_REVIEW_CONSENT_STALE_DISPOSITION_LIMIT = 32;
+
 /**
  * Process-memory-only pending consent partitions. A loaded extension module
  * shares this registry across registrations, while exact Pi session IDs remain
@@ -3555,6 +3564,7 @@ interface PendingReviewConsent {
  */
 export class PendingReviewConsentRegistry {
 	private readonly sessions = new Map<PendingReviewConsentSessionKey, Map<string, PendingReviewConsent>>();
+	private readonly staleDispositions = new Map<PendingReviewConsentSessionKey, Map<string, PendingReviewConsentDisposition>>();
 
 	get(sessionKey: PendingReviewConsentSessionKey): Map<string, PendingReviewConsent> | undefined {
 		return this.sessions.get(sessionKey);
@@ -3569,18 +3579,50 @@ export class PendingReviewConsentRegistry {
 		return pending;
 	}
 
-	consume(sessionKey: PendingReviewConsentSessionKey, pending: PendingReviewConsent): void {
+	private remove(sessionKey: PendingReviewConsentSessionKey, pending: PendingReviewConsent): boolean {
 		const session = this.sessions.get(sessionKey);
-		if (session?.get(pending.id) !== pending) return;
+		if (session?.get(pending.id) !== pending) return false;
 		session.delete(pending.id);
 		if (session.size === 0) this.sessions.delete(sessionKey);
+		return true;
+	}
+
+	private rememberDisposition(sessionKey: PendingReviewConsentSessionKey, pending: PendingReviewConsent, disposition: PendingReviewConsentDisposition): void {
+		let stale = this.staleDispositions.get(sessionKey);
+		if (stale === undefined) {
+			stale = new Map<string, PendingReviewConsentDisposition>();
+			this.staleDispositions.set(sessionKey, stale);
+		}
+		stale.delete(pending.id);
+		stale.set(pending.id, disposition);
+		while (stale.size > PENDING_REVIEW_CONSENT_STALE_DISPOSITION_LIMIT) stale.delete(stale.keys().next().value!);
+	}
+
+	consume(sessionKey: PendingReviewConsentSessionKey, pending: PendingReviewConsent): boolean {
+		if (!this.remove(sessionKey, pending)) return false;
+		this.rememberDisposition(sessionKey, pending, PENDING_REVIEW_CONSENT_DISPOSITION.CONSUMED);
+		return true;
+	}
+
+	expire(sessionKey: PendingReviewConsentSessionKey, pending: PendingReviewConsent): boolean {
+		if (!this.remove(sessionKey, pending)) return false;
+		this.rememberDisposition(sessionKey, pending, PENDING_REVIEW_CONSENT_DISPOSITION.EXPIRED);
+		return true;
+	}
+
+	discard(sessionKey: PendingReviewConsentSessionKey, pending: PendingReviewConsent): void {
+		this.remove(sessionKey, pending);
+	}
+
+	staleDisposition(sessionKey: PendingReviewConsentSessionKey, binding: string): PendingReviewConsentDisposition | undefined {
+		return this.staleDispositions.get(sessionKey)?.get(binding);
 	}
 
 	take(sessionKey: PendingReviewConsentSessionKey): PendingReviewConsent[] {
 		const session = this.sessions.get(sessionKey);
-		if (session === undefined) return [];
 		this.sessions.delete(sessionKey);
-		return [...session.values()];
+		this.staleDispositions.delete(sessionKey);
+		return session === undefined ? [] : [...session.values()];
 	}
 }
 
@@ -3596,14 +3638,27 @@ function pendingReviewConsentSessionKey(context: ExtensionContext | undefined, f
 	return fallbackKey;
 }
 
-function consumePendingReviewConsent(pending: PendingReviewConsent, registry: PendingReviewConsentRegistry, sessionKey: PendingReviewConsentSessionKey): void {
+function consumePendingReviewConsent(pending: PendingReviewConsent, registry: PendingReviewConsentRegistry, sessionKey: PendingReviewConsentSessionKey): boolean {
+	if (!registry.consume(sessionKey, pending)) return false;
 	if (pending.expiry !== undefined) clearTimeout(pending.expiry);
 	pending.expiry = undefined;
-	registry.consume(sessionKey, pending);
+	return true;
+}
+
+function discardPendingReviewConsent(pending: PendingReviewConsent, registry: PendingReviewConsentRegistry, sessionKey: PendingReviewConsentSessionKey): void {
+	if (pending.expiry !== undefined) clearTimeout(pending.expiry);
+	pending.expiry = undefined;
+	registry.discard(sessionKey, pending);
+}
+
+function expirePendingReviewConsent(pending: PendingReviewConsent, registry: PendingReviewConsentRegistry, sessionKey: PendingReviewConsentSessionKey): void {
+	if (pending.expiry !== undefined) clearTimeout(pending.expiry);
+	pending.expiry = undefined;
+	if (registry.expire(sessionKey, pending)) pending.cleanupCandidate();
 }
 
 function cleanupPendingReviewConsent(pending: PendingReviewConsent, registry: PendingReviewConsentRegistry, sessionKey: PendingReviewConsentSessionKey): void {
-	consumePendingReviewConsent(pending, registry, sessionKey);
+	discardPendingReviewConsent(pending, registry, sessionKey);
 	pending.cleanupCandidate();
 }
 
@@ -3623,7 +3678,7 @@ function pruneExpiredReviewConsents(registry: PendingReviewConsentRegistry, sess
 	const pendingReviewConsents = registry.get(sessionKey);
 	if (pendingReviewConsents === undefined) return;
 	for (const pending of [...pendingReviewConsents.values()]) {
-		if (pending.expiresAt <= now()) cleanupPendingReviewConsent(pending, registry, sessionKey);
+		if (pending.expiresAt <= now()) expirePendingReviewConsent(pending, registry, sessionKey);
 	}
 }
 
@@ -3637,11 +3692,28 @@ function reviewConsentDigest(consent: ReviewConsentEnvelope): string {
 // "ready" and sent the model back into START for a second consent prompt. The
 // fact is local and proven before any provider call, so the outcome names the
 // binding and the exit; the current STATUS rides along as context only.
-function staleConsentBindingDiagnostics(binding: string, expired: boolean): { code: "consent-binding-expired" | "consent-binding-unknown"; message: string } {
+const STALE_CONSENT_BINDING_DIAGNOSTIC_CODE = {
+	EXPIRED: "consent-binding-expired",
+	ALREADY_CONSUMED: "consent-binding-already-consumed",
+	UNKNOWN: "consent-binding-unknown",
+} as const;
+
+type StaleConsentBindingDiagnosticCode = (typeof STALE_CONSENT_BINDING_DIAGNOSTIC_CODE)[keyof typeof STALE_CONSENT_BINDING_DIAGNOSTIC_CODE];
+
+interface StaleConsentBindingDiagnostics {
+	code: StaleConsentBindingDiagnosticCode;
+	message: string;
+}
+
+function staleConsentBindingDiagnostics(binding: string, disposition: PendingReviewConsentDisposition | undefined): StaleConsentBindingDiagnostics {
 	const exit = "Run START again for this candidate to obtain a fresh consent envelope and answer that envelope's binding once; do not resend this binding.";
-	return expired
-		? { code: "consent-binding-expired", message: `consent binding ${binding} expired after ${PENDING_REVIEW_CONSENT_TTL_MS / 60_000} minutes without an answer. ${exit}` }
-		: { code: "consent-binding-unknown", message: `consent binding ${binding} is not held by this Pi session: it was already answered, expired, or was issued by another Pi session or process. ${exit}` };
+	if (disposition === PENDING_REVIEW_CONSENT_DISPOSITION.EXPIRED) {
+		return { code: STALE_CONSENT_BINDING_DIAGNOSTIC_CODE.EXPIRED, message: `consent binding ${binding} expired after ${PENDING_REVIEW_CONSENT_TTL_MS / 60_000} minutes without an answer. ${exit}` };
+	}
+	if (disposition === PENDING_REVIEW_CONSENT_DISPOSITION.CONSUMED) {
+		return { code: STALE_CONSENT_BINDING_DIAGNOSTIC_CODE.ALREADY_CONSUMED, message: `consent binding ${binding} was already consumed by an earlier answer. ${exit}` };
+	}
+	return { code: STALE_CONSENT_BINDING_DIAGNOSTIC_CODE.UNKNOWN, message: `consent binding ${binding} is not held by this Pi session. ${exit}` };
 }
 
 function staleConsentBindingOutcome(operation: ReviewControllerOperation, binding: string, diagnostics: ReturnType<typeof staleConsentBindingDiagnostics>, status: ReviewStatusV3): Record<string, unknown> {
@@ -4904,8 +4976,11 @@ async function executeReviewControllerOperation(
 		if (input.answer !== "granted" && input.answer !== "declined") throw new Error("Review controller answer-consent answer must be granted or declined");
 		const pending = pendingReviewConsentRegistry.get(pendingReviewConsentSession)?.get(input.consentBinding);
 		if (pending === undefined || pending.expiresAt <= reviewConsentNow()) {
-			const stale = staleConsentBindingDiagnostics(input.consentBinding, pending !== undefined);
-			if (pending !== undefined) cleanupPendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession);
+			const disposition = pending === undefined
+				? pendingReviewConsentRegistry.staleDisposition(pendingReviewConsentSession, input.consentBinding)
+				: PENDING_REVIEW_CONSENT_DISPOSITION.EXPIRED;
+			const stale = staleConsentBindingDiagnostics(input.consentBinding, disposition);
+			if (pending !== undefined) expirePendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession);
 			if (nativeReviewCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
 			try {
 				const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
@@ -4922,6 +4997,23 @@ async function executeReviewControllerOperation(
 		if (reviewConsentDigest(pending.consent) !== pending.consentDigest) throw new Error("Review controller consent envelope binding changed");
 		pending.verifyCandidate();
 		if (nativeReviewCli?.answerConsent === undefined) throw new Error("Native review consent follow-up is unavailable");
+		if (!consumePendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession)) {
+			const stale = staleConsentBindingDiagnostics(
+				input.consentBinding,
+				pendingReviewConsentRegistry.staleDisposition(pendingReviewConsentSession, input.consentBinding),
+			);
+			if (nativeReviewCli.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
+			try {
+				const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
+					cwd: defaultCwd,
+					...(signal === undefined ? {} : { signal }),
+				}, retainedUntrackedSelections, defaultCwd);
+				if (negotiated.transport !== undefined) return hostTransportUnavailable(parameters.operation, negotiated.transport);
+				return staleConsentBindingOutcome(parameters.operation, input.consentBinding, stale, negotiated.status!);
+			} catch (error) {
+				return nativeStatusFailed(parameters.operation, error);
+			}
+		}
 		try {
 			const gated = await resolveReviewModeGate(nativeReviewCli, parameters.operation, defaultCwd, signal);
 			if (gated !== undefined) {
@@ -4929,11 +5021,11 @@ async function executeReviewControllerOperation(
 				return gated;
 			}
 		} catch (error) {
+			cleanupPendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession);
 			return nativeOperationFailure(parameters.operation, error);
 		}
-		// The one-shot binding is consumed before the provider mutation. Any
-		// ambiguous result reconciles through STATUS and can never be replayed.
-		consumePendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession);
+		// The one-shot binding is consumed before the first answer-path await. Any
+		// ambiguous provider result reconciles through STATUS and can never be replayed.
 		let completed: Record<string, unknown>;
 		try {
 			const answered = await nativeReviewCli.answerConsent({
@@ -5095,7 +5187,7 @@ async function executeReviewControllerOperation(
 					if (existing === undefined) {
 						for (const pending of [...(pendingReviewConsents?.values() ?? [])]) {
 							if (pending.candidateView.token === consentCandidateView.token) {
-								consumePendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession);
+								discardPendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession);
 							}
 						}
 					}
@@ -5121,7 +5213,7 @@ async function executeReviewControllerOperation(
 						};
 						pendingReviewConsentRegistry.ensure(pendingReviewConsentSession).set(id, pending);
 						pending.expiry = reviewConsentScheduleTimer(
-							() => cleanupPendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession),
+							() => expirePendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession),
 							PENDING_REVIEW_CONSENT_TTL_MS,
 						);
 						pending.expiry.unref();

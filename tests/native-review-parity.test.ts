@@ -331,7 +331,7 @@ async function answerConsent(runtime: ParityRuntime, cwd: string, binding: unkno
 // that names itself and its exit. It still carries the current negotiated
 // STATUS as reconciliation context, but it never reads as a healthy
 // pre-start "ready".
-function assertStaleConsentBinding(outcome: Record<string, unknown>, binding: unknown, code: "consent-binding-unknown" | "consent-binding-expired"): void {
+function assertStaleConsentBinding(outcome: Record<string, unknown>, binding: unknown, code: "consent-binding-unknown" | "consent-binding-expired" | "consent-binding-already-consumed"): void {
 	assert.equal(outcome.status, "blocked");
 	assert.equal(outcome.outcome, "consent-binding-stale");
 	assert.equal(outcome.consent_binding, binding);
@@ -425,7 +425,7 @@ test("public consent relay is session-bound, one-shot, and candidate-scoped", as
 	assert.equal(declined.lineage_created, false);
 	const staleConsumed = await answerConsent(second, cwd, blockedB.consent_binding, "declined", "session-b");
 	assert.equal(staleConsumed.operation, "answer-consent");
-	assertStaleConsentBinding(staleConsumed, blockedB.consent_binding, "consent-binding-unknown");
+	assertStaleConsentBinding(staleConsumed, blockedB.consent_binding, "consent-binding-already-consumed");
 	assert.deepEqual(fixture.answers, ["declined", "declined"]);
 
 	const shutdown = first.events.get("session_shutdown");
@@ -453,7 +453,7 @@ test("public consent relay is session-bound, one-shot, and candidate-scoped", as
 	assert.equal(fixture.starts.count, 4);
 });
 
-test("stale local consent bindings reconcile exactly once with the native status transition", async (t) => {
+test("already-consumed local consent bindings reconcile exactly once with the native status transition", async (t) => {
 	const cwd = repository(t);
 	const fixture = consentNative(cwd);
 	const nextTransition = {
@@ -476,7 +476,7 @@ test("stale local consent bindings reconcile exactly once with the native status
 
 	const reconciled = await answerConsent(runtime, cwd, blocked.consent_binding, "declined");
 	assert.equal(reconciled.operation, "answer-consent");
-	assertStaleConsentBinding(reconciled, blocked.consent_binding, "consent-binding-unknown");
+	assertStaleConsentBinding(reconciled, blocked.consent_binding, "consent-binding-already-consumed");
 	assert.deepEqual(reconciled.result, reconciledStatus.raw);
 	assert.deepEqual((reconciled.result as { next_transition?: unknown }).next_transition, nextTransition);
 	assert.equal(statusRequests.length, 2, "the stale binding performs one reconciliation after the initial START status");
@@ -526,8 +526,8 @@ test("launched answer-consent failures remain blocked after fresh-target STATUS 
 	assert.equal(answerCalls, 1, "reconciliation must not replay answer-consent");
 
 	const stale = await answerConsent(runtime, cwd, blocked.consent_binding, "granted");
-	assertStaleConsentBinding(stale, blocked.consent_binding, "consent-binding-unknown");
-	assert.equal(statusRequests.length, 3, "a later stale binding performs one current STATUS read");
+	assertStaleConsentBinding(stale, blocked.consent_binding, "consent-binding-already-consumed");
+	assert.equal(statusRequests.length, 3, "a later already-consumed binding performs one current STATUS read");
 	assert.equal(answerCalls, 1, "the stale binding must not replay answer-consent");
 });
 
@@ -636,11 +636,75 @@ test("unavailable and ambiguous consent follow-ups never replay a consumed bindi
 	const callsBeforeStaleReconciliation = statusCalls;
 	const stale = await answerConsent(ambiguousRuntime, cwd, ambiguous.consent_binding, "granted");
 	assert.equal(stale.operation, "answer-consent");
-	assertStaleConsentBinding(stale, ambiguous.consent_binding, "consent-binding-unknown");
-	assert.equal(statusCalls, callsBeforeStaleReconciliation + 1, "stale binding reconciliation performs exactly one additional STATUS call");
+	assertStaleConsentBinding(stale, ambiguous.consent_binding, "consent-binding-already-consumed");
+	assert.equal(statusCalls, callsBeforeStaleReconciliation + 1, "already-consumed binding reconciliation performs exactly one additional STATUS call");
 });
 
-test("pending public consent expiry is synchronous and a fresh registry never replays lost state", async (t) => {
+test("concurrent answers atomically claim consent before review-mode gating and ignore a queued expiry callback", async (t) => {
+	const cwd = repository(t);
+	const fixture = consentNative(cwd);
+	const candidateViews = new CandidateViewRegistry();
+	const cleanup = candidateViews.cleanup.bind(candidateViews);
+	let cleanupCalls = 0;
+	candidateViews.cleanup = (token) => {
+		cleanupCalls += 1;
+		cleanup(token);
+	};
+	const scheduled: Array<() => void> = [];
+	let releaseModeGate: (() => void) | undefined;
+	const modeGate = new Promise<void>((resolve) => { releaseModeGate = resolve; });
+	let modeCalls = 0;
+	const statusRequests: Array<{ agent?: string }> = [];
+	fixture.native.targetStatus = async (request) => {
+		statusRequests.push(request);
+		return startStatus(cwd);
+	};
+	let releaseProvider: (() => void) | undefined;
+	const providerGate = new Promise<void>((resolve) => { releaseProvider = resolve; });
+	const nativeAnswer = fixture.native.answerConsent!;
+	let nativeAnswerCalls = 0;
+	fixture.native.answerConsent = async (request) => {
+		nativeAnswerCalls += 1;
+		assert.equal(cleanupCalls, 0, "a queued expiry callback must not clean claimed candidate authority before the provider answer");
+		await providerGate;
+		return await nativeAnswer(request);
+	};
+	const runtime = parityRuntime(fixture.native, {
+		candidateViews,
+		scheduleTimer: (callback) => { scheduled.push(callback); return { unref() {} }; },
+	});
+	const blocked = await beginConsent(runtime, cwd);
+	fixture.native.reviewMode = async () => {
+		modeCalls += 1;
+		if (modeCalls === 1) await modeGate;
+		return {
+			operation: "status",
+			scope: "clone",
+			status: { global: "", cloneLocal: "", effective: "on", source: "default" },
+		};
+	};
+
+	const first = answerConsent(runtime, cwd, blocked.consent_binding, "declined");
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(modeCalls, 1, "the first answer pauses at the asynchronous review-mode gate");
+	const second = answerConsent(runtime, cwd, blocked.consent_binding, "declined");
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(scheduled.length, 1);
+	scheduled[0]!();
+	assert.equal(cleanupCalls, 0, "a queued expiry callback is a harmless no-op after the answer claim");
+
+	releaseModeGate!();
+	releaseProvider!();
+	const [firstResult, secondResult] = await Promise.all([first, second]);
+	assert.equal(firstResult.outcome, "consent-declined-this-candidate");
+	assertStaleConsentBinding(secondResult, blocked.consent_binding, "consent-binding-already-consumed");
+	assert.equal(nativeAnswerCalls, 1, "only the atomically claimed answer may invoke native answer-consent");
+	assert.equal(statusRequests.length, 2, "the losing concurrent answer performs one STATUS reconciliation after the initial START status");
+	assert.equal(statusRequests[1]?.agent, "pi", "the losing answer keeps Pi host transport for STATUS reconciliation");
+	assert.equal(cleanupCalls, 1, "only the answered binding cleans candidate authority");
+});
+
+test("timer-cleaned and synchronously pruned consent bindings remain expired within their session", async (t) => {
 	const cwd = repository(t);
 	const fixture = consentNative(cwd);
 	const registry = new PendingReviewConsentRegistry();
@@ -657,22 +721,30 @@ test("pending public consent expiry is synchronous and a fresh registry never re
 	assert.equal(reused.consent_binding, first.consent_binding);
 	assert.equal(scheduled.length, 1);
 	now += 10 * 60 * 1000;
-	// gentle-pi#516: a slow human answer must learn that its binding expired
-	// and that START issues a fresh envelope, not a healthy "ready".
-	const expired = await answerConsent(runtime, cwd, first.consent_binding, "declined");
-	assert.equal(expired.operation, "answer-consent");
-	assertStaleConsentBinding(expired, first.consent_binding, "consent-binding-expired");
-	assert.match(String((expired.diagnostics as { message?: unknown }).message), /expired after 10 minutes/);
+	// The real TTL callback drops the frozen candidate immediately. Its
+	// session-local disposition remains only to classify this stale answer.
+	scheduled[0]!();
+	const timerExpired = await answerConsent(runtime, cwd, first.consent_binding, "declined");
+	assert.equal(timerExpired.operation, "answer-consent");
+	assertStaleConsentBinding(timerExpired, first.consent_binding, "consent-binding-expired");
+	assert.match(String((timerExpired.diagnostics as { message?: unknown }).message), /expired after 10 minutes/);
 	const second = await beginConsent(runtime, cwd);
 	assert.notEqual(second.consent_binding, first.consent_binding);
 	assert.equal(scheduled.length, 2);
-	// Once START has pruned it, the same binding is simply unknown here.
-	assertStaleConsentBinding(await answerConsent(runtime, cwd, first.consent_binding, "declined"), first.consent_binding, "consent-binding-unknown");
+	assertStaleConsentBinding(await answerConsent(runtime, cwd, first.consent_binding, "declined"), first.consent_binding, "consent-binding-expired");
+
+	// No second callback runs: START synchronously prunes this unused binding
+	// before it can reuse the frozen candidate, and its answer stays typed expiry.
+	now += 10 * 60 * 1000;
+	const third = await beginConsent(runtime, cwd);
+	assert.notEqual(third.consent_binding, second.consent_binding);
+	assertStaleConsentBinding(await answerConsent(runtime, cwd, second.consent_binding, "declined"), second.consent_binding, "consent-binding-expired");
 
 	const reloaded = parityRuntime(fixture.native, { pendingReviewConsentRegistry: new PendingReviewConsentRegistry() });
+	assertStaleConsentBinding(await answerConsent(reloaded, cwd, first.consent_binding, "declined"), first.consent_binding, "consent-binding-unknown");
 	const afterReload = await beginConsent(reloaded, cwd);
-	assert.notEqual(afterReload.consent_binding, second.consent_binding);
-	assert.equal(fixture.starts.count, 4);
+	assert.notEqual(afterReload.consent_binding, third.consent_binding);
+	assert.equal(fixture.starts.count, 5);
 });
 
 test("native START maps only provider facts and omits absent evidence", async (t) => {

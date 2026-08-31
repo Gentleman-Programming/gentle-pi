@@ -94,6 +94,12 @@ test("orchestrator-delegation.md states the admissibility-before-relay rule", ()
 	assert.match(DELEGATION, /The test is what produced the failure, not what the work was doing when it happened/i);
 });
 
+test("orchestrator-delegation.md excludes local consent lifecycle outcomes from provider-defect reporting", () => {
+	assert.match(DELEGATION, /`consent-binding-expired` and `consent-binding-already-consumed` are local lifecycle outcomes, not Gentle AI provider defects/i);
+	assert.match(DELEGATION, /An unknown consent binding is reportable only when independent evidence proves a fresh, same-session, unconsumed binding was lost/i);
+	assert.match(DELEGATION, /Never infer that evidence from the old combined stale-binding message/i);
+});
+
 test("orchestrator-delegation.md states the never-offer-to-repair rule", () => {
 	assert.match(
 		DELEGATION,
