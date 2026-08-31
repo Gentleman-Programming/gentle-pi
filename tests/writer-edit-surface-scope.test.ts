@@ -26,7 +26,7 @@ import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
 // ---------------------------------------------------------------------------
 
 const REJECTION =
-	"Parent must derive or map narrow repository-relative allowed edit surfaces from the delegated task and relaunch the writer. Do not ask the human to author paths or globs.";
+	"Writer tasks must include the exact Markdown heading `## Allowed edit surfaces` with narrow repository-relative paths or narrow globs, one per line. The parent must derive or map that canonical block from the delegated task and relaunch the writer; do not accept aliases, and do not ask the human to author paths or globs.";
 
 type ToolCallHandler = (
 	event: { toolName: string; input: unknown },
@@ -184,6 +184,11 @@ test("out-of-scope and empty surfaces stay rejected", async () => {
 		mode: "task",
 		task: "Fix the decoder.",
 	}, "a task with no section is rejected");
+	await assertRejected({
+		agent: "gentle-ai-worker",
+		mode: "task",
+		task: ["## Edit ranges", "- `lib/sdd-status.ts`"].join("\n"),
+	}, "a semantically equivalent heading is rejected with the actionable canonical-heading reason");
 	await assertRejected({
 		agent: "gentle-ai-worker",
 		mode: "task",

@@ -23,6 +23,12 @@ const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const DOWNLOAD_TIMEOUTS = { headers: 10_000, body: 30_000, attempts: 2, retryDelay: 100 };
 const GO_COMMAND_TIMEOUT_MS = 120_000;
+// `go install` compiles the pinned module from source on Windows. A clean
+// build on a cold module cache measured about 232 s (#400), so the 120 s
+// probe bound killed a healthy build; fifteen minutes leaves close to a 4x
+// margin for slower disks and real-time scanners while still bounding a hung
+// toolchain. The `go version` and `where.exe` probes keep the 120 s bound.
+const GO_INSTALL_TIMEOUT_MS = 15 * 60_000;
 const GO_COMMAND_MAX_BUFFER = 1024 * 1024;
 const WINDOWS_SYSTEM_ROOT = "C:\\Windows";
 // The one authoritative pinned Gentle AI version. Every other location in this
@@ -295,8 +301,8 @@ function isCanonicalManifest(contents, parsed, expected) {
 
 function commandOutput(result) { return typeof result?.stdout === "string" ? result.stdout : ""; }
 
-function commandOptions(env, cwd) {
-	return { cwd, env, shell: false, windowsHide: true, timeout: GO_COMMAND_TIMEOUT_MS, maxBuffer: GO_COMMAND_MAX_BUFFER };
+function commandOptions(env, cwd, timeout = GO_COMMAND_TIMEOUT_MS) {
+	return { cwd, env, shell: false, windowsHide: true, timeout, maxBuffer: GO_COMMAND_MAX_BUFFER };
 }
 
 function outputVersion(output) {
@@ -630,7 +636,7 @@ async function installWindowsGentleAiFromGoSumdb(options, packageRoot, architect
 			const existing = versionBundlePath(runtimeRoot);
 			if (await existingWindowsSourceBundleMatches(existing, execute, goPath, environment, architecture)) return { installed: false, binaryPath: join(existing, "gentle-ai.exe"), method: GENTLE_AI_INSTALL_METHOD.GO_SUMDB_SOURCE_BUILD };
 			await assertGoToolchain(execute, goPath, environment, stagingDirectory);
-			try { await runCommand(execute, goPath, ["install", GENTLE_AI_WINDOWS_SOURCE_PACKAGE], commandOptions(environment, stagingDirectory)); }
+			try { await runCommand(execute, goPath, ["install", GENTLE_AI_WINDOWS_SOURCE_PACKAGE], commandOptions(environment, stagingDirectory, GO_INSTALL_TIMEOUT_MS)); }
 			catch (error) { throw new GentleAiInstallerError(GENTLE_AI_GO_INSTALL_FAILED_CODE, `Gentle AI Go SumDB source installation failed for ${GENTLE_AI_WINDOWS_SOURCE_PACKAGE}.`, error); }
 			const builtBinary = join(environment.GOBIN, "gentle-ai.exe"), binaryPath = join(stagingDirectory, "gentle-ai.exe");
 			const details = await lstat(builtBinary);

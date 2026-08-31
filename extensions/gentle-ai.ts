@@ -464,7 +464,7 @@ const ALLOWED_EDIT_SURFACES_HEADING = /^## Allowed edit surfaces[ \t]*$/gim;
 const MARKDOWN_HEADING_LINE = /^#{1,6}\s/;
 const MARKDOWN_LIST_MARKER = /^(?:[-*+]|\d+[.)])\s+/;
 const WRITER_EDIT_SURFACE_REJECTION =
-	"Parent must derive or map narrow repository-relative allowed edit surfaces from the delegated task and relaunch the writer. Do not ask the human to author paths or globs.";
+	"Writer tasks must include the exact Markdown heading `## Allowed edit surfaces` with narrow repository-relative paths or narrow globs, one per line. The parent must derive or map that canonical block from the delegated task and relaunch the writer; do not accept aliases, and do not ask the human to author paths or globs.";
 
 function isTaskScopedRepositoryRelativePath(value: string): boolean {
 	const normalized = value.replace(/\\/g, "/");
@@ -2744,9 +2744,9 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 		throw new Error("Review controller operation is unsupported");
 	}
 	if (value.operation === REVIEW_CONTROLLER_OPERATION.SELECT_INTENDED_UNTRACKED) {
-		const unexpected = Object.keys(value).find((key) => !["operation", "selectionBinding", "intendedUntracked"].includes(key));
-		if (unexpected !== undefined || typeof value.selectionBinding !== "string" || !Array.isArray(value.intendedUntracked)) throw new Error("Review intended-untracked selection accepts exactly selectionBinding and intendedUntracked");
-		return { operation: value.operation, selectionBinding: value.selectionBinding, intendedUntracked: value.intendedUntracked };
+		const unexpected = Object.keys(value).find((key) => !["operation", "selectionBinding", "intendedUntracked", "workspaceRoot"].includes(key));
+		if (unexpected !== undefined || typeof value.selectionBinding !== "string" || !Array.isArray(value.intendedUntracked) || (value.workspaceRoot !== undefined && typeof value.workspaceRoot !== "string")) throw new Error("Review intended-untracked selection accepts exactly selectionBinding and intendedUntracked, with optional workspaceRoot");
+		return { operation: value.operation, selectionBinding: value.selectionBinding, intendedUntracked: value.intendedUntracked, ...(typeof value.workspaceRoot === "string" ? { workspaceRoot: value.workspaceRoot } : {}) };
 	}
 	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT, REVIEW_CONTROLLER_OPERATION.STATUS, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.ABANDON, REVIEW_CONTROLLER_OPERATION.QUARANTINE_LEGACY, REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY, REVIEW_CONTROLLER_OPERATION.REPAIR_LEGACY_ALIAS, REVIEW_CONTROLLER_OPERATION.REPAIR].includes(value.operation as ReviewControllerOperation);
 	if (needsLineage && (typeof value.lineageId !== "string" || value.lineageId.trim().length === 0)) {
@@ -3324,6 +3324,18 @@ function requiredStatusActionText(lineageId?: string): string {
 	return `Run target-scoped review.status${lineageId === undefined ? "" : ` for lineage ${lineageId}`} and follow only its declared action.`;
 }
 
+// The public collect projection is collectBindings: each provider collect
+// input serialized once as the opaque binding gentle_review_capture consumes.
+// The raw next_transition.collect.inputs carry the same bytes, so a four-lens
+// collect state used to cost about 28k characters per STATUS, INSPECT, or
+// START answer and again on every blocked retry (#465). The raw transition
+// keeps its kind and reason so the orchestrator still sees the collect state.
+function withoutRawCollectInputs(raw: Record<string, unknown>): Record<string, unknown> {
+	if (!isRecord(raw.next_transition)) return raw;
+	const { collect: _collect, ...transition } = raw.next_transition;
+	return { ...raw, next_transition: transition };
+}
+
 function mapNativeTargetStatus(operation: ReviewControllerOperation, status: ReviewStatusV3, requestedLineageId?: string): Record<string, unknown> {
 	if (
 		status.nextTransition?.kind === "collect" &&
@@ -3333,8 +3345,10 @@ function mapNativeTargetStatus(operation: ReviewControllerOperation, status: Rev
 		return {
 			operation,
 			status: "blocked",
-			result: status.raw,
-			...(selection === undefined ? { collectBindings: publicReviewCaptureBindings(status) } : { selectionBinding: canonicalReviewCaptureBinding(selection) }),
+			result: withoutRawCollectInputs(status.raw),
+			...(selection === undefined
+				? { collectBindings: publicReviewCaptureBindings(status) }
+				: { selectionBinding: canonicalReviewCaptureBinding(selection) }),
 		};
 	}
 	if (status.action === "recover") {
@@ -3958,9 +3972,13 @@ function readRetainedNativeCaptureRoute(selections: Map<string, RetainedNativeSt
 
 function isTerminalReviewAuthorityState(state: string | undefined): boolean { return state === "invalidated" || state === "approved" || state === "escalated"; }
 
+function clearRetainedNativeUntrackedSelection(selections: Map<string, RetainedNativeStatusSelection>, workspaceRoot: string, lineageId: string): void {
+	selections.delete(reviewLifecycleStorageKey(workspaceRoot, lineageId));
+}
+
 function clearRetainedNativeStatusSelectionsOnTerminal(selections: Map<string, RetainedNativeStatusSelection>, workspaceRoot: string, lineageId: string | undefined, state: string | undefined): void {
 	if (lineageId === undefined || !isTerminalReviewAuthorityState(state)) return;
-	selections.delete(reviewLifecycleStorageKey(workspaceRoot, lineageId));
+	if (state !== "approved") clearRetainedNativeUntrackedSelection(selections, workspaceRoot, lineageId);
 	for (const [key, selection] of selections) if (isRetainedNativeCaptureRoute(selection) && selection.workspaceRoot === workspaceRoot && selection.lineageId === lineageId) selections.delete(key);
 }
 
@@ -4811,6 +4829,7 @@ async function executeReviewControllerOperation(
 			cwd: defaultCwd,
 			lineageId: parameters.lineageId,
 			...(frozenTarget?.committedOnly === true ? { baseRef: frozenTarget.baseCommit, committedOnly: true } : {}),
+			...readRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, parameters.lineageId),
 			...(signal === undefined ? {} : { signal }),
 		};
 		let status: ReviewStatusV3;
@@ -4859,6 +4878,7 @@ async function executeReviewControllerOperation(
 				binding: { lineageId: parameters.lineageId, targetIdentity: status.targetIdentity, revision: status.authority.revision },
 				...(signal === undefined ? {} : { signal }),
 			});
+			clearRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, parameters.lineageId);
 			return {
 				operation: parameters.operation,
 				status: "closed",
@@ -4971,7 +4991,7 @@ async function executeReviewControllerOperation(
 		const rejected = input === undefined || canonicalReviewCaptureBinding(input) !== canonicalBinding || exactCollectArgument(input, "target_identity") !== status.targetIdentity || exactCollectArgument(input, "projection") !== status.projection.projection || exactCollectArgument(input, "base_tree") !== status.projection.baseTree || exactCollectArgument(input, "candidate_tree") !== status.projection.currentCandidateTree || !Array.isArray(eligible) || selected.reason !== undefined || selected.intendedUntracked!.some((path) => !eligible.includes(path));
 		if (rejected) return { operation: parameters.operation, status: "blocked", outcome: "intended-untracked-selection-binding-rejected", mutation_performed: false, mutation_outcome: "none" };
 		const submission = { argumentTokens: input.submission!.argumentTokens, value: JSON.stringify({ schema: "gentle-ai.review-intended-untracked-selection/v1", untracked_scope: scope, expected_untracked_inventory: inventory, intended_untracked: selected.intendedUntracked }) };
-		const result = await executeReviewControllerOperation({ operation: REVIEW_CONTROLLER_OPERATION.START, input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, untrackedScope: scope, expectedUntrackedInventory: inventory, intendedUntracked: selected.intendedUntracked }) }, sessionCwd, nativeReviewCli, signal, candidateViews, context, retainedUntrackedSelections, pendingReviewConsentRegistry, pendingReviewConsentFallbackKey, writeReviewConsentLatch, reviewConsentNow, reviewConsentScheduleTimer, submission);
+		const result = await executeReviewControllerOperation({ operation: REVIEW_CONTROLLER_OPERATION.START, ...(parameters.workspaceRoot === undefined ? {} : { workspaceRoot: parameters.workspaceRoot }), input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, untrackedScope: scope, expectedUntrackedInventory: inventory, intendedUntracked: selected.intendedUntracked }) }, sessionCwd, nativeReviewCli, signal, candidateViews, context, retainedUntrackedSelections, pendingReviewConsentRegistry, pendingReviewConsentFallbackKey, writeReviewConsentLatch, reviewConsentNow, reviewConsentScheduleTimer, submission);
 		return { ...result, operation: parameters.operation };
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.START) {

@@ -8,7 +8,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { __testing, createGentleAiExtension, PendingReviewConsentRegistry } from "../extensions/gentle-ai.ts";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError, NativeReviewConsentRequiredError, type NativeReviewCli } from "../lib/native-review-cli.ts";
-import { decodeReviewConsentV3, type ReviewCollectInputV3, type ReviewStatusV3 } from "../lib/review-integration-v2.ts";
+import { decodeReviewConsentV3, decodeReviewStatusV3, type ReviewCollectInputV3, type ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 
 const SHA = `sha256:${"a".repeat(64)}`;
 const TREE = "b".repeat(40);
@@ -122,6 +122,61 @@ test("public acknowledgement relays one current provider vector and never replay
 	assert.equal(later.outcome, "native-approved-acknowledgement-not-current");
 	assert.equal(requests.length, 2);
 	assert.equal(acknowledgementRequests.length, 1);
+});
+
+test("approved acknowledgement reuses an explicit STATUS excluded-untracked selection and clears it after consumption", async () => {
+	const cwd = process.cwd();
+	const lineageId = "acknowledge-approved-excluded-untracked";
+	const selection = {
+		untrackedScope: "exclude",
+		expectedUntrackedInventory: "inventory-sha256",
+		intendedUntracked: [],
+	};
+	const selections = new Map();
+	const requests: Array<Record<string, unknown>> = [];
+	let acknowledgements = 0;
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => {
+			requests.push(request);
+			return approvedAcknowledgementStatus(lineageId);
+		},
+		acknowledgeApproved: async () => { acknowledgements += 1; },
+	} as unknown as NativeReviewCli;
+
+	await __testing.executeReviewControllerOperation(
+		{ operation: "status", lineageId, input: JSON.stringify(selection) },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		undefined,
+		selections,
+	);
+	const acknowledged = await __testing.executeReviewControllerOperation(
+		{ operation: "acknowledge-approved", lineageId },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		undefined,
+		selections,
+	);
+	assert.equal(acknowledged.outcome, "native-approved-acknowledgement-completed");
+	await __testing.executeReviewControllerOperation(
+		{ operation: "status", lineageId },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		undefined,
+		selections,
+	);
+	assert.deepEqual(requests, [
+		{ cwd, lineageId, agent: "pi", ...selection },
+		{ cwd, lineageId, ...selection },
+		{ cwd, lineageId, agent: "pi" },
+	]);
+	assert.equal(acknowledgements, 1);
 });
 
 test("public acknowledgement reports the burn from the review-acknowledged/v1 envelope when the provider prints one", async () => {
@@ -628,8 +683,8 @@ test("ordinary START binds the native workspace candidate and returns the native
 	assert.equal(startCalls, 1);
 });
 
-test("pre-lineage intended-untracked selection uses one opaque STATUS binding before START", async (t) => {
-	const cwd = realpathSync(repository(t)), eligible = "selected.md";
+test("pre-lineage intended-untracked selection revalidates and starts at an explicit workspace root", async (t) => {
+	const cwd = realpathSync(repository(t)), sessionCwd = repository(t), eligible = "selected.md";
 	writeFileSync(join(cwd, eligible), "selected\n");
 	const initialTarget = startStatus(cwd), target = startStatus(cwd, undefined, [eligible]);
 	const selection: ReviewCollectInputV3 = {
@@ -648,11 +703,13 @@ test("pre-lineage intended-untracked selection uses one opaque STATUS binding be
 		targetStatus: async (request: Record<string, unknown>) => { requests.push(request); return "intendedUntrackedSelection" in request ? target : initial; },
 		start: async (request: Record<string, unknown>) => { assert.equal(retained.size, 0); starts.push(request); return { lineageId: "selected", state: "reviewing", riskLevel: "low", selectedLenses: [], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: false, riskReasons: [], raw: {} }; },
 	} as unknown as NativeReviewCli;
-	const listed = await __testing.executeReviewControllerOperation({ operation: "status" }, cwd, native, undefined, undefined, undefined, retained);
+	const listed = await __testing.executeReviewControllerOperation({ operation: "status", workspaceRoot: cwd }, sessionCwd, native, undefined, undefined, undefined, retained);
 	const selectionBinding = listed.selectionBinding as string;
 	assert.equal(typeof selectionBinding, "string");
-	const selectedResult = await __testing.executeReviewControllerOperation({ operation: "select-intended-untracked", selectionBinding, intendedUntracked: [eligible] } as never, cwd, native, undefined, undefined, undefined, retained);
+	const selectedResult = await __testing.executeReviewControllerOperation({ operation: "select-intended-untracked", selectionBinding, intendedUntracked: [eligible], workspaceRoot: cwd } as never, sessionCwd, native, undefined, undefined, undefined, retained);
 	assert.equal(starts.length, 1, JSON.stringify(selectedResult));
+	assert.deepEqual(requests.map((request) => request.cwd), [cwd, cwd, cwd]);
+	assert.equal(starts[0]!.cwd, cwd);
 	assert.deepEqual(starts[0]!.intendedUntrackedSelection, { argumentTokens: selection.submission!.argumentTokens, value: JSON.stringify({ schema: "gentle-ai.review-intended-untracked-selection/v1", untracked_scope: "select", expected_untracked_inventory: SHA, intended_untracked: [eligible] }) });
 	for (const invalid of [
 		{ selectionBinding: selectionBinding.replace(eligible, "docs/stale.md"), intendedUntracked: [eligible] },
@@ -1123,5 +1180,55 @@ test("controller forwards AbortSignal and retains typed native diagnostics witho
 		assert.equal(failed.outcome, "native-status-package-binary-missing");
 		assert.equal(failed.mutation_outcome, "none");
 		assert.equal((failed.diagnostics as { error_code?: string }).error_code, NATIVE_REVIEW_ERROR_CODE.PACKAGE_BINARY_MISSING);
+	}
+});
+
+// #465: a collect-state STATUS/INSPECT/START answer used to carry every
+// provider collect input twice, once inside result.next_transition.collect
+// and once as the canonical collectBinding string, so a four-lens review paid
+// roughly 28k characters per call and again on every blocked retry. The
+// consumed projection is collectBindings; the raw inputs are the duplicate.
+function fourLensCollectStatus(): { raw: Record<string, unknown>; lenses: readonly string[] } {
+	const captured = JSON.parse(readFileSync(new URL("./fixtures/devbinary/status-v5-capture-result-submission.captured.json", import.meta.url), "utf8")) as Record<string, unknown>;
+	const nextTransition = captured.next_transition as { collect: { inputs: Array<Record<string, unknown>> } };
+	const template = nextTransition.collect.inputs[0]!;
+	const lenses = ["review-risk", "review-readability", "review-reliability", "review-resilience"] as const;
+	// The captured input names its lens in the capture arguments and again in
+	// the provider-owned submission tokens; rewrite every occurrence so each of
+	// the four inputs is one distinct provider slot.
+	const inputs = lenses.map((lens, order) => JSON.parse(JSON.stringify(template).replaceAll("review-reliability", lens).replaceAll("--order=0", `--order=${order}`)) as Record<string, unknown>);
+	// The captured envelope predates the current action enumeration; the collect transition is what this test exercises.
+	return { raw: { ...captured, action: "stop", next_transition: { ...nextTransition, collect: { inputs } } }, lenses };
+}
+
+function occurrences(haystack: string, needle: string): number {
+	return haystack.split(needle).length - 1;
+}
+
+test("collect-state public STATUS, INSPECT, and START serialize each provider collect input exactly once", async () => {
+	const { raw, lenses } = fourLensCollectStatus();
+	const status = decodeReviewStatusV3(raw);
+	const lineageId = status.authority!.lineageId!;
+	const native = { targetStatus: async () => status } as unknown as NativeReviewCli;
+	for (const parameters of [
+		{ operation: "status", lineageId },
+		{ operation: "inspect" },
+		{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+	] as const) {
+		const result = await __testing.executeReviewControllerOperation(parameters, process.cwd(), native);
+		assert.equal(result.status, "blocked", parameters.operation);
+		const bindings = result.collectBindings as readonly { collectBinding: string }[];
+		assert.equal(bindings.length, lenses.length, parameters.operation);
+		const serialized = JSON.stringify(result);
+		const projected = JSON.stringify(bindings);
+		for (const lens of lenses) {
+			const needle = `--lens=${lens}`;
+			assert.ok(occurrences(projected, needle) > 0, `${lens} must be published through collectBindings`);
+			assert.equal(occurrences(JSON.stringify(result.result), needle), 0, `${parameters.operation} must not repeat the ${lens} collect input inside result (${serialized.length} characters)`);
+			assert.equal(occurrences(serialized, needle), occurrences(projected, needle), `${parameters.operation} must serialize the ${lens} collect input exactly once (${serialized.length} characters)`);
+		}
+		const transition = (result.result as { next_transition: { kind: string } }).next_transition;
+		assert.equal(transition.kind, "collect", `${parameters.operation} keeps the transition kind so the orchestrator still sees the collect state`);
+		assert.ok(serialized.length < 2 * JSON.stringify(bindings).length, `${parameters.operation} answer (${serialized.length} characters) must not double the ${JSON.stringify(bindings).length}-character binding projection`);
 	}
 });
