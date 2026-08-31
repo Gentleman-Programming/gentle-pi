@@ -31,18 +31,23 @@ const EXPECTED_BANNER_COMMANDS = [
 const EXPECTED_COMMANDS = [
 	"gentle:install-sdd",
 	"gentle:sdd-preflight",
-	"sdd-status",
-	"sdd-continue",
+	"gentle-sdd-status",
+	"gentle-sdd-continue",
 	"gentle:models",
 	"gentle:persona",
 	"gentle:status",
 	"gentle:doctor",
-	"sdd-init",
+	"gentle-sdd-init",
 	"skill-registry:refresh",
 	...EXPECTED_BANNER_COMMANDS,
 ];
 
 const FORBIDDEN_COMPAT_COMMANDS = [
+	// The SDD entry points carry the gentle- prefix so they read identically in
+	// Claude Code and Pi. The bare names are retired without an alias.
+	"sdd-init",
+	"sdd-continue",
+	"sdd-status",
 	"gentle-ai:install-sdd",
 	"gentle-ai:sdd-preflight",
 	"gentle-ai:sdd-status",
@@ -482,10 +487,10 @@ async function run() {
 		assert.match(applyPromptResult.systemPrompt, /"changeName": "status-demo"/);
 		assert.match(applyPromptResult.systemPrompt, /### apply instructions/);
 		const statusCtx = createCtx(promptCwd, true);
-		await commands.get("sdd-status").handler("status-demo --json", statusCtx);
+		await commands.get("gentle-sdd-status").handler("status-demo --json", statusCtx);
 		assert.match(statusCtx.ui.notifications.at(-1).message, /"schemaName": "gentle-pi\.sdd-status"/);
 		const continueCtx = createCtx(promptCwd, true);
-		await commands.get("sdd-continue").handler("status-demo", continueCtx);
+		await commands.get("gentle-sdd-continue").handler("status-demo", continueCtx);
 		assert.match(continueCtx.ui.notifications.at(-1).message, /Native SDD Dispatcher/);
 		assert.match(continueCtx.ui.notifications.at(-1).message, /nextPhase: sdd-apply/);
 		const { execFileSync } = await import("node:child_process");
@@ -497,7 +502,7 @@ async function run() {
 			'{"schema":"gentle-ai.recovery-required/v1","change_name":"status-demo"}',
 		);
 		const blockedContinueCtx = createCtx(promptCwd, true);
-		await commands.get("sdd-continue").handler("status-demo", blockedContinueCtx);
+		await commands.get("gentle-sdd-continue").handler("status-demo", blockedContinueCtx);
 		assert.doesNotMatch(blockedContinueCtx.ui.notifications.at(-1).message, /resolve-review:/);
 		assert.match(blockedContinueCtx.ui.notifications.at(-1).message, /nextPhase: sdd-apply/);
 	} finally {
@@ -1161,7 +1166,7 @@ async function run() {
 		await rm(globalModelsPath, { force: true });
 	}
 
-	for (const [index, text] of ["/sdd", "/sdd plan", "/sdd:plan", "/sdd-plan this change"].entries()) {
+	for (const [index, text] of ["/sdd", "/sdd plan", "/sdd:plan", "/sdd-plan this change", "/gentle-sdd-continue", "/gentle-sdd-status fix-rose --json", "/gentle-sdd-init"].entries()) {
 		const slashSddCwd = await tempWorkspace();
 		try {
 			const ctx = createCtx(slashSddCwd, true, `slash-sdd-session-${index}`);
@@ -1282,7 +1287,7 @@ async function run() {
 	}
 
 	// Issue #64: selecting engram as the artifact store must not cause
-	// /sdd-init to create openspec/ or openspec/config.yaml.
+	// /gentle-sdd-init to create openspec/ or openspec/config.yaml.
 	const engramSddInitCwd = await tempWorkspace();
 	try {
 		pi.setActiveTools(["read", "bash", "edit", "write", "mem_save"]);
@@ -1292,21 +1297,21 @@ async function run() {
 			return options[0];
 		};
 		await commands.get("gentle:sdd-preflight").handler("", ctx);
-		await commands.get("sdd-init").handler("", ctx);
+		await commands.get("gentle-sdd-init").handler("", ctx);
 		assert.equal(
 			existsSync(join(engramSddInitCwd, "openspec")),
 			false,
-			"/sdd-init must not create openspec/ when artifactStore is engram",
+			"/gentle-sdd-init must not create openspec/ when artifactStore is engram",
 		);
 		assert.equal(
 			existsSync(join(engramSddInitCwd, "openspec", "config.yaml")),
 			false,
-			"/sdd-init must not write openspec/config.yaml when artifactStore is engram",
+			"/gentle-sdd-init must not write openspec/config.yaml when artifactStore is engram",
 		);
 		assert.doesNotMatch(
 			ctx.ui.notifications.at(-1).message,
 			/Wrote openspec\/config\.yaml/,
-			"/sdd-init must not announce openspec/config.yaml when artifactStore is engram",
+			"/gentle-sdd-init must not announce openspec/config.yaml when artifactStore is engram",
 		);
 		assert.match(
 			ctx.ui.notifications.at(-1).message,
@@ -1330,26 +1335,26 @@ async function run() {
 			return options[0];
 		};
 		await commands.get("gentle:sdd-preflight").handler("", ctx);
-		await commands.get("sdd-init").handler("", ctx);
+		await commands.get("gentle-sdd-init").handler("", ctx);
 		assert.equal(
 			existsSync(join(bothSddInitCwd, "openspec", "specs")),
 			true,
-			"/sdd-init must create openspec/specs when artifactStore is both",
+			"/gentle-sdd-init must create openspec/specs when artifactStore is both",
 		);
 		assert.equal(
 			existsSync(join(bothSddInitCwd, "openspec", "changes", "archive")),
 			true,
-			"/sdd-init must create openspec/changes/archive when artifactStore is both",
+			"/gentle-sdd-init must create openspec/changes/archive when artifactStore is both",
 		);
 		assert.equal(
 			existsSync(join(bothSddInitCwd, "openspec", "config.yaml")),
 			true,
-			"/sdd-init must write openspec/config.yaml when artifactStore is both",
+			"/gentle-sdd-init must write openspec/config.yaml when artifactStore is both",
 		);
 		assert.match(
 			ctx.ui.notifications.at(-1).message,
 			/Wrote openspec\/config\.yaml/,
-			"/sdd-init must announce openspec/config.yaml when artifactStore is both",
+			"/gentle-sdd-init must announce openspec/config.yaml when artifactStore is both",
 		);
 		assert.equal(ctx.ui.notifications.at(-1).level, "info");
 	} finally {
@@ -1412,7 +1417,7 @@ async function run() {
 	const sddCwd = await tempWorkspace();
 	try {
 		const ctx = createCtx(sddCwd, true);
-		await commands.get("sdd-init").handler("", ctx);
+		await commands.get("gentle-sdd-init").handler("", ctx);
 		assert.equal(existsSync(join(sddCwd, ".pi", "agents", "sdd-apply.md")), false);
 		assert.equal(existsSync(join(sddCwd, ".pi", "chains", "sdd-full.chain.md")), false);
 		assert.equal(existsSync(join(globalAgentHome, "agents", "sdd-apply.md")), true);
@@ -1439,7 +1444,7 @@ async function run() {
 		);
 		await writeFile(globalModelsPath, "{ invalid json");
 		const ctx = createCtx(invalidSddInitCwd, true, "invalid-sdd-init-session");
-		await commands.get("sdd-init").handler("", ctx);
+		await commands.get("gentle-sdd-init").handler("", ctx);
 		assert.equal(ctx.ui.notifications[0].level, "warning");
 		assert.match(ctx.ui.notifications[0].message, /Model routing skipped:/);
 		assert.match(ctx.ui.notifications[0].message, /models\.json/);

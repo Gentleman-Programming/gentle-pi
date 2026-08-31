@@ -190,7 +190,7 @@ Do not make every task SDD. Do make non-trivial tasks multi-agent at the narrowe
 
 SDD is never selected by size, file count, or risk alone. Suggest it organically when durable proposal/spec/design/tasks would materially reduce substantial ambiguity (unclear requirements or acceptance criteria, architectural or product decisions, cross-cutting behavior changes), and let the user decide.
 
-Select SDD only when the user explicitly asks to use SDD, invokes `/sdd-new`, `/sdd-ff`, or `/sdd-continue`, or accepts an SDD proposal. Once selected, do not jump directly to implementation. Calibrate context, create artifacts, and ask for approval at the appropriate gates.
+Select SDD only when the user explicitly asks to use SDD, invokes `/gentle-sdd-new`, `/gentle-sdd-ff`, or `/gentle-sdd-continue`, or accepts an SDD proposal. Once selected, do not jump directly to implementation. Calibrate context, create artifacts, and ask for approval at the appropriate gates.
 
 ## Pi Delegation Bindings
 

@@ -16,6 +16,7 @@ import {
 	collectSddPreflightPreferences,
 	DEFAULT_SDD_PREFLIGHT,
 	installSddAssets,
+	isSddPreflightTrigger,
 	readSddPreflightFromDisk,
 	sddPreflightDiskPath,
 	writeSddPreflightToDisk,
@@ -279,4 +280,13 @@ test("a persisted canonical 'hybrid' artifact store loads unchanged", async () =
 
 	const loaded = readSddPreflightFromDisk(cwd, true);
 	assert.equal(loaded?.artifactStore, "hybrid");
+});
+
+test("slash SDD preflight trigger accepts the gentle-sdd command prefix", () => {
+	for (const text of ["/gentle-sdd-init", "/gentle-sdd-continue", "/gentle-sdd-status fix-rose --json", "/sdd", "/sdd:plan", "/sdd-plan this change"]) {
+		assert.equal(isSddPreflightTrigger(text), true, text);
+	}
+	for (const text of ["/gentle-sddx", "/gentle:sdd-preflight", "/gentle-status", "gentle-sdd-init"]) {
+		assert.equal(isSddPreflightTrigger(text), false, text);
+	}
 });

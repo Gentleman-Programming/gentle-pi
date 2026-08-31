@@ -5520,7 +5520,7 @@ function createGentleAiExtensionForTesting(
 		);
 	};
 
-	pi.registerCommand("sdd-status", {
+	pi.registerCommand("gentle-sdd-status", {
 		description: "Show deterministic SDD change status and instructions.",
 		handler: async (args, ctx) => {
 			await handleSddStatusCommand(args, ctx);
@@ -5541,7 +5541,7 @@ function createGentleAiExtensionForTesting(
 		);
 	};
 
-	pi.registerCommand("sdd-continue", {
+	pi.registerCommand("gentle-sdd-continue", {
 		description: "Resolve SDD status and route the next phase deterministically.",
 		handler: async (args, ctx) => {
 			await handleSddContinueCommand(args, ctx);
