@@ -612,3 +612,99 @@ test("current review STATUS retains compact snapshot and released-lock wire fiel
 		assert.equal((await client(canonical.adapter).reviewStatus({ cwd: alias })).repository, root);
 	}
 });
+
+// ---------------------------------------------------------------------------
+// acknowledge-approved — gentle-ai #3947 made the burn print one typed
+// `gentle-ai.review-acknowledged/v1` envelope; every published release up to
+// v2.5.0-rc.3 burns in silence. Both are a successful burn; anything else on
+// stdout is not.
+// ---------------------------------------------------------------------------
+
+const ACKNOWLEDGED_LINEAGE = "review-3ec95251db75f626";
+const ACKNOWLEDGED_TARGET = "sha256:b505dcd8d82395c053c9786935e11e0e235cbdecca4f1f46f98c768ea6248d3d";
+const ACKNOWLEDGED_REVISION = "sha256:9732b1c3526bfecd3851093239241145c970cc126acea59bfaf14133214b60ee";
+const ACKNOWLEDGEMENT_TOKENS = [`--cwd=/repo`, `--lineage=${ACKNOWLEDGED_LINEAGE}`, `--target=${ACKNOWLEDGED_TARGET}`, `--expected-revision=${ACKNOWLEDGED_REVISION}`, "--token=provider-issued-once"] as const;
+const ACKNOWLEDGED_BINDING = { lineageId: ACKNOWLEDGED_LINEAGE, targetIdentity: ACKNOWLEDGED_TARGET, revision: ACKNOWLEDGED_REVISION } as const;
+
+test("acknowledge-approved keeps accepting the pinned silent burn byte-for-byte", async () => {
+	const queue = queuedAdapter([{ stdout: "" }]);
+	const result = await client(queue.adapter).acknowledgeApproved({ argumentTokens: ACKNOWLEDGEMENT_TOKENS, cwd: "/repo", binding: ACKNOWLEDGED_BINDING });
+	assert.equal(result, undefined);
+	assert.deepEqual(queue.calls[0]?.arguments, ["review", "acknowledge-approved", ...ACKNOWLEDGEMENT_TOKENS]);
+	assert.equal(queue.calls[0]?.cwd, "/repo");
+	assert.equal(queue.calls[0]?.timeoutMs, undefined);
+	assert.equal(queue.calls.length, 1);
+});
+
+test("acknowledge-approved decodes the captured review-acknowledged/v1 burn envelope", async () => {
+	const raw = readFileSync(join(process.cwd(), "tests", "fixtures", "devbinary", "review-acknowledged-v1.captured.json"), "utf8");
+	const queue = queuedAdapter([{ stdout: raw }]);
+	const result = await client(queue.adapter).acknowledgeApproved({ argumentTokens: ACKNOWLEDGEMENT_TOKENS, cwd: "/repo", binding: ACKNOWLEDGED_BINDING });
+	assert.equal(result?.schema, "gentle-ai.review-acknowledged/v1");
+	assert.deepEqual(
+		{ lineageId: result?.lineageId, targetIdentity: result?.targetIdentity, consumedRevision: result?.consumedRevision, authority: result?.authority },
+		{ lineageId: ACKNOWLEDGED_LINEAGE, targetIdentity: ACKNOWLEDGED_TARGET, consumedRevision: ACKNOWLEDGED_REVISION, authority: "burned" },
+	);
+	assert.deepEqual(queue.calls[0]?.arguments, ["review", "acknowledge-approved", ...ACKNOWLEDGEMENT_TOKENS]);
+	assert.equal(queue.calls.length, 1);
+
+	const unbound = await client(queuedAdapter([{ stdout: raw }]).adapter).acknowledgeApproved({ argumentTokens: ACKNOWLEDGEMENT_TOKENS, cwd: "/repo" });
+	assert.equal(unbound?.consumedRevision, ACKNOWLEDGED_REVISION);
+});
+
+test("acknowledge-approved fails closed on a foreign, drifted, or mismatched success body", async () => {
+	const raw = JSON.parse(readFileSync(join(process.cwd(), "tests", "fixtures", "devbinary", "review-acknowledged-v1.captured.json"), "utf8")) as Record<string, unknown>;
+	const bodies: Array<[string, string, { lineageId: string; targetIdentity: string; revision: string }]> = [
+		["a STATUS envelope", JSON.stringify(fixture("status-v5.captured.json")), ACKNOWLEDGED_BINDING],
+		["a last-event closure", JSON.stringify(fixture("last-event-capture-result-approved.captured.json")), ACKNOWLEDGED_BINDING],
+		["an envelope with an unknown field", JSON.stringify({ ...raw, receipt: {} }), ACKNOWLEDGED_BINDING],
+		["an envelope naming another lineage", JSON.stringify(raw), { ...ACKNOWLEDGED_BINDING, lineageId: "review-other" }],
+		["an envelope naming another revision", JSON.stringify(raw), { ...ACKNOWLEDGED_BINDING, revision: `sha256:${"c".repeat(64)}` }],
+		["non-JSON output", "acknowledged\n", ACKNOWLEDGED_BINDING],
+	];
+	for (const [name, stdout, binding] of bodies) {
+		const queue = queuedAdapter([{ stdout }]);
+		await assert.rejects(
+			() => client(queue.adapter).acknowledgeApproved({ argumentTokens: ACKNOWLEDGEMENT_TOKENS, cwd: "/repo", binding }),
+			(error: unknown) => error instanceof NativeReviewCliError
+				&& (error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE || error.code === NATIVE_REVIEW_ERROR_CODE.MALFORMED_JSON)
+				&& error.mutationOutcome === "unknown",
+			name,
+		);
+		assert.equal(queue.calls.length, 1, name);
+	}
+});
+
+test("acknowledge-approved keeps its fail-closed stderr and typed refusal discipline around the envelope", async () => {
+	const raw = readFileSync(join(process.cwd(), "tests", "fixtures", "devbinary", "review-acknowledged-v1.captured.json"), "utf8");
+	await assert.rejects(
+		() => client(queuedAdapter([{ stdout: raw, stderr: "note: burned\n" }]).adapter).acknowledgeApproved({ argumentTokens: ACKNOWLEDGEMENT_TOKENS, cwd: "/repo", binding: ACKNOWLEDGED_BINDING }),
+		(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.UNEXPECTED_STDERR,
+	);
+	await assert.rejects(
+		() => client(queuedAdapter([{ stdout: "", stderr: "note: burned\n" }]).adapter).acknowledgeApproved({ argumentTokens: ACKNOWLEDGEMENT_TOKENS, cwd: "/repo", binding: ACKNOWLEDGED_BINDING }),
+		(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.UNEXPECTED_STDERR,
+	);
+	const failure = {
+		schema: "gentle-ai.review-integration.failure/v2",
+		contract: "gentle-ai.review-integration/v2",
+		operation: "review.capture-result",
+		phase: "pre_native",
+		code: "gate_scope_changed",
+		message: "the target scope changed since START",
+		mutation_outcome: "not_started",
+		authority_applicability: "current_target",
+		retry_safe: true,
+		replayability: "manual_action_required",
+		required_inputs: [],
+		next_action: "explicit-maintainer-action",
+	};
+	await assert.rejects(
+		() => client(queuedAdapter([{ stdout: JSON.stringify(failure), exitCode: 1 }]).adapter).acknowledgeApproved({ argumentTokens: ACKNOWLEDGEMENT_TOKENS, cwd: "/repo", binding: ACKNOWLEDGED_BINDING }),
+		(error: unknown) => error instanceof Error && error.name === "NativeReviewIntegrationError",
+	);
+	await assert.rejects(
+		() => client(queuedAdapter([{ stdout: "", stderr: "Error: approved acknowledgement names no live compact authority\n", exitCode: 1 }]).adapter).acknowledgeApproved({ argumentTokens: ACKNOWLEDGEMENT_TOKENS, cwd: "/repo", binding: ACKNOWLEDGED_BINDING }),
+		(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.EMPTY_OUTPUT,
+	);
+});

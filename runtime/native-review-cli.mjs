@@ -8,6 +8,7 @@ import { PackageLocalGentleAiBinaryMissingError, resolveGentleAiBinary } from ".
 import { GENTLE_PI_REVIEW_RELAY_CONTRACT, GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV } from "./review-relay-contract.mjs";
 import {
 	REVIEW_INTEGRATION_CONTRACT,
+	decodeReviewAcknowledgedV1,
 	decodeReviewConsentV2,
 	decodeReviewConsentV3,
 	decodeReviewFailureV2,
@@ -17,6 +18,8 @@ import {
 	decodeReviewStartV3,
 	decodeReviewStartV4,
 	decodeReviewStatusV3,
+
+
 
 
 
@@ -351,11 +354,18 @@ export const NATIVE_REVIEW_LEGACY_ALIAS_REPAIR = {
 // The one continuation that burns approved authority. Its tokens are rendered
 // by the provider in a closed order and are relayed verbatim: Pi never builds,
 // reorders, or substitutes one, because a synthesized acknowledgement would be
-// Pi deciding that a review is over.
+// Pi deciding that a review is over. `binding` is the lineage, target, and
+// revision the caller already holds from STATUS: when the provider answers the
+// burn with a review-acknowledged/v1 envelope (gentle-ai #3947), that envelope
+// must name exactly this burn.
 
 
 
 
+
+
+
+/** `undefined` is the pinned silent burn (every release up to v2.5.0-rc.3); an envelope is the #3947 typed burn. */
 
 
 
@@ -1689,6 +1699,9 @@ function decodeDeclinedConsentStart(value         , expected                    
 
 
 
+
+
+
 function decodeNativeAdmittedResultManifest(value         )                                     {
 	// The admission answer routes through the exact-identity forward decoder
 	// (decoder-freshness discipline): the complete live envelope — identity
@@ -1775,10 +1788,13 @@ export class NativeReviewCliV216                            {
 		signal                         ,
 		path        ,
 		toleratedStderr                    = [],
-		// A successful acknowledgement burns its authority and prints nothing:
-		// there is no receipt left to describe. Only that shape opts out of the
-		// body, and only for a zero exit; a non-zero exit still has to produce
-		// its typed failure envelope like every other operation.
+		// A successful acknowledgement burns its authority and, on every
+		// published release up to v2.5.0-rc.3, prints nothing: there is no
+		// receipt left to describe. Only that shape opts out of the body, and
+		// only for a zero exit. When such an operation does print, the bytes
+		// are handed back as a body for the caller to decode against the one
+		// identity it accepts (gentle-ai #3947); a non-zero exit still has to
+		// produce its typed failure envelope like every other operation.
 		expectsBody = true,
 	)                               {
 		let result                ;
@@ -1792,10 +1808,9 @@ export class NativeReviewCliV216                            {
 		if (result.timedOut) throw nativeError(NATIVE_REVIEW_ERROR_CODE.TIMEOUT, operation, mutating, "native process timed out", result);
 		if (result.signal) throw nativeError(NATIVE_REVIEW_ERROR_CODE.SIGNAL, operation, mutating, "native process was signalled", result);
 		const diagnostics = nativeProcessDiagnostics(operation, NATIVE_REVIEW_ERROR_CODE.NON_ZERO, result);
-		if (!expectsBody && result.exitCode === 0) {
-			if (result.stdout.trim().length > 0) throw nativeError(NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE, operation, mutating, "native bodyless operation returned output", result);
+		if (!expectsBody && result.exitCode === 0 && result.stdout.trim().length === 0) {
 			if (result.stderr.trim().length > 0 && !stderrIsTolerated(result.stderr, toleratedStderr)) throw nativeError(NATIVE_REVIEW_ERROR_CODE.UNEXPECTED_STDERR, operation, mutating, "native process wrote stderr", result);
-			return { body: {}, exitCode: result.exitCode };
+			return { body: {}, exitCode: result.exitCode, silent: true };
 		}
 		const body = parseJson(result.stdout, operation, mutating, diagnostics);
 		if (result.exitCode !== 0) {
@@ -2023,17 +2038,25 @@ export class NativeReviewCliV216                            {
 	}
 
 	// Relays the provider-issued acknowledgement exactly as rendered. A success
-	// burns the authority and its artifacts and prints nothing, so there is no
-	// body to decode and nothing survives to describe; a refusal still arrives
-	// as the ordinary typed failure envelope.
-	async acknowledgeApproved(request                                        )                {
+	// burns the authority and its artifacts; a refusal still arrives as the
+	// ordinary typed failure envelope. Two success shapes exist and both are
+	// the same burn: every published release up to v2.5.0-rc.3 prints nothing
+	// (resolved as `undefined`, byte-for-byte the pinned behaviour), and
+	// gentle-ai #3947 prints one `gentle-ai.review-acknowledged/v1` envelope
+	// naming the burned lineage, target, and consumed revision. Any other
+	// output on a zero exit is schema-incompatible with the mutation outcome
+	// unknown, exactly like a malformed terminal closure: the caller
+	// reconciles through STATUS and never infers the burn from prose.
+	async acknowledgeApproved(request                                        )                                                  {
 		if (request.argumentTokens.length === 0) throw new TypeError("Native ACKNOWLEDGE_APPROVED requires the provider-issued argument tokens");
 		if (request.argumentTokens.some((token) => typeof token !== "string" || token.length === 0)) throw new TypeError("Native ACKNOWLEDGE_APPROVED argument tokens must all be non-empty strings");
 		if (request.argumentTokens.some((token) => token.includes("{{value}}"))) throw new TypeError("Native ACKNOWLEDGE_APPROVED argument tokens carry no caller-substituted value");
 		const executable = this.executablePath(NATIVE_REVIEW_OPERATION.ACKNOWLEDGE_APPROVED, true);
-		await this.invoke(NATIVE_REVIEW_OPERATION.ACKNOWLEDGE_APPROVED, request.cwd, [
+		const execution = await this.invoke(NATIVE_REVIEW_OPERATION.ACKNOWLEDGE_APPROVED, request.cwd, [
 			"review", "acknowledge-approved", ...request.argumentTokens,
 		], true, request.signal, executable, [], false);
+		if (execution.silent) return undefined;
+		return decode(NATIVE_REVIEW_OPERATION.ACKNOWLEDGE_APPROVED, true, () => decodeReviewAcknowledgedV1(execution.body, request.binding ?? {}));
 	}
 
 	async captureCorrectionPlan(request                                          )                                    {

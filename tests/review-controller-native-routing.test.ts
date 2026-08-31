@@ -116,12 +116,58 @@ test("public acknowledgement relays one current provider vector and never replay
 	const completed = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId }, process.cwd(), native);
 	assert.deepEqual(completed, { operation: "acknowledge-approved", status: "closed", outcome: "native-approved-acknowledgement-completed", lineage_id: lineageId, target_identity: SHA, authority: "burned", delivery: "ordinary-repository-policy", mutation_performed: true, mutation_outcome: "committed" });
 	assert.deepEqual(requests, [{ cwd: process.cwd(), lineageId }]);
-	assert.deepEqual(acknowledgementRequests, [{ cwd: process.cwd(), argumentTokens: [`--cwd=${process.cwd()}`, `--lineage=${lineageId}`, `--target=${SHA}`, `--expected-revision=${SHA}`, "--token=provider-issued-once"] }]);
+	assert.deepEqual(acknowledgementRequests, [{ cwd: process.cwd(), argumentTokens: [`--cwd=${process.cwd()}`, `--lineage=${lineageId}`, `--target=${SHA}`, `--expected-revision=${SHA}`, "--token=provider-issued-once"], binding: { lineageId, targetIdentity: SHA, revision: SHA } }]);
 
 	const later = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId }, process.cwd(), native);
 	assert.equal(later.outcome, "native-approved-acknowledgement-not-current");
 	assert.equal(requests.length, 2);
 	assert.equal(acknowledgementRequests.length, 1);
+});
+
+test("public acknowledgement reports the burn from the review-acknowledged/v1 envelope when the provider prints one", async () => {
+	const lineageId = "acknowledge-approved-envelope";
+	let statusCalls = 0;
+	const acknowledgementRequests: Array<Record<string, unknown>> = [];
+	const native = {
+		targetStatus: async () => {
+			statusCalls += 1;
+			return statusCalls === 1 ? approvedAcknowledgementStatus(lineageId) : burnedAcknowledgementStatus(lineageId);
+		},
+		acknowledgeApproved: async (request: Record<string, unknown>) => {
+			acknowledgementRequests.push(request);
+			return {
+				schema: "gentle-ai.review-acknowledged/v1",
+				operation: "review/acknowledge-approved",
+				action: "acknowledged",
+				lineageId,
+				targetIdentity: SHA,
+				consumedRevision: SHA,
+				authority: "burned",
+				raw: { schema: "gentle-ai.review-acknowledged/v1" },
+			};
+		},
+	} as unknown as NativeReviewCli;
+
+	const completed = await __testing.executeReviewControllerOperation({ operation: "acknowledge-approved", lineageId }, process.cwd(), native);
+	assert.deepEqual(completed, {
+		operation: "acknowledge-approved",
+		status: "closed",
+		outcome: "native-approved-acknowledgement-completed",
+		lineage_id: lineageId,
+		target_identity: SHA,
+		consumed_revision: SHA,
+		authority: "burned",
+		burn_evidence: "gentle-ai.review-acknowledged/v1",
+		delivery: "ordinary-repository-policy",
+		mutation_performed: true,
+		mutation_outcome: "committed",
+	});
+	assert.equal(statusCalls, 1, "the burn is reported from the envelope, never from a later STATUS");
+	assert.deepEqual(acknowledgementRequests, [{
+		cwd: process.cwd(),
+		argumentTokens: [`--cwd=${process.cwd()}`, `--lineage=${lineageId}`, `--target=${SHA}`, `--expected-revision=${SHA}`, "--token=provider-issued-once"],
+		binding: { lineageId, targetIdentity: SHA, revision: SHA },
+	}]);
 });
 
 test("ambiguous acknowledgement reconciles STATUS once without replaying the provider vector", async () => {

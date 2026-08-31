@@ -128,6 +128,7 @@ import {
 	NATIVE_REVIEW_RECONCILE_ANOMALIES,
 	sanitizeForeignNativeReviewDiagnostics,
 	type NativeReviewCli,
+	type NativeReviewAcknowledgeApprovedOutcome,
 	type NativeReviewAcknowledgeApprovedRequest,
 	type NativeTargetStatusRequest,
 	type NativeReviewModeOperation,
@@ -2715,7 +2716,7 @@ interface ReviewControllerParameters {
 }
 
 type NativeReviewAcknowledgementCli = NativeReviewCli & {
-	acknowledgeApproved?: (request: NativeReviewAcknowledgeApprovedRequest) => Promise<void>;
+	acknowledgeApproved?: (request: NativeReviewAcknowledgeApprovedRequest) => Promise<NativeReviewAcknowledgeApprovedOutcome | void>;
 };
 
 interface ReviewControllerStartInput {
@@ -4782,9 +4783,15 @@ async function executeReviewControllerOperation(
 			return nativeOperationFailure(parameters.operation, error);
 		}
 		try {
-			await acknowledgementCli.acknowledgeApproved({
+			// gentle-ai #3947: the burn answers with one review-acknowledged/v1
+			// envelope bound to exactly this lineage, target, and revision, and
+			// the burn is reported from that envelope, never from a later
+			// STATUS. Every published release up to v2.5.0-rc.3 still burns in
+			// silence, and that result stays byte-identical.
+			const acknowledged = await acknowledgementCli.acknowledgeApproved({
 				argumentTokens,
 				cwd: defaultCwd,
+				binding: { lineageId: parameters.lineageId, targetIdentity: status.targetIdentity, revision: status.authority.revision },
 				...(signal === undefined ? {} : { signal }),
 			});
 			return {
@@ -4793,7 +4800,9 @@ async function executeReviewControllerOperation(
 				outcome: "native-approved-acknowledgement-completed",
 				lineage_id: parameters.lineageId,
 				target_identity: status.targetIdentity,
+				...(acknowledged === undefined ? {} : { consumed_revision: acknowledged.consumedRevision }),
 				authority: "burned",
+				...(acknowledged === undefined ? {} : { burn_evidence: acknowledged.schema }),
 				delivery: "ordinary-repository-policy",
 				mutation_performed: true,
 				mutation_outcome: "committed",
