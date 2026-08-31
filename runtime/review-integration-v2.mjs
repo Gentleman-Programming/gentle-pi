@@ -178,6 +178,12 @@ const CAPABILITIES_SCHEMA_IDENTITIES                                            
 		requiredMandatoryFeatures: REQUIRED_MANDATORY_FEATURES_V23,
 		optionalFeatureFloor: 14,
 	}),
+	"gentle-ai.review-integration.capabilities/v2.4": Object.freeze({
+		protocolMinor: 4,
+		requiredSchemas: Object.freeze([...REQUIRED_SCHEMAS_COMMON_V23, "gentle-ai.review-integration.capabilities/v2.4", "gentle-ai.review-integration.consent/v3", "gentle-ai.review-integration.start/v4", "gentle-ai.review-integration.status/v6", "gentle-ai.review-intended-untracked-selection/v1"]),
+		requiredMandatoryFeatures: REQUIRED_MANDATORY_FEATURES_V23,
+		optionalFeatureFloor: 14,
+	}),
 });
 const OPTIONAL_FEATURE_NAMES = Object.freeze([
 	"base_ref_workspace_overlay",
@@ -1341,7 +1347,29 @@ function decodeTransitionArguments(value         , label        )               
 	});
 }
 
-function decodeCaptureSubmission(value         , label        , v5         )                            {
+function decodeCaptureSubmission(value         , label        , v5         , v6         , captureOperation        )                            {
+	// status/v6 adds the provider-owned intended-untracked selection form.
+	if (v6 && captureOperation === "external.select_intended_untracked" && typeof value === "object" && value !== null && (value                           ).operation_token === "status") {
+		const submission = exactRecord(value, label, ["operation_token", "argument_tokens", "value"]);
+		const expectedTokens = [
+			"--contract=gentle-ai.review-integration/v2", "--next-transition=true", "--agent=pi",
+			"--projection=workspace", "--intended-untracked-selection={{value}}",
+		]         ;
+		const operationToken = enumeration(submission.operation_token, ["status"]         , `${label}.operation_token`);
+		const argumentTokens = stringArray(submission.argument_tokens, `${label}.argument_tokens`, { minimum: expectedTokens.length, maximum: expectedTokens.length });
+		if (argumentTokens.some((token, index) => token !== expectedTokens[index])) throw new TypeError(`${label}.argument_tokens substitution binding is invalid`);
+		const row = exactRecord(submission.value, `${label}.value`, ["slot", "domain", "schema", "substitution_location"]);
+		return {
+			operationToken,
+			argumentTokens,
+			values: [{
+				slot: enumeration(row.slot, ["intended_untracked_selection"]         , `${label}.value.slot`),
+				domain: enumeration(row.domain, ["schema_bound_json"]         , `${label}.value.domain`),
+				schema: enumeration(row.schema, ["gentle-ai.review-intended-untracked-selection/v1"]         , `${label}.value.schema`),
+				substitutionLocation: integer(row.substitution_location, `${label}.value.substitution_location`, 4, 4),
+			}],
+		};
+	}
 	// status/v5: the live 2.4.0-main binary emits the materialize
 	// capture-result submission as a SINGULAR `value` object carrying a
 	// `schema` key (captured 2026-08-16 from 2.4.0-main.b1afef46; the
@@ -1504,7 +1532,7 @@ const CORRECTION_REQUEST_REASON_CODES = Object.freeze(["correction_plan_required
 // v5 capture operations that must carry a submission descriptor.
 const V5_SUBMISSION_CAPTURE_OPERATIONS = Object.freeze(["review.capture-correction-plan"]         );
 
-function decodeCollectInput(value         , label        , v5         )                       {
+function decodeCollectInput(value         , label        , v5         , v6         )                       {
 	const input = exactRecord(value, label, ["name", "schema", "capture_operation", "arguments"], ["artifact_subject", "base_tree", "candidate_tree", "changed_path_manifest", "submission", ...(v5 ? ["provider_task", "validation_request"] : [])]);
 	const name = text(input.name, `${label}.name`, { minimum: 1, pattern: /^[a-z0-9_]+$/ });
 	const schema = nonempty(input.schema, `${label}.schema`);
@@ -1524,6 +1552,32 @@ function decodeCollectInput(value         , label        , v5         )         
 			if (input.submission === undefined) throw new TypeError(`${label}.submission is required for ${captureOperation}`);
 			if (captureOperation === "review.capture-correction-plan" && schema !== "gentle-ai.review-correction-plan/v1") throw new TypeError(`${label}.schema must be gentle-ai.review-correction-plan/v1`);
 		}
+	}
+
+	const intendedUntracked = v6
+		&& name === "intended_untracked_selection"
+		&& schema === "gentle-ai.review-intended-untracked-selection/v1"
+		&& captureOperation === "external.select_intended_untracked";
+	if (intendedUntracked) {
+		const expectedNames = ["target_identity", "projection", "base_tree", "candidate_tree", "eligible_paths_json", "expected_untracked_inventory"]         ;
+		if (argumentsList.length !== expectedNames.length || argumentsList.some((argument, index) => argument.name !== expectedNames[index] || argument.token !== undefined)) {
+			throw new TypeError(`${label}.arguments must preserve the exact intended-untracked metadata binding`);
+		}
+		sha256(argumentsList[0] .value, `${label}.arguments[0].value`);
+		enumeration(argumentsList[1] .value, ["workspace"]         , `${label}.arguments[1].value`);
+		gitTree(argumentsList[2] .value, `${label}.arguments[2].value`);
+		gitTree(argumentsList[3] .value, `${label}.arguments[3].value`);
+		const eligiblePathsJson = argumentsList[4] .value;
+		let eligiblePaths         ;
+		try { eligiblePaths = JSON.parse(eligiblePathsJson); } catch { throw new TypeError(`${label}.arguments[4].value must be canonical JSON`); }
+		if (!Array.isArray(eligiblePaths) || eligiblePaths.length === 0 || eligiblePaths.some((path) => {
+			if (typeof path !== "string" || path.length === 0 || path.startsWith("/") || /^[A-Za-z]:\//.test(path) || path.includes("\\") || path.includes("\0")) return true;
+			const segments = path.split("/");
+			return segments.some((segment) => segment === "" || segment === "." || segment === "..");
+		}) || new Set(eligiblePaths).size !== eligiblePaths.length || JSON.stringify(eligiblePaths) !== eligiblePathsJson) {
+			throw new TypeError(`${label}.arguments[4].value must contain unique canonical repository-relative paths`);
+		}
+		sha256(argumentsList[5] .value, `${label}.arguments[5].value`);
 	}
 
 	// gentle-pi#311 P4-roles: the two Go-owned non-lens provider role capture
@@ -1575,16 +1629,17 @@ function decodeCollectInput(value         , label        , v5         )         
 	} else if (input.artifact_subject !== undefined || input.base_tree !== undefined || input.candidate_tree !== undefined || input.changed_path_manifest !== undefined) {
 		throw new TypeError(`${label} carries capture-result fields without review.capture-result`);
 	}
-	const submissionOperations                    = v5 ? ["review.capture-result", "review.capture-correction-plan"] : ["review.capture-result"];
+	const submissionOperations                    = v5
+		? ["review.capture-result", "review.capture-correction-plan", ...(v6 ? ["external.select_intended_untracked"] : [])]
+		: ["review.capture-result"];
 	if (input.submission !== undefined && !submissionOperations.includes(captureOperation)) {
 		throw new TypeError(v5 ? `${label}.submission is only valid for ${submissionOperations.join(", ")}` : `${label}.submission is only valid for review.capture-result`);
 	}
+	if (intendedUntracked && input.submission === undefined) throw new TypeError(`${label}.submission is required for external.select_intended_untracked`);
 
-	// The v5 descriptor forms are discriminated by their closed operation
-	// tokens; every other submission stays the host-relay completing form.
 	const submission = input.submission === undefined
 		? undefined
-		: decodeCaptureSubmission(input.submission, `${label}.submission`, v5);
+		: decodeCaptureSubmission(input.submission, `${label}.submission`, v5, v6, captureOperation);
 
 	return {
 		name,
@@ -1601,8 +1656,9 @@ function decodeCollectInput(value         , label        , v5         )         
 	};
 }
 
-export function decodeReviewNextTransitionV3(value         , options                   = {})                         {
-	const v5 = options.v5 === true;
+export function decodeReviewNextTransitionV3(value         , options                                 = {})                         {
+	const v6 = options.v6 === true;
+	const v5 = options.v5 === true || v6;
 	const transition = exactRecord(value, "next_transition", ["kind", "reason_code"], ["execute", "collect", ...(v5 ? ["correction_request"] : [])]);
 	const kind = enumeration(transition.kind, ["execute", "collect", "stop"]         , "next_transition.kind");
 	const reasonCode = text(transition.reason_code, "next_transition.reason_code", { minimum: 1, pattern: /^[a-z0-9_]+$/ });
@@ -1650,7 +1706,7 @@ export function decodeReviewNextTransitionV3(value         , options            
 	}
 	if (kind === "collect") {
 		const collect = exactRecord(transition.collect, "next_transition.collect", ["inputs"]);
-		const inputs = array(collect.inputs, "next_transition.collect.inputs", (entry, label) => decodeCollectInput(entry, label, v5), { minimum: 1 });
+		const inputs = array(collect.inputs, "next_transition.collect.inputs", (entry, label) => decodeCollectInput(entry, label, v5, v6), { minimum: 1 });
 		if (transition.execute !== undefined) throw new TypeError("next_transition.execute is incompatible with collect");
 		return { kind, reasonCode, collect: { inputs }, ...(correctionRequest === undefined ? {} : { correctionRequest }) };
 	}
@@ -1703,12 +1759,15 @@ export function decodeReviewStatusV3(value         )                 {
 	// Additive forward acceptance: status/v5 (gentle-ai main; ground-truthed
 	// against a live capture and the vendored status-v5.schema.json) is the v3
 	// key set plus the optional forecast and the v5-only next_transition
-	// surfaces. The v3 identity keeps rejecting every v5-only field.
-	const v5 = typeof value === "object" && value !== null && (value                           ).schema === "gentle-ai.review-integration.status/v5";
+	// surfaces. status/v6 adds the intended-untracked selection; v3 keeps
+	// rejecting every v5/v6-only field.
+	const schema = typeof value === "object" && value !== null ? (value                           ).schema : undefined;
+	const v6 = schema === "gentle-ai.review-integration.status/v6";
+	const v5 = v6 || schema === "gentle-ai.review-integration.status/v5";
 	const body = exactRecord(value, "status", [
 		"schema", "contract", "operation", "applicability", "action", "replayability", "target_identity", "projection", "repair", "candidates",
 	], ["authority", "frozen", "action_disposition", "eligibility", "next_transition", "authority_target_identity", ...(v5 ? ["receipt", "forecast", "repository_context", "validation_request"] : [])]);
-	requireIdentity(body, v5 ? "gentle-ai.review-integration.status/v5" : "gentle-ai.review-integration.status/v3", REVIEW_INTEGRATION_OPERATION.STATUS);
+	requireIdentity(body, v6 ? "gentle-ai.review-integration.status/v6" : v5 ? "gentle-ai.review-integration.status/v5" : "gentle-ai.review-integration.status/v3", REVIEW_INTEGRATION_OPERATION.STATUS);
 
 	const applicability = enumeration(body.applicability, ["current_target", "unrelated", "ambiguous", "corrupted"]         , "status.applicability");
 	let receipt                                   ;
@@ -1755,7 +1814,7 @@ export function decodeReviewStatusV3(value         )                 {
 	if (action === "recover" && actionDisposition === undefined) throw new TypeError("recover status requires action_disposition");
 	if (action !== "recover" && actionDisposition !== undefined) throw new TypeError("status.action_disposition is only valid for the recover action");
 	if (body.eligibility !== undefined) decodeEligibility(body.eligibility, "status.eligibility");
-	const nextTransition = body.next_transition === undefined ? undefined : decodeReviewNextTransitionV3(body.next_transition, { v5 });
+	const nextTransition = body.next_transition === undefined ? undefined : decodeReviewNextTransitionV3(body.next_transition, { v5, v6 });
 	const validationRequest = v5 && body.validation_request !== undefined
 		? decodeReviewTargetedValidationRequestV1(body.validation_request, "status.validation_request")
 		: undefined;
