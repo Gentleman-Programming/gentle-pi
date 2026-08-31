@@ -63,6 +63,10 @@ interface OpaquePiLog {
 }
 
 function harness(t: test.TestContext, overrides: Record<string, string> = {}): OpaqueHarness {
+	// The fake pi is a shebang node script; Windows cannot spawn script files
+	// without a native executable, so these subprocess transport tests run on
+	// POSIX only. (The production adapter spawns real binaries on Windows.)
+	if (process.platform === "win32") return t.skip("windows: script-file subprocess fixtures need a native executable") as unknown as OpaqueHarness;
 	const directory = mkdtempSync(join(tmpdir(), "gentle-pi-opaque-reviewer-"));
 	t.after(() => rmSync(directory, { recursive: true, force: true }));
 	const pi = join(directory, "pi");

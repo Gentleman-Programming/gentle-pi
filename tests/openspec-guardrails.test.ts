@@ -22,7 +22,7 @@ test("detectActiveDomainCollisions finds other active changes touching the same 
 	const collisions = detectActiveDomainCollisions(cwd, "current", "sdd-openspec");
 
 	assert.deepEqual(collisions.map((collision) => collision.change), ["other"]);
-	assert.match(collisions[0].path, /openspec\/changes\/other\/specs\/sdd-openspec\/spec\.md$/);
+	assert.match(collisions[0].path, /openspec(?:[\\/]+)changes(?:[\\/]+)other(?:[\\/]+)specs(?:[\\/]+)sdd-openspec(?:[\\/]+)spec\.md$/);
 });
 
 test("detectLegacyFlatSpec warns when a flat change spec exists without domain specs", async () => {

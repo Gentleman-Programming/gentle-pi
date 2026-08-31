@@ -5,9 +5,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { readReviewConsentLatch, recordReviewConsentLatch, REVIEW_CONSENT_LATCH_SCHEMA } from "../lib/review-consent-latch.ts";
+import { sandboxGitEnv, scrubInheritedGitEnvironment } from "./support/env.ts";
+
+// The production review authority fails closed on inherited GIT_CONFIG_* keys
+// (e.g. an agent harness exporting GIT_CONFIG_COUNT with credential scoped
+// config). Scrub the ambient env for this file's process so the authority's
+// guard sees a clean environment regardless of the developer machine.
+scrubInheritedGitEnvironment();
 
 function git(cwd: string, ...args: string[]): string {
-	return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+	return execFileSync("git", args, { cwd, encoding: "utf8", env: sandboxGitEnv() }).trim();
 }
 
 function repository(t: test.TestContext): string {

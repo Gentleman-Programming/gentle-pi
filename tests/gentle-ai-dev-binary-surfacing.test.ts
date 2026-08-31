@@ -13,6 +13,10 @@ import {
 	setGentleAiDevBinaryEnvironmentForTesting,
 } from "../lib/gentle-ai-binary.ts";
 
+// On Windows an sh-script override cannot be spawned (no native executable),
+// so the banner reports "version unavailable" instead of the echoed version.
+const DEV_BINARY_VERSION_TOKEN = process.platform === "win32" ? "version unavailable" : "9.9.9-dev+surface";
+
 // Loud surfacing for the dev-binary override: while an override is active,
 // every diagnostic surface must say so, name the exact binary, its live
 // version, and its content digest — the maintainer must never wonder which
@@ -69,7 +73,7 @@ test("gentle:doctor and gentle:status surface the active dev-binary override lou
 			const { pi, commands } = harness();
 			createGentleAiExtension({ nativeReviewCli: null })(pi);
 			const cwd = await mkdtemp(join(tmpdir(), "gentle-pi-dev-cwd-"));
-			const expected = `Gentle AI dev binary override active (unpinned, field-test only): ${devBinary} 9.9.9-dev+surface sha256:${sha256.slice(0, 16)}`;
+			const expected = `Gentle AI dev binary override active (unpinned, field-test only): ${devBinary} ${DEV_BINARY_VERSION_TOKEN} sha256:${sha256.slice(0, 16)}`;
 			for (const command of ["gentle:doctor", "gentle:status"]) {
 				const notifications: Array<{ message: string; severity: string }> = [];
 				await commands.get(command)!.handler("", contextFor(cwd, notifications));
@@ -183,7 +187,7 @@ test("session start announces the active override once, loudly", async () => {
 			const cwd = await mkdtemp(join(tmpdir(), "gentle-pi-dev-cwd-"));
 			const notifications: Array<{ message: string; severity: string }> = [];
 			await sessionStart!({}, contextFor(cwd, notifications));
-			const expected = `Gentle AI dev binary override active (unpinned, field-test only): ${devBinary} 9.9.9-dev+surface sha256:${sha256.slice(0, 16)}`;
+			const expected = `Gentle AI dev binary override active (unpinned, field-test only): ${devBinary} ${DEV_BINARY_VERSION_TOKEN} sha256:${sha256.slice(0, 16)}`;
 			const announcement = notifications.find((entry) => entry.message.includes(expected));
 			assert.ok(announcement, JSON.stringify(notifications));
 			assert.equal(announcement!.severity, "warning");

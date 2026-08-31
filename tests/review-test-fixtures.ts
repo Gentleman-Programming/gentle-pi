@@ -8,6 +8,14 @@ import {
 } from "../lib/review-snapshot.ts";
 import { existsSync, renameSync } from "node:fs";
 import type { ReviewLockPlatformAdapterV1 } from "../lib/review-lock.ts";
+import { scrubInheritedGitEnvironment } from "./support/env.ts";
+
+// Review-authority tests run production git guards that read the ambient
+// process env at call time and fail closed on inherited GIT_CONFIG_* keys
+// (agent harnesses commonly export scoped credential config). Scrub once at
+// module load: node:test isolates each file in its own process, so this is
+// file-scoped and cannot contaminate sibling test files.
+scrubInheritedGitEnvironment();
 import {
 	REVIEW_EVENT,
 	REVIEW_LENS,

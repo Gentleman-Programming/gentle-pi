@@ -434,6 +434,12 @@ test("workspaceRoot fails closed before any native call for invalid target paths
 	const sessionCwd = repository(t);
 	const worktree = addWorktree(t, sessionCwd, "feat-guard");
 	const nonGit = mkdtempSync(join(tmpdir(), "gentle-pi-non-git-"));
+	// git walks UP from a directory to find a repository; on machines where a
+	// parent of tmpdir is inside a git worktree (e.g. a dotfiles repo in the
+	// user profile), a bare mkdtemp under tmpdir resolves to that parent repo
+	// and is NOT fail-closed. A .git gitdir-barrier marks the directory as an
+	// unresolvable worktree on every platform, keeping the fixture deterministic.
+	writeFileSync(join(nonGit, ".git"), "gitdir: /gentle-pi/test-barrier\n");
 	t.after(() => rmSync(nonGit, { recursive: true, force: true }));
 	const filePath = join(worktree, "app.ts");
 	let nativeCalls = 0;

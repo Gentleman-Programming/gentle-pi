@@ -18,7 +18,7 @@ import {
 	type GentleAiDevBinaryEnvironment,
 } from "../lib/gentle-ai-binary.ts";
 
-const PLATFORM = "linux";
+const PLATFORM = process.platform;
 
 async function scratch(prefix: string): Promise<string> {
 	return await mkdtemp(join(tmpdir(), prefix));
@@ -99,7 +99,12 @@ test("invalid override sources fail closed instead of silently falling back to t
 	writeFileSync(nonExecutable, "#!/bin/sh\n");
 	chmodSync(nonExecutable, 0o644);
 
-	for (const value of ["relative/gentle-ai", symlinked, nonExecutable, join(bin, "missing-gentle-ai")]) {
+	const invalidValues: string[] = ["relative/gentle-ai", symlinked, join(bin, "missing-gentle-ai")];
+	// The 0o644 no-executable case only exists where POSIX mode bits are
+	// representable; Windows has no executable-bit concept for this check.
+	if (process.platform !== "win32") invalidValues.push(nonExecutable);
+
+	for (const value of invalidValues) {
 		const env = environment(home, { [GENTLE_AI_DEV_BINARY_ENV]: value });
 		assert.throws(() => resolveGentleAiDevBinaryOverride(env, PLATFORM), isOverrideError(GENTLE_AI_DEV_BINARY_ENV), value);
 		assert.throws(() => resolveGentleAiBinary(packageRoot, PLATFORM, readFileSync, env), isOverrideError(GENTLE_AI_DEV_BINARY_ENV), value);

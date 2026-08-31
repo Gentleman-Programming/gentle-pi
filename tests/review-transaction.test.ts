@@ -491,6 +491,7 @@ test("tag PUSH CREATE accepts an annotated tag for an approved commit advertised
 	);
 	assert.equal(unresolved.status, GATE_RESULT.DENY, unresolved.reason);
 
+	if (process.platform !== "win32") {
 	const fakeGitDirectory = join(parent, "fake-git");
 	mkdirSync(fakeGitDirectory);
 	const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
@@ -508,6 +509,7 @@ test("tag PUSH CREATE accepts an annotated tag for an approved commit advertised
 		assert.match(ambiguous.reason, /ambiguously/i);
 	} finally {
 		process.env.PATH = originalPath;
+	}
 	}
 
 	writeFileSync(join(repository, "release.ts"), "export const release = 2;\n");
