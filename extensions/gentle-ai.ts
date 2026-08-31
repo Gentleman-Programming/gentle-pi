@@ -4328,15 +4328,27 @@ function hostTransportUnavailable(
 	operation: ReviewControllerOperation | "gentle_review_capture",
 	transport: ReviewTransportRefusal,
 ): Record<string, unknown> {
+	// #535: a provider-printed raw `gentle-ai review ...` continuation is a dead
+	// end in this runtime — Pi is not in the provider's immutable review runtime
+	// list, so every CLI-only exit refuses with this same transport code. The
+	// refusal therefore names the continuation that runs in this surface (the
+	// gentle_review / gentle_review_capture wrapper tools) while the provider's
+	// own diagnostic stays intact in relay_transport as evidence.
+	const isCapture = operation === "gentle_review_capture";
 	return {
-		...(operation === "gentle_review_capture" ? { tool: operation } : { operation }),
+		...(isCapture ? { tool: operation } : { operation }),
 		status: "blocked",
 		outcome: "pi-host-relay-transport-unavailable",
 		reason: `The native provider refused the required pi reviewer transport (${transport.code}): ${transport.message}`,
 		relay_transport: transport,
 		mutation_performed: false,
 		mutation_outcome: "none",
-		next_action: "Install a native gentle-ai provider that supports `review status --agent pi`, then call fresh STATUS and submit its exact one-slot capture binding. Pi never falls back to an agent-less lifecycle route.",
+		wrapper_continuation: {
+			tool: "gentle_review",
+			operation: REVIEW_CONTROLLER_OPERATION.INSPECT,
+			...(isCapture ? { then: "gentle_review_capture" } : {}),
+		},
+		next_action: `Install a native gentle-ai provider that supports \`review status --agent pi\`, then re-enter negotiated STATUS with gentle_review {"operation":"inspect"}${isCapture ? " and resubmit gentle_review_capture with the exact one-slot collectBinding that fresh STATUS returns" : " and follow the transition it returns"}. A provider-printed raw CLI continuation does not run in this runtime, and Pi never falls back to an agent-less lifecycle route.`,
 	};
 }
 
