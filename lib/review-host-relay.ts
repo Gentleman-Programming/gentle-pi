@@ -85,9 +85,12 @@ export class ReviewHostRelayError extends Error {
 	readonly timeoutMs: number | null;
 	// "none" until the submission invocation launches; a launched submission
 	// whose outcome could not be read is "unknown" and the caller reconciles
-	// through negotiated STATUS, never through a blind retry.
+	// through negotiated STATUS, never through a blind retry. A launched
+	// submission that gentle-ai refused with its typed admission refusal is
+	// "none" again: the provider states that the lens slot was not consumed
+	// (gentle-pi#522 / #524).
 	readonly mutationOutcome: "none" | "unknown";
-	constructor(kind: ReviewHostRelayFailureKind, stage: ReviewHostRelayStage, message: string, details?: { exitCode?: number | null; stderr?: string; timedOut?: boolean; elapsedMs?: number; timeoutMs?: number }) {
+	constructor(kind: ReviewHostRelayFailureKind, stage: ReviewHostRelayStage, message: string, details?: { exitCode?: number | null; stderr?: string; timedOut?: boolean; elapsedMs?: number; timeoutMs?: number; mutationOutcome?: "none" | "unknown" }) {
 		super(message);
 		this.name = "ReviewHostRelayError";
 		this.kind = kind;
@@ -97,8 +100,19 @@ export class ReviewHostRelayError extends Error {
 		this.timedOut = details?.timedOut ?? false;
 		this.elapsedMs = details?.elapsedMs ?? null;
 		this.timeoutMs = details?.timeoutMs ?? null;
-		this.mutationOutcome = stage === "submit" ? "unknown" : "none";
+		this.mutationOutcome = details?.mutationOutcome ?? (stage === "submit" ? "unknown" : "none");
 	}
+}
+
+// gentle-pi#522 / #524: gentle-ai refuses a reviewer submission before any
+// admission with exit 1 and its typed operator line, `<reason> [invalid_request]`.
+// That code is the provider's preflight class: the request was refused as
+// sent and the lens slot was not consumed. The relay recognises only that
+// typed shape; it never parses the reason, and it never retries.
+const ADMISSION_REFUSAL = /\[invalid_request\]/;
+
+export function isReviewHostRelayAdmissionRefusal(capture: { exitCode: number | null; timedOut: boolean }, stderr: string): boolean {
+	return capture.exitCode === 1 && !capture.timedOut && ADMISSION_REFUSAL.test(stderr);
 }
 
 // Refusal classification for the materialize invocation. The installed
@@ -528,7 +542,17 @@ export async function runReviewHostRelaySlot(request: ReviewHostRelayRequest): P
 			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", `gentle-ai capture submission could not start: ${error instanceof Error ? error.message : String(error)}`);
 		}
 		if (submission.exitCode !== 0 || submission.timedOut || submission.stdout.length === 0) {
-			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", "gentle-ai refused the relayed capture submission", { exitCode: submission.exitCode, stderr: submission.stderr.toString("utf8"), timedOut: submission.timedOut, elapsedMs: submission.elapsedMs, timeoutMs: gentleAiTimeoutMs });
+			const stderr = submission.stderr.toString("utf8");
+			const details = { exitCode: submission.exitCode, stderr, timedOut: submission.timedOut, elapsedMs: submission.elapsedMs, timeoutMs: gentleAiTimeoutMs };
+			// A typed admission refusal is a proven non-mutation whose reason is
+			// the refusal text itself; everything else that launched (timeout,
+			// signal, untyped exit) stays unknown pending STATUS.
+			if (isReviewHostRelayAdmissionRefusal(submission, stderr)) {
+				throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", stderr.trim(), { ...details, mutationOutcome: "none" });
+			}
+			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", submission.timedOut
+				? `gentle-ai capture submission exceeded its ${gentleAiTimeoutMs}ms bound after ${submission.elapsedMs}ms`
+				: "gentle-ai refused the relayed capture submission", details);
 		}
 		return {
 			promptByteLength: promptBytes.length,

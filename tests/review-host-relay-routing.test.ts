@@ -219,6 +219,52 @@ test("a transport failure stops the selected capture without auto-follow", async
 	assert.equal(harness.statusCalls.length, 1, "no automatic relaunch after transport failure");
 });
 
+// gentle-pi#522 / #524: a submission Go refused at admission is a proven
+// non-mutation. The model must see the refusal text, mutation_outcome none,
+// and a continuation for the reoffered slot, never an unknown outcome that the
+// contract forbids replaying.
+test("an admission refusal reaches the model as a proven non-mutation carrying the refusal and a continuation", async (t) => {
+	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
+	const cwd = repository(t);
+	const lineageId = "relay-lineage";
+	const harness = nativeHarness([finalizeStatus(lineageId, [relayCollectInput(lineageId, "review-risk", 0)])]);
+	const refusal = "Error: reviewer artifact admission binding_mismatch: reviewer result echoed a different artifact subject: the rejected admission did not consume the lens slot, so re-run the lens and invoke gentle-ai review capture-result again on the same lineage with a result that echoes the binding's top-level subject_hash [invalid_request]\n";
+	__testing.setReviewHostRelayRunnerForTesting(async () => {
+		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", refusal.trim(), { exitCode: 1, stderr: refusal, elapsedMs: 40, timeoutMs: 120_000, mutationOutcome: "none" });
+	});
+
+	const result = await runCapture(cwd, harness, lineageId);
+
+	assert.equal(result.status, "blocked");
+	assert.equal(result.outcome, "pi-host-relay-transport-failure");
+	assert.deepEqual(result.failure, { kind: "submission-refused", stage: "submit", exit_code: 1, timed_out: false, elapsed_ms: 40, timeout_ms: 120_000, stderr: refusal });
+	assert.equal(result.reason, refusal.trim());
+	assert.equal(result.mutation_performed, false);
+	assert.equal(result.mutation_outcome, "none");
+	assert.match(String(result.next_action), /did not consume the lens slot/);
+	assert.match(String(result.next_action), /fresh STATUS/);
+	assert.equal(harness.statusCalls.length, 1, "a proven non-mutation needs no STATUS reconciliation and no relaunch");
+});
+
+test("a submission whose outcome is genuinely indeterminate still reconciles through STATUS and carries its evidence", async (t) => {
+	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
+	const cwd = repository(t);
+	const lineageId = "relay-lineage";
+	const pending = finalizeStatus(lineageId, [relayCollectInput(lineageId, "review-risk", 0)]);
+	const harness = nativeHarness([pending, pending]);
+	__testing.setReviewHostRelayRunnerForTesting(async () => {
+		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", "gentle-ai capture submission exceeded its 120000ms bound after 120004ms", { exitCode: null, stderr: "", timedOut: true, elapsedMs: 120_004, timeoutMs: 120_000 });
+	});
+
+	const result = await runCapture(cwd, harness, lineageId);
+
+	assert.equal(result.status, "reconciled");
+	assert.equal(result.outcome, "native-capture-outcome-unknown");
+	assert.deepEqual(result.failure, { kind: "submission-refused", stage: "submit", exit_code: null, timed_out: true, elapsed_ms: 120_004, timeout_ms: 120_000 });
+	assert.match(String(result.reason), /exceeded its 120000ms bound/);
+	assert.equal(harness.statusCalls.length, 2, "an indeterminate submission reconciles exactly once through STATUS");
+});
+
 test("a relay timeout reports its one-slot measurements and no auto-follow", async (t) => {
 	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
 	const cwd = repository(t);

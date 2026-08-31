@@ -327,6 +327,24 @@ async function answerConsent(runtime: ParityRuntime, cwd: string, binding: unkno
 	return await executeController(runtime, { operation: "answer-consent", input: JSON.stringify({ consentBinding: binding, answer }) }, cwd, sessionId);
 }
 
+// gentle-pi#516: an unknown or expired binding is a typed, blocked outcome
+// that names itself and its exit. It still carries the current negotiated
+// STATUS as reconciliation context, but it never reads as a healthy
+// pre-start "ready".
+function assertStaleConsentBinding(outcome: Record<string, unknown>, binding: unknown, code: "consent-binding-unknown" | "consent-binding-expired"): void {
+	assert.equal(outcome.status, "blocked");
+	assert.equal(outcome.outcome, "consent-binding-stale");
+	assert.equal(outcome.consent_binding, binding);
+	assert.equal((outcome.diagnostics as { code?: unknown } | undefined)?.code, code);
+	assert.match(String((outcome.diagnostics as { message?: unknown } | undefined)?.message), /START again/);
+	assert.equal(outcome.native_invocation_attempted, false);
+	assert.equal(outcome.lineage_created, false);
+	assert.equal(outcome.mutation_performed, false);
+	assert.equal(outcome.mutation_outcome, "none");
+	assert.equal(outcome.provider_action, "start");
+	assert.equal(outcome.next_action, "restart-for-fresh-consent");
+}
+
 test("review-mode gate retains every off-source continuation and fails closed on native errors", async () => {
 	for (const [source, expected] of [
 		["clone_local", /clear this clone-local override/],
@@ -397,7 +415,9 @@ test("public consent relay is session-bound, one-shot, and candidate-scoped", as
 	assert.deepEqual(blockedA.consent, decodeReviewConsentV3(captured("consent-v3.captured.json")).raw);
 	const staleOtherSession = await answerConsent(second, cwd, blockedA.consent_binding, "declined", "session-b");
 	assert.equal(staleOtherSession.operation, "answer-consent");
-	assert.equal(staleOtherSession.status, "ready");
+	// gentle-pi#516: a binding this session does not hold must never read as
+	// a healthy pre-start STATUS; it names itself and the exit.
+	assertStaleConsentBinding(staleOtherSession, blockedA.consent_binding, "consent-binding-unknown");
 	assert.deepEqual(fixture.answers, ["declined"]);
 	const blockedB = await beginConsent(second, cwd, "session-b");
 	const declined = await answerConsent(second, cwd, blockedB.consent_binding, "declined", "session-b");
@@ -405,7 +425,7 @@ test("public consent relay is session-bound, one-shot, and candidate-scoped", as
 	assert.equal(declined.lineage_created, false);
 	const staleConsumed = await answerConsent(second, cwd, blockedB.consent_binding, "declined", "session-b");
 	assert.equal(staleConsumed.operation, "answer-consent");
-	assert.equal(staleConsumed.status, "ready");
+	assertStaleConsentBinding(staleConsumed, blockedB.consent_binding, "consent-binding-unknown");
 	assert.deepEqual(fixture.answers, ["declined", "declined"]);
 
 	const shutdown = first.events.get("session_shutdown");
@@ -414,7 +434,7 @@ test("public consent relay is session-bound, one-shot, and candidate-scoped", as
 	await shutdown!({}, context(cwd, "session-a"));
 	const staleShutdown = await answerConsent(first, cwd, blockedA.consent_binding, "declined", "session-a");
 	assert.equal(staleShutdown.operation, "answer-consent");
-	assert.equal(staleShutdown.status, "ready");
+	assertStaleConsentBinding(staleShutdown, blockedA.consent_binding, "consent-binding-unknown");
 
 	writeFileSync(join(cwd, "app.ts"), "export const value = 3;\n");
 	const nextCandidate = await beginConsent(second, cwd, "session-b");
@@ -429,7 +449,7 @@ test("public consent relay is session-bound, one-shot, and candidate-scoped", as
 	await disable!.handler("disable", context(cwd, "session-b"));
 	const staleModeCleared = await answerConsent(second, cwd, nextCandidate.consent_binding, "declined", "session-b");
 	assert.equal(staleModeCleared.operation, "answer-consent");
-	assert.equal(staleModeCleared.status, "ready");
+	assertStaleConsentBinding(staleModeCleared, nextCandidate.consent_binding, "consent-binding-unknown");
 	assert.equal(fixture.starts.count, 4);
 });
 
@@ -456,7 +476,7 @@ test("stale local consent bindings reconcile exactly once with the native status
 
 	const reconciled = await answerConsent(runtime, cwd, blocked.consent_binding, "declined");
 	assert.equal(reconciled.operation, "answer-consent");
-	assert.equal(reconciled.status, "ready");
+	assertStaleConsentBinding(reconciled, blocked.consent_binding, "consent-binding-unknown");
 	assert.deepEqual(reconciled.result, reconciledStatus.raw);
 	assert.deepEqual((reconciled.result as { next_transition?: unknown }).next_transition, nextTransition);
 	assert.equal(statusRequests.length, 2, "the stale binding performs one reconciliation after the initial START status");
@@ -506,7 +526,7 @@ test("launched answer-consent failures remain blocked after fresh-target STATUS 
 	assert.equal(answerCalls, 1, "reconciliation must not replay answer-consent");
 
 	const stale = await answerConsent(runtime, cwd, blocked.consent_binding, "granted");
-	assert.equal(stale.status, "ready");
+	assertStaleConsentBinding(stale, blocked.consent_binding, "consent-binding-unknown");
 	assert.equal(statusRequests.length, 3, "a later stale binding performs one current STATUS read");
 	assert.equal(answerCalls, 1, "the stale binding must not replay answer-consent");
 });
@@ -616,7 +636,7 @@ test("unavailable and ambiguous consent follow-ups never replay a consumed bindi
 	const callsBeforeStaleReconciliation = statusCalls;
 	const stale = await answerConsent(ambiguousRuntime, cwd, ambiguous.consent_binding, "granted");
 	assert.equal(stale.operation, "answer-consent");
-	assert.equal(stale.status, "ready");
+	assertStaleConsentBinding(stale, ambiguous.consent_binding, "consent-binding-unknown");
 	assert.equal(statusCalls, callsBeforeStaleReconciliation + 1, "stale binding reconciliation performs exactly one additional STATUS call");
 });
 
@@ -637,12 +657,17 @@ test("pending public consent expiry is synchronous and a fresh registry never re
 	assert.equal(reused.consent_binding, first.consent_binding);
 	assert.equal(scheduled.length, 1);
 	now += 10 * 60 * 1000;
+	// gentle-pi#516: a slow human answer must learn that its binding expired
+	// and that START issues a fresh envelope, not a healthy "ready".
+	const expired = await answerConsent(runtime, cwd, first.consent_binding, "declined");
+	assert.equal(expired.operation, "answer-consent");
+	assertStaleConsentBinding(expired, first.consent_binding, "consent-binding-expired");
+	assert.match(String((expired.diagnostics as { message?: unknown }).message), /expired after 10 minutes/);
 	const second = await beginConsent(runtime, cwd);
 	assert.notEqual(second.consent_binding, first.consent_binding);
 	assert.equal(scheduled.length, 2);
-	const expired = await answerConsent(runtime, cwd, first.consent_binding, "declined");
-	assert.equal(expired.operation, "answer-consent");
-	assert.equal(expired.status, "ready");
+	// Once START has pruned it, the same binding is simply unknown here.
+	assertStaleConsentBinding(await answerConsent(runtime, cwd, first.consent_binding, "declined"), first.consent_binding, "consent-binding-unknown");
 
 	const reloaded = parityRuntime(fixture.native, { pendingReviewConsentRegistry: new PendingReviewConsentRegistry() });
 	const afterReload = await beginConsent(reloaded, cwd);

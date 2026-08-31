@@ -62,6 +62,22 @@ if (inputToken !== undefined) {
 		process.exit(0);
 	}
 	if (mode === "refuse-cleanup-fail") fs.chmodSync(path.dirname(path.dirname(inputPath)), 0o500);
+	if (mode === "admit") {
+		// Go's admission refusal shape: a schema-bounded failure/v2 envelope on
+		// stdout, the operator line with the typed code suffix on stderr, exit 1.
+		const bytes = fs.readFileSync(inputPath);
+		let parsed;
+		try { parsed = JSON.parse(bytes.toString("utf8")); } catch { parsed = undefined; }
+		const refuse = (cause) => {
+			process.stdout.write(JSON.stringify({ schema: "gentle-ai.review-integration.failure/v2", contract: "gentle-ai.review-integration/v2", operation: "review.capture-result", phase: "preflight", code: "invalid_request", message: "The negotiated review request is invalid.", mutation_outcome: "not_started", authority_applicability: "not_evaluated", retry_safe: true, replayability: "not_replayable", required_inputs: [], next_action: "correct_request", cause }));
+			process.stderr.write("Error: " + cause + " [invalid_request]\\n");
+			process.exit(1);
+		};
+		if (parsed === undefined || typeof parsed !== "object") refuse("lens provider result admission incomplete: reviewer payload contains no complete JSON object: no object start was found in " + bytes.length + " bytes; the rejected reviewer payload was preserved at " + inputPath + ".rejected");
+		if (parsed.subject_hash !== process.env.RELAY_FAKE_EXPECTED_SUBJECT) refuse("reviewer artifact admission binding_mismatch: reviewer result echoed a different artifact subject: the rejected admission did not consume the lens slot, so re-run the lens and invoke gentle-ai review capture-result again on the same lineage with a result that echoes the binding's top-level subject_hash, which is " + process.env.RELAY_FAKE_EXPECTED_SUBJECT);
+		process.stdout.write(JSON.stringify({ schema: "gentle-ai.review-result-artifact/v2", admission_decision: "completed" }));
+		process.exit(0);
+	}
 	process.stderr.write("capture binding does not match the current reviewing authority\\n");
 	process.exit(1);
 }
@@ -436,6 +452,59 @@ test("submission refusal is a typed error whose outcome is unknown pending STATU
 	assert.equal(error.mutationOutcome, "unknown");
 	assert.match(error.stderr, /capture binding does not match/);
 	assert.equal(readLog(fixture.logPath).length, 2);
+});
+
+// gentle-pi#522 / #524: Go refuses a reviewer submission at admission with a
+// typed [invalid_request] refusal and states that the lens slot was not
+// consumed. That is a proven non-mutation, not an unknown outcome, and the
+// refusal text is the only thing that tells the host what to change.
+function admittingRequest(fixture: RelayHarness, reviewerOutput: Buffer) {
+	return relayRequest(fixture, {
+		environment: {
+			...fixture.environment,
+			RELAY_FAKE_PROMPT_B64: PROMPT_BYTES.toString("base64"),
+			RELAY_FAKE_PI_OUTPUT_B64: reviewerOutput.toString("base64"),
+		},
+	});
+}
+
+test("a reviewer printing garbage is refused at admission as a proven non-mutation carrying Go's refusal", async (t) => {
+	const fixture = harness(t, { RELAY_FAKE_SUBMIT_MODE: "admit", RELAY_FAKE_EXPECTED_SUBJECT: `sha256:${"a".repeat(64)}` });
+	const error = await rejectsWithRelayError(
+		runReviewHostRelaySlot(admittingRequest(fixture, Buffer.from("not json at all", "utf8"))),
+		REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED,
+		"submit",
+	);
+	assert.equal(error.mutationOutcome, "none");
+	assert.equal(error.exitCode, 1);
+	assert.equal(error.timedOut, false);
+	assert.match(error.stderr, /reviewer payload contains no complete JSON object/);
+	assert.match(error.stderr, /\[invalid_request\]/);
+	assert.match(error.message, /reviewer payload contains no complete JSON object/);
+	assert.equal(readLog(fixture.logPath).length, 2, "the refusal must not be retried by the relay");
+});
+
+test("a reviewer echoing a different subject is refused at admission as a proven non-mutation carrying Go's continuation", async (t) => {
+	const fixture = harness(t, { RELAY_FAKE_SUBMIT_MODE: "admit", RELAY_FAKE_EXPECTED_SUBJECT: `sha256:${"a".repeat(64)}` });
+	const wrongSubject = Buffer.from(JSON.stringify({ subject_hash: `sha256:${"0".repeat(64)}`, inspection: { status: "completed", paths: [] }, findings: [], evidence: ["x"] }), "utf8");
+	const error = await rejectsWithRelayError(
+		runReviewHostRelaySlot(admittingRequest(fixture, wrongSubject)),
+		REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED,
+		"submit",
+	);
+	assert.equal(error.mutationOutcome, "none");
+	assert.equal(error.exitCode, 1);
+	assert.match(error.stderr, /binding_mismatch/);
+	assert.match(error.stderr, /did not consume the lens slot/);
+	assert.match(error.stderr, /\[invalid_request\]/);
+	assert.match(error.message, /did not consume the lens slot/);
+	assert.equal(readLog(fixture.logPath).length, 2, "the refusal must not be retried by the relay");
+});
+
+test("a submission the fake admits with the expected subject still completes", async (t) => {
+	const fixture = harness(t, { RELAY_FAKE_SUBMIT_MODE: "admit", RELAY_FAKE_EXPECTED_SUBJECT: `sha256:${"a".repeat(64)}` });
+	const result = await runReviewHostRelaySlot(admittingRequest(fixture, Buffer.from(JSON.stringify({ subject_hash: `sha256:${"a".repeat(64)}`, inspection: { status: "completed", paths: [] }, findings: [], evidence: ["x"] }), "utf8")));
+	assert.equal(JSON.parse(result.submission).admission_decision, "completed");
 });
 
 test("submission refusal preserves its primary evidence when result staging cleanup also fails", async (t) => {
