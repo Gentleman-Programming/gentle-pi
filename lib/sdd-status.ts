@@ -101,6 +101,12 @@ export interface SddStatus {
 	relationships: SddRelationships;
 	collisions: SddDomainCollisionReport[];
 	legacyFlatSpec?: { path: string; hasDomainSpecs: boolean };
+	/**
+	 * Positive terminal projection: the change was archived. `path` is the
+	 * repo-relative archive folder (openspec/changes/archive/YYYY-MM-DD-<change>).
+	 * When set, `nextRecommended` is "archived" and no further phase is recommended.
+	 */
+	archived?: { path: string };
 	nextRecommended: string;
 	instructions?: SddPhaseInstructions;
 	blockedReasons: string[];
@@ -299,6 +305,31 @@ function emptyStatus(cwd: string, changeName: string | null, blockedReasons: str
 	};
 }
 
+/**
+ * Find the newest archive entry for a change. Archive folders are named
+ * `YYYY-MM-DD-<change>`; only an exact `-<change>` suffix after a full date
+ * prefix matches (change "foo-bar" never matches "2026-01-01-foo-bar-baz").
+ * safeDirectories sorts lexicographically, so the last match is the newest date.
+ */
+function findArchivedChangeEntry(root: string, changeName: string): string | undefined {
+	return safeDirectories(join(root, "openspec", "changes", "archive"))
+		.filter(
+			(entry) =>
+				/^\d{4}-\d{2}-\d{2}-$/.test(entry.slice(0, 11)) && entry.slice(11) === changeName,
+		)
+		.at(-1);
+}
+
+/** Positive terminal projection for a change whose folder moved to the archive. */
+function archivedStatus(cwd: string, changeName: string, archiveEntry: string, artifactStore: SddArtifactStore): SddStatus {
+	const status = emptyStatus(cwd, changeName, [], artifactStore);
+	status.applyState = "all_done";
+	status.dependencies = { apply: "all_done", verify: "all_done", sync: "all_done", archive: "all_done" };
+	status.archived = { path: join("openspec", "changes", "archive", archiveEntry) };
+	status.nextRecommended = "archived";
+	return status;
+}
+
 export function listActiveOpenSpecChanges(cwd: string): string[] {
 	return safeDirectories(join(cwd, "openspec", "changes")).filter(
 		(change) => change !== "archive",
@@ -462,6 +493,12 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 		// Pure openspec still blocks (legit "run sdd-new").
 		if (store === "hybrid") {
 			return nonAuthoritativeStatus(options.cwd, changeName, store, options.includeInstructions);
+		}
+		// Issue #535: an absent active folder may mean the change was archived.
+		// Project explicit completion instead of a false "run sdd-new" block.
+		const archiveEntry = findArchivedChangeEntry(root, changeName);
+		if (archiveEntry) {
+			return archivedStatus(root, changeName, archiveEntry, store);
 		}
 		return emptyStatus(root, changeName, [`Active change not found: ${changeName}.`], store);
 	}
