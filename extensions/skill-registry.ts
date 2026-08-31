@@ -178,6 +178,15 @@ function comparablePath(path: string): string {
 	return clean.length > 1 ? clean.replace(/[\\/]+$/, "") : clean;
 }
 
+/**
+ * Case-insensitive path equality for dedup decisions on Windows (paths are
+ * case-insensitive there); falls back to exact comparison elsewhere.
+ */
+function sameComparablePath(a: string, b: string): boolean {
+	if (a === b) return true;
+	return process.platform === "win32" && a.toLowerCase() === b.toLowerCase();
+}
+
 async function uniqueExistingDirs(dirs: string[]): Promise<string[]> {
 	const seen = new Set<string>();
 	const out: string[] = [];
@@ -451,7 +460,18 @@ function extensionSourcePath(source: string): string | undefined {
 	try {
 		return comparablePath(fileURLToPath(cleanSource));
 	} catch {
-		return undefined;
+		// win32: drive-less POSIX-style file: URLs throw in fileURLToPath
+		// (ERR_INVALID_FILE_URL_PATH). Fall back to a logical path derived from
+		// the URL authority and pathname so installed-copy dedup keeps working
+		// for URLs that originate on non-Windows paths.
+		let parsed: URL;
+		try {
+			parsed = new URL(cleanSource);
+		} catch {
+			return undefined;
+		}
+		const logical = (parsed.hostname !== "" ? `${parsed.hostname}/` : "") + parsed.pathname.replace(/^\/+/, "");
+		return comparablePath(logical);
 	}
 }
 
@@ -462,7 +482,7 @@ function shouldSkipDuplicateExtensionLoad(
 ): boolean {
 	const currentPath = extensionSourcePath(source);
 	const projectLocalPath = comparablePath(join(cwd, "extensions", "skill-registry.ts"));
-	if (currentPath && currentPath !== projectLocalPath && existsSync(projectLocalPath)) {
+	if (currentPath && !sameComparablePath(currentPath, projectLocalPath) && existsSync(projectLocalPath)) {
 		return true;
 	}
 
@@ -472,7 +492,7 @@ function shouldSkipDuplicateExtensionLoad(
 		state[SKILL_REGISTRY_EXTENSION_SOURCE_KEY] = currentSource;
 		return false;
 	}
-	return existingSource !== currentSource;
+	return !sameComparablePath(existingSource, currentSource);
 }
 
 function closeSkillRegistryWatchers(): void {

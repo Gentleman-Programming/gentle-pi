@@ -316,3 +316,18 @@ test("non-forced regeneration invalidates cache when skill bytes change but path
 	assert.match(secondRegistry, /Variant two\. Body B\./);
 	assert.doesNotMatch(secondRegistry, /Variant one\. Body A\./);
 });
+
+test("drive-less POSIX file: URLs resolve for dedup on every platform (#regression: win32 fileURLToPath throws)", () => {
+	// On Windows, fileURLToPath('file:///home/...') throws ERR_INVALID_FILE_URL_PATH;
+	// extensionSourcePath must fall back to a logical path instead of silently
+	// returning undefined (which would break installed-copy dedup). This test
+	// asserts the observable dedup contract via shouldSkipDuplicateExtensionLoad
+	// for a cwd with no project-local extension: the drive-less source records,
+	// and the same logical source across query variants is not double-reported.
+	const cwd = join(tmpdir(), `gentle-pi-driveless-${Date.now()}`);
+
+	const first = __testing.shouldSkipDuplicateExtensionLoad("file:///repo/extensions/skill-registry.ts?variant", cwd, {});
+	assert.equal(first, false, "first drive-less source must register without silently undefined");
+	const second = __testing.shouldSkipDuplicateExtensionLoad("file:///repo/extensions/skill-registry.ts?variant-two", cwd, {});
+	assert.equal(second, false, "the same logical source must not be reported twice across query variants");
+});
