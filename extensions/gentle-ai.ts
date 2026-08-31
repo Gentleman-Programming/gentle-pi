@@ -2647,12 +2647,12 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 const REVIEW_CAPTURE_PARAMETERS = {
 	type: "object",
 	additionalProperties: false,
-	required: ["lineageId", "collectBinding"],
+	required: ["collectBinding"],
 	properties: {
 		lineageId: {
 			type: "string",
 			minLength: 1,
-			description: "Exact lineage from the current provider-issued collect transition.",
+			description: "Exact lineage from the current provider-issued collect transition. Required for every lineage-bound capture; omit it only when answering the pre-START intended_untracked_selection input, which has no lineage yet.",
 		},
 		collectBinding: {
 			type: "string",
@@ -2672,16 +2672,35 @@ const REVIEW_CAPTURE_PARAMETERS = {
 			type: "string",
 			description: "Optional explicit existing Git worktree root, resolved with the controller's worktree confinement semantics.",
 		},
+		untrackedScope: {
+			type: "string",
+			enum: ["exclude", "select"],
+			description: "Pre-START route only: answers the provider intended_untracked_selection input without lineageId. \"exclude\" declares no intended untracked paths; \"select\" requires a non-empty intendedUntracked subset of the provider eligible inventory.",
+		},
+		intendedUntracked: {
+			type: "array",
+			items: { type: "string", minLength: 1 },
+			description: "Pre-START route only: unique repository-relative untracked paths from the provider's eligible_paths_json inventory; valid solely with untrackedScope \"select\".",
+		},
 	},
 } as const;
 
-interface ReviewCaptureParameters {
+interface ReviewLineageCaptureParameters {
 	lineageId: string;
 	collectBinding: string;
 	reviewerRunAcknowledged?: boolean;
 	correctionLines?: number;
 	workspaceRoot?: string;
 }
+
+interface ReviewPreStartSelectionCaptureParameters {
+	untrackedScope: NativeStartUntrackedScope;
+	intendedUntracked: readonly string[];
+	collectBinding: string;
+	workspaceRoot?: string;
+}
+
+type ReviewCaptureParameters = ReviewLineageCaptureParameters | ReviewPreStartSelectionCaptureParameters;
 
 const REVIEW_SCOPE_PARAMETERS = {
 	type: "object",
@@ -2760,9 +2779,30 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 
 function parseReviewCaptureParameters(value: unknown): ReviewCaptureParameters {
 	if (!isRecord(value)) throw new Error("Review capture parameters must be an object");
-	const allowed = new Set(["lineageId", "collectBinding", "reviewerRunAcknowledged", "correctionLines", "workspaceRoot"]);
+	const allowed = new Set(["lineageId", "collectBinding", "reviewerRunAcknowledged", "correctionLines", "workspaceRoot", "untrackedScope", "intendedUntracked"]);
 	const unexpected = Object.keys(value).find((key) => !allowed.has(key));
 	if (unexpected !== undefined) throw new Error(`Review capture does not accept ${unexpected}`);
+	if (value.untrackedScope !== undefined || value.intendedUntracked !== undefined) {
+		const scope = value.untrackedScope;
+		if (scope !== NATIVE_START_UNTRACKED_SCOPE.EXCLUDE && scope !== NATIVE_START_UNTRACKED_SCOPE.SELECT) throw new Error('Review capture untrackedScope must be "exclude" or "select"');
+		for (const key of ["lineageId", "reviewerRunAcknowledged", "correctionLines"] as const) {
+			if (value[key] !== undefined) throw new Error(`Review capture pre-START selection does not accept ${key}`);
+		}
+		if (typeof value.collectBinding !== "string" || value.collectBinding.length === 0) throw new Error("Review capture requires a JSON-serialized collectBinding");
+		if (value.workspaceRoot !== undefined && typeof value.workspaceRoot !== "string") throw new Error("Review capture workspaceRoot must be a string");
+		const intendedUntracked = value.intendedUntracked;
+		if (intendedUntracked !== undefined && (!Array.isArray(intendedUntracked) || intendedUntracked.some((path) => !isNativeStartUntrackedPath(path) || intendedUntracked.indexOf(path) !== intendedUntracked.lastIndexOf(path)))) {
+			throw new Error("Review capture intendedUntracked must be unique repository-relative untracked paths");
+		}
+		if (scope === NATIVE_START_UNTRACKED_SCOPE.EXCLUDE && (intendedUntracked?.length ?? 0) > 0) throw new Error('Review capture untrackedScope "exclude" forbids intendedUntracked paths');
+		if (scope === NATIVE_START_UNTRACKED_SCOPE.SELECT && (intendedUntracked?.length ?? 0) === 0) throw new Error('Review capture untrackedScope "select" requires a non-empty intendedUntracked subset');
+		return {
+			untrackedScope: scope,
+			intendedUntracked: intendedUntracked === undefined ? [] : [...intendedUntracked],
+			collectBinding: value.collectBinding,
+			...(value.workspaceRoot === undefined ? {} : { workspaceRoot: value.workspaceRoot }),
+		};
+	}
 	if (!isCanonicalProcessString(value.lineageId)) throw new Error("Review capture requires an exact non-empty lineageId");
 	if (typeof value.collectBinding !== "string" || value.collectBinding.length === 0) throw new Error("Review capture requires a JSON-serialized collectBinding");
 	if (value.reviewerRunAcknowledged !== undefined && typeof value.reviewerRunAcknowledged !== "boolean") throw new Error("Review capture reviewerRunAcknowledged must be boolean");
@@ -3938,6 +3978,22 @@ function isRetainedNativeCaptureRoute(selection: RetainedNativeStatusSelection |
 	return selection !== undefined && "workspaceRoot" in selection;
 }
 
+function reviewPreStartSelectionStorageKey(workspaceRoot: string): string {
+	return `pre-start\u0000${workspaceRoot}`;
+}
+
+function consumeRetainedPreStartUntrackedSelection(selections: Map<string, RetainedNativeStatusSelection>, workspaceRoot: string): NativeStartUntrackedSelection {
+	const key = reviewPreStartSelectionStorageKey(workspaceRoot);
+	const selection = selections.get(key);
+	if (selection === undefined || isRetainedNativeCaptureRoute(selection)) return {};
+	selections.delete(key);
+	return {
+		untrackedScope: selection.untrackedScope,
+		expectedUntrackedInventory: selection.expectedUntrackedInventory,
+		intendedUntracked: [...selection.intendedUntracked],
+	};
+}
+
 function retainNativeCaptureRoutes(selections: Map<string, RetainedNativeStatusSelection>, workspaceRoot: string, status: ReviewStatusV3, baseRef: string | undefined): void {
 	const lineageId = status.authority?.lineageId;
 	if (status.applicability !== "current_target" || !isCanonicalProcessString(lineageId) || isTerminalReviewAuthorityState(status.authority?.state)) return;
@@ -4396,6 +4452,82 @@ function captureBindingRejected(reason: string): Record<string, unknown> {
 	};
 }
 
+const REVIEW_PRE_START_SELECTION_INPUT_NAME = "intended_untracked_selection";
+const REVIEW_PRE_START_SELECTION_CAPTURE_OPERATION = "external.select_intended_untracked";
+const REVIEW_PRE_START_SELECTION_REASON_CODE = "intended_untracked_selection_required";
+const REVIEW_PRE_START_SELECTION_NEXT_ACTION =
+	"Answer the pre-START intended_untracked_selection collect input through gentle_review_capture without lineageId: pass its exact collectBinding plus untrackedScope \"exclude\", or \"select\" with a non-empty intendedUntracked subset of the provider eligible inventory. Then call ordinary START again; it consumes the retained exact selection once. Never bypass through the native CLI or by moving untracked files.";
+
+async function executePreStartUntrackedSelectionCapture(
+	parameters: ReviewPreStartSelectionCaptureParameters,
+	sessionCwd: string,
+	nativeReviewCli: NativeReviewCli,
+	candidateViews: CandidateViewRegistry | null,
+	retainedUntrackedSelections: Map<string, RetainedNativeStatusSelection>,
+	signal?: AbortSignal,
+): Promise<Record<string, unknown>> {
+	const canonicalBinding = parseCanonicalReviewCaptureBinding(parameters.collectBinding);
+	const cwd = resolveReviewControllerWorkspaceRoot(parameters.workspaceRoot, sessionCwd, candidateViews, undefined);
+	let status: ReviewStatusV3;
+	try {
+		const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, { cwd, ...(signal === undefined ? {} : { signal }) }, retainedUntrackedSelections, cwd);
+		if (negotiated.transport !== undefined) return hostTransportUnavailable("gentle_review_capture", negotiated.transport);
+		status = negotiated.status!;
+	} catch (error) {
+		return nativeOperationFailure("gentle_review_capture", error);
+	}
+	if (status.applicability !== "unrelated" || status.authority !== undefined) {
+		return captureBindingRejected(status.applicability === "current_target"
+			? "a review lineage already exists for this target; answer its lineage-bound collect transition instead of a pre-START selection"
+			: "current STATUS is ambiguous and cannot authorize a pre-START intended-untracked selection");
+	}
+	if (status.nextTransition?.kind !== "collect") return captureBindingRejected("current STATUS does not offer a collect transition");
+	const matches = (status.nextTransition.collect?.inputs ?? []).filter((input) => canonicalReviewCaptureBinding(input) === canonicalBinding);
+	if (matches.length !== 1) {
+		return captureBindingRejected(matches.length === 0
+			? "collectBinding is missing or stale for current STATUS"
+			: "collectBinding matches more than one current STATUS input");
+	}
+	const input = matches[0]!;
+	if (input.captureOperation !== REVIEW_PRE_START_SELECTION_CAPTURE_OPERATION || input.name !== REVIEW_PRE_START_SELECTION_INPUT_NAME) {
+		return captureBindingRejected("collectBinding is not the provider pre-START intended-untracked selection input");
+	}
+	if (!isCanonicalProcessString(status.targetIdentity)) return captureBindingRejected("current STATUS does not name an exact pre-START target identity");
+	const expectedUntrackedInventory = exactCollectArgument(input, "expected_untracked_inventory");
+	const eligiblePathsJson = exactCollectArgument(input, "eligible_paths_json");
+	if (!isCanonicalProcessString(expectedUntrackedInventory) || eligiblePathsJson === undefined) {
+		return captureBindingRejected("provider selection input omitted its exact expected-inventory or eligible-path binding");
+	}
+	let eligible: unknown;
+	try { eligible = JSON.parse(eligiblePathsJson); } catch { eligible = undefined; }
+	if (!Array.isArray(eligible) || eligible.some((path) => !isNativeStartUntrackedPath(path)) || new Set(eligible).size !== eligible.length) {
+		return captureBindingRejected("provider selection input published a malformed eligible-path inventory");
+	}
+	const outside = parameters.intendedUntracked.filter((path) => !eligible.includes(path));
+	if (outside.length > 0) return captureBindingRejected(`intendedUntracked names paths outside the provider eligible inventory: ${outside.join(", ")}`);
+	retainNativeStatusSelection(retainedUntrackedSelections, reviewPreStartSelectionStorageKey(cwd), Object.freeze({
+		untrackedScope: parameters.untrackedScope,
+		expectedUntrackedInventory,
+		intendedUntracked: Object.freeze([...parameters.intendedUntracked]),
+	}));
+	return {
+		tool: "gentle_review_capture",
+		status: "completed",
+		outcome: "pre-start-untracked-selection-retained",
+		workspace_root: cwd,
+		target_identity: status.targetIdentity,
+		projection: status.projection.projection,
+		base_tree: status.projection.baseTree,
+		current_candidate_tree: status.projection.currentCandidateTree,
+		untracked_scope: parameters.untrackedScope,
+		expected_untracked_inventory: expectedUntrackedInventory,
+		intended_untracked: [...parameters.intendedUntracked],
+		mutation_performed: false,
+		mutation_outcome: "none",
+		next_action: 'Call ordinary START (gentle_review {"operation":"start"}) for this workspace root without untracked fields; it consumes this exact retained selection once. A changed untracked inventory fails closed and reissues the provider selection input.',
+	};
+}
+
 interface SelectedReviewCapture {
 	input: ReviewCollectInputV3;
 	binding: ReviewLastEventClosureBinding;
@@ -4469,6 +4601,9 @@ async function executeReviewCaptureOperation(
 			mutation_performed: false,
 			mutation_outcome: "none",
 		};
+	}
+	if ("untrackedScope" in parameters) {
+		return await executePreStartUntrackedSelectionCapture(parameters, sessionCwd, nativeReviewCli, candidateViews, retainedUntrackedSelections, signal);
 	}
 	const canonicalBinding = parseCanonicalReviewCaptureBinding(parameters.collectBinding);
 	const cwd = resolveReviewControllerWorkspaceRoot(parameters.workspaceRoot, sessionCwd, candidateViews, parameters.lineageId);
@@ -4968,8 +5103,11 @@ async function executeReviewControllerOperation(
 			if (baseRef !== undefined && !isCanonicalProcessString(baseRef)) return nativeStartRejection("base-ref-invalid");
 			if (baseRef !== undefined && rawStart.committedOnly !== true) return nativeStartRejection("committed-only-required");
 			if (baseRef === undefined && "committedOnly" in rawStart) return nativeStartRejection("committed-only-invalid");
-			const untrackedSelection = validateNativeStartUntrackedSelection(rawStart);
-			if (untrackedSelection.reason !== undefined) return nativeStartRejection(untrackedSelection.reason);
+			const declaredUntrackedSelection = validateNativeStartUntrackedSelection(rawStart);
+			if (declaredUntrackedSelection.reason !== undefined) return nativeStartRejection(declaredUntrackedSelection.reason);
+			const untrackedSelection = declaredUntrackedSelection.untrackedScope === undefined
+				? consumeRetainedPreStartUntrackedSelection(retainedUntrackedSelections, defaultCwd)
+				: declaredUntrackedSelection;
 			const retainedUntrackedSelection = cloneRetainedNativeUntrackedSelection(untrackedSelection);
 			let canonicalBaseRef: string | undefined;
 			if (baseRef !== undefined) {
@@ -4999,7 +5137,12 @@ async function executeReviewControllerOperation(
 				}, retainedUntrackedSelections, defaultCwd);
 				if (negotiated.transport !== undefined) return hostTransportUnavailable(parameters.operation, negotiated.transport);
 				target = negotiated.status!;
-				if (target.nextTransition?.kind === "collect" || target.applicability !== "unrelated" || target.action !== "start") return mapNativeTargetStatus(parameters.operation, target, parameters.lineageId);
+				if (target.nextTransition?.kind === "collect" || target.applicability !== "unrelated" || target.action !== "start") {
+					const mapped = mapNativeTargetStatus(parameters.operation, target, parameters.lineageId);
+					return target.applicability === "unrelated" && target.nextTransition?.kind === "collect" && target.nextTransition.reasonCode === REVIEW_PRE_START_SELECTION_REASON_CODE
+						? { ...mapped, next_action: REVIEW_PRE_START_SELECTION_NEXT_ACTION }
+						: mapped;
+				}
 			} catch (error) {
 				return nativeOperationFailure(parameters.operation, error);
 			}
@@ -5356,7 +5499,8 @@ function createGentleAiExtensionForTesting(
 		description: "Capture exactly one provider-issued ordinary native review collect slot. This is not a controller operation: it validates one opaque collect binding against current target-scoped STATUS, executes at most one capture, and never follows a transition.",
 		promptSnippet: "Use one exact current STATUS collectBinding for one ordinary native capture; call fresh STATUS before every additional capture.",
 		promptGuidelines: [
-			"Pass only lineageId, the JSON-serialized exact collectBinding from current STATUS, and the route-specific optional acknowledgement or correctionLines value. Never compose provider argument tokens, prompts, results, verdicts, or lens arrays.",
+			"For lineage-bound captures pass only lineageId, the JSON-serialized exact collectBinding from current STATUS, and the route-specific optional acknowledgement or correctionLines value. Never compose provider argument tokens, prompts, results, verdicts, or lens arrays.",
+			"A pre-START intended_untracked_selection input is the one lineage-less route: omit lineageId and pass its exact collectBinding plus untrackedScope \"exclude\", or \"select\" with a non-empty intendedUntracked subset of the provider eligible inventory. The accepted exact selection is retained for this workspace root and the next ordinary START consumes it once.",
 			"A materialize reviewer slot first forecasts one model run; re-submit that same exact binding with reviewerRunAcknowledged: true to authorize one host relay. Correction-plan slots require correctionLines inside the provider-issued bounds. Refuter and validation vectors execute exactly once as provider-rendered.",
 			"A native terminal closure or nonterminal capture returns directly. Do not expect automatic STATUS, FINALIZE, receipt, delivery, or another capture; call fresh STATUS before any next capture.",
 		],
