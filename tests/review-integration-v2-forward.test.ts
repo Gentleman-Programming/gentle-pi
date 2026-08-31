@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import {
+	REVIEW_ACKNOWLEDGED_SCHEMA,
+	decodeReviewAcknowledgedV1,
 	decodeReviewCapabilitiesV2,
 	decodeReviewConsentV2,
 	decodeReviewConsentV3,
+	decodeReviewFailureV2,
 	decodeReviewLastEventClosureV1,
+	decodeReviewNextTransitionV3,
+	decodeReviewRepairV2,
 	decodeReviewResultArtifactV2,
 	decodeReviewStartV3,
 	decodeReviewStartV4,
@@ -483,4 +488,82 @@ test("START/v4 closed approval keeps acknowledgement but forbids a continuation"
 
 	closed.next_transition = (reviewingStartV4().next_transition as JsonObject);
 	assert.throws(() => decodeReviewStartV4(closed), /closed approved zero-lens START cannot carry next_transition/);
+});
+
+// ---------------------------------------------------------------------------
+// review-acknowledged/v1 — gentle-ai #3947: the exact acknowledgement burn
+// prints one typed envelope instead of nothing. Provenance:
+// tests/fixtures/devbinary/review-acknowledged.provenance.md.
+// ---------------------------------------------------------------------------
+
+const ACKNOWLEDGED_FIXTURE = "review-acknowledged-v1.captured.json";
+
+function acknowledgedFixture(): JsonObject {
+	return clone(fixture(DEV_FIXTURES, ACKNOWLEDGED_FIXTURE) as JsonObject);
+}
+
+test("review-acknowledged/v1 decodes the captured burn envelope exactly", () => {
+	const raw = acknowledgedFixture();
+	const decoded = decodeReviewAcknowledgedV1(raw);
+	assert.deepEqual(decoded, {
+		schema: "gentle-ai.review-acknowledged/v1",
+		operation: "review/acknowledge-approved",
+		action: "acknowledged",
+		lineageId: "review-3ec95251db75f626",
+		targetIdentity: "sha256:b505dcd8d82395c053c9786935e11e0e235cbdecca4f1f46f98c768ea6248d3d",
+		consumedRevision: "sha256:9732b1c3526bfecd3851093239241145c970cc126acea59bfaf14133214b60ee",
+		authority: "burned",
+		raw,
+	});
+	assert.equal(decodeReviewAcknowledgedV1(raw, { lineageId: decoded.lineageId, targetIdentity: decoded.targetIdentity, revision: decoded.consumedRevision }).authority, "burned");
+	assert.equal(REVIEW_ACKNOWLEDGED_SCHEMA, "gentle-ai.review-acknowledged/v1");
+});
+
+test("review-acknowledged/v1 rejects identity drift, foreign fields, and a binding that names another burn", () => {
+	const cases: Array<[string, (body: JsonObject) => void, RegExp]> = [
+		["schema", (body) => { body.schema = "gentle-ai.review-acknowledged/v2"; }, /schema/],
+		["operation", (body) => { body.operation = "review.acknowledge-approved"; }, /operation/],
+		["action", (body) => { body.action = "replayed"; }, /action/],
+		["authority", (body) => { body.authority = "retained"; }, /authority/],
+		["unknown key", (body) => { body.receipt = { status: "created" }; }, /receipt/],
+		["missing consumed revision", (body) => { delete body.consumed_revision; }, /consumed_revision/],
+		["malformed target", (body) => { body.target_identity = "b505dcd8"; }, /target_identity/],
+		["malformed lineage", (body) => { body.lineage_id = "Review_3ec95251"; }, /lineage_id/],
+	];
+	for (const [name, mutate, pattern] of cases) {
+		const body = acknowledgedFixture();
+		mutate(body);
+		assert.throws(() => decodeReviewAcknowledgedV1(body), pattern, name);
+	}
+	const raw = acknowledgedFixture();
+	assert.throws(() => decodeReviewAcknowledgedV1(raw, { lineageId: "review-other" }), /lineage/);
+	assert.throws(() => decodeReviewAcknowledgedV1(raw, { targetIdentity: sha("b") }), /target/);
+	assert.throws(() => decodeReviewAcknowledgedV1(raw, { revision: sha("c") }), /revision/);
+	assert.throws(() => decodeReviewAcknowledgedV1(null), /object/);
+	assert.throws(() => decodeReviewAcknowledgedV1("{}"), /object/);
+});
+
+test("review-acknowledged/v1 is disjoint from every prior captured identity in both directions", () => {
+	const priorFixtures = readdirSync(DEV_FIXTURES).filter((name) => name.endsWith(".json") && name !== ACKNOWLEDGED_FIXTURE);
+	assert.ok(priorFixtures.length >= 15, "the prior captured corpus must be present");
+	for (const name of priorFixtures) {
+		assert.throws(() => decodeReviewAcknowledgedV1(fixture(DEV_FIXTURES, name)), /schema|object/, `${name} must not decode as an acknowledgement`);
+	}
+	const acknowledged = acknowledgedFixture();
+	const priorDecoders: Array<[string, (value: unknown) => unknown]> = [
+		["status/v3", decodeReviewStatusV3],
+		["start/v3", decodeReviewStartV3],
+		["start/v4", decodeReviewStartV4],
+		["capabilities/v2", decodeReviewCapabilitiesV2],
+		["consent/v2", decodeReviewConsentV2],
+		["consent/v3", decodeReviewConsentV3],
+		["last-event-closure/v1", decodeReviewLastEventClosureV1],
+		["result-artifact/v2", decodeReviewResultArtifactV2],
+		["failure/v2", decodeReviewFailureV2],
+		["next-transition/v3", decodeReviewNextTransitionV3],
+		["repair/v2", decodeReviewRepairV2],
+	];
+	for (const [name, decoder] of priorDecoders) {
+		assert.throws(() => decoder(clone(acknowledged)), `${name} must reject the acknowledged envelope`);
+	}
 });

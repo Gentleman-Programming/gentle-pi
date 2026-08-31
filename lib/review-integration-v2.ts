@@ -2254,6 +2254,61 @@ export function assertReviewApprovedAcknowledgementExecuteV1(
 	if (expected.revision !== undefined && shape.revision !== expected.revision) throw new TypeError("acknowledgement.execute.revision does not match the current target"); return shape.tokens;
 }
 
+// ---------------------------------------------------------------------------
+// review-acknowledged/v1 — the answer the burn prints (gentle-ai #3947)
+// ---------------------------------------------------------------------------
+
+// Until gentle-ai #3947 a successful `review acknowledge-approved` burned its
+// authority in silence and a host could only infer the burn from a later
+// STATUS offering a fresh START. From main commit bc9f74d2 the command prints
+// exactly this envelope on success. Like result-artifact/v2 it carries no
+// `contract`: the schema constant plus the slash-form operation are its whole
+// identity, so requireIdentity (which demands the contract pair) does not
+// apply. Every published release up to v2.5.0-rc.3 still prints nothing; the
+// native client owns that distinction, this decoder only ever sees bytes.
+export const REVIEW_ACKNOWLEDGED_SCHEMA = "gentle-ai.review-acknowledged/v1" as const;
+const REVIEW_ACKNOWLEDGED_OPERATION = "review/acknowledge-approved" as const;
+
+export interface ReviewAcknowledgedV1 {
+	schema: typeof REVIEW_ACKNOWLEDGED_SCHEMA;
+	operation: typeof REVIEW_ACKNOWLEDGED_OPERATION;
+	action: "acknowledged";
+	lineageId: string;
+	targetIdentity: string;
+	consumedRevision: string;
+	authority: "burned";
+	raw: Record<string, unknown>;
+}
+
+/** The binding the caller already holds from STATUS; the envelope must name exactly that burn. */
+export interface ReviewAcknowledgedExpectationV1 {
+	lineageId?: string;
+	targetIdentity?: string;
+	revision?: string;
+}
+
+export function decodeReviewAcknowledgedV1(value: unknown, expected: ReviewAcknowledgedExpectationV1 = {}): ReviewAcknowledgedV1 {
+	if (record(value, "acknowledged").schema !== REVIEW_ACKNOWLEDGED_SCHEMA) throw new TypeError(`schema must be ${REVIEW_ACKNOWLEDGED_SCHEMA}`);
+	const body = exactRecord(value, "acknowledged", ["schema", "operation", "action", "lineage_id", "target_identity", "consumed_revision", "authority"]);
+	if (body.operation !== REVIEW_ACKNOWLEDGED_OPERATION) throw new TypeError(`acknowledged.operation must be ${REVIEW_ACKNOWLEDGED_OPERATION}`);
+	if (body.action !== "acknowledged") throw new TypeError("acknowledged.action must be acknowledged");
+	if (body.authority !== "burned") throw new TypeError("acknowledged.authority must be burned");
+	const decoded: ReviewAcknowledgedV1 = {
+		schema: REVIEW_ACKNOWLEDGED_SCHEMA,
+		operation: REVIEW_ACKNOWLEDGED_OPERATION,
+		action: "acknowledged",
+		lineageId: lineage(body.lineage_id, "acknowledged.lineage_id"),
+		targetIdentity: sha256(body.target_identity, "acknowledged.target_identity"),
+		consumedRevision: sha256(body.consumed_revision, "acknowledged.consumed_revision"),
+		authority: "burned",
+		raw: body,
+	};
+	if (expected.lineageId !== undefined && decoded.lineageId !== expected.lineageId) throw new TypeError("acknowledged.lineage_id does not name the acknowledged lineage");
+	if (expected.targetIdentity !== undefined && decoded.targetIdentity !== expected.targetIdentity) throw new TypeError("acknowledged.target_identity does not name the acknowledged target");
+	if (expected.revision !== undefined && decoded.consumedRevision !== expected.revision) throw new TypeError("acknowledged.consumed_revision does not name the consumed revision");
+	return decoded;
+}
+
 export interface ReviewLastEventClosureV1 {
 	schema: typeof REVIEW_LAST_EVENT_CLOSURE_SCHEMA;
 	operation: ReviewLastEventClosureOperation;
