@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -628,9 +628,9 @@ function reviewContext(cwd: string): ExtensionContext {
 	return { cwd, hasUI: false, ui: { confirm: async () => true } } as unknown as ExtensionContext;
 }
 
-function startStatus(cwd: string, baseRef?: string): ReviewStatusV3 {
+function startStatus(cwd: string, baseRef?: string, intendedUntracked: readonly string[] = []): ReviewStatusV3 {
 	const candidateViews = new CandidateViewRegistry();
-	const view = candidateViews.create({ contributorRoot: cwd, ...(baseRef === undefined ? {} : { baseRef, committedOnly: true }) });
+	const view = candidateViews.create({ contributorRoot: cwd, intendedUntracked, ...(baseRef === undefined ? {} : { baseRef, committedOnly: true }) });
 	try {
 		return {
 			contract: "gentle-ai.review-integration/v2",
@@ -647,7 +647,7 @@ function startStatus(cwd: string, baseRef?: string): ReviewStatusV3 {
 				currentCandidateTree: view.candidateTree,
 				pathsDigest: SHA,
 				paths: [...view.paths],
-				intendedUntracked: [],
+				intendedUntracked: [...intendedUntracked],
 				intendedUntrackedProof: SHA,
 				initialSnapshotIdentity: SHA,
 				currentSnapshotIdentity: SHA,
@@ -681,6 +681,43 @@ test("ordinary START binds the native workspace candidate and returns the native
 	assert.equal(result.operation, "start");
 	assert.equal(targetCalls, 1);
 	assert.equal(startCalls, 1);
+});
+
+test("pre-lineage intended-untracked selection revalidates and starts at an explicit workspace root", async (t) => {
+	const cwd = realpathSync(repository(t)), sessionCwd = repository(t), eligible = "selected.md";
+	writeFileSync(join(cwd, eligible), "selected\n");
+	const initialTarget = startStatus(cwd), target = startStatus(cwd, undefined, [eligible]);
+	const selection: ReviewCollectInputV3 = {
+		name: "intended_untracked_selection", schema: "gentle-ai.review-intended-untracked-selection/v1", captureOperation: "external.select_intended_untracked",
+		arguments: [
+			{ name: "target_identity", value: SHA }, { name: "projection", value: "workspace" },
+			{ name: "base_tree", value: initialTarget.projection.baseTree }, { name: "candidate_tree", value: initialTarget.projection.currentCandidateTree },
+			{ name: "eligible_paths_json", value: JSON.stringify([eligible]) }, { name: "expected_untracked_inventory", value: SHA },
+		],
+		submission: { operationToken: "status", argumentTokens: ["--contract=gentle-ai.review-integration/v2", "--next-transition=true", "--agent=pi", "--projection=workspace", "--intended-untracked-selection={{value}}"], values: [{ slot: "intended_untracked_selection", domain: "schema_bound_json", schema: "gentle-ai.review-intended-untracked-selection/v1", substitutionLocation: 4 }] },
+	};
+	const initial = { ...initialTarget, nextTransition: { kind: "collect", reasonCode: "intended_untracked_selection_required", collect: { inputs: [selection] } }, raw: { schema: "gentle-ai.review-integration.status/v6" } } as ReviewStatusV3;
+	const requests: Array<Record<string, unknown>> = [], starts: Array<Record<string, unknown>> = [], retained = new Map();
+	const native = {
+		reviewMode: async () => ({ operation: "status", scope: "clone", status: { global: "on", cloneLocal: "on", effective: "on", source: "clone_local" } }),
+		targetStatus: async (request: Record<string, unknown>) => { requests.push(request); return "intendedUntrackedSelection" in request ? target : initial; },
+		start: async (request: Record<string, unknown>) => { assert.equal(retained.size, 0); starts.push(request); return { lineageId: "selected", state: "reviewing", riskLevel: "low", selectedLenses: [], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: false, riskReasons: [], raw: {} }; },
+	} as unknown as NativeReviewCli;
+	const listed = await __testing.executeReviewControllerOperation({ operation: "status", workspaceRoot: cwd }, sessionCwd, native, undefined, undefined, undefined, retained);
+	const selectionBinding = listed.selectionBinding as string;
+	assert.equal(typeof selectionBinding, "string");
+	const selectedResult = await __testing.executeReviewControllerOperation({ operation: "select-intended-untracked", selectionBinding, intendedUntracked: [eligible], workspaceRoot: cwd } as never, sessionCwd, native, undefined, undefined, undefined, retained);
+	assert.equal(starts.length, 1, JSON.stringify(selectedResult));
+	assert.deepEqual(requests.map((request) => request.cwd), [cwd, cwd, cwd]);
+	assert.equal(starts[0]!.cwd, cwd);
+	assert.deepEqual(starts[0]!.intendedUntrackedSelection, { argumentTokens: selection.submission!.argumentTokens, value: JSON.stringify({ schema: "gentle-ai.review-intended-untracked-selection/v1", untracked_scope: "select", expected_untracked_inventory: SHA, intended_untracked: [eligible] }) });
+	for (const invalid of [
+		{ selectionBinding: selectionBinding.replace(eligible, "docs/stale.md"), intendedUntracked: [eligible] },
+		{ selectionBinding, intendedUntracked: [eligible, eligible] }, { selectionBinding, intendedUntracked: ["docs/unknown.md"] },
+	]) await __testing.executeReviewControllerOperation({ operation: "select-intended-untracked", ...invalid } as never, cwd, native, undefined, undefined, undefined, retained);
+	await assert.rejects(() => __testing.executeReviewControllerOperation({ operation: "select-intended-untracked", selectionBinding, intendedUntracked: [eligible], input: "{}" } as never, cwd, native, undefined, undefined, undefined, retained), /exactly selectionBinding/);
+	assert.equal(starts.length, 1);
+	assert.equal(requests.every((request) => !("lineageId" in request)), true);
 });
 
 test("ordinary START relays native consent without authoring or advancing it", async (t) => {

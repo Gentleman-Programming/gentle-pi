@@ -128,6 +128,7 @@ import {
 	NATIVE_REVIEW_RECONCILE_ANOMALIES,
 	sanitizeForeignNativeReviewDiagnostics,
 	type NativeReviewCli,
+	type NativeIntendedUntrackedSelectionSubmission,
 	type NativeReviewAcknowledgeApprovedOutcome,
 	type NativeReviewAcknowledgeApprovedRequest,
 	type NativeTargetStatusRequest,
@@ -2576,6 +2577,7 @@ const REVIEW_CONTROLLER_OPERATION = {
 	ADVANCE: "advance",
 	ACKNOWLEDGE_APPROVED: "acknowledge-approved",
 	STATUS: "status",
+	SELECT_INTENDED_UNTRACKED: "select-intended-untracked",
 	EXPORT: "export",
 	IMPORT: "import",
 	INSPECT: "inspect",
@@ -2617,6 +2619,8 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 			type: "string",
 			description: "Bounded review lineage identifier. A failed start creates no lineage; do not use it with status or advance.",
 		},
+		selectionBinding: { type: "string", description: "Opaque provider-issued pre-lineage intended-untracked selection binding." },
+		intendedUntracked: { type: "array", items: { type: "string" }, description: "Repository-relative paths selected from the provider binding." },
 		changeName: {
 			type: "string",
 			description: "Canonical OpenSpec change name required to resolve a recovered authority during lifecycle validate.",
@@ -2703,6 +2707,8 @@ interface ReviewScopeParameters {
 interface ReviewControllerParameters {
 	operation: ReviewControllerOperation;
 	lineageId?: string;
+	selectionBinding?: string;
+	intendedUntracked?: readonly string[];
 	changeName?: string;
 	idempotencyKey?: string;
 	transition?: string;
@@ -2736,6 +2742,11 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 	if (!isRecord(value)) throw new Error("Review controller parameters must be an object");
 	if (typeof value.operation !== "string" || !isReviewControllerOperation(value.operation)) {
 		throw new Error("Review controller operation is unsupported");
+	}
+	if (value.operation === REVIEW_CONTROLLER_OPERATION.SELECT_INTENDED_UNTRACKED) {
+		const unexpected = Object.keys(value).find((key) => !["operation", "selectionBinding", "intendedUntracked", "workspaceRoot"].includes(key));
+		if (unexpected !== undefined || typeof value.selectionBinding !== "string" || !Array.isArray(value.intendedUntracked) || (value.workspaceRoot !== undefined && typeof value.workspaceRoot !== "string")) throw new Error("Review intended-untracked selection accepts exactly selectionBinding and intendedUntracked, with optional workspaceRoot");
+		return { operation: value.operation, selectionBinding: value.selectionBinding, intendedUntracked: value.intendedUntracked, ...(typeof value.workspaceRoot === "string" ? { workspaceRoot: value.workspaceRoot } : {}) };
 	}
 	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT, REVIEW_CONTROLLER_OPERATION.STATUS, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.ABANDON, REVIEW_CONTROLLER_OPERATION.QUARANTINE_LEGACY, REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY, REVIEW_CONTROLLER_OPERATION.REPAIR_LEGACY_ALIAS, REVIEW_CONTROLLER_OPERATION.REPAIR].includes(value.operation as ReviewControllerOperation);
 	if (needsLineage && (typeof value.lineageId !== "string" || value.lineageId.trim().length === 0)) {
@@ -3330,11 +3341,14 @@ function mapNativeTargetStatus(operation: ReviewControllerOperation, status: Rev
 		status.nextTransition?.kind === "collect" &&
 		(operation === REVIEW_CONTROLLER_OPERATION.START || operation === REVIEW_CONTROLLER_OPERATION.INSPECT || operation === REVIEW_CONTROLLER_OPERATION.STATUS)
 	) {
+		const selection = reviewIntendedUntrackedInput(status);
 		return {
 			operation,
 			status: "blocked",
 			result: withoutRawCollectInputs(status.raw),
-			collectBindings: publicReviewCaptureBindings(status),
+			...(selection === undefined
+				? { collectBindings: publicReviewCaptureBindings(status) }
+				: { selectionBinding: canonicalReviewCaptureBinding(selection) }),
 		};
 	}
 	if (status.action === "recover") {
@@ -4378,15 +4392,19 @@ function exactCollectArgument(input: ReviewCollectInputV3, name: string): string
 	return matches.length === 1 ? matches[0]!.value : undefined;
 }
 
-interface PublicReviewCaptureBinding {
-	collectBinding: string;
+function reviewIntendedUntrackedInput(status: ReviewStatusV3): ReviewCollectInputV3 | undefined {
+	if (status.raw.schema !== "gentle-ai.review-integration.status/v6" || status.nextTransition?.kind !== "collect") return undefined;
+	const matches = (status.nextTransition.collect?.inputs ?? []).filter((input) => {
+		const value = input.submission?.values[0];
+		return input.name === "intended_untracked_selection" && input.schema === "gentle-ai.review-intended-untracked-selection/v1" && input.captureOperation === "external.select_intended_untracked" && input.submission?.operationToken === "status" && input.submission.values.length === 1 && value?.slot === "intended_untracked_selection" && value.domain === "schema_bound_json";
+	});
+	return matches.length === 1 ? matches[0] : undefined;
 }
 
+interface PublicReviewCaptureBinding { collectBinding: string; }
 function publicReviewCaptureBindings(status: ReviewStatusV3): readonly PublicReviewCaptureBinding[] {
 	if (status.nextTransition?.kind !== "collect") return [];
-	return (status.nextTransition.collect?.inputs ?? []).map((input) => ({
-		collectBinding: canonicalReviewCaptureBinding(input),
-	}));
+	return (status.nextTransition.collect?.inputs ?? []).filter((input) => input.captureOperation !== "external.select_intended_untracked").map((input) => ({ collectBinding: canonicalReviewCaptureBinding(input) }));
 }
 
 function captureBindingRejected(reason: string): Record<string, unknown> {
@@ -4600,6 +4618,7 @@ async function executeReviewControllerOperation(
 	writeReviewConsentLatch: typeof recordReviewConsentLatch = recordReviewConsentLatch,
 	reviewConsentNow: () => number = Date.now,
 	reviewConsentScheduleTimer: (callback: () => void, delayMs: number) => { unref: () => void } = setTimeout,
+	intendedUntrackedSelection?: NativeIntendedUntrackedSelectionSubmission,
 ): Promise<Record<string, unknown>> {
 	const parameters = parseReviewControllerParameters(parametersValue);
 	const defaultCwd = resolveReviewControllerWorkspaceRoot(parameters.workspaceRoot, sessionCwd, candidateViews, parameters.lineageId);
@@ -4955,6 +4974,26 @@ async function executeReviewControllerOperation(
 		}
 		return completed;
 	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.SELECT_INTENDED_UNTRACKED) {
+		if (nativeReviewCli?.targetStatus === undefined || nativeReviewCli.start === undefined) return nativeStatusUnsupported(parameters.operation);
+		const canonicalBinding = parseCanonicalReviewCaptureBinding(parameters.selectionBinding!);
+		let status: ReviewStatusV3;
+		try {
+			const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, { cwd: defaultCwd, ...(signal === undefined ? {} : { signal }) }, retainedUntrackedSelections, defaultCwd);
+			if (negotiated.transport !== undefined) return hostTransportUnavailable(parameters.operation, negotiated.transport);
+			status = negotiated.status!;
+		} catch (error) { return nativeStatusFailed(parameters.operation, error); }
+		const input = reviewIntendedUntrackedInput(status), eligibleJson = input === undefined ? undefined : exactCollectArgument(input, "eligible_paths_json"), inventory = input === undefined ? undefined : exactCollectArgument(input, "expected_untracked_inventory");
+		let eligible: unknown;
+		try { eligible = JSON.parse(eligibleJson ?? ""); } catch { eligible = undefined; }
+		const scope = parameters.intendedUntracked!.length === 0 ? NATIVE_START_UNTRACKED_SCOPE.EXCLUDE : NATIVE_START_UNTRACKED_SCOPE.SELECT;
+		const selected = validateNativeStartUntrackedSelection({ untrackedScope: scope, expectedUntrackedInventory: inventory, intendedUntracked: parameters.intendedUntracked });
+		const rejected = input === undefined || canonicalReviewCaptureBinding(input) !== canonicalBinding || exactCollectArgument(input, "target_identity") !== status.targetIdentity || exactCollectArgument(input, "projection") !== status.projection.projection || exactCollectArgument(input, "base_tree") !== status.projection.baseTree || exactCollectArgument(input, "candidate_tree") !== status.projection.currentCandidateTree || !Array.isArray(eligible) || selected.reason !== undefined || selected.intendedUntracked!.some((path) => !eligible.includes(path));
+		if (rejected) return { operation: parameters.operation, status: "blocked", outcome: "intended-untracked-selection-binding-rejected", mutation_performed: false, mutation_outcome: "none" };
+		const submission = { argumentTokens: input.submission!.argumentTokens, value: JSON.stringify({ schema: "gentle-ai.review-intended-untracked-selection/v1", untracked_scope: scope, expected_untracked_inventory: inventory, intended_untracked: selected.intendedUntracked }) };
+		const result = await executeReviewControllerOperation({ operation: REVIEW_CONTROLLER_OPERATION.START, ...(parameters.workspaceRoot === undefined ? {} : { workspaceRoot: parameters.workspaceRoot }), input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, untrackedScope: scope, expectedUntrackedInventory: inventory, intendedUntracked: selected.intendedUntracked }) }, sessionCwd, nativeReviewCli, signal, candidateViews, context, retainedUntrackedSelections, pendingReviewConsentRegistry, pendingReviewConsentFallbackKey, writeReviewConsentLatch, reviewConsentNow, reviewConsentScheduleTimer, submission);
+		return { ...result, operation: parameters.operation };
+	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.START) {
 		const rawStart = parseControllerJson(
 			requiredControllerString(parameters, "input"),
@@ -5001,6 +5040,7 @@ async function executeReviewControllerOperation(
 					...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 					...(canonicalBaseRef === undefined ? {} : { baseRef: canonicalBaseRef, committedOnly: true }),
 					...(untrackedSelection.untrackedScope === undefined ? {} : untrackedSelection),
+					...(intendedUntrackedSelection === undefined ? {} : { intendedUntrackedSelection }),
 					...(signal === undefined ? {} : { signal }),
 				}, retainedUntrackedSelections, defaultCwd);
 				if (negotiated.transport !== undefined) return hostTransportUnavailable(parameters.operation, negotiated.transport);
@@ -5016,10 +5056,16 @@ async function executeReviewControllerOperation(
 			// candidate-target-projection-drift. Timer order must not decide
 			// correctness: the queued cleanup macrotask may not have fired yet.
 			pruneExpiredReviewConsents(pendingReviewConsentRegistry, pendingReviewConsentSession, reviewConsentNow);
+			const candidateIntendedUntracked = target.projection.intendedUntracked;
 			let candidateView: ReturnType<CandidateViewRegistry["create"]> | undefined;
 			let nativeStartAttempted = false;
 			try {
-				candidateView = candidateViews?.createOrReuse({ contributorRoot: defaultCwd, replayKey, ...(canonicalBaseRef === undefined ? {} : { baseRef: canonicalBaseRef, committedOnly: true }), ...(untrackedSelection.untrackedScope === undefined ? {} : { intendedUntracked: untrackedSelection.intendedUntracked }) });
+				const candidateRequest = { contributorRoot: defaultCwd, replayKey, ...(canonicalBaseRef === undefined ? {} : { baseRef: canonicalBaseRef, committedOnly: true }) };
+				candidateView = candidateViews?.createOrReuse({ ...candidateRequest, ...(candidateIntendedUntracked.length === 0 ? {} : { intendedUntracked: candidateIntendedUntracked }) });
+				if (candidateView !== undefined && candidateIntendedUntracked.length === 0 && candidateView.candidateTree !== target.projection.currentCandidateTree) {
+					candidateView.cleanup();
+					candidateView = candidateViews?.createOrReuse({ ...candidateRequest, intendedUntracked: [] });
+				}
 				if (candidateView !== undefined) assertNativeStartCandidateBinding(candidateView, target);
 				let result: NativeStartResult;
 				try {
@@ -5032,6 +5078,7 @@ async function executeReviewControllerOperation(
 						targetIdentity: target.targetIdentity,
 						projection: target.projection.projection,
 						...(untrackedSelection.untrackedScope === undefined ? {} : untrackedSelection),
+						...(intendedUntrackedSelection === undefined ? {} : { intendedUntrackedSelection }),
 						...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
 						...(policy.policyPath === undefined ? {} : { policyPath: policy.policyPath }),
 						...(focus === undefined ? {} : { focus }),

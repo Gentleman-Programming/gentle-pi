@@ -43,6 +43,33 @@ function currentStatusFixture(name: string): Record<string, unknown> {
 	return body;
 }
 
+function initialIntendedUntrackedStatusV6(): JsonObject {
+	const body = currentStatusFixture("status-v5.captured.json");
+	const projection = body.projection as JsonObject;
+	const schema = "gentle-ai.review-intended-untracked-selection/v1";
+	body.schema = "gentle-ai.review-integration.status/v6";
+	body.forecast = {
+		horizon: "partial", steps: [{ step: 1, kind: "collect", reason_code: "intended_untracked_selection_required", description: "initial intended-untracked selection required" }],
+	};
+	body.next_transition = {
+		kind: "collect",
+		reason_code: "intended_untracked_selection_required",
+		collect: { inputs: [{
+			name: "intended_untracked_selection", schema, capture_operation: "external.select_intended_untracked",
+			arguments: [
+				["target_identity", body.target_identity], ["projection", "workspace"], ["base_tree", projection.base_tree],
+				["candidate_tree", projection.current_candidate_tree], ["eligible_paths_json", '["docs/selected.md"]'], ["expected_untracked_inventory", sha("e")],
+			].map(([name, value]) => ({ name, value })),
+			submission: {
+				operation_token: "status",
+				argument_tokens: ["--contract=gentle-ai.review-integration/v2", "--next-transition=true", "--agent=pi", "--projection=workspace", "--intended-untracked-selection={{value}}"],
+				value: { slot: "intended_untracked_selection", domain: "schema_bound_json", schema, substitution_location: 4 },
+			},
+		}] },
+	};
+	return body;
+}
+
 test("captured capabilities retain their exact schema identity", () => {
 	const capabilities = decodeReviewCapabilitiesV2(
 		fixture(DEV_FIXTURES, "capabilities-v2.2.captured.json"),
@@ -57,15 +84,6 @@ test("historical v3 FINALIZE status remains rejected without rewriting fixture b
 		() => decodeReviewStatusV3(fixture(V2_FIXTURES, "status.fixture.json")),
 		/receipt|finalize|status/i,
 	);
-});
-
-test("captured v5 STATUS preserves its strict receipt while routing intended-untracked selection", () => {
-	const body = currentStatusFixture("status-v5.captured.json");
-	(body.next_transition as JsonObject).reason_code = "intended_untracked_selection_required";
-	const decoded = decodeReviewStatusV3(body);
-	assert.deepEqual(decoded.receipt, { status: "not_applicable" });
-	assert.equal(decoded.nextTransition?.kind, "collect");
-	assert.equal(decoded.nextTransition?.reasonCode, "intended_untracked_selection_required");
 });
 
 test("v5 STATUS rejects malformed receipt status, identity, and extra fields", () => {
@@ -323,7 +341,7 @@ function reviewingStartV4(action: "created" | "replayed" = "created"): JsonObjec
 	return body;
 }
 
-test("capabilities/v2.3 requires START/v4 and rejects future identities", () => {
+test("capabilities/v2.3 retains status/v5 while v2.4 requires status/v6", () => {
 	const v23 = clone(fixture(DEV_FIXTURES, "capabilities-v2.2.captured.json") as JsonObject);
 	v23.schema = "gentle-ai.review-integration.capabilities/v2.3";
 	(v23.protocol as JsonObject).minor = 3;
@@ -338,12 +356,24 @@ test("capabilities/v2.3 requires START/v4 and rejects future identities", () => 
 	const decoded = decodeReviewCapabilitiesV2(v23, CAPTURED_DIGEST);
 	assert.equal(decoded.schemas.has("gentle-ai.review-integration.start/v4"), true);
 	assert.equal(decoded.schemas.has("gentle-ai.review-integration.start/v3"), false);
+	assert.equal(decoded.schemas.has("gentle-ai.review-integration.status/v5"), true);
 
-	const future = clone(v23);
-	future.schema = "gentle-ai.review-integration.capabilities/v2.4";
-	(future.protocol as JsonObject).minor = 4;
-	future.schemas = (future.schemas as string[]).map((schema) => schema.replace("capabilities/v2.3", "capabilities/v2.4"));
-	assert.throws(() => decodeReviewCapabilitiesV2(future, CAPTURED_DIGEST), /schema must be one of/);
+	const v24 = clone(v23);
+	v24.schema = "gentle-ai.review-integration.capabilities/v2.4";
+	(v24.protocol as JsonObject).minor = 4;
+	v24.schemas = [
+		...(v24.schemas as string[]).map((schema) => schema
+			.replace("capabilities/v2.3", "capabilities/v2.4")
+			.replace("status/v5", "status/v6")),
+		"gentle-ai.review-intended-untracked-selection/v1",
+	];
+	const v24Decoded = decodeReviewCapabilitiesV2(v24, CAPTURED_DIGEST);
+	assert.equal(v24Decoded.schemas.has("gentle-ai.review-integration.status/v6"), true);
+	assert.equal(v24Decoded.schemas.has("gentle-ai.review-integration.status/v5"), false);
+
+	const missingStatusV6 = clone(v24);
+	missingStatusV6.schemas = (missingStatusV6.schemas as string[]).map((schema) => schema.replace("status/v6", "status/v5"));
+	assert.throws(() => decodeReviewCapabilitiesV2(missingStatusV6, CAPTURED_DIGEST), /status\/v6/);
 
 	// Distinguishing case for the v2.3 retired-schema filter: the real rc.3
 	// provider no longer advertises these three identities, so a v2.3
@@ -361,6 +391,51 @@ test("capabilities/v2.3 requires START/v4 and rejects future identities", () => 
 	const v22Retired = clone(fixture(DEV_FIXTURES, "capabilities-v2.2.captured.json") as JsonObject);
 	v22Retired.schemas = (v22Retired.schemas as string[]).filter((schema) => !retiredSchemas.includes(schema));
 	assert.throws(() => decodeReviewCapabilitiesV2(v22Retired, CAPTURED_DIGEST), /schema/);
+});
+
+test("status/v6 decodes and enforces the intended-untracked selection submission", () => {
+	const decoded = decodeReviewStatusV3(initialIntendedUntrackedStatusV6());
+	const input = decoded.nextTransition?.collect?.inputs[0];
+	assert.deepEqual([input?.schema, input?.captureOperation, input?.arguments, input?.submission], [
+		"gentle-ai.review-intended-untracked-selection/v1", "external.select_intended_untracked", [
+			{ name: "target_identity", value: decoded.targetIdentity }, { name: "projection", value: "workspace" },
+			{ name: "base_tree", value: decoded.projection.baseTree }, { name: "candidate_tree", value: decoded.projection.currentCandidateTree },
+			{ name: "eligible_paths_json", value: '["docs/selected.md"]' }, { name: "expected_untracked_inventory", value: sha("e") },
+		], {
+			operationToken: "status",
+			argumentTokens: ["--contract=gentle-ai.review-integration/v2", "--next-transition=true", "--agent=pi", "--projection=workspace", "--intended-untracked-selection={{value}}"],
+			values: [{ slot: "intended_untracked_selection", domain: "schema_bound_json", schema: "gentle-ai.review-intended-untracked-selection/v1", substitutionLocation: 4 }],
+		},
+	]);
+	const submission = (body: JsonObject) => (((body.next_transition as JsonObject).collect as JsonObject).inputs as JsonObject[])[0]!.submission as JsonObject;
+	const cases: Array<[string, (value: JsonObject) => void, RegExp]> = [
+		["operation", (value) => { value.operation_token = "start"; }, /operation/],
+		["competing values", (value) => { value.values = [clone(value.value)]; }, /value/],
+		["slot", (value) => { delete (value.value as JsonObject).slot; }, /slot/],
+		["schema", (value) => { (value.value as JsonObject).schema = "gentle-ai.review-intended-untracked-selection/v2"; }, /schema/],
+		["placeholder", (value) => { (value.argument_tokens as string[])[4] = "--intended-untracked-selection={{selection}}"; }, /value|substitution/],
+		["location", (value) => { (value.value as JsonObject).substitution_location = 3; }, /substitution/],
+	];
+	for (const [name, mutate, pattern] of cases) {
+		const body = initialIntendedUntrackedStatusV6();
+		mutate(submission(body));
+		assert.throws(() => decodeReviewStatusV3(body), pattern, name);
+	}
+	const v5 = initialIntendedUntrackedStatusV6();
+	v5.schema = "gentle-ai.review-integration.status/v5";
+	assert.throws(() => decodeReviewStatusV3(v5), /submission/);
+
+	const collectInput = (body: JsonObject) => (((body.next_transition as JsonObject).collect as JsonObject).inputs as JsonObject[])[0]!;
+	const artifactSubject = { schema: "gentle-ai.review-artifact-subject/v2", subject_hash: sha("a"), lineage_id: "review-test", authority_revision: sha("b"), target_identity: sha("c"), base_tree: "a".repeat(40), candidate_tree: "b".repeat(40), changed_path_manifest_sha256: sha("d"), lens: "review-risk", selected_order: 0 };
+	const incompatibleCaptures: ReadonlyArray<readonly [string, JsonObject]> = [
+		["review.capture-result", { schema: "https://gentle-ai.dev/schema/review/reviewer/v1", artifact_subject: artifactSubject, base_tree: "a".repeat(40), candidate_tree: "b".repeat(40), changed_path_manifest: [{ path: "x.ts", status: "M", old_mode: "100644", new_mode: "100644", deleted: false, type_changed: false, mode_only: false, intended_untracked: false }] }],
+		["review.capture-correction-plan", { schema: "gentle-ai.review-correction-plan/v1" }],
+	];
+	for (const [captureOperation, fields] of incompatibleCaptures) {
+		const body = initialIntendedUntrackedStatusV6();
+		Object.assign(collectInput(body), { capture_operation: captureOperation, ...fields });
+		assert.throws(() => decodeReviewStatusV3(body), /operation_token/, captureOperation);
+	}
 });
 
 test("START/v4 accepts only its reviewing status continuation and preserves v3 strictness", () => {

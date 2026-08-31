@@ -441,6 +441,11 @@ export const NATIVE_UNTRACKED_SCOPE = {
 
 
 
+
+
+
+
+
 export const NATIVE_REVIEW_CONSENT_ANSWER = { GRANTED: "granted", DECLINED: "declined" }         ;
 
 
@@ -1853,6 +1858,7 @@ export class NativeReviewCliV216                            {
 			...(request.baseRef === undefined ? {} : { baseRef: request.baseRef, committedOnly: true }),
 			...(request.lineageId === undefined ? {} : { lineageId: request.lineageId }),
 			...selection,
+			...(request.intendedUntrackedSelection === undefined ? {} : { intendedUntrackedSelection: request.intendedUntrackedSelection }),
 			agent: "pi",
 			...(request.signal === undefined ? {} : { signal: request.signal }),
 		});
@@ -1956,7 +1962,9 @@ export class NativeReviewCliV216                            {
 		if (request.baseRef !== undefined && request.committedOnly !== true) throw new TypeError("Native STATUS baseRef requires explicit committedOnly acknowledgement");
 		if (request.baseRef === undefined && request.committedOnly !== undefined) throw new TypeError("Native STATUS committedOnly requires an explicit baseRef");
 		const selection = nativeUntrackedSelection(request);
-		const execution = await this.negotiated(NATIVE_REVIEW_OPERATION.STATUS, request.cwd, [
+		const submitted = request.intendedUntrackedSelection;
+		if (submitted !== undefined && submitted.argumentTokens.filter((token) => token.includes("{{value}}")).length !== 1) throw new TypeError("Native intended-untracked selection requires exactly one provider-issued {{value}} token");
+		const statusArguments = submitted === undefined ? [
 			"review", "status", "--contract", REVIEW_INTEGRATION_CONTRACT, "--cwd", request.cwd,
 			"--projection", request.projection ?? "workspace",
 			...nativeUntrackedSelectionArguments(selection),
@@ -1964,7 +1972,8 @@ export class NativeReviewCliV216                            {
 			...(request.lineageId === undefined ? [] : ["--lineage", request.lineageId]),
 			...(request.agent === undefined ? [] : ["--agent", request.agent]),
 			"--next-transition",
-		], false, request.signal);
+		] : ["review", "status", "--cwd", request.cwd, ...submitted.argumentTokens.map((token) => token.replaceAll("{{value}}", submitted.value))];
+		const execution = await this.negotiated(NATIVE_REVIEW_OPERATION.STATUS, request.cwd, statusArguments, false, request.signal);
 		assertSupportedNextTransitionOperation(execution.body);
 		return decode(NATIVE_REVIEW_OPERATION.STATUS, false, () => decodeReviewStatusV3(execution.body));
 	}

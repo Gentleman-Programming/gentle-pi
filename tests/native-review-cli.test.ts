@@ -294,6 +294,40 @@ test("native START queries STATUS then executes only the provider-rendered order
 	]);
 });
 
+test("native START relays provider-owned intended-untracked selection and transition argv verbatim", async () => {
+	const selectionValue = JSON.stringify(["new.ts", "nested/other.ts"]);
+	const selectionTokens = ["--selection-kind=untracked", "--selection-json={{value}}", "--selection-proof=provider-issued"];
+	const startTokens = [
+		"--contract=gentle-ai.review-integration/v2", "--cwd=/repo", `--target=${TARGET}`,
+		"--projection=workspace", "--agent=pi", "--consent=relay",
+	];
+	const queue = queuedAdapter([
+		{ stdout: JSON.stringify(negotiatedStartStatus(TARGET, startTokens)) },
+		{ stdout: JSON.stringify(fixture("start-v3-zero-lens-closed.captured.json")) },
+	]);
+	await client(queue.adapter).start({
+		cwd: "/repo",
+		targetIdentity: TARGET,
+		intendedUntrackedSelection: { argumentTokens: selectionTokens, value: selectionValue },
+	});
+	assert.deepEqual(queue.calls.map((call) => call.arguments), [
+		["review", "status", "--cwd", "/repo", "--selection-kind=untracked", `--selection-json=${selectionValue}`, "--selection-proof=provider-issued"],
+		["review", "start", ...startTokens],
+	]);
+	for (const flag of ["--untracked-scope", "--expected-untracked-inventory", "--intended-untracked", "--contract", "--agent", "--projection"]) {
+		assert.equal(queue.calls[0]?.arguments.includes(flag), false, flag);
+	}
+
+	for (const argumentTokens of [["--selection-json=value"], ["--selection-json={{value}}", "--duplicate={{value}}"]]) {
+		const rejected = queuedAdapter([]);
+		await assert.rejects(
+			() => client(rejected.adapter).start({ cwd: "/repo", targetIdentity: TARGET, intendedUntrackedSelection: { argumentTokens, value: selectionValue } }),
+			/exactly one provider-issued \{\{value\}\} token/,
+		);
+		assert.equal(rejected.calls.length, 0);
+	}
+});
+
 test("native START retains the provider-owned START/v4 status transition in exact argument order", async () => {
 	const tokens = [
 		"--contract=gentle-ai.review-integration/v2", "--cwd=/repo", `--target=${TARGET}`,
