@@ -4,7 +4,7 @@ import { cpSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
-import { resolveRepositoryAuthorityV1, setReviewRepositoryIdentityRetryHookForTesting } from "../lib/review-repository.ts";
+import { resolveRepositoryAuthorityV1, reviewGitEnvironment, setReviewRepositoryIdentityRetryHookForTesting } from "../lib/review-repository.ts";
 import { REVIEW_MODE, ReviewTransactionStore, createReviewState, setReviewMutationLockPlatformForTesting } from "../lib/review-transaction.ts";
 import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
 import { qualifiedReviewLockPlatform, testSnapshot } from "./review-test-fixtures.ts";
@@ -167,4 +167,40 @@ test("a reader racing the first-time IDENTITY write recovers once the concurrent
 	const authority = resolveRepositoryAuthorityV1(root);
 	assert.equal(hookCalls, 1);
 	assert.deepEqual(authority.repository_identity.root_commit_ids, [rootCommit]);
+});
+
+test("scoped-config keys are sanitized, routing keys still fail closed", () => {
+	// Agent harnesses routinely export GIT_CONFIG_COUNT + scoped credential keys
+	// to disable interactive git prompts; these are not routing controls and must
+	// NOT make every review-authority probe fail closed. True routing keys keep
+	// the REVIEW_GIT_ENV_UNSAFE throw.
+	const ambientScoped = {
+		GIT_CONFIG_COUNT: "2",
+		GIT_CONFIG_KEY_0: "credential.interactive",
+		GIT_CONFIG_VALUE_0: "false",
+		GIT_CONFIG_KEY_1: "credential.guiPrompt",
+		GIT_CONFIG_VALUE_1: "false",
+	};
+	const touched = [...Object.keys(ambientScoped), "GIT_DIR"] as const;
+	const previous: Record<string, string | undefined> = {};
+	for (const key of touched) {
+		previous[key] = process.env[key];
+		delete process.env[key];
+	}
+	try {
+		Object.assign(process.env, ambientScoped);
+		const environment = reviewGitEnvironment();
+		assert.equal(environment.GIT_CONFIG_COUNT, undefined, "scoped config must be stripped from the child env");
+		assert.equal(environment.GIT_CONFIG_KEY_0, undefined);
+		assert.equal(environment.GIT_CONFIG_GLOBAL, process.platform === "win32" ? "NUL" : "/dev/null", "config neutralization stays");
+
+		process.env.GIT_DIR = "C:\attacker\repo";
+		assert.throws(() => reviewGitEnvironment(), /REVIEW_GIT_ENV_UNSAFE/, "routing keys must still fail closed");
+	} finally {
+		for (const key of touched) {
+			const value = previous[key];
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
 });

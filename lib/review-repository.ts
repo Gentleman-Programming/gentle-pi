@@ -50,7 +50,14 @@ export function inheritedUnsafeGitEnvironmentKeys(
 export function reviewGitEnvironment(): NodeJS.ProcessEnv {
 	for (const key of Object.keys(process.env)) {
 		const normalizedKey = key.toUpperCase();
-		if (UNSAFE_GIT_ENVIRONMENT.has(normalizedKey) || /^GIT_CONFIG_(?:KEY|VALUE)_/.test(normalizedKey)) throw new ReviewRepositoryError("REVIEW_GIT_ENV_UNSAFE: inherited Git routing/configuration override is present");
+		// Scoped-config keys (GIT_CONFIG_COUNT + GIT_CONFIG_KEY_*/GIT_CONFIG_VALUE_*)
+		// are routinely exported by agent harnesses to disable interactive
+		// credential prompts (e.g. GIT_CONFIG_COUNT=2 with
+		// credential.interactive=false) and are not routing controls; they are
+		// stripped silently below (all GIT_* keys are dropped from the child env).
+		// Every other routing/config override still fails closed.
+		if (normalizedKey === "GIT_CONFIG_COUNT" || /^GIT_CONFIG_(?:KEY|VALUE)_/.test(normalizedKey)) continue;
+		if (UNSAFE_GIT_ENVIRONMENT.has(normalizedKey)) throw new ReviewRepositoryError("REVIEW_GIT_ENV_UNSAFE: inherited Git routing/configuration override is present");
 	}
 	const environment: NodeJS.ProcessEnv = {};
 	for (const [key, value] of Object.entries(process.env)) if (!key.startsWith("GIT_")) environment[key] = value;
