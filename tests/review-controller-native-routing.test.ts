@@ -714,7 +714,13 @@ test("pre-lineage intended-untracked selection revalidates and starts at an expl
 	for (const invalid of [
 		{ selectionBinding: selectionBinding.replace(eligible, "docs/stale.md"), intendedUntracked: [eligible] },
 		{ selectionBinding, intendedUntracked: [eligible, eligible] }, { selectionBinding, intendedUntracked: ["docs/unknown.md"] },
-	]) await __testing.executeReviewControllerOperation({ operation: "select-intended-untracked", ...invalid } as never, cwd, native, undefined, undefined, undefined, retained);
+	]) {
+		const rejection = await __testing.executeReviewControllerOperation({ operation: "select-intended-untracked", ...invalid } as never, cwd, native, undefined, undefined, undefined, retained);
+		assert.equal(rejection.status, "blocked", JSON.stringify(invalid));
+		assert.equal(rejection.outcome, "intended-untracked-selection-binding-rejected", JSON.stringify(invalid));
+		assert.equal(rejection.mutation_performed, false, JSON.stringify(invalid));
+		assert.equal(rejection.mutation_outcome, "none", JSON.stringify(invalid));
+	}
 	await assert.rejects(() => __testing.executeReviewControllerOperation({ operation: "select-intended-untracked", selectionBinding, intendedUntracked: [eligible], input: "{}" } as never, cwd, native, undefined, undefined, undefined, retained), /exactly selectionBinding/);
 	assert.equal(starts.length, 1);
 	assert.equal(requests.every((request) => !("lineageId" in request)), true);

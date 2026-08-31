@@ -318,7 +318,7 @@ test("native START relays provider-owned intended-untracked selection and transi
 		assert.equal(queue.calls[0]?.arguments.includes(flag), false, flag);
 	}
 
-	for (const argumentTokens of [["--selection-json=value"], ["--selection-json={{value}}", "--duplicate={{value}}"]]) {
+	for (const argumentTokens of [["--selection-json=value"], ["--selection-json={{value}}", "--duplicate={{value}}"], ["--selection-json={{value}}{{value}}"]]) {
 		const rejected = queuedAdapter([]);
 		await assert.rejects(
 			() => client(rejected.adapter).start({ cwd: "/repo", targetIdentity: TARGET, intendedUntrackedSelection: { argumentTokens, value: selectionValue } }),

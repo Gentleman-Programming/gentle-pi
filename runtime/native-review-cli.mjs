@@ -1963,7 +1963,7 @@ export class NativeReviewCliV216                            {
 		if (request.baseRef === undefined && request.committedOnly !== undefined) throw new TypeError("Native STATUS committedOnly requires an explicit baseRef");
 		const selection = nativeUntrackedSelection(request);
 		const submitted = request.intendedUntrackedSelection;
-		if (submitted !== undefined && submitted.argumentTokens.filter((token) => token.includes("{{value}}")).length !== 1) throw new TypeError("Native intended-untracked selection requires exactly one provider-issued {{value}} token");
+		if (submitted !== undefined && submitted.argumentTokens.reduce((count, token) => count + token.split("{{value}}").length - 1, 0) !== 1) throw new TypeError("Native intended-untracked selection requires exactly one provider-issued {{value}} token");
 		const statusArguments = submitted === undefined ? [
 			"review", "status", "--contract", REVIEW_INTEGRATION_CONTRACT, "--cwd", request.cwd,
 			"--projection", request.projection ?? "workspace",
