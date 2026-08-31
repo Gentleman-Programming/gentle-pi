@@ -2670,7 +2670,7 @@ const REVIEW_CAPTURE_PARAMETERS = {
 		correctionLines: {
 			type: "integer",
 			minimum: 1,
-			description: "Positive correction-line plan, accepted only for the selected provider correction-plan slot and within its exact bounds.",
+			description: "Positive correction-line plan in diff lines: one replaced source line counts as two (one deletion plus one addition). A different unit from the provider's frozen logical correction budget. Accepted only for the selected provider correction-plan slot and within its exact bounds.",
 		},
 		workspaceRoot: {
 			type: "string",
@@ -4515,6 +4515,14 @@ async function executeReviewCaptureOperation(
 	const selected = selectExactReviewCapture(status, parameters.lineageId, canonicalBinding);
 	if (!isSelectedReviewCapture(selected)) return selected;
 
+	// During correction the flow carries both the original authority target
+	// identity and a distinct provider-issued correction target identity
+	// (gentle-pi#535 row 15). Echo the correction one on the capture result so
+	// the caller never reconstructs which is which from the opaque binding.
+	const correctionTargetIdentity = selected.input.validationRequest?.correctionTargetIdentity ?? selected.input.artifactSubject?.correctionTargetIdentity;
+	const withCorrectionTarget = (result: Record<string, unknown>): Record<string, unknown> =>
+		correctionTargetIdentity === undefined ? result : { ...result, correction_target_identity: correctionTargetIdentity };
+
 	const hostRelaySlots = reviewHostRelaySlots([selected.input]);
 	if (hostRelaySlots.length === 1) {
 		if (parameters.correctionLines !== undefined) return captureBindingRejected("correctionLines is valid only for a correction-plan capture");
@@ -4532,7 +4540,7 @@ async function executeReviewCaptureOperation(
 				mutation_outcome: "none",
 			};
 		}
-		return await executeReviewHostRelayCapture(hostRelaySlots[0]!, nativeReviewCli, cwd, selected.binding, retainedUntrackedSelections, route, signal);
+		return withCorrectionTarget(await executeReviewHostRelayCapture(hostRelaySlots[0]!, nativeReviewCli, cwd, selected.binding, retainedUntrackedSelections, route, signal));
 	}
 
 	if (selected.input.captureOperation === "review.capture-correction-plan") {
@@ -4562,7 +4570,7 @@ async function executeReviewCaptureOperation(
 				cwd,
 				...(signal === undefined ? {} : { signal }),
 			});
-			return mapAndClearLastEventClosure(closure, selected.binding, retainedUntrackedSelections, cwd);
+			return withCorrectionTarget(mapAndClearLastEventClosure(closure, selected.binding, retainedUntrackedSelections, cwd));
 		} catch (error) {
 			return await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, selected.binding, retainedUntrackedSelections, route);
 		}
@@ -4573,7 +4581,7 @@ async function executeReviewCaptureOperation(
 		if (parameters.reviewerRunAcknowledged !== undefined || parameters.correctionLines !== undefined) {
 			return captureBindingRejected("reviewerRunAcknowledged and correctionLines are not valid for a provider role capture");
 		}
-		return await executeProviderRoleVectorCapture(providerRoleSlots[0]!, nativeReviewCli, cwd, selected.binding, retainedUntrackedSelections, route, signal);
+		return withCorrectionTarget(await executeProviderRoleVectorCapture(providerRoleSlots[0]!, nativeReviewCli, cwd, selected.binding, retainedUntrackedSelections, route, signal));
 	}
 	return captureBindingRejected(`unsupported provider capture operation: ${selected.input.captureOperation}`);
 }
@@ -5413,7 +5421,7 @@ function createGentleAiExtensionForTesting(
 		promptSnippet: "Use one exact current STATUS collectBinding for one ordinary native capture; call fresh STATUS before every additional capture.",
 		promptGuidelines: [
 			"Pass only lineageId, the JSON-serialized exact collectBinding from current STATUS, and the route-specific optional acknowledgement or correctionLines value. Never compose provider argument tokens, prompts, results, verdicts, or lens arrays.",
-			"A materialize reviewer slot first forecasts one model run; re-submit that same exact binding with reviewerRunAcknowledged: true to authorize one host relay. Correction-plan slots require correctionLines inside the provider-issued bounds. Refuter and validation vectors execute exactly once as provider-rendered.",
+			"A materialize reviewer slot first forecasts one model run; re-submit that same exact binding with reviewerRunAcknowledged: true to authorize one host relay. Correction-plan slots require correctionLines inside the provider-issued bounds, counted in diff lines (one replaced source line is one deletion plus one addition) — a different unit from the frozen logical correction budget. Refuter and validation vectors execute exactly once as provider-rendered.",
 			"A native terminal closure or nonterminal capture returns directly. Do not expect automatic STATUS, FINALIZE, receipt, delivery, or another capture; call fresh STATUS before any next capture.",
 		],
 		parameters: REVIEW_CAPTURE_PARAMETERS,
@@ -5453,7 +5461,7 @@ function createGentleAiExtensionForTesting(
 			"Inspect and recover review authority and start native ordinary review. Ordinary capture is available only through the separate gentle_review_capture tool. Review outcomes never authorize delivery: commit, push, pull-request, and release commands follow ordinary repository policy. RESET/RECOVER remain destructive and are executed by the audited native CLI.",
 		promptSnippet: "Inspect authority, then start native ordinary review; use gentle_review_capture for one current collect slot",
 		promptGuidelines: [
-			'Call {"operation":"inspect"} before START. New native ordinary START uses a JSON string such as "{\\"mode\\":\\"ordinary\\"}"; an explicit baseRef must be paired with committedOnly: true to request a committed range, while policyPath remains repository-local. policyHash is legacy compact-only. The controller derives lineage, Git/untracked scope, tier, lenses, authored lines, and budget.',
+			'Call {"operation":"inspect"} before START. New native ordinary START uses a JSON string such as "{\\"mode\\":\\"ordinary\\"}"; an explicit baseRef must be paired with committedOnly: true to request a committed range, while policyPath remains repository-local. policyHash is legacy compact-only. The controller derives lineage, Git/untracked scope, tier, lenses, authored lines, and budget; the frozen correction budget counts logical corrections, while correction-plan correctionLines count diff lines (one replaced source line is one deletion plus one addition).',
 			"Use RECONCILE_AUTHORITY only to quarantine one invalid native recovery successor. Supply exact predecessorLineage, expectedPredecessorRevision, successorLineage, expectedSuccessorRevision, actor, and reason values; Pi derives and displays the seven-line native authorization binding for fresh UI approval. The predecessor stays untouched, native returns the durable audit record, and Pi never falls back to RESET or RECOVER.",
 			"Use ABANDON or QUARANTINE_LEGACY only after an explicit user decision and with exact native inputs. ABANDON needs lineage, expectedRevision, snapshotIdentity, capturedLensResults, findingsPresent, evidenceRecordsPresent, actor, and reason; QUARANTINE_LEGACY accepts only the published malformed freeze-findings diagnostic/disposition. A dual reconciliation may supply only anomalies `unchanged_target,malformed_recovery_authorization` in that exact order. Use REPAIR_LEGACY_ALIAS only with lineage, actor, and reason: Pi freshly reads native inventory and derives repository, revision, diagnostic, disposition, and the exact eight-line binding before interactive approval. `review dispose-result` is unsupported pending design.",
 			"Lens, refuter, and validator verdicts are admitted natively, never Pi-authored. Use gentle_review_capture with exactly one current provider-owned collectBinding for ordinary native capture; it never follows another transition.",

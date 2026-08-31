@@ -922,6 +922,59 @@ test("targeted-validator provider vectors preserve their nonuniform native closu
 	const result = await __testing.executeReviewCaptureOperation({ lineageId: closureLineage, collectBinding: JSON.stringify(input) }, process.cwd(), native);
 	assert.equal(result.status, "closed");
 	assert.equal(result.outcome, "native-last-event-closure");
+	assert.equal("correction_target_identity" in result, false);
+});
+
+test("targeted-validator captures echo the distinct provider correction target identity", async () => {
+	const closureLineage = "review-validator-correction-target";
+	const correctionTarget = `sha256:${"d".repeat(64)}`;
+	const baseInput = collectInput(closureLineage);
+	const { submission: _submission, artifactSubject: _artifactSubject, ...roleInput } = baseInput;
+	void _submission;
+	void _artifactSubject;
+	const input = {
+		...roleInput,
+		name: "provider_targeted_validator",
+		schema: "https://gentle-ai.dev/schema/review/targeted-validator/v1",
+		captureOperation: "review.capture-validation",
+		arguments: [
+			{ name: "lineage", value: closureLineage, token: `--lineage=${closureLineage}` },
+			{ name: "target", value: correctionTarget, token: `--target=${correctionTarget}` },
+			{ name: "agent", value: "pi", token: "--agent=pi" },
+			{ name: "execute", value: "true", token: "--execute=true" },
+		],
+		validationRequest: { correctionTargetIdentity: correctionTarget },
+	} as unknown as ReviewCollectInputV3;
+	const roleStatus = { ...status(closureLineage), nextTransition: { kind: "collect", reasonCode: "provider_role_required", collect: { inputs: [input] } } } as ReviewStatusV3;
+	const native = {
+		targetStatus: async () => roleStatus,
+		captureProviderRole: async () => ({ schema: "gentle-ai.review-last-event-closure/v1", operation: "review/capture-validation", lineageId: closureLineage, state: "approved", storeRevision: SHA }),
+	} as unknown as NativeReviewCli;
+	const result = await __testing.executeReviewCaptureOperation({ lineageId: closureLineage, collectBinding: JSON.stringify(input) }, process.cwd(), native);
+	assert.equal(result.outcome, "native-last-event-closure");
+	assert.equal(result.correction_target_identity, correctionTarget);
+});
+
+test("capture schema and guidance name diff-line units apart from the frozen logical correction budget", () => {
+	const tools = new Map<string, { description: string; promptGuidelines?: readonly string[]; parameters: unknown }>();
+	createGentleAiExtension({ nativeReviewCli: null })({
+		on() {},
+		registerTool(definition: { name: string; description: string; promptGuidelines?: readonly string[]; parameters: unknown }) { tools.set(definition.name, definition); },
+		registerCommand() {},
+	} as unknown as ExtensionAPI);
+	const capture = tools.get("gentle_review_capture");
+	const controller = tools.get("gentle_review");
+	assert.ok(capture);
+	assert.ok(controller);
+	const schema = JSON.stringify(capture.parameters);
+	assert.match(schema, /diff lines/);
+	assert.match(schema, /logical correction budget/);
+	const captureGuidance = (capture.promptGuidelines ?? []).join("\n");
+	assert.match(captureGuidance, /diff lines/);
+	assert.match(captureGuidance, /logical correction budget/);
+	const controllerGuidance = (controller.promptGuidelines ?? []).join("\n");
+	assert.match(controllerGuidance, /logical correction/);
+	assert.match(controllerGuidance, /diff lines/);
 });
 
 test("correction-plan collection demands provider-bounded lines, then returns its terminal closure", async () => {
