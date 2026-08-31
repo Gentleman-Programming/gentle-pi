@@ -4879,6 +4879,9 @@ async function executeReviewControllerOperation(
 				...(signal === undefined ? {} : { signal }),
 			});
 			clearRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, parameters.lineageId);
+			// The registry owns restoring writability of its 0555 views before
+			// removal; a terminal approved cleanup keeps the lineage projection.
+			candidateViews?.cleanupTerminal(parameters.lineageId, "approved", defaultCwd);
 			return {
 				operation: parameters.operation,
 				status: "closed",
