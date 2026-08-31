@@ -8,7 +8,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { __testing, createGentleAiExtension, PendingReviewConsentRegistry } from "../extensions/gentle-ai.ts";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError, NativeReviewConsentRequiredError, type NativeReviewCli } from "../lib/native-review-cli.ts";
-import { decodeReviewConsentV3, type ReviewCollectInputV3, type ReviewStatusV3 } from "../lib/review-integration-v2.ts";
+import { decodeReviewConsentV3, decodeReviewStatusV3, type ReviewCollectInputV3, type ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 
 const SHA = `sha256:${"a".repeat(64)}`;
 const TREE = "b".repeat(40);
@@ -1088,5 +1088,55 @@ test("controller forwards AbortSignal and retains typed native diagnostics witho
 		assert.equal(failed.outcome, "native-status-package-binary-missing");
 		assert.equal(failed.mutation_outcome, "none");
 		assert.equal((failed.diagnostics as { error_code?: string }).error_code, NATIVE_REVIEW_ERROR_CODE.PACKAGE_BINARY_MISSING);
+	}
+});
+
+// #465: a collect-state STATUS/INSPECT/START answer used to carry every
+// provider collect input twice, once inside result.next_transition.collect
+// and once as the canonical collectBinding string, so a four-lens review paid
+// roughly 28k characters per call and again on every blocked retry. The
+// consumed projection is collectBindings; the raw inputs are the duplicate.
+function fourLensCollectStatus(): { raw: Record<string, unknown>; lenses: readonly string[] } {
+	const captured = JSON.parse(readFileSync(new URL("./fixtures/devbinary/status-v5-capture-result-submission.captured.json", import.meta.url), "utf8")) as Record<string, unknown>;
+	const nextTransition = captured.next_transition as { collect: { inputs: Array<Record<string, unknown>> } };
+	const template = nextTransition.collect.inputs[0]!;
+	const lenses = ["review-risk", "review-readability", "review-reliability", "review-resilience"] as const;
+	// The captured input names its lens in the capture arguments and again in
+	// the provider-owned submission tokens; rewrite every occurrence so each of
+	// the four inputs is one distinct provider slot.
+	const inputs = lenses.map((lens, order) => JSON.parse(JSON.stringify(template).replaceAll("review-reliability", lens).replaceAll("--order=0", `--order=${order}`)) as Record<string, unknown>);
+	// The captured envelope predates the current action enumeration; the collect transition is what this test exercises.
+	return { raw: { ...captured, action: "stop", next_transition: { ...nextTransition, collect: { inputs } } }, lenses };
+}
+
+function occurrences(haystack: string, needle: string): number {
+	return haystack.split(needle).length - 1;
+}
+
+test("collect-state public STATUS, INSPECT, and START serialize each provider collect input exactly once", async () => {
+	const { raw, lenses } = fourLensCollectStatus();
+	const status = decodeReviewStatusV3(raw);
+	const lineageId = status.authority!.lineageId!;
+	const native = { targetStatus: async () => status } as unknown as NativeReviewCli;
+	for (const parameters of [
+		{ operation: "status", lineageId },
+		{ operation: "inspect" },
+		{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+	] as const) {
+		const result = await __testing.executeReviewControllerOperation(parameters, process.cwd(), native);
+		assert.equal(result.status, "blocked", parameters.operation);
+		const bindings = result.collectBindings as readonly { collectBinding: string }[];
+		assert.equal(bindings.length, lenses.length, parameters.operation);
+		const serialized = JSON.stringify(result);
+		const projected = JSON.stringify(bindings);
+		for (const lens of lenses) {
+			const needle = `--lens=${lens}`;
+			assert.ok(occurrences(projected, needle) > 0, `${lens} must be published through collectBindings`);
+			assert.equal(occurrences(JSON.stringify(result.result), needle), 0, `${parameters.operation} must not repeat the ${lens} collect input inside result (${serialized.length} characters)`);
+			assert.equal(occurrences(serialized, needle), occurrences(projected, needle), `${parameters.operation} must serialize the ${lens} collect input exactly once (${serialized.length} characters)`);
+		}
+		const transition = (result.result as { next_transition: { kind: string } }).next_transition;
+		assert.equal(transition.kind, "collect", `${parameters.operation} keeps the transition kind so the orchestrator still sees the collect state`);
+		assert.ok(serialized.length < 2 * JSON.stringify(bindings).length, `${parameters.operation} answer (${serialized.length} characters) must not double the ${JSON.stringify(bindings).length}-character binding projection`);
 	}
 });

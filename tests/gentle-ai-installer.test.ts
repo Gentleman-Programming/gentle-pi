@@ -873,3 +873,22 @@ test("installer rejects an archive without the expected regular executable", asy
 	);
 	assert.equal(existsSync(join(packageRoot, ".gentle-ai", "v2.5.0-rc.3", "gentle-ai")), false);
 });
+
+// #400: a clean Windows source build measured 232 s on a cold module cache,
+// so `go install` cannot share the 120 s bound that fits the `go version`
+// probes. The probes keep their bound; the build gets its own.
+test("Windows source build bounds go install separately from the Go toolchain probes", async () => {
+	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-windows-timeout-"));
+	const fixture = windowsGoFixture();
+	const goPath = join(packageRoot, "go.exe");
+	await writeFile(goPath, "trusted local Go executable");
+	fixture.setGoExecutable(goPath);
+	await installGentleAi({ packageRoot, platform: "win32", arch: "x64", execFile: fixture.run, resolveGoExecutable: async () => goPath });
+	const goCalls = fixture.calls.filter((call) => call.file === goPath);
+	const install = goCalls.find((call) => call.arguments_[0] === "install");
+	assert.ok(install, "go install must run");
+	assert.ok(typeof install.options.timeout === "number" && install.options.timeout >= 600_000, `go install must get at least a ten-minute bound, received ${install.options.timeout}`);
+	const probes = goCalls.filter((call) => call.arguments_[0] === "version");
+	assert.ok(probes.length >= 2, "go version probes must run");
+	for (const probe of probes) assert.equal(probe.options.timeout, 120_000, `go ${probe.arguments_.join(" ")} keeps the probe bound`);
+});

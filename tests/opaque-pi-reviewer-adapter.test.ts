@@ -8,6 +8,7 @@ import {
 	OPAQUE_PI_REVIEWER_ARGV,
 	OPAQUE_PI_REVIEWER_TRANSPORT_FAILURE,
 	OpaquePiReviewerTransportError,
+	resolvePiLaunch,
 	runOpaquePiReviewer,
 } from "../lib/opaque-pi-reviewer-adapter.ts";
 
@@ -229,5 +230,37 @@ test("the opaque adapter has no review lifecycle imports or identifiers", () => 
 	assert.doesNotMatch(source, /review-integration|gentle-ai|materialize|submit/i);
 	for (const identifier of ["lineage", "target", "revision", "receipt", "lens", "order", "subject", "schema", "capture", "submission", "status", "model", "provider", "profile"]) {
 		assert.doesNotMatch(source, new RegExp(`\\b${identifier}\\b`, "i"), `adapter must not contain lifecycle identifier ${identifier}`);
+	}
+});
+
+// #468 / #519: on Windows a bare `pi` resolves to pi.cmd, pi.ps1, or a POSIX
+// shim, none of which Node can spawn with shell:false (EINVAL or ENOENT). The
+// relay already runs inside Pi, so the host's own JavaScript entry is spawned
+// through process.execPath instead. Other platforms keep today's exact shape.
+test("the Pi launch shape spawns the host entry through process.execPath on win32 and stays byte-identical elsewhere", () => {
+	const host = {
+		execPath: "C:\\Program Files\\nodejs\\node.exe",
+		entry: "C:\\Users\\dev\\AppData\\Local\\pnpm\\global\\5\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js",
+	};
+	const windows = resolvePiLaunch(undefined, "win32", host);
+	assert.deepEqual(windows, { file: host.execPath, arguments: [host.entry, ...OPAQUE_PI_REVIEWER_ARGV] });
+	assert.notEqual(windows.file, "pi");
+	assert.equal(windows.arguments.includes("pi"), false);
+	for (const platform of ["linux", "darwin", "freebsd"] as const) {
+		assert.deepEqual(resolvePiLaunch(undefined, platform, host), { file: "pi", arguments: [...OPAQUE_PI_REVIEWER_ARGV] }, platform);
+		assert.deepEqual(resolvePiLaunch("/opt/pi/bin/pi", platform, host), { file: "/opt/pi/bin/pi", arguments: [...OPAQUE_PI_REVIEWER_ARGV] }, platform);
+	}
+	assert.deepEqual(resolvePiLaunch("C:\\tools\\pi.exe", "win32", host), { file: "C:\\tools\\pi.exe", arguments: [...OPAQUE_PI_REVIEWER_ARGV] });
+	for (const entry of [undefined, "", "cli.js", "dist/bundle/cli.js"]) {
+		assert.throws(() => resolvePiLaunch(undefined, "win32", { execPath: host.execPath, entry }), /host entry/, `entry ${JSON.stringify(entry)} must fail closed instead of spawning a bare pi`);
+	}
+});
+
+test("the default Pi launch resolves from the running host process", () => {
+	const launch = resolvePiLaunch(undefined);
+	if (process.platform === "win32") {
+		assert.deepEqual(launch, { file: process.execPath, arguments: [process.argv[1]!, ...OPAQUE_PI_REVIEWER_ARGV] });
+	} else {
+		assert.deepEqual(launch, { file: "pi", arguments: [...OPAQUE_PI_REVIEWER_ARGV] });
 	}
 });

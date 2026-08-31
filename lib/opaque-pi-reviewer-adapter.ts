@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, posix, win32 } from "node:path";
 
 export const OPAQUE_PI_REVIEWER_ARGV = Object.freeze([
 	"--print",
@@ -85,6 +85,37 @@ interface OpaquePiProcessResult {
 
 const DEFAULT_OPAQUE_PI_TIMEOUT_MS = 600_000;
 
+export interface PiLaunch {
+	readonly file: string;
+	readonly arguments: readonly string[];
+}
+
+interface PiHostProcess {
+	readonly execPath: string;
+	readonly entry: string | undefined;
+}
+
+/**
+ * The exact spawn shape for the fresh Pi process. A bare `pi` on Windows
+ * resolves to pi.cmd, pi.ps1, or a POSIX shim, none of which Node can spawn
+ * with shell:false (EINVAL or ENOENT). This adapter already runs inside Pi, so
+ * on win32 the host's own JavaScript entry is spawned through the host's
+ * process.execPath instead; a shell is never enabled. Every other platform,
+ * and every explicit launcher, keeps the exact shape it always had.
+ */
+export function resolvePiLaunch(
+	piExecutable: string | undefined,
+	platform: NodeJS.Platform = process.platform,
+	host: PiHostProcess = { execPath: process.execPath, entry: process.argv[1] },
+): PiLaunch {
+	if (piExecutable !== undefined) return { file: piExecutable, arguments: [...OPAQUE_PI_REVIEWER_ARGV] };
+	if (platform !== "win32") return { file: "pi", arguments: [...OPAQUE_PI_REVIEWER_ARGV] };
+	if (typeof host.entry !== "string" || host.entry.length === 0 || !(platform === "win32" ? win32 : posix).isAbsolute(host.entry)) {
+		throw new Error(`Pi host entry could not be resolved from the running process (received ${JSON.stringify(host.entry ?? null)}); a bare pi launcher cannot be spawned on Windows without a shell`);
+	}
+	return { file: host.execPath, arguments: [host.entry, ...OPAQUE_PI_REVIEWER_ARGV] };
+}
+
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -92,7 +123,14 @@ function errorMessage(error: unknown): string {
 function runPiProcess(prompt: Buffer, scratchDirectory: string, options: OpaquePiReviewerOptions): Promise<OpaquePiProcessResult> {
 	return new Promise((resolve, reject) => {
 		const startedAt = Date.now();
-		const child = spawn(options.piExecutable ?? "pi", [...OPAQUE_PI_REVIEWER_ARGV], {
+		let launch: PiLaunch;
+		try {
+			launch = resolvePiLaunch(options.piExecutable);
+		} catch (error) {
+			reject(error);
+			return;
+		}
+		const child = spawn(launch.file, [...launch.arguments], {
 			cwd: scratchDirectory,
 			env: options.environment ?? process.env,
 			stdio: ["pipe", "pipe", "pipe"],
