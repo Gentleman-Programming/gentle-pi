@@ -3313,6 +3313,18 @@ function requiredStatusActionText(lineageId?: string): string {
 	return `Run target-scoped review.status${lineageId === undefined ? "" : ` for lineage ${lineageId}`} and follow only its declared action.`;
 }
 
+// The public collect projection is collectBindings: each provider collect
+// input serialized once as the opaque binding gentle_review_capture consumes.
+// The raw next_transition.collect.inputs carry the same bytes, so a four-lens
+// collect state used to cost about 28k characters per STATUS, INSPECT, or
+// START answer and again on every blocked retry (#465). The raw transition
+// keeps its kind and reason so the orchestrator still sees the collect state.
+function withoutRawCollectInputs(raw: Record<string, unknown>): Record<string, unknown> {
+	if (!isRecord(raw.next_transition)) return raw;
+	const { collect: _collect, ...transition } = raw.next_transition;
+	return { ...raw, next_transition: transition };
+}
+
 function mapNativeTargetStatus(operation: ReviewControllerOperation, status: ReviewStatusV3, requestedLineageId?: string): Record<string, unknown> {
 	if (
 		status.nextTransition?.kind === "collect" &&
@@ -3321,7 +3333,7 @@ function mapNativeTargetStatus(operation: ReviewControllerOperation, status: Rev
 		return {
 			operation,
 			status: "blocked",
-			result: status.raw,
+			result: withoutRawCollectInputs(status.raw),
 			collectBindings: publicReviewCaptureBindings(status),
 		};
 	}
