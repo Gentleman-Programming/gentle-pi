@@ -28,8 +28,8 @@ const CANONICAL_LIFECYCLE_SPECS = [
 	"openspec/specs/review-transaction/spec.md",
 ] as const;
 const HISTORICAL_LIFECYCLE_SPECS = [
-	"openspec/changes/complete-native-review-lifecycle/specs/review-orchestration/spec.md",
-	"openspec/changes/complete-native-review-lifecycle/specs/review-transaction/spec.md",
+	"openspec/changes/archive/2026-09-02-complete-native-review-lifecycle/specs/review-orchestration/spec.md",
+	"openspec/changes/archive/2026-09-02-complete-native-review-lifecycle/specs/review-transaction/spec.md",
 ] as const;
 
 function read(path: string): string {
