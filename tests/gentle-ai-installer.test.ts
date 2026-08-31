@@ -172,7 +172,10 @@ test("Windows source install reports missing or too-old Go without publishing a 
 
 test("Windows source install cleans staging after Go failure or wrong built version", async () => {
 	for (const fixtureOptions of [
-		{ installError: Object.assign(new Error("go install timed out"), { code: "ETIMEDOUT" }), expectedCode: "GENTLE_AI_GO_INSTALL_FAILED" },
+		{ installError: Object.assign(new Error("go install timed out"), { code: "ETIMEDOUT" }), expectedCode: "GENTLE_AI_GO_INSTALL_TIMEOUT" },
+		// execFile reports its own timeout kill as killed + kill signal with a null exit code.
+		{ installError: Object.assign(new Error("Command failed"), { killed: true, signal: "SIGTERM", code: null }), expectedCode: "GENTLE_AI_GO_INSTALL_TIMEOUT" },
+		{ installError: Object.assign(new Error("build failed"), { code: 1 }), expectedCode: "GENTLE_AI_GO_INSTALL_FAILED" },
 		{ reportedVersion: "gentle-ai 2.2.1\n", expectedCode: "GENTLE_AI_VERSION_MISMATCH" },
 	] as const) {
 		const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-windows-cleanup-"));
@@ -188,6 +191,21 @@ test("Windows source install cleans staging after Go failure or wrong built vers
 		assert.ok(fixture.calls.some((call) => call.arguments_[0] === "install"));
 		assert.equal(existsSync(join(runtimeDirectory, "gentle-ai.exe")), false);
 		assert.equal(existsSync(runtimeDirectory) && (await readdir(runtimeDirectory)).some((entry) => entry.startsWith(".go-install-") || entry.endsWith(".tmp")), false);
+	}
+});
+
+test("Windows source build gets the extended build bound while every other go command keeps the command timeout", async () => {
+	const packageRoot = await mkdtemp(join(tmpdir(), "gentle-pi-installer-windows-timeout-"));
+	const fixture = windowsGoFixture();
+	const goPath = join(packageRoot, "go.exe");
+	await writeFile(goPath, "trusted local Go executable");
+	fixture.setGoExecutable(goPath);
+	await installGentleAi({ packageRoot, platform: "win32", arch: "x64", execFile: fixture.run, resolveGoExecutable: async () => goPath });
+	const installCalls = fixture.calls.filter((call) => call.arguments_[0] === "install");
+	assert.equal(installCalls.length, 1);
+	assert.equal(installCalls[0].options.timeout, 600_000);
+	for (const call of fixture.calls.filter((entry) => entry.file === goPath && entry.arguments_[0] !== "install")) {
+		assert.equal(call.options.timeout, 120_000);
 	}
 });
 
