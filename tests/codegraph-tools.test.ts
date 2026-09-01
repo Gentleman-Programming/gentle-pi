@@ -7,6 +7,8 @@ import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import codeGraphTools, {
 	createCodeGraphTool,
+	codeGraphNodeScript,
+	findCodeGraphCmdOnPath,
 	type CodeGraphRunner,
 } from "../extensions/codegraph-tools.ts";
 
@@ -210,4 +212,35 @@ test("CodeGraph tool registration exposes a single constrained custom tool", () 
 			limit: { type: "integer", minimum: 1, maximum: 20 },
 		},
 	});
+});
+
+test("Windows shim helpers resolve the npm codegraph script without a shell", async (t) => {
+	const binDir = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-bin-")));
+	t.after(() => rmSync(binDir, { recursive: true, force: true }));
+
+	const pkgRoot = join(binDir, "node_modules", "@colbymchenry", "codegraph");
+	mkdirSync(pkgRoot, { recursive: true });
+	const scriptTarget = join(pkgRoot, "npm-shim.js");
+	writeFileSync(scriptTarget, "#!/usr/bin/env node\n");
+	writeFileSync(
+		join(pkgRoot, "package.json"),
+		JSON.stringify({
+			name: "@colbymchenry/codegraph",
+			version: "1.0.0",
+			bin: { codegraph: "npm-shim.js" },
+		}),
+	);
+	writeFileSync(
+		join(binDir, "codegraph.cmd"),
+		"@ECHO off\nnode \"%~dp0\\node_modules\\@colbymchenry\\codegraph\\npm-shim.js\" %*\n",
+	);
+
+	const originalPath = process.env.PATH;
+	try {
+		process.env.PATH = `${binDir};${originalPath ?? ""}`;
+		assert.equal(findCodeGraphCmdOnPath(), join(binDir, "codegraph.cmd"));
+		assert.equal(codeGraphNodeScript(join(binDir, "codegraph.cmd")), scriptTarget);
+	} finally {
+		process.env.PATH = originalPath ?? "";
+	}
 });
