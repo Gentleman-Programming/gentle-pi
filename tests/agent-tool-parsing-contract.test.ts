@@ -182,6 +182,30 @@ function parseJ0k3rTools(frontmatter: string): { tools: string[]; ambiguous: boo
 	return { tools, ambiguous };
 }
 
+// Non-array `tools` scalars are verified upstream behavior, not a mirror bug:
+// pi-subagents-j0k3r@1.5.6 turns `tools: false` into data.tools === ["false"]
+// (parseScalar("false") -> boolean false -> String(false) -> "false", kept by
+// filter(Boolean)), and `tools: true` into ["true"]. The DEFAULT_TOOLS fallback
+// at the agent-load boundary (config.ts:343) fires only when the `tools` key is
+// absent entirely. Mirroring that quirk is a conscious contract decision;
+// "fixing" it into a fallback here would be drift from the pinned contract.
+test("j0k3r contract quirk: non-array tools scalars stay as inert tokens; only undeclared tools hit the DEFAULT_TOOLS fallback", () => {
+	const { tools: falseTools, ambiguous } = parseJ0k3rTools("name: a\ndescription: d\ntools: false");
+	assert.deepEqual(falseTools, ["false"], "tools: false must mirror upstream's inert \"false\" token, not a fallback");
+	assert.ok(!ambiguous, "a lone non-array scalar is not format-ambiguous upstream");
+
+	const { tools: trueTools } = parseJ0k3rTools("name: a\ndescription: d\ntools: true");
+	assert.deepEqual(trueTools, ["true"], "tools: true mirrors upstream's inert \"true\" token");
+
+	// Undeclared `tools` is the only non-array case upstream: the frontmatter
+	// scan leaves data.tools undefined and the agent-load boundary resolves it
+	// to DEFAULT_TOOLS (['read', 'memory_context', 'memory_search',
+	// 'memory_recall', 'memory_get'] in j0k3r config.ts). This mirror stops at
+	// the empty declaration; the fallback lives in the package, not here.
+	const { tools: undeclared } = parseJ0k3rTools("name: a\ndescription: d\nmodel: sonnet");
+	assert.deepEqual(undeclared, [], "an absent tools key parses to no tokens; upstream adds DEFAULT_TOOLS at load");
+});
+
 test("issue #62 regression: packaged agents also satisfy the pi-subagents-j0k3r multiline parsing rules", () => {
 	const agentFiles = readdirSync(ASSETS_AGENTS_DIR).flatMap((entry) =>
 		entry.endsWith(".md") ? [join(ASSETS_AGENTS_DIR, entry)] : [],
