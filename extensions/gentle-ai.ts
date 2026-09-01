@@ -5684,7 +5684,7 @@ function createGentleAiExtensionForTesting(
 			? ""
 			: `\n\n${buildGentlePrompt(readPersonaMode(ctx.cwd), ctx.cwd, readActiveToolNames(pi))}`;
 		return {
-			systemPrompt: `${event.systemPrompt}${gentlePrompt}${sddPrompt}${nativeStatusPrompt}`,
+			systemPrompt: `${gentlePrompt}${event.systemPrompt}${sddPrompt}${nativeStatusPrompt}`,
 		};
 	});
 
