@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -120,7 +120,7 @@ function git(repository: string, ...args: string[]): string {
 }
 
 function createRepository(t: test.TestContext): RepositoryFixture {
-	const parent = mkdtempSync(join(tmpdir(), "gentle-pi-review-controller-"));
+	const parent = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-review-controller-")));
 	const repository = join(parent, "repo");
 	mkdirSync(repository);
 	t.after(() => rmSync(parent, { recursive: true, force: true }));

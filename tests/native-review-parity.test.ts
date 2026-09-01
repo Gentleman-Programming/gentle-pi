@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -131,7 +131,7 @@ test("current review mode keeps canonical reach values and rejects unrecognized 
 		(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE,
 	);
 	if (process.platform !== "win32") {
-		const root = mkdtempSync(join(tmpdir(), "gentle-pi-review-mode-"));
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-review-mode-")));
 		const alias = `${root}-alias`;
 		const { symlinkSync } = await import("node:fs");
 		symlinkSync(root, alias, "dir");
@@ -208,7 +208,7 @@ function parityRuntime(nativeReviewCli: NativeReviewCli | null, options: ParityR
 }
 
 function repository(t: test.TestContext): string {
-	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-native-parity-"));
+	const cwd = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-native-parity-")));
 	t.after(() => {
 		try { execFileSync("chmod", ["-R", "u+w", cwd], { stdio: "ignore" }); } catch { /* best effort */ }
 		rmSync(cwd, { recursive: true, force: true });

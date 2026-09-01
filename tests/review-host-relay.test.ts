@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -118,7 +118,7 @@ interface RelayHarness {
 }
 
 function harness(t: test.TestContext, overrides: Record<string, string> = {}): RelayHarness {
-	const directory = mkdtempSync(join(tmpdir(), "gentle-pi-relay-harness-"));
+	const directory = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-relay-harness-")));
 	t.after(() => rmSync(directory, { recursive: true, force: true }));
 	const gentleAi = join(directory, "gentle-ai");
 	const pi = join(directory, "pi");
@@ -404,7 +404,7 @@ test("the production relay path resolves the reviewer bound from the environment
 
 test("a relay Pi timeout keeps its typed mapping and timing evidence when opaque scratch cleanup also fails", async (t) => {
 	const fixture = harness(t, { RELAY_FAKE_PI_MODE: "hang", RELAY_FAKE_PI_BREAK_CLEANUP: "true" });
-	const scratchParent = mkdtempSync(join(tmpdir(), "gentle-pi-relay-pi-primary-failure-"));
+	const scratchParent = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-relay-pi-primary-failure-")));
 	const originalTmpdir = process.env.TMPDIR;
 	process.env.TMPDIR = scratchParent;
 	try {
@@ -509,7 +509,7 @@ test("a submission the fake admits with the expected subject still completes", a
 
 test("submission refusal preserves its primary evidence when result staging cleanup also fails", async (t) => {
 	const fixture = harness(t, { RELAY_FAKE_SUBMIT_MODE: "refuse-cleanup-fail" });
-	const scratchParent = mkdtempSync(join(tmpdir(), "gentle-pi-relay-primary-failure-"));
+	const scratchParent = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-relay-primary-failure-")));
 	const originalTmpdir = process.env.TMPDIR;
 	process.env.TMPDIR = scratchParent;
 	try {
@@ -542,7 +542,7 @@ test("relay scratch and staging directories are removed after failures too", asy
 
 test("a result staging cleanup failure remains a typed submit failure", async (t) => {
 	const fixture = harness(t, { RELAY_FAKE_SUBMIT_MODE: "cleanup-fail" });
-	const scratchParent = mkdtempSync(join(tmpdir(), "gentle-pi-relay-cleanup-"));
+	const scratchParent = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-relay-cleanup-")));
 	const originalTmpdir = process.env.TMPDIR;
 	process.env.TMPDIR = scratchParent;
 	try {
