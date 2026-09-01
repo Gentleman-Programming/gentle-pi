@@ -38,7 +38,10 @@ function parseFrontmatterList(raw: string | undefined): string[] | undefined {
 		.filter(Boolean);
 }
 
-function splitToolList(rawTools: string[] | undefined): { tools: string[]; mcpDirectTools: string[] } {
+function splitToolList(rawTools: string[] | undefined): {
+	tools: string[];
+	mcpDirectTools: string[];
+} {
 	const mcpDirectTools: string[] = [];
 	const tools: string[] = [];
 	for (const tool of rawTools ?? []) {
@@ -103,7 +106,10 @@ test("issue #62 regression: packaged YAML tool blocks parse to real allowlists u
 			);
 		}
 
-		assert.ok(builtinTools.length > 0, `${label} must parse to a non-empty allowlist`);
+		assert.ok(
+			builtinTools.length > 0,
+			`${label} must parse to a non-empty allowlist`,
+		);
 		assert.ok(
 			builtinTools.includes("read"),
 			`${label} must retain the read tool after parsing`,
@@ -112,7 +118,9 @@ test("issue #62 regression: packaged YAML tool blocks parse to real allowlists u
 		if (declaresDenyAll) {
 			// The `"*": false` deny-all prefix must survive as its own inert
 			// token and never swallow the tools declared after it.
-			const toolsAfterMarker = builtinTools.filter((tool) => tool !== DENY_ALL_MARKER);
+			const toolsAfterMarker = builtinTools.filter(
+				(tool) => tool !== DENY_ALL_MARKER,
+			);
 			assert.ok(
 				toolsAfterMarker.length > 0,
 				`${label}: the "*": false marker swallowed every following tool`,
@@ -126,7 +134,9 @@ test("issue #62 regression: packaged YAML tool blocks parse to real allowlists u
 });
 
 test("the vendored parsing contract handles YAML blocks, comma scalars, and mcp partitioning identically", () => {
-	const yamlBlock = ["  - read", "  - grep", "  - find", "  - mcp:engram"].join("\n");
+	const yamlBlock = ["  - read", "  - grep", "  - find", "  - mcp:engram"].join(
+		"\n",
+	);
 	const commaScalar = "read, grep, find, mcp:engram";
 
 	const fromBlock = splitToolList(parseFrontmatterList(yamlBlock));
@@ -134,14 +144,22 @@ test("the vendored parsing contract handles YAML blocks, comma scalars, and mcp 
 
 	assert.deepEqual(fromBlock.tools, ["read", "grep", "find"]);
 	assert.deepEqual(fromBlock.mcpDirectTools, ["engram"]);
-	assert.deepEqual(fromBlock, fromScalar, "block and scalar forms must parse identically");
+	assert.deepEqual(
+		fromBlock,
+		fromScalar,
+		"block and scalar forms must parse identically",
+	);
 
 	// Documents why the mirror exists: the pre-0.35.0 comma-only split
 	// collapses a YAML block into exactly the garbage this suite rejects.
 	const commaOnlyLegacy = (yamlBlock ?? "").split(",");
 	for (const token of commaOnlyLegacy) {
 		if (token.includes("\n")) {
-			assert.match(token, /\n/, "legacy comma-only parsing collapses YAML lines into one token");
+			assert.match(
+				token,
+				/\n/,
+				"legacy comma-only parsing collapses YAML lines into one token",
+			);
 			break;
 		}
 	}
@@ -151,7 +169,10 @@ test("the vendored parsing contract handles YAML blocks, comma scalars, and mcp 
 // `- item` list lines append scalar tokens to the current key; a non-empty
 // `tools:` value means inline comma syntax; declaring BOTH formats on one
 // agent is ambiguous and that package refuses to load the agent.
-function parseJ0k3rTools(frontmatter: string): { tools: string[]; ambiguous: boolean } {
+function parseJ0k3rTools(frontmatter: string): {
+	tools: string[];
+	ambiguous: boolean;
+} {
 	const tools: string[] = [];
 	let toolsFormat: "inline" | "multiline" | undefined;
 	let ambiguous = false;
@@ -175,7 +196,12 @@ function parseJ0k3rTools(frontmatter: string): { tools: string[]; ambiguous: boo
 			if (toolsFormat !== undefined && format !== toolsFormat) ambiguous = true;
 			toolsFormat = format;
 			if (format === "inline") {
-				tools.push(...match[2].split(",").map((item) => item.trim()).filter(Boolean));
+				tools.push(
+					...match[2]
+						.split(",")
+						.map((item) => item.trim())
+						.filter(Boolean),
+				);
 			}
 		}
 	}
@@ -190,20 +216,41 @@ function parseJ0k3rTools(frontmatter: string): { tools: string[]; ambiguous: boo
 // absent entirely. Mirroring that quirk is a conscious contract decision;
 // "fixing" it into a fallback here would be drift from the pinned contract.
 test("j0k3r contract quirk: non-array tools scalars stay as inert tokens; only undeclared tools hit the DEFAULT_TOOLS fallback", () => {
-	const { tools: falseTools, ambiguous } = parseJ0k3rTools("name: a\ndescription: d\ntools: false");
-	assert.deepEqual(falseTools, ["false"], "tools: false must mirror upstream's inert \"false\" token, not a fallback");
-	assert.ok(!ambiguous, "a lone non-array scalar is not format-ambiguous upstream");
+	const { tools: falseTools, ambiguous } = parseJ0k3rTools(
+		"name: a\ndescription: d\ntools: false",
+	);
+	assert.deepEqual(
+		falseTools,
+		["false"],
+		'tools: false must mirror upstream\'s inert "false" token, not a fallback',
+	);
+	assert.ok(
+		!ambiguous,
+		"a lone non-array scalar is not format-ambiguous upstream",
+	);
 
-	const { tools: trueTools } = parseJ0k3rTools("name: a\ndescription: d\ntools: true");
-	assert.deepEqual(trueTools, ["true"], "tools: true mirrors upstream's inert \"true\" token");
+	const { tools: trueTools } = parseJ0k3rTools(
+		"name: a\ndescription: d\ntools: true",
+	);
+	assert.deepEqual(
+		trueTools,
+		["true"],
+		'tools: true mirrors upstream\'s inert "true" token',
+	);
 
 	// Undeclared `tools` is the only non-array case upstream: the frontmatter
 	// scan leaves data.tools undefined and the agent-load boundary resolves it
 	// to DEFAULT_TOOLS (['read', 'memory_context', 'memory_search',
 	// 'memory_recall', 'memory_get'] in j0k3r config.ts). This mirror stops at
 	// the empty declaration; the fallback lives in the package, not here.
-	const { tools: undeclared } = parseJ0k3rTools("name: a\ndescription: d\nmodel: sonnet");
-	assert.deepEqual(undeclared, [], "an absent tools key parses to no tokens; upstream adds DEFAULT_TOOLS at load");
+	const { tools: undeclared } = parseJ0k3rTools(
+		"name: a\ndescription: d\nmodel: sonnet",
+	);
+	assert.deepEqual(
+		undeclared,
+		[],
+		"an absent tools key parses to no tokens; upstream adds DEFAULT_TOOLS at load",
+	);
 });
 
 test("issue #62 regression: packaged agents also satisfy the pi-subagents-j0k3r multiline parsing rules", () => {
@@ -219,9 +266,18 @@ test("issue #62 regression: packaged agents also satisfy the pi-subagents-j0k3r 
 		const label = file.split("/").pop() ?? file;
 
 		const { tools, ambiguous } = parseJ0k3rTools(frontmatter);
-		assert.ok(!ambiguous, `${label}: j0k3r treats mixed inline+multiline tools as ambiguous and refuses to load the agent`);
-		assert.ok(tools.length > 0, `${label} must parse to a non-empty j0k3r tool list`);
-		assert.ok(tools.includes("read"), `${label} must retain read under j0k3r parsing`);
+		assert.ok(
+			!ambiguous,
+			`${label}: j0k3r treats mixed inline+multiline tools as ambiguous and refuses to load the agent`,
+		);
+		assert.ok(
+			tools.length > 0,
+			`${label} must parse to a non-empty j0k3r tool list`,
+		);
+		assert.ok(
+			tools.includes("read"),
+			`${label} must retain read under j0k3r parsing`,
+		);
 		for (const tool of tools) {
 			assert.ok(
 				!tool.includes("\n") && !tool.startsWith("- "),
