@@ -461,17 +461,19 @@ const SUBAGENTS_PACKAGE_NAMES = ["pi-subagents-j0k3r", "pi-subagents"] as const;
 const SUBAGENT_RUN_TOOL = "subagent_run";
 const BOUNDED_WRITER_AGENT_NAMES = ["gentle-ai-worker", "worker"] as const;
 const ALLOWED_EDIT_SURFACES_HEADING = /^## Allowed edit surfaces[ \t]*$/gim;
-const MARKDOWN_HEADING_LINE = /^#{1,6}\s/;
-const MARKDOWN_LIST_MARKER = /^(?:[-*+]|\d+[.)])\s+/;
+const MARKDOWN_HEADING_LINE = /^ {0,3}#{1,6} /;
+const MARKDOWN_LIST_MARKER = /^(?:[-*+]|\d+[.)]) +/;
 const WRITER_EDIT_SURFACE_REJECTION =
-	"Writer tasks must include the exact Markdown heading `## Allowed edit surfaces` with narrow repository-relative paths or narrow globs, one per line. The parent must derive or map that canonical block from the delegated task and relaunch the writer; do not accept aliases, and do not ask the human to author paths or globs.";
+	"Writer tasks must include the exact Markdown heading `## Allowed edit surfaces` with narrow repository-relative paths or narrow globs, one per line. Every non-empty line belongs to the section until the next canonical Markdown heading and must be a valid surface entry. Paths containing whitespace require whole-entry backticks; begin explanatory prose under the next Markdown heading. The parent must derive or map that canonical block from the delegated task and relaunch the writer; do not accept aliases, and do not ask the human to author paths or globs.";
 
-function isTaskScopedRepositoryRelativePath(value: string): boolean {
+function isTaskScopedRepositoryRelativePath(value: string, isWholeEntryBackticked: boolean): boolean {
 	const normalized = value.replace(/\\/g, "/");
 	if (
 		normalized.length === 0 ||
 		isAbsolute(value) ||
-		/^(?:[A-Za-z]:|\/|~)/.test(normalized)
+		/^(?:[A-Za-z]:|\/|~)/.test(normalized) ||
+		/\p{Cc}|\p{Zl}|\p{Zp}/u.test(normalized) ||
+		(/\p{White_Space}/u.test(normalized) && !isWholeEntryBackticked)
 	) {
 		return false;
 	}
@@ -481,7 +483,6 @@ function isTaskScopedRepositoryRelativePath(value: string): boolean {
 		withoutCurrentDirectory.length === 0 ||
 		withoutCurrentDirectory === "." ||
 		withoutCurrentDirectory.startsWith("/") ||
-		/\s/.test(withoutCurrentDirectory) ||
 		withoutCurrentDirectory.split("/").some((segment) => segment === "..")
 	) {
 		return false;
@@ -490,56 +491,36 @@ function isTaskScopedRepositoryRelativePath(value: string): boolean {
 	return !/[?*\[\]{}]/.test(withoutCurrentDirectory.split("/")[0]);
 }
 
-/** Strips a list marker and surrounding backticks off one surface line. */
-function readSurfaceEntry(line: string): string {
-	const entry = line.replace(MARKDOWN_LIST_MARKER, "");
-	return entry.match(/^`(.+)`$/)?.[1] ?? entry;
-}
+type AllowedEditSurfaceEntry = {
+	source: string;
+	value: string;
+	isWholeEntryBackticked: boolean;
+	isValidMarkdownSyntax: boolean;
+};
 
-/** A line still reads as a surface entry when nothing but a bare path is left. */
-function looksLikeSurfaceEntry(line: string): boolean {
-	return line.length > 0 && !MARKDOWN_HEADING_LINE.test(line) && !/\s/.test(readSurfaceEntry(line));
+/** Reads one entry and records whether backticks delimit the whole path. */
+function readSurfaceEntry(line: string): AllowedEditSurfaceEntry {
+	const withoutListMarker = line.replace(MARKDOWN_LIST_MARKER, "");
+	const backticked = withoutListMarker.match(/^`([^`]+)`$/);
+	return {
+		source: line,
+		value: backticked?.[1] ?? withoutListMarker,
+		isWholeEntryBackticked: backticked !== null,
+		isValidMarkdownSyntax:
+			!/^(?:[-*+]|\d+[.)])$/.test(line) && (!withoutListMarker.includes("`") || backticked !== null),
+	};
 }
 
 /**
- * Reads the surface list that follows an `## Allowed edit surfaces` heading.
- *
- * A delegated `task` is a whole prompt: the list is normally followed by deeper
- * headings (`### Validation commands`, `#### Return`) and by ordinary prose.
- * Ending the section only at `#`/`##` swallowed all of that, turned prose into
- * surface entries, and rejected valid authorizations (issue #484). A `context`
- * value carrying just the heading and its lines had nothing following it, which
- * is why the identical surfaces were accepted there.
- *
- * So the section ends at the next heading of ANY level, and prose closes the
- * list inside it. Blank lines never close it: an entry is only ever dropped
- * when nothing below it still reads as a surface entry. A line that a caller
- * could pass off as a path stays under validation instead of being discarded,
- * because discarding is what would let `/etc/passwd` sit under a blank line or
- * a paragraph and reach an accepted dispatch.
+ * Reads every non-empty line until the next Markdown heading as an edit surface.
+ * A prose line cannot terminate this section: it must fail validation instead.
  */
-function readAllowedEditSurfaceEntries(following: string): string[] {
-	const lines = following.split(/\r?\n/).map((line) => line.trim());
+function readAllowedEditSurfaceEntries(following: string): AllowedEditSurfaceEntry[] {
+	const lines = following.split(/\r?\n/).map((line) => line.replace(/ +$/g, ""));
 	const headingIndex = lines.findIndex((line) => MARKDOWN_HEADING_LINE.test(line));
-	const section = headingIndex === -1 ? lines : lines.slice(0, headingIndex);
-	const entries: string[] = [];
-
-	for (const [index, line] of section.entries()) {
-		if (line.length === 0) continue;
-		const entry = readSurfaceEntry(line);
-		if (/\s/.test(entry)) {
-			// Prose closes the list only when it is genuinely trailing. Anything
-			// below it that still reads as a path makes the section ambiguous, so
-			// every non-empty line is validated and the ambiguity is rejected.
-			if (section.slice(index + 1).some(looksLikeSurfaceEntry)) {
-				return section.filter((candidate) => candidate.length > 0).map(readSurfaceEntry);
-			}
-			break;
-		}
-		entries.push(entry);
-	}
-
-	return entries;
+	return (headingIndex === -1 ? lines : lines.slice(0, headingIndex))
+		.filter((line) => line.length > 0)
+		.map((line) => readSurfaceEntry(line.replace(/^ {0,3}/, "")));
 }
 
 function hasTaskScopedAllowedEditSurfaces(...values: unknown[]): boolean {
@@ -553,9 +534,19 @@ function hasTaskScopedAllowedEditSurfaces(...values: unknown[]): boolean {
 		for (const heading of headings) {
 			const bodyStart = (heading.index ?? 0) + heading[0].length;
 			const entries = readAllowedEditSurfaceEntries(value.slice(bodyStart));
-			if (entries.length === 0 || !entries.every(isTaskScopedRepositoryRelativePath)) return false;
+			if (
+				entries.length === 0 ||
+				!entries.every(
+					(entry) =>
+						entry.isValidMarkdownSyntax &&
+						!/\p{Cc}|\p{Zl}|\p{Zp}/u.test(entry.source) &&
+						isTaskScopedRepositoryRelativePath(entry.value, entry.isWholeEntryBackticked),
+				)
+			) {
+				return false;
+			}
 
-			const uniqueEntries = [...new Set(entries)].sort();
+			const uniqueEntries = [...new Set(entries.map((entry) => entry.value))].sort();
 			if (
 				expectedEntries &&
 				(expectedEntries.length !== uniqueEntries.length ||

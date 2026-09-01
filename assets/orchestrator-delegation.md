@@ -159,7 +159,8 @@ The bounded writer refuses to write outside the exact allowed edit surfaces and 
 
 Before launching a bounded writer (`gentle-ai-worker`, a user-configured `worker`, or the native `Agent` fallback), derive the allowed edit surface from the task being delegated — the files the planned change must touch, plus the directories where the task authorizes new files — and pass it in the delegated prompt under an `## Allowed edit surfaces` heading, in the same exact-path form as `## Skills to load before work`:
 
-- exact repository-relative paths or narrow globs, one per line; never `.` and never a bare repository root;
+- exact repository-relative paths or narrow globs, one per line; never `.` and never a bare repository root; paths containing whitespace require whole-entry backticks (for example, `` `Directory With Spaces/note.md` `` or ``- `Directory With Spaces/note.md` ``); a list marker alone does not permit whitespace;
+- the section ends only at the next canonical ATX Markdown heading of any level (zero to three leading ASCII spaces, one to six `#`, then an ASCII space); every non-empty line before that heading must be a valid surface entry, so put explanatory prose under a following heading;
 - pre-existing untracked targets the writer may write, listed explicitly;
 - the directories where new files are authorized, when the task requires new files;
 - nothing beyond the delegated task — a surface wider than the task is the same defect as no surface at all.
