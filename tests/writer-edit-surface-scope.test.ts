@@ -117,6 +117,21 @@ test("canonical headings close the surface section with up to three ASCII spaces
 	}
 });
 
+test("canonical empty headings with trailing spaces close the surface section", async () => {
+	for (const indentation of ["", "   "]) {
+		await assertAccepted({
+			agent: "gentle-ai-worker",
+			mode: "task",
+			task: [
+				"## Allowed edit surfaces",
+				"- `lib/sdd-status.ts`",
+				`${indentation}### `,
+				"Ordinary prose after an empty heading is not a surface entry.",
+			].join("\n"),
+		}, `${JSON.stringify(indentation)} indentation closes at an empty heading`);
+	}
+});
+
 test("pseudo-headings remain inside the surface section and reject dangerous paths", async () => {
 	for (const [label, heading] of [
 		["four-space indentation", "    ### Validation"],

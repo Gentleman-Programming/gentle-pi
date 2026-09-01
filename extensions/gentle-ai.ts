@@ -516,9 +516,10 @@ function readSurfaceEntry(line: string): AllowedEditSurfaceEntry {
  * A prose line cannot terminate this section: it must fail validation instead.
  */
 function readAllowedEditSurfaceEntries(following: string): AllowedEditSurfaceEntry[] {
-	const lines = following.split(/\r?\n/).map((line) => line.replace(/ +$/g, ""));
+	const lines = following.split(/\r?\n/);
 	const headingIndex = lines.findIndex((line) => MARKDOWN_HEADING_LINE.test(line));
 	return (headingIndex === -1 ? lines : lines.slice(0, headingIndex))
+		.map((line) => line.replace(/ +$/g, ""))
 		.filter((line) => line.length > 0)
 		.map((line) => readSurfaceEntry(line.replace(/^ {0,3}/, "")));
 }
