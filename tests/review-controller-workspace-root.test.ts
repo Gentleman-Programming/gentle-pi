@@ -55,7 +55,7 @@ function context(cwd: string): ExtensionContext {
 }
 
 function repository(t: test.TestContext, prefix = "gentle-pi-workspace-root-"): string {
-	const cwd = mkdtempSync(join(tmpdir(), prefix));
+	const cwd = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
 	t.after(() => {
 		if (process.platform !== "win32") {
 			try { execFileSync("chmod", ["-R", "u+w", cwd], { stdio: "ignore" }); } catch { /* best effort */ }
@@ -70,7 +70,7 @@ function repository(t: test.TestContext, prefix = "gentle-pi-workspace-root-"): 
 }
 
 function addWorktree(t: test.TestContext, cwd: string, branch: string): string {
-	const parent = mkdtempSync(join(tmpdir(), "gentle-pi-workspace-worktrees-"));
+	const parent = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-workspace-worktrees-")));
 	t.after(() => {
 		try { execFileSync("git", ["worktree", "remove", "--force", join(parent, branch)], { cwd }); } catch {}
 		rmSync(parent, { recursive: true, force: true });
@@ -389,7 +389,7 @@ test("an explicit foreign workspace root works when the Pi session cwd is not a 
 	const target = repository(t, "gentle-pi-target-b-non-git-session-");
 	const nested = join(target, "nested");
 	mkdirSync(nested);
-	const nonGit = mkdtempSync(join(tmpdir(), "gentle-pi-non-git-session-"));
+	const nonGit = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-non-git-session-")));
 	t.after(() => rmSync(nonGit, { recursive: true, force: true }));
 	const observed: string[] = [];
 	const { controller } = runtime(fakeNative({
@@ -433,7 +433,7 @@ test("omitted workspaceRoot fails closed for the same lineage bound to two targe
 test("workspaceRoot fails closed before any native call for invalid target paths", async (t) => {
 	const sessionCwd = repository(t);
 	const worktree = addWorktree(t, sessionCwd, "feat-guard");
-	const nonGit = mkdtempSync(join(tmpdir(), "gentle-pi-non-git-"));
+	const nonGit = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-non-git-")));
 	t.after(() => rmSync(nonGit, { recursive: true, force: true }));
 	const filePath = join(worktree, "app.ts");
 	let nativeCalls = 0;

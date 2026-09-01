@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -117,7 +117,7 @@ function collectStatus(lineageId, inputs) {
 }
 
 function repository(t) {
-	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-relay-restart-"));
+	const cwd = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-relay-restart-")));
 	t.after(() => rmSync(cwd, { recursive: true, force: true }));
 	execFileSync("git", ["init", "-b", "main"], { cwd });
 	writeFileSync(join(cwd, "app.ts"), "export const value = 1;\n");
@@ -204,7 +204,7 @@ await writeFile(outFile, JSON.stringify({ result, inspectResult, captureBinding,
 }
 
 function runWorker(t, cwd, statuses, mode) {
-	const scratch = mkdtempSync(join(tmpdir(), "gentle-pi-relay-restart-run-"));
+	const scratch = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-relay-restart-run-")));
 	t.after(() => rmSync(scratch, { recursive: true, force: true }));
 	const statusFile = join(scratch, "statuses.json");
 	const outFile = join(scratch, "out.json");

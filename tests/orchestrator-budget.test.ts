@@ -58,13 +58,29 @@ const { __testing } = await import("../extensions/gentle-ai.ts");
 // canonical budget independently of the checkout or installed-package path.
 // The child-process measurement keeps production cache behavior separate from
 // fixture measurements.
+// The root is built to one exact length rather than "tmpdir plus a long
+// suffix". The prompt declares the absolute root once, so it grows one byte
+// per root character, and a 48-character macOS tmpdir pushed the previous
+// construction to 164 characters where a 4-character Linux /tmp gave 121.
+// A fixed length makes every platform measure the same budget claim.
+const CONTROLLED_LONG_ASSETS_ROOT_CHARS = 128;
 const controlledLongBaseDir = mkdtempSync(join(tmpdir(), "gp-long-"));
+const controlledLongSegmentChars = CONTROLLED_LONG_ASSETS_ROOT_CHARS - join(controlledLongBaseDir, "x", "assets").length + 1;
+assert.ok(
+	controlledLongSegmentChars >= 1,
+	`tmpdir ${tmpdir()} is too long to build a ${CONTROLLED_LONG_ASSETS_ROOT_CHARS}-char controlled assets root`,
+);
 const controlledLongAssetsDir = join(
 	controlledLongBaseDir,
-	"path-independent-prompt-budget-".repeat(3),
+	"path-independent-prompt-budget-".repeat(Math.ceil(controlledLongSegmentChars / 31)).slice(0, controlledLongSegmentChars),
 	"assets",
 );
 mkdirSync(controlledLongAssetsDir, { recursive: true });
+assert.equal(
+	controlledLongAssetsDir.length,
+	CONTROLLED_LONG_ASSETS_ROOT_CHARS,
+	`controlled long assets root is ${controlledLongAssetsDir.length} chars, want exactly ${CONTROLLED_LONG_ASSETS_ROOT_CHARS}`,
+);
 assert.ok(
 	controlledLongAssetsDir.length >= MIN_CONTROLLED_LONG_ASSETS_ROOT_CHARS,
 	`controlled long assets root is only ${controlledLongAssetsDir.length} chars, need >= ${MIN_CONTROLLED_LONG_ASSETS_ROOT_CHARS}`,

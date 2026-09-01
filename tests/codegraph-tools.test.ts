@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,14 +11,14 @@ import codeGraphTools, {
 } from "../extensions/codegraph-tools.ts";
 
 function workspace(t: test.TestContext): string {
-	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-"));
+	const cwd = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-")));
 	execFileSync("git", ["init", "-b", "main"], { cwd, stdio: "ignore" });
 	t.after(() => rmSync(cwd, { recursive: true, force: true }));
 	return cwd;
 }
 
 test("CodeGraph tool rejects non-project, nested-project, HOME, and temporary workspaces before init", async (t) => {
-	const nonProject = mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-non-project-"));
+	const nonProject = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-non-project-")));
 	t.after(() => rmSync(nonProject, { recursive: true, force: true }));
 	const root = workspace(t);
 	const nested = join(root, "nested");

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { realpathSync } from "node:fs";
 import test from "node:test";
 import { initTheme, keyHint } from "@earendil-works/pi-coding-agent";
 import { imageFallback, visibleWidth } from "@earendil-works/pi-tui";
@@ -180,7 +181,8 @@ test("quiet tool rendering registers noisy built-in tools", () => {
 test("quiet tool execution uses the tool-call cwd", async () => {
 	const tool = registeredQuietTools().get("bash");
 	const output = extractTextContent(await tool.execute("tool-call", { command: "pwd" }, new AbortController().signal, undefined, { cwd: "/tmp" })).trim();
-	assert.equal(output, "/tmp");
+	// pwd prints the physical directory: on macOS /tmp is a symlink to /private/tmp.
+	assert.equal(output, realpathSync("/tmp"));
 	assert.notEqual(output, process.cwd());
 });
 

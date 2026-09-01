@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import baseTest from "node:test";
@@ -22,7 +22,7 @@ import { requireNativeBinary } from "./support/native-binary-gate.ts";
 
 const execFileAsync = promisify(execFile);
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const pinnedBinaryHome = mkdtempSync(join(tmpdir(), "gentle-pi-pinned-runtime-home-"));
+const pinnedBinaryHome = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-pinned-runtime-home-")));
 const pinnedBinaryEnvironment: GentleAiDevBinaryEnvironment = {
 	env: { ...process.env },
 	home: pinnedBinaryHome,
@@ -77,8 +77,8 @@ interface RegisteredController {
 // intentionally have clone-local mode off, which must never participate in the
 // fixture's lifecycle.
 async function reviewEnabledHome(t: baseTest.TestContext): Promise<string> {
-	const home = await mkdtemp(join(tmpdir(), "gentle-pi-review-home-"));
-	const lifecycleCwd = await mkdtemp(join(tmpdir(), "gentle-pi-review-lifecycle-"));
+	const home = await realpath(await mkdtemp(join(tmpdir(), "gentle-pi-review-home-")));
+	const lifecycleCwd = await realpath(await mkdtemp(join(tmpdir(), "gentle-pi-review-lifecycle-")));
 	const xdgConfigHome = join(home, ".config");
 	const xdgDataHome = join(home, ".local", "share");
 	const xdgCacheHome = join(home, ".cache");
@@ -140,7 +140,7 @@ test("generated runtime decoder consumes the captured terminal closure directly"
 
 test("registered gentle_review surfaces the package-pinned Pi transport refusal before native START for a safe internal symlink candidate", async (t) => {
 	await reviewEnabledHome(t);
-	const workspace = await mkdtemp(join(tmpdir(), "gentle-pi-v215-symlink-candidate-"));
+	const workspace = await realpath(await mkdtemp(join(tmpdir(), "gentle-pi-v215-symlink-candidate-")));
 	const repository = join(workspace, "repository");
 	t.after(async () => {
 		// Candidate views are intentionally read-only. Restore test-workspace write

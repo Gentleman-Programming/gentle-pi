@@ -226,7 +226,7 @@ test("public acknowledgement reports the burn from the review-acknowledged/v1 en
 });
 
 function candidateRepository(t: test.TestContext): string {
-	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-native-routing-"));
+	const cwd = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-native-routing-")));
 	// The registry's views are 0555 dirs / 0444 files; restore writability before
 	// the fixture teardown so a surviving view never breaks rmSync.
 	t.after(() => { try { execFileSync("chmod", ["-R", "u+w", cwd]); } catch {} rmSync(cwd, { recursive: true, force: true }); });
@@ -624,7 +624,7 @@ test("public INSPECT and STATUS publish the exact pi-bound binding that capture 
 });
 
 function repository(t: test.TestContext): string {
-	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-native-routing-"));
+	const cwd = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-native-routing-")));
 	t.after(() => {
 		execFileSync("chmod", ["-R", "u+rwx", cwd], { stdio: "ignore" });
 		chmodSync(cwd, 0o700);
