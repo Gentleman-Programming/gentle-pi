@@ -290,8 +290,9 @@ export interface ReviewHostRelayPreparedResult {
 	readonly request: ReviewHostRelayRequest;
 	readonly promptByteLength: number;
 	readonly resultByteLength: number;
-	readonly resultBytes: Buffer;
 }
+
+const preparedResultBytes = new WeakMap<ReviewHostRelayPreparedResult, Buffer>();
 
 export type ReviewHostRelayRunner = (request: ReviewHostRelayRequest) => Promise<ReviewHostRelayResult>;
 export type ReviewHostRelayPreparationRunner = (request: ReviewHostRelayRequest) => Promise<ReviewHostRelayPreparedResult>;
@@ -556,12 +557,13 @@ export async function prepareReviewHostRelaySlot(
 	} catch (error) {
 		throw relayPiTransportError(error, promptBytes.length, piTimeoutMs);
 	}
-	return {
+	const prepared = Object.freeze({
 		request: preparedRequest,
 		promptByteLength: promptBytes.length,
 		resultByteLength: piResult.stdoutByteLength,
-		resultBytes: Buffer.from(piResult.stdout),
-	};
+	});
+	preparedResultBytes.set(prepared, Buffer.from(piResult.stdout));
+	return prepared;
 }
 
 /**
@@ -587,7 +589,9 @@ export async function runReviewHostRelayReviewerGroup(
  * completing form. Only the provider-declared artifact slot is substituted.
  */
 export async function submitReviewHostRelayPreparedResult(prepared: ReviewHostRelayPreparedResult): Promise<ReviewHostRelayResult> {
-	const { request, resultBytes } = prepared;
+	const resultBytes = preparedResultBytes.get(prepared);
+	if (resultBytes === undefined) throw new TypeError("Pi host relay requires a recognized prepared result");
+	const { request } = prepared;
 	assertTokens("capture", request.captureArgumentTokens);
 	const submissionBinding = resolveReviewHostRelaySubmission(request.submission);
 	const stagingDirectory = await mkdtemp(join(tmpdir(), "gentle-pi-host-relay-result-"));

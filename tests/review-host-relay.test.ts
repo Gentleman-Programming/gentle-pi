@@ -383,7 +383,7 @@ test("preparation snapshots mutable submission tokens and values before material
 	assert.deepEqual(readFileSync(fixture.submitCapturePath), PI_OUTPUT_BYTES);
 });
 
-test("preparation detaches reviewer bytes before deferred submission", async (t) => {
+test("preparation keeps reviewer bytes private through deferred submission", async (t) => {
 	const fixture = harness(t);
 	const reviewerBytes = Buffer.from(PI_OUTPUT_BYTES);
 	const prepared = await prepareReviewHostRelaySlot(relayRequest(fixture), async () => ({
@@ -392,8 +392,15 @@ test("preparation detaches reviewer bytes before deferred submission", async (t)
 		stdoutByteLength: reviewerBytes.length,
 	}));
 	reviewerBytes.fill(0);
+	const mutablePrepared = prepared as unknown as { resultBytes?: Buffer };
+	mutablePrepared.resultBytes?.fill(0);
+	assert.throws(() => { mutablePrepared.resultBytes = Buffer.from("fabricated"); }, TypeError);
 	await submitReviewHostRelayPreparedResult(prepared);
 	assert.deepEqual(readFileSync(fixture.submitCapturePath), PI_OUTPUT_BYTES);
+
+	const fabricated = { ...prepared, resultBytes: Buffer.from("fabricated") } as unknown as ReviewHostRelayPreparedResult;
+	await assert.rejects(submitReviewHostRelayPreparedResult(fabricated), /recognized prepared result/);
+	assert.equal(readLog(fixture.logPath).length, 2, "unrecognized results must not launch provider submission");
 });
 
 test("the supplied AbortSignal stays live through deferred submission", async (t) => {
@@ -438,7 +445,6 @@ test("four reviewer results retain provider order when their preparation resolve
 			request,
 			promptByteLength: index + 1,
 			resultByteLength: index + 1,
-			resultBytes: Buffer.from(REVIEWER_GROUP_LENSES[index]!),
 		}));
 	}));
 
@@ -446,7 +452,7 @@ test("four reviewer results retain provider order when their preparation resolve
 	for (const finish of [...complete].reverse()) finish();
 	const prepared = await group;
 
-	assert.deepEqual(prepared.map((result) => result.resultBytes.toString("utf8")), REVIEWER_GROUP_LENSES);
+	assert.deepEqual(prepared.map((result) => result.resultByteLength), [1, 2, 3, 4]);
 });
 
 test("partial reviewer failures wait for a later pending transport and report the first provider-ordered error", async (t) => {
@@ -468,7 +474,6 @@ test("partial reviewer failures wait for a later pending transport and report th
 					request,
 					promptByteLength: index + 1,
 					resultByteLength: index + 1,
-					resultBytes: Buffer.from(REVIEWER_GROUP_LENSES[index]!),
 				});
 			});
 		}
@@ -476,7 +481,6 @@ test("partial reviewer failures wait for a later pending transport and report th
 			request,
 			promptByteLength: index + 1,
 			resultByteLength: index + 1,
-			resultBytes: Buffer.from(REVIEWER_GROUP_LENSES[index]!),
 		});
 	});
 	void group.then(() => { groupSettled = true; }, () => { groupSettled = true; });
