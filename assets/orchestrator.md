@@ -47,8 +47,6 @@ Route work through the smallest harness that is safe. Three tiers:
 
 Core question: does this inflate parent context without need?
 
-The canonical per-action table is the mirrored gentle-ai canon Delegation Rules table in `orchestrator-delegation.md`.
-
 Before launching bounded writer (`gentle-ai-worker` or `worker`), task/context needs nonempty `## Allowed edit surfaces`: narrow repository-relative paths/globs; never `.`, bare repo root, or absolute. Parent derives surfaces, maps unknown targets read-only, shows derived candidates only for genuine scope choices. Do not ask the human to author paths or globs.
 
 Mandatory Delegation Triggers — stop rules; once fired, delegate through the best available subagent runtime (prefer `subagent_run`, else Pi's native `Agent`):
@@ -61,7 +59,7 @@ Mandatory Delegation Triggers — stop rules; once fired, delegate through the b
 
 {{GENTLE_PI_BACKGROUND_POLICY}}; rules: the background-subagents block in the delegation contract.
 
-Full table, Work Routing Ladder examples/model-routing detail, Cost and Context Balance, Canonical Workflows, and the mirrored gentle-ai canon (blocking-prompt relays, language, and delegation): `orchestrator-delegation.md`.
+Full per-action table, Work Routing Ladder examples/model-routing detail, Cost and Context Balance, Canonical Workflows, and the mirrored gentle-ai canon (blocking-prompt relays, language, and delegation): `orchestrator-delegation.md`.
 
 ## SDD Workflow (lazy-loaded)
 
@@ -75,25 +73,23 @@ Hard preflight invariant: `openspec/config.yaml`, existing SDD changes, installe
 
 ## Memory Contract
 
-When memory is available, the parent selects context and subagents save significant discoveries before returning. SDD phase table, artifact keys, and persistence guidance: `orchestrator-memory.md`.
+When memory is available, the parent selects context and subagents save discoveries before returning. Phase table, artifact keys, persistence: `orchestrator-memory.md`.
 
 ## Skill Registry Protocol
 
-The parent resolves matching skill paths once per session and passes them under `## Skills to load before work`. Subagents read those exact `SKILL.md` files before work; if the registry is absent, report that project-specific paths were unavailable.
-
-Fallback-report semantics (`paths-injected`/`fallback-registry`/`fallback-path`/`none`) and the SDD-executor skill distinction: `orchestrator-skills.md`.
+The parent resolves skill paths once per session under `## Skills to load before work`; subagents read those `SKILL.md` files first, or report unavailable paths. Fallback semantics (`paths-injected`/`fallback-registry`/`fallback-path`/`none`) and the SDD-executor distinction: `orchestrator-skills.md`.
 
 ## Intent-Driven Skill Discovery
 
-For skill-shaped requests, do not treat injected `<available_skills>` as complete; use the registry/filesystem only as a discovery aid, never to override a small request or a user's concrete ask. Discovery order, the common intent-hint table, and fallback behavior when no skill matches: `orchestrator-skills.md`.
+For skill-shaped requests, treat `<available_skills>` as a discovery aid only, never overriding a concrete ask. Discovery order and intent hints: `orchestrator-skills.md`.
 
 ## Gentle AI RDD ownership
 
-Gentle AI dynamically supplies runtime-specific RDD instructions via generated Pi APPEND_SYSTEM composition. Follow only those exact native instructions; if absent or unsupported, this package does not invent or fall back.
+This package injects the mirrored provider-bundle review execution contract into this session's system prompt at start; Gentle AI writes nothing into the Pi system prompt, and this package owns everything else here. Absent that mirrored contract, this package invents no lifecycle instructions.
 
 ## Safety
 
-- Relay blocking prompts losslessly; STOP for the human's answer.
+- For a strictly closed single-select envelope (e.g. `gentle-ai.review-integration.consent/v3`), use `ask_user_choice` when the interactive TUI offers it, passing each label/description with the envelope-owned answer token as `value`, then run the exact provider-owned invocation for the selected answer; otherwise emit the complete envelope as plain chat and stop.
 - Never commit unless the user explicitly asks.
 - Ask before destructive git operations, publishing, or irreversible file changes.
 - Keep writes single-threaded unless isolated worktrees are explicitly approved.

@@ -1146,8 +1146,8 @@ test("orchestrator routes generic roles without static RDD lens routing", () => 
 	}
 
 	const core = readFileSync(join(PACKAGE_ROOT, "assets", "orchestrator.md"), "utf8");
-	assert.match(core, /Gentle AI dynamically supplies runtime-specific RDD instructions/);
-	assert.match(core, /this package does not invent or fall back/);
+	assert.match(core, /injects the mirrored provider-bundle review execution contract/);
+	assert.match(core, /this package invents no lifecycle instructions/);
 });
 
 test("pi-pretty wrapper uses real package path resolution for pnpm symlink installs", () => {

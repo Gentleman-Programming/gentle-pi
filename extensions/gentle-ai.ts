@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import {
 	existsSync,
 	lstatSync,
@@ -701,6 +701,64 @@ function renderOrchestratorPrompt(
 			renderBackgroundSubagentsStatusLine(background),
 		)
 		.trim();
+}
+
+// gentle-pi#560 / gentle-ai#4056, #4057: Gentle AI stopped writing a
+// runtime-specific review execution contract into Pi's generated
+// APPEND_SYSTEM composition on 2026-08-01. This package now injects the
+// mirrored provider contract bundle's own `orchestration/pi.md` text
+// instead, read once from the package-local mirror
+// (contracts/review-provider-contract-mirror/) and cached as the fully
+// rendered fragment for the process lifetime. It is deliberately NOT folded
+// into getOrchestratorPrompt/orchestratorPromptCache: that core prompt is
+// pinned at an 8192-byte budget (tests/orchestrator-budget.test.ts).
+const PROVIDER_CONTRACT_MIRROR_ROOT = join(PACKAGE_ROOT, "contracts", "review-provider-contract-mirror");
+const PROVIDER_CONTRACT_LOCK_FILE = "provider-contract.lock.json";
+const PI_ORCHESTRATION_RUNTIME = "pi";
+
+let reviewContractPromptFragmentCache: string | null | undefined;
+let reviewContractPromptMissingWarned = false;
+
+// Verifies the mirrored orchestration/pi.md bytes against the lock's digest before injection (gentle-ai R1/R3).
+function readMirroredReviewContractFragment(mirrorRoot: string = PROVIDER_CONTRACT_MIRROR_ROOT): string | null {
+	try {
+		const lockPath = join(mirrorRoot, PROVIDER_CONTRACT_LOCK_FILE);
+		const lock = JSON.parse(readFileSync(lockPath, "utf8")) as {
+			contract_semver?: unknown;
+			entries?: Record<string, unknown>;
+		};
+		if (typeof lock.contract_semver !== "string" || lock.contract_semver === "") return null;
+		const expectedSha256 = lock.entries?.[`orchestration/${PI_ORCHESTRATION_RUNTIME}.md`];
+		if (typeof expectedSha256 !== "string" || !/^[0-9a-f]{64}$/.test(expectedSha256)) return null;
+		const contractPath = join(mirrorRoot, `v${lock.contract_semver}`, "bundle", "orchestration", `${PI_ORCHESTRATION_RUNTIME}.md`);
+		const rawBytes = readFileSync(contractPath);
+		const actualSha256 = createHash("sha256").update(rawBytes).digest("hex");
+		if (!timingSafeEqual(Buffer.from(expectedSha256, "hex"), Buffer.from(actualSha256, "hex"))) return null;
+		const text = rawBytes.toString("utf8").trim();
+		if (text.length === 0) return null;
+		return `## Gentle AI review execution contract (mirrored provider bundle ${lock.contract_semver})\n\n${text}`;
+	} catch {
+		return null;
+	}
+}
+
+function loadReviewContractPromptFragment(
+	ctx: Pick<ExtensionContext, "hasUI" | "ui">,
+	mirrorRoot: string = PROVIDER_CONTRACT_MIRROR_ROOT,
+): string | null {
+	if (reviewContractPromptFragmentCache === undefined) {
+		reviewContractPromptFragmentCache = readMirroredReviewContractFragment(mirrorRoot);
+	}
+	if (reviewContractPromptFragmentCache === null && !reviewContractPromptMissingWarned) {
+		reviewContractPromptMissingWarned = true;
+		if (ctx.hasUI) {
+			ctx.ui.notify(
+				"Gentle AI review execution contract is unavailable: the mirrored provider bundle is missing, unreadable, or fails digest verification. Review preflight instructions will not be injected this session.",
+				"warning",
+			);
+		}
+	}
+	return reviewContractPromptFragmentCache;
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -5681,6 +5739,8 @@ export const __testing = {
 	renderSddModelPanel: renderSddModelPanelForTesting,
 	getOrchestratorPrompt,
 	renderOrchestratorPrompt,
+	loadReviewContractPromptFragment,
+	readMirroredReviewContractFragment,
 	loadBackgroundSubagentsPolicy,
 	resolveBackgroundSubagentsPolicy,
 	renderBackgroundSubagentsReport,
@@ -5977,8 +6037,18 @@ function createGentleAiExtensionForTesting(
 		const gentlePrompt = isNamedAgent || isSddAgent
 			? ""
 			: `\n\n${buildGentlePrompt(readPersonaMode(ctx.cwd), ctx.cwd, readActiveToolNames(pi))}`;
+		// gentle-pi#560 / gentle-ai#4056, #4057: inject the mirrored provider
+		// contract bundle's review execution contract for the primary session
+		// only, and only when a native review CLI is actually present.
+		const reviewContractPrompt =
+			!isNamedAgent && !isSddAgent && nativeReviewCli !== null
+				? (() => {
+					const fragment = loadReviewContractPromptFragment(ctx);
+					return fragment === null ? "" : `\n\n${fragment}`;
+				})()
+				: "";
 		return {
-			systemPrompt: `${event.systemPrompt}${gentlePrompt}${sddPrompt}${nativeStatusPrompt}`,
+			systemPrompt: `${event.systemPrompt}${gentlePrompt}${sddPrompt}${nativeStatusPrompt}${reviewContractPrompt}`,
 		};
 	});
 

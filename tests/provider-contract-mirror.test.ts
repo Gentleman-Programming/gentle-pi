@@ -27,6 +27,10 @@ const FIXTURE_PATHS = [
 	"vectors/targeted-validator.json",
 ] as const;
 
+// Fixture provenance: the real gentle-ai provider contract bundle 1.2.0
+// release archive, extracted. gentle-pi#560 / gentle-ai#4056, #4057.
+const FIXTURE_1_2_0_ROOT = join(import.meta.dirname, "fixtures", "provider-contract-bundle", "v1.2.0");
+
 interface LockRecord {
 	schema: string;
 	acquisition: string;
@@ -101,6 +105,21 @@ test("mirrors a verified local bundle tree and the offline drift check passes", 
 			assert.ok(existsSync(mirrored), `${path} must be mirrored`);
 			assert.deepEqual(readFileSync(mirrored), readFileSync(join(FIXTURE_ROOT, path)), `${path} must be byte-identical`);
 		}
+		assert.deepEqual(checkProviderContractMirror(packageRoot), []);
+	});
+});
+
+test("mirrors a verified local 1.2.0 bundle tree, including its orchestration entry, and the offline drift check passes", () => {
+	withTemporaryRoot((packageRoot) => {
+		mirrorProviderContractBundle(FIXTURE_1_2_0_ROOT, packageRoot);
+		const lockPath = join(packageRoot, PROVIDER_CONTRACT_MIRROR_ROOT, PROVIDER_CONTRACT_LOCK_FILE);
+		const lock = JSON.parse(readFileSync(lockPath, "utf8")) as LockRecord;
+		assert.equal(lock.contract_semver, "1.2.0");
+		assert.equal(Object.keys(lock.entries).length, 9);
+		assert.ok("orchestration/pi.md" in lock.entries, "the mirrored lock must record orchestration/pi.md");
+		const mirrored = join(packageRoot, PROVIDER_CONTRACT_MIRROR_ROOT, "v1.2.0", "bundle", "orchestration", "pi.md");
+		assert.ok(existsSync(mirrored), "orchestration/pi.md must be mirrored");
+		assert.deepEqual(readFileSync(mirrored), readFileSync(join(FIXTURE_1_2_0_ROOT, "orchestration", "pi.md")));
 		assert.deepEqual(checkProviderContractMirror(packageRoot), []);
 	});
 });
