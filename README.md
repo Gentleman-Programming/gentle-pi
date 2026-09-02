@@ -67,23 +67,15 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 
 ## Install
 
-```bash
-pi install npm:gentle-pi@0.14.0
-```
-
-### RDD version policy
-
-Native RDD started in `gentle-pi` `v0.15.0` on 2026-07-10 with bounded review transactions. Every release from `v0.15.0` onward is part of the unstable RDD development line. New releases will continue improving RDD until the project declares the line stable. The stable version for normal use without native RDD is the last preceding release, `v0.14.0`.
+Install the current supported release from npm's `latest` dist-tag:
 
 ```bash
-# Stable version without native RDD
-pi install npm:gentle-pi@0.14.0
-
-# Latest released RDD build (unstable)
 pi install npm:gentle-pi@latest
 ```
 
-The latest RDD package installs Gentle AI only into its private `.gentle-ai/` directory. Darwin and Linux use pinned release assets with asset and executable SHA-256 verification (signed archives for stable pins such as the current v2.5.0; raw prerelease binaries only under a prerelease pin). Windows x64 and arm64 build the exact `v2.5.0` source tag with a local Go 1.25.10+ toolchain, a sealed Go environment, `GOTOOLCHAIN=local`, and `GOSUMDB=sum.golang.org`; it does not download Go automatically. Windows provenance is Go-toolchain plus SumDB evidence and postinstall tamper detection, **not** Authenticode or protection against a malicious joint binary-and-manifest replacement. Package-private locks coordinate cooperative concurrent or crashed installers; their tombstones fail closed. A malicious same-user process with write access to package-private `node_modules` is outside that protocol because it can already replace package code, binary, or manifest, and portable Node has no pathname-delete CAS. It never uses `PATH` or a global `gentle-ai` installation. For development or offline installs only, set `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1`; native review operations then fail closed with an actionable `package-local-binary-missing` error until the package is reinstalled normally.
+RDD availability and activation are runtime concerns, not separate npm release channels. Use `/gentle:review-mode status` to inspect the effective review mode after installation.
+
+The package installs Gentle AI only into its private `.gentle-ai/` directory. Darwin and Linux use pinned release assets with asset and executable SHA-256 verification (signed archives for stable pins such as the current v2.5.0; raw prerelease binaries only under a prerelease pin). Windows x64 and arm64 build the exact `v2.5.0` source tag with a local Go 1.25.10+ toolchain, a sealed Go environment, `GOTOOLCHAIN=local`, and `GOSUMDB=sum.golang.org`; it does not download Go automatically. Windows provenance is Go-toolchain plus SumDB evidence and postinstall tamper detection, **not** Authenticode or protection against a malicious joint binary-and-manifest replacement. Package-private locks coordinate cooperative concurrent or crashed installers; their tombstones fail closed. A malicious same-user process with write access to package-private `node_modules` is outside that protocol because it can already replace package code, binary, or manifest, and portable Node has no pathname-delete CAS. It never uses `PATH` or a global `gentle-ai` installation. For development or offline installs only, set `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1`; native review operations then fail closed with an actionable `package-local-binary-missing` error until the package is reinstalled normally.
 
 Recommended companion packages:
 
@@ -564,6 +556,8 @@ Legacy string entries are still accepted and treated as `model`-only config.
 | -------------------------------- | ------------------------------------------------------------------- |
 | `/gentle:status`              | Shows package, SDD asset, OpenSpec, and global model config status. |
 | `/gentle:doctor`              | Runs read-only diagnostics for SDD assets, model/persona config, memory tools, and safety guards. |
+| `/gentle:sdd-preflight`          | Runs or reuses the lazy SDD preflight for the current Pi session.  |
+| `/gentle:review-mode`            | Shows or sets review mode with `status`, `disable`, or `enable`; only explicit user invocation changes it. |
 | `/gentle:models`                 | Opens global model + effort assignment UI. Press `x` to export and `r` to restore saved routing. |
 | `/gentle:persona`                | Switches global persona mode, with project override support.        |
 | `/gentle:background-subagents`   | Shows or sets the managed background-subagents policy (`status\|enable\|disable`), naming the source that decided it. |
