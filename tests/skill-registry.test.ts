@@ -114,16 +114,19 @@ test("uniqueExistingDirs normalizes duplicates and ignores missing roots", async
 	);
 });
 
-test("findSkillFiles scans one skill directory level only", async () => {
+test("findSkillFiles scans flat skills and category-nested skills without descending further", async () => {
 	const root = join(tmpdir(), `gentle-pi-shallow-${Date.now()}`);
 	const skillPath = join(root, "docs", "SKILL.md");
 	const nestedSkillPath = join(root, "fixtures", "nested", "SKILL.md");
+	const deeperSkillPath = join(root, "fixtures", "nested", "deeper", "SKILL.md");
 	mkdirSync(dirname(skillPath), { recursive: true });
 	mkdirSync(dirname(nestedSkillPath), { recursive: true });
+	mkdirSync(dirname(deeperSkillPath), { recursive: true });
 	writeFileSync(skillPath, "---\nname: docs\ndescription: Docs.\n---\n");
 	writeFileSync(nestedSkillPath, "---\nname: nested\ndescription: Nested fixture.\n---\n");
+	writeFileSync(deeperSkillPath, "---\nname: deeper\ndescription: Deeper fixture.\n---\n");
 
-	assert.deepEqual(await __testing.findSkillFiles(root), [skillPath]);
+	assert.deepEqual(await __testing.findSkillFiles(root), [skillPath, nestedSkillPath]);
 });
 
 test("findSkillFiles follows symlinked skill directories", async (t) => {

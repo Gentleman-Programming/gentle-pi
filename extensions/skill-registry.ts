@@ -117,9 +117,37 @@ async function findSkillFiles(root: string): Promise<string[]> {
 		const candidate = join(skillDir, "SKILL.md");
 		try {
 			const skillInfo = await stat(candidate);
-			if (skillInfo.isFile()) out.push(candidate);
+			if (skillInfo.isFile()) {
+				out.push(candidate);
+				continue;
+			}
 		} catch {
-			// Missing or unreadable skill files are ignored; the registry is best-effort.
+			// A non-skill child may be a category; inspect exactly one level deeper.
+		}
+
+		let nestedEntries;
+		try {
+			nestedEntries = await readdir(skillDir, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const nestedEntry of nestedEntries) {
+			const nestedSkillDir = join(skillDir, nestedEntry.name);
+			let nestedDirInfo;
+			try {
+				nestedDirInfo = await stat(nestedSkillDir);
+			} catch {
+				continue;
+			}
+			if (!nestedDirInfo.isDirectory()) continue;
+
+			const nestedCandidate = join(nestedSkillDir, "SKILL.md");
+			try {
+				const nestedSkillInfo = await stat(nestedCandidate);
+				if (nestedSkillInfo.isFile()) out.push(nestedCandidate);
+			} catch {
+				// Missing or unreadable skill files are ignored; the registry is best-effort.
+			}
 		}
 	}
 	return out.sort();
