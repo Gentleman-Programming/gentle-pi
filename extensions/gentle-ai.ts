@@ -3662,6 +3662,18 @@ export class PendingReviewConsentRegistry {
 const processPendingReviewConsentRegistry = new PendingReviewConsentRegistry();
 const processRetainedNativeStatusSelections = new Map<PendingReviewConsentSessionKey, Map<string, RetainedNativeStatusSelection>>();
 
+// gentle-pi#556 / gentle-ai#4051: nesting depth of named-agent (SDD phase
+// executor or other subagent) starts vs. ends for a session. Starts and
+// ends are paired so a subagent's own loop end never leaves the primary
+// loop's `agent_end` preflight suppressed for the rest of the session: a
+// named-agent start increments the depth, a matching end decrements it,
+// and a fresh primary-loop start resets it to 0.
+const processAgentEndSubagentDepth = new Map<PendingReviewConsentSessionKey, number>();
+
+// Target identities already nudged once per session, so the read-only
+// `agent_end` preflight reminder fires at most once per unreviewed candidate.
+const processAgentEndPreflightNudgedTargets = new Map<PendingReviewConsentSessionKey, Set<string>>();
+
 function pendingReviewConsentSessionKey(context: ExtensionContext | undefined, fallbackKey: symbol): PendingReviewConsentSessionKey {
 	try {
 		const sessionManager = (context as unknown as { sessionManager?: { getSessionId?: () => unknown } } | undefined)?.sessionManager;
@@ -4489,6 +4501,14 @@ async function negotiatedStatusForHostTransport(
 		reviewTransportRefusalByProvider.set(provider, transport);
 		return { transport };
 	}
+}
+
+// gentle-pi#556 / gentle-ai#4051: the exact once-per-candidate reminder sent
+// through `agent_end`. It never runs START itself, so it names the one
+// supported continuation (gentle_review inspect) and defers the resulting
+// consent envelope to the human.
+function renderAgentEndReviewPreflightMessage(targetIdentity: string): string {
+	return `Receipt-driven development is enabled, and this worktree holds an unreviewed candidate (target ${targetIdentity}). By the review contract entry rule, run the review preflight before reporting completion.\n\nCall the gentle_review tool with {"operation":"inspect"} and follow the transition it returns; it currently offers review.start for this target. Relay the resulting gentle-ai.review-integration.consent/v3 envelope to the human losslessly, and never answer it on the human's behalf.\n\nThis extension never runs START itself. This reminder is sent once per candidate.`;
 }
 
 function canonicalReviewCaptureBinding(value: unknown): string {
@@ -5727,6 +5747,8 @@ function createGentleAiExtensionForTesting(
 		const sessionKey = pendingReviewConsentSessionKey(context, pendingReviewConsentFallbackKey);
 		cleanupAllPendingReviewConsents(pendingReviewConsentRegistry, sessionKey);
 		processRetainedNativeStatusSelections.delete(sessionKey);
+		processAgentEndSubagentDepth.delete(sessionKey);
+		processAgentEndPreflightNudgedTargets.delete(sessionKey);
 	});
 
 	pi.registerTool({
@@ -5929,6 +5951,12 @@ function createGentleAiExtensionForTesting(
 	pi.on("before_agent_start", async (event, ctx) => {
 		const isSddAgent = isSddAgentStartEvent(event);
 		const isNamedAgent = isNamedAgentStartEvent(event);
+		const subagentDepthKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey);
+		if (isSddAgent || isNamedAgent) {
+			processAgentEndSubagentDepth.set(subagentDepthKey, (processAgentEndSubagentDepth.get(subagentDepthKey) ?? 0) + 1);
+		} else {
+			processAgentEndSubagentDepth.set(subagentDepthKey, 0);
+		}
 		if (isSddAgent && !getSddPreflightPreferences(ctx)) {
 			await runSddPreflight(ctx);
 		}
@@ -5952,6 +5980,57 @@ function createGentleAiExtensionForTesting(
 		return {
 			systemPrompt: `${event.systemPrompt}${gentlePrompt}${sddPrompt}${nativeStatusPrompt}`,
 		};
+	});
+
+	// gentle-pi#556 / gentle-ai#4051: with RDD enabled, the agent could finish
+	// an authorized implementation and report completion without ever running
+	// the review STATUS preflight or offering the consent question. This
+	// handler is read-only and idempotent: it never runs START, never answers
+	// consent, and never writes a file. It only sends one turn-triggering
+	// reminder, at most once per unreviewed target identity per session.
+	pi.on("agent_end", async (_event, ctx) => {
+		if (nativeReviewCli?.reviewMode === undefined || nativeReviewCli.targetStatus === undefined) return;
+		if (ctx.hasUI !== true) return;
+		const sessionKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey);
+		const subagentDepth = processAgentEndSubagentDepth.get(sessionKey) ?? 0;
+		if (subagentDepth > 0) {
+			processAgentEndSubagentDepth.set(sessionKey, subagentDepth - 1);
+			return;
+		}
+		let modeEffective: "on" | "off";
+		try {
+			const mode = await nativeReviewCli.reviewMode({ cwd: ctx.cwd, operation: NATIVE_REVIEW_MODE_OPERATION.STATUS });
+			modeEffective = mode.status.effective;
+		} catch {
+			return;
+		}
+		if (modeEffective === "off") return;
+		let status: ReviewStatusV3;
+		try {
+			const retainedSelections = ((key: PendingReviewConsentSessionKey) => processRetainedNativeStatusSelections.get(key) ?? processRetainedNativeStatusSelections.set(key, new Map()).get(key)!)(sessionKey);
+			const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, { cwd: ctx.cwd }, retainedSelections, ctx.cwd);
+			if (negotiated.status === undefined) return;
+			status = negotiated.status;
+		} catch {
+			return;
+		}
+		if (status.nextTransition?.kind !== "execute" || status.nextTransition.execute.operation !== "review.start") return;
+		const targetIdentity = status.targetIdentity;
+		let nudged = processAgentEndPreflightNudgedTargets.get(sessionKey);
+		if (nudged === undefined) {
+			nudged = new Set<string>();
+			processAgentEndPreflightNudgedTargets.set(sessionKey, nudged);
+		}
+		if (nudged.has(targetIdentity)) return;
+		nudged.add(targetIdentity);
+		pi.sendMessage(
+			{
+				customType: "gentle-pi.review-preflight",
+				content: renderAgentEndReviewPreflightMessage(targetIdentity),
+				display: true,
+			},
+			{ triggerTurn: true, deliverAs: "followUp" },
+		);
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
