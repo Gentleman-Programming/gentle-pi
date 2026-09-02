@@ -477,6 +477,125 @@ const RESIZE_GRACE_PERIOD_MS = 300;
 
 type IntroMode = "full" | "minimal" | "skip";
 
+type StartupStats = {
+  gitBranch: string;
+  path: string;
+  mcp: string;
+  agents: string;
+  plugins: string;
+  skills: string;
+  extensions: string;
+  version: string;
+  tools: string;
+};
+type StartupStat = { label: string; value: string };
+type StartupStatsGrid = {
+  wide: boolean;
+  labelWidth: number;
+  valueWidth: number;
+  rows: Array<{ left: StartupStat; right?: StartupStat }>;
+};
+
+const WIDE_STATS_MIN_WIDTH = 122;
+const WIDE_STATS_LABEL_WIDTH = 12;
+const WIDE_STATS_VALUE_WIDTH = 46;
+const WIDE_STATS_GUTTER = "   ";
+
+function fitStartupStatValue(value: unknown, width: number): string {
+  return String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, width)
+    .padEnd(width);
+}
+
+function buildStartupStatsGrid(width: number, stats: StartupStats): StartupStatsGrid {
+  const narrowRows: StartupStat[] = [
+    { label: "PATH:", value: stats.path },
+    { label: "GIT:", value: stats.gitBranch },
+    { label: "MCP:", value: stats.mcp },
+    { label: "PLUGINS:", value: stats.plugins },
+    { label: "AGENTS:", value: stats.agents },
+    { label: "SKILLS:", value: stats.skills },
+    { label: "EXTENSIONS:", value: stats.extensions },
+    { label: "TOOLS:", value: stats.tools },
+    { label: "VER:", value: stats.version },
+  ];
+
+  if (width < WIDE_STATS_MIN_WIDTH) {
+    const labelWidth = Math.max(...narrowRows.map(({ label }) => label.length));
+    return {
+      wide: false,
+      labelWidth,
+      valueWidth: Math.max(
+        0,
+        Math.min(
+          Math.max(...narrowRows.map(({ value }) => value.length)),
+          Math.max(8, width - labelWidth - 4),
+        ),
+      ),
+      rows: narrowRows.map((left) => ({ left })),
+    };
+  }
+
+  return {
+    wide: true,
+    labelWidth: WIDE_STATS_LABEL_WIDTH,
+    valueWidth: WIDE_STATS_VALUE_WIDTH,
+    rows: [
+      { left: narrowRows[0], right: narrowRows[1] },
+      { left: narrowRows[2], right: narrowRows[3] },
+      { left: narrowRows[4], right: narrowRows[6] },
+      { left: narrowRows[5] },
+      { left: narrowRows[7], right: narrowRows[8] },
+    ],
+  };
+}
+
+function formatStartupStat(
+  stat: StartupStat | undefined,
+  labelWidth: number,
+  valueWidth: number,
+  separator: string,
+): string {
+  if (!stat) return " ".repeat(labelWidth + separator.length + valueWidth);
+  return `${stat.label.padEnd(labelWidth)}${separator}${fitStartupStatValue(stat.value, valueWidth)}`;
+}
+
+export function formatStartupStatsRows(width: number, stats: StartupStats): string[] {
+  const grid = buildStartupStatsGrid(width, stats);
+  const separator = grid.wide ? " " : "  ";
+  return grid.rows.map(({ left, right }) => {
+    const row = formatStartupStat(left, grid.labelWidth, grid.valueWidth, separator);
+    return grid.wide
+      ? `${row}${WIDE_STATS_GUTTER}${formatStartupStat(right, grid.labelWidth, grid.valueWidth, separator)}`
+      : row;
+  });
+}
+
+const STARTUP_STAT_LABEL_PATTERN =
+  /(?:^| {3})(?:PATH|GIT|MCP|PLUGINS|AGENTS|SKILLS|EXTENSIONS|TOOLS|VER):/g;
+
+function addFormattedStartupStatsRow(builder: LayoutBuilder, row: string): void {
+  const labelIndices = new Set<number>();
+  for (const match of row.matchAll(STARTUP_STAT_LABEL_PATTERN)) {
+    const label = match[0].trimStart();
+    const labelStart = match.index + match[0].length - label.length;
+    for (let index = labelStart; index < labelStart + label.length; index++) {
+      labelIndices.add(index);
+    }
+  }
+
+  builder.addRow();
+  for (let index = 0; index < row.length; index++) {
+    const char = row[index] ?? " ";
+    builder.add(
+      labelIndices.has(index) ? "label" : char === " " ? "none" : "value",
+      char,
+    );
+  }
+}
+
 function pickIntroMode(rows: number, cols: number): IntroMode {
   if (rows >= FULL_INTRO_MIN_ROWS && cols >= FULL_INTRO_MIN_COLS) return "full";
   if (rows >= MINIMAL_INTRO_MIN_ROWS && cols >= MINIMAL_INTRO_MIN_COLS) return "minimal";
@@ -758,10 +877,8 @@ export default function (pi: ExtensionAPI) {
             const frame = Math.floor(tick / 2);
 
             const sideBySideMinWidth = roseBase.width + 3 + logoBase.width + 4;
-            const wideStatsMinWidth = 122;
             const horizontal =
               state.mode === "full" && bannerConfig.showRose && bannerConfig.showTextLogo && width >= sideBySideMinWidth;
-            const wideStats = width >= wideStatsMinWidth;
 
             const b = new LayoutBuilder();
             b.addRow();
@@ -859,86 +976,20 @@ export default function (pi: ExtensionAPI) {
               b.addRow();
               b.center(width);
 
-              const fit = (v: unknown, w: number) =>
-                String(v ?? "")
-                  .replace(/\s+/g, " ")
-                  .trim()
-                  .slice(0, w)
-                  .padEnd(w);
-              const addWideRow = (
-                l1: string,
-                v1: string,
-                l2: string,
-                v2: string,
-              ) => {
-                b.addRow();
-                b.add("label", fit(l1, 10));
-                b.add("none", " ");
-                b.add("value", fit(v1, 48));
-                b.add("none", "   ");
-                b.add("label", fit(l2, 12));
-                b.add("none", " ");
-                b.add("value", fit(v2, 46));
+              const statsRows = formatStartupStatsRows(width, {
+                gitBranch,
+                path: ctx.cwd,
+                mcp: `${mcpServersCount} server(s)`,
+                agents: `${sddAgentsCount} phases`,
+                plugins: `${packagesCount} package(s)`,
+                skills: `${skills.length} loaded`,
+                extensions: `${extensionsCount} active`,
+                tools: `${customTools.length} custom`,
+                version: `v${VERSION}`,
+              });
+              for (const row of statsRows) {
+                addFormattedStartupStatsRow(b, row);
                 b.center(width);
-              };
-              const narrowRows: Array<[string, string]> = [
-                ["GIT:", gitBranch],
-                ["PATH:", ctx.cwd],
-                ["MCP:", `${mcpServersCount} server(s)`],
-                ["AGENTS:", `${sddAgentsCount} phases`],
-                ["PLUGINS:", `${packagesCount} package(s)`],
-                ["SKILLS:", `${skills.length} loaded`],
-                ["EXTENSIONS:", `${extensionsCount} active`],
-                ["VER:", `v${VERSION}`],
-                ["TOOLS:", `${customTools.length} custom`],
-              ];
-              const narrowLabelW = Math.max(...narrowRows.map(([l]) => l.length));
-              const narrowValueW = Math.max(
-                0,
-                Math.min(
-                  Math.max(...narrowRows.map(([, v]) => v.length)),
-                  Math.max(8, width - narrowLabelW - 4),
-                ),
-              );
-              const addNarrowRow = (label: string, value: string) => {
-                b.addRow();
-                b.add("label", label.padEnd(narrowLabelW));
-                b.add("none", "  ");
-                b.add("value", fit(value, narrowValueW));
-                b.center(width);
-              };
-
-              if (wideStats) {
-                addWideRow("GIT:", gitBranch, "PATH:", ctx.cwd);
-                addWideRow(
-                  "MCP:",
-                  `${mcpServersCount} server(s)`,
-                  "PLUGINS:",
-                  `${packagesCount} package(s)`,
-                );
-                addWideRow(
-                  "AGENTS:",
-                  `${sddAgentsCount} phases`,
-                  "EXTENSIONS:",
-                  `${extensionsCount} active`,
-                );
-                addWideRow(
-                  "SKILLS:",
-                  `${skills.length} loaded`,
-                  "TOOLS:",
-                  `${customTools.length} custom`,
-                );
-                addWideRow("VER:", `v${VERSION}`, "", "");
-              } else {
-                addNarrowRow("GIT:", gitBranch);
-                addNarrowRow("PATH:", ctx.cwd);
-                addNarrowRow("MCP:", `${mcpServersCount} server(s)`);
-                addNarrowRow("PLUGINS:", `${packagesCount} package(s)`);
-                addNarrowRow("AGENTS:", `${sddAgentsCount} phases`);
-                addNarrowRow("SKILLS:", `${skills.length} loaded`);
-                addNarrowRow("EXTENSIONS:", `${extensionsCount} active`);
-                addNarrowRow("VER:", `v${VERSION}`);
-                addNarrowRow("TOOLS:", `${customTools.length} custom`);
               }
 
               b.addRow();

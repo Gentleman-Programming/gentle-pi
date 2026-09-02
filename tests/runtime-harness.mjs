@@ -817,6 +817,52 @@ async function run() {
 	// (cancelled), and /gentle:banner -> Color row -> nested picker (cancelled).
 	// Also covers an invalid non-empty argument, which must still open the
 	// picker and treat its cancellation as a no-op.
+	// issue-375: all startup-stat rows must share one grid at the wide
+	// threshold. Long values must truncate within that grid rather than changing
+	// its columns or wrapping a terminal line.
+	{
+		const { formatStartupStatsRows } = await import(
+			`${pathToFileURL(join(ROOT, "extensions/startup-banner.ts")).href}?startup-stats-grid`,
+		);
+		const longStats = {
+			gitBranch: `On branch ${"branch-".repeat(12)}`,
+			path: `/${"workspace/".repeat(12)}`,
+			mcp: `${"9".repeat(70)} server(s)`,
+			agents: `${"8".repeat(70)} phases`,
+			plugins: `${"7".repeat(70)} package(s)`,
+			skills: `${"6".repeat(70)} loaded`,
+			extensions: `${"5".repeat(70)} active`,
+			version: `v${"4".repeat(70)}`,
+			tools: `${"3".repeat(70)} custom`,
+		};
+
+		const narrowRows = formatStartupStatsRows(80, longStats);
+		assert.deepEqual(
+			narrowRows.map((row) => row.match(/^(PATH:|GIT:|MCP:|PLUGINS:|AGENTS:|SKILLS:|EXTENSIONS:|TOOLS:|VER:)/)?.[1]),
+			["PATH:", "GIT:", "MCP:", "PLUGINS:", "AGENTS:", "SKILLS:", "EXTENSIONS:", "TOOLS:", "VER:"],
+			"narrow layout must show PATH before GIT and keep version visually secondary",
+		);
+		assert.ok(narrowRows.every((row) => row.length <= 80 && !row.includes("\n")), "narrow rows must not wrap or clip");
+
+		const thresholdRows = formatStartupStatsRows(122, longStats);
+		assert.equal(thresholdRows.length, 5, "wide layout must compact stats into five paired grid rows");
+		assert.ok(thresholdRows.every((row) => row.length === 121 && !row.includes("\n")), "122-column grid must fit without wrapping or clipping");
+		assert.deepEqual(
+			thresholdRows.map((row) => row.indexOf("GIT:") >= 0 ? row.indexOf("GIT:") : row.indexOf("PLUGINS:") >= 0 ? row.indexOf("PLUGINS:") : row.indexOf("EXTENSIONS:") >= 0 ? row.indexOf("EXTENSIONS:") : row.indexOf("VER:")),
+			[62, 62, 62, -1, 62],
+			"wide second-column stats must retain the same origin",
+		);
+		assert.equal(thresholdRows[0].slice(13, 59), longStats.path.slice(0, 46), "PATH must retain 46 characters at 122 columns");
+		assert.match(thresholdRows[4], /TOOLS:.*VER:/, "version must share the wide grid with another stat");
+
+		const largerRows = formatStartupStatsRows(160, longStats);
+		assert.deepEqual(largerRows, thresholdRows, "larger widths must preserve the stable wide grid geometry");
+		assert.ok(
+			thresholdRows.every((row) => row.length <= 122 && !row.includes("\n")),
+			"long path, branch, version, and count values must stay inside the 122-column grid",
+		);
+	}
+
 	const cancelPickerCwd = await tempWorkspace();
 	try {
 		const bannerConfigPath = join(globalConfigHome, "banner.json");
