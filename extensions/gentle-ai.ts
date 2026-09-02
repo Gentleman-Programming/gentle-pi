@@ -703,6 +703,58 @@ function renderOrchestratorPrompt(
 		.trim();
 }
 
+// gentle-pi#560 / gentle-ai#4056, #4057: Gentle AI stopped writing a
+// runtime-specific review execution contract into Pi's generated
+// APPEND_SYSTEM composition on 2026-08-01. This package now injects the
+// mirrored provider contract bundle's own `orchestration/pi.md` text
+// instead, read once from the package-local mirror
+// (contracts/review-provider-contract-mirror/) and cached as the fully
+// rendered fragment for the process lifetime. It is deliberately NOT folded
+// into getOrchestratorPrompt/orchestratorPromptCache: that core prompt is
+// pinned at an 8192-byte budget (tests/orchestrator-budget.test.ts).
+const PROVIDER_CONTRACT_MIRROR_ROOT = join(PACKAGE_ROOT, "contracts", "review-provider-contract-mirror");
+const PROVIDER_CONTRACT_LOCK_FILE = "provider-contract.lock.json";
+const PI_ORCHESTRATION_RUNTIME = "pi";
+
+let reviewContractPromptFragmentCache: string | null | undefined;
+let reviewContractPromptMissingWarned = false;
+
+function readMirroredReviewContractFragment(): string | null {
+	try {
+		const lockPath = join(PROVIDER_CONTRACT_MIRROR_ROOT, PROVIDER_CONTRACT_LOCK_FILE);
+		const lock = JSON.parse(readFileSync(lockPath, "utf8")) as { contract_semver?: unknown };
+		if (typeof lock.contract_semver !== "string" || lock.contract_semver === "") return null;
+		const contractPath = join(
+			PROVIDER_CONTRACT_MIRROR_ROOT,
+			`v${lock.contract_semver}`,
+			"bundle",
+			"orchestration",
+			`${PI_ORCHESTRATION_RUNTIME}.md`,
+		);
+		const text = readFileSync(contractPath, "utf8").trim();
+		if (text.length === 0) return null;
+		return `## Gentle AI review execution contract (mirrored provider bundle ${lock.contract_semver})\n\n${text}`;
+	} catch {
+		return null;
+	}
+}
+
+function loadReviewContractPromptFragment(ctx: Pick<ExtensionContext, "hasUI" | "ui">): string | null {
+	if (reviewContractPromptFragmentCache === undefined) {
+		reviewContractPromptFragmentCache = readMirroredReviewContractFragment();
+	}
+	if (reviewContractPromptFragmentCache === null && !reviewContractPromptMissingWarned) {
+		reviewContractPromptMissingWarned = true;
+		if (ctx.hasUI) {
+			ctx.ui.notify(
+				"Gentle AI review execution contract is unavailable: the mirrored provider bundle is missing or unreadable. Review preflight instructions will not be injected this session.",
+				"warning",
+			);
+		}
+	}
+	return reviewContractPromptFragmentCache;
+}
+
 async function pathExists(path: string): Promise<boolean> {
 	try {
 		await access(path);
@@ -5681,6 +5733,8 @@ export const __testing = {
 	renderSddModelPanel: renderSddModelPanelForTesting,
 	getOrchestratorPrompt,
 	renderOrchestratorPrompt,
+	loadReviewContractPromptFragment,
+	readMirroredReviewContractFragment,
 	loadBackgroundSubagentsPolicy,
 	resolveBackgroundSubagentsPolicy,
 	renderBackgroundSubagentsReport,
@@ -5977,8 +6031,18 @@ function createGentleAiExtensionForTesting(
 		const gentlePrompt = isNamedAgent || isSddAgent
 			? ""
 			: `\n\n${buildGentlePrompt(readPersonaMode(ctx.cwd), ctx.cwd, readActiveToolNames(pi))}`;
+		// gentle-pi#560 / gentle-ai#4056, #4057: inject the mirrored provider
+		// contract bundle's review execution contract for the primary session
+		// only, and only when a native review CLI is actually present.
+		const reviewContractPrompt =
+			!isNamedAgent && !isSddAgent && nativeReviewCli !== null
+				? (() => {
+					const fragment = loadReviewContractPromptFragment(ctx);
+					return fragment === null ? "" : `\n\n${fragment}`;
+				})()
+				: "";
 		return {
-			systemPrompt: `${event.systemPrompt}${gentlePrompt}${sddPrompt}${nativeStatusPrompt}`,
+			systemPrompt: `${event.systemPrompt}${gentlePrompt}${sddPrompt}${nativeStatusPrompt}${reviewContractPrompt}`,
 		};
 	});
 

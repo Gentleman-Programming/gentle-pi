@@ -347,8 +347,8 @@ test("core-alone: load-bearing direct-delegation tokens remain without lazy unio
 
 test("core-alone: dynamic Gentle AI ownership replaces package lifecycle instructions", () => {
 	const core = readRealAsset("orchestrator.md");
-	assert.match(core, /dynamically supplies runtime-specific RDD instructions via generated Pi APPEND_SYSTEM composition/);
-	assert.match(core, /if absent or unsupported, this package does not invent or fall back/);
+	assert.match(core, /injects the mirrored provider-bundle review execution contract into this session's system prompt at start/);
+	assert.match(core, /Absent that mirrored contract, this package invents no lifecycle instructions/);
 	assert.doesNotMatch(core, /start -> finalize -> validate/i);
 	assert.doesNotMatch(core, /receipt validation/i);
 });

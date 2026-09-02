@@ -6,7 +6,7 @@ import test from "node:test";
 const ROOT = join(import.meta.dirname, "..");
 const ASSETS = join(ROOT, "assets");
 const BOUNDARY =
-	"Gentle AI dynamically supplies runtime-specific RDD instructions via generated Pi APPEND_SYSTEM composition. Follow only those exact native instructions; if absent or unsupported, this package does not invent or fall back.";
+	"This package injects the mirrored provider-bundle review execution contract into this session's system prompt at start; Gentle AI writes nothing into the Pi system prompt, and this package owns everything else here. Absent that mirrored contract, this package invents no lifecycle instructions.";
 
 function read(relativePath: string): string {
 	return readFileSync(join(ROOT, relativePath), "utf8");

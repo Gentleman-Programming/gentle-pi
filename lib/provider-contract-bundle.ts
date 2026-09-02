@@ -31,6 +31,8 @@ export const PI_RUNTIME_IDENTITY = "pi";
 export const SUPPORTED_PROVIDER_CONTRACT_MAJOR = 1;
 // `runtimes` became part of the manifest in contract 1.1.0.
 export const RUNTIMES_REQUIRED_SINCE_MINOR = 1;
+// `orchestration` became part of the manifest in contract 1.2.0.
+export const ORCHESTRATION_REQUIRED_SINCE_MINOR = 2;
 // Exactly the provider roles gentle-pi supports, in the manifest's strict order.
 export const PROVIDER_CONTRACT_ROLE_IDS = ["lens", "refuter", "targeted-validator"] as const;
 // Every mandatory capability a role may declare. An unknown mandatory
@@ -42,6 +44,13 @@ const MAX_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_BUNDLE_BYTES = 16 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 64 * 1024;
 const BUNDLE_ENTRY_COUNT = 8;
+// Generous fixed safety bound on raw archive/tree entries read BEFORE the
+// manifest itself is parsed (the exact expected count, base entries plus one
+// per `orchestration` runtime, is known only after manifest decode). Real
+// contracts register a handful of runtimes; this bound only rules out an
+// absurd smuggled inventory, it is not the exact-count check.
+const MAX_ORCHESTRATION_ENTRIES = 64;
+const MAX_RAW_BUNDLE_ENTRIES = BUNDLE_ENTRY_COUNT + MAX_ORCHESTRATION_ENTRIES;
 // setuid/setgid/sticky, any execute bit, or world-writable content is never
 // acceptable for a data-only contract bundle.
 const FORBIDDEN_MODE_BITS = 0o7113;
@@ -84,7 +93,13 @@ export interface VerifiedProviderContractBundle {
 	/** Present exactly when the manifest declares the runtime registry (>= 1.1.0). */
 	readonly runtimes: readonly string[] | undefined;
 	readonly roles: readonly VerifiedProviderRole[];
-	/** Canonical path -> exact verified bytes for all eight entries. */
+	/**
+	 * Verified runtime-bound review execution contract text, runtime identity
+	 * -> UTF-8 `orchestration/<runtime>.md` contents. Empty before contract
+	 * 1.2.0, where `orchestration` does not exist in the manifest.
+	 */
+	readonly orchestration: ReadonlyMap<string, string>;
+	/** Canonical path -> exact verified bytes for all entries (base eight plus one per orchestration runtime). */
 	readonly entries: ReadonlyMap<string, Buffer>;
 	/** Canonical path -> SHA-256 of the exact verified bytes. */
 	readonly entrySha256: ReadonlyMap<string, string>;
@@ -306,6 +321,23 @@ function parseManifestRole(value: unknown, index: number): ManifestRole {
 	};
 }
 
+interface ManifestOrchestrationEntry {
+	readonly runtime: string;
+	readonly file: ManifestFileReference;
+}
+
+function parseOrchestrationEntry(value: unknown, index: number): ManifestOrchestrationEntry {
+	const where = `manifest.orchestration[${index}]`;
+	const object = requireObject(value, where);
+	requireExactKeys(object, ["runtime", "file"], ["runtime", "file"], where);
+	const runtime = requireString(object.runtime, `${where}.runtime`);
+	if (!RUNTIME_IDENTITY_PATTERN.test(runtime)) invalid(`${where}.runtime ${JSON.stringify(runtime)} is not a runtime identity`);
+	const file = parseFileReference(object.file, `${where}.file`);
+	const expectedPath = `orchestration/${runtime}.md`;
+	if (file.path !== expectedPath) invalid(`${where}.file.path must be ${JSON.stringify(expectedPath)}`);
+	return { runtime, file };
+}
+
 interface ParsedManifest {
 	readonly contractSemver: string;
 	readonly major: number;
@@ -315,13 +347,14 @@ interface ParsedManifest {
 	readonly runtimes: readonly string[] | undefined;
 	readonly readme: ManifestFileReference;
 	readonly roles: readonly ManifestRole[];
+	readonly orchestration: readonly ManifestOrchestrationEntry[];
 }
 
 function parseManifest(payload: Buffer): ParsedManifest {
 	const object = decodeStrictManifestObject(payload);
 	requireExactKeys(
 		object,
-		["schema", "contract_semver", "transport_capability", "runtimes", "readme", "roles"],
+		["schema", "contract_semver", "transport_capability", "runtimes", "readme", "roles", "orchestration"],
 		["schema", "contract_semver", "transport_capability", "readme", "roles"],
 		"manifest",
 	);
@@ -365,6 +398,33 @@ function parseManifest(payload: Buffer): ParsedManifest {
 		invalid(`manifest.runtimes does not register the ${JSON.stringify(PI_RUNTIME_IDENTITY)} runtime identity`);
 	}
 
+	const orchestrationRequired = minor >= ORCHESTRATION_REQUIRED_SINCE_MINOR;
+	let orchestration: readonly ManifestOrchestrationEntry[] = [];
+	if (Object.prototype.hasOwnProperty.call(object, "orchestration")) {
+		if (!orchestrationRequired) {
+			invalid(`manifest.orchestration is not part of contract ${contractSemver}; it exists from 1.${ORCHESTRATION_REQUIRED_SINCE_MINOR}.0`);
+		}
+		if (!Array.isArray(object.orchestration) || object.orchestration.length === 0) {
+			invalid("manifest.orchestration must be a non-empty array");
+		}
+		const parsedOrchestration = object.orchestration.map((entry, index) => parseOrchestrationEntry(entry, index));
+		for (let position = 0; position < parsedOrchestration.length; position += 1) {
+			const entry = parsedOrchestration[position] as ManifestOrchestrationEntry;
+			if (position > 0 && (parsedOrchestration[position - 1] as ManifestOrchestrationEntry).runtime >= entry.runtime) {
+				invalid("manifest.orchestration must be strictly sorted by runtime and unique");
+			}
+			if (runtimes === undefined || !runtimes.includes(entry.runtime)) {
+				invalid(`manifest.orchestration[${position}].runtime ${JSON.stringify(entry.runtime)} is not registered in manifest.runtimes`);
+			}
+		}
+		if (!parsedOrchestration.some((entry) => entry.runtime === PI_RUNTIME_IDENTITY)) {
+			invalid(`manifest.orchestration does not register the ${JSON.stringify(PI_RUNTIME_IDENTITY)} runtime identity`);
+		}
+		orchestration = parsedOrchestration;
+	} else if (orchestrationRequired) {
+		invalid(`manifest.orchestration is required from contract 1.${ORCHESTRATION_REQUIRED_SINCE_MINOR}.0 (got ${contractSemver} without it)`);
+	}
+
 	if (!Array.isArray(object.roles)) invalid("manifest.roles must be an array");
 	const roles = object.roles.map((role, index) => parseManifestRole(role, index));
 	if (roles.length !== PROVIDER_CONTRACT_ROLE_IDS.length) {
@@ -385,6 +445,7 @@ function parseManifest(payload: Buffer): ParsedManifest {
 		runtimes,
 		readme: parseFileReference(object.readme, "manifest.readme"),
 		roles,
+		orchestration,
 	};
 }
 
@@ -467,8 +528,8 @@ export function bundleTreeSha256(entrySha256: ReadonlyMap<string, string>): stri
 
 /** Verifies a complete in-memory bundle inventory. The single trust anchor. */
 export function verifyProviderContractBundleEntries(rawEntries: ReadonlyMap<string, Buffer>): VerifiedProviderContractBundle {
-	if (rawEntries.size !== BUNDLE_ENTRY_COUNT) {
-		invalid(`bundle inventory has ${rawEntries.size} files; exactly ${BUNDLE_ENTRY_COUNT} are expected`);
+	if (rawEntries.size > MAX_RAW_BUNDLE_ENTRIES) {
+		invalid(`bundle inventory has ${rawEntries.size} files; at most ${MAX_RAW_BUNDLE_ENTRIES} are ever expected`);
 	}
 	for (const [name, payload] of rawEntries) {
 		if (!isCanonicalBundlePath(name)) invalid(`bundle path ${JSON.stringify(name)} is unsafe`);
@@ -478,12 +539,27 @@ export function verifyProviderContractBundleEntries(rawEntries: ReadonlyMap<stri
 	if (manifestPayload === undefined) invalid("bundle is missing manifest.json");
 	const manifest = parseManifest(manifestPayload);
 
+	// The exact expected inventory size is only known once the manifest is
+	// decoded: base entries plus exactly one `orchestration/<runtime>.md` per
+	// registered orchestration runtime.
+	const expectedEntryCount = BUNDLE_ENTRY_COUNT + manifest.orchestration.length;
+	if (rawEntries.size !== expectedEntryCount) {
+		invalid(`bundle inventory has ${rawEntries.size} files; exactly ${expectedEntryCount} are expected`);
+	}
+
 	verifyFileReference(rawEntries, manifest.readme, "README.md");
 	const expected = new Set(["README.md", "manifest.json"]);
 	for (const role of manifest.roles) {
 		verifyRoleArtifacts(rawEntries, role);
 		expected.add(`schemas/${role.id}.schema.json`);
 		expected.add(`vectors/${role.id}.json`);
+	}
+	const orchestration = new Map<string, string>();
+	for (const entry of manifest.orchestration) {
+		const path = `orchestration/${entry.runtime}.md`;
+		const payload = verifyFileReference(rawEntries, entry.file, path);
+		orchestration.set(entry.runtime, payload.toString("utf8"));
+		expected.add(path);
 	}
 	for (const name of rawEntries.keys()) {
 		if (!expected.has(name)) invalid(`bundle has unexpected file ${JSON.stringify(name)}`);
@@ -514,6 +590,7 @@ export function verifyProviderContractBundleEntries(rawEntries: ReadonlyMap<stri
 			vectorPath: role.vector.path,
 			vectorSha256: role.vector.sha256,
 		})),
+		orchestration,
 		entries,
 		entrySha256,
 		treeSha256: bundleTreeSha256(entrySha256),
@@ -566,7 +643,7 @@ export function verifyProviderContractBundleTree(directory: string): VerifiedPro
 			}
 			if (!isCanonicalBundlePath(relativeName)) invalid(`bundle tree path ${JSON.stringify(relativeName)} is unsafe`);
 			if (details.size > MAX_FILE_BYTES) invalid(`bundle tree entry ${JSON.stringify(relativeName)} exceeds its size limit`);
-			if (entries.size >= BUNDLE_ENTRY_COUNT) invalid(`bundle tree has more than ${BUNDLE_ENTRY_COUNT} files`);
+			if (entries.size >= MAX_RAW_BUNDLE_ENTRIES) invalid(`bundle tree has more than ${MAX_RAW_BUNDLE_ENTRIES} files`);
 			entries.set(relativeName, readFileSync(absolute));
 		}
 	};
@@ -628,7 +705,7 @@ function readTarEntries(expanded: Buffer): Map<string, Buffer> {
 		if (size > MAX_FILE_BYTES) invalid(`tar entry ${JSON.stringify(name)} exceeds its size limit`);
 		totalBytes += size;
 		if (totalBytes > MAX_BUNDLE_BYTES) invalid("tar entries exceed the bundle size limit");
-		if (entries.size >= BUNDLE_ENTRY_COUNT) invalid(`tar has more than ${BUNDLE_ENTRY_COUNT} entries`);
+		if (entries.size >= MAX_RAW_BUNDLE_ENTRIES) invalid(`tar has more than ${MAX_RAW_BUNDLE_ENTRIES} entries`);
 		const padding = (TAR_BLOCK_SIZE - (size % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;
 		if (expanded.length - offset < size + padding) invalid("tar stream ends before a complete entry");
 		entries.set(name, Buffer.from(expanded.subarray(offset, offset + size)));
@@ -696,6 +773,11 @@ export function generateProviderContractBaselines(bundle: VerifiedProviderContra
 		mandatory_capabilities: mandatory,
 		runtimes: bundle.runtimes === undefined ? null : [...bundle.runtimes],
 		pi_registered: piRuntimeRegistration(bundle).registered,
+		orchestration: [...bundle.orchestration.keys()].sort().map((runtime) => ({
+			runtime,
+			path: `orchestration/${runtime}.md`,
+			sha256: bundle.entrySha256.get(`orchestration/${runtime}.md`),
+		})),
 	};
 	return new Map([
 		[PROVIDER_ROLES_BASELINE_FILE, `${JSON.stringify(roles, null, 2)}\n`],
