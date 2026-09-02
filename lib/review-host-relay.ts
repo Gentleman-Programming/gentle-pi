@@ -284,7 +284,18 @@ export interface ReviewHostRelayResult {
 	readonly submission: string;
 }
 
+/** Opaque materialize-and-review result, not yet submitted to the provider. */
+export interface ReviewHostRelayPreparedResult {
+	/** Copy-safe request snapshot captured before materialization starts. */
+	readonly request: ReviewHostRelayRequest;
+	readonly promptByteLength: number;
+	readonly resultByteLength: number;
+	readonly resultBytes: Buffer;
+}
+
 export type ReviewHostRelayRunner = (request: ReviewHostRelayRequest) => Promise<ReviewHostRelayResult>;
+export type ReviewHostRelayPreparationRunner = (request: ReviewHostRelayRequest) => Promise<ReviewHostRelayPreparedResult>;
+export type ReviewHostRelaySubmissionRunner = (prepared: ReviewHostRelayPreparedResult) => Promise<ReviewHostRelayResult>;
 
 const DEFAULT_GENTLE_AI_TIMEOUT_MS = 120_000;
 
@@ -442,38 +453,54 @@ function assertTokens(name: string, tokens: readonly string[]): void {
 	}
 }
 
-/**
- * Runs one complete host-relay capture for one provider-bound slot:
- * materialize → opaque Pi adapter → submit. Throws a typed
- * {@link ReviewHostRelayError} on every failure leg and submits nothing after
- * a failure; the caller re-queries negotiated STATUS instead of retrying.
- */
-export async function runReviewHostRelaySlot(request: ReviewHostRelayRequest): Promise<ReviewHostRelayResult> {
+function snapshotReviewHostRelayRequest(request: ReviewHostRelayRequest): ReviewHostRelayRequest {
 	assertTokens("capture", request.captureArgumentTokens);
-	// The completing form is validated before any process launches: a
-	// materialize slot without a provider-owned submission is a typed
-	// contract mismatch, never a synthesized invocation.
-	const submissionBinding = resolveReviewHostRelaySubmission(request.submission);
-	const gentleAi = request.gentleAiExecutable ?? resolveGentleAiBinary();
-	if (!isAbsolute(gentleAi)) throw new TypeError("Pi host relay requires an absolute gentle-ai executable path");
-	const baseEnvironment = request.environment ?? process.env;
-	// Every gentle-ai invocation the relay makes carries the handshake; the
-	// pi subprocess environment stays exactly as the user configured it.
-	const gentleAiEnvironment = { ...baseEnvironment, [GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV]: GENTLE_PI_REVIEW_RELAY_CONTRACT };
-	const gentleAiTimeoutMs = request.gentleAiTimeoutMs ?? DEFAULT_GENTLE_AI_TIMEOUT_MS;
-	const targetCwd = request.targetCwd ?? process.cwd();
+	// The completing form is validated before any process launches: a materialize
+	// slot without a provider-owned submission is a typed contract mismatch,
+	// never a synthesized invocation.
+	resolveReviewHostRelaySubmission(request.submission);
+	const gentleAiExecutable = request.gentleAiExecutable ?? resolveGentleAiBinary();
+	if (!isAbsolute(gentleAiExecutable)) throw new TypeError("Pi host relay requires an absolute gentle-ai executable path");
+	const environment = Object.freeze({ ...(request.environment ?? process.env) }) as NodeJS.ProcessEnv;
+	const submission = request.submission === undefined ? undefined : Object.freeze({
+		operationToken: request.submission.operationToken,
+		argumentTokens: Object.freeze([...request.submission.argumentTokens]),
+		values: Object.freeze(request.submission.values.map((value) => Object.freeze({ ...value }))),
+	});
+	return Object.freeze({
+		...request,
+		captureArgumentTokens: Object.freeze([...request.captureArgumentTokens]),
+		...(submission === undefined ? {} : { submission }),
+		gentleAiExecutable,
+		environment,
+		gentleAiTimeoutMs: request.gentleAiTimeoutMs ?? DEFAULT_GENTLE_AI_TIMEOUT_MS,
+		targetCwd: request.targetCwd ?? process.cwd(),
+	});
+}
 
-	// (a) Materialize the Go-issued opaque prompt. This invocation is also the
-	// capability detection: an old binary's unknown-flag refusal proves the
-	// relay surface is absent, and the provider's handshake refusal surfaces
-	// verbatim. No version sniffing.
+/**
+ * Materializes one provider-bound reviewer prompt and runs its opaque Pi
+ * subprocess. It does not submit anything, so independent reviewer work can
+ * finish before the caller performs provider-ordered admission.
+ */
+export async function prepareReviewHostRelaySlot(
+	request: ReviewHostRelayRequest,
+	reviewer: typeof runOpaquePiReviewer = runOpaquePiReviewer,
+): Promise<ReviewHostRelayPreparedResult> {
+	// Copy mutable transport configuration before the first async boundary. The
+	// supplied AbortSignal intentionally stays live across materialize, reviewer,
+	// and submit, preserving the established cancellation behavior.
+	const preparedRequest = snapshotReviewHostRelayRequest(request);
+
+	// The provider materializes the opaque prompt and detects whether this relay
+	// surface is available. No version sniffing or prompt reconstruction occurs.
 	let materialized: ProcessCapture;
 	try {
-		materialized = await collectGentleAiProcess(gentleAi, ["review", "capture-result", ...request.captureArgumentTokens], {
-			cwd: targetCwd,
-			env: gentleAiEnvironment,
-			timeoutMs: gentleAiTimeoutMs,
-			...(request.signal === undefined ? {} : { signal: request.signal }),
+		materialized = await collectGentleAiProcess(preparedRequest.gentleAiExecutable!, ["review", "capture-result", ...preparedRequest.captureArgumentTokens], {
+			cwd: preparedRequest.targetCwd!,
+			env: { ...preparedRequest.environment!, [GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV]: GENTLE_PI_REVIEW_RELAY_CONTRACT },
+			timeoutMs: preparedRequest.gentleAiTimeoutMs!,
+			...(preparedRequest.signal === undefined ? {} : { signal: preparedRequest.signal }),
 		});
 	} catch (error) {
 		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.MATERIALIZE_FAILED, "materialize", `gentle-ai prompt materialization could not start: ${error instanceof Error ? error.message : String(error)}`);
@@ -481,45 +508,88 @@ export async function runReviewHostRelaySlot(request: ReviewHostRelayRequest): P
 	if (materialized.exitCode !== 0 || materialized.timedOut) {
 		const stderr = materialized.stderr.toString("utf8");
 		const refusal = classifyReviewHostRelayRefusal(stderr);
-		const timing = { elapsedMs: materialized.elapsedMs, timeoutMs: gentleAiTimeoutMs };
+		const timing = { elapsedMs: materialized.elapsedMs, timeoutMs: preparedRequest.gentleAiTimeoutMs! };
 		if (refusal === "unknown-flag") {
-			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.RELAY_UNAVAILABLE, "materialize", REVIEW_HOST_RELAY_UNAVAILABLE_MESSAGE, { exitCode: materialized.exitCode, stderr, timedOut: materialized.timedOut, ...timing });
+			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.RELAY_UNAVAILABLE, "materialize", REVIEW_HOST_RELAY_UNAVAILABLE_MESSAGE, {
+				exitCode: materialized.exitCode,
+				stderr,
+				timedOut: materialized.timedOut,
+				...timing,
+			});
 		}
 		if (refusal === "handshake") {
-			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.HANDSHAKE_REFUSED, "materialize", stderr, { exitCode: materialized.exitCode, stderr, timedOut: materialized.timedOut, ...timing });
+			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.HANDSHAKE_REFUSED, "materialize", stderr, {
+				exitCode: materialized.exitCode,
+				stderr,
+				timedOut: materialized.timedOut,
+				...timing,
+			});
 		}
 		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.MATERIALIZE_FAILED, "materialize", materialized.timedOut
-			? `gentle-ai prompt materialization exceeded its ${gentleAiTimeoutMs}ms bound after ${materialized.elapsedMs}ms`
+			? `gentle-ai prompt materialization exceeded its ${preparedRequest.gentleAiTimeoutMs!}ms bound after ${materialized.elapsedMs}ms`
 			: "gentle-ai prompt materialization failed", { exitCode: materialized.exitCode, stderr, timedOut: materialized.timedOut, ...timing });
 	}
 	const promptBytes = materialized.stdout;
 	if (promptBytes.length === 0) {
-		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.EMPTY_PROMPT, "materialize", "gentle-ai prompt materialization produced no bytes", { exitCode: 0, stderr: materialized.stderr.toString("utf8"), elapsedMs: materialized.elapsedMs, timeoutMs: gentleAiTimeoutMs });
+		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.EMPTY_PROMPT, "materialize", "gentle-ai prompt materialization produced no bytes", {
+			exitCode: 0,
+			stderr: materialized.stderr.toString("utf8"),
+			elapsedMs: materialized.elapsedMs,
+			timeoutMs: preparedRequest.gentleAiTimeoutMs!,
+		});
 	}
 	// The reviewer bound is derived from the prompt the provider actually
-	// materialized, so it can only be resolved here. An explicit request
-	// timeout (the test seam) still wins over both the override and the scale.
-	const piTimeoutMs = request.piTimeoutMs ?? resolveReviewHostRelayPiTimeoutMs(promptBytes.length, baseEnvironment);
+	// materialized. The explicit request timeout is a test seam that wins over
+	// both the user-owned environment override and the scale-derived bound.
+	const piTimeoutMs = preparedRequest.piTimeoutMs ?? resolveReviewHostRelayPiTimeoutMs(promptBytes.length, preparedRequest.environment);
 
-	// (b) The pure adapter owns the fresh isolated Pi process. Its input and
-	// output are opaque bytes; this coordinator only maps transport failures to
-	// the established relay boundary.
+	// The pure adapter owns the fresh isolated Pi process. Its input and output
+	// are opaque bytes; this coordinator only maps transport failures.
 	let piResult: OpaquePiReviewerResult;
 	try {
-		piResult = await runOpaquePiReviewer(promptBytes, {
-			...(request.piExecutable === undefined ? {} : { piExecutable: request.piExecutable }),
-			environment: baseEnvironment,
+		piResult = await reviewer(promptBytes, {
+			...(preparedRequest.piExecutable === undefined ? {} : { piExecutable: preparedRequest.piExecutable }),
+			environment: preparedRequest.environment,
 			timeoutMs: piTimeoutMs,
-			...(request.signal === undefined ? {} : { signal: request.signal }),
+			...(preparedRequest.signal === undefined ? {} : { signal: preparedRequest.signal }),
 		});
 	} catch (error) {
 		throw relayPiTransportError(error, promptBytes.length, piTimeoutMs);
 	}
-	const resultBytes = piResult.stdout;
+	return {
+		request: preparedRequest,
+		promptByteLength: promptBytes.length,
+		resultByteLength: piResult.stdoutByteLength,
+		resultBytes: Buffer.from(piResult.stdout),
+	};
+}
 
-	// (c) Submit the raw final bytes untouched through the provider-owned
-	// completing form: its exact operation and argument tokens, with only the
-	// artifact path substituted into the declared {{value}} slot.
+/**
+ * Starts every reviewer before awaiting any result. If one or more reviewers
+ * fail, it rejects only after every started transport has settled and reports
+ * the earliest failed request in provider order.
+ */
+export async function runReviewHostRelayReviewerGroup(
+	requests: readonly ReviewHostRelayRequest[],
+	prepare: ReviewHostRelayPreparationRunner = prepareReviewHostRelaySlot,
+): Promise<readonly ReviewHostRelayPreparedResult[]> {
+	if (requests.length === 0) {
+		throw new TypeError("Pi host relay reviewer group requires at least one provider-bound request");
+	}
+	const settled = await Promise.allSettled(requests.map(async (request) => await prepare(request)));
+	const failed = settled.find((result) => result.status === "rejected");
+	if (failed?.status === "rejected") throw failed.reason;
+	return settled.map((result) => (result as PromiseFulfilledResult<ReviewHostRelayPreparedResult>).value);
+}
+
+/**
+ * Submits one already-reviewed opaque result through the exact provider-owned
+ * completing form. Only the provider-declared artifact slot is substituted.
+ */
+export async function submitReviewHostRelayPreparedResult(prepared: ReviewHostRelayPreparedResult): Promise<ReviewHostRelayResult> {
+	const { request, resultBytes } = prepared;
+	assertTokens("capture", request.captureArgumentTokens);
+	const submissionBinding = resolveReviewHostRelaySubmission(request.submission);
 	const stagingDirectory = await mkdtemp(join(tmpdir(), "gentle-pi-host-relay-result-"));
 	let primaryFailure = false;
 	try {
@@ -528,14 +598,16 @@ export async function runReviewHostRelaySlot(request: ReviewHostRelayRequest): P
 		await writeFile(resultFile, resultBytes, { mode: 0o600 });
 		await chmod(resultFile, 0o600);
 		const submitTokens = submissionBinding.argumentTokens.map((token, index) =>
-			index === submissionBinding.substitutionLocation ? token.split(REVIEW_HOST_RELAY_SUBMISSION_VALUE_SLOT).join(resultFile) : token,
+			index === submissionBinding.substitutionLocation
+				? token.split(REVIEW_HOST_RELAY_SUBMISSION_VALUE_SLOT).join(resultFile)
+				: token,
 		);
 		let submission: ProcessCapture;
 		try {
-			submission = await collectGentleAiProcess(gentleAi, ["review", submissionBinding.operationToken, ...submitTokens], {
-				cwd: targetCwd,
-				env: gentleAiEnvironment,
-				timeoutMs: gentleAiTimeoutMs,
+			submission = await collectGentleAiProcess(request.gentleAiExecutable!, ["review", submissionBinding.operationToken, ...submitTokens], {
+				cwd: request.targetCwd!,
+				env: { ...request.environment!, [GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV]: GENTLE_PI_REVIEW_RELAY_CONTRACT },
+				timeoutMs: request.gentleAiTimeoutMs!,
 				...(request.signal === undefined ? {} : { signal: request.signal }),
 			});
 		} catch (error) {
@@ -543,20 +615,22 @@ export async function runReviewHostRelaySlot(request: ReviewHostRelayRequest): P
 		}
 		if (submission.exitCode !== 0 || submission.timedOut || submission.stdout.length === 0) {
 			const stderr = submission.stderr.toString("utf8");
-			const details = { exitCode: submission.exitCode, stderr, timedOut: submission.timedOut, elapsedMs: submission.elapsedMs, timeoutMs: gentleAiTimeoutMs };
-			// A typed admission refusal is a proven non-mutation whose reason is
-			// the refusal text itself; everything else that launched (timeout,
-			// signal, untyped exit) stays unknown pending STATUS.
+			const details = { exitCode: submission.exitCode, stderr, timedOut: submission.timedOut, elapsedMs: submission.elapsedMs, timeoutMs: request.gentleAiTimeoutMs! };
+			// A typed admission refusal proves the provider consumed no slot.
+			// Every other launched submission stays unknown pending fresh STATUS.
 			if (isReviewHostRelayAdmissionRefusal(submission, stderr)) {
-				throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", stderr.trim(), { ...details, mutationOutcome: "none" });
+				throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", stderr.trim(), {
+					...details,
+					mutationOutcome: "none",
+				});
 			}
 			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", submission.timedOut
-				? `gentle-ai capture submission exceeded its ${gentleAiTimeoutMs}ms bound after ${submission.elapsedMs}ms`
+				? `gentle-ai capture submission exceeded its ${request.gentleAiTimeoutMs!}ms bound after ${submission.elapsedMs}ms`
 				: "gentle-ai refused the relayed capture submission", details);
 		}
 		return {
-			promptByteLength: promptBytes.length,
-			resultByteLength: piResult.stdoutByteLength,
+			promptByteLength: prepared.promptByteLength,
+			resultByteLength: prepared.resultByteLength,
 			submission: submission.stdout.toString("utf8"),
 		};
 	} catch (error) {
@@ -575,4 +649,12 @@ export async function runReviewHostRelaySlot(request: ReviewHostRelayRequest): P
 			}
 		}
 	}
+}
+
+/**
+ * Compatibility one-binding path: materialize → opaque Pi adapter → submit.
+ * It preserves the established API and its typed failure behavior exactly.
+ */
+export async function runReviewHostRelaySlot(request: ReviewHostRelayRequest): Promise<ReviewHostRelayResult> {
+	return await submitReviewHostRelayPreparedResult(await prepareReviewHostRelaySlot(request));
 }
