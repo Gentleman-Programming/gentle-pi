@@ -2,6 +2,12 @@
 
 Bind this to the parent Pi session only, on SDD phase memory reads/writes. Not always-on; loaded on demand from `assets/orchestrator.md`'s `## Memory Contract` pointer.
 
+### Direct Inline & General Tasks
+
+When working outside of SDD (direct inline edits, bug fixes, configuration/deployment updates, or newly learned user conventions):
+- The parent session MUST invoke `mem_save` immediately upon completing the action before emitting the final response.
+- Never defer persistence to session close. Direct inline tasks skip SDD planning ceremony, but NEVER skip hot memory persistence.
+
 ### SDD phases
 
 Each SDD phase subagent reads its own required inputs directly from the active backend; the parent passes artifact references (topic keys or file paths), NOT the content itself. Phase subagents persist their artifact before returning.
