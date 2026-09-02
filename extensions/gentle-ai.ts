@@ -159,7 +159,7 @@ const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
 
 function gentlePiAgentHome(): string {
-	return process.env.GENTLE_PI_AGENT_HOME ?? join(homedir(), ".pi", "agent");
+	return process.env.GENTLE_PI_AGENT_HOME ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
 function sddGlobalAssetDriftCount(): number {

@@ -19,7 +19,7 @@ const LEGACY_MANAGED_ASSET_MANIFESTS = Object.freeze([
 ]);
 
 function gentlePiAgentHome(): string {
-	return process.env.GENTLE_PI_AGENT_HOME ?? join(homedir(), ".pi", "agent");
+	return process.env.GENTLE_PI_AGENT_HOME ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
 export type SddExecutionMode = "interactive" | "auto";
