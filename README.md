@@ -11,6 +11,8 @@
 [![SDD/OpenSpec](https://img.shields.io/badge/SDD-OpenSpec-00ADD8)](#sddopenspec-flow)
 [![Subagents](https://img.shields.io/badge/Pi-subagents-brightgreen)](#what-it-adds)
 
+**[Gentle-AI website](https://gentle-ai.gentlemanprogramming.com/)** &bull; **[Gentle-AI wiki](https://gentle-ai-wiki.gentlemanprogramming.com/)** &bull; **[Engram](https://engram.gentlemanprogramming.com/)**
+
 <div align="center">
 
 <!--
