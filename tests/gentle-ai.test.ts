@@ -66,6 +66,7 @@ test("registered Gentle Review tools render reusable rose lifecycle call rows", 
 		["gentle_review", { operation: "status" }, "review status"],
 		["gentle_review", { operation: "future-operation", secret: "/private" }, "review"],
 		["gentle_review_scope", {}, "review scope"],
+		["gentle_review_capture_group", {}, "review capture group"],
 		[
 			"gentle_review_capture",
 			{

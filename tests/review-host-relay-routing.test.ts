@@ -59,6 +59,12 @@ function relayCollectInput(lineageId: string, lens: string, order: number, mater
 				{ name: "materialize", value: "true", token: "--materialize=true" },
 			] : []),
 		],
+		artifactSubject: {
+			schema: "gentle-ai.review-artifact-subject/v2", subjectHash: `sha256:${String(order).repeat(64)}`,
+			lineageId, authorityRevision: SHA, targetIdentity: SHA, baseTree: TREE, candidateTree: TREE,
+			changedPathManifestSha256: SHA, lens: lens.slice(7) as "risk" | "resilience" | "readability" | "reliability", selectedOrder: order,
+		},
+		baseTree: TREE, candidateTree: TREE, changedPathManifest: [],
 		...(materialize && submission !== "absent" ? { submission: submission === "provider" ? providerSubmission(lineageId, lens, order) : submission } : {}),
 	};
 }
@@ -164,6 +170,86 @@ test("Pi-authored review documents are rejected at the capture input boundary", 
 		/does not accept review_result/,
 	);
 	assert.equal(relayCalls, 0);
+});
+
+function groupInputs(lineageId: string): ReviewCollectInputV3[] { return ["review-risk", "review-resilience", "review-readability", "review-reliability"].map((lens, order) => relayCollectInput(lineageId, lens, order)); }
+
+async function runCaptureGroup(cwd: string, harness: RoutingHarness, lineageId: string, inputs: readonly ReviewCollectInputV3[], reviewerRunAcknowledged = true): Promise<Record<string, unknown>> { return await __testing.executeReviewCaptureGroupOperation({ lineageId, collectBindings: inputs.map((input) => JSON.stringify(input)), reviewerRunAcknowledged }, cwd, harness.native) as Record<string, unknown>; }
+
+function prepared(request: ReviewHostRelayRequest) { return { request, promptByteLength: 64, resultByteLength: 32 }; }
+
+test("grouped capture forecasts once, reaches a four-reviewer barrier, and reconciles unclosed submissions", async (t) => {
+	t.after(() => __testing.setReviewHostRelayGroupRunnersForTesting());
+	const cwd = repository(t), lineageId = "relay-group", inputs = groupInputs(lineageId), lenses = inputs.map((input) => input.arguments.find((argument) => argument.name === "lens")!.value);
+	const harness = nativeHarness([finalizeStatus(lineageId, inputs), finalizeStatus(lineageId, inputs), ...inputs.map((_input, index) => finalizeStatus(lineageId, index === 1 ? [...inputs.slice(index), { name: "unrelated", schema: "example", captureOperation: "external.example", arguments: [] }] : inputs.slice(index))), finalizeStatus(lineageId)]);
+	let ready!: () => void;
+	const allStarted = new Promise<void>((resolve) => { ready = resolve; });
+	const releases = new Map<string, () => void>(), completed: string[] = [], submitted: string[] = [];
+	const reviewerGroup = async (requests: readonly ReviewHostRelayRequest[]) => await Promise.all(requests.map(async (request) => {
+		const lens = request.captureArgumentTokens.find((token) => token.startsWith("--lens="))!.slice(7);
+		await new Promise<void>((resolve) => { releases.set(lens, resolve); if (releases.size === requests.length) ready(); });
+		completed.push(lens); return prepared(request);
+	}));
+	__testing.setReviewHostRelayGroupRunnersForTesting(reviewerGroup, async (result) => {
+		submitted.push(result.request.captureArgumentTokens.find((token) => token.startsWith("--lens="))!.slice(7));
+		return { promptByteLength: result.promptByteLength, resultByteLength: result.resultByteLength, submission: "{}" };
+	});
+	const forecast = await runCaptureGroup(cwd, harness, lineageId, inputs, false);
+	assert.deepEqual(forecast.cost_forecast, { transport: "pi_host_relay", model_runs: 4, lenses });
+	const run = runCaptureGroup(cwd, harness, lineageId, inputs);
+	await allStarted;
+	assert.deepEqual([...releases.keys()], lenses, "all reviewers start before the group waits");
+	for (const lens of [...lenses].reverse()) releases.get(lens!)!();
+	const result = await run;
+	assert.deepEqual(completed, [...lenses].reverse(), "reviewer completion order is not submission order");
+	assert.deepEqual(submitted, lenses);
+	assert.deepEqual({ outcome: result.outcome, statusCalls: harness.statusCalls.length, providerAction: result.provider_action }, { outcome: "native-reviewer-group-status-reconciled", statusCalls: 7, providerAction: "stop" });
+	assert.equal(result.next_transition, undefined);
+});
+
+test("group rejects partial, duplicate, reordered, stale, mixed, and late-invalid bindings before launch", async (t) => {
+	t.after(() => __testing.setReviewHostRelayGroupRunnersForTesting());
+	const cwd = repository(t), lineageId = "relay-group-reject", inputs = groupInputs(lineageId);
+	const stale = JSON.parse(JSON.stringify(inputs[3]!)) as ReviewCollectInputV3;
+	stale.arguments = [...stale.arguments, { name: "replacement", value: "stale", token: "--replacement=stale" }];
+	const mixed = [...inputs.slice(0, 3), relayCollectInput(lineageId, "review-reliability", 3, false)];
+	const malformed = JSON.parse(JSON.stringify(inputs)) as ReviewCollectInputV3[];
+	malformed[3]!.submission!.argumentTokens = ["--input={{value}}"];
+	const cases = [
+		{ bindings: inputs.slice(0, 3), current: inputs }, { bindings: [...inputs].reverse(), current: inputs },
+		{ bindings: [...inputs.slice(0, 3), inputs[2]!], current: inputs }, { bindings: [...inputs.slice(0, 3), stale], current: inputs },
+		{ bindings: mixed, current: mixed }, { bindings: malformed, current: malformed },
+	];
+	let launches = 0;
+	__testing.setReviewHostRelayGroupRunnersForTesting(async (requests) => { launches += requests.length; return requests.map(prepared); });
+	for (const entry of cases) {
+		const result = await runCaptureGroup(cwd, nativeHarness([finalizeStatus(lineageId, entry.current)]), lineageId, entry.bindings);
+		assert.equal(result.outcome, "capture-group-rejected");
+	}
+	assert.equal(launches, 0);
+});
+
+test("group preserves earlier admission when a later STATUS drifts, and stops on closure or unknown outcome", async (t) => {
+	t.after(() => __testing.setReviewHostRelayGroupRunnersForTesting());
+	const cwd = repository(t), lineageId = "relay-group-stop", inputs = groupInputs(lineageId);
+	const reviewerGroup = async (requests: readonly ReviewHostRelayRequest[]) => requests.map(prepared);
+	let submissions = 0;
+	__testing.setReviewHostRelayGroupRunnersForTesting(reviewerGroup, async (result) => { submissions += 1; return { promptByteLength: result.promptByteLength, resultByteLength: result.resultByteLength, submission: "{}" }; });
+	const staleStatus = finalizeStatus(lineageId, inputs), stale = await runCaptureGroup(cwd, nativeHarness([finalizeStatus(lineageId, inputs), finalizeStatus(lineageId, inputs), staleStatus]), lineageId, inputs);
+	assert.deepEqual({ outcome: stale.outcome, submissions, mutation: stale.mutation_performed, mutationOutcome: stale.mutation_outcome }, { outcome: "capture-group-authority-drift", submissions: 1, mutation: true, mutationOutcome: "partial" });
+	assert.equal(stale.reconciliation, staleStatus.raw);
+	submissions = 0;
+	const drift = await runCaptureGroup(cwd, nativeHarness([finalizeStatus(lineageId, inputs), finalizeStatus(lineageId, inputs), finalizeStatus(lineageId, inputs.slice(2))]), lineageId, inputs);
+	assert.deepEqual({ outcome: drift.outcome, submissions, mutation: drift.mutation_performed, mutationOutcome: drift.mutation_outcome }, { outcome: "capture-group-authority-drift", submissions: 1, mutation: true, mutationOutcome: "partial" });
+	assert.deepEqual(((drift.host_relay as { reviewers: Array<{ lens: string }> }).reviewers).map((reviewer) => reviewer.lens), ["review-risk"]);
+	submissions = 0;
+	__testing.setReviewHostRelayGroupRunnersForTesting(reviewerGroup, async (result) => { submissions += 1; return { promptByteLength: result.promptByteLength, resultByteLength: result.resultByteLength, submission: JSON.stringify({ schema: "gentle-ai.review-last-event-closure/v1", operation: "review/capture-result", lineage_id: lineageId, state: "approved", store_revision: SHA, action: "native last event closed the review" }) }; });
+	const terminal = await runCaptureGroup(cwd, nativeHarness([finalizeStatus(lineageId, inputs), finalizeStatus(lineageId, inputs)]), lineageId, inputs);
+	assert.deepEqual({ status: terminal.status, submissions }, { status: "closed", submissions: 1 });
+	submissions = 0;
+	__testing.setReviewHostRelayGroupRunnersForTesting(reviewerGroup, async () => { submissions += 1; throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", "unknown", { timedOut: true }); });
+	const unknown = await runCaptureGroup(cwd, nativeHarness([finalizeStatus(lineageId, inputs), finalizeStatus(lineageId, inputs), finalizeStatus(lineageId, inputs)]), lineageId, inputs);
+	assert.deepEqual({ status: unknown.status, submissions }, { status: "reconciled", submissions: 1 });
 });
 
 test("an old binary reports the relay as unavailable without touching existing behavior", async (t) => {

@@ -71,7 +71,12 @@ import {
 	ReviewHostRelayError,
 	reviewHostRelaySlots,
 	reviewProviderRoleVectorSlots,
+	resolveReviewHostRelaySubmission,
+	runReviewHostRelayReviewerGroup,
 	runReviewHostRelaySlot,
+	submitReviewHostRelayPreparedResult,
+	type ReviewHostRelayPreparedResult,
+	type ReviewHostRelayRequest,
 	type ReviewHostRelayRunner,
 	type ReviewHostRelaySlot,
 	type ReviewProviderRoleVectorSlot,
@@ -2687,6 +2692,25 @@ interface ReviewCaptureParameters {
 	workspaceRoot?: string;
 }
 
+const REVIEW_CAPTURE_GROUP_PARAMETERS = {
+	type: "object",
+	additionalProperties: false,
+	required: ["lineageId", "collectBindings"],
+	properties: {
+		lineageId: { type: "string", minLength: 1, description: "Exact lineage from the current provider-issued collect transition." },
+		collectBindings: { type: "array", minItems: 1, items: { type: "string", minLength: 1 }, description: "Ordered JSON-serialized exact copies of the complete current materialize reviewer collect set." },
+		reviewerRunAcknowledged: { type: "boolean", description: "Required after the one group forecast; authorizes exactly the forecast reviewer runs." },
+		workspaceRoot: { type: "string", description: "Optional explicit existing Git worktree root, resolved with the controller's worktree confinement semantics." },
+	},
+} as const;
+
+interface ReviewCaptureGroupParameters {
+	lineageId: string;
+	collectBindings: readonly string[];
+	reviewerRunAcknowledged?: boolean;
+	workspaceRoot?: string;
+}
+
 const REVIEW_SCOPE_PARAMETERS = {
 	type: "object",
 	additionalProperties: false,
@@ -2784,6 +2808,23 @@ function parseReviewCaptureParameters(value: unknown): ReviewCaptureParameters {
 		collectBinding: value.collectBinding,
 		...(value.reviewerRunAcknowledged === undefined ? {} : { reviewerRunAcknowledged: value.reviewerRunAcknowledged }),
 		...(value.correctionLines === undefined ? {} : { correctionLines: value.correctionLines }),
+		...(value.workspaceRoot === undefined ? {} : { workspaceRoot: value.workspaceRoot }),
+	};
+}
+
+function parseReviewCaptureGroupParameters(value: unknown): ReviewCaptureGroupParameters {
+	if (!isRecord(value)) throw new Error("Review capture group parameters must be an object");
+	const allowed = new Set(["lineageId", "collectBindings", "reviewerRunAcknowledged", "workspaceRoot"]);
+	const unexpected = Object.keys(value).find((key) => !allowed.has(key));
+	if (unexpected !== undefined) throw new Error(`Review capture group does not accept ${unexpected}`);
+	if (!isCanonicalProcessString(value.lineageId)) throw new Error("Review capture group requires an exact non-empty lineageId");
+	if (!Array.isArray(value.collectBindings) || value.collectBindings.length === 0 || value.collectBindings.some((binding) => typeof binding !== "string" || binding.length === 0)) throw new Error("Review capture group requires one or more JSON-serialized collectBindings");
+	if (value.reviewerRunAcknowledged !== undefined && typeof value.reviewerRunAcknowledged !== "boolean") throw new Error("Review capture group reviewerRunAcknowledged must be boolean");
+	if (value.workspaceRoot !== undefined && typeof value.workspaceRoot !== "string") throw new Error("Review capture group workspaceRoot must be a string");
+	return {
+		lineageId: value.lineageId,
+		collectBindings: [...value.collectBindings],
+		...(value.reviewerRunAcknowledged === undefined ? {} : { reviewerRunAcknowledged: value.reviewerRunAcknowledged }),
 		...(value.workspaceRoot === undefined ? {} : { workspaceRoot: value.workspaceRoot }),
 	};
 }
@@ -4069,8 +4110,14 @@ function requiresExplicitTargetLifecycleRoot(requested: string | undefined, sess
 // The runner is injectable for tests only; production always uses the real
 // relay in lib/review-host-relay.ts.
 let activeReviewHostRelayRunner: ReviewHostRelayRunner = runReviewHostRelaySlot;
+let activeReviewHostRelayReviewerGroupRunner = runReviewHostRelayReviewerGroup;
+let activeReviewHostRelaySubmissionRunner = submitReviewHostRelayPreparedResult;
 function setReviewHostRelayRunnerForTesting(runner?: ReviewHostRelayRunner): void {
 	activeReviewHostRelayRunner = runner ?? runReviewHostRelaySlot;
+}
+function setReviewHostRelayGroupRunnersForTesting(reviewerGroup?: typeof runReviewHostRelayReviewerGroup, submission?: typeof submitReviewHostRelayPreparedResult): void {
+	activeReviewHostRelayReviewerGroupRunner = reviewerGroup ?? runReviewHostRelayReviewerGroup;
+	activeReviewHostRelaySubmissionRunner = submission ?? submitReviewHostRelayPreparedResult;
 }
 
 const REVIEW_HOST_RELAY_RETRY_ACTION =
@@ -4166,23 +4213,25 @@ function decodeRelayLastEventClosure(submission: string): ReviewLastEventClosure
 }
 
 async function reconcileUnknownReviewCaptureFailure(
-	error: unknown,
+	error: unknown | undefined,
 	nativeReviewCli: NativeReviewCli,
 	cwd: string,
 	binding: ReviewLastEventClosureBinding,
 	selections: Map<string, RetainedNativeStatusSelection>,
 	route: RetainedNativeCaptureRoute | undefined,
+	expectedReviewCaptureSuffix?: readonly string[],
 ): Promise<Record<string, unknown>> {
-	const failure = nativeOperationFailure("gentle_review_capture", error);
-	if (!nativeMutationRequiresStatus(error)) return failure;
+	const failure = error === undefined ? undefined : nativeOperationFailure("gentle_review_capture", error);
+	if (error !== undefined && !nativeMutationRequiresStatus(error)) return failure;
 	try {
 		const status = await reconcileUnknownReviewLastEventCapture(nativeReviewCli, cwd, binding, route);
 		syncRetainedNativeStatusSelections(selections, cwd, status, route?.baseRef);
+		if (expectedReviewCaptureSuffix !== undefined && !hasExactReviewCaptureSuffix(status, expectedReviewCaptureSuffix)) return captureGroupAuthorityDrift(status);
 		return {
 			tool: "gentle_review_capture",
 			status: "reconciled",
 			outcome: "native-capture-outcome-unknown",
-			native_failure: failure,
+			...(failure === undefined ? {} : { native_failure: failure }),
 			lineage_id: binding.lineageId,
 			target_identity: status.targetIdentity,
 			provider_action: status.action,
@@ -4190,11 +4239,8 @@ async function reconcileUnknownReviewCaptureFailure(
 			result: status.raw,
 		};
 	} catch (statusError) {
-		return {
-			...failure,
-			outcome: "native-capture-status-reconciliation-failed",
-			reconciliation_failure: nativeOperationFailure("gentle_review_capture", statusError),
-		};
+		const reconciliationFailure = nativeOperationFailure("gentle_review_capture", statusError);
+		return { ...(failure ?? reconciliationFailure), outcome: "native-capture-status-reconciliation-failed", reconciliation_failure: reconciliationFailure };
 	}
 }
 
@@ -4397,7 +4443,7 @@ function clearReviewTransportProbeForTesting(nativeReviewCli: NativeReviewCli | 
 }
 
 function hostTransportUnavailable(
-	operation: ReviewControllerOperation | "gentle_review_capture",
+	operation: ReviewControllerOperation | "gentle_review_capture" | "gentle_review_capture_group",
 	transport: ReviewTransportRefusal,
 ): Record<string, unknown> {
 	// #535: a provider-printed raw `gentle-ai review ...` continuation is a dead
@@ -4406,7 +4452,7 @@ function hostTransportUnavailable(
 	// refusal therefore names the continuation that runs in this surface (the
 	// gentle_review / gentle_review_capture wrapper tools) while the provider's
 	// own diagnostic stays intact in relay_transport as evidence.
-	const isCapture = operation === "gentle_review_capture";
+	const isCapture = operation === "gentle_review_capture" || operation === "gentle_review_capture_group";
 	return {
 		...(isCapture ? { tool: operation } : { operation }),
 		status: "blocked",
@@ -4418,9 +4464,9 @@ function hostTransportUnavailable(
 		wrapper_continuation: {
 			tool: "gentle_review",
 			operation: REVIEW_CONTROLLER_OPERATION.INSPECT,
-			...(isCapture ? { then: "gentle_review_capture" } : {}),
+			...(isCapture ? { then: operation } : {}),
 		},
-		next_action: `Install a native gentle-ai provider that supports \`review status --agent pi\`, then re-enter negotiated STATUS with gentle_review {"operation":"inspect"}${isCapture ? " and resubmit gentle_review_capture with the exact one-slot collectBinding that fresh STATUS returns" : " and follow the transition it returns"}. A provider-printed raw CLI continuation does not run in this runtime, and Pi never falls back to an agent-less lifecycle route.`,
+		next_action: `Install a native gentle-ai provider that supports \`review status --agent pi\`, then re-enter negotiated STATUS with gentle_review {"operation":"inspect"}${!isCapture ? " and follow the transition it returns" : operation === "gentle_review_capture_group" ? " and resubmit gentle_review_capture_group with the complete exact ordered collectBindings that fresh STATUS returns" : " and resubmit gentle_review_capture with the exact one-slot collectBinding that fresh STATUS returns"}. A provider-printed raw CLI continuation does not run in this runtime, and Pi never falls back to an agent-less lifecycle route.`,
 	};
 }
 
@@ -4491,11 +4537,11 @@ function publicReviewCaptureBindings(status: ReviewStatusV3): readonly PublicRev
 	return (status.nextTransition.collect?.inputs ?? []).filter((input) => input.captureOperation !== "external.select_intended_untracked").map((input) => ({ collectBinding: canonicalReviewCaptureBinding(input) }));
 }
 
-function captureBindingRejected(reason: string): Record<string, unknown> {
+function captureBindingRejected(reason: string, group = false): Record<string, unknown> {
 	return {
-		tool: "gentle_review_capture",
+		tool: group ? "gentle_review_capture_group" : "gentle_review_capture",
 		status: "blocked",
-		outcome: "capture-binding-rejected",
+		outcome: group ? "capture-group-rejected" : "capture-binding-rejected",
 		reason,
 		mutation_performed: false,
 		mutation_outcome: "none",
@@ -4555,6 +4601,88 @@ function selectExactReviewCapture(
 
 function isSelectedReviewCapture(value: SelectedReviewCapture | Record<string, unknown>): value is SelectedReviewCapture {
 	return "input" in value && "binding" in value;
+}
+
+function captureGroupRejected(reason: string): Record<string, unknown> { return captureBindingRejected(reason, true); }
+
+function hasExactReviewCaptureSuffix(status: ReviewStatusV3, expected: readonly string[]): boolean {
+	const current = status.nextTransition?.kind === "collect"
+		? (status.nextTransition.collect?.inputs ?? []).filter((input) => input.captureOperation === "review.capture-result").map(canonicalReviewCaptureBinding)
+		: [];
+	return current.length === expected.length && current.every((binding, index) => binding === expected[index]);
+}
+
+function captureGroupAuthorityDrift(status: ReviewStatusV3): Record<string, unknown> {
+	return { ...captureGroupRejected("authoritative STATUS does not offer exactly the unsubmitted reviewer suffix"), outcome: "capture-group-authority-drift", reconciliation: status.raw, authority_applicability: status.applicability, provider_action: status.action, next_transition: status.nextTransition };
+}
+
+interface SelectedReviewCaptureGroup {
+	slots: readonly ReviewHostRelaySlot[];
+	binding: ReviewLastEventClosureBinding;
+}
+
+function selectExactReviewCaptureGroup(
+	status: ReviewStatusV3,
+	lineageId: string,
+	canonicalBindings: readonly string[],
+): SelectedReviewCaptureGroup | Record<string, unknown> {
+	const inputs = status.nextTransition?.kind === "collect" ? status.nextTransition.collect?.inputs ?? [] : [];
+	const slots = reviewHostRelaySlots(inputs);
+	if (inputs.length === 0 || slots.length !== inputs.length) {
+		return captureGroupRejected("current STATUS does not offer an exclusively materialize reviewer capture group");
+	}
+	const currentBindings = inputs.map((input) => canonicalReviewCaptureBinding(input));
+	if (new Set(currentBindings).size !== currentBindings.length || canonicalBindings.length !== currentBindings.length || canonicalBindings.some((binding, index) => binding !== currentBindings[index])) {
+		return captureGroupRejected("collectBindings must be the complete distinct current reviewer group in exact provider order");
+	}
+	const first = selectExactReviewCapture(status, lineageId, currentBindings[0]!);
+	if (!isSelectedReviewCapture(first)) return captureGroupRejected(String(first.reason ?? "current STATUS rejected a reviewer binding"));
+	const expectedRevision = exactCollectArgument(inputs[0]!, "expected-revision");
+	const repositoryContext = exactCollectArgument(inputs[0]!, "repository-context");
+	const statusTargetIdentity = status.targetIdentity;
+	if (!isCanonicalProcessString(expectedRevision) || !isCanonicalProcessString(repositoryContext) || expectedRevision !== status.authority?.revision) {
+		return captureGroupRejected("current STATUS does not bind one matching expected revision and repository context for the reviewer group");
+	}
+	if (status.repositoryContext !== undefined && (status.repositoryContext.handle !== repositoryContext || status.repositoryContext.revision !== expectedRevision || status.repositoryContext.targetIdentity !== statusTargetIdentity)) {
+		return captureGroupRejected("current STATUS repository context does not match the reviewer group binding");
+	}
+	const lenses = new Set<string>(), orders = new Set<string>(), subjectHashes = new Set<string>();
+	for (let index = 0; index < inputs.length; index += 1) {
+		const input = inputs[index]!, slot = slots[index]!, subject = input.artifactSubject;
+		const slotLineage = exactCollectArgument(input, "lineage"), target = exactCollectArgument(input, "target");
+		const revision = exactCollectArgument(input, "expected-revision"), context = exactCollectArgument(input, "repository-context");
+		const subjectHash = exactCollectArgument(input, "subject-hash"), order = slot.order, lens = slot.lens;
+		if (
+			subject === undefined || slot.submission === undefined || slotLineage !== lineageId || target !== statusTargetIdentity
+			|| revision !== expectedRevision || context !== repositoryContext || subjectHash !== subject.subjectHash || order === undefined || lens === undefined
+			|| subject.lineageId !== lineageId || subject.authorityRevision !== expectedRevision || subject.targetIdentity !== statusTargetIdentity
+			|| lens.slice(7) !== subject.lens || String(subject.selectedOrder) !== order
+		) return captureGroupRejected("current STATUS carries an incomplete or mismatched materialize reviewer binding");
+		try { resolveReviewHostRelaySubmission(slot.submission); } catch { return captureGroupRejected("current STATUS carries an invalid provider reviewer submission descriptor"); }
+		const value = slot.submission.values[0];
+		if (slot.submission.operationToken !== "capture-result" || value?.slot !== "reviewer_result" || value.domain !== "artifact_path_or_stdin" || lenses.has(lens) || orders.has(order) || subjectHashes.has(subject.subjectHash)) {
+			return captureGroupRejected("current STATUS carries duplicate or invalid reviewer slot identities");
+		}
+		lenses.add(lens); orders.add(order); subjectHashes.add(subject.subjectHash);
+	}
+	return { slots, binding: first.binding };
+}
+
+function reviewHostRelayGroupFailure(
+	error: ReviewHostRelayError,
+	slots: readonly ReviewHostRelaySlot[],
+	prepared: readonly ReviewHostRelayPreparedResult[],
+	submitted: number,
+): Record<string, unknown> {
+	return {
+		tool: "gentle_review_capture_group",
+		status: "blocked",
+		outcome: error.kind === REVIEW_HOST_RELAY_FAILURE.RELAY_UNAVAILABLE ? "pi-host-relay-unavailable" : error.kind === REVIEW_HOST_RELAY_FAILURE.HANDSHAKE_REFUSED ? "pi-host-relay-handshake-refused" : error.kind === REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT ? "pi-host-relay-timeout" : "pi-host-relay-transport-failure",
+		reason: error.message,
+		failure: reviewHostRelayFailureReport(error),
+		...reviewHostRelayGroupProgress(slots, prepared, submitted),
+		next_action: error.kind === REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED ? REVIEW_HOST_RELAY_REFUSED_ACTION : REVIEW_HOST_RELAY_RETRY_ACTION,
+	};
 }
 
 async function executeReviewCaptureOperation(
@@ -4668,6 +4796,118 @@ async function executeReviewCaptureOperation(
 		return withCorrectionTarget(await executeProviderRoleVectorCapture(providerRoleSlots[0]!, nativeReviewCli, cwd, selected.binding, retainedUntrackedSelections, route, signal));
 	}
 	return captureBindingRejected(`unsupported provider capture operation: ${selected.input.captureOperation}`);
+}
+
+function reviewHostRelayGroupDiagnostics(slots: readonly ReviewHostRelaySlot[], prepared: readonly ReviewHostRelayPreparedResult[], count: number): readonly Record<string, unknown>[] {
+	return slots.slice(0, count).map((slot, index) => ({
+		...(slot.lens === undefined ? {} : { lens: slot.lens }),
+		...(slot.order === undefined ? {} : { order: slot.order }),
+		...(slot.subjectHash === undefined ? {} : { subject_hash: slot.subjectHash }),
+		prompt_bytes: prepared[index]?.promptByteLength,
+		result_bytes: prepared[index]?.resultByteLength,
+	}));
+}
+
+function reviewHostRelayGroupProgress(
+	slots: readonly ReviewHostRelaySlot[],
+	prepared: readonly ReviewHostRelayPreparedResult[],
+	submitted: number,
+	uncertain = false,
+): Record<string, unknown> {
+	const outcome = submitted === 0 ? uncertain ? "unknown" : "none" : uncertain ? "partial_unknown" : submitted === slots.length ? "completed" : "partial";
+	return {
+		prepared_reviewers: prepared.length,
+		submitted_reviewers: submitted,
+		host_relay: { transport: "pi_host_relay", reviewers: reviewHostRelayGroupDiagnostics(slots, prepared, submitted) },
+		...(submitted === 0 && uncertain ? { mutation_outcome: outcome } : { mutation_performed: submitted > 0, mutation_outcome: outcome }),
+	};
+}
+
+async function executeReviewCaptureGroupOperation(
+	parametersValue: unknown,
+	sessionCwd: string,
+	nativeReviewCli: NativeReviewCli | null,
+	signal?: AbortSignal,
+	candidateViews: CandidateViewRegistry | null = new CandidateViewRegistry(),
+	retainedUntrackedSelections: Map<string, RetainedNativeStatusSelection> = new Map(),
+	requireRegisteredRoute = false,
+): Promise<Record<string, unknown>> {
+	const parameters = parseReviewCaptureGroupParameters(parametersValue);
+	if (nativeReviewCli === null || nativeReviewCli.targetStatus === undefined) return { ...captureGroupRejected("native target STATUS is unavailable"), outcome: "native-status-unsupported" };
+	const canonicalBindings = parameters.collectBindings.map((binding) => parseCanonicalReviewCaptureBinding(binding));
+	const cwd = resolveReviewControllerWorkspaceRoot(parameters.workspaceRoot, sessionCwd, candidateViews, parameters.lineageId);
+	const routes = canonicalBindings.map((binding) => readRetainedNativeCaptureRoute(retainedUntrackedSelections, binding));
+	const route = routes[0];
+	if (requireRegisteredRoute && (route === undefined || routes.some((candidate) => candidate === undefined || candidate.workspaceRoot !== cwd || candidate.lineageId !== parameters.lineageId || candidate.baseRef !== route.baseRef))) {
+		return captureGroupRejected("collectBindings are unknown, expired, or belong to different session routes");
+	}
+	const freshStatus = () => negotiatedStatusForHostTransport(nativeReviewCli, {
+		cwd, lineageId: parameters.lineageId,
+		...(route?.baseRef === undefined ? {} : { baseRef: route.baseRef, committedOnly: true }),
+		...readRetainedNativeUntrackedSelection(retainedUntrackedSelections, cwd, parameters.lineageId),
+		...(signal === undefined ? {} : { signal }),
+	}, retainedUntrackedSelections, cwd);
+	let status: ReviewStatusV3;
+	try {
+		const negotiated = await freshStatus();
+		if (negotiated.transport !== undefined) return hostTransportUnavailable("gentle_review_capture_group", negotiated.transport);
+		status = negotiated.status!;
+	} catch (error) {
+		return { ...captureGroupRejected(error instanceof Error ? error.message : String(error)), outcome: "native-status-failed" };
+	}
+	const group = selectExactReviewCaptureGroup(status, parameters.lineageId, canonicalBindings);
+	if (!("slots" in group && "binding" in group)) return group;
+	if (parameters.reviewerRunAcknowledged !== true) {
+		return {
+			tool: "gentle_review_capture_group",
+			status: "blocked",
+			outcome: "reviewer-model-run-forecast",
+			cost_forecast: { transport: "pi_host_relay", model_runs: group.slots.length, lenses: group.slots.map((slot) => slot.lens).filter((lens): lens is string => lens !== undefined) },
+			mutation_performed: false,
+			mutation_outcome: "none",
+		};
+	}
+	const requests: readonly ReviewHostRelayRequest[] = group.slots.map((slot) => ({
+		captureArgumentTokens: slot.captureArgumentTokens,
+		targetCwd: cwd,
+		submission: slot.submission!,
+		...(signal === undefined ? {} : { signal }),
+	}));
+	let prepared: readonly ReviewHostRelayPreparedResult[];
+	try {
+		prepared = await activeReviewHostRelayReviewerGroupRunner(requests);
+		if (prepared.length !== requests.length) throw new Error("Pi host relay reviewer group returned a different number of prepared results");
+	} catch (error) {
+		return error instanceof ReviewHostRelayError
+			? reviewHostRelayGroupFailure(error, group.slots, [], 0)
+			: { ...captureGroupRejected(error instanceof Error ? error.message : String(error)), outcome: "pi-host-relay-reviewer-group-failed" };
+	}
+	for (let index = 0; index < prepared.length; index += 1) {
+		let current: SelectedReviewCapture | Record<string, unknown>;
+		try {
+			const negotiated = await freshStatus();
+			if (negotiated.transport !== undefined) return { ...hostTransportUnavailable("gentle_review_capture_group", negotiated.transport), ...reviewHostRelayGroupProgress(group.slots, prepared, index) };
+			if (!hasExactReviewCaptureSuffix(negotiated.status!, canonicalBindings.slice(index))) return { ...captureGroupAuthorityDrift(negotiated.status!), ...reviewHostRelayGroupProgress(group.slots, prepared, index) };
+			current = selectExactReviewCapture(negotiated.status!, parameters.lineageId, canonicalBindings[index]!);
+		} catch (error) {
+			return { ...captureGroupRejected(error instanceof Error ? error.message : String(error)), outcome: "native-status-failed", ...reviewHostRelayGroupProgress(group.slots, prepared, index) };
+		}
+		if (!isSelectedReviewCapture(current)) return { ...captureGroupRejected(String(current.reason ?? "current STATUS rejected a reviewer binding")), ...reviewHostRelayGroupProgress(group.slots, prepared, index) };
+		try {
+			const result = await activeReviewHostRelaySubmissionRunner(prepared[index]!);
+			const closure = decodeRelayLastEventClosure(result.submission);
+			if (closure !== undefined) {
+				const closed = mapAndClearLastEventClosure(closure, current.binding, retainedUntrackedSelections, cwd);
+				return { ...closed, tool: "gentle_review_capture_group", ...reviewHostRelayGroupProgress(group.slots, prepared, index + 1) };
+			}
+		} catch (error) {
+			if (error instanceof ReviewHostRelayError && error.mutationOutcome !== "unknown") return reviewHostRelayGroupFailure(error, group.slots, prepared, index);
+			const reconciled = await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, current.binding, retainedUntrackedSelections, route);
+			return { ...reconciled, tool: "gentle_review_capture_group", ...reviewHostRelayGroupProgress(group.slots, prepared, index, true), ...(error instanceof ReviewHostRelayError ? { failure: reviewHostRelayFailureReport(error), reason: error.message } : {}) };
+		}
+	}
+	const reconciled = await reconcileUnknownReviewCaptureFailure(undefined, nativeReviewCli, cwd, group.binding, retainedUntrackedSelections, route, canonicalBindings.slice(prepared.length));
+	return { ...reconciled, tool: "gentle_review_capture_group", outcome: reconciled.outcome === "capture-group-authority-drift" ? reconciled.outcome : reconciled.status === "reconciled" ? "native-reviewer-group-status-reconciled" : "native-reviewer-group-status-reconciliation-failed", ...reviewHostRelayGroupProgress(group.slots, prepared, prepared.length) };
 }
 
 type DispatchHydrationOutcome =
@@ -5422,7 +5662,9 @@ export const __testing = {
 	nativeStatusUnsupported,
 	executeReviewControllerOperation,
 	executeReviewCaptureOperation,
+	executeReviewCaptureGroupOperation,
 	setReviewHostRelayRunnerForTesting,
+	setReviewHostRelayGroupRunnersForTesting,
 	clearReviewTransportProbeForTesting,
 	renderSddModelPanel: renderSddModelPanelForTesting,
 	getOrchestratorPrompt,
@@ -5514,6 +5756,38 @@ function createGentleAiExtensionForTesting(
 		async execute(_toolCallId, parameters) {
 			const input = parameters as ReviewScopeParameters;
 			const details = readCandidateContextManifestPage(input.manifest, input.sha256, input.cursor ?? 0);
+			return { content: [{ type: "text", text: JSON.stringify(details) }], details };
+		},
+	});
+
+	pi.registerTool({
+		name: "gentle_review_capture_group",
+		label: "Gentle Review Capture Group",
+		description: "Capture one complete provider-issued materialize reviewer group. It validates the exact ordered current collect set, forecasts its bounded model cost, runs reviewers concurrently, and admits outputs one at a time in provider order.",
+		promptSnippet: "Use one complete exact current STATUS materialize reviewer group; acknowledge its forecast before the grouped run.",
+		promptGuidelines: [
+			"Pass only lineageId, the complete ordered collectBindings array from one current STATUS result, and reviewerRunAcknowledged after its forecast. Never mix, reorder, duplicate, or partially select bindings.",
+			"The group materializes and runs independent reviewers concurrently, but rechecks STATUS before every provider-ordered submission. It stops on a closure, correction, drift, or uncertain capture outcome; it never follows another transition or replays a prepared output.",
+		],
+		parameters: REVIEW_CAPTURE_GROUP_PARAMETERS,
+		executionMode: "sequential",
+		renderCall(_args, theme, context) {
+			return renderGentleAiLifecycleCall("review capture group", theme, context as GentleAiRenderContext | undefined);
+		},
+		renderResult(result, options) {
+			return renderGentleAiResult(result, options);
+		},
+		async execute(_toolCallId, parameters, signal, _onUpdate, ctx) {
+			if (signal?.aborted) throw new Error("Review capture group was cancelled");
+			const details = await executeReviewCaptureGroupOperation(
+				parameters,
+				ctx.cwd,
+				nativeReviewCli,
+				signal,
+				candidateViews,
+				((sessionKey: PendingReviewConsentSessionKey) => processRetainedNativeStatusSelections.get(sessionKey) ?? processRetainedNativeStatusSelections.set(sessionKey, new Map()).get(sessionKey)!)(pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey)),
+				true,
+			);
 			return { content: [{ type: "text", text: JSON.stringify(details) }], details };
 		},
 	});
