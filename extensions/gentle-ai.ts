@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import {
 	existsSync,
 	lstatSync,
@@ -719,19 +719,22 @@ const PI_ORCHESTRATION_RUNTIME = "pi";
 let reviewContractPromptFragmentCache: string | null | undefined;
 let reviewContractPromptMissingWarned = false;
 
-function readMirroredReviewContractFragment(): string | null {
+// Verifies the mirrored orchestration/pi.md bytes against the lock's digest before injection (gentle-ai R1/R3).
+function readMirroredReviewContractFragment(mirrorRoot: string = PROVIDER_CONTRACT_MIRROR_ROOT): string | null {
 	try {
-		const lockPath = join(PROVIDER_CONTRACT_MIRROR_ROOT, PROVIDER_CONTRACT_LOCK_FILE);
-		const lock = JSON.parse(readFileSync(lockPath, "utf8")) as { contract_semver?: unknown };
+		const lockPath = join(mirrorRoot, PROVIDER_CONTRACT_LOCK_FILE);
+		const lock = JSON.parse(readFileSync(lockPath, "utf8")) as {
+			contract_semver?: unknown;
+			entries?: Record<string, unknown>;
+		};
 		if (typeof lock.contract_semver !== "string" || lock.contract_semver === "") return null;
-		const contractPath = join(
-			PROVIDER_CONTRACT_MIRROR_ROOT,
-			`v${lock.contract_semver}`,
-			"bundle",
-			"orchestration",
-			`${PI_ORCHESTRATION_RUNTIME}.md`,
-		);
-		const text = readFileSync(contractPath, "utf8").trim();
+		const expectedSha256 = lock.entries?.[`orchestration/${PI_ORCHESTRATION_RUNTIME}.md`];
+		if (typeof expectedSha256 !== "string" || !/^[0-9a-f]{64}$/.test(expectedSha256)) return null;
+		const contractPath = join(mirrorRoot, `v${lock.contract_semver}`, "bundle", "orchestration", `${PI_ORCHESTRATION_RUNTIME}.md`);
+		const rawBytes = readFileSync(contractPath);
+		const actualSha256 = createHash("sha256").update(rawBytes).digest("hex");
+		if (!timingSafeEqual(Buffer.from(expectedSha256, "hex"), Buffer.from(actualSha256, "hex"))) return null;
+		const text = rawBytes.toString("utf8").trim();
 		if (text.length === 0) return null;
 		return `## Gentle AI review execution contract (mirrored provider bundle ${lock.contract_semver})\n\n${text}`;
 	} catch {
@@ -739,15 +742,18 @@ function readMirroredReviewContractFragment(): string | null {
 	}
 }
 
-function loadReviewContractPromptFragment(ctx: Pick<ExtensionContext, "hasUI" | "ui">): string | null {
+function loadReviewContractPromptFragment(
+	ctx: Pick<ExtensionContext, "hasUI" | "ui">,
+	mirrorRoot: string = PROVIDER_CONTRACT_MIRROR_ROOT,
+): string | null {
 	if (reviewContractPromptFragmentCache === undefined) {
-		reviewContractPromptFragmentCache = readMirroredReviewContractFragment();
+		reviewContractPromptFragmentCache = readMirroredReviewContractFragment(mirrorRoot);
 	}
 	if (reviewContractPromptFragmentCache === null && !reviewContractPromptMissingWarned) {
 		reviewContractPromptMissingWarned = true;
 		if (ctx.hasUI) {
 			ctx.ui.notify(
-				"Gentle AI review execution contract is unavailable: the mirrored provider bundle is missing or unreadable. Review preflight instructions will not be injected this session.",
+				"Gentle AI review execution contract is unavailable: the mirrored provider bundle is missing, unreadable, or fails digest verification. Review preflight instructions will not be injected this session.",
 				"warning",
 			);
 		}

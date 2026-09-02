@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import type { NativeReviewCli } from "../lib/native-review-cli.ts";
@@ -79,4 +82,40 @@ test("before_agent_start injects nothing when nativeReviewCli is null", async ()
 	const { beforeAgentStart } = harness(null);
 	const result = await beforeAgentStart(primaryEvent, ctx());
 	assert.doesNotMatch(result.systemPrompt, /Gentle AI review execution contract/);
+});
+
+// gentle-ai R1/R3: a tampered mirrored orchestration/pi.md must never be spliced into the system prompt.
+function tempMirror(text: string, entrySha256: string): string {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-mirror-"));
+	const bundleDir = join(root, "v9.9.9", "bundle", "orchestration");
+	mkdirSync(bundleDir, { recursive: true });
+	writeFileSync(join(bundleDir, "pi.md"), text, "utf8");
+	const lock = JSON.stringify({ contract_semver: "9.9.9", entries: { "orchestration/pi.md": entrySha256 } });
+	writeFileSync(join(root, "provider-contract.lock.json"), lock, "utf8");
+	return root;
+}
+
+test("rejects a tampered mirror, accepts a matching one, and warns once", async () => {
+	const tampered = tempMirror("tampered contract text", "0".repeat(64));
+	const matchingText = "matching contract text";
+	const matching = tempMirror(matchingText, createHash("sha256").update(Buffer.from(matchingText, "utf8")).digest("hex"));
+	try {
+		// Cache-bust: isolate this module's fragment cache from the real-mirror tests above.
+		const cacheBustedUrl = `${pathToFileURL(join(import.meta.dirname, "..", "extensions", "gentle-ai.ts")).href}?tamper=${Math.random()}`;
+		type Testing = {
+			readMirroredReviewContractFragment: (mirrorRoot?: string) => string | null;
+			loadReviewContractPromptFragment: (ctx: ExtensionContext, mirrorRoot?: string) => string | null;
+		};
+		const fresh = (await import(cacheBustedUrl)) as { __testing: Testing };
+		assert.equal(fresh.__testing.readMirroredReviewContractFragment(tampered), null);
+		assert.ok(fresh.__testing.readMirroredReviewContractFragment(matching)?.includes(matchingText));
+		let notifyCount = 0;
+		const spyCtx = { hasUI: true, ui: { notify: () => { notifyCount += 1; } } } as unknown as ExtensionContext;
+		fresh.__testing.loadReviewContractPromptFragment(spyCtx, tampered);
+		fresh.__testing.loadReviewContractPromptFragment(spyCtx, tampered);
+		assert.equal(notifyCount, 1);
+	} finally {
+		rmSync(tampered, { recursive: true, force: true });
+		rmSync(matching, { recursive: true, force: true });
+	}
 });
