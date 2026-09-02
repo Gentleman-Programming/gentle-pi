@@ -3621,11 +3621,13 @@ export class PendingReviewConsentRegistry {
 const processPendingReviewConsentRegistry = new PendingReviewConsentRegistry();
 const processRetainedNativeStatusSelections = new Map<PendingReviewConsentSessionKey, Map<string, RetainedNativeStatusSelection>>();
 
-// gentle-pi#556 / gentle-ai#4051: whether the most recent `before_agent_start`
-// event observed for a session named an agent (SDD phase executor or any
-// other named subagent). The `agent_end` preflight nudge fires only for the
-// primary session loop, never for a subagent's own loop end.
-const processAgentEndSubagentSessions = new Map<PendingReviewConsentSessionKey, boolean>();
+// gentle-pi#556 / gentle-ai#4051: nesting depth of named-agent (SDD phase
+// executor or other subagent) starts vs. ends for a session. Starts and
+// ends are paired so a subagent's own loop end never leaves the primary
+// loop's `agent_end` preflight suppressed for the rest of the session: a
+// named-agent start increments the depth, a matching end decrements it,
+// and a fresh primary-loop start resets it to 0.
+const processAgentEndSubagentDepth = new Map<PendingReviewConsentSessionKey, number>();
 
 // Target identities already nudged once per session, so the read-only
 // `agent_end` preflight reminder fires at most once per unreviewed candidate.
@@ -5503,7 +5505,7 @@ function createGentleAiExtensionForTesting(
 		const sessionKey = pendingReviewConsentSessionKey(context, pendingReviewConsentFallbackKey);
 		cleanupAllPendingReviewConsents(pendingReviewConsentRegistry, sessionKey);
 		processRetainedNativeStatusSelections.delete(sessionKey);
-		processAgentEndSubagentSessions.delete(sessionKey);
+		processAgentEndSubagentDepth.delete(sessionKey);
 		processAgentEndPreflightNudgedTargets.delete(sessionKey);
 	});
 
@@ -5675,10 +5677,12 @@ function createGentleAiExtensionForTesting(
 	pi.on("before_agent_start", async (event, ctx) => {
 		const isSddAgent = isSddAgentStartEvent(event);
 		const isNamedAgent = isNamedAgentStartEvent(event);
-		processAgentEndSubagentSessions.set(
-			pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey),
-			isSddAgent || isNamedAgent,
-		);
+		const subagentDepthKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey);
+		if (isSddAgent || isNamedAgent) {
+			processAgentEndSubagentDepth.set(subagentDepthKey, (processAgentEndSubagentDepth.get(subagentDepthKey) ?? 0) + 1);
+		} else {
+			processAgentEndSubagentDepth.set(subagentDepthKey, 0);
+		}
 		if (isSddAgent && !getSddPreflightPreferences(ctx)) {
 			await runSddPreflight(ctx);
 		}
@@ -5714,7 +5718,11 @@ function createGentleAiExtensionForTesting(
 		if (nativeReviewCli?.reviewMode === undefined || nativeReviewCli.targetStatus === undefined) return;
 		if (ctx.hasUI !== true) return;
 		const sessionKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey);
-		if (processAgentEndSubagentSessions.get(sessionKey) === true) return;
+		const subagentDepth = processAgentEndSubagentDepth.get(sessionKey) ?? 0;
+		if (subagentDepth > 0) {
+			processAgentEndSubagentDepth.set(sessionKey, subagentDepth - 1);
+			return;
+		}
 		let modeEffective: "on" | "off";
 		try {
 			const mode = await nativeReviewCli.reviewMode({ cwd: ctx.cwd, operation: NATIVE_REVIEW_MODE_OPERATION.STATUS });

@@ -172,7 +172,7 @@ test("agent_end skips headless sessions before any native call", async () => {
 	assert.deepEqual(sent, []);
 });
 
-test("agent_end sends nothing for a session whose before_agent_start named an agent", async () => {
+test("agent_end pairs a named agent's start with its own end, then still nudges for the primary loop's end", async () => {
 	const targetIdentity = `sha256:${"f".repeat(64)}`;
 	const native = {
 		reviewMode: onMode("on"),
@@ -186,8 +186,28 @@ test("agent_end sends nothing for a session whose before_agent_start named an ag
 
 	await beforeAgentStart!({ agentName: "review-readability", systemPrompt: "" }, session);
 	await agentEnd!(agentEndEvent, session);
+	assert.deepEqual(sent, [], "the subagent's own loop end is suppressed");
 
-	assert.deepEqual(sent, []);
+	await agentEnd!(agentEndEvent, session);
+	assert.equal(sent.length, 1, "the primary loop's end still nudges once the subagent's end is paired off");
+});
+
+test("agent_end resets the subagent depth when a fresh primary loop starts", async () => {
+	const targetIdentity = `sha256:${"1".repeat(64)}`;
+	const native = {
+		reviewMode: onMode("on"),
+		targetStatus: async () => executeStartStatus(targetIdentity),
+	} as unknown as NativeReviewCli;
+	const { handlers, sent } = harness(native);
+	const beforeAgentStart = handlers.get("before_agent_start");
+	const agentEnd = handlers.get("agent_end");
+	const session = ctx("agent-end-subagent-reset");
+
+	await beforeAgentStart!({ agentName: "review-readability", systemPrompt: "" }, session);
+	await beforeAgentStart!({ systemPrompt: "" }, session);
+	await agentEnd!(agentEndEvent, session);
+
+	assert.equal(sent.length, 1, "a fresh primary-loop start resets the depth so its own end nudges");
 });
 
 test("agent_end handler exists but sends nothing when nativeReviewCli is null", async () => {
