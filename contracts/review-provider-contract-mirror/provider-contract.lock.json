@@ -5,21 +5,21 @@
   "source": {
     "kind": "tree"
   },
-  "tree_sha256": "11e4926d65f1469aed16c24346effd4d2db10e92107aa5b8b9fd1ed56f62b666",
+  "tree_sha256": "9ef1127c471d1833e85b16efbc28c9e1432e4bea522fd3bdaff2c70fcd81c2eb",
   "entries": {
     "README.md": "18baab5ee79aefd0bc62a28da0dadcf2162544f57a940c5b859cd6bc4932a085",
-    "manifest.json": "9c86b96e59e2747c7529fe6e649e0e2b1eded6db6806c9d13b5e323e31f0fd53",
-    "orchestration/pi.md": "54fba57b11b280f56f7f15e91ddad3d844c70e0127e5c1adeff0a9d1b7a98e64",
+    "manifest.json": "519adbc5687953b3c3816c253eece9b46a6189ce67eeea79555da445d87bdc8e",
+    "orchestration/pi.md": "f13327642dc24bd8f36350949e57531239b760d5a671243c905d6e770bc62cf9",
     "schemas/lens.schema.json": "ffef79cfb763333282285ff5c795a32b5a88d840b4a8d125ce012188b04cffe1",
     "schemas/refuter.schema.json": "36f8267c6c3f04600b8f1cb77df70d90858611af822cc81922efd6b3502fb646",
-    "schemas/targeted-validator.schema.json": "58f5efca0fb8089a51e998d5cf07209528a6b6e3782246b34ee1e825132063a8",
+    "schemas/targeted-validator.schema.json": "6a8d7b331ec6f000366017e39e0476511c3b032649c42abfe865c1e9c956510e",
     "vectors/lens.json": "7ef0b08404645eeb5dba92aba5f8e4780667b6ec775f43ed8547ff9f2a7148c8",
     "vectors/refuter.json": "f42d71906e49c4191660b2da7e70f01f1778b23d32089005bd2d7ae9cbb73039",
     "vectors/targeted-validator.json": "7b5a5165e3a913863fb98d2ba5387811860c21333b5c37e6ed3b4e0d121cf2fa"
   },
   "generated": {
-    "generated/provider-capabilities.baseline.json": "061f766bc5f5fb0a977b1b4f4aa9568392f738b5bece70f0fadfcd8468c237b6",
-    "generated/provider-roles.baseline.json": "c17f3cd17369d67de6b85abe6354dfaa548480f32abe34524a58dbac9c09b2e7"
+    "generated/provider-capabilities.baseline.json": "e0a7d1aeef3b9996b3fa6f74d7187e306936573e0a6b07315484008d6681e933",
+    "generated/provider-roles.baseline.json": "7a1c5ef7688f7dadef0b2c1f2a50af0a8d1fd1d58cce089ababd6e5bb7ccaefc"
   },
   "runtimes": [
     "claude-code",
