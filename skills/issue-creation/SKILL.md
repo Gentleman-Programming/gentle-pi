@@ -46,14 +46,14 @@ LABEL_ARGS+=(--label "$LABEL") # Repeat only for each permitted discovered label
    gh issue list --repo "$TARGET" --state all --search "$QUERY" --limit 1000
    ```
 
-   If results are saturated or completeness is uncertain, narrow the read-only search or stop. Comment on a confirmed duplicate instead of creating one.
+   If results are saturated or completeness is uncertain, narrow the read-only search or stop. Comment on a confirmed duplicate instead of creating one. Before commenting on a confirmed duplicate, perform the same privacy scan/redaction on the exact comment body as for publication.
 2. Select one repository-provided form only when its declared purpose matches. If multiple forms match and policy does not distinguish them, stop and request that decision.
-3. For a YAML form, read its schema and establish controls in declared order. Support only `input`, `textarea`, `dropdown`, and `checkboxes`; ignore `markdown` guidance. Fail closed before mutation on malformed, unsupported, missing, or ambiguous required structure or answers. Missing or ambiguous required answers fail closed: do not open a browser or mutate. For a malformed, unsupported, or unrepresentable form, report why automation is unsafe and stop; only when the user explicitly requests browser completion may the browser handoff below be used.
+3. For a YAML form, read its schema and establish controls in declared order. Support only `input`, `textarea`, `dropdown`, and `checkboxes`. Markdown controls are non-answer guidance: honor their visible instructions when collecting and materializing adjacent answers, but do not render them as response sections. Fail closed before mutation on malformed, unsupported, missing, or ambiguous required structure or answers. A malformed schema, or missing or ambiguous required answers, fail closed: do not open a browser or mutate. A browser handoff is available only when the user explicitly requests browser completion or a syntactically valid selected form cannot safely/faithfully be represented by the automated path; otherwise report why automation is unsafe and stop.
 
 | Control | Required handling |
 | --- | --- |
 | `input` / `textarea` | Preserve the visible label. Require an answer when `validations.required` is true; otherwise render `_No response_`. |
-| `dropdown` | Preserve visible labels and options. Require exact selected option text; single-select has one selection, and multi-select preserves selections in declared options order. A required dropdown needs at least one valid selection. |
+| `dropdown` | Preserve visible labels and options. Require exact selected option text; single-select has one selection, and multi-select preserves selections in declared options order. A required dropdown needs at least one valid selection; an optional dropdown with no selection renders `_No response_`. |
 | `checkboxes` | Preserve the visible label and every option as `- [x]` or `- [ ]` in declared order. Enforce individually required checkboxes and require explicit first-person affirmation for first-person option text. |
 
 For each answer, render `### <visible label>` followed by its materialized value. For `textarea.attributes.render`, fence the answer with the declared language and a fence long enough for its content. Never invent answers, selections, confirmations, or labels.
@@ -68,11 +68,20 @@ Create one owner-only temporary directory outside the repository for both privat
 
 ```bash
 umask 077
-TMP_DIR="$(mktemp -d)"
-chmod 700 "$TMP_DIR"
-BODY_FILE="$TMP_DIR/body.md"
-READBACK_FILE="$TMP_DIR/readback.json"
-trap 'rm -rf "$TMP_DIR"' EXIT
+REPO_ROOT="$(git rev-parse --show-toplevel)" || exit 1
+REPO_ROOT="$(cd "$REPO_ROOT" && pwd -P)" || exit 1
+if [ "$REPO_ROOT" = "/" ]; then
+  printf '%s\n' "Temporary directory is inside the repository" >&2; exit 1
+fi
+TMP_DIR="$(TMPDIR=/tmp mktemp -d /tmp/gentle-ai-issue.XXXXXXXX)" || exit 1
+trap 'rm -rf -- "$TMP_DIR"' EXIT
+TMP_DIR_REAL="$(cd "$TMP_DIR" && pwd -P)" || exit 1
+case "$TMP_DIR_REAL/" in
+  "$REPO_ROOT/"*) printf '%s\n' "Temporary directory is inside the repository" >&2; exit 1 ;;
+esac
+chmod 700 "$TMP_DIR_REAL"
+BODY_FILE="$TMP_DIR_REAL/body.md"
+READBACK_FILE="$TMP_DIR_REAL/readback.json"
 ```
 
 Make one mutation attempt through the automated path and publish exactly once:
@@ -81,7 +90,7 @@ Make one mutation attempt through the automated path and publish exactly once:
 gh issue create --repo "$TARGET" --title "$TITLE" --body-file "$BODY_FILE" "${LABEL_ARGS[@]}"
 ```
 
-Only when the user explicitly requests browser completion may an optional, separate browser handoff open the repository form; it is never the default or a response to missing answers:
+When browser completion is available under the form decision above, an optional, separate browser handoff may open the repository form. It is never proof of publication and is never a response to malformed schemas or missing/ambiguous required answers:
 
 ```bash
 gh issue create --repo "$TARGET" --web
