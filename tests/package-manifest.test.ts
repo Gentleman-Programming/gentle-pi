@@ -9,11 +9,12 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { applyModelConfig } from "../extensions/gentle-ai.ts";
+import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
 import { installSddAssets } from "../lib/sdd-preflight.ts";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -1069,6 +1070,26 @@ test("installSddAssets installs gentle-ai-worker with a loader-compatible scoped
 		!existsSync(temporaryAgentHome),
 		"the integration test must delete only its temporary agent home",
 	);
+});
+
+test("agent home resolver centralizes Gentle and Pi agent-dir precedence", () => {
+	const explicitGentleHome = mkdtempSync(join(tmpdir(), "gentle-pi-resolver-explicit-"));
+	const piAgentDir = mkdtempSync(join(tmpdir(), "gentle-pi-resolver-pi-dir-"));
+
+	try {
+		assert.equal(
+			resolveGentlePiAgentHome({
+				GENTLE_PI_AGENT_HOME: explicitGentleHome,
+				PI_CODING_AGENT_DIR: piAgentDir,
+			}),
+			explicitGentleHome,
+		);
+		assert.equal(resolveGentlePiAgentHome({ PI_CODING_AGENT_DIR: piAgentDir }), piAgentDir);
+		assert.equal(resolveGentlePiAgentHome({}), join(homedir(), ".pi", "agent"));
+	} finally {
+		rmSync(explicitGentleHome, { recursive: true, force: true });
+		rmSync(piAgentDir, { recursive: true, force: true });
+	}
 });
 
 test("asset installation uses PI_CODING_AGENT_DIR as the Pi agent home when no explicit Gentle override is set", () => {

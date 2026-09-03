@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { resolveGentlePiAgentHome } from "./agent-home.ts";
 import type { SddArtifactStore } from "./sdd-status.ts";
 
 export type { SddArtifactStore };
@@ -19,7 +19,7 @@ const LEGACY_MANAGED_ASSET_MANIFESTS = Object.freeze([
 ]);
 
 function gentlePiAgentHome(): string {
-	return process.env.GENTLE_PI_AGENT_HOME ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+	return resolveGentlePiAgentHome();
 }
 
 export type SddExecutionMode = "interactive" | "auto";
