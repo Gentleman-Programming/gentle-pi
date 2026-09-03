@@ -9,11 +9,12 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { applyModelConfig } from "../extensions/gentle-ai.ts";
+import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
 import { installSddAssets } from "../lib/sdd-preflight.ts";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -1069,6 +1070,103 @@ test("installSddAssets installs gentle-ai-worker with a loader-compatible scoped
 		!existsSync(temporaryAgentHome),
 		"the integration test must delete only its temporary agent home",
 	);
+});
+
+test("agent home resolver centralizes Gentle and Pi agent-dir precedence", () => {
+	const explicitGentleHome = mkdtempSync(join(tmpdir(), "gentle-pi-resolver-explicit-"));
+	const piAgentDir = mkdtempSync(join(tmpdir(), "gentle-pi-resolver-pi-dir-"));
+
+	try {
+		assert.equal(
+			resolveGentlePiAgentHome({
+				GENTLE_PI_AGENT_HOME: explicitGentleHome,
+				PI_CODING_AGENT_DIR: piAgentDir,
+			}),
+			explicitGentleHome,
+		);
+		assert.equal(resolveGentlePiAgentHome({ PI_CODING_AGENT_DIR: piAgentDir }), piAgentDir);
+		assert.equal(resolveGentlePiAgentHome({}), join(homedir(), ".pi", "agent"));
+		assert.equal(
+			resolveGentlePiAgentHome({ GENTLE_PI_AGENT_HOME: "", PI_CODING_AGENT_DIR: piAgentDir }),
+			piAgentDir,
+			"an empty explicit override falls through like Pi Subagents does",
+		);
+		assert.equal(
+			resolveGentlePiAgentHome({ PI_CODING_AGENT_DIR: "" }),
+			join(homedir(), ".pi", "agent"),
+			"an empty PI_CODING_AGENT_DIR falls through like Pi Subagents does",
+		);
+	} finally {
+		rmSync(explicitGentleHome, { recursive: true, force: true });
+		rmSync(piAgentDir, { recursive: true, force: true });
+	}
+});
+
+test("asset installation uses PI_CODING_AGENT_DIR as the Pi agent home when no explicit Gentle override is set", () => {
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const previousPiAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const temporaryPiAgentDir = mkdtempSync(join(tmpdir(), "gentle-pi-agent-dir-"));
+	const explicitGentleHome = mkdtempSync(join(tmpdir(), "gentle-pi-explicit-home-"));
+
+	try {
+		delete process.env.GENTLE_PI_AGENT_HOME;
+		process.env.PI_CODING_AGENT_DIR = temporaryPiAgentDir;
+
+		installSddAssets(PACKAGE_ROOT, true);
+
+		const installedPath = join(temporaryPiAgentDir, "agents", "gentle-ai-explore.md");
+		assert.ok(existsSync(installedPath), "managed agents must install where Pi Subagents reads global definitions");
+		assert.deepEqual(readAgentDefinition(installedPath).tools, MANAGED_EXEMPLAR_TOOLS);
+		assert.ok(
+			!existsSync(join(explicitGentleHome, "agents", "gentle-ai-explore.md")),
+			"the explicit override fixture must still be untouched before it is selected",
+		);
+
+		process.env.GENTLE_PI_AGENT_HOME = explicitGentleHome;
+		installSddAssets(PACKAGE_ROOT, true);
+		assert.ok(
+			existsSync(join(explicitGentleHome, "agents", "gentle-ai-explore.md")),
+			"GENTLE_PI_AGENT_HOME remains the explicit test/operator override",
+		);
+	} finally {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		if (previousPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousPiAgentDir;
+		rmSync(temporaryPiAgentDir, { recursive: true, force: true });
+		rmSync(explicitGentleHome, { recursive: true, force: true });
+	}
+});
+
+test("global model routing uses PI_CODING_AGENT_DIR for package-installed agents", () => {
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const previousPiAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const temporaryPiAgentDir = mkdtempSync(join(tmpdir(), "gentle-pi-model-agent-dir-"));
+	const temporaryProject = mkdtempSync(join(tmpdir(), "gentle-pi-model-project-"));
+
+	try {
+		delete process.env.GENTLE_PI_AGENT_HOME;
+		process.env.PI_CODING_AGENT_DIR = temporaryPiAgentDir;
+		installSddAssets(PACKAGE_ROOT, true);
+
+		const result = applyModelConfig(temporaryProject, {
+			"gentle-ai-explore": { model: "provider/model", thinking: "high" },
+		});
+
+		assert.equal(result.updated, 2);
+		const config = JSON.parse(readFileSync(join(temporaryPiAgentDir, "subagents.json"), "utf8"));
+		assert.deepEqual(config.model_profiles["gentle-ai-explore"], {
+			model: "provider/model",
+			effort: "high",
+		});
+	} finally {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		if (previousPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousPiAgentDir;
+		rmSync(temporaryPiAgentDir, { recursive: true, force: true });
+		rmSync(temporaryProject, { recursive: true, force: true });
+	}
 });
 
 test("normal and forced installation copy generic agents with complete role contracts", () => {
