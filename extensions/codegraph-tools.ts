@@ -1,7 +1,7 @@
 import { execFile, execFileSync } from "node:child_process";
-import { lstatSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -177,12 +177,90 @@ function codeGraphFailureMessage(status: CodeGraphStatus): string {
 		: `CodeGraph failed to run. ${FALLBACK_INSTRUCTIONS}`;
 }
 
+function isEnoent(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		(error as { code?: unknown }).code === "ENOENT"
+	);
+}
+
+/** Find `codegraph.cmd` in the npm global bin directory (the dirs in PATH). */
+export function findCodeGraphCmdOnPath(): string | undefined {
+	const pathEnv = process.env.PATH ?? "";
+	for (const dir of pathEnv.split(";")) {
+		if (!dir) continue;
+		const candidate = join(dir, "codegraph.cmd");
+		if (existsSync(candidate)) return candidate;
+	}
+	return undefined;
+}
+
+/**
+ * Resolve the actual JS entry of the `@colbymchenry/codegraph` package from the
+ * npm global bin dir (sibling of the `codegraph.cmd` shim) and run it with the
+ * current Node executable. No shell involvement, so args are never interpreted.
+ */
+export function codeGraphNodeScript(cmdPath: string): string | undefined {
+	const binDir = dirname(cmdPath);
+	const pkgRoot = join(binDir, "node_modules", "@colbymchenry", "codegraph");
+	const pkgJsonPath = join(pkgRoot, "package.json");
+	if (!existsSync(pkgJsonPath)) return undefined;
+	try {
+		const pkg = JSON.parse(readFileSync(pkgJsonPath, "utf8")) as { bin?: unknown };
+		const bin = pkg.bin;
+		const target =
+			typeof bin === "string"
+				? bin
+				: bin &&
+						typeof bin === "object" &&
+						"codegraph" in bin &&
+						typeof (bin as Record<string, unknown>).codegraph === "string"
+					? (bin as Record<string, string>).codegraph
+					: undefined;
+		if (typeof target !== "string" || !target) return undefined;
+		const script = join(pkgRoot, target);
+		return existsSync(script) ? script : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 const runCodeGraphCommand: CodeGraphRunner = async (args, options) => {
-	const result = await execFileAsync("codegraph", [...args], {
+	const runOptions = {
 		cwd: options.cwd,
 		signal: options.signal,
 		maxBuffer: options.maxBuffer,
-	});
+	};
+
+	try {
+		const result = await execFileAsync("codegraph", [...args], runOptions);
+		return { stdout: result.stdout, stderr: result.stderr };
+	} catch (error) {
+		// Windows npm installs only shims (codegraph.cmd/.ps1 and a shell script)
+		// with no codegraph.exe, so plain execFile (CreateProcess, no shell)
+		// always fails with ENOENT even when the shim is on PATH.
+		if (process.platform !== "win32" || !isEnoent(error)) throw error;
+	}
+
+	// Resolve the real package script from the npm global bin directory and run
+	// it through the current Node executable: no shell, no command injection.
+	const cmdPath = findCodeGraphCmdOnPath();
+	if (cmdPath) {
+		const script = codeGraphNodeScript(cmdPath);
+		if (script) {
+			try {
+				const result = await execFileAsync(process.execPath, [script, ...args], runOptions);
+				return { stdout: result.stdout, stderr: result.stderr };
+			} catch (innerError) {
+				if (!isEnoent(innerError)) throw innerError;
+			}
+		}
+	}
+
+	// Last resort on win32: let cmd.exe resolve the shim.
+	const result = await execFileAsync("codegraph", [...args], { ...runOptions, shell: true });
 	return { stdout: result.stdout, stderr: result.stderr };
 };
 
