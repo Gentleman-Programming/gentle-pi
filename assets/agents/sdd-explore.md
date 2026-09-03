@@ -5,6 +5,7 @@ tools:
   - read
   - grep
   - find
+  - codegraph
   - edit
   - write
   - mem_save
