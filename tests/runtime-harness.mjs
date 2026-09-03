@@ -122,11 +122,11 @@ function createPi() {
 		},
 		getAllTools() {
 			return [
-				{ name: "read" },
-				{ name: "bash" },
-				{ name: "edit" },
-				{ name: "write" },
-				{ name: "mem_save" },
+				{ name: "read", sourceInfo: { source: "builtin" } },
+				{ name: "bash", sourceInfo: { source: "builtin" } },
+				{ name: "edit", sourceInfo: { source: "builtin" } },
+				{ name: "write", sourceInfo: { source: "builtin" } },
+				{ name: "mem_save", sourceInfo: { source: "builtin" } },
 			];
 		},
 	};
@@ -137,9 +137,19 @@ function createPi() {
 function createUi() {
 	const notifications = [];
 	const selections = [];
+	let header;
 	return {
 		notifications,
 		selections,
+		get header() {
+			return header;
+		},
+		setHeader(factory) {
+			header = factory(
+				{ requestRender() {} },
+				{ fg(_name, text) { return text; } },
+			);
+		},
 		notify(message, level = "info") {
 			notifications.push({ message, level });
 		},
@@ -861,6 +871,76 @@ async function run() {
 			thresholdRows.every((row) => row.length <= 122 && !row.includes("\n")),
 			"long path, branch, version, and count values must stay inside the 122-column grid",
 		);
+
+		// PR #571: every rendered banner row must fit narrow widths, and runtime
+		// values must never introduce terminal controls. The harness uses ctx.cwd as
+		// the nearest real dynamic input seam because control bytes are not portable
+		// process-environment values.
+		const bannerConfigPath = join(globalConfigHome, "banner.json");
+		const originalRows = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+		const originalColumns = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+		const originalWrite = process.stdout.write;
+		const unsafePath = `safe\u0000\u0001\u007f\u009b31m\x1b]8;;https://example.invalid\u0007link\x1b]8;;\x1b\\tail`;
+		const restoreTerminalDimensions = () => {
+			if (originalRows) Object.defineProperty(process.stdout, "rows", originalRows);
+			else delete process.stdout.rows;
+			if (originalColumns) Object.defineProperty(process.stdout, "columns", originalColumns);
+			else delete process.stdout.columns;
+		};
+		try {
+			Object.defineProperty(process.stdout, "rows", { configurable: true, value: 30 });
+			Object.defineProperty(process.stdout, "columns", { configurable: true, value: 80 });
+			await writeFile(
+				bannerConfigPath,
+				'{"showRose":false,"showTextLogo":false,"color":"pink"}\n',
+			);
+			for (const width of [1, 2, 5, 10, 19, 20]) {
+				assert.ok(
+					formatStartupStatsRows(width, longStats).every((row) => row.length <= Math.max(1, width)),
+					`startup stats must fit a ${width}-column terminal before rendering`,
+				);
+			}
+			const unsafeStats = {
+				gitBranch: unsafePath,
+				path: unsafePath,
+				mcp: unsafePath,
+				agents: unsafePath,
+				plugins: unsafePath,
+				skills: unsafePath,
+				extensions: unsafePath,
+				version: unsafePath,
+				tools: unsafePath,
+			};
+			for (const row of formatStartupStatsRows(80, unsafeStats)) {
+				assert.doesNotMatch(row, /[\x00-\x1f\x7f-\x9f]/, "startup stats must sanitize controls before layout");
+			}
+
+			const renderPath = unsafePath.replace(/\u0000/g, "");
+			const bannerCtx = createCtx(renderPath, true, "startup-banner-safety");
+			process.stdout.write = () => true;
+			await hooks.get("session_start").at(-1)({ reason: "startup" }, bannerCtx);
+			await new Promise((resolve) => setTimeout(resolve, 60));
+			assert.ok(bannerCtx.ui.header, "startup banner must register a header renderer");
+
+			for (const width of [20, 40, 80, 122, 160]) {
+				const lines = bannerCtx.ui.header.render(width);
+				assert.ok(lines.length > 0, `startup banner must render at width ${width}`);
+				assert.ok(
+					lines.every((line) => stripAnsi(line).length <= width),
+					`ANSI-stripped startup-banner rows must fit width ${width}`,
+				);
+				for (const line of lines) {
+					const withoutTrustedStyles = line.replace(/\x1b\[(?:\d+(?:;\d+)*)?m/g, "");
+					assert.doesNotMatch(withoutTrustedStyles, /[\x00-\x1a\x1c-\x1f\x7f-\x9f]/, "dynamic values must not emit terminal controls");
+					assert.doesNotMatch(withoutTrustedStyles, /\x1b/, "only trusted SGR styling may remain");
+				}
+			}
+			bannerCtx.ui.header.invalidate();
+		} finally {
+			process.stdout.write = originalWrite;
+			restoreTerminalDimensions();
+			await rm(bannerConfigPath, { force: true });
+		}
 	}
 
 	const cancelPickerCwd = await tempWorkspace();

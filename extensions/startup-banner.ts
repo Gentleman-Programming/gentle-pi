@@ -501,8 +501,12 @@ const WIDE_STATS_LABEL_WIDTH = 12;
 const WIDE_STATS_VALUE_WIDTH = 46;
 const WIDE_STATS_GUTTER = "   ";
 
+function sanitizeStartupStatValue(value: unknown): string {
+  return String(value ?? "").replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+}
+
 function fitStartupStatValue(value: unknown, width: number): string {
-  return String(value ?? "")
+  return sanitizeStartupStatValue(value)
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, width)
@@ -510,20 +514,24 @@ function fitStartupStatValue(value: unknown, width: number): string {
 }
 
 function buildStartupStatsGrid(width: number, stats: StartupStats): StartupStatsGrid {
+  const clean = (value: unknown) => sanitizeStartupStatValue(value);
   const narrowRows: StartupStat[] = [
-    { label: "PATH:", value: stats.path },
-    { label: "GIT:", value: stats.gitBranch },
-    { label: "MCP:", value: stats.mcp },
-    { label: "PLUGINS:", value: stats.plugins },
-    { label: "AGENTS:", value: stats.agents },
-    { label: "SKILLS:", value: stats.skills },
-    { label: "EXTENSIONS:", value: stats.extensions },
-    { label: "TOOLS:", value: stats.tools },
-    { label: "VER:", value: stats.version },
+    { label: "PATH:", value: clean(stats.path) },
+    { label: "GIT:", value: clean(stats.gitBranch) },
+    { label: "MCP:", value: clean(stats.mcp) },
+    { label: "PLUGINS:", value: clean(stats.plugins) },
+    { label: "AGENTS:", value: clean(stats.agents) },
+    { label: "SKILLS:", value: clean(stats.skills) },
+    { label: "EXTENSIONS:", value: clean(stats.extensions) },
+    { label: "TOOLS:", value: clean(stats.tools) },
+    { label: "VER:", value: clean(stats.version) },
   ];
 
   if (width < WIDE_STATS_MIN_WIDTH) {
-    const labelWidth = Math.max(...narrowRows.map(({ label }) => label.length));
+    const labelWidth = Math.min(
+      Math.max(...narrowRows.map(({ label }) => label.length)),
+      Math.max(0, width - 2),
+    );
     return {
       wide: false,
       labelWidth,
@@ -532,6 +540,7 @@ function buildStartupStatsGrid(width: number, stats: StartupStats): StartupStats
         Math.min(
           Math.max(...narrowRows.map(({ value }) => value.length)),
           Math.max(8, width - labelWidth - 4),
+          Math.max(0, width - labelWidth - 2),
         ),
       ),
       rows: narrowRows.map((left) => ({ left })),
@@ -559,12 +568,12 @@ function formatStartupStat(
   separator: string,
 ): string {
   if (!stat) return " ".repeat(labelWidth + separator.length + valueWidth);
-  return `${stat.label.padEnd(labelWidth)}${separator}${fitStartupStatValue(stat.value, valueWidth)}`;
+  return `${stat.label.slice(0, labelWidth).padEnd(labelWidth)}${separator}${fitStartupStatValue(stat.value, valueWidth)}`;
 }
 
 export function formatStartupStatsRows(width: number, stats: StartupStats): string[] {
   const grid = buildStartupStatsGrid(width, stats);
-  const separator = grid.wide ? " " : "  ";
+  const separator = grid.wide ? " " : " ".repeat(Math.min(2, Math.max(0, width)));
   return grid.rows.map(({ left, right }) => {
     const row = formatStartupStat(left, grid.labelWidth, grid.valueWidth, separator);
     return grid.wide
