@@ -4766,7 +4766,7 @@ function selectExactReviewCaptureGroup(
 			subject === undefined || slot.submission === undefined || slotLineage !== lineageId || target !== statusTargetIdentity
 			|| revision !== expectedRevision || context !== repositoryContext || subjectHash !== subject.subjectHash || order === undefined || lens === undefined
 			|| subject.lineageId !== lineageId || subject.authorityRevision !== expectedRevision || subject.targetIdentity !== statusTargetIdentity
-			|| lens.slice(7) !== subject.lens || String(subject.selectedOrder) !== order
+			|| lens !== subject.lens || String(subject.selectedOrder) !== order
 		) return captureGroupRejected("current STATUS carries an incomplete or mismatched materialize reviewer binding");
 		try { resolveReviewHostRelaySubmission(slot.submission); } catch { return captureGroupRejected("current STATUS carries an invalid provider reviewer submission descriptor"); }
 		const value = slot.submission.values[0];
