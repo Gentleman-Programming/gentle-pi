@@ -4749,10 +4749,11 @@ function selectExactReviewCaptureGroup(
 	const expectedRevision = exactCollectArgument(inputs[0]!, "expected-revision");
 	const repositoryContext = exactCollectArgument(inputs[0]!, "repository-context");
 	const statusTargetIdentity = status.targetIdentity;
-	if (!isCanonicalProcessString(expectedRevision) || !isCanonicalProcessString(repositoryContext) || expectedRevision !== status.authority?.revision) {
+	const currentRepositoryContext = status.repositoryContext;
+	if (!isCanonicalProcessString(expectedRevision) || !isCanonicalProcessString(repositoryContext) || currentRepositoryContext === undefined || expectedRevision !== currentRepositoryContext.revision) {
 		return captureGroupRejected("current STATUS does not bind one matching expected revision and repository context for the reviewer group");
 	}
-	if (status.repositoryContext !== undefined && (status.repositoryContext.handle !== repositoryContext || status.repositoryContext.revision !== expectedRevision || status.repositoryContext.targetIdentity !== statusTargetIdentity)) {
+	if (currentRepositoryContext.handle !== repositoryContext || currentRepositoryContext.targetIdentity !== statusTargetIdentity) {
 		return captureGroupRejected("current STATUS repository context does not match the reviewer group binding");
 	}
 	const lenses = new Set<string>(), orders = new Set<string>(), subjectHashes = new Set<string>();

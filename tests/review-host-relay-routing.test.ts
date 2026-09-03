@@ -14,6 +14,7 @@ import type { ReviewCaptureSubmissionV1, ReviewCollectInputV3, ReviewStatusV3 } 
 // other capture form stays untouched.
 
 const SHA = `sha256:${"1".repeat(64)}`;
+const PHASE_REVISION = `sha256:${"3".repeat(64)}`;
 const TREE = "2".repeat(40);
 
 function repository(t: test.TestContext): string {
@@ -26,10 +27,10 @@ function repository(t: test.TestContext): string {
 	return cwd;
 }
 
-function bindingArguments(lineageId: string, lens: string, order: number): ReviewCollectInputV3["arguments"] {
+function bindingArguments(lineageId: string, lens: string, order: number, revision = SHA): ReviewCollectInputV3["arguments"] {
 	return [
 		{ name: "lineage", value: lineageId, token: `--lineage=${lineageId}` },
-		{ name: "expected-revision", value: SHA, token: `--expected-revision=${SHA}` },
+		{ name: "expected-revision", value: revision, token: `--expected-revision=${revision}` },
 		{ name: "target", value: SHA, token: `--target=${SHA}` },
 		{ name: "repository-context", value: `rctx1_${"e".repeat(64)}`, token: `--repository-context=rctx1_${"e".repeat(64)}` },
 		{ name: "lens", value: lens, token: `--lens=${lens}` },
@@ -38,8 +39,8 @@ function bindingArguments(lineageId: string, lens: string, order: number): Revie
 	];
 }
 
-function providerSubmission(lineageId: string, lens: string, order: number): ReviewCaptureSubmissionV1 {
-	const bindingTokens = bindingArguments(lineageId, lens, order).map((argument) => argument.token!);
+function providerSubmission(lineageId: string, lens: string, order: number, revision = SHA): ReviewCaptureSubmissionV1 {
+	const bindingTokens = bindingArguments(lineageId, lens, order, revision).map((argument) => argument.token!);
 	return {
 		operationToken: "capture-result",
 		argumentTokens: [...bindingTokens, "--input={{value}}"],
@@ -47,13 +48,13 @@ function providerSubmission(lineageId: string, lens: string, order: number): Rev
 	};
 }
 
-function relayCollectInput(lineageId: string, lens: string, order: number, materialize = true, submission: ReviewCaptureSubmissionV1 | "provider" | "absent" = "provider"): ReviewCollectInputV3 {
+function relayCollectInput(lineageId: string, lens: string, order: number, materialize = true, submission: ReviewCaptureSubmissionV1 | "provider" | "absent" = "provider", revision = SHA): ReviewCollectInputV3 {
 	return {
 		name: "reviewer_result",
 		schema: "https://gentle-ai.dev/schema/review/reviewer/v1",
 		captureOperation: "review.capture-result",
 		arguments: [
-			...bindingArguments(lineageId, lens, order),
+			...bindingArguments(lineageId, lens, order, revision),
 			...(materialize ? [
 				{ name: "agent", value: "pi", token: "--agent=pi" },
 				{ name: "materialize", value: "true", token: "--materialize=true" },
@@ -61,11 +62,11 @@ function relayCollectInput(lineageId: string, lens: string, order: number, mater
 		],
 		artifactSubject: {
 			schema: "gentle-ai.review-artifact-subject/v2", subjectHash: `sha256:${String(order).repeat(64)}`,
-			lineageId, authorityRevision: SHA, targetIdentity: SHA, baseTree: TREE, candidateTree: TREE,
+			lineageId, authorityRevision: revision, targetIdentity: SHA, baseTree: TREE, candidateTree: TREE,
 			changedPathManifestSha256: SHA, lens: lens.slice(7) as "risk" | "resilience" | "readability" | "reliability", selectedOrder: order,
 		},
 		baseTree: TREE, candidateTree: TREE, changedPathManifest: [],
-		...(materialize && submission !== "absent" ? { submission: submission === "provider" ? providerSubmission(lineageId, lens, order) : submission } : {}),
+		...(materialize && submission !== "absent" ? { submission: submission === "provider" ? providerSubmission(lineageId, lens, order, revision) : submission } : {}),
 	};
 }
 
@@ -92,6 +93,7 @@ function finalizeStatus(lineageId: string, inputs?: readonly ReviewCollectInputV
 			currentSnapshotIdentity: SHA,
 		},
 		candidates: [],
+		repositoryContext: { capability: "review.opaque_repository_context", handle: `rctx1_${"e".repeat(64)}`, revision: SHA, targetIdentity: SHA },
 		...(inputs === undefined ? {} : { nextTransition: { kind: "collect", reasonCode: "reviewer_results_required", collect: { inputs: [...inputs] } } }),
 		raw: { schema: "gentle-ai.review-integration.status/v3", action: "stop", lineage_id: lineageId },
 	} as unknown as ReviewStatusV3;
@@ -172,7 +174,7 @@ test("Pi-authored review documents are rejected at the capture input boundary", 
 	assert.equal(relayCalls, 0);
 });
 
-function groupInputs(lineageId: string): ReviewCollectInputV3[] { return ["review-risk", "review-resilience", "review-readability", "review-reliability"].map((lens, order) => relayCollectInput(lineageId, lens, order)); }
+function groupInputs(lineageId: string, revision = SHA): ReviewCollectInputV3[] { return ["review-risk", "review-resilience", "review-readability", "review-reliability"].map((lens, order) => relayCollectInput(lineageId, lens, order, true, "provider", revision)); }
 
 async function runCaptureGroup(cwd: string, harness: RoutingHarness, lineageId: string, inputs: readonly ReviewCollectInputV3[], reviewerRunAcknowledged = true): Promise<Record<string, unknown>> { return await __testing.executeReviewCaptureGroupOperation({ lineageId, collectBindings: inputs.map((input) => JSON.stringify(input)), reviewerRunAcknowledged }, cwd, harness.native) as Record<string, unknown>; }
 
@@ -205,6 +207,39 @@ test("grouped capture forecasts once, reaches a four-reviewer barrier, and recon
 	assert.deepEqual(submitted, lenses);
 	assert.deepEqual({ outcome: result.outcome, statusCalls: harness.statusCalls.length, providerAction: result.provider_action }, { outcome: "native-reviewer-group-status-reconciled", statusCalls: 7, providerAction: "stop" });
 	assert.equal(result.next_transition, undefined);
+});
+
+test("group accepts capture-phase revision Pn when authority has advanced to Rn at the forecast boundary", async (t) => {
+	t.after(() => __testing.setReviewHostRelayGroupRunnersForTesting());
+	const cwd = repository(t), lineageId = "relay-group-phase-revision", inputs = groupInputs(lineageId, PHASE_REVISION);
+	const status = finalizeStatus(lineageId, inputs);
+	status.repositoryContext = { capability: "review.opaque_repository_context", handle: `rctx1_${"e".repeat(64)}`, revision: PHASE_REVISION, targetIdentity: SHA };
+	let launches = 0;
+	__testing.setReviewHostRelayGroupRunnersForTesting(async (requests) => { launches += requests.length; return requests.map(prepared); });
+
+	const forecast = await runCaptureGroup(cwd, nativeHarness([status]), lineageId, inputs, false);
+
+	assert.notEqual(forecast.reason, "current STATUS does not bind one matching expected revision and repository context for the reviewer group", "capture-phase Pn must compare to current repository-context Pn, not authority Rn");
+	assert.deepEqual(forecast.cost_forecast, { transport: "pi_host_relay", model_runs: 4, lenses: ["review-risk", "review-resilience", "review-readability", "review-reliability"] });
+	assert.equal(launches, 0, "forecast validation must complete before any reviewer model launch");
+});
+
+test("group rejects absent or mismatched current repository context before launch", async (t) => {
+	t.after(() => __testing.setReviewHostRelayGroupRunnersForTesting());
+	const cwd = repository(t), lineageId = "relay-group-context-reject", inputs = groupInputs(lineageId, PHASE_REVISION);
+	const revisionMismatch = finalizeStatus(lineageId, inputs);
+	const handleMismatch = finalizeStatus(lineageId, inputs);
+	const absent = finalizeStatus(lineageId, inputs);
+	handleMismatch.repositoryContext = { capability: "review.opaque_repository_context", handle: `rctx1_${"f".repeat(64)}`, revision: PHASE_REVISION, targetIdentity: SHA };
+	delete absent.repositoryContext;
+	let launches = 0;
+	__testing.setReviewHostRelayGroupRunnersForTesting(async (requests) => { launches += requests.length; return requests.map(prepared); });
+
+	for (const status of [revisionMismatch, handleMismatch, absent]) {
+		const result = await runCaptureGroup(cwd, nativeHarness([status]), lineageId, inputs);
+		assert.equal(result.outcome, "capture-group-rejected");
+	}
+	assert.equal(launches, 0, "repository-context validation must reject before reviewer model launch");
 });
 
 test("group rejects partial, duplicate, reordered, stale, mixed, and late-invalid bindings before launch", async (t) => {
