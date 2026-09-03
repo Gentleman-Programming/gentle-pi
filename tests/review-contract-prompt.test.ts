@@ -64,6 +64,24 @@ test("before_agent_start injects the mirrored review execution contract for the 
 	const expected = mirroredPiOrchestrationText();
 	assert.match(result.systemPrompt, /## Gentle AI review execution contract \(mirrored provider bundle 1\.2\.0\)/);
 	assert.ok(result.systemPrompt.includes(expected), "the mirrored orchestration/pi.md text must appear verbatim");
+	assert.match(result.systemPrompt, /call `gentle_review` with {"operation":"inspect"}/);
+	assert.match(result.systemPrompt, /call `gentle_review` with operation `status`, the exact retained `lineageId`, and `workspaceRoot`/);
+	assert.match(result.systemPrompt, /Use `gentle_review_capture` for one current returned slot or `gentle_review_capture_group` for the complete current reviewer group/);
+	assert.match(result.systemPrompt, /An approved capture awaits acknowledgement; it is not burned\. On `approved`, use bound facade STATUS to obtain or replay the exact provider-issued `acknowledge-approved` continuation, then execute it unchanged\. Only its successful returned envelope burns authority; do not issue STATUS after that burn\./);
+	let previousLifecycleIndex = result.systemPrompt.indexOf("## Gentle AI review execution contract");
+	for (const marker of [
+		'call `gentle_review` with {"operation":"inspect"}',
+		"2. **Freeze once.**",
+		"call `gentle_review` with operation `status`",
+		"Use `gentle_review_capture` for one current returned slot",
+		"5. **Acknowledge exactly.**",
+	]) {
+		const markerIndex = result.systemPrompt.indexOf(marker, previousLifecycleIndex + 1);
+		assert.ok(markerIndex > previousLifecycleIndex, `${marker} must follow the previous lifecycle step`);
+		previousLifecycleIndex = markerIndex;
+	}
+	assert.doesNotMatch(result.systemPrompt, /authority is already burned/);
+	assert.doesNotMatch(result.systemPrompt, /gentle-ai review status\b.*--agent pi/);
 });
 
 test("before_agent_start does not inject the review execution contract for a named agent session", async () => {

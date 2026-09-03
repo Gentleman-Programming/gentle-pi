@@ -54,7 +54,7 @@
       ],
       "schema": {
         "path": "schemas/targeted-validator.schema.json",
-        "sha256": "58f5efca0fb8089a51e998d5cf07209528a6b6e3782246b34ee1e825132063a8"
+        "sha256": "6a8d7b331ec6f000366017e39e0476511c3b032649c42abfe865c1e9c956510e"
       },
       "vector": {
         "path": "vectors/targeted-validator.json",
@@ -67,7 +67,7 @@
       "runtime": "pi",
       "file": {
         "path": "orchestration/pi.md",
-        "sha256": "54fba57b11b280f56f7f15e91ddad3d844c70e0127e5c1adeff0a9d1b7a98e64"
+        "sha256": "69c51944081ccff09d1cee5e24eb3a14b7b911a2e734cef8f8ea94a15b9f9d4c"
       }
     }
   ]
