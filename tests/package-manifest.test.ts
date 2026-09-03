@@ -1086,6 +1086,16 @@ test("agent home resolver centralizes Gentle and Pi agent-dir precedence", () =>
 		);
 		assert.equal(resolveGentlePiAgentHome({ PI_CODING_AGENT_DIR: piAgentDir }), piAgentDir);
 		assert.equal(resolveGentlePiAgentHome({}), join(homedir(), ".pi", "agent"));
+		assert.equal(
+			resolveGentlePiAgentHome({ GENTLE_PI_AGENT_HOME: "", PI_CODING_AGENT_DIR: piAgentDir }),
+			piAgentDir,
+			"an empty explicit override falls through like Pi Subagents does",
+		);
+		assert.equal(
+			resolveGentlePiAgentHome({ PI_CODING_AGENT_DIR: "" }),
+			join(homedir(), ".pi", "agent"),
+			"an empty PI_CODING_AGENT_DIR falls through like Pi Subagents does",
+		);
 	} finally {
 		rmSync(explicitGentleHome, { recursive: true, force: true });
 		rmSync(piAgentDir, { recursive: true, force: true });
