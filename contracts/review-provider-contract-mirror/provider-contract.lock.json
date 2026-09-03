@@ -5,11 +5,11 @@
   "source": {
     "kind": "tree"
   },
-  "tree_sha256": "9ef1127c471d1833e85b16efbc28c9e1432e4bea522fd3bdaff2c70fcd81c2eb",
+  "tree_sha256": "9cc05e9f0cbfd22734f1a112dc6120230b22de5318401db19652b4287b7382b8",
   "entries": {
     "README.md": "18baab5ee79aefd0bc62a28da0dadcf2162544f57a940c5b859cd6bc4932a085",
-    "manifest.json": "519adbc5687953b3c3816c253eece9b46a6189ce67eeea79555da445d87bdc8e",
-    "orchestration/pi.md": "f13327642dc24bd8f36350949e57531239b760d5a671243c905d6e770bc62cf9",
+    "manifest.json": "042a8925ac71929c33de2cad630bac26192ff61e255145649b3c34ba4048e923",
+    "orchestration/pi.md": "69c51944081ccff09d1cee5e24eb3a14b7b911a2e734cef8f8ea94a15b9f9d4c",
     "schemas/lens.schema.json": "ffef79cfb763333282285ff5c795a32b5a88d840b4a8d125ce012188b04cffe1",
     "schemas/refuter.schema.json": "36f8267c6c3f04600b8f1cb77df70d90858611af822cc81922efd6b3502fb646",
     "schemas/targeted-validator.schema.json": "6a8d7b331ec6f000366017e39e0476511c3b032649c42abfe865c1e9c956510e",
@@ -18,7 +18,7 @@
     "vectors/targeted-validator.json": "7b5a5165e3a913863fb98d2ba5387811860c21333b5c37e6ed3b4e0d121cf2fa"
   },
   "generated": {
-    "generated/provider-capabilities.baseline.json": "e0a7d1aeef3b9996b3fa6f74d7187e306936573e0a6b07315484008d6681e933",
+    "generated/provider-capabilities.baseline.json": "0c3847e7449f095a44b92653effb68b8c8e09b8f1593b4fc6365f7a78ae99767",
     "generated/provider-roles.baseline.json": "7a1c5ef7688f7dadef0b2c1f2a50af0a8d1fd1d58cce089ababd6e5bb7ccaefc"
   },
   "runtimes": [
