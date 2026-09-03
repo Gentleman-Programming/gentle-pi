@@ -865,6 +865,12 @@ const GUARD_ACTION = {
 type GuardAction = (typeof GUARD_ACTION)[keyof typeof GUARD_ACTION];
 type GuardClassification = GuardAction | "not-guarded";
 
+interface GuardEvaluation {
+	action: GuardClassification;
+	key?: GuardedCommandKey;
+	triggerIndex: number;
+}
+
 const GUARDED_COMMAND_KEY = {
 	GIT_PUSH: "gitPush",
 	GIT_REBASE: "gitRebase",
@@ -903,6 +909,14 @@ const AUTONOMOUS_DEFAULT_ACTIONS: Record<GuardedCommandKey, GuardAction> = {
 	piRemove: "confirm",
 };
 
+const GUARDED_COMMAND_LABELS: Record<GuardedCommandKey, string> = {
+	gitPush: "git push",
+	gitRebase: "git rebase",
+	gitBranchDeleteForce: "forced git branch deletion",
+	npmPublish: "npm publish",
+	piRemove: "pi remove",
+};
+
 const SAFE_GUARDRAILS_CONFIG: RuntimeGuardrailsConfig = {
 	autonomousMode: false,
 	guardedCommands: {},
@@ -918,31 +932,58 @@ const SAFE_GUARDRAILS_CONFIG: RuntimeGuardrailsConfig = {
  *      (applying AUTONOMOUS_DEFAULT_ACTIONS for any key not set in guardedCommands)
  *   4. No match → "not-guarded"
  */
+function evaluateGuardedCommand(
+	command: string,
+	config: RuntimeGuardrailsConfig,
+): GuardEvaluation {
+	// Step 1: hard-deny always wins, regardless of any config
+	for (const pattern of DENIED_BASH_PATTERNS) {
+		const match = pattern.exec(command);
+		if (match) {
+			const pushMatch = GIT_PUSH_RE.exec(command);
+			return {
+				action: "block",
+				key: pushMatch ? GUARDED_COMMAND_KEY.GIT_PUSH : undefined,
+				triggerIndex: pushMatch?.index ?? match.index,
+			};
+		}
+	}
+
+	// Step 2 & 3: find which guarded key (if any) this command matches
+	for (const [key, pattern] of Object.entries(GUARDED_KEY_PATTERNS) as [
+		GuardedCommandKey,
+		RegExp,
+	][]) {
+		const match = pattern.exec(command);
+		if (!match) continue;
+
+		// Matched a guarded key
+		const action = config.autonomousMode
+			? (config.guardedCommands[key] ?? AUTONOMOUS_DEFAULT_ACTIONS[key])
+			: "confirm";
+		return { action, key, triggerIndex: match.index };
+	}
+	return { action: "not-guarded", triggerIndex: 0 };
+}
+
 function classifyGuardedCommand(
 	command: string,
 	config: RuntimeGuardrailsConfig,
 ): GuardClassification {
-	// Step 1: hard-deny always wins, regardless of any config
-	for (const pattern of DENIED_BASH_PATTERNS) {
-		if (pattern.test(command)) return "block";
-	}
+	return evaluateGuardedCommand(command, config).action;
+}
 
-	// Step 2 & 3: find which guarded key (if any) this command matches
-	for (const [key, pattern] of Object.entries(GUARDED_KEY_PATTERNS) as [GuardedCommandKey, RegExp][]) {
-		if (!pattern.test(command)) continue;
+function guardedCommandPreview(command: string, triggerIndex: number): string {
+	const start = Math.max(0, triggerIndex - 60);
+	const prefix = start > 0 ? "…" : "";
+	return `${prefix}${truncateToWidth(command.slice(start).replace(/\s+/g, " ").trim(), 180 - prefix.length, "…")}`;
+}
 
-		// Matched a guarded key
-		if (!config.autonomousMode) {
-			// Legacy behavior: any match → confirm
-			return "confirm";
-		}
-
-		// Autonomous mode: use configured action, fall back to sensible defaults
-		const configuredAction = config.guardedCommands[key];
-		return configuredAction ?? AUTONOMOUS_DEFAULT_ACTIONS[key];
-	}
-
-	return "not-guarded";
+/** Confirmation headline for a guarded command; generic when no key matched. */
+function guardedCommandTitle(key?: GuardedCommandKey): string {
+	return key === undefined
+		? "Allow guarded command?"
+		: `Allow guarded ${GUARDED_COMMAND_LABELS[key]}?`;
 }
 
 function parseGuardrailsConfigFile(
@@ -1274,7 +1315,8 @@ async function confirmCommand(
 	herdrLifecycle: HerdrConfirmationLifecycle,
 ): Promise<ToolCallEventResult | undefined> {
 	const guardrailsConfig = loadRuntimeGuardrailsConfig(ctx.cwd);
-	const classification = classifyGuardedCommand(command, guardrailsConfig);
+	const evaluation = evaluateGuardedCommand(command, guardrailsConfig);
+	const { action: classification } = evaluation;
 
 	if (classification === "block") {
 		return {
@@ -1297,11 +1339,8 @@ async function confirmCommand(
 				"Gentle AI safety policy requires interactive confirmation before this command.",
 		};
 	}
-	const preview = truncateToWidth(
-		command.replace(/\s+/g, " ").trim(),
-		180,
-		"…",
-	);
+	const title = guardedCommandTitle(evaluation.key);
+	const preview = guardedCommandPreview(command, evaluation.triggerIndex);
 	const requestId = randomUUID();
 	const emitPermissionRequest = (
 		state: "waiting" | "approved" | "denied",
@@ -1320,7 +1359,7 @@ async function confirmCommand(
 	emitPermissionRequest("waiting");
 	herdrLifecycle.begin();
 	try {
-		approved = await ctx.ui.confirm("Allow guarded command?", preview);
+		approved = await ctx.ui.confirm(title, preview);
 	} catch (error) {
 		confirmationFailed = true;
 		confirmationError = error;
@@ -5766,6 +5805,8 @@ export const __testing = {
 	listDiscoverableAgents,
 	orderDiscoverableAgents,
 	classifyGuardedCommand,
+	guardedCommandPreview,
+	guardedCommandTitle,
 	loadRuntimeGuardrailsConfig,
 	buildGentlePrompt,
 	nativeStatusUnsupported,
