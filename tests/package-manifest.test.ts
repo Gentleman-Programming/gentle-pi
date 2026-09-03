@@ -895,6 +895,22 @@ test("jd-fix-agent packaged allowlist includes write tools", () => {
 	}
 });
 
+test("sdd-explore packages its CodeGraph-enabled exploration allowlist", () => {
+	const agentPath = join(PACKAGE_ROOT, "assets", "agents", "sdd-explore.md");
+	const { name, tools } = readAgentDefinition(agentPath);
+
+	assert.equal(name, "sdd-explore");
+	assert.deepEqual(tools, [
+		"read",
+		"grep",
+		"find",
+		"codegraph",
+		"edit",
+		"write",
+		"mem_save",
+	]);
+});
+
 test("gentle-ai-worker packages the exact scoped writer contract", () => {
 	const agentsDir = join(PACKAGE_ROOT, "assets", "agents");
 	const agentPath = join(agentsDir, "gentle-ai-worker.md");
