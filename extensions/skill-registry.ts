@@ -562,6 +562,22 @@ function closeSkillRegistryWatchers(): void {
 	watchedCwds.clear();
 }
 
+async function refreshRegistryFromWatcher(
+	cwd: string,
+	notify: (message: string, level: "info" | "warning") => void,
+): Promise<void> {
+	try {
+		const result = await regenerateRegistry(cwd, false);
+		if (result.regenerated) {
+			notify(`Skill registry refreshed (${result.skillCount} skills)`, "info");
+		} else if (result.failure) {
+			notify(storageFailureMessage(result.failure), "warning");
+		}
+	} catch (error) {
+		notify(`Skill registry refresh failed: ${errorDiagnostic(error)}`, "warning");
+	}
+}
+
 async function startSkillRegistryWatcher(
 	cwd: string,
 	notify: (message: string, level: "info" | "warning") => void,
@@ -576,18 +592,7 @@ async function startSkillRegistryWatcher(
 	const refresh = () => {
 		if (timer) clearTimeout(timer);
 		timer = setTimeout(() => {
-			void (async () => {
-				try {
-					const result = await regenerateRegistry(cwd, false);
-					if (result.regenerated) {
-						notify(`Skill registry refreshed (${result.skillCount} skills)`, "info");
-					} else if (result.failure) {
-						notify(storageFailureMessage(result.failure), "warning");
-					}
-				} catch (error) {
-					notify(`Skill registry refresh failed: ${errorDiagnostic(error)}`, "warning");
-				}
-			})();
+			void refreshRegistryFromWatcher(cwd, notify);
 		}, WATCH_DEBOUNCE_MS);
 	};
 	for (const dir of dirs) {
@@ -598,6 +603,14 @@ async function startSkillRegistryWatcher(
 			notify(`Skill registry watch unavailable: ${errorDiagnostic(error)}`, "warning");
 		}
 	}
+}
+
+async function recoverLegacyRegistry(
+	cwd: string,
+	notify?: (message: string, level: "warning") => void,
+): Promise<void> {
+	const recovery = await regenerateRegistry(cwd, true);
+	if (recovery.failure) notify?.(storageFailureMessage(recovery.failure), "warning");
 }
 
 export const __testing = {
@@ -619,6 +632,8 @@ export const __testing = {
 	},
 	shouldSkipSkillRegistryStartup,
 	shouldSkipDuplicateExtensionLoad,
+	refreshRegistryFromWatcher,
+	recoverLegacyRegistry,
 	startSkillRegistryWatcher,
 	closeSkillRegistryWatchers,
 	activeWatcherCount() {
@@ -672,13 +687,15 @@ export default function (pi: ExtensionAPI) {
 				setTimeout(() => {
 					void (async () => {
 						try {
-							const recovery = await regenerateRegistry(ctx.cwd, true);
-							if (recovery.failure && ctx.hasUI) {
-								ctx.ui.notify(storageFailureMessage(recovery.failure), "warning");
-							}
+							await recoverLegacyRegistry(
+								ctx.cwd,
+								ctx.hasUI ? (message, level) => ctx.ui.notify(message, level) : undefined,
+							);
 						} catch (error) {
 							if (ctx.hasUI) {
 								ctx.ui.notify(`Skill registry refresh failed: ${errorDiagnostic(error)}`, "warning");
+							} else {
+								throw error;
 							}
 						}
 					})();
@@ -692,6 +709,8 @@ export default function (pi: ExtensionAPI) {
 					`Skill registry refresh failed: ${message}`,
 					"warning",
 				);
+			} else {
+				throw error;
 			}
 		}
 	});

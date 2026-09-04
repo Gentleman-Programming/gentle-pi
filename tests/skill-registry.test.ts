@@ -7,7 +7,7 @@ import test from "node:test";
 import { pathToFileURL } from "node:url";
 import createSkillRegistryExtension, { __testing } from "../extensions/skill-registry.ts";
 
-function storageError(code: "EACCES" | "EPERM" | "EROFS", message: string): NodeJS.ErrnoException {
+function storageError(code: "EACCES" | "EPERM" | "EROFS" | "EIO", message: string): NodeJS.ErrnoException {
 	return Object.assign(new Error(message), { code });
 }
 
@@ -348,9 +348,18 @@ test("non-forced regeneration invalidates cache when skill bytes change but path
 
 test("registry and cache storage restrictions never report successful regeneration", async (t) => {
 	const cwd = skillFixture("restricted-writes");
+	const atlDirectory = join(cwd, ".atl");
 	const registryPath = join(cwd, ".atl", "skill-registry.md");
 	const cachePath = join(cwd, ".atl", ".skill-registry.cache.json");
 	t.after(() => __testing.resetStorage());
+
+	__testing.setStorage({
+		mkdir: async () => { throw storageError("EACCES", "directory denied"); },
+	});
+	const directoryFailure = await __testing.regenerateRegistry(cwd, true);
+	assert.equal(directoryFailure.regenerated, false);
+	assert.equal(directoryFailure.failure?.stage, "atl-directory");
+	assert.equal(directoryFailure.failure?.path, atlDirectory);
 
 	__testing.setStorage({
 		writeFile: async (path, data) => {
@@ -415,12 +424,16 @@ test("unexpected registry write failures preserve their original diagnostic", as
 	t.after(() => __testing.resetStorage());
 	__testing.setStorage({
 		writeFile: async (path, data) => {
-			if (path === registryPath) throw new Error("disk disconnected");
+			if (path === registryPath) throw storageError("EIO", "disk disconnected");
 			return writeFileAsync(path, data);
 		},
 	});
 
-	await assert.rejects(__testing.regenerateRegistry(cwd, true), /disk disconnected/);
+	await assert.rejects(__testing.regenerateRegistry(cwd, true), (error: NodeJS.ErrnoException) => {
+		assert.equal(error.code, "EIO");
+		assert.match(error.message, /disk disconnected/);
+		return true;
+	});
 });
 
 test("a later writable forced refresh recovers after a storage restriction", async (t) => {
@@ -466,4 +479,28 @@ test("manual refresh reports unavailable storage with the affected path and next
 	assert.match(notifications[0]?.message ?? "", /unavailable/i);
 	assert.match(notifications[0]?.message ?? "", new RegExp(cachePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 	assert.match(notifications[0]?.message ?? "", /repair permissions/i);
+});
+
+test("unexpected startup and delayed recovery failures propagate while watcher reports the original diagnostic", async (t) => {
+	const cwd = skillFixture("async-unexpected");
+	const registryPath = join(cwd, ".atl", "skill-registry.md");
+	t.after(() => __testing.resetStorage());
+	__testing.setStorage({
+		writeFile: async (path, data) => {
+			if (path === registryPath) throw storageError("EIO", "async disk fault");
+			return writeFileAsync(path, data);
+		},
+	});
+
+	const { events } = extensionHarness();
+	const startup = events.get("session_start");
+	assert.ok(startup);
+	await assert.rejects(() => startup({}, { cwd, hasUI: false }), /async disk fault/);
+	await assert.rejects(__testing.recoverLegacyRegistry(cwd), /async disk fault/);
+	const notifications: Array<{ message: string; level: string }> = [];
+	await __testing.refreshRegistryFromWatcher(cwd, (message, level) => {
+		notifications.push({ message, level });
+	});
+	assert.match(notifications[0]?.message ?? "", /async disk fault/);
+	assert.equal(notifications[0]?.level, "warning");
 });
