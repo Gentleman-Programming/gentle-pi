@@ -184,6 +184,19 @@ const CAPABILITIES_SCHEMA_IDENTITIES                                            
 		requiredMandatoryFeatures: REQUIRED_MANDATORY_FEATURES_V23,
 		optionalFeatureFloor: 14,
 	}),
+	// Ground-truthed against the published v2.6.0 binary: capabilities/v2.5
+	// advertises the same required surface as v2.4 (status/v6 is still
+	// advertised for compatibility) plus the new status/v7 schema, which is a
+	// superset-checked addition, not a requirement -- decodeReviewStatusV3
+	// accepts v7 as an additive extension of v6, so the required-schema floor
+	// stays unchanged. The v2.6.0 binary advertised 15 optional features
+	// (floor stays at 14, its established minimum).
+	"gentle-ai.review-integration.capabilities/v2.5": Object.freeze({
+		protocolMinor: 5,
+		requiredSchemas: Object.freeze([...REQUIRED_SCHEMAS_COMMON_V23, "gentle-ai.review-integration.capabilities/v2.5", "gentle-ai.review-integration.consent/v3", "gentle-ai.review-integration.start/v4", "gentle-ai.review-integration.status/v6", "gentle-ai.review-intended-untracked-selection/v1"]),
+		requiredMandatoryFeatures: REQUIRED_MANDATORY_FEATURES_V23,
+		optionalFeatureFloor: 14,
+	}),
 });
 const OPTIONAL_FEATURE_NAMES = Object.freeze([
 	"base_ref_workspace_overlay",
@@ -565,6 +578,8 @@ export const REVIEW_PROVIDER_ROLE_CAPTURE_OPERATIONS = Object.freeze(Object.valu
 
 
 	                      
+
+
 
 
 
@@ -1762,15 +1777,19 @@ export function decodeReviewStatusV3(value         )                 {
 	// Additive forward acceptance: status/v5 (gentle-ai main; ground-truthed
 	// against a live capture and the vendored status-v5.schema.json) is the v3
 	// key set plus the optional forecast and the v5-only next_transition
-	// surfaces. status/v6 adds the intended-untracked selection; v3 keeps
-	// rejecting every v5/v6-only field.
+	// surfaces. status/v6 adds the intended-untracked selection; status/v7
+	// (gentle-ai v2.6.0, advertised through capabilities/v2.5 alongside v6)
+	// adds only the top-level optional `eligible_untracked_inventory` digest,
+	// so it is decoded on the v6 surface. v3 keeps rejecting every v5/v6/v7-only
+	// field.
 	const schema = typeof value === "object" && value !== null ? (value                           ).schema : undefined;
-	const v6 = schema === "gentle-ai.review-integration.status/v6";
+	const v7 = schema === "gentle-ai.review-integration.status/v7";
+	const v6 = v7 || schema === "gentle-ai.review-integration.status/v6";
 	const v5 = v6 || schema === "gentle-ai.review-integration.status/v5";
 	const body = exactRecord(value, "status", [
 		"schema", "contract", "operation", "applicability", "action", "replayability", "target_identity", "projection", "repair", "candidates",
-	], ["authority", "frozen", "action_disposition", "eligibility", "next_transition", "authority_target_identity", ...(v5 ? ["receipt", "forecast", "repository_context", "validation_request"] : [])]);
-	requireIdentity(body, v6 ? "gentle-ai.review-integration.status/v6" : v5 ? "gentle-ai.review-integration.status/v5" : "gentle-ai.review-integration.status/v3", REVIEW_INTEGRATION_OPERATION.STATUS);
+	], ["authority", "frozen", "action_disposition", "eligibility", "next_transition", "authority_target_identity", ...(v5 ? ["receipt", "forecast", "repository_context", "validation_request"] : []), ...(v7 ? ["eligible_untracked_inventory"] : [])]);
+	requireIdentity(body, v7 ? "gentle-ai.review-integration.status/v7" : v6 ? "gentle-ai.review-integration.status/v6" : v5 ? "gentle-ai.review-integration.status/v5" : "gentle-ai.review-integration.status/v3", REVIEW_INTEGRATION_OPERATION.STATUS);
 
 	const applicability = enumeration(body.applicability, ["current_target", "unrelated", "ambiguous", "corrupted"]         , "status.applicability");
 	let receipt                                   ;
@@ -1852,6 +1871,15 @@ export function decodeReviewStatusV3(value         )                 {
 		};
 	}
 
+	// status/v7 top-level optional digest (gentle-ai v2.6.0): resolves #4066's
+	// closed loop where `sdd-attempt finish` named a digest status never
+	// published. Absent on the `staged` projection, which never resolves an
+	// inventory, so it stays structurally optional rather than a required v7
+	// field.
+	const eligibleUntrackedInventory = v7 && body.eligible_untracked_inventory !== undefined
+		? sha256(body.eligible_untracked_inventory, "status.eligible_untracked_inventory")
+		: undefined;
+
 	return {
 		contract: REVIEW_INTEGRATION_CONTRACT,
 		applicability,
@@ -1870,6 +1898,7 @@ export function decodeReviewStatusV3(value         )                 {
 		...(forecast === undefined ? {} : { forecast }),
 		...(repositoryContext === undefined ? {} : { repositoryContext }),
 		...(validationRequest === undefined ? {} : { validationRequest }),
+		...(eligibleUntrackedInventory === undefined ? {} : { eligibleUntrackedInventory }),
 		raw: body,
 	};
 }

@@ -393,6 +393,53 @@ test("capabilities/v2.3 retains status/v5 while v2.4 requires status/v6", () => 
 	assert.throws(() => decodeReviewCapabilitiesV2(v22Retired, CAPTURED_DIGEST), /schema/);
 });
 
+test("capabilities/v2.5 negotiates the v2.6.0 advertisement and status/v7 decodes the eligible untracked inventory", () => {
+	// gentle-ai v2.6.0 advertises capabilities/v2.5: the v2.4 surface plus
+	// status/v7, with status/v6 still advertised for compatibility.
+	const v25 = clone(fixture(DEV_FIXTURES, "capabilities-v2.2.captured.json") as JsonObject);
+	v25.schema = "gentle-ai.review-integration.capabilities/v2.5";
+	(v25.protocol as JsonObject).minor = 5;
+	const features = v25.features as JsonObject;
+	features.mandatory = (features.mandatory as JsonObject[]).filter((feature) =>
+		!["exact_receipt_replay", "five_delivery_gates", "sdd_receipt_binding"].includes(feature.name as string));
+	v25.schemas = [
+		...(v25.schemas as string[]).map((schema) => schema
+			.replace("capabilities/v2.2", "capabilities/v2.5")
+			.replace("start/v3", "start/v4")
+			.replace("status/v5", "status/v6")),
+		"gentle-ai.review-intended-untracked-selection/v1",
+		"gentle-ai.review-integration.status/v7",
+	];
+	const decoded = decodeReviewCapabilitiesV2(v25, CAPTURED_DIGEST);
+	assert.equal(decoded.schemas.has("gentle-ai.review-integration.status/v6"), true);
+	// The negotiated set is the v2.5 requirement floor; status/v7 is additive
+	// and never required, so an advertisement without it still negotiates.
+	assert.equal(decoded.schemas.has("gentle-ai.review-integration.status/v7"), false);
+	const withoutStatusV7 = clone(v25);
+	withoutStatusV7.schemas = (withoutStatusV7.schemas as string[]).filter((schema) => schema !== "gentle-ai.review-integration.status/v7");
+	assert.equal(decodeReviewCapabilitiesV2(withoutStatusV7, CAPTURED_DIGEST).schemas.has("gentle-ai.review-integration.status/v6"), true);
+
+	// status/v6 stays required: v7 is an additive extension, not a replacement.
+	const missingStatusV6 = clone(v25);
+	missingStatusV6.schemas = (missingStatusV6.schemas as string[]).filter((schema) => schema !== "gentle-ai.review-integration.status/v6");
+	assert.throws(() => decodeReviewCapabilitiesV2(missingStatusV6, CAPTURED_DIGEST), /status\/v6/);
+
+	// status/v7 adds only the optional top-level eligible untracked inventory digest.
+	const v7 = initialIntendedUntrackedStatusV6();
+	v7.schema = "gentle-ai.review-integration.status/v7";
+	v7.eligible_untracked_inventory = sha("e");
+	assert.equal(decodeReviewStatusV3(v7).eligibleUntrackedInventory, sha("e"));
+
+	const v7Staged = initialIntendedUntrackedStatusV6();
+	v7Staged.schema = "gentle-ai.review-integration.status/v7";
+	assert.equal(decodeReviewStatusV3(v7Staged).eligibleUntrackedInventory, undefined);
+
+	// The digest is v7-only: a v6 envelope carrying it is still rejected.
+	const v6WithDigest = initialIntendedUntrackedStatusV6();
+	v6WithDigest.eligible_untracked_inventory = sha("e");
+	assert.throws(() => decodeReviewStatusV3(v6WithDigest), /eligible_untracked_inventory/);
+});
+
 test("status/v6 decodes and enforces the intended-untracked selection submission", () => {
 	const decoded = decodeReviewStatusV3(initialIntendedUntrackedStatusV6());
 	const input = decoded.nextTransition?.collect?.inputs[0];
