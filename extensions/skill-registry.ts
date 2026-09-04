@@ -605,14 +605,6 @@ async function startSkillRegistryWatcher(
 	}
 }
 
-async function recoverLegacyRegistry(
-	cwd: string,
-	notify?: (message: string, level: "warning") => void,
-): Promise<void> {
-	const recovery = await regenerateRegistry(cwd, true);
-	if (recovery.failure) notify?.(storageFailureMessage(recovery.failure), "warning");
-}
-
 export const __testing = {
 	projectSkillDirs,
 	userSkillDirs,
@@ -633,7 +625,6 @@ export const __testing = {
 	shouldSkipSkillRegistryStartup,
 	shouldSkipDuplicateExtensionLoad,
 	refreshRegistryFromWatcher,
-	recoverLegacyRegistry,
 	startSkillRegistryWatcher,
 	closeSkillRegistryWatchers,
 	activeWatcherCount() {
@@ -684,22 +675,17 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			if (quarantinedLegacy) {
-				setTimeout(() => {
-					void (async () => {
-						try {
-							await recoverLegacyRegistry(
-								ctx.cwd,
-								ctx.hasUI ? (message, level) => ctx.ui.notify(message, level) : undefined,
-							);
-						} catch (error) {
-							if (ctx.hasUI) {
-								ctx.ui.notify(`Skill registry refresh failed: ${errorDiagnostic(error)}`, "warning");
-							} else {
-								throw error;
-							}
-						}
-					})();
-				}, WATCH_DEBOUNCE_MS);
+				if (!ctx.hasUI) {
+					await regenerateRegistry(ctx.cwd, true);
+				} else {
+					setTimeout(() => {
+						void regenerateRegistry(ctx.cwd, true)
+							.then((recovery) => {
+								if (recovery.failure) ctx.ui.notify(storageFailureMessage(recovery.failure), "warning");
+							})
+							.catch((error) => ctx.ui.notify(`Skill registry refresh failed: ${errorDiagnostic(error)}`, "warning"));
+					}, WATCH_DEBOUNCE_MS);
+				}
 			}
 		} catch (error) {
 			if (ctx.hasUI) {
