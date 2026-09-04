@@ -150,11 +150,28 @@ test("2.5.0 repeats 2.5.0-rc.3 because the stable lane Pi consumes is unchanged"
 	assert.deepEqual(contract, NATIVE_CLI_CONTRACTS["2.5.0-rc.3"] as Record<string, boolean>);
 });
 
+test("2.6.0 repeats 2.5.0 because the negotiated lane Pi consumes is unchanged", () => {
+	// Ground-truthed against the published v2.6.0 binary installed from its
+	// signed archive: the v2 lane advertises capabilities/v2.5 and answers
+	// status/v7, consent/v3, and the `start/v4` continuation, all already
+	// decoded. `review mode status --json` and `review validate --gate
+	// pre-commit` were re-run against the binary and still answer
+	// `gentle-ai.rdd-mode-status/v1` and `gentle-ai.review-gate-result/v1`
+	// respectively. Declining the consent/v3 prompt during `review start`
+	// still surfaces `risk_evidence` only on that blocking envelope, not on
+	// the negotiated `start/v4` continuation, so riskEvidence and hint stay
+	// dark: still not proven to reach the negotiated START path Pi consumes.
+	const contract = NATIVE_CLI_CONTRACTS["2.6.0"] as Record<string, boolean>;
+	assert.equal(contract.riskEvidence, false);
+	assert.equal(contract.hint, false);
+	assert.deepEqual(contract, NATIVE_CLI_CONTRACTS["2.5.0"] as Record<string, boolean>);
+});
+
 test("no shipped version key was added beyond the pin bump", () => {
 	// Rows are promises to consumers, so a new key only ever appears in a
 	// dedicated commit alongside a pin bump, never as a side effect. v2.2.4 and
 	// v2.3.0 shipped upstream while Pi stayed on 2.2.3 and were never pinned,
 	// so they get no row: a row asserts ground truth measured against a binary
 	// Pi actually ran, and the table only has to be ascending, not gapless.
-	assert.deepEqual(Object.keys(NATIVE_CLI_CONTRACTS), [...DARK_VERSIONS, "2.2.0", "2.2.1", "2.2.2", "2.2.3", "2.4.0", "2.5.0-rc.3", "2.5.0"]);
+	assert.deepEqual(Object.keys(NATIVE_CLI_CONTRACTS), [...DARK_VERSIONS, "2.2.0", "2.2.1", "2.2.2", "2.2.3", "2.4.0", "2.5.0-rc.3", "2.5.0", "2.6.0"]);
 });
