@@ -506,11 +506,10 @@ function sanitizeStartupStatValue(value: unknown): string {
 }
 
 function fitStartupStatValue(value: unknown, width: number): string {
-  return sanitizeStartupStatValue(value)
+  const normalizedValue = sanitizeStartupStatValue(value)
     .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, width)
-    .padEnd(width);
+    .trim();
+  return truncateToWidth(normalizedValue, width, "", true).replace(/\x1b\[0m$/, "");
 }
 
 function buildStartupStatsGrid(width: number, stats: StartupStats): StartupStatsGrid {

@@ -7,7 +7,7 @@ import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
-import { matchesKey } from "@earendil-works/pi-tui";
+import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { domainHashV1 } from "../lib/review-canonical.ts";
@@ -852,13 +852,18 @@ async function run() {
 			["PATH:", "GIT:", "MCP:", "PLUGINS:", "AGENTS:", "SKILLS:", "EXTENSIONS:", "TOOLS:", "VER:"],
 			"narrow layout must show PATH before GIT and keep version visually secondary",
 		);
-		assert.ok(narrowRows.every((row) => row.length <= 80 && !row.includes("\n")), "narrow rows must not wrap or clip");
+		assert.ok(narrowRows.every((row) => visibleWidth(row) <= 80 && !row.includes("\n")), "narrow rows must not wrap or clip");
 
 		const thresholdRows = formatStartupStatsRows(122, longStats);
 		assert.equal(thresholdRows.length, 5, "wide layout must compact stats into five paired grid rows");
-		assert.ok(thresholdRows.every((row) => row.length === 121 && !row.includes("\n")), "122-column grid must fit without wrapping or clipping");
+		assert.ok(thresholdRows.every((row) => visibleWidth(row) === 121 && !row.includes("\n")), "122-column grid must fit without wrapping or clipping");
 		assert.deepEqual(
-			thresholdRows.map((row) => row.indexOf("GIT:") >= 0 ? row.indexOf("GIT:") : row.indexOf("PLUGINS:") >= 0 ? row.indexOf("PLUGINS:") : row.indexOf("EXTENSIONS:") >= 0 ? row.indexOf("EXTENSIONS:") : row.indexOf("VER:")),
+			thresholdRows.map((row) => {
+				const rightLabelIndex = ["GIT:", "PLUGINS:", "EXTENSIONS:", "VER:"]
+					.map((label) => row.indexOf(label))
+					.find((index) => index >= 0);
+				return rightLabelIndex === undefined ? -1 : visibleWidth(row.slice(0, rightLabelIndex));
+			}),
 			[62, 62, 62, -1, 62],
 			"wide second-column stats must retain the same origin",
 		);
@@ -868,8 +873,25 @@ async function run() {
 		const largerRows = formatStartupStatsRows(160, longStats);
 		assert.deepEqual(largerRows, thresholdRows, "larger widths must preserve the stable wide grid geometry");
 		assert.ok(
-			thresholdRows.every((row) => row.length <= 122 && !row.includes("\n")),
+			thresholdRows.every((row) => visibleWidth(row) <= 122 && !row.includes("\n")),
 			"long path, branch, version, and count values must stay inside the 122-column grid",
+		);
+
+		const unicodeStats = {
+			gitBranch: "plain",
+			path: "👩‍💻".repeat(7),
+			mcp: "plain",
+			agents: "plain",
+			plugins: "plain",
+			skills: "plain",
+			extensions: "界".repeat(7),
+			version: "plain",
+			tools: "plain",
+		};
+		const unicodeRows = formatStartupStatsRows(20, unicodeStats);
+		assert.ok(
+			unicodeRows.every((row) => visibleWidth(row) === 20),
+			"wide and grapheme values must truncate and pad to the terminal display width",
 		);
 
 		// PR #571: every rendered banner row must fit narrow widths, and runtime
@@ -896,7 +918,7 @@ async function run() {
 			);
 			for (const width of [1, 2, 5, 10, 19, 20]) {
 				assert.ok(
-					formatStartupStatsRows(width, longStats).every((row) => row.length <= Math.max(1, width)),
+					formatStartupStatsRows(width, longStats).every((row) => visibleWidth(row) <= Math.max(1, width)),
 					`startup stats must fit a ${width}-column terminal before rendering`,
 				);
 			}
@@ -912,7 +934,7 @@ async function run() {
 				tools: unsafePath,
 			};
 			for (const row of formatStartupStatsRows(80, unsafeStats)) {
-				assert.doesNotMatch(row, /[\x00-\x1f\x7f-\x9f]/, "startup stats must sanitize controls before layout");
+				assert.doesNotMatch(stripAnsi(row), /[\x00-\x1f\x7f-\x9f]/, "startup stats must sanitize controls before layout");
 			}
 
 			const renderPath = unsafePath.replace(/\u0000/g, "");
