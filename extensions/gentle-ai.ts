@@ -3455,6 +3455,19 @@ function mapNativeTargetStatus(operation: ReviewControllerOperation, status: Rev
 			required_status_action: "Use only the provider-selected recovery disposition; do not substitute scope_changed, invalidated, or escalated.",
 		};
 	}
+	// gentle-pi#627: a stale managed-asset set stops the transition with the
+	// exact `gentle-ai sync` invocation that resolves it. Render that command
+	// as the one actionable next step; every other reason code keeps rendering
+	// as a plain blocked result.
+	if (status.nextTransition?.kind === "stop" && status.nextTransition.reasonCode === "managed_assets_outdated" && status.nextTransition.continuation !== undefined) {
+		return {
+			operation,
+			status: "blocked",
+			result: status.raw,
+			...(requestedLineageId === undefined ? {} : { requested_lineage_id: requestedLineageId }),
+			hint: `run ${status.nextTransition.continuation.command}`,
+		};
+	}
 	return {
 		operation,
 		status: status.action === "start" ? "ready" : "blocked",
@@ -3929,7 +3942,7 @@ function completeNativeStart(
 }
 
 function nativeOperationFailure(operation: ReviewControllerOperation | "gentle_review_capture", error: unknown): Record<string, unknown> {
-	const value = error as { mutationOutcome?: unknown; nextAction?: unknown; diagnostics?: unknown; auditRecord?: unknown; launchAttempted?: unknown; candidateViewPreNative?: unknown; failureEnvelope?: { raw?: unknown; mutationOutcome?: unknown; replayability?: unknown; nextAction?: unknown } };
+	const value = error as { mutationOutcome?: unknown; nextAction?: unknown; diagnostics?: unknown; auditRecord?: unknown; launchAttempted?: unknown; candidateViewPreNative?: unknown; failureEnvelope?: { raw?: unknown; mutationOutcome?: unknown; replayability?: unknown; nextAction?: unknown; code?: unknown; continuation?: { command?: unknown } } };
 	if (isRecord(value.failureEnvelope) && isRecord(value.failureEnvelope.raw)) {
 		const mutationOutcome = value.failureEnvelope.mutationOutcome;
 		return {
@@ -3943,6 +3956,12 @@ function nativeOperationFailure(operation: ReviewControllerOperation | "gentle_r
 					: { mutation_performed: false, mutation_outcome: "none" }),
 			...(typeof value.failureEnvelope.replayability === "string" ? { replayability: value.failureEnvelope.replayability } : {}),
 			...(typeof value.failureEnvelope.nextAction === "string" ? { next_action: value.failureEnvelope.nextAction } : {}),
+			// gentle-pi#627: START's preflight failure envelope for a stale
+			// managed-asset set carries a top-level continuation; render its
+			// `gentle-ai sync` command as the one actionable next step.
+			...(value.failureEnvelope.code === "managed_assets_outdated" && typeof value.failureEnvelope.continuation?.command === "string"
+				? { hint: `run ${value.failureEnvelope.continuation.command}` }
+				: {}),
 		};
 	}
 	// Every consent binding guard runs before the provider is launched, so this

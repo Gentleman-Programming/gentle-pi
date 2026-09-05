@@ -95,6 +95,37 @@ function burnedAcknowledgementStatus(lineageId: string): ReviewStatusV3 {
 	return burned;
 }
 
+// gentle-pi#627: gentle-ai reports a stale managed-asset set as a typed stop
+// carrying the exact `gentle-ai sync` invocation that resolves it.
+function managedAssetsOutdatedStatus(lineageId: string): ReviewStatusV3 {
+	const stopped = status(lineageId, [], "approved");
+	stopped.nextTransition = { kind: "stop", reasonCode: "managed_assets_outdated", continuation: { operation: "sync", command: "gentle-ai sync --agent claude-code", agent: "claude-code", staleAssets: ["orchestration/claude-code.md"] } };
+	return stopped;
+}
+
+test("STATUS renders the managed_assets_outdated continuation command as the actionable next step", async () => {
+	const lineageId = "managed-assets-outdated";
+	const native = { targetStatus: async () => managedAssetsOutdatedStatus(lineageId) } as unknown as NativeReviewCli;
+	const blocked = await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, process.cwd(), native);
+	assert.equal(blocked.status, "blocked");
+	assert.equal(blocked.hint, "run gentle-ai sync --agent claude-code");
+
+	// an unknown stop reason code keeps rendering as a plain blocked result
+	const otherStopNative = { targetStatus: async () => burnedAcknowledgementStatus(lineageId) } as unknown as NativeReviewCli;
+	const plainBlocked = await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, process.cwd(), otherStopNative);
+	assert.equal(plainBlocked.status, "blocked");
+	assert.equal(plainBlocked.hint, undefined);
+
+	// an older gentle-ai may report this same stop with no continuation; the
+	// renderer degrades to a plain blocked result instead of losing the status
+	const noContinuation = status(lineageId, [], "approved");
+	noContinuation.nextTransition = { kind: "stop", reasonCode: "managed_assets_outdated" };
+	const noContinuationNative = { targetStatus: async () => noContinuation } as unknown as NativeReviewCli;
+	const degraded = await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, process.cwd(), noContinuationNative);
+	assert.equal(degraded.status, "blocked");
+	assert.equal(degraded.hint, undefined);
+});
+
 test("public acknowledgement relays one current provider vector and never replays after authority burn", async () => {
 	const lineageId = "acknowledge-approved";
 	const requests: Array<Record<string, unknown>> = [];
