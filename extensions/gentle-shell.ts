@@ -173,6 +173,7 @@ const CHANGES_WIDGET_KEY = "gentle-shell-changes";
 const CHANGES_COMMAND_NAME = "gentle:changes";
 const CHANGES_SHORTCUT_DEFAULT = "alt+g";
 const CHANGES_POLL_DEFAULT_MS = 2000;
+const CHANGES_WATCH_DEFAULT_MS = 5000;
 const GIT_TIMEOUT_MS = 5000;
 const OVERLAY_HEIGHT_RATIO = 0.8;
 const OVERLAY_MIN_ROWS = 8;
@@ -224,14 +225,31 @@ export function changesShortcut(env: NodeJS.ProcessEnv = process.env): string | 
 	return value === "" || value.toLowerCase() === "off" ? undefined : value;
 }
 
+function positiveMs(value: string | undefined, fallback: number): number {
+	const parsed = Number.parseInt(value ?? "", 10);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 function changesPollMs(env: NodeJS.ProcessEnv): number {
-	const parsed = Number.parseInt(env.GENTLE_PI_SHELL_CHANGES_POLL_MS ?? "", 10);
-	return Number.isFinite(parsed) && parsed > 0 ? parsed : CHANGES_POLL_DEFAULT_MS;
+	return positiveMs(env.GENTLE_PI_SHELL_CHANGES_POLL_MS, CHANGES_POLL_DEFAULT_MS);
+}
+
+// Background watch: the widget and the bar follow edits made outside pi.
+// 0 or "off" disables it; tool events still refresh.
+function changesWatchMs(env: NodeJS.ProcessEnv): number | undefined {
+	const value = env.GENTLE_PI_SHELL_CHANGES_WATCH_MS?.trim().toLowerCase();
+	if (value === "0" || value === "off") return undefined;
+	return positiveMs(value, CHANGES_WATCH_DEFAULT_MS);
+}
+
+function changesFingerprint(model: ChangesModel): string {
+	return model.files.map((file) => `${file.path}:${file.status}:${file.added}:${file.deleted}`).join("|");
 }
 
 interface OverlayDeps {
 	git: GitRunner;
 	refresh(): Promise<ChangesModel>;
+	apply(ctx: ExtensionContext, model: ChangesModel): void;
 	pollMs: number;
 }
 
@@ -243,7 +261,7 @@ async function showChangesOverlay(ctx: ExtensionContext, model: ChangesModel, de
 	const poll = setInterval(async () => {
 		const latest = await deps.refresh();
 		view?.update(latest);
-		showChanges(ctx, latest);
+		deps.apply(ctx, latest);
 	}, deps.pollMs);
 	poll.unref();
 	try {
@@ -290,9 +308,21 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	if (!shellEnabled(env)) return;
 	let prompt: GentlePromptEditor | undefined;
 	let changes: ChangesTracker | undefined;
+	let watch: NodeJS.Timeout | undefined;
+	let shown = "";
+	const applyChanges = (ctx: ExtensionContext, model: ChangesModel) => {
+		const fingerprint = changesFingerprint(model);
+		if (fingerprint === shown) return;
+		shown = fingerprint;
+		showChanges(ctx, model);
+	};
 	const refreshChanges = async (ctx: ExtensionContext) => {
 		if (!changes || !ctx.hasUI) return;
-		showChanges(ctx, await changes.refresh());
+		applyChanges(ctx, await changes.refresh());
+	};
+	const stopWatch = () => {
+		if (watch) clearInterval(watch);
+		watch = undefined;
 	};
 	pi.on("session_start", async (_event, ctx) => {
 		if (!ctx.hasUI) return;
@@ -305,8 +335,16 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			prompt = created;
 		});
 		await tracker.start();
-		showChanges(ctx, tracker.model);
+		shown = "";
+		applyChanges(ctx, tracker.model);
+		stopWatch();
+		const watchMs = changesWatchMs(env);
+		if (watchMs) {
+			watch = setInterval(() => void refreshChanges(ctx), watchMs);
+			watch.unref();
+		}
 	});
+	pi.on("session_shutdown", () => stopWatch());
 	const openChanges = async (ctx: ExtensionContext) => {
 		if (!changes) return;
 		const tracker = changes;
@@ -315,7 +353,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			ctx.ui.notify("No changes in the working tree.", "info");
 			return;
 		}
-		await showChangesOverlay(ctx, model, { git: gitRunner(pi, ctx.cwd), refresh: () => tracker.refresh(), pollMs: changesPollMs(env) });
+		await showChangesOverlay(ctx, model, { git: gitRunner(pi, ctx.cwd), refresh: () => tracker.refresh(), apply: applyChanges, pollMs: changesPollMs(env) });
 	};
 	pi.registerCommand(CHANGES_COMMAND_NAME, {
 		description: "Show the working tree changes against HEAD, with diffs. Press o to open a file in $EDITOR.",

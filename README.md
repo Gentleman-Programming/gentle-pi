@@ -619,7 +619,7 @@ Working-tree changes show up below the editor as soon as a file differs from HEA
 ```
 
 - It is plain `git diff` against HEAD plus untracked files, so a resumed session shows the same picture as a fresh one.
-- Counts refresh after every tool call and at the end of each turn, through `git diff --numstat` and `git status --porcelain`. Outside a git repository the widget stays hidden.
+- Counts refresh after every tool call, at the end of each turn, and every 5 seconds in the background, so edits made from nvim or another agent show up without touching pi. `GENTLE_PI_SHELL_CHANGES_WATCH_MS` changes the interval; `off` leaves only the tool-driven refresh. Outside a git repository the widget stays hidden.
 - On narrow terminals the file list is dropped before the summary is truncated.
 
 `/gentle:changes` or `alt+g` opens the changes as an overlay: files on the left, the selected file's diff on the right.

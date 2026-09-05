@@ -22,6 +22,7 @@ interface FakeUi {
 	footerFactory: unknown;
 	editorFactory: unknown;
 	widgets: Map<string, unknown>;
+	widgetSets: number;
 	notices: string[];
 	overlay: unknown;
 	overlayView: { render(width: number): string[] } | undefined;
@@ -75,7 +76,7 @@ async function fire(handlers: Map<string, Array<(event: unknown, ctx: ExtensionC
 }
 
 function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: boolean; pending?: boolean; editorFactory?: unknown } = {}): { ctx: ExtensionContext; ui: FakeUi } {
-	const ui: FakeUi = { footerFactory: undefined, editorFactory: options.editorFactory, widgets: new Map(), notices: [], overlay: undefined, overlayView: undefined, closeOverlay: undefined };
+	const ui: FakeUi = { footerFactory: undefined, editorFactory: options.editorFactory, widgets: new Map(), widgetSets: 0, notices: [], overlay: undefined, overlayView: undefined, closeOverlay: undefined };
 	const ctx = {
 		hasUI: options.hasUI ?? true,
 		hasPendingMessages: () => options.pending ?? false,
@@ -100,6 +101,7 @@ function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: bo
 				return ui.editorFactory;
 			},
 			setWidget(key: string, content: unknown) {
+				ui.widgetSets += 1;
 				if (content === undefined) ui.widgets.delete(key);
 				else ui.widgets.set(key, content);
 			},
@@ -262,7 +264,7 @@ test("gentleShell shows working-tree changes in a widget below the editor and in
 		{ numstat: "", porcelain: "" },
 		{ numstat: "10\t0\tlib/b.ts\n", porcelain: "A  lib/b.ts\0" },
 	]);
-	gentleShell(pi, {});
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
 	const { ctx, ui } = fakeContext();
 	await fire(handlers, "session_start", ctx);
 	assert.deepEqual(git[0].slice(0, 2), ["-C", "/repo"]);
@@ -365,4 +367,28 @@ test("gentleShell keeps the open overlay in sync with git while it stays open", 
 	assert.match(renderFooter(ui), /main ±2/);
 	ui.closeOverlay?.();
 	await open;
+});
+
+test("gentleShell watches git in the background so the widget and bar follow external edits", async () => {
+	const { pi, handlers, git } = fakePi([
+		{ numstat: "", porcelain: "" },
+		{ numstat: "", porcelain: "" },
+		{ numstat: "3\t1\tlib/c.ts\n", porcelain: " M lib/c.ts\0" },
+	]);
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "5" });
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	assert.equal(ui.widgets.has("gentle-shell-changes"), false);
+	await new Promise((resolve) => setTimeout(resolve, 40));
+	assert.equal(ui.widgets.has("gentle-shell-changes"), true);
+	assert.match(renderFooter(ui), /main ±1/);
+	assert.ok(git.length >= 6, "background watch should keep polling git");
+
+	const widgetSetsBefore = ui.widgetSets;
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(ui.widgetSets, widgetSetsBefore, "unchanged tree must not rewrite the widget");
+	await fire(handlers, "session_shutdown", ctx);
+	const gitCallsAfterShutdown = git.length;
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(git.length, gitCallsAfterShutdown, "shutdown must stop the watch");
 });
