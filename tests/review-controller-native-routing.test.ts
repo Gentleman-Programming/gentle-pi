@@ -722,7 +722,7 @@ test("ordinary START binds the native workspace candidate and returns the native
 	assert.equal(startCalls, 1);
 });
 
-test("pre-lineage intended-untracked selection revalidates and starts at an explicit workspace root", async (t) => {
+for (const statusSchema of ["gentle-ai.review-integration.status/v6", "gentle-ai.review-integration.status/v7"]) test(`pre-lineage intended-untracked selection revalidates and starts at an explicit workspace root (${statusSchema})`, async (t) => {
 	const cwd = realpathSync(repository(t)), sessionCwd = repository(t), eligible = "selected.md";
 	writeFileSync(join(cwd, eligible), "selected\n");
 	const initialTarget = startStatus(cwd), target = startStatus(cwd, undefined, [eligible]);
@@ -735,7 +735,7 @@ test("pre-lineage intended-untracked selection revalidates and starts at an expl
 		],
 		submission: { operationToken: "status", argumentTokens: ["--contract=gentle-ai.review-integration/v2", "--next-transition=true", "--agent=pi", "--projection=workspace", "--intended-untracked-selection={{value}}"], values: [{ slot: "intended_untracked_selection", domain: "schema_bound_json", schema: "gentle-ai.review-intended-untracked-selection/v1", substitutionLocation: 4 }] },
 	};
-	const initial = { ...initialTarget, nextTransition: { kind: "collect", reasonCode: "intended_untracked_selection_required", collect: { inputs: [selection] } }, raw: { schema: "gentle-ai.review-integration.status/v6" } } as ReviewStatusV3;
+	const initial = { ...initialTarget, nextTransition: { kind: "collect", reasonCode: "intended_untracked_selection_required", collect: { inputs: [selection] } }, raw: { schema: statusSchema } } as ReviewStatusV3;
 	const requests: Array<Record<string, unknown>> = [], starts: Array<Record<string, unknown>> = [], retained = new Map();
 	const native = {
 		reviewMode: async () => ({ operation: "status", scope: "clone", status: { global: "on", cloneLocal: "on", effective: "on", source: "clone_local" } }),
