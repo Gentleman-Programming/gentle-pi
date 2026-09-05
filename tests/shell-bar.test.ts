@@ -135,6 +135,23 @@ test("renderShellBar appends extension statuses as trailing segments", () => {
 	assert.match(line, /⟡ 🔌 MCP: 3 servers enabled$/);
 });
 
+test("renderShellBar repaints extension statuses in the bar role, discarding colors the extension embedded", () => {
+	const tagged = { fg: (color: string, text: string) => `<${color}>${text}</${color}>`, bold: (text: string) => text };
+	const [line] = renderShellBar(model({ statuses: ["\x1b[38;2;255;0;0mMCP: 3/3 servers\x1b[0m"] }), tagged, 400);
+	assert.match(line, /<muted>MCP: 3\/3 servers<\/muted>$/);
+	assert.doesNotMatch(line, /\x1b\[/);
+});
+
+test("renderShellBar compacts the path and branch before it sacrifices an extension status", () => {
+	const long = model({ branch: "fix/shell-bar-status-ansi", dirty: 2, statuses: ["MCP: 3/3 servers"] });
+	const [full] = renderShellBar(long, plainTheme, 160);
+	assert.match(full, /~\/work\/gentle-pi fix\/shell-bar-status-ansi ±2 .* MCP: 3\/3 servers$/);
+	const [compact] = renderShellBar(long, plainTheme, 118);
+	assert.ok(visibleWidth(compact) <= 118, `line overflowed: ${visibleWidth(compact)}`);
+	assert.match(compact, /⟡ gentle-pi fix\/shell-bar-… ±2 ⟡/);
+	assert.match(compact, /MCP: 3\/3 servers$/);
+});
+
 test("renderShellBar drops the session name, then trailing segments, before truncating", () => {
 	const wide = model({ sessionName: "Release notes", statuses: ["MCP: 3 servers enabled"] });
 	const [atNinety] = renderShellBar(wide, plainTheme, 90);
@@ -145,6 +162,10 @@ test("renderShellBar drops the session name, then trailing segments, before trun
 	const [atFifty] = renderShellBar(wide, plainTheme, 50);
 	assert.ok(visibleWidth(atFifty) <= 50, `line overflowed: ${visibleWidth(atFifty)}`);
 	assert.match(atFifty, /^✿ gentle-pi/);
+});
+
+test("shellEnabled stays off inside a Gentle Agents child", () => {
+	assert.equal(shellEnabled({ GENTLE_PI_AGENTS_CHILD: "1" }), false);
 });
 
 test("shellEnabled honors GENTLE_PI_SHELL=0", () => {

@@ -42,7 +42,7 @@ const EMPTY_DIFF = "no diff for this file";
 const CLEAN_TREE = "working tree is clean";
 const KEYS = [
 	["j/k", "file"],
-	["pgup/pgdn", "scroll"],
+	["ctrl+j/k", "scroll"],
 	["o", "open in editor"],
 	["esc", "close"],
 ] as const;
@@ -115,15 +115,16 @@ export class ChangesView {
 			this.deps.onClose();
 			return;
 		}
-		if (data === "o" || matchesKey(data, Key.enter)) {
-			const file = this.model.files[this.selected];
-			if (file) this.deps.onOpen(file);
-			return;
-		}
+		// ctrl+j arrives as a bare line feed, which pi also reads as enter, so
+		// the scroll keys are checked before the open key; a real Enter is CR.
 		if (data === "j" || matchesKey(data, Key.down)) this.select(this.selected + 1);
 		else if (data === "k" || matchesKey(data, Key.up)) this.select(this.selected - 1);
-		else if (matchesKey(data, Key.pageDown)) this.scrollBy(this.bodyRows());
-		else if (matchesKey(data, Key.pageUp)) this.scrollBy(-this.bodyRows());
+		else if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.ctrl("j"))) this.scrollBy(this.bodyRows());
+		else if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.ctrl("k"))) this.scrollBy(-this.bodyRows());
+		else if (data === "o" || matchesKey(data, Key.enter)) {
+			const file = this.model.files[this.selected];
+			if (file) this.deps.onOpen(file);
+		}
 	}
 
 	render(width: number): string[] {

@@ -86,6 +86,8 @@ const STATUS_ROLE: Record<TodoStatus, string> = { [TODO_STATUS.PENDING]: "text",
 const GLYPH_ROLE: Record<TodoStatus, string> = { [TODO_STATUS.PENDING]: "muted", [TODO_STATUS.IN_PROGRESS]: "accent", [TODO_STATUS.DONE]: "success" };
 const NOTE_ROLE = "muted";
 const STALE_AFTER_TURNS = 2;
+/** Above this many rows the finished tasks fold into one line and the rest is capped. */
+const ROW_CAP = 12;
 
 export function emptyTodo(): TodoState {
 	return { tasks: [], nextId: 1, updatedTurn: null };
@@ -242,6 +244,20 @@ function taskRow(task: TodoTask, theme: TodoTheme): string {
 	return `${theme.fg(GLYPH_ROLE[task.status], STATUS_GLYPH[task.status])} ${theme.fg(STATUS_ROLE[task.status], title)}${note}`;
 }
 
+// Long lists keep the card short: done tasks fold into "✓ N done" and the
+// open ones fill the remaining rows, with a trailing count for the rest.
+function bodyRows(state: TodoState, theme: TodoTheme): string[] {
+	if (state.tasks.length <= ROW_CAP) return state.tasks.map((task) => taskRow(task, theme));
+	const { done } = todoSummary(state);
+	const open = state.tasks.filter((task) => task.status !== TODO_STATUS.DONE);
+	const rows: string[] = [];
+	if (done > 0) rows.push(`${theme.fg(GLYPH_ROLE[TODO_STATUS.DONE], STATUS_GLYPH[TODO_STATUS.DONE])} ${theme.fg(NOTE_ROLE, `${done} done`)}`);
+	const room = ROW_CAP - rows.length - (open.length > ROW_CAP - rows.length ? 1 : 0);
+	for (const task of open.slice(0, room)) rows.push(taskRow(task, theme));
+	if (open.length > room) rows.push(theme.fg(NOTE_ROLE, `… ${open.length - room} more`));
+	return rows;
+}
+
 function collapsedRow(state: TodoState, theme: TodoTheme): string {
 	const active = state.tasks.find((task) => task.status === TODO_STATUS.IN_PROGRESS);
 	if (active) return taskRow(active, theme);
@@ -254,7 +270,7 @@ export function renderTodoCard(state: TodoState, theme: TodoTheme, width: number
 	const { done, total } = todoSummary(state);
 	const stale = options.staleTurns >= STALE_AFTER_TURNS;
 	const hint = stale ? `stale · ${options.staleTurns} turns` : options.collapsed && options.collapseKey ? `${options.collapseKey} expand` : undefined;
-	const body = options.collapsed ? [collapsedRow(state, theme)] : state.tasks.map((task) => taskRow(task, theme));
+	const body = options.collapsed ? [collapsedRow(state, theme)] : bodyRows(state, theme);
 	return renderCard(
 		{ title: "Todos", subtitle: `${done} of ${total}`, body, tone: stale ? CARD_TONE.WARNING : CARD_TONE.INFO, glyph: TODO_GLYPH },
 		theme,

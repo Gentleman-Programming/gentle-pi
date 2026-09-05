@@ -1,6 +1,7 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { GAUGE_CELLS, gaugeTone, paintGauge, renderGauge, type GaugeTone } from "./shell-gauge.ts";
 import { renderUsageBar, type ProviderUsage } from "./shell-usage.ts";
+import { sanitizeTerminalText } from "./terminal-theme.ts";
 
 export { gaugeTone, renderGauge, type GaugeTone };
 
@@ -48,8 +49,10 @@ export const SHELL_BAR_BRAND = "✿ gentle-pi";
 export const SHELL_BAR_SEPARATOR = "⟡";
 export const SHELL_BAR_GAUGE_CELLS = GAUGE_CELLS;
 const RIGHT_PADDING = 2;
+const COMPACT_BRANCH_WIDTH = 15;
 
 export function shellEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+	if (env.GENTLE_PI_AGENTS_CHILD === "1") return false;
 	const value = env.GENTLE_PI_SHELL?.trim().toLowerCase();
 	return !(value === "0" || value === "false" || value === "off");
 }
@@ -67,8 +70,10 @@ export function formatCost(total: number, subscription: boolean): string {
 	return subscription ? `$${amount} sub` : `$${amount}`;
 }
 
+// Extensions may paint their status themselves (pi-mcp-adapter does); the bar
+// owns the palette, so their escapes go and the text takes the status role.
 function sanitizeStatus(text: string): string {
-	return text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
+	return sanitizeTerminalText(text.replace(/[\r\n\t]/g, " ")).replace(/ +/g, " ").trim();
 }
 
 function buildSegments(model: ShellBarModel, theme: ShellBarTheme): string[] {
@@ -87,12 +92,32 @@ function buildSegments(model: ShellBarModel, theme: ShellBarTheme): string[] {
 	return [theme.fg(ROLE.BRAND, SHELL_BAR_BRAND), location, modelSegment, context, cost, ...(usage ? [usage] : []), ...statuses];
 }
 
+// When the line overflows, the location gives way first: the path shrinks to
+// its last segment and a long branch is clipped, so the trailing statuses
+// (MCP servers, extension notices) survive on ordinary terminal widths.
+function compactModel(model: ShellBarModel): ShellBarModel {
+	const cwd = model.cwd.split("/").filter((part) => part.length > 0).pop() ?? model.cwd;
+	const branch = model.branch && visibleWidth(model.branch) > COMPACT_BRANCH_WIDTH ? clipText(model.branch, COMPACT_BRANCH_WIDTH) : model.branch;
+	return { ...model, cwd, branch };
+}
+
+// Plain clip: pi's truncateToWidth wraps the result in resets, which would end
+// up inside a painted segment.
+function clipText(text: string, max: number): string {
+	let clipped = "";
+	for (const char of text) {
+		if (visibleWidth(clipped + char) > max - 1) break;
+		clipped += char;
+	}
+	return `${clipped}…`;
+}
+
 function joinSegments(segments: string[], theme: ShellBarTheme): string {
 	return segments.join(` ${theme.fg(ROLE.SEPARATOR, SHELL_BAR_SEPARATOR)} `);
 }
 
 export function renderShellBar(model: ShellBarModel, theme: ShellBarTheme, width: number): string[] {
-	const segments = buildSegments(model, theme);
+	let segments = buildSegments(model, theme);
 	const right = model.sessionName ? theme.fg(ROLE.SESSION, model.sessionName) : undefined;
 
 	let left = joinSegments(segments, theme);
@@ -101,6 +126,10 @@ export function renderShellBar(model: ShellBarModel, theme: ShellBarTheme, width
 		return [left + padding + right];
 	}
 
+	if (visibleWidth(left) > width) {
+		segments = buildSegments(compactModel(model), theme);
+		left = joinSegments(segments, theme);
+	}
 	while (segments.length > 1 && visibleWidth(left) > width) {
 		segments.pop();
 		left = joinSegments(segments, theme);

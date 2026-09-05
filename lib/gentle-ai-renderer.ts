@@ -62,22 +62,28 @@ export function getGentleAiRenderState(state: unknown): GentleAiRenderState | un
 // The call row: the top rule, with the expand key at its right end once the
 // tool finished, and the command when expanded. pi renders the result
 // component right below it, and that one closes the frame.
+// The call card owns the top rule. While the execution is still running it
+// also closes the frame, because no result row exists yet; once a final
+// result is in, the result card closes it instead.
 export class GentleAiCallCard {
 	private card: Card = { title: CARD_TITLE, body: [], tone: CARD_TONE.WARNING };
 	private theme: CardTheme = passthroughTheme;
 	private detail: string | undefined;
 	private hint: string | undefined;
+	private open = true;
 
 	update(status: LifecycleStatus, operationPath: string, theme: CardTheme, detail?: string, hint?: string): void {
 		this.card = { title: CARD_TITLE, subtitle: `${status} · ${operationPath}`, body: [], tone: STATUS_TONE[status], glyph: CARD_GLYPH };
 		this.theme = theme;
 		this.detail = detail;
 		this.hint = hint;
+		this.open = status === LIFECYCLE_STATUS.RUNNING || status === LIFECYCLE_STATUS.PREPARING;
 	}
 
 	render(width: number): string[] {
 		const lines = [cardTop(this.card, this.theme, width, this.hint)];
 		if (this.detail) lines.push(cardLine(this.theme.fg(DETAIL_ROLE, this.detail), this.card.tone, this.theme, width));
+		if (this.open) lines.push(cardBottom(this.card.tone, this.theme, width));
 		return lines;
 	}
 
@@ -93,12 +99,14 @@ export class GentleAiResultCard {
 	private readonly expanded: boolean;
 	private readonly tone: CardTone;
 	private readonly theme: CardTheme;
+	private readonly partial: boolean;
 
-	constructor(text: string, expanded: boolean, tone: CardTone, theme: CardTheme) {
+	constructor(text: string, expanded: boolean, tone: CardTone, theme: CardTheme, partial = false) {
 		this.text = text;
 		this.expanded = expanded;
 		this.tone = tone;
 		this.theme = theme;
+		this.partial = partial;
 	}
 
 	render(width: number): string[] {
@@ -114,7 +122,8 @@ export class GentleAiResultCard {
 				lines.push(cardLine(this.theme.fg(HIDDEN_ROLE, `${count} ${count === 1 ? "line" : "lines"}`), this.tone, this.theme, width));
 			}
 		}
-		lines.push(cardBottom(this.tone, this.theme, width));
+		// A partial result sits under a running call card, which still closes the frame.
+		if (!this.partial) lines.push(cardBottom(this.tone, this.theme, width));
 		return lines;
 	}
 
@@ -141,9 +150,12 @@ export function renderGentleAiResult(
 		const changed = state.finished !== true || state.failed !== (options.isError === true);
 		state.finished = true;
 		state.failed = options.isError === true;
-		if (changed) context?.invalidate?.();
+		// pi's invalidate re-runs the tool display synchronously; called from
+		// inside this render it would nest a second call+result pair into the
+		// same container. Deferring it keeps one frame per execution.
+		if (changed) queueMicrotask(() => context?.invalidate?.());
 	}
-	return new GentleAiResultCard(text, options.expanded === true, tone, theme);
+	return new GentleAiResultCard(text, options.expanded === true, tone, theme, options.isPartial === true);
 }
 
 export function renderGentleAiLifecycleCall(

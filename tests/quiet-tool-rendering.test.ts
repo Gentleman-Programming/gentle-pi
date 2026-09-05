@@ -1276,7 +1276,9 @@ test("quiet tool rendering respects command and env wrapper order", () => {
 	assertGenericBash(bash, command);
 });
 
-test("quiet tool rendering lets a final result promote a replayed call card to its outcome", () => {
+test("quiet tool rendering lets a final result promote a replayed call card to its outcome", async () => {
+	// The promotion invalidates after the render returns (a microtask), never inside it.
+	const flush = () => new Promise((resolve) => queueMicrotask(() => resolve(undefined)));
 	const { pi, tools } = createPi();
 	withEnv({ GENTLE_PI_QUIET_TOOLS: undefined }, () => quietTools(pi as any));
 	const tool = tools.get("bash");
@@ -1288,6 +1290,8 @@ test("quiet tool rendering lets a final result promote a replayed call card to i
 	const call = tool.renderCall({ command }, statusTheme, replayed);
 	assert.equal(cardTitle(renderToString(call)), "🌹︎ Gentle AI · preparing · review status");
 	renderToString(tool.renderResult(textResult("done"), { expanded: false, isPartial: false }, statusTheme, replayed));
+	assert.equal(invalidations, 0, "never reentrant");
+	await flush();
 	assert.equal(invalidations, 1);
 	const promoted = tool.renderCall({ command }, statusTheme, { ...replayed, lastComponent: call });
 	assert.strictEqual(promoted, call);
@@ -1295,9 +1299,11 @@ test("quiet tool rendering lets a final result promote a replayed call card to i
 	assert.equal(cardTone(renderToString(promoted)), "success");
 
 	renderToString(tool.renderResult(textResult("boom"), { expanded: false, isPartial: false }, statusTheme, { ...replayed, isError: true }));
+	await flush();
 	assert.equal(invalidations, 2);
 	assert.equal(cardTitle(renderToString(tool.renderCall({ command }, statusTheme, { ...replayed, lastComponent: call }))), "🌹︎ Gentle AI · failed · review status");
 	renderToString(tool.renderResult(textResult("boom"), { expanded: false, isPartial: false }, statusTheme, { ...replayed, isError: true }));
+	await flush();
 	assert.equal(invalidations, 2, "an unchanged outcome must not request another render");
 });
 
