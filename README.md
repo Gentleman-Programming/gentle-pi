@@ -622,6 +622,12 @@ Session changes show up below the editor as soon as the agent touches a file, an
 - Counts refresh after every tool call and at the end of each turn, through `git diff --numstat` and `git status --porcelain`. Outside a git repository the widget stays hidden.
 - On narrow terminals the file list is dropped before the summary is truncated.
 
+`/gentle:changes` opens the session changes as an overlay: files on the left, the selected file's diff on the right.
+
+- `j`/`k` or the arrows move between files, `pgup`/`pgdn` scroll the diff, `esc` or `q` closes.
+- `o` (or `enter`) opens the selected file in `$VISUAL` or `$EDITOR` and returns to pi when the editor exits, so a jump into nvim and back never leaves the session.
+- Untracked files are diffed against an empty file so new files show their full content.
+
 Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer and editor.
 
 ## Commands

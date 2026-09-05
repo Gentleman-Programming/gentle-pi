@@ -1,13 +1,15 @@
 import { CustomEditor, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
+import { spawnSync } from "node:child_process";
 import * as os from "node:os";
 import { renderShellBar, shellEnabled, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
-import { ChangesTracker, renderChangesWidget, type ChangesModel } from "../lib/shell-changes.ts";
+import { CHANGE_STATUS, ChangesTracker, renderChangesWidget, type ChangedFile, type ChangesModel, type GitRunner } from "../lib/shell-changes.ts";
+import { ChangesView } from "../lib/shell-changes-view.ts";
 import { framePromptLines, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
 
 // Gentle Shell: the visual layer gentle-pi puts on top of pi. It installs the
-// status bar, the petal prompt, and the session changes widget; later slices
-// add the changes overlay, subscription usage, and cards.
+// status bar, the petal prompt, the session changes widget and overlay;
+// later slices add subscription usage and cards.
 
 export interface ShellFooterData {
 	getGitBranch(): string | null;
@@ -166,13 +168,62 @@ function installPrompt(ctx: ExtensionContext, onCreated: (prompt: GentlePromptEd
 }
 
 const CHANGES_WIDGET_KEY = "gentle-shell-changes";
+const CHANGES_COMMAND_NAME = "gentle:changes";
 const GIT_TIMEOUT_MS = 5000;
+const OVERLAY_HEIGHT_RATIO = 0.8;
+const OVERLAY_MIN_ROWS = 8;
 
-function gitRunner(pi: ExtensionAPI, cwd: string) {
+function gitRunner(pi: ExtensionAPI, cwd: string): GitRunner {
 	return async (args: string[]) => {
 		const result = await pi.exec("git", ["-C", cwd, ...args], { timeout: GIT_TIMEOUT_MS });
 		return { stdout: result.stdout, code: result.code };
 	};
+}
+
+export async function loadFileDiff(git: GitRunner, file: ChangedFile): Promise<string> {
+	const args = file.status === CHANGE_STATUS.UNTRACKED ? ["diff", "--no-index", "--", "/dev/null", file.path] : ["diff", "HEAD", "--", file.path];
+	const result = await git(args);
+	return result.code === 0 || result.code === 1 ? result.stdout : "";
+}
+
+export interface ExternalEditorHost {
+	stop(): void;
+	start(): void;
+	requestRender(force?: boolean): void;
+}
+
+export function openInExternalEditor(host: ExternalEditorHost, path: string, env: NodeJS.ProcessEnv = process.env, spawn: typeof spawnSync = spawnSync): boolean {
+	const command = env.VISUAL || env.EDITOR;
+	if (!command) return false;
+	const [editor, ...editorArgs] = command.split(" ");
+	host.stop();
+	try {
+		spawn(editor, [...editorArgs, path], { stdio: "inherit", shell: process.platform === "win32" });
+	} finally {
+		host.start();
+		host.requestRender(true);
+	}
+	return true;
+}
+
+async function showChangesOverlay(ctx: ExtensionContext, model: ChangesModel, git: GitRunner): Promise<void> {
+	let host: ExternalEditorHost | undefined;
+	const chosen = await ctx.ui.custom<ChangedFile | null>(
+		(tui, theme, _keybindings, done) => {
+			host = tui;
+			return new ChangesView(model, {
+				theme,
+				rows: Math.max(OVERLAY_MIN_ROWS, Math.floor(tui.terminal.rows * OVERLAY_HEIGHT_RATIO)),
+				loadDiff: (file) => loadFileDiff(git, file),
+				onOpen: (file) => done(file),
+				onClose: () => done(null),
+				requestRender: () => tui.requestRender(),
+			});
+		},
+		{ overlay: true, overlayOptions: { width: "92%", anchor: "center" } },
+	);
+	if (!chosen || !host) return;
+	if (!openInExternalEditor(host, chosen.path)) ctx.ui.notify("No editor configured. Set $VISUAL or $EDITOR.", "warning");
 }
 
 function showChanges(ctx: ExtensionContext, model: ChangesModel): void {
@@ -212,6 +263,18 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		});
 		await tracker.start();
 		showChanges(ctx, tracker.model);
+	});
+	pi.registerCommand(CHANGES_COMMAND_NAME, {
+		description: "Show the files this session changed, with diffs. Press o to open one in $EDITOR.",
+		handler: async (_args, ctx) => {
+			if (!changes) return;
+			const model = await changes.refresh();
+			if (model.files.length === 0) {
+				ctx.ui.notify("No session changes yet.", "info");
+				return;
+			}
+			await showChangesOverlay(ctx, model, gitRunner(pi, ctx.cwd));
+		},
 	});
 	pi.on("agent_start", () => prompt?.setWorking(true));
 	pi.on("agent_end", async (_event, ctx) => {
