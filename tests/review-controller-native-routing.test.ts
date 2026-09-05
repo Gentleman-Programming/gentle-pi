@@ -1220,6 +1220,119 @@ test("ordinary START refuses a target projection that no longer matches the froz
 	assert.equal(startCalls, 0);
 });
 
+// gentle-pi#455: a consent binding one active Pi session's START created must
+// be answerable from another active session presenting the same opaque
+// binding id -- consent bindings are not partitioned by which session's
+// START created them, only by the repository and candidate they are scoped to.
+test("answer-consent resolves a valid binding presented by a different active Pi session", async (t) => {
+	const cwd = repository(t);
+	const consent = decodeReviewConsentV3(JSON.parse(readFileSync(join(process.cwd(), "tests", "fixtures", "devbinary", "consent-v3.captured.json"), "utf8")));
+	const registry = new PendingReviewConsentRegistry();
+	const sessionA = Symbol("session-a"), sessionB = Symbol("session-b");
+	let answerCalls = 0;
+	const native = {
+		targetStatus: async () => startStatus(cwd),
+		start: async () => { throw new NativeReviewConsentRequiredError(consent); },
+		answerConsent: async () => {
+			answerCalls += 1;
+			return { kind: "granted", start: { lineageId: "cross-session", state: "reviewing", riskLevel: "low", selectedLenses: [], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: false, riskReasons: [] } };
+		},
+	} as unknown as NativeReviewCli;
+	const started = await __testing.executeReviewControllerOperation({ operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, cwd, native, undefined, undefined, undefined, undefined, registry, sessionA);
+	assert.equal(typeof started.consent_binding, "string", JSON.stringify(started));
+	const answered = await __testing.executeReviewControllerOperation({ operation: "answer-consent", input: JSON.stringify({ consentBinding: started.consent_binding, answer: "granted" }) }, cwd, native, undefined, undefined, undefined, undefined, registry, sessionB);
+	assert.equal(answerCalls, 1, JSON.stringify(answered));
+	assert.equal((answered.result as { lineage_id?: string } | undefined)?.lineage_id, "cross-session", JSON.stringify(answered));
+	assert.notEqual(answered.status, "blocked", JSON.stringify(answered));
+});
+
+// gentle-pi#455: cross-session resolution must still enforce single use --
+// once a binding is answered by any session, no session (including the one
+// whose START created it) may answer it again.
+test("a consumed consent binding cannot be answered a second time from any session", async (t) => {
+	const cwd = repository(t);
+	const consent = decodeReviewConsentV3(JSON.parse(readFileSync(join(process.cwd(), "tests", "fixtures", "devbinary", "consent-v3.captured.json"), "utf8")));
+	const registry = new PendingReviewConsentRegistry();
+	const sessionA = Symbol("session-a"), sessionB = Symbol("session-b");
+	let answerCalls = 0;
+	const native = {
+		targetStatus: async () => startStatus(cwd),
+		start: async () => { throw new NativeReviewConsentRequiredError(consent); },
+		answerConsent: async () => {
+			answerCalls += 1;
+			return { kind: "granted", start: { lineageId: "single-use", state: "reviewing", riskLevel: "low", selectedLenses: [], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: false, riskReasons: [] } };
+		},
+	} as unknown as NativeReviewCli;
+	const started = await __testing.executeReviewControllerOperation({ operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, cwd, native, undefined, undefined, undefined, undefined, registry, sessionA);
+	const binding = started.consent_binding as string;
+	const first = await __testing.executeReviewControllerOperation({ operation: "answer-consent", input: JSON.stringify({ consentBinding: binding, answer: "granted" }) }, cwd, native, undefined, undefined, undefined, undefined, registry, sessionB);
+	assert.equal(answerCalls, 1, JSON.stringify(first));
+	const replay = await __testing.executeReviewControllerOperation({ operation: "answer-consent", input: JSON.stringify({ consentBinding: binding, answer: "granted" }) }, cwd, native, undefined, undefined, undefined, undefined, registry, sessionA);
+	assert.equal(answerCalls, 1, JSON.stringify(replay));
+	assert.equal(replay.status, "blocked", JSON.stringify(replay));
+	assert.equal(replay.outcome, "consent-binding-stale", JSON.stringify(replay));
+	assert.equal((replay.diagnostics as { code?: string } | undefined)?.code, "consent-binding-already-consumed", JSON.stringify(replay));
+});
+
+// gentle-pi#455 correction: cross-session resolution looks a binding up by
+// its opaque id alone, so it must independently refuse an answer presented
+// from a different repository than the one its owning START minted it for,
+// without ever running the mode gate or native answerConsent, and without
+// consuming the binding -- leaving it answerable from the right repository.
+test("answer-consent refuses a binding presented from a different repository than the one its START minted, and leaves it answerable from the right one", async (t) => {
+	const cwdA = repository(t), cwdB = repository(t);
+	const consent = decodeReviewConsentV3(JSON.parse(readFileSync(join(process.cwd(), "tests", "fixtures", "devbinary", "consent-v3.captured.json"), "utf8")));
+	const registry = new PendingReviewConsentRegistry();
+	const sessionA = Symbol("session-a"), sessionB = Symbol("session-b");
+	let answerCalls = 0;
+	const native = {
+		targetStatus: async () => startStatus(cwdA),
+		start: async () => { throw new NativeReviewConsentRequiredError(consent); },
+		answerConsent: async () => {
+			answerCalls += 1;
+			return { kind: "granted", start: { lineageId: "right-repo", state: "reviewing", riskLevel: "low", selectedLenses: [], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: false, riskReasons: [] } };
+		},
+	} as unknown as NativeReviewCli;
+	const started = await __testing.executeReviewControllerOperation({ operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, cwdA, native, undefined, undefined, undefined, undefined, registry, sessionA);
+	const binding = started.consent_binding as string;
+	const wrongRepo = await __testing.executeReviewControllerOperation({ operation: "answer-consent", input: JSON.stringify({ consentBinding: binding, answer: "granted" }) }, cwdB, native, undefined, undefined, undefined, undefined, registry, sessionB);
+	assert.equal(answerCalls, 0, JSON.stringify(wrongRepo));
+	assert.equal(wrongRepo.status, "blocked", JSON.stringify(wrongRepo));
+	assert.equal(wrongRepo.outcome, "consent-binding-repository-mismatch", JSON.stringify(wrongRepo));
+	assert.equal((wrongRepo.diagnostics as { code?: string } | undefined)?.code, "consent-binding-repository-mismatch", JSON.stringify(wrongRepo));
+	assert.equal(wrongRepo.mutation_performed, false, JSON.stringify(wrongRepo));
+	const rightRepo = await __testing.executeReviewControllerOperation({ operation: "answer-consent", input: JSON.stringify({ consentBinding: binding, answer: "granted" }) }, cwdA, native, undefined, undefined, undefined, undefined, registry, sessionA);
+	assert.equal(answerCalls, 1, JSON.stringify(rightRepo));
+	assert.equal((rightRepo.result as { lineage_id?: string } | undefined)?.lineage_id, "right-repo", JSON.stringify(rightRepo));
+});
+
+// gentle-pi#323: within the live consent TTL window, a content-independent
+// replay key let a second ordinary START reuse the first START's still-live
+// (never lineage-bound) frozen candidate view even though the live candidate
+// content changed underneath it, and then dead-ended at
+// candidate-target-projection-drift instead of minting a fresh view and a
+// fresh consent envelope. An intended-untracked selection is retained across
+// both calls so the pre-existing empty-untracked drift-recovery branch does
+// not mask the general content-change gap this covers.
+test("ordinary START mints a fresh candidate view when candidate content changes within the live consent TTL window", async (t) => {
+	const candidateViews = new CandidateViewRegistry();
+	t.after(() => candidateViews.cleanupAll());
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "extra.md"), "kept\n");
+	const consent = decodeReviewConsentV3(JSON.parse(readFileSync(join(process.cwd(), "tests", "fixtures", "devbinary", "consent-v3.captured.json"), "utf8")));
+	const native = {
+		targetStatus: async () => startStatus(cwd, undefined, ["extra.md"]),
+		start: async () => { throw new NativeReviewConsentRequiredError(consent); },
+	} as unknown as NativeReviewCli;
+	const first = await __testing.executeReviewControllerOperation({ operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, cwd, native, undefined, candidateViews);
+	assert.equal(first.outcome, "native-review-consent-required", JSON.stringify(first));
+	writeFileSync(join(cwd, "tracked.txt"), "candidate two\n");
+	const second = await __testing.executeReviewControllerOperation({ operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, cwd, native, undefined, candidateViews);
+	assert.notEqual(second.outcome, "native-operation-failed", JSON.stringify(second));
+	assert.equal(second.outcome, "native-review-consent-required", JSON.stringify(second));
+	assert.notEqual(second.consent_binding, first.consent_binding, JSON.stringify(second));
+});
+
 test("controller-owned dispatch confines single and parallel graph actors to the current candidate view", async (t) => {
 	const cwd = repository(t);
 	const candidateViews = new CandidateViewRegistry();

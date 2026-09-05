@@ -3657,7 +3657,13 @@ const PENDING_REVIEW_CONSENT_STALE_DISPOSITION_LIMIT = 32;
  */
 export class PendingReviewConsentRegistry {
 	private readonly sessions = new Map<PendingReviewConsentSessionKey, Map<string, PendingReviewConsent>>();
-	private readonly staleDispositions = new Map<PendingReviewConsentSessionKey, Map<string, PendingReviewConsentDisposition>>();
+	// gentle-pi#455: a binding id is globally unique (randomUUID), so its live
+	// owner and its stale disposition are tracked by binding id alone. This
+	// index lets answer-consent resolve and atomically take exactly once a
+	// binding another active Pi session's START created; the per-session map
+	// above stays authoritative for session-scoped listings and shutdown cleanup.
+	private readonly byBinding = new Map<string, PendingReviewConsentSessionKey>();
+	private readonly staleDispositions = new Map<string, PendingReviewConsentDisposition>();
 
 	get(sessionKey: PendingReviewConsentSessionKey): Map<string, PendingReviewConsent> | undefined {
 		return this.sessions.get(sessionKey);
@@ -3672,34 +3678,46 @@ export class PendingReviewConsentRegistry {
 		return pending;
 	}
 
+	// Registers a freshly created pending binding under its owning session and
+	// the cross-session binding index in one step so the two never drift.
+	add(sessionKey: PendingReviewConsentSessionKey, pending: PendingReviewConsent): void {
+		this.ensure(sessionKey).set(pending.id, pending);
+		this.byBinding.set(pending.id, sessionKey);
+	}
+
+	// Resolves a live binding to its owning session regardless of which
+	// session asks, so answer-consent can reach a binding another session's
+	// START created (gentle-pi#455).
+	resolve(bindingId: string): { sessionKey: PendingReviewConsentSessionKey; pending: PendingReviewConsent } | undefined {
+		const sessionKey = this.byBinding.get(bindingId);
+		const pending = sessionKey === undefined ? undefined : this.sessions.get(sessionKey)?.get(bindingId);
+		return pending === undefined ? undefined : { sessionKey, pending };
+	}
+
 	private remove(sessionKey: PendingReviewConsentSessionKey, pending: PendingReviewConsent): boolean {
 		const session = this.sessions.get(sessionKey);
 		if (session?.get(pending.id) !== pending) return false;
 		session.delete(pending.id);
 		if (session.size === 0) this.sessions.delete(sessionKey);
+		if (this.byBinding.get(pending.id) === sessionKey) this.byBinding.delete(pending.id);
 		return true;
 	}
 
-	private rememberDisposition(sessionKey: PendingReviewConsentSessionKey, pending: PendingReviewConsent, disposition: PendingReviewConsentDisposition): void {
-		let stale = this.staleDispositions.get(sessionKey);
-		if (stale === undefined) {
-			stale = new Map<string, PendingReviewConsentDisposition>();
-			this.staleDispositions.set(sessionKey, stale);
-		}
-		stale.delete(pending.id);
-		stale.set(pending.id, disposition);
-		while (stale.size > PENDING_REVIEW_CONSENT_STALE_DISPOSITION_LIMIT) stale.delete(stale.keys().next().value!);
+	private rememberDisposition(pending: PendingReviewConsent, disposition: PendingReviewConsentDisposition): void {
+		this.staleDispositions.delete(pending.id);
+		this.staleDispositions.set(pending.id, disposition);
+		while (this.staleDispositions.size > PENDING_REVIEW_CONSENT_STALE_DISPOSITION_LIMIT) this.staleDispositions.delete(this.staleDispositions.keys().next().value!);
 	}
 
 	consume(sessionKey: PendingReviewConsentSessionKey, pending: PendingReviewConsent): boolean {
 		if (!this.remove(sessionKey, pending)) return false;
-		this.rememberDisposition(sessionKey, pending, PENDING_REVIEW_CONSENT_DISPOSITION.CONSUMED);
+		this.rememberDisposition(pending, PENDING_REVIEW_CONSENT_DISPOSITION.CONSUMED);
 		return true;
 	}
 
 	expire(sessionKey: PendingReviewConsentSessionKey, pending: PendingReviewConsent): boolean {
 		if (!this.remove(sessionKey, pending)) return false;
-		this.rememberDisposition(sessionKey, pending, PENDING_REVIEW_CONSENT_DISPOSITION.EXPIRED);
+		this.rememberDisposition(pending, PENDING_REVIEW_CONSENT_DISPOSITION.EXPIRED);
 		return true;
 	}
 
@@ -3707,14 +3725,14 @@ export class PendingReviewConsentRegistry {
 		this.remove(sessionKey, pending);
 	}
 
-	staleDisposition(sessionKey: PendingReviewConsentSessionKey, binding: string): PendingReviewConsentDisposition | undefined {
-		return this.staleDispositions.get(sessionKey)?.get(binding);
+	staleDisposition(binding: string): PendingReviewConsentDisposition | undefined {
+		return this.staleDispositions.get(binding);
 	}
 
 	take(sessionKey: PendingReviewConsentSessionKey): PendingReviewConsent[] {
 		const session = this.sessions.get(sessionKey);
 		this.sessions.delete(sessionKey);
-		this.staleDispositions.delete(sessionKey);
+		if (session !== undefined) for (const pending of session.values()) if (this.byBinding.get(pending.id) === sessionKey) this.byBinding.delete(pending.id);
 		return session === undefined ? [] : [...session.values()];
 	}
 }
@@ -3840,6 +3858,29 @@ function staleConsentBindingOutcome(operation: ReviewControllerOperation, bindin
 		...nativeStartPreAuthorityRejection(),
 		provider_action: status.action,
 		...(status.action === "start" ? { next_action: "restart-for-fresh-consent" } : mapped.next_action === undefined ? { next_action: status.action } : {}),
+	};
+}
+
+// gentle-pi#455 correction: cross-session resolution looks a binding up by
+// its opaque id alone, so it must independently confirm the answering
+// invocation addresses the same repository its owning START minted it for.
+// This is a typed, non-bearer refusal in the same shape family as the
+// stale-binding outcome -- it never runs the mode gate or native
+// answerConsent, and never consumes the binding, so it stays answerable from
+// the correct repository afterwards.
+function consentBindingRepositoryMismatchOutcome(operation: ReviewControllerOperation, binding: string, mintingRepositoryCwd: string, answeringRepositoryCwd: string): Record<string, unknown> {
+	return {
+		operation,
+		status: "blocked",
+		outcome: "consent-binding-repository-mismatch",
+		consent_binding: binding,
+		diagnostics: {
+			code: "consent-binding-repository-mismatch",
+			message: `consent binding ${binding} was minted for repository ${mintingRepositoryCwd}, not ${answeringRepositoryCwd}. Answer this binding from a session addressing ${mintingRepositoryCwd}; do not resend this binding from a different repository.`,
+		},
+		native_invocation_attempted: false,
+		...nativeStartPreAuthorityRejection(),
+		next_action: "answer-from-minting-repository",
 	};
 }
 
@@ -5358,13 +5399,18 @@ async function executeReviewControllerOperation(
 		if (Object.keys(input).some((key) => key !== "consentBinding" && key !== "answer") || Object.keys(input).length !== 2) throw new Error("Review controller answer-consent input must contain exactly consentBinding and answer");
 		if (typeof input.consentBinding !== "string" || input.consentBinding.length === 0) throw new Error("Review controller answer-consent requires an opaque consentBinding");
 		if (input.answer !== "granted" && input.answer !== "declined") throw new Error("Review controller answer-consent answer must be granted or declined");
-		const pending = pendingReviewConsentRegistry.get(pendingReviewConsentSession)?.get(input.consentBinding);
+		// gentle-pi#455: resolve the binding by its opaque id alone, so a
+		// binding one active Pi session's START created is answerable from any
+		// active session presenting it -- not only the session that created it.
+		const resolved = pendingReviewConsentRegistry.resolve(input.consentBinding);
+		const pending = resolved?.pending;
+		const owningSession = resolved?.sessionKey ?? pendingReviewConsentSession;
 		if (pending === undefined || pending.expiresAt <= reviewConsentNow()) {
 			const disposition = pending === undefined
-				? pendingReviewConsentRegistry.staleDisposition(pendingReviewConsentSession, input.consentBinding)
+				? pendingReviewConsentRegistry.staleDisposition(input.consentBinding)
 				: PENDING_REVIEW_CONSENT_DISPOSITION.EXPIRED;
 			const stale = staleConsentBindingDiagnostics(input.consentBinding, disposition);
-			if (pending !== undefined) expirePendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession);
+			if (pending !== undefined) expirePendingReviewConsent(pending, pendingReviewConsentRegistry, owningSession);
 			if (nativeReviewCli?.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
 			try {
 				const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
@@ -5377,14 +5423,15 @@ async function executeReviewControllerOperation(
 				return nativeStatusFailed(parameters.operation, error);
 			}
 		}
-		if (realpathSync(defaultCwd) !== pending.repositoryCwd) throw new Error("Review controller consent repository binding changed");
+		const answeringRepositoryCwd = realpathSync(defaultCwd);
+		if (answeringRepositoryCwd !== pending.repositoryCwd) return consentBindingRepositoryMismatchOutcome(parameters.operation, input.consentBinding, pending.repositoryCwd, answeringRepositoryCwd);
 		if (reviewConsentDigest(pending.consent) !== pending.consentDigest) throw new Error("Review controller consent envelope binding changed");
 		pending.verifyCandidate();
 		if (nativeReviewCli?.answerConsent === undefined) throw new Error("Native review consent follow-up is unavailable");
-		if (!consumePendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession)) {
+		if (!consumePendingReviewConsent(pending, pendingReviewConsentRegistry, owningSession)) {
 			const stale = staleConsentBindingDiagnostics(
 				input.consentBinding,
-				pendingReviewConsentRegistry.staleDisposition(pendingReviewConsentSession, input.consentBinding),
+				pendingReviewConsentRegistry.staleDisposition(input.consentBinding),
 			);
 			if (nativeReviewCli.targetStatus === undefined) return nativeStatusUnsupported(parameters.operation);
 			try {
@@ -5401,11 +5448,11 @@ async function executeReviewControllerOperation(
 		try {
 			const gated = await resolveReviewModeGate(nativeReviewCli, parameters.operation, defaultCwd, signal);
 			if (gated !== undefined) {
-				cleanupPendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession);
+				cleanupPendingReviewConsent(pending, pendingReviewConsentRegistry, owningSession);
 				return gated;
 			}
 		} catch (error) {
-			cleanupPendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession);
+			cleanupPendingReviewConsent(pending, pendingReviewConsentRegistry, owningSession);
 			return nativeOperationFailure(parameters.operation, error);
 		}
 		// The one-shot binding is consumed before the first answer-path await. Any
@@ -5525,7 +5572,16 @@ async function executeReviewControllerOperation(
 			} catch (error) {
 				return nativeOperationFailure(parameters.operation, error);
 			}
-			const replayKey = JSON.stringify({ cwd: defaultCwd, lineageId: parameters.lineageId ?? null, input: parameters.input ?? null, inputPath: parameters.inputPath ?? null });
+			// gentle-pi#323: the replay key must fold in the current candidate
+			// content identity. Without it, a second START with identical
+			// {cwd, lineageId, input, inputPath} reuses a still-live (never
+			// lineage-bound) frozen candidate view from within the consent TTL
+			// window even after the live candidate content changed underneath
+			// it, and dead-ends at candidate-target-projection-drift with no
+			// recovery. Folding in currentCandidateTree makes a content change
+			// mint a fresh replay key -- and therefore a fresh candidate view --
+			// instead of reusing the stale one.
+			const replayKey = JSON.stringify({ cwd: defaultCwd, lineageId: parameters.lineageId ?? null, input: parameters.input ?? null, inputPath: parameters.inputPath ?? null, candidateTree: target.projection.currentCandidateTree });
 			// Synchronously drop any binding whose TTL has already elapsed
 			// before reusing its retained candidate view, so a fresh-candidate
 			// retry cannot reuse a view tied to an expired binding and trip
@@ -5595,7 +5651,7 @@ async function executeReviewControllerOperation(
 							consentDigest,
 							expiresAt: reviewConsentNow() + PENDING_REVIEW_CONSENT_TTL_MS,
 						};
-						pendingReviewConsentRegistry.ensure(pendingReviewConsentSession).set(id, pending);
+						pendingReviewConsentRegistry.add(pendingReviewConsentSession, pending);
 						pending.expiry = reviewConsentScheduleTimer(
 							() => expirePendingReviewConsent(pending, pendingReviewConsentRegistry, pendingReviewConsentSession),
 							PENDING_REVIEW_CONSENT_TTL_MS,

@@ -490,6 +490,31 @@ test("candidate registry isolates replay, projection, current, and cleanup state
 	registry.cleanupTerminal("same-lineage", "approved", rootA);
 });
 
+// gentle-pi#323: `createOrReuse` reuses whatever view a replay key maps to,
+// with no awareness of live candidate content -- a content-independent key
+// reuses a stale view even after the candidate content it was frozen from
+// has changed. The fix lives at the START call site (extensions/gentle-ai.ts),
+// which now folds the current candidate tree into the replay key; this test
+// documents both the registry's plain-key reuse contract and that folding
+// content identity into the key produces a fresh view once content changes.
+test("candidate registry reuses a replay-keyed view verbatim regardless of live content, so callers must fold content identity into the key", (t) => {
+	const registry = new CandidateViewRegistry();
+	t.after(() => registry.cleanupAll());
+	const contributorRoot = repository(t);
+	const contentIndependentKey = "cwd-and-lineage-only";
+	const first = registry.createOrReuse({ contributorRoot, replayKey: contentIndependentKey });
+	writeFileSync(join(contributorRoot, "tracked.txt"), "candidate two\n");
+	const staleReuse = registry.createOrReuse({ contributorRoot, replayKey: contentIndependentKey });
+	assert.equal(staleReuse.token, first.token, "a content-independent replay key reuses the stale view");
+	const freshForCurrentContent = registry.create({ contributorRoot });
+	assert.notEqual(staleReuse.candidateTree, freshForCurrentContent.candidateTree, "the stale reused view no longer reflects live candidate content");
+	const contentScopedKey = `${contentIndependentKey} ${freshForCurrentContent.candidateTree}`;
+	const rekeyed = registry.createOrReuse({ contributorRoot, replayKey: contentScopedKey });
+	assert.notEqual(rekeyed.token, staleReuse.token, "folding candidate content into the replay key mints a fresh view once content changes");
+	assert.equal(rekeyed.candidateTree, freshForCurrentContent.candidateTree);
+	registry.cleanup(freshForCurrentContent.token);
+});
+
 test("candidate registry rejects a lineage target whose authorized symlink was replaced", (t) => {
 	const root = repository(t);
 	const replacement = repository(t);
