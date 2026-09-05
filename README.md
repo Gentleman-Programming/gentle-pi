@@ -630,6 +630,16 @@ Working-tree changes show up below the editor as soon as a file differs from HEA
 - `o` (or `enter`) opens the selected file in `$VISUAL` or `$EDITOR` and returns to pi when the editor exits, so a jump into nvim and back never leaves the session.
 - Untracked files are diffed against an empty file so new files show their full content.
 
+Subscription usage shows in the bar after the cost, and `/gentle:usage` opens a panel with every window per provider:
+
+```text
+✿ gentle-pi ⟡ … ⟡ $9.49 sub ⟡ 5h ▰▰▰▰▰▱▱▱ 62% · week 31%
+```
+
+- For Codex, usage comes from the same account usage endpoint the Codex CLI reads, using the OAuth token pi already holds. It is fetched at session start, at most every 5 minutes after a turn, and on `r` in the panel. Rate-limit headers on SSE responses are picked up too.
+- Only the plan name and the windows are kept; account details in the payload are discarded.
+- Gauges turn amber at 80% and red at 95%, like the context gauge.
+
 Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer and editor.
 
 ## Commands

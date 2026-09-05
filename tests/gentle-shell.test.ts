@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import gentleShell, { buildShellBarModel, changesShortcut, loadFileDiff, openInExternalEditor, type GentlePromptEditor } from "../extensions/gentle-shell.ts";
+import gentleShell, { buildShellBarModel, changesShortcut, fetchCodexUsage, loadFileDiff, openInExternalEditor, type GentlePromptEditor } from "../extensions/gentle-shell.ts";
 import { CHANGE_STATUS } from "../lib/shell-changes.ts";
 import type { ShellBarTheme } from "../lib/shell-bar.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
@@ -75,7 +75,7 @@ async function fire(handlers: Map<string, Array<(event: unknown, ctx: ExtensionC
 	for (const handler of handlers.get(event) ?? []) await handler({}, ctx);
 }
 
-function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: boolean; pending?: boolean; editorFactory?: unknown } = {}): { ctx: ExtensionContext; ui: FakeUi } {
+function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: boolean; pending?: boolean; editorFactory?: unknown; token?: string } = {}): { ctx: ExtensionContext; ui: FakeUi } {
 	const ui: FakeUi = { footerFactory: undefined, editorFactory: options.editorFactory, widgets: new Map(), widgetSets: 0, notices: [], overlay: undefined, overlayView: undefined, closeOverlay: undefined };
 	const ctx = {
 		hasUI: options.hasUI ?? true,
@@ -87,7 +87,7 @@ function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: bo
 			getSessionName: () => "Release notes",
 			getEntries: () => options.entries ?? [],
 		},
-		modelRegistry: { isUsingOAuth: () => options.oauth ?? true },
+		modelRegistry: { isUsingOAuth: () => options.oauth ?? true, getApiKeyForProvider: async () => options.token },
 		getContextUsage: () => ({ tokens: 122_400, contextWindow: 272_000, percent: 45 }),
 		ui: {
 			theme: plainTheme,
@@ -391,4 +391,71 @@ test("gentleShell watches git in the background so the widget and bar follow ext
 	const gitCallsAfterShutdown = git.length;
 	await new Promise((resolve) => setTimeout(resolve, 20));
 	assert.equal(git.length, gitCallsAfterShutdown, "shutdown must stop the watch");
+});
+
+const JWT = `h.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-1" } })).toString("base64url")}.s`;
+const USAGE_PAYLOAD = { plan_type: "pro", rate_limit: { primary_window: { used_percent: 40, limit_window_seconds: 604_800, reset_at: 1_788_777_491 } } };
+
+function fakeFetch(payload: unknown = USAGE_PAYLOAD, ok = true) {
+	const calls: Array<{ url: string; headers: Record<string, string> }> = [];
+	const fetchFn = (async (url: string | URL, init?: RequestInit) => {
+		calls.push({ url: String(url), headers: (init?.headers ?? {}) as Record<string, string> });
+		return { ok, json: async () => payload } as Response;
+	}) as typeof fetch;
+	return { fetchFn, calls };
+}
+
+test("fetchCodexUsage sends the token and account id and parses the payload", async () => {
+	const { fetchFn, calls } = fakeFetch();
+	const usage = await fetchCodexUsage(JWT, fetchFn, 1_788_600_000_000);
+	assert.equal(usage?.plan, "pro");
+	assert.equal(calls[0].url, "https://chatgpt.com/backend-api/wham/usage");
+	assert.equal(calls[0].headers.Authorization, `Bearer ${JWT}`);
+	assert.equal(calls[0].headers["chatgpt-account-id"], "acct-1");
+
+	const plain = fakeFetch();
+	assert.equal(await fetchCodexUsage("sk-plain-api-key", plain.fetchFn, 0), undefined);
+	assert.equal(plain.calls.length, 0, "a non-OAuth key must not be sent anywhere");
+	assert.equal(await fetchCodexUsage(JWT, fakeFetch({}, false).fetchFn, 0), undefined);
+	assert.equal(await fetchCodexUsage(undefined, plain.fetchFn, 0), undefined);
+});
+
+test("gentleShell fetches Codex usage on session start and shows it in the bar", async () => {
+	const { pi, handlers } = fakePi();
+	const { fetchFn, calls } = fakeFetch();
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { fetch: fetchFn, now: () => 1_788_600_000_000 });
+	const { ctx, ui } = fakeContext({ token: JWT });
+	await fire(handlers, "session_start", ctx);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(calls.length, 1);
+	assert.match(renderFooter(ui), /\$0\.000 sub ⟡ week ▰▰▰▱▱▱▱▱ 40%/);
+
+	await fire(handlers, "agent_end", ctx);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(calls.length, 1, "agent_end must not refetch within the refresh window");
+});
+
+test("gentleShell records SSE rate-limit headers from provider responses", async () => {
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { fetch: fakeFetch({}, false).fetchFn, now: () => 0 });
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	for (const handler of handlers.get("after_provider_response") ?? []) {
+		handler({ status: 200, headers: { "x-codex-primary-used-percent": "62", "x-codex-primary-window-minutes": "300", "x-codex-secondary-used-percent": "31", "x-codex-secondary-window-minutes": "10080" } }, ctx);
+	}
+	assert.match(renderFooter(ui), /5h ▰▰▰▰▰▱▱▱ 62% · week 31%/);
+});
+
+test("gentleShell registers /gentle:usage and opens the subscriptions overlay", async () => {
+	const { pi, handlers, commands } = fakePi();
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { fetch: fakeFetch().fetchFn, now: () => 1_788_600_000_000 });
+	const { ctx, ui } = fakeContext({ token: JWT });
+	await fire(handlers, "session_start", ctx);
+	const opened = commands.get("gentle:usage")!.handler("", ctx);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	const plain = ui.overlayView!.render(90).map(stripAnsi);
+	assert.match(plain[0], /Subscriptions/);
+	assert.match(plain[1], /openai-codex · pro/);
+	ui.closeOverlay?.();
+	await opened;
 });

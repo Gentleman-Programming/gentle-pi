@@ -8,10 +8,12 @@ import { renderShellBar, shellEnabled, type ShellBarModel, type ShellBarTheme } 
 import { CHANGE_STATUS, ChangesTracker, renderChangesWidget, type ChangedFile, type ChangesModel, type GitRunner, type LineCounter } from "../lib/shell-changes.ts";
 import { ChangesView } from "../lib/shell-changes-view.ts";
 import { framePromptLines, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
+import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, parseCodexHeaders, parseCodexUsage, UsageStore, type ProviderUsage } from "../lib/shell-usage.ts";
+import { UsageView } from "../lib/shell-usage-view.ts";
 
 // Gentle Shell: the visual layer gentle-pi puts on top of pi. It installs the
-// status bar, the petal prompt, the working-tree changes widget and overlay;
-// later slices add subscription usage and cards.
+// status bar, the petal prompt, the working-tree changes widget and overlay,
+// and the subscription usage view; a later slice adds cards.
 
 export interface ShellFooterData {
 	getGitBranch(): string | null;
@@ -33,7 +35,15 @@ interface ShellBarComponent {
 interface BuildOptions {
 	home?: string;
 	dirty?: number;
+	usage?: ProviderUsage;
 }
+
+export interface ShellDeps {
+	fetch: typeof fetch;
+	now(): number;
+}
+
+const defaultShellDeps: ShellDeps = { fetch: (...args) => globalThis.fetch(...args), now: () => Date.now() };
 
 interface AssistantUsageEntry {
 	type: string;
@@ -82,6 +92,7 @@ export function buildShellBarModel(
 		contextWindow: usage?.contextWindow ?? model?.contextWindow ?? 0,
 		costTotal: sessionCost(ctx),
 		subscription: model ? ctx.modelRegistry.isUsingOAuth(model) : false,
+		usage: options.usage,
 		statuses,
 	};
 }
@@ -93,11 +104,12 @@ export function createShellBarComponent(
 	theme: ShellBarTheme,
 	footerData: ShellFooterData,
 	dirty: () => number | undefined = () => undefined,
+	usage: () => ProviderUsage | undefined = () => undefined,
 ): ShellBarComponent {
 	const unsubscribe = footerData.onBranchChange(() => host.requestRender());
 	return {
 		render(width: number) {
-			return renderShellBar(buildShellBarModel(pi, ctx, footerData, { dirty: dirty() }), theme, width);
+			return renderShellBar(buildShellBarModel(pi, ctx, footerData, { dirty: dirty(), usage: usage() }), theme, width);
 		},
 		invalidate() {},
 		dispose() {
@@ -304,8 +316,66 @@ function showChanges(ctx: ExtensionContext, model: ChangesModel): void {
 	);
 }
 
-export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env): void {
+const USAGE_COMMAND_NAME = "gentle:usage";
+const USAGE_REFRESH_MS = 5 * 60_000;
+
+// The Codex usage endpoint is what the Codex CLI itself reads. The OAuth
+// token pi already holds carries the account id; nothing else is sent.
+export async function fetchCodexUsage(token: string | undefined, fetchFn: typeof fetch, now: number): Promise<ProviderUsage | undefined> {
+	if (!token) return undefined;
+	const accountId = accountIdFromToken(token);
+	if (!accountId) return undefined;
+	try {
+		const response = await fetchFn(CODEX_USAGE_URL, {
+			headers: { Authorization: `Bearer ${token}`, "chatgpt-account-id": accountId, originator: "pi", "User-Agent": "gentle-pi" },
+		});
+		if (!response.ok) return undefined;
+		return parseCodexUsage(await response.json(), now);
+	} catch {
+		return undefined;
+	}
+}
+
+export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env, deps: ShellDeps = defaultShellDeps): void {
 	if (!shellEnabled(env)) return;
+	const usage = new UsageStore();
+	let renderHost: ShellRenderHost | undefined;
+	let usageFetchedAt = 0;
+	const refreshUsage = async (ctx: ExtensionContext, force: boolean) => {
+		const provider = ctx.model?.provider;
+		if (provider !== CODEX_PROVIDER) return;
+		const now = deps.now();
+		if (!force && now - usageFetchedAt < USAGE_REFRESH_MS) return;
+		usageFetchedAt = now;
+		const token = await ctx.modelRegistry.getApiKeyForProvider(CODEX_PROVIDER).catch(() => undefined);
+		const fetched = await fetchCodexUsage(token, deps.fetch, deps.now());
+		if (!fetched) return;
+		usage.record(fetched);
+		renderHost?.requestRender();
+	};
+	pi.on("after_provider_response", (event) => {
+		const parsed = parseCodexHeaders(event.headers, deps.now());
+		if (!parsed) return;
+		usage.record(parsed);
+		renderHost?.requestRender();
+	});
+	pi.registerCommand(USAGE_COMMAND_NAME, {
+		description: "Show subscription usage windows for the connected providers. Press r to refetch.",
+		handler: async (_args, ctx) => {
+			await refreshUsage(ctx, true);
+			await ctx.ui.custom<null>(
+				(tui, theme, _keybindings, done) =>
+					new UsageView(usage, {
+						theme,
+						now: () => deps.now(),
+						onRefresh: () => refreshUsage(ctx, true),
+						onClose: () => done(null),
+						requestRender: () => tui.requestRender(),
+					}),
+				{ overlay: true, overlayOptions: { width: "70%", minWidth: 60, anchor: "center" } },
+			);
+		},
+	});
 	let prompt: GentlePromptEditor | undefined;
 	let changes: ChangesTracker | undefined;
 	let watch: NodeJS.Timeout | undefined;
@@ -328,9 +398,11 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		if (!ctx.hasUI) return;
 		changes = new ChangesTracker(gitRunner(pi, ctx.cwd), lineCounter(ctx.cwd));
 		const tracker = changes;
-		ctx.ui.setFooter((tui, theme, footerData) =>
-			createShellBarComponent(pi, ctx, tui, theme, footerData, () => tracker.model.files.length),
-		);
+		ctx.ui.setFooter((tui, theme, footerData) => {
+			renderHost = tui;
+			return createShellBarComponent(pi, ctx, tui, theme, footerData, () => tracker.model.files.length, () => usage.get(ctx.model?.provider ?? ""));
+		});
+		void refreshUsage(ctx, true);
 		installPrompt(ctx, (created) => {
 			prompt = created;
 		});
@@ -370,6 +442,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	pi.on("agent_end", async (_event, ctx) => {
 		prompt?.setWorking(false);
 		await refreshChanges(ctx);
+		void refreshUsage(ctx, false);
 	});
 	pi.on("tool_execution_end", async (_event, ctx) => {
 		await refreshChanges(ctx);
