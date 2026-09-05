@@ -423,6 +423,72 @@ test("REPAIR retains frozen committed collect selectors and leaves workspace rou
 	assert.deepEqual(workspaceRequests, [{ cwd, lineageId: workspaceLineage }]);
 });
 
+test("selectorless STATUS resumes a retained committed correction lineage", async (t) => {
+	const candidateViews = new CandidateViewRegistry();
+	t.after(() => candidateViews.cleanupAll());
+	const cwd = repository(t);
+	const lineageId = "retained-committed-correction";
+	const view = candidateViews.create({
+		contributorRoot: cwd,
+		baseRef: execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim(),
+		committedOnly: true,
+	});
+	candidateViews.retain(view.token, lineageId);
+	const frozenTarget = candidateViews.resolveProjection(lineageId, cwd);
+	const requests: Array<Record<string, unknown>> = [];
+	const selections = new Map();
+	let captures = 0;
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => {
+			requests.push(request);
+			return status(lineageId, [correctionPlanInput(lineageId)], "correction_required");
+		},
+		captureCorrectionPlan: async () => {
+			captures += 1;
+			return { schema: "gentle-ai.review-last-event-closure/v1", operation: "review.capture-correction-plan", lineageId, state: "correction_required", storeRevision: SHA };
+		},
+	} as unknown as NativeReviewCli;
+
+	const listed = await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, cwd, native, undefined, candidateViews, undefined, selections);
+	const captured = await __testing.executeReviewCaptureOperation({ lineageId, collectBinding: bindingOf(listed), correctionLines: 1 }, cwd, native, undefined, candidateViews, selections, true);
+
+	assert.equal(captured.outcome, "native-last-event-closure");
+	assert.equal(captures, 1);
+	assert.deepEqual(requests, Array.from({ length: 2 }, () => ({ cwd, lineageId, agent: "pi", baseRef: frozenTarget.baseCommit, committedOnly: true })));
+});
+
+test("selectorless STATUS uses a retained committed selector only at its retained workspace", async (t) => {
+	const candidateViews = new CandidateViewRegistry();
+	t.after(() => candidateViews.cleanupAll());
+	const retainedRoot = repository(t);
+	const otherRoot = repository(t);
+	const lineageId = "retained-selector-boundary";
+	const view = candidateViews.create({
+		contributorRoot: retainedRoot,
+		baseRef: execFileSync("git", ["rev-parse", "HEAD"], { cwd: retainedRoot, encoding: "utf8" }).trim(),
+		committedOnly: true,
+	});
+	candidateViews.retain(view.token, lineageId);
+	const frozenTarget = candidateViews.resolveProjection(lineageId, retainedRoot);
+	const requests: Array<Record<string, unknown>> = [];
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => {
+			requests.push(request);
+			return status(String(request.lineageId ?? "unretained"));
+		},
+	} as unknown as NativeReviewCli;
+
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId, input: JSON.stringify({ baseRef: "explicit-base", committedOnly: true }) }, retainedRoot, native, undefined, candidateViews);
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId: "unretained" }, retainedRoot, native, undefined, candidateViews);
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, otherRoot, native, undefined, candidateViews);
+
+	assert.deepEqual(requests, [
+		{ cwd: retainedRoot, lineageId, agent: "pi", baseRef: "explicit-base", committedOnly: true },
+		{ cwd: retainedRoot, lineageId: "unretained", agent: "pi" },
+		{ cwd: retainedRoot, lineageId, agent: "pi", baseRef: frozenTarget.baseCommit, committedOnly: true },
+	]);
+});
+
 test("STATUS preserves retained intended-untracked selection through selectorless same-lineage replacement collection", async () => {
 	const cwd = process.cwd();
 	const lineageId = "selectorless-replacement";
