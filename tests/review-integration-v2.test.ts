@@ -700,6 +700,22 @@ test("v5 targeted-validator collect inputs carry the exact provider-owned valida
 	assert.throws(() => decodeReviewNextTransitionV3(weakenedRequest, { v5: true }), /policy_content/);
 });
 
+test("a capture-result collect input decodes without changed_path_manifest, which the artifact subject digest already binds", () => {
+	const status = fixture<JsonObject>("status.fixture.json");
+	const transition = clone((status.next_transition ?? {}) as JsonObject);
+	const inputs = ((transition.collect as JsonObject | undefined)?.inputs ?? []) as JsonObject[];
+	const captureInput = inputs.find((input) => input.capture_operation === "review.capture-result");
+	assert.ok(captureInput, "the status fixture carries a capture-result collect input");
+	assert.doesNotThrow(() => decodeReviewNextTransitionV3(transition, { v5: true, v6: true }), "with the manifest");
+	delete captureInput.changed_path_manifest;
+	const decoded = decodeReviewNextTransitionV3(transition, { v5: true, v6: true });
+	const decodedInput = decoded.collect?.inputs.find((input) => input.captureOperation === "review.capture-result");
+	assert.ok(decodedInput?.artifactSubject?.changedPathManifestSha256, "the digest on the artifact subject is the binding");
+	assert.equal(decodedInput?.changedPathManifest, undefined);
+	delete captureInput.artifact_subject;
+	assert.throws(() => decodeReviewNextTransitionV3(transition, { v5: true, v6: true }), /requires artifact_subject, base_tree, and candidate_tree/);
+});
+
 test("status enforces authority/frozen/receipt conditionals and decodes the required repair field", () => {
 	const current = devFixture<JsonObject>("status-v5-repository-context.captured.json");
 	delete current.receipt;

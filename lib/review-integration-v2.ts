@@ -1642,8 +1642,11 @@ function decodeCollectInput(value: unknown, label: string, v5: boolean, v6: bool
 	}
 
 	if (captureOperation === "review.capture-result") {
-		if (input.artifact_subject === undefined || input.base_tree === undefined || input.candidate_tree === undefined || input.changed_path_manifest === undefined) {
-			throw new TypeError(`${label} requires artifact_subject, base_tree, candidate_tree, and changed_path_manifest`);
+		// changed_path_manifest is optional here: the artifact subject's
+		// changed_path_manifest_sha256 already binds the frozen manifest, and
+		// gentle-ai stops inlining one copy per lens (gentle-ai#3922).
+		if (input.artifact_subject === undefined || input.base_tree === undefined || input.candidate_tree === undefined) {
+			throw new TypeError(`${label} requires artifact_subject, base_tree, and candidate_tree`);
 		}
 		if (schema !== "https://gentle-ai.dev/schema/review/reviewer/v1") throw new TypeError(`${label}.schema must be https://gentle-ai.dev/schema/review/reviewer/v1`);
 	} else if (input.artifact_subject !== undefined || input.base_tree !== undefined || input.candidate_tree !== undefined || input.changed_path_manifest !== undefined) {
