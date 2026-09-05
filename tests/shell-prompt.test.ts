@@ -61,13 +61,13 @@ test("petalGlyph spins through the flowers while working and rests otherwise", (
 	assert.equal(petalGlyph(PROMPT_STATE.QUEUED, 1), "❀");
 });
 
-test("framePromptLines spins the petal silently while working and labels only the queued state", () => {
+test("framePromptLines spins the petal and labels the working and queued states", () => {
 	const plain = (_color: string, text: string) => text;
 	const working = framePromptLines(editorLines(40), 40, options({ state: PROMPT_STATE.WORKING, tick: 1 }));
 	assert.match(working[0], /<accent>❀<\/accent>/);
-	assert.doesNotMatch(working[0], /working/);
+	assert.match(working[0], /<muted>working<\/muted>/);
 	const workingPlain = framePromptLines(editorLines(40), 40, options({ state: PROMPT_STATE.WORKING, tick: 1, fg: plain }));
-	assert.match(stripAnsi(workingPlain[0]), /^╭─ ❀ ─+╮$/);
+	assert.match(stripAnsi(workingPlain[0]), /^╭─ ❀ working ─+╮$/);
 	assert.equal(visibleWidth(workingPlain[0]), 40);
 
 	const queued = framePromptLines(editorLines(40), 40, options({ state: PROMPT_STATE.QUEUED }));

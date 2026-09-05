@@ -23,6 +23,7 @@ interface FakeUi {
 	editorFactory: unknown;
 	widgets: Map<string, unknown>;
 	widgetSets: number;
+	workingVisible: boolean | undefined;
 	notices: string[];
 	overlay: unknown;
 	overlayView: { render(width: number): string[] } | undefined;
@@ -82,7 +83,7 @@ async function fire(handlers: Map<string, Array<(event: unknown, ctx: ExtensionC
 }
 
 function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: boolean; pending?: boolean; editorFactory?: unknown; token?: string } = {}): { ctx: ExtensionContext; ui: FakeUi } {
-	const ui: FakeUi = { footerFactory: undefined, editorFactory: options.editorFactory, widgets: new Map(), widgetSets: 0, notices: [], overlay: undefined, overlayView: undefined, closeOverlay: undefined };
+	const ui: FakeUi = { footerFactory: undefined, editorFactory: options.editorFactory, widgets: new Map(), widgetSets: 0, workingVisible: undefined, notices: [], overlay: undefined, overlayView: undefined, closeOverlay: undefined };
 	const ctx = {
 		hasUI: options.hasUI ?? true,
 		hasPendingMessages: () => options.pending ?? false,
@@ -113,6 +114,9 @@ function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: bo
 			},
 			notify(message: string) {
 				ui.notices.push(message);
+			},
+			setWorkingVisible(visible: boolean) {
+				ui.workingVisible = visible;
 			},
 			custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: null) => void) => { render(width: number): string[] }) {
 				ui.overlay = factory;
@@ -221,6 +225,7 @@ test("gentleShell frames the editor with the petal prompt and a hint while empty
 	gentleShell(pi, {});
 	const { ctx, ui } = fakeContext();
 	const editor = installedPrompt(ctx, ui, handlers);
+	assert.equal(ui.workingVisible, false, "pi's own Working row must be hidden");
 	editor.focused = true;
 	const lines = editor.render(60).map(stripAnsi);
 	assert.match(lines[0], /^╭─ ✿ ─+╮$/);
@@ -240,7 +245,7 @@ test("gentleShell shows working while the agent runs and queued when messages wa
 	const editor = installedPrompt(ctx, ui, handlers);
 
 	for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
-	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ [✿❀❁✾] ─+╮$/);
+	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ [✿❀❁✾] working ─+╮$/);
 	pending.value = true;
 	assert.match(stripAnsi(editor.render(60)[0]), /^╭─ [✿❀❁✾] queued ─+╮$/);
 	for (const handler of handlers.get("agent_end") ?? []) handler({}, ctx);

@@ -468,6 +468,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		installPrompt(ctx, (created) => {
 			prompt = created;
 		});
+		// The petal already says the agent is working; pi's own "Working" row would say it twice.
+		ctx.ui.setWorkingVisible(false);
 		const notice = deps.devBinary();
 		ctx.ui.setWidget(DEV_BINARY_WIDGET_KEY, notice ? (_tui, theme) => spaced(cardComponent(devBinaryCard(notice), theme, true)) : undefined);
 		await tracker.start();

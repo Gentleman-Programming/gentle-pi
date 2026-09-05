@@ -602,12 +602,12 @@ The status bar replaces pi's three-line footer with a single line of segments:
 The prompt wraps pi's editor in a rounded frame with a petal that shows what the agent is doing:
 
 ```text
-╭─ ✿ ─────────────────────────────────────────────────╮
+╭─ ✿ working ──────────────────────────────────────────╮
 │ type, or / for commands                              │
 ╰──────────────────────────────────────────────────────╯
 ```
 
-- The petal is still while pi waits, spins while the agent works, and turns amber with a `queued` label when messages are waiting behind the current turn.
+- The petal is still while pi waits, spins with a `working` label while the agent works, and turns amber with a `queued` label when messages are waiting behind the current turn. pi's own "Working" row above the editor is hidden, since the frame already says it.
 - The frame keeps pi's border color, so bash mode and thinking levels still show through it, and the editor's scroll indicators stay inside the frame.
 - The hint appears only while the editor is empty.
 - If another extension already installed a custom editor, Gentle Shell leaves it alone.

@@ -38,7 +38,7 @@ const FAKE_CURSOR = "\x1b[7m \x1b[0m";
 const SCROLL_INDICATOR = /[↑↓] \d+ more/;
 const STATE_LABEL: Record<PromptState, string | undefined> = {
 	[PROMPT_STATE.IDLE]: undefined,
-	[PROMPT_STATE.WORKING]: undefined,
+	[PROMPT_STATE.WORKING]: "working",
 	[PROMPT_STATE.QUEUED]: "queued",
 };
 
