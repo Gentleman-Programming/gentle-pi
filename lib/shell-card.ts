@@ -1,8 +1,8 @@
-import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 // Gentle Shell cards: the shape every Gentle notice takes in the transcript
-// and above the editor. A titled line, then the body beside a left rule in
-// the card's tone. Pure: takes strings, returns lines.
+// and above the editor. The same rounded frame as the prompt and the
+// overlays, with the title in the card's tone. Pure: strings in, lines out.
 
 export const CARD_TONE = {
 	INFO: "info",
@@ -29,35 +29,49 @@ export interface CardRenderOptions {
 }
 
 export const CARD_GLYPH = "✿";
-const RULE = "▏";
 const TONE_ROLE: Record<CardTone, string> = {
 	[CARD_TONE.INFO]: "customMessageLabel",
 	[CARD_TONE.WARNING]: "warning",
 	[CARD_TONE.ERROR]: "error",
 };
+const FRAME_ROLE = "border";
 const SUBTITLE_ROLE = "muted";
 const BODY_ROLE = "text";
 const SEPARATOR = "·";
+const FRAME_COLUMNS = 4;
 
-function titleLine(card: Card, theme: CardTheme): string {
-	const head = theme.fg(TONE_ROLE[card.tone], `${card.glyph ?? CARD_GLYPH} ${card.title}`);
-	if (!card.subtitle) return head;
-	return `${head} ${theme.fg(SUBTITLE_ROLE, SEPARATOR)} ${theme.fg(SUBTITLE_ROLE, card.subtitle)}`;
+function rule(length: number): string {
+	return "─".repeat(Math.max(0, length));
 }
 
-function bodyLines(card: Card, width: number): string[] {
-	const wrapWidth = Math.max(1, width - 2);
-	return card.body.flatMap((paragraph) => (paragraph === "" ? [""] : wrapTextWithAnsi(paragraph, wrapWidth)));
+function titleText(card: Card, theme: CardTheme): { styled: string; width: number } {
+	const head = `${card.glyph ?? CARD_GLYPH} ${card.title}`;
+	const styled = card.subtitle
+		? `${theme.fg(TONE_ROLE[card.tone], head)} ${theme.fg(SUBTITLE_ROLE, SEPARATOR)} ${theme.fg(SUBTITLE_ROLE, card.subtitle)}`
+		: theme.fg(TONE_ROLE[card.tone], head);
+	return { styled, width: head.length + (card.subtitle ? card.subtitle.length + 3 : 0) };
+}
+
+function bodyLines(card: Card, innerWidth: number): string[] {
+	return card.body.flatMap((paragraph) => (paragraph === "" ? [""] : wrapTextWithAnsi(paragraph, innerWidth)));
+}
+
+function frameLine(text: string, innerWidth: number, theme: CardTheme): string {
+	const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(text)));
+	return `${theme.fg(FRAME_ROLE, "│")} ${text}${padding} ${theme.fg(FRAME_ROLE, "│")}`;
 }
 
 export function renderCard(card: Card, theme: CardTheme, width: number, options: CardRenderOptions): string[] {
-	const rule = theme.fg(TONE_ROLE[card.tone], RULE);
-	const lines = bodyLines(card, width);
-	if (lines.length === 0) return [titleLine(card, theme)];
+	const innerWidth = Math.max(1, width - FRAME_COLUMNS);
+	const title = titleText(card, theme);
+	const top = theme.fg(FRAME_ROLE, "╭─ ") + title.styled + theme.fg(FRAME_ROLE, ` ${rule(width - title.width - 5)}╮`);
+	const bottom = theme.fg(FRAME_ROLE, `╰${rule(width - 2)}╯`);
+	const lines = bodyLines(card, innerWidth);
+	if (lines.length === 0) return [top, bottom];
 	if (!options.expanded) {
 		const first = lines.find((line) => line !== "") ?? "";
-		const clipped = lines.length > 1 ? truncateToWidth(first, Math.max(1, width - 3), "") + "…" : first;
-		return [titleLine(card, theme), `${rule} ${theme.fg(BODY_ROLE, clipped)}`];
+		const clipped = lines.length > 1 ? truncateToWidth(first, Math.max(1, innerWidth - 1), "") + "…" : first;
+		return [top, frameLine(theme.fg(BODY_ROLE, clipped), innerWidth, theme), bottom];
 	}
-	return [titleLine(card, theme), ...lines.map((line) => (line === "" ? rule : `${rule} ${theme.fg(BODY_ROLE, line)}`))];
+	return [top, ...lines.map((line) => frameLine(line === "" ? "" : theme.fg(BODY_ROLE, line), innerWidth, theme)), bottom];
 }

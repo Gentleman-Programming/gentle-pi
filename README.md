@@ -642,11 +642,12 @@ Subscription usage shows in the bar after the cost, and `/gentle:usage` opens a 
 - Only the plan name and the windows are kept; account details in the payload are discarded.
 - Gauges turn amber at 80% and red at 95%, like the context gauge.
 
-Gentle notices are drawn as cards: a titled line and a left rule beside the body, in the tone of the notice.
+Gentle notices are drawn as cards: the same rounded frame as the prompt, with the title in the tone of the notice.
 
 ```text
-✿ Gentle AI · review preflight
-▏ Receipt-driven development is enabled, and this worktree holds an unreviewed candidate…
+╭─ ✿ Gentle AI · review preflight ─────────────────────────────────────╮
+│ Receipt-driven development is enabled, and this worktree holds an…   │
+╰──────────────────────────────────────────────────────────────────────╯
 ```
 
 - The review preflight reminder renders as a card in the transcript and collapses to two lines with pi's tool toggle.

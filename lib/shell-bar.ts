@@ -32,7 +32,7 @@ export interface ShellBarTheme {
 // map them to the rose palette (accent = rose, syntaxFunction = powder blue).
 const ROLE = {
 	BRAND: "accent",
-	SEPARATOR: "border",
+	SEPARATOR: "dim",
 	PATH: "muted",
 	BRANCH: "text",
 	DIRTY: "warning",

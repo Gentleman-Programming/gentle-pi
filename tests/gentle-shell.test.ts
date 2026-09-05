@@ -480,11 +480,11 @@ test("gentleShell draws the review preflight message as a Gentle card", () => {
 	assert.ok(renderer, "renderer not registered");
 	const message = { customType: "gentle-pi.review-preflight", content: "Receipt-driven development is enabled.\n\nCall the gentle_review tool." };
 	const expanded = renderer(message, { expanded: true }, plainTheme).render(80).map(stripAnsi);
-	assert.equal(expanded[0], "✿ Gentle AI · review preflight");
-	assert.match(expanded[1], /^▏ Receipt-driven development is enabled\.$/);
+	assert.match(expanded[0], /^╭─ ✿ Gentle AI · review preflight ─+╮$/);
+	assert.match(expanded[1], /^│ Receipt-driven development is enabled\. +│$/);
 	assert.ok(expanded.some((line) => line.includes("gentle_review")));
 	const collapsed = renderer({ ...message, content: [{ type: "text", text: message.content }] }, { expanded: false }, plainTheme).render(80).map(stripAnsi);
-	assert.equal(collapsed.length, 2);
+	assert.equal(collapsed.length, 3);
 });
 
 test("gentleShell keeps a dev-binary override visible above the editor for the whole session", async () => {
@@ -496,8 +496,10 @@ test("gentleShell keeps a dev-binary override visible above the editor for the w
 	const factory = ui.widgets.get("gentle-shell-dev-binary") as (tui: unknown, theme: unknown) => { render(width: number): string[] };
 	assert.ok(factory, "dev binary widget missing");
 	const lines = factory(fakeTui, plainTheme).render(100).map(stripAnsi);
-	assert.equal(lines[0], "✿ Gentle AI · dev binary override · field-test only");
-	assert.match(lines[1], /^▏ \/Users\/me\/go\/bin\/gentle-ai · sha256:6e53bfc6305a3949$/);
+	assert.match(lines[0], /^╭─ ✿ Gentle AI · dev binary override · field-test only ─+╮$/);
+	assert.match(lines[1], /^│ \/Users\/me\/go\/bin\/gentle-ai · sha256:6e53bfc6305a3949 +│$/);
+	assert.match(lines[2], /^╰─+╯$/);
+	assert.equal(lines[3], "", "a blank line keeps the card off the prompt frame");
 
 	const clean = fakePi();
 	gentleShell(clean.pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { ...deps, devBinary: () => undefined });

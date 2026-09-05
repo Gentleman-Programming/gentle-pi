@@ -194,7 +194,7 @@ export function renderUsageBar(usage: ProviderUsage, theme: UsageTheme): string 
 	const main = usage.limits[0];
 	const [first, ...rest] = main?.windows ?? [];
 	if (!first) return undefined;
-	const head = `${theme.fg(ROLE.LIMIT, main.name)} ${theme.fg(ROLE.LABEL, first.label)} ${paintMeter(first.usedPercent, 8, theme)} ${theme.fg(ROLE.PERCENT, `${Math.round(first.usedPercent)}%`)}`;
+	const head = `${theme.fg(ROLE.LABEL, main.name)} ${theme.fg(ROLE.LABEL, first.label)} ${paintMeter(first.usedPercent, 8, theme)} ${theme.fg(ROLE.PERCENT, `${Math.round(first.usedPercent)}%`)}`;
 	const tail = rest.map((window) => `${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.LABEL, window.label)} ${theme.fg(ROLE.PERCENT, `${Math.round(window.usedPercent)}%`)}`);
 	return [head, ...tail].join(" ");
 }

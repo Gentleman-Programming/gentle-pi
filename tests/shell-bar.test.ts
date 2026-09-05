@@ -90,7 +90,7 @@ test("renderShellBar colors the brand, model, effort, and gauge by role", () => 
 	assert.match(line, /<text>gpt-5\.5<\/text>/);
 	assert.match(line, /<syntaxFunction>medium<\/syntaxFunction>/);
 	assert.match(line, /<accent>▰▰▰▰<\/accent><border>▱▱▱▱<\/border>/);
-	assert.match(line, /<border>⟡<\/border>/);
+	assert.match(line, /<dim>⟡<\/dim>/);
 });
 
 test("renderShellBar shows the branch as dirty-neutral and omits it outside git", () => {

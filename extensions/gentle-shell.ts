@@ -350,6 +350,17 @@ function cardComponent(card: Card, theme: CardTheme, expanded: boolean) {
 	};
 }
 
+// Widgets above the editor sit flush against the prompt frame; a blank line
+// after the card keeps the two frames apart.
+function spaced(component: { render(width: number): string[]; invalidate(): void }) {
+	return {
+		render(width: number) {
+			return [...component.render(width), ""];
+		},
+		invalidate() {},
+	};
+}
+
 export function devBinaryCard(notice: DevBinaryNotice): Card {
 	if (notice.state === "invalid") {
 		return { title: "Gentle AI", subtitle: "dev binary override invalid", body: [notice.reason], tone: CARD_TONE.ERROR };
@@ -458,7 +469,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			prompt = created;
 		});
 		const notice = deps.devBinary();
-		ctx.ui.setWidget(DEV_BINARY_WIDGET_KEY, notice ? (_tui, theme) => cardComponent(devBinaryCard(notice), theme, true) : undefined);
+		ctx.ui.setWidget(DEV_BINARY_WIDGET_KEY, notice ? (_tui, theme) => spaced(cardComponent(devBinaryCard(notice), theme, true)) : undefined);
 		await tracker.start();
 		shown = "";
 		applyChanges(ctx, tracker.model);
