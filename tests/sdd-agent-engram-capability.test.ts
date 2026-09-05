@@ -97,6 +97,28 @@ test("resolveEngramExtensionEntry is undefined without pi.extensions metadata", 
 	}
 });
 
+test("resolveEngramExtensionEntry is undefined when the entry is a directory, not a regular file", () => {
+	const agentHome = mkdtempSync(join(tmpdir(), "gentle-pi-engram-dir-"));
+	try {
+		const packageDir = join(agentHome, "npm", "node_modules", "gentle-engram");
+		mkdirSync(packageDir, { recursive: true });
+		// A `"."` entry resolves to the package directory itself. existsSync
+		// alone accepts it, and stamping a directory into agent frontmatter would
+		// make the child session fail to load its extension (CodeRabbit, PR #605).
+		writeFileSync(
+			join(packageDir, "package.json"),
+			JSON.stringify({
+				name: "gentle-engram",
+				version: "0.1.11",
+				pi: { extensions: ["."] },
+			}),
+		);
+		assert.equal(resolveEngramExtensionEntry(agentHome), undefined);
+	} finally {
+		rmSync(agentHome, { recursive: true, force: true });
+	}
+});
+
 test("declaresMemoryTools detects mem_* allowlist entries", () => {
 	assert.equal(declaresMemoryTools(AGENT_DECLARING_MEMORY), true);
 	assert.equal(declaresMemoryTools(AGENT_WITHOUT_MEMORY), false);

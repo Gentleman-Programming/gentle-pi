@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { resolveGentlePiAgentHome } from "./agent-home.ts";
 
@@ -25,7 +25,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /**
  * Resolve the installed gentle-engram Pi extension entry file, or undefined
  * when gentle-engram is not installed under the Pi package root or does not
- * declare a loadable `pi.extensions[0]`.
+ * declare a loadable regular-file `pi.extensions[0]` entry. A directory entry
+ * (for example `"."`) is not loadable by Pi and must resolve to undefined.
  */
 export function resolveEngramExtensionEntry(
 	agentHome: string = resolveGentlePiAgentHome(),
@@ -46,7 +47,11 @@ export function resolveEngramExtensionEntry(
 		);
 		if (entry === undefined) return undefined;
 		const entryPath = isAbsolute(entry) ? entry : join(packageDir, entry);
-		return existsSync(entryPath) ? resolve(entryPath) : undefined;
+		// Pi resolves extension entries as files: a directory path would make the
+		// child session fail to load its extension, so only regular files pass
+		// (statSync throws on a missing path, which the catch below maps to
+		// undefined — the same outcome the previous existsSync guard produced).
+		return statSync(entryPath).isFile() ? resolve(entryPath) : undefined;
 	} catch {
 		return undefined;
 	}
