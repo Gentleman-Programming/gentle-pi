@@ -1,8 +1,8 @@
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { CHANGE_STATUS, changesSummary, type ChangedFile, type ChangesModel } from "./shell-changes.ts";
 
-// Gentle Shell changes overlay: a framed two-pane view with the session's
-// changed files on the left and the selected file's diff on the right.
+// Gentle Shell changes overlay: a framed two-pane view with the working
+// tree's changed files on the left and the selected file's diff on the right.
 // Git access is injected so the component renders without a repository.
 
 export interface ChangesViewTheme {
@@ -108,7 +108,7 @@ export class ChangesView {
 		const inner = width - 2;
 		const listWidth = Math.min(LIST_MAX_WIDTH, Math.floor(inner * LIST_RATIO));
 		const diffWidth = inner - listWidth - 4;
-		const titleText = `✎ Session changes · ${changesSummary(this.model)}`;
+		const titleText = `✎ Changes · ${changesSummary(this.model)}`;
 		const top = theme.fg(ROLE.FRAME, "╭─ ") + theme.fg(ROLE.TITLE, titleText) + theme.fg(ROLE.FRAME, ` ${rule(inner - visibleWidth(titleText) - 3)}╮`);
 		const rows = this.bodyRows();
 		const diff = this.visibleDiff(rows);

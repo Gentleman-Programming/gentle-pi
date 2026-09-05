@@ -10,7 +10,7 @@ import { ChangesView } from "../lib/shell-changes-view.ts";
 import { framePromptLines, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
 
 // Gentle Shell: the visual layer gentle-pi puts on top of pi. It installs the
-// status bar, the petal prompt, the session changes widget and overlay;
+// status bar, the petal prompt, the working-tree changes widget and overlay;
 // later slices add subscription usage and cards.
 
 export interface ShellFooterData {
@@ -275,12 +275,12 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		showChanges(ctx, tracker.model);
 	});
 	pi.registerCommand(CHANGES_COMMAND_NAME, {
-		description: "Show the files this session changed, with diffs. Press o to open one in $EDITOR.",
+		description: "Show the working tree changes against HEAD, with diffs. Press o to open a file in $EDITOR.",
 		handler: async (_args, ctx) => {
 			if (!changes) return;
 			const model = await changes.refresh();
 			if (model.files.length === 0) {
-				ctx.ui.notify("No session changes yet.", "info");
+				ctx.ui.notify("No changes in the working tree.", "info");
 				return;
 			}
 			await showChangesOverlay(ctx, model, gitRunner(pi, ctx.cwd));

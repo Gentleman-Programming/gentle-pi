@@ -1,7 +1,7 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
-// Gentle Shell changes: what the agent touched during this session. Git is
-// the source of truth; this module turns raw `git diff --numstat` and
+// Gentle Shell changes: the working tree against HEAD, new files included.
+// Git is the source of truth; this module turns raw `git diff --numstat` and
 // `git status --porcelain -z` output into a model and renders the widget.
 
 export const CHANGE_STATUS = {
@@ -104,15 +104,8 @@ export function snapshotChanges(snapshot: ChangesSnapshot): ChangedFile[] {
 	return files;
 }
 
-function fingerprint(file: ChangedFile): string {
-	return `${file.status}:${file.added}:${file.deleted}`;
-}
-
-export function sessionChanges(current: ChangedFile[], baseline: ChangedFile[]): ChangesModel {
-	const untouched = new Map(baseline.map((file) => [file.path, fingerprint(file)]));
-	const files = current
-		.filter((file) => untouched.get(file.path) !== fingerprint(file))
-		.sort((a, b) => a.path.localeCompare(b.path));
+export function changesModel(changed: ChangedFile[]): ChangesModel {
+	const files = [...changed].sort((a, b) => a.path.localeCompare(b.path));
 	return {
 		files,
 		added: files.reduce((total, file) => total + file.added, 0),
@@ -150,13 +143,12 @@ const noLines: LineCounter = async () => 0;
 const NUMSTAT_ARGS = ["diff", "--numstat", "HEAD"];
 const PORCELAIN_ARGS = ["status", "--porcelain=v1", "--untracked-files=all", "-z"];
 
-// Tracks session changes against a baseline captured at session start.
-// Concurrent refreshes coalesce: one git round-trip runs at a time and a
-// refresh requested meanwhile triggers exactly one more.
+// Tracks working-tree changes. Concurrent refreshes coalesce: one git
+// round-trip runs at a time and a refresh requested meanwhile triggers
+// exactly one more.
 export class ChangesTracker {
 	private readonly git: GitRunner;
 	private readonly countLines: LineCounter;
-	private baseline: ChangedFile[] = [];
 	private current: ChangesModel = emptyChanges();
 	private available = false;
 	private inFlight: Promise<ChangesModel> | undefined;
@@ -174,8 +166,7 @@ export class ChangesTracker {
 	async start(): Promise<void> {
 		const files = await this.capture();
 		this.available = files !== undefined;
-		this.baseline = files ?? [];
-		this.current = emptyChanges();
+		this.current = files ? changesModel(files) : emptyChanges();
 	}
 
 	async refresh(): Promise<ChangesModel> {
@@ -196,7 +187,7 @@ export class ChangesTracker {
 		do {
 			this.queued = false;
 			const files = await this.capture();
-			if (files) this.current = sessionChanges(files, this.baseline);
+			if (files) this.current = changesModel(files);
 		} while (this.queued);
 		return this.current;
 	}

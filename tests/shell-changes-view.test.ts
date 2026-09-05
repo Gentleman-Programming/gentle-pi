@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { CHANGE_STATUS, sessionChanges, type ChangedFile } from "../lib/shell-changes.ts";
+import { CHANGE_STATUS, changesModel, type ChangedFile } from "../lib/shell-changes.ts";
 import { ChangesView, colorDiff, type ChangesViewDeps } from "../lib/shell-changes-view.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 
@@ -47,7 +47,7 @@ function view(overrides: Partial<ChangesViewDeps> = {}, files = [file("lib/a.ts"
 		},
 		...overrides,
 	};
-	return { view: new ChangesView(sessionChanges(files, []), deps), calls, events };
+	return { view: new ChangesView(changesModel(files), deps), calls, events };
 }
 
 async function settle(): Promise<void> {
@@ -72,7 +72,7 @@ test("ChangesView renders a framed two-pane layout at the requested size", async
 	assert.equal(lines.length, 12);
 	for (const line of lines) assert.equal(visibleWidth(line), 80, `"${stripAnsi(line)}" is not 80 wide`);
 	const plain = lines.map(stripAnsi);
-	assert.match(plain[0], /^╭─ ✎ Session changes · 2 files · \+12 −1 ─+╮$/);
+	assert.match(plain[0], /^╭─ ✎ Changes · 2 files · \+12 −1 ─+╮$/);
 	assert.match(plain[1], /^│ ▸ lib\/a\.ts +\+2 −1 +│ @@ -1,2 \+1,3 @@ +│$/);
 	assert.match(plain[2], /^│   lib\/b\.ts +\+10 new +│  const a = 1; +│$/);
 	assert.match(plain[11], /^╰─+╯$/);

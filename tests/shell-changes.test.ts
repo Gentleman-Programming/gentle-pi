@@ -9,13 +9,13 @@ import {
 	parseNumstat,
 	parsePorcelain,
 	renderChangesWidget,
-	sessionChanges,
+	changesModel,
 	snapshotChanges,
 	type ChangedFile,
 } from "../lib/shell-changes.ts";
 
-// The changes view shows what the agent touched during this session: git
-// state now, minus whatever was already dirty when the session started.
+// The changes view shows the working tree against HEAD, new files included,
+// so a resumed session sees the same picture as a fresh one.
 
 const plainTheme = {
 	fg(_color: string, text: string) {
@@ -73,25 +73,17 @@ test("snapshotChanges merges status with counts and keeps untracked files withou
 	assert.deepEqual(files, [file("lib/a.ts", 4, 2), file("notes.md", 0, 0, CHANGE_STATUS.UNTRACKED)]);
 });
 
-test("sessionChanges drops files that look exactly as they did when the session started", () => {
-	const baseline = [file("lib/a.ts", 4, 2), file("notes.md", 0, 0, CHANGE_STATUS.UNTRACKED)];
-	const now = [file("lib/a.ts", 4, 2), file("notes.md", 0, 0, CHANGE_STATUS.UNTRACKED), file("lib/b.ts", 10, 0, CHANGE_STATUS.ADDED)];
-	const model = sessionChanges(now, baseline);
-	assert.deepEqual(model.files, [file("lib/b.ts", 10, 0, CHANGE_STATUS.ADDED)]);
-	assert.equal(model.added, 10);
-	assert.equal(model.deleted, 0);
-});
-
-test("sessionChanges keeps a pre-dirty file once its counts move", () => {
-	const baseline = [file("lib/a.ts", 4, 2)];
-	const model = sessionChanges([file("lib/a.ts", 9, 2)], baseline);
-	assert.deepEqual(model.files, [file("lib/a.ts", 9, 2)]);
+test("changesModel sorts files by path and totals the counts", () => {
+	const model = changesModel([file("lib/b.ts", 10, 0, CHANGE_STATUS.ADDED), file("lib/a.ts", 4, 2)]);
+	assert.deepEqual(model.files, [file("lib/a.ts", 4, 2), file("lib/b.ts", 10, 0, CHANGE_STATUS.ADDED)]);
+	assert.equal(model.added, 14);
+	assert.equal(model.deleted, 2);
 });
 
 test("changesSummary and the widget describe the session at a glance", () => {
-	const model = sessionChanges([file("extensions/gentle-shell.ts", 31, 0, CHANGE_STATUS.ADDED), file("lib/shell-bar.ts", 9, 7), file("tests/x.test.ts", 2, 0)], []);
+	const model = changesModel([file("extensions/gentle-shell.ts", 31, 0, CHANGE_STATUS.ADDED), file("lib/shell-bar.ts", 9, 7), file("tests/x.test.ts", 2, 0)]);
 	assert.equal(changesSummary(model), "3 files · +42 −7");
-	assert.equal(changesSummary(sessionChanges([file("a.ts", 1, 0)], [])), "1 file · +1 −0");
+	assert.equal(changesSummary(changesModel([file("a.ts", 1, 0)])), "1 file · +1 −0");
 
 	const [line, ...rest] = renderChangesWidget(model, plainTheme, 120);
 	assert.equal(rest.length, 0);
@@ -99,7 +91,7 @@ test("changesSummary and the widget describe the session at a glance", () => {
 });
 
 test("renderChangesWidget colors counts by direction and yields nothing when clean", () => {
-	const model = sessionChanges([file("a.ts", 1, 2)], []);
+	const model = changesModel([file("a.ts", 1, 2)]);
 	const [line] = renderChangesWidget(model, taggedTheme, 400);
 	assert.match(line, /<accent>✎<\/accent>/);
 	assert.match(line, /<success>\+1<\/success> <error>−2<\/error>/);
@@ -108,7 +100,7 @@ test("renderChangesWidget colors counts by direction and yields nothing when cle
 });
 
 test("renderChangesWidget drops the file list before truncating on narrow terminals", () => {
-	const model = sessionChanges([file("a/very/long/path/one.ts", 1, 0), file("a/very/long/path/two.ts", 1, 0)], []);
+	const model = changesModel([file("a/very/long/path/one.ts", 1, 0), file("a/very/long/path/two.ts", 1, 0)]);
 	const [line] = renderChangesWidget(model, plainTheme, 40);
 	assert.ok(visibleWidth(line) <= 40);
 	assert.match(line, /^✎ 2 files · \+2 −0/);
@@ -127,16 +119,16 @@ function fakeGit(numstats: string[], porcelains: string[], code = 0) {
 	return { git, calls };
 }
 
-test("ChangesTracker captures a baseline on start and reports only later changes", async () => {
+test("ChangesTracker reads the working tree on start and again on refresh", async () => {
 	const { git, calls } = fakeGit(
 		["4\t2\tlib/a.ts\n", "4\t2\tlib/a.ts\n10\t0\tlib/b.ts\n"],
 		[" M lib/a.ts\0", " M lib/a.ts\0A  lib/b.ts\0"],
 	);
 	const tracker = new ChangesTracker(git);
 	await tracker.start();
-	assert.deepEqual(tracker.model, emptyChanges());
+	assert.deepEqual(tracker.model.files, [file("lib/a.ts", 4, 2)]);
 	const model = await tracker.refresh();
-	assert.deepEqual(model.files, [file("lib/b.ts", 10, 0, CHANGE_STATUS.ADDED)]);
+	assert.deepEqual(model.files, [file("lib/a.ts", 4, 2), file("lib/b.ts", 10, 0, CHANGE_STATUS.ADDED)]);
 	assert.equal(calls.length, 4);
 	assert.deepEqual(calls[0], ["diff", "--numstat", "HEAD"]);
 	assert.deepEqual(calls[1], ["status", "--porcelain=v1", "--untracked-files=all", "-z"]);

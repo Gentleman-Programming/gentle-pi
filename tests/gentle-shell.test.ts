@@ -244,10 +244,10 @@ function renderFooter(ui: FakeUi): string {
 	return factory(fakeTui, plainTheme, footerData).render(160)[0];
 }
 
-test("gentleShell tracks session changes in a widget below the editor and in the bar", async () => {
+test("gentleShell shows working-tree changes in a widget below the editor and in the bar", async () => {
 	const { pi, handlers, git } = fakePi([
-		{ numstat: "4\t2\tlib/a.ts\n", porcelain: " M lib/a.ts\0" },
-		{ numstat: "4\t2\tlib/a.ts\n10\t0\tlib/b.ts\n", porcelain: " M lib/a.ts\0A  lib/b.ts\0" },
+		{ numstat: "", porcelain: "" },
+		{ numstat: "10\t0\tlib/b.ts\n", porcelain: "A  lib/b.ts\0" },
 	]);
 	gentleShell(pi, {});
 	const { ctx, ui } = fakeContext();
@@ -276,7 +276,7 @@ test("gentleShell registers /gentle:changes and opens the overlay only when ther
 	assert.ok(command, "command not registered");
 
 	await command.handler("", ctx);
-	assert.deepEqual(ui.notices, ["No session changes yet."]);
+	assert.deepEqual(ui.notices, ["No changes in the working tree."]);
 	assert.equal(ui.overlay, undefined);
 
 	await fire(handlers, "tool_execution_end", ctx);
