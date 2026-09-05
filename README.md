@@ -584,6 +584,23 @@ Config shape (per agent):
 
 Legacy string entries are still accepted and treated as `model`-only config.
 
+## Gentle Shell
+
+Gentle Shell is the visual layer gentle-pi puts on top of pi. It follows the Gentle themes: one border language, champagne titles, rose for whatever is alive.
+
+The status bar replaces pi's three-line footer with a single line of segments:
+
+```text
+✿ gentle-pi ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ MCP: 3 servers enabled        Release notes
+```
+
+- Context is a gauge, not a number. It turns amber at 80% and red at 95%; after compaction it shows `?%` until the next response.
+- Cost carries `sub` when the active model runs on a subscription login.
+- Statuses other extensions publish through `setStatus` are appended as trailing segments; the session name sits at the right edge.
+- On narrow terminals the session name is dropped first, then trailing segments, before the line is truncated.
+
+Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer.
+
 ## Commands
 
 | Command                          | What it does                                                        |
