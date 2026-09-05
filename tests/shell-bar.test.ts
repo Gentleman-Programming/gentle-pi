@@ -37,6 +37,7 @@ function model(overrides: Partial<ShellBarModel> = {}): ShellBarModel {
 	return {
 		cwd: "~/work/gentle-pi",
 		branch: "main",
+		dirty: undefined,
 		sessionName: undefined,
 		modelId: "gpt-5.5",
 		effort: "medium",
@@ -94,6 +95,13 @@ test("renderShellBar colors the brand, model, effort, and gauge by role", () => 
 test("renderShellBar shows the branch as dirty-neutral and omits it outside git", () => {
 	const [line] = renderShellBar(model({ branch: null }), plainTheme, 160);
 	assert.match(line, /⟡ ~\/work\/gentle-pi ⟡/);
+});
+
+test("renderShellBar shows the session dirty count next to the branch", () => {
+	const [line] = renderShellBar(model({ dirty: 3 }), taggedTheme, 400);
+	assert.match(line, /<text>main<\/text> <warning>±3<\/warning>/);
+	const [clean] = renderShellBar(model({ dirty: 0 }), plainTheme, 160);
+	assert.doesNotMatch(clean, /±/);
 });
 
 test("renderShellBar shows an unknown context as a question mark after compaction", () => {

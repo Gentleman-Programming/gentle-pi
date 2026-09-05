@@ -20,10 +20,18 @@ const plainTheme: ShellBarTheme = {
 interface FakeUi {
 	footerFactory: unknown;
 	editorFactory: unknown;
+	widgets: Map<string, unknown>;
 }
 
-function fakePi(): { pi: ExtensionAPI; handlers: Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>> } {
+interface GitScript {
+	numstat: string;
+	porcelain: string;
+}
+
+function fakePi(script: GitScript[] = [{ numstat: "", porcelain: "" }]): { pi: ExtensionAPI; handlers: Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>; git: string[][] } {
 	const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
+	const git: string[][] = [];
+	let round = 0;
 	const pi = {
 		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
 			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
@@ -31,12 +39,22 @@ function fakePi(): { pi: ExtensionAPI; handlers: Map<string, Array<(event: unkno
 		getThinkingLevel() {
 			return "medium";
 		},
+		async exec(_command: string, args: string[]) {
+			git.push(args);
+			const isNumstat = args.includes("diff");
+			const step = script[Math.min(isNumstat ? round : round++, script.length - 1)];
+			return { stdout: isNumstat ? step.numstat : step.porcelain, stderr: "", code: 0, killed: false };
+		},
 	} as unknown as ExtensionAPI;
-	return { pi, handlers };
+	return { pi, handlers, git };
+}
+
+async function fire(handlers: Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>, event: string, ctx: ExtensionContext): Promise<void> {
+	for (const handler of handlers.get(event) ?? []) await handler({}, ctx);
 }
 
 function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: boolean; pending?: boolean; editorFactory?: unknown } = {}): { ctx: ExtensionContext; ui: FakeUi } {
-	const ui: FakeUi = { footerFactory: undefined, editorFactory: options.editorFactory };
+	const ui: FakeUi = { footerFactory: undefined, editorFactory: options.editorFactory, widgets: new Map() };
 	const ctx = {
 		hasUI: options.hasUI ?? true,
 		hasPendingMessages: () => options.pending ?? false,
@@ -59,6 +77,10 @@ function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: bo
 			},
 			getEditorComponent() {
 				return ui.editorFactory;
+			},
+			setWidget(key: string, content: unknown) {
+				if (content === undefined) ui.widgets.delete(key);
+				else ui.widgets.set(key, content);
 			},
 		},
 	} as unknown as ExtensionContext;
@@ -195,4 +217,30 @@ test("gentleShell leaves an editor another extension already installed", () => {
 	const { ctx, ui } = fakeContext({ editorFactory: theirs });
 	for (const handler of handlers.get("session_start") ?? []) handler({}, ctx);
 	assert.equal(ui.editorFactory, theirs);
+});
+
+const footerData = { getGitBranch: () => "main", getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1, onBranchChange: () => () => {} };
+
+function renderFooter(ui: FakeUi): string {
+	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, footerData: unknown) => { render(width: number): string[] };
+	return factory(fakeTui, plainTheme, footerData).render(160)[0];
+}
+
+test("gentleShell tracks session changes in a widget below the editor and in the bar", async () => {
+	const { pi, handlers, git } = fakePi([
+		{ numstat: "4\t2\tlib/a.ts\n", porcelain: " M lib/a.ts\0" },
+		{ numstat: "4\t2\tlib/a.ts\n10\t0\tlib/b.ts\n", porcelain: " M lib/a.ts\0A  lib/b.ts\0" },
+	]);
+	gentleShell(pi, {});
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	assert.deepEqual(git[0].slice(0, 2), ["-C", "/repo"]);
+	assert.equal(ui.widgets.has("gentle-shell-changes"), false);
+	assert.doesNotMatch(renderFooter(ui), /±/);
+
+	await fire(handlers, "tool_execution_end", ctx);
+	const factory = ui.widgets.get("gentle-shell-changes") as (tui: unknown, theme: ShellBarTheme) => { render(width: number): string[] };
+	const [line] = factory(fakeTui, plainTheme).render(120);
+	assert.equal(line, "✎ 1 file · +10 −0 · lib/b.ts · /gentle:changes");
+	assert.match(renderFooter(ui), /main ±1/);
 });

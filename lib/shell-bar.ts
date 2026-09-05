@@ -7,6 +7,7 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 export interface ShellBarModel {
 	cwd: string;
 	branch: string | null;
+	dirty: number | undefined;
 	sessionName: string | undefined;
 	modelId: string;
 	effort: string | undefined;
@@ -38,6 +39,7 @@ const ROLE = {
 	SEPARATOR: "border",
 	PATH: "muted",
 	BRANCH: "text",
+	DIRTY: "warning",
 	MODEL: "text",
 	EFFORT: "syntaxFunction",
 	GAUGE_EMPTY: "border",
@@ -99,9 +101,10 @@ function paintGauge(percent: number | null, theme: ShellBarTheme): string {
 }
 
 function buildSegments(model: ShellBarModel, theme: ShellBarTheme): string[] {
+	const dirty = model.dirty ? ` ${theme.fg(ROLE.DIRTY, `±${model.dirty}`)}` : "";
 	const location = model.branch
-		? `${theme.fg(ROLE.PATH, model.cwd)} ${theme.fg(ROLE.BRANCH, model.branch)}`
-		: theme.fg(ROLE.PATH, model.cwd);
+		? `${theme.fg(ROLE.PATH, model.cwd)} ${theme.fg(ROLE.BRANCH, model.branch)}${dirty}`
+		: theme.fg(ROLE.PATH, model.cwd) + dirty;
 	const modelSegment = model.effort
 		? `${theme.fg(ROLE.MODEL, model.modelId)} ${theme.fg(ROLE.LABEL, "·")} ${theme.fg(ROLE.EFFORT, model.effort)}`
 		: theme.fg(ROLE.MODEL, model.modelId);

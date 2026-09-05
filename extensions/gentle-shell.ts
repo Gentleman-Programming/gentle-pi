@@ -2,11 +2,12 @@ import { CustomEditor, type ExtensionAPI, type ExtensionContext, type Keybinding
 import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
 import * as os from "node:os";
 import { renderShellBar, shellEnabled, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
+import { ChangesTracker, renderChangesWidget, type ChangesModel } from "../lib/shell-changes.ts";
 import { framePromptLines, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
 
 // Gentle Shell: the visual layer gentle-pi puts on top of pi. It installs the
-// status bar and the petal prompt; later slices add the changes view,
-// subscription usage, and cards.
+// status bar, the petal prompt, and the session changes widget; later slices
+// add the changes overlay, subscription usage, and cards.
 
 export interface ShellFooterData {
 	getGitBranch(): string | null;
@@ -27,6 +28,7 @@ interface ShellBarComponent {
 
 interface BuildOptions {
 	home?: string;
+	dirty?: number;
 }
 
 interface AssistantUsageEntry {
@@ -68,6 +70,7 @@ export function buildShellBarModel(
 	return {
 		cwd: shortenHome(ctx.sessionManager.getCwd(), home),
 		branch: footerData.getGitBranch(),
+		dirty: options.dirty,
 		sessionName: ctx.sessionManager.getSessionName(),
 		modelId: model?.id ?? "no-model",
 		effort: model?.reasoning ? pi.getThinkingLevel() : undefined,
@@ -85,11 +88,12 @@ export function createShellBarComponent(
 	host: ShellRenderHost,
 	theme: ShellBarTheme,
 	footerData: ShellFooterData,
+	dirty: () => number | undefined = () => undefined,
 ): ShellBarComponent {
 	const unsubscribe = footerData.onBranchChange(() => host.requestRender());
 	return {
 		render(width: number) {
-			return renderShellBar(buildShellBarModel(pi, ctx, footerData), theme, width);
+			return renderShellBar(buildShellBarModel(pi, ctx, footerData, { dirty: dirty() }), theme, width);
 		},
 		invalidate() {},
 		dispose() {
@@ -161,16 +165,60 @@ function installPrompt(ctx: ExtensionContext, onCreated: (prompt: GentlePromptEd
 	});
 }
 
+const CHANGES_WIDGET_KEY = "gentle-shell-changes";
+const GIT_TIMEOUT_MS = 5000;
+
+function gitRunner(pi: ExtensionAPI, cwd: string) {
+	return async (args: string[]) => {
+		const result = await pi.exec("git", ["-C", cwd, ...args], { timeout: GIT_TIMEOUT_MS });
+		return { stdout: result.stdout, code: result.code };
+	};
+}
+
+function showChanges(ctx: ExtensionContext, model: ChangesModel): void {
+	if (model.files.length === 0) {
+		ctx.ui.setWidget(CHANGES_WIDGET_KEY, undefined);
+		return;
+	}
+	ctx.ui.setWidget(
+		CHANGES_WIDGET_KEY,
+		(_tui, theme) => ({
+			render(width: number) {
+				return renderChangesWidget(model, theme, width);
+			},
+			invalidate() {},
+		}),
+		{ placement: "belowEditor" },
+	);
+}
+
 export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env): void {
 	if (!shellEnabled(env)) return;
 	let prompt: GentlePromptEditor | undefined;
-	pi.on("session_start", (_event, ctx) => {
+	let changes: ChangesTracker | undefined;
+	const refreshChanges = async (ctx: ExtensionContext) => {
+		if (!changes || !ctx.hasUI) return;
+		showChanges(ctx, await changes.refresh());
+	};
+	pi.on("session_start", async (_event, ctx) => {
 		if (!ctx.hasUI) return;
-		ctx.ui.setFooter((tui, theme, footerData) => createShellBarComponent(pi, ctx, tui, theme, footerData));
+		changes = new ChangesTracker(gitRunner(pi, ctx.cwd));
+		const tracker = changes;
+		ctx.ui.setFooter((tui, theme, footerData) =>
+			createShellBarComponent(pi, ctx, tui, theme, footerData, () => tracker.model.files.length),
+		);
 		installPrompt(ctx, (created) => {
 			prompt = created;
 		});
+		await tracker.start();
+		showChanges(ctx, tracker.model);
 	});
 	pi.on("agent_start", () => prompt?.setWorking(true));
-	pi.on("agent_end", () => prompt?.setWorking(false));
+	pi.on("agent_end", async (_event, ctx) => {
+		prompt?.setWorking(false);
+		await refreshChanges(ctx);
+	});
+	pi.on("tool_execution_end", async (_event, ctx) => {
+		await refreshChanges(ctx);
+	});
 }

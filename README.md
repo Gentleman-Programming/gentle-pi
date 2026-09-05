@@ -612,6 +612,16 @@ The prompt wraps pi's editor in a rounded frame with a petal that shows what the
 - The hint appears only while the editor is empty.
 - If another extension already installed a custom editor, Gentle Shell leaves it alone.
 
+Session changes show up below the editor as soon as the agent touches a file, and as `±N` next to the branch in the bar:
+
+```text
+✎ 3 files · +42 −7 · extensions/gentle-shell.ts, lib/shell-bar.ts, tests/x.test.ts · /gentle:changes
+```
+
+- The baseline is the git state when the session started, so files that were already dirty stay out of the count until their diff moves.
+- Counts refresh after every tool call and at the end of each turn, through `git diff --numstat` and `git status --porcelain`. Outside a git repository the widget stays hidden.
+- On narrow terminals the file list is dropped before the summary is truncated.
+
 Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer and editor.
 
 ## Commands
