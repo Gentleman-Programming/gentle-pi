@@ -75,7 +75,6 @@ test("native abandon carries the exact discarded-work authorization and audit re
 		snapshotIdentity: SHA,
 		capturedLensResults: ["00-risk.json"],
 		findingsPresent: true,
-		evidenceRecordsPresent: false,
 		actor: "maintainer",
 		reason: "discard candidate",
 	};
@@ -83,6 +82,33 @@ test("native abandon carries the exact discarded-work authorization and audit re
 	const result = await client(queue.adapter).abandon({ ...request, maintainerAuthorization: nativeReviewAbandonAuthorization(request) });
 	assert.equal(result.record.status, "committed");
 	assert.deepEqual(queue.calls[0]?.arguments.slice(0, 10), ["review", "abandon", "--cwd", "/repo", "--lineage", "abandoned", "--expected-revision", "revision-1", "--actor", "maintainer"]);
+});
+
+// gentle-ai 0ed9225f ("close on the last causal event") removed evidence records
+// from CompactDiscardedWorkSummary, so the native v2 gate verifies an exact
+// EIGHT-line binding with no evidence_records_present line. The facade-side
+// derivation must match that contract byte-for-byte or native rejects every
+// abandoned binding (issue #466).
+test("nativeReviewAbandonAuthorization renders the native eight-line v2 binding", () => {
+	const binding = nativeReviewAbandonAuthorization({
+		lineage: "review-abc",
+		expectedRevision: "revision-9",
+		snapshotIdentity: "snapshot-1",
+		capturedLensResults: ["00-risk.json", "01-refuter.json"],
+		findingsPresent: true,
+		actor: "maintainer",
+		reason: "operator_disposition",
+	});
+	assert.equal(binding, [
+		"gentle-ai.review-abandon-authorization/v2",
+		"lineage=review-abc",
+		"revision=revision-9",
+		"snapshot_identity=snapshot-1",
+		"reason=operator_disposition",
+		"captured_lens_results=00-risk.json,01-refuter.json",
+		"findings_present=true",
+		"actor=maintainer",
+	].join("\n"));
 });
 
 test("native quarantine retains published legacy-v1 maintenance compatibility", async () => {
@@ -215,7 +241,7 @@ test("native recovery operations reject malformed canonical inputs before a proc
 test("partial maintenance failures preserve the provider audit record and unknown mutation outcome", async () => {
 	const request = {
 		cwd: "/repo", lineage: "abandoned", expectedRevision: "revision-1", snapshotIdentity: SHA,
-		capturedLensResults: ["00-risk.json"], findingsPresent: true, evidenceRecordsPresent: false, actor: "maintainer", reason: "discard candidate",
+		capturedLensResults: ["00-risk.json"], findingsPresent: true, actor: "maintainer", reason: "discard candidate",
 	};
 	const queue = queuedAdapter([{ exitCode: 1, stdout: JSON.stringify({ operation: "review/abandon", record: { schema: "gentle-ai.review-reclaim-audit/v1", lineage_id: request.lineage, status: "partial" } }) }]);
 	await assert.rejects(
@@ -263,7 +289,6 @@ test("native abandon rejects a legacy authorization before process launch", asyn
 		snapshotIdentity: SHA,
 		capturedLensResults: ["00-risk.json"],
 		findingsPresent: true,
-		evidenceRecordsPresent: false,
 		actor: "maintainer",
 		reason: "discard candidate",
 	};
@@ -311,7 +336,7 @@ test("maintenance cancellation preserves the exact signal and unknown mutation o
 	const controller = new AbortController();
 	const request = {
 		cwd: "/repo", lineage: "abandoned", expectedRevision: "revision-1", snapshotIdentity: SHA,
-		capturedLensResults: ["00-risk.json"], findingsPresent: true, evidenceRecordsPresent: false,
+		capturedLensResults: ["00-risk.json"], findingsPresent: true,
 		actor: "maintainer", reason: "discard candidate",
 	};
 	const adapter: ExecFileAdapter = async (call) => {
