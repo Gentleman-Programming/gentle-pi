@@ -170,3 +170,17 @@ test("ChangesTracker coalesces overlapping refreshes into at most one extra roun
 	await Promise.all([first, second, third]);
 	assert.equal(rounds, 3);
 });
+
+test("ChangesTracker counts the lines of untracked files, which git numstat leaves out", async () => {
+	const { git } = fakeGit(["", ""], ["", "?? notes.md\0?? empty.md\0"]);
+	const counted: string[] = [];
+	const tracker = new ChangesTracker(git, async (path) => {
+		counted.push(path);
+		return path === "notes.md" ? 3 : 0;
+	});
+	await tracker.start();
+	const model = await tracker.refresh();
+	assert.deepEqual(model.files, [file("empty.md", 0, 0, CHANGE_STATUS.UNTRACKED), file("notes.md", 3, 0, CHANGE_STATUS.UNTRACKED)]);
+	assert.equal(model.added, 3);
+	assert.deepEqual(counted, ["notes.md", "empty.md"]);
+});

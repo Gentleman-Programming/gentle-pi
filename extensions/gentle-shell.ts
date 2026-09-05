@@ -1,9 +1,11 @@
 import { CustomEditor, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
 import { spawnSync } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import * as os from "node:os";
+import { join } from "node:path";
 import { renderShellBar, shellEnabled, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
-import { CHANGE_STATUS, ChangesTracker, renderChangesWidget, type ChangedFile, type ChangesModel, type GitRunner } from "../lib/shell-changes.ts";
+import { CHANGE_STATUS, ChangesTracker, renderChangesWidget, type ChangedFile, type ChangesModel, type GitRunner, type LineCounter } from "../lib/shell-changes.ts";
 import { ChangesView } from "../lib/shell-changes-view.ts";
 import { framePromptLines, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
 
@@ -180,6 +182,14 @@ function gitRunner(pi: ExtensionAPI, cwd: string): GitRunner {
 	};
 }
 
+function lineCounter(cwd: string): LineCounter {
+	return async (path: string) => {
+		const text = await readFile(join(cwd, path), "utf8");
+		if (text.length === 0) return 0;
+		return text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
+	};
+}
+
 export async function loadFileDiff(git: GitRunner, file: ChangedFile): Promise<string> {
 	const args = file.status === CHANGE_STATUS.UNTRACKED ? ["diff", "--no-index", "--", "/dev/null", file.path] : ["diff", "HEAD", "--", file.path];
 	const result = await git(args);
@@ -253,7 +263,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	};
 	pi.on("session_start", async (_event, ctx) => {
 		if (!ctx.hasUI) return;
-		changes = new ChangesTracker(gitRunner(pi, ctx.cwd));
+		changes = new ChangesTracker(gitRunner(pi, ctx.cwd), lineCounter(ctx.cwd));
 		const tracker = changes;
 		ctx.ui.setFooter((tui, theme, footerData) =>
 			createShellBarComponent(pi, ctx, tui, theme, footerData, () => tracker.model.files.length),

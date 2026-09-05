@@ -143,6 +143,9 @@ export interface GitResult {
 }
 
 export type GitRunner = (args: string[]) => Promise<GitResult>;
+export type LineCounter = (path: string) => Promise<number>;
+
+const noLines: LineCounter = async () => 0;
 
 const NUMSTAT_ARGS = ["diff", "--numstat", "HEAD"];
 const PORCELAIN_ARGS = ["status", "--porcelain=v1", "--untracked-files=all", "-z"];
@@ -152,14 +155,16 @@ const PORCELAIN_ARGS = ["status", "--porcelain=v1", "--untracked-files=all", "-z
 // refresh requested meanwhile triggers exactly one more.
 export class ChangesTracker {
 	private readonly git: GitRunner;
+	private readonly countLines: LineCounter;
 	private baseline: ChangedFile[] = [];
 	private current: ChangesModel = emptyChanges();
 	private available = false;
 	private inFlight: Promise<ChangesModel> | undefined;
 	private queued = false;
 
-	constructor(git: GitRunner) {
+	constructor(git: GitRunner, countLines: LineCounter = noLines) {
 		this.git = git;
+		this.countLines = countLines;
 	}
 
 	get model(): ChangesModel {
@@ -199,6 +204,11 @@ export class ChangesTracker {
 	private async capture(): Promise<ChangedFile[] | undefined> {
 		const [numstat, porcelain] = await Promise.all([this.git(NUMSTAT_ARGS), this.git(PORCELAIN_ARGS)]);
 		if (numstat.code !== 0 || porcelain.code !== 0) return undefined;
-		return snapshotChanges({ numstat: numstat.stdout, porcelain: porcelain.stdout });
+		const files = snapshotChanges({ numstat: numstat.stdout, porcelain: porcelain.stdout });
+		// Untracked files never appear in numstat; count their lines directly.
+		for (const file of files) {
+			if (file.status === CHANGE_STATUS.UNTRACKED) file.added = await this.countLines(file.path).catch(() => 0);
+		}
+		return files;
 	}
 }
