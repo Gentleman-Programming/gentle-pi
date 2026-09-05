@@ -1,16 +1,21 @@
 import { keyHint, type AgentToolResult } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { CARD_TONE, cardBottom, cardInnerWidth, cardLine, cardTop, type Card, type CardTheme, type CardTone } from "./shell-card.ts";
 import { sanitizeTerminalText } from "./terminal-theme.ts";
 
-type GentleAiLifecycleColor = "warning" | "success" | "error" | "dim";
+// Gentle AI tool cards: every call into the gentle-ai binary and every
+// gentle_review tool draws the same card as the other Gentle notices. The
+// call component owns the top rule; the result component closes the frame.
 
-export interface GentleAiRenderTheme {
-	bold(value: string): string;
-	fg(color: GentleAiLifecycleColor, value: string): string;
-}
+export type GentleAiRenderTheme = CardTheme;
 
 export interface GentleAiRenderState {
-	lifecycleComponent?: boolean; genericLocked?: boolean;
+	lifecycleComponent?: boolean;
+	genericLocked?: boolean;
+	/** Set by the result renderer once a final result exists, so a replayed
+	 * call (which pi never marks as started) still shows its outcome. */
+	finished?: boolean;
+	failed?: boolean;
 }
 
 export interface GentleAiRenderContext {
@@ -20,7 +25,30 @@ export interface GentleAiRenderContext {
 	isError?: boolean;
 	lastComponent?: unknown;
 	state?: unknown;
+	invalidate?: () => void;
 }
+
+const LIFECYCLE_STATUS = {
+	PREPARING: "preparing",
+	RUNNING: "running",
+	COMPLETED: "completed",
+	FAILED: "failed",
+} as const;
+
+type LifecycleStatus = (typeof LIFECYCLE_STATUS)[keyof typeof LIFECYCLE_STATUS];
+
+const STATUS_TONE: Record<LifecycleStatus, CardTone> = {
+	[LIFECYCLE_STATUS.PREPARING]: CARD_TONE.WARNING,
+	[LIFECYCLE_STATUS.RUNNING]: CARD_TONE.WARNING,
+	[LIFECYCLE_STATUS.COMPLETED]: CARD_TONE.SUCCESS,
+	[LIFECYCLE_STATUS.FAILED]: CARD_TONE.ERROR,
+};
+
+const CARD_TITLE = "Gentle AI";
+// The binary keeps its rose; Gentle Shell notices keep the flower.
+const CARD_GLYPH = "\u{1F339}\uFE0E";
+const DETAIL_ROLE = "dim";
+const passthroughTheme: CardTheme = { fg: (_color, text) => text };
 
 export function getGentleAiRenderState(state: unknown): GentleAiRenderState | undefined {
 	if (!state || typeof state !== "object" || Array.isArray(state)) return undefined;
@@ -29,19 +57,86 @@ export function getGentleAiRenderState(state: unknown): GentleAiRenderState | un
 	return (rowState.gentleAiRender = {} as GentleAiRenderState);
 }
 
+// The call row: the top rule and, when expanded, the command. pi renders the
+// result component right below it, and that one closes the frame.
+export class GentleAiCallCard {
+	private card: Card = { title: CARD_TITLE, body: [], tone: CARD_TONE.WARNING };
+	private theme: CardTheme = passthroughTheme;
+	private detail: string | undefined;
+
+	update(status: LifecycleStatus, operationPath: string, theme: CardTheme, detail?: string): void {
+		this.card = { title: CARD_TITLE, subtitle: `${status} · ${operationPath}`, body: [], tone: STATUS_TONE[status], glyph: CARD_GLYPH };
+		this.theme = theme;
+		this.detail = detail;
+	}
+
+	render(width: number): string[] {
+		const lines = [cardTop(this.card, this.theme, width)];
+		if (this.detail) lines.push(cardLine(this.theme.fg(DETAIL_ROLE, this.detail), this.card.tone, this.theme, width));
+		return lines;
+	}
+
+	invalidate(): void {}
+}
+
+// The result rows: the body when expanded, the expand hint when collapsed,
+// and always the bottom rule that closes the call card above. The rail
+// follows the outcome: amber while partial, green when done, red on error.
+export class GentleAiResultCard {
+	private readonly text: string;
+	private readonly expanded: boolean;
+	private readonly tone: CardTone;
+	private readonly theme: CardTheme;
+
+	constructor(text: string, expanded: boolean, tone: CardTone, theme: CardTheme) {
+		this.text = text;
+		this.expanded = expanded;
+		this.tone = tone;
+		this.theme = theme;
+	}
+
+	render(width: number): string[] {
+		const lines: string[] = [];
+		if (this.text.length > 0) {
+			if (this.expanded) {
+				const innerWidth = cardInnerWidth(width);
+				for (const raw of this.text.split("\n")) {
+					for (const line of raw === "" ? [""] : wrapTextWithAnsi(raw, innerWidth)) lines.push(cardLine(line, this.tone, this.theme, width));
+				}
+			} else {
+				lines.push(cardLine(keyHint("app.tools.expand", "to expand"), this.tone, this.theme, width));
+			}
+		}
+		lines.push(cardBottom(this.tone, this.theme, width));
+		return lines;
+	}
+
+	invalidate(): void {}
+}
+
 export interface GentleAiResultRenderOptions {
 	expanded?: boolean;
+	isPartial?: boolean;
+	isError?: boolean;
 }
 
 export function renderGentleAiResult(
 	result: AgentToolResult<unknown>,
 	options: GentleAiResultRenderOptions,
-): Text {
+	theme: CardTheme = passthroughTheme,
+	context?: GentleAiRenderContext,
+): GentleAiResultCard {
 	const textItems = result.content.flatMap((content) => (content.type === "text" ? [sanitizeTerminalText(content.text)] : []));
-	const text = textItems.join("\n");
-	const hasExpandableText = textItems.some((item) => item.length > 0);
-	const output = !hasExpandableText ? "" : options.expanded ? text : keyHint("app.tools.expand", "to expand");
-	return new Text(output, 0, 0);
+	const text = textItems.some((item) => item.length > 0) ? textItems.join("\n") : "";
+	const tone = options.isError ? CARD_TONE.ERROR : options.isPartial ? CARD_TONE.WARNING : CARD_TONE.SUCCESS;
+	const state = getGentleAiRenderState(context?.state);
+	if (state && options.isPartial !== true) {
+		const changed = state.finished !== true || state.failed !== (options.isError === true);
+		state.finished = true;
+		state.failed = options.isError === true;
+		if (changed) context?.invalidate?.();
+	}
+	return new GentleAiResultCard(text, options.expanded === true, tone, theme);
 }
 
 export function renderGentleAiLifecycleCall(
@@ -49,22 +144,23 @@ export function renderGentleAiLifecycleCall(
 	theme: GentleAiRenderTheme,
 	context?: GentleAiRenderContext,
 	detail?: string,
-): Text {
-	const status = context?.isError
-		? "failed"
-		: context?.argsComplete === false
-			? "preparing"
-			: !context?.executionStarted || context.isPartial
-				? "running"
-				: "completed";
-	const color = status === "preparing" || status === "running" ? "warning" : status === "completed" ? "success" : "error";
-	const lines = [theme.fg(color, theme.bold(`🌹︎ Gentle AI · ${status} · ${operationPath}`))];
-	if (detail) lines.push(theme.fg("dim", sanitizeTerminalText(detail)));
+): GentleAiCallCard {
+	// A finished execution is completed even when pi replays it without
+	// argsComplete (session reload); preparing only applies before it starts.
 	const state = getGentleAiRenderState(context?.state);
-	const component = context?.lastComponent instanceof Text && (!state || state.lifecycleComponent === true)
+	const finished = (context?.executionStarted === true && context.isPartial !== true) || state?.finished === true;
+	const failed = context?.isError === true || state?.failed === true;
+	const status: LifecycleStatus = failed
+		? LIFECYCLE_STATUS.FAILED
+		: finished
+			? LIFECYCLE_STATUS.COMPLETED
+			: context?.argsComplete === false
+				? LIFECYCLE_STATUS.PREPARING
+				: LIFECYCLE_STATUS.RUNNING;
+	const component = context?.lastComponent instanceof GentleAiCallCard && (!state || state.lifecycleComponent === true)
 		? context.lastComponent
-		: new Text("", 0, 0);
+		: new GentleAiCallCard();
 	if (state) state.lifecycleComponent = true;
-	component.setText(lines.join("\n"));
+	component.update(status, operationPath, theme, detail ? sanitizeTerminalText(detail) : undefined);
 	return component;
 }

@@ -608,7 +608,7 @@ The prompt wraps pi's editor in a rounded frame with a petal that shows what the
 ```
 
 - The petal is still while pi waits, spins with a `working` label while the agent works, and turns amber with a `queued` label when messages are waiting behind the current turn. pi's own "Working" row above the editor is hidden, since the frame already says it.
-- The frame keeps pi's border color, so bash mode and thinking levels still show through it, and the editor's scroll indicators stay inside the frame.
+- The frame uses the theme's border color over the panel background, so the prompt reads as one panel with the cards around it; the editor's scroll indicators stay inside the frame.
 - The hint appears only while the editor is empty.
 - If another extension already installed a custom editor, Gentle Shell leaves it alone.
 
@@ -650,7 +650,8 @@ Gentle notices are drawn as cards: the same rounded frame as the prompt, with th
 ╰──────────────────────────────────────────────────────────────────────╯
 ```
 
-- The review preflight reminder renders as a card in the transcript and collapses to two lines with pi's tool toggle.
+- Every call into the gentle-ai binary and every `gentle_review` tool renders as a card under the rose, `🌹︎ Gentle AI`: the frame is amber while it runs, green when it finished, red when it failed, and the result closes the frame with the expand hint or the output. Reviewer captures name their lens (`review capture · risk`; the group lists all four).
+- The review preflight reminder renders as a card in the transcript with the expand key in its top rule.
 - An active dev-binary override shows above the editor at startup, in amber, naming the binary and its digest, and leaves with the first prompt; an invalid override shows in red with the reason.
 - Todo and subagent widgets belong to their own packages and keep their rendering.
 
