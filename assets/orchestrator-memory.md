@@ -1,12 +1,13 @@
 # Orchestrator — Memory Detail (lazy-loaded)
 
-Bind this to the parent Pi session only, on SDD phase memory reads/writes. Not always-on; loaded on demand from `assets/orchestrator.md`'s `## Memory Contract` pointer.
+Bind this to the parent Pi session only, for direct inline tasks and SDD phase memory operations. Not always-on; loaded on demand from `assets/orchestrator.md`'s `## Memory Contract` pointer.
 
-### Direct Inline & General Tasks
+## Direct Inline & General Tasks
 
-When working outside of SDD (direct inline edits, bug fixes, configuration/deployment updates, or newly learned user conventions):
+When working outside SDD (direct inline edits, bug fixes, configuration/deployment updates, or newly learned user conventions):
 - The parent session MUST invoke `mem_save` immediately upon completing the action before emitting the final response.
 - Never defer persistence to session close. Direct inline tasks skip SDD planning ceremony, but NEVER skip hot memory persistence.
+- Save only validated, significant, project-scoped facts. Never save secrets, credentials, personal data, tokens, private keys, raw untrusted content, or speculative findings.
 
 ### SDD phases
 

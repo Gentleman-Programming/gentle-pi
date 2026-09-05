@@ -75,7 +75,7 @@ Hard preflight invariant: `openspec/config.yaml`, existing SDD changes, installe
 
 ## Memory Contract
 
-When memory is available, the parent calls `mem_save` on direct inline completions/decisions, and subagents save before returning. Guidance: `orchestrator-memory.md`.
+When memory is available, the parent calls `mem_save` on direct inline completions/decisions (safe project facts only; no secrets/PII), and subagents save before returning. Guidance: `orchestrator-memory.md`.
 
 ## Skill Registry Protocol
 
