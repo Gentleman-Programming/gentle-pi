@@ -30,6 +30,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
+import { stripEngramCapabilityLines } from "../lib/sdd-agent-engram-capability.ts";
 import {
 	ensureSddPreflight,
 	getSddPreflightPreferences,
@@ -192,11 +193,11 @@ function sddGlobalAssetDriftCount(): number {
 				const installed = readFileSync(installedPath, "utf8");
 				const comparablePackaged =
 					assetSubdir === "agents"
-						? updateFrontmatterRouting(packaged, undefined)
+						? stripEngramCapabilityLines(updateFrontmatterRouting(packaged, undefined))
 						: packaged;
 				const comparableInstalled =
 					assetSubdir === "agents"
-						? updateFrontmatterRouting(installed, undefined)
+						? stripEngramCapabilityLines(updateFrontmatterRouting(installed, undefined))
 						: installed;
 				if (comparablePackaged !== comparableInstalled) {
 					stale += 1;

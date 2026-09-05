@@ -4,6 +4,10 @@ import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveGentlePiAgentHome } from "./agent-home.ts";
+import {
+	resolveEngramExtensionEntry,
+	updateFrontmatterEngramCapability,
+} from "./sdd-agent-engram-capability.ts";
 import type { SddArtifactStore } from "./sdd-status.ts";
 
 export type { SddArtifactStore };
@@ -539,7 +543,7 @@ function removeRetiredManagedAssets(
 export function installSddAssets(
 	_cwd: string,
 	force: boolean,
-): { agents: number; chains: number; support: number; skipped: number } {
+): { agents: number; chains: number; support: number; skipped: number; engramStamps: number } {
 	const agentHome = gentlePiAgentHome();
 	const manifestPath = join(agentHome, "gentle-ai", MANAGED_ASSETS_MANIFEST);
 	let legacyAssetHashes: (() => Readonly<Record<string, readonly string[]>>) | undefined;
@@ -574,6 +578,11 @@ export function installSddAssets(
 		manifest,
 		legacyAssetHashes,
 	);
+	const engramStamps = stampInstalledAgentsEngramCapability(
+		join(agentHome, "agents"),
+		resolveEngramExtensionEntry(agentHome),
+		manifest,
+	);
 	mkdirSync(dirname(manifestPath), { recursive: true });
 	writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
 	return {
@@ -581,7 +590,44 @@ export function installSddAssets(
 		chains: chains.copied,
 		support: support.copied,
 		skipped: agents.skipped + chains.skipped + support.skipped,
+		engramStamps,
 	};
+}
+
+/**
+ * Stamp (or strip) the engram child-session capability line on package-managed
+ * installed agent files. Only files whose content still matches the manifest
+ * hash are touched, so user-edited agents stay untouched. Runs on every
+ * install/refresh pass, so the stamp self-heals when gentle-engram is
+ * installed or removed after the agents were copied.
+ */
+function stampInstalledAgentsEngramCapability(
+	installedAgentsDir: string,
+	engramExtensionEntry: string | undefined,
+	manifest: ManagedAssetsManifest,
+): number {
+	if (!existsSync(installedAgentsDir)) return 0;
+	let stamped = 0;
+	for (const entry of readdirSync(installedAgentsDir, { withFileTypes: true })) {
+		if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+		const ownershipKey = `agents/${entry.name}`;
+		const managedHash = manifest.assets[ownershipKey];
+		if (managedHash === undefined) continue;
+		const installedPath = join(installedAgentsDir, entry.name);
+		let installed: string;
+		try {
+			installed = readFileSync(installedPath, "utf8");
+		} catch {
+			continue;
+		}
+		if (managedAssetHash(installed) !== managedHash) continue;
+		const next = updateFrontmatterEngramCapability(installed, engramExtensionEntry);
+		if (next === installed) continue;
+		writeFileSync(installedPath, next);
+		manifest.assets[ownershipKey] = managedAssetHash(next);
+		stamped += 1;
+	}
+	return stamped;
 }
 
 export function isSddPreflightTrigger(text: string): boolean {
@@ -605,6 +651,8 @@ export function isSddPreflightTrigger(text: string): boolean {
 }
 
 export function sddPreflightSessionKey(ctx: ExtensionContext): string {
+	// SAFETY: ExtensionContext's public type does not expose sessionManager; it is
+	// probed opportunistically and absence falls back to ctx.cwd.
 	const manager = (ctx as unknown as { sessionManager?: unknown }).sessionManager;
 	if (isRecord(manager)) {
 		const getSessionFile = manager.getSessionFile;
@@ -623,6 +671,8 @@ export function sddPreflightSessionKey(ctx: ExtensionContext): string {
 
 function hasWritableEngramTool(pi: ExtensionAPI): boolean {
 	try {
+		// SAFETY: ExtensionAPI's public type does not declare getActiveTools; presence
+		// is probed at runtime and absence degrades to "engram unavailable".
 		const getActiveTools = (pi as unknown as { getActiveTools?: () => unknown[] })
 			.getActiveTools;
 		if (typeof getActiveTools !== "function") return false;

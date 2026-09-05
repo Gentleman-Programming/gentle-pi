@@ -103,6 +103,21 @@ test("artifact-producing SDD agents can persist OpenSpec files while status rema
 	assert.ok(!statusTools.includes("write"), "sdd-status.md must remain read-only");
 });
 
+test("SDD agent assets do not ship subagentOnlyExtensions (installer-stamped only)", () => {
+	// gentle-ai#602 / gentle-pi#593: the engram child capability line is stamped
+	// into INSTALLED agent frontmatter with the per-machine gentle-engram entry
+	// path. The shipped assets must stay machine-independent.
+	for (const fileName of readdirSync(assetsAgentsDir)) {
+		if (!fileName.endsWith(".md")) continue;
+		const frontmatter = readFrontmatter(join(assetsAgentsDir, fileName));
+		assert.doesNotMatch(
+			frontmatter,
+			/^subagentOnlyExtensions:/m,
+			`${fileName} must not ship a machine-specific subagentOnlyExtensions line`,
+		);
+	}
+});
+
 test("project does not ship local SDD agent overrides", () => {
 	for (const relativeDir of [join(".pi", "agents"), join(".pi", "subagents")]) {
 		const dir = join(repoRoot, relativeDir);
