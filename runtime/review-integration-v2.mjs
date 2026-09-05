@@ -80,7 +80,10 @@ const RISK_LEVELS = ["low", "medium", "high"]         ;
 const REVIEW_LENSES = ["review-risk", "review-resilience", "review-readability", "review-reliability"]         ;
 const RISK_REASON_CODES = ["configuration_change", "empty_content", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "process_boundary", "process_scan_limit", "service_token", "shell_source"]         ;
 const RISK_SIGNALS = ["auth", "update", "security", "payments", "permissions", "shell_process"]         ;
-const STATUS_ACTIONS = ["start", "recover", "maintainer_action", "select_lineage", "repair_authority", "stop"]         ;
+// "collect" and "execute" are the v2 envelope's projection of a live
+// transaction whose next_transition is mandatory: the root action names the
+// transition kind instead of reading as a terminal stop.
+const STATUS_ACTIONS = ["start", "recover", "maintainer_action", "select_lineage", "repair_authority", "stop", "collect", "execute"]         ;
 const RECEIPT_STATUSES = ["expected_missing", "present", "publication_pending", "not_applicable"]         ;
 
 export const REVIEW_STATUS_ACTION_DISPOSITION = {
