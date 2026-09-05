@@ -1,0 +1,132 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
+import {
+	formatCost,
+	formatTokens,
+	gaugeTone,
+	renderGauge,
+	renderShellBar,
+	shellEnabled,
+	type ShellBarModel,
+	type ShellBarTheme,
+} from "../lib/shell-bar.ts";
+
+// The Gentle Shell bar replaces pi's three-line footer with one line of
+// segments. Rendering is pure so it can be verified without a TUI.
+
+const taggedTheme: ShellBarTheme = {
+	fg(color: string, value: string) {
+		return `<${color}>${value}</${color}>`;
+	},
+	bold(value: string) {
+		return value;
+	},
+};
+
+const plainTheme: ShellBarTheme = {
+	fg(_color: string, value: string) {
+		return value;
+	},
+	bold(value: string) {
+		return value;
+	},
+};
+
+function model(overrides: Partial<ShellBarModel> = {}): ShellBarModel {
+	return {
+		cwd: "~/work/gentle-pi",
+		branch: "main",
+		sessionName: undefined,
+		modelId: "gpt-5.5",
+		effort: "medium",
+		contextPercent: 45,
+		contextWindow: 272_000,
+		costTotal: 9.49,
+		subscription: true,
+		statuses: [],
+		...overrides,
+	};
+}
+
+test("renderGauge fills cells proportionally to the percentage", () => {
+	assert.equal(renderGauge(45, 8), "▰▰▰▰▱▱▱▱");
+	assert.equal(renderGauge(0, 8), "▱▱▱▱▱▱▱▱");
+	assert.equal(renderGauge(100, 8), "▰▰▰▰▰▰▰▰");
+	assert.equal(renderGauge(null, 8), "▱▱▱▱▱▱▱▱");
+});
+
+test("gaugeTone turns to warning at 80% and error at 95%", () => {
+	assert.equal(gaugeTone(45), "accent");
+	assert.equal(gaugeTone(79.9), "accent");
+	assert.equal(gaugeTone(80), "warning");
+	assert.equal(gaugeTone(95), "error");
+	assert.equal(gaugeTone(null), "dim");
+});
+
+test("formatTokens and formatCost keep the bar compact", () => {
+	assert.equal(formatTokens(950), "950");
+	assert.equal(formatTokens(4_200), "4.2k");
+	assert.equal(formatTokens(272_000), "272k");
+	assert.equal(formatTokens(13_000_000), "13M");
+	assert.equal(formatCost(9.49, true), "$9.49 sub");
+	assert.equal(formatCost(0.004, false), "$0.004");
+});
+
+test("renderShellBar renders one line with the segments in order", () => {
+	const [line, ...rest] = renderShellBar(model(), plainTheme, 160);
+	assert.equal(rest.length, 0);
+	assert.equal(
+		line,
+		"✿ gentle-pi ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub",
+	);
+});
+
+test("renderShellBar colors the brand, model, effort, and gauge by role", () => {
+	const [line] = renderShellBar(model(), taggedTheme, 400);
+	assert.match(line, /<accent>✿ gentle-pi<\/accent>/);
+	assert.match(line, /<text>gpt-5\.5<\/text>/);
+	assert.match(line, /<syntaxFunction>medium<\/syntaxFunction>/);
+	assert.match(line, /<accent>▰▰▰▰<\/accent><border>▱▱▱▱<\/border>/);
+	assert.match(line, /<border>⟡<\/border>/);
+});
+
+test("renderShellBar shows the branch as dirty-neutral and omits it outside git", () => {
+	const [line] = renderShellBar(model({ branch: null }), plainTheme, 160);
+	assert.match(line, /⟡ ~\/work\/gentle-pi ⟡/);
+});
+
+test("renderShellBar shows an unknown context as a question mark after compaction", () => {
+	const [line] = renderShellBar(model({ contextPercent: null }), plainTheme, 160);
+	assert.match(line, /ctx ▱▱▱▱▱▱▱▱ \?%/);
+});
+
+test("renderShellBar right-aligns the session name when it fits", () => {
+	const [line] = renderShellBar(model({ sessionName: "Release notes" }), plainTheme, 120);
+	assert.equal(visibleWidth(line), 120);
+	assert.match(line, /Release notes$/);
+});
+
+test("renderShellBar appends extension statuses as trailing segments", () => {
+	const [line] = renderShellBar(model({ statuses: ["🔌 MCP: 3 servers\tenabled"] }), plainTheme, 160);
+	assert.match(line, /⟡ 🔌 MCP: 3 servers enabled$/);
+});
+
+test("renderShellBar drops the session name, then trailing segments, before truncating", () => {
+	const wide = model({ sessionName: "Release notes", statuses: ["MCP: 3 servers enabled"] });
+	const [atNinety] = renderShellBar(wide, plainTheme, 90);
+	assert.ok(visibleWidth(atNinety) <= 90, `line overflowed: ${visibleWidth(atNinety)}`);
+	assert.doesNotMatch(atNinety, /Release notes/);
+	assert.match(atNinety, /gpt-5\.5/);
+
+	const [atFifty] = renderShellBar(wide, plainTheme, 50);
+	assert.ok(visibleWidth(atFifty) <= 50, `line overflowed: ${visibleWidth(atFifty)}`);
+	assert.match(atFifty, /^✿ gentle-pi/);
+});
+
+test("shellEnabled honors GENTLE_PI_SHELL=0", () => {
+	assert.equal(shellEnabled({}), true);
+	assert.equal(shellEnabled({ GENTLE_PI_SHELL: "1" }), true);
+	assert.equal(shellEnabled({ GENTLE_PI_SHELL: "0" }), false);
+	assert.equal(shellEnabled({ GENTLE_PI_SHELL: "false" }), false);
+});
