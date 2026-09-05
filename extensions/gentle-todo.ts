@@ -53,6 +53,7 @@ const TOOL_PARAMETERS = {
 } as const;
 
 export function todoEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+	if (env.GENTLE_PI_AGENTS_CHILD === "1") return false;
 	const value = env.GENTLE_PI_TODO?.trim().toLowerCase();
 	return !(value === "0" || value === "false" || value === "off");
 }

@@ -137,12 +137,11 @@ Background execution is policy-gated: the always-on orchestrator prompt renders 
 
 When the policy is on and `subagent_run` is available:
 
-- Use `subagent_run` `mode: "background"` ONLY for independent, read-only exploration or audit work where the parent can continue non-overlapping work.
-- At the parent level, allow no more than 2 concurrent background tasks.
-- Completion notifications only: do not poll, sleep, run status checks, or proactively read for completion.
-- Use foreground `mode: "task"` when the result is needed before the next action, and always for user decisions, SDD apply or other writers, dependent verification evidence, archive, dependent phases, and any delegated work whose output determines the next action.
-- Do not duplicate launches or work, and do not overlap files or topics. Never run parallel writers in one worktree.
-- Background jobs are process-local and non-durable. A restart loses them; make no recovery claim.
+- Default to `subagent_run` `mode: "background"`. It returns a task id at once; the terminal stays free and the human keeps typing. Pass a `label` of three to six words naming the work.
+- When a background task finishes, its result arrives as a message in this session (custom type `gentle-agents.result`, one per task) and starts a new turn if you are idle. Wait for it: end the turn once launches and any non-overlapping work are done. Never poll, sleep, or call `subagent_status`/`subagent_result` for completion.
+- Use `mode: "task"` only when the subagent must ask the human something mid-flight (task-mode dialogs reach the human; background dialogs are dismissed) or when the human asked to wait.
+- Launch as many independent tasks as the work has; the runner queues beyond `max_concurrency`. Do not duplicate launches or work, and do not overlap files or topics. Never run parallel writers in one worktree.
+- Finished tasks persist across restarts; running ones are stopped when pi exits and must be relaunched, never claimed as recovered.
 <!-- /gentle-pi:background-subagents -->
 
 For generic non-SDD exploration and mapping, first attempt the installed package-owned `gentle-ai-explore`. If that individual role is missing or unusable, fall back to Pi's native `Agent` with the same read-only mapping constraints and report the fallback.
