@@ -5865,8 +5865,8 @@ function createGentleAiExtensionForTesting(
 				context as GentleAiRenderContext | undefined,
 			);
 		},
-		renderResult(result, options) {
-			return renderGentleAiResult(result, options);
+		renderResult(result, options, theme, context) {
+			return renderGentleAiResult(result, options, theme, context as GentleAiRenderContext | undefined);
 		},
 		async execute(_toolCallId, parameters) {
 			const input = parameters as ReviewScopeParameters;
@@ -5874,6 +5874,25 @@ function createGentleAiExtensionForTesting(
 			return { content: [{ type: "text", text: JSON.stringify(details) }], details };
 		},
 	});
+
+	// The lens a reviewer capture runs is inside its collect binding, so the
+	// card can say "review capture · risk" instead of a bare operation name.
+	const lensLabel = (lens: unknown): string | undefined =>
+		typeof lens === "string" && lens.length > 0 ? lens.replace(/^review-/, "") : undefined;
+	const collectBindingLens = (binding: unknown): string | undefined => {
+		if (typeof binding !== "string") return undefined;
+		try {
+			const parsed = JSON.parse(binding) as Record<string, unknown>;
+			const subject = (parsed.artifactSubject ?? parsed.artifact_subject) as Record<string, unknown> | undefined;
+			return lensLabel(subject?.lens);
+		} catch {
+			return undefined;
+		}
+	};
+	const withLenses = (operation: string, lenses: readonly (string | undefined)[]): string => {
+		const named = lenses.filter((lens): lens is string => lens !== undefined);
+		return named.length === 0 ? operation : `${operation} · ${named.join(" · ")}`;
+	};
 
 	pi.registerTool({
 		name: "gentle_review_capture_group",
@@ -5886,11 +5905,13 @@ function createGentleAiExtensionForTesting(
 		],
 		parameters: REVIEW_CAPTURE_GROUP_PARAMETERS,
 		executionMode: "sequential",
-		renderCall(_args, theme, context) {
-			return renderGentleAiLifecycleCall("review capture group", theme, context as GentleAiRenderContext | undefined);
+		renderCall(args, theme, context) {
+			const bindings = (args as { collectBindings?: unknown }).collectBindings;
+			const lenses = Array.isArray(bindings) ? bindings.map(collectBindingLens) : [];
+			return renderGentleAiLifecycleCall(withLenses("review capture group", lenses), theme, context as GentleAiRenderContext | undefined);
 		},
-		renderResult(result, options) {
-			return renderGentleAiResult(result, options);
+		renderResult(result, options, theme, context) {
+			return renderGentleAiResult(result, options, theme, context as GentleAiRenderContext | undefined);
 		},
 		async execute(_toolCallId, parameters, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Review capture group was cancelled");
@@ -5919,15 +5940,15 @@ function createGentleAiExtensionForTesting(
 		],
 		parameters: REVIEW_CAPTURE_PARAMETERS,
 		executionMode: "sequential",
-		renderCall(_args, theme, context) {
+		renderCall(args, theme, context) {
 			return renderGentleAiLifecycleCall(
-				"review capture",
+				withLenses("review capture", [collectBindingLens((args as { collectBinding?: unknown }).collectBinding)]),
 				theme,
 				context as GentleAiRenderContext | undefined,
 			);
 		},
-		renderResult(result, options) {
-			return renderGentleAiResult(result, options);
+		renderResult(result, options, theme, context) {
+			return renderGentleAiResult(result, options, theme, context as GentleAiRenderContext | undefined);
 		},
 		async execute(_toolCallId, parameters, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Review capture was cancelled");
@@ -5971,8 +5992,8 @@ function createGentleAiExtensionForTesting(
 				context as GentleAiRenderContext | undefined,
 			);
 		},
-		renderResult(result, options) {
-			return renderGentleAiResult(result, options);
+		renderResult(result, options, theme, context) {
+			return renderGentleAiResult(result, options, theme, context as GentleAiRenderContext | undefined);
 		},
 		async execute(_toolCallId, parameters, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Review controller operation was cancelled");

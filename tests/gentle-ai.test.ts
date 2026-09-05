@@ -16,6 +16,7 @@ import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import type { NativeReviewCli } from "../lib/native-review-cli.ts";
 import type { ReviewCollectInputV3, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
+import { cardBody, cardHint, cardTitle, cardTone } from "./gentle-card-text.ts";
 
 initTheme("dark");
 
@@ -112,10 +113,10 @@ test("registered Gentle Review tools render reusable rose lifecycle call rows", 
 		assert.strictEqual(initial, running);
 		assert.strictEqual(running, completed);
 		assert.strictEqual(completed, failed);
-		assert.equal(initialText, `<warning>🌹︎ Gentle AI · running · ${operationPath}</warning>`);
-		assert.equal(runningText, `<warning>🌹︎ Gentle AI · running · ${operationPath}</warning>`);
-		assert.equal(completedText, `<success>🌹︎ Gentle AI · completed · ${operationPath}</success>`);
-		assert.equal(failedText, `<error>🌹︎ Gentle AI · failed · ${operationPath}</error>`);
+		assert.equal(cardTitle(initialText), `🌹︎ Gentle AI · running · ${operationPath}`); assert.equal(cardTone(initialText), "warning");
+		assert.equal(cardTitle(runningText), `🌹︎ Gentle AI · running · ${operationPath}`); assert.equal(cardTone(runningText), "warning");
+		assert.equal(cardTitle(completedText), `🌹︎ Gentle AI · completed · ${operationPath}`); assert.equal(cardTone(completedText), "success");
+		assert.equal(cardTitle(failedText), `🌹︎ Gentle AI · failed · ${operationPath}`); assert.equal(cardTone(failedText), "error");
 		assert.doesNotMatch(renderComponent(failed), /future-operation|secret|private/);
 		for (const forbiddenValue of ["lineage-id", "binding-id", "sha256:hash-value", "secret-value", "arbitrary-value"]) {
 			assert.doesNotMatch(failedText, new RegExp(forbiddenValue));
@@ -159,20 +160,20 @@ test("registered Gentle Review tools preserve result envelopes and redact collap
 			{ expanded: false, isPartial: false, isError: true },
 		]) {
 			const collapsed = renderComponent(tool.renderResult({ content: [{ type: "text", text: resultText }] }, options, lifecycleTheme, {}));
-			assert.equal(collapsed, expandHint, `${name} collapsed output must contain one expand hint`);
-			assert.equal(collapsed.split("\n")[0], expandHint, `${name} collapsed output must start with the hint`);
+			assert.match(cardBody(collapsed), /\d+ lines?\b/, `${name} collapsed output must contain one expand hint`);
+			assert.match(cardBody(collapsed), /\d+ lines?\b/, `${name} collapsed output must start with the hint`);
 			assert.doesNotMatch(collapsed, /safe result|lineage=secret|private/);
 		}
 		const expanded = renderComponent(tool.renderResult({ content: [{ type: "text", text: resultText }] }, { expanded: true, isPartial: false, isError: true }, lifecycleTheme, {}));
-		assert.equal(expanded.split("\n")[0], "safe result");
+		assert.equal(cardBody(expanded).split("\n")[0], "safe result");
 		assert.match(expanded, /safe result/);
 		assert.match(expanded, /lineage=secret body=private/);
 		assert.doesNotMatch(expanded, /to expand/);
-		assert.doesNotMatch(expanded, /\x1b\[/);
+		assert.doesNotMatch(cardBody(expanded), /\x1b\[/);
 		const nonText = renderComponent(tool.renderResult({ content: [{ type: "image", data: "opaque", mimeType: "image/png" }] }, { expanded: true, isPartial: false }, lifecycleTheme, {}));
-		assert.equal(nonText, "");
+		assert.equal(cardBody(nonText), "");
 		const empty = renderComponent(tool.renderResult({ content: [{ type: "text", text: "" }] }, { expanded: false, isPartial: false }, lifecycleTheme, {}));
-		assert.equal(empty, "");
+		assert.equal(cardBody(empty), "");
 	}
 });
 
@@ -435,8 +436,8 @@ test("model panel render does not auto-apply the Gentle theme and sanitizes agen
 	const rendered = lines.join("\n");
 	const plain = stripAnsi(rendered);
 
-	assert.doesNotMatch(rendered, /\x1b\[38;2;71;85;105m/);
-	assert.doesNotMatch(rendered, /\x1b\[38;2;125;211;252m/);
+	assert.doesNotMatch(cardBody(rendered), /\x1b\[38;2;71;85;105m/);
+	assert.doesNotMatch(cardBody(rendered), /\x1b\[38;2;125;211;252m/);
 	assert.match(plain, /Assign Models and Effort to Agents/);
 	assert.match(plain, /safe-agent\s+model=inherit, effort=inherit/);
 	assert.doesNotMatch(plain, /\[31m/);
@@ -989,4 +990,19 @@ test("permission lifecycle is inactive for unguarded and headless commands", asy
 	} finally {
 		rmSync(cwd, { recursive: true, force: true });
 	}
+});
+
+test("registered Gentle Review capture tools name the lens they run", () => {
+	const tools = registeredGentleTools();
+	const binding = (lens: string) => JSON.stringify({ name: "reviewer_result", captureOperation: "review.capture-result", arguments: [], artifactSubject: { lens } });
+	const single = tools.get("gentle_review_capture")!.renderCall({ lineageId: "l", collectBinding: binding("review-risk") }, lifecycleTheme, lifecycleContext({ executionStarted: true }));
+	assert.equal(cardTitle(renderComponent(single)), "🌹︎ Gentle AI · running · review capture · risk");
+	const bare = tools.get("gentle_review_capture")!.renderCall({ lineageId: "l", collectBinding: "{not json" }, lifecycleTheme, lifecycleContext({ executionStarted: true }));
+	assert.equal(cardTitle(renderComponent(bare)), "🌹︎ Gentle AI · running · review capture");
+	const group = tools.get("gentle_review_capture_group")!.renderCall(
+		{ lineageId: "l", collectBindings: [binding("review-risk"), binding("review-resilience"), binding("review-readability"), binding("review-reliability")] },
+		lifecycleTheme,
+		lifecycleContext({ executionStarted: true }),
+	);
+	assert.equal(cardTitle(renderComponent(group)), "🌹︎ Gentle AI · running · review capture group · risk · resilience · readability · reliability");
 });

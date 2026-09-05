@@ -584,6 +584,79 @@ Config shape (per agent):
 
 Legacy string entries are still accepted and treated as `model`-only config.
 
+## Gentle Shell
+
+Gentle Shell is the visual layer gentle-pi puts on top of pi. It follows the Gentle themes: one border language, champagne titles, rose for whatever is alive.
+
+The status bar replaces pi's three-line footer with a single line of segments:
+
+```text
+✿ gentle-pi ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ MCP: 3 servers enabled        Release notes
+```
+
+- Context is a gauge, not a number. It turns amber at 80% and red at 95%; after compaction it shows `?%` until the next response.
+- Cost carries `sub` when the active model runs on a subscription login.
+- Statuses other extensions publish through `setStatus` are appended as trailing segments; the session name sits at the right edge.
+- On narrow terminals the session name is dropped first, then trailing segments, before the line is truncated.
+
+The prompt wraps pi's editor in a rounded frame with a petal that shows what the agent is doing:
+
+```text
+╭─ ✿ working ──────────────────────────────────────────╮
+│ type, or / for commands                              │
+╰──────────────────────────────────────────────────────╯
+```
+
+- The petal is still while pi waits, spins with a `working` label while the agent works, and turns amber with a `queued` label when messages are waiting behind the current turn. pi's own "Working" row above the editor is hidden, since the frame already says it.
+- The frame uses the theme's border color over the panel background, so the prompt reads as one panel with the cards around it; the editor's scroll indicators stay inside the frame.
+- The hint appears only while the editor is empty.
+- If another extension already installed a custom editor, Gentle Shell leaves it alone.
+
+Working-tree changes show up below the editor as soon as a file differs from HEAD, and as `±N` next to the branch in the bar:
+
+```text
+✎ 3 files · +42 −7 · extensions/gentle-shell.ts, lib/shell-bar.ts, tests/x.test.ts · /gentle:changes
+```
+
+- It is plain `git diff` against HEAD plus untracked files, so a resumed session shows the same picture as a fresh one.
+- Counts refresh after every tool call, at the end of each turn, and every 5 seconds in the background, so edits made from nvim or another agent show up without touching pi. `GENTLE_PI_SHELL_CHANGES_WATCH_MS` changes the interval; `off` leaves only the tool-driven refresh. Outside a git repository the widget stays hidden.
+- On narrow terminals the file list is dropped before the summary is truncated.
+
+`/gentle:changes` or `alt+g` opens the changes as an overlay: files on the left, the selected file's diff on the right.
+
+- `j`/`k` or the arrows move between files, `pgup`/`pgdn` scroll the diff, `esc` or `q` closes.
+- While the overlay is open, git is polled every 2 seconds, so edits made from nvim, another agent, or a checkout show up in place. The selection sticks to the file, and a diff reloads only when its counts move.
+- `GENTLE_PI_SHELL_CHANGES_KEY` rebinds the shortcut (pi key syntax, for example `ctrl+shift+g`); `off` disables it. On macOS, `alt+g` needs the terminal to send Option as Meta.
+- `o` (or `enter`) opens the selected file in `$VISUAL` or `$EDITOR` and returns to pi when the editor exits, so a jump into nvim and back never leaves the session.
+- Untracked files are diffed against an empty file so new files show their full content.
+
+Subscription usage shows in the bar after the cost, and `/gentle:usage` opens a panel with every window per provider:
+
+```text
+✿ gentle-pi ⟡ … ⟡ $9.49 sub ⟡ codex 5h ▰▰▰▰▰▱▱▱ 62% · week 31%
+```
+
+- For Codex, usage comes from the same account usage endpoint the Codex CLI reads, using the OAuth token pi already holds. It is fetched at session start, at most every 5 minutes after a turn, and on `r` in the panel. Rate-limit headers on SSE responses are picked up too.
+- For Claude Pro/Max, usage arrives in the rate-limit headers of every response, so the 5h and weekly windows appear after the first turn.
+- The bar names the subscription it shows (`codex`, `claude`) and always follows the active model. The panel puts the active provider first, marked with the petal, and says why it has no data when it does not: API-key providers have no subscription windows, Claude reports after the first response, Codex waits for a fetch.
+- Only the plan name and the windows are kept; account details in the payload are discarded.
+- Gauges turn amber at 80% and red at 95%, like the context gauge.
+
+Gentle notices are drawn as cards: the same rounded frame as the prompt, with the left rail and the title in the tone of the notice and the rest of the frame in the theme's border color.
+
+```text
+╭─ ✿ Gentle AI · review preflight ─────────────────────────────────────╮
+│ Receipt-driven development is enabled, and this worktree holds an…   │
+╰──────────────────────────────────────────────────────────────────────╯
+```
+
+- Every call into the gentle-ai binary and every `gentle_review` tool renders as a card under the rose, `🌹︎ Gentle AI`: the rail is amber while it runs, green when it finished, red when it failed; the expand key sits in the top rule once the tool finished, and the collapsed result shows only its line count. Reviewer captures name their lens (`review capture · risk`; the group lists all four).
+- The review preflight reminder renders as a card in the transcript with the expand key in its top rule.
+- An active dev-binary override shows above the editor at startup, in amber, naming the binary and its digest, and leaves with the first prompt; an invalid override shows in red with the reason.
+- Todo and subagent widgets belong to their own packages and keep their rendering.
+
+Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer and editor.
+
 ## Commands
 
 | Command                          | What it does                                                        |

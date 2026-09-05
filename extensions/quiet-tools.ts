@@ -653,7 +653,7 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArg
 				{ result: true, isPartial: options.isPartial },
 			).directResult;
 			if (directResult) {
-				return renderGentleAiResult(safeResult, { expanded: options.expanded });
+				return renderGentleAiResult(safeResult, { expanded: options.expanded, isPartial: options.isPartial, isError }, theme, renderContext as GentleAiRenderContext | undefined);
 			}
 			if (options.isPartial) {
 				if (options.expanded) return new Text(`${theme.fg("warning", partialLabel(toolName, text))}\n${theme.fg("muted", text)}`, 0, 0);
