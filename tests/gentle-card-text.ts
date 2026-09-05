@@ -28,3 +28,8 @@ export function cardBody(rendered: string): string {
 		.map((line) => line.replace(EDGE_LEFT, "").replace(EDGE_RIGHT, "").trimEnd())
 		.join("\n");
 }
+
+export function cardHint(rendered: string): string | undefined {
+	const first = rendered.split("\n")[0] ?? "";
+	return plain(first).match(/ ─+ (.+) ╮$/)?.[1];
+}

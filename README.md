@@ -642,7 +642,7 @@ Subscription usage shows in the bar after the cost, and `/gentle:usage` opens a 
 - Only the plan name and the windows are kept; account details in the payload are discarded.
 - Gauges turn amber at 80% and red at 95%, like the context gauge.
 
-Gentle notices are drawn as cards: the same rounded frame as the prompt, with the title in the tone of the notice.
+Gentle notices are drawn as cards: the same rounded frame as the prompt, with the left rail and the title in the tone of the notice and the rest of the frame in the theme's border color.
 
 ```text
 ╭─ ✿ Gentle AI · review preflight ─────────────────────────────────────╮
@@ -650,7 +650,7 @@ Gentle notices are drawn as cards: the same rounded frame as the prompt, with th
 ╰──────────────────────────────────────────────────────────────────────╯
 ```
 
-- Every call into the gentle-ai binary and every `gentle_review` tool renders as a card under the rose, `🌹︎ Gentle AI`: the frame is amber while it runs, green when it finished, red when it failed, and the result closes the frame with the expand hint or the output. Reviewer captures name their lens (`review capture · risk`; the group lists all four).
+- Every call into the gentle-ai binary and every `gentle_review` tool renders as a card under the rose, `🌹︎ Gentle AI`: the rail is amber while it runs, green when it finished, red when it failed; the expand key sits in the top rule once the tool finished, and the collapsed result shows only its line count. Reviewer captures name their lens (`review capture · risk`; the group lists all four).
 - The review preflight reminder renders as a card in the transcript with the expand key in its top rule.
 - An active dev-binary override shows above the editor at startup, in amber, naming the binary and its digest, and leaves with the first prompt; an invalid override shows in red with the reason.
 - Todo and subagent widgets belong to their own packages and keep their rendering.

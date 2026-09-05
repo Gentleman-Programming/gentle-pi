@@ -47,16 +47,17 @@ test("renderCard collapses to the frame and the first body line with an expand h
 	assert.equal(visibleWidth(lines[1]), 60);
 });
 
-test("renderCard paints the whole frame in the card tone", () => {
+test("renderCard keeps the rail and its corners in the tone and the rest of the frame in the border color", () => {
 	const info = renderCard(card(), taggedTheme, 80, { expanded: true });
-	assert.match(info[0], /^<customMessageLabel>╭─ <\/customMessageLabel><customMessageLabel>✿ Gentle AI<\/customMessageLabel> <muted>·<\/muted> <muted>review preflight<\/muted><customMessageLabel> ─+<\/customMessageLabel><customMessageLabel>╮<\/customMessageLabel>$/);
-	assert.match(info[1], /^<customMessageLabel>│<\/customMessageLabel> <text>.*<customMessageLabel>│<\/customMessageLabel>$/);
-	assert.match(info[info.length - 1], /^<customMessageLabel>╰─+╯<\/customMessageLabel>$/);
+	assert.match(info[0], /^<customMessageLabel>╭<\/customMessageLabel><border>─ <\/border><customMessageLabel>✿ Gentle AI<\/customMessageLabel> <muted>·<\/muted> <muted>review preflight<\/muted><border> ─+<\/border><border>╮<\/border>$/);
+	assert.match(info[1], /^<customMessageLabel>│<\/customMessageLabel> <text>.*<border>│<\/border>$/);
+	assert.match(info[info.length - 1], /^<customMessageLabel>╰<\/customMessageLabel><border>─+╯<\/border>$/);
 
 	const warning = renderCard(card({ tone: CARD_TONE.WARNING, subtitle: undefined }), taggedTheme, 80, { expanded: true });
-	assert.match(warning[0], /^<warning>╭─ <\/warning><warning>✿ Gentle AI<\/warning><warning> ─+<\/warning><warning>╮<\/warning>$/);
-	assert.match(warning[1], /^<warning>│<\/warning> .*<warning>│<\/warning>$/);
-	assert.match(warning[warning.length - 1], /^<warning>╰─+╯<\/warning>$/);
+	assert.match(warning[0], /^<warning>╭<\/warning>/);
+	assert.match(warning[0], /<warning>✿ Gentle AI<\/warning>/);
+	assert.match(warning[1], /^<warning>│<\/warning> /);
+	assert.match(warning[warning.length - 1], /^<warning>╰<\/warning>/);
 
 	const error = renderCard(card({ tone: CARD_TONE.ERROR }), taggedTheme, 80, { expanded: true });
 	assert.match(error[0], /<error>✿ Gentle AI<\/error>/);

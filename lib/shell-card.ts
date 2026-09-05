@@ -62,26 +62,31 @@ function bodyLines(card: Card, innerWidth: number): string[] {
 	return card.body.flatMap((paragraph) => (paragraph === "" ? [""] : wrapTextWithAnsi(paragraph, innerWidth)));
 }
 
-// The whole frame carries the tone, so a running, finished, or failed card
-// reads at a glance from any edge.
+// The left rail, corners included, carries the tone at full strength; the
+// rest of the frame stays in the theme's border color, so the state reads from the rail.
+const FRAME_ROLE = "border";
+
+function soft(theme: CardTheme, _tone: CardTone, text: string): string {
+	return theme.fg(FRAME_ROLE, text);
+}
+
 export function cardTop(card: Card, theme: CardTheme, width: number, hint?: string): string {
 	const title = titleText(card, theme);
-	const frame = TONE_ROLE[card.tone];
 	const hintWidth = hint ? visibleWidth(hint) + 2 : 0;
 	const fill = rule(width - title.width - 5 - hintWidth);
 	const tail = hint ? ` ${theme.fg(HINT_ROLE, hint)} ` : "";
-	return theme.fg(frame, "╭─ ") + title.styled + theme.fg(frame, ` ${fill}`) + tail + theme.fg(frame, "╮");
+	return theme.fg(TONE_ROLE[card.tone], "╭") + soft(theme, card.tone, "─ ") + title.styled + soft(theme, card.tone, ` ${fill}`) + tail + soft(theme, card.tone, "╮");
 }
 
 export function cardLine(text: string, tone: CardTone, theme: CardTheme, width: number): string {
 	const innerWidth = Math.max(1, width - FRAME_COLUMNS);
 	const clipped = truncateToWidth(text, innerWidth, "…");
 	const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(clipped)));
-	return `${theme.fg(TONE_ROLE[tone], "│")} ${clipped}${padding} ${theme.fg(TONE_ROLE[tone], "│")}`;
+	return `${theme.fg(TONE_ROLE[tone], "│")} ${clipped}${padding} ${soft(theme, tone, "│")}`;
 }
 
 export function cardBottom(tone: CardTone, theme: CardTheme, width: number): string {
-	return theme.fg(TONE_ROLE[tone], `╰${rule(width - 2)}╯`);
+	return theme.fg(TONE_ROLE[tone], "╰") + soft(theme, tone, `${rule(width - 2)}╯`);
 }
 
 export function cardInnerWidth(width: number): number {

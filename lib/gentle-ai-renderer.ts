@@ -23,6 +23,7 @@ export interface GentleAiRenderContext {
 	executionStarted?: boolean;
 	isPartial?: boolean;
 	isError?: boolean;
+	expanded?: boolean;
 	lastComponent?: unknown;
 	state?: unknown;
 	invalidate?: () => void;
@@ -48,6 +49,7 @@ const CARD_TITLE = "Gentle AI";
 // The binary keeps its rose; Gentle Shell notices keep the flower.
 const CARD_GLYPH = "\u{1F339}\uFE0E";
 const DETAIL_ROLE = "dim";
+const HIDDEN_ROLE = "dim";
 const passthroughTheme: CardTheme = { fg: (_color, text) => text };
 
 export function getGentleAiRenderState(state: unknown): GentleAiRenderState | undefined {
@@ -57,21 +59,24 @@ export function getGentleAiRenderState(state: unknown): GentleAiRenderState | un
 	return (rowState.gentleAiRender = {} as GentleAiRenderState);
 }
 
-// The call row: the top rule and, when expanded, the command. pi renders the
-// result component right below it, and that one closes the frame.
+// The call row: the top rule, with the expand key at its right end once the
+// tool finished, and the command when expanded. pi renders the result
+// component right below it, and that one closes the frame.
 export class GentleAiCallCard {
 	private card: Card = { title: CARD_TITLE, body: [], tone: CARD_TONE.WARNING };
 	private theme: CardTheme = passthroughTheme;
 	private detail: string | undefined;
+	private hint: string | undefined;
 
-	update(status: LifecycleStatus, operationPath: string, theme: CardTheme, detail?: string): void {
+	update(status: LifecycleStatus, operationPath: string, theme: CardTheme, detail?: string, hint?: string): void {
 		this.card = { title: CARD_TITLE, subtitle: `${status} · ${operationPath}`, body: [], tone: STATUS_TONE[status], glyph: CARD_GLYPH };
 		this.theme = theme;
 		this.detail = detail;
+		this.hint = hint;
 	}
 
 	render(width: number): string[] {
-		const lines = [cardTop(this.card, this.theme, width)];
+		const lines = [cardTop(this.card, this.theme, width, this.hint)];
 		if (this.detail) lines.push(cardLine(this.theme.fg(DETAIL_ROLE, this.detail), this.card.tone, this.theme, width));
 		return lines;
 	}
@@ -79,9 +84,10 @@ export class GentleAiCallCard {
 	invalidate(): void {}
 }
 
-// The result rows: the body when expanded, the expand hint when collapsed,
-// and always the bottom rule that closes the call card above. The rail
-// follows the outcome: amber while partial, green when done, red on error.
+// The result rows: the body when expanded, a count-only line when collapsed
+// (the call card carries the expand key and the text stays hidden), and
+// always the bottom rule that closes the frame. The rail follows the outcome:
+// amber while partial, green when done, red on error.
 export class GentleAiResultCard {
 	private readonly text: string;
 	private readonly expanded: boolean;
@@ -104,7 +110,8 @@ export class GentleAiResultCard {
 					for (const line of raw === "" ? [""] : wrapTextWithAnsi(raw, innerWidth)) lines.push(cardLine(line, this.tone, this.theme, width));
 				}
 			} else {
-				lines.push(cardLine(keyHint("app.tools.expand", "to expand"), this.tone, this.theme, width));
+				const count = this.text.split("\n").length;
+				lines.push(cardLine(this.theme.fg(HIDDEN_ROLE, `${count} ${count === 1 ? "line" : "lines"}`), this.tone, this.theme, width));
 			}
 		}
 		lines.push(cardBottom(this.tone, this.theme, width));
@@ -161,6 +168,7 @@ export function renderGentleAiLifecycleCall(
 		? context.lastComponent
 		: new GentleAiCallCard();
 	if (state) state.lifecycleComponent = true;
-	component.update(status, operationPath, theme, detail ? sanitizeTerminalText(detail) : undefined);
+	const hint = finished ? keyHint("app.tools.expand", context?.expanded ? "to collapse" : "to expand") : undefined;
+	component.update(status, operationPath, theme, detail ? sanitizeTerminalText(detail) : undefined, hint);
 	return component;
 }
