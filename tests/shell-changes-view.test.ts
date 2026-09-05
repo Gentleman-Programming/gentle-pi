@@ -102,6 +102,10 @@ test("ChangesView scrolls the diff pane and shows an empty state for files witho
 	const plain = component.render(80).map(stripAnsi);
 	assert.doesNotMatch(plain[1], /@@/);
 	assert.match(plain[1], /\+line \d+/);
+	component.handleInput("\x0b");
+	assert.match(stripAnsi(component.render(80)[1]), /@@/, "ctrl+k scrolls back to the top");
+	component.handleInput("\x0a");
+	assert.doesNotMatch(stripAnsi(component.render(80)[1]), /@@/, "ctrl+j scrolls a page down");
 
 	const empty = view({ async loadDiff() { return ""; } });
 	await settle();
