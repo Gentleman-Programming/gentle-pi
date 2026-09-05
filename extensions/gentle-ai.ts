@@ -4632,8 +4632,18 @@ function exactCollectArgument(input: ReviewCollectInputV3, name: string): string
 	return matches.length === 1 ? matches[0]!.value : undefined;
 }
 
+// The intended-untracked collect input arrived with status/v6 and every later
+// status version keeps it; matching one exact version left every workspace
+// with untracked files unable to start a review once gentle-ai answered v7
+// (gentle-pi#610, gentle-ai#4187).
+const INTENDED_UNTRACKED_STATUS_SCHEMA = /^gentle-ai\.review-integration\.status\/v(\d+)$/;
+function statusCarriesIntendedUntrackedSelection(schema: unknown): boolean {
+	const match = typeof schema === "string" ? INTENDED_UNTRACKED_STATUS_SCHEMA.exec(schema) : null;
+	return match !== null && Number(match[1]) >= 6;
+}
+
 function reviewIntendedUntrackedInput(status: ReviewStatusV3): ReviewCollectInputV3 | undefined {
-	if (status.raw.schema !== "gentle-ai.review-integration.status/v6" || status.nextTransition?.kind !== "collect") return undefined;
+	if (!statusCarriesIntendedUntrackedSelection(status.raw.schema) || status.nextTransition?.kind !== "collect") return undefined;
 	const matches = (status.nextTransition.collect?.inputs ?? []).filter((input) => {
 		const value = input.submission?.values[0];
 		return input.name === "intended_untracked_selection" && input.schema === "gentle-ai.review-intended-untracked-selection/v1" && input.captureOperation === "external.select_intended_untracked" && input.submission?.operationToken === "status" && input.submission.values.length === 1 && value?.slot === "intended_untracked_selection" && value.domain === "schema_bound_json";
