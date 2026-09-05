@@ -700,6 +700,24 @@ test("v5 targeted-validator collect inputs carry the exact provider-owned valida
 	assert.throws(() => decodeReviewNextTransitionV3(weakenedRequest, { v5: true }), /policy_content/);
 });
 
+test("status.frozen carries the optional frozen manifest digest", () => {
+	const current = devFixture<JsonObject>("status-v5-repository-context.captured.json");
+	delete current.receipt;
+	if (current.action === "finalize") {
+		current.action = "stop";
+		delete current.next_transition;
+		delete current.forecast;
+	}
+	assert.equal(typeof (current.frozen as JsonObject | undefined)?.tier, "string", "the captured status carries frozen");
+	const digest = `sha256:${"ab".repeat(32)}`;
+	(current.frozen as JsonObject).changed_path_manifest_sha256 = digest;
+	assert.equal(decodeReviewStatusV3(current).frozen?.changedPathManifestSha256, digest);
+	(current.frozen as JsonObject).changed_path_manifest_sha256 = "not-a-digest";
+	assert.throws(() => decodeReviewStatusV3(current), /changed_path_manifest_sha256/);
+	delete (current.frozen as JsonObject).changed_path_manifest_sha256;
+	assert.equal(decodeReviewStatusV3(current).frozen?.changedPathManifestSha256, undefined);
+});
+
 test("a capture-result collect input decodes without changed_path_manifest, which the artifact subject digest already binds", () => {
 	const status = fixture<JsonObject>("status.fixture.json");
 	const transition = clone((status.next_transition ?? {}) as JsonObject);
