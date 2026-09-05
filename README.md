@@ -653,7 +653,27 @@ Gentle notices are drawn as cards: the same rounded frame as the prompt, with th
 - Every call into the gentle-ai binary and every `gentle_review` tool renders as a card under the rose, `🌹︎ Gentle AI`: the rail is amber while it runs, green when it finished, red when it failed; the expand key sits in the top rule once the tool finished, and the collapsed result shows only its line count. Reviewer captures name their lens (`review capture · risk`; the group lists all four).
 - The review preflight reminder renders as a card in the transcript with the expand key in its top rule.
 - An active dev-binary override shows above the editor at startup, in amber, naming the binary and its digest, and leaves with the first prompt; an invalid override shows in red with the reason.
-- Todo and subagent widgets belong to their own packages and keep their rendering.
+- Subagent widgets belong to their own package and keep their rendering.
+
+### Gentle Todo
+
+The `todo` tool and its card replace the third-party todo extension (remove `npm:@juicesharp/rpiv-todo` from your pi packages; sessions written by it replay into the new card).
+
+```text
+╭─ ❀ Todos · 1 of 3 ──────────────────────────────────────╮
+│ ✓ Add quiet tool rendering                              │
+│ ◐ Fix quiet tools conflict · fixing conflict            │
+│ ○ Show git bash tails                                   │
+╰─────────────────────────────────────────────────────────╯
+```
+
+Three things keep the list current, which a static tool description cannot:
+
+- `write` replaces the whole list in one call, so the model rewrites the plan instead of patching it; `add`, `update`, `clear`, and `list` remain for single moves.
+- Every turn's system prompt carries the open tasks and the rules: in_progress before starting, done right after finishing, update before ending the turn.
+- A list that goes two turns untouched while tasks stay open turns amber with `stale · N turns`, and the prompt says so, so the model brings it up to date.
+
+A finished list stays on screen for the turn it finished in and clears at the next. `ctrl+shift+t` collapses the card to the task in progress (`GENTLE_PI_TODO_KEY` rebinds it, `off` disables it); `GENTLE_PI_TODO=0` disables the tool and the card.
 
 Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer and editor.
 
