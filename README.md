@@ -699,6 +699,8 @@ Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer and editor.
 | -------------------------------- | ------------------------------------------------------------------- |
 | `/gentle:status`              | Shows package, SDD asset, OpenSpec, and global model config status. |
 | `/gentle:doctor`              | Runs read-only diagnostics for SDD assets, model/persona config, memory tools, and safety guards. |
+| `/gentle:sdd-preflight`       | Runs or reuses the lazy SDD preflight for this Pi session.          |
+| `/gentle:review-mode`         | Shows or sets the Gentle AI review-driven-development kill switch (`status\|disable\|enable`). |
 | `/gentle:models`                 | Opens global model + effort assignment UI. Press `x` to export and `r` to restore saved routing. |
 | `/gentle:persona`                | Switches global persona mode, with project override support.        |
 | `/gentle:background-subagents`   | Shows or sets the managed background-subagents policy (`status\|enable\|disable`), naming the source that decided it. |
