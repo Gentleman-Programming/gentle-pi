@@ -602,12 +602,12 @@ The status bar replaces pi's three-line footer with a single line of segments:
 The prompt wraps pi's editor in a rounded frame with a petal that shows what the agent is doing:
 
 ```text
-╭─ ✿ working ──────────────────────────────────────────╮
+╭─ ✿ ─────────────────────────────────────────────────╮
 │ type, or / for commands                              │
 ╰──────────────────────────────────────────────────────╯
 ```
 
-- The petal is still while pi waits, pulses while the agent works, and turns amber with a `queued` label when messages are waiting behind the current turn.
+- The petal is still while pi waits, spins while the agent works, and turns amber with a `queued` label when messages are waiting behind the current turn.
 - The frame keeps pi's border color, so bash mode and thinking levels still show through it, and the editor's scroll indicators stay inside the frame.
 - The hint appears only while the editor is empty.
 - If another extension already installed a custom editor, Gentle Shell leaves it alone.
@@ -651,7 +651,7 @@ Gentle notices are drawn as cards: the same rounded frame as the prompt, with th
 ```
 
 - The review preflight reminder renders as a card in the transcript and collapses to two lines with pi's tool toggle.
-- An active dev-binary override stays visible above the editor for the whole session, in amber, naming the binary and its digest; an invalid override shows in red with the reason.
+- An active dev-binary override shows above the editor at startup, in amber, naming the binary and its digest, and leaves with the first prompt; an invalid override shows in red with the reason.
 - Todo and subagent widgets belong to their own packages and keep their rendering.
 
 Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer and editor.

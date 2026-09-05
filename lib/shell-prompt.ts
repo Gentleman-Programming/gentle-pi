@@ -29,6 +29,8 @@ export interface PromptFrameOptions {
 }
 
 export const PROMPT_PETAL = "✿";
+// A spin, not a blink: a different flower each frame while the agent works.
+const PETAL_FRAMES = ["✿", "❀", "❁", "✾"] as const;
 export const PROMPT_HINT = "type, or / for commands";
 const LABEL_ROLE = "muted";
 const HINT_ROLE = "dim";
@@ -36,14 +38,17 @@ const FAKE_CURSOR = "\x1b[7m \x1b[0m";
 const SCROLL_INDICATOR = /[↑↓] \d+ more/;
 const STATE_LABEL: Record<PromptState, string | undefined> = {
 	[PROMPT_STATE.IDLE]: undefined,
-	[PROMPT_STATE.WORKING]: "working",
+	[PROMPT_STATE.WORKING]: undefined,
 	[PROMPT_STATE.QUEUED]: "queued",
 };
 
-export function petalTone(state: PromptState, tick: number): PetalTone {
-	if (state === PROMPT_STATE.QUEUED) return PETAL_TONE.WARNING;
-	if (state === PROMPT_STATE.WORKING) return tick % 2 === 0 ? PETAL_TONE.ACCENT : PETAL_TONE.DIM;
-	return PETAL_TONE.ACCENT;
+export function petalTone(state: PromptState): PetalTone {
+	return state === PROMPT_STATE.QUEUED ? PETAL_TONE.WARNING : PETAL_TONE.ACCENT;
+}
+
+export function petalGlyph(state: PromptState, tick: number): string {
+	if (state === PROMPT_STATE.IDLE) return PROMPT_PETAL;
+	return PETAL_FRAMES[tick % PETAL_FRAMES.length];
 }
 
 function scrollIndicator(rule: string): string | undefined {
@@ -56,7 +61,7 @@ function rule(length: number): string {
 
 function topRule(width: number, options: PromptFrameOptions, indicator: string | undefined): string {
 	const label = indicator ?? STATE_LABEL[options.state];
-	const petal = options.fg(petalTone(options.state, options.tick), PROMPT_PETAL);
+	const petal = options.fg(petalTone(options.state), petalGlyph(options.state, options.tick));
 	const labelText = label ? ` ${options.fg(LABEL_ROLE, label)}` : "";
 	const labelWidth = label ? label.length + 1 : 0;
 	const fill = width - 3 - 1 - labelWidth - 1 - 1;

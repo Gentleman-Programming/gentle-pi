@@ -139,7 +139,7 @@ interface PromptEditorDeps {
 	pending(): boolean;
 }
 
-const PETAL_PULSE_MS = 600;
+const PETAL_PULSE_MS = 160;
 
 export class GentlePromptEditor extends CustomEditor {
 	private promptState: PromptState = PROMPT_STATE.IDLE;
@@ -502,7 +502,11 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			handler: async (ctx) => openChanges(ctx),
 		});
 	}
-	pi.on("agent_start", () => prompt?.setWorking(true));
+	pi.on("agent_start", (_event, ctx) => {
+		prompt?.setWorking(true);
+		// The dev-binary card is a startup notice: it leaves with the first prompt.
+		if (ctx.hasUI) ctx.ui.setWidget(DEV_BINARY_WIDGET_KEY, undefined);
+	});
 	pi.on("agent_end", async (_event, ctx) => {
 		prompt?.setWorking(false);
 		await refreshChanges(ctx);

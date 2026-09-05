@@ -5,6 +5,7 @@ import { stripAnsi } from "../lib/terminal-theme.ts";
 import {
 	framePromptLines,
 	PROMPT_STATE,
+	petalGlyph,
 	petalTone,
 	withPromptHint,
 	type PromptFrameOptions,
@@ -48,26 +49,30 @@ test("framePromptLines paints the frame with the editor border color and the pet
 	assert.match(lines[2], /^\[b\]╰─+╯\[\/b\]$/);
 });
 
-test("petalTone pulses while working and turns to warning when messages are queued", () => {
-	assert.equal(petalTone(PROMPT_STATE.IDLE, 0), "accent");
-	assert.equal(petalTone(PROMPT_STATE.WORKING, 0), "accent");
-	assert.equal(petalTone(PROMPT_STATE.WORKING, 1), "dim");
-	assert.equal(petalTone(PROMPT_STATE.WORKING, 2), "accent");
-	assert.equal(petalTone(PROMPT_STATE.QUEUED, 0), "warning");
-	assert.equal(petalTone(PROMPT_STATE.QUEUED, 1), "warning");
+test("petalTone stays rose while working and turns to warning when messages are queued", () => {
+	assert.equal(petalTone(PROMPT_STATE.IDLE), "accent");
+	assert.equal(petalTone(PROMPT_STATE.WORKING), "accent");
+	assert.equal(petalTone(PROMPT_STATE.QUEUED), "warning");
 });
 
-test("framePromptLines labels the working and queued states after the petal", () => {
+test("petalGlyph spins through the flowers while working and rests otherwise", () => {
+	assert.equal(petalGlyph(PROMPT_STATE.IDLE, 3), "✿");
+	assert.deepEqual([0, 1, 2, 3, 4].map((tick) => petalGlyph(PROMPT_STATE.WORKING, tick)), ["✿", "❀", "❁", "✾", "✿"]);
+	assert.equal(petalGlyph(PROMPT_STATE.QUEUED, 1), "❀");
+});
+
+test("framePromptLines spins the petal silently while working and labels only the queued state", () => {
 	const plain = (_color: string, text: string) => text;
 	const working = framePromptLines(editorLines(40), 40, options({ state: PROMPT_STATE.WORKING, tick: 1 }));
-	assert.match(working[0], /<dim>✿<\/dim>/);
-	assert.match(working[0], /<muted>working<\/muted>/);
+	assert.match(working[0], /<accent>❀<\/accent>/);
+	assert.doesNotMatch(working[0], /working/);
 	const workingPlain = framePromptLines(editorLines(40), 40, options({ state: PROMPT_STATE.WORKING, tick: 1, fg: plain }));
-	assert.match(stripAnsi(workingPlain[0]), /^╭─ ✿ working ─+╮$/);
+	assert.match(stripAnsi(workingPlain[0]), /^╭─ ❀ ─+╮$/);
 	assert.equal(visibleWidth(workingPlain[0]), 40);
 
 	const queued = framePromptLines(editorLines(40), 40, options({ state: PROMPT_STATE.QUEUED }));
 	assert.match(queued[0], /<warning>✿<\/warning>/);
+	assert.match(queued[0], /<muted>queued<\/muted>/);
 	const queuedPlain = framePromptLines(editorLines(40), 40, options({ state: PROMPT_STATE.QUEUED, fg: plain }));
 	assert.match(stripAnsi(queuedPlain[0]), /^╭─ ✿ queued ─+╮$/);
 	assert.equal(visibleWidth(queuedPlain[0]), 40);
