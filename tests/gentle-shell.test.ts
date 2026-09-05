@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import gentleShell, { buildShellBarModel, changesShortcut, fetchCodexUsage, loadFileDiff, openInExternalEditor, type GentlePromptEditor } from "../extensions/gentle-shell.ts";
+import gentleShell, { buildShellBarModel, changesShortcut, devBinaryCard, fetchCodexUsage, loadFileDiff, openInExternalEditor, type GentlePromptEditor } from "../extensions/gentle-shell.ts";
 import { CHANGE_STATUS } from "../lib/shell-changes.ts";
 import type { ShellBarTheme } from "../lib/shell-bar.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
@@ -42,6 +42,9 @@ interface ShortcutRegistration {
 	handler: (ctx: ExtensionContext) => Promise<void>;
 }
 
+type MessageRenderer = (message: { customType: string; content: unknown }, options: { expanded: boolean }, theme: unknown) => { render(width: number): string[] };
+const renderers = new Map<string, MessageRenderer>();
+
 function fakePi(script: GitScript[] = [{ numstat: "", porcelain: "" }]): { pi: ExtensionAPI; handlers: Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>; git: string[][]; commands: Map<string, CommandRegistration>; shortcuts: Map<string, ShortcutRegistration> } {
 	const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
 	const commands = new Map<string, CommandRegistration>();
@@ -57,6 +60,9 @@ function fakePi(script: GitScript[] = [{ numstat: "", porcelain: "" }]): { pi: E
 		},
 		registerShortcut(key: string, registration: ShortcutRegistration) {
 			shortcuts.set(key, registration);
+		},
+		registerMessageRenderer(type: string, renderer: MessageRenderer) {
+			renderers.set(type, renderer);
 		},
 		getThinkingLevel() {
 			return "medium";
@@ -465,4 +471,39 @@ test("gentleShell registers /gentle:usage and opens the subscriptions overlay", 
 	assert.match(plain[1], /✿ openai-codex · pro/);
 	ui.closeOverlay?.();
 	await opened;
+});
+
+test("gentleShell draws the review preflight message as a Gentle card", () => {
+	const { pi } = fakePi();
+	gentleShell(pi, {});
+	const renderer = renderers.get("gentle-pi.review-preflight");
+	assert.ok(renderer, "renderer not registered");
+	const message = { customType: "gentle-pi.review-preflight", content: "Receipt-driven development is enabled.\n\nCall the gentle_review tool." };
+	const expanded = renderer(message, { expanded: true }, plainTheme).render(80).map(stripAnsi);
+	assert.equal(expanded[0], "✿ Gentle AI · review preflight");
+	assert.match(expanded[1], /^▏ Receipt-driven development is enabled\.$/);
+	assert.ok(expanded.some((line) => line.includes("gentle_review")));
+	const collapsed = renderer({ ...message, content: [{ type: "text", text: message.content }] }, { expanded: false }, plainTheme).render(80).map(stripAnsi);
+	assert.equal(collapsed.length, 2);
+});
+
+test("gentleShell keeps a dev-binary override visible above the editor for the whole session", async () => {
+	const { pi, handlers } = fakePi();
+	const deps = { fetch: fakeFetch({}, false).fetchFn, now: () => 0, devBinary: () => ({ state: "active" as const, path: "/Users/me/go/bin/gentle-ai", sha256: "6e53bfc6305a3949deadbeef" }) };
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, deps);
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const factory = ui.widgets.get("gentle-shell-dev-binary") as (tui: unknown, theme: unknown) => { render(width: number): string[] };
+	assert.ok(factory, "dev binary widget missing");
+	const lines = factory(fakeTui, plainTheme).render(100).map(stripAnsi);
+	assert.equal(lines[0], "✿ Gentle AI · dev binary override · field-test only");
+	assert.match(lines[1], /^▏ \/Users\/me\/go\/bin\/gentle-ai · sha256:6e53bfc6305a3949$/);
+
+	const clean = fakePi();
+	gentleShell(clean.pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { ...deps, devBinary: () => undefined });
+	const fresh = fakeContext();
+	await fire(clean.handlers, "session_start", fresh.ctx);
+	assert.equal(fresh.ui.widgets.has("gentle-shell-dev-binary"), false);
+
+	assert.equal(devBinaryCard({ state: "invalid", reason: "binary missing" }).tone, "error");
 });

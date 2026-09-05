@@ -642,6 +642,17 @@ Subscription usage shows in the bar after the cost, and `/gentle:usage` opens a 
 - Only the plan name and the windows are kept; account details in the payload are discarded.
 - Gauges turn amber at 80% and red at 95%, like the context gauge.
 
+Gentle notices are drawn as cards: a titled line and a left rule beside the body, in the tone of the notice.
+
+```text
+✿ Gentle AI · review preflight
+▏ Receipt-driven development is enabled, and this worktree holds an unreviewed candidate…
+```
+
+- The review preflight reminder renders as a card in the transcript and collapses to two lines with pi's tool toggle.
+- An active dev-binary override stays visible above the editor for the whole session, in amber, naming the binary and its digest; an invalid override shows in red with the reason.
+- Todo and subagent widgets belong to their own packages and keep their rendering.
+
 Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer and editor.
 
 ## Commands

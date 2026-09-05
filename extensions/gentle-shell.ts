@@ -7,13 +7,15 @@ import { join } from "node:path";
 import { renderShellBar, shellEnabled, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
 import { CHANGE_STATUS, ChangesTracker, renderChangesWidget, type ChangedFile, type ChangesModel, type GitRunner, type LineCounter } from "../lib/shell-changes.ts";
 import { ChangesView } from "../lib/shell-changes-view.ts";
+import { CARD_TONE, renderCard, type Card, type CardTheme } from "../lib/shell-card.ts";
+import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
 import { framePromptLines, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
 import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, parseCodexUsage, parseUsageHeaders, UsageStore, type ProviderUsage } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
 
 // Gentle Shell: the visual layer gentle-pi puts on top of pi. It installs the
 // status bar, the petal prompt, the working-tree changes widget and overlay,
-// and the subscription usage view; a later slice adds cards.
+// the subscription usage view, and the cards Gentle notices are drawn with.
 
 export interface ShellFooterData {
 	getGitBranch(): string | null;
@@ -38,12 +40,25 @@ interface BuildOptions {
 	usage?: ProviderUsage;
 }
 
+export type DevBinaryNotice = { state: "active"; path: string; sha256: string } | { state: "invalid"; reason: string };
+
 export interface ShellDeps {
 	fetch: typeof fetch;
 	now(): number;
+	devBinary(): DevBinaryNotice | undefined;
 }
 
-const defaultShellDeps: ShellDeps = { fetch: (...args) => globalThis.fetch(...args), now: () => Date.now() };
+function ambientDevBinary(): DevBinaryNotice | undefined {
+	try {
+		const override = resolveGentleAiDevBinaryOverride();
+		return override ? { state: "active", path: override.path, sha256: override.sha256 } : undefined;
+	} catch (error) {
+		if (error instanceof GentleAiDevBinaryOverrideError) return { state: "invalid", reason: error.message };
+		return undefined;
+	}
+}
+
+const defaultShellDeps: ShellDeps = { fetch: (...args) => globalThis.fetch(...args), now: () => Date.now(), devBinary: ambientDevBinary };
 
 interface AssistantUsageEntry {
 	type: string;
@@ -317,6 +332,36 @@ function showChanges(ctx: ExtensionContext, model: ChangesModel): void {
 }
 
 const USAGE_COMMAND_NAME = "gentle:usage";
+const REVIEW_PREFLIGHT_TYPE = "gentle-pi.review-preflight";
+const DEV_BINARY_WIDGET_KEY = "gentle-shell-dev-binary";
+const SHA_PREFIX_LENGTH = 16;
+
+function messageText(content: string | Array<{ type: string; text?: string }>): string {
+	if (typeof content === "string") return content;
+	return content.map((part) => (part.type === "text" ? (part.text ?? "") : "")).join("\n");
+}
+
+function cardComponent(card: Card, theme: CardTheme, expanded: boolean) {
+	return {
+		render(width: number) {
+			return renderCard(card, theme, width, { expanded });
+		},
+		invalidate() {},
+	};
+}
+
+export function devBinaryCard(notice: DevBinaryNotice): Card {
+	if (notice.state === "invalid") {
+		return { title: "Gentle AI", subtitle: "dev binary override invalid", body: [notice.reason], tone: CARD_TONE.ERROR };
+	}
+	return {
+		title: "Gentle AI",
+		subtitle: "dev binary override · field-test only",
+		body: [`${notice.path} · sha256:${notice.sha256.slice(0, SHA_PREFIX_LENGTH)}`],
+		tone: CARD_TONE.WARNING,
+	};
+}
+
 const USAGE_REFRESH_MS = 5 * 60_000;
 
 // The Codex usage endpoint is what the Codex CLI itself reads. The OAuth
@@ -336,8 +381,9 @@ export async function fetchCodexUsage(token: string | undefined, fetchFn: typeof
 	}
 }
 
-export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env, deps: ShellDeps = defaultShellDeps): void {
+export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env, overrides: Partial<ShellDeps> = {}): void {
 	if (!shellEnabled(env)) return;
+	const deps: ShellDeps = { ...defaultShellDeps, ...overrides };
 	const usage = new UsageStore();
 	let renderHost: ShellRenderHost | undefined;
 	let usageFetchedAt = 0;
@@ -358,6 +404,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		if (!parsed) return;
 		usage.record(parsed);
 		renderHost?.requestRender();
+	});
+	pi.registerMessageRenderer(REVIEW_PREFLIGHT_TYPE, (message, options, theme) => {
+		const body = messageText(message.content as string | Array<{ type: string; text?: string }>).split("\n");
+		return cardComponent({ title: "Gentle AI", subtitle: "review preflight", body, tone: CARD_TONE.INFO }, theme, options.expanded);
 	});
 	pi.registerCommand(USAGE_COMMAND_NAME, {
 		description: "Show subscription usage windows for the connected providers. Press r to refetch.",
@@ -407,6 +457,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		installPrompt(ctx, (created) => {
 			prompt = created;
 		});
+		const notice = deps.devBinary();
+		ctx.ui.setWidget(DEV_BINARY_WIDGET_KEY, notice ? (_tui, theme) => cardComponent(devBinaryCard(notice), theme, true) : undefined);
 		await tracker.start();
 		shown = "";
 		applyChanges(ctx, tracker.model);
