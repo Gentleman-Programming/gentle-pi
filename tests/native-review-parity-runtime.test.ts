@@ -178,7 +178,11 @@ test("registered gentle_review surfaces the package-pinned Pi transport refusal 
 		return { ...command, signal: null, timedOut: false, outputLimitExceeded: false };
 	});
 	const tools = new Map<string, RegisteredController>();
-	createGentleAiExtension({ nativeReviewCli: native, candidateViews } as Parameters<typeof createGentleAiExtension>[0])({
+	// The extension declares the relay handshake in the session environment on
+	// load (gentle-pi#550). This runner spawns the pinned binary with the test
+	// process environment and must keep observing the handshake-less refusal,
+	// so the declaration goes to a throwaway environment here.
+	createGentleAiExtension({ nativeReviewCli: native, candidateViews, processEnv: {} } as Parameters<typeof createGentleAiExtension>[0])({
 		on() {},
 		registerTool(definition: RegisteredController & { name: string }) { tools.set(definition.name, definition); },
 		registerCommand() {},
