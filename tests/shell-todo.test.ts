@@ -141,6 +141,22 @@ test("renderTodoCard draws the framed list with status glyphs and keeps every li
 	assert.match(plain[4], /^╰─+╯$/);
 });
 
+test("renderTodoCard folds a long list: done tasks become one row and the open ones are capped", () => {
+	const tasks = Array.from({ length: 40 }, (_, index) => ({ title: `Task ${index + 1}`, status: index < 25 ? "done" : index === 25 ? "in_progress" : "pending" }));
+	const state = applyTodo(emptyTodo(), { action: "write", tasks }, 1).state;
+	const plain = renderTodoCard(state, plainTheme, 60, { collapsed: false, staleTurns: 0 }).map(stripAnsi);
+	assert.equal(plain.length, 14, "top rule, twelve rows, bottom rule");
+	assert.match(plain[0], /Todos · 25 of 40/);
+	assert.match(plain[1], /^│ ✓ 25 done +│$/);
+	assert.match(plain[2], /^│ ◐ Task 26 +│$/);
+	assert.match(plain[11], /^│ ○ Task 35 +│$/);
+	assert.match(plain[12], /^│ … 5 more +│$/);
+	const allDone = applyTodo(emptyTodo(), { action: "write", tasks: tasks.map((task) => ({ ...task, status: "done" })) }, 1).state;
+	const folded = renderTodoCard(allDone, plainTheme, 60, { collapsed: false, staleTurns: 0 }).map(stripAnsi);
+	assert.equal(folded.length, 3);
+	assert.match(folded[1], /^│ ✓ 40 done +│$/);
+});
+
 test("renderTodoCard marks a stale list in the top rule and collapses to the task in progress", () => {
 	const stale = renderTodoCard(seeded(), plainTheme, 70, { collapsed: false, staleTurns: 2, collapseKey: "ctrl+shift+t" }).map(stripAnsi);
 	assert.match(stale[0], /^╭─ ❀ Todos · 1 of 3 ─+ stale · 2 turns ╮$/);

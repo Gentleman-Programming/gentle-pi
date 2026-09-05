@@ -166,3 +166,17 @@ test("session_start replays the list from the branch, rpiv-todo results included
 	await fire("session_start", headless.ctx);
 	assert.equal(headless.widget(), undefined);
 });
+
+test("session_start drops a list that was already finished, so a reload never shows stale done work", async () => {
+	const { pi, fire } = fakePi();
+	gentleTodo(pi, {});
+	const finished = [
+		{ type: "message", message: { role: "user", content: "hi" } },
+		{ type: "message", message: { role: "toolResult", toolName: "todo", isError: false, details: { gentleTodo: { tasks: [{ id: 1, title: "Done A", status: "done" }, { id: 2, title: "Done B", status: "done" }], nextId: 3, updatedTurn: 1 } } } },
+	];
+	const { ctx, widget } = fakeContext(finished);
+	await fire("session_start", ctx);
+	assert.equal(widget(), undefined, "nothing to show after a reload of finished work");
+	const prompt = (await fire("before_agent_start", ctx, { systemPrompt: "base" })) as { systemPrompt: string } | undefined;
+	assert.equal(prompt, undefined, "and nothing is injected into the prompt");
+});

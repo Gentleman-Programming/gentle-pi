@@ -160,7 +160,10 @@ export default function gentleTodo(pi: ExtensionAPI, env: NodeJS.ProcessEnv = pr
 
 	pi.on("session_start", (_event, ctx) => {
 		const current = session(ctx);
-		current.state = replayTodo(ctx.sessionManager.getBranch());
+		// A list that was already finished when the session was left is history,
+		// not work: it would otherwise sit on screen until two more turns pass.
+		const replayed = replayTodo(ctx.sessionManager.getBranch());
+		current.state = replayed.tasks.length > 0 && todoSummary(replayed).open === 0 ? { ...replayed, tasks: [] } : replayed;
 		current.turn = ctx.sessionManager.getBranch().filter((entry) => (entry as { type?: string }).type === "message" && (entry as { message?: { role?: string } }).message?.role === "user").length;
 		current.ui = ctx.hasUI ? ctx.ui : undefined;
 		show(current);
