@@ -434,15 +434,28 @@ test("per-JD-agent model assignment keeps judge-a and judge-b profiles divergent
 		else process.env.GENTLE_PI_AGENT_HOME = previousHome;
 		rmSync(root, { recursive: true, force: true });
 	});
-	writeMarkdown(join(root, "agents", "jd-judge-a.md"), "name: jd-judge-a\n");
-	writeMarkdown(join(root, "agents", "jd-judge-b.md"), "name: jd-judge-b\n");
+	writeMarkdown(
+		join(root, "agents", "jd-judge-a.md"),
+		"---\nname: jd-judge-a\ndescription: Judgment Day judge A\n---\n\nYou are Judgment Day judge A.\n",
+	);
+	writeMarkdown(
+		join(root, "agents", "jd-judge-b.md"),
+		"---\nname: jd-judge-b\ndescription: Judgment Day judge B\n---\n\nYou are Judgment Day judge B.\n",
+	);
 	writeMarkdown(join(root, "agents", "jd-fix-agent.md"), "name: jd-fix-agent\n");
 
-	const result = applyModelConfig(root, {
+	applyModelConfig(root, {
 		"jd-judge-a": { model: "anthropic/claude-3-7-sonnet", thinking: "high" },
 		"jd-judge-b": { model: "openai/gpt-4o", thinking: "low" },
 	});
-	assert.equal(result.updated, 2, "both JD judges must be routed");
+
+	const judgeA = readFileSync(join(root, "agents", "jd-judge-a.md"), "utf8");
+	assert.match(judgeA, /^model: anthropic\/claude-3-7-sonnet$/m);
+	assert.match(judgeA, /^thinking: high$/m);
+
+	const judgeB = readFileSync(join(root, "agents", "jd-judge-b.md"), "utf8");
+	assert.match(judgeB, /^model: openai\/gpt-4o$/m);
+	assert.match(judgeB, /^thinking: low$/m);
 
 	const profiles = JSON.parse(
 		readFileSync(join(root, "subagents.json"), "utf8"),
