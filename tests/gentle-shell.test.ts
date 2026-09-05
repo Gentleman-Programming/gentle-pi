@@ -428,7 +428,7 @@ test("gentleShell fetches Codex usage on session start and shows it in the bar",
 	await fire(handlers, "session_start", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	assert.equal(calls.length, 1);
-	assert.match(renderFooter(ui), /\$0\.000 sub ⟡ week ▰▰▰▱▱▱▱▱ 40%/);
+	assert.match(renderFooter(ui), /\$0\.000 sub ⟡ codex week ▰▰▰▱▱▱▱▱ 40%/);
 
 	await fire(handlers, "agent_end", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 0));
@@ -443,7 +443,14 @@ test("gentleShell records SSE rate-limit headers from provider responses", async
 	for (const handler of handlers.get("after_provider_response") ?? []) {
 		handler({ status: 200, headers: { "x-codex-primary-used-percent": "62", "x-codex-primary-window-minutes": "300", "x-codex-secondary-used-percent": "31", "x-codex-secondary-window-minutes": "10080" } }, ctx);
 	}
-	assert.match(renderFooter(ui), /5h ▰▰▰▰▰▱▱▱ 62% · week 31%/);
+	assert.match(renderFooter(ui), /codex 5h ▰▰▰▰▰▱▱▱ 62% · week 31%/);
+
+	(ctx as unknown as { model: { provider: string } }).model.provider = "anthropic";
+	for (const handler of handlers.get("after_provider_response") ?? []) {
+		handler({ status: 200, headers: { "anthropic-ratelimit-unified-5h-utilization": "0.25", "anthropic-ratelimit-unified-7d-utilization": "0.9" } }, ctx);
+	}
+	assert.match(renderFooter(ui), /claude 5h ▰▰▱▱▱▱▱▱ 25% · week 90%/);
+	assert.doesNotMatch(renderFooter(ui), /codex/);
 });
 
 test("gentleShell registers /gentle:usage and opens the subscriptions overlay", async () => {
@@ -455,7 +462,7 @@ test("gentleShell registers /gentle:usage and opens the subscriptions overlay", 
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	const plain = ui.overlayView!.render(90).map(stripAnsi);
 	assert.match(plain[0], /Subscriptions/);
-	assert.match(plain[1], /openai-codex · pro/);
+	assert.match(plain[1], /✿ openai-codex · pro/);
 	ui.closeOverlay?.();
 	await opened;
 });

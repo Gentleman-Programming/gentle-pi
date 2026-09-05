@@ -1,5 +1,5 @@
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { renderUsagePanel, type UsageStore, type UsageTheme } from "./shell-usage.ts";
+import { renderUsagePanel, type ActiveProvider, type UsageStore, type UsageTheme } from "./shell-usage.ts";
 
 // Gentle Shell subscriptions overlay: a framed panel over the usage store.
 // It reads the store on every render, so a refresh only needs to record.
@@ -7,6 +7,7 @@ import { renderUsagePanel, type UsageStore, type UsageTheme } from "./shell-usag
 export interface UsageViewDeps {
 	theme: UsageTheme;
 	now(): number;
+	active(): ActiveProvider | undefined;
 	onRefresh(): Promise<void>;
 	onClose(): void;
 	requestRender(): void;
@@ -62,7 +63,7 @@ export class UsageView {
 		const inner = width - 2;
 		const title = this.refreshing ? REFRESHING : TITLE;
 		const top = theme.fg(FRAME_ROLE, "╭─ ") + theme.fg(TITLE_ROLE, title) + theme.fg(FRAME_ROLE, ` ${rule(inner - visibleWidth(title) - 3)}╮`);
-		const body = renderUsagePanel(this.store.all(), theme, inner - 2, this.deps.now()).map(
+		const body = renderUsagePanel(this.store.all(), theme, inner - 2, this.deps.now(), this.deps.active()).map(
 			(line) => `${theme.fg(FRAME_ROLE, "│")} ${fit(line, inner - 2)} ${theme.fg(FRAME_ROLE, "│")}`,
 		);
 		const keys = KEYS.map(([key, label]) => `${theme.fg(KEY_ROLE, key)} ${theme.fg(KEY_TEXT_ROLE, label)}`).join("   ");

@@ -55,6 +55,13 @@ interface RawCodexUsage {
 }
 
 export const CODEX_PROVIDER = "openai-codex";
+export const ANTHROPIC_PROVIDER = "anthropic";
+const ANTHROPIC_MAIN_LIMIT = "claude";
+const ANTHROPIC_PREFIX = "anthropic-ratelimit-unified-";
+const ANTHROPIC_WINDOWS: ReadonlyArray<[key: string, seconds: number]> = [
+	["5h", 18_000],
+	["7d", 604_800],
+];
 export const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_MAIN_LIMIT = "codex";
 const CODEX_ACCOUNT_CLAIM = "https://api.openai.com/auth";
@@ -74,6 +81,21 @@ const ROLE = {
 	SEPARATOR: "muted",
 } as const;
 export const USAGE_EMPTY_MESSAGE = "No subscription usage yet. Usage arrives with the next response, or press r to fetch it.";
+export const SUPPORTED_USAGE_PROVIDERS: readonly string[] = [CODEX_PROVIDER, ANTHROPIC_PROVIDER];
+const PENDING_NOTE: Record<string, string> = {
+	[CODEX_PROVIDER]: "no usage yet · r to fetch",
+	[ANTHROPIC_PROVIDER]: "usage arrives with the first response",
+};
+const UNSUPPORTED_NOTE = "no subscription usage for this provider";
+const ACTIVE_MARK = "✿";
+
+export interface ActiveProvider {
+	provider: string;
+}
+
+export function providerNote(provider: string): string {
+	return PENDING_NOTE[provider] ?? UNSUPPORTED_NOTE;
+}
 
 export function windowLabel(seconds: number): string {
 	if (seconds === WEEK) return "week";
@@ -133,6 +155,25 @@ export function parseCodexHeaders(headers: Record<string, string>, now: number):
 	return { provider: CODEX_PROVIDER, plan: undefined, limits: [{ name: CODEX_MAIN_LIMIT, windows, limitReached: Boolean(reached) }], fetchedAt: now };
 }
 
+// Claude Pro/Max sends utilization as a 0..1 fraction per window and reset
+// times in Unix seconds on every response; there is no usage endpoint.
+export function parseAnthropicHeaders(headers: Record<string, string>, now: number): ProviderUsage | undefined {
+	const windows: UsageWindow[] = [];
+	for (const [key, seconds] of ANTHROPIC_WINDOWS) {
+		const fraction = Number.parseFloat(headers[`${ANTHROPIC_PREFIX}${key}-utilization`] ?? "");
+		if (!Number.isFinite(fraction)) continue;
+		const reset = Number.parseInt(headers[`${ANTHROPIC_PREFIX}${key}-reset`] ?? "", 10);
+		windows.push({ label: windowLabel(seconds), usedPercent: fraction * 100, windowSeconds: seconds, resetAt: Number.isFinite(reset) ? reset * 1000 : null });
+	}
+	if (windows.length === 0) return undefined;
+	const status = headers[`${ANTHROPIC_PREFIX}status`];
+	return { provider: ANTHROPIC_PROVIDER, plan: undefined, limits: [{ name: ANTHROPIC_MAIN_LIMIT, windows, limitReached: status === "rejected" }], fetchedAt: now };
+}
+
+export function parseUsageHeaders(headers: Record<string, string>, now: number): ProviderUsage | undefined {
+	return parseCodexHeaders(headers, now) ?? parseAnthropicHeaders(headers, now);
+}
+
 export function accountIdFromToken(token: string): string | undefined {
 	const parts = token.split(".");
 	if (parts.length !== 3) return undefined;
@@ -153,7 +194,7 @@ export function renderUsageBar(usage: ProviderUsage, theme: UsageTheme): string 
 	const main = usage.limits[0];
 	const [first, ...rest] = main?.windows ?? [];
 	if (!first) return undefined;
-	const head = `${theme.fg(ROLE.LABEL, first.label)} ${paintMeter(first.usedPercent, 8, theme)} ${theme.fg(ROLE.PERCENT, `${Math.round(first.usedPercent)}%`)}`;
+	const head = `${theme.fg(ROLE.LIMIT, main.name)} ${theme.fg(ROLE.LABEL, first.label)} ${paintMeter(first.usedPercent, 8, theme)} ${theme.fg(ROLE.PERCENT, `${Math.round(first.usedPercent)}%`)}`;
 	const tail = rest.map((window) => `${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.LABEL, window.label)} ${theme.fg(ROLE.PERCENT, `${Math.round(window.usedPercent)}%`)}`);
 	return [head, ...tail].join(" ");
 }
@@ -163,12 +204,20 @@ function updatedAgo(fetchedAt: number, now: number): string {
 	return minutes < 1 ? "updated just now" : `updated ${minutes}m ago`;
 }
 
-export function renderUsagePanel(usages: ProviderUsage[], theme: UsageTheme, width: number, now: number): string[] {
-	if (usages.length === 0) return [truncateToWidth(USAGE_EMPTY_MESSAGE, width, "…")];
+// The active provider comes first, marked with the petal, and explains
+// itself when it has no data yet. Other providers seen this session follow.
+export function renderUsagePanel(usages: ProviderUsage[], theme: UsageTheme, width: number, now: number, active?: ActiveProvider): string[] {
+	const activeUsage = active ? usages.find((usage) => usage.provider === active.provider) : undefined;
+	const others = usages.filter((usage) => usage !== activeUsage);
+	if (!active && usages.length === 0) return [truncateToWidth(USAGE_EMPTY_MESSAGE, width, "…")];
 	const lines: string[] = [];
-	for (const usage of usages) {
+	if (active && !activeUsage) {
+		lines.push(`${theme.fg(ROLE.LIMIT, ACTIVE_MARK)} ${theme.fg(ROLE.PROVIDER, active.provider)} ${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.RESET, providerNote(active.provider))}`);
+	}
+	for (const usage of [...(activeUsage ? [activeUsage] : []), ...others]) {
+		const mark = usage === activeUsage ? `${theme.fg(ROLE.LIMIT, ACTIVE_MARK)} ` : "";
 		const plan = usage.plan ? ` ${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.PLAN, usage.plan)}` : "";
-		lines.push(`${theme.fg(ROLE.PROVIDER, usage.provider)}${plan} ${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.RESET, updatedAgo(usage.fetchedAt, now))}`);
+		lines.push(`${mark}${theme.fg(ROLE.PROVIDER, usage.provider)}${plan} ${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.RESET, updatedAgo(usage.fetchedAt, now))}`);
 		for (const limit of usage.limits) {
 			lines.push(`  ${theme.fg(ROLE.LIMIT, limit.name)}`);
 			for (const window of limit.windows) {

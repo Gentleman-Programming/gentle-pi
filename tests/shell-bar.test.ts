@@ -116,7 +116,7 @@ test("renderShellBar adds the subscription windows after the cost when usage is 
 		] }],
 	};
 	const [line] = renderShellBar(model({ usage }), plainTheme, 200);
-	assert.match(line, /\$9\.49 sub ⟡ 5h ▰▰▰▰▰▱▱▱ 62% · week 31%$/);
+	assert.match(line, /\$9\.49 sub ⟡ codex 5h ▰▰▰▰▰▱▱▱ 62% · week 31%$/);
 });
 
 test("renderShellBar shows an unknown context as a question mark after compaction", () => {

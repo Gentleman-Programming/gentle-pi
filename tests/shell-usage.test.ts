@@ -4,7 +4,9 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import {
 	accountIdFromToken,
 	formatReset,
+	parseAnthropicHeaders,
 	parseCodexHeaders,
+	parseUsageHeaders,
 	parseCodexUsage,
 	renderUsageBar,
 	renderUsagePanel,
@@ -119,9 +121,9 @@ test("accountIdFromToken decodes the chatgpt account claim from an OAuth JWT", (
 
 test("renderUsageBar summarizes the main limit with a gauge and the rest as percentages", () => {
 	const usage = parseCodexUsage(CODEX_PAYLOAD, NOW);
-	assert.equal(renderUsageBar(usage, plainTheme), "week ▰▰▰▱▱▱▱▱ 40%");
+	assert.equal(renderUsageBar(usage, plainTheme), "codex week ▰▰▰▱▱▱▱▱ 40%");
 	const twoWindows = parseCodexUsage({ ...CODEX_PAYLOAD, rate_limit: CODEX_PAYLOAD.additional_rate_limits[0].rate_limit }, NOW);
-	assert.equal(renderUsageBar(twoWindows, plainTheme), "5h ▰▱▱▱▱▱▱▱ 12% · week 3%");
+	assert.equal(renderUsageBar(twoWindows, plainTheme), "codex 5h ▰▱▱▱▱▱▱▱ 12% · week 3%");
 	const hot = renderUsageBar(parseCodexUsage({ rate_limit: { primary_window: { used_percent: 91, limit_window_seconds: 18_000, reset_at: 1 } } }, NOW), taggedTheme);
 	assert.match(hot, /<warning>▰▰▰▰▰▰▰<\/warning>/);
 	assert.equal(renderUsageBar(parseCodexUsage({}, NOW), plainTheme), undefined);
@@ -140,6 +142,24 @@ test("renderUsagePanel lists each provider with meters, resets, and a stale mark
 	assert.deepEqual(renderUsagePanel([], plainTheme, 120, NOW), ["No subscription usage yet. Usage arrives with the next response, or press r to fetch it."]);
 });
 
+test("renderUsagePanel puts the active provider first and explains missing data", () => {
+	const codex = parseCodexUsage(CODEX_PAYLOAD, NOW);
+	const claude = parseAnthropicHeaders({ "anthropic-ratelimit-unified-5h-utilization": "0.2" }, NOW);
+	assert.ok(claude);
+	const both = renderUsagePanel([codex, claude], plainTheme, 100, NOW, { provider: "anthropic" });
+	assert.match(both[0], /^✿ anthropic · updated just now$/);
+	assert.match(both[1], /^ {2}claude$/);
+	assert.match(both.find((line) => line.startsWith("openai-codex")) ?? "", /^openai-codex · pro/);
+
+	const apiKey = renderUsagePanel([codex], plainTheme, 100, NOW, { provider: "openai" });
+	assert.match(apiKey[0], /^✿ openai · no subscription usage for this provider$/);
+	assert.match(apiKey[1], /^openai-codex · pro/);
+
+	const pending = renderUsagePanel([], plainTheme, 100, NOW, { provider: "anthropic" });
+	assert.deepEqual(pending, ["✿ anthropic · usage arrives with the first response"]);
+	assert.deepEqual(renderUsagePanel([], plainTheme, 100, NOW, { provider: "openai-codex" }), ["✿ openai-codex · no usage yet · r to fetch"]);
+});
+
 test("UsageStore keeps the latest snapshot per provider and lists them in order", () => {
 	const store = new UsageStore();
 	const first: ProviderUsage = { provider: "openai-codex", plan: "pro", limits: [], fetchedAt: 1 };
@@ -149,4 +169,29 @@ test("UsageStore keeps the latest snapshot per provider and lists them in order"
 	store.record(second);
 	assert.equal(store.get("openai-codex"), second);
 	assert.deepEqual(store.all().map((usage) => usage.provider), ["openai-codex", "anthropic"]);
+});
+
+test("parseAnthropicHeaders turns the unified utilization fractions into 5h and weekly windows", () => {
+	const headers = {
+		"anthropic-ratelimit-unified-status": "allowed_warning",
+		"anthropic-ratelimit-unified-5h-utilization": "0.42",
+		"anthropic-ratelimit-unified-5h-reset": "1788620161",
+		"anthropic-ratelimit-unified-7d-utilization": "0.875",
+		"anthropic-ratelimit-unified-7d-reset": "1789206961",
+		"anthropic-ratelimit-unified-representative-claim": "seven_day",
+	};
+	const usage = parseAnthropicHeaders(headers, NOW);
+	assert.ok(usage);
+	assert.equal(usage.provider, "anthropic");
+	assert.deepEqual(usage.limits.map((limit) => limit.name), ["claude"]);
+	assert.deepEqual(usage.limits[0].windows.map((w) => `${w.label}:${w.usedPercent}:${w.resetAt}`), ["5h:42:1788620161000", "week:87.5:1789206961000"]);
+	assert.equal(usage.limits[0].limitReached, false);
+	assert.equal(parseAnthropicHeaders({ ...headers, "anthropic-ratelimit-unified-status": "rejected" }, NOW)?.limits[0].limitReached, true);
+	assert.equal(parseAnthropicHeaders({ "anthropic-ratelimit-requests-remaining": "99" }, NOW), undefined);
+});
+
+test("parseUsageHeaders picks whichever provider the headers belong to", () => {
+	assert.equal(parseUsageHeaders({ "x-codex-primary-used-percent": "10", "x-codex-primary-window-minutes": "300" }, NOW)?.provider, "openai-codex");
+	assert.equal(parseUsageHeaders({ "anthropic-ratelimit-unified-5h-utilization": "0.1" }, NOW)?.provider, "anthropic");
+	assert.equal(parseUsageHeaders({ "content-type": "application/json" }, NOW), undefined);
 });

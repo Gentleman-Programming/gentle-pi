@@ -8,7 +8,7 @@ import { renderShellBar, shellEnabled, type ShellBarModel, type ShellBarTheme } 
 import { CHANGE_STATUS, ChangesTracker, renderChangesWidget, type ChangedFile, type ChangesModel, type GitRunner, type LineCounter } from "../lib/shell-changes.ts";
 import { ChangesView } from "../lib/shell-changes-view.ts";
 import { framePromptLines, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
-import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, parseCodexHeaders, parseCodexUsage, UsageStore, type ProviderUsage } from "../lib/shell-usage.ts";
+import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, parseCodexUsage, parseUsageHeaders, UsageStore, type ProviderUsage } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
 
 // Gentle Shell: the visual layer gentle-pi puts on top of pi. It installs the
@@ -354,7 +354,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		renderHost?.requestRender();
 	};
 	pi.on("after_provider_response", (event) => {
-		const parsed = parseCodexHeaders(event.headers, deps.now());
+		const parsed = parseUsageHeaders(event.headers, deps.now());
 		if (!parsed) return;
 		usage.record(parsed);
 		renderHost?.requestRender();
@@ -368,6 +368,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 					new UsageView(usage, {
 						theme,
 						now: () => deps.now(),
+						active: () => (ctx.model ? { provider: ctx.model.provider } : undefined),
 						onRefresh: () => refreshUsage(ctx, true),
 						onClose: () => done(null),
 						requestRender: () => tui.requestRender(),
