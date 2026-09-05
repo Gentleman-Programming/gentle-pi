@@ -47,16 +47,29 @@ test("renderCard collapses to the frame and the first body line with an expand h
 	assert.equal(visibleWidth(lines[1]), 60);
 });
 
-test("renderCard colors the title by tone, the frame as border, and the body as text", () => {
+test("renderCard paints the whole frame in the card tone", () => {
 	const info = renderCard(card(), taggedTheme, 80, { expanded: true });
-	assert.match(info[0], /^<border>╭─ <\/border><customMessageLabel>✿ Gentle AI<\/customMessageLabel> <muted>·<\/muted> <muted>review preflight<\/muted><border> ─+╮<\/border>$/);
-	assert.match(info[1], /^<border>│<\/border> <text>/);
+	assert.match(info[0], /^<customMessageLabel>╭─ <\/customMessageLabel><customMessageLabel>✿ Gentle AI<\/customMessageLabel> <muted>·<\/muted> <muted>review preflight<\/muted><customMessageLabel> ─+<\/customMessageLabel><customMessageLabel>╮<\/customMessageLabel>$/);
+	assert.match(info[1], /^<customMessageLabel>│<\/customMessageLabel> <text>.*<customMessageLabel>│<\/customMessageLabel>$/);
+	assert.match(info[info.length - 1], /^<customMessageLabel>╰─+╯<\/customMessageLabel>$/);
 
 	const warning = renderCard(card({ tone: CARD_TONE.WARNING, subtitle: undefined }), taggedTheme, 80, { expanded: true });
-	assert.match(warning[0], /<warning>✿ Gentle AI<\/warning><border> ─+╮<\/border>$/);
+	assert.match(warning[0], /^<warning>╭─ <\/warning><warning>✿ Gentle AI<\/warning><warning> ─+<\/warning><warning>╮<\/warning>$/);
+	assert.match(warning[1], /^<warning>│<\/warning> .*<warning>│<\/warning>$/);
+	assert.match(warning[warning.length - 1], /^<warning>╰─+╯<\/warning>$/);
 
 	const error = renderCard(card({ tone: CARD_TONE.ERROR }), taggedTheme, 80, { expanded: true });
 	assert.match(error[0], /<error>✿ Gentle AI<\/error>/);
+	assert.equal(CARD_TONE.SUCCESS, "success");
+});
+
+test("renderCard places a hint at the right end of the top rule and can paint every line", () => {
+	const lines = renderCard(card(), plainTheme, 60, { expanded: false, hint: "ctrl+o expand" });
+	assert.match(stripAnsi(lines[0]), /^╭─ ✿ Gentle AI · review preflight ─+ ctrl\+o expand ╮$/);
+	assert.equal(visibleWidth(lines[0]), 60);
+
+	const painted = renderCard(card(), plainTheme, 60, { expanded: false, paint: (line) => `[bg]${line}[/bg]` });
+	assert.ok(painted.every((line) => line.startsWith("[bg]") && line.endsWith("[/bg]")));
 });
 
 test("renderCard accepts a custom glyph and an empty body", () => {
@@ -64,4 +77,9 @@ test("renderCard accepts a custom glyph and an empty body", () => {
 	assert.equal(lines.length, 2);
 	assert.match(lines[0], /^╭─ ✎ Gentle AI · review preflight ─+╮$/);
 	assert.match(lines[1], /^╰─+╯$/);
+});
+
+test("renderCard keeps the top rule at width with a two-cell glyph", () => {
+	const lines = renderCard(card({ glyph: "\u{1F339}\uFE0E" }), plainTheme, 60, { expanded: false, hint: "ctrl+o expand" });
+	for (const line of lines) assert.equal(visibleWidth(line), 60, `"${stripAnsi(line)}" is not 60 wide`);
 });

@@ -118,16 +118,21 @@ export function changesSummary(model: ChangesModel): string {
 	return `${model.files.length} ${noun} · +${model.added} −${model.deleted}`;
 }
 
+// One line: summary, the files joined by dots, and the command pushed to
+// the right edge. The file list goes first when the terminal is narrow.
 export function renderChangesWidget(model: ChangesModel, theme: ChangesTheme, width: number): string[] {
 	if (model.files.length === 0) return [];
 	const noun = model.files.length === 1 ? "file" : "files";
-	const head = `${theme.fg("accent", WIDGET_GLYPH)} ${theme.fg("text", `${model.files.length} ${noun}`)} ${theme.fg("muted", "·")} ${theme.fg("success", `+${model.added}`)} ${theme.fg("error", `−${model.deleted}`)}`;
-	const hint = `${theme.fg("muted", "·")} ${theme.fg("dim", CHANGES_COMMAND)}`;
-	const list = theme.fg("muted", model.files.map((file) => file.path).join(", "));
-	const full = `${head} ${theme.fg("muted", "·")} ${list} ${hint}`;
-	if (visibleWidth(full) <= width) return [full];
-	const short = `${head} ${hint}`;
-	return [truncateToWidth(visibleWidth(short) <= width ? short : head, width, "…")];
+	const dot = theme.fg("muted", "·");
+	const head = `${theme.fg("accent", WIDGET_GLYPH)} ${theme.fg("text", `${model.files.length} ${noun}`)} ${dot} ${theme.fg("success", `+${model.added}`)} ${theme.fg("error", `−${model.deleted}`)}`;
+	const hint = theme.fg("dim", CHANGES_COMMAND);
+	const list = model.files.map((file) => theme.fg("muted", file.path)).join(` ${dot} `);
+	const left = `${head} ${dot} ${list}`;
+	const gap = width - visibleWidth(left) - visibleWidth(hint);
+	if (gap >= 2) return [`${left}${" ".repeat(gap)}${hint}`];
+	const headGap = width - visibleWidth(head) - visibleWidth(hint);
+	if (headGap >= 2) return [`${head}${" ".repeat(headGap)}${hint}`];
+	return [truncateToWidth(head, width, "…")];
 }
 
 export interface GitResult {

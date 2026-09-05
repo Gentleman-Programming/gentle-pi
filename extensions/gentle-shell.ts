@@ -1,4 +1,4 @@
-import { CustomEditor, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, keyHint, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
 import { spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
@@ -9,7 +9,7 @@ import { CHANGE_STATUS, ChangesTracker, renderChangesWidget, type ChangedFile, t
 import { ChangesView } from "../lib/shell-changes-view.ts";
 import { CARD_TONE, renderCard, type Card, type CardTheme } from "../lib/shell-card.ts";
 import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
-import { framePromptLines, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
+import { framePromptLines, panelPainter, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
 import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, parseCodexUsage, parseUsageHeaders, UsageStore, type ProviderUsage } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
 
@@ -136,9 +136,12 @@ export function createShellBarComponent(
 interface PromptEditorDeps {
 	fg: (color: string, text: string) => string;
 	bold: (text: string) => string;
+	paint?: (line: string) => string;
 	requestRender(): void;
 	pending(): boolean;
 }
+
+const PROMPT_FRAME_ROLE = "border";
 
 const PETAL_PULSE_MS = 160;
 
@@ -170,7 +173,16 @@ export class GentlePromptEditor extends CustomEditor {
 		const lines = super.render(Math.max(1, width - 2));
 		if (this.getText() === "" && lines.length === 3) lines[1] = withPromptHint(lines[1], PROMPT_HINT, this.deps.fg);
 		const state = this.promptState === PROMPT_STATE.WORKING && this.deps.pending() ? PROMPT_STATE.QUEUED : this.promptState;
-		return framePromptLines(lines, width, { state, tick: this.tick, borderColor: this.borderColor, fg: this.deps.fg, bold: this.deps.bold });
+		// The frame keeps the theme's border color rather than pi's thinking-level
+		// color, so the prompt reads as one panel with the cards around it.
+		return framePromptLines(lines, width, {
+			state,
+			tick: this.tick,
+			borderColor: (text) => this.deps.fg(PROMPT_FRAME_ROLE, text),
+			fg: this.deps.fg,
+			bold: this.deps.bold,
+			paint: this.deps.paint,
+		});
 	}
 
 	dispose(): void {
@@ -190,6 +202,7 @@ function installPrompt(ctx: ExtensionContext, onCreated: (prompt: GentlePromptEd
 		const prompt = new GentlePromptEditor(tui, theme, keybindings, {
 			fg: (color, text) => ctx.ui.theme.fg(color as Parameters<typeof ctx.ui.theme.fg>[0], text),
 			bold: (text) => ctx.ui.theme.bold(text),
+			paint: panelPainter(ctx.ui.theme.getBgAnsi("customMessageBg")),
 			requestRender: () => tui.requestRender(),
 			pending: () => ctx.hasPendingMessages(),
 		});
@@ -343,10 +356,16 @@ function messageText(content: string | Array<{ type: string; text?: string }>): 
 	return content.map((part) => (part.type === "text" ? (part.text ?? "") : "")).join("\n");
 }
 
-function cardComponent(card: Card, theme: CardTheme, expanded: boolean) {
+interface CardComponentOptions {
+	expanded: boolean;
+	hint?: string;
+	paint?: (line: string) => string;
+}
+
+function cardComponent(card: Card, theme: CardTheme, options: CardComponentOptions) {
 	return {
 		render(width: number) {
-			return renderCard(card, theme, width, { expanded });
+			return renderCard(card, theme, width, options);
 		},
 		invalidate() {},
 	};
@@ -420,7 +439,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	});
 	pi.registerMessageRenderer(REVIEW_PREFLIGHT_TYPE, (message, options, theme) => {
 		const body = messageText(message.content as string | Array<{ type: string; text?: string }>).split("\n");
-		return cardComponent({ title: "Gentle AI", subtitle: "review preflight", body, tone: CARD_TONE.INFO }, theme, options.expanded);
+		const hint = keyHint("app.tools.expand", options.expanded ? "collapse" : "expand");
+		return cardComponent({ title: "Gentle AI", subtitle: "review preflight", body, tone: CARD_TONE.INFO }, theme, { expanded: options.expanded, hint });
 	});
 	pi.registerCommand(USAGE_COMMAND_NAME, {
 		description: "Show subscription usage windows for the connected providers. Press r to refetch.",
@@ -473,7 +493,12 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		// The petal already says the agent is working; pi's own "Working" row would say it twice.
 		ctx.ui.setWorkingVisible(false);
 		const notice = deps.devBinary();
-		ctx.ui.setWidget(DEV_BINARY_WIDGET_KEY, notice ? (_tui, theme) => spaced(cardComponent(devBinaryCard(notice), theme, true)) : undefined);
+		ctx.ui.setWidget(
+			DEV_BINARY_WIDGET_KEY,
+			notice
+				? (_tui, theme) => spaced(cardComponent(devBinaryCard(notice), theme, { expanded: true, paint: (line) => theme.bg("customMessageBg", line) }))
+				: undefined,
+		);
 		await tracker.start();
 		shown = "";
 		applyChanges(ctx, tracker.model);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { initTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import gentleShell, { buildShellBarModel, changesShortcut, devBinaryCard, fetchCodexUsage, loadFileDiff, openInExternalEditor, type GentlePromptEditor } from "../extensions/gentle-shell.ts";
 import { CHANGE_STATUS } from "../lib/shell-changes.ts";
 import type { ShellBarTheme } from "../lib/shell-bar.ts";
@@ -9,14 +9,22 @@ import { stripAnsi } from "../lib/terminal-theme.ts";
 // The Gentle Shell extension wires the pure bar renderer into pi's footer
 // slot. These tests drive it with a fake ExtensionAPI and context.
 
-const plainTheme: ShellBarTheme = {
+initTheme("dark");
+
+const plainTheme = {
 	fg(_color: string, value: string) {
 		return value;
 	},
 	bold(value: string) {
 		return value;
 	},
-};
+	bg(_color: string, value: string) {
+		return value;
+	},
+	getBgAnsi() {
+		return "";
+	},
+} satisfies ShellBarTheme & { bg(color: string, value: string): string; getBgAnsi(): string };
 
 interface FakeUi {
 	footerFactory: unknown;
@@ -229,6 +237,7 @@ test("gentleShell frames the editor with the petal prompt and a hint while empty
 	editor.focused = true;
 	const lines = editor.render(60).map(stripAnsi);
 	assert.match(lines[0], /^╭─ ✿ ─+╮$/);
+	assert.ok(editor.render(60).every((line) => line.endsWith("\x1b[49m")), "prompt lines carry the panel background");
 	assert.match(lines[1], /^│.*type, or \/ for commands +│$/);
 	assert.match(lines[lines.length - 1], /^╰─+╯$/);
 	editor.setText("hola");
@@ -285,7 +294,7 @@ test("gentleShell shows working-tree changes in a widget below the editor and in
 	await fire(handlers, "tool_execution_end", ctx);
 	const factory = ui.widgets.get("gentle-shell-changes") as (tui: unknown, theme: ShellBarTheme) => { render(width: number): string[] };
 	const [line] = factory(fakeTui, plainTheme).render(120);
-	assert.equal(line, "✎ 1 file · +10 −0 · lib/b.ts · /gentle:changes");
+	assert.match(line, /^✎ 1 file · \+10 −0 · lib\/b\.ts +\/gentle:changes$/);
 	assert.match(renderFooter(ui), /main ±1/);
 });
 
@@ -485,7 +494,7 @@ test("gentleShell draws the review preflight message as a Gentle card", () => {
 	assert.ok(renderer, "renderer not registered");
 	const message = { customType: "gentle-pi.review-preflight", content: "Receipt-driven development is enabled.\n\nCall the gentle_review tool." };
 	const expanded = renderer(message, { expanded: true }, plainTheme).render(80).map(stripAnsi);
-	assert.match(expanded[0], /^╭─ ✿ Gentle AI · review preflight ─+╮$/);
+	assert.match(expanded[0], /^╭─ ✿ Gentle AI · review preflight ─+ .*collapse ╮$/);
 	assert.match(expanded[1], /^│ Receipt-driven development is enabled\. +│$/);
 	assert.ok(expanded.some((line) => line.includes("gentle_review")));
 	const collapsed = renderer({ ...message, content: [{ type: "text", text: message.content }] }, { expanded: false }, plainTheme).render(80).map(stripAnsi);

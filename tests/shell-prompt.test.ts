@@ -4,6 +4,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import {
 	framePromptLines,
+	panelPainter,
 	PROMPT_STATE,
 	petalGlyph,
 	petalTone,
@@ -107,4 +108,11 @@ test("withPromptHint leaves the line alone when the hint does not fit", () => {
 	const line = ` ${CURSOR}${" ".repeat(6)}`;
 	const hinted = withPromptHint(line, "type, or / for commands", (_c, t) => t);
 	assert.equal(hinted, line);
+});
+
+test("panelPainter keeps the background running after pi's cursor reset", () => {
+	const paint = panelPainter("<bg>");
+	assert.equal(paint("a\x1b[0mb"), "<bg>a\x1b[0m<bg>b\x1b[49m");
+	const lines = framePromptLines(editorLines(40), 40, options({ fg: (_c, t) => t, paint }));
+	assert.ok(lines.every((line) => line.startsWith("<bg>") && line.endsWith("\x1b[49m")));
 });

@@ -6,6 +6,7 @@ import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works
 
 export const CARD_TONE = {
 	INFO: "info",
+	SUCCESS: "success",
 	WARNING: "warning",
 	ERROR: "error",
 } as const;
@@ -26,15 +27,20 @@ export interface CardTheme {
 
 export interface CardRenderOptions {
 	expanded: boolean;
+	/** Right-aligned hint in the top rule, e.g. the expand key. May carry ANSI. */
+	hint?: string;
+	/** Paints a finished line, e.g. with the panel background. */
+	paint?: (line: string) => string;
 }
 
 export const CARD_GLYPH = "✿";
 const TONE_ROLE: Record<CardTone, string> = {
 	[CARD_TONE.INFO]: "customMessageLabel",
+	[CARD_TONE.SUCCESS]: "success",
 	[CARD_TONE.WARNING]: "warning",
 	[CARD_TONE.ERROR]: "error",
 };
-const FRAME_ROLE = "border";
+const HINT_ROLE = "dim";
 const SUBTITLE_ROLE = "muted";
 const BODY_ROLE = "text";
 const SEPARATOR = "·";
@@ -49,29 +55,53 @@ function titleText(card: Card, theme: CardTheme): { styled: string; width: numbe
 	const styled = card.subtitle
 		? `${theme.fg(TONE_ROLE[card.tone], head)} ${theme.fg(SUBTITLE_ROLE, SEPARATOR)} ${theme.fg(SUBTITLE_ROLE, card.subtitle)}`
 		: theme.fg(TONE_ROLE[card.tone], head);
-	return { styled, width: head.length + (card.subtitle ? card.subtitle.length + 3 : 0) };
+	return { styled, width: visibleWidth(head) + (card.subtitle ? visibleWidth(card.subtitle) + 3 : 0) };
 }
 
 function bodyLines(card: Card, innerWidth: number): string[] {
 	return card.body.flatMap((paragraph) => (paragraph === "" ? [""] : wrapTextWithAnsi(paragraph, innerWidth)));
 }
 
-function frameLine(text: string, innerWidth: number, theme: CardTheme): string {
-	const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(text)));
-	return `${theme.fg(FRAME_ROLE, "│")} ${text}${padding} ${theme.fg(FRAME_ROLE, "│")}`;
+// The whole frame carries the tone, so a running, finished, or failed card
+// reads at a glance from any edge.
+export function cardTop(card: Card, theme: CardTheme, width: number, hint?: string): string {
+	const title = titleText(card, theme);
+	const frame = TONE_ROLE[card.tone];
+	const hintWidth = hint ? visibleWidth(hint) + 2 : 0;
+	const fill = rule(width - title.width - 5 - hintWidth);
+	const tail = hint ? ` ${theme.fg(HINT_ROLE, hint)} ` : "";
+	return theme.fg(frame, "╭─ ") + title.styled + theme.fg(frame, ` ${fill}`) + tail + theme.fg(frame, "╮");
+}
+
+export function cardLine(text: string, tone: CardTone, theme: CardTheme, width: number): string {
+	const innerWidth = Math.max(1, width - FRAME_COLUMNS);
+	const clipped = truncateToWidth(text, innerWidth, "…");
+	const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(clipped)));
+	return `${theme.fg(TONE_ROLE[tone], "│")} ${clipped}${padding} ${theme.fg(TONE_ROLE[tone], "│")}`;
+}
+
+export function cardBottom(tone: CardTone, theme: CardTheme, width: number): string {
+	return theme.fg(TONE_ROLE[tone], `╰${rule(width - 2)}╯`);
+}
+
+export function cardInnerWidth(width: number): number {
+	return Math.max(1, width - FRAME_COLUMNS);
 }
 
 export function renderCard(card: Card, theme: CardTheme, width: number, options: CardRenderOptions): string[] {
 	const innerWidth = Math.max(1, width - FRAME_COLUMNS);
-	const title = titleText(card, theme);
-	const top = theme.fg(FRAME_ROLE, "╭─ ") + title.styled + theme.fg(FRAME_ROLE, ` ${rule(width - title.width - 5)}╮`);
-	const bottom = theme.fg(FRAME_ROLE, `╰${rule(width - 2)}╯`);
+	const paint = options.paint ?? ((line: string) => line);
+	const top = cardTop(card, theme, width, options.hint);
+	const bottom = cardBottom(card.tone, theme, width);
 	const lines = bodyLines(card, innerWidth);
-	if (lines.length === 0) return [top, bottom];
-	if (!options.expanded) {
-		const first = lines.find((line) => line !== "") ?? "";
-		const clipped = lines.length > 1 ? truncateToWidth(first, Math.max(1, innerWidth - 1), "") + "…" : first;
-		return [top, frameLine(theme.fg(BODY_ROLE, clipped), innerWidth, theme), bottom];
-	}
-	return [top, ...lines.map((line) => frameLine(line === "" ? "" : theme.fg(BODY_ROLE, line), innerWidth, theme)), bottom];
+	const body = (() => {
+		if (lines.length === 0) return [];
+		if (!options.expanded) {
+			const first = lines.find((line) => line !== "") ?? "";
+			const clipped = lines.length > 1 ? truncateToWidth(first, Math.max(1, innerWidth - 1), "") + "…" : first;
+			return [cardLine(theme.fg(BODY_ROLE, clipped), card.tone, theme, width)];
+		}
+		return lines.map((line) => cardLine(line === "" ? "" : theme.fg(BODY_ROLE, line), card.tone, theme, width));
+	})();
+	return [top, ...body, bottom].map(paint);
 }

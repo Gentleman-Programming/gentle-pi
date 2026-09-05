@@ -33,6 +33,8 @@ export interface PromptFrameOptions {
 	borderColor: (text: string) => string;
 	fg: (color: string, text: string) => string;
 	bold?: (text: string) => string;
+	/** Paints a finished line, e.g. with the panel background. */
+	paint?: (line: string) => string;
 }
 
 // A terminal cell cannot grow, so the petal earns presence with weight and
@@ -96,7 +98,8 @@ export function framePromptLines(lines: string[], width: number, options: Prompt
 	const top = lines[0];
 	const bottom = lines[lines.length - 1];
 	const content = lines.slice(1, -1).map((line) => sideRules(line, innerWidth, options));
-	return [topRule(width, options, scrollIndicator(top)), ...content, bottomRule(width, options, scrollIndicator(bottom))];
+	const paint = options.paint ?? ((line: string) => line);
+	return [topRule(width, options, scrollIndicator(top)), ...content, bottomRule(width, options, scrollIndicator(bottom))].map(paint);
 }
 
 export function withPromptHint(line: string, hint: string, fg: PromptFrameOptions["fg"]): string {
@@ -106,4 +109,11 @@ export function withPromptHint(line: string, hint: string, fg: PromptFrameOption
 	const trailing = line.slice(afterCursor);
 	if (trailing.trim() !== "" || trailing.length < hint.length + 1) return line;
 	return `${line.slice(0, afterCursor)} ${fg(HINT_ROLE, hint)}${" ".repeat(trailing.length - hint.length - 1)}`;
+}
+
+// Paints a line with a background that survives the resets pi's editor
+// emits around the cursor, so the panel color runs edge to edge.
+export function panelPainter(bgAnsi: string): (line: string) => string {
+	const RESET = "\x1b[0m";
+	return (line) => `${bgAnsi}${line.split(RESET).join(`${RESET}${bgAnsi}`)}\x1b[49m`;
 }
