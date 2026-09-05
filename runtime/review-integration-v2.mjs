@@ -551,6 +551,18 @@ export const REVIEW_PROVIDER_ROLE_CAPTURE_OPERATIONS = Object.freeze(Object.valu
 
 
 
+// gentle-pi#627: the exact `gentle-ai sync` invocation that resolves a stale
+// managed-asset set (STATUS next_transition stop, and START's preflight
+// failure envelope both carry this same shape).
+
+
+
+
+
+
+
+
+
 
 
 
@@ -662,6 +674,8 @@ const FAILURE_NEXT_ACTIONS = ["correct_request", "retry", "retry_with_bounded_ba
 // cause_category is diagnostic metadata (nothing routes on it), so unknown
 // snake_case values are tolerated for forward compatibility.
 const FAILURE_CAUSE_CATEGORIES = ["inventory_io_or_layout", "lock_ambiguous", "reset_residue", "record_or_graph_invalid", "inventory_incomplete", "incomplete_store_entry"]         ;
+
+
 
 
 
@@ -1682,12 +1696,32 @@ function decodeCollectInput(value         , label        , v5         , v6      
 	};
 }
 
+// gentle-pi#627: gentle-ai's managed-assets continuation (STATUS next_transition
+// stop reason_code=managed_assets_outdated, and START's preflight failure
+// envelope) names the exact `gentle-ai sync` invocation that resolves a stale
+// managed-asset set without abandoning the frozen candidate. Decoded verbatim
+// from internal/cli/review_operation_contract.go's ReviewManagedAssetsContinuation.
+export function decodeReviewManagedAssetsContinuationV1(value         , label        )                                    {
+	const body = exactRecord(value, label, ["operation", "command"], ["agent", "stale_assets"]);
+	const operation = enumeration(body.operation, ["sync"]         , `${label}.operation`);
+	const command = nonempty(body.command, `${label}.command`);
+	const agent = body.agent === undefined ? undefined : nonempty(body.agent, `${label}.agent`);
+	const staleAssets = body.stale_assets === undefined ? undefined : stringArray(body.stale_assets, `${label}.stale_assets`, { minimum: 1 });
+	return { operation, command, ...(agent === undefined ? {} : { agent }), ...(staleAssets === undefined ? {} : { staleAssets }) };
+}
+
 export function decodeReviewNextTransitionV3(value         , options                                 = {})                         {
 	const v6 = options.v6 === true;
 	const v5 = options.v5 === true || v6;
-	const transition = exactRecord(value, "next_transition", ["kind", "reason_code"], ["execute", "collect", ...(v5 ? ["correction_request"] : [])]);
+	const transition = exactRecord(value, "next_transition", ["kind", "reason_code"], ["execute", "collect", ...(v5 ? ["correction_request"] : []), "continuation"]);
 	const kind = enumeration(transition.kind, ["execute", "collect", "stop"]         , "next_transition.kind");
 	const reasonCode = text(transition.reason_code, "next_transition.reason_code", { minimum: 1, pattern: /^[a-z0-9_]+$/ });
+	const continuation = transition.continuation === undefined ? undefined : decodeReviewManagedAssetsContinuationV1(transition.continuation, "next_transition.continuation");
+	// gentle-pi#627: continuation is optional on every status version an older
+	// gentle-ai may emit a managed_assets_outdated stop with no continuation at
+	// all, and decode must not refuse the whole envelope for that. When present
+	// it is only valid on a stop with this exact reason_code.
+	if (continuation !== undefined && !(kind === "stop" && reasonCode === "managed_assets_outdated")) throw new TypeError("next_transition.continuation is only valid for a stop transition with reason_code managed_assets_outdated");
 
 	// status/v5: the bounded correction plan request rides exactly its two
 	// reason codes and never any other (vendored status-v5.schema.json).
@@ -1737,7 +1771,7 @@ export function decodeReviewNextTransitionV3(value         , options            
 		return { kind, reasonCode, collect: { inputs }, ...(correctionRequest === undefined ? {} : { correctionRequest }) };
 	}
 	if (transition.execute !== undefined || transition.collect !== undefined) throw new TypeError("next_transition stop cannot carry a transition");
-	return { kind, reasonCode, ...(correctionRequest === undefined ? {} : { correctionRequest }) };
+	return { kind, reasonCode, ...(correctionRequest === undefined ? {} : { correctionRequest }), ...(continuation === undefined ? {} : { continuation }) };
 }
 
 // ---------------------------------------------------------------------------
@@ -2058,9 +2092,10 @@ function decodeFailureContext(value         , label        )                    
 export function decodeReviewFailureV2(value         )                  {
 	const body = exactRecord(value, "failure", [
 		"schema", "contract", "operation", "phase", "code", "message", "mutation_outcome", "authority_applicability", "retry_safe", "replayability", "required_inputs", "next_action",
-	], ["lineage_id", "request_digest", "progress_identity", "cause_category", "cause", "context"]);
+	], ["lineage_id", "request_digest", "progress_identity", "cause_category", "cause", "context", "continuation"]);
 	requireIdentity(body, "gentle-ai.review-integration.failure/v2");
 	const operation = enumeration(body.operation, FAILURE_OPERATIONS, "failure.operation");
+	const code = text(body.code, "failure.code", { pattern: /^[a-z0-9]+(?:_[a-z0-9]+)*$/ });
 
 	if (body.progress_identity !== undefined) {
 		if (body.lineage_id === undefined || body.request_digest === undefined) throw new TypeError("failure.progress_identity requires lineage_id and request_digest");
@@ -2069,13 +2104,18 @@ export function decodeReviewFailureV2(value         )                  {
 	if (body.request_digest !== undefined && operation === REVIEW_INTEGRATION_OPERATION.REPAIR && body.progress_identity === undefined) {
 		throw new TypeError("failure.request_digest with review.repair requires progress_identity");
 	}
+	// gentle-pi#627: continuation is optional on every version — an older
+	// gentle-ai may emit managed_assets_outdated with no continuation, and
+	// decode must not refuse the whole envelope for that. When present it is
+	// only valid on this exact code.
+	if (body.continuation !== undefined && code !== "managed_assets_outdated") throw new TypeError("failure.continuation is only valid for code managed_assets_outdated");
 
 	return {
 		schema: "gentle-ai.review-integration.failure/v2",
 		contract: REVIEW_INTEGRATION_CONTRACT,
 		operation,
 		phase: enumeration(body.phase, ["preflight", "pre_native", "native_running", "native_committed", "reconciliation"]         , "failure.phase"),
-		code: text(body.code, "failure.code", { pattern: /^[a-z0-9]+(?:_[a-z0-9]+)*$/ }),
+		code,
 		message: text(body.message, "failure.message", { minimum: 1, maximum: 240, pattern: /^[^\r\n]+$/ }),
 		mutationOutcome: enumeration(body.mutation_outcome, Object.values(REVIEW_MUTATION_OUTCOME), "failure.mutation_outcome"),
 		authorityApplicability: enumeration(body.authority_applicability, Object.values(REVIEW_AUTHORITY_APPLICABILITY), "failure.authority_applicability"),
@@ -2089,6 +2129,7 @@ export function decodeReviewFailureV2(value         )                  {
 		...(body.cause_category === undefined ? {} : { causeCategory: text(body.cause_category, "failure.cause_category", { minimum: 1, pattern: /^[a-z0-9]+(?:_[a-z0-9]+)*$/ }) }),
 		...(body.cause === undefined ? {} : { cause: text(body.cause, "failure.cause", { minimum: 1, maximum: 4000, pattern: /^[^\r\n]+$/ }) }),
 		...(body.context === undefined ? {} : { context: decodeFailureContext(body.context, "failure.context") }),
+		...(body.continuation === undefined ? {} : { continuation: decodeReviewManagedAssetsContinuationV1(body.continuation, "failure.continuation") }),
 		raw: body,
 	};
 }

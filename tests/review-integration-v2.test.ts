@@ -184,6 +184,44 @@ test("failure enforces exact keys, enums, and identifiers", () => {
 	assert.throws(() => decodeReviewFailureV2(badCode), /code/);
 });
 
+test("failure with code managed_assets_outdated decodes its continuation, degrades without one, and forbids it elsewhere", () => {
+	const source: JsonObject = {
+		schema: "gentle-ai.review-integration.failure/v2",
+		contract: REVIEW_INTEGRATION_CONTRACT,
+		operation: "review.start",
+		phase: "preflight",
+		code: "managed_assets_outdated",
+		message: "the managed asset set is stale",
+		mutation_outcome: "not_started",
+		authority_applicability: "current_target",
+		retry_safe: true,
+		replayability: "manual_action_required",
+		required_inputs: [],
+		next_action: "explicit-maintainer-action",
+		continuation: { operation: "sync", command: "gentle-ai sync --agent claude-code", agent: "claude-code", stale_assets: ["orchestration/claude-code.md"] },
+	};
+	assert.deepEqual(decodeReviewFailureV2(source).continuation, { operation: "sync", command: "gentle-ai sync --agent claude-code", agent: "claude-code", staleAssets: ["orchestration/claude-code.md"] });
+
+	const missingCommand = clone(source);
+	delete (missingCommand.continuation as JsonObject).command;
+	assert.throws(() => decodeReviewFailureV2(missingCommand), /command.*required|required.*command/);
+
+	// an older gentle-ai may emit managed_assets_outdated with no continuation
+	// at all; decode must not refuse the whole envelope for that
+	const missingContinuation = clone(source);
+	delete missingContinuation.continuation;
+	assert.equal(decodeReviewFailureV2(missingContinuation).continuation, undefined);
+
+	const unexpectedContinuation: JsonObject = { ...clone(source), code: "gate_scope_changed" };
+	assert.throws(() => decodeReviewFailureV2(unexpectedContinuation), /continuation is only valid/);
+
+	// an envelope without continuation, on a code that does not require one, is unchanged
+	const withoutContinuation = clone(source);
+	withoutContinuation.code = "gate_scope_changed";
+	delete withoutContinuation.continuation;
+	assert.equal(decodeReviewFailureV2(withoutContinuation).continuation, undefined);
+});
+
 test("net-new decoders: consent, next-transition, and artifact-subject reject malformed payloads", () => {
 	const consentSource = fixture<JsonObject>("consent.fixture.json");
 	assertRequired(decodeReviewConsentV2, consentSource, ["schema", "contract", "operation", "action", "blocking", "target_identity", "projection", "risk_level", "changed_files", "changed_lines", "headline", "reason", "value", "risk_evidence", "choices", "off_path"]);
@@ -403,6 +441,41 @@ test("next_transition decodes an execute variant and rejects a stop that carries
 	const stopWithExecute = clone(execute);
 	stopWithExecute.kind = "stop";
 	assert.throws(() => decodeReviewNextTransitionV3(stopWithExecute), /stop cannot carry/);
+});
+
+// gentle-pi#627: gentle-ai reports a stale managed-asset set as a typed stop
+// carrying the exact `gentle-ai sync` invocation that resolves it.
+function managedAssetsContinuation(overrides: Partial<JsonObject> = {}): JsonObject {
+	return { operation: "sync", command: "gentle-ai sync --agent claude-code", agent: "claude-code", stale_assets: ["orchestration/claude-code.md"], ...overrides };
+}
+
+test("next_transition stop decodes a managed_assets_outdated continuation and rejects a malformed one", () => {
+	const stop: JsonObject = { kind: "stop", reason_code: "managed_assets_outdated", continuation: managedAssetsContinuation() };
+	const decoded = decodeReviewNextTransitionV3(stop);
+	assert.deepEqual(decoded.continuation, { operation: "sync", command: "gentle-ai sync --agent claude-code", agent: "claude-code", staleAssets: ["orchestration/claude-code.md"] });
+
+	const bare: JsonObject = { kind: "stop", reason_code: "managed_assets_outdated", continuation: { operation: "sync", command: "gentle-ai sync" } };
+	assert.deepEqual(decodeReviewNextTransitionV3(bare).continuation, { operation: "sync", command: "gentle-ai sync" });
+
+	const missingCommand = clone(stop);
+	delete (missingCommand.continuation as JsonObject).command;
+	assert.throws(() => decodeReviewNextTransitionV3(missingCommand), /command.*required|required.*command/);
+
+	const emptyCommand = clone(stop);
+	(emptyCommand.continuation as JsonObject).command = "";
+	assert.throws(() => decodeReviewNextTransitionV3(emptyCommand), /command/);
+
+	// an older gentle-ai may emit this stop with no continuation at all; decode
+	// must not refuse the whole envelope for that
+	const missingForReasonCode = { kind: "stop", reason_code: "managed_assets_outdated" };
+	assert.equal(decodeReviewNextTransitionV3(missingForReasonCode).continuation, undefined);
+
+	const unexpectedOnOtherReasonCode = { kind: "stop", reason_code: "rdd_disabled", continuation: managedAssetsContinuation() };
+	assert.throws(() => decodeReviewNextTransitionV3(unexpectedOnOtherReasonCode), /continuation is only valid/);
+
+	// envelopes without continuation stay unchanged
+	const plainStop = decodeReviewNextTransitionV3({ kind: "stop", reason_code: "rdd_disabled" });
+	assert.equal(plainStop.continuation, undefined);
 });
 
 function approvedAcknowledgementTransition(): JsonObject {
