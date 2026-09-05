@@ -154,6 +154,11 @@ import {
 } from "../lib/review-integration-v2.ts";
 import { reconcileUnknownReviewLastEventCapture } from "../lib/review-last-event-controller.ts";
 import { recordReviewConsentLatch } from "../lib/review-consent-latch.ts";
+import {
+	inspectWorktreeWorkspaceConfig,
+	renderWorktreeWorkspaceConfigStatusLine,
+	renderWorktreeWorkspaceConfigWarning,
+} from "../lib/worktree-workspace-config.ts";
 
 const GRAPH_V1_ORDINARY_READ_ONLY = "Graph-v1 ordinary review authority is read-only; use native compact-v2 review operations";
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -6033,6 +6038,21 @@ function createGentleAiExtensionForTesting(
 		} catch (error) {
 			if (ctx.hasUI) ctx.ui.notify(`Gentle AI dev binary override check failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
 		}
+		// gentle-pi#370: a linked worktree starts without the ignored
+		// project-local `.pi` configuration. Say so here, at the boundary that
+		// created the gap, instead of letting it resurface much later as a
+		// gentle-ai refusal that names `pi` as an unsupported runtime.
+		try {
+			const worktreeConfig = renderWorktreeWorkspaceConfigWarning(inspectWorktreeWorkspaceConfig(ctx.cwd));
+			if (ctx.hasUI && worktreeConfig !== undefined) ctx.ui.notify(worktreeConfig, "warning");
+		} catch (error) {
+			if (ctx.hasUI) {
+				ctx.ui.notify(
+					`Gentle AI could not check this worktree's project-local .pi configuration: ${error instanceof Error ? error.message : String(error)}`,
+					"warning",
+				);
+			}
+		}
 		try {
 			const installResult = installSddAssets(ctx.cwd, true);
 			migrateLegacyProjectModelOverrides(ctx.cwd);
@@ -6467,10 +6487,20 @@ function createGentleAiExtensionForTesting(
 			const localSddAgentOverrides = sddLocalAgentOverrideCount(ctx.cwd);
 			const modelConfig = await readModelConfigAsync(ctx.cwd);
 			const devBinary = await describeDevBinaryOverride();
+			// gentle-pi#370: whoever is already investigating "pi is not a
+			// supported runtime" reaches for this command, so the worktree
+			// configuration gap has to be visible from here too.
+			let worktreeConfigLine: string | undefined;
+			try {
+				worktreeConfigLine = renderWorktreeWorkspaceConfigStatusLine(inspectWorktreeWorkspaceConfig(ctx.cwd));
+			} catch {
+				worktreeConfigLine = undefined;
+			}
 			ctx.ui.notify(
 				[
 					"el Gentleman package is active.",
 					...(devBinary.state === "inactive" ? [] : [devBinary.line]),
+					...(worktreeConfigLine === undefined ? [] : [worktreeConfigLine]),
 					`Persona: ${readPersonaMode(ctx.cwd)}`,
 					`Global SDD agents: ${agentsInstalled ? "installed" : "not installed"}`,
 					`Global SDD chains: ${chainsInstalled ? "installed" : "not installed"}`,
@@ -6488,7 +6518,7 @@ function createGentleAiExtensionForTesting(
 					`Global model config: ${existsSync(modelConfigPath(ctx.cwd)) ? "present" : "missing"}`,
 					...describeModelConfig(ctx.cwd, modelConfig),
 				].join("\n"),
-				staleSddAssets > 0 || localSddAgentOverrides > 0 || devBinary.state !== "inactive" ? "warning" : "info",
+				staleSddAssets > 0 || localSddAgentOverrides > 0 || devBinary.state !== "inactive" || worktreeConfigLine !== undefined ? "warning" : "info",
 			);
 		},
 	});
