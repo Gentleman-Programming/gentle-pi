@@ -599,7 +599,20 @@ The status bar replaces pi's three-line footer with a single line of segments:
 - Statuses other extensions publish through `setStatus` are appended as trailing segments; the session name sits at the right edge.
 - On narrow terminals the session name is dropped first, then trailing segments, before the line is truncated.
 
-Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer.
+The prompt wraps pi's editor in a rounded frame with a petal that shows what the agent is doing:
+
+```text
+╭─ ✿ working ──────────────────────────────────────────╮
+│ type, or / for commands                              │
+╰──────────────────────────────────────────────────────╯
+```
+
+- The petal is still while pi waits, pulses while the agent works, and turns amber with a `queued` label when messages are waiting behind the current turn.
+- The frame keeps pi's border color, so bash mode and thinking levels still show through it, and the editor's scroll indicators stay inside the frame.
+- The hint appears only while the editor is empty.
+- If another extension already installed a custom editor, Gentle Shell leaves it alone.
+
+Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer and editor.
 
 ## Commands
 
