@@ -135,6 +135,7 @@ export function createShellBarComponent(
 
 interface PromptEditorDeps {
 	fg: (color: string, text: string) => string;
+	bold: (text: string) => string;
 	requestRender(): void;
 	pending(): boolean;
 }
@@ -169,7 +170,7 @@ export class GentlePromptEditor extends CustomEditor {
 		const lines = super.render(Math.max(1, width - 2));
 		if (this.getText() === "" && lines.length === 3) lines[1] = withPromptHint(lines[1], PROMPT_HINT, this.deps.fg);
 		const state = this.promptState === PROMPT_STATE.WORKING && this.deps.pending() ? PROMPT_STATE.QUEUED : this.promptState;
-		return framePromptLines(lines, width, { state, tick: this.tick, borderColor: this.borderColor, fg: this.deps.fg });
+		return framePromptLines(lines, width, { state, tick: this.tick, borderColor: this.borderColor, fg: this.deps.fg, bold: this.deps.bold });
 	}
 
 	dispose(): void {
@@ -188,6 +189,7 @@ function installPrompt(ctx: ExtensionContext, onCreated: (prompt: GentlePromptEd
 	ctx.ui.setEditorComponent((tui, theme, keybindings) => {
 		const prompt = new GentlePromptEditor(tui, theme, keybindings, {
 			fg: (color, text) => ctx.ui.theme.fg(color as Parameters<typeof ctx.ui.theme.fg>[0], text),
+			bold: (text) => ctx.ui.theme.bold(text),
 			requestRender: () => tui.requestRender(),
 			pending: () => ctx.hasPendingMessages(),
 		});

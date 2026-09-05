@@ -27,6 +27,11 @@ function options(overrides: Partial<PromptFrameOptions> = {}): PromptFrameOption
 	};
 }
 
+test("framePromptLines sets the petal in bold when the theme offers it", () => {
+	const lines = framePromptLines(editorLines(40), 40, options({ bold: (text) => `*${text}*` }));
+	assert.match(lines[0], /<borderAccent>\*✿\*<\/borderAccent>/);
+});
+
 function editorLines(width: number, content: string[] = [` ${CURSOR}`]): string[] {
 	const inner = width - 2;
 	return ["─".repeat(inner), ...content.map((line) => line + " ".repeat(inner - visibleWidth(line))), "─".repeat(inner)];
@@ -43,16 +48,16 @@ test("framePromptLines draws rounded corners, side rules, and keeps every line a
 });
 
 test("framePromptLines paints the frame with the editor border color and the petal with the state tone", () => {
-	const lines = framePromptLines(editorLines(40), 40, options({ borderColor: (text) => `[b]${text}[/b]` }));
-	assert.match(lines[0], /^\[b\]╭─ \[\/b\]<accent>✿<\/accent>\[b\] ─+╮\[\/b\]$/);
+	const lines = framePromptLines(editorLines(40), 40, options({ borderColor: (text) => `[b]${text}[/b]`, bold: (text) => `*${text}*` }));
+	assert.match(lines[0], /^\[b\]╭─ \[\/b\]<borderAccent>\*✿\*<\/borderAccent>\[b\] ─+╮\[\/b\]$/);
 	assert.match(lines[1], /^\[b\]│\[\/b\].*\[b\]│\[\/b\]$/);
 	assert.match(lines[2], /^\[b\]╰─+╯\[\/b\]$/);
 });
 
-test("petalTone stays rose while working and turns to warning when messages are queued", () => {
-	assert.equal(petalTone(PROMPT_STATE.IDLE), "accent");
-	assert.equal(petalTone(PROMPT_STATE.WORKING), "accent");
-	assert.equal(petalTone(PROMPT_STATE.QUEUED), "warning");
+test("petalTone rests bright, walks the rose ramp while working, and turns to warning when queued", () => {
+	assert.equal(petalTone(PROMPT_STATE.IDLE, 2), "borderAccent");
+	assert.deepEqual([0, 1, 2, 3, 4].map((tick) => petalTone(PROMPT_STATE.WORKING, tick)), ["borderAccent", "accent", "thinkingHigh", "mdQuoteBorder", "borderAccent"]);
+	assert.equal(petalTone(PROMPT_STATE.QUEUED, 1), "warning");
 });
 
 test("petalGlyph spins through the flowers while working and rests otherwise", () => {
