@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { TASK_STATUS, type TaskRecord } from "../lib/agents-protocol.ts";
-import { formatElapsed, renderAgentsCard, widgetTasks } from "../lib/agents-widget.ts";
+import { formatElapsed, renderAgentsCard, widgetExpiryMs, widgetTasks } from "../lib/agents-widget.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 
 // Gentle Agents widget: the card above the editor that shows what the
@@ -31,6 +31,16 @@ test("widgetTasks keeps active tasks in start order and only recently finished o
 	];
 	assert.deepEqual(widgetTasks(tasks, 100_000).map((entry) => entry.id), ["new-done", "running", "queued"]);
 	assert.deepEqual(widgetTasks([], 100_000), []);
+});
+
+test("widgetExpiryMs says how long until the next finished row leaves the card", () => {
+	const running = task({ id: "running", createdAt: 2000, startedAt: 2000 });
+	const done = task({ id: "done", status: TASK_STATUS.COMPLETED, endedAt: 95_000 });
+	const later = task({ id: "later", status: TASK_STATUS.COMPLETED, endedAt: 99_000 });
+	assert.equal(widgetExpiryMs([running, done, later], 100_000), 55_000, "the oldest shown row expires first");
+	assert.equal(widgetExpiryMs([done], 155_000), undefined, "a row past its minute is already gone");
+	assert.equal(widgetExpiryMs([running], 100_000), undefined, "active rows never expire");
+	assert.equal(widgetExpiryMs([], 100_000), undefined);
 });
 
 test("renderAgentsCard draws columns for agent, task, and model · tokens · cost · time, with the batch time in the rule", () => {
