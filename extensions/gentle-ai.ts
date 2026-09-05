@@ -1,3 +1,4 @@
+import { declareReviewRelayHandshake } from "../lib/review-relay-contract.ts";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import {
@@ -5824,6 +5825,10 @@ export interface GentleAiRuntimeDependencies {
 	// sleep and without relying on the queued cleanup macrotask firing.
 	now?: () => number;
 	scheduleTimer?: (callback: () => void, delayMs: number) => { unref: () => void };
+	// The environment the session's child processes inherit; tests inject a
+	// plain object so the handshake declaration is observable without
+	// touching the test runner's own process.env.
+	processEnv?: NodeJS.ProcessEnv;
 }
 
 export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencies = {}): (pi: ExtensionAPI) => void {
@@ -5839,6 +5844,7 @@ function createGentleAiExtensionForTesting(
 	const reviewConsentScheduleTimer = dependencies.scheduleTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
 	const pendingReviewConsentRegistry = dependencies.pendingReviewConsentRegistry ?? processPendingReviewConsentRegistry;
 	return function gentleAi(pi: ExtensionAPI): void {
+	declareReviewRelayHandshake(dependencies.processEnv ?? process.env);
 	const pendingReviewConsentFallbackKey = Symbol("pending-review-consent-fallback");
 	const candidateViews = dependencies.candidateViews === undefined ? new CandidateViewRegistry() : dependencies.candidateViews;
 	const herdrLifecycle = createHerdrConfirmationLifecycle(pi.events);
