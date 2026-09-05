@@ -45,6 +45,7 @@ function model(overrides: Partial<ShellBarModel> = {}): ShellBarModel {
 		contextWindow: 272_000,
 		costTotal: 9.49,
 		subscription: true,
+		usage: undefined,
 		statuses: [],
 		...overrides,
 	};
@@ -102,6 +103,20 @@ test("renderShellBar shows the session dirty count next to the branch", () => {
 	assert.match(line, /<text>main<\/text> <warning>±3<\/warning>/);
 	const [clean] = renderShellBar(model({ dirty: 0 }), plainTheme, 160);
 	assert.doesNotMatch(clean, /±/);
+});
+
+test("renderShellBar adds the subscription windows after the cost when usage is known", () => {
+	const usage = {
+		provider: "openai-codex",
+		plan: "pro",
+		fetchedAt: 0,
+		limits: [{ name: "codex", limitReached: false, windows: [
+			{ label: "5h", usedPercent: 62, windowSeconds: 18_000, resetAt: null },
+			{ label: "week", usedPercent: 31, windowSeconds: 604_800, resetAt: null },
+		] }],
+	};
+	const [line] = renderShellBar(model({ usage }), plainTheme, 200);
+	assert.match(line, /\$9\.49 sub ⟡ 5h ▰▰▰▰▰▱▱▱ 62% · week 31%$/);
 });
 
 test("renderShellBar shows an unknown context as a question mark after compaction", () => {

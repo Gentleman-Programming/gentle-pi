@@ -1,5 +1,5 @@
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import { gaugeTone, renderGauge } from "./shell-bar.ts";
+import { paintGauge } from "./shell-gauge.ts";
 
 // Gentle Shell subscription usage: the rate-limit windows each connected
 // provider reports. Codex sends them as SSE headers and through its usage
@@ -71,7 +71,6 @@ const ROLE = {
 	LABEL: "muted",
 	PERCENT: "text",
 	RESET: "dim",
-	EMPTY: "border",
 	SEPARATOR: "muted",
 } as const;
 export const USAGE_EMPTY_MESSAGE = "No subscription usage yet. Usage arrives with the next response, or press r to fetch it.";
@@ -147,9 +146,7 @@ export function accountIdFromToken(token: string): string | undefined {
 }
 
 function paintMeter(percent: number, cells: number, theme: UsageTheme): string {
-	const gauge = renderGauge(percent, cells);
-	const filled = gauge.replace(/▱+$/, "");
-	return theme.fg(gaugeTone(percent), filled) + theme.fg(ROLE.EMPTY, gauge.slice(filled.length));
+	return paintGauge(percent, theme, cells);
 }
 
 export function renderUsageBar(usage: ProviderUsage, theme: UsageTheme): string | undefined {

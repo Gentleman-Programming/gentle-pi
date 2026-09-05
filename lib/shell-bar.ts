@@ -1,4 +1,8 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { GAUGE_CELLS, gaugeTone, paintGauge, renderGauge, type GaugeTone } from "./shell-gauge.ts";
+import { renderUsageBar, type ProviderUsage } from "./shell-usage.ts";
+
+export { gaugeTone, renderGauge, type GaugeTone };
 
 // Gentle Shell status bar: one line of segments that replaces pi's built-in
 // three-line footer. Everything here is pure so the bar can be rendered and
@@ -15,6 +19,7 @@ export interface ShellBarModel {
 	contextWindow: number;
 	costTotal: number;
 	subscription: boolean;
+	usage: ProviderUsage | undefined;
 	statuses: string[];
 }
 
@@ -22,15 +27,6 @@ export interface ShellBarTheme {
 	fg(color: string, text: string): string;
 	bold(text: string): string;
 }
-
-const GAUGE_TONE = {
-	ACCENT: "accent",
-	WARNING: "warning",
-	ERROR: "error",
-	DIM: "dim",
-} as const;
-
-export type GaugeTone = (typeof GAUGE_TONE)[keyof typeof GAUGE_TONE];
 
 // Theme roles the bar paints with. Keys are pi theme colors; the Gentle themes
 // map them to the rose palette (accent = rose, syntaxFunction = powder blue).
@@ -42,7 +38,6 @@ const ROLE = {
 	DIRTY: "warning",
 	MODEL: "text",
 	EFFORT: "syntaxFunction",
-	GAUGE_EMPTY: "border",
 	LABEL: "muted",
 	VALUE: "text",
 	STATUS: "muted",
@@ -51,29 +46,12 @@ const ROLE = {
 
 export const SHELL_BAR_BRAND = "✿ gentle-pi";
 export const SHELL_BAR_SEPARATOR = "⟡";
-export const SHELL_BAR_GAUGE_CELLS = 8;
-const GAUGE_FILLED = "▰";
-const GAUGE_EMPTY = "▱";
-const WARNING_THRESHOLD = 80;
-const ERROR_THRESHOLD = 95;
+export const SHELL_BAR_GAUGE_CELLS = GAUGE_CELLS;
 const RIGHT_PADDING = 2;
 
 export function shellEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
 	const value = env.GENTLE_PI_SHELL?.trim().toLowerCase();
 	return !(value === "0" || value === "false" || value === "off");
-}
-
-export function renderGauge(percent: number | null, cells: number = SHELL_BAR_GAUGE_CELLS): string {
-	const clamped = Math.max(0, Math.min(100, percent ?? 0));
-	const filled = Math.round((clamped / 100) * cells);
-	return GAUGE_FILLED.repeat(filled) + GAUGE_EMPTY.repeat(cells - filled);
-}
-
-export function gaugeTone(percent: number | null): GaugeTone {
-	if (percent === null) return GAUGE_TONE.DIM;
-	if (percent >= ERROR_THRESHOLD) return GAUGE_TONE.ERROR;
-	if (percent >= WARNING_THRESHOLD) return GAUGE_TONE.WARNING;
-	return GAUGE_TONE.ACCENT;
 }
 
 export function formatTokens(count: number): string {
@@ -93,13 +71,6 @@ function sanitizeStatus(text: string): string {
 	return text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
 }
 
-function paintGauge(percent: number | null, theme: ShellBarTheme): string {
-	const cells = renderGauge(percent);
-	const filled = cells.replace(new RegExp(`${GAUGE_EMPTY}+$`), "");
-	const empty = cells.slice(filled.length);
-	return theme.fg(gaugeTone(percent), filled) + theme.fg(ROLE.GAUGE_EMPTY, empty);
-}
-
 function buildSegments(model: ShellBarModel, theme: ShellBarTheme): string[] {
 	const dirty = model.dirty ? ` ${theme.fg(ROLE.DIRTY, `±${model.dirty}`)}` : "";
 	const location = model.branch
@@ -111,8 +82,9 @@ function buildSegments(model: ShellBarModel, theme: ShellBarTheme): string[] {
 	const percentText = model.contextPercent === null ? "?%" : `${Math.round(model.contextPercent)}%`;
 	const context = `${theme.fg(ROLE.LABEL, "ctx")} ${paintGauge(model.contextPercent, theme)} ${theme.fg(ROLE.VALUE, percentText)}`;
 	const cost = theme.fg(ROLE.VALUE, formatCost(model.costTotal, model.subscription));
+	const usage = model.usage ? renderUsageBar(model.usage, theme) : undefined;
 	const statuses = model.statuses.map((status) => theme.fg(ROLE.STATUS, sanitizeStatus(status)));
-	return [theme.fg(ROLE.BRAND, SHELL_BAR_BRAND), location, modelSegment, context, cost, ...statuses];
+	return [theme.fg(ROLE.BRAND, SHELL_BAR_BRAND), location, modelSegment, context, cost, ...(usage ? [usage] : []), ...statuses];
 }
 
 function joinSegments(segments: string[], theme: ShellBarTheme): string {
