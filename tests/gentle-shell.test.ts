@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import gentleShell, { buildShellBarModel, loadFileDiff, openInExternalEditor, type GentlePromptEditor } from "../extensions/gentle-shell.ts";
+import gentleShell, { buildShellBarModel, changesShortcut, loadFileDiff, openInExternalEditor, type GentlePromptEditor } from "../extensions/gentle-shell.ts";
 import { CHANGE_STATUS } from "../lib/shell-changes.ts";
 import type { ShellBarTheme } from "../lib/shell-bar.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
@@ -24,6 +24,8 @@ interface FakeUi {
 	widgets: Map<string, unknown>;
 	notices: string[];
 	overlay: unknown;
+	overlayView: { render(width: number): string[] } | undefined;
+	closeOverlay: (() => void) | undefined;
 }
 
 interface GitScript {
@@ -35,9 +37,14 @@ interface CommandRegistration {
 	handler: (args: string, ctx: ExtensionContext) => Promise<void>;
 }
 
-function fakePi(script: GitScript[] = [{ numstat: "", porcelain: "" }]): { pi: ExtensionAPI; handlers: Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>; git: string[][]; commands: Map<string, CommandRegistration> } {
+interface ShortcutRegistration {
+	handler: (ctx: ExtensionContext) => Promise<void>;
+}
+
+function fakePi(script: GitScript[] = [{ numstat: "", porcelain: "" }]): { pi: ExtensionAPI; handlers: Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>; git: string[][]; commands: Map<string, CommandRegistration>; shortcuts: Map<string, ShortcutRegistration> } {
 	const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
 	const commands = new Map<string, CommandRegistration>();
+	const shortcuts = new Map<string, ShortcutRegistration>();
 	const git: string[][] = [];
 	let round = 0;
 	const pi = {
@@ -46,6 +53,9 @@ function fakePi(script: GitScript[] = [{ numstat: "", porcelain: "" }]): { pi: E
 		},
 		registerCommand(name: string, registration: CommandRegistration) {
 			commands.set(name, registration);
+		},
+		registerShortcut(key: string, registration: ShortcutRegistration) {
+			shortcuts.set(key, registration);
 		},
 		getThinkingLevel() {
 			return "medium";
@@ -57,7 +67,7 @@ function fakePi(script: GitScript[] = [{ numstat: "", porcelain: "" }]): { pi: E
 			return { stdout: isNumstat ? step.numstat : step.porcelain, stderr: "", code: 0, killed: false };
 		},
 	} as unknown as ExtensionAPI;
-	return { pi, handlers, git, commands };
+	return { pi, handlers, git, commands, shortcuts };
 }
 
 async function fire(handlers: Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>, event: string, ctx: ExtensionContext): Promise<void> {
@@ -65,7 +75,7 @@ async function fire(handlers: Map<string, Array<(event: unknown, ctx: ExtensionC
 }
 
 function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: boolean; pending?: boolean; editorFactory?: unknown } = {}): { ctx: ExtensionContext; ui: FakeUi } {
-	const ui: FakeUi = { footerFactory: undefined, editorFactory: options.editorFactory, widgets: new Map(), notices: [], overlay: undefined };
+	const ui: FakeUi = { footerFactory: undefined, editorFactory: options.editorFactory, widgets: new Map(), notices: [], overlay: undefined, overlayView: undefined, closeOverlay: undefined };
 	const ctx = {
 		hasUI: options.hasUI ?? true,
 		hasPendingMessages: () => options.pending ?? false,
@@ -96,9 +106,12 @@ function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: bo
 			notify(message: string) {
 				ui.notices.push(message);
 			},
-			async custom(factory: unknown) {
+			custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: null) => void) => { render(width: number): string[] }) {
 				ui.overlay = factory;
-				return null;
+				return new Promise<null>((resolve) => {
+					ui.closeOverlay = () => resolve(null);
+					ui.overlayView = factory(fakeTui, plainTheme, fakeKeybindings, () => resolve(null));
+				});
 			},
 		},
 	} as unknown as ExtensionContext;
@@ -280,8 +293,11 @@ test("gentleShell registers /gentle:changes and opens the overlay only when ther
 	assert.equal(ui.overlay, undefined);
 
 	await fire(handlers, "tool_execution_end", ctx);
-	await command.handler("", ctx);
+	const opened = command.handler("", ctx);
+	await new Promise((resolve) => setTimeout(resolve, 0));
 	assert.equal(typeof ui.overlay, "function");
+	ui.closeOverlay?.();
+	await opened;
 });
 
 test("loadFileDiff asks git for a HEAD diff, or a no-index diff for untracked files", async () => {
@@ -308,4 +324,45 @@ test("openInExternalEditor stops the TUI around the editor and honors $VISUAL ov
 	assert.equal(openInExternalEditor(host, "lib/a.ts", { VISUAL: "nvim -u none", EDITOR: "vi" }, spawn), true);
 	assert.deepEqual(events, ["stop", "spawn:nvim -u none lib/a.ts", "start", "render:true"]);
 	assert.equal(openInExternalEditor(host, "lib/a.ts", {}, spawn), false);
+});
+
+test("changesShortcut defaults to alt+g and can be overridden or disabled", () => {
+	assert.equal(changesShortcut({}), "alt+g");
+	assert.equal(changesShortcut({ GENTLE_PI_SHELL_CHANGES_KEY: "ctrl+shift+g" }), "ctrl+shift+g");
+	assert.equal(changesShortcut({ GENTLE_PI_SHELL_CHANGES_KEY: "off" }), undefined);
+	assert.equal(changesShortcut({ GENTLE_PI_SHELL_CHANGES_KEY: "" }), undefined);
+});
+
+test("gentleShell binds the changes shortcut to the same handler as the command", async () => {
+	const { pi, handlers, shortcuts } = fakePi();
+	gentleShell(pi, {});
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const shortcut = shortcuts.get("alt+g");
+	assert.ok(shortcut, "alt+g not registered");
+	await shortcut.handler(ctx);
+	assert.deepEqual(ui.notices, ["No changes in the working tree."]);
+
+	const silent = fakePi();
+	gentleShell(silent.pi, { GENTLE_PI_SHELL_CHANGES_KEY: "off" });
+	assert.equal(silent.shortcuts.size, 0);
+});
+
+test("gentleShell keeps the open overlay in sync with git while it stays open", async () => {
+	const { pi, handlers, commands } = fakePi([
+		{ numstat: "10\t0\tlib/b.ts\n", porcelain: "A  lib/b.ts\0" },
+		{ numstat: "10\t0\tlib/b.ts\n", porcelain: "A  lib/b.ts\0" },
+		{ numstat: "10\t0\tlib/b.ts\n3\t1\tlib/c.ts\n", porcelain: "A  lib/b.ts\0 M lib/c.ts\0" },
+	]);
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_POLL_MS: "5" });
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const open = commands.get("gentle:changes")!.handler("", ctx);
+	await new Promise((resolve) => setTimeout(resolve, 40));
+	const plain = ui.overlayView!.render(100).map(stripAnsi);
+	assert.match(plain[0], /2 files · \+13 −1/);
+	assert.match(plain[2], /lib\/c\.ts/);
+	assert.match(renderFooter(ui), /main ±2/);
+	ui.closeOverlay?.();
+	await open;
 });

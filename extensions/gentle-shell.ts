@@ -171,6 +171,8 @@ function installPrompt(ctx: ExtensionContext, onCreated: (prompt: GentlePromptEd
 
 const CHANGES_WIDGET_KEY = "gentle-shell-changes";
 const CHANGES_COMMAND_NAME = "gentle:changes";
+const CHANGES_SHORTCUT_DEFAULT = "alt+g";
+const CHANGES_POLL_DEFAULT_MS = 2000;
 const GIT_TIMEOUT_MS = 5000;
 const OVERLAY_HEIGHT_RATIO = 0.8;
 const OVERLAY_MIN_ROWS = 8;
@@ -216,24 +218,55 @@ export function openInExternalEditor(host: ExternalEditorHost, path: string, env
 	return true;
 }
 
-async function showChangesOverlay(ctx: ExtensionContext, model: ChangesModel, git: GitRunner): Promise<void> {
+export function changesShortcut(env: NodeJS.ProcessEnv = process.env): string | undefined {
+	const value = env.GENTLE_PI_SHELL_CHANGES_KEY?.trim();
+	if (value === undefined) return CHANGES_SHORTCUT_DEFAULT;
+	return value === "" || value.toLowerCase() === "off" ? undefined : value;
+}
+
+function changesPollMs(env: NodeJS.ProcessEnv): number {
+	const parsed = Number.parseInt(env.GENTLE_PI_SHELL_CHANGES_POLL_MS ?? "", 10);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : CHANGES_POLL_DEFAULT_MS;
+}
+
+interface OverlayDeps {
+	git: GitRunner;
+	refresh(): Promise<ChangesModel>;
+	pollMs: number;
+}
+
+// While the overlay is open, git is polled so edits made outside pi (nvim,
+// another agent, a git checkout) show up without reopening it.
+async function showChangesOverlay(ctx: ExtensionContext, model: ChangesModel, deps: OverlayDeps): Promise<void> {
 	let host: ExternalEditorHost | undefined;
-	const chosen = await ctx.ui.custom<ChangedFile | null>(
-		(tui, theme, _keybindings, done) => {
-			host = tui;
-			return new ChangesView(model, {
-				theme,
-				rows: Math.max(OVERLAY_MIN_ROWS, Math.floor(tui.terminal.rows * OVERLAY_HEIGHT_RATIO)),
-				loadDiff: (file) => loadFileDiff(git, file),
-				onOpen: (file) => done(file),
-				onClose: () => done(null),
-				requestRender: () => tui.requestRender(),
-			});
-		},
-		{ overlay: true, overlayOptions: { width: "92%", anchor: "center" } },
-	);
-	if (!chosen || !host) return;
-	if (!openInExternalEditor(host, chosen.path)) ctx.ui.notify("No editor configured. Set $VISUAL or $EDITOR.", "warning");
+	let view: ChangesView | undefined;
+	const poll = setInterval(async () => {
+		const latest = await deps.refresh();
+		view?.update(latest);
+		showChanges(ctx, latest);
+	}, deps.pollMs);
+	poll.unref();
+	try {
+		const chosen = await ctx.ui.custom<ChangedFile | null>(
+			(tui, theme, _keybindings, done) => {
+				host = tui;
+				view = new ChangesView(model, {
+					theme,
+					rows: Math.max(OVERLAY_MIN_ROWS, Math.floor(tui.terminal.rows * OVERLAY_HEIGHT_RATIO)),
+					loadDiff: (file) => loadFileDiff(deps.git, file),
+					onOpen: (file) => done(file),
+					onClose: () => done(null),
+					requestRender: () => tui.requestRender(),
+				});
+				return view;
+			},
+			{ overlay: true, overlayOptions: { width: "92%", anchor: "center" } },
+		);
+		if (!chosen || !host) return;
+		if (!openInExternalEditor(host, chosen.path)) ctx.ui.notify("No editor configured. Set $VISUAL or $EDITOR.", "warning");
+	} finally {
+		clearInterval(poll);
+	}
 }
 
 function showChanges(ctx: ExtensionContext, model: ChangesModel): void {
@@ -274,18 +307,27 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		await tracker.start();
 		showChanges(ctx, tracker.model);
 	});
+	const openChanges = async (ctx: ExtensionContext) => {
+		if (!changes) return;
+		const tracker = changes;
+		const model = await tracker.refresh();
+		if (model.files.length === 0) {
+			ctx.ui.notify("No changes in the working tree.", "info");
+			return;
+		}
+		await showChangesOverlay(ctx, model, { git: gitRunner(pi, ctx.cwd), refresh: () => tracker.refresh(), pollMs: changesPollMs(env) });
+	};
 	pi.registerCommand(CHANGES_COMMAND_NAME, {
 		description: "Show the working tree changes against HEAD, with diffs. Press o to open a file in $EDITOR.",
-		handler: async (_args, ctx) => {
-			if (!changes) return;
-			const model = await changes.refresh();
-			if (model.files.length === 0) {
-				ctx.ui.notify("No changes in the working tree.", "info");
-				return;
-			}
-			await showChangesOverlay(ctx, model, gitRunner(pi, ctx.cwd));
-		},
+		handler: async (_args, ctx) => openChanges(ctx),
 	});
+	const shortcut = changesShortcut(env);
+	if (shortcut) {
+		pi.registerShortcut(shortcut as Parameters<ExtensionAPI["registerShortcut"]>[0], {
+			description: "Open the working tree changes",
+			handler: async (ctx) => openChanges(ctx),
+		});
+	}
 	pi.on("agent_start", () => prompt?.setWorking(true));
 	pi.on("agent_end", async (_event, ctx) => {
 		prompt?.setWorking(false);

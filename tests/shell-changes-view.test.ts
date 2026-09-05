@@ -117,3 +117,26 @@ test("ChangesView opens the selected file and closes on escape or q", async () =
 	component.handleInput("q");
 	assert.equal(events.filter((event) => event === "close").length, 2);
 });
+
+test("ChangesView.update keeps the selected file, reloads moved diffs, and survives an empty tree", async () => {
+	const { view: component, calls } = view();
+	await settle();
+	component.handleInput("j");
+	await settle();
+	assert.deepEqual(calls, ["lib/a.ts", "lib/b.ts"]);
+
+	component.update(changesModel([file("lib/a.ts", 5, 1), file("lib/b.ts", 10, 0, CHANGE_STATUS.ADDED), file("lib/c.ts", 1, 0)]));
+	await settle();
+	assert.match(stripAnsi(component.render(80)[2]), /^│ ▸ lib\/b\.ts/);
+	assert.deepEqual(calls, ["lib/a.ts", "lib/b.ts"], "unchanged selected file must not reload");
+	component.handleInput("k");
+	await settle();
+	assert.deepEqual(calls, ["lib/a.ts", "lib/b.ts", "lib/a.ts"], "moved counts must reload the diff");
+
+	component.update(changesModel([]));
+	const plain = component.render(80).map(stripAnsi);
+	assert.match(plain[0], /0 files · \+0 −0/);
+	assert.match(plain[1], /working tree is clean/);
+	component.handleInput("j");
+	component.handleInput("o");
+});

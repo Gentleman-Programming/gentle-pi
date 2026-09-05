@@ -39,6 +39,7 @@ const LIST_RATIO = 0.35;
 const CHROME_ROWS = 3;
 const MIN_BODY_ROWS = 1;
 const EMPTY_DIFF = "no diff for this file";
+const CLEAN_TREE = "working tree is clean";
 const KEYS = [
 	["j/k", "file"],
 	["pgup/pgdn", "scroll"],
@@ -74,8 +75,12 @@ function fit(text: string, width: number): string {
 	return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
 }
 
+function fingerprint(file: ChangedFile): string {
+	return `${file.status}:${file.added}:${file.deleted}`;
+}
+
 export class ChangesView {
-	private readonly model: ChangesModel;
+	private model: ChangesModel;
 	private readonly deps: ChangesViewDeps;
 	private selected = 0;
 	private scroll = 0;
@@ -85,6 +90,24 @@ export class ChangesView {
 		this.model = model;
 		this.deps = deps;
 		this.loadSelected();
+	}
+
+	// Replace the model while open: keep the selection by path and drop cached
+	// diffs for files whose counts moved so they reload.
+	update(model: ChangesModel): void {
+		const selectedPath = this.model.files[this.selected]?.path;
+		const before = new Map(this.model.files.map((file) => [file.path, fingerprint(file)]));
+		for (const file of model.files) {
+			if (before.get(file.path) !== fingerprint(file)) this.diffs.delete(file.path);
+		}
+		for (const path of this.diffs.keys()) {
+			if (!model.files.some((file) => file.path === path)) this.diffs.delete(path);
+		}
+		this.model = model;
+		const index = model.files.findIndex((file) => file.path === selectedPath);
+		this.selected = index === -1 ? Math.max(0, Math.min(this.selected, model.files.length - 1)) : index;
+		this.loadSelected();
+		this.deps.requestRender();
 	}
 
 	handleInput(data: string): void {
@@ -141,7 +164,8 @@ export class ChangesView {
 
 	private visibleDiff(rows: number): string[] {
 		const file = this.model.files[this.selected];
-		const lines = file ? this.diffs.get(file.path) : undefined;
+		if (!file) return [this.deps.theme.fg(ROLE.EMPTY, CLEAN_TREE)];
+		const lines = this.diffs.get(file.path);
 		if (!lines) return [];
 		if (lines.length === 0) return [this.deps.theme.fg(ROLE.EMPTY, EMPTY_DIFF)];
 		const maxScroll = Math.max(0, lines.length - rows);

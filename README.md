@@ -622,9 +622,11 @@ Working-tree changes show up below the editor as soon as a file differs from HEA
 - Counts refresh after every tool call and at the end of each turn, through `git diff --numstat` and `git status --porcelain`. Outside a git repository the widget stays hidden.
 - On narrow terminals the file list is dropped before the summary is truncated.
 
-`/gentle:changes` opens the changes as an overlay: files on the left, the selected file's diff on the right.
+`/gentle:changes` or `alt+g` opens the changes as an overlay: files on the left, the selected file's diff on the right.
 
 - `j`/`k` or the arrows move between files, `pgup`/`pgdn` scroll the diff, `esc` or `q` closes.
+- While the overlay is open, git is polled every 2 seconds, so edits made from nvim, another agent, or a checkout show up in place. The selection sticks to the file, and a diff reloads only when its counts move.
+- `GENTLE_PI_SHELL_CHANGES_KEY` rebinds the shortcut (pi key syntax, for example `ctrl+shift+g`); `off` disables it. On macOS, `alt+g` needs the terminal to send Option as Meta.
 - `o` (or `enter`) opens the selected file in `$VISUAL` or `$EDITOR` and returns to pi when the editor exits, so a jump into nvim and back never leaves the session.
 - Untracked files are diffed against an empty file so new files show their full content.
 
