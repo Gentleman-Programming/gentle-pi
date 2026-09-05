@@ -711,6 +711,11 @@ test("status enforces authority/frozen/receipt conditionals and decodes the requ
 	const decoded = decodeReviewStatusV3(current);
 	assert.equal(decoded.repair.status, "unsupported");
 	assert.equal(decoded.authority?.state, "reviewing");
+	for (const action of ["collect", "execute"]) {
+		const projected = clone(current);
+		projected.action = action;
+		assert.equal(decodeReviewStatusV3(projected).action, action, "a live transaction's root action names its mandated transition kind");
+	}
 
 	const missingAuthority = clone(current);
 	delete missingAuthority.authority;
