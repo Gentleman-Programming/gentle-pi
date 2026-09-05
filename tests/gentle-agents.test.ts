@@ -51,7 +51,7 @@ function fakePi() {
 	return { pi, tools, shortcuts, commands, fire, sent, renderers };
 }
 
-function fakeContext() {
+function fakeContext(tui: { requestRender(): void } = fakeTui) {
 	const widgets = new Map<string, (tui: unknown, theme: unknown) => { render(width: number): string[] }>();
 	const dialogs: string[] = [];
 	const overlays: Array<{ render(width: number): string[]; handleInput(data: string): void }> = [];
@@ -86,7 +86,7 @@ function fakeContext() {
 	} as unknown as ExtensionContext;
 	const widget = () => {
 		const factory = widgets.get("gentle-agents");
-		return factory ? factory(fakeTui, plainTheme).render(72).map(stripAnsi) : undefined;
+		return factory ? factory(tui, plainTheme).render(72).map(stripAnsi) : undefined;
 	};
 	return { ctx, widget, dialogs, overlays };
 }
@@ -220,6 +220,39 @@ test("background runs return at once; status, result, send_message, cancel, and 
 	assert.match((await tools.get("subagent_cancel")!.execute("c9", { task_id: id }, undefined, undefined, ctx)).content[0].text, /not running/);
 	assert.match((await tools.get("subagent_status")!.execute("c10", { task_id: "nope" }, undefined, undefined, ctx)).content[0].text, /Error: no task nope/);
 	assert.match((await tools.get("subagent_run")!.execute("c11", { agent: "ghost", task: "x" }, undefined, undefined, ctx)).content[0].text, /no subagent named "ghost"\. Known: explore/);
+});
+
+test("once the last task is done the card asks for one frame when its finished row expires, so an idle terminal clears it", async () => {
+	const { pi, tools, fire } = fakePi();
+	const harness = deps();
+	let clock = 1000;
+	const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+	harness.deps.now = () => clock;
+	harness.deps.schedule = (fn, ms) => {
+		const timer = { fn, ms, cancelled: false };
+		timers.push(timer);
+		return () => {
+			timer.cancelled = true;
+		};
+	};
+	gentleAgents(pi, {}, harness.deps);
+	let frames = 0;
+	const { ctx, widget } = fakeContext({ requestRender: () => (frames += 1) });
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Short job", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	widget();
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Done." }] }] });
+	await tick();
+	assert.match(widget()![1], /✓  explore  Short job/);
+	const expiry = timers.filter((timer) => !timer.cancelled && timer.ms === 60_000);
+	assert.equal(expiry.length, 1, "exactly one timer waits for the finished row to leave the card");
+	clock += 60_000;
+	const before = frames;
+	expiry[0].fn();
+	assert.equal(frames, before + 1, "the expiry asks the terminal for a frame");
+	assert.deepEqual(widget(), [], "the card is gone");
+	assert.equal(timers.filter((timer) => !timer.cancelled && timer.ms === 60_000).length, 0, "nothing is rescheduled once the card is empty");
 });
 
 test("completionText names the outcome before the answer", () => {

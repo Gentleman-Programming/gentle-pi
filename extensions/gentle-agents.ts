@@ -11,7 +11,7 @@ import { AgentRunner, piCommand, type AskAnswer, type RunnerDeps, type TaskReque
 import { historyDir, loadHistory, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
 import { sessionToMarkdown } from "../lib/agents-transcript.ts";
 import { AgentsView } from "../lib/agents-view.ts";
-import { AGENTS_GLYPH, renderAgentsCard } from "../lib/agents-widget.ts";
+import { AGENTS_GLYPH, renderAgentsCard, widgetExpiryMs } from "../lib/agents-widget.ts";
 import { CARD_TONE, renderCard } from "../lib/shell-card.ts";
 import { openInExternalEditor } from "./gentle-shell.ts";
 
@@ -177,16 +177,26 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		}, RENDER_COALESCE_MS);
 	};
 
-	// The elapsed column ticks once a second, and only while something runs.
+	// The elapsed column ticks once a second while something runs. Once every
+	// task is done, one frame is due when the next finished row leaves the
+	// card, so an idle terminal still sees it clear.
 	const tickClock = () => {
 		cancelClock?.();
 		cancelClock = undefined;
-		if (store.list().some((task) => !isFinished(task.status))) {
+		const tasks = store.list();
+		if (tasks.some((task) => !isFinished(task.status))) {
 			cancelClock = deps.schedule(() => {
 				requestRender();
 				tickClock();
 			}, CLOCK_TICK_MS);
+			return;
 		}
+		const expiry = widgetExpiryMs(tasks, deps.now());
+		if (expiry === undefined) return;
+		cancelClock = deps.schedule(() => {
+			host?.requestRender();
+			tickClock();
+		}, expiry);
 	};
 
 	// A finished task goes to disk once, after its child is gone; the history

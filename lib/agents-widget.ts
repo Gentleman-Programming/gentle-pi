@@ -71,10 +71,20 @@ function clip(text: string, width: number): string {
 export function widgetTasks(tasks: readonly TaskRecord[], now: number): TaskRecord[] {
 	const active = tasks.filter((task) => !isFinished(task.status));
 	const finished = tasks
-		.filter((task) => isFinished(task.status) && task.endedAt !== null && now - task.endedAt <= FINISHED_TTL_MS)
+		.filter((task) => isFinished(task.status) && task.endedAt !== null && now - task.endedAt < FINISHED_TTL_MS)
 		.sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))
 		.slice(0, MAX_FINISHED);
 	return [...active, ...finished].sort((a, b) => (a.startedAt ?? a.createdAt) - (b.startedAt ?? b.createdAt));
+}
+
+// How long until the next finished row leaves the card, or undefined when no
+// shown row is waiting to expire. The host asks for exactly one frame at that
+// moment instead of ticking while the terminal is idle.
+export function widgetExpiryMs(tasks: readonly TaskRecord[], now: number): number | undefined {
+	const deadlines = widgetTasks(tasks, now)
+		.filter((task) => isFinished(task.status) && task.endedAt !== null)
+		.map((task) => (task.endedAt ?? now) + FINISHED_TTL_MS - now);
+	return deadlines.length === 0 ? undefined : Math.max(1, Math.min(...deadlines));
 }
 
 function elapsed(task: TaskRecord, now: number): string {
