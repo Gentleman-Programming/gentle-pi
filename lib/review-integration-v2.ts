@@ -388,6 +388,8 @@ export interface ReviewStatusFrozenV1 {
 	tier: RiskLevel;
 	originalChangedLines: number;
 	correctionBudget: number;
+	/** Digest of the frozen changed-path manifest; binds manifest-less capture inputs (gentle-ai#3922). */
+	changedPathManifestSha256?: string;
 }
 
 export interface ReviewStatusReconciliationV1 {
@@ -1823,11 +1825,12 @@ export function decodeReviewStatusV3(value: unknown): ReviewStatusV3 {
 
 	let frozen: ReviewStatusFrozenV1 | undefined;
 	if (body.frozen !== undefined) {
-		const source = exactRecord(body.frozen, "status.frozen", ["tier", "original_changed_lines", "correction_budget"]);
+		const source = exactRecord(body.frozen, "status.frozen", ["tier", "original_changed_lines", "correction_budget"], ["changed_path_manifest_sha256"]);
 		frozen = {
 			tier: enumeration(source.tier, RISK_LEVELS, "status.frozen.tier"),
 			originalChangedLines: integer(source.original_changed_lines, "status.frozen.original_changed_lines"),
 			correctionBudget: integer(source.correction_budget, "status.frozen.correction_budget", 0, 200),
+			...(source.changed_path_manifest_sha256 === undefined ? {} : { changedPathManifestSha256: sha256(source.changed_path_manifest_sha256, "status.frozen.changed_path_manifest_sha256") }),
 		};
 	}
 	if (authority?.version === REVIEW_AUTHORITY_VERSION.COMPACT_V2 && frozen === undefined) throw new TypeError("compact-v2 status requires frozen metadata");

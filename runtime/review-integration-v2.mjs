@@ -410,6 +410,8 @@ const REPOSITORY_CONTEXT_OUTCOMES = ["applied", "pending", "blocked_conflict", "
 
 
 
+
+
 // Provider-owned completing form for a host-mediated capture slot
 // (gentle-pi#311 P4). The provider issues the exact operation and argument
 // tokens that submit the captured bytes; the host substitutes only the
@@ -1824,11 +1826,12 @@ export function decodeReviewStatusV3(value         )                 {
 
 	let frozen                                  ;
 	if (body.frozen !== undefined) {
-		const source = exactRecord(body.frozen, "status.frozen", ["tier", "original_changed_lines", "correction_budget"]);
+		const source = exactRecord(body.frozen, "status.frozen", ["tier", "original_changed_lines", "correction_budget"], ["changed_path_manifest_sha256"]);
 		frozen = {
 			tier: enumeration(source.tier, RISK_LEVELS, "status.frozen.tier"),
 			originalChangedLines: integer(source.original_changed_lines, "status.frozen.original_changed_lines"),
 			correctionBudget: integer(source.correction_budget, "status.frozen.correction_budget", 0, 200),
+			...(source.changed_path_manifest_sha256 === undefined ? {} : { changedPathManifestSha256: sha256(source.changed_path_manifest_sha256, "status.frozen.changed_path_manifest_sha256") }),
 		};
 	}
 	if (authority?.version === REVIEW_AUTHORITY_VERSION.COMPACT_V2 && frozen === undefined) throw new TypeError("compact-v2 status requires frozen metadata");
