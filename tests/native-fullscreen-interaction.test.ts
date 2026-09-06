@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import test from "node:test";
-import { Container, type TuiMouseEvent, SelectList, Text } from "@earendil-works/pi-tui";
+import test, { mock } from "node:test";
+import { Container, MouseRegion, type TuiMouseEvent, SelectList, Text } from "@earendil-works/pi-tui";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
 
 const items = [
@@ -38,6 +38,38 @@ function mouse(
 		wheelDelta,
 	};
 }
+
+test("native fullscreen interaction preserves observer order and native dispatch identity", () => {
+	const order: string[] = [];
+	const root = createNativeFullscreenInteraction({
+		keyboardTarget: new Text("keyboard", 0, 0),
+		requestRender() {},
+		mouseObserver: { beforeMouse: () => order.push("before"), afterMouse: () => order.push("after") },
+	});
+	root.addChild(new Text("before child", 0, 0));
+	root.addChild(new MouseRegion(new Text("native child", 0, 0), () => {
+		order.push("native child");
+		return { handled: true, focus: true };
+	}));
+	root.addChild(new Text("after child", 0, 0));
+	const lines = root.render(80);
+	const row = lines.findIndex((line) => line.includes("native child"));
+	assert.ok(row >= 0);
+	const nativeHandleMouse = Container.prototype.handleMouse;
+	let nativeResult: ReturnType<typeof nativeHandleMouse>;
+	const spy = mock.method(Container.prototype, "handleMouse", function (this: Container, event: TuiMouseEvent) {
+		nativeResult = nativeHandleMouse.call(this, event);
+		return nativeResult;
+	});
+	try {
+		const result = root.handleMouse(mouse("press", "left", row, lines.length));
+		assert.deepEqual(order, ["before", "native child", "after"]);
+		assert.equal(result, nativeResult, "the observer returns the exact native Container result");
+		assert.equal(result?.focusTarget, root, "native focus ownership remains with the root");
+	} finally {
+		spy.mock.restore();
+	}
+});
 
 test("native fullscreen interaction preserves Container geometry and SelectList behavior", () => {
 	const list = new SelectList(items, items.length, theme);

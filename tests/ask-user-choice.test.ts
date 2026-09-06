@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import askUserChoice from "../extensions/ask-user-choice.ts";
 
 interface ChoiceResult {
@@ -53,6 +54,7 @@ interface ChoiceTui {
 
 interface ChoiceTheme {
 	fg(color: string, text: string): string;
+	bg(color: string, text: string): string;
 	bold(text: string): string;
 }
 
@@ -131,11 +133,11 @@ function tuiContext(inputs: readonly string[], rendered: { value: string }) {
 	return {
 		mode: "tui",
 		ui: {
-			custom: async (factory: (tui: { requestRender(): void }, theme: { fg(_color: string, text: string): string; bold(text: string): string }, keybindings: unknown, done: (value: unknown) => void) => { render(width: number): string[]; handleInput(data: string): void }) => {
+			custom: async (factory: ChoiceCustomFactory) => {
 				let result: unknown;
 				const component = factory(
 					{ requestRender() {} },
-					{ fg: (_color, text) => text, bold: (text) => text },
+					{ fg: (_color, text) => text, bg: (_color, text) => text, bold: (text) => text },
 					{},
 					(value) => {
 						result = value;
@@ -171,6 +173,43 @@ test("ask_user_choice exposes a strict closed single-select schema", () => {
 	assert.deepEqual(Object.keys(optionSchema?.properties ?? {}).sort(), ["description", "label", "value"]);
 });
 
+test("ask_user_choice hover preserves the keyboard-selected opaque value", async () => {
+	const { tool } = registerChoiceTool();
+	let completionCalls = 0;
+	const result = await tool.execute("call", { question: "Proceed?", options }, new AbortController().signal, undefined, {
+		mode: "tui",
+		ui: { custom: async (factory: ChoiceCustomFactory) => {
+			let completed: unknown;
+			const component = factory({ requestRender() {} }, {
+				fg: (_color, text) => `\u001b[38;5;39m${text}\u001b[39m`,
+				bg: (_color, text) => `\u001b[48;5;236m${text}\u001b[49m`, bold: (text) => text,
+			}, {}, (value) => { completionCalls++; completed = value; });
+			const lines = component.render(80);
+			const first = lines.findIndex((line) => stripTerminalSequences(line).includes(options[0]!.label));
+			const second = lines.findIndex((line) => stripTerminalSequences(line).includes(options[1]!.label));
+			assert.ok(first >= 0 && second >= 0);
+			const hover = {
+				type: "move", button: "none", x: 0, y: second,
+				screenX: 0, screenY: second, width: 80, height: lines.length,
+				shift: false, alt: false, ctrl: false,
+			};
+			assert.equal(component.handleMouse?.(hover)?.render, true);
+			assert.equal(completed, undefined, "hover never submits");
+			const hovered = component.render(80);
+			assert.ok(hovered[second]?.includes("\u001b[48;5;236m"), "only the second option is hovered");
+			assert.ok(
+				hovered[first]?.includes("\u001b[38;5;39m") && !hovered[first]?.includes("\u001b[48;5;236m"),
+				"hover does not change keyboard selection",
+			);
+			component.handleInput("\r");
+			component.handleInput("\r");
+			return completed;
+		} },
+	});
+	assert.deepEqual(result.details.selection, { value: options[0]!.value, label: options[0]!.label, index: 1 });
+	assert.equal(completionCalls, 1);
+});
+
 test("ask_user_choice retains native rendered hit testing for mouse selection", async () => {
 	const longOptions = [
 		{
@@ -201,7 +240,7 @@ test("ask_user_choice retains native rendered hit testing for mouse selection", 
 					let completed: unknown;
 					const component = factory(
 						{ requestRender() {} },
-						{ fg: (_color, text) => text, bold: (text) => text },
+						{ fg: (_color, text) => text, bg: (_color, text) => text, bold: (text) => text },
 						{},
 						(value) => {
 							completionCalls++;
@@ -216,9 +255,9 @@ test("ask_user_choice retains native rendered hit testing for mouse selection", 
 					const event = (type: string, button: string, y: number, wheelDelta?: number) => ({
 						type,
 						button,
-						x: 0,
+						x: 1,
 						y,
-						screenX: 0,
+						screenX: 1,
 						screenY: y,
 						width: 100,
 						height: wide.length,

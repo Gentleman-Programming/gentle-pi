@@ -1,8 +1,14 @@
-import { Container, type Component } from "@earendil-works/pi-tui";
+import { Container, type Component, type TuiMouseEvent } from "@earendil-works/pi-tui";
+
+export interface NativeFullscreenMouseObserver {
+	beforeMouse(event: TuiMouseEvent): void;
+	afterMouse(event: TuiMouseEvent): void;
+}
 
 export interface NativeFullscreenInteractionOptions {
 	keyboardTarget: Component;
 	requestRender(): void;
+	mouseObserver?: NativeFullscreenMouseObserver;
 }
 
 export class NativeFullscreenInteraction extends Container {
@@ -18,12 +24,21 @@ export class NativeFullscreenInteraction extends Container {
 		this.options.keyboardTarget.handleInput(data);
 		this.options.requestRender();
 	}
+
+	override handleMouse(event: TuiMouseEvent) {
+		this.options.mouseObserver?.beforeMouse(event);
+		try {
+			return super.handleMouse(event);
+		} finally {
+			this.options.mouseObserver?.afterMouse(event);
+		}
+	}
 }
 
 /**
  * Compose native Container mouse dispatch with one keyboard-owning control.
- * The returned root intentionally inherits Container.handleMouse unchanged so
- * native layout, targeting, focus, wheel, and click semantics stay intact.
+ * Optional observers run around native delegation without rewriting its result,
+ * so native layout, targeting, focus, wheel, and click semantics stay intact.
  */
 export function createNativeFullscreenInteraction(
 	options: NativeFullscreenInteractionOptions,
