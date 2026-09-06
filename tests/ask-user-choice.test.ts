@@ -35,6 +35,34 @@ interface ChoiceLifecycleEvent {
 	data: { active: boolean };
 }
 
+interface NativeChoiceComponent {
+	render(width: number): string[];
+	handleInput(data: string): void;
+	handleMouse?: (event: Record<string, unknown>) => NativeChoiceMouseResult | undefined;
+}
+
+interface NativeChoiceMouseResult {
+	handled?: boolean;
+	focus?: boolean;
+	render?: boolean;
+}
+
+interface ChoiceTui {
+	requestRender(): void;
+}
+
+interface ChoiceTheme {
+	fg(color: string, text: string): string;
+	bold(text: string): string;
+}
+
+type ChoiceCustomFactory = (
+	tui: ChoiceTui,
+	theme: ChoiceTheme,
+	keybindings: unknown,
+	done: (value: unknown) => void,
+) => NativeChoiceComponent;
+
 type BeforeAgentStart = (event: unknown, ctx: { mode: string }) => void | Promise<void>;
 
 function registerChoiceTool(
@@ -143,6 +171,91 @@ test("ask_user_choice exposes a strict closed single-select schema", () => {
 	assert.deepEqual(Object.keys(optionSchema?.properties ?? {}).sort(), ["description", "label", "value"]);
 });
 
+test("ask_user_choice retains native rendered hit testing for mouse selection", async () => {
+	const longOptions = [
+		{
+			label: "Authorize the observed baseline hash after independent verification",
+			description: "Accept the observed baseline after a long description that verifies layout offsets.",
+			value: "authorize_observed_hash",
+		},
+		{
+			label: "Preserve the originally requested hash without changing the envelope",
+			description: "Keep the original opaque answer token after the user confirms the requested value.",
+			value: "preserve_requested_hash",
+		},
+	];
+	const { tool } = registerChoiceTool();
+	let completionCalls = 0;
+	const result = await tool.execute(
+		"call",
+		{
+			question: "A deliberately long question verifies that the rendered header does not shift native option hit bounds.",
+			options: longOptions,
+		},
+		new AbortController().signal,
+		undefined,
+		{
+			mode: "tui",
+			ui: {
+				custom: async (factory: ChoiceCustomFactory) => {
+					let completed: unknown;
+					const component = factory(
+						{ requestRender() {} },
+						{ fg: (_color, text) => text, bold: (text) => text },
+						{},
+						(value) => {
+							completionCalls++;
+							completed = value;
+						},
+					) as NativeChoiceComponent;
+					const narrow = component.render(24);
+					assert.ok(narrow.length > 0, "the real component renders before a narrow-to-wide resize");
+					const wide = component.render(100);
+					const secondRow = wide.findIndex((line) => line.includes(longOptions[1]!.label.slice(0, 24)));
+					assert.ok(secondRow >= 0, "the test locates the actual rendered option row");
+					const event = (type: string, button: string, y: number, wheelDelta?: number) => ({
+						type,
+						button,
+						x: 0,
+						y,
+						screenX: 0,
+						screenY: y,
+						width: 100,
+						height: wide.length,
+						shift: false,
+						alt: false,
+						ctrl: false,
+						wheelDelta,
+					});
+					assert.equal(typeof component.handleMouse, "function", "native mouse dispatch must survive the custom UI adapter");
+					const wheel = component.handleMouse?.(event("wheel", "none", secondRow, 1));
+					assert.equal(wheel?.handled, true);
+					assert.equal(wheel?.render, true);
+					assert.equal(completed, undefined, "wheel changes focus without answering");
+					assert.equal(component.handleMouse?.(event("release", "left", secondRow)), undefined);
+					assert.equal(component.handleMouse?.(event("click", "right", secondRow)), undefined);
+					assert.equal(component.handleMouse?.(event("click", "left", wide.length)), undefined);
+					assert.equal(component.handleMouse?.({ type: "click" }), undefined);
+					const press = component.handleMouse?.(event("press", "left", secondRow));
+					assert.equal(press?.handled, true);
+					assert.equal(press?.focus, true);
+					assert.equal(completed, undefined, "press focuses and selects but never answers");
+					component.handleMouse?.(event("click", "left", secondRow));
+					component.handleMouse?.(event("click", "left", secondRow));
+					component.handleInput("\r");
+					return completed;
+				},
+			},
+		},
+	);
+	assert.deepEqual(result.details.selection, {
+		value: "preserve_requested_hash",
+		label: longOptions[1]!.label,
+		index: 2,
+	});
+	assert.equal(completionCalls, 1, "late keyboard input cannot complete the choice twice");
+});
+
 test("ask_user_choice handles a closed Kilo hash decision with an opaque envelope value", async () => {
 	const { tool } = registerChoiceTool(["read"]);
 	const rendered = { value: "" };
@@ -185,7 +298,9 @@ test("ask_user_choice emits a private balanced lifecycle around selection and ca
 			},
 		},
 	);
-	assert.equal(selected.details.selection?.value, "preserve_requested_hash");
+	const selection = selected.details.selection;
+	assert.ok(selection !== null && typeof selection === "object" && "value" in selection);
+	assert.equal(selection.value, "preserve_requested_hash");
 	assert.deepEqual(sequence, ["active", "custom", "inactive"]);
 	assert.deepEqual(selectedRegistration.emittedEvents(), [
 		{ channel: "gentle-pi:ask-user-choice:blocked", data: { active: true } },
