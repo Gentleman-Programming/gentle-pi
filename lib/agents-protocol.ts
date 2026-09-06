@@ -27,6 +27,7 @@ export const TASK_EVENT = {
 	TOOL_END: "tool_end",
 	TURN_END: "turn_end",
 	AGENT_END: "agent_end",
+	AGENT_SETTLED: "agent_settled",
 	ERROR: "error",
 	ASK: "ask",
 	NOTE: "note",
@@ -57,12 +58,13 @@ export interface ToolUpdateEvent { type: typeof TASK_EVENT.TOOL_UPDATE; callId: 
 export interface ToolEndEvent { type: typeof TASK_EVENT.TOOL_END; callId: string; output: string; isError: boolean }
 export interface TurnEndEvent { type: typeof TASK_EVENT.TURN_END }
 export interface AgentEndEvent { type: typeof TASK_EVENT.AGENT_END; text: string }
+export interface AgentSettledEvent { type: typeof TASK_EVENT.AGENT_SETTLED }
 export interface ErrorEvent { type: typeof TASK_EVENT.ERROR; message: string }
 export interface AskEvent { type: typeof TASK_EVENT.ASK; request: AskRequest }
 export interface NoteEvent { type: typeof TASK_EVENT.NOTE; text: string }
 export interface UsageEvent { type: typeof TASK_EVENT.USAGE; tokens: number; cost: number }
 
-export type TaskEvent = TextEvent | ThinkingEvent | ToolStartEvent | ToolUpdateEvent | ToolEndEvent | TurnEndEvent | AgentEndEvent | ErrorEvent | AskEvent | NoteEvent | UsageEvent;
+export type TaskEvent = TextEvent | ThinkingEvent | ToolStartEvent | ToolUpdateEvent | ToolEndEvent | TurnEndEvent | AgentEndEvent | AgentSettledEvent | ErrorEvent | AskEvent | NoteEvent | UsageEvent;
 
 export interface TextItem { kind: typeof THREAD_ITEM.TEXT; text: string }
 export interface ThinkingItem { kind: typeof THREAD_ITEM.THINKING; text: string }
@@ -195,6 +197,8 @@ export function normalizeRpcEvent(raw: unknown): TaskEvent[] {
 			return [{ type: TASK_EVENT.TURN_END }];
 		case "agent_end":
 			return [{ type: TASK_EVENT.AGENT_END, text: lastAssistantText(event.messages) }];
+		case "agent_settled":
+			return [{ type: TASK_EVENT.AGENT_SETTLED }];
 		case "extension_ui_request":
 			return DIALOG_METHODS.has(String(event.method)) ? [{ type: TASK_EVENT.ASK, request: askRequest(event) }] : [];
 		case "auto_retry_start":

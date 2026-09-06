@@ -169,6 +169,7 @@ test("subagent_list_agents and subagent_run in task mode launch a child with the
 	await tick();
 	assert.match(widget()![1], /◐  explore  map lib modules +gpt-5\.6-terra · 12k · \$0\.09 · \d+s │$/);
 	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "lib has three agent files." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
 	const result = await running;
 	assert.equal(result.content[0].text, "lib has three agent files.");
 	assert.equal((result.details.gentleAgents as { status: string }).status, "completed");
@@ -200,6 +201,7 @@ test("background runs return at once; status, result, send_message, cancel, and 
 	assert.match((await tools.get("subagent_continue")!.execute("c5", { task_id: id, prompt: "more" }, undefined, undefined, ctx)).content[0].text, /cannot be continued yet/);
 	assert.match((await tools.get("subagent_list_tasks")!.execute("c6", {}, undefined, undefined, ctx)).content[0].text, new RegExp(`^${id} · explore · running`));
 	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "All done." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
 	await tick();
 	assert.equal((await tools.get("subagent_result")!.execute("c7", { task_id: id }, undefined, undefined, ctx)).content[0].text, "All done.");
 	assert.equal(sent.length, 1, "a background result is delivered to the model once");
@@ -216,6 +218,7 @@ test("background runs return at once; status, result, send_message, cancel, and 
 	assert.equal(args[args.indexOf("--session") + 1], "/sessions/child.jsonl");
 	await tick();
 	harness.children[1].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Summary." }] }] });
+	harness.children[1].emit({ type: "agent_settled" });
 	assert.equal((await resumed).content[0].text, "Summary.");
 	assert.match((await tools.get("subagent_cancel")!.execute("c9", { task_id: id }, undefined, undefined, ctx)).content[0].text, /not running/);
 	assert.match((await tools.get("subagent_status")!.execute("c10", { task_id: "nope" }, undefined, undefined, ctx)).content[0].text, /Error: no task nope/);
@@ -243,6 +246,7 @@ test("once the last task is done the card asks for one frame when its finished r
 	await tick();
 	widget();
 	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Done." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
 	await tick();
 	assert.match(widget()![1], /✓  explore  Short job/);
 	const expiry = timers.filter((timer) => !timer.cancelled && timer.ms === 60_000);
@@ -276,6 +280,7 @@ test("a task-mode child's dialog reaches the host UI and the answer goes back to
 	assert.deepEqual(harness.children[0].written.at(-1), { type: "extension_ui_response", id: "u1", value: "a.ts" });
 	assert.match(widget()![1], /◐  explore  Ask me/);
 	harness.children[0].emit({ type: "agent_end", messages: [] });
+	harness.children[0].emit({ type: "agent_settled" });
 	await running;
 	assert.deepEqual(await answerThroughUi(ctx.ui, { id: "u2", method: "confirm", title: "Sure?" }, { message: "really" }), { confirmed: true });
 	assert.deepEqual(await answerThroughUi(ctx.ui, { id: "u3", method: "input", title: "Name" }, {}), { cancelled: true });
@@ -293,6 +298,7 @@ test("finished tasks are written to history, come back through resolveTask, and 
 	const id = (started.details.gentleAgents as { taskId: string }).taskId;
 	await tick();
 	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Kept." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
 	await tick();
 	const tasksDir = join(home, ".pi", "agent", "gentle-agents", "tasks");
 	let stored = await loadHistory(tasksDir);

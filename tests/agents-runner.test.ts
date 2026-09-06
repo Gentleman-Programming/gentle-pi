@@ -21,16 +21,18 @@ interface Harness {
 	children: FakeChild[];
 	timers: Array<{ fn: () => void; ms: number; cancelled: boolean }>;
 	asks: Array<{ taskId: string; method: string }>;
+	finishes: string[];
 }
 
-function harness(options: { maxConcurrency?: number; answer?: Record<string, unknown> } = {}): Harness {
+function harness(options: { maxConcurrency?: number; answer?: Record<string, unknown>; exitOnKill?: boolean } = {}): Harness {
 	const children: FakeChild[] = [];
 	const timers: Harness["timers"] = [];
 	const asks: Harness["asks"] = [];
+	const finishes: string[] = [];
 	let clock = 1000;
 	const deps: RunnerDeps = {
 		spawn: () => {
-			const fake = fakeChild();
+			const fake = fakeChild({ exitOnKill: options.exitOnKill });
 			children.push(fake);
 			return fake.child;
 		},
@@ -50,8 +52,9 @@ function harness(options: { maxConcurrency?: number; answer?: Record<string, unk
 			asks.push({ taskId, method: ask.method });
 			return options.answer ?? { value: "yes" };
 		},
+		onFinish: (task) => finishes.push(task.id),
 	});
-	return { store, runner, children, timers, asks };
+	return { store, runner, children, timers, asks, finishes };
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -96,6 +99,7 @@ test("AgentRunner runs a task end to end: prompt, deltas into the store, complet
 	child.emit({ type: "tool_execution_start", toolCallId: "c1", toolName: "grep", args: {} });
 	child.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Found it" } });
 	child.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Found it" }] }] });
+	child.emit({ type: "agent_settled" });
 	await tick();
 	const finished = store.get(task.id);
 	assert.equal(finished?.status, TASK_STATUS.COMPLETED);
@@ -108,6 +112,33 @@ test("AgentRunner runs a task end to end: prompt, deltas into the store, complet
 	assert.equal((await runner.waitFor(task.id)).status, TASK_STATUS.COMPLETED);
 });
 
+test("AgentRunner waits for child exit after settlement before releasing its queue slot or finishing twice", async () => {
+	const { store, runner, children, finishes } = harness({ maxConcurrency: 1, exitOnKill: false });
+	const first = runner.run(request());
+	const second = runner.run(request({ prompt: "Second" }));
+	await tick();
+	assert.equal(children.length, 1);
+	children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Answer" }] }] });
+	await tick();
+	assert.equal(store.get(first.id)?.status, TASK_STATUS.RUNNING, "agent_end ends one run, not the session");
+	assert.equal(store.get(first.id)?.result, "Answer", "agent_end retains the final run output");
+	assert.equal(store.get(second.id)?.status, TASK_STATUS.QUEUED, "the slot stays occupied until settlement");
+	assert.deepEqual(finishes, []);
+	children[0].emit({ type: "agent_settled" });
+	await tick();
+	assert.equal(store.get(first.id)?.status, TASK_STATUS.RUNNING, "terminal RPC state does not release a live process");
+	assert.equal(store.get(second.id)?.status, TASK_STATUS.QUEUED);
+	children[0].exit(0);
+	await tick();
+	await tick();
+	assert.equal(store.get(first.id)?.status, TASK_STATUS.COMPLETED);
+	assert.deepEqual(finishes, [first.id], "settlement delivers completion once");
+	assert.equal(children.length, 2, "child exit releases the queue slot");
+	children[0].emit({ type: "agent_settled" });
+	await tick();
+	assert.deepEqual(finishes, [first.id], "duplicate terminal events do not finalize twice");
+});
+
 test("AgentRunner queues beyond max concurrency and starts the next task when one finishes", async () => {
 	const { store, runner, children } = harness({ maxConcurrency: 1 });
 	const first = runner.run(request());
@@ -116,6 +147,7 @@ test("AgentRunner queues beyond max concurrency and starts the next task when on
 	assert.equal(children.length, 1);
 	assert.equal(store.get(second.id)?.status, TASK_STATUS.QUEUED);
 	children[0].emit({ type: "agent_end", messages: [] });
+	children[0].emit({ type: "agent_settled" });
 	await tick();
 	await tick();
 	assert.equal(store.get(first.id)?.status, TASK_STATUS.COMPLETED);
@@ -220,4 +252,42 @@ test("AgentRunner turns a synchronous spawn exception into a failed task", async
 	const finished = await runner.waitFor(task.id);
 	assert.equal(finished.status, TASK_STATUS.FAILED);
 	assert.match(finished.error ?? "", /could not start pi: ENOENT/);
+});
+
+test("AgentRunner fails but quarantines capacity when an owned group cannot be confirmed gone", async () => {
+	const store = new TaskStore();
+	const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+	let now = 0;
+	const child = fakeChild({ exitOnKill: false, pid: 71 });
+	const runner = new AgentRunner(store, { maxConcurrency: 1, timeoutMs: 60_000, stallTimeoutMs: 10_000 }, {
+		spawn: () => child.child,
+		now: () => now,
+		schedule: (fn, ms) => {
+			const timer = { fn, ms, cancelled: false };
+			timers.push(timer);
+			return () => { timer.cancelled = true; };
+		},
+		pi: { command: "pi", args: [] },
+		process: { platform: "linux", kill: (_pid, signal) => {
+			if (signal === 0) throw Object.assign(new Error("permission denied"), { code: "EPERM" });
+		} },
+	}, { askUser: async () => ({ cancelled: true }) });
+	const first = runner.run(request());
+	const second = runner.run(request({ prompt: "queued" }));
+	await tick();
+	const waiter = runner.waitFor(first.id);
+	runner.cancel(first.id);
+	const grace = timers.find((timer) => timer.ms === 250);
+	assert.ok(grace);
+	grace.fn();
+	now = 2_000;
+	const check = timers.filter((timer) => timer.ms === 25).at(-1);
+	assert.ok(check);
+	check.fn();
+	await tick();
+	assert.equal(store.get(first.id)?.status, TASK_STATUS.FAILED);
+	assert.equal((await waiter).status, TASK_STATUS.FAILED);
+	assert.match(store.get(first.id)?.error ?? "", /cleanup unconfirmed/);
+	assert.equal(store.get(second.id)?.status, TASK_STATUS.QUEUED, "the unconfirmed group retains its capacity");
+	assert.equal(timers.filter((timer) => timer.ms === 25 && !timer.cancelled).length, 0, "confirmation polling stops at its deadline");
 });
