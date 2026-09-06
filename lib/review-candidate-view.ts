@@ -339,6 +339,26 @@ function gitlinkMapsEqual(left: Readonly<Record<string, string>>, right: Readonl
 	return entries.length === Object.keys(right).length && entries.every(([path, objectId]) => right[path] === objectId);
 }
 
+// Two materialized candidate views describe the exact same reviewable content
+// when their base, candidate tree, commit-state, and changed scope all match.
+// This is what makes a retried native START's freshly-materialized duplicate
+// view safely discardable in favor of an already-bound one (gentle-pi
+// candidate-view rebind defect, ga#4085 / ga#4050): the comparison never
+// trusts a caller-supplied claim, only Git-derived identity already computed
+// by materializeCandidateView for both records.
+function candidateRecordsShareIdentity(left: CandidateViewRecord, right: CandidateViewRecord): boolean {
+	return left.contributorRoot === right.contributorRoot &&
+		left.baseCommit === right.baseCommit &&
+		left.baseTree === right.baseTree &&
+		left.candidateTree === right.candidateTree &&
+		left.committedOnly === right.committedOnly &&
+		JSON.stringify(left.intendedUntracked ?? null) === JSON.stringify(right.intendedUntracked ?? null) &&
+		JSON.stringify(left.scope.paths) === JSON.stringify(right.scope.paths) &&
+		JSON.stringify(left.scope.modes) === JSON.stringify(right.scope.modes) &&
+		gitlinkMapsEqual(left.scope.gitlinks, right.scope.gitlinks) &&
+		JSON.stringify(left.scope.deletedPaths) === JSON.stringify(right.scope.deletedPaths);
+}
+
 function decodeCanonicalPath(value: Buffer): string {
 	const path = value.toString("utf8");
 	if (!Buffer.from(path, "utf8").equals(value) || !isSafeCandidatePath(path)) {
@@ -1030,6 +1050,32 @@ export class CandidateViewRegistry {
 
 	bindCurrent(request: BindCandidateViewRequest): void {
 		const selectedLenses = this.validateSelectedLenses(request.selectedLenses);
+		const candidate = this.records.get(request.token);
+		const key = candidate === undefined ? undefined : this.lineageKey(candidate.contributorRoot, request.lineageId);
+		const existingToken = key === undefined ? undefined : this.lineages.get(key);
+		// A retried native START for a lineage this controller already bound
+		// (native reports it "resumed") re-materializes a fresh, content-
+		// identical candidate view under a new token before it reaches here.
+		// Rebinding that duplicate to the same lineage key used to fail closed
+		// with "candidate view lineage binding is missing or ambiguous" even
+		// though nothing is actually ambiguous: it is the exact same reviewable
+		// content, re-verified from Git. Discard the redundant duplicate and
+		// keep the already-bound view current instead of failing the retry
+		// (gentle-pi candidate-view rebind defect, ga#4085 / ga#4050).
+		if (candidate !== undefined && existingToken !== undefined && existingToken !== request.token) {
+			const existing = this.records.get(existingToken);
+			let existingSafe = false;
+			if (existing !== undefined && existing.lineageId === request.lineageId) {
+				try { assertRecordSafe(existing); existingSafe = true; } catch { existingSafe = false; }
+			}
+			if (existing !== undefined && existingSafe && candidateRecordsShareIdentity(existing, candidate)) {
+				existing.selectedLenses = selectedLenses;
+				this.remove(candidate);
+				this.forget(candidate);
+				this.current.set(existing.contributorRoot, { lineageId: request.lineageId, token: existingToken });
+				return;
+			}
+		}
 		const record = this.bindRecord(request.token, request.lineageId, selectedLenses);
 		this.current.set(record.contributorRoot, { lineageId: request.lineageId, token: request.token });
 	}

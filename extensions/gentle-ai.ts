@@ -3166,6 +3166,23 @@ function nativeStatusFailed(operation: ReviewControllerOperation, error: unknown
 			next_action: "require-complete-native-authority-inventory",
 		};
 	}
+	// gentle-pi#599: a negotiated STATUS/inspect request the native provider
+	// rejects with a decoded failure/v2 envelope (for example a preflight
+	// `invalid_request` refusal for a nested foreign Git repository) used to
+	// fall through to the generic outcome below, discarding the envelope's own
+	// cause, code, retry_safe, and next_action -- the one piece of information
+	// that makes the refusal actionable (pass the intended nested repo as
+	// workspaceRoot). `nativeOperationFailure` already renders this exact
+	// failure-envelope shape faithfully for every mutating operation; reuse it
+	// here instead of masking the refusal as opaque authority-inventory
+	// corruption.
+	if (error instanceof NativeReviewIntegrationError) {
+		return {
+			...nativeOperationFailure(operation, error),
+			outcome: "native-status-unavailable",
+			inventory_complete: false,
+		};
+	}
 	return {
 		operation,
 		status: "blocked",
