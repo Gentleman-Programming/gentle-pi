@@ -18,6 +18,7 @@ import {
 	digestChangedPathManifest,
 	injectReviewCandidateView,
 	readCandidateContextManifestPage,
+	type NativeCandidateProjectionDescriptor,
 } from "../lib/review-candidate-view.ts";
 
 function git(cwd: string, ...arguments_: string[]): string {
@@ -1994,4 +1995,77 @@ test("candidate view cleans up a partially registered unborn fallback worktree w
 	const parent = join(realpathSync(git(contributorRoot, "rev-parse", "--path-format=absolute", "--git-common-dir")), "gentle-ai", "candidate-views");
 	const leftover = existsSync(parent) ? readdirSync(parent).filter((entry) => lstatSync(join(parent, entry)).isDirectory()) : [];
 	assert.deepEqual(leftover, [], "no candidate directory remains after a partial unborn fallback failure");
+});
+
+function stagedFinalizeDescriptor(cwd: string, path: string, content: string): NativeCandidateProjectionDescriptor {
+	writeFileSync(join(cwd, path), content);
+	git(cwd, "add", path);
+	const baseTree = git(cwd, "rev-parse", "HEAD^{tree}");
+	const currentCandidateTree = git(cwd, "write-tree");
+	return { baseTree, currentCandidateTree, paths: [path], intendedUntracked: [], projection: "staged" };
+}
+
+function candidateViewWorktreeCount(cwd: string): number {
+	return git(cwd, "worktree", "list").split("\n").filter((line) => line.includes("candidate-views")).length;
+}
+
+test("gentle-pi#185: a forecast-restored FINALIZE worktree does not leak across the next restore for the same lineage", (t) => {
+	// gentle-pi#185: `restoreForFinalizeFromNative` materializes a real Git
+	// worktree to restore a lineage's FINALIZE binding from the native frozen
+	// projection. A forecast-only FINALIZE after a process restart uses this
+	// exact path, but its outcome is non-terminal, so `cleanupTerminal` (which
+	// only fires for "approved"/"escalated") never runs for it. Before the fix,
+	// `restoreForFinalizeFromNative` never cleared the stale binding it had
+	// just created, so restoring the same lineage's FINALIZE binding again
+	// (the lineage's later approved FINALIZE, or another restart-time
+	// forecast) threw "native frozen projection is invalid or already
+	// restored" from `restoreProjectionFromNative` — leaving the first
+	// worktree registered forever and breaking the very finalize that should
+	// have succeeded.
+	const cwd = repository(t);
+	const registry = new CandidateViewRegistry();
+	const lineageId = "forecast-lineage-185";
+	const descriptor = stagedFinalizeDescriptor(cwd, "tracked.txt", "forecast change\n");
+
+	assert.equal(candidateViewWorktreeCount(cwd), 0, "no candidate worktree exists before any restore");
+
+	// Reproduces the leak symptom: a forecast-only FINALIZE restore
+	// materializes a worktree that is still registered with Git once the
+	// (non-terminal) forecast finalize returns.
+	registry.restoreForFinalizeFromNative(lineageId, cwd, descriptor);
+	assert.equal(candidateViewWorktreeCount(cwd), 1, "the forecast restore leaves its worktree registered with Git after it returns");
+
+	// A later restore for the same lineage (its approved FINALIZE, or another
+	// restart-time forecast) must clean up the stale worktree and replace it
+	// deterministically instead of throwing or leaking a parallel sibling.
+	assert.doesNotThrow(
+		() => registry.restoreForFinalizeFromNative(lineageId, cwd, descriptor),
+		"restoring the same lineage's FINALIZE binding again must not fail on the stale binding it left behind",
+	);
+	assert.equal(candidateViewWorktreeCount(cwd), 1, "the second restore must replace the first worktree, never accumulate a parallel sibling");
+
+	// The subsequent approved FINALIZE's terminal cleanup must still work for
+	// the worktree that is actually registered after the restore.
+	registry.cleanupTerminal(lineageId, "approved", cwd);
+	assert.equal(candidateViewWorktreeCount(cwd), 0, "approved cleanup removes the restored worktree, leaving no candidate worktree registered");
+});
+
+test("gentle-pi#185 review correction: a restore whose materialization fails leaves the previous binding intact", (t) => {
+	const cwd = repository(t);
+	const lineageId = "forecast-lineage-185-rollback";
+	const descriptor = stagedFinalizeDescriptor(cwd, "tracked.txt", "forecast change\n");
+	let worktreeAdds = 0;
+	const executor: CandidateGitExecutor = (file, args, options) => {
+		if (args[0] === "worktree" && args[1] === "add" && ++worktreeAdds === 2) throw Object.assign(new Error("simulated worktree add failure"), { status: 128 });
+		return execFileSync(file, args, options);
+	};
+	const registry = new CandidateViewRegistry(executor);
+	const first = registry.restoreForFinalizeFromNative(lineageId, cwd, descriptor);
+	assert.equal(candidateViewWorktreeCount(cwd), 1);
+	let failure: unknown;
+	try { registry.restoreForFinalizeFromNative(lineageId, cwd, descriptor); } catch (error) { failure = error; }
+	assert.equal((failure as CandidateViewError)?.reason, "candidate-view-git-failure", "a failed materialization must propagate, not silently succeed");
+	assert.equal(candidateViewWorktreeCount(cwd), 1, "the previously registered worktree must survive the failed restore");
+	assert.equal(registry.resolveForFinalize(lineageId, cwd).token, first.token, "the lineage must still resolve to its original worktree");
+	registry.cleanupTerminal(lineageId, "approved", cwd);
 });

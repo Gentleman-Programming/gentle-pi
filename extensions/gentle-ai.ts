@@ -3108,6 +3108,15 @@ async function resolveReviewModeGate(
 	}
 }
 
+// gentle-pi#185: a native CLI without negotiated STATUS support (no
+// `targetStatus`, or a version-incompatible provider) hits this boundary
+// before any candidate-view restoration is attempted, so it can never
+// reproduce the #176 empty-registry failure — but the boundary's own
+// `next_action` was a machine token with nothing a human or an agent could
+// run. `remediation_command` names the exact upstream command that
+// re-establishes negotiated STATUS for this session's Pi host identity.
+const NATIVE_STATUS_UNSUPPORTED_REMEDIATION_COMMAND = "gentle-ai review status --cwd <repo> --contract gentle-ai.review-integration/v2 --agent pi --next-transition";
+
 function nativeStatusUnsupported(operation: ReviewControllerOperation): Record<string, unknown> {
 	return {
 		operation,
@@ -3116,6 +3125,7 @@ function nativeStatusUnsupported(operation: ReviewControllerOperation): Record<s
 		...(operation === REVIEW_CONTROLLER_OPERATION.START ? nativeStartPreAuthorityRejection() : { mutation_performed: false }),
 		inventory_complete: false,
 		next_action: "require-upstream-read-only-native-status-inventory",
+		remediation_command: NATIVE_STATUS_UNSUPPORTED_REMEDIATION_COMMAND,
 		evidence: {
 			native_contract: "gentle-ai/2.1.4",
 			general_status: "unsupported",
