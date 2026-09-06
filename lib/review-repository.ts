@@ -55,8 +55,8 @@ export function reviewGitEnvironment(): NodeJS.ProcessEnv {
 	const environment: NodeJS.ProcessEnv = {};
 	for (const [key, value] of Object.entries(process.env)) if (!key.startsWith("GIT_")) environment[key] = value;
 	environment.GIT_CONFIG_NOSYSTEM = "1";
-	environment.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
-	environment.GIT_CONFIG_SYSTEM = process.platform === "win32" ? "NUL" : "/dev/null";
+	environment.GIT_CONFIG_GLOBAL = "/dev/null";
+	environment.GIT_CONFIG_SYSTEM = "/dev/null";
 	environment.GIT_OPTIONAL_LOCKS = "0";
 	environment.LC_ALL = "C";
 	environment.LANG = "C";
