@@ -3,24 +3,42 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import { Text, visibleWidth } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
+import { ChildStandingReviewPermissionClient, ParentStandingReviewPermissionBroker } from "../lib/review-session-standing-permission-ipc.ts";
+import { captureReviewSessionIdentity, grantReviewSessionPermission, hasReviewSessionPermission, revokeReviewSessionPermissionsForSession } from "../lib/review-session-standing-permission.ts";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 import { NativeReviewConsentRequiredError, type NativeReviewCli } from "../lib/native-review-cli.ts";
-import { decodeReviewConsentV3, type ReviewStatusV3 } from "../lib/review-integration-v2.ts";
+import { decodeReviewConsentV2, decodeReviewConsentV3, type ReviewConsentEnvelope, type ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import {
 	HOST_REVIEW_SESSION_PERMISSION_LABEL,
 	formatReviewConsentUi,
 	presentReviewConsentUi,
 } from "../lib/review-consent-ui.ts";
 
-function consent() {
+function consentFixture(): Record<string, unknown> {
 	const path = join(process.cwd(), "tests", "fixtures", "devbinary", "consent-v3.captured.json");
-	const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+	return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+}
+
+function consent() {
+	const raw = consentFixture();
 	raw.agent = "pi";
 	return decodeReviewConsentV3(raw, "pi");
+}
+
+function providerV2Consent() {
+	const raw = consentFixture();
+	delete raw.agent;
+	raw.schema = "gentle-ai.review-integration.consent/v2";
+	return decodeReviewConsentV2(raw);
+}
+
+function nonPiV3Consent() {
+	return decodeReviewConsentV3(consentFixture(), "claude-code");
 }
 
 test("host UI preserves the complete provider envelope and adds a separately owned third action", () => {
@@ -98,9 +116,19 @@ function reviewRepository(t: test.TestContext): string {
 	return cwd;
 }
 
-function startStatus(cwd: string): ReviewStatusV3 {
+function siblingWorktree(t: test.TestContext, parentRoot: string): string {
+	const cwd = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-session-consent-worktree-")));
+	t.after(() => rmSync(cwd, { recursive: true, force: true }));
+	execFileSync("git", ["worktree", "add", "-b", `permission-child-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, cwd, "HEAD"], { cwd: parentRoot, stdio: "ignore" });
+	return cwd;
+}
+
+function startStatus(cwd: string, intendedUntracked: readonly string[] = []): ReviewStatusV3 {
 	const views = new CandidateViewRegistry();
-	const candidate = views.create({ contributorRoot: cwd });
+	const candidate = views.create({
+		contributorRoot: cwd,
+		...(intendedUntracked.length === 0 ? {} : { intendedUntracked }),
+	});
 	try {
 		return {
 			contract: "gentle-ai.review-integration/v2",
@@ -117,7 +145,7 @@ function startStatus(cwd: string): ReviewStatusV3 {
 				currentCandidateTree: candidate.candidateTree,
 				pathsDigest: `sha256:${"a".repeat(64)}`,
 				paths: [...candidate.paths],
-				intendedUntracked: [],
+				intendedUntracked: [...intendedUntracked],
 				intendedUntrackedProof: `sha256:${"a".repeat(64)}`,
 				initialSnapshotIdentity: `sha256:${"a".repeat(64)}`,
 				currentSnapshotIdentity: `sha256:${"a".repeat(64)}`,
@@ -128,6 +156,37 @@ function startStatus(cwd: string): ReviewStatusV3 {
 	} finally {
 		views.cleanup(candidate.token);
 	}
+}
+
+function intendedUntrackedSelectionStatuses(cwd: string, eligible: string): { initial: ReviewStatusV3; selected: ReviewStatusV3 } {
+	const initialTarget = startStatus(cwd);
+	const selectedTarget = startStatus(cwd, [eligible]);
+	const selection = {
+		name: "intended_untracked_selection",
+		schema: "gentle-ai.review-intended-untracked-selection/v1",
+		captureOperation: "external.select_intended_untracked",
+		arguments: [
+			{ name: "target_identity", value: initialTarget.targetIdentity },
+			{ name: "projection", value: "workspace" },
+			{ name: "base_tree", value: initialTarget.projection.baseTree },
+			{ name: "candidate_tree", value: initialTarget.projection.currentCandidateTree },
+			{ name: "eligible_paths_json", value: JSON.stringify([eligible]) },
+			{ name: "expected_untracked_inventory", value: "sha256:" + "a".repeat(64) },
+		],
+		submission: {
+			operationToken: "status",
+			argumentTokens: ["--contract=gentle-ai.review-integration/v2", "--next-transition=true", "--agent=pi", "--projection=workspace", "--intended-untracked-selection={{value}}"],
+			values: [{ slot: "intended_untracked_selection", domain: "schema_bound_json", schema: "gentle-ai.review-intended-untracked-selection/v1", substitutionLocation: 4 }],
+		},
+	};
+	return {
+		initial: {
+			...initialTarget,
+			nextTransition: { kind: "collect", reasonCode: "intended_untracked_selection_required", collect: { inputs: [selection] } },
+			raw: { schema: "gentle-ai.review-integration.status/v7" },
+		} as unknown as ReviewStatusV3,
+		selected: selectedTarget,
+	};
 }
 
 function piConsent() {
@@ -145,18 +204,23 @@ function controllerHarness(cwd: string, processEnv: NodeJS.ProcessEnv = {}, opti
 	now?: () => number;
 	answerConsentError?: Error & { mutationOutcome?: "none" | "unknown" };
 	startAction?: "created" | "resumed" | "replayed" | "closed" | "blocked-scope-action";
+	childStandingReviewPermissionClient?: ChildStandingReviewPermissionClient;
+	consent?: ReviewConsentEnvelope;
+	targetStatus?: (request: Record<string, unknown>) => Promise<ReviewStatusV3>;
 } = {}) {
 	const tools = new Map<string, RegisteredTool>();
 	const commands = new Map<string, RegisteredCommand>();
 	const events = new Map<string, RegisteredEvent>();
 	const answers: string[] = [];
-	const permissionConsent = piConsent();
+	const answerRequests: Array<{ consent: { raw: unknown }; answer: "granted" | "declined" }> = [];
+	const permissionConsent = options.consent ?? piConsent();
 	const native = {
 		reviewMode: async () => ({ operation: "status", scope: "clone", status: { global: "", cloneLocal: "", effective: "on", source: "default" } }),
-		targetStatus: async () => startStatus(cwd),
+		targetStatus: async (request: Record<string, unknown>) => options.targetStatus?.(request) ?? startStatus(cwd),
 		start: async () => { throw new NativeReviewConsentRequiredError(permissionConsent); },
-		answerConsent: async (request: { answer: "granted" | "declined" }) => {
+		answerConsent: async (request: { consent: { raw: unknown }; answer: "granted" | "declined" }) => {
 			answers.push(request.answer);
+			answerRequests.push(request);
 			if (options.answerConsentError !== undefined && answers.length === 1) throw options.answerConsentError;
 			if (request.answer === "declined") return {
 				kind: "declined",
@@ -172,7 +236,7 @@ function controllerHarness(cwd: string, processEnv: NodeJS.ProcessEnv = {}, opti
 			return { kind: "started", start: { lineageId: `lineage-${answers.length}`, state: action === "blocked-scope-action" ? "unreviewed" : "approved", riskLevel: "high", selectedLenses: [], changedFiles: 1, changedLines: 2, correctionBudget: 0, action, lensesRequired: false, riskReasons: [] } };
 		},
 	} as unknown as NativeReviewCli;
-	createGentleAiExtension({ nativeReviewCli: native, candidateViews: new CandidateViewRegistry(), processEnv, now: options.now })({
+	createGentleAiExtension({ nativeReviewCli: native, candidateViews: new CandidateViewRegistry(), processEnv, now: options.now, childStandingReviewPermissionClient: options.childStandingReviewPermissionClient })({
 		on(name: string, handler: RegisteredEvent) { events.set(name, handler); },
 		registerCommand(name: string, definition: RegisteredCommand) { commands.set(name, definition); },
 		registerTool(definition: RegisteredTool & { name: string }) { tools.set(definition.name, definition); },
@@ -180,7 +244,7 @@ function controllerHarness(cwd: string, processEnv: NodeJS.ProcessEnv = {}, opti
 	} as unknown as ExtensionAPI);
 	const controller = tools.get("gentle_review");
 	assert.ok(controller);
-	return { controller: controller!, answers, commands, events };
+	return { controller: controller!, answers, answerRequests, consent: permissionConsent, commands, events };
 }
 
 function interactiveContext(cwd: string, manager: object, select: (title: string, options: string[]) => Promise<string | undefined>, sessionId = "session-a"): ExtensionContext {
@@ -193,24 +257,53 @@ function interactiveContext(cwd: string, manager: object, select: (title: string
 	} as unknown as ExtensionContext;
 }
 
-test("the host third action grants current and next fresh candidate through answer-consent exactly once each", async (t) => {
+test("a validated intended-untracked selection may use the host third action only for its selected repository", async (t) => {
 	const cwd = reviewRepository(t);
-	const runtime = controllerHarness(cwd);
+	const sibling = siblingWorktree(t, cwd);
+	const unrelated = reviewRepository(t);
+	const selectedPath = "selected.md";
+	for (const root of [cwd, sibling, unrelated]) writeFileSync(join(root, selectedPath), "selected\n");
+	const statuses = new Map<string, ReturnType<typeof intendedUntrackedSelectionStatuses>>();
+	const statusFor = (root: string) => statuses.get(root) ?? statuses.set(root, intendedUntrackedSelectionStatuses(root, selectedPath)).get(root)!;
+	const runtime = controllerHarness(cwd, {}, {
+		targetStatus: async (request) => ("intendedUntrackedSelection" in request ? statusFor(request.cwd as string).selected : statusFor(request.cwd as string).initial),
+	});
 	const manager = {};
 	let prompts = 0;
-	const ctx = interactiveContext(cwd, manager, async (_title, options) => {
+	const select = async (_title: string, options: string[]) => {
 		prompts += 1;
+		assert.equal(options.length, 3, "the host UI exposes exactly its two provider choices plus one host action");
 		return options[2];
-	});
-	const start = { operation: "start", input: JSON.stringify({ mode: "ordinary" }) };
-	const first = (await runtime.controller.execute("first", start, undefined, undefined, ctx)).details;
+	};
+	const selectIntended = async (root: string, context: ExtensionContext) => {
+		const listed = (await runtime.controller.execute(`list-${root}`, { operation: "status", workspaceRoot: root }, undefined, undefined, context)).details;
+		assert.equal(typeof listed.selectionBinding, "string");
+		return await runtime.controller.execute(`select-${root}`, { operation: "select-intended-untracked", selectionBinding: listed.selectionBinding, intendedUntracked: [selectedPath], workspaceRoot: root }, undefined, undefined, context);
+	};
+
+	const first = (await selectIntended(cwd, interactiveContext(cwd, manager, select))).details;
 	assert.equal(first.operation, "answer-consent");
 	assert.deepEqual(runtime.answers, ["granted"]);
-	writeFileSync(join(cwd, "app.ts"), "export const value = 3;\n");
-	const second = (await runtime.controller.execute("second", start, undefined, undefined, ctx)).details;
+	assert.equal(runtime.answerRequests[0]?.answer, "granted", "the exact provider grant is relayed once");
+	assert.equal(JSON.stringify(runtime.answerRequests[0]?.consent.raw), JSON.stringify(runtime.consent.raw), "the exact provider envelope is granted unchanged");
+	const grantedIdentity = await captureReviewSessionIdentity(interactiveContext(cwd, manager, select), {});
+	assert.ok(grantedIdentity);
+	assert.equal(hasReviewSessionPermission(grantedIdentity), true, "the host third action establishes the session repository grant");
+
+	const second = (await selectIntended(sibling, interactiveContext(sibling, manager, select))).details;
 	assert.equal(second.operation, "answer-consent");
 	assert.deepEqual(runtime.answers, ["granted", "granted"]);
-	assert.equal(prompts, 1, "the next fresh envelope consumes the host permission without another prompt");
+	assert.equal(prompts, 1, "a sibling worktree consumes the selected repository grant without another prompt");
+
+	const third = (await selectIntended(unrelated, interactiveContext(unrelated, manager, select))).details;
+	assert.equal(third.operation, "answer-consent");
+	assert.deepEqual(runtime.answers, ["granted", "granted", "granted"]);
+	assert.equal(prompts, 2, "an unrelated repository receives a new explicit host prompt");
+
+	const headless = (await selectIntended(unrelated, { ...interactiveContext(unrelated, {}, async () => { throw new Error("headless must not prompt"); }), mode: "print", hasUI: false } as ExtensionContext)).details;
+	assert.equal(headless.outcome, "native-review-consent-required");
+	assert.equal(JSON.stringify(headless.consent), JSON.stringify(runtime.consent.raw), "an unavailable host returns the byte-equivalent raw provider envelope");
+	assert.deepEqual(runtime.answers, ["granted", "granted", "granted"], "an unavailable host never submits a provider answer");
 });
 
 test("provider grant and decline remain candidate-only and cancellation stores nothing", async (t) => {
@@ -375,4 +468,116 @@ test("headless, child, explicit-workspace, and changed post-UI identity never us
 	const switched = (await runtime.controller.execute("switched", start, undefined, undefined, ctx)).details;
 	assert.equal(switched.outcome, "native-review-consent-required");
 	assert.deepEqual(runtime.answers, []);
+});
+
+test("standing permission never replays provider v2 or non-Pi v3 consents", async (t) => {
+	const cwd = reviewRepository(t);
+	const manager = {};
+	const start = { operation: "start", input: JSON.stringify({ mode: "ordinary" }) };
+	const authorized = controllerHarness(cwd);
+	const grantingContext = interactiveContext(cwd, manager, async (_title, options) => options[2]);
+	await authorized.controller.execute("grant-standing-permission", start, undefined, undefined, grantingContext);
+	assert.deepEqual(authorized.answers, ["granted"]);
+
+	for (const [label, providerConsent] of [
+		["provider v2", providerV2Consent()],
+		["non-Pi v3", nonPiV3Consent()],
+	] as const) {
+		const runtime = controllerHarness(cwd, {}, { consent: providerConsent });
+		const result = (await runtime.controller.execute(label, start, undefined, undefined, interactiveContext(cwd, manager, async () => { throw new Error(`${label} must not prompt`); }))).details;
+		assert.equal(result.outcome, "native-review-consent-required", label);
+		assert.deepEqual(result.consent, providerConsent.raw, `${label} returns the exact unresolved provider envelope`);
+		assert.deepEqual(runtime.answers, [], `${label} never submits a provider answer`);
+	}
+});
+
+test("a child never asks its broker to replay provider v2 or non-Pi v3 consents", async (t) => {
+	const cwd = reviewRepository(t);
+	const start = { operation: "start", input: JSON.stringify({ mode: "ordinary" }), workspaceRoot: cwd };
+	for (const [label, providerConsent] of [
+		["provider v2", providerV2Consent()],
+		["non-Pi v3", nonPiV3Consent()],
+	] as const) {
+		let brokerRequests = 0;
+		const runtime = controllerHarness(cwd, { GENTLE_PI_AGENTS_CHILD: "1" }, {
+			consent: providerConsent,
+			childStandingReviewPermissionClient: {
+				requestAuthorization: async () => {
+					brokerRequests += 1;
+					return true;
+				},
+				close() {},
+			} as unknown as ChildStandingReviewPermissionClient,
+		});
+		const result = (await runtime.controller.execute(label, start, undefined, undefined, interactiveContext(cwd, {}, async () => { throw new Error(`${label} child must not prompt`); }))).details;
+		assert.equal(result.outcome, "native-review-consent-required", label);
+		assert.deepEqual(result.consent, providerConsent.raw, `${label} returns the exact unresolved provider envelope`);
+		assert.equal(brokerRequests, 0, `${label} never requests broker authorization`);
+		assert.deepEqual(runtime.answers, [], `${label} never submits a provider answer`);
+	}
+});
+
+test("child permission transport survives reload shutdown but closes on terminal session shutdown", (t) => {
+	const cwd = reviewRepository(t);
+	let closes = 0;
+	const runtime = controllerHarness(cwd, { GENTLE_PI_AGENTS_CHILD: "1" }, {
+		childStandingReviewPermissionClient: { close: () => { closes += 1; } } as unknown as ChildStandingReviewPermissionClient,
+	});
+	const shutdown = runtime.events.get("session_shutdown");
+	assert.ok(shutdown);
+	const context = interactiveContext(cwd, {}, async () => undefined, "child-session");
+	shutdown({ reason: "reload" }, context);
+	assert.equal(closes, 0, "reload leaves the process-owned transport open for the replacement extension");
+	shutdown({ reason: "new" }, context);
+	assert.equal(closes, 1, "a terminal lifecycle closes the transport");
+});
+
+test("a package-owned child replays its exact pending ordinary grant from a sibling Git worktree only while its parent session remains authorized", async (t) => {
+	const parentRoot = reviewRepository(t);
+	const childRoot = siblingWorktree(t, parentRoot);
+	const unrelatedRoot = reviewRepository(t);
+	writeFileSync(join(childRoot, "app.ts"), "export const value = 2;\n");
+	const parentManager = {};
+	const parentIdentity = await captureReviewSessionIdentity({
+		cwd: parentRoot,
+		mode: "tui",
+		hasUI: true,
+		sessionManager: Object.assign(parentManager, { getSessionId: () => "parent-session" }),
+	}, {});
+	assert.ok(parentIdentity);
+	assert.equal(grantReviewSessionPermission(parentIdentity), true);
+
+	const childToParent = new PassThrough();
+	const parentToChild = new PassThrough();
+	const broker = new ParentStandingReviewPermissionBroker(
+		{ readable: childToParent, writable: parentToChild },
+		(repositoryIdentity) => repositoryIdentity === parentIdentity.repositoryIdentity && parentManager.getSessionId() === "parent-session" && hasReviewSessionPermission(parentIdentity),
+	);
+	const childPermission = new ChildStandingReviewPermissionClient(
+		{ readable: parentToChild, writable: childToParent },
+		{ timeoutMs: 25 },
+	);
+	const runtime = controllerHarness(childRoot, { GENTLE_PI_AGENTS_CHILD: "1" }, { childStandingReviewPermissionClient: childPermission });
+	const childContext = interactiveContext(childRoot, {}, async () => { throw new Error("a child must not open its own consent UI"); }, "child-session");
+	const explicitStart = { operation: "start", input: JSON.stringify({ mode: "ordinary" }), workspaceRoot: childRoot };
+
+	const granted = (await runtime.controller.execute("child-grant", explicitStart, undefined, undefined, childContext)).details;
+	assert.equal(granted.operation, "answer-consent");
+	assert.deepEqual(runtime.answers, ["granted"], "the child locally replays the exact provider grant once");
+
+	const unrelatedContext = interactiveContext(unrelatedRoot, {}, async () => { throw new Error("an unrelated child target must not open its own consent UI"); }, "child-session");
+	const unrelatedStart = { operation: "start", input: JSON.stringify({ mode: "ordinary" }), workspaceRoot: unrelatedRoot };
+	const unrelated = (await runtime.controller.execute("child-unrelated", unrelatedStart, undefined, undefined, unrelatedContext)).details;
+	assert.equal(unrelated.outcome, "native-review-consent-required", "a dynamically targeted unrelated repository is denied by the task-bound broker");
+	assert.deepEqual(runtime.answers, ["granted"]);
+
+	revokeReviewSessionPermissionsForSession(parentIdentity.sessionManager, parentIdentity.sessionId);
+	writeFileSync(join(childRoot, "app.ts"), "export const value = 3;\n");
+	const denied = (await runtime.controller.execute("child-revoked", explicitStart, undefined, undefined, childContext)).details;
+	assert.equal(denied.outcome, "native-review-consent-required", "a revoked parent session cannot authorize the next child candidate");
+	assert.deepEqual(runtime.answers, ["granted"]);
+	childPermission.close();
+	broker.close();
+	childToParent.destroy();
+	parentToChild.destroy();
 });

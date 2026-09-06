@@ -154,11 +154,14 @@ import {
 	type ReviewStatusV3,
 } from "../lib/review-integration-v2.ts";
 import { reconcileUnknownReviewLastEventCapture } from "../lib/review-last-event-controller.ts";
-import { presentReviewConsentUi } from "../lib/review-consent-ui.ts";
+import { acquireChildStandingReviewPermissionClient, type ChildStandingReviewPermissionClient } from "../lib/review-session-standing-permission-ipc.ts";
+import { isPiConsentV3, presentReviewConsentUi } from "../lib/review-consent-ui.ts";
 import {
 	captureReviewSessionIdentity,
 	grantReviewSessionPermission,
 	hasReviewSessionPermission,
+	resolveCanonicalGitRepositoryIdentity,
+	revokeReviewSessionPermission,
 	reviewSessionPermissionEpoch,
 	revokeReviewSessionPermissionsForSession,
 	sameReviewSessionIdentity,
@@ -3881,9 +3884,18 @@ function reviewSessionManagerAndId(context: ExtensionContext): { manager: object
 function isDirectOrdinaryReviewStart(parametersValue: unknown): boolean {
 	try {
 		const parameters = parseReviewControllerParameters(parametersValue);
-		if (parameters.operation !== REVIEW_CONTROLLER_OPERATION.START || parameters.workspaceRoot !== undefined) return false;
+		if (parameters.operation !== REVIEW_CONTROLLER_OPERATION.START) return false;
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
 		return input.mode === REVIEW_MODE.ORDINARY;
+	} catch {
+		return false;
+	}
+}
+
+function isHostReviewConsentEligibleOperation(parametersValue: unknown): boolean {
+	if (isDirectOrdinaryReviewStart(parametersValue)) return true;
+	try {
+		return parseReviewControllerParameters(parametersValue).operation === REVIEW_CONTROLLER_OPERATION.SELECT_INTENDED_UNTRACKED;
 	} catch {
 		return false;
 	}
@@ -4435,11 +4447,13 @@ async function reconcileUnknownReviewCaptureFailure(
 	selections: Map<string, RetainedNativeStatusSelection>,
 	route: RetainedNativeCaptureRoute | undefined,
 	expectedReviewCaptureSuffix?: readonly string[],
+	agent?: "pi",
 ): Promise<Record<string, unknown>> {
 	const failure = error === undefined ? undefined : nativeOperationFailure("gentle_review_capture", error);
 	if (error !== undefined && !nativeMutationRequiresStatus(error)) return failure;
 	try {
-		const status = await reconcileUnknownReviewLastEventCapture(nativeReviewCli, cwd, binding, route);
+		const selector = agent === undefined ? route : { ...route, agent };
+		const status = await reconcileUnknownReviewLastEventCapture(nativeReviewCli, cwd, binding, selector);
 		syncRetainedNativeStatusSelections(selections, cwd, status, route?.baseRef);
 		if (expectedReviewCaptureSuffix !== undefined && !hasExactReviewCaptureSuffix(status, expectedReviewCaptureSuffix)) return captureGroupAuthorityDrift(status);
 		return {
@@ -4500,10 +4514,10 @@ async function executeReviewHostRelayCapture(
 			},
 		};
 	} catch (error) {
-		if (!(error instanceof ReviewHostRelayError)) return await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding, selections, route);
+		if (!(error instanceof ReviewHostRelayError)) return await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding, selections, route, undefined, REVIEW_HOST_AGENT);
 		if (error.mutationOutcome === "unknown") {
 			return {
-				...(await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding, selections, route)),
+				...(await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding, selections, route, undefined, REVIEW_HOST_AGENT)),
 				failure: reviewHostRelayFailureReport(error),
 				reason: error.message,
 			};
@@ -5167,11 +5181,11 @@ async function executeReviewCaptureGroupOperation(
 			}
 		} catch (error) {
 			if (error instanceof ReviewHostRelayError && error.mutationOutcome !== "unknown") return reviewHostRelayGroupFailure(error, group.slots, prepared, index);
-			const reconciled = await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, current.binding, retainedUntrackedSelections, route);
+			const reconciled = await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, current.binding, retainedUntrackedSelections, route, undefined, REVIEW_HOST_AGENT);
 			return { ...reconciled, tool: "gentle_review_capture_group", ...reviewHostRelayGroupProgress(group.slots, prepared, index, true), ...(error instanceof ReviewHostRelayError ? { failure: reviewHostRelayFailureReport(error), reason: error.message } : {}) };
 		}
 	}
-	const reconciled = await reconcileUnknownReviewCaptureFailure(undefined, nativeReviewCli, cwd, group.binding, retainedUntrackedSelections, route, canonicalBindings.slice(prepared.length));
+	const reconciled = await reconcileUnknownReviewCaptureFailure(undefined, nativeReviewCli, cwd, group.binding, retainedUntrackedSelections, route, canonicalBindings.slice(prepared.length), REVIEW_HOST_AGENT);
 	return { ...reconciled, tool: "gentle_review_capture_group", outcome: reconciled.outcome === "capture-group-authority-drift" ? reconciled.outcome : reconciled.status === "reconciled" ? "native-reviewer-group-status-reconciled" : "native-reviewer-group-status-reconciliation-failed", ...reviewHostRelayGroupProgress(group.slots, prepared, prepared.length) };
 }
 
@@ -5992,6 +6006,9 @@ export interface GentleAiRuntimeDependencies {
 	// plain object so the handshake declaration is observable without
 	// touching the test runner's own process.env.
 	processEnv?: NodeJS.ProcessEnv;
+	// Package-owned children use this parent-bound channel only to ask whether
+	// their own pending ordinary START may replay a grant locally.
+	childStandingReviewPermissionClient?: Pick<ChildStandingReviewPermissionClient, "requestAuthorization" | "close">;
 }
 
 export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencies = {}): (pi: ExtensionAPI) => void {
@@ -6002,6 +6019,10 @@ function createGentleAiExtensionForTesting(
 	dependencies: GentleAiRuntimeDependencies = {},
 ): (pi: ExtensionAPI) => void {
 	const nativeReviewCli = dependencies.nativeReviewCli === undefined ? createNativeReviewCli() : dependencies.nativeReviewCli;
+	const childStandingReviewPermissionLease = dependencies.childStandingReviewPermissionClient === undefined
+		? acquireChildStandingReviewPermissionClient(dependencies.processEnv ?? process.env)
+		: undefined;
+	const childStandingReviewPermission = dependencies.childStandingReviewPermissionClient ?? childStandingReviewPermissionLease?.client;
 	const reviewConsentNow = dependencies.now ?? (() => Date.now());
 	const reviewConsentScheduleTimer = dependencies.scheduleTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
 	const pendingReviewConsentRegistry = dependencies.pendingReviewConsentRegistry ?? processPendingReviewConsentRegistry;
@@ -6020,8 +6041,8 @@ function createGentleAiExtensionForTesting(
 			);
 		} catch { /* Status is nonblocking and never permission authority. */ }
 	};
-	const capturePermissionIdentity = (context: ExtensionContext): Promise<ReviewSessionIdentity | undefined> =>
-		captureReviewSessionIdentity(context, permissionEnvironment);
+	const capturePermissionIdentity = (context: ExtensionContext, cwd: string = context.cwd): Promise<ReviewSessionIdentity | undefined> =>
+		captureReviewSessionIdentity({ ...context, cwd }, permissionEnvironment);
 	const refreshReviewSessionPermissionStatus = async (context: ExtensionContext): Promise<ReviewSessionIdentity | undefined> => {
 		const identity = await capturePermissionIdentity(context);
 		setReviewSessionPermissionStatus(context, identity !== undefined && hasReviewSessionPermission(identity));
@@ -6033,10 +6054,20 @@ function createGentleAiExtensionForTesting(
 		setReviewSessionPermissionStatus(context, false);
 		return revoked;
 	};
+	const revokeCurrentRepositoryReviewSessionPermission = async (context: ExtensionContext): Promise<boolean> => {
+		const identity = await capturePermissionIdentity(context);
+		const revoked = identity === undefined ? false : revokeReviewSessionPermission(identity);
+		setReviewSessionPermissionStatus(context, false);
+		return revoked;
+	};
 
 	pi.on("session_shutdown", (event, context) => {
 		const reason = (event as { reason?: unknown }).reason;
-		if (reason !== "reload") revokeCurrentReviewSessionPermission(context);
+		if (reason !== "reload") {
+			if (childStandingReviewPermissionLease !== undefined) childStandingReviewPermissionLease.closeIfCurrent();
+			else childStandingReviewPermission?.close();
+			revokeCurrentReviewSessionPermission(context);
+		}
 		const sessionKey = pendingReviewConsentSessionKey(context, pendingReviewConsentFallbackKey);
 		cleanupAllPendingReviewConsents(pendingReviewConsentRegistry, sessionKey);
 		processRetainedNativeStatusSelections.delete(sessionKey);
@@ -6173,7 +6204,7 @@ function createGentleAiExtensionForTesting(
 			"Use ABANDON or QUARANTINE_LEGACY only after an explicit user decision and with exact native inputs. ABANDON needs lineage, expectedRevision, snapshotIdentity, capturedLensResults, findingsPresent, evidenceRecordsPresent, actor, and reason; QUARANTINE_LEGACY accepts only the published malformed freeze-findings diagnostic/disposition. A dual reconciliation may supply only anomalies `unchanged_target,malformed_recovery_authorization` in that exact order. Use REPAIR_LEGACY_ALIAS only with lineage, actor, and reason: Pi freshly reads native inventory and derives repository, revision, diagnostic, disposition, and the exact eight-line binding before interactive approval. `review dispose-result` is unsupported pending design.",
 			"Lens, refuter, and validator verdicts are admitted natively, never Pi-authored. Use gentle_review_capture with exactly one current provider-owned collectBinding for ordinary native capture; it never follows another transition.",
 			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization, then call RESET or RECOVER only after authorization. RESET and RECOVER_LOCK route to audited native `gentle-ai review reclaim`; only RESET carries the legacy repositoryId, commonDirHash, inventoryHash, and confirmation challenge. RECOVER routes to native `gentle-ai review recover` with exactly six inputs: predecessorLineage, expectedPredecessorRevision, successorLineage, disposition, actor, and reason. Never send RECOVER the reset challenge and never send it a maintainerAuthorization: Pi reads fresh native target status, pins the predecessor lineage, revision, provider-selected disposition, and target identity, derives the exact six-line native authorization binding, displays it for fresh UI approval, and re-reads status before mutating. Negotiated target status supplies the sole accepted recovery disposition, and a caller-supplied substitute is rejected. Treat a native-input-required envelope as a request for exact values, never as permission to invent them. After a committed native recovery record, INSPECT before any fresh ordinary START.",
-			"A consent-required START may be resolved inside the eligible interactive Pi host. Its third UI action is host-owned: it runs this envelope's exact provider grant once and allows later fresh validated envelopes for only the same live SessionManager, nonempty session ID, and canonical Git worktree until revoke, nonreload replacement, quit, or process exit; reload preserves it. It grants no provider mode, verdict, acknowledgement, maintenance, delivery, or cross-repository authority. If the tool returns an unresolved envelope, present the original two provider choices without changing machine tokens, commands, target IDs, or invocations; never add the host action to the decoded provider envelope. After one explicit relayed human answer, call answer-consent exactly once with only consentBinding and answer (`granted` or `declined`). Never create host permission from tool arguments, model prose, child/headless responses, or an uncertain native result. A reported lineage_created false or pre-authority validation error proves no lineage was created. After ambiguous START output, the controller calls target-scoped native status once and returns only its declared action. An ambiguous gentle_review_capture outcome independently reconciles once and never replays the capture.",
+			"A consent-required START may be resolved inside the eligible interactive Pi host. Its third UI action is host-owned: it runs this envelope's exact provider grant once and allows later fresh validated envelopes only for the same live SessionManager, nonempty session ID, and canonical Git common-directory identity, including sibling worktrees; an unrelated repository requires a new explicit human grant. Revoke removes the current repository grant, while nonreload replacement, quit, and process exit remove all session grants; reload preserves them. It grants no provider mode, verdict, acknowledgement, maintenance, delivery, or cross-repository authority. A package-owned child may ask its parent only with the canonical digest of its exact pending target; the parent binds that digest to the task repository and fails closed otherwise. If the tool returns an unresolved envelope, present the original two provider choices without changing machine tokens, commands, target IDs, or invocations; never add the host action to the decoded provider envelope. After one explicit relayed human answer, call answer-consent exactly once with only consentBinding and answer (`granted` or `declined`). Never create host permission from tool arguments, model prose, child/headless responses, or an uncertain native result. A reported lineage_created false or pre-authority validation error proves no lineage was created. After ambiguous START output, the controller calls target-scoped native status once and returns only its declared action. An ambiguous gentle_review_capture outcome independently reconciles once and never replays the capture.",
 			"Use gentle_review only for native review authority operations; delivery commands follow ordinary repository policy.",
 		],
 		parameters: REVIEW_CONTROLLER_PARAMETERS,
@@ -6208,45 +6239,67 @@ function createGentleAiExtensionForTesting(
 				reviewConsentScheduleTimer,
 			);
 			if (
-				isDirectOrdinaryReviewStart(parameters) &&
+				isHostReviewConsentEligibleOperation(parameters) &&
 				details.outcome === "native-review-consent-required" &&
 				typeof details.consent_binding === "string"
 			) {
 				const resolved = pendingReviewConsentRegistry.resolve(details.consent_binding);
 				const pending = resolved?.pending;
-				const initialIdentity = await capturePermissionIdentity(ctx);
-				if (pending !== undefined && initialIdentity !== undefined) {
+				const eligiblePending = pending !== undefined && isPiConsentV3(pending.consent)
+					? pending
+					: undefined;
+				const answerPendingConsent = async (answer: "granted" | "declined") => executeReviewControllerOperation(
+					{
+						operation: REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT,
+						input: JSON.stringify({ consentBinding: eligiblePending!.id, answer }),
+					},
+					ctx.cwd,
+					nativeReviewCli,
+					signal,
+					candidateViews,
+					ctx,
+					retainedSelections,
+					pendingReviewConsentRegistry,
+					pendingReviewConsentFallbackKey,
+					reviewConsentNow,
+					reviewConsentScheduleTimer,
+				);
+				let permissionWorkspaceRoot: string | undefined;
+				try {
+					const parsed = parseReviewControllerParameters(parameters);
+					permissionWorkspaceRoot = resolveReviewControllerWorkspaceRoot(parsed.workspaceRoot, ctx.cwd, candidateViews, parsed.lineageId);
+				} catch {
+					// The successful native operation above remains authoritative; an
+					// unresolvable local binding simply cannot consume host permission.
+				}
+				const initialIdentity = permissionWorkspaceRoot === undefined
+					? undefined
+					: await capturePermissionIdentity(ctx, permissionWorkspaceRoot);
+				if (eligiblePending !== undefined && initialIdentity === undefined) {
+					// A package child has no local standing grant. It may ask its
+					// inherited parent only for the canonical repository identity of
+					// this exact pending target, then replay this local binding once.
+					const repositoryIdentity = permissionWorkspaceRoot === undefined
+						? undefined
+						: await resolveCanonicalGitRepositoryIdentity(permissionWorkspaceRoot);
+					if (repositoryIdentity !== undefined && await childStandingReviewPermission?.requestAuthorization(repositoryIdentity) === true) details = await answerPendingConsent("granted");
+				} else if (eligiblePending !== undefined && initialIdentity !== undefined) {
 					const initialEpoch = reviewSessionPermissionEpoch(initialIdentity);
 					const permissionAlreadyActive = hasReviewSessionPermission(initialIdentity);
 					const selection = initialEpoch === undefined
 						? undefined
 						: permissionAlreadyActive
 							? { kind: "host-session" as const }
-							: await presentReviewConsentUi(ctx, pending.consent);
+							: await presentReviewConsentUi(ctx, eligiblePending.consent);
 					if (selection !== undefined) {
-						const confirmedIdentity = await capturePermissionIdentity(ctx);
+						const confirmedIdentity = await capturePermissionIdentity(ctx, permissionWorkspaceRoot);
 						if (initialEpoch !== undefined && confirmedIdentity !== undefined && sameReviewSessionIdentity(initialIdentity, confirmedIdentity) && reviewSessionPermissionEpoch(confirmedIdentity) === initialEpoch) {
 							const answer = selection.kind === "provider" ? selection.answer : "granted";
-							details = await executeReviewControllerOperation(
-								{
-									operation: REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT,
-									input: JSON.stringify({ consentBinding: pending.id, answer }),
-								},
-								ctx.cwd,
-								nativeReviewCli,
-								signal,
-								candidateViews,
-								ctx,
-								retainedSelections,
-								pendingReviewConsentRegistry,
-								pendingReviewConsentFallbackKey,
-								reviewConsentNow,
-								reviewConsentScheduleTimer,
-							);
+							details = await answerPendingConsent(answer);
 							if (!permissionAlreadyActive && selection.kind === "host-session" && completedGrantedReviewConsent(details)) {
 								if (grantReviewSessionPermission(confirmedIdentity, initialEpoch)) {
 									setReviewSessionPermissionStatus(ctx, true);
-									try { ctx.ui.notify("Reviews are allowed for this Pi session and Git worktree.", "info"); } catch { /* Nonblocking indication only. */ }
+									try { ctx.ui.notify("Reviews are allowed for this Pi session and this Git repository.", "info"); } catch { /* Nonblocking indication only. */ }
 								} else {
 									try { ctx.ui.notify("This review started, but the in-memory session permission registry was incompatible, so later candidates will ask again.", "warning"); } catch { /* Best effort. */ }
 								}
@@ -6628,7 +6681,7 @@ function createGentleAiExtensionForTesting(
 	});
 
 	pi.registerCommand("gentle:review-session-permission", {
-		description: "Show or revoke the process-memory review permission for this exact Pi session and Git worktree (status|revoke).",
+		description: "Show or revoke the process-memory review permission for this exact Pi session and Git repository (status|revoke).",
 		handler: async (args, ctx) => {
 			const subAction = args.trim().length === 0 ? "status" : args.trim();
 			if (subAction !== "status" && subAction !== "revoke") {
@@ -6636,8 +6689,8 @@ function createGentleAiExtensionForTesting(
 				return;
 			}
 			if (subAction === "revoke") {
-				const revoked = revokeCurrentReviewSessionPermission(ctx);
-				ctx.ui.notify(revoked ? "Review permission revoked for this Pi session. Provider review mode and authority were not changed." : "No review permission is active for this Pi session. Provider review mode and authority were not changed.", "info");
+				const revoked = await revokeCurrentRepositoryReviewSessionPermission(ctx);
+				ctx.ui.notify(revoked ? "Review permission revoked for this Git repository in this Pi session. Provider review mode and authority were not changed." : "No review permission is active for this Git repository in this Pi session. Provider review mode and authority were not changed.", "info");
 				return;
 			}
 			const identity = await refreshReviewSessionPermissionStatus(ctx);
@@ -6646,7 +6699,7 @@ function createGentleAiExtensionForTesting(
 				return;
 			}
 			ctx.ui.notify(hasReviewSessionPermission(identity)
-				? "Reviews are allowed for this Pi session and Git worktree. Use /gentle:review-session-permission revoke to ask again."
+				? "Reviews are allowed for this Pi session and Git repository. Use /gentle:review-session-permission revoke to ask again."
 				: "Reviews are not pre-authorized for this Pi session; each medium- or high-risk candidate asks normally.", "info");
 		},
 	});

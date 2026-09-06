@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -20,6 +20,16 @@ function repository(t: test.TestContext): string {
 	const cwd = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-session-permission-")));
 	t.after(() => rmSync(cwd, { recursive: true, force: true }));
 	execFileSync("git", ["init", "-b", "main"], { cwd, stdio: "ignore" });
+	writeFileSync(join(cwd, "README.md"), "test repository\n");
+	execFileSync("git", ["add", "README.md"], { cwd, stdio: "ignore" });
+	execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base"], { cwd, stdio: "ignore" });
+	return cwd;
+}
+
+function siblingWorktree(t: test.TestContext, parentRoot: string): string {
+	const cwd = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-session-permission-worktree-")));
+	t.after(() => rmSync(cwd, { recursive: true, force: true }));
+	execFileSync("git", ["worktree", "add", "--detach", cwd, "HEAD"], { cwd: parentRoot, stdio: "ignore" });
 	return cwd;
 }
 
@@ -33,9 +43,10 @@ function context(cwd: string, manager: object, sessionId: string, overrides: Par
 	};
 }
 
-test("standing permission is process-memory-only and bound to manager, session id, and canonical worktree", async (t) => {
+test("standing permission is process-memory-only and bound to one live manager, session, and Git common directory", async (t) => {
 	const firstRoot = repository(t);
-	const secondRoot = repository(t);
+	const siblingRoot = siblingWorktree(t, firstRoot);
+	const unrelatedRoot = repository(t);
 	const manager = {};
 	const identity = await captureReviewSessionIdentity(context(firstRoot, manager, "session-a"), {});
 	assert.ok(identity);
@@ -45,14 +56,18 @@ test("standing permission is process-memory-only and bound to manager, session i
 
 	const wrongManager = await captureReviewSessionIdentity(context(firstRoot, {}, "session-a"), {});
 	const wrongSession = await captureReviewSessionIdentity(context(firstRoot, manager, "session-b"), {});
-	const wrongRoot = await captureReviewSessionIdentity(context(secondRoot, manager, "session-a"), {});
-	assert.ok(wrongManager && wrongSession && wrongRoot);
+	const sibling = await captureReviewSessionIdentity(context(siblingRoot, manager, "session-a"), {});
+	const unrelated = await captureReviewSessionIdentity(context(unrelatedRoot, manager, "session-a"), {});
+	assert.ok(wrongManager && wrongSession && sibling && unrelated);
+	assert.equal(sibling.repositoryIdentity, identity.repositoryIdentity, "sibling worktrees share one common-directory identity");
+	assert.notEqual(unrelated.repositoryIdentity, identity.repositoryIdentity, "independent repositories have distinct identities");
 	assert.equal(hasReviewSessionPermission(wrongManager), false);
 	assert.equal(hasReviewSessionPermission(wrongSession), false);
-	assert.equal(hasReviewSessionPermission(wrongRoot), false);
+	assert.equal(hasReviewSessionPermission(sibling), true, "a grant follows sibling worktrees of the same clone");
+	assert.equal(hasReviewSessionPermission(unrelated), false, "an unrelated repository requires its own human grant");
 
 	assert.equal(revokeReviewSessionPermission(identity), true);
-	assert.equal(hasReviewSessionPermission(identity), false);
+	assert.equal(hasReviewSessionPermission(sibling), false);
 });
 
 test("headless, child, empty-session, and non-Git contexts cannot offer or consume standing permission", async (t) => {

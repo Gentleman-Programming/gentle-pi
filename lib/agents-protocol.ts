@@ -27,6 +27,7 @@ export const TASK_EVENT = {
 	TOOL_END: "tool_end",
 	TURN_END: "turn_end",
 	AGENT_END: "agent_end",
+	AGENT_SETTLED: "agent_settled",
 	ERROR: "error",
 	ASK: "ask",
 	NOTE: "note",
@@ -56,13 +57,19 @@ export interface ToolStartEvent { type: typeof TASK_EVENT.TOOL_START; callId: st
 export interface ToolUpdateEvent { type: typeof TASK_EVENT.TOOL_UPDATE; callId: string; output: string }
 export interface ToolEndEvent { type: typeof TASK_EVENT.TOOL_END; callId: string; output: string; isError: boolean }
 export interface TurnEndEvent { type: typeof TASK_EVENT.TURN_END }
-export interface AgentEndEvent { type: typeof TASK_EVENT.AGENT_END; text: string }
+export interface AgentEndEvent {
+	type: typeof TASK_EVENT.AGENT_END;
+	text: string;
+	outcome: "success" | "error" | "aborted" | "empty";
+	diagnostic?: string;
+}
+export interface AgentSettledEvent { type: typeof TASK_EVENT.AGENT_SETTLED }
 export interface ErrorEvent { type: typeof TASK_EVENT.ERROR; message: string }
 export interface AskEvent { type: typeof TASK_EVENT.ASK; request: AskRequest }
 export interface NoteEvent { type: typeof TASK_EVENT.NOTE; text: string }
 export interface UsageEvent { type: typeof TASK_EVENT.USAGE; tokens: number; cost: number }
 
-export type TaskEvent = TextEvent | ThinkingEvent | ToolStartEvent | ToolUpdateEvent | ToolEndEvent | TurnEndEvent | AgentEndEvent | ErrorEvent | AskEvent | NoteEvent | UsageEvent;
+export type TaskEvent = TextEvent | ThinkingEvent | ToolStartEvent | ToolUpdateEvent | ToolEndEvent | TurnEndEvent | AgentEndEvent | AgentSettledEvent | ErrorEvent | AskEvent | NoteEvent | UsageEvent;
 
 export interface TextItem { kind: typeof THREAD_ITEM.TEXT; text: string }
 export interface ThinkingItem { kind: typeof THREAD_ITEM.THINKING; text: string }
@@ -142,16 +149,22 @@ function keepTail(text: string, max: number): string {
 	return text.length <= max ? text : `${ELLIPSIS}${text.slice(text.length - max + 1)}`;
 }
 
-function lastAssistantText(messages: unknown): string {
-	if (!Array.isArray(messages)) return "";
+function terminalAssistant(messages: unknown): Omit<AgentEndEvent, "type"> {
+	if (!Array.isArray(messages)) return { text: "", outcome: "empty", diagnostic: "assistant returned no final report" };
 	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		const message = messages[index] as { role?: string; content?: unknown };
-		if (message?.role === "assistant") {
-			const text = contentText(message.content);
-			if (text.length > 0) return text;
-		}
+		const message = messages[index] as { role?: string; content?: unknown; stopReason?: unknown };
+		if (message?.role !== "assistant") continue;
+		const stopReason = clean(message.stopReason).toLowerCase();
+		// Do not preserve unbounded provider error payloads. The terminal reason is
+		// enough for an operator to distinguish failure from an empty report.
+		if (stopReason === "error") return { text: "", outcome: "error", diagnostic: "assistant reported an error" };
+		if (stopReason === "aborted") return { text: "", outcome: "aborted", diagnostic: "assistant aborted" };
+		const text = contentText(message.content);
+		return text.length > 0
+			? { text, outcome: "success" }
+			: { text: "", outcome: "empty", diagnostic: "assistant returned no final report" };
 	}
-	return "";
+	return { text: "", outcome: "empty", diagnostic: "assistant returned no final report" };
 }
 
 type Raw = Record<string, unknown>;
@@ -194,7 +207,9 @@ export function normalizeRpcEvent(raw: unknown): TaskEvent[] {
 		case "turn_end":
 			return [{ type: TASK_EVENT.TURN_END }];
 		case "agent_end":
-			return [{ type: TASK_EVENT.AGENT_END, text: lastAssistantText(event.messages) }];
+			return [{ type: TASK_EVENT.AGENT_END, ...terminalAssistant(event.messages) }];
+		case "agent_settled":
+			return [{ type: TASK_EVENT.AGENT_SETTLED }];
 		case "extension_ui_request":
 			return DIALOG_METHODS.has(String(event.method)) ? [{ type: TASK_EVENT.ASK, request: askRequest(event) }] : [];
 		case "auto_retry_start":
@@ -293,7 +308,9 @@ function recordPatch(task: TaskRecord, event: TaskEvent): Partial<TaskRecord> {
 		case TASK_EVENT.TURN_END:
 			return { ...resumed, turns: task.turns + 1 };
 		case TASK_EVENT.AGENT_END:
-			return { ...resumed, result: event.text.length > 0 ? event.text : task.result, lastStep: "responded" };
+			return event.outcome === "success"
+				? { ...resumed, result: event.text, error: null, lastStep: "responded" }
+				: { ...resumed, result: null, error: event.diagnostic ?? "assistant did not produce a final report", lastStep: event.diagnostic ?? "assistant failed" };
 		case TASK_EVENT.ERROR:
 			return { ...resumed, lastStep: `error: ${event.message}` };
 		case TASK_EVENT.ASK:

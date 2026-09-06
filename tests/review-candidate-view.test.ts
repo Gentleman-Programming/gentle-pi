@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -377,6 +377,50 @@ test("candidate view preserves staged additions with explicit intended-untracked
 		all.cleanup();
 		excluded.cleanup();
 		selected.cleanup();
+	}
+});
+
+test("candidate view detects a same-stat tracked rewrite with selected untracked content when trustctime is disabled", (t) => {
+	const contributorRoot = repository(t);
+	const tracked = join(contributorRoot, "tracked.txt");
+	const index = join(contributorRoot, ".git", "index");
+	// A fractional timestamp exposes Date-based timestamp restoration, which can
+	// collapse the private index onto the live index's racy-clean boundary.
+	const fixedTimestampSeconds = 946_684_800.654_321;
+	git(contributorRoot, "config", "core.trustctime", "false");
+	writeFileSync(tracked, "fixed\n");
+	utimesSync(tracked, fixedTimestampSeconds, fixedTimestampSeconds);
+	git(contributorRoot, "add", "tracked.txt");
+	git(contributorRoot, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "fixed timestamp base");
+	writeFileSync(tracked, "other\n");
+	utimesSync(tracked, fixedTimestampSeconds, fixedTimestampSeconds);
+	utimesSync(index, fixedTimestampSeconds, fixedTimestampSeconds);
+	const liveIndexMtimeNs = lstatSync(index, { bigint: true }).mtimeNs;
+	if (liveIndexMtimeNs % 1_000_000n === 0n) t.diagnostic("filesystem does not retain sub-millisecond index mtimes; retaining the same-stat rewrite assertion");
+	else assert.notEqual(liveIndexMtimeNs % 1_000_000_000n, 0n, "sub-millisecond filesystem must retain the requested non-whole-second index mtime");
+	writeFileSync(join(contributorRoot, "selected.txt"), "selected\n");
+
+	let privateIndexMtimeNs: bigint | undefined;
+	const registry = new CandidateViewRegistry((file, arguments_, options) => {
+		if (arguments_[0] === "add" && privateIndexMtimeNs === undefined) {
+			const privateIndexPath = options.env?.GIT_INDEX_FILE;
+			assert.equal(typeof privateIndexPath, "string", "private candidate index must be set before Git refreshes tracked entries");
+			privateIndexMtimeNs = lstatSync(privateIndexPath, { bigint: true }).mtimeNs;
+		}
+		return execFileSync(file, arguments_, options);
+	});
+	const view = registry.create({ contributorRoot, intendedUntracked: ["selected.txt"] });
+	try {
+		assert.notEqual(privateIndexMtimeNs, undefined, "private index timestamp must be observed before Git add");
+		assert.ok(privateIndexMtimeNs! < liveIndexMtimeNs, "private index must be strictly earlier than the live index");
+		assert.ok(liveIndexMtimeNs - privateIndexMtimeNs! >= 1_000_000_000n, "private index must leave a bounded racy-clean safety interval");
+		assert.deepEqual(view.intendedUntracked, ["selected.txt"]);
+		assert.deepEqual(view.paths, ["selected.txt", "tracked.txt"]);
+		assert.notEqual(view.candidateTree, view.baseTree);
+		assert.equal(readFileSync(join(view.root, "tracked.txt"), "utf8"), "other\n");
+		assert.equal(readFileSync(join(view.root, "selected.txt"), "utf8"), "selected\n");
+	} finally {
+		view.cleanup();
 	}
 });
 
