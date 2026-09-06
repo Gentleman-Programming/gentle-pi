@@ -1,6 +1,8 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { realpathSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 
 export const REVIEW_SESSION_PERMISSION_REGISTRY_SCHEMA = "gentle-pi.review-session-standing-permission/v1";
@@ -24,6 +26,9 @@ export interface ReviewSessionIdentity {
 	readonly sessionManager: ReviewSessionManager;
 	readonly sessionId: string;
 	readonly worktreeRoot: string;
+	// A SHA-256 digest of the canonical Git common directory. It is stable for
+	// sibling worktrees of one clone without serializing a filesystem path.
+	readonly repositoryIdentity: string;
 }
 
 interface ReviewSessionPermissionRegistry {
@@ -65,6 +70,14 @@ function exactSessionId(sessionManager: ReviewSessionManager): string | undefine
 	}
 }
 
+function canonicalRepositoryIdentity(commonDir: string): string {
+	return `sha256:${createHash("sha256").update(commonDir).digest("hex")}`;
+}
+
+function validAbsoluteGitPath(value: string): boolean {
+	return isAbsolute(value) && value.length > 0 && !value.includes("\n") && !value.includes("\r");
+}
+
 export async function resolveCanonicalGitWorktreeRoot(cwd: string): Promise<string | undefined> {
 	try {
 		const result = await execFileAsync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
@@ -73,8 +86,35 @@ export async function resolveCanonicalGitWorktreeRoot(cwd: string): Promise<stri
 			maxBuffer: 64 * 1024,
 		});
 		const output = result.stdout.trim();
-		if (!isAbsolute(output) || output.length === 0 || output.includes("\n") || output.includes("\r")) return undefined;
+		if (!validAbsoluteGitPath(output)) return undefined;
 		return await realpath(output);
+	} catch {
+		return undefined;
+	}
+}
+
+/** Resolves a non-secret, clone-stable identity from Git's canonical common dir. */
+export async function resolveCanonicalGitRepositoryIdentity(cwd: string): Promise<string | undefined> {
+	try {
+		const result = await execFileAsync("git", ["-C", cwd, "rev-parse", "--git-common-dir"], {
+			encoding: "utf8",
+			timeout: 5_000,
+			maxBuffer: 64 * 1024,
+		});
+		const output = result.stdout.trim();
+		if (output.length === 0 || output.includes("\n") || output.includes("\r")) return undefined;
+		return canonicalRepositoryIdentity(await realpath(resolve(cwd, output)));
+	} catch {
+		return undefined;
+	}
+}
+
+/** The parent AgentRunner binds a child task to this same digest at spawn time. */
+export function resolveCanonicalGitRepositoryIdentitySync(cwd: string): string | undefined {
+	try {
+		const output = execFileSync("git", ["-C", cwd, "rev-parse", "--git-common-dir"], { encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024 }).trim();
+		if (output.length === 0 || output.includes("\n") || output.includes("\r")) return undefined;
+		return canonicalRepositoryIdentity(realpathSync(resolve(cwd, output)));
 	} catch {
 		return undefined;
 	}
@@ -96,19 +136,20 @@ export async function captureReviewSessionIdentity(
 	context: ReviewSessionContext,
 	processEnv: NodeJS.ProcessEnv = process.env,
 	resolveRoot: (cwd: string) => Promise<string | undefined> = resolveCanonicalGitWorktreeRoot,
+	resolveRepositoryIdentity: (cwd: string) => Promise<string | undefined> = resolveCanonicalGitRepositoryIdentity,
 ): Promise<ReviewSessionIdentity | undefined> {
 	if (processEnv.GENTLE_PI_AGENTS_CHILD === "1" || context.hasUI !== true || !hasInteractiveTui(context)) return undefined;
 	const sessionManager = context.sessionManager;
 	if (typeof sessionManager !== "object" || sessionManager === null) return undefined;
 	const sessionId = exactSessionId(sessionManager);
 	if (sessionId === undefined) return undefined;
-	const worktreeRoot = await resolveRoot(context.cwd);
-	if (worktreeRoot === undefined) return undefined;
-	return { sessionManager, sessionId, worktreeRoot };
+	const [worktreeRoot, repositoryIdentity] = await Promise.all([resolveRoot(context.cwd), resolveRepositoryIdentity(context.cwd)]);
+	if (worktreeRoot === undefined || repositoryIdentity === undefined) return undefined;
+	return { sessionManager, sessionId, worktreeRoot, repositoryIdentity };
 }
 
 export function sameReviewSessionIdentity(left: ReviewSessionIdentity, right: ReviewSessionIdentity): boolean {
-	return left.sessionManager === right.sessionManager && left.sessionId === right.sessionId && left.worktreeRoot === right.worktreeRoot;
+	return left.sessionManager === right.sessionManager && left.sessionId === right.sessionId && left.repositoryIdentity === right.repositoryIdentity;
 }
 
 function epochFor(state: ReviewSessionPermissionRegistry, sessionManager: object, sessionId: string): number {
@@ -142,12 +183,14 @@ export function grantReviewSessionPermission(identity: ReviewSessionIdentity, ex
 		roots = new Set();
 		sessions.set(identity.sessionId, roots);
 	}
-	roots.add(identity.worktreeRoot);
+	roots.add(identity.repositoryIdentity);
 	return true;
 }
 
+// A grant belongs to one live session and one Git clone. It follows sibling
+// worktrees through their common directory, never an unrelated repository.
 export function hasReviewSessionPermission(identity: ReviewSessionIdentity): boolean {
-	return registry()?.permissions.get(identity.sessionManager)?.get(identity.sessionId)?.has(identity.worktreeRoot) === true;
+	return registry()?.permissions.get(identity.sessionManager)?.get(identity.sessionId)?.has(identity.repositoryIdentity) === true;
 }
 
 export function revokeReviewSessionPermission(identity: ReviewSessionIdentity): boolean {
@@ -157,7 +200,7 @@ export function revokeReviewSessionPermission(identity: ReviewSessionIdentity): 
 	const sessions = state.permissions.get(identity.sessionManager);
 	const roots = sessions?.get(identity.sessionId);
 	if (sessions === undefined || roots === undefined) return false;
-	const removed = roots.delete(identity.worktreeRoot);
+	const removed = roots.delete(identity.repositoryIdentity);
 	if (roots.size === 0) sessions.delete(identity.sessionId);
 	if (sessions.size === 0) state.permissions.delete(identity.sessionManager);
 	return removed;

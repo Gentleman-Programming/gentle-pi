@@ -1,6 +1,6 @@
 import { execFileSync, type ExecFileSyncOptions } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, utimesSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -12,6 +12,11 @@ const CANDIDATE_GIT_TIMEOUT_MS = 10_000;
 const CANDIDATE_GIT_TIMEOUT_MAX_MS = 120_000;
 const CANDIDATE_GIT_TIMEOUT_ENV = "GENTLE_PI_CANDIDATE_GIT_TIMEOUT_MS";
 const CANDIDATE_GIT_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+// Keep the copied index at least one timestamp tick behind its source. The
+// two-second target also clears filesystems whose mtime granularity is a second
+// or coarser without needlessly assigning an arbitrary historical timestamp.
+const PRIVATE_INDEX_RACY_SAFETY_NS = 1_000_000_000n;
+const PRIVATE_INDEX_RACY_BACKDATE_NS = 2_000_000_000n;
 
 // Candidate views may materialize full repository trees. Large repositories can
 // raise this bounded deadline without creating an unbounded child process.
@@ -800,11 +805,29 @@ function isErrnoCode(error: unknown, code: string): boolean {
 	return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
+function timestampSeconds(timestampNs: bigint): number {
+	// Node's utimes API takes Unix seconds as a number. Splitting the value keeps
+	// the seconds conversion exact; the explicit racy-clean backdate below is far
+	// larger than the fractional precision a Number can represent at this epoch.
+	return Number(timestampNs / 1_000_000_000n) + Number(timestampNs % 1_000_000_000n) / 1_000_000_000;
+}
+
 function seedPrivateIndexFromLiveIndex(cwd: string, indexPath: string, executor: CandidateGitExecutor): boolean {
 	const liveIndex = resolve(cwd, git(cwd, ["rev-parse", "--path-format=absolute", "--git-path", "index"], process.env, executor));
-	const entry = lstatSync(liveIndex, { throwIfNoEntry: false });
+	const entry = lstatSync(liveIndex, { bigint: true, throwIfNoEntry: false });
 	if (entry === undefined) return false; if (!entry.isFile()) throw new CandidateViewError("candidate live Git index is not a regular file");
+	if (entry.mtimeNs < PRIVATE_INDEX_RACY_BACKDATE_NS) throw new CandidateViewError("candidate live Git index timestamp is too early for racy-clean protection");
 	copyFileSync(liveIndex, indexPath);
+	// Git's racy-clean check compares index and tracked-file mtimes. copyFileSync
+	// gives the private index a new timestamp; restoring a Date can also lose
+	// nanoseconds. Backdate the bigint live timestamp instead, then verify the
+	// filesystem applied enough of that bounded interval for Git to refresh
+	// content rather than trusting a racy-clean stat match.
+	utimesSync(indexPath, timestampSeconds(entry.atimeNs), timestampSeconds(entry.mtimeNs - PRIVATE_INDEX_RACY_BACKDATE_NS));
+	const privateMtimeNs = lstatSync(indexPath, { bigint: true }).mtimeNs;
+	if (privateMtimeNs >= entry.mtimeNs || entry.mtimeNs - privateMtimeNs < PRIVATE_INDEX_RACY_SAFETY_NS) {
+		throw new CandidateViewError("candidate private Git index timestamp cannot preserve racy-clean protection");
+	}
 	for (const name of readdirSync(dirname(liveIndex))) if (/^sharedindex\.[0-9a-f]+$/.test(name)) {
 		try {
 			const sharedIndex = join(dirname(liveIndex), name);

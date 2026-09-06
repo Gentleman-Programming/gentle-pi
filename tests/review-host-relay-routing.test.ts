@@ -142,9 +142,22 @@ function finalizeStatus(lineageId: string, inputs?: readonly ReviewCollectInputV
 	} as unknown as ReviewStatusV3;
 }
 
+function providerRefuterRequiredStatus(lineageId: string): ReviewStatusV3 {
+	const refuter: ReviewCollectInputV3 = {
+		name: "provider_refuter",
+		schema: "https://gentle-ai.dev/schema/review/refuter/v1",
+		captureOperation: "review.capture-refuter",
+		arguments: bindingArguments(lineageId, "review-risk", 0),
+	};
+	return {
+		...finalizeStatus(lineageId),
+		nextTransition: { kind: "collect", reasonCode: "provider_refuter_required", collect: { inputs: [refuter] } },
+	};
+}
+
 interface RoutingHarness {
 	statusQueue: ReviewStatusV3[];
-	statusCalls: Array<{ cwd: string; lineageId?: string }>;
+	statusCalls: Array<{ cwd: string; lineageId?: string; agent?: "pi" }>;
 	native: NativeReviewCli;
 }
 
@@ -156,7 +169,7 @@ function nativeHarness(statuses: readonly ReviewStatusV3[]): RoutingHarness {
 	};
 	harness.native = {
 		targetStatus: async (request) => {
-			harness.statusCalls.push({ cwd: request.cwd, ...(request.lineageId === undefined ? {} : { lineageId: request.lineageId }) });
+			harness.statusCalls.push({ cwd: request.cwd, ...(request.lineageId === undefined ? {} : { lineageId: request.lineageId }), ...(request.agent === undefined ? {} : { agent: request.agent }) });
 			const next = harness.statusQueue.shift();
 			if (next === undefined) throw new Error("status queue exhausted");
 			return next;
@@ -226,7 +239,7 @@ function prepared(request: ReviewHostRelayRequest) { return { request, promptByt
 test("grouped capture forecasts once, reaches a four-reviewer barrier, and reconciles unclosed submissions", async (t) => {
 	t.after(() => __testing.setReviewHostRelayGroupRunnersForTesting());
 	const cwd = repository(t), lineageId = "relay-group", inputs = groupInputs(lineageId), lenses = inputs.map((input) => input.arguments.find((argument) => argument.name === "lens")!.value);
-	const harness = nativeHarness([finalizeStatus(lineageId, inputs), finalizeStatus(lineageId, inputs), ...inputs.map((_input, index) => finalizeStatus(lineageId, index === 1 ? [...inputs.slice(index), { name: "unrelated", schema: "example", captureOperation: "external.example", arguments: [] }] : inputs.slice(index))), finalizeStatus(lineageId)]);
+	const harness = nativeHarness([finalizeStatus(lineageId, inputs), finalizeStatus(lineageId, inputs), ...inputs.map((_input, index) => finalizeStatus(lineageId, index === 1 ? [...inputs.slice(index), { name: "unrelated", schema: "example", captureOperation: "external.example", arguments: [] }] : inputs.slice(index))), providerRefuterRequiredStatus(lineageId)]);
 	let ready!: () => void;
 	const allStarted = new Promise<void>((resolve) => { ready = resolve; });
 	const releases = new Map<string, () => void>(), completed: string[] = [], submitted: string[] = [];
@@ -249,7 +262,9 @@ test("grouped capture forecasts once, reaches a four-reviewer barrier, and recon
 	assert.deepEqual(completed, [...lenses].reverse(), "reviewer completion order is not submission order");
 	assert.deepEqual(submitted, lenses);
 	assert.deepEqual({ outcome: result.outcome, statusCalls: harness.statusCalls.length, providerAction: result.provider_action }, { outcome: "native-reviewer-group-status-reconciled", statusCalls: 7, providerAction: "stop" });
-	assert.equal(result.next_transition, undefined);
+	assert.equal(harness.statusCalls.at(-1)?.agent, "pi", "post-last-capture reconciliation preserves the Pi host runtime");
+	assert.equal((result.next_transition as { kind?: string; reasonCode?: string } | undefined)?.kind, "collect");
+	assert.equal((result.next_transition as { kind?: string; reasonCode?: string } | undefined)?.reasonCode, "provider_refuter_required");
 });
 
 test("captured v5 STATUS accepts capture-phase Pn when authority has advanced to Rn at the forecast boundary", async (t) => {
@@ -465,6 +480,7 @@ test("a submission whose outcome is genuinely indeterminate still reconciles thr
 	assert.deepEqual(result.failure, { kind: "submission-refused", stage: "submit", exit_code: null, timed_out: true, elapsed_ms: 120_004, timeout_ms: 120_000 });
 	assert.match(String(result.reason), /exceeded its 120000ms bound/);
 	assert.equal(harness.statusCalls.length, 2, "an indeterminate submission reconciles exactly once through STATUS");
+	assert.equal(harness.statusCalls.at(-1)?.agent, "pi", "ordinary host-relay reconciliation preserves the Pi host runtime");
 });
 
 test("a relay timeout reports its one-slot measurements and no auto-follow", async (t) => {

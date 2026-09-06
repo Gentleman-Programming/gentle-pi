@@ -21,15 +21,18 @@ interface Harness {
 	children: FakeChild[];
 	timers: Array<{ fn: () => void; ms: number; cancelled: boolean }>;
 	asks: Array<{ taskId: string; method: string }>;
+	spawnOptions: Array<{ stdio?: string[] }>;
 }
 
 function harness(options: { maxConcurrency?: number; answer?: Record<string, unknown> } = {}): Harness {
 	const children: FakeChild[] = [];
 	const timers: Harness["timers"] = [];
 	const asks: Harness["asks"] = [];
+	const spawnOptions: Harness["spawnOptions"] = [];
 	let clock = 1000;
 	const deps: RunnerDeps = {
-		spawn: () => {
+		spawn: (_command, _args, options) => {
+			spawnOptions.push({ stdio: options.stdio });
 			const fake = fakeChild();
 			children.push(fake);
 			return fake.child;
@@ -51,7 +54,7 @@ function harness(options: { maxConcurrency?: number; answer?: Record<string, unk
 			return options.answer ?? { value: "yes" };
 		},
 	});
-	return { store, runner, children, timers, asks };
+	return { store, runner, children, timers, asks, spawnOptions };
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -97,6 +100,10 @@ test("AgentRunner runs a task end to end: prompt, deltas into the store, complet
 	child.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Found it" } });
 	child.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Found it" }] }] });
 	await tick();
+	assert.equal(store.get(task.id)?.status, TASK_STATUS.RUNNING, "agent_end retains the latest answer while queued follow-up may still run");
+	assert.equal(children[0].killed.length, 0, "the child remains available until Pi reports settlement");
+	child.emit({ type: "agent_settled" });
+	await tick();
 	const finished = store.get(task.id);
 	assert.equal(finished?.status, TASK_STATUS.COMPLETED);
 	assert.equal(finished?.result, "Found it");
@@ -115,12 +122,82 @@ test("AgentRunner queues beyond max concurrency and starts the next task when on
 	await tick();
 	assert.equal(children.length, 1);
 	assert.equal(store.get(second.id)?.status, TASK_STATUS.QUEUED);
-	children[0].emit({ type: "agent_end", messages: [] });
+	children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "First complete." }], stopReason: "stop" }] });
+	await tick();
+	assert.equal(store.get(first.id)?.status, TASK_STATUS.RUNNING, "the concurrency slot remains held through a queued follow-up");
+	children[0].emit({ type: "agent_settled" });
 	await tick();
 	await tick();
 	assert.equal(store.get(first.id)?.status, TASK_STATUS.COMPLETED);
 	assert.equal(children.length, 2);
 	assert.equal(store.get(second.id)?.status, TASK_STATUS.RUNNING);
+});
+
+test("AgentRunner classifies terminal assistant outcomes only after settlement", async () => {
+	const scenarios = [
+		{ name: "error", messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "WebSocket error: secret=never-copy" }], status: TASK_STATUS.FAILED, error: /assistant reported an error/ },
+		{ name: "aborted", messages: [{ role: "assistant", content: [], stopReason: "aborted" }], status: TASK_STATUS.FAILED, error: /assistant aborted/ },
+		{ name: "empty", messages: [{ role: "assistant", content: [], stopReason: "stop" }], status: TASK_STATUS.FAILED, error: /no final report/ },
+		{ name: "success", messages: [{ role: "assistant", content: [{ type: "text", text: "final report" }], stopReason: "stop" }], status: TASK_STATUS.COMPLETED, error: null },
+	] as const;
+	for (const scenario of scenarios) {
+		const { store, runner, children } = harness();
+		const task = runner.run(request());
+		await tick();
+		children[0].emit({ type: "agent_end", messages: scenario.messages });
+		assert.equal(store.get(task.id)?.status, TASK_STATUS.RUNNING, `${scenario.name} stays running until settlement`);
+		children[0].emit({ type: "agent_settled" });
+		const finished = await runner.waitFor(task.id);
+		assert.equal(finished.status, scenario.status, scenario.name);
+		if (scenario.error) assert.match(finished.error ?? "", scenario.error);
+		else assert.equal(finished.result, "final report");
+	}
+});
+
+test("AgentRunner clears an earlier answer after a later error, but permits a successful retry before settlement", async () => {
+	const first = harness();
+	const failedTask = first.runner.run(request());
+	await tick();
+	first.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "stale success" }], stopReason: "stop" }] });
+	first.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "provider detail must not persist" }] });
+	first.children[0].emit({ type: "agent_settled" });
+	const failed = await first.runner.waitFor(failedTask.id);
+	assert.equal(failed.status, TASK_STATUS.FAILED);
+	assert.equal(failed.result, null, "a later error must not report stale successful text");
+
+	const retry = harness();
+	const retryTask = retry.runner.run(request());
+	await tick();
+	retry.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "error" }] });
+	retry.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "retry report" }], stopReason: "stop" }] });
+	retry.children[0].emit({ type: "agent_settled" });
+	const recovered = await retry.runner.waitFor(retryTask.id);
+	assert.equal(recovered.status, TASK_STATUS.COMPLETED);
+	assert.equal(recovered.result, "retry report");
+});
+
+test("AgentRunner fails if the child exits after agent_end but before agent_settled", async () => {
+	const { store, runner, children } = harness();
+	const task = runner.run(request());
+	await tick();
+	children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "partial answer" }] }] });
+	await tick();
+	children[0].exit(0);
+	await tick();
+	assert.equal(store.get(task.id)?.status, TASK_STATUS.FAILED);
+	assert.match(store.get(task.id)?.error ?? "", /before agent_settled/);
+	assert.equal(store.get(task.id)?.result, "partial answer", "the final observed answer remains available for diagnostics");
+});
+
+test("AgentRunner reserves a parent-owned fourth stdio fd only for package-child authorization", async () => {
+	const { runner, children, spawnOptions } = harness();
+	const task = runner.run(request({ authorizeParentStandingReviewPermission: () => true }));
+	await tick();
+	assert.deepEqual(spawnOptions[0]?.stdio, ["pipe", "pipe", "pipe", "pipe"]);
+	assert.equal((spawnOptions[0] as { stdio?: string[] } | undefined)?.stdio?.length, 4);
+	children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "channel checked" }], stopReason: "stop" }] });
+	children[0].emit({ type: "agent_settled" });
+	assert.equal((await runner.waitFor(task.id)).status, TASK_STATUS.COMPLETED);
 });
 
 test("AgentRunner answers dialogs through askUser in task mode and cancels them in background mode", async () => {

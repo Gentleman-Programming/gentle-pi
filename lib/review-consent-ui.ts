@@ -4,7 +4,7 @@ import type { ReviewConsentEnvelope, ReviewConsentV3 } from "./review-integratio
 export const HOST_REVIEW_SESSION_PERMISSION_LABEL = "Run this review and allow reviews for this Pi session";
 
 const HOST_REVIEW_SESSION_PERMISSION_EFFECT =
-	"Runs the provider's exact grant for this frozen candidate, then lets the Pi host use each later candidate's fresh validated provider grant once while this exact Pi session and Git worktree remain active. Reload keeps it; new, resume, fork, quit, process restart, or explicit revocation ends it. It grants no verdict, acknowledgement, maintenance, delivery, or cross-repository authority.";
+	"Runs the provider's exact grant for this frozen candidate, then lets the Pi host use each later candidate's fresh validated provider grant once while this exact Pi session and canonical Git repository identity, including sibling worktrees, remain active. Reload keeps it; new, resume, fork, quit, process restart, or explicit revocation ends it. It grants no verdict, acknowledgement, maintenance, delivery, or cross-repository authority.";
 
 export type ReviewConsentUiSelection =
 	| { kind: "provider"; answer: "granted" | "declined" }
@@ -15,7 +15,7 @@ export interface ReviewConsentUiModel {
 	readonly options: readonly [string, string, string];
 }
 
-function isPiConsentV3(consent: ReviewConsentEnvelope): consent is ReviewConsentV3 {
+export function isPiConsentV3(consent: ReviewConsentEnvelope): consent is ReviewConsentV3 {
 	return consent.schema === "gentle-ai.review-integration.consent/v3" && consent.agent === "pi";
 }
 
@@ -32,7 +32,7 @@ export function formatReviewConsentUi(consent: ReviewConsentV3): ReviewConsentUi
 		"Risk evidence:",
 		evidence,
 		"",
-		"Ownership: The first two actions are provider-owned and apply only to this candidate. The third action is owned by the Pi host and controls only an in-memory permission for this exact Pi session and Git worktree.",
+		"Ownership: The first two actions are provider-owned and apply only to this candidate. The third action is owned by the Pi host and controls only an in-memory permission for this exact Pi session and canonical Git repository identity, including sibling worktrees.",
 		"",
 		`Off-path note: ${consent.offPath.note}`,
 		`Off-path command: ${consent.offPath.command}`,

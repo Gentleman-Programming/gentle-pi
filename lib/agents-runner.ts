@@ -1,5 +1,6 @@
-import type { Readable, Writable } from "node:stream";
+import type { Duplex, Readable, Writable } from "node:stream";
 import { formatModelRef, type AgentDefinition, type AgentMode, type ModelRef } from "./agents-config.ts";
+import { ParentStandingReviewPermissionBroker } from "./review-session-standing-permission-ipc.ts";
 import { isFinished, normalizeRpcEvent, TASK_EVENT, TASK_STATUS, taskLabel, type AskRequest, type TaskRecord, type TaskStore } from "./agents-protocol.ts";
 
 // Gentle Agents runner. Every subagent is its own `pi --mode rpc` process:
@@ -12,6 +13,7 @@ export interface ChildLike {
 	stdin: Writable;
 	stdout: Readable;
 	stderr: Readable | null | undefined;
+	stdio?: Array<Duplex | null | undefined>;
 	kill(signal?: NodeJS.Signals): boolean;
 	on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
 	on(event: "error", listener: (error: Error) => void): unknown;
@@ -20,6 +22,7 @@ export interface ChildLike {
 export interface SpawnOptions {
 	cwd: string;
 	env: NodeJS.ProcessEnv;
+	stdio?: Array<"pipe" | "ignore" | "inherit">;
 }
 
 export type Spawn = (command: string, args: string[], options: SpawnOptions) => ChildLike;
@@ -66,6 +69,9 @@ export interface TaskRequest {
 	sessionDir: string;
 	resumeSessionPath: string | undefined;
 	env: NodeJS.ProcessEnv;
+	// This closure stays only in the parent process. Its presence creates an
+	// inherited fd, never an environment boolean or model-visible permission.
+	authorizeParentStandingReviewPermission?: (repositoryIdentity: string) => boolean;
 }
 
 interface ProcessLike {
@@ -85,6 +91,7 @@ interface LiveTask {
 	cancelStall: () => void;
 	cancelling: boolean;
 	nextId: number;
+	permissionBroker?: ParentStandingReviewPermissionBroker;
 }
 
 const CHILD_MARKER = "GENTLE_PI_AGENTS_CHILD";
@@ -243,10 +250,19 @@ export class AgentRunner {
 	// spawn exceptions, the process error event, and stdin errors all settle
 	// through finish() instead of surfacing as uncaught errors in the host.
 	private launch(id: string, request: TaskRequest): void {
-		const env = { ...request.env, [CHILD_MARKER]: "1" };
+		const hasParentPermissionChannel = request.authorizeParentStandingReviewPermission !== undefined;
+		const env = {
+			...request.env,
+			[CHILD_MARKER]: "1",
+			...(hasParentPermissionChannel ? { GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" } : {}),
+		};
 		let child: ChildLike;
 		try {
-			child = this.deps.spawn(this.deps.pi.command, [...this.deps.pi.args, ...childArguments(request)], { cwd: request.cwd, env });
+			child = this.deps.spawn(this.deps.pi.command, [...this.deps.pi.args, ...childArguments(request)], {
+				cwd: request.cwd,
+				env,
+				...(hasParentPermissionChannel ? { stdio: ["pipe", "pipe", "pipe", "pipe"] } : {}),
+			});
 		} catch (error) {
 			this.store.update(id, { status: TASK_STATUS.RUNNING, startedAt: this.deps.now(), lastStep: "starting" });
 			this.finish(id, TASK_STATUS.FAILED, `could not start pi: ${error instanceof Error ? error.message : String(error)}`);
@@ -254,6 +270,13 @@ export class AgentRunner {
 		}
 		const live: LiveTask = { child, pending: new Map(), cancelTimeout: () => {}, cancelStall: () => {}, cancelling: false, nextId: 0 };
 		this.live.set(id, live);
+		const permissionPipe = child.stdio?.[3];
+		if (hasParentPermissionChannel && permissionPipe !== undefined && permissionPipe !== null) {
+			live.permissionBroker = new ParentStandingReviewPermissionBroker(
+				{ readable: permissionPipe, writable: permissionPipe },
+				(repositoryIdentity) => this.live.get(id) === live && !live.cancelling && request.authorizeParentStandingReviewPermission?.(repositoryIdentity) === true,
+			);
+		}
 		this.store.update(id, { status: TASK_STATUS.RUNNING, startedAt: this.deps.now(), lastStep: "starting" });
 		child.on("error", (error) => this.finish(id, TASK_STATUS.FAILED, `could not start pi: ${error.message}`));
 		child.stdin.on("error", () => {});
@@ -266,7 +289,7 @@ export class AgentRunner {
 		child.on("exit", (code) => {
 			if (!this.live.has(id)) return;
 			const current = this.store.get(id);
-			if (current && !isFinished(current.status)) this.finish(id, live.cancelling ? TASK_STATUS.CANCELLED : TASK_STATUS.FAILED, `pi exited with code ${code ?? "unknown"}`);
+			if (current && !isFinished(current.status)) this.finish(id, live.cancelling ? TASK_STATUS.CANCELLED : TASK_STATUS.FAILED, `pi exited with code ${code ?? "unknown"} before agent_settled`);
 		});
 		void this.send(id, { type: "get_state" }).then((response) => {
 			const data = response.data as { sessionFile?: string } | undefined;
@@ -317,7 +340,12 @@ export class AgentRunner {
 		for (const event of normalizeRpcEvent(raw)) {
 			this.store.apply(id, event, this.deps.now());
 			if (event.type === TASK_EVENT.ASK) void this.answer(id, request, live, event.request, raw);
-			if (event.type === TASK_EVENT.AGENT_END) this.finish(id, TASK_STATUS.COMPLETED, null);
+			if (event.type === TASK_EVENT.AGENT_SETTLED) {
+				const terminal = this.store.get(id);
+				if (terminal?.error) this.finish(id, TASK_STATUS.FAILED, terminal.error);
+				else if (terminal?.result) this.finish(id, TASK_STATUS.COMPLETED, null);
+				else this.finish(id, TASK_STATUS.FAILED, "assistant settled without a final report");
+			}
 		}
 	}
 
@@ -344,6 +372,7 @@ export class AgentRunner {
 		if (live) {
 			live.cancelTimeout();
 			live.cancelStall();
+			live.permissionBroker?.close();
 			this.live.delete(id);
 			try {
 				live.child.kill("SIGTERM");

@@ -8,6 +8,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { AGENT_MODE, discoverAgents, loadAgentsConfig, resolveAgentProfile, type AgentDefinition, type AgentMode } from "../lib/agents-config.ts";
 import { isFinished, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
 import { AgentRunner, piCommand, type AskAnswer, type RunnerDeps, type TaskRequest } from "../lib/agents-runner.ts";
+import { hasReviewSessionPermission, resolveCanonicalGitRepositoryIdentitySync, type ReviewSessionManager } from "../lib/review-session-standing-permission.ts";
 import { historyDir, loadHistory, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
 import { sessionToMarkdown } from "../lib/agents-transcript.ts";
 import { AgentsView } from "../lib/agents-view.ts";
@@ -42,7 +43,7 @@ interface ToolText {
 }
 
 const defaultDeps = (env: NodeJS.ProcessEnv): AgentsDeps => ({
-	spawn: (command, args, options) => spawn(command, args, { cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"] }),
+	spawn: (command, args, options) => spawn(command, args, { cwd: options.cwd, env: options.env, stdio: options.stdio ?? ["pipe", "pipe", "pipe"] }),
 	now: () => Date.now(),
 	schedule: (fn, ms) => {
 		const timer = setTimeout(fn, ms);
@@ -320,19 +321,40 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const profile = resolveAgentProfile(agent, config);
 		const sessionDir = join(deps.home, ".pi", "agent", "gentle-agents", "sessions");
 		mkdirSync(sessionDir, { recursive: true });
+		const parentSessionManager = ctx.sessionManager as unknown as ReviewSessionManager;
+		const parentSessionId = ctx.sessionManager.getSessionId() ?? "";
+		const parentWorktreeRoot = ctx.sessionManager.getCwd();
+		const parentRepositoryIdentity = resolveCanonicalGitRepositoryIdentitySync(parentWorktreeRoot);
 		return {
 			agent,
 			prompt,
 			label,
 			context,
 			mode,
-			cwd: ctx.sessionManager.getCwd(),
-			parentSessionId: ctx.sessionManager.getSessionId() ?? "",
+			cwd: parentWorktreeRoot,
+			parentSessionId,
 			model: profile.model,
 			thinking: profile.thinking,
 			sessionDir,
 			resumeSessionPath: resume,
 			env: deps.env,
+			...(parentRepositoryIdentity === undefined ? {} : {
+				authorizeParentStandingReviewPermission: (repositoryIdentity: string) => {
+					try {
+						return repositoryIdentity === parentRepositoryIdentity &&
+							parentSessionManager.getSessionId() === parentSessionId &&
+							parentSessionId.length > 0 &&
+							hasReviewSessionPermission({
+								sessionManager: parentSessionManager,
+								sessionId: parentSessionId,
+								worktreeRoot: parentWorktreeRoot,
+								repositoryIdentity: parentRepositoryIdentity,
+							});
+					} catch {
+						return false;
+					}
+				},
+			}),
 		};
 	};
 
