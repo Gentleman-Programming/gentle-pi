@@ -4,11 +4,11 @@ import {
 	KeybindingsManager,
 	isKeyRelease,
 	matchesKey,
-	MouseRegion,
 	Text,
 	type TuiMouseEvent,
 	type TuiMouseEventResult,
 } from "@earendil-works/pi-tui";
+import { NativePointerScope } from "./native-pointer-region.ts";
 
 export interface NativeChoiceItem {
 	id: string;
@@ -39,7 +39,7 @@ export class NativeChoiceList<T extends NativeChoiceItem> extends Container {
 	private selected = 0;
 	private hovered: string | undefined;
 	private disabled = false;
-	private moving = false;
+	private readonly pointerScope = new NativePointerScope();
 	private renderedWidth: number | undefined;
 
 	constructor(items: readonly T[], theme: NativeChoiceListTheme, keybindings?: KeybindingsManager) {
@@ -71,20 +71,12 @@ export class NativeChoiceList<T extends NativeChoiceItem> extends Container {
 
 	setDisabled(disabled: boolean): void {
 		this.disabled = disabled;
+		this.pointerScope.setDisabled(disabled);
 		if (disabled) this.clearHover();
 	}
 
 	createMouseObserver(requestRender: () => void) {
-		return {
-			beforeMouse: (event: TuiMouseEvent) => {
-				this.moving = false;
-			},
-			afterMouse: (event: TuiMouseEvent) => {
-				if (event.type === "move" && event.button === "none" && !this.moving && this.clearHover()) {
-					requestRender();
-				}
-			},
-		};
+		return this.pointerScope.createMouseObserver(requestRender);
 	}
 
 	override handleMouse(event: TuiMouseEvent) {
@@ -119,14 +111,14 @@ export class NativeChoiceList<T extends NativeChoiceItem> extends Container {
 	override render(width: number): string[] {
 		if (this.renderedWidth !== width) {
 			this.renderedWidth = width;
-			this.clearHover();
+			this.pointerScope.invalidate();
 		}
 		return super.render(width);
 	}
 
 	override invalidate(): void {
 		this.renderedWidth = undefined;
-		this.clearHover();
+		this.pointerScope.invalidate();
 		super.invalidate();
 	}
 
@@ -135,13 +127,17 @@ export class NativeChoiceList<T extends NativeChoiceItem> extends Container {
 		const box = new Box(0, 0, (value) => this.hovered === item.id ? this.theme.hoverBackground(value) : value);
 		box.addChild(text);
 		this.rows.push({ item, text, box });
-		this.addChild(new MouseRegion(box, (event) => this.handleRowMouse(item, event)));
+		this.addChild(this.pointerScope.wrap(box, {
+			onHover: (event) => this.handleRowMouse(item, event),
+			onLeave: () => this.clearHover(),
+			onPress: (event) => this.handleRowMouse(item, event),
+			onClick: (event) => this.handleRowMouse(item, event),
+		}));
 	}
 
 	private handleRowMouse(item: T, event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		if (this.disabled) return undefined;
 		if (event.type === "move" && event.button === "none") {
-			this.moving = true;
 			const changed = this.setHover(item.id);
 			return { handled: true, render: changed };
 		}

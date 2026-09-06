@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { mock } from "node:test";
 import {
 	KeybindingsManager, stripTerminalSequences, Text, TUI_KEYBINDINGS,
-	type TuiMouseEvent, visibleWidth,
+	type Component, type TuiMouseEvent, visibleWidth,
 } from "@earendil-works/pi-tui";
 import { NativeChoiceList } from "../lib/native-choice-list.ts";
+import {
+	NativePointerScope,
+	type NativePointerRegionCallbacks,
+} from "../lib/native-pointer-region.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
 
 const selectedForeground = "\u001b[38;5;39m";
@@ -170,4 +174,29 @@ test("empty native choice lists do not activate phantom selections", () => {
 	list.handleInput("\u001b");
 	assert.equal(selected, 0);
 	assert.equal(cancelled, 1);
+});
+
+test("native choice list composes rows through the shared pointer scope", () => {
+	const originalWrap = NativePointerScope.prototype.wrap;
+	let wraps = 0;
+	const spy = mock.method(NativePointerScope.prototype, "wrap", function (
+		this: NativePointerScope, child: Component, callbacks: NativePointerRegionCallbacks,
+	) {
+		wraps++;
+		return originalWrap.call(this, child, callbacks);
+	});
+	try {
+		const list = new NativeChoiceList([
+			{ id: "first", label: "First" },
+			{ id: "second", label: "Second" },
+		], theme);
+		const lines = list.render(40);
+		assert.equal(wraps, 2, "each choice row uses the composable shared pointer primitive");
+		const second = lines.findIndex((line) => line.includes("Second"));
+		assert.ok(second >= 0);
+		assert.equal(list.handleMouse(event("move", "none", second, 40, lines.length))?.render, true);
+		assert.equal(list.getSelectedItem()?.id, "first", "hover remains distinct from keyboard selection");
+	} finally {
+		spy.mock.restore();
+	}
 });
