@@ -212,13 +212,13 @@ function controllerHarness(cwd: string, processEnv: NodeJS.ProcessEnv = {}, opti
 	const commands = new Map<string, RegisteredCommand>();
 	const events = new Map<string, RegisteredEvent>();
 	const answers: string[] = [];
-	const answerRequests: Array<{ consent: { raw: unknown }; answer: "granted" | "declined" }> = [];
+	const answerRequests: Array<{ cwd: string; consent: { raw: unknown }; answer: "granted" | "declined" }> = [];
 	const permissionConsent = options.consent ?? piConsent();
 	const native = {
 		reviewMode: async () => ({ operation: "status", scope: "clone", status: { global: "", cloneLocal: "", effective: "on", source: "default" } }),
 		targetStatus: async (request: Record<string, unknown>) => options.targetStatus?.(request) ?? startStatus(cwd),
 		start: async () => { throw new NativeReviewConsentRequiredError(permissionConsent); },
-		answerConsent: async (request: { consent: { raw: unknown }; answer: "granted" | "declined" }) => {
+		answerConsent: async (request: { cwd: string; consent: { raw: unknown }; answer: "granted" | "declined" }) => {
 			answers.push(request.answer);
 			answerRequests.push(request);
 			if (options.answerConsentError !== undefined && answers.length === 1) throw options.answerConsentError;
@@ -304,6 +304,32 @@ test("a validated intended-untracked selection may use the host third action onl
 	assert.equal(headless.outcome, "native-review-consent-required");
 	assert.equal(JSON.stringify(headless.consent), JSON.stringify(runtime.consent.raw), "an unavailable host returns the byte-equivalent raw provider envelope");
 	assert.deepEqual(runtime.answers, ["granted", "granted", "granted"], "an unavailable host never submits a provider answer");
+});
+
+test("standing permission replays an explicit sibling-worktree consent against its binding-owned workspace root", async (t) => {
+	const parentRoot = reviewRepository(t);
+	const siblingRoot = siblingWorktree(t, parentRoot);
+	writeFileSync(join(siblingRoot, "app.ts"), "export const value = 2;\n");
+	const manager = {};
+	const context = interactiveContext(parentRoot, manager, async () => {
+		throw new Error("an active standing permission must not reopen consent UI");
+	});
+	const identity = await captureReviewSessionIdentity(context, {});
+	assert.ok(identity);
+	assert.equal(grantReviewSessionPermission(identity), true);
+
+	const runtime = controllerHarness(parentRoot);
+	const details = (await runtime.controller.execute(
+		"sibling-standing-permission",
+		{ operation: "start", input: JSON.stringify({ mode: "ordinary" }), workspaceRoot: siblingRoot },
+		undefined,
+		undefined,
+		context,
+	)).details;
+
+	assert.equal(details.operation, "answer-consent");
+	assert.deepEqual(runtime.answers, ["granted"]);
+	assert.equal(runtime.answerRequests[0]?.cwd, siblingRoot, "automatic continuation must preserve the pending binding's canonical sibling worktree root");
 });
 
 test("provider grant and decline remain candidate-only and cancellation stores nothing", async (t) => {
@@ -437,13 +463,12 @@ test("a failed consent invocation never arms host permission", async (t) => {
 	assert.deepEqual(runtime.answers, ["granted", "declined"]);
 });
 
-test("headless, child, explicit-workspace, and changed post-UI identity never use host permission", async (t) => {
+test("headless, child, and changed post-UI identity never use host permission", async (t) => {
 	const cwd = reviewRepository(t);
 	const start = { operation: "start", input: JSON.stringify({ mode: "ordinary" }) };
 	for (const [label, processEnv, makeContext, parameters] of [
 		["headless", {}, () => ({ ...interactiveContext(cwd, {}, async () => { throw new Error("must not prompt"); }), mode: "print", hasUI: false }) as ExtensionContext, start],
 		["child", { GENTLE_PI_AGENTS_CHILD: "1" }, () => interactiveContext(cwd, {}, async () => { throw new Error("must not prompt"); }), start],
-		["explicit workspace", {}, () => interactiveContext(cwd, {}, async () => { throw new Error("must not prompt"); }), { ...start, workspaceRoot: cwd }],
 	] as const) {
 		const runtime = controllerHarness(cwd, processEnv);
 		const result = (await runtime.controller.execute(label, parameters, undefined, undefined, makeContext())).details;
