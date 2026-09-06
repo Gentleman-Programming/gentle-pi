@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -183,7 +183,6 @@ interface ParityRuntimeOptions {
 	pendingReviewConsentRegistry?: PendingReviewConsentRegistry;
 	now?: () => number;
 	scheduleTimer?: (callback: () => void, delayMs: number) => { unref: () => void };
-	writeConsentLatch?: (cwd: string) => void;
 }
 
 function parityRuntime(nativeReviewCli: NativeReviewCli | null, options: ParityRuntimeOptions = {}): ParityRuntime {
@@ -197,7 +196,7 @@ function parityRuntime(nativeReviewCli: NativeReviewCli | null, options: ParityR
 		now: options.now,
 		scheduleTimer: options.scheduleTimer,
 	} as unknown as Parameters<typeof createGentleAiExtension>[0];
-	__testing.createGentleAiExtension(dependencies, options.writeConsentLatch ?? (() => {}))({
+	__testing.createGentleAiExtension(dependencies)({
 		on(name: string, handler: RegisteredEvent) { events.set(name, handler); },
 		registerTool(definition: RegisteredControllerTool & { name: string }) { tools.set(definition.name, definition); },
 		registerCommand(name: string, definition: RegisteredCommand) { commands.set(name, definition); },
@@ -795,18 +794,14 @@ test("native START maps only provider facts and omits absent evidence", async (t
 	assert.equal(rendered.next_transition, nextTransition);
 });
 
-test("consent completion stays authoritative when local latch recording fails", async (t) => {
+test("candidate consent completion writes no persistent asked latch", async (t) => {
 	const cwd = repository(t);
 	const fixture = consentNative(cwd);
-	const notices: Array<{ message: string; type?: string }> = [];
-	const runtime = parityRuntime(fixture.native, {
-		writeConsentLatch: () => { throw new Error("injected latch failure"); },
-	});
+	const runtime = parityRuntime(fixture.native);
 	const blocked = await beginConsent(runtime, cwd);
 	const completed = await answerConsent(runtime, cwd, blocked.consent_binding, "granted");
 	assert.equal((completed.result as { lineage_id?: string }).lineage_id, "consent-lineage");
 	assert.deepEqual(fixture.answers, ["granted"]);
-	assert.deepEqual(notices, []);
-	// The extension handler owns UI reporting; the controller's successful native
-	// result remains authoritative even when the local best-effort latch fails.
+	const commonDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, encoding: "utf8" }).trim();
+	assert.equal(existsSync(join(commonDir, "gentle-pi", "review-consent", "asked.json")), false);
 });
