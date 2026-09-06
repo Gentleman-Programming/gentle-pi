@@ -37,11 +37,11 @@ Delegation is not optional once complexity appears. If a task crosses the trigge
 
 ## Work Routing Ladder
 
-Route work through the smallest harness that is safe. Three tiers:
+Route work through the smallest safe harness; state the routing choice directly (inline, worker, or SDD). Three tiers:
 
-1. **Inline Direct** — small, mechanical, parent has context (typo, one-file edit, read-only check of 1-3 known files, bash for state). No SDD ceremony; stop when it is no longer small.
+1. **Inline Direct** — small, mechanical, parent has context (typo, 1-file edit, 1-3 file read check, bash state). No ceremony.
 2. **Simple Delegation** — generic non-SDD exploration → `gentle-ai-explore`; bounded implementation → `gentle-ai-worker`; command-running generic non-SDD verification → `gentle-ai-verify`. Try its package role; if missing/unusable, use native `Agent` under the same read-only mapping/verification constraints and report fallback. SDD roles stay inside SDD.
-3. **SDD (optional)** — selected only by an explicit request (`/gentle-sdd-new`/`/gentle-sdd-ff`/`/gentle-sdd-continue` or a direct ask) or an accepted proposal; size, file count, or risk alone never selects SDD. Suggest it organically when durable proposal/spec/design/tasks would materially reduce substantial ambiguity. Once selected, do not jump to implementation; create artifacts and gate for approval.
+3. **SDD (optional)** — proactively suggest SDD for multi-module scope, contract/schema changes, or architectural decisions where durable artifacts reduce ambiguity; ask first. Selected only by explicit request (`/sdd-new`/`/sdd-ff`/`/sdd-continue` or direct ask) or accepted proposal; size/risk alone never auto-selects SDD. Once selected, create artifacts and gate for approval instead of jumping to code.
 
 ## Delegation Rules
 
@@ -89,7 +89,7 @@ This package injects the mirrored provider-bundle review execution contract into
 
 ## Safety
 
-- For a strictly closed single-select envelope (e.g. `gentle-ai.review-integration.consent/v3`), use `ask_user_choice` when the interactive TUI offers it, passing each label/description with the envelope-owned answer token as `value`, then run the exact provider-owned invocation for the selected answer; otherwise emit the complete envelope as plain chat and stop.
+- For closed single-select envelopes (`consent/v3`), use `ask_user_choice` when available (label/description with answer token as `value`) and run the exact invocation; otherwise emit the full envelope as plain chat and stop.
 - Never commit unless the user explicitly asks.
 - Ask before destructive git operations, publishing, or irreversible file changes.
 - Keep writes single-threaded unless isolated worktrees are explicitly approved.
