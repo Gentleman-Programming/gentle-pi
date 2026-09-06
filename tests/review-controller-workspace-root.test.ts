@@ -6,9 +6,9 @@ import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
-import type { NativeReviewCli } from "../lib/native-review-cli.ts";
+import { NativeReviewIntegrationError, type NativeReviewCli } from "../lib/native-review-cli.ts";
 import { CandidateViewRegistry } from "../lib/review-candidate-view.ts";
-import type { AuthorityRepairAssessmentV1, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
+import { decodeReviewFailureV2, type AuthorityRepairAssessmentV1, type ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 
 interface RegisteredTool {
 	execute: (
@@ -238,6 +238,49 @@ test("INSPECT and STATUS operate on the explicit workspace root while the sessio
 	await controller.execute("status-b", { operation: "status", lineageId: "native-lineage", workspaceRoot: worktree }, undefined, undefined, context(sessionCwd));
 	await controller.execute("inspect-default", { operation: "inspect" }, undefined, undefined, context(sessionCwd));
 	assert.deepEqual(observedCwds, [realpathSync(worktree), realpathSync(worktree), sessionCwd]);
+});
+
+// gentle-pi#599: inspect without an explicit workspaceRoot against a parent
+// repository that wraps an untracked nested Git repository fails at the
+// native preflight with a decoded, actionable `invalid_request` envelope. The
+// facade used to discard that envelope's cause, code, retry_safe, and
+// next_action in favor of a generic `native-status-unavailable` outcome
+// indistinguishable from authority corruption. It must preserve the native
+// envelope instead.
+test("inspect without workspaceRoot preserves the native invalid_request cause for a nested foreign Git repository", async (t) => {
+	const sessionCwd = repository(t);
+	const { controller } = runtime(fakeNative({
+		targetStatus: async () => {
+			throw new NativeReviewIntegrationError(decodeReviewFailureV2({
+				schema: "gentle-ai.review-integration.failure/v2",
+				contract: "gentle-ai.review-integration/v2",
+				operation: "review.status",
+				phase: "preflight",
+				code: "invalid_request",
+				message: "The negotiated review request is invalid.",
+				mutation_outcome: "not_started",
+				authority_applicability: "not_evaluated",
+				retry_safe: true,
+				replayability: "not_replayable",
+				required_inputs: [],
+				next_action: "correct_request",
+				cause: "untracked directory \"engram\" holds another Git repository that is not a linked worktree of this one, so it cannot enter the review candidate: add it to .gitignore, move it outside this repository, or register it as a linked worktree",
+			}));
+		},
+	}));
+	const result = await controller.execute("inspect-nested-foreign-repo", { operation: "inspect" }, undefined, undefined, context(sessionCwd));
+	const details = result.details as {
+		status?: string;
+		outcome?: string;
+		next_action?: string;
+		native_failure?: { code?: string; cause?: string; retry_safe?: boolean };
+	};
+	assert.equal(details.status, "blocked");
+	assert.equal(details.outcome, "native-status-unavailable");
+	assert.equal(details.native_failure?.code, "invalid_request");
+	assert.equal(details.native_failure?.retry_safe, true);
+	assert.match(details.native_failure?.cause ?? "", /engram/);
+	assert.equal(details.next_action, "correct_request");
 });
 
 test("START freezes the candidate from the explicit workspace root and returns the actor binding envelope", async (t) => {

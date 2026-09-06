@@ -490,6 +490,51 @@ test("candidate registry isolates replay, projection, current, and cleanup state
 	registry.cleanupTerminal("same-lineage", "approved", rootA);
 });
 
+// ga#4085 / ga#4050: after a valid `granted` consent, a retried native START
+// for a lineage this controller already bound (native reports it "resumed")
+// re-materializes a fresh, content-identical candidate view under a new
+// token -- for example after a transport hiccup between START and the
+// follow-up STATUS call. Rebinding that duplicate to the same lineage used to
+// fail closed with "candidate view lineage binding is missing or ambiguous"
+// even though nothing was actually ambiguous. It must reuse the already-bound
+// view instead of failing the retry.
+test("candidate registry rebinds a retried native START for an already-bound lineage instead of failing closed", (t) => {
+	const contributorRoot = repository(t);
+	writeFileSync(join(contributorRoot, "tracked.txt"), "candidate\n");
+	const registry = new CandidateViewRegistry();
+	t.after(() => registry.cleanupAll());
+	const first = registry.create({ contributorRoot });
+	registry.bindCurrent({ token: first.token, lineageId: "retry-lineage", selectedLenses: ["review-risk"] });
+	assert.equal(registry.hasCurrentBinding(contributorRoot), true);
+
+	const retry = registry.create({ contributorRoot });
+	assert.notEqual(retry.token, first.token, "the retry must materialize a distinct physical worktree/token");
+	assert.doesNotThrow(() => registry.bindCurrent({ token: retry.token, lineageId: "retry-lineage", selectedLenses: ["review-risk"] }));
+
+	// The already-bound view stays current; the redundant duplicate is discarded.
+	assert.equal(registry.resolveForLens("retry-lineage", "review-risk", contributorRoot).root, first.root);
+	assert.equal(registry.resolveCurrentForLens("review-risk", contributorRoot).root, first.root);
+	assert.equal(existsSync(retry.root), false, "the redundant duplicate candidate view must be cleaned up");
+	registry.cleanupTerminal("retry-lineage", "approved", contributorRoot);
+});
+
+test("candidate registry still fails closed rebinding the same lineage to genuinely different content", (t) => {
+	const contributorRoot = repository(t);
+	const registry = new CandidateViewRegistry();
+	t.after(() => registry.cleanupAll());
+	const first = registry.create({ contributorRoot });
+	registry.bindCurrent({ token: first.token, lineageId: "conflict-lineage", selectedLenses: ["review-risk"] });
+	writeFileSync(join(contributorRoot, "tracked.txt"), "different content\n");
+	const conflicting = registry.create({ contributorRoot });
+	assert.notEqual(conflicting.candidateTree, first.candidateTree);
+	assert.throws(
+		() => registry.bindCurrent({ token: conflicting.token, lineageId: "conflict-lineage", selectedLenses: ["review-risk"] }),
+		CandidateViewError,
+	);
+	registry.cleanup(conflicting.token);
+	registry.cleanupTerminal("conflict-lineage", "approved", contributorRoot);
+});
+
 // gentle-pi#323: `createOrReuse` reuses whatever view a replay key maps to,
 // with no awareness of live candidate content -- a content-independent key
 // reuses a stale view even after the candidate content it was frozen from
