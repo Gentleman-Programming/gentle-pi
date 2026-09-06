@@ -363,12 +363,37 @@ test("general STATUS returns the typed native-status-unsupported boundary withou
 		mutation_performed: false,
 		inventory_complete: false,
 		next_action: "require-upstream-read-only-native-status-inventory",
+		remediation_command: "gentle-ai review status --cwd <repo> --contract gentle-ai.review-integration/v2 --agent pi --next-transition",
 		evidence: {
 			native_contract: "gentle-ai/2.1.4",
 			general_status: "unsupported",
 			claimant_inventory: "unsupported",
 		},
 	});
+});
+
+test("gentle-pi#185: general STATUS on a non-negotiated native CLI names the exact status command to run", async (t) => {
+	// The legacy `correctionForecast` restoration guard this issue originally
+	// reported (extensions/gentle-ai.ts, then around line 5329) was scoped to
+	// `targetStatus !== undefined` and skipped restoring a candidate view when
+	// the native CLI lacked negotiated STATUS support, reproducing the #176
+	// empty-registry failure. That entire manual FINALIZE lifecycle (and the
+	// `correctionForecast` guard with it) has since been replaced by the
+	// STATUS/capture-driven flow: every operation now checks negotiated STATUS
+	// support up front, so no candidate-view restoration is ever attempted on
+	// a non-negotiated CLI. This test proves the current equivalent boundary
+	// (`nativeStatusUnsupported`) fails closed with an actionable envelope
+	// instead of a bare machine token, so a non-negotiated CLI can never
+	// surface as a silent empty-registry failure.
+	const fixture = createRepository(t);
+	const { controller } = registerRuntime();
+	const result = await controllerCall(controller, extensionContext(fixture.repository), { operation: "status" });
+	assert.equal(result.status, "blocked");
+	assert.equal(result.outcome, "native-status-unsupported");
+	assert.equal(
+		result.remediation_command,
+		"gentle-ai review status --cwd <repo> --contract gentle-ai.review-integration/v2 --agent pi --next-transition",
+	);
 });
 
 test("failed START gives exact mode and serialization guidance and creates no lineage", async (t) => {

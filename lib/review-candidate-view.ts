@@ -1322,21 +1322,18 @@ export class CandidateViewRegistry {
 	 * correction.
 	 */
 	rebindForFinalizeFromNative(lineageId: string, contributorRoot: string, descriptor: NativeCandidateProjectionDescriptor): CandidateView {
-		const root = this.canonicalRoot(contributorRoot);
-		const key = this.lineageKey(root, lineageId);
-		const staleToken = this.lineages.get(key);
-		const stale = staleToken === undefined ? undefined : this.records.get(staleToken);
-		this.projections.delete(key);
-		if (stale !== undefined) {
-			this.remove(stale);
-			this.forget(stale);
-		}
-		return this.restoreForFinalizeFromNative(lineageId, root, descriptor);
+		return this.restoreForFinalizeFromNative(lineageId, contributorRoot, descriptor);
 	}
 
+	/**
+	 * Restores a lineage's FINALIZE binding (gentle-pi #185): the stale entry
+	 * is only detached, not destroyed, so a failed restore can undo it.
+	 */
 	restoreForFinalizeFromNative(lineageId: string, contributorRoot: string, descriptor: NativeCandidateProjectionDescriptor): CandidateView {
 		const root = this.canonicalRoot(contributorRoot);
 		const key = this.lineageKey(root, lineageId);
+		const staleToken = this.lineages.get(key), staleProjection = this.projections.get(key);
+		this.lineages.delete(key); this.projections.delete(key);
 		let projectionRestored = false;
 		let record: CandidateViewRecord | undefined;
 		try {
@@ -1354,6 +1351,8 @@ export class CandidateViewRegistry {
 			if (!matchesProjection(record)) throw new CandidateViewError("live candidate does not match the native frozen projection");
 			this.records.set(record.token, record);
 			this.bindRecord(record.token, lineageId, []);
+			const stale = staleToken === undefined ? undefined : this.records.get(staleToken);
+			if (stale !== undefined) { this.remove(stale); this.forget(stale); }
 			return this.expose(record);
 		} catch (error) {
 			if (projectionRestored) this.projections.delete(key);
@@ -1361,6 +1360,8 @@ export class CandidateViewRegistry {
 				this.forget(record);
 				this.remove(record);
 			}
+			if (staleToken !== undefined) this.lineages.set(key, staleToken);
+			if (staleProjection !== undefined) this.projections.set(key, staleProjection);
 			throw error;
 		}
 	}
