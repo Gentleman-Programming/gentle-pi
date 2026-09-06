@@ -67,6 +67,9 @@ test("before_agent_start injects the mirrored review execution contract for the 
 	assert.match(result.systemPrompt, /call `gentle_review` with {"operation":"inspect"}/);
 	assert.match(result.systemPrompt, /call `gentle_review` with operation `status`, the exact retained `lineageId`, and `workspaceRoot`/);
 	assert.match(result.systemPrompt, /Use `gentle_review_capture` for one current returned slot or `gentle_review_capture_group` for the complete current reviewer group/);
+	assert.match(result.systemPrompt, /An eligible interactive Pi host may resolve `gentle-ai\.review-integration\.consent\/v3` before the envelope reaches the model/);
+	assert.match(result.systemPrompt, /If `gentle_review` returns the envelope unresolved, it is still the original provider-owned two-choice contract/);
+	assert.match(result.systemPrompt, /Never add the host action to a decoded or relayed provider envelope/);
 	assert.match(result.systemPrompt, /An approved capture awaits acknowledgement; it is not burned\. On `approved`, use bound facade STATUS to obtain or replay the exact provider-issued `acknowledge-approved` continuation, then execute it unchanged\. Only its successful returned envelope burns authority; do not issue STATUS after that burn\./);
 	let previousLifecycleIndex = result.systemPrompt.indexOf("## Gentle AI review execution contract");
 	for (const marker of [

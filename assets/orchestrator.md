@@ -89,7 +89,7 @@ This package injects the mirrored provider-bundle review execution contract into
 
 ## Safety
 
-- For a strictly closed single-select envelope (e.g. `gentle-ai.review-integration.consent/v3`), use `ask_user_choice` when the interactive TUI offers it, passing each label/description with the envelope-owned answer token as `value`, then run the exact provider-owned invocation for the selected answer; otherwise emit the complete envelope as plain chat and stop.
+- An eligible interactive Pi host may resolve `gentle-ai.review-integration.consent/v3` before the envelope reaches the model. Permission: host-owned. If `gentle_review` returns the envelope unresolved, it is still the original provider-owned two-choice contract. Use `ask_user_choice` exactly or relay losslessly and stop. Never add the host action to a decoded or relayed provider envelope.
 - Never commit unless the user explicitly asks.
 - Ask before destructive git operations, publishing, or irreversible file changes.
 - Keep writes single-threaded unless isolated worktrees are explicitly approved.
