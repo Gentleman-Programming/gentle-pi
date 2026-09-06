@@ -499,7 +499,12 @@ export const NATIVE_REVIEW_AUTHORITY_ENTRY_VERSION = {
 }         ;
 
 
-export const NATIVE_REVIEW_AUTHORITY_ENTRY_STATUS = NATIVE_REVIEW_AUTHORITY_STATUS;
+export const NATIVE_REVIEW_AUTHORITY_ENTRY_STATUS = {
+	...NATIVE_REVIEW_AUTHORITY_STATUS,
+	INCOMPLETE_STORE_ENTRY: "incomplete-store-entry",
+	HISTORICAL_PRE_RECEIPT: "historical-pre-receipt",
+	INVALIDATED: "invalidated",
+}         ;
 
 
 export const NATIVE_REVIEW_LOCK_STATUS = {
@@ -531,6 +536,11 @@ export const NATIVE_REVIEW_RECOVERY_DISPOSITION = {
 	INVALIDATED: "invalidated",
 	ESCALATED: "escalated",
 }         ;
+
+
+
+
+
 
 
 
@@ -1047,8 +1057,15 @@ function decodeNativeReviewRecovery(value         )                       {
 		...(recovery.maintainer_authorization === undefined ? {} : { maintainerAuthorization: requiredString(recovery.maintainer_authorization) }),
 	};
 }
+function decodeNativeReviewDiscardedWorkSummary(value         )                                   {
+	const discardedWork = exactObject(value, ["captured_lens_results", "findings_present"]);
+	return {
+		capturedLensResults: stringArray(discardedWork.captured_lens_results),
+		findingsPresent: booleanValue(discardedWork.findings_present),
+	};
+}
 function decodeNativeReviewStatusEntry(value         )                             {
-	const entry = exactObject(value, ["version", "path", "status", "problems"], ["lineage_id", "state", "revision", "snapshot_identity", "chain_identity", "recovery"]);
+	const entry = exactObject(value, ["version", "path", "status", "problems"], ["lineage_id", "state", "revision", "snapshot_identity", "chain_identity", "recovery", "discarded_work"]);
 	return {
 		version: enumString(entry.version, Object.values(NATIVE_REVIEW_AUTHORITY_ENTRY_VERSION))                                     ,
 		...(entry.lineage_id === undefined ? {} : { lineageId: requiredString(entry.lineage_id) }),
@@ -1059,6 +1076,7 @@ function decodeNativeReviewStatusEntry(value         )                          
 		...(entry.snapshot_identity === undefined ? {} : { snapshotIdentity: sha256Identity(entry.snapshot_identity) }),
 		...(entry.chain_identity === undefined ? {} : { chainIdentity: requiredString(entry.chain_identity) }),
 		...(entry.recovery === undefined ? {} : { recovery: decodeNativeReviewRecovery(entry.recovery) }),
+		...(entry.discarded_work === undefined ? {} : { discardedWork: decodeNativeReviewDiscardedWorkSummary(entry.discarded_work) }),
 		problems: stringArray(entry.problems),
 	};
 }
