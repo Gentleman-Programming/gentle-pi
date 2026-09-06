@@ -498,8 +498,13 @@ export const NATIVE_REVIEW_AUTHORITY_ENTRY_VERSION = {
 } as const;
 export type NativeReviewAuthorityEntryVersion = (typeof NATIVE_REVIEW_AUTHORITY_ENTRY_VERSION)[keyof typeof NATIVE_REVIEW_AUTHORITY_ENTRY_VERSION];
 
-export const NATIVE_REVIEW_AUTHORITY_ENTRY_STATUS = NATIVE_REVIEW_AUTHORITY_STATUS;
-export type NativeReviewAuthorityEntryStatus = NativeReviewAuthorityStatus;
+export const NATIVE_REVIEW_AUTHORITY_ENTRY_STATUS = {
+	...NATIVE_REVIEW_AUTHORITY_STATUS,
+	INCOMPLETE_STORE_ENTRY: "incomplete-store-entry",
+	HISTORICAL_PRE_RECEIPT: "historical-pre-receipt",
+	INVALIDATED: "invalidated",
+} as const;
+export type NativeReviewAuthorityEntryStatus = (typeof NATIVE_REVIEW_AUTHORITY_ENTRY_STATUS)[keyof typeof NATIVE_REVIEW_AUTHORITY_ENTRY_STATUS];
 
 export const NATIVE_REVIEW_LOCK_STATUS = {
 	OWNED: "owned",
@@ -541,6 +546,10 @@ export interface NativeReviewRecovery {
 	recoveredAt: string;
 	maintainerAuthorization?: string;
 }
+export interface NativeReviewDiscardedWorkSummary {
+	capturedLensResults: readonly string[];
+	findingsPresent: boolean;
+}
 export interface NativeReviewAuthorityEntry {
 	version: NativeReviewAuthorityEntryVersion;
 	lineageId?: string;
@@ -551,6 +560,7 @@ export interface NativeReviewAuthorityEntry {
 	snapshotIdentity?: string;
 	chainIdentity?: string;
 	recovery?: NativeReviewRecovery;
+	discardedWork?: NativeReviewDiscardedWorkSummary;
 	problems: readonly string[];
 }
 export interface NativeReviewAuthorityLock {
@@ -1046,8 +1056,15 @@ function decodeNativeReviewRecovery(value: unknown): NativeReviewRecovery {
 		...(recovery.maintainer_authorization === undefined ? {} : { maintainerAuthorization: requiredString(recovery.maintainer_authorization) }),
 	};
 }
+function decodeNativeReviewDiscardedWorkSummary(value: unknown): NativeReviewDiscardedWorkSummary {
+	const discardedWork = exactObject(value, ["captured_lens_results", "findings_present"]);
+	return {
+		capturedLensResults: stringArray(discardedWork.captured_lens_results),
+		findingsPresent: booleanValue(discardedWork.findings_present),
+	};
+}
 function decodeNativeReviewStatusEntry(value: unknown): NativeReviewAuthorityEntry {
-	const entry = exactObject(value, ["version", "path", "status", "problems"], ["lineage_id", "state", "revision", "snapshot_identity", "chain_identity", "recovery"]);
+	const entry = exactObject(value, ["version", "path", "status", "problems"], ["lineage_id", "state", "revision", "snapshot_identity", "chain_identity", "recovery", "discarded_work"]);
 	return {
 		version: enumString(entry.version, Object.values(NATIVE_REVIEW_AUTHORITY_ENTRY_VERSION)) as NativeReviewAuthorityEntryVersion,
 		...(entry.lineage_id === undefined ? {} : { lineageId: requiredString(entry.lineage_id) }),
@@ -1058,6 +1075,7 @@ function decodeNativeReviewStatusEntry(value: unknown): NativeReviewAuthorityEnt
 		...(entry.snapshot_identity === undefined ? {} : { snapshotIdentity: sha256Identity(entry.snapshot_identity) }),
 		...(entry.chain_identity === undefined ? {} : { chainIdentity: requiredString(entry.chain_identity) }),
 		...(entry.recovery === undefined ? {} : { recovery: decodeNativeReviewRecovery(entry.recovery) }),
+		...(entry.discarded_work === undefined ? {} : { discardedWork: decodeNativeReviewDiscardedWorkSummary(entry.discarded_work) }),
 		problems: stringArray(entry.problems),
 	};
 }
