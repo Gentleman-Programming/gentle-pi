@@ -15,8 +15,8 @@ export interface StoredTask {
 const FILE_SUFFIX = ".json";
 const SAFE_ID = /^[a-z0-9-]+$/i;
 
-export function historyDir(home: string): string {
-	return join(home, ".pi", "agent", "gentle-agents", "tasks");
+export function historyDir(home: string, agentHome = join(home, ".pi", "agent")): string {
+	return join(agentHome, "gentle-agents", "tasks");
 }
 
 function fileFor(dir: string, id: string): string {
