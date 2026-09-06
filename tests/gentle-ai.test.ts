@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { gzipSync } from "node:zlib";
-import { initTheme, keyHint } from "@earendil-works/pi-coding-agent";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -177,7 +177,6 @@ test("registered Gentle Review tools preserve result envelopes and redact collap
 	assert.deepEqual(result.details, visibleEnvelope);
 
 	const resultText = "safe result\x1b[31m\nlineage=secret body=private";
-	const expandHint = keyHint("app.tools.expand", "to expand");
 	for (const name of ["gentle_review", "gentle_review_scope", "gentle_review_capture"]) {
 		const tool = tools.get(name);
 		assert.equal(typeof tool?.renderResult, "function", `${name} must define result rendering`);
@@ -187,8 +186,9 @@ test("registered Gentle Review tools preserve result envelopes and redact collap
 			{ expanded: false, isPartial: false, isError: true },
 		]) {
 			const collapsed = renderComponent(tool.renderResult({ content: [{ type: "text", text: resultText }] }, options, lifecycleTheme, {}));
-			assert.match(cardBody(collapsed), /\d+ lines?\b/, `${name} collapsed output must contain one expand hint`);
-			assert.match(cardBody(collapsed), /\d+ lines?\b/, `${name} collapsed output must start with the hint`);
+			const collapsedBody = cardBody(collapsed);
+			assert.equal((collapsedBody.match(/\d+ lines?\b/g) ?? []).length, 1, `${name} collapsed output must contain one expand hint`);
+			assert.match(collapsedBody, /^<dim>\d+ lines?\b<\/dim>/, `${name} collapsed output must start with the hint`);
 			assert.doesNotMatch(collapsed, /safe result|lineage=secret|private/);
 		}
 		const expanded = renderComponent(tool.renderResult({ content: [{ type: "text", text: resultText }] }, { expanded: true, isPartial: false, isError: true }, lifecycleTheme, {}));
