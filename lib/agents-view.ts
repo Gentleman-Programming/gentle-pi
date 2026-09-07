@@ -83,6 +83,9 @@ const SCOPE_LABEL: Record<ViewScope, string> = { [VIEW_SCOPE.SESSION]: "this ses
 const SCOPE_KEY: Record<ViewScope, string> = { [VIEW_SCOPE.SESSION]: "all sessions", [VIEW_SCOPE.ALL]: "this session" };
 const EMPTY_LIST = "no tasks yet";
 const EMPTY_THREAD = "waiting for the first event";
+const FOLLOW_BUTTON = "[ Follow ]";
+const OPEN_BUTTON = "[ Open session ]";
+const FOOTER_BUTTONS_WIDTH = FOLLOW_BUTTON.length + 1 + OPEN_BUTTON.length;
 const KEYS = [
 	["j/k", "task"],
 	["ctrl+j/k", "scroll"],
@@ -96,6 +99,11 @@ const EMPTY_COMPONENT: Component = {
 	invalidate() {},
 };
 
+interface PointerButtonLayout {
+	x: number;
+	width: number;
+}
+
 interface PointerLayout {
 	width: number;
 	height: number;
@@ -104,6 +112,9 @@ interface PointerLayout {
 	threadX: number;
 	threadWidth: number;
 	bodyRows: number;
+	footerY: number;
+	followButton?: PointerButtonLayout;
+	openButton?: PointerButtonLayout;
 }
 
 function rule(length: number): string {
@@ -176,6 +187,9 @@ export class AgentsView {
 	private readonly taskRegions = new Map<number, NativePointerRegion>();
 	private readonly listRegion: NativePointerRegion;
 	private readonly threadRegion: NativePointerRegion;
+	private readonly followRegion: NativePointerRegion;
+	private readonly openRegion: NativePointerRegion;
+	private hoveredControl: "follow" | "open" | undefined;
 	private pointerLayout: PointerLayout | undefined;
 	private unsubscribeTask: (() => void) | undefined;
 	private readonly unsubscribeSummary: () => void;
@@ -191,9 +205,19 @@ export class AgentsView {
 		this.threadRegion = this.pointerScope.wrap(EMPTY_COMPONENT, {
 			onWheel: (event) => this.wheelThread(event),
 		});
+		this.followRegion = this.pointerScope.wrap(EMPTY_COMPONENT, {
+			onHover: () => this.hoverControl("follow"),
+			onLeave: () => this.clearHoveredControl("follow"),
+			onClick: (event) => this.clickFollow(event),
+		});
+		this.openRegion = this.pointerScope.wrap(EMPTY_COMPONENT, {
+			onHover: () => this.hoverControl("open"),
+			onLeave: () => this.clearHoveredControl("open"),
+			onClick: (event) => this.clickOpen(event),
+		});
 		this.refreshTasks();
 		this.unsubscribeSummary = deps.store.subscribeSummary(() => {
-			this.pointerScope.invalidate();
+			this.clearFooterLayout();
 			this.refreshTasks();
 			this.deps.requestRender();
 		});
@@ -230,12 +254,12 @@ export class AgentsView {
 			this.deps.requestRender();
 		} else if (data === "a" && this.deps.sessionId !== undefined) this.toggleScope();
 		else if ((data === "s" || data === "c") && task && this.canCancel(task)) this.deps.onCancel(task);
-		else if ((data === "o" || matchesKey(data, Key.enter)) && task) this.deps.onOpen(task);
+		else if ((data === "o" || matchesKey(data, Key.enter)) && this.canOpen(task)) this.deps.onOpen(task!);
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		const layout = this.pointerLayout;
-		if (!layout || event.x < 0 || event.y < 0 || event.x >= layout.width || event.y >= layout.height) return undefined;
+		if (!layout || event.width !== layout.width || event.height !== layout.height || event.x < 0 || event.y < 0 || event.x >= layout.width || event.y >= layout.height) return undefined;
 		if (event.y >= 1 && event.y < 1 + layout.bodyRows) {
 			const row = event.y - 1;
 			if (event.x >= layout.listX && event.x < layout.listX + layout.listWidth) {
@@ -247,6 +271,10 @@ export class AgentsView {
 				return this.threadRegion.handleMouse(event);
 			}
 		}
+		if (event.y === layout.footerY) {
+			if (this.isInButton(event.x, layout.followButton)) return this.followRegion.handleMouse(event);
+			if (this.isInButton(event.x, layout.openButton)) return this.openRegion.handleMouse(event);
+		}
 		return undefined;
 	}
 
@@ -255,13 +283,15 @@ export class AgentsView {
 		// the list is otherwise reordered only when a status changes.
 		const now = this.deps.now();
 		if (this.tasks.some((task) => !this.inScope(task, now))) this.refreshTasks();
+		if (this.pointerLayout && this.pointerLayout.width !== width) this.clearFooterLayout();
 		const theme = this.deps.theme;
 		const inner = width - 2;
 		const listWidth = Math.min(LIST_MAX_WIDTH, Math.floor(inner * LIST_RATIO));
 		const threadWidth = inner - listWidth - 4;
 		const rows = this.bodyRows();
+		const footerY = rows + 1;
 		this.followSelection(rows);
-		this.pointerLayout = { width, height: rows + CHROME_ROWS, listX: 2, listWidth, threadX: listWidth + 5, threadWidth, bodyRows: rows };
+		this.pointerLayout = { width, height: rows + CHROME_ROWS, listX: 2, listWidth, threadX: listWidth + 5, threadWidth, bodyRows: rows, footerY };
 		this.listRegion.render(listWidth);
 		this.threadRegion.render(threadWidth);
 		const scope = this.deps.sessionId === undefined ? "" : `${SCOPE_LABEL[this.scope]} · `;
@@ -273,12 +303,13 @@ export class AgentsView {
 			body.push(`${theme.fg(ROLE.FRAME, "│")} ${fit(this.taskLine(row), listWidth)} ${theme.fg(ROLE.FRAME, "│")} ${fit(right[row] ?? "", threadWidth)}${theme.fg(ROLE.FRAME, "│")}`);
 		}
 		const keys = this.keys().map(([key, label]) => `${theme.fg(ROLE.KEY, key)} ${theme.fg(ROLE.KEY_TEXT, label)}`).join("   ");
-		const keysLine = `${theme.fg(ROLE.FRAME, "│")} ${fit(keys, inner - 2)} ${theme.fg(ROLE.FRAME, "│")}`;
+		const footer = this.footer(keys, inner - 2);
+		const keysLine = `${theme.fg(ROLE.FRAME, "│")} ${fit(footer, inner - 2)} ${theme.fg(ROLE.FRAME, "│")}`;
 		return [top, ...body, keysLine, theme.fg(ROLE.FRAME, `╰${rule(inner)}╯`)];
 	}
 
 	invalidate(): void {
-		this.pointerScope.invalidate();
+		this.clearFooterLayout();
 	}
 
 	private counts(): string {
@@ -290,6 +321,10 @@ export class AgentsView {
 		return !isFinished(task.status) && (this.deps.canCancel?.(task) ?? true);
 	}
 
+	private canOpen(task: TaskRecord | undefined): boolean {
+		return Boolean(task?.sessionPath);
+	}
+
 	private keys(): ReadonlyArray<readonly [string, string]> {
 		const task = this.selectedTask();
 		const stop = task && this.canCancel(task) ? [["s", "Stop selected"]] as const : [];
@@ -299,6 +334,7 @@ export class AgentsView {
 
 	// A new scope reads from the top: selection, list window, and thread reset.
 	private toggleScope(): void {
+		this.clearFooterLayout();
 		this.scope = this.scope === VIEW_SCOPE.SESSION ? VIEW_SCOPE.ALL : VIEW_SCOPE.SESSION;
 		this.tasks = [];
 		this.selected = 0;
@@ -345,7 +381,8 @@ export class AgentsView {
 		this.unsubscribeTask?.();
 		const task = this.selectedTask();
 		this.unsubscribeTask = task ? this.deps.store.subscribe(task.id, () => {
-			this.pointerScope.invalidate();
+			this.clearFooterLayout();
+			this.refreshTasks();
 			this.deps.requestRender();
 		}) : undefined;
 	}
@@ -414,6 +451,60 @@ export class AgentsView {
 		this.follow = false;
 		this.scroll = Math.max(0, this.scroll + delta);
 		this.deps.requestRender();
+	}
+
+	private clearFooterLayout(): void {
+		this.pointerLayout = undefined;
+		this.hoveredControl = undefined;
+		this.pointerScope.invalidate();
+	}
+
+	private footer(keys: string, width: number): string {
+		const showButtons = visibleWidth(keys) + FOOTER_BUTTONS_WIDTH + 1 <= width;
+		const task = this.selectedTask();
+		this.followRegion.setDisabled(!showButtons || !task);
+		this.openRegion.setDisabled(!showButtons || !this.canOpen(task));
+		if (!showButtons) return keys;
+		this.followRegion.render(FOLLOW_BUTTON.length);
+		this.openRegion.render(OPEN_BUTTON.length);
+		const buttonX = 2 + width - FOOTER_BUTTONS_WIDTH;
+		if (this.pointerLayout) {
+			this.pointerLayout.followButton = { x: buttonX, width: FOLLOW_BUTTON.length };
+			this.pointerLayout.openButton = { x: buttonX + FOLLOW_BUTTON.length + 1, width: OPEN_BUTTON.length };
+		}
+		const followRole = task && this.hoveredControl === "follow" ? "warning" : task ? ROLE.KEY : ROLE.META;
+		const openRole = this.canOpen(task) && this.hoveredControl === "open" ? "warning" : this.canOpen(task) ? ROLE.KEY : ROLE.META;
+		return `${fit(keys, width - FOOTER_BUTTONS_WIDTH - 1)} ${this.deps.theme.fg(followRole, FOLLOW_BUTTON)} ${this.deps.theme.fg(openRole, OPEN_BUTTON)}`;
+	}
+
+	private isInButton(x: number, button: PointerButtonLayout | undefined): boolean {
+		return button !== undefined && x >= button.x && x < button.x + button.width;
+	}
+
+	private hoverControl(control: "follow" | "open"): TuiMouseEventResult {
+		if (this.hoveredControl === control) return { handled: true };
+		this.hoveredControl = control;
+		return { handled: true, render: true };
+	}
+
+	private clearHoveredControl(control: "follow" | "open"): void {
+		if (this.hoveredControl !== control) return;
+		this.hoveredControl = undefined;
+		this.deps.requestRender();
+	}
+
+	private clickFollow(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (event.button !== "left" || !this.selectedTask()) return undefined;
+		this.follow = true;
+		return { handled: true, render: true };
+	}
+
+	private clickOpen(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (event.button !== "left") return undefined;
+		const task = this.selectedTask();
+		if (!this.canOpen(task)) return undefined;
+		this.deps.onOpen(task!);
+		return { handled: true, render: true };
 	}
 
 	private taskRegion(row: number): NativePointerRegion {
