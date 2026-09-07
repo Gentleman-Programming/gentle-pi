@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join, posix, win32 } from "node:path";
 import { promisify } from "node:util";
 import { PackageLocalGentleAiBinaryMissingError, resolveGentleAiBinary } from "./gentle-ai-binary.ts";
 import { GENTLE_PI_REVIEW_RELAY_CONTRACT, GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV } from "./review-relay-contract.ts";
+import { decodeReviewAssessmentV1, type ReviewAssessmentV1 } from "./review-risk-assessment.ts";
 import {
 	REVIEW_INTEGRATION_CONTRACT,
 	decodeReviewAcknowledgedV1,
@@ -59,6 +60,7 @@ export const NATIVE_REVIEW_OPERATION = {
 	RECONCILE_AUTHORITY: "review/reconcile-authority",
 	REPAIR_LEGACY_ALIAS: "review/repair-legacy-alias",
 	MODE: "review/mode",
+	ASSESS: "review/assess",
 	REPAIR: "review/repair",
 	CAPTURE_RESULT: "review/capture-result",
 	CAPTURE_CORRECTION_PLAN: "review/capture-correction-plan",
@@ -109,6 +111,11 @@ export interface NativeReviewCli {
 	// outside the negotiated review-integration protocol — same shape as
 	// reviewStatus/reclaim above.
 	reviewMode?(request: NativeReviewModeRequest): Promise<NativeReviewModeResult>;
+	// Read-only risk assessment (gentle-ai#4295, landing in parallel with
+	// gentle-pi#662). Same plain-versioned shape as reviewMode/reviewStatus:
+	// an older binary without the verb, or any other process/decode failure,
+	// rejects the returned promise -- callers fail closed to `high` risk.
+	assess?(request: NativeReviewAssessRequest): Promise<ReviewAssessmentV1>;
 }
 
 export const NATIVE_REVIEW_MODE_OPERATION = {
@@ -148,6 +155,17 @@ export type NativeReviewModeScope = (typeof NATIVE_REVIEW_MODE_SCOPE)[keyof type
 export interface NativeReviewModeRequest {
 	cwd: string;
 	operation: NativeReviewModeOperation;
+	signal?: AbortSignal;
+}
+
+// Read-only risk assessment request (gentle-pi#662). `baseRef` requires
+// explicit `committedOnly` acknowledgement, exactly like Native START's
+// baseRef/committedOnly pairing, because both select a committed range
+// instead of the ambient working tree.
+export interface NativeReviewAssessRequest {
+	cwd: string;
+	baseRef?: string;
+	committedOnly?: boolean;
 	signal?: AbortSignal;
 }
 
@@ -261,7 +279,6 @@ export interface NativeReviewAbandonRequest {
 	snapshotIdentity: string;
 	capturedLensResults: readonly string[];
 	findingsPresent: boolean;
-	evidenceRecordsPresent: boolean;
 	actor: string;
 	reason: string;
 	maintainerAuthorization: string;
@@ -498,8 +515,13 @@ export const NATIVE_REVIEW_AUTHORITY_ENTRY_VERSION = {
 } as const;
 export type NativeReviewAuthorityEntryVersion = (typeof NATIVE_REVIEW_AUTHORITY_ENTRY_VERSION)[keyof typeof NATIVE_REVIEW_AUTHORITY_ENTRY_VERSION];
 
-export const NATIVE_REVIEW_AUTHORITY_ENTRY_STATUS = NATIVE_REVIEW_AUTHORITY_STATUS;
-export type NativeReviewAuthorityEntryStatus = NativeReviewAuthorityStatus;
+export const NATIVE_REVIEW_AUTHORITY_ENTRY_STATUS = {
+	...NATIVE_REVIEW_AUTHORITY_STATUS,
+	INCOMPLETE_STORE_ENTRY: "incomplete-store-entry",
+	HISTORICAL_PRE_RECEIPT: "historical-pre-receipt",
+	INVALIDATED: "invalidated",
+} as const;
+export type NativeReviewAuthorityEntryStatus = (typeof NATIVE_REVIEW_AUTHORITY_ENTRY_STATUS)[keyof typeof NATIVE_REVIEW_AUTHORITY_ENTRY_STATUS];
 
 export const NATIVE_REVIEW_LOCK_STATUS = {
 	OWNED: "owned",
@@ -541,6 +563,10 @@ export interface NativeReviewRecovery {
 	recoveredAt: string;
 	maintainerAuthorization?: string;
 }
+export interface NativeReviewDiscardedWorkSummary {
+	capturedLensResults: readonly string[];
+	findingsPresent: boolean;
+}
 export interface NativeReviewAuthorityEntry {
 	version: NativeReviewAuthorityEntryVersion;
 	lineageId?: string;
@@ -551,6 +577,7 @@ export interface NativeReviewAuthorityEntry {
 	snapshotIdentity?: string;
 	chainIdentity?: string;
 	recovery?: NativeReviewRecovery;
+	discardedWork?: NativeReviewDiscardedWorkSummary;
 	problems: readonly string[];
 }
 export interface NativeReviewAuthorityLock {
@@ -1046,8 +1073,15 @@ function decodeNativeReviewRecovery(value: unknown): NativeReviewRecovery {
 		...(recovery.maintainer_authorization === undefined ? {} : { maintainerAuthorization: requiredString(recovery.maintainer_authorization) }),
 	};
 }
+function decodeNativeReviewDiscardedWorkSummary(value: unknown): NativeReviewDiscardedWorkSummary {
+	const discardedWork = exactObject(value, ["captured_lens_results", "findings_present"]);
+	return {
+		capturedLensResults: stringArray(discardedWork.captured_lens_results),
+		findingsPresent: booleanValue(discardedWork.findings_present),
+	};
+}
 function decodeNativeReviewStatusEntry(value: unknown): NativeReviewAuthorityEntry {
-	const entry = exactObject(value, ["version", "path", "status", "problems"], ["lineage_id", "state", "revision", "snapshot_identity", "chain_identity", "recovery"]);
+	const entry = exactObject(value, ["version", "path", "status", "problems"], ["lineage_id", "state", "revision", "snapshot_identity", "chain_identity", "recovery", "discarded_work"]);
 	return {
 		version: enumString(entry.version, Object.values(NATIVE_REVIEW_AUTHORITY_ENTRY_VERSION)) as NativeReviewAuthorityEntryVersion,
 		...(entry.lineage_id === undefined ? {} : { lineageId: requiredString(entry.lineage_id) }),
@@ -1058,6 +1092,7 @@ function decodeNativeReviewStatusEntry(value: unknown): NativeReviewAuthorityEnt
 		...(entry.snapshot_identity === undefined ? {} : { snapshotIdentity: sha256Identity(entry.snapshot_identity) }),
 		...(entry.chain_identity === undefined ? {} : { chainIdentity: requiredString(entry.chain_identity) }),
 		...(entry.recovery === undefined ? {} : { recovery: decodeNativeReviewRecovery(entry.recovery) }),
+		...(entry.discarded_work === undefined ? {} : { discardedWork: decodeNativeReviewDiscardedWorkSummary(entry.discarded_work) }),
 		problems: stringArray(entry.problems),
 	};
 }
@@ -1372,9 +1407,7 @@ class NativeReviewPlainCli {
 			if (!isCanonicalProcessString(value)) throw new TypeError(`Native ABANDON ${name} must be a non-empty, trimmed, NUL-free string`);
 		}
 		if (!Array.isArray(request.capturedLensResults) || request.capturedLensResults.some((entry) => !isCanonicalProcessString(entry))) throw new TypeError("Native ABANDON capturedLensResults must be an array of non-empty, trimmed, NUL-free strings");
-		for (const [name, value] of [["findingsPresent", request.findingsPresent], ["evidenceRecordsPresent", request.evidenceRecordsPresent]] as const) {
-			if (typeof value !== "boolean") throw new TypeError(`Native ABANDON ${name} must be a boolean`);
-		}
+		if (typeof request.findingsPresent !== "boolean") throw new TypeError("Native ABANDON findingsPresent must be a boolean");
 		if (request.maintainerAuthorization !== nativeReviewAbandonAuthorization(request)) throw new TypeError("Native ABANDON maintainerAuthorization must match the exact lineage, revision, snapshot, reason, discarded-work, and actor binding");
 		const execution = await this.execute(NATIVE_REVIEW_OPERATION.ABANDON, request.cwd, [
 			"review", "abandon", "--cwd", request.cwd,
@@ -1463,7 +1496,11 @@ class NativeReviewPlainCli {
 	}
 }
 
-export function nativeReviewAbandonAuthorization(request: Pick<NativeReviewAbandonRequest, "lineage" | "expectedRevision" | "snapshotIdentity" | "capturedLensResults" | "findingsPresent" | "evidenceRecordsPresent" | "actor" | "reason">): string {
+export function nativeReviewAbandonAuthorization(request: Pick<NativeReviewAbandonRequest, "lineage" | "expectedRevision" | "snapshotIdentity" | "capturedLensResults" | "findingsPresent" | "actor" | "reason">): string {
+	// gentle-ai 0ed9225f removed evidence records from the discarded-work summary,
+	// so the native v2 gate verifies an exact eight-line binding (schema, lineage,
+	// revision, snapshot_identity, reason, captured_lens_results, findings_present,
+	// actor) — there is no evidence_records_present line to derive or relay.
 	return [
 		"gentle-ai.review-abandon-authorization/v2",
 		`lineage=${request.lineage}`,
@@ -1472,7 +1509,6 @@ export function nativeReviewAbandonAuthorization(request: Pick<NativeReviewAband
 		`reason=${request.reason}`,
 		`captured_lens_results=${request.capturedLensResults.join(",")}`,
 		`findings_present=${request.findingsPresent}`,
-		`evidence_records_present=${request.evidenceRecordsPresent}`,
 		`actor=${request.actor.trim()}`,
 	].join("\n");
 }
@@ -1595,14 +1631,20 @@ function splitNativeConsentInvocation(invocation: string): readonly string[] {
 	let quote: "'" | '"' | undefined;
 	let escaping = false;
 	let started = false;
-	for (const character of invocation.trim()) {
+	const source = invocation.trim();
+	for (let index = 0; index < source.length; index += 1) {
+		const character = source[index]!;
 		if (escaping) {
 			current += character;
 			escaping = false;
 			started = true;
 			continue;
 		}
-		if (character === "\\" && quote !== "'") {
+		// Provider invocations are not shell commands. Keep every path backslash
+		// verbatim, including quoted UNC and drive-root paths. Outside quotes,
+		// only a backslash before whitespace joins a space-containing token.
+		const next = source[index + 1];
+		if (character === "\\" && quote === undefined && next !== undefined && /\s/.test(next)) {
 			escaping = true;
 			started = true;
 			continue;
@@ -1693,7 +1735,9 @@ function consentInvocationArguments(request: NativeReviewConsentAnswerRequest): 
 	if (words[0] !== "gentle-ai" || words[1] !== "review" || words[2] !== "start") throw new NativeReviewConsentBindingError("consent-invocation-not-start", "Native consent invocation is not a provider review START");
 	const arguments_ = words.slice(1);
 	if (exactConsentOption(arguments_, "--contract") !== REVIEW_INTEGRATION_CONTRACT) throw new NativeReviewConsentBindingError("consent-invocation-contract-changed", "Native consent invocation contract changed");
-	if (exactConsentOption(arguments_, "--cwd") !== request.cwd) throw new NativeReviewConsentBindingError("consent-invocation-cwd-changed", "Native consent invocation repository binding changed");
+	const providerCwd = exactConsentOption(arguments_, "--cwd");
+	const requestedCwd = normalizeNativeReviewCwd(request.cwd);
+	if (normalizeNativeReviewCwd(providerCwd) !== requestedCwd) throw new NativeReviewConsentBindingError("consent-invocation-cwd-changed", "Native consent invocation repository binding changed");
 	if (exactConsentOption(arguments_, "--target") !== request.consent.targetIdentity) throw new NativeReviewConsentBindingError("consent-invocation-target-changed", "Native consent invocation target binding changed");
 	if (exactConsentOption(arguments_, "--projection") !== request.consent.projection) throw new NativeReviewConsentBindingError("consent-invocation-projection-changed", "Native consent invocation projection binding changed");
 	const lineageId = optionalConsentLineageOption(arguments_);
@@ -2191,6 +2235,26 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 			this.executablePath(NATIVE_REVIEW_OPERATION.MODE, mutating),
 		);
 		return decode(NATIVE_REVIEW_OPERATION.MODE, mutating, () => decodeNativeReviewMode(execution.body, request.operation));
+	}
+
+	// Read-only risk assessment (gentle-ai#4295, gentle-pi#662). Never mutates;
+	// an older binary without the verb, or any other process/decode failure,
+	// rejects -- callers (the `gentle_review` tool's `assess` operation) fail
+	// closed to `high`.
+	async assess(request: NativeReviewAssessRequest): Promise<ReviewAssessmentV1> {
+		if (request.baseRef !== undefined && !isCanonicalProcessString(request.baseRef)) throw new TypeError("Native ASSESS baseRef must be a non-empty, trimmed, NUL-free string");
+		if (request.baseRef !== undefined && request.committedOnly !== true) throw new TypeError("Native ASSESS baseRef requires explicit committedOnly acknowledgement");
+		if (request.baseRef === undefined && request.committedOnly !== undefined) throw new TypeError("Native ASSESS committedOnly requires an explicit baseRef");
+		const cwd = await canonicalNativeReviewCwd(request.cwd);
+		const execution = await this.invoke(
+			NATIVE_REVIEW_OPERATION.ASSESS,
+			cwd,
+			["review", "assess", "--cwd", cwd, ...(request.baseRef === undefined ? [] : ["--base-ref", request.baseRef, "--committed-only"]), "--json"],
+			false,
+			request.signal,
+			this.executablePath(NATIVE_REVIEW_OPERATION.ASSESS, false),
+		);
+		return decode(NATIVE_REVIEW_OPERATION.ASSESS, false, () => decodeReviewAssessmentV1(execution.body));
 	}
 
 	// Recovery commands are version-gated plain CLI operations outside the

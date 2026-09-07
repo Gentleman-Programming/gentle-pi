@@ -1,17 +1,19 @@
-import type { Readable, Writable } from "node:stream";
+import type { Duplex, Readable, Writable } from "node:stream";
 import { formatModelRef, type AgentDefinition, type AgentMode, type ModelRef } from "./agents-config.ts";
+import { ParentStandingReviewPermissionBroker } from "./review-session-standing-permission-ipc.ts";
 import { isFinished, normalizeRpcEvent, TASK_EVENT, TASK_STATUS, taskLabel, type AskRequest, type TaskRecord, type TaskStore } from "./agents-protocol.ts";
 
 // Gentle Agents runner. Every subagent is its own `pi --mode rpc` process:
 // the host never runs subagent work on the TUI thread. It writes JSON
 // commands, reads JSON lines, applies deltas to the store, answers dialogs,
-// and enforces a total timeout plus a stall watchdog per task.
+// and enforces an inactivity watchdog per task.
 
 export interface ChildLike {
 	pid: number | undefined;
 	stdin: Writable;
 	stdout: Readable;
 	stderr: Readable | null | undefined;
+	stdio?: Array<Duplex | null | undefined>;
 	kill(signal?: NodeJS.Signals): boolean;
 	on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
 	on(event: "error", listener: (error: Error) => void): unknown;
@@ -21,6 +23,7 @@ export interface SpawnOptions {
 	cwd: string;
 	env: NodeJS.ProcessEnv;
 	detached?: boolean;
+	stdio?: Array<"pipe" | "ignore" | "inherit">;
 }
 
 export type Spawn = (command: string, args: string[], options: SpawnOptions) => ChildLike;
@@ -45,7 +48,6 @@ export interface RunnerDeps {
 
 export interface RunnerLimits {
 	maxConcurrency: number;
-	timeoutMs: number;
 	stallTimeoutMs: number;
 }
 
@@ -73,6 +75,9 @@ export interface TaskRequest {
 	sessionDir: string;
 	resumeSessionPath: string | undefined;
 	env: NodeJS.ProcessEnv;
+	// This closure stays only in the parent process. Its presence creates an
+	// inherited fd, never an environment boolean or model-visible permission.
+	authorizeParentStandingReviewPermission?: (repositoryIdentity: string) => boolean;
 }
 
 interface ProcessLike {
@@ -88,7 +93,6 @@ interface Pending {
 interface LiveTask {
 	child: ChildLike;
 	pending: Map<string, Pending>;
-	cancelTimeout: () => void;
 	cancelStall: () => void;
 	cancelGrace: () => void;
 	processGroup: number | undefined;
@@ -97,6 +101,7 @@ interface LiveTask {
 	cleanupDeadlineAt: number | undefined;
 	quarantined: boolean;
 	nextId: number;
+	permissionBroker?: ParentStandingReviewPermissionBroker;
 }
 
 const CHILD_MARKER = "GENTLE_PI_AGENTS_CHILD";
@@ -257,23 +262,39 @@ export class AgentRunner {
 	// A child that cannot start (missing pi, bad cwd) fails only its task:
 	// spawn exceptions and process errors settle without uncaught host errors.
 	private launch(id: string, request: TaskRequest): void {
-		const env = { ...request.env, [CHILD_MARKER]: "1" };
 		const detached = this.processControl.platform !== "win32";
+		const hasParentPermissionChannel = request.authorizeParentStandingReviewPermission !== undefined;
+		const env = {
+			...request.env,
+			[CHILD_MARKER]: "1",
+			...(hasParentPermissionChannel ? { GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" } : {}),
+		};
 		let child: ChildLike;
 		try {
-			child = this.deps.spawn(this.deps.pi.command, [...this.deps.pi.args, ...childArguments(request)], { cwd: request.cwd, env, detached });
+			child = this.deps.spawn(this.deps.pi.command, [...this.deps.pi.args, ...childArguments(request)], {
+				cwd: request.cwd,
+				env,
+				detached,
+				...(hasParentPermissionChannel ? { stdio: ["pipe", "pipe", "pipe", "pipe"] } : {}),
+			});
 		} catch (error) {
 			this.store.update(id, { status: TASK_STATUS.RUNNING, startedAt: this.deps.now(), lastStep: "starting" });
 			this.finish(id, TASK_STATUS.FAILED, `could not start pi: ${error instanceof Error ? error.message : String(error)}`);
 			return;
 		}
 		const processGroup = detached && typeof child.pid === "number" && child.pid > 0 ? child.pid : undefined;
-		const live: LiveTask = { child, pending: new Map(), cancelTimeout: () => {}, cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0 };
+		const live: LiveTask = { child, pending: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0 };
 		this.live.set(id, live);
+		const permissionPipe = child.stdio?.[3];
+		if (hasParentPermissionChannel && permissionPipe !== undefined && permissionPipe !== null) {
+			live.permissionBroker = new ParentStandingReviewPermissionBroker(
+				{ readable: permissionPipe, writable: permissionPipe },
+				(repositoryIdentity) => this.live.get(id) === live && !live.terminal && request.authorizeParentStandingReviewPermission?.(repositoryIdentity) === true,
+			);
+		}
 		this.store.update(id, { status: TASK_STATUS.RUNNING, startedAt: this.deps.now(), lastStep: "starting" });
 		child.on("error", (error) => this.childError(id, error));
 		child.stdin.on("error", () => {});
-		live.cancelTimeout = this.deps.schedule(() => this.requestStop(id, TASK_STATUS.TIMED_OUT, `timed out after ${Math.round(this.limits.timeoutMs / 60_000)} min`), this.limits.timeoutMs);
 		this.armStall(id, live);
 		const lines = new JsonLines((value) => this.receive(id, request, value));
 		child.stdout.setEncoding("utf8");
@@ -282,7 +303,7 @@ export class AgentRunner {
 		child.on("exit", (code) => this.exited(id, code));
 		void this.send(id, { type: "get_state" }).then((response) => {
 			const data = response.data as { sessionFile?: string } | undefined;
-			if (data?.sessionFile) this.store.update(id, { sessionPath: data.sessionFile });
+			if (!live.terminal && this.live.get(id) === live && data?.sessionFile) this.store.update(id, { sessionPath: data.sessionFile });
 		});
 		void this.send(id, { type: "prompt", message: promptText(request) }).then((response) => {
 			if (response.success === false) this.requestStop(id, TASK_STATUS.FAILED, String(response.error ?? "prompt rejected"));
@@ -315,8 +336,9 @@ export class AgentRunner {
 
 	private receive(id: string, request: TaskRequest, value: unknown): void {
 		const live = this.live.get(id);
-		if (!live || !value || typeof value !== "object") return;
+		if (!live || live.terminal || !value || typeof value !== "object") return;
 		const raw = value as Record<string, unknown>;
+		this.armStall(id, live);
 		if (raw.type === "response") {
 			const pending = typeof raw.id === "string" ? live.pending.get(raw.id) : undefined;
 			if (pending) {
@@ -325,11 +347,15 @@ export class AgentRunner {
 			}
 			return;
 		}
-		this.armStall(id, live);
 		for (const event of normalizeRpcEvent(raw)) {
 			this.store.apply(id, event, this.deps.now());
 			if (event.type === TASK_EVENT.ASK) void this.answer(id, request, live, event.request, raw);
-			if (event.type === TASK_EVENT.AGENT_SETTLED) this.requestStop(id, TASK_STATUS.COMPLETED, null);
+			if (event.type === TASK_EVENT.AGENT_SETTLED) {
+				const terminal = this.store.get(id);
+				if (terminal?.error) this.requestStop(id, TASK_STATUS.FAILED, terminal.error);
+				else if (terminal?.result) this.requestStop(id, TASK_STATUS.COMPLETED, null);
+				else this.requestStop(id, TASK_STATUS.FAILED, "assistant settled without a final report");
+			}
 		}
 	}
 
@@ -344,6 +370,7 @@ export class AgentRunner {
 				answer = { cancelled: true };
 			}
 		}
+		if (this.live.get(id) !== live || live.terminal) return;
 		this.write(live, { type: "extension_ui_response", id: ask.id, ...answer });
 		const current = this.store.get(id);
 		if (current?.status === TASK_STATUS.WAITING) this.store.update(id, { status: TASK_STATUS.RUNNING, lastStep: answer.cancelled ? "question dismissed" : "answered" });
@@ -372,7 +399,7 @@ export class AgentRunner {
 		if (!live || live.terminal) return;
 		live.terminal = { status, error };
 		live.cleanupDeadlineAt = this.deps.now() + GROUP_CONFIRM_DEADLINE_MS;
-		live.cancelTimeout();
+		live.permissionBroker?.close();
 		live.cancelStall();
 		if (abort) void this.send(id, { type: "abort" });
 		this.signal(live, "SIGTERM");
@@ -417,7 +444,7 @@ export class AgentRunner {
 			this.requestStop(id, TASK_STATUS.FAILED, `pi process error: ${error.message}`);
 			return;
 		}
-		live.cancelTimeout();
+		live.permissionBroker?.close();
 		live.cancelStall();
 		live.cancelGrace();
 		this.live.delete(id);
@@ -429,19 +456,24 @@ export class AgentRunner {
 		if (!live) return;
 		live.childExit = code;
 		if (this.groupExists(live)) {
-			if (!live.terminal) this.requestStop(id, TASK_STATUS.FAILED, `pi exited with code ${code ?? "unknown"}`);
+			if (!live.terminal) this.requestStop(id, TASK_STATUS.FAILED, `pi exited with code ${code ?? "unknown"} before agent_settled`);
 			return;
 		}
 		this.completeExit(id, live);
 	}
 
 	private completeExit(id: string, live: LiveTask): void {
-		live.cancelTimeout();
+		live.permissionBroker?.close();
 		live.cancelStall();
 		live.cancelGrace();
 		this.live.delete(id);
+		// Quarantine already notified completion, but its retained slot is now free.
+		if (live.quarantined) {
+			queueMicrotask(() => this.pump());
+			return;
+		}
 		const terminal = live.terminal;
-		this.finish(id, terminal ? terminal.status : TASK_STATUS.FAILED, terminal ? terminal.error : `pi exited with code ${live.childExit ?? "unknown"}`);
+		this.finish(id, terminal ? terminal.status : TASK_STATUS.FAILED, terminal ? terminal.error : `pi exited with code ${live.childExit ?? "unknown"} before agent_settled`);
 	}
 
 	private finish(id: string, status: TaskRecord["status"], error: string | null): void {

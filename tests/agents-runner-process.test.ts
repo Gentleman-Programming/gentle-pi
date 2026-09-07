@@ -56,7 +56,9 @@ test("POSIX cleanup retains queue slots when a leader exits but its TERM-resisti
 		schedule: (fn, ms) => {
 			if (ms === 500) {
 				const timer = { fn, timer: undefined, cancelled: false };
-				runtimeTimers.push(timer);
+				const index = launches - 1;
+				runtimeTimers[index] = timer;
+				if (descendantPids[index] !== undefined) armRuntimeTimeout(index);
 				return () => {
 					timer.cancelled = true;
 					if (timer.timer) clearTimeout(timer.timer);
@@ -67,7 +69,7 @@ test("POSIX cleanup retains queue slots when a leader exits but its TERM-resisti
 		},
 		pi: { command: process.execPath, args: [fixture] },
 	};
-	const runner = new AgentRunner(store, { maxConcurrency: 1, timeoutMs: 500, stallTimeoutMs: 5_000 }, deps, { askUser: async () => ({ cancelled: true }) });
+	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs: 500 }, deps, { askUser: async () => ({ cancelled: true }) });
 	const first = runner.run(request("first"));
 	const second = runner.run(request("second"));
 	const third = runner.run(request("third"));

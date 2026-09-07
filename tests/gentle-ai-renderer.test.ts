@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { Box, visibleWidth } from "@earendil-works/pi-tui";
 import { renderGentleAiResult, GentleAiCallCard } from "../lib/gentle-ai-renderer.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 
@@ -19,9 +20,24 @@ test("a running call card closes its own frame and a completed one leaves that t
 	card.update("preparing", "review status", plainTheme, "$ gentle-ai review status");
 	assert.match(card.render(60).map(stripAnsi)[2], /^╰─+╯$/);
 	card.update("completed", "review status", plainTheme, undefined, "ctrl+o to expand");
-	const completed = card.render(60).map(stripAnsi);
+	const completed = card.render(80).map(stripAnsi);
 	assert.equal(completed.length, 1);
 	assert.match(completed[0], /ctrl\+o to expand ╮$/);
+	assert.equal(visibleWidth(completed[0]), 80);
+});
+
+test("completed review cards fit Pi's default Box at terminal width 57", () => {
+	for (const operationPath of ["review inspect", "review status", "review capture · reliability", "review acknowledge approved"]) {
+		const card = new GentleAiCallCard();
+		card.update("completed", operationPath, plainTheme, undefined, "ctrl+o to expand");
+		const box = new Box(1, 1);
+		box.addChild(card);
+		const lines = box.render(57).map(stripAnsi);
+		for (const line of lines) assert.equal(visibleWidth(line), 57, `${operationPath}: ${JSON.stringify(line)}`);
+		if (operationPath === "review inspect") {
+			assert.equal(lines[1], " ╭─ 🌹︎ Gentle AI · completed · review inspect ─────────╮ ");
+		}
+	}
 });
 
 test("a partial result draws no bottom rule and a final one draws exactly one", () => {

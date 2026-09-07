@@ -4,6 +4,7 @@ import type { ReviewLastEventClosureBinding, ReviewStatusV3 } from "./review-int
 export interface ReviewLastEventCaptureSelector {
 	readonly baseRef?: string;
 	readonly committedOnly?: true;
+	readonly agent?: "pi";
 }
 
 /**

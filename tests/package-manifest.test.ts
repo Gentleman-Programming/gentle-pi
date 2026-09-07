@@ -80,6 +80,8 @@ interface PackageJson {
 	files?: string[];
 	scripts?: Record<string, string>;
 	dependencies?: Record<string, string>;
+	peerDependencies?: Record<string, string>;
+	devDependencies?: Record<string, string>;
 	bundledDependencies?: string[];
 	bundleDependencies?: string[];
 	repository?: {
@@ -98,6 +100,15 @@ function readPackageJson(): PackageJson {
 		throw new Error("package.json must contain valid JSON", { cause: error });
 	}
 }
+
+test("package declares the tested Pi minimum required for agent_settled", () => {
+	const manifest = readPackageJson();
+	assert.equal(manifest.peerDependencies?.["@earendil-works/pi-coding-agent"], ">=0.85.1");
+	assert.equal(manifest.devDependencies?.["@earendil-works/pi-coding-agent"], "0.85.1");
+	const readme = readFileSync(join(PACKAGE_ROOT, "README.md"), "utf8");
+	assert.match(readme, /Pi 0\.85\.1 or newer/);
+	assert.match(readme, /agent_settled/);
+});
 
 test("package manifest has no obsolete native activation build surface", () => {
 	const packageJson = readPackageJson();

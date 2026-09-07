@@ -51,7 +51,10 @@ test("normalizeRpcEvent maps pi RPC events to task deltas and ignores the rest",
 	assert.deepEqual(normalizeRpcEvent({ type: "tool_execution_update", toolCallId: "c1", toolName: "bash", partialResult: { content: [{ type: "text", text: "a\nb" }] } }), [{ type: TASK_EVENT.TOOL_UPDATE, callId: "c1", output: "a\nb" }]);
 	assert.deepEqual(normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "c1", toolName: "bash", isError: true, result: { content: [{ type: "text", text: "boom" }] } }), [{ type: TASK_EVENT.TOOL_END, callId: "c1", output: "boom", isError: true }]);
 	assert.deepEqual(normalizeRpcEvent({ type: "turn_end" }), [{ type: TASK_EVENT.TURN_END }]);
-	assert.deepEqual(normalizeRpcEvent({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done." }] }] }), [{ type: TASK_EVENT.AGENT_END, text: "done." }]);
+	assert.deepEqual(normalizeRpcEvent({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done." }], stopReason: "stop" }] }), [{ type: TASK_EVENT.AGENT_END, text: "done.", outcome: "success" }]);
+	assert.deepEqual(normalizeRpcEvent({ type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "WebSocket error with untrusted provider payload" }] }), [{ type: TASK_EVENT.AGENT_END, text: "", outcome: "error", diagnostic: "assistant reported an error" }]);
+	assert.deepEqual(normalizeRpcEvent({ type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "aborted" }] }), [{ type: TASK_EVENT.AGENT_END, text: "", outcome: "aborted", diagnostic: "assistant aborted" }]);
+	assert.deepEqual(normalizeRpcEvent({ type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "stop" }] }), [{ type: TASK_EVENT.AGENT_END, text: "", outcome: "empty", diagnostic: "assistant returned no final report" }]);
 	assert.deepEqual(normalizeRpcEvent({ type: "agent_settled" }), [{ type: TASK_EVENT.AGENT_SETTLED }]);
 	assert.deepEqual(normalizeRpcEvent({ type: "message_update", assistantMessageEvent: { type: "error", reason: "error", error: { message: "rate limited" } } }), [{ type: TASK_EVENT.ERROR, message: "rate limited" }]);
 	assert.deepEqual(normalizeRpcEvent({ type: "extension_ui_request", id: "u1", method: "confirm", title: "Delete?" }), [{ type: TASK_EVENT.ASK, request: { id: "u1", method: "confirm", title: "Delete?" } }]);
@@ -144,7 +147,7 @@ test("TaskStore.apply moves the task to waiting on ask, back to running on any l
 	store.apply("a", { type: TASK_EVENT.USAGE, tokens: 50, cost: 0.25 }, 4);
 	assert.equal(store.get("a")?.tokens, 150);
 	assert.equal(store.get("a")?.cost, 0.75);
-	store.apply("a", { type: TASK_EVENT.AGENT_END, text: "final answer" }, 5);
+	store.apply("a", { type: TASK_EVENT.AGENT_END, text: "final answer", outcome: "success" }, 5);
 	assert.equal(store.get("a")?.result, "final answer");
 	assert.equal(store.get("a")?.status, TASK_STATUS.RUNNING, "agent_end alone does not finish: the runner decides");
 });
