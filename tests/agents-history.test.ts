@@ -16,7 +16,9 @@ function task(id: string, createdAt: number): TaskRecord {
 	return { id, agent: "explore", mode: "task", prompt: "p", label: "p", cwd: "/r", parentSessionId: "s", status: TASK_STATUS.COMPLETED, createdAt, startedAt: createdAt, endedAt: createdAt + 5, model: "m", thinking: undefined, sessionPath: null, error: null, result: "ok", lastStep: "done", lastActivityAt: createdAt, turns: 1, toolCalls: 0, tokens: 10, cost: 0.01 };
 }
 
-test("historyDir lives under the pi agent home", () => {
+test("historyDir follows an isolated agent profile while explicit homes retain the default fallback", () => {
+	assert.equal(historyDir("/home/x", "/profiles/pi-principal/agent"), join("/profiles/pi-principal/agent", "gentle-agents", "tasks"));
+	assert.equal(historyDir("/home/x", "/profiles/pi-lab/agent"), join("/profiles/pi-lab/agent", "gentle-agents", "tasks"));
 	assert.equal(historyDir("/home/x"), join("/home/x", ".pi", "agent", "gentle-agents", "tasks"));
 });
 

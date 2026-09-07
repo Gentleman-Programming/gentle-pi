@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join, relative, resolve } from "node:path";
 import test, { after, mock } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TuiMouseEvent } from "@earendil-works/pi-tui";
-import gentleAgents, { agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, answerThroughUi, completionText, legacySubagentsInstalled, type AgentsDeps } from "../extensions/gentle-agents.ts";
+import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, answerThroughUi, completionText, legacySubagentsInstalled, type AgentsDeps } from "../extensions/gentle-agents.ts";
 import { historyDir, loadHistory, saveTask } from "../lib/agents-history.ts";
 import { emptyThread, TASK_STATUS, type TaskRecord } from "../lib/agents-protocol.ts";
 import { NativePointerScope } from "../lib/native-pointer-region.ts";
@@ -135,6 +135,76 @@ function deps(): { deps: Partial<AgentsDeps>; children: FakeChild[]; spawned: st
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test("agentRuntimePaths isolates sessions and transcripts by profile and retains the explicit-home fallback", () => {
+	assert.deepEqual(agentRuntimePaths("/home/x", "/profiles/pi-principal/agent"), {
+		sessions: "/profiles/pi-principal/agent/gentle-agents/sessions",
+		transcripts: "/profiles/pi-principal/agent/gentle-agents/transcripts",
+	});
+	assert.deepEqual(agentRuntimePaths("/home/x", "/profiles/pi-lab/agent"), {
+		sessions: "/profiles/pi-lab/agent/gentle-agents/sessions",
+		transcripts: "/profiles/pi-lab/agent/gentle-agents/transcripts",
+	});
+	assert.deepEqual(agentRuntimePaths("/home/x"), {
+		sessions: "/home/x/.pi/agent/gentle-agents/sessions",
+		transcripts: "/home/x/.pi/agent/gentle-agents/transcripts",
+	});
+});
+
+test("extension resolves each profile environment at setup time without changing HOME", async () => {
+	const principalHome = join(root, "pi-principal", "agent");
+	const labHome = join(root, "pi-lab", "agent");
+	for (const [agentHome, name] of [[principalHome, "principal"], [labHome, "lab"]] as const) {
+		mkdirSync(join(agentHome, "agents"), { recursive: true });
+		writeFileSync(join(agentHome, "agents", `${name}.md`), `---\ndescription: ${name}\n---\n${name}`);
+	}
+	const withoutExplicitHome = () => {
+		const harness = deps();
+		const { home: _home, env: _env, ...overrides } = harness.deps;
+		return overrides;
+	};
+	const principal = fakePi();
+	gentleAgents(principal.pi, { GENTLE_PI_AGENT_HOME: principalHome, PI_CODING_AGENT_DIR: labHome }, withoutExplicitHome());
+	const principalContext = fakeContext();
+	await principal.fire("session_start", principalContext.ctx);
+	assert.match((await principal.tools.get("subagent_list_agents")!.execute("p1", {}, undefined, undefined, principalContext.ctx)).content[0].text, /principal/);
+	const lab = fakePi();
+	gentleAgents(lab.pi, { PI_CODING_AGENT_DIR: labHome }, withoutExplicitHome());
+	const labContext = fakeContext();
+	await lab.fire("session_start", labContext.ctx);
+	assert.match((await lab.tools.get("subagent_list_agents")!.execute("l1", {}, undefined, undefined, labContext.ctx)).content[0].text, /lab/);
+});
+
+for (const [key, tilde] of [["GENTLE_PI_AGENT_HOME", false], ["PI_CODING_AGENT_DIR", false], ["GENTLE_PI_AGENT_HOME", true], ["PI_CODING_AGENT_DIR", true]] as const) {
+	test(`${key} ${tilde ? "tilde" : "relative"} profile shares an absolute parent and child session root`, async () => {
+		const agentHome = join(root, `${key}-${tilde}`, "agent");
+		mkdirSync(join(agentHome, "agents"), { recursive: true });
+		writeFileSync(join(agentHome, "agents", "relative.md"), "---\ndescription: relative profile\n---\nMap things.");
+		writeFileSync(join(agentHome, "subagents.json"), JSON.stringify({ default_model: "openai/profile-model" }));
+		const env = { [key]: tilde ? `~/${relative(homedir(), agentHome)}` : relative(process.cwd(), agentHome) };
+		const harness = deps();
+		const { home: _home, env: _env, ...overrides } = harness.deps;
+		const { pi, tools, fire } = fakePi();
+		gentleAgents(pi, env, overrides);
+		const { ctx } = fakeContext();
+		assert.notEqual(ctx.sessionManager.getCwd(), process.cwd());
+		await fire("session_start", ctx);
+		await tools.get("subagent_run")!.execute("relative", { agent: "relative", task: "Map", mode: "background" }, undefined, undefined, ctx);
+		await tick();
+		try {
+			const args = harness.spawned[0];
+			const sessionDir = args[args.indexOf("--session-dir") + 1];
+			const expected = join(agentHome, "gentle-agents", "sessions");
+			assert.equal(sessionDir, expected);
+			assert.equal(resolve(ctx.sessionManager.getCwd(), sessionDir), expected);
+			assert.equal(existsSync(expected), true, "parent created the exact child session root");
+			assert.match(args[args.indexOf("--model") + 1], /profile-model/);
+		} finally {
+			await fire("session_shutdown", ctx);
+			await tick();
+		}
+	});
+}
 
 test("agentsEnabled and agentsCollapseKey read their flags and stay off inside a child", () => {
 	assert.equal(agentsEnabled({}), true);

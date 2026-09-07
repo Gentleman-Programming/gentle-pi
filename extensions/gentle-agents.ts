@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { keyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { AGENT_MODE, discoverAgents, loadAgentsConfig, resolveAgentProfile, type AgentDefinition, type AgentMode } from "../lib/agents-config.ts";
@@ -16,6 +16,7 @@ import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-inte
 import { AGENTS_GLYPH, renderAgentsCard, widgetExpiryMs } from "../lib/agents-widget.ts";
 import { CARD_TONE, renderCard } from "../lib/shell-card.ts";
 import { openInExternalEditor } from "./gentle-shell.ts";
+import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
 
 // Gentle Agents: subagents as isolated `pi --mode rpc` children, a task
 // store that notifies per task, and a Gentle Shell card above the editor.
@@ -36,7 +37,13 @@ const TOOL_PREFIX = "subagent_";
 
 export interface AgentsDeps extends RunnerDeps {
 	home: string;
+	agentHome?: string;
 	env: NodeJS.ProcessEnv;
+}
+
+export function agentRuntimePaths(home: string, agentHome = join(home, ".pi", "agent")): { sessions: string; transcripts: string } {
+	const root = join(agentHome, "gentle-agents");
+	return { sessions: join(root, "sessions"), transcripts: join(root, "transcripts") };
 }
 
 interface ToolText {
@@ -68,7 +75,11 @@ export function agentsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
 export const LEGACY_SUBAGENTS_PACKAGE = "pi-subagents-j0k3r";
 
 export function legacySubagentsInstalled(home: string): boolean {
-	const settingsPath = join(home, ".pi", "agent", "settings.json");
+	return legacySubagentsInstalledAt(join(home, ".pi", "agent"));
+}
+
+function legacySubagentsInstalledAt(agentHome: string): boolean {
+	const settingsPath = join(agentHome, "settings.json");
 	if (!existsSync(settingsPath)) return false;
 	try {
 		const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as { packages?: unknown };
@@ -161,7 +172,14 @@ export async function answerThroughUi(ui: ExtensionContext["ui"] | undefined, as
 export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env, overrides: Partial<AgentsDeps> = {}): void {
 	if (!agentsEnabled(env)) return;
 	const deps: AgentsDeps = { ...defaultDeps(env), ...overrides };
-	if (legacySubagentsInstalled(deps.home)) {
+	const selectedHome = overrides.agentHome ?? (overrides.home === undefined ? resolveGentlePiAgentHome(deps.env) : join(deps.home, ".pi", "agent"));
+	// Expand environment tildes like Pi, but leave explicit path APIs literal.
+	const environmentHome = overrides.agentHome === undefined && overrides.home === undefined;
+	const expandedHome = environmentHome && selectedHome === "~" ? deps.home
+		: environmentHome && (selectedHome.startsWith("~/") || (process.platform === "win32" && selectedHome.startsWith("~\\"))) ? join(deps.home, selectedHome.slice(2)) : selectedHome;
+	// Freeze the host's root before a child uses a different session cwd.
+	const agentHome = resolve(expandedHome);
+	if (legacySubagentsInstalledAt(agentHome)) {
 		pi.on("session_start", (_event, ctx) => {
 			if (ctx.hasUI) ctx.ui.notify(`${AGENTS_GLYPH} Gentle Agents is waiting: remove the old package first with "pi remove npm:${LEGACY_SUBAGENTS_PACKAGE}"`, "warning");
 		});
@@ -171,7 +189,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const viewKey = agentsViewKey(env);
 	const stopKey = agentsStopKey(env);
 	const store = new TaskStore();
-	const tasksDir = historyDir(deps.home);
+	const tasksDir = historyDir(deps.home, agentHome);
 	let ui: ExtensionContext["ui"] | undefined;
 	let host: { requestRender(): void } | undefined;
 	let collapsed = false;
@@ -216,7 +234,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	// is then trimmed to the configured size. Failures never reach the TUI.
 	const persist = (task: TaskRecord) => {
 		void saveTask(tasksDir, task, store.thread(task.id))
-			.then(() => pruneHistory(tasksDir, loadAgentsConfig({ cwd: task.cwd, home: deps.home }).historyMaxTasks))
+			.then(() => pruneHistory(tasksDir, loadAgentsConfig({ cwd: task.cwd, home: deps.home, agentHome }).historyMaxTasks))
 			.catch(() => {});
 	};
 
@@ -226,7 +244,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		pi.sendMessage({ customType: AGENTS_RESULT_TYPE, content: completionText(task), display: true, details: taskDetails(task) }, { deliverAs: "followUp", triggerTurn: true });
 	};
 
-	const runner = new AgentRunner(store, loadAgentsConfig({ cwd: process.cwd(), home: deps.home }), deps, {
+	const runner = new AgentRunner(store, loadAgentsConfig({ cwd: process.cwd(), home: deps.home, agentHome }), deps, {
 		askUser: (_taskId, ask, raw) => answerThroughUi(ui, ask, raw),
 		onFinish: (task) => {
 			ownedTaskIds.delete(task.id);
@@ -355,7 +373,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	};
 
 	const writeTranscript = async (task: TaskRecord): Promise<string> => {
-		const dir = join(deps.home, ".pi", "agent", "gentle-agents", "transcripts");
+		const dir = agentRuntimePaths(deps.home, agentHome).transcripts;
 		await mkdir(dir, { recursive: true });
 		const markdown = sessionToMarkdown(await readFile(task.sessionPath ?? "", "utf8"), { title: `${task.agent} · ${task.label} · ${task.status}` });
 		const path = join(dir, `${task.id}.md`);
@@ -383,12 +401,12 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		});
 	};
 
-	const roots = (ctx: ExtensionContext) => ({ cwd: ctx.sessionManager.getCwd(), home: deps.home });
+	const roots = (ctx: ExtensionContext) => ({ cwd: ctx.sessionManager.getCwd(), home: deps.home, agentHome });
 
 	const buildRequest = (ctx: ExtensionContext, agent: AgentDefinition, prompt: string, label: string | undefined, context: string | undefined, mode: AgentMode, resume?: string): TaskRequest => {
 		const config = loadAgentsConfig(roots(ctx));
 		const profile = resolveAgentProfile(agent, config);
-		const sessionDir = join(deps.home, ".pi", "agent", "gentle-agents", "sessions");
+		const sessionDir = agentRuntimePaths(deps.home, agentHome).sessions;
 		mkdirSync(sessionDir, { recursive: true });
 		const parentSessionManager = ctx.sessionManager as unknown as ReviewSessionManager;
 		const parentSessionId = ctx.sessionManager.getSessionId() ?? "";

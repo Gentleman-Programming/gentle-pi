@@ -5,7 +5,9 @@ import { join } from "node:path";
 import test, { after } from "node:test";
 import {
 	AGENT_MODE,
+	agentDirectories,
 	discoverAgents,
+	loadAgentsConfig,
 	parseAgentDefinition,
 	parseAgentsConfig,
 	parseFrontmatter,
@@ -91,6 +93,23 @@ test("discoverAgents merges the four directories with project over global and su
 	assert.equal(errors.length, 1);
 	assert.match(errors[0], /broken\.md/);
 	assert.deepEqual(discoverAgents({ cwd: join(root, "empty"), home: join(root, "nohome") }), { agents: [], errors: [] });
+});
+
+test("profile agent roots isolate global definitions and subagents.json while explicit homes keep their fallback", () => {
+	const cwd = join(root, "profile-project");
+	const principal = join(root, "pi-principal", "agent");
+	const lab = join(root, "pi-lab", "agent");
+	for (const [agentHome, name, model] of [[principal, "principal", "openai/principal"], [lab, "lab", "openai/lab"]] as const) {
+		mkdirSync(join(agentHome, "agents"), { recursive: true });
+		writeFileSync(join(agentHome, "agents", `${name}.md`), `---\ndescription: ${name}\n---\n${name}`);
+		writeFileSync(join(agentHome, "subagents.json"), JSON.stringify({ default_model: model }));
+	}
+	assert.deepEqual(agentDirectories({ cwd, home: join(root, "legacy-home"), agentHome: principal }).slice(0, 2).map(({ dir }) => dir), [join(principal, "agents"), join(principal, "subagents")]);
+	assert.deepEqual(discoverAgents({ cwd, home: join(root, "legacy-home"), agentHome: principal }).agents.map((agent) => agent.name), ["principal"]);
+	assert.deepEqual(discoverAgents({ cwd, home: join(root, "legacy-home"), agentHome: lab }).agents.map((agent) => agent.name), ["lab"]);
+	assert.equal(loadAgentsConfig({ cwd, home: join(root, "legacy-home"), agentHome: principal }).defaultModel?.id, "principal");
+	assert.equal(loadAgentsConfig({ cwd, home: join(root, "legacy-home"), agentHome: lab }).defaultModel?.id, "lab");
+	assert.equal(agentDirectories({ cwd, home: join(root, "legacy-home") })[0].dir, join(root, "legacy-home", ".pi", "agent", "agents"));
 });
 
 test("parseAgentsConfig applies defaults, validates values, and silently ignores the retired total-timeout key", () => {

@@ -91,6 +91,7 @@ export interface ResolvedProfile {
 export interface DiscoveryRoots {
 	cwd: string;
 	home: string;
+	agentHome?: string;
 }
 
 export interface DiscoveryResult {
@@ -204,10 +205,15 @@ export function parseAgentDefinition(text: string, filePath: string, scope: Agen
 // Discovery order is precedence order: a later directory replaces an earlier
 // definition with the same name, so project beats global and `subagents/`
 // beats `agents/` within each scope.
+function profileRoot(roots: DiscoveryRoots): string {
+	return roots.agentHome ?? join(roots.home, ".pi", "agent");
+}
+
 export function agentDirectories(roots: DiscoveryRoots): Array<{ dir: string; scope: AgentScope }> {
+	const agentHome = profileRoot(roots);
 	return [
-		{ dir: join(roots.home, ".pi", "agent", "agents"), scope: AGENT_SCOPE.GLOBAL },
-		{ dir: join(roots.home, ".pi", "agent", "subagents"), scope: AGENT_SCOPE.GLOBAL },
+		{ dir: join(agentHome, "agents"), scope: AGENT_SCOPE.GLOBAL },
+		{ dir: join(agentHome, "subagents"), scope: AGENT_SCOPE.GLOBAL },
 		{ dir: join(roots.cwd, ".pi", "agents"), scope: AGENT_SCOPE.PROJECT },
 		{ dir: join(roots.cwd, ".pi", "subagents"), scope: AGENT_SCOPE.PROJECT },
 	];
@@ -284,7 +290,7 @@ function readJson(path: string): RawConfig {
 }
 
 export function loadAgentsConfig(roots: DiscoveryRoots): AgentsConfig {
-	return parseAgentsConfig(readJson(join(roots.home, ".pi", "agent", "subagents.json")), readJson(join(roots.cwd, ".pi", "subagents.json")));
+	return parseAgentsConfig(readJson(join(profileRoot(roots), "subagents.json")), readJson(join(roots.cwd, ".pi", "subagents.json")));
 }
 
 function pick<T>(candidates: Array<[T | undefined, ProfileSource]>): [T | undefined, ProfileSource] {
