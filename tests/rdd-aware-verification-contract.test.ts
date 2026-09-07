@@ -55,6 +55,12 @@ const SMALL_MODEL_BIAS_SENTENCE =
 	"The small-model bias raises the tier by one for verification purposes (medium becomes high); an unknown `Receipt-driven development:` line never lowers a tier below `off`.";
 const SPOT_CHECK_SENTENCE =
 	"The parent spot check (re-running one reported command before delivery) stays required in every tier.";
+// gentle-pi#668: the `on` branch of trigger 5 holds only while the native
+// review actually reaches a terminal outcome for this candidate -- a decline,
+// a clone-local disable, or a refused START/STATUS all fall back to the exact
+// same risk-gated path as `off`.
+const ON_BRANCH_FALLBACK_SENTENCE =
+	'That `on` branch holds only while the native review actually reaches a terminal outcome for this candidate (gentle-pi#668): a human decline of the consent envelope for this candidate (candidate-scoped, never the RDD kill switch), a clone-local RDD disable discovered mid-flow, or a refused START/STATUS all fall back to the risk-gated path exactly as `off` -- call `gentle_review` with `{"operation":"assess"}` (pass `nativeReviewOutcome` when the parent already knows it; the tool derives it from what it itself observed for the candidate otherwise, failing closed to `unknown` when it cannot) and follow the returned plan.';
 
 test("trigger 5 (Verification rule) states the exact on-line routing: writer report is the verification of record", () => {
 	assert.ok(delegation.includes(ON_SENTENCE), "trigger 5 is missing the exact on-line sentence");
@@ -76,6 +82,19 @@ test("trigger 5 states the small-model bias and the unknown-never-lowers-a-tier 
 
 test("trigger 5 keeps the parent spot check requirement in every tier", () => {
 	assert.ok(delegation.includes(SPOT_CHECK_SENTENCE), "trigger 5 is missing the parent spot check sentence");
+});
+
+test("trigger 5 states that the on branch holds only while the native review closes for this candidate, falling back to the off path exactly once (gentle-pi#668)", () => {
+	assert.equal(countOccurrences(delegation, ON_BRANCH_FALLBACK_SENTENCE), 1, "trigger 5 is missing (or duplicates) the on-branch fallback sentence");
+});
+
+test("the on-branch fallback sentence names all three non-closed triggers and never introduces a forbidden native RDD marker", () => {
+	for (const clause of ["decline", "clone-local", "refused START/STATUS"]) {
+		assert.ok(ON_BRANCH_FALLBACK_SENTENCE.includes(clause), `on-branch fallback sentence missing: ${clause}`);
+	}
+	for (const marker of ["gentle-ai review status", "next_transition", "review.capture-result", "review.validate", "reviewGate.result"]) {
+		assert.ok(!delegation.includes(marker), `stale/forbidden RDD marker introduced: ${marker}`);
+	}
 });
 
 test("the on-line and off/unknown-line routing sentences appear exactly once each (normative statement lives only in trigger 5)", () => {

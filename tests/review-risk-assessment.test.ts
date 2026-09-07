@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
+import { createGentleAiExtension, __testing } from "../extensions/gentle-ai.ts";
 import {
 	NATIVE_REVIEW_ERROR_CODE,
 	NATIVE_REVIEW_MODE_SOURCE,
@@ -19,9 +19,11 @@ import {
 	VERIFICATION_TIER,
 	RDD_LINE,
 	WRITER_PROFILE,
+	NATIVE_REVIEW_OUTCOME,
 	type VerificationTier,
 	type RddLine,
 	type WriterProfile,
+	type NativeReviewOutcome,
 } from "../lib/review-risk-assessment.ts";
 
 // ---------------------------------------------------------------------------
@@ -91,23 +93,127 @@ test("decodeReviewAssessmentV1 rejects a malformed shape", () => {
 const RISKS: readonly VerificationTier[] = [VERIFICATION_TIER.PASSIVE, VERIFICATION_TIER.MEDIUM, VERIFICATION_TIER.HIGH, VERIFICATION_TIER.UNASSESSABLE];
 const RDD_LINES: readonly RddLine[] = [RDD_LINE.ON, RDD_LINE.OFF, RDD_LINE.UNKNOWN];
 const PROFILES: readonly WriterProfile[] = [WRITER_PROFILE.SMALL, WRITER_PROFILE.LARGE];
+const NON_CLOSED_OUTCOMES: readonly NativeReviewOutcome[] = [NATIVE_REVIEW_OUTCOME.DECLINED, NATIVE_REVIEW_OUTCOME.UNAVAILABLE, NATIVE_REVIEW_OUTCOME.UNKNOWN];
 
-test("verificationPlan: rdd on, passive risk -> structural readback only regardless of writer profile", () => {
+test("verificationPlan: rdd on + closed, passive risk -> structural readback only regardless of writer profile", () => {
 	for (const writerProfile of PROFILES) {
-		const plan = verificationPlan({ rddLine: RDD_LINE.ON, risk: VERIFICATION_TIER.PASSIVE, writerProfile });
+		const plan = verificationPlan({ rddLine: RDD_LINE.ON, risk: VERIFICATION_TIER.PASSIVE, writerProfile, nativeReviewOutcome: NATIVE_REVIEW_OUTCOME.CLOSED });
 		assert.equal(plan.structuralReadbackOnly, true);
 		assert.equal(plan.writerSelfVerification, false);
 		assert.equal(plan.independentVerifier, false);
 	}
 });
 
-test("verificationPlan: rdd on, medium/high/unassessable risk -> writer self-verification, no independent verifier", () => {
+test("verificationPlan: rdd on + closed, medium/high/unassessable risk -> writer self-verification, no independent verifier", () => {
 	for (const risk of [VERIFICATION_TIER.MEDIUM, VERIFICATION_TIER.HIGH, VERIFICATION_TIER.UNASSESSABLE]) {
 		for (const writerProfile of PROFILES) {
-			const plan = verificationPlan({ rddLine: RDD_LINE.ON, risk, writerProfile });
-			assert.equal(plan.writerSelfVerification, true, `rdd on, risk ${risk}, profile ${writerProfile}`);
+			const plan = verificationPlan({ rddLine: RDD_LINE.ON, risk, writerProfile, nativeReviewOutcome: NATIVE_REVIEW_OUTCOME.CLOSED });
+			assert.equal(plan.writerSelfVerification, true, `rdd on+closed, risk ${risk}, profile ${writerProfile}`);
 			assert.equal(plan.structuralReadbackOnly, false);
-			assert.equal(plan.independentVerifier, false, `native review is the independent check under rdd on for risk ${risk}`);
+			assert.equal(plan.independentVerifier, false, `the closed native review is the independent check under rdd on for risk ${risk}`);
+		}
+	}
+});
+
+// ---------------------------------------------------------------------------
+// gentle-pi#668: the `on` branch holds only while the native review reaches a
+// terminal (`closed`) outcome for this candidate. A decline, an unavailable
+// review, or an unknown/omitted outcome falls back to the exact same
+// risk-gated path as `off` -- declining a review is candidate-scoped and
+// never lowers the bar below the RDD-off path.
+// ---------------------------------------------------------------------------
+
+test("verificationPlan: rdd on + non-closed outcome behaves exactly like rdd off for every risk/profile combination", () => {
+	for (const outcome of NON_CLOSED_OUTCOMES) {
+		for (const risk of RISKS) {
+			for (const writerProfile of PROFILES) {
+				const off = verificationPlan({ rddLine: RDD_LINE.OFF, risk, writerProfile });
+				const onFallback = verificationPlan({ rddLine: RDD_LINE.ON, risk, writerProfile, nativeReviewOutcome: outcome });
+				assert.equal(onFallback.writerSelfVerification, off.writerSelfVerification, `outcome ${outcome}, risk ${risk}, profile ${writerProfile}`);
+				assert.equal(onFallback.structuralReadbackOnly, off.structuralReadbackOnly, `outcome ${outcome}, risk ${risk}, profile ${writerProfile}`);
+				assert.equal(onFallback.independentVerifier, off.independentVerifier, `outcome ${outcome}, risk ${risk}, profile ${writerProfile}`);
+			}
+		}
+	}
+});
+
+test("verificationPlan: an omitted nativeReviewOutcome under rdd on defaults to unknown (fail closed), exactly like rdd off", () => {
+	for (const risk of RISKS) {
+		for (const writerProfile of PROFILES) {
+			const off = verificationPlan({ rddLine: RDD_LINE.OFF, risk, writerProfile });
+			const omitted = verificationPlan({ rddLine: RDD_LINE.ON, risk, writerProfile });
+			assert.equal(omitted.writerSelfVerification, off.writerSelfVerification);
+			assert.equal(omitted.structuralReadbackOnly, off.structuralReadbackOnly);
+			assert.equal(omitted.independentVerifier, off.independentVerifier);
+		}
+	}
+});
+
+test("verificationPlan: on+closed+medium+large -> no verifier", () => {
+	const plan = verificationPlan({ rddLine: RDD_LINE.ON, risk: VERIFICATION_TIER.MEDIUM, writerProfile: WRITER_PROFILE.LARGE, nativeReviewOutcome: NATIVE_REVIEW_OUTCOME.CLOSED });
+	assert.equal(plan.independentVerifier, false);
+	assert.equal(plan.writerSelfVerification, true);
+});
+
+test("verificationPlan: on+declined+medium+large -> no verifier (medium, large)", () => {
+	const plan = verificationPlan({ rddLine: RDD_LINE.ON, risk: VERIFICATION_TIER.MEDIUM, writerProfile: WRITER_PROFILE.LARGE, nativeReviewOutcome: NATIVE_REVIEW_OUTCOME.DECLINED });
+	assert.equal(plan.independentVerifier, false);
+	assert.equal(plan.writerSelfVerification, true);
+});
+
+test("verificationPlan: on+declined+medium+small -> verifier", () => {
+	const plan = verificationPlan({ rddLine: RDD_LINE.ON, risk: VERIFICATION_TIER.MEDIUM, writerProfile: WRITER_PROFILE.SMALL, nativeReviewOutcome: NATIVE_REVIEW_OUTCOME.DECLINED });
+	assert.equal(plan.independentVerifier, true);
+});
+
+test("verificationPlan: on+declined+high -> verifier", () => {
+	for (const writerProfile of PROFILES) {
+		const plan = verificationPlan({ rddLine: RDD_LINE.ON, risk: VERIFICATION_TIER.HIGH, writerProfile, nativeReviewOutcome: NATIVE_REVIEW_OUTCOME.DECLINED });
+		assert.equal(plan.independentVerifier, true);
+	}
+});
+
+test("verificationPlan: on+unavailable+high -> verifier", () => {
+	for (const writerProfile of PROFILES) {
+		const plan = verificationPlan({ rddLine: RDD_LINE.ON, risk: VERIFICATION_TIER.HIGH, writerProfile, nativeReviewOutcome: NATIVE_REVIEW_OUTCOME.UNAVAILABLE });
+		assert.equal(plan.independentVerifier, true);
+	}
+});
+
+test("verificationPlan: on+unknown (omitted)+high -> verifier", () => {
+	for (const writerProfile of PROFILES) {
+		const plan = verificationPlan({ rddLine: RDD_LINE.ON, risk: VERIFICATION_TIER.HIGH, writerProfile });
+		assert.equal(plan.independentVerifier, true);
+	}
+});
+
+test("verificationPlan: on+declined+passive -> structural readback", () => {
+	for (const writerProfile of PROFILES) {
+		const plan = verificationPlan({ rddLine: RDD_LINE.ON, risk: VERIFICATION_TIER.PASSIVE, writerProfile, nativeReviewOutcome: NATIVE_REVIEW_OUTCOME.DECLINED });
+		assert.equal(plan.structuralReadbackOnly, true);
+		assert.equal(plan.writerSelfVerification, false);
+		assert.equal(plan.independentVerifier, false);
+	}
+});
+
+test("verificationPlan: off+closed+high -> verifier (outcome ignored)", () => {
+	for (const writerProfile of PROFILES) {
+		const plan = verificationPlan({ rddLine: RDD_LINE.OFF, risk: VERIFICATION_TIER.HIGH, writerProfile, nativeReviewOutcome: NATIVE_REVIEW_OUTCOME.CLOSED });
+		assert.equal(plan.independentVerifier, true);
+		assert.equal(plan.writerSelfVerification, true);
+	}
+});
+
+test("verificationPlan: off/unknown lines ignore nativeReviewOutcome entirely", () => {
+	for (const rddLine of [RDD_LINE.OFF, RDD_LINE.UNKNOWN]) {
+		for (const risk of RISKS) {
+			for (const writerProfile of PROFILES) {
+				const withoutOutcome = verificationPlan({ rddLine, risk, writerProfile });
+				for (const outcome of Object.values(NATIVE_REVIEW_OUTCOME)) {
+					const withOutcome = verificationPlan({ rddLine, risk, writerProfile, nativeReviewOutcome: outcome });
+					assert.deepEqual(withOutcome, withoutOutcome, `rddLine ${rddLine}, risk ${risk}, profile ${writerProfile}, outcome ${outcome}`);
+				}
+			}
 		}
 	}
 });
@@ -351,6 +457,83 @@ test("gentle_review assess: writerModelId/writerEffort in input select the write
 	const gemini = await tool.execute("call-8", { operation: "assess", input: JSON.stringify({ writerModelId: "gemini-2.5-pro", writerEffort: "high" }) }, undefined, undefined, ctx);
 	assert.equal((gemini.details as { writerProfile: string }).writerProfile, "large", "gemini-2.5-pro must never be tiered as a small model");
 	assert.equal((gemini.details as { plan: { independentVerifier: boolean } }).plan.independentVerifier, false);
+});
+
+test("gentle_review assess: an explicit nativeReviewOutcome:\"declined\" input falls back to the risk-gated plan even when RDD is on (gentle-pi#668)", async () => {
+	const nativeReviewCli: Partial<NativeReviewCli> = {
+		reviewMode: async () => ({ operation: "status", scope: "clone", status: { global: "on", cloneLocal: "", effective: "on", source: NATIVE_REVIEW_MODE_SOURCE.GLOBAL } }),
+		assess: async () => ({
+			schema: REVIEW_ASSESSMENT_SCHEMA,
+			risk: "high",
+			reasons: [],
+			changedPaths: 3,
+			changedLines: 40,
+			candidate: { kind: "current-changes", baseRef: undefined },
+		}),
+	};
+	const tool = reviewControllerTool(nativeReviewCli);
+	const result = await tool.execute("call-9", { operation: "assess", input: JSON.stringify({ nativeReviewOutcome: "declined" }) }, undefined, undefined, ctx);
+	const details = result.details as { risk: string; rddLine: string; outcome_source: string; plan: { writerSelfVerification: boolean; independentVerifier: boolean; structuralReadbackOnly: boolean } };
+	assert.equal(details.risk, "high");
+	assert.equal(details.rddLine, "on", "the rendered RDD line still reads on -- only the verification plan falls back");
+	assert.equal(details.outcome_source, "explicit");
+	assert.equal(details.plan.writerSelfVerification, true);
+	assert.equal(details.plan.independentVerifier, true, "a declined review for this candidate must re-enable the risk-gated independent verifier");
+	assert.equal(details.plan.structuralReadbackOnly, false);
+});
+
+test("gentle_review assess: an unrecognized nativeReviewOutcome value is rejected", async () => {
+	const tool = reviewControllerTool({});
+	await assert.rejects(
+		() => tool.execute("call-10", { operation: "assess", input: JSON.stringify({ nativeReviewOutcome: "approved" }) }, undefined, undefined, ctx),
+		/nativeReviewOutcome/,
+	);
+});
+
+// gentle-pi#668 correction: keyed per candidate (repository + target
+// identity), never repository alone; `closed` is never written to the memo.
+function assessOnNativeCli(currentTargetIdentity: () => string): Partial<NativeReviewCli> {
+	return {
+		reviewMode: async () => ({ operation: "status", scope: "clone", status: { global: "on", cloneLocal: "", effective: "on", source: NATIVE_REVIEW_MODE_SOURCE.GLOBAL } }),
+		assess: async () => ({ schema: REVIEW_ASSESSMENT_SCHEMA, risk: "high", reasons: [], changedPaths: 1, changedLines: 5, candidate: { kind: "current-changes", baseRef: undefined } }),
+		targetStatus: (async () => ({ applicability: "current_target", targetIdentity: currentTargetIdentity() })) as NativeReviewCli["targetStatus"],
+	};
+}
+
+test("gentle_review assess: derivation is bound to the exact candidate recorded, closed can only ever be passed explicitly (gentle-pi#668 correction)", async (t) => {
+	t.after(() => __testing.clearNativeReviewOutcomeMemoForTesting());
+	__testing.clearNativeReviewOutcomeMemoForTesting();
+	let current = "target-a";
+	const tool = reviewControllerTool(assessOnNativeCli(() => current));
+
+	// Nothing recorded for candidate A yet -> unknown, risk-gated.
+	const before = (await tool.execute("call-11", { operation: "assess" }, undefined, undefined, ctx)).details as { nativeReviewOutcome: string; outcome_source: string; plan: { independentVerifier: boolean } };
+	assert.equal(before.nativeReviewOutcome, "unknown");
+	assert.equal(before.outcome_source, "unknown");
+	assert.equal(before.plan.independentVerifier, true);
+
+	// Candidate A recorded declined -> assess for A derives it.
+	__testing.recordNativeReviewOutcome(ctx.cwd, "target-a", "declined");
+	const forA = (await tool.execute("call-12", { operation: "assess" }, undefined, undefined, ctx)).details as { nativeReviewOutcome: string; outcome_source: string; plan: { independentVerifier: boolean } };
+	assert.equal(forA.nativeReviewOutcome, "declined");
+	assert.equal(forA.outcome_source, "derived");
+	assert.equal(forA.plan.independentVerifier, true, "a derived decline re-enables the independent verifier for the matching candidate");
+
+	// Candidate B (different current target) never inherits A's decline --
+	// and since closed is never written, an acknowledged A can never leak a
+	// closed derivation into B either.
+	current = "target-b";
+	const forB = (await tool.execute("call-13", { operation: "assess" }, undefined, undefined, ctx)).details as { nativeReviewOutcome: string; outcome_source: string; plan: { independentVerifier: boolean } };
+	assert.equal(forB.nativeReviewOutcome, "unknown", "candidate B must never inherit candidate A's recorded outcome");
+	assert.equal(forB.outcome_source, "unknown");
+	assert.equal(forB.plan.independentVerifier, true);
+
+	// Explicit input always wins, and is the only way to reach "closed".
+	const closed = (await tool.execute("call-14", { operation: "assess", input: JSON.stringify({ nativeReviewOutcome: "closed" }) }, undefined, undefined, ctx)).details as { nativeReviewOutcome: string; outcome_source: string; plan: { independentVerifier: boolean; writerSelfVerification: boolean } };
+	assert.equal(closed.nativeReviewOutcome, "closed");
+	assert.equal(closed.outcome_source, "explicit");
+	assert.equal(closed.plan.writerSelfVerification, true);
+	assert.equal(closed.plan.independentVerifier, false, "an explicit closed outcome restores the on-path: no separate verifier");
 });
 
 test("gentle_review assess never requires a lineageId (unlike most other operations)", async () => {
