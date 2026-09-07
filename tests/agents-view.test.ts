@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { emptyThread, TASK_EVENT, TASK_STATUS, TaskStore, type TaskRecord } from "../lib/agents-protocol.ts";
 import { AgentsView, itemLines, taskHeader } from "../lib/agents-view.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
@@ -99,6 +99,69 @@ test("AgentsView subscribes only to the selected task and survives an empty stor
 	view.dispose();
 	store.apply("a", { type: TASK_EVENT.TEXT, text: "after" }, 2000);
 	assert.equal(renders(), before + 1, "disposed views stay quiet");
+});
+
+function mouse(x: number, y: number, width: number, height: number, type: TuiMouseEvent["type"] = "move", wheelDelta?: number): TuiMouseEvent {
+	return { type, button: type === "move" || type === "wheel" ? "none" : "left", x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false, wheelDelta };
+}
+
+test("AgentsView pointer regions hover and select task rows without activating, and keep list and thread wheels independent", () => {
+	const { store, view, events } = harness(6);
+	for (const id of ["a", "b", "c", "d", "e"]) store.add(task(id, { agent: id }));
+	for (let index = 0; index < 8; index += 1) store.apply("b", { type: TASK_EVENT.TEXT, text: `thread ${index}\n` }, 2000);
+	const lines = view.render(80);
+
+	assert.equal(view.handleMouse(mouse(4, 2, 80, lines.length))?.handled, true, "hover consumes only the task row");
+	assert.equal(view.selectedTask()?.id, "a", "hover never changes keyboard selection or the displayed thread");
+	assert.equal(view.handleMouse(mouse(4, 2, 80, lines.length, "click"))?.handled, true);
+	assert.equal(view.selectedTask()?.id, "b", "click selects the task and displays its thread");
+	assert.deepEqual(events, [], "click selects the task only; it never opens or cancels");
+	view.render(80);
+	assert.equal(view.handleMouse(mouse(50, 2, 80, lines.length, "wheel", -1))?.handled, true, "thread wheel is handled by its viewport");
+	assert.match(stripAnsi(view.render(80)[2]), /thread 6/, "thread wheel moves only the selected thread");
+	assert.equal(view.handleMouse(mouse(4, 2, 80, lines.length, "wheel", 1))?.handled, true, "list wheel is handled by its viewport");
+	assert.match(stripAnsi(view.render(80)[1]), / b /, "list wheel changes only the task-list viewport");
+	assert.equal(view.handleMouse(mouse(50, 2, 80, lines.length, "click")), undefined, "thread clicks are inert");
+	view.dispose();
+	assert.equal(view.handleMouse(mouse(4, 2, 80, lines.length)), undefined, "late pointer events are inert after disposal");
+});
+
+test("AgentsView clears hover on leave, list scrolling, resize, updates, empty lists, and disposal", () => {
+	const { store, view } = harness(6);
+	store.add(task("a"));
+	store.add(task("b", { agent: "b" }));
+	store.add(task("c", { agent: "c" }));
+	store.add(task("d", { agent: "d" }));
+	const lines = view.render(80);
+	const observer = view.mouseObserver();
+	const dispatch = (event: TuiMouseEvent) => {
+		observer.beforeMouse(event);
+		try {
+			return view.handleMouse(event);
+		} finally {
+			observer.afterMouse(event);
+		}
+	};
+	dispatch(mouse(4, 2, 80, lines.length));
+	assert.match(stripAnsi(view.render(80)[2]), /▹/, "the hovered row is styled without changing selection");
+	dispatch(mouse(4, 2, 80, lines.length, "wheel", -1));
+	assert.match(stripAnsi(view.render(80)[2]), /▹/, "a list wheel event at its boundary preserves hover");
+	dispatch(mouse(4, 2, 80, lines.length, "wheel", 1));
+	assert.doesNotMatch(stripAnsi(view.render(80).join("\n")), /▹/, "list scrolling clears hover so it cannot remain on the task formerly under the pointer");
+	dispatch(mouse(4, 2, 80, lines.length));
+	dispatch(mouse(50, 2, 80, lines.length));
+	assert.doesNotMatch(stripAnsi(view.render(80)[2]), /▹/, "the root observer clears hover outside a child region");
+	dispatch(mouse(4, 2, 80, lines.length));
+	view.render(81);
+	assert.doesNotMatch(stripAnsi(view.render(81)[2]), /▹/, "resize clears hover before the next frame");
+	dispatch(mouse(4, 2, 81, lines.length));
+	store.apply("a", { type: TASK_EVENT.TEXT, text: "update" }, 2000);
+	assert.doesNotMatch(stripAnsi(view.render(81)[2]), /▹/, "task updates clear hover");
+	view.dispose();
+	const { view: empty } = harness(6);
+	empty.render(80);
+	assert.equal(empty.handleMouse(mouse(4, 1, 80, 6)), undefined, "empty task rows are inert");
+	empty.dispose();
 });
 
 test("AgentsView advertises s to stop an active selection, retains c as an alias, and hides stopping for finished tasks", () => {
