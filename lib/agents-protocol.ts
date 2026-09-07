@@ -126,7 +126,7 @@ export interface TaskSummary {
 export type TaskListener = (task: TaskRecord, thread: TaskThread) => void;
 export type SummaryListener = (summary: TaskSummary) => void;
 
-const DEFAULT_LIMITS: ThreadLimits = { maxItems: 400, maxOutputChars: 4000 };
+const DEFAULT_LIMITS: ThreadLimits = { maxItems: 400, maxOutputChars: 16_000 };
 /** Child UI requests that block on an answer; everything else (notify, setStatus, setWidget) is noise here. */
 export const DIALOG_METHODS: ReadonlySet<string> = new Set(["select", "confirm", "input", "editor"]);
 const LABEL_MAX = 72;
