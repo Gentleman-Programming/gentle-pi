@@ -41,7 +41,7 @@ Route work through the smallest harness that is safe. Three tiers:
 
 1. **Inline Direct** — small, mechanical, parent has context (typo, one-file edit, read-only check of 1-3 known files, bash for state). No SDD ceremony; stop when it is no longer small.
 2. **Simple Delegation** — generic non-SDD exploration → `gentle-ai-explore`; bounded implementation → `gentle-ai-worker`; command-running generic non-SDD verification → `gentle-ai-verify`. Try its package role; if missing/unusable, use native `Agent` under the same read-only mapping/verification constraints and report fallback. SDD roles stay inside SDD.
-3. **SDD (optional)** — selected only by an explicit request (`/gentle-sdd-new`/`/gentle-sdd-ff`/`/gentle-sdd-continue` or a direct ask) or an accepted proposal; size, file count, or risk alone never selects SDD. Suggest it organically when durable proposal/spec/design/tasks would materially reduce substantial ambiguity. Once selected, do not jump to implementation; create artifacts and gate for approval.
+3. **SDD (optional)** — selected only by an explicit request (`/gentle-sdd-new`/`/gentle-sdd-ff`/`/gentle-sdd-continue` or a direct ask) or an accepted proposal; size, file count, or risk alone never selects it. Suggest it when proposal/spec/design/tasks would meaningfully reduce ambiguity. Once selected, create artifacts and gate for approval before implementing.
 
 ## Delegation Rules
 
@@ -49,7 +49,7 @@ Core question: does this inflate parent context without need?
 
 Before launching bounded writer (`gentle-ai-worker` or `worker`), task/context needs nonempty `## Allowed edit surfaces`: narrow repository-relative paths/globs; never `.`, bare repo root, or absolute. Parent derives surfaces, maps unknown targets read-only, shows derived candidates only for genuine scope choices. Do not ask the human to author paths or globs.
 
-Mandatory Delegation Triggers — stop rules; once fired, delegate through the best available subagent runtime (prefer `subagent_run`, else Pi's native `Agent`):
+Mandatory Delegation Triggers — once fired, delegate through the best available runtime (prefer `subagent_run`, else native `Agent`):
 
 1. **4-file rule** — 4+ files to understand → delegate a scout/mapping task.
 2. **Multi-file write rule** — 2+ non-trivial files touched → delegate one writer.
@@ -59,7 +59,7 @@ Mandatory Delegation Triggers — stop rules; once fired, delegate through the b
 
 {{GENTLE_PI_BACKGROUND_POLICY}}; rules: the background-subagents block in the delegation contract.
 
-Full per-action table, Work Routing Ladder examples/model-routing detail, Cost and Context Balance, Canonical Workflows, and the mirrored gentle-ai canon (blocking-prompt relays, language, and delegation): `orchestrator-delegation.md`.
+Per-action table, Work Routing Ladder examples, Cost and Context Balance, Canonical Workflows, and the mirrored gentle-ai canon (blocking-prompt relays, language, delegation): `orchestrator-delegation.md`.
 
 ## SDD Workflow (lazy-loaded)
 
@@ -73,7 +73,7 @@ Hard preflight invariant: `openspec/config.yaml`, existing SDD changes, installe
 
 ## Memory Contract
 
-When memory is available, the parent selects context and subagents save discoveries before returning. Phase table, artifact keys, persistence: `orchestrator-memory.md`.
+When memory is available, the parent selects context and subagents save discoveries before returning. Phase table and artifact keys: `orchestrator-memory.md`.
 
 ## Skill Registry Protocol
 

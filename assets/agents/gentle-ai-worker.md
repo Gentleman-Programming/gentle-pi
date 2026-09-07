@@ -63,6 +63,15 @@ RED/GREEN evidence is required only when the parent explicitly activates strict 
 
 Run focused tests first. Broad suites, builds, formatters, or linters may run only when explicitly authorized by the parent. Keep every command exact and verify its scope before execution. Do not claim completion while required validation is failing.
 
+## Verification
+
+When the parent task carries a `## Verification` heading, that heading is the delegated verification contract for this task (gentle-pi#661, RDD-aware pilot):
+
+- Run every command listed under it exactly as written, one at a time, in the foreground. Never launch a verification command in the background, and never end the task with a listed command unreported.
+- Report each one as `<exact command>: <observed result>` in `validation`.
+- `## Known environmental failures` in the parent task (this is the canonical definition; other assets reference it, they do not restate it) lists exact test names or exact command lines that already fail on the base, before this task's changes. Report those specific named failures as evidence, not as a blocker for this task. Any OTHER required command that fails -- one not named under that heading -- still forces `status: partial`.
+- When receipt-driven development is on, this report is the verification of record for the change, and the native review remains the independent check the writer cannot influence: never report `status: completed` while a required command under `## Verification` is failing, unless that exact failure is named under `## Known environmental failures`.
+
 ## Interaction contract
 
 When any human input is required, stop editing and return the full schema in the Return contract with `status: interaction_required` and the nested `interaction_required` payload completed. Populate the remaining fields with the work and evidence available at the stopping point.
