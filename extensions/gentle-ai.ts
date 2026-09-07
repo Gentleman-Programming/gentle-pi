@@ -684,21 +684,158 @@ function renderBackgroundSubagentsStatusLine(
 	return `Background subagent policy: ${background.policy} (capability: ${background.capability})`;
 }
 
-// Rendered prompts are memoized per background policy/capability key for the
-// process lifetime; the assets bytes themselves are read once per key.
+/**
+ * A `status` object is only trusted when `effective` is exactly `on`/`off`
+ * and `source` is one of the exported `NATIVE_REVIEW_MODE_SOURCE` values.
+ * `resolveRddModeStatus` only ever produces a value shaped like this, but
+ * `renderRddStatusLine` validates at the render boundary anyway -- a
+ * malformed or partial object (a bad decode upstream, a future field
+ * change, a hand-built test fixture) must fail closed to the "unknown"
+ * line, never render an unrecognized value verbatim.
+ */
+function isValidRddModeStatus(
+	status: NativeReviewModeStatus | undefined,
+): status is NativeReviewModeStatus {
+	if (status === undefined || status === null || typeof status !== "object") return false;
+	if (status.effective !== "on" && status.effective !== "off") return false;
+	const validSources: readonly string[] = Object.values(NATIVE_REVIEW_MODE_SOURCE);
+	return typeof status.source === "string" && validSources.includes(status.source);
+}
+
+/**
+ * Renders the receipt-driven-development status line rendered next to
+ * `Background subagent policy` (gentle-pi#661). Renders the fail-closed
+ * "unknown" line whenever `status` is not a validated on/off status with a
+ * recognized source -- `undefined` (the native reader could not answer:
+ * binary absent, timed out, aborted, or a native CLI failure) or any
+ * malformed/partial object. This is a pure render, never a native call, so
+ * it never throws.
+ */
+function renderRddStatusLine(
+	status: NativeReviewModeStatus | undefined,
+): string {
+	return isValidRddModeStatus(status)
+		? `Receipt-driven development: ${status.effective} (decided by ${status.source})`
+		: "Receipt-driven development: unknown (native status unavailable)";
+}
+
+// The primary-session prompt awaits this on every non-SDD, non-named agent
+// start, so an unbounded native read would stall session start behind a
+// hung `gentle-ai` child (gentle-pi#661 native-review escalation). The
+// production call site (before_agent_start) passes
+// `AbortSignal.timeout(RDD_STATUS_TIMEOUT_MS)`; resolveRddModeStatus also
+// races the call against that same signal itself (not just the CLI's own
+// signal handling) so an abort is honored even against a stub/mock
+// reviewMode that ignores its `signal` argument, as tests do.
+const RDD_STATUS_TIMEOUT_MS = 3000;
+// Repeated session/agent-start builds within this window reuse the last
+// resolved status instead of respawning the native binary. Deliberately
+// memoizes a failed/undefined resolution too (a sustained outage should not
+// retry every agent start), trading a slower recovery signal for far fewer
+// spawns; the one-shot notify below still surfaces a sustained outage.
+const RDD_STATUS_MEMO_TTL_MS = 30_000;
+const rddStatusMemo = new Map<string, { readonly status: NativeReviewModeStatus | undefined; readonly expiresAt: number }>();
+
+/** @internal test seam: clears the per-cwd RDD status memo. */
+function clearRddStatusMemoForTesting(): void {
+	rddStatusMemo.clear();
+}
+
+function rddAbortRejection(signal: AbortSignal): Promise<never> {
+	return new Promise((_resolve, reject) => {
+		if (signal.aborted) {
+			reject(signal.reason ?? new Error("aborted"));
+			return;
+		}
+		signal.addEventListener("abort", () => reject(signal.reason ?? new Error("aborted")), { once: true });
+	});
+}
+
+async function readRddModeStatusOnce(
+	nativeReviewCli: Pick<NativeReviewCli, "reviewMode"> | null | undefined,
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<NativeReviewModeStatus | undefined> {
+	if (!nativeReviewCli?.reviewMode) return undefined;
+	try {
+		const call = nativeReviewCli.reviewMode({ cwd, operation: NATIVE_REVIEW_MODE_OPERATION.STATUS, signal });
+		const result = signal === undefined ? await call : await Promise.race([call, rddAbortRejection(signal)]);
+		return result.status;
+	} catch {
+		return undefined;
+	}
+}
+
+let rddStatusUnavailableWarned = false;
+
+/**
+ * Best-effort native RDD mode status read for prompt rendering, memoized per
+ * cwd for `RDD_STATUS_MEMO_TTL_MS`. Reuses the `reviewMode` STATUS reader
+ * (`gentle-ai review mode status --json`, decoded to
+ * `NativeReviewModeStatus`) that the `/gentle:review-mode` command also
+ * calls. Never throws and never hangs past `signal`'s deadline when one is
+ * given: an absent binary, a timed-out/aborted process, or a native CLI
+ * failure all resolve to `undefined`. `ctx` is optional and used only for a
+ * one-shot (per process) UI notice when the read is swallowed, so a
+ * sustained native outage is observable beyond the rendered "unknown" line.
+ */
+async function resolveRddModeStatus(
+	nativeReviewCli: Pick<NativeReviewCli, "reviewMode"> | null | undefined,
+	cwd: string,
+	signal?: AbortSignal,
+	now: () => number = Date.now,
+	ctx?: Pick<ExtensionContext, "hasUI" | "ui">,
+): Promise<NativeReviewModeStatus | undefined> {
+	const nowMs = now();
+	const cached = rddStatusMemo.get(cwd);
+	if (cached !== undefined && cached.expiresAt > nowMs) return cached.status;
+	const status = await readRddModeStatusOnce(nativeReviewCli, cwd, signal);
+	rddStatusMemo.set(cwd, { status, expiresAt: nowMs + RDD_STATUS_MEMO_TTL_MS });
+	if (status === undefined && !rddStatusUnavailableWarned) {
+		rddStatusUnavailableWarned = true;
+		if (ctx?.hasUI) {
+			ctx.ui.notify(
+				"Gentle AI: receipt-driven-development status is unavailable (native review CLI absent, timed out, or failed). The parent prompt renders \"unknown\" until this recovers; this notice will not repeat this session.",
+				"warning",
+			);
+		}
+	}
+	return status;
+}
+
+/** Resolves and renders the RDD status line for a production call site in one call. */
+async function resolveRddStatusLine(
+	nativeReviewCli: Pick<NativeReviewCli, "reviewMode"> | null | undefined,
+	cwd: string,
+	signal?: AbortSignal,
+	now: () => number = Date.now,
+	ctx?: Pick<ExtensionContext, "hasUI" | "ui">,
+): Promise<string> {
+	return renderRddStatusLine(await resolveRddModeStatus(nativeReviewCli, cwd, signal, now, ctx));
+}
+
+// Rendered prompts are memoized per background policy/capability/RDD-status
+// key for the process lifetime; the assets bytes themselves are read once
+// per key. `rddStatusLine` defaults to the "unknown" fallback line (the
+// longest of the three renderable forms), not "", so the default no-argument
+// render IS the worst case the canonical 8 KiB budget in
+// tests/orchestrator-budget.test.ts measures; assets/orchestrator.md is
+// sized with that worst case already included. Production still resolves
+// and passes the real line (on/off/unknown) via resolveRddStatusLine.
 const orchestratorPromptCache = new Map<string, string>();
 function getOrchestratorPrompt(
 	cwd: string = process.cwd(),
 	activeTools?: readonly string[],
+	rddStatusLine: string = renderRddStatusLine(undefined),
 ): string {
 	const background: BackgroundSubagentsRendering = {
 		policy: loadBackgroundSubagentsPolicy(cwd),
 		capability: resolveBackgroundSubagentsCapability(cwd, activeTools),
 	};
-	const cacheKey = `${background.policy}:${background.capability}`;
+	const cacheKey = `${background.policy}:${background.capability}:${rddStatusLine}`;
 	let prompt = orchestratorPromptCache.get(cacheKey);
 	if (prompt === undefined) {
-		prompt = renderOrchestratorPrompt(ASSETS_DIR, background);
+		prompt = renderOrchestratorPrompt(ASSETS_DIR, background, rddStatusLine);
 		orchestratorPromptCache.set(cacheKey, prompt);
 	}
 	return prompt;
@@ -707,12 +844,14 @@ function getOrchestratorPrompt(
 function renderOrchestratorPrompt(
 	assetsDir: string,
 	background: BackgroundSubagentsRendering = DEFAULT_BACKGROUND_SUBAGENTS_RENDERING,
+	rddStatusLine: string = renderRddStatusLine(undefined),
 ): string {
+	const backgroundPolicyBlock = `${renderBackgroundSubagentsStatusLine(background)}\n${rddStatusLine}`;
 	return readFileSync(join(assetsDir, "orchestrator.md"), "utf8")
 		.replaceAll("{{GENTLE_PI_ASSETS_ROOT}}", assetsDir)
 		.replaceAll(
 			"{{GENTLE_PI_BACKGROUND_POLICY}}",
-			renderBackgroundSubagentsStatusLine(background),
+			backgroundPolicyBlock,
 		)
 		.trim();
 }
@@ -811,6 +950,7 @@ function buildGentlePrompt(
 	persona: PersonaMode,
 	cwd: string = process.cwd(),
 	activeTools?: readonly string[],
+	rddStatusLine: string = renderRddStatusLine(undefined),
 ): string {
 	const personaPrompt =
 		persona === "neutral" ? NEUTRAL_PERSONA_PROMPT : GENTLEMAN_PERSONA_PROMPT;
@@ -845,7 +985,7 @@ Harness principles:
 - Protect the human reviewer: avoid oversized changes, surface review workload risk, and ask before turning one task into a large multi-area change.
 - Never claim persistent memory is available because of this package. Memory is provided by separate packages or MCP tools when installed and callable.
 
-${getOrchestratorPrompt(cwd, activeTools)}`;
+${getOrchestratorPrompt(cwd, activeTools, rddStatusLine)}`;
 }
 
 // Matches `git [global-flags] push` — tolerates flags like -C /repo or --work-tree=/tmp
@@ -5966,6 +6106,13 @@ export const __testing = {
 	resolveBackgroundSubagentsCapability,
 	readActiveToolNames,
 	renderBackgroundSubagentsStatusLine,
+	renderRddStatusLine,
+	isValidRddModeStatus,
+	resolveRddModeStatus,
+	resolveRddStatusLine,
+	RDD_STATUS_TIMEOUT_MS,
+	RDD_STATUS_MEMO_TTL_MS,
+	clearRddStatusMemoForTesting,
 	resolveControllerSddStatus,
 	resolveStartupControllerSddStatus,
 	createGentleAiExtension: createGentleAiExtensionForTesting,
@@ -6408,9 +6555,21 @@ function createGentleAiExtensionForTesting(
 				prefs?.artifactStore,
 			), phase)}`
 			: "";
+		// gentle-pi#661: the RDD status line (and the rest of the gentle prompt)
+		// is built only for the primary session, mirrored on the
+		// reviewContractPrompt condition below -- named/SDD agents never reach
+		// this branch, so no line is resolved or computed for them.
+		// resolveRddStatusLine never throws and never hangs past
+		// RDD_STATUS_TIMEOUT_MS: an absent/timed-out/aborted/failing native
+		// binary renders the fail-closed "unknown" line instead.
 		const gentlePrompt = isNamedAgent || isSddAgent
 			? ""
-			: `\n\n${buildGentlePrompt(readPersonaMode(ctx.cwd), ctx.cwd, readActiveToolNames(pi))}`;
+			: `\n\n${buildGentlePrompt(
+					readPersonaMode(ctx.cwd),
+					ctx.cwd,
+					readActiveToolNames(pi),
+					await resolveRddStatusLine(nativeReviewCli, ctx.cwd, AbortSignal.timeout(RDD_STATUS_TIMEOUT_MS), undefined, ctx),
+				)}`;
 		// gentle-pi#560 / gentle-ai#4056, #4057: inject the mirrored provider
 		// contract bundle's review execution contract for the primary session
 		// only, and only when a native review CLI is actually present.
