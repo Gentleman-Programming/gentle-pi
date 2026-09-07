@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os, { tmpdir } from "node:os";
+import { syncBuiltinESMExports } from "node:module";
+import { dirname, join, resolve, sep } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { __testing, createGentleAiExtension, PendingReviewConsentRegistry } from "../extensions/gentle-ai.ts";
@@ -735,6 +738,94 @@ function repository(t: test.TestContext): string {
 	return cwd;
 }
 
+test("candidate lifecycle sweeps startup and cleans every shutdown including reload", async (t) => {
+	const cwd = repository(t);
+	for (const key of ["HOME", "GENTLE_PI_AGENT_HOME", "PI_CODING_AGENT_DIR", "GENTLE_PI_CONFIG_HOME", "GENTLE_PI_GENTLE_AI_DEV_BINARY"]) {
+		const previous = process.env[key];
+		process.env[key] = key === "GENTLE_PI_GENTLE_AI_DEV_BINARY" ? "" : join(cwd, key);
+		if (process.env[key]) mkdirSync(process.env[key]!, { recursive: true });
+		t.after(() => { if (previous === undefined) delete process.env[key]; else process.env[key] = previous; });
+	}
+	t.mock.method(os, "homedir", () => join(cwd, "HOME"));
+	const homeAgent = join(cwd, "HOME", ".agents", "isolation-probe.md");
+	mkdirSync(dirname(homeAgent), { recursive: true });
+	writeFileSync(homeAgent, "---\nname: isolation-probe\ndescription: Fixture\n---\n");
+	writeFileSync(join(cwd, "GENTLE_PI_CONFIG_HOME", "models.json"), JSON.stringify({ "isolation-probe": { model: "fixture/model" } }));
+	t.diagnostic(`startup routing: cwd=${cwd}; HOME, GENTLE_PI_AGENT_HOME, PI_CODING_AGENT_DIR, GENTLE_PI_CONFIG_HOME are same-named children; dev-binary override disabled`);
+	const calls: string[] = [];
+	const destinations: string[] = [];
+	const violations: string[] = [];
+	const discovery: string[] = [];
+	const assets = resolve("assets");
+	const inside = (root: string, path: string) => path === root || path.startsWith(`${root}${sep}`);
+	const originalExists = fs.existsSync;
+	const originalRealpath = fs.realpathSync;
+	// Install guards BEFORE startup, including RED: a swallowed startup error
+	// must never hide an attempted external write or read real-home contents.
+	for (const [module, names] of [
+		[fs, ["existsSync", "lstatSync", "readdirSync", "readFileSync", "mkdirSync", "writeFileSync", "rmSync"]],
+		[fsp, ["access", "readdir", "readFile", "mkdir", "writeFile"]],
+	] as const) {
+		for (const name of names) {
+			const original = (module as any)[name];
+			t.mock.method(module as any, name, (value: string, ...args: unknown[]) => {
+				const path = resolve(value);
+				const writes = /^(mkdir|writeFile|rm)/.test(name);
+				const allowed = inside(cwd, path) || (!writes && inside(assets, path));
+				if (!allowed && name === "existsSync") return false;
+				if (!allowed && ["access", "readdir"].includes(name)) return Promise.reject(Object.assign(new Error("fixture discovery boundary"), { code: "ENOENT" }));
+				if (!allowed) { violations.push(`${name}:${path}`); throw new Error("fixture filesystem boundary"); }
+				if (writes) {
+					let ancestor = path;
+					while (!originalExists(ancestor)) ancestor = dirname(ancestor);
+					assert.ok(inside(cwd, originalRealpath(ancestor)), "write ancestor escaped fixture");
+					destinations.push(path);
+				}
+				if (name.startsWith("readdir")) discovery.push(path);
+				return original(value, ...args);
+			});
+		}
+	}
+	syncBuiltinESMExports();
+	// Prove the guard refuses an escape without performing the attempted write.
+	const escape = join(cwd, "..", "startup-isolation-escape");
+	assert.throws(() => fs.writeFileSync(escape, "blocked"), /fixture filesystem boundary/);
+	assert.deepEqual(violations, [`writeFileSync:${escape}`]);
+	violations.length = 0;
+	const hooks = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
+	const registry = new CandidateViewRegistry();
+	t.mock.method(registry, "sweepOrphans", (root: string) => { assert.equal(root, cwd); calls.push("sweep"); });
+	t.mock.method(registry, "cleanupAll", () => { calls.push("cleanup"); });
+	createGentleAiExtension({ nativeReviewCli: null, candidateViews: registry, processEnv: {} })({
+		on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
+			hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+		},
+		registerTool() {}, registerCommand() {},
+	} as unknown as ExtensionAPI);
+	try {
+		assert.equal(hooks.get("session_start")?.length, 1);
+		await hooks.get("session_start")![0]!({ reason: "startup" }, reviewContext(cwd));
+		assert.deepEqual(violations, []);
+		assert.ok(destinations.length > 0, "startup must actually write fixture assets");
+		assert.ok(discovery.includes(join(cwd, "HOME", ".agents")), "home agent discovery must use the fixture");
+		assert.equal(existsSync(join(cwd, "GENTLE_PI_AGENT_HOME", "gentle-ai", "managed-assets.json")), true);
+		assert.match(readFileSync(homeAgent, "utf8"), /model: fixture\/model/);
+		assert.ok(destinations.includes(homeAgent), "the discovered fixture agent must actually receive routing");
+		assert.ok(destinations.includes(join(cwd, "GENTLE_PI_AGENT_HOME", "subagents.json")));
+		t.diagnostic(`confined startup: ${destinations.length} filesystem mutations; fixture home-agent routing and managed-assets manifest verified; external violations=0`);
+		assert.deepEqual(calls, ["sweep"]);
+	} finally {
+		// Restore only mocks before fixture teardown; never clean external paths.
+		t.mock.restoreAll();
+		syncBuiltinESMExports();
+	}
+	t.mock.method(registry, "cleanupAll", () => { calls.push("cleanup"); });
+	for (const reason of ["quit", "reload", "new", "resume", "fork"]) {
+		for (const hook of hooks.get("session_shutdown")!) await hook({ reason }, reviewContext(cwd));
+	}
+	assert.deepEqual(calls, ["sweep", ...Array(5).fill("cleanup")]);
+});
+
 interface RegisteredControllerTool {
 	execute: (toolCallId: string, params: unknown, signal: AbortSignal | undefined, onUpdate: undefined, ctx: ExtensionContext) => Promise<{ details?: unknown }>;
 }
@@ -873,6 +964,22 @@ test("ordinary START relays native consent without authoring or advancing it", a
 	assert.equal(result.outcome, "native-review-consent-required");
 	assert.equal(typeof result.consent_binding, "string");
 	assert.equal(result.mutation_outcome, "none");
+});
+
+test("shutdown preserves failed consent candidates without interrupting session teardown", async (t) => {
+	const cwd = repository(t);
+	const consent = decodeReviewConsentV3(JSON.parse(readFileSync(join(process.cwd(), "tests", "fixtures", "devbinary", "consent-v3.captured.json"), "utf8")));
+	const native = {
+		targetStatus: async () => startStatus(cwd),
+		start: async () => { throw new NativeReviewConsentRequiredError(consent); },
+	} as unknown as NativeReviewCli;
+	const registry = new CandidateViewRegistry();
+	const runtime = reviewRuntime(native, registry);
+	const ctx = reviewContext(cwd);
+	const result = await runtime.controller.execute("pending", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, ctx);
+	assert.equal((result.details as { outcome: string }).outcome, "native-review-consent-required");
+	t.mock.method(registry, "cleanup", () => { throw new Error("fixture unsafe ownership"); });
+	assert.doesNotThrow(() => runtime.sessionShutdown({ reason: "reload" }, ctx));
 });
 
 test("ordinary START obeys the review-mode kill switch before target STATUS", async () => {

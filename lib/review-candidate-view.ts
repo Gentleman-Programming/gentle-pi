@@ -5,6 +5,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
+import { assertCandidateOwnerParent, createCandidateOwner, removeCandidateOwner, sweepCandidateOwners, type CandidateViewOwner } from "./review-candidate-view-owner.ts";
 
 const REVIEW_LENS = ["review-risk", "review-resilience", "review-readability", "review-reliability"] as const;
 export type ReviewLens = (typeof REVIEW_LENS)[number];
@@ -99,6 +100,7 @@ interface CandidateViewScope {
 }
 
 interface CandidateViewRecord {
+	owner: CandidateViewOwner;
 	token: string;
 	root: string;
 	parent: string;
@@ -628,11 +630,15 @@ function makeWritableForCleanup(path: string): void {
 }
 
 function candidateViewParent(commonDir: string): string {
-	const parent = join(commonDir, "gentle-ai", "candidate-views");
+	const control = join(commonDir, "gentle-ai");
+	mkdirSync(control, { recursive: true, mode: 0o700 });
+	const controlStat = lstatSync(control);
+	if (!controlStat.isDirectory() || controlStat.isSymbolicLink() || realpathSync(control) !== control) throw new CandidateViewError("candidate view ancestor is unsafe");
+	const parent = join(control, "candidate-views");
 	mkdirSync(parent, { recursive: true, mode: 0o700 });
 	const stat = lstatSync(parent);
 	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new CandidateViewError("candidate view parent is unsafe");
-	return realpathSync(parent);
+	return assertCandidateOwnerParent(commonDir);
 }
 
 export interface ResolvedCandidateBase {
@@ -852,6 +858,7 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 		? resolveCandidateBase(contributorRoot, "HEAD", process.env, executor)
 		: base;
 	const parent = candidateViewParent(canonicalCommonDir);
+	sweepCandidateOwners(canonicalCommonDir, (args) => git(canonicalCommonDir, args, process.env, executor), makeWritableForCleanup);
 	const index = mkdtempSync(join(tmpdir(), "gentle-ai-candidate-index-"));
 	const indexPath = join(index, "index");
 	const environment = { ...process.env, GIT_INDEX_FILE: indexPath };
@@ -875,6 +882,7 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 		}
 		const candidateTree = git(contributorRoot, ["write-tree"], environment, executor);
 		const root = join(parent, randomUUID());
+		const owner = createCandidateOwner(canonicalCommonDir, root);
 		// The worktree is created under the same try/catch cleanup boundary as
 		// the read-tree materialization that follows. addUnbornWorktree's
 		// fallback path can register a worktree with `worktree add` and then
@@ -895,9 +903,9 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 			const scope = deriveChangedScope(contributorRoot, base.tree, candidateTree, [...tree.entries, ...tree.gitlinks], executor);
 			for (const gitlink of tree.gitlinks) if (lstatSync(join(root, gitlink.path), { throwIfNoEntry: false })) throw new CandidateViewError("candidate view materialized a metadata-only gitlink");
 			makeReadonly(root, entries);
-			return { token: basename(root), root: realpathSync(root), parent, contributorRoot, commonDir: canonicalCommonDir, baseCommit, baseTree: base.tree, candidateTree, committedOnly, intendedUntracked, entries, gitlinks: tree.gitlinks, scope, gitExecutor: executor };
+			return { owner, token: basename(root), root: realpathSync(root), parent, contributorRoot, commonDir: canonicalCommonDir, baseCommit, baseTree: base.tree, candidateTree, committedOnly, intendedUntracked, entries, gitlinks: tree.gitlinks, scope, gitExecutor: executor };
 		} catch (error) {
-			try { git(contributorRoot, ["worktree", "remove", "--force", root], process.env, executor); } catch { rmSync(root, { recursive: true, force: true }); }
+			try { removeCandidateOwner(owner, (args) => git(canonicalCommonDir, args, process.env, executor), makeWritableForCleanup); } catch { /* Preserve the marker and any partial worktree for conservative recovery. */ }
 			throw error;
 		}
 	} finally {
@@ -1050,8 +1058,18 @@ export class CandidateViewRegistry {
 		return this.createOrReuse(request);
 	}
 
+	sweepOrphans(contributorRoot: string): void {
+		try {
+			const cwd = realpathSync(contributorRoot);
+			const common = realpathSync(resolve(cwd, git(cwd, ["rev-parse", "--git-common-dir"], process.env, this.gitExecutor)));
+			sweepCandidateOwners(common, (args) => git(common, args, process.env, this.gitExecutor), makeWritableForCleanup);
+		} catch { /* Non-repositories and unavailable ownership are preserved. */ }
+	}
+
 	cleanupAll(): void {
-		for (const token of [...this.records.keys()]) this.cleanup(token);
+		for (const token of [...this.records.keys()]) {
+			try { this.cleanup(token); } catch { /* Continue other owned views; failed records remain retryable. */ }
+		}
 	}
 
 	createOrReuse(request: CreateCandidateViewRequest): CandidateView {
@@ -1546,10 +1564,7 @@ export class CandidateViewRegistry {
 
 	private remove(record: CandidateViewRecord): void {
 		if (!isWithin(record.parent, record.root)) throw new CandidateViewError("candidate view cleanup escaped its owned parent");
-		try { makeWritableForCleanup(record.root); } catch {}
-		try { git(record.contributorRoot, ["worktree", "remove", "--force", record.root], process.env, record.gitExecutor); } catch {}
-		// Git removes worktree metadata; physical removal remains this owner's duty.
-		rmSync(record.root, { recursive: true, force: true });
+		removeCandidateOwner(record.owner, (args) => git(record.commonDir, args, process.env, record.gitExecutor), makeWritableForCleanup);
 	}
 
 	private forget(record: CandidateViewRecord): void {
