@@ -35,21 +35,6 @@ Package static assets intentionally omit lifecycle instructions, candidate routi
 - Keep command safety and user interaction in the host, without interpreting provider authority state.
 - Keep durable review state, admissions, correction accounting, and approvals in Gentle AI. Keep delivery decisions in ordinary repository policy.
 
-## Native risk-gated verification (gentle-pi#662)
-
-Separate from the review-authority transport above, the host also exposes one read-only native operation: `gentle-ai review assess --cwd <repo> [--base-ref <ref> --committed-only] --json` (gentle-ai#4295). It is decoded by `lib/review-risk-assessment.ts` and wired through `lib/native-review-cli.ts` exactly like the existing `reviewMode` STATUS reader -- a bounded subprocess with a typed decode, never a mutation. A non-zero exit, a failure envelope, or an older binary without the verb all fail closed to `high` risk.
-
-The `gentle_review` tool's `assess` operation (`extensions/gentle-ai.ts`) combines that assessment with the rendered `Receipt-driven development:` line to decide whether a delegated writer's change needs a separate `gentle-ai-verify` run, following this tier table:
-
-| Native risk tier | Verification when RDD is `off`/`unknown` |
-| --- | --- |
-| passive | structural readback by the parent; no separate verifier, no tests |
-| medium | writer self-verification stands; a separate `gentle-ai-verify` run is added only when the writer profile is a small model (mini or low effort) |
-| high | writer self-verification plus a separate `gentle-ai-verify` run, always |
-| unknown / assess failed | treated as high |
-
-When RDD is `on`, the writer's own self-verification is the record and the native review is the independent check, except a passive-risk change, which still gets a structural readback instead. The small-model bias raises the medium tier to high for verification purposes only; an unknown RDD line never lowers a tier below `off`. The parent's own spot check (re-running one reported command before delivery) stays required in every tier.
-
 ## Review checklist
 
 - [ ] The adapter surface is still `Buffer → Buffer/error`.
