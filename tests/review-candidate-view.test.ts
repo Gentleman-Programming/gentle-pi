@@ -1071,6 +1071,7 @@ test("candidate registry forwards explicit Windows mode validation to view verif
 	writeFileSync(join(contributorRoot, "unchanged-executable.sh"), "#!/bin/sh\necho base\n");
 	git(contributorRoot, "add", "unchanged-executable.sh");
 	git(contributorRoot, "update-index", "--chmod=+x", "unchanged-executable.sh");
+	chmodSync(join(contributorRoot, "unchanged-executable.sh"), 0o755);
 	git(contributorRoot, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "executable base");
 	writeFileSync(join(contributorRoot, "tracked.txt"), "changed\n");
 	const view = new CandidateViewRegistry(undefined, "win32").createOrReuse({ contributorRoot, baseRef: "HEAD" });
