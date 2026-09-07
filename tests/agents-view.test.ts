@@ -32,15 +32,19 @@ function harness(rows = 8, sessionId?: string) {
 	return { store, view, events, renders: () => renders };
 }
 
-test("itemLines renders text, thinking, tools with an output tail, and notes", () => {
+test("itemLines renders text, whole thinking blocks, whole tool output, and notes", () => {
 	assert.deepEqual(itemLines({ kind: "text", text: "one two three four" }, plainTheme, 9), ["one two", "three", "four"]);
-	assert.deepEqual(itemLines({ kind: "thinking", text: "deep\nthoughts" }, plainTheme, 20), ["∴ deep"]);
+	assert.deepEqual(itemLines({ kind: "thinking", text: "deep\nthoughts" }, plainTheme, 20), ["∴ deep", "  thoughts"]);
 	const output = Array.from({ length: 10 }, (_, index) => `line ${index}`).join("\n");
 	const tool = itemLines({ kind: "tool", callId: "c", name: "bash", args: { command: "ls  -la" }, output, running: true, isError: false }, plainTheme, 30);
 	assert.equal(tool[0], "▸ bash ls -la");
-	assert.equal(tool.length, 10, "head, eight tail lines, running marker");
-	assert.equal(tool[1], "  line 2");
-	assert.equal(tool[9], "  …");
+	assert.equal(tool.length, 12, "head, every output line, running marker");
+	assert.equal(tool[1], "  line 0");
+	assert.equal(tool[10], "  line 9");
+	assert.equal(tool[11], "  …");
+	// A long output line wraps instead of being clipped, so nothing is hidden.
+	const wide = itemLines({ kind: "tool", callId: "c", name: "bash", args: {}, output: "alpha beta gamma delta", running: false, isError: false }, plainTheme, 12);
+	assert.deepEqual(wide.slice(1), ["  alpha beta", "  gamma", "  delta"]);
 	assert.deepEqual(itemLines({ kind: "note", text: "error: boom" }, plainTheme, 30), ["· error: boom"]);
 	assert.equal(taskHeader(task("a"), 61_000), "explore · running · gpt-5.6-terra · 34k · $0.27 · 1m00s");
 });

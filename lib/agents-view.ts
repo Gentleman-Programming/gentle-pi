@@ -78,7 +78,6 @@ const LIST_MAX_WIDTH = 34;
 const LIST_RATIO = 0.32;
 const CHROME_ROWS = 3;
 const MIN_BODY_ROWS = 1;
-const OUTPUT_TAIL_LINES = 8;
 export const SESSION_FINISHED_TTL_MS = 15 * 60_000;
 const SCOPE_LABEL: Record<ViewScope, string> = { [VIEW_SCOPE.SESSION]: "this session", [VIEW_SCOPE.ALL]: "all sessions" };
 const SCOPE_KEY: Record<ViewScope, string> = { [VIEW_SCOPE.SESSION]: "all sessions", [VIEW_SCOPE.ALL]: "this session" };
@@ -125,9 +124,22 @@ function toolLines(item: ToolItem, theme: AgentsViewTheme, width: number): strin
 	const role = item.isError ? ROLE.TOOL_ERROR : ROLE.TOOL;
 	const head = truncateToWidth(`▸ ${item.name} ${argsSummary(item)}`, width, "…");
 	const lines = [theme.fg(role, head)];
-	const output = item.output.split("\n").filter((line) => line.length > 0);
-	for (const line of output.slice(-OUTPUT_TAIL_LINES)) lines.push(theme.fg(ROLE.OUTPUT, truncateToWidth(`  ${line}`, width, "…")));
+	// The whole captured output, wrapped: the thread pane scrolls, so nothing
+	// is hidden here. The store already keeps only the last maxOutputChars of a
+	// tool's output and marks the cut with a leading ellipsis.
+	for (const line of item.output.split("\n").filter((line) => line.length > 0)) {
+		for (const wrapped of wrapTextWithAnsi(line, Math.max(1, width - 2))) lines.push(theme.fg(ROLE.OUTPUT, `  ${wrapped}`));
+	}
 	if (item.running) lines.push(theme.fg(ROLE.META, "  …"));
+	return lines;
+}
+
+function thinkingLines(text: string, theme: AgentsViewTheme, width: number): string[] {
+	const lines: string[] = [];
+	for (const [index, line] of text.split("\n").filter((line) => line.length > 0).entries()) {
+		const prefix = index === 0 ? "∴ " : "  ";
+		for (const wrapped of wrapTextWithAnsi(line, Math.max(1, width - 2))) lines.push(theme.fg(ROLE.THINKING, `${prefix}${wrapped}`));
+	}
 	return lines;
 }
 
@@ -136,7 +148,7 @@ export function itemLines(item: ThreadItem, theme: AgentsViewTheme, width: numbe
 		case THREAD_ITEM.TEXT:
 			return wrapTextWithAnsi(item.text, width).map((line) => theme.fg(ROLE.TEXT, line));
 		case THREAD_ITEM.THINKING:
-			return [theme.fg(ROLE.THINKING, truncateToWidth(`∴ ${item.text.split("\n")[0] ?? ""}`, width, "…"))];
+			return thinkingLines(item.text, theme, width);
 		case THREAD_ITEM.TOOL:
 			return toolLines(item, theme, width);
 		case THREAD_ITEM.NOTE:
