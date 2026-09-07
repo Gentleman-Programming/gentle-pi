@@ -1,5 +1,5 @@
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -220,7 +220,7 @@ export function codeGraphNodeScript(cmdPath: string): string | undefined {
 					: undefined;
 		if (typeof target !== "string" || !target) return undefined;
 		const script = join(pkgRoot, target);
-		return existsSync(script) ? script : undefined;
+		return statSync(script).isFile() ? script : undefined;
 	} catch {
 		return undefined;
 	}

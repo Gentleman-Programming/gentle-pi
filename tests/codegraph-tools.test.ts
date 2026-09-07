@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -241,7 +241,7 @@ function withWindowsPath(t: test.TestContext, path: string): void {
 		? `${path};${previousWindowsPath ?? previousPath ?? ""}`
 		: path;
 	process.env.Path = windowsPath;
-	if (process.platform === "win32") process.env.PATH = windowsPath;
+	process.env.PATH = windowsPath;
 	t.after(() => {
 		if (previousPath === undefined) delete process.env.PATH;
 		else process.env.PATH = previousPath;
@@ -256,6 +256,9 @@ test("Windows shim helpers skip stale PATH shims before resolving the npm script
 	t.after(() => rmSync(staleBinDir, { recursive: true, force: true }));
 	t.after(() => rmSync(validBinDir, { recursive: true, force: true }));
 	writeFileSync(join(staleBinDir, "codegraph.cmd"), "@ECHO off\n");
+	const stalePkgRoot = join(staleBinDir, "node_modules", "@colbymchenry", "codegraph");
+	mkdirSync(stalePkgRoot, { recursive: true });
+	writeFileSync(join(stalePkgRoot, "package.json"), JSON.stringify({ bin: { codegraph: "." } }));
 	const scriptTarget = writeCodeGraphPackage(validBinDir);
 
 	withWindowsPath(t, `${staleBinDir};${validBinDir}`);
@@ -269,6 +272,11 @@ test("Windows launcher passes command metacharacters as one literal argv value",
 	t.after(() => rmSync(binDir, { recursive: true, force: true }));
 	writeCodeGraphPackage(binDir, "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n");
 	const cwd = workspace(t);
+	if (process.platform !== "win32") {
+		const gitShim = join(binDir, "git");
+		writeFileSync(gitShim, "#!/bin/sh\nprintf '%s\\n' \"$PWD\"\n");
+		chmodSync(gitShim, 0o755);
+	}
 	withWindowsPath(t, binDir);
 
 	const previousPlatform = process.platform;
