@@ -108,10 +108,15 @@ import { CandidateViewError, CandidateViewRegistry, injectReviewCandidateView, r
 import {
 	GentleAiDevBinaryOverrideError,
 	registerGentleAiDevBinary,
+	resolveGentleAiBinary,
 	resolveGentleAiDevBinaryOverride,
 	unregisterGentleAiDevBinary,
 	type GentleAiDevBinaryOverride,
 } from "../lib/gentle-ai-binary.ts";
+import {
+	spawnTelemetryTrigger,
+	type TelemetryTriggerSpawn,
+} from "../lib/telemetry-trigger.ts";
 import {
 	createNativeReviewCli,
 	createNodeExecFileAdapter,
@@ -143,7 +148,21 @@ import {
 	type NativeReviewModeSource,
 	type NativeReviewProcessDiagnostics,
 	type NativeStartResult,
+	type NativeReviewAssessRequest,
+	type ExecFileAdapter,
+	type ExecFileResult,
 } from "../lib/native-review-cli.ts";
+import {
+	verificationPlan,
+	resolveWriterProfile,
+	RDD_LINE,
+	VERIFICATION_TIER,
+	NATIVE_REVIEW_OUTCOME,
+	type RddLine,
+	type VerificationTier,
+	type ReviewAssessmentV1,
+	type NativeReviewOutcome,
+} from "../lib/review-risk-assessment.ts";
 import {
 	assertReviewApprovedAcknowledgementExecuteV1,
 	decodeReviewLastEventClosureV1,
@@ -154,7 +173,19 @@ import {
 	type ReviewStatusV3,
 } from "../lib/review-integration-v2.ts";
 import { reconcileUnknownReviewLastEventCapture } from "../lib/review-last-event-controller.ts";
-import { recordReviewConsentLatch } from "../lib/review-consent-latch.ts";
+import { acquireChildStandingReviewPermissionClient, type ChildStandingReviewPermissionClient } from "../lib/review-session-standing-permission-ipc.ts";
+import { isPiConsentV3, presentReviewConsentUi } from "../lib/review-consent-ui.ts";
+import {
+	captureReviewSessionIdentity,
+	grantReviewSessionPermission,
+	hasReviewSessionPermission,
+	resolveCanonicalGitRepositoryIdentity,
+	revokeReviewSessionPermission,
+	reviewSessionPermissionEpoch,
+	revokeReviewSessionPermissionsForSession,
+	sameReviewSessionIdentity,
+	type ReviewSessionIdentity,
+} from "../lib/review-session-standing-permission.ts";
 
 const GRAPH_V1_ORDINARY_READ_ONLY = "Graph-v1 ordinary review authority is read-only; use native compact-v2 review operations";
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -672,21 +703,288 @@ function renderBackgroundSubagentsStatusLine(
 	return `Background subagent policy: ${background.policy} (capability: ${background.capability})`;
 }
 
-// Rendered prompts are memoized per background policy/capability key for the
-// process lifetime; the assets bytes themselves are read once per key.
+/**
+ * A `status` object is only trusted when `effective` is exactly `on`/`off`
+ * and `source` is one of the exported `NATIVE_REVIEW_MODE_SOURCE` values.
+ * `resolveRddModeStatus` only ever produces a value shaped like this, but
+ * `renderRddStatusLine` validates at the render boundary anyway -- a
+ * malformed or partial object (a bad decode upstream, a future field
+ * change, a hand-built test fixture) must fail closed to the "unknown"
+ * line, never render an unrecognized value verbatim.
+ */
+function isValidRddModeStatus(
+	status: NativeReviewModeStatus | undefined,
+): status is NativeReviewModeStatus {
+	if (status === undefined || status === null || typeof status !== "object") return false;
+	if (status.effective !== "on" && status.effective !== "off") return false;
+	const validSources: readonly string[] = Object.values(NATIVE_REVIEW_MODE_SOURCE);
+	return typeof status.source === "string" && validSources.includes(status.source);
+}
+
+/**
+ * Renders the receipt-driven-development status line rendered next to
+ * `Background subagent policy` (gentle-pi#661). Renders the fail-closed
+ * "unknown" line whenever `status` is not a validated on/off status with a
+ * recognized source -- `undefined` (the native reader could not answer:
+ * binary absent, timed out, aborted, or a native CLI failure) or any
+ * malformed/partial object. This is a pure render, never a native call, so
+ * it never throws.
+ */
+function renderRddStatusLine(
+	status: NativeReviewModeStatus | undefined,
+): string {
+	return isValidRddModeStatus(status)
+		? `Receipt-driven development: ${status.effective} (decided by ${status.source})`
+		: "Receipt-driven development: unknown (native status unavailable)";
+}
+
+// The primary-session prompt awaits this on every non-SDD, non-named agent
+// start, so an unbounded native read would stall session start behind a
+// hung `gentle-ai` child (gentle-pi#661 native-review escalation). The
+// production call site (before_agent_start) passes
+// `AbortSignal.timeout(RDD_STATUS_TIMEOUT_MS)`; resolveRddModeStatus also
+// races the call against that same signal itself (not just the CLI's own
+// signal handling) so an abort is honored even against a stub/mock
+// reviewMode that ignores its `signal` argument, as tests do.
+const RDD_STATUS_TIMEOUT_MS = 3000;
+// Repeated session/agent-start builds within this window reuse the last
+// resolved status instead of respawning the native binary. Deliberately
+// memoizes a failed/undefined resolution too (a sustained outage should not
+// retry every agent start), trading a slower recovery signal for far fewer
+// spawns; the one-shot notify below still surfaces a sustained outage.
+const RDD_STATUS_MEMO_TTL_MS = 30_000;
+const rddStatusMemo = new Map<string, { readonly status: NativeReviewModeStatus | undefined; readonly expiresAt: number }>();
+
+/** @internal test seam: clears the per-cwd RDD status memo. */
+function clearRddStatusMemoForTesting(): void {
+	rddStatusMemo.clear();
+}
+
+// gentle-pi#668 (corrected): last-known outcome for ONE candidate, keyed by
+// repository realpath AND targetIdentity -- never repository alone, or one
+// candidate's outcome would leak into every other candidate's `assess` call.
+// Only declined/unavailable are ever written (from ANSWER_CONSENT); `closed`
+// is never written/derived -- pass it explicitly. A missing entry reads back
+// `undefined`, treated as `unknown` (fail closed, exactly like `off`).
+const nativeReviewOutcomeByCandidate = new Map<string, "declined" | "unavailable">();
+
+function nativeReviewOutcomeMemoKey(cwd: string, targetIdentity: string): string {
+	try {
+		return `${realpathSync(cwd)}\u0000${targetIdentity}`;
+	} catch {
+		return `${cwd}\u0000${targetIdentity}`;
+	}
+}
+
+function recordNativeReviewOutcome(cwd: string, targetIdentity: string, outcome: "declined" | "unavailable"): void {
+	nativeReviewOutcomeByCandidate.set(nativeReviewOutcomeMemoKey(cwd, targetIdentity), outcome);
+}
+
+/** Returns the recorded outcome for exactly this candidate, or `undefined` when none is recorded. */
+function readNativeReviewOutcome(cwd: string, targetIdentity: string): "declined" | "unavailable" | undefined {
+	return nativeReviewOutcomeByCandidate.get(nativeReviewOutcomeMemoKey(cwd, targetIdentity));
+}
+
+/** @internal test seam: clears the per-candidate native review outcome memo. */
+function clearNativeReviewOutcomeMemoForTesting(): void {
+	nativeReviewOutcomeByCandidate.clear();
+}
+
+// Best-effort current-candidate target identity for `assess` (gentle-pi#668):
+// reuses `targetStatus`, a native call this tool already makes elsewhere.
+async function readCurrentTargetIdentityBestEffort(
+	nativeReviewCli: Pick<NativeReviewCli, "targetStatus"> | null | undefined,
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	if (nativeReviewCli?.targetStatus === undefined) return undefined;
+	try {
+		const status = await nativeReviewCli.targetStatus({ cwd, ...(signal === undefined ? {} : { signal }) });
+		return status.applicability === "current_target" ? status.targetIdentity : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function rddAbortRejection(signal: AbortSignal): Promise<never> {
+	return new Promise((_resolve, reject) => {
+		if (signal.aborted) {
+			reject(signal.reason ?? new Error("aborted"));
+			return;
+		}
+		signal.addEventListener("abort", () => reject(signal.reason ?? new Error("aborted")), { once: true });
+	});
+}
+
+async function readRddModeStatusOnce(
+	nativeReviewCli: Pick<NativeReviewCli, "reviewMode"> | null | undefined,
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<NativeReviewModeStatus | undefined> {
+	if (!nativeReviewCli?.reviewMode) return undefined;
+	try {
+		const call = nativeReviewCli.reviewMode({ cwd, operation: NATIVE_REVIEW_MODE_OPERATION.STATUS, signal });
+		const result = signal === undefined ? await call : await Promise.race([call, rddAbortRejection(signal)]);
+		return result.status;
+	} catch {
+		return undefined;
+	}
+}
+
+// gentle-pi#662: read-only combined native risk assessment plus the computed
+// verification plan (`lib/review-risk-assessment.ts`), for the `gentle_review`
+// tool's `assess` operation. Never throws: an unavailable/failed native
+// assess call (older binary without the verb, timeout, malformed response)
+// resolves to the `unassessable` tier, which `verificationPlan` treats the
+// same as `high` -- the fail-closed rule from gentle-pi#662.
+interface ReviewAssessmentPlanDetails {
+	schema: "gentle-pi.review-assessment-plan/v1";
+	risk: VerificationTier;
+	reasons: readonly { code: string; path: string; detail: string }[];
+	changedPaths: number;
+	changedLines: number;
+	candidate: { kind: string; baseRef: string | undefined } | null;
+	rddLine: RddLine;
+	nativeReviewOutcome: NativeReviewOutcome;
+	// gentle-pi#668: where nativeReviewOutcome came from -- explicit (caller
+	// passed it), derived (matched this exact candidate), or unknown.
+	outcome_source: "explicit" | "derived" | "unknown";
+	writerProfile: "small" | "large";
+	plan: {
+		writerSelfVerification: boolean;
+		structuralReadbackOnly: boolean;
+		independentVerifier: boolean;
+		reason: string;
+	};
+}
+
+async function resolveReviewAssessmentPlan(
+	nativeReviewCli: Pick<NativeReviewCli, "reviewMode" | "assess" | "targetStatus"> | null | undefined,
+	cwd: string,
+	input: ReviewAssessInput,
+	signal?: AbortSignal,
+): Promise<ReviewAssessmentPlanDetails> {
+	if (input.baseRef !== undefined && input.committedOnly !== true) throw new Error("Review assess baseRef requires committedOnly: true");
+	if (input.baseRef === undefined && input.committedOnly !== undefined) throw new Error("Review assess committedOnly requires an explicit baseRef");
+
+	const status = await readRddModeStatusOnce(nativeReviewCli, cwd, signal);
+	const rddLine: RddLine = isValidRddModeStatus(status) ? status.effective : RDD_LINE.UNKNOWN;
+	const writerProfile = resolveWriterProfile({
+		...(input.writerModelId === undefined ? {} : { model: { id: input.writerModelId } }),
+		thinking: input.writerEffort,
+	});
+
+	let assessment: ReviewAssessmentV1 | undefined;
+	let unassessableDetail: string | undefined;
+	if (nativeReviewCli?.assess === undefined) {
+		unassessableDetail = "native review assess is unavailable: the installed gentle-ai binary does not expose the assess command.";
+	} else {
+		try {
+			const request: NativeReviewAssessRequest = {
+				cwd,
+				...(input.baseRef === undefined ? {} : { baseRef: input.baseRef, committedOnly: true as const }),
+				...(signal === undefined ? {} : { signal }),
+			};
+			assessment = await nativeReviewCli.assess(request);
+		} catch (error) {
+			unassessableDetail = `native review assess failed: ${error instanceof Error ? error.message : String(error)}`;
+		}
+	}
+
+	const risk: VerificationTier = assessment?.risk ?? VERIFICATION_TIER.UNASSESSABLE;
+	// gentle-pi#668: explicit always wins; otherwise derive only for THIS
+	// candidate's own target identity, never repository-only. `closed` is
+	// never derived.
+	const targetIdentity = input.nativeReviewOutcome === undefined ? await readCurrentTargetIdentityBestEffort(nativeReviewCli, cwd, signal) : undefined;
+	const derived = targetIdentity === undefined ? undefined : readNativeReviewOutcome(cwd, targetIdentity);
+	const nativeReviewOutcome: NativeReviewOutcome = input.nativeReviewOutcome ?? derived ?? NATIVE_REVIEW_OUTCOME.UNKNOWN;
+	const outcomeSource: "explicit" | "derived" | "unknown" = input.nativeReviewOutcome !== undefined ? "explicit" : derived === undefined ? "unknown" : "derived";
+	const plan = verificationPlan({ rddLine, risk, writerProfile, nativeReviewOutcome });
+	return {
+		schema: "gentle-pi.review-assessment-plan/v1",
+		risk,
+		reasons: assessment?.reasons ?? (unassessableDetail === undefined ? [] : [{ code: "native-assess-unavailable", path: "", detail: unassessableDetail }]),
+		changedPaths: assessment?.changedPaths ?? 0,
+		changedLines: assessment?.changedLines ?? 0,
+		candidate: assessment === undefined ? null : { kind: assessment.candidate.kind, baseRef: assessment.candidate.baseRef },
+		rddLine,
+		nativeReviewOutcome,
+		outcome_source: outcomeSource,
+		writerProfile,
+		plan,
+	};
+}
+
+let rddStatusUnavailableWarned = false;
+
+/**
+ * Best-effort native RDD mode status read for prompt rendering, memoized per
+ * cwd for `RDD_STATUS_MEMO_TTL_MS`. Reuses the `reviewMode` STATUS reader
+ * (`gentle-ai review mode status --json`, decoded to
+ * `NativeReviewModeStatus`) that the `/gentle:review-mode` command also
+ * calls. Never throws and never hangs past `signal`'s deadline when one is
+ * given: an absent binary, a timed-out/aborted process, or a native CLI
+ * failure all resolve to `undefined`. `ctx` is optional and used only for a
+ * one-shot (per process) UI notice when the read is swallowed, so a
+ * sustained native outage is observable beyond the rendered "unknown" line.
+ */
+async function resolveRddModeStatus(
+	nativeReviewCli: Pick<NativeReviewCli, "reviewMode"> | null | undefined,
+	cwd: string,
+	signal?: AbortSignal,
+	now: () => number = Date.now,
+	ctx?: Pick<ExtensionContext, "hasUI" | "ui">,
+): Promise<NativeReviewModeStatus | undefined> {
+	const nowMs = now();
+	const cached = rddStatusMemo.get(cwd);
+	if (cached !== undefined && cached.expiresAt > nowMs) return cached.status;
+	const status = await readRddModeStatusOnce(nativeReviewCli, cwd, signal);
+	rddStatusMemo.set(cwd, { status, expiresAt: nowMs + RDD_STATUS_MEMO_TTL_MS });
+	if (status === undefined && !rddStatusUnavailableWarned) {
+		rddStatusUnavailableWarned = true;
+		if (ctx?.hasUI) {
+			ctx.ui.notify(
+				"Gentle AI: receipt-driven-development status is unavailable (native review CLI absent, timed out, or failed). The parent prompt renders \"unknown\" until this recovers; this notice will not repeat this session.",
+				"warning",
+			);
+		}
+	}
+	return status;
+}
+
+/** Resolves and renders the RDD status line for a production call site in one call. */
+async function resolveRddStatusLine(
+	nativeReviewCli: Pick<NativeReviewCli, "reviewMode"> | null | undefined,
+	cwd: string,
+	signal?: AbortSignal,
+	now: () => number = Date.now,
+	ctx?: Pick<ExtensionContext, "hasUI" | "ui">,
+): Promise<string> {
+	return renderRddStatusLine(await resolveRddModeStatus(nativeReviewCli, cwd, signal, now, ctx));
+}
+
+// Rendered prompts are memoized per background policy/capability/RDD-status
+// key for the process lifetime; the assets bytes themselves are read once
+// per key. `rddStatusLine` defaults to the "unknown" fallback line (the
+// longest of the three renderable forms), not "", so the default no-argument
+// render IS the worst case the canonical 8 KiB budget in
+// tests/orchestrator-budget.test.ts measures; assets/orchestrator.md is
+// sized with that worst case already included. Production still resolves
+// and passes the real line (on/off/unknown) via resolveRddStatusLine.
 const orchestratorPromptCache = new Map<string, string>();
 function getOrchestratorPrompt(
 	cwd: string = process.cwd(),
 	activeTools?: readonly string[],
+	rddStatusLine: string = renderRddStatusLine(undefined),
 ): string {
 	const background: BackgroundSubagentsRendering = {
 		policy: loadBackgroundSubagentsPolicy(cwd),
 		capability: resolveBackgroundSubagentsCapability(cwd, activeTools),
 	};
-	const cacheKey = `${background.policy}:${background.capability}`;
+	const cacheKey = `${background.policy}:${background.capability}:${rddStatusLine}`;
 	let prompt = orchestratorPromptCache.get(cacheKey);
 	if (prompt === undefined) {
-		prompt = renderOrchestratorPrompt(ASSETS_DIR, background);
+		prompt = renderOrchestratorPrompt(ASSETS_DIR, background, rddStatusLine);
 		orchestratorPromptCache.set(cacheKey, prompt);
 	}
 	return prompt;
@@ -695,12 +993,14 @@ function getOrchestratorPrompt(
 function renderOrchestratorPrompt(
 	assetsDir: string,
 	background: BackgroundSubagentsRendering = DEFAULT_BACKGROUND_SUBAGENTS_RENDERING,
+	rddStatusLine: string = renderRddStatusLine(undefined),
 ): string {
+	const backgroundPolicyBlock = `${renderBackgroundSubagentsStatusLine(background)}\n${rddStatusLine}`;
 	return readFileSync(join(assetsDir, "orchestrator.md"), "utf8")
 		.replaceAll("{{GENTLE_PI_ASSETS_ROOT}}", assetsDir)
 		.replaceAll(
 			"{{GENTLE_PI_BACKGROUND_POLICY}}",
-			renderBackgroundSubagentsStatusLine(background),
+			backgroundPolicyBlock,
 		)
 		.trim();
 }
@@ -799,6 +1099,7 @@ function buildGentlePrompt(
 	persona: PersonaMode,
 	cwd: string = process.cwd(),
 	activeTools?: readonly string[],
+	rddStatusLine: string = renderRddStatusLine(undefined),
 ): string {
 	const personaPrompt =
 		persona === "neutral" ? NEUTRAL_PERSONA_PROMPT : GENTLEMAN_PERSONA_PROMPT;
@@ -833,7 +1134,7 @@ Harness principles:
 - Protect the human reviewer: avoid oversized changes, surface review workload risk, and ask before turning one task into a large multi-area change.
 - Never claim persistent memory is available because of this package. Memory is provided by separate packages or MCP tools when installed and callable.
 
-${getOrchestratorPrompt(cwd, activeTools)}`;
+${getOrchestratorPrompt(cwd, activeTools, rddStatusLine)}`;
 }
 
 // Matches `git [global-flags] push` — tolerates flags like -C /repo or --work-tree=/tmp
@@ -2646,6 +2947,9 @@ const REVIEW_CONTROLLER_OPERATION = {
 	RECONCILE_AUTHORITY: "reconcile-authority",
 	REPAIR_LEGACY_ALIAS: "repair-legacy-alias",
 	REPAIR: "repair",
+	// gentle-pi#662: read-only native risk assessment (gentle-ai#4295). Never
+	// mutates review authority state and never requires a lineageId.
+	ASSESS: "assess",
 } as const;
 
 type ReviewControllerOperation =
@@ -2692,7 +2996,7 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 		},
 		input: {
 			type: "string",
-			description: "A JSON-serialized object string, not a nested object. New native ordinary START uses {\"mode\":\"ordinary\"}; answer-consent uses exactly {\"consentBinding\":\"<opaque id>\",\"answer\":\"granted|declined\"}. Ordinary provider capture belongs only to gentle_review_capture. An explicit baseRef requires committedOnly: true and requests a committed range, while repository-local policyPath remains optional. Legacy controller input remains separate.",
+			description: "A JSON-serialized object string, not a nested object. New native ordinary START uses {\"mode\":\"ordinary\"}; answer-consent uses exactly {\"consentBinding\":\"<opaque id>\",\"answer\":\"granted|declined\"}. Ordinary provider capture belongs only to gentle_review_capture. An explicit baseRef requires committedOnly: true and requests a committed range, while repository-local policyPath remains optional. ASSESS accepts an optional object with baseRef, committedOnly, writerModelId, writerEffort, and nativeReviewOutcome (gentle-pi#662/#668); omitting writerModelId and writerEffort assesses the ambient working tree and fails closed to a small writer profile (never large) because the writer's actual profile is unknown to this call. nativeReviewOutcome (one of closed, declined, unavailable, unknown) tells ASSESS whether the native review actually closed for this candidate: when Receipt-driven development reads on but the review was declined for this candidate, is unavailable, or its outcome is unknown, ASSESS falls back to the exact risk-gated plan it returns when RDD is off, re-enabling the separate verifier -- a decline is candidate-scoped and never lowers the bar below the RDD-off path. Omitting it lets ASSESS try to derive declined/unavailable from what this process itself recorded for this exact candidate (never a different one, and never from repository state alone), failing closed to unknown when it cannot; `closed` is never derived -- pass it explicitly, and only right after acknowledging the approved review for this same candidate. The returned outcome_source (explicit|derived|unknown) says which of these produced the value. Legacy controller input remains separate.",
 		},
 		outputPath: { type: "string", description: "Retired with legacy bundle export; ignored. Export returns legacy-operation-retired." },
 		inputPath: { type: "string", description: "Repository-local JSON input file for the separate legacy controller flow (alternative to input). Legacy bundle import is retired." },
@@ -2780,6 +3084,51 @@ interface ReviewScopeParameters {
 	cursor?: number;
 }
 
+// gentle-pi#662: read-only native risk assessment, gating the separate
+// verifier on native risk instead of a task-description judgment when the
+// rendered `Receipt-driven development:` line is `off` or `unknown`. Exposed
+// as `gentle_review` operation `assess` (not a dedicated tool), taking its
+// optional fields through the controller's existing generic `input` JSON
+// string, exactly like START's `{"mode":...,"baseRef":...}`.
+interface ReviewAssessInput {
+	baseRef?: string;
+	committedOnly?: boolean;
+	writerModelId?: string;
+	writerEffort?: string;
+	// gentle-pi#668: the caller's own known outcome for this candidate.
+	// Omitted tries to auto-derive declined/unavailable for this EXACT
+	// candidate's own target identity (never a different one); `closed` is
+	// never auto-derived -- pass it explicitly.
+	nativeReviewOutcome?: NativeReviewOutcome;
+}
+
+function isNativeReviewOutcome(value: unknown): value is NativeReviewOutcome {
+	return typeof value === "string" && (Object.values(NATIVE_REVIEW_OUTCOME) as readonly string[]).includes(value);
+}
+
+function parseReviewAssessInput(operation: ReviewControllerOperation, raw: string | undefined): ReviewAssessInput {
+	if (raw === undefined) return {};
+	const value = parseControllerJson(raw, operation);
+	const allowed = new Set(["baseRef", "committedOnly", "writerModelId", "writerEffort", "nativeReviewOutcome"]);
+	const unexpected = Object.keys(value).find((key) => !allowed.has(key));
+	if (unexpected !== undefined) throw new Error(`Review controller ${operation} input does not accept ${unexpected}`);
+	const { baseRef, committedOnly, writerModelId, writerEffort, nativeReviewOutcome } = value;
+	if (baseRef !== undefined && typeof baseRef !== "string") throw new Error(`Review controller ${operation} input baseRef must be a string`);
+	if (committedOnly !== undefined && typeof committedOnly !== "boolean") throw new Error(`Review controller ${operation} input committedOnly must be a boolean`);
+	if (writerModelId !== undefined && typeof writerModelId !== "string") throw new Error(`Review controller ${operation} input writerModelId must be a string`);
+	if (writerEffort !== undefined && typeof writerEffort !== "string") throw new Error(`Review controller ${operation} input writerEffort must be a string`);
+	if (nativeReviewOutcome !== undefined && !isNativeReviewOutcome(nativeReviewOutcome)) {
+		throw new Error(`Review controller ${operation} input nativeReviewOutcome must be one of ${Object.values(NATIVE_REVIEW_OUTCOME).join(", ")}`);
+	}
+	return {
+		...(baseRef === undefined ? {} : { baseRef: baseRef as string }),
+		...(committedOnly === undefined ? {} : { committedOnly: committedOnly as boolean }),
+		...(writerModelId === undefined ? {} : { writerModelId: writerModelId as string }),
+		...(writerEffort === undefined ? {} : { writerEffort: writerEffort as string }),
+		...(nativeReviewOutcome === undefined ? {} : { nativeReviewOutcome: nativeReviewOutcome as NativeReviewOutcome }),
+	};
+}
+
 interface ReviewControllerParameters {
 	operation: ReviewControllerOperation;
 	lineageId?: string;
@@ -2824,7 +3173,7 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 		if (unexpected !== undefined || typeof value.selectionBinding !== "string" || !Array.isArray(value.intendedUntracked) || (value.workspaceRoot !== undefined && typeof value.workspaceRoot !== "string")) throw new Error("Review intended-untracked selection accepts exactly selectionBinding and intendedUntracked, with optional workspaceRoot");
 		return { operation: value.operation, selectionBinding: value.selectionBinding, intendedUntracked: value.intendedUntracked, ...(typeof value.workspaceRoot === "string" ? { workspaceRoot: value.workspaceRoot } : {}) };
 	}
-	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT, REVIEW_CONTROLLER_OPERATION.STATUS, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.ABANDON, REVIEW_CONTROLLER_OPERATION.QUARANTINE_LEGACY, REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY, REVIEW_CONTROLLER_OPERATION.REPAIR_LEGACY_ALIAS, REVIEW_CONTROLLER_OPERATION.REPAIR].includes(value.operation as ReviewControllerOperation);
+	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT, REVIEW_CONTROLLER_OPERATION.STATUS, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.ABANDON, REVIEW_CONTROLLER_OPERATION.QUARANTINE_LEGACY, REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY, REVIEW_CONTROLLER_OPERATION.REPAIR_LEGACY_ALIAS, REVIEW_CONTROLLER_OPERATION.REPAIR, REVIEW_CONTROLLER_OPERATION.ASSESS].includes(value.operation as ReviewControllerOperation);
 	if (needsLineage && (typeof value.lineageId !== "string" || value.lineageId.trim().length === 0)) {
 		throw new Error("Review controller requires a lineageId");
 	}
@@ -3108,6 +3457,15 @@ async function resolveReviewModeGate(
 	}
 }
 
+// gentle-pi#185: a native CLI without negotiated STATUS support (no
+// `targetStatus`, or a version-incompatible provider) hits this boundary
+// before any candidate-view restoration is attempted, so it can never
+// reproduce the #176 empty-registry failure — but the boundary's own
+// `next_action` was a machine token with nothing a human or an agent could
+// run. `remediation_command` names the exact upstream command that
+// re-establishes negotiated STATUS for this session's Pi host identity.
+const NATIVE_STATUS_UNSUPPORTED_REMEDIATION_COMMAND = "gentle-ai review status --cwd <repo> --contract gentle-ai.review-integration/v2 --agent pi --next-transition";
+
 function nativeStatusUnsupported(operation: ReviewControllerOperation): Record<string, unknown> {
 	return {
 		operation,
@@ -3116,6 +3474,7 @@ function nativeStatusUnsupported(operation: ReviewControllerOperation): Record<s
 		...(operation === REVIEW_CONTROLLER_OPERATION.START ? nativeStartPreAuthorityRejection() : { mutation_performed: false }),
 		inventory_complete: false,
 		next_action: "require-upstream-read-only-native-status-inventory",
+		remediation_command: NATIVE_STATUS_UNSUPPORTED_REMEDIATION_COMMAND,
 		evidence: {
 			native_contract: "gentle-ai/2.1.4",
 			general_status: "unsupported",
@@ -3166,6 +3525,23 @@ function nativeStatusFailed(operation: ReviewControllerOperation, error: unknown
 			next_action: "require-complete-native-authority-inventory",
 		};
 	}
+	// gentle-pi#599: a negotiated STATUS/inspect request the native provider
+	// rejects with a decoded failure/v2 envelope (for example a preflight
+	// `invalid_request` refusal for a nested foreign Git repository) used to
+	// fall through to the generic outcome below, discarding the envelope's own
+	// cause, code, retry_safe, and next_action -- the one piece of information
+	// that makes the refusal actionable (pass the intended nested repo as
+	// workspaceRoot). `nativeOperationFailure` already renders this exact
+	// failure-envelope shape faithfully for every mutating operation; reuse it
+	// here instead of masking the refusal as opaque authority-inventory
+	// corruption.
+	if (error instanceof NativeReviewIntegrationError) {
+		return {
+			...nativeOperationFailure(operation, error),
+			outcome: "native-status-unavailable",
+			inventory_complete: false,
+		};
+	}
 	return {
 		operation,
 		status: "blocked",
@@ -3204,7 +3580,6 @@ function missingNativeMaintenanceInputs(operation: NativeMaintenanceOperation, i
 		...missing,
 		...(Array.isArray(input.capturedLensResults) && input.capturedLensResults.every((entry) => isCanonicalProcessString(entry)) ? [] : ["capturedLensResults"]),
 		...(typeof input.findingsPresent === "boolean" ? [] : ["findingsPresent"]),
-		...(typeof input.evidenceRecordsPresent === "boolean" ? [] : ["evidenceRecordsPresent"]),
 	];
 }
 
@@ -3214,7 +3589,7 @@ function invalidNativeMaintenanceInput(operation: NativeMaintenanceOperation, in
 }
 
 function nativeMaintenanceAuthorization(operation: NativeMaintenanceOperation, input: Record<string, unknown>): string {
-	if (operation === "abandon") return nativeReviewAbandonAuthorization({ lineage: String(input.lineage), expectedRevision: String(input.expectedRevision), snapshotIdentity: String(input.snapshotIdentity), capturedLensResults: (input.capturedLensResults as readonly unknown[]).map(String), findingsPresent: input.findingsPresent === true, evidenceRecordsPresent: input.evidenceRecordsPresent === true, actor: String(input.actor), reason: String(input.reason) });
+	if (operation === "abandon") return nativeReviewAbandonAuthorization({ lineage: String(input.lineage), expectedRevision: String(input.expectedRevision), snapshotIdentity: String(input.snapshotIdentity), capturedLensResults: (input.capturedLensResults as readonly unknown[]).map(String), findingsPresent: input.findingsPresent === true, actor: String(input.actor), reason: String(input.reason) });
 	if (operation === "quarantineLegacy") return nativeReviewLegacyQuarantineAuthorization({ repository: String(input.repository), lineage: String(input.lineage), expectedRevision: String(input.expectedRevision), diagnostic: NATIVE_REVIEW_LEGACY_QUARANTINE.DIAGNOSTIC, disposition: NATIVE_REVIEW_LEGACY_QUARANTINE.DISPOSITION, actor: String(input.actor), reason: String(input.reason) });
 	return nativeReviewReconcileAuthorization({ predecessorLineage: String(input.predecessorLineage), expectedPredecessorRevision: String(input.expectedPredecessorRevision), successorLineage: String(input.successorLineage), expectedSuccessorRevision: String(input.expectedSuccessorRevision), actor: String(input.actor), reason: String(input.reason), ...(input.anomalies === undefined ? {} : { anomalies: NATIVE_REVIEW_RECONCILE_ANOMALIES.COMBINED }) });
 }
@@ -3241,7 +3616,7 @@ async function executeNativeAuthorityMaintenance(
 	}
 	try {
 		const result = nativeOperation === "abandon"
-			? await nativeReviewCli.abandon!({ cwd, lineage: String(input.lineage), expectedRevision: String(input.expectedRevision), snapshotIdentity: String(input.snapshotIdentity), capturedLensResults: (input.capturedLensResults as readonly unknown[]).map(String), findingsPresent: input.findingsPresent === true, evidenceRecordsPresent: input.evidenceRecordsPresent === true, actor: String(input.actor), reason: String(input.reason), maintainerAuthorization: nativeMaintenanceAuthorization(nativeOperation, input), ...(signal === undefined ? {} : { signal }) })
+			? await nativeReviewCli.abandon!({ cwd, lineage: String(input.lineage), expectedRevision: String(input.expectedRevision), snapshotIdentity: String(input.snapshotIdentity), capturedLensResults: (input.capturedLensResults as readonly unknown[]).map(String), findingsPresent: input.findingsPresent === true, actor: String(input.actor), reason: String(input.reason), maintainerAuthorization: nativeMaintenanceAuthorization(nativeOperation, input), ...(signal === undefined ? {} : { signal }) })
 			: nativeOperation === "quarantineLegacy"
 				? await nativeReviewCli.quarantineLegacy!({ cwd, repository: String(input.repository), lineage: String(input.lineage), expectedRevision: String(input.expectedRevision), diagnostic: NATIVE_REVIEW_LEGACY_QUARANTINE.DIAGNOSTIC, disposition: NATIVE_REVIEW_LEGACY_QUARANTINE.DISPOSITION, actor: String(input.actor), reason: String(input.reason), maintainerAuthorization: nativeMaintenanceAuthorization(nativeOperation, input), ...(signal === undefined ? {} : { signal }) })
 				: await nativeReviewCli.reconcileAuthority!({ cwd, predecessorLineage: String(input.predecessorLineage), expectedPredecessorRevision: String(input.expectedPredecessorRevision), successorLineage: String(input.successorLineage), expectedSuccessorRevision: String(input.expectedSuccessorRevision), actor: String(input.actor), reason: String(input.reason), ...(input.anomalies === undefined ? {} : { anomalies: NATIVE_REVIEW_RECONCILE_ANOMALIES.COMBINED }), maintainerAuthorization: nativeMaintenanceAuthorization(nativeOperation, input), ...(signal === undefined ? {} : { signal }) });
@@ -3636,6 +4011,8 @@ function nativeStatusInputRejection(reason: string, field?: string): Record<stri
 }
 
 const PENDING_REVIEW_CONSENT_TTL_MS = 10 * 60 * 1000;
+const REVIEW_SESSION_PERMISSION_STATUS_KEY = "gentle-review-session-permission";
+const REVIEW_SESSION_PERMISSION_STATUS_TEXT = "reviews allowed for this session";
 
 type PendingReviewConsentSessionKey = string | symbol;
 
@@ -3772,6 +4149,18 @@ const processAgentEndPreflightNudgedTargets = new Map<PendingReviewConsentSessio
 // unreviewed candidate this session should be reminded about.
 const processAgentEndSessionBaseline = new Map<PendingReviewConsentSessionKey, string>();
 
+// gentle-pi#677: gentle-ai#4309 owns anonymous usage telemetry end to end;
+// Pi only nudges it once per process. This is a plain process-lifetime
+// guard, not a session-keyed map, because the nudge is meant to fire at most
+// once no matter how many primary-session `before_agent_start` events this
+// process observes.
+let processTelemetryTriggerAttempted = false;
+
+/** Testing-only reset for the once-per-process telemetry trigger guard. */
+function resetTelemetryTriggerGuardForTesting(): void {
+	processTelemetryTriggerAttempted = false;
+}
+
 function pendingReviewConsentSessionKey(context: ExtensionContext | undefined, fallbackKey: symbol): PendingReviewConsentSessionKey {
 	try {
 		const sessionManager = (context as unknown as { sessionManager?: { getSessionId?: () => unknown } } | undefined)?.sessionManager;
@@ -3827,6 +4216,61 @@ function pruneExpiredReviewConsents(registry: PendingReviewConsentRegistry, sess
 
 function reviewConsentDigest(consent: ReviewConsentEnvelope): string {
 	return createHash("sha256").update(JSON.stringify(consent)).digest("hex");
+}
+
+function reviewSessionManagerAndId(context: ExtensionContext): { manager: object; sessionId: string } | undefined {
+	try {
+		const manager = context.sessionManager as unknown as { getSessionId?: () => unknown };
+		const sessionId = manager.getSessionId?.();
+		if (typeof manager !== "object" || manager === null || typeof sessionId !== "string" || sessionId.length === 0) return undefined;
+		return { manager, sessionId };
+	} catch {
+		return undefined;
+	}
+}
+
+function isDirectOrdinaryReviewStart(parametersValue: unknown): boolean {
+	try {
+		const parameters = parseReviewControllerParameters(parametersValue);
+		if (parameters.operation !== REVIEW_CONTROLLER_OPERATION.START) return false;
+		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
+		return input.mode === REVIEW_MODE.ORDINARY;
+	} catch {
+		return false;
+	}
+}
+
+function isHostReviewConsentEligibleOperation(parametersValue: unknown): boolean {
+	if (isDirectOrdinaryReviewStart(parametersValue)) return true;
+	try {
+		return parseReviewControllerParameters(parametersValue).operation === REVIEW_CONTROLLER_OPERATION.SELECT_INTENDED_UNTRACKED;
+	} catch {
+		return false;
+	}
+}
+
+function completedGrantedReviewConsent(outcome: Record<string, unknown>): boolean {
+	if (
+		outcome.operation !== REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT ||
+		outcome.status !== undefined ||
+		outcome.outcome !== undefined ||
+		outcome.native_invocation_attempted === false ||
+		outcome.mutation_performed === false ||
+		outcome.lineage_created === false ||
+		!isCanonicalProcessString(outcome.workspace_root)
+	) return false;
+	const result = outcome.result;
+	if (!isRecord(result)) return false;
+	const nonnegativeInteger = (value: unknown): boolean => Number.isInteger(value) && Number(value) >= 0;
+	return isCanonicalProcessString(result.lineage_id) &&
+		isCanonicalProcessString(result.state) &&
+		isCanonicalProcessString(result.risk_tier) &&
+		Array.isArray(result.selected_lenses) && result.selected_lenses.every(isCanonicalProcessString) &&
+		nonnegativeInteger(result.changed_files) &&
+		nonnegativeInteger(result.original_changed_lines) &&
+		nonnegativeInteger(result.correction_budget) &&
+		(result.action === "created" || result.action === "resumed" || result.action === "replayed" || result.action === "closed") &&
+		typeof result.lenses_required === "boolean";
 }
 
 // gentle-pi#516: a binding this session does not hold (already answered,
@@ -4351,11 +4795,13 @@ async function reconcileUnknownReviewCaptureFailure(
 	selections: Map<string, RetainedNativeStatusSelection>,
 	route: RetainedNativeCaptureRoute | undefined,
 	expectedReviewCaptureSuffix?: readonly string[],
+	agent?: "pi",
 ): Promise<Record<string, unknown>> {
 	const failure = error === undefined ? undefined : nativeOperationFailure("gentle_review_capture", error);
 	if (error !== undefined && !nativeMutationRequiresStatus(error)) return failure;
 	try {
-		const status = await reconcileUnknownReviewLastEventCapture(nativeReviewCli, cwd, binding, route);
+		const selector = agent === undefined ? route : { ...route, agent };
+		const status = await reconcileUnknownReviewLastEventCapture(nativeReviewCli, cwd, binding, selector);
 		syncRetainedNativeStatusSelections(selections, cwd, status, route?.baseRef);
 		if (expectedReviewCaptureSuffix !== undefined && !hasExactReviewCaptureSuffix(status, expectedReviewCaptureSuffix)) return captureGroupAuthorityDrift(status);
 		return {
@@ -4416,10 +4862,10 @@ async function executeReviewHostRelayCapture(
 			},
 		};
 	} catch (error) {
-		if (!(error instanceof ReviewHostRelayError)) return await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding, selections, route);
+		if (!(error instanceof ReviewHostRelayError)) return await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding, selections, route, undefined, REVIEW_HOST_AGENT);
 		if (error.mutationOutcome === "unknown") {
 			return {
-				...(await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding, selections, route)),
+				...(await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding, selections, route, undefined, REVIEW_HOST_AGENT)),
 				failure: reviewHostRelayFailureReport(error),
 				reason: error.message,
 			};
@@ -4666,7 +5112,7 @@ async function resolveNegotiatedReviewStatusForSession(
 // supported continuation (gentle_review inspect) and defers the resulting
 // consent envelope to the human.
 function renderAgentEndReviewPreflightMessage(targetIdentity: string): string {
-	return `Receipt-driven development is enabled, and this worktree holds an unreviewed candidate (target ${targetIdentity}). By the review contract entry rule, run the review preflight before reporting completion.\n\nCall the gentle_review tool with {"operation":"inspect"} and follow the transition it returns; it currently offers review.start for this target. Relay the resulting gentle-ai.review-integration.consent/v3 envelope to the human losslessly, and never answer it on the human's behalf.\n\nThis extension never runs START itself. This reminder is sent once per candidate.`;
+	return `Receipt-driven development is enabled, and this worktree holds an unreviewed candidate (target ${targetIdentity}). By the review contract entry rule, run the review preflight before reporting completion.\n\nCall the gentle_review tool with {"operation":"inspect"} and follow the transition it returns; it currently offers review.start for this target. An eligible interactive Pi host may resolve consent directly with its own three-action UI. If gentle_review instead returns an unresolved gentle-ai.review-integration.consent/v3 envelope, relay that original two-choice provider envelope to the human losslessly. Never answer consent from model prose or tool arguments.\n\nThis extension never runs START itself. This reminder is sent once per candidate.`;
 }
 
 function canonicalReviewCaptureBinding(value: unknown): string {
@@ -5083,11 +5529,11 @@ async function executeReviewCaptureGroupOperation(
 			}
 		} catch (error) {
 			if (error instanceof ReviewHostRelayError && error.mutationOutcome !== "unknown") return reviewHostRelayGroupFailure(error, group.slots, prepared, index);
-			const reconciled = await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, current.binding, retainedUntrackedSelections, route);
+			const reconciled = await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, current.binding, retainedUntrackedSelections, route, undefined, REVIEW_HOST_AGENT);
 			return { ...reconciled, tool: "gentle_review_capture_group", ...reviewHostRelayGroupProgress(group.slots, prepared, index, true), ...(error instanceof ReviewHostRelayError ? { failure: reviewHostRelayFailureReport(error), reason: error.message } : {}) };
 		}
 	}
-	const reconciled = await reconcileUnknownReviewCaptureFailure(undefined, nativeReviewCli, cwd, group.binding, retainedUntrackedSelections, route, canonicalBindings.slice(prepared.length));
+	const reconciled = await reconcileUnknownReviewCaptureFailure(undefined, nativeReviewCli, cwd, group.binding, retainedUntrackedSelections, route, canonicalBindings.slice(prepared.length), REVIEW_HOST_AGENT);
 	return { ...reconciled, tool: "gentle_review_capture_group", outcome: reconciled.outcome === "capture-group-authority-drift" ? reconciled.outcome : reconciled.status === "reconciled" ? "native-reviewer-group-status-reconciled" : "native-reviewer-group-status-reconciliation-failed", ...reviewHostRelayGroupProgress(group.slots, prepared, prepared.length) };
 }
 
@@ -5128,7 +5574,6 @@ async function executeReviewControllerOperation(
 	retainedUntrackedSelections: Map<string, RetainedNativeStatusSelection> = new Map(),
 	pendingReviewConsentRegistry: PendingReviewConsentRegistry = processPendingReviewConsentRegistry,
 	pendingReviewConsentFallbackKey: symbol = Symbol("pending-review-consent-fallback"),
-	writeReviewConsentLatch: typeof recordReviewConsentLatch = recordReviewConsentLatch,
 	reviewConsentNow: () => number = Date.now,
 	reviewConsentScheduleTimer: (callback: () => void, delayMs: number) => { unref: () => void } = setTimeout,
 	intendedUntrackedSelection?: NativeIntendedUntrackedSelectionSubmission,
@@ -5152,6 +5597,15 @@ async function executeReviewControllerOperation(
 			mutation_outcome: "none",
 			next_action: "Use the native `gentle-ai review` CLI (start/finalize/validate/status/recover) against the repository review authority; receipts and canonical artifacts live in the Git common-directory store at .git/gentle-ai/reviews and travel with the repository through normal Git replication.",
 		};
+	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.ASSESS) {
+		// Read-only native risk assessment (gentle-ai#4295, gentle-pi#662). Never
+		// mutates, never requires a lineageId, and never routes through
+		// authorizeDestructiveReviewOperation (it returns early for any
+		// operation that is neither RESET nor a maintenance operation).
+		const input = parseReviewAssessInput(parameters.operation, parameters.input);
+		const details = await resolveReviewAssessmentPlan(nativeReviewCli, defaultCwd, input, signal);
+		return { operation: parameters.operation, ...details, ...(includeWorkspaceRoot ? { workspace_root: defaultCwd } : {}) };
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.REPAIR_LEGACY_ALIAS) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
@@ -5395,6 +5849,9 @@ async function executeReviewControllerOperation(
 			// The registry owns restoring writability of its 0555 views before
 			// removal; a terminal approved cleanup keeps the lineage projection.
 			candidateViews?.cleanupTerminal(parameters.lineageId, "approved", defaultCwd);
+			// gentle-pi#668: `closed` is never auto-derived or recorded here --
+			// a parent that wants the on-path passes nativeReviewOutcome:
+			// "closed" explicitly on its next assess call for this candidate.
 			return {
 				operation: parameters.operation,
 				status: "closed",
@@ -5467,6 +5924,9 @@ async function executeReviewControllerOperation(
 		try {
 			const gated = await resolveReviewModeGate(nativeReviewCli, parameters.operation, defaultCwd, signal);
 			if (gated !== undefined) {
+				// gentle-pi#668: mode disabled for this exact candidate -- keyed by
+				// its targetIdentity, never by repository alone.
+				recordNativeReviewOutcome(pending.authorityCwd, pending.consent.targetIdentity, NATIVE_REVIEW_OUTCOME.UNAVAILABLE);
 				cleanupPendingReviewConsent(pending, pendingReviewConsentRegistry, owningSession);
 				return gated;
 			}
@@ -5485,6 +5945,9 @@ async function executeReviewControllerOperation(
 				...(signal === undefined ? {} : { signal }),
 			});
 			if (answered.kind === "declined") {
+				// gentle-pi#668: candidate-scoped decline, keyed by this exact
+				// candidate's targetIdentity, never by repository alone.
+				recordNativeReviewOutcome(pending.authorityCwd, pending.consent.targetIdentity, NATIVE_REVIEW_OUTCOME.DECLINED);
 				pending.cleanupCandidate();
 				return {
 					operation: parameters.operation,
@@ -5505,15 +5968,6 @@ async function executeReviewControllerOperation(
 				projection: "workspace",
 			}, retainedUntrackedSelections);
 		}
-		if (input.answer === "granted") {
-			try {
-				writeReviewConsentLatch(pending.repositoryCwd);
-			} catch (error) {
-				try {
-					context?.ui.notify(`Native review start completed, but Pi could not record the local consent latch: ${error instanceof Error ? error.message : String(error)}`, "warning");
-				} catch { /* Reporting is best effort; native completion remains authoritative. */ }
-			}
-		}
 		return completed;
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.SELECT_INTENDED_UNTRACKED) {
@@ -5533,7 +5987,7 @@ async function executeReviewControllerOperation(
 		const rejected = input === undefined || canonicalReviewCaptureBinding(input) !== canonicalBinding || exactCollectArgument(input, "target_identity") !== status.targetIdentity || exactCollectArgument(input, "projection") !== status.projection.projection || exactCollectArgument(input, "base_tree") !== status.projection.baseTree || exactCollectArgument(input, "candidate_tree") !== status.projection.currentCandidateTree || !Array.isArray(eligible) || selected.reason !== undefined || selected.intendedUntracked!.some((path) => !eligible.includes(path));
 		if (rejected) return { operation: parameters.operation, status: "blocked", outcome: "intended-untracked-selection-binding-rejected", mutation_performed: false, mutation_outcome: "none" };
 		const submission = { argumentTokens: input.submission!.argumentTokens, value: JSON.stringify({ schema: "gentle-ai.review-intended-untracked-selection/v1", untracked_scope: scope, expected_untracked_inventory: inventory, intended_untracked: selected.intendedUntracked }) };
-		const result = await executeReviewControllerOperation({ operation: REVIEW_CONTROLLER_OPERATION.START, ...(parameters.workspaceRoot === undefined ? {} : { workspaceRoot: parameters.workspaceRoot }), input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, untrackedScope: scope, expectedUntrackedInventory: inventory, intendedUntracked: selected.intendedUntracked }) }, sessionCwd, nativeReviewCli, signal, candidateViews, context, retainedUntrackedSelections, pendingReviewConsentRegistry, pendingReviewConsentFallbackKey, writeReviewConsentLatch, reviewConsentNow, reviewConsentScheduleTimer, submission);
+		const result = await executeReviewControllerOperation({ operation: REVIEW_CONTROLLER_OPERATION.START, ...(parameters.workspaceRoot === undefined ? {} : { workspaceRoot: parameters.workspaceRoot }), input: JSON.stringify({ mode: REVIEW_MODE.ORDINARY, untrackedScope: scope, expectedUntrackedInventory: inventory, intendedUntracked: selected.intendedUntracked }) }, sessionCwd, nativeReviewCli, signal, candidateViews, context, retainedUntrackedSelections, pendingReviewConsentRegistry, pendingReviewConsentFallbackKey, reviewConsentNow, reviewConsentScheduleTimer, submission);
 		return { ...result, operation: parameters.operation };
 	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.START) {
@@ -5663,7 +6117,7 @@ async function executeReviewControllerOperation(
 							cleanupCandidate: () => {
 								if (candidateCleaned) return;
 								candidateCleaned = true;
-								consentCandidateView.cleanup();
+								try { consentCandidateView.cleanup(); } catch { /* Failed ownership proof preserves the view; consent expiry/teardown still completes. */ }
 							},
 							...(retainedUntrackedSelection === undefined ? {} : { untrackedSelection: retainedUntrackedSelection }),
 							consent: error.consent,
@@ -5879,8 +6333,19 @@ export const __testing = {
 	resolveBackgroundSubagentsCapability,
 	readActiveToolNames,
 	renderBackgroundSubagentsStatusLine,
+	renderRddStatusLine,
+	isValidRddModeStatus,
+	resolveRddModeStatus,
+	resolveRddStatusLine,
+	RDD_STATUS_TIMEOUT_MS,
+	RDD_STATUS_MEMO_TTL_MS,
+	clearRddStatusMemoForTesting,
+	readNativeReviewOutcome,
+	recordNativeReviewOutcome,
+	clearNativeReviewOutcomeMemoForTesting,
 	resolveControllerSddStatus,
 	resolveStartupControllerSddStatus,
+	resetTelemetryTriggerGuardForTesting,
 	createGentleAiExtension: createGentleAiExtensionForTesting,
 };
 
@@ -5918,6 +6383,18 @@ export interface GentleAiRuntimeDependencies {
 	// plain object so the handshake declaration is observable without
 	// touching the test runner's own process.env.
 	processEnv?: NodeJS.ProcessEnv;
+	// Package-owned children use this parent-bound channel only to ask whether
+	// their own pending ordinary START may replay a grant locally.
+	childStandingReviewPermissionClient?: Pick<ChildStandingReviewPermissionClient, "requestAuthorization" | "close">;
+	// gentle-pi#677: test-only seams for the telemetry trigger. Production
+	// leaves both undefined: the real package-local resolveGentleAiBinary()
+	// and the real detached child_process spawn run.
+	resolveTelemetryTriggerBinary?: () => string;
+	telemetryTriggerSpawn?: TelemetryTriggerSpawn;
+	// Test-only seam for the foreground `/gentle:telemetry` slash command's
+	// bounded exec; production leaves this undefined and uses the real node
+	// exec-file adapter shared with the rest of the extension.
+	telemetryExecFileAdapter?: ExecFileAdapter;
 }
 
 export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencies = {}): (pi: ExtensionAPI) => void {
@@ -5926,19 +6403,61 @@ export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencie
 
 function createGentleAiExtensionForTesting(
 	dependencies: GentleAiRuntimeDependencies = {},
-	writeReviewConsentLatch: typeof recordReviewConsentLatch = recordReviewConsentLatch,
 ): (pi: ExtensionAPI) => void {
 	const nativeReviewCli = dependencies.nativeReviewCli === undefined ? createNativeReviewCli() : dependencies.nativeReviewCli;
+	const childStandingReviewPermissionLease = dependencies.childStandingReviewPermissionClient === undefined
+		? acquireChildStandingReviewPermissionClient(dependencies.processEnv ?? process.env)
+		: undefined;
+	const childStandingReviewPermission = dependencies.childStandingReviewPermissionClient ?? childStandingReviewPermissionLease?.client;
 	const reviewConsentNow = dependencies.now ?? (() => Date.now());
 	const reviewConsentScheduleTimer = dependencies.scheduleTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
 	const pendingReviewConsentRegistry = dependencies.pendingReviewConsentRegistry ?? processPendingReviewConsentRegistry;
+	const resolveTelemetryTriggerBinary = dependencies.resolveTelemetryTriggerBinary ?? resolveGentleAiBinary;
+	const telemetryExecFileAdapter = dependencies.telemetryExecFileAdapter ?? createNodeExecFileAdapter();
 	return function gentleAi(pi: ExtensionAPI): void {
 	declareReviewRelayHandshake(dependencies.processEnv ?? process.env);
 	const pendingReviewConsentFallbackKey = Symbol("pending-review-consent-fallback");
 	const candidateViews = dependencies.candidateViews === undefined ? new CandidateViewRegistry() : dependencies.candidateViews;
 	const herdrLifecycle = createHerdrConfirmationLifecycle(pi.events);
+	const permissionEnvironment = dependencies.processEnv ?? process.env;
 
-	pi.on("session_shutdown", (_event, context) => {
+	const setReviewSessionPermissionStatus = (context: ExtensionContext, active: boolean): void => {
+		try {
+			(context.ui as unknown as { setStatus?: (key: string, text?: string) => void }).setStatus?.(
+				REVIEW_SESSION_PERMISSION_STATUS_KEY,
+				active ? REVIEW_SESSION_PERMISSION_STATUS_TEXT : undefined,
+			);
+		} catch { /* Status is nonblocking and never permission authority. */ }
+	};
+	const capturePermissionIdentity = (context: ExtensionContext, cwd: string = context.cwd): Promise<ReviewSessionIdentity | undefined> =>
+		captureReviewSessionIdentity({ ...context, cwd }, permissionEnvironment);
+	const refreshReviewSessionPermissionStatus = async (context: ExtensionContext): Promise<ReviewSessionIdentity | undefined> => {
+		const identity = await capturePermissionIdentity(context);
+		setReviewSessionPermissionStatus(context, identity !== undefined && hasReviewSessionPermission(identity));
+		return identity;
+	};
+	const revokeCurrentReviewSessionPermission = (context: ExtensionContext): boolean => {
+		const coordinates = reviewSessionManagerAndId(context);
+		const revoked = coordinates === undefined ? false : revokeReviewSessionPermissionsForSession(coordinates.manager, coordinates.sessionId);
+		setReviewSessionPermissionStatus(context, false);
+		return revoked;
+	};
+	const revokeCurrentRepositoryReviewSessionPermission = async (context: ExtensionContext): Promise<boolean> => {
+		const identity = await capturePermissionIdentity(context);
+		const revoked = identity === undefined ? false : revokeReviewSessionPermission(identity);
+		setReviewSessionPermissionStatus(context, false);
+		return revoked;
+	};
+
+	pi.on("session_shutdown", (event, context) => {
+		// Pi tears down this registry on reload as well as session replacement/quit.
+		try { candidateViews?.cleanupAll(); } catch { /* Preserve failed owned views for later recovery. */ }
+		const reason = (event as { reason?: unknown }).reason;
+		if (reason !== "reload") {
+			if (childStandingReviewPermissionLease !== undefined) childStandingReviewPermissionLease.closeIfCurrent();
+			else childStandingReviewPermission?.close();
+			revokeCurrentReviewSessionPermission(context);
+		}
 		const sessionKey = pendingReviewConsentSessionKey(context, pendingReviewConsentFallbackKey);
 		cleanupAllPendingReviewConsents(pendingReviewConsentRegistry, sessionKey);
 		processRetainedNativeStatusSelections.delete(sessionKey);
@@ -6072,11 +6591,12 @@ function createGentleAiExtensionForTesting(
 		promptGuidelines: [
 			'Call {"operation":"inspect"} before START. New native ordinary START uses a JSON string such as "{\\"mode\\":\\"ordinary\\"}"; an explicit baseRef must be paired with committedOnly: true to request a committed range, while policyPath remains repository-local. policyHash is legacy compact-only. The controller derives lineage, Git/untracked scope, tier, lenses, authored lines, and budget; the frozen correction budget counts logical corrections, while correction-plan correctionLines count diff lines (one replaced source line is one deletion plus one addition).',
 			"Use RECONCILE_AUTHORITY only to quarantine one invalid native recovery successor. Supply exact predecessorLineage, expectedPredecessorRevision, successorLineage, expectedSuccessorRevision, actor, and reason values; Pi derives and displays the seven-line native authorization binding for fresh UI approval. The predecessor stays untouched, native returns the durable audit record, and Pi never falls back to RESET or RECOVER.",
-			"Use ABANDON or QUARANTINE_LEGACY only after an explicit user decision and with exact native inputs. ABANDON needs lineage, expectedRevision, snapshotIdentity, capturedLensResults, findingsPresent, evidenceRecordsPresent, actor, and reason; QUARANTINE_LEGACY accepts only the published malformed freeze-findings diagnostic/disposition. A dual reconciliation may supply only anomalies `unchanged_target,malformed_recovery_authorization` in that exact order. Use REPAIR_LEGACY_ALIAS only with lineage, actor, and reason: Pi freshly reads native inventory and derives repository, revision, diagnostic, disposition, and the exact eight-line binding before interactive approval. `review dispose-result` is unsupported pending design.",
+			"Use ABANDON or QUARANTINE_LEGACY only after an explicit user decision and with exact native inputs. ABANDON needs lineage, expectedRevision, snapshotIdentity, capturedLensResults, findingsPresent, actor, and reason; QUARANTINE_LEGACY accepts only the published malformed freeze-findings diagnostic/disposition. A dual reconciliation may supply only anomalies `unchanged_target,malformed_recovery_authorization` in that exact order. Use REPAIR_LEGACY_ALIAS only with lineage, actor, and reason: Pi freshly reads native inventory and derives repository, revision, diagnostic, disposition, and the exact eight-line binding before interactive approval. `review dispose-result` is unsupported pending design.",
 			"Lens, refuter, and validator verdicts are admitted natively, never Pi-authored. Use gentle_review_capture with exactly one current provider-owned collectBinding for ordinary native capture; it never follows another transition.",
 			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization, then call RESET or RECOVER only after authorization. RESET and RECOVER_LOCK route to audited native `gentle-ai review reclaim`; only RESET carries the legacy repositoryId, commonDirHash, inventoryHash, and confirmation challenge. RECOVER routes to native `gentle-ai review recover` with exactly six inputs: predecessorLineage, expectedPredecessorRevision, successorLineage, disposition, actor, and reason. Never send RECOVER the reset challenge and never send it a maintainerAuthorization: Pi reads fresh native target status, pins the predecessor lineage, revision, provider-selected disposition, and target identity, derives the exact six-line native authorization binding, displays it for fresh UI approval, and re-reads status before mutating. Negotiated target status supplies the sole accepted recovery disposition, and a caller-supplied substitute is rejected. Treat a native-input-required envelope as a request for exact values, never as permission to invent them. After a committed native recovery record, INSPECT before any fresh ordinary START.",
-			"A consent-required START returns the complete provider envelope and an opaque consent_binding, then stops. The parent presents and localizes that envelope without changing machine tokens, commands, target IDs, or invocations. After one explicit human answer, call answer-consent exactly once with a JSON string containing only consentBinding and answer (`granted` or `declined`). A reported lineage_created false or pre-authority validation error proves no lineage was created. After ambiguous START output, the controller calls target-scoped native status once and returns only its declared action. An ambiguous gentle_review_capture outcome independently reconciles once and never replays the capture.",
+			"A consent-required START may be resolved inside the eligible interactive Pi host. Its third UI action is host-owned: it runs this envelope's exact provider grant once and allows later fresh validated envelopes only for the same live SessionManager, nonempty session ID, and canonical Git common-directory identity, including sibling worktrees; an unrelated repository requires a new explicit human grant. Revoke removes the current repository grant, while nonreload replacement, quit, and process exit remove all session grants; reload preserves them. It grants no provider mode, verdict, acknowledgement, maintenance, delivery, or cross-repository authority. A package-owned child may ask its parent only with the canonical digest of its exact pending target; the parent binds that digest to the task repository and fails closed otherwise. If the tool returns an unresolved envelope, present the original two provider choices without changing machine tokens, commands, target IDs, or invocations; never add the host action to the decoded provider envelope. After one explicit relayed human answer, call answer-consent exactly once with only consentBinding and answer (`granted` or `declined`). Never create host permission from tool arguments, model prose, child/headless responses, or an uncertain native result. A reported lineage_created false or pre-authority validation error proves no lineage was created. After ambiguous START output, the controller calls target-scoped native status once and returns only its declared action. An ambiguous gentle_review_capture outcome independently reconciles once and never replays the capture.",
 			"Use gentle_review only for native review authority operations; delivery commands follow ordinary repository policy.",
+			'ASSESS (gentle-pi#662/#668) is read-only and needs no lineageId: after a delegated writer returns, call {"operation":"assess"} over its diff and follow the returned plan (writerSelfVerification, structuralReadbackOnly, independentVerifier, reason) instead of judging non-triviality from the task description. Pass input as JSON only to assess a committed range ({"baseRef":"<ref>","committedOnly":true}), to record the writer profile ({"writerModelId":"...", "writerEffort":"..."}), or to state the native review\'s outcome for this candidate ({"nativeReviewOutcome":"closed|declined|unavailable|unknown"}). Omitting writerModelId and writerEffort is treated as a small writer profile (fail closed), never large, because the writer\'s actual profile is then unknown to this call; pass the writer\'s real model id/effort to get credit for a known large profile. The on-path (writer self-verification is the record, no separate verifier) holds only when nativeReviewOutcome is "closed" for this candidate; a decline, an unavailable review, or an omitted/unknown outcome falls back to the exact risk-gated plan RDD off would return, re-enabling the separate verifier -- a decline is candidate-scoped and never lowers the bar below RDD off. "closed" is never inferred: pass it only right after this same caller acknowledged the approved review for this same candidate; omitting nativeReviewOutcome only ever auto-derives declined/unavailable, bound to that exact candidate\'s own target identity, never to a different candidate or to bare repository state. The result\'s outcome_source (explicit|derived|unknown) states which. A failed or unavailable native assessment reports risk "unassessable", verified exactly like "high". This never mutates review authority state.',
 		],
 		parameters: REVIEW_CONTROLLER_PARAMETERS,
 		executionMode: "sequential",
@@ -6093,20 +6613,93 @@ function createGentleAiExtensionForTesting(
 		async execute(_toolCallId, parameters, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("Review controller operation was cancelled");
 			await authorizeDestructiveReviewOperation(parameters, ctx);
-			const details = await executeReviewControllerOperation(
+			const sessionKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey);
+			const retainedSelections = processRetainedNativeStatusSelections.get(sessionKey)
+				?? processRetainedNativeStatusSelections.set(sessionKey, new Map()).get(sessionKey)!;
+			let details = await executeReviewControllerOperation(
 				parameters,
 				ctx.cwd,
 				nativeReviewCli,
 				signal,
 				candidateViews,
 				ctx,
-				((sessionKey: PendingReviewConsentSessionKey) => processRetainedNativeStatusSelections.get(sessionKey) ?? processRetainedNativeStatusSelections.set(sessionKey, new Map()).get(sessionKey)!)(pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey)),
+				retainedSelections,
 				pendingReviewConsentRegistry,
 				pendingReviewConsentFallbackKey,
-				writeReviewConsentLatch,
 				reviewConsentNow,
 				reviewConsentScheduleTimer,
 			);
+			if (
+				isHostReviewConsentEligibleOperation(parameters) &&
+				details.outcome === "native-review-consent-required" &&
+				typeof details.consent_binding === "string"
+			) {
+				const resolved = pendingReviewConsentRegistry.resolve(details.consent_binding);
+				const pending = resolved?.pending;
+				const eligiblePending = pending !== undefined && isPiConsentV3(pending.consent)
+					? pending
+					: undefined;
+				const answerPendingConsent = async (answer: "granted" | "declined") => executeReviewControllerOperation(
+					{
+						operation: REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT,
+						input: JSON.stringify({ consentBinding: eligiblePending!.id, answer }),
+						workspaceRoot: eligiblePending!.authorityCwd,
+					},
+					ctx.cwd,
+					nativeReviewCli,
+					signal,
+					candidateViews,
+					ctx,
+					retainedSelections,
+					pendingReviewConsentRegistry,
+					pendingReviewConsentFallbackKey,
+					reviewConsentNow,
+					reviewConsentScheduleTimer,
+				);
+				let permissionWorkspaceRoot: string | undefined;
+				try {
+					const parsed = parseReviewControllerParameters(parameters);
+					permissionWorkspaceRoot = resolveReviewControllerWorkspaceRoot(parsed.workspaceRoot, ctx.cwd, candidateViews, parsed.lineageId);
+				} catch {
+					// The successful native operation above remains authoritative; an
+					// unresolvable local binding simply cannot consume host permission.
+				}
+				const initialIdentity = permissionWorkspaceRoot === undefined
+					? undefined
+					: await capturePermissionIdentity(ctx, permissionWorkspaceRoot);
+				if (eligiblePending !== undefined && initialIdentity === undefined) {
+					// A package child has no local standing grant. It may ask its
+					// inherited parent only for the canonical repository identity of
+					// this exact pending target, then replay this local binding once.
+					const repositoryIdentity = permissionWorkspaceRoot === undefined
+						? undefined
+						: await resolveCanonicalGitRepositoryIdentity(permissionWorkspaceRoot);
+					if (repositoryIdentity !== undefined && await childStandingReviewPermission?.requestAuthorization(repositoryIdentity) === true) details = await answerPendingConsent("granted");
+				} else if (eligiblePending !== undefined && initialIdentity !== undefined) {
+					const initialEpoch = reviewSessionPermissionEpoch(initialIdentity);
+					const permissionAlreadyActive = hasReviewSessionPermission(initialIdentity);
+					const selection = initialEpoch === undefined
+						? undefined
+						: permissionAlreadyActive
+							? { kind: "host-session" as const }
+							: await presentReviewConsentUi(ctx, eligiblePending.consent);
+					if (selection !== undefined) {
+						const confirmedIdentity = await capturePermissionIdentity(ctx, permissionWorkspaceRoot);
+						if (initialEpoch !== undefined && confirmedIdentity !== undefined && sameReviewSessionIdentity(initialIdentity, confirmedIdentity) && reviewSessionPermissionEpoch(confirmedIdentity) === initialEpoch) {
+							const answer = selection.kind === "provider" ? selection.answer : "granted";
+							details = await answerPendingConsent(answer);
+							if (!permissionAlreadyActive && selection.kind === "host-session" && completedGrantedReviewConsent(details)) {
+								if (grantReviewSessionPermission(confirmedIdentity, initialEpoch)) {
+									setReviewSessionPermissionStatus(ctx, true);
+									try { ctx.ui.notify("Reviews are allowed for this Pi session and this Git repository.", "info"); } catch { /* Nonblocking indication only. */ }
+								} else {
+									try { ctx.ui.notify("This review started, but the in-memory session permission registry was incompatible, so later candidates will ask again.", "warning"); } catch { /* Best effort. */ }
+								}
+							}
+						}
+					}
+				}
+			}
 			return {
 				content: [{ type: "text", text: JSON.stringify(details) }],
 				details,
@@ -6118,7 +6711,11 @@ function createGentleAiExtensionForTesting(
 		return ensureSddPreflight(ctx, { pi, installAssets: (cwd) => installSddAssets(cwd, false), applyModelConfig: async () => applySavedModelConfig(ctx) }, { promptFields });
 	}
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
+		try { candidateViews?.sweepOrphans(ctx.cwd); } catch { /* Ownership sweeping must not block startup. */ }
+		const reason = (event as { reason?: unknown }).reason;
+		if (reason !== "reload") revokeCurrentReviewSessionPermission(ctx);
+		await refreshReviewSessionPermissionStatus(ctx);
 		// Loud, every session: an active dev-binary override means this session
 		// runs an unpinned gentle-ai. Announce which one before anything else.
 		try {
@@ -6187,6 +6784,26 @@ function createGentleAiExtensionForTesting(
 		} else {
 			processAgentEndSubagentDepth.set(subagentDepthKey, 0);
 		}
+		// gentle-pi#677: nudge gentle-ai's own telemetry trigger for a primary
+		// session only, reusing the exact isNamedAgent/isSddAgent predicate that
+		// decides the orchestrator prompt below. At most one attempt per
+		// process regardless of how many primary-session before_agent_start
+		// events this process observes; a missing/old binary or a spawn error
+		// must never affect activation, so every failure is swallowed silently.
+		if (!isNamedAgent && !isSddAgent && !processTelemetryTriggerAttempted) {
+			processTelemetryTriggerAttempted = true;
+			try {
+				const executable = resolveTelemetryTriggerBinary();
+				spawnTelemetryTrigger({
+					executable,
+					cwd: ctx.cwd,
+					env: dependencies.processEnv ?? process.env,
+					spawn: dependencies.telemetryTriggerSpawn,
+				});
+			} catch {
+				// Best-effort only; never surfaced and never affects activation.
+			}
+		}
 		if (isSddAgent && !getSddPreflightPreferences(ctx)) {
 			await runSddPreflight(ctx);
 		}
@@ -6204,9 +6821,21 @@ function createGentleAiExtensionForTesting(
 				prefs?.artifactStore,
 			), phase)}`
 			: "";
+		// gentle-pi#661: the RDD status line (and the rest of the gentle prompt)
+		// is built only for the primary session, mirrored on the
+		// reviewContractPrompt condition below -- named/SDD agents never reach
+		// this branch, so no line is resolved or computed for them.
+		// resolveRddStatusLine never throws and never hangs past
+		// RDD_STATUS_TIMEOUT_MS: an absent/timed-out/aborted/failing native
+		// binary renders the fail-closed "unknown" line instead.
 		const gentlePrompt = isNamedAgent || isSddAgent
 			? ""
-			: `\n\n${buildGentlePrompt(readPersonaMode(ctx.cwd), ctx.cwd, readActiveToolNames(pi))}`;
+			: `\n\n${buildGentlePrompt(
+					readPersonaMode(ctx.cwd),
+					ctx.cwd,
+					readActiveToolNames(pi),
+					await resolveRddStatusLine(nativeReviewCli, ctx.cwd, AbortSignal.timeout(RDD_STATUS_TIMEOUT_MS), undefined, ctx),
+				)}`;
 		// gentle-pi#560 / gentle-ai#4056, #4057: inject the mirrored provider
 		// contract bundle's review execution contract for the primary session
 		// only, and only when a native review CLI is actually present.
@@ -6476,6 +7105,30 @@ function createGentleAiExtensionForTesting(
 		},
 	});
 
+	pi.registerCommand("gentle:review-session-permission", {
+		description: "Show or revoke the process-memory review permission for this exact Pi session and Git repository (status|revoke).",
+		handler: async (args, ctx) => {
+			const subAction = args.trim().length === 0 ? "status" : args.trim();
+			if (subAction !== "status" && subAction !== "revoke") {
+				ctx.ui.notify(`Unknown /gentle:review-session-permission sub-action "${subAction}". Use status or revoke.`, "warning");
+				return;
+			}
+			if (subAction === "revoke") {
+				const revoked = await revokeCurrentRepositoryReviewSessionPermission(ctx);
+				ctx.ui.notify(revoked ? "Review permission revoked for this Git repository in this Pi session. Provider review mode and authority were not changed." : "No review permission is active for this Git repository in this Pi session. Provider review mode and authority were not changed.", "info");
+				return;
+			}
+			const identity = await refreshReviewSessionPermissionStatus(ctx);
+			if (identity === undefined) {
+				ctx.ui.notify("Review session permission is unavailable: it requires the interactive Pi TUI, a non-child session, a nonempty session ID, and a canonical Git worktree.", "info");
+				return;
+			}
+			ctx.ui.notify(hasReviewSessionPermission(identity)
+				? "Reviews are allowed for this Pi session and Git repository. Use /gentle:review-session-permission revoke to ask again."
+				: "Reviews are not pre-authorized for this Pi session; each medium- or high-risk candidate asks normally.", "info");
+		},
+	});
+
 	pi.registerCommand("gentle:review-mode", {
 		description: "Show or set the Gentle AI review-driven-development kill switch (status|disable|enable). Every sub-action is user-initiated only; Pi automation never toggles it.",
 		handler: async (args, ctx) => {
@@ -6518,6 +7171,56 @@ function createGentleAiExtensionForTesting(
 				}
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			}
+		},
+	});
+
+	// gentle-pi#677: gentle-ai owns telemetry end to end (status, the opt-out
+	// switches, and rate limiting); this command only runs the corresponding
+	// `gentle-ai telemetry <op> --json` in the foreground and relays its
+	// output, so a Pi user never has to leave Pi to check or change it.
+	pi.registerCommand("gentle:telemetry", {
+		description: "Show or change the local Gentle AI telemetry trigger (status|enable|disable|preview); gentle-ai owns the data and the opt-out.",
+		handler: async (args, ctx) => {
+			const subAction = args.trim().length === 0 ? "status" : args.trim();
+			if (subAction !== "status" && subAction !== "enable" && subAction !== "disable" && subAction !== "preview") {
+				ctx.ui.notify(`Unknown /gentle:telemetry sub-action "${subAction}". Use status, enable, disable, or preview.`, "warning");
+				return;
+			}
+			let executable: string;
+			try {
+				executable = resolveTelemetryTriggerBinary();
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				return;
+			}
+			let result: ExecFileResult;
+			try {
+				result = await telemetryExecFileAdapter({
+					file: executable,
+					arguments: ["telemetry", subAction, "--json"],
+					cwd: ctx.cwd,
+					timeoutMs: 5_000,
+					maxBufferBytes: 1024 * 1024,
+				});
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				return;
+			}
+			if (result.exitCode !== 0) {
+				ctx.ui.notify(`gentle-ai telemetry ${subAction} failed (exit ${result.exitCode}): ${(result.stderr || result.stdout || "no output").trim()}`, "error");
+				return;
+			}
+			let relayed: string;
+			try {
+				relayed = JSON.stringify(JSON.parse(result.stdout), null, 2);
+			} catch {
+				relayed = result.stdout.trim();
+			}
+			if (subAction === "disable") {
+				ctx.ui.notify("Gentle AI telemetry disabled.", "info");
+				return;
+			}
+			ctx.ui.notify(relayed, "info");
 		},
 	});
 

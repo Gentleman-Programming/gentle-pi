@@ -112,17 +112,18 @@ test("profile agent roots isolate global definitions and subagents.json while ex
 	assert.equal(agentDirectories({ cwd, home: join(root, "legacy-home") })[0].dir, join(root, "legacy-home", ".pi", "agent", "agents"));
 });
 
-test("parseAgentsConfig applies defaults, validates values, and lets the project file win", () => {
-	const config = parseAgentsConfig({ default_model: "openai-codex/gpt-6-astra", default_effort: "medium", max_concurrency: 3, timeout_ms: 1000, model_profiles: { explore: { model: "openai-codex/gpt-5.6-terra", effort: "high" } } }, { max_concurrency: 2, model_profiles: { explore: { effort: "low" }, worker: { model: "anthropic/claude-sonnet-5" } } });
+test("parseAgentsConfig applies defaults, validates values, and silently ignores the retired total-timeout key", () => {
+	const config = parseAgentsConfig({ default_model: "openai-codex/gpt-6-astra", default_effort: "medium", max_concurrency: 3, timeout_ms: 1000, stall_timeout_ms: 12_000, model_profiles: { explore: { model: "openai-codex/gpt-5.6-terra", effort: "high" } } }, { max_concurrency: 2, timeout_ms: 500, model_profiles: { explore: { effort: "low" }, worker: { model: "anthropic/claude-sonnet-5" } } });
 	assert.deepEqual(config.defaultModel, { provider: "openai-codex", id: "gpt-6-astra" });
 	assert.equal(config.defaultThinking, "medium");
 	assert.equal(config.maxConcurrency, 2);
-	assert.equal(config.timeoutMs, 1000);
+	assert.equal(config.stallTimeoutMs, 12_000);
+	assert.equal("timeoutMs" in config, false, "legacy timeout_ms must not become an active runtime setting");
 	assert.deepEqual(config.modelProfiles.explore, { model: { provider: "openai-codex", id: "gpt-5.6-terra" }, thinking: "low" });
 	assert.deepEqual(config.modelProfiles.worker, { model: { provider: "anthropic", id: "claude-sonnet-5" }, thinking: undefined });
 	const defaults = parseAgentsConfig(undefined, undefined);
 	assert.equal(defaults.maxConcurrency, 5);
-	assert.equal(defaults.timeoutMs, 20 * 60_000);
+	assert.equal("timeoutMs" in defaults, false);
 	assert.equal(defaults.stallTimeoutMs, 4 * 60_000);
 	assert.equal(defaults.defaultMode, AGENT_MODE.TASK);
 	assert.equal(defaults.historyMaxTasks, 200);

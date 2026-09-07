@@ -181,7 +181,16 @@ test("quiet tool rendering registers noisy built-in tools", () => {
 
 test("quiet tool execution uses the tool-call cwd", async () => {
 	const tool = registeredQuietTools().get("bash");
-	const output = extractTextContent(await tool.execute("tool-call", { command: "pwd" }, new AbortController().signal, undefined, { cwd: "/tmp" })).trim();
+	const context = {
+		cwd: "/tmp",
+		sessionManager: {
+			getSessionId: () => "quiet-tool-test",
+			getSessionFile: () => undefined,
+		},
+	};
+	const output = extractTextContent(
+		await tool.execute("tool-call", { command: "pwd" }, new AbortController().signal, undefined, context),
+	).trim();
 	// pwd prints the physical directory: on macOS /tmp is a symlink to /private/tmp.
 	assert.equal(output, realpathSync("/tmp"));
 	assert.notEqual(output, process.cwd());

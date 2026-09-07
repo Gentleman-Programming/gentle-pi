@@ -14,7 +14,7 @@ export interface FakeChild {
 	killed: string[];
 }
 
-export function fakeChild(): FakeChild {
+export function fakeChild(options: { exitOnKill?: boolean; pid?: number } = {}): FakeChild {
 	const emitter = new EventEmitter();
 	const stdin = new PassThrough();
 	const stdout = new PassThrough();
@@ -34,12 +34,13 @@ export function fakeChild(): FakeChild {
 		}
 	});
 	const child: ChildLike = {
-		pid: 42,
+		pid: options.pid,
 		stdin,
 		stdout,
 		stderr: new PassThrough(),
 		kill: (signal) => {
 			killed.push(String(signal ?? "SIGTERM"));
+			if (options.exitOnKill !== false) queueMicrotask(() => emitter.emit("exit", 0, signal ?? "SIGTERM"));
 			return true;
 		},
 		on: (event, listener) => {

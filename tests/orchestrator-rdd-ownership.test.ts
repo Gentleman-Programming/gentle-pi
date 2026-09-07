@@ -60,6 +60,15 @@ test("rendered parent prompt keeps the RDD boundary while omitting lifecycle mir
 	for (const marker of ["Authority-First Terminal Procedure", "reconcile-terminal-mirrors", "next_transition"]) {
 		assert.ok(!rendered.includes(marker), `rendered parent prompt leaked: ${marker}`);
 	}
+	// gentle-pi#661: getOrchestratorPrompt()'s no-argument default renders the
+	// "unknown (native status unavailable)" RDD status line -- the longest of
+	// the three renderable forms -- so this IS the worst-case render the 8 KiB
+	// budget below must cover, not a smaller placeholder production later
+	// exceeds.
+	assert.ok(
+		rendered.includes("Receipt-driven development: unknown (native status unavailable)"),
+		"the default render must include the worst-case RDD status line",
+	);
 	assert.ok(Buffer.byteLength(rendered, "utf8") <= 8192, "the rendered parent prompt must stay below the reduced 8 KiB budget");
 });
 

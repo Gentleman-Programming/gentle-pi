@@ -1,17 +1,19 @@
-import type { Readable, Writable } from "node:stream";
+import type { Duplex, Readable, Writable } from "node:stream";
 import { formatModelRef, type AgentDefinition, type AgentMode, type ModelRef } from "./agents-config.ts";
+import { ParentStandingReviewPermissionBroker } from "./review-session-standing-permission-ipc.ts";
 import { isFinished, normalizeRpcEvent, TASK_EVENT, TASK_STATUS, taskLabel, type AskRequest, type TaskRecord, type TaskStore } from "./agents-protocol.ts";
 
 // Gentle Agents runner. Every subagent is its own `pi --mode rpc` process:
 // the host never runs subagent work on the TUI thread. It writes JSON
 // commands, reads JSON lines, applies deltas to the store, answers dialogs,
-// and enforces a total timeout plus a stall watchdog per task.
+// and enforces an inactivity watchdog per task.
 
 export interface ChildLike {
 	pid: number | undefined;
 	stdin: Writable;
 	stdout: Readable;
 	stderr: Readable | null | undefined;
+	stdio?: Array<Duplex | null | undefined>;
 	kill(signal?: NodeJS.Signals): boolean;
 	on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
 	on(event: "error", listener: (error: Error) => void): unknown;
@@ -20,9 +22,16 @@ export interface ChildLike {
 export interface SpawnOptions {
 	cwd: string;
 	env: NodeJS.ProcessEnv;
+	detached?: boolean;
+	stdio?: Array<"pipe" | "ignore" | "inherit">;
 }
 
 export type Spawn = (command: string, args: string[], options: SpawnOptions) => ChildLike;
+
+export interface ProcessControl {
+	platform: NodeJS.Platform;
+	kill(pid: number, signal: NodeJS.Signals | 0): void;
+}
 
 export interface PiCommand {
 	command: string;
@@ -34,11 +43,11 @@ export interface RunnerDeps {
 	now(): number;
 	schedule(fn: () => void, ms: number): () => void;
 	pi: PiCommand;
+	process?: ProcessControl;
 }
 
 export interface RunnerLimits {
 	maxConcurrency: number;
-	timeoutMs: number;
 	stallTimeoutMs: number;
 }
 
@@ -66,6 +75,9 @@ export interface TaskRequest {
 	sessionDir: string;
 	resumeSessionPath: string | undefined;
 	env: NodeJS.ProcessEnv;
+	// This closure stays only in the parent process. Its presence creates an
+	// inherited fd, never an environment boolean or model-visible permission.
+	authorizeParentStandingReviewPermission?: (repositoryIdentity: string) => boolean;
 }
 
 interface ProcessLike {
@@ -81,14 +93,23 @@ interface Pending {
 interface LiveTask {
 	child: ChildLike;
 	pending: Map<string, Pending>;
-	cancelTimeout: () => void;
 	cancelStall: () => void;
-	cancelling: boolean;
+	cancelGrace: () => void;
+	processGroup: number | undefined;
+	terminal: { status: TaskRecord["status"]; error: string | null } | undefined;
+	childExit: number | null | undefined;
+	cleanupDeadlineAt: number | undefined;
+	quarantined: boolean;
 	nextId: number;
+	permissionBroker?: ParentStandingReviewPermissionBroker;
 }
 
 const CHILD_MARKER = "GENTLE_PI_AGENTS_CHILD";
 const DEFAULT_TOOLS: readonly string[] = [];
+const TERMINATION_GRACE_MS = 250;
+const GROUP_CONFIRM_MS = 25;
+const GROUP_CONFIRM_DEADLINE_MS = 1_000;
+const hostProcess: ProcessControl = { platform: process.platform, kill: (pid, signal) => process.kill(pid, signal) };
 
 export function childArguments(request: TaskRequest): string[] {
 	const args = ["--mode", "rpc", "--session-dir", request.sessionDir];
@@ -149,6 +170,7 @@ export class AgentRunner {
 	private readonly limits: RunnerLimits;
 	private readonly deps: RunnerDeps;
 	private readonly hooks: RunnerHooks;
+	private readonly processControl: ProcessControl;
 	private readonly queue: Array<{ task: TaskRecord; request: TaskRequest }> = [];
 	private readonly live = new Map<string, LiveTask>();
 	private readonly waiters = new Map<string, Array<(task: TaskRecord) => void>>();
@@ -159,6 +181,7 @@ export class AgentRunner {
 		this.limits = limits;
 		this.deps = deps;
 		this.hooks = hooks;
+		this.processControl = deps.process ?? hostProcess;
 	}
 
 	run(request: TaskRequest): TaskRecord {
@@ -212,11 +235,8 @@ export class AgentRunner {
 			this.finish(id, TASK_STATUS.CANCELLED, "cancelled before start");
 			return true;
 		}
-		const live = this.live.get(id);
-		if (!live) return false;
-		live.cancelling = true;
-		void this.send(id, { type: "abort" });
-		this.finish(id, TASK_STATUS.CANCELLED, "cancelled");
+		if (!this.live.has(id)) return false;
+		this.requestStop(id, TASK_STATUS.CANCELLED, "cancelled", true);
 		return true;
 	}
 
@@ -240,46 +260,59 @@ export class AgentRunner {
 	}
 
 	// A child that cannot start (missing pi, bad cwd) fails only its task:
-	// spawn exceptions, the process error event, and stdin errors all settle
-	// through finish() instead of surfacing as uncaught errors in the host.
+	// spawn exceptions and process errors settle without uncaught host errors.
 	private launch(id: string, request: TaskRequest): void {
-		const env = { ...request.env, [CHILD_MARKER]: "1" };
+		const detached = this.processControl.platform !== "win32";
+		const hasParentPermissionChannel = request.authorizeParentStandingReviewPermission !== undefined;
+		const env = {
+			...request.env,
+			[CHILD_MARKER]: "1",
+			...(hasParentPermissionChannel ? { GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" } : {}),
+		};
 		let child: ChildLike;
 		try {
-			child = this.deps.spawn(this.deps.pi.command, [...this.deps.pi.args, ...childArguments(request)], { cwd: request.cwd, env });
+			child = this.deps.spawn(this.deps.pi.command, [...this.deps.pi.args, ...childArguments(request)], {
+				cwd: request.cwd,
+				env,
+				detached,
+				...(hasParentPermissionChannel ? { stdio: ["pipe", "pipe", "pipe", "pipe"] } : {}),
+			});
 		} catch (error) {
 			this.store.update(id, { status: TASK_STATUS.RUNNING, startedAt: this.deps.now(), lastStep: "starting" });
 			this.finish(id, TASK_STATUS.FAILED, `could not start pi: ${error instanceof Error ? error.message : String(error)}`);
 			return;
 		}
-		const live: LiveTask = { child, pending: new Map(), cancelTimeout: () => {}, cancelStall: () => {}, cancelling: false, nextId: 0 };
+		const processGroup = detached && typeof child.pid === "number" && child.pid > 0 ? child.pid : undefined;
+		const live: LiveTask = { child, pending: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0 };
 		this.live.set(id, live);
+		const permissionPipe = child.stdio?.[3];
+		if (hasParentPermissionChannel && permissionPipe !== undefined && permissionPipe !== null) {
+			live.permissionBroker = new ParentStandingReviewPermissionBroker(
+				{ readable: permissionPipe, writable: permissionPipe },
+				(repositoryIdentity) => this.live.get(id) === live && !live.terminal && request.authorizeParentStandingReviewPermission?.(repositoryIdentity) === true,
+			);
+		}
 		this.store.update(id, { status: TASK_STATUS.RUNNING, startedAt: this.deps.now(), lastStep: "starting" });
-		child.on("error", (error) => this.finish(id, TASK_STATUS.FAILED, `could not start pi: ${error.message}`));
+		child.on("error", (error) => this.childError(id, error));
 		child.stdin.on("error", () => {});
-		live.cancelTimeout = this.deps.schedule(() => this.finish(id, TASK_STATUS.TIMED_OUT, `timed out after ${Math.round(this.limits.timeoutMs / 60_000)} min`), this.limits.timeoutMs);
 		this.armStall(id, live);
 		const lines = new JsonLines((value) => this.receive(id, request, value));
 		child.stdout.setEncoding("utf8");
 		child.stdout.on("data", (chunk: string) => lines.push(chunk));
 		child.stderr?.on("data", () => {});
-		child.on("exit", (code) => {
-			if (!this.live.has(id)) return;
-			const current = this.store.get(id);
-			if (current && !isFinished(current.status)) this.finish(id, live.cancelling ? TASK_STATUS.CANCELLED : TASK_STATUS.FAILED, `pi exited with code ${code ?? "unknown"}`);
-		});
+		child.on("exit", (code) => this.exited(id, code));
 		void this.send(id, { type: "get_state" }).then((response) => {
 			const data = response.data as { sessionFile?: string } | undefined;
-			if (data?.sessionFile) this.store.update(id, { sessionPath: data.sessionFile });
+			if (!live.terminal && this.live.get(id) === live && data?.sessionFile) this.store.update(id, { sessionPath: data.sessionFile });
 		});
 		void this.send(id, { type: "prompt", message: promptText(request) }).then((response) => {
-			if (response.success === false) this.finish(id, TASK_STATUS.FAILED, String(response.error ?? "prompt rejected"));
+			if (response.success === false) this.requestStop(id, TASK_STATUS.FAILED, String(response.error ?? "prompt rejected"));
 		});
 	}
 
 	private armStall(id: string, live: LiveTask): void {
 		live.cancelStall();
-		live.cancelStall = this.deps.schedule(() => this.finish(id, TASK_STATUS.TIMED_OUT, `stalled for ${Math.round(this.limits.stallTimeoutMs / 60_000)} min`), this.limits.stallTimeoutMs);
+		live.cancelStall = this.deps.schedule(() => this.requestStop(id, TASK_STATUS.TIMED_OUT, `stalled for ${Math.round(this.limits.stallTimeoutMs / 60_000)} min`), this.limits.stallTimeoutMs);
 	}
 
 	private send(id: string, command: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -303,8 +336,9 @@ export class AgentRunner {
 
 	private receive(id: string, request: TaskRequest, value: unknown): void {
 		const live = this.live.get(id);
-		if (!live || !value || typeof value !== "object") return;
+		if (!live || live.terminal || !value || typeof value !== "object") return;
 		const raw = value as Record<string, unknown>;
+		this.armStall(id, live);
 		if (raw.type === "response") {
 			const pending = typeof raw.id === "string" ? live.pending.get(raw.id) : undefined;
 			if (pending) {
@@ -313,11 +347,15 @@ export class AgentRunner {
 			}
 			return;
 		}
-		this.armStall(id, live);
 		for (const event of normalizeRpcEvent(raw)) {
 			this.store.apply(id, event, this.deps.now());
 			if (event.type === TASK_EVENT.ASK) void this.answer(id, request, live, event.request, raw);
-			if (event.type === TASK_EVENT.AGENT_END) this.finish(id, TASK_STATUS.COMPLETED, null);
+			if (event.type === TASK_EVENT.AGENT_SETTLED) {
+				const terminal = this.store.get(id);
+				if (terminal?.error) this.requestStop(id, TASK_STATUS.FAILED, terminal.error);
+				else if (terminal?.result) this.requestStop(id, TASK_STATUS.COMPLETED, null);
+				else this.requestStop(id, TASK_STATUS.FAILED, "assistant settled without a final report");
+			}
 		}
 	}
 
@@ -332,25 +370,115 @@ export class AgentRunner {
 				answer = { cancelled: true };
 			}
 		}
+		if (this.live.get(id) !== live || live.terminal) return;
 		this.write(live, { type: "extension_ui_response", id: ask.id, ...answer });
 		const current = this.store.get(id);
 		if (current?.status === TASK_STATUS.WAITING) this.store.update(id, { status: TASK_STATUS.RUNNING, lastStep: answer.cancelled ? "question dismissed" : "answered" });
 	}
 
+	// POSIX children start detached, so their PID is the owned process-group ID.
+	// Windows uses ChildProcess.kill only: Node has no equivalent tree guarantee.
+	private signal(live: LiveTask, signal: NodeJS.Signals): void {
+		if (live.processGroup !== undefined) {
+			try {
+				this.processControl.kill(-live.processGroup, signal);
+				return;
+			} catch {
+				// The owned group is already gone; the child handle may still observe exit.
+			}
+		}
+		try {
+			live.child.kill(signal);
+		} catch {
+			// already gone
+		}
+	}
+
+	private requestStop(id: string, status: TaskRecord["status"], error: string | null, abort = false): void {
+		const live = this.live.get(id);
+		if (!live || live.terminal) return;
+		live.terminal = { status, error };
+		live.cleanupDeadlineAt = this.deps.now() + GROUP_CONFIRM_DEADLINE_MS;
+		live.permissionBroker?.close();
+		live.cancelStall();
+		if (abort) void this.send(id, { type: "abort" });
+		this.signal(live, "SIGTERM");
+		live.cancelGrace = this.deps.schedule(() => {
+			if (this.live.get(id) !== live) return;
+			this.signal(live, "SIGKILL");
+			this.confirmGroupExit(id, live);
+		}, TERMINATION_GRACE_MS);
+	}
+
+	private groupExists(live: LiveTask): boolean {
+		if (live.processGroup === undefined) return false;
+		try {
+			this.processControl.kill(-live.processGroup, 0);
+			return true;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code !== "ESRCH";
+		}
+	}
+
+	private confirmGroupExit(id: string, live: LiveTask): void {
+		if (this.live.get(id) !== live) return;
+		if (this.groupExists(live)) {
+			if (this.deps.now() >= (live.cleanupDeadlineAt ?? 0)) {
+				live.cancelGrace();
+				live.quarantined = true;
+				this.finish(id, TASK_STATUS.FAILED, `process cleanup unconfirmed after ${GROUP_CONFIRM_DEADLINE_MS}ms; capacity quarantined`);
+				return;
+			}
+			live.cancelGrace = this.deps.schedule(() => this.confirmGroupExit(id, live), GROUP_CONFIRM_MS);
+			return;
+		}
+		if (live.childExit !== undefined) this.completeExit(id, live);
+	}
+
+	private childError(id: string, error: Error): void {
+		const live = this.live.get(id);
+		if (!live) return;
+		// Node leaves pid undefined when spawn failed; a live PID must still exit
+		// before its slot is released, even if its handle later emits an error.
+		if (live.child.pid !== undefined) {
+			this.requestStop(id, TASK_STATUS.FAILED, `pi process error: ${error.message}`);
+			return;
+		}
+		live.permissionBroker?.close();
+		live.cancelStall();
+		live.cancelGrace();
+		this.live.delete(id);
+		this.finish(id, TASK_STATUS.FAILED, `could not start pi: ${error.message}`);
+	}
+
+	private exited(id: string, code: number | null): void {
+		const live = this.live.get(id);
+		if (!live) return;
+		live.childExit = code;
+		if (this.groupExists(live)) {
+			if (!live.terminal) this.requestStop(id, TASK_STATUS.FAILED, `pi exited with code ${code ?? "unknown"} before agent_settled`);
+			return;
+		}
+		this.completeExit(id, live);
+	}
+
+	private completeExit(id: string, live: LiveTask): void {
+		live.permissionBroker?.close();
+		live.cancelStall();
+		live.cancelGrace();
+		this.live.delete(id);
+		// Quarantine already notified completion, but its retained slot is now free.
+		if (live.quarantined) {
+			queueMicrotask(() => this.pump());
+			return;
+		}
+		const terminal = live.terminal;
+		this.finish(id, terminal ? terminal.status : TASK_STATUS.FAILED, terminal ? terminal.error : `pi exited with code ${live.childExit ?? "unknown"} before agent_settled`);
+	}
+
 	private finish(id: string, status: TaskRecord["status"], error: string | null): void {
 		const current = this.store.get(id);
 		if (!current || isFinished(current.status)) return;
-		const live = this.live.get(id);
-		if (live) {
-			live.cancelTimeout();
-			live.cancelStall();
-			this.live.delete(id);
-			try {
-				live.child.kill("SIGTERM");
-			} catch {
-				// already gone
-			}
-		}
 		const finished = this.store.update(id, { status, endedAt: this.deps.now(), error, lastStep: error ?? "done" });
 		if (finished) {
 			this.hooks.onFinish?.(finished);

@@ -71,22 +71,46 @@ function soft(theme: CardTheme, _tone: CardTone, text: string): string {
 }
 
 export function cardTop(card: Card, theme: CardTheme, width: number, hint?: string): string {
+	const targetWidth = Math.max(0, Math.floor(width));
+	if (targetWidth === 0) return "";
+	if (targetWidth < 5) {
+		const left = theme.fg(TONE_ROLE[card.tone], "╭");
+		if (targetWidth === 1) return left;
+		return left + soft(theme, card.tone, `${rule(targetWidth - 2)}╮`);
+	}
+
 	const title = titleText(card, theme);
-	const hintWidth = hint ? visibleWidth(hint) + 2 : 0;
-	const fill = rule(width - title.width - 5 - hintWidth);
-	const tail = hint ? ` ${theme.fg(HINT_ROLE, hint)} ` : "";
-	return theme.fg(TONE_ROLE[card.tone], "╭") + soft(theme, card.tone, "─ ") + title.styled + soft(theme, card.tone, ` ${fill}`) + tail + soft(theme, card.tone, "╮");
+	const fullHintWidth = hint ? visibleWidth(hint) + 2 : 0;
+	const shownHint = hint && title.width + 5 + fullHintWidth <= targetWidth ? hint : undefined;
+	const hintWidth = shownHint ? fullHintWidth : 0;
+	const titleWidth = Math.max(0, targetWidth - 5 - hintWidth);
+	const styledTitle = title.width <= titleWidth ? title.styled : truncateToWidth(title.styled, titleWidth, "");
+	const styledTitleWidth = title.width <= titleWidth ? title.width : visibleWidth(styledTitle);
+	const fill = rule(targetWidth - styledTitleWidth - 5 - hintWidth);
+	const tail = shownHint ? ` ${theme.fg(HINT_ROLE, shownHint)} ` : "";
+	return theme.fg(TONE_ROLE[card.tone], "╭") + soft(theme, card.tone, "─ ") + styledTitle + soft(theme, card.tone, ` ${fill}`) + tail + soft(theme, card.tone, "╮");
 }
 
 export function cardLine(text: string, tone: CardTone, theme: CardTheme, width: number): string {
-	const innerWidth = Math.max(1, width - FRAME_COLUMNS);
-	const clipped = truncateToWidth(text, innerWidth, "…");
+	const targetWidth = Math.max(0, Math.floor(width));
+	if (targetWidth === 0) return "";
+	const left = theme.fg(TONE_ROLE[tone], "│");
+	if (targetWidth === 1) return left;
+	if (targetWidth === 2) return left + soft(theme, tone, "│");
+	if (targetWidth === 3) return `${left} ${soft(theme, tone, "│")}`;
+
+	const innerWidth = targetWidth - FRAME_COLUMNS;
+	const clipped = innerWidth === 0 ? "" : truncateToWidth(text, innerWidth, "…");
 	const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(clipped)));
-	return `${theme.fg(TONE_ROLE[tone], "│")} ${clipped}${padding} ${soft(theme, tone, "│")}`;
+	return `${left} ${clipped}${padding} ${soft(theme, tone, "│")}`;
 }
 
 export function cardBottom(tone: CardTone, theme: CardTheme, width: number): string {
-	return theme.fg(TONE_ROLE[tone], "╰") + soft(theme, tone, `${rule(width - 2)}╯`);
+	const targetWidth = Math.max(0, Math.floor(width));
+	if (targetWidth === 0) return "";
+	const left = theme.fg(TONE_ROLE[tone], "╰");
+	if (targetWidth === 1) return left;
+	return left + soft(theme, tone, `${rule(targetWidth - 2)}╯`);
 }
 
 export function cardInnerWidth(width: number): number {

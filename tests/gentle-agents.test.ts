@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import test, { after } from "node:test";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join, relative, resolve } from "node:path";
+import test, { after, mock } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsViewKey, answerThroughUi, completionText, legacySubagentsInstalled, type AgentsDeps } from "../extensions/gentle-agents.ts";
-import { loadHistory } from "../lib/agents-history.ts";
+import type { TuiMouseEvent } from "@earendil-works/pi-tui";
+import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, answerThroughUi, completionText, legacySubagentsInstalled, type AgentsDeps } from "../extensions/gentle-agents.ts";
+import { historyDir, loadHistory, saveTask } from "../lib/agents-history.ts";
+import { emptyThread, TASK_STATUS, type TaskRecord } from "../lib/agents-protocol.ts";
+import { NativePointerScope } from "../lib/native-pointer-region.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
 
@@ -21,6 +24,23 @@ interface Registered {
 
 const plainTheme = { fg: (_color: string, text: string) => text };
 const fakeTui = { requestRender() {} };
+
+type Overlay = {
+	render(width: number): string[];
+	handleInput(data: string): void;
+	handleMouse?(event: TuiMouseEvent): unknown;
+};
+
+function mouse(
+	type: TuiMouseEvent["type"],
+	button: TuiMouseEvent["button"],
+	x: number,
+	y: number,
+	width: number,
+	height: number,
+): TuiMouseEvent {
+	return { type, button, x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false };
+}
 const root = mkdtempSync(join(tmpdir(), "gentle-agents-ext-"));
 after(() => rmSync(root, { recursive: true, force: true }));
 const home = join(root, "home");
@@ -33,7 +53,7 @@ writeFileSync(join(home, ".pi", "agent", "subagents.json"), JSON.stringify({ max
 function fakePi() {
 	const handlers = new Map<string, Handler[]>();
 	const tools = new Map<string, Registered>();
-	const shortcuts = new Map<string, { handler(ctx: ExtensionContext): Promise<void> }>();
+	const shortcuts = new Map<string, { description: string; handler(ctx: ExtensionContext): Promise<void> }>();
 	const commands = new Map<string, { handler(args: string, ctx: ExtensionContext): Promise<void> }>();
 	const sent: Array<{ message: Record<string, unknown>; options: Record<string, unknown> }> = [];
 	const renderers = new Map<string, (message: unknown, options: { expanded: boolean }, theme: unknown) => { render(width: number): string[] }>();
@@ -42,7 +62,7 @@ function fakePi() {
 		registerMessageRenderer: (type: string, renderer: (message: unknown, options: { expanded: boolean }, theme: unknown) => { render(width: number): string[] }) => renderers.set(type, renderer),
 		on: (event: string, handler: Handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 		registerTool: (tool: Registered) => tools.set(tool.name, tool),
-		registerShortcut: (key: string, registration: { handler(ctx: ExtensionContext): Promise<void> }) => shortcuts.set(key, registration),
+		registerShortcut: (key: string, registration: { description: string; handler(ctx: ExtensionContext): Promise<void> }) => shortcuts.set(key, registration),
 		registerCommand: (name: string, registration: { handler(args: string, ctx: ExtensionContext): Promise<void> }) => commands.set(name, registration),
 	} as unknown as ExtensionAPI;
 	const fire = async (event: string, ctx: ExtensionContext, payload: unknown = {}) => {
@@ -51,16 +71,16 @@ function fakePi() {
 	return { pi, tools, shortcuts, commands, fire, sent, renderers };
 }
 
-function fakeContext(tui: { requestRender(): void } = fakeTui) {
+function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (title: string, message: string) => Promise<boolean> = async () => true, inputResult: (title: string, placeholder: string | undefined) => Promise<string | undefined> = async () => undefined) {
 	const widgets = new Map<string, (tui: unknown, theme: unknown) => { render(width: number): string[] }>();
 	const dialogs: string[] = [];
-	const overlays: Array<{ render(width: number): string[]; handleInput(data: string): void }> = [];
+	const overlays: Overlay[] = [];
 	const ctx = {
 		hasUI: true,
 		sessionManager: { getSessionId: () => "s1", getCwd: () => cwd },
 		ui: {
 			notify: (message: string) => dialogs.push(`notify:${message}`),
-			custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => { render(width: number): string[]; handleInput(data: string): void }) =>
+			custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => Overlay) =>
 				new Promise((resolve) => {
 					const component = factory({ terminal: { rows: 30 }, requestRender() {} }, plainTheme, {}, resolve);
 					overlays.push(component);
@@ -73,13 +93,13 @@ function fakeContext(tui: { requestRender(): void } = fakeTui) {
 				dialogs.push(`select:${title}:${options.join("|")}`);
 				return options[0];
 			},
-			confirm: async (title: string) => {
-				dialogs.push(`confirm:${title}`);
-				return true;
+			confirm: async (title: string, message: string) => {
+				dialogs.push(`confirm:${title}:${message}`);
+				return confirmResult(title, message);
 			},
-			input: async (title: string) => {
+			input: async (title: string, placeholder: string | undefined) => {
 				dialogs.push(`input:${title}`);
-				return undefined;
+				return inputResult(title, placeholder);
 			},
 			editor: async () => "edited",
 		},
@@ -155,6 +175,37 @@ test("extension resolves each profile environment at setup time without changing
 	assert.match((await lab.tools.get("subagent_list_agents")!.execute("l1", {}, undefined, undefined, labContext.ctx)).content[0].text, /lab/);
 });
 
+for (const [key, tilde] of [["GENTLE_PI_AGENT_HOME", false], ["PI_CODING_AGENT_DIR", false], ["GENTLE_PI_AGENT_HOME", true], ["PI_CODING_AGENT_DIR", true]] as const) {
+	test(`${key} ${tilde ? "tilde" : "relative"} profile shares an absolute parent and child session root`, async () => {
+		const agentHome = join(root, `${key}-${tilde}`, "agent");
+		mkdirSync(join(agentHome, "agents"), { recursive: true });
+		writeFileSync(join(agentHome, "agents", "relative.md"), "---\ndescription: relative profile\n---\nMap things.");
+		writeFileSync(join(agentHome, "subagents.json"), JSON.stringify({ default_model: "openai/profile-model" }));
+		const env = { [key]: tilde ? `~/${relative(homedir(), agentHome)}` : relative(process.cwd(), agentHome) };
+		const harness = deps();
+		const { home: _home, env: _env, ...overrides } = harness.deps;
+		const { pi, tools, fire } = fakePi();
+		gentleAgents(pi, env, overrides);
+		const { ctx } = fakeContext();
+		assert.notEqual(ctx.sessionManager.getCwd(), process.cwd());
+		await fire("session_start", ctx);
+		await tools.get("subagent_run")!.execute("relative", { agent: "relative", task: "Map", mode: "background" }, undefined, undefined, ctx);
+		await tick();
+		try {
+			const args = harness.spawned[0];
+			const sessionDir = args[args.indexOf("--session-dir") + 1];
+			const expected = join(agentHome, "gentle-agents", "sessions");
+			assert.equal(sessionDir, expected);
+			assert.equal(resolve(ctx.sessionManager.getCwd(), sessionDir), expected);
+			assert.equal(existsSync(expected), true, "parent created the exact child session root");
+			assert.match(args[args.indexOf("--model") + 1], /profile-model/);
+		} finally {
+			await fire("session_shutdown", ctx);
+			await tick();
+		}
+	});
+}
+
 test("agentsEnabled and agentsCollapseKey read their flags and stay off inside a child", () => {
 	assert.equal(agentsEnabled({}), true);
 	assert.equal(agentsEnabled({ GENTLE_PI_AGENTS: "off" }), false);
@@ -163,6 +214,9 @@ test("agentsEnabled and agentsCollapseKey read their flags and stay off inside a
 	assert.equal(agentsCollapseKey({ GENTLE_PI_AGENTS_KEY: "off" }), undefined);
 	assert.equal(agentsViewKey({}), "alt+a");
 	assert.equal(agentsViewKey({ GENTLE_PI_AGENTS_VIEW_KEY: "off" }), undefined);
+	assert.equal(agentsStopKey({}), "alt+s");
+	assert.equal(agentsStopKey({ GENTLE_PI_AGENTS_STOP_KEY: "" }), undefined);
+	assert.equal(agentsStopKey({ GENTLE_PI_AGENTS_STOP_KEY: "off" }), undefined);
 	const off = fakePi();
 	gentleAgents(off.pi, { GENTLE_PI_AGENTS: "0" });
 	assert.equal(off.tools.size, 0);
@@ -208,6 +262,7 @@ test("subagent_list_agents and subagent_run in task mode launch a child with the
 	await tick();
 	assert.match(widget()![1], /◐  explore  map lib modules +gpt-5\.6-terra · 12k · \$0\.09 · \d+s │$/);
 	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "lib has three agent files." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
 	const result = await running;
 	assert.equal(result.content[0].text, "lib has three agent files.");
 	assert.equal((result.details.gentleAgents as { status: string }).status, "completed");
@@ -239,6 +294,7 @@ test("background runs return at once; status, result, send_message, cancel, and 
 	assert.match((await tools.get("subagent_continue")!.execute("c5", { task_id: id, prompt: "more" }, undefined, undefined, ctx)).content[0].text, /cannot be continued yet/);
 	assert.match((await tools.get("subagent_list_tasks")!.execute("c6", {}, undefined, undefined, ctx)).content[0].text, new RegExp(`^${id} · explore · running`));
 	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "All done." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
 	await tick();
 	assert.equal((await tools.get("subagent_result")!.execute("c7", { task_id: id }, undefined, undefined, ctx)).content[0].text, "All done.");
 	assert.equal(sent.length, 1, "a background result is delivered to the model once");
@@ -255,6 +311,7 @@ test("background runs return at once; status, result, send_message, cancel, and 
 	assert.equal(args[args.indexOf("--session") + 1], "/sessions/child.jsonl");
 	await tick();
 	harness.children[1].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Summary." }] }] });
+	harness.children[1].emit({ type: "agent_settled" });
 	assert.equal((await resumed).content[0].text, "Summary.");
 	assert.match((await tools.get("subagent_cancel")!.execute("c9", { task_id: id }, undefined, undefined, ctx)).content[0].text, /not running/);
 	assert.match((await tools.get("subagent_status")!.execute("c10", { task_id: "nope" }, undefined, undefined, ctx)).content[0].text, /Error: no task nope/);
@@ -282,6 +339,7 @@ test("once the last task is done the card asks for one frame when its finished r
 	await tick();
 	widget();
 	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Done." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
 	await tick();
 	assert.match(widget()![1], /✓  explore  Short job/);
 	const expiry = timers.filter((timer) => !timer.cancelled && timer.ms === 60_000);
@@ -315,11 +373,72 @@ test("a task-mode child's dialog reaches the host UI and the answer goes back to
 	assert.deepEqual(harness.children[0].written.at(-1), { type: "extension_ui_response", id: "u1", value: "a.ts" });
 	assert.match(widget()![1], /◐  explore  Ask me/);
 	harness.children[0].emit({ type: "agent_end", messages: [] });
+	harness.children[0].emit({ type: "agent_settled" });
 	await running;
 	assert.deepEqual(await answerThroughUi(ctx.ui, { id: "u2", method: "confirm", title: "Sure?" }, { message: "really" }), { confirmed: true });
 	assert.deepEqual(await answerThroughUi(ctx.ui, { id: "u3", method: "input", title: "Name" }, {}), { cancelled: true });
 	assert.deepEqual(await answerThroughUi(ctx.ui, { id: "u4", method: "editor", title: "Edit" }, {}), { value: "edited" });
 	assert.deepEqual(await answerThroughUi(undefined, { id: "u5", method: "select", title: "x" }, {}), { cancelled: true });
+});
+
+test("AgentsView production composition observes each pointer event once and accepts only left clicks", async () => {
+	const { pi, tools, fire, commands } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, overlays } = fakeContext();
+	await fire("session_start", ctx);
+
+	await tools.get("subagent_run")!.execute("b", { agent: "explore", task: "b", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	await tools.get("subagent_run")!.execute("a", { agent: "explore", task: "a", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+
+	const originalCreateMouseObserver = NativePointerScope.prototype.createMouseObserver;
+	let beforeCalls = 0;
+	let afterCalls = 0;
+	const spy = mock.method(NativePointerScope.prototype, "createMouseObserver", function (
+		this: NativePointerScope,
+		requestRender?: () => void,
+	) {
+		const observer = originalCreateMouseObserver.call(this, requestRender);
+		return {
+			beforeMouse(event: TuiMouseEvent) {
+				beforeCalls += 1;
+				observer.beforeMouse(event);
+			},
+			afterMouse(event: TuiMouseEvent) {
+				afterCalls += 1;
+				observer.afterMouse(event);
+			},
+		};
+	});
+	try {
+		const opened = commands.get("gentle:agents")!.handler("", ctx);
+		for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+		const overlay = overlays[0];
+		assert.ok(overlay, "the production extension mounted its fullscreen interaction");
+		const lines = overlay.render(80);
+		const dispatch = (event: TuiMouseEvent) => {
+			const before = beforeCalls;
+			const after = afterCalls;
+			const result = overlay.handleMouse?.(event);
+			assert.deepEqual([beforeCalls - before, afterCalls - after], [1, 1], "the root owns one observer lifecycle per event");
+			return result;
+		};
+
+		assert.match(stripAnsi(overlay.render(80)[1] ?? ""), /▸/, "the first task starts selected");
+		assert.equal(dispatch(mouse("click", "right", 4, 2, 80, lines.length)), undefined, "right click is inert");
+		assert.match(stripAnsi(overlay.render(80)[1] ?? ""), /▸/, "right click cannot select another task");
+		assert.equal(dispatch(mouse("press", "left", 4, 2, 80, lines.length)), undefined, "press is inert");
+		assert.equal(dispatch(mouse("click", "middle", 4, 2, 80, lines.length)), undefined, "middle click is inert");
+		const leftClick = dispatch(mouse("click", "left", 4, 2, 80, lines.length));
+		assert.equal((leftClick as { handled?: boolean } | undefined)?.handled, true, "left click selects the task");
+		assert.match(stripAnsi(overlay.render(80)[2] ?? ""), /▸/, "left click selects the second task");
+		overlay.handleInput("\x1b");
+		await opened;
+	} finally {
+		spy.mock.restore();
+	}
 });
 
 test("finished tasks are written to history, come back through resolveTask, and the overlay lists them", async () => {
@@ -332,6 +451,7 @@ test("finished tasks are written to history, come back through resolveTask, and 
 	const id = (started.details.gentleAgents as { taskId: string }).taskId;
 	await tick();
 	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Kept." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
 	await tick();
 	const tasksDir = join(home, ".pi", "agent", "gentle-agents", "tasks");
 	let stored = await loadHistory(tasksDir);
@@ -356,4 +476,144 @@ test("finished tasks are written to history, come back through resolveTask, and 
 	assert.ok(overlay.render(80).map(stripAnsi).some((line) => /✓ explore/.test(line)), "the finished task is listed");
 	overlay.handleInput("\x1b");
 	await opened;
+});
+
+test("the overlay confirms a running task once and reports when it finishes during confirmation", async () => {
+	const { pi, tools, fire, commands, sent } = fakePi();
+	const harness = deps();
+	const modalHome = join(root, "modal-home");
+	mkdirSync(join(modalHome, ".pi", "agent", "agents"), { recursive: true });
+	writeFileSync(join(modalHome, ".pi", "agent", "agents", "explore.md"), "---\ndescription: maps things\nmodel: openai-codex/gpt-5.6-terra\n---\nYou map things.");
+	writeFileSync(join(modalHome, ".pi", "agent", "subagents.json"), JSON.stringify({ max_concurrency: 2 }));
+	harness.deps.home = modalHome;
+	let answerConfirmation: (confirmed: boolean) => void = () => {};
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, dialogs, overlays } = fakeContext(fakeTui, () => new Promise((resolve) => {
+		answerConfirmation = resolve;
+	}));
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Race", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	const opened = commands.get("gentle:agents")!.handler("", ctx);
+	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+	const overlay = overlays[0];
+	assert.ok(overlay, "the overlay component was created");
+	overlay.handleInput("s");
+	overlay.handleInput("c");
+	await tick();
+	assert.deepEqual(dialogs, ["confirm:Stop explore?:Current work may be incomplete."], "s and its compatibility alias share one confirmation");
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Finished first." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	answerConfirmation(true);
+	await tick();
+	assert.match(dialogs.at(-1) ?? "", /^notify:Task explore already finished\.$/);
+	assert.equal(sent.length, 1, "a normal completion during confirmation still reaches the parent");
+	overlay.handleInput("\x1b");
+	await opened;
+});
+
+test("the overlay stops a queued selection immediately without confirmation", async () => {
+	const { pi, tools, fire, commands } = fakePi();
+	const harness = deps();
+	const queueHome = join(root, "queue-home");
+	mkdirSync(join(queueHome, ".pi", "agent", "agents"), { recursive: true });
+	writeFileSync(join(queueHome, ".pi", "agent", "agents", "explore.md"), "---\ndescription: maps things\n---\nYou map things.");
+	writeFileSync(join(queueHome, ".pi", "agent", "subagents.json"), JSON.stringify({ max_concurrency: 1 }));
+	harness.deps.home = queueHome;
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, dialogs, overlays } = fakeContext();
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "First", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	const queued = await tools.get("subagent_run")!.execute("c2", { agent: "explore", task: "Queued", mode: "background" }, undefined, undefined, ctx);
+	const queuedId = (queued.details.gentleAgents as { taskId: string }).taskId;
+	const opened = commands.get("gentle:agents")!.handler("", ctx);
+	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+	overlays[0]!.handleInput("s");
+	await tick();
+	assert.deepEqual(dialogs, ["notify:Stopped explore."], "queued work stops without confirmation");
+	assert.match((await tools.get("subagent_status")!.execute("c3", { task_id: queuedId }, undefined, undefined, ctx)).content[0].text, /cancelled/);
+	overlays[0]!.handleInput("\x1b");
+	await opened;
+});
+
+test("the overlay explains that stopping a waiting subagent dismisses its question", async () => {
+	const { pi, tools, fire, commands } = fakePi();
+	const harness = deps();
+	const waitingHome = join(root, "waiting-home");
+	mkdirSync(join(waitingHome, ".pi", "agent", "agents"), { recursive: true });
+	writeFileSync(join(waitingHome, ".pi", "agent", "agents", "explore.md"), "---\ndescription: maps things\n---\nYou map things.");
+	harness.deps.home = waitingHome;
+	let answerInput: (value: string | undefined) => void = () => {};
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, dialogs, overlays } = fakeContext(fakeTui, async () => true, () => new Promise<string | undefined>((resolve) => {
+		answerInput = resolve;
+	}));
+	await fire("session_start", ctx);
+	const running = tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Ask", mode: "task" }, undefined, undefined, ctx);
+	await tick();
+	harness.children[0].emit({ type: "extension_ui_request", id: "wait", method: "input", title: "Need input" });
+	await tick();
+	const opened = commands.get("gentle:agents")!.handler("", ctx);
+	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+	overlays[0]!.handleInput("s");
+	await tick();
+	assert.ok(dialogs.includes("confirm:Stop explore?:Its pending question will be dismissed."));
+	assert.match((await running).content[0].text, /cancelled/);
+	answerInput(undefined);
+	overlays[0]!.handleInput("\x1b");
+	await opened;
+});
+
+test("restored task history cannot execute stop", async () => {
+	const { pi, fire, commands } = fakePi();
+	const harness = deps();
+	const historyHome = join(root, "history-home");
+	const historical: TaskRecord = { id: "history-running", agent: "explore", mode: "background", prompt: "p", label: "p", cwd, parentSessionId: "old", status: TASK_STATUS.RUNNING, createdAt: 1, startedAt: 1, endedAt: null, model: "m", thinking: undefined, sessionPath: null, error: null, result: null, lastStep: "working", lastActivityAt: 1, turns: 0, toolCalls: 0, tokens: 0, cost: 0 };
+	await saveTask(historyDir(historyHome), historical, emptyThread());
+	harness.deps.home = historyHome;
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, dialogs, overlays } = fakeContext();
+	await fire("session_start", ctx);
+	const opened = commands.get("gentle:agents")!.handler("", ctx);
+	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+	assert.doesNotMatch(stripAnsi(overlays[0]!.render(80).at(-2) ?? ""), /Stop selected/);
+	overlays[0]!.handleInput("s");
+	overlays[0]!.handleInput("c");
+	await tick();
+	assert.deepEqual(dialogs, []);
+	overlays[0]!.handleInput("\x1b");
+	await opened;
+});
+
+test("Alt+S confirms a snapshot of active subagents and suppresses their follow-up delivery", async () => {
+	const { pi, tools, fire, shortcuts, sent } = fakePi();
+	const harness = deps();
+	let answerConfirmation: (confirmed: boolean) => void = () => {};
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, dialogs } = fakeContext(fakeTui, () => new Promise<boolean>((resolve) => {
+		answerConfirmation = resolve;
+	}));
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "First", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	const shortcut = shortcuts.get("alt+s");
+	assert.ok(shortcut, "Alt+S is registered by default");
+	assert.equal(shortcut.description, "Stop active subagent(s)");
+	const stopping = shortcut.handler(ctx);
+	await tick();
+	await tools.get("subagent_run")!.execute("c2", { agent: "explore", task: "Second", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	answerConfirmation(true);
+	await stopping;
+	assert.deepEqual(dialogs, ["confirm:Stop 1 active subagent?:Only these 1 subagent will stop. Current work may be incomplete.", "notify:Stopped 1 subagent."]);
+	assert.equal(sent.length, 0, "intentional cancellation does not start a follow-up turn");
+	assert.match((await tools.get("subagent_list_tasks")!.execute("c3", {}, undefined, undefined, ctx)).content[0].text, /running/, "a subagent started during confirmation remains active");
+	const secondConfirmation = shortcut.handler(ctx);
+	await tick();
+	assert.match(dialogs.at(-1) ?? "", /^confirm:Stop 1 active subagent\?/);
+	answerConfirmation(false);
+	await secondConfirmation;
+	await fire("session_shutdown", ctx);
 });

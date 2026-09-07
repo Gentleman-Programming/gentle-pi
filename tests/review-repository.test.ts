@@ -4,7 +4,7 @@ import { cpSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
-import { resolveRepositoryAuthorityV1, setReviewRepositoryIdentityRetryHookForTesting } from "../lib/review-repository.ts";
+import { resolveRepositoryAuthorityV1, reviewGitEnvironment, setReviewRepositoryIdentityRetryHookForTesting } from "../lib/review-repository.ts";
 import { REVIEW_MODE, ReviewTransactionStore, createReviewState, setReviewMutationLockPlatformForTesting } from "../lib/review-transaction.ts";
 import { REVIEW_LENS, REVIEW_ROUTE } from "../lib/review-triggers.ts";
 import { qualifiedReviewLockPlatform, testSnapshot } from "./review-test-fixtures.ts";
@@ -48,6 +48,33 @@ function addOrphanRoot(root: string, branch: string, file: string): void {
 	git(root, "commit", "-m", `orphan root on ${branch}`);
 	git(root, "checkout", "main");
 }
+
+test("review Git environment uses a Git-compatible null config path on Windows", () => {
+	const environment = reviewGitEnvironment();
+	assert.equal(environment.GIT_CONFIG_GLOBAL, "/dev/null");
+	assert.equal(environment.GIT_CONFIG_SYSTEM, "/dev/null");
+});
+
+test("review Git environment runs a real Git authority probe", (t) => {
+	const root = repository(t);
+	const commonDirectory = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+		cwd: root,
+		encoding: "utf8",
+		env: reviewGitEnvironment(),
+	}).trim();
+	assert.equal(resolve(commonDirectory), resolve(git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")));
+});
+
+test("review Git environment rejects inherited unsafe Git overrides", () => {
+	const prior = process.env.GIT_DIR;
+	try {
+		process.env.GIT_DIR = "/unsafe";
+		assert.throws(() => reviewGitEnvironment(), /REVIEW_GIT_ENV_UNSAFE/);
+	} finally {
+		if (prior === undefined) delete process.env.GIT_DIR;
+		else process.env.GIT_DIR = prior;
+	}
+});
 
 test("a Windows drive-letter Git common directory resolves repository authority", { skip: process.platform !== "win32" }, (t) => {
 	const root = repository(t);

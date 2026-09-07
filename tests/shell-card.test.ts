@@ -20,6 +20,12 @@ const taggedTheme = {
 	},
 };
 
+const ansiTheme = {
+	fg(_color: string, text: string) {
+		return `\x1b[35m${text}\x1b[0m`;
+	},
+};
+
 function card(overrides: Partial<Card> = {}): Card {
 	return {
 		title: "Gentle AI",
@@ -83,4 +89,30 @@ test("renderCard accepts a custom glyph and an empty body", () => {
 test("renderCard keeps the top rule at width with a two-cell glyph", () => {
 	const lines = renderCard(card({ glyph: "\u{1F339}\uFE0E" }), plainTheme, 60, { expanded: false, hint: "ctrl+o expand" });
 	for (const line of lines) assert.equal(visibleWidth(line), 60, `"${stripAnsi(line)}" is not 60 wide`);
+});
+
+test("renderCard drops the hint before truncating title content", () => {
+	const lines = renderCard(card(), plainTheme, 40, { expanded: false, hint: "ctrl+o expand" }).map(stripAnsi);
+	assert.equal(lines[0], "╭─ ✿ Gentle AI · review preflight ─────╮");
+	assert.ok(!lines[0].includes("ctrl+o"));
+	assert.equal(visibleWidth(lines[0]), 40);
+});
+
+test("renderCard truncates ANSI-styled title content at display width", () => {
+	const lines = renderCard(
+		card({ glyph: "\u{1F339}\uFE0E", title: "Gentle AI review", subtitle: "completed · review acknowledge approved" }),
+		ansiTheme,
+		30,
+		{ expanded: false, hint: "ctrl+o to expand" },
+	);
+	assert.match(stripAnsi(lines[0]), /^╭─ 🌹︎ Gentle AI review.*╮$/);
+	assert.ok(!stripAnsi(lines[0]).includes("ctrl+o"));
+	for (const line of lines) assert.equal(visibleWidth(line), 30, `"${stripAnsi(line)}" is not 30 wide`);
+});
+
+test("renderCard never exceeds extremely narrow supplied widths", () => {
+	for (const width of [0, 1, 2, 3, 4, 5, 8, 16]) {
+		const lines = renderCard(card({ glyph: "\u{1F339}\uFE0E" }), ansiTheme, width, { expanded: true, hint: "ctrl+o to expand" });
+		for (const line of lines) assert.equal(visibleWidth(line), width, `"${stripAnsi(line)}" is not ${width} wide`);
+	}
 });
