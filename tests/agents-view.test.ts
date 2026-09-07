@@ -14,7 +14,7 @@ function task(id: string, overrides: Partial<TaskRecord> = {}): TaskRecord {
 	return { id, agent: "explore", mode: "task", prompt: "p", label: "p", cwd: "/r", parentSessionId: "s", status: TASK_STATUS.RUNNING, createdAt: 1000, startedAt: 1000, endedAt: null, model: "gpt-5.6-terra", thinking: undefined, sessionPath: "/sessions/x.jsonl", error: null, result: null, lastStep: "grep", lastActivityAt: 1000, turns: 0, toolCalls: 0, tokens: 34_000, cost: 0.27, ...overrides };
 }
 
-function harness(rows = 8) {
+function harness(rows = 8, sessionId?: string) {
 	const store = new TaskStore();
 	const events: string[] = [];
 	let renders = 0;
@@ -22,6 +22,7 @@ function harness(rows = 8) {
 		theme: plainTheme,
 		rows,
 		store,
+		sessionId,
 		now: () => 61_000,
 		onCancel: (entry) => events.push(`cancel:${entry.id}`),
 		onOpen: (entry) => events.push(`open:${entry.id}`),
@@ -120,4 +121,46 @@ test("AgentsView Escape and q close an active selection without cancelling it", 
 	view.handleInput("\x1b");
 	view.handleInput("q");
 	assert.deepEqual(events, ["close", "close"], "close keys never invoke selected-task cancellation");
+});
+
+test("AgentsView scrolls the task list so the selection stays visible when there are more tasks than rows", () => {
+	const { store, view } = harness(6);
+	for (let index = 0; index < 6; index += 1) store.add(task(`t${index}`, { agent: `agent${index}`, createdAt: 1000 - index, lastActivityAt: 1000 - index }));
+	const listed = () => view.render(80).slice(1, 4).map((line) => stripAnsi(line).slice(0, 24));
+	assert.match(listed()[0], /▸ ◐ agent0/);
+	assert.match(listed()[2], /agent2/);
+	for (let index = 0; index < 4; index += 1) view.handleInput("j");
+	assert.equal(view.selectedTask()?.id, "t4");
+	assert.match(listed()[2], /▸ ◐ agent4/, "the list scrolls down until the selection is the last visible row");
+	assert.match(listed()[0], /agent2/);
+	view.handleInput("j");
+	view.handleInput("j");
+	assert.equal(view.selectedTask()?.id, "t5", "the selection stops at the last task");
+	assert.match(listed()[2], /▸ ◐ agent5/);
+	for (let index = 0; index < 4; index += 1) view.handleInput("k");
+	assert.match(listed()[0], /▸ ◐ agent1/, "moving up scrolls the list back");
+	assert.match(listed()[2], /agent3/);
+});
+
+test("AgentsView lists the active session's recent tasks by default and a toggles every session", () => {
+	const { store, view } = harness(8, "s");
+	store.add(task("mine", { agent: "mine" }));
+	store.add(task("theirs", { agent: "theirs", parentSessionId: "other", createdAt: 900, lastActivityAt: 900 }));
+	store.add(task("fresh", { agent: "fresh", status: TASK_STATUS.COMPLETED, endedAt: 61_000 - 60_000, createdAt: 850, lastActivityAt: 850 }));
+	store.add(task("stale", { agent: "stale", status: TASK_STATUS.COMPLETED, endedAt: 61_000 - 16 * 60_000, createdAt: 800, lastActivityAt: 800 }));
+	const names = () => view.render(80).map(stripAnsi).filter((line) => /[◐✓] /.test(line)).map((line) => line.match(/[◐✓] (\w+)/)?.[1]);
+	let plain = view.render(80).map(stripAnsi);
+	assert.match(plain[0], /^╭─ ❀ Agents · this session · 1 active · 1 finished ─+╮$/);
+	assert.deepEqual(names(), ["mine", "fresh"], "another session's task and one finished over fifteen minutes ago stay out");
+	assert.match(plain.at(-2) ?? "", /a all sessions/);
+	view.handleInput("a");
+	plain = view.render(80).map(stripAnsi);
+	assert.match(plain[0], /^╭─ ❀ Agents · all sessions · 2 active · 2 finished ─+╮$/);
+	assert.deepEqual(names(), ["mine", "theirs", "fresh", "stale"]);
+	assert.match(plain.at(-2) ?? "", /a this session/);
+	view.handleInput("j");
+	assert.equal(view.selectedTask()?.id, "theirs");
+	view.handleInput("a");
+	assert.equal(view.selectedTask()?.id, "mine", "a new scope reads from the top");
+	assert.deepEqual(names(), ["mine", "fresh"]);
 });

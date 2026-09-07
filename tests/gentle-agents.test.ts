@@ -323,7 +323,7 @@ test("finished tasks are written to history, come back through resolveTask, and 
 	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
 	const overlay = overlays[0];
 	assert.ok(overlay, "the overlay component was created");
-	assert.match(stripAnsi(overlay.render(80)[0]), /^╭─ ❀ Agents · 0 active · \d+ finished/);
+	assert.match(stripAnsi(overlay.render(80)[0]), /^╭─ ❀ Agents · this session · 0 active · \d+ finished/);
 	assert.ok(overlay.render(80).map(stripAnsi).some((line) => /✓ explore/.test(line)), "the finished task is listed");
 	overlay.handleInput("\x1b");
 	await opened;
@@ -467,4 +467,45 @@ test("Alt+S confirms a snapshot of active subagents and suppresses their follow-
 	answerConfirmation(false);
 	await secondConfirmation;
 	await fire("session_shutdown", ctx);
+});
+
+test("the card follows the active session: after /new the earlier session's tasks leave it, and come back on /resume", async () => {
+	const { pi, tools, commands, fire } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, widget, overlays } = fakeContext();
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Long job", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	assert.match(widget()![1], /◐  explore  Long job/);
+	const sessions = ctx as unknown as { sessionManager: { getSessionId(): string; getCwd(): string } };
+	sessions.sessionManager = { getSessionId: () => "s2", getCwd: () => cwd };
+	await fire("session_start", ctx, { type: "session_start", reason: "new" });
+	assert.deepEqual(widget(), [], "the new session starts with an empty card");
+	assert.match((await tools.get("subagent_list_tasks")!.execute("c2", {}, undefined, undefined, ctx)).content[0].text, /No subagent tasks in this session/);
+	const opened = commands.get("gentle:agents")!.handler("", ctx);
+	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+	const overlay = overlays[0]!;
+	assert.match(stripAnsi(overlay.render(80)[0]), /this session · 0 active · 0 finished/, "the overlay opens on the active session");
+	overlay.handleInput("a");
+	assert.ok(overlay.render(80).map(stripAnsi).some((line) => /◐ explore/.test(line)), "all sessions still reaches the running task");
+	overlay.handleInput("\x1b");
+	await opened;
+	sessions.sessionManager = { getSessionId: () => "s1", getCwd: () => cwd };
+	await fire("session_start", ctx, { type: "session_start", reason: "resume" });
+	assert.match(widget()![1], /◐  explore  Long job/, "resuming the first session shows its task again");
+});
+
+test("the card caps its rows to the terminal height and says how many tasks are hidden", async () => {
+	const { pi, tools, fire } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, widget } = fakeContext({ requestRender() {}, terminal: { rows: 20 } } as { requestRender(): void });
+	await fire("session_start", ctx);
+	for (let index = 0; index < 6; index += 1) await tools.get("subagent_run")!.execute(`c${index}`, { agent: "explore", task: `Job ${index}`, label: `job ${index}`, mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	const card = widget()!;
+	assert.equal(card.length, 8, "a 20-row terminal gets five card rows (four tasks and the overflow line) inside the frame, then the spacer");
+	assert.match(card[0], /2 active · 4 queued/);
+	assert.match(card[5], /^│ … 2 more · alt\+a to view +│$/);
 });
