@@ -75,6 +75,7 @@ function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (t
 	const widgets = new Map<string, (tui: unknown, theme: unknown) => { render(width: number): string[] }>();
 	const dialogs: string[] = [];
 	const overlays: Overlay[] = [];
+	const customCompletions: unknown[] = [];
 	const ctx = {
 		hasUI: true,
 		sessionManager: { getSessionId: () => "s1", getCwd: () => cwd },
@@ -82,7 +83,11 @@ function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (t
 			notify: (message: string) => dialogs.push(`notify:${message}`),
 			custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => Overlay) =>
 				new Promise((resolve) => {
-					const component = factory({ terminal: { rows: 30 }, requestRender() {} }, plainTheme, {}, resolve);
+					const done = (value: unknown) => {
+						customCompletions.push(value);
+						resolve(value);
+					};
+					const component = factory({ terminal: { rows: 30 }, requestRender() {} }, plainTheme, {}, done);
 					overlays.push(component);
 				}),
 			setWidget(key: string, content: ((tui: unknown, theme: unknown) => { render(width: number): string[] }) | undefined) {
@@ -108,7 +113,7 @@ function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (t
 		const factory = widgets.get("gentle-agents");
 		return factory ? factory(tui, plainTheme).render(72).map(stripAnsi) : undefined;
 	};
-	return { ctx, widget, dialogs, overlays };
+	return { ctx, widget, dialogs, overlays, customCompletions };
 }
 
 function deps(): { deps: Partial<AgentsDeps>; children: FakeChild[]; spawned: string[][] } {
@@ -446,7 +451,7 @@ test("AgentsView production footer uses rendered bounds and invalidates them bef
 	const { pi, tools, fire, commands } = fakePi();
 	const harness = deps();
 	gentleAgents(pi, {}, harness.deps);
-	const { ctx, overlays } = fakeContext();
+	const { ctx, overlays, customCompletions } = fakeContext();
 	(ctx as unknown as { sessionManager: { getSessionId(): string; getCwd(): string } }).sessionManager = { getSessionId: () => "footer-session", getCwd: () => cwd };
 	await fire("session_start", ctx);
 	await tools.get("subagent_run")!.execute("c1", { agent: "寿司", task: "Footer target", mode: "background" }, undefined, undefined, ctx);
@@ -499,6 +504,10 @@ test("AgentsView production footer uses rendered bounds and invalidates them bef
 		follow = buttons(lines, "[ Follow ]");
 		open = buttons(lines, "[ Open session ]");
 		assert.equal((overlay.handleMouse?.(mouse("click", "left", open.x, open.y, 160, lines.length)) as { handled?: boolean } | undefined)?.handled, true, "Open delegates exactly one eligible click to the existing callback");
+		assert.equal(customCompletions.length, 1, "Open completes the actual ui.custom callback exactly once");
+		const openedTask = customCompletions[0] as TaskRecord | undefined;
+		assert.equal(openedTask?.id, selected.id, "Open completes ui.custom with the selected task before Escape");
+		assert.equal(openedTask?.sessionPath, selected.sessionPath, "Open preserves the selected task's openable session in the ui.custom result");
 
 		store.update(selected.id, { sessionPath: null });
 		assert.equal(overlay.handleMouse?.(mouse("click", "left", follow.x, follow.y, 160, lines.length)), undefined, "a selected task update makes old footer coordinates inert until render");
