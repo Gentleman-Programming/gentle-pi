@@ -127,10 +127,32 @@ export const WRITER_PROFILE = {
 } as const;
 export type WriterProfile = (typeof WRITER_PROFILE)[keyof typeof WRITER_PROFILE];
 
+// gentle-pi#668: whether the native review actually reached a terminal
+// outcome for the current candidate. The `on` branch of `verificationPlan`
+// (the writer self-verifies, the native review is the independent check, no
+// separate verifier) holds only for `CLOSED` -- a human decline for this
+// candidate, a clone-local RDD disable, a refused START/STATUS, or any other
+// non-terminal outcome falls back to the exact same risk-gated path as `off`.
+// `UNKNOWN` is the fail-closed default for an omitted outcome: never treated
+// as `CLOSED`.
+export const NATIVE_REVIEW_OUTCOME = {
+	CLOSED: "closed",
+	DECLINED: "declined",
+	UNAVAILABLE: "unavailable",
+	UNKNOWN: "unknown",
+} as const;
+export type NativeReviewOutcome = (typeof NATIVE_REVIEW_OUTCOME)[keyof typeof NATIVE_REVIEW_OUTCOME];
+
 export interface VerificationPlanInput {
 	readonly rddLine: RddLine;
 	readonly risk: VerificationTier;
 	readonly writerProfile: WriterProfile;
+	/**
+	 * Native review outcome for the current candidate. Only consulted when
+	 * `rddLine` is `"on"`; `"off"`/`"unknown"` lines ignore it entirely.
+	 * Omitted resolves to `NATIVE_REVIEW_OUTCOME.UNKNOWN` (gentle-pi#668).
+	 */
+	readonly nativeReviewOutcome?: NativeReviewOutcome;
 }
 
 export interface VerificationPlan {
@@ -141,14 +163,76 @@ export interface VerificationPlan {
 }
 
 /**
- * Computes who verifies a delegated writer's change, exactly as gentle-pi#662
- * specifies:
+ * Builds the risk-gated verification plan shared by the `off`/`unknown` RDD
+ * lines and by an `on` line whose native review did not close for this
+ * candidate (gentle-pi#668). `gatePrefix` supplies the sentence fragment
+ * naming which branch fired, up to and including the word "and"; the
+ * tier-specific clause is appended after it.
+ */
+function riskGatedPlan(gatePrefix: string, risk: VerificationTier, writerProfile: WriterProfile): VerificationPlan {
+	if (risk === VERIFICATION_TIER.PASSIVE) {
+		return Object.freeze({
+			writerSelfVerification: false,
+			structuralReadbackOnly: true,
+			independentVerifier: false,
+			reason: `${gatePrefix} the native assessment reports passive risk: a structural readback by the parent is the complete check, with no separate verifier and no tests.`,
+		});
+	}
+
+	if (risk === VERIFICATION_TIER.MEDIUM) {
+		const smallModelBias = writerProfile === WRITER_PROFILE.SMALL;
+		return Object.freeze({
+			writerSelfVerification: true,
+			structuralReadbackOnly: false,
+			independentVerifier: smallModelBias,
+			reason: smallModelBias
+				? `${gatePrefix} the native assessment reports medium risk, but the small-model bias raises it one tier to high for verification purposes: the writer self-verifies and a separate independent verifier also runs.`
+				: `${gatePrefix} the native assessment reports medium risk with a large writer profile: the writer's self-verification stands and no separate verifier is required.`,
+		});
+	}
+
+	// high or unassessable.
+	return Object.freeze({
+		writerSelfVerification: true,
+		structuralReadbackOnly: false,
+		independentVerifier: true,
+		reason: risk === VERIFICATION_TIER.UNASSESSABLE
+			? `${gatePrefix} the native risk assessment could not be produced, so the candidate is treated as high risk: the writer self-verifies and a separate independent verifier always runs.`
+			: `${gatePrefix} the native assessment reports high risk: the writer self-verifies and a separate independent verifier always runs.`,
+	});
+}
+
+// Names why an `on` line falls back to the risk-gated path, for every
+// non-closed native review outcome (gentle-pi#668). `UNKNOWN` covers both an
+// omitted outcome and a caller-supplied one this decoder does not
+// recognize -- both fail closed the same way.
+function nonClosedOutcomeClause(outcome: NativeReviewOutcome): string {
+	switch (outcome) {
+		case NATIVE_REVIEW_OUTCOME.DECLINED:
+			return "the native review was declined for this candidate";
+		case NATIVE_REVIEW_OUTCOME.UNAVAILABLE:
+			return "the native review is unavailable for this candidate";
+		default:
+			return "the native review outcome for this candidate is unknown";
+	}
+}
+
+/**
+ * Computes who verifies a delegated writer's change, exactly as
+ * gentle-pi#662/#668 specify:
  *
- * - `rdd: "on"`: the writer self-verifies and no independent verifier runs,
- *   because the native review is the check -- except `passive`, which gets a
- *   structural readback by the parent instead.
+ * - `rdd: "on"` AND the native review reached `NATIVE_REVIEW_OUTCOME.CLOSED`
+ *   for this candidate: the writer self-verifies and no independent verifier
+ *   runs, because the closed native review is the check -- except `passive`,
+ *   which gets a structural readback by the parent instead.
+ * - `rdd: "on"` with any other outcome (`declined`, `unavailable`, or the
+ *   fail-closed `unknown` default for an omitted/unrecognized outcome): the
+ *   `on` branch never held for this candidate, so the risk-gated path below
+ *   applies exactly as `off` -- declining a review is candidate-scoped and
+ *   never lowers the bar below the RDD-off path.
  * - `rdd: "off"` or `"unknown"` (both gate identically, so an unknown RDD line
- *   never lowers a tier relative to `off`):
+ *   never lowers a tier relative to `off`; `nativeReviewOutcome` is ignored
+ *   entirely on these lines):
  *   - `passive`: structural readback by the parent only; no verifier, no
  *     tests.
  *   - `medium`: the writer self-verifies; a separate independent verifier
@@ -165,54 +249,37 @@ export function verificationPlan(input: VerificationPlanInput): VerificationPlan
 	const { rddLine, risk, writerProfile } = input;
 
 	if (rddLine === RDD_LINE.ON) {
-		if (risk === VERIFICATION_TIER.PASSIVE) {
+		const outcome = input.nativeReviewOutcome ?? NATIVE_REVIEW_OUTCOME.UNKNOWN;
+		if (outcome === NATIVE_REVIEW_OUTCOME.CLOSED) {
+			if (risk === VERIFICATION_TIER.PASSIVE) {
+				return Object.freeze({
+					writerSelfVerification: false,
+					structuralReadbackOnly: true,
+					independentVerifier: false,
+					reason: "receipt-driven development is on and the native review closed for this candidate; the assessment also reports passive risk: a structural readback by the parent replaces both the writer's self-verification and any separate verifier.",
+				});
+			}
 			return Object.freeze({
-				writerSelfVerification: false,
-				structuralReadbackOnly: true,
+				writerSelfVerification: true,
+				structuralReadbackOnly: false,
 				independentVerifier: false,
-				reason: "receipt-driven development is on and the native assessment reports passive risk: a structural readback by the parent replaces both the writer's self-verification and any separate verifier.",
+				reason: "receipt-driven development is on and the native review closed for this candidate: the writer's self-verification is the record and the closed native review was the independent check the writer cannot influence, so no separate verifier is required.",
 			});
 		}
-		return Object.freeze({
-			writerSelfVerification: true,
-			structuralReadbackOnly: false,
-			independentVerifier: false,
-			reason: "receipt-driven development is on: the writer's self-verification is the record and the native review is the independent check the writer cannot influence, so no separate verifier is required.",
-		});
+		// The on branch holds only while the native review reaches a terminal
+		// outcome for this candidate. Anything else -- declined, unavailable, or
+		// unknown -- falls back to the exact same risk-gated path as off.
+		return riskGatedPlan(
+			`receipt-driven development is on, but ${nonClosedOutcomeClause(outcome)}, so the risk-gated path applies exactly as receipt-driven development off, and`,
+			risk,
+			writerProfile,
+		);
 	}
 
 	// rddLine is "off" or "unknown" here -- both gate on the native risk
-	// assessment identically, so an unknown RDD line never lowers a tier.
-	if (risk === VERIFICATION_TIER.PASSIVE) {
-		return Object.freeze({
-			writerSelfVerification: false,
-			structuralReadbackOnly: true,
-			independentVerifier: false,
-			reason: `receipt-driven development is ${rddLine} and the native assessment reports passive risk: a structural readback by the parent is the complete check, with no separate verifier and no tests.`,
-		});
-	}
-
-	if (risk === VERIFICATION_TIER.MEDIUM) {
-		const smallModelBias = writerProfile === WRITER_PROFILE.SMALL;
-		return Object.freeze({
-			writerSelfVerification: true,
-			structuralReadbackOnly: false,
-			independentVerifier: smallModelBias,
-			reason: smallModelBias
-				? `receipt-driven development is ${rddLine} and the native assessment reports medium risk, but the small-model bias raises it one tier to high for verification purposes: the writer self-verifies and a separate independent verifier also runs.`
-				: `receipt-driven development is ${rddLine} and the native assessment reports medium risk with a large writer profile: the writer's self-verification stands and no separate verifier is required.`,
-		});
-	}
-
-	// high or unassessable.
-	return Object.freeze({
-		writerSelfVerification: true,
-		structuralReadbackOnly: false,
-		independentVerifier: true,
-		reason: risk === VERIFICATION_TIER.UNASSESSABLE
-			? `receipt-driven development is ${rddLine} and the native risk assessment could not be produced, so the candidate is treated as high risk: the writer self-verifies and a separate independent verifier always runs.`
-			: `receipt-driven development is ${rddLine} and the native assessment reports high risk: the writer self-verifies and a separate independent verifier always runs.`,
-	});
+	// assessment identically, so an unknown RDD line never lowers a tier, and
+	// neither line ever consults nativeReviewOutcome.
+	return riskGatedPlan(`receipt-driven development is ${rddLine} and`, risk, writerProfile);
 }
 
 // ---------------------------------------------------------------------------

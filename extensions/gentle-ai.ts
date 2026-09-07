@@ -108,10 +108,15 @@ import { CandidateViewError, CandidateViewRegistry, injectReviewCandidateView, r
 import {
 	GentleAiDevBinaryOverrideError,
 	registerGentleAiDevBinary,
+	resolveGentleAiBinary,
 	resolveGentleAiDevBinaryOverride,
 	unregisterGentleAiDevBinary,
 	type GentleAiDevBinaryOverride,
 } from "../lib/gentle-ai-binary.ts";
+import {
+	spawnTelemetryTrigger,
+	type TelemetryTriggerSpawn,
+} from "../lib/telemetry-trigger.ts";
 import {
 	createNativeReviewCli,
 	createNodeExecFileAdapter,
@@ -144,15 +149,19 @@ import {
 	type NativeReviewProcessDiagnostics,
 	type NativeStartResult,
 	type NativeReviewAssessRequest,
+	type ExecFileAdapter,
+	type ExecFileResult,
 } from "../lib/native-review-cli.ts";
 import {
 	verificationPlan,
 	resolveWriterProfile,
 	RDD_LINE,
 	VERIFICATION_TIER,
+	NATIVE_REVIEW_OUTCOME,
 	type RddLine,
 	type VerificationTier,
 	type ReviewAssessmentV1,
+	type NativeReviewOutcome,
 } from "../lib/review-risk-assessment.ts";
 import {
 	assertReviewApprovedAcknowledgementExecuteV1,
@@ -751,6 +760,52 @@ function clearRddStatusMemoForTesting(): void {
 	rddStatusMemo.clear();
 }
 
+// gentle-pi#668 (corrected): last-known outcome for ONE candidate, keyed by
+// repository realpath AND targetIdentity -- never repository alone, or one
+// candidate's outcome would leak into every other candidate's `assess` call.
+// Only declined/unavailable are ever written (from ANSWER_CONSENT); `closed`
+// is never written/derived -- pass it explicitly. A missing entry reads back
+// `undefined`, treated as `unknown` (fail closed, exactly like `off`).
+const nativeReviewOutcomeByCandidate = new Map<string, "declined" | "unavailable">();
+
+function nativeReviewOutcomeMemoKey(cwd: string, targetIdentity: string): string {
+	try {
+		return `${realpathSync(cwd)}\u0000${targetIdentity}`;
+	} catch {
+		return `${cwd}\u0000${targetIdentity}`;
+	}
+}
+
+function recordNativeReviewOutcome(cwd: string, targetIdentity: string, outcome: "declined" | "unavailable"): void {
+	nativeReviewOutcomeByCandidate.set(nativeReviewOutcomeMemoKey(cwd, targetIdentity), outcome);
+}
+
+/** Returns the recorded outcome for exactly this candidate, or `undefined` when none is recorded. */
+function readNativeReviewOutcome(cwd: string, targetIdentity: string): "declined" | "unavailable" | undefined {
+	return nativeReviewOutcomeByCandidate.get(nativeReviewOutcomeMemoKey(cwd, targetIdentity));
+}
+
+/** @internal test seam: clears the per-candidate native review outcome memo. */
+function clearNativeReviewOutcomeMemoForTesting(): void {
+	nativeReviewOutcomeByCandidate.clear();
+}
+
+// Best-effort current-candidate target identity for `assess` (gentle-pi#668):
+// reuses `targetStatus`, a native call this tool already makes elsewhere.
+async function readCurrentTargetIdentityBestEffort(
+	nativeReviewCli: Pick<NativeReviewCli, "targetStatus"> | null | undefined,
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	if (nativeReviewCli?.targetStatus === undefined) return undefined;
+	try {
+		const status = await nativeReviewCli.targetStatus({ cwd, ...(signal === undefined ? {} : { signal }) });
+		return status.applicability === "current_target" ? status.targetIdentity : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 function rddAbortRejection(signal: AbortSignal): Promise<never> {
 	return new Promise((_resolve, reject) => {
 		if (signal.aborted) {
@@ -790,6 +845,10 @@ interface ReviewAssessmentPlanDetails {
 	changedLines: number;
 	candidate: { kind: string; baseRef: string | undefined } | null;
 	rddLine: RddLine;
+	nativeReviewOutcome: NativeReviewOutcome;
+	// gentle-pi#668: where nativeReviewOutcome came from -- explicit (caller
+	// passed it), derived (matched this exact candidate), or unknown.
+	outcome_source: "explicit" | "derived" | "unknown";
 	writerProfile: "small" | "large";
 	plan: {
 		writerSelfVerification: boolean;
@@ -800,7 +859,7 @@ interface ReviewAssessmentPlanDetails {
 }
 
 async function resolveReviewAssessmentPlan(
-	nativeReviewCli: Pick<NativeReviewCli, "reviewMode" | "assess"> | null | undefined,
+	nativeReviewCli: Pick<NativeReviewCli, "reviewMode" | "assess" | "targetStatus"> | null | undefined,
 	cwd: string,
 	input: ReviewAssessInput,
 	signal?: AbortSignal,
@@ -833,7 +892,14 @@ async function resolveReviewAssessmentPlan(
 	}
 
 	const risk: VerificationTier = assessment?.risk ?? VERIFICATION_TIER.UNASSESSABLE;
-	const plan = verificationPlan({ rddLine, risk, writerProfile });
+	// gentle-pi#668: explicit always wins; otherwise derive only for THIS
+	// candidate's own target identity, never repository-only. `closed` is
+	// never derived.
+	const targetIdentity = input.nativeReviewOutcome === undefined ? await readCurrentTargetIdentityBestEffort(nativeReviewCli, cwd, signal) : undefined;
+	const derived = targetIdentity === undefined ? undefined : readNativeReviewOutcome(cwd, targetIdentity);
+	const nativeReviewOutcome: NativeReviewOutcome = input.nativeReviewOutcome ?? derived ?? NATIVE_REVIEW_OUTCOME.UNKNOWN;
+	const outcomeSource: "explicit" | "derived" | "unknown" = input.nativeReviewOutcome !== undefined ? "explicit" : derived === undefined ? "unknown" : "derived";
+	const plan = verificationPlan({ rddLine, risk, writerProfile, nativeReviewOutcome });
 	return {
 		schema: "gentle-pi.review-assessment-plan/v1",
 		risk,
@@ -842,6 +908,8 @@ async function resolveReviewAssessmentPlan(
 		changedLines: assessment?.changedLines ?? 0,
 		candidate: assessment === undefined ? null : { kind: assessment.candidate.kind, baseRef: assessment.candidate.baseRef },
 		rddLine,
+		nativeReviewOutcome,
+		outcome_source: outcomeSource,
 		writerProfile,
 		plan,
 	};
@@ -2928,7 +2996,7 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 		},
 		input: {
 			type: "string",
-			description: "A JSON-serialized object string, not a nested object. New native ordinary START uses {\"mode\":\"ordinary\"}; answer-consent uses exactly {\"consentBinding\":\"<opaque id>\",\"answer\":\"granted|declined\"}. Ordinary provider capture belongs only to gentle_review_capture. An explicit baseRef requires committedOnly: true and requests a committed range, while repository-local policyPath remains optional. ASSESS accepts an optional object with baseRef, committedOnly, writerModelId, and writerEffort (gentle-pi#662); omitting writerModelId and writerEffort assesses the ambient working tree and fails closed to a small writer profile (never large) because the writer's actual profile is unknown to this call. Legacy controller input remains separate.",
+			description: "A JSON-serialized object string, not a nested object. New native ordinary START uses {\"mode\":\"ordinary\"}; answer-consent uses exactly {\"consentBinding\":\"<opaque id>\",\"answer\":\"granted|declined\"}. Ordinary provider capture belongs only to gentle_review_capture. An explicit baseRef requires committedOnly: true and requests a committed range, while repository-local policyPath remains optional. ASSESS accepts an optional object with baseRef, committedOnly, writerModelId, writerEffort, and nativeReviewOutcome (gentle-pi#662/#668); omitting writerModelId and writerEffort assesses the ambient working tree and fails closed to a small writer profile (never large) because the writer's actual profile is unknown to this call. nativeReviewOutcome (one of closed, declined, unavailable, unknown) tells ASSESS whether the native review actually closed for this candidate: when Receipt-driven development reads on but the review was declined for this candidate, is unavailable, or its outcome is unknown, ASSESS falls back to the exact risk-gated plan it returns when RDD is off, re-enabling the separate verifier -- a decline is candidate-scoped and never lowers the bar below the RDD-off path. Omitting it lets ASSESS try to derive declined/unavailable from what this process itself recorded for this exact candidate (never a different one, and never from repository state alone), failing closed to unknown when it cannot; `closed` is never derived -- pass it explicitly, and only right after acknowledging the approved review for this same candidate. The returned outcome_source (explicit|derived|unknown) says which of these produced the value. Legacy controller input remains separate.",
 		},
 		outputPath: { type: "string", description: "Retired with legacy bundle export; ignored. Export returns legacy-operation-retired." },
 		inputPath: { type: "string", description: "Repository-local JSON input file for the separate legacy controller flow (alternative to input). Legacy bundle import is retired." },
@@ -3027,24 +3095,37 @@ interface ReviewAssessInput {
 	committedOnly?: boolean;
 	writerModelId?: string;
 	writerEffort?: string;
+	// gentle-pi#668: the caller's own known outcome for this candidate.
+	// Omitted tries to auto-derive declined/unavailable for this EXACT
+	// candidate's own target identity (never a different one); `closed` is
+	// never auto-derived -- pass it explicitly.
+	nativeReviewOutcome?: NativeReviewOutcome;
+}
+
+function isNativeReviewOutcome(value: unknown): value is NativeReviewOutcome {
+	return typeof value === "string" && (Object.values(NATIVE_REVIEW_OUTCOME) as readonly string[]).includes(value);
 }
 
 function parseReviewAssessInput(operation: ReviewControllerOperation, raw: string | undefined): ReviewAssessInput {
 	if (raw === undefined) return {};
 	const value = parseControllerJson(raw, operation);
-	const allowed = new Set(["baseRef", "committedOnly", "writerModelId", "writerEffort"]);
+	const allowed = new Set(["baseRef", "committedOnly", "writerModelId", "writerEffort", "nativeReviewOutcome"]);
 	const unexpected = Object.keys(value).find((key) => !allowed.has(key));
 	if (unexpected !== undefined) throw new Error(`Review controller ${operation} input does not accept ${unexpected}`);
-	const { baseRef, committedOnly, writerModelId, writerEffort } = value;
+	const { baseRef, committedOnly, writerModelId, writerEffort, nativeReviewOutcome } = value;
 	if (baseRef !== undefined && typeof baseRef !== "string") throw new Error(`Review controller ${operation} input baseRef must be a string`);
 	if (committedOnly !== undefined && typeof committedOnly !== "boolean") throw new Error(`Review controller ${operation} input committedOnly must be a boolean`);
 	if (writerModelId !== undefined && typeof writerModelId !== "string") throw new Error(`Review controller ${operation} input writerModelId must be a string`);
 	if (writerEffort !== undefined && typeof writerEffort !== "string") throw new Error(`Review controller ${operation} input writerEffort must be a string`);
+	if (nativeReviewOutcome !== undefined && !isNativeReviewOutcome(nativeReviewOutcome)) {
+		throw new Error(`Review controller ${operation} input nativeReviewOutcome must be one of ${Object.values(NATIVE_REVIEW_OUTCOME).join(", ")}`);
+	}
 	return {
 		...(baseRef === undefined ? {} : { baseRef: baseRef as string }),
 		...(committedOnly === undefined ? {} : { committedOnly: committedOnly as boolean }),
 		...(writerModelId === undefined ? {} : { writerModelId: writerModelId as string }),
 		...(writerEffort === undefined ? {} : { writerEffort: writerEffort as string }),
+		...(nativeReviewOutcome === undefined ? {} : { nativeReviewOutcome: nativeReviewOutcome as NativeReviewOutcome }),
 	};
 }
 
@@ -4067,6 +4148,18 @@ const processAgentEndPreflightNudgedTargets = new Map<PendingReviewConsentSessio
 // something this session produced, so `agent_end` must not treat it as an
 // unreviewed candidate this session should be reminded about.
 const processAgentEndSessionBaseline = new Map<PendingReviewConsentSessionKey, string>();
+
+// gentle-pi#677: gentle-ai#4309 owns anonymous usage telemetry end to end;
+// Pi only nudges it once per process. This is a plain process-lifetime
+// guard, not a session-keyed map, because the nudge is meant to fire at most
+// once no matter how many primary-session `before_agent_start` events this
+// process observes.
+let processTelemetryTriggerAttempted = false;
+
+/** Testing-only reset for the once-per-process telemetry trigger guard. */
+function resetTelemetryTriggerGuardForTesting(): void {
+	processTelemetryTriggerAttempted = false;
+}
 
 function pendingReviewConsentSessionKey(context: ExtensionContext | undefined, fallbackKey: symbol): PendingReviewConsentSessionKey {
 	try {
@@ -5756,6 +5849,9 @@ async function executeReviewControllerOperation(
 			// The registry owns restoring writability of its 0555 views before
 			// removal; a terminal approved cleanup keeps the lineage projection.
 			candidateViews?.cleanupTerminal(parameters.lineageId, "approved", defaultCwd);
+			// gentle-pi#668: `closed` is never auto-derived or recorded here --
+			// a parent that wants the on-path passes nativeReviewOutcome:
+			// "closed" explicitly on its next assess call for this candidate.
 			return {
 				operation: parameters.operation,
 				status: "closed",
@@ -5828,6 +5924,9 @@ async function executeReviewControllerOperation(
 		try {
 			const gated = await resolveReviewModeGate(nativeReviewCli, parameters.operation, defaultCwd, signal);
 			if (gated !== undefined) {
+				// gentle-pi#668: mode disabled for this exact candidate -- keyed by
+				// its targetIdentity, never by repository alone.
+				recordNativeReviewOutcome(pending.authorityCwd, pending.consent.targetIdentity, NATIVE_REVIEW_OUTCOME.UNAVAILABLE);
 				cleanupPendingReviewConsent(pending, pendingReviewConsentRegistry, owningSession);
 				return gated;
 			}
@@ -5846,6 +5945,9 @@ async function executeReviewControllerOperation(
 				...(signal === undefined ? {} : { signal }),
 			});
 			if (answered.kind === "declined") {
+				// gentle-pi#668: candidate-scoped decline, keyed by this exact
+				// candidate's targetIdentity, never by repository alone.
+				recordNativeReviewOutcome(pending.authorityCwd, pending.consent.targetIdentity, NATIVE_REVIEW_OUTCOME.DECLINED);
 				pending.cleanupCandidate();
 				return {
 					operation: parameters.operation,
@@ -6015,7 +6117,7 @@ async function executeReviewControllerOperation(
 							cleanupCandidate: () => {
 								if (candidateCleaned) return;
 								candidateCleaned = true;
-								consentCandidateView.cleanup();
+								try { consentCandidateView.cleanup(); } catch { /* Failed ownership proof preserves the view; consent expiry/teardown still completes. */ }
 							},
 							...(retainedUntrackedSelection === undefined ? {} : { untrackedSelection: retainedUntrackedSelection }),
 							consent: error.consent,
@@ -6238,8 +6340,12 @@ export const __testing = {
 	RDD_STATUS_TIMEOUT_MS,
 	RDD_STATUS_MEMO_TTL_MS,
 	clearRddStatusMemoForTesting,
+	readNativeReviewOutcome,
+	recordNativeReviewOutcome,
+	clearNativeReviewOutcomeMemoForTesting,
 	resolveControllerSddStatus,
 	resolveStartupControllerSddStatus,
+	resetTelemetryTriggerGuardForTesting,
 	createGentleAiExtension: createGentleAiExtensionForTesting,
 };
 
@@ -6280,6 +6386,15 @@ export interface GentleAiRuntimeDependencies {
 	// Package-owned children use this parent-bound channel only to ask whether
 	// their own pending ordinary START may replay a grant locally.
 	childStandingReviewPermissionClient?: Pick<ChildStandingReviewPermissionClient, "requestAuthorization" | "close">;
+	// gentle-pi#677: test-only seams for the telemetry trigger. Production
+	// leaves both undefined: the real package-local resolveGentleAiBinary()
+	// and the real detached child_process spawn run.
+	resolveTelemetryTriggerBinary?: () => string;
+	telemetryTriggerSpawn?: TelemetryTriggerSpawn;
+	// Test-only seam for the foreground `/gentle:telemetry` slash command's
+	// bounded exec; production leaves this undefined and uses the real node
+	// exec-file adapter shared with the rest of the extension.
+	telemetryExecFileAdapter?: ExecFileAdapter;
 }
 
 export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencies = {}): (pi: ExtensionAPI) => void {
@@ -6297,6 +6412,8 @@ function createGentleAiExtensionForTesting(
 	const reviewConsentNow = dependencies.now ?? (() => Date.now());
 	const reviewConsentScheduleTimer = dependencies.scheduleTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
 	const pendingReviewConsentRegistry = dependencies.pendingReviewConsentRegistry ?? processPendingReviewConsentRegistry;
+	const resolveTelemetryTriggerBinary = dependencies.resolveTelemetryTriggerBinary ?? resolveGentleAiBinary;
+	const telemetryExecFileAdapter = dependencies.telemetryExecFileAdapter ?? createNodeExecFileAdapter();
 	return function gentleAi(pi: ExtensionAPI): void {
 	declareReviewRelayHandshake(dependencies.processEnv ?? process.env);
 	const pendingReviewConsentFallbackKey = Symbol("pending-review-consent-fallback");
@@ -6333,6 +6450,8 @@ function createGentleAiExtensionForTesting(
 	};
 
 	pi.on("session_shutdown", (event, context) => {
+		// Pi tears down this registry on reload as well as session replacement/quit.
+		try { candidateViews?.cleanupAll(); } catch { /* Preserve failed owned views for later recovery. */ }
 		const reason = (event as { reason?: unknown }).reason;
 		if (reason !== "reload") {
 			if (childStandingReviewPermissionLease !== undefined) childStandingReviewPermissionLease.closeIfCurrent();
@@ -6477,7 +6596,7 @@ function createGentleAiExtensionForTesting(
 			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization, then call RESET or RECOVER only after authorization. RESET and RECOVER_LOCK route to audited native `gentle-ai review reclaim`; only RESET carries the legacy repositoryId, commonDirHash, inventoryHash, and confirmation challenge. RECOVER routes to native `gentle-ai review recover` with exactly six inputs: predecessorLineage, expectedPredecessorRevision, successorLineage, disposition, actor, and reason. Never send RECOVER the reset challenge and never send it a maintainerAuthorization: Pi reads fresh native target status, pins the predecessor lineage, revision, provider-selected disposition, and target identity, derives the exact six-line native authorization binding, displays it for fresh UI approval, and re-reads status before mutating. Negotiated target status supplies the sole accepted recovery disposition, and a caller-supplied substitute is rejected. Treat a native-input-required envelope as a request for exact values, never as permission to invent them. After a committed native recovery record, INSPECT before any fresh ordinary START.",
 			"A consent-required START may be resolved inside the eligible interactive Pi host. Its third UI action is host-owned: it runs this envelope's exact provider grant once and allows later fresh validated envelopes only for the same live SessionManager, nonempty session ID, and canonical Git common-directory identity, including sibling worktrees; an unrelated repository requires a new explicit human grant. Revoke removes the current repository grant, while nonreload replacement, quit, and process exit remove all session grants; reload preserves them. It grants no provider mode, verdict, acknowledgement, maintenance, delivery, or cross-repository authority. A package-owned child may ask its parent only with the canonical digest of its exact pending target; the parent binds that digest to the task repository and fails closed otherwise. If the tool returns an unresolved envelope, present the original two provider choices without changing machine tokens, commands, target IDs, or invocations; never add the host action to the decoded provider envelope. After one explicit relayed human answer, call answer-consent exactly once with only consentBinding and answer (`granted` or `declined`). Never create host permission from tool arguments, model prose, child/headless responses, or an uncertain native result. A reported lineage_created false or pre-authority validation error proves no lineage was created. After ambiguous START output, the controller calls target-scoped native status once and returns only its declared action. An ambiguous gentle_review_capture outcome independently reconciles once and never replays the capture.",
 			"Use gentle_review only for native review authority operations; delivery commands follow ordinary repository policy.",
-			'ASSESS (gentle-pi#662) is read-only and needs no lineageId: after a delegated writer returns, call {"operation":"assess"} over its diff and follow the returned plan (writerSelfVerification, structuralReadbackOnly, independentVerifier, reason) instead of judging non-triviality from the task description. Pass input as JSON only to assess a committed range ({"baseRef":"<ref>","committedOnly":true}) or to record the writer profile ({"writerModelId":"...", "writerEffort":"..."}). Omitting writerModelId and writerEffort is treated as a small writer profile (fail closed), never large, because the writer\'s actual profile is then unknown to this call; pass the writer\'s real model id/effort to get credit for a known large profile. A failed or unavailable native assessment reports risk "unassessable", verified exactly like "high". This never mutates review authority state.',
+			'ASSESS (gentle-pi#662/#668) is read-only and needs no lineageId: after a delegated writer returns, call {"operation":"assess"} over its diff and follow the returned plan (writerSelfVerification, structuralReadbackOnly, independentVerifier, reason) instead of judging non-triviality from the task description. Pass input as JSON only to assess a committed range ({"baseRef":"<ref>","committedOnly":true}), to record the writer profile ({"writerModelId":"...", "writerEffort":"..."}), or to state the native review\'s outcome for this candidate ({"nativeReviewOutcome":"closed|declined|unavailable|unknown"}). Omitting writerModelId and writerEffort is treated as a small writer profile (fail closed), never large, because the writer\'s actual profile is then unknown to this call; pass the writer\'s real model id/effort to get credit for a known large profile. The on-path (writer self-verification is the record, no separate verifier) holds only when nativeReviewOutcome is "closed" for this candidate; a decline, an unavailable review, or an omitted/unknown outcome falls back to the exact risk-gated plan RDD off would return, re-enabling the separate verifier -- a decline is candidate-scoped and never lowers the bar below RDD off. "closed" is never inferred: pass it only right after this same caller acknowledged the approved review for this same candidate; omitting nativeReviewOutcome only ever auto-derives declined/unavailable, bound to that exact candidate\'s own target identity, never to a different candidate or to bare repository state. The result\'s outcome_source (explicit|derived|unknown) states which. A failed or unavailable native assessment reports risk "unassessable", verified exactly like "high". This never mutates review authority state.',
 		],
 		parameters: REVIEW_CONTROLLER_PARAMETERS,
 		executionMode: "sequential",
@@ -6593,6 +6712,7 @@ function createGentleAiExtensionForTesting(
 	}
 
 	pi.on("session_start", async (event, ctx) => {
+		try { candidateViews?.sweepOrphans(ctx.cwd); } catch { /* Ownership sweeping must not block startup. */ }
 		const reason = (event as { reason?: unknown }).reason;
 		if (reason !== "reload") revokeCurrentReviewSessionPermission(ctx);
 		await refreshReviewSessionPermissionStatus(ctx);
@@ -6663,6 +6783,26 @@ function createGentleAiExtensionForTesting(
 			processAgentEndSubagentDepth.set(subagentDepthKey, (processAgentEndSubagentDepth.get(subagentDepthKey) ?? 0) + 1);
 		} else {
 			processAgentEndSubagentDepth.set(subagentDepthKey, 0);
+		}
+		// gentle-pi#677: nudge gentle-ai's own telemetry trigger for a primary
+		// session only, reusing the exact isNamedAgent/isSddAgent predicate that
+		// decides the orchestrator prompt below. At most one attempt per
+		// process regardless of how many primary-session before_agent_start
+		// events this process observes; a missing/old binary or a spawn error
+		// must never affect activation, so every failure is swallowed silently.
+		if (!isNamedAgent && !isSddAgent && !processTelemetryTriggerAttempted) {
+			processTelemetryTriggerAttempted = true;
+			try {
+				const executable = resolveTelemetryTriggerBinary();
+				spawnTelemetryTrigger({
+					executable,
+					cwd: ctx.cwd,
+					env: dependencies.processEnv ?? process.env,
+					spawn: dependencies.telemetryTriggerSpawn,
+				});
+			} catch {
+				// Best-effort only; never surfaced and never affects activation.
+			}
 		}
 		if (isSddAgent && !getSddPreflightPreferences(ctx)) {
 			await runSddPreflight(ctx);
@@ -7031,6 +7171,56 @@ function createGentleAiExtensionForTesting(
 				}
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			}
+		},
+	});
+
+	// gentle-pi#677: gentle-ai owns telemetry end to end (status, the opt-out
+	// switches, and rate limiting); this command only runs the corresponding
+	// `gentle-ai telemetry <op> --json` in the foreground and relays its
+	// output, so a Pi user never has to leave Pi to check or change it.
+	pi.registerCommand("gentle:telemetry", {
+		description: "Show or change the local Gentle AI telemetry trigger (status|enable|disable|preview); gentle-ai owns the data and the opt-out.",
+		handler: async (args, ctx) => {
+			const subAction = args.trim().length === 0 ? "status" : args.trim();
+			if (subAction !== "status" && subAction !== "enable" && subAction !== "disable" && subAction !== "preview") {
+				ctx.ui.notify(`Unknown /gentle:telemetry sub-action "${subAction}". Use status, enable, disable, or preview.`, "warning");
+				return;
+			}
+			let executable: string;
+			try {
+				executable = resolveTelemetryTriggerBinary();
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				return;
+			}
+			let result: ExecFileResult;
+			try {
+				result = await telemetryExecFileAdapter({
+					file: executable,
+					arguments: ["telemetry", subAction, "--json"],
+					cwd: ctx.cwd,
+					timeoutMs: 5_000,
+					maxBufferBytes: 1024 * 1024,
+				});
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				return;
+			}
+			if (result.exitCode !== 0) {
+				ctx.ui.notify(`gentle-ai telemetry ${subAction} failed (exit ${result.exitCode}): ${(result.stderr || result.stdout || "no output").trim()}`, "error");
+				return;
+			}
+			let relayed: string;
+			try {
+				relayed = JSON.stringify(JSON.parse(result.stdout), null, 2);
+			} catch {
+				relayed = result.stdout.trim();
+			}
+			if (subAction === "disable") {
+				ctx.ui.notify("Gentle AI telemetry disabled.", "info");
+				return;
+			}
+			ctx.ui.notify(relayed, "info");
 		},
 	});
 

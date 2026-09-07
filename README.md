@@ -680,6 +680,8 @@ Gentle notices are drawn as cards: the same rounded frame as the prompt, with th
 
 ### Gentle Agents
 
+The current package requires Pi 0.85.1 or newer (development tests pin 0.85.1). Use the latest Pi release; gentle-pi does not update your installed Pi automatically. Children, including any `GENTLE_PI_AGENTS_PI` override, must emit `agent_settled`: `agent_end` records a run's output but is not completion because retries or queued continuations may follow.
+
 The `subagent_*` tools and the agents card replace the third-party subagents package (remove `npm:pi-subagents-j0k3r` from your pi packages; while it is still installed the tools stay unregistered and a warning says so at startup). Agent definitions and settings are the ones you already have: markdown agents in `~/.pi/agent/agents/`, `~/.pi/agent/subagents/`, `<cwd>/.pi/agents/`, `<cwd>/.pi/subagents/` (project beats global, `subagents/` beats `agents/`), and `subagents.json` at the global and project level (`default_model`, `default_effort`, `default_mode`, `model_profiles`, `stall_timeout_ms`, `max_concurrency`, `history_max_tasks`).
 
 ```text
@@ -694,7 +696,7 @@ Every subagent is its own `pi --mode rpc` child process, so the terminal never r
 - `subagent_list_agents`, `subagent_run` (`agent`, `task`, `label?`, `context?`, `mode?` task or background), `subagent_status`, `subagent_result`, `subagent_list_tasks`, `subagent_cancel`, `subagent_send_message` (steer a running child), `subagent_continue` (resume a finished task in its own session).
 - A background task's result comes back to the model as a `gentle-agents.result` message, drawn as a rose card, and starts a new turn when the agent is idle; the model never polls.
 - The card shows the active session's tasks only: after `/new` or `/resume` the earlier session's tasks leave it and come back with their session. Finished rows stay for one minute (three at most), and the card spends at most a quarter of the terminal (three to eight rows) on tasks; beyond that the rest fold into one `… N more · alt+a to view` line so the editor never leaves the screen. Questions and running work keep their rows first.
-- `/gentle:agents` or `alt+a` opens the overlay: tasks on the left, the selected task's thread on the right. It opens on this session (active tasks plus those finished in the last fifteen minutes); `a` widens the list to every task of every session, including the stored history, and back. The list scrolls with the selection. `j`/`k` move, `ctrl+j`/`ctrl+k` or `pgdn`/`pgup` scroll the thread (`f` follows the tail again), `s` stops the selected task (`c` is a legacy alias), and `o` opens a markdown transcript of the task's session in `$EDITOR` (written under `~/.pi/agent/gentle-agents/transcripts/`). `esc` or `q` only closes the overlay. Only the selected task is subscribed while it is open.
+- `/gentle:agents` or `alt+a` opens the overlay: tasks on the left, the selected task's thread on the right. It opens on this session (active tasks plus those finished in the last fifteen minutes); `a` widens the list to every task of every session, including the stored history, and back. The list scrolls with the selection. In fullscreen mode, hovering only highlights a task row; clicking selects it without opening its session or cancelling it; and the wheel scrolls the list or thread under the pointer independently. `j`/`k` move, `ctrl+j`/`ctrl+k` or `pgdn`/`pgup` scroll the thread (`f` follows the tail again), `s` stops the selected task (`c` is a legacy alias), and `o` opens a markdown transcript of the task's session in `$EDITOR` (written under `~/.pi/agent/gentle-agents/transcripts/`). `esc` or `q` only closes the overlay. Only the selected task is subscribed while it is open.
 - `alt+s` confirms stopping the current active or queued subagents owned by the current process. `GENTLE_PI_AGENTS_STOP_KEY` rebinds it; `off` disables it.
 - Finished tasks are written to `~/.pi/agent/gentle-agents/tasks/` (one JSON per task, newest `history_max_tasks` kept, default 200) and come back on demand for `subagent_result`, `subagent_continue`, and the overlay. Child sessions live under `~/.pi/agent/gentle-agents/sessions/`.
 - `ctrl+shift+a` collapses the card to its first row (`GENTLE_PI_AGENTS_KEY`), `GENTLE_PI_AGENTS_VIEW_KEY` rebinds the overlay, `GENTLE_PI_AGENTS_PI` overrides the pi command used for children, and `GENTLE_PI_AGENTS=0` disables the tools and the card.
@@ -730,6 +732,7 @@ Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer and editor.
 | `/gentle:models`                 | Opens global model + effort assignment UI. Press `x` to export and `r` to restore saved routing. |
 | `/gentle:persona`                | Switches global persona mode, with project override support.        |
 | `/gentle:background-subagents`   | Shows or sets the managed background-subagents policy (`status\|enable\|disable`), naming the source that decided it. |
+| `/gentle:telemetry`              | Shows or changes the local Gentle AI telemetry trigger (`status\|enable\|disable\|preview`).  |
 | `/gentle:banner`                 | Configures startup banner rose, text logo, and color preset.        |
 | `/gentle:toggle-rose`            | Toggles the startup rose.                                           |
 | `/gentle:toggle-text-logo`       | Toggles the startup text logo.                                      |
@@ -806,6 +809,22 @@ Memory contract for SDD delegation:
 - subagents should not independently search memory during normal runtime unless explicitly instructed to retrieve a specific artifact or observation;
 - subagents should save significant discoveries, decisions, bug fixes, and completed SDD phase artifacts before returning when memory tools are available;
 - in memory/hybrid mode, SDD artifacts use stable topic keys such as `sdd/<change>/proposal`, `sdd/<change>/spec`, `sdd/<change>/design`, `sdd/<change>/tasks`, `sdd/<change>/apply-progress`, and `sdd/<change>/verify-report`.
+
+## Telemetry
+
+`gentle-pi` does not collect anything itself. [gentle-ai](https://github.com/Gentleman-Programming/gentle-ai) owns anonymous usage telemetry end to end — install and heartbeat events, what fields are sent, rate limiting, and every opt-out. See its README/docs for the exact contract.
+
+At session start, for a primary session only (never for a named or SDD sub-agent), Gentle Pi asks the local `gentle-ai` binary to send its own telemetry: it spawns `gentle-ai telemetry trigger --json` detached, with a 3 s deadline, discards its output, and never blocks session start or surfaces an error — an older binary without the verb is silently treated as nothing to do. This runs at most once per process.
+
+Install counts for `gentle-pi` and `gentle-engram` come from npm download statistics; the package itself never emits an install event.
+
+To opt out:
+
+- `/gentle:telemetry disable` — asks the local `gentle-ai` binary to disable telemetry (also `status` and `preview` to inspect it without leaving Pi).
+- `DO_NOT_TRACK=1` — Gentle Pi itself will not spawn the trigger, and `gentle-ai` also honors this standard on its own.
+- `GENTLE_AI_TELEMETRY=0` — same effect, `gentle-ai`'s own environment switch.
+
+`CI=true` also suppresses the trigger, since automated runs are not a real usage signal.
 
 ## Package contents
 

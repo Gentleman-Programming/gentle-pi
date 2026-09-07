@@ -1,4 +1,5 @@
-import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { createNativePointerScope, type NativePointerRegion } from "./native-pointer-region.ts";
 import { isFinished, TASK_STATUS, THREAD_ITEM, type TaskRecord, type TaskStore, type TaskThread, type ThreadItem, type ToolItem } from "./agents-protocol.ts";
 import { formatElapsed } from "./agents-widget.ts";
 import { formatTokens } from "./shell-bar.ts";
@@ -91,6 +92,21 @@ const KEYS = [
 	["esc", "close"],
 ] as const;
 
+const EMPTY_COMPONENT: Component = {
+	render: () => [],
+	invalidate() {},
+};
+
+interface PointerLayout {
+	width: number;
+	height: number;
+	listX: number;
+	listWidth: number;
+	threadX: number;
+	threadWidth: number;
+	bodyRows: number;
+}
+
 function rule(length: number): string {
 	return "─".repeat(Math.max(0, length));
 }
@@ -139,10 +155,16 @@ export class AgentsView {
 	private readonly deps: AgentsViewDeps;
 	private tasks: TaskRecord[] = [];
 	private selected = 0;
-	private listOffset = 0;
+	private hovered: number | undefined;
+	private listScroll = 0;
 	private scope: ViewScope;
 	private scroll = 0;
 	private follow = true;
+	private readonly pointerScope = createNativePointerScope();
+	private readonly taskRegions = new Map<number, NativePointerRegion>();
+	private readonly listRegion: NativePointerRegion;
+	private readonly threadRegion: NativePointerRegion;
+	private pointerLayout: PointerLayout | undefined;
 	private unsubscribeTask: (() => void) | undefined;
 	private readonly unsubscribeSummary: () => void;
 	private cache = new WeakMap<ThreadItem, string[]>();
@@ -151,8 +173,15 @@ export class AgentsView {
 	constructor(deps: AgentsViewDeps) {
 		this.deps = deps;
 		this.scope = deps.sessionId === undefined ? VIEW_SCOPE.ALL : VIEW_SCOPE.SESSION;
+		this.listRegion = this.pointerScope.wrap(EMPTY_COMPONENT, {
+			onWheel: (event) => this.wheelList(event),
+		});
+		this.threadRegion = this.pointerScope.wrap(EMPTY_COMPONENT, {
+			onWheel: (event) => this.wheelThread(event),
+		});
 		this.refreshTasks();
 		this.unsubscribeSummary = deps.store.subscribeSummary(() => {
+			this.pointerScope.invalidate();
 			this.refreshTasks();
 			this.deps.requestRender();
 		});
@@ -160,8 +189,14 @@ export class AgentsView {
 	}
 
 	dispose(): void {
+		this.pointerLayout = undefined;
+		this.pointerScope.dispose();
 		this.unsubscribeTask?.();
 		this.unsubscribeSummary();
+	}
+
+	mouseObserver(): ReturnType<typeof this.pointerScope.createMouseObserver> {
+		return this.pointerScope.createMouseObserver(() => this.deps.requestRender());
 	}
 
 	selectedTask(): TaskRecord | undefined {
@@ -186,6 +221,23 @@ export class AgentsView {
 		else if ((data === "o" || matchesKey(data, Key.enter)) && task) this.deps.onOpen(task);
 	}
 
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		const layout = this.pointerLayout;
+		if (!layout || event.x < 0 || event.y < 0 || event.x >= layout.width || event.y >= layout.height) return undefined;
+		if (event.y >= 1 && event.y < 1 + layout.bodyRows) {
+			const row = event.y - 1;
+			if (event.x >= layout.listX && event.x < layout.listX + layout.listWidth) {
+				if (event.type === "wheel") return this.listRegion.handleMouse(event);
+				const task = this.tasks[this.listScroll + row];
+				return task ? this.taskRegion(row).handleMouse(event) : undefined;
+			}
+			if (event.x >= layout.threadX && event.x < layout.threadX + layout.threadWidth && event.type === "wheel") {
+				return this.threadRegion.handleMouse(event);
+			}
+		}
+		return undefined;
+	}
+
 	render(width: number): string[] {
 		// Finished rows age out of the session scope while the overlay is open;
 		// the list is otherwise reordered only when a status changes.
@@ -195,11 +247,14 @@ export class AgentsView {
 		const inner = width - 2;
 		const listWidth = Math.min(LIST_MAX_WIDTH, Math.floor(inner * LIST_RATIO));
 		const threadWidth = inner - listWidth - 4;
+		const rows = this.bodyRows();
+		this.followSelection(rows);
+		this.pointerLayout = { width, height: rows + CHROME_ROWS, listX: 2, listWidth, threadX: listWidth + 5, threadWidth, bodyRows: rows };
+		this.listRegion.render(listWidth);
+		this.threadRegion.render(threadWidth);
 		const scope = this.deps.sessionId === undefined ? "" : `${SCOPE_LABEL[this.scope]} · `;
 		const title = `❀ Agents · ${scope}${this.counts()}`;
 		const top = theme.fg(ROLE.FRAME, "╭─ ") + theme.fg(ROLE.TITLE, title) + theme.fg(ROLE.FRAME, ` ${rule(inner - visibleWidth(title) - 3)}╮`);
-		const rows = this.bodyRows();
-		this.followSelection(rows);
 		const right = this.threadWindow(rows, threadWidth);
 		const body: string[] = [];
 		for (let row = 0; row < rows; row += 1) {
@@ -210,7 +265,9 @@ export class AgentsView {
 		return [top, ...body, keysLine, theme.fg(ROLE.FRAME, `╰${rule(inner)}╯`)];
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.pointerScope.invalidate();
+	}
 
 	private counts(): string {
 		const active = this.tasks.filter((task) => !isFinished(task.status)).length;
@@ -233,7 +290,8 @@ export class AgentsView {
 		this.scope = this.scope === VIEW_SCOPE.SESSION ? VIEW_SCOPE.ALL : VIEW_SCOPE.SESSION;
 		this.tasks = [];
 		this.selected = 0;
-		this.listOffset = 0;
+		this.listScroll = 0;
+		this.hovered = undefined;
 		this.scroll = 0;
 		this.follow = true;
 		this.refreshTasks();
@@ -249,11 +307,11 @@ export class AgentsView {
 	}
 
 	// Keep the selected row inside the list window, moving the window by the
-	// least amount needed.
+	// least amount needed; the wheel moves the same window on its own.
 	private followSelection(rows: number): void {
-		if (this.selected < this.listOffset) this.listOffset = this.selected;
-		else if (this.selected >= this.listOffset + rows) this.listOffset = this.selected - rows + 1;
-		this.listOffset = Math.max(0, Math.min(this.listOffset, Math.max(0, this.tasks.length - rows)));
+		if (this.selected < this.listScroll) this.listScroll = this.selected;
+		else if (this.selected >= this.listScroll + rows) this.listScroll = this.selected - rows + 1;
+		this.listScroll = Math.max(0, Math.min(this.listScroll, Math.max(0, this.tasks.length - rows)));
 	}
 
 	private bodyRows(): number {
@@ -266,24 +324,30 @@ export class AgentsView {
 		this.tasks = this.deps.store.list().filter((task) => this.inScope(task, now));
 		const index = this.tasks.findIndex((task) => task.id === selectedId);
 		this.selected = index === -1 ? Math.max(0, Math.min(this.selected, this.tasks.length - 1)) : index;
+		this.listScroll = Math.max(0, Math.min(this.listScroll, Math.max(0, this.tasks.length - this.bodyRows())));
+		if (this.hovered !== undefined && !this.tasks[this.hovered]) this.hovered = undefined;
 		if (index === -1) this.subscribeSelected();
 	}
 
 	private subscribeSelected(): void {
 		this.unsubscribeTask?.();
 		const task = this.selectedTask();
-		this.unsubscribeTask = task ? this.deps.store.subscribe(task.id, () => this.deps.requestRender()) : undefined;
+		this.unsubscribeTask = task ? this.deps.store.subscribe(task.id, () => {
+			this.pointerScope.invalidate();
+			this.deps.requestRender();
+		}) : undefined;
 	}
 
 	private taskLine(row: number): string {
 		if (this.tasks.length === 0) return row === 0 ? this.deps.theme.fg(ROLE.EMPTY, EMPTY_LIST) : "";
-		const index = this.listOffset + row;
+		const index = this.listScroll + row;
 		const task = this.tasks[index];
 		if (!task) return "";
 		const theme = this.deps.theme;
-		const marker = index === this.selected ? theme.fg(ROLE.SELECTED, "▸") : " ";
+		this.taskRegion(row).render(this.pointerLayout?.listWidth ?? 1);
+		const marker = index === this.selected ? theme.fg(ROLE.SELECTED, "▸") : index === this.hovered ? theme.fg(ROLE.SELECTED, "▹") : " ";
 		const glyph = theme.fg(GLYPH_ROLE[task.status], GLYPH[task.status]);
-		const name = theme.fg(index === this.selected ? ROLE.NAME : ROLE.NAME_IDLE, task.agent);
+		const name = theme.fg(index === this.selected || index === this.hovered ? ROLE.NAME : ROLE.NAME_IDLE, task.agent);
 		const time = task.startedAt === null ? "" : theme.fg(ROLE.META, formatElapsed((task.endedAt ?? this.deps.now()) - task.startedAt));
 		return `${marker} ${glyph} ${name}  ${time}`;
 	}
@@ -338,5 +402,53 @@ export class AgentsView {
 		this.follow = false;
 		this.scroll = Math.max(0, this.scroll + delta);
 		this.deps.requestRender();
+	}
+
+	private taskRegion(row: number): NativePointerRegion {
+		let region = this.taskRegions.get(row);
+		if (!region) {
+			region = this.pointerScope.wrap(EMPTY_COMPONENT, {
+				onHover: () => this.hoverTask(row),
+				onLeave: () => this.clearHoveredTask(row),
+				onClick: (event) => this.clickTask(row, event),
+			});
+			this.taskRegions.set(row, region);
+		}
+		return region;
+	}
+
+	private hoverTask(row: number): TuiMouseEventResult | undefined {
+		const index = this.listScroll + row;
+		if (!this.tasks[index] || this.hovered === index) return { handled: true };
+		this.hovered = index;
+		return { handled: true, render: true };
+	}
+
+	private clearHoveredTask(row: number): void {
+		if (this.hovered !== this.listScroll + row) return;
+		this.hovered = undefined;
+		this.deps.requestRender();
+	}
+
+	private clickTask(row: number, event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (event.button !== "left") return undefined;
+		this.select(this.listScroll + row);
+		return { handled: true, render: true };
+	}
+
+	private wheelList(event: TuiMouseEvent): TuiMouseEventResult {
+		const delta = event.wheelDelta ?? 0;
+		const next = Math.max(0, Math.min(Math.max(0, this.tasks.length - this.bodyRows()), this.listScroll + delta));
+		if (next === this.listScroll) return { handled: true, render: false };
+		this.listScroll = next;
+		this.hovered = undefined;
+		return { handled: true, render: true };
+	}
+
+	private wheelThread(event: TuiMouseEvent): TuiMouseEventResult {
+		const delta = event.wheelDelta ?? 0;
+		if (delta === 0) return { handled: true, render: false };
+		this.scrollBy(delta);
+		return { handled: true, render: true };
 	}
 }

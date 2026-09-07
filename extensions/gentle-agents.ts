@@ -12,6 +12,7 @@ import { hasReviewSessionPermission, resolveCanonicalGitRepositoryIdentitySync, 
 import { historyDir, loadHistory, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
 import { sessionToMarkdown } from "../lib/agents-transcript.ts";
 import { AgentsView } from "../lib/agents-view.ts";
+import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
 import { AGENTS_GLYPH, renderAgentsCard, widgetExpiryMs, widgetRows } from "../lib/agents-widget.ts";
 import { CARD_TONE, renderCard } from "../lib/shell-card.ts";
 import { openInExternalEditor } from "./gentle-shell.ts";
@@ -334,7 +335,13 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 					onClose: () => done(null),
 					requestRender: () => tui.requestRender(),
 				});
-				return view;
+				const interaction = createNativeFullscreenInteraction({
+					keyboardTarget: view,
+					requestRender: () => tui.requestRender(),
+					mouseObserver: view.mouseObserver(),
+				});
+				interaction.addChild(view);
+				return interaction;
 			},
 			{ overlay: true, overlayOptions: { width: "92%", anchor: "center" } },
 		);

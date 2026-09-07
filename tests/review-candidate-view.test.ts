@@ -11,6 +11,7 @@ import { gzipSync } from "node:zlib";
 import {
 	CandidateViewRegistry,
 	CandidateViewError,
+	hasExpectedExecutableBits,
 	type CandidateGitExecutor,
 	createCandidateView,
 	decodeCandidateContextManifest,
@@ -27,13 +28,243 @@ function git(cwd: string, ...arguments_: string[]): string {
 
 function repository(t: test.TestContext): string {
 	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-candidate-view-"));
-	t.after(() => rmSync(cwd, { recursive: true, force: true }));
+	t.after(() => {
+		execFileSync("chmod", ["-R", "u+rwx", cwd]);
+		rmSync(cwd, { recursive: true, force: true });
+	});
 	git(cwd, "init", "-b", "main");
 	writeFileSync(join(cwd, "tracked.txt"), "base\n");
 	git(cwd, "add", "tracked.txt");
 	git(cwd, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "base");
 	return cwd;
 }
+
+function ownerMarker(root: string): string { return `${root}.owner.json`; }
+
+function orphanFixture(t: test.TestContext) {
+	const cwd = repository(t);
+	const registry = new CandidateViewRegistry();
+	const view = registry.create({ contributorRoot: cwd });
+	const marker = ownerMarker(view.root);
+	const owner = JSON.parse(readFileSync(marker, "utf8"));
+	owner.pid = 2147483000;
+	writeFileSync(marker, JSON.stringify(owner));
+	return { cwd, registry, view, marker, owner };
+}
+
+function mockOwnerProbe(t: test.TestContext, code?: string): void {
+	t.mock.method(process, "kill", () => {
+		if (code) throw Object.assign(new Error("fixture probe"), { code });
+		return true;
+	});
+}
+
+test("candidate ownership is private and durable before worktree add; ordinary cleanup removes its marker", (t) => {
+	const cwd = repository(t);
+	let observed = false;
+	let syncs = 0;
+	const fsync = fs.fsyncSync;
+	t.mock.method(fs, "fsyncSync", (fd: number) => { syncs++; fsync(fd); });
+	syncBuiltinESMExports();
+	t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+	const registry = new CandidateViewRegistry((file, args, options) => {
+		if (args[0] === "worktree" && args[1] === "add") {
+			const root = args[args.length - 2]!;
+			const marker = ownerMarker(root);
+			const owner = JSON.parse(readFileSync(marker, "utf8"));
+			assert.equal(owner.root, root);
+			assert.equal(owner.pid, process.pid);
+			assert.match(owner.token, /^[0-9a-f-]{36}$/);
+			assert.equal(lstatSync(marker).mode & 0o777, 0o600);
+			assert.equal(existsSync(root), false);
+			assert.ok(syncs >= 4, "marker and every newly created ancestor must be durable before add");
+			observed = true;
+		}
+		return execFileSync(file, args, options);
+	});
+	const view = registry.create({ contributorRoot: cwd });
+	assert.equal(observed, true);
+	view.cleanup();
+	assert.equal(existsSync(view.root), false);
+	assert.equal(existsSync(ownerMarker(view.root)), false);
+});
+
+test("marked registered definitively dead candidate is reclaimed before another materialization", (t) => {
+	const { cwd, view, marker } = orphanFixture(t);
+	mockOwnerProbe(t, "ESRCH");
+	const next = new CandidateViewRegistry().create({ contributorRoot: cwd });
+	assert.equal(existsSync(view.root), false);
+	assert.equal(existsSync(marker), false);
+	assert.ok(!git(cwd, "worktree", "list", "--porcelain").includes(view.root));
+	next.cleanup();
+});
+
+for (const scenario of ["self", "live", "EPERM", "unknown", "malformed", "foreign-host", "unknown-host", "invalid-pid", "extra-key", "legacy", "unregistered", "root-symlink", "marker-symlink", "parent-symlink", "escape", "unknown-lock", "public-marker", "locked", "backlink", "admin-symlink", "missing-root"] as const) {
+	test(`orphan sweep preserves ${scenario} ownership`, (t) => {
+		const { cwd, view, marker, owner } = orphanFixture(t);
+		mockOwnerProbe(t, scenario === "live" ? undefined : scenario === "EPERM" ? "EPERM" : scenario === "unknown" ? "EIO" : "ESRCH");
+		if (scenario === "self") owner.pid = process.pid;
+		if (scenario === "foreign-host") owner.host = "another-host";
+		if (scenario === "unknown-host") owner.host = null;
+		if (scenario === "invalid-pid") owner.pid = -1;
+		if (scenario === "extra-key") owner.extra = true;
+		if (scenario === "escape") owner.root = cwd;
+		writeFileSync(marker, scenario === "malformed" ? "{" : JSON.stringify(owner));
+		if (scenario === "legacy") rmSync(marker);
+		if (scenario === "public-marker") chmodSync(marker, 0o644);
+		if (scenario === "locked") git(cwd, "worktree", "lock", view.root);
+		if (scenario === "backlink" || scenario === "admin-symlink") {
+			const admin = readFileSync(join(view.root, ".git"), "utf8").slice(8).trim();
+			if (scenario === "backlink") writeFileSync(join(admin, "gitdir"), `${cwd}/.git\n`);
+			else { renameSync(admin, `${admin}.saved`); symlinkSync(`${admin}.saved`, admin); }
+		}
+		if (scenario === "missing-root") renameSync(view.root, `${view.root}.saved`);
+		if (scenario === "unknown-lock") writeFileSync(`${view.root}.reaper-lock`, "unknown");
+		if (scenario === "unregistered") {
+			execFileSync("chmod", ["-R", "u+rwx", view.root]);
+			git(cwd, "worktree", "remove", "--force", view.root);
+			mkdirSync(view.root);
+			writeFileSync(join(view.root, "preserve.txt"), "unregistered");
+		}
+		if (scenario === "root-symlink") { renameSync(view.root, `${view.root}.saved`); symlinkSync(`${view.root}.saved`, view.root); }
+		if (scenario === "marker-symlink") { renameSync(marker, `${marker}.saved`); symlinkSync(`${marker}.saved`, marker); }
+		if (scenario === "parent-symlink") {
+			const parent = join(view.root, "..");
+			renameSync(parent, `${parent}.saved`);
+			symlinkSync(`${parent}.saved`, parent);
+		}
+		new CandidateViewRegistry().sweepOrphans(cwd);
+		assert.equal(existsSync(view.root), scenario !== "missing-root");
+		assert.equal(existsSync(marker), scenario !== "legacy");
+		assert.equal(readFileSync(join(cwd, "tracked.txt"), "utf8"), "base\n");
+	});
+}
+
+test("reaper lock excludes concurrent sweeps and rechecks marker identity before removal", (t) => {
+	const { cwd, view, marker, owner } = orphanFixture(t);
+	mockOwnerProbe(t, "ESRCH");
+	let lists = 0;
+	const racing = new CandidateViewRegistry((file, args, options) => {
+		if (args.includes("list")) {
+			lists++;
+			new CandidateViewRegistry().sweepOrphans(cwd);
+			if (lists === 2) writeFileSync(marker, JSON.stringify({ ...owner, token: "00000000-0000-4000-8000-000000000000" }));
+		}
+		return execFileSync(file, args, options);
+	});
+	racing.sweepOrphans(cwd);
+	assert.ok(lists >= 2);
+	assert.equal(existsSync(view.root), true);
+	assert.equal(existsSync(`${view.root}.reaper-lock`), false);
+});
+
+test("failed Git removal preserves owned candidate and marker without recursive fallback", (t) => {
+	const cwd = repository(t);
+	const registry = new CandidateViewRegistry((file, args, options) => {
+		if (args.includes("remove")) throw new Error("fixture removal failure");
+		return execFileSync(file, args, options);
+	});
+	const view = registry.create({ contributorRoot: cwd });
+	assert.throws(() => view.cleanup());
+	assert.equal(existsSync(view.root), true);
+	assert.equal(existsSync(ownerMarker(view.root)), true);
+});
+
+test("failed creation retains a recoverable marker when Git removal also fails", (t) => {
+	const cwd = repository(t);
+	let root = "";
+	const registry = new CandidateViewRegistry((file, args, options) => {
+		if (args[0] === "worktree" && args[1] === "add") root = args[args.length - 2]!;
+		if (args.includes("remove") || (args[0] === "read-tree" && options.cwd === root)) throw new Error("fixture failure");
+		return execFileSync(file, args, options);
+	});
+	assert.throws(() => registry.create({ contributorRoot: cwd }));
+	assert.equal(existsSync(root), true);
+	const owner = JSON.parse(readFileSync(ownerMarker(root), "utf8"));
+	writeFileSync(ownerMarker(root), JSON.stringify({ ...owner, pid: 2147483000 }));
+	mockOwnerProbe(t, "ESRCH");
+	new CandidateViewRegistry().sweepOrphans(cwd);
+	assert.equal(existsSync(root), false);
+});
+
+test("materialization rejects a symlinked owner ancestor without creating an external store", (t) => {
+	const cwd = repository(t);
+	const outside = join(cwd, "outside");
+	mkdirSync(outside);
+	symlinkSync(outside, join(cwd, ".git", "gentle-ai"));
+	assert.throws(() => new CandidateViewRegistry().create({ contributorRoot: cwd }));
+	assert.equal(existsSync(join(outside, "candidate-views")), false);
+});
+
+test("owner fsync failure prevents worktree registration", (t) => {
+	const cwd = repository(t);
+	let adds = 0;
+	t.mock.method(fs, "fsyncSync", () => { throw new Error("fixture fsync failure"); });
+	syncBuiltinESMExports();
+	t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+	const registry = new CandidateViewRegistry((file, args, options) => {
+		if (args[0] === "worktree" && args[1] === "add") adds++;
+		return execFileSync(file, args, options);
+	});
+	assert.throws(() => registry.create({ contributorRoot: cwd }), /fsync/);
+	assert.equal(adds, 0);
+});
+
+test("ordinary cleanup preserves mismatched owner and cleanupAll continues other records", (t) => {
+	const cwd = repository(t);
+	const registry = new CandidateViewRegistry();
+	const first = registry.create({ contributorRoot: cwd });
+	const second = registry.create({ contributorRoot: cwd });
+	const marker = ownerMarker(first.root);
+	const bytes = readFileSync(marker, "utf8");
+	writeFileSync(marker, JSON.stringify({ ...JSON.parse(bytes), token: "00000000-0000-4000-8000-000000000000" }));
+	registry.cleanupAll();
+	assert.equal(existsSync(first.root), true);
+	assert.equal(existsSync(marker), true);
+	assert.equal(existsSync(second.root), false);
+	writeFileSync(marker, bytes);
+	registry.cleanupAll();
+	assert.equal(existsSync(first.root), false);
+});
+
+for (const race of ["root", "registration", "lock"] as const) {
+	test(`orphan reaper preserves a ${race} replacement at the Git race boundary`, (t) => {
+		const { cwd, view, marker } = orphanFixture(t);
+		mockOwnerProbe(t, "ESRCH");
+		let lists = 0;
+		const registry = new CandidateViewRegistry((file, args, options) => {
+			const result = execFileSync(file, args, options);
+			if (args.includes("list") && ++lists === 2) {
+				if (race === "root") { renameSync(view.root, `${view.root}.saved`); mkdirSync(view.root); }
+				if (race === "registration") return String(result).replace(`worktree ${view.root}`, `worktree ${view.root}.other`);
+				if (race === "lock") writeFileSync(`${view.root}.reaper-lock`, "replacement");
+			}
+			return result;
+		});
+		registry.sweepOrphans(cwd);
+		assert.equal(existsSync(view.root), true);
+		assert.equal(existsSync(marker), true);
+		if (race === "lock") assert.equal(readFileSync(`${view.root}.reaper-lock`, "utf8"), "replacement");
+	});
+}
+
+test("ordinary cleanup never unlinks a replaced sidecar after Git removal", (t) => {
+	const cwd = repository(t);
+	let marker = "";
+	const registry = new CandidateViewRegistry((file, args, options) => {
+		const result = execFileSync(file, args, options);
+		if (args[0] === "worktree" && args[1] === "remove") {
+			const bytes = readFileSync(marker);
+			renameSync(marker, `${marker}.saved`);
+			writeFileSync(marker, bytes, { mode: 0o600 });
+		}
+		return result;
+	});
+	const view = registry.create({ contributorRoot: cwd });
+	marker = ownerMarker(view.root);
+	assert.throws(() => view.cleanup(), /ownership changed/i);
+	assert.equal(existsSync(marker), true);
+});
 
 function compactCandidateContextManifest(task: string): { encoded: string; sha256: string } {
 	const match = /Frozen changed scope manifest \(gzip\+base64url\): `([A-Za-z0-9_-]+)`\.\nFrozen changed scope manifest SHA-256: `([0-9a-f]{64})`\./.exec(task);
@@ -661,14 +892,15 @@ test("candidate view cleanup is confined and idempotent", (t) => {
 	assert.equal(lstatSync(view.root, { throwIfNoEntry: false }), undefined);
 });
 
-test("candidate cleanup removes a readonly root when Git reports success without deleting it", (t) => {
+test("candidate cleanup preserves a root when Git reports success without deleting it", (t) => {
 	const registry = new CandidateViewRegistry((file, arguments_, options) =>
 		arguments_[0] === "worktree" && arguments_[1] === "remove" ? "" : execFileSync(file, arguments_, options));
 	const view = registry.create({ contributorRoot: repository(t) });
 	assert.equal(lstatSync(view.root).mode & 0o222, 0);
-	view.cleanup();
-	view.cleanup();
-	assert.equal(lstatSync(view.root, { throwIfNoEntry: false }), undefined);
+	assert.throws(() => view.cleanup(), /incomplete/);
+	assert.throws(() => view.cleanup(), /incomplete/);
+	assert.equal(existsSync(view.root), true);
+	assert.equal(existsSync(ownerMarker(view.root)), true);
 });
 
 test("corrected views stay within frozen scope and replace projections only when promoted", (t) => {
@@ -821,6 +1053,32 @@ test("candidate view verifies unchanged tree entries even when they are absent f
 		chmodSync(join(view.root, "unchanged.txt"), 0o444);
 		chmodSync(view.root, 0o555);
 		assert.throws(() => view.verify(), CandidateViewError);
+	} finally {
+		view.cleanup();
+	}
+});
+
+test("candidate executable-mode validation accepts a readonly Git executable on Windows and rejects it on POSIX", () => {
+	assert.equal(hasExpectedExecutableBits(0o444, "100755", "win32"), true);
+	assert.equal(hasExpectedExecutableBits(0o444, "100755", "linux"), false);
+	assert.equal(hasExpectedExecutableBits(0o555, "100755", "linux"), true);
+	assert.equal(hasExpectedExecutableBits(0o555, "100644", "win32"), false);
+});
+
+test("candidate registry forwards explicit Windows mode validation to view verification", (t) => {
+	if (process.platform === "win32") return t.skip("requires POSIX candidate-owner directory permissions unavailable on Windows");
+	const contributorRoot = repository(t);
+	writeFileSync(join(contributorRoot, "unchanged-executable.sh"), "#!/bin/sh\necho base\n");
+	git(contributorRoot, "add", "unchanged-executable.sh");
+	git(contributorRoot, "update-index", "--chmod=+x", "unchanged-executable.sh");
+	chmodSync(join(contributorRoot, "unchanged-executable.sh"), 0o755);
+	git(contributorRoot, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "executable base");
+	writeFileSync(join(contributorRoot, "tracked.txt"), "changed\n");
+	const view = new CandidateViewRegistry(undefined, "win32").createOrReuse({ contributorRoot, baseRef: "HEAD" });
+	try {
+		assert.deepEqual(view.paths, ["tracked.txt"]);
+		chmodSync(view.root, 0o755); chmodSync(join(view.root, "unchanged-executable.sh"), 0o444); chmodSync(view.root, 0o555);
+		assert.doesNotThrow(() => view.verify());
 	} finally {
 		view.cleanup();
 	}

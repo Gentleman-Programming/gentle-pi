@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test, { after } from "node:test";
+import test, { after, mock } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { TuiMouseEvent } from "@earendil-works/pi-tui";
 import gentleAgents, { agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, answerThroughUi, completionText, legacySubagentsInstalled, type AgentsDeps } from "../extensions/gentle-agents.ts";
 import { historyDir, loadHistory, saveTask } from "../lib/agents-history.ts";
 import { emptyThread, TASK_STATUS, type TaskRecord } from "../lib/agents-protocol.ts";
+import { NativePointerScope } from "../lib/native-pointer-region.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
 
@@ -22,6 +24,23 @@ interface Registered {
 
 const plainTheme = { fg: (_color: string, text: string) => text };
 const fakeTui = { requestRender() {} };
+
+type Overlay = {
+	render(width: number): string[];
+	handleInput(data: string): void;
+	handleMouse?(event: TuiMouseEvent): unknown;
+};
+
+function mouse(
+	type: TuiMouseEvent["type"],
+	button: TuiMouseEvent["button"],
+	x: number,
+	y: number,
+	width: number,
+	height: number,
+): TuiMouseEvent {
+	return { type, button, x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false };
+}
 const root = mkdtempSync(join(tmpdir(), "gentle-agents-ext-"));
 after(() => rmSync(root, { recursive: true, force: true }));
 const home = join(root, "home");
@@ -55,13 +74,13 @@ function fakePi() {
 function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (title: string, message: string) => Promise<boolean> = async () => true, inputResult: (title: string, placeholder: string | undefined) => Promise<string | undefined> = async () => undefined) {
 	const widgets = new Map<string, (tui: unknown, theme: unknown) => { render(width: number): string[] }>();
 	const dialogs: string[] = [];
-	const overlays: Array<{ render(width: number): string[]; handleInput(data: string): void }> = [];
+	const overlays: Overlay[] = [];
 	const ctx = {
 		hasUI: true,
 		sessionManager: { getSessionId: () => "s1", getCwd: () => cwd },
 		ui: {
 			notify: (message: string) => dialogs.push(`notify:${message}`),
-			custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => { render(width: number): string[]; handleInput(data: string): void }) =>
+			custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => Overlay) =>
 				new Promise((resolve) => {
 					const component = factory({ terminal: { rows: 30 }, requestRender() {} }, plainTheme, {}, resolve);
 					overlays.push(component);
@@ -290,6 +309,66 @@ test("a task-mode child's dialog reaches the host UI and the answer goes back to
 	assert.deepEqual(await answerThroughUi(ctx.ui, { id: "u3", method: "input", title: "Name" }, {}), { cancelled: true });
 	assert.deepEqual(await answerThroughUi(ctx.ui, { id: "u4", method: "editor", title: "Edit" }, {}), { value: "edited" });
 	assert.deepEqual(await answerThroughUi(undefined, { id: "u5", method: "select", title: "x" }, {}), { cancelled: true });
+});
+
+test("AgentsView production composition observes each pointer event once and accepts only left clicks", async () => {
+	const { pi, tools, fire, commands } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, overlays } = fakeContext();
+	await fire("session_start", ctx);
+
+	await tools.get("subagent_run")!.execute("b", { agent: "explore", task: "b", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	await tools.get("subagent_run")!.execute("a", { agent: "explore", task: "a", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+
+	const originalCreateMouseObserver = NativePointerScope.prototype.createMouseObserver;
+	let beforeCalls = 0;
+	let afterCalls = 0;
+	const spy = mock.method(NativePointerScope.prototype, "createMouseObserver", function (
+		this: NativePointerScope,
+		requestRender?: () => void,
+	) {
+		const observer = originalCreateMouseObserver.call(this, requestRender);
+		return {
+			beforeMouse(event: TuiMouseEvent) {
+				beforeCalls += 1;
+				observer.beforeMouse(event);
+			},
+			afterMouse(event: TuiMouseEvent) {
+				afterCalls += 1;
+				observer.afterMouse(event);
+			},
+		};
+	});
+	try {
+		const opened = commands.get("gentle:agents")!.handler("", ctx);
+		for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+		const overlay = overlays[0];
+		assert.ok(overlay, "the production extension mounted its fullscreen interaction");
+		const lines = overlay.render(80);
+		const dispatch = (event: TuiMouseEvent) => {
+			const before = beforeCalls;
+			const after = afterCalls;
+			const result = overlay.handleMouse?.(event);
+			assert.deepEqual([beforeCalls - before, afterCalls - after], [1, 1], "the root owns one observer lifecycle per event");
+			return result;
+		};
+
+		assert.match(stripAnsi(overlay.render(80)[1] ?? ""), /▸/, "the first task starts selected");
+		assert.equal(dispatch(mouse("click", "right", 4, 2, 80, lines.length)), undefined, "right click is inert");
+		assert.match(stripAnsi(overlay.render(80)[1] ?? ""), /▸/, "right click cannot select another task");
+		assert.equal(dispatch(mouse("press", "left", 4, 2, 80, lines.length)), undefined, "press is inert");
+		assert.equal(dispatch(mouse("click", "middle", 4, 2, 80, lines.length)), undefined, "middle click is inert");
+		const leftClick = dispatch(mouse("click", "left", 4, 2, 80, lines.length));
+		assert.equal((leftClick as { handled?: boolean } | undefined)?.handled, true, "left click selects the task");
+		assert.match(stripAnsi(overlay.render(80)[2] ?? ""), /▸/, "left click selects the second task");
+		overlay.handleInput("\x1b");
+		await opened;
+	} finally {
+		spy.mock.restore();
+	}
 });
 
 test("finished tasks are written to history, come back through resolveTask, and the overlay lists them", async () => {
