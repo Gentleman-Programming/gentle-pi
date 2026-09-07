@@ -1,0 +1,272 @@
+// gentle-pi#662: pure decoding, tier mapping, and verification-plan logic for
+// the native read-only `gentle-ai review assess` command (gentle-ai#4295).
+// Kept independent of the native review CLI wrapper (`lib/native-review-cli.ts`)
+// so the decoder and the verificationPlan table can be unit-tested without a
+// child process, and so the parent tool and the delegation asset agree on one
+// deterministic mapping.
+//
+// Native reference (gentle-ai#4295, landing in parallel with this change):
+// `gentle-ai review assess --cwd <repo> [--base-ref <ref> --committed-only] --json`
+// prints `{"schema":"gentle-ai.review-assessment/v1","risk":"passive|medium|high",
+// "reasons":[{"code":"…","path":"…","detail":"…"}],"changed_paths":1,
+// "changed_lines":1,"candidate":{"kind":"current-changes|base-diff","base_ref":"…"}}`.
+// A non-zero exit or a failure envelope means the candidate could not be
+// assessed; hosts treat that as `high`. Older binaries without the verb (or
+// any other decode/process failure) fail closed the same way -- see
+// `verificationTierForUnassessable` below.
+
+export const REVIEW_ASSESSMENT_SCHEMA = "gentle-ai.review-assessment/v1" as const;
+
+export const REVIEW_ASSESSMENT_RISK = {
+	PASSIVE: "passive",
+	MEDIUM: "medium",
+	HIGH: "high",
+} as const;
+export type ReviewAssessmentRisk = (typeof REVIEW_ASSESSMENT_RISK)[keyof typeof REVIEW_ASSESSMENT_RISK];
+
+export const REVIEW_ASSESSMENT_CANDIDATE_KIND = {
+	CURRENT_CHANGES: "current-changes",
+	BASE_DIFF: "base-diff",
+} as const;
+export type ReviewAssessmentCandidateKind = (typeof REVIEW_ASSESSMENT_CANDIDATE_KIND)[keyof typeof REVIEW_ASSESSMENT_CANDIDATE_KIND];
+
+export interface ReviewAssessmentReason {
+	readonly code: string;
+	readonly path: string;
+	readonly detail: string;
+}
+
+export interface ReviewAssessmentCandidate {
+	readonly kind: ReviewAssessmentCandidateKind;
+	readonly baseRef: string | undefined;
+}
+
+export interface ReviewAssessmentV1 {
+	readonly schema: typeof REVIEW_ASSESSMENT_SCHEMA;
+	readonly risk: ReviewAssessmentRisk;
+	readonly reasons: readonly ReviewAssessmentReason[];
+	readonly changedPaths: number;
+	readonly changedLines: number;
+	readonly candidate: ReviewAssessmentCandidate;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function decodeReason(value: unknown): ReviewAssessmentReason {
+	if (!isRecord(value)) throw new TypeError("review assessment reason must be an object");
+	const { code, path, detail } = value;
+	if (typeof code !== "string" || code.length === 0) throw new TypeError("review assessment reason.code must be a non-empty string");
+	if (typeof path !== "string") throw new TypeError("review assessment reason.path must be a string");
+	if (typeof detail !== "string") throw new TypeError("review assessment reason.detail must be a string");
+	return Object.freeze({ code, path, detail });
+}
+
+function decodeCandidate(value: unknown): ReviewAssessmentCandidate {
+	if (!isRecord(value)) throw new TypeError("review assessment candidate must be an object");
+	const { kind, base_ref: baseRef } = value;
+	if (kind !== REVIEW_ASSESSMENT_CANDIDATE_KIND.CURRENT_CHANGES && kind !== REVIEW_ASSESSMENT_CANDIDATE_KIND.BASE_DIFF) {
+		throw new TypeError("review assessment candidate.kind must be current-changes or base-diff");
+	}
+	if (baseRef !== undefined && (typeof baseRef !== "string" || baseRef.length === 0)) {
+		throw new TypeError("review assessment candidate.base_ref must be a non-empty string when present");
+	}
+	return Object.freeze({ kind, baseRef: baseRef as string | undefined });
+}
+
+/**
+ * Decodes and validates one `gentle-ai.review-assessment/v1` envelope. Rejects
+ * any other schema, an unrecognized risk value, or a malformed shape -- the
+ * native review CLI wrapper turns a thrown error here into the same
+ * schema-incompatible failure it already produces for every other decoded
+ * native response.
+ */
+export function decodeReviewAssessmentV1(value: unknown): ReviewAssessmentV1 {
+	if (!isRecord(value)) throw new TypeError("review assessment must be an object");
+	if (value.schema !== REVIEW_ASSESSMENT_SCHEMA) throw new TypeError(`review assessment schema must be ${REVIEW_ASSESSMENT_SCHEMA}`);
+	const { risk, reasons, changed_paths: changedPaths, changed_lines: changedLines, candidate } = value;
+	if (risk !== REVIEW_ASSESSMENT_RISK.PASSIVE && risk !== REVIEW_ASSESSMENT_RISK.MEDIUM && risk !== REVIEW_ASSESSMENT_RISK.HIGH) {
+		throw new TypeError("review assessment risk must be passive, medium, or high");
+	}
+	if (!Array.isArray(reasons)) throw new TypeError("review assessment reasons must be an array");
+	if (!Number.isSafeInteger(changedPaths) || (changedPaths as number) < 0) throw new TypeError("review assessment changed_paths must be a non-negative integer");
+	if (!Number.isSafeInteger(changedLines) || (changedLines as number) < 0) throw new TypeError("review assessment changed_lines must be a non-negative integer");
+	return Object.freeze({
+		schema: REVIEW_ASSESSMENT_SCHEMA,
+		risk,
+		reasons: Object.freeze(reasons.map(decodeReason)),
+		changedPaths: changedPaths as number,
+		changedLines: changedLines as number,
+		candidate: decodeCandidate(candidate),
+	});
+}
+
+// ---------------------------------------------------------------------------
+// Verification-plan tiering (gentle-pi#662).
+// ---------------------------------------------------------------------------
+
+export const VERIFICATION_TIER = {
+	PASSIVE: "passive",
+	MEDIUM: "medium",
+	HIGH: "high",
+	UNASSESSABLE: "unassessable",
+} as const;
+export type VerificationTier = (typeof VERIFICATION_TIER)[keyof typeof VERIFICATION_TIER];
+
+export const RDD_LINE = {
+	ON: "on",
+	OFF: "off",
+	UNKNOWN: "unknown",
+} as const;
+export type RddLine = (typeof RDD_LINE)[keyof typeof RDD_LINE];
+
+export const WRITER_PROFILE = {
+	SMALL: "small",
+	LARGE: "large",
+} as const;
+export type WriterProfile = (typeof WRITER_PROFILE)[keyof typeof WRITER_PROFILE];
+
+export interface VerificationPlanInput {
+	readonly rddLine: RddLine;
+	readonly risk: VerificationTier;
+	readonly writerProfile: WriterProfile;
+}
+
+export interface VerificationPlan {
+	readonly writerSelfVerification: boolean;
+	readonly structuralReadbackOnly: boolean;
+	readonly independentVerifier: boolean;
+	readonly reason: string;
+}
+
+/**
+ * Computes who verifies a delegated writer's change, exactly as gentle-pi#662
+ * specifies:
+ *
+ * - `rdd: "on"`: the writer self-verifies and no independent verifier runs,
+ *   because the native review is the check -- except `passive`, which gets a
+ *   structural readback by the parent instead.
+ * - `rdd: "off"` or `"unknown"` (both gate identically, so an unknown RDD line
+ *   never lowers a tier relative to `off`):
+ *   - `passive`: structural readback by the parent only; no verifier, no
+ *     tests.
+ *   - `medium`: the writer self-verifies; a separate independent verifier
+ *     runs only when `writerProfile` is `"small"` -- the small-model bias
+ *     raises the tier by one for verification purposes (medium -> high). An
+ *     unknown or omitted writer profile resolves to `"small"` before it
+ *     reaches this function (see `resolveWriterProfile`), so an unrecognized
+ *     profile never lowers a tier below what a known small model would get.
+ *   - `high` or `unassessable` (a failed or unrecognized native assessment is
+ *     always treated as high): the writer self-verifies and an independent
+ *     verifier always runs.
+ */
+export function verificationPlan(input: VerificationPlanInput): VerificationPlan {
+	const { rddLine, risk, writerProfile } = input;
+
+	if (rddLine === RDD_LINE.ON) {
+		if (risk === VERIFICATION_TIER.PASSIVE) {
+			return Object.freeze({
+				writerSelfVerification: false,
+				structuralReadbackOnly: true,
+				independentVerifier: false,
+				reason: "receipt-driven development is on and the native assessment reports passive risk: a structural readback by the parent replaces both the writer's self-verification and any separate verifier.",
+			});
+		}
+		return Object.freeze({
+			writerSelfVerification: true,
+			structuralReadbackOnly: false,
+			independentVerifier: false,
+			reason: "receipt-driven development is on: the writer's self-verification is the record and the native review is the independent check the writer cannot influence, so no separate verifier is required.",
+		});
+	}
+
+	// rddLine is "off" or "unknown" here -- both gate on the native risk
+	// assessment identically, so an unknown RDD line never lowers a tier.
+	if (risk === VERIFICATION_TIER.PASSIVE) {
+		return Object.freeze({
+			writerSelfVerification: false,
+			structuralReadbackOnly: true,
+			independentVerifier: false,
+			reason: `receipt-driven development is ${rddLine} and the native assessment reports passive risk: a structural readback by the parent is the complete check, with no separate verifier and no tests.`,
+		});
+	}
+
+	if (risk === VERIFICATION_TIER.MEDIUM) {
+		const smallModelBias = writerProfile === WRITER_PROFILE.SMALL;
+		return Object.freeze({
+			writerSelfVerification: true,
+			structuralReadbackOnly: false,
+			independentVerifier: smallModelBias,
+			reason: smallModelBias
+				? `receipt-driven development is ${rddLine} and the native assessment reports medium risk, but the small-model bias raises it one tier to high for verification purposes: the writer self-verifies and a separate independent verifier also runs.`
+				: `receipt-driven development is ${rddLine} and the native assessment reports medium risk with a large writer profile: the writer's self-verification stands and no separate verifier is required.`,
+		});
+	}
+
+	// high or unassessable.
+	return Object.freeze({
+		writerSelfVerification: true,
+		structuralReadbackOnly: false,
+		independentVerifier: true,
+		reason: risk === VERIFICATION_TIER.UNASSESSABLE
+			? `receipt-driven development is ${rddLine} and the native risk assessment could not be produced, so the candidate is treated as high risk: the writer self-verifies and a separate independent verifier always runs.`
+			: `receipt-driven development is ${rddLine} and the native assessment reports high risk: the writer self-verifies and a separate independent verifier always runs.`,
+	});
+}
+
+// ---------------------------------------------------------------------------
+// Small-writer-profile predicate (gentle-pi#662).
+// ---------------------------------------------------------------------------
+
+/**
+ * The minimal shape of `lib/agents-config.ts`'s `ResolvedProfile` this
+ * predicate needs: the resolved model reference and its resolved effort
+ * (`ResolvedProfile.thinking`, one of `ThinkingLevel`).
+ */
+export interface WriterModelProfileLike {
+	readonly model?: { readonly id: string } | undefined;
+	readonly thinking?: string | undefined;
+}
+
+// Matches `mini` only as a whole token of the model id -- delimited by the
+// string start/end or one of `-_./:` or whitespace -- never a bare substring.
+// `gpt-5.4-mini`, `o4-mini`, `openai/gpt-5.4-mini`, `claude-mini`, and
+// `mini-high` all match; `gemini`, `gemini-2.5-pro`, and `gemini-2.5-flash`
+// do not, because their `mini` is preceded by `ge`, not a delimiter.
+const SMALL_MODEL_ID_TOKEN = /(?:^|[-_./:\s])mini(?:$|[-_./:\s])/i;
+
+/**
+ * A writer profile counts as a "small model" for the medium-risk bias when:
+ * - its resolved effort is `low`, or
+ * - its resolved model id carries `mini` as a whole token (see
+ *   `SMALL_MODEL_ID_TOKEN`), or
+ * - it carries NO signal at all -- no profile object, or a profile with
+ *   neither a model id nor a resolved effort. An unknown or omitted writer
+ *   profile fails closed to small rather than defaulting to large, so a
+ *   caller that cannot resolve the writer's profile never gets a weaker
+ *   verification plan than a known small model would (gentle-pi#662).
+ *
+ * A profile that carries a model id or an effort, just not a matching one
+ * (for example `{model: {id: "claude-sonnet-5"}, thinking: "high"}`), is
+ * "known large" and returns `false` -- fail-closed applies only to a truly
+ * unknown/omitted profile, not to an explicitly resolved large one.
+ */
+export function isSmallWriterProfile(profile: WriterModelProfileLike | undefined): boolean {
+	if (profile === undefined) return true;
+	if (profile.thinking === "low") return true;
+	const modelId = profile.model?.id;
+	if (typeof modelId === "string") return SMALL_MODEL_ID_TOKEN.test(modelId);
+	// No model id was resolved. Fail closed to small only when effort is also
+	// unknown -- there is no signal at all to call this a known large model.
+	return profile.thinking === undefined;
+}
+
+/**
+ * Maps a resolved writer profile to the `writerProfile` input `verificationPlan`
+ * expects. An unknown or omitted profile never lowers a tier: it resolves to
+ * `"small"`, exactly like `isSmallWriterProfile` (gentle-pi#662).
+ */
+export function resolveWriterProfile(profile: WriterModelProfileLike | undefined): WriterProfile {
+	return isSmallWriterProfile(profile) ? WRITER_PROFILE.SMALL : WRITER_PROFILE.LARGE;
+}
