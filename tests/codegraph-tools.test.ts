@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import codeGraphTools, {
 	createCodeGraphTool,
 	codeGraphNodeScript,
-	findCodeGraphCmdOnPath,
+	findCodeGraphNodeScriptOnPath,
 	type CodeGraphRunner,
 } from "../extensions/codegraph-tools.ts";
 
@@ -214,14 +214,11 @@ test("CodeGraph tool registration exposes a single constrained custom tool", () 
 	});
 });
 
-test("Windows shim helpers resolve the npm codegraph script without a shell", async (t) => {
-	const binDir = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-bin-")));
-	t.after(() => rmSync(binDir, { recursive: true, force: true }));
-
+function writeCodeGraphPackage(binDir: string, scriptSource = "#!/usr/bin/env node\n"): string {
 	const pkgRoot = join(binDir, "node_modules", "@colbymchenry", "codegraph");
 	mkdirSync(pkgRoot, { recursive: true });
 	const scriptTarget = join(pkgRoot, "npm-shim.js");
-	writeFileSync(scriptTarget, "#!/usr/bin/env node\n");
+	writeFileSync(scriptTarget, scriptSource);
 	writeFileSync(
 		join(pkgRoot, "package.json"),
 		JSON.stringify({
@@ -234,13 +231,62 @@ test("Windows shim helpers resolve the npm codegraph script without a shell", as
 		join(binDir, "codegraph.cmd"),
 		"@ECHO off\nnode \"%~dp0\\node_modules\\@colbymchenry\\codegraph\\npm-shim.js\" %*\n",
 	);
+	return scriptTarget;
+}
 
-	const originalPath = process.env.PATH;
-	try {
-		process.env.PATH = `${binDir};${originalPath ?? ""}`;
-		assert.equal(findCodeGraphCmdOnPath(), join(binDir, "codegraph.cmd"));
-		assert.equal(codeGraphNodeScript(join(binDir, "codegraph.cmd")), scriptTarget);
-	} finally {
-		process.env.PATH = originalPath ?? "";
-	}
+function withWindowsPath(t: test.TestContext, path: string): void {
+	const previousPath = process.env.PATH;
+	const previousWindowsPath = process.env.Path;
+	const windowsPath = process.platform === "win32"
+		? `${path};${previousWindowsPath ?? previousPath ?? ""}`
+		: path;
+	process.env.Path = windowsPath;
+	if (process.platform === "win32") process.env.PATH = windowsPath;
+	t.after(() => {
+		if (previousPath === undefined) delete process.env.PATH;
+		else process.env.PATH = previousPath;
+		if (previousWindowsPath === undefined) delete process.env.Path;
+		else process.env.Path = previousWindowsPath;
+	});
+}
+
+test("Windows shim helpers skip stale PATH shims before resolving the npm script", (t) => {
+	const staleBinDir = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-stale-bin-")));
+	const validBinDir = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-valid-bin-")));
+	t.after(() => rmSync(staleBinDir, { recursive: true, force: true }));
+	t.after(() => rmSync(validBinDir, { recursive: true, force: true }));
+	writeFileSync(join(staleBinDir, "codegraph.cmd"), "@ECHO off\n");
+	const scriptTarget = writeCodeGraphPackage(validBinDir);
+
+	withWindowsPath(t, `${staleBinDir};${validBinDir}`);
+
+	assert.equal(codeGraphNodeScript(join(staleBinDir, "codegraph.cmd")), undefined);
+	assert.equal(findCodeGraphNodeScriptOnPath(), scriptTarget);
+});
+
+test("Windows launcher passes command metacharacters as one literal argv value", async (t) => {
+	const binDir = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-bin-")));
+	t.after(() => rmSync(binDir, { recursive: true, force: true }));
+	writeCodeGraphPackage(binDir, "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n");
+	const cwd = workspace(t);
+	withWindowsPath(t, binDir);
+
+	const previousPlatform = process.platform;
+	Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+	t.after(() => Object.defineProperty(process, "platform", { configurable: true, value: previousPlatform }));
+
+	const query = "literal & echo injected > shell-injection.txt";
+	const result = await createCodeGraphTool().execute(
+		"test",
+		{ operation: "query", query },
+		undefined,
+		undefined,
+		{ cwd } as ExtensionContext,
+	);
+
+	assert.deepEqual(result.content, [{
+		type: "text",
+		text: JSON.stringify(["query", "--path", cwd, "--limit", "10", "--", query]),
+	}]);
+	assert.equal(existsSync(join(cwd, "shell-injection.txt")), false);
 });

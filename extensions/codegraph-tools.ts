@@ -186,15 +186,14 @@ function isEnoent(error: unknown): boolean {
 	);
 }
 
-/** Find `codegraph.cmd` in the npm global bin directory (the dirs in PATH). */
-export function findCodeGraphCmdOnPath(): string | undefined {
-	const pathEnv = process.env.PATH ?? "";
+/** Find `codegraph.cmd` shims in Windows PATH order. */
+function* codeGraphCmdPathsOnPath(): Iterable<string> {
+	const pathEnv = process.env.Path ?? process.env.PATH ?? "";
 	for (const dir of pathEnv.split(";")) {
 		if (!dir) continue;
 		const candidate = join(dir, "codegraph.cmd");
-		if (existsSync(candidate)) return candidate;
+		if (existsSync(candidate)) yield candidate;
 	}
-	return undefined;
 }
 
 /**
@@ -227,12 +226,25 @@ export function codeGraphNodeScript(cmdPath: string): string | undefined {
 	}
 }
 
+function* codeGraphNodeScriptsOnPath(): Iterable<string> {
+	for (const cmdPath of codeGraphCmdPathsOnPath()) {
+		const script = codeGraphNodeScript(cmdPath);
+		if (script) yield script;
+	}
+}
+
+/** Resolve the first valid CodeGraph npm entry point in Windows PATH order. */
+export function findCodeGraphNodeScriptOnPath(): string | undefined {
+	return codeGraphNodeScriptsOnPath().next().value;
+}
+
 const runCodeGraphCommand: CodeGraphRunner = async (args, options) => {
 	const runOptions = {
 		cwd: options.cwd,
 		signal: options.signal,
 		maxBuffer: options.maxBuffer,
 	};
+	let unavailableError: unknown;
 
 	try {
 		const result = await execFileAsync("codegraph", [...args], runOptions);
@@ -242,26 +254,22 @@ const runCodeGraphCommand: CodeGraphRunner = async (args, options) => {
 		// with no codegraph.exe, so plain execFile (CreateProcess, no shell)
 		// always fails with ENOENT even when the shim is on PATH.
 		if (process.platform !== "win32" || !isEnoent(error)) throw error;
+		unavailableError = error;
 	}
 
-	// Resolve the real package script from the npm global bin directory and run
-	// it through the current Node executable: no shell, no command injection.
-	const cmdPath = findCodeGraphCmdOnPath();
-	if (cmdPath) {
-		const script = codeGraphNodeScript(cmdPath);
-		if (script) {
-			try {
-				const result = await execFileAsync(process.execPath, [script, ...args], runOptions);
-				return { stdout: result.stdout, stderr: result.stderr };
-			} catch (innerError) {
-				if (!isEnoent(innerError)) throw innerError;
-			}
+	// Resolve the real package script from each npm global bin directory in PATH
+	// order and run it through the current Node executable. This remains
+	// shell-free, so argument boundaries are never interpreted by a shell.
+	for (const script of codeGraphNodeScriptsOnPath()) {
+		try {
+			const result = await execFileAsync(process.execPath, [script, ...args], runOptions);
+			return { stdout: result.stdout, stderr: result.stderr };
+		} catch (innerError) {
+			if (!isEnoent(innerError)) throw innerError;
 		}
 	}
 
-	// Last resort on win32: let cmd.exe resolve the shim.
-	const result = await execFileAsync("codegraph", [...args], { ...runOptions, shell: true });
-	return { stdout: result.stdout, stderr: result.stderr };
+	throw unavailableError;
 };
 
 export function createCodeGraphTool(runner: CodeGraphRunner = runCodeGraphCommand) {
