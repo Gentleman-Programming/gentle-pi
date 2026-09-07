@@ -6098,7 +6098,7 @@ async function executeReviewControllerOperation(
 							cleanupCandidate: () => {
 								if (candidateCleaned) return;
 								candidateCleaned = true;
-								consentCandidateView.cleanup();
+								try { consentCandidateView.cleanup(); } catch { /* Failed ownership proof preserves the view; consent expiry/teardown still completes. */ }
 							},
 							...(retainedUntrackedSelection === undefined ? {} : { untrackedSelection: retainedUntrackedSelection }),
 							consent: error.consent,
@@ -6419,6 +6419,8 @@ function createGentleAiExtensionForTesting(
 	};
 
 	pi.on("session_shutdown", (event, context) => {
+		// Pi tears down this registry on reload as well as session replacement/quit.
+		try { candidateViews?.cleanupAll(); } catch { /* Preserve failed owned views for later recovery. */ }
 		const reason = (event as { reason?: unknown }).reason;
 		if (reason !== "reload") {
 			if (childStandingReviewPermissionLease !== undefined) childStandingReviewPermissionLease.closeIfCurrent();
@@ -6679,6 +6681,7 @@ function createGentleAiExtensionForTesting(
 	}
 
 	pi.on("session_start", async (event, ctx) => {
+		try { candidateViews?.sweepOrphans(ctx.cwd); } catch { /* Ownership sweeping must not block startup. */ }
 		const reason = (event as { reason?: unknown }).reason;
 		if (reason !== "reload") revokeCurrentReviewSessionPermission(ctx);
 		await refreshReviewSessionPermissionStatus(ctx);
