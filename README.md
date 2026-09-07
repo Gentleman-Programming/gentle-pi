@@ -76,6 +76,8 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | **Lazy SDD preflight**         | Resolves SDD mode, artifact store, delivery strategy, and review budget once per session; prompts only when a choice is genuinely unresolved.              |
 | **Subagent orchestration**     | Keeps one parent session responsible while child agents explore, implement, test, or review with focused context.                             |
 | **Strict TDD support**         | When project config declares a test command, apply/verify phases must record RED → GREEN → TRIANGULATE → REFACTOR evidence.                   |
+| **Closed choice prompts** | Per-option hover/click/wheel in fullscreen; keyboard selection in either TUI mode. |
+| **Native pointer regions** | Compose hover, press, click, and wheel behavior around public TUI components. |
 | **Reviewer protection**        | Surfaces review workload risk before a task turns into an oversized PR.                                                                       |
 | **Per-agent model assignment** | Pi-native modal for assigning stronger or cheaper models to specific SDD/custom agents.                                                       |
 | **Skill discovery registry**   | Maintains `.atl/skill-registry.md` from project and user skills so review/comment/PR workflows do not silently miss the right skill.          |
@@ -84,6 +86,28 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | **Bounded native review**      | Freezes one candidate, dispatches only controller-selected lenses, and records native authority. Review outcomes are informational; delivery follows ordinary repository policy. |
 | **Verified native runtime**    | Provisions the exact package-local Gentle AI v2.6.0 runtime: signed, SHA-256-pinned release archives on Darwin/Linux and a Go SumDB-verified source build on Windows x64/arm64. It validates package-local integrity and rejects PATH, global, sibling, symlink, and mode fallbacks. |
 | **Runtime safety**             | Blocks destructive shell commands, asks for confirmation for sensitive operations, and blocks direct read/write/edit access to sensitive paths. |
+
+## Native pointer regions
+
+Compose pointer behavior around public `Text`, `Box`, or custom content without making it a keyboard target:
+
+```ts
+const scope = createNativePointerScope();
+const openInput = scope.wrap(new Text("Open input", 0, 0), {
+  onClick: () => {
+    openInputEditor();
+    return { handled: true };
+  },
+});
+const panel = new Container();
+panel.addChild(openInput);
+const observer = scope.createMouseObserver(() => tui.requestRender());
+```
+
+Pass `observer` around the root's native mouse dispatch; reuse `panel` as custom or overlay content.
+Pointer input is fullscreen-only. Regions preserve a consuming child's native result and do not focus
+`Text`, activate on press or wheel, synthesize outside leave events, or alter terminal tracking.
+Callers own keyboard policy, theme state, and business actions.
 
 **Migration note:** Do not enable `pi-tool-cards` and `quiet-tools` together: Pi rejects duplicate `bash`, `read`, `edit`, and `write` registrations. Disable or remove the standalone package during migration; gentle-pi does not alter user configuration or delete that repository.
 

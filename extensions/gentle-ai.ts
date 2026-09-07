@@ -6251,6 +6251,7 @@ function createGentleAiExtensionForTesting(
 					{
 						operation: REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT,
 						input: JSON.stringify({ consentBinding: eligiblePending!.id, answer }),
+						workspaceRoot: eligiblePending!.authorityCwd,
 					},
 					ctx.cwd,
 					nativeReviewCli,

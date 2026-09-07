@@ -123,7 +123,7 @@ export default function (pi) {
 	});
 	const statuses: Array<{ key: string; text?: string }> = [];
 	const uiContext = testUi(statuses);
-	const bindings = { uiContext };
+	const bindings = { uiContext, mode: "tui" as const };
 	const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd: runtimeCwd, sessionManager, sessionStartEvent }) => {
 		const services = await createAgentSessionServices({
 			cwd: runtimeCwd,

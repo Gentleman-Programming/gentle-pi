@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import askUserChoice from "../extensions/ask-user-choice.ts";
 
 interface ChoiceResult {
@@ -34,6 +35,35 @@ interface ChoiceLifecycleEvent {
 	channel: string;
 	data: { active: boolean };
 }
+
+interface NativeChoiceComponent {
+	render(width: number): string[];
+	handleInput(data: string): void;
+	handleMouse?: (event: Record<string, unknown>) => NativeChoiceMouseResult | undefined;
+}
+
+interface NativeChoiceMouseResult {
+	handled?: boolean;
+	focus?: boolean;
+	render?: boolean;
+}
+
+interface ChoiceTui {
+	requestRender(): void;
+}
+
+interface ChoiceTheme {
+	fg(color: string, text: string): string;
+	bg(color: string, text: string): string;
+	bold(text: string): string;
+}
+
+type ChoiceCustomFactory = (
+	tui: ChoiceTui,
+	theme: ChoiceTheme,
+	keybindings: unknown,
+	done: (value: unknown) => void,
+) => NativeChoiceComponent;
 
 type BeforeAgentStart = (event: unknown, ctx: { mode: string }) => void | Promise<void>;
 
@@ -103,11 +133,11 @@ function tuiContext(inputs: readonly string[], rendered: { value: string }) {
 	return {
 		mode: "tui",
 		ui: {
-			custom: async (factory: (tui: { requestRender(): void }, theme: { fg(_color: string, text: string): string; bold(text: string): string }, keybindings: unknown, done: (value: unknown) => void) => { render(width: number): string[]; handleInput(data: string): void }) => {
+			custom: async (factory: ChoiceCustomFactory) => {
 				let result: unknown;
 				const component = factory(
 					{ requestRender() {} },
-					{ fg: (_color, text) => text, bold: (text) => text },
+					{ fg: (_color, text) => text, bg: (_color, text) => text, bold: (text) => text },
 					{},
 					(value) => {
 						result = value;
@@ -141,6 +171,128 @@ test("ask_user_choice exposes a strict closed single-select schema", () => {
 	assert.equal(optionsSchema?.maxItems, 4);
 	assert.equal(optionSchema?.additionalProperties, false);
 	assert.deepEqual(Object.keys(optionSchema?.properties ?? {}).sort(), ["description", "label", "value"]);
+});
+
+test("ask_user_choice hover preserves the keyboard-selected opaque value", async () => {
+	const { tool } = registerChoiceTool();
+	let completionCalls = 0;
+	const result = await tool.execute("call", { question: "Proceed?", options }, new AbortController().signal, undefined, {
+		mode: "tui",
+		ui: { custom: async (factory: ChoiceCustomFactory) => {
+			let completed: unknown;
+			const component = factory({ requestRender() {} }, {
+				fg: (_color, text) => `\u001b[38;5;39m${text}\u001b[39m`,
+				bg: (_color, text) => `\u001b[48;5;236m${text}\u001b[49m`, bold: (text) => text,
+			}, {}, (value) => { completionCalls++; completed = value; });
+			const lines = component.render(80);
+			const first = lines.findIndex((line) => stripTerminalSequences(line).includes(options[0]!.label));
+			const second = lines.findIndex((line) => stripTerminalSequences(line).includes(options[1]!.label));
+			assert.ok(first >= 0 && second >= 0);
+			const hover = {
+				type: "move", button: "none", x: 0, y: second,
+				screenX: 0, screenY: second, width: 80, height: lines.length,
+				shift: false, alt: false, ctrl: false,
+			};
+			assert.equal(component.handleMouse?.(hover)?.render, true);
+			assert.equal(completed, undefined, "hover never submits");
+			const hovered = component.render(80);
+			assert.ok(hovered[second]?.includes("\u001b[48;5;236m"), "only the second option is hovered");
+			assert.ok(
+				hovered[first]?.includes("\u001b[38;5;39m") && !hovered[first]?.includes("\u001b[48;5;236m"),
+				"hover does not change keyboard selection",
+			);
+			component.handleInput("\r");
+			component.handleInput("\r");
+			return completed;
+		} },
+	});
+	assert.deepEqual(result.details.selection, { value: options[0]!.value, label: options[0]!.label, index: 1 });
+	assert.equal(completionCalls, 1);
+});
+
+test("ask_user_choice retains native rendered hit testing for mouse selection", async () => {
+	const longOptions = [
+		{
+			label: "Authorize the observed baseline hash after independent verification",
+			description: "Accept the observed baseline after a long description that verifies layout offsets.",
+			value: "authorize_observed_hash",
+		},
+		{
+			label: "Preserve the originally requested hash without changing the envelope",
+			description: "Keep the original opaque answer token after the user confirms the requested value.",
+			value: "preserve_requested_hash",
+		},
+	];
+	const { tool } = registerChoiceTool();
+	let completionCalls = 0;
+	const result = await tool.execute(
+		"call",
+		{
+			question: "A deliberately long question verifies that the rendered header does not shift native option hit bounds.",
+			options: longOptions,
+		},
+		new AbortController().signal,
+		undefined,
+		{
+			mode: "tui",
+			ui: {
+				custom: async (factory: ChoiceCustomFactory) => {
+					let completed: unknown;
+					const component = factory(
+						{ requestRender() {} },
+						{ fg: (_color, text) => text, bg: (_color, text) => text, bold: (text) => text },
+						{},
+						(value) => {
+							completionCalls++;
+							completed = value;
+						},
+					) as NativeChoiceComponent;
+					const narrow = component.render(24);
+					assert.ok(narrow.length > 0, "the real component renders before a narrow-to-wide resize");
+					const wide = component.render(100);
+					const secondRow = wide.findIndex((line) => line.includes(longOptions[1]!.label.slice(0, 24)));
+					assert.ok(secondRow >= 0, "the test locates the actual rendered option row");
+					const event = (type: string, button: string, y: number, wheelDelta?: number) => ({
+						type,
+						button,
+						x: 1,
+						y,
+						screenX: 1,
+						screenY: y,
+						width: 100,
+						height: wide.length,
+						shift: false,
+						alt: false,
+						ctrl: false,
+						wheelDelta,
+					});
+					assert.equal(typeof component.handleMouse, "function", "native mouse dispatch must survive the custom UI adapter");
+					const wheel = component.handleMouse?.(event("wheel", "none", secondRow, 1));
+					assert.equal(wheel?.handled, true);
+					assert.equal(wheel?.render, true);
+					assert.equal(completed, undefined, "wheel changes focus without answering");
+					assert.equal(component.handleMouse?.(event("release", "left", secondRow)), undefined);
+					assert.equal(component.handleMouse?.(event("click", "right", secondRow)), undefined);
+					assert.equal(component.handleMouse?.(event("click", "left", wide.length)), undefined);
+					assert.equal(component.handleMouse?.({ type: "click" }), undefined);
+					const press = component.handleMouse?.(event("press", "left", secondRow));
+					assert.equal(press?.handled, true);
+					assert.equal(press?.focus, true);
+					assert.equal(completed, undefined, "press focuses and selects but never answers");
+					component.handleMouse?.(event("click", "left", secondRow));
+					component.handleMouse?.(event("click", "left", secondRow));
+					component.handleInput("\r");
+					return completed;
+				},
+			},
+		},
+	);
+	assert.deepEqual(result.details.selection, {
+		value: "preserve_requested_hash",
+		label: longOptions[1]!.label,
+		index: 2,
+	});
+	assert.equal(completionCalls, 1, "late keyboard input cannot complete the choice twice");
 });
 
 test("ask_user_choice handles a closed Kilo hash decision with an opaque envelope value", async () => {
@@ -185,7 +337,9 @@ test("ask_user_choice emits a private balanced lifecycle around selection and ca
 			},
 		},
 	);
-	assert.equal(selected.details.selection?.value, "preserve_requested_hash");
+	const selection = selected.details.selection;
+	assert.ok(selection !== null && typeof selection === "object" && "value" in selection);
+	assert.equal(selection.value, "preserve_requested_hash");
 	assert.deepEqual(sequence, ["active", "custom", "inactive"]);
 	assert.deepEqual(selectedRegistration.emittedEvents(), [
 		{ channel: "gentle-pi:ask-user-choice:blocked", data: { active: true } },

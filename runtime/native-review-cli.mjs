@@ -498,7 +498,12 @@ export const NATIVE_REVIEW_AUTHORITY_ENTRY_VERSION = {
 }         ;
 
 
-export const NATIVE_REVIEW_AUTHORITY_ENTRY_STATUS = NATIVE_REVIEW_AUTHORITY_STATUS;
+export const NATIVE_REVIEW_AUTHORITY_ENTRY_STATUS = {
+	...NATIVE_REVIEW_AUTHORITY_STATUS,
+	INCOMPLETE_STORE_ENTRY: "incomplete-store-entry",
+	HISTORICAL_PRE_RECEIPT: "historical-pre-receipt",
+	INVALIDATED: "invalidated",
+}         ;
 
 
 export const NATIVE_REVIEW_LOCK_STATUS = {
@@ -530,6 +535,11 @@ export const NATIVE_REVIEW_RECOVERY_DISPOSITION = {
 	INVALIDATED: "invalidated",
 	ESCALATED: "escalated",
 }         ;
+
+
+
+
+
 
 
 
@@ -1046,8 +1056,15 @@ function decodeNativeReviewRecovery(value         )                       {
 		...(recovery.maintainer_authorization === undefined ? {} : { maintainerAuthorization: requiredString(recovery.maintainer_authorization) }),
 	};
 }
+function decodeNativeReviewDiscardedWorkSummary(value         )                                   {
+	const discardedWork = exactObject(value, ["captured_lens_results", "findings_present"]);
+	return {
+		capturedLensResults: stringArray(discardedWork.captured_lens_results),
+		findingsPresent: booleanValue(discardedWork.findings_present),
+	};
+}
 function decodeNativeReviewStatusEntry(value         )                             {
-	const entry = exactObject(value, ["version", "path", "status", "problems"], ["lineage_id", "state", "revision", "snapshot_identity", "chain_identity", "recovery"]);
+	const entry = exactObject(value, ["version", "path", "status", "problems"], ["lineage_id", "state", "revision", "snapshot_identity", "chain_identity", "recovery", "discarded_work"]);
 	return {
 		version: enumString(entry.version, Object.values(NATIVE_REVIEW_AUTHORITY_ENTRY_VERSION))                                     ,
 		...(entry.lineage_id === undefined ? {} : { lineageId: requiredString(entry.lineage_id) }),
@@ -1058,6 +1075,7 @@ function decodeNativeReviewStatusEntry(value         )                          
 		...(entry.snapshot_identity === undefined ? {} : { snapshotIdentity: sha256Identity(entry.snapshot_identity) }),
 		...(entry.chain_identity === undefined ? {} : { chainIdentity: requiredString(entry.chain_identity) }),
 		...(entry.recovery === undefined ? {} : { recovery: decodeNativeReviewRecovery(entry.recovery) }),
+		...(entry.discarded_work === undefined ? {} : { discardedWork: decodeNativeReviewDiscardedWorkSummary(entry.discarded_work) }),
 		problems: stringArray(entry.problems),
 	};
 }
@@ -1596,14 +1614,20 @@ function splitNativeConsentInvocation(invocation        )                    {
 	let quote                       ;
 	let escaping = false;
 	let started = false;
-	for (const character of invocation.trim()) {
+	const source = invocation.trim();
+	for (let index = 0; index < source.length; index += 1) {
+		const character = source[index] ;
 		if (escaping) {
 			current += character;
 			escaping = false;
 			started = true;
 			continue;
 		}
-		if (character === "\\" && quote !== "'") {
+		// Provider invocations are not shell commands. Keep every path backslash
+		// verbatim, including quoted UNC and drive-root paths. Outside quotes,
+		// only a backslash before whitespace joins a space-containing token.
+		const next = source[index + 1];
+		if (character === "\\" && quote === undefined && next !== undefined && /\s/.test(next)) {
 			escaping = true;
 			started = true;
 			continue;
@@ -1694,7 +1718,9 @@ function consentInvocationArguments(request                                  )  
 	if (words[0] !== "gentle-ai" || words[1] !== "review" || words[2] !== "start") throw new NativeReviewConsentBindingError("consent-invocation-not-start", "Native consent invocation is not a provider review START");
 	const arguments_ = words.slice(1);
 	if (exactConsentOption(arguments_, "--contract") !== REVIEW_INTEGRATION_CONTRACT) throw new NativeReviewConsentBindingError("consent-invocation-contract-changed", "Native consent invocation contract changed");
-	if (exactConsentOption(arguments_, "--cwd") !== request.cwd) throw new NativeReviewConsentBindingError("consent-invocation-cwd-changed", "Native consent invocation repository binding changed");
+	const providerCwd = exactConsentOption(arguments_, "--cwd");
+	const requestedCwd = normalizeNativeReviewCwd(request.cwd);
+	if (normalizeNativeReviewCwd(providerCwd) !== requestedCwd) throw new NativeReviewConsentBindingError("consent-invocation-cwd-changed", "Native consent invocation repository binding changed");
 	if (exactConsentOption(arguments_, "--target") !== request.consent.targetIdentity) throw new NativeReviewConsentBindingError("consent-invocation-target-changed", "Native consent invocation target binding changed");
 	if (exactConsentOption(arguments_, "--projection") !== request.consent.projection) throw new NativeReviewConsentBindingError("consent-invocation-projection-changed", "Native consent invocation projection binding changed");
 	const lineageId = optionalConsentLineageOption(arguments_);
