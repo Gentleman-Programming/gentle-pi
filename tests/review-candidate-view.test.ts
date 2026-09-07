@@ -1065,6 +1065,24 @@ test("candidate executable-mode validation accepts a readonly Git executable on 
 	assert.equal(hasExpectedExecutableBits(0o555, "100644", "win32"), false);
 });
 
+test("candidate registry forwards explicit Windows mode validation to view verification", (t) => {
+	if (process.platform === "win32") return t.skip("requires POSIX candidate-owner directory permissions unavailable on Windows");
+	const contributorRoot = repository(t);
+	writeFileSync(join(contributorRoot, "unchanged-executable.sh"), "#!/bin/sh\necho base\n");
+	git(contributorRoot, "add", "unchanged-executable.sh");
+	git(contributorRoot, "update-index", "--chmod=+x", "unchanged-executable.sh");
+	git(contributorRoot, "-c", "user.name=Candidate Test", "-c", "user.email=candidate@example.invalid", "commit", "-m", "executable base");
+	writeFileSync(join(contributorRoot, "tracked.txt"), "changed\n");
+	const view = new CandidateViewRegistry(undefined, "win32").createOrReuse({ contributorRoot });
+	try {
+		assert.deepEqual(view.paths, ["tracked.txt"]);
+		chmodSync(view.root, 0o755); chmodSync(join(view.root, "unchanged-executable.sh"), 0o444); chmodSync(view.root, 0o555);
+		assert.doesNotThrow(() => view.verify());
+	} finally {
+		view.cleanup();
+	}
+});
+
 test("candidate view compacts an oversized non-ASCII scope losslessly and deterministically", (t) => {
 	const contributorRoot = repository(t);
 	writeFileSync(join(contributorRoot, "deleted.txt"), "delete me\n");
