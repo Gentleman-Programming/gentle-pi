@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -50,6 +51,27 @@ try {
 		stdio: "inherit",
 	});
 	const packageRoot = join(installDirectory, "node_modules", "gentle-pi");
+	const { nativeReviewAbandonAuthorization } = await import(pathToFileURL(join(packageRoot, "runtime", "native-review-cli.mjs")).href);
+	const abandonAuthorization = nativeReviewAbandonAuthorization({
+		lineage: "review-abc",
+		expectedRevision: "revision-9",
+		snapshotIdentity: "snapshot-1",
+		capturedLensResults: ["00-risk.json", "01-refuter.json"],
+		findingsPresent: true,
+		actor: "maintainer",
+		reason: "operator_disposition",
+	});
+	assert.equal(abandonAuthorization, [
+		"gentle-ai.review-abandon-authorization/v2",
+		"lineage=review-abc",
+		"revision=revision-9",
+		"snapshot_identity=snapshot-1",
+		"reason=operator_disposition",
+		"captured_lens_results=00-risk.json,01-refuter.json",
+		"findings_present=true",
+		"actor=maintainer",
+	].join("\n"));
+	assert.ok(!abandonAuthorization.includes("evidence_records_present"));
 	// Accept prerelease pins too: a stable-only pattern here was a second,
 	// silent pin that refused the first prerelease version directory.
 	const versions = readdirSync(join(packageRoot, ".gentle-ai"), { withFileTypes: true }).filter((entry) => entry.isDirectory() && /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.]*)?$/.test(entry.name));
