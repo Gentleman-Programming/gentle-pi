@@ -18,6 +18,7 @@ export interface AgentsViewDeps {
 	store: TaskStore;
 	now(): number;
 	onCancel(task: TaskRecord): void;
+	canCancel?(task: TaskRecord): boolean;
 	onOpen(task: TaskRecord): void;
 	onClose(): void;
 	requestRender(): void;
@@ -71,7 +72,6 @@ const KEYS = [
 	["j/k", "task"],
 	["ctrl+j/k", "scroll"],
 	["f", "follow"],
-	["c", "cancel"],
 	["o", "open session"],
 	["esc", "close"],
 ] as const;
@@ -163,7 +163,7 @@ export class AgentsView {
 		else if (data === "f") {
 			this.follow = true;
 			this.deps.requestRender();
-		} else if (data === "c" && task && !isFinished(task.status)) this.deps.onCancel(task);
+		} else if ((data === "s" || data === "c") && task && this.canCancel(task)) this.deps.onCancel(task);
 		else if ((data === "o" || matchesKey(data, Key.enter)) && task) this.deps.onOpen(task);
 	}
 
@@ -180,7 +180,7 @@ export class AgentsView {
 		for (let row = 0; row < rows; row += 1) {
 			body.push(`${theme.fg(ROLE.FRAME, "│")} ${fit(this.taskLine(row), listWidth)} ${theme.fg(ROLE.FRAME, "│")} ${fit(right[row] ?? "", threadWidth)}${theme.fg(ROLE.FRAME, "│")}`);
 		}
-		const keys = KEYS.map(([key, label]) => `${theme.fg(ROLE.KEY, key)} ${theme.fg(ROLE.KEY_TEXT, label)}`).join("   ");
+		const keys = this.keys().map(([key, label]) => `${theme.fg(ROLE.KEY, key)} ${theme.fg(ROLE.KEY_TEXT, label)}`).join("   ");
 		const keysLine = `${theme.fg(ROLE.FRAME, "│")} ${fit(keys, inner - 2)} ${theme.fg(ROLE.FRAME, "│")}`;
 		return [top, ...body, keysLine, theme.fg(ROLE.FRAME, `╰${rule(inner)}╯`)];
 	}
@@ -190,6 +190,16 @@ export class AgentsView {
 	private counts(): string {
 		const active = this.tasks.filter((task) => !isFinished(task.status)).length;
 		return `${active} active · ${this.tasks.length - active} finished`;
+	}
+
+	private canCancel(task: TaskRecord): boolean {
+		return !isFinished(task.status) && (this.deps.canCancel?.(task) ?? true);
+	}
+
+	private keys(): ReadonlyArray<readonly [string, string]> {
+		const task = this.selectedTask();
+		const stop = task && this.canCancel(task) ? [["s", "Stop selected"]] as const : [];
+		return [...KEYS.slice(0, 3), ...stop, ...KEYS.slice(3)];
 	}
 
 	private bodyRows(): number {

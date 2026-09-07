@@ -72,7 +72,6 @@ export interface AgentsConfig {
 	defaultThinking: ThinkingLevel | undefined;
 	defaultMode: AgentMode;
 	modelProfiles: Record<string, ModelProfile>;
-	timeoutMs: number;
 	stallTimeoutMs: number;
 	maxConcurrency: number;
 	historyMaxTasks: number;
@@ -106,7 +105,6 @@ export interface Frontmatter {
 	body: string;
 }
 
-const DEFAULT_TIMEOUT_MS = 20 * 60_000;
 const DEFAULT_STALL_TIMEOUT_MS = 4 * 60_000;
 const DEFAULT_MAX_CONCURRENCY = 5;
 const DEFAULT_HISTORY_MAX_TASKS = 200;
@@ -267,7 +265,8 @@ export function parseAgentsConfig(global: RawConfig, project: RawConfig): Agents
 		defaultThinking: thinking !== undefined && THINKING_LEVELS.includes(thinking) ? (thinking as ThinkingLevel) : undefined,
 		defaultMode: mode !== undefined && AGENT_MODES.includes(mode) ? (mode as AgentMode) : AGENT_MODE.TASK,
 		modelProfiles: mergeProfiles(parseProfiles(global?.model_profiles), parseProfiles(project?.model_profiles)),
-		timeoutMs: positiveInteger(merged.timeout_ms, DEFAULT_TIMEOUT_MS),
+		// `timeout_ms` remains accepted as an inert legacy key so existing JSON
+		// files load normally; only silence is bounded by `stall_timeout_ms`.
 		stallTimeoutMs: positiveInteger(merged.stall_timeout_ms, DEFAULT_STALL_TIMEOUT_MS),
 		maxConcurrency: positiveInteger(merged.max_concurrency, DEFAULT_MAX_CONCURRENCY),
 		historyMaxTasks: positiveInteger(merged.history_max_tasks, DEFAULT_HISTORY_MAX_TASKS),

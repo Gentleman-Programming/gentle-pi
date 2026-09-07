@@ -6,7 +6,7 @@ import { isFinished, normalizeRpcEvent, TASK_EVENT, TASK_STATUS, taskLabel, type
 // Gentle Agents runner. Every subagent is its own `pi --mode rpc` process:
 // the host never runs subagent work on the TUI thread. It writes JSON
 // commands, reads JSON lines, applies deltas to the store, answers dialogs,
-// and enforces a total timeout plus a stall watchdog per task.
+// and enforces an inactivity watchdog per task.
 
 export interface ChildLike {
 	pid: number | undefined;
@@ -41,7 +41,6 @@ export interface RunnerDeps {
 
 export interface RunnerLimits {
 	maxConcurrency: number;
-	timeoutMs: number;
 	stallTimeoutMs: number;
 }
 
@@ -87,7 +86,6 @@ interface Pending {
 interface LiveTask {
 	child: ChildLike;
 	pending: Map<string, Pending>;
-	cancelTimeout: () => void;
 	cancelStall: () => void;
 	cancelling: boolean;
 	nextId: number;
@@ -268,7 +266,7 @@ export class AgentRunner {
 			this.finish(id, TASK_STATUS.FAILED, `could not start pi: ${error instanceof Error ? error.message : String(error)}`);
 			return;
 		}
-		const live: LiveTask = { child, pending: new Map(), cancelTimeout: () => {}, cancelStall: () => {}, cancelling: false, nextId: 0 };
+		const live: LiveTask = { child, pending: new Map(), cancelStall: () => {}, cancelling: false, nextId: 0 };
 		this.live.set(id, live);
 		const permissionPipe = child.stdio?.[3];
 		if (hasParentPermissionChannel && permissionPipe !== undefined && permissionPipe !== null) {
@@ -280,7 +278,6 @@ export class AgentRunner {
 		this.store.update(id, { status: TASK_STATUS.RUNNING, startedAt: this.deps.now(), lastStep: "starting" });
 		child.on("error", (error) => this.finish(id, TASK_STATUS.FAILED, `could not start pi: ${error.message}`));
 		child.stdin.on("error", () => {});
-		live.cancelTimeout = this.deps.schedule(() => this.finish(id, TASK_STATUS.TIMED_OUT, `timed out after ${Math.round(this.limits.timeoutMs / 60_000)} min`), this.limits.timeoutMs);
 		this.armStall(id, live);
 		const lines = new JsonLines((value) => this.receive(id, request, value));
 		child.stdout.setEncoding("utf8");
@@ -328,6 +325,7 @@ export class AgentRunner {
 		const live = this.live.get(id);
 		if (!live || !value || typeof value !== "object") return;
 		const raw = value as Record<string, unknown>;
+		this.armStall(id, live);
 		if (raw.type === "response") {
 			const pending = typeof raw.id === "string" ? live.pending.get(raw.id) : undefined;
 			if (pending) {
@@ -336,7 +334,6 @@ export class AgentRunner {
 			}
 			return;
 		}
-		this.armStall(id, live);
 		for (const event of normalizeRpcEvent(raw)) {
 			this.store.apply(id, event, this.deps.now());
 			if (event.type === TASK_EVENT.ASK) void this.answer(id, request, live, event.request, raw);
@@ -370,7 +367,6 @@ export class AgentRunner {
 		if (!current || isFinished(current.status)) return;
 		const live = this.live.get(id);
 		if (live) {
-			live.cancelTimeout();
 			live.cancelStall();
 			live.permissionBroker?.close();
 			this.live.delete(id);
