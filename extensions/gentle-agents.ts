@@ -13,7 +13,7 @@ import { historyDir, loadHistory, loadStoredTask, pruneHistory, saveTask } from 
 import { sessionToMarkdown } from "../lib/agents-transcript.ts";
 import { AgentsView } from "../lib/agents-view.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
-import { AGENTS_GLYPH, renderAgentsCard, widgetExpiryMs } from "../lib/agents-widget.ts";
+import { AGENTS_GLYPH, renderAgentsCard, widgetExpiryMs, widgetRows } from "../lib/agents-widget.ts";
 import { CARD_TONE, renderCard } from "../lib/shell-card.ts";
 import { openInExternalEditor } from "./gentle-shell.ts";
 import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
@@ -192,12 +192,19 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const tasksDir = historyDir(deps.home, agentHome);
 	let ui: ExtensionContext["ui"] | undefined;
 	let host: { requestRender(): void } | undefined;
+	let sessions: ExtensionContext["sessionManager"] | undefined;
 	let collapsed = false;
 	let renderQueued = false;
 	let cancelClock: (() => void) | undefined;
 	const ownedTaskIds = new Set<string>();
 	const stoppingTaskIds = new Set<string>();
 	let stopAllConfirmation: Promise<void> | undefined;
+
+	// The card and its clock follow the session pi has open right now; a task
+	// started before /new or /resume stays in the store and comes back with
+	// its session. Before the first session_start there is nothing to scope by.
+	const activeSessionId = (): string | undefined => (sessions === undefined ? undefined : sessions.getSessionId() ?? "");
+	const visibleTasks = (): TaskRecord[] => store.list(activeSessionId());
 
 	const requestRender = () => {
 		if (renderQueued) return;
@@ -214,7 +221,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const tickClock = () => {
 		cancelClock?.();
 		cancelClock = undefined;
-		const tasks = store.list();
+		const tasks = visibleTasks();
 		if (tasks.some((task) => !isFinished(task.status))) {
 			cancelClock = deps.schedule(() => {
 				requestRender();
@@ -338,6 +345,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 					theme,
 					rows: Math.max(OVERLAY_MIN_ROWS, Math.floor(tui.terminal.rows * OVERLAY_HEIGHT_RATIO)),
 					store,
+					sessionId: ctx.sessionManager.getSessionId() ?? "",
 					now: () => deps.now(),
 					onCancel: (task) => void stopSelected(task, ctx),
 					canCancel: isOwnedActive,
@@ -389,11 +397,13 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 
 	const showWidget = (ctx: ExtensionContext) => {
 		ui = ctx.hasUI ? ctx.ui : undefined;
+		sessions = ctx.sessionManager;
+		tickClock();
 		ui?.setWidget(AGENTS_WIDGET_KEY, (tui, theme) => {
 			host = tui;
 			return {
 				render(width: number) {
-					const lines = renderAgentsCard(store.list(), theme, width, deps.now(), { collapsed, collapseKey });
+					const lines = renderAgentsCard(visibleTasks(), theme, width, deps.now(), { collapsed, collapseKey, maxRows: widgetRows(tui.terminal?.rows), viewKey });
 					return lines.length === 0 ? [] : [...lines, ""];
 				},
 				invalidate() {},
@@ -555,7 +565,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	}
 
 	pi.registerCommand(AGENTS_COMMAND_NAME, {
-		description: "Show the subagents of this and earlier sessions with their threads. Press o to open a task's session in $EDITOR.",
+		description: "Show this session's subagents with their threads; a widens the list to every session. Press o to open a task's session in $EDITOR.",
 		handler: async (_args, ctx) => openOverlay(ctx),
 	});
 	if (viewKey) {

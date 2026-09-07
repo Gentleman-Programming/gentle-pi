@@ -13,6 +13,10 @@ export const AGENTS_GLYPH = "❀";
 export interface AgentsWidgetOptions {
 	collapsed: boolean;
 	collapseKey?: string;
+	// Rows the card may spend on tasks; beyond that the rest fold into one
+	// "… N more" line so the card never pushes the editor off the screen.
+	maxRows?: number;
+	viewKey?: string;
 }
 
 interface StatusLook {
@@ -39,6 +43,18 @@ const LOOK: Record<TaskStatus, StatusLook> = {
 };
 const FINISHED_TTL_MS = 60_000;
 const MAX_FINISHED = 3;
+const ROWS_MIN = 3;
+const ROWS_MAX = 8;
+const ROWS_RATIO = 0.25;
+const SHOW_PRIORITY: Record<TaskStatus, number> = {
+	[TASK_STATUS.WAITING]: 0,
+	[TASK_STATUS.RUNNING]: 1,
+	[TASK_STATUS.QUEUED]: 2,
+	[TASK_STATUS.COMPLETED]: 3,
+	[TASK_STATUS.FAILED]: 3,
+	[TASK_STATUS.CANCELLED]: 3,
+	[TASK_STATUS.TIMED_OUT]: 3,
+};
 const NAME_MAX = 20;
 const TASK_MIN = 12;
 const GLYPH_GAP = "  ";
@@ -74,7 +90,7 @@ export function widgetTasks(tasks: readonly TaskRecord[], now: number): TaskReco
 		.filter((task) => isFinished(task.status) && task.endedAt !== null && now - task.endedAt < FINISHED_TTL_MS)
 		.sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))
 		.slice(0, MAX_FINISHED);
-	return [...active, ...finished].sort((a, b) => (a.startedAt ?? a.createdAt) - (b.startedAt ?? b.createdAt));
+	return [...active, ...finished].sort(startOrder);
 }
 
 // How long until the next finished row leaves the card, or undefined when no
@@ -85,6 +101,33 @@ export function widgetExpiryMs(tasks: readonly TaskRecord[], now: number): numbe
 		.filter((task) => isFinished(task.status) && task.endedAt !== null)
 		.map((task) => (task.endedAt ?? now) + FINISHED_TTL_MS - now);
 	return deadlines.length === 0 ? undefined : Math.max(1, Math.min(...deadlines));
+}
+
+// A quarter of the terminal, never fewer than three rows nor more than eight.
+export function widgetRows(terminalRows: number | undefined): number {
+	if (terminalRows === undefined) return ROWS_MAX;
+	return Math.max(ROWS_MIN, Math.min(ROWS_MAX, Math.floor(terminalRows * ROWS_RATIO)));
+}
+
+function startOrder(a: TaskRecord, b: TaskRecord): number {
+	return (a.startedAt ?? a.createdAt) - (b.startedAt ?? b.createdAt);
+}
+
+// When the card overflows, questions and running work keep their rows first;
+// what stays visible is still drawn in start order.
+function visibleRows(shown: readonly TaskRecord[], maxRows: number | undefined): { listed: TaskRecord[]; hidden: number } {
+	if (maxRows === undefined || shown.length <= maxRows) return { listed: [...shown], hidden: 0 };
+	const kept = Math.max(1, maxRows - 1);
+	const listed = [...shown]
+		.sort((a, b) => SHOW_PRIORITY[a.status] - SHOW_PRIORITY[b.status] || startOrder(a, b))
+		.slice(0, kept)
+		.sort(startOrder);
+	return { listed, hidden: shown.length - listed.length };
+}
+
+function overflowRow(hidden: number, theme: CardTheme, viewKey: string | undefined): string {
+	const hint = viewKey ? ` · ${viewKey} to view` : "";
+	return theme.fg(META_ROLE, `${ELLIPSIS} ${hidden} more${hint}`);
 }
 
 function elapsed(task: TaskRecord, now: number): string {
@@ -166,10 +209,12 @@ export function renderAgentsCard(tasks: readonly TaskRecord[], theme: CardTheme,
 	const shown = widgetTasks(tasks, now);
 	if (shown.length === 0) return [];
 	const cols = columns(shown, cardInnerWidth(width), now);
-	const listed = options.collapsed ? [shown[0]] : shown;
+	const { listed, hidden } = options.collapsed ? { listed: [shown[0]], hidden: 0 } : visibleRows(shown, options.maxRows);
 	const hint = options.collapsed && options.collapseKey ? `${options.collapseKey} expand` : batchElapsed(shown, now);
+	const body = listed.flatMap((task) => row(task, theme, cols, now));
+	if (hidden > 0) body.push(overflowRow(hidden, theme, options.viewKey));
 	return renderCard(
-		{ title: "Agents", subtitle: counts(shown), body: listed.flatMap((task) => row(task, theme, cols, now)), tone: tone(shown), glyph: AGENTS_GLYPH },
+		{ title: "Agents", subtitle: counts(shown), body, tone: tone(shown), glyph: AGENTS_GLYPH },
 		theme,
 		width,
 		{ expanded: true, hint },

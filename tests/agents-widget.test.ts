@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { TASK_STATUS, type TaskRecord } from "../lib/agents-protocol.ts";
-import { formatElapsed, renderAgentsCard, widgetExpiryMs, widgetTasks } from "../lib/agents-widget.ts";
+import { formatElapsed, renderAgentsCard, widgetExpiryMs, widgetRows, widgetTasks } from "../lib/agents-widget.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 
 // Gentle Agents widget: the card above the editor that shows what the
@@ -83,4 +83,29 @@ test("renderAgentsCard shows questions and failures in place of the task, and co
 	assert.equal(collapsed.length, 3);
 	assert.match(collapsed[0], /ctrl\+shift\+a expand ╮$/);
 	assert.match(collapsed[1], /^│ \?  sdd-explore  asked: Delete\?/);
+});
+
+test("widgetRows caps the card at a quarter of the terminal, between three and eight rows", () => {
+	assert.equal(widgetRows(40), 8, "tall terminals still stop at eight rows");
+	assert.equal(widgetRows(24), 6);
+	assert.equal(widgetRows(10), 3, "short terminals keep three rows");
+	assert.equal(widgetRows(undefined), 8, "without a terminal the widest default applies");
+});
+
+test("renderAgentsCard caps the rows at maxRows, keeps active tasks ahead of finished ones, and says how many are hidden", () => {
+	const tasks = [
+		task({ id: "done", status: TASK_STATUS.COMPLETED, startedAt: 500, endedAt: 2000 }),
+		...Array.from({ length: 6 }, (_, index) => task({ id: `run${index}`, label: `job ${index}`, createdAt: 1000 + index, startedAt: 1000 + index })),
+	];
+	const plain = renderAgentsCard(tasks, plainTheme, 80, 5000, { collapsed: false, maxRows: 4, viewKey: "alt+a" }).map(stripAnsi);
+	assert.equal(plain.length, 6, "frame plus four rows");
+	assert.match(plain[0], /6 active · 1 done/, "the title still counts every shown task");
+	assert.match(plain[1], /◐  sdd-explore  job 0/);
+	assert.match(plain[3], /◐  sdd-explore  job 2/);
+	assert.match(plain[4], /^│ … 4 more · alt\+a to view +│$/, "the finished row gives way to running ones");
+	assert.equal(renderAgentsCard(tasks, plainTheme, 80, 5000, { collapsed: false }).length, 9, "without a cap every row shows");
+	assert.equal(renderAgentsCard(tasks, plainTheme, 80, 5000, { collapsed: false, maxRows: 7 }).length, 9, "at the cap no row is hidden");
+	assert.match(renderAgentsCard(tasks, plainTheme, 80, 5000, { collapsed: false, maxRows: 4 }).map(stripAnsi)[4], /^│ … 4 more +│$/, "no view key, no hint");
+	const waiting = [...tasks, task({ id: "ask", status: TASK_STATUS.WAITING, lastStep: "asked: Delete?", createdAt: 4000, startedAt: 4000 })];
+	assert.match(renderAgentsCard(waiting, plainTheme, 80, 5000, { collapsed: false, maxRows: 2 }).map(stripAnsi)[1], /^│ \?  sdd-explore  asked: Delete\?/, "a question is never hidden");
 });

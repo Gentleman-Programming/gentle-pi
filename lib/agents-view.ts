@@ -7,16 +7,28 @@ import { formatTokens } from "./shell-bar.ts";
 // Gentle Agents overlay: tasks on the left, the selected task's thread on
 // the right. Only the selected task is subscribed, thread items are rendered
 // once each (they are immutable until replaced), and the viewport shows the
-// tail unless the human scrolls up.
+// tail unless the human scrolls up. The list opens on the active session's
+// work (active tasks plus those finished in the last quarter hour); `a`
+// widens it to every task of every session, including the stored history.
 
 export interface AgentsViewTheme {
 	fg(color: string, text: string): string;
 }
 
+export const VIEW_SCOPE = {
+	SESSION: "session",
+	ALL: "all",
+} as const;
+
+export type ViewScope = (typeof VIEW_SCOPE)[keyof typeof VIEW_SCOPE];
+
 export interface AgentsViewDeps {
 	theme: AgentsViewTheme;
 	rows: number;
 	store: TaskStore;
+	// The active session; without it there is nothing to scope by and the
+	// list shows every task.
+	sessionId?: string;
 	now(): number;
 	onCancel(task: TaskRecord): void;
 	canCancel?(task: TaskRecord): boolean;
@@ -67,6 +79,9 @@ const LIST_RATIO = 0.32;
 const CHROME_ROWS = 3;
 const MIN_BODY_ROWS = 1;
 const OUTPUT_TAIL_LINES = 8;
+export const SESSION_FINISHED_TTL_MS = 15 * 60_000;
+const SCOPE_LABEL: Record<ViewScope, string> = { [VIEW_SCOPE.SESSION]: "this session", [VIEW_SCOPE.ALL]: "all sessions" };
+const SCOPE_KEY: Record<ViewScope, string> = { [VIEW_SCOPE.SESSION]: "all sessions", [VIEW_SCOPE.ALL]: "this session" };
 const EMPTY_LIST = "no tasks yet";
 const EMPTY_THREAD = "waiting for the first event";
 const KEYS = [
@@ -142,6 +157,7 @@ export class AgentsView {
 	private selected = 0;
 	private hovered: number | undefined;
 	private listScroll = 0;
+	private scope: ViewScope;
 	private scroll = 0;
 	private follow = true;
 	private readonly pointerScope = createNativePointerScope();
@@ -156,6 +172,7 @@ export class AgentsView {
 
 	constructor(deps: AgentsViewDeps) {
 		this.deps = deps;
+		this.scope = deps.sessionId === undefined ? VIEW_SCOPE.ALL : VIEW_SCOPE.SESSION;
 		this.listRegion = this.pointerScope.wrap(EMPTY_COMPONENT, {
 			onWheel: (event) => this.wheelList(event),
 		});
@@ -199,7 +216,8 @@ export class AgentsView {
 		else if (data === "f") {
 			this.follow = true;
 			this.deps.requestRender();
-		} else if ((data === "s" || data === "c") && task && this.canCancel(task)) this.deps.onCancel(task);
+		} else if (data === "a" && this.deps.sessionId !== undefined) this.toggleScope();
+		else if ((data === "s" || data === "c") && task && this.canCancel(task)) this.deps.onCancel(task);
 		else if ((data === "o" || matchesKey(data, Key.enter)) && task) this.deps.onOpen(task);
 	}
 
@@ -221,15 +239,21 @@ export class AgentsView {
 	}
 
 	render(width: number): string[] {
+		// Finished rows age out of the session scope while the overlay is open;
+		// the list is otherwise reordered only when a status changes.
+		const now = this.deps.now();
+		if (this.tasks.some((task) => !this.inScope(task, now))) this.refreshTasks();
 		const theme = this.deps.theme;
 		const inner = width - 2;
 		const listWidth = Math.min(LIST_MAX_WIDTH, Math.floor(inner * LIST_RATIO));
 		const threadWidth = inner - listWidth - 4;
 		const rows = this.bodyRows();
+		this.followSelection(rows);
 		this.pointerLayout = { width, height: rows + CHROME_ROWS, listX: 2, listWidth, threadX: listWidth + 5, threadWidth, bodyRows: rows };
 		this.listRegion.render(listWidth);
 		this.threadRegion.render(threadWidth);
-		const title = `❀ Agents · ${this.counts()}`;
+		const scope = this.deps.sessionId === undefined ? "" : `${SCOPE_LABEL[this.scope]} · `;
+		const title = `❀ Agents · ${scope}${this.counts()}`;
 		const top = theme.fg(ROLE.FRAME, "╭─ ") + theme.fg(ROLE.TITLE, title) + theme.fg(ROLE.FRAME, ` ${rule(inner - visibleWidth(title) - 3)}╮`);
 		const right = this.threadWindow(rows, threadWidth);
 		const body: string[] = [];
@@ -257,7 +281,37 @@ export class AgentsView {
 	private keys(): ReadonlyArray<readonly [string, string]> {
 		const task = this.selectedTask();
 		const stop = task && this.canCancel(task) ? [["s", "Stop selected"]] as const : [];
-		return [...KEYS.slice(0, 3), ...stop, ...KEYS.slice(3)];
+		const scope = this.deps.sessionId === undefined ? [] : [["a", SCOPE_KEY[this.scope]]] as const;
+		return [...KEYS.slice(0, 3), ...stop, ...scope, ...KEYS.slice(3)];
+	}
+
+	// A new scope reads from the top: selection, list window, and thread reset.
+	private toggleScope(): void {
+		this.scope = this.scope === VIEW_SCOPE.SESSION ? VIEW_SCOPE.ALL : VIEW_SCOPE.SESSION;
+		this.tasks = [];
+		this.selected = 0;
+		this.listScroll = 0;
+		this.hovered = undefined;
+		this.scroll = 0;
+		this.follow = true;
+		this.refreshTasks();
+		this.deps.requestRender();
+	}
+
+	// The session scope: this session's active tasks plus those that finished
+	// within the last quarter hour. Everything else waits under "all sessions".
+	private inScope(task: TaskRecord, now: number): boolean {
+		if (this.scope === VIEW_SCOPE.ALL) return true;
+		if (task.parentSessionId !== this.deps.sessionId) return false;
+		return !isFinished(task.status) || task.endedAt === null || now - task.endedAt < SESSION_FINISHED_TTL_MS;
+	}
+
+	// Keep the selected row inside the list window, moving the window by the
+	// least amount needed; the wheel moves the same window on its own.
+	private followSelection(rows: number): void {
+		if (this.selected < this.listScroll) this.listScroll = this.selected;
+		else if (this.selected >= this.listScroll + rows) this.listScroll = this.selected - rows + 1;
+		this.listScroll = Math.max(0, Math.min(this.listScroll, Math.max(0, this.tasks.length - rows)));
 	}
 
 	private bodyRows(): number {
@@ -266,7 +320,8 @@ export class AgentsView {
 
 	private refreshTasks(): void {
 		const selectedId = this.tasks[this.selected]?.id;
-		this.tasks = this.deps.store.list();
+		const now = this.deps.now();
+		this.tasks = this.deps.store.list().filter((task) => this.inScope(task, now));
 		const index = this.tasks.findIndex((task) => task.id === selectedId);
 		this.selected = index === -1 ? Math.max(0, Math.min(this.selected, this.tasks.length - 1)) : index;
 		this.listScroll = Math.max(0, Math.min(this.listScroll, Math.max(0, this.tasks.length - this.bodyRows())));
