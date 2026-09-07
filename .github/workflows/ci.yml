@@ -63,6 +63,8 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+        env:
+          GENTLE_PI_SKIP_GENTLE_AI_INSTALL: "1"
 
       - name: Run Windows Git authority probe
         shell: pwsh
