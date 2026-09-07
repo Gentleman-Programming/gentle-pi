@@ -7,7 +7,7 @@ import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
 
 // Gentle Agents runner: every subagent is a child `pi --mode rpc` process.
 // The host only parses JSON lines, applies deltas to the store, answers
-// dialogs, and enforces timeouts. These tests drive a fake child.
+// dialogs, and enforces its inactivity watchdog. These tests drive a fake child.
 
 const explorer: AgentDefinition = { name: "explore", description: "maps", filePath: "/a/explore.md", scope: "global", instructions: "You map things.", model: undefined, thinking: undefined, mode: undefined, tools: ["read", "grep"] };
 
@@ -48,7 +48,7 @@ function harness(options: { maxConcurrency?: number; answer?: Record<string, unk
 		pi: { command: "pi", args: [] },
 	};
 	const store = new TaskStore();
-	const runner = new AgentRunner(store, { maxConcurrency: options.maxConcurrency ?? 2, timeoutMs: 60_000, stallTimeoutMs: 10_000 }, deps, {
+	const runner = new AgentRunner(store, { maxConcurrency: options.maxConcurrency ?? 2, stallTimeoutMs: 10_000 }, deps, {
 		askUser: async (taskId, ask) => {
 			asks.push({ taskId, method: ask.method });
 			return options.answer ?? { value: "yes" };
@@ -217,35 +217,34 @@ test("AgentRunner answers dialogs through askUser in task mode and cancels them 
 	assert.equal(store.get(task.id)?.status, TASK_STATUS.RUNNING, "answered questions do not leave the task waiting");
 });
 
-test("AgentRunner cancels, times out on the watchdog, and fails when the child exits early", async () => {
-	const { store, runner, children, timers } = harness({ maxConcurrency: 3 });
+test("AgentRunner cancels and fails when the child exits early", async () => {
+	const { store, runner, children } = harness({ maxConcurrency: 3 });
 	const cancelled = runner.run(request());
-	const timedOut = runner.run(request());
 	const crashed = runner.run(request());
 	await tick();
 	runner.cancel(cancelled.id);
 	await tick();
 	assert.equal(store.get(cancelled.id)?.status, TASK_STATUS.CANCELLED);
 	assert.ok(children[0].written.some((command) => command.type === "abort"));
-	const watchdog = timers.find((timer) => timer.ms === 60_000 && !timer.cancelled);
-	assert.ok(watchdog);
-	watchdog.fn();
-	await tick();
-	assert.equal(store.get(timedOut.id)?.status, TASK_STATUS.TIMED_OUT);
-	children[2].exit(1);
+	children[1].exit(1);
 	await tick();
 	assert.equal(store.get(crashed.id)?.status, TASK_STATUS.FAILED);
 	assert.match(store.get(crashed.id)?.error ?? "", /exited with code 1/);
 	assert.ok(runner.steer(cancelled.id, "x") === false, "a finished task cannot be steered");
 });
 
-test("AgentRunner steers a running task and marks a stalled one", async () => {
+test("AgentRunner has no total-duration watchdog but keeps active work alive and times out true silence", async () => {
 	const { store, runner, children, timers } = harness();
 	const task = runner.run(request({ mode: AGENT_MODE.BACKGROUND }));
 	await tick();
-	assert.equal(runner.steer(task.id, "Focus on lib/"), true);
+	assert.deepEqual(timers.filter((timer) => !timer.cancelled).map((timer) => timer.ms), [10_000], "only the inactivity watchdog is scheduled");
+	const initialStall = timers[0];
+	children[0].emit({ type: "response", id: "r1", success: true });
 	await tick();
-	assert.deepEqual(children[0].written.at(-1), { id: children[0].written.at(-1)?.id, type: "steer", message: "Focus on lib/" });
+	assert.equal(initialStall.cancelled, true, "every child RPC event, including a response, re-arms the inactivity watchdog");
+	children[0].emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "still working" } });
+	await tick();
+	assert.equal(store.get(task.id)?.status, TASK_STATUS.RUNNING, "ongoing RPC activity keeps a long-running task active");
 	const stall = timers.filter((timer) => timer.ms === 10_000 && !timer.cancelled).at(-1);
 	assert.ok(stall);
 	stall.fn();
@@ -280,12 +279,12 @@ test("AgentRunner fails only the task when the child cannot start, and the queue
 	await tick();
 	assert.equal(children.length, 2, "the next queued task starts");
 	assert.equal(store.get(next.id)?.status, TASK_STATUS.RUNNING);
-	assert.ok(timers.filter((timer) => timer.ms === 60_000).every((timer, index) => index === 1 || timer.cancelled), "the failed task's watchdog is cancelled");
+	assert.ok(timers.filter((timer) => timer.ms === 10_000).some((timer) => timer.cancelled), "the failed task's inactivity watchdog is cancelled");
 });
 
 test("AgentRunner turns a synchronous spawn exception into a failed task", async () => {
 	const store = new TaskStore();
-	const runner = new AgentRunner(store, { maxConcurrency: 1, timeoutMs: 1000, stallTimeoutMs: 1000 }, {
+	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs: 1000 }, {
 		spawn: () => {
 			throw new Error("ENOENT: pi not found");
 		},

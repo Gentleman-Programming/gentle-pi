@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { keyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { AGENT_MODE, discoverAgents, loadAgentsConfig, resolveAgentProfile, type AgentDefinition, type AgentMode } from "../lib/agents-config.ts";
-import { isFinished, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
+import { isFinished, TASK_STATUS, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
 import { AgentRunner, piCommand, type AskAnswer, type RunnerDeps, type TaskRequest } from "../lib/agents-runner.ts";
 import { hasReviewSessionPermission, resolveCanonicalGitRepositoryIdentitySync, type ReviewSessionManager } from "../lib/review-session-standing-permission.ts";
 import { historyDir, loadHistory, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
@@ -27,6 +27,7 @@ export const AGENTS_COMMAND_NAME = "gentle:agents";
 export const AGENTS_RESULT_TYPE = "gentle-agents.result";
 const COLLAPSE_KEY_DEFAULT = "ctrl+shift+a";
 const VIEW_KEY_DEFAULT = "alt+a";
+const STOP_KEY_DEFAULT = "alt+s";
 const OVERLAY_HEIGHT_RATIO = 0.8;
 const OVERLAY_MIN_ROWS = 12;
 const RENDER_COALESCE_MS = 400;
@@ -86,6 +87,12 @@ export function agentsViewKey(env: NodeJS.ProcessEnv = process.env): string | un
 export function agentsCollapseKey(env: NodeJS.ProcessEnv = process.env): string | undefined {
 	const value = env.GENTLE_PI_AGENTS_KEY?.trim();
 	if (value === undefined) return COLLAPSE_KEY_DEFAULT;
+	return value === "" || value.toLowerCase() === "off" ? undefined : value;
+}
+
+export function agentsStopKey(env: NodeJS.ProcessEnv = process.env): string | undefined {
+	const value = env.GENTLE_PI_AGENTS_STOP_KEY?.trim();
+	if (value === undefined) return STOP_KEY_DEFAULT;
 	return value === "" || value.toLowerCase() === "off" ? undefined : value;
 }
 
@@ -162,6 +169,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	}
 	const collapseKey = agentsCollapseKey(env);
 	const viewKey = agentsViewKey(env);
+	const stopKey = agentsStopKey(env);
 	const store = new TaskStore();
 	const tasksDir = historyDir(deps.home);
 	let ui: ExtensionContext["ui"] | undefined;
@@ -169,6 +177,9 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	let collapsed = false;
 	let renderQueued = false;
 	let cancelClock: (() => void) | undefined;
+	const ownedTaskIds = new Set<string>();
+	const stoppingTaskIds = new Set<string>();
+	let stopAllConfirmation: Promise<void> | undefined;
 
 	const requestRender = () => {
 		if (renderQueued) return;
@@ -218,9 +229,10 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const runner = new AgentRunner(store, loadAgentsConfig({ cwd: process.cwd(), home: deps.home }), deps, {
 		askUser: (_taskId, ask, raw) => answerThroughUi(ui, ask, raw),
 		onFinish: (task) => {
+			ownedTaskIds.delete(task.id);
 			requestRender();
 			persist(task);
-			if (task.mode === AGENT_MODE.BACKGROUND) deliver(task);
+			if (task.mode === AGENT_MODE.BACKGROUND && task.status !== TASK_STATUS.CANCELLED) deliver(task);
 		},
 	});
 
@@ -237,6 +249,55 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			invalidate() {},
 		};
 	});
+
+	const isOwnedActive = (task: TaskRecord | undefined): task is TaskRecord => task !== undefined && ownedTaskIds.has(task.id) && !isFinished(task.status);
+
+	const stopSelected = async (task: TaskRecord, ctx: ExtensionContext): Promise<void> => {
+		const selected = store.get(task.id);
+		if (!isOwnedActive(selected)) return;
+		if (selected.status === TASK_STATUS.QUEUED) {
+			if (runner.cancel(selected.id)) ctx.ui.notify(`Stopped ${selected.agent}.`);
+			else ctx.ui.notify(`Task ${selected.agent} already finished.`, "warning");
+			return;
+		}
+		if (stoppingTaskIds.has(selected.id)) return;
+		stoppingTaskIds.add(selected.id);
+		try {
+			const message = selected.status === TASK_STATUS.WAITING ? "Its pending question will be dismissed." : "Current work may be incomplete.";
+			if (!await ctx.ui.confirm(`Stop ${selected.agent}?`, message)) return;
+			const current = store.get(selected.id);
+			if (!isOwnedActive(current)) {
+				ctx.ui.notify(`Task ${selected.agent} already finished.`, "warning");
+				return;
+			}
+			if (runner.cancel(current.id)) ctx.ui.notify(`Stopped ${current.agent}.`);
+			else ctx.ui.notify(`Task ${current.agent} already finished.`, "warning");
+		} finally {
+			stoppingTaskIds.delete(selected.id);
+		}
+	};
+
+	const stopAll = (ctx: ExtensionContext): Promise<void> => {
+		if (stopAllConfirmation) return stopAllConfirmation;
+		const active = store.list().filter(isOwnedActive);
+		if (active.length === 0) {
+			ctx.ui.notify("No active subagents to stop.");
+			return Promise.resolve();
+		}
+		const count = active.length;
+		const noun = count === 1 ? "subagent" : "subagents";
+		const confirmation = (async () => {
+			try {
+				if (!await ctx.ui.confirm(`Stop ${count} active ${noun}?`, `Only these ${count} ${noun} will stop. Current work may be incomplete.`)) return;
+				const cancelled = active.filter((task) => runner.cancel(task.id)).length;
+				ctx.ui.notify(`Stopped ${cancelled} ${cancelled === 1 ? "subagent" : "subagents"}.`);
+			} finally {
+				stopAllConfirmation = undefined;
+			}
+		})();
+		stopAllConfirmation = confirmation;
+		return confirmation;
+	};
 
 	// Tasks from earlier sessions come back from disk on demand.
 	const resolveTask = async (id: string): Promise<TaskRecord | undefined> => {
@@ -260,7 +321,8 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 					rows: Math.max(OVERLAY_MIN_ROWS, Math.floor(tui.terminal.rows * OVERLAY_HEIGHT_RATIO)),
 					store,
 					now: () => deps.now(),
-					onCancel: (task) => runner.cancel(task.id),
+					onCancel: (task) => void stopSelected(task, ctx),
+					canCancel: isOwnedActive,
 					onOpen: (task) => done(task),
 					onClose: () => done(null),
 					requestRender: () => tui.requestRender(),
@@ -367,6 +429,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 
 	const launch = async (ctx: ExtensionContext, request: TaskRequest): Promise<ToolText> => {
 		const task = runner.run(request);
+		ownedTaskIds.add(task.id);
 		store.subscribe(task.id, () => requestRender());
 		if (request.mode === AGENT_MODE.BACKGROUND) return text(`Started ${task.agent} in the background as task ${task.id}. Use subagent_status or subagent_result with that id.`, taskDetails(task));
 		const finished = await runner.waitFor(task.id);
@@ -481,6 +544,12 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		pi.registerShortcut(viewKey as Parameters<ExtensionAPI["registerShortcut"]>[0], {
 			description: "Show the subagents overlay",
 			handler: async (ctx) => openOverlay(ctx),
+		});
+	}
+	if (stopKey) {
+		pi.registerShortcut(stopKey as Parameters<ExtensionAPI["registerShortcut"]>[0], {
+			description: "Stop active subagent(s)",
+			handler: async (ctx) => stopAll(ctx),
 		});
 	}
 

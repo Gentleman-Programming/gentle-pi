@@ -5,8 +5,9 @@ import { join } from "node:path";
 import test, { after, mock } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TuiMouseEvent } from "@earendil-works/pi-tui";
-import gentleAgents, { agentsCollapseKey, agentsEnabled, agentsViewKey, answerThroughUi, completionText, legacySubagentsInstalled, type AgentsDeps } from "../extensions/gentle-agents.ts";
-import { loadHistory } from "../lib/agents-history.ts";
+import gentleAgents, { agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, answerThroughUi, completionText, legacySubagentsInstalled, type AgentsDeps } from "../extensions/gentle-agents.ts";
+import { historyDir, loadHistory, saveTask } from "../lib/agents-history.ts";
+import { emptyThread, TASK_STATUS, type TaskRecord } from "../lib/agents-protocol.ts";
 import { NativePointerScope } from "../lib/native-pointer-region.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
@@ -52,7 +53,7 @@ writeFileSync(join(home, ".pi", "agent", "subagents.json"), JSON.stringify({ max
 function fakePi() {
 	const handlers = new Map<string, Handler[]>();
 	const tools = new Map<string, Registered>();
-	const shortcuts = new Map<string, { handler(ctx: ExtensionContext): Promise<void> }>();
+	const shortcuts = new Map<string, { description: string; handler(ctx: ExtensionContext): Promise<void> }>();
 	const commands = new Map<string, { handler(args: string, ctx: ExtensionContext): Promise<void> }>();
 	const sent: Array<{ message: Record<string, unknown>; options: Record<string, unknown> }> = [];
 	const renderers = new Map<string, (message: unknown, options: { expanded: boolean }, theme: unknown) => { render(width: number): string[] }>();
@@ -61,7 +62,7 @@ function fakePi() {
 		registerMessageRenderer: (type: string, renderer: (message: unknown, options: { expanded: boolean }, theme: unknown) => { render(width: number): string[] }) => renderers.set(type, renderer),
 		on: (event: string, handler: Handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 		registerTool: (tool: Registered) => tools.set(tool.name, tool),
-		registerShortcut: (key: string, registration: { handler(ctx: ExtensionContext): Promise<void> }) => shortcuts.set(key, registration),
+		registerShortcut: (key: string, registration: { description: string; handler(ctx: ExtensionContext): Promise<void> }) => shortcuts.set(key, registration),
 		registerCommand: (name: string, registration: { handler(args: string, ctx: ExtensionContext): Promise<void> }) => commands.set(name, registration),
 	} as unknown as ExtensionAPI;
 	const fire = async (event: string, ctx: ExtensionContext, payload: unknown = {}) => {
@@ -70,7 +71,7 @@ function fakePi() {
 	return { pi, tools, shortcuts, commands, fire, sent, renderers };
 }
 
-function fakeContext(tui: { requestRender(): void } = fakeTui) {
+function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (title: string, message: string) => Promise<boolean> = async () => true, inputResult: (title: string, placeholder: string | undefined) => Promise<string | undefined> = async () => undefined) {
 	const widgets = new Map<string, (tui: unknown, theme: unknown) => { render(width: number): string[] }>();
 	const dialogs: string[] = [];
 	const overlays: Overlay[] = [];
@@ -92,13 +93,13 @@ function fakeContext(tui: { requestRender(): void } = fakeTui) {
 				dialogs.push(`select:${title}:${options.join("|")}`);
 				return options[0];
 			},
-			confirm: async (title: string) => {
-				dialogs.push(`confirm:${title}`);
-				return true;
+			confirm: async (title: string, message: string) => {
+				dialogs.push(`confirm:${title}:${message}`);
+				return confirmResult(title, message);
 			},
-			input: async (title: string) => {
+			input: async (title: string, placeholder: string | undefined) => {
 				dialogs.push(`input:${title}`);
-				return undefined;
+				return inputResult(title, placeholder);
 			},
 			editor: async () => "edited",
 		},
@@ -143,6 +144,9 @@ test("agentsEnabled and agentsCollapseKey read their flags and stay off inside a
 	assert.equal(agentsCollapseKey({ GENTLE_PI_AGENTS_KEY: "off" }), undefined);
 	assert.equal(agentsViewKey({}), "alt+a");
 	assert.equal(agentsViewKey({ GENTLE_PI_AGENTS_VIEW_KEY: "off" }), undefined);
+	assert.equal(agentsStopKey({}), "alt+s");
+	assert.equal(agentsStopKey({ GENTLE_PI_AGENTS_STOP_KEY: "" }), undefined);
+	assert.equal(agentsStopKey({ GENTLE_PI_AGENTS_STOP_KEY: "off" }), undefined);
 	const off = fakePi();
 	gentleAgents(off.pi, { GENTLE_PI_AGENTS: "0" });
 	assert.equal(off.tools.size, 0);
@@ -402,4 +406,144 @@ test("finished tasks are written to history, come back through resolveTask, and 
 	assert.ok(overlay.render(80).map(stripAnsi).some((line) => /✓ explore/.test(line)), "the finished task is listed");
 	overlay.handleInput("\x1b");
 	await opened;
+});
+
+test("the overlay confirms a running task once and reports when it finishes during confirmation", async () => {
+	const { pi, tools, fire, commands, sent } = fakePi();
+	const harness = deps();
+	const modalHome = join(root, "modal-home");
+	mkdirSync(join(modalHome, ".pi", "agent", "agents"), { recursive: true });
+	writeFileSync(join(modalHome, ".pi", "agent", "agents", "explore.md"), "---\ndescription: maps things\nmodel: openai-codex/gpt-5.6-terra\n---\nYou map things.");
+	writeFileSync(join(modalHome, ".pi", "agent", "subagents.json"), JSON.stringify({ max_concurrency: 2 }));
+	harness.deps.home = modalHome;
+	let answerConfirmation: (confirmed: boolean) => void = () => {};
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, dialogs, overlays } = fakeContext(fakeTui, () => new Promise((resolve) => {
+		answerConfirmation = resolve;
+	}));
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Race", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	const opened = commands.get("gentle:agents")!.handler("", ctx);
+	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+	const overlay = overlays[0];
+	assert.ok(overlay, "the overlay component was created");
+	overlay.handleInput("s");
+	overlay.handleInput("c");
+	await tick();
+	assert.deepEqual(dialogs, ["confirm:Stop explore?:Current work may be incomplete."], "s and its compatibility alias share one confirmation");
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Finished first." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	answerConfirmation(true);
+	await tick();
+	assert.match(dialogs.at(-1) ?? "", /^notify:Task explore already finished\.$/);
+	assert.equal(sent.length, 1, "a normal completion during confirmation still reaches the parent");
+	overlay.handleInput("\x1b");
+	await opened;
+});
+
+test("the overlay stops a queued selection immediately without confirmation", async () => {
+	const { pi, tools, fire, commands } = fakePi();
+	const harness = deps();
+	const queueHome = join(root, "queue-home");
+	mkdirSync(join(queueHome, ".pi", "agent", "agents"), { recursive: true });
+	writeFileSync(join(queueHome, ".pi", "agent", "agents", "explore.md"), "---\ndescription: maps things\n---\nYou map things.");
+	writeFileSync(join(queueHome, ".pi", "agent", "subagents.json"), JSON.stringify({ max_concurrency: 1 }));
+	harness.deps.home = queueHome;
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, dialogs, overlays } = fakeContext();
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "First", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	const queued = await tools.get("subagent_run")!.execute("c2", { agent: "explore", task: "Queued", mode: "background" }, undefined, undefined, ctx);
+	const queuedId = (queued.details.gentleAgents as { taskId: string }).taskId;
+	const opened = commands.get("gentle:agents")!.handler("", ctx);
+	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+	overlays[0]!.handleInput("s");
+	await tick();
+	assert.deepEqual(dialogs, ["notify:Stopped explore."], "queued work stops without confirmation");
+	assert.match((await tools.get("subagent_status")!.execute("c3", { task_id: queuedId }, undefined, undefined, ctx)).content[0].text, /cancelled/);
+	overlays[0]!.handleInput("\x1b");
+	await opened;
+});
+
+test("the overlay explains that stopping a waiting subagent dismisses its question", async () => {
+	const { pi, tools, fire, commands } = fakePi();
+	const harness = deps();
+	const waitingHome = join(root, "waiting-home");
+	mkdirSync(join(waitingHome, ".pi", "agent", "agents"), { recursive: true });
+	writeFileSync(join(waitingHome, ".pi", "agent", "agents", "explore.md"), "---\ndescription: maps things\n---\nYou map things.");
+	harness.deps.home = waitingHome;
+	let answerInput: (value: string | undefined) => void = () => {};
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, dialogs, overlays } = fakeContext(fakeTui, async () => true, () => new Promise<string | undefined>((resolve) => {
+		answerInput = resolve;
+	}));
+	await fire("session_start", ctx);
+	const running = tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Ask", mode: "task" }, undefined, undefined, ctx);
+	await tick();
+	harness.children[0].emit({ type: "extension_ui_request", id: "wait", method: "input", title: "Need input" });
+	await tick();
+	const opened = commands.get("gentle:agents")!.handler("", ctx);
+	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+	overlays[0]!.handleInput("s");
+	await tick();
+	assert.ok(dialogs.includes("confirm:Stop explore?:Its pending question will be dismissed."));
+	assert.match((await running).content[0].text, /cancelled/);
+	answerInput(undefined);
+	overlays[0]!.handleInput("\x1b");
+	await opened;
+});
+
+test("restored task history cannot execute stop", async () => {
+	const { pi, fire, commands } = fakePi();
+	const harness = deps();
+	const historyHome = join(root, "history-home");
+	const historical: TaskRecord = { id: "history-running", agent: "explore", mode: "background", prompt: "p", label: "p", cwd, parentSessionId: "old", status: TASK_STATUS.RUNNING, createdAt: 1, startedAt: 1, endedAt: null, model: "m", thinking: undefined, sessionPath: null, error: null, result: null, lastStep: "working", lastActivityAt: 1, turns: 0, toolCalls: 0, tokens: 0, cost: 0 };
+	await saveTask(historyDir(historyHome), historical, emptyThread());
+	harness.deps.home = historyHome;
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, dialogs, overlays } = fakeContext();
+	await fire("session_start", ctx);
+	const opened = commands.get("gentle:agents")!.handler("", ctx);
+	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+	assert.doesNotMatch(stripAnsi(overlays[0]!.render(80).at(-2) ?? ""), /Stop selected/);
+	overlays[0]!.handleInput("s");
+	overlays[0]!.handleInput("c");
+	await tick();
+	assert.deepEqual(dialogs, []);
+	overlays[0]!.handleInput("\x1b");
+	await opened;
+});
+
+test("Alt+S confirms a snapshot of active subagents and suppresses their follow-up delivery", async () => {
+	const { pi, tools, fire, shortcuts, sent } = fakePi();
+	const harness = deps();
+	let answerConfirmation: (confirmed: boolean) => void = () => {};
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, dialogs } = fakeContext(fakeTui, () => new Promise<boolean>((resolve) => {
+		answerConfirmation = resolve;
+	}));
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "First", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	const shortcut = shortcuts.get("alt+s");
+	assert.ok(shortcut, "Alt+S is registered by default");
+	assert.equal(shortcut.description, "Stop active subagent(s)");
+	const stopping = shortcut.handler(ctx);
+	await tick();
+	await tools.get("subagent_run")!.execute("c2", { agent: "explore", task: "Second", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	answerConfirmation(true);
+	await stopping;
+	assert.deepEqual(dialogs, ["confirm:Stop 1 active subagent?:Only these 1 subagent will stop. Current work may be incomplete.", "notify:Stopped 1 subagent."]);
+	assert.equal(sent.length, 0, "intentional cancellation does not start a follow-up turn");
+	assert.match((await tools.get("subagent_list_tasks")!.execute("c3", {}, undefined, undefined, ctx)).content[0].text, /running/, "a subagent started during confirmation remains active");
+	const secondConfirmation = shortcut.handler(ctx);
+	await tick();
+	assert.match(dialogs.at(-1) ?? "", /^confirm:Stop 1 active subagent\?/);
+	answerConfirmation(false);
+	await secondConfirmation;
+	await fire("session_shutdown", ctx);
 });

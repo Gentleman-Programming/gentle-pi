@@ -6,6 +6,7 @@ import { dirname, isAbsolute, join, posix, win32 } from "node:path";
 import { promisify } from "node:util";
 import { PackageLocalGentleAiBinaryMissingError, resolveGentleAiBinary } from "./gentle-ai-binary.mjs";
 import { GENTLE_PI_REVIEW_RELAY_CONTRACT, GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV } from "./review-relay-contract.mjs";
+import { decodeReviewAssessmentV1,                         } from "./review-risk-assessment.mjs";
 import {
 	REVIEW_INTEGRATION_CONTRACT,
 	decodeReviewAcknowledgedV1,
@@ -60,6 +61,7 @@ export const NATIVE_REVIEW_OPERATION = {
 	RECONCILE_AUTHORITY: "review/reconcile-authority",
 	REPAIR_LEGACY_ALIAS: "review/repair-legacy-alias",
 	MODE: "review/mode",
+	ASSESS: "review/assess",
 	REPAIR: "review/repair",
 	CAPTURE_RESULT: "review/capture-result",
 	CAPTURE_CORRECTION_PLAN: "review/capture-correction-plan",
@@ -112,6 +114,11 @@ export const NATIVE_REVIEW_ERROR_CODE = {
 
 
 
+
+
+
+
+
 export const NATIVE_REVIEW_MODE_OPERATION = {
 	STATUS: "status",
 	ENABLE: "enable",
@@ -145,6 +152,17 @@ export const NATIVE_REVIEW_MODE_SCOPE = {
 	BOTH: "both",
 }         ;
 
+
+
+
+
+
+
+
+// Read-only risk assessment request (gentle-pi#662). `baseRef` requires
+// explicit `committedOnly` acknowledgement, exactly like Native START's
+// baseRef/committedOnly pairing, because both select a committed range
+// instead of the ambient working tree.
 
 
 
@@ -253,7 +271,6 @@ export const NATIVE_REVIEW_LEGACY_ALIAS_REPAIR = {
 	DIAGNOSTIC: "unsupported historical v1 operation alias",
 	DISPOSITION: "quarantine-approved-historical-alias",
 }         ;
-
 
 
 
@@ -1391,9 +1408,7 @@ class NativeReviewPlainCli {
 			if (!isCanonicalProcessString(value)) throw new TypeError(`Native ABANDON ${name} must be a non-empty, trimmed, NUL-free string`);
 		}
 		if (!Array.isArray(request.capturedLensResults) || request.capturedLensResults.some((entry) => !isCanonicalProcessString(entry))) throw new TypeError("Native ABANDON capturedLensResults must be an array of non-empty, trimmed, NUL-free strings");
-		for (const [name, value] of [["findingsPresent", request.findingsPresent], ["evidenceRecordsPresent", request.evidenceRecordsPresent]]         ) {
-			if (typeof value !== "boolean") throw new TypeError(`Native ABANDON ${name} must be a boolean`);
-		}
+		if (typeof request.findingsPresent !== "boolean") throw new TypeError("Native ABANDON findingsPresent must be a boolean");
 		if (request.maintainerAuthorization !== nativeReviewAbandonAuthorization(request)) throw new TypeError("Native ABANDON maintainerAuthorization must match the exact lineage, revision, snapshot, reason, discarded-work, and actor binding");
 		const execution = await this.execute(NATIVE_REVIEW_OPERATION.ABANDON, request.cwd, [
 			"review", "abandon", "--cwd", request.cwd,
@@ -1482,7 +1497,11 @@ class NativeReviewPlainCli {
 	}
 }
 
-export function nativeReviewAbandonAuthorization(request                                                                                                                                                                                   )         {
+export function nativeReviewAbandonAuthorization(request                                                                                                                                                        )         {
+	// gentle-ai 0ed9225f removed evidence records from the discarded-work summary,
+	// so the native v2 gate verifies an exact eight-line binding (schema, lineage,
+	// revision, snapshot_identity, reason, captured_lens_results, findings_present,
+	// actor) — there is no evidence_records_present line to derive or relay.
 	return [
 		"gentle-ai.review-abandon-authorization/v2",
 		`lineage=${request.lineage}`,
@@ -1491,7 +1510,6 @@ export function nativeReviewAbandonAuthorization(request                        
 		`reason=${request.reason}`,
 		`captured_lens_results=${request.capturedLensResults.join(",")}`,
 		`findings_present=${request.findingsPresent}`,
-		`evidence_records_present=${request.evidenceRecordsPresent}`,
 		`actor=${request.actor.trim()}`,
 	].join("\n");
 }
@@ -2218,6 +2236,26 @@ export class NativeReviewCliV216                            {
 			this.executablePath(NATIVE_REVIEW_OPERATION.MODE, mutating),
 		);
 		return decode(NATIVE_REVIEW_OPERATION.MODE, mutating, () => decodeNativeReviewMode(execution.body, request.operation));
+	}
+
+	// Read-only risk assessment (gentle-ai#4295, gentle-pi#662). Never mutates;
+	// an older binary without the verb, or any other process/decode failure,
+	// rejects -- callers (the `gentle_review` tool's `assess` operation) fail
+	// closed to `high`.
+	async assess(request                           )                              {
+		if (request.baseRef !== undefined && !isCanonicalProcessString(request.baseRef)) throw new TypeError("Native ASSESS baseRef must be a non-empty, trimmed, NUL-free string");
+		if (request.baseRef !== undefined && request.committedOnly !== true) throw new TypeError("Native ASSESS baseRef requires explicit committedOnly acknowledgement");
+		if (request.baseRef === undefined && request.committedOnly !== undefined) throw new TypeError("Native ASSESS committedOnly requires an explicit baseRef");
+		const cwd = await canonicalNativeReviewCwd(request.cwd);
+		const execution = await this.invoke(
+			NATIVE_REVIEW_OPERATION.ASSESS,
+			cwd,
+			["review", "assess", "--cwd", cwd, ...(request.baseRef === undefined ? [] : ["--base-ref", request.baseRef, "--committed-only"]), "--json"],
+			false,
+			request.signal,
+			this.executablePath(NATIVE_REVIEW_OPERATION.ASSESS, false),
+		);
+		return decode(NATIVE_REVIEW_OPERATION.ASSESS, false, () => decodeReviewAssessmentV1(execution.body));
 	}
 
 	// Recovery commands are version-gated plain CLI operations outside the

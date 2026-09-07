@@ -163,3 +163,24 @@ test("AgentsView clears hover on leave, list scrolling, resize, updates, empty l
 	assert.equal(empty.handleMouse(mouse(4, 1, 80, 6)), undefined, "empty task rows are inert");
 	empty.dispose();
 });
+
+test("AgentsView advertises s to stop an active selection, retains c as an alias, and hides stopping for finished tasks", () => {
+	const { store, view, events } = harness(8);
+	store.add(task("active"));
+	assert.match(stripAnsi(view.render(80).at(-2) ?? ""), /s Stop selected/);
+	view.handleInput("s");
+	view.handleInput("c");
+	assert.deepEqual(events, ["cancel:active", "cancel:active"]);
+	store.update("active", { status: TASK_STATUS.CANCELLED, endedAt: 2000 });
+	assert.doesNotMatch(stripAnsi(view.render(80).at(-2) ?? ""), /Stop selected/);
+	view.handleInput("s");
+	assert.deepEqual(events, ["cancel:active", "cancel:active"], "finished tasks never stop");
+});
+
+test("AgentsView Escape and q close an active selection without cancelling it", () => {
+	const { store, view, events } = harness(8);
+	store.add(task("active"));
+	view.handleInput("\x1b");
+	view.handleInput("q");
+	assert.deepEqual(events, ["close", "close"], "close keys never invoke selected-task cancellation");
+});
