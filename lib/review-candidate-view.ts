@@ -1,10 +1,11 @@
 import { execFileSync, type ExecFileSyncOptions } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, utimesSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
+import { assertCandidateOwnerParent, createCandidateOwner, removeCandidateOwner, sweepCandidateOwners, type CandidateViewOwner } from "./review-candidate-view-owner.ts";
 
 const REVIEW_LENS = ["review-risk", "review-resilience", "review-readability", "review-reliability"] as const;
 export type ReviewLens = (typeof REVIEW_LENS)[number];
@@ -12,6 +13,11 @@ const CANDIDATE_GIT_TIMEOUT_MS = 10_000;
 const CANDIDATE_GIT_TIMEOUT_MAX_MS = 120_000;
 const CANDIDATE_GIT_TIMEOUT_ENV = "GENTLE_PI_CANDIDATE_GIT_TIMEOUT_MS";
 const CANDIDATE_GIT_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+// Keep the copied index at least one timestamp tick behind its source. The
+// two-second target also clears filesystems whose mtime granularity is a second
+// or coarser without needlessly assigning an arbitrary historical timestamp.
+const PRIVATE_INDEX_RACY_SAFETY_NS = 1_000_000_000n;
+const PRIVATE_INDEX_RACY_BACKDATE_NS = 2_000_000_000n;
 
 // Candidate views may materialize full repository trees. Large repositories can
 // raise this bounded deadline without creating an unbounded child process.
@@ -94,6 +100,7 @@ interface CandidateViewScope {
 }
 
 interface CandidateViewRecord {
+	owner: CandidateViewOwner;
 	token: string;
 	root: string;
 	parent: string;
@@ -337,6 +344,26 @@ function isCanonicalObjectId(objectId: string): boolean { return /^(?:[0-9a-f]{4
 function gitlinkMapsEqual(left: Readonly<Record<string, string>>, right: Readonly<Record<string, string>>): boolean {
 	const entries = Object.entries(left);
 	return entries.length === Object.keys(right).length && entries.every(([path, objectId]) => right[path] === objectId);
+}
+
+// Two materialized candidate views describe the exact same reviewable content
+// when their base, candidate tree, commit-state, and changed scope all match.
+// This is what makes a retried native START's freshly-materialized duplicate
+// view safely discardable in favor of an already-bound one (gentle-pi
+// candidate-view rebind defect, ga#4085 / ga#4050): the comparison never
+// trusts a caller-supplied claim, only Git-derived identity already computed
+// by materializeCandidateView for both records.
+function candidateRecordsShareIdentity(left: CandidateViewRecord, right: CandidateViewRecord): boolean {
+	return left.contributorRoot === right.contributorRoot &&
+		left.baseCommit === right.baseCommit &&
+		left.baseTree === right.baseTree &&
+		left.candidateTree === right.candidateTree &&
+		left.committedOnly === right.committedOnly &&
+		JSON.stringify(left.intendedUntracked ?? null) === JSON.stringify(right.intendedUntracked ?? null) &&
+		JSON.stringify(left.scope.paths) === JSON.stringify(right.scope.paths) &&
+		JSON.stringify(left.scope.modes) === JSON.stringify(right.scope.modes) &&
+		gitlinkMapsEqual(left.scope.gitlinks, right.scope.gitlinks) &&
+		JSON.stringify(left.scope.deletedPaths) === JSON.stringify(right.scope.deletedPaths);
 }
 
 function decodeCanonicalPath(value: Buffer): string {
@@ -603,11 +630,15 @@ function makeWritableForCleanup(path: string): void {
 }
 
 function candidateViewParent(commonDir: string): string {
-	const parent = join(commonDir, "gentle-ai", "candidate-views");
+	const control = join(commonDir, "gentle-ai");
+	mkdirSync(control, { recursive: true, mode: 0o700 });
+	const controlStat = lstatSync(control);
+	if (!controlStat.isDirectory() || controlStat.isSymbolicLink() || realpathSync(control) !== control) throw new CandidateViewError("candidate view ancestor is unsafe");
+	const parent = join(control, "candidate-views");
 	mkdirSync(parent, { recursive: true, mode: 0o700 });
 	const stat = lstatSync(parent);
 	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new CandidateViewError("candidate view parent is unsafe");
-	return realpathSync(parent);
+	return assertCandidateOwnerParent(commonDir);
 }
 
 export interface ResolvedCandidateBase {
@@ -780,11 +811,29 @@ function isErrnoCode(error: unknown, code: string): boolean {
 	return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
+function timestampSeconds(timestampNs: bigint): number {
+	// Node's utimes API takes Unix seconds as a number. Splitting the value keeps
+	// the seconds conversion exact; the explicit racy-clean backdate below is far
+	// larger than the fractional precision a Number can represent at this epoch.
+	return Number(timestampNs / 1_000_000_000n) + Number(timestampNs % 1_000_000_000n) / 1_000_000_000;
+}
+
 function seedPrivateIndexFromLiveIndex(cwd: string, indexPath: string, executor: CandidateGitExecutor): boolean {
 	const liveIndex = resolve(cwd, git(cwd, ["rev-parse", "--path-format=absolute", "--git-path", "index"], process.env, executor));
-	const entry = lstatSync(liveIndex, { throwIfNoEntry: false });
+	const entry = lstatSync(liveIndex, { bigint: true, throwIfNoEntry: false });
 	if (entry === undefined) return false; if (!entry.isFile()) throw new CandidateViewError("candidate live Git index is not a regular file");
+	if (entry.mtimeNs < PRIVATE_INDEX_RACY_BACKDATE_NS) throw new CandidateViewError("candidate live Git index timestamp is too early for racy-clean protection");
 	copyFileSync(liveIndex, indexPath);
+	// Git's racy-clean check compares index and tracked-file mtimes. copyFileSync
+	// gives the private index a new timestamp; restoring a Date can also lose
+	// nanoseconds. Backdate the bigint live timestamp instead, then verify the
+	// filesystem applied enough of that bounded interval for Git to refresh
+	// content rather than trusting a racy-clean stat match.
+	utimesSync(indexPath, timestampSeconds(entry.atimeNs), timestampSeconds(entry.mtimeNs - PRIVATE_INDEX_RACY_BACKDATE_NS));
+	const privateMtimeNs = lstatSync(indexPath, { bigint: true }).mtimeNs;
+	if (privateMtimeNs >= entry.mtimeNs || entry.mtimeNs - privateMtimeNs < PRIVATE_INDEX_RACY_SAFETY_NS) {
+		throw new CandidateViewError("candidate private Git index timestamp cannot preserve racy-clean protection");
+	}
 	for (const name of readdirSync(dirname(liveIndex))) if (/^sharedindex\.[0-9a-f]+$/.test(name)) {
 		try {
 			const sharedIndex = join(dirname(liveIndex), name);
@@ -809,6 +858,7 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 		? resolveCandidateBase(contributorRoot, "HEAD", process.env, executor)
 		: base;
 	const parent = candidateViewParent(canonicalCommonDir);
+	sweepCandidateOwners(canonicalCommonDir, (args) => git(canonicalCommonDir, args, process.env, executor), makeWritableForCleanup);
 	const index = mkdtempSync(join(tmpdir(), "gentle-ai-candidate-index-"));
 	const indexPath = join(index, "index");
 	const environment = { ...process.env, GIT_INDEX_FILE: indexPath };
@@ -832,6 +882,7 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 		}
 		const candidateTree = git(contributorRoot, ["write-tree"], environment, executor);
 		const root = join(parent, randomUUID());
+		const owner = createCandidateOwner(canonicalCommonDir, root);
 		// The worktree is created under the same try/catch cleanup boundary as
 		// the read-tree materialization that follows. addUnbornWorktree's
 		// fallback path can register a worktree with `worktree add` and then
@@ -852,9 +903,9 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 			const scope = deriveChangedScope(contributorRoot, base.tree, candidateTree, [...tree.entries, ...tree.gitlinks], executor);
 			for (const gitlink of tree.gitlinks) if (lstatSync(join(root, gitlink.path), { throwIfNoEntry: false })) throw new CandidateViewError("candidate view materialized a metadata-only gitlink");
 			makeReadonly(root, entries);
-			return { token: basename(root), root: realpathSync(root), parent, contributorRoot, commonDir: canonicalCommonDir, baseCommit, baseTree: base.tree, candidateTree, committedOnly, intendedUntracked, entries, gitlinks: tree.gitlinks, scope, gitExecutor: executor };
+			return { owner, token: basename(root), root: realpathSync(root), parent, contributorRoot, commonDir: canonicalCommonDir, baseCommit, baseTree: base.tree, candidateTree, committedOnly, intendedUntracked, entries, gitlinks: tree.gitlinks, scope, gitExecutor: executor };
 		} catch (error) {
-			try { git(contributorRoot, ["worktree", "remove", "--force", root], process.env, executor); } catch { rmSync(root, { recursive: true, force: true }); }
+			try { removeCandidateOwner(owner, (args) => git(canonicalCommonDir, args, process.env, executor), makeWritableForCleanup); } catch { /* Preserve the marker and any partial worktree for conservative recovery. */ }
 			throw error;
 		}
 	} finally {
@@ -1007,8 +1058,18 @@ export class CandidateViewRegistry {
 		return this.createOrReuse(request);
 	}
 
+	sweepOrphans(contributorRoot: string): void {
+		try {
+			const cwd = realpathSync(contributorRoot);
+			const common = realpathSync(resolve(cwd, git(cwd, ["rev-parse", "--git-common-dir"], process.env, this.gitExecutor)));
+			sweepCandidateOwners(common, (args) => git(common, args, process.env, this.gitExecutor), makeWritableForCleanup);
+		} catch { /* Non-repositories and unavailable ownership are preserved. */ }
+	}
+
 	cleanupAll(): void {
-		for (const token of [...this.records.keys()]) this.cleanup(token);
+		for (const token of [...this.records.keys()]) {
+			try { this.cleanup(token); } catch { /* Continue other owned views; failed records remain retryable. */ }
+		}
 	}
 
 	createOrReuse(request: CreateCandidateViewRequest): CandidateView {
@@ -1030,6 +1091,32 @@ export class CandidateViewRegistry {
 
 	bindCurrent(request: BindCandidateViewRequest): void {
 		const selectedLenses = this.validateSelectedLenses(request.selectedLenses);
+		const candidate = this.records.get(request.token);
+		const key = candidate === undefined ? undefined : this.lineageKey(candidate.contributorRoot, request.lineageId);
+		const existingToken = key === undefined ? undefined : this.lineages.get(key);
+		// A retried native START for a lineage this controller already bound
+		// (native reports it "resumed") re-materializes a fresh, content-
+		// identical candidate view under a new token before it reaches here.
+		// Rebinding that duplicate to the same lineage key used to fail closed
+		// with "candidate view lineage binding is missing or ambiguous" even
+		// though nothing is actually ambiguous: it is the exact same reviewable
+		// content, re-verified from Git. Discard the redundant duplicate and
+		// keep the already-bound view current instead of failing the retry
+		// (gentle-pi candidate-view rebind defect, ga#4085 / ga#4050).
+		if (candidate !== undefined && existingToken !== undefined && existingToken !== request.token) {
+			const existing = this.records.get(existingToken);
+			let existingSafe = false;
+			if (existing !== undefined && existing.lineageId === request.lineageId) {
+				try { assertRecordSafe(existing); existingSafe = true; } catch { existingSafe = false; }
+			}
+			if (existing !== undefined && existingSafe && candidateRecordsShareIdentity(existing, candidate)) {
+				existing.selectedLenses = selectedLenses;
+				this.remove(candidate);
+				this.forget(candidate);
+				this.current.set(existing.contributorRoot, { lineageId: request.lineageId, token: existingToken });
+				return;
+			}
+		}
 		const record = this.bindRecord(request.token, request.lineageId, selectedLenses);
 		this.current.set(record.contributorRoot, { lineageId: request.lineageId, token: request.token });
 	}
@@ -1276,21 +1363,18 @@ export class CandidateViewRegistry {
 	 * correction.
 	 */
 	rebindForFinalizeFromNative(lineageId: string, contributorRoot: string, descriptor: NativeCandidateProjectionDescriptor): CandidateView {
-		const root = this.canonicalRoot(contributorRoot);
-		const key = this.lineageKey(root, lineageId);
-		const staleToken = this.lineages.get(key);
-		const stale = staleToken === undefined ? undefined : this.records.get(staleToken);
-		this.projections.delete(key);
-		if (stale !== undefined) {
-			this.remove(stale);
-			this.forget(stale);
-		}
-		return this.restoreForFinalizeFromNative(lineageId, root, descriptor);
+		return this.restoreForFinalizeFromNative(lineageId, contributorRoot, descriptor);
 	}
 
+	/**
+	 * Restores a lineage's FINALIZE binding (gentle-pi #185): the stale entry
+	 * is only detached, not destroyed, so a failed restore can undo it.
+	 */
 	restoreForFinalizeFromNative(lineageId: string, contributorRoot: string, descriptor: NativeCandidateProjectionDescriptor): CandidateView {
 		const root = this.canonicalRoot(contributorRoot);
 		const key = this.lineageKey(root, lineageId);
+		const staleToken = this.lineages.get(key), staleProjection = this.projections.get(key);
+		this.lineages.delete(key); this.projections.delete(key);
 		let projectionRestored = false;
 		let record: CandidateViewRecord | undefined;
 		try {
@@ -1308,6 +1392,8 @@ export class CandidateViewRegistry {
 			if (!matchesProjection(record)) throw new CandidateViewError("live candidate does not match the native frozen projection");
 			this.records.set(record.token, record);
 			this.bindRecord(record.token, lineageId, []);
+			const stale = staleToken === undefined ? undefined : this.records.get(staleToken);
+			if (stale !== undefined) { this.remove(stale); this.forget(stale); }
 			return this.expose(record);
 		} catch (error) {
 			if (projectionRestored) this.projections.delete(key);
@@ -1315,6 +1401,8 @@ export class CandidateViewRegistry {
 				this.forget(record);
 				this.remove(record);
 			}
+			if (staleToken !== undefined) this.lineages.set(key, staleToken);
+			if (staleProjection !== undefined) this.projections.set(key, staleProjection);
 			throw error;
 		}
 	}
@@ -1476,10 +1564,7 @@ export class CandidateViewRegistry {
 
 	private remove(record: CandidateViewRecord): void {
 		if (!isWithin(record.parent, record.root)) throw new CandidateViewError("candidate view cleanup escaped its owned parent");
-		try { makeWritableForCleanup(record.root); } catch {}
-		try { git(record.contributorRoot, ["worktree", "remove", "--force", record.root], process.env, record.gitExecutor); } catch {}
-		// Git removes worktree metadata; physical removal remains this owner's duty.
-		rmSync(record.root, { recursive: true, force: true });
+		removeCandidateOwner(record.owner, (args) => git(record.commonDir, args, process.env, record.gitExecutor), makeWritableForCleanup);
 	}
 
 	private forget(record: CandidateViewRecord): void {

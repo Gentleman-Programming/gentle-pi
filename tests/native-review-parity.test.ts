@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -183,7 +183,6 @@ interface ParityRuntimeOptions {
 	pendingReviewConsentRegistry?: PendingReviewConsentRegistry;
 	now?: () => number;
 	scheduleTimer?: (callback: () => void, delayMs: number) => { unref: () => void };
-	writeConsentLatch?: (cwd: string) => void;
 }
 
 function parityRuntime(nativeReviewCli: NativeReviewCli | null, options: ParityRuntimeOptions = {}): ParityRuntime {
@@ -197,7 +196,7 @@ function parityRuntime(nativeReviewCli: NativeReviewCli | null, options: ParityR
 		now: options.now,
 		scheduleTimer: options.scheduleTimer,
 	} as unknown as Parameters<typeof createGentleAiExtension>[0];
-	__testing.createGentleAiExtension(dependencies, options.writeConsentLatch ?? (() => {}))({
+	__testing.createGentleAiExtension(dependencies)({
 		on(name: string, handler: RegisteredEvent) { events.set(name, handler); },
 		registerTool(definition: RegisteredControllerTool & { name: string }) { tools.set(definition.name, definition); },
 		registerCommand(name: string, definition: RegisteredCommand) { commands.set(name, definition); },
@@ -401,7 +400,7 @@ test("public gentle:review-mode handler reports current operations, global-off w
 	assert.deepEqual(unavailableNotices, [{ message: "Gentle AI review mode is not available with the currently negotiated native version.", type: "info" }]);
 });
 
-test("public consent relay is session-bound, one-shot, and candidate-scoped", async (t) => {
+test("public consent relay allows any active session to resolve a live binding, is one-shot, and is candidate-scoped", async (t) => {
 	const cwd = repository(t);
 	const sharedRegistry = new PendingReviewConsentRegistry();
 	const fixture = consentNative(cwd);
@@ -411,14 +410,22 @@ test("public consent relay is session-bound, one-shot, and candidate-scoped", as
 	const sameSessionResult = await answerConsent(second, cwd, sameSession.consent_binding, "declined", "same-session");
 	assert.equal(sameSessionResult.outcome, "consent-declined-this-candidate");
 
+	// gentle-pi#455: a binding is answerable by whichever active Pi session
+	// presents it, not only the session whose START created it.
 	const blockedA = await beginConsent(first, cwd, "session-a");
 	assert.deepEqual(blockedA.consent, decodeReviewConsentV3(captured("consent-v3.captured.json")).raw);
-	const staleOtherSession = await answerConsent(second, cwd, blockedA.consent_binding, "declined", "session-b");
-	assert.equal(staleOtherSession.operation, "answer-consent");
-	// gentle-pi#516: a binding this session does not hold must never read as
-	// a healthy pre-start STATUS; it names itself and the exit.
-	assertStaleConsentBinding(staleOtherSession, blockedA.consent_binding, "consent-binding-unknown");
-	assert.deepEqual(fixture.answers, ["declined"]);
+	const declinedFromOtherSession = await answerConsent(second, cwd, blockedA.consent_binding, "declined", "session-b");
+	assert.equal(declinedFromOtherSession.operation, "answer-consent");
+	assert.equal(declinedFromOtherSession.outcome, "consent-declined-this-candidate");
+	assert.deepEqual(fixture.answers, ["declined", "declined"]);
+
+	// Cross-session resolution still enforces single use: once answered, no
+	// session -- including the one whose START created it -- may answer it again.
+	const staleAfterCrossSessionAnswer = await answerConsent(first, cwd, blockedA.consent_binding, "declined", "session-a");
+	assert.equal(staleAfterCrossSessionAnswer.operation, "answer-consent");
+	assertStaleConsentBinding(staleAfterCrossSessionAnswer, blockedA.consent_binding, "consent-binding-already-consumed");
+	assert.deepEqual(fixture.answers, ["declined", "declined"]);
+
 	const blockedB = await beginConsent(second, cwd, "session-b");
 	const declined = await answerConsent(second, cwd, blockedB.consent_binding, "declined", "session-b");
 	assert.equal(declined.outcome, "consent-declined-this-candidate");
@@ -426,15 +433,19 @@ test("public consent relay is session-bound, one-shot, and candidate-scoped", as
 	const staleConsumed = await answerConsent(second, cwd, blockedB.consent_binding, "declined", "session-b");
 	assert.equal(staleConsumed.operation, "answer-consent");
 	assertStaleConsentBinding(staleConsumed, blockedB.consent_binding, "consent-binding-already-consumed");
-	assert.deepEqual(fixture.answers, ["declined", "declined"]);
+	assert.deepEqual(fixture.answers, ["declined", "declined", "declined"]);
 
+	// A binding still pending when its owning session shuts down is discarded
+	// and becomes unreachable to every session -- cross-session resolution
+	// included.
+	const blockedShutdown = await beginConsent(first, cwd, "session-a");
 	const shutdown = first.events.get("session_shutdown");
 	assert.ok(shutdown);
 	await shutdown!({}, context(cwd, "session-a"));
 	await shutdown!({}, context(cwd, "session-a"));
-	const staleShutdown = await answerConsent(first, cwd, blockedA.consent_binding, "declined", "session-a");
+	const staleShutdown = await answerConsent(second, cwd, blockedShutdown.consent_binding, "declined", "session-b");
 	assert.equal(staleShutdown.operation, "answer-consent");
-	assertStaleConsentBinding(staleShutdown, blockedA.consent_binding, "consent-binding-unknown");
+	assertStaleConsentBinding(staleShutdown, blockedShutdown.consent_binding, "consent-binding-unknown");
 
 	writeFileSync(join(cwd, "app.ts"), "export const value = 3;\n");
 	const nextCandidate = await beginConsent(second, cwd, "session-b");
@@ -450,7 +461,7 @@ test("public consent relay is session-bound, one-shot, and candidate-scoped", as
 	const staleModeCleared = await answerConsent(second, cwd, nextCandidate.consent_binding, "declined", "session-b");
 	assert.equal(staleModeCleared.operation, "answer-consent");
 	assertStaleConsentBinding(staleModeCleared, nextCandidate.consent_binding, "consent-binding-unknown");
-	assert.equal(fixture.starts.count, 4);
+	assert.equal(fixture.starts.count, 5);
 });
 
 test("already-consumed local consent bindings reconcile exactly once with the native status transition", async (t) => {
@@ -783,18 +794,14 @@ test("native START maps only provider facts and omits absent evidence", async (t
 	assert.equal(rendered.next_transition, nextTransition);
 });
 
-test("consent completion stays authoritative when local latch recording fails", async (t) => {
+test("candidate consent completion writes no persistent asked latch", async (t) => {
 	const cwd = repository(t);
 	const fixture = consentNative(cwd);
-	const notices: Array<{ message: string; type?: string }> = [];
-	const runtime = parityRuntime(fixture.native, {
-		writeConsentLatch: () => { throw new Error("injected latch failure"); },
-	});
+	const runtime = parityRuntime(fixture.native);
 	const blocked = await beginConsent(runtime, cwd);
 	const completed = await answerConsent(runtime, cwd, blocked.consent_binding, "granted");
 	assert.equal((completed.result as { lineage_id?: string }).lineage_id, "consent-lineage");
 	assert.deepEqual(fixture.answers, ["granted"]);
-	assert.deepEqual(notices, []);
-	// The extension handler owns UI reporting; the controller's successful native
-	// result remains authoritative even when the local best-effort latch fails.
+	const commonDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, encoding: "utf8" }).trim();
+	assert.equal(existsSync(join(commonDir, "gentle-pi", "review-consent", "asked.json")), false);
 });

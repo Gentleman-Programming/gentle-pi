@@ -1,7 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
-import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
+import { NativeChoiceList } from "../lib/native-choice-list.ts";
+import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
 
 const CHOICE_TOOL_NAME = "ask_user_choice";
 const ASK_USER_CHOICE_BLOCKED_EVENT = "gentle-pi:ask-user-choice:blocked";
@@ -72,41 +74,45 @@ export default function askUserChoice(pi: ExtensionAPI): void {
 				throw new Error("ask_user_choice is unavailable outside the interactive TUI");
 			}
 
-			const items: SelectItem[] = params.options.map((option) => ({
-				value: option.value,
+			const items = params.options.map((option, index) => ({
+				id: `choice-${index}`,
 				label: option.label,
 				description: option.description,
 			}));
 			let selection: ChoiceSelection | undefined;
 			try {
 				pi.events.emit(ASK_USER_CHOICE_BLOCKED_EVENT, { active: true });
-				selection = await ctx.ui.custom<ChoiceSelection | undefined>((tui, theme, _keybindings, done) => {
-					const container = new Container();
-					container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-					container.addChild(new Text(theme.fg("accent", theme.bold(params.question)), 1, 0));
-					const list = new SelectList(items, items.length, {
+				selection = await ctx.ui.custom<ChoiceSelection | undefined>((tui, theme, keybindings, done) => {
+					const list = new NativeChoiceList(items, {
 						selectedPrefix: (text) => theme.fg("accent", text),
 						selectedText: (text) => theme.fg("accent", text),
 						description: (text) => theme.fg("muted", text),
-						scrollInfo: (text) => theme.fg("dim", text),
-						noMatch: (text) => theme.fg("warning", text),
+						hoverBackground: (text) => theme.bg("toolPendingBg", text),
+					}, keybindings);
+					const container = createNativeFullscreenInteraction({
+						keyboardTarget: list,
+						requestRender: () => tui.requestRender(),
+						mouseObserver: list.createMouseObserver(() => tui.requestRender()),
 					});
+					let completed = false;
+					const finish = (result: ChoiceSelection | undefined) => {
+						if (completed) return;
+						completed = true;
+						list.setDisabled(true);
+						done(result);
+					};
 					list.onSelect = (item) => {
 						const index = items.indexOf(item);
-						done({ value: item.value, label: item.label, index: index + 1 });
+						const option = params.options[index];
+						if (option) finish({ value: option.value, label: option.label, index: index + 1 });
 					};
-					list.onCancel = () => done(undefined);
+					list.onCancel = () => finish(undefined);
+					container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+					container.addChild(new Text(theme.fg("accent", theme.bold(params.question)), 1, 0));
 					container.addChild(list);
 					container.addChild(new Text(theme.fg("dim", "↑↓ navigate • Enter select • Esc cancel"), 1, 0));
 					container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
-					return {
-						render: (width) => container.render(width),
-						invalidate: () => container.invalidate(),
-						handleInput: (data) => {
-							list.handleInput(data);
-							tui.requestRender();
-						},
-					};
+					return container;
 				});
 			} finally {
 				pi.events.emit(ASK_USER_CHOICE_BLOCKED_EVENT, { active: false });

@@ -609,6 +609,46 @@ test("current native process boundary preserves caps, timeout classes, and sanit
 	);
 });
 
+test("authority inventory accepts compact discarded work and historical entry statuses", async () => {
+	const repository = process.cwd();
+	const discardedWork = { captured_lens_results: [], findings_present: false };
+	const statuses = ["incomplete-store-entry", "historical-pre-receipt", "invalidated"] as const;
+	const body = {
+		schema: "gentle-ai.review-authority-status/v1",
+		operation: "review/status",
+		repository,
+		complete: true,
+		authoritative: true,
+		status: "active",
+		entries: statuses.map((status) => ({
+			version: "compact-v2",
+			lineage_id: `review-${status}`,
+			path: `${repository}/.git/gentle-ai/${status}`,
+			status,
+			discarded_work: discardedWork,
+			problems: [],
+		})),
+		locks: [],
+		diagnostics: [],
+	};
+	const decoded = await client(queuedAdapter([{ stdout: JSON.stringify(body) }]).adapter).reviewStatus({ cwd: repository });
+	assert.deepEqual(decoded.entries.map((entry) => ({ status: entry.status, discardedWork: entry.discardedWork })), statuses.map((status) => ({
+		status,
+		discardedWork: { capturedLensResults: [], findingsPresent: false },
+	})));
+
+	for (const entry of [
+		{ ...body.entries[0], discarded_work: { captured_lens_results: "not-an-array", findings_present: false } },
+		{ ...body.entries[0], discarded_work: { ...discardedWork, unexpected: true } },
+		{ ...body.entries[0], status: "future-status" },
+	]) {
+		await assert.rejects(
+			() => client(queuedAdapter([{ stdout: JSON.stringify({ ...body, entries: [entry] }) }]).adapter).reviewStatus({ cwd: repository }),
+			(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE,
+		);
+	}
+});
+
 test("current review STATUS retains compact snapshot and released-lock wire fields", async (t) => {
 	const repository = process.cwd();
 	const snapshotIdentity = `sha256:${"d".repeat(64)}`;

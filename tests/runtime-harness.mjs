@@ -314,6 +314,7 @@ async function run() {
 		const capture = lastEventPi.tools.get("gentle_review_capture");
 		assert.ok(controller, "runtime must register the public status controller");
 		assert.ok(capture, "runtime must register the one-slot capture tool");
+		assert.equal(lastEventPi.tools.get("gentle_review_capture_group")?.executionMode, "sequential", "runtime must register grouped capture with bounded foreground concurrency");
 		assert.equal(controller.parameters.properties.operation.enum.includes("finalize"), false);
 		assert.equal(controller.parameters.properties.operation.enum.includes("validate"), false);
 

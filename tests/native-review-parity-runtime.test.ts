@@ -140,6 +140,8 @@ test("generated runtime decoder consumes the captured terminal closure directly"
 
 test("registered gentle_review surfaces the package-pinned Pi transport refusal before native START for a safe internal symlink candidate", async (t) => {
 	await reviewEnabledHome(t);
+	const handshakeLessEnvironment = { ...process.env };
+	delete handshakeLessEnvironment.GENTLE_PI_REVIEW_RELAY_CONTRACT;
 	const workspace = await realpath(await mkdtemp(join(tmpdir(), "gentle-pi-v215-symlink-candidate-")));
 	const repository = join(workspace, "repository");
 	t.after(async () => {
@@ -174,11 +176,15 @@ test("registered gentle_review surfaces the package-pinned Pi transport refusal 
 	// refusal happens before native START, regardless of candidate materialization.
 	const native = new NativeReviewCliV216(async (request) => {
 		if (request.arguments[0] === "review" && request.arguments[1] === "start") nativeStartReached = true;
-		const command = await run(binary, request.arguments, request.cwd, true);
+		const command = await run(binary, request.arguments, request.cwd, true, handshakeLessEnvironment);
 		return { ...command, signal: null, timedOut: false, outputLimitExceeded: false };
 	});
 	const tools = new Map<string, RegisteredController>();
-	createGentleAiExtension({ nativeReviewCli: native, candidateViews } as Parameters<typeof createGentleAiExtension>[0])({
+	// The extension declares the relay handshake in the session environment on
+	// load (gentle-pi#550). Keep registration isolated in a throwaway environment
+	// and spawn the pinned binary with an explicit handshake-less environment so
+	// ambient valid relay configuration cannot change this fixture's behavior.
+	createGentleAiExtension({ nativeReviewCli: native, candidateViews, processEnv: {} } as Parameters<typeof createGentleAiExtension>[0])({
 		on() {},
 		registerTool(definition: RegisteredController & { name: string }) { tools.set(definition.name, definition); },
 		registerCommand() {},

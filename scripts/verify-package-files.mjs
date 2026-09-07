@@ -46,6 +46,7 @@ const requiredPaths = [
   "assets/support/sdd-status-contract.md",
   "assets/support/strict-tdd.md",
   "assets/support/strict-tdd-verify.md",
+  "docs/delegated-verification.md",
   "docs/native-authority-architecture.md",
   "docs/skill-style-guide.md",
   "docs/review-integration.md",
@@ -62,6 +63,7 @@ const requiredPaths = [
 	"runtime/gentle-ai-binary.mjs",
 	"runtime/native-review-cli.mjs",
 	"runtime/review-integration-v2.mjs",
+	"runtime/review-risk-assessment.mjs",
 	"runtime/review-relay-contract.mjs",
   "scripts/check-provider-contract.mjs",
   "scripts/gentle-ai-installer.mjs",
@@ -80,16 +82,17 @@ const requiredPaths = [
   // exact bytes are pinned by the lock-driven scripts/check-provider-contract.mjs
   // drift check, which runs in the same pnpm test flow.
   "contracts/review-provider-contract-mirror/provider-contract.lock.json",
-  "contracts/review-provider-contract-mirror/v1.1.0/bundle/README.md",
-  "contracts/review-provider-contract-mirror/v1.1.0/bundle/manifest.json",
-  "contracts/review-provider-contract-mirror/v1.1.0/bundle/schemas/lens.schema.json",
-  "contracts/review-provider-contract-mirror/v1.1.0/bundle/schemas/refuter.schema.json",
-  "contracts/review-provider-contract-mirror/v1.1.0/bundle/schemas/targeted-validator.schema.json",
-  "contracts/review-provider-contract-mirror/v1.1.0/bundle/vectors/lens.json",
-  "contracts/review-provider-contract-mirror/v1.1.0/bundle/vectors/refuter.json",
-  "contracts/review-provider-contract-mirror/v1.1.0/bundle/vectors/targeted-validator.json",
-  "contracts/review-provider-contract-mirror/v1.1.0/generated/provider-capabilities.baseline.json",
-  "contracts/review-provider-contract-mirror/v1.1.0/generated/provider-roles.baseline.json",
+  "contracts/review-provider-contract-mirror/v1.2.0/bundle/README.md",
+  "contracts/review-provider-contract-mirror/v1.2.0/bundle/manifest.json",
+  "contracts/review-provider-contract-mirror/v1.2.0/bundle/orchestration/pi.md",
+  "contracts/review-provider-contract-mirror/v1.2.0/bundle/schemas/lens.schema.json",
+  "contracts/review-provider-contract-mirror/v1.2.0/bundle/schemas/refuter.schema.json",
+  "contracts/review-provider-contract-mirror/v1.2.0/bundle/schemas/targeted-validator.schema.json",
+  "contracts/review-provider-contract-mirror/v1.2.0/bundle/vectors/lens.json",
+  "contracts/review-provider-contract-mirror/v1.2.0/bundle/vectors/refuter.json",
+  "contracts/review-provider-contract-mirror/v1.2.0/bundle/vectors/targeted-validator.json",
+  "contracts/review-provider-contract-mirror/v1.2.0/generated/provider-capabilities.baseline.json",
+  "contracts/review-provider-contract-mirror/v1.2.0/generated/provider-roles.baseline.json",
   "prompts/skill-creation.md",
   "skills/_shared/review-ledger-contract.md",
   "skills/branch-pr/SKILL.md",
@@ -175,7 +178,7 @@ const contractHashes = {
   "contracts/review-integration/v2/schemas/repair.schema.json": "98a85fd45a8ae7f6211ffeeb3f9c478fa1dd1c17f385751f15f2111e6c3ab167",
   "contracts/review-integration/v2/schemas/start.schema.json": "2991e3fcca672d9257d61b6a336fb34e58b15a8e03f8a09a7adf892cae6a8085",
   "contracts/review-integration/v2/schemas/status.schema.json": "c4dcc736cfc6300560a3c4262d2d982368529d5c49d58d499552a3b0beef9212",
-  "docs/review-integration.md": "0a2a415e8bd24be61f5c6090bd0efccde0ed1b4561261be11bba197aa081f336",
+  "docs/review-integration.md": "95a3df92785bc4d9f3b99e702aaf817ae0440bd16c83218d2c3f2aca67c280fb",
 };
 
 requiredPaths.push(...Object.keys(contractHashes));
@@ -333,7 +336,7 @@ async function main() {
   });
 
   if (driftedContracts.length > 0) {
-    console.error("gentle-pi packaged review-integration/v1 and review-integration/v2 contract bytes drifted from the pinned v2.5.0 runtime's vendored Gentle AI contract artifacts:");
+    console.error("gentle-pi packaged review-integration/v1 and review-integration/v2 contract bytes drifted from the pinned v2.6.0 runtime's vendored Gentle AI contract artifacts:");
     for (const drift of driftedContracts) console.error(`- ${drift.relativePath}: expected ${drift.expected}, got ${drift.actual}`);
     process.exit(1);
   }
@@ -378,7 +381,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log(`gentle-pi package resource check passed (${requiredPaths.length} files; ${Object.keys(contractHashes).length} exact byte-pinned contract artifacts for the v2.5.0 runtime).`);
+  console.log(`gentle-pi package resource check passed (${requiredPaths.length} files; ${Object.keys(contractHashes).length} exact byte-pinned contract artifacts for the v2.6.0 runtime).`);
 }
 
 const isMainModule = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;

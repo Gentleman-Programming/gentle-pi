@@ -18,7 +18,12 @@ import {
 	resolveReviewHostRelayPiTimeoutMs,
 	resolveReviewHostRelaySubmission,
 	reviewHostRelaySlots,
+	prepareReviewHostRelaySlot,
+	runReviewHostRelayReviewerGroup,
 	runReviewHostRelaySlot,
+	submitReviewHostRelayPreparedResult,
+	type ReviewHostRelayPreparedResult,
+	type ReviewHostRelayRequest,
 } from "../lib/review-host-relay.ts";
 import { GENTLE_PI_REVIEW_RELAY_CONTRACT, GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV } from "../lib/review-relay-contract.ts";
 import { decodeReviewNextTransitionV3, type ReviewCaptureSubmissionV1, type ReviewCollectInputV3 } from "../lib/review-integration-v2.ts";
@@ -47,6 +52,8 @@ const inputToken = argv.find((token) => token === "--input" || token.startsWith(
 if (inputToken !== undefined) {
 	const mode = process.env.RELAY_FAKE_SUBMIT_MODE || "ok";
 	const inputPath = inputToken.startsWith("--input=") ? inputToken.slice("--input=".length) : argv[argv.indexOf("--input") + 1];
+	const submitDelayMs = Number(process.env.RELAY_FAKE_SUBMIT_DELAY_MS || "0");
+	if (Number.isSafeInteger(submitDelayMs) && submitDelayMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, submitDelayMs);
 	if (mode === "ok" || mode === "cleanup-fail") {
 		const bytes = fs.readFileSync(inputPath);
 		if (process.env.RELAY_FAKE_SUBMIT_CAPTURE) fs.writeFileSync(process.env.RELAY_FAKE_SUBMIT_CAPTURE, bytes);
@@ -95,13 +102,32 @@ process.stdin.on("data", (chunk) => chunks.push(chunk));
 process.stdin.on("end", () => {
 	const stdin = Buffer.concat(chunks);
 	if (process.env.RELAY_FAKE_PI_STDIN_CAPTURE) fs.writeFileSync(process.env.RELAY_FAKE_PI_STDIN_CAPTURE, stdin);
-	const mode = process.env.RELAY_FAKE_PI_MODE || "ok";
-	if (process.env.RELAY_FAKE_PI_BREAK_CLEANUP === "true") fs.chmodSync(path.dirname(process.cwd()), 0o500);
-	if (mode === "ok") { process.stdout.write(Buffer.from(process.env.RELAY_FAKE_PI_OUTPUT_B64 || "", "base64")); process.exit(0); }
-	if (mode === "empty") process.exit(0);
-	if (mode === "hang") { setTimeout(() => process.exit(0), 10_000); return; }
-	process.stderr.write("pi exploded\\n");
-	process.exit(4);
+	const finish = () => {
+		const mode = process.env.RELAY_FAKE_PI_MODE || "ok";
+		if (process.env.RELAY_FAKE_PI_BREAK_CLEANUP === "true") fs.chmodSync(path.dirname(process.cwd()), 0o500);
+		if (mode === "ok") { process.stdout.write(Buffer.from(process.env.RELAY_FAKE_PI_OUTPUT_B64 || "", "base64")); process.exit(0); }
+		if (mode === "empty") process.exit(0);
+		if (mode === "hang") { setTimeout(() => process.exit(0), 10_000); return; }
+		process.stderr.write("pi exploded\\n");
+		process.exit(4);
+	};
+	const barrierDirectory = process.env.RELAY_FAKE_PI_BARRIER_DIR;
+	if (barrierDirectory === undefined) { finish(); return; }
+	fs.mkdirSync(barrierDirectory, { recursive: true });
+	fs.writeFileSync(path.join(barrierDirectory, String(process.pid)), "started");
+	const expected = Number(process.env.RELAY_FAKE_PI_BARRIER_COUNT || "4");
+	const deadline = Date.now() + 1_000;
+	const releaseFile = process.env.RELAY_FAKE_PI_RELEASE_FILE;
+	const waitForGroup = () => {
+		if (fs.readdirSync(barrierDirectory).length < expected) {
+			if (Date.now() >= deadline) { process.stderr.write("reviewer barrier timed out\\n"); process.exit(5); return; }
+			setTimeout(waitForGroup, 10);
+			return;
+		}
+		if (releaseFile !== undefined && !fs.existsSync(releaseFile)) { setTimeout(waitForGroup, 10); return; }
+		finish();
+	};
+	waitForGroup();
 });
 `;
 
@@ -151,6 +177,14 @@ function readLog(path: string): Array<{ argv: string[]; contract: string | null;
 	return readFileSync(path, "utf8").split("\n").filter((line) => line.length > 0).map((line) => JSON.parse(line));
 }
 
+async function waitFor(condition: () => boolean, message: string): Promise<void> {
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		if (condition()) return;
+		await new Promise<void>((resolve) => setTimeout(resolve, 10));
+	}
+	throw new Error(message);
+}
+
 const BINDING_TOKENS = Object.freeze([
 	"--lineage=review-1d5aadacc600e167",
 	`--expected-revision=sha256:${"c".repeat(64)}`,
@@ -161,6 +195,7 @@ const BINDING_TOKENS = Object.freeze([
 	`--subject-hash=sha256:${"a".repeat(64)}`,
 ]);
 const CAPTURE_TOKENS = Object.freeze([...BINDING_TOKENS, "--agent=pi", "--materialize=true"]);
+const REVIEWER_GROUP_LENSES = ["review-risk", "review-resilience", "review-readability", "review-reliability"] as const;
 
 // The provider-owned completing form: exact operation and argument tokens
 // with one declared {{value}} substitution slot for the artifact path.
@@ -199,6 +234,20 @@ function relayRequest(fixture: RelayHarness, overrides: Record<string, unknown> 
 		...overrides,
 	};
 }
+
+function reviewerGroupRequests(fixture: RelayHarness): ReviewHostRelayRequest[] {
+	return REVIEWER_GROUP_LENSES.map((lens, order) => relayRequest(fixture, {
+		captureArgumentTokens: CAPTURE_TOKENS.map((token) => token === "--lens=review-reliability"
+			? `--lens=${lens}`
+			: token === "--order=0" ? `--order=${order}` : token),
+		environment: {
+			...fixture.environment,
+			RELAY_FAKE_PROMPT_B64: PROMPT_BYTES.toString("base64"),
+			RELAY_FAKE_PI_OUTPUT_B64: PI_OUTPUT_BYTES.toString("base64"),
+		},
+	}));
+}
+
 
 async function rejectsWithRelayError(promise: Promise<unknown>, kind: string, stage: string): Promise<ReviewHostRelayError> {
 	let caught: ReviewHostRelayError | undefined;
@@ -303,6 +352,145 @@ test("the pi lockdown argv is pinned exactly with no model or provider selection
 	assert.deepEqual([...REVIEW_HOST_RELAY_PI_ARGV], expected);
 	assert.deepEqual(piCalls[0]!.argv, expected);
 	assert.equal(piCalls[0]!.argv.some((token) => token.startsWith("--model") || token.startsWith("--provider") || token.startsWith("--profile")), false);
+});
+
+test("preparation snapshots mutable submission tokens and values before materialization", async (t) => {
+	const fixture = harness(t);
+	const barrierDirectory = join(fixture.directory, "submission-snapshot-barrier");
+	const releaseFile = join(fixture.directory, "submission-snapshot-release");
+	const submissionTokens = [...SUBMISSION.argumentTokens];
+	const submissionValues = SUBMISSION.values.map((value) => ({ ...value }));
+	const submission: ReviewCaptureSubmissionV1 = { ...SUBMISSION, argumentTokens: submissionTokens, values: submissionValues };
+	const prepared = prepareReviewHostRelaySlot(relayRequest(fixture, {
+		submission,
+		environment: {
+			...fixture.environment,
+			RELAY_FAKE_PROMPT_B64: PROMPT_BYTES.toString("base64"),
+			RELAY_FAKE_PI_OUTPUT_B64: PI_OUTPUT_BYTES.toString("base64"),
+			RELAY_FAKE_PI_BARRIER_DIR: barrierDirectory,
+			RELAY_FAKE_PI_BARRIER_COUNT: "1",
+			RELAY_FAKE_PI_RELEASE_FILE: releaseFile,
+		},
+	}));
+	await waitFor(() => readLog(fixture.piLogPath).length === 1, "reviewer did not reach the snapshot barrier");
+	submissionTokens[submissionTokens.length - 1] = "--input=mutated";
+	submissionValues[0]!.slot = "mutated";
+	writeFileSync(releaseFile, "release");
+
+	const result = await prepared;
+	assert.deepEqual(result.request.submission, SUBMISSION);
+	await submitReviewHostRelayPreparedResult(result);
+	assert.deepEqual(readFileSync(fixture.submitCapturePath), PI_OUTPUT_BYTES);
+});
+
+test("preparation keeps reviewer bytes private through deferred submission", async (t) => {
+	const fixture = harness(t);
+	const reviewerBytes = Buffer.from(PI_OUTPUT_BYTES);
+	const prepared = await prepareReviewHostRelaySlot(relayRequest(fixture), async () => ({
+		stdout: reviewerBytes,
+		promptByteLength: PROMPT_BYTES.length,
+		stdoutByteLength: reviewerBytes.length,
+	}));
+	reviewerBytes.fill(0);
+	const mutablePrepared = prepared as unknown as { resultBytes?: Buffer };
+	mutablePrepared.resultBytes?.fill(0);
+	assert.throws(() => { mutablePrepared.resultBytes = Buffer.from("fabricated"); }, TypeError);
+	await submitReviewHostRelayPreparedResult(prepared);
+	assert.deepEqual(readFileSync(fixture.submitCapturePath), PI_OUTPUT_BYTES);
+
+	const fabricated = { ...prepared, resultBytes: Buffer.from("fabricated") } as unknown as ReviewHostRelayPreparedResult;
+	await assert.rejects(submitReviewHostRelayPreparedResult(fabricated), /recognized prepared result/);
+	assert.equal(readLog(fixture.logPath).length, 2, "unrecognized results must not launch provider submission");
+});
+
+test("the supplied AbortSignal stays live through deferred submission", async (t) => {
+	const fixture = harness(t, { RELAY_FAKE_SUBMIT_DELAY_MS: "1000" });
+	const controller = new AbortController();
+	const prepared = await prepareReviewHostRelaySlot(relayRequest(fixture, { signal: controller.signal }));
+	const submission = submitReviewHostRelayPreparedResult(prepared);
+	await waitFor(() => readLog(fixture.logPath).length === 2, "submission did not start");
+	controller.abort();
+	await rejectsWithRelayError(submission, REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit");
+});
+
+test("four reviewers cross a shared barrier before any result submission can begin", async (t) => {
+	const fixture = harness(t);
+	const barrierDirectory = join(fixture.directory, "reviewer-barrier");
+	const requests = reviewerGroupRequests(fixture).map((request) => ({
+		...request,
+		environment: {
+			...request.environment,
+			RELAY_FAKE_PI_BARRIER_DIR: barrierDirectory,
+			RELAY_FAKE_PI_BARRIER_COUNT: String(REVIEWER_GROUP_LENSES.length),
+		},
+	}));
+
+	const prepared = await runReviewHostRelayReviewerGroup(requests);
+
+	assert.equal(prepared.length, REVIEWER_GROUP_LENSES.length);
+	assert.ok(prepared.every((result) => result.resultByteLength === PI_OUTPUT_BYTES.length));
+	assert.equal(readLog(fixture.piLogPath).length, REVIEWER_GROUP_LENSES.length);
+	assert.equal(readLog(fixture.logPath).length, REVIEWER_GROUP_LENSES.length, "preparation materializes only; it does not submit");
+});
+
+test("four reviewer results retain provider order when their preparation resolves in reverse", async (t) => {
+	const requests = reviewerGroupRequests(harness(t));
+	const started: number[] = [];
+	const complete: Array<() => void> = [];
+	const group = runReviewHostRelayReviewerGroup(requests, (request) => new Promise<ReviewHostRelayPreparedResult>((resolve) => {
+		const index = requests.indexOf(request);
+		assert.notEqual(index, -1);
+		started.push(index);
+		complete.push(() => resolve({
+			request,
+			promptByteLength: index + 1,
+			resultByteLength: index + 1,
+		}));
+	}));
+
+	assert.deepEqual(started, [0, 1, 2, 3], "every reviewer starts before the group waits");
+	for (const finish of [...complete].reverse()) finish();
+	const prepared = await group;
+
+	assert.deepEqual(prepared.map((result) => result.resultByteLength), [1, 2, 3, 4]);
+});
+
+test("partial reviewer failures wait for a later pending transport and report the first provider-ordered error", async (t) => {
+	const requests = reviewerGroupRequests(harness(t));
+	const started: number[] = [];
+	let groupSettled = false;
+	let releaseLaterReviewer: (() => void) | undefined, rejectFirstProvider: ((reason?: unknown) => void) | undefined;
+	const firstProviderError = new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_FAILED, "pi", "first provider error");
+
+	const group = runReviewHostRelayReviewerGroup(requests, (request) => {
+		const index = requests.indexOf(request);
+		assert.notEqual(index, -1);
+		started.push(index);
+		if (index === 1) return new Promise<ReviewHostRelayPreparedResult>((_resolve, reject) => { rejectFirstProvider = reject; });
+		if (index === 2) return Promise.reject(new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_FAILED, "pi", "later provider error"));
+		if (index === 3) {
+			return new Promise<ReviewHostRelayPreparedResult>((resolve) => {
+				releaseLaterReviewer = () => resolve({
+					request,
+					promptByteLength: index + 1,
+					resultByteLength: index + 1,
+				});
+			});
+		}
+		return Promise.resolve({
+			request,
+			promptByteLength: index + 1,
+			resultByteLength: index + 1,
+		});
+	});
+	void group.then(() => { groupSettled = true; }, () => { groupSettled = true; });
+
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.deepEqual(started, [0, 1, 2, 3], "one failed reviewer does not prevent later reviewers from starting");
+	rejectFirstProvider!(firstProviderError); await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(groupSettled, false, "the group must remain pending until the later reviewer settles");
+	releaseLaterReviewer!();
+	await assert.rejects(group, (error: unknown) => error === firstProviderError);
 });
 
 // ---------------------------------------------------------------------------

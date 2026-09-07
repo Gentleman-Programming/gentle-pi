@@ -14,5 +14,6 @@ blockExoticSubdeps: true
 
 allowBuilds:
   '@google/genai': true
+  esbuild: false
   koffi: true
   protobufjs: true

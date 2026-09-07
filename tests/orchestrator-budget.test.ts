@@ -114,8 +114,21 @@ function measureOrchestratorPromptBytes(assetsDir: string): number {
 // 2.2 — Byte budget (Spec: Always-On Injection Byte Budget)
 // ---------------------------------------------------------------------------
 
+// gentle-pi#661: `renderOrchestratorPrompt`/`getOrchestratorPrompt` default
+// `rddStatusLine` to the "unknown (native status unavailable)" line -- the
+// longest of the three renderable RDD status lines -- precisely so that a
+// no-argument call renders the worst case this budget measures, not a
+// smaller placeholder that production would later exceed. Assert that line
+// is actually present so a future default change cannot silently start
+// measuring a shorter render again.
+const RDD_WORST_CASE_LINE = "Receipt-driven development: unknown (native status unavailable)";
+
 test("getOrchestratorPrompt return value stays within the canonical 8,192 B budget at a short assets root", () => {
 	const rendered = __testing.renderOrchestratorPrompt(representativeProductionAssetsDir);
+	assert.ok(
+		rendered.includes(RDD_WORST_CASE_LINE),
+		"the default render must include the worst-case RDD status line to measure the real production budget",
+	);
 	const bytes = Buffer.byteLength(rendered, "utf8");
 	assert.ok(
 		bytes <= BUDGET_BYTES,
@@ -125,6 +138,10 @@ test("getOrchestratorPrompt return value stays within the canonical 8,192 B budg
 
 test(`getOrchestratorPrompt keeps a controlled long (>= ${MIN_CONTROLLED_LONG_ASSETS_ROOT_CHARS} char) assets root within the canonical budget`, () => {
 	const rendered = __testing.renderOrchestratorPrompt(controlledLongAssetsDir);
+	assert.ok(
+		rendered.includes(RDD_WORST_CASE_LINE),
+		"the default render must include the worst-case RDD status line to measure the real production budget",
+	);
 	const bytes = measureOrchestratorPromptBytes(controlledLongAssetsDir);
 	assert.equal(bytes, Buffer.byteLength(rendered, "utf8"), "child-process and direct render byte counts must match");
 	assert.ok(
@@ -347,8 +364,8 @@ test("core-alone: load-bearing direct-delegation tokens remain without lazy unio
 
 test("core-alone: dynamic Gentle AI ownership replaces package lifecycle instructions", () => {
 	const core = readRealAsset("orchestrator.md");
-	assert.match(core, /dynamically supplies runtime-specific RDD instructions via generated Pi APPEND_SYSTEM composition/);
-	assert.match(core, /if absent or unsupported, this package does not invent or fall back/);
+	assert.match(core, /injects the mirrored provider-bundle review execution contract into this session's system prompt at start/);
+	assert.match(core, /Absent that mirrored contract, this package invents no lifecycle instructions/);
 	assert.doesNotMatch(core, /start -> finalize -> validate/i);
 	assert.doesNotMatch(core, /receipt validation/i);
 });
@@ -419,4 +436,56 @@ test("getOrchestratorPrompt memoizes the return across calls", () => {
 	const first = __testing.getOrchestratorPrompt();
 	const second = __testing.getOrchestratorPrompt();
 	assert.equal(second, first, "second call must return the memoized string");
+});
+
+// ---------------------------------------------------------------------------
+// gentle-pi#661 follow-up: byte-budget compression must not turn a pointer
+// into an opaque "Detail: `file.md`" -- each pointer line must still name
+// the lazy-loaded material it points to, in the shortest form that still
+// says what is over there.
+// ---------------------------------------------------------------------------
+
+test("every compressed lazy-file pointer in the core still names the material it points to", () => {
+	const core = readFileSync(join(REAL_ASSETS_DIR, "orchestrator.md"), "utf8");
+	// One-sentence "<named material>: `file.md`." pointers, compressed for the
+	// byte budget -- each must keep naming what is over there, not collapse
+	// to an opaque "Detail: `file.md`.".
+	const namedPointers: ReadonlyArray<{ file: string; mustName: readonly string[] }> = [
+		{
+			file: "orchestrator-delegation.md",
+			mustName: ["Per-action table", "Work Routing Ladder", "Canonical Workflows", "blocking-prompt relays"],
+		},
+		{
+			file: "orchestrator-memory.md",
+			mustName: ["Phase table", "artifact keys"],
+		},
+		{
+			file: "orchestrator-skills.md",
+			mustName: ["Discovery order", "intent hints"],
+		},
+	];
+	for (const { file, mustName } of namedPointers) {
+		// The pointer sentence: from the previous sentence boundary up to and
+		// including the backtick-quoted filename. `orchestrator-delegation.md`
+		// is referenced more than once in the core (a language-boundary pointer
+		// earlier, this compressed per-action pointer later) -- take the LAST
+		// occurrence, which is the one under test here.
+		const fileToken = `\`${file}\``;
+		const fileIndex = core.lastIndexOf(fileToken);
+		assert.ok(fileIndex >= 0, `core is missing a pointer to ${file}`);
+		const sentenceStart = core.lastIndexOf(".", fileIndex);
+		const pointerSentence = core.slice(sentenceStart + 1, fileIndex + fileToken.length);
+		for (const name of mustName) {
+			assert.ok(
+				pointerSentence.includes(name),
+				`the pointer to ${file} must name "${name}", got: ${JSON.stringify(pointerSentence.trim())}`,
+			);
+		}
+	}
+	// The SDD workflow pointer was never compressed to a bare filename; its
+	// surrounding paragraphs already name the material at length.
+	assert.match(
+		core,
+		/SDD phases, native dispatcher rules, status contract, preflight\/init guards, artifact-store policy, execution mode, Strict TDD forwarding, phase result contract, and review workload guard/,
+	);
 });

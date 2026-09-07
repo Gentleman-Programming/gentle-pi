@@ -35,6 +35,16 @@ function fixtureEntries(): Map<string, Buffer> {
 	return new Map(FIXTURE_PATHS.map((path) => [path, readFileSync(join(FIXTURE_ROOT, path))]));
 }
 
+// Fixture provenance: the real gentle-ai provider contract bundle 1.2.0
+// release archive (contract semver 1.2.0), extracted. Adds `orchestration`
+// to the manifest: gentle-pi#560 / gentle-ai#4056, #4057.
+const FIXTURE_1_2_0_ROOT = join(import.meta.dirname, "fixtures", "provider-contract-bundle", "v1.2.0");
+const FIXTURE_1_2_0_PATHS = [...FIXTURE_PATHS, "orchestration/pi.md"] as const;
+
+function fixture120Entries(): Map<string, Buffer> {
+	return new Map(FIXTURE_1_2_0_PATHS.map((path) => [path, readFileSync(join(FIXTURE_1_2_0_ROOT, path))]));
+}
+
 function sha256Hex(bytes: Buffer): string {
 	return createHash("sha256").update(bytes).digest("hex");
 }
@@ -177,9 +187,23 @@ test("generated baselines project roles, capabilities, and runtime registration 
 	assert.equal(capabilities.transport_capability, PROVIDER_TRANSPORT_CAPABILITY);
 	assert.deepEqual(capabilities.mandatory_capabilities, [PROVIDER_TRANSPORT_CAPABILITY]);
 	assert.equal(capabilities.pi_registered, true);
+	assert.deepEqual(capabilities.orchestration, []);
 	// Byte determinism: regenerating from the same bundle is identical.
 	const again = generateProviderContractBaselines(verifyProviderContractBundleTree(FIXTURE_ROOT));
 	assert.deepEqual([...again.entries()], [...baselines.entries()]);
+});
+
+test("generated 1.2.0 baselines record the mirrored orchestration entry", () => {
+	const bundle = verifyProviderContractBundleTree(FIXTURE_1_2_0_ROOT);
+	const baselines = generateProviderContractBaselines(bundle);
+	const capabilities = JSON.parse(baselines.get("provider-capabilities.baseline.json") as string) as { orchestration: { runtime: string; path: string; sha256: string }[] };
+	assert.deepEqual(capabilities.orchestration, [
+		{
+			runtime: PI_RUNTIME_IDENTITY,
+			path: "orchestration/pi.md",
+			sha256: bundle.entrySha256.get("orchestration/pi.md"),
+		},
+	]);
 });
 
 // --- inventory and hash rejections ---------------------------------------------
@@ -312,6 +336,58 @@ test("rejects a schema whose $id does not match the manifest result schema id", 
 			(manifest.roles as { result_schema_id: string }[])[0].result_schema_id = "https://gentle-ai.dev/schema/review/other/v1";
 		}),
 		"$id does not match",
+	);
+});
+
+// --- orchestration (contract 1.2.0) -------------------------------------------------
+
+test("verifies the 1.2.0 fixture tree and exposes the mirrored pi orchestration text", () => {
+	const bundle = verifyProviderContractBundleTree(FIXTURE_1_2_0_ROOT);
+	assert.equal(bundle.contractSemver, "1.2.0");
+	assert.deepEqual([bundle.major, bundle.minor, bundle.patch], [1, 2, 0]);
+	assert.equal(bundle.entries.size, 9);
+	assert.deepEqual([...bundle.orchestration.keys()], [PI_RUNTIME_IDENTITY]);
+	const piText = bundle.orchestration.get(PI_RUNTIME_IDENTITY);
+	assert.equal(piText, readFileSync(join(FIXTURE_1_2_0_ROOT, "orchestration/pi.md"), "utf8"));
+	assert.equal(bundle.entrySha256.get("orchestration/pi.md"), sha256Hex(readFileSync(join(FIXTURE_1_2_0_ROOT, "orchestration/pi.md"))));
+});
+
+test("rejects a 1.2.0 manifest without the required orchestration array", () => {
+	assertRejects(
+		withManifest(fixture120Entries(), (manifest) => {
+			delete manifest.orchestration;
+		}),
+		"manifest.orchestration is required from contract 1.2.0",
+	);
+});
+
+test("rejects a 1.2.0 orchestration entry whose runtime is not registered in manifest.runtimes", () => {
+	assertRejects(
+		withManifest(fixture120Entries(), (manifest) => {
+			const orchestration = manifest.orchestration as { runtime: string; file: { path: string } }[];
+			orchestration[0]!.runtime = "aider";
+			orchestration[0]!.file.path = "orchestration/aider.md";
+		}),
+		'manifest.orchestration[0].runtime "aider" is not registered in manifest.runtimes',
+	);
+});
+
+test("rejects a 1.2.0 orchestration entry whose file bytes do not match its manifest SHA-256", () => {
+	const entries = fixture120Entries();
+	const tampered = Buffer.from(entries.get("orchestration/pi.md") as Buffer);
+	tampered[tampered.length - 2] = 0x20;
+	entries.set("orchestration/pi.md", tampered);
+	assertRejects(entries, "does not match its manifest SHA-256");
+});
+
+test("rejects an orchestration array on a 1.1.0 manifest", () => {
+	assertRejects(
+		withManifest(fixtureEntries(), (manifest) => {
+			manifest.orchestration = [
+				{ runtime: PI_RUNTIME_IDENTITY, file: { path: "orchestration/pi.md", sha256: "0".repeat(64) } },
+			];
+		}),
+		"manifest.orchestration is not part of contract 1.1.0",
 	);
 });
 

@@ -9,11 +9,12 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { applyModelConfig } from "../extensions/gentle-ai.ts";
+import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
 import { installSddAssets } from "../lib/sdd-preflight.ts";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -261,20 +262,20 @@ test("package manifest installs pi-pretty through a wrapper without bundling nat
 	);
 });
 
-test("package verification binds the published Gentle AI v2.5.0 runtime pin", () => {
+test("package verification binds the published Gentle AI v2.6.0 runtime pin", () => {
 	const installer = readFileSync(join(PACKAGE_ROOT, "scripts", "gentle-ai-installer.mjs"), "utf8");
 	const binary = readFileSync(join(PACKAGE_ROOT, "lib", "gentle-ai-binary.ts"), "utf8");
 	const verifier = readFileSync(join(PACKAGE_ROOT, "scripts", "verify-package-files.mjs"), "utf8");
 
-	assert.match(installer, /INSTALLER_VERSION = "2\.5\.0"/);
+	assert.match(installer, /INSTALLER_VERSION = "2\.6\.0"/);
 	assert.match(installer, /GENTLE_AI_WINDOWS_SOURCE_PACKAGE.*GENTLE_AI_WINDOWS_SOURCE_MODULE/);
-	assert.match(installer, /GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM = "h1:0nvTLJFAf9ruBDwTvi\+aDrWt\/dt\/GKvUP2cFVB6c2DI="/);
+	assert.match(installer, /GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM = "h1:scGoZYnPHh4oCVqlcfQAOSpm22Ii5lmB0kBbiBKvNZk="/);
 	assert.match(installer, /GOTOOLCHAIN: "local"/);
 	assert.match(installer, /GOSUMDB: "sum\.golang\.org"/);
 	assert.match(binary, /GENTLE_AI_VERSION = INSTALLER_VERSION/);
 	assert.match(binary, /GO_SUMDB_SOURCE_BUILD/);
 	assert.match(binary, /GENTLE_AI_WINDOWS_SOURCE_MODULE_CHECKSUM/);
-	assert.match(verifier, /v2\.5\.0/);
+	assert.match(verifier, /v2\.6\.0/);
 });
 
 
@@ -895,6 +896,22 @@ test("jd-fix-agent packaged allowlist includes write tools", () => {
 	}
 });
 
+test("sdd-explore packages its CodeGraph-enabled exploration allowlist", () => {
+	const agentPath = join(PACKAGE_ROOT, "assets", "agents", "sdd-explore.md");
+	const { name, tools } = readAgentDefinition(agentPath);
+
+	assert.equal(name, "sdd-explore");
+	assert.deepEqual(tools, [
+		"read",
+		"grep",
+		"find",
+		"codegraph",
+		"edit",
+		"write",
+		"mem_save",
+	]);
+});
+
 test("gentle-ai-worker packages the exact scoped writer contract", () => {
 	const agentsDir = join(PACKAGE_ROOT, "assets", "agents");
 	const agentPath = join(agentsDir, "gentle-ai-worker.md");
@@ -1055,6 +1072,103 @@ test("installSddAssets installs gentle-ai-worker with a loader-compatible scoped
 	);
 });
 
+test("agent home resolver centralizes Gentle and Pi agent-dir precedence", () => {
+	const explicitGentleHome = mkdtempSync(join(tmpdir(), "gentle-pi-resolver-explicit-"));
+	const piAgentDir = mkdtempSync(join(tmpdir(), "gentle-pi-resolver-pi-dir-"));
+
+	try {
+		assert.equal(
+			resolveGentlePiAgentHome({
+				GENTLE_PI_AGENT_HOME: explicitGentleHome,
+				PI_CODING_AGENT_DIR: piAgentDir,
+			}),
+			explicitGentleHome,
+		);
+		assert.equal(resolveGentlePiAgentHome({ PI_CODING_AGENT_DIR: piAgentDir }), piAgentDir);
+		assert.equal(resolveGentlePiAgentHome({}), join(homedir(), ".pi", "agent"));
+		assert.equal(
+			resolveGentlePiAgentHome({ GENTLE_PI_AGENT_HOME: "", PI_CODING_AGENT_DIR: piAgentDir }),
+			piAgentDir,
+			"an empty explicit override falls through like Pi Subagents does",
+		);
+		assert.equal(
+			resolveGentlePiAgentHome({ PI_CODING_AGENT_DIR: "" }),
+			join(homedir(), ".pi", "agent"),
+			"an empty PI_CODING_AGENT_DIR falls through like Pi Subagents does",
+		);
+	} finally {
+		rmSync(explicitGentleHome, { recursive: true, force: true });
+		rmSync(piAgentDir, { recursive: true, force: true });
+	}
+});
+
+test("asset installation uses PI_CODING_AGENT_DIR as the Pi agent home when no explicit Gentle override is set", () => {
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const previousPiAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const temporaryPiAgentDir = mkdtempSync(join(tmpdir(), "gentle-pi-agent-dir-"));
+	const explicitGentleHome = mkdtempSync(join(tmpdir(), "gentle-pi-explicit-home-"));
+
+	try {
+		delete process.env.GENTLE_PI_AGENT_HOME;
+		process.env.PI_CODING_AGENT_DIR = temporaryPiAgentDir;
+
+		installSddAssets(PACKAGE_ROOT, true);
+
+		const installedPath = join(temporaryPiAgentDir, "agents", "gentle-ai-explore.md");
+		assert.ok(existsSync(installedPath), "managed agents must install where Pi Subagents reads global definitions");
+		assert.deepEqual(readAgentDefinition(installedPath).tools, MANAGED_EXEMPLAR_TOOLS);
+		assert.ok(
+			!existsSync(join(explicitGentleHome, "agents", "gentle-ai-explore.md")),
+			"the explicit override fixture must still be untouched before it is selected",
+		);
+
+		process.env.GENTLE_PI_AGENT_HOME = explicitGentleHome;
+		installSddAssets(PACKAGE_ROOT, true);
+		assert.ok(
+			existsSync(join(explicitGentleHome, "agents", "gentle-ai-explore.md")),
+			"GENTLE_PI_AGENT_HOME remains the explicit test/operator override",
+		);
+	} finally {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		if (previousPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousPiAgentDir;
+		rmSync(temporaryPiAgentDir, { recursive: true, force: true });
+		rmSync(explicitGentleHome, { recursive: true, force: true });
+	}
+});
+
+test("global model routing uses PI_CODING_AGENT_DIR for package-installed agents", () => {
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const previousPiAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const temporaryPiAgentDir = mkdtempSync(join(tmpdir(), "gentle-pi-model-agent-dir-"));
+	const temporaryProject = mkdtempSync(join(tmpdir(), "gentle-pi-model-project-"));
+
+	try {
+		delete process.env.GENTLE_PI_AGENT_HOME;
+		process.env.PI_CODING_AGENT_DIR = temporaryPiAgentDir;
+		installSddAssets(PACKAGE_ROOT, true);
+
+		const result = applyModelConfig(temporaryProject, {
+			"gentle-ai-explore": { model: "provider/model", thinking: "high" },
+		});
+
+		assert.equal(result.updated, 2);
+		const config = JSON.parse(readFileSync(join(temporaryPiAgentDir, "subagents.json"), "utf8"));
+		assert.deepEqual(config.model_profiles["gentle-ai-explore"], {
+			model: "provider/model",
+			effort: "high",
+		});
+	} finally {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		if (previousPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousPiAgentDir;
+		rmSync(temporaryPiAgentDir, { recursive: true, force: true });
+		rmSync(temporaryProject, { recursive: true, force: true });
+	}
+});
+
 test("normal and forced installation copy generic agents with complete role contracts", () => {
 	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
 	const expectedTools = {
@@ -1146,8 +1260,8 @@ test("orchestrator routes generic roles without static RDD lens routing", () => 
 	}
 
 	const core = readFileSync(join(PACKAGE_ROOT, "assets", "orchestrator.md"), "utf8");
-	assert.match(core, /Gentle AI dynamically supplies runtime-specific RDD instructions/);
-	assert.match(core, /this package does not invent or fall back/);
+	assert.match(core, /injects the mirrored provider-bundle review execution contract/);
+	assert.match(core, /this package invents no lifecycle instructions/);
 });
 
 test("pi-pretty wrapper uses real package path resolution for pnpm symlink installs", () => {
@@ -1163,9 +1277,9 @@ test("pi-pretty wrapper uses real package path resolution for pnpm symlink insta
 	assert.match(wrapper, /quietToolsEnabled/);
 });
 
-test("v2.3.0 release package and runtime stop before publication", () => {
+test("v2.4.0 release package and runtime stop before publication", () => {
 	const packageJson = readPackageJson();
-	assert.equal(packageJson.version, "2.3.0", "the release manifest must remain explicitly pinned to v2.3.0");
+	assert.equal(packageJson.version, "2.4.0", "the release manifest must remain explicitly pinned to v2.4.0");
 	assert.equal(
 		packageJson.scripts?.test,
 		"node --experimental-strip-types --test tests/*.test.ts && pnpm run check:provider-contract && pnpm run test:harness",

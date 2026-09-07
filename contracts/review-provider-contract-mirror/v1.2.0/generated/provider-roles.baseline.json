@@ -1,6 +1,6 @@
 {
   "schema": "gentle-pi.provider-contract-roles-baseline/v1",
-  "contract_semver": "1.1.0",
+  "contract_semver": "1.2.0",
   "roles": [
     {
       "id": "lens",
@@ -34,7 +34,7 @@
         "gentle-ai.provider-transport/v1"
       ],
       "schema_path": "schemas/targeted-validator.schema.json",
-      "schema_sha256": "58f5efca0fb8089a51e998d5cf07209528a6b6e3782246b34ee1e825132063a8",
+      "schema_sha256": "6a8d7b331ec6f000366017e39e0476511c3b032649c42abfe865c1e9c956510e",
       "vector_path": "vectors/targeted-validator.json",
       "vector_sha256": "7b5a5165e3a913863fb98d2ba5387811860c21333b5c37e6ed3b4e0d121cf2fa"
     }

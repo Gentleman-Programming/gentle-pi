@@ -79,7 +79,10 @@ const RISK_LEVELS = ["low", "medium", "high"] as const;
 const REVIEW_LENSES = ["review-risk", "review-resilience", "review-readability", "review-reliability"] as const;
 const RISK_REASON_CODES = ["configuration_change", "empty_content", "executable_change", "executable_mode", "hot_path", "large_change", "non_executable_only", "process_boundary", "process_scan_limit", "service_token", "shell_source"] as const;
 const RISK_SIGNALS = ["auth", "update", "security", "payments", "permissions", "shell_process"] as const;
-const STATUS_ACTIONS = ["start", "recover", "maintainer_action", "select_lineage", "repair_authority", "stop"] as const;
+// "collect" and "execute" are the v2 envelope's projection of a live
+// transaction whose next_transition is mandatory: the root action names the
+// transition kind instead of reading as a terminal stop.
+const STATUS_ACTIONS = ["start", "recover", "maintainer_action", "select_lineage", "repair_authority", "stop", "collect", "execute"] as const;
 const RECEIPT_STATUSES = ["expected_missing", "present", "publication_pending", "not_applicable"] as const;
 type ReviewReceiptStatus = (typeof RECEIPT_STATUSES)[number];
 export const REVIEW_STATUS_ACTION_DISPOSITION = {
@@ -180,6 +183,19 @@ const CAPABILITIES_SCHEMA_IDENTITIES: Readonly<Record<string, { protocolMinor: n
 	"gentle-ai.review-integration.capabilities/v2.4": Object.freeze({
 		protocolMinor: 4,
 		requiredSchemas: Object.freeze([...REQUIRED_SCHEMAS_COMMON_V23, "gentle-ai.review-integration.capabilities/v2.4", "gentle-ai.review-integration.consent/v3", "gentle-ai.review-integration.start/v4", "gentle-ai.review-integration.status/v6", "gentle-ai.review-intended-untracked-selection/v1"]),
+		requiredMandatoryFeatures: REQUIRED_MANDATORY_FEATURES_V23,
+		optionalFeatureFloor: 14,
+	}),
+	// Ground-truthed against the published v2.6.0 binary: capabilities/v2.5
+	// advertises the same required surface as v2.4 (status/v6 is still
+	// advertised for compatibility) plus the new status/v7 schema, which is a
+	// superset-checked addition, not a requirement -- decodeReviewStatusV3
+	// accepts v7 as an additive extension of v6, so the required-schema floor
+	// stays unchanged. The v2.6.0 binary advertised 15 optional features
+	// (floor stays at 14, its established minimum).
+	"gentle-ai.review-integration.capabilities/v2.5": Object.freeze({
+		protocolMinor: 5,
+		requiredSchemas: Object.freeze([...REQUIRED_SCHEMAS_COMMON_V23, "gentle-ai.review-integration.capabilities/v2.5", "gentle-ai.review-integration.consent/v3", "gentle-ai.review-integration.start/v4", "gentle-ai.review-integration.status/v6", "gentle-ai.review-intended-untracked-selection/v1"]),
 		requiredMandatoryFeatures: REQUIRED_MANDATORY_FEATURES_V23,
 		optionalFeatureFloor: 14,
 	}),
@@ -372,6 +388,8 @@ export interface ReviewStatusFrozenV1 {
 	tier: RiskLevel;
 	originalChangedLines: number;
 	correctionBudget: number;
+	/** Digest of the frozen changed-path manifest; binds manifest-less capture inputs (gentle-ai#3922). */
+	changedPathManifestSha256?: string;
 }
 
 export interface ReviewStatusReconciliationV1 {
@@ -532,6 +550,16 @@ export interface ReviewCollectInputV3 {
 	validationRequest?: ReviewTargetedValidationRequestV1;
 }
 
+// gentle-pi#627: the exact `gentle-ai sync` invocation that resolves a stale
+// managed-asset set (STATUS next_transition stop, and START's preflight
+// failure envelope both carry this same shape).
+export interface ReviewManagedAssetsContinuationV1 {
+	operation: "sync";
+	command: string;
+	agent?: string;
+	staleAssets?: readonly string[];
+}
+
 export interface ReviewNextTransitionV3 {
 	kind: "execute" | "collect" | "stop";
 	reasonCode: string;
@@ -539,6 +567,8 @@ export interface ReviewNextTransitionV3 {
 	collect?: { inputs: readonly ReviewCollectInputV3[] };
 	/** status/v5 only: the bounded correction plan request. */
 	correctionRequest?: ReviewCorrectionPlanRequestV1;
+	/** stop only, reason_code managed_assets_outdated: the sync continuation. */
+	continuation?: ReviewManagedAssetsContinuationV1;
 }
 
 export interface ReviewStatusV3 {
@@ -569,6 +599,8 @@ export interface ReviewStatusV3 {
 	repositoryContext?: ReviewRepositoryContextV2;
 	/** status/v5 only: the provider-owned request mirrored by the targeted-validator collect input. */
 	validationRequest?: ReviewTargetedValidationRequestV1;
+	/** status/v7 only: the eligible untracked-path inventory digest, absent on the `staged` projection. */
+	eligibleUntrackedInventory?: string;
 	raw: Readonly<Record<string, unknown>>;
 }
 
@@ -690,6 +722,8 @@ export interface ReviewFailureV2 {
 	causeCategory?: ReviewFailureCauseCategoryV2;
 	cause?: string;
 	context?: ReviewFailureContextV2;
+	/** code=managed_assets_outdated only: the sync continuation (gentle-pi#627). */
+	continuation?: ReviewManagedAssetsContinuationV1;
 	raw: Readonly<Record<string, unknown>>;
 }
 
@@ -1624,8 +1658,11 @@ function decodeCollectInput(value: unknown, label: string, v5: boolean, v6: bool
 	}
 
 	if (captureOperation === "review.capture-result") {
-		if (input.artifact_subject === undefined || input.base_tree === undefined || input.candidate_tree === undefined || input.changed_path_manifest === undefined) {
-			throw new TypeError(`${label} requires artifact_subject, base_tree, candidate_tree, and changed_path_manifest`);
+		// changed_path_manifest is optional here: the artifact subject's
+		// changed_path_manifest_sha256 already binds the frozen manifest, and
+		// gentle-ai stops inlining one copy per lens (gentle-ai#3922).
+		if (input.artifact_subject === undefined || input.base_tree === undefined || input.candidate_tree === undefined) {
+			throw new TypeError(`${label} requires artifact_subject, base_tree, and candidate_tree`);
 		}
 		if (schema !== "https://gentle-ai.dev/schema/review/reviewer/v1") throw new TypeError(`${label}.schema must be https://gentle-ai.dev/schema/review/reviewer/v1`);
 	} else if (input.artifact_subject !== undefined || input.base_tree !== undefined || input.candidate_tree !== undefined || input.changed_path_manifest !== undefined) {
@@ -1658,12 +1695,32 @@ function decodeCollectInput(value: unknown, label: string, v5: boolean, v6: bool
 	};
 }
 
+// gentle-pi#627: gentle-ai's managed-assets continuation (STATUS next_transition
+// stop reason_code=managed_assets_outdated, and START's preflight failure
+// envelope) names the exact `gentle-ai sync` invocation that resolves a stale
+// managed-asset set without abandoning the frozen candidate. Decoded verbatim
+// from internal/cli/review_operation_contract.go's ReviewManagedAssetsContinuation.
+export function decodeReviewManagedAssetsContinuationV1(value: unknown, label: string): ReviewManagedAssetsContinuationV1 {
+	const body = exactRecord(value, label, ["operation", "command"], ["agent", "stale_assets"]);
+	const operation = enumeration(body.operation, ["sync"] as const, `${label}.operation`);
+	const command = nonempty(body.command, `${label}.command`);
+	const agent = body.agent === undefined ? undefined : nonempty(body.agent, `${label}.agent`);
+	const staleAssets = body.stale_assets === undefined ? undefined : stringArray(body.stale_assets, `${label}.stale_assets`, { minimum: 1 });
+	return { operation, command, ...(agent === undefined ? {} : { agent }), ...(staleAssets === undefined ? {} : { staleAssets }) };
+}
+
 export function decodeReviewNextTransitionV3(value: unknown, options: { v5?: boolean; v6?: boolean } = {}): ReviewNextTransitionV3 {
 	const v6 = options.v6 === true;
 	const v5 = options.v5 === true || v6;
-	const transition = exactRecord(value, "next_transition", ["kind", "reason_code"], ["execute", "collect", ...(v5 ? ["correction_request"] : [])]);
+	const transition = exactRecord(value, "next_transition", ["kind", "reason_code"], ["execute", "collect", ...(v5 ? ["correction_request"] : []), "continuation"]);
 	const kind = enumeration(transition.kind, ["execute", "collect", "stop"] as const, "next_transition.kind");
 	const reasonCode = text(transition.reason_code, "next_transition.reason_code", { minimum: 1, pattern: /^[a-z0-9_]+$/ });
+	const continuation = transition.continuation === undefined ? undefined : decodeReviewManagedAssetsContinuationV1(transition.continuation, "next_transition.continuation");
+	// gentle-pi#627: continuation is optional on every status version an older
+	// gentle-ai may emit a managed_assets_outdated stop with no continuation at
+	// all, and decode must not refuse the whole envelope for that. When present
+	// it is only valid on a stop with this exact reason_code.
+	if (continuation !== undefined && !(kind === "stop" && reasonCode === "managed_assets_outdated")) throw new TypeError("next_transition.continuation is only valid for a stop transition with reason_code managed_assets_outdated");
 
 	// status/v5: the bounded correction plan request rides exactly its two
 	// reason codes and never any other (vendored status-v5.schema.json).
@@ -1713,7 +1770,7 @@ export function decodeReviewNextTransitionV3(value: unknown, options: { v5?: boo
 		return { kind, reasonCode, collect: { inputs }, ...(correctionRequest === undefined ? {} : { correctionRequest }) };
 	}
 	if (transition.execute !== undefined || transition.collect !== undefined) throw new TypeError("next_transition stop cannot carry a transition");
-	return { kind, reasonCode, ...(correctionRequest === undefined ? {} : { correctionRequest }) };
+	return { kind, reasonCode, ...(correctionRequest === undefined ? {} : { correctionRequest }), ...(continuation === undefined ? {} : { continuation }) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1761,15 +1818,19 @@ export function decodeReviewStatusV3(value: unknown): ReviewStatusV3 {
 	// Additive forward acceptance: status/v5 (gentle-ai main; ground-truthed
 	// against a live capture and the vendored status-v5.schema.json) is the v3
 	// key set plus the optional forecast and the v5-only next_transition
-	// surfaces. status/v6 adds the intended-untracked selection; v3 keeps
-	// rejecting every v5/v6-only field.
+	// surfaces. status/v6 adds the intended-untracked selection; status/v7
+	// (gentle-ai v2.6.0, advertised through capabilities/v2.5 alongside v6)
+	// adds only the top-level optional `eligible_untracked_inventory` digest,
+	// so it is decoded on the v6 surface. v3 keeps rejecting every v5/v6/v7-only
+	// field.
 	const schema = typeof value === "object" && value !== null ? (value as Record<string, unknown>).schema : undefined;
-	const v6 = schema === "gentle-ai.review-integration.status/v6";
+	const v7 = schema === "gentle-ai.review-integration.status/v7";
+	const v6 = v7 || schema === "gentle-ai.review-integration.status/v6";
 	const v5 = v6 || schema === "gentle-ai.review-integration.status/v5";
 	const body = exactRecord(value, "status", [
 		"schema", "contract", "operation", "applicability", "action", "replayability", "target_identity", "projection", "repair", "candidates",
-	], ["authority", "frozen", "action_disposition", "eligibility", "next_transition", "authority_target_identity", ...(v5 ? ["receipt", "forecast", "repository_context", "validation_request"] : [])]);
-	requireIdentity(body, v6 ? "gentle-ai.review-integration.status/v6" : v5 ? "gentle-ai.review-integration.status/v5" : "gentle-ai.review-integration.status/v3", REVIEW_INTEGRATION_OPERATION.STATUS);
+	], ["authority", "frozen", "action_disposition", "eligibility", "next_transition", "authority_target_identity", ...(v5 ? ["receipt", "forecast", "repository_context", "validation_request"] : []), ...(v7 ? ["eligible_untracked_inventory"] : [])]);
+	requireIdentity(body, v7 ? "gentle-ai.review-integration.status/v7" : v6 ? "gentle-ai.review-integration.status/v6" : v5 ? "gentle-ai.review-integration.status/v5" : "gentle-ai.review-integration.status/v3", REVIEW_INTEGRATION_OPERATION.STATUS);
 
 	const applicability = enumeration(body.applicability, ["current_target", "unrelated", "ambiguous", "corrupted"] as const, "status.applicability");
 	let receipt: ReviewStatusReceiptV1 | undefined;
@@ -1798,11 +1859,12 @@ export function decodeReviewStatusV3(value: unknown): ReviewStatusV3 {
 
 	let frozen: ReviewStatusFrozenV1 | undefined;
 	if (body.frozen !== undefined) {
-		const source = exactRecord(body.frozen, "status.frozen", ["tier", "original_changed_lines", "correction_budget"]);
+		const source = exactRecord(body.frozen, "status.frozen", ["tier", "original_changed_lines", "correction_budget"], ["changed_path_manifest_sha256"]);
 		frozen = {
 			tier: enumeration(source.tier, RISK_LEVELS, "status.frozen.tier"),
 			originalChangedLines: integer(source.original_changed_lines, "status.frozen.original_changed_lines"),
 			correctionBudget: integer(source.correction_budget, "status.frozen.correction_budget", 0, 200),
+			...(source.changed_path_manifest_sha256 === undefined ? {} : { changedPathManifestSha256: sha256(source.changed_path_manifest_sha256, "status.frozen.changed_path_manifest_sha256") }),
 		};
 	}
 	if (authority?.version === REVIEW_AUTHORITY_VERSION.COMPACT_V2 && frozen === undefined) throw new TypeError("compact-v2 status requires frozen metadata");
@@ -1851,6 +1913,15 @@ export function decodeReviewStatusV3(value: unknown): ReviewStatusV3 {
 		};
 	}
 
+	// status/v7 top-level optional digest (gentle-ai v2.6.0): resolves #4066's
+	// closed loop where `sdd-attempt finish` named a digest status never
+	// published. Absent on the `staged` projection, which never resolves an
+	// inventory, so it stays structurally optional rather than a required v7
+	// field.
+	const eligibleUntrackedInventory = v7 && body.eligible_untracked_inventory !== undefined
+		? sha256(body.eligible_untracked_inventory, "status.eligible_untracked_inventory")
+		: undefined;
+
 	return {
 		contract: REVIEW_INTEGRATION_CONTRACT,
 		applicability,
@@ -1869,6 +1940,7 @@ export function decodeReviewStatusV3(value: unknown): ReviewStatusV3 {
 		...(forecast === undefined ? {} : { forecast }),
 		...(repositoryContext === undefined ? {} : { repositoryContext }),
 		...(validationRequest === undefined ? {} : { validationRequest }),
+		...(eligibleUntrackedInventory === undefined ? {} : { eligibleUntrackedInventory }),
 		raw: body,
 	};
 }
@@ -2019,9 +2091,10 @@ function decodeFailureContext(value: unknown, label: string): ReviewFailureConte
 export function decodeReviewFailureV2(value: unknown): ReviewFailureV2 {
 	const body = exactRecord(value, "failure", [
 		"schema", "contract", "operation", "phase", "code", "message", "mutation_outcome", "authority_applicability", "retry_safe", "replayability", "required_inputs", "next_action",
-	], ["lineage_id", "request_digest", "progress_identity", "cause_category", "cause", "context"]);
+	], ["lineage_id", "request_digest", "progress_identity", "cause_category", "cause", "context", "continuation"]);
 	requireIdentity(body, "gentle-ai.review-integration.failure/v2");
 	const operation = enumeration(body.operation, FAILURE_OPERATIONS, "failure.operation");
+	const code = text(body.code, "failure.code", { pattern: /^[a-z0-9]+(?:_[a-z0-9]+)*$/ });
 
 	if (body.progress_identity !== undefined) {
 		if (body.lineage_id === undefined || body.request_digest === undefined) throw new TypeError("failure.progress_identity requires lineage_id and request_digest");
@@ -2030,13 +2103,18 @@ export function decodeReviewFailureV2(value: unknown): ReviewFailureV2 {
 	if (body.request_digest !== undefined && operation === REVIEW_INTEGRATION_OPERATION.REPAIR && body.progress_identity === undefined) {
 		throw new TypeError("failure.request_digest with review.repair requires progress_identity");
 	}
+	// gentle-pi#627: continuation is optional on every version — an older
+	// gentle-ai may emit managed_assets_outdated with no continuation, and
+	// decode must not refuse the whole envelope for that. When present it is
+	// only valid on this exact code.
+	if (body.continuation !== undefined && code !== "managed_assets_outdated") throw new TypeError("failure.continuation is only valid for code managed_assets_outdated");
 
 	return {
 		schema: "gentle-ai.review-integration.failure/v2",
 		contract: REVIEW_INTEGRATION_CONTRACT,
 		operation,
 		phase: enumeration(body.phase, ["preflight", "pre_native", "native_running", "native_committed", "reconciliation"] as const, "failure.phase"),
-		code: text(body.code, "failure.code", { pattern: /^[a-z0-9]+(?:_[a-z0-9]+)*$/ }),
+		code,
 		message: text(body.message, "failure.message", { minimum: 1, maximum: 240, pattern: /^[^\r\n]+$/ }),
 		mutationOutcome: enumeration(body.mutation_outcome, Object.values(REVIEW_MUTATION_OUTCOME), "failure.mutation_outcome"),
 		authorityApplicability: enumeration(body.authority_applicability, Object.values(REVIEW_AUTHORITY_APPLICABILITY), "failure.authority_applicability"),
@@ -2050,6 +2128,7 @@ export function decodeReviewFailureV2(value: unknown): ReviewFailureV2 {
 		...(body.cause_category === undefined ? {} : { causeCategory: text(body.cause_category, "failure.cause_category", { minimum: 1, pattern: /^[a-z0-9]+(?:_[a-z0-9]+)*$/ }) }),
 		...(body.cause === undefined ? {} : { cause: text(body.cause, "failure.cause", { minimum: 1, maximum: 4000, pattern: /^[^\r\n]+$/ }) }),
 		...(body.context === undefined ? {} : { context: decodeFailureContext(body.context, "failure.context") }),
+		...(body.continuation === undefined ? {} : { continuation: decodeReviewManagedAssetsContinuationV1(body.continuation, "failure.continuation") }),
 		raw: body,
 	};
 }

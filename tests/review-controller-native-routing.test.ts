@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os, { tmpdir } from "node:os";
+import { syncBuiltinESMExports } from "node:module";
+import { dirname, join, resolve, sep } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { __testing, createGentleAiExtension, PendingReviewConsentRegistry } from "../extensions/gentle-ai.ts";
@@ -94,6 +97,37 @@ function burnedAcknowledgementStatus(lineageId: string): ReviewStatusV3 {
 	burned.nextTransition = { kind: "stop", reasonCode: "approved_acknowledged" };
 	return burned;
 }
+
+// gentle-pi#627: gentle-ai reports a stale managed-asset set as a typed stop
+// carrying the exact `gentle-ai sync` invocation that resolves it.
+function managedAssetsOutdatedStatus(lineageId: string): ReviewStatusV3 {
+	const stopped = status(lineageId, [], "approved");
+	stopped.nextTransition = { kind: "stop", reasonCode: "managed_assets_outdated", continuation: { operation: "sync", command: "gentle-ai sync --agent claude-code", agent: "claude-code", staleAssets: ["orchestration/claude-code.md"] } };
+	return stopped;
+}
+
+test("STATUS renders the managed_assets_outdated continuation command as the actionable next step", async () => {
+	const lineageId = "managed-assets-outdated";
+	const native = { targetStatus: async () => managedAssetsOutdatedStatus(lineageId) } as unknown as NativeReviewCli;
+	const blocked = await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, process.cwd(), native);
+	assert.equal(blocked.status, "blocked");
+	assert.equal(blocked.hint, "run gentle-ai sync --agent claude-code");
+
+	// an unknown stop reason code keeps rendering as a plain blocked result
+	const otherStopNative = { targetStatus: async () => burnedAcknowledgementStatus(lineageId) } as unknown as NativeReviewCli;
+	const plainBlocked = await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, process.cwd(), otherStopNative);
+	assert.equal(plainBlocked.status, "blocked");
+	assert.equal(plainBlocked.hint, undefined);
+
+	// an older gentle-ai may report this same stop with no continuation; the
+	// renderer degrades to a plain blocked result instead of losing the status
+	const noContinuation = status(lineageId, [], "approved");
+	noContinuation.nextTransition = { kind: "stop", reasonCode: "managed_assets_outdated" };
+	const noContinuationNative = { targetStatus: async () => noContinuation } as unknown as NativeReviewCli;
+	const degraded = await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, process.cwd(), noContinuationNative);
+	assert.equal(degraded.status, "blocked");
+	assert.equal(degraded.hint, undefined);
+});
 
 test("public acknowledgement relays one current provider vector and never replays after authority burn", async () => {
 	const lineageId = "acknowledge-approved";
@@ -423,6 +457,72 @@ test("REPAIR retains frozen committed collect selectors and leaves workspace rou
 	assert.deepEqual(workspaceRequests, [{ cwd, lineageId: workspaceLineage }]);
 });
 
+test("selectorless STATUS resumes a retained committed correction lineage", async (t) => {
+	const candidateViews = new CandidateViewRegistry();
+	t.after(() => candidateViews.cleanupAll());
+	const cwd = repository(t);
+	const lineageId = "retained-committed-correction";
+	const view = candidateViews.create({
+		contributorRoot: cwd,
+		baseRef: execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim(),
+		committedOnly: true,
+	});
+	candidateViews.retain(view.token, lineageId);
+	const frozenTarget = candidateViews.resolveProjection(lineageId, cwd);
+	const requests: Array<Record<string, unknown>> = [];
+	const selections = new Map();
+	let captures = 0;
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => {
+			requests.push(request);
+			return status(lineageId, [correctionPlanInput(lineageId)], "correction_required");
+		},
+		captureCorrectionPlan: async () => {
+			captures += 1;
+			return { schema: "gentle-ai.review-last-event-closure/v1", operation: "review.capture-correction-plan", lineageId, state: "correction_required", storeRevision: SHA };
+		},
+	} as unknown as NativeReviewCli;
+
+	const listed = await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, cwd, native, undefined, candidateViews, undefined, selections);
+	const captured = await __testing.executeReviewCaptureOperation({ lineageId, collectBinding: bindingOf(listed), correctionLines: 1 }, cwd, native, undefined, candidateViews, selections, true);
+
+	assert.equal(captured.outcome, "native-last-event-closure");
+	assert.equal(captures, 1);
+	assert.deepEqual(requests, Array.from({ length: 2 }, () => ({ cwd, lineageId, agent: "pi", baseRef: frozenTarget.baseCommit, committedOnly: true })));
+});
+
+test("selectorless STATUS uses a retained committed selector only at its retained workspace", async (t) => {
+	const candidateViews = new CandidateViewRegistry();
+	t.after(() => candidateViews.cleanupAll());
+	const retainedRoot = repository(t);
+	const otherRoot = repository(t);
+	const lineageId = "retained-selector-boundary";
+	const view = candidateViews.create({
+		contributorRoot: retainedRoot,
+		baseRef: execFileSync("git", ["rev-parse", "HEAD"], { cwd: retainedRoot, encoding: "utf8" }).trim(),
+		committedOnly: true,
+	});
+	candidateViews.retain(view.token, lineageId);
+	const frozenTarget = candidateViews.resolveProjection(lineageId, retainedRoot);
+	const requests: Array<Record<string, unknown>> = [];
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => {
+			requests.push(request);
+			return status(String(request.lineageId ?? "unretained"));
+		},
+	} as unknown as NativeReviewCli;
+
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId, input: JSON.stringify({ baseRef: "explicit-base", committedOnly: true }) }, retainedRoot, native, undefined, candidateViews);
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId: "unretained" }, retainedRoot, native, undefined, candidateViews);
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, otherRoot, native, undefined, candidateViews);
+
+	assert.deepEqual(requests, [
+		{ cwd: retainedRoot, lineageId, agent: "pi", baseRef: "explicit-base", committedOnly: true },
+		{ cwd: retainedRoot, lineageId: "unretained", agent: "pi" },
+		{ cwd: retainedRoot, lineageId, agent: "pi", baseRef: frozenTarget.baseCommit, committedOnly: true },
+	]);
+});
+
 test("STATUS preserves retained intended-untracked selection through selectorless same-lineage replacement collection", async () => {
 	const cwd = process.cwd();
 	const lineageId = "selectorless-replacement";
@@ -638,6 +738,94 @@ function repository(t: test.TestContext): string {
 	return cwd;
 }
 
+test("candidate lifecycle sweeps startup and cleans every shutdown including reload", async (t) => {
+	const cwd = repository(t);
+	for (const key of ["HOME", "GENTLE_PI_AGENT_HOME", "PI_CODING_AGENT_DIR", "GENTLE_PI_CONFIG_HOME", "GENTLE_PI_GENTLE_AI_DEV_BINARY"]) {
+		const previous = process.env[key];
+		process.env[key] = key === "GENTLE_PI_GENTLE_AI_DEV_BINARY" ? "" : join(cwd, key);
+		if (process.env[key]) mkdirSync(process.env[key]!, { recursive: true });
+		t.after(() => { if (previous === undefined) delete process.env[key]; else process.env[key] = previous; });
+	}
+	t.mock.method(os, "homedir", () => join(cwd, "HOME"));
+	const homeAgent = join(cwd, "HOME", ".agents", "isolation-probe.md");
+	mkdirSync(dirname(homeAgent), { recursive: true });
+	writeFileSync(homeAgent, "---\nname: isolation-probe\ndescription: Fixture\n---\n");
+	writeFileSync(join(cwd, "GENTLE_PI_CONFIG_HOME", "models.json"), JSON.stringify({ "isolation-probe": { model: "fixture/model" } }));
+	t.diagnostic(`startup routing: cwd=${cwd}; HOME, GENTLE_PI_AGENT_HOME, PI_CODING_AGENT_DIR, GENTLE_PI_CONFIG_HOME are same-named children; dev-binary override disabled`);
+	const calls: string[] = [];
+	const destinations: string[] = [];
+	const violations: string[] = [];
+	const discovery: string[] = [];
+	const assets = resolve("assets");
+	const inside = (root: string, path: string) => path === root || path.startsWith(`${root}${sep}`);
+	const originalExists = fs.existsSync;
+	const originalRealpath = fs.realpathSync;
+	// Install guards BEFORE startup, including RED: a swallowed startup error
+	// must never hide an attempted external write or read real-home contents.
+	for (const [module, names] of [
+		[fs, ["existsSync", "lstatSync", "readdirSync", "readFileSync", "mkdirSync", "writeFileSync", "rmSync"]],
+		[fsp, ["access", "readdir", "readFile", "mkdir", "writeFile"]],
+	] as const) {
+		for (const name of names) {
+			const original = (module as any)[name];
+			t.mock.method(module as any, name, (value: string, ...args: unknown[]) => {
+				const path = resolve(value);
+				const writes = /^(mkdir|writeFile|rm)/.test(name);
+				const allowed = inside(cwd, path) || (!writes && inside(assets, path));
+				if (!allowed && name === "existsSync") return false;
+				if (!allowed && ["access", "readdir"].includes(name)) return Promise.reject(Object.assign(new Error("fixture discovery boundary"), { code: "ENOENT" }));
+				if (!allowed) { violations.push(`${name}:${path}`); throw new Error("fixture filesystem boundary"); }
+				if (writes) {
+					let ancestor = path;
+					while (!originalExists(ancestor)) ancestor = dirname(ancestor);
+					assert.ok(inside(cwd, originalRealpath(ancestor)), "write ancestor escaped fixture");
+					destinations.push(path);
+				}
+				if (name.startsWith("readdir")) discovery.push(path);
+				return original(value, ...args);
+			});
+		}
+	}
+	syncBuiltinESMExports();
+	// Prove the guard refuses an escape without performing the attempted write.
+	const escape = join(cwd, "..", "startup-isolation-escape");
+	assert.throws(() => fs.writeFileSync(escape, "blocked"), /fixture filesystem boundary/);
+	assert.deepEqual(violations, [`writeFileSync:${escape}`]);
+	violations.length = 0;
+	const hooks = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
+	const registry = new CandidateViewRegistry();
+	t.mock.method(registry, "sweepOrphans", (root: string) => { assert.equal(root, cwd); calls.push("sweep"); });
+	t.mock.method(registry, "cleanupAll", () => { calls.push("cleanup"); });
+	createGentleAiExtension({ nativeReviewCli: null, candidateViews: registry, processEnv: {} })({
+		on(name: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
+			hooks.set(name, [...(hooks.get(name) ?? []), handler]);
+		},
+		registerTool() {}, registerCommand() {},
+	} as unknown as ExtensionAPI);
+	try {
+		assert.equal(hooks.get("session_start")?.length, 1);
+		await hooks.get("session_start")![0]!({ reason: "startup" }, reviewContext(cwd));
+		assert.deepEqual(violations, []);
+		assert.ok(destinations.length > 0, "startup must actually write fixture assets");
+		assert.ok(discovery.includes(join(cwd, "HOME", ".agents")), "home agent discovery must use the fixture");
+		assert.equal(existsSync(join(cwd, "GENTLE_PI_AGENT_HOME", "gentle-ai", "managed-assets.json")), true);
+		assert.match(readFileSync(homeAgent, "utf8"), /model: fixture\/model/);
+		assert.ok(destinations.includes(homeAgent), "the discovered fixture agent must actually receive routing");
+		assert.ok(destinations.includes(join(cwd, "GENTLE_PI_AGENT_HOME", "subagents.json")));
+		t.diagnostic(`confined startup: ${destinations.length} filesystem mutations; fixture home-agent routing and managed-assets manifest verified; external violations=0`);
+		assert.deepEqual(calls, ["sweep"]);
+	} finally {
+		// Restore only mocks before fixture teardown; never clean external paths.
+		t.mock.restoreAll();
+		syncBuiltinESMExports();
+	}
+	t.mock.method(registry, "cleanupAll", () => { calls.push("cleanup"); });
+	for (const reason of ["quit", "reload", "new", "resume", "fork"]) {
+		for (const hook of hooks.get("session_shutdown")!) await hook({ reason }, reviewContext(cwd));
+	}
+	assert.deepEqual(calls, ["sweep", ...Array(5).fill("cleanup")]);
+});
+
 interface RegisteredControllerTool {
 	execute: (toolCallId: string, params: unknown, signal: AbortSignal | undefined, onUpdate: undefined, ctx: ExtensionContext) => Promise<{ details?: unknown }>;
 }
@@ -722,7 +910,7 @@ test("ordinary START binds the native workspace candidate and returns the native
 	assert.equal(startCalls, 1);
 });
 
-test("pre-lineage intended-untracked selection revalidates and starts at an explicit workspace root", async (t) => {
+for (const statusSchema of ["gentle-ai.review-integration.status/v6", "gentle-ai.review-integration.status/v7"]) test(`pre-lineage intended-untracked selection revalidates and starts at an explicit workspace root (${statusSchema})`, async (t) => {
 	const cwd = realpathSync(repository(t)), sessionCwd = repository(t), eligible = "selected.md";
 	writeFileSync(join(cwd, eligible), "selected\n");
 	const initialTarget = startStatus(cwd), target = startStatus(cwd, undefined, [eligible]);
@@ -735,7 +923,7 @@ test("pre-lineage intended-untracked selection revalidates and starts at an expl
 		],
 		submission: { operationToken: "status", argumentTokens: ["--contract=gentle-ai.review-integration/v2", "--next-transition=true", "--agent=pi", "--projection=workspace", "--intended-untracked-selection={{value}}"], values: [{ slot: "intended_untracked_selection", domain: "schema_bound_json", schema: "gentle-ai.review-intended-untracked-selection/v1", substitutionLocation: 4 }] },
 	};
-	const initial = { ...initialTarget, nextTransition: { kind: "collect", reasonCode: "intended_untracked_selection_required", collect: { inputs: [selection] } }, raw: { schema: "gentle-ai.review-integration.status/v6" } } as ReviewStatusV3;
+	const initial = { ...initialTarget, nextTransition: { kind: "collect", reasonCode: "intended_untracked_selection_required", collect: { inputs: [selection] } }, raw: { schema: statusSchema } } as ReviewStatusV3;
 	const requests: Array<Record<string, unknown>> = [], starts: Array<Record<string, unknown>> = [], retained = new Map();
 	const native = {
 		reviewMode: async () => ({ operation: "status", scope: "clone", status: { global: "on", cloneLocal: "on", effective: "on", source: "clone_local" } }),
@@ -776,6 +964,22 @@ test("ordinary START relays native consent without authoring or advancing it", a
 	assert.equal(result.outcome, "native-review-consent-required");
 	assert.equal(typeof result.consent_binding, "string");
 	assert.equal(result.mutation_outcome, "none");
+});
+
+test("shutdown preserves failed consent candidates without interrupting session teardown", async (t) => {
+	const cwd = repository(t);
+	const consent = decodeReviewConsentV3(JSON.parse(readFileSync(join(process.cwd(), "tests", "fixtures", "devbinary", "consent-v3.captured.json"), "utf8")));
+	const native = {
+		targetStatus: async () => startStatus(cwd),
+		start: async () => { throw new NativeReviewConsentRequiredError(consent); },
+	} as unknown as NativeReviewCli;
+	const registry = new CandidateViewRegistry();
+	const runtime = reviewRuntime(native, registry);
+	const ctx = reviewContext(cwd);
+	const result = await runtime.controller.execute("pending", { operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, undefined, undefined, ctx);
+	assert.equal((result.details as { outcome: string }).outcome, "native-review-consent-required");
+	t.mock.method(registry, "cleanup", () => { throw new Error("fixture unsafe ownership"); });
+	assert.doesNotThrow(() => runtime.sessionShutdown({ reason: "reload" }, ctx));
 });
 
 test("ordinary START obeys the review-mode kill switch before target STATUS", async () => {
@@ -1218,6 +1422,119 @@ test("ordinary START refuses a target projection that no longer matches the froz
 	assert.equal(result.outcome, "native-operation-failed");
 	assert.equal(result.mutation_outcome, "none");
 	assert.equal(startCalls, 0);
+});
+
+// gentle-pi#455: a consent binding one active Pi session's START created must
+// be answerable from another active session presenting the same opaque
+// binding id -- consent bindings are not partitioned by which session's
+// START created them, only by the repository and candidate they are scoped to.
+test("answer-consent resolves a valid binding presented by a different active Pi session", async (t) => {
+	const cwd = repository(t);
+	const consent = decodeReviewConsentV3(JSON.parse(readFileSync(join(process.cwd(), "tests", "fixtures", "devbinary", "consent-v3.captured.json"), "utf8")));
+	const registry = new PendingReviewConsentRegistry();
+	const sessionA = Symbol("session-a"), sessionB = Symbol("session-b");
+	let answerCalls = 0;
+	const native = {
+		targetStatus: async () => startStatus(cwd),
+		start: async () => { throw new NativeReviewConsentRequiredError(consent); },
+		answerConsent: async () => {
+			answerCalls += 1;
+			return { kind: "granted", start: { lineageId: "cross-session", state: "reviewing", riskLevel: "low", selectedLenses: [], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: false, riskReasons: [] } };
+		},
+	} as unknown as NativeReviewCli;
+	const started = await __testing.executeReviewControllerOperation({ operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, cwd, native, undefined, undefined, undefined, undefined, registry, sessionA);
+	assert.equal(typeof started.consent_binding, "string", JSON.stringify(started));
+	const answered = await __testing.executeReviewControllerOperation({ operation: "answer-consent", input: JSON.stringify({ consentBinding: started.consent_binding, answer: "granted" }) }, cwd, native, undefined, undefined, undefined, undefined, registry, sessionB);
+	assert.equal(answerCalls, 1, JSON.stringify(answered));
+	assert.equal((answered.result as { lineage_id?: string } | undefined)?.lineage_id, "cross-session", JSON.stringify(answered));
+	assert.notEqual(answered.status, "blocked", JSON.stringify(answered));
+});
+
+// gentle-pi#455: cross-session resolution must still enforce single use --
+// once a binding is answered by any session, no session (including the one
+// whose START created it) may answer it again.
+test("a consumed consent binding cannot be answered a second time from any session", async (t) => {
+	const cwd = repository(t);
+	const consent = decodeReviewConsentV3(JSON.parse(readFileSync(join(process.cwd(), "tests", "fixtures", "devbinary", "consent-v3.captured.json"), "utf8")));
+	const registry = new PendingReviewConsentRegistry();
+	const sessionA = Symbol("session-a"), sessionB = Symbol("session-b");
+	let answerCalls = 0;
+	const native = {
+		targetStatus: async () => startStatus(cwd),
+		start: async () => { throw new NativeReviewConsentRequiredError(consent); },
+		answerConsent: async () => {
+			answerCalls += 1;
+			return { kind: "granted", start: { lineageId: "single-use", state: "reviewing", riskLevel: "low", selectedLenses: [], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: false, riskReasons: [] } };
+		},
+	} as unknown as NativeReviewCli;
+	const started = await __testing.executeReviewControllerOperation({ operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, cwd, native, undefined, undefined, undefined, undefined, registry, sessionA);
+	const binding = started.consent_binding as string;
+	const first = await __testing.executeReviewControllerOperation({ operation: "answer-consent", input: JSON.stringify({ consentBinding: binding, answer: "granted" }) }, cwd, native, undefined, undefined, undefined, undefined, registry, sessionB);
+	assert.equal(answerCalls, 1, JSON.stringify(first));
+	const replay = await __testing.executeReviewControllerOperation({ operation: "answer-consent", input: JSON.stringify({ consentBinding: binding, answer: "granted" }) }, cwd, native, undefined, undefined, undefined, undefined, registry, sessionA);
+	assert.equal(answerCalls, 1, JSON.stringify(replay));
+	assert.equal(replay.status, "blocked", JSON.stringify(replay));
+	assert.equal(replay.outcome, "consent-binding-stale", JSON.stringify(replay));
+	assert.equal((replay.diagnostics as { code?: string } | undefined)?.code, "consent-binding-already-consumed", JSON.stringify(replay));
+});
+
+// gentle-pi#455 correction: cross-session resolution looks a binding up by
+// its opaque id alone, so it must independently refuse an answer presented
+// from a different repository than the one its owning START minted it for,
+// without ever running the mode gate or native answerConsent, and without
+// consuming the binding -- leaving it answerable from the right repository.
+test("answer-consent refuses a binding presented from a different repository than the one its START minted, and leaves it answerable from the right one", async (t) => {
+	const cwdA = repository(t), cwdB = repository(t);
+	const consent = decodeReviewConsentV3(JSON.parse(readFileSync(join(process.cwd(), "tests", "fixtures", "devbinary", "consent-v3.captured.json"), "utf8")));
+	const registry = new PendingReviewConsentRegistry();
+	const sessionA = Symbol("session-a"), sessionB = Symbol("session-b");
+	let answerCalls = 0;
+	const native = {
+		targetStatus: async () => startStatus(cwdA),
+		start: async () => { throw new NativeReviewConsentRequiredError(consent); },
+		answerConsent: async () => {
+			answerCalls += 1;
+			return { kind: "granted", start: { lineageId: "right-repo", state: "reviewing", riskLevel: "low", selectedLenses: [], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: false, riskReasons: [] } };
+		},
+	} as unknown as NativeReviewCli;
+	const started = await __testing.executeReviewControllerOperation({ operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, cwdA, native, undefined, undefined, undefined, undefined, registry, sessionA);
+	const binding = started.consent_binding as string;
+	const wrongRepo = await __testing.executeReviewControllerOperation({ operation: "answer-consent", input: JSON.stringify({ consentBinding: binding, answer: "granted" }) }, cwdB, native, undefined, undefined, undefined, undefined, registry, sessionB);
+	assert.equal(answerCalls, 0, JSON.stringify(wrongRepo));
+	assert.equal(wrongRepo.status, "blocked", JSON.stringify(wrongRepo));
+	assert.equal(wrongRepo.outcome, "consent-binding-repository-mismatch", JSON.stringify(wrongRepo));
+	assert.equal((wrongRepo.diagnostics as { code?: string } | undefined)?.code, "consent-binding-repository-mismatch", JSON.stringify(wrongRepo));
+	assert.equal(wrongRepo.mutation_performed, false, JSON.stringify(wrongRepo));
+	const rightRepo = await __testing.executeReviewControllerOperation({ operation: "answer-consent", input: JSON.stringify({ consentBinding: binding, answer: "granted" }) }, cwdA, native, undefined, undefined, undefined, undefined, registry, sessionA);
+	assert.equal(answerCalls, 1, JSON.stringify(rightRepo));
+	assert.equal((rightRepo.result as { lineage_id?: string } | undefined)?.lineage_id, "right-repo", JSON.stringify(rightRepo));
+});
+
+// gentle-pi#323: within the live consent TTL window, a content-independent
+// replay key let a second ordinary START reuse the first START's still-live
+// (never lineage-bound) frozen candidate view even though the live candidate
+// content changed underneath it, and then dead-ended at
+// candidate-target-projection-drift instead of minting a fresh view and a
+// fresh consent envelope. An intended-untracked selection is retained across
+// both calls so the pre-existing empty-untracked drift-recovery branch does
+// not mask the general content-change gap this covers.
+test("ordinary START mints a fresh candidate view when candidate content changes within the live consent TTL window", async (t) => {
+	const candidateViews = new CandidateViewRegistry();
+	t.after(() => candidateViews.cleanupAll());
+	const cwd = repository(t);
+	writeFileSync(join(cwd, "extra.md"), "kept\n");
+	const consent = decodeReviewConsentV3(JSON.parse(readFileSync(join(process.cwd(), "tests", "fixtures", "devbinary", "consent-v3.captured.json"), "utf8")));
+	const native = {
+		targetStatus: async () => startStatus(cwd, undefined, ["extra.md"]),
+		start: async () => { throw new NativeReviewConsentRequiredError(consent); },
+	} as unknown as NativeReviewCli;
+	const first = await __testing.executeReviewControllerOperation({ operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, cwd, native, undefined, candidateViews);
+	assert.equal(first.outcome, "native-review-consent-required", JSON.stringify(first));
+	writeFileSync(join(cwd, "tracked.txt"), "candidate two\n");
+	const second = await __testing.executeReviewControllerOperation({ operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, cwd, native, undefined, candidateViews);
+	assert.notEqual(second.outcome, "native-operation-failed", JSON.stringify(second));
+	assert.equal(second.outcome, "native-review-consent-required", JSON.stringify(second));
+	assert.notEqual(second.consent_binding, first.consent_binding, JSON.stringify(second));
 });
 
 test("controller-owned dispatch confines single and parallel graph actors to the current candidate view", async (t) => {

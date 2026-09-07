@@ -1,19 +1,20 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { __testing } from "../extensions/gentle-ai.ts";
 import type { NativeReviewCli } from "../lib/native-review-cli.ts";
 import { REVIEW_HOST_RELAY_FAILURE, REVIEW_HOST_RELAY_PI_TIMEOUT_ENV, REVIEW_HOST_RELAY_PI_TIMEOUT_MAX_MS, REVIEW_HOST_RELAY_SUBMISSION_MISSING_MESSAGE, REVIEW_HOST_RELAY_UNAVAILABLE_MESSAGE, ReviewHostRelayError, type ReviewHostRelayRequest } from "../lib/review-host-relay.ts";
-import type { ReviewCaptureSubmissionV1, ReviewCollectInputV3, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
+import { decodeReviewStatusV3, type ReviewArtifactSubjectV2, type ReviewCaptureSubmissionV1, type ReviewCollectInputV3, type ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 
 // One-slot capture routing: the host relay runs only when the selected
 // provider-returned collect input carries the --materialize token. Every
 // other capture form stays untouched.
 
 const SHA = `sha256:${"1".repeat(64)}`;
+const PHASE_REVISION = `sha256:${"3".repeat(64)}`;
 const TREE = "2".repeat(40);
 
 function repository(t: test.TestContext): string {
@@ -26,10 +27,10 @@ function repository(t: test.TestContext): string {
 	return cwd;
 }
 
-function bindingArguments(lineageId: string, lens: string, order: number): ReviewCollectInputV3["arguments"] {
+function bindingArguments(lineageId: string, lens: ReviewArtifactSubjectV2["lens"], order: number, revision = SHA): ReviewCollectInputV3["arguments"] {
 	return [
 		{ name: "lineage", value: lineageId, token: `--lineage=${lineageId}` },
-		{ name: "expected-revision", value: SHA, token: `--expected-revision=${SHA}` },
+		{ name: "expected-revision", value: revision, token: `--expected-revision=${revision}` },
 		{ name: "target", value: SHA, token: `--target=${SHA}` },
 		{ name: "repository-context", value: `rctx1_${"e".repeat(64)}`, token: `--repository-context=rctx1_${"e".repeat(64)}` },
 		{ name: "lens", value: lens, token: `--lens=${lens}` },
@@ -38,8 +39,8 @@ function bindingArguments(lineageId: string, lens: string, order: number): Revie
 	];
 }
 
-function providerSubmission(lineageId: string, lens: string, order: number): ReviewCaptureSubmissionV1 {
-	const bindingTokens = bindingArguments(lineageId, lens, order).map((argument) => argument.token!);
+function providerSubmission(lineageId: string, lens: ReviewArtifactSubjectV2["lens"], order: number, revision = SHA): ReviewCaptureSubmissionV1 {
+	const bindingTokens = bindingArguments(lineageId, lens, order, revision).map((argument) => argument.token!);
 	return {
 		operationToken: "capture-result",
 		argumentTokens: [...bindingTokens, "--input={{value}}"],
@@ -47,20 +48,69 @@ function providerSubmission(lineageId: string, lens: string, order: number): Rev
 	};
 }
 
-function relayCollectInput(lineageId: string, lens: string, order: number, materialize = true, submission: ReviewCaptureSubmissionV1 | "provider" | "absent" = "provider"): ReviewCollectInputV3 {
+function relayCollectInput(lineageId: string, lens: ReviewArtifactSubjectV2["lens"], order: number, materialize = true, submission: ReviewCaptureSubmissionV1 | "provider" | "absent" = "provider", revision = SHA): ReviewCollectInputV3 {
 	return {
 		name: "reviewer_result",
 		schema: "https://gentle-ai.dev/schema/review/reviewer/v1",
 		captureOperation: "review.capture-result",
 		arguments: [
-			...bindingArguments(lineageId, lens, order),
+			...bindingArguments(lineageId, lens, order, revision),
 			...(materialize ? [
 				{ name: "agent", value: "pi", token: "--agent=pi" },
 				{ name: "materialize", value: "true", token: "--materialize=true" },
 			] : []),
 		],
-		...(materialize && submission !== "absent" ? { submission: submission === "provider" ? providerSubmission(lineageId, lens, order) : submission } : {}),
+		artifactSubject: {
+			schema: "gentle-ai.review-artifact-subject/v2", subjectHash: `sha256:${String(order).repeat(64)}`,
+			lineageId, authorityRevision: revision, targetIdentity: SHA, baseTree: TREE, candidateTree: TREE,
+			changedPathManifestSha256: SHA, lens, selectedOrder: order,
+		},
+		baseTree: TREE, candidateTree: TREE, changedPathManifest: [],
+		...(materialize && submission !== "absent" ? { submission: submission === "provider" ? providerSubmission(lineageId, lens, order, revision) : submission } : {}),
 	};
+}
+
+function capturedGroupedStatus(lineageId: string, authorityRevision = SHA): ReviewStatusV3 {
+	const raw = JSON.parse(readFileSync(new URL("./fixtures/devbinary/status-v5-capture-result-submission.captured.json", import.meta.url), "utf8")) as Record<string, unknown>;
+	// The captured binary's forward-only `finalize` action is not accepted by
+	// this checked-out decoder; retain the v5 capture and normalize only that
+	// unrelated routing action before decoding its provider-owned group.
+	raw.action = "stop";
+	const authority = raw.authority as Record<string, unknown>, repositoryContext = raw.repository_context as Record<string, unknown>;
+	authority.lineage_id = lineageId;
+	authority.revision = authorityRevision;
+	const phaseRevision = String(repositoryContext.revision), targetIdentity = String(raw.target_identity);
+	const source = ((((raw.next_transition as Record<string, unknown>).collect as Record<string, unknown>).inputs as Array<Record<string, unknown>>)[0]!);
+	const lenses = ["review-risk", "review-resilience", "review-readability", "review-reliability"];
+	((raw.next_transition as Record<string, unknown>).collect as Record<string, unknown>).inputs = lenses.map((lens, order) => {
+		const input = JSON.parse(JSON.stringify(source)) as Record<string, unknown>;
+		const subjectHash = `sha256:${String(order + 1).repeat(64)}`;
+		const arguments_ = input.arguments as Array<Record<string, unknown>>;
+		for (const argument of arguments_) {
+			const value = argument.name === "lineage" ? lineageId
+				: argument.name === "lens" ? lens
+				: argument.name === "order" ? String(order)
+				: argument.name === "subject-hash" ? subjectHash
+				: argument.value;
+			argument.value = value;
+			argument.token = `--${String(argument.name)}=${String(value)}`;
+		}
+		const submission = input.submission as Record<string, unknown>;
+		submission.argument_tokens = [...arguments_.filter((argument) => argument.name !== "agent" && argument.name !== "materialize").map((argument) => argument.token), "--input={{value}}"];
+		const artifactSubject = input.artifact_subject as Record<string, unknown>;
+		artifactSubject.subject_hash = subjectHash;
+		artifactSubject.lineage_id = lineageId;
+		artifactSubject.authority_revision = phaseRevision;
+		artifactSubject.target_identity = targetIdentity;
+		artifactSubject.lens = lens;
+		artifactSubject.selected_order = order;
+		return input;
+	});
+	return decodeReviewStatusV3(raw);
+}
+
+function replaceArgument(input: ReviewCollectInputV3, name: string, value: string): void {
+	input.arguments = input.arguments.map((argument) => argument.name === name ? { ...argument, value, token: `--${name}=${value}` } : argument);
 }
 
 function finalizeStatus(lineageId: string, inputs?: readonly ReviewCollectInputV3[]): ReviewStatusV3 {
@@ -86,14 +136,28 @@ function finalizeStatus(lineageId: string, inputs?: readonly ReviewCollectInputV
 			currentSnapshotIdentity: SHA,
 		},
 		candidates: [],
+		repositoryContext: { capability: "review.opaque_repository_context", handle: `rctx1_${"e".repeat(64)}`, revision: SHA, targetIdentity: SHA },
 		...(inputs === undefined ? {} : { nextTransition: { kind: "collect", reasonCode: "reviewer_results_required", collect: { inputs: [...inputs] } } }),
 		raw: { schema: "gentle-ai.review-integration.status/v3", action: "stop", lineage_id: lineageId },
 	} as unknown as ReviewStatusV3;
 }
 
+function providerRefuterRequiredStatus(lineageId: string): ReviewStatusV3 {
+	const refuter: ReviewCollectInputV3 = {
+		name: "provider_refuter",
+		schema: "https://gentle-ai.dev/schema/review/refuter/v1",
+		captureOperation: "review.capture-refuter",
+		arguments: bindingArguments(lineageId, "review-risk", 0),
+	};
+	return {
+		...finalizeStatus(lineageId),
+		nextTransition: { kind: "collect", reasonCode: "provider_refuter_required", collect: { inputs: [refuter] } },
+	};
+}
+
 interface RoutingHarness {
 	statusQueue: ReviewStatusV3[];
-	statusCalls: Array<{ cwd: string; lineageId?: string }>;
+	statusCalls: Array<{ cwd: string; lineageId?: string; agent?: "pi" }>;
 	native: NativeReviewCli;
 }
 
@@ -105,7 +169,7 @@ function nativeHarness(statuses: readonly ReviewStatusV3[]): RoutingHarness {
 	};
 	harness.native = {
 		targetStatus: async (request) => {
-			harness.statusCalls.push({ cwd: request.cwd, ...(request.lineageId === undefined ? {} : { lineageId: request.lineageId }) });
+			harness.statusCalls.push({ cwd: request.cwd, ...(request.lineageId === undefined ? {} : { lineageId: request.lineageId }), ...(request.agent === undefined ? {} : { agent: request.agent }) });
 			const next = harness.statusQueue.shift();
 			if (next === undefined) throw new Error("status queue exhausted");
 			return next;
@@ -164,6 +228,159 @@ test("Pi-authored review documents are rejected at the capture input boundary", 
 		/does not accept review_result/,
 	);
 	assert.equal(relayCalls, 0);
+});
+
+function groupInputs(lineageId: string, revision = SHA): ReviewCollectInputV3[] { return ["review-risk", "review-resilience", "review-readability", "review-reliability"].map((lens, order) => relayCollectInput(lineageId, lens, order, true, "provider", revision)); }
+
+async function runCaptureGroup(cwd: string, harness: RoutingHarness, lineageId: string, inputs: readonly ReviewCollectInputV3[], reviewerRunAcknowledged = true): Promise<Record<string, unknown>> { return await __testing.executeReviewCaptureGroupOperation({ lineageId, collectBindings: inputs.map((input) => JSON.stringify(input)), reviewerRunAcknowledged }, cwd, harness.native) as Record<string, unknown>; }
+
+function prepared(request: ReviewHostRelayRequest) { return { request, promptByteLength: 64, resultByteLength: 32 }; }
+
+test("grouped capture forecasts once, reaches a four-reviewer barrier, and reconciles unclosed submissions", async (t) => {
+	t.after(() => __testing.setReviewHostRelayGroupRunnersForTesting());
+	const cwd = repository(t), lineageId = "relay-group", inputs = groupInputs(lineageId), lenses = inputs.map((input) => input.arguments.find((argument) => argument.name === "lens")!.value);
+	const harness = nativeHarness([finalizeStatus(lineageId, inputs), finalizeStatus(lineageId, inputs), ...inputs.map((_input, index) => finalizeStatus(lineageId, index === 1 ? [...inputs.slice(index), { name: "unrelated", schema: "example", captureOperation: "external.example", arguments: [] }] : inputs.slice(index))), providerRefuterRequiredStatus(lineageId)]);
+	let ready!: () => void;
+	const allStarted = new Promise<void>((resolve) => { ready = resolve; });
+	const releases = new Map<string, () => void>(), completed: string[] = [], submitted: string[] = [];
+	const reviewerGroup = async (requests: readonly ReviewHostRelayRequest[]) => await Promise.all(requests.map(async (request) => {
+		const lens = request.captureArgumentTokens.find((token) => token.startsWith("--lens="))!.slice(7);
+		await new Promise<void>((resolve) => { releases.set(lens, resolve); if (releases.size === requests.length) ready(); });
+		completed.push(lens); return prepared(request);
+	}));
+	__testing.setReviewHostRelayGroupRunnersForTesting(reviewerGroup, async (result) => {
+		submitted.push(result.request.captureArgumentTokens.find((token) => token.startsWith("--lens="))!.slice(7));
+		return { promptByteLength: result.promptByteLength, resultByteLength: result.resultByteLength, submission: "{}" };
+	});
+	const forecast = await runCaptureGroup(cwd, harness, lineageId, inputs, false);
+	assert.deepEqual(forecast.cost_forecast, { transport: "pi_host_relay", model_runs: 4, lenses });
+	const run = runCaptureGroup(cwd, harness, lineageId, inputs);
+	await allStarted;
+	assert.deepEqual([...releases.keys()], lenses, "all reviewers start before the group waits");
+	for (const lens of [...lenses].reverse()) releases.get(lens!)!();
+	const result = await run;
+	assert.deepEqual(completed, [...lenses].reverse(), "reviewer completion order is not submission order");
+	assert.deepEqual(submitted, lenses);
+	assert.deepEqual({ outcome: result.outcome, statusCalls: harness.statusCalls.length, providerAction: result.provider_action }, { outcome: "native-reviewer-group-status-reconciled", statusCalls: 7, providerAction: "stop" });
+	assert.equal(harness.statusCalls.at(-1)?.agent, "pi", "post-last-capture reconciliation preserves the Pi host runtime");
+	assert.equal((result.next_transition as { kind?: string; reasonCode?: string } | undefined)?.kind, "collect");
+	assert.equal((result.next_transition as { kind?: string; reasonCode?: string } | undefined)?.reasonCode, "provider_refuter_required");
+});
+
+test("captured v5 STATUS accepts capture-phase Pn when authority has advanced to Rn at the forecast boundary", async (t) => {
+	t.after(() => __testing.setReviewHostRelayGroupRunnersForTesting());
+	const cwd = repository(t), lineageId = "relay-group-phase-revision", status = capturedGroupedStatus(lineageId, SHA), inputs = status.nextTransition!.collect!.inputs!;
+	let launches = 0;
+	__testing.setReviewHostRelayGroupRunnersForTesting(async (requests) => { launches += requests.length; return requests.map(prepared); });
+
+	assert.notEqual(status.authority!.revision, status.repositoryContext!.revision, "captured v5 group keeps capture-phase Pn distinct from authority Rn");
+	const forecast = await runCaptureGroup(cwd, nativeHarness([status]), lineageId, inputs, false);
+
+	assert.equal(forecast.outcome, "reviewer-model-run-forecast");
+	assert.deepEqual(forecast.cost_forecast, { transport: "pi_host_relay", model_runs: 4, lenses: ["review-risk", "review-resilience", "review-readability", "review-reliability"] });
+	assert.equal(launches, 0, "decoder-valid capture-phase Pn must pass admission before any reviewer model launch");
+});
+
+ test("group rejects STATUS repository target mismatch and per-slot revision, context, or target drift before launch", async (t) => {
+	t.after(() => __testing.setReviewHostRelayGroupRunnersForTesting());
+	const cwd = repository(t), lineageId = "relay-group-slot-consistency";
+	const repositoryTargetMismatch = capturedGroupedStatus(lineageId, SHA);
+	repositoryTargetMismatch.repositoryContext!.targetIdentity = SHA;
+	const revisionMismatch = capturedGroupedStatus(lineageId, SHA);
+	replaceArgument(revisionMismatch.nextTransition!.collect!.inputs![1]!, "expected-revision", SHA);
+	const contextMismatch = capturedGroupedStatus(lineageId, SHA);
+	replaceArgument(contextMismatch.nextTransition!.collect!.inputs![1]!, "repository-context", `rctx1_${"f".repeat(64)}`);
+	const targetMismatch = capturedGroupedStatus(lineageId, SHA);
+	replaceArgument(targetMismatch.nextTransition!.collect!.inputs![1]!, "target", SHA);
+	let launches = 0;
+	__testing.setReviewHostRelayGroupRunnersForTesting(async (requests) => { launches += requests.length; return requests.map(prepared); });
+
+	// Each call forwards this STATUS's own current set, so rejection proves an
+	// internal STATUS guard rather than stale or caller/canonical mismatch.
+	const repositoryTargetResult = await runCaptureGroup(cwd, nativeHarness([repositoryTargetMismatch]), lineageId, repositoryTargetMismatch.nextTransition!.collect!.inputs!);
+	assert.deepEqual({ outcome: repositoryTargetResult.outcome, reason: repositoryTargetResult.reason }, {
+		outcome: "capture-group-rejected",
+		reason: "current STATUS repository context does not match the reviewer group binding",
+	});
+	const revisionResult = await runCaptureGroup(cwd, nativeHarness([revisionMismatch]), lineageId, revisionMismatch.nextTransition!.collect!.inputs!);
+	assert.deepEqual({ outcome: revisionResult.outcome, reason: revisionResult.reason }, {
+		outcome: "capture-group-rejected",
+		reason: "current STATUS carries an incomplete or mismatched materialize reviewer binding",
+	});
+	const contextResult = await runCaptureGroup(cwd, nativeHarness([contextMismatch]), lineageId, contextMismatch.nextTransition!.collect!.inputs!);
+	assert.deepEqual({ outcome: contextResult.outcome, reason: contextResult.reason }, {
+		outcome: "capture-group-rejected",
+		reason: "current STATUS carries an incomplete or mismatched materialize reviewer binding",
+	});
+	const targetResult = await runCaptureGroup(cwd, nativeHarness([targetMismatch]), lineageId, targetMismatch.nextTransition!.collect!.inputs!);
+	assert.deepEqual({ outcome: targetResult.outcome, reason: targetResult.reason }, {
+		outcome: "capture-group-rejected",
+		reason: "current STATUS carries an incomplete or mismatched materialize reviewer binding",
+	});
+	assert.equal(launches, 0, "current STATUS consistency checks reject before reviewer model launch");
+});
+
+test("group rejects absent or mismatched current repository context before launch", async (t) => {
+	t.after(() => __testing.setReviewHostRelayGroupRunnersForTesting());
+	const cwd = repository(t), lineageId = "relay-group-context-reject", inputs = groupInputs(lineageId, PHASE_REVISION);
+	const revisionMismatch = finalizeStatus(lineageId, inputs);
+	const handleMismatch = finalizeStatus(lineageId, inputs);
+	const absent = finalizeStatus(lineageId, inputs);
+	handleMismatch.repositoryContext = { capability: "review.opaque_repository_context", handle: `rctx1_${"f".repeat(64)}`, revision: PHASE_REVISION, targetIdentity: SHA };
+	delete absent.repositoryContext;
+	let launches = 0;
+	__testing.setReviewHostRelayGroupRunnersForTesting(async (requests) => { launches += requests.length; return requests.map(prepared); });
+
+	for (const status of [revisionMismatch, handleMismatch, absent]) {
+		const result = await runCaptureGroup(cwd, nativeHarness([status]), lineageId, inputs);
+		assert.equal(result.outcome, "capture-group-rejected");
+	}
+	assert.equal(launches, 0, "repository-context validation must reject before reviewer model launch");
+});
+
+test("group rejects partial, duplicate, reordered, stale, mixed, and late-invalid bindings before launch", async (t) => {
+	t.after(() => __testing.setReviewHostRelayGroupRunnersForTesting());
+	const cwd = repository(t), lineageId = "relay-group-reject", inputs = groupInputs(lineageId);
+	const stale = JSON.parse(JSON.stringify(inputs[3]!)) as ReviewCollectInputV3;
+	stale.arguments = [...stale.arguments, { name: "replacement", value: "stale", token: "--replacement=stale" }];
+	const mixed = [...inputs.slice(0, 3), relayCollectInput(lineageId, "review-reliability", 3, false)];
+	const malformed = JSON.parse(JSON.stringify(inputs)) as ReviewCollectInputV3[];
+	malformed[3]!.submission!.argumentTokens = ["--input={{value}}"];
+	const cases = [
+		{ bindings: inputs.slice(0, 3), current: inputs }, { bindings: [...inputs].reverse(), current: inputs },
+		{ bindings: [...inputs.slice(0, 3), inputs[2]!], current: inputs }, { bindings: [...inputs.slice(0, 3), stale], current: inputs },
+		{ bindings: mixed, current: mixed }, { bindings: malformed, current: malformed },
+	];
+	let launches = 0;
+	__testing.setReviewHostRelayGroupRunnersForTesting(async (requests) => { launches += requests.length; return requests.map(prepared); });
+	for (const entry of cases) {
+		const result = await runCaptureGroup(cwd, nativeHarness([finalizeStatus(lineageId, entry.current)]), lineageId, entry.bindings);
+		assert.equal(result.outcome, "capture-group-rejected");
+	}
+	assert.equal(launches, 0);
+});
+
+test("group preserves earlier admission when a later STATUS drifts, and stops on closure or unknown outcome", async (t) => {
+	t.after(() => __testing.setReviewHostRelayGroupRunnersForTesting());
+	const cwd = repository(t), lineageId = "relay-group-stop", inputs = groupInputs(lineageId);
+	const reviewerGroup = async (requests: readonly ReviewHostRelayRequest[]) => requests.map(prepared);
+	let submissions = 0;
+	__testing.setReviewHostRelayGroupRunnersForTesting(reviewerGroup, async (result) => { submissions += 1; return { promptByteLength: result.promptByteLength, resultByteLength: result.resultByteLength, submission: "{}" }; });
+	const staleStatus = finalizeStatus(lineageId, inputs), stale = await runCaptureGroup(cwd, nativeHarness([finalizeStatus(lineageId, inputs), finalizeStatus(lineageId, inputs), staleStatus]), lineageId, inputs);
+	assert.deepEqual({ outcome: stale.outcome, submissions, mutation: stale.mutation_performed, mutationOutcome: stale.mutation_outcome }, { outcome: "capture-group-authority-drift", submissions: 1, mutation: true, mutationOutcome: "partial" });
+	assert.equal(stale.reconciliation, staleStatus.raw);
+	submissions = 0;
+	const drift = await runCaptureGroup(cwd, nativeHarness([finalizeStatus(lineageId, inputs), finalizeStatus(lineageId, inputs), finalizeStatus(lineageId, inputs.slice(2))]), lineageId, inputs);
+	assert.deepEqual({ outcome: drift.outcome, submissions, mutation: drift.mutation_performed, mutationOutcome: drift.mutation_outcome }, { outcome: "capture-group-authority-drift", submissions: 1, mutation: true, mutationOutcome: "partial" });
+	assert.deepEqual(((drift.host_relay as { reviewers: Array<{ lens: string }> }).reviewers).map((reviewer) => reviewer.lens), ["review-risk"]);
+	submissions = 0;
+	__testing.setReviewHostRelayGroupRunnersForTesting(reviewerGroup, async (result) => { submissions += 1; return { promptByteLength: result.promptByteLength, resultByteLength: result.resultByteLength, submission: JSON.stringify({ schema: "gentle-ai.review-last-event-closure/v1", operation: "review/capture-result", lineage_id: lineageId, state: "approved", store_revision: SHA, action: "native last event closed the review" }) }; });
+	const terminal = await runCaptureGroup(cwd, nativeHarness([finalizeStatus(lineageId, inputs), finalizeStatus(lineageId, inputs)]), lineageId, inputs);
+	assert.deepEqual({ status: terminal.status, submissions }, { status: "closed", submissions: 1 });
+	submissions = 0;
+	__testing.setReviewHostRelayGroupRunnersForTesting(reviewerGroup, async () => { submissions += 1; throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", "unknown", { timedOut: true }); });
+	const unknown = await runCaptureGroup(cwd, nativeHarness([finalizeStatus(lineageId, inputs), finalizeStatus(lineageId, inputs), finalizeStatus(lineageId, inputs)]), lineageId, inputs);
+	assert.deepEqual({ status: unknown.status, submissions }, { status: "reconciled", submissions: 1 });
 });
 
 test("an old binary reports the relay as unavailable without touching existing behavior", async (t) => {
@@ -263,6 +480,7 @@ test("a submission whose outcome is genuinely indeterminate still reconciles thr
 	assert.deepEqual(result.failure, { kind: "submission-refused", stage: "submit", exit_code: null, timed_out: true, elapsed_ms: 120_004, timeout_ms: 120_000 });
 	assert.match(String(result.reason), /exceeded its 120000ms bound/);
 	assert.equal(harness.statusCalls.length, 2, "an indeterminate submission reconciles exactly once through STATUS");
+	assert.equal(harness.statusCalls.at(-1)?.agent, "pi", "ordinary host-relay reconciliation preserves the Pi host runtime");
 });
 
 test("a relay timeout reports its one-slot measurements and no auto-follow", async (t) => {
