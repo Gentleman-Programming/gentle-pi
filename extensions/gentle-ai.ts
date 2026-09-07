@@ -108,10 +108,15 @@ import { CandidateViewError, CandidateViewRegistry, injectReviewCandidateView, r
 import {
 	GentleAiDevBinaryOverrideError,
 	registerGentleAiDevBinary,
+	resolveGentleAiBinary,
 	resolveGentleAiDevBinaryOverride,
 	unregisterGentleAiDevBinary,
 	type GentleAiDevBinaryOverride,
 } from "../lib/gentle-ai-binary.ts";
+import {
+	spawnTelemetryTrigger,
+	type TelemetryTriggerSpawn,
+} from "../lib/telemetry-trigger.ts";
 import {
 	createNativeReviewCli,
 	createNodeExecFileAdapter,
@@ -144,6 +149,8 @@ import {
 	type NativeReviewProcessDiagnostics,
 	type NativeStartResult,
 	type NativeReviewAssessRequest,
+	type ExecFileAdapter,
+	type ExecFileResult,
 } from "../lib/native-review-cli.ts";
 import {
 	verificationPlan,
@@ -4142,6 +4149,18 @@ const processAgentEndPreflightNudgedTargets = new Map<PendingReviewConsentSessio
 // unreviewed candidate this session should be reminded about.
 const processAgentEndSessionBaseline = new Map<PendingReviewConsentSessionKey, string>();
 
+// gentle-pi#677: gentle-ai#4309 owns anonymous usage telemetry end to end;
+// Pi only nudges it once per process. This is a plain process-lifetime
+// guard, not a session-keyed map, because the nudge is meant to fire at most
+// once no matter how many primary-session `before_agent_start` events this
+// process observes.
+let processTelemetryTriggerAttempted = false;
+
+/** Testing-only reset for the once-per-process telemetry trigger guard. */
+function resetTelemetryTriggerGuardForTesting(): void {
+	processTelemetryTriggerAttempted = false;
+}
+
 function pendingReviewConsentSessionKey(context: ExtensionContext | undefined, fallbackKey: symbol): PendingReviewConsentSessionKey {
 	try {
 		const sessionManager = (context as unknown as { sessionManager?: { getSessionId?: () => unknown } } | undefined)?.sessionManager;
@@ -6326,6 +6345,7 @@ export const __testing = {
 	clearNativeReviewOutcomeMemoForTesting,
 	resolveControllerSddStatus,
 	resolveStartupControllerSddStatus,
+	resetTelemetryTriggerGuardForTesting,
 	createGentleAiExtension: createGentleAiExtensionForTesting,
 };
 
@@ -6366,6 +6386,15 @@ export interface GentleAiRuntimeDependencies {
 	// Package-owned children use this parent-bound channel only to ask whether
 	// their own pending ordinary START may replay a grant locally.
 	childStandingReviewPermissionClient?: Pick<ChildStandingReviewPermissionClient, "requestAuthorization" | "close">;
+	// gentle-pi#677: test-only seams for the telemetry trigger. Production
+	// leaves both undefined: the real package-local resolveGentleAiBinary()
+	// and the real detached child_process spawn run.
+	resolveTelemetryTriggerBinary?: () => string;
+	telemetryTriggerSpawn?: TelemetryTriggerSpawn;
+	// Test-only seam for the foreground `/gentle:telemetry` slash command's
+	// bounded exec; production leaves this undefined and uses the real node
+	// exec-file adapter shared with the rest of the extension.
+	telemetryExecFileAdapter?: ExecFileAdapter;
 }
 
 export function createGentleAiExtension(dependencies: GentleAiRuntimeDependencies = {}): (pi: ExtensionAPI) => void {
@@ -6383,6 +6412,8 @@ function createGentleAiExtensionForTesting(
 	const reviewConsentNow = dependencies.now ?? (() => Date.now());
 	const reviewConsentScheduleTimer = dependencies.scheduleTimer ?? ((callback, delayMs) => setTimeout(callback, delayMs));
 	const pendingReviewConsentRegistry = dependencies.pendingReviewConsentRegistry ?? processPendingReviewConsentRegistry;
+	const resolveTelemetryTriggerBinary = dependencies.resolveTelemetryTriggerBinary ?? resolveGentleAiBinary;
+	const telemetryExecFileAdapter = dependencies.telemetryExecFileAdapter ?? createNodeExecFileAdapter();
 	return function gentleAi(pi: ExtensionAPI): void {
 	declareReviewRelayHandshake(dependencies.processEnv ?? process.env);
 	const pendingReviewConsentFallbackKey = Symbol("pending-review-consent-fallback");
@@ -6753,6 +6784,26 @@ function createGentleAiExtensionForTesting(
 		} else {
 			processAgentEndSubagentDepth.set(subagentDepthKey, 0);
 		}
+		// gentle-pi#677: nudge gentle-ai's own telemetry trigger for a primary
+		// session only, reusing the exact isNamedAgent/isSddAgent predicate that
+		// decides the orchestrator prompt below. At most one attempt per
+		// process regardless of how many primary-session before_agent_start
+		// events this process observes; a missing/old binary or a spawn error
+		// must never affect activation, so every failure is swallowed silently.
+		if (!isNamedAgent && !isSddAgent && !processTelemetryTriggerAttempted) {
+			processTelemetryTriggerAttempted = true;
+			try {
+				const executable = resolveTelemetryTriggerBinary();
+				spawnTelemetryTrigger({
+					executable,
+					cwd: ctx.cwd,
+					env: dependencies.processEnv ?? process.env,
+					spawn: dependencies.telemetryTriggerSpawn,
+				});
+			} catch {
+				// Best-effort only; never surfaced and never affects activation.
+			}
+		}
 		if (isSddAgent && !getSddPreflightPreferences(ctx)) {
 			await runSddPreflight(ctx);
 		}
@@ -7120,6 +7171,56 @@ function createGentleAiExtensionForTesting(
 				}
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			}
+		},
+	});
+
+	// gentle-pi#677: gentle-ai owns telemetry end to end (status, the opt-out
+	// switches, and rate limiting); this command only runs the corresponding
+	// `gentle-ai telemetry <op> --json` in the foreground and relays its
+	// output, so a Pi user never has to leave Pi to check or change it.
+	pi.registerCommand("gentle:telemetry", {
+		description: "Show or change the local Gentle AI telemetry trigger (status|enable|disable|preview); gentle-ai owns the data and the opt-out.",
+		handler: async (args, ctx) => {
+			const subAction = args.trim().length === 0 ? "status" : args.trim();
+			if (subAction !== "status" && subAction !== "enable" && subAction !== "disable" && subAction !== "preview") {
+				ctx.ui.notify(`Unknown /gentle:telemetry sub-action "${subAction}". Use status, enable, disable, or preview.`, "warning");
+				return;
+			}
+			let executable: string;
+			try {
+				executable = resolveTelemetryTriggerBinary();
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				return;
+			}
+			let result: ExecFileResult;
+			try {
+				result = await telemetryExecFileAdapter({
+					file: executable,
+					arguments: ["telemetry", subAction, "--json"],
+					cwd: ctx.cwd,
+					timeoutMs: 5_000,
+					maxBufferBytes: 1024 * 1024,
+				});
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				return;
+			}
+			if (result.exitCode !== 0) {
+				ctx.ui.notify(`gentle-ai telemetry ${subAction} failed (exit ${result.exitCode}): ${(result.stderr || result.stdout || "no output").trim()}`, "error");
+				return;
+			}
+			let relayed: string;
+			try {
+				relayed = JSON.stringify(JSON.parse(result.stdout), null, 2);
+			} catch {
+				relayed = result.stdout.trim();
+			}
+			if (subAction === "disable") {
+				ctx.ui.notify("Gentle AI telemetry disabled.", "info");
+				return;
+			}
+			ctx.ui.notify(relayed, "info");
 		},
 	});
 
