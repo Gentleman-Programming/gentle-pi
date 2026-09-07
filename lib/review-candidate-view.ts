@@ -340,6 +340,11 @@ function isMaterializedCandidateMode(mode: string): boolean {
 	return mode === "100644" || mode === "100755" || mode === "120000";
 }
 
+export function hasExpectedExecutableBits(filesystemMode: number, gitMode: string, platform: NodeJS.Platform = process.platform): boolean {
+	return gitMode === "100755" && platform === "win32"
+		|| (filesystemMode & 0o111) === (gitMode === "100755" ? 0o111 : 0);
+}
+
 function isCanonicalObjectId(objectId: string): boolean { return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(objectId); }
 function gitlinkMapsEqual(left: Readonly<Record<string, string>>, right: Readonly<Record<string, string>>): boolean {
 	const entries = Object.entries(left);
@@ -913,7 +918,7 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 	}
 }
 
-function assertRecordSafe(record: CandidateViewRecord): void {
+function assertRecordSafe(record: CandidateViewRecord, platform: NodeJS.Platform = process.platform): void {
 	try {
 		const contributor = lstatSync(record.contributorRoot);
 		if (!contributor.isDirectory() || contributor.isSymbolicLink() || realpathSync(record.contributorRoot) !== record.contributorRoot) {
@@ -953,7 +958,7 @@ function assertRecordSafe(record: CandidateViewRecord): void {
 		if (!item) throw new CandidateViewError("candidate view entry is missing or moved");
 		if (entry.mode === "120000") {
 			if (!item.isSymbolicLink()) throw new CandidateViewError("candidate view symlink is unsafe or changed");
-		} else if (!item.isFile() || item.isSymbolicLink() || (item.mode & 0o222) !== 0 || ((item.mode & 0o111) !== (entry.mode === "100755" ? 0o111 : 0))) {
+		} else if (!item.isFile() || item.isSymbolicLink() || (item.mode & 0o222) !== 0 || !hasExpectedExecutableBits(item.mode, entry.mode, platform)) {
 			throw new CandidateViewError("candidate view entry is unsafe, writable, or has a changed mode");
 		}
 		const actualHash = entryContentHash(root, entry);
@@ -964,8 +969,10 @@ function assertRecordSafe(record: CandidateViewRecord): void {
 export class CandidateViewRegistry {
 	private readonly records = new Map<string, CandidateViewRecord>();
 	private readonly gitExecutor: CandidateGitExecutor;
-	constructor(gitExecutor: CandidateGitExecutor = defaultCandidateGitExecutor) {
+	private readonly platform: NodeJS.Platform;
+	constructor(gitExecutor: CandidateGitExecutor = defaultCandidateGitExecutor, platform: NodeJS.Platform = process.platform) {
 		this.gitExecutor = gitExecutor;
+		this.platform = platform;
 	}
 	// Lifecycle state is scoped to the canonical target worktree as well as the
 	// provider lineage. Lineage text is repository-local and may legitimately be
@@ -1051,7 +1058,7 @@ export class CandidateViewRegistry {
 		const key = this.lineageKey(contributorRoot, lineageId);
 		const token = this.lineages.get(key);
 		const record = token === undefined ? undefined : this.records.get(token);
-		if (record !== undefined) assertRecordSafe(record);
+		if (record !== undefined) assertRecordSafe(record, this.platform);
 	}
 
 	create(request: CreateCandidateViewRequest): CandidateView {
@@ -1078,7 +1085,7 @@ export class CandidateViewRegistry {
 		const scopedReplayKey = normalizedRequest.replayKey === undefined ? undefined : this.replayKey(contributorRoot, normalizedRequest.replayKey);
 		const token = scopedReplayKey === undefined ? undefined : this.replays.get(scopedReplayKey);
 		const existing = token === undefined ? undefined : this.records.get(token);
-		if (existing) { assertRecordSafe(existing); return this.expose(existing); }
+		if (existing) { assertRecordSafe(existing, this.platform); return this.expose(existing); }
 		const record = materializeCandidateView(normalizedRequest, this.gitExecutor);
 		this.records.set(record.token, record);
 		if (scopedReplayKey !== undefined) this.replays.set(scopedReplayKey, record.token);
@@ -1107,7 +1114,7 @@ export class CandidateViewRegistry {
 			const existing = this.records.get(existingToken);
 			let existingSafe = false;
 			if (existing !== undefined && existing.lineageId === request.lineageId) {
-				try { assertRecordSafe(existing); existingSafe = true; } catch { existingSafe = false; }
+				try { assertRecordSafe(existing, this.platform); existingSafe = true; } catch { existingSafe = false; }
 			}
 			if (existing !== undefined && existingSafe && candidateRecordsShareIdentity(existing, candidate)) {
 				existing.selectedLenses = selectedLenses;
@@ -1130,7 +1137,7 @@ export class CandidateViewRegistry {
 		const record = this.records.get(request.token);
 		if (!record || record.lineageId !== undefined) throw new CandidateViewError("native reviewing candidate view is missing or already bound", "authoritative-current-match-missing");
 		if (this.current.has(record.contributorRoot)) throw new CandidateViewError("candidate view already has a current lineage binding", "current-binding-already-established");
-		assertRecordSafe(record);
+		assertRecordSafe(record, this.platform);
 		this.assertCurrentBindingMatchesLiveCandidate(record);
 		this.bindCurrent(request);
 	}
@@ -1172,7 +1179,7 @@ export class CandidateViewRegistry {
 		const existing = existingToken === undefined ? undefined : this.records.get(existingToken);
 		if (existing) {
 			if (existing.lineageId !== undefined) throw new CandidateViewError("corrected candidate replay is no longer pending");
-			assertRecordSafe(existing);
+			assertRecordSafe(existing, this.platform);
 			return this.expose(existing);
 		}
 		const record = materializeCandidateView({ contributorRoot: root, baseRef: projection.baseCommit, committedOnly: projection.committedOnly, ...(projection.intendedUntracked === undefined ? {} : { intendedUntracked: projection.intendedUntracked }) }, this.gitExecutor);
@@ -1202,8 +1209,8 @@ export class CandidateViewRegistry {
 		if (currentBinding !== undefined && currentBinding.lineageId !== lineageId) {
 			throw new CandidateViewError("corrected candidate replacement conflicts with the current lineage binding");
 		}
-		assertRecordSafe(replacement);
-		if (current) assertRecordSafe(current);
+		assertRecordSafe(replacement, this.platform);
+		if (current) assertRecordSafe(current, this.platform);
 		if (
 			replacement.contributorRoot !== projection.contributorRoot ||
 			replacement.baseCommit !== projection.baseCommit ||
@@ -1264,7 +1271,7 @@ export class CandidateViewRegistry {
 		const record = this.records.get(token);
 		const key = record === undefined ? undefined : this.lineageKey(record.contributorRoot, lineageId);
 		if (!record || record.lineageId !== undefined || !key || this.lineages.has(key)) throw new CandidateViewError("candidate view lineage binding is missing or ambiguous");
-		assertRecordSafe(record);
+		assertRecordSafe(record, this.platform);
 		record.lineageId = lineageId;
 		record.selectedLenses = selectedLenses;
 		this.lineages.set(key, record.token);
@@ -1463,7 +1470,7 @@ export class CandidateViewRegistry {
 		const token = this.lineages.get(key);
 		const record = token === undefined ? undefined : this.records.get(token);
 		if (!record || record.lineageId !== lineageId || !record.selectedLenses?.includes(lens as ReviewLens)) throw new CandidateViewError("candidate view context is missing, ambiguous, stale, or lens-unselected");
-		assertRecordSafe(record);
+		assertRecordSafe(record, this.platform);
 		return this.expose(record);
 	}
 
@@ -1514,7 +1521,7 @@ export class CandidateViewRegistry {
 		const current = this.currentBinding(contributorRoot);
 		const record = this.records.get(current.token);
 		if (!record || record.lineageId !== current.lineageId || this.lineages.get(this.lineageKey(current.root, current.lineageId)) !== current.token) throw new CandidateViewError("review subagent dispatch current lineage binding is stale or ambiguous", "current-binding-stale");
-		assertRecordSafe(record);
+		assertRecordSafe(record, this.platform);
 		this.assertCurrentBindingMatchesLiveCandidate(record);
 		if (!lenses.every((lens) => record.selectedLenses?.includes(lens as ReviewLens))) throw new CandidateViewError("candidate view context is missing, ambiguous, stale, or lens-unselected", "current-binding-lens-unselected");
 		return lenses.map(() => this.expose(record));
@@ -1543,7 +1550,7 @@ export class CandidateViewRegistry {
 		const token = this.lineages.get(key);
 		const record = token === undefined ? undefined : this.records.get(token);
 		if (!record || record.lineageId !== lineageId) throw new CandidateViewError("candidate view context is missing or ambiguous for FINALIZE");
-		assertRecordSafe(record);
+		assertRecordSafe(record, this.platform);
 		return this.expose(record);
 	}
 
@@ -1596,7 +1603,7 @@ export class CandidateViewRegistry {
 			modes: record.scope.modes,
 			gitlinks: record.scope.gitlinks,
 			deletedPaths: record.scope.deletedPaths,
-			verify: () => assertRecordSafe(record),
+			verify: () => assertRecordSafe(record, this.platform),
 			cleanup: () => this.cleanup(record.token),
 		};
 	}

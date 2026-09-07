@@ -11,6 +11,7 @@ import { gzipSync } from "node:zlib";
 import {
 	CandidateViewRegistry,
 	CandidateViewError,
+	hasExpectedExecutableBits,
 	type CandidateGitExecutor,
 	createCandidateView,
 	decodeCandidateContextManifest,
@@ -1055,6 +1056,13 @@ test("candidate view verifies unchanged tree entries even when they are absent f
 	} finally {
 		view.cleanup();
 	}
+});
+
+test("candidate executable-mode validation accepts a readonly Git executable on Windows and rejects it on POSIX", () => {
+	assert.equal(hasExpectedExecutableBits(0o444, "100755", "win32"), true);
+	assert.equal(hasExpectedExecutableBits(0o444, "100755", "linux"), false);
+	assert.equal(hasExpectedExecutableBits(0o555, "100755", "linux"), true);
+	assert.equal(hasExpectedExecutableBits(0o555, "100644", "win32"), false);
 });
 
 test("candidate view compacts an oversized non-ASCII scope losslessly and deterministically", (t) => {
