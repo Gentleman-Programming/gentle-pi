@@ -176,6 +176,97 @@ test("consent follow-up executes the provider-named invocation exactly once and 
 
 // A binding mismatch is decided entirely inside Pi, before the provider is
 // launched, so it must not be reported as a provider failure (issue #247).
+test("consent answer preserves quoted Windows provider cwd tokens and launches the provider exactly once", async () => {
+	const windowsCwd = "C:\\Users\\x\\repo with spaces";
+	const gitBashCwd = "/c/Users/x/repo with spaces";
+	const cwdPairs = process.platform === "win32"
+		? [{ providerCwd: windowsCwd, requestedCwd: gitBashCwd }, { providerCwd: gitBashCwd, requestedCwd: windowsCwd }, { providerCwd: gitBashCwd, requestedCwd: gitBashCwd }, { providerCwd: windowsCwd, requestedCwd: windowsCwd }]
+		: [{ providerCwd: windowsCwd, requestedCwd: windowsCwd }];
+	for (const { providerCwd, requestedCwd } of cwdPairs) {
+		const decoded = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV2(fixture<Record<string, unknown>>("consent.fixture.json"));
+		const lineage = "windows-cwd-lineage";
+		for (const choice of decoded.choices) {
+			choice.invocation = choice.invocation
+				.replace("--cwd /repo", `--cwd "${providerCwd}"`)
+				.replace("review-consent-fixture", lineage);
+		}
+		const started = JSON.parse(JSON.stringify(fixture<Record<string, unknown>>("start.fixture.json")).replaceAll("review-start-fixture", lineage)) as Record<string, unknown>;
+		const expected = [
+			"review", "start", "--contract", "gentle-ai.review-integration/v2", "--cwd", providerCwd,
+			"--target", decoded.targetIdentity, "--projection", "workspace", "--lineage", lineage, "--consent", "granted",
+		];
+		for (const createClient of [client, runtimeClient]) {
+			const queue = queuedAdapter([capabilities(), structuredClone(started)]);
+			const result = await createClient(queue.adapter).answerConsent({ cwd: requestedCwd, consent: decoded, answer: "granted" });
+			assert.equal(result.kind, "started");
+			assert.deepEqual(queue.calls, [expected]);
+		}
+	}
+});
+
+test("consent answer preserves quoted UNC and drive-root cwd tokens", async () => {
+	for (const providerCwd of ["\\\\server\\share", "C:\\"]) {
+		const decoded = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV2(fixture<Record<string, unknown>>("consent.fixture.json"));
+		const lineage = "windows-root-lineage";
+		for (const choice of decoded.choices) {
+			choice.invocation = choice.invocation
+				.replace("--cwd /repo", `--cwd "${providerCwd}"`)
+				.replace("review-consent-fixture", lineage);
+		}
+		const started = JSON.parse(JSON.stringify(fixture<Record<string, unknown>>("start.fixture.json")).replaceAll("review-start-fixture", lineage)) as Record<string, unknown>;
+		const expected = [
+			"review", "start", "--contract", "gentle-ai.review-integration/v2", "--cwd", providerCwd,
+			"--target", decoded.targetIdentity, "--projection", "workspace", "--lineage", lineage, "--consent", "granted",
+		];
+		for (const createClient of [client, runtimeClient]) {
+			const queue = queuedAdapter([capabilities(), structuredClone(started)]);
+			const result = await createClient(queue.adapter).answerConsent({ cwd: providerCwd, consent: decoded, answer: "granted" });
+			assert.equal(result.kind, "started");
+			assert.deepEqual(queue.calls, [expected]);
+		}
+	}
+});
+
+test("unmatched consent invocation quotes reject before provider launch", async () => {
+	for (const quote of ["'", '"']) {
+		const decoded = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV2(fixture<Record<string, unknown>>("consent.fixture.json"));
+		const choice = decoded.choices.find((candidate) => candidate.answer === "granted") as { invocation: string };
+		choice.invocation = `${choice.invocation} ${quote}`;
+		for (const createClient of [client, runtimeClient]) {
+			const queue = queuedAdapter([]);
+			await assert.rejects(
+				() => createClient(queue.adapter).answerConsent({ cwd: "/repo", consent: decoded, answer: "granted" }),
+				(error: unknown) => error instanceof TypeError && error.message === "Native consent invocation has invalid quoting",
+			);
+			assert.deepEqual(queue.calls, []);
+		}
+	}
+});
+
+test("different, duplicate, missing, and malformed consent cwd options reject before provider launch", async () => {
+	const decoded = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV2(fixture<Record<string, unknown>>("consent.fixture.json"));
+	const drifted = (replace: (invocation: string) => string): ReviewConsentV2 => {
+		const consent = structuredClone(decoded);
+		const choice = consent.choices.find((candidate) => candidate.answer === "granted") as { invocation: string };
+		choice.invocation = replace(choice.invocation);
+		return consent;
+	};
+	const cases = [
+		{ label: "different", reason: "consent-invocation-cwd-changed", consent: drifted((value) => value.replace("--cwd /repo", "--cwd /another-repo")) },
+		{ label: "duplicate", reason: "consent-invocation-option-invalid", consent: drifted((value) => `${value} --cwd /repo`) },
+		{ label: "missing", reason: "consent-invocation-option-invalid", consent: drifted((value) => value.replace("--cwd /repo ", "")) },
+		{ label: "malformed", reason: "consent-invocation-cwd-changed", consent: drifted((value) => value.replace("--cwd /repo", '--cwd ""')) },
+	] as const;
+	for (const scenario of cases) {
+		const queue = queuedAdapter([]);
+		await assert.rejects(
+			() => client(queue.adapter).answerConsent!({ cwd: "/repo", consent: scenario.consent, answer: "granted" }),
+			(error: unknown) => error instanceof NativeReviewConsentBindingError && error.reason === scenario.reason,
+		);
+		assert.deepEqual(queue.calls, [], `${scenario.label} cwd must not launch the provider`);
+	}
+});
+
 test("a consent invocation binding mismatch is a typed pre-native error that never launches the provider", async () => {
 	const consent = (await import("../lib/review-integration-v2.ts")).decodeReviewConsentV2(fixture<Record<string, unknown>>("consent.fixture.json"));
 	const queue = queuedAdapter([]);
