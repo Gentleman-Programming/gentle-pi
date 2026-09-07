@@ -376,6 +376,7 @@ export class AgentsView {
 		const next = Math.max(0, Math.min(Math.max(0, this.tasks.length - this.bodyRows()), this.listScroll + delta));
 		if (next === this.listScroll) return { handled: true, render: false };
 		this.listScroll = next;
+		this.hovered = undefined;
 		return { handled: true, render: true };
 	}
 

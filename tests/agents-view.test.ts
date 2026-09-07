@@ -126,10 +126,12 @@ test("AgentsView pointer regions hover and select task rows without activating, 
 	assert.equal(view.handleMouse(mouse(4, 2, 80, lines.length)), undefined, "late pointer events are inert after disposal");
 });
 
-test("AgentsView clears hover on leave, resize, updates, empty lists, and disposal", () => {
+test("AgentsView clears hover on leave, list scrolling, resize, updates, empty lists, and disposal", () => {
 	const { store, view } = harness(6);
 	store.add(task("a"));
 	store.add(task("b", { agent: "b" }));
+	store.add(task("c", { agent: "c" }));
+	store.add(task("d", { agent: "d" }));
 	const lines = view.render(80);
 	const observer = view.mouseObserver();
 	const dispatch = (event: TuiMouseEvent) => {
@@ -142,6 +144,11 @@ test("AgentsView clears hover on leave, resize, updates, empty lists, and dispos
 	};
 	dispatch(mouse(4, 2, 80, lines.length));
 	assert.match(stripAnsi(view.render(80)[2]), /▹/, "the hovered row is styled without changing selection");
+	dispatch(mouse(4, 2, 80, lines.length, "wheel", -1));
+	assert.match(stripAnsi(view.render(80)[2]), /▹/, "a list wheel event at its boundary preserves hover");
+	dispatch(mouse(4, 2, 80, lines.length, "wheel", 1));
+	assert.doesNotMatch(stripAnsi(view.render(80).join("\n")), /▹/, "list scrolling clears hover so it cannot remain on the task formerly under the pointer");
+	dispatch(mouse(4, 2, 80, lines.length));
 	dispatch(mouse(50, 2, 80, lines.length));
 	assert.doesNotMatch(stripAnsi(view.render(80)[2]), /▹/, "the root observer clears hover outside a child region");
 	dispatch(mouse(4, 2, 80, lines.length));
