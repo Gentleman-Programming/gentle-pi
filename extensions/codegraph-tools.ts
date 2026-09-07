@@ -189,7 +189,10 @@ function isEnoent(error: unknown): boolean {
 /** Find `codegraph.cmd` shims in Windows PATH order. */
 function* codeGraphCmdPathsOnPath(): Iterable<string> {
 	const pathEnv = process.env.Path ?? process.env.PATH ?? "";
-	for (const dir of pathEnv.split(";")) {
+	for (const entry of pathEnv.split(";")) {
+		const dir = entry.length >= 2 && entry.startsWith('"') && entry.endsWith('"')
+			? entry.slice(1, -1)
+			: entry;
 		if (!dir) continue;
 		const candidate = join(dir, "codegraph.cmd");
 		if (existsSync(candidate)) yield candidate;

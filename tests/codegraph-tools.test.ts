@@ -267,6 +267,28 @@ test("Windows shim helpers skip stale PATH shims before resolving the npm script
 	assert.equal(findCodeGraphNodeScriptOnPath(), scriptTarget);
 });
 
+test("Windows shim helpers resolve quoted PATH entries in order without stripping unmatched quotes", (t) => {
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-quoted-bin-")));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const firstBin = join(root, "Program Files", "nodejs");
+	const secondBin = join(root, "other-bin");
+	const firstScript = writeCodeGraphPackage(firstBin);
+	const secondScript = writeCodeGraphPackage(secondBin);
+	withWindowsPath(t, `"${firstBin}";${secondBin}`);
+
+	assert.equal(findCodeGraphNodeScriptOnPath(), firstScript);
+	for (const [path, expected] of [
+		[`${firstBin};"${secondBin}"`, firstScript],
+		[`"${firstBin};${secondBin}`, secondScript],
+		[`${firstBin}";${secondBin}`, secondScript],
+		[`${secondBin};"${firstBin}"`, secondScript],
+	]) {
+		process.env.Path = path;
+		process.env.PATH = path;
+		assert.equal(findCodeGraphNodeScriptOnPath(), expected);
+	}
+});
+
 test("Windows launcher passes command metacharacters as one literal argv value", async (t) => {
 	const binDir = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-bin-")));
 	t.after(() => rmSync(binDir, { recursive: true, force: true }));
