@@ -1614,14 +1614,20 @@ function splitNativeConsentInvocation(invocation        )                    {
 	let quote                       ;
 	let escaping = false;
 	let started = false;
-	for (const character of invocation.trim()) {
+	const source = invocation.trim();
+	for (let index = 0; index < source.length; index += 1) {
+		const character = source[index] ;
 		if (escaping) {
 			current += character;
 			escaping = false;
 			started = true;
 			continue;
 		}
-		if (character === "\\" && quote !== "'") {
+		// Provider invocations are not shell commands. Keep every path backslash
+		// verbatim, including quoted UNC and drive-root paths. Outside quotes,
+		// only a backslash before whitespace joins a space-containing token.
+		const next = source[index + 1];
+		if (character === "\\" && quote === undefined && next !== undefined && /\s/.test(next)) {
 			escaping = true;
 			started = true;
 			continue;
@@ -1712,7 +1718,9 @@ function consentInvocationArguments(request                                  )  
 	if (words[0] !== "gentle-ai" || words[1] !== "review" || words[2] !== "start") throw new NativeReviewConsentBindingError("consent-invocation-not-start", "Native consent invocation is not a provider review START");
 	const arguments_ = words.slice(1);
 	if (exactConsentOption(arguments_, "--contract") !== REVIEW_INTEGRATION_CONTRACT) throw new NativeReviewConsentBindingError("consent-invocation-contract-changed", "Native consent invocation contract changed");
-	if (exactConsentOption(arguments_, "--cwd") !== request.cwd) throw new NativeReviewConsentBindingError("consent-invocation-cwd-changed", "Native consent invocation repository binding changed");
+	const providerCwd = exactConsentOption(arguments_, "--cwd");
+	const requestedCwd = normalizeNativeReviewCwd(request.cwd);
+	if (normalizeNativeReviewCwd(providerCwd) !== requestedCwd) throw new NativeReviewConsentBindingError("consent-invocation-cwd-changed", "Native consent invocation repository binding changed");
 	if (exactConsentOption(arguments_, "--target") !== request.consent.targetIdentity) throw new NativeReviewConsentBindingError("consent-invocation-target-changed", "Native consent invocation target binding changed");
 	if (exactConsentOption(arguments_, "--projection") !== request.consent.projection) throw new NativeReviewConsentBindingError("consent-invocation-projection-changed", "Native consent invocation projection binding changed");
 	const lineageId = optionalConsentLineageOption(arguments_);

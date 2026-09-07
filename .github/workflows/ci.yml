@@ -69,3 +69,7 @@ jobs:
       - name: Run Windows Git authority probe
         shell: pwsh
         run: pnpm exec node --experimental-strip-types --test tests/review-repository.test.ts
+
+      - name: Run Windows native consent boundary
+        shell: pwsh
+        run: pnpm exec node --experimental-strip-types --test tests/native-review-consent.test.ts
