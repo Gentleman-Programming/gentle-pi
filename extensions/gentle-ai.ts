@@ -143,7 +143,17 @@ import {
 	type NativeReviewModeSource,
 	type NativeReviewProcessDiagnostics,
 	type NativeStartResult,
+	type NativeReviewAssessRequest,
 } from "../lib/native-review-cli.ts";
+import {
+	verificationPlan,
+	resolveWriterProfile,
+	RDD_LINE,
+	VERIFICATION_TIER,
+	type RddLine,
+	type VerificationTier,
+	type ReviewAssessmentV1,
+} from "../lib/review-risk-assessment.ts";
 import {
 	assertReviewApprovedAcknowledgementExecuteV1,
 	decodeReviewLastEventClosureV1,
@@ -764,6 +774,77 @@ async function readRddModeStatusOnce(
 	} catch {
 		return undefined;
 	}
+}
+
+// gentle-pi#662: read-only combined native risk assessment plus the computed
+// verification plan (`lib/review-risk-assessment.ts`), for the `gentle_review`
+// tool's `assess` operation. Never throws: an unavailable/failed native
+// assess call (older binary without the verb, timeout, malformed response)
+// resolves to the `unassessable` tier, which `verificationPlan` treats the
+// same as `high` -- the fail-closed rule from gentle-pi#662.
+interface ReviewAssessmentPlanDetails {
+	schema: "gentle-pi.review-assessment-plan/v1";
+	risk: VerificationTier;
+	reasons: readonly { code: string; path: string; detail: string }[];
+	changedPaths: number;
+	changedLines: number;
+	candidate: { kind: string; baseRef: string | undefined } | null;
+	rddLine: RddLine;
+	writerProfile: "small" | "large";
+	plan: {
+		writerSelfVerification: boolean;
+		structuralReadbackOnly: boolean;
+		independentVerifier: boolean;
+		reason: string;
+	};
+}
+
+async function resolveReviewAssessmentPlan(
+	nativeReviewCli: Pick<NativeReviewCli, "reviewMode" | "assess"> | null | undefined,
+	cwd: string,
+	input: ReviewAssessInput,
+	signal?: AbortSignal,
+): Promise<ReviewAssessmentPlanDetails> {
+	if (input.baseRef !== undefined && input.committedOnly !== true) throw new Error("Review assess baseRef requires committedOnly: true");
+	if (input.baseRef === undefined && input.committedOnly !== undefined) throw new Error("Review assess committedOnly requires an explicit baseRef");
+
+	const status = await readRddModeStatusOnce(nativeReviewCli, cwd, signal);
+	const rddLine: RddLine = isValidRddModeStatus(status) ? status.effective : RDD_LINE.UNKNOWN;
+	const writerProfile = resolveWriterProfile({
+		...(input.writerModelId === undefined ? {} : { model: { id: input.writerModelId } }),
+		thinking: input.writerEffort,
+	});
+
+	let assessment: ReviewAssessmentV1 | undefined;
+	let unassessableDetail: string | undefined;
+	if (nativeReviewCli?.assess === undefined) {
+		unassessableDetail = "native review assess is unavailable: the installed gentle-ai binary does not expose the assess command.";
+	} else {
+		try {
+			const request: NativeReviewAssessRequest = {
+				cwd,
+				...(input.baseRef === undefined ? {} : { baseRef: input.baseRef, committedOnly: true as const }),
+				...(signal === undefined ? {} : { signal }),
+			};
+			assessment = await nativeReviewCli.assess(request);
+		} catch (error) {
+			unassessableDetail = `native review assess failed: ${error instanceof Error ? error.message : String(error)}`;
+		}
+	}
+
+	const risk: VerificationTier = assessment?.risk ?? VERIFICATION_TIER.UNASSESSABLE;
+	const plan = verificationPlan({ rddLine, risk, writerProfile });
+	return {
+		schema: "gentle-pi.review-assessment-plan/v1",
+		risk,
+		reasons: assessment?.reasons ?? (unassessableDetail === undefined ? [] : [{ code: "native-assess-unavailable", path: "", detail: unassessableDetail }]),
+		changedPaths: assessment?.changedPaths ?? 0,
+		changedLines: assessment?.changedLines ?? 0,
+		candidate: assessment === undefined ? null : { kind: assessment.candidate.kind, baseRef: assessment.candidate.baseRef },
+		rddLine,
+		writerProfile,
+		plan,
+	};
 }
 
 let rddStatusUnavailableWarned = false;
@@ -2798,6 +2879,9 @@ const REVIEW_CONTROLLER_OPERATION = {
 	RECONCILE_AUTHORITY: "reconcile-authority",
 	REPAIR_LEGACY_ALIAS: "repair-legacy-alias",
 	REPAIR: "repair",
+	// gentle-pi#662: read-only native risk assessment (gentle-ai#4295). Never
+	// mutates review authority state and never requires a lineageId.
+	ASSESS: "assess",
 } as const;
 
 type ReviewControllerOperation =
@@ -2844,7 +2928,7 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 		},
 		input: {
 			type: "string",
-			description: "A JSON-serialized object string, not a nested object. New native ordinary START uses {\"mode\":\"ordinary\"}; answer-consent uses exactly {\"consentBinding\":\"<opaque id>\",\"answer\":\"granted|declined\"}. Ordinary provider capture belongs only to gentle_review_capture. An explicit baseRef requires committedOnly: true and requests a committed range, while repository-local policyPath remains optional. Legacy controller input remains separate.",
+			description: "A JSON-serialized object string, not a nested object. New native ordinary START uses {\"mode\":\"ordinary\"}; answer-consent uses exactly {\"consentBinding\":\"<opaque id>\",\"answer\":\"granted|declined\"}. Ordinary provider capture belongs only to gentle_review_capture. An explicit baseRef requires committedOnly: true and requests a committed range, while repository-local policyPath remains optional. ASSESS accepts an optional object with baseRef, committedOnly, writerModelId, and writerEffort (gentle-pi#662); omitting writerModelId and writerEffort assesses the ambient working tree and fails closed to a small writer profile (never large) because the writer's actual profile is unknown to this call. Legacy controller input remains separate.",
 		},
 		outputPath: { type: "string", description: "Retired with legacy bundle export; ignored. Export returns legacy-operation-retired." },
 		inputPath: { type: "string", description: "Repository-local JSON input file for the separate legacy controller flow (alternative to input). Legacy bundle import is retired." },
@@ -2932,6 +3016,38 @@ interface ReviewScopeParameters {
 	cursor?: number;
 }
 
+// gentle-pi#662: read-only native risk assessment, gating the separate
+// verifier on native risk instead of a task-description judgment when the
+// rendered `Receipt-driven development:` line is `off` or `unknown`. Exposed
+// as `gentle_review` operation `assess` (not a dedicated tool), taking its
+// optional fields through the controller's existing generic `input` JSON
+// string, exactly like START's `{"mode":...,"baseRef":...}`.
+interface ReviewAssessInput {
+	baseRef?: string;
+	committedOnly?: boolean;
+	writerModelId?: string;
+	writerEffort?: string;
+}
+
+function parseReviewAssessInput(operation: ReviewControllerOperation, raw: string | undefined): ReviewAssessInput {
+	if (raw === undefined) return {};
+	const value = parseControllerJson(raw, operation);
+	const allowed = new Set(["baseRef", "committedOnly", "writerModelId", "writerEffort"]);
+	const unexpected = Object.keys(value).find((key) => !allowed.has(key));
+	if (unexpected !== undefined) throw new Error(`Review controller ${operation} input does not accept ${unexpected}`);
+	const { baseRef, committedOnly, writerModelId, writerEffort } = value;
+	if (baseRef !== undefined && typeof baseRef !== "string") throw new Error(`Review controller ${operation} input baseRef must be a string`);
+	if (committedOnly !== undefined && typeof committedOnly !== "boolean") throw new Error(`Review controller ${operation} input committedOnly must be a boolean`);
+	if (writerModelId !== undefined && typeof writerModelId !== "string") throw new Error(`Review controller ${operation} input writerModelId must be a string`);
+	if (writerEffort !== undefined && typeof writerEffort !== "string") throw new Error(`Review controller ${operation} input writerEffort must be a string`);
+	return {
+		...(baseRef === undefined ? {} : { baseRef: baseRef as string }),
+		...(committedOnly === undefined ? {} : { committedOnly: committedOnly as boolean }),
+		...(writerModelId === undefined ? {} : { writerModelId: writerModelId as string }),
+		...(writerEffort === undefined ? {} : { writerEffort: writerEffort as string }),
+	};
+}
+
 interface ReviewControllerParameters {
 	operation: ReviewControllerOperation;
 	lineageId?: string;
@@ -2976,7 +3092,7 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 		if (unexpected !== undefined || typeof value.selectionBinding !== "string" || !Array.isArray(value.intendedUntracked) || (value.workspaceRoot !== undefined && typeof value.workspaceRoot !== "string")) throw new Error("Review intended-untracked selection accepts exactly selectionBinding and intendedUntracked, with optional workspaceRoot");
 		return { operation: value.operation, selectionBinding: value.selectionBinding, intendedUntracked: value.intendedUntracked, ...(typeof value.workspaceRoot === "string" ? { workspaceRoot: value.workspaceRoot } : {}) };
 	}
-	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT, REVIEW_CONTROLLER_OPERATION.STATUS, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.ABANDON, REVIEW_CONTROLLER_OPERATION.QUARANTINE_LEGACY, REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY, REVIEW_CONTROLLER_OPERATION.REPAIR_LEGACY_ALIAS, REVIEW_CONTROLLER_OPERATION.REPAIR].includes(value.operation as ReviewControllerOperation);
+	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT, REVIEW_CONTROLLER_OPERATION.STATUS, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.ABANDON, REVIEW_CONTROLLER_OPERATION.QUARANTINE_LEGACY, REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY, REVIEW_CONTROLLER_OPERATION.REPAIR_LEGACY_ALIAS, REVIEW_CONTROLLER_OPERATION.REPAIR, REVIEW_CONTROLLER_OPERATION.ASSESS].includes(value.operation as ReviewControllerOperation);
 	if (needsLineage && (typeof value.lineageId !== "string" || value.lineageId.trim().length === 0)) {
 		throw new Error("Review controller requires a lineageId");
 	}
@@ -5389,6 +5505,15 @@ async function executeReviewControllerOperation(
 			next_action: "Use the native `gentle-ai review` CLI (start/finalize/validate/status/recover) against the repository review authority; receipts and canonical artifacts live in the Git common-directory store at .git/gentle-ai/reviews and travel with the repository through normal Git replication.",
 		};
 	}
+	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.ASSESS) {
+		// Read-only native risk assessment (gentle-ai#4295, gentle-pi#662). Never
+		// mutates, never requires a lineageId, and never routes through
+		// authorizeDestructiveReviewOperation (it returns early for any
+		// operation that is neither RESET nor a maintenance operation).
+		const input = parseReviewAssessInput(parameters.operation, parameters.input);
+		const details = await resolveReviewAssessmentPlan(nativeReviewCli, defaultCwd, input, signal);
+		return { operation: parameters.operation, ...details, ...(includeWorkspaceRoot ? { workspace_root: defaultCwd } : {}) };
+	}
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.REPAIR_LEGACY_ALIAS) {
 		const input = parseControllerJson(requiredControllerString(parameters, "input"), parameters.operation);
 		return await executeNativeLegacyAliasRepair(input, defaultCwd, nativeReviewCli, signal, context);
@@ -6352,6 +6477,7 @@ function createGentleAiExtensionForTesting(
 			"For blocked-legacy or blocked-mixed, do not call START repeatedly. Explain invalidation, request explicit user authorization, then call RESET or RECOVER only after authorization. RESET and RECOVER_LOCK route to audited native `gentle-ai review reclaim`; only RESET carries the legacy repositoryId, commonDirHash, inventoryHash, and confirmation challenge. RECOVER routes to native `gentle-ai review recover` with exactly six inputs: predecessorLineage, expectedPredecessorRevision, successorLineage, disposition, actor, and reason. Never send RECOVER the reset challenge and never send it a maintainerAuthorization: Pi reads fresh native target status, pins the predecessor lineage, revision, provider-selected disposition, and target identity, derives the exact six-line native authorization binding, displays it for fresh UI approval, and re-reads status before mutating. Negotiated target status supplies the sole accepted recovery disposition, and a caller-supplied substitute is rejected. Treat a native-input-required envelope as a request for exact values, never as permission to invent them. After a committed native recovery record, INSPECT before any fresh ordinary START.",
 			"A consent-required START may be resolved inside the eligible interactive Pi host. Its third UI action is host-owned: it runs this envelope's exact provider grant once and allows later fresh validated envelopes only for the same live SessionManager, nonempty session ID, and canonical Git common-directory identity, including sibling worktrees; an unrelated repository requires a new explicit human grant. Revoke removes the current repository grant, while nonreload replacement, quit, and process exit remove all session grants; reload preserves them. It grants no provider mode, verdict, acknowledgement, maintenance, delivery, or cross-repository authority. A package-owned child may ask its parent only with the canonical digest of its exact pending target; the parent binds that digest to the task repository and fails closed otherwise. If the tool returns an unresolved envelope, present the original two provider choices without changing machine tokens, commands, target IDs, or invocations; never add the host action to the decoded provider envelope. After one explicit relayed human answer, call answer-consent exactly once with only consentBinding and answer (`granted` or `declined`). Never create host permission from tool arguments, model prose, child/headless responses, or an uncertain native result. A reported lineage_created false or pre-authority validation error proves no lineage was created. After ambiguous START output, the controller calls target-scoped native status once and returns only its declared action. An ambiguous gentle_review_capture outcome independently reconciles once and never replays the capture.",
 			"Use gentle_review only for native review authority operations; delivery commands follow ordinary repository policy.",
+			'ASSESS (gentle-pi#662) is read-only and needs no lineageId: after a delegated writer returns, call {"operation":"assess"} over its diff and follow the returned plan (writerSelfVerification, structuralReadbackOnly, independentVerifier, reason) instead of judging non-triviality from the task description. Pass input as JSON only to assess a committed range ({"baseRef":"<ref>","committedOnly":true}) or to record the writer profile ({"writerModelId":"...", "writerEffort":"..."}). Omitting writerModelId and writerEffort is treated as a small writer profile (fail closed), never large, because the writer\'s actual profile is then unknown to this call; pass the writer\'s real model id/effort to get credit for a known large profile. A failed or unavailable native assessment reports risk "unassessable", verified exactly like "high". This never mutates review authority state.',
 		],
 		parameters: REVIEW_CONTROLLER_PARAMETERS,
 		executionMode: "sequential",
