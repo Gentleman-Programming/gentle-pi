@@ -15,7 +15,6 @@ import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, parseCodexUsage, p
 import { UsageView } from "../lib/shell-usage-view.ts";
 import { sidebarPart } from "../lib/shell-sidebar.ts";
 import { installSidebar } from "../lib/shell-sidebar-layout.ts";
-import { readSidebarBannerConfig } from "../lib/shell-sidebar-banner.ts";
 
 // Gentle Shell: the visual layer gentle-pi puts on top of pi. It installs the
 // status bar, the petal prompt, the working-tree changes widget and overlay,
@@ -546,13 +545,6 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		if (!ctx.hasUI) return;
 		changes = new WorktreeChangesTracker(deps.gitRunner(ctx.cwd), deps.gitRunner, lineCounter, () => sessionRegistry.roots());
 		const tracker = changes;
-		// Install the editor/footer synchronously. Keep branding hidden until its
-		// saved preferences resolve, so an explicit opt-out never flashes on screen.
-		const banner = { showRose: false, showTextLogo: false };
-		void readSidebarBannerConfig().then((config) => {
-			Object.assign(banner, config);
-			renderHost?.requestRender();
-		});
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			renderHost = tui;
 			const bottom = createShellBarComponent(pi, ctx, tui, theme, footerData, () => tracker.model.files.length, () => usage.get(ctx.model?.provider ?? ""));
@@ -560,7 +552,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				render: (width) => renderShellSidebarBar(buildShellBarModel(pi, ctx, footerData, { dirty: tracker.model.files.length, usage: usage.get(ctx.model?.provider ?? "") }), theme, width),
 				invalidate() {},
 			});
-			const uninstall = installSidebar(tui, theme, banner);
+			const uninstall = installSidebar(tui, theme);
 			return { ...part, dispose() { uninstall(); part.dispose(); } };
 		});
 		void refreshUsage(ctx, true);

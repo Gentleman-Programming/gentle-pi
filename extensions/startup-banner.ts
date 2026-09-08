@@ -44,6 +44,26 @@ const TEXT_LOGO = [
   "     ▒▒▒▒▒▒",
 ];
 
+const ROSE_LARGE_RAW = [
+  "             ⣠⣾⣷⣶⣦⣤⣤⣄⣠⣄⣀  ⢀⣀⣀",
+  "          ⢀⣴⣿⣿⠿⣋⣭⣭⣯⣭⣍⣭⣿⣟⠛⠛⠿⣿⣷⣄",
+  "      ⢀⣴⣾⡟⢻⣿⡟⠁⣼⣿⠏⣵⢻⣿⣻⣿⣿⢿⡻⣿⣿⣶⡌⢿⣿⣷⣦⣤⡄",
+  "   ⣤⣶⣾⣿⣿⠏ ⠈⢿⣄ ⢹⣏⠠⠟⣾⣿⣿⣿⣿⣿⠷⣏⣼⠟⢡⣿⡟⠋⢻⣿⣿⡄",
+  "   ⠈⣿⣿⣿⣿⡆   ⣽⢧⡘⠈⠳⣦⣍⠛⠛⢦⣉⣴⣛⣫⣭⣴⡟⠋  ⣾⣿⣿⡿",
+  "   ⢀⠹⣿⣿⣿⣷⣤⡄ ⠋ ⠙⢆ ⣠⠴⠟⠛⣛⣛⣛⠟⠋⠁⠺⡇ ⣀⣴⣿⣿⡟⠁",
+  "   ⠈⣀⠈⠛⠷⠿⣿⣿⣷⣤⣀ ⢠⠋   ⠈⠉⠉    ⣠⣴⣥⠾⠛⠉⣰⣿⣷",
+  "          ⠹⣯⣝⠛⠛⠷⢶⣤⣤⣀   ⢀⡠⠖⠋⠉⢉⣀⣀⣴⣾⣿⠿⠟⠃",
+  "             ⠘⠻⢿⣦⣄⡀  ⠉⠛⢦⠠⢊⠤⠴⢒⣛⣛⣩⣽⡿⠟⠁",
+  "        ⠶⢶⣤⣄⡀⠨⠭⠽⠟⣓⢦⣀⠈⢇⡥⠖⠛⠋⠉⠉",
+  "           ⠈⢷ ⠐⠂⢤⣽⣄ ⠰⡎⠙⠳⣄⡀ ⠈⢣⠘⢦⠋",
+  "            ⠈⢳⣀⡒⠉⠉⣉⠙⡲⣽⣄ ⣏⠳⡄ ⠘⡇ ⡾⠁",
+  "              ⠛⠻⢦⣄⣉⡁⣀⣀⣈⣙⣺⣌⡇⢠⢀⡇⡾",
+  "                   ⠈⠉    ⠈⠳⡄⣸⢱⠇",
+  "                           ⡷⠡⡯⢖⠉",
+  "                        ⢀⡴⢪⠔⣉⠔⠋",
+  "                           ⠐⠈",
+];
+
 function rgb(r: number, g: number, b: number, text: string): string {
   return `\x1b[38;2;${r};${g};${b}m${text}\x1b[39m`;
 }
@@ -513,9 +533,9 @@ export default function (pi: ExtensionAPI) {
   const notifyBannerConfig = (ctx: any, config: BannerConfig) => {
     ctx.ui.notify(
       [
-        `Sidebar branding: rose=${config.showRose ? "on" : "off"}, text logo=${config.showTextLogo ? "on" : "off"}; startup context color=${config.color}`,
+        `Startup banner: rose=${config.showRose ? "on" : "off"}, text logo=${config.showTextLogo ? "on" : "off"}, color=${config.color}`,
         `Config: ${bannerConfigPath()}`,
-        "Visibility applies on the next session or /reload. Sidebar colors follow your theme.",
+        "Changes apply on the next startup banner render.",
       ].join("\n"),
       "info",
     );
@@ -523,10 +543,10 @@ export default function (pi: ExtensionAPI) {
 
   const registerBannerCommand = (name: string) => {
     pi.registerCommand(name, {
-      description: "Configure sidebar branding visibility and startup context color.",
+      description: "Configure the Gentle Pi startup banner.",
       handler: async (_args, ctx) => {
         const config = await readBannerConfig();
-        const selected = await ctx.ui.select("Sidebar branding / startup context", [
+        const selected = await ctx.ui.select("Startup banner", [
           `Rose: ${config.showRose ? "on" : "off"}`,
           `Text logo: ${config.showTextLogo ? "on" : "off"}`,
           `Color: ${config.color}`,
@@ -546,7 +566,7 @@ export default function (pi: ExtensionAPI) {
   };
   const registerToggleCommand = (name: string, key: "showRose" | "showTextLogo") => {
     pi.registerCommand(name, {
-      description: `Toggle sidebar ${key === "showRose" ? "rose" : "text logo"}.`,
+      description: `Toggle startup banner ${key === "showRose" ? "rose" : "text logo"}.`,
       handler: async (_args, ctx) => {
         const config = await readBannerConfig();
         config[key] = !config[key];
@@ -594,6 +614,9 @@ export default function (pi: ExtensionAPI) {
     // clearing stdout here would leave its previous-frame cache out of sync.
     const bannerConfig = await readBannerConfig();
     const palette = BANNER_PALETTES[bannerConfig.color];
+    const roseBase = padLines(normalizeAscii(ROSE_LARGE_RAW));
+    const logoBase = padLines(TEXT_LOGO);
+    void warmupLetterStrokes();
 
     let gitBranch = "Not a git repo";
     let mcpServersCount = 0;
@@ -654,7 +677,7 @@ export default function (pi: ExtensionAPI) {
       })();
     }, 200);
 
-    const tick = 0;
+    let tick = 0;
     let refreshStats = () => {};
     const state = {
       timer: null as NodeJS.Timeout | null,
@@ -684,8 +707,17 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setHeader((tui, theme) => {
         if (state.timer) clearInterval(state.timer);
 
-        // Context updates request ordinary Pi renders; there is no artwork timer.
         refreshStats = () => tui.requestRender();
+        const animStart = Date.now();
+        state.timer = setInterval(() => {
+          tick++;
+          const finished = allStrokesReady() && tick > WRITING_END_TICK + 22;
+          if (finished || Date.now() - animStart > 5000) {
+            clearInterval(state.timer!);
+            state.timer = null;
+          }
+          try { tui.requestRender(); } catch { cleanup(); }
+        }, 25);
 
         // Grace period: pi-tui emite resizes transitorios mientras compone su layout inicial.
         const bootStart = Date.now();
@@ -697,8 +729,7 @@ export default function (pi: ExtensionAPI) {
             const next = currentIntroMode();
             if (next === state.mode) return;
             state.mode = next;
-            // render() returns no lines in skip mode; Pi owns their removal.
-            if (next === "skip") cleanup();
+            // Pi owns removal in skip mode; keep listening for later expansion.
             try {
               tui.requestRender();
             } catch {
@@ -721,6 +752,9 @@ export default function (pi: ExtensionAPI) {
                 : 0;
             const frame = Math.floor(tick / 2);
 
+            const sideBySideMinWidth = roseBase.width + 3 + logoBase.width + 4;
+            const horizontal =
+              state.mode === "full" && bannerConfig.showRose && bannerConfig.showTextLogo && width >= sideBySideMinWidth;
             const wideStatsMinWidth = 122;
             const wideStats = width >= wideStatsMinWidth;
 
@@ -728,9 +762,65 @@ export default function (pi: ExtensionAPI) {
             b.addRow();
             b.center(width);
 
-            // Branding belongs exclusively to the desktop sidebar. Keep startup
-            // context here regardless of the independent rose/wordmark preferences.
-            {
+            if (state.mode === "minimal") {
+              if (bannerConfig.showTextLogo) for (let logoI = 0; logoI < logoBase.lines.length; logoI++) {
+                const logoLine = logoBase.lines[logoI];
+                b.addRow();
+                b.lines[b.lines.length - 1].push(
+                  ...buildPenLogoLine(logoLine, logoI, logoBase.lines.length, tick),
+                );
+                b.center(width);
+              }
+            } else if (horizontal) {
+              const rowCount = Math.max(roseBase.lines.length, logoBase.lines.length);
+              const roseOffset = Math.max(0, Math.floor((rowCount - roseBase.lines.length) / 2));
+              const logoOffset = Math.max(0, Math.floor((rowCount - logoBase.lines.length) / 2));
+              for (let i = 0; i < rowCount; i++) {
+                const roseI = i - roseOffset;
+                const logoI = i - logoOffset;
+                const roseLine = roseI >= 0 && roseI < roseBase.lines.length
+                  ? roseBase.lines[roseI] : " ".repeat(roseBase.width);
+                const logoLine = logoI >= 0 && logoI < logoBase.lines.length
+                  ? logoBase.lines[logoI] : " ".repeat(logoBase.width);
+                b.addRow();
+                b.add("rose", roseLine);
+                b.add("none", "   ");
+                if (logoI >= 0 && logoI < logoBase.lines.length) {
+                  b.lines[b.lines.length - 1].push(
+                    ...buildPenLogoLine(logoLine, logoI, logoBase.lines.length, tick),
+                  );
+                } else {
+                  b.add("none", " ".repeat(logoBase.width));
+                }
+                b.center(width);
+              }
+            } else {
+              const showBanner = bannerConfig.showTextLogo && width >= logoBase.width + 2;
+              const showRose = bannerConfig.showRose && width >= roseBase.width + 2;
+              if (showBanner) {
+                for (let logoI = 0; logoI < logoBase.lines.length; logoI++) {
+                  const logoLine = logoBase.lines[logoI];
+                  b.addRow();
+                  b.lines[b.lines.length - 1].push(
+                    ...buildPenLogoLine(logoLine, logoI, logoBase.lines.length, tick),
+                  );
+                  b.center(width);
+                }
+                if (showRose) {
+                  b.addRow();
+                  b.center(width);
+                }
+              }
+              if (showRose) {
+                for (const roseLine of roseBase.lines) {
+                  b.addRow();
+                  b.add("rose", roseLine);
+                  b.center(width);
+                }
+              }
+            }
+
+            if (state.mode === "full" || (!bannerConfig.showRose && !bannerConfig.showTextLogo)) {
               b.addRow();
               b.center(width);
 

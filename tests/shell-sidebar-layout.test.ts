@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ScrollView, type TUI } from "@earendil-works/pi-tui";
+import { ScrollView, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { installSidebar } from "../lib/shell-sidebar-layout.ts";
 import { sidebarPart, sidebarState } from "../lib/shell-sidebar.ts";
 import { renderShellSidebarBar } from "../lib/shell-bar.ts";
@@ -57,7 +57,7 @@ test("installation on a missing-terminal host is a harmless no-op", () => {
 test("only fullscreen at 140 columns activates; shrinking restores bottom paint", (t) => {
 	for (const [mode, width, active] of [["regular", 140, false], ["fullscreen", 139, false], ["fullscreen", 140, true]] as const) {
 		const f = fixture(mode, width);
-		t.after(installSidebar(f.tui, theme, { showRose: true, showTextLogo: true }));
+		t.after(installSidebar(f.tui, theme));
 		assert.equal(f.root[NODE]().type, active ? "hstack" : "vstack");
 		assert.deepEqual(f.bottom.render(80), active ? [] : ["Status"]);
 		f.host.terminal.columns = 139;
@@ -72,19 +72,24 @@ test("rail orders Status, changes, agents, TODO independent of registration orde
 		sidebarPart(f.tui, key, { render: () => [key, ""], invalidate() {} });
 	}
 	t.after(installSidebar(f.tui, theme));
-	assert.deepEqual(rail(f).render(50).map((line) => line.trim()), ["Status", "", "changes", "", "agents", "", "todo"]);
+	assert.deepEqual(rail(f).render(50).map((line) => line.trim()), ["✿ Gentle-Pi ✿", "", "Status", "", "changes", "", "agents", "", "todo"]);
 });
 
 test("branding belongs to scroll content before Status, never transcript or narrow bottom", (t) => {
 	const f = fixture();
-	t.after(installSidebar(f.tui, theme, { showRose: true, showTextLogo: true }));
+	t.after(installSidebar(f.tui, theme));
 	const scroll = rail(f);
 	const lines = scroll.render(50);
-	const brandIndex = lines.findIndex((line) => line.includes("GENTLE PI"));
+	const brandIndex = lines.findIndex((line) => line.includes("✿ Gentle-Pi ✿"));
 	assert.ok(brandIndex >= 0 && brandIndex < lines.findIndex((line) => line.includes("Status")));
-	assert.match(lines.join("\n"), /[\u2800-\u28ff]/);
+	assert.doesNotMatch(lines.join("\n"), /[\u2800-\u28ff]/);
+	const heading = lines[brandIndex];
+	const usableWidth = scroll.getContentWidth(50) - 2;
+	const spare = usableWidth - visibleWidth("✿ Gentle-Pi ✿");
+	const scrollbarWidth = 50 - scroll.getContentWidth(50);
+	assert.equal(heading, " ".repeat(1 + Math.floor(spare / 2)) + "✿ Gentle-Pi ✿" + " ".repeat(1 + Math.ceil(spare / 2) + scrollbarWidth));
 	assert.deepEqual(f.root.render(), ["transcript"]);
-	scroll.updateLayout(lines.length, 3, () => {});
+	scroll.updateLayout(lines.length, 2, () => {});
 	scroll.scrollBy(9);
 	assert.ok(scroll.scrollTop > 0);
 	f.host.terminal.columns = 80;

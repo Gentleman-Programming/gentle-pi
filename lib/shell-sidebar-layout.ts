@@ -1,7 +1,7 @@
 import { ScrollView, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { sidebarState } from "./shell-sidebar.ts";
 import type { ShellBarTheme } from "./shell-bar.ts";
-import { renderSidebarBanner, type SidebarBannerConfig } from "./shell-sidebar-banner.ts";
+import { renderSidebarBanner } from "./shell-sidebar-banner.ts";
 
 export const SIDEBAR_BREAKPOINT = 140;
 const RAIL_WIDTH = 50;
@@ -14,7 +14,7 @@ type LayoutNode = { type: string; entries?: unknown[]; gap?: number; align?: str
 type LayoutRoot = Component & { [NODE]?: () => LayoutNode };
 type Host = TUI & { mode?: string; layoutRoot?: LayoutRoot };
 
-export function installSidebar(tui: TUI, theme: ShellBarTheme, banner: SidebarBannerConfig = { showRose: false, showTextLogo: false }): () => void {
+export function installSidebar(tui: TUI, theme: ShellBarTheme): () => void {
 	if (!tui.terminal) return () => {};
 	const host = tui as Host;
 	const state = sidebarState(tui);
@@ -59,7 +59,7 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme, banner: SidebarBa
 				while (lines.length && lines[lines.length - 1]?.trim() === "") lines.pop();
 				return lines;
 			}).filter((lines) => lines.length > 0);
-			const branding = renderSidebarBanner(theme, contentWidth - RAIL_PADDING * 2, banner);
+			const branding = renderSidebarBanner(theme, contentWidth - RAIL_PADDING * 2);
 			if (sections.length && branding.length) sections.unshift(branding);
 			railLines = sections.flatMap((lines, index) => [
 				...(index === 0 ? [] : [""]),
