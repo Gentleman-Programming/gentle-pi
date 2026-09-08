@@ -17,6 +17,7 @@ export interface ChildLike {
 	kill(signal?: NodeJS.Signals): boolean;
 	on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
 	on(event: "error", listener: (error: Error) => void): unknown;
+	on(event: "spawn", listener: () => void): unknown;
 }
 
 export interface SpawnOptions {
@@ -75,6 +76,8 @@ export interface TaskRequest {
 	sessionDir: string;
 	resumeSessionPath: string | undefined;
 	env: NodeJS.ProcessEnv;
+	// Captures the originating session; invoked only after successful OS spawn.
+	onLaunch?: () => void;
 	// This closure stays only in the parent process. Its presence creates an
 	// inherited fd, never an environment boolean or model-visible permission.
 	authorizeParentStandingReviewPermission?: (repositoryIdentity: string) => boolean;
@@ -294,6 +297,13 @@ export class AgentRunner {
 		}
 		this.store.update(id, { status: TASK_STATUS.RUNNING, startedAt: this.deps.now(), lastStep: "starting" });
 		child.on("error", (error) => this.childError(id, error));
+		let announced = false;
+		child.on("spawn", () => {
+			if (announced || this.live.get(id) !== live || live.terminal) return;
+			announced = true;
+			try { request.onLaunch?.(); }
+			catch (error) { this.requestStop(id, TASK_STATUS.FAILED, `could not register launched worktree: ${error instanceof Error ? error.message : String(error)}`); }
+		});
 		child.stdin.on("error", () => {});
 		this.armStall(id, live);
 		const lines = new JsonLines((value) => this.receive(id, request, value));

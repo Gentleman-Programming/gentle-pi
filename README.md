@@ -85,7 +85,7 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | **Skill creation workflow**    | Provides the `gentle-ai-skill-creator`/`gentle-ai-skill-improver` skills, `/skill-creation` prompt, and packaged style guide for LLM-first skills. |
 | **Delivery skills**            | Includes issue-first PRs, chained PRs, work-unit commits, cognitive docs, comment writing, and Judgment Day review.                           |
 | **Bounded native review**      | Freezes one candidate, dispatches only controller-selected lenses, and records native authority. Review outcomes are informational; delivery follows ordinary repository policy. |
-| **Verified native runtime**    | Provisions the exact package-local Gentle AI v2.6.0 runtime: signed, SHA-256-pinned release archives on Darwin/Linux and a Go SumDB-verified source build on Windows x64/arm64. It validates package-local integrity and rejects PATH, global, sibling, symlink, and mode fallbacks. |
+| **Verified native runtime**    | Provisions the exact package-local Gentle AI v2.7.0 runtime: signed, SHA-256-pinned release archives on Darwin/Linux and a Go SumDB-verified source build on Windows x64/arm64. It validates package-local integrity and rejects PATH, global, sibling, symlink, and mode fallbacks. |
 | **Runtime safety**             | Blocks destructive shell commands, asks for confirmation for sensitive operations, and blocks direct read/write/edit access to sensitive paths. |
 
 ## Native pointer regions
@@ -110,13 +110,21 @@ Pointer input is fullscreen-only. Regions preserve a consuming child's native re
 `Text`, activate on press or wheel, synthesize outside leave events, or alter terminal tracking.
 Callers own keyboard policy, theme state, and business actions.
 
-**Migration note:** Do not enable `pi-tool-cards` and `quiet-tools` together: Pi rejects duplicate `bash`, `read`, `edit`, and `write` registrations. Disable or remove the standalone package during migration; gentle-pi does not alter user configuration or delete that repository.
+**Migration note:** Do not enable `pi-tool-cards` and `quiet-tools` together: Pi rejects duplicate `bash`, `read`, `edit`, and `write` registrations. Disable or remove the standalone package during migration; gentle-pi does not change those package registrations or delete that repository. The global fullscreen setting described below is a separate install-time change.
 
 ## Install
 
 ```bash
 pi install npm:gentle-pi@0.14.0
 ```
+
+### Install-time fullscreen
+
+For this release, a successful postinstall in Pi's **global npm-managed** `agent-home/npm/node_modules/gentle-pi` installation persists `"tuiMode": "fullscreen"` in `agent-home/settings.json`, preserving other settings. Agent home resolves through `GENTLE_PI_AGENT_HOME`, then `PI_CODING_AGENT_DIR`, then `~/.pi/agent`. Use `/settings` to switch back to regular; rerunning this recognized postinstall resets it to fullscreen. Existing project overrides still take precedence.
+
+Project-local installs (`pi install -l`), Git/local-path installs, temporary packages, development checkouts, ordinary npm consumers, and pnpm symlink-store packages do **not** receive this change. Updates or installs that do not execute postinstall cannot reassert it; this is not a universal install/update guarantee or a change to historical releases.
+
+Malformed/nonobject JSON, symlink/nonregular settings, unsafe paths, or a busy settings lock fail without replacing settings. The installer coordinates with Pi's cooperative settings lock and uses atomic replacement; it does not guarantee safety against noncooperating writers or malicious concurrent directory replacement. Already-fullscreen settings remain byte-identical. Native installation failure leaves settings untouched; `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1` skips only native provisioning, not the recognized global fullscreen setting.
 
 ### RDD version policy
 
@@ -130,7 +138,7 @@ pi install npm:gentle-pi@0.14.0
 pi install npm:gentle-pi@latest
 ```
 
-The latest RDD package installs Gentle AI only into its private `.gentle-ai/` directory. Darwin and Linux use pinned release assets with asset and executable SHA-256 verification (signed archives for stable pins such as the current v2.6.0; raw prerelease binaries only under a prerelease pin). Windows x64 and arm64 build the exact `v2.6.0` source tag with a local Go 1.25.10+ toolchain, a sealed Go environment, `GOTOOLCHAIN=local`, and `GOSUMDB=sum.golang.org`; it does not download Go automatically. Windows provenance is Go-toolchain plus SumDB evidence and postinstall tamper detection, **not** Authenticode or protection against a malicious joint binary-and-manifest replacement. Package-private locks coordinate cooperative concurrent or crashed installers; their tombstones fail closed. A malicious same-user process with write access to package-private `node_modules` is outside that protocol because it can already replace package code, binary, or manifest, and portable Node has no pathname-delete CAS. It never uses `PATH` or a global `gentle-ai` installation. For development or offline installs only, set `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1`; native review operations then fail closed with an actionable `package-local-binary-missing` error until the package is reinstalled normally.
+The latest RDD package installs Gentle AI only into its private `.gentle-ai/` directory. Darwin and Linux use pinned release assets with asset and executable SHA-256 verification (signed archives for stable pins such as the current v2.7.0; raw prerelease binaries only under a prerelease pin). Windows x64 and arm64 build the exact `v2.7.0` source tag with a local Go 1.25.10+ toolchain, a sealed Go environment, `GOTOOLCHAIN=local`, and `GOSUMDB=sum.golang.org`; it does not download Go automatically. Windows provenance is Go-toolchain plus SumDB evidence and postinstall tamper detection, **not** Authenticode or protection against a malicious joint binary-and-manifest replacement. Package-private locks coordinate cooperative concurrent or crashed installers; their tombstones fail closed. A malicious same-user process with write access to package-private `node_modules` is outside that protocol because it can already replace package code, binary, or manifest, and portable Node has no pathname-delete CAS. It never uses `PATH` or a global `gentle-ai` installation. For development or offline installs only, set `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1`; native review operations then fail closed with an actionable `package-local-binary-missing` error until the package is reinstalled normally.
 
 Recommended companion packages:
 
@@ -284,13 +292,13 @@ flowchart TD
 
 VALIDATE is informational. Commit, push, PR, and release commands follow ordinary repository policy; RDD never authorizes, rewrites, consumes review state for, or blocks them. Dangerous-command safety and destructive-review consent remain independent.
 
-Native contract pairing is exact: this adapter resolves only the integrity-verified package-local Gentle AI v2.6.0 executable, independently hashes it, then negotiates `gentle-ai.review-integration/v2` outside the repository. Capabilities are cached by that executable digest. Every START, target status, FINALIZE, validate, and BIND-SDD request passes the same contract identifier. Negotiated envelopes decode exactly against the vendored schemas; `recover` routes only the provider-selected `action_disposition`, and optional additions require a future compatible schema/minor that the provider explicitly advertises and the consumer negotiates.
+Native contract pairing is exact: this adapter resolves only the integrity-verified package-local Gentle AI v2.7.0 executable, independently hashes it, then negotiates `gentle-ai.review-integration/v2` outside the repository. Capabilities are cached by that executable digest. Every START, target status, FINALIZE, validate, and BIND-SDD request passes the same contract identifier. Negotiated envelopes decode exactly against the vendored schemas; `recover` routes only the provider-selected `action_disposition`, and optional additions require a future compatible schema/minor that the provider explicitly advertises and the consumer negotiates.
 
 Contract `/v2` replaces the Base64 `candidate_diff` reviewer transport of `/v1` with immutable `base_tree`/`candidate_tree` plus an ordered `changed_path_manifest` and never an inline patch. `gentle-pi` negotiates `/v2` only, with no dual-lane fallback; the cutover landed as one atomic commit against gentle-ai v2.2.2 (tracked by the `migrate-review-integration-v2` change), and the `/v1` schemas stay packaged because the `/v2` schemas `$ref` into their fragments. This provider contract version is unrelated to Pi's own internal "compact-v2" review-authority naming used below — the shared digit is coincidental, not a version pairing.
 
 Target status owns `current_target`, `unrelated`, `ambiguous`, and `corrupted` applicability and returns one native action. Pi does not reconstruct ordinary authority from provider-private files or choose a lineage from repository-wide history. Restart recovery rebuilds only the derived candidate view from the native Git/content projection, including intended-untracked paths, symlinks, and immutable gitlink identities. Native failure envelopes retain their exact mutation outcome, replayability, required inputs, request digest, and next action. After an unknown or lost mutating result, Pi calls target status before any replay decision and returns only the provider-declared action.
 
-Once the pinned gentle-ai runtime (currently v2.6.0) has written review authority, rollback MUST preserve every native store and receipt and MUST NOT run a downgraded binary against that repository. Disable the Pi route or roll forward to a compatible authority-aware release instead; deleting authority data or reinstalling an older binary is not a rollback path.
+Once the pinned gentle-ai runtime (currently v2.7.0) has written review authority, rollback MUST preserve every native store and receipt and MUST NOT run a downgraded binary against that repository. Disable the Pi route or roll forward to a compatible authority-aware release instead; deleting authority data or reinstalling an older binary is not a rollback path.
 
 ### FINALIZE wrapper input
 
@@ -612,6 +620,8 @@ Legacy string entries are still accepted and treated as `model`-only config.
 
 Gentle Shell is the visual layer gentle-pi puts on top of pi. It follows the Gentle themes: one border language, champagne titles, rose for whatever is alive.
 
+In fullscreen at 140 columns or wider, the right sidebar scrolls **✿ Gentle-Pi ✿ → Status → Changes → Agents → TODO** together. The one-line heading is horizontally centered within the usable rail width, with pink flowers and normal white text in the Gentleman themes. Colors follow the active theme; no artwork scaling or custom fonts are used. Narrow/mobile terminals and regular mode retain bottom widgets without the sidebar heading. The original rose and text logo remain in the main chat startup intro.
+
 The status bar replaces pi's three-line footer with a single line of segments:
 
 ```text
@@ -636,22 +646,26 @@ The prompt wraps pi's editor in a rounded frame with a petal that shows what the
 - The hint appears only while the editor is empty.
 - If another extension already installed a custom editor, Gentle Shell leaves it alone.
 
-Working-tree changes show up below the editor as soon as a file differs from HEAD, and as `±N` next to the branch in the bar:
+Changes across this session's registered worktrees show up below the editor and as an aggregate `±N` next to the session branch in the bar:
 
 ```text
 ✎ 3 files · +42 −7 · extensions/gentle-shell.ts, lib/shell-bar.ts, tests/x.test.ts · /gentle:changes
 ```
 
-- It is plain `git diff` against HEAD plus untracked files, so a resumed session shows the same picture as a fresh one.
+- Each registered root shows **all** dirty files: plain `git diff` against HEAD plus untracked files, including edits that predate this session. There are no baselines or file-level attribution filters.
+- The canonical session cwd root is included automatically. Successful standard `read`, `write`, `edit`, `grep`, `find`, and `ls` calls register their target worktree after completion. Failed calls, shell command text, and prose never register roots. Only roots sharing the session's Git common directory are accepted.
+- For opaque shell use or worktrees used earlier, call `session_worktree_register` with `{"path":"/path/to/worktree"}`. Registration is explicit, canonicalized, and deduplicated; unrelated dirty siblings remain invisible without an ignored-roots list.
+- The root registry persists in Pi custom entries (`gentle-pi.session-worktree/v1`). Exit/resume and `/reload` restore the same session UUID; `/tree` keeps roots session-wide. New sessions, `/fork`, and `/clone` ignore inherited registrations with another UUID. Clean roots stay registered but hidden until dirty; missing/prunable roots are skipped safely. Ephemeral `--no-session` runs cannot persist across exit.
 - Counts refresh after every tool call, at the end of each turn, and every 5 seconds in the background, so edits made from nvim or another agent show up without touching pi. `GENTLE_PI_SHELL_CHANGES_WATCH_MS` changes the interval; `off` leaves only the tool-driven refresh. Outside a git repository the widget stays hidden.
 - On narrow terminals the file list is dropped before the summary is truncated.
 
-`/gentle:changes` or `alt+g` opens the changes as an overlay: files on the left, the selected file's diff on the right.
+`/gentle:changes` or `alt+g` opens the framed two-pane viewer. Dirty worktrees are accordion groups in the left pane, labeled with branch and directory basename (`detached` when there is no branch). Expand groups to reveal indented changed files; multiple groups can stay expanded. The right pane previews the selected file's lazy-loaded diff, or shows the selected group's full directory and summary. Clean, bare, missing, and prunable roots remain hidden; untracked-only roots are included.
 
-- `j`/`k` or the arrows move between files, `ctrl+j`/`ctrl+k` or `pgdn`/`pgup` scroll the diff, `esc` or `q` closes.
-- While the overlay is open, git is polled every 2 seconds, so edits made from nvim, another agent, or a checkout show up in place. The selection sticks to the file, and a diff reloads only when its counts move.
+- `j`/`k` or up/down traverse visible groups and files, keeping the selection in view. On a group, `enter`, space, or right arrow toggles expansion. Left arrow or backspace moves a file selection to its parent, or collapses the selected group. `ctrl+j`/`ctrl+k` or `pgdn`/`pgup` scroll the diff; `esc` or `q` closes the overlay.
+- Opening, pressing `r`, and the background/overlay refresh cadence scan only registered roots. Worktree discovery supplies branch labels, never registration. No changes in registered roots means no widget and an informational notice instead of an overlay.
+- While the overlay is open, git is polled every 2 seconds, so edits made from nvim, another agent, or a checkout show up in place. Expansion and selection stick to the raw worktree root and file path across refreshes; a diff reloads when its counts move.
 - `GENTLE_PI_SHELL_CHANGES_KEY` rebinds the shortcut (pi key syntax, for example `ctrl+shift+g`); `off` disables it. On macOS, `alt+g` needs the terminal to send Option as Meta.
-- `o` (or `enter`) opens the selected file in `$VISUAL` or `$EDITOR` and returns to pi when the editor exits, so a jump into nvim and back never leaves the session.
+- On a file row, `o` (or `enter`) opens the selected file in `$VISUAL` or `$EDITOR`, with the selected worktree as the editor's working directory, and returns to pi when the editor exits. Diff lookup and caches are also scoped to that root; identical relative filenames in other worktrees cannot share a diff.
 - Untracked files are diffed against an empty file so new files show their full content.
 
 Subscription usage shows in the bar after the cost, and `/gentle:usage` opens a panel with every window per provider:
@@ -696,10 +710,12 @@ Agent paths follow `GENTLE_PI_AGENT_HOME`, then `PI_CODING_AGENT_DIR`, then `~/.
 
 Every subagent is its own `pi --mode rpc` child process, so the terminal never runs subagent work: the host reads JSON lines, applies each one as a small delta to a bounded per-task thread, and notifies only the listeners of that task. A task-mode child's question (`ctx.ui.select`, `confirm`, `input`, `editor`) reaches you as an ordinary pi dialog; a background child's question is dismissed. Subagents have no automatic total execution timeout: a long-running child remains live while it continues emitting RPC events. A silent child still times out through the configurable `stall_timeout_ms` watchdog (default four minutes). Closing pi stops the children that are still running.
 
-- `subagent_list_agents`, `subagent_run` (`agent`, `task`, `label?`, `context?`, `mode?` task or background), `subagent_status`, `subagent_result`, `subagent_list_tasks`, `subagent_cancel`, `subagent_send_message` (steer a running child), `subagent_continue` (resume a finished task in its own session).
+- `subagent_list_agents`, `subagent_run` (`agent`, `task`, `label?`, `context?`, `workspace_root?`, `mode?` task or background), `subagent_status`, `subagent_result`, `subagent_list_tasks`, `subagent_cancel`, `subagent_send_message` (steer a running child), `subagent_continue` (resume a finished task in its own session).
+- `subagent_run.workspace_root` selects an existing worktree in the session's Git clone. Validation happens before queueing; the child runs at that canonical root. Successful OS spawn registers the root in the originating parent session, including delayed queued launches, even without an active shell listener. Failed spawns do not register. `subagent_continue` retains the previous task's cwd; status and task details expose it.
 - A background task's result comes back to the model as a `gentle-agents.result` message, drawn as a rose card, and starts a new turn when the agent is idle; the model never polls.
 - The card shows the active session's tasks only: after `/new` or `/resume` the earlier session's tasks leave it and come back with their session. Finished rows stay for one minute (three at most), and the card spends at most a quarter of the terminal (three to eight rows) on tasks; beyond that the rest fold into one `… N more · alt+a to view` line so the editor never leaves the screen. Questions and running work keep their rows first.
 - `/gentle:agents` or `alt+a` opens the overlay: tasks on the left, the selected task's thread on the right. The thread shows every event the child streamed, in full: text, thinking, and each tool call with its whole output (the store keeps the last 16 KB per call and marks a cut with a leading `…`). It opens on this session (active tasks plus those finished in the last fifteen minutes); `a` widens the list to every task of every session, including the stored history, and back. The list scrolls with the selection. In fullscreen mode, hovering only highlights a task row; clicking selects it without opening its session or cancelling it; and the wheel scrolls the list or thread under the pointer independently. When the footer key hints fit, its `Follow` button returns the selected thread to its tail and `Open session` opens a markdown transcript in `$EDITOR` for a task with a session file; it does not resume the child session. `j`/`k` move, `ctrl+j`/`ctrl+k` or `pgdn`/`pgup` scroll the thread (`f` follows the tail again), `s` stops the selected task (`c` is a legacy alias), and `o` opens the same transcript (written under `~/.pi/agent/gentle-agents/transcripts/`). `esc` or `q` only closes the overlay. Only the selected task is subscribed while it is open.
+- The overlay groups visible tasks by their actual parent session ID: the active parent is labeled `Current orchestrator`, other parents `Orchestrator`, and children `Subagent`; missing IDs never infer a parent and remain separate groups. Active groups start expanded and terminal-only groups collapsed, while a manual collapse or expansion persists as tasks update. Select a heading to use left/right or a native left click to toggle it; headings cannot stop or open a task, and collapsing them clears any hidden child selection.
 - `alt+s` confirms stopping the current active or queued subagents owned by the current process. `GENTLE_PI_AGENTS_STOP_KEY` rebinds it; `off` disables it.
 - Finished tasks are written to `~/.pi/agent/gentle-agents/tasks/` (one JSON per task, newest `history_max_tasks` kept, default 200) and come back on demand for `subagent_result`, `subagent_continue`, and the overlay. Child sessions live under `~/.pi/agent/gentle-agents/sessions/`.
 - `ctrl+shift+a` collapses the card to its first row (`GENTLE_PI_AGENTS_KEY`), `GENTLE_PI_AGENTS_VIEW_KEY` rebinds the overlay, `GENTLE_PI_AGENTS_PI` overrides the pi command used for children, and `GENTLE_PI_AGENTS=0` disables the tools and the card.
@@ -771,7 +787,7 @@ Both files use the strict shape `{"schema":"gentle-pi.background-subagents/v1","
 
 Because the project file outranks the global one, `enable` still writes the global file but reports plainly when a project file keeps the effective policy unchanged. The resolved capability (`ready` or `absent`) reports whether `subagent_run` is actually callable in this session; a policy of `on` with capability `absent` means Gentle Agents is disabled or the retired subagents package is still installed.
 
-Startup banner settings are global and default to the current pink rose + text logo. Supported color presets are `pink`, `cyan`, `yellow`, and `green`.
+Startup banner settings remain global in `banner.json` under `GENTLE_PI_CONFIG_HOME` (default `~/.pi/gentle-ai`). Existing `showRose` and `showTextLogo` opt-outs independently control the main startup artwork; both default to enabled. Changes apply on the next session or `/reload`. Color presets are `pink` (default), `cyan`, `yellow`, and `green`. The static sidebar heading is independent of these preferences and follows the active theme.
 
 Startup flag:
 
@@ -843,7 +859,7 @@ To opt out:
 | `scripts/gentle-ai-installer.mjs` | Installs signed Darwin/Linux archives or exact Go SumDB-verified Windows source builds into the package-local runtime. |
 | `contracts/review-integration/v1/` | Byte-identical provider schemas and conformance fixtures for contract `review-integration/v1`, hash-checked before packaging; retained on disk permanently because `/v2`'s schemas `$ref` into these fragments. |
 | `contracts/review-integration/v2/` | Byte-identical provider schemas and conformance fixtures for contract `review-integration/v2` (immutable `base_tree`/`candidate_tree`, ordered `changed_path_manifest`, no inline candidate diff), hash-checked before packaging. |
-| `extensions/startup-banner.ts` | Shows and configures the startup intro, color presets, compact runtime panel, and collaboration credit.     |
+| `extensions/startup-banner.ts` | Shows and configures the startup intro, color presets, and compact runtime panel.     |
 | `extensions/sdd-init.ts`       | Registers `/gentle-sdd-init` for OpenSpec initialization.                                                         |
 | `extensions/skill-registry.ts` | Maintains `.atl/skill-registry.md` from project/user skills and closes file watchers on shutdown.          |
 | `assets/orchestrator.md`       | Parent-session orchestration contract (always-on core).                                                    |
