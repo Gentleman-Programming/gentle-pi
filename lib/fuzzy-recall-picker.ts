@@ -1,10 +1,9 @@
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import {
 	Container,
-	Key,
-	matchesKey,
 	SelectList,
 	Text,
+	type Component,
 	type SelectItem,
 	type SelectListTheme,
 } from "@earendil-works/pi-tui";
@@ -36,11 +35,11 @@ export type FuzzyRecallPickerContext = {
 
 function createPickerTheme(theme: PickerTheme): SelectListTheme {
 	return {
-		selectedPrefix: (text) => theme.fg("accent", text),
-		selectedText: (text) => theme.fg("accent", text),
-		description: (text) => theme.fg("muted", text),
-		scrollInfo: (text) => theme.fg("dim", text),
-		noMatch: (text) => theme.fg("dim", text),
+		selectedPrefix: (text: string) => theme.fg("accent", text),
+		selectedText: (text: string) => theme.fg("accent", text),
+		description: (text: string) => theme.fg("muted", text),
+		scrollInfo: (text: string) => theme.fg("dim", text),
+		noMatch: (text: string) => theme.fg("dim", text),
 	};
 }
 
@@ -48,25 +47,6 @@ export function isPrintable(data: string): boolean {
 	if (data.length !== 1) return false;
 	const code = data.charCodeAt(0);
 	return code >= 0x20 && code !== 0x7f;
-}
-
-export function applySelection(
-	apply: (value: string) => void,
-	value: string,
-): void {
-	try {
-		apply(value);
-	} catch {
-		// absorb RPC edge cases from the selection callback
-	}
-}
-
-export function applyCancel(apply: () => void): void {
-	try {
-		apply();
-	} catch {
-		// absorb errors from the cancel callback
-	}
 }
 
 export function dedupeNewestFirst(commands: readonly string[]): string[] {
@@ -129,17 +109,84 @@ export function filterByQuery(
 	return filtered.map((entry) => entry.command);
 }
 
+export function applySelection(
+	apply: (value: string) => void,
+	value: string,
+): void {
+	try {
+		apply(value);
+	} catch {
+		// absorb RPC edge cases from the selection callback
+	}
+}
+
+export function applyCancel(apply: () => void): void {
+	try {
+		apply();
+	} catch {
+		// absorb errors from the cancel callback
+	}
+}
+
+/**
+ * Picker root that owns keyboard input. Implements `handleInput` as a class
+ * method (not a property assignment) so the prototype chain exposes it to the
+ * TUI runtime, which dispatches keys via `component.handleInput(data)`.
+ */
+class PickerRoot extends Container {
+	private readonly list: SelectList;
+	private readonly queryLine: Text;
+	private query = "";
+
+	constructor(
+		list: SelectList,
+		queryLine: Text,
+		children: Component[],
+	) {
+		super();
+		this.list = list;
+		this.queryLine = queryLine;
+		for (const child of children) this.addChild(child);
+		this.addChild(queryLine);
+		this.addChild(list);
+	}
+
+	override handleInput(data: string): void {
+		if (data === "\x7f" || data === "\b") {
+			if (this.query.length > 0) {
+				this.query = this.query.slice(0, -1);
+				this.refreshQuery();
+			}
+			return;
+		}
+		if (isPrintable(data)) {
+			this.query += data;
+			this.refreshQuery();
+			return;
+		}
+		// Up, Down, Enter, Escape, Ctrl+C and other SelectList-owned keys.
+		// SelectList uses its own keybindings table internally.
+		this.list.handleInput(data);
+	}
+
+	private refreshQuery(): void {
+		this.queryLine.setText(`▸  ${this.query}_`);
+		this.list.setFilter(this.query);
+		this.invalidate();
+	}
+}
+
 export function createFuzzyRecallPicker(
 	options: FuzzyRecallPickerOptions,
 	ctx: FuzzyRecallPickerContext,
-): Container {
+): Component {
 	const {
 		items,
 		title,
 		hint,
 		applySelection: onSelect,
 		applyCancel: onCancel,
-		requestRender,
+		requestRender: _requestRender,
 		done,
 	} = options;
 	const hintText = hint ?? DEFAULT_HINT_TEXT;
@@ -157,26 +204,7 @@ export function createFuzzyRecallPicker(
 	const bottomBorder = new DynamicBorder(accent);
 	const titleText = new Text(theme.fg("accent", theme.bold(title)), 1, 0);
 	const hintTextNode = new Text(theme.fg("dim", hintText), 1, 0);
-
-	const buildQueryLine = (q: string): string =>
-		theme.fg("muted", `▸  ${q}`) + accent("_");
-
-	let query = "";
-	const queryText = new Text(buildQueryLine(query), 0, 0);
-
-	const container = new Container();
-	container.addChild(topBorder);
-	container.addChild(titleText);
-	container.addChild(queryText);
-	container.addChild(list);
-	container.addChild(hintTextNode);
-	container.addChild(bottomBorder);
-
-	const refresh = (): void => {
-		queryText.setText(buildQueryLine(query));
-		list.setFilter(query);
-		requestRender();
-	};
+	const queryLine = new Text(theme.fg("muted", `▸  ${""}`) + accent("_"), 0, 0);
 
 	list.onSelect = (item): void => {
 		applySelection(onSelect, item.value);
@@ -188,29 +216,12 @@ export function createFuzzyRecallPicker(
 		done(undefined);
 	};
 
-	container.handleInput = (data: string): void => {
-		if (matchesKey(data, Key.escape)) {
-			applyCancel(onCancel);
-			done(undefined);
-			return;
-		}
-		if (matchesKey(data, Key.backspace)) {
-			if (query.length > 0) {
-				query = query.slice(0, -1);
-				refresh();
-			}
-			return;
-		}
-		if (isPrintable(data)) {
-			query += data;
-			refresh();
-			return;
-		}
-		// Up, Down, Enter, Ctrl+C and other SelectList-owned keys
-		// reach the SelectList via handleInput.
-		list.handleInput(data);
-	};
-
-	refresh();
-	return container;
+	const root = new PickerRoot(list, queryLine, [
+		topBorder,
+		titleText,
+		hintTextNode,
+		bottomBorder,
+	]);
+	list.setFilter("");
+	return root;
 }
