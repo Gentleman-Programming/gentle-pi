@@ -76,7 +76,7 @@ function fakePi() {
 	return { pi, tools, shortcuts, commands, fire, sent, renderers, entries, events };
 }
 
-function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (title: string, message: string) => Promise<boolean> = async () => true, inputResult: (title: string, placeholder: string | undefined) => Promise<string | undefined> = async () => undefined) {
+function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (title: string, message: string) => Promise<boolean> = async () => true, inputResult: (title: string, placeholder: string | undefined) => Promise<string | undefined> = async () => undefined, overlayTui: { terminal: { rows: number }; requestRender(): void } = { terminal: { rows: 30 }, requestRender() {} }) {
 	const widgets = new Map<string, (tui: unknown, theme: unknown) => { render(width: number): string[] }>();
 	const dialogs: string[] = [];
 	const overlays: Overlay[] = [];
@@ -92,7 +92,7 @@ function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (t
 						customCompletions.push(value);
 						resolve(value);
 					};
-					const component = factory({ terminal: { rows: 30 }, requestRender() {} }, plainTheme, {}, done);
+					const component = factory(overlayTui, plainTheme, {}, done);
 					overlays.push(component);
 				}),
 			setWidget(key: string, content: ((tui: unknown, theme: unknown) => { render(width: number): string[] }) | undefined) {
@@ -854,4 +854,24 @@ test("the card caps its rows to the terminal height and says how many tasks are 
 	assert.equal(card.length, 8, "a 20-row terminal gets five card rows (four tasks and the overflow line) inside the frame, then the spacer");
 	assert.match(card[0], /2 active · 4 queued/);
 	assert.match(card[5], /^│ … 2 more · alt\+a to view +│$/);
+});
+
+test("the production overlay reads terminal rows at render time without a minimum-height override", async () => {
+	const { pi, fire, commands } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	let rows = 10;
+	const overlayTui = { terminal: { get rows() { return rows; } }, requestRender() {} };
+	const { ctx, overlays } = fakeContext(fakeTui, async () => true, async () => undefined, overlayTui);
+	await fire("session_start", ctx);
+	const opened = commands.get("gentle:agents")!.handler("", ctx);
+	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+	const overlay = overlays[0]!;
+	assert.equal(overlay.render(80).length, 8, "the overlay leaves its two-row host margin");
+	rows = 5;
+	assert.equal(overlay.render(80).length, 3, "a live terminal resize changes the production frame budget");
+	rows = 2;
+	assert.equal(overlay.render(80).length, 0, "the two-row host budget renders nothing rather than forced chrome");
+	overlay.handleInput("\x1b");
+	await opened;
 });

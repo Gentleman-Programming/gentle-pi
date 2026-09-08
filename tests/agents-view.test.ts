@@ -204,15 +204,10 @@ test("AgentsView close control, Escape, and q share rendered bounds and one idem
 	assert.equal(view.handleMouse(mouse(closeX, 0, wide + 1, lines.length, "click")), undefined, "stale width is inert");
 	assert.equal(view.handleMouse(mouse(closeX, 0, wide, lines.length + 1, "click")), undefined, "stale height is inert");
 
-	lines = view.render(30);
+	lines = view.render(59);
 	top = stripAnsi(lines[0]);
-	assert.equal(visibleWidth(top), 30, "the compact close header fits its rendered width");
-	assert.doesNotMatch(top, /\[× Close\]/);
-	assert.match(top, /\[×\]/, "compact headers show the compact close control");
-	lines = view.render(17);
-	top = stripAnsi(lines[0]);
-	assert.equal(visibleWidth(top), 17, "constrained headers still fit their rendered width");
-	assert.doesNotMatch(top, /\[×\]/, "constrained headers hide the close control instead of truncating it");
+	assert.equal(visibleWidth(top), 59, "the one-line fallback fits its rendered width");
+	assert.doesNotMatch(top, /\[×|Follow|Open session/, "sub-pane widths expose no pointer controls");
 
 	lines = view.render(wide);
 	top = stripAnsi(lines[0]);
@@ -314,4 +309,62 @@ test("AgentsView footer buttons follow, open only a session-backed selection, an
 	assert.equal(empty.handleMouse(mouse(followX, footerY, width, emptyLines.length, "click")), undefined, "Follow is disabled with no selected task");
 	assert.equal(empty.handleMouse(mouse(openX, footerY, width, emptyLines.length, "click")), undefined, "Open is disabled with no selected session");
 	empty.dispose();
+});
+
+test("AgentsView reads live rows, preserves manual scroll and selection, and invalidates stale pointer bounds", () => {
+	const store = new TaskStore();
+	let rows = 8;
+	const view = new AgentsView({
+		theme: plainTheme,
+		rows: () => rows,
+		store,
+		sessionId: "s",
+		now: () => 61_000,
+		onCancel() {},
+		onOpen() {},
+		onClose() {},
+		requestRender() {},
+	});
+	for (let index = 0; index < 6; index += 1) store.add(task(`t${index}`, { agent: `agent${index}`, createdAt: 1000 - index, lastActivityAt: 1000 - index }));
+	for (let index = 0; index < 10; index += 1) store.apply("t4", { type: TASK_EVENT.TEXT, text: `line ${index}\n` }, 2000);
+	for (let index = 0; index < 4; index += 1) view.handleInput("j");
+	view.render(80);
+	view.handleInput("\x1b[5~");
+	rows = 6;
+	const resized = view.render(80).map(stripAnsi);
+	assert.equal(resized.length, 6, "the frame uses the live terminal height budget");
+	assert.equal(view.selectedTask()?.id, "t4", "resize never changes the selected task");
+	assert.match(resized[3] ?? "", /▸ └ ◐ Subagent agent4/, "the list scroll clamps while retaining the selected row");
+	assert.doesNotMatch(resized.join("\n"), /line 9/, "manual thread scroll survives resize instead of returning to the tail");
+	assert.equal(view.handleMouse(mouse(4, 2, 80, 8, "click")), undefined, "old-height pointer input is stale after resize");
+	rows = 2;
+	assert.equal(view.render(80).length, 1, "a tiny terminal gets one bounded fallback line, never forced chrome");
+	view.dispose();
+});
+
+test("AgentsView rejects cached-height pointer input before the live resize renders", () => {
+	const store = new TaskStore();
+	let rows = 8;
+	const view = new AgentsView({
+		theme: plainTheme,
+		rows: () => rows,
+		store,
+		now: () => 61_000,
+		onCancel() {},
+		onOpen() {},
+		onClose() {},
+		requestRender() {},
+	});
+	store.add(task("a"));
+	for (let index = 0; index < 12; index += 1) store.apply("a", { type: TASK_EVENT.TEXT, text: `l${index}\n` }, 2000);
+	view.handleInput("\x1b[5~");
+	const oldFrame = view.render(80);
+	assert.match(stripAnsi(oldFrame[3] ?? ""), /l0/, "manual scrolling establishes a stable pre-resize position");
+	rows = 6;
+	assert.equal(view.handleMouse(mouse(50, 2, 80, oldFrame.length, "wheel", 1)), undefined, "old-height wheel input is inert before the resize frame");
+	const resized = view.render(80);
+	assert.match(stripAnsi(resized[3] ?? ""), /l0/, "the stale wheel leaves manual thread scroll unchanged");
+	assert.equal(view.handleMouse(mouse(50, 2, 80, resized.length, "wheel", 1))?.handled, true, "the new-height wheel reaches the rendered thread region");
+	assert.match(stripAnsi(view.render(80)[2] ?? ""), /l0/, "the live wheel scrolls past the semantic block label after the new frame");
+	view.dispose();
 });

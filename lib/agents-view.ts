@@ -1,4 +1,5 @@
 import { Key, matchesKey, truncateToWidth, visibleWidth, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { measureAgentsViewLayout, type AgentsViewLayout } from "./agents-view-layout.ts";
 import { isFinished, TASK_STATUS, type TaskRecord, type TaskStore, type TaskThread, type ThreadItem } from "./agents-protocol.ts";
 import { renderThreadItem, type AgentsThreadTheme } from "./agents-thread-view.ts";
 import { formatElapsed } from "./agents-widget.ts";
@@ -23,7 +24,7 @@ export type ViewScope = (typeof VIEW_SCOPE)[keyof typeof VIEW_SCOPE];
 
 export interface AgentsViewDeps {
 	theme: AgentsViewTheme;
-	rows: number;
+	rows: number | (() => number);
 	store: TaskStore;
 	// The active session; without it there is nothing to scope by and the
 	// list shows every task.
@@ -67,10 +68,6 @@ const GLYPH_ROLE: Record<string, string> = {
 	[TASK_STATUS.CANCELLED]: "dim",
 	[TASK_STATUS.TIMED_OUT]: "error",
 };
-const LIST_MAX_WIDTH = 34;
-const LIST_RATIO = 0.32;
-const CHROME_ROWS = 3;
-const MIN_BODY_ROWS = 1;
 export const SESSION_FINISHED_TTL_MS = 15 * 60_000;
 const SCOPE_LABEL: Record<ViewScope, string> = { [VIEW_SCOPE.SESSION]: "this session", [VIEW_SCOPE.ALL]: "all sessions" };
 const SCOPE_KEY: Record<ViewScope, string> = { [VIEW_SCOPE.SESSION]: "all sessions", [VIEW_SCOPE.ALL]: "this session" };
@@ -79,7 +76,6 @@ const EMPTY_THREAD = "waiting for the first event";
 const FOLLOW_BUTTON = "[ Follow ]";
 const OPEN_BUTTON = "[ Open session ]";
 const CLOSE_BUTTON = "[× Close]";
-const COMPACT_CLOSE_BUTTON = "[×]";
 const FOOTER_BUTTONS_WIDTH = FOLLOW_BUTTON.length + 1 + OPEN_BUTTON.length;
 const KEYS = [
 	["j/k", "task"],
@@ -99,15 +95,7 @@ interface PointerButtonLayout {
 	width: number;
 }
 
-interface PointerLayout {
-	width: number;
-	height: number;
-	listX: number;
-	listWidth: number;
-	threadX: number;
-	threadWidth: number;
-	bodyRows: number;
-	footerY: number;
+interface PointerLayout extends AgentsViewLayout {
 	closeButton?: PointerButtonLayout;
 	followButton?: PointerButtonLayout;
 	openButton?: PointerButtonLayout;
@@ -241,6 +229,8 @@ export class AgentsView {
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		const layout = this.pointerLayout;
 		if (this.closed || !layout || event.width !== layout.width || event.height !== layout.height || event.x < 0 || event.y < 0 || event.x >= layout.width || event.y >= layout.height) return undefined;
+		const live = this.layout(layout.width);
+		if (live.mode !== "panes" || live.height !== layout.height) return undefined;
 		if (event.y === 0 && this.isInButton(event.x, layout.closeButton)) return this.closeRegion.handleMouse(event);
 		if (event.y >= 1 && event.y < 1 + layout.bodyRows) {
 			const row = event.y - 1;
@@ -261,42 +251,40 @@ export class AgentsView {
 	}
 
 	render(width: number): string[] {
+		const layout = this.layout(width);
+		if (layout.width === 0 || layout.height === 0) {
+			this.clearFooterLayout();
+			return [];
+		}
+		if (layout.mode === "fallback") {
+			this.clearFooterLayout();
+			return [fit("Agents", layout.width)];
+		}
 		// Finished rows age out of the session scope while the overlay is open;
 		// the list is otherwise reordered only when a status changes.
 		const now = this.deps.now();
 		if (this.tasks.some((task) => !this.inScope(task, now))) this.refreshTasks();
-		if (this.pointerLayout && this.pointerLayout.width !== width) this.clearFooterLayout();
+		if (this.pointerLayout && (this.pointerLayout.width !== layout.width || this.pointerLayout.height !== layout.height)) this.clearFooterLayout();
 		const theme = this.deps.theme;
-		const inner = width - 2;
-		const listWidth = Math.min(LIST_MAX_WIDTH, Math.floor(inner * LIST_RATIO));
-		const threadWidth = inner - listWidth - 4;
-		const rows = this.bodyRows();
-		const footerY = rows + 1;
-		const closeLabel = this.closeLabel(inner);
+		const inner = layout.width - 2;
+		const closeLabel = this.closeLabel();
 		this.closeRegion.setDisabled(closeLabel === undefined);
-		this.followSelection(rows);
+		this.followSelection(layout.bodyRows);
 		this.pointerLayout = {
-			width,
-			height: rows + CHROME_ROWS,
-			listX: 2,
-			listWidth,
-			threadX: listWidth + 5,
-			threadWidth,
-			bodyRows: rows,
-			footerY,
-			closeButton: closeLabel ? { x: width - 1 - visibleWidth(closeLabel), width: visibleWidth(closeLabel) } : undefined,
+			...layout,
+			closeButton: closeLabel ? { x: layout.width - 1 - visibleWidth(closeLabel), width: visibleWidth(closeLabel) } : undefined,
 		};
-		this.listRegion.render(listWidth);
-		this.threadRegion.render(threadWidth);
+		this.listRegion.render(layout.listWidth);
+		this.threadRegion.render(layout.threadWidth);
 		if (closeLabel) this.closeRegion.render(visibleWidth(closeLabel));
 		const scope = this.deps.sessionId === undefined ? "" : `${SCOPE_LABEL[this.scope]} · `;
 		const title = truncateToWidth(`❀ Agents · ${scope}${this.counts()}`, Math.max(0, inner - 3 - (closeLabel ? visibleWidth(closeLabel) + 1 : 0)), "…");
 		const close = closeLabel ? ` ${theme.fg(this.hoveredControl === "close" ? "warning" : ROLE.KEY, closeLabel)}` : "";
 		const top = theme.fg(ROLE.FRAME, "╭─ ") + theme.fg(ROLE.TITLE, title) + theme.fg(ROLE.FRAME, ` ${rule(inner - visibleWidth(title) - 3 - (closeLabel ? visibleWidth(closeLabel) + 1 : 0))}`) + close + theme.fg(ROLE.FRAME, "╮");
-		const right = this.threadWindow(rows, threadWidth);
+		const right = this.threadWindow(layout.bodyRows, layout.threadWidth);
 		const body: string[] = [];
-		for (let row = 0; row < rows; row += 1) {
-			body.push(`${theme.fg(ROLE.FRAME, "│")} ${fit(this.taskLine(row), listWidth)} ${theme.fg(ROLE.FRAME, "│")} ${fit(right[row] ?? "", threadWidth)}${theme.fg(ROLE.FRAME, "│")}`);
+		for (let row = 0; row < layout.bodyRows; row += 1) {
+			body.push(`${theme.fg(ROLE.FRAME, "│")} ${fit(this.taskLine(row), layout.listWidth)} ${theme.fg(ROLE.FRAME, "│")} ${fit(right[row] ?? "", layout.threadWidth)}${theme.fg(ROLE.FRAME, "│")}`);
 		}
 		const keyHints = this.selectedRow()?.kind === "heading" ? [["←/→", "group"] as const, ...this.keys()] : this.keys();
 		const keys = keyHints.map(([key, label]) => `${theme.fg(ROLE.KEY, key)} ${theme.fg(ROLE.KEY_TEXT, label)}`).join("   ");
@@ -361,8 +349,13 @@ export class AgentsView {
 		this.listScroll = Math.max(0, Math.min(this.listScroll, Math.max(0, this.visibleRows().length - rows)));
 	}
 
+	private layout(width = this.pointerLayout?.width ?? 80): AgentsViewLayout {
+		const rows = typeof this.deps.rows === "function" ? this.deps.rows() : this.deps.rows;
+		return measureAgentsViewLayout(width, rows);
+	}
+
 	private bodyRows(): number {
-		return Math.max(MIN_BODY_ROWS, this.deps.rows - CHROME_ROWS);
+		return this.layout().bodyRows;
 	}
 
 	private refreshTasks(): void {
@@ -542,10 +535,8 @@ export class AgentsView {
 		return `${fit(keys, width - FOOTER_BUTTONS_WIDTH - 1)} ${this.deps.theme.fg(followRole, FOLLOW_BUTTON)} ${this.deps.theme.fg(openRole, OPEN_BUTTON)}`;
 	}
 
-	private closeLabel(inner: number): string | undefined {
-		if (inner >= 34) return CLOSE_BUTTON;
-		if (inner >= 18) return COMPACT_CLOSE_BUTTON;
-		return undefined;
+	private closeLabel(): string {
+		return CLOSE_BUTTON;
 	}
 
 	private close(): void {

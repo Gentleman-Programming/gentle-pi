@@ -31,8 +31,7 @@ export const AGENTS_RESULT_TYPE = "gentle-agents.result";
 const COLLAPSE_KEY_DEFAULT = "ctrl+shift+a";
 const VIEW_KEY_DEFAULT = "alt+a";
 const STOP_KEY_DEFAULT = "alt+s";
-const OVERLAY_HEIGHT_RATIO = 0.8;
-const OVERLAY_MIN_ROWS = 12;
+const OVERLAY_VERTICAL_MARGIN = 2;
 const RENDER_COALESCE_MS = 400;
 const CLOCK_TICK_MS = 1000;
 const TOOL_PREFIX = "subagent_";
@@ -355,7 +354,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				overlayHost = tui;
 				view = new AgentsView({
 					theme,
-					rows: Math.max(OVERLAY_MIN_ROWS, Math.floor(tui.terminal.rows * OVERLAY_HEIGHT_RATIO)),
+					rows: () => Math.max(0, tui.terminal.rows - OVERLAY_VERTICAL_MARGIN),
 					store,
 					sessionId: ctx.sessionManager.getSessionId() ?? "",
 					now: () => deps.now(),
