@@ -86,6 +86,8 @@ const EMPTY_LIST = "no tasks yet";
 const EMPTY_THREAD = "waiting for the first event";
 const FOLLOW_BUTTON = "[ Follow ]";
 const OPEN_BUTTON = "[ Open session ]";
+const CLOSE_BUTTON = "[× Close]";
+const COMPACT_CLOSE_BUTTON = "[×]";
 const FOOTER_BUTTONS_WIDTH = FOLLOW_BUTTON.length + 1 + OPEN_BUTTON.length;
 const KEYS = [
 	["j/k", "task"],
@@ -114,6 +116,7 @@ interface PointerLayout {
 	threadWidth: number;
 	bodyRows: number;
 	footerY: number;
+	closeButton?: PointerButtonLayout;
 	followButton?: PointerButtonLayout;
 	openButton?: PointerButtonLayout;
 }
@@ -201,8 +204,10 @@ export class AgentsView {
 	private readonly threadRegion: NativePointerRegion;
 	private readonly followRegion: NativePointerRegion;
 	private readonly openRegion: NativePointerRegion;
-	private hoveredControl: "follow" | "open" | undefined;
+	private readonly closeRegion: NativePointerRegion;
+	private hoveredControl: "follow" | "open" | "close" | undefined;
 	private pointerLayout: PointerLayout | undefined;
+	private closed = false;
 	private unsubscribeTask: (() => void) | undefined;
 	private subscribedTaskId: string | undefined;
 	private readonly unsubscribeSummary: () => void;
@@ -228,6 +233,11 @@ export class AgentsView {
 			onLeave: () => this.clearHoveredControl("open"),
 			onClick: (event) => this.clickOpen(event),
 		});
+		this.closeRegion = this.pointerScope.wrap(EMPTY_COMPONENT, {
+			onHover: () => this.hoverControl("close"),
+			onLeave: () => this.clearHoveredControl("close"),
+			onClick: (event) => this.clickClose(event),
+		});
 		this.refreshTasks();
 		this.unsubscribeSummary = deps.store.subscribeSummary(() => {
 			this.clearFooterLayout();
@@ -238,6 +248,7 @@ export class AgentsView {
 	}
 
 	dispose(): void {
+		this.closed = true;
 		this.pointerLayout = undefined;
 		this.pointerScope.dispose();
 		this.unsubscribeTask?.();
@@ -256,8 +267,9 @@ export class AgentsView {
 	}
 
 	handleInput(data: string): void {
+		if (this.closed) return;
 		if (matchesKey(data, Key.escape) || data === "q") {
-			this.deps.onClose();
+			this.close();
 			return;
 		}
 		const rows = this.visibleRows();
@@ -279,7 +291,8 @@ export class AgentsView {
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		const layout = this.pointerLayout;
-		if (!layout || event.width !== layout.width || event.height !== layout.height || event.x < 0 || event.y < 0 || event.x >= layout.width || event.y >= layout.height) return undefined;
+		if (this.closed || !layout || event.width !== layout.width || event.height !== layout.height || event.x < 0 || event.y < 0 || event.x >= layout.width || event.y >= layout.height) return undefined;
+		if (event.y === 0 && this.isInButton(event.x, layout.closeButton)) return this.closeRegion.handleMouse(event);
 		if (event.y >= 1 && event.y < 1 + layout.bodyRows) {
 			const row = event.y - 1;
 			if (event.x >= layout.listX && event.x < layout.listX + layout.listWidth) {
@@ -310,13 +323,27 @@ export class AgentsView {
 		const threadWidth = inner - listWidth - 4;
 		const rows = this.bodyRows();
 		const footerY = rows + 1;
+		const closeLabel = this.closeLabel(inner);
+		this.closeRegion.setDisabled(closeLabel === undefined);
 		this.followSelection(rows);
-		this.pointerLayout = { width, height: rows + CHROME_ROWS, listX: 2, listWidth, threadX: listWidth + 5, threadWidth, bodyRows: rows, footerY };
+		this.pointerLayout = {
+			width,
+			height: rows + CHROME_ROWS,
+			listX: 2,
+			listWidth,
+			threadX: listWidth + 5,
+			threadWidth,
+			bodyRows: rows,
+			footerY,
+			closeButton: closeLabel ? { x: width - 1 - visibleWidth(closeLabel), width: visibleWidth(closeLabel) } : undefined,
+		};
 		this.listRegion.render(listWidth);
 		this.threadRegion.render(threadWidth);
+		if (closeLabel) this.closeRegion.render(visibleWidth(closeLabel));
 		const scope = this.deps.sessionId === undefined ? "" : `${SCOPE_LABEL[this.scope]} · `;
-		const title = `❀ Agents · ${scope}${this.counts()}`;
-		const top = theme.fg(ROLE.FRAME, "╭─ ") + theme.fg(ROLE.TITLE, title) + theme.fg(ROLE.FRAME, ` ${rule(inner - visibleWidth(title) - 3)}╮`);
+		const title = truncateToWidth(`❀ Agents · ${scope}${this.counts()}`, Math.max(0, inner - 3 - (closeLabel ? visibleWidth(closeLabel) + 1 : 0)), "…");
+		const close = closeLabel ? ` ${theme.fg(this.hoveredControl === "close" ? "warning" : ROLE.KEY, closeLabel)}` : "";
+		const top = theme.fg(ROLE.FRAME, "╭─ ") + theme.fg(ROLE.TITLE, title) + theme.fg(ROLE.FRAME, ` ${rule(inner - visibleWidth(title) - 3 - (closeLabel ? visibleWidth(closeLabel) + 1 : 0))}`) + close + theme.fg(ROLE.FRAME, "╮");
 		const right = this.threadWindow(rows, threadWidth);
 		const body: string[] = [];
 		for (let row = 0; row < rows; row += 1) {
@@ -566,17 +593,30 @@ export class AgentsView {
 		return `${fit(keys, width - FOOTER_BUTTONS_WIDTH - 1)} ${this.deps.theme.fg(followRole, FOLLOW_BUTTON)} ${this.deps.theme.fg(openRole, OPEN_BUTTON)}`;
 	}
 
+	private closeLabel(inner: number): string | undefined {
+		if (inner >= 34) return CLOSE_BUTTON;
+		if (inner >= 18) return COMPACT_CLOSE_BUTTON;
+		return undefined;
+	}
+
+	private close(): void {
+		if (this.closed) return;
+		this.closed = true;
+		this.pointerScope.invalidate();
+		this.deps.onClose();
+	}
+
 	private isInButton(x: number, button: PointerButtonLayout | undefined): boolean {
 		return button !== undefined && x >= button.x && x < button.x + button.width;
 	}
 
-	private hoverControl(control: "follow" | "open"): TuiMouseEventResult {
+	private hoverControl(control: "follow" | "open" | "close"): TuiMouseEventResult {
 		if (this.hoveredControl === control) return { handled: true };
 		this.hoveredControl = control;
 		return { handled: true, render: true };
 	}
 
-	private clearHoveredControl(control: "follow" | "open"): void {
+	private clearHoveredControl(control: "follow" | "open" | "close"): void {
 		if (this.hoveredControl !== control) return;
 		this.hoveredControl = undefined;
 		this.deps.requestRender();
@@ -593,6 +633,12 @@ export class AgentsView {
 		const task = this.selectedTask();
 		if (!this.canOpen(task)) return undefined;
 		this.deps.onOpen(task!);
+		return { handled: true, render: true };
+	}
+
+	private clickClose(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (event.button !== "left") return undefined;
+		this.close();
 		return { handled: true, render: true };
 	}
 
