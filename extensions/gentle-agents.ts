@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { SessionWorktreeRegistry, resolveSessionWorktree, type WorktreeResolver } from "../lib/session-worktree-registry.ts";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -39,6 +40,7 @@ export interface AgentsDeps extends RunnerDeps {
 	home: string;
 	agentHome?: string;
 	env: NodeJS.ProcessEnv;
+	resolveWorktree: WorktreeResolver;
 }
 
 export function agentRuntimePaths(home: string, agentHome = join(home, ".pi", "agent")): { sessions: string; transcripts: string } {
@@ -61,6 +63,7 @@ const defaultDeps = (env: NodeJS.ProcessEnv): AgentsDeps => ({
 	},
 	pi: piCommand(),
 	home: os.homedir(),
+	resolveWorktree: resolveSessionWorktree,
 	env,
 });
 
@@ -112,13 +115,13 @@ function text(value: string, details: Record<string, unknown> = {}): ToolText {
 }
 
 function taskDetails(task: TaskRecord): Record<string, unknown> {
-	return { gentleAgents: { taskId: task.id, agent: task.agent, status: task.status, mode: task.mode } };
+	return { gentleAgents: { taskId: task.id, agent: task.agent, status: task.status, mode: task.mode, cwd: task.cwd } };
 }
 
 export function describeTask(task: TaskRecord): string {
 	const head = `${task.id} · ${task.agent} · ${task.status} · ${task.mode}`;
 	const detail = task.error ? `\n${task.error}` : "";
-	return `${head} · ${task.turns} turns · ${task.toolCalls} tool calls · last: ${task.lastStep}${detail}`;
+	return `${head} · cwd: ${task.cwd} · ${task.turns} turns · ${task.toolCalls} tool calls · last: ${task.lastStep}${detail}`;
 }
 
 function finishedText(task: TaskRecord): string {
@@ -193,6 +196,14 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	let ui: ExtensionContext["ui"] | undefined;
 	let host: { requestRender(): void } | undefined;
 	let sessions: ExtensionContext["sessionManager"] | undefined;
+	let worktrees: SessionWorktreeRegistry | undefined;
+	const registryFor = (ctx: ExtensionContext) => {
+		if (!worktrees || worktrees.sessionId !== ctx.sessionManager.getSessionId()) {
+			worktrees?.close();
+			worktrees = new SessionWorktreeRegistry(pi, ctx.sessionManager, ctx.sessionManager.getCwd(), deps.resolveWorktree);
+		}
+		return worktrees;
+	};
 	let collapsed = false;
 	let renderQueued = false;
 	let cancelClock: (() => void) | undefined;
@@ -413,7 +424,14 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 
 	const roots = (ctx: ExtensionContext) => ({ cwd: ctx.sessionManager.getCwd(), home: deps.home, agentHome });
 
-	const buildRequest = (ctx: ExtensionContext, agent: AgentDefinition, prompt: string, label: string | undefined, context: string | undefined, mode: AgentMode, resume?: string): TaskRequest => {
+	const buildRequest = (ctx: ExtensionContext, agent: AgentDefinition, prompt: string, label: string | undefined, context: string | undefined, mode: AgentMode, resume?: string, workspaceRoot?: string): TaskRequest => {
+		const registry = registryFor(ctx);
+		const parentCwd = ctx.sessionManager.getCwd();
+		// An explicit target is validated before any queue or session-dir writes.
+		const parentIdentity = deps.resolveWorktree(parentCwd, parentCwd);
+		// Preserve ordinary non-Git continuation, without admitting any new root.
+		const sameNonGitContinuation = resume !== undefined && workspaceRoot === parentCwd && !parentIdentity;
+		const target = workspaceRoot !== undefined && !sameNonGitContinuation ? registry.validate(workspaceRoot) : parentIdentity?.root;
 		const config = loadAgentsConfig(roots(ctx));
 		const profile = resolveAgentProfile(agent, config);
 		const sessionDir = agentRuntimePaths(deps.home, agentHome).sessions;
@@ -428,8 +446,9 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			label,
 			context,
 			mode,
-			cwd: parentWorktreeRoot,
+			cwd: target ?? parentWorktreeRoot,
 			parentSessionId,
+			...(target === undefined ? {} : { onLaunch: () => { registry.register(target, "subagent:spawn"); } }),
 			model: profile.model,
 			thinking: profile.thinking,
 			sessionDir,
@@ -501,6 +520,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				task: { type: "string", description: "What the subagent must do, self-contained." },
 				label: { type: "string", description: "Three to six words naming the work, shown on the agents card, e.g. 'map footer data sources'." },
 				context: { type: "string", description: "Optional extra context appended to the task." },
+				workspace_root: { type: "string", description: "Optional worktree in the same Git clone. Validated before queueing; the child runs at its canonical root and registers it on actual launch." },
 				mode: { type: "string", enum: ["task", "background"], description: "task waits for the result (default); background returns immediately." },
 			},
 		},
@@ -509,7 +529,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			const agent = agents.find((candidate) => candidate.name === params.agent);
 			if (!agent) return text(`Error: no subagent named "${String(params.agent)}". Known: ${agents.map((candidate) => candidate.name).join(", ") || "none"}`, { error: "unknown agent" });
 			const mode = (params.mode as AgentMode | undefined) ?? agent.mode ?? loadAgentsConfig(roots(ctx)).defaultMode;
-			return launch(ctx, buildRequest(ctx, agent, String(params.task ?? ""), typeof params.label === "string" ? params.label : undefined, typeof params.context === "string" ? params.context : undefined, mode));
+			return launch(ctx, buildRequest(ctx, agent, String(params.task ?? ""), typeof params.label === "string" ? params.label : undefined, typeof params.context === "string" ? params.context : undefined, mode, undefined, typeof params.workspace_root === "string" ? params.workspace_root : undefined));
 		},
 	);
 
@@ -550,7 +570,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			const agent = discoverAgents(roots(ctx)).agents.find((candidate) => candidate.name === previous.agent);
 			if (!agent) return text(`Error: subagent "${previous.agent}" is no longer defined.`, { error: "unknown agent" });
 			const mode = (params.mode as AgentMode | undefined) ?? (previous.mode as AgentMode);
-			return launch(ctx, buildRequest(ctx, agent, String(params.prompt ?? ""), typeof params.label === "string" ? params.label : undefined, undefined, mode, previous.sessionPath));
+			return launch(ctx, buildRequest(ctx, agent, String(params.prompt ?? ""), typeof params.label === "string" ? params.label : undefined, undefined, mode, previous.sessionPath, previous.cwd));
 		},
 	);
 
@@ -581,8 +601,10 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		});
 	}
 
-	pi.on("session_start", (_event, ctx) => showWidget(ctx));
+	pi.on("session_start", (_event, ctx) => { registryFor(ctx); showWidget(ctx); });
 	pi.on("session_shutdown", () => {
+		worktrees?.close();
+		worktrees = undefined;
 		runner.cancelAll();
 	});
 }

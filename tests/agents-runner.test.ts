@@ -62,6 +62,55 @@ function harness(options: { maxConcurrency?: number; answer?: Record<string, unk
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
+test("launch registration waits for actual spawn, including queued launches, and ignores failed spawns", async () => {
+	const launches: string[] = [];
+	const spawns: Array<() => void> = [];
+	const children: FakeChild[] = [];
+	const cwds: string[] = [];
+	const store = new TaskStore();
+	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs: 1000 }, {
+		spawn: (_command, _args, options) => {
+			cwds.push(options.cwd);
+			if (options.cwd === "/throws") throw new Error("missing executable");
+			const fake = fakeChild();
+			const on = fake.child.on.bind(fake.child);
+			fake.child.on = ((event: string, listener: () => void) => {
+				if (event === "spawn") spawns.push(listener);
+				else on(event as "exit", listener);
+				return fake.child;
+			}) as typeof fake.child.on;
+			children.push(fake);
+			return fake.child;
+		},
+		now: () => 1000, schedule: () => () => {}, pi: { command: "pi", args: [] },
+	}, { askUser: async () => ({ cancelled: true }) });
+	const first = runner.run(request({ cwd: "/child", onLaunch: () => launches.push("s1:/child") }));
+	const second = runner.run(request({ cwd: "/queued", onLaunch: () => launches.push("s1:/queued") }));
+	assert.deepEqual(launches, []);
+	await tick();
+	assert.deepEqual(launches, [], "returning a child handle is not successful spawn");
+	assert.equal(typeof spawns[0], "function");
+	spawns[0]();
+	assert.deepEqual(launches, ["s1:/child"]);
+	runner.cancel(first.id);
+	await tick();
+	assert.equal(store.get(second.id)?.cwd, "/queued");
+	spawns[1]();
+	assert.deepEqual(launches, ["s1:/child", "s1:/queued"]);
+	runner.cancel(second.id);
+	await tick();
+	const failed = runner.run(request({ cwd: "/missing", onLaunch: () => launches.push("bad") }));
+	await tick();
+	children[2].fail("ENOENT");
+	await tick();
+	assert.equal(store.get(failed.id)?.status, TASK_STATUS.FAILED);
+	const thrown = runner.run(request({ cwd: "/throws", onLaunch: () => launches.push("bad") }));
+	await tick();
+	assert.equal(store.get(thrown.id)?.status, TASK_STATUS.FAILED);
+	assert.deepEqual(launches, ["s1:/child", "s1:/queued"]);
+	assert.deepEqual(cwds, ["/child", "/queued", "/missing", "/throws"]);
+});
+
 test("childArguments builds an rpc launch with model, thinking, tools, session dir, and instructions", () => {
 	const args = childArguments(request());
 	assert.deepEqual(args.slice(0, 2), ["--mode", "rpc"]);

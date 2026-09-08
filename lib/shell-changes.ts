@@ -143,6 +143,86 @@ export interface GitResult {
 export type GitRunner = (args: string[]) => Promise<GitResult>;
 export type LineCounter = (path: string) => Promise<number>;
 
+export interface WorktreeChanges {
+	root: string;
+	branch?: string;
+	model: ChangesModel;
+}
+
+// -z avoids Git's quoting of paths containing whitespace or newlines.
+export function parseWorktrees(text: string): Array<{ root: string; branch?: string }> {
+	return text.split("\0\0").flatMap((record) => {
+		const fields = record.split("\0");
+		const root = fields.find((field) => field.startsWith("worktree "))?.slice(9);
+		if (!root || fields.some((field) => field === "bare" || field.startsWith("prunable"))) return [];
+		const branch = fields.find((field) => field.startsWith("branch "))?.slice(7).replace(/^refs\/heads\//, "");
+		return [branch ? { root, branch } : { root }];
+	});
+}
+
+export class WorktreeChangesTracker {
+	worktrees: WorktreeChanges[] = [];
+	private inFlight: Promise<ChangesModel> | undefined;
+	private readonly discover: GitRunner;
+	private readonly gitForRoot: (root: string) => GitRunner;
+	private readonly linesForRoot: (root: string) => LineCounter;
+	private readonly registeredRoots: () => readonly string[];
+
+	constructor(discover: GitRunner, gitForRoot: (root: string) => GitRunner, linesForRoot: (root: string) => LineCounter = () => noLines, registeredRoots: () => readonly string[] = () => []) {
+		this.discover = discover;
+		this.gitForRoot = gitForRoot;
+		this.linesForRoot = linesForRoot;
+		this.registeredRoots = registeredRoots;
+	}
+
+	get model(): ChangesModel {
+		return changesModel(this.worktrees.flatMap((tree) => tree.model.files.map((file) => ({
+			...file,
+			path: this.worktrees.length === 1 ? file.path : `${tree.root}/${file.path}`,
+		}))));
+	}
+
+	async start(): Promise<void> {
+		await this.refresh();
+	}
+
+	async refresh(): Promise<ChangesModel> {
+		// A scan can take longer than the polling interval in a large clone.
+		// Share it rather than extending it indefinitely with queued polls.
+		if (this.inFlight) return this.inFlight;
+		this.inFlight = this.capture();
+		try {
+			return await this.inFlight;
+		} finally {
+			this.inFlight = undefined;
+		}
+	}
+
+	private async capture(): Promise<ChangesModel> {
+		const result = await this.discover(["worktree", "list", "--porcelain", "-z"]).catch(() => ({ code: 128, stdout: "" }));
+		const trees: WorktreeChanges[] = [];
+		const metadata = new Map((result.code === 0 ? parseWorktrees(result.stdout) : []).map((tree) => [tree.root, tree]));
+		// Discovery labels registered roots; it never grants visibility to siblings.
+		const roots = new Set(this.registeredRoots());
+		for (const root of roots) {
+			const tree = metadata.get(root) ?? { root };
+			try {
+				const tracker = new ChangesTracker(this.gitForRoot(tree.root), this.linesForRoot(tree.root));
+				await tracker.start();
+				if (tracker.model.files.length) trees.push({ ...tree, model: tracker.model });
+			} catch {
+				// Linked roots can disappear between discovery and status.
+			}
+		}
+		const latest = new Set(this.registeredRoots());
+		// A root admitted during status must not wait for a later poll (which may
+		// be disabled). Ordinary overlapping polls still share exactly one scan.
+		if (latest.size !== roots.size || [...latest].some((root) => !roots.has(root))) return this.capture();
+		this.worktrees = trees;
+		return this.model;
+	}
+}
+
 const noLines: LineCounter = async () => 0;
 
 const NUMSTAT_ARGS = ["diff", "--numstat", "HEAD"];
@@ -199,7 +279,7 @@ export class ChangesTracker {
 
 	private async capture(): Promise<ChangedFile[] | undefined> {
 		const [numstat, porcelain] = await Promise.all([this.git(NUMSTAT_ARGS), this.git(PORCELAIN_ARGS)]);
-		if (numstat.code !== 0 || porcelain.code !== 0) return undefined;
+		if (porcelain.code !== 0) return undefined;
 		const files = snapshotChanges({ numstat: numstat.stdout, porcelain: porcelain.stdout });
 		// Untracked files never appear in numstat; count their lines directly.
 		for (const file of files) {
