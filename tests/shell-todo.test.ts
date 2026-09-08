@@ -134,7 +134,7 @@ test("renderTodoCard draws the framed list with status glyphs and keeps every li
 	const lines = renderTodoCard(seeded(), plainTheme, 60, { collapsed: false, staleTurns: 0, collapseKey: "ctrl+shift+t" });
 	for (const line of lines) assert.equal(visibleWidth(line), 60, `"${stripAnsi(line)}" is not 60 wide`);
 	const plain = lines.map(stripAnsi);
-	assert.match(plain[0], /^╭─ ❀ Todos · 1 of 3 ─+╮$/);
+	assert.match(plain[0], /^╭─ ❀ Todos · 1 of 3 ─+ ctrl\+shift\+t collapse ╮$/);
 	assert.match(plain[1], /^│ ✓ ~Add quiet tool rendering~ +│$/);
 	assert.match(plain[2], /^│ ◐ Fix quiet tools conflict · fixing conflict +│$/);
 	assert.match(plain[3], /^│ ○ Show git bash tails +│$/);
@@ -157,14 +157,40 @@ test("renderTodoCard folds a long list: done tasks become one row and the open o
 	assert.match(folded[1], /^│ ✓ 40 done +│$/);
 });
 
-test("renderTodoCard marks a stale list in the top rule and collapses to the task in progress", () => {
-	const stale = renderTodoCard(seeded(), plainTheme, 70, { collapsed: false, staleTurns: 2, collapseKey: "ctrl+shift+t" }).map(stripAnsi);
-	assert.match(stale[0], /^╭─ ❀ Todos · 1 of 3 ─+ stale · 2 turns ╮$/);
-	const collapsed = renderTodoCard(seeded(), plainTheme, 70, { collapsed: true, staleTurns: 0, collapseKey: "ctrl+shift+t" }).map(stripAnsi);
-	assert.equal(collapsed.length, 3);
-	assert.match(collapsed[0], /^╭─ ❀ Todos · 1 of 3 ─+ ctrl\+shift\+t expand ╮$/);
-	assert.match(collapsed[1], /^│ ◐ Fix quiet tools conflict · fixing conflict +│$/);
+test("renderTodoCard keeps the configured collapse shortcut in the header while stale state remains visible", () => {
+	const freshExpanded = renderTodoCard(seeded(), plainTheme, 70, { collapsed: false, staleTurns: 0, collapseKey: "ctrl+shift+t" }).map(stripAnsi);
+	assert.match(freshExpanded[0], /^╭─ ❀ Todos · 1 of 3 ─+ ctrl\+shift\+t collapse ╮$/);
+
+	const freshCollapsed = renderTodoCard(seeded(), plainTheme, 70, { collapsed: true, staleTurns: 0, collapseKey: "ctrl+shift+t" }).map(stripAnsi);
+	assert.equal(freshCollapsed.length, 3);
+	assert.match(freshCollapsed[0], /^╭─ ❀ Todos · 1 of 3 ─+ ctrl\+shift\+t expand ╮$/);
+	assert.match(freshCollapsed[1], /^│ ◐ Fix quiet tools conflict · fixing conflict +│$/);
+
+	const staleExpanded = renderTodoCard(seeded(), plainTheme, 70, { collapsed: false, staleTurns: 2, collapseKey: "ctrl+shift+t" }).map(stripAnsi);
+	assert.match(staleExpanded[0], /^╭─ ❀ Todos · 1 of 3 ─+ ctrl\+shift\+t collapse ╮$/);
+	assert.match(staleExpanded[1], /^│ stale · 2 turns +│$/);
+
+	const staleCollapsed = renderTodoCard(seeded(), plainTheme, 70, { collapsed: true, staleTurns: 2, collapseKey: "ctrl+shift+t" }).map(stripAnsi);
+	assert.match(staleCollapsed[0], /^╭─ ❀ Todos · 1 of 3 ─+ ctrl\+shift\+t expand ╮$/);
+	assert.match(staleCollapsed[1], /^│ stale · 2 turns +│$/);
+	assert.match(staleCollapsed[2], /^│ ◐ Fix quiet tools conflict · fixing conflict +│$/);
+
 	const idle = applyTodo(emptyTodo(), { action: "write", tasks: [{ title: "Only pending" }] }, 1).state;
 	assert.match(renderTodoCard(idle, plainTheme, 70, { collapsed: true, staleTurns: 0 }).map(stripAnsi)[1], /^│ ○ 1 open +│$/);
 	assert.deepEqual(renderTodoCard(emptyTodo(), plainTheme, 70, { collapsed: false, staleTurns: 0 }), []);
+});
+
+test("renderTodoCard uses custom shortcuts, omits disabled shortcuts, and remains width-safe when hints cannot fit", () => {
+	const custom = renderTodoCard(seeded(), plainTheme, 70, { collapsed: false, staleTurns: 2, collapseKey: "alt+t" }).map(stripAnsi);
+	assert.match(custom[0], /alt\+t collapse/);
+	assert.match(custom[1], /stale · 2 turns/);
+
+	const disabled = renderTodoCard(seeded(), plainTheme, 70, { collapsed: true, staleTurns: 2 }).map(stripAnsi);
+	assert.doesNotMatch(disabled[0], /(?:collapse|expand|ctrl\+shift\+t)/);
+	assert.match(disabled[1], /stale · 2 turns/);
+
+	for (const width of [0, 1, 2, 3, 4, 5, 8, 16]) {
+		const lines = renderTodoCard(seeded(), plainTheme, width, { collapsed: false, staleTurns: 2, collapseKey: "ctrl+shift+t" });
+		for (const line of lines) assert.equal(visibleWidth(line), width, `"${stripAnsi(line)}" is not ${width} wide`);
+	}
 });
