@@ -1,12 +1,13 @@
 import { CustomEditor, keyHint, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import * as os from "node:os";
 import { join } from "node:path";
 import { renderShellBar, shellEnabled, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
-import { CHANGE_STATUS, ChangesTracker, renderChangesWidget, type ChangedFile, type ChangesModel, type GitRunner, type LineCounter } from "../lib/shell-changes.ts";
-import { ChangesView } from "../lib/shell-changes-view.ts";
+import { CHANGE_STATUS, WorktreeChangesTracker, renderChangesWidget, type ChangedFile, type ChangesModel, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
+import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
+import { SessionWorktreeRegistry, SESSION_WORKTREE_CHANGED, resolveSessionWorktree, toolWorktreePath, worktreeGitEnvironment, type WorktreeResolver } from "../lib/session-worktree-registry.ts";
 import { CARD_TONE, renderCard, type Card, type CardTheme } from "../lib/shell-card.ts";
 import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
 import { framePromptLines, panelPainter, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
@@ -46,6 +47,8 @@ export interface ShellDeps {
 	fetch: typeof fetch;
 	now(): number;
 	devBinary(): DevBinaryNotice | undefined;
+	resolveWorktree: WorktreeResolver;
+	gitRunner(cwd: string): GitRunner;
 }
 
 function ambientDevBinary(): DevBinaryNotice | undefined {
@@ -58,7 +61,7 @@ function ambientDevBinary(): DevBinaryNotice | undefined {
 	}
 }
 
-const defaultShellDeps: ShellDeps = { fetch: (...args) => globalThis.fetch(...args), now: () => Date.now(), devBinary: ambientDevBinary };
+const defaultShellDeps: ShellDeps = { fetch: (...args) => globalThis.fetch(...args), now: () => Date.now(), devBinary: ambientDevBinary, resolveWorktree: resolveSessionWorktree, gitRunner: shellGitRunner };
 
 interface AssistantUsageEntry {
 	type: string;
@@ -220,11 +223,22 @@ const GIT_TIMEOUT_MS = 5000;
 const OVERLAY_HEIGHT_RATIO = 0.8;
 const OVERLAY_MIN_ROWS = 8;
 
-function gitRunner(pi: ExtensionAPI, cwd: string): GitRunner {
-	return async (args: string[]) => {
-		const result = await pi.exec("git", ["-C", cwd, ...args], { timeout: GIT_TIMEOUT_MS });
-		return { stdout: result.stdout, code: result.code };
-	};
+export function shellGitRunner(cwd: string, env: NodeJS.ProcessEnv = process.env): GitRunner {
+	// Pi exec cannot replace the inherited environment. Use argv directly and
+	// a complete sanitized environment for discovery, status, and lazy diffs.
+	const childEnv = worktreeGitEnvironment(env);
+	return (args) => new Promise((resolve) => {
+		execFile("git", ["-C", cwd, ...args], {
+			env: childEnv,
+			encoding: "utf8",
+			timeout: GIT_TIMEOUT_MS,
+			// Pi exec accumulates output without a maxBuffer cap. In particular,
+			// large porcelain inventories must not become partial successful scans.
+			maxBuffer: Infinity,
+		}, (error, stdout) => {
+			resolve({ stdout, code: error ? typeof error.code === "number" ? error.code : 1 : 0 });
+		});
+	});
 }
 
 function lineCounter(cwd: string): LineCounter {
@@ -247,13 +261,13 @@ export interface ExternalEditorHost {
 	requestRender(force?: boolean): void;
 }
 
-export function openInExternalEditor(host: ExternalEditorHost, path: string, env: NodeJS.ProcessEnv = process.env, spawn: typeof spawnSync = spawnSync): boolean {
+export function openInExternalEditor(host: ExternalEditorHost, path: string, env: NodeJS.ProcessEnv = process.env, spawn: typeof spawnSync = spawnSync, cwd?: string): boolean {
 	const command = env.VISUAL || env.EDITOR;
 	if (!command) return false;
 	const [editor, ...editorArgs] = command.split(" ");
 	host.stop();
 	try {
-		spawn(editor, [...editorArgs, path], { stdio: "inherit", shell: process.platform === "win32" });
+		spawn(editor, [...editorArgs, path], { cwd, stdio: "inherit", shell: process.platform === "win32" });
 	} finally {
 		host.start();
 		host.requestRender(true);
@@ -289,7 +303,8 @@ function changesFingerprint(model: ChangesModel): string {
 }
 
 interface OverlayDeps {
-	git: GitRunner;
+	git(root: string): GitRunner;
+	worktrees(): WorktreeChanges[];
 	refresh(): Promise<ChangesModel>;
 	apply(ctx: ExtensionContext, model: ChangesModel): void;
 	pollMs: number;
@@ -297,24 +312,26 @@ interface OverlayDeps {
 
 // While the overlay is open, git is polled so edits made outside pi (nvim,
 // another agent, a git checkout) show up without reopening it.
-async function showChangesOverlay(ctx: ExtensionContext, model: ChangesModel, deps: OverlayDeps): Promise<void> {
+async function showChangesOverlay(ctx: ExtensionContext, deps: OverlayDeps): Promise<void> {
 	let host: ExternalEditorHost | undefined;
-	let view: ChangesView | undefined;
-	const poll = setInterval(async () => {
+	let view: WorktreeChangesView | undefined;
+	const refresh = async () => {
 		const latest = await deps.refresh();
-		view?.update(latest);
+		view?.update(deps.worktrees());
 		deps.apply(ctx, latest);
-	}, deps.pollMs);
+	};
+	const poll = setInterval(() => void refresh(), deps.pollMs);
 	poll.unref();
 	try {
-		const chosen = await ctx.ui.custom<ChangedFile | null>(
+		const chosen = await ctx.ui.custom<{ root: string; file: ChangedFile } | null>(
 			(tui, theme, _keybindings, done) => {
 				host = tui;
-				view = new ChangesView(model, {
+				view = new WorktreeChangesView(deps.worktrees(), {
 					theme,
 					rows: Math.max(OVERLAY_MIN_ROWS, Math.floor(tui.terminal.rows * OVERLAY_HEIGHT_RATIO)),
-					loadDiff: (file) => loadFileDiff(deps.git, file),
-					onOpen: (file) => done(file),
+					loadDiff: (root, file) => loadFileDiff(deps.git(root), file),
+					onOpen: (root, file) => done({ root, file }),
+					onRefresh: () => void refresh(),
 					onClose: () => done(null),
 					requestRender: () => tui.requestRender(),
 				});
@@ -323,9 +340,10 @@ async function showChangesOverlay(ctx: ExtensionContext, model: ChangesModel, de
 			{ overlay: true, overlayOptions: { width: "92%", anchor: "center" } },
 		);
 		if (!chosen || !host) return;
-		if (!openInExternalEditor(host, chosen.path)) ctx.ui.notify("No editor configured. Set $VISUAL or $EDITOR.", "warning");
+		if (!openInExternalEditor(host, chosen.file.path, process.env, spawnSync, chosen.root)) ctx.ui.notify("No editor configured. Set $VISUAL or $EDITOR.", "warning");
 	} finally {
 		clearInterval(poll);
+		view = undefined;
 	}
 }
 
@@ -461,7 +479,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		},
 	});
 	let prompt: GentlePromptEditor | undefined;
-	let changes: ChangesTracker | undefined;
+	let changes: WorktreeChangesTracker | undefined;
+	let registry: SessionWorktreeRegistry | undefined;
+	let currentContext: ExtensionContext | undefined;
+	const pendingTools = new Map<string, { sessionId: string; path?: string }>();
 	let watch: NodeJS.Timeout | undefined;
 	let shown = "";
 	const applyChanges = (ctx: ExtensionContext, model: ChangesModel) => {
@@ -471,16 +492,42 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		showChanges(ctx, model);
 	};
 	const refreshChanges = async (ctx: ExtensionContext) => {
-		if (!changes || !ctx.hasUI) return;
-		applyChanges(ctx, await changes.refresh());
+		const tracker = changes;
+		if (!tracker || !ctx.hasUI || registry?.sessionId !== ctx.sessionManager.getSessionId()) return;
+		const model = await tracker.refresh();
+		if (changes === tracker) applyChanges(ctx, model);
 	};
 	const stopWatch = () => {
 		if (watch) clearInterval(watch);
 		watch = undefined;
 	};
+	const unsubscribeWorktrees = pi.events.on(SESSION_WORKTREE_CHANGED, (data) => {
+		if (!currentContext || !registry || (data as { sessionId?: string } | undefined)?.sessionId !== registry.sessionId) return;
+		void refreshChanges(currentContext);
+	});
+	pi.registerTool({
+		name: "session_worktree_register",
+		label: "Register session worktree",
+		description: "Register a worktree used by this session, including earlier work or opaque shell use. Only the same Git clone is accepted. Shows ALL dirty files in that root, including preexisting and untracked files; never infers roots from shell commands or prose.",
+		parameters: { type: "object", required: ["path"], additionalProperties: false, properties: { path: { type: "string", description: "Worktree path to include in this session." } } } as never,
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			if (!registry || registry.sessionId !== ctx.sessionManager.getSessionId()) throw new Error("No active session worktree registry.");
+			const root = registry.register((params as { path: string }).path, "explicit");
+			await refreshChanges(ctx);
+			return { content: [{ type: "text", text: `Registered session worktree: ${root}` }], details: { root, sessionId: registry.sessionId } };
+		},
+	});
 	pi.on("session_start", async (_event, ctx) => {
+		stopWatch();
+		registry?.close();
+		pendingTools.clear();
+		currentContext = ctx;
+		changes = undefined;
+		registry = new SessionWorktreeRegistry(pi, ctx.sessionManager, ctx.cwd, deps.resolveWorktree);
+		registry.start();
+		const sessionRegistry = registry;
 		if (!ctx.hasUI) return;
-		changes = new ChangesTracker(gitRunner(pi, ctx.cwd), lineCounter(ctx.cwd));
+		changes = new WorktreeChangesTracker(deps.gitRunner(ctx.cwd), deps.gitRunner, lineCounter, () => sessionRegistry.roots());
 		const tracker = changes;
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			renderHost = tui;
@@ -500,6 +547,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				: undefined,
 		);
 		await tracker.start();
+		if (changes !== tracker) return;
 		shown = "";
 		applyChanges(ctx, tracker.model);
 		stopWatch();
@@ -509,7 +557,15 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			watch.unref();
 		}
 	});
-	pi.on("session_shutdown", () => stopWatch());
+	pi.on("session_shutdown", () => {
+		stopWatch();
+		registry?.close();
+		registry = undefined;
+		changes = undefined;
+		currentContext = undefined;
+		pendingTools.clear();
+		unsubscribeWorktrees();
+	});
 	const openChanges = async (ctx: ExtensionContext) => {
 		if (!changes) return;
 		const tracker = changes;
@@ -518,10 +574,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			ctx.ui.notify("No changes in the working tree.", "info");
 			return;
 		}
-		await showChangesOverlay(ctx, model, { git: gitRunner(pi, ctx.cwd), refresh: () => tracker.refresh(), apply: applyChanges, pollMs: changesPollMs(env) });
+		await showChangesOverlay(ctx, { git: deps.gitRunner, worktrees: () => tracker.worktrees, refresh: () => tracker.refresh(), apply: applyChanges, pollMs: changesPollMs(env) });
 	};
 	pi.registerCommand(CHANGES_COMMAND_NAME, {
-		description: "Show the working tree changes against HEAD, with diffs. Press o to open a file in $EDITOR.",
+		description: "Browse this session's registered dirty worktrees and their changes against HEAD. Press o on a file to open $EDITOR.",
 		handler: async (_args, ctx) => openChanges(ctx),
 	});
 	const shortcut = changesShortcut(env);
@@ -541,7 +597,20 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		await refreshChanges(ctx);
 		void refreshUsage(ctx, false);
 	});
-	pi.on("tool_execution_end", async (_event, ctx) => {
+	pi.on("tool_execution_start", (event, ctx) => {
+		pendingTools.set(event.toolCallId, { sessionId: ctx.sessionManager.getSessionId() });
+	});
+	pi.on("tool_result", (event, ctx) => {
+		const pending = pendingTools.get(event.toolCallId);
+		if (pending?.sessionId === ctx.sessionManager.getSessionId()) pending.path = toolWorktreePath(event.toolName, event.input);
+	});
+	pi.on("tool_execution_end", async (event, ctx) => {
+		const pending = pendingTools.get(event.toolCallId);
+		pendingTools.delete(event.toolCallId);
+		if (!event.isError && pending?.path !== undefined && pending.sessionId === registry?.sessionId && pending.sessionId === ctx.sessionManager.getSessionId()) {
+			try { registry.register(pending.path, `tool:${event.toolName}`); }
+			catch { /* Non-project paths and missing roots do not expand the registry. */ }
+		}
 		await refreshChanges(ctx);
 	});
 }
