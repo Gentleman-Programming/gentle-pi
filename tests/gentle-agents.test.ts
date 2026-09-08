@@ -497,7 +497,7 @@ test("AgentsView production composition observes each pointer event once and acc
 	const { pi, tools, fire, commands } = fakePi();
 	const harness = deps();
 	gentleAgents(pi, {}, harness.deps);
-	const { ctx, overlays } = fakeContext();
+	const { ctx, overlays, customCompletions } = fakeContext();
 	await fire("session_start", ctx);
 
 	await tools.get("subagent_run")!.execute("b", { agent: "explore", task: "b", mode: "background" }, undefined, undefined, ctx);
@@ -538,14 +538,22 @@ test("AgentsView production composition observes each pointer event once and acc
 			return result;
 		};
 
-		assert.match(stripAnsi(overlay.render(80)[1] ?? ""), /▸/, "the first task starts selected");
-		assert.equal(dispatch(mouse("click", "right", 4, 2, 80, lines.length)), undefined, "right click is inert");
-		assert.match(stripAnsi(overlay.render(80)[1] ?? ""), /▸/, "right click cannot select another task");
-		assert.equal(dispatch(mouse("press", "left", 4, 2, 80, lines.length)), undefined, "press is inert");
-		assert.equal(dispatch(mouse("click", "middle", 4, 2, 80, lines.length)), undefined, "middle click is inert");
-		const leftClick = dispatch(mouse("click", "left", 4, 2, 80, lines.length));
-		assert.equal((leftClick as { handled?: boolean } | undefined)?.handled, true, "left click selects the task");
-		assert.match(stripAnsi(overlay.render(80)[2] ?? ""), /▸/, "left click selects the second task");
+		assert.match(stripAnsi(overlay.render(80)[1] ?? ""), /Current orchestrator/, "the parent heading is the first visible row");
+		assert.doesNotMatch(stripAnsi(overlay.render(80)[1] ?? ""), /▸/, "the heading is not a selected task");
+		assert.match(stripAnsi(overlay.render(80)[2] ?? ""), /▸ └ .*Subagent/, "the first child starts selected beneath its heading");
+		overlay.handleInput("k");
+		overlay.handleInput("s");
+		overlay.handleInput("o");
+		assert.deepEqual(harness.children.map((child) => child.killed), [[], []], "heading actions never stop a child");
+		assert.deepEqual(customCompletions, [], "heading actions never open a child session");
+		overlay.handleInput("j");
+		assert.equal(dispatch(mouse("click", "right", 4, 3, 80, lines.length)), undefined, "right click is inert");
+		assert.match(stripAnsi(overlay.render(80)[2] ?? ""), /▸ └ .*Subagent/, "right click cannot select another child");
+		assert.equal(dispatch(mouse("press", "left", 4, 3, 80, lines.length)), undefined, "press is inert");
+		assert.equal(dispatch(mouse("click", "middle", 4, 3, 80, lines.length)), undefined, "middle click is inert");
+		const leftClick = dispatch(mouse("click", "left", 4, 3, 80, lines.length));
+		assert.equal((leftClick as { handled?: boolean } | undefined)?.handled, true, "left click selects a child task");
+		assert.match(stripAnsi(overlay.render(80)[3] ?? ""), /▸ └ .*Subagent/, "left click selects the second child");
 		overlay.handleInput("\x1b");
 		await opened;
 	} finally {
@@ -661,7 +669,8 @@ test("finished tasks are written to history, come back through resolveTask, and 
 	const overlay = overlays[0];
 	assert.ok(overlay, "the overlay component was created");
 	assert.match(stripAnsi(overlay.render(80)[0]), /^╭─ ❀ Agents · this session · 0 active · \d+ finished/);
-	assert.ok(overlay.render(80).map(stripAnsi).some((line) => /✓ explore/.test(line)), "the finished task is listed");
+	overlay.handleInput("\x1b[C");
+		assert.ok(overlay.render(80).map(stripAnsi).some((line) => /✓ Subagent explore/.test(line)), "expanding the terminal group lists its finished child");
 	overlay.handleInput("\x1b");
 	await opened;
 });
@@ -825,7 +834,7 @@ test("the card follows the active session: after /new the earlier session's task
 	const overlay = overlays[0]!;
 	assert.match(stripAnsi(overlay.render(80)[0]), /this session · 0 active · 0 finished/, "the overlay opens on the active session");
 	overlay.handleInput("a");
-	assert.ok(overlay.render(80).map(stripAnsi).some((line) => /◐ explore/.test(line)), "all sessions still reaches the running task");
+	assert.ok(overlay.render(80).map(stripAnsi).some((line) => /◐ Subagent explore/.test(line)), "all sessions still reaches the running child");
 	overlay.handleInput("\x1b");
 	await opened;
 	sessions.sessionManager = { getSessionId: () => "s1", getCwd: () => cwd };
