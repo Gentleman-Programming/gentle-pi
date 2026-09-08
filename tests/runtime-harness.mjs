@@ -7,7 +7,7 @@ import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
-import { matchesKey } from "@earendil-works/pi-tui";
+import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { domainHashV1 } from "../lib/review-canonical.ts";
@@ -122,11 +122,11 @@ function createPi() {
 		},
 		getAllTools() {
 			return [
-				{ name: "read" },
-				{ name: "bash" },
-				{ name: "edit" },
-				{ name: "write" },
-				{ name: "mem_save" },
+				{ name: "read", sourceInfo: { source: "builtin" } },
+				{ name: "bash", sourceInfo: { source: "builtin" } },
+				{ name: "edit", sourceInfo: { source: "builtin" } },
+				{ name: "write", sourceInfo: { source: "builtin" } },
+				{ name: "mem_save", sourceInfo: { source: "builtin" } },
 			];
 		},
 	};
@@ -137,9 +137,19 @@ function createPi() {
 function createUi() {
 	const notifications = [];
 	const selections = [];
+	let header;
 	return {
 		notifications,
 		selections,
+		get header() {
+			return header;
+		},
+		setHeader(factory) {
+			header = factory(
+				{ requestRender() {} },
+				{ fg(_name, text) { return text; } },
+			);
+		},
 		notify(message, level = "info") {
 			notifications.push({ message, level });
 		},
@@ -818,6 +828,144 @@ async function run() {
 	// (cancelled), and /gentle:banner -> Color row -> nested picker (cancelled).
 	// Also covers an invalid non-empty argument, which must still open the
 	// picker and treat its cancellation as a no-op.
+	// issue-375: all startup-stat rows must share one grid at the wide
+	// threshold. Long values must truncate within that grid rather than changing
+	// its columns or wrapping a terminal line.
+	{
+		const { formatStartupStatsRows } = await import(
+			`${pathToFileURL(join(ROOT, "extensions/startup-banner.ts")).href}?startup-stats-grid`,
+		);
+		const longStats = {
+			gitBranch: `On branch ${"branch-".repeat(12)}`,
+			path: `/${"workspace/".repeat(12)}`,
+			mcp: `${"9".repeat(70)} server(s)`,
+			agents: `${"8".repeat(70)} phases`,
+			plugins: `${"7".repeat(70)} package(s)`,
+			skills: `${"6".repeat(70)} loaded`,
+			extensions: `${"5".repeat(70)} active`,
+			version: `v${"4".repeat(70)}`,
+			tools: `${"3".repeat(70)} custom`,
+		};
+
+		const narrowRows = formatStartupStatsRows(80, longStats);
+		assert.deepEqual(
+			narrowRows.map((row) => row.match(/^(PATH:|GIT:|MCP:|PLUGINS:|AGENTS:|SKILLS:|EXTENSIONS:|TOOLS:|VER:)/)?.[1]),
+			["PATH:", "GIT:", "MCP:", "PLUGINS:", "AGENTS:", "SKILLS:", "EXTENSIONS:", "TOOLS:", "VER:"],
+			"narrow layout must show PATH before GIT and keep version visually secondary",
+		);
+		assert.ok(narrowRows.every((row) => visibleWidth(row) <= 80 && !row.includes("\n")), "narrow rows must not wrap or clip");
+
+		const thresholdRows = formatStartupStatsRows(122, longStats);
+		assert.equal(thresholdRows.length, 5, "wide layout must compact stats into five paired grid rows");
+		assert.ok(thresholdRows.every((row) => visibleWidth(row) === 121 && !row.includes("\n")), "122-column grid must fit without wrapping or clipping");
+		assert.deepEqual(
+			thresholdRows.map((row) => {
+				const rightLabelIndex = ["GIT:", "PLUGINS:", "EXTENSIONS:", "VER:"]
+					.map((label) => row.indexOf(label))
+					.find((index) => index >= 0);
+				return rightLabelIndex === undefined ? -1 : visibleWidth(row.slice(0, rightLabelIndex));
+			}),
+			[62, 62, 62, -1, 62],
+			"wide second-column stats must retain the same origin",
+		);
+		assert.equal(thresholdRows[0].slice(13, 59), longStats.path.slice(0, 46), "PATH must retain 46 characters at 122 columns");
+		assert.match(thresholdRows[4], /TOOLS:.*VER:/, "version must share the wide grid with another stat");
+
+		const largerRows = formatStartupStatsRows(160, longStats);
+		assert.deepEqual(largerRows, thresholdRows, "larger widths must preserve the stable wide grid geometry");
+		assert.ok(
+			thresholdRows.every((row) => visibleWidth(row) <= 122 && !row.includes("\n")),
+			"long path, branch, version, and count values must stay inside the 122-column grid",
+		);
+
+		const unicodeStats = {
+			gitBranch: "plain",
+			path: "👩‍💻".repeat(7),
+			mcp: "plain",
+			agents: "plain",
+			plugins: "plain",
+			skills: "plain",
+			extensions: "界".repeat(7),
+			version: "plain",
+			tools: "plain",
+		};
+		const unicodeRows = formatStartupStatsRows(20, unicodeStats);
+		assert.ok(
+			unicodeRows.every((row) => visibleWidth(row) === 20),
+			"wide and grapheme values must truncate and pad to the terminal display width",
+		);
+
+		// PR #571: every rendered banner row must fit narrow widths, and runtime
+		// values must never introduce terminal controls. The harness uses ctx.cwd as
+		// the nearest real dynamic input seam because control bytes are not portable
+		// process-environment values.
+		const bannerConfigPath = join(globalConfigHome, "banner.json");
+		const originalRows = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+		const originalColumns = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+		const originalWrite = process.stdout.write;
+		const unsafePath = `safe\u0000\u0001\u007f\u009b31m\x1b]8;;https://example.invalid\u0007link\x1b]8;;\x1b\\tail`;
+		const restoreTerminalDimensions = () => {
+			if (originalRows) Object.defineProperty(process.stdout, "rows", originalRows);
+			else delete process.stdout.rows;
+			if (originalColumns) Object.defineProperty(process.stdout, "columns", originalColumns);
+			else delete process.stdout.columns;
+		};
+		try {
+			Object.defineProperty(process.stdout, "rows", { configurable: true, value: 30 });
+			Object.defineProperty(process.stdout, "columns", { configurable: true, value: 80 });
+			await writeFile(
+				bannerConfigPath,
+				'{"showRose":false,"showTextLogo":false,"color":"pink"}\n',
+			);
+			for (const width of [1, 2, 5, 10, 19, 20]) {
+				assert.ok(
+					formatStartupStatsRows(width, longStats).every((row) => visibleWidth(row) <= Math.max(1, width)),
+					`startup stats must fit a ${width}-column terminal before rendering`,
+				);
+			}
+			const unsafeStats = {
+				gitBranch: unsafePath,
+				path: unsafePath,
+				mcp: unsafePath,
+				agents: unsafePath,
+				plugins: unsafePath,
+				skills: unsafePath,
+				extensions: unsafePath,
+				version: unsafePath,
+				tools: unsafePath,
+			};
+			for (const row of formatStartupStatsRows(80, unsafeStats)) {
+				assert.doesNotMatch(stripAnsi(row), /[\x00-\x1f\x7f-\x9f]/, "startup stats must sanitize controls before layout");
+			}
+
+			const renderPath = unsafePath.replace(/\u0000/g, "");
+			const bannerCtx = createCtx(renderPath, true, "startup-banner-safety");
+			process.stdout.write = () => true;
+			await hooks.get("session_start").at(-1)({ reason: "startup" }, bannerCtx);
+			await new Promise((resolve) => setTimeout(resolve, 60));
+			assert.ok(bannerCtx.ui.header, "startup banner must register a header renderer");
+
+			for (const width of [20, 40, 80, 122, 160]) {
+				const lines = bannerCtx.ui.header.render(width);
+				assert.ok(lines.length > 0, `startup banner must render at width ${width}`);
+				assert.ok(
+					lines.every((line) => stripAnsi(line).length <= width),
+					`ANSI-stripped startup-banner rows must fit width ${width}`,
+				);
+				for (const line of lines) {
+					const withoutTrustedStyles = line.replace(/\x1b\[(?:\d+(?:;\d+)*)?m/g, "");
+					assert.doesNotMatch(withoutTrustedStyles, /[\x00-\x1a\x1c-\x1f\x7f-\x9f]/, "dynamic values must not emit terminal controls");
+					assert.doesNotMatch(withoutTrustedStyles, /\x1b/, "only trusted SGR styling may remain");
+				}
+			}
+			bannerCtx.ui.header.invalidate();
+		} finally {
+			process.stdout.write = originalWrite;
+			restoreTerminalDimensions();
+			await rm(bannerConfigPath, { force: true });
+		}
+	}
+
 	const cancelPickerCwd = await tempWorkspace();
 	try {
 		const bannerConfigPath = join(globalConfigHome, "banner.json");
