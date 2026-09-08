@@ -231,3 +231,44 @@ test("AgentsView lists the active session's recent tasks by default and a toggle
 	assert.equal(view.selectedTask()?.id, "mine", "a new scope reads from the top");
 	assert.deepEqual(names(), ["mine", "fresh"]);
 });
+
+test("AgentsView footer buttons follow, open only a session-backed selection, and clear stale geometry", () => {
+	const { store, view, events } = harness(8, "s");
+	store.add(task("a", { sessionPath: "/sessions/a.jsonl" }));
+	for (let index = 0; index < 12; index += 1) store.apply("a", { type: TASK_EVENT.TEXT, text: `line ${index}\n` }, 2000);
+	const width = 160;
+	const lines = view.render(width);
+	const footerY = lines.length - 2;
+	const followX = 131;
+	const openX = 142;
+	assert.match(stripAnsi(lines.at(-2) ?? ""), /\[ Follow \].*\[ Open session \]/, "buttons render only after the full key-hint row fits");
+
+	view.handleInput("\x1b[5~");
+	assert.match(stripAnsi(view.render(width)[2]), /line 5/, "page up leaves follow mode before the button restores it");
+	assert.equal(view.handleMouse(mouse(followX, footerY, width, lines.length))?.render, true, "button hover requests a distinct frame");
+	assert.equal(view.handleMouse(mouse(followX, footerY, width, lines.length, "press")), undefined, "press is inert");
+	assert.equal(view.handleMouse({ ...mouse(followX, footerY, width, lines.length, "click"), button: "right" }), undefined, "right click is inert");
+	assert.equal(view.handleMouse({ ...mouse(followX, footerY, width, lines.length, "click"), button: "middle" }), undefined, "middle click is inert");
+	assert.equal(view.handleMouse(mouse(followX, footerY, width, lines.length, "click"))?.handled, true);
+	assert.match(stripAnsi(view.render(width)[2]), /line 9/, "Follow returns the selected thread to its tail");
+	assert.equal(view.handleMouse(mouse(openX, footerY, width, lines.length, "click"))?.handled, true);
+	assert.deepEqual(events, ["open:a"], "Open delegates the selected task to the existing callback");
+	assert.equal(view.handleMouse(mouse(followX, footerY, width + 1, lines.length, "click")), undefined, "a pre-render resize makes the prior footer geometry inert");
+
+	store.update("a", { sessionPath: null });
+	view.render(width);
+	assert.equal(view.handleMouse(mouse(openX, footerY, width, lines.length, "click")), undefined, "Open is disabled when the selected task loses its session path");
+	assert.deepEqual(events, ["open:a"]);
+	view.render(200);
+	assert.equal(view.handleMouse(mouse(followX, footerY, 200, lines.length, "click")), undefined, "resize discards the old footer geometry before routing clicks");
+	assert.doesNotMatch(stripAnsi(view.render(44).at(-2) ?? ""), /\[ Follow \]|\[ Open session \]/, "buttons hide instead of truncating when the rendered key hints do not fit");
+	view.handleInput("a");
+	assert.equal(view.handleMouse(mouse(followX, footerY, width, lines.length, "click")), undefined, "a scope change clears old footer geometry until the next frame");
+	view.dispose();
+	assert.equal(view.handleMouse(mouse(followX, footerY, width, lines.length, "click")), undefined, "disposed footer controls stay inert");
+	const { view: empty } = harness(8, "s");
+	const emptyLines = empty.render(width);
+	assert.equal(empty.handleMouse(mouse(followX, footerY, width, emptyLines.length, "click")), undefined, "Follow is disabled with no selected task");
+	assert.equal(empty.handleMouse(mouse(openX, footerY, width, emptyLines.length, "click")), undefined, "Open is disabled with no selected session");
+	empty.dispose();
+});

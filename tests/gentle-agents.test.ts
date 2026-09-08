@@ -4,10 +4,10 @@ import { homedir, tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import test, { after, mock } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { TuiMouseEvent } from "@earendil-works/pi-tui";
+import { visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, answerThroughUi, completionText, legacySubagentsInstalled, type AgentsDeps } from "../extensions/gentle-agents.ts";
 import { historyDir, loadHistory, saveTask } from "../lib/agents-history.ts";
-import { emptyThread, TASK_STATUS, type TaskRecord } from "../lib/agents-protocol.ts";
+import { emptyThread, TASK_EVENT, TASK_STATUS, TaskStore, type TaskRecord } from "../lib/agents-protocol.ts";
 import { NativePointerScope } from "../lib/native-pointer-region.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
@@ -75,6 +75,7 @@ function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (t
 	const widgets = new Map<string, (tui: unknown, theme: unknown) => { render(width: number): string[] }>();
 	const dialogs: string[] = [];
 	const overlays: Overlay[] = [];
+	const customCompletions: unknown[] = [];
 	const ctx = {
 		hasUI: true,
 		sessionManager: { getSessionId: () => "s1", getCwd: () => cwd },
@@ -82,7 +83,11 @@ function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (t
 			notify: (message: string) => dialogs.push(`notify:${message}`),
 			custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => Overlay) =>
 				new Promise((resolve) => {
-					const component = factory({ terminal: { rows: 30 }, requestRender() {} }, plainTheme, {}, resolve);
+					const done = (value: unknown) => {
+						customCompletions.push(value);
+						resolve(value);
+					};
+					const component = factory({ terminal: { rows: 30 }, requestRender() {} }, plainTheme, {}, done);
 					overlays.push(component);
 				}),
 			setWidget(key: string, content: ((tui: unknown, theme: unknown) => { render(width: number): string[] }) | undefined) {
@@ -108,7 +113,7 @@ function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (t
 		const factory = widgets.get("gentle-agents");
 		return factory ? factory(tui, plainTheme).render(72).map(stripAnsi) : undefined;
 	};
-	return { ctx, widget, dialogs, overlays };
+	return { ctx, widget, dialogs, overlays, customCompletions };
 }
 
 function deps(): { deps: Partial<AgentsDeps>; children: FakeChild[]; spawned: string[][] } {
@@ -438,6 +443,82 @@ test("AgentsView production composition observes each pointer event once and acc
 		await opened;
 	} finally {
 		spy.mock.restore();
+	}
+});
+
+test("AgentsView production footer uses rendered bounds and invalidates them before the next frame", async () => {
+	writeFileSync(join(home, ".pi", "agent", "agents", "寿司.md"), "---\ndescription: unicode footer target\nmodel: openai-codex/gpt-5.6-terra\n---\nFooter target.");
+	const { pi, tools, fire, commands } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, overlays, customCompletions } = fakeContext();
+	(ctx as unknown as { sessionManager: { getSessionId(): string; getCwd(): string } }).sessionManager = { getSessionId: () => "footer-session", getCwd: () => cwd };
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "寿司", task: "Footer target", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+
+	let store: TaskStore | undefined;
+	const subscribeSummary = TaskStore.prototype.subscribeSummary;
+	const captureStore = mock.method(TaskStore.prototype, "subscribeSummary", function (this: TaskStore, ...args: Parameters<TaskStore["subscribeSummary"]>) {
+		store ??= this;
+		return subscribeSummary.apply(this, args);
+	});
+	try {
+		const opened = commands.get("gentle:agents")!.handler("", ctx);
+		for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+		const overlay = overlays[0];
+		assert.ok(overlay, "the production extension mounted its fullscreen interaction");
+		assert.ok(store, "the overlay subscribed to the production task store");
+		const selected = store.list().find((entry) => entry.parentSessionId === "footer-session");
+		assert.ok(selected?.sessionPath, "the selected unicode task initially has an openable session");
+		for (let index = 0; index < 12; index += 1) store.apply(selected.id, { type: TASK_EVENT.TEXT, text: `line ${index}\n` }, 2000 + index);
+
+		const buttons = (lines: string[], label: string) => {
+			const footer = lines.at(-2) ?? "";
+			const start = footer.indexOf(label);
+			assert.ok(start > 0, `the roomy footer exposes ${label}`);
+			return { x: visibleWidth(footer.slice(0, start)), y: lines.length - 2 };
+		};
+		let lines = overlay.render(160).map(stripAnsi);
+		let follow = buttons(lines, "[ Follow ]");
+		let open = buttons(lines, "[ Open session ]");
+		assert.match(lines[1] ?? "", /寿司/, "a unicode task remains inside the body, not the header or footer");
+		assert.match(lines[follow.y] ?? "", /s Stop selected.*a all sessions/, "the existing stop and scope shortcuts remain beside the footer buttons");
+		assert.doesNotMatch(overlay.render(44).map(stripAnsi).at(-2) ?? "", /\[ Follow \]|\[ Open session \]/, "a narrow render hides controls rather than retaining roomy bounds");
+		lines = overlay.render(160).map(stripAnsi);
+		follow = buttons(lines, "[ Follow ]");
+		open = buttons(lines, "[ Open session ]");
+		assert.equal(overlay.handleMouse?.(mouse("click", "left", follow.x, 0, 160, lines.length)), undefined, "header coordinates never route to a footer button");
+		assert.equal(overlay.handleMouse?.(mouse("click", "left", follow.x, follow.y - 1, 160, lines.length)), undefined, "body coordinates never route to a footer button");
+		assert.equal(overlay.handleMouse?.(mouse("press", "left", follow.x, follow.y, 160, lines.length)), undefined, "press is inert");
+		assert.equal(overlay.handleMouse?.(mouse("click", "right", follow.x, follow.y, 160, lines.length)), undefined, "right click is inert");
+		assert.equal(overlay.handleMouse?.(mouse("click", "middle", follow.x, follow.y, 160, lines.length)), undefined, "middle click is inert");
+		assert.equal((overlay.handleMouse?.(mouse("move", "none", follow.x, follow.y, 160, lines.length)) as { handled?: boolean } | undefined)?.handled, true, "hover does not activate Follow");
+
+		overlay.handleInput("\x1b[5~");
+		assert.equal((overlay.handleMouse?.(mouse("click", "left", follow.x, follow.y, 160, lines.length)) as { handled?: boolean } | undefined)?.handled, true, "Follow restores tail tracking");
+		assert.equal((overlay.handleMouse?.(mouse("click", "left", follow.x, follow.y, 160, lines.length)) as { handled?: boolean } | undefined)?.handled, true, "repeated Follow remains enabled instead of toggling off");
+		store.apply(selected.id, { type: TASK_EVENT.TEXT, text: "line 12\n" }, 2012);
+		lines = overlay.render(160).map(stripAnsi);
+		assert.ok(lines.some((line) => /line 12/.test(line)), "Follow keeps the stream at its tail after manual scrolling");
+		follow = buttons(lines, "[ Follow ]");
+		open = buttons(lines, "[ Open session ]");
+		assert.equal((overlay.handleMouse?.(mouse("click", "left", open.x, open.y, 160, lines.length)) as { handled?: boolean } | undefined)?.handled, true, "Open delegates exactly one eligible click to the existing callback");
+		assert.equal(customCompletions.length, 1, "Open completes the actual ui.custom callback exactly once");
+		const openedTask = customCompletions[0] as TaskRecord | undefined;
+		assert.equal(openedTask?.id, selected.id, "Open completes ui.custom with the selected task before Escape");
+		assert.equal(openedTask?.sessionPath, selected.sessionPath, "Open preserves the selected task's openable session in the ui.custom result");
+
+		store.update(selected.id, { sessionPath: null });
+		assert.equal(overlay.handleMouse?.(mouse("click", "left", follow.x, follow.y, 160, lines.length)), undefined, "a selected task update makes old footer coordinates inert until render");
+		lines = overlay.render(160).map(stripAnsi);
+		follow = buttons(lines, "[ Follow ]");
+		overlay.handleInput("a");
+		assert.equal(overlay.handleMouse?.(mouse("click", "left", follow.x, follow.y, 160, lines.length)), undefined, "a scope change makes old footer coordinates inert until render");
+		overlay.handleInput("\x1b");
+		await opened;
+	} finally {
+		captureStore.mock.restore();
 	}
 });
 
