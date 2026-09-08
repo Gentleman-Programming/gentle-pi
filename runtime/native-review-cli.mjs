@@ -832,6 +832,18 @@ export const NATIVE_CLI_CONTRACTS = Object.freeze({
 	// consumes did not change between 2.5.0 and 2.6.0, so the columns match
 	// the 2.5.0 row.
 	"2.6.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	// Ground-truthed against the published v2.7.0 binary installed from its
+	// signed archive: `review capabilities` on the v2 lane still advertises
+	// capabilities/v2.5 (protocol minor 5) and answers status/v7, consent/v3,
+	// and the `start/v4` continuation, all of which the decoders already read.
+	// `review mode status --json` still answers `gentle-ai.rdd-mode-status/v1`
+	// and `review validate --gate pre-commit` still answers
+	// `gentle-ai.review-gate-result/v1` carrying `delivery`, both verified
+	// against the binary. riskEvidence and hint stay dark for the same reason
+	// they have on every row since 2.2.0: still not proven to reach the
+	// negotiated START path Pi reads. The closed fields Pi consumes did not
+	// change between 2.6.0 and 2.7.0, so the columns match the 2.6.0 row.
+	"2.7.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 });
 
 
