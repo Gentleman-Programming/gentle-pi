@@ -1,7 +1,8 @@
-import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { createNativePointerScope, type NativePointerRegion } from "./native-pointer-region.ts";
-import { isFinished, TASK_STATUS, THREAD_ITEM, type TaskRecord, type TaskStore, type TaskThread, type ThreadItem, type ToolItem } from "./agents-protocol.ts";
+import { Key, matchesKey, truncateToWidth, visibleWidth, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { isFinished, TASK_STATUS, type TaskRecord, type TaskStore, type TaskThread, type ThreadItem } from "./agents-protocol.ts";
+import { renderThreadItem, type AgentsThreadTheme } from "./agents-thread-view.ts";
 import { formatElapsed } from "./agents-widget.ts";
+import { createNativePointerScope, type NativePointerRegion } from "./native-pointer-region.ts";
 import { formatTokens } from "./shell-bar.ts";
 
 // Gentle Agents overlay: tasks on the left, the selected task's thread on
@@ -11,9 +12,7 @@ import { formatTokens } from "./shell-bar.ts";
 // work (active tasks plus those finished in the last quarter hour); `a`
 // widens it to every task of every session, including the stored history.
 
-export interface AgentsViewTheme {
-	fg(color: string, text: string): string;
-}
+export interface AgentsViewTheme extends AgentsThreadTheme {}
 
 export const VIEW_SCOPE = {
 	SESSION: "session",
@@ -44,13 +43,6 @@ const ROLE = {
 	NAME: "text",
 	NAME_IDLE: "muted",
 	META: "dim",
-	TEXT: "text",
-	THINKING: "dim",
-	TOOL: "accent",
-	TOOL_ERROR: "error",
-	OUTPUT: "muted",
-	NOTE: "muted",
-	NOTE_ERROR: "warning",
 	KEY: "accent",
 	KEY_TEXT: "dim",
 	EMPTY: "dim",
@@ -124,49 +116,6 @@ function rule(length: number): string {
 function fit(text: string, width: number): string {
 	const clipped = truncateToWidth(text, width, "…");
 	return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
-}
-
-function argsSummary(item: ToolItem): string {
-	const values = Object.values(item.args).filter((value) => typeof value === "string") as string[];
-	return (values[0] ?? "").replace(/\s+/g, " ").trim();
-}
-
-function toolLines(item: ToolItem, theme: AgentsViewTheme, width: number): string[] {
-	const role = item.isError ? ROLE.TOOL_ERROR : ROLE.TOOL;
-	const head = truncateToWidth(`▸ ${item.name} ${argsSummary(item)}`, width, "…");
-	const lines = [theme.fg(role, head)];
-	// The whole captured output, wrapped: the thread pane scrolls, so nothing
-	// is hidden here. The store already keeps only the last maxOutputChars of a
-	// tool's output and marks the cut with a leading ellipsis.
-	for (const line of item.output.split("\n").filter((line) => line.length > 0)) {
-		for (const wrapped of wrapTextWithAnsi(line, Math.max(1, width - 2))) lines.push(theme.fg(ROLE.OUTPUT, `  ${wrapped}`));
-	}
-	if (item.running) lines.push(theme.fg(ROLE.META, "  …"));
-	return lines;
-}
-
-function thinkingLines(text: string, theme: AgentsViewTheme, width: number): string[] {
-	const lines: string[] = [];
-	for (const [index, line] of text.split("\n").filter((line) => line.length > 0).entries()) {
-		const prefix = index === 0 ? "∴ " : "  ";
-		for (const wrapped of wrapTextWithAnsi(line, Math.max(1, width - 2))) lines.push(theme.fg(ROLE.THINKING, `${prefix}${wrapped}`));
-	}
-	return lines;
-}
-
-export function itemLines(item: ThreadItem, theme: AgentsViewTheme, width: number): string[] {
-	switch (item.kind) {
-		case THREAD_ITEM.TEXT:
-			return wrapTextWithAnsi(item.text, width).map((line) => theme.fg(ROLE.TEXT, line));
-		case THREAD_ITEM.THINKING:
-			return thinkingLines(item.text, theme, width);
-		case THREAD_ITEM.TOOL:
-			return toolLines(item, theme, width);
-		case THREAD_ITEM.NOTE:
-			return [theme.fg(item.text.startsWith("error") ? ROLE.NOTE_ERROR : ROLE.NOTE, truncateToWidth(`· ${item.text}`, width, "…"))];
-		default:
-			return [];
-	}
 }
 
 export function taskHeader(task: TaskRecord, now: number): string {
@@ -411,7 +360,7 @@ export class AgentsView {
 		for (const item of thread.items) {
 			let rendered = this.cache.get(item);
 			if (!rendered) {
-				rendered = itemLines(item, this.deps.theme, width);
+				rendered = renderThreadItem(item, this.deps.theme, width);
 				this.cache.set(item, rendered);
 			}
 			lines.push(...rendered);
