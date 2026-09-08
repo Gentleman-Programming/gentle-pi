@@ -1,0 +1,109 @@
+name: Feature Request
+description: Propose a new capability or a behavior change in gentle-pi.
+labels: ["enhancement", "status:needs-review"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem before the solution, so maintainers can evaluate the need
+        and not only the proposed shape.
+        Requests receive `enhancement` and `status:needs-review`; these labels do not imply approval.
+        Only an issue carrying `status:approved` may be implemented in a pull request.
+
+        Keep the entire request public-safe: remove credentials, tokens, private paths,
+        hostnames, and other sensitive data, including from logs and screenshots.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched open and closed issues and did not find this request.
+          required: true
+        - label: I reviewed this request and removed credentials, tokens, private paths, hostnames, and other sensitive data.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is difficult, impossible, or error-prone today? Describe the need, not the implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the behavior you expect once this exists, from the point of view of someone using gentle-pi.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance criteria
+      description: List the observable conditions that would make this request complete. Include the existing behavior that must remain unchanged.
+      placeholder: |
+        - ...
+        - Existing ... remains unchanged.
+    validations:
+      required: true
+
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals (optional)
+      description: State what this request deliberately excludes, to keep the eventual change reviewable.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered (optional)
+      description: Describe workarounds you tried and why they are insufficient.
+    validations:
+      required: false
+
+  - type: input
+    id: gentle_pi_version
+    attributes:
+      label: gentle-pi version (optional)
+      description: Provide the installed package version, or the commit if running from source.
+    validations:
+      required: false
+
+  - type: input
+    id: pi_version
+    attributes:
+      label: Pi version (optional)
+      description: Provide the Pi coding agent version this request applies to.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      description: Select the platform this request targets, or that it is not platform specific.
+      multiple: false
+      options:
+        - Not platform specific
+        - macOS
+        - Linux
+        - Windows
+        - Windows (WSL)
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context (optional)
+      description: Include only useful excerpts. Remove credentials, tokens, private paths, hostnames, and other sensitive data before pasting.
+      render: text
+    validations:
+      required: false
