@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { emptyThread, TASK_EVENT, TASK_STATUS, TaskStore, type TaskRecord } from "../lib/agents-protocol.ts";
-import { AgentsView, itemLines, taskHeader } from "../lib/agents-view.ts";
+import { renderThreadItem } from "../lib/agents-thread-view.ts";
+import { AgentsView, taskHeader } from "../lib/agents-view.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 
 // Gentle Agents overlay: list left, selected thread right, tail-following,
@@ -32,20 +33,20 @@ function harness(rows = 8, sessionId?: string) {
 	return { store, view, events, renders: () => renders };
 }
 
-test("itemLines renders text, whole thinking blocks, whole tool output, and notes", () => {
-	assert.deepEqual(itemLines({ kind: "text", text: "one two three four" }, plainTheme, 9), ["one two", "three", "four"]);
-	assert.deepEqual(itemLines({ kind: "thinking", text: "deep\nthoughts" }, plainTheme, 20), ["∴ deep", "  thoughts"]);
+test("renderThreadItem renders labeled text, thinking, tool-output, and note blocks", () => {
+	assert.deepEqual(renderThreadItem({ kind: "text", text: "one two three four" }, plainTheme, 9), ["Text", "  one two", "  three", "  four"]);
+	assert.deepEqual(renderThreadItem({ kind: "thinking", text: "deep\nthoughts" }, plainTheme, 20), ["Thinking", "  deep", "  thoughts"]);
 	const output = Array.from({ length: 10 }, (_, index) => `line ${index}`).join("\n");
-	const tool = itemLines({ kind: "tool", callId: "c", name: "bash", args: { command: "ls  -la" }, output, running: true, isError: false }, plainTheme, 30);
-	assert.equal(tool[0], "▸ bash ls -la");
-	assert.equal(tool.length, 12, "head, every output line, running marker");
-	assert.equal(tool[1], "  line 0");
-	assert.equal(tool[10], "  line 9");
-	assert.equal(tool[11], "  …");
+	const tool = renderThreadItem({ kind: "tool", callId: "c", name: "bash", args: { command: "ls  -la" }, output, running: true, isError: false }, plainTheme, 30);
+	assert.equal(tool[0], "Tool · bash · Running");
+	assert.equal(tool.length, 12, "head, output label, and every retained output line");
+	assert.equal(tool[1], "  Output");
+	assert.equal(tool[2], "    line 0");
+	assert.equal(tool[11], "    line 9");
 	// A long output line wraps instead of being clipped, so nothing is hidden.
-	const wide = itemLines({ kind: "tool", callId: "c", name: "bash", args: {}, output: "alpha beta gamma delta", running: false, isError: false }, plainTheme, 12);
-	assert.deepEqual(wide.slice(1), ["  alpha beta", "  gamma", "  delta"]);
-	assert.deepEqual(itemLines({ kind: "note", text: "error: boom" }, plainTheme, 30), ["· error: boom"]);
+	const wide = renderThreadItem({ kind: "tool", callId: "c", name: "bash", args: {}, output: "alpha beta gamma delta", running: false, isError: false }, plainTheme, 12);
+	assert.deepEqual(wide.slice(2), ["    alpha", "    beta", "    gamma", "    delta"]);
+	assert.deepEqual(renderThreadItem({ kind: "note", text: "error: boom" }, plainTheme, 30), ["Note", "  error: boom"]);
 	assert.equal(taskHeader(task("a"), 61_000), "explore · running · gpt-5.6-terra · 34k · $0.27 · 1m00s");
 });
 
@@ -82,13 +83,15 @@ test("AgentsView keys move the selection, scroll, follow, cancel, open, and clos
 	assert.deepEqual(events, ["cancel:a", "open:a"]);
 	for (let index = 0; index < 12; index += 1) store.apply("a", { type: TASK_EVENT.TEXT, text: `l${index}\n` }, 2000);
 	view.handleInput("\x1b[5~");
-	assert.match(stripAnsi(view.render(80)[2]), /│ l0 +│$/, "page up leaves follow mode and shows the top");
+	assert.match(stripAnsi(view.render(80)[2]), /│ Text +│$/, "page up leaves follow mode and shows the top block label");
+	assert.match(stripAnsi(view.render(80)[3]), /│   l0 +│$/, "page up leaves follow mode and shows the top block body");
 	view.handleInput("\x0a");
-	assert.match(stripAnsi(view.render(80)[2]), /│ l4 +│$/, "ctrl+j scrolls one page down");
+	assert.match(stripAnsi(view.render(80)[2]), /│   l3 +│$/, "ctrl+j scrolls one page down across the labeled block");
 	view.handleInput("\x0b");
-	assert.match(stripAnsi(view.render(80)[2]), /│ l0 +│$/, "ctrl+k scrolls one page up");
+	assert.match(stripAnsi(view.render(80)[2]), /│ Text +│$/, "ctrl+k scrolls one page up to the labeled block");
+	assert.match(stripAnsi(view.render(80)[3]), /│   l0 +│$/, "ctrl+k restores the top block body");
 	view.handleInput("f");
-	assert.match(stripAnsi(view.render(80)[2]), /│ l9 +│$/, "f follows the tail again");
+	assert.match(stripAnsi(view.render(80)[2]), /│   l9 +│$/, "f follows the tail again");
 	view.handleInput("\x1b");
 	assert.deepEqual(events, ["cancel:a", "open:a", "close"]);
 });
