@@ -12,6 +12,10 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const temporary = mkdtempSync(join(tmpdir(), "gentle-pi-packed-runner-"));
 const packDirectory = join(temporary, "pack");
 const installDirectory = join(temporary, "install");
+// Every child inherits only disposable Pi homes, never the operator's settings.
+const agentHome = join(temporary, "agent");
+const piAgentHome = join(temporary, "pi-agent");
+const isolatedEnv = { ...process.env, GENTLE_PI_AGENT_HOME: agentHome, PI_CODING_AGENT_DIR: piAgentHome };
 
 function windowsNpmInvocation() {
 	const candidates = [];
@@ -32,12 +36,16 @@ function windowsNpmInvocation() {
 
 function runNpm(arguments_, options) {
 	const invocation = process.platform === "win32" ? windowsNpmInvocation() : { file: "npm", prefix: [] };
-	return execFileSync(invocation.file, [...invocation.prefix, ...arguments_], options);
+	return execFileSync(invocation.file, [...invocation.prefix, ...arguments_], { ...options, env: isolatedEnv });
 }
 
 try {
 	mkdirSync(packDirectory);
 	mkdirSync(installDirectory);
+	mkdirSync(agentHome);
+	mkdirSync(piAgentHome);
+	const originalSettings = '{ "tuiMode": "regular", "theme": "packed-fixture" }\n';
+	writeFileSync(join(agentHome, "settings.json"), originalSettings);
 	const packed = JSON.parse(runNpm(["pack", "--ignore-scripts", "--json", "--pack-destination", packDirectory], {
 		cwd: root,
 		encoding: "utf8",
@@ -50,7 +58,13 @@ try {
 		cwd: installDirectory,
 		stdio: "inherit",
 	});
+	// This is an ordinary npm consumer, not Pi's managed global npm directory.
+	assert.equal(readFileSync(join(agentHome, "settings.json"), "utf8"), originalSettings);
+	assert.deepEqual(readdirSync(agentHome), ["settings.json"]);
+	assert.deepEqual(readdirSync(piAgentHome), []);
+	assert.equal(existsSync(join(installDirectory, ".pi", "settings.json")), false);
 	const packageRoot = join(installDirectory, "node_modules", "gentle-pi");
+	assert.ok(existsSync(join(packageRoot, "scripts", "install-tui-mode-setting.mjs")));
 	const { nativeReviewAbandonAuthorization } = await import(pathToFileURL(join(packageRoot, "runtime", "native-review-cli.mjs")).href);
 	const abandonAuthorization = nativeReviewAbandonAuthorization({
 		lineage: "review-abc",
@@ -77,7 +91,7 @@ try {
 	const versions = readdirSync(join(packageRoot, ".gentle-ai"), { withFileTypes: true }).filter((entry) => entry.isDirectory() && /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.]*)?$/.test(entry.name));
 	if (versions.length !== 1) throw new Error("packed install did not contain exactly one package-local Gentle AI version");
 	const executable = join(packageRoot, ".gentle-ai", versions[0].name, process.platform === "win32" ? "gentle-ai.exe" : "gentle-ai");
-	const capabilities = JSON.parse(execFileSync(executable, ["review", "capabilities", "--contract", "gentle-ai.review-integration/v2"], { cwd: installDirectory, encoding: "utf8" }));
+	const capabilities = JSON.parse(execFileSync(executable, ["review", "capabilities", "--contract", "gentle-ai.review-integration/v2"], { cwd: installDirectory, encoding: "utf8", env: isolatedEnv }));
 	// Decode with the PACKED consumer's own decoder rather than comparing the
 	// schema string against a list hand-copied into this script. The copy was a
 	// second, silent pin: it accepted only `capabilities/v2`, so the moment the

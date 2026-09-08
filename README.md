@@ -70,7 +70,7 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | Capability                     | What it does                                                                                                                                  |
 | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | **el Gentleman persona**       | Makes Pi behave like a senior architect and teacher, not a generic chatbot. Spanish responses use Rioplatense voseo by default; neutral mode is saved globally with project overrides. |
-| **Configurable startup intro** | Adds a rose/text-logo startup intro, compact runtime panel, color presets, and commands to hide or show the decorative parts.                  |
+| **Configurable startup intro** | Adds desktop sidebar branding, a compact startup context panel, and independent rose/text visibility controls.                  |
 | **Work routing discipline**    | Small tasks stay inline. Context-heavy exploration can be delegated. Large or risky changes go through SDD/OpenSpec.                          |
 | **SDD/OpenSpec assets**        | Installs phase agents and chains for `init`, `onboard`, `explore`, `proposal`, `spec`, `design`, `tasks`, `apply`, `verify`, `sync`, and `archive`. |
 | **Lazy SDD preflight**         | Resolves SDD mode, artifact store, delivery strategy, and review budget once per session; prompts only when a choice is genuinely unresolved.              |
@@ -109,13 +109,21 @@ Pointer input is fullscreen-only. Regions preserve a consuming child's native re
 `Text`, activate on press or wheel, synthesize outside leave events, or alter terminal tracking.
 Callers own keyboard policy, theme state, and business actions.
 
-**Migration note:** Do not enable `pi-tool-cards` and `quiet-tools` together: Pi rejects duplicate `bash`, `read`, `edit`, and `write` registrations. Disable or remove the standalone package during migration; gentle-pi does not alter user configuration or delete that repository.
+**Migration note:** Do not enable `pi-tool-cards` and `quiet-tools` together: Pi rejects duplicate `bash`, `read`, `edit`, and `write` registrations. Disable or remove the standalone package during migration; gentle-pi does not change those package registrations or delete that repository. The global fullscreen setting described below is a separate install-time change.
 
 ## Install
 
 ```bash
 pi install npm:gentle-pi@0.14.0
 ```
+
+### Install-time fullscreen
+
+For this release, a successful postinstall in Pi's **global npm-managed** `agent-home/npm/node_modules/gentle-pi` installation persists `"tuiMode": "fullscreen"` in `agent-home/settings.json`, preserving other settings. Agent home resolves through `GENTLE_PI_AGENT_HOME`, then `PI_CODING_AGENT_DIR`, then `~/.pi/agent`. Use `/settings` to switch back to regular; rerunning this recognized postinstall resets it to fullscreen. Existing project overrides still take precedence.
+
+Project-local installs (`pi install -l`), Git/local-path installs, temporary packages, development checkouts, ordinary npm consumers, and pnpm symlink-store packages do **not** receive this change. Updates or installs that do not execute postinstall cannot reassert it; this is not a universal install/update guarantee or a change to historical releases.
+
+Malformed/nonobject JSON, symlink/nonregular settings, unsafe paths, or a busy settings lock fail without replacing settings. The installer coordinates with Pi's cooperative settings lock and uses atomic replacement; it does not guarantee safety against noncooperating writers or malicious concurrent directory replacement. Already-fullscreen settings remain byte-identical. Native installation failure leaves settings untouched; `GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1` skips only native provisioning, not the recognized global fullscreen setting.
 
 ### RDD version policy
 
@@ -159,7 +167,7 @@ pi
 /gentle:models             Assign global model/effort routing to SDD/custom agents.
 /gentle:persona            Switch between gentleman and neutral persona modes.
 /gentle:background-subagents  Show or set the managed background-subagents policy, with its deciding source.
-/gentle:banner             Configure startup rose, text logo, and color preset.
+/gentle:banner             Configure sidebar rose/text visibility and startup context color.
 ```
 
 Typical flow:
@@ -611,6 +619,8 @@ Legacy string entries are still accepted and treated as `model`-only config.
 
 Gentle Shell is the visual layer gentle-pi puts on top of pi. It follows the Gentle themes: one border language, champagne titles, rose for whatever is alive.
 
+In fullscreen at 140 columns or wider, the right sidebar scrolls **branding → Status → Changes → Agents → TODO** together. The compact banner combines bold `GENTLE PI` terminal text with a dot-scaled version of the original intro rose, without cropping. It uses the active theme, not a custom font. Narrow/mobile terminals and regular mode retain bottom widgets without this artwork; the startup header retains context only.
+
 The status bar replaces pi's three-line footer with a single line of segments:
 
 ```text
@@ -740,10 +750,10 @@ Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer and editor.
 | `/gentle:persona`                | Switches global persona mode, with project override support.        |
 | `/gentle:background-subagents`   | Shows or sets the managed background-subagents policy (`status\|enable\|disable`), naming the source that decided it. |
 | `/gentle:telemetry`              | Shows or changes the local Gentle AI telemetry trigger (`status\|enable\|disable\|preview`).  |
-| `/gentle:banner`                 | Configures startup banner rose, text logo, and color preset.        |
-| `/gentle:toggle-rose`            | Toggles the startup rose.                                           |
-| `/gentle:toggle-text-logo`       | Toggles the startup text logo.                                      |
-| `/gentle:banner-color`           | Selects a startup banner color preset.                              |
+| `/gentle:banner`                 | Configures sidebar rose/text visibility and startup context color.        |
+| `/gentle:toggle-rose`            | Toggles the desktop sidebar rose.                                           |
+| `/gentle:toggle-text-logo`       | Toggles the desktop sidebar wordmark.                                      |
+| `/gentle:banner-color`           | Selects a startup context color preset.                              |
 | `/gentle-sdd-init`               | Initializes or refreshes `openspec/config.yaml` (openspec/both stores only). |
 | `/gentle:install-sdd`         | Repairs missing global SDD runtime assets without overwriting files. |
 | `/gentle:install-sdd --force` | Force-refreshes installed global SDD assets.                         |
@@ -775,7 +785,7 @@ Both files use the strict shape `{"schema":"gentle-pi.background-subagents/v1","
 
 Because the project file outranks the global one, `enable` still writes the global file but reports plainly when a project file keeps the effective policy unchanged. The resolved capability (`ready` or `absent`) reports whether `subagent_run` is actually callable in this session; a policy of `on` with capability `absent` means Gentle Agents is disabled or the retired subagents package is still installed.
 
-Startup banner settings are global and default to the current pink rose + text logo. Supported color presets are `pink`, `cyan`, `yellow`, and `green`.
+Banner settings remain global in `banner.json` under `GENTLE_PI_CONFIG_HOME` (default `~/.pi/gentle-ai`). Existing `showRose` and `showTextLogo` opt-outs remain independent; both default to enabled. Visibility changes apply on the next session or `/reload`. The sidebar follows the active theme; `pink`, `cyan`, `yellow`, and `green` presets affect startup context only.
 
 Startup flag:
 
@@ -847,7 +857,7 @@ To opt out:
 | `scripts/gentle-ai-installer.mjs` | Installs signed Darwin/Linux archives or exact Go SumDB-verified Windows source builds into the package-local runtime. |
 | `contracts/review-integration/v1/` | Byte-identical provider schemas and conformance fixtures for contract `review-integration/v1`, hash-checked before packaging; retained on disk permanently because `/v2`'s schemas `$ref` into these fragments. |
 | `contracts/review-integration/v2/` | Byte-identical provider schemas and conformance fixtures for contract `review-integration/v2` (immutable `base_tree`/`candidate_tree`, ordered `changed_path_manifest`, no inline candidate diff), hash-checked before packaging. |
-| `extensions/startup-banner.ts` | Shows and configures the startup intro, color presets, compact runtime panel, and collaboration credit.     |
+| `extensions/startup-banner.ts` | Shows startup context and configures its color presets plus desktop sidebar branding visibility.     |
 | `extensions/sdd-init.ts`       | Registers `/gentle-sdd-init` for OpenSpec initialization.                                                         |
 | `extensions/skill-registry.ts` | Maintains `.atl/skill-registry.md` from project/user skills and closes file watchers on shutdown.          |
 | `assets/orchestrator.md`       | Parent-session orchestration contract (always-on core).                                                    |
