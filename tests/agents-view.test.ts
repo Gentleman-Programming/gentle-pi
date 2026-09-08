@@ -58,7 +58,7 @@ test("AgentsView renders the frame with the task list and the selected thread's 
 	for (const line of lines) assert.equal(visibleWidth(line), 90, `"${stripAnsi(line)}" is not 90 wide`);
 	const plain = lines.map(stripAnsi);
 	assert.equal(plain.length, 8);
-	assert.match(plain[0], /^╭─ ❀ Agents · 1 active · 1 finished ─+╮$/);
+	assert.match(plain[0], /^╭─ ❀ Agents · 1 active · 1 finished ─+ \[× Close\]╮$/);
 	assert.match(plain[1], /^│ ▸ ◐ explore  1m00s +│ explore · running · gpt-5\.6-terra · 34k · \$0\.27 · 1m00s +│$/);
 	assert.match(plain[2], /^│   ✓ worker  4s +│ line 3 +│$/, "the thread window follows the tail");
 	assert.match(plain[4], /line 5/);
@@ -78,8 +78,7 @@ test("AgentsView keys move the selection, scroll, follow, cancel, open, and clos
 	view.handleInput("k");
 	view.handleInput("c");
 	view.handleInput("o");
-	view.handleInput("\x1b");
-	assert.deepEqual(events, ["cancel:a", "open:a", "close"]);
+	assert.deepEqual(events, ["cancel:a", "open:a"]);
 	for (let index = 0; index < 12; index += 1) store.apply("a", { type: TASK_EVENT.TEXT, text: `l${index}\n` }, 2000);
 	view.handleInput("\x1b[5~");
 	assert.match(stripAnsi(view.render(80)[2]), /│ l0 +│$/, "page up leaves follow mode and shows the top");
@@ -89,6 +88,8 @@ test("AgentsView keys move the selection, scroll, follow, cancel, open, and clos
 	assert.match(stripAnsi(view.render(80)[2]), /│ l0 +│$/, "ctrl+k scrolls one page up");
 	view.handleInput("f");
 	assert.match(stripAnsi(view.render(80)[2]), /│ l9 +│$/, "f follows the tail again");
+	view.handleInput("\x1b");
+	assert.deepEqual(events, ["cancel:a", "open:a", "close"]);
 });
 
 test("AgentsView subscribes only to the selected task and survives an empty store", () => {
@@ -182,12 +183,49 @@ test("AgentsView advertises s to stop an active selection, retains c as an alias
 	assert.deepEqual(events, ["cancel:active", "cancel:active"], "finished tasks never stop");
 });
 
-test("AgentsView Escape and q close an active selection without cancelling it", () => {
+test("AgentsView close control, Escape, and q share rendered bounds and one idempotent close", () => {
 	const { store, view, events } = harness(8);
 	store.add(task("active"));
+	const wide = 80;
+	let lines = view.render(wide);
+	let top = stripAnsi(lines[0]);
+	assert.equal(visibleWidth(top), wide, "the full close header fits its rendered width");
+	assert.match(top, /\[× Close\]/, "wide headers show the labelled close control");
+	let closeX = visibleWidth(top.slice(0, top.indexOf("[× Close]")));
+	assert.equal(view.handleMouse(mouse(closeX, 0, wide, lines.length))?.render, true, "hover targets only the rendered close bounds");
+	assert.equal(view.selectedTask()?.id, "active", "close hover never changes task selection");
+	assert.equal(view.handleMouse(mouse(closeX, 0, wide, lines.length, "press")), undefined, "press is inert");
+	assert.equal(view.handleMouse({ ...mouse(closeX, 0, wide, lines.length, "click"), button: "right" }), undefined, "right click is inert");
+	assert.equal(view.handleMouse({ ...mouse(closeX, 0, wide, lines.length, "click"), button: "middle" }), undefined, "middle click is inert");
+	assert.equal(view.handleMouse(mouse(closeX, 0, wide + 1, lines.length, "click")), undefined, "stale width is inert");
+	assert.equal(view.handleMouse(mouse(closeX, 0, wide, lines.length + 1, "click")), undefined, "stale height is inert");
+
+	lines = view.render(30);
+	top = stripAnsi(lines[0]);
+	assert.equal(visibleWidth(top), 30, "the compact close header fits its rendered width");
+	assert.doesNotMatch(top, /\[× Close\]/);
+	assert.match(top, /\[×\]/, "compact headers show the compact close control");
+	lines = view.render(17);
+	top = stripAnsi(lines[0]);
+	assert.equal(visibleWidth(top), 17, "constrained headers still fit their rendered width");
+	assert.doesNotMatch(top, /\[×\]/, "constrained headers hide the close control instead of truncating it");
+
+	lines = view.render(wide);
+	top = stripAnsi(lines[0]);
+	closeX = visibleWidth(top.slice(0, top.indexOf("[× Close]")));
+	assert.equal(view.handleMouse(mouse(closeX, 0, wide, lines.length, "click"))?.handled, true);
 	view.handleInput("\x1b");
 	view.handleInput("q");
-	assert.deepEqual(events, ["close", "close"], "close keys never invoke selected-task cancellation");
+	assert.deepEqual(events, ["close"], "pointer and close keys share one idempotent close action without cancelling");
+	assert.equal(view.handleMouse(mouse(closeX, 0, wide, lines.length, "click")), undefined, "late pointer events are inert after close");
+	const { store: keyStore, view: keyView, events: keyEvents } = harness(8);
+	keyStore.add(task("key-close"));
+	keyView.handleInput("\x1b");
+	keyView.handleInput("q");
+	assert.deepEqual(keyEvents, ["close"], "Escape and q themselves close only once");
+	keyView.dispose();
+	view.dispose();
+	assert.equal(view.handleMouse(mouse(closeX, 0, wide, lines.length)), undefined, "disposed close controls stay inert");
 });
 
 test("AgentsView scrolls the task list so the selection stays visible when there are more tasks than rows", () => {
@@ -217,12 +255,12 @@ test("AgentsView lists the active session's recent tasks by default and a toggle
 	store.add(task("stale", { agent: "stale", status: TASK_STATUS.COMPLETED, endedAt: 61_000 - 16 * 60_000, createdAt: 800, lastActivityAt: 800 }));
 	const names = () => view.render(80).map(stripAnsi).filter((line) => /[◐✓] /.test(line)).map((line) => line.match(/[◐✓] (\w+)/)?.[1]);
 	let plain = view.render(80).map(stripAnsi);
-	assert.match(plain[0], /^╭─ ❀ Agents · this session · 1 active · 1 finished ─+╮$/);
+	assert.match(plain[0], /^╭─ ❀ Agents · this session · 1 active · 1 finished ─+ \[× Close\]╮$/);
 	assert.deepEqual(names(), ["mine", "fresh"], "another session's task and one finished over fifteen minutes ago stay out");
 	assert.match(plain.at(-2) ?? "", /a all sessions/);
 	view.handleInput("a");
 	plain = view.render(80).map(stripAnsi);
-	assert.match(plain[0], /^╭─ ❀ Agents · all sessions · 2 active · 2 finished ─+╮$/);
+	assert.match(plain[0], /^╭─ ❀ Agents · all sessions · 2 active · 2 finished ─+ \[× Close\]╮$/);
 	assert.deepEqual(names(), ["mine", "theirs", "fresh", "stale"]);
 	assert.match(plain.at(-2) ?? "", /a this session/);
 	view.handleInput("j");
