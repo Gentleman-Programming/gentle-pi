@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
+import { execFileSync, execFile } from "node:child_process";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { initTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import gentleShell, { buildShellBarModel, changesShortcut, devBinaryCard, fetchCodexUsage, loadFileDiff, openInExternalEditor, type GentlePromptEditor } from "../extensions/gentle-shell.ts";
+import installGentleShell, { buildShellBarModel, changesShortcut, devBinaryCard, fetchCodexUsage, loadFileDiff, shellGitRunner, openInExternalEditor, type GentlePromptEditor } from "../extensions/gentle-shell.ts";
 import { CHANGE_STATUS } from "../lib/shell-changes.ts";
 import type { ShellBarTheme } from "../lib/shell-bar.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
@@ -10,6 +14,9 @@ import { stripAnsi } from "../lib/terminal-theme.ts";
 // slot. These tests drive it with a fake ExtensionAPI and context.
 
 initTheme("dark");
+
+const resolveWorktree = (path: string) => ({ root: path.startsWith("/repo") || path === "." ? "/repo" : path, commonDir: "/clone/git" });
+const gentleShell: typeof installGentleShell = (pi, env, deps) => installGentleShell(pi, env, { resolveWorktree, gitRunner: (cwd) => async (args) => pi.exec("git", ["-C", cwd, ...args], { timeout: 5000 }), ...deps });
 
 const plainTheme = {
 	fg(_color: string, value: string) {
@@ -34,7 +41,7 @@ interface FakeUi {
 	workingVisible: boolean | undefined;
 	notices: string[];
 	overlay: unknown;
-	overlayView: { render(width: number): string[] } | undefined;
+	overlayView: { render(width: number): string[]; handleInput(data: string): void } | undefined;
 	closeOverlay: (() => void) | undefined;
 }
 
@@ -54,16 +61,25 @@ interface ShortcutRegistration {
 type MessageRenderer = (message: { customType: string; content: unknown }, options: { expanded: boolean }, theme: unknown) => { render(width: number): string[] };
 const renderers = new Map<string, MessageRenderer>();
 
-function fakePi(script: GitScript[] = [{ numstat: "", porcelain: "" }]): { pi: ExtensionAPI; handlers: Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>; git: string[][]; commands: Map<string, CommandRegistration>; shortcuts: Map<string, ShortcutRegistration> } {
+function fakePi(script: GitScript[] = [{ numstat: "", porcelain: "" }]) {
 	const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
 	const commands = new Map<string, CommandRegistration>();
 	const shortcuts = new Map<string, ShortcutRegistration>();
 	const git: string[][] = [];
+	let entries: unknown[] = [];
+	const tools = new Map<string, { execute(id: string, params: unknown, signal: undefined, update: undefined, ctx: ExtensionContext): Promise<unknown> }>();
+	const listeners = new Map<string, (data: unknown) => void>();
 	let round = 0;
 	const pi = {
 		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) {
-			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+			handlers.set(event, [...(handlers.get(event) ?? []), (payload, ctx) => {
+				entries = ctx.sessionManager.getEntries();
+				return handler(payload, ctx);
+			}]);
 		},
+		appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); },
+		events: { on(name: string, fn: (data: unknown) => void) { listeners.set(name, fn); return () => listeners.delete(name); }, emit(name: string, data: unknown) { listeners.get(name)?.(data); } },
+		registerTool(tool: { name: string }) { tools.set(tool.name, tool as never); },
 		registerCommand(name: string, registration: CommandRegistration) {
 			commands.set(name, registration);
 		},
@@ -78,20 +94,24 @@ function fakePi(script: GitScript[] = [{ numstat: "", porcelain: "" }]): { pi: E
 		},
 		async exec(_command: string, args: string[]) {
 			git.push(args);
+			if (args.includes("worktree")) return { stdout: "worktree /repo\0branch refs/heads/main\0\0", stderr: "", code: 0, killed: false };
 			const isNumstat = args.includes("diff");
 			const step = script[Math.min(isNumstat ? round : round++, script.length - 1)];
 			return { stdout: isNumstat ? step.numstat : step.porcelain, stderr: "", code: 0, killed: false };
 		},
 	} as unknown as ExtensionAPI;
-	return { pi, handlers, git, commands, shortcuts };
+	return { pi, handlers, git, commands, shortcuts, tools };
 }
 
 async function fire(handlers: Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>, event: string, ctx: ExtensionContext): Promise<void> {
 	for (const handler of handlers.get(event) ?? []) await handler({}, ctx);
 }
 
-function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: boolean; pending?: boolean; editorFactory?: unknown; token?: string } = {}): { ctx: ExtensionContext; ui: FakeUi } {
+function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: boolean; pending?: boolean; editorFactory?: unknown; token?: string } = {}): { ctx: ExtensionContext; ui: FakeUi; overlayReady: Promise<void> } {
 	const ui: FakeUi = { footerFactory: undefined, editorFactory: options.editorFactory, widgets: new Map(), widgetSets: 0, workingVisible: undefined, notices: [], overlay: undefined, overlayView: undefined, closeOverlay: undefined };
+	let resolveOverlay: () => void;
+	const overlayReady = new Promise<void>((resolve) => { resolveOverlay = resolve; });
+	const entries = options.entries ?? [];
 	const ctx = {
 		hasUI: options.hasUI ?? true,
 		hasPendingMessages: () => options.pending ?? false,
@@ -100,7 +120,8 @@ function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: bo
 		sessionManager: {
 			getCwd: () => "/repo",
 			getSessionName: () => "Release notes",
-			getEntries: () => options.entries ?? [],
+			getEntries: () => entries,
+			getSessionId: () => "shell-session",
 		},
 		modelRegistry: { isUsingOAuth: () => options.oauth ?? true, getApiKeyForProvider: async () => options.token },
 		getContextUsage: () => ({ tokens: 122_400, contextWindow: 272_000, percent: 45 }),
@@ -126,16 +147,17 @@ function fakeContext(options: { hasUI?: boolean; entries?: unknown[]; oauth?: bo
 			setWorkingVisible(visible: boolean) {
 				ui.workingVisible = visible;
 			},
-			custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: null) => void) => { render(width: number): string[] }) {
+			custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: null) => void) => { render(width: number): string[]; handleInput(data: string): void }) {
 				ui.overlay = factory;
 				return new Promise<null>((resolve) => {
 					ui.closeOverlay = () => resolve(null);
 					ui.overlayView = factory(fakeTui, plainTheme, fakeKeybindings, () => resolve(null));
+					resolveOverlay();
 				});
 			},
 		},
 	} as unknown as ExtensionContext;
-	return { ctx, ui };
+	return { ctx, ui, overlayReady };
 }
 
 function assistantEntry(usage: { input: number; output: number; cost: number }) {
@@ -322,6 +344,174 @@ test("gentleShell registers /gentle:changes and opens the overlay only when ther
 	await opened;
 });
 
+test("changes overlay follows registered linked roots on open, refresh and polling and scopes diff git cwd", async () => {
+	const { pi, handlers, commands, tools } = fakePi();
+	let roots = ["/repo"];
+	const diffs: string[][] = [];
+	pi.exec = (async (_command: string, args: string[]) => {
+		let stdout = "";
+		if (args.includes("worktree")) stdout = roots.map((root) => `worktree ${root}\0branch refs/heads/${root.slice(1)}\0\0`).join("");
+		else if (args.includes("status")) stdout = " M same.ts\0";
+		else if (args.includes("--numstat")) stdout = "1\t1\tsame.ts\n";
+		else { diffs.push(args); stdout = `+${args[1]}`; }
+		return { stdout, stderr: "", code: 0, killed: false };
+	}) as ExtensionAPI["exec"];
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off", GENTLE_PI_SHELL_CHANGES_POLL_MS: "5" });
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	roots.push("/linked");
+	await tools.get("session_worktree_register")!.execute("register", { path: "/linked" }, undefined, undefined, ctx);
+	const open = commands.get("gentle:changes")!.handler("", ctx);
+	try {
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.match(ui.overlayView!.render(120).join("\n"), /linked · linked/);
+		assert.equal(diffs.length, 0);
+		ui.overlayView!.handleInput("j");
+		ui.overlayView!.handleInput("\r");
+		ui.overlayView!.handleInput("j");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.deepEqual(diffs[0], ["-C", "/linked", "diff", "HEAD", "--", "same.ts"]);
+		ui.overlayView!.handleInput("\x1b[D");
+		roots.push("/new");
+		await tools.get("session_worktree_register")!.execute("register", { path: "/new" }, undefined, undefined, ctx);
+		ui.overlayView!.handleInput("r");
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.match(ui.overlayView!.render(120).join("\n"), /new · new/);
+		roots.push("/polled");
+		await tools.get("session_worktree_register")!.execute("register", { path: "/polled" }, undefined, undefined, ctx);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.match(ui.overlayView!.render(120).join("\n"), /polled · polled/);
+	} finally {
+		ui.closeOverlay?.();
+		await open;
+		await fire(handlers, "session_shutdown", ctx);
+	}
+});
+
+test("successful direct tools register whole roots, failures and shell contents do not, and all UI counts agree", async () => {
+	const { pi, handlers, tools, commands } = fakePi();
+	const queried: string[] = [];
+	pi.exec = (async (_command: string, args: string[]) => {
+		const root = args[1];
+		if (args.includes("status")) queried.push(root);
+		const stdout = args.includes("worktree") ? ["/repo", "/used", "/failed", "/opaque", "/hidden"].map((path) => `worktree ${path}\0\0`).join("")
+			: args.includes("status") ? " M preexisting.ts\0?? new.ts\0"
+			: args.includes("--numstat") ? "2\t1\tpreexisting.ts\n" : "+diff";
+		return { stdout, stderr: "", code: 0, killed: false };
+	}) as ExtensionAPI["exec"];
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
+	const { ctx, ui, overlayReady } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	const emit = async (name: string, event: unknown) => {
+		for (const handler of handlers.get(name) ?? []) await handler(event, ctx);
+	};
+	const complete = async (toolName: string, input: unknown, isError = false) => {
+		await emit("tool_execution_start", { toolCallId: "call", toolName, args: input });
+		await emit("tool_result", { toolCallId: "call", toolName, input, isError: false });
+		await emit("tool_execution_end", { toolCallId: "call", toolName, isError });
+	};
+	await complete("read", { path: "/failed" }, true);
+	await complete("bash", { command: "cd /opaque && edit stuff", path: "/opaque" });
+	assert.deepEqual(new Set(queried), new Set(["/repo"]));
+	await complete("read", { path: "/used" });
+	await complete("write", { path: "/used" });
+	assert.deepEqual(new Set(queried), new Set(["/repo", "/used"]));
+	assert.equal(ctx.sessionManager.getEntries().length, 2, "multiple completed tools dedupe");
+	assert.match(renderFooter(ui), /±4/);
+	const widget = ui.widgets.get("gentle-shell-changes") as (host: unknown, theme: unknown) => { render(width: number): string[] };
+	assert.match(widget(fakeTui, plainTheme).render(140)[0], /4 files/);
+	const open = commands.get("gentle:changes")!.handler("", ctx);
+	await overlayReady;
+	assert.doesNotMatch(ui.overlayView!.render(140).join("\n"), /hidden|opaque|failed/);
+	ui.closeOverlay?.();
+	await open;
+	await tools.get("session_worktree_register")!.execute("explicit", { path: "/opaque" }, undefined, undefined, ctx);
+	assert.match(renderFooter(ui), /±6/);
+	await fire(handlers, "session_shutdown", ctx);
+});
+
+test("session switching drops pending tool and foreign launch events while same-session entries restore", async () => {
+	const h = fakePi([{ numstat: "1\t0\ta.ts\n", porcelain: " M a.ts\0" }]);
+	gentleShell(h.pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
+	const first = fakeContext();
+	await fire(h.handlers, "session_start", first.ctx);
+	for (const handler of h.handlers.get("tool_execution_start") ?? []) await handler({ toolCallId: "old", toolName: "read", args: { path: "/foreign" } }, first.ctx);
+	const next = fakeContext({ entries: [...first.ctx.sessionManager.getEntries()] });
+	(next.ctx.sessionManager as unknown as { getSessionId(): string }).getSessionId = () => "new-session";
+	await fire(h.handlers, "session_start", next.ctx);
+	for (const handler of h.handlers.get("tool_result") ?? []) await handler({ toolCallId: "old", toolName: "read", input: { path: "/foreign" } }, next.ctx);
+	for (const handler of h.handlers.get("tool_execution_end") ?? []) await handler({ toolCallId: "old", toolName: "read", isError: false }, next.ctx);
+	const before = h.git.length;
+	h.pi.events.emit("gentle-pi:session-worktree-changed", { sessionId: "shell-session", root: "/foreign" });
+	assert.equal(h.git.length, before);
+	assert.match(renderFooter(next.ui), /±1/);
+	assert.ok(!h.git.some((args) => args[1] === "/foreign"));
+	await fire(h.handlers, "session_shutdown", next.ctx);
+});
+
+test("registered canonical root governs real Git discovery, status and diff despite inherited routing", async (t) => {
+	const fixture = realpathSync(mkdtempSync(join(tmpdir(), "shell-git-routing-")));
+	t.after(() => rmSync(fixture, { recursive: true, force: true }));
+	const selected = join(fixture, "selected");
+	const foreign = join(fixture, "foreign");
+	const empty = join(fixture, "empty");
+	mkdirSync(empty);
+	writeFileSync(join(empty, "config"), "");
+	const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
+	Object.assign(cleanEnv, { GIT_CONFIG_GLOBAL: join(empty, "config"), GIT_CONFIG_NOSYSTEM: "1" });
+	const git = (cwd: string, args: string[]) => execFileSync("git", ["-C", cwd, "-c", `core.hooksPath=${empty}`, "-c", "commit.gpgsign=false", ...args], { env: cleanEnv, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	for (const root of [selected, foreign]) {
+		git(fixture, ["init", "--initial-branch=main", `--template=${empty}`, root]);
+		writeFileSync(join(root, "tracked.txt"), "before\n");
+		git(root, ["add", "tracked.txt"]);
+		git(root, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "Fixture"]);
+	}
+	writeFileSync(join(selected, "tracked.txt"), "selected change\n");
+	writeFileSync(join(selected, "selected-only.txt"), "selected untracked\n");
+	writeFileSync(join(foreign, "tracked.txt"), "foreign change\n");
+	writeFileSync(join(foreign, "foreign-only.txt"), "foreign untracked\n");
+	const poisoned = { ...cleanEnv, GIT_DIR: join(foreign, ".git"), GIT_WORK_TREE: foreign, GIT_INDEX_FILE: join(foreign, ".git", "index") };
+	const h = fakePi();
+	// Pi exec has no env option and inherits routing. Model that boundary with
+	// a child-only env, without changing this test process's environment.
+	h.pi.exec = ((command: string, args: string[], options: { timeout?: number } = {}) => new Promise((resolve) => {
+		execFile(command, args, { env: poisoned, encoding: "utf8", timeout: options.timeout, maxBuffer: Infinity }, (error, stdout, stderr) => resolve({ stdout, stderr, code: error ? typeof error.code === "number" ? error.code : 1 : 0, killed: Boolean(error?.killed) }));
+	})) as ExtensionAPI["exec"];
+	const { ctx, ui, overlayReady } = fakeContext();
+	(ctx as unknown as { cwd: string }).cwd = selected;
+	(ctx.sessionManager as unknown as { getCwd(): string }).getCwd = () => selected;
+	const run = shellGitRunner(selected, poisoned);
+	const discovery = await run(["worktree", "list", "--porcelain", "-z"]);
+	assert.match(discovery.stdout, new RegExp(`worktree ${selected}`));
+	assert.ok(!discovery.stdout.includes(foreign));
+	installGentleShell(h.pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { devBinary: () => undefined, gitRunner: (cwd) => shellGitRunner(cwd, poisoned) });
+	await fire(h.handlers, "session_start", ctx);
+	t.after(() => fire(h.handlers, "session_shutdown", ctx));
+	const widget = ui.widgets.get("gentle-shell-changes") as (host: unknown, theme: unknown) => { render(width: number): string[] };
+	const rendered = widget(fakeTui, plainTheme).render(300).join("\n");
+	assert.match(rendered, /selected-only\.txt/);
+	assert.doesNotMatch(rendered, /foreign-only\.txt/);
+	const diff = await loadFileDiff(run, { path: "tracked.txt", added: 1, deleted: 1, status: CHANGE_STATUS.MODIFIED });
+	assert.match(diff, /\+selected change/);
+	assert.doesNotMatch(diff, /foreign change/);
+	const untracked = await loadFileDiff(run, { path: "selected-only.txt", added: 1, deleted: 0, status: CHANGE_STATUS.UNTRACKED });
+	assert.match(untracked, /\+selected untracked/);
+	assert.equal((await run(["rev-parse", "--verify", "missing-ref"])).code, 128, "Git failure codes stay intact");
+	assert.equal(poisoned.GIT_DIR, join(foreign, ".git"), "caller environment is not mutated");
+	assert.equal((await shellGitRunner(selected, { PATH: empty })(["status"])).code, 1, "spawn errors remain failed results rather than uncaught exceptions");
+	writeFileSync(join(selected, "tracked.txt"), "selected large line\n".repeat(70_000) + "selected final marker\n");
+	const largeDiff = await run(["diff", "HEAD", "--", "tracked.txt"]);
+	assert.equal(largeDiff.code, 0);
+	assert.ok(largeDiff.stdout.length > 1024 * 1024, "output must not inherit execFile's default one MiB cap");
+	assert.match(largeDiff.stdout, /\+selected final marker/);
+	const open = h.commands.get("gentle:changes")!.handler("", ctx);
+	await overlayReady;
+	ui.overlayView!.handleInput("\r");
+	ui.overlayView!.handleInput("j");
+	ui.closeOverlay?.();
+	await open;
+});
+
 test("loadFileDiff asks git for a HEAD diff, or a no-index diff for untracked files", async () => {
 	const calls: string[][] = [];
 	const git = async (args: string[]) => {
@@ -346,6 +536,16 @@ test("openInExternalEditor stops the TUI around the editor and honors $VISUAL ov
 	assert.equal(openInExternalEditor(host, "lib/a.ts", { VISUAL: "nvim -u none", EDITOR: "vi" }, spawn), true);
 	assert.deepEqual(events, ["stop", "spawn:nvim -u none lib/a.ts", "start", "render:true"]);
 	assert.equal(openInExternalEditor(host, "lib/a.ts", {}, spawn), false);
+});
+
+test("external editor receives the selected worktree as process cwd", () => {
+	let cwd: string | undefined;
+	const spawn = ((_command: string, _args: string[], options: { cwd?: string }) => {
+		cwd = options.cwd;
+		return { status: 0 };
+	}) as typeof import("node:child_process").spawnSync;
+	openInExternalEditor({ stop() {}, start() {}, requestRender() {} }, "same.ts", { EDITOR: "vi" }, spawn, "/linked");
+	assert.equal(cwd, "/linked");
 });
 
 test("changesShortcut defaults to alt+g and can be overridden or disabled", () => {
@@ -381,9 +581,10 @@ test("gentleShell keeps the open overlay in sync with git while it stays open", 
 	await fire(handlers, "session_start", ctx);
 	const open = commands.get("gentle:changes")!.handler("", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 40));
+	ui.overlayView!.handleInput("\r");
 	const plain = ui.overlayView!.render(100).map(stripAnsi);
-	assert.match(plain[0], /2 files · \+13 −1/);
-	assert.match(plain[2], /lib\/c\.ts/);
+	assert.match(plain[2], /2 files · \+13 −1/);
+	assert.match(plain[3], /lib\/c\.ts/);
 	assert.match(renderFooter(ui), /main ±2/);
 	ui.closeOverlay?.();
 	await open;

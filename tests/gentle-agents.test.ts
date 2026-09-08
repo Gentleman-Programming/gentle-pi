@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
+import { SESSION_WORKTREE_ENTRY, SESSION_WORKTREE_CHANGED } from "../lib/session-worktree-registry.ts";
 import test, { after, mock } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
@@ -57,7 +58,11 @@ function fakePi() {
 	const commands = new Map<string, { handler(args: string, ctx: ExtensionContext): Promise<void> }>();
 	const sent: Array<{ message: Record<string, unknown>; options: Record<string, unknown> }> = [];
 	const renderers = new Map<string, (message: unknown, options: { expanded: boolean }, theme: unknown) => { render(width: number): string[] }>();
+	const entries: Array<{ type: string; customType: string; data: unknown }> = [];
+	const events: Array<{ name: string; data: unknown }> = [];
 	const pi = {
+		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }),
+		events: { emit: (name: string, data: unknown) => events.push({ name, data }) },
 		sendMessage: (message: Record<string, unknown>, options: Record<string, unknown>) => sent.push({ message, options }),
 		registerMessageRenderer: (type: string, renderer: (message: unknown, options: { expanded: boolean }, theme: unknown) => { render(width: number): string[] }) => renderers.set(type, renderer),
 		on: (event: string, handler: Handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
@@ -68,7 +73,7 @@ function fakePi() {
 	const fire = async (event: string, ctx: ExtensionContext, payload: unknown = {}) => {
 		for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
 	};
-	return { pi, tools, shortcuts, commands, fire, sent, renderers };
+	return { pi, tools, shortcuts, commands, fire, sent, renderers, entries, events };
 }
 
 function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (title: string, message: string) => Promise<boolean> = async () => true, inputResult: (title: string, placeholder: string | undefined) => Promise<string | undefined> = async () => undefined, overlayTui: { terminal: { rows: number }; requestRender(): void } = { terminal: { rows: 30 }, requestRender() {} }) {
@@ -78,7 +83,7 @@ function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (t
 	const customCompletions: unknown[] = [];
 	const ctx = {
 		hasUI: true,
-		sessionManager: { getSessionId: () => "s1", getCwd: () => cwd },
+		sessionManager: { getSessionId: () => "s1", getCwd: () => cwd, getEntries: () => [] },
 		ui: {
 			notify: (message: string) => dialogs.push(`notify:${message}`),
 			custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => Overlay) =>
@@ -134,12 +139,114 @@ function deps(): { deps: Partial<AgentsDeps>; children: FakeChild[]; spawned: st
 			schedule: () => () => {},
 			pi: { command: "pi", args: [] },
 			home,
+			resolveWorktree: (path, base) => ({ root: resolve(base, path), commonDir: "/fixture/common" }),
 			env: { PATH: "/bin" },
 		},
 	};
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test("explicit child roots launch and continue in the actual cwd, persist without shell, and reject other clones", async () => {
+	const h = fakePi();
+	const runtime = deps();
+	const childRoot = join(root, "child-worktree");
+	const launched: string[] = [];
+	const spawnEvents: Array<() => void> = [];
+	const baseSpawn = runtime.deps.spawn!;
+	runtime.deps.spawn = (command, args, options) => {
+		launched.push(options.cwd);
+		const child = baseSpawn(command, args, options);
+		const on = child.on.bind(child);
+		child.on = ((event: string, listener: () => void) => {
+			if (event === "spawn") spawnEvents.push(listener);
+			else on(event as "exit", listener);
+			return child;
+		}) as typeof child.on;
+		return child;
+	};
+	runtime.deps.resolveWorktree = (path, base) => ({ root: resolve(base, path), commonDir: path === "/other-clone" ? "/other/git" : "/fixture/common" });
+	gentleAgents(h.pi, {}, runtime.deps);
+	const { ctx } = fakeContext();
+	(ctx.sessionManager as unknown as { getEntries(): unknown[] }).getEntries = () => h.entries;
+	await h.fire("session_start", ctx);
+	const run = h.tools.get("subagent_run")!;
+	await assert.rejects(run.execute("bad", { agent: "explore", task: "Map", workspace_root: "/other-clone", mode: "background" }, undefined, undefined, ctx), /same Git clone/);
+	assert.deepEqual(launched, []);
+	const result = await run.execute("one", { agent: "explore", task: "Map /other-clone mentioned in prose", workspace_root: childRoot, mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	assert.deepEqual(launched, [childRoot]);
+	assert.deepEqual(h.entries, [], "queueing and returning a child handle do not register roots");
+	spawnEvents[0]();
+	assert.deepEqual(h.entries, [{ type: "custom", customType: SESSION_WORKTREE_ENTRY, data: { sessionId: "s1", root: childRoot, evidence: "subagent:spawn" } }]);
+	assert.deepEqual(h.events, [{ name: SESSION_WORKTREE_CHANGED, data: { sessionId: "s1" } }]);
+	const details = result.details.gentleAgents as { taskId: string; cwd: string };
+	assert.equal(details.cwd, childRoot);
+	runtime.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "mapped" }] }] });
+	runtime.children[0].emit({ type: "agent_settled" });
+	await tick();
+	await h.tools.get("subagent_continue")!.execute("continue", { task_id: details.taskId, prompt: "Follow up", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	assert.deepEqual(launched, [childRoot, childRoot]);
+	spawnEvents[1]();
+	assert.equal(h.entries.length, 1, "continuation dedupes the original root");
+	const status = await h.tools.get("subagent_status")!.execute("status", { task_id: details.taskId }, undefined, undefined, ctx);
+	assert.match(status.content[0].text, /cwd:/);
+	await h.fire("session_shutdown", ctx);
+	spawnEvents[1]();
+	assert.equal(h.entries.length, 1, "late process events after shutdown cannot write session state");
+	await tick();
+});
+
+test("ordinary non-Git tasks still continue in their original cwd without registering a worktree", async () => {
+	const h = fakePi();
+	const runtime = deps();
+	runtime.deps.resolveWorktree = () => undefined;
+	gentleAgents(h.pi, {}, runtime.deps);
+	const { ctx } = fakeContext();
+	await h.fire("session_start", ctx);
+	const result = await h.tools.get("subagent_run")!.execute("run", { agent: "explore", task: "Map", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	runtime.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "mapped" }] }] });
+	runtime.children[0].emit({ type: "agent_settled" });
+	await tick();
+	const taskId = (result.details.gentleAgents as { taskId: string }).taskId;
+	await h.tools.get("subagent_continue")!.execute("continue", { task_id: taskId, prompt: "Follow up", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	assert.equal(runtime.children.length, 2);
+	assert.deepEqual(h.entries, []);
+	await h.fire("session_shutdown", ctx);
+	await tick();
+});
+
+test("delayed child spawn retains the originating session and cannot append into its replacement", async () => {
+	const h = fakePi();
+	const runtime = deps();
+	const spawnEvents: Array<() => void> = [];
+	const baseSpawn = runtime.deps.spawn!;
+	runtime.deps.spawn = (command, args, options) => {
+		const child = baseSpawn(command, args, options);
+		const on = child.on.bind(child);
+		child.on = ((event: string, listener: () => void) => {
+			if (event === "spawn") spawnEvents.push(listener);
+			else on(event as "exit", listener);
+			return child;
+		}) as typeof child.on;
+		return child;
+	};
+	gentleAgents(h.pi, {}, runtime.deps);
+	const { ctx } = fakeContext();
+	await h.fire("session_start", ctx);
+	await h.tools.get("subagent_run")!.execute("run", { agent: "explore", task: "Map", workspace_root: join(root, "old-root"), mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	const next = fakeContext();
+	(next.ctx.sessionManager as unknown as { getSessionId(): string }).getSessionId = () => "s2";
+	await h.fire("session_start", next.ctx);
+	spawnEvents[0]();
+	await tick();
+	assert.deepEqual(h.entries, [], "captured registry is closed instead of appending to the new bound API");
+	await h.fire("session_shutdown", next.ctx);
+});
 
 test("agentRuntimePaths isolates sessions and transcripts by profile and retains the explicit-home fallback", () => {
 	assert.deepEqual(agentRuntimePaths("/home/x", "/profiles/pi-principal/agent"), {
@@ -390,7 +497,7 @@ test("AgentsView production composition observes each pointer event once and acc
 	const { pi, tools, fire, commands } = fakePi();
 	const harness = deps();
 	gentleAgents(pi, {}, harness.deps);
-	const { ctx, overlays } = fakeContext();
+	const { ctx, overlays, customCompletions } = fakeContext();
 	await fire("session_start", ctx);
 
 	await tools.get("subagent_run")!.execute("b", { agent: "explore", task: "b", mode: "background" }, undefined, undefined, ctx);
@@ -431,14 +538,22 @@ test("AgentsView production composition observes each pointer event once and acc
 			return result;
 		};
 
-		assert.match(stripAnsi(overlay.render(80)[1] ?? ""), /▸/, "the first task starts selected");
-		assert.equal(dispatch(mouse("click", "right", 4, 2, 80, lines.length)), undefined, "right click is inert");
-		assert.match(stripAnsi(overlay.render(80)[1] ?? ""), /▸/, "right click cannot select another task");
-		assert.equal(dispatch(mouse("press", "left", 4, 2, 80, lines.length)), undefined, "press is inert");
-		assert.equal(dispatch(mouse("click", "middle", 4, 2, 80, lines.length)), undefined, "middle click is inert");
-		const leftClick = dispatch(mouse("click", "left", 4, 2, 80, lines.length));
-		assert.equal((leftClick as { handled?: boolean } | undefined)?.handled, true, "left click selects the task");
-		assert.match(stripAnsi(overlay.render(80)[2] ?? ""), /▸/, "left click selects the second task");
+		assert.match(stripAnsi(overlay.render(80)[1] ?? ""), /Current orchestrator/, "the parent heading is the first visible row");
+		assert.doesNotMatch(stripAnsi(overlay.render(80)[1] ?? ""), /▸/, "the heading is not a selected task");
+		assert.match(stripAnsi(overlay.render(80)[2] ?? ""), /▸ └ .*Subagent/, "the first child starts selected beneath its heading");
+		overlay.handleInput("k");
+		overlay.handleInput("s");
+		overlay.handleInput("o");
+		assert.deepEqual(harness.children.map((child) => child.killed), [[], []], "heading actions never stop a child");
+		assert.deepEqual(customCompletions, [], "heading actions never open a child session");
+		overlay.handleInput("j");
+		assert.equal(dispatch(mouse("click", "right", 4, 3, 80, lines.length)), undefined, "right click is inert");
+		assert.match(stripAnsi(overlay.render(80)[2] ?? ""), /▸ └ .*Subagent/, "right click cannot select another child");
+		assert.equal(dispatch(mouse("press", "left", 4, 3, 80, lines.length)), undefined, "press is inert");
+		assert.equal(dispatch(mouse("click", "middle", 4, 3, 80, lines.length)), undefined, "middle click is inert");
+		const leftClick = dispatch(mouse("click", "left", 4, 3, 80, lines.length));
+		assert.equal((leftClick as { handled?: boolean } | undefined)?.handled, true, "left click selects a child task");
+		assert.match(stripAnsi(overlay.render(80)[3] ?? ""), /▸ └ .*Subagent/, "left click selects the second child");
 		overlay.handleInput("\x1b");
 		await opened;
 	} finally {
@@ -554,7 +669,8 @@ test("finished tasks are written to history, come back through resolveTask, and 
 	const overlay = overlays[0];
 	assert.ok(overlay, "the overlay component was created");
 	assert.match(stripAnsi(overlay.render(80)[0]), /^╭─ ❀ Agents · this session · 0 active · \d+ finished/);
-	assert.ok(overlay.render(80).map(stripAnsi).some((line) => /✓ explore/.test(line)), "the finished task is listed");
+	overlay.handleInput("\x1b[C");
+		assert.ok(overlay.render(80).map(stripAnsi).some((line) => /✓ Subagent explore/.test(line)), "expanding the terminal group lists its finished child");
 	overlay.handleInput("\x1b");
 	await opened;
 });
@@ -718,7 +834,7 @@ test("the card follows the active session: after /new the earlier session's task
 	const overlay = overlays[0]!;
 	assert.match(stripAnsi(overlay.render(80)[0]), /this session · 0 active · 0 finished/, "the overlay opens on the active session");
 	overlay.handleInput("a");
-	assert.ok(overlay.render(80).map(stripAnsi).some((line) => /◐ explore/.test(line)), "all sessions still reaches the running task");
+	assert.ok(overlay.render(80).map(stripAnsi).some((line) => /◐ Subagent explore/.test(line)), "all sessions still reaches the running child");
 	overlay.handleInput("\x1b");
 	await opened;
 	sessions.sessionManager = { getSessionId: () => "s1", getCwd: () => cwd };

@@ -1,9 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
 	CHANGE_STATUS,
 	ChangesTracker,
+	WorktreeChangesTracker,
+	parseWorktrees,
 	changesSummary,
 	emptyChanges,
 	parseNumstat,
@@ -165,6 +172,167 @@ test("ChangesTracker coalesces overlapping refreshes into at most one extra roun
 	resolveGate?.();
 	await Promise.all([first, second, third]);
 	assert.equal(rounds, 3);
+});
+
+test("registered roots hide clean and missing worktrees while metadata never admits bare or prunable siblings", async () => {
+	let roots = "worktree /main\0branch refs/heads/main\0\0worktree /linked space\0detached\0\0worktree /clean\0\0worktree /gone\0\0worktree /pruned\0prunable missing\0\0worktree /bare\0bare\0\0";
+	const calls: string[] = [];
+	let registered = ["/main", "/linked space", "/clean", "/gone"];
+	const tracker = new WorktreeChangesTracker(async () => ({ stdout: roots, code: 0 }), (root) => async (args) => {
+		calls.push(root);
+		if (root === "/gone") throw new Error("missing directory");
+		return { stdout: args[0] === "status" && root !== "/clean" ? "?? same.ts\0" : "", code: 0 };
+	}, (root) => async () => root === "/main" ? 2 : 3, () => registered);
+	await tracker.start();
+	assert.deepEqual(tracker.worktrees.map((tree) => [tree.root, tree.branch, tree.model.added]), [["/main", "main", 2], ["/linked space", undefined, 3]]);
+	assert.equal(tracker.model.files.length, 2, "identical filenames in different roots remain distinct");
+	assert.equal(new Set(tracker.model.files.map((file) => file.path)).size, 2);
+	assert.ok(!calls.includes("/pruned") && !calls.includes("/bare"));
+	roots += "worktree /new\0branch refs/heads/new\0\0";
+	registered.push("/new");
+	await tracker.refresh();
+	assert.equal(tracker.worktrees.length, 3);
+	roots = "worktree /clean\0\0";
+	registered = ["/clean"];
+	await tracker.refresh();
+	assert.deepEqual(tracker.worktrees, []);
+	assert.deepEqual(tracker.model, emptyChanges());
+});
+
+test("only registered worktrees are scanned, with whole preexisting and untracked contents", async () => {
+	const queried: string[] = [];
+	const roots = ["/used"];
+	const tracker = new WorktreeChangesTracker(async () => ({ code: 0, stdout: "worktree /used\0\0worktree /hidden\0\0" }), (root) => async (args) => {
+		queried.push(root);
+		return { code: 0, stdout: args[0] === "status" ? " M old.ts\0?? new.ts\0" : "4\t2\told.ts\n" };
+	}, () => async () => 3, () => roots);
+	await tracker.start();
+	assert.deepEqual(new Set(queried), new Set(["/used"]));
+	assert.equal(tracker.model.files.length, 2);
+	assert.equal(tracker.model.added, 7);
+	roots.push("/hidden");
+	await tracker.refresh();
+	assert.equal(tracker.model.files.length, 4);
+});
+
+test("worktree refresh shares one scan so polling faster than discovery cannot prolong it", async () => {
+	let release: (() => void) | undefined;
+	let scans = 0;
+	const tracker = new WorktreeChangesTracker(async () => {
+		scans++;
+		if (scans === 2) await new Promise<void>((resolve) => { release = resolve; });
+		return { stdout: "", code: 0 };
+	}, () => async () => ({ stdout: "", code: 0 }));
+	await tracker.start();
+	const first = tracker.refresh();
+	const overlapping = tracker.refresh();
+	release!();
+	await Promise.all([first, overlapping]);
+	assert.equal(scans, 2, "overlapping poll must not extend an already slow scan");
+	await tracker.refresh();
+	assert.equal(scans, 3, "next refresh still rediscovers roots");
+});
+
+test("registration during an in-flight status scan is included before refresh resolves", async () => {
+	const roots = ["/used"];
+	let release: () => void;
+	let entered: () => void;
+	const scanning = new Promise<void>((resolve) => { entered = resolve; });
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	let paused = false;
+	const tracker = new WorktreeChangesTracker(async () => ({ code: 0, stdout: "" }), (root) => async (args) => {
+		if (root === "/used" && args[0] === "status" && !paused) { paused = true; entered(); await gate; }
+		return { code: 0, stdout: args[0] === "status" ? " M file.ts\0" : "1\t0\tfile.ts\n" };
+	}, undefined, () => roots);
+	const scan = tracker.refresh();
+	await scanning;
+	roots.push("/newly-used");
+	const concurrent = tracker.refresh();
+	release();
+	await Promise.all([scan, concurrent]);
+	assert.equal(tracker.model.files.length, 2);
+});
+
+test("worktree porcelain preserves unusual directory names and detached fallback", () => {
+	assert.deepEqual(parseWorktrees("worktree /a\nbranch strange\0HEAD abc\0detached\0\0"), [{ root: "/a\nbranch strange" }]);
+});
+
+test("registered roots remain scannable during metadata discovery failure", async () => {
+	let code = 128;
+	const tracker = new WorktreeChangesTracker(async () => ({ stdout: "worktree /repo\0\0", code }), () => async (args) => ({ stdout: args[0] === "status" ? "?? new.ts\0" : "", code: 0 }), undefined, () => ["/repo"]);
+	await tracker.start();
+	assert.equal(tracker.worktrees.length, 1);
+	code = 0;
+	await tracker.refresh();
+	assert.equal(tracker.worktrees.length, 1);
+});
+
+test("isolated Git worktrees include preexisting dirty files only after root registration", async (t) => {
+	const temporary = await mkdtemp(join(tmpdir(), "gentle-shell-worktrees-"));
+	// Every repository, linked root and Git configuration belongs to this fixture.
+	t.after(() => rm(temporary, { recursive: true, force: true }));
+	const fixture = await realpath(temporary);
+	const main = join(fixture, "main");
+	const linked = join(fixture, "linked space");
+	const clean = join(fixture, "clean");
+	const untracked = join(fixture, "untracked");
+	const empty = join(fixture, "empty");
+	const config = join(fixture, "gitconfig");
+	await mkdir(empty);
+	await writeFile(config, "");
+	const env = { ...process.env };
+	for (const key of Object.keys(env)) {
+		if (key.startsWith("GIT_")) delete env[key];
+	}
+	env.GIT_CONFIG_GLOBAL = config;
+	env.GIT_CONFIG_NOSYSTEM = "1";
+	env.GIT_ATTR_NOSYSTEM = "1";
+	const exec = promisify(execFile);
+	const gitAt = (root: string) => async (args: string[]) => {
+		const { stdout } = await exec("git", [
+			"--no-optional-locks", "-C", root,
+			"-c", `core.hooksPath=${empty}`,
+			"-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false",
+			...args,
+		], { env });
+		return { stdout, code: 0 };
+	};
+	await gitAt(fixture)(["init", "--initial-branch=main", `--template=${empty}`, main]);
+	await gitAt(main)(["config", "user.name", "Shell Test"]);
+	await gitAt(main)(["config", "user.email", "shell-test@example.invalid"]);
+	await writeFile(join(main, "same.ts"), "export const value = 1;\n");
+	await gitAt(main)(["add", "same.ts"]);
+	await gitAt(main)(["commit", "-m", "Initial fixture"]);
+	await gitAt(main)(["worktree", "add", "-b", "linked", linked]);
+	await gitAt(main)(["worktree", "add", "-b", "clean", clean]);
+
+	// Discovery starts from a linked root, not the clone's primary worktree.
+	const registered = [main, linked, clean];
+	const tracker = new WorktreeChangesTracker(gitAt(linked), gitAt, undefined, () => registered);
+	await tracker.start();
+	assert.deepEqual(tracker.worktrees, [], "all clean roots are hidden");
+	await writeFile(join(main, "same.ts"), "export const value = 2;\n");
+	await writeFile(join(linked, "same.ts"), "export const value = 3;\n");
+	await tracker.refresh();
+	assert.deepEqual(new Set(tracker.worktrees.map((tree) => tree.root)), new Set([main, linked]));
+	assert.deepEqual(tracker.worktrees.map((tree) => tree.model.files[0].path), ["same.ts", "same.ts"]);
+	assert.equal(new Set(tracker.model.files.map((file) => file.path)).size, 2, "aggregate paths distinguish the two roots");
+
+	await gitAt(main)(["worktree", "add", "-b", "untracked", untracked]);
+	await writeFile(join(untracked, "notes.md"), "New worktree content\n");
+	await tracker.refresh();
+	assert.equal(tracker.worktrees.length, 2, "a new dirty sibling stays hidden until registered");
+	registered.push(untracked);
+	await tracker.refresh();
+	assert.deepEqual(new Set(tracker.worktrees.map((tree) => tree.root)), new Set([main, linked, untracked]));
+	assert.deepEqual(tracker.worktrees.find((tree) => tree.root === untracked)?.model.files, [file("notes.md", 0, 0, CHANGE_STATUS.UNTRACKED)]);
+	assert.ok(!tracker.worktrees.some((tree) => tree.root === clean), "unchanged linked root remains hidden");
+});
+
+test("untracked-only unborn roots remain visible without a HEAD diff", async () => {
+	const tracker = new ChangesTracker(async (args) => ({ stdout: args[0] === "status" ? "?? first.ts\0" : "", code: args[0] === "status" ? 0 : 128 }), async () => 2);
+	await tracker.start();
+	assert.deepEqual(tracker.model.files, [file("first.ts", 2, 0, CHANGE_STATUS.UNTRACKED)]);
 });
 
 test("ChangesTracker counts the lines of untracked files, which git numstat leaves out", async () => {
