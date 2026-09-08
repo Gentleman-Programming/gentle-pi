@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { sidebarPart } from "../lib/shell-sidebar.ts";
 import {
 	applyTodo,
 	emptyTodo,
@@ -102,13 +103,16 @@ export default function gentleTodo(pi: ExtensionAPI, env: NodeJS.ProcessEnv = pr
 		const snapshot = current;
 		current.ui.setWidget(WIDGET_KEY, (tui, theme) => {
 			snapshot.host = tui;
-			return {
+			return sidebarPart(tui, "todo", {
 				render(width: number) {
 					const lines = renderTodoCard(snapshot.state, theme, width, { collapsed: snapshot.collapsed, staleTurns: staleTurns(snapshot.state, snapshot.turn), collapseKey });
 					return lines.length === 0 ? [] : [...lines, ""];
 				},
 				invalidate() {},
-			};
+			}, {
+				render: (width) => renderTodoCard(snapshot.state, theme, width, { collapsed: snapshot.collapsed, staleTurns: staleTurns(snapshot.state, snapshot.turn), collapseKey, scrollable: true }),
+				invalidate() {},
+			});
 		});
 	};
 

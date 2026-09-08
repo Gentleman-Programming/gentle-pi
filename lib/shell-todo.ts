@@ -71,6 +71,8 @@ export interface TodoTheme extends CardTheme {
 }
 
 export interface TodoRenderOptions {
+	/** A scrollable host supplies the height bound instead of folding tasks. */
+	scrollable?: boolean;
 	collapsed: boolean;
 	staleTurns: number;
 	collapseKey?: string;
@@ -270,7 +272,7 @@ export function renderTodoCard(state: TodoState, theme: TodoTheme, width: number
 	const { done, total } = todoSummary(state);
 	const stale = options.staleTurns >= STALE_AFTER_TURNS;
 	const hint = stale ? `stale · ${options.staleTurns} turns` : options.collapsed && options.collapseKey ? `${options.collapseKey} expand` : undefined;
-	const body = options.collapsed ? [collapsedRow(state, theme)] : bodyRows(state, theme);
+	const body = options.collapsed ? [collapsedRow(state, theme)] : options.scrollable ? state.tasks.map((task) => taskRow(task, theme)) : bodyRows(state, theme);
 	return renderCard(
 		{ title: "Todos", subtitle: `${done} of ${total}`, body, tone: stale ? CARD_TONE.WARNING : CARD_TONE.INFO, glyph: TODO_GLYPH },
 		theme,

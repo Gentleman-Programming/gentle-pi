@@ -59,9 +59,10 @@ test("AgentsView renders the frame with the task list and the selected thread's 
 	for (const line of lines) assert.equal(visibleWidth(line), 90, `"${stripAnsi(line)}" is not 90 wide`);
 	const plain = lines.map(stripAnsi);
 	assert.equal(plain.length, 8);
-	assert.match(plain[0], /^╭─ ❀ Agents · 1 active · 1 finished ─+╮$/);
-	assert.match(plain[1], /^│ ▸ ◐ explore  1m00s +│ explore · running · gpt-5\.6-terra · 34k · \$0\.27 · 1m00s +│$/);
-	assert.match(plain[2], /^│   ✓ worker  4s +│   line 3 +│$/, "the thread window follows the tail");
+	assert.match(plain[0], /^╭─ ❀ Agents · 1 active · 1 finished ─+ \[× Close\]╮$/);
+	assert.match(plain[1], /▾ Orchestrator s · 2 Subag….*explore · running · gpt-5\.6-terra · 34k · \$0\.27 · 1m00s/);
+	assert.match(plain[2], /▸ └ ◐ Subagent explore.*line 3/, "the thread window follows the tail");
+	assert.match(plain[3], /└ ✓ Subagent worker.*line 4/);
 	assert.match(plain[4], /line 5/);
 	assert.match(plain[6], /j\/k task .* esc close/);
 	assert.match(plain[7], /^╰─+╯$/);
@@ -79,8 +80,7 @@ test("AgentsView keys move the selection, scroll, follow, cancel, open, and clos
 	view.handleInput("k");
 	view.handleInput("c");
 	view.handleInput("o");
-	view.handleInput("\x1b");
-	assert.deepEqual(events, ["cancel:a", "open:a", "close"]);
+	assert.deepEqual(events, ["cancel:a", "open:a"]);
 	for (let index = 0; index < 12; index += 1) store.apply("a", { type: TASK_EVENT.TEXT, text: `l${index}\n` }, 2000);
 	view.handleInput("\x1b[5~");
 	assert.match(stripAnsi(view.render(80)[2]), /│ Text +│$/, "page up leaves follow mode and shows the top block label");
@@ -92,6 +92,8 @@ test("AgentsView keys move the selection, scroll, follow, cancel, open, and clos
 	assert.match(stripAnsi(view.render(80)[3]), /│   l0 +│$/, "ctrl+k restores the top block body");
 	view.handleInput("f");
 	assert.match(stripAnsi(view.render(80)[2]), /│   l9 +│$/, "f follows the tail again");
+	view.handleInput("\x1b");
+	assert.deepEqual(events, ["cancel:a", "open:a", "close"]);
 });
 
 test("AgentsView subscribes only to the selected task and survives an empty store", () => {
@@ -119,9 +121,9 @@ test("AgentsView pointer regions hover and select task rows without activating, 
 	for (let index = 0; index < 8; index += 1) store.apply("b", { type: TASK_EVENT.TEXT, text: `thread ${index}\n` }, 2000);
 	const lines = view.render(80);
 
-	assert.equal(view.handleMouse(mouse(4, 2, 80, lines.length))?.handled, true, "hover consumes only the task row");
+	assert.equal(view.handleMouse(mouse(4, 3, 80, lines.length))?.handled, true, "hover consumes only the task row");
 	assert.equal(view.selectedTask()?.id, "a", "hover never changes keyboard selection or the displayed thread");
-	assert.equal(view.handleMouse(mouse(4, 2, 80, lines.length, "click"))?.handled, true);
+	assert.equal(view.handleMouse(mouse(4, 3, 80, lines.length, "click"))?.handled, true);
 	assert.equal(view.selectedTask()?.id, "b", "click selects the task and displays its thread");
 	assert.deepEqual(events, [], "click selects the task only; it never opens or cancels");
 	view.render(80);
@@ -150,21 +152,21 @@ test("AgentsView clears hover on leave, list scrolling, resize, updates, empty l
 			observer.afterMouse(event);
 		}
 	};
-	dispatch(mouse(4, 2, 80, lines.length));
-	assert.match(stripAnsi(view.render(80)[2]), /▹/, "the hovered row is styled without changing selection");
-	dispatch(mouse(4, 2, 80, lines.length, "wheel", -1));
-	assert.match(stripAnsi(view.render(80)[2]), /▹/, "a list wheel event at its boundary preserves hover");
-	dispatch(mouse(4, 2, 80, lines.length, "wheel", 1));
+	dispatch(mouse(4, 3, 80, lines.length));
+	assert.match(stripAnsi(view.render(80)[3]), /▹/, "the hovered row is styled without changing selection");
+	dispatch(mouse(4, 3, 80, lines.length, "wheel", -1));
+	assert.match(stripAnsi(view.render(80)[3]), /▹/, "a list wheel event at its boundary preserves hover");
+	dispatch(mouse(4, 3, 80, lines.length, "wheel", 1));
 	assert.doesNotMatch(stripAnsi(view.render(80).join("\n")), /▹/, "list scrolling clears hover so it cannot remain on the task formerly under the pointer");
-	dispatch(mouse(4, 2, 80, lines.length));
-	dispatch(mouse(50, 2, 80, lines.length));
-	assert.doesNotMatch(stripAnsi(view.render(80)[2]), /▹/, "the root observer clears hover outside a child region");
-	dispatch(mouse(4, 2, 80, lines.length));
+	dispatch(mouse(4, 3, 80, lines.length));
+	dispatch(mouse(50, 3, 80, lines.length));
+	assert.doesNotMatch(stripAnsi(view.render(80)[3]), /▹/, "the root observer clears hover outside a child region");
+	dispatch(mouse(4, 3, 80, lines.length));
 	view.render(81);
-	assert.doesNotMatch(stripAnsi(view.render(81)[2]), /▹/, "resize clears hover before the next frame");
-	dispatch(mouse(4, 2, 81, lines.length));
+	assert.doesNotMatch(stripAnsi(view.render(81)[3]), /▹/, "resize clears hover before the next frame");
+	dispatch(mouse(4, 3, 81, lines.length));
 	store.apply("a", { type: TASK_EVENT.TEXT, text: "update" }, 2000);
-	assert.doesNotMatch(stripAnsi(view.render(81)[2]), /▹/, "task updates clear hover");
+	assert.doesNotMatch(stripAnsi(view.render(81)[3]), /▹/, "task updates clear the actual hovered task row");
 	view.dispose();
 	const { view: empty } = harness(6);
 	empty.render(80);
@@ -185,51 +187,89 @@ test("AgentsView advertises s to stop an active selection, retains c as an alias
 	assert.deepEqual(events, ["cancel:active", "cancel:active"], "finished tasks never stop");
 });
 
-test("AgentsView Escape and q close an active selection without cancelling it", () => {
+test("AgentsView close control, Escape, and q share rendered bounds and one idempotent close", () => {
 	const { store, view, events } = harness(8);
 	store.add(task("active"));
+	const wide = 80;
+	let lines = view.render(wide);
+	let top = stripAnsi(lines[0]);
+	assert.equal(visibleWidth(top), wide, "the full close header fits its rendered width");
+	assert.match(top, /\[× Close\]/, "wide headers show the labelled close control");
+	let closeX = visibleWidth(top.slice(0, top.indexOf("[× Close]")));
+	assert.equal(view.handleMouse(mouse(closeX, 0, wide, lines.length))?.render, true, "hover targets only the rendered close bounds");
+	assert.equal(view.selectedTask()?.id, "active", "close hover never changes task selection");
+	assert.equal(view.handleMouse(mouse(closeX, 0, wide, lines.length, "press")), undefined, "press is inert");
+	assert.equal(view.handleMouse({ ...mouse(closeX, 0, wide, lines.length, "click"), button: "right" }), undefined, "right click is inert");
+	assert.equal(view.handleMouse({ ...mouse(closeX, 0, wide, lines.length, "click"), button: "middle" }), undefined, "middle click is inert");
+	assert.equal(view.handleMouse(mouse(closeX, 0, wide + 1, lines.length, "click")), undefined, "stale width is inert");
+	assert.equal(view.handleMouse(mouse(closeX, 0, wide, lines.length + 1, "click")), undefined, "stale height is inert");
+
+	lines = view.render(30);
+	top = stripAnsi(lines[0]);
+	assert.equal(visibleWidth(top), 30, "the compact close header fits its rendered width");
+	assert.doesNotMatch(top, /\[× Close\]/);
+	assert.match(top, /\[×\]/, "compact headers show the compact close control");
+	lines = view.render(17);
+	top = stripAnsi(lines[0]);
+	assert.equal(visibleWidth(top), 17, "constrained headers still fit their rendered width");
+	assert.doesNotMatch(top, /\[×\]/, "constrained headers hide the close control instead of truncating it");
+
+	lines = view.render(wide);
+	top = stripAnsi(lines[0]);
+	closeX = visibleWidth(top.slice(0, top.indexOf("[× Close]")));
+	assert.equal(view.handleMouse(mouse(closeX, 0, wide, lines.length, "click"))?.handled, true);
 	view.handleInput("\x1b");
 	view.handleInput("q");
-	assert.deepEqual(events, ["close", "close"], "close keys never invoke selected-task cancellation");
+	assert.deepEqual(events, ["close"], "pointer and close keys share one idempotent close action without cancelling");
+	assert.equal(view.handleMouse(mouse(closeX, 0, wide, lines.length, "click")), undefined, "late pointer events are inert after close");
+	const { store: keyStore, view: keyView, events: keyEvents } = harness(8);
+	keyStore.add(task("key-close"));
+	keyView.handleInput("\x1b");
+	keyView.handleInput("q");
+	assert.deepEqual(keyEvents, ["close"], "Escape and q themselves close only once");
+	keyView.dispose();
+	view.dispose();
+	assert.equal(view.handleMouse(mouse(closeX, 0, wide, lines.length)), undefined, "disposed close controls stay inert");
 });
 
 test("AgentsView scrolls the task list so the selection stays visible when there are more tasks than rows", () => {
 	const { store, view } = harness(6);
 	for (let index = 0; index < 6; index += 1) store.add(task(`t${index}`, { agent: `agent${index}`, createdAt: 1000 - index, lastActivityAt: 1000 - index }));
 	const listed = () => view.render(80).slice(1, 4).map((line) => stripAnsi(line).slice(0, 24));
-	assert.match(listed()[0], /▸ ◐ agent0/);
-	assert.match(listed()[2], /agent2/);
+	assert.match(listed()[0], /Orchestrator s/);
+	assert.match(listed()[1], /▸ └ ◐ Subagent agent0/);
+	assert.match(listed()[2], /Subagent agent1/);
 	for (let index = 0; index < 4; index += 1) view.handleInput("j");
 	assert.equal(view.selectedTask()?.id, "t4");
-	assert.match(listed()[2], /▸ ◐ agent4/, "the list scrolls down until the selection is the last visible row");
-	assert.match(listed()[0], /agent2/);
+	assert.match(listed()[2], /▸ └ ◐ Subagent agent4/, "the list scrolls down until the selection is the last visible row");
+	assert.match(listed()[0], /Subagent agent2/);
 	view.handleInput("j");
 	view.handleInput("j");
 	assert.equal(view.selectedTask()?.id, "t5", "the selection stops at the last task");
-	assert.match(listed()[2], /▸ ◐ agent5/);
+	assert.match(listed()[2], /▸ └ ◐ Subagent agent5/);
 	for (let index = 0; index < 4; index += 1) view.handleInput("k");
-	assert.match(listed()[0], /▸ ◐ agent1/, "moving up scrolls the list back");
-	assert.match(listed()[2], /agent3/);
+	assert.match(listed()[0], /▸ └ ◐ Subagent agent1/, "moving up scrolls the list back");
+	assert.match(listed()[2], /Subagent agent3/);
 });
 
 test("AgentsView lists the active session's recent tasks by default and a toggles every session", () => {
-	const { store, view } = harness(8, "s");
+	const { store, view } = harness(12, "s");
 	store.add(task("mine", { agent: "mine" }));
 	store.add(task("theirs", { agent: "theirs", parentSessionId: "other", createdAt: 900, lastActivityAt: 900 }));
 	store.add(task("fresh", { agent: "fresh", status: TASK_STATUS.COMPLETED, endedAt: 61_000 - 60_000, createdAt: 850, lastActivityAt: 850 }));
 	store.add(task("stale", { agent: "stale", status: TASK_STATUS.COMPLETED, endedAt: 61_000 - 16 * 60_000, createdAt: 800, lastActivityAt: 800 }));
-	const names = () => view.render(80).map(stripAnsi).filter((line) => /[◐✓] /.test(line)).map((line) => line.match(/[◐✓] (\w+)/)?.[1]);
+	const names = () => view.render(80).map(stripAnsi).filter((line) => /[◐✓] Subagent /.test(line)).map((line) => line.match(/[◐✓] Subagent (\w+)/)?.[1]);
 	let plain = view.render(80).map(stripAnsi);
-	assert.match(plain[0], /^╭─ ❀ Agents · this session · 1 active · 1 finished ─+╮$/);
+	assert.match(plain[0], /^╭─ ❀ Agents · this session · 1 active · 1 finished ─+ \[× Close\]╮$/);
 	assert.deepEqual(names(), ["mine", "fresh"], "another session's task and one finished over fifteen minutes ago stay out");
 	assert.match(plain.at(-2) ?? "", /a all sessions/);
 	view.handleInput("a");
 	plain = view.render(80).map(stripAnsi);
-	assert.match(plain[0], /^╭─ ❀ Agents · all sessions · 2 active · 2 finished ─+╮$/);
-	assert.deepEqual(names(), ["mine", "theirs", "fresh", "stale"]);
+	assert.match(plain[0], /^╭─ ❀ Agents · all sessions · 2 active · 2 finished ─+ \[× Close\]╮$/);
+	assert.deepEqual(names(), ["mine", "fresh", "stale", "theirs"], "children stay beneath their actual parent-session heading");
 	assert.match(plain.at(-2) ?? "", /a this session/);
 	view.handleInput("j");
-	assert.equal(view.selectedTask()?.id, "theirs");
+	assert.equal(view.selectedTask()?.id, "fresh", "child-first navigation stays within the current orchestrator group");
 	view.handleInput("a");
 	assert.equal(view.selectedTask()?.id, "mine", "a new scope reads from the top");
 	assert.deepEqual(names(), ["mine", "fresh"]);
