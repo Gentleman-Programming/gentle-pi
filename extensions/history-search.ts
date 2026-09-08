@@ -2,6 +2,7 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import {
 	Container,
 	Key,
@@ -16,7 +17,7 @@ const EMPTY_HISTORY_MESSAGE =
 	"No hay comandos de bash en el historial de esta sesión.";
 const NON_TUI_MESSAGE = "Comando /history solo disponible en modo TUI.";
 const GENERIC_ERROR_MESSAGE = "gentle-pi /history: error inesperado";
-const PICKER_TITLE = "🔍 [gentle-pi] Selecciona un comando:";
+const PICKER_TITLE = "🔍 [gentle-pi] Selecciona un comando";
 
 const HISTORY_COMMAND_DESCRIPTION =
 	"Buscar en el historial de comandos de terminal de la sesión";
@@ -171,13 +172,21 @@ function isPrintable(data: string): boolean {
 	return code >= 0x20 && code !== 0x7f;
 }
 
-const LIST_THEME: SelectListTheme = {
-	selectedPrefix: (text: string) => text,
-	selectedText: (text: string) => text,
-	description: (text: string) => text,
-	scrollInfo: (text: string) => text,
-	noMatch: (text: string) => text,
+type PickerTheme = {
+	fg: (color: string, text: string) => string;
+	bold: (text: string) => string;
+	bg: (color: string, text: string) => string;
 };
+
+function createPickerTheme(theme: PickerTheme): SelectListTheme {
+	return {
+		selectedPrefix: (text) => theme.fg("accent", text),
+		selectedText: (text) => theme.fg("accent", text),
+		description: (text) => theme.fg("muted", text),
+		scrollInfo: (text) => theme.fg("dim", text),
+		noMatch: (text) => theme.fg("dim", text),
+	};
+}
 
 type PickerDone = (value: { command: string } | undefined) => void;
 
@@ -186,25 +195,41 @@ function createHistoryPicker(
 	ctx: ExtensionCommandContext,
 	requestRender: () => void,
 	done: PickerDone,
+	theme: PickerTheme,
 ): Container {
 	const items: SelectItem[] = commands.map((command) => ({
 		label: command,
 		value: command,
 	}));
 
-	const list = new SelectList(items, 10, LIST_THEME);
-	const titleText = new Text(PICKER_TITLE, 0, 0);
-	const queryText = new Text("> ", 0, 0);
+	const pickerTheme = createPickerTheme(theme);
+	const list = new SelectList(items, 10, pickerTheme);
+	const accent = (text: string): string => theme.fg("accent", text);
+	const topBorder = new DynamicBorder(accent);
+	const bottomBorder = new DynamicBorder(accent);
+	const titleText = new Text(theme.fg("accent", theme.bold(PICKER_TITLE)), 1, 0);
+	const hintText = new Text(
+		theme.fg("dim", "type to filter · ↑/↓ navigate · Enter select · Esc cancel"),
+		1,
+		0,
+	);
+
+	const buildQueryLine = (q: string): string =>
+		theme.fg("muted", `▸  ${q}`) + accent("_");
+
+	let query = "";
+	const queryText = new Text(buildQueryLine(query), 0, 0);
 
 	const container = new Container();
+	container.addChild(topBorder);
 	container.addChild(titleText);
 	container.addChild(queryText);
 	container.addChild(list);
-
-	let query = "";
+	container.addChild(hintText);
+	container.addChild(bottomBorder);
 
 	const refresh = (): void => {
-		queryText.setText(`> ${query}`);
+		queryText.setText(buildQueryLine(query));
 		list.setFilter(query);
 		requestRender();
 	};
@@ -268,8 +293,14 @@ async function runHistoryCommand(ctx: ExtensionCommandContext): Promise<void> {
 			return;
 		}
 		await ctx.ui.custom<{ command: string } | undefined>(
-			(tui, _theme, _keybindings, done) => {
-				return createHistoryPicker(commands, ctx, () => tui.requestRender(), done);
+			(tui, theme, _keybindings, done) => {
+				return createHistoryPicker(
+					commands,
+					ctx,
+					() => tui.requestRender(),
+					done,
+					theme as PickerTheme,
+				);
 			},
 		);
 	} catch {
