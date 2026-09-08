@@ -312,7 +312,7 @@ async function showChangesOverlay(ctx: ExtensionContext, model: ChangesModel, de
 				host = tui;
 				view = new ChangesView(model, {
 					theme,
-					rows: Math.max(OVERLAY_MIN_ROWS, Math.floor(tui.terminal.rows * OVERLAY_HEIGHT_RATIO)),
+					rows: () => Math.max(OVERLAY_MIN_ROWS, Math.floor(tui.terminal.rows * OVERLAY_HEIGHT_RATIO)),
 					loadDiff: (file) => loadFileDiff(deps.git, file),
 					onOpen: (file) => done(file),
 					onClose: () => done(null),
@@ -326,6 +326,7 @@ async function showChangesOverlay(ctx: ExtensionContext, model: ChangesModel, de
 		if (!openInExternalEditor(host, chosen.path)) ctx.ui.notify("No editor configured. Set $VISUAL or $EDITOR.", "warning");
 	} finally {
 		clearInterval(poll);
+		view?.dispose();
 	}
 }
 

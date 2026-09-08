@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { TuiAltScreen, visibleWidth, type Terminal, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { CHANGE_STATUS, changesModel, type ChangedFile } from "../lib/shell-changes.ts";
 import { ChangesView, colorDiff, type ChangesViewDeps } from "../lib/shell-changes-view.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
@@ -52,6 +52,10 @@ function view(overrides: Partial<ChangesViewDeps> = {}, files = [file("lib/a.ts"
 
 async function settle(): Promise<void> {
 	await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function mouse(type: TuiMouseEvent["type"], x: number, y: number, wheelDelta?: number, height = 12): TuiMouseEvent {
+	return { type, button: type === "wheel" ? "none" : "left", x, y, screenX: x, screenY: y, width: 80, height, shift: false, alt: false, ctrl: false, wheelDelta };
 }
 
 test("colorDiff drops git headers and colors hunks, additions, and removals by role", () => {
@@ -120,6 +124,88 @@ test("ChangesView opens the selected file and closes on escape or q", async () =
 	component.handleInput("\x1b");
 	component.handleInput("q");
 	assert.equal(events.filter((event) => event === "close").length, 2);
+});
+
+test("ChangesView click selects a file without opening it", async () => {
+	const { view: component, events } = view();
+	await settle();
+	component.render(80);
+	component.handleMouse(mouse("press", 3, 2));
+	component.handleMouse(mouse("release", 3, 2));
+	component.handleMouse(mouse("click", 3, 2));
+	await settle();
+	assert.match(stripAnsi(component.render(80)[2]), /^│ ▸ lib\/b\.ts/);
+	assert.deepEqual(events.filter((event) => event.startsWith("open:")), []);
+});
+
+test("ChangesView receives native fullscreen press and release as a click", async () => {
+	let onInput: ((data: string) => void) | undefined;
+	const terminal: Terminal = {
+		start(input) { onInput = input; }, stop() {}, async drainInput() {}, write() {}, get columns() { return 80; }, get rows() { return 12; }, get kittyProtocolActive() { return false; }, moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {},
+	};
+	const { view: component, events } = view();
+	const tui = new TuiAltScreen(terminal, false, undefined, { mouse: true });
+	tui.setLayoutRoot(component);
+	tui.start();
+	tui.renderNow(true);
+	try {
+		onInput?.("\x1b[<0;4;3M");
+		onInput?.("\x1b[<0;4;3m");
+		assert.match(stripAnsi(component.render(80)[2]), /^│ ▸ lib\/b\.ts/);
+		assert.deepEqual(events.filter((event) => event.startsWith("open:")), []);
+	} finally {
+		tui.stop();
+	}
+});
+
+test("ChangesView rebuilds pointer geometry when its overlay height changes", async () => {
+	let rows = 12;
+	const { view: component } = view({ rows: () => rows });
+	await settle();
+	component.render(80);
+	rows = 8;
+	assert.deepEqual(component.handleMouse(mouse("click", 3, 2, undefined, 8)), { handled: true, render: false });
+	component.render(80);
+	assert.deepEqual(component.handleMouse(mouse("click", 3, 2, undefined, 8)), { handled: true, render: true });
+	assert.match(stripAnsi(component.render(80)[2]), /^│ ▸ lib\/b\.ts/);
+});
+
+test("ChangesView scrolls the file list and diff independently, ignores hover, and clears stale pointer layouts", async () => {
+	const files = Array.from({ length: 8 }, (_, index) => file(`lib/${index}.ts`, 1, 0));
+	const long = Array.from({ length: 20 }, (_, index) => `+line ${index}`).join("\n");
+	const { view: component, events } = view({ rows: 8, async loadDiff() { return `@@ -0,0 +1,20 @@\n${long}`; } }, files);
+	await settle();
+	component.render(80);
+	component.handleMouse(mouse("move", 3, 2, undefined, 8));
+	assert.match(stripAnsi(component.render(80)[1]), /^│ ▸ lib\/0\.ts/);
+	assert.deepEqual(events.filter((event) => event.startsWith("open:")), []);
+
+	assert.deepEqual(component.handleMouse(mouse("wheel", 3, 1, 2, 8)), { handled: true, render: true });
+	assert.match(stripAnsi(component.render(80)[1]), /^│   lib\/2\.ts/);
+	component.update(changesModel(files));
+	assert.match(stripAnsi(component.render(80)[1]), /^│   lib\/2\.ts/, "an unchanged live refresh preserves the independently scrolled file viewport");
+	assert.deepEqual(component.handleMouse(mouse("wheel", 50, 1, 2, 8)), { handled: true, render: true });
+	assert.doesNotMatch(stripAnsi(component.render(80)[1]), /@@/);
+	assert.deepEqual(component.handleMouse(mouse("wheel", 50, 1, -100, 8)), { handled: true, render: true });
+	assert.deepEqual(component.handleMouse(mouse("wheel", 50, 1, -1, 8)), { handled: true, render: false });
+
+	component.update(changesModel([file("lib/new.ts", 1, 0)]));
+	assert.deepEqual(component.handleMouse(mouse("click", 3, 1, undefined, 8)), { handled: true, render: false });
+	component.render(80);
+	component.dispose();
+	assert.deepEqual(component.handleMouse(mouse("click", 3, 1, undefined, 8)), { handled: true, render: false });
+});
+
+test("ChangesView keeps keyboard selection visible after file-list scrolling", async () => {
+	const files = Array.from({ length: 8 }, (_, index) => file(`lib/${index}.ts`, 1, 0));
+	const { view: component } = view({ rows: 8 }, files);
+	await settle();
+	component.render(80);
+	component.handleMouse(mouse("wheel", 3, 1, 2, 8));
+	component.handleInput("j");
+	assert.match(stripAnsi(component.render(80)[1]), /^│ ▸ lib\/1\.ts/);
+	component.update(changesModel(files.slice(0, 3)));
+	assert.match(stripAnsi(component.render(80)[1]), /^│   lib\/0\.ts/);
 });
 
 test("ChangesView.update keeps the selected file, reloads moved diffs, and survives an empty tree", async () => {

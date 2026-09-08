@@ -648,6 +648,7 @@ Working-tree changes show up below the editor as soon as a file differs from HEA
 `/gentle:changes` or `alt+g` opens the changes as an overlay: files on the left, the selected file's diff on the right.
 
 - `j`/`k` or the arrows move between files, `ctrl+j`/`ctrl+k` or `pgdn`/`pgup` scroll the diff, `esc` or `q` closes.
+- In fullscreen mode, left-click a file to select it; mouse wheels scroll the file list and diff pane independently. Hovering does not select or open a file.
 - While the overlay is open, git is polled every 2 seconds, so edits made from nvim, another agent, or a checkout show up in place. The selection sticks to the file, and a diff reloads only when its counts move.
 - `GENTLE_PI_SHELL_CHANGES_KEY` rebinds the shortcut (pi key syntax, for example `ctrl+shift+g`); `off` disables it. On macOS, `alt+g` needs the terminal to send Option as Meta.
 - `o` (or `enter`) opens the selected file in `$VISUAL` or `$EDITOR` and returns to pi when the editor exits, so a jump into nvim and back never leaves the session.

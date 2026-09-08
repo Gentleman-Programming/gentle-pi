@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { initTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { TuiMouseEvent } from "@earendil-works/pi-tui";
 import gentleShell, { buildShellBarModel, changesShortcut, devBinaryCard, fetchCodexUsage, loadFileDiff, openInExternalEditor, type GentlePromptEditor } from "../extensions/gentle-shell.ts";
 import { CHANGE_STATUS } from "../lib/shell-changes.ts";
 import type { ShellBarTheme } from "../lib/shell-bar.ts";
@@ -34,7 +35,7 @@ interface FakeUi {
 	workingVisible: boolean | undefined;
 	notices: string[];
 	overlay: unknown;
-	overlayView: { render(width: number): string[] } | undefined;
+	overlayView: { render(width: number): string[]; handleMouse?(event: TuiMouseEvent): unknown } | undefined;
 	closeOverlay: (() => void) | undefined;
 }
 
@@ -318,6 +319,23 @@ test("gentleShell registers /gentle:changes and opens the overlay only when ther
 	const opened = command.handler("", ctx);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	assert.equal(typeof ui.overlay, "function");
+	ui.closeOverlay?.();
+	await opened;
+});
+
+test("gentleShell keeps the changes overlay open when a click selects a file", async () => {
+	const { pi, handlers, commands } = fakePi([{ numstat: "1\t0\tlib/a.ts\n2\t0\tlib/b.ts\n", porcelain: " M lib/a.ts\0 M lib/b.ts\0" }]);
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
+	const { ctx, ui } = fakeContext();
+	await fire(handlers, "session_start", ctx);
+	let settled = false;
+	const opened = commands.get("gentle:changes")!.handler("", ctx).then(() => { settled = true; });
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	ui.overlayView!.render(100);
+	ui.overlayView!.handleMouse?.({ type: "click", button: "left", x: 3, y: 2, screenX: 3, screenY: 2, width: 100, height: 32, shift: false, alt: false, ctrl: false });
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(settled, false, "a file click must not resolve into the external-editor path");
+	assert.match(ui.overlayView!.render(100).map(stripAnsi)[2], /▸ lib\/b\.ts/);
 	ui.closeOverlay?.();
 	await opened;
 });
