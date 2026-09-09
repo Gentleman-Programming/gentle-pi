@@ -78,6 +78,17 @@ export class WindowsDaclValidationError extends Error {
 	}
 }
 
+export type WindowsOwnerClassification = "user" | "system" | "administrators" | "sid" | "other" | "missing";
+
+export class WindowsOwnerValidationError extends Error {
+	readonly owner: WindowsOwnerClassification;
+	constructor(owner: WindowsOwnerClassification = "missing") {
+		super(`Windows owner validation failed (${owner})`);
+		this.name = "WindowsOwnerValidationError";
+		this.owner = owner;
+	}
+}
+
 function classifyWindowsTrustee(value: string | undefined): WindowsDaclTrusteeClassification {
 	const trustee = value?.toUpperCase() ?? "";
 	if (["OW", "CO", "BU", "AU", "WD", "LA"].includes(trustee)) return trustee as WindowsDaclTrusteeClassification;
@@ -110,24 +121,78 @@ export function validatePrivateWindowsDacl(dacl: string, user: string, protected
 	if (granted.size !== 3) throw new WindowsDaclValidationError("ace-count");
 }
 
-function assertPrivateWindowsDacl(path: string, protectedDacl: boolean): void {
-	validatePrivateWindowsDacl(windowsDacl(path), windowsUserSid(), protectedDacl, windowsLocalAdministratorSid());
+export function validatePrivateWindowsOwner(owner: string | undefined, user: string): void {
+	const normalizedOwner = owner?.toUpperCase();
+	// Owners implicitly control a DACL, so accept only principals that the exact DACL already grants full control.
+	if (normalizedOwner === undefined) throw new WindowsOwnerValidationError("missing");
+	if (!isWindowsSid(user) || !isWindowsSid(normalizedOwner)) throw new WindowsOwnerValidationError(isWindowsSid(normalizedOwner) ? "sid" : "other");
+	if (normalizedOwner === user.toUpperCase()) return;
+	if (normalizedOwner === WINDOWS_SYSTEM) return;
+	if (normalizedOwner === WINDOWS_ADMINISTRATORS) return;
+	throw new WindowsOwnerValidationError("sid");
 }
 
-function enforcePrivateWindowsDacl(path: string): void {
-	const user = windowsUserSid();
-	const localAdministrator = windowsLocalAdministratorSid();
+interface WindowsAclIdentity {
+	user: string;
+	localAdministrator: string;
+}
+
+function windowsAclIdentity(): WindowsAclIdentity {
+	return { user: windowsUserSid(), localAdministrator: windowsLocalAdministratorSid() };
+}
+
+function windowsOwnerSid(path: string): string {
+	if (path.length === 0 || path.length > 32767 || path.includes("\0")) throw new WindowsOwnerValidationError();
+	const script = "$ErrorActionPreference='Stop';$acl=[System.IO.Directory]::GetAccessControl($env:GENTLE_PI_CANDIDATE_OWNER_PATH,[System.Security.AccessControl.AccessControlSections]::Owner);$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value";
+	const systemRoot = dirname(dirname(windowsSystemExecutable("whoami.exe")));
+	let output: string;
+	try {
+		output = execFileSync(windowsSystemExecutable("WindowsPowerShell\\v1.0\\powershell.exe"), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { encoding: "utf8", timeout: 5000, maxBuffer: 4096, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: { ...process.env, SystemRoot: systemRoot, GENTLE_PI_CANDIDATE_OWNER_PATH: path } });
+	} catch {
+		throw new WindowsOwnerValidationError();
+	}
+	const matches = output.match(/S-\d+(?:-\d+)+/gi) ?? [];
+	if (matches.length !== 1 || !isWindowsSid(matches[0]!)) throw new WindowsOwnerValidationError();
+	return matches[0]!.toUpperCase();
+}
+
+export function assertTrustedWindowsOwner(path: string): void {
+	validatePrivateWindowsOwner(windowsOwnerSid(path), windowsUserSid());
+}
+
+function assertPrivateWindowsDacl(path: string, protectedDacl: boolean, identity: WindowsAclIdentity = windowsAclIdentity()): void {
+	validatePrivateWindowsOwner(windowsOwnerSid(path), identity.user);
+	validatePrivateWindowsDacl(windowsDacl(path), identity.user, protectedDacl, identity.localAdministrator);
+}
+
+function enforcePrivateWindowsDacl(path: string, identity: WindowsAclIdentity = windowsAclIdentity()): void {
+	validatePrivateWindowsOwner(windowsOwnerSid(path), identity.user);
+	const { user, localAdministrator } = identity;
 	const sddl = `D:P(A;OICI;FA;;;${user})(A;OICI;FA;;;${WINDOWS_SYSTEM})(A;OICI;FA;;;${WINDOWS_ADMINISTRATORS})`;
 	const script = "$ErrorActionPreference='Stop';$acl=New-Object System.Security.AccessControl.DirectorySecurity;$acl.SetSecurityDescriptorSddlForm($env:GENTLE_PI_CANDIDATE_ACL_SDDL,[System.Security.AccessControl.AccessControlSections]::Access);[System.IO.Directory]::SetAccessControl($env:GENTLE_PI_CANDIDATE_ACL_PATH,$acl)";
 	const systemRoot = dirname(dirname(windowsSystemExecutable("whoami.exe")));
 	execFileSync(windowsSystemExecutable("WindowsPowerShell\\v1.0\\powershell.exe"), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { encoding: "utf8", timeout: 5000, maxBuffer: 16384, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: { ...process.env, SystemRoot: systemRoot, GENTLE_PI_CANDIDATE_ACL_PATH: path, GENTLE_PI_CANDIDATE_ACL_SDDL: sddl } });
-	validatePrivateWindowsDacl(windowsDacl(path), user, true, localAdministrator);
+	assertPrivateWindowsDacl(path, true, identity);
 }
 
 function privateWindowsDacl(path: string, protectedDacl: boolean, enforce = false): void {
 	if (testingWindowsAclAuthority !== undefined) return testingWindowsAclAuthority(path);
 	if (enforce) enforcePrivateWindowsDacl(path);
 	else assertPrivateWindowsDacl(path, protectedDacl);
+}
+
+function privateWindowsCandidateOwnerBoundary(commonDir: string, enforce = false): void {
+	const boundary = [commonDir, join(commonDir, "gentle-ai"), join(commonDir, "gentle-ai", "candidate-views")];
+	if (testingWindowsAclAuthority !== undefined) {
+		for (const path of boundary) testingWindowsAclAuthority(path);
+		return;
+	}
+	const identity = windowsAclIdentity();
+	if (enforce) {
+		for (const path of boundary) validatePrivateWindowsOwner(windowsOwnerSid(path), identity.user);
+		for (const path of boundary) enforcePrivateWindowsDacl(path, identity);
+	}
+	for (const path of boundary) assertPrivateWindowsDacl(path, true, identity);
 }
 
 // A hostname or a repository-local nonce cannot prove that a PID is local.
@@ -171,18 +236,25 @@ function directory(path: string, privateMode = false, platform: NodeJS.Platform 
 
 export function assertCandidateOwnerParent(commonDir: string, platform: NodeJS.Platform = process.platform): string {
 	directory(commonDir);
-	directory(join(commonDir, "gentle-ai"));
+	const control = join(commonDir, "gentle-ai");
+	directory(control);
 	const parent = join(commonDir, "gentle-ai", "candidate-views");
-	directory(parent, true, platform);
+	directory(parent, false, platform);
+	if (platform === "win32") privateWindowsCandidateOwnerBoundary(commonDir);
+	else directory(parent, true, platform);
 	return parent;
 }
 
 export function prepareCandidateOwnerParent(commonDir: string, platform: NodeJS.Platform = process.platform): string {
 	directory(commonDir);
-	directory(join(commonDir, "gentle-ai"));
+	const control = join(commonDir, "gentle-ai");
+	directory(control);
 	const parent = join(commonDir, "gentle-ai", "candidate-views");
 	directory(parent, false, platform);
-	if (platform === "win32") privateWindowsDacl(parent, true, true);
+	if (platform === "win32") {
+		privateWindowsCandidateOwnerBoundary(commonDir, true);
+		return parent;
+	}
 	return assertCandidateOwnerParent(commonDir, platform);
 }
 

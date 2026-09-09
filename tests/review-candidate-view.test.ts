@@ -22,7 +22,7 @@ import {
 	readCandidateContextManifestPage,
 	type NativeCandidateProjectionDescriptor,
 } from "../lib/review-candidate-view.ts";
-import { prepareCandidateOwnerParent, setWindowsAclAuthorityForTesting, validatePrivateWindowsDacl, WindowsDaclValidationError } from "../lib/review-candidate-view-owner.ts";
+import { assertCandidateOwnerParent, assertTrustedWindowsOwner, prepareCandidateOwnerParent, setWindowsAclAuthorityForTesting, validatePrivateWindowsDacl, validatePrivateWindowsOwner, WindowsDaclValidationError, WindowsOwnerValidationError } from "../lib/review-candidate-view-owner.ts";
 
 function git(cwd: string, ...arguments_: string[]): string {
 	return execFileSync("git", arguments_, { cwd, encoding: "utf8" }).trim();
@@ -157,6 +157,39 @@ test("private candidate owner rejects raw and LA local Administrator grants as d
 
 test("private candidate owner fails closed when local Administrator resolution is unavailable", () => {
 	assert.throws(() => validatePrivateWindowsDacl("D:P(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", "S-1-5-21-1-2-3-500", true), (error: unknown) => error instanceof WindowsDaclValidationError && error.reason === "ace-trustee" && error.trustee === "LA");
+});
+
+test("private candidate owner accepts only trusted Windows owners", () => {
+	for (const owner of ["S-1-5-21-1-2-3-1001", "S-1-5-18", "S-1-5-32-544"]) assert.doesNotThrow(() => validatePrivateWindowsOwner(owner, "S-1-5-21-1-2-3-1001"));
+	assert.throws(() => validatePrivateWindowsOwner("S-1-5-21-4-5-6-1002", "S-1-5-21-1-2-3-1001"), (error: unknown) => error instanceof WindowsOwnerValidationError && !error.message.includes("S-1-5-21-4-5-6-1002"));
+});
+
+test("private candidate owner fails closed when Windows owner resolution is unavailable", () => {
+	assert.throws(() => validatePrivateWindowsOwner(undefined, "S-1-5-21-1-2-3-1001"), WindowsOwnerValidationError);
+});
+
+test("private candidate owner rejects a different Windows owner at the ancestor replacement boundary", (t) => {
+	const cwd = repository(t), commonDir = join(cwd, ".git"), control = join(commonDir, "gentle-ai"), parent = join(control, "candidate-views");
+	mkdirSync(parent, { recursive: true });
+	setWindowsAclAuthorityForTesting((path) => {
+		if (path === control) validatePrivateWindowsOwner("S-1-5-21-4-5-6-1002", "S-1-5-21-1-2-3-1001");
+	});
+	t.after(() => setWindowsAclAuthorityForTesting());
+	assert.throws(() => prepareCandidateOwnerParent(commonDir, "win32"), (error: unknown) => error instanceof WindowsOwnerValidationError && error.owner === "sid");
+});
+
+test("private candidate owner revalidates every Windows ancestor replacement boundary", (t) => {
+	const cwd = repository(t), commonDir = join(cwd, ".git"), control = join(commonDir, "gentle-ai"), parent = join(control, "candidate-views");
+	mkdirSync(parent, { recursive: true });
+	const checked: string[] = [];
+	setWindowsAclAuthorityForTesting((path) => checked.push(path));
+	t.after(() => setWindowsAclAuthorityForTesting());
+	assert.equal(assertCandidateOwnerParent(commonDir, "win32"), parent);
+	assert.deepEqual(checked, [commonDir, control, parent]);
+});
+
+test("private candidate owner rejects the actual foreign Windows system owner", { skip: process.platform !== "win32" }, () => {
+	assert.throws(() => assertTrustedWindowsOwner(join(process.env.SystemRoot!, "System32")), (error: unknown) => error instanceof WindowsOwnerValidationError && error.owner === "sid");
 });
 
 test("private candidate owner removes unrelated explicit Windows grants during enforcement", { skip: process.platform !== "win32" }, (t) => {
