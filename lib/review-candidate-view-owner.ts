@@ -16,6 +16,74 @@ export interface CandidateViewOwner {
 	commonDir: string;
 }
 type Git = (args: readonly string[]) => string;
+export type WindowsAclAuthority = (path: string) => void;
+
+let testingWindowsAclAuthority: WindowsAclAuthority | undefined;
+export function setWindowsAclAuthorityForTesting(authority?: WindowsAclAuthority): void {
+	testingWindowsAclAuthority = authority;
+}
+
+const WINDOWS_SYSTEM = "S-1-5-18";
+const WINDOWS_ADMINISTRATORS = "S-1-5-32-544";
+const WINDOWS_SYSTEM_DIRECTORY = "\\\\?\\GLOBALROOT\\SystemRoot\\System32";
+
+function windowsSystemExecutable(name: "whoami.exe" | "icacls.exe"): string {
+	try {
+		return realpathSync.native(join(WINDOWS_SYSTEM_DIRECTORY, name));
+	} catch {
+		throw new Error("Windows system executable is unavailable");
+	}
+}
+
+function windowsUserSid(): string {
+	const output = execFileSync(windowsSystemExecutable("whoami.exe"), ["/user", "/fo", "csv", "/nh"], { encoding: "utf8", timeout: 5000, maxBuffer: 4096, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+	const matches = output.match(/S-\d+(?:-\d+)+/gi) ?? [];
+	if (matches.length !== 1) throw new Error("Windows user SID is unavailable");
+	return matches[0]!.toUpperCase();
+}
+
+function windowsDacl(path: string): string {
+	const archive = `.gentle-ai-acl-${randomUUID()}.txt`;
+	const archivePath = join(dirname(path), archive);
+	try {
+		execFileSync(windowsSystemExecutable("icacls.exe"), [path, "/save", archive, "/c"], { cwd: dirname(path), encoding: "utf8", timeout: 5000, maxBuffer: 16384, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+		const sddl = readFileSync(archivePath, "utf16le").match(/D:[^\r\n]+/)?.[0];
+		if (sddl === undefined) throw new Error("Windows DACL is unavailable");
+		return sddl;
+	} finally {
+		try { unlinkSync(archivePath); } catch {}
+	}
+}
+
+export function validatePrivateWindowsDacl(dacl: string, user: string, protectedDacl: boolean): void {
+	if (protectedDacl && !dacl.startsWith("D:P")) throw new Error("Windows DACL inherits access");
+	const trustees = new Map([[user.toUpperCase(), "user"], [WINDOWS_SYSTEM, "system"], ["SY", "system"], [WINDOWS_ADMINISTRATORS, "administrators"], ["BA", "administrators"]]);
+	const aces = [...dacl.matchAll(/\(([^()]*)\)/g)].map((match) => match[1]!.split(";"));
+	const expectedFlags = protectedDacl ? "OICI" : "ID";
+	const granted = new Set<string>();
+	for (const ace of aces) {
+		const trustee = trustees.get(ace[5]?.toUpperCase() ?? "");
+		if (ace.length !== 6 || ace[0] !== "A" || ace[1] !== expectedFlags || ace[2] !== "FA" || ace[3] !== "" || ace[4] !== "" || trustee === undefined || granted.has(trustee)) throw new Error("Windows DACL does not match the trusted grant model");
+		granted.add(trustee);
+	}
+	if (granted.size !== 3) throw new Error("Windows DACL lacks trusted full access");
+}
+
+function assertPrivateWindowsDacl(path: string, protectedDacl: boolean): void {
+	validatePrivateWindowsDacl(windowsDacl(path), windowsUserSid(), protectedDacl);
+}
+
+function enforcePrivateWindowsDacl(path: string): void {
+	const user = windowsUserSid();
+	execFileSync(windowsSystemExecutable("icacls.exe"), [path, "/inheritance:r", "/grant:r", `*${user}:(OI)(CI)F`, `*${WINDOWS_SYSTEM}:(OI)(CI)F`, `*${WINDOWS_ADMINISTRATORS}:(OI)(CI)F`], { encoding: "utf8", timeout: 5000, maxBuffer: 16384, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+	assertPrivateWindowsDacl(path, true);
+}
+
+function privateWindowsDacl(path: string, protectedDacl: boolean, enforce = false): void {
+	if (testingWindowsAclAuthority !== undefined) return testingWindowsAclAuthority(path);
+	if (enforce) enforcePrivateWindowsDacl(path);
+	else assertPrivateWindowsDacl(path, protectedDacl);
+}
 
 // A hostname or a repository-local nonce cannot prove that a PID is local.
 // Bind to the kernel boot and, on Linux, its PID namespace. Unsupported or
@@ -35,58 +103,105 @@ function localHost(): string | null {
 	return null;
 }
 
-function directory(path: string, privateMode = false): string {
+function samePath(path: string, expected: string, platform: NodeJS.Platform): boolean {
+	if (platform !== "win32") return path === expected;
+	const normalize = (value: string): string => value.replaceAll("\\", "/").toLowerCase();
+	return normalize(path) === normalize(expected);
+}
+
+function directory(path: string, privateMode = false, platform: NodeJS.Platform = process.platform): string {
 	const stat = lstatSync(path);
-	if (!stat.isDirectory() || stat.isSymbolicLink() || realpathSync(path) !== path ||
-		(privateMode && (stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0))) throw new Error("Unsafe candidate owner directory");
+	const uid = process.getuid?.();
+	if (!stat.isDirectory() || stat.isSymbolicLink() || !samePath(realpathSync(path), path, platform) ||
+		(privateMode && platform !== "win32" && (uid === undefined || stat.uid !== uid || (stat.mode & 0o077) !== 0))) throw new Error("Unsafe candidate owner directory");
+	if (privateMode && platform === "win32") privateWindowsDacl(path, true);
 	return `${stat.dev}:${stat.ino}`;
 }
 
-export function assertCandidateOwnerParent(commonDir: string): string {
+export function assertCandidateOwnerParent(commonDir: string, platform: NodeJS.Platform = process.platform): string {
 	directory(commonDir);
 	directory(join(commonDir, "gentle-ai"));
 	const parent = join(commonDir, "gentle-ai", "candidate-views");
-	directory(parent, true);
+	directory(parent, true, platform);
 	return parent;
 }
 
-function regular(path: string, privateMode = false): string {
+export function prepareCandidateOwnerParent(commonDir: string, platform: NodeJS.Platform = process.platform): string {
+	directory(commonDir);
+	directory(join(commonDir, "gentle-ai"));
+	const parent = join(commonDir, "gentle-ai", "candidate-views");
+	directory(parent, false, platform);
+	if (platform === "win32") privateWindowsDacl(parent, true, true);
+	return assertCandidateOwnerParent(commonDir, platform);
+}
+
+function regular(path: string, privateMode = false, platform: NodeJS.Platform = process.platform): string {
 	const stat = lstatSync(path);
-	if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || realpathSync(path) !== path || stat.size > 16384 ||
-		(privateMode && (stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== 0o600))) throw new Error("Unsafe candidate owner file");
+	const uid = process.getuid?.();
+	if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || !samePath(realpathSync(path), path, platform) || stat.size > 16384 ||
+		(privateMode && platform !== "win32" && (uid === undefined || stat.uid !== uid || (stat.mode & 0o777) !== 0o600))) throw new Error("Unsafe candidate owner file");
+	if (privateMode && platform === "win32") privateWindowsDacl(path, false);
 	return `${stat.dev}:${stat.ino}`;
 }
 
 function syncDirectory(path: string): void {
+	// Windows does not permit fsync on directory handles; the marker file itself
+	// remains fsynced before this platform-specific no-op.
+	if (process.platform === "win32") return;
 	const fd = openSync(path, "r");
 	try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
-function exclusiveFile(path: string, content: string): void {
-	const fd = openSync(path, "wx", 0o600);
-	try { writeFileSync(fd, content); fsyncSync(fd); } finally { closeSync(fd); }
-	syncDirectory(dirname(path));
+function removeExactPrivateFile(path: string, identity: string, platform: NodeJS.Platform): void {
+	try {
+		if (regular(path, true, platform) !== identity) return;
+		unlinkSync(path);
+		syncDirectory(dirname(path));
+	} catch { /* An unproven or replaced file survives. */ }
+}
+
+function exclusiveFile(path: string, content: string, platform: NodeJS.Platform = process.platform, rollbackOnFailure = false): string {
+	let identity: string | undefined;
+	try {
+		const fd = openSync(path, "wx", 0o600);
+		try {
+			identity = regular(path, true, platform);
+			writeFileSync(fd, content);
+			fsyncSync(fd);
+		} finally { closeSync(fd); }
+		syncDirectory(dirname(path));
+		return identity;
+	} catch (error) {
+		if (rollbackOnFailure && identity !== undefined) removeExactPrivateFile(path, identity, platform);
+		throw error;
+	}
 }
 
 function markerPath(root: string): string { return `${root}.owner.json`; }
 
-export function createCandidateOwner(commonDir: string, root: string): CandidateViewOwner {
-	const parent = assertCandidateOwnerParent(commonDir);
+export function createCandidateOwner(commonDir: string, root: string, platform: NodeJS.Platform = process.platform): CandidateViewOwner {
+	const parent = assertCandidateOwnerParent(commonDir, platform);
 	const uuid = basename(root);
 	if (!UUID.test(uuid) || root !== join(parent, uuid) || lstatSync(root, { throwIfNoEntry: false })) throw new Error("Unsafe candidate owner root");
 	const owner: CandidateViewOwner = { version: 1, uuid, token: randomUUID(), pid: process.pid, host: localHost(), root, commonDir };
 	// Any write/fsync failure aborts creation BEFORE Git can register the view.
-	// An incomplete marker is retained, never guessed into ownership.
-	exclusiveFile(markerPath(root), JSON.stringify(owner));
-	syncDirectory(dirname(parent));
-	syncDirectory(commonDir);
+	const marker = markerPath(root);
+	let markerIdentity: string | undefined;
+	try {
+		markerIdentity = exclusiveFile(marker, JSON.stringify(owner), platform, true);
+		syncDirectory(dirname(parent));
+		syncDirectory(commonDir);
+	} catch (error) {
+		if (markerIdentity !== undefined) removeExactPrivateFile(marker, markerIdentity, platform);
+		throw error;
+	}
 	return Object.freeze(owner);
 }
 
-function readOwner(commonDir: string, root: string): CandidateViewOwner {
-	const parent = assertCandidateOwnerParent(commonDir);
+function readOwner(commonDir: string, root: string, platform: NodeJS.Platform = process.platform): CandidateViewOwner {
+	const parent = assertCandidateOwnerParent(commonDir, platform);
 	if (!UUID.test(basename(root)) || root !== join(parent, basename(root))) throw new Error("Candidate owner escaped parent");
-	regular(markerPath(root), true);
+	regular(markerPath(root), true, platform);
 	const owner = JSON.parse(readFileSync(markerPath(root), "utf8")) as CandidateViewOwner;
 	if (!owner || Object.keys(owner).sort().join(",") !== "commonDir,host,pid,root,token,uuid,version" || owner.version !== 1 ||
 		owner.uuid !== basename(root) || !UUID.test(owner.token) || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 ||
@@ -100,54 +215,58 @@ function dead(owner: CandidateViewOwner): boolean {
 	});
 }
 
-function registration(root: string, commonDir: string, git: Git): string {
+function registration(root: string, commonDir: string, git: Git, platform: NodeJS.Platform = process.platform): string {
 	const rows = git(["worktree", "list", "--porcelain", "-z"]).split("\0\0");
-	const matching = rows.filter((row) => row.split("\0")[0] === `worktree ${root}`);
+	const matching = rows.filter((row) => {
+		const worktree = row.split("\0")[0];
+		return worktree !== undefined && worktree.startsWith("worktree ") && samePath(worktree.slice(9), root, platform);
+	});
 	if (matching.length !== 1 || matching[0]!.split("\0").some((field) => /^(locked|prunable)( |$)/.test(field))) throw new Error("Candidate registration is ambiguous");
 	const gitFile = join(root, ".git");
 	regular(gitFile);
 	const pointer = readFileSync(gitFile, "utf8");
 	if (!pointer.startsWith("gitdir: ") || !pointer.endsWith("\n")) throw new Error("Unsafe candidate Git pointer");
 	const admin = pointer.slice(8, -1);
-	if (dirname(admin) !== join(commonDir, "worktrees")) throw new Error("Candidate admin escaped common directory");
+	if (!samePath(dirname(admin), join(commonDir, "worktrees"), platform)) throw new Error("Candidate admin escaped common directory");
 	directory(join(commonDir, "worktrees"));
 	directory(admin);
 	regular(join(admin, "gitdir"));
 	regular(join(admin, "commondir"));
-	if (readFileSync(join(admin, "gitdir"), "utf8") !== `${gitFile}\n` ||
-		resolve(admin, readFileSync(join(admin, "commondir"), "utf8").trim()) !== commonDir) throw new Error("Candidate Git backlinks changed");
+	const gitdir = readFileSync(join(admin, "gitdir"), "utf8");
+	if (!gitdir.endsWith("\n") || !samePath(gitdir.slice(0, -1), gitFile, platform) ||
+		!samePath(resolve(admin, readFileSync(join(admin, "commondir"), "utf8").trim()), commonDir, platform)) throw new Error("Candidate Git backlinks changed");
 	return matching[0]! + pointer;
 }
 
-export function removeCandidateOwner(owner: CandidateViewOwner, git: Git, makeWritable: (root: string) => void, orphan = false): void {
+export function removeCandidateOwner(owner: CandidateViewOwner, git: Git, makeWritable: (root: string) => void, orphan = false, platform: NodeJS.Platform = process.platform): void {
 	const { root, commonDir } = owner;
-	const parent = assertCandidateOwnerParent(commonDir);
+	const parent = assertCandidateOwnerParent(commonDir, platform);
 	const expected = JSON.stringify(owner);
-	const parentIdentity = directory(parent, true);
-	const markerIdentity = regular(markerPath(root), true);
+	const parentIdentity = directory(parent, true, platform);
+	const markerIdentity = regular(markerPath(root), true, platform);
 	const checkOwner = (): void => {
-		if (directory(parent, true) !== parentIdentity || regular(markerPath(root), true) !== markerIdentity ||
-			JSON.stringify(readOwner(commonDir, root)) !== expected || (orphan ? !dead(owner) : owner.pid !== process.pid)) throw new Error("Candidate ownership changed");
+		if (directory(parent, true, platform) !== parentIdentity || regular(markerPath(root), true, platform) !== markerIdentity ||
+			JSON.stringify(readOwner(commonDir, root, platform)) !== expected || (orphan ? !dead(owner) : owner.pid !== process.pid)) throw new Error("Candidate ownership changed");
 	};
 	checkOwner();
 	const lock = `${root}.reaper-lock`;
 	const token = randomUUID();
 	exclusiveFile(lock, token); // EEXIST is final; unknown/stale locks are never stolen.
-	const lockIdentity = regular(lock, true);
+	const lockIdentity = regular(lock, true, platform);
 	const checkLock = (): void => {
-		if (regular(lock, true) !== lockIdentity || readFileSync(lock, "utf8") !== token) throw new Error("Candidate reaper lock changed");
+		if (regular(lock, true, platform) !== lockIdentity || readFileSync(lock, "utf8") !== token) throw new Error("Candidate reaper lock changed");
 	};
 	try {
 		checkOwner();
-		const identity = [directory(parent, true), directory(root), regular(markerPath(root), true)];
-		const registered = registration(root, commonDir, git);
+		const identity = [directory(parent, true, platform), directory(root), regular(markerPath(root), true, platform)];
+		const registered = registration(root, commonDir, git, platform);
 		checkOwner();
 		checkLock();
 		makeWritable(root);
 		// Git and chmod are race boundaries: repeat path, owner, lock, and exact
 		// registration proofs immediately before asking Git to remove this root.
-		if (registration(root, commonDir, git) !== registered ||
-			JSON.stringify([directory(parent, true), directory(root), regular(markerPath(root), true)]) !== JSON.stringify(identity)) throw new Error("Candidate cleanup identity changed");
+		if (registration(root, commonDir, git, platform) !== registered ||
+			JSON.stringify([directory(parent, true, platform), directory(root), regular(markerPath(root), true, platform)]) !== JSON.stringify(identity)) throw new Error("Candidate cleanup identity changed");
 		checkOwner();
 		checkLock();
 		git(["worktree", "remove", "--force", root]);
@@ -159,18 +278,18 @@ export function removeCandidateOwner(owner: CandidateViewOwner, git: Git, makeWr
 		syncDirectory(parent);
 	} finally {
 		// Only release this exact lock, even when the deletion itself failed.
-		try { assertCandidateOwnerParent(commonDir); checkLock(); unlinkSync(lock); syncDirectory(parent); } catch {}
+		try { assertCandidateOwnerParent(commonDir, platform); checkLock(); unlinkSync(lock); syncDirectory(parent); } catch {}
 	}
 }
 
-export function sweepCandidateOwners(commonDir: string, git: Git, makeWritable: (root: string) => void): void {
+export function sweepCandidateOwners(commonDir: string, git: Git, makeWritable: (root: string) => void, platform: NodeJS.Platform = process.platform): void {
 	try {
-		const parent = assertCandidateOwnerParent(commonDir);
+		const parent = assertCandidateOwnerParent(commonDir, platform);
 		for (const name of readdirSync(parent)) {
 			if (!name.endsWith(".owner.json")) continue;
 			try {
-				const owner = readOwner(commonDir, join(parent, name.slice(0, -11)));
-				if (dead(owner)) removeCandidateOwner(owner, git, makeWritable, true);
+				const owner = readOwner(commonDir, join(parent, name.slice(0, -11)), platform);
+				if (dead(owner)) removeCandidateOwner(owner, git, makeWritable, true, platform);
 			} catch { /* Unknown, legacy, unsafe, unregistered, and contended entries survive. */ }
 		}
 	} catch { /* Startup/materialization sweeps are best-effort; never create a store. */ }

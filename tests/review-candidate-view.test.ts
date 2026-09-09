@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import childProcess from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -21,6 +22,7 @@ import {
 	readCandidateContextManifestPage,
 	type NativeCandidateProjectionDescriptor,
 } from "../lib/review-candidate-view.ts";
+import { setWindowsAclAuthorityForTesting, validatePrivateWindowsDacl } from "../lib/review-candidate-view-owner.ts";
 
 function git(cwd: string, ...arguments_: string[]): string {
 	return execFileSync("git", arguments_, { cwd, encoding: "utf8" }).trim();
@@ -29,7 +31,7 @@ function git(cwd: string, ...arguments_: string[]): string {
 function repository(t: test.TestContext): string {
 	const cwd = mkdtempSync(join(tmpdir(), "gentle-pi-candidate-view-"));
 	t.after(() => {
-		execFileSync("chmod", ["-R", "u+rwx", cwd]);
+		if (process.platform !== "win32") execFileSync("chmod", ["-R", "u+rwx", cwd]);
 		rmSync(cwd, { recursive: true, force: true });
 	});
 	git(cwd, "init", "-b", "main");
@@ -40,6 +42,11 @@ function repository(t: test.TestContext): string {
 }
 
 function ownerMarker(root: string): string { return `${root}.owner.json`; }
+
+function mockWindowsAcl(t: test.TestContext): void {
+	setWindowsAclAuthorityForTesting(() => {});
+	t.after(() => setWindowsAclAuthorityForTesting());
+}
 
 function orphanFixture(t: test.TestContext) {
 	const cwd = repository(t);
@@ -87,6 +94,155 @@ test("candidate ownership is private and durable before worktree add; ordinary c
 	view.cleanup();
 	assert.equal(existsSync(view.root), false);
 	assert.equal(existsSync(ownerMarker(view.root)), false);
+});
+
+test("private candidate owner accepts safe Windows artifacts", (t) => {
+	mockWindowsAcl(t);
+	const view = new CandidateViewRegistry(undefined, "win32").create({ contributorRoot: repository(t) });
+	try {
+		assert.equal(lstatSync(ownerMarker(view.root)).isFile(), true);
+		assert.doesNotThrow(() => view.verify());
+	} finally {
+		view.cleanup();
+	}
+});
+
+test("private candidate owner rejects an untrusted conditional Windows allow ACE", () => {
+	assert.throws(
+		() => validatePrivateWindowsDacl("D:P(A;OICI;FA;;;S-1-5-21-1)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(XA;OICI;FA;;;S-1-5-21-2;condition)", "S-1-5-21-1", true),
+		/Windows DACL does not match the trusted grant model/,
+	);
+});
+
+test("private candidate owner ignores a spoofed SystemRoot when invoking Windows ACL tools", { skip: process.platform !== "win32" }, (t) => {
+	const originalSystemRoot = process.env.SystemRoot;
+	const spoofedSystemRoot = join(tmpdir(), "gentle-pi-spoofed-SystemRoot");
+	process.env.SystemRoot = spoofedSystemRoot;
+	t.after(() => {
+		if (originalSystemRoot === undefined) delete process.env.SystemRoot;
+		else process.env.SystemRoot = originalSystemRoot;
+	});
+	const execFile = childProcess.execFileSync;
+	const aclExecutables: string[] = [];
+	t.mock.method(childProcess, "execFileSync", (file, arguments_, options) => {
+		if (typeof file === "string" && /\\(?:whoami|icacls)\.exe$/i.test(file)) {
+			aclExecutables.push(file);
+			assert.equal(file.toLowerCase().startsWith(spoofedSystemRoot.toLowerCase()), false);
+		}
+		return execFile(file, arguments_, options);
+	});
+	syncBuiltinESMExports();
+	t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+	const view = new CandidateViewRegistry().create({ contributorRoot: repository(t) });
+	try {
+		view.verify();
+		assert.ok(aclExecutables.length > 0);
+	} finally {
+		view.cleanup();
+	}
+});
+
+test("private candidate owner reads back a restrictive Windows DACL before worktree materialization", { skip: process.platform !== "win32" }, (t) => {
+	const system = process.env.SystemRoot!;
+	const user = execFileSync(`${system}\\System32\\whoami.exe`, ["/user", "/fo", "csv", "/nh"], { encoding: "utf8" }).match(/S-\d+(?:-\d+)+/i)?.[0];
+	assert.ok(user);
+	const view = new CandidateViewRegistry().create({ contributorRoot: repository(t) });
+	try {
+		const parent = join(view.root, ".."), archive = ".candidate-owner-acl.txt";
+		execFileSync(`${system}\\System32\\icacls.exe`, [parent, "/save", archive, "/c"], { cwd: parent, encoding: "utf8" });
+		const sddl = readFileSync(join(parent, archive), "utf16le");
+		rmSync(join(parent, archive));
+		const dacl = sddl.match(/D:[^\r\n]+/)?.[0];
+		assert.ok(dacl);
+		assert.doesNotThrow(() => validatePrivateWindowsDacl(dacl, user!, true));
+	} finally {
+		view.cleanup();
+	}
+});
+
+function publicationFailure(t: test.TestContext, phase: "write" | "fsync" | "directory"): void {
+	mockWindowsAcl(t);
+	if (phase === "directory") {
+		const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+		Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+		t.after(() => Object.defineProperty(process, "platform", descriptor));
+	}
+	const cwd = repository(t), parent = join(cwd, ".git", "gentle-ai", "candidate-views");
+	let adds = 0;
+	if (phase === "write") t.mock.method(fs, "writeFileSync", () => { throw new Error("fixture marker write failure"); });
+	if (phase === "fsync") t.mock.method(fs, "fsyncSync", () => { throw new Error("fixture marker fsync failure"); });
+	if (phase === "directory") {
+		const fsync = fs.fsyncSync;
+		let syncs = 0;
+		t.mock.method(fs, "fsyncSync", (fd: number) => {
+			if (++syncs === 1) return fsync(fd);
+			throw new Error("fixture marker directory sync failure");
+		});
+	}
+	syncBuiltinESMExports();
+	t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+	const registry = new CandidateViewRegistry((file, args, options) => {
+		if (args[0] === "worktree" && args[1] === "add") adds++;
+		return execFileSync(file, args, options);
+	}, "win32");
+	assert.throws(
+		() => registry.create({ contributorRoot: cwd }),
+		(error: unknown) => error instanceof CandidateViewError && error.reason === "candidate-owner-preparation-failed",
+	);
+	assert.equal(adds, 0);
+	assert.deepEqual(readdirSync(parent).filter((name) => name.endsWith(".owner.json") || name.endsWith(".reaper-lock")), []);
+}
+
+for (const [phase, label] of [["write", "marker write"], ["fsync", "marker fsync"], ["directory", "post-marker directory sync"]] as const) {
+	test(`candidate owner publication rolls back after ${label} failure`, (t) => publicationFailure(t, phase));
+}
+
+test("candidate owner publication never removes a replaced marker", (t) => {
+	mockWindowsAcl(t);
+	const cwd = repository(t), parent = join(cwd, ".git", "gentle-ai", "candidate-views");
+	const write = fs.writeFileSync;
+	t.mock.method(fs, "fsyncSync", () => {
+		const marker = readdirSync(parent).find((name) => name.endsWith(".owner.json"));
+		assert.ok(marker);
+		renameSync(join(parent, marker!), join(parent, `${marker}.saved`));
+		write(join(parent, marker!), "replacement", { mode: 0o600 });
+		throw new Error("fixture marker fsync failure after replacement");
+	});
+	syncBuiltinESMExports();
+	t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+	let adds = 0;
+	const registry = new CandidateViewRegistry((file, args, options) => {
+		if (args[0] === "worktree" && args[1] === "add") adds++;
+		return execFileSync(file, args, options);
+	}, "win32");
+	assert.throws(() => registry.create({ contributorRoot: cwd }), CandidateViewError);
+	assert.equal(adds, 0);
+	const marker = readdirSync(parent).find((name) => name.endsWith(".owner.json"));
+	assert.ok(marker);
+	assert.equal(readFileSync(join(parent, marker!), "utf8"), "replacement");
+	assert.equal(readdirSync(parent).some((name) => name.endsWith(".reaper-lock")), false);
+});
+
+test("candidate owner rejects an absent POSIX getuid before worktree creation", { skip: process.platform === "win32" }, (t) => {
+	const originalGetuid = process.getuid;
+	Object.defineProperty(process, "getuid", { configurable: true, value: undefined });
+	t.after(() => Object.defineProperty(process, "getuid", { configurable: true, value: originalGetuid }));
+	assert.throws(
+		() => new CandidateViewRegistry().create({ contributorRoot: repository(t) }),
+		(error: unknown) => error instanceof CandidateViewError && error.reason === "candidate-owner-preparation-failed",
+	);
+});
+
+test("candidate owner rejects a POSIX UID mismatch before worktree creation", { skip: process.platform === "win32" }, (t) => {
+	const uid = process.getuid?.();
+	assert.equal(typeof uid, "number");
+	const originalGetuid = process.getuid;
+	Object.defineProperty(process, "getuid", { configurable: true, value: () => uid! + 1 });
+	t.after(() => Object.defineProperty(process, "getuid", { configurable: true, value: originalGetuid }));
+	assert.throws(
+		() => new CandidateViewRegistry().create({ contributorRoot: repository(t) }),
+		(error: unknown) => error instanceof CandidateViewError && error.reason === "candidate-owner-preparation-failed",
+	);
 });
 
 test("marked registered definitively dead candidate is reclaimed before another materialization", (t) => {
@@ -1066,7 +1222,6 @@ test("candidate executable-mode validation accepts a readonly Git executable on 
 });
 
 test("candidate registry forwards explicit Windows mode validation to view verification", (t) => {
-	if (process.platform === "win32") return t.skip("requires POSIX candidate-owner directory permissions unavailable on Windows");
 	const contributorRoot = repository(t);
 	writeFileSync(join(contributorRoot, "unchanged-executable.sh"), "#!/bin/sh\necho base\n");
 	git(contributorRoot, "add", "unchanged-executable.sh");

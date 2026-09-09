@@ -70,6 +70,10 @@ jobs:
         shell: pwsh
         run: pnpm exec node --experimental-strip-types --test tests/review-repository.test.ts
 
+      - name: Run Windows candidate view regression
+        shell: pwsh
+        run: pnpm exec node --experimental-strip-types --test --test-name-pattern "private candidate owner" tests/review-candidate-view.test.ts
+
       - name: Run Windows native consent boundary
         shell: pwsh
         run: pnpm exec node --experimental-strip-types --test tests/native-review-consent.test.ts
