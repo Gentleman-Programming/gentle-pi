@@ -110,6 +110,8 @@ import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
 import { CandidateViewError, CandidateViewRegistry, injectReviewCandidateView, readCandidateContextManifestPage, resolveCanonicalCandidateBase, type CandidateView } from "../lib/review-candidate-view.ts";
 import {
 	GentleAiDevBinaryOverrideError,
+	GENTLE_AI_INSTALL_RECOVERY_COMMAND,
+	GENTLE_AI_INSTALL_RECOVERY_INSTRUCTIONS,
 	registerGentleAiDevBinary,
 	resolveGentleAiBinary,
 	resolveGentleAiDevBinaryOverride,
@@ -3512,7 +3514,9 @@ function nativeStatusPackageBinaryMissing(operation: ReviewControllerOperation, 
 		...(operation === REVIEW_CONTROLLER_OPERATION.START ? nativeStartPreAuthorityRejection() : { lineage_created: false, mutation_performed: false, mutation_outcome: "none" }),
 		inventory_complete: false,
 		diagnostics,
-		next_action: "reinstall-package-local-gentle-ai",
+		reason: `The verified package-local binary is unavailable. ${GENTLE_AI_INSTALL_RECOVERY_INSTRUCTIONS} This does not prove install lifecycle scripts were disabled.`,
+		recovery_command: GENTLE_AI_INSTALL_RECOVERY_COMMAND,
+		next_action: GENTLE_AI_INSTALL_RECOVERY_INSTRUCTIONS,
 	};
 }
 

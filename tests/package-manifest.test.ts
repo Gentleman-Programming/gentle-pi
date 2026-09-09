@@ -229,8 +229,12 @@ test("generated runtime modules and packed-package checks are deterministic", ()
 test("package manifest ships and runs the checked-in package-local Gentle AI installer", () => {
 	const packageJson = readPackageJson();
 	const verifier = readFileSync(join(PACKAGE_ROOT, "scripts", "verify-package-files.mjs"), "utf8");
+	const readme = readFileSync(join(PACKAGE_ROOT, "README.md"), "utf8");
 
 	assert.equal(packageJson.scripts?.postinstall, "node scripts/install-gentle-ai.mjs");
+	assert.match(readme, /run `node scripts\/install-gentle-ai\.mjs`/, "missing-binary recovery documentation must use the package postinstall entrypoint");
+	assert.match(readme, /installed `gentle-pi` package directory/, "recovery documentation must name the package working directory");
+	assert.match(readme, /if `GENTLE_PI_SKIP_GENTLE_AI_INSTALL` is set, remove or unset it before/i, "recovery documentation must prevent the installer skip from repeating");
 	assert.ok(packageJson.files?.includes("scripts/"));
 	assert.match(verifier, /"scripts\/install-gentle-ai\.mjs"/);
 	assert.match(verifier, /"scripts\/gentle-ai-installer\.mjs"/);
