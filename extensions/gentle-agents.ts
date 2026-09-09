@@ -54,7 +54,7 @@ interface ToolText {
 }
 
 const defaultDeps = (env: NodeJS.ProcessEnv): AgentsDeps => ({
-	spawn: (command, args, options) => spawn(command, args, { cwd: options.cwd, env: options.env, stdio: options.stdio ?? ["pipe", "pipe", "pipe"] }),
+	spawn: (command, args, options) => spawn(command, args, { cwd: options.cwd, env: options.env, stdio: options.stdio ?? ["pipe", "pipe", "pipe"], windowsHide: true, detached: options.detached }),
 	now: () => Date.now(),
 	schedule: (fn, ms) => {
 		const timer = setTimeout(fn, ms);
