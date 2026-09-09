@@ -29,7 +29,6 @@ const ROLE = {
 	PATH_IDLE: "muted",
 	ADDED: "success",
 	REMOVED: "error",
-	NEW: "success",
 	HUNK: "customMessageLabel",
 	KEY: "accent",
 	KEY_TEXT: "dim",
@@ -66,11 +65,20 @@ export function colorDiff(text: string, theme: ChangesViewTheme): string[] {
 	return lines;
 }
 
+const FILE_STATUS = {
+	[CHANGE_STATUS.MODIFIED]: "M",
+	[CHANGE_STATUS.ADDED]: "A",
+	[CHANGE_STATUS.DELETED]: "D",
+	[CHANGE_STATUS.RENAMED]: "R",
+	[CHANGE_STATUS.UNTRACKED]: "??",
+} as const;
+
 function fileCounts(file: ChangedFile, theme: ChangesViewTheme): string {
-	if (file.status === CHANGE_STATUS.UNTRACKED || file.status === CHANGE_STATUS.ADDED) {
-		return `${theme.fg(ROLE.ADDED, `+${file.added}`)} ${theme.fg(ROLE.NEW, "new")}`;
-	}
-	return `${theme.fg(ROLE.ADDED, `+${file.added}`)} ${theme.fg(ROLE.REMOVED, `−${file.deleted}`)}`;
+	return `${theme.fg(ROLE.ADDED, `+${file.added}`)} ${theme.fg(ROLE.REMOVED, `-${file.deleted}`)}`;
+}
+
+function fileLabel(file: ChangedFile, theme: ChangesViewTheme, role: string): string {
+	return `${theme.fg(role, `${FILE_STATUS[file.status]} ${displayText(file.path)}`)}  ${fileCounts(file, theme)}`;
 }
 
 function fit(text: string, width: number): string {
@@ -211,9 +219,9 @@ export class WorktreeChangesView {
 			const active = index + this.listOffset === this.selected;
 			const marker = active ? theme.fg(ROLE.SELECTED, "▸") : " ";
 			const text = row.file
-				? `  - ${displayText(row.file.path)}  ${fileCounts(row.file, theme)}`
-				: `${this.expanded.has(row.tree.root) ? "▾" : "▸"} ${displayText(row.tree.branch ?? "detached")} · ${displayText(basename(row.tree.root))}`;
-			return `${marker} ${theme.fg(active ? ROLE.SELECTED : ROLE.PATH_IDLE, text)}`;
+				? `  ${fileLabel(row.file, theme, active ? ROLE.SELECTED : ROLE.PATH_IDLE)}`
+				: theme.fg(active ? ROLE.SELECTED : ROLE.PATH_IDLE, `${this.expanded.has(row.tree.root) ? "▾" : "▸"} ${displayText(row.tree.branch ?? "detached")} · ${displayText(basename(row.tree.root))}`);
+			return `${marker} ${text}`;
 		};
 		const keys = theme.fg(ROLE.KEY_TEXT, "j/k select   enter toggle/open   ← parent/fold   ctrl+j/k scroll   r refresh   esc close");
 		return renderPanes(width, height, theme, `✎ Changes · ${this.trees.length} worktrees`, leftLine, preview, keys);
@@ -307,8 +315,7 @@ export class ChangesView {
 		if (!file) return "";
 		const theme = this.deps.theme;
 		const marker = row === this.selected ? theme.fg(ROLE.SELECTED, "▸") : " ";
-		const path = theme.fg(row === this.selected ? ROLE.PATH : ROLE.PATH_IDLE, file.path);
-		return `${marker} ${path}  ${fileCounts(file, theme)}`;
+		return `${marker} ${fileLabel(file, theme, row === this.selected ? ROLE.PATH : ROLE.PATH_IDLE)}`;
 	}
 
 	private visibleDiff(rows: number): string[] {

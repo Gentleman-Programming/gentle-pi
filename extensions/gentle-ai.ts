@@ -1,3 +1,5 @@
+import { consumeReviewMutation, pendingReviewMutation, recordReviewMutation } from "../lib/review-reminder-receipt.ts";
+import { resolveSessionWorktree } from "../lib/session-worktree-registry.ts";
 import { declareReviewRelayHandshake } from "../lib/review-relay-contract.ts";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
@@ -4138,17 +4140,6 @@ const processRetainedNativeStatusSelections = new Map<PendingReviewConsentSessio
 // and a fresh primary-loop start resets it to 0.
 const processAgentEndSubagentDepth = new Map<PendingReviewConsentSessionKey, number>();
 
-// Target identities already nudged once per session, so the read-only
-// `agent_end` preflight reminder fires at most once per unreviewed candidate.
-const processAgentEndPreflightNudgedTargets = new Map<PendingReviewConsentSessionKey, Set<string>>();
-
-// gentle-pi#568: the target identity negotiated STATUS reported at
-// `session_start`, before this session touched the worktree. A candidate
-// already present at that point is the user's own pre-session work, not
-// something this session produced, so `agent_end` must not treat it as an
-// unreviewed candidate this session should be reminded about.
-const processAgentEndSessionBaseline = new Map<PendingReviewConsentSessionKey, string>();
-
 // gentle-pi#677: gentle-ai#4309 owns anonymous usage telemetry end to end;
 // Pi only nudges it once per process. This is a plain process-lifetime
 // guard, not a session-keyed map, because the nudge is meant to fire at most
@@ -5080,9 +5071,9 @@ async function negotiatedStatusForHostTransport(
 // under the exact guards `agent_end` uses to decide whether to nudge: a
 // native review CLI with both `reviewMode` and `targetStatus`, a UI-bearing
 // context, and RDD effectively on. Returns `undefined` on any missing guard,
-// an effective-off mode, or any STATUS error or transport refusal, so both
-// `session_start` (recording a baseline) and `agent_end` (deciding whether to
-// nudge) resolve the same target identity through the same path.
+// an effective-off mode, or any STATUS error or transport refusal. Startup
+// negotiation and mutation-gated `agent_end` use the same native whole-target
+// path; neither derives candidate scope from local mutation receipts.
 async function resolveNegotiatedReviewStatusForSession(
 	nativeReviewCli: NativeReviewCli | null,
 	ctx: ExtensionContext,
@@ -5107,12 +5098,12 @@ async function resolveNegotiatedReviewStatusForSession(
 	}
 }
 
-// gentle-pi#556 / gentle-ai#4051: the exact once-per-candidate reminder sent
+// gentle-pi#556 / gentle-ai#4051: the mutation-gated reminder sent
 // through `agent_end`. It never runs START itself, so it names the one
 // supported continuation (gentle_review inspect) and defers the resulting
 // consent envelope to the human.
 function renderAgentEndReviewPreflightMessage(targetIdentity: string): string {
-	return `Receipt-driven development is enabled, and this worktree holds an unreviewed candidate (target ${targetIdentity}). By the review contract entry rule, run the review preflight before reporting completion.\n\nCall the gentle_review tool with {"operation":"inspect"} and follow the transition it returns; it currently offers review.start for this target. An eligible interactive Pi host may resolve consent directly with its own three-action UI. If gentle_review instead returns an unresolved gentle-ai.review-integration.consent/v3 envelope, relay that original two-choice provider envelope to the human losslessly. Never answer consent from model prose or tool arguments.\n\nThis extension never runs START itself. This reminder is sent once per candidate.`;
+	return `Receipt-driven development is enabled, and this worktree holds an unreviewed candidate (target ${targetIdentity}). By the review contract entry rule, run the review preflight before reporting completion.\n\nCall the gentle_review tool with {"operation":"inspect"} and follow the transition it returns; it currently offers review.start for this target. An eligible interactive Pi host may resolve consent directly with its own three-action UI. If gentle_review instead returns an unresolved gentle-ai.review-integration.consent/v3 envelope, relay that original two-choice provider envelope to the human losslessly. Never answer consent from model prose or tool arguments.\n\nThis extension never runs START itself. This reminder consumes only this session's observed mutation generation.`;
 }
 
 function canonicalReviewCaptureBinding(value: unknown): string {
@@ -6449,7 +6440,11 @@ function createGentleAiExtensionForTesting(
 		return revoked;
 	};
 
+	let reminderSessionActive = true;
+	let reminderEpoch = 0;
 	pi.on("session_shutdown", (event, context) => {
+		reminderSessionActive = false;
+		reminderEpoch += 1;
 		// Pi tears down this registry on reload as well as session replacement/quit.
 		try { candidateViews?.cleanupAll(); } catch { /* Preserve failed owned views for later recovery. */ }
 		const reason = (event as { reason?: unknown }).reason;
@@ -6462,12 +6457,11 @@ function createGentleAiExtensionForTesting(
 		cleanupAllPendingReviewConsents(pendingReviewConsentRegistry, sessionKey);
 		processRetainedNativeStatusSelections.delete(sessionKey);
 		processAgentEndSubagentDepth.delete(sessionKey);
-		processAgentEndPreflightNudgedTargets.delete(sessionKey);
-		processAgentEndSessionBaseline.delete(sessionKey);
 	});
 
 	pi.registerTool({
 		name: "gentle_review_scope",
+		renderShell: "self",
 		label: "Gentle Review Scope",
 		description: "Read one bounded, integrity-checked page of the controller-owned frozen changed scope. This read-only tool never inspects the ambient or candidate tree.",
 		parameters: REVIEW_SCOPE_PARAMETERS,
@@ -6510,6 +6504,7 @@ function createGentleAiExtensionForTesting(
 
 	pi.registerTool({
 		name: "gentle_review_capture_group",
+		renderShell: "self",
 		label: "Gentle Review Capture Group",
 		description: "Capture one complete provider-issued materialize reviewer group. It validates the exact ordered current collect set, forecasts its bounded model cost, runs reviewers concurrently, and admits outputs one at a time in provider order.",
 		promptSnippet: "Use one complete exact current STATUS materialize reviewer group; acknowledge its forecast before the grouped run.",
@@ -6544,6 +6539,7 @@ function createGentleAiExtensionForTesting(
 
 	pi.registerTool({
 		name: "gentle_review_capture",
+		renderShell: "self",
 		label: "Gentle Review Capture",
 		description: "Capture exactly one provider-issued ordinary native review collect slot. This is not a controller operation: it validates one opaque collect binding against current target-scoped STATUS, executes at most one capture, and never follows a transition.",
 		promptSnippet: "Use one exact current STATUS collectBinding for one ordinary native capture; call fresh STATUS before every additional capture.",
@@ -6584,6 +6580,7 @@ function createGentleAiExtensionForTesting(
 
 	pi.registerTool({
 		name: "gentle_review",
+		renderShell: "self",
 		label: "Gentle Review Controller",
 		description:
 			"Inspect and recover review authority and start native ordinary review. Ordinary capture is available only through the separate gentle_review_capture tool. Review outcomes never authorize delivery: commit, push, pull-request, and release commands follow ordinary repository policy. RESET/RECOVER remain destructive and are executed by the audited native CLI.",
@@ -6616,6 +6613,17 @@ function createGentleAiExtensionForTesting(
 			const sessionKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey);
 			const retainedSelections = processRetainedNativeStatusSelections.get(sessionKey)
 				?? processRetainedNativeStatusSelections.set(sessionKey, new Map()).get(sessionKey)!;
+			// Snapshot before native awaits: a concurrent own write is a new generation.
+			const acknowledgementEpoch = reminderEpoch;
+			let acknowledgementRoot: string | undefined;
+			let acknowledgementMutation: string | undefined;
+			try {
+				const parsed = parseReviewControllerParameters(parameters);
+				if (parsed.operation === REVIEW_CONTROLLER_OPERATION.ACKNOWLEDGE_APPROVED) {
+					acknowledgementRoot = resolveReviewControllerWorkspaceRoot(parsed.workspaceRoot, ctx.cwd, candidateViews, parsed.lineageId);
+					acknowledgementMutation = pendingReviewMutation(ctx.sessionManager, acknowledgementRoot);
+				}
+			} catch { /* Controller validation owns invalid parameters and unavailable roots. */ }
 			let details = await executeReviewControllerOperation(
 				parameters,
 				ctx.cwd,
@@ -6629,6 +6637,16 @@ function createGentleAiExtensionForTesting(
 				reviewConsentNow,
 				reviewConsentScheduleTimer,
 			);
+			if (details.operation === REVIEW_CONTROLLER_OPERATION.ACKNOWLEDGE_APPROVED &&
+				details.outcome === "native-approved-acknowledgement-completed" &&
+				details.status === "closed" && details.authority === "burned" &&
+				typeof details.target_identity === "string") {
+				try {
+					if (reminderSessionActive && acknowledgementEpoch === reminderEpoch && acknowledgementRoot && pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey) === sessionKey) {
+						consumeReviewMutation(pi, ctx.sessionManager, acknowledgementRoot, acknowledgementMutation, "acknowledged", details.target_identity);
+					}
+				} catch { /* Bookkeeping cannot hide a confirmed native burn. */ }
+			}
 			if (
 				isHostReviewConsentEligibleOperation(parameters) &&
 				details.outcome === "native-review-consent-required" &&
@@ -6712,6 +6730,8 @@ function createGentleAiExtensionForTesting(
 	}
 
 	pi.on("session_start", async (event, ctx) => {
+		reminderSessionActive = true;
+		reminderEpoch += 1;
 		try { candidateViews?.sweepOrphans(ctx.cwd); } catch { /* Ownership sweeping must not block startup. */ }
 		const reason = (event as { reason?: unknown }).reason;
 		if (reason !== "reload") revokeCurrentReviewSessionPermission(ctx);
@@ -6752,18 +6772,13 @@ function createGentleAiExtensionForTesting(
 				);
 			}
 		}
-		// gentle-pi#568: record the target identity STATUS reports right now,
-		// before this session does anything, as the baseline `agent_end` skips
-		// later. Best-effort and silent: it never notifies and never lets a
-		// STATUS failure fail session start.
+		// Keep the startup transport negotiation, but do not treat its target as
+		// an ownership baseline: reload may have outstanding durable receipts.
 		try {
 			const sessionKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey);
-			const status = await resolveNegotiatedReviewStatusForSession(nativeReviewCli, ctx, sessionKey);
-			if (status?.targetIdentity !== undefined) {
-				processAgentEndSessionBaseline.set(sessionKey, status.targetIdentity);
-			}
+			await resolveNegotiatedReviewStatusForSession(nativeReviewCli, ctx, sessionKey);
 		} catch {
-			// Baseline recording is best-effort only; never surface or throw.
+			// Startup negotiation is best-effort only; never surface or throw.
 		}
 	});
 
@@ -6855,33 +6870,30 @@ function createGentleAiExtensionForTesting(
 	// an authorized implementation and report completion without ever running
 	// the review STATUS preflight or offering the consent question. This
 	// handler is read-only and idempotent: it never runs START, never answers
-	// consent, and never writes a file. It only sends one turn-triggering
-	// reminder, at most once per unreviewed target identity per session.
-	// gentle-pi#568: a candidate matching the baseline `session_start`
-	// recorded predates this session's own work and is skipped rather than
-	// nudged, so a worktree already dirty from the user's own edits does not
-	// draw a reminder about work this session never produced.
+	// consent, or chooses a partial candidate. Durable own-mutation receipts
+	// gate STATUS and consume only the generation captured before that await.
 	pi.on("agent_end", async (_event, ctx) => {
 		if (nativeReviewCli?.reviewMode === undefined || nativeReviewCli.targetStatus === undefined) return;
-		if (ctx.hasUI !== true) return;
+		if (ctx.hasUI !== true || !reminderSessionActive) return;
 		const sessionKey = pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey);
 		const subagentDepth = processAgentEndSubagentDepth.get(sessionKey) ?? 0;
 		if (subagentDepth > 0) {
 			processAgentEndSubagentDepth.set(sessionKey, subagentDepth - 1);
 			return;
 		}
+		const root = resolveSessionWorktree(ctx.cwd, ctx.cwd)?.root;
+		if (!root) return;
+		let mutation: string | undefined;
+		try { mutation = pendingReviewMutation(ctx.sessionManager, root); }
+		catch { return; }
+		if (!mutation) return;
+		const epoch = reminderEpoch;
 		const status = await resolveNegotiatedReviewStatusForSession(nativeReviewCli, ctx, sessionKey);
-		if (status === undefined) return;
+		if (status === undefined || !reminderSessionActive || epoch !== reminderEpoch || pendingReviewConsentSessionKey(ctx, pendingReviewConsentFallbackKey) !== sessionKey) return;
+		// Another concurrent end or ACK may already have consumed this prefix.
+		if (!pendingReviewMutation(ctx.sessionManager, root, mutation)) return;
 		if (status.nextTransition?.kind !== "execute" || status.nextTransition.execute.operation !== "review.start") return;
 		const targetIdentity = status.targetIdentity;
-		if (processAgentEndSessionBaseline.get(sessionKey) === targetIdentity) return;
-		let nudged = processAgentEndPreflightNudgedTargets.get(sessionKey);
-		if (nudged === undefined) {
-			nudged = new Set<string>();
-			processAgentEndPreflightNudgedTargets.set(sessionKey, nudged);
-		}
-		if (nudged.has(targetIdentity)) return;
-		nudged.add(targetIdentity);
 		pi.sendMessage(
 			{
 				customType: "gentle-pi.review-preflight",
@@ -6890,6 +6902,16 @@ function createGentleAiExtensionForTesting(
 			},
 			{ triggerTurn: true, deliverAs: "followUp" },
 		);
+		consumeReviewMutation(pi, ctx.sessionManager, root, mutation, "nudged", targetIdentity);
+	});
+
+	pi.on("tool_result", (event, ctx) => {
+		if (!reminderSessionActive || event.isError !== false || (event.toolName !== "write" && event.toolName !== "edit")) return;
+		if (!isRecord(event.input) || typeof event.input.path !== "string" || !event.input.path.trim()) return;
+		try {
+			const root = resolveSessionWorktree(event.input.path, ctx.cwd)?.root;
+			if (root) recordReviewMutation(pi, ctx.sessionManager, root, { source: "direct", toolName: event.toolName, toolCallId: event.toolCallId });
+		} catch { /* Receipt persistence must not change a successful tool result. */ }
 	});
 
 	pi.on("tool_call", async (event, ctx) => {

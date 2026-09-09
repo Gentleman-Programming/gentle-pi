@@ -1,7 +1,9 @@
-import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { createNativePointerScope, type NativePointerRegion } from "./native-pointer-region.ts";
-import { isFinished, TASK_STATUS, THREAD_ITEM, type TaskRecord, type TaskStore, type TaskThread, type ThreadItem, type ToolItem } from "./agents-protocol.ts";
+import { Key, matchesKey, truncateToWidth, visibleWidth, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { measureAgentsViewLayout, type AgentsViewLayout } from "./agents-view-layout.ts";
+import { isFinished, TASK_STATUS, type TaskRecord, type TaskStore, type TaskThread, type ThreadItem } from "./agents-protocol.ts";
+import { renderThreadItem, type AgentsThreadTheme } from "./agents-thread-view.ts";
 import { formatElapsed } from "./agents-widget.ts";
+import { createNativePointerScope, type NativePointerRegion } from "./native-pointer-region.ts";
 import { formatTokens } from "./shell-bar.ts";
 
 // Gentle Agents overlay: tasks on the left, the selected task's thread on
@@ -11,9 +13,7 @@ import { formatTokens } from "./shell-bar.ts";
 // work (active tasks plus those finished in the last quarter hour); `a`
 // widens it to every task of every session, including the stored history.
 
-export interface AgentsViewTheme {
-	fg(color: string, text: string): string;
-}
+export interface AgentsViewTheme extends AgentsThreadTheme {}
 
 export const VIEW_SCOPE = {
 	SESSION: "session",
@@ -24,7 +24,7 @@ export type ViewScope = (typeof VIEW_SCOPE)[keyof typeof VIEW_SCOPE];
 
 export interface AgentsViewDeps {
 	theme: AgentsViewTheme;
-	rows: number;
+	rows: number | (() => number);
 	store: TaskStore;
 	// The active session; without it there is nothing to scope by and the
 	// list shows every task.
@@ -41,16 +41,10 @@ const ROLE = {
 	FRAME: "border",
 	TITLE: "customMessageLabel",
 	SELECTED: "accent",
+	HOVER: "warning",
 	NAME: "text",
 	NAME_IDLE: "muted",
 	META: "dim",
-	TEXT: "text",
-	THINKING: "dim",
-	TOOL: "accent",
-	TOOL_ERROR: "error",
-	OUTPUT: "muted",
-	NOTE: "muted",
-	NOTE_ERROR: "warning",
 	KEY: "accent",
 	KEY_TEXT: "dim",
 	EMPTY: "dim",
@@ -74,10 +68,6 @@ const GLYPH_ROLE: Record<string, string> = {
 	[TASK_STATUS.CANCELLED]: "dim",
 	[TASK_STATUS.TIMED_OUT]: "error",
 };
-const LIST_MAX_WIDTH = 34;
-const LIST_RATIO = 0.32;
-const CHROME_ROWS = 3;
-const MIN_BODY_ROWS = 1;
 export const SESSION_FINISHED_TTL_MS = 15 * 60_000;
 const SCOPE_LABEL: Record<ViewScope, string> = { [VIEW_SCOPE.SESSION]: "this session", [VIEW_SCOPE.ALL]: "all sessions" };
 const SCOPE_KEY: Record<ViewScope, string> = { [VIEW_SCOPE.SESSION]: "all sessions", [VIEW_SCOPE.ALL]: "this session" };
@@ -85,13 +75,17 @@ const EMPTY_LIST = "no tasks yet";
 const EMPTY_THREAD = "waiting for the first event";
 const FOLLOW_BUTTON = "[ Follow ]";
 const OPEN_BUTTON = "[ Open session ]";
-const FOOTER_BUTTONS_WIDTH = FOLLOW_BUTTON.length + 1 + OPEN_BUTTON.length;
+const CLOSE_BUTTON = "[× Close]";
+// At the 60-cell split boundary these four controls fit before any hints.
+const STOP_BUTTON = "[Stop]";
+const SCOPE_BUTTON = "[Scope]";
 const KEYS = [
 	["j/k", "task"],
 	["ctrl+j/k", "scroll"],
 	["f", "follow"],
 	["o", "open session"],
-	["esc", "close"],
+	["esc", "back"],
+	["q", "close"],
 ] as const;
 
 const EMPTY_COMPONENT: Component = {
@@ -104,18 +98,23 @@ interface PointerButtonLayout {
 	width: number;
 }
 
-interface PointerLayout {
-	width: number;
-	height: number;
-	listX: number;
-	listWidth: number;
-	threadX: number;
-	threadWidth: number;
-	bodyRows: number;
-	footerY: number;
-	followButton?: PointerButtonLayout;
-	openButton?: PointerButtonLayout;
+interface PointerLayout extends AgentsViewLayout {
+	narrowView: "list" | "details";
+	sourceHeight?: number;
+	closeButton?: PointerButtonLayout;
+	modeButton?: PointerButtonLayout;
+	actions?: Array<PointerButtonLayout & { region: NativePointerRegion }>;
 }
+
+interface SessionGroup {
+	id: string;
+	sessionId: string | undefined;
+	tasks: TaskRecord[];
+}
+
+type VisibleRow =
+	| { id: string; kind: "heading"; group: SessionGroup }
+	| { id: string; kind: "task"; group: SessionGroup; task: TaskRecord };
 
 function rule(length: number): string {
 	return "─".repeat(Math.max(0, length));
@@ -126,49 +125,6 @@ function fit(text: string, width: number): string {
 	return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
 }
 
-function argsSummary(item: ToolItem): string {
-	const values = Object.values(item.args).filter((value) => typeof value === "string") as string[];
-	return (values[0] ?? "").replace(/\s+/g, " ").trim();
-}
-
-function toolLines(item: ToolItem, theme: AgentsViewTheme, width: number): string[] {
-	const role = item.isError ? ROLE.TOOL_ERROR : ROLE.TOOL;
-	const head = truncateToWidth(`▸ ${item.name} ${argsSummary(item)}`, width, "…");
-	const lines = [theme.fg(role, head)];
-	// The whole captured output, wrapped: the thread pane scrolls, so nothing
-	// is hidden here. The store already keeps only the last maxOutputChars of a
-	// tool's output and marks the cut with a leading ellipsis.
-	for (const line of item.output.split("\n").filter((line) => line.length > 0)) {
-		for (const wrapped of wrapTextWithAnsi(line, Math.max(1, width - 2))) lines.push(theme.fg(ROLE.OUTPUT, `  ${wrapped}`));
-	}
-	if (item.running) lines.push(theme.fg(ROLE.META, "  …"));
-	return lines;
-}
-
-function thinkingLines(text: string, theme: AgentsViewTheme, width: number): string[] {
-	const lines: string[] = [];
-	for (const [index, line] of text.split("\n").filter((line) => line.length > 0).entries()) {
-		const prefix = index === 0 ? "∴ " : "  ";
-		for (const wrapped of wrapTextWithAnsi(line, Math.max(1, width - 2))) lines.push(theme.fg(ROLE.THINKING, `${prefix}${wrapped}`));
-	}
-	return lines;
-}
-
-export function itemLines(item: ThreadItem, theme: AgentsViewTheme, width: number): string[] {
-	switch (item.kind) {
-		case THREAD_ITEM.TEXT:
-			return wrapTextWithAnsi(item.text, width).map((line) => theme.fg(ROLE.TEXT, line));
-		case THREAD_ITEM.THINKING:
-			return thinkingLines(item.text, theme, width);
-		case THREAD_ITEM.TOOL:
-			return toolLines(item, theme, width);
-		case THREAD_ITEM.NOTE:
-			return [theme.fg(item.text.startsWith("error") ? ROLE.NOTE_ERROR : ROLE.NOTE, truncateToWidth(`· ${item.text}`, width, "…"))];
-		default:
-			return [];
-	}
-}
-
 export function taskHeader(task: TaskRecord, now: number): string {
 	const parts = [task.agent, task.status, task.model, task.tokens > 0 ? formatTokens(task.tokens) : "", task.cost > 0 ? `$${task.cost.toFixed(2)}` : "", task.startedAt === null ? "" : formatElapsed((task.endedAt ?? now) - task.startedAt)];
 	return parts.filter((part) => part.length > 0).join(" · ");
@@ -177,9 +133,16 @@ export function taskHeader(task: TaskRecord, now: number): string {
 export class AgentsView {
 	private readonly deps: AgentsViewDeps;
 	private tasks: TaskRecord[] = [];
-	private selected = 0;
-	private hovered: number | undefined;
+	private selectedId: string | undefined;
+	private hoveredId: string | undefined;
+	private narrowView: "list" | "details" = "list";
+	private narrowGroup: string | undefined;
+	private groupCursor: string | undefined;
+	private footerPage = 0;
+	private readonly actionRegions = new Map<string, NativePointerRegion>();
+	private readonly expanded = new Map<string, boolean>();
 	private listScroll = 0;
+	private readonly manualListOffsets = new Map<string, number>();
 	private scope: ViewScope;
 	private scroll = 0;
 	private follow = true;
@@ -189,9 +152,16 @@ export class AgentsView {
 	private readonly threadRegion: NativePointerRegion;
 	private readonly followRegion: NativePointerRegion;
 	private readonly openRegion: NativePointerRegion;
-	private hoveredControl: "follow" | "open" | undefined;
+	private readonly closeRegion: NativePointerRegion;
+	private readonly modeRegion: NativePointerRegion;
+	private hoveredControl: "follow" | "open" | "close" | "mode" | undefined;
 	private pointerLayout: PointerLayout | undefined;
+	// Keyboard input has no terminal width, so retain its last rendered width
+	// independently from disposable pointer hit geometry.
+	private lastRenderedWidth: number | undefined;
+	private closed = false;
 	private unsubscribeTask: (() => void) | undefined;
+	private subscribedTaskId: string | undefined;
 	private readonly unsubscribeSummary: () => void;
 	private cache = new WeakMap<ThreadItem, string[]>();
 	private cacheWidth = -1;
@@ -215,6 +185,16 @@ export class AgentsView {
 			onLeave: () => this.clearHoveredControl("open"),
 			onClick: (event) => this.clickOpen(event),
 		});
+		this.closeRegion = this.pointerScope.wrap(EMPTY_COMPONENT, {
+			onHover: () => this.hoverControl("close"),
+			onLeave: () => this.clearHoveredControl("close"),
+			onClick: (event) => this.clickClose(event),
+		});
+		this.modeRegion = this.pointerScope.wrap(EMPTY_COMPONENT, {
+			onHover: () => this.hoverControl("mode"),
+			onLeave: () => this.clearHoveredControl("mode"),
+			onClick: (event) => this.clickMode(event),
+		});
 		this.refreshTasks();
 		this.unsubscribeSummary = deps.store.subscribeSummary(() => {
 			this.clearFooterLayout();
@@ -225,9 +205,12 @@ export class AgentsView {
 	}
 
 	dispose(): void {
+		this.closed = true;
 		this.pointerLayout = undefined;
 		this.pointerScope.dispose();
 		this.unsubscribeTask?.();
+		this.unsubscribeTask = undefined;
+		this.subscribedTaskId = undefined;
 		this.unsubscribeSummary();
 	}
 
@@ -236,73 +219,128 @@ export class AgentsView {
 	}
 
 	selectedTask(): TaskRecord | undefined {
-		return this.tasks[this.selected];
+		return this.tasks.find((task) => `task:${task.id}` === this.selectedId);
 	}
 
 	handleInput(data: string): void {
-		if (matchesKey(data, Key.escape) || data === "q") {
-			this.deps.onClose();
+		if (this.closed) return;
+		if (data === "q") return this.close();
+		if (matchesKey(data, Key.escape)) return this.back();
+		if (data === "F" && !this.isNarrow()) {
+			this.setNarrowView(this.narrowView === "list" ? "details" : "list");
 			return;
 		}
-		const task = this.selectedTask();
-		if (data === "j" || matchesKey(data, Key.down)) this.select(this.selected + 1);
-		else if (data === "k" || matchesKey(data, Key.up)) this.select(this.selected - 1);
+		if ((data === "\t" || matchesKey(data, Key.enter)) && this.isNarrow()) {
+			if (this.narrowView === "details") this.back();
+			else this.activate();
+			return;
+		}
+		const rows = this.visibleRows();
+		const selected = this.selectedRow(rows);
+		const task = this.actionableTask();
+		const index = selected ? rows.findIndex((row) => row.id === selected.id) : -1;
+		if (this.narrowView === "details" && (data === "j" || data === "k" || matchesKey(data, Key.down) || matchesKey(data, Key.up))) {
+			this.scrollBy(data === "j" || matchesKey(data, Key.down) ? 1 : -1);
+			return;
+		}
+		if (data === "j" || matchesKey(data, Key.down)) this.select(index + 1, rows);
+		else if (data === "k" || matchesKey(data, Key.up)) this.select(index - 1, rows);
+		else if (matchesKey(data, Key.left) && selected?.kind === "heading") this.setExpanded(selected.group, false);
+		else if (matchesKey(data, Key.right) && selected?.kind === "heading") this.setExpanded(selected.group, true);
 		else if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.ctrl("j"))) this.scrollBy(this.pageRows());
 		else if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.ctrl("k"))) this.scrollBy(-this.pageRows());
-		else if (data === "f") {
+		else if (data === "f" && task) {
 			this.follow = true;
 			this.deps.requestRender();
 		} else if (data === "a" && this.deps.sessionId !== undefined) this.toggleScope();
 		else if ((data === "s" || data === "c") && task && this.canCancel(task)) this.deps.onCancel(task);
-		else if ((data === "o" || matchesKey(data, Key.enter)) && this.canOpen(task)) this.deps.onOpen(task!);
+		else if ((data === "o" || matchesKey(data, Key.enter)) && task && this.canOpen(task)) this.deps.onOpen(task);
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (this.closed) return undefined;
+		const live = this.layout(event.width);
+		const liveHeight = live.mode === "fallback" ? Math.min(1, live.height) : live.height;
+		if (event.width !== live.width || event.height !== liveHeight) return undefined;
 		const layout = this.pointerLayout;
-		if (!layout || event.width !== layout.width || event.height !== layout.height || event.x < 0 || event.y < 0 || event.x >= layout.width || event.y >= layout.height) return undefined;
+		if (!layout || (layout.sourceHeight !== undefined && layout.sourceHeight !== live.height) || event.width !== layout.width || event.height !== layout.height || live.mode !== layout.mode || layout.narrowView !== this.narrowView || event.x < 0 || event.y < 0 || event.x >= layout.width || event.y >= layout.height) return undefined;
+		if (event.y === 0) {
+			if (this.isInButton(event.x, layout.modeButton)) return this.modeRegion.handleMouse(event);
+			if (this.isInButton(event.x, layout.closeButton)) return this.closeRegion.handleMouse(event);
+		}
 		if (event.y >= 1 && event.y < 1 + layout.bodyRows) {
 			const row = event.y - 1;
-			if (event.x >= layout.listX && event.x < layout.listX + layout.listWidth) {
+			if (layout.mode === "narrow" && event.x >= layout.listX && event.x < layout.listX + layout.listWidth) {
+				if (event.type === "wheel") return this.narrowView === "list" ? this.listRegion.handleMouse(event) : this.threadRegion.handleMouse(event);
+				const visible = this.narrowView === "list" ? this.visibleRows()[this.listScroll + row] : undefined;
+				return visible ? this.taskRegion(row).handleMouse(event) : undefined;
+			}
+			if (layout.mode === "panes" && event.x >= layout.listX && event.x < layout.listX + layout.listWidth) {
 				if (event.type === "wheel") return this.listRegion.handleMouse(event);
-				const task = this.tasks[this.listScroll + row];
-				return task ? this.taskRegion(row).handleMouse(event) : undefined;
+				const visible = this.visibleRows()[this.listScroll + row];
+				return visible ? this.taskRegion(row).handleMouse(event) : undefined;
 			}
-			if (event.x >= layout.threadX && event.x < layout.threadX + layout.threadWidth && event.type === "wheel") {
-				return this.threadRegion.handleMouse(event);
-			}
+			if (layout.mode === "panes" && event.x >= layout.threadX && event.x < layout.threadX + layout.threadWidth && event.type === "wheel") return this.threadRegion.handleMouse(event);
 		}
 		if (event.y === layout.footerY) {
-			if (this.isInButton(event.x, layout.followButton)) return this.followRegion.handleMouse(event);
-			if (this.isInButton(event.x, layout.openButton)) return this.openRegion.handleMouse(event);
+			for (const action of layout.actions ?? []) if (this.isInButton(event.x, action)) return action.region.handleMouse(event);
 		}
 		return undefined;
 	}
 
 	render(width: number): string[] {
+		const layout = this.layout(width);
+		this.lastRenderedWidth = layout.width;
+		if (layout.width === 0 || layout.height === 0) {
+			this.clearFooterLayout();
+			return [];
+		}
+		if (layout.mode === "fallback") {
+			this.clearFooterLayout();
+			this.closeRegion.setDisabled(false);
+			this.closeRegion.render(1);
+			this.pointerLayout = { ...layout, height: 1, sourceHeight: layout.height, narrowView: this.narrowView, closeButton: { x: 0, width: 1 } };
+			return ["×" + fit(" Close Agents", layout.width - 1)];
+		}
 		// Finished rows age out of the session scope while the overlay is open;
 		// the list is otherwise reordered only when a status changes.
 		const now = this.deps.now();
 		if (this.tasks.some((task) => !this.inScope(task, now))) this.refreshTasks();
-		if (this.pointerLayout && this.pointerLayout.width !== width) this.clearFooterLayout();
+		if (this.pointerLayout && (this.pointerLayout.width !== layout.width || this.pointerLayout.height !== layout.height || this.pointerLayout.mode !== layout.mode || this.pointerLayout.narrowView !== this.narrowView)) this.clearFooterLayout();
 		const theme = this.deps.theme;
-		const inner = width - 2;
-		const listWidth = Math.min(LIST_MAX_WIDTH, Math.floor(inner * LIST_RATIO));
-		const threadWidth = inner - listWidth - 4;
-		const rows = this.bodyRows();
-		const footerY = rows + 1;
-		this.followSelection(rows);
-		this.pointerLayout = { width, height: rows + CHROME_ROWS, listX: 2, listWidth, threadX: listWidth + 5, threadWidth, bodyRows: rows, footerY };
-		this.listRegion.render(listWidth);
-		this.threadRegion.render(threadWidth);
+		const inner = layout.width - 2;
+		const closeLabel = this.closeLabel(layout);
+		const modeLabel = this.modeLabel(layout);
+		this.closeRegion.setDisabled(closeLabel === undefined);
+		this.modeRegion.setDisabled(modeLabel === undefined);
+		this.followSelection(layout.bodyRows);
+		const closeWidth = visibleWidth(closeLabel ?? "");
+		const modeWidth = visibleWidth(modeLabel ?? "");
+		const closeX = layout.width - 1 - closeWidth;
+		this.pointerLayout = {
+			...layout,
+			narrowView: this.narrowView,
+			closeButton: closeLabel ? { x: closeX, width: closeWidth } : undefined,
+			modeButton: modeLabel ? { x: closeX - modeWidth - 1, width: modeWidth } : undefined,
+		};
+		this.listRegion.render(layout.listWidth);
+		this.threadRegion.render(layout.threadWidth);
+		if (closeLabel) this.closeRegion.render(closeWidth);
+		if (modeLabel) this.modeRegion.render(modeWidth);
 		const scope = this.deps.sessionId === undefined ? "" : `${SCOPE_LABEL[this.scope]} · `;
-		const title = `❀ Agents · ${scope}${this.counts()}`;
-		const top = theme.fg(ROLE.FRAME, "╭─ ") + theme.fg(ROLE.TITLE, title) + theme.fg(ROLE.FRAME, ` ${rule(inner - visibleWidth(title) - 3)}╮`);
-		const right = this.threadWindow(rows, threadWidth);
+		const controlsWidth = (closeLabel ? closeWidth + 1 : 0) + (modeLabel ? modeWidth + 1 : 0);
+		const title = truncateToWidth(`❀ Agents · ${scope}${this.counts()}`, Math.max(0, inner - 3 - controlsWidth), "…");
+		const mode = modeLabel ? ` ${theme.fg(this.hoveredControl === "mode" ? "warning" : ROLE.KEY, modeLabel)}` : "";
+		const close = closeLabel ? ` ${theme.fg(this.hoveredControl === "close" ? "warning" : ROLE.KEY, closeLabel)}` : "";
+		const top = theme.fg(ROLE.FRAME, "╭─ ") + theme.fg(ROLE.TITLE, title) + theme.fg(ROLE.FRAME, ` ${rule(inner - visibleWidth(title) - 3 - controlsWidth)}`) + mode + close + theme.fg(ROLE.FRAME, "╮");
+		const detail = layout.mode === "panes" || this.narrowView === "details" ? this.threadWindow(layout.bodyRows, layout.threadWidth) : [];
 		const body: string[] = [];
-		for (let row = 0; row < rows; row += 1) {
-			body.push(`${theme.fg(ROLE.FRAME, "│")} ${fit(this.taskLine(row), listWidth)} ${theme.fg(ROLE.FRAME, "│")} ${fit(right[row] ?? "", threadWidth)}${theme.fg(ROLE.FRAME, "│")}`);
+		for (let row = 0; row < layout.bodyRows; row += 1) {
+			if (layout.mode === "panes") body.push(`${theme.fg(ROLE.FRAME, "│")} ${fit(this.taskLine(row), layout.listWidth)} ${theme.fg(ROLE.FRAME, "│")} ${fit(detail[row] ?? "", layout.threadWidth)}${theme.fg(ROLE.FRAME, "│")}`);
+			else body.push(`${theme.fg(ROLE.FRAME, "│")} ${fit(this.narrowView === "list" ? this.taskLine(row) : detail[row] ?? "", layout.listWidth)} ${theme.fg(ROLE.FRAME, "│")}`);
 		}
-		const keys = this.keys().map(([key, label]) => `${theme.fg(ROLE.KEY, key)} ${theme.fg(ROLE.KEY_TEXT, label)}`).join("   ");
+		const keyHints = this.selectedRow()?.kind === "heading" ? [["←/→", "group"] as const, ...this.keys(layout.mode === "narrow")] : this.keys(layout.mode === "narrow");
+		const keys = keyHints.map(([key, label]) => `${theme.fg(ROLE.KEY, key)} ${theme.fg(ROLE.KEY_TEXT, label)}`).join("   ");
 		const footer = this.footer(keys, inner - 2);
 		const keysLine = `${theme.fg(ROLE.FRAME, "│")} ${fit(footer, inner - 2)} ${theme.fg(ROLE.FRAME, "│")}`;
 		return [top, ...body, keysLine, theme.fg(ROLE.FRAME, `╰${rule(inner)}╯`)];
@@ -317,6 +355,10 @@ export class AgentsView {
 		return `${active} active · ${this.tasks.length - active} finished`;
 	}
 
+	private actionableTask(): TaskRecord | undefined {
+		return this.isNarrow() && !this.narrowGroup && this.narrowView === "list" ? undefined : this.selectedTask();
+	}
+
 	private canCancel(task: TaskRecord): boolean {
 		return !isFinished(task.status) && (this.deps.canCancel?.(task) ?? true);
 	}
@@ -325,21 +367,26 @@ export class AgentsView {
 		return Boolean(task?.sessionPath);
 	}
 
-	private keys(): ReadonlyArray<readonly [string, string]> {
-		const task = this.selectedTask();
+	private keys(narrow = false): ReadonlyArray<readonly [string, string]> {
+		const task = this.actionableTask();
+		const details = narrow && task ? [["tab", this.narrowView === "list" ? "details" : "back"]] as const : [];
 		const stop = task && this.canCancel(task) ? [["s", "Stop selected"]] as const : [];
 		const scope = this.deps.sessionId === undefined ? [] : [["a", SCOPE_KEY[this.scope]]] as const;
-		return [...KEYS.slice(0, 3), ...stop, ...scope, ...KEYS.slice(3)];
+		return [...KEYS.slice(0, 1), ...details, ...KEYS.slice(1, 3), ...stop, ...scope, ...KEYS.slice(3)];
 	}
 
 	// A new scope reads from the top: selection, list window, and thread reset.
 	private toggleScope(): void {
 		this.clearFooterLayout();
 		this.scope = this.scope === VIEW_SCOPE.SESSION ? VIEW_SCOPE.ALL : VIEW_SCOPE.SESSION;
+		this.narrowGroup = undefined;
+		this.groupCursor = undefined;
+		this.manualListOffsets.clear();
+		this.narrowView = "list";
 		this.tasks = [];
-		this.selected = 0;
+		this.selectedId = undefined;
 		this.listScroll = 0;
-		this.hovered = undefined;
+		this.hoveredId = undefined;
 		this.scroll = 0;
 		this.follow = true;
 		this.refreshTasks();
@@ -357,48 +404,172 @@ export class AgentsView {
 	// Keep the selected row inside the list window, moving the window by the
 	// least amount needed; the wheel moves the same window on its own.
 	private followSelection(rows: number): void {
-		if (this.selected < this.listScroll) this.listScroll = this.selected;
-		else if (this.selected >= this.listScroll + rows) this.listScroll = this.selected - rows + 1;
-		this.listScroll = Math.max(0, Math.min(this.listScroll, Math.max(0, this.tasks.length - rows)));
+		const manual = this.manualListOffsets.get(this.listKey());
+		if (manual !== undefined) {
+			this.listScroll = Math.min(manual, Math.max(0, this.visibleRows().length - rows));
+			return;
+		}
+		const selected = this.selectedRow();
+		const index = selected ? this.visibleRows().findIndex((row) => row.id === selected.id) : -1;
+		if (index >= 0 && index < this.listScroll) this.listScroll = index;
+		else if (index >= this.listScroll + rows) this.listScroll = index - rows + 1;
+		this.listScroll = Math.max(0, Math.min(this.listScroll, Math.max(0, this.visibleRows().length - rows)));
+	}
+
+	private layout(width = this.pointerLayout?.width ?? this.lastRenderedWidth ?? 80): AgentsViewLayout {
+		const rows = typeof this.deps.rows === "function" ? this.deps.rows() : this.deps.rows;
+		return measureAgentsViewLayout(width, rows, this.narrowView === "details");
+	}
+
+	private listKey(): string {
+		return this.isNarrow() ? this.narrowGroup ?? "root" : "panes";
+	}
+
+	private isNarrow(): boolean {
+		return measureAgentsViewLayout(this.lastRenderedWidth ?? 80, 3).mode !== "panes";
+	}
+
+	private back(): void {
+		if (this.narrowView === "details") this.setNarrowView("list");
+		else if (this.isNarrow() && this.narrowGroup) {
+			this.groupCursor = `heading:${this.narrowGroup}`;
+			this.narrowGroup = undefined;
+			this.listScroll = 0;
+			this.clearFooterLayout();
+			this.deps.requestRender();
+		} else this.close();
+	}
+
+	private activate(): void {
+		const selected = this.selectedRow();
+		if (selected?.kind === "heading" && this.isNarrow()) {
+			this.narrowGroup = selected.group.id;
+			this.listScroll = 0;
+			const children = this.visibleRows();
+			if (!children.some((row) => row.id === this.selectedId)) this.select(0, children);
+			this.clearFooterLayout();
+			this.deps.requestRender();
+		} else if (this.selectedTask()) this.setNarrowView("details");
 	}
 
 	private bodyRows(): number {
-		return Math.max(MIN_BODY_ROWS, this.deps.rows - CHROME_ROWS);
+		return this.layout().bodyRows;
 	}
 
 	private refreshTasks(): void {
-		const selectedId = this.tasks[this.selected]?.id;
 		const now = this.deps.now();
 		this.tasks = this.deps.store.list().filter((task) => this.inScope(task, now));
-		const index = this.tasks.findIndex((task) => task.id === selectedId);
-		this.selected = index === -1 ? Math.max(0, Math.min(this.selected, this.tasks.length - 1)) : index;
-		this.listScroll = Math.max(0, Math.min(this.listScroll, Math.max(0, this.tasks.length - this.bodyRows())));
-		if (this.hovered !== undefined && !this.tasks[this.hovered]) this.hovered = undefined;
-		if (index === -1) this.subscribeSelected();
+		const rows = this.allRows();
+		if (this.narrowGroup && !this.sessionGroups().some((group) => group.id === this.narrowGroup)) this.narrowGroup = undefined;
+		if (!this.selectedId || (!this.selectedTask() && !rows.some((row) => row.id === this.selectedId))) {
+			this.selectedId = rows.find((row) => row.kind === "task")?.id ?? rows[0]?.id;
+		}
+		if (!this.selectedTask()) this.narrowView = "list";
+		this.listScroll = Math.max(0, Math.min(this.listScroll, Math.max(0, rows.length - this.bodyRows())));
+		if (this.hoveredId && !rows.some((row) => row.id === this.hoveredId)) this.hoveredId = undefined;
+		this.subscribeSelected();
+	}
+
+	private sessionGroups(): SessionGroup[] {
+		const groups = new Map<string, SessionGroup>();
+		for (const task of this.tasks) {
+			const sessionId = task.parentSessionId.trim() || undefined;
+			const id = sessionId ? `session:${sessionId}` : `unknown:${task.id}`;
+			const group = groups.get(id) ?? { id, sessionId, tasks: [] };
+			if (!groups.has(id)) groups.set(id, group);
+			group.tasks.push(task);
+		}
+		return [...groups.values()];
+	}
+
+	private visibleRows(): VisibleRow[] {
+		if (!this.isNarrow()) return this.allRows();
+		const groups = this.sessionGroups();
+		if (!this.narrowGroup) return groups.map((group) => ({ id: `heading:${group.id}`, kind: "heading", group }));
+		const group = groups.find((entry) => entry.id === this.narrowGroup);
+		return group?.tasks.map((task) => ({ id: `task:${task.id}`, kind: "task", group, task })) ?? [];
+	}
+
+	private allRows(): VisibleRow[] {
+		const rows: VisibleRow[] = [];
+		for (const group of this.sessionGroups()) {
+			rows.push({ id: `heading:${group.id}`, kind: "heading", group });
+			if (this.isExpanded(group)) {
+				for (const task of group.tasks) rows.push({ id: `task:${task.id}`, kind: "task", group, task });
+			}
+		}
+		return rows;
+	}
+
+	private selectedRow(rows = this.visibleRows()): VisibleRow | undefined {
+		if (this.isNarrow() && !this.narrowGroup && this.narrowView === "list") return rows.find((row) => row.id === this.groupCursor) ?? rows[0];
+		return rows.find((row) => row.id === this.selectedId);
+	}
+
+	private isExpanded(group: SessionGroup): boolean {
+		return this.expanded.get(group.id) ?? group.tasks.some((task) => !isFinished(task.status));
+	}
+
+	private setExpanded(group: SessionGroup, expanded: boolean): void {
+		if (this.isExpanded(group) === expanded) return;
+		this.expanded.set(group.id, expanded);
+		if (!expanded) {
+			this.selectedId = `heading:${group.id}`;
+			this.narrowView = "list";
+		}
+		this.listScroll = Math.min(this.listScroll, Math.max(0, this.visibleRows().length - this.bodyRows()));
+		this.clearFooterLayout();
+		this.subscribeSelected();
+		this.deps.requestRender();
 	}
 
 	private subscribeSelected(): void {
-		this.unsubscribeTask?.();
 		const task = this.selectedTask();
-		this.unsubscribeTask = task ? this.deps.store.subscribe(task.id, () => {
+		if (task?.id === this.subscribedTaskId) return;
+		this.unsubscribeTask?.();
+		this.unsubscribeTask = undefined;
+		this.subscribedTaskId = task?.id;
+		if (!task) return;
+		this.unsubscribeTask = this.deps.store.subscribe(task.id, () => {
 			this.clearFooterLayout();
 			this.refreshTasks();
 			this.deps.requestRender();
-		}) : undefined;
+		});
 	}
 
 	private taskLine(row: number): string {
-		if (this.tasks.length === 0) return row === 0 ? this.deps.theme.fg(ROLE.EMPTY, EMPTY_LIST) : "";
-		const index = this.listScroll + row;
-		const task = this.tasks[index];
-		if (!task) return "";
+		const visible = this.visibleRows();
+		if (visible.length === 0) return row === 0 ? this.deps.theme.fg(ROLE.EMPTY, EMPTY_LIST) : "";
+		const entry = visible[this.listScroll + row];
+		if (!entry) return "";
 		const theme = this.deps.theme;
 		this.taskRegion(row).render(this.pointerLayout?.listWidth ?? 1);
-		const marker = index === this.selected ? theme.fg(ROLE.SELECTED, "▸") : index === this.hovered ? theme.fg(ROLE.SELECTED, "▹") : " ";
-		const glyph = theme.fg(GLYPH_ROLE[task.status], GLYPH[task.status]);
-		const name = theme.fg(index === this.selected || index === this.hovered ? ROLE.NAME : ROLE.NAME_IDLE, task.agent);
+		const selected = entry.id === this.selectedRow()?.id;
+		const hovered = entry.id === this.hoveredId;
+		const emphasis = selected ? ROLE.SELECTED : hovered ? ROLE.HOVER : undefined;
+		const marker = emphasis ? theme.fg(emphasis, selected ? "▸" : "▹") : " ";
+		if (entry.kind === "heading") {
+			const state = this.isExpanded(entry.group) ? "▾" : "▸";
+			return `${marker}${theme.fg(emphasis ?? ROLE.SELECTED, state)} ${theme.fg(emphasis ?? ROLE.NAME_IDLE, this.groupHeading(entry.group))}`;
+		}
+		const task = entry.task;
+		const glyph = theme.fg(GLYPH_ROLE[task.status] ?? ROLE.META, GLYPH[task.status] ?? "?");
+		const name = theme.fg(emphasis ?? ROLE.NAME_IDLE, `Subagent ${task.agent}`);
 		const time = task.startedAt === null ? "" : theme.fg(ROLE.META, formatElapsed((task.endedAt ?? this.deps.now()) - task.startedAt));
-		return `${marker} ${glyph} ${name}  ${time}`;
+		return `${marker} ${theme.fg(ROLE.META, "└")} ${glyph} ${name}  ${time}`;
+	}
+
+	private groupHeading(group: SessionGroup): string {
+		const count = `${group.tasks.length} ${group.tasks.length === 1 ? "Subagent" : "Subagents"}`;
+		if (!this.isExpanded(group)) return `${this.groupTitle(group)} · ${count}`;
+		const active = group.tasks.filter((task) => !isFinished(task.status)).length;
+		return `${this.groupTitle(group)} · ${count} · ${active} active`;
+	}
+
+	private groupTitle(group: SessionGroup): string {
+		if (!group.sessionId) return "Unknown session";
+		if (group.sessionId === this.deps.sessionId) return "Current orchestrator";
+		return `Orchestrator ${group.sessionId.slice(0, 8)}`;
 	}
 
 	private threadLines(thread: TaskThread, width: number): string[] {
@@ -411,7 +582,7 @@ export class AgentsView {
 		for (const item of thread.items) {
 			let rendered = this.cache.get(item);
 			if (!rendered) {
-				rendered = itemLines(item, this.deps.theme, width);
+				rendered = renderThreadItem(item, this.deps.theme, width);
 				this.cache.set(item, rendered);
 			}
 			lines.push(...rendered);
@@ -421,23 +592,37 @@ export class AgentsView {
 
 	private threadWindow(rows: number, width: number): string[] {
 		const task = this.selectedTask();
-		if (!task) return [];
+		if (!task) return [this.deps.theme.fg(ROLE.EMPTY, "Select a task to inspect its thread")];
 		const theme = this.deps.theme;
 		const header = theme.fg(ROLE.META, truncateToWidth(taskHeader(task, this.deps.now()), width, "…"));
 		const lines = this.threadLines(this.deps.store.thread(task.id), width);
 		if (lines.length === 0) return [header, theme.fg(ROLE.EMPTY, task.error ?? EMPTY_THREAD)];
-		const visible = rows - 1;
+		const visible = Math.max(0, rows - 1);
 		const maxScroll = Math.max(0, lines.length - visible);
-		this.scroll = this.follow ? maxScroll : Math.min(this.scroll, maxScroll);
-		return [header, ...lines.slice(this.scroll, this.scroll + visible)];
+		if (this.follow) this.scroll = maxScroll;
+		// A taller/wider presentation may clamp its window, not the saved position.
+		const start = Math.min(this.scroll, maxScroll);
+		return [header, ...lines.slice(start, start + visible)];
 	}
 
-	private select(index: number): void {
-		const next = Math.max(0, Math.min(this.tasks.length - 1, index));
-		if (next === this.selected) return;
-		this.selected = next;
+	private select(index: number, rows = this.visibleRows(), revealSelection = true): void {
+		const next = rows[Math.max(0, Math.min(rows.length - 1, index))];
+		if (!next) return;
+		// Keyboard movement reveals the selection; pointer activation keeps the
+		// manually positioned list available for Back, even after height clamping.
+		if (revealSelection) this.manualListOffsets.delete(this.listKey());
+		if (this.isNarrow() && !this.narrowGroup) {
+			this.groupCursor = next.id;
+			this.clearFooterLayout();
+			this.deps.requestRender();
+			return;
+		}
+		if (next.id === this.selectedId) return;
+		this.selectedId = next.id;
+		if (next.kind === "heading") this.narrowView = "list";
 		this.scroll = 0;
 		this.follow = true;
+		this.clearFooterLayout();
 		this.subscribeSelected();
 		this.deps.requestRender();
 	}
@@ -460,34 +645,90 @@ export class AgentsView {
 	}
 
 	private footer(keys: string, width: number): string {
-		const showButtons = visibleWidth(keys) + FOOTER_BUTTONS_WIDTH + 1 <= width;
-		const task = this.selectedTask();
-		this.followRegion.setDisabled(!showButtons || !task);
-		this.openRegion.setDisabled(!showButtons || !this.canOpen(task));
-		if (!showButtons) return keys;
-		this.followRegion.render(FOLLOW_BUTTON.length);
-		this.openRegion.render(OPEN_BUTTON.length);
-		const buttonX = 2 + width - FOOTER_BUTTONS_WIDTH;
-		if (this.pointerLayout) {
-			this.pointerLayout.followButton = { x: buttonX, width: FOLLOW_BUTTON.length };
-			this.pointerLayout.openButton = { x: buttonX + FOLLOW_BUTTON.length + 1, width: OPEN_BUTTON.length };
+		const task = this.actionableTask();
+		const controls = [
+			{ label: FOLLOW_BUTTON, short: "Follow", region: this.followRegion, enabled: Boolean(task) },
+			{ label: OPEN_BUTTON, short: "Open", region: this.openRegion, enabled: this.canOpen(task) },
+		];
+		if (task && this.canCancel(task)) controls.push({ label: STOP_BUTTON, short: "Stop", region: this.actionRegion("stop", () => this.handleInput("s")), enabled: true });
+		if (this.deps.sessionId !== undefined) controls.push({ label: SCOPE_BUTTON, short: "Scope", region: this.actionRegion("scope", () => this.toggleScope()), enabled: true });
+		for (const control of controls) control.region.setDisabled(!control.enabled);
+		const required = controls.reduce((sum, control) => sum + control.label.length + 1, -1);
+		const shown = required <= width ? controls : [controls[this.footerPage % controls.length]];
+		const actions: NonNullable<PointerLayout["actions"]> = [];
+		let text = "";
+		for (const control of shown) {
+			const label = required <= width ? control.label : control.short;
+			if (text) text += " ";
+			actions.push({ x: 2 + visibleWidth(text), width: label.length, region: control.region });
+			control.region.render(label.length);
+			const hovered = (control.region === this.followRegion && this.hoveredControl === "follow") || (control.region === this.openRegion && this.hoveredControl === "open");
+			text += this.deps.theme.fg(!control.enabled ? ROLE.META : hovered ? ROLE.HOVER : ROLE.KEY, label);
 		}
-		const followRole = task && this.hoveredControl === "follow" ? "warning" : task ? ROLE.KEY : ROLE.META;
-		const openRole = this.canOpen(task) && this.hoveredControl === "open" ? "warning" : this.canOpen(task) ? ROLE.KEY : ROLE.META;
-		return `${fit(keys, width - FOOTER_BUTTONS_WIDTH - 1)} ${this.deps.theme.fg(followRole, FOLLOW_BUTTON)} ${this.deps.theme.fg(openRole, OPEN_BUTTON)}`;
+		if (required > width) {
+			const more = this.actionRegion("more", () => {
+				this.footerPage++;
+				this.clearFooterLayout();
+				this.deps.requestRender();
+			});
+			more.render(1);
+			actions.push({ x: 2 + width - 1, width: 1, region: more });
+			text = fit(text, width - 1) + ">";
+		} else if (visibleWidth(text) + 1 < width) text += " " + truncateToWidth(keys, width - visibleWidth(text) - 1, "…");
+		if (this.pointerLayout) this.pointerLayout.actions = actions;
+		return text;
+	}
+
+	private actionRegion(id: string, action: () => void): NativePointerRegion {
+		let region = this.actionRegions.get(id);
+		if (!region) {
+			region = this.pointerScope.wrap(EMPTY_COMPONENT, {
+				onClick: (event) => {
+					if (event.button !== "left") return undefined;
+					action();
+					return { handled: true, render: true };
+				},
+			});
+			this.actionRegions.set(id, region);
+		}
+		return region;
+	}
+
+	private modeLabel(layout: AgentsViewLayout): string | undefined {
+		if (this.narrowView === "details" || (this.isNarrow() && this.narrowGroup)) return layout.width < 24 ? "←" : "[← Back]";
+		return !this.isNarrow() && this.selectedTask() ? "[F Fullscreen]" : undefined;
+	}
+
+	private closeLabel(layout: AgentsViewLayout): string | undefined {
+		if (layout.mode === "fallback") return undefined;
+		return layout.width < 60 ? "[×]" : CLOSE_BUTTON;
+	}
+
+	private setNarrowView(view: "list" | "details"): void {
+		if (view === this.narrowView || (view === "details" && !this.selectedTask())) return;
+		this.narrowView = view;
+		this.clearFooterLayout();
+		this.deps.requestRender();
+	}
+
+	private close(): void {
+		if (this.closed) return;
+		this.closed = true;
+		this.pointerScope.invalidate();
+		this.deps.onClose();
 	}
 
 	private isInButton(x: number, button: PointerButtonLayout | undefined): boolean {
 		return button !== undefined && x >= button.x && x < button.x + button.width;
 	}
 
-	private hoverControl(control: "follow" | "open"): TuiMouseEventResult {
+	private hoverControl(control: "follow" | "open" | "close" | "mode"): TuiMouseEventResult {
 		if (this.hoveredControl === control) return { handled: true };
 		this.hoveredControl = control;
 		return { handled: true, render: true };
 	}
 
-	private clearHoveredControl(control: "follow" | "open"): void {
+	private clearHoveredControl(control: "follow" | "open" | "close" | "mode"): void {
 		if (this.hoveredControl !== control) return;
 		this.hoveredControl = undefined;
 		this.deps.requestRender();
@@ -507,6 +748,19 @@ export class AgentsView {
 		return { handled: true, render: true };
 	}
 
+	private clickClose(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (event.button !== "left") return undefined;
+		this.close();
+		return { handled: true, render: true };
+	}
+
+	private clickMode(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (event.button !== "left") return undefined;
+		if (this.narrowView === "details" || (this.isNarrow() && this.narrowGroup)) this.back();
+		else this.activate();
+		return { handled: true, render: true };
+	}
+
 	private taskRegion(row: number): NativePointerRegion {
 		let region = this.taskRegions.get(row);
 		if (!region) {
@@ -521,30 +775,39 @@ export class AgentsView {
 	}
 
 	private hoverTask(row: number): TuiMouseEventResult | undefined {
-		const index = this.listScroll + row;
-		if (!this.tasks[index] || this.hovered === index) return { handled: true };
-		this.hovered = index;
+		const entry = this.visibleRows()[this.listScroll + row];
+		if (!entry || this.hoveredId === entry.id) return { handled: true };
+		this.hoveredId = entry.id;
 		return { handled: true, render: true };
 	}
 
 	private clearHoveredTask(row: number): void {
-		if (this.hovered !== this.listScroll + row) return;
-		this.hovered = undefined;
+		const entry = this.visibleRows()[this.listScroll + row];
+		if (!entry || this.hoveredId !== entry.id) return;
+		this.hoveredId = undefined;
 		this.deps.requestRender();
 	}
 
 	private clickTask(row: number, event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		if (event.button !== "left") return undefined;
-		this.select(this.listScroll + row);
+		const entry = this.visibleRows()[this.listScroll + row];
+		if (!entry) return undefined;
+		if (this.isNarrow()) {
+			this.select(this.listScroll + row, this.visibleRows(), false);
+			this.activate();
+		} else if (entry.kind === "heading") this.setExpanded(entry.group, !this.isExpanded(entry.group));
+		else this.select(this.listScroll + row);
 		return { handled: true, render: true };
 	}
 
 	private wheelList(event: TuiMouseEvent): TuiMouseEventResult {
 		const delta = event.wheelDelta ?? 0;
-		const next = Math.max(0, Math.min(Math.max(0, this.tasks.length - this.bodyRows()), this.listScroll + delta));
+		const next = Math.max(0, Math.min(Math.max(0, this.visibleRows().length - this.bodyRows()), this.listScroll + delta));
 		if (next === this.listScroll) return { handled: true, render: false };
 		this.listScroll = next;
-		this.hovered = undefined;
+		this.manualListOffsets.set(this.listKey(), next);
+		this.clearFooterLayout();
+		this.hoveredId = undefined;
 		return { handled: true, render: true };
 	}
 

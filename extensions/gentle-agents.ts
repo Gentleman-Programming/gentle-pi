@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { recordReviewMutation } from "../lib/review-reminder-receipt.ts";
 import { SessionWorktreeRegistry, resolveSessionWorktree, type WorktreeResolver } from "../lib/session-worktree-registry.ts";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -6,6 +7,7 @@ import os from "node:os";
 import { join, resolve } from "node:path";
 import { keyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { sidebarPart } from "../lib/shell-sidebar.ts";
 import { AGENT_MODE, discoverAgents, loadAgentsConfig, resolveAgentProfile, type AgentDefinition, type AgentMode } from "../lib/agents-config.ts";
 import { isFinished, TASK_STATUS, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
 import { AgentRunner, piCommand, type AskAnswer, type RunnerDeps, type TaskRequest } from "../lib/agents-runner.ts";
@@ -30,8 +32,6 @@ export const AGENTS_RESULT_TYPE = "gentle-agents.result";
 const COLLAPSE_KEY_DEFAULT = "ctrl+shift+a";
 const VIEW_KEY_DEFAULT = "alt+a";
 const STOP_KEY_DEFAULT = "alt+s";
-const OVERLAY_HEIGHT_RATIO = 0.8;
-const OVERLAY_MIN_ROWS = 12;
 const RENDER_COALESCE_MS = 400;
 const CLOCK_TICK_MS = 1000;
 const TOOL_PREFIX = "subagent_";
@@ -54,7 +54,7 @@ interface ToolText {
 }
 
 const defaultDeps = (env: NodeJS.ProcessEnv): AgentsDeps => ({
-	spawn: (command, args, options) => spawn(command, args, { cwd: options.cwd, env: options.env, stdio: options.stdio ?? ["pipe", "pipe", "pipe"] }),
+	spawn: (command, args, options) => spawn(command, args, { cwd: options.cwd, env: options.env, stdio: options.stdio ?? ["pipe", "pipe", "pipe"], windowsHide: true, detached: options.detached }),
 	now: () => Date.now(),
 	schedule: (fn, ms) => {
 		const timer = setTimeout(fn, ms);
@@ -264,6 +264,13 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 
 	const runner = new AgentRunner(store, loadAgentsConfig({ cwd: process.cwd(), home: deps.home, agentHome }), deps, {
 		askUser: (_taskId, ask, raw) => answerThroughUi(ui, ask, raw),
+		onSuccessfulMutation: (task, tool) => {
+			if (!sessions || !worktrees || task.parentSessionId !== activeSessionId() || !ownedTaskIds.has(task.id)) return;
+			const root = deps.resolveWorktree(tool.path, task.cwd)?.root;
+			const childRoot = deps.resolveWorktree(task.cwd, task.cwd)?.root;
+			if (!root || root !== childRoot || !worktrees.roots().includes(root)) return;
+			recordReviewMutation(pi, sessions, root, { source: "subagent", taskId: task.id, toolName: tool.toolName, toolCallId: tool.toolCallId });
+		},
 		onFinish: (task) => {
 			ownedTaskIds.delete(task.id);
 			requestRender();
@@ -354,7 +361,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				overlayHost = tui;
 				view = new AgentsView({
 					theme,
-					rows: Math.max(OVERLAY_MIN_ROWS, Math.floor(tui.terminal.rows * OVERLAY_HEIGHT_RATIO)),
+					rows: () => Math.max(0, tui.terminal.rows),
 					store,
 					sessionId: ctx.sessionManager.getSessionId() ?? "",
 					now: () => deps.now(),
@@ -372,7 +379,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				interaction.addChild(view);
 				return interaction;
 			},
-			{ overlay: true, overlayOptions: { width: "92%", anchor: "center" } },
+			{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", margin: 0, anchor: "center" } },
 		);
 		view?.dispose();
 		if (!chosen || !overlayHost) return;
@@ -412,13 +419,16 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		tickClock();
 		ui?.setWidget(AGENTS_WIDGET_KEY, (tui, theme) => {
 			host = tui;
-			return {
+			return sidebarPart(tui, "agents", {
 				render(width: number) {
 					const lines = renderAgentsCard(visibleTasks(), theme, width, deps.now(), { collapsed, collapseKey, maxRows: widgetRows(tui.terminal?.rows), viewKey });
 					return lines.length === 0 ? [] : [...lines, ""];
 				},
 				invalidate() {},
-			};
+			}, {
+				render: (width) => renderAgentsCard(visibleTasks(), theme, width, deps.now(), { collapsed, collapseKey, viewKey }),
+				invalidate() {},
+			});
 		});
 	};
 
@@ -603,6 +613,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 
 	pi.on("session_start", (_event, ctx) => { registryFor(ctx); showWidget(ctx); });
 	pi.on("session_shutdown", () => {
+		sessions = undefined;
 		worktrees?.close();
 		worktrees = undefined;
 		runner.cancelAll();

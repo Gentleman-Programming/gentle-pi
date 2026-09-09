@@ -528,6 +528,8 @@ async function countPackageExtensions(packages: unknown[]): Promise<number> {
 }
 
 export default function (pi: ExtensionAPI) {
+  let disposeHeader = () => {};
+  pi.on("session_shutdown", () => disposeHeader());
   const notifyBannerConfig = (ctx: any, config: BannerConfig) => {
     ctx.ui.notify(
       [
@@ -597,6 +599,7 @@ export default function (pi: ExtensionAPI) {
   registerColorCommand("gentle:banner-color");
 
   pi.on("session_start", async (_event, ctx) => {
+    disposeHeader();
     if (!ctx.hasUI) return;
 
     // Si se está ejecutando un comando de CLI como "pi update" o "pi install", no mostramos la intro animada.
@@ -607,16 +610,13 @@ export default function (pi: ExtensionAPI) {
 
     if (currentIntroMode() === "skip") return;
 
-    // Fire-and-forget: el setup geométrico de cada letra corre en background
-    // para que la animación arranque en el primer frame sin bloquear el event loop.
-    void warmupLetterStrokes();
-
-    process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
-
+    // Pi has already started its renderer. Let setHeader schedule the paint;
+    // clearing stdout here would leave its previous-frame cache out of sync.
     const bannerConfig = await readBannerConfig();
     const palette = BANNER_PALETTES[bannerConfig.color];
     const roseBase = padLines(normalizeAscii(ROSE_LARGE_RAW));
     const logoBase = padLines(TEXT_LOGO);
+    void warmupLetterStrokes();
 
     let gitBranch = "Not a git repo";
     let mcpServersCount = 0;
@@ -637,7 +637,8 @@ export default function (pi: ExtensionAPI) {
           const b = stdout.trim();
           gitBranch = b ? `On branch ${b}` : "Detached HEAD";
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => refreshStats());
     }, 100);
 
     setTimeout(() => {
@@ -652,6 +653,7 @@ export default function (pi: ExtensionAPI) {
         } catch {
           mcpServersCount = 0;
         }
+        refreshStats();
       })();
     }, 150);
 
@@ -671,10 +673,12 @@ export default function (pi: ExtensionAPI) {
           extensionsCount = 0;
           packagesCount = 0;
         }
+        refreshStats();
       })();
     }, 200);
 
     let tick = 0;
+    let refreshStats = () => {};
     const state = {
       timer: null as NodeJS.Timeout | null,
       mode: currentIntroMode() as IntroMode,
@@ -683,6 +687,7 @@ export default function (pi: ExtensionAPI) {
     };
 
     const cleanup = () => {
+      refreshStats = () => {};
       if (state.timer) {
         clearInterval(state.timer);
         state.timer = null;
@@ -697,27 +702,21 @@ export default function (pi: ExtensionAPI) {
       }
     };
 
+    disposeHeader = cleanup;
     setTimeout(() => {
       ctx.ui.setHeader((tui, theme) => {
         if (state.timer) clearInterval(state.timer);
 
+        refreshStats = () => tui.requestRender();
         const animStart = Date.now();
-        const HARD_TIMEOUT_MS = 5000;
-
         state.timer = setInterval(() => {
           tick++;
-          const elapsed = Date.now() - animStart;
-          const finishedAnimation =
-            allStrokesReady() && tick > WRITING_END_TICK + 22;
-          if (finishedAnimation || elapsed > HARD_TIMEOUT_MS) {
-            cleanup();
-            return;
+          const finished = allStrokesReady() && tick > WRITING_END_TICK + 22;
+          if (finished || Date.now() - animStart > 5000) {
+            clearInterval(state.timer!);
+            state.timer = null;
           }
-          try {
-            tui.requestRender();
-          } catch {
-            cleanup();
-          }
+          try { tui.requestRender(); } catch { cleanup(); }
         }, 25);
 
         // Grace period: pi-tui emite resizes transitorios mientras compone su layout inicial.
@@ -730,11 +729,7 @@ export default function (pi: ExtensionAPI) {
             const next = currentIntroMode();
             if (next === state.mode) return;
             state.mode = next;
-            if (next === "skip") {
-              cleanup();
-              process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
-              return;
-            }
+            // Pi owns removal in skip mode; keep listening for later expansion.
             try {
               tui.requestRender();
             } catch {
@@ -758,9 +753,9 @@ export default function (pi: ExtensionAPI) {
             const frame = Math.floor(tick / 2);
 
             const sideBySideMinWidth = roseBase.width + 3 + logoBase.width + 4;
-            const wideStatsMinWidth = 122;
             const horizontal =
               state.mode === "full" && bannerConfig.showRose && bannerConfig.showTextLogo && width >= sideBySideMinWidth;
+            const wideStatsMinWidth = 122;
             const wideStats = width >= wideStatsMinWidth;
 
             const b = new LayoutBuilder();
@@ -772,52 +767,27 @@ export default function (pi: ExtensionAPI) {
                 const logoLine = logoBase.lines[logoI];
                 b.addRow();
                 b.lines[b.lines.length - 1].push(
-                  ...buildPenLogoLine(
-                    logoLine,
-                    logoI,
-                    logoBase.lines.length,
-                    tick,
-                  ),
+                  ...buildPenLogoLine(logoLine, logoI, logoBase.lines.length, tick),
                 );
                 b.center(width);
               }
             } else if (horizontal) {
-              const rowCount = Math.max(
-                roseBase.lines.length,
-                logoBase.lines.length,
-              );
-              const roseOffset = Math.max(
-                0,
-                Math.floor((rowCount - roseBase.lines.length) / 2),
-              );
-              const logoOffset = Math.max(
-                0,
-                Math.floor((rowCount - logoBase.lines.length) / 2),
-              );
-
+              const rowCount = Math.max(roseBase.lines.length, logoBase.lines.length);
+              const roseOffset = Math.max(0, Math.floor((rowCount - roseBase.lines.length) / 2));
+              const logoOffset = Math.max(0, Math.floor((rowCount - logoBase.lines.length) / 2));
               for (let i = 0; i < rowCount; i++) {
                 const roseI = i - roseOffset;
                 const logoI = i - logoOffset;
-                const roseLine =
-                  roseI >= 0 && roseI < roseBase.lines.length
-                    ? roseBase.lines[roseI]
-                    : " ".repeat(roseBase.width);
-                const logoLine =
-                  logoI >= 0 && logoI < logoBase.lines.length
-                    ? logoBase.lines[logoI]
-                    : " ".repeat(logoBase.width);
-
+                const roseLine = roseI >= 0 && roseI < roseBase.lines.length
+                  ? roseBase.lines[roseI] : " ".repeat(roseBase.width);
+                const logoLine = logoI >= 0 && logoI < logoBase.lines.length
+                  ? logoBase.lines[logoI] : " ".repeat(logoBase.width);
                 b.addRow();
                 b.add("rose", roseLine);
                 b.add("none", "   ");
                 if (logoI >= 0 && logoI < logoBase.lines.length) {
                   b.lines[b.lines.length - 1].push(
-                    ...buildPenLogoLine(
-                      logoLine,
-                      logoI,
-                      logoBase.lines.length,
-                      tick,
-                    ),
+                    ...buildPenLogoLine(logoLine, logoI, logoBase.lines.length, tick),
                   );
                 } else {
                   b.add("none", " ".repeat(logoBase.width));
@@ -832,12 +802,7 @@ export default function (pi: ExtensionAPI) {
                   const logoLine = logoBase.lines[logoI];
                   b.addRow();
                   b.lines[b.lines.length - 1].push(
-                    ...buildPenLogoLine(
-                      logoLine,
-                      logoI,
-                      logoBase.lines.length,
-                      tick,
-                    ),
+                    ...buildPenLogoLine(logoLine, logoI, logoBase.lines.length, tick),
                   );
                   b.center(width);
                 }

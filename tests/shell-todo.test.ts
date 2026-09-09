@@ -180,6 +180,53 @@ test("renderTodoCard keeps the configured collapse shortcut in the header while 
 	assert.deepEqual(renderTodoCard(emptyTodo(), plainTheme, 70, { collapsed: false, staleTurns: 0 }), []);
 });
 
+test("completed titles strike only title cells across wrapped lines, never padding or rails", () => {
+	const theme = {
+		fg: (_color: string, text: string) => `\x1b[32m${text}\x1b[39m`,
+		strikethrough: (text: string) => `\x1b[9m${text}\x1b[29m`,
+	};
+	const state = applyTodo(emptyTodo(), { action: "write", tasks: [
+		{ title: "Alpha beta gamma delta epsilon", status: "done" },
+		{ title: "Pending", status: "pending" },
+	] }, 1).state;
+	for (const width of [12, 20, 60]) {
+		const lines = renderTodoCard(state, theme, width, { collapsed: false, staleTurns: 0 });
+		let struckLetters = "";
+		for (const line of lines) {
+			let strike = false, column = 0;
+			const plain = stripAnsi(line);
+			const titleEnd = plain.slice(0, -1).trimEnd().length;
+			for (const token of line.match(/\x1b\[[\d;]*m|[^\x1b]/gu) ?? []) {
+				if (token.startsWith("\x1b")) {
+					for (const code of token.slice(2, -1).split(";").map(Number)) {
+						if (code === 0 || code === 29) strike = false;
+						if (code === 9) strike = true;
+					}
+				} else {
+					if (column < 2 || column >= titleEnd || /[│╭╮╰╯─✓]/u.test(token)) assert.equal(strike, false, `struck frame/padding: ${JSON.stringify(line)}`);
+					if (strike && /[A-Za-z]/.test(token)) struckLetters += token;
+					column += visibleWidth(token);
+				}
+			}
+			assert.equal(strike, false, "SGR 9 must close before the host appends padding");
+			assert.equal(visibleWidth(line), width);
+		}
+		assert.equal(struckLetters, "Alphabetagammadeltaepsilon");
+	}
+});
+
+test("renderTodoCard keeps stale indicators and collapse hints in scrollable lists", () => {
+	const tasks = Array.from({ length: 40 }, (_, index) => ({ title: `Task ${index + 1}`, status: index < 25 ? "done" : "pending" }));
+	const state = applyTodo(emptyTodo(), { action: "write", tasks }, 1).state;
+	const lines = renderTodoCard(state, plainTheme, 70, { scrollable: true, collapsed: false, staleTurns: 2, collapseKey: "alt+t" }).map(stripAnsi);
+	assert.equal(lines.length, 43, "top rule, stale row, every task, bottom rule");
+	assert.match(lines[0], /^╭─ ❀ Todos · 25 of 40 ─+ alt\+t collapse ╮$/);
+	assert.match(lines[1], /^│ stale · 2 turns +│$/);
+	assert.match(lines[2], /^│ ✓ ~Task 1~ +│$/);
+	assert.match(lines[41], /^│ ○ Task 40 +│$/);
+	for (const line of lines) assert.equal(visibleWidth(line), 70);
+});
+
 test("renderTodoCard uses custom shortcuts, omits disabled shortcuts, and remains width-safe when hints cannot fit", () => {
 	const custom = renderTodoCard(seeded(), plainTheme, 70, { collapsed: false, staleTurns: 2, collapseKey: "alt+t" }).map(stripAnsi);
 	assert.match(custom[0], /alt\+t collapse/);

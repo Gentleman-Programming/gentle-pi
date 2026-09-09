@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join, relative, resolve } from "node:path";
+import { pendingReviewMutation, REVIEW_REMINDER_RECEIPT } from "../lib/review-reminder-receipt.ts";
 import { SESSION_WORKTREE_ENTRY, SESSION_WORKTREE_CHANGED } from "../lib/session-worktree-registry.ts";
 import test, { after, mock } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -76,23 +78,25 @@ function fakePi() {
 	return { pi, tools, shortcuts, commands, fire, sent, renderers, entries, events };
 }
 
-function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (title: string, message: string) => Promise<boolean> = async () => true, inputResult: (title: string, placeholder: string | undefined) => Promise<string | undefined> = async () => undefined) {
+function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (title: string, message: string) => Promise<boolean> = async () => true, inputResult: (title: string, placeholder: string | undefined) => Promise<string | undefined> = async () => undefined, overlayTui: { terminal: { rows: number }; requestRender(): void } = { terminal: { rows: 30 }, requestRender() {} }) {
 	const widgets = new Map<string, (tui: unknown, theme: unknown) => { render(width: number): string[] }>();
 	const dialogs: string[] = [];
 	const overlays: Overlay[] = [];
 	const customCompletions: unknown[] = [];
+	const customOptions: unknown[] = [];
 	const ctx = {
 		hasUI: true,
 		sessionManager: { getSessionId: () => "s1", getCwd: () => cwd, getEntries: () => [] },
 		ui: {
 			notify: (message: string) => dialogs.push(`notify:${message}`),
-			custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => Overlay) =>
+			custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => Overlay, options: unknown) =>
 				new Promise((resolve) => {
+					customOptions.push(options);
 					const done = (value: unknown) => {
 						customCompletions.push(value);
 						resolve(value);
 					};
-					const component = factory({ terminal: { rows: 30 }, requestRender() {} }, plainTheme, {}, done);
+					const component = factory(overlayTui, plainTheme, {}, done);
 					overlays.push(component);
 				}),
 			setWidget(key: string, content: ((tui: unknown, theme: unknown) => { render(width: number): string[] }) | undefined) {
@@ -118,7 +122,7 @@ function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (t
 		const factory = widgets.get("gentle-agents");
 		return factory ? factory(tui, plainTheme).render(72).map(stripAnsi) : undefined;
 	};
-	return { ctx, widget, dialogs, overlays, customCompletions };
+	return { ctx, widget, dialogs, overlays, customCompletions, customOptions };
 }
 
 function deps(): { deps: Partial<AgentsDeps>; children: FakeChild[]; spawned: string[][] } {
@@ -146,6 +150,188 @@ function deps(): { deps: Partial<AgentsDeps>; children: FakeChild[]; spawned: st
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+async function shutdownAndRestoreNativeSpawn(
+	childProcess: typeof import("node:child_process"),
+	originalSpawn: typeof import("node:child_process").spawn,
+	shutdown: () => Promise<unknown>,
+): Promise<void> {
+	try {
+		await shutdown();
+	} finally {
+		childProcess.spawn = originalSpawn;
+		syncBuiltinESMExports();
+	}
+}
+
+for (const scenario of ["own", "other-root", "escaped", "sibling", "session-switch", "shutdown", "unregistered"] as const) {
+	test(`child mutation attribution through registered subagent_run: ${scenario}`, async () => {
+		const h = fakePi();
+		const d = deps();
+		const { ctx } = fakeContext();
+		let sessionId = "s1";
+		const sibling = join(root, "sibling");
+		const childRoot = scenario === "other-root" ? sibling : cwd;
+		ctx.sessionManager.getSessionId = () => sessionId;
+		ctx.sessionManager.getEntries = (() => h.entries) as typeof ctx.sessionManager.getEntries;
+		ctx.sessionManager.getBranch = (() => h.entries) as typeof ctx.sessionManager.getBranch;
+		d.deps.resolveWorktree = (path, base) => {
+			const absolute = resolve(base, path);
+			const worktree = [cwd, sibling].find((candidate) => absolute === candidate || absolute.startsWith(`${candidate}/`));
+			return worktree ? { root: worktree, commonDir: "/fixture/common" } : undefined;
+		};
+		const spawn = d.deps.spawn!;
+		d.deps.spawn = (...args) => {
+			const child = spawn(...args);
+			const on = child.on.bind(child);
+			child.on = ((event: string, listener: () => void) => {
+				if (event === "spawn" && scenario !== "unregistered") queueMicrotask(listener);
+				return on(event as "spawn", listener);
+			}) as typeof child.on;
+			return child;
+		};
+		gentleAgents(h.pi, {}, d.deps);
+		await h.fire("session_start", ctx);
+		await h.tools.get("subagent_run")!.execute("mutation", { agent: "explore", task: "Write", mode: "background", workspace_root: childRoot }, undefined, undefined, ctx);
+		await tick();
+		assert.equal(h.entries.filter((entry) => entry.customType === REVIEW_REMINDER_RECEIPT).length, 0, "spawn alone is not ownership");
+		if (scenario === "session-switch") sessionId = "s2";
+		if (scenario === "shutdown") await h.fire("session_shutdown", ctx);
+		const path = scenario === "escaped" ? "../../outside.ts" : scenario === "sibling" ? join(sibling, "file.ts") : "file.ts";
+		d.children[0].emit({ type: "tool_execution_start", toolCallId: "write", toolName: "write", args: { path } });
+		d.children[0].emit({ type: "tool_execution_end", toolCallId: "write", isError: false, result: { content: [] } });
+		const accepted = scenario === "own" || scenario === "other-root";
+		assert.equal(h.entries.filter((entry) => entry.customType === REVIEW_REMINDER_RECEIPT).length, accepted ? 1 : 0);
+		assert.equal(Boolean(pendingReviewMutation(ctx.sessionManager, cwd)), scenario === "own", "another registered root never authorizes current-root STATUS");
+		if (scenario === "other-root") assert.ok(pendingReviewMutation(ctx.sessionManager, sibling));
+		await h.fire("session_shutdown", ctx);
+		await tick();
+	});
+}
+
+test("default Node spawn adapter launches task and background children with console-hidden, shell-free pipes", async () => {
+	const childProcess = createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process");
+	const originalSpawn = childProcess.spawn;
+	const captured: Array<{ command: string; args: readonly string[]; options: Record<string, unknown> }> = [];
+	const children: FakeChild[] = [];
+	const shutdown: Array<() => Promise<void>> = [];
+	childProcess.spawn = ((command: string, args: readonly string[], options: Record<string, unknown>) => {
+		captured.push({ command, args, options });
+		const child = fakeChild();
+		children.push(child);
+		return child.child;
+	}) as typeof childProcess.spawn;
+	syncBuiltinESMExports();
+	try {
+		const launch = async (mode: "task" | "background", env: NodeJS.ProcessEnv, sessionCwd = cwd) => {
+			const h = fakePi();
+			gentleAgents(h.pi, env, { home, agentHome: join(home, ".pi", "agent"), env, pi: { command: "/fixture/pi", args: ["--host-flag"] }, resolveWorktree: () => undefined });
+			const { ctx } = fakeContext();
+			(ctx.sessionManager as unknown as { getCwd(): string }).getCwd = () => sessionCwd;
+			await h.fire("session_start", ctx);
+			shutdown.push(() => h.fire("session_shutdown", ctx));
+			return { h, ctx, result: h.tools.get("subagent_run")!.execute(`spawn-${mode}`, { agent: "explore", task: `Capture ${mode}`, mode }, undefined, undefined, ctx) };
+		};
+		const task = await launch("task", { PATH: "/bin", FIXTURE: "task" });
+		await tick();
+		children[0]!.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "task complete" }] }] });
+		children[0]!.emit({ type: "agent_settled" });
+		await task.result;
+		const background = await launch("background", { PATH: "/bin", FIXTURE: "background" });
+		await background.result;
+		await tick();
+		const permission = await launch("task", { PATH: "/bin", FIXTURE: "permission" }, process.cwd());
+		await tick();
+		children[2]!.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "permission complete" }] }] });
+		children[2]!.emit({ type: "agent_settled" });
+		await permission.result;
+
+		const args = ["--host-flag", "--mode", "rpc", "--session-dir", join(home, ".pi", "agent", "gentle-agents", "sessions"), "--model", "openai-codex/gpt-5.6-terra:low", "--tools", "read,grep", "--append-system-prompt", "You map things."];
+		assert.equal(captured.length, 3, "the extension reaches Node's spawn boundary for task, background, and permission-channel launches");
+		for (const [index, fixture] of ["task", "background", "permission"].entries()) {
+			assert.equal(captured[index]?.command, "/fixture/pi");
+			assert.deepEqual(captured[index]?.args, args);
+			assert.equal(captured[index]?.options.cwd, index === 2 ? process.cwd() : cwd);
+			assert.deepEqual(captured[index]?.options.env, { PATH: "/bin", FIXTURE: fixture, GENTLE_PI_AGENTS_CHILD: "1", ...(index === 2 ? { GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" } : {}) });
+			assert.equal(captured[index]?.options.shell, undefined, "the adapter does not invoke a shell");
+			assert.equal(captured[index]?.options.windowsHide, true, "the adapter always hides a Windows console");
+			assert.equal(captured[index]?.options.detached, process.platform !== "win32", "the adapter forwards the runner's platform selection");
+		}
+		assert.deepEqual(captured[0]?.options.stdio, ["pipe", "pipe", "pipe"], "ordinary task launches receive default pipes");
+		assert.deepEqual(captured[1]?.options.stdio, ["pipe", "pipe", "pipe"], "ordinary background launches receive default pipes");
+		assert.deepEqual(captured[2]?.options.stdio, ["pipe", "pipe", "pipe", "pipe"], "the adapter preserves the runner's fourth permission fd");
+		await Promise.all(shutdown.map((close) => close()));
+		assert.deepEqual(children[1]?.killed, ["SIGTERM"], "session shutdown cleans up an active background child");
+		shutdown.length = 0;
+	} finally {
+		await shutdownAndRestoreNativeSpawn(childProcess, originalSpawn, () => Promise.all(shutdown.map((close) => close())));
+	}
+});
+
+test("native spawn interception restores CommonJS and ESM exports after rejected shutdown and assertion failure", async () => {
+	const childProcess = createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process");
+	const originalSpawn = childProcess.spawn;
+	const assertRestored = async () => {
+		assert.equal(childProcess.spawn, originalSpawn, "CommonJS spawn is restored");
+		assert.equal((await import("node:child_process")).spawn, originalSpawn, "ESM spawn is restored");
+	};
+	const installMock = () => {
+		childProcess.spawn = (() => fakeChild().child) as typeof childProcess.spawn;
+		syncBuiltinESMExports();
+	};
+	const start = async (rejectShutdown: boolean) => {
+		const h = fakePi();
+		const fire = h.fire;
+		if (rejectShutdown) {
+			h.fire = async (event, ctx, payload) => {
+				await fire(event, ctx, payload);
+				if (event === "session_shutdown") throw new Error("forced shutdown rejection");
+				return undefined;
+			};
+		}
+		gentleAgents(h.pi, {}, { home, agentHome: join(home, ".pi", "agent"), env: { PATH: "/bin" }, pi: { command: "/fixture/pi", args: [] }, resolveWorktree: () => undefined });
+		const { ctx } = fakeContext();
+		await h.fire("session_start", ctx);
+		await h.tools.get("subagent_run")!.execute("cleanup", { agent: "explore", task: "Keep cleanup live", mode: "background" }, undefined, undefined, ctx);
+		await tick();
+		return { h, ctx };
+	};
+
+	let mocked = false;
+	installMock();
+	mocked = true;
+	try {
+		const rejected = await start(true);
+		await assert.rejects(shutdownAndRestoreNativeSpawn(childProcess, originalSpawn, () => rejected.h.fire("session_shutdown", rejected.ctx)), /forced shutdown rejection/);
+		mocked = false;
+		await assertRestored();
+	} finally {
+		if (mocked) {
+			childProcess.spawn = originalSpawn;
+			syncBuiltinESMExports();
+		}
+	}
+
+	installMock();
+	mocked = true;
+	try {
+		const asserted = await start(false);
+		await assert.rejects(async () => {
+			try {
+				assert.fail("forced assertion failure");
+			} finally {
+				await shutdownAndRestoreNativeSpawn(childProcess, originalSpawn, () => asserted.h.fire("session_shutdown", asserted.ctx));
+			}
+		}, /forced assertion failure/);
+		mocked = false;
+		await assertRestored();
+	} finally {
+		if (mocked) {
+			childProcess.spawn = originalSpawn;
+			syncBuiltinESMExports();
+		}
+	}
+});
 
 test("explicit child roots launch and continue in the actual cwd, persist without shell, and reject other clones", async () => {
 	const h = fakePi();
@@ -368,11 +554,11 @@ test("subagent_list_agents and subagent_run in task mode launch a child with the
 	await tick();
 	assert.match(String(harness.children[0].written[1].message), /Map lib\/ and report every module\.\n\n## Context\nFocus on agents-\*\.ts/);
 	assert.match(widget()![0], /^╭─ ❀ Agents · 1 active ─+ \d+s ╮$/);
-	assert.match(widget()![1], /^│ ◐  explore  map lib modules +gpt-5\.6-terra · \d+s │$/);
+	assert.match(widget()![1], /^│ ◐  explore  map lib modules +gpt-5\.6-terra · low · \d+s │$/);
 	harness.children[0].emit({ type: "tool_execution_start", toolCallId: "c", toolName: "grep", args: {} });
 	harness.children[0].emit({ type: "message_end", message: { role: "assistant", usage: { totalTokens: 12_000, cost: { total: 0.09 } } } });
 	await tick();
-	assert.match(widget()![1], /◐  explore  map lib modules +gpt-5\.6-terra · 12k · \$0\.09 · \d+s │$/);
+	assert.match(widget()![1], /◐  explore  map lib modules +gpt-5\.6-terra · low · 12k · \$0\.09 · \d+s │$/);
 	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "lib has three agent files." }] }] });
 	harness.children[0].emit({ type: "agent_settled" });
 	const result = await running;
@@ -497,7 +683,7 @@ test("AgentsView production composition observes each pointer event once and acc
 	const { pi, tools, fire, commands } = fakePi();
 	const harness = deps();
 	gentleAgents(pi, {}, harness.deps);
-	const { ctx, overlays } = fakeContext();
+	const { ctx, overlays, customCompletions } = fakeContext();
 	await fire("session_start", ctx);
 
 	await tools.get("subagent_run")!.execute("b", { agent: "explore", task: "b", mode: "background" }, undefined, undefined, ctx);
@@ -538,14 +724,22 @@ test("AgentsView production composition observes each pointer event once and acc
 			return result;
 		};
 
-		assert.match(stripAnsi(overlay.render(80)[1] ?? ""), /▸/, "the first task starts selected");
-		assert.equal(dispatch(mouse("click", "right", 4, 2, 80, lines.length)), undefined, "right click is inert");
-		assert.match(stripAnsi(overlay.render(80)[1] ?? ""), /▸/, "right click cannot select another task");
-		assert.equal(dispatch(mouse("press", "left", 4, 2, 80, lines.length)), undefined, "press is inert");
-		assert.equal(dispatch(mouse("click", "middle", 4, 2, 80, lines.length)), undefined, "middle click is inert");
-		const leftClick = dispatch(mouse("click", "left", 4, 2, 80, lines.length));
-		assert.equal((leftClick as { handled?: boolean } | undefined)?.handled, true, "left click selects the task");
-		assert.match(stripAnsi(overlay.render(80)[2] ?? ""), /▸/, "left click selects the second task");
+		assert.match(stripAnsi(overlay.render(80)[1] ?? ""), /Current orchestrator/, "the parent heading is the first visible row");
+		assert.doesNotMatch(stripAnsi(overlay.render(80)[1] ?? ""), /▸/, "the heading is not a selected task");
+		assert.match(stripAnsi(overlay.render(80)[2] ?? ""), /▸ └ .*Subagent/, "the first child starts selected beneath its heading");
+		overlay.handleInput("k");
+		overlay.handleInput("s");
+		overlay.handleInput("o");
+		assert.deepEqual(harness.children.map((child) => child.killed), [[], []], "heading actions never stop a child");
+		assert.deepEqual(customCompletions, [], "heading actions never open a child session");
+		overlay.handleInput("j");
+		assert.equal(dispatch(mouse("click", "right", 4, 3, 80, lines.length)), undefined, "right click is inert");
+		assert.match(stripAnsi(overlay.render(80)[2] ?? ""), /▸ └ .*Subagent/, "right click cannot select another child");
+		assert.equal(dispatch(mouse("press", "left", 4, 3, 80, lines.length)), undefined, "press is inert");
+		assert.equal(dispatch(mouse("click", "middle", 4, 3, 80, lines.length)), undefined, "middle click is inert");
+		const leftClick = dispatch(mouse("click", "left", 4, 3, 80, lines.length));
+		assert.equal((leftClick as { handled?: boolean } | undefined)?.handled, true, "left click selects a child task");
+		assert.match(stripAnsi(overlay.render(80)[3] ?? ""), /▸ └ .*Subagent/, "left click selects the second child");
 		overlay.handleInput("\x1b");
 		await opened;
 	} finally {
@@ -591,7 +785,7 @@ test("AgentsView production footer uses rendered bounds and invalidates them bef
 		let open = buttons(lines, "[ Open session ]");
 		assert.match(lines[1] ?? "", /寿司/, "a unicode task remains inside the body, not the header or footer");
 		assert.match(lines[follow.y] ?? "", /s Stop selected.*a all sessions/, "the existing stop and scope shortcuts remain beside the footer buttons");
-		assert.doesNotMatch(overlay.render(44).map(stripAnsi).at(-2) ?? "", /\[ Follow \]|\[ Open session \]/, "a narrow render hides controls rather than retaining roomy bounds");
+		assert.match(overlay.render(44).map(stripAnsi).at(-2) ?? "", /\[Scope\]/, "the narrow root keeps mouse-accessible scope controls");
 		lines = overlay.render(160).map(stripAnsi);
 		follow = buttons(lines, "[ Follow ]");
 		open = buttons(lines, "[ Open session ]");
@@ -661,7 +855,8 @@ test("finished tasks are written to history, come back through resolveTask, and 
 	const overlay = overlays[0];
 	assert.ok(overlay, "the overlay component was created");
 	assert.match(stripAnsi(overlay.render(80)[0]), /^╭─ ❀ Agents · this session · 0 active · \d+ finished/);
-	assert.ok(overlay.render(80).map(stripAnsi).some((line) => /✓ explore/.test(line)), "the finished task is listed");
+	overlay.handleInput("\x1b[C");
+		assert.ok(overlay.render(80).map(stripAnsi).some((line) => /✓ Subagent explore/.test(line)), "expanding the terminal group lists its finished child");
 	overlay.handleInput("\x1b");
 	await opened;
 });
@@ -825,7 +1020,7 @@ test("the card follows the active session: after /new the earlier session's task
 	const overlay = overlays[0]!;
 	assert.match(stripAnsi(overlay.render(80)[0]), /this session · 0 active · 0 finished/, "the overlay opens on the active session");
 	overlay.handleInput("a");
-	assert.ok(overlay.render(80).map(stripAnsi).some((line) => /◐ explore/.test(line)), "all sessions still reaches the running task");
+	assert.ok(overlay.render(80).map(stripAnsi).some((line) => /◐ Subagent explore/.test(line)), "all sessions still reaches the running child");
 	overlay.handleInput("\x1b");
 	await opened;
 	sessions.sessionManager = { getSessionId: () => "s1", getCwd: () => cwd };
@@ -845,4 +1040,25 @@ test("the card caps its rows to the terminal height and says how many tasks are 
 	assert.equal(card.length, 8, "a 20-row terminal gets five card rows (four tasks and the overflow line) inside the frame, then the spacer");
 	assert.match(card[0], /2 active · 4 queued/);
 	assert.match(card[5], /^│ … 2 more · alt\+a to view +│$/);
+});
+
+test("the production overlay reads terminal rows at render time without a minimum-height override", async () => {
+	const { pi, fire, commands } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	let rows = 10;
+	const overlayTui = { terminal: { get rows() { return rows; } }, requestRender() {} };
+	const { ctx, overlays, customOptions } = fakeContext(fakeTui, async () => true, async () => undefined, overlayTui);
+	await fire("session_start", ctx);
+	const opened = commands.get("gentle:agents")!.handler("", ctx);
+	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+	const overlay = overlays[0]!;
+	assert.deepEqual(customOptions[0], { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", margin: 0, anchor: "center" } });
+	assert.equal(overlay.render(80).length, 10, "the overlay uses the full terminal height");
+	rows = 5;
+	assert.equal(overlay.render(80).length, 5, "a live terminal resize changes the production frame budget");
+	rows = 2;
+	assert.equal(overlay.render(80).length, 1, "tiny terminals retain bounded controls rather than forced chrome");
+	overlay.handleInput("\x1b");
+	await opened;
 });

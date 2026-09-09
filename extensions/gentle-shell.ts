@@ -4,7 +4,7 @@ import { execFile, spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import * as os from "node:os";
 import { join } from "node:path";
-import { renderShellBar, shellEnabled, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
+import { renderShellBar, renderShellSidebarBar, shellEnabled, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
 import { CHANGE_STATUS, WorktreeChangesTracker, renderChangesWidget, type ChangedFile, type ChangesModel, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { SessionWorktreeRegistry, SESSION_WORKTREE_CHANGED, resolveSessionWorktree, toolWorktreePath, worktreeGitEnvironment, type WorktreeResolver } from "../lib/session-worktree-registry.ts";
@@ -13,6 +13,8 @@ import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from
 import { framePromptLines, panelPainter, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
 import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, parseCodexUsage, parseUsageHeaders, UsageStore, type ProviderUsage } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
+import { sidebarPart } from "../lib/shell-sidebar.ts";
+import { installSidebar } from "../lib/shell-sidebar-layout.ts";
 
 // Gentle Shell: the visual layer gentle-pi puts on top of pi. It installs the
 // status bar, the petal prompt, the working-tree changes widget and overlay,
@@ -354,9 +356,23 @@ function showChanges(ctx: ExtensionContext, model: ChangesModel): void {
 	}
 	ctx.ui.setWidget(
 		CHANGES_WIDGET_KEY,
-		(_tui, theme) => ({
+		(tui, theme) => sidebarPart(tui, "changes", {
 			render(width: number) {
 				return renderChangesWidget(model, theme, width);
+			},
+			invalidate() {},
+		}, {
+			render(width: number) {
+				const noun = model.files.length === 1 ? "file" : "files";
+				return renderCard({
+					title: "Changes",
+					tone: CARD_TONE.INFO,
+					body: [
+						`${model.files.length} ${noun} · ${theme.fg("success", `+${model.added}`)} ${theme.fg("error", `−${model.deleted}`)}`,
+						"",
+						theme.fg("muted", `/${CHANGES_COMMAND_NAME}`),
+					],
+				}, theme, width, { expanded: true });
 			},
 			invalidate() {},
 		}),
@@ -531,7 +547,13 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		const tracker = changes;
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			renderHost = tui;
-			return createShellBarComponent(pi, ctx, tui, theme, footerData, () => tracker.model.files.length, () => usage.get(ctx.model?.provider ?? ""));
+			const bottom = createShellBarComponent(pi, ctx, tui, theme, footerData, () => tracker.model.files.length, () => usage.get(ctx.model?.provider ?? ""));
+			const part = sidebarPart(tui, "footer", bottom, {
+				render: (width) => renderShellSidebarBar(buildShellBarModel(pi, ctx, footerData, { dirty: tracker.model.files.length, usage: usage.get(ctx.model?.provider ?? "") }), theme, width),
+				invalidate() {},
+			});
+			const uninstall = installSidebar(tui, theme);
+			return { ...part, dispose() { uninstall(); part.dispose(); } };
 		});
 		void refreshUsage(ctx, true);
 		installPrompt(ctx, (created) => {

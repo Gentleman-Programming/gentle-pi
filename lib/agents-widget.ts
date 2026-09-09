@@ -6,7 +6,7 @@ import { CARD_TONE, cardInnerWidth, renderCard, type CardTheme, type CardTone } 
 // Gentle Agents widget: the card above the editor. Reads task records only
 // (status, prompt, counters, timestamps), so drawing it costs nothing per
 // event. One row per task: glyph, agent, task summary, then
-// model · tokens · cost · time right-aligned.
+// model · effort · tokens · cost · time right-aligned.
 
 export const AGENTS_GLYPH = "❀";
 
@@ -29,7 +29,7 @@ interface Columns {
 	name: number;
 	task: number;
 	meta: number;
-	withModel: boolean;
+	fullMetrics: boolean;
 }
 
 const LOOK: Record<TaskStatus, StatusLook> = {
@@ -73,6 +73,7 @@ export function formatElapsed(ms: number): string {
 }
 
 function clip(text: string, width: number): string {
+	if (width <= 0) return "";
 	if (visibleWidth(text) <= width) return text;
 	let out = "";
 	for (const char of text) {
@@ -139,9 +140,20 @@ function modelLabel(task: TaskRecord): string {
 	return id === "default" ? "" : id;
 }
 
-function meta(task: TaskRecord, now: number, withModel: boolean): string {
+function executionLabel(task: TaskRecord, width = Infinity): string {
+	const model = modelLabel(task);
+	const effort = task.thinking ?? "";
+	if (!model) return clip(effort, width);
+	if (!effort) return clip(model, width);
+	const suffix = ` · ${effort}`;
+	if (width <= visibleWidth(suffix)) return clip(`${model} · ${effort}`, width);
+	return clip(model, width - visibleWidth(suffix)) + suffix;
+}
+
+function meta(task: TaskRecord, now: number, fullMetrics: boolean): string {
 	if (task.status === TASK_STATUS.QUEUED) return "queued";
-	const parts = [withModel ? modelLabel(task) : "", task.tokens > 0 ? formatTokens(task.tokens) : "", task.cost > 0 ? `$${task.cost.toFixed(2)}` : "", elapsed(task, now)];
+	if (!fullMetrics) return executionLabel(task);
+	const parts = [executionLabel(task), task.tokens > 0 ? formatTokens(task.tokens) : "", task.cost > 0 ? `$${task.cost.toFixed(2)}` : "", elapsed(task, now)];
 	return parts.filter((part) => part.length > 0).join(" · ");
 }
 
@@ -151,23 +163,30 @@ function taskText(task: TaskRecord): string {
 	return task.label;
 }
 
-// Narrow cards give up the task column first, then the model label.
+// Narrow cards give up the task and usage columns before execution metadata.
 function columns(tasks: readonly TaskRecord[], inner: number, now: number): Columns {
-	const name = Math.min(NAME_MAX, Math.max(...tasks.map((task) => visibleWidth(task.agent))));
+	const name = Math.max(0, Math.min(NAME_MAX, inner - 3, Math.max(...tasks.map((task) => visibleWidth(task.agent)))));
 	const fixed = 1 + GLYPH_GAP.length + name + COLUMN_GAP.length;
-	const metaWidth = (withModel: boolean) => Math.max(...tasks.map((task) => visibleWidth(meta(task, now, withModel))));
+	const metaWidth = (fullMetrics: boolean) => Math.max(...tasks.map((task) => visibleWidth(meta(task, now, fullMetrics))));
 	const full = metaWidth(true);
 	const task = inner - fixed - full - COLUMN_GAP.length;
-	if (task >= TASK_MIN) return { inner, name, meta: full, task, withModel: true };
-	return { inner, name, meta: metaWidth(false), task: 0, withModel: false };
+	if (task >= TASK_MIN) return { inner, name, meta: full, task, fullMetrics: true };
+	return { inner, name, meta: Math.max(0, Math.min(inner - fixed, metaWidth(false))), task: 0, fullMetrics: false };
 }
 
-function row(task: TaskRecord, theme: CardTheme, cols: Columns, now: number): string[] {
+function row(task: TaskRecord, theme: CardTheme, cols: Columns, now: number, allowMetadataRow: boolean): string[] {
 	const look = LOOK[task.status];
 	const name = clip(task.agent, cols.name);
 	const head = `${theme.fg(look.role, look.glyph)}${GLYPH_GAP}${theme.fg(NAME_ROLE, name)}${" ".repeat(cols.name - visibleWidth(name))}`;
-	const tail = theme.fg(META_ROLE, meta(task, now, cols.withModel).padStart(cols.meta));
-	if (cols.task === 0) return [`${head}${" ".repeat(Math.max(COLUMN_GAP.length, cols.inner - visibleWidth(head) - visibleWidth(tail)))}${tail}`];
+	const metadata = cols.fullMetrics ? meta(task, now, true) : task.status === TASK_STATUS.QUEUED ? clip("queued", cols.meta) : executionLabel(task, cols.meta);
+	const tail = theme.fg(META_ROLE, " ".repeat(Math.max(0, cols.meta - visibleWidth(metadata))) + metadata);
+	if (cols.inner < 3) return [theme.fg(look.role, clip(look.glyph, cols.inner))];
+	// The scrollable sidebar can preserve identity and execution metadata on
+	// separate rows. The height-capped above-editor widget keeps its row budget.
+	if (allowMetadataRow && cols.task === 0 && task.status !== TASK_STATUS.QUEUED && visibleWidth(executionLabel(task)) > cols.meta) {
+		return [head, theme.fg(META_ROLE, executionLabel(task, cols.inner))];
+	}
+	if (cols.task === 0) return [`${head}${" ".repeat(Math.max(0, cols.inner - visibleWidth(head) - visibleWidth(tail)))}${tail}`];
 	const text = clip(taskText(task), cols.task);
 	return [`${head}${COLUMN_GAP}${theme.fg(TASK_ROLE, text)}${" ".repeat(cols.task - visibleWidth(text))}${COLUMN_GAP}${tail}`];
 }
@@ -211,7 +230,7 @@ export function renderAgentsCard(tasks: readonly TaskRecord[], theme: CardTheme,
 	const cols = columns(shown, cardInnerWidth(width), now);
 	const { listed, hidden } = options.collapsed ? { listed: [shown[0]], hidden: 0 } : visibleRows(shown, options.maxRows);
 	const hint = options.collapsed && options.collapseKey ? `${options.collapseKey} expand` : batchElapsed(shown, now);
-	const body = listed.flatMap((task) => row(task, theme, cols, now));
+	const body = listed.flatMap((task) => row(task, theme, cols, now, options.maxRows === undefined));
 	if (hidden > 0) body.push(overflowRow(hidden, theme, options.viewKey));
 	return renderCard(
 		{ title: "Agents", subtitle: counts(shown), body, tone: tone(shown), glyph: AGENTS_GLYPH },
