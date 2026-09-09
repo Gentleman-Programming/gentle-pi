@@ -25,7 +25,7 @@ interface Harness {
 	spawnOptions: Array<{ stdio?: string[] }>;
 }
 
-function harness(options: { maxConcurrency?: number; answer?: Record<string, unknown>; exitOnKill?: boolean } = {}): Harness {
+function harness(options: { maxConcurrency?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean } = {}): Harness {
 	const children: FakeChild[] = [];
 	const timers: Harness["timers"] = [];
 	const asks: Harness["asks"] = [];
@@ -36,6 +36,15 @@ function harness(options: { maxConcurrency?: number; answer?: Record<string, unk
 		spawn: (_command, _args, launchOptions) => {
 			spawnOptions.push({ stdio: launchOptions.stdio });
 			const fake = fakeChild({ exitOnKill: options.exitOnKill });
+			if (options.state !== undefined) {
+				fake.child.stdin.removeAllListeners("data");
+				fake.child.stdin.on("data", (chunk) => {
+					const command = JSON.parse(String(chunk));
+					fake.written.push(command);
+					fake.emit({ type: "response", id: command.id, success: command.type !== "get_state" || options.stateSuccess !== false,
+						data: command.type === "get_state" ? options.state : undefined });
+				});
+			}
 			children.push(fake);
 			return fake.child;
 		},
@@ -109,6 +118,29 @@ test("launch registration waits for actual spawn, including queued launches, and
 	assert.equal(store.get(thrown.id)?.status, TASK_STATUS.FAILED);
 	assert.deepEqual(launches, ["s1:/child", "s1:/queued"]);
 	assert.deepEqual(cwds, ["/child", "/queued", "/missing", "/throws"]);
+});
+
+test("runner captures resolved model and effort, retaining omitted launch values", async () => {
+	for (const scenario of [
+		{ state: { model: { provider: "anthropic", id: "resolved-model" }, thinkingLevel: "off" }, model: "anthropic/resolved-model", thinking: "off" },
+		{ state: { thinkingLevel: "max" }, model: "openai-codex/gpt-5.6-terra", thinking: "max" },
+		{ state: {}, model: "openai-codex/gpt-5.6-terra", thinking: "high" },
+		{ state: { model: null }, model: "default", thinking: "high" },
+		{ state: { model: { id: 7 }, thinkingLevel: 7 }, model: "openai-codex/gpt-5.6-terra", thinking: "high" },
+	]) {
+		const h = harness({ state: scenario.state });
+		const task = h.runner.run(request());
+		await tick();
+		assert.equal(h.store.get(task.id)?.model, scenario.model);
+		assert.equal(h.store.get(task.id)?.thinking, scenario.thinking);
+		h.runner.cancel(task.id);
+	}
+	const h = harness({ state: { model: { provider: "wrong", id: "wrong" }, thinkingLevel: "low" }, stateSuccess: false });
+	const task = h.runner.run(request({ model: undefined, thinking: undefined }));
+	await tick();
+	assert.equal(h.store.get(task.id)?.model, "default");
+	assert.equal(h.store.get(task.id)?.thinking, undefined);
+	h.runner.cancel(task.id);
 });
 
 test("childArguments builds an rpc launch with model, thinking, tools, session dir, and instructions", () => {

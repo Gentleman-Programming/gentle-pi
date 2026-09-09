@@ -157,6 +157,41 @@ test("renderTodoCard folds a long list: done tasks become one row and the open o
 	assert.match(folded[1], /^│ ✓ 40 done +│$/);
 });
 
+test("completed titles strike only title cells across wrapped lines, never padding or rails", () => {
+	const theme = {
+		fg: (_color: string, text: string) => `\x1b[32m${text}\x1b[39m`,
+		strikethrough: (text: string) => `\x1b[9m${text}\x1b[29m`,
+	};
+	const state = applyTodo(emptyTodo(), { action: "write", tasks: [
+		{ title: "Alpha beta gamma delta epsilon", status: "done" },
+		{ title: "Pending", status: "pending" },
+	] }, 1).state;
+	for (const width of [12, 20, 60]) {
+		const lines = renderTodoCard(state, theme, width, { collapsed: false, staleTurns: 0 });
+		let struckLetters = "";
+		for (const line of lines) {
+			let strike = false, column = 0;
+			const plain = stripAnsi(line);
+			const titleEnd = plain.slice(0, -1).trimEnd().length;
+			for (const token of line.match(/\x1b\[[\d;]*m|[^\x1b]/gu) ?? []) {
+				if (token.startsWith("\x1b")) {
+					for (const code of token.slice(2, -1).split(";").map(Number)) {
+						if (code === 0 || code === 29) strike = false;
+						if (code === 9) strike = true;
+					}
+				} else {
+					if (column < 2 || column >= titleEnd || /[│╭╮╰╯─✓]/u.test(token)) assert.equal(strike, false, `struck frame/padding: ${JSON.stringify(line)}`);
+					if (strike && /[A-Za-z]/.test(token)) struckLetters += token;
+					column += visibleWidth(token);
+				}
+			}
+			assert.equal(strike, false, "SGR 9 must close before the host appends padding");
+			assert.equal(visibleWidth(line), width);
+		}
+		assert.equal(struckLetters, "Alphabetagammadeltaepsilon");
+	}
+});
+
 test("renderTodoCard marks a stale list in the top rule and collapses to the task in progress", () => {
 	const stale = renderTodoCard(seeded(), plainTheme, 70, { collapsed: false, staleTurns: 2, collapseKey: "ctrl+shift+t" }).map(stripAnsi);
 	assert.match(stale[0], /^╭─ ❀ Todos · 1 of 3 ─+ stale · 2 turns ╮$/);

@@ -312,8 +312,16 @@ export class AgentRunner {
 		child.stderr?.on("data", () => {});
 		child.on("exit", (code) => this.exited(id, code));
 		void this.send(id, { type: "get_state" }).then((response) => {
-			const data = response.data as { sessionFile?: string } | undefined;
-			if (!live.terminal && this.live.get(id) === live && data?.sessionFile) this.store.update(id, { sessionPath: data.sessionFile });
+			const data = response.data as { sessionFile?: unknown; model?: { provider?: unknown; id?: unknown } | null; thinkingLevel?: unknown } | undefined;
+			if (response.success !== true || live.terminal || this.live.get(id) !== live || !data) return;
+			const resolved: Partial<TaskRecord> = {};
+			if (typeof data.sessionFile === "string" && data.sessionFile) resolved.sessionPath = data.sessionFile;
+			if (data.model === null) resolved.model = "default";
+			else if (typeof data.model?.provider === "string" && data.model.provider && typeof data.model.id === "string" && data.model.id) {
+				resolved.model = formatModelRef({ provider: data.model.provider, id: data.model.id });
+			}
+			if (typeof data.thinkingLevel === "string" && ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(data.thinkingLevel)) resolved.thinking = data.thinkingLevel;
+			this.store.update(id, resolved);
 		});
 		void this.send(id, { type: "prompt", message: promptText(request) }).then((response) => {
 			if (response.success === false) this.requestStop(id, TASK_STATUS.FAILED, String(response.error ?? "prompt rejected"));

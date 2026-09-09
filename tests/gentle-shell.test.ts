@@ -259,7 +259,7 @@ test("gentleShell frames the editor with the petal prompt and a hint while empty
 	editor.focused = true;
 	const lines = editor.render(60).map(stripAnsi);
 	assert.match(lines[0], /^╭─ ✿ ─+╮$/);
-	assert.ok(editor.render(60).every((line) => line.endsWith("\x1b[49m")), "prompt lines carry the panel background");
+	assert.match(editor.render(60)[1], /\x1b\[49m│$/, "prompt interior closes its background before the rail");
 	assert.match(lines[1], /^│.*type, or \/ for commands +│$/);
 	assert.match(lines[lines.length - 1], /^╰─+╯$/);
 	editor.setText("hola");
@@ -715,6 +715,11 @@ test("gentleShell keeps a dev-binary override visible above the editor for the w
 	assert.match(lines[1], /^│ \/Users\/me\/go\/bin\/gentle-ai · sha256:6e53bfc6305a3949 +│$/);
 	assert.match(lines[2], /^╰─+╯$/);
 	assert.equal(lines[3], "", "a blank line keeps the card off the prompt frame");
+	const painted = factory(fakeTui, { ...plainTheme, bg: (_role: string, text: string) => `\x1b[44m${text}\x1b[49m` }).render(100);
+	assert.equal(painted[0], lines[0], "top frame cells have no background");
+	assert.match(painted[1], /^│\x1b\[44m.*\x1b\[49m│$/);
+	assert.equal(painted[2], lines[2], "bottom frame cells have no background");
+	assert.equal(painted[3], "", "external spacer has no background");
 	await fire(handlers, "agent_start", ctx);
 	assert.equal(ui.widgets.has("gentle-shell-dev-binary"), false, "the startup notice leaves with the first prompt");
 
