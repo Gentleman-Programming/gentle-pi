@@ -202,7 +202,7 @@ test("AgentRunner admits strict live notifications once and closes IPC before St
 	children[0].message({ id: "n1", kind: "notification", message: "checkpoint" });
 	children[0].message({ id: "n1", kind: "notification", message: "checkpoint" });
 	children[0].message({ id: "n2", kind: "notification", message: "x".repeat(8 * 1024 + 1) });
-	children[0].message({ id: "n3", kind: "query", message: "unsupported" });
+	children[0].message({ id: "q3", kind: "query", message: "unsupported" });
 	children[0].message({ id: "n4", kind: "notification", message: "\uD800" });
 	children[0].message({ id: "n5", kind: "notification", message: "forged field", sender: "forged" });
 	children[0].message({ id: "n0", kind: "notification", message: "invalid correlation" });
@@ -213,7 +213,7 @@ test("AgentRunner admits strict live notifications once and closes IPC before St
 	assert.deepEqual(children[0].sent, [
 		{ id: "n1", kind: "ack", accepted: true },
 		{ id: "n2", kind: "ack", accepted: false, error: "invalid child IPC message" },
-		{ id: "n3", kind: "ack", accepted: false, error: "unsupported child IPC kind" },
+		{ id: "q3", kind: "reply", error: "task parent cannot accept queries" },
 		{ id: "n4", kind: "ack", accepted: false, error: "invalid child IPC message" },
 		{ id: "n5", kind: "ack", accepted: false, error: "invalid child IPC frame" },
 	]);

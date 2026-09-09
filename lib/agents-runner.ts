@@ -1,6 +1,6 @@
 import type { Duplex, Readable, Writable } from "node:stream";
-import { formatModelRef, type AgentDefinition, type AgentMode, type ModelRef } from "./agents-config.ts";
-import { parseChildFrame } from "./agents-messaging.ts";
+import { AGENT_MODE, formatModelRef, type AgentDefinition, type AgentMode, type ModelRef } from "./agents-config.ts";
+import { CHILD_QUERY_MAX_INFLIGHT, CHILD_QUERY_TIMEOUT_MS, parseChildFrame, validChildMessage, validChildQueryId } from "./agents-messaging.ts";
 import { ParentStandingReviewPermissionBroker } from "./review-session-standing-permission-ipc.ts";
 import { isFinished, normalizeRpcEvent, TASK_EVENT, TASK_STATUS, taskLabel, type AskRequest, type TaskRecord, type TaskStore } from "./agents-protocol.ts";
 
@@ -62,11 +62,17 @@ export interface AskAnswer {
 	cancelled?: boolean;
 }
 
+export interface TaskQuery {
+	taskId: string;
+	requestId: string;
+}
+
 export interface RunnerHooks {
 	askUser(taskId: string, request: AskRequest, raw: Record<string, unknown>): Promise<AskAnswer>;
 	onFinish?(task: TaskRecord): void;
 	// Accepts a child notification only while the originating parent session is active.
 	onNotification?(task: TaskRecord, message: string): boolean | void;
+	onQuery?(task: TaskRecord, requestId: string, message: string): boolean | void;
 	// Parent-only observation of a paired successful filesystem tool, not prose.
 	onSuccessfulMutation?(task: TaskRecord, tool: { toolName: "write" | "edit"; toolCallId: string; path: string }): void | Promise<void>;
 }
@@ -101,9 +107,20 @@ interface Pending {
 	resolve(value: Record<string, unknown>): void;
 }
 
+interface PendingQuery {
+	cancel: () => void;
+	replying: boolean;
+}
+
+interface PendingReply {
+	resolve(value: boolean): void;
+}
+
 interface LiveTask {
 	child: ChildLike;
 	pending: Map<string, Pending>;
+	queries: Map<string, PendingQuery>;
+	replies: Map<string, PendingReply>;
 	cancelStall: () => void;
 	cancelGrace: () => void;
 	processGroup: number | undefined;
@@ -126,6 +143,33 @@ const DEFAULT_TOOLS: readonly string[] = [];
 const TERMINATION_GRACE_MS = 250;
 const GROUP_CONFIRM_MS = 25;
 const GROUP_CONFIRM_DEADLINE_MS = 1_000;
+const QUERY_REJECTION_ERRORS = new Set([
+	"invalid child IPC frame",
+	"invalid child IPC correlation",
+	"unsupported child IPC kind",
+	"invalid child IPC message",
+	"task is not a live owned recipient",
+	"task parent cannot accept queries",
+	"task parent is not the active host session",
+	"duplicate query request",
+	"too many pending parent queries",
+	"parent query timed out",
+	"parent rejected query",
+]);
+const QUERY_REJECTION = Symbol("query rejection");
+
+function rejectQuery(error: string): never {
+	throw { [QUERY_REJECTION]: error };
+}
+
+function queryRejection(error: unknown): string {
+	if (error && typeof error === "object" && QUERY_REJECTION in error) {
+		const value = (error as { [QUERY_REJECTION]?: unknown })[QUERY_REJECTION];
+		if (typeof value === "string" && QUERY_REJECTION_ERRORS.has(value)) return value;
+	}
+	return "parent rejected query";
+}
+
 const hostProcess: ProcessControl = { platform: process.platform, kill: (pid, signal) => process.kill(pid, signal) };
 
 export function childArguments(request: TaskRequest): string[] {
@@ -191,6 +235,8 @@ export class AgentRunner {
 	private readonly queue: Array<{ task: TaskRecord; request: TaskRequest }> = [];
 	private readonly live = new Map<string, LiveTask>();
 	private readonly waiters = new Map<string, Array<(task: TaskRecord) => void>>();
+	private readonly queryWaiters = new Map<string, Array<(query: TaskQuery | undefined) => void>>();
+	private readonly firstQueries = new Map<string, TaskQuery>();
 	private counter = 0;
 
 	constructor(store: TaskStore, limits: RunnerLimits, deps: RunnerDeps, hooks: RunnerHooks) {
@@ -243,6 +289,33 @@ export class AgentRunner {
 			list.push(resolve);
 			this.waiters.set(id, list);
 		});
+	}
+
+	waitForQuery(id: string): Promise<TaskQuery | undefined> {
+		const current = this.store.get(id);
+		if (!current || isFinished(current.status)) return Promise.resolve(undefined);
+		const first = this.firstQueries.get(id);
+		if (first) return Promise.resolve(first);
+		return new Promise((resolve) => {
+			const list = this.queryWaiters.get(id) ?? [];
+			list.push(resolve);
+			this.queryWaiters.set(id, list);
+		});
+	}
+
+	async reply(id: string, requestId: string, message: string, parentSessionId: string): Promise<boolean> {
+		const task = this.store.get(id);
+		const live = this.live.get(id);
+		if (!task || !live || live.terminal || task.parentSessionId !== parentSessionId || !validChildMessage(message)) return false;
+		const query = live.queries.get(requestId);
+		if (!query || query.replying) return false;
+		query.replying = true;
+		const accepted = await this.sendReply(live, requestId, { id: requestId, kind: "reply", message });
+		if (live.queries.get(requestId) === query) {
+			query.cancel();
+			live.queries.delete(requestId);
+		}
+		return accepted;
 	}
 
 	cancel(id: string): boolean {
@@ -301,7 +374,7 @@ export class AgentRunner {
 			return;
 		}
 		const processGroup = detached && typeof child.pid === "number" && child.pid > 0 ? child.pid : undefined;
-		const live: LiveTask = { child, mutationStarts: new Map(), pending: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0, ipcClosed: false, acknowledgedIpcIds: new Set(), acknowledgedIpcOrder: [] };
+		const live: LiveTask = { child, mutationStarts: new Map(), pending: new Map(), queries: new Map(), replies: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0, ipcClosed: false, acknowledgedIpcIds: new Set(), acknowledgedIpcOrder: [] };
 		this.live.set(id, live);
 		const permissionPipe = child.stdio?.[3];
 		if (hasParentPermissionChannel && permissionPipe !== undefined && permissionPipe !== null) {
@@ -367,24 +440,59 @@ export class AgentRunner {
 		if (!live || live.ipcClosed) return;
 		const parsed = parseChildFrame(value);
 		if (!parsed.frame) {
-			if (parsed.id) this.acknowledge(live, parsed.id, false, parsed.error ?? "invalid child IPC frame");
+			if (parsed.id && validChildQueryId(parsed.id)) this.sendQueryError(live, parsed.id, parsed.error ?? "invalid child IPC frame");
+			else if (parsed.id) this.acknowledge(live, parsed.id, false, parsed.error ?? "invalid child IPC frame");
 			return;
 		}
-		if (live.acknowledgedIpcIds.has(parsed.frame.id)) return;
 		const task = this.store.get(id);
 		if (!task || live.terminal || isFinished(task.status) || task.parentSessionId === "") {
-			this.acknowledge(live, parsed.frame.id, false, "task is not a live owned recipient");
+			if (parsed.frame.kind === "notification") this.acknowledge(live, parsed.frame.id, false, "task is not a live owned recipient");
+			else this.sendQueryError(live, parsed.frame.id, "task is not a live owned recipient");
 			return;
 		}
-		try {
-			if (this.hooks.onNotification?.(task, parsed.frame.message) === false) {
-				this.acknowledge(live, parsed.frame.id, false, "task parent is not the active host session");
-				return;
-			}
-			this.acknowledge(live, parsed.frame.id, true);
-		} catch {
-			this.acknowledge(live, parsed.frame.id, false, "parent rejected notification");
+		if (parsed.frame.kind === "notification") {
+			if (live.acknowledgedIpcIds.has(parsed.frame.id)) return;
+			try {
+				if (this.hooks.onNotification?.(task, parsed.frame.message) === false) this.acknowledge(live, parsed.frame.id, false, "task parent is not the active host session");
+				else this.acknowledge(live, parsed.frame.id, true);
+			} catch { this.acknowledge(live, parsed.frame.id, false, "parent rejected notification"); }
+			return;
 		}
+		let query: PendingQuery | undefined;
+		try {
+			if (live.queries.has(parsed.frame.id)) rejectQuery("duplicate query request");
+			if (live.queries.size >= CHILD_QUERY_MAX_INFLIGHT) rejectQuery("too many pending parent queries");
+			query = { replying: false, cancel: this.deps.schedule(() => this.expireQuery(live, parsed.frame!.id), CHILD_QUERY_TIMEOUT_MS) };
+			live.queries.set(parsed.frame.id, query);
+			if (!this.hooks.onQuery) rejectQuery("task parent cannot accept queries");
+			if (this.hooks.onQuery(task, parsed.frame.id, parsed.frame.message) === false) rejectQuery("task parent is not the active host session");
+			if (task.mode === AGENT_MODE.TASK && !this.firstQueries.has(id)) {
+				const first = { taskId: id, requestId: parsed.frame.id };
+				this.firstQueries.set(id, first);
+				for (const resolve of this.queryWaiters.get(id) ?? []) resolve(first);
+				this.queryWaiters.delete(id);
+			}
+		} catch (error) {
+			if (query && live.queries.get(parsed.frame.id) === query) {
+				query.cancel();
+				live.queries.delete(parsed.frame.id);
+			}
+			this.sendQueryError(live, parsed.frame.id, queryRejection(error));
+		}
+	}
+
+	private expireQuery(live: LiveTask, id: string): void {
+		const query = live.queries.get(id);
+		if (!query) return;
+		live.queries.delete(id);
+		if (query.replying) this.settleReply(live, id, false);
+		else this.sendQueryError(live, id, "parent query timed out");
+	}
+
+	private sendQueryError(live: LiveTask, id: string, error: string): void {
+		const safeError = QUERY_REJECTION_ERRORS.has(error) ? error : "parent rejected query";
+		try { live.child.send?.({ id, kind: "reply", error: safeError }, () => {}); }
+		catch { /* Child-owned IPC callback reports transport failure. */ }
 	}
 
 	private acknowledge(live: LiveTask, id: string, accepted: boolean, error?: string): void {
@@ -396,9 +504,30 @@ export class AgentRunner {
 		catch { /* Child-owned IPC callback reports transport failure. */ }
 	}
 
+	private sendReply(live: LiveTask, id: string, frame: Record<string, unknown>): Promise<boolean> {
+		return new Promise((resolve) => {
+			live.replies.set(id, { resolve });
+			try {
+				if (!live.child.send) this.settleReply(live, id, false);
+				else live.child.send(frame, (error) => this.settleReply(live, id, !error));
+			} catch { this.settleReply(live, id, false); }
+		});
+	}
+
+	private settleReply(live: LiveTask, id: string, accepted: boolean): void {
+		const pending = live.replies.get(id);
+		if (!pending) return;
+		live.replies.delete(id);
+		pending.resolve(accepted);
+	}
+
 	private closeIpc(live: LiveTask): void {
 		if (live.ipcClosed) return;
 		live.ipcClosed = true;
+		for (const query of live.queries.values()) query.cancel();
+		live.queries.clear();
+		for (const pending of live.replies.values()) pending.resolve(false);
+		live.replies.clear();
 		live.child.channel?.unref?.();
 		try { live.child.disconnect?.(); }
 		catch { /* Channel may already be disconnected. */ }
@@ -581,6 +710,9 @@ export class AgentRunner {
 			this.hooks.onFinish?.(finished);
 			for (const resolve of this.waiters.get(id) ?? []) resolve(finished);
 			this.waiters.delete(id);
+			for (const resolve of this.queryWaiters.get(id) ?? []) resolve(undefined);
+			this.queryWaiters.delete(id);
+			this.firstQueries.delete(id);
 		}
 		queueMicrotask(() => this.pump());
 	}
