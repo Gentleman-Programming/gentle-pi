@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { TASK_STATUS, TaskStore, type TaskRecord } from "../lib/agents-protocol.ts";
-import { AgentsView } from "../lib/agents-view.ts";
+import { AgentsView, SESSION_FINISHED_TTL_MS } from "../lib/agents-view.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 
 const plainTheme = { fg: (_color: string, text: string) => text };
@@ -35,14 +35,14 @@ function task(id: string, parentSessionId: string, overrides: Partial<TaskRecord
 	};
 }
 
-function harness(rows = 12) {
+function harness(rows = 12, now = () => 10_000) {
 	const store = new TaskStore();
 	const view = new AgentsView({
 		theme: plainTheme,
 		rows,
 		store,
 		sessionId: "current-session-id",
-		now: () => 10_000,
+		now,
 		onCancel: () => {},
 		onOpen: () => {},
 		onClose: () => {},
@@ -94,7 +94,7 @@ test("AgentsView never infers unknown parent sessions and keeps manual terminal 
 
 test("AgentsView keeps headings non-actionable and clears a hidden selected child thread", () => {
 	const { store, view } = harness();
-	store.add(task("first", "current-session-id", { lastActivityAt: 200 }));
+	store.add(task("first", "current-session-id", { createdAt: 2000, lastActivityAt: 200 }));
 	store.add(task("child", "current-session-id", { lastActivityAt: 100 }));
 	assert.equal(view.selectedTask()?.id, "first", "the first visible child starts selected");
 	view.handleInput("k");
@@ -105,6 +105,55 @@ test("AgentsView keeps headings non-actionable and clears a hidden selected chil
 	assert.equal(view.selectedTask(), undefined, "expanding preserves heading focus until a child is selected");
 	view.handleInput("s");
 	view.handleInput("o");
+	view.dispose();
+});
+
+test("AgentsView retains observed live children until the session TTL and forgets absent groups", () => {
+	let now = 10_000;
+	const { store, view } = harness(12, () => now);
+	store.add(task("live", "current-session-id", { agent: "retained" }));
+	store.add(task("other", "other-session", { agent: "excluded" }));
+	store.apply("live", { type: "text", text: "kept thread" }, now);
+	store.update("live", { status: TASK_STATUS.COMPLETED, endedAt: now });
+	for (const elapsed of [0, SESSION_FINISHED_TTL_MS - 1]) {
+		now = 10_000 + elapsed;
+		const output = view.render(100).map(stripAnsi).join("\n");
+		assert.match(output, /Subagent retained/);
+		assert.match(output, /kept thread/);
+		assert.doesNotMatch(output, /excluded/);
+		assert.equal(view.selectedTask()?.id, "live");
+	}
+	now = 10_000 + SESSION_FINISHED_TTL_MS;
+	assert.doesNotMatch(view.render(100).join("\n"), /Subagent retained/);
+	assert.equal(view.selectedTask(), undefined);
+	store.add(task("archive", "current-session-id", { agent: "archived", status: TASK_STATUS.COMPLETED, endedAt: now }));
+	assert.doesNotMatch(view.render(100).join("\n"), /Subagent archived/, "absent groups lose implicit expansion");
+	view.dispose();
+});
+
+test("AgentsView respects explicit collapse after the final live child finishes", () => {
+	const { store, view } = harness();
+	store.add(task("live", "current-session-id", { agent: "hidden" }));
+	view.render(100);
+	view.handleInput("k");
+	view.handleInput("\x1b[D");
+	store.update("live", { status: TASK_STATUS.COMPLETED, endedAt: 10_000 });
+	assert.doesNotMatch(view.render(100).join("\n"), /Subagent hidden/);
+	view.handleInput("\x1b[C");
+	assert.match(view.render(100).join("\n"), /Subagent hidden/);
+	view.dispose();
+});
+
+test("AgentsView orders children by creation then ID, not renewed activity", () => {
+	const { store, view } = harness();
+	store.add(task("old", "current-session-id", { agent: "old", createdAt: 100 }));
+	store.add(task("b", "current-session-id", { agent: "new-b", createdAt: 200 }));
+	store.add(task("a", "current-session-id", { agent: "new-a", createdAt: 200 }));
+	store.update("old", { lastActivityAt: 20_000 });
+	const output = view.render(100).join("\n");
+	assert.ok(output.indexOf("Subagent new-a") < output.indexOf("Subagent new-b"));
+	assert.ok(output.indexOf("Subagent new-b") < output.indexOf("Subagent old"));
+	assert.equal(view.selectedTask()?.id, "old", "reordering preserves selection");
 	view.dispose();
 });
 
