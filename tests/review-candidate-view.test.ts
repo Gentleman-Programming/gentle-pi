@@ -198,7 +198,19 @@ test("private candidate owner rejects a controlled foreign Windows owner", { ski
 		t.skip("Current Windows token cannot assign BUILTIN\\Users as the controlled temporary directory owner");
 		return;
 	}
-	assert.throws(() => assertTrustedWindowsOwner(path), (error: unknown) => error instanceof WindowsOwnerValidationError && error.owner === "sid");
+	assert.throws(() => assertTrustedWindowsOwner(path, "directory"), (error: unknown) => error instanceof WindowsOwnerValidationError && error.owner === "sid");
+});
+
+test("private candidate owner reads trusted Windows directory and marker file owners", { skip: process.platform !== "win32" }, (t) => {
+	const cwd = repository(t), commonDir = join(cwd, ".git"), parent = join(commonDir, "gentle-ai", "candidate-views");
+	const view = new CandidateViewRegistry().create({ contributorRoot: cwd });
+	try {
+		assert.doesNotThrow(() => assertTrustedWindowsOwner(parent, "directory"));
+		assert.doesNotThrow(() => assertTrustedWindowsOwner(ownerMarker(view.root), "file"));
+		assert.doesNotThrow(() => view.verify());
+	} finally {
+		view.cleanup();
+	}
 });
 
 test("private candidate owner removes unrelated explicit Windows grants during enforcement", { skip: process.platform !== "win32" }, (t) => {

@@ -137,13 +137,17 @@ interface WindowsAclIdentity {
 	localAdministrator: string;
 }
 
+type WindowsObjectKind = "file" | "directory";
+
 function windowsAclIdentity(): WindowsAclIdentity {
 	return { user: windowsUserSid(), localAdministrator: windowsLocalAdministratorSid() };
 }
 
-function windowsOwnerSid(path: string): string {
+function windowsOwnerSid(path: string, kind: WindowsObjectKind): string {
 	if (path.length === 0 || path.length > 32767 || path.includes("\0")) throw new WindowsOwnerValidationError();
-	const script = "$ErrorActionPreference='Stop';$acl=[System.IO.Directory]::GetAccessControl($env:GENTLE_PI_CANDIDATE_OWNER_PATH,[System.Security.AccessControl.AccessControlSections]::Owner);$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value";
+	const script = kind === "file"
+		? "$ErrorActionPreference='Stop';$acl=[System.IO.File]::GetAccessControl($env:GENTLE_PI_CANDIDATE_OWNER_PATH,[System.Security.AccessControl.AccessControlSections]::Owner);$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value"
+		: "$ErrorActionPreference='Stop';$acl=[System.IO.Directory]::GetAccessControl($env:GENTLE_PI_CANDIDATE_OWNER_PATH,[System.Security.AccessControl.AccessControlSections]::Owner);$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value";
 	const systemRoot = dirname(dirname(windowsSystemExecutable("whoami.exe")));
 	let output: string;
 	try {
@@ -156,29 +160,29 @@ function windowsOwnerSid(path: string): string {
 	return matches[0]!.toUpperCase();
 }
 
-export function assertTrustedWindowsOwner(path: string): void {
-	validatePrivateWindowsOwner(windowsOwnerSid(path), windowsUserSid());
+export function assertTrustedWindowsOwner(path: string, kind: WindowsObjectKind): void {
+	validatePrivateWindowsOwner(windowsOwnerSid(path, kind), windowsUserSid());
 }
 
-function assertPrivateWindowsDacl(path: string, protectedDacl: boolean, identity: WindowsAclIdentity = windowsAclIdentity()): void {
-	validatePrivateWindowsOwner(windowsOwnerSid(path), identity.user);
+function assertPrivateWindowsDacl(path: string, kind: WindowsObjectKind, protectedDacl: boolean, identity: WindowsAclIdentity = windowsAclIdentity()): void {
+	validatePrivateWindowsOwner(windowsOwnerSid(path, kind), identity.user);
 	validatePrivateWindowsDacl(windowsDacl(path), identity.user, protectedDacl, identity.localAdministrator);
 }
 
 function enforcePrivateWindowsDacl(path: string, identity: WindowsAclIdentity = windowsAclIdentity()): void {
-	validatePrivateWindowsOwner(windowsOwnerSid(path), identity.user);
+	validatePrivateWindowsOwner(windowsOwnerSid(path, "directory"), identity.user);
 	const { user, localAdministrator } = identity;
 	const sddl = `D:P(A;OICI;FA;;;${user})(A;OICI;FA;;;${WINDOWS_SYSTEM})(A;OICI;FA;;;${WINDOWS_ADMINISTRATORS})`;
 	const script = "$ErrorActionPreference='Stop';$acl=New-Object System.Security.AccessControl.DirectorySecurity;$acl.SetSecurityDescriptorSddlForm($env:GENTLE_PI_CANDIDATE_ACL_SDDL,[System.Security.AccessControl.AccessControlSections]::Access);[System.IO.Directory]::SetAccessControl($env:GENTLE_PI_CANDIDATE_ACL_PATH,$acl)";
 	const systemRoot = dirname(dirname(windowsSystemExecutable("whoami.exe")));
 	execFileSync(windowsSystemExecutable("WindowsPowerShell\\v1.0\\powershell.exe"), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { encoding: "utf8", timeout: 5000, maxBuffer: 16384, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: { ...process.env, SystemRoot: systemRoot, GENTLE_PI_CANDIDATE_ACL_PATH: path, GENTLE_PI_CANDIDATE_ACL_SDDL: sddl } });
-	assertPrivateWindowsDacl(path, true, identity);
+	assertPrivateWindowsDacl(path, "directory", true, identity);
 }
 
-function privateWindowsDacl(path: string, protectedDacl: boolean, enforce = false): void {
+function privateWindowsDacl(path: string, kind: WindowsObjectKind, protectedDacl: boolean, enforce = false): void {
 	if (testingWindowsAclAuthority !== undefined) return testingWindowsAclAuthority(path);
 	if (enforce) enforcePrivateWindowsDacl(path);
-	else assertPrivateWindowsDacl(path, protectedDacl);
+	else assertPrivateWindowsDacl(path, kind, protectedDacl);
 }
 
 function privateWindowsCandidateOwnerBoundary(commonDir: string, enforce = false): void {
@@ -189,11 +193,11 @@ function privateWindowsCandidateOwnerBoundary(commonDir: string, enforce = false
 	}
 	const identity = windowsAclIdentity();
 	if (enforce) {
-		for (const path of boundary) validatePrivateWindowsOwner(windowsOwnerSid(path), identity.user);
+		for (const path of boundary) validatePrivateWindowsOwner(windowsOwnerSid(path, "directory"), identity.user);
 		for (const path of boundary) enforcePrivateWindowsDacl(path, identity);
 		return;
 	}
-	for (const path of boundary) assertPrivateWindowsDacl(path, true, identity);
+	for (const path of boundary) assertPrivateWindowsDacl(path, "directory", true, identity);
 }
 
 // A hostname or a repository-local nonce cannot prove that a PID is local.
@@ -231,7 +235,7 @@ function directory(path: string, privateMode = false, platform: NodeJS.Platform 
 	const uid = process.getuid?.();
 	if (!stat.isDirectory() || stat.isSymbolicLink() || !samePath(realpathSync(path), path, platform) ||
 		(privateMode && platform !== "win32" && (uid === undefined || stat.uid !== uid || (stat.mode & 0o077) !== 0))) throw new Error("Unsafe candidate owner directory");
-	if (privateMode && platform === "win32") privateWindowsDacl(path, true);
+	if (privateMode && platform === "win32") privateWindowsDacl(path, "directory", true);
 	return `${stat.dev}:${stat.ino}`;
 }
 
@@ -264,7 +268,7 @@ function regular(path: string, privateMode = false, platform: NodeJS.Platform = 
 	const uid = process.getuid?.();
 	if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || !samePath(realpathSync(path), path, platform) || stat.size > 16384 ||
 		(privateMode && platform !== "win32" && (uid === undefined || stat.uid !== uid || (stat.mode & 0o777) !== 0o600))) throw new Error("Unsafe candidate owner file");
-	if (privateMode && platform === "win32") privateWindowsDacl(path, false);
+	if (privateMode && platform === "win32") privateWindowsDacl(path, "file", false);
 	return `${stat.dev}:${stat.ino}`;
 }
 
