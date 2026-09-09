@@ -1,12 +1,13 @@
-import { ScrollView, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
+import { ScrollView, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { sidebarState } from "./shell-sidebar.ts";
 import type { ShellBarTheme } from "./shell-bar.ts";
 import { renderSidebarBanner } from "./shell-sidebar-banner.ts";
 
 export const SIDEBAR_BREAKPOINT = 140;
-const RAIL_WIDTH = 50;
+export const SIDEBAR_MIN_WIDTH = 32;
+const SIDEBAR_MAX_WIDTH = 80;
+const TRANSCRIPT_MIN_WIDTH = 60;
 const RAIL_PADDING = 1;
-const GAP = 3;
 // Experimental Pi 0.85.1 internals. Only the fullscreen layout tree is adapted;
 // regular mode keeps native scrollback and the original bottom components.
 const NODE = Symbol.for("@earendil-works/pi-tui/layout-node");
@@ -49,11 +50,35 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme): () => void {
 			target: { component: scroll, originX: event.screenX - event.x, originY: event.screenY - event.y, width: event.width, height: event.height },
 		};
 	};
+	let dragX: number | undefined;
+	const maximumWidth = () => Math.min(SIDEBAR_MAX_WIDTH, tui.terminal.columns - TRANSCRIPT_MIN_WIDTH);
+	const handle: Component = {
+		render: () => Array.from({ length: tui.terminal.rows ?? 1 }, () => theme.fg("border", "│")),
+		invalidate() {},
+		handleMouse(event: TuiMouseEvent) {
+			if (event.button !== "left") return undefined;
+			if (event.type === "press") {
+				dragX = event.screenX;
+				return { handled: true as const, capture: true };
+			}
+			if (event.type === "release") {
+				dragX = undefined;
+				return { handled: true as const };
+			}
+			if ((event.type !== "drag" && event.type !== "move") || dragX === undefined) return undefined;
+			const delta = dragX - event.screenX;
+			dragX = event.screenX;
+			state.width = Math.max(SIDEBAR_MIN_WIDTH, Math.min(maximumWidth(), state.width + delta));
+			tui.requestRender();
+			return { handled: true as const, render: true };
+		},
+	};
 	const prepare = (width: number): boolean => {
 		state.active = false;
 		if (stopped || failed || host.mode !== "fullscreen" || width < SIDEBAR_BREAKPOINT) return false;
 		try {
-			const contentWidth = scroll.getContentWidth(RAIL_WIDTH);
+			state.width = Math.max(SIDEBAR_MIN_WIDTH, Math.min(maximumWidth(), state.width));
+			const contentWidth = scroll.getContentWidth(state.width);
 			const sections = ["footer", "changes", "agents", "todo"].map((key) => {
 				const lines = [...(state.parts.get(key)?.render(contentWidth - RAIL_PADDING * 2) ?? [])];
 				while (lines.length && lines[lines.length - 1]?.trim() === "") lines.pop();
@@ -85,9 +110,10 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme): () => void {
 			const descriptor = Object.getOwnPropertyDescriptor(root, NODE);
 			const left = { render: (width: number) => root.render(width), invalidate() {}, [NODE]: () => original.call(root) };
 			const replacement = () => prepare(tui.terminal.columns)
-				? { type: "hstack", gap: GAP, align: "stretch", entries: [
+				? { type: "hstack", gap: 0, align: "stretch", entries: [
 					{ component: left, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-					{ component: scroll, basis: RAIL_WIDTH, grow: 0, shrink: 0, minSize: RAIL_WIDTH },
+					{ component: handle, basis: 1, grow: 0, shrink: 0, minSize: 1 },
+					{ component: scroll, basis: state.width, grow: 0, shrink: 0, minSize: state.width },
 				] }
 				: original.call(root);
 			root[NODE] = replacement;

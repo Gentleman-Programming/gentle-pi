@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ScrollView, visibleWidth, type TUI } from "@earendil-works/pi-tui";
+import { ScrollView, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { installSidebar } from "../lib/shell-sidebar-layout.ts";
 import { sidebarPart, sidebarState } from "../lib/shell-sidebar.ts";
 import { renderShellSidebarBar } from "../lib/shell-bar.ts";
@@ -12,7 +12,7 @@ function fixture(mode = "fullscreen", columns = 140) {
 	const original = () => ({ type: "vstack", entries: [] });
 	const root = { render: () => ["transcript"], invalidate() {}, [NODE]: original };
 	let renders = 0;
-	const host = { mode, terminal: { columns }, layoutRoot: root, requestRender() { renders++; } };
+	const host = { mode, terminal: { columns, rows: 24 }, layoutRoot: root, requestRender() { renders++; } };
 	const tui = host as unknown as TUI;
 	const bottom = sidebarPart(tui, "footer", { render: (_width: number) => ["Status"], invalidate() {} });
 	return { host, tui, root, original, bottom, renders: () => renders };
@@ -20,7 +20,10 @@ function fixture(mode = "fullscreen", columns = 140) {
 function rail(f: ReturnType<typeof fixture>): ScrollView {
 	const node = f.root[NODE]() as unknown as { type: string; entries: { component: ScrollView }[] };
 	assert.equal(node.type, "hstack");
-	return node.entries[1].component;
+	return node.entries[2].component;
+}
+function layout(f: ReturnType<typeof fixture>) {
+	return f.root[NODE]() as unknown as { type: string; gap: number; entries: { component: Component; basis: number; minSize: number }[] };
 }
 
 test("grouped Status preserves structured fields and opaque integration text", () => {
@@ -111,6 +114,28 @@ test("wheel scrolls the rail and is consumed at both boundaries and blank space"
 	scroll.updateLayout(1, 5, () => {});
 	assert.equal(scroll.handleMouse({ type: "wheel", wheelDelta: 1 } as Parameters<typeof scroll.handleMouse>[0])?.handled, true);
 	assert.equal(scroll.scrollTop, 0);
+});
+
+test("dragging the handle resizes the rail within its bounds", (t) => {
+	const f = fixture("fullscreen", 160);
+	t.after(installSidebar(f.tui, theme));
+	let node = layout(f);
+	assert.equal(node.gap, 0);
+	assert.deepEqual(node.entries[1].component.render(1), Array(24).fill("│"));
+	const handle = node.entries[1].component;
+	const event = (type: TuiMouseEvent["type"], screenX: number) => ({ type, button: "left", screenX, screenY: 0, x: 0, y: 0, width: 1, height: 10 }) as TuiMouseEvent;
+	assert.equal(handle.handleMouse?.(event("press", 100))?.capture, true);
+	handle.handleMouse?.(event("drag", 90));
+	node = layout(f);
+	assert.equal(sidebarState(f.tui).width, 60);
+	assert.equal(node.entries[2].basis, 60);
+	assert.equal(node.entries[2].minSize, 60);
+	handle.handleMouse?.(event("drag", 0));
+	assert.equal(sidebarState(f.tui).width, 80);
+	handle.handleMouse?.(event("drag", 200));
+	assert.equal(sidebarState(f.tui).width, 32);
+	handle.handleMouse?.(event("release", 200));
+	assert.ok(f.renders() >= 4);
 });
 
 test("cleanup restores the native layout and bottom paint without disposing widgets", () => {
