@@ -157,8 +157,9 @@ function deps(): { deps: Partial<AgentsDeps>; children: FakeChild[]; spawned: st
 test("all nine subagent registrations own their transcript shell", () => {
 	const { pi, tools } = fakePi();
 	gentleAgents(pi, {}, deps().deps);
-	assert.equal(tools.size, 9);
-	for (const tool of tools.values()) assert.equal(tool.renderShell, "self", tool.name);
+	const subagentTools = [...tools.values()].filter((tool) => tool.name.startsWith("subagent_"));
+	assert.equal(subagentTools.length, 9);
+	for (const tool of subagentTools) assert.equal(tool.renderShell, "self", tool.name);
 });
 
 test("host query delivery exposes correlation and accepts one current-session reply", async () => {
@@ -1009,7 +1010,7 @@ test("subagent_list_agents and subagent_run in task mode launch a child with the
 	gentleAgents(pi, {}, harness.deps);
 	const { ctx, widget } = fakeContext();
 	await fire("session_start", ctx);
-	assert.deepEqual([...tools.keys()].sort(), ["subagent_cancel", "subagent_continue", "subagent_list_agents", "subagent_list_tasks", "subagent_reply", "subagent_result", "subagent_run", "subagent_send_message", "subagent_status"]);
+	assert.deepEqual([...tools.keys()].sort(), ["orchestrator_list", "orchestrator_send_message", "orchestrator_session_id", "subagent_cancel", "subagent_continue", "subagent_list_agents", "subagent_list_tasks", "subagent_reply", "subagent_result", "subagent_run", "subagent_send_message", "subagent_status"]);
 	const listed = await tools.get("subagent_list_agents")!.execute("c0", {}, undefined, undefined, ctx);
 	assert.match(listed.content[0].text, /- explore \(global\): maps things/);
 
@@ -1531,4 +1532,98 @@ test("the production overlay reads terminal rows at render time without a minimu
 	assert.equal(overlay.render(80).length, 1, "tiny terminals retain bounded controls rather than forced chrome");
 	overlay.handleInput("\x1b");
 	await opened;
+});
+
+test("session transport adds host tools, forwards notifications, and closes on shutdown", async () => {
+	const h = fakePi();
+	const runtime = deps();
+	let callback: ((notification: { id: string; senderSessionId: string; message: string }) => Promise<void>) | undefined;
+	let listenerStarts = 0;
+	let listenerCloses = 0;
+	let clientCloses = 0;
+	const registry = { list: async () => [{ sessionId: "peer", reachability: "unknown" }], listActivations: async () => [] };
+	runtime.deps.sessionTransport = {
+		createRegistry: async () => registry,
+		createListener: (_registry, _sessionId, received) => {
+			callback = received;
+			return { registry, start: async () => { listenerStarts += 1; }, close: async () => { listenerCloses += 1; } };
+		},
+		createClient: () => ({ close: () => { clientCloses += 1; } }),
+	} as never;
+	gentleAgents(h.pi, {}, runtime.deps);
+	const { ctx } = fakeContext();
+	await h.fire("session_start", ctx);
+	assert.equal(listenerStarts, 1);
+	assert.ok(h.tools.has("orchestrator_session_id"));
+	assert.ok(h.tools.has("orchestrator_list"));
+	assert.ok(h.tools.has("orchestrator_send_message"));
+	assert.match((await h.tools.get("orchestrator_list")!.execute("list", {}, undefined, undefined, ctx)).content[0].text, /peer/);
+	assert.ok(callback, "listener receives the inbound callback");
+	await callback!({ id: "message-1", senderSessionId: "peer", message: "\u001b[31mraw model content" });
+	assert.equal(h.sent.at(-1)?.message.customType, "gentle-agents.orchestrator-message");
+	assert.match(String(h.sent.at(-1)?.message.content), /\u001b\[31mraw model content/);
+	assert.deepEqual(h.sent.at(-1)?.options, { deliverAs: "followUp", triggerTurn: true });
+	await h.fire("session_shutdown", ctx);
+	assert.equal(clientCloses, 1);
+	assert.equal(listenerCloses, 1);
+});
+
+test("session transport accepts a notification while listener publication is still starting", async () => {
+	const h = fakePi();
+	const runtime = deps();
+	let callback: ((notification: { id: string; senderSessionId: string; message: string }) => Promise<void>) | undefined;
+	const registry = { list: async () => [], listActivations: async () => [] };
+	runtime.deps.sessionTransport = {
+		createRegistry: async () => registry,
+		createListener: (_registry, _sessionId, received) => {
+			callback = received;
+			return { registry, start: async () => { await callback!({ id: "published", senderSessionId: "peer", message: "during publication" }); }, close: async () => {} };
+		},
+		createClient: () => ({ close: () => {} }),
+	} as never;
+	gentleAgents(h.pi, {}, runtime.deps);
+	const { ctx } = fakeContext();
+	await h.fire("session_start", ctx);
+	assert.equal(h.sent.at(-1)?.message.customType, "gentle-agents.orchestrator-message");
+	assert.match(String(h.sent.at(-1)?.message.content), /during publication/);
+});
+
+test("session transport selects a peer for outbound delivery and rejects stale callbacks after replacement", async () => {
+	const h = fakePi();
+	const runtime = deps();
+	const callbacks: Array<(notification: { id: string; senderSessionId: string; message: string }) => Promise<void>> = [];
+	const sent: Array<{ recipient: string; message: string; expectedActivation?: unknown }> = [];
+	let closed = 0;
+	const records = [
+		{ version: 1, sessionId: "alpha", endpoint: "/alpha.sock", createdAt: 1 },
+		{ version: 1, sessionId: "beta", endpoint: "/beta.sock", createdAt: 2 },
+	];
+	const registry = { list: async () => [], listActivations: async () => records };
+	runtime.deps.sessionTransport = {
+		createRegistry: async () => registry,
+		createListener: (_registry, _sessionId, received) => {
+			callbacks.push(received);
+			return { registry, start: async () => {}, close: async () => { closed += 1; } };
+		},
+		createClient: () => ({
+			close: () => { closed += 1; },
+			sendNotification: async (recipient: string, message: string, options: { expectedActivation?: unknown }) => {
+				sent.push({ recipient, message, expectedActivation: options.expectedActivation });
+				return { id: "accepted-1", accepted: true };
+			},
+		}),
+	} as never;
+	gentleAgents(h.pi, {}, runtime.deps);
+	const { ctx, dialogs } = fakeContext();
+	await h.fire("session_start", ctx);
+	const result = await h.tools.get("orchestrator_send_message")!.execute("send", { message: "hello peer" }, undefined, undefined, ctx);
+	assert.deepEqual(dialogs, ["select:Select recipient orchestrator:Orchestrator alpha|Orchestrator beta"]);
+	assert.deepEqual(sent, [{ recipient: "alpha", message: "hello peer", expectedActivation: records[0] }]);
+	assert.match(result.content[0].text, /accepted for delivery; it is not a delivery or read receipt/);
+	const original = callbacks[0]!;
+	(ctx.sessionManager as unknown as { getSessionId(): string }).getSessionId = () => "s2";
+	await h.fire("session_start", ctx);
+	assert.equal(closed, 2, "replacement closes the old client and listener before activating its successor");
+	await assert.rejects(original({ id: "late", senderSessionId: "alpha", message: "late callback" }), /stale session transport/);
+	await h.fire("session_shutdown", ctx);
 });
