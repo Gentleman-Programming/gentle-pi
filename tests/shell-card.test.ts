@@ -70,13 +70,39 @@ test("renderCard keeps the rail and its corners in the tone and the rest of the 
 	assert.equal(CARD_TONE.SUCCESS, "success");
 });
 
-test("renderCard places a hint at the right end of the top rule and can paint every line", () => {
+test("renderCard places a hint at the right end of the top rule and paints only body interiors", () => {
 	const lines = renderCard(card(), plainTheme, 60, { expanded: false, hint: "ctrl+o expand" });
 	assert.match(stripAnsi(lines[0]), /^╭─ ✿ Gentle AI · review preflight ─+ ctrl\+o expand ╮$/);
 	assert.equal(visibleWidth(lines[0]), 60);
 
 	const painted = renderCard(card(), plainTheme, 60, { expanded: false, paint: (line) => `[bg]${line}[/bg]` });
-	assert.ok(painted.every((line) => line.startsWith("[bg]") && line.endsWith("[/bg]")));
+	assert.ok(!painted[0].includes("[bg]"));
+	assert.match(painted[1], /^│\[bg\].*\[\/bg\]│$/);
+	assert.ok(!painted[2].includes("[bg]"));
+});
+
+test("card backgrounds stop before border cells and remain active after content resets", () => {
+	const bg = "\x1b[44m";
+	const paint = (text: string) => bg + text.replaceAll("\x1b[0m", "\x1b[0m" + bg) + "\x1b[49m";
+	for (const width of [0, 1, 2, 3, 4, 8, 40]) {
+		const lines = renderCard(card({ body: ["red\x1b[0m blue", ""] }), ansiTheme, width, { expanded: true, paint });
+		for (const [row, line] of lines.entries()) {
+			let painted = false, column = 0;
+			for (const token of line.match(/\x1b\[[\d;]*m|[^\x1b]/gu) ?? []) {
+				if (token.startsWith("\x1b")) {
+					for (const code of token.slice(2, -1).split(";").map(Number)) {
+						if (code === 0 || code === 49) painted = false;
+						if (code === 44) painted = true;
+					}
+				} else {
+					assert.equal(painted, row > 0 && row < lines.length - 1 && column > 0 && column < width - 1, `row ${row}, cell ${column}`);
+					column += visibleWidth(token);
+				}
+			}
+			assert.equal(painted, false, "background must not leak into host padding");
+			assert.equal(visibleWidth(line), width);
+		}
+	}
 });
 
 test("renderCard accepts a custom glyph and an empty body", () => {

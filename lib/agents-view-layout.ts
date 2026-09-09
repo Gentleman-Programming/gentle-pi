@@ -23,14 +23,14 @@ export interface AgentsViewLayout {
 	threadWidth: number;
 }
 
-export function measureAgentsViewLayout(width: number, height: number): AgentsViewLayout {
+export function measureAgentsViewLayout(width: number, height: number, fullscreen = false): AgentsViewLayout {
 	const boundedWidth = Math.max(0, Math.floor(width));
 	const boundedHeight = Math.max(0, Math.floor(height));
 	if (boundedWidth < AGENTS_FALLBACK_WIDTH || boundedHeight < CHROME_ROWS) {
 		return { mode: "fallback", width: boundedWidth, height: boundedHeight, bodyRows: 0, footerY: undefined, listX: 0, listWidth: 0, threadX: 0, threadWidth: 0 };
 	}
 	const inner = boundedWidth - 2;
-	if (boundedWidth < AGENTS_SPLIT_LIST_MIN_WIDTH + AGENTS_SPLIT_THREAD_MIN_WIDTH + FRAME_WIDTH) {
+	if (fullscreen || boundedWidth < AGENTS_SPLIT_LIST_MIN_WIDTH + AGENTS_SPLIT_THREAD_MIN_WIDTH + FRAME_WIDTH) {
 		const viewportWidth = Math.max(0, inner - 2);
 		return { mode: "narrow", width: boundedWidth, height: boundedHeight, bodyRows: boundedHeight - CHROME_ROWS, footerY: boundedHeight - 2, listX: 2, listWidth: viewportWidth, threadX: 2, threadWidth: viewportWidth };
 	}

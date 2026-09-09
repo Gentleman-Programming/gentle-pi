@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 import { Box, visibleWidth } from "@earendil-works/pi-tui";
 import { renderGentleAiResult, GentleAiCallCard } from "../lib/gentle-ai-renderer.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
@@ -36,6 +37,30 @@ test("completed review cards fit Pi's default Box at terminal width 57", () => {
 		for (const line of lines) assert.equal(visibleWidth(line), 57, `${operationPath}: ${JSON.stringify(line)}`);
 		if (operationPath === "review inspect") {
 			assert.equal(lines[1], " ╭─ 🌹︎ Gentle AI · completed · review inspect ─────────╮ ");
+		}
+	}
+});
+
+test("review registrations own their shell and capture backgrounds exclude all frame cells", () => {
+	const source = readFileSync(new URL("../extensions/gentle-ai.ts", import.meta.url), "utf8");
+	assert.equal((source.match(/renderShell: "self"/g) ?? []).length, 4, "review registrations must opt out of Pi's painted Box");
+	const theme = { ...plainTheme, bg: (_role: string, text: string) => `\x1b[44m${text}\x1b[49m` };
+	for (const expanded of [true, false]) {
+		const call = new GentleAiCallCard();
+		call.update("completed", "review capture", theme, "$ capture");
+		const lines = [...call.render(40), ...renderGentleAiResult({ content: [{ type: "text", text: "Result" }] }, { expanded }, theme).render(40)];
+		for (const [row, line] of lines.entries()) {
+			let bg = false, column = 0;
+			for (const token of line.match(/\x1b\[[\d;]*m|[^\x1b]/gu) ?? []) {
+				if (token === "\x1b[44m") bg = true;
+				else if (token === "\x1b[49m" || token === "\x1b[0m") bg = false;
+				else if (!token.startsWith("\x1b")) {
+					assert.equal(bg, row > 0 && row < lines.length - 1 && column > 0 && column < 39);
+					column += visibleWidth(token);
+				}
+			}
+			assert.equal(bg, false);
+			assert.equal(visibleWidth(line), 40);
 		}
 	}
 });

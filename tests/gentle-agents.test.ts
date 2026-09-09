@@ -83,13 +83,15 @@ function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (t
 	const dialogs: string[] = [];
 	const overlays: Overlay[] = [];
 	const customCompletions: unknown[] = [];
+	const customOptions: unknown[] = [];
 	const ctx = {
 		hasUI: true,
 		sessionManager: { getSessionId: () => "s1", getCwd: () => cwd, getEntries: () => [] },
 		ui: {
 			notify: (message: string) => dialogs.push(`notify:${message}`),
-			custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => Overlay) =>
+			custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => Overlay, options: unknown) =>
 				new Promise((resolve) => {
+					customOptions.push(options);
 					const done = (value: unknown) => {
 						customCompletions.push(value);
 						resolve(value);
@@ -120,7 +122,7 @@ function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (t
 		const factory = widgets.get("gentle-agents");
 		return factory ? factory(tui, plainTheme).render(72).map(stripAnsi) : undefined;
 	};
-	return { ctx, widget, dialogs, overlays, customCompletions };
+	return { ctx, widget, dialogs, overlays, customCompletions, customOptions };
 }
 
 function deps(): { deps: Partial<AgentsDeps>; children: FakeChild[]; spawned: string[][] } {
@@ -552,11 +554,11 @@ test("subagent_list_agents and subagent_run in task mode launch a child with the
 	await tick();
 	assert.match(String(harness.children[0].written[1].message), /Map lib\/ and report every module\.\n\n## Context\nFocus on agents-\*\.ts/);
 	assert.match(widget()![0], /^╭─ ❀ Agents · 1 active ─+ \d+s ╮$/);
-	assert.match(widget()![1], /^│ ◐  explore  map lib modules +gpt-5\.6-terra · \d+s │$/);
+	assert.match(widget()![1], /^│ ◐  explore  map lib modules +gpt-5\.6-terra · low · \d+s │$/);
 	harness.children[0].emit({ type: "tool_execution_start", toolCallId: "c", toolName: "grep", args: {} });
 	harness.children[0].emit({ type: "message_end", message: { role: "assistant", usage: { totalTokens: 12_000, cost: { total: 0.09 } } } });
 	await tick();
-	assert.match(widget()![1], /◐  explore  map lib modules +gpt-5\.6-terra · 12k · \$0\.09 · \d+s │$/);
+	assert.match(widget()![1], /◐  explore  map lib modules +gpt-5\.6-terra · low · 12k · \$0\.09 · \d+s │$/);
 	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "lib has three agent files." }] }] });
 	harness.children[0].emit({ type: "agent_settled" });
 	const result = await running;
@@ -783,7 +785,7 @@ test("AgentsView production footer uses rendered bounds and invalidates them bef
 		let open = buttons(lines, "[ Open session ]");
 		assert.match(lines[1] ?? "", /寿司/, "a unicode task remains inside the body, not the header or footer");
 		assert.match(lines[follow.y] ?? "", /s Stop selected.*a all sessions/, "the existing stop and scope shortcuts remain beside the footer buttons");
-		assert.doesNotMatch(overlay.render(44).map(stripAnsi).at(-2) ?? "", /\[ Follow \]|\[ Open session \]/, "a narrow render hides controls rather than retaining roomy bounds");
+		assert.match(overlay.render(44).map(stripAnsi).at(-2) ?? "", /\[Scope\]/, "the narrow root keeps mouse-accessible scope controls");
 		lines = overlay.render(160).map(stripAnsi);
 		follow = buttons(lines, "[ Follow ]");
 		open = buttons(lines, "[ Open session ]");
@@ -1046,16 +1048,17 @@ test("the production overlay reads terminal rows at render time without a minimu
 	gentleAgents(pi, {}, harness.deps);
 	let rows = 10;
 	const overlayTui = { terminal: { get rows() { return rows; } }, requestRender() {} };
-	const { ctx, overlays } = fakeContext(fakeTui, async () => true, async () => undefined, overlayTui);
+	const { ctx, overlays, customOptions } = fakeContext(fakeTui, async () => true, async () => undefined, overlayTui);
 	await fire("session_start", ctx);
 	const opened = commands.get("gentle:agents")!.handler("", ctx);
 	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
 	const overlay = overlays[0]!;
-	assert.equal(overlay.render(80).length, 8, "the overlay leaves its two-row host margin");
+	assert.deepEqual(customOptions[0], { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", margin: 0, anchor: "center" } });
+	assert.equal(overlay.render(80).length, 10, "the overlay uses the full terminal height");
 	rows = 5;
-	assert.equal(overlay.render(80).length, 3, "a live terminal resize changes the production frame budget");
+	assert.equal(overlay.render(80).length, 5, "a live terminal resize changes the production frame budget");
 	rows = 2;
-	assert.equal(overlay.render(80).length, 0, "the two-row host budget renders nothing rather than forced chrome");
+	assert.equal(overlay.render(80).length, 1, "tiny terminals retain bounded controls rather than forced chrome");
 	overlay.handleInput("\x1b");
 	await opened;
 });

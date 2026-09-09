@@ -65,7 +65,7 @@ test("renderAgentsCard keeps every task on one line, clipping long labels, and d
 	assert.match(wide[1], /^│ ◐  sdd-explore  write the gentle shell foot… +claude-sonnet-5 · 34k · \$0\.27 · 4s │$/);
 	const narrow = renderAgentsCard(tasks, plainTheme, 44, 5_000, { collapsed: false }).map(stripAnsi);
 	assert.equal(narrow.length, 3);
-	assert.match(narrow[1], /^│ ◐  sdd-explore +34k · \$0\.27 · 4s │$/);
+	assert.match(narrow[1], /^│ ◐  sdd-explore +claude-sonnet-5 +│$/);
 });
 
 test("renderAgentsCard shows questions and failures in place of the task, and collapses to the first row", () => {
@@ -83,6 +83,30 @@ test("renderAgentsCard shows questions and failures in place of the task, and co
 	assert.equal(collapsed.length, 3);
 	assert.match(collapsed[0], /ctrl\+shift\+a expand ╮$/);
 	assert.match(collapsed[1], /^│ \?  sdd-explore  asked: Delete\?/);
+});
+
+test("agent model and effort outrank usage at sidebar widths without inventing unknown values", () => {
+	for (const width of [32, 44, 60, 100]) {
+		const lines = renderAgentsCard([task({ agent: "worker", model: "openai/gpt-5", thinking: "high" })], plainTheme, width, 5000, { collapsed: false });
+		assert.equal(lines.length, 3);
+		assert.match(lines[1], /worker/);
+		assert.match(lines[1], /gpt-5 · high/);
+		for (const line of lines) assert.equal(visibleWidth(line), width);
+		if (width <= 44) assert.doesNotMatch(lines[1], /34k|\$0\.27|4s/);
+	}
+	for (const width of [0, 1, 2, 3, 4, 8, 16, 24]) {
+		const lines = renderAgentsCard([task({ agent: "界worker", thinking: "xhigh" })], plainTheme, width, 5000, { collapsed: false });
+		assert.ok(lines.length <= 4, "narrow metadata gets at most one dedicated row");
+		for (const line of lines) assert.equal(visibleWidth(line), width);
+	}
+	const sidebar = renderAgentsCard([task({ agent: "gentle-ai-worker", model: "openai/gpt-5.6", thinking: "high" })], plainTheme, 32, 5000, { collapsed: false });
+	assert.match(sidebar.join("\n"), /gentle-ai-worker/);
+	assert.match(sidebar.join("\n"), /gpt-5\.6 · high/);
+	for (const line of sidebar) assert.equal(visibleWidth(line), 32);
+	const unknown = renderAgentsCard([task({ model: "default", thinking: undefined })], plainTheme, 80, 5000, { collapsed: false }).join("\n");
+	assert.doesNotMatch(unknown, /default|undefined|high|off/);
+	const off = renderAgentsCard([task({ thinking: "off" })], plainTheme, 80, 5000, { collapsed: false }).join("\n");
+	assert.match(off, /claude-sonnet-5 · off/);
 });
 
 test("widgetRows caps the card at a quarter of the terminal, between three and eight rows", () => {

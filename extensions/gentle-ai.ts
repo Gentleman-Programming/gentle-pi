@@ -6461,6 +6461,7 @@ function createGentleAiExtensionForTesting(
 
 	pi.registerTool({
 		name: "gentle_review_scope",
+		renderShell: "self",
 		label: "Gentle Review Scope",
 		description: "Read one bounded, integrity-checked page of the controller-owned frozen changed scope. This read-only tool never inspects the ambient or candidate tree.",
 		parameters: REVIEW_SCOPE_PARAMETERS,
@@ -6503,6 +6504,7 @@ function createGentleAiExtensionForTesting(
 
 	pi.registerTool({
 		name: "gentle_review_capture_group",
+		renderShell: "self",
 		label: "Gentle Review Capture Group",
 		description: "Capture one complete provider-issued materialize reviewer group. It validates the exact ordered current collect set, forecasts its bounded model cost, runs reviewers concurrently, and admits outputs one at a time in provider order.",
 		promptSnippet: "Use one complete exact current STATUS materialize reviewer group; acknowledge its forecast before the grouped run.",
@@ -6537,6 +6539,7 @@ function createGentleAiExtensionForTesting(
 
 	pi.registerTool({
 		name: "gentle_review_capture",
+		renderShell: "self",
 		label: "Gentle Review Capture",
 		description: "Capture exactly one provider-issued ordinary native review collect slot. This is not a controller operation: it validates one opaque collect binding against current target-scoped STATUS, executes at most one capture, and never follows a transition.",
 		promptSnippet: "Use one exact current STATUS collectBinding for one ordinary native capture; call fresh STATUS before every additional capture.",
@@ -6577,6 +6580,7 @@ function createGentleAiExtensionForTesting(
 
 	pi.registerTool({
 		name: "gentle_review",
+		renderShell: "self",
 		label: "Gentle Review Controller",
 		description:
 			"Inspect and recover review authority and start native ordinary review. Ordinary capture is available only through the separate gentle_review_capture tool. Review outcomes never authorize delivery: commit, push, pull-request, and release commands follow ordinary repository policy. RESET/RECOVER remain destructive and are executed by the audited native CLI.",
