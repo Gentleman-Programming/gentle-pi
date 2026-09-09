@@ -34,5 +34,10 @@ test("Agents layout reserves fallback for tiny terminals, a single viewport for 
 	assert.equal(layout.listX, 2);
 	assert.equal(layout.threadX, layout.listX + layout.listWidth + 3);
 	assert.ok(layout.threadX + layout.threadWidth + 1 <= layout.width);
+	const fullscreen = measureAgentsViewLayout(60, 8, true);
+	assert.equal(fullscreen.mode, "narrow");
+	assert.equal(fullscreen.threadWidth, 56);
+	assert.equal(fullscreen.threadX, 2);
+	assert.equal(fullscreen.height, 8);
 	assert.equal(visibleWidth("寿司"), 4, "multibyte widths remain terminal-cell widths");
 });
