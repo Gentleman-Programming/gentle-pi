@@ -14,6 +14,7 @@ import { framePromptLines, PROMPT_HINT, PROMPT_STATE, withPromptHint, type Promp
 import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, parseCodexUsage, parseUsageHeaders, UsageStore, type ProviderUsage } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
 import { sidebarPart } from "../lib/shell-sidebar.ts";
+import { SddProfileManager } from "../lib/sdd-profiles-manager.ts";
 import { installSidebar } from "../lib/shell-sidebar-layout.ts";
 
 // Gentle Shell: the visual layer gentle-pi puts on top of pi. It installs the
@@ -101,6 +102,10 @@ export function buildShellBarModel(
 	const statuses = Array.from(footerData.getExtensionStatuses().entries())
 		.sort(([a], [b]) => a.localeCompare(b))
 		.map(([, text]) => text);
+	let profileName: string | null = null;
+	try {
+		profileName = new SddProfileManager().getActiveProfileName();
+	} catch { /* Profiles must never break the bar. */ }
 	return {
 		cwd: shortenHome(ctx.sessionManager.getCwd(), home),
 		branch: footerData.getGitBranch(),
@@ -114,6 +119,7 @@ export function buildShellBarModel(
 		subscription: model ? ctx.modelRegistry.isUsingOAuth(model) : false,
 		usage: options.usage,
 		statuses,
+		profileName,
 	};
 }
 

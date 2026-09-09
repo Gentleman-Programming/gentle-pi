@@ -174,3 +174,22 @@ test("shellEnabled honors GENTLE_PI_SHELL=0", () => {
 	assert.equal(shellEnabled({ GENTLE_PI_SHELL: "0" }), false);
 	assert.equal(shellEnabled({ GENTLE_PI_SHELL: "false" }), false);
 });
+
+test("renderShellBar shows the active profile as a trailing segment", () => {
+	const [line] = renderShellBar(model({ profileName: "strict-tdd" }), plainTheme, 200);
+	assert.match(line, /⟡ ❀ strict-tdd$/);
+});
+
+test("renderShellBar omits the profile marker when no profile is active", () => {
+	const [line] = renderShellBar(model({ profileName: null }), plainTheme, 160);
+	assert.doesNotMatch(line, /❀/);
+	const [missing] = renderShellBar(model(), plainTheme, 160);
+	assert.doesNotMatch(missing, /❀/);
+});
+
+test("renderShellBar sanitizes weird profile names", () => {
+	const [line] = renderShellBar(model({ profileName: "evil\x1b[31mname\nwith\ttabs" }), plainTheme, 200);
+	assert.doesNotMatch(line, /\x1b\[/);
+	assert.doesNotMatch(line, /[\r\n\t]/);
+	assert.match(line, /❀ /);
+});

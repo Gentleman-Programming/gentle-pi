@@ -23,6 +23,7 @@ export interface ShellBarModel {
 	subscription: boolean;
 	usage: ProviderUsage | undefined;
 	statuses: string[];
+	profileName?: string | null;
 }
 
 export interface ShellBarTheme {
@@ -90,7 +91,8 @@ function buildSegments(model: ShellBarModel, theme: ShellBarTheme): string[] {
 	const cost = theme.fg(ROLE.VALUE, formatCost(model.costTotal, model.subscription));
 	const usage = model.usage ? renderUsageBar(model.usage, theme) : undefined;
 	const statuses = model.statuses.map((status) => theme.fg(ROLE.STATUS, sanitizeStatus(status)));
-	return [theme.fg(ROLE.BRAND, SHELL_BAR_BRAND), location, modelSegment, context, cost, ...(usage ? [usage] : []), ...statuses];
+	const profile = model.profileName ? theme.fg(ROLE.STATUS, `❀ ${sanitizeStatus(model.profileName)}`) : undefined;
+	return [theme.fg(ROLE.BRAND, SHELL_BAR_BRAND), location, modelSegment, context, cost, ...(usage ? [usage] : []), ...statuses, ...(profile ? [profile] : [])];
 }
 
 // When the line overflows, the location gives way first: the path shrinks to
