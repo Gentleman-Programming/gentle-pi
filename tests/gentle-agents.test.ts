@@ -159,6 +159,38 @@ test("all eight subagent registrations own their transcript shell", () => {
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
+test("child parent-message tooling admits notifications and the active parent preserves raw model text", async () => {
+	const child = fakePi();
+	const listeners = new Map<string, Array<(value: Record<string, unknown>) => void>>();
+	const frames: Array<Record<string, unknown>> = [];
+	gentleAgents(child.pi, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: "fixture" }, {
+		childIpc: {
+			send: (frame: Record<string, unknown>) => { frames.push(frame); return true; },
+			on: (event: string, listener: (value: Record<string, unknown>) => void) => listeners.set(event, [...(listeners.get(event) ?? []), listener]),
+		},
+	});
+	assert.deepEqual([...child.tools.keys()], ["subagent_parent_message"]);
+	const pending = child.tools.get("subagent_parent_message")!.execute("message", { message: "raw\u001B[2J text" }, undefined, undefined, {} as ExtensionContext);
+	assert.deepEqual(frames, [{ id: "n1", kind: "notification", message: "raw\u001B[2J text" }]);
+	for (const listener of listeners.get("message") ?? []) listener({ id: "n1", kind: "ack", accepted: true });
+	assert.equal((await pending).content[0].text, "Notification accepted by the parent.");
+
+	const parent = fakePi();
+	const runtime = deps();
+	gentleAgents(parent.pi, {}, runtime.deps);
+	const { ctx } = fakeContext();
+	await parent.fire("session_start", ctx);
+	await parent.tools.get("subagent_run")!.execute("run", { agent: "explore", task: "notify", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	runtime.children[0].message({ id: "n1", kind: "notification", message: "raw\u001B[2J text" });
+	await tick();
+	assert.equal(parent.sent[0]?.message.content, "raw\u001B[2J text");
+	assert.deepEqual(parent.sent[0]?.options, { deliverAs: "followUp", triggerTurn: true });
+	const rendered = parent.renderers.get("gentle-agents.message")!(parent.sent[0]?.message, { expanded: true }, plainTheme).render(80).join("\n");
+	assert.match(rendered, /raw\\x1B\[2J text/);
+	await parent.fire("session_shutdown", ctx);
+});
+
 async function shutdownAndRestoreNativeSpawn(
 	childProcess: typeof import("node:child_process"),
 	originalSpawn: typeof import("node:child_process").spawn,
@@ -254,20 +286,20 @@ test("default Node spawn adapter launches task and background children with cons
 		children[2]!.emit({ type: "agent_settled" });
 		await permission.result;
 
-		const args = ["--host-flag", "--mode", "rpc", "--session-dir", join(home, ".pi", "agent", "gentle-agents", "sessions"), "--model", "openai-codex/gpt-5.6-terra:low", "--tools", "read,grep", "--append-system-prompt", "You map things."];
+		const args = ["--host-flag", "--mode", "rpc", "--session-dir", join(home, ".pi", "agent", "gentle-agents", "sessions"), "--model", "openai-codex/gpt-5.6-terra:low", "--tools", "read,grep,subagent_parent_message", "--append-system-prompt", "You map things."];
 		assert.equal(captured.length, 3, "the extension reaches Node's spawn boundary for task, background, and permission-channel launches");
 		for (const [index, fixture] of ["task", "background", "permission"].entries()) {
 			assert.equal(captured[index]?.command, "/fixture/pi");
 			assert.deepEqual(captured[index]?.args, args);
 			assert.equal(captured[index]?.options.cwd, index === 2 ? process.cwd() : cwd);
-			assert.deepEqual(captured[index]?.options.env, { PATH: "/bin", FIXTURE: fixture, GENTLE_PI_AGENTS_CHILD: "1", ...(index === 2 ? { GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" } : {}) });
+			assert.deepEqual(captured[index]?.options.env, { PATH: "/bin", FIXTURE: fixture, GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: captured[index]?.options.env.GENTLE_PI_AGENTS_OWNED_IPC, GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" });
 			assert.equal(captured[index]?.options.shell, undefined, "the adapter does not invoke a shell");
 			assert.equal(captured[index]?.options.windowsHide, true, "the adapter always hides a Windows console");
 			assert.equal(captured[index]?.options.detached, process.platform !== "win32", "the adapter forwards the runner's platform selection");
 		}
-		assert.deepEqual(captured[0]?.options.stdio, ["pipe", "pipe", "pipe"], "ordinary task launches receive default pipes");
-		assert.deepEqual(captured[1]?.options.stdio, ["pipe", "pipe", "pipe"], "ordinary background launches receive default pipes");
-		assert.deepEqual(captured[2]?.options.stdio, ["pipe", "pipe", "pipe", "pipe"], "the adapter preserves the runner's fourth permission fd");
+		assert.deepEqual(captured[0]?.options.stdio, ["pipe", "pipe", "pipe", "pipe", "ipc"], "repository tasks retain fd3 permission and receive messaging IPC at fd4");
+		assert.deepEqual(captured[1]?.options.stdio, ["pipe", "pipe", "pipe", "pipe", "ipc"], "repository background tasks retain fd3 permission and receive messaging IPC at fd4");
+		assert.deepEqual(captured[2]?.options.stdio, ["pipe", "pipe", "pipe", "pipe", "ipc"], "the adapter preserves fd3 permission while messaging uses fd4");
 		await Promise.all(shutdown.map((close) => close()));
 		assert.deepEqual(children[1]?.killed, ["SIGTERM"], "session shutdown cleans up an active background child");
 		shutdown.length = 0;
@@ -558,7 +590,7 @@ test("subagent_list_agents and subagent_run in task mode launch a child with the
 	await tick();
 	const [args] = harness.spawned;
 	assert.equal(args[args.indexOf("--model") + 1], "openai-codex/gpt-5.6-terra:low", "the profile effort overrides the definition");
-	assert.equal(args[args.indexOf("--tools") + 1], "read,grep");
+	assert.equal(args[args.indexOf("--tools") + 1], "read,grep,subagent_parent_message");
 	await tick();
 	assert.match(String(harness.children[0].written[1].message), /Map lib\/ and report every module\.\n\n## Context\nFocus on agents-\*\.ts/);
 	assert.match(widget()![0], /^╭─ ❀ Agents · 1 active ─+ \d+s ╮$/);

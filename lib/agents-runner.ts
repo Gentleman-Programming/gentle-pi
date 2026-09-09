@@ -1,5 +1,6 @@
 import type { Duplex, Readable, Writable } from "node:stream";
 import { formatModelRef, type AgentDefinition, type AgentMode, type ModelRef } from "./agents-config.ts";
+import { parseChildFrame } from "./agents-messaging.ts";
 import { ParentStandingReviewPermissionBroker } from "./review-session-standing-permission-ipc.ts";
 import { isFinished, normalizeRpcEvent, TASK_EVENT, TASK_STATUS, taskLabel, type AskRequest, type TaskRecord, type TaskStore } from "./agents-protocol.ts";
 
@@ -15,16 +16,19 @@ export interface ChildLike {
 	stderr: Readable | null | undefined;
 	stdio?: Array<Duplex | null | undefined>;
 	kill(signal?: NodeJS.Signals): boolean;
+	send?(message: Record<string, unknown>, callback?: (error: Error | null) => void): boolean;
+	disconnect?(): void;
+	channel?: { unref?(): void };
 	on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
 	on(event: "error", listener: (error: Error) => void): unknown;
-	on(event: "spawn", listener: () => void): unknown;
+	on(event: "spawn" | "message" | "disconnect", listener: (...args: unknown[]) => void): unknown;
 }
 
 export interface SpawnOptions {
 	cwd: string;
 	env: NodeJS.ProcessEnv;
 	detached?: boolean;
-	stdio?: Array<"pipe" | "ignore" | "inherit">;
+	stdio?: Array<"pipe" | "ignore" | "inherit" | "ipc">;
 }
 
 export type Spawn = (command: string, args: string[], options: SpawnOptions) => ChildLike;
@@ -61,6 +65,8 @@ export interface AskAnswer {
 export interface RunnerHooks {
 	askUser(taskId: string, request: AskRequest, raw: Record<string, unknown>): Promise<AskAnswer>;
 	onFinish?(task: TaskRecord): void;
+	// Accepts a child notification only while the originating parent session is active.
+	onNotification?(task: TaskRecord, message: string): boolean | void;
 	// Parent-only observation of a paired successful filesystem tool, not prose.
 	onSuccessfulMutation?(task: TaskRecord, tool: { toolName: "write" | "edit"; toolCallId: string; path: string }): void | Promise<void>;
 }
@@ -107,10 +113,15 @@ interface LiveTask {
 	quarantined: boolean;
 	nextId: number;
 	permissionBroker?: ParentStandingReviewPermissionBroker;
+	ipcClosed: boolean;
+	acknowledgedIpcIds: Set<string>;
+	acknowledgedIpcOrder: string[];
 	mutationStarts: Map<string, { toolName: "write" | "edit"; toolCallId: string; path: string }>;
 }
 
 const CHILD_MARKER = "GENTLE_PI_AGENTS_CHILD";
+const IPC_MARKER = "GENTLE_PI_AGENTS_OWNED_IPC";
+const PARENT_NOTIFICATION_TOOL = "subagent_parent_message";
 const DEFAULT_TOOLS: readonly string[] = [];
 const TERMINATION_GRACE_MS = 250;
 const GROUP_CONFIRM_MS = 25;
@@ -122,7 +133,7 @@ export function childArguments(request: TaskRequest): string[] {
 	if (request.resumeSessionPath) args.push("--session", request.resumeSessionPath);
 	if (request.model) args.push("--model", request.thinking ? `${formatModelRef(request.model)}:${request.thinking}` : formatModelRef(request.model));
 	else if (request.thinking) args.push("--thinking", request.thinking);
-	const tools = request.agent.tools.length > 0 ? request.agent.tools : DEFAULT_TOOLS;
+	const tools = request.agent.tools.length > 0 ? [...new Set([...request.agent.tools, PARENT_NOTIFICATION_TOOL])] : DEFAULT_TOOLS;
 	if (tools.length > 0) args.push("--tools", tools.join(","));
 	if (request.agent.instructions.length > 0) args.push("--append-system-prompt", request.agent.instructions);
 	return args;
@@ -273,6 +284,7 @@ export class AgentRunner {
 		const env = {
 			...request.env,
 			[CHILD_MARKER]: "1",
+			[IPC_MARKER]: `${this.deps.now()}-${Math.random().toString(36).slice(2)}`,
 			...(hasParentPermissionChannel ? { GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" } : {}),
 		};
 		let child: ChildLike;
@@ -281,7 +293,7 @@ export class AgentRunner {
 				cwd: request.cwd,
 				env,
 				detached,
-				...(hasParentPermissionChannel ? { stdio: ["pipe", "pipe", "pipe", "pipe"] } : {}),
+				stdio: hasParentPermissionChannel ? ["pipe", "pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe", "ipc"],
 			});
 		} catch (error) {
 			this.store.update(id, { status: TASK_STATUS.RUNNING, startedAt: this.deps.now(), lastStep: "starting" });
@@ -289,7 +301,7 @@ export class AgentRunner {
 			return;
 		}
 		const processGroup = detached && typeof child.pid === "number" && child.pid > 0 ? child.pid : undefined;
-		const live: LiveTask = { child, mutationStarts: new Map(), pending: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0 };
+		const live: LiveTask = { child, mutationStarts: new Map(), pending: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0, ipcClosed: false, acknowledgedIpcIds: new Set(), acknowledgedIpcOrder: [] };
 		this.live.set(id, live);
 		const permissionPipe = child.stdio?.[3];
 		if (hasParentPermissionChannel && permissionPipe !== undefined && permissionPipe !== null) {
@@ -299,7 +311,10 @@ export class AgentRunner {
 			);
 		}
 		this.store.update(id, { status: TASK_STATUS.RUNNING, startedAt: this.deps.now(), lastStep: "starting" });
+		child.channel?.unref?.();
 		child.on("error", (error) => this.childError(id, error));
+		child.on("message", (value) => this.receiveChildMessage(id, value));
+		child.on("disconnect", () => this.closeIpc(live));
 		let announced = false;
 		child.on("spawn", () => {
 			if (announced || this.live.get(id) !== live || live.terminal) return;
@@ -345,6 +360,48 @@ export class AgentRunner {
 			live.pending.set(requestId, { resolve });
 			this.write(live, { id: requestId, ...command });
 		});
+	}
+
+	private receiveChildMessage(id: string, value: unknown): void {
+		const live = this.live.get(id);
+		if (!live || live.ipcClosed) return;
+		const parsed = parseChildFrame(value);
+		if (!parsed.frame) {
+			if (parsed.id) this.acknowledge(live, parsed.id, false, parsed.error ?? "invalid child IPC frame");
+			return;
+		}
+		if (live.acknowledgedIpcIds.has(parsed.frame.id)) return;
+		const task = this.store.get(id);
+		if (!task || live.terminal || isFinished(task.status) || task.parentSessionId === "") {
+			this.acknowledge(live, parsed.frame.id, false, "task is not a live owned recipient");
+			return;
+		}
+		try {
+			if (this.hooks.onNotification?.(task, parsed.frame.message) === false) {
+				this.acknowledge(live, parsed.frame.id, false, "task parent is not the active host session");
+				return;
+			}
+			this.acknowledge(live, parsed.frame.id, true);
+		} catch {
+			this.acknowledge(live, parsed.frame.id, false, "parent rejected notification");
+		}
+	}
+
+	private acknowledge(live: LiveTask, id: string, accepted: boolean, error?: string): void {
+		if (live.ipcClosed || live.acknowledgedIpcIds.has(id) || !live.child.send) return;
+		live.acknowledgedIpcIds.add(id);
+		live.acknowledgedIpcOrder.push(id);
+		if (live.acknowledgedIpcOrder.length > 64) live.acknowledgedIpcIds.delete(live.acknowledgedIpcOrder.shift()!);
+		try { live.child.send({ id, kind: "ack", accepted, ...(error ? { error } : {}) }, () => {}); }
+		catch { /* Child-owned IPC callback reports transport failure. */ }
+	}
+
+	private closeIpc(live: LiveTask): void {
+		if (live.ipcClosed) return;
+		live.ipcClosed = true;
+		live.child.channel?.unref?.();
+		try { live.child.disconnect?.(); }
+		catch { /* Channel may already be disconnected. */ }
 	}
 
 	private write(live: LiveTask, payload: Record<string, unknown>): void {
@@ -437,6 +494,7 @@ export class AgentRunner {
 		live.mutationStarts.clear();
 		live.cleanupDeadlineAt = this.deps.now() + GROUP_CONFIRM_DEADLINE_MS;
 		live.permissionBroker?.close();
+		this.closeIpc(live);
 		live.cancelStall();
 		if (abort) void this.send(id, { type: "abort" });
 		this.signal(live, "SIGTERM");
@@ -482,6 +540,7 @@ export class AgentRunner {
 			return;
 		}
 		live.permissionBroker?.close();
+		this.closeIpc(live);
 		live.cancelStall();
 		live.cancelGrace();
 		this.live.delete(id);
@@ -501,6 +560,7 @@ export class AgentRunner {
 
 	private completeExit(id: string, live: LiveTask): void {
 		live.permissionBroker?.close();
+		this.closeIpc(live);
 		live.cancelStall();
 		live.cancelGrace();
 		this.live.delete(id);

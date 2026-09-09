@@ -11,6 +11,7 @@ import { sidebarPart } from "../lib/shell-sidebar.ts";
 import { AGENT_MODE, discoverAgents, loadAgentsConfig, resolveAgentProfile, type AgentDefinition, type AgentMode } from "../lib/agents-config.ts";
 import { isFinished, TASK_STATUS, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
 import { AgentRunner, piCommand, type AskAnswer, type RunnerDeps, type TaskRequest } from "../lib/agents-runner.ts";
+import { ChildMessenger, type IpcEndpoint } from "../lib/agents-messaging.ts";
 import { hasReviewSessionPermission, resolveCanonicalGitRepositoryIdentitySync, type ReviewSessionManager } from "../lib/review-session-standing-permission.ts";
 import { historyDir, loadHistory, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
 import { sessionToMarkdown } from "../lib/agents-transcript.ts";
@@ -29,6 +30,7 @@ import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
 export const AGENTS_WIDGET_KEY = "gentle-agents";
 export const AGENTS_COMMAND_NAME = "gentle:agents";
 export const AGENTS_RESULT_TYPE = "gentle-agents.result";
+export const AGENTS_MESSAGE_TYPE = "gentle-agents.message";
 const COLLAPSE_KEY_DEFAULT = "ctrl+shift+a";
 const VIEW_KEY_DEFAULT = "alt+a";
 const STOP_KEY_DEFAULT = "alt+s";
@@ -39,6 +41,7 @@ const TOOL_PREFIX = "subagent_";
 export interface AgentsDeps extends RunnerDeps {
 	home: string;
 	agentHome?: string;
+	childIpc?: IpcEndpoint;
 	env: NodeJS.ProcessEnv;
 	resolveWorktree: WorktreeResolver;
 }
@@ -110,6 +113,37 @@ export function agentsStopKey(env: NodeJS.ProcessEnv = process.env): string | un
 	return value === "" || value.toLowerCase() === "off" ? undefined : value;
 }
 
+function sanitizeTerminalText(value: string): string {
+	return value.replace(/[\x00-\x08\x0B-\x1F\x7F-\x9F]/g, (control) => `\\x${control.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`);
+}
+
+function messageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content.map((part) => part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string" ? (part as { text: string }).text : "").join("\n");
+}
+
+function ownedChildIpc(env: NodeJS.ProcessEnv, candidate: IpcEndpoint | undefined): IpcEndpoint | undefined {
+	if (env.GENTLE_PI_AGENTS_CHILD !== "1" || !env.GENTLE_PI_AGENTS_OWNED_IPC || !candidate || typeof candidate.send !== "function" || typeof candidate.on !== "function") return undefined;
+	return candidate;
+}
+
+function registerChildMessaging(pi: ExtensionAPI, ipc: IpcEndpoint): void {
+	const messenger = new ChildMessenger(ipc);
+	pi.registerTool({
+		name: "subagent_parent_message",
+		label: "Agent parent message",
+		description: "Send a bounded notification to this subagent's parent. Queries and recipient selection are unsupported in this slice.",
+		parameters: { type: "object", additionalProperties: false, required: ["message"], properties: { message: { type: "string" } } } as never,
+		async execute(_id, params) {
+			const input = params as { message?: unknown };
+			if (typeof input.message !== "string") throw new Error("parent messages require text");
+			await messenger.notify(input.message);
+			return { content: [{ type: "text", text: "Notification accepted by the parent." }], details: {} };
+		},
+	});
+}
+
 function text(value: string, details: Record<string, unknown> = {}): ToolText {
 	return { content: [{ type: "text", text: value }], details };
 }
@@ -173,6 +207,11 @@ export async function answerThroughUi(ui: ExtensionContext["ui"] | undefined, as
 }
 
 export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env, overrides: Partial<AgentsDeps> = {}): void {
+	const childIpc = ownedChildIpc(env, overrides.childIpc ?? (process.send ? process as unknown as IpcEndpoint : undefined));
+	if (env.GENTLE_PI_AGENTS_CHILD === "1") {
+		if (childIpc) registerChildMessaging(pi, childIpc);
+		return;
+	}
 	if (!agentsEnabled(env)) return;
 	const deps: AgentsDeps = { ...defaultDeps(env), ...overrides };
 	const selectedHome = overrides.agentHome ?? (overrides.home === undefined ? resolveGentlePiAgentHome(deps.env) : join(deps.home, ".pi", "agent"));
@@ -264,6 +303,11 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 
 	const runner = new AgentRunner(store, loadAgentsConfig({ cwd: process.cwd(), home: deps.home, agentHome }), deps, {
 		askUser: (_taskId, ask, raw) => answerThroughUi(ui, ask, raw),
+		onNotification: (task, message) => {
+			if (activeSessionId() !== task.parentSessionId) return false;
+			pi.sendMessage({ customType: AGENTS_MESSAGE_TYPE, content: message, display: true, details: { gentleAgents: { taskId: task.id, agent: task.agent, parentSessionId: task.parentSessionId, kind: "notification" } } }, { deliverAs: "followUp", triggerTurn: true });
+			return true;
+		},
 		onSuccessfulMutation: (task, tool) => {
 			if (!sessions || !worktrees || task.parentSessionId !== activeSessionId() || !ownedTaskIds.has(task.id)) return;
 			const root = deps.resolveWorktree(tool.path, task.cwd)?.root;
@@ -277,6 +321,15 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			persist(task);
 			if (task.mode === AGENT_MODE.BACKGROUND && task.status !== TASK_STATUS.CANCELLED) deliver(task);
 		},
+	});
+
+	pi.registerMessageRenderer(AGENTS_MESSAGE_TYPE, (message, options, theme) => {
+		const details = (message.details as { gentleAgents?: { taskId?: unknown; agent?: unknown } } | undefined)?.gentleAgents;
+		const taskId = typeof details?.taskId === "string" ? details.taskId : "unknown";
+		const agent = typeof details?.agent === "string" ? details.agent : "Subagent";
+		const heading = `${sanitizeTerminalText(agent)} message · Task ${sanitizeTerminalText(taskId)}`;
+		const body = sanitizeTerminalText(messageText(message.content));
+		return new Text(`${theme.fg("customMessageLabel", heading)}\n${theme.fg("customMessageText", body)}`, options.outputPad, 0);
 	});
 
 	pi.registerMessageRenderer(AGENTS_RESULT_TYPE, (message, options, theme) => {
