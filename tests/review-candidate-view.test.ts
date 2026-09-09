@@ -22,7 +22,7 @@ import {
 	readCandidateContextManifestPage,
 	type NativeCandidateProjectionDescriptor,
 } from "../lib/review-candidate-view.ts";
-import { setWindowsAclAuthorityForTesting, validatePrivateWindowsDacl, WindowsDaclValidationError } from "../lib/review-candidate-view-owner.ts";
+import { prepareCandidateOwnerParent, setWindowsAclAuthorityForTesting, validatePrivateWindowsDacl, WindowsDaclValidationError } from "../lib/review-candidate-view-owner.ts";
 
 function git(cwd: string, ...arguments_: string[]): string {
 	return execFileSync("git", arguments_, { cwd, encoding: "utf8" }).trim();
@@ -133,6 +133,30 @@ test("private candidate owner reports bounded Windows DACL mismatch reasons", ()
 	const dacl = "D:P(A;OICI;FA;;;S-1-5-21-1)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 	for (const [reason, invalid] of [["ace-flags", dacl.replace("OICI", "OI")], ["ace-rights", dacl.replace("FA", "FR")], ["ace-reserved-fields", dacl.replace(";;;S-1-5-21-1", ";object;;S-1-5-21-1")], ["ace-trustee", dacl.replace("S-1-5-21-1", "S-1-5-21-2")], ["ace-duplicate", `${dacl}(A;OICI;FA;;;SY)`], ["ace-count", dacl.replace("(A;OICI;FA;;;BA)", "")]] as const) {
 		assert.throws(() => validatePrivateWindowsDacl(invalid, "S-1-5-21-1", true), (error: unknown) => error instanceof WindowsDaclValidationError && error.reason === reason && error.message === `Windows DACL validation failed: ${reason}`);
+	}
+});
+
+test("private candidate owner removes unrelated explicit Windows grants during enforcement", { skip: process.platform !== "win32" }, (t) => {
+	const cwd = repository(t), commonDir = join(cwd, ".git"), parent = join(commonDir, "gentle-ai", "candidate-views");
+	const initial = new CandidateViewRegistry().create({ contributorRoot: cwd });
+	initial.cleanup();
+	const system = process.env.SystemRoot!;
+	const user = execFileSync(`${system}\\System32\\whoami.exe`, ["/user", "/fo", "csv", "/nh"], { encoding: "utf8" }).match(/S-\d+(?:-\d+)+/i)?.[0];
+	assert.ok(user);
+	execFileSync(`${system}\\System32\\icacls.exe`, [parent, "/grant", "*S-1-5-32-545:(OI)(CI)F"], { encoding: "utf8" });
+	const archive = ".candidate-owner-acl.txt";
+	try {
+		execFileSync(`${system}\\System32\\icacls.exe`, [parent, "/save", archive, "/c"], { cwd: parent, encoding: "utf8" });
+		const before = readFileSync(join(parent, archive), "utf16le").match(/D:[^\r\n]+/)?.[0];
+		assert.ok(before);
+		assert.throws(() => validatePrivateWindowsDacl(before, user!, true), (error: unknown) => error instanceof WindowsDaclValidationError && error.reason === "ace-trustee");
+		assert.doesNotThrow(() => prepareCandidateOwnerParent(commonDir));
+		execFileSync(`${system}\\System32\\icacls.exe`, [parent, "/save", archive, "/c"], { cwd: parent, encoding: "utf8" });
+		const after = readFileSync(join(parent, archive), "utf16le").match(/D:[^\r\n]+/)?.[0];
+		assert.ok(after);
+		assert.doesNotThrow(() => validatePrivateWindowsDacl(after, user!, true));
+	} finally {
+		rmSync(join(parent, archive), { force: true });
 	}
 });
 

@@ -27,7 +27,7 @@ const WINDOWS_SYSTEM = "S-1-5-18";
 const WINDOWS_ADMINISTRATORS = "S-1-5-32-544";
 const WINDOWS_SYSTEM_DIRECTORY = "\\\\?\\GLOBALROOT\\SystemRoot\\System32";
 
-function windowsSystemExecutable(name: "whoami.exe" | "icacls.exe"): string {
+function windowsSystemExecutable(name: "whoami.exe" | "icacls.exe" | "WindowsPowerShell\\v1.0\\powershell.exe"): string {
 	try {
 		return realpathSync.native(join(WINDOWS_SYSTEM_DIRECTORY, name));
 	} catch {
@@ -92,7 +92,10 @@ function assertPrivateWindowsDacl(path: string, protectedDacl: boolean): void {
 
 function enforcePrivateWindowsDacl(path: string): void {
 	const user = windowsUserSid();
-	execFileSync(windowsSystemExecutable("icacls.exe"), [path, "/inheritance:r", "/grant:r", `*${user}:(OI)(CI)F`, `*${WINDOWS_SYSTEM}:(OI)(CI)F`, `*${WINDOWS_ADMINISTRATORS}:(OI)(CI)F`], { encoding: "utf8", timeout: 5000, maxBuffer: 16384, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+	const sddl = `D:P(A;OICI;FA;;;${user})(A;OICI;FA;;;${WINDOWS_SYSTEM})(A;OICI;FA;;;${WINDOWS_ADMINISTRATORS})`;
+	const script = "$ErrorActionPreference='Stop';$acl=New-Object System.Security.AccessControl.DirectorySecurity;$acl.SetSecurityDescriptorSddlForm($env:GENTLE_PI_CANDIDATE_ACL_SDDL,[System.Security.AccessControl.AccessControlSections]::Access);[System.IO.Directory]::SetAccessControl($env:GENTLE_PI_CANDIDATE_ACL_PATH,$acl)";
+	const systemRoot = dirname(dirname(windowsSystemExecutable("whoami.exe")));
+	execFileSync(windowsSystemExecutable("WindowsPowerShell\\v1.0\\powershell.exe"), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { encoding: "utf8", timeout: 5000, maxBuffer: 16384, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: { ...process.env, SystemRoot: systemRoot, GENTLE_PI_CANDIDATE_ACL_PATH: path, GENTLE_PI_CANDIDATE_ACL_SDDL: sddl } });
 	assertPrivateWindowsDacl(path, true);
 }
 
