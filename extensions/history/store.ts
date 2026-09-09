@@ -116,13 +116,14 @@ export function ensureRegistryEntry(
   const data = readRegistry(root);
   if (data[hash] === cwd) return { hash, created: false };
   if (data[hash] !== undefined) {
-    // Collision: lengthen this entry's key; readers resolve labels by exact
-    // key match so both mappings remain addressable.
-    const longHash = projectHashLong(cwd);
-    delete data[hash];
-    data[longHash] = cwd;
+    // Collision: re-key the EXISTING occupant at 24 hash chars so both
+    // identities coexist; the incoming cwd keeps the short hash — the
+    // key shape projectDir/sessionFilePath/drains derive.
+    const existing = data[hash];
+    data[projectHashLong(existing)] = existing;
+    data[hash] = cwd;
     writeRegistryAtomic(root, data);
-    return { hash: longHash, created: true };
+    return { hash, created: true };
   }
   data[hash] = cwd;
   writeRegistryAtomic(root, data);

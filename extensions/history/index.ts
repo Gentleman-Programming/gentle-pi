@@ -1,4 +1,4 @@
-//SPDX-FileCopyrightText: 2026 ExoPro. Inspired by @jasonish/pi-prompt-history
+// SPDX-FileCopyrightText: 2026 ExoPro. Inspired by @jasonish/pi-prompt-history
 // SPDX-License-Identifier: MIT
 
 import { join } from "node:path";
