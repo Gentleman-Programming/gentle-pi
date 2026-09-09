@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+import { realpathSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
-import type { NativeReviewCli } from "../lib/native-review-cli.ts";
+import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError, type NativeReviewCli } from "../lib/native-review-cli.ts";
 import type { ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 
 // gentle-pi#556 / gentle-ai#4051: with RDD enabled, the agent finished an
@@ -23,27 +26,30 @@ import type { ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 // touch this machine's actual home directory.
 
 type AnyHandler = (event: unknown, ctx: ExtensionContext) => unknown;
+type RegisteredTool = Parameters<ExtensionAPI["registerTool"]>[0];
 type SentMessage = { message: Record<string, unknown>; options: Record<string, unknown> };
 
 function harness(nativeReviewCli: NativeReviewCli | null): {
 	handlers: Map<string, AnyHandler>;
 	sent: SentMessage[];
+	tools: Map<string, RegisteredTool>;
 } {
 	const handlers = new Map<string, AnyHandler>();
 	const sent: SentMessage[] = [];
+	const tools = new Map<string, RegisteredTool>();
 	const pi = {
 		on(name: string, handler: AnyHandler) {
 			handlers.set(name, handler);
 		},
 		events: { emit() {} },
 		registerCommand() {},
-		registerTool() {},
+		registerTool(tool: RegisteredTool) { tools.set(tool.name, tool); },
 		sendMessage(message: Record<string, unknown>, options: Record<string, unknown> = {}) {
 			sent.push({ message, options });
 		},
 	} as unknown as ExtensionAPI;
 	createGentleAiExtension({ nativeReviewCli })(pi);
-	return { handlers, sent };
+	return { handlers, sent, tools };
 }
 
 function ctx(sessionId: string, hasUI = true, cwd = process.cwd()): ExtensionContext {
@@ -110,6 +116,114 @@ function stopStatus(targetIdentity: string): ReviewStatusV3 {
 }
 
 const agentEndEvent = { type: "agent_end", messages: [] };
+
+// #772: use the acknowledgement vector and returned-envelope shapes from
+// review-controller-native-routing.test.ts, through the registered tool rather
+// than the controller helper, so agent_end shares the same extension state.
+for (const scenario of ["same", "changed", "sibling-root", "nested-root", "failed", "unknown", "shutdown", "other-session", "legacy-success"] as const) {
+	test(`agent_end after approved acknowledgement: ${scenario}`, async (t) => {
+		const changedTarget = scenario === "changed";
+		const unsuccessful = scenario === "failed" || scenario === "unknown";
+		const cwd = realpathSync(process.cwd());
+		const siblingRoot = realpathSync(tmpdir());
+		if (scenario === "sibling-root") {
+			// Model a sibling worktree sharing the real common directory without
+			// creating a worktree or mutating repository state.
+			const exec = childProcess.execFileSync;
+			const commonDir = exec("git", ["rev-parse", "--git-common-dir"], { cwd, encoding: "utf8" }).trim();
+			t.mock.method(childProcess, "execFileSync", (file: string, args: string[], options: { cwd?: string }) => {
+				if (file === "git" && options.cwd === siblingRoot) {
+					if (args[1] === "--show-toplevel") return siblingRoot;
+					if (args[1] === "--git-common-dir") return commonDir;
+				}
+				return exec(file, args, options);
+			});
+			syncBuiltinESMExports();
+			t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+		}
+		const lineageId = `agent-end-post-ack-${scenario}`;
+		const targetIdentity = `sha256:${"a".repeat(64)}`;
+		const nextTarget = changedTarget ? `sha256:${"b".repeat(64)}` : targetIdentity;
+		const binding = { lineageId, targetIdentity, revision: targetIdentity };
+		const arguments_ = [
+			["cwd", cwd], ["lineage", lineageId], ["target", targetIdentity],
+			["expected-revision", targetIdentity], ["token", "provider-issued-once"],
+		].map(([name, value]) => ({ name, value, token: `--${name}=${value}` }));
+		const approved = {
+			contract: "gentle-ai.review-integration/v2",
+			applicability: "current_target",
+			authority: { version: "compact-v2", lineageId, state: "approved", generation: 1, revision: targetIdentity },
+			receipt: { status: "expected_missing" },
+			action: "stop", replayability: "not_replayable", targetIdentity, candidates: [],
+			nextTransition: {
+				kind: "execute", reasonCode: "approved_acknowledgement_required",
+				execute: {
+					operation: "review.acknowledge-approved",
+					command: "gentle-ai review acknowledge-approved --provider-vector",
+					arguments: arguments_,
+					preconditions: [{ name: "state", value: "approved", token: "--state=approved" }],
+					binding,
+				},
+			},
+			raw: { schema: "gentle-ai.review-integration.status/v5" },
+		} as unknown as ReviewStatusV3;
+		const statusRequests: unknown[] = [];
+		const acknowledgementRequests: unknown[] = [];
+		let burned = false;
+		const native = {
+			reviewMode: onMode("on"),
+			targetStatus: async (request: unknown) => {
+				statusRequests.push(request);
+				return burned ? executeStartStatus(nextTarget) : approved;
+			},
+			acknowledgeApproved: async (request: unknown) => {
+				acknowledgementRequests.push(request);
+				burned = true;
+				if (scenario === "failed") throw new TypeError("local acknowledgement validation failed");
+				if (scenario === "unknown") throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, "review/acknowledge-approved", true, true, "acknowledgement outcome unknown");
+				if (scenario === "legacy-success") return undefined;
+				return {
+					schema: "gentle-ai.review-acknowledged/v1",
+					operation: "review/acknowledge-approved", action: "acknowledged",
+					lineageId, targetIdentity, consumedRevision: targetIdentity, authority: "burned",
+					raw: { schema: "gentle-ai.review-acknowledged/v1" },
+				};
+			},
+		} as unknown as NativeReviewCli;
+		const { handlers, sent, tools } = harness(native);
+		const session = ctx(lineageId, true, cwd);
+		const review = tools.get("gentle_review");
+		assert.ok(review);
+		const result = await review.execute("post-ack", { operation: "acknowledge-approved", lineageId }, undefined, undefined, session);
+		if (unsuccessful) {
+			assert.equal(result.details.outcome, scenario === "failed" ? "native-operation-failed" : "native-mutation-status-reconciled");
+			assert.equal(result.details.mutation_outcome, scenario === "failed" ? "none" : "unknown");
+		} else assert.deepEqual(result.details, {
+			operation: "acknowledge-approved", status: "closed",
+			outcome: "native-approved-acknowledgement-completed",
+			lineage_id: lineageId, target_identity: targetIdentity,
+			...(scenario === "legacy-success" ? {} : { consumed_revision: targetIdentity, burn_evidence: "gentle-ai.review-acknowledged/v1" }),
+			authority: "burned",
+			delivery: "ordinary-repository-policy", mutation_performed: true, mutation_outcome: "committed",
+		});
+		assert.deepEqual(acknowledgementRequests, [{ cwd, argumentTokens: arguments_.map(({ token }) => token), binding }]);
+		if (scenario !== "unknown") assert.deepEqual(statusRequests, [{ cwd, lineageId }], "ACK reports burn without a later STATUS");
+		const callsBeforeEnd = statusRequests.length;
+		assert.deepEqual(sent, [], "no earlier reminder can mask the post-burn regression");
+
+		if (scenario === "shutdown") await handlers.get("session_shutdown")!({}, session);
+		const endSession = scenario === "sibling-root" ? ctx(lineageId, true, siblingRoot)
+			: scenario === "nested-root" ? ctx(lineageId, true, join(cwd, "tests"))
+			: scenario === "other-session" ? ctx(`${lineageId}-new`, true, cwd) : session;
+		await handlers.get("agent_end")!(agentEndEvent, endSession);
+		assert.deepEqual(statusRequests.slice(callsBeforeEnd), [{ cwd: endSession.cwd, agent: "pi" }]);
+		const reminders = sent.filter(({ message }) => message.customType === "gentle-pi.review-preflight");
+		const shouldRemind = scenario !== "same" && scenario !== "legacy-success" && scenario !== "nested-root";
+		assert.equal(reminders.length, shouldRemind ? 1 : 0,
+			shouldRemind ? "an unacknowledged target/session/root still requires preflight" : "the acknowledged target must not receive another preflight reminder");
+		if (changedTarget) assert.ok(String(reminders[0]?.message.content).includes(nextTarget));
+	});
+}
 
 test("agent_end performs no STATUS call and sends nothing when RDD is off", async () => {
 	const statusRequests: unknown[] = [];
