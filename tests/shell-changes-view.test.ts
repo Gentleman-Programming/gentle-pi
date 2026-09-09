@@ -75,7 +75,7 @@ test("worktree accordion keeps groups and nested files beside a framed lazy diff
 	assert.equal(lines.length, 10);
 	assert.match(lines[0], /^╭─ ✎ Changes/);
 	assert.match(lines[1], /^│   ▾ main · main +│ \+\/main:same.ts +│$/);
-	assert.match(lines[2], /^│ ▸   - same.ts +\+1 −0 +│/);
+	assert.match(lines[2], /^│ ▸   M same.ts +\+1 -0 +│/);
 	assert.match(lines[3], /^│   ▸ detached · linked +│/);
 	assert.match(lines[9], /^╰─+╯$/);
 	for (const line of lines) assert.equal(visibleWidth(line), 100);
@@ -83,7 +83,7 @@ test("worktree accordion keeps groups and nested files beside a framed lazy diff
 	component.handleInput("o");
 	component.handleInput("j");
 	assert.doesNotMatch(component.render(100).join("\n"), /\+\/main:same.ts/, "header selection clears unrelated preview");
-	assert.match(component.render(100)[2], /^│     - same.ts +\+1 −0 +│/, "unselected children retain their fixed marker and indentation");
+	assert.match(component.render(100)[2], /^│     M same.ts +\+1 -0 +│/, "unselected children retain their fixed marker and indentation");
 	component.handleInput(" ");
 	component.handleInput("j");
 	await settle();
@@ -190,7 +190,7 @@ test("accordion selection scrolls flattened rows and diff scrolling does not ope
 	component.handleInput(" ");
 	for (let index = 0; index < 20; index++) component.handleInput("j");
 	await settle();
-	assert.match(component.render(100).join("\n"), /▸   - file-19.ts/);
+	assert.match(component.render(100).join("\n"), /▸   M file-19.ts/);
 	component.handleInput("\x0a");
 	assert.match(component.render(100)[1], /\+line 5/);
 	component.handleInput("\x0b");
@@ -200,6 +200,43 @@ test("accordion selection scrolls flattened rows and diff scrolling does not ope
 		for (const line of component.render(width)) assert.ok(visibleWidth(line) <= width);
 	}
 });
+
+const statusCases = [
+	[CHANGE_STATUS.MODIFIED, "M", 2, 1],
+	[CHANGE_STATUS.ADDED, "A", 3, 0],
+	[CHANGE_STATUS.DELETED, "D", 0, 4],
+	[CHANGE_STATUS.RENAMED, "R", 0, 0],
+	[CHANGE_STATUS.UNTRACKED, "??", 5, 0],
+] as const;
+
+for (const [status, code, added, deleted] of statusCases) {
+	test(`both file lists render ${status} with colored signed counts`, () => {
+		const theme = {
+			fg(role: string, text: string) {
+				const color = role === "success" ? 32 : role === "error" ? 31 : 36;
+				return `\x1b[${color}m${text}\x1b[39m`;
+			},
+		};
+		const target = file("a.ts", added, deleted, status);
+		const accordion = new WorktreeChangesView([{ root: "/main", branch: "main", model: changesModel([target]) }], {
+			theme, rows: 10, loadDiff: async () => "", onOpen() {}, onClose() {}, onRefresh() {}, requestRender() {},
+		});
+		accordion.handleInput("\r");
+		const standalone = view({ theme }, [target]).view;
+		for (const selected of [false, true]) {
+			if (selected) accordion.handleInput("j");
+			for (const [component, row] of [[accordion, 2], [standalone, 1]] as const) {
+				const line = component.render(100)[row];
+				assert.ok(stripAnsi(line).includes(`${code} a.ts  +${added} -${deleted}`));
+				assert.ok(line.includes(`\x1b[32m+${added}\x1b[39m`), "addition uses success color");
+				assert.ok(line.includes(`\x1b[31m-${deleted}\x1b[39m`), "deletion uses error color");
+				for (const width of [8, 20, 40, 100]) {
+					for (const rendered of component.render(width)) assert.ok(visibleWidth(rendered) <= width);
+				}
+			}
+		}
+	});
+}
 
 test("colorDiff drops git headers and colors hunks, additions, and removals by role", () => {
 	const lines = colorDiff(DIFF_A, taggedTheme);
@@ -220,8 +257,8 @@ test("ChangesView renders a framed two-pane layout at the requested size", async
 	for (const line of lines) assert.equal(visibleWidth(line), 80, `"${stripAnsi(line)}" is not 80 wide`);
 	const plain = lines.map(stripAnsi);
 	assert.match(plain[0], /^╭─ ✎ Changes · 2 files · \+12 −1 ─+╮$/);
-	assert.match(plain[1], /^│ ▸ lib\/a\.ts +\+2 −1 +│ @@ -1,2 \+1,3 @@ +│$/);
-	assert.match(plain[2], /^│   lib\/b\.ts +\+10 new +│  const a = 1; +│$/);
+	assert.match(plain[1], /^│ ▸ M lib\/a\.ts +\+2 -1 +│ @@ -1,2 \+1,3 @@ +│$/);
+	assert.match(plain[2], /^│   A lib\/b\.ts +\+10 -0 +│  const a = 1; +│$/);
 	assert.match(plain[11], /^╰─+╯$/);
 	assert.match(plain[10], /j\/k file .* o open in editor .* esc close/);
 });
@@ -233,11 +270,11 @@ test("ChangesView loads the selected diff lazily and moves with j/k and arrows",
 	component.handleInput("j");
 	await settle();
 	assert.deepEqual(calls, ["lib/a.ts", "lib/b.ts"]);
-	assert.match(stripAnsi(component.render(80)[2]), /^│ ▸ lib\/b\.ts/);
+	assert.match(stripAnsi(component.render(80)[2]), /^│ ▸ A lib\/b\.ts/);
 	component.handleInput("\x1b[A");
-	assert.match(stripAnsi(component.render(80)[1]), /^│ ▸ lib\/a\.ts/);
+	assert.match(stripAnsi(component.render(80)[1]), /^│ ▸ M lib\/a\.ts/);
 	component.handleInput("k");
-	assert.match(stripAnsi(component.render(80)[1]), /^│ ▸ lib\/a\.ts/);
+	assert.match(stripAnsi(component.render(80)[1]), /^│ ▸ M lib\/a\.ts/);
 	assert.ok(events.filter((event) => event === "render").length >= 2);
 });
 
@@ -278,7 +315,7 @@ test("ChangesView.update keeps the selected file, reloads moved diffs, and survi
 
 	component.update(changesModel([file("lib/a.ts", 5, 1), file("lib/b.ts", 10, 0, CHANGE_STATUS.ADDED), file("lib/c.ts", 1, 0)]));
 	await settle();
-	assert.match(stripAnsi(component.render(80)[2]), /^│ ▸ lib\/b\.ts/);
+	assert.match(stripAnsi(component.render(80)[2]), /^│ ▸ A lib\/b\.ts/);
 	assert.deepEqual(calls, ["lib/a.ts", "lib/b.ts"], "unchanged selected file must not reload");
 	component.handleInput("k");
 	await settle();
