@@ -38,7 +38,7 @@ for (const showRose of [false, true]) for (const showTextLogo of [false, true]) 
 		}
 		let start: Function;
 		let shutdown: Function;
-		let header: { render(width: number): string[]; invalidate(): void };
+		let header: { render(width: number): string[]; dispose(): void };
 		const writes: string[] = [];
 		startup({ on: (name: string, fn: Function) => {
 			if (name === "session_start") start = fn;
