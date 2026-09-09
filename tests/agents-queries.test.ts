@@ -8,7 +8,6 @@ import { fakeChild } from "./agents-fake-child.ts";
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 const agent: AgentDefinition = { name: "worker", description: "", filePath: "/a.md", scope: "global", instructions: "", model: undefined, thinking: undefined, mode: undefined, tools: ["read"] };
-type QueryRunner = { reply(taskId: string, requestId: string, message: string, parentSessionId: string): Promise<boolean> };
 const request = (mode = AGENT_MODE.BACKGROUND) => ({ agent, prompt: "work", label: undefined, context: undefined, mode, cwd: "/repo", parentSessionId: "s1", model: undefined, thinking: undefined, sessionDir: "/sessions", resumeSessionPath: undefined, env: {} });
 
 test("ChildMessenger validates query replies and settles timeout, callback failure, and disconnect once", async () => {
@@ -142,10 +141,10 @@ test("background queries keep correlation, bounds, and ownership before replying
 	await tick();
 	assert.deepEqual(queries, ["q1", "q2", "q3", "q4"].map((requestId, index) => ({ taskId: task.id, requestId, message: ["Which file?", "two", "three", "four"][index] })));
 	assert.deepEqual(child.sent.slice(-2), [{ id: "q5", kind: "reply", error: "too many pending parent queries" }, { id: "q1", kind: "reply", error: "duplicate query request" }]);
-	assert.equal(await (runner as unknown as QueryRunner).reply(task.id, "q1", "src/a.ts", "s1"), true);
-	assert.equal(await (runner as unknown as QueryRunner).reply(task.id, "q1", "again", "s1"), false);
-	assert.equal(await (runner as unknown as QueryRunner).reply(task.id, "q2", "other", "s2"), false);
-	assert.equal(await (runner as unknown as QueryRunner).reply(task.id, "q2", "x".repeat(CHILD_MESSAGE_MAX_BYTES + 1), "s1"), false);
+	assert.equal(await runner.reply(task.id, "q1", "src/a.ts", "s1"), true);
+	assert.equal(await runner.reply(task.id, "q1", "again", "s1"), false);
+	assert.equal(await runner.reply(task.id, "q2", "other", "s2"), false);
+	assert.equal(await runner.reply(task.id, "q2", "x".repeat(CHILD_MESSAGE_MAX_BYTES + 1), "s1"), false);
 	assert.deepEqual(child.sent.at(-1), { id: "q1", kind: "reply", message: "src/a.ts" });
 });
 
@@ -157,7 +156,7 @@ test("a throwing query hook rolls back ownership before one error and never sche
 	await tick();
 	child.message({ id: "q1", kind: "query", message: "throw" });
 	assert.deepEqual(child.sent.at(-1), { id: "q1", kind: "reply", error: "parent rejected query" });
-	assert.equal(await (runner as unknown as QueryRunner).reply(task.id, "q1", "late", "s1"), false);
+	assert.equal(await runner.reply(task.id, "q1", "late", "s1"), false);
 	timers.at(-1)?.fn();
 	assert.equal(child.sent.filter((frame) => frame.id === "q1").length, 1);
 });
@@ -172,14 +171,14 @@ test("query expiry, IPC revocation, delayed callbacks, and foreground admission 
 	assert.equal(timers.at(-1)?.ms, 30_000);
 	let callback: ((error: Error | null) => void) | undefined;
 	child.child.send = (_frame, done) => { callback = done; return false; };
-	const pending = (runner as unknown as QueryRunner).reply(task.id, "q1", "late", "s1");
+	const pending = runner.reply(task.id, "q1", "late", "s1");
 	timers.at(-1)?.fn();
 	assert.equal(await pending, false);
 	callback?.(null);
-	assert.equal(await (runner as unknown as QueryRunner).reply(task.id, "q1", "again", "s1"), false);
+	assert.equal(await runner.reply(task.id, "q1", "again", "s1"), false);
 	child.message({ id: "q2", kind: "query", message: "disconnect" });
 	child.child.disconnect?.();
-	assert.equal(await (runner as unknown as QueryRunner).reply(task.id, "q2", "no", "s1"), false);
+	assert.equal(await runner.reply(task.id, "q2", "no", "s1"), false);
 	const foregroundChild = fakeChild();
 	let foregroundQueries = 0;
 	const foreground = new AgentRunner(new TaskStore(), { maxConcurrency: 1, stallTimeoutMs: 10_000 }, { spawn: () => foregroundChild.child, now: () => 1, schedule: () => () => {}, pi: { command: "pi", args: [] } }, { askUser: async () => ({ cancelled: true }), onQuery: () => { foregroundQueries += 1; } });

@@ -11,6 +11,7 @@ test("notification and query frames admit only bounded exact schemas", () => {
 	for (const frame of [
 		{ id: "n1", kind: "notification", message: "ready", sender: "forged" },
 		{ id: "n1", kind: "query", message: "wrong grammar" },
+		{ id: "q1", kind: "notification", message: "wrong grammar" },
 		{ id: "q0", kind: "query", message: "leading zero" },
 		{ id: `q${"1".repeat(1_000)}`, kind: "query", message: "unbounded correlation" },
 		{ id: "q9007199254740992", kind: "query", message: "unsafe correlation" },
