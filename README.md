@@ -461,11 +461,15 @@ Every new interactive session confirms preflight on its first SDD invocation. Sa
 
 Canonical values are `auto` execution mode, `openspec` artifact store, `ask-on-risk` delivery strategy, and a `400` changed-line review threshold. The delivery strategy domain is `ask-on-risk`, `auto-chain`, `single-pr`, or `exception-ok`; `chain_strategy` remains deferred until chaining is selected. `exception-ok` requires explicit `size:exception` acceptance and is never inferred. Consent, authorization, security, destructive/publishing, interactive phase approval, and ambiguous-scope gates remain human-controlled.
 
-Startup refreshes hash-proven package-owned assets. For the previously unowned `sdd-research.md`, migration recognizes only the known old content hash (ignoring model/thinking routing), preserves routing, and records ownership. Body-edited or unknown assets remain untouched. Manual refresh uses the same ownership checks:
+Startup refreshes hash-proven package-owned assets. For the previously unowned `sdd-research.md`, migration recognizes only the known old content hash (ignoring model/thinking routing), preserves routing, and records ownership. Body-edited or unknown assets remain untouched. Manual refresh uses the same ownership checks, scoped to the selected owner:
 
 ```text
+/gentle:install-delegation --force
+/gentle:install-review --force
 /gentle:install-sdd --force
 ```
+
+SDD preflight (including `/gentle-sdd-init`) installs missing SDD agents, chains, and support files and refreshes hash-proven managed SDD copies only. It preserves user edits and project overrides. Applying explicit saved model settings remains a separate, global concern at startup and preflight; the three installer commands do not apply model settings.
 
 ### Selected research
 
@@ -772,8 +776,10 @@ Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer and editor.
 | `/gentle:toggle-text-logo`       | Toggles the startup text logo.                                      |
 | `/gentle:banner-color`           | Selects a startup banner color preset.                              |
 | `/gentle-sdd-init`               | Initializes or refreshes `openspec/config.yaml` (openspec/both stores only). |
-| `/gentle:install-sdd`         | Repairs missing global SDD runtime assets without overwriting files. |
-| `/gentle:install-sdd --force` | Force-refreshes installed global SDD assets.                         |
+| `/gentle:install-delegation` | Installs missing global delegation agents only; `--force` refreshes managed copies. |
+| `/gentle:install-review`     | Installs missing global review agents and chains only; `--force` refreshes managed copies. |
+| `/gentle:install-sdd`         | Installs missing global SDD agents, chains, and support only, without overwriting files. |
+| `/gentle:install-sdd --force` | Refreshes only managed global SDD assets, preserving user edits and project overrides. |
 | `/skill-registry:refresh`        | Regenerates `.atl/skill-registry.md`.                               |
 | `/skill-creation`                | Creates or updates an LLM-first skill using the packaged `gentle-ai-skill-creator` contract and style guide. |
 

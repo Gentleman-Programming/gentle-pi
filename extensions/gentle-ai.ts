@@ -38,6 +38,7 @@ import {
 	ensureSddPreflight,
 	getSddPreflightPreferences,
 	installSddAssets,
+	installPackageAssets,
 	isPackageManagedSddAsset,
 	isSddPreflightTrigger,
 	renderSddPreflightPrompt,
@@ -193,6 +194,7 @@ import {
 const GRAPH_V1_ORDINARY_READ_ONLY = "Graph-v1 ordinary review authority is read-only; use native compact-v2 review operations";
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
+const PACKAGE_ASSET_REPAIR_GUIDANCE = "refresh intentionally by owner: delegation /gentle:install-delegation --force; review /gentle:install-review --force; SDD /gentle:install-sdd --force";
 
 function gentlePiAgentHome(): string {
 	return resolveGentlePiAgentHome();
@@ -6727,7 +6729,7 @@ function createGentleAiExtensionForTesting(
 	});
 
 	function runSddPreflight(ctx: ExtensionContext, promptFields: readonly SddPreflightField[] = []): Promise<SddPreflightPreferences> {
-		return ensureSddPreflight(ctx, { pi, installAssets: (cwd) => installSddAssets(cwd, false), applyModelConfig: async () => applySavedModelConfig(ctx) }, { promptFields });
+		return ensureSddPreflight(ctx, { pi, installAssets: (cwd) => installPackageAssets(cwd, true, ["sdd"]), applyModelConfig: async () => applySavedModelConfig(ctx) }, { promptFields });
 	}
 
 	pi.on("session_start", async (event, ctx) => {
@@ -6951,18 +6953,20 @@ function createGentleAiExtensionForTesting(
 		return await confirmCommand(event.input.command, ctx, pi.events, herdrLifecycle);
 	});
 
-	pi.registerCommand("gentle:install-sdd", {
-		description:
-			"Repair or refresh global Gentle AI SDD subagent and chain assets.",
-		handler: async (args, ctx) => {
-			const force = args.includes("--force");
-			const result = installSddAssets(ctx.cwd, force);
-			ctx.ui.notify(
-				`Global Gentle AI SDD assets installed: ${result.agents} agent(s), ${result.chains} chain(s), ${result.support} support file(s), ${result.skipped} already present.`,
-				"info",
-			);
-		},
-	});
+	for (const owner of ["delegation", "review", "sdd"] as const) {
+		const label = owner === "sdd" ? "SDD" : owner;
+		pi.registerCommand(`gentle:install-${owner}`, {
+			description: `Repair or refresh only global Gentle AI ${label} assets.`,
+			handler: async (args, ctx) => {
+				const force = args.includes("--force");
+				const result = installPackageAssets(ctx.cwd, force, [owner]);
+				ctx.ui.notify(
+					`Global Gentle AI ${label} assets installed: ${result.agents} agent(s), ${result.chains} chain(s), ${result.support} support file(s), ${result.skipped} already present.`,
+					"info",
+				);
+			},
+		});
+	}
 
 	pi.registerCommand("gentle:sdd-preflight", {
 		description:
@@ -7116,7 +7120,7 @@ function createGentleAiExtensionForTesting(
 				"el Gentleman doctor",
 				`${agentsInstalled ? "pass" : "fail"}: Global SDD agents ${agentsInstalled ? "installed" : "missing"}`,
 				`${chainsInstalled ? "pass" : "fail"}: Global SDD chains ${chainsInstalled ? "installed" : "missing"}`,
-				`${staleSddAssets === 0 ? "pass" : "warn"}: Global SDD asset drift ${staleSddAssets} file(s)`,
+				`${staleSddAssets === 0 ? "pass" : "warn"}: Global package asset drift ${staleSddAssets} file(s)`,
 				`${localSddAgentOverrides === 0 ? "pass" : "warn"}: Project-local SDD agent overrides ${localSddAgentOverrides} file(s)`,
 				`${openspecConfigured ? "pass" : "warn"}: OpenSpec config ${openspecConfigured ? "present" : "missing"}`,
 				`${skillRegistryPresent ? "pass" : "warn"}: Skill registry ${skillRegistryPresent ? "present" : "missing"}`,
@@ -7126,8 +7130,8 @@ function createGentleAiExtensionForTesting(
 				...(devBinary.state === "active" ? [`warn: ${devBinary.line}`] : []),
 				...(devBinary.state === "invalid" ? [`fail: ${devBinary.line}`, "remedy: fix the dev binary override or clear it with /gentle:dev-binary off (or unset GENTLE_PI_GENTLE_AI_DEV_BINARY)"] : []),
 			];
-			if (!agentsInstalled || !chainsInstalled) {
-				lines.push("remedy: run /gentle:install-sdd --force to refresh global SDD assets intentionally");
+			if (!agentsInstalled || !chainsInstalled || staleSddAssets > 0) {
+				lines.push(`remedy: ${PACKAGE_ASSET_REPAIR_GUIDANCE}`);
 			}
 			if (modelConfig.status === "invalid") {
 				lines.push(`remedy: fix or remove ${modelConfig.path}`);
@@ -7309,9 +7313,9 @@ function createGentleAiExtensionForTesting(
 					`Persona: ${readPersonaMode(ctx.cwd)}`,
 					`Global SDD agents: ${agentsInstalled ? "installed" : "not installed"}`,
 					`Global SDD chains: ${chainsInstalled ? "installed" : "not installed"}`,
-					`Global SDD assets stale: ${staleSddAssets} file(s)${
+					`Global package assets stale: ${staleSddAssets} file(s)${
 						staleSddAssets > 0
-							? " — run /gentle:install-sdd --force to refresh intentionally"
+							? ` — ${PACKAGE_ASSET_REPAIR_GUIDANCE}`
 							: ""
 					}`,
 					`Project-local SDD agent overrides: ${localSddAgentOverrides} file(s)${

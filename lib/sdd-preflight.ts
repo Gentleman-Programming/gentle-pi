@@ -590,7 +590,8 @@ function removeRetiredManagedAssets(
 	}
 }
 
-// Compatibility entry point: startup and commands still install every asset until unit 2.
+// Legacy all-owner entry point retained for compatibility and the current startup sweep.
+// Owner-specific commands and SDD preflight use installPackageAssets directly.
 export function installSddAssets(
 	cwd: string,
 	force: boolean,
