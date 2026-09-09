@@ -143,6 +143,18 @@ test("private candidate owner reports bounded Windows DACL mismatch reasons for 
 	}
 });
 
+test("private candidate owner accepts LA for an RID-500 current user", () => {
+	assert.doesNotThrow(() => validatePrivateWindowsDacl("D:P(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", "S-1-5-21-1-2-3-500", true));
+});
+
+test("private candidate owner rejects LA for a non-RID-500 current user", () => {
+	assert.throws(() => validatePrivateWindowsDacl("D:P(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", "S-1-5-21-1-2-3-1001", true), (error: unknown) => error instanceof WindowsDaclValidationError && error.reason === "ace-trustee" && error.trustee === "LA");
+});
+
+test("private candidate owner rejects raw and LA current-user grants as duplicates", () => {
+	assert.throws(() => validatePrivateWindowsDacl("D:P(A;OICI;FA;;;S-1-5-21-1-2-3-500)(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", "S-1-5-21-1-2-3-500", true), (error: unknown) => error instanceof WindowsDaclValidationError && error.reason === "ace-duplicate");
+});
+
 test("private candidate owner removes unrelated explicit Windows grants during enforcement", { skip: process.platform !== "win32" }, (t) => {
 	const cwd = repository(t), commonDir = join(cwd, ".git"), parent = join(commonDir, "gentle-ai", "candidate-views");
 	const initial = new CandidateViewRegistry().create({ contributorRoot: cwd });

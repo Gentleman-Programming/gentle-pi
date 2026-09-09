@@ -72,13 +72,18 @@ export class WindowsDaclValidationError extends Error {
 function classifyWindowsTrustee(value: string | undefined): WindowsDaclTrusteeClassification {
 	const trustee = value?.toUpperCase() ?? "";
 	if (["OW", "CO", "BU", "AU", "WD", "LA"].includes(trustee)) return trustee as WindowsDaclTrusteeClassification;
-	if (/^S-\d+(?:-\d+)+$/i.test(trustee)) return "sid";
+	if (isWindowsSid(trustee)) return "sid";
 	return trustee === "" ? "missing" : "other";
+}
+
+function isWindowsSid(value: string): boolean {
+	return /^S-\d+(?:-\d+)+$/i.test(value);
 }
 
 export function validatePrivateWindowsDacl(dacl: string, user: string, protectedDacl: boolean): void {
 	if (protectedDacl && !dacl.startsWith("D:P")) throw new WindowsDaclValidationError("protection");
 	const trustees = new Map([[user.toUpperCase(), "user"], [WINDOWS_SYSTEM, "system"], ["SY", "system"], [WINDOWS_ADMINISTRATORS, "administrators"], ["BA", "administrators"]]);
+	if (isWindowsSid(user) && user.endsWith("-500")) trustees.set("LA", "user");
 	const aces = [...dacl.matchAll(/\(([^()]*)\)/g)].map((match) => match[1]!.split(";"));
 	const expectedFlags = protectedDacl ? "OICI" : "ID";
 	const granted = new Set<string>();
