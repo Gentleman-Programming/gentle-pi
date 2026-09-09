@@ -369,4 +369,185 @@ export class SddProfileManager {
 		}
 		return null;
 	}
+
+	setActiveProfileName(name: string): void {
+		try {
+			const dir = path.dirname(this.activeStatePath);
+			if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(this.activeStatePath, name.trim(), "utf-8");
+		} catch {}
+	}
+
+	clearActiveProfileName(): void {
+		if (fs.existsSync(this.activeStatePath)) {
+			try {
+				fs.unlinkSync(this.activeStatePath);
+			} catch {}
+		}
+		const clean = (filePath: string) => {
+			if (!fs.existsSync(filePath)) return;
+			try {
+				const config = JSON.parse(fs.readFileSync(filePath, "utf-8")) as SubagentsConfigFile;
+				if (config.active_profile) {
+					delete config.active_profile;
+				fs.writeFileSync(filePath, JSON.stringify(config, null, 2) + "\n", "utf-8");
+				}
+			} catch {}
+		};
+		clean(this.projectSubagentsPath);
+		clean(this.globalSubagentsPath);
+	}
+
+	deleteProfile(name: string, force = false): boolean {
+		const key = this.sanitizeName(name);
+		const active = this.getActiveProfileName();
+		if (!force && active && this.sanitizeName(active) === key) return false;
+		let deleted = false;
+		for (const dir of [this.projectDir, this.globalDir]) {
+			const filePath = path.join(dir, `${key}.json`);
+			if (fs.existsSync(filePath)) {
+				try {
+					fs.unlinkSync(filePath);
+					deleted = true;
+				} catch {}
+			}
+		}
+		const isBuiltin =
+			Boolean(BUILTIN_PROFILES[name] ?? BUILTIN_PROFILES[key]) ||
+			Boolean(this.builtinsDir && fs.existsSync(path.join(this.builtinsDir, `${key}.json`)));
+		if (isBuiltin && !this.getDeletedProfiles().has(key)) {
+			this.addDeletedProfile(key);
+			deleted = true;
+		}
+		if (deleted) {
+			const current = this.getActiveProfileName();
+			if (current && this.sanitizeName(current) === key) this.clearActiveProfileName();
+		}
+		return deleted;
+	}
+
+	renameProfile(oldName: string, newName: string): { success: boolean; message: string; targetPath?: string } {
+		const trimmedNew = newName.trim();
+		if (!trimmedNew) return { success: false, message: "New name must not be empty." };
+		const oldKey = this.sanitizeName(oldName);
+		const newKey = this.sanitizeName(trimmedNew);
+		if (oldKey === newKey) return { success: false, message: "New name must differ." };
+		const original = this.loadProfile(oldName);
+		if (!original) return { success: false, message: `Profile "${oldName}" not found.` };
+		if (this.loadProfile(trimmedNew)) {
+			return { success: false, message: `Profile "${trimmedNew}" already exists.` };
+		}
+		const targetScope: "project" | "global" = fs.existsSync(path.join(this.projectDir, `${oldKey}.json`))
+			? "project"
+			: "global";
+		const updated: Profile = { ...original, name: trimmedNew, updated_at: new Date().toISOString() };
+		const savedPath = this.saveProfile(updated, targetScope);
+		const active = this.getActiveProfileName();
+		const wasActive = Boolean(active && this.sanitizeName(active) === oldKey);
+		this.deleteProfile(oldName, true);
+		const bump = (filePath: string) => {
+			if (!fs.existsSync(filePath)) return;
+			try {
+				const config = JSON.parse(fs.readFileSync(filePath, "utf-8")) as SubagentsConfigFile;
+				if (config.active_profile && this.sanitizeName(config.active_profile) === oldKey) {
+					config.active_profile = trimmedNew;
+					fs.writeFileSync(filePath, JSON.stringify(config, null, 2) + "\n", "utf-8");
+				}
+			} catch {}
+		};
+		bump(this.projectSubagentsPath);
+		bump(this.globalSubagentsPath);
+		if (wasActive) this.setActiveProfileName(trimmedNew);
+		return { success: true, message: `Renamed "${oldName}" to "${trimmedNew}".`, targetPath: savedPath };
+	}
+
+	activateProfile(name: string, target: "global" | "project" = "global"): { success: boolean; profile?: Profile; message: string } {
+		const profile = this.loadProfile(name);
+		if (!profile) return { success: false, message: `Profile "${name}" not found.` };
+		const targetPath = target === "project" ? this.projectSubagentsPath : this.globalSubagentsPath;
+		applyProfileToFile(targetPath, profile);
+		this.setActiveProfileName(profile.name);
+		return { success: true, profile, message: `Activated "${profile.name}" on ${target} subagents.json.` };
+	}
+
+	saveCurrentAsProfile(name: string, description?: string, scope: "global" | "project" = "global"): { success: boolean; path?: string; profile?: Profile; message: string } {
+		let sourcePath = this.globalSubagentsPath;
+		if (fs.existsSync(this.projectSubagentsPath)) sourcePath = this.projectSubagentsPath;
+		let config: SubagentsConfigFile = {};
+		if (fs.existsSync(sourcePath)) {
+			try {
+				config = JSON.parse(fs.readFileSync(sourcePath, "utf-8"));
+			} catch {
+				config = {};
+			}
+		}
+		const profile = extractProfileFromConfig(config, name, description);
+		const savedPath = this.saveProfile(profile, scope);
+		this.setActiveProfileName(profile.name);
+		return { success: true, path: savedPath, profile, message: `Saved "${profile.name}" to ${savedPath}.` };
+	}
+
+	createProfile(params: {
+		name: string;
+		description?: string;
+		default_model?: string;
+		default_effort?: ReasoningEffort;
+		model_profiles?: Record<string, ModelProfileEntry>;
+		scope?: "global" | "project";
+	}): { success: boolean; path?: string; profile?: Profile; message: string } {
+		const trimmed = params.name.trim();
+		if (!trimmed) return { success: false, message: "Profile name must not be empty." };
+		if (this.loadProfile(trimmed)) {
+			return { success: false, message: `Profile "${trimmed}" already exists.` };
+		}
+		const scope = params.scope ?? "global";
+		const now = new Date().toISOString();
+		const newProfile: Profile = {
+			name: trimmed,
+			description: params.description?.trim() || undefined,
+			default_model: params.default_model?.trim() || undefined,
+			default_effort: params.default_effort,
+			model_profiles: params.model_profiles ?? {},
+			created_at: now,
+			updated_at: now,
+		};
+		const savedPath = this.saveProfile(newProfile, scope);
+		return {
+			success: true,
+			path: savedPath,
+			profile: newProfile,
+			message: `Created "${newProfile.name}" in ${scope} (${savedPath}).`,
+		};
+	}
+
+	setAgentInProfile(params: {
+		profileName: string;
+		agentName: string;
+		model: string;
+		effort?: ReasoningEffort;
+	}): { success: boolean; profile?: Profile; message: string } {
+		const profile = this.loadProfile(params.profileName);
+		if (!profile) return { success: false, message: `Profile "${params.profileName}" not found.` };
+		const agent = params.agentName.trim();
+		if (!ALL_KNOWN_AGENTS.includes(agent)) {
+			return { success: false, message: `Unknown agent "${params.agentName}".` };
+		}
+		const model = params.model.trim();
+		if (!model) return { success: false, message: "Model must not be empty." };
+		const updatedProfile: Profile = {
+			...profile,
+			model_profiles: { ...profile.model_profiles, [agent]: { model, effort: params.effort } },
+			updated_at: new Date().toISOString(),
+		};
+		const key = this.sanitizeName(profile.name);
+		const origin: "global" | "project" = fs.existsSync(path.join(this.projectDir, `${key}.json`))
+			? "project"
+			: "global";
+		this.saveProfile(updatedProfile, origin);
+		return {
+			success: true,
+			profile: updatedProfile,
+			message: `Set "${agent}" to "${model}" in "${profile.name}".`,
+		};
+	}
 }

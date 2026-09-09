@@ -174,6 +174,100 @@ test("getActiveProfileName prefers project subagents.json over .active file", ()
 	assert.equal(mgr.getActiveProfileName(), null);
 });
 
+test("saveProfile round-trips and clears tombstone", () => {
+const d = makeManagerDirs();
+fs.writeFileSync(path.join(d.globalDir, ".deleted-profiles"), "gentle-default\n");
+const mgr = new SddProfileManager({ ...d });
+assert.equal(mgr.loadProfile("gentle-default"), null);
+mgr.saveProfile({ ...MIN_PROFILE("gentle-default"), default_model: "new/m" }, "global");
+assert.equal(mgr.loadProfile("gentle-default")?.default_model, "new/m");
+assert.ok(mgr.listProfiles().some((p) => p.name === "gentle-default"));
+const loaded = mgr.loadProfile("gentle-default");
+assert.ok(loaded?.created_at);
+assert.ok(loaded?.updated_at);
+});
+
+test("activateProfile writes subagents.json and sets active", () => {
+const d = makeManagerDirs();
+const mgr = new SddProfileManager({ ...d });
+mgr.saveProfile({ ...MIN_PROFILE("custom-v1"), default_model: "custom/m" }, "global");
+const res = mgr.activateProfile("custom-v1", "global");
+assert.equal(res.success, true);
+assert.equal(mgr.getActiveProfileName(), "custom-v1");
+const onDisk = JSON.parse(fs.readFileSync(d.globalSubagentsPath, "utf-8"));
+assert.equal(onDisk.active_profile, "custom-v1");
+assert.equal(onDisk.default_model, "custom/m");
+assert.equal(mgr.activateProfile("nope", "global").success, false);
+});
+
+test("deleteProfile refuses active and tombstones builtins", () => {
+const d = makeManagerDirs();
+const mgr = new SddProfileManager({ ...d });
+mgr.saveProfile(MIN_PROFILE("mine"), "global");
+mgr.activateProfile("mine", "global");
+assert.equal(mgr.deleteProfile("mine"), false);
+assert.ok(mgr.loadProfile("mine"));
+assert.equal(mgr.deleteProfile("gentle-default"), true);
+assert.ok(!mgr.listProfiles().some((p) => p.name === "gentle-default"));
+assert.equal(mgr.loadProfile("gentle-default"), null);
+});
+
+test("renameProfile moves file and follows active pointer", () => {
+const d = makeManagerDirs();
+const mgr = new SddProfileManager({ ...d });
+mgr.saveProfile(MIN_PROFILE("old-name"), "global");
+mgr.activateProfile("old-name", "global");
+const res = mgr.renameProfile("old-name", "new-name");
+assert.equal(res.success, true);
+assert.equal(mgr.loadProfile("old-name"), null);
+assert.ok(mgr.loadProfile("new-name"));
+assert.equal(mgr.getActiveProfileName(), "new-name");
+assert.equal(mgr.renameProfile("new-name", "new-name").success, false);
+assert.equal(mgr.renameProfile("missing", "other").success, false);
+});
+
+test("saveCurrentAsProfile snapshots config and marks active", () => {
+const d = makeManagerDirs();
+const mgr = new SddProfileManager({ ...d });
+mgr.saveProfile({ ...MIN_PROFILE("base"), default_model: "snap/m" }, "global");
+mgr.activateProfile("base", "global");
+const res = mgr.saveCurrentAsProfile("snap", "Snapshot", "global");
+assert.equal(res.success, true);
+assert.equal(mgr.loadProfile("snap")?.default_model, "snap/m");
+assert.equal(mgr.getActiveProfileName(), "snap");
+});
+
+test("createProfile creates and refuses duplicates", () => {
+const d = makeManagerDirs();
+const mgr = new SddProfileManager({ ...d });
+const res = mgr.createProfile({ name: "fresh", default_model: "a/b", scope: "global" });
+assert.equal(res.success, true);
+assert.equal(mgr.loadProfile("fresh")?.default_model, "a/b");
+assert.equal(mgr.createProfile({ name: "fresh" }).success, false);
+assert.equal(mgr.createProfile({ name: "   " }).success, false);
+});
+
+test("setAgentInProfile persists model+effort and validates", () => {
+const d = makeManagerDirs();
+const mgr = new SddProfileManager({ ...d });
+mgr.createProfile({ name: "agents", scope: "global" });
+const res = mgr.setAgentInProfile({ profileName: "agents", agentName: "sdd-explore", model: "a/b", effort: "high" });
+assert.equal(res.success, true);
+assert.deepEqual(mgr.loadProfile("agents")?.model_profiles?.["sdd-explore"], { model: "a/b", effort: "high" });
+assert.equal(mgr.setAgentInProfile({ profileName: "agents", agentName: "nope", model: "a/b" }).success, false);
+assert.equal(mgr.setAgentInProfile({ profileName: "missing", agentName: "sdd-explore", model: "a/b" }).success, false);
+});
+
+test("setAgentInProfile saves back to project origin", () => {
+const d = makeManagerDirs();
+const mgr = new SddProfileManager({ ...d });
+mgr.createProfile({ name: "agents", scope: "project" });
+const res = mgr.setAgentInProfile({ profileName: "agents", agentName: "sdd-spec", model: "c/d" });
+assert.equal(res.success, true);
+assert.ok(fs.existsSync(path.join(d.projectDir, "agents.json")));
+assert.ok(!fs.existsSync(path.join(d.globalDir, "agents.json")));
+});
+
 test("resolveAvailableModels merges registry discovery with fallback", async () => {
 	const ctx = {
 		modelRegistry: {
