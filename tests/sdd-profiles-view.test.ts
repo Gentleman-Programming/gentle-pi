@@ -100,6 +100,7 @@ function text(view: SddProfilesView): string {
 	return view.render(80).join("\n");
 }
 
+describe("SddProfilesView PART 1", () => {
 	it("list shows profile names with the active marker", () => {
 		const out = text(makeView());
 		assert.match(out, /gentle-default/);
@@ -136,6 +137,42 @@ function text(view: SddProfilesView): string {
 		const view = makeFullView(state);
 		view.handleInput("a");
 		assert.deepEqual(state.activated, ["gentle-default"]);
+	});
+
+	it("editor stages a per-agent model/effort and saves it", () => {
+		const state = newState();
+		const view = makeFullView(state);
+		view.handleInput("e");
+		assert.match(text(view), /editing: gentle-default/);
+		view.handleInput("j");
+		view.handleInput("\r");
+		assert.match(text(view), /Model for:/);
+		view.handleInput("\x1b[B");
+		view.handleInput("\r");
+		assert.match(text(view), /Reasoning effort/);
+		view.handleInput("j");
+		view.handleInput("j");
+		view.handleInput("j");
+		view.handleInput("\r");
+		assert.match(text(view), /modified/);
+		view.handleInput("s");
+		assert.equal(state.saved.length, 1);
+		const agent = ALL_KNOWN_AGENTS[0];
+		assert.equal(state.saved[0].model_profiles[agent]?.model, MODELS[1]);
+		assert.equal(state.saved[0].model_profiles[agent]?.effort, "low");
+	});
+
+	it("model-picker live filter narrows items", () => {
+		const state = newState();
+		const view = makeFullView(state);
+		view.handleInput("e");
+		view.handleInput("\r");
+		assert.match(text(view), /openai\/gpt-5-mini/);
+		type(view, "sonnet");
+		const out = text(view);
+		assert.match(out, /anthropic\/claude-sonnet-5/);
+		assert.doesNotMatch(out, /openai\/gpt-5-mini/);
+		assert.equal(out.includes("\x1b"), false);
 	});
 
 	it("create wizard produces a saved profile via the manager", () => {
@@ -180,6 +217,44 @@ function text(view: SddProfilesView): string {
 		assert.match(out, /gentle-economy/);
 	});
 
+	it("editor renders two-pane with agent rows left and detail right", () => {
+		const state = newState();
+		const view = makeFullView(state);
+		view.handleInput("e");
+		const out = text(view);
+		assert.match(out, /editing: gentle-default/);
+		assert.match(out, /│/);
+		assert.match(out, /orchestrator \(default\)/);
+		assert.match(out, /Model:/);
+		assert.match(out, /Effort:/);
+		assert.match(out, /anthropic\/claude-sonnet-5/);
+		assert.doesNotMatch(out, /Row:/);
+	});
+
+	it("paints only through known theme roles (recording theme)", () => {
+		const seen = new Set<string>();
+		const recording = { fg: (role: string, text: string) => { seen.add(role); return text; } };
+		const manager = {
+			listProfiles: () => summaries,
+			loadProfile: (name: string) => profiles[name] ?? null,
+		} as unknown as SddProfileManager;
+		const view = new SddProfilesView({ manager, theme: recording, rows: 16, onClose: () => {}, requestRender: () => {} });
+		const known = new Set(Object.values(ROLE));
+		const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+		const check = (label: string) => {
+			seen.clear();
+			const out = view.render(80).map(strip).join("\n");
+			for (const role of seen) assert.ok(known.has(role), `${label}: unknown theme role "${role}"`);
+			assert.ok(seen.size > 0, `${label}: expected at least one themed role`);
+			return out;
+		};
+		assert.match(check("list"), /gentle-default/);
+		view.handleInput("\r");
+		assert.match(check("detail"), /sdd-explore/);
+		view.handleInput("\x1b");
+		view.handleInput("e");
+		assert.match(check("editor"), /orchestrator \(default\)/);
+	});
 
 	it("passthrough theme renders list and detail content", () => {
 		// No zero-escape assertion here: truncateToWidth appends reset codes
@@ -191,7 +266,112 @@ function text(view: SddProfilesView): string {
 		assert.match(text(view), /sdd-explore/);
 	});
 
+	it("every rendered line strictly matches target width across views", () => {
+		const state = newState();
+		const view = makeFullView(state);
+		const targetWidth = 80;
+
+		const checkWidths = (label: string) => {
+			const lines = view.render(targetWidth);
+			for (let i = 0; i < lines.length; i++) {
+				// Visible width, not raw length: fit() keeps trailing resets
+				// (agents-view parity), so raw length includes escapes.
+				assert.equal(
+					visibleWidth(lines[i] ?? ""),
+					targetWidth,
+					`${label}: line ${i} width ${visibleWidth(lines[i] ?? "")} !== ${targetWidth}`,
+				);
+			}
+		};
+
+		checkWidths("list view");
+		view.handleInput("\r");
+		checkWidths("detail view");
+		view.handleInput("\x1b");
+		view.handleInput("e");
+		checkWidths("editor view");
+	});
+
+	it("bulk model-assign stages the model for every agent", () => {
+		const state = newState();
+		const view = makeFullView(state);
+		view.handleInput("e");
+		for (let i = 0; i < ALL_KNOWN_AGENTS.length + 1; i++) view.handleInput("j");
+		assert.match(text(view), new RegExp(ASSIGN_ALL_SUBAGENTS_KEY));
+		view.handleInput("\r");
+		assert.match(text(view), /ALL agents/);
+		view.handleInput("\x1b[B");
+		view.handleInput("\r");
+		view.handleInput("j");
+		view.handleInput("j");
+		view.handleInput("j");
+		view.handleInput("\r");
+		assert.match(text(view), /modified/);
+		view.handleInput("s");
+		assert.equal(state.saved.length, 1);
+		for (const agent of ALL_KNOWN_AGENTS) {
+			assert.equal(state.saved[0].model_profiles[agent]?.model, MODELS[1]);
+			assert.equal(state.saved[0].model_profiles[agent]?.effort, "low");
+		}
+	});
+
+	it("bulk effort-assign stages the effort for every agent", () => {
+		const state = newState();
+		const view = makeFullView(state);
+		view.handleInput("e");
+		for (let i = 0; i < ALL_KNOWN_AGENTS.length + 2; i++) view.handleInput("j");
+		assert.match(text(view), new RegExp(ASSIGN_ALL_EFFORT_KEY));
+		view.handleInput("\r");
+		assert.match(text(view), /Reasoning effort/);
+		view.handleInput("j");
+		view.handleInput("j");
+		view.handleInput("j");
+		view.handleInput("\r");
+		view.handleInput("s");
+		assert.equal(state.saved.length, 1);
+		for (const agent of ALL_KNOWN_AGENTS) {
+			assert.equal(state.saved[0].model_profiles[agent]?.effort, "low");
+		}
+		assert.equal(state.saved[0].model_profiles["sdd-explore"]?.model, "openai/gpt-5-mini");
+	});
+
+	it("category pick applies only to category members", () => {
+		const state = newState();
+		const view = makeFullView(state);
+		view.handleInput("e");
+		for (let i = 0; i < ALL_KNOWN_AGENTS.length + 3; i++) view.handleInput("j");
+		assert.match(text(view), new RegExp(ASSIGN_CATEGORY_KEY.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+		view.handleInput("\r");
+		assert.match(text(view), new RegExp(SDD_AGENT_CATEGORIES[0].name));
+		view.handleInput("\r");
+		assert.match(text(view), new RegExp(`category \\[${SDD_AGENT_CATEGORIES[0].id}\\]`));
+		view.handleInput("\x1b[B");
+		view.handleInput("\r");
+		view.handleInput("j");
+		view.handleInput("j");
+		view.handleInput("j");
+		view.handleInput("\r");
+		view.handleInput("s");
+		assert.equal(state.saved.length, 1);
+		for (const agent of SDD_AGENT_CATEGORIES[0].agents) {
+			assert.equal(state.saved[0].model_profiles[agent]?.model, MODELS[1]);
+			assert.equal(state.saved[0].model_profiles[agent]?.effort, "low");
+		}
+		const outsider = SDD_AGENT_CATEGORIES[1].agents[0];
+		assert.equal(state.saved[0].model_profiles[outsider], undefined);
+	});
+});
+
 describe("SddProfilesView current-model marker and delete guardrail", () => {
+	it("model picker marks the currently assigned model", () => {
+		const view = makeFullView(newState());
+		view.handleInput("e");
+		view.handleInput("\r");
+		const out = text(view);
+		assert.match(out, /model picker/);
+		assert.match(out, /anthropic\/claude-sonnet-5.*● current/);
+	});
+
 	it("d on the active profile refuses with feedback and deletes nothing", () => {
 		const state = newState();
 		const view = makeFullView(state);

@@ -136,6 +136,15 @@ export class SddProfilesView implements Component {
 
 	invalidate(): void {}
 
+	private editorRows(): string[] {
+		// Bulk rows sit after the agents so per-agent j/k navigation is stable.
+		return [ORCHESTRATOR_ROW, ...ALL_KNOWN_AGENTS, ASSIGN_ALL_SUBAGENTS_KEY, ASSIGN_ALL_EFFORT_KEY, ASSIGN_CATEGORY_KEY];
+	}
+
+	private isBulkRow(row: string): boolean {
+		return row === ASSIGN_ALL_SUBAGENTS_KEY || row === ASSIGN_ALL_EFFORT_KEY || row === ASSIGN_CATEGORY_KEY;
+	}
+
 	render(width: number): string[] {
 		const safeWidth = Math.max(40, Math.floor(width || 80));
 		const inner = safeWidth - 2;
@@ -259,6 +268,205 @@ export class SddProfilesView implements Component {
 			return;
 		}
 		this.onProfileActivated?.(full);
+	}
+
+	private openEditor(): void {
+		const selected = this.profiles[this.selectedIndex];
+		if (!selected) return;
+		const full = this.manager.loadProfile(selected.name);
+		if (!full) return;
+		this.editing = JSON.parse(JSON.stringify(full)) as Profile;
+		this.editorIndex = 0;
+		this.editorScroll = 0;
+		this.dirty = false;
+		this.view = "profile-editor";
+	}
+
+	private handleEditorInput(data: string): void {
+		const rows = this.editorRows();
+		if (matchesKey(data, Key.escape)) {
+			this.refreshProfiles();
+			this.view = "profiles-list";
+			return;
+		}
+		if (matchesKey(data, Key.up) || data === "k") {
+			if (this.editorIndex > 0) this.editorIndex -= 1;
+			return;
+		}
+		if (matchesKey(data, Key.down) || data === "j") {
+			if (this.editorIndex < rows.length - 1) this.editorIndex += 1;
+			return;
+		}
+		if (data === "s" || data === "S") {
+			if (this.editing) {
+				this.manager.saveProfile(this.editing, "global");
+				this.dirty = false;
+				this.feedback = `Saved "${this.editing.name}".`;
+				this.refreshProfiles();
+				this.view = "profiles-list";
+			}
+			return;
+		}
+		if (matchesKey(data, Key.enter)) {
+			const row = rows[this.editorIndex];
+			if (row === ORCHESTRATOR_ROW) {
+				this.pickerTarget = "default-model";
+			this.targetCategory = undefined;
+			this.modelFilter = "";
+				this.applyModelFilter();
+				this.view = "model-picker";
+			} else if (row === ASSIGN_ALL_SUBAGENTS_KEY) {
+				this.pickerTarget = "all-models";
+				this.targetCategory = undefined;
+				this.modelFilter = "";
+				this.applyModelFilter();
+				this.view = "model-picker";
+			} else if (row === ASSIGN_ALL_EFFORT_KEY) {
+				this.pickerTarget = "all-models";
+				this.targetCategory = undefined;
+				this.stagedModel = undefined;
+				this.pickerIndex = 0;
+				this.pickerScroll = 0;
+				this.view = "effort-picker";
+			} else if (row === ASSIGN_CATEGORY_KEY) {
+				this.pickerIndex = 0;
+				this.pickerScroll = 0;
+				this.view = "category-picker";
+			} else {
+				this.pickerTarget = "agent-model";
+				this.targetCategory = undefined;
+				this.modelFilter = "";
+				this.applyModelFilter();
+				this.view = "model-picker";
+			}
+		}
+	}
+
+	private applyModelFilter(): void {
+		const tokens = this.modelFilter.trim().toLowerCase().split(/\s+/).filter(Boolean);
+		this.pickerItems =
+			tokens.length === 0
+				? [...this.availableModels]
+				: this.availableModels.filter((m) => {
+						const lower = m.toLowerCase();
+						return tokens.every((t) => lower.includes(t));
+					});
+		this.pickerIndex = 0;
+		this.pickerScroll = 0;
+	}
+
+	private handleModelPickerInput(data: string): void {
+		if (matchesKey(data, Key.escape)) {
+			this.view = "profile-editor";
+			return;
+		}
+		if (matchesKey(data, Key.up)) {
+			if (this.pickerIndex > 0) this.pickerIndex -= 1;
+			return;
+		}
+		if (matchesKey(data, Key.down)) {
+			if (this.pickerIndex < this.pickerItems.length - 1) this.pickerIndex += 1;
+			return;
+		}
+		if (matchesKey(data, Key.backspace) || data === "" || data === "\b") {
+			if (this.modelFilter.length > 0) {
+				this.modelFilter = this.modelFilter.slice(0, -1);
+				this.applyModelFilter();
+			}
+			return;
+		}
+		if (matchesKey(data, Key.enter)) {
+			const chosen = this.pickerItems[this.pickerIndex];
+			if (!chosen) return;
+			this.stagedModel = chosen;
+			this.pickerIndex = 0;
+			this.pickerScroll = 0;
+			this.view = "effort-picker";
+			return;
+		}
+		if (data.length === 1 && data >= " " && data <= "~") {
+			this.modelFilter += data;
+			this.applyModelFilter();
+		}
+	}
+
+	private handleEffortPickerInput(data: string): void {
+		if (matchesKey(data, Key.escape)) {
+			this.view = "profile-editor";
+			return;
+		}
+		if (matchesKey(data, Key.up) || data === "k") {
+			if (this.pickerIndex > 0) this.pickerIndex -= 1;
+			return;
+		}
+		if (matchesKey(data, Key.down) || data === "j") {
+			if (this.pickerIndex < EFFORT_OPTIONS.length - 1) this.pickerIndex += 1;
+			return;
+		}
+		if (!matchesKey(data, Key.enter)) return;
+		const choice = EFFORT_OPTIONS[this.pickerIndex];
+		const effort = choice === "default" ? undefined : choice;
+		const profile = this.editing;
+		if (profile) {
+			if (this.pickerTarget === "default-model") {
+				if (this.stagedModel) {
+					profile.default_model = this.stagedModel;
+					profile.default_effort = effort;
+					this.dirty = true;
+				}
+			} else if (this.pickerTarget === "all-models") {
+				for (const agent of ALL_KNOWN_AGENTS) {
+					profile.model_profiles[agent] = {
+						model: this.stagedModel ?? profile.model_profiles[agent]?.model ?? profile.default_model ?? "anthropic/claude-sonnet-4-5",
+						effort,
+					};
+				}
+				this.dirty = true;
+			} else if (this.pickerTarget === "category-models" && this.targetCategory) {
+				const cat = SDD_AGENT_CATEGORIES.find((c) => c.id === this.targetCategory);
+			if (cat) {
+					for (const agent of cat.agents) {
+						profile.model_profiles[agent] = {
+							model: this.stagedModel ?? profile.model_profiles[agent]?.model ?? profile.default_model ?? "anthropic/claude-sonnet-4-5",
+							effort,
+						};
+					}
+					this.dirty = true;
+				}
+			} else {
+				const agent = this.editorRows()[this.editorIndex];
+				if (agent && agent !== ORCHESTRATOR_ROW && !this.isBulkRow(agent) && this.stagedModel) {
+					profile.model_profiles[agent] = { model: this.stagedModel, effort };
+					this.dirty = true;
+				}
+			}
+		}
+		this.stagedModel = undefined;
+		this.targetCategory = undefined;
+		this.view = "profile-editor";
+	}
+
+	private handleCategoryPickerInput(data: string): void {
+		if (matchesKey(data, Key.escape)) {
+			this.view = "profile-editor";
+			return;
+		}
+		if (matchesKey(data, Key.up) || data === "k") {
+			if (this.pickerIndex > 0) this.pickerIndex -= 1;
+			return;
+		}
+		if (matchesKey(data, Key.down) || data === "j") {
+			if (this.pickerIndex < SDD_AGENT_CATEGORIES.length - 1) this.pickerIndex += 1;
+			return;
+		}
+		if (!matchesKey(data, Key.enter)) return;
+		const cat = SDD_AGENT_CATEGORIES[this.pickerIndex];
+		if (!cat) return;
+		this.pickerTarget = "category-models";
+		this.targetCategory = cat.id;
+		this.modelFilter = "";
+		this.applyModelFilter();
+		this.view = "model-picker";
 	}
 
 	private handleTextInput(data: string): void {
@@ -483,6 +691,121 @@ export class SddProfilesView implements Component {
 	private renderModal(inner: number, bodyRows: number): string[] {
 		const theme = this.theme;
 		switch (this.view) {
+			case "profile-editor": {
+				const rows = this.editorRows();
+				const name = this.editing?.name ?? "";
+				const listWidth = Math.max(20, Math.min(30, Math.floor(inner * 0.35)));
+				const rightWidth = Math.max(10, inner - listWidth - 4);
+				const win = this.scrollList(rows, this.editorIndex, this.editorScroll, bodyRows);
+				this.editorScroll = win.scroll;
+				const leftLines = win.visible.map((row, i) => {
+					const isSelected = win.scroll + i === this.editorIndex;
+					const marker = isSelected ? theme.fg(ROLE.SELECTED, "▶") : " ";
+					const detail = row === ORCHESTRATOR_ROW
+						? ` (${this.editing?.default_model ?? "default"})`
+						: (this.editing?.model_profiles[row] ? ` (${this.editing.model_profiles[row].model})` : "");
+					return `${marker} ${theme.fg(isSelected ? ROLE.SELECTED : ROLE.NAME_IDLE, `${row}${detail}`)}`;
+				});
+				const row = rows[this.editorIndex];
+				const isOrchestrator = row === ORCHESTRATOR_ROW;
+				const isBulk = row === ASSIGN_ALL_SUBAGENTS_KEY || row === ASSIGN_ALL_EFFORT_KEY || row === ASSIGN_CATEGORY_KEY;
+				const entry = isOrchestrator || isBulk ? undefined : this.editing?.model_profiles[row];
+				const model = isOrchestrator ? (this.editing?.default_model ?? "default") : (entry?.model ?? "default");
+				const effort = isOrchestrator ? (this.editing?.default_effort ?? "default") : (entry?.effort ?? "default");
+				const bulkBlurb =
+					row === ASSIGN_ALL_SUBAGENTS_KEY
+						? "one model for every agent"
+						: row === ASSIGN_ALL_EFFORT_KEY
+							? "one effort level for every agent"
+							: "one model for a single category";
+				const rightLines = [
+					`${theme.fg(ROLE.TITLE, row)}${this.dirty ? theme.fg(ROLE.SELECTED, " *") : ""}`,
+					theme.fg(ROLE.META, isOrchestrator ? "orchestrator default" : isBulk ? bulkBlurb : "per-agent override"),
+					rule(Math.min(rightWidth - 2, 40)),
+					...(isBulk
+						? [theme.fg(ROLE.META, "enter opens the picker; applies on confirm")]
+						: [
+								`${theme.fg(ROLE.SELECTED, "Model:")} ${theme.fg(ROLE.MODEL, model)}`,
+							`${theme.fg(ROLE.SELECTED, "Effort:")} ${theme.fg(ROLE.TEXT, effort)}`,
+						]),
+					"",
+					theme.fg(ROLE.META, "enter picks model/effort"),
+				];
+				const titleText = `✿ Profiles · editing: ${name}${this.dirty ? " · [modified *]" : ""}`;
+				const top = this.topBar(titleText, inner);
+				const body = this.joinTwoPane(leftLines, rightLines, listWidth, rightWidth, bodyRows);
+				const keys: Array<[string, string]> = [
+					["j/k", "navigate"],
+					["enter", "pick model"],
+					["s", "save"],
+					["esc", "back"],
+				];
+				const formatted = keys.map(([key, label]) => `${theme.fg(ROLE.KEY, key)} ${theme.fg(ROLE.KEY_TEXT, label)}`).join("   ");
+				return [top, ...body, `${theme.fg(ROLE.FRAME, "│")} ${fit(formatted, inner - 2)} ${theme.fg(ROLE.FRAME, "│")}`, theme.fg(ROLE.FRAME, `╰${rule(inner)}╯`)];
+			}
+			case "model-picker": {
+				const target =
+					this.pickerTarget === "default-model"
+						? ORCHESTRATOR_ROW
+						: this.pickerTarget === "all-models"
+							? "ALL agents"
+							: this.pickerTarget === "category-models"
+								? `category [${this.targetCategory ?? "?"}]`
+								: (this.editorRows()[this.editorIndex] ?? "agent");
+				const win = this.scrollList(this.pickerItems, this.pickerIndex, this.pickerScroll, bodyRows - 3);
+				this.pickerScroll = win.scroll;
+				const current =
+					this.pickerTarget === "default-model"
+						? (this.editing?.default_model ?? null)
+						: this.pickerTarget === "agent-model"
+							? (this.editing?.model_profiles?.[this.editorRows()[this.editorIndex] ?? ""]?.model ??
+								this.editing?.default_model ?? null)
+							: null;
+				const lines =
+					win.visible.length === 0
+						? [theme.fg(ROLE.EMPTY, "no matches")]
+						: win.visible.map((m, i) => {
+								const isSelected = win.scroll + i === this.pickerIndex;
+								const mark = current !== null && m === current ? theme.fg(ROLE.META, " ● current") : "";
+								return `${isSelected ? theme.fg(ROLE.SELECTED, "▶") : " "} ${theme.fg(isSelected ? ROLE.SELECTED : ROLE.TEXT, m)}${mark}`;
+							});
+				lines.push("", `${theme.fg(ROLE.META, "Model for:")} ${theme.fg(ROLE.MODEL, `${target} · filter: ${this.modelFilter}`)}${theme.fg(ROLE.SELECTED, "█")}`);
+				return this.chrome(`model picker · ${this.pickerItems.length} models`, lines, [
+					["↑/↓", "navigate"],
+					["enter", "pick effort"],
+					["backspace", "erase"],
+					["esc", "back"],
+				], inner, bodyRows);
+			}
+			case "category-picker": {
+				const win = this.scrollList(SDD_AGENT_CATEGORIES, this.pickerIndex, this.pickerScroll, bodyRows - 3);
+				this.pickerScroll = win.scroll;
+				const lines = win.visible.map((cat, i) => {
+					const isSelected = win.scroll + i === this.pickerIndex;
+					return `${isSelected ? theme.fg(ROLE.SELECTED, "▶") : " "} ${theme.fg(isSelected ? ROLE.SELECTED : ROLE.TEXT, cat.name)}`;
+				});
+				const cat = SDD_AGENT_CATEGORIES[this.pickerIndex];
+				lines.push("", theme.fg(ROLE.META, cat ? `${cat.agents.length} agents · enter picks model.` : "no categories"));
+				return this.chrome("category picker", lines, [
+					["j/k", "navigate"],
+					["enter", "pick model"],
+					["esc", "back"],
+				], inner, bodyRows);
+			}
+			case "effort-picker": {
+				const win = this.scrollList(EFFORT_OPTIONS, this.pickerIndex, this.pickerScroll, bodyRows - 3);
+				this.pickerScroll = win.scroll;
+				const lines = win.visible.map((effort, i) => {
+					const isSelected = win.scroll + i === this.pickerIndex;
+					return `${isSelected ? theme.fg(ROLE.SELECTED, "▶") : " "} ${theme.fg(isSelected ? ROLE.SELECTED : ROLE.TEXT, effort)}`;
+				});
+				lines.push("", theme.fg(ROLE.META, `Reasoning effort for ${this.stagedModel ?? "model"} · enter applies.`));
+				return this.chrome("effort picker", lines, [
+					["j/k", "navigate"],
+					["enter", "apply"],
+					["esc", "back"],
+				], inner, bodyRows);
+			}
 			case "create-profile": {
 				const step1 = this.creationStep === "name";
 				const lines = step1
