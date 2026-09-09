@@ -26,6 +26,7 @@ interface ChoiceParameters {
 }
 
 interface ChoiceTool {
+	renderShell?: string;
 	name: string;
 	parameters: ChoiceParameters;
 	execute: (...args: unknown[]) => Promise<ChoiceResult>;
@@ -150,6 +151,10 @@ function tuiContext(inputs: readonly string[], rendered: { value: string }) {
 		},
 	};
 }
+
+test("ask_user_choice transcript opts out of Pi's painted tool shell", () => {
+	assert.equal(registerChoiceTool().tool.renderShell, "self");
+});
 
 test("ask_user_choice registers without runtime actions or overriding the open questionnaire", () => {
 	const registration = registerChoiceTool(["read", "ask_user_question"]);

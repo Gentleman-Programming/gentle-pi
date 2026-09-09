@@ -67,7 +67,7 @@ function fakePi(script: GitScript[] = [{ numstat: "", porcelain: "" }]) {
 	const shortcuts = new Map<string, ShortcutRegistration>();
 	const git: string[][] = [];
 	let entries: unknown[] = [];
-	const tools = new Map<string, { execute(id: string, params: unknown, signal: undefined, update: undefined, ctx: ExtensionContext): Promise<unknown> }>();
+	const tools = new Map<string, { renderShell?: string; execute(id: string, params: unknown, signal: undefined, update: undefined, ctx: ExtensionContext): Promise<unknown> }>();
 	const listeners = new Map<string, (data: unknown) => void>();
 	let round = 0;
 	const pi = {
@@ -259,12 +259,30 @@ test("gentleShell frames the editor with the petal prompt and a hint while empty
 	editor.focused = true;
 	const lines = editor.render(60).map(stripAnsi);
 	assert.match(lines[0], /^╭─ ✿ ─+╮$/);
-	assert.match(editor.render(60)[1], /\x1b\[49m│$/, "prompt interior closes its background before the rail");
+	assert.doesNotMatch(editor.render(60).join("\n"), /\x1b\[44m/, "prompt must not paint passive backgrounds");
 	assert.match(lines[1], /^│.*type, or \/ for commands +│$/);
 	assert.match(lines[lines.length - 1], /^╰─+╯$/);
 	editor.setText("hola");
 	assert.doesNotMatch(editor.render(60).map(stripAnsi)[1], /type, or/);
 	editor.dispose();
+});
+
+test("registered prompt stays transparent while idle, working, and queued", () => {
+	const { pi, handlers, tools } = fakePi();
+	gentleShell(pi, {});
+	const { ctx, ui } = fakeContext();
+	ctx.ui.theme = { ...plainTheme, getBgAnsi: () => "\x1b[44m" } as typeof ctx.ui.theme;
+	const editor = installedPrompt(ctx, ui, handlers);
+	try {
+		for (const state of ["idle", "working", "queued"]) {
+			if (state === "working") for (const handler of handlers.get("agent_start") ?? []) handler({}, ctx);
+			(ctx as unknown as { hasPendingMessages(): boolean }).hasPendingMessages = () => state === "queued";
+			for (const width of [8, 40, 80]) assert.doesNotMatch(editor.render(width).join("\n"), /\x1b\[44m/, state);
+		}
+	} finally {
+		editor.dispose();
+	}
+	assert.equal(tools.get("session_worktree_register")?.renderShell, "self");
 });
 
 test("gentleShell shows working while the agent runs and queued when messages wait", () => {
@@ -694,6 +712,10 @@ test("gentleShell draws the review preflight message as a Gentle card", () => {
 	const renderer = renderers.get("gentle-pi.review-preflight");
 	assert.ok(renderer, "renderer not registered");
 	const message = { customType: "gentle-pi.review-preflight", content: "Receipt-driven development is enabled.\n\nCall the gentle_review tool." };
+	const sentinelTheme = { ...plainTheme, bg: (_role: string, text: string) => `\x1b[44m${text}\x1b[49m` };
+	for (const expanded of [true, false]) {
+		assert.doesNotMatch(renderer(message, { expanded }, sentinelTheme).render(80).join("\n"), /\x1b\[44m/);
+	}
 	const expanded = renderer(message, { expanded: true }, plainTheme).render(80).map(stripAnsi);
 	assert.match(expanded[0], /^╭─ ✿ Gentle AI · review preflight ─+ .*collapse ╮$/);
 	assert.match(expanded[1], /^│ Receipt-driven development is enabled\. +│$/);
@@ -717,7 +739,7 @@ test("gentleShell keeps a dev-binary override visible above the editor for the w
 	assert.equal(lines[3], "", "a blank line keeps the card off the prompt frame");
 	const painted = factory(fakeTui, { ...plainTheme, bg: (_role: string, text: string) => `\x1b[44m${text}\x1b[49m` }).render(100);
 	assert.equal(painted[0], lines[0], "top frame cells have no background");
-	assert.match(painted[1], /^│\x1b\[44m.*\x1b\[49m│$/);
+	assert.equal(painted[1], lines[1], "body interior remains transparent");
 	assert.equal(painted[2], lines[2], "bottom frame cells have no background");
 	assert.equal(painted[3], "", "external spacer has no background");
 	await fire(handlers, "agent_start", ctx);

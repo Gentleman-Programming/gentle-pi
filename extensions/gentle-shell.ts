@@ -10,7 +10,7 @@ import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { SessionWorktreeRegistry, SESSION_WORKTREE_CHANGED, resolveSessionWorktree, toolWorktreePath, worktreeGitEnvironment, type WorktreeResolver } from "../lib/session-worktree-registry.ts";
 import { CARD_TONE, renderCard, type Card, type CardTheme } from "../lib/shell-card.ts";
 import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
-import { framePromptLines, panelPainter, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
+import { framePromptLines, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
 import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, parseCodexUsage, parseUsageHeaders, UsageStore, type ProviderUsage } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
 import { sidebarPart } from "../lib/shell-sidebar.ts";
@@ -141,7 +141,6 @@ export function createShellBarComponent(
 interface PromptEditorDeps {
 	fg: (color: string, text: string) => string;
 	bold: (text: string) => string;
-	paint?: (line: string) => string;
 	requestRender(): void;
 	pending(): boolean;
 }
@@ -186,7 +185,6 @@ export class GentlePromptEditor extends CustomEditor {
 			borderColor: (text) => this.deps.fg(PROMPT_FRAME_ROLE, text),
 			fg: this.deps.fg,
 			bold: this.deps.bold,
-			paint: this.deps.paint,
 		});
 	}
 
@@ -207,7 +205,6 @@ function installPrompt(ctx: ExtensionContext, onCreated: (prompt: GentlePromptEd
 		const prompt = new GentlePromptEditor(tui, theme, keybindings, {
 			fg: (color, text) => ctx.ui.theme.fg(color as Parameters<typeof ctx.ui.theme.fg>[0], text),
 			bold: (text) => ctx.ui.theme.bold(text),
-			paint: panelPainter(ctx.ui.theme.getBgAnsi("customMessageBg")),
 			requestRender: () => tui.requestRender(),
 			pending: () => ctx.hasPendingMessages(),
 		});
@@ -393,7 +390,6 @@ function messageText(content: string | Array<{ type: string; text?: string }>): 
 interface CardComponentOptions {
 	expanded: boolean;
 	hint?: string;
-	paint?: (line: string) => string;
 }
 
 function cardComponent(card: Card, theme: CardTheme, options: CardComponentOptions) {
@@ -523,6 +519,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	});
 	pi.registerTool({
 		name: "session_worktree_register",
+		renderShell: "self",
 		label: "Register session worktree",
 		description: "Register a worktree used by this session, including earlier work or opaque shell use. Only the same Git clone is accepted. Shows ALL dirty files in that root, including preexisting and untracked files; never infers roots from shell commands or prose.",
 		parameters: { type: "object", required: ["path"], additionalProperties: false, properties: { path: { type: "string", description: "Worktree path to include in this session." } } } as never,
@@ -565,7 +562,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		ctx.ui.setWidget(
 			DEV_BINARY_WIDGET_KEY,
 			notice
-				? (_tui, theme) => spaced(cardComponent(devBinaryCard(notice), theme, { expanded: true, paint: (line) => theme.bg("customMessageBg", line) }))
+				? (_tui, theme) => spaced(cardComponent(devBinaryCard(notice), theme, { expanded: true }))
 				: undefined,
 		);
 		await tracker.start();

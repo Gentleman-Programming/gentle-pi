@@ -70,22 +70,17 @@ test("renderCard keeps the rail and its corners in the tone and the rest of the 
 	assert.equal(CARD_TONE.SUCCESS, "success");
 });
 
-test("renderCard places a hint at the right end of the top rule and paints only body interiors", () => {
+test("renderCard places a hint at the right end of the top rule without background fill", () => {
 	const lines = renderCard(card(), plainTheme, 60, { expanded: false, hint: "ctrl+o expand" });
 	assert.match(stripAnsi(lines[0]), /^╭─ ✿ Gentle AI · review preflight ─+ ctrl\+o expand ╮$/);
 	assert.equal(visibleWidth(lines[0]), 60);
 
-	const painted = renderCard(card(), plainTheme, 60, { expanded: false, paint: (line) => `[bg]${line}[/bg]` });
-	assert.ok(!painted[0].includes("[bg]"));
-	assert.match(painted[1], /^│\[bg\].*\[\/bg\]│$/);
-	assert.ok(!painted[2].includes("[bg]"));
+	assert.doesNotMatch(lines.join("\n"), /\x1b\[44m/);
 });
 
-test("card backgrounds stop before border cells and remain active after content resets", () => {
-	const bg = "\x1b[44m";
-	const paint = (text: string) => bg + text.replaceAll("\x1b[0m", "\x1b[0m" + bg) + "\x1b[49m";
+test("cards remain transparent across content resets and narrow widths", () => {
 	for (const width of [0, 1, 2, 3, 4, 8, 40]) {
-		const lines = renderCard(card({ body: ["red\x1b[0m blue", ""] }), ansiTheme, width, { expanded: true, paint });
+		const lines = renderCard(card({ body: ["red\x1b[0m blue", ""] }), ansiTheme, width, { expanded: true });
 		for (const [row, line] of lines.entries()) {
 			let painted = false, column = 0;
 			for (const token of line.match(/\x1b\[[\d;]*m|[^\x1b]/gu) ?? []) {
@@ -95,7 +90,7 @@ test("card backgrounds stop before border cells and remain active after content 
 						if (code === 44) painted = true;
 					}
 				} else {
-					assert.equal(painted, row > 0 && row < lines.length - 1 && column > 0 && column < width - 1, `row ${row}, cell ${column}`);
+					assert.equal(painted, false, `row ${row}, cell ${column}`);
 					column += visibleWidth(token);
 				}
 			}

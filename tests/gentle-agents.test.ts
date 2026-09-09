@@ -20,6 +20,7 @@ import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
 
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 interface Registered {
+	renderShell?: string;
 	name: string;
 	execute(id: string, params: unknown, signal: undefined, onUpdate: undefined, ctx: ExtensionContext): Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
 	renderCall(args: unknown, theme: unknown): { render(width: number): string[] };
@@ -148,6 +149,13 @@ function deps(): { deps: Partial<AgentsDeps>; children: FakeChild[]; spawned: st
 		},
 	};
 }
+
+test("all eight subagent registrations own their transcript shell", () => {
+	const { pi, tools } = fakePi();
+	gentleAgents(pi, {}, deps().deps);
+	assert.equal(tools.size, 8);
+	for (const tool of tools.values()) assert.equal(tool.renderShell, "self", tool.name);
+});
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 

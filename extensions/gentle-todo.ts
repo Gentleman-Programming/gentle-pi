@@ -118,6 +118,7 @@ export default function gentleTodo(pi: ExtensionAPI, env: NodeJS.ProcessEnv = pr
 
 	pi.registerTool({
 		name: TODO_TOOL_NAME,
+		renderShell: "self",
 		label: "Todo",
 		description: "Plan and track multi-step work. Use write to set the whole list, update to move one task, add for a new one, clear to reset, list to read it back.",
 		promptSnippet: "Track multi-step work; rewrite the whole list as the plan changes",

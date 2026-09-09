@@ -33,8 +33,6 @@ export interface PromptFrameOptions {
 	borderColor: (text: string) => string;
 	fg: (color: string, text: string) => string;
 	bold?: (text: string) => string;
-	/** Paints only the editor interior, never the frame. */
-	paint?: (line: string) => string;
 }
 
 // A terminal cell cannot grow, so the petal earns presence with weight and
@@ -93,7 +91,7 @@ function sideRules(line: string, innerWidth: number, options: PromptFrameOptions
 	const clipped = innerWidth === 0 ? "" : truncateToWidth(line, innerWidth, "");
 	const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(clipped)));
 	const content = clipped + padding;
-	return options.borderColor("│") + (options.paint ? options.paint(content) : content) + options.borderColor("│");
+	return options.borderColor("│") + content + options.borderColor("│");
 }
 
 export function framePromptLines(lines: string[], width: number, options: PromptFrameOptions): string[] {
@@ -114,11 +112,4 @@ export function withPromptHint(line: string, hint: string, fg: PromptFrameOption
 	const trailing = line.slice(afterCursor);
 	if (trailing.trim() !== "" || trailing.length < hint.length + 1) return line;
 	return `${line.slice(0, afterCursor)} ${fg(HINT_ROLE, hint)}${" ".repeat(trailing.length - hint.length - 1)}`;
-}
-
-// Paints a line with a background that survives the resets pi's editor
-// emits around the cursor, so the panel color runs edge to edge.
-export function panelPainter(bgAnsi: string): (line: string) => string {
-	const RESET = "\x1b[0m";
-	return (line) => `${bgAnsi}${line.split(RESET).join(`${RESET}${bgAnsi}`)}\x1b[49m`;
 }

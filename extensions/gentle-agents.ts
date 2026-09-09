@@ -496,6 +496,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const tool = (name: string, description: string, parameters: Record<string, unknown>, execute: (params: Record<string, unknown>, ctx: ExtensionContext) => Promise<ToolText>) => {
 		pi.registerTool({
 			name: `${TOOL_PREFIX}${name}`,
+			renderShell: "self",
 			label: `Agent ${name.replace(/_/g, " ")}`,
 			description,
 			parameters: { type: "object", additionalProperties: false, ...parameters } as never,

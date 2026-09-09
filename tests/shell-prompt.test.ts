@@ -4,7 +4,6 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import {
 	framePromptLines,
-	panelPainter,
 	PROMPT_STATE,
 	petalGlyph,
 	petalTone,
@@ -110,11 +109,10 @@ test("withPromptHint leaves the line alone when the hint does not fit", () => {
 	assert.equal(hinted, line);
 });
 
-test("working prompt backgrounds stay inside rails at narrow and normal widths", () => {
+test("working prompt stays transparent at narrow and normal widths", () => {
 	for (const width of [0, 1, 2, 3, 8, 40]) {
 		const lines = framePromptLines(["──", ` ${CURSOR}界`, "──"], width, options({
 			state: PROMPT_STATE.WORKING, fg: (_c, t) => t,
-			paint: panelPainter("\x1b[44m"),
 		}));
 		for (const [row, line] of lines.entries()) {
 			assert.ok(visibleWidth(line) <= width);
@@ -126,7 +124,7 @@ test("working prompt backgrounds stay inside rails at narrow and normal widths",
 						if (code === 44) bg = true;
 					}
 				} else {
-					assert.equal(bg, row === 1 && cell > 0 && cell < width - 1);
+					assert.equal(bg, false, `row ${row}, cell ${cell} must remain transparent`);
 					cell += visibleWidth(token);
 				}
 			}
@@ -135,11 +133,8 @@ test("working prompt backgrounds stay inside rails at narrow and normal widths",
 	}
 });
 
-test("panelPainter keeps the background running after pi's cursor reset", () => {
-	const paint = panelPainter("<bg>");
-	assert.equal(paint("a\x1b[0mb"), "<bg>a\x1b[0m<bg>b\x1b[49m");
-	const lines = framePromptLines(editorLines(40), 40, options({ fg: (_c, t) => t, paint }));
-	assert.ok(!lines[0].includes("<bg>"));
-	assert.match(lines[1], /^│<bg>.*\x1b\[49m│$/);
-	assert.ok(!lines[2].includes("<bg>"));
+test("transparent prompt preserves pi's cursor reset", () => {
+	const lines = framePromptLines(editorLines(40), 40, options({ fg: (_c, t) => t }));
+	assert.ok(lines[1].includes(CURSOR));
+	assert.doesNotMatch(lines.join("\n"), /\x1b\[44m/);
 });

@@ -278,6 +278,7 @@ const runCodeGraphCommand: CodeGraphRunner = async (args, options) => {
 export function createCodeGraphTool(runner: CodeGraphRunner = runCodeGraphCommand) {
 	return {
 		name: "codegraph",
+		renderShell: "self" as const,
 		label: "CodeGraph",
 		description:
 			"Initialize, search, or explore the CodeGraph index for the current Pi workspace only. This tool never accepts a project path or shell command.",

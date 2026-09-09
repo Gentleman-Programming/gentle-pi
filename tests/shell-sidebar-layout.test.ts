@@ -108,6 +108,31 @@ test("wheel scrolls the rail and is consumed at both boundaries and blank space"
 		assert.equal(scroll.scrollTop, expected);
 		assert.equal(result?.target?.component, scroll);
 	}
+	f.host.terminal.columns = 139;
+	assert.equal(f.root[NODE]().type, "vstack");
+	assert.deepEqual(f.bottom.render(80), ["Status"]);
+	f.host.terminal.columns = 160;
+	const restored = rail(f);
+	assert.deepEqual(f.bottom.render(80), []);
+	const layout = f.root[NODE]() as unknown as { gap: number; entries: { basis: number; grow: number; shrink: number; minSize: number }[] };
+	assert.equal(layout.gap, 3);
+	assert.deepEqual(layout.entries.map(({ basis, grow, shrink, minSize }) => ({ basis, grow, shrink, minSize })), [
+		{ basis: 0, grow: 1, shrink: 1, minSize: 1 },
+		{ basis: 50, grow: 0, shrink: 0, minSize: 50 },
+	]);
+	const restoredLines = restored.render(50);
+	// Native ScrollView.render only appends the scrollbar gutter; short rows need not fill the layout allocation.
+	for (const line of restoredLines) assert.ok(visibleWidth(line) <= 50);
+	assert.ok(restoredLines.some((line) => line.startsWith(" Status ")));
+	assert.deepEqual(f.root.render(), ["transcript"]);
+	restored.updateLayout(20, 5, () => {});
+	const before = restored.scrollTop;
+	const result = restored.handleMouse({ type: "wheel", wheelDelta: 2, x: 3, y: 4, screenX: 113, screenY: 6, width: 50, height: 5 } as Parameters<typeof restored.handleMouse>[0]);
+	assert.equal(result?.handled, true);
+	assert.equal(result?.target?.component, restored);
+	assert.equal(restored.scrollTop, Math.min(15, before + 2));
+	for (const line of restored.render(50)) assert.ok(visibleWidth(line) <= 50);
+	assert.deepEqual(f.root.render(), ["transcript"]);
 	scroll.updateLayout(1, 5, () => {});
 	assert.equal(scroll.handleMouse({ type: "wheel", wheelDelta: 1 } as Parameters<typeof scroll.handleMouse>[0])?.handled, true);
 	assert.equal(scroll.scrollTop, 0);

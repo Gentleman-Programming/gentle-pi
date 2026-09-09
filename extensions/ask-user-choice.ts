@@ -62,6 +62,7 @@ function resultDetails(params: ChoiceParams): ChoiceDetails {
 export default function askUserChoice(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: CHOICE_TOOL_NAME,
+		renderShell: "self",
 		label: "Ask User Choice",
 		description: "Ask one strictly closed single-select question with two to four ordered options. It never accepts free-text or multiple selections.",
 		promptGuidelines: [

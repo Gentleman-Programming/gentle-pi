@@ -84,7 +84,7 @@ export class GentleAiCallCard {
 
 	render(width: number): string[] {
 		const lines = [cardTop(this.card, this.theme, width, this.hint)];
-		if (this.detail) lines.push(cardLine(this.theme.fg(DETAIL_ROLE, this.detail), this.card.tone, this.theme, width, (text) => this.theme.bg?.("customMessageBg", text) ?? text));
+		if (this.detail) lines.push(cardLine(this.theme.fg(DETAIL_ROLE, this.detail), this.card.tone, this.theme, width));
 		if (this.open) lines.push(cardBottom(this.card.tone, this.theme, width));
 		return lines;
 	}
@@ -117,11 +117,11 @@ export class GentleAiResultCard {
 			if (this.expanded) {
 				const innerWidth = cardInnerWidth(width);
 				for (const raw of this.text.split("\n")) {
-					for (const line of raw === "" ? [""] : wrapTextWithAnsi(raw, innerWidth)) lines.push(cardLine(line, this.tone, this.theme, width, (text) => this.theme.bg?.("customMessageBg", text) ?? text));
+					for (const line of raw === "" ? [""] : wrapTextWithAnsi(raw, innerWidth)) lines.push(cardLine(line, this.tone, this.theme, width));
 				}
 			} else {
 				const count = this.text.split("\n").length;
-				lines.push(cardLine(this.theme.fg(HIDDEN_ROLE, `${count} ${count === 1 ? "line" : "lines"}`), this.tone, this.theme, width, (text) => this.theme.bg?.("customMessageBg", text) ?? text));
+				lines.push(cardLine(this.theme.fg(HIDDEN_ROLE, `${count} ${count === 1 ? "line" : "lines"}`), this.tone, this.theme, width));
 			}
 		}
 		// A partial result sits under a running call card, which still closes the frame.
