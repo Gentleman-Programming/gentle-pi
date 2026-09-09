@@ -256,6 +256,72 @@ test("live-only extension instances discover same-profile peers across cwd bound
 	await Promise.all([panel.opened, peerPanel.opened]);
 });
 
+test("manual agents command warns once in RPC mode and stays quiet without UI", async (t) => {
+	const local = liveInstance(t, liveProfile("live-non-tui"), "non-tui");
+	Object.assign(local.ctx, { mode: "rpc" });
+	const notify = t.mock.method(local.ctx.ui, "notify");
+	await local.commands.get("gentle:agents")!.handler("", local.ctx);
+	assert.equal(notify.mock.callCount(), 1);
+	assert.equal(notify.mock.calls[0].arguments[1], "warning");
+	assert.deepEqual(local.overlays, []);
+	Object.assign(local.ctx, { hasUI: false });
+	await local.commands.get("gentle:agents")!.handler("", local.ctx);
+	assert.equal(notify.mock.callCount(), 1, "headless invocation adds no notification");
+	assert.deepEqual(local.overlays, []);
+});
+
+for (const scenario of ["recover", "shutdown", "replacement"] as const) {
+	test(`live presence after owned-target publication failure: ${scenario}`, async (t) => {
+		const profile = liveProfile(`live-io-${scenario}`);
+		const local = liveInstance(t, profile, "io-original");
+		await local.fire("session_start", local.ctx);
+		const original = listPresence(profile).entries[0]!;
+		const target = join(profile, "gentle-agents", "presence", `${original.sessionHash}.${original.incarnation}.activity.json`);
+		const fs = createRequire(import.meta.url)("node:fs") as typeof import("node:fs");
+		const rename = fs.renameSync;
+		let failures = 0;
+		const fault = t.mock.method(fs, "renameSync", (from, to) => {
+			if (to === target) {
+				failures++;
+				throw Object.assign(new Error("fixture publication failure"), { code: "EIO" });
+			}
+			return rename(from, to);
+		});
+		syncBuiltinESMExports();
+		try {
+			await local.tools.get("subagent_run")!.execute("io", { agent: "local", task: "Recover activity", mode: "background" }, undefined, undefined, local.ctx);
+			await eventually(() => failures > 0 && listPresence(profile).entries.length === 0, "guarded flush failure must dispose the owned publication");
+		} finally {
+			fault.mock.restore();
+			syncBuiltinESMExports();
+		}
+		if (scenario === "shutdown") await local.fire("session_shutdown", local.ctx);
+		if (scenario === "replacement") {
+			const next = fakeContext().ctx;
+			next.sessionManager.getSessionId = () => "io-replacement";
+			await local.fire("session_start", next);
+		}
+		const replacement = listPresence(profile).entries[0];
+		local.children[0].emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "activity after IO recovery" } });
+		await tick();
+		if (scenario === "recover") {
+			await eventually(() => listPresence(profile).entries.some((header) => readActivity(profile, header).activity?.tasks.some((row) => row.thread.items.some((item) => item.text === "activity after IO recovery"))), "ordinary task delta must recreate presence with current activity");
+			const recovered = listPresence(profile).entries;
+			assert.equal(recovered.length, 1);
+			assert.equal(recovered[0].sessionHash, original.sessionHash);
+			assert.notEqual(recovered[0].incarnation, original.incarnation);
+		} else if (scenario === "shutdown") {
+			assert.deepEqual(listPresence(profile).entries, [], "shutdown and late child events never recreate presence");
+		} else {
+			const headers = listPresence(profile).entries;
+			assert.equal(headers.length, 1, "late old-session activity cannot resurrect its publisher");
+			assert.notEqual(headers[0].sessionHash, original.sessionHash);
+			assert.equal(headers[0].incarnation, replacement!.incarnation);
+			assert.deepEqual(readActivity(profile, headers[0]).activity?.tasks, [], "replacement must not publish old-session tasks");
+		}
+	});
+}
+
 test("live-only instances sharing a session ID remain distinct and withdraw only their own incarnation", async (t) => {
 	const profile = liveProfile("live-incarnation-profile");
 	const local = liveInstance(t, profile, "same-live");

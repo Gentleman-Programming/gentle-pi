@@ -201,7 +201,12 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	let presence: PresencePublisher | undefined;
 	const overlays = new Set<AgentsView>();
 	const publishActivity = () => {
+		if (!sessions) return;
 		try {
+			if (!presence || presence.error) {
+				presence = PresencePublisher.start({ profile: agentHome, sessionId: activeSessionId() ?? "",
+					label: sessions.getSessionName?.() || sessions.getCwd().split(/[\\/]/).pop() || "Orchestrator", activity: [] });
+			}
 			presence?.update(store.list(activeSessionId()).filter((task) => !isFinished(task.status) && !restoredTaskIds.has(task.id)).map((task) => ({ task, thread: store.thread(task.id) })));
 		} catch { presence?.dispose(); presence = undefined; }
 	};
@@ -365,7 +370,11 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	};
 
 	const openOverlay = async (ctx: ExtensionContext) => {
-		if (!ctx.hasUI || ctx.mode !== "tui") return;
+		if (!ctx.hasUI) return;
+		if (ctx.mode !== "tui") {
+			ctx.ui.notify("The agents overlay requires TUI mode.", "warning");
+			return;
+		}
 		let view: AgentsView | undefined;
 		let overlayHost: { requestRender(force?: boolean): void; stop(): void; start(): void } | undefined;
 		const chosen = await ctx.ui.custom<TaskRecord | null>(
