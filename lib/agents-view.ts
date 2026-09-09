@@ -141,6 +141,7 @@ export class AgentsView {
 	private footerPage = 0;
 	private readonly actionRegions = new Map<string, NativePointerRegion>();
 	private readonly expanded = new Map<string, boolean>();
+	private readonly observedActiveGroups = new Set<string>();
 	private listScroll = 0;
 	private readonly manualListOffsets = new Map<string, number>();
 	private scope: ViewScope;
@@ -459,6 +460,12 @@ export class AgentsView {
 	private refreshTasks(): void {
 		const now = this.deps.now();
 		this.tasks = this.deps.store.list().filter((task) => this.inScope(task, now));
+		const groups = this.sessionGroups();
+		const present = new Set(groups.map((group) => group.id));
+		for (const id of this.observedActiveGroups) if (!present.has(id)) this.observedActiveGroups.delete(id);
+		for (const group of groups) {
+			if (group.tasks.some((task) => !isFinished(task.status))) this.observedActiveGroups.add(group.id);
+		}
 		const rows = this.allRows();
 		if (this.narrowGroup && !this.sessionGroups().some((group) => group.id === this.narrowGroup)) this.narrowGroup = undefined;
 		if (!this.selectedId || (!this.selectedTask() && !rows.some((row) => row.id === this.selectedId))) {
@@ -478,6 +485,9 @@ export class AgentsView {
 			const group = groups.get(id) ?? { id, sessionId, tasks: [] };
 			if (!groups.has(id)) groups.set(id, group);
 			group.tasks.push(task);
+		}
+		for (const group of groups.values()) {
+			group.tasks.sort((a, b) => b.createdAt - a.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 		}
 		return [...groups.values()];
 	}
@@ -507,7 +517,7 @@ export class AgentsView {
 	}
 
 	private isExpanded(group: SessionGroup): boolean {
-		return this.expanded.get(group.id) ?? group.tasks.some((task) => !isFinished(task.status));
+		return this.expanded.get(group.id) ?? this.observedActiveGroups.has(group.id);
 	}
 
 	private setExpanded(group: SessionGroup, expanded: boolean): void {
