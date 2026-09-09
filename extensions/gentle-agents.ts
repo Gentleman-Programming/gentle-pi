@@ -385,7 +385,10 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 					rows: () => Math.max(0, tui.terminal.rows),
 					store,
 					sessionId: ctx.sessionManager.getSessionId() ?? "",
-					presence: { profile: agentHome, target: presence?.target },
+					presence: {
+						profile: agentHome,
+						get target() { return presence?.target; },
+					},
 					now: () => deps.now(),
 					onCancel: (task) => void stopSelected(task, ctx),
 					canCancel: isOwnedActive,

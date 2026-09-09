@@ -276,6 +276,13 @@ for (const scenario of ["recover", "shutdown", "replacement"] as const) {
 		const local = liveInstance(t, profile, "io-original");
 		await local.fire("session_start", local.ctx);
 		const original = listPresence(profile).entries[0]!;
+		const peer = scenario === "recover" ? liveInstance(t, profile, "io-original") : undefined;
+		if (peer) await peer.fire("session_start", peer.ctx);
+		const panel = peer ? await liveOverlay(local) : undefined;
+		if (panel) {
+			panel.overlay.handleInput("a");
+			await eventually(() => /io-original/.test(panel.frame()), "same-session peer is visible before publication failure");
+		}
 		const target = join(profile, "gentle-agents", "presence", `${original.sessionHash}.${original.incarnation}.activity.json`);
 		const fs = createRequire(import.meta.url)("node:fs") as typeof import("node:fs");
 		const rename = fs.renameSync;
@@ -290,7 +297,7 @@ for (const scenario of ["recover", "shutdown", "replacement"] as const) {
 		syncBuiltinESMExports();
 		try {
 			await local.tools.get("subagent_run")!.execute("io", { agent: "local", task: "Recover activity", mode: "background" }, undefined, undefined, local.ctx);
-			await eventually(() => failures > 0 && listPresence(profile).entries.length === 0, "guarded flush failure must dispose the owned publication");
+			await eventually(() => failures > 0 && !listPresence(profile).entries.some((header) => header.incarnation === original.incarnation), "guarded flush failure must dispose the owned publication");
 		} finally {
 			fault.mock.restore();
 			syncBuiltinESMExports();
@@ -307,9 +314,15 @@ for (const scenario of ["recover", "shutdown", "replacement"] as const) {
 		if (scenario === "recover") {
 			await eventually(() => listPresence(profile).entries.some((header) => readActivity(profile, header).activity?.tasks.some((row) => row.thread.items.some((item) => item.text === "activity after IO recovery"))), "ordinary task delta must recreate presence with current activity");
 			const recovered = listPresence(profile).entries;
-			assert.equal(recovered.length, 1);
-			assert.equal(recovered[0].sessionHash, original.sessionHash);
-			assert.notEqual(recovered[0].incarnation, original.incarnation);
+			assert.equal(recovered.length, 2, "recovery preserves the distinct same-session peer");
+			assert.ok(recovered.every((header) => header.sessionHash === original.sessionHash));
+			assert.ok(recovered.every((header) => header.incarnation !== original.incarnation));
+			const scans = t.mock.method(PresenceCursor.prototype, "next");
+			await peer!.tools.get("subagent_run")!.execute("peer", { agent: "peer", task: "Peer after recovery", mode: "background" }, undefined, undefined, peer!.ctx);
+			// The second scan starts only after the first post-recovery traversal is displayed.
+			await eventually(() => scans.mock.callCount() >= 2 && /Subagent peer/.test(panel!.frame()), "same-session peer remains visible after recovery without reopening");
+			assert.equal((panel!.frame().match(/Subagent local/g) ?? []).length, 1, "recovered local activity appears once, never as a read-only peer duplicate");
+			assert.equal((panel!.frame().match(/Subagent peer/g) ?? []).length, 1, "the actual same-session peer remains independently visible");
 		} else if (scenario === "shutdown") {
 			assert.deepEqual(listPresence(profile).entries, [], "shutdown and late child events never recreate presence");
 		} else {
