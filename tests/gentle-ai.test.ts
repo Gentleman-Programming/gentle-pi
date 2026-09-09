@@ -13,7 +13,7 @@ import type {
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
 import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
-import type { NativeReviewCli } from "../lib/native-review-cli.ts";
+import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError, type NativeReviewCli } from "../lib/native-review-cli.ts";
 import type { ReviewCollectInputV3, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { cardBody, cardHint, cardTitle, cardTone } from "./gentle-card-text.ts";
@@ -60,6 +60,31 @@ function lifecycleContext(overrides: Record<string, unknown> = {}): Record<strin
 		...overrides,
 	};
 }
+
+test("missing package-local binaries give a direct recovery without attributing the cause to lifecycle scripts", async () => {
+	const result = await __testing.executeReviewControllerOperation(
+		{ operation: "inspect" },
+		process.cwd(),
+		{
+			targetStatus: async () => {
+				throw new NativeReviewCliError(
+					NATIVE_REVIEW_ERROR_CODE.PACKAGE_BINARY_MISSING,
+					"review/status",
+					false,
+					false,
+					"package binary missing",
+				);
+			},
+		} as unknown as NativeReviewCli,
+	);
+
+	assert.equal(result.outcome, "native-status-package-binary-missing");
+	assert.equal(result.recovery_command, "node scripts/install-gentle-ai.mjs");
+	assert.match(String(result.next_action), /installed gentle-pi package directory/);
+	assert.match(String(result.next_action), /GENTLE_PI_SKIP_GENTLE_AI_INSTALL/);
+	assert.match(String(result.next_action), /remove or unset it before/);
+	assert.match(String(result.reason), /does not prove install lifecycle scripts were disabled/);
+});
 
 test("registered Gentle Review tools render reusable rose lifecycle call rows", () => {
 	const tools = registeredGentleTools();
