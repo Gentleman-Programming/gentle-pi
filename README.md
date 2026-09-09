@@ -73,7 +73,7 @@ Most coding-agent sessions fail for operational reasons, not model reasons:
 | **Configurable startup intro** | Adds a rose/text-logo startup intro, compact runtime panel, color presets, and commands to hide or show the decorative parts.                  |
 | **Work routing discipline**    | Small tasks stay inline. Context-heavy exploration can be delegated. Large or risky changes go through SDD/OpenSpec.                          |
 | **SDD/OpenSpec assets**        | Installs phase agents and chains for `init`, `onboard`, `explore`, `proposal`, `spec`, `design`, `tasks`, `apply`, `verify`, `sync`, and `archive`. |
-| **Lazy SDD preflight**         | Resolves SDD mode, artifact store, delivery strategy, and review budget once per session; prompts only when a choice is genuinely unresolved.              |
+| **Lazy SDD preflight**         | Confirms SDD mode, artifact store, delivery strategy, and review budget on the first SDD invocation of every interactive session, including saved preferences.              |
 | **Subagent orchestration**     | Keeps one parent session responsible while child agents explore, implement, test, or review with focused context.                             |
 | **Strict TDD support**         | When project config declares a test command, apply/verify phases must record RED → GREEN → TRIANGULATE → REFACTOR evidence.                   |
 | **Closed choice prompts** | Per-option hover/click/wheel in fullscreen; keyboard selection in either TUI mode. |
@@ -457,15 +457,25 @@ Engram-only mode is different by design: Engram is working memory and does not m
 ~/.pi/agent/gentle-ai/support/strict-tdd*.md
 ```
 
-Preflight values resolve in this order: explicit current user/session choice, valid persisted preference, capability or already-selected strategy constraint, canonical default, then a prompt only when genuinely unresolved. Resolved values are reused for later SDD flows in the session.
+Every new interactive session confirms preflight on its first SDD invocation. Saved preferences and canonical defaults are suggestions: confirm the grouped values or change them. Cancellation leaves preflight unresolved. Confirmed current-session choices are reused for later SDD flows; headless sessions retain silent defaults. Session confirmation does not reset project initialization: the cold-start order remains confirmation → `sdd-init` → explore.
 
 Canonical values are `auto` execution mode, `openspec` artifact store, `ask-on-risk` delivery strategy, and a `400` changed-line review threshold. The delivery strategy domain is `ask-on-risk`, `auto-chain`, `single-pr`, or `exception-ok`; `chain_strategy` remains deferred until chaining is selected. `exception-ok` requires explicit `size:exception` acceptance and is never inferred. Consent, authorization, security, destructive/publishing, interactive phase approval, and ambiguous-scope gates remain human-controlled.
 
-It does **not** overwrite existing global assets unless you explicitly run:
+Startup refreshes hash-proven package-owned assets. For the previously unowned `sdd-research.md`, migration recognizes only the known old content hash (ignoring model/thinking routing), preserves routing, and records ownership. Body-edited or unknown assets remain untouched. Manual refresh uses the same ownership checks:
 
 ```text
 /gentle:install-sdd --force
 ```
+
+### Selected research
+
+Research capabilities use an explicit package mapping intersected with active Pi tools and the agent's allowlist. Official documentation requires only `fetch_content`; open-web requires all four tools: `web_search`, `source_check`, `fetch_content`, and `get_search_content`. Each must be active and approved/reachable in the child; none is optional. Inventory admission does not prove execution or source-backed evidence. The child receives exact registered names through `--tools` and rechecks its local inventory. SDK-only parent tools are not inherited by a CLI child.
+
+Generic MCP and dynamic namespace gateways (including `mcp__context7`) are not method-scoped grants. Context7-only installations remain unavailable through those gateways until a narrow verified route exists; this does not disable supported direct web tools. Explicit source restrictions always apply. Selected supported research must run and record auditable source-backed claims; any selected unavailable or partial class blocks proposal readiness. Bash and invented citations are never fallbacks.
+
+This downstream mapping implements the exact Pi grants defined by merged [Gentle AI PR #4420](https://github.com/Gentleman-Programming/gentle-ai/pull/4420) for gentle-ai#3846 and gentle-pi#471. Research admission is enforced locally against active child tools, not through the pinned native binary, so this change does not require a native release or re-pin. The opt-in live integration test verifies actual child tool execution and a source-backed passage independently of inventory checks.
+
+Workspace edits do not activate a different installed package path. Activate the updated package separately before expecting these behaviors in new sessions; edited installed assets may still need an explicit human reconciliation.
 
 Manual preflight command:
 

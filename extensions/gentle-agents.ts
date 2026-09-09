@@ -22,6 +22,7 @@ import { AGENTS_GLYPH, renderAgentsCard, widgetExpiryMs, widgetRows } from "../l
 import { CARD_TONE, renderCard } from "../lib/shell-card.ts";
 import { openInExternalEditor } from "./gentle-shell.ts";
 import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
+import { researchAgent, resolveResearchCapabilities, renderResearchCapabilities, RESEARCH_CHILD_TOOLS_ENV } from "../lib/sdd-research-capabilities.ts";
 
 // Gentle Agents: subagents as isolated `pi --mode rpc` children, a task
 // store that notifies per task, and a Gentle Shell card above the editor.
@@ -214,6 +215,19 @@ export async function answerThroughUi(ui: ExtensionContext["ui"] | undefined, as
 }
 
 export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env, overrides: Partial<AgentsDeps> = {}): void {
+	if (env.GENTLE_PI_AGENTS_CHILD === "1" && env[RESEARCH_CHILD_TOOLS_ENV] !== undefined) {
+		let allowed: string[] = [];
+		try {
+			const parsed: unknown = JSON.parse(env[RESEARCH_CHILD_TOOLS_ENV]!);
+			if (Array.isArray(parsed) && parsed.every(value => typeof value === "string")) allowed = parsed;
+		} catch { /* Invalid launch restrictions deny every tool. */ }
+		pi.on("before_agent_start", event => ({ systemPrompt: `${event.systemPrompt}\n\n${renderResearchCapabilities(resolveResearchCapabilities(pi, allowed))}` }));
+		pi.on("tool_call", event => {
+			if (!allowed.includes(event.toolName) || !pi.getActiveTools().includes(event.toolName)) {
+				return { block: true, reason: "Tool is outside the research child's active launch allowlist." };
+			}
+		});
+	}
 	const childIpc = ownedChildIpc(env, overrides.childIpc ?? (process.send ? process as unknown as IpcEndpoint : undefined));
 	if (env.GENTLE_PI_AGENTS_CHILD === "1") {
 		if (childIpc) registerChildMessaging(pi, childIpc);
@@ -547,6 +561,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const target = workspaceRoot !== undefined && !sameNonGitContinuation ? registry.validate(workspaceRoot) : parentIdentity?.root;
 		const config = loadAgentsConfig(roots(ctx));
 		const profile = resolveAgentProfile(agent, config);
+		const research = agent.name === "sdd-research" ? researchAgent(agent, pi) : undefined;
 		const sessionDir = agentRuntimePaths(deps.home, agentHome).sessions;
 		mkdirSync(sessionDir, { recursive: true });
 		const parentSessionManager = ctx.sessionManager as unknown as ReviewSessionManager;
@@ -554,7 +569,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const parentWorktreeRoot = ctx.sessionManager.getCwd();
 		const parentRepositoryIdentity = resolveCanonicalGitRepositoryIdentitySync(parentWorktreeRoot);
 		return {
-			agent,
+			agent: research?.agent ?? agent,
 			prompt,
 			label,
 			context,
@@ -566,7 +581,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			thinking: profile.thinking,
 			sessionDir,
 			resumeSessionPath: resume,
-			env: deps.env,
+			env: research ? { ...deps.env, [RESEARCH_CHILD_TOOLS_ENV]: JSON.stringify(research.agent.tools) } : deps.env,
 			...(parentRepositoryIdentity === undefined ? {} : {
 				authorizeParentStandingReviewPermission: (repositoryIdentity: string) => {
 					try {

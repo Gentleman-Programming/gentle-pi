@@ -1,5 +1,6 @@
 import { consumeReviewMutation, pendingReviewMutation, recordReviewMutation } from "../lib/review-reminder-receipt.ts";
 import { resolveSessionWorktree } from "../lib/session-worktree-registry.ts";
+import { resolveResearchCapabilities, renderResearchCapabilities } from "../lib/sdd-research-capabilities.ts";
 import { declareReviewRelayHandshake } from "../lib/review-relay-contract.ts";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
@@ -6786,7 +6787,11 @@ function createGentleAiExtensionForTesting(
 		if (typeof event.text !== "string" || !isSddPreflightTrigger(event.text)) {
 			return { action: "continue" };
 		}
-		await runSddPreflight(ctx);
+		try { await runSddPreflight(ctx); }
+		catch (error) {
+			if (ctx.hasUI) ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+			return { action: "handled" };
+		}
 		return { action: "continue" };
 	});
 
@@ -6819,8 +6824,14 @@ function createGentleAiExtensionForTesting(
 				// Best-effort only; never surfaced and never affects activation.
 			}
 		}
-		if (isSddAgent && !getSddPreflightPreferences(ctx)) {
-			await runSddPreflight(ctx);
+		try {
+			if (isSddAgent && !getSddPreflightPreferences(ctx)) {
+				await runSddPreflight(ctx);
+			}
+		} catch (error) {
+			// Pi logs thrown before_agent_start errors and continues. Return an
+			// unresolved gate instead of silently losing the preflight instructions.
+			return { systemPrompt: `${event.systemPrompt}\n\nSDD preflight unresolved: ${error instanceof Error ? error.message : String(error)}\nSTOP: Do not initialize the project, launch phases, write artifacts, or infer consent. Request session preflight confirmation before continuing.` };
 		}
 		const prefs = getSddPreflightPreferences(ctx);
 		const sddPrompt =
@@ -6862,7 +6873,7 @@ function createGentleAiExtensionForTesting(
 				})()
 				: "";
 		return {
-			systemPrompt: `${event.systemPrompt}${gentlePrompt}${sddPrompt}${nativeStatusPrompt}${reviewContractPrompt}`,
+			systemPrompt: `${event.systemPrompt}${gentlePrompt}${sddPrompt}${nativeStatusPrompt}${reviewContractPrompt}${!isNamedAgent && !isSddAgent ? `\n\n${renderResearchCapabilities(resolveResearchCapabilities(pi))}` : ""}`,
 		};
 	});
 
@@ -6955,9 +6966,13 @@ function createGentleAiExtensionForTesting(
 
 	pi.registerCommand("gentle:sdd-preflight", {
 		description:
-			"Run or reuse the lazy SDD preflight for this Pi session.",
-		handler: async (_args, ctx) => {
-			await runSddPreflight(ctx, SDD_PREFLIGHT_FIELDS);
+			"Run or reuse session SDD preflight; use --edit to change preferences.",
+		handler: async (args, ctx) => {
+			if (args.trim() !== "" && args.trim() !== "--edit") {
+				ctx.ui.notify("Usage: /gentle:sdd-preflight [--edit]", "warning");
+				return;
+			}
+			await runSddPreflight(ctx, args.trim() === "--edit" ? SDD_PREFLIGHT_FIELDS : []);
 		},
 	});
 

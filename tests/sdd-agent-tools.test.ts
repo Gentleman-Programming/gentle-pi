@@ -67,7 +67,7 @@ const requiredToolsByAgent: Record<string, string[]> = {
 	"sdd-init.md": ["read", "grep", "find", "edit", "write", "bash", "mem_search", "mem_get_observation", "mem_save", "mem_update"],
 	"sdd-onboard.md": ["read", "grep", "find", "edit", "write", "bash", "mem_search", "mem_get_observation", "mem_save", "mem_update"],
 	"sdd-proposal.md": ["read", "grep", "find", "edit", "write", "mem_search", "mem_get_observation", "mem_save"],
-	"sdd-research.md": ["read", "grep", "find", "edit", "write", "mem_search", "mem_get_observation", "mem_save"],
+	"sdd-research.md": ["read", "grep", "find", "edit", "write", "mem_search", "mem_get_observation", "mem_save", "fetch_content", "web_search", "source_check", "get_search_content"],
 	"sdd-spec.md": ["read", "grep", "find", "edit", "write", "mem_search", "mem_get_observation", "mem_save"],
 	"sdd-status.md": ["read", "grep", "find", "bash", "mem_search", "mem_get_observation"],
 	"sdd-sync.md": ["read", "grep", "find", "edit", "write", "bash", "mem_search", "mem_get_observation", "mem_save", "mem_update"],
@@ -101,6 +101,15 @@ test("artifact-producing SDD agents can persist OpenSpec files while status rema
 	const statusTools = readTools(join(assetsAgentsDir, "sdd-status.md"));
 	assert.ok(!statusTools.includes("edit"), "sdd-status.md must remain read-only");
 	assert.ok(!statusTools.includes("write"), "sdd-status.md must remain read-only");
+});
+
+test("research instructions require executed evidence rather than blanket denial", () => {
+	const source = readFileSync(join(assetsAgentsDir, "sdd-research.md"), "utf8");
+	assert.doesNotMatch(source, /documentation=\[\]; open-web=\[\]/);
+	assert.match(source, /Actually call approved tools/);
+	assert.match(source, /claim maps to source IDs/);
+	assert.match(source, /proposal_ready: false/);
+	assert.ok(!readTools(join(assetsAgentsDir, "sdd-research.md")).includes("bash"));
 });
 
 test("project does not ship local SDD agent overrides", () => {
