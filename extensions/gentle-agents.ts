@@ -13,9 +13,10 @@ import { isFinished, TASK_STATUS, TaskStore, type AskRequest, type TaskRecord } 
 import { AgentRunner, piCommand, type AskAnswer, type RunnerDeps, type TaskRequest } from "../lib/agents-runner.ts";
 import { ChildMessenger, type IpcEndpoint } from "../lib/agents-messaging.ts";
 import { hasReviewSessionPermission, resolveCanonicalGitRepositoryIdentitySync, type ReviewSessionManager } from "../lib/review-session-standing-permission.ts";
-import { historyDir, loadHistory, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
+import { historyDir, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
 import { sessionToMarkdown } from "../lib/agents-transcript.ts";
 import { AgentsView } from "../lib/agents-view.ts";
+import { PresencePublisher } from "../lib/orchestrator-presence.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
 import { AGENTS_GLYPH, renderAgentsCard, widgetExpiryMs, widgetRows } from "../lib/agents-widget.ts";
 import { CARD_TONE, renderCard } from "../lib/shell-card.ts";
@@ -231,10 +232,23 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const viewKey = agentsViewKey(env);
 	const stopKey = agentsStopKey(env);
 	const store = new TaskStore();
+	const restoredTaskIds = new Set<string>();
 	const tasksDir = historyDir(deps.home, agentHome);
 	let ui: ExtensionContext["ui"] | undefined;
 	let host: { requestRender(): void } | undefined;
 	let sessions: ExtensionContext["sessionManager"] | undefined;
+	let presence: PresencePublisher | undefined;
+	const overlays = new Set<AgentsView>();
+	const publishActivity = () => {
+		if (!sessions) return;
+		try {
+			if (!presence || presence.error) {
+				presence = PresencePublisher.start({ profile: agentHome, sessionId: activeSessionId() ?? "",
+					label: sessions.getSessionName?.() || sessions.getCwd().split(/[\\/]/).pop() || "Orchestrator", activity: [] });
+			}
+			presence?.update(store.list(activeSessionId()).filter((task) => !isFinished(task.status) && !restoredTaskIds.has(task.id)).map((task) => ({ task, thread: store.thread(task.id) })));
+		} catch { presence?.dispose(); presence = undefined; }
+	};
 	let worktrees: SessionWorktreeRegistry | undefined;
 	const registryFor = (ctx: ExtensionContext) => {
 		if (!worktrees || worktrees.sessionId !== ctx.sessionManager.getSessionId()) {
@@ -271,6 +285,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const tickClock = () => {
 		cancelClock?.();
 		cancelClock = undefined;
+		if (!sessions) return;
 		const tasks = visibleTasks();
 		if (tasks.some((task) => !isFinished(task.status))) {
 			cancelClock = deps.schedule(() => {
@@ -400,13 +415,19 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const live = store.get(id);
 		if (live) return live;
 		const stored = await loadStoredTask(tasksDir, id);
-		if (stored) store.restore(stored.task, stored.thread);
+		if (stored) {
+			restoredTaskIds.add(stored.task.id);
+			store.restore(stored.task, stored.thread);
+		}
 		return stored?.task;
 	};
 
 	const openOverlay = async (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
-		for (const stored of await loadHistory(tasksDir)) store.restore(stored.task, stored.thread);
+		if (ctx.mode !== "tui") {
+			ctx.ui.notify("The agents overlay requires TUI mode.", "warning");
+			return;
+		}
 		let view: AgentsView | undefined;
 		let overlayHost: { requestRender(force?: boolean): void; stop(): void; start(): void } | undefined;
 		const chosen = await ctx.ui.custom<TaskRecord | null>(
@@ -417,13 +438,19 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 					rows: () => Math.max(0, tui.terminal.rows),
 					store,
 					sessionId: ctx.sessionManager.getSessionId() ?? "",
+					presence: {
+						profile: agentHome,
+						get target() { return presence?.target; },
+					},
 					now: () => deps.now(),
 					onCancel: (task) => void stopSelected(task, ctx),
 					canCancel: isOwnedActive,
+					isLocalTask: (task) => !restoredTaskIds.has(task.id),
 					onOpen: (task) => done(task),
 					onClose: () => done(null),
 					requestRender: () => tui.requestRender(),
 				});
+				overlays.add(view);
 				const interaction = createNativeFullscreenInteraction({
 					keyboardTarget: view,
 					requestRender: () => tui.requestRender(),
@@ -433,8 +460,10 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				return interaction;
 			},
 			{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", margin: 0, anchor: "center" } },
-		);
-		view?.dispose();
+		).finally(() => {
+			view?.dispose();
+			if (view) overlays.delete(view);
+		});
 		if (!chosen || !overlayHost) return;
 		if (!chosen.sessionPath) {
 			ctx.ui.notify("This task has no session file yet.", "warning");
@@ -462,6 +491,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	// A status change is worth a frame right away; deltas inside a task are
 	// coalesced so a chatty child cannot flood the terminal.
 	store.subscribeSummary(() => {
+		publishActivity();
 		host?.requestRender();
 		tickClock();
 	});
@@ -540,7 +570,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const launch = async (ctx: ExtensionContext, request: TaskRequest): Promise<ToolText> => {
 		const task = runner.run(request);
 		ownedTaskIds.add(task.id);
-		store.subscribe(task.id, () => requestRender());
+		store.subscribe(task.id, () => { publishActivity(); requestRender(); });
 		if (request.mode === AGENT_MODE.BACKGROUND) return text(`Started ${task.agent} in the background as task ${task.id}. Use subagent_status or subagent_result with that id.`, taskDetails(task));
 		const finished = await runner.waitFor(task.id);
 		return text(finishedText(finished), taskDetails(finished));
@@ -649,7 +679,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	}
 
 	pi.registerCommand(AGENTS_COMMAND_NAME, {
-		description: "Show this session's subagents with their threads; a widens the list to every session. Press o to open a task's session in $EDITOR.",
+		description: "Show this session's active subagents; a lists open orchestrators in this profile. Peer threads are read-only; o opens a local task's transcript in $EDITOR.",
 		handler: async (_args, ctx) => openOverlay(ctx),
 	});
 	if (viewKey) {
@@ -665,8 +695,22 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		});
 	}
 
-	pi.on("session_start", (_event, ctx) => { registryFor(ctx); showWidget(ctx); });
+	pi.on("session_start", (_event, ctx) => {
+		presence?.dispose();
+		registryFor(ctx);
+		showWidget(ctx);
+		try {
+			presence = PresencePublisher.start({ profile: agentHome, sessionId: activeSessionId() ?? "",
+				label: ctx.sessionManager.getSessionName?.() || ctx.sessionManager.getCwd().split(/[\\/]/).pop() || "Orchestrator", activity: [] });
+			publishActivity();
+		} catch { presence = undefined; }
+	});
 	pi.on("session_shutdown", () => {
+		presence?.dispose();
+		presence = undefined;
+		cancelClock?.();
+		for (const view of overlays) { view.handleInput("q"); view.dispose(); }
+		overlays.clear();
 		sessions = undefined;
 		worktrees?.close();
 		worktrees = undefined;

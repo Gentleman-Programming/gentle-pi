@@ -55,21 +55,22 @@ function mouse(x: number, y: number, width: number, height: number, type: TuiMou
 	return { type, button: type === "move" ? "none" : "left", x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false };
 }
 
-test("AgentsView groups this session by parent session and labels orchestrators and subagents", () => {
+test("AgentsView shows direct current children and groups only open orchestrators in the directory", () => {
 	const { store, view } = harness();
 	store.add(task("current", "current-session-id", { agent: "current-worker" }));
 	store.add(task("other", "other-session-123456", { agent: "other-worker" }));
 
 	const plain = view.render(100).map(stripAnsi).join("\n");
-	assert.match(plain, /Current orchestrator/);
+	assert.doesNotMatch(plain, /Current orchestrator/);
 	assert.match(plain, /Subagent current-worker/);
 	assert.doesNotMatch(plain, /other-worker/, "the default scope excludes another parent session");
 	view.handleInput("a");
-	assert.match(view.render(100).map(stripAnsi).join("\n"), /Orchestrator other-se/);
+	assert.doesNotMatch(view.render(100).map(stripAnsi).join("\n"), /Orchestrator other-se/);
+	assert.match(view.render(100).join("\n"), /Current orchestrator/);
 	view.dispose();
 });
 
-test("AgentsView never infers unknown parent sessions and keeps manual terminal expansion", () => {
+test("AgentsView never infers unknown open sessions and keeps manual directory expansion", () => {
 	const { store, view } = harness();
 	store.add(task("current", "current-session-id", { lastActivityAt: 500 }));
 	store.add(task("other", "other-session-123456", { lastActivityAt: 400 }));
@@ -79,16 +80,17 @@ test("AgentsView never infers unknown parent sessions and keeps manual terminal 
 
 	let lines = view.render(100);
 	let plain = lines.map(stripAnsi).join("\n");
-	assert.equal((plain.match(/Unknown session/g) ?? []).length, 2, "each missing parent ID remains its own group");
+	assert.doesNotMatch(plain, /Unknown session|unknown-active|other-worker/, "retained origins are not presence evidence");
 	assert.doesNotMatch(plain, /unknown-terminal/, "a terminal-only group starts collapsed");
-	const terminalHeading = lines.map(stripAnsi).findLastIndex((line) => /Unknown session/.test(line));
+	const terminalHeading = lines.map(stripAnsi).findIndex((line) => /Current orchestrator/.test(line));
 	assert.equal(view.handleMouse(mouse(4, terminalHeading, 100, lines.length, "click"))?.handled, true, "left click toggles a heading");
-	assert.match(view.render(100).map(stripAnsi).join("\n"), /unknown-termina/, "the expanded child remains visible even when its label is width-clipped");
+	assert.doesNotMatch(view.render(100).map(stripAnsi).join("\n"), /Subagent worker/, "click collapses the local directory group");
 	store.update("unknown-terminal", { status: TASK_STATUS.FAILED });
-	assert.match(view.render(100).map(stripAnsi).join("\n"), /unknown-termina/, "manual expansion persists across task updates");
+	assert.doesNotMatch(view.render(100).map(stripAnsi).join("\n"), /Subagent worker/, "manual collapse persists across unrelated updates");
 	view.handleMouse(mouse(4, terminalHeading, 100, lines.length, "click"));
 	store.update("unknown-terminal", { status: TASK_STATUS.CANCELLED });
-	assert.doesNotMatch(view.render(100).map(stripAnsi).join("\n"), /unknown-termina/, "manual collapse persists across task updates");
+	assert.match(view.render(100).map(stripAnsi).join("\n"), /Subagent worker/, "manual expansion persists across unrelated updates");
+	assert.doesNotMatch(view.render(100).join("\n"), /unknown-termina/, "unknown terminal history remains excluded");
 	view.dispose();
 });
 
@@ -97,6 +99,7 @@ test("AgentsView keeps headings non-actionable and clears a hidden selected chil
 	store.add(task("first", "current-session-id", { createdAt: 2000, lastActivityAt: 200 }));
 	store.add(task("child", "current-session-id", { lastActivityAt: 100 }));
 	assert.equal(view.selectedTask()?.id, "first", "the first visible child starts selected");
+	view.handleInput("a");
 	view.handleInput("k");
 	view.handleInput("\x1b[D");
 	assert.equal(view.selectedTask(), undefined, "collapsing selects the heading instead of a hidden child");
@@ -108,7 +111,7 @@ test("AgentsView keeps headings non-actionable and clears a hidden selected chil
 	view.dispose();
 });
 
-test("AgentsView retains observed live children until the session TTL and forgets absent groups", () => {
+test("AgentsView removes terminal children immediately without deleting retained threads", () => {
 	let now = 10_000;
 	const { store, view } = harness(12, () => now);
 	store.add(task("live", "current-session-id", { agent: "retained" }));
@@ -118,10 +121,10 @@ test("AgentsView retains observed live children until the session TTL and forget
 	for (const elapsed of [0, SESSION_FINISHED_TTL_MS - 1]) {
 		now = 10_000 + elapsed;
 		const output = view.render(100).map(stripAnsi).join("\n");
-		assert.match(output, /Subagent retained/);
-		assert.match(output, /kept thread/);
+		assert.doesNotMatch(output, /Subagent retained|kept thread/);
+		assert.equal(store.thread("live").items.length, 1, "retained thread remains available outside the panel");
 		assert.doesNotMatch(output, /excluded/);
-		assert.equal(view.selectedTask()?.id, "live");
+		assert.equal(view.selectedTask(), undefined);
 	}
 	now = 10_000 + SESSION_FINISHED_TTL_MS;
 	assert.doesNotMatch(view.render(100).join("\n"), /Subagent retained/);
@@ -131,16 +134,20 @@ test("AgentsView retains observed live children until the session TTL and forget
 	view.dispose();
 });
 
-test("AgentsView respects explicit collapse after the final live child finishes", () => {
+test("AgentsView retains an idle open heading and explicit collapse after the final child finishes", () => {
 	const { store, view } = harness();
 	store.add(task("live", "current-session-id", { agent: "hidden" }));
+	view.handleInput("a");
 	view.render(100);
 	view.handleInput("k");
 	view.handleInput("\x1b[D");
 	store.update("live", { status: TASK_STATUS.COMPLETED, endedAt: 10_000 });
 	assert.doesNotMatch(view.render(100).join("\n"), /Subagent hidden/);
 	view.handleInput("\x1b[C");
-	assert.match(view.render(100).join("\n"), /Subagent hidden/);
+	assert.doesNotMatch(view.render(100).join("\n"), /Subagent hidden/);
+	assert.match(view.render(100).join("\n"), /Current orchestrator.*0/);
+	store.add(task("replacement", "current-session-id", { agent: "replacement" }));
+	assert.match(view.render(100).join("\n"), /Subagent replacement/);
 	view.dispose();
 });
 

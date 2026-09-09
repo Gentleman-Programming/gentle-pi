@@ -15,7 +15,7 @@ function mouse(x: number, y: number, width: number, height: number, type: TuiMou
 	return { type, button: type === "move" || type === "wheel" ? "none" : "left", x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false };
 }
 
-test("AgentsView integrates grouped selection, semantic scrolling, live geometry, and idempotent close", () => {
+test("AgentsView integrates flat current-session selection, semantic scrolling, live geometry, and idempotent close", () => {
 	const store = new TaskStore();
 	let rows = 8;
 	const closes: string[] = [];
@@ -43,21 +43,33 @@ test("AgentsView integrates grouped selection, semantic scrolling, live geometry
 
 	view.handleInput("k");
 	view.handleInput("\x1b[D");
-	assert.equal(view.selectedTask(), undefined, "collapsing a group clears its hidden selection");
+	assert.equal(view.selectedTask()?.id, "first", "up and left keep the first task selected without a group heading");
 	rows = 6;
 	assert.equal(view.handleMouse(mouse(closeX, 0, wide, frame.length)), undefined, "old close bounds are inert before the live resize frame");
 	frame = view.render(wide);
 	assert.equal(frame.length, rows, "the next frame uses the live height budget");
-	assert.match(frame.map(stripAnsi).join("\n"), /Select a task to inspect its thread/, "a collapsed heading keeps the detail pane inert");
+	assert.doesNotMatch(frame.map(stripAnsi).join("\n"), /Current orchestrator|Select a task to inspect its thread/, "current-session tasks stay flat with an active detail pane");
+	assert.match(frame.map(stripAnsi).join("\n"), /semantic line 11/, "the selected task still follows its thread after resizing");
 
 	view.handleInput("\x1b[C");
+	assert.equal(view.selectedTask()?.id, "first", "right does not expand a heading in the flat list");
 	view.handleInput("j");
+	assert.equal(view.selectedTask()?.id, "second", "down selects the next task directly");
+	view.handleInput("k");
+	assert.equal(view.selectedTask()?.id, "first", "up returns directly to the first task");
+	view.render(wide);
 	view.handleInput("\x1b[5~");
 	frame = view.render(wide);
 	assert.doesNotMatch(frame.map(stripAnsi).join("\n"), /semantic line 11/, "manual thread scrolling remains off the tail after resizing");
 	const narrow = view.render(59).map(stripAnsi);
 	assert.equal(narrow.length, rows, "width 59 keeps a narrow single viewport");
 	assert.match(narrow[0] ?? "", /\[×\]/, "narrow mode keeps only the compact close control");
+	view.handleInput("\t");
+	const details = view.render(59).map(stripAnsi);
+	assert.match(details[0] ?? "", /\[← Back\]/, "Tab opens selected-task details directly from the flat list");
+	assert.match(details.join("\n"), /first · running/, "details belong to the selected task");
+	view.handleInput("\t");
+	assert.equal(view.selectedTask()?.id, "first", "returning from details preserves task selection");
 	rows = 2;
 	const fallback = view.render(59).map(stripAnsi);
 	assert.equal(fallback.length, 1, "a two-row terminal uses the one-line fallback");

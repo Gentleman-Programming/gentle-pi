@@ -1,17 +1,18 @@
 import { Key, matchesKey, truncateToWidth, visibleWidth, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { measureAgentsViewLayout, type AgentsViewLayout } from "./agents-view-layout.ts";
-import { isFinished, TASK_STATUS, type TaskRecord, type TaskStore, type TaskThread, type ThreadItem } from "./agents-protocol.ts";
+import { emptyThread, isFinished, TASK_STATUS, type TaskRecord, type TaskStore, type TaskThread, type ThreadItem } from "./agents-protocol.ts";
 import { renderThreadItem, type AgentsThreadTheme } from "./agents-thread-view.ts";
 import { formatElapsed } from "./agents-widget.ts";
 import { createNativePointerScope, type NativePointerRegion } from "./native-pointer-region.ts";
 import { formatTokens } from "./shell-bar.ts";
+import { PresenceCursor, readActivity, type Header, type Target } from "./orchestrator-presence.ts";
 
 // Gentle Agents overlay: tasks on the left, the selected task's thread on
 // the right. Only the selected task is subscribed, thread items are rendered
 // once each (they are immutable until replaced), and the viewport shows the
-// tail unless the human scrolls up. The list opens on the active session's
-// work (active tasks plus those finished in the last quarter hour); `a`
-// widens it to every task of every session, including the stored history.
+// tail unless the human scrolls up. Current scope contains direct live children;
+// all sessions is a presence directory, not a history browser. Remote activity
+// is presentation-only and never enters the local TaskStore.
 
 export interface AgentsViewTheme extends AgentsThreadTheme {}
 
@@ -26,12 +27,12 @@ export interface AgentsViewDeps {
 	theme: AgentsViewTheme;
 	rows: number | (() => number);
 	store: TaskStore;
-	// The active session; without it there is nothing to scope by and the
-	// list shows every task.
 	sessionId?: string;
+	presence?: { profile: string; target?: Readonly<Target> };
 	now(): number;
 	onCancel(task: TaskRecord): void;
 	canCancel?(task: TaskRecord): boolean;
+	isLocalTask?(task: TaskRecord): boolean;
 	onOpen(task: TaskRecord): void;
 	onClose(): void;
 	requestRender(): void;
@@ -109,6 +110,7 @@ interface PointerLayout extends AgentsViewLayout {
 interface SessionGroup {
 	id: string;
 	sessionId: string | undefined;
+	label?: string;
 	tasks: TaskRecord[];
 }
 
@@ -166,10 +168,82 @@ export class AgentsView {
 	private readonly unsubscribeSummary: () => void;
 	private cache = new WeakMap<ThreadItem, string[]>();
 	private cacheWidth = -1;
+	private peers: SessionGroup[] = [];
+	private remoteThreads = new Map<string, TaskThread>();
+	private presenceCursor?: PresenceCursor;
+	private presenceTimer?: ReturnType<typeof setTimeout>;
+
+	// One directory page or one pinned activity per turn; yield between reads.
+	// Keep the previous directory until a traversal completes, avoiding page flicker.
+	private refreshPresence(): void {
+		const source = this.deps.presence;
+		if (!source || this.closed) return;
+		const groups: SessionGroup[] = [];
+		const threads = new Map<string, TaskThread>();
+		const seen = new Set<string>();
+		let pending: Header[] = [];
+		let overflow = true;
+		const step = () => {
+			if (this.closed) return;
+			try {
+				if (pending.length) {
+					const header = pending.shift()!;
+					const id = `${header.sessionHash}:${header.incarnation}`;
+					if (!seen.has(id) && header.incarnation !== source.target?.incarnation) {
+						seen.add(id);
+						const { activity, unavailable } = readActivity(source.profile, header);
+						const tasks = (activity?.tasks ?? []).filter(({ summary }) => !isFinished(summary.status as TaskRecord["status"])).map(({ summary, thread }) => {
+							const task: TaskRecord = { ...summary, id: `peer:${id}:${summary.id}`, parentSessionId: id,
+								status: summary.status as TaskRecord["status"], mode: "background", prompt: "", cwd: "",
+								thinking: undefined, sessionPath: null, error: null, result: null, lastStep: "", turns: 0, toolCalls: 0, tokens: 0, cost: 0 };
+							threads.set(task.id, { ...emptyThread(), ...thread,
+								items: thread.items.map((item) => item.kind === "tool" ? { ...item, args: {} } : item) as ThreadItem[] });
+							return task;
+						});
+						groups.push({ id, sessionId: id, label: `${header.label}${unavailable ? " · unavailable" : ""}`, tasks });
+					}
+				} else if (overflow) {
+					this.presenceCursor ??= new PresenceCursor(source.profile);
+					const page = this.presenceCursor.next();
+					pending = page.entries.filter((entry) => entry.recent);
+					overflow = page.overflow;
+				} else {
+					this.peers = groups;
+					this.remoteThreads = threads;
+					this.refreshTasks();
+					this.clearFooterLayout();
+					this.deps.requestRender();
+					this.stopPresenceRefresh();
+					this.presenceTimer = setTimeout(() => this.refreshPresence(), 1000);
+					this.presenceTimer.unref();
+					return;
+				}
+			} catch {
+				this.peers = [];
+				this.remoteThreads.clear();
+				this.refreshTasks();
+				this.clearFooterLayout();
+				this.deps.requestRender();
+				this.stopPresenceRefresh();
+				this.presenceTimer = setTimeout(() => this.refreshPresence(), 1000);
+				this.presenceTimer.unref();
+				return;
+			}
+			this.presenceTimer = setTimeout(step, 0);
+			this.presenceTimer.unref();
+		};
+		step();
+	}
+
+	private stopPresenceRefresh(): void {
+		clearTimeout(this.presenceTimer);
+		this.presenceCursor?.close();
+		this.presenceCursor = undefined;
+	}
 
 	constructor(deps: AgentsViewDeps) {
 		this.deps = deps;
-		this.scope = deps.sessionId === undefined ? VIEW_SCOPE.ALL : VIEW_SCOPE.SESSION;
+		this.scope = VIEW_SCOPE.SESSION;
 		this.listRegion = this.pointerScope.wrap(EMPTY_COMPONENT, {
 			onWheel: (event) => this.wheelList(event),
 		});
@@ -203,10 +277,12 @@ export class AgentsView {
 			this.deps.requestRender();
 		});
 		this.subscribeSelected();
+		this.refreshPresence();
 	}
 
 	dispose(): void {
 		this.closed = true;
+		this.stopPresenceRefresh();
 		this.pointerLayout = undefined;
 		this.pointerScope.dispose();
 		this.unsubscribeTask?.();
@@ -303,8 +379,7 @@ export class AgentsView {
 			this.pointerLayout = { ...layout, height: 1, sourceHeight: layout.height, narrowView: this.narrowView, closeButton: { x: 0, width: 1 } };
 			return ["×" + fit(" Close Agents", layout.width - 1)];
 		}
-		// Finished rows age out of the session scope while the overlay is open;
-		// the list is otherwise reordered only when a status changes.
+		// Retained terminal rows never belong in either live scope.
 		const now = this.deps.now();
 		if (this.tasks.some((task) => !this.inScope(task, now))) this.refreshTasks();
 		if (this.pointerLayout && (this.pointerLayout.width !== layout.width || this.pointerLayout.height !== layout.height || this.pointerLayout.mode !== layout.mode || this.pointerLayout.narrowView !== this.narrowView)) this.clearFooterLayout();
@@ -353,19 +428,19 @@ export class AgentsView {
 
 	private counts(): string {
 		const active = this.tasks.filter((task) => !isFinished(task.status)).length;
-		return `${active} active · ${this.tasks.length - active} finished`;
+		return `${active} active`;
 	}
 
 	private actionableTask(): TaskRecord | undefined {
-		return this.isNarrow() && !this.narrowGroup && this.narrowView === "list" ? undefined : this.selectedTask();
+		return this.directoryRoot() && this.narrowView === "list" ? undefined : this.selectedTask();
 	}
 
 	private canCancel(task: TaskRecord): boolean {
-		return !isFinished(task.status) && (this.deps.canCancel?.(task) ?? true);
+		return !this.remoteThreads.has(task.id) && !isFinished(task.status) && (this.deps.canCancel?.(task) ?? true);
 	}
 
 	private canOpen(task: TaskRecord | undefined): boolean {
-		return Boolean(task?.sessionPath);
+		return Boolean(task?.sessionPath) && !this.remoteThreads.has(task!.id);
 	}
 
 	private keys(narrow = false): ReadonlyArray<readonly [string, string]> {
@@ -394,12 +469,13 @@ export class AgentsView {
 		this.deps.requestRender();
 	}
 
-	// The session scope: this session's active tasks plus those that finished
-	// within the last quarter hour. Everything else waits under "all sessions".
-	private inScope(task: TaskRecord, now: number): boolean {
-		if (this.scope === VIEW_SCOPE.ALL) return true;
-		if (task.parentSessionId !== this.deps.sessionId) return false;
-		return !isFinished(task.status) || task.endedAt === null || now - task.endedAt < SESSION_FINISHED_TTL_MS;
+	private inScope(task: TaskRecord, _now: number): boolean {
+		return !isFinished(task.status) && (task.parentSessionId === this.deps.sessionId
+			|| (this.scope === VIEW_SCOPE.ALL && this.remoteThreads.has(task.id)));
+	}
+
+	private directoryRoot(): boolean {
+		return this.scope === VIEW_SCOPE.ALL && this.isNarrow() && !this.narrowGroup;
 	}
 
 	// Keep the selected row inside the list window, moving the window by the
@@ -458,8 +534,9 @@ export class AgentsView {
 	}
 
 	private refreshTasks(): void {
-		const now = this.deps.now();
-		this.tasks = this.deps.store.list().filter((task) => this.inScope(task, now));
+		this.tasks = this.deps.store.list().filter((task) => task.parentSessionId === this.deps.sessionId
+			&& !isFinished(task.status) && (this.deps.isLocalTask?.(task) ?? true));
+		if (this.scope === VIEW_SCOPE.ALL) this.tasks.push(...this.peers.flatMap((group) => group.tasks));
 		const groups = this.sessionGroups();
 		const present = new Set(groups.map((group) => group.id));
 		for (const id of this.observedActiveGroups) if (!present.has(id)) this.observedActiveGroups.delete(id);
@@ -489,11 +566,16 @@ export class AgentsView {
 		for (const group of groups.values()) {
 			group.tasks.sort((a, b) => b.createdAt - a.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 		}
+		if (this.scope === VIEW_SCOPE.ALL) {
+			const localId = `session:${this.deps.sessionId}`;
+			const local = groups.get(localId) ?? { id: localId, sessionId: this.deps.sessionId, tasks: [] };
+			return [local, ...this.peers];
+		}
 		return [...groups.values()];
 	}
 
 	private visibleRows(): VisibleRow[] {
-		if (!this.isNarrow()) return this.allRows();
+		if (!this.isNarrow() || this.scope === VIEW_SCOPE.SESSION) return this.allRows();
 		const groups = this.sessionGroups();
 		if (!this.narrowGroup) return groups.map((group) => ({ id: `heading:${group.id}`, kind: "heading", group }));
 		const group = groups.find((entry) => entry.id === this.narrowGroup);
@@ -503,8 +585,8 @@ export class AgentsView {
 	private allRows(): VisibleRow[] {
 		const rows: VisibleRow[] = [];
 		for (const group of this.sessionGroups()) {
-			rows.push({ id: `heading:${group.id}`, kind: "heading", group });
-			if (this.isExpanded(group)) {
+			if (this.scope === VIEW_SCOPE.ALL) rows.push({ id: `heading:${group.id}`, kind: "heading", group });
+			if (this.scope === VIEW_SCOPE.SESSION || this.isExpanded(group)) {
 				for (const task of group.tasks) rows.push({ id: `task:${task.id}`, kind: "task", group, task });
 			}
 		}
@@ -512,7 +594,7 @@ export class AgentsView {
 	}
 
 	private selectedRow(rows = this.visibleRows()): VisibleRow | undefined {
-		if (this.isNarrow() && !this.narrowGroup && this.narrowView === "list") return rows.find((row) => row.id === this.groupCursor) ?? rows[0];
+		if (this.directoryRoot() && this.narrowView === "list") return rows.find((row) => row.id === this.groupCursor) ?? rows[0];
 		return rows.find((row) => row.id === this.selectedId);
 	}
 
@@ -539,7 +621,7 @@ export class AgentsView {
 		this.unsubscribeTask?.();
 		this.unsubscribeTask = undefined;
 		this.subscribedTaskId = task?.id;
-		if (!task) return;
+		if (!task || this.remoteThreads.has(task.id)) return;
 		this.unsubscribeTask = this.deps.store.subscribe(task.id, () => {
 			this.clearFooterLayout();
 			this.refreshTasks();
@@ -577,7 +659,8 @@ export class AgentsView {
 	}
 
 	private groupTitle(group: SessionGroup): string {
-		if (!group.sessionId) return "Unknown session";
+		if (group.label) return group.label;
+		if (!group.sessionId) return "Current orchestrator";
 		if (group.sessionId === this.deps.sessionId) return "Current orchestrator";
 		return `Orchestrator ${group.sessionId.slice(0, 8)}`;
 	}
@@ -605,7 +688,7 @@ export class AgentsView {
 		if (!task) return [this.deps.theme.fg(ROLE.EMPTY, "Select a task to inspect its thread")];
 		const theme = this.deps.theme;
 		const header = theme.fg(ROLE.META, truncateToWidth(taskHeader(task, this.deps.now()), width, "…"));
-		const lines = this.threadLines(this.deps.store.thread(task.id), width);
+		const lines = this.threadLines(this.remoteThreads.get(task.id) ?? this.deps.store.thread(task.id), width);
 		if (lines.length === 0) return [header, theme.fg(ROLE.EMPTY, task.error ?? EMPTY_THREAD)];
 		const visible = Math.max(0, rows - 1);
 		const maxScroll = Math.max(0, lines.length - visible);
@@ -621,7 +704,7 @@ export class AgentsView {
 		// Keyboard movement reveals the selection; pointer activation keeps the
 		// manually positioned list available for Back, even after height clamping.
 		if (revealSelection) this.manualListOffsets.delete(this.listKey());
-		if (this.isNarrow() && !this.narrowGroup) {
+		if (this.directoryRoot()) {
 			this.groupCursor = next.id;
 			this.clearFooterLayout();
 			this.deps.requestRender();
@@ -724,6 +807,7 @@ export class AgentsView {
 	private close(): void {
 		if (this.closed) return;
 		this.closed = true;
+		this.stopPresenceRefresh();
 		this.pointerScope.invalidate();
 		this.deps.onClose();
 	}
