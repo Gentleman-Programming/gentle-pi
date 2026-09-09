@@ -5,7 +5,7 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join, relative, resolve } from "node:path";
 import { pendingReviewMutation, REVIEW_REMINDER_RECEIPT } from "../lib/review-reminder-receipt.ts";
 import { SESSION_WORKTREE_ENTRY, SESSION_WORKTREE_CHANGED } from "../lib/session-worktree-registry.ts";
-import test, { after, mock } from "node:test";
+import test, { after, afterEach, mock } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, answerThroughUi, completionText, legacySubagentsInstalled, type AgentsDeps } from "../extensions/gentle-agents.ts";
@@ -47,7 +47,13 @@ function mouse(
 	return { type, button, x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false };
 }
 const root = mkdtempSync(join(tmpdir(), "gentle-agents-ext-"));
-after(() => rmSync(root, { recursive: true, force: true }));
+const activeSessionTeardowns = new Set<() => Promise<void>>();
+const stopActiveSessions = () => Promise.all([...activeSessionTeardowns].map((shutdown) => shutdown()));
+afterEach(stopActiveSessions);
+after(async () => {
+	try { await stopActiveSessions(); }
+	finally { rmSync(root, { recursive: true, force: true }); }
+});
 const home = join(root, "home");
 const cwd = join(root, "project");
 const nonGitCwd = join(root, "non-git-project");
@@ -76,8 +82,24 @@ function fakePi() {
 		registerShortcut: (key: string, registration: { description: string; handler(ctx: ExtensionContext): Promise<void> }) => shortcuts.set(key, registration),
 		registerCommand: (name: string, registration: { handler(args: string, ctx: ExtensionContext): Promise<void> }) => commands.set(name, registration),
 	} as unknown as ExtensionAPI;
+	let activeSession: ExtensionContext | undefined;
+	const teardown = async () => {
+		const ctx = activeSession;
+		if (ctx === undefined) return;
+		await fire("session_shutdown", ctx, { reason: "quit" });
+	};
 	const fire = async (event: string, ctx: ExtensionContext, payload: unknown = {}) => {
-		for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
+		try {
+			for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
+		} finally {
+			if (event === "session_start") {
+				activeSession = ctx;
+				activeSessionTeardowns.add(teardown);
+			} else if (event === "session_shutdown" && activeSession === ctx) {
+				activeSession = undefined;
+				activeSessionTeardowns.delete(teardown);
+			}
+		}
 	};
 	return { pi, tools, shortcuts, commands, fire, sent, renderers, entries, events };
 }

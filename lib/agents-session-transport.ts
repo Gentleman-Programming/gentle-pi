@@ -1,9 +1,10 @@
-import { chmod, constants, link, lstat, mkdir, open, opendir, unlink, writeFile } from "node:fs/promises";
+import { chmod, constants, link, lstat, mkdir, open, opendir, realpath, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 
 const DIR_MODE = 0o700, FILE_MODE = 0o600, MAX_RECORD_BYTES = 8192, MAX_ENTRIES = 64, MAX_SOCKET_PATH_BYTES = 100;
+const RUNTIME_TMP = "/tmp", RUNTIME_PREFIX = "gentle-pi-", PROFILE_HASH_HEX_LENGTH = 32, SOCKET_NAME_BYTES = 27;
 const SESSION = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/, TOKEN = /^[A-Za-z0-9_-]{22}$/;
 const OPEN_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
 type Code = "invalid_session" | "not_found" | "invalid_presence" | "unsafe_path" | "io_error" | "busy";
@@ -49,25 +50,50 @@ async function privateDirectory(path: string, create = false) {
 	} catch (error) { boundary(error); }
 }
 
+type RuntimeParent = Readonly<{ mode: number; uid: number; isSymbolicLink: () => boolean; isDirectory: () => boolean }>;
+
+export const isSafeRuntimeParent = (stat: RuntimeParent) => {
+	if (stat.isSymbolicLink() || !stat.isDirectory() || (!sameUser(stat) && stat.uid !== 0)) return false;
+	const mode = stat.mode & 0o7777;
+	return (sameUser(stat) && (mode & 0o022) === 0) || (mode & 0o1777) === 0o1777;
+};
+
+async function runtimeSocketDirectory(agentHome: string) {
+	try {
+		// macOS resolves /tmp to /private/tmp. This shared parent is not ours: it
+		// must be owner-only writable or a world-writable sticky tmp.
+		const shared = await realpath(RUNTIME_TMP), sharedStat = await lstat(shared);
+		if (!isSafeRuntimeParent(sharedStat)) fail("unsafe_path", "unsafe transport path");
+		const userRoot = join(shared, `${RUNTIME_PREFIX}${uid() ?? "unknown"}`);
+		await privateDirectory(userRoot, true);
+		const profile = createHash("sha256").update(agentHome).digest("hex").slice(0, PROFILE_HASH_HEX_LENGTH);
+		const sockets = join(userRoot, profile);
+		if (Buffer.byteLength(join(sockets, `${"x".repeat(SOCKET_NAME_BYTES - 5)}.sock`)) > MAX_SOCKET_PATH_BYTES) fail("unsafe_path", "unsafe transport path");
+		await privateDirectory(sockets, true);
+		return sockets;
+	} catch (error) { boundary(error); }
+}
+
 export class SessionPresenceRegistry {
 	readonly paths: TransportPaths;
 
 	private readonly beforeCandidateOpen?: () => Promise<void>;
 
-	private constructor(agentHome: string, beforeCandidateOpen?: () => Promise<void>) {
-		const root = join(resolve(agentHome), "gentle-agents", "transport");
-		this.paths = Object.freeze({ root, presence: join(root, "presence"), sockets: join(root, "sockets") });
+	private constructor(agentHome: string, sockets: string, beforeCandidateOpen?: () => Promise<void>) {
+		const root = join(agentHome, "gentle-agents", "transport");
+		this.paths = Object.freeze({ root, presence: join(root, "presence"), sockets });
 		this.beforeCandidateOpen = beforeCandidateOpen;
 	}
 
 	static async create(agentHome: string, beforeCandidateOpen?: () => Promise<void>) {
 		if (process.platform === "win32") fail("io_error", "transport I/O failed");
-		const registry = new SessionPresenceRegistry(agentHome, beforeCandidateOpen), home = resolve(agentHome);
+		const home = resolve(agentHome);
 		await parentDirectory(home);
 		await parentDirectory(join(home, "gentle-agents"));
+		const sockets = await runtimeSocketDirectory(home);
+		const registry = new SessionPresenceRegistry(home, sockets, beforeCandidateOpen);
 		await privateDirectory(registry.paths.root, true);
 		await privateDirectory(registry.paths.presence, true);
-		await privateDirectory(registry.paths.sockets, true);
 		return registry;
 	}
 

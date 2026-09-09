@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import nodeTest from "node:test";
 const test = process.platform === "win32" ? nodeTest.skip : nodeTest;
-import { ActiveSessionClient, ActiveSessionClientError, ActiveSessionListener, FrameDecoder, MAX_FRAME_BYTES, SessionPresenceError, SessionPresenceRegistry, TransportProtocolError, encodeAckFrame, encodeNotificationFrame, type PresenceRecord } from "../lib/agents-session-transport.ts";
+import { ActiveSessionClient, ActiveSessionClientError, ActiveSessionListener, FrameDecoder, MAX_FRAME_BYTES, SessionPresenceError, SessionPresenceRegistry, TransportProtocolError, encodeAckFrame, encodeNotificationFrame, isSafeRuntimeParent, type PresenceRecord } from "../lib/agents-session-transport.ts";
 
 async function registry(t: test.TestContext, beforeCandidateOpen?: () => Promise<void>) {
 	const home = await mkdtemp(join(tmpdir(), "g-"));
@@ -44,6 +44,40 @@ test("preserves both shared parent modes while creating private transport direct
 	assert.equal(await mode(transport.paths.sockets), 0o700);
 	assert.equal(await mode(join(transport.paths.root, "..", "..")), 0o755, "agentHome remains host-owned");
 	assert.equal(await mode(join(transport.paths.root, "..")), 0o755, "gentle-agents remains host-owned");
+});
+
+test("accepts only private-owned or sticky world-writable runtime parents", () => {
+	const current = process.getuid!(), foreign = current === 1 ? 2 : 1;
+	const parent = (mode: number, uid: number, directory = true, symlink = false) => ({ mode, uid, isDirectory: () => directory, isSymbolicLink: () => symlink });
+	assert.equal(isSafeRuntimeParent(parent(0o700, current)), true, "private owned parent is safe");
+	assert.equal(isSafeRuntimeParent(parent(0o777, current)), false, "non-sticky world-writable owned parent is unsafe");
+	assert.equal(isSafeRuntimeParent(parent(0o770, current)), false, "group-writable owned parent is unsafe");
+	assert.equal(isSafeRuntimeParent(parent(0o1777, current)), true, "current-user sticky parent is safe");
+	assert.equal(isSafeRuntimeParent(parent(0o1777, 0)), true, "root-owned sticky parent is safe");
+	assert.equal(isSafeRuntimeParent(parent(0o1777, foreign)), false, "foreign-owned sticky parent is unsafe");
+	assert.equal(isSafeRuntimeParent(parent(0o755, foreign)), false, "foreign read-only parent is rejected conservatively");
+	assert.equal(isSafeRuntimeParent(parent(0o1777, foreign, true, true)), false, "symlinked parent is unsafe");
+	assert.equal(isSafeRuntimeParent(parent(0o1777, foreign, false)), false, "non-directory parent is unsafe");
+});
+
+test("binds deep ASCII and Unicode profiles to isolated bounded socket paths", async (t) => {
+	const base = await mkdtemp(join(tmpdir(), "g-deep-"));
+	t.after(() => rm(base, { recursive: true, force: true }));
+	const profile = async (name: string) => {
+		const home = join(base, ...Array.from({ length: 4 }, () => name.repeat(32)));
+		await mkdir(join(home, "gentle-agents"), { recursive: true, mode: 0o755 });
+		return SessionPresenceRegistry.create(home);
+	};
+	const ascii = await profile("ascii-"), unicode = await profile("é-");
+	const asciiRecord = await ascii.record("ascii"), unicodeRecord = await unicode.record("unicode");
+	for (const record of [asciiRecord, unicodeRecord]) assert.ok(Buffer.byteLength(record.endpoint) <= 100, "socket endpoint stays within the conservative Unix limit");
+	assert.notEqual(ascii.paths.sockets, unicode.paths.sockets, "profile hash isolates runtime socket partitions");
+	assert.equal(ascii.paths.presence.includes(base), true, "presence records remain in the private profile transport directory");
+	assert.equal(asciiRecord.endpoint.includes(base), false, "socket endpoint is independent of the profile path");
+	const instance = new ActiveSessionListener(unicode, "unicode", async () => {});
+	await instance.start();
+	assert.equal((await lstat(instance.record!.endpoint)).isSocket(), true, "the bounded Unicode-profile endpoint is usable");
+	await instance.close();
 });
 
 test("publishes immutable v1 activations with private modes and exact discovery", async (t) => {
