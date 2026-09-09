@@ -13,6 +13,7 @@ import type {
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
 import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
+import { CandidateViewError, type CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError, type NativeReviewCli } from "../lib/native-review-cli.ts";
 import type { ReviewCollectInputV3, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
@@ -400,6 +401,83 @@ test("ordinary native capture exposes a registered schema and STATUS binding cop
 	}, process.cwd(), native);
 	assert.equal(captured.status, "captured");
 	assert.equal(launches, 1);
+});
+
+test("ordinary START reports candidate-owner preparation failure as pre-native no mutation", async () => {
+	let nativeStarts = 0;
+	const target = {
+		contract: "gentle-ai.review-integration/v2",
+		applicability: "unrelated",
+		action: "start",
+		replayability: "not_replayable",
+		targetIdentity: "a".repeat(64),
+		projection: {
+			schema: "gentle-ai.review-candidate-projection/v1",
+			kind: "current-changes",
+			projection: "workspace",
+			baseTree: "b".repeat(40),
+			initialReviewTree: "b".repeat(40),
+			currentCandidateTree: "b".repeat(40),
+			pathsDigest: "a".repeat(64),
+			paths: [],
+			intendedUntracked: [],
+			intendedUntrackedProof: "a".repeat(64),
+			initialSnapshotIdentity: "a".repeat(64),
+			currentSnapshotIdentity: "a".repeat(64),
+		},
+		candidates: [],
+		raw: { schema: "gentle-ai.review-integration.status/v5" },
+	} as unknown as ReviewStatusV3;
+	const native = {
+		targetStatus: async () => target,
+		start: async () => { nativeStarts += 1; throw new Error("native START must not run"); },
+	} as unknown as NativeReviewCli;
+	const candidateViews = {
+		createOrReuse: () => { throw new CandidateViewError("candidate view owner preparation failed", "candidate-owner-preparation-failed"); },
+	} as unknown as CandidateViewRegistry;
+	const result = await __testing.executeReviewControllerOperation(
+		{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+		process.cwd(),
+		native,
+		undefined,
+		candidateViews,
+	);
+	assert.equal(nativeStarts, 0);
+	assert.equal(result.outcome, "native-operation-failed");
+	assert.equal(result.mutation_outcome, "none");
+	assert.deepEqual(result.diagnostics, {
+		code: "candidate-owner-preparation-failed",
+		message: "candidate view rejected before native START",
+	});
+
+	let statusCalls = 0;
+	const afterNative = await __testing.executeReviewControllerOperation(
+		{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+		process.cwd(),
+		{
+			targetStatus: async () => { statusCalls += 1; return target; },
+			start: async () => {
+				nativeStarts += 1;
+				throw new CandidateViewError("post-native candidate verification failed", "candidate-view-timeout", {
+					phase: "candidate-view",
+					category: "timeout",
+					git_subcommand: "worktree",
+					timeout_ms: 10_000,
+					max_buffer_bytes: 64 * 1024 * 1024,
+					message: "candidate-view Git command worktree timed out after 10000ms; inspect the candidate state before any new START",
+				});
+			},
+		} as unknown as NativeReviewCli,
+		undefined,
+		null,
+	);
+	assert.equal(nativeStarts, 1);
+	assert.equal(statusCalls, 2, "a post-native diagnostic must reconcile STATUS");
+	assert.equal(afterNative.mutation_outcome, "unknown");
+	assert.deepEqual(afterNative.diagnostics, {
+		code: "candidate-view-timeout",
+		message: "post-native candidate verification failed",
+	});
 });
 
 test("agent model discovery prioritizes SDD and Judgment Day agents", (t) => {
