@@ -37,8 +37,10 @@ import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
 import {
 	ensureSddPreflight,
 	getSddPreflightPreferences,
-	installSddAssets,
 	installPackageAssets,
+	getPackageAssetOwner,
+	hasPackageAssetOwnerInstallation,
+	type PackageAssetOwner,
 	isPackageManagedSddAsset,
 	isSddPreflightTrigger,
 	renderSddPreflightPrompt,
@@ -194,14 +196,14 @@ import {
 const GRAPH_V1_ORDINARY_READ_ONLY = "Graph-v1 ordinary review authority is read-only; use native compact-v2 review operations";
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
-const PACKAGE_ASSET_REPAIR_GUIDANCE = "refresh intentionally by owner: delegation /gentle:install-delegation --force; review /gentle:install-review --force; SDD /gentle:install-sdd --force";
 
 function gentlePiAgentHome(): string {
 	return resolveGentlePiAgentHome();
 }
 
-function sddGlobalAssetDriftCount(): number {
+function packageAssetAudit(owner: PackageAssetOwner): { stale: number; overrides: number } {
 	let stale = 0;
+	let overrides = 0;
 	for (const [assetSubdir, installedSubdir, ownershipPrefix] of [
 		["agents", "agents", "agents"],
 		["chains", "chains", "chains"],
@@ -210,7 +212,7 @@ function sddGlobalAssetDriftCount(): number {
 		const assetDir = join(ASSETS_DIR, assetSubdir);
 		if (!existsSync(assetDir)) continue;
 		for (const entry of readdirSync(assetDir, { withFileTypes: true })) {
-			if (!entry.isFile()) continue;
+			if (!entry.isFile() || getPackageAssetOwner(`${ownershipPrefix}/${entry.name}`) !== owner) continue;
 			const installedPath = join(gentlePiAgentHome(), installedSubdir, entry.name);
 			try {
 				if (!existsSync(installedPath)) {
@@ -223,6 +225,7 @@ function sddGlobalAssetDriftCount(): number {
 						`${ownershipPrefix}/${entry.name}`,
 					)
 				) {
+					overrides += 1;
 					continue;
 				}
 				const packaged = readFileSync(join(assetDir, entry.name), "utf8");
@@ -243,15 +246,37 @@ function sddGlobalAssetDriftCount(): number {
 			}
 		}
 	}
-	return stale;
+	return { stale, overrides };
 }
 
-function sddLocalAgentOverrideCount(cwd: string): number {
+function packageAssetDiagnosticLines(cwd: string): string[] {
+	return (["delegation", "review", "sdd"] as const).flatMap((owner) => {
+		const label = owner === "sdd" ? "SDD" : owner;
+		const onDemand = owner === "sdd" && !hasPackageAssetOwnerInstallation(owner);
+		const { stale, overrides } = packageAssetAudit(owner);
+		const local = localAgentOverrideCount(cwd, owner);
+		const lines = [onDemand
+			? `info: Global ${label} assets: on demand (not installed)`
+			: `${stale > 0 ? "warn" : "pass"}: Global ${label} assets stale: ${stale} file(s)`];
+		if (!onDemand && stale > 0) {
+			lines[0] += ` — run /gentle:install-${owner} --force to refresh managed assets`;
+		}
+		if (overrides > 0) {
+			lines.push(`info: Global ${label} user overrides: ${overrides} file(s); preserved, not package drift`);
+		}
+		if (local > 0) {
+			lines.push(`warn: Project-local ${label} agent overrides: ${local} file(s) — local ${label} agents shadow package assets; keep only intentional overrides`);
+		}
+		return lines;
+	});
+}
+
+function localAgentOverrideCount(cwd: string, owner: PackageAssetOwner): number {
 	const packageSddAgentsDir = join(ASSETS_DIR, "agents");
 	const packageSddAgentNames = existsSync(packageSddAgentsDir)
 		? new Set(
 				readdirSync(packageSddAgentsDir, { withFileTypes: true })
-					.filter((entry) => entry.isFile() && /^sdd-.*\.md$/i.test(entry.name))
+					.filter((entry) => entry.isFile() && getPackageAssetOwner(`agents/${entry.name}`) === owner)
 					.map((entry) => entry.name),
 			)
 		: new Set<string>();
@@ -6749,7 +6774,7 @@ function createGentleAiExtensionForTesting(
 			if (ctx.hasUI) ctx.ui.notify(`Gentle AI dev binary override check failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
 		}
 		try {
-			const installResult = installSddAssets(ctx.cwd, true);
+			const installResult = installPackageAssets(ctx.cwd, true, ["delegation", "review"]);
 			migrateLegacyProjectModelOverrides(ctx.cwd);
 			const modelResult = await applySavedModelConfig(ctx);
 			if (ctx.hasUI && modelResult.invalidPath) {
@@ -6761,7 +6786,7 @@ function createGentleAiExtensionForTesting(
 			}
 			if (ctx.hasUI && modelResult.updated > 0) {
 				ctx.ui.notify(
-					`el Gentleman applied SDD model config to ${modelResult.updated} agent(s). Global SDD assets ready: ${installResult.agents} new agent(s), ${installResult.chains} new chain(s), ${installResult.support} new support file(s).`,
+					`el Gentleman applied saved model config to ${modelResult.updated} agent(s). Global delegation/review assets ready: ${installResult.agents} new agent(s), ${installResult.chains} new chain(s), ${installResult.support} new support file(s).`,
 					"info",
 				);
 			}
@@ -7099,29 +7124,19 @@ function createGentleAiExtensionForTesting(
 	pi.registerCommand("gentle:doctor", {
 		description: "Run read-only Gentle AI diagnostics for this Pi workspace.",
 		handler: async (_args, ctx) => {
-			const agentsInstalled = existsSync(
-				join(gentlePiAgentHome(), "agents", "sdd-apply.md"),
-			);
-			const chainsInstalled = existsSync(
-				join(gentlePiAgentHome(), "chains", "sdd-full.chain.md"),
-			);
+			const assetLines = packageAssetDiagnosticLines(ctx.cwd);
 			const openspecConfigured = existsSync(
 				join(ctx.cwd, "openspec", "config.yaml"),
 			);
 			const skillRegistryPresent = existsSync(
 				join(ctx.cwd, ".atl", "skill-registry.md"),
 			);
-			const staleSddAssets = sddGlobalAssetDriftCount();
-			const localSddAgentOverrides = sddLocalAgentOverrideCount(ctx.cwd);
 			const modelConfig = await readSavedModelConfigAsync(ctx.cwd);
 			const engramActive = hasWritableEngramTool(pi);
 			const devBinary = await describeDevBinaryOverride();
 			const lines = [
 				"el Gentleman doctor",
-				`${agentsInstalled ? "pass" : "fail"}: Global SDD agents ${agentsInstalled ? "installed" : "missing"}`,
-				`${chainsInstalled ? "pass" : "fail"}: Global SDD chains ${chainsInstalled ? "installed" : "missing"}`,
-				`${staleSddAssets === 0 ? "pass" : "warn"}: Global package asset drift ${staleSddAssets} file(s)`,
-				`${localSddAgentOverrides === 0 ? "pass" : "warn"}: Project-local SDD agent overrides ${localSddAgentOverrides} file(s)`,
+				...assetLines,
 				`${openspecConfigured ? "pass" : "warn"}: OpenSpec config ${openspecConfigured ? "present" : "missing"}`,
 				`${skillRegistryPresent ? "pass" : "warn"}: Skill registry ${skillRegistryPresent ? "present" : "missing"}`,
 				`${modelConfig.status === "invalid" ? "fail" : "pass"}: Global model config ${modelConfig.status}`,
@@ -7130,18 +7145,12 @@ function createGentleAiExtensionForTesting(
 				...(devBinary.state === "active" ? [`warn: ${devBinary.line}`] : []),
 				...(devBinary.state === "invalid" ? [`fail: ${devBinary.line}`, "remedy: fix the dev binary override or clear it with /gentle:dev-binary off (or unset GENTLE_PI_GENTLE_AI_DEV_BINARY)"] : []),
 			];
-			if (!agentsInstalled || !chainsInstalled || staleSddAssets > 0) {
-				lines.push(`remedy: ${PACKAGE_ASSET_REPAIR_GUIDANCE}`);
-			}
 			if (modelConfig.status === "invalid") {
 				lines.push(`remedy: fix or remove ${modelConfig.path}`);
 			}
-			if (localSddAgentOverrides > 0) {
-				lines.push("remedy: remove project-local SDD agent overrides unless intentionally debugging package assets");
-			}
 			ctx.ui.notify(
 				lines.join("\n"),
-				lines.some((line) => line.startsWith("fail:")) ? "warning" : "info",
+				lines.some((line) => line.startsWith("fail:")) || assetLines.some((line) => line.startsWith("warn:")) ? "warning" : "info",
 			);
 		},
 	});
@@ -7293,17 +7302,10 @@ function createGentleAiExtensionForTesting(
 	pi.registerCommand("gentle:status", {
 		description: "Show Gentle AI package status for this project.",
 		handler: async (_args, ctx) => {
-			const agentsInstalled = existsSync(
-				join(gentlePiAgentHome(), "agents", "sdd-apply.md"),
-			);
-			const chainsInstalled = existsSync(
-				join(gentlePiAgentHome(), "chains", "sdd-full.chain.md"),
-			);
+			const assetLines = packageAssetDiagnosticLines(ctx.cwd);
 			const openspecConfigured = existsSync(
 				join(ctx.cwd, "openspec", "config.yaml"),
 			);
-			const staleSddAssets = sddGlobalAssetDriftCount();
-			const localSddAgentOverrides = sddLocalAgentOverrideCount(ctx.cwd);
 			const modelConfig = await readModelConfigAsync(ctx.cwd);
 			const devBinary = await describeDevBinaryOverride();
 			ctx.ui.notify(
@@ -7311,23 +7313,12 @@ function createGentleAiExtensionForTesting(
 					"el Gentleman package is active.",
 					...(devBinary.state === "inactive" ? [] : [devBinary.line]),
 					`Persona: ${readPersonaMode(ctx.cwd)}`,
-					`Global SDD agents: ${agentsInstalled ? "installed" : "not installed"}`,
-					`Global SDD chains: ${chainsInstalled ? "installed" : "not installed"}`,
-					`Global package assets stale: ${staleSddAssets} file(s)${
-						staleSddAssets > 0
-							? ` — ${PACKAGE_ASSET_REPAIR_GUIDANCE}`
-							: ""
-					}`,
-					`Project-local SDD agent overrides: ${localSddAgentOverrides} file(s)${
-						localSddAgentOverrides > 0
-							? " — local SDD agents shadow package assets; remove them unless intentionally debugging"
-							: ""
-					}`,
+					...assetLines,
 					`OpenSpec config: ${openspecConfigured ? "present" : "missing"}`,
 					`Global model config: ${existsSync(modelConfigPath(ctx.cwd)) ? "present" : "missing"}`,
 					...describeModelConfig(ctx.cwd, modelConfig),
 				].join("\n"),
-				staleSddAssets > 0 || localSddAgentOverrides > 0 || devBinary.state !== "inactive" ? "warning" : "info",
+				assetLines.some((line) => line.startsWith("warn:")) || devBinary.state !== "inactive" ? "warning" : "info",
 			);
 		},
 	});

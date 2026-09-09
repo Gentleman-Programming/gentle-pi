@@ -364,6 +364,15 @@ export function updatePackageManagedSddAgentOwnership(
 	}
 }
 
+export function hasPackageAssetOwnerInstallation(owner: PackageAssetOwner): boolean {
+	const agentHome = gentlePiAgentHome();
+	const manifest = readManagedAssetsManifest(join(agentHome, "gentle-ai", MANAGED_ASSETS_MANIFEST));
+	return Object.keys(manifest.assets).some((key) => getPackageAssetOwner(key) === owner) ||
+		Object.entries(ASSET_OWNER_BY_KEY).some(([key, candidate]) =>
+			candidate === owner && existsSync(join(agentHome, key)),
+		);
+}
+
 export function isPackageManagedSddAsset(
 	installedPath: string,
 	ownershipKey: string,
@@ -590,7 +599,7 @@ function removeRetiredManagedAssets(
 	}
 }
 
-// Legacy all-owner entry point retained for compatibility and the current startup sweep.
+// Legacy all-owner entry point retained for compatibility.
 // Owner-specific commands and SDD preflight use installPackageAssets directly.
 export function installSddAssets(
 	cwd: string,
