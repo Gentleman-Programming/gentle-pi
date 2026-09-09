@@ -76,13 +76,16 @@ const EMPTY_THREAD = "waiting for the first event";
 const FOLLOW_BUTTON = "[ Follow ]";
 const OPEN_BUTTON = "[ Open session ]";
 const CLOSE_BUTTON = "[× Close]";
-const FOOTER_BUTTONS_WIDTH = FOLLOW_BUTTON.length + 1 + OPEN_BUTTON.length;
+// At the 60-cell split boundary these four controls fit before any hints.
+const STOP_BUTTON = "[Stop]";
+const SCOPE_BUTTON = "[Scope]";
 const KEYS = [
 	["j/k", "task"],
 	["ctrl+j/k", "scroll"],
 	["f", "follow"],
 	["o", "open session"],
-	["esc", "close"],
+	["esc", "back"],
+	["q", "close"],
 ] as const;
 
 const EMPTY_COMPONENT: Component = {
@@ -97,10 +100,10 @@ interface PointerButtonLayout {
 
 interface PointerLayout extends AgentsViewLayout {
 	narrowView: "list" | "details";
+	sourceHeight?: number;
 	closeButton?: PointerButtonLayout;
 	modeButton?: PointerButtonLayout;
-	followButton?: PointerButtonLayout;
-	openButton?: PointerButtonLayout;
+	actions?: Array<PointerButtonLayout & { region: NativePointerRegion }>;
 }
 
 interface SessionGroup {
@@ -133,8 +136,13 @@ export class AgentsView {
 	private selectedId: string | undefined;
 	private hoveredId: string | undefined;
 	private narrowView: "list" | "details" = "list";
+	private narrowGroup: string | undefined;
+	private groupCursor: string | undefined;
+	private footerPage = 0;
+	private readonly actionRegions = new Map<string, NativePointerRegion>();
 	private readonly expanded = new Map<string, boolean>();
 	private listScroll = 0;
+	private readonly manualListOffsets = new Map<string, number>();
 	private scope: ViewScope;
 	private scroll = 0;
 	private follow = true;
@@ -211,43 +219,51 @@ export class AgentsView {
 	}
 
 	selectedTask(): TaskRecord | undefined {
-		const row = this.selectedRow();
-		return row?.kind === "task" ? row.task : undefined;
+		return this.tasks.find((task) => `task:${task.id}` === this.selectedId);
 	}
 
 	handleInput(data: string): void {
 		if (this.closed) return;
-		if (matchesKey(data, Key.escape) || data === "q") {
-			this.close();
+		if (data === "q") return this.close();
+		if (matchesKey(data, Key.escape)) return this.back();
+		if (data === "F" && !this.isNarrow()) {
+			this.setNarrowView(this.narrowView === "list" ? "details" : "list");
 			return;
 		}
-		if (data === "\t" && this.layout().mode === "narrow" && this.selectedTask()) {
-			this.setNarrowView(this.narrowView === "list" ? "details" : "list");
+		if ((data === "\t" || matchesKey(data, Key.enter)) && this.isNarrow()) {
+			if (this.narrowView === "details") this.back();
+			else this.activate();
 			return;
 		}
 		const rows = this.visibleRows();
 		const selected = this.selectedRow(rows);
+		const task = this.actionableTask();
 		const index = selected ? rows.findIndex((row) => row.id === selected.id) : -1;
+		if (this.narrowView === "details" && (data === "j" || data === "k" || matchesKey(data, Key.down) || matchesKey(data, Key.up))) {
+			this.scrollBy(data === "j" || matchesKey(data, Key.down) ? 1 : -1);
+			return;
+		}
 		if (data === "j" || matchesKey(data, Key.down)) this.select(index + 1, rows);
 		else if (data === "k" || matchesKey(data, Key.up)) this.select(index - 1, rows);
 		else if (matchesKey(data, Key.left) && selected?.kind === "heading") this.setExpanded(selected.group, false);
 		else if (matchesKey(data, Key.right) && selected?.kind === "heading") this.setExpanded(selected.group, true);
 		else if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.ctrl("j"))) this.scrollBy(this.pageRows());
 		else if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.ctrl("k"))) this.scrollBy(-this.pageRows());
-		else if (data === "f" && selected?.kind === "task") {
+		else if (data === "f" && task) {
 			this.follow = true;
 			this.deps.requestRender();
 		} else if (data === "a" && this.deps.sessionId !== undefined) this.toggleScope();
-		else if ((data === "s" || data === "c") && selected?.kind === "task" && this.canCancel(selected.task)) this.deps.onCancel(selected.task);
-		else if ((data === "o" || matchesKey(data, Key.enter)) && selected?.kind === "task" && this.canOpen(selected.task)) this.deps.onOpen(selected.task);
+		else if ((data === "s" || data === "c") && task && this.canCancel(task)) this.deps.onCancel(task);
+		else if ((data === "o" || matchesKey(data, Key.enter)) && task && this.canOpen(task)) this.deps.onOpen(task);
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		if (this.closed) return undefined;
 		const live = this.layout(event.width);
-		if (event.width !== live.width || event.height !== live.height) return undefined;
+		const liveHeight = live.mode === "fallback" ? Math.min(1, live.height) : live.height;
+		if (event.width !== live.width || event.height !== liveHeight) return undefined;
 		const layout = this.pointerLayout;
-		if (!layout || event.width !== layout.width || event.height !== layout.height || live.mode !== layout.mode || layout.narrowView !== this.narrowView || event.x < 0 || event.y < 0 || event.x >= layout.width || event.y >= layout.height) return undefined;
+		if (!layout || (layout.sourceHeight !== undefined && layout.sourceHeight !== live.height) || event.width !== layout.width || event.height !== layout.height || live.mode !== layout.mode || layout.narrowView !== this.narrowView || event.x < 0 || event.y < 0 || event.x >= layout.width || event.y >= layout.height) return undefined;
 		if (event.y === 0) {
 			if (this.isInButton(event.x, layout.modeButton)) return this.modeRegion.handleMouse(event);
 			if (this.isInButton(event.x, layout.closeButton)) return this.closeRegion.handleMouse(event);
@@ -267,8 +283,7 @@ export class AgentsView {
 			if (layout.mode === "panes" && event.x >= layout.threadX && event.x < layout.threadX + layout.threadWidth && event.type === "wheel") return this.threadRegion.handleMouse(event);
 		}
 		if (event.y === layout.footerY) {
-			if (this.isInButton(event.x, layout.followButton)) return this.followRegion.handleMouse(event);
-			if (this.isInButton(event.x, layout.openButton)) return this.openRegion.handleMouse(event);
+			for (const action of layout.actions ?? []) if (this.isInButton(event.x, action)) return action.region.handleMouse(event);
 		}
 		return undefined;
 	}
@@ -282,7 +297,10 @@ export class AgentsView {
 		}
 		if (layout.mode === "fallback") {
 			this.clearFooterLayout();
-			return [fit("Agents", layout.width)];
+			this.closeRegion.setDisabled(false);
+			this.closeRegion.render(1);
+			this.pointerLayout = { ...layout, height: 1, sourceHeight: layout.height, narrowView: this.narrowView, closeButton: { x: 0, width: 1 } };
+			return ["×" + fit(" Close Agents", layout.width - 1)];
 		}
 		// Finished rows age out of the session scope while the overlay is open;
 		// the list is otherwise reordered only when a status changes.
@@ -292,8 +310,7 @@ export class AgentsView {
 		const theme = this.deps.theme;
 		const inner = layout.width - 2;
 		const closeLabel = this.closeLabel(layout);
-		const requestedModeLabel = this.modeLabel(layout);
-		const modeLabel = requestedModeLabel && inner - 3 - visibleWidth(closeLabel ?? "") - 1 - visibleWidth(requestedModeLabel) - 1 >= 3 ? requestedModeLabel : undefined;
+		const modeLabel = this.modeLabel(layout);
 		this.closeRegion.setDisabled(closeLabel === undefined);
 		this.modeRegion.setDisabled(modeLabel === undefined);
 		this.followSelection(layout.bodyRows);
@@ -316,7 +333,7 @@ export class AgentsView {
 		const mode = modeLabel ? ` ${theme.fg(this.hoveredControl === "mode" ? "warning" : ROLE.KEY, modeLabel)}` : "";
 		const close = closeLabel ? ` ${theme.fg(this.hoveredControl === "close" ? "warning" : ROLE.KEY, closeLabel)}` : "";
 		const top = theme.fg(ROLE.FRAME, "╭─ ") + theme.fg(ROLE.TITLE, title) + theme.fg(ROLE.FRAME, ` ${rule(inner - visibleWidth(title) - 3 - controlsWidth)}`) + mode + close + theme.fg(ROLE.FRAME, "╮");
-		const detail = this.threadWindow(layout.bodyRows, layout.threadWidth);
+		const detail = layout.mode === "panes" || this.narrowView === "details" ? this.threadWindow(layout.bodyRows, layout.threadWidth) : [];
 		const body: string[] = [];
 		for (let row = 0; row < layout.bodyRows; row += 1) {
 			if (layout.mode === "panes") body.push(`${theme.fg(ROLE.FRAME, "│")} ${fit(this.taskLine(row), layout.listWidth)} ${theme.fg(ROLE.FRAME, "│")} ${fit(detail[row] ?? "", layout.threadWidth)}${theme.fg(ROLE.FRAME, "│")}`);
@@ -338,6 +355,10 @@ export class AgentsView {
 		return `${active} active · ${this.tasks.length - active} finished`;
 	}
 
+	private actionableTask(): TaskRecord | undefined {
+		return this.isNarrow() && !this.narrowGroup && this.narrowView === "list" ? undefined : this.selectedTask();
+	}
+
 	private canCancel(task: TaskRecord): boolean {
 		return !isFinished(task.status) && (this.deps.canCancel?.(task) ?? true);
 	}
@@ -347,7 +368,7 @@ export class AgentsView {
 	}
 
 	private keys(narrow = false): ReadonlyArray<readonly [string, string]> {
-		const task = this.selectedTask();
+		const task = this.actionableTask();
 		const details = narrow && task ? [["tab", this.narrowView === "list" ? "details" : "back"]] as const : [];
 		const stop = task && this.canCancel(task) ? [["s", "Stop selected"]] as const : [];
 		const scope = this.deps.sessionId === undefined ? [] : [["a", SCOPE_KEY[this.scope]]] as const;
@@ -358,6 +379,10 @@ export class AgentsView {
 	private toggleScope(): void {
 		this.clearFooterLayout();
 		this.scope = this.scope === VIEW_SCOPE.SESSION ? VIEW_SCOPE.ALL : VIEW_SCOPE.SESSION;
+		this.narrowGroup = undefined;
+		this.groupCursor = undefined;
+		this.manualListOffsets.clear();
+		this.narrowView = "list";
 		this.tasks = [];
 		this.selectedId = undefined;
 		this.listScroll = 0;
@@ -379,6 +404,11 @@ export class AgentsView {
 	// Keep the selected row inside the list window, moving the window by the
 	// least amount needed; the wheel moves the same window on its own.
 	private followSelection(rows: number): void {
+		const manual = this.manualListOffsets.get(this.listKey());
+		if (manual !== undefined) {
+			this.listScroll = Math.min(manual, Math.max(0, this.visibleRows().length - rows));
+			return;
+		}
 		const selected = this.selectedRow();
 		const index = selected ? this.visibleRows().findIndex((row) => row.id === selected.id) : -1;
 		if (index >= 0 && index < this.listScroll) this.listScroll = index;
@@ -388,7 +418,38 @@ export class AgentsView {
 
 	private layout(width = this.pointerLayout?.width ?? this.lastRenderedWidth ?? 80): AgentsViewLayout {
 		const rows = typeof this.deps.rows === "function" ? this.deps.rows() : this.deps.rows;
-		return measureAgentsViewLayout(width, rows);
+		return measureAgentsViewLayout(width, rows, this.narrowView === "details");
+	}
+
+	private listKey(): string {
+		return this.isNarrow() ? this.narrowGroup ?? "root" : "panes";
+	}
+
+	private isNarrow(): boolean {
+		return measureAgentsViewLayout(this.lastRenderedWidth ?? 80, 3).mode !== "panes";
+	}
+
+	private back(): void {
+		if (this.narrowView === "details") this.setNarrowView("list");
+		else if (this.isNarrow() && this.narrowGroup) {
+			this.groupCursor = `heading:${this.narrowGroup}`;
+			this.narrowGroup = undefined;
+			this.listScroll = 0;
+			this.clearFooterLayout();
+			this.deps.requestRender();
+		} else this.close();
+	}
+
+	private activate(): void {
+		const selected = this.selectedRow();
+		if (selected?.kind === "heading" && this.isNarrow()) {
+			this.narrowGroup = selected.group.id;
+			this.listScroll = 0;
+			const children = this.visibleRows();
+			if (!children.some((row) => row.id === this.selectedId)) this.select(0, children);
+			this.clearFooterLayout();
+			this.deps.requestRender();
+		} else if (this.selectedTask()) this.setNarrowView("details");
 	}
 
 	private bodyRows(): number {
@@ -398,11 +459,12 @@ export class AgentsView {
 	private refreshTasks(): void {
 		const now = this.deps.now();
 		this.tasks = this.deps.store.list().filter((task) => this.inScope(task, now));
-		const rows = this.visibleRows();
-		if (!this.selectedId || !rows.some((row) => row.id === this.selectedId)) {
+		const rows = this.allRows();
+		if (this.narrowGroup && !this.sessionGroups().some((group) => group.id === this.narrowGroup)) this.narrowGroup = undefined;
+		if (!this.selectedId || (!this.selectedTask() && !rows.some((row) => row.id === this.selectedId))) {
 			this.selectedId = rows.find((row) => row.kind === "task")?.id ?? rows[0]?.id;
 		}
-		if (this.selectedRow(rows)?.kind !== "task") this.narrowView = "list";
+		if (!this.selectedTask()) this.narrowView = "list";
 		this.listScroll = Math.max(0, Math.min(this.listScroll, Math.max(0, rows.length - this.bodyRows())));
 		if (this.hoveredId && !rows.some((row) => row.id === this.hoveredId)) this.hoveredId = undefined;
 		this.subscribeSelected();
@@ -421,6 +483,14 @@ export class AgentsView {
 	}
 
 	private visibleRows(): VisibleRow[] {
+		if (!this.isNarrow()) return this.allRows();
+		const groups = this.sessionGroups();
+		if (!this.narrowGroup) return groups.map((group) => ({ id: `heading:${group.id}`, kind: "heading", group }));
+		const group = groups.find((entry) => entry.id === this.narrowGroup);
+		return group?.tasks.map((task) => ({ id: `task:${task.id}`, kind: "task", group, task })) ?? [];
+	}
+
+	private allRows(): VisibleRow[] {
 		const rows: VisibleRow[] = [];
 		for (const group of this.sessionGroups()) {
 			rows.push({ id: `heading:${group.id}`, kind: "heading", group });
@@ -432,6 +502,7 @@ export class AgentsView {
 	}
 
 	private selectedRow(rows = this.visibleRows()): VisibleRow | undefined {
+		if (this.isNarrow() && !this.narrowGroup && this.narrowView === "list") return rows.find((row) => row.id === this.groupCursor) ?? rows[0];
 		return rows.find((row) => row.id === this.selectedId);
 	}
 
@@ -473,7 +544,7 @@ export class AgentsView {
 		if (!entry) return "";
 		const theme = this.deps.theme;
 		this.taskRegion(row).render(this.pointerLayout?.listWidth ?? 1);
-		const selected = entry.id === this.selectedId;
+		const selected = entry.id === this.selectedRow()?.id;
 		const hovered = entry.id === this.hoveredId;
 		const emphasis = selected ? ROLE.SELECTED : hovered ? ROLE.HOVER : undefined;
 		const marker = emphasis ? theme.fg(emphasis, selected ? "▸" : "▹") : " ";
@@ -526,15 +597,27 @@ export class AgentsView {
 		const header = theme.fg(ROLE.META, truncateToWidth(taskHeader(task, this.deps.now()), width, "…"));
 		const lines = this.threadLines(this.deps.store.thread(task.id), width);
 		if (lines.length === 0) return [header, theme.fg(ROLE.EMPTY, task.error ?? EMPTY_THREAD)];
-		const visible = rows - 1;
+		const visible = Math.max(0, rows - 1);
 		const maxScroll = Math.max(0, lines.length - visible);
-		this.scroll = this.follow ? maxScroll : Math.min(this.scroll, maxScroll);
-		return [header, ...lines.slice(this.scroll, this.scroll + visible)];
+		if (this.follow) this.scroll = maxScroll;
+		// A taller/wider presentation may clamp its window, not the saved position.
+		const start = Math.min(this.scroll, maxScroll);
+		return [header, ...lines.slice(start, start + visible)];
 	}
 
-	private select(index: number, rows = this.visibleRows()): void {
+	private select(index: number, rows = this.visibleRows(), revealSelection = true): void {
 		const next = rows[Math.max(0, Math.min(rows.length - 1, index))];
-		if (!next || next.id === this.selectedId) return;
+		if (!next) return;
+		// Keyboard movement reveals the selection; pointer activation keeps the
+		// manually positioned list available for Back, even after height clamping.
+		if (revealSelection) this.manualListOffsets.delete(this.listKey());
+		if (this.isNarrow() && !this.narrowGroup) {
+			this.groupCursor = next.id;
+			this.clearFooterLayout();
+			this.deps.requestRender();
+			return;
+		}
+		if (next.id === this.selectedId) return;
 		this.selectedId = next.id;
 		if (next.kind === "heading") this.narrowView = "list";
 		this.scroll = 0;
@@ -562,31 +645,63 @@ export class AgentsView {
 	}
 
 	private footer(keys: string, width: number): string {
-		const showButtons = visibleWidth(keys) + FOOTER_BUTTONS_WIDTH + 1 <= width;
-		const task = this.selectedTask();
-		this.followRegion.setDisabled(!showButtons || !task);
-		this.openRegion.setDisabled(!showButtons || !this.canOpen(task));
-		if (!showButtons) return keys;
-		this.followRegion.render(FOLLOW_BUTTON.length);
-		this.openRegion.render(OPEN_BUTTON.length);
-		const buttonX = 2 + width - FOOTER_BUTTONS_WIDTH;
-		if (this.pointerLayout) {
-			this.pointerLayout.followButton = { x: buttonX, width: FOLLOW_BUTTON.length };
-			this.pointerLayout.openButton = { x: buttonX + FOLLOW_BUTTON.length + 1, width: OPEN_BUTTON.length };
+		const task = this.actionableTask();
+		const controls = [
+			{ label: FOLLOW_BUTTON, short: "Follow", region: this.followRegion, enabled: Boolean(task) },
+			{ label: OPEN_BUTTON, short: "Open", region: this.openRegion, enabled: this.canOpen(task) },
+		];
+		if (task && this.canCancel(task)) controls.push({ label: STOP_BUTTON, short: "Stop", region: this.actionRegion("stop", () => this.handleInput("s")), enabled: true });
+		if (this.deps.sessionId !== undefined) controls.push({ label: SCOPE_BUTTON, short: "Scope", region: this.actionRegion("scope", () => this.toggleScope()), enabled: true });
+		for (const control of controls) control.region.setDisabled(!control.enabled);
+		const required = controls.reduce((sum, control) => sum + control.label.length + 1, -1);
+		const shown = required <= width ? controls : [controls[this.footerPage % controls.length]];
+		const actions: NonNullable<PointerLayout["actions"]> = [];
+		let text = "";
+		for (const control of shown) {
+			const label = required <= width ? control.label : control.short;
+			if (text) text += " ";
+			actions.push({ x: 2 + visibleWidth(text), width: label.length, region: control.region });
+			control.region.render(label.length);
+			const hovered = (control.region === this.followRegion && this.hoveredControl === "follow") || (control.region === this.openRegion && this.hoveredControl === "open");
+			text += this.deps.theme.fg(!control.enabled ? ROLE.META : hovered ? ROLE.HOVER : ROLE.KEY, label);
 		}
-		const followRole = task && this.hoveredControl === "follow" ? "warning" : task ? ROLE.KEY : ROLE.META;
-		const openRole = this.canOpen(task) && this.hoveredControl === "open" ? "warning" : this.canOpen(task) ? ROLE.KEY : ROLE.META;
-		return `${fit(keys, width - FOOTER_BUTTONS_WIDTH - 1)} ${this.deps.theme.fg(followRole, FOLLOW_BUTTON)} ${this.deps.theme.fg(openRole, OPEN_BUTTON)}`;
+		if (required > width) {
+			const more = this.actionRegion("more", () => {
+				this.footerPage++;
+				this.clearFooterLayout();
+				this.deps.requestRender();
+			});
+			more.render(1);
+			actions.push({ x: 2 + width - 1, width: 1, region: more });
+			text = fit(text, width - 1) + ">";
+		} else if (visibleWidth(text) + 1 < width) text += " " + truncateToWidth(keys, width - visibleWidth(text) - 1, "…");
+		if (this.pointerLayout) this.pointerLayout.actions = actions;
+		return text;
+	}
+
+	private actionRegion(id: string, action: () => void): NativePointerRegion {
+		let region = this.actionRegions.get(id);
+		if (!region) {
+			region = this.pointerScope.wrap(EMPTY_COMPONENT, {
+				onClick: (event) => {
+					if (event.button !== "left") return undefined;
+					action();
+					return { handled: true, render: true };
+				},
+			});
+			this.actionRegions.set(id, region);
+		}
+		return region;
 	}
 
 	private modeLabel(layout: AgentsViewLayout): string | undefined {
-		if (layout.mode !== "narrow" || !this.selectedTask()) return undefined;
-		return this.narrowView === "list" ? "[Details]" : "[← Back]";
+		if (this.narrowView === "details" || (this.isNarrow() && this.narrowGroup)) return layout.width < 24 ? "←" : "[← Back]";
+		return !this.isNarrow() && this.selectedTask() ? "[F Fullscreen]" : undefined;
 	}
 
 	private closeLabel(layout: AgentsViewLayout): string | undefined {
 		if (layout.mode === "fallback") return undefined;
-		return layout.mode === "narrow" ? "[×]" : CLOSE_BUTTON;
+		return layout.width < 60 ? "[×]" : CLOSE_BUTTON;
 	}
 
 	private setNarrowView(view: "list" | "details"): void {
@@ -640,8 +755,9 @@ export class AgentsView {
 	}
 
 	private clickMode(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-		if (event.button !== "left" || !this.selectedTask()) return undefined;
-		this.setNarrowView(this.narrowView === "list" ? "details" : "list");
+		if (event.button !== "left") return undefined;
+		if (this.narrowView === "details" || (this.isNarrow() && this.narrowGroup)) this.back();
+		else this.activate();
 		return { handled: true, render: true };
 	}
 
@@ -676,7 +792,10 @@ export class AgentsView {
 		if (event.button !== "left") return undefined;
 		const entry = this.visibleRows()[this.listScroll + row];
 		if (!entry) return undefined;
-		if (entry.kind === "heading") this.setExpanded(entry.group, !this.isExpanded(entry.group));
+		if (this.isNarrow()) {
+			this.select(this.listScroll + row, this.visibleRows(), false);
+			this.activate();
+		} else if (entry.kind === "heading") this.setExpanded(entry.group, !this.isExpanded(entry.group));
 		else this.select(this.listScroll + row);
 		return { handled: true, render: true };
 	}
@@ -686,6 +805,8 @@ export class AgentsView {
 		const next = Math.max(0, Math.min(Math.max(0, this.visibleRows().length - this.bodyRows()), this.listScroll + delta));
 		if (next === this.listScroll) return { handled: true, render: false };
 		this.listScroll = next;
+		this.manualListOffsets.set(this.listKey(), next);
+		this.clearFooterLayout();
 		this.hoveredId = undefined;
 		return { handled: true, render: true };
 	}

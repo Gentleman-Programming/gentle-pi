@@ -31,7 +31,6 @@ export const AGENTS_RESULT_TYPE = "gentle-agents.result";
 const COLLAPSE_KEY_DEFAULT = "ctrl+shift+a";
 const VIEW_KEY_DEFAULT = "alt+a";
 const STOP_KEY_DEFAULT = "alt+s";
-const OVERLAY_VERTICAL_MARGIN = 2;
 const RENDER_COALESCE_MS = 400;
 const CLOCK_TICK_MS = 1000;
 const TOOL_PREFIX = "subagent_";
@@ -354,7 +353,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				overlayHost = tui;
 				view = new AgentsView({
 					theme,
-					rows: () => Math.max(0, tui.terminal.rows - OVERLAY_VERTICAL_MARGIN),
+					rows: () => Math.max(0, tui.terminal.rows),
 					store,
 					sessionId: ctx.sessionManager.getSessionId() ?? "",
 					now: () => deps.now(),
@@ -372,7 +371,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				interaction.addChild(view);
 				return interaction;
 			},
-			{ overlay: true, overlayOptions: { width: "92%", anchor: "center" } },
+			{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", margin: 0, anchor: "center" } },
 		);
 		view?.dispose();
 		if (!chosen || !overlayHost) return;

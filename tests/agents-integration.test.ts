@@ -61,8 +61,8 @@ test("AgentsView integrates grouped selection, semantic scrolling, live geometry
 	rows = 2;
 	const fallback = view.render(59).map(stripAnsi);
 	assert.equal(fallback.length, 1, "a two-row terminal uses the one-line fallback");
-	assert.doesNotMatch(fallback[0] ?? "", /\[×|Follow|Open session/, "fallback mode renders no command controls");
-	assert.equal(view.handleMouse(mouse(0, 0, 59, fallback.length)), undefined, "fallback pointer routing is inert");
+	assert.match(fallback[0] ?? "", /^× Close/, "fallback mode keeps a single Close cell");
+	assert.equal(view.handleMouse(mouse(1, 0, 59, fallback.length)), undefined, "fallback routing outside the Close cell is inert");
 
 	rows = 6;
 	frame = view.render(wide);
