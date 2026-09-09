@@ -55,18 +55,35 @@ function windowsDacl(path: string): string {
 	}
 }
 
+export type WindowsDaclValidationReason = "protection" | "ace-count" | "ace-shape" | "ace-type" | "ace-flags" | "ace-rights" | "ace-reserved-fields" | "ace-trustee" | "ace-duplicate";
+
+export class WindowsDaclValidationError extends Error {
+	readonly reason: WindowsDaclValidationReason;
+	constructor(reason: WindowsDaclValidationReason) {
+		super(`Windows DACL validation failed: ${reason}`);
+		this.name = "WindowsDaclValidationError";
+		this.reason = reason;
+	}
+}
+
 export function validatePrivateWindowsDacl(dacl: string, user: string, protectedDacl: boolean): void {
-	if (protectedDacl && !dacl.startsWith("D:P")) throw new Error("Windows DACL inherits access");
+	if (protectedDacl && !dacl.startsWith("D:P")) throw new WindowsDaclValidationError("protection");
 	const trustees = new Map([[user.toUpperCase(), "user"], [WINDOWS_SYSTEM, "system"], ["SY", "system"], [WINDOWS_ADMINISTRATORS, "administrators"], ["BA", "administrators"]]);
 	const aces = [...dacl.matchAll(/\(([^()]*)\)/g)].map((match) => match[1]!.split(";"));
 	const expectedFlags = protectedDacl ? "OICI" : "ID";
 	const granted = new Set<string>();
 	for (const ace of aces) {
 		const trustee = trustees.get(ace[5]?.toUpperCase() ?? "");
-		if (ace.length !== 6 || ace[0] !== "A" || ace[1] !== expectedFlags || ace[2] !== "FA" || ace[3] !== "" || ace[4] !== "" || trustee === undefined || granted.has(trustee)) throw new Error("Windows DACL does not match the trusted grant model");
+		if (ace.length !== 6) throw new WindowsDaclValidationError("ace-shape");
+		if (ace[0] !== "A") throw new WindowsDaclValidationError("ace-type");
+		if (ace[1] !== expectedFlags) throw new WindowsDaclValidationError("ace-flags");
+		if (ace[2] !== "FA") throw new WindowsDaclValidationError("ace-rights");
+		if (ace[3] !== "" || ace[4] !== "") throw new WindowsDaclValidationError("ace-reserved-fields");
+		if (trustee === undefined) throw new WindowsDaclValidationError("ace-trustee");
+		if (granted.has(trustee)) throw new WindowsDaclValidationError("ace-duplicate");
 		granted.add(trustee);
 	}
-	if (granted.size !== 3) throw new Error("Windows DACL lacks trusted full access");
+	if (granted.size !== 3) throw new WindowsDaclValidationError("ace-count");
 }
 
 function assertPrivateWindowsDacl(path: string, protectedDacl: boolean): void {
@@ -103,7 +120,7 @@ function localHost(): string | null {
 	return null;
 }
 
-function samePath(path: string, expected: string, platform: NodeJS.Platform): boolean {
+export function samePath(path: string, expected: string, platform: NodeJS.Platform): boolean {
 	if (platform !== "win32") return path === expected;
 	const canonical = (value: string): string => {
 		try {

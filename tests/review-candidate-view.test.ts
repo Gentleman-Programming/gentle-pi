@@ -6,7 +6,7 @@ import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { gzipSync } from "node:zlib";
 import {
@@ -22,7 +22,7 @@ import {
 	readCandidateContextManifestPage,
 	type NativeCandidateProjectionDescriptor,
 } from "../lib/review-candidate-view.ts";
-import { setWindowsAclAuthorityForTesting, validatePrivateWindowsDacl } from "../lib/review-candidate-view-owner.ts";
+import { setWindowsAclAuthorityForTesting, validatePrivateWindowsDacl, WindowsDaclValidationError } from "../lib/review-candidate-view-owner.ts";
 
 function git(cwd: string, ...arguments_: string[]): string {
 	return execFileSync("git", arguments_, { cwd, encoding: "utf8" }).trim();
@@ -124,9 +124,36 @@ test("private candidate owner accepts a canonical Windows worktree registration 
 
 test("private candidate owner rejects an untrusted conditional Windows allow ACE", () => {
 	assert.throws(
-		() => validatePrivateWindowsDacl("D:P(A;OICI;FA;;;S-1-5-21-1)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(XA;OICI;FA;;;S-1-5-21-2;condition)", "S-1-5-21-1", true),
-		/Windows DACL does not match the trusted grant model/,
+		() => validatePrivateWindowsDacl("D:P(A;OICI;FA;;;S-1-5-21-1)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(XA;OICI;FA;;;S-1-5-21-2)", "S-1-5-21-1", true),
+		(error: unknown) => error instanceof WindowsDaclValidationError && error.reason === "ace-type" && !error.message.includes("S-1-5-21-2"),
 	);
+});
+
+test("private candidate owner reports bounded Windows DACL mismatch reasons", () => {
+	const dacl = "D:P(A;OICI;FA;;;S-1-5-21-1)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+	for (const [reason, invalid] of [["ace-flags", dacl.replace("OICI", "OI")], ["ace-rights", dacl.replace("FA", "FR")], ["ace-reserved-fields", dacl.replace(";;;S-1-5-21-1", ";object;;S-1-5-21-1")], ["ace-trustee", dacl.replace("S-1-5-21-1", "S-1-5-21-2")], ["ace-duplicate", `${dacl}(A;OICI;FA;;;SY)`], ["ace-count", dacl.replace("(A;OICI;FA;;;BA)", "")]] as const) {
+		assert.throws(() => validatePrivateWindowsDacl(invalid, "S-1-5-21-1", true), (error: unknown) => error instanceof WindowsDaclValidationError && error.reason === reason && error.message === `Windows DACL validation failed: ${reason}`);
+	}
+});
+
+test("candidate contributor root accepts canonical Windows Git path spelling", { skip: process.platform !== "win32" }, (t) => {
+	const contributorRoot = repository(t);
+	let useCanonicalSpelling = false;
+	const registry = new CandidateViewRegistry((file, arguments_, options) => {
+		const output = execFileSync(file, arguments_, options);
+		if (!useCanonicalSpelling || typeof output !== "string" || arguments_[0] !== "rev-parse") return output;
+		if (arguments_[1] === "--show-toplevel") return output.toUpperCase();
+		if (arguments_[1] === "--git-common-dir") return resolve(contributorRoot, output).toUpperCase();
+		return output;
+	}, "win32");
+	mockWindowsAcl(t);
+	const view = registry.create({ contributorRoot });
+	try {
+		useCanonicalSpelling = true;
+		assert.doesNotThrow(() => view.verify());
+	} finally {
+		view.cleanup();
+	}
 });
 
 test("private candidate owner ignores a spoofed SystemRoot when invoking Windows ACL tools", { skip: process.platform !== "win32" }, (t) => {
