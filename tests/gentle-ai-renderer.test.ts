@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readFileSync } from "node:fs";
+import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Box, visibleWidth } from "@earendil-works/pi-tui";
 import { renderGentleAiResult, GentleAiCallCard } from "../lib/gentle-ai-renderer.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
@@ -41,21 +42,33 @@ test("completed review cards fit Pi's default Box at terminal width 57", () => {
 	}
 });
 
-test("review registrations own their shell and capture backgrounds exclude all frame cells", () => {
-	const source = readFileSync(new URL("../extensions/gentle-ai.ts", import.meta.url), "utf8");
-	assert.equal((source.match(/renderShell: "self"/g) ?? []).length, 4, "review registrations must opt out of Pi's painted Box");
+test("review registrations own their shell", () => {
+	const tools: ToolDefinition[] = [];
+	createGentleAiExtension({ nativeReviewCli: null } as never)({
+		on() {}, registerCommand() {}, registerTool(tool: ToolDefinition) { tools.push(tool); },
+	} as unknown as ExtensionAPI);
+	const review = tools.filter((tool) => tool.name.startsWith("gentle_review"));
+	assert.equal(review.length, 4);
+	for (const tool of review) assert.equal(tool.renderShell, "self", tool.name);
+});
+
+test("review call and result cards have no passive background fill", () => {
 	const theme = { ...plainTheme, bg: (_role: string, text: string) => `\x1b[44m${text}\x1b[49m` };
-	for (const expanded of [true, false]) {
+	for (const options of [
+		{ expanded: true }, { expanded: false },
+		{ expanded: true, isPartial: true }, { expanded: false, isPartial: true },
+		{ expanded: true, isError: true }, { expanded: false, isError: true },
+	]) {
 		const call = new GentleAiCallCard();
-		call.update("completed", "review capture", theme, "$ capture");
-		const lines = [...call.render(40), ...renderGentleAiResult({ content: [{ type: "text", text: "Result" }] }, { expanded }, theme).render(40)];
+		call.update(options.isPartial ? "running" : "completed", "review capture", theme, "$ capture");
+		const lines = [...call.render(40), ...renderGentleAiResult({ content: [{ type: "text", text: "Result" }] }, options, theme).render(40)];
 		for (const [row, line] of lines.entries()) {
 			let bg = false, column = 0;
 			for (const token of line.match(/\x1b\[[\d;]*m|[^\x1b]/gu) ?? []) {
 				if (token === "\x1b[44m") bg = true;
 				else if (token === "\x1b[49m" || token === "\x1b[0m") bg = false;
 				else if (!token.startsWith("\x1b")) {
-					assert.equal(bg, row > 0 && row < lines.length - 1 && column > 0 && column < 39);
+					assert.equal(bg, false, `row ${row}, cell ${column} must remain transparent`);
 					column += visibleWidth(token);
 				}
 			}

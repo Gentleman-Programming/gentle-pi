@@ -10,6 +10,7 @@ import { stripAnsi } from "../lib/terminal-theme.ts";
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 
 interface Registered {
+	renderShell?: string;
 	execute(toolCallId: string, params: unknown, signal: undefined, onUpdate: undefined, ctx: ExtensionContext): Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }>;
 	renderCall(args: unknown, theme: unknown): { render(width: number): string[] };
 	renderResult(result: unknown, options: { expanded: boolean }, theme: unknown): { render(width: number): string[] };
@@ -77,6 +78,12 @@ test("todoEnabled and todoCollapseKey read their environment flags", () => {
 	const off = fakePi();
 	gentleTodo(off.pi, { GENTLE_PI_TODO: "off" });
 	assert.equal(off.tools.size, 0);
+});
+
+test("todo registration owns its transparent transcript shell", () => {
+	const { pi, tools } = fakePi();
+	gentleTodo(pi, {});
+	assert.equal(tools.get("todo")?.renderShell, "self");
 });
 
 test("the todo tool writes the list, shows the card after the call, and carries the snapshot in details", async () => {
