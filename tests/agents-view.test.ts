@@ -136,6 +136,82 @@ test("AgentsView pointer regions hover and select task rows without activating, 
 	assert.equal(view.handleMouse(mouse(4, 2, 80, lines.length)), undefined, "late pointer events are inert after disposal");
 });
 
+test("AgentsView retains narrow keyboard mode after selection and store invalidation", () => {
+	const { store, view, events } = harness(6);
+	store.add(task("a"));
+	store.add(task("b", { agent: "b" }));
+	for (let index = 0; index < 3; index += 1) store.apply("b", { type: TASK_EVENT.TEXT, text: `thread ${index}\n` }, 2000);
+	const frame = view.render(40);
+	assert.equal(view.handleMouse(mouse(4, 3, 40, frame.length, "click"))?.handled, true, "pointer selection invalidates hit bounds");
+	view.handleInput("\t");
+	assert.match(view.render(40).map(stripAnsi).join("\n"), /thread 2/, "Tab still enters Details before a pointer-invalidating selection rerenders");
+	view.handleInput("\t");
+	view.handleInput("\t");
+	assert.match(view.render(40).map(stripAnsi).join("\n"), /thread 2/, "repeated Tab toggles semantically before a frame");
+	view.handleInput("\t");
+	store.apply("b", { type: TASK_EVENT.TEXT, text: "after update\n" }, 2000);
+	view.handleInput("\t");
+	assert.match(view.render(40).map(stripAnsi).join("\n"), /after update/, "a selected-task update does not discard narrow keyboard knowledge");
+	view.handleInput("k");
+	view.handleInput("k");
+	view.handleInput("\t");
+	assert.equal(view.selectedTask(), undefined, "Tab remains inert for a heading");
+	view.handleInput("\x1b[D");
+	view.handleInput("\x1b[C");
+	view.handleInput("j");
+	assert.ok(view.selectedTask(), "heading Left/Right keeps its existing group behavior");
+	assert.deepEqual(events, [], "Tab never opens the editor");
+	view.dispose();
+});
+
+test("AgentsView uses a narrow List/Details viewport without changing task, group, editor, or close semantics", () => {
+	const { store, view, events } = harness(6);
+	store.add(task("a"));
+	store.add(task("b", { agent: "b" }));
+	for (let index = 0; index < 8; index += 1) store.apply("b", { type: TASK_EVENT.TEXT, text: `thread ${index}\n` }, 2000);
+	let frame = view.render(40);
+	let top = stripAnsi(frame[0] ?? "");
+	assert.match(top, /\[Details\].*\[×\]/, "narrow headers expose Details and compact Close when both fit");
+	assert.equal(view.handleMouse(mouse(4, 3, 40, frame.length, "click"))?.handled, true);
+	assert.equal(view.selectedTask()?.id, "b", "a narrow task click selects only");
+	assert.deepEqual(events, [], "selecting never opens or stops a task");
+	frame = view.render(40);
+	top = stripAnsi(frame[0] ?? "");
+	const detailsX = visibleWidth(top.slice(0, top.indexOf("[Details]")));
+	assert.equal(view.handleMouse(mouse(detailsX, 0, 40, frame.length, "click"))?.handled, true);
+	assert.equal(view.handleMouse(mouse(detailsX, 0, 40, frame.length, "click")), undefined, "a mode change invalidates old pointer bounds before render");
+	frame = view.render(40);
+	top = stripAnsi(frame[0] ?? "");
+	assert.match(top, /\[← Back\]/);
+	assert.match(frame.map(stripAnsi).join("\n"), /thread 7/, "Details is the local thread viewport");
+	assert.equal(view.handleMouse(mouse(4, 2, 40, frame.length, "wheel", -1))?.handled, true, "the detail viewport owns its wheel");
+	const backX = visibleWidth(top.slice(0, top.indexOf("[← Back]")));
+	assert.equal(view.handleMouse(mouse(backX, 0, 40, frame.length, "click"))?.handled, true, "Back is an explicit pointer control");
+	assert.match(view.render(40).map(stripAnsi).join("\n"), /Subagent b/, "Back restores the local List viewport");
+	view.handleInput("\t");
+	assert.match(view.render(40).map(stripAnsi).join("\n"), /thread 7/, "Tab enters Details only for a selected task");
+	view.handleInput("\t");
+	assert.match(view.render(40).map(stripAnsi).join("\n"), /Subagent b/, "Tab returns to List");
+	view.handleInput("\t");
+	view.handleInput("k");
+	view.handleInput("k");
+	assert.equal(view.selectedTask(), undefined, "selecting a heading clears detail state");
+	view.handleInput("\t");
+	assert.doesNotMatch(stripAnsi(view.render(40)[0] ?? ""), /\[← Back\]/, "headings keep Tab and Details inert");
+	view.handleInput("\x1b[D");
+	view.handleInput("\x1b[C");
+	view.handleInput("j");
+	view.handleInput("\x0d");
+	view.handleInput("o");
+	assert.deepEqual(events, ["open:a", "open:a"], "Enter and o keep their editor action");
+	assert.equal(view.render(11).length, 1, "width below 12 uses the control-free fallback");
+	assert.equal(view.handleMouse(mouse(0, 0, 11, 1)), undefined);
+	view.handleInput("\x1b");
+	view.handleInput("q");
+	assert.deepEqual(events, ["open:a", "open:a", "close"], "Escape and q close once without cancelling");
+	view.dispose();
+});
+
 test("AgentsView clears hover on leave, list scrolling, resize, updates, empty lists, and disposal", () => {
 	const { store, view } = harness(6);
 	store.add(task("a"));
@@ -206,8 +282,9 @@ test("AgentsView close control, Escape, and q share rendered bounds and one idem
 
 	lines = view.render(59);
 	top = stripAnsi(lines[0]);
-	assert.equal(visibleWidth(top), 59, "the one-line fallback fits its rendered width");
-	assert.doesNotMatch(top, /\[×|Follow|Open session/, "sub-pane widths expose no pointer controls");
+	assert.equal(visibleWidth(top), 59, "the narrow header fits its rendered width");
+	assert.match(top, /\[Details\].*\[×\]/, "width 59 uses its narrow mode controls instead of the fallback");
+	assert.doesNotMatch(top, /Follow|Open session/, "narrow mode keeps footer controls out when they do not fit");
 
 	lines = view.render(wide);
 	top = stripAnsi(lines[0]);
@@ -337,6 +414,14 @@ test("AgentsView reads live rows, preserves manual scroll and selection, and inv
 	assert.match(resized[3] ?? "", /▸ └ ◐ Subagent agent4/, "the list scroll clamps while retaining the selected row");
 	assert.doesNotMatch(resized.join("\n"), /line 9/, "manual thread scroll survives resize instead of returning to the tail");
 	assert.equal(view.handleMouse(mouse(4, 2, 80, 8, "click")), undefined, "old-height pointer input is stale after resize");
+	view.render(40);
+	view.handleInput("\t");
+	const narrow = view.render(40).map(stripAnsi);
+	rows = 5;
+	const narrower = view.render(40).map(stripAnsi);
+	assert.equal(view.selectedTask()?.id, "t4", "a narrow resize retains the selection");
+	assert.doesNotMatch(narrow.join("\n"), /line 9/);
+	assert.doesNotMatch(narrower.join("\n"), /line 9/, "a narrow resize preserves manual detail scrolling");
 	rows = 2;
 	assert.equal(view.render(80).length, 1, "a tiny terminal gets one bounded fallback line, never forced chrome");
 	view.dispose();

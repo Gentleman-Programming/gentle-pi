@@ -3,7 +3,7 @@ import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { measureAgentsViewLayout } from "../lib/agents-view-layout.ts";
 
-const widths = [0, 1, 2, 11, 12, 60, 90];
+const widths = [0, 1, 2, 11, 12, 59, 60, 90];
 
 for (const rows of [0, 1, 2]) {
 	test(`Agents layout safely bounds ${rows}-row terminals`, () => {
@@ -17,9 +17,15 @@ for (const rows of [0, 1, 2]) {
 	});
 }
 
-test("Agents layout uses the whole bounded frame only when two panes fit", () => {
-	const fallback = measureAgentsViewLayout(59, 8);
-	assert.equal(fallback.mode, "fallback");
+test("Agents layout reserves fallback for tiny terminals, a single viewport for narrow terminals, and panes at 60 cells", () => {
+	for (const width of [0, 1, 2, 11]) assert.equal(measureAgentsViewLayout(width, 8).mode, "fallback");
+	for (const height of [0, 1, 2]) assert.equal(measureAgentsViewLayout(80, height).mode, "fallback");
+	for (const width of [12, 59]) {
+		const narrow = measureAgentsViewLayout(width, 3);
+		assert.equal(narrow.mode, "narrow");
+		assert.equal(narrow.bodyRows, 0);
+		assert.equal(narrow.footerY, 1);
+	}
 	const layout = measureAgentsViewLayout(60, 8);
 	assert.equal(layout.mode, "panes");
 	assert.equal(layout.height, 8);

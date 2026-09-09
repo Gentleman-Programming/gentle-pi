@@ -96,7 +96,9 @@ interface PointerButtonLayout {
 }
 
 interface PointerLayout extends AgentsViewLayout {
+	narrowView: "list" | "details";
 	closeButton?: PointerButtonLayout;
+	modeButton?: PointerButtonLayout;
 	followButton?: PointerButtonLayout;
 	openButton?: PointerButtonLayout;
 }
@@ -130,6 +132,7 @@ export class AgentsView {
 	private tasks: TaskRecord[] = [];
 	private selectedId: string | undefined;
 	private hoveredId: string | undefined;
+	private narrowView: "list" | "details" = "list";
 	private readonly expanded = new Map<string, boolean>();
 	private listScroll = 0;
 	private scope: ViewScope;
@@ -142,8 +145,12 @@ export class AgentsView {
 	private readonly followRegion: NativePointerRegion;
 	private readonly openRegion: NativePointerRegion;
 	private readonly closeRegion: NativePointerRegion;
-	private hoveredControl: "follow" | "open" | "close" | undefined;
+	private readonly modeRegion: NativePointerRegion;
+	private hoveredControl: "follow" | "open" | "close" | "mode" | undefined;
 	private pointerLayout: PointerLayout | undefined;
+	// Keyboard input has no terminal width, so retain its last rendered width
+	// independently from disposable pointer hit geometry.
+	private lastRenderedWidth: number | undefined;
 	private closed = false;
 	private unsubscribeTask: (() => void) | undefined;
 	private subscribedTaskId: string | undefined;
@@ -174,6 +181,11 @@ export class AgentsView {
 			onHover: () => this.hoverControl("close"),
 			onLeave: () => this.clearHoveredControl("close"),
 			onClick: (event) => this.clickClose(event),
+		});
+		this.modeRegion = this.pointerScope.wrap(EMPTY_COMPONENT, {
+			onHover: () => this.hoverControl("mode"),
+			onLeave: () => this.clearHoveredControl("mode"),
+			onClick: (event) => this.clickMode(event),
 		});
 		this.refreshTasks();
 		this.unsubscribeSummary = deps.store.subscribeSummary(() => {
@@ -209,6 +221,10 @@ export class AgentsView {
 			this.close();
 			return;
 		}
+		if (data === "\t" && this.layout().mode === "narrow" && this.selectedTask()) {
+			this.setNarrowView(this.narrowView === "list" ? "details" : "list");
+			return;
+		}
 		const rows = this.visibleRows();
 		const selected = this.selectedRow(rows);
 		const index = selected ? rows.findIndex((row) => row.id === selected.id) : -1;
@@ -227,21 +243,28 @@ export class AgentsView {
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (this.closed) return undefined;
+		const live = this.layout(event.width);
+		if (event.width !== live.width || event.height !== live.height) return undefined;
 		const layout = this.pointerLayout;
-		if (this.closed || !layout || event.width !== layout.width || event.height !== layout.height || event.x < 0 || event.y < 0 || event.x >= layout.width || event.y >= layout.height) return undefined;
-		const live = this.layout(layout.width);
-		if (live.mode !== "panes" || live.height !== layout.height) return undefined;
-		if (event.y === 0 && this.isInButton(event.x, layout.closeButton)) return this.closeRegion.handleMouse(event);
+		if (!layout || event.width !== layout.width || event.height !== layout.height || live.mode !== layout.mode || layout.narrowView !== this.narrowView || event.x < 0 || event.y < 0 || event.x >= layout.width || event.y >= layout.height) return undefined;
+		if (event.y === 0) {
+			if (this.isInButton(event.x, layout.modeButton)) return this.modeRegion.handleMouse(event);
+			if (this.isInButton(event.x, layout.closeButton)) return this.closeRegion.handleMouse(event);
+		}
 		if (event.y >= 1 && event.y < 1 + layout.bodyRows) {
 			const row = event.y - 1;
-			if (event.x >= layout.listX && event.x < layout.listX + layout.listWidth) {
+			if (layout.mode === "narrow" && event.x >= layout.listX && event.x < layout.listX + layout.listWidth) {
+				if (event.type === "wheel") return this.narrowView === "list" ? this.listRegion.handleMouse(event) : this.threadRegion.handleMouse(event);
+				const visible = this.narrowView === "list" ? this.visibleRows()[this.listScroll + row] : undefined;
+				return visible ? this.taskRegion(row).handleMouse(event) : undefined;
+			}
+			if (layout.mode === "panes" && event.x >= layout.listX && event.x < layout.listX + layout.listWidth) {
 				if (event.type === "wheel") return this.listRegion.handleMouse(event);
 				const visible = this.visibleRows()[this.listScroll + row];
 				return visible ? this.taskRegion(row).handleMouse(event) : undefined;
 			}
-			if (event.x >= layout.threadX && event.x < layout.threadX + layout.threadWidth && event.type === "wheel") {
-				return this.threadRegion.handleMouse(event);
-			}
+			if (layout.mode === "panes" && event.x >= layout.threadX && event.x < layout.threadX + layout.threadWidth && event.type === "wheel") return this.threadRegion.handleMouse(event);
 		}
 		if (event.y === layout.footerY) {
 			if (this.isInButton(event.x, layout.followButton)) return this.followRegion.handleMouse(event);
@@ -252,6 +275,7 @@ export class AgentsView {
 
 	render(width: number): string[] {
 		const layout = this.layout(width);
+		this.lastRenderedWidth = layout.width;
 		if (layout.width === 0 || layout.height === 0) {
 			this.clearFooterLayout();
 			return [];
@@ -264,29 +288,41 @@ export class AgentsView {
 		// the list is otherwise reordered only when a status changes.
 		const now = this.deps.now();
 		if (this.tasks.some((task) => !this.inScope(task, now))) this.refreshTasks();
-		if (this.pointerLayout && (this.pointerLayout.width !== layout.width || this.pointerLayout.height !== layout.height)) this.clearFooterLayout();
+		if (this.pointerLayout && (this.pointerLayout.width !== layout.width || this.pointerLayout.height !== layout.height || this.pointerLayout.mode !== layout.mode || this.pointerLayout.narrowView !== this.narrowView)) this.clearFooterLayout();
 		const theme = this.deps.theme;
 		const inner = layout.width - 2;
-		const closeLabel = this.closeLabel();
+		const closeLabel = this.closeLabel(layout);
+		const requestedModeLabel = this.modeLabel(layout);
+		const modeLabel = requestedModeLabel && inner - 3 - visibleWidth(closeLabel ?? "") - 1 - visibleWidth(requestedModeLabel) - 1 >= 3 ? requestedModeLabel : undefined;
 		this.closeRegion.setDisabled(closeLabel === undefined);
+		this.modeRegion.setDisabled(modeLabel === undefined);
 		this.followSelection(layout.bodyRows);
+		const closeWidth = visibleWidth(closeLabel ?? "");
+		const modeWidth = visibleWidth(modeLabel ?? "");
+		const closeX = layout.width - 1 - closeWidth;
 		this.pointerLayout = {
 			...layout,
-			closeButton: closeLabel ? { x: layout.width - 1 - visibleWidth(closeLabel), width: visibleWidth(closeLabel) } : undefined,
+			narrowView: this.narrowView,
+			closeButton: closeLabel ? { x: closeX, width: closeWidth } : undefined,
+			modeButton: modeLabel ? { x: closeX - modeWidth - 1, width: modeWidth } : undefined,
 		};
 		this.listRegion.render(layout.listWidth);
 		this.threadRegion.render(layout.threadWidth);
-		if (closeLabel) this.closeRegion.render(visibleWidth(closeLabel));
+		if (closeLabel) this.closeRegion.render(closeWidth);
+		if (modeLabel) this.modeRegion.render(modeWidth);
 		const scope = this.deps.sessionId === undefined ? "" : `${SCOPE_LABEL[this.scope]} · `;
-		const title = truncateToWidth(`❀ Agents · ${scope}${this.counts()}`, Math.max(0, inner - 3 - (closeLabel ? visibleWidth(closeLabel) + 1 : 0)), "…");
+		const controlsWidth = (closeLabel ? closeWidth + 1 : 0) + (modeLabel ? modeWidth + 1 : 0);
+		const title = truncateToWidth(`❀ Agents · ${scope}${this.counts()}`, Math.max(0, inner - 3 - controlsWidth), "…");
+		const mode = modeLabel ? ` ${theme.fg(this.hoveredControl === "mode" ? "warning" : ROLE.KEY, modeLabel)}` : "";
 		const close = closeLabel ? ` ${theme.fg(this.hoveredControl === "close" ? "warning" : ROLE.KEY, closeLabel)}` : "";
-		const top = theme.fg(ROLE.FRAME, "╭─ ") + theme.fg(ROLE.TITLE, title) + theme.fg(ROLE.FRAME, ` ${rule(inner - visibleWidth(title) - 3 - (closeLabel ? visibleWidth(closeLabel) + 1 : 0))}`) + close + theme.fg(ROLE.FRAME, "╮");
-		const right = this.threadWindow(layout.bodyRows, layout.threadWidth);
+		const top = theme.fg(ROLE.FRAME, "╭─ ") + theme.fg(ROLE.TITLE, title) + theme.fg(ROLE.FRAME, ` ${rule(inner - visibleWidth(title) - 3 - controlsWidth)}`) + mode + close + theme.fg(ROLE.FRAME, "╮");
+		const detail = this.threadWindow(layout.bodyRows, layout.threadWidth);
 		const body: string[] = [];
 		for (let row = 0; row < layout.bodyRows; row += 1) {
-			body.push(`${theme.fg(ROLE.FRAME, "│")} ${fit(this.taskLine(row), layout.listWidth)} ${theme.fg(ROLE.FRAME, "│")} ${fit(right[row] ?? "", layout.threadWidth)}${theme.fg(ROLE.FRAME, "│")}`);
+			if (layout.mode === "panes") body.push(`${theme.fg(ROLE.FRAME, "│")} ${fit(this.taskLine(row), layout.listWidth)} ${theme.fg(ROLE.FRAME, "│")} ${fit(detail[row] ?? "", layout.threadWidth)}${theme.fg(ROLE.FRAME, "│")}`);
+			else body.push(`${theme.fg(ROLE.FRAME, "│")} ${fit(this.narrowView === "list" ? this.taskLine(row) : detail[row] ?? "", layout.listWidth)} ${theme.fg(ROLE.FRAME, "│")}`);
 		}
-		const keyHints = this.selectedRow()?.kind === "heading" ? [["←/→", "group"] as const, ...this.keys()] : this.keys();
+		const keyHints = this.selectedRow()?.kind === "heading" ? [["←/→", "group"] as const, ...this.keys(layout.mode === "narrow")] : this.keys(layout.mode === "narrow");
 		const keys = keyHints.map(([key, label]) => `${theme.fg(ROLE.KEY, key)} ${theme.fg(ROLE.KEY_TEXT, label)}`).join("   ");
 		const footer = this.footer(keys, inner - 2);
 		const keysLine = `${theme.fg(ROLE.FRAME, "│")} ${fit(footer, inner - 2)} ${theme.fg(ROLE.FRAME, "│")}`;
@@ -310,11 +346,12 @@ export class AgentsView {
 		return Boolean(task?.sessionPath);
 	}
 
-	private keys(): ReadonlyArray<readonly [string, string]> {
+	private keys(narrow = false): ReadonlyArray<readonly [string, string]> {
 		const task = this.selectedTask();
+		const details = narrow && task ? [["tab", this.narrowView === "list" ? "details" : "back"]] as const : [];
 		const stop = task && this.canCancel(task) ? [["s", "Stop selected"]] as const : [];
 		const scope = this.deps.sessionId === undefined ? [] : [["a", SCOPE_KEY[this.scope]]] as const;
-		return [...KEYS.slice(0, 3), ...stop, ...scope, ...KEYS.slice(3)];
+		return [...KEYS.slice(0, 1), ...details, ...KEYS.slice(1, 3), ...stop, ...scope, ...KEYS.slice(3)];
 	}
 
 	// A new scope reads from the top: selection, list window, and thread reset.
@@ -349,7 +386,7 @@ export class AgentsView {
 		this.listScroll = Math.max(0, Math.min(this.listScroll, Math.max(0, this.visibleRows().length - rows)));
 	}
 
-	private layout(width = this.pointerLayout?.width ?? 80): AgentsViewLayout {
+	private layout(width = this.pointerLayout?.width ?? this.lastRenderedWidth ?? 80): AgentsViewLayout {
 		const rows = typeof this.deps.rows === "function" ? this.deps.rows() : this.deps.rows;
 		return measureAgentsViewLayout(width, rows);
 	}
@@ -365,6 +402,7 @@ export class AgentsView {
 		if (!this.selectedId || !rows.some((row) => row.id === this.selectedId)) {
 			this.selectedId = rows.find((row) => row.kind === "task")?.id ?? rows[0]?.id;
 		}
+		if (this.selectedRow(rows)?.kind !== "task") this.narrowView = "list";
 		this.listScroll = Math.max(0, Math.min(this.listScroll, Math.max(0, rows.length - this.bodyRows())));
 		if (this.hoveredId && !rows.some((row) => row.id === this.hoveredId)) this.hoveredId = undefined;
 		this.subscribeSelected();
@@ -404,8 +442,12 @@ export class AgentsView {
 	private setExpanded(group: SessionGroup, expanded: boolean): void {
 		if (this.isExpanded(group) === expanded) return;
 		this.expanded.set(group.id, expanded);
-		if (!expanded) this.selectedId = `heading:${group.id}`;
+		if (!expanded) {
+			this.selectedId = `heading:${group.id}`;
+			this.narrowView = "list";
+		}
 		this.listScroll = Math.min(this.listScroll, Math.max(0, this.visibleRows().length - this.bodyRows()));
+		this.clearFooterLayout();
 		this.subscribeSelected();
 		this.deps.requestRender();
 	}
@@ -494,8 +536,10 @@ export class AgentsView {
 		const next = rows[Math.max(0, Math.min(rows.length - 1, index))];
 		if (!next || next.id === this.selectedId) return;
 		this.selectedId = next.id;
+		if (next.kind === "heading") this.narrowView = "list";
 		this.scroll = 0;
 		this.follow = true;
+		this.clearFooterLayout();
 		this.subscribeSelected();
 		this.deps.requestRender();
 	}
@@ -535,8 +579,21 @@ export class AgentsView {
 		return `${fit(keys, width - FOOTER_BUTTONS_WIDTH - 1)} ${this.deps.theme.fg(followRole, FOLLOW_BUTTON)} ${this.deps.theme.fg(openRole, OPEN_BUTTON)}`;
 	}
 
-	private closeLabel(): string {
-		return CLOSE_BUTTON;
+	private modeLabel(layout: AgentsViewLayout): string | undefined {
+		if (layout.mode !== "narrow" || !this.selectedTask()) return undefined;
+		return this.narrowView === "list" ? "[Details]" : "[← Back]";
+	}
+
+	private closeLabel(layout: AgentsViewLayout): string | undefined {
+		if (layout.mode === "fallback") return undefined;
+		return layout.mode === "narrow" ? "[×]" : CLOSE_BUTTON;
+	}
+
+	private setNarrowView(view: "list" | "details"): void {
+		if (view === this.narrowView || (view === "details" && !this.selectedTask())) return;
+		this.narrowView = view;
+		this.clearFooterLayout();
+		this.deps.requestRender();
 	}
 
 	private close(): void {
@@ -550,13 +607,13 @@ export class AgentsView {
 		return button !== undefined && x >= button.x && x < button.x + button.width;
 	}
 
-	private hoverControl(control: "follow" | "open" | "close"): TuiMouseEventResult {
+	private hoverControl(control: "follow" | "open" | "close" | "mode"): TuiMouseEventResult {
 		if (this.hoveredControl === control) return { handled: true };
 		this.hoveredControl = control;
 		return { handled: true, render: true };
 	}
 
-	private clearHoveredControl(control: "follow" | "open" | "close"): void {
+	private clearHoveredControl(control: "follow" | "open" | "close" | "mode"): void {
 		if (this.hoveredControl !== control) return;
 		this.hoveredControl = undefined;
 		this.deps.requestRender();
@@ -579,6 +636,12 @@ export class AgentsView {
 	private clickClose(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		if (event.button !== "left") return undefined;
 		this.close();
+		return { handled: true, render: true };
+	}
+
+	private clickMode(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (event.button !== "left" || !this.selectedTask()) return undefined;
+		this.setNarrowView(this.narrowView === "list" ? "details" : "list");
 		return { handled: true, render: true };
 	}
 
