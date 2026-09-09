@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { AGENT_MODE, type AgentDefinition } from "../lib/agents-config.ts";
 import { TASK_STATUS, TaskStore } from "../lib/agents-protocol.ts";
-import { AgentRunner, childArguments, JsonLines, piCommand, type RunnerDeps, type TaskRequest } from "../lib/agents-runner.ts";
+import { AgentRunner, childArguments, JsonLines, piCommand, type RunnerDeps, type RunnerHooks, type TaskRequest } from "../lib/agents-runner.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
 
 // Gentle Agents runner: every subagent is a child `pi --mode rpc` process.
@@ -25,7 +25,7 @@ interface Harness {
 	spawnOptions: Array<{ stdio?: string[] }>;
 }
 
-function harness(options: { maxConcurrency?: number; answer?: Record<string, unknown>; exitOnKill?: boolean } = {}): Harness {
+function harness(options: { maxConcurrency?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"] } = {}): Harness {
 	const children: FakeChild[] = [];
 	const timers: Harness["timers"] = [];
 	const asks: Harness["asks"] = [];
@@ -56,11 +56,43 @@ function harness(options: { maxConcurrency?: number; answer?: Record<string, unk
 			return options.answer ?? { value: "yes" };
 		},
 		onFinish: (task) => finishes.push(task.id),
+		onSuccessfulMutation: options.onSuccessfulMutation,
 	});
 	return { store, runner, children, timers, asks, finishes, spawnOptions };
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+for (const ending of ["cancel", "failure", "hook-error", "hook-async-error"] as const) {
+	test(`successful child mutations require paired RPC events and survive ${ending}`, async () => {
+		const mutations: unknown[] = [];
+		const h = harness({ onSuccessfulMutation: (task, tool) => {
+			mutations.push({ taskId: task.id, parent: task.parentSessionId, ...tool });
+			if (ending === "hook-error") throw new Error("receipt append unavailable");
+			if (ending === "hook-async-error") return Promise.reject(new Error("async receipt append unavailable"));
+		} });
+		const task = h.runner.run(request());
+		await tick();
+		const child = h.children[0];
+		const start = (id: string, toolName: string) => child.emit({ type: "tool_execution_start", toolCallId: id, toolName, args: { path: "src/file.ts" } });
+		const end = (id: string, isError: unknown = false) => child.emit({ type: "tool_execution_end", toolCallId: id, isError, result: { content: [] } });
+		assert.deepEqual(mutations, [], "spawn is not mutation evidence");
+		end("missing");
+		for (const name of ["read", "bash", "subagent_run"]) { start(name, name); end(name); }
+		start("failed", "write"); end("failed", true);
+		start("unknown", "edit"); end("unknown", null);
+		child.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "I edited files" } });
+		assert.deepEqual(mutations, []);
+		for (const name of ["write", "edit"]) { start(name, name); end(name); end(name); }
+		assert.deepEqual(mutations, ["write", "edit"].map((toolName) => ({ taskId: task.id, parent: "s1", toolName, toolCallId: toolName, path: "src/file.ts" })));
+		start("unfinished", "write");
+		if (ending === "failure") child.fail("later failure");
+		else h.runner.cancel(task.id);
+		await tick();
+		end("unfinished"); start("late", "write"); end("late");
+		assert.equal(mutations.length, 2, "terminal cleanup rejects late events without retracting successful writes");
+	});
+}
 
 test("launch registration waits for actual spawn, including queued launches, and ignores failed spawns", async () => {
 	const launches: string[] = [];

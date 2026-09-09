@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { recordReviewMutation } from "../lib/review-reminder-receipt.ts";
 import { SessionWorktreeRegistry, resolveSessionWorktree, type WorktreeResolver } from "../lib/session-worktree-registry.ts";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -264,6 +265,13 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 
 	const runner = new AgentRunner(store, loadAgentsConfig({ cwd: process.cwd(), home: deps.home, agentHome }), deps, {
 		askUser: (_taskId, ask, raw) => answerThroughUi(ui, ask, raw),
+		onSuccessfulMutation: (task, tool) => {
+			if (!sessions || !worktrees || task.parentSessionId !== activeSessionId() || !ownedTaskIds.has(task.id)) return;
+			const root = deps.resolveWorktree(tool.path, task.cwd)?.root;
+			const childRoot = deps.resolveWorktree(task.cwd, task.cwd)?.root;
+			if (!root || root !== childRoot || !worktrees.roots().includes(root)) return;
+			recordReviewMutation(pi, sessions, root, { source: "subagent", taskId: task.id, toolName: tool.toolName, toolCallId: tool.toolCallId });
+		},
 		onFinish: (task) => {
 			ownedTaskIds.delete(task.id);
 			requestRender();
@@ -606,6 +614,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 
 	pi.on("session_start", (_event, ctx) => { registryFor(ctx); showWidget(ctx); });
 	pi.on("session_shutdown", () => {
+		sessions = undefined;
 		worktrees?.close();
 		worktrees = undefined;
 		runner.cancelAll();

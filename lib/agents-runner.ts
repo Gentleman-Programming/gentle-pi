@@ -61,6 +61,8 @@ export interface AskAnswer {
 export interface RunnerHooks {
 	askUser(taskId: string, request: AskRequest, raw: Record<string, unknown>): Promise<AskAnswer>;
 	onFinish?(task: TaskRecord): void;
+	// Parent-only observation of a paired successful filesystem tool, not prose.
+	onSuccessfulMutation?(task: TaskRecord, tool: { toolName: "write" | "edit"; toolCallId: string; path: string }): void | Promise<void>;
 }
 
 export interface TaskRequest {
@@ -105,6 +107,7 @@ interface LiveTask {
 	quarantined: boolean;
 	nextId: number;
 	permissionBroker?: ParentStandingReviewPermissionBroker;
+	mutationStarts: Map<string, { toolName: "write" | "edit"; toolCallId: string; path: string }>;
 }
 
 const CHILD_MARKER = "GENTLE_PI_AGENTS_CHILD";
@@ -286,7 +289,7 @@ export class AgentRunner {
 			return;
 		}
 		const processGroup = detached && typeof child.pid === "number" && child.pid > 0 ? child.pid : undefined;
-		const live: LiveTask = { child, pending: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0 };
+		const live: LiveTask = { child, mutationStarts: new Map(), pending: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0 };
 		this.live.set(id, live);
 		const permissionPipe = child.stdio?.[3];
 		if (hasParentPermissionChannel && permissionPipe !== undefined && permissionPipe !== null) {
@@ -359,6 +362,21 @@ export class AgentRunner {
 		}
 		for (const event of normalizeRpcEvent(raw)) {
 			this.store.apply(id, event, this.deps.now());
+			if (event.type === TASK_EVENT.TOOL_START && event.callId) {
+				live.mutationStarts.delete(event.callId);
+				if ((event.name === "write" || event.name === "edit") && typeof event.args.path === "string" && event.args.path.trim()) {
+					live.mutationStarts.set(event.callId, { toolName: event.name, toolCallId: event.callId, path: event.args.path });
+				}
+			}
+			if (event.type === TASK_EVENT.TOOL_END) {
+				const mutation = live.mutationStarts.get(event.callId);
+				live.mutationStarts.delete(event.callId);
+				const task = this.store.get(id);
+				if (mutation && task && raw.isError === false && !event.isError) {
+					try { void Promise.resolve(this.hooks.onSuccessfulMutation?.(task, mutation)).catch(() => {}); }
+					catch { /* Bookkeeping failure must not rewrite a successful tool or stop the child. */ }
+				}
+			}
 			if (event.type === TASK_EVENT.ASK) void this.answer(id, request, live, event.request, raw);
 			if (event.type === TASK_EVENT.AGENT_SETTLED) {
 				const terminal = this.store.get(id);
@@ -408,6 +426,7 @@ export class AgentRunner {
 		const live = this.live.get(id);
 		if (!live || live.terminal) return;
 		live.terminal = { status, error };
+		live.mutationStarts.clear();
 		live.cleanupDeadlineAt = this.deps.now() + GROUP_CONFIRM_DEADLINE_MS;
 		live.permissionBroker?.close();
 		live.cancelStall();
