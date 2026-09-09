@@ -600,6 +600,47 @@ test("live-only directory traverses presence overflow, excludes expired and othe
 	await panel.opened;
 });
 
+test("research launch passes only active approved external tools to child argv", async () => {
+	const fixtureHome = join(root, "research-home");
+	mkdirSync(join(fixtureHome, ".pi", "agent", "agents"), { recursive: true });
+	writeFileSync(join(fixtureHome, ".pi", "agent", "agents", "sdd-research.md"), "---\nname: sdd-research\ntools: [read, write, fetch_content, web_search, source_check, mcp, bash]\n---\nCollect research.");
+	const fake = fakePi(), runtime = deps(), { ctx } = fakeContext();
+	fake.pi.getActiveTools = () => ["fetch_content", "web_search", "mcp", "bash"];
+	fake.pi.getAllTools = () => fake.pi.getActiveTools().map(name => ({ name })) as never;
+	gentleAgents(fake.pi, {}, { ...runtime.deps, home: fixtureHome });
+	await fake.tools.get("subagent_run")!.execute("research", { agent: "sdd-research", task: "Research docs", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	const argv = runtime.spawned[0];
+	assert.equal(argv[argv.indexOf("--tools") + 1], "read,write,fetch_content,web_search,subagent_parent_message");
+	assert.match(argv[argv.indexOf("--append-system-prompt") + 1], /documentation: available/);
+	assert.match(argv[argv.indexOf("--append-system-prompt") + 1], /open-web: blocked/, "two reachable tools cannot admit open-web");
+	await fake.fire("session_shutdown", ctx);
+});
+
+test("research child inventory requires every canonical open-web tool", () => {
+	const required = ["web_search", "source_check", "fetch_content", "get_search_content"];
+	for (const missing of [undefined, ...required]) {
+		const hooks = new Map<string, (event: any) => any>();
+		const active = required.filter(name => name !== missing);
+		const pi = { on: (name: string, handler: (event: any) => any) => hooks.set(name, handler), getActiveTools: () => active, getAllTools: () => required.map(name => ({ name })) } as never;
+		gentleAgents(pi, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_RESEARCH_TOOLS: JSON.stringify(required) });
+		const prompt = hooks.get("before_agent_start")!({ systemPrompt: "research" }).systemPrompt;
+		assert.match(prompt, new RegExp(`open-web: ${missing === undefined ? "available" : "blocked"}`));
+		assert.match(prompt, new RegExp(`documentation: ${missing === "fetch_content" ? "blocked" : "available"}`));
+		assert.match(prompt, /Availability is not evidence/);
+	}
+});
+
+test("research child rechecks local inventory and blocks gateway calls", async () => {
+	const hooks = new Map<string, (event: any) => any>();
+	const pi = { on: (name: string, handler: (event: any) => any) => hooks.set(name, handler), getActiveTools: () => ["read", "mcp"], getAllTools: () => [{ name: "read" }, { name: "mcp" }] } as never;
+	gentleAgents(pi, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_RESEARCH_TOOLS: '["read","fetch_content"]' });
+	assert.match(hooks.get("before_agent_start")!({ systemPrompt: "research" }).systemPrompt, /documentation: blocked/);
+	assert.equal(hooks.get("tool_call")!({ toolName: "mcp" }).block, true);
+	assert.equal(hooks.get("tool_call")!({ toolName: "fetch_content" }).block, true);
+	assert.equal(hooks.get("tool_call")!({ toolName: "read" }), undefined);
+});
+
 async function shutdownAndRestoreNativeSpawn(
 	childProcess: typeof import("node:child_process"),
 	originalSpawn: typeof import("node:child_process").spawn,

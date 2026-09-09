@@ -14,6 +14,8 @@ import { join } from "node:path";
 import test from "node:test";
 import {
 	collectSddPreflightPreferences,
+	ensureSddPreflight,
+	getSddPreflightPreferences,
 	DEFAULT_SDD_PREFLIGHT,
 	installSddAssets,
 	isSddPreflightTrigger,
@@ -42,17 +44,50 @@ function preflightContext(cwd: string, hasUI: boolean, calls: string[] = [], ans
 function writeRawPreflight(cwd: string, chainedPrStrategy: string, prompted = true): string {
 	const path = sddPreflightDiskPath(cwd); mkdirSync(join(cwd, ".pi", "gentle-ai"), { recursive: true }); writeFileSync(path, JSON.stringify({ executionMode: "auto", artifactStore: "openspec", chainedPrStrategy, reviewBudgetLines: 400, engramAvailable: false, prompted })); return path;
 }
-test("production callers distinguish automatic defaults from explicit preflight prompts", () => {
+test("production callers distinguish first-session confirmation from explicit field editing", () => {
 	const root = join(import.meta.dirname, ".."), gentleAi = readFileSync(join(root, "extensions", "gentle-ai.ts"), "utf8"), sddInit = readFileSync(join(root, "extensions", "sdd-init.ts"), "utf8");
-	assert.match(gentleAi, /function runSddPreflight\(\s*ctx: ExtensionContext,\s*promptFields: readonly SddPreflightField\[\] = \[\]\s*\)/s); assert.match(gentleAi, /if \(isSddAgent && !getSddPreflightPreferences\(ctx\)\) \{\s*await runSddPreflight\(ctx\);/s); assert.match(gentleAi, /applyModelConfig: async \(\) => applySavedModelConfig\(ctx\)\s*\},\s*\{\s*promptFields\s*\}\s*\);/s); assert.match(gentleAi, /handler: async \(_args, ctx\) => \{\s*await runSddPreflight\(ctx, SDD_PREFLIGHT_FIELDS\);/s); assert.match(sddInit, /applyModelConfig: \(\) => applySavedModelConfig\(ctx\)\s*\},\s*\{\s*promptFields: \[\]\s*\}\s*\);/s);
+	assert.match(gentleAi, /function runSddPreflight\(\s*ctx: ExtensionContext,\s*promptFields: readonly SddPreflightField\[\] = \[\]\s*\)/s); assert.match(gentleAi, /if \(isSddAgent && !getSddPreflightPreferences\(ctx\)\) \{\s*await runSddPreflight\(ctx\);/s); assert.match(gentleAi, /applyModelConfig: async \(\) => applySavedModelConfig\(ctx\)\s*\},\s*\{\s*promptFields\s*\}\s*\);/s); assert.ok(gentleAi.includes('await runSddPreflight(ctx, args.trim() === "--edit" ? SDD_PREFLIGHT_FIELDS : []);')); assert.match(sddInit, /applyModelConfig: \(\) => applySavedModelConfig\(ctx\)\s*\},\s*\{\s*promptFields: \[\]\s*\}\s*\);/s);
 });
 test("capability-constrained artifact selector elision", async () => {
 	const calls: string[] = [], prefs = await collectSddPreflightPreferences(preflightContext(await workspace(), true, calls), false, { promptFields: ["artifactStore"] });
 	assert.deepEqual(prefs, DEFAULT_SDD_PREFLIGHT); assert.deepEqual(calls, []);
 });
-test("headless/UI canonical-domain parity", async () => {
-	const calls: string[] = [], ui = await collectSddPreflightPreferences(preflightContext(await workspace(), true, calls), false), headless = await collectSddPreflightPreferences(preflightContext(await workspace(), false), false);
-	assert.deepEqual(ui, DEFAULT_SDD_PREFLIGHT); assert.deepEqual(headless, ui); assert.deepEqual(calls, []);
+test("headless defaults stay silent while UI confirms defaults", async () => {
+	const calls: string[] = [], ui = await collectSddPreflightPreferences(preflightContext(await workspace(), true, calls, { "Confirm SDD session preflight": "Confirm" }), false), headless = await collectSddPreflightPreferences(preflightContext(await workspace(), false), false);
+	assert.deepEqual(headless, DEFAULT_SDD_PREFLIGHT);
+	assert.deepEqual(ui, { ...headless, prompted: true }); assert.equal(calls.length, 1);
+});
+test("disk preferences are suggestions and resolved choices are reused only in session", async () => {
+	const cwd = await workspace(), calls: string[] = [];
+	writeSddPreflightToDisk(cwd, SAMPLE_PREFS);
+	const ctx = preflightContext(cwd, true, calls, { "Confirm SDD session preflight": "Confirm" });
+	assert.equal(getSddPreflightPreferences(ctx), undefined);
+	const callbacks = { pi: { getActiveTools: () => ["mem_save"] } as never, installAssets: () => ({ agents: 0, chains: 0, support: 0, skipped: 0 }) };
+	await ensureSddPreflight(ctx, callbacks);
+	await ensureSddPreflight(ctx, callbacks);
+	assert.equal(calls.length, 1);
+	const next = { ...ctx, sessionManager: { getSessionId: () => `${cwd}-new` } } as typeof ctx;
+	assert.equal(getSddPreflightPreferences(next), undefined);
+	await ensureSddPreflight(next, callbacks);
+	assert.equal(calls.length, 2);
+});
+test("RPC children retain headless defaults despite supporting UI dialogs", async () => {
+	const calls: string[] = [];
+	const ctx = { ...preflightContext(await workspace(), true, calls), mode: "rpc" as const };
+	assert.deepEqual(await collectSddPreflightPreferences(ctx, false), DEFAULT_SDD_PREFLIGHT);
+	assert.deepEqual(calls, []);
+});
+test("explicit field editing cannot open RPC or no-UI dialogs", async () => {
+	for (const hasUI of [true, false]) {
+		const calls: string[] = [];
+		const ctx = { ...preflightContext(await workspace(), hasUI, calls), mode: "rpc" as const };
+		const prefs = await collectSddPreflightPreferences(ctx, false, { promptFields: ["executionMode", "artifactStore", "chainedPrStrategy", "reviewBudgetLines"] });
+		assert.deepEqual(prefs, DEFAULT_SDD_PREFLIGHT);
+		assert.deepEqual(calls, []);
+	}
+});
+test("cancelled confirmation cannot become current-session consent", async () => {
+	await assert.rejects(collectSddPreflightPreferences(preflightContext(await workspace(), true), false), /cancelled/i);
 });
 test("explicit UI selections override defaults when a field is genuinely unresolved", async () => {
 	const calls: string[] = [], prefs = await collectSddPreflightPreferences(preflightContext(await workspace(), true, calls, { "SDD execution mode": "interactive", "SDD artifact store": "engram", "SDD delivery strategy": "auto-chain", "SDD review budget lines": "700" }), true, { persisted: DEFAULT_SDD_PREFLIGHT, promptFields: ["executionMode", "artifactStore", "chainedPrStrategy", "reviewBudgetLines"] });
@@ -97,11 +132,11 @@ test("readSddPreflightFromDisk returns persisted prefs after write", async () =>
 	assert.deepEqual(loaded, SAMPLE_PREFS);
 });
 
-test("persisted preferences are reused with zero prompts", async () => {
+test("persisted preferences require fresh session confirmation", async () => {
 	const cwd = await workspace(); writeSddPreflightToDisk(cwd, SAMPLE_PREFS);
 	const loaded = readSddPreflightFromDisk(cwd); assert.ok(loaded);
-	const calls: string[] = [], reused = await collectSddPreflightPreferences(preflightContext(cwd, true, calls), loaded!.engramAvailable, { persisted: loaded });
-	assert.deepEqual(reused, loaded); assert.deepEqual(calls, []);
+	const calls: string[] = [], reused = await collectSddPreflightPreferences(preflightContext(cwd, true, calls, { "Confirm SDD session preflight": "Confirm" }), loaded!.engramAvailable, { persisted: loaded });
+	assert.deepEqual(reused, loaded); assert.equal(calls.length, 1);
 });
 
 test("readSddPreflightFromDisk returns undefined for corrupt JSON", async () => {

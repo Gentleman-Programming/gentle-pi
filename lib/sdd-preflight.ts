@@ -16,6 +16,7 @@ const LEGACY_MANAGED_ASSET_MANIFESTS = Object.freeze([
 	{ path: join(ASSETS_DIR, "migrations", "managed-assets-v0.10.7.json"), version: "0.10.7" },
 	{ path: join(ASSETS_DIR, "migrations", "managed-assets-v0.13.json"), version: "0.13.0" },
 	{ path: join(ASSETS_DIR, "migrations", "managed-assets-v0.14.json"), version: "0.14.0" },
+	{ path: join(ASSETS_DIR, "migrations", "managed-assets-v2.5.0.json"), version: "2.5.0" },
 ]);
 
 function gentlePiAgentHome(): string {
@@ -476,6 +477,9 @@ function copyDirectoryFiles(
 				delete manifest.assets[ownershipKey];
 				skipped += 1;
 				continue;
+			} else if (ownershipKey === "agents/sdd-research.md" && installedContent !== undefined) {
+				// Keep routing adopted by the legacy migration on subsequent refreshes.
+				nextSource = migrateLegacyAssetContent(ownershipKey, installedContent, source);
 			}
 		}
 		writeFileSync(targetPath, nextSource);
@@ -646,13 +650,23 @@ export async function collectSddPreflightPreferences(
 	engramAvailable: boolean,
 	options: SddPreflightResolutionOptions = {},
 ): Promise<SddPreflightPreferences> {
-	const persistedPrompted = options.persisted?.prompted === true;
+	// Disk preferences suggest values; they never carry current-session consent.
 	const allowExceptionOk = options.acceptSizeException === true;
 	const persisted = normalizedSelections(options.persisted, engramAvailable, allowExceptionOk);
 	const resolved: Partial<Record<SddPreflightField, unknown>> = { ...persisted };
-	let prompted = persistedPrompted;
+	let prompted = false;
 	let sizeExceptionAccepted = allowExceptionOk && persisted.chainedPrStrategy === "exception-ok";
 	const promptFields = new Set(options.promptFields ?? []);
+	// RPC is headless even though Pi exposes functional dialog methods there.
+	if (ctx.hasUI && ctx.mode !== "rpc" && promptFields.size === 0) {
+		const suggestions = { ...DEFAULT_SDD_PREFLIGHT, ...persisted };
+		ctx.ui.notify(`SDD session suggestions: mode=${suggestions.executionMode}; artifacts=${suggestions.artifactStore}; delivery=${suggestions.chainedPrStrategy}; budget=${suggestions.reviewBudgetLines}. Saved preferences are not session consent.`, "info");
+		if (typeof ctx.ui.select !== "function") throw new Error("SDD preflight confirmation UI unavailable; no session consent recorded.");
+		const answer = await ctx.ui.select("Confirm SDD session preflight", ["Confirm", "Change choices"]);
+		if (answer === "Confirm") prompted = true;
+		else if (answer === "Change choices") for (const field of SDD_PREFLIGHT_FIELDS) promptFields.add(field);
+		else throw new Error("SDD preflight cancelled; no session consent recorded.");
+	}
 
 	const usePromptedValue = (
 		field: SddPreflightField,
@@ -671,15 +685,23 @@ export async function collectSddPreflightPreferences(
 		read: () => Promise<unknown>,
 		enabled = true,
 	): Promise<void> => {
-		if (ctx.hasUI && enabled && promptFields.has(field)) {
-			usePromptedValue(field, await read());
+		if (ctx.hasUI && ctx.mode !== "rpc" && enabled && promptFields.has(field)) {
+			const value = await read();
+			if (normalizedSelections({ [field]: value }, engramAvailable, allowExceptionOk)[field] === undefined) {
+				throw new Error("SDD preflight cancelled or invalid; no session consent recorded.");
+			}
+			usePromptedValue(field, value);
 		}
 	};
 	const artifactOptions = engramAvailable ? ["openspec", "engram", "hybrid"] : ["openspec"];
-	await promptField("executionMode", () => ctx.ui.select("SDD execution mode", ["interactive", "auto"]));
-	await promptField("artifactStore", () => ctx.ui.select("SDD artifact store", artifactOptions), artifactOptions.length > 1);
-	await promptField("chainedPrStrategy", () => ctx.ui.select("SDD delivery strategy", ["ask-on-risk", "auto-chain", "single-pr"]));
-	await promptField("reviewBudgetLines", () => ctx.ui.input("SDD review budget lines", String(DEFAULT_SDD_PREFLIGHT.reviewBudgetLines)));
+	const suggestedFirst = (field: SddPreflightField, values: string[]): string[] => {
+		const suggested = String(resolved[field] ?? DEFAULT_SDD_PREFLIGHT[field]);
+		return values.includes(suggested) ? [suggested, ...values.filter(value => value !== suggested)] : values;
+	};
+	await promptField("executionMode", () => ctx.ui.select("SDD execution mode", suggestedFirst("executionMode", ["interactive", "auto"])));
+	await promptField("artifactStore", () => ctx.ui.select("SDD artifact store", suggestedFirst("artifactStore", artifactOptions)), artifactOptions.length > 1);
+	await promptField("chainedPrStrategy", () => ctx.ui.select("SDD delivery strategy", suggestedFirst("chainedPrStrategy", ["ask-on-risk", "auto-chain", "single-pr"])));
+	await promptField("reviewBudgetLines", () => ctx.ui.input("SDD review budget lines", String(resolved.reviewBudgetLines ?? DEFAULT_SDD_PREFLIGHT.reviewBudgetLines)));
 
 	const resolvedValue = <T>(field: SddPreflightField, fallback: T): T =>
 		(resolved[field] as T | undefined) ?? fallback;
@@ -788,11 +810,6 @@ export function getSddPreflightPreferences(
 	const sessionKey = sddPreflightSessionKey(ctx);
 	const cached = sddPreflightBySession.get(sessionKey);
 	if (cached) return cached;
-	// Cache miss: check the durable disk store (survives restarts and non-SDD agent starts)
-	const persisted = readSddPreflightFromDisk(ctx.cwd);
-	if (persisted) {
-		sddPreflightBySession.set(sessionKey, persisted);
-		return persisted;
-	}
+	// Only ensureSddPreflight may promote disk suggestions to resolved session choices.
 	return undefined;
 }
