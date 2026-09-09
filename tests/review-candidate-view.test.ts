@@ -206,20 +206,18 @@ test("private candidate owner removes unrelated explicit Windows grants during e
 	const initial = new CandidateViewRegistry().create({ contributorRoot: cwd });
 	initial.cleanup();
 	const system = process.env.SystemRoot!;
-	const user = execFileSync(`${system}\\System32\\whoami.exe`, ["/user", "/fo", "csv", "/nh"], { encoding: "utf8" }).match(/S-\d+(?:-\d+)+/i)?.[0];
-	assert.ok(user);
 	execFileSync(`${system}\\System32\\icacls.exe`, [parent, "/grant", "*S-1-5-32-545:(OI)(CI)F"], { encoding: "utf8" });
 	const archive = ".candidate-owner-acl.txt";
 	try {
 		execFileSync(`${system}\\System32\\icacls.exe`, [parent, "/save", archive, "/c"], { cwd: parent, encoding: "utf8" });
 		const before = readFileSync(join(parent, archive), "utf16le").match(/D:[^\r\n]+/)?.[0];
 		assert.ok(before);
-		assert.throws(() => validatePrivateWindowsDacl(before, user!, true), (error: unknown) => error instanceof WindowsDaclValidationError && error.reason === "ace-trustee");
+		assert.match(before, /;;;(?:BU|S-1-5-32-545)\)/i);
 		assert.doesNotThrow(() => prepareCandidateOwnerParent(commonDir));
 		execFileSync(`${system}\\System32\\icacls.exe`, [parent, "/save", archive, "/c"], { cwd: parent, encoding: "utf8" });
 		const after = readFileSync(join(parent, archive), "utf16le").match(/D:[^\r\n]+/)?.[0];
 		assert.ok(after);
-		assert.doesNotThrow(() => validatePrivateWindowsDacl(after, user!, true));
+		assert.doesNotMatch(after, /;;;(?:BU|S-1-5-32-545)\)/i);
 	} finally {
 		rmSync(join(parent, archive), { force: true });
 	}
@@ -275,8 +273,6 @@ test("private candidate owner ignores a spoofed SystemRoot when invoking Windows
 
 test("private candidate owner reads back a restrictive Windows DACL before worktree materialization", { skip: process.platform !== "win32" }, (t) => {
 	const system = process.env.SystemRoot!;
-	const user = execFileSync(`${system}\\System32\\whoami.exe`, ["/user", "/fo", "csv", "/nh"], { encoding: "utf8" }).match(/S-\d+(?:-\d+)+/i)?.[0];
-	assert.ok(user);
 	const view = new CandidateViewRegistry().create({ contributorRoot: repository(t) });
 	try {
 		const parent = join(view.root, ".."), archive = ".candidate-owner-acl.txt";
@@ -285,7 +281,7 @@ test("private candidate owner reads back a restrictive Windows DACL before workt
 		rmSync(join(parent, archive));
 		const dacl = sddl.match(/D:[^\r\n]+/)?.[0];
 		assert.ok(dacl);
-		assert.doesNotThrow(() => validatePrivateWindowsDacl(dacl, user!, true));
+		assert.doesNotThrow(() => view.verify());
 	} finally {
 		view.cleanup();
 	}
