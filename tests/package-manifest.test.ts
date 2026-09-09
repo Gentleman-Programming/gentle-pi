@@ -229,8 +229,12 @@ test("generated runtime modules and packed-package checks are deterministic", ()
 test("package manifest ships and runs the checked-in package-local Gentle AI installer", () => {
 	const packageJson = readPackageJson();
 	const verifier = readFileSync(join(PACKAGE_ROOT, "scripts", "verify-package-files.mjs"), "utf8");
+	const readme = readFileSync(join(PACKAGE_ROOT, "README.md"), "utf8");
 
 	assert.equal(packageJson.scripts?.postinstall, "node scripts/install-gentle-ai.mjs");
+	assert.match(readme, /run `node scripts\/install-gentle-ai\.mjs`/, "missing-binary recovery documentation must use the package postinstall entrypoint");
+	assert.match(readme, /installed `gentle-pi` package directory/, "recovery documentation must name the package working directory");
+	assert.match(readme, /if `GENTLE_PI_SKIP_GENTLE_AI_INSTALL` is set, remove or unset it before/i, "recovery documentation must prevent the installer skip from repeating");
 	assert.ok(packageJson.files?.includes("scripts/"));
 	assert.match(verifier, /"scripts\/install-gentle-ai\.mjs"/);
 	assert.match(verifier, /"scripts\/gentle-ai-installer\.mjs"/);
@@ -466,6 +470,44 @@ test("packaged agents declare only tool names a Pi child session can resolve", (
 				`${file} declares ${unsupported}, which no Pi child session exposes; use find for discovery`,
 			);
 		}
+	}
+});
+
+test("unowned legacy research migrates by exact normalized hash, preserving routing and user edits", () => {
+	const packaged = readFileSync(join(PACKAGE_ROOT, "assets", "agents", "sdd-research.md"), "utf8");
+	const oldAdmission = "- Evidence grants for this runtime are `documentation=[]; open-web=[]`. Never infer evidence capability from bash, persistence tools, or any inherited tool; persistence tools are not evidence grants. Unsupported or undeclared classes deny admission and emit no claims.\n- Because this runtime declares no evidence grants, retain the selected request, persist a `blocked` outcome with no claims, and stop.\n";
+	const legacy = packaged
+		.replace(/  - fetch_content\n  - web_search\n  - source_check\n  - get_search_content\n/, "")
+		.replace(/- Use the injected `## SDD Research Capabilities`[\s\S]*?(?=- Admission denial)/, oldAdmission)
+		.replace(/Use `done` only when all selected questions[\s\S]*?product decisions remain separately confirmed by the parent\./i, "For this runtime the outcome is `blocked` with an admission denial and no claims.");
+	const manifest = JSON.parse(readFileSync(join(PACKAGE_ROOT, "assets", "migrations", "managed-assets-v2.5.0.json"), "utf8"));
+	assert.equal(sha256(legacy), manifest.assets["agents/sdd-research.md"], "fixture reconstruction must match observed old package bytes");
+	const temporary = mkdtempSync(join(tmpdir(), "gentle-research-migration-"));
+	const previous = process.env.GENTLE_PI_AGENT_HOME;
+	try {
+		for (const edited of [false, true]) {
+			const agentHome = join(temporary, edited ? "edited" : "legacy");
+			process.env.GENTLE_PI_AGENT_HOME = agentHome;
+			mkdirSync(join(agentHome, "agents"), { recursive: true });
+			const target = join(agentHome, "agents", "sdd-research.md");
+			const routed = legacy.replace("name: sdd-research\n", "name: sdd-research\nmodel: custom/model\nthinking: high\n") + (edited ? "\nUser research restrictions.\n" : "");
+			writeFileSync(target, routed);
+			installSddAssets(temporary, true);
+			const actual = readFileSync(target, "utf8");
+			if (edited) assert.equal(actual, routed);
+			else {
+				assert.match(actual, /  - fetch_content/);
+				assert.match(actual, /model: custom\/model\nthinking: high/);
+				const ownership = JSON.parse(readFileSync(join(agentHome, "gentle-ai", "managed-assets.json"), "utf8"));
+				assert.equal(ownership.assets["agents/sdd-research.md"], sha256(actual));
+				installSddAssets(temporary, true);
+				assert.equal(readFileSync(target, "utf8"), actual, "subsequent refresh keeps adopted model routing");
+			}
+		}
+	} finally {
+		if (previous === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previous;
+		rmSync(temporary, { recursive: true, force: true });
 	}
 });
 

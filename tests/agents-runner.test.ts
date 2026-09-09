@@ -22,10 +22,10 @@ interface Harness {
 	timers: Array<{ fn: () => void; ms: number; cancelled: boolean }>;
 	asks: Array<{ taskId: string; method: string }>;
 	finishes: string[];
-	spawnOptions: Array<{ stdio?: string[] }>;
+	spawnOptions: Array<{ env: NodeJS.ProcessEnv; stdio?: string[] }>;
 }
 
-function harness(options: { maxConcurrency?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"] } = {}): Harness {
+function harness(options: { maxConcurrency?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean; onNotification?: RunnerHooks["onNotification"]; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"] } = {}): Harness {
 	const children: FakeChild[] = [];
 	const timers: Harness["timers"] = [];
 	const asks: Harness["asks"] = [];
@@ -34,7 +34,7 @@ function harness(options: { maxConcurrency?: number; answer?: Record<string, unk
 	let clock = 1000;
 	const deps: RunnerDeps = {
 		spawn: (_command, _args, launchOptions) => {
-			spawnOptions.push({ stdio: launchOptions.stdio });
+			spawnOptions.push({ env: launchOptions.env, stdio: launchOptions.stdio });
 			const fake = fakeChild({ exitOnKill: options.exitOnKill });
 			if (options.state !== undefined) {
 				fake.child.stdin.removeAllListeners("data");
@@ -65,6 +65,7 @@ function harness(options: { maxConcurrency?: number; answer?: Record<string, unk
 			return options.answer ?? { value: "yes" };
 		},
 		onFinish: (task) => finishes.push(task.id),
+		onNotification: options.onNotification,
 		onSuccessfulMutation: options.onSuccessfulMutation,
 	});
 	return { store, runner, children, timers, asks, finishes, spawnOptions };
@@ -180,12 +181,67 @@ test("childArguments builds an rpc launch with model, thinking, tools, session d
 	assert.deepEqual(args.slice(0, 2), ["--mode", "rpc"]);
 	assert.ok(args.includes("--session-dir") && args[args.indexOf("--session-dir") + 1] === "/sessions");
 	assert.equal(args[args.indexOf("--model") + 1], "openai-codex/gpt-5.6-terra:high");
-	assert.equal(args[args.indexOf("--tools") + 1], "read,grep");
+	assert.equal(args[args.indexOf("--tools") + 1], "read,grep,subagent_parent_message");
 	assert.equal(args[args.indexOf("--append-system-prompt") + 1], "You map things.");
 	assert.ok(!args.includes("--session"));
 	const resumed = childArguments(request({ resumeSessionPath: "/sessions/old.jsonl", model: undefined, thinking: undefined, agent: { ...explorer, tools: [] } }));
 	assert.equal(resumed[resumed.indexOf("--session") + 1], "/sessions/old.jsonl");
 	assert.ok(!resumed.includes("--model") && !resumed.includes("--tools"));
+});
+
+test("childArguments grants every child the notification-only parent message tool", () => {
+	const args = childArguments(request());
+	assert.equal(args[args.indexOf("--tools") + 1], "read,grep,subagent_parent_message");
+});
+
+test("AgentRunner admits strict live notifications once and closes IPC before Stop", async () => {
+	const notifications: string[] = [];
+	const { runner, children, spawnOptions } = harness({ onNotification: (task, message) => task.parentSessionId === "s1" && (notifications.push(message), true) });
+	const task = runner.run(request());
+	await tick();
+	children[0].message({ id: "n1", kind: "notification", message: "checkpoint" });
+	children[0].message({ id: "n1", kind: "notification", message: "checkpoint" });
+	children[0].message({ id: "n2", kind: "notification", message: "x".repeat(8 * 1024 + 1) });
+	children[0].message({ id: "q3", kind: "query", message: "unsupported" });
+	children[0].message({ id: "n4", kind: "notification", message: "\uD800" });
+	children[0].message({ id: "n5", kind: "notification", message: "forged field", sender: "forged" });
+	children[0].message({ id: "n0", kind: "notification", message: "invalid correlation" });
+	children[0].message({ id: `n${"1".repeat(1_000)}`, kind: "notification", message: "invalid correlation" });
+	await tick();
+	assert.deepEqual(spawnOptions[0]?.stdio, ["pipe", "pipe", "pipe", "ipc"]);
+	assert.deepEqual(notifications, ["checkpoint"]);
+	assert.deepEqual(children[0].sent, [
+		{ id: "n1", kind: "ack", accepted: true },
+		{ id: "n2", kind: "ack", accepted: false, error: "invalid child IPC message" },
+		{ id: "q3", kind: "reply", error: "task parent cannot accept queries" },
+		{ id: "n4", kind: "ack", accepted: false, error: "invalid child IPC message" },
+		{ id: "n5", kind: "ack", accepted: false, error: "invalid child IPC frame" },
+	]);
+	runner.cancel(task.id);
+	children[0].message({ id: "after-stop", kind: "notification", message: "ignored" });
+	await tick();
+	assert.equal(children[0].sent.length, 5);
+	assert.ok(children[0].disconnects > 0);
+});
+
+test("AgentRunner rejects notifications from an inactive parent session with a static acknowledgement", async () => {
+	const { runner, children } = harness({ onNotification: () => false });
+	runner.run(request());
+	await tick();
+	children[0].message({ id: "n1", kind: "notification", message: "not active" });
+	await tick();
+	assert.deepEqual(children[0].sent, [{ id: "n1", kind: "ack", accepted: false, error: "task parent is not the active host session" }]);
+});
+
+test("AgentRunner retains only a 64-notification duplicate window", async () => {
+	const notifications: string[] = [];
+	const { runner, children } = harness({ onNotification: (_task, message) => { notifications.push(message); } });
+	runner.run(request());
+	await tick();
+	for (let index = 1; index <= 65; index += 1) children[0].message({ id: `n${index}`, kind: "notification", message: `message ${index}` });
+	children[0].message({ id: "n1", kind: "notification", message: "message 1 again" });
+	await tick();
+	assert.equal(notifications.length, 66, "an ID evicted from the recent 64-ack window can be admitted again");
 });
 
 test("piCommand reuses the running pi entry point and honors the override", () => {
@@ -348,22 +404,27 @@ for (const [platform, detached] of [["win32", false], ["linux", true]] as const)
 	}, { askUser: async () => ({ cancelled: true }) });
 	const task = runner.run(request({ env: { PATH: "/fixture", KEEP: "yes" } }));
 	await tick();
+	const ownedIpc = launches[0]?.options.env.GENTLE_PI_AGENTS_OWNED_IPC;
+	assert.match(ownedIpc ?? "", /^\d+-[a-z0-9]+$/, "the runner creates an opaque owned-IPC marker");
 	assert.deepEqual(launches, [{
 		command: "pi-fixture",
-		args: ["--from-host", "--mode", "rpc", "--session-dir", "/sessions", "--model", "openai-codex/gpt-5.6-terra:high", "--tools", "read,grep", "--append-system-prompt", "You map things."],
-		options: { cwd: "/repo", env: { PATH: "/fixture", KEEP: "yes", GENTLE_PI_AGENTS_CHILD: "1" }, detached },
+		args: ["--from-host", "--mode", "rpc", "--session-dir", "/sessions", "--model", "openai-codex/gpt-5.6-terra:high", "--tools", "read,grep,subagent_parent_message", "--append-system-prompt", "You map things."],
+		options: { cwd: "/repo", env: { PATH: "/fixture", KEEP: "yes", GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: ownedIpc }, detached, stdio: ["pipe", "pipe", "pipe", "ipc"] },
 	}]);
 	child.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "platform checked" }], stopReason: "stop" }] });
 	child.emit({ type: "agent_settled" });
 	assert.equal((await runner.waitFor(task.id)).status, TASK_STATUS.COMPLETED);
 });
 
-test("AgentRunner reserves a parent-owned fourth stdio fd only for package-child authorization", async () => {
+test("AgentRunner retains permission broker fd3 and assigns messaging IPC to fd4", async () => {
 	const { runner, children, spawnOptions } = harness();
 	const task = runner.run(request({ authorizeParentStandingReviewPermission: () => true }));
 	await tick();
-	assert.deepEqual(spawnOptions[0]?.stdio, ["pipe", "pipe", "pipe", "pipe"]);
-	assert.equal((spawnOptions[0] as { stdio?: string[] } | undefined)?.stdio?.length, 4);
+	const launch = spawnOptions[0];
+	assert.match(launch?.env.GENTLE_PI_AGENTS_OWNED_IPC ?? "", /^\d+-[a-z0-9]+$/, "the owned-IPC marker has the runner's opaque shape");
+	assert.deepEqual(launch?.env, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: launch?.env.GENTLE_PI_AGENTS_OWNED_IPC, GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" });
+	assert.deepEqual(launch?.stdio, ["pipe", "pipe", "pipe", "pipe", "ipc"]);
+	assert.equal(launch?.stdio?.length, 5);
 	children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "channel checked" }], stopReason: "stop" }] });
 	children[0].emit({ type: "agent_settled" });
 	assert.equal((await runner.waitFor(task.id)).status, TASK_STATUS.COMPLETED);

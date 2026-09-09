@@ -1094,13 +1094,13 @@ async function run() {
 		assert.equal(existsSync(join(globalAgentHome, "agents", "sdd-sync.md")), true);
 		assert.equal(existsSync(join(globalAgentHome, "gentle-ai", "support", "sdd-status-contract.md")), true);
 		assert.equal(existsSync(join(globalAgentHome, "chains", "sdd-full.chain.md")), true);
-		assert.equal(ctx.ui.selections.length, 0, "automatic SDD triggers must not render confirmation-only selectors");
-		assert.match(ctx.ui.notifications.at(-1).message, /Preference source: canonical default or persisted preference/);
+		assert.equal(ctx.ui.selections.length, 1, "first interactive SDD trigger confirms session suggestions");
+		assert.match(ctx.ui.notifications.at(-1).message, /Preference source: explicit session choice/);
 		assert.deepEqual(
 			await inputHook({ text: "please use sdd for this change", source: "interactive" }, ctx),
 			{ action: "continue" },
 		);
-		assert.equal(ctx.ui.selections.length, 0, "natural SDD triggers reuse preferences without prompts");
+		assert.equal(ctx.ui.selections.length, 1, "natural SDD triggers reuse confirmed session choices");
 		assert.deepEqual(
 			await inputHook({ text: "/sdd", source: "interactive" }, ctx),
 			{ action: "continue" },
@@ -1113,7 +1113,7 @@ async function run() {
 			await inputHook({ text: "/sdd:plan", source: "interactive" }, ctx),
 			{ action: "continue" },
 		);
-		assert.equal(ctx.ui.selections.length, 0, "slash SDD triggers use automatic defaults without prompts");
+		assert.equal(ctx.ui.selections.length, 1, "slash SDD triggers reuse confirmed session choices");
 
 		assert.deepEqual(
 			await inputHook({ text: "/sdd-plan this change", source: "interactive" }, ctx),
@@ -1141,14 +1141,14 @@ async function run() {
 				"global SDD model routing must be materialized in agent frontmatter, not project settings overrides",
 			);
 		}
-		assert.equal(ctx.ui.selections.length, 0, "automatic SDD routing must not render confirmation-only selectors");
-		assert.match(ctx.ui.notifications.at(-1).message, /Preference source: canonical default or persisted preference/);
+		assert.equal(ctx.ui.selections.length, 1, "automatic SDD routing reuses session confirmation");
+		assert.match(ctx.ui.notifications.at(-1).message, /Preference source: explicit session choice/);
 		await commands.get("gentle:status").handler("", ctx);
 		assert.match(ctx.ui.notifications.at(-1).message, /Global SDD assets stale: 0 file\(s\)/);
 		assert.doesNotMatch(ctx.ui.notifications.at(-1).message, /install-sdd --force/);
 
 		await inputHook({ text: "/sdd-plan another change", source: "interactive" }, ctx);
-		assert.equal(ctx.ui.selections.length, 0, "automatic preflight should remain prompt-free for the session");
+		assert.equal(ctx.ui.selections.length, 1, "resolved preflight must not prompt again in this session");
 		const promptHook = hooks.get("before_agent_start")[0];
 		const promptResult = await promptHook({ systemPrompt: "base" }, ctx);
 		assert.match(promptResult.systemPrompt, /SDD Session Preflight/);
@@ -1177,23 +1177,63 @@ async function run() {
 			});
 			assert.equal(existsSync(join(slashSddCwd, ".pi", "agents", "sdd-apply.md")), false);
 			assert.equal(existsSync(join(globalAgentHome, "agents", "sdd-apply.md")), true);
-			assert.equal(ctx.ui.selections.length, 0, `${text} should use automatic preflight without selectors`);
+			assert.equal(ctx.ui.selections.length, 1, `${text} must confirm the fresh interactive session`);
 		} finally {
 			await rm(slashSddCwd, { recursive: true, force: true });
 		}
 	}
 
+	const commandPreflightCwd = await tempWorkspace();
+	try {
+		const command = commands.get("gentle:sdd-preflight");
+		const interactive = createCtx(commandPreflightCwd, true, "explicit-command-regression");
+		await command.handler("", interactive);
+		const first = interactive.ui.selections.length;
+		await command.handler("", interactive);
+		const reused = interactive.ui.selections.length;
+		const select = interactive.ui.select;
+		interactive.ui.select = async (label, options) => {
+			const value = await select(label, options);
+			return label === "SDD execution mode" ? "interactive" : value;
+		};
+		interactive.ui.input = async () => "650";
+		await command.handler("--edit", interactive);
+		const edited = interactive.ui.selections.length;
+		await command.handler("", interactive);
+		assert.equal(interactive.ui.selections.length, edited, "edited choices also reuse without prompting");
+		const saved = JSON.parse(await readFile(join(commandPreflightCwd, ".pi", "gentle-ai", "sdd-preflight.json"), "utf8"));
+		assert.equal(saved.executionMode, "interactive");
+		assert.equal(saved.reviewBudgetLines, 650);
+		const rpc = createCtx(commandPreflightCwd, true, "explicit-command-rpc-regression");
+		rpc.mode = "rpc";
+		let rpcInputs = 0;
+		rpc.ui.input = async (_label, placeholder) => { rpcInputs += 1; return placeholder; };
+		await command.handler("", rpc);
+		await command.handler("--edit", rpc);
+		const noUi = createCtx(commandPreflightCwd, false, "explicit-command-no-ui-regression");
+		let noUiInputs = 0;
+		noUi.ui.input = async (_label, placeholder) => { noUiInputs += 1; return placeholder; };
+		await command.handler("", noUi);
+		await command.handler("--edit", noUi);
+		assert.deepEqual({ first, reused, edited, rpc: rpc.ui.selections.length, noUi: noUi.ui.selections.length },
+			{ first: 1, reused: 1, edited: 3, rpc: 0, noUi: 0 },
+			"explicit command confirms once, reuses unless --edit, and never prompts headless callers");
+		assert.deepEqual({ rpcInputs, noUiInputs }, { rpcInputs: 0, noUiInputs: 0 });
+	} finally {
+		await rm(commandPreflightCwd, { recursive: true, force: true });
+	}
+
 	const commandSddCwd = await tempWorkspace();
 	try {
 		const ctx = createCtx(commandSddCwd, true, "command-session");
-		await commands.get("gentle:sdd-preflight").handler("", ctx);
+		await commands.get("gentle:sdd-preflight").handler("--edit", ctx);
 		assert.equal(existsSync(join(commandSddCwd, ".pi", "agents", "sdd-apply.md")), false);
 		assert.equal(existsSync(join(globalAgentHome, "agents", "sdd-apply.md")), true);
 		assert.equal(ctx.ui.selections.length, 2, "explicit preflight prompts intentional choice fields");
 		assert.equal(ctx.ui.selections.some(({ label }) => label === "SDD artifact store"), false, "one-option artifact store must be elided");
 		assert.match(ctx.ui.notifications.at(-1).message, /Preference source: explicit session choice/);
-		await commands.get("gentle:sdd-preflight").handler("", ctx);
-		assert.equal(ctx.ui.selections.length, 4, "explicit preflight remains an intentional re-prompt");
+		await commands.get("gentle:sdd-preflight").handler("--edit", ctx);
+		assert.equal(ctx.ui.selections.length, 4, "--edit remains an intentional re-prompt");
 	} finally {
 		await rm(commandSddCwd, { recursive: true, force: true });
 	}
@@ -1212,7 +1252,7 @@ async function run() {
 		assert.equal(existsSync(join(sddAgentGuardCwd, ".pi", "chains", "sdd-full.chain.md")), false);
 		assert.equal(existsSync(join(globalAgentHome, "agents", "sdd-apply.md")), true);
 		assert.equal(existsSync(join(globalAgentHome, "chains", "sdd-full.chain.md")), true);
-		assert.equal(ctx.ui.selections.length, 0, "automatic SDD-agent startup must not render selectors");
+		assert.equal(ctx.ui.selections.length, 1, "fresh interactive SDD-agent startup requires confirmation");
 		assert.match(promptResult.systemPrompt, /SDD Session Preflight/);
 		assert.doesNotMatch(
 			promptResult.systemPrompt,
@@ -1233,7 +1273,7 @@ async function run() {
 			},
 			ctx,
 		);
-		assert.equal(ctx.ui.selections.length, 0, "SDD-agent startup should reuse automatic preferences");
+		assert.equal(ctx.ui.selections.length, 1, "SDD-agent startup reuses confirmed session preferences");
 		assert.doesNotMatch(
 			reusedPromptResult.systemPrompt,
 			/el Gentleman Identity and Harness/,
@@ -1241,6 +1281,21 @@ async function run() {
 		);
 	} finally {
 		await rm(sddAgentGuardCwd, { recursive: true, force: true });
+	}
+
+	const unresolvedSddCwd = await tempWorkspace();
+	try {
+		const ctx = createCtx(unresolvedSddCwd, true, "unresolved-preflight-session");
+		ctx.ui.select = async () => undefined;
+		assert.deepEqual(await hooks.get("input")[0]({ text: "/sdd", source: "interactive" }, ctx), { action: "handled" });
+		const result = await hooks.get("before_agent_start")[0]({ agentName: "sdd-explore", systemPrompt: "SDD executor" }, ctx);
+		assert.match(result.systemPrompt, /SDD preflight unresolved/);
+		assert.match(result.systemPrompt, /STOP: Do not initialize/);
+		assert.doesNotMatch(result.systemPrompt, /## SDD Session Preflight/);
+		assert.equal(existsSync(join(unresolvedSddCwd, "openspec", "config.yaml")), false);
+		assert.equal(existsSync(join(unresolvedSddCwd, ".pi", "gentle-ai", "sdd-preflight.json")), false);
+	} finally {
+		await rm(unresolvedSddCwd, { recursive: true, force: true });
 	}
 
 	const noUiSddAgentCwd = await tempWorkspace();
@@ -1280,7 +1335,7 @@ async function run() {
 	try {
 		pi.setActiveTools(["read", "bash", "edit", "write", "mem_save"]);
 		const ctx = createCtx(engramSddCwd, true, "engram-session");
-		await commands.get("gentle:sdd-preflight").handler("", ctx);
+		await commands.get("gentle:sdd-preflight").handler("--edit", ctx);
 		assert.deepEqual(ctx.ui.selections[1].options, ["openspec", "engram", "hybrid"]);
 	} finally {
 		pi.setActiveTools(["read", "bash", "edit", "write"]);
@@ -1297,7 +1352,7 @@ async function run() {
 			if (label === "SDD artifact store") return "engram";
 			return options[0];
 		};
-		await commands.get("gentle:sdd-preflight").handler("", ctx);
+		await commands.get("gentle:sdd-preflight").handler("--edit", ctx);
 		await commands.get("gentle-sdd-init").handler("", ctx);
 		assert.equal(
 			existsSync(join(engramSddInitCwd, "openspec")),
@@ -1335,7 +1390,7 @@ async function run() {
 			if (label === "SDD artifact store") return "hybrid";
 			return options[0];
 		};
-		await commands.get("gentle:sdd-preflight").handler("", ctx);
+		await commands.get("gentle:sdd-preflight").handler("--edit", ctx);
 		await commands.get("gentle-sdd-init").handler("", ctx);
 		assert.equal(
 			existsSync(join(bothSddInitCwd, "openspec", "specs")),
@@ -1426,12 +1481,20 @@ async function run() {
 		assert.equal(existsSync(join(globalAgentHome, "agents", "sdd-sync.md")), true);
 		assert.equal(existsSync(join(globalAgentHome, "gentle-ai", "support", "sdd-status-contract.md")), true);
 		assert.equal(existsSync(join(globalAgentHome, "chains", "sdd-full.chain.md")), true);
-		assert.equal(ctx.ui.selections.length, 0, "sdd-init uses automatic preflight defaults");
-		assert.match(ctx.ui.notifications[0].message, /SDD preflight complete/);
+		assert.equal(ctx.ui.selections.length, 1, "sdd-init confirms session preflight before project initialization");
+		assert.match(ctx.ui.notifications[1].message, /SDD preflight complete/);
 		assert.match(ctx.ui.notifications.at(-1).message, /Wrote openspec\/config\.yaml/);
+		const initializedConfig = await readFile(join(sddCwd, "openspec", "config.yaml"), "utf8");
+		const explore = await hooks.get("before_agent_start")[0]({ agentName: "sdd-explore", systemPrompt: "You are the SDD explore executor for Gentle AI." }, ctx);
+		assert.match(explore.systemPrompt, /explicit current-session choices/);
+		assert.equal(ctx.ui.selections.length, 1, "confirmation -> sdd-init -> explore must reuse the resolved preflight");
+		const nextSession = createCtx(sddCwd, true, "cold-start-with-saved-preferences");
+		await hooks.get("input")[0]({ text: "/sdd", source: "interactive" }, nextSession);
+		assert.equal(nextSession.ui.selections.length, 1, "saved preferences still require confirmation in a new session");
+		assert.equal(await readFile(join(sddCwd, "openspec", "config.yaml"), "utf8"), initializedConfig, "new session confirmation must not reset project initialization");
 
-		await commands.get("gentle:sdd-preflight").handler("", ctx);
-		assert.equal(ctx.ui.selections.length, 2, "explicit preflight prompts after automatic sdd-init");
+		await commands.get("gentle:sdd-preflight").handler("--edit", ctx);
+		assert.equal(ctx.ui.selections.length, 3, "--edit permits changes after confirmed sdd-init");
 	} finally {
 		await rm(sddCwd, { recursive: true, force: true });
 	}
@@ -1446,9 +1509,9 @@ async function run() {
 		await writeFile(globalModelsPath, "{ invalid json");
 		const ctx = createCtx(invalidSddInitCwd, true, "invalid-sdd-init-session");
 		await commands.get("gentle-sdd-init").handler("", ctx);
-		assert.equal(ctx.ui.notifications[0].level, "warning");
-		assert.match(ctx.ui.notifications[0].message, /Model routing skipped:/);
-		assert.match(ctx.ui.notifications[0].message, /models\.json/);
+		assert.equal(ctx.ui.notifications[1].level, "warning");
+		assert.match(ctx.ui.notifications[1].message, /Model routing skipped:/);
+		assert.match(ctx.ui.notifications[1].message, /models\.json/);
 		assert.match(ctx.ui.notifications.at(-1).message, /Wrote openspec\/config\.yaml/);
 		const preservedAgent = await readFile(
 			join(invalidSddInitCwd, ".pi", "agents", "sdd-apply.md"),

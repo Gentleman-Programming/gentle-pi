@@ -11,15 +11,18 @@ import { sidebarPart } from "../lib/shell-sidebar.ts";
 import { AGENT_MODE, discoverAgents, loadAgentsConfig, resolveAgentProfile, type AgentDefinition, type AgentMode } from "../lib/agents-config.ts";
 import { isFinished, TASK_STATUS, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
 import { AgentRunner, piCommand, type AskAnswer, type RunnerDeps, type TaskRequest } from "../lib/agents-runner.ts";
+import { ChildMessenger, type IpcEndpoint } from "../lib/agents-messaging.ts";
 import { hasReviewSessionPermission, resolveCanonicalGitRepositoryIdentitySync, type ReviewSessionManager } from "../lib/review-session-standing-permission.ts";
-import { historyDir, loadHistory, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
+import { historyDir, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
 import { sessionToMarkdown } from "../lib/agents-transcript.ts";
 import { AgentsView } from "../lib/agents-view.ts";
+import { PresencePublisher } from "../lib/orchestrator-presence.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
 import { AGENTS_GLYPH, renderAgentsCard, widgetExpiryMs, widgetRows } from "../lib/agents-widget.ts";
 import { CARD_TONE, renderCard } from "../lib/shell-card.ts";
 import { openInExternalEditor } from "./gentle-shell.ts";
 import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
+import { researchAgent, resolveResearchCapabilities, renderResearchCapabilities, RESEARCH_CHILD_TOOLS_ENV } from "../lib/sdd-research-capabilities.ts";
 
 // Gentle Agents: subagents as isolated `pi --mode rpc` children, a task
 // store that notifies per task, and a Gentle Shell card above the editor.
@@ -29,6 +32,7 @@ import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
 export const AGENTS_WIDGET_KEY = "gentle-agents";
 export const AGENTS_COMMAND_NAME = "gentle:agents";
 export const AGENTS_RESULT_TYPE = "gentle-agents.result";
+export const AGENTS_MESSAGE_TYPE = "gentle-agents.message";
 const COLLAPSE_KEY_DEFAULT = "ctrl+shift+a";
 const VIEW_KEY_DEFAULT = "alt+a";
 const STOP_KEY_DEFAULT = "alt+s";
@@ -39,6 +43,7 @@ const TOOL_PREFIX = "subagent_";
 export interface AgentsDeps extends RunnerDeps {
 	home: string;
 	agentHome?: string;
+	childIpc?: IpcEndpoint;
 	env: NodeJS.ProcessEnv;
 	resolveWorktree: WorktreeResolver;
 }
@@ -51,6 +56,7 @@ export function agentRuntimePaths(home: string, agentHome = join(home, ".pi", "a
 interface ToolText {
 	content: Array<{ type: "text"; text: string }>;
 	details: Record<string, unknown>;
+	terminate?: boolean;
 }
 
 const defaultDeps = (env: NodeJS.ProcessEnv): AgentsDeps => ({
@@ -110,8 +116,44 @@ export function agentsStopKey(env: NodeJS.ProcessEnv = process.env): string | un
 	return value === "" || value.toLowerCase() === "off" ? undefined : value;
 }
 
-function text(value: string, details: Record<string, unknown> = {}): ToolText {
-	return { content: [{ type: "text", text: value }], details };
+function sanitizeTerminalText(value: string): string {
+	return value.replace(/[\x00-\x08\x0B-\x1F\x7F-\x9F]/g, (control) => `\\x${control.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`);
+}
+
+function messageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content.map((part) => part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string" ? (part as { text: string }).text : "").join("\n");
+}
+
+function ownedChildIpc(env: NodeJS.ProcessEnv, candidate: IpcEndpoint | undefined): IpcEndpoint | undefined {
+	if (env.GENTLE_PI_AGENTS_CHILD !== "1" || !env.GENTLE_PI_AGENTS_OWNED_IPC || !candidate || typeof candidate.send !== "function" || typeof candidate.on !== "function") return undefined;
+	return candidate;
+}
+
+function registerChildMessaging(pi: ExtensionAPI, ipc: IpcEndpoint): void {
+	const messenger = new ChildMessenger(ipc);
+	pi.registerTool({
+		name: "subagent_parent_message",
+		label: "Agent parent message",
+		description: "Send a bounded notification or correlated query to this subagent's parent.",
+		parameters: { type: "object", additionalProperties: false, required: ["message"], properties: { kind: { type: "string", enum: ["notification", "query"] }, message: { type: "string" } } } as never,
+		async execute(_id, params) {
+			const input = params as { kind?: unknown; message?: unknown };
+			if (typeof input.message !== "string") throw new Error("parent messages require text");
+			if (input.kind === undefined || input.kind === "notification") {
+				await messenger.notify(input.message);
+				return { content: [{ type: "text", text: "Notification accepted by the parent." }], details: {} };
+			}
+			if (input.kind !== "query") throw new Error("parent messages require notification or query kind");
+			const reply = await messenger.query(input.message);
+			return { content: [{ type: "text", text: reply }], details: { reply } };
+		},
+	});
+}
+
+function text(value: string, details: Record<string, unknown> = {}, terminate = false): ToolText {
+	return { content: [{ type: "text", text: value }], details, ...(terminate ? { terminate: true } : {}) };
 }
 
 function taskDetails(task: TaskRecord): Record<string, unknown> {
@@ -173,6 +215,24 @@ export async function answerThroughUi(ui: ExtensionContext["ui"] | undefined, as
 }
 
 export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env, overrides: Partial<AgentsDeps> = {}): void {
+	if (env.GENTLE_PI_AGENTS_CHILD === "1" && env[RESEARCH_CHILD_TOOLS_ENV] !== undefined) {
+		let allowed: string[] = [];
+		try {
+			const parsed: unknown = JSON.parse(env[RESEARCH_CHILD_TOOLS_ENV]!);
+			if (Array.isArray(parsed) && parsed.every(value => typeof value === "string")) allowed = parsed;
+		} catch { /* Invalid launch restrictions deny every tool. */ }
+		pi.on("before_agent_start", event => ({ systemPrompt: `${event.systemPrompt}\n\n${renderResearchCapabilities(resolveResearchCapabilities(pi, allowed))}` }));
+		pi.on("tool_call", event => {
+			if (!allowed.includes(event.toolName) || !pi.getActiveTools().includes(event.toolName)) {
+				return { block: true, reason: "Tool is outside the research child's active launch allowlist." };
+			}
+		});
+	}
+	const childIpc = ownedChildIpc(env, overrides.childIpc ?? (process.send ? process as unknown as IpcEndpoint : undefined));
+	if (env.GENTLE_PI_AGENTS_CHILD === "1") {
+		if (childIpc) registerChildMessaging(pi, childIpc);
+		return;
+	}
 	if (!agentsEnabled(env)) return;
 	const deps: AgentsDeps = { ...defaultDeps(env), ...overrides };
 	const selectedHome = overrides.agentHome ?? (overrides.home === undefined ? resolveGentlePiAgentHome(deps.env) : join(deps.home, ".pi", "agent"));
@@ -192,10 +252,23 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const viewKey = agentsViewKey(env);
 	const stopKey = agentsStopKey(env);
 	const store = new TaskStore();
+	const restoredTaskIds = new Set<string>();
 	const tasksDir = historyDir(deps.home, agentHome);
 	let ui: ExtensionContext["ui"] | undefined;
 	let host: { requestRender(): void } | undefined;
 	let sessions: ExtensionContext["sessionManager"] | undefined;
+	let presence: PresencePublisher | undefined;
+	const overlays = new Set<AgentsView>();
+	const publishActivity = () => {
+		if (!sessions) return;
+		try {
+			if (!presence || presence.error) {
+				presence = PresencePublisher.start({ profile: agentHome, sessionId: activeSessionId() ?? "",
+					label: sessions.getSessionName?.() || sessions.getCwd().split(/[\\/]/).pop() || "Orchestrator", activity: [] });
+			}
+			presence?.update(store.list(activeSessionId()).filter((task) => !isFinished(task.status) && !restoredTaskIds.has(task.id)).map((task) => ({ task, thread: store.thread(task.id) })));
+		} catch { presence?.dispose(); presence = undefined; }
+	};
 	let worktrees: SessionWorktreeRegistry | undefined;
 	const registryFor = (ctx: ExtensionContext) => {
 		if (!worktrees || worktrees.sessionId !== ctx.sessionManager.getSessionId()) {
@@ -209,6 +282,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	let cancelClock: (() => void) | undefined;
 	const ownedTaskIds = new Set<string>();
 	const stoppingTaskIds = new Set<string>();
+	const yieldedTaskIds = new Set<string>();
 	let stopAllConfirmation: Promise<void> | undefined;
 
 	// The card and its clock follow the session pi has open right now; a task
@@ -232,6 +306,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const tickClock = () => {
 		cancelClock?.();
 		cancelClock = undefined;
+		if (!sessions) return;
 		const tasks = visibleTasks();
 		if (tasks.some((task) => !isFinished(task.status))) {
 			cancelClock = deps.schedule(() => {
@@ -264,6 +339,23 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 
 	const runner = new AgentRunner(store, loadAgentsConfig({ cwd: process.cwd(), home: deps.home, agentHome }), deps, {
 		askUser: (_taskId, ask, raw) => answerThroughUi(ui, ask, raw),
+		onNotification: (task, message) => {
+			if (activeSessionId() !== task.parentSessionId) return false;
+			pi.sendMessage({ customType: AGENTS_MESSAGE_TYPE, content: message, display: true, details: { gentleAgents: { taskId: task.id, agent: task.agent, parentSessionId: task.parentSessionId, kind: "notification" } } }, { deliverAs: "followUp", triggerTurn: true });
+			return true;
+		},
+		onQuery: (task, requestId, message) => {
+			if (activeSessionId() !== task.parentSessionId) return false;
+			const hadYield = yieldedTaskIds.has(task.id);
+			if (task.mode === AGENT_MODE.TASK) yieldedTaskIds.add(task.id);
+			try {
+				pi.sendMessage({ customType: AGENTS_MESSAGE_TYPE, content: `Subagent ${task.agent} asks:\nTask ID: ${task.id}\nRequest ID: ${requestId}\nQuestion: ${message}`, display: true, details: { gentleAgents: { taskId: task.id, agent: task.agent, parentSessionId: task.parentSessionId, requestId, kind: "query" } } }, { deliverAs: "followUp", triggerTurn: true });
+				return true;
+			} catch (error) {
+				if (task.mode === AGENT_MODE.TASK && !hadYield) yieldedTaskIds.delete(task.id);
+				throw error;
+			}
+		},
 		onSuccessfulMutation: (task, tool) => {
 			if (!sessions || !worktrees || task.parentSessionId !== activeSessionId() || !ownedTaskIds.has(task.id)) return;
 			const root = deps.resolveWorktree(tool.path, task.cwd)?.root;
@@ -275,8 +367,18 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			ownedTaskIds.delete(task.id);
 			requestRender();
 			persist(task);
-			if (task.mode === AGENT_MODE.BACKGROUND && task.status !== TASK_STATUS.CANCELLED) deliver(task);
+			const yielded = yieldedTaskIds.delete(task.id);
+			if ((task.mode === AGENT_MODE.BACKGROUND && task.status !== TASK_STATUS.CANCELLED) || (yielded && task.status !== TASK_STATUS.CANCELLED && activeSessionId() === task.parentSessionId)) deliver(task);
 		},
+	});
+
+	pi.registerMessageRenderer(AGENTS_MESSAGE_TYPE, (message, options, theme) => {
+		const details = (message.details as { gentleAgents?: { taskId?: unknown; agent?: unknown } } | undefined)?.gentleAgents;
+		const taskId = typeof details?.taskId === "string" ? details.taskId : "unknown";
+		const agent = typeof details?.agent === "string" ? details.agent : "Subagent";
+		const heading = `${sanitizeTerminalText(agent)} message · Task ${sanitizeTerminalText(taskId)}`;
+		const body = sanitizeTerminalText(messageText(message.content));
+		return new Text(`${theme.fg("customMessageLabel", heading)}\n${theme.fg("customMessageText", body)}`, options.outputPad, 0);
 	});
 
 	pi.registerMessageRenderer(AGENTS_RESULT_TYPE, (message, options, theme) => {
@@ -347,13 +449,19 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const live = store.get(id);
 		if (live) return live;
 		const stored = await loadStoredTask(tasksDir, id);
-		if (stored) store.restore(stored.task, stored.thread);
+		if (stored) {
+			restoredTaskIds.add(stored.task.id);
+			store.restore(stored.task, stored.thread);
+		}
 		return stored?.task;
 	};
 
 	const openOverlay = async (ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
-		for (const stored of await loadHistory(tasksDir)) store.restore(stored.task, stored.thread);
+		if (ctx.mode !== "tui") {
+			ctx.ui.notify("The agents overlay requires TUI mode.", "warning");
+			return;
+		}
 		let view: AgentsView | undefined;
 		let overlayHost: { requestRender(force?: boolean): void; stop(): void; start(): void } | undefined;
 		const chosen = await ctx.ui.custom<TaskRecord | null>(
@@ -364,13 +472,19 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 					rows: () => Math.max(0, tui.terminal.rows),
 					store,
 					sessionId: ctx.sessionManager.getSessionId() ?? "",
+					presence: {
+						profile: agentHome,
+						get target() { return presence?.target; },
+					},
 					now: () => deps.now(),
 					onCancel: (task) => void stopSelected(task, ctx),
 					canCancel: isOwnedActive,
+					isLocalTask: (task) => !restoredTaskIds.has(task.id),
 					onOpen: (task) => done(task),
 					onClose: () => done(null),
 					requestRender: () => tui.requestRender(),
 				});
+				overlays.add(view);
 				const interaction = createNativeFullscreenInteraction({
 					keyboardTarget: view,
 					requestRender: () => tui.requestRender(),
@@ -380,8 +494,10 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				return interaction;
 			},
 			{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", margin: 0, anchor: "center" } },
-		);
-		view?.dispose();
+		).finally(() => {
+			view?.dispose();
+			if (view) overlays.delete(view);
+		});
 		if (!chosen || !overlayHost) return;
 		if (!chosen.sessionPath) {
 			ctx.ui.notify("This task has no session file yet.", "warning");
@@ -409,6 +525,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	// A status change is worth a frame right away; deltas inside a task are
 	// coalesced so a chatty child cannot flood the terminal.
 	store.subscribeSummary(() => {
+		publishActivity();
 		host?.requestRender();
 		tickClock();
 	});
@@ -444,6 +561,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const target = workspaceRoot !== undefined && !sameNonGitContinuation ? registry.validate(workspaceRoot) : parentIdentity?.root;
 		const config = loadAgentsConfig(roots(ctx));
 		const profile = resolveAgentProfile(agent, config);
+		const research = agent.name === "sdd-research" ? researchAgent(agent, pi) : undefined;
 		const sessionDir = agentRuntimePaths(deps.home, agentHome).sessions;
 		mkdirSync(sessionDir, { recursive: true });
 		const parentSessionManager = ctx.sessionManager as unknown as ReviewSessionManager;
@@ -451,7 +569,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const parentWorktreeRoot = ctx.sessionManager.getCwd();
 		const parentRepositoryIdentity = resolveCanonicalGitRepositoryIdentitySync(parentWorktreeRoot);
 		return {
-			agent,
+			agent: research?.agent ?? agent,
 			prompt,
 			label,
 			context,
@@ -463,7 +581,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			thinking: profile.thinking,
 			sessionDir,
 			resumeSessionPath: resume,
-			env: deps.env,
+			env: research ? { ...deps.env, [RESEARCH_CHILD_TOOLS_ENV]: JSON.stringify(research.agent.tools) } : deps.env,
 			...(parentRepositoryIdentity === undefined ? {} : {
 				authorizeParentStandingReviewPermission: (repositoryIdentity: string) => {
 					try {
@@ -487,8 +605,13 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const launch = async (ctx: ExtensionContext, request: TaskRequest): Promise<ToolText> => {
 		const task = runner.run(request);
 		ownedTaskIds.add(task.id);
-		store.subscribe(task.id, () => requestRender());
+		store.subscribe(task.id, () => { publishActivity(); requestRender(); });
 		if (request.mode === AGENT_MODE.BACKGROUND) return text(`Started ${task.agent} in the background as task ${task.id}. Use subagent_status or subagent_result with that id.`, taskDetails(task));
+		const query = await runner.waitForQuery(task.id);
+		if (query) {
+			const live = store.get(task.id) ?? task;
+			return text(`Subagent ${live.agent} is waiting for your reply to request ${query.requestId}.`, { gentleAgents: { taskId: live.id, agent: live.agent, status: live.status, mode: live.mode, requestId: query.requestId } }, true);
+		}
 		const finished = await runner.waitFor(task.id);
 		return text(finishedText(finished), taskDetails(finished));
 	};
@@ -560,7 +683,12 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		return text(tasks.length === 0 ? "No subagent tasks in this session." : tasks.map(describeTask).join("\n"));
 	});
 
-	tool("cancel", "Cancel a queued or running subagent task.", { required: ["task_id"], properties: { task_id: { type: "string" } } }, async (params) => {
+	tool("reply", "Reply once to a live query from a child of the current parent session.", { required: ["task_id", "request_id", "message"], properties: { task_id: { type: "string" }, request_id: { type: "string" }, message: { type: "string" } } }, async (params, ctx) => {
+		const accepted = await runner.reply(String(params.task_id), String(params.request_id), typeof params.message === "string" ? params.message : "", ctx.sessionManager.getSessionId() ?? "");
+		return accepted ? text("Reply accepted for delivery.") : text("Error: query is unavailable.", { error: "query unavailable" });
+	});
+
+	tool("cancel",  "Cancel a queued or running subagent task.", { required: ["task_id"], properties: { task_id: { type: "string" } } }, async (params) => {
 		const id = String(params.task_id);
 		return runner.cancel(id) ? text(`Cancelled task ${id}.`) : text(`Error: task ${id} is not running.`, { error: "not running" });
 	});
@@ -596,7 +724,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	}
 
 	pi.registerCommand(AGENTS_COMMAND_NAME, {
-		description: "Show this session's subagents with their threads; a widens the list to every session. Press o to open a task's session in $EDITOR.",
+		description: "Show this session's active subagents; a lists open orchestrators in this profile. Peer threads are read-only; o opens a local task's transcript in $EDITOR.",
 		handler: async (_args, ctx) => openOverlay(ctx),
 	});
 	if (viewKey) {
@@ -612,8 +740,22 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		});
 	}
 
-	pi.on("session_start", (_event, ctx) => { registryFor(ctx); showWidget(ctx); });
+	pi.on("session_start", (_event, ctx) => {
+		presence?.dispose();
+		registryFor(ctx);
+		showWidget(ctx);
+		try {
+			presence = PresencePublisher.start({ profile: agentHome, sessionId: activeSessionId() ?? "",
+				label: ctx.sessionManager.getSessionName?.() || ctx.sessionManager.getCwd().split(/[\\/]/).pop() || "Orchestrator", activity: [] });
+			publishActivity();
+		} catch { presence = undefined; }
+	});
 	pi.on("session_shutdown", () => {
+		presence?.dispose();
+		presence = undefined;
+		cancelClock?.();
+		for (const view of overlays) { view.handleInput("q"); view.dispose(); }
+		overlays.clear();
 		sessions = undefined;
 		worktrees?.close();
 		worktrees = undefined;
