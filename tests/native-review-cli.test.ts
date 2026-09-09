@@ -12,6 +12,7 @@ import {
 	NativeReviewCliError,
 	NativeReviewCliV216,
 	createNodeExecFileAdapter,
+	isNativeReviewUnachievableVerbRefused,
 	type ExecFileAdapter,
 } from "../lib/native-review-cli.ts";
 
@@ -131,6 +132,74 @@ test("provider-owned refuter and targeted-validator vectors accept only their ma
 		() => client(queuedAdapter([]).adapter).captureProviderRole({ captureOperation: "review.capture-result", argumentTokens: ["--agent=pi"], cwd: "/repo" }),
 		/CAPTURE_PROVIDER_ROLE supports only/,
 	);
+});
+
+// gentle-pi#638: the host relay's deterministic-failure exit declares the
+// bound slot unachievable through the native verb instead of leaving the
+// operator to re-spend an identical reviewer run. The invocation names the
+// slot's frozen binding fields (--lineage/--target/--expected-revision/
+// --request-hash), the machine-readable --reason, an optional bounded
+// --detail, and the opaque --repository-context the slot carried; Go
+// verifies all of them against the frozen authority before recording
+// anything (internal/cli/review_capture_unachievable.go).
+const UNACHIEVABLE_TARGET = `sha256:${"1".repeat(64)}`;
+const UNACHIEVABLE_REVISION = `sha256:${"3".repeat(64)}`;
+const UNACHIEVABLE_REQUEST_HASH = `sha256:${"0".repeat(64)}`;
+const UNACHIEVABLE_ARTIFACT = { schema: "gentle-ai.review-capture-unachievable/v1", lineage_id: "relay-lineage", target_identity: UNACHIEVABLE_TARGET, lens: "review-reliability", selected_order: 0, reason: "relay_transport_bound_exceeded", recorded: true };
+function unachievableRequest(cwd = "/repo") {
+	return { cwd, lineageId: "relay-lineage", targetIdentity: UNACHIEVABLE_TARGET, expectedRevision: UNACHIEVABLE_REVISION, requestHash: UNACHIEVABLE_REQUEST_HASH, reason: "relay_transport_bound_exceeded" };
+}
+
+test("capture-unachievable declares the exact slot binding and decodes its recorded artifact", async () => {
+	const queue = queuedAdapter([{ stdout: JSON.stringify(UNACHIEVABLE_ARTIFACT) }]);
+	const result = await client(queue.adapter).captureUnachievableLens({ ...unachievableRequest(), detail: "killed after 2256004ms against a 2256000ms relay bound", repositoryContext: "rctx1_" + "e".repeat(64) });
+	assert.deepEqual(result, { schema: "gentle-ai.review-capture-unachievable/v1", lineageId: "relay-lineage", targetIdentity: UNACHIEVABLE_TARGET, lens: "review-reliability", selectedOrder: 0, reason: "relay_transport_bound_exceeded", recorded: true });
+	assert.deepEqual(queue.calls[0]?.arguments, ["review", "capture-unachievable", "--lineage", "relay-lineage", "--target", UNACHIEVABLE_TARGET, "--expected-revision", UNACHIEVABLE_REVISION, "--request-hash", UNACHIEVABLE_REQUEST_HASH, "--reason", "relay_transport_bound_exceeded", "--detail", "killed after 2256004ms against a 2256000ms relay bound", "--repository-context", "rctx1_" + "e".repeat(64), "--cwd", "/repo"]);
+	assert.equal(queue.calls[0]?.timeoutMs, undefined, "the mutating declaration runs without the read-only negotiation timeout");
+
+	// the optional detail and repository context are genuinely optional
+	const bare = queuedAdapter([{ stdout: JSON.stringify(UNACHIEVABLE_ARTIFACT) }]);
+	await client(bare.adapter).captureUnachievableLens(unachievableRequest());
+	assert.deepEqual(bare.calls[0]?.arguments, ["review", "capture-unachievable", "--lineage", "relay-lineage", "--target", UNACHIEVABLE_TARGET, "--expected-revision", UNACHIEVABLE_REVISION, "--request-hash", UNACHIEVABLE_REQUEST_HASH, "--reason", "relay_transport_bound_exceeded", "--cwd", "/repo"]);
+});
+
+test("capture-unachievable validates its request and artifact shape before and after the invocation", async () => {
+	for (const request of [
+		{ ...unachievableRequest(), lineageId: "" },
+		{ ...unachievableRequest(), targetIdentity: "not-a-sha" },
+		{ ...unachievableRequest(), expectedRevision: " " },
+		{ ...unachievableRequest(), requestHash: "sha256:short" },
+		{ ...unachievableRequest(), reason: "" },
+		{ ...unachievableRequest(), detail: "x".repeat(513) },
+		{ ...unachievableRequest(), repositoryContext: "no\u0000context" },
+	]) {
+		const queue = queuedAdapter([]);
+		await assert.rejects(() => client(queue.adapter).captureUnachievableLens(request), TypeError);
+		assert.equal(queue.calls.length, 0, "a malformed declaration is refused before any process launches");
+	}
+
+	for (const artifact of [
+		{ ...UNACHIEVABLE_ARTIFACT, schema: "gentle-ai.review-capture-unachievable/v2" },
+		{ ...UNACHIEVABLE_ARTIFACT, recorded: false },
+		{ ...UNACHIEVABLE_ARTIFACT, selected_order: -1 },
+	]) {
+		const queue = queuedAdapter([{ stdout: JSON.stringify(artifact) }]);
+		await assert.rejects(() => client(queue.adapter).captureUnachievableLens(unachievableRequest()));
+		assert.equal(queue.calls.length, 1);
+	}
+});
+
+test("an older binary's unknown-verb refusal classifies as a capability signal, not a capture failure", async () => {
+	const queue = queuedAdapter([{ stdout: "", stderr: 'Error: unknown review command "capture-unachievable"\n', exitCode: 1 }]);
+	const error = await client(queue.adapter).captureUnachievableLens(unachievableRequest()).then(() => undefined, (caught: unknown) => caught);
+	assert.ok(error instanceof NativeReviewCliError, "an empty-stdout refusal rejects with the typed CLI error carrying stderr diagnostics");
+	assert.equal(isNativeReviewUnachievableVerbRefused(error), true);
+
+	// Every other stderr — a typed binding-mismatch refusal, a timeout, or a
+	// clean run — is a real outcome, never a capability signal.
+	assert.equal(isNativeReviewUnachievableVerbRefused(new Error('unknown review command "capture-unachievable"')), false, "only the captured native stderr classifies");
+	const typedRefusal = new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, "review/capture-unachievable", true, true, "native capture-unachievable refused", { operation: "review/capture-unachievable", error_code: NATIVE_REVIEW_ERROR_CODE.NON_ZERO, exit_code: 1, timed_out: false, output_limit_exceeded: false, stderr: "Error: review capture-unachievable binding does not match the current reviewing authority [invalid_request]" });
+	assert.equal(isNativeReviewUnachievableVerbRefused(typedRefusal), false);
 });
 
 test("malformed closure output remains a typed schema failure and never authorizes a retry", async () => {

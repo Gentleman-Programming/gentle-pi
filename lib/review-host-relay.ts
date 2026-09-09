@@ -141,6 +141,46 @@ export function classifyReviewHostRelayRefusal(stderr: string): "unknown-flag" |
 }
 
 // ---------------------------------------------------------------------------
+// gentle-pi#638: the two relay failure classes that are deterministic for the
+// slot — the reviewer cannot complete under current conditions and a
+// byte-identical relaunch cannot change the outcome. Only these two may be
+// declared unachievable through the native capture-unachievable verb:
+//
+//   pi-timed-out                the reviewer was killed by the relay bound
+//                               scaled from the materialized prompt bytes (the
+//                               gentle-pi#367 surface); relaunching the same
+//                               slot reaches the same wall.
+//   submission-refused (none)   the provider refused the lens context at
+//                               admission with its typed [invalid_request]
+//                               refusal and stated the slot was not consumed
+//                               (gentle-pi#522 / #524); the refused bytes,
+//                               not transport, are the problem.
+//
+// Every other class — launch and materialize failures, empty output, and
+// any submission whose mutation outcome is genuinely unknown — stays
+// transient and keeps the relaunch-once behavior.
+// ---------------------------------------------------------------------------
+
+export const REVIEW_HOST_RELAY_UNACHIEVABLE_REASON = {
+	PI_TIMED_OUT: "relay_transport_bound_exceeded",
+	ADMISSION_REFUSED: "lens_admission_refused",
+} as const;
+
+export function reviewHostRelayUnachievableReason(error: ReviewHostRelayError): string | undefined {
+	if (error.kind === REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT) return REVIEW_HOST_RELAY_UNACHIEVABLE_REASON.PI_TIMED_OUT;
+	if (error.kind === REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED && error.mutationOutcome === "none") return REVIEW_HOST_RELAY_UNACHIEVABLE_REASON.ADMISSION_REFUSED;
+	return undefined;
+}
+
+// Optional bounded evidence for the declaration's --detail. Only the killed reviewer carries measurements worth recording; an admission refusal's text already rides failure.stderr, and unmeasured failures never get a fabricated detail.
+export function reviewHostRelayUnachievableDetail(error: ReviewHostRelayError): string | undefined {
+	if (error.kind === REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT && error.elapsedMs !== null && error.timeoutMs !== null) {
+		return `killed after ${error.elapsedMs}ms against a ${error.timeoutMs}ms relay bound`;
+	}
+	return undefined;
+}
+
+// ---------------------------------------------------------------------------
 // Slot detection — the provider decides. A collect input routes through the
 // host relay ONLY when the provider itself issued the `--materialize` token
 // (with the pi runtime identity) on a `review.capture-result` collection

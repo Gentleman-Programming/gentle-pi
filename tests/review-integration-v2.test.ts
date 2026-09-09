@@ -478,6 +478,74 @@ test("next_transition stop decodes a managed_assets_outdated continuation and re
 	assert.equal(plainStop.continuation, undefined);
 });
 
+// gentle-pi#638: after the host relay declares a selected lens slot
+// unachievable through the native capture-unachievable verb, gentle-ai's
+// STATUS stops with reason_code unachievable_lens_slot and carries one entry
+// per declared slot, each naming the complete withdraw command
+// (contracts/review-integration/v2/schemas/status-v7.schema.json, the stop
+// variant). A restart that never saw the collect offer must still be able to
+// retract the declaration from the stop alone, so the withdraw binding is
+// decoded, never dropped.
+function unachievableSlot(overrides: Partial<JsonObject> = {}): JsonObject {
+	return {
+		lens: "review-risk",
+		selected_order: 0,
+		subject_hash: digest,
+		reason: "relay_transport_bound_exceeded",
+		withdraw: {
+			operation: "review.capture-unachievable",
+			command: `gentle-ai review capture-unachievable --lineage=review-fixture --expected-revision=${digest} --target=${digest} --repository-context=rctx1_${"e".repeat(64)} --request-hash=${digest} --withdraw=true`,
+			arguments: [
+				{ name: "lineage", value: "review-fixture", token: "--lineage=review-fixture" },
+				{ name: "expected-revision", value: digest, token: `--expected-revision=${digest}` },
+				{ name: "target", value: digest, token: `--target=${digest}` },
+				{ name: "repository-context", value: `rctx1_${"e".repeat(64)}`, token: `--repository-context=rctx1_${"e".repeat(64)}` },
+				{ name: "request-hash", value: digest, token: `--request-hash=${digest}` },
+				{ name: "withdraw", value: "true", token: "--withdraw=true" },
+			],
+			binding: { lineage_id: "review-fixture", revision: digest, target_identity: digest, repository_context: `rctx1_${"e".repeat(64)}` },
+		},
+		...overrides,
+	};
+}
+
+test("next_transition stop decodes unachievable_lens_slots and their withdraw bindings only on that reason code", () => {
+	const stop: JsonObject = { kind: "stop", reason_code: "unachievable_lens_slot", unachievable_lens_slots: [unachievableSlot()] };
+	const decoded = decodeReviewNextTransitionV3(stop);
+	assert.equal(decoded.kind, "stop");
+	assert.equal(decoded.reasonCode, "unachievable_lens_slot");
+	const slot = decoded.unachievableLensSlots?.[0];
+	assert.equal(slot?.lens, "review-risk");
+	assert.equal(slot?.selectedOrder, 0);
+	assert.equal(slot?.subjectHash, digest);
+	assert.equal(slot?.reason, "relay_transport_bound_exceeded");
+	assert.equal(slot?.detail, undefined);
+	assert.equal(slot?.withdraw.operation, "review.capture-unachievable");
+	assert.deepEqual(slot?.withdraw.arguments.map((argument) => argument.token), ["--lineage=review-fixture", `--expected-revision=${digest}`, `--target=${digest}`, `--repository-context=rctx1_${"e".repeat(64)}`, `--request-hash=${digest}`, "--withdraw=true"]);
+	assert.equal(slot?.withdraw.binding.targetIdentity, digest);
+	assert.equal(slot?.withdraw.command, `gentle-ai review capture-unachievable --lineage=review-fixture --expected-revision=${digest} --target=${digest} --repository-context=rctx1_${"e".repeat(64)} --request-hash=${digest} --withdraw=true`);
+
+	// detail is the one optional field the schema declares
+	const detailed = decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [unachievableSlot({ detail: "killed after 2256004ms against a 2256000ms relay bound" })] });
+	assert.equal(detailed.unachievableLensSlots?.[0]?.detail, "killed after 2256004ms against a 2256000ms relay bound");
+
+	// malformed entries are refused: a negative selected_order, a slot missing
+	// its withdraw form, a foreign withdraw operation, or an empty array
+	assert.throws(() => decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [unachievableSlot({ selected_order: -1 })] }), /selected_order/);
+	const withoutWithdraw = unachievableSlot();
+	delete withoutWithdraw.withdraw;
+	assert.throws(() => decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [withoutWithdraw] }), /withdraw.*required|required.*withdraw/);
+	assert.throws(() => decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [unachievableSlot({ withdraw: { ...(unachievableSlot().withdraw as JsonObject), operation: "review.capture-result" } })] }), /operation/);
+	assert.throws(() => decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [] }), /length/);
+
+	// the slots are only valid on their own exact stop reason code
+	assert.throws(() => decodeReviewNextTransitionV3({ kind: "stop", reason_code: "rdd_disabled", unachievable_lens_slots: [unachievableSlot()] }), /unachievable_lens_slots is only valid/);
+	// an execute or collect transition never carries them
+	assert.throws(() => decodeReviewNextTransitionV3({ kind: "execute", reason_code: "fresh_target_ready", execute: { operation: "review.start", arguments: [{ name: "lineage", value: "review-fixture" }], preconditions: [], binding: { target_identity: digest } }, unachievable_lens_slots: [unachievableSlot()] }), /unachievable_lens_slots is only valid/);
+	// plain stops stay unchanged
+	assert.equal(decodeReviewNextTransitionV3({ kind: "stop", reason_code: "rdd_disabled" }).unachievableLensSlots, undefined);
+});
+
 function approvedAcknowledgementTransition(): JsonObject {
 	return {
 		kind: "execute",

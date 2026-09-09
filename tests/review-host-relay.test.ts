@@ -18,6 +18,8 @@ import {
 	resolveReviewHostRelayPiTimeoutMs,
 	resolveReviewHostRelaySubmission,
 	reviewHostRelaySlots,
+	reviewHostRelayUnachievableDetail,
+	reviewHostRelayUnachievableReason,
 	prepareReviewHostRelaySlot,
 	runReviewHostRelayReviewerGroup,
 	runReviewHostRelaySlot,
@@ -777,6 +779,36 @@ test("refusal classification distinguishes unknown-flag, handshake, and other", 
 	assert.equal(classifyReviewHostRelayRefusal("the active runtime is not eligible for immutable receipt review"), "handshake");
 	assert.equal(classifyReviewHostRelayRefusal("declare GENTLE_PI_REVIEW_RELAY_CONTRACT=gentle-pi.review-relay/v1"), "handshake");
 	assert.equal(classifyReviewHostRelayRefusal("some unrelated explosion"), "other");
+});
+
+// gentle-pi#638: exactly two relay failure classes are deterministic for the
+// slot, so the relay's catch ladder can declare the slot unachievable
+// instead of leaving the operator to re-spend an identical reviewer run: a
+// reviewer killed by the scaled bound (the gentle-pi#367 surface) and a
+// provider admission refusal of the lens context (gentle-pi#522 / #524). Every
+// transient class — launch failures, empty output, transport timeouts, and
+// any submission whose outcome is genuinely unknown — stays outside the
+// predicate and keeps the relaunch-once behavior.
+test("the unachievable predicate names exactly the two deterministic failure classes", () => {
+	const killed = new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT, "pi", "pi reviewer subprocess exceeded the relay bound", { timedOut: true, elapsedMs: 2_256_004, timeoutMs: 2_256_000 });
+	assert.equal(reviewHostRelayUnachievableReason(killed), "relay_transport_bound_exceeded");
+	assert.equal(reviewHostRelayUnachievableDetail(killed), "killed after 2256004ms against a 2256000ms relay bound");
+
+	const admitted = new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", "refused [invalid_request]", { exitCode: 1, mutationOutcome: "none" });
+	assert.equal(reviewHostRelayUnachievableReason(admitted), "lens_admission_refused");
+	assert.equal(reviewHostRelayUnachievableDetail(admitted), undefined, "the refusal text rides failure.stderr; the declaration carries no echo of it");
+
+	const unknownOutcome = new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", "gentle-ai capture submission exceeded its bound", { timedOut: true });
+	assert.equal(reviewHostRelayUnachievableReason(unknownOutcome), undefined, "an unknown mutation outcome is never deterministic");
+	assert.equal(reviewHostRelayUnachievableDetail(unknownOutcome), undefined);
+
+	for (const kind of [REVIEW_HOST_RELAY_FAILURE.PI_FAILED, REVIEW_HOST_RELAY_FAILURE.PI_LAUNCH_FAILED, REVIEW_HOST_RELAY_FAILURE.PI_EMPTY_OUTPUT, REVIEW_HOST_RELAY_FAILURE.MATERIALIZE_FAILED, REVIEW_HOST_RELAY_FAILURE.EMPTY_PROMPT, REVIEW_HOST_RELAY_FAILURE.RELAY_UNAVAILABLE, REVIEW_HOST_RELAY_FAILURE.HANDSHAKE_REFUSED, REVIEW_HOST_RELAY_FAILURE.SUBMISSION_CONTRACT_MISMATCH]) {
+		assert.equal(reviewHostRelayUnachievableReason(new ReviewHostRelayError(kind, "pi", "transient")), undefined, `${kind} stays transient`);
+	}
+
+	const unmeasured = new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT, "pi", "killed at the bound");
+	assert.equal(reviewHostRelayUnachievableReason(unmeasured), "relay_transport_bound_exceeded");
+	assert.equal(reviewHostRelayUnachievableDetail(unmeasured), undefined, "no measurements means no detail, never a fabricated one");
 });
 
 // ---------------------------------------------------------------------------
