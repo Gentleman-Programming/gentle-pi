@@ -157,4 +157,93 @@ test("bare profile name activates it, unknown token prints usage", async () => {
 	assert.equal(manager.getActiveProfileName(), "gentle-economy");
 	const usage = (await handler("frobnicate", ctx)) as string;
 	assert.match(usage, /Usage:/);
+});test("shortcut default is platform-dependent, env overrides, off disables", () => {
+	assert.equal(sddProfileShortcut({}, "darwin"), "ctrl+shift+m");
+	assert.equal(sddProfileShortcut({}, "linux"), "alt+m");
+	assert.equal(sddProfileShortcut({ GENTLE_PI_SDD_PROFILES_KEY: "ctrl+x" }, "darwin"), "ctrl+x");
+	assert.equal(sddProfileShortcut({ GENTLE_PI_SDD_PROFILES_KEY: "off" }, "linux"), undefined);
+	assert.equal(sddProfileShortcut({ GENTLE_PI_SDD_PROFILES_KEY: "OFF" }, "darwin"), undefined);
+	assert.equal(sddProfileShortcut({ GENTLE_PI_SDD_PROFILES_KEY: "" }, "linux"), undefined);
 });
+
+test("shortcut is registered once and returns the profile list text", async () => {
+	const { shortcuts, ctx, manager } = setup();
+	assert.equal(shortcuts.size, 1);
+	saveForTest(manager, "alpha");
+	manager.activateProfile("alpha");
+	const entry = [...shortcuts.values()][0];
+	const out = (await entry.handler(ctx)) as string;
+	assert.match(out, /alpha/);
+	assert.match(out, /\* alpha/);
+});
+
+test("env off disables the shortcut registration", () => {
+	const { shortcuts } = setup({ GENTLE_PI_SDD_PROFILES_KEY: "off" });
+	assert.equal(shortcuts.size, 0);
+});
+
+test("session_start syncs model and thinking when setters exist", async () => {
+	const { events, ctx, manager, pi } = setup();
+	manager.activateProfile("gentle-economy");
+	const modelCalls: unknown[] = [];
+	const thinkingCalls: unknown[] = [];
+	pi.setModel = async (model: unknown) => {
+		modelCalls.push(model);
+		return true;
+	};
+	pi.setThinkingLevel = (level: unknown) => {
+		thinkingCalls.push(level);
+	};
+	ctx.modelRegistry = { find: (provider: string, id: string) => ({ provider, id }) };
+	const onStart = events.get("session_start") as (event: unknown, ctx: unknown) => unknown;
+	assert.ok(onStart, "session_start subscribed");
+	await onStart({}, ctx);
+	// gentle-economy carries default_model openai/gpt-5-mini and default_effort low.
+	assert.deepEqual(modelCalls, [{ provider: "openai", id: "gpt-5-mini" }]);
+	assert.deepEqual(thinkingCalls, ["low"]);
+});
+
+test("session_start works with ui with or without setStatus and no pi setters", async () => {
+	const statusCalls: unknown[][] = [];
+	const variants = [
+		{ notify: () => {} },
+		{ notify: () => {}, setStatus: (...args: unknown[]) => void statusCalls.push(args) },
+	];
+	for (const ui of variants) {
+		const { events, ctx, manager } = setup();
+		manager.activateProfile("gentle-economy");
+		const before = manager.getActiveProfileName();
+		const onStart = events.get("session_start") as (event: unknown, ctx: unknown) => unknown;
+		await onStart({}, { ...ctx, ui });
+		assert.equal(manager.getActiveProfileName(), before);
+	}
+	// PR8: footer segment deferred, session_start never depends on setStatus.
+	assert.equal(statusCalls.length, 0);
+});
+
+test("sdd_profile_list tool returns profiles as JSON", async () => {
+	const { tools, ctx, manager } = setup();
+	manager.activateProfile("gentle-economy");
+	const list = tools.get(SDD_PROFILE_TOOL_LIST);
+	assert.ok(list, "list tool registered");
+	const result = await list.execute("id", {}, undefined, undefined, ctx);
+	const parsed = JSON.parse(result.content.map((part: any) => part.text).join("\n"));
+	assert.equal(parsed.active_profile, "gentle-economy");
+	assert.ok(Array.isArray(parsed.profiles));
+	assert.ok(parsed.profiles.some((p: any) => p.name === "gentle-economy"));
+});
+
+test("sdd_profile_use tool roundtrips and errors on a missing profile", async () => {
+	const { tools, ctx, manager } = setup();
+	const use = tools.get(SDD_PROFILE_TOOL_USE);
+	assert.ok(use, "use tool registered");
+	const result = await use.execute("id", { profile_name: "gentle-reasoning", scope: "global" }, undefined, undefined, ctx);
+	const parsed = JSON.parse(result.content[0].text);
+	assert.equal(parsed.active_profile, "gentle-reasoning");
+	assert.equal(manager.getActiveProfileName(), "gentle-reasoning");
+	await assert.rejects(
+		() => use.execute("id", { profile_name: "nope" }, undefined, undefined, ctx),
+		/not found/i,
+	);
+});
+

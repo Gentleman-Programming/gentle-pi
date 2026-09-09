@@ -760,6 +760,7 @@ Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer and editor.
 | `/gentle:toggle-text-logo`       | Toggles the startup text logo.                                      |
 | `/gentle:banner-color`           | Selects a startup banner color preset.                              |
 | `/gentle-sdd-init`               | Initializes or refreshes `openspec/config.yaml` (openspec/both stores only). |
+| `/gentle-sdd-profile`            | Manages SDD model profiles (`list | use | save | rename | delete`); shortcut `alt+m` (`ctrl+shift+m` on macOS). |
 | `/gentle:install-sdd`         | Repairs missing global SDD runtime assets without overwriting files. |
 | `/gentle:install-sdd --force` | Force-refreshes installed global SDD assets.                         |
 | `/skill-registry:refresh`        | Regenerates `.atl/skill-registry.md`.                               |

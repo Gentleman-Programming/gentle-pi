@@ -19,6 +19,7 @@ const EXTENSIONS = [
 	"extensions/skill-registry.ts",
 	"extensions/sdd-init.ts",
 	"extensions/startup-banner.ts",
+	"extensions/gentle-sdd-profile.ts",
 ];
 
 const EXPECTED_BANNER_COMMANDS = [
@@ -38,6 +39,7 @@ const EXPECTED_COMMANDS = [
 	"gentle:status",
 	"gentle:doctor",
 	"gentle-sdd-init",
+	"gentle-sdd-profile",
 	"skill-registry:refresh",
 	...EXPECTED_BANNER_COMMANDS,
 ];
@@ -69,6 +71,7 @@ function createPi() {
 	const commands = new Map();
 	const flags = new Map();
 	const tools = new Map();
+	const shortcuts = new Map();
 	const eventHandlers = new Map();
 	const emittedEvents = [];
 	const flagValues = new Map([["no-skill-registry", true]]);
@@ -105,6 +108,9 @@ function createPi() {
 		registerTool(definition) {
 			tools.set(definition.name, definition);
 		},
+		registerShortcut(name, definition) {
+			shortcuts.set(name, definition);
+		},
 		getFlag(name) {
 			return flagValues.get(name) ?? false;
 		},
@@ -131,7 +137,7 @@ function createPi() {
 		},
 	};
 
-	return { pi, hooks, commands, flags, tools, emittedEvents };
+	return { pi, hooks, commands, flags, tools, shortcuts, emittedEvents };
 }
 
 function createUi() {
