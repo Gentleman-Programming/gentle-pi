@@ -29,7 +29,7 @@ export interface CardRenderOptions {
 	expanded: boolean;
 	/** Right-aligned hint in the top rule, e.g. the expand key. May carry ANSI. */
 	hint?: string;
-	/** Paints a finished line, e.g. with the panel background. */
+	/** Paints only body cells between the rails, never the frame. */
 	paint?: (line: string) => string;
 }
 
@@ -91,18 +91,18 @@ export function cardTop(card: Card, theme: CardTheme, width: number, hint?: stri
 	return theme.fg(TONE_ROLE[card.tone], "╭") + soft(theme, card.tone, "─ ") + styledTitle + soft(theme, card.tone, ` ${fill}`) + tail + soft(theme, card.tone, "╮");
 }
 
-export function cardLine(text: string, tone: CardTone, theme: CardTheme, width: number): string {
+export function cardLine(text: string, tone: CardTone, theme: CardTheme, width: number, paint: (text: string) => string = (text) => text): string {
 	const targetWidth = Math.max(0, Math.floor(width));
 	if (targetWidth === 0) return "";
 	const left = theme.fg(TONE_ROLE[tone], "│");
 	if (targetWidth === 1) return left;
 	if (targetWidth === 2) return left + soft(theme, tone, "│");
-	if (targetWidth === 3) return `${left} ${soft(theme, tone, "│")}`;
+	if (targetWidth === 3) return `${left}${paint(" ")}${soft(theme, tone, "│")}`;
 
 	const innerWidth = targetWidth - FRAME_COLUMNS;
 	const clipped = innerWidth === 0 ? "" : truncateToWidth(text, innerWidth, "…");
 	const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(clipped)));
-	return `${left} ${clipped}${padding} ${soft(theme, tone, "│")}`;
+	return `${left}${paint(` ${clipped}${padding} `)}${soft(theme, tone, "│")}`;
 }
 
 export function cardBottom(tone: CardTone, theme: CardTheme, width: number): string {
@@ -128,9 +128,9 @@ export function renderCard(card: Card, theme: CardTheme, width: number, options:
 		if (!options.expanded) {
 			const first = lines.find((line) => line !== "") ?? "";
 			const clipped = lines.length > 1 ? truncateToWidth(first, Math.max(1, innerWidth - 1), "") + "…" : first;
-			return [cardLine(theme.fg(BODY_ROLE, clipped), card.tone, theme, width)];
+			return [cardLine(theme.fg(BODY_ROLE, clipped), card.tone, theme, width, paint)];
 		}
-		return lines.map((line) => cardLine(line === "" ? "" : theme.fg(BODY_ROLE, line), card.tone, theme, width));
+		return lines.map((line) => cardLine(line === "" ? "" : theme.fg(BODY_ROLE, line), card.tone, theme, width, paint));
 	})();
-	return [top, ...body, bottom].map(paint);
+	return [top, ...body, bottom];
 }
