@@ -4142,6 +4142,10 @@ const processAgentEndSubagentDepth = new Map<PendingReviewConsentSessionKey, num
 // `agent_end` preflight reminder fires at most once per unreviewed candidate.
 const processAgentEndPreflightNudgedTargets = new Map<PendingReviewConsentSessionKey, Set<string>>();
 
+// #772: confirmed burns suppress only this session's exact worktree candidate.
+// This is reminder state, not an inferred `closed` assessment outcome.
+const processAgentEndAcknowledgedTargets = new Map<PendingReviewConsentSessionKey, Set<string>>();
+
 // gentle-pi#568: the target identity negotiated STATUS reported at
 // `session_start`, before this session touched the worktree. A candidate
 // already present at that point is the user's own pre-session work, not
@@ -6464,6 +6468,7 @@ function createGentleAiExtensionForTesting(
 		processAgentEndSubagentDepth.delete(sessionKey);
 		processAgentEndPreflightNudgedTargets.delete(sessionKey);
 		processAgentEndSessionBaseline.delete(sessionKey);
+		processAgentEndAcknowledgedTargets.delete(sessionKey);
 	});
 
 	pi.registerTool({
@@ -6629,6 +6634,21 @@ function createGentleAiExtensionForTesting(
 				reviewConsentNow,
 				reviewConsentScheduleTimer,
 			);
+			if (details.operation === REVIEW_CONTROLLER_OPERATION.ACKNOWLEDGE_APPROVED &&
+				details.outcome === "native-approved-acknowledgement-completed" &&
+				details.status === "closed" && details.authority === "burned" &&
+				typeof details.target_identity === "string") {
+				try {
+					const parsed = parseReviewControllerParameters(parameters);
+					const root = resolveReviewControllerWorkspaceRoot(parsed.workspaceRoot, ctx.cwd, candidateViews, parsed.lineageId);
+					let acknowledged = processAgentEndAcknowledgedTargets.get(sessionKey);
+					if (acknowledged === undefined) {
+						acknowledged = new Set<string>();
+						processAgentEndAcknowledgedTargets.set(sessionKey, acknowledged);
+					}
+					acknowledged.add(reviewLifecycleStorageKey(root, details.target_identity));
+				} catch { /* An unresolved local root must not suppress reminders or hide a confirmed burn. */ }
+			}
 			if (
 				isHostReviewConsentEligibleOperation(parameters) &&
 				details.outcome === "native-review-consent-required" &&
@@ -6874,6 +6894,13 @@ function createGentleAiExtensionForTesting(
 		if (status === undefined) return;
 		if (status.nextTransition?.kind !== "execute" || status.nextTransition.execute.operation !== "review.start") return;
 		const targetIdentity = status.targetIdentity;
+		const acknowledged = processAgentEndAcknowledgedTargets.get(sessionKey);
+		if (acknowledged !== undefined) {
+			try {
+				const root = resolveReviewControllerWorkspaceRoot(undefined, ctx.cwd, candidateViews, undefined);
+				if (acknowledged.has(reviewLifecycleStorageKey(root, targetIdentity))) return;
+			} catch { /* Fail open to the existing reminder when local root resolution fails. */ }
+		}
 		if (processAgentEndSessionBaseline.get(sessionKey) === targetIdentity) return;
 		let nudged = processAgentEndPreflightNudgedTargets.get(sessionKey);
 		if (nudged === undefined) {
