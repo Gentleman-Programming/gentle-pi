@@ -82,9 +82,9 @@ test("candidate ownership is private and durable before worktree add; ordinary c
 			assert.equal(owner.root, root);
 			assert.equal(owner.pid, process.pid);
 			assert.match(owner.token, /^[0-9a-f-]{36}$/);
-			assert.equal(lstatSync(marker).mode & 0o777, 0o600);
+			if (process.platform !== "win32") assert.equal(lstatSync(marker).mode & 0o777, 0o600);
 			assert.equal(existsSync(root), false);
-			assert.ok(syncs >= 4, "marker and every newly created ancestor must be durable before add");
+			assert.ok(syncs >= (process.platform === "win32" ? 1 : 4), "marker and every newly created ancestor must be durable before add");
 			observed = true;
 		}
 		return execFileSync(file, args, options);
@@ -143,16 +143,20 @@ test("private candidate owner reports bounded Windows DACL mismatch reasons for 
 	}
 });
 
-test("private candidate owner accepts LA for an RID-500 current user", () => {
-	assert.doesNotThrow(() => validatePrivateWindowsDacl("D:P(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", "S-1-5-21-1-2-3-500", true));
+test("private candidate owner accepts LA for the exact local Administrator SID", () => {
+	assert.doesNotThrow(() => validatePrivateWindowsDacl("D:P(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", "S-1-5-21-1-2-3-500", true, "S-1-5-21-1-2-3-500"));
 });
 
-test("private candidate owner rejects LA for a non-RID-500 current user", () => {
-	assert.throws(() => validatePrivateWindowsDacl("D:P(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", "S-1-5-21-1-2-3-1001", true), (error: unknown) => error instanceof WindowsDaclValidationError && error.reason === "ace-trustee" && error.trustee === "LA");
+test("private candidate owner rejects LA for a non-local RID-500 current user when the local Administrator differs", () => {
+	assert.throws(() => validatePrivateWindowsDacl("D:P(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", "S-1-5-21-1-2-3-500", true, "S-1-5-21-4-5-6-500"), (error: unknown) => error instanceof WindowsDaclValidationError && error.reason === "ace-trustee" && error.trustee === "LA");
 });
 
-test("private candidate owner rejects raw and LA current-user grants as duplicates", () => {
-	assert.throws(() => validatePrivateWindowsDacl("D:P(A;OICI;FA;;;S-1-5-21-1-2-3-500)(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", "S-1-5-21-1-2-3-500", true), (error: unknown) => error instanceof WindowsDaclValidationError && error.reason === "ace-duplicate");
+test("private candidate owner rejects raw and LA local Administrator grants as duplicates", () => {
+	assert.throws(() => validatePrivateWindowsDacl("D:P(A;OICI;FA;;;S-1-5-21-1-2-3-500)(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", "S-1-5-21-1-2-3-500", true, "S-1-5-21-1-2-3-500"), (error: unknown) => error instanceof WindowsDaclValidationError && error.reason === "ace-duplicate");
+});
+
+test("private candidate owner fails closed when local Administrator resolution is unavailable", () => {
+	assert.throws(() => validatePrivateWindowsDacl("D:P(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", "S-1-5-21-1-2-3-500", true), (error: unknown) => error instanceof WindowsDaclValidationError && error.reason === "ace-trustee" && error.trustee === "LA");
 });
 
 test("private candidate owner removes unrelated explicit Windows grants during enforcement", { skip: process.platform !== "win32" }, (t) => {

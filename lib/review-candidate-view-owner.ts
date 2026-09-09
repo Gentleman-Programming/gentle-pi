@@ -42,6 +42,15 @@ function windowsUserSid(): string {
 	return matches[0]!.toUpperCase();
 }
 
+function windowsLocalAdministratorSid(): string {
+	const script = "$ErrorActionPreference='Stop';$descriptor=New-Object System.Security.AccessControl.RawSecurityDescriptor 'D:(A;;FA;;;LA)';$descriptor.DiscretionaryAcl[0].SecurityIdentifier.Value";
+	const systemRoot = dirname(dirname(windowsSystemExecutable("whoami.exe")));
+	const output = execFileSync(windowsSystemExecutable("WindowsPowerShell\\v1.0\\powershell.exe"), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { encoding: "utf8", timeout: 5000, maxBuffer: 4096, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: { ...process.env, SystemRoot: systemRoot } });
+	const matches = output.match(/S-\d+(?:-\d+)+/gi) ?? [];
+	if (matches.length !== 1 || !isWindowsSid(matches[0]!)) throw new Error("Windows local Administrator SID is unavailable");
+	return matches[0]!.toUpperCase();
+}
+
 function windowsDacl(path: string): string {
 	const archive = `.gentle-ai-acl-${randomUUID()}.txt`;
 	const archivePath = join(dirname(path), archive);
@@ -80,10 +89,10 @@ function isWindowsSid(value: string): boolean {
 	return /^S-\d+(?:-\d+)+$/i.test(value);
 }
 
-export function validatePrivateWindowsDacl(dacl: string, user: string, protectedDacl: boolean): void {
+export function validatePrivateWindowsDacl(dacl: string, user: string, protectedDacl: boolean, localAdministratorSid?: string): void {
 	if (protectedDacl && !dacl.startsWith("D:P")) throw new WindowsDaclValidationError("protection");
 	const trustees = new Map([[user.toUpperCase(), "user"], [WINDOWS_SYSTEM, "system"], ["SY", "system"], [WINDOWS_ADMINISTRATORS, "administrators"], ["BA", "administrators"]]);
-	if (isWindowsSid(user) && user.endsWith("-500")) trustees.set("LA", "user");
+	if (isWindowsSid(user) && localAdministratorSid !== undefined && isWindowsSid(localAdministratorSid) && user.toUpperCase() === localAdministratorSid.toUpperCase()) trustees.set("LA", "user");
 	const aces = [...dacl.matchAll(/\(([^()]*)\)/g)].map((match) => match[1]!.split(";"));
 	const expectedFlags = protectedDacl ? "OICI" : "ID";
 	const granted = new Set<string>();
@@ -102,16 +111,17 @@ export function validatePrivateWindowsDacl(dacl: string, user: string, protected
 }
 
 function assertPrivateWindowsDacl(path: string, protectedDacl: boolean): void {
-	validatePrivateWindowsDacl(windowsDacl(path), windowsUserSid(), protectedDacl);
+	validatePrivateWindowsDacl(windowsDacl(path), windowsUserSid(), protectedDacl, windowsLocalAdministratorSid());
 }
 
 function enforcePrivateWindowsDacl(path: string): void {
 	const user = windowsUserSid();
+	const localAdministrator = windowsLocalAdministratorSid();
 	const sddl = `D:P(A;OICI;FA;;;${user})(A;OICI;FA;;;${WINDOWS_SYSTEM})(A;OICI;FA;;;${WINDOWS_ADMINISTRATORS})`;
 	const script = "$ErrorActionPreference='Stop';$acl=New-Object System.Security.AccessControl.DirectorySecurity;$acl.SetSecurityDescriptorSddlForm($env:GENTLE_PI_CANDIDATE_ACL_SDDL,[System.Security.AccessControl.AccessControlSections]::Access);[System.IO.Directory]::SetAccessControl($env:GENTLE_PI_CANDIDATE_ACL_PATH,$acl)";
 	const systemRoot = dirname(dirname(windowsSystemExecutable("whoami.exe")));
 	execFileSync(windowsSystemExecutable("WindowsPowerShell\\v1.0\\powershell.exe"), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { encoding: "utf8", timeout: 5000, maxBuffer: 16384, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: { ...process.env, SystemRoot: systemRoot, GENTLE_PI_CANDIDATE_ACL_PATH: path, GENTLE_PI_CANDIDATE_ACL_SDDL: sddl } });
-	assertPrivateWindowsDacl(path, true);
+	validatePrivateWindowsDacl(windowsDacl(path), user, true, localAdministrator);
 }
 
 function privateWindowsDacl(path: string, protectedDacl: boolean, enforce = false): void {
