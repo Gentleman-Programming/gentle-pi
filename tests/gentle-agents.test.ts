@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { homedir, tmpdir } from "node:os";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join, relative, resolve } from "node:path";
+import { pendingReviewMutation, REVIEW_REMINDER_RECEIPT } from "../lib/review-reminder-receipt.ts";
 import { SESSION_WORKTREE_ENTRY, SESSION_WORKTREE_CHANGED } from "../lib/session-worktree-registry.ts";
 import test, { after, mock } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -161,6 +162,51 @@ async function shutdownAndRestoreNativeSpawn(
 		childProcess.spawn = originalSpawn;
 		syncBuiltinESMExports();
 	}
+}
+
+for (const scenario of ["own", "other-root", "escaped", "sibling", "session-switch", "shutdown", "unregistered"] as const) {
+	test(`child mutation attribution through registered subagent_run: ${scenario}`, async () => {
+		const h = fakePi();
+		const d = deps();
+		const { ctx } = fakeContext();
+		let sessionId = "s1";
+		const sibling = join(root, "sibling");
+		const childRoot = scenario === "other-root" ? sibling : cwd;
+		ctx.sessionManager.getSessionId = () => sessionId;
+		ctx.sessionManager.getEntries = (() => h.entries) as typeof ctx.sessionManager.getEntries;
+		ctx.sessionManager.getBranch = (() => h.entries) as typeof ctx.sessionManager.getBranch;
+		d.deps.resolveWorktree = (path, base) => {
+			const absolute = resolve(base, path);
+			const worktree = [cwd, sibling].find((candidate) => absolute === candidate || absolute.startsWith(`${candidate}/`));
+			return worktree ? { root: worktree, commonDir: "/fixture/common" } : undefined;
+		};
+		const spawn = d.deps.spawn!;
+		d.deps.spawn = (...args) => {
+			const child = spawn(...args);
+			const on = child.on.bind(child);
+			child.on = ((event: string, listener: () => void) => {
+				if (event === "spawn" && scenario !== "unregistered") queueMicrotask(listener);
+				return on(event as "spawn", listener);
+			}) as typeof child.on;
+			return child;
+		};
+		gentleAgents(h.pi, {}, d.deps);
+		await h.fire("session_start", ctx);
+		await h.tools.get("subagent_run")!.execute("mutation", { agent: "explore", task: "Write", mode: "background", workspace_root: childRoot }, undefined, undefined, ctx);
+		await tick();
+		assert.equal(h.entries.filter((entry) => entry.customType === REVIEW_REMINDER_RECEIPT).length, 0, "spawn alone is not ownership");
+		if (scenario === "session-switch") sessionId = "s2";
+		if (scenario === "shutdown") await h.fire("session_shutdown", ctx);
+		const path = scenario === "escaped" ? "../../outside.ts" : scenario === "sibling" ? join(sibling, "file.ts") : "file.ts";
+		d.children[0].emit({ type: "tool_execution_start", toolCallId: "write", toolName: "write", args: { path } });
+		d.children[0].emit({ type: "tool_execution_end", toolCallId: "write", isError: false, result: { content: [] } });
+		const accepted = scenario === "own" || scenario === "other-root";
+		assert.equal(h.entries.filter((entry) => entry.customType === REVIEW_REMINDER_RECEIPT).length, accepted ? 1 : 0);
+		assert.equal(Boolean(pendingReviewMutation(ctx.sessionManager, cwd)), scenario === "own", "another registered root never authorizes current-root STATUS");
+		if (scenario === "other-root") assert.ok(pendingReviewMutation(ctx.sessionManager, sibling));
+		await h.fire("session_shutdown", ctx);
+		await tick();
+	});
 }
 
 test("default Node spawn adapter launches task and background children with console-hidden, shell-free pipes", async () => {
