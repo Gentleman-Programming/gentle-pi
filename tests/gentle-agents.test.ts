@@ -154,11 +154,141 @@ function deps(): { deps: Partial<AgentsDeps>; children: FakeChild[]; spawned: st
 	};
 }
 
-test("all eight subagent registrations own their transcript shell", () => {
+test("all nine subagent registrations own their transcript shell", () => {
 	const { pi, tools } = fakePi();
 	gentleAgents(pi, {}, deps().deps);
-	assert.equal(tools.size, 8);
+	assert.equal(tools.size, 9);
 	for (const tool of tools.values()) assert.equal(tool.renderShell, "self", tool.name);
+});
+
+test("host query delivery exposes correlation and accepts one current-session reply", async () => {
+	const { pi, tools, fire, sent } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	const started = await tools.get("subagent_run")!.execute("query", { agent: "explore", task: "Ask once", mode: "background" }, undefined, undefined, ctx);
+	const taskId = (started.details.gentleAgents as { taskId: string }).taskId;
+	await tick();
+	harness.children[0].message({ id: "q1", kind: "query", message: "Which file?" });
+	await tick();
+	assert.match(String(sent.at(-1)?.message.content), new RegExp(`Task ID: ${taskId}\\nRequest ID: q1`));
+	(ctx.sessionManager as { getSessionId(): string }).getSessionId = () => "s2";
+	assert.match((await tools.get("subagent_reply")!.execute("stale", { task_id: taskId, request_id: "q1", message: "wrong" }, undefined, undefined, ctx)).content[0].text, /unavailable/);
+	(ctx.sessionManager as { getSessionId(): string }).getSessionId = () => "s1";
+	assert.equal((await tools.get("subagent_reply")!.execute("reply", { task_id: taskId, request_id: "q1", message: "src/a.ts" }, undefined, undefined, ctx)).content[0].text, "Reply accepted for delivery.");
+	assert.deepEqual(harness.children[0].sent.at(-1), { id: "q1", kind: "reply", message: "src/a.ts" });
+	assert.match((await tools.get("subagent_reply")!.execute("duplicate", { task_id: taskId, request_id: "q1", message: "again" }, undefined, undefined, ctx)).content[0].text, /unavailable/);
+});
+
+test("first foreground query yields while its child runs and delivers one completion", async () => {
+	const { pi, tools, fire, sent } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	const pending = tools.get("subagent_run")!.execute("foreground", { agent: "explore", task: "Ask then finish" }, undefined, undefined, ctx);
+	await tick();
+	harness.children[0].message({ id: "q1", kind: "query", message: "Which file?" });
+	const yielded = await pending;
+	const taskId = (yielded.details.gentleAgents as { taskId: string }).taskId;
+	assert.equal((yielded as { terminate?: boolean }).terminate, true);
+	assert.deepEqual(harness.children[0].killed, []);
+	await tools.get("subagent_reply")!.execute("reply", { task_id: taskId, request_id: "q1", message: "src/a.ts" }, undefined, undefined, ctx);
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 1);
+});
+
+test("cancelling a yielded foreground task prevents completion follow-up", async () => {
+	const { pi, tools, fire, sent } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	const pending = tools.get("subagent_run")!.execute("cancel", { agent: "explore", task: "cancel after query" }, undefined, undefined, ctx);
+	await tick();
+	harness.children[0].message({ id: "q1", kind: "query", message: "q" });
+	const yielded = await pending;
+	const taskId = (yielded.details.gentleAgents as { taskId: string }).taskId;
+	assert.match((await tools.get("subagent_cancel")!.execute("stop", { task_id: taskId }, undefined, undefined, ctx)).content[0].text, /Cancelled task/);
+	await tick();
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "late" }], stopReason: "stop" }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 0);
+});
+
+test("yielded foreground completion is suppressed after session replacement or cancellation", async () => {
+	const { pi, tools, fire, sent } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	const pending = tools.get("subagent_run")!.execute("switch", { agent: "explore", task: "switch session" }, undefined, undefined, ctx);
+	await tick();
+	harness.children[0].message({ id: "q1", kind: "query", message: "q" });
+	const yielded = await pending;
+	const taskId = (yielded.details.gentleAgents as { taskId: string }).taskId;
+	(ctx.sessionManager as { getSessionId(): string }).getSessionId = () => "s2";
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 0);
+	(ctx.sessionManager as { getSessionId(): string }).getSessionId = () => "s1";
+	assert.match((await tools.get("subagent_cancel")!.execute("cancel", { task_id: taskId }, undefined, undefined, ctx)).content[0].text, /not running/);
+});
+
+test("first handoff failure keeps ordinary completion, later failure retains yielded completion", async () => {
+	const first = fakePi();
+	const firstHarness = deps();
+	gentleAgents(first.pi, {}, firstHarness.deps);
+	const firstContext = fakeContext();
+	await first.fire("session_start", firstContext.ctx);
+	(first.pi as unknown as { sendMessage(): void }).sendMessage = () => { throw new Error("host unavailable"); };
+	const ordinary = first.tools.get("subagent_run")!.execute("first", { agent: "explore", task: "fail handoff" }, undefined, undefined, firstContext.ctx);
+	await tick();
+	firstHarness.children[0].message({ id: "q1", kind: "query", message: "q" });
+	firstHarness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "ordinary" }], stopReason: "stop" }] });
+	firstHarness.children[0].emit({ type: "agent_settled" });
+	assert.equal((await ordinary).content[0].text, "ordinary");
+
+	const second = fakePi();
+	const secondHarness = deps();
+	gentleAgents(second.pi, {}, secondHarness.deps);
+	const secondContext = fakeContext();
+	await second.fire("session_start", secondContext.ctx);
+	let sends = 0;
+	(second.pi as unknown as { sendMessage(message: Record<string, unknown>, options: Record<string, unknown>): void }).sendMessage = (message, options) => {
+		sends += 1;
+		if (sends === 2) throw new Error("second unavailable");
+		second.sent.push({ message, options });
+	};
+	const pending = second.tools.get("subagent_run")!.execute("second", { agent: "explore", task: "two queries" }, undefined, undefined, secondContext.ctx);
+	await tick();
+	secondHarness.children[0].message({ id: "q1", kind: "query", message: "first" });
+	await pending;
+	secondHarness.children[0].message({ id: "q2", kind: "query", message: "second" });
+	secondHarness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" }] });
+	secondHarness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	assert.equal(second.sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 1);
+});
+
+test("foreground handoff survives settlement before its original await resumes", async () => {
+	const { pi, tools, fire, sent } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	const pending = tools.get("subagent_run")!.execute("race", { agent: "explore", task: "query then settle" }, undefined, undefined, ctx);
+	await tick();
+	harness.children[0].message({ id: "q1", kind: "query", message: "q" });
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "race result" }], stopReason: "stop" }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	assert.equal((await pending as { terminate?: boolean }).terminate, true);
+	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 1);
 });
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -879,7 +1009,7 @@ test("subagent_list_agents and subagent_run in task mode launch a child with the
 	gentleAgents(pi, {}, harness.deps);
 	const { ctx, widget } = fakeContext();
 	await fire("session_start", ctx);
-	assert.deepEqual([...tools.keys()].sort(), ["subagent_cancel", "subagent_continue", "subagent_list_agents", "subagent_list_tasks", "subagent_result", "subagent_run", "subagent_send_message", "subagent_status"]);
+	assert.deepEqual([...tools.keys()].sort(), ["subagent_cancel", "subagent_continue", "subagent_list_agents", "subagent_list_tasks", "subagent_reply", "subagent_result", "subagent_run", "subagent_send_message", "subagent_status"]);
 	const listed = await tools.get("subagent_list_agents")!.execute("c0", {}, undefined, undefined, ctx);
 	assert.match(listed.content[0].text, /- explore \(global\): maps things/);
 

@@ -5,16 +5,18 @@ import { join } from "node:path";
 import test from "node:test";
 import { CHILD_MESSAGE_MAX_BYTES, ChildMessenger, parseChildFrame } from "../lib/agents-messaging.ts";
 
-test("notification frames admit only bounded exact schemas", () => {
+test("notification and query frames admit only bounded exact schemas", () => {
 	assert.deepEqual(parseChildFrame({ id: "n1", kind: "notification", message: "💡\nready" }).frame, { id: "n1", kind: "notification", message: "💡\nready" });
+	assert.deepEqual(parseChildFrame({ id: "q1", kind: "query", message: "💡\nready" }).frame, { id: "q1", kind: "query", message: "💡\nready" });
 	for (const frame of [
 		{ id: "n1", kind: "notification", message: "ready", sender: "forged" },
-		{ id: "n1", kind: "query", message: "unsupported" },
-		{ id: "n0", kind: "notification", message: "leading zero" },
-		{ id: `n${"1".repeat(1_000)}`, kind: "notification", message: "unbounded correlation" },
-		{ id: "n9007199254740992", kind: "notification", message: "unsafe correlation" },
-		{ id: "n1", kind: "notification", message: "\uD800" },
-		{ id: "n1", kind: "notification", message: "💡".repeat(Math.floor(CHILD_MESSAGE_MAX_BYTES / 4) + 1) },
+		{ id: "n1", kind: "query", message: "wrong grammar" },
+		{ id: "q1", kind: "notification", message: "wrong grammar" },
+		{ id: "q0", kind: "query", message: "leading zero" },
+		{ id: `q${"1".repeat(1_000)}`, kind: "query", message: "unbounded correlation" },
+		{ id: "q9007199254740992", kind: "query", message: "unsafe correlation" },
+		{ id: "q1", kind: "query", message: "\uD800" },
+		{ id: "q1", kind: "query", message: "💡".repeat(Math.floor(CHILD_MESSAGE_MAX_BYTES / 4) + 1) },
 		{ id: 3, kind: "notification", message: "ready" },
 	]) assert.ok(parseChildFrame(frame).error, `reject ${JSON.stringify(frame).slice(0, 80)}`);
 });

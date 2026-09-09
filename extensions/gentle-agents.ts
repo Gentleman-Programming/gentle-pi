@@ -55,6 +55,7 @@ export function agentRuntimePaths(home: string, agentHome = join(home, ".pi", "a
 interface ToolText {
 	content: Array<{ type: "text"; text: string }>;
 	details: Record<string, unknown>;
+	terminate?: boolean;
 }
 
 const defaultDeps = (env: NodeJS.ProcessEnv): AgentsDeps => ({
@@ -134,19 +135,24 @@ function registerChildMessaging(pi: ExtensionAPI, ipc: IpcEndpoint): void {
 	pi.registerTool({
 		name: "subagent_parent_message",
 		label: "Agent parent message",
-		description: "Send a bounded notification to this subagent's parent. Queries and recipient selection are unsupported in this slice.",
-		parameters: { type: "object", additionalProperties: false, required: ["message"], properties: { message: { type: "string" } } } as never,
+		description: "Send a bounded notification or correlated query to this subagent's parent.",
+		parameters: { type: "object", additionalProperties: false, required: ["message"], properties: { kind: { type: "string", enum: ["notification", "query"] }, message: { type: "string" } } } as never,
 		async execute(_id, params) {
-			const input = params as { message?: unknown };
+			const input = params as { kind?: unknown; message?: unknown };
 			if (typeof input.message !== "string") throw new Error("parent messages require text");
-			await messenger.notify(input.message);
-			return { content: [{ type: "text", text: "Notification accepted by the parent." }], details: {} };
+			if (input.kind === undefined || input.kind === "notification") {
+				await messenger.notify(input.message);
+				return { content: [{ type: "text", text: "Notification accepted by the parent." }], details: {} };
+			}
+			if (input.kind !== "query") throw new Error("parent messages require notification or query kind");
+			const reply = await messenger.query(input.message);
+			return { content: [{ type: "text", text: reply }], details: { reply } };
 		},
 	});
 }
 
-function text(value: string, details: Record<string, unknown> = {}): ToolText {
-	return { content: [{ type: "text", text: value }], details };
+function text(value: string, details: Record<string, unknown> = {}, terminate = false): ToolText {
+	return { content: [{ type: "text", text: value }], details, ...(terminate ? { terminate: true } : {}) };
 }
 
 function taskDetails(task: TaskRecord): Record<string, unknown> {
@@ -262,6 +268,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	let cancelClock: (() => void) | undefined;
 	const ownedTaskIds = new Set<string>();
 	const stoppingTaskIds = new Set<string>();
+	const yieldedTaskIds = new Set<string>();
 	let stopAllConfirmation: Promise<void> | undefined;
 
 	// The card and its clock follow the session pi has open right now; a task
@@ -323,6 +330,18 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			pi.sendMessage({ customType: AGENTS_MESSAGE_TYPE, content: message, display: true, details: { gentleAgents: { taskId: task.id, agent: task.agent, parentSessionId: task.parentSessionId, kind: "notification" } } }, { deliverAs: "followUp", triggerTurn: true });
 			return true;
 		},
+		onQuery: (task, requestId, message) => {
+			if (activeSessionId() !== task.parentSessionId) return false;
+			const hadYield = yieldedTaskIds.has(task.id);
+			if (task.mode === AGENT_MODE.TASK) yieldedTaskIds.add(task.id);
+			try {
+				pi.sendMessage({ customType: AGENTS_MESSAGE_TYPE, content: `Subagent ${task.agent} asks:\nTask ID: ${task.id}\nRequest ID: ${requestId}\nQuestion: ${message}`, display: true, details: { gentleAgents: { taskId: task.id, agent: task.agent, parentSessionId: task.parentSessionId, requestId, kind: "query" } } }, { deliverAs: "followUp", triggerTurn: true });
+				return true;
+			} catch (error) {
+				if (task.mode === AGENT_MODE.TASK && !hadYield) yieldedTaskIds.delete(task.id);
+				throw error;
+			}
+		},
 		onSuccessfulMutation: (task, tool) => {
 			if (!sessions || !worktrees || task.parentSessionId !== activeSessionId() || !ownedTaskIds.has(task.id)) return;
 			const root = deps.resolveWorktree(tool.path, task.cwd)?.root;
@@ -334,7 +353,8 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			ownedTaskIds.delete(task.id);
 			requestRender();
 			persist(task);
-			if (task.mode === AGENT_MODE.BACKGROUND && task.status !== TASK_STATUS.CANCELLED) deliver(task);
+			const yielded = yieldedTaskIds.delete(task.id);
+			if ((task.mode === AGENT_MODE.BACKGROUND && task.status !== TASK_STATUS.CANCELLED) || (yielded && task.status !== TASK_STATUS.CANCELLED && activeSessionId() === task.parentSessionId)) deliver(task);
 		},
 	});
 
@@ -572,6 +592,11 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		ownedTaskIds.add(task.id);
 		store.subscribe(task.id, () => { publishActivity(); requestRender(); });
 		if (request.mode === AGENT_MODE.BACKGROUND) return text(`Started ${task.agent} in the background as task ${task.id}. Use subagent_status or subagent_result with that id.`, taskDetails(task));
+		const query = await runner.waitForQuery(task.id);
+		if (query) {
+			const live = store.get(task.id) ?? task;
+			return text(`Subagent ${live.agent} is waiting for your reply to request ${query.requestId}.`, { gentleAgents: { taskId: live.id, agent: live.agent, status: live.status, mode: live.mode, requestId: query.requestId } }, true);
+		}
 		const finished = await runner.waitFor(task.id);
 		return text(finishedText(finished), taskDetails(finished));
 	};
@@ -643,7 +668,12 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		return text(tasks.length === 0 ? "No subagent tasks in this session." : tasks.map(describeTask).join("\n"));
 	});
 
-	tool("cancel", "Cancel a queued or running subagent task.", { required: ["task_id"], properties: { task_id: { type: "string" } } }, async (params) => {
+	tool("reply", "Reply once to a live query from a child of the current parent session.", { required: ["task_id", "request_id", "message"], properties: { task_id: { type: "string" }, request_id: { type: "string" }, message: { type: "string" } } }, async (params, ctx) => {
+		const accepted = await runner.reply(String(params.task_id), String(params.request_id), typeof params.message === "string" ? params.message : "", ctx.sessionManager.getSessionId() ?? "");
+		return accepted ? text("Reply accepted for delivery.") : text("Error: query is unavailable.", { error: "query unavailable" });
+	});
+
+	tool("cancel",  "Cancel a queued or running subagent task.", { required: ["task_id"], properties: { task_id: { type: "string" } } }, async (params) => {
 		const id = String(params.task_id);
 		return runner.cancel(id) ? text(`Cancelled task ${id}.`) : text(`Error: task ${id} is not running.`, { error: "not running" });
 	});
