@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join, relative, resolve } from "node:path";
@@ -12,6 +12,7 @@ import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agen
 import { historyDir, loadHistory, saveTask } from "../lib/agents-history.ts";
 import { emptyThread, TASK_EVENT, TASK_STATUS, TaskStore, type TaskRecord } from "../lib/agents-protocol.ts";
 import { NativePointerScope } from "../lib/native-pointer-region.ts";
+import { PresenceCursor, PresencePublisher, listPresence, readActivity } from "../lib/orchestrator-presence.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
 
@@ -87,6 +88,7 @@ function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (t
 	const customOptions: unknown[] = [];
 	const ctx = {
 		hasUI: true,
+		mode: "tui",
 		sessionManager: { getSessionId: () => "s1", getCwd: () => cwd, getEntries: () => [] },
 		ui: {
 			notify: (message: string) => dialogs.push(`notify:${message}`),
@@ -158,6 +160,196 @@ test("all eight subagent registrations own their transcript shell", () => {
 });
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+async function eventually(check: () => boolean, message: string): Promise<void> {
+	for (let attempt = 0; attempt < 120; attempt++) {
+		if (check()) return;
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+	assert.fail(message);
+}
+
+function liveProfile(name: string): string {
+	const profile = join(realpathSync(root), name);
+	mkdirSync(join(profile, "agents"), { recursive: true });
+	for (const agent of ["local", "peer"]) {
+		writeFileSync(join(profile, "agents", `${agent}.md`), `---\ndescription: ${agent}\n---\nFixture agent.`);
+	}
+	return profile;
+}
+
+function liveInstance(t: test.TestContext, profile: string, sessionId: string) {
+	const h = fakePi();
+	const runtime = deps();
+	const context = fakeContext();
+	Object.assign(context.ctx.sessionManager, {
+		getSessionId: () => sessionId,
+		getSessionName: () => sessionId,
+		getCwd: () => join(realpathSync(root), sessionId),
+	});
+	runtime.deps.schedule = (fn, ms) => {
+		const timer = setTimeout(fn, ms);
+		timer.unref();
+		return () => clearTimeout(timer);
+	};
+	gentleAgents(h.pi, {}, { ...runtime.deps, agentHome: profile });
+	t.after(async () => {
+		for (const overlay of context.overlays) overlay.handleInput("q");
+		await h.fire("session_shutdown", context.ctx, { reason: "quit" });
+	});
+	return { ...h, ...context, ...runtime };
+}
+
+async function liveOverlay(instance: ReturnType<typeof liveInstance>) {
+	const opened = instance.commands.get("gentle:agents")!.handler("", instance.ctx);
+	await eventually(() => instance.overlays.length > 0, "overlay must mount without waiting for an unbounded directory scan");
+	const overlay = instance.overlays.at(-1)!;
+	const frame = () => overlay.render(160).map(stripAnsi).join("\n");
+	return { overlay, frame, opened };
+}
+
+test("live-only extension instances discover same-profile peers across cwd boundaries without importing their tasks", async (t) => {
+	const profile = liveProfile("live-peer-profile");
+	const local = liveInstance(t, profile, "local-live");
+	const peer = liveInstance(t, profile, "peer-live");
+	assert.equal(listPresence(profile).entries.length, 0, "factory construction starts no presence resources");
+	await local.fire("session_start", local.ctx, { reason: "startup" });
+	await peer.fire("session_start", peer.ctx, { reason: "startup" });
+	assert.equal(listPresence(profile).entries.length, 2, "idle open orchestrators publish empty activity");
+	for (const header of listPresence(profile).entries) assert.deepEqual(readActivity(profile, header).activity?.tasks, []);
+	const panel = await liveOverlay(local);
+	panel.overlay.handleInput("a");
+	await eventually(() => /peer-live/.test(panel.frame()), "an idle peer with zero children must be discoverable");
+	const run = async (instance: typeof local, agent: string) => {
+		const result = await instance.tools.get("subagent_run")!.execute(agent, { agent, task: agent, mode: "background" }, undefined, undefined, instance.ctx);
+		return (result.details.gentleAgents as { taskId: string }).taskId;
+	};
+	await run(local, "local");
+	const peerId = await run(peer, "peer");
+	await tick();
+	peer.children[0].emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "peer streamed text" } });
+	await eventually(() => listPresence(profile).entries.some((header) => readActivity(profile, header).activity?.tasks.some((row) => row.summary.id === peerId && row.thread.items.some((item) => item.text === "peer streamed text"))), "task deltas, not just status changes, must publish peer activity");
+	await eventually(() => /Subagent peer/.test(panel.frame()), "open directory refreshes peer children without reopening");
+	const peerPanel = await liveOverlay(peer);
+	peerPanel.overlay.handleInput("a");
+	await eventually(() => /Subagent local/.test(peerPanel.frame()), "discovery is symmetric across extension instances");
+	const lines = panel.overlay.render(160).map(stripAnsi);
+	const y = lines.findIndex((line) => line.includes("Subagent peer"));
+	assert.ok(y > 0);
+	panel.overlay.handleMouse?.(mouse("click", "left", 4, y, 160, lines.length));
+	assert.match(panel.frame(), /peer streamed text/, "remote inspection reads the peer's pinned activity, not a local thread");
+	for (const key of ["s", "c", "o", "\r"]) panel.overlay.handleInput(key);
+	assert.deepEqual(local.customCompletions, [], "remote rows never route Open into the local editor");
+	assert.deepEqual(local.children[0].killed, [], "remote Stop never cancels the local child");
+	assert.deepEqual(peer.children[0].killed, [], "peer rows provide no remote control channel");
+	assert.doesNotMatch((await local.tools.get("subagent_list_tasks")!.execute("list", {}, undefined, undefined, local.ctx)).content[0].text, /· peer ·/);
+	assert.match((await local.tools.get("subagent_status")!.execute("status", { task_id: peerId }, undefined, undefined, local.ctx)).content[0].text, /no task/, "peer discovery must never restore into local TaskStore");
+	panel.overlay.handleInput("a");
+	assert.doesNotMatch(panel.frame(), /Subagent peer|peer-live|Current orchestrator/);
+	assert.match(panel.frame(), /Subagent local/);
+	panel.overlay.handleInput("a");
+	await peer.fire("session_shutdown", peer.ctx, { reason: "resume" });
+	await eventually(() => !/peer-live|Subagent peer/.test(panel.frame()), "shutdown removes the peer from an already-open directory");
+	assert.equal(listPresence(profile).entries.length, 1);
+	panel.overlay.handleInput("q");
+	peerPanel.overlay.handleInput("q");
+	await Promise.all([panel.opened, peerPanel.opened]);
+});
+
+test("live-only instances sharing a session ID remain distinct and withdraw only their own incarnation", async (t) => {
+	const profile = liveProfile("live-incarnation-profile");
+	const local = liveInstance(t, profile, "same-live");
+	const peer = liveInstance(t, profile, "same-live");
+	peer.ctx.sessionManager.getCwd = () => join(realpathSync(root), "peer-cwd");
+	for (const [instance, agent] of [[local, "local"], [peer, "peer"]] as const) {
+		await instance.fire("session_start", instance.ctx, { reason: "startup" });
+		await instance.tools.get("subagent_run")!.execute(agent, { agent, task: agent, mode: "background" }, undefined, undefined, instance.ctx);
+	}
+	const headers = listPresence(profile).entries;
+	assert.equal(headers.length, 2);
+	assert.equal(headers[0].sessionHash, headers[1].sessionHash);
+	assert.notEqual(headers[0].incarnation, headers[1].incarnation);
+	const panel = await liveOverlay(local);
+	panel.overlay.handleInput("a");
+	await eventually(() => /Subagent peer/.test(panel.frame()), "same-session peers remain independently visible");
+	assert.equal((panel.frame().match(/Subagent local/g) ?? []).length, 1, "own publication is not duplicated as a peer");
+	await local.fire("session_shutdown", local.ctx, { reason: "quit" });
+	await panel.opened;
+	assert.equal(listPresence(profile).entries.length, 1, "shutdown removes only this activation");
+	assert.deepEqual(peer.children[0].killed, []);
+});
+
+test("live-only directory traverses presence overflow, excludes expired and other-profile peers, and replaces sessions", async (t) => {
+	const profile = liveProfile("live-paged-profile");
+	const now = Date.now();
+	const oldClock = mock.method(Date, "now", () => now - 16_000);
+	let expired: PresencePublisher;
+	try {
+		expired = PresencePublisher.start({ profile, sessionId: "expired", label: "Expired peer", activity: [] });
+	} finally {
+		oldClock.mock.restore();
+	}
+	// Simulate an abruptly closed publisher: retained files, but no renewing heartbeat.
+	const stem = join(profile, "gentle-agents", "presence", `${expired.target.sessionHash}.${expired.target.incarnation}`);
+	const staleFiles = ["header", "activity"].map((kind) => ({ path: `${stem}.${kind}.json`, bytes: readFileSync(`${stem}.${kind}.json`) }));
+	expired.dispose();
+	for (const { path, bytes } of staleFiles) writeFileSync(path, bytes, { mode: 0o600 });
+	const isolated = PresencePublisher.start({ profile: liveProfile("live-isolated-profile"), sessionId: "isolated", label: "Isolated peer", activity: [] });
+	t.after(() => isolated.dispose());
+	for (let index = 0; index < 130; index++) {
+		const publisher = PresencePublisher.start({ profile, sessionId: `idle-${index}`, label: `Idle peer ${index}`, activity: [] });
+		t.after(() => publisher.dispose());
+	}
+	assert.equal(listPresence(profile).overflow, true, "fixture exceeds the foundation's first-page budget");
+	let pageReadThisTurn = false;
+	const next = PresenceCursor.prototype.next;
+	const pages = t.mock.method(PresenceCursor.prototype, "next", function (this: PresenceCursor, ...args: Parameters<PresenceCursor["next"]>) {
+		assert.equal(pageReadThisTurn, false, "directory pages must yield instead of blocking the UI with an unbounded loop");
+		pageReadThisTurn = true;
+		setImmediate(() => { pageReadThisTurn = false; });
+		return next.apply(this, args);
+	});
+	const local = liveInstance(t, profile, "directory-local");
+	await local.fire("session_start", local.ctx, { reason: "startup" });
+	const panel = await liveOverlay(local);
+	panel.overlay.handleInput("a");
+	const seen = new Set<string>();
+	await eventually(() => {
+		for (let step = 0; step < 140; step++) {
+			const frame = panel.frame();
+			assert.doesNotMatch(frame, /Expired peer|Isolated peer/);
+			for (const match of frame.matchAll(/Idle peer (\d+)/g)) seen.add(match[1]);
+			panel.overlay.handleInput("j");
+		}
+		for (let step = 0; step < 140; step++) panel.overlay.handleInput("k");
+		return seen.size === 130;
+	}, "every idle orchestrator beyond the 128-entry page must eventually be reachable");
+	assert.ok(pages.mock.callCount() >= 3, "the directory traversed all three fixture pages");
+	panel.overlay.handleInput("q");
+	await panel.opened;
+	const readsAtClose = pages.mock.callCount();
+	await new Promise((resolve) => setTimeout(resolve, 1100));
+	assert.equal(pages.mock.callCount(), readsAtClose, "closing the overlay cancels future directory scans");
+	pages.mock.restore();
+	await local.fire("session_shutdown", local.ctx, { reason: "new" });
+	const replacement = liveInstance(t, profile, "replacement-live");
+	await replacement.fire("session_start", replacement.ctx, { reason: "new" });
+	const cursor = new PresenceCursor(profile);
+	const labels: string[] = [];
+	try {
+		let page;
+		do {
+			page = cursor.next();
+			labels.push(...page.entries.map((entry) => entry.label));
+		} while (page.overflow);
+	} finally {
+		cursor.close();
+	}
+	assert.ok(labels.some((label) => label.includes("replacement-live")));
+	assert.ok(labels.every((label) => !label.includes("directory-local")), "session replacement withdraws the old activation");
+	panel.overlay.handleInput("q");
+	await panel.opened;
+});
 
 async function shutdownAndRestoreNativeSpawn(
 	childProcess: typeof import("node:child_process"),
@@ -723,6 +915,7 @@ test("AgentsView production composition observes each pointer event once and acc
 		for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
 		const overlay = overlays[0];
 		assert.ok(overlay, "the production extension mounted its fullscreen interaction");
+		overlay.handleInput("a"); // Directory headings remain non-actionable; Current has no wrapper.
 		const lines = overlay.render(80);
 		const dispatch = (event: TuiMouseEvent) => {
 			const before = beforeCalls;
@@ -793,7 +986,7 @@ test("AgentsView production footer uses rendered bounds and invalidates them bef
 		let open = buttons(lines, "[ Open session ]");
 		assert.match(lines[1] ?? "", /寿司/, "a unicode task remains inside the body, not the header or footer");
 		assert.match(lines[follow.y] ?? "", /s Stop selected.*a all sessions/, "the existing stop and scope shortcuts remain beside the footer buttons");
-		assert.match(overlay.render(44).map(stripAnsi).at(-2) ?? "", /\[Scope\]/, "the narrow root keeps mouse-accessible scope controls");
+		assert.match(overlay.render(59).map(stripAnsi).at(-2) ?? "", /\[Scope\]/, "the narrow list keeps mouse-accessible scope controls");
 		lines = overlay.render(160).map(stripAnsi);
 		follow = buttons(lines, "[ Follow ]");
 		open = buttons(lines, "[ Open session ]");
@@ -831,7 +1024,7 @@ test("AgentsView production footer uses rendered bounds and invalidates them bef
 	}
 });
 
-test("finished tasks are written to history, come back through resolveTask, and the overlay lists them", async () => {
+test("finished tasks remain available through resolveTask but never reappear in the live-only overlay", async () => {
 	const { pi, tools, fire, commands, shortcuts } = fakePi();
 	const harness = deps();
 	gentleAgents(pi, {}, harness.deps);
@@ -862,9 +1055,10 @@ test("finished tasks are written to history, come back through resolveTask, and 
 	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
 	const overlay = overlays[0];
 	assert.ok(overlay, "the overlay component was created");
-	assert.match(stripAnsi(overlay.render(80)[0]), /^╭─ ❀ Agents · this session · 0 active · \d+ finished/);
+	assert.doesNotMatch(overlay.render(80).map(stripAnsi).join("\n"), /finished|Subagent explore|Current orchestrator/);
+	overlay.handleInput("a");
 	overlay.handleInput("\x1b[C");
-		assert.ok(overlay.render(80).map(stripAnsi).some((line) => /✓ Subagent explore/.test(line)), "expanding the terminal group lists its finished child");
+	assert.doesNotMatch(overlay.render(80).map(stripAnsi).join("\n"), /✓ Subagent explore/, "all sessions is not a historical-task browser");
 	overlay.handleInput("\x1b");
 	await opened;
 });
@@ -957,19 +1151,20 @@ test("the overlay explains that stopping a waiting subagent dismisses its questi
 	await opened;
 });
 
-test("restored task history cannot execute stop", async () => {
-	const { pi, fire, commands } = fakePi();
+test("restored task history cannot enter the live panel or execute stop even with the current session ID", async () => {
+	const { pi, fire, commands, tools } = fakePi();
 	const harness = deps();
 	const historyHome = join(root, "history-home");
-	const historical: TaskRecord = { id: "history-running", agent: "explore", mode: "background", prompt: "p", label: "p", cwd, parentSessionId: "old", status: TASK_STATUS.RUNNING, createdAt: 1, startedAt: 1, endedAt: null, model: "m", thinking: undefined, sessionPath: null, error: null, result: null, lastStep: "working", lastActivityAt: 1, turns: 0, toolCalls: 0, tokens: 0, cost: 0 };
+	const historical: TaskRecord = { id: "history-running", agent: "explore", mode: "background", prompt: "p", label: "p", cwd, parentSessionId: "s1", status: TASK_STATUS.RUNNING, createdAt: 1, startedAt: 1, endedAt: null, model: "m", thinking: undefined, sessionPath: null, error: null, result: null, lastStep: "working", lastActivityAt: 1, turns: 0, toolCalls: 0, tokens: 0, cost: 0 };
 	await saveTask(historyDir(historyHome), historical, emptyThread());
 	harness.deps.home = historyHome;
 	gentleAgents(pi, {}, harness.deps);
 	const { ctx, dialogs, overlays } = fakeContext();
 	await fire("session_start", ctx);
+	await tools.get("subagent_status")!.execute("restore", { task_id: historical.id }, undefined, undefined, ctx);
 	const opened = commands.get("gentle:agents")!.handler("", ctx);
 	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
-	assert.doesNotMatch(stripAnsi(overlays[0]!.render(80).at(-2) ?? ""), /Stop selected/);
+	assert.doesNotMatch(stripAnsi(overlays[0]!.render(80).join("\n")), /Stop selected|Subagent explore/);
 	overlays[0]!.handleInput("s");
 	overlays[0]!.handleInput("c");
 	await tick();
@@ -1026,9 +1221,9 @@ test("the card follows the active session: after /new the earlier session's task
 	const opened = commands.get("gentle:agents")!.handler("", ctx);
 	for (let attempt = 0; attempt < 40 && overlays.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
 	const overlay = overlays[0]!;
-	assert.match(stripAnsi(overlay.render(80)[0]), /this session · 0 active · 0 finished/, "the overlay opens on the active session");
+	assert.match(stripAnsi(overlay.render(80)[0]), /this session · 0 active/, "the overlay opens on the active session");
 	overlay.handleInput("a");
-	assert.ok(overlay.render(80).map(stripAnsi).some((line) => /◐ Subagent explore/.test(line)), "all sessions still reaches the running child");
+	assert.doesNotMatch(overlay.render(80).map(stripAnsi).join("\n"), /◐ Subagent explore/, "retained children of a replaced session do not imply an open orchestrator");
 	overlay.handleInput("\x1b");
 	await opened;
 	sessions.sessionManager = { getSessionId: () => "s1", getCwd: () => cwd };
