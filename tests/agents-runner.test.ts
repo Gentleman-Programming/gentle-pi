@@ -268,6 +268,32 @@ test("AgentRunner fails if the child exits after agent_end but before agent_sett
 	assert.equal(store.get(task.id)?.result, "partial answer", "the final observed answer remains available for diagnostics");
 });
 
+for (const [platform, detached] of [["win32", false], ["linux", true]] as const) test(`AgentRunner selects detached=${detached} for ${platform} without changing the launch contract`, async () => {
+	const store = new TaskStore();
+	const launches: Array<{ command: string; args: string[]; options: Parameters<RunnerDeps["spawn"]>[2] }> = [];
+	const child = fakeChild();
+	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs: 1_000 }, {
+		spawn: (command, args, options) => {
+			launches.push({ command, args, options });
+			return child.child;
+		},
+		now: () => 1,
+		schedule: () => () => {},
+		pi: { command: "pi-fixture", args: ["--from-host"] },
+		process: { platform, kill: () => {} },
+	}, { askUser: async () => ({ cancelled: true }) });
+	const task = runner.run(request({ env: { PATH: "/fixture", KEEP: "yes" } }));
+	await tick();
+	assert.deepEqual(launches, [{
+		command: "pi-fixture",
+		args: ["--from-host", "--mode", "rpc", "--session-dir", "/sessions", "--model", "openai-codex/gpt-5.6-terra:high", "--tools", "read,grep", "--append-system-prompt", "You map things."],
+		options: { cwd: "/repo", env: { PATH: "/fixture", KEEP: "yes", GENTLE_PI_AGENTS_CHILD: "1" }, detached },
+	}]);
+	child.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "platform checked" }], stopReason: "stop" }] });
+	child.emit({ type: "agent_settled" });
+	assert.equal((await runner.waitFor(task.id)).status, TASK_STATUS.COMPLETED);
+});
+
 test("AgentRunner reserves a parent-owned fourth stdio fd only for package-child authorization", async () => {
 	const { runner, children, spawnOptions } = harness();
 	const task = runner.run(request({ authorizeParentStandingReviewPermission: () => true }));

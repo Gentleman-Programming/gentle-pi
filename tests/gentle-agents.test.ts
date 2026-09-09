@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join, relative, resolve } from "node:path";
 import { SESSION_WORKTREE_ENTRY, SESSION_WORKTREE_CHANGED } from "../lib/session-worktree-registry.ts";
 import test, { after, mock } from "node:test";
@@ -146,6 +147,143 @@ function deps(): { deps: Partial<AgentsDeps>; children: FakeChild[]; spawned: st
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+async function shutdownAndRestoreNativeSpawn(
+	childProcess: typeof import("node:child_process"),
+	originalSpawn: typeof import("node:child_process").spawn,
+	shutdown: () => Promise<unknown>,
+): Promise<void> {
+	try {
+		await shutdown();
+	} finally {
+		childProcess.spawn = originalSpawn;
+		syncBuiltinESMExports();
+	}
+}
+
+test("default Node spawn adapter launches task and background children with console-hidden, shell-free pipes", async () => {
+	const childProcess = createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process");
+	const originalSpawn = childProcess.spawn;
+	const captured: Array<{ command: string; args: readonly string[]; options: Record<string, unknown> }> = [];
+	const children: FakeChild[] = [];
+	const shutdown: Array<() => Promise<void>> = [];
+	childProcess.spawn = ((command: string, args: readonly string[], options: Record<string, unknown>) => {
+		captured.push({ command, args, options });
+		const child = fakeChild();
+		children.push(child);
+		return child.child;
+	}) as typeof childProcess.spawn;
+	syncBuiltinESMExports();
+	try {
+		const launch = async (mode: "task" | "background", env: NodeJS.ProcessEnv, sessionCwd = cwd) => {
+			const h = fakePi();
+			gentleAgents(h.pi, env, { home, agentHome: join(home, ".pi", "agent"), env, pi: { command: "/fixture/pi", args: ["--host-flag"] }, resolveWorktree: () => undefined });
+			const { ctx } = fakeContext();
+			(ctx.sessionManager as unknown as { getCwd(): string }).getCwd = () => sessionCwd;
+			await h.fire("session_start", ctx);
+			shutdown.push(() => h.fire("session_shutdown", ctx));
+			return { h, ctx, result: h.tools.get("subagent_run")!.execute(`spawn-${mode}`, { agent: "explore", task: `Capture ${mode}`, mode }, undefined, undefined, ctx) };
+		};
+		const task = await launch("task", { PATH: "/bin", FIXTURE: "task" });
+		await tick();
+		children[0]!.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "task complete" }] }] });
+		children[0]!.emit({ type: "agent_settled" });
+		await task.result;
+		const background = await launch("background", { PATH: "/bin", FIXTURE: "background" });
+		await background.result;
+		await tick();
+		const permission = await launch("task", { PATH: "/bin", FIXTURE: "permission" }, process.cwd());
+		await tick();
+		children[2]!.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "permission complete" }] }] });
+		children[2]!.emit({ type: "agent_settled" });
+		await permission.result;
+
+		const args = ["--host-flag", "--mode", "rpc", "--session-dir", join(home, ".pi", "agent", "gentle-agents", "sessions"), "--model", "openai-codex/gpt-5.6-terra:low", "--tools", "read,grep", "--append-system-prompt", "You map things."];
+		assert.equal(captured.length, 3, "the extension reaches Node's spawn boundary for task, background, and permission-channel launches");
+		for (const [index, fixture] of ["task", "background", "permission"].entries()) {
+			assert.equal(captured[index]?.command, "/fixture/pi");
+			assert.deepEqual(captured[index]?.args, args);
+			assert.equal(captured[index]?.options.cwd, index === 2 ? process.cwd() : cwd);
+			assert.deepEqual(captured[index]?.options.env, { PATH: "/bin", FIXTURE: fixture, GENTLE_PI_AGENTS_CHILD: "1", ...(index === 2 ? { GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" } : {}) });
+			assert.equal(captured[index]?.options.shell, undefined, "the adapter does not invoke a shell");
+			assert.equal(captured[index]?.options.windowsHide, true, "the adapter always hides a Windows console");
+			assert.equal(captured[index]?.options.detached, process.platform !== "win32", "the adapter forwards the runner's platform selection");
+		}
+		assert.deepEqual(captured[0]?.options.stdio, ["pipe", "pipe", "pipe"], "ordinary task launches receive default pipes");
+		assert.deepEqual(captured[1]?.options.stdio, ["pipe", "pipe", "pipe"], "ordinary background launches receive default pipes");
+		assert.deepEqual(captured[2]?.options.stdio, ["pipe", "pipe", "pipe", "pipe"], "the adapter preserves the runner's fourth permission fd");
+		await Promise.all(shutdown.map((close) => close()));
+		assert.deepEqual(children[1]?.killed, ["SIGTERM"], "session shutdown cleans up an active background child");
+		shutdown.length = 0;
+	} finally {
+		await shutdownAndRestoreNativeSpawn(childProcess, originalSpawn, () => Promise.all(shutdown.map((close) => close())));
+	}
+});
+
+test("native spawn interception restores CommonJS and ESM exports after rejected shutdown and assertion failure", async () => {
+	const childProcess = createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process");
+	const originalSpawn = childProcess.spawn;
+	const assertRestored = async () => {
+		assert.equal(childProcess.spawn, originalSpawn, "CommonJS spawn is restored");
+		assert.equal((await import("node:child_process")).spawn, originalSpawn, "ESM spawn is restored");
+	};
+	const installMock = () => {
+		childProcess.spawn = (() => fakeChild().child) as typeof childProcess.spawn;
+		syncBuiltinESMExports();
+	};
+	const start = async (rejectShutdown: boolean) => {
+		const h = fakePi();
+		const fire = h.fire;
+		if (rejectShutdown) {
+			h.fire = async (event, ctx, payload) => {
+				await fire(event, ctx, payload);
+				if (event === "session_shutdown") throw new Error("forced shutdown rejection");
+				return undefined;
+			};
+		}
+		gentleAgents(h.pi, {}, { home, agentHome: join(home, ".pi", "agent"), env: { PATH: "/bin" }, pi: { command: "/fixture/pi", args: [] }, resolveWorktree: () => undefined });
+		const { ctx } = fakeContext();
+		await h.fire("session_start", ctx);
+		await h.tools.get("subagent_run")!.execute("cleanup", { agent: "explore", task: "Keep cleanup live", mode: "background" }, undefined, undefined, ctx);
+		await tick();
+		return { h, ctx };
+	};
+
+	let mocked = false;
+	installMock();
+	mocked = true;
+	try {
+		const rejected = await start(true);
+		await assert.rejects(shutdownAndRestoreNativeSpawn(childProcess, originalSpawn, () => rejected.h.fire("session_shutdown", rejected.ctx)), /forced shutdown rejection/);
+		mocked = false;
+		await assertRestored();
+	} finally {
+		if (mocked) {
+			childProcess.spawn = originalSpawn;
+			syncBuiltinESMExports();
+		}
+	}
+
+	installMock();
+	mocked = true;
+	try {
+		const asserted = await start(false);
+		await assert.rejects(async () => {
+			try {
+				assert.fail("forced assertion failure");
+			} finally {
+				await shutdownAndRestoreNativeSpawn(childProcess, originalSpawn, () => asserted.h.fire("session_shutdown", asserted.ctx));
+			}
+		}, /forced assertion failure/);
+		mocked = false;
+		await assertRestored();
+	} finally {
+		if (mocked) {
+			childProcess.spawn = originalSpawn;
+			syncBuiltinESMExports();
+		}
+	}
+});
 
 test("explicit child roots launch and continue in the actual cwd, persist without shell, and reject other clones", async () => {
 	const h = fakePi();
