@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join, relative, resolve } from "node:path";
@@ -49,8 +49,10 @@ const root = mkdtempSync(join(tmpdir(), "gentle-agents-ext-"));
 after(() => rmSync(root, { recursive: true, force: true }));
 const home = join(root, "home");
 const cwd = join(root, "project");
+const nonGitCwd = join(root, "non-git-project");
 mkdirSync(join(home, ".pi", "agent", "agents"), { recursive: true });
 mkdirSync(cwd, { recursive: true });
+mkdirSync(nonGitCwd, { recursive: true });
 writeFileSync(join(home, ".pi", "agent", "agents", "explore.md"), "---\ndescription: maps things\nmodel: openai-codex/gpt-5.6-terra\nthinking: high\ntools: [read, grep]\n---\nYou map things.");
 writeFileSync(join(home, ".pi", "agent", "subagents.json"), JSON.stringify({ max_concurrency: 2, model_profiles: { explore: { effort: "low" } } }));
 
@@ -188,6 +190,12 @@ test("child parent-message tooling admits notifications and the active parent pr
 	assert.deepEqual(parent.sent[0]?.options, { deliverAs: "followUp", triggerTurn: true });
 	const rendered = parent.renderers.get("gentle-agents.message")!(parent.sent[0]?.message, { expanded: true }, plainTheme).render(80).join("\n");
 	assert.match(rendered, /raw\\x1B\[2J text/);
+	(ctx.sessionManager as unknown as { getSessionId(): string }).getSessionId = () => "s2";
+	await parent.fire("session_start", ctx, { type: "session_start", reason: "new" });
+	runtime.children[0].message({ id: "n2", kind: "notification", message: "must not reach a replacement session" });
+	await tick();
+	assert.equal(parent.sent.length, 1, "a child from the prior session delivers no notification after session replacement");
+	assert.deepEqual(runtime.children[0].sent, [{ id: "n1", kind: "ack", accepted: true }, { id: "n2", kind: "ack", accepted: false, error: "task parent is not the active host session" }]);
 	await parent.fire("session_shutdown", ctx);
 });
 
@@ -249,12 +257,29 @@ for (const scenario of ["own", "other-root", "escaped", "sibling", "session-swit
 	});
 }
 
-test("default Node spawn adapter launches task and background children with console-hidden, shell-free pipes", async () => {
+test("default Node spawn adapter distinguishes IPC-only and permission-capable canonical Git children", async () => {
 	const childProcess = createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process");
 	const originalSpawn = childProcess.spawn;
 	const captured: Array<{ command: string; args: readonly string[]; options: Record<string, unknown> }> = [];
 	const children: FakeChild[] = [];
 	const shutdown: Array<() => Promise<void>> = [];
+	const canonicalGitCwd = join(root, "canonical-git-project");
+	const gitBin = join(root, "canonical-git-bin");
+	mkdirSync(join(canonicalGitCwd, ".git"), { recursive: true });
+	mkdirSync(gitBin, { recursive: true });
+	const gitFixture = join(gitBin, "git");
+	writeFileSync(gitFixture, `#!/bin/sh\nif [ "$1" = "-C" ] && [ "$2" = "${canonicalGitCwd}" ] && [ "$3" = "rev-parse" ] && [ "$4" = "--git-common-dir" ]; then\n  printf '.git\\n'\n  exit 0\nfi\nexit 1\n`);
+	chmodSync(gitFixture, 0o755);
+	const withCanonicalGitFixture = <T>(action: () => T): T => {
+		const previousPath = process.env.PATH;
+		process.env.PATH = gitBin;
+		try {
+			return action();
+		} finally {
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+		}
+	};
 	childProcess.spawn = ((command: string, args: readonly string[], options: Record<string, unknown>) => {
 		captured.push({ command, args, options });
 		const child = fakeChild();
@@ -263,14 +288,14 @@ test("default Node spawn adapter launches task and background children with cons
 	}) as typeof childProcess.spawn;
 	syncBuiltinESMExports();
 	try {
-		const launch = async (mode: "task" | "background", env: NodeJS.ProcessEnv, sessionCwd = cwd) => {
+		const launch = async (mode: "task" | "background", env: NodeJS.ProcessEnv, sessionCwd = nonGitCwd) => {
 			const h = fakePi();
 			gentleAgents(h.pi, env, { home, agentHome: join(home, ".pi", "agent"), env, pi: { command: "/fixture/pi", args: ["--host-flag"] }, resolveWorktree: () => undefined });
 			const { ctx } = fakeContext();
 			(ctx.sessionManager as unknown as { getCwd(): string }).getCwd = () => sessionCwd;
 			await h.fire("session_start", ctx);
 			shutdown.push(() => h.fire("session_shutdown", ctx));
-			return { h, ctx, result: h.tools.get("subagent_run")!.execute(`spawn-${mode}`, { agent: "explore", task: `Capture ${mode}`, mode }, undefined, undefined, ctx) };
+			return { h, ctx, result: withCanonicalGitFixture(() => h.tools.get("subagent_run")!.execute(`spawn-${mode}`, { agent: "explore", task: `Capture ${mode}`, mode }, undefined, undefined, ctx)) };
 		};
 		const task = await launch("task", { PATH: "/bin", FIXTURE: "task" });
 		await tick();
@@ -280,26 +305,27 @@ test("default Node spawn adapter launches task and background children with cons
 		const background = await launch("background", { PATH: "/bin", FIXTURE: "background" });
 		await background.result;
 		await tick();
-		const permission = await launch("task", { PATH: "/bin", FIXTURE: "permission" }, process.cwd());
+		const permission = await launch("task", { PATH: "/bin", FIXTURE: "permission" }, canonicalGitCwd);
 		await tick();
 		children[2]!.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "permission complete" }] }] });
 		children[2]!.emit({ type: "agent_settled" });
 		await permission.result;
 
 		const args = ["--host-flag", "--mode", "rpc", "--session-dir", join(home, ".pi", "agent", "gentle-agents", "sessions"), "--model", "openai-codex/gpt-5.6-terra:low", "--tools", "read,grep,subagent_parent_message", "--append-system-prompt", "You map things."];
-		assert.equal(captured.length, 3, "the extension reaches Node's spawn boundary for task, background, and permission-channel launches");
+		assert.equal(captured.length, 3, "the extension reaches Node's spawn boundary for IPC-only and permission-channel launches");
 		for (const [index, fixture] of ["task", "background", "permission"].entries()) {
+			const permissionChannel = index === 2;
+			const ownedIpc = captured[index]?.options.env.GENTLE_PI_AGENTS_OWNED_IPC;
+			assert.match(ownedIpc ?? "", /^\d+-[a-z0-9]+$/, "the child receives an opaque owned-IPC marker");
 			assert.equal(captured[index]?.command, "/fixture/pi");
 			assert.deepEqual(captured[index]?.args, args);
-			assert.equal(captured[index]?.options.cwd, index === 2 ? process.cwd() : cwd);
-			assert.deepEqual(captured[index]?.options.env, { PATH: "/bin", FIXTURE: fixture, GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: captured[index]?.options.env.GENTLE_PI_AGENTS_OWNED_IPC, GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" });
+			assert.equal(captured[index]?.options.cwd, permissionChannel ? canonicalGitCwd : nonGitCwd);
+			assert.deepEqual(captured[index]?.options.env, { PATH: "/bin", FIXTURE: fixture, GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: ownedIpc, ...(permissionChannel ? { GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" } : {}) });
 			assert.equal(captured[index]?.options.shell, undefined, "the adapter does not invoke a shell");
 			assert.equal(captured[index]?.options.windowsHide, true, "the adapter always hides a Windows console");
 			assert.equal(captured[index]?.options.detached, process.platform !== "win32", "the adapter forwards the runner's platform selection");
+			assert.deepEqual(captured[index]?.options.stdio, permissionChannel ? ["pipe", "pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe", "ipc"], permissionChannel ? "canonical repository children retain an fd3 permission channel and receive messaging IPC at fd4" : "IPC-only children have no inherited permission fd");
 		}
-		assert.deepEqual(captured[0]?.options.stdio, ["pipe", "pipe", "pipe", "pipe", "ipc"], "repository tasks retain fd3 permission and receive messaging IPC at fd4");
-		assert.deepEqual(captured[1]?.options.stdio, ["pipe", "pipe", "pipe", "pipe", "ipc"], "repository background tasks retain fd3 permission and receive messaging IPC at fd4");
-		assert.deepEqual(captured[2]?.options.stdio, ["pipe", "pipe", "pipe", "pipe", "ipc"], "the adapter preserves fd3 permission while messaging uses fd4");
 		await Promise.all(shutdown.map((close) => close()));
 		assert.deepEqual(children[1]?.killed, ["SIGTERM"], "session shutdown cleans up an active background child");
 		shutdown.length = 0;

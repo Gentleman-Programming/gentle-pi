@@ -79,13 +79,14 @@ test("callback failures clear pending work but a closed messenger cannot retry",
 test("a real Node IPC child exchanges a notification acknowledgement without stdout framing", async () => {
 	const child = spawn(process.execPath, [join(import.meta.dirname, "fixtures", "agents-messaging-child.mjs")], { stdio: ["ignore", "pipe", "pipe", "ipc"] });
 	const messages: unknown[] = [];
+	let output = "";
+	const closed = once(child, "close");
 	child.on("message", (message) => messages.push(message));
+	child.stdout.on("data", (chunk) => { output += chunk; });
 	await once(child, "message");
 	assert.deepEqual(messages, [{ id: "n1", kind: "notification", message: "fixture ready" }]);
 	child.send({ id: "n1", kind: "ack", accepted: true });
-	let output = "";
-	child.stdout.on("data", (chunk) => { output += chunk; });
-	const [code] = await once(child, "exit");
+	const [code] = await closed;
 	assert.equal(code, 0);
 	assert.equal(output, '{"accepted":true}\n');
 });

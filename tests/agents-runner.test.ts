@@ -22,7 +22,7 @@ interface Harness {
 	timers: Array<{ fn: () => void; ms: number; cancelled: boolean }>;
 	asks: Array<{ taskId: string; method: string }>;
 	finishes: string[];
-	spawnOptions: Array<{ stdio?: string[] }>;
+	spawnOptions: Array<{ env: NodeJS.ProcessEnv; stdio?: string[] }>;
 }
 
 function harness(options: { maxConcurrency?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean; onNotification?: RunnerHooks["onNotification"]; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"] } = {}): Harness {
@@ -34,7 +34,7 @@ function harness(options: { maxConcurrency?: number; answer?: Record<string, unk
 	let clock = 1000;
 	const deps: RunnerDeps = {
 		spawn: (_command, _args, launchOptions) => {
-			spawnOptions.push({ stdio: launchOptions.stdio });
+			spawnOptions.push({ env: launchOptions.env, stdio: launchOptions.stdio });
 			const fake = fakeChild({ exitOnKill: options.exitOnKill });
 			if (options.state !== undefined) {
 				fake.child.stdin.removeAllListeners("data");
@@ -404,10 +404,12 @@ for (const [platform, detached] of [["win32", false], ["linux", true]] as const)
 	}, { askUser: async () => ({ cancelled: true }) });
 	const task = runner.run(request({ env: { PATH: "/fixture", KEEP: "yes" } }));
 	await tick();
+	const ownedIpc = launches[0]?.options.env.GENTLE_PI_AGENTS_OWNED_IPC;
+	assert.match(ownedIpc ?? "", /^\d+-[a-z0-9]+$/, "the runner creates an opaque owned-IPC marker");
 	assert.deepEqual(launches, [{
 		command: "pi-fixture",
 		args: ["--from-host", "--mode", "rpc", "--session-dir", "/sessions", "--model", "openai-codex/gpt-5.6-terra:high", "--tools", "read,grep,subagent_parent_message", "--append-system-prompt", "You map things."],
-		options: { cwd: "/repo", env: { PATH: "/fixture", KEEP: "yes", GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: (launches[0]?.options.env.GENTLE_PI_AGENTS_OWNED_IPC) }, detached, stdio: ["pipe", "pipe", "pipe", "ipc"] },
+		options: { cwd: "/repo", env: { PATH: "/fixture", KEEP: "yes", GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: ownedIpc }, detached, stdio: ["pipe", "pipe", "pipe", "ipc"] },
 	}]);
 	child.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "platform checked" }], stopReason: "stop" }] });
 	child.emit({ type: "agent_settled" });
@@ -418,8 +420,11 @@ test("AgentRunner retains permission broker fd3 and assigns messaging IPC to fd4
 	const { runner, children, spawnOptions } = harness();
 	const task = runner.run(request({ authorizeParentStandingReviewPermission: () => true }));
 	await tick();
-	assert.deepEqual(spawnOptions[0]?.stdio, ["pipe", "pipe", "pipe", "pipe", "ipc"]);
-	assert.equal((spawnOptions[0] as { stdio?: string[] } | undefined)?.stdio?.length, 5);
+	const launch = spawnOptions[0];
+	assert.match(launch?.env.GENTLE_PI_AGENTS_OWNED_IPC ?? "", /^\d+-[a-z0-9]+$/, "the owned-IPC marker has the runner's opaque shape");
+	assert.deepEqual(launch?.env, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: launch?.env.GENTLE_PI_AGENTS_OWNED_IPC, GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" });
+	assert.deepEqual(launch?.stdio, ["pipe", "pipe", "pipe", "pipe", "ipc"]);
+	assert.equal(launch?.stdio?.length, 5);
 	children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "channel checked" }], stopReason: "stop" }] });
 	children[0].emit({ type: "agent_settled" });
 	assert.equal((await runner.waitFor(task.id)).status, TASK_STATUS.COMPLETED);
