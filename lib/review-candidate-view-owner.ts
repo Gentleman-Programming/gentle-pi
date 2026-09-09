@@ -56,14 +56,24 @@ function windowsDacl(path: string): string {
 }
 
 export type WindowsDaclValidationReason = "protection" | "ace-count" | "ace-shape" | "ace-type" | "ace-flags" | "ace-rights" | "ace-reserved-fields" | "ace-trustee" | "ace-duplicate";
+export type WindowsDaclTrusteeClassification = "OW" | "CO" | "BU" | "AU" | "WD" | "LA" | "sid" | "other" | "missing";
 
 export class WindowsDaclValidationError extends Error {
 	readonly reason: WindowsDaclValidationReason;
-	constructor(reason: WindowsDaclValidationReason) {
-		super(`Windows DACL validation failed: ${reason}`);
+	readonly trustee?: WindowsDaclTrusteeClassification;
+	constructor(reason: WindowsDaclValidationReason, trustee?: WindowsDaclTrusteeClassification) {
+		super(`Windows DACL validation failed: ${reason}${trustee === undefined ? "" : ` (${trustee})`}`);
 		this.name = "WindowsDaclValidationError";
 		this.reason = reason;
+		this.trustee = trustee;
 	}
+}
+
+function classifyWindowsTrustee(value: string | undefined): WindowsDaclTrusteeClassification {
+	const trustee = value?.toUpperCase() ?? "";
+	if (["OW", "CO", "BU", "AU", "WD", "LA"].includes(trustee)) return trustee as WindowsDaclTrusteeClassification;
+	if (/^S-\d+(?:-\d+)+$/i.test(trustee)) return "sid";
+	return trustee === "" ? "missing" : "other";
 }
 
 export function validatePrivateWindowsDacl(dacl: string, user: string, protectedDacl: boolean): void {
@@ -79,7 +89,7 @@ export function validatePrivateWindowsDacl(dacl: string, user: string, protected
 		if (ace[1] !== expectedFlags) throw new WindowsDaclValidationError("ace-flags");
 		if (ace[2] !== "FA") throw new WindowsDaclValidationError("ace-rights");
 		if (ace[3] !== "" || ace[4] !== "") throw new WindowsDaclValidationError("ace-reserved-fields");
-		if (trustee === undefined) throw new WindowsDaclValidationError("ace-trustee");
+		if (trustee === undefined) throw new WindowsDaclValidationError("ace-trustee", classifyWindowsTrustee(ace[5]));
 		if (granted.has(trustee)) throw new WindowsDaclValidationError("ace-duplicate");
 		granted.add(trustee);
 	}

@@ -132,7 +132,14 @@ test("private candidate owner rejects an untrusted conditional Windows allow ACE
 test("private candidate owner reports bounded Windows DACL mismatch reasons", () => {
 	const dacl = "D:P(A;OICI;FA;;;S-1-5-21-1)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 	for (const [reason, invalid] of [["ace-flags", dacl.replace("OICI", "OI")], ["ace-rights", dacl.replace("FA", "FR")], ["ace-reserved-fields", dacl.replace(";;;S-1-5-21-1", ";object;;S-1-5-21-1")], ["ace-trustee", dacl.replace("S-1-5-21-1", "S-1-5-21-2")], ["ace-duplicate", `${dacl}(A;OICI;FA;;;SY)`], ["ace-count", dacl.replace("(A;OICI;FA;;;BA)", "")]] as const) {
-		assert.throws(() => validatePrivateWindowsDacl(invalid, "S-1-5-21-1", true), (error: unknown) => error instanceof WindowsDaclValidationError && error.reason === reason && error.message === `Windows DACL validation failed: ${reason}`);
+		assert.throws(() => validatePrivateWindowsDacl(invalid, "S-1-5-21-1", true), (error: unknown) => error instanceof WindowsDaclValidationError && error.reason === reason && error.message === `Windows DACL validation failed: ${reason}${reason === "ace-trustee" ? " (sid)" : ""}`);
+	}
+});
+
+test("private candidate owner reports bounded Windows DACL mismatch reasons for trustees", () => {
+	const dacl = "D:P(A;OICI;FA;;;S-1-5-21-1)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+	for (const [trustee, classification] of [["OW", "OW"], ["CO", "CO"], ["BU", "BU"], ["AU", "AU"], ["WD", "WD"], ["LA", "LA"], ["S-1-5-21-999-888-777-666", "sid"], ["unknown", "other"], ["", "missing"]] as const) {
+		assert.throws(() => validatePrivateWindowsDacl(dacl.replace("S-1-5-21-1", trustee), "S-1-5-21-1", true), (error: unknown) => error instanceof WindowsDaclValidationError && error.reason === "ace-trustee" && error.trustee === classification && error.message === `Windows DACL validation failed: ace-trustee (${classification})` && (trustee === classification || trustee === "" || !error.message.includes(trustee)));
 	}
 });
 
