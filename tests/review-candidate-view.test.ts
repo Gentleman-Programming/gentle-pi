@@ -107,6 +107,21 @@ test("private candidate owner accepts safe Windows artifacts", (t) => {
 	}
 });
 
+test("private candidate owner accepts a canonical Windows worktree registration spelling", { skip: process.platform !== "win32" }, (t) => {
+	let root: string | undefined;
+	const registry = new CandidateViewRegistry((file, arguments_, options) => {
+		const output = execFileSync(file, arguments_, options);
+		if (root !== undefined && arguments_[0] === "worktree" && arguments_[1] === "list" && typeof output === "string") {
+			return output.replace(`worktree ${root}\0`, `worktree \\\\?\\${root}\0`);
+		}
+		return output;
+	}, "win32");
+	const view = registry.create({ contributorRoot: repository(t) });
+	root = view.root;
+	view.cleanup();
+	assert.equal(existsSync(root), false);
+});
+
 test("private candidate owner rejects an untrusted conditional Windows allow ACE", () => {
 	assert.throws(
 		() => validatePrivateWindowsDacl("D:P(A;OICI;FA;;;S-1-5-21-1)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(XA;OICI;FA;;;S-1-5-21-2;condition)", "S-1-5-21-1", true),
@@ -362,7 +377,10 @@ test("owner fsync failure prevents worktree registration", (t) => {
 		if (args[0] === "worktree" && args[1] === "add") adds++;
 		return execFileSync(file, args, options);
 	});
-	assert.throws(() => registry.create({ contributorRoot: cwd }), /fsync/);
+	assert.throws(
+		() => registry.create({ contributorRoot: cwd }),
+		(error: unknown) => error instanceof CandidateViewError && error.reason === "candidate-owner-preparation-failed" && error.cause instanceof Error && /fsync/.test(error.cause.message),
+	);
 	assert.equal(adds, 0);
 });
 
@@ -1222,6 +1240,7 @@ test("candidate executable-mode validation accepts a readonly Git executable on 
 });
 
 test("candidate registry forwards explicit Windows mode validation to view verification", (t) => {
+	mockWindowsAcl(t);
 	const contributorRoot = repository(t);
 	writeFileSync(join(contributorRoot, "unchanged-executable.sh"), "#!/bin/sh\necho base\n");
 	git(contributorRoot, "add", "unchanged-executable.sh");

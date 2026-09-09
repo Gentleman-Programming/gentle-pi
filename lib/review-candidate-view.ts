@@ -238,8 +238,8 @@ export interface CandidateViewDiagnostic {
 export class CandidateViewError extends Error {
 	readonly reason: string;
 	readonly diagnostics?: CandidateViewDiagnostic;
-	constructor(message: string, reason = "candidate-view-invalid", diagnostics?: CandidateViewDiagnostic) {
-		super(message);
+	constructor(message: string, reason = "candidate-view-invalid", diagnostics?: CandidateViewDiagnostic, options?: ErrorOptions) {
+		super(message, options);
 		this.name = "CandidateViewError";
 		this.reason = reason;
 		this.diagnostics = diagnostics === undefined ? undefined : sanitizeCandidateViewDiagnostic(diagnostics);
@@ -645,8 +645,8 @@ function candidateViewParent(commonDir: string, platform: NodeJS.Platform): stri
 	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new CandidateViewError("candidate view parent is unsafe");
 	try {
 		return prepareCandidateOwnerParent(commonDir, platform);
-	} catch {
-		throw new CandidateViewError("candidate view owner preparation failed", "candidate-owner-preparation-failed");
+	} catch (error) {
+		throw new CandidateViewError("candidate view owner preparation failed", "candidate-owner-preparation-failed", undefined, { cause: error });
 	}
 }
 
@@ -894,8 +894,8 @@ function materializeCandidateView(request: CreateCandidateViewRequest, executor:
 		let owner: CandidateViewOwner;
 		try {
 			owner = createCandidateOwner(canonicalCommonDir, root, platform);
-		} catch {
-			throw new CandidateViewError("candidate view owner preparation failed", "candidate-owner-preparation-failed");
+		} catch (error) {
+			throw new CandidateViewError("candidate view owner preparation failed", "candidate-owner-preparation-failed", undefined, { cause: error });
 		}
 		// The worktree is created under the same try/catch cleanup boundary as
 		// the read-tree materialization that follows. addUnbornWorktree's

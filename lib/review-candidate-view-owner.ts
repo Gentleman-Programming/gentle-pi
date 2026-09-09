@@ -105,8 +105,14 @@ function localHost(): string | null {
 
 function samePath(path: string, expected: string, platform: NodeJS.Platform): boolean {
 	if (platform !== "win32") return path === expected;
-	const normalize = (value: string): string => value.replaceAll("\\", "/").toLowerCase();
-	return normalize(path) === normalize(expected);
+	const canonical = (value: string): string => {
+		try {
+			return realpathSync.native(value).replaceAll("\\", "/").toLowerCase();
+		} catch {
+			return join(realpathSync.native(dirname(value)), basename(value)).replaceAll("\\", "/").toLowerCase();
+		}
+	};
+	return canonical(path) === canonical(expected);
 }
 
 function directory(path: string, privateMode = false, platform: NodeJS.Platform = process.platform): string {
@@ -271,7 +277,10 @@ export function removeCandidateOwner(owner: CandidateViewOwner, git: Git, makeWr
 		checkLock();
 		git(["worktree", "remove", "--force", root]);
 		// Git failure or incomplete removal must never trigger recursive rm.
-		if (lstatSync(root, { throwIfNoEntry: false }) || git(["worktree", "list", "--porcelain", "-z"]).split("\0").includes(`worktree ${root}`)) throw new Error("Candidate removal is incomplete");
+		if (lstatSync(root, { throwIfNoEntry: false }) || git(["worktree", "list", "--porcelain", "-z"]).split("\0\0").some((row) => {
+			const worktree = row.split("\0")[0];
+			return worktree !== undefined && worktree.startsWith("worktree ") && samePath(worktree.slice(9), root, platform);
+		})) throw new Error("Candidate removal is incomplete");
 		checkOwner();
 		checkLock();
 		unlinkSync(markerPath(root));
