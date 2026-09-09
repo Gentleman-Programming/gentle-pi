@@ -21,7 +21,16 @@ test("unsupported hosts retain the original bottom widget and disposal", () => {
 test("terminal state survives host replacement without leaking across terminals", () => {
 	const terminal = {};
 	assert.equal(sidebarState(host(terminal)), sidebarState(host(terminal)));
+	assert.equal(sidebarState(host(terminal)).width, 50);
 	assert.notEqual(sidebarState(host(terminal)), sidebarState(host({})));
+});
+
+test("terminal state created before sidebar resizing gains the default width in place", () => {
+	const terminal = {} as Record<symbol, unknown>;
+	const legacy = { active: true, parts: new Map() };
+	terminal[Symbol.for("gentle-pi.experimental-sidebar.state")] = legacy;
+	assert.equal(sidebarState(host(terminal)), legacy);
+	assert.equal(sidebarState(host(terminal)).width, 50);
 });
 
 test("bottom paint is suppressed only while the sidebar owns the host", () => {

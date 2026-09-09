@@ -5,12 +5,16 @@ import type { Component, TUI } from "@earendil-works/pi-tui";
 const STATE = Symbol.for("gentle-pi.experimental-sidebar.state");
 export interface SidebarState {
 	active: boolean;
+	width: number;
 	ownsHost?: () => boolean;
 	parts: Map<string, Component>;
 }
 export function sidebarState(tui: TUI): SidebarState {
 	const terminal = tui.terminal as unknown as Record<symbol, SidebarState>;
-	return terminal[STATE] ??= { active: false, parts: new Map() };
+	const state = terminal[STATE] ??= { active: false, width: 50, parts: new Map() };
+	// Migrate terminal-owned state created by an older extension instance.
+	if (!Number.isFinite(state.width)) state.width = 50;
+	return state;
 }
 
 /** Keep the original bottom component mounted, suppressing only its paint. */
