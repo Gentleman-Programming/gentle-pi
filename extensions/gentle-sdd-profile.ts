@@ -225,6 +225,18 @@ export default function gentleSddProfile(pi: ExtensionAPI, env: NodeJS.ProcessEn
 					return notify(ctx, result.message, result.success ? "info" : "error");
 				}
 
+				case "show": {
+					const name = parts[1];
+					if (!name || name.startsWith("--")) {
+						return notify(ctx, "Usage: /gentle-sdd-profile show <name>", "warning");
+					}
+					const profile = manager.loadProfile(name);
+					if (!profile) return notify(ctx, `Profile "${name}" not found.`, "error");
+					const active = manager.getActiveProfileName();
+					const isActive = Boolean(active && active.toLowerCase() === name.toLowerCase());
+					return formatProfileDetail(profile, isActive);
+				}
+
 				case "save": {
 					const name = parts[1];
 					if (!name || name.startsWith("--")) {
@@ -237,6 +249,43 @@ export default function gentleSddProfile(pi: ExtensionAPI, env: NodeJS.ProcessEn
 					const words = parts.slice(2).filter((w) => w !== "--project" && w !== "--global");
 					const description = words.length > 0 ? words.join(" ") : undefined;
 					const result = manager.saveCurrentAsProfile(name, description, scope);
+					return notify(ctx, result.message, result.success ? "info" : "error");
+				}
+
+				case "create": {
+					const name = parts[1];
+					if (!name || name.startsWith("--")) {
+						return notify(
+							ctx,
+							"Usage: /gentle-sdd-profile create <name> [default_model] [effort] [--project]",
+							"warning",
+						);
+					}
+					const rawModel = parts[2];
+					const rawEffort = parts[3];
+					const result = manager.createProfile({
+						name,
+						default_model: rawModel && rawModel !== "--project" ? rawModel : undefined,
+						default_effort: rawEffort && rawEffort !== "--project" ? (rawEffort as never) : undefined,
+						scope,
+					});
+					return notify(ctx, result.message, result.success ? "info" : "error");
+				}
+
+				case "set": {
+					const profileName = parts[1];
+					const agentName = parts[2];
+					const model = parts[3];
+					const effort = parts[4];
+					if (!profileName || !agentName || !model) {
+						return notify(ctx, "Usage: /gentle-sdd-profile set <profile> <agent> <model> [effort]", "warning");
+					}
+					const result = manager.setAgentInProfile({
+						profileName,
+						agentName,
+						model,
+						effort: effort as never,
+					});
 					return notify(ctx, result.message, result.success ? "info" : "error");
 				}
 
@@ -335,6 +384,103 @@ export default function gentleSddProfile(pi: ExtensionAPI, env: NodeJS.ProcessEn
 			const active_profile = manager.getActiveProfileName();
 			const text = JSON.stringify({ success: true, message: result.message, active_profile }, null, 2);
 			return { content: [{ type: "text", text }], details: { success: true, message: result.message, active_profile } };
+		},
+	});
+
+	pi.registerCommand(GENTLE_SDD_PROFILE_LIST_COMMAND, {
+		description: "List SDD model profiles.",
+		handler: async (_args: string, ctx: ExtensionContext) => listProfilesText(ctx),
+	});
+
+	pi.registerCommand(GENTLE_SDD_PROFILE_SAVE_COMMAND, {
+		description: "Save current subagents config as a profile.",
+		handler: async (args: string, ctx: ExtensionContext) => {
+			const manager = getManager(ctx);
+			const trimmed = (args || "").trim();
+			if (!trimmed) return notify(ctx, "Usage: /gentle-sdd-profile-save <name> [description]", "warning");
+			const [name, ...rest] = trimmed.split(/\s+/);
+			const res = manager.saveCurrentAsProfile(name, rest.join(" ") || undefined, "global");
+			return notify(ctx, res.message, res.success ? "info" : "error");
+		},
+	});
+
+	pi.registerCommand(GENTLE_SDD_PROFILE_RENAME_COMMAND, {
+		description: "Rename an SDD model profile.",
+		handler: async (args: string, ctx: ExtensionContext) => {
+			const manager = getManager(ctx);
+			const parts = (args || "").trim().split(/\s+/);
+			if (!parts[0] || !parts[1]) return notify(ctx, "Usage: /gentle-sdd-profile-rename <old> <new>", "warning");
+			const res = manager.renameProfile(parts[0], parts[1]);
+			return notify(ctx, res.message, res.success ? "info" : "warning");
+		},
+	});
+
+	pi.registerCommand(GENTLE_SDD_PROFILE_DELETE_COMMAND, {
+		description: "Delete an SDD model profile.",
+		handler: async (args: string, ctx: ExtensionContext) => {
+			const manager = getManager(ctx);
+			const target = (args || "").trim();
+			if (!target) return notify(ctx, "Usage: /gentle-sdd-profile-delete <name>", "warning");
+			if (!manager.loadProfile(target)) return notify(ctx, `Profile "${target}" not found.`, "warning");
+			const active = manager.getActiveProfileName();
+			if (active && manager.sanitizeName(active) === manager.sanitizeName(target)) {
+				return notify(ctx, `Cannot delete active profile "${target}". Activate another profile first.`, "warning");
+			}
+			const deleted = manager.deleteProfile(target);
+			return notify(ctx, deleted ? `Deleted profile "${target}".` : `Could not delete profile "${target}".`, deleted ? "info" : "warning");
+		},
+	});
+
+	pi.registerTool({
+		name: SDD_PROFILE_TOOL_RENAME,
+		label: "Rename SDD profile",
+		description: "Rename an existing SDD model profile.",
+		parameters: {
+			type: "object",
+			required: ["old_name", "new_name"],
+			additionalProperties: false,
+			properties: {
+				old_name: { type: "string", description: "Current profile name." },
+				new_name: { type: "string", description: "New profile name." },
+			},
+		} as never,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const args = params as { old_name?: unknown; new_name?: unknown };
+			const manager = getManager(ctx);
+			const res = manager.renameProfile(String(args.old_name ?? ""), String(args.new_name ?? ""));
+			const text = JSON.stringify(res, null, 2);
+			return { content: [{ type: "text", text }], details: res };
+		},
+	});
+
+	pi.registerTool({
+		name: SDD_PROFILE_TOOL_DELETE,
+		label: "Delete SDD profile",
+		description: "Delete an existing SDD model profile. Refuses the active profile.",
+		parameters: {
+			type: "object",
+			required: ["profile_name"],
+			additionalProperties: false,
+			properties: {
+				profile_name: { type: "string", description: "Profile name to delete." },
+			},
+		} as never,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const args = params as { profile_name?: unknown };
+			const manager = getManager(ctx);
+			const name = String(args.profile_name ?? "");
+			if (!manager.loadProfile(name)) {
+				const res = { success: false, message: `Profile "${name}" not found.` };
+				return { content: [{ type: "text", text: JSON.stringify(res, null, 2) }], details: res };
+			}
+			const active = manager.getActiveProfileName();
+			if (active && manager.sanitizeName(active) === manager.sanitizeName(name)) {
+				const res = { success: false, message: `Cannot delete active profile "${name}". Activate another profile first.` };
+				return { content: [{ type: "text", text: JSON.stringify(res, null, 2) }], details: res };
+			}
+			const deleted = manager.deleteProfile(name);
+			const res = { success: deleted, message: deleted ? `Deleted profile "${name}".` : `Could not delete profile "${name}".` };
+			return { content: [{ type: "text", text: JSON.stringify(res, null, 2) }], details: res };
 		},
 	});
 }

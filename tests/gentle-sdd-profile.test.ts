@@ -157,7 +157,9 @@ test("bare profile name activates it, unknown token prints usage", async () => {
 	assert.equal(manager.getActiveProfileName(), "gentle-economy");
 	const usage = (await handler("frobnicate", ctx)) as string;
 	assert.match(usage, /Usage:/);
-});test("shortcut default is platform-dependent, env overrides, off disables", () => {
+});
+
+test("shortcut default is platform-dependent, env overrides, off disables", () => {
 	assert.equal(sddProfileShortcut({}, "darwin"), "ctrl+shift+m");
 	assert.equal(sddProfileShortcut({}, "linux"), "alt+m");
 	assert.equal(sddProfileShortcut({ GENTLE_PI_SDD_PROFILES_KEY: "ctrl+x" }, "darwin"), "ctrl+x");
@@ -247,3 +249,109 @@ test("sdd_profile_use tool roundtrips and errors on a missing profile", async ()
 	);
 });
 
+test("modal picker gets non-empty models without a list() registry", async () => {
+	const probe = setup();
+	probe.ctx.hasUI = true;
+	probe.ctx.modelRegistry = {}; // No list(), no getAvailable(): fallback must kick in.
+	let captured: unknown = undefined;
+	probe.ctx.ui.custom = async (render: (...a: any[]) => any) => {
+		const fakeTui = { terminal: { rows: 24 }, requestRender: () => {} };
+		const view = render(fakeTui, { fg: (_c: string, t: string) => t }, {}, () => {});
+		captured = (view as { availableModels?: unknown }).availableModels;
+		return null;
+	};
+	const entry = [...probe.shortcuts.values()][0];
+	assert.ok(entry, "shortcut registered");
+	await entry.handler(probe.ctx);
+	assert.ok(Array.isArray(captured), "models passed to view");
+	assert.ok((captured as string[]).length > 0, "picker models non-empty via fallback");
+	assert.ok((captured as string[]).some((m) => m.includes("/")), "provider/model shape");
+});
+
+test("show prints detail, errors when missing", async () => {
+	const { handler, ctx, manager } = setup();
+	saveForTest(manager, "alpha");
+	const out = (await handler("show alpha", ctx)) as string;
+	assert.match(out, /Profile: alpha/);
+	const missing = (await handler("show ghost", ctx)) as string;
+	assert.match(missing, /not found/i);
+	const usage = (await handler("show", ctx)) as string;
+	assert.match(usage, /Usage:/);
+});
+
+test("create makes a profile, duplicate errors", async () => {
+	const { handler, ctx, manager, notices } = setup();
+	const out = (await handler("create brand-new openai/gpt-4o", ctx)) as string;
+	assert.match(out, /brand-new/);
+	assert.ok(manager.loadProfile("brand-new"), "created profile loads");
+	const dup = (await handler("create brand-new", ctx)) as string;
+	assert.match(dup, /already exists/i);
+	assert.ok(notices.some((n) => n.message === dup && n.level === "error"));
+	const usage = (await handler("create", ctx)) as string;
+	assert.match(usage, /Usage:/);
+});
+
+test("set assigns agent model, errors on unknown agent and missing profile", async () => {
+	const { handler, ctx, manager } = setup();
+	saveForTest(manager, "alpha");
+	const out = (await handler("set alpha sdd-explore openai/gpt-4o", ctx)) as string;
+	assert.match(out, /sdd-explore/);
+	assert.equal(manager.loadProfile("alpha")?.model_profiles?.["sdd-explore"]?.model, "openai/gpt-4o");
+	const unknownAgent = (await handler("set alpha nope-agent openai/gpt-4o", ctx)) as string;
+	assert.match(unknownAgent, /Unknown agent/i);
+	const missing = (await handler("set ghost sdd-explore openai/gpt-4o", ctx)) as string;
+	assert.match(missing, /not found/i);
+	const usage = (await handler("set alpha", ctx)) as string;
+	assert.match(usage, /Usage:/);
+});
+
+test("helper commands list/save/rename/delete roundtrip", async () => {
+	const { commands, ctx, manager } = setup();
+	for (const name of [GENTLE_SDD_PROFILE_LIST_COMMAND, GENTLE_SDD_PROFILE_SAVE_COMMAND, GENTLE_SDD_PROFILE_RENAME_COMMAND, GENTLE_SDD_PROFILE_DELETE_COMMAND]) {
+		assert.ok(commands.has(name), `${name} registered`);
+	}
+	saveForTest(manager, "alpha");
+	const list = (await commands.get(GENTLE_SDD_PROFILE_LIST_COMMAND)!.handler("", ctx)) as string;
+	assert.match(list, /alpha/);
+	const saved = (await commands.get(GENTLE_SDD_PROFILE_SAVE_COMMAND)!.handler("snap snap desc", ctx)) as string;
+	assert.match(saved, /snap/);
+	assert.ok(manager.loadProfile("snap"), "helper save persists");
+	const renamed = (await commands.get(GENTLE_SDD_PROFILE_RENAME_COMMAND)!.handler("snap snap2", ctx)) as string;
+	assert.match(renamed, /snap2/);
+	manager.activateProfile("alpha");
+	const deleted = (await commands.get(GENTLE_SDD_PROFILE_DELETE_COMMAND)!.handler("snap2", ctx)) as string;
+	assert.match(deleted, /Deleted/i);
+	assert.equal(manager.loadProfile("snap2"), null);
+});
+
+test("helper delete refuses the active profile", async () => {
+	const { commands, ctx, manager } = setup();
+	saveForTest(manager, "live");
+	manager.activateProfile("live");
+	const out = (await commands.get(GENTLE_SDD_PROFILE_DELETE_COMMAND)!.handler("live", ctx)) as string;
+	assert.match(out, /active/i);
+	assert.ok(manager.loadProfile("live"), "active profile kept");
+});
+
+test("sdd_profile_rename and sdd_profile_delete tools roundtrip with guards", async () => {
+	const { tools, ctx, manager } = setup();
+	const rename = tools.get(SDD_PROFILE_TOOL_RENAME);
+	const del = tools.get(SDD_PROFILE_TOOL_DELETE);
+	assert.ok(rename, "rename tool registered");
+	assert.ok(del, "delete tool registered");
+	saveForTest(manager, "old");
+	const r = await rename.execute("id", { old_name: "old", new_name: "new" }, undefined, undefined, ctx);
+	assert.match(JSON.parse(r.content[0].text).message, /new/);
+	assert.ok(manager.loadProfile("new"), "renamed profile loads");
+	saveForTest(manager, "live");
+	manager.activateProfile("live");
+	const refused = await del.execute("id", { profile_name: "live" }, undefined, undefined, ctx);
+	assert.match(JSON.parse(refused.content[0].text).message, /active/i);
+	assert.ok(manager.loadProfile("live"), "active profile kept");
+	const missing = await del.execute("id", { profile_name: "ghost" }, undefined, undefined, ctx);
+	assert.match(JSON.parse(missing.content[0].text).message, /not found/i);
+	manager.activateProfile("new");
+	const okDel = await del.execute("id", { profile_name: "live" }, undefined, undefined, ctx);
+	// live is no longer active (new is), so delete succeeds.
+	assert.equal(JSON.parse(okDel.content[0].text).success, true);
+});
