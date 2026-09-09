@@ -164,3 +164,209 @@ export function sanitizeProfileName(name: string): string {
 	return name.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "-");
 }
 
+export class SddProfileManager {
+	readonly globalDir: string;
+	readonly projectDir: string;
+	readonly builtinsDir?: string;
+	readonly activeStatePath: string;
+	readonly globalSubagentsPath: string;
+	readonly projectSubagentsPath: string;
+
+	constructor(options: ManagerOptions = {}) {
+		const agentHome = resolveGentlePiAgentHome();
+		this.globalDir = options.globalDir ?? path.join(agentHome, "profiles");
+		this.projectDir = options.projectDir ?? path.join(process.cwd(), ".pi", "profiles");
+		this.builtinsDir = options.builtinsDir;
+		this.activeStatePath = options.activeStatePath ?? path.join(this.globalDir, ".active");
+		this.globalSubagentsPath = options.globalSubagentsPath ?? path.join(agentHome, "subagents.json");
+		this.projectSubagentsPath =
+			options.projectSubagentsPath ?? path.join(process.cwd(), ".pi", "subagents.json");
+	}
+
+	sanitizeName(name: string): string {
+		return sanitizeProfileName(name);
+	}
+
+	private getDeletedProfilesPath(): string {
+		return path.join(this.globalDir, ".deleted-profiles");
+	}
+
+	private getDeletedProfiles(): Set<string> {
+		const filePath = this.getDeletedProfilesPath();
+		if (!fs.existsSync(filePath)) return new Set();
+		try {
+			const raw = fs.readFileSync(filePath, "utf-8");
+			return new Set(raw.split("\n").map((s) => this.sanitizeName(s)).filter(Boolean));
+		} catch {
+			return new Set();
+		}
+	}
+
+	private addDeletedProfile(name: string): void {
+		const set = this.getDeletedProfiles();
+		set.add(this.sanitizeName(name));
+		try {
+			if (!fs.existsSync(this.globalDir)) fs.mkdirSync(this.globalDir, { recursive: true });
+			fs.writeFileSync(this.getDeletedProfilesPath(), Array.from(set).join("\n"), "utf-8");
+		} catch {}
+	}
+
+	private removeDeletedProfile(name: string): void {
+		const set = this.getDeletedProfiles();
+		const key = this.sanitizeName(name);
+		if (set.has(key)) {
+			set.delete(key);
+			try {
+				fs.writeFileSync(this.getDeletedProfilesPath(), Array.from(set).join("\n"), "utf-8");
+			} catch {}
+		}
+	}
+
+	private readProfilesFromDir(
+		dir: string,
+		scope: ProfileScope,
+	): Map<string, { profile: Profile; path: string }> {
+		const map = new Map<string, { profile: Profile; path: string }>();
+		if (!fs.existsSync(dir)) return map;
+		const deleted = scope === "builtin" ? this.getDeletedProfiles() : new Set<string>();
+		try {
+			for (const file of fs.readdirSync(dir)) {
+				if (!file.endsWith(".json") || file.startsWith(".")) continue;
+				const filePath = path.join(dir, file);
+				try {
+					const data = JSON.parse(fs.readFileSync(filePath, "utf-8")) as Profile;
+					if (data && typeof data === "object" && data.name) {
+						const key = this.sanitizeName(data.name);
+						if (deleted.has(key)) continue;
+						map.set(key, { profile: data, path: filePath });
+					}
+				} catch {}
+			}
+		} catch {}
+		return map;
+	}
+
+	listProfiles(): ProfileSummary[] {
+		const deleted = this.getDeletedProfiles();
+		const merged = new Map<string, { profile: Profile; scope: ProfileScope; path?: string }>();
+		for (const [key, profile] of Object.entries(BUILTIN_PROFILES)) {
+			const norm = this.sanitizeName(key);
+			if (!deleted.has(norm)) merged.set(norm, { profile, scope: "builtin" });
+		}
+		if (this.builtinsDir) {
+			for (const [key, val] of this.readProfilesFromDir(this.builtinsDir, "builtin")) {
+				merged.set(key, { profile: val.profile, scope: "builtin", path: val.path });
+			}
+		}
+		for (const [key, val] of this.readProfilesFromDir(this.globalDir, "global")) {
+			merged.set(key, { profile: val.profile, scope: "global", path: val.path });
+		}
+		for (const [key, val] of this.readProfilesFromDir(this.projectDir, "project")) {
+			merged.set(key, { profile: val.profile, scope: "project", path: val.path });
+		}
+		const active = this.getActiveProfileName();
+		const out: ProfileSummary[] = [];
+		for (const item of merged.values()) {
+			out.push({
+				name: item.profile.name,
+				description: item.profile.description,
+				default_model: item.profile.default_model,
+				agent_count: Object.keys(item.profile.model_profiles ?? {}).length,
+				scope: item.scope,
+				is_active: Boolean(
+					active && this.sanitizeName(item.profile.name) === this.sanitizeName(active),
+				),
+				path: item.path,
+			});
+		}
+		return out.sort((a, b) => a.name.localeCompare(b.name));
+	}
+
+	loadProfile(name: string): Profile | null {
+		const key = this.sanitizeName(name);
+		const projectPath = path.join(this.projectDir, `${key}.json`);
+		if (fs.existsSync(projectPath)) {
+			try {
+				return JSON.parse(fs.readFileSync(projectPath, "utf-8")) as Profile;
+			} catch {}
+		}
+		const globalPath = path.join(this.globalDir, `${key}.json`);
+		if (fs.existsSync(globalPath)) {
+			try {
+				return JSON.parse(fs.readFileSync(globalPath, "utf-8")) as Profile;
+			} catch {}
+		}
+		if (!this.getDeletedProfiles().has(key)) {
+			if (this.builtinsDir) {
+				const builtinPath = path.join(this.builtinsDir, `${key}.json`);
+				if (fs.existsSync(builtinPath)) {
+					try {
+						return JSON.parse(fs.readFileSync(builtinPath, "utf-8")) as Profile;
+					} catch {}
+				}
+			}
+			const builtin = BUILTIN_PROFILES[name] ?? BUILTIN_PROFILES[key];
+			if (builtin) return { ...builtin };
+		}
+		return null;
+	}
+
+	saveProfile(profile: Profile, scope: "global" | "project" = "global"): string {
+		const targetDir = scope === "project" ? this.projectDir : this.globalDir;
+		if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
+		const key = this.sanitizeName(profile.name);
+		this.removeDeletedProfile(key);
+		const targetPath = path.join(targetDir, `${key}.json`);
+		const now = new Date().toISOString();
+		const payload: Profile = { ...profile, name: profile.name.trim(), updated_at: now };
+		if (!payload.created_at) payload.created_at = now;
+		const bytes = JSON.stringify(payload, null, 2) + "\n";
+		const temp = path.join(targetDir, `.${key}.${randomUUID()}.tmp`);
+		const fd = fs.openSync(temp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+		try {
+			try {
+				fs.writeFileSync(fd, bytes);
+			} finally {
+				fs.closeSync(fd);
+			}
+			fs.renameSync(temp, targetPath);
+		} finally {
+			try {
+				fs.unlinkSync(temp);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+		}
+		return targetPath;
+	}
+
+	getActiveProfileName(): string | null {
+		if (fs.existsSync(this.projectSubagentsPath)) {
+			try {
+				const config = JSON.parse(
+					fs.readFileSync(this.projectSubagentsPath, "utf-8"),
+				) as SubagentsConfigFile;
+				if (typeof config.active_profile === "string" && config.active_profile.trim()) {
+					return config.active_profile.trim();
+				}
+			} catch {}
+		}
+		if (fs.existsSync(this.activeStatePath)) {
+			try {
+				const content = fs.readFileSync(this.activeStatePath, "utf-8").trim();
+				if (content) return content;
+			} catch {}
+		}
+		if (fs.existsSync(this.globalSubagentsPath)) {
+			try {
+				const config = JSON.parse(
+					fs.readFileSync(this.globalSubagentsPath, "utf-8"),
+				) as SubagentsConfigFile;
+				if (typeof config.active_profile === "string" && config.active_profile.trim()) {
+					return config.active_profile.trim();
+				}
+			} catch {}
+		}
+		return null;
+	}
+}

@@ -10,6 +10,7 @@ import {
 	extractProfileFromConfig,
 	resolveAvailableModels,
 	sanitizeProfileName,
+	SddProfileManager,
 } from "../lib/sdd-profiles-manager.ts";
 
 const PROFILE: Profile = {
@@ -22,6 +23,7 @@ const PROFILE: Profile = {
 		"sdd-spec": { model: "anthropic/claude-sonnet-5", effort: "high" },
 	},
 };
+
 test("apply preserves custom props and updates model_profiles", () => {
 	const current = {
 		timeout: 5000,
@@ -93,6 +95,83 @@ test("sanitize normalizes names", () => {
 	assert.equal(sanitizeProfileName("  My Profile! "), "my-profile-");
 	assert.equal(sanitizeProfileName("UPPER_under-score"), "upper_under-score");
 	assert.equal(sanitizeProfileName("a/b c"), "a-b-c");
+});
+
+function makeManagerDirs() {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "sdd-mgr-"));
+	const globalDir = path.join(root, "global");
+	const projectDir = path.join(root, "project");
+	const builtinsDir = path.join(root, "builtins");
+	fs.mkdirSync(globalDir, { recursive: true });
+	fs.mkdirSync(projectDir, { recursive: true });
+	fs.mkdirSync(builtinsDir, { recursive: true });
+	return {
+		root,
+		globalDir,
+		projectDir,
+		builtinsDir,
+		activeStatePath: path.join(root, ".active"),
+		globalSubagentsPath: path.join(root, "global-subagents.json"),
+		projectSubagentsPath: path.join(root, "project-subagents.json"),
+	};
+}
+
+function writeProfile(dir: string, profile: Profile): void {
+	fs.writeFileSync(path.join(dir, `${profile.name}.json`), JSON.stringify(profile));
+}
+
+const MIN_PROFILE = (name: string, model = "a/b"): Profile => ({ name, model_profiles: { x: { model } } });
+
+test("listProfiles includes embedded builtins", () => {
+	const d = makeManagerDirs();
+	const mgr = new SddProfileManager({ ...d });
+	const names = new Map(mgr.listProfiles().map((p) => [p.name, p]));
+	assert.ok(names.has("gentle-default"));
+	assert.equal(names.get("gentle-default")?.scope, "builtin");
+	assert.equal(names.get("gentle-default")?.is_active, false);
+});
+
+test("listProfiles precedence is project over global over builtin", () => {
+	const d = makeManagerDirs();
+	writeProfile(d.globalDir, { ...MIN_PROFILE("gentle-default"), default_model: "global/m" });
+	writeProfile(d.projectDir, { ...MIN_PROFILE("gentle-default"), default_model: "project/m" });
+	const mgr = new SddProfileManager({ ...d });
+	const found = mgr.listProfiles().find((p) => p.name === "gentle-default");
+	assert.equal(found?.scope, "project");
+	assert.equal(found?.default_model, "project/m");
+});
+
+test("listProfiles hides tombstoned builtin", () => {
+	const d = makeManagerDirs();
+	fs.writeFileSync(path.join(d.globalDir, ".deleted-profiles"), "gentle-default\n");
+	const mgr = new SddProfileManager({ ...d });
+	assert.ok(!mgr.listProfiles().some((p) => p.name === "gentle-default"));
+	assert.equal(mgr.loadProfile("gentle-default"), null);
+});
+
+test("loadProfile falls back project, global, builtinsDir, embedded", () => {
+	const d = makeManagerDirs();
+	writeProfile(d.builtinsDir, { ...MIN_PROFILE("custom"), default_model: "builtins/m" });
+	const mgr = new SddProfileManager({ ...d });
+	assert.equal(mgr.loadProfile("custom")?.default_model, "builtins/m");
+	writeProfile(d.globalDir, { ...MIN_PROFILE("custom"), default_model: "global/m" });
+	assert.equal(mgr.loadProfile("custom")?.default_model, "global/m");
+	writeProfile(d.projectDir, { ...MIN_PROFILE("custom"), default_model: "project/m" });
+	assert.equal(mgr.loadProfile("custom")?.default_model, "project/m");
+	assert.equal(mgr.loadProfile("gentle-economy")?.name, "gentle-economy");
+	assert.equal(mgr.loadProfile("missing"), null);
+});
+
+test("getActiveProfileName prefers project subagents.json over .active file", () => {
+	const d = makeManagerDirs();
+	fs.writeFileSync(d.activeStatePath, "from-active\n");
+	fs.writeFileSync(d.projectSubagentsPath, JSON.stringify({ active_profile: "from-project" }));
+	const mgr = new SddProfileManager({ ...d });
+	assert.equal(mgr.getActiveProfileName(), "from-project");
+	fs.unlinkSync(d.projectSubagentsPath);
+	assert.equal(mgr.getActiveProfileName(), "from-active");
+	fs.unlinkSync(d.activeStatePath);
+	assert.equal(mgr.getActiveProfileName(), null);
 });
 
 test("resolveAvailableModels merges registry discovery with fallback", async () => {
