@@ -188,8 +188,17 @@ test("private candidate owner revalidates every Windows ancestor replacement bou
 	assert.deepEqual(checked, [commonDir, control, parent]);
 });
 
-test("private candidate owner rejects the actual foreign Windows system owner", { skip: process.platform !== "win32" }, () => {
-	assert.throws(() => assertTrustedWindowsOwner(join(process.env.SystemRoot!, "System32")), (error: unknown) => error instanceof WindowsOwnerValidationError && error.owner === "sid");
+test("private candidate owner rejects a controlled foreign Windows owner", { skip: process.platform !== "win32" }, (t) => {
+	const path = mkdtempSync(join(tmpdir(), "gentle-pi-foreign-owner-"));
+	t.after(() => rmSync(path, { recursive: true, force: true }));
+	try {
+		execFileSync(realpathSync.native("\\\\?\\GLOBALROOT\\SystemRoot\\System32\\icacls.exe"), [path, "/setowner", "*S-1-5-32-545"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	} catch {
+		if (process.env.GITHUB_ACTIONS === "true" || process.env.CI === "true") assert.fail("Windows CI could not assign BUILTIN\\Users as the controlled temporary directory owner");
+		t.skip("Current Windows token cannot assign BUILTIN\\Users as the controlled temporary directory owner");
+		return;
+	}
+	assert.throws(() => assertTrustedWindowsOwner(path), (error: unknown) => error instanceof WindowsOwnerValidationError && error.owner === "sid");
 });
 
 test("private candidate owner removes unrelated explicit Windows grants during enforcement", { skip: process.platform !== "win32" }, (t) => {

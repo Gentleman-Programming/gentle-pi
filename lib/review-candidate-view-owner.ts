@@ -191,6 +191,7 @@ function privateWindowsCandidateOwnerBoundary(commonDir: string, enforce = false
 	if (enforce) {
 		for (const path of boundary) validatePrivateWindowsOwner(windowsOwnerSid(path), identity.user);
 		for (const path of boundary) enforcePrivateWindowsDacl(path, identity);
+		return;
 	}
 	for (const path of boundary) assertPrivateWindowsDacl(path, true, identity);
 }
@@ -235,9 +236,9 @@ function directory(path: string, privateMode = false, platform: NodeJS.Platform 
 }
 
 export function assertCandidateOwnerParent(commonDir: string, platform: NodeJS.Platform = process.platform): string {
-	directory(commonDir);
+	directory(commonDir, false, platform);
 	const control = join(commonDir, "gentle-ai");
-	directory(control);
+	directory(control, false, platform);
 	const parent = join(commonDir, "gentle-ai", "candidate-views");
 	directory(parent, false, platform);
 	if (platform === "win32") privateWindowsCandidateOwnerBoundary(commonDir);
@@ -246,9 +247,9 @@ export function assertCandidateOwnerParent(commonDir: string, platform: NodeJS.P
 }
 
 export function prepareCandidateOwnerParent(commonDir: string, platform: NodeJS.Platform = process.platform): string {
-	directory(commonDir);
+	directory(commonDir, false, platform);
 	const control = join(commonDir, "gentle-ai");
-	directory(control);
+	directory(control, false, platform);
 	const parent = join(commonDir, "gentle-ai", "candidate-views");
 	directory(parent, false, platform);
 	if (platform === "win32") {
