@@ -40,7 +40,11 @@ test("model routing authority normalizes and preserves sync/async source status"
 			"not valid": "ignored",
 			nullValue: null,
 		}),
-		{ worker: { model: "openai/gpt-5" }, clear: {} },
+		{
+			worker: { model: "openai/gpt-5" },
+			clear: {},
+			"not valid": { model: "ignored" },
+		},
 	);
 
 	const missingPath = join(globalDir, "missing.json");
@@ -50,7 +54,7 @@ test("model routing authority normalizes and preserves sync/async source status"
 	const validGlobalPath = join(globalDir, "valid.json");
 	writeFileSync(
 		validGlobalPath,
-		JSON.stringify({ worker: "openai/gpt-5", reviewer: { thinking: "medium" }, "not valid": "openai/gpt-4" }),
+		JSON.stringify({ worker: "openai/gpt-5", reviewer: { thinking: "medium" }, clear: {}, "not valid/+": "openai/gpt-4" }),
 	);
 	const validSync = authority.readModelConfigFile(validGlobalPath);
 	const validAsync = await authority.readModelConfigFileAsync(validGlobalPath);
@@ -59,10 +63,45 @@ test("model routing authority normalizes and preserves sync/async source status"
 		config: {
 			worker: { model: "openai/gpt-5" },
 			reviewer: { model: undefined, thinking: "medium" },
-			"not valid": { model: "openai/gpt-4" },
+			clear: {},
+			"not valid/+": { model: "openai/gpt-4" },
 		},
 	});
 	assert.deepEqual(validAsync, validSync);
+
+	for (const [label, value] of [
+		["padded", { worker: "inherit", " worker ": "openai/gpt-5" }],
+		["quote", { worker: "inherit", 'bad"name': "openai/gpt-5" }],
+		["c0", { worker: "inherit", [`bad\u0000name`]: "openai/gpt-5" }],
+		["c1", { worker: "inherit", [`bad\u0080name`]: "openai/gpt-5" }],
+		["null", { valid: "inherit", worker: null }],
+		["entry", { valid: "inherit", worker: { model: "not valid" } }],
+		[
+			"partial-model",
+			{ valid: "inherit", worker: { model: "not valid", thinking: "high" } },
+		],
+		[
+			"partial-thinking",
+			{ valid: "inherit", worker: { model: "openai/gpt-5", thinking: "invalid" } },
+		],
+		[
+			"unknown-entry-field",
+			{ valid: "inherit", worker: { model: "openai/gpt-5", extra: true } },
+		],
+	] as const) {
+		await t.test(label, async () => {
+			const path = join(globalDir, `${label}.json`);
+			writeFileSync(path, JSON.stringify(value));
+			const expected = { status: "invalid" as const, path };
+			assert.deepEqual(
+				[
+					authority.readModelConfigFile(path),
+					await authority.readModelConfigFileAsync(path),
+				],
+				[expected, expected],
+			);
+		});
+	}
 
 	const invalidGlobalPath = join(globalDir, "invalid.json");
 	writeFileSync(invalidGlobalPath, "[]");
@@ -176,7 +215,7 @@ test("saved-routing apply fails closed for invalid project and global sources", 
 		return { updated: 0, skipped: 0 };
 	};
 
-	for (const projectValue of ["{", "[]", "null"] as const) {
+	for (const projectValue of ["{", "[]", "null", '{" worker":"openai/gpt-5"}'] as const) {
 		writeFileSync(projectPath, projectValue);
 		const before = statSync(profilePath);
 		const result = await applySavedModelConfig(context, applyConfig);
@@ -252,7 +291,7 @@ test("saved-routing apply preserves missing, valid, null, inherit, and omission 
 	const afterValid = statSync(profilePath);
 	writeFileSync(projectPath, JSON.stringify({ worker: null }));
 	const nullEntry = await applySavedModelConfig(context);
-	assert.equal(nullEntry.invalidPath, undefined);
+	assert.equal(nullEntry.invalidPath, projectPath);
 	assert.equal(readFileSync(profilePath, "utf8"), afterValidBytes);
 	assert.equal(statSync(profilePath).mtimeMs, afterValid.mtimeMs);
 	assert.doesNotMatch(readFileSync(agentPath, "utf8"), /model: null/);
