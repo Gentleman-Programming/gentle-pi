@@ -36,8 +36,16 @@ import {
 	runOpaquePiReviewer,
 	type OpaquePiReviewerResult,
 } from "./opaque-pi-reviewer-adapter.ts";
-import { REVIEW_PROVIDER_ROLE_CAPTURE_OPERATION, REVIEW_PROVIDER_ROLE_CAPTURE_OPERATIONS, type ReviewCaptureSubmissionV1, type ReviewCollectInputV3 } from "./review-integration-v2.ts";
-import { GENTLE_PI_REVIEW_RELAY_CONTRACT, GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV } from "./review-relay-contract.ts";
+import {
+	REVIEW_PROVIDER_ROLE_CAPTURE_OPERATION,
+	REVIEW_PROVIDER_ROLE_CAPTURE_OPERATIONS,
+	type ReviewCaptureSubmissionV1,
+	type ReviewCollectInputV3,
+} from "./review-integration-v2.ts";
+import {
+	GENTLE_PI_REVIEW_RELAY_CONTRACT,
+	GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV,
+} from "./review-relay-contract.ts";
 
 // Compatibility export for existing relay consumers. The pure adapter owns the
 // fixed Pi process boundary and its locked-down argv.
@@ -62,7 +70,8 @@ export const REVIEW_HOST_RELAY_FAILURE = {
 	PI_EMPTY_OUTPUT: "pi-empty-output",
 	SUBMISSION_REFUSED: "submission-refused",
 } as const;
-export type ReviewHostRelayFailureKind = (typeof REVIEW_HOST_RELAY_FAILURE)[keyof typeof REVIEW_HOST_RELAY_FAILURE];
+export type ReviewHostRelayFailureKind =
+	(typeof REVIEW_HOST_RELAY_FAILURE)[keyof typeof REVIEW_HOST_RELAY_FAILURE];
 
 export type ReviewHostRelayStage = "binding" | "materialize" | "pi" | "submit";
 
@@ -90,7 +99,19 @@ export class ReviewHostRelayError extends Error {
 	// "none" again: the provider states that the lens slot was not consumed
 	// (gentle-pi#522 / #524).
 	readonly mutationOutcome: "none" | "unknown";
-	constructor(kind: ReviewHostRelayFailureKind, stage: ReviewHostRelayStage, message: string, details?: { exitCode?: number | null; stderr?: string; timedOut?: boolean; elapsedMs?: number; timeoutMs?: number; mutationOutcome?: "none" | "unknown" }) {
+	constructor(
+		kind: ReviewHostRelayFailureKind,
+		stage: ReviewHostRelayStage,
+		message: string,
+		details?: {
+			exitCode?: number | null;
+			stderr?: string;
+			timedOut?: boolean;
+			elapsedMs?: number;
+			timeoutMs?: number;
+			mutationOutcome?: "none" | "unknown";
+		},
+	) {
 		super(message);
 		this.name = "ReviewHostRelayError";
 		this.kind = kind;
@@ -100,7 +121,8 @@ export class ReviewHostRelayError extends Error {
 		this.timedOut = details?.timedOut ?? false;
 		this.elapsedMs = details?.elapsedMs ?? null;
 		this.timeoutMs = details?.timeoutMs ?? null;
-		this.mutationOutcome = details?.mutationOutcome ?? (stage === "submit" ? "unknown" : "none");
+		this.mutationOutcome =
+			details?.mutationOutcome ?? (stage === "submit" ? "unknown" : "none");
 	}
 }
 
@@ -111,8 +133,13 @@ export class ReviewHostRelayError extends Error {
 // typed shape; it never parses the reason, and it never retries.
 const ADMISSION_REFUSAL = /\[invalid_request\]/;
 
-export function isReviewHostRelayAdmissionRefusal(capture: { exitCode: number | null; timedOut: boolean }, stderr: string): boolean {
-	return capture.exitCode === 1 && !capture.timedOut && ADMISSION_REFUSAL.test(stderr);
+export function isReviewHostRelayAdmissionRefusal(
+	capture: { exitCode: number | null; timedOut: boolean },
+	stderr: string,
+): boolean {
+	return (
+		capture.exitCode === 1 && !capture.timedOut && ADMISSION_REFUSAL.test(stderr)
+	);
 }
 
 // Refusal classification for the materialize invocation. The installed
@@ -125,7 +152,8 @@ export function isReviewHostRelayAdmissionRefusal(capture: { exitCode: number | 
 //                 untouched.
 //   handshake     the provider's pre-authority pi admission refusal — always
 //                 surfaced verbatim, never worked around.
-const UNKNOWN_FLAG_REFUSAL = /flag provided but not defined: -{1,2}(?:materialize|agent)\b/;
+const UNKNOWN_FLAG_REFUSAL =
+	/flag provided but not defined: -{1,2}(?:materialize|agent)\b/;
 const HANDSHAKE_REFUSAL = new RegExp(
 	[
 		GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV,
@@ -134,7 +162,9 @@ const HANDSHAKE_REFUSAL = new RegExp(
 	].join("|"),
 );
 
-export function classifyReviewHostRelayRefusal(stderr: string): "unknown-flag" | "handshake" | "other" {
+export function classifyReviewHostRelayRefusal(
+	stderr: string,
+): "unknown-flag" | "handshake" | "other" {
 	if (UNKNOWN_FLAG_REFUSAL.test(stderr)) return "unknown-flag";
 	if (HANDSHAKE_REFUSAL.test(stderr)) return "handshake";
 	return "other";
@@ -161,29 +191,50 @@ export interface ReviewHostRelaySlot {
 	readonly subjectHash?: string;
 }
 
-function argumentValue(input: ReviewCollectInputV3, name: string): string | undefined {
+function argumentValue(
+	input: ReviewCollectInputV3,
+	name: string,
+): string | undefined {
 	const matches = input.arguments.filter((argument) => argument.name === name);
 	return matches.length === 1 ? matches[0]!.value : undefined;
 }
 
-function renderToken(argument: ReviewCollectInputV3["arguments"][number]): string {
+function renderToken(
+	argument: ReviewCollectInputV3["arguments"][number],
+): string {
 	return argument.token ?? `--${argument.name}=${argument.value}`;
 }
 
-export function isReviewHostRelayCollectInput(input: ReviewCollectInputV3): boolean {
-	return input.captureOperation === "review.capture-result"
-		&& argumentValue(input, "materialize") === "true"
-		&& argumentValue(input, "agent") === "pi";
+export function isReviewHostRelayCollectInput(
+	input: ReviewCollectInputV3,
+): boolean {
+	return (
+		input.captureOperation === "review.capture-result" &&
+		argumentValue(input, "materialize") === "true" &&
+		argumentValue(input, "agent") === "pi"
+	);
 }
 
-export function reviewHostRelaySlots(inputs: readonly ReviewCollectInputV3[]): readonly ReviewHostRelaySlot[] {
-	return inputs.filter((input) => isReviewHostRelayCollectInput(input)).map((input) => ({
-		captureArgumentTokens: input.arguments.map((argument) => renderToken(argument)),
-		...(input.submission === undefined ? {} : { submission: input.submission }),
-		...(argumentValue(input, "lens") === undefined ? {} : { lens: argumentValue(input, "lens") }),
-		...(argumentValue(input, "order") === undefined ? {} : { order: argumentValue(input, "order") }),
-		...(input.artifactSubject === undefined ? {} : { subjectHash: input.artifactSubject.subjectHash }),
-	}));
+export function reviewHostRelaySlots(
+	inputs: readonly ReviewCollectInputV3[],
+): readonly ReviewHostRelaySlot[] {
+	return inputs
+		.filter((input) => isReviewHostRelayCollectInput(input))
+		.map((input) => ({
+			captureArgumentTokens: input.arguments.map((argument) =>
+				renderToken(argument),
+			),
+			...(input.submission === undefined ? {} : { submission: input.submission }),
+			...(argumentValue(input, "lens") === undefined
+				? {}
+				: { lens: argumentValue(input, "lens") }),
+			...(argumentValue(input, "order") === undefined
+				? {}
+				: { order: argumentValue(input, "order") }),
+			...(input.artifactSubject === undefined
+				? {}
+				: { subjectHash: input.artifactSubject.subjectHash }),
+		}));
 }
 
 // ---------------------------------------------------------------------------
@@ -206,65 +257,92 @@ export interface ReviewProviderRoleVectorSlot {
 	readonly name: string;
 }
 
-export function isReviewProviderRoleVectorInput(input: ReviewCollectInputV3): boolean {
-	return (REVIEW_PROVIDER_ROLE_CAPTURE_OPERATIONS as readonly string[]).includes(input.captureOperation)
-		&& argumentValue(input, "execute") === "true"
-		&& argumentValue(input, "agent") === "pi";
+export function isReviewProviderRoleVectorInput(
+	input: ReviewCollectInputV3,
+): boolean {
+	return (
+		(REVIEW_PROVIDER_ROLE_CAPTURE_OPERATIONS as readonly string[]).includes(
+			input.captureOperation,
+		) &&
+		argumentValue(input, "execute") === "true" &&
+		argumentValue(input, "agent") === "pi"
+	);
 }
 
-    export function reviewProviderRoleVectorSlots(inputs: readonly ReviewCollectInputV3[]): readonly ReviewProviderRoleVectorSlot[] {
-    	return inputs.filter((input) => isReviewProviderRoleVectorInput(input)).map((input) => ({
-    		captureOperation: input.captureOperation as ReviewProviderRoleVectorSlot["captureOperation"],
-    		argumentTokens: input.arguments.map((argument) => renderToken(argument)),
-    		name: input.name,
-    	}));
-    }
+export function reviewProviderRoleVectorSlots(
+	inputs: readonly ReviewCollectInputV3[],
+): readonly ReviewProviderRoleVectorSlot[] {
+	return inputs
+		.filter((input) => isReviewProviderRoleVectorInput(input))
+		.map((input) => ({
+			captureOperation:
+				input.captureOperation as ReviewProviderRoleVectorSlot["captureOperation"],
+			argumentTokens: input.arguments.map((argument) => renderToken(argument)),
+			name: input.name,
+		}));
+}
 
-    // ---------------------------------------------------------------------------
-    // Execute vector for review.capture-result (gentle-pi execute-native compat)
-    //
-    // A self-contained execute vector for `review.capture-result` with
-    // `--agent=pi --execute=true`. Unlike the materialize path (which materializes
-    // a prompt, runs Pi, and submits the result), the execute path is handled
-    // by the native CLI directly: Go materializes the prompt, spawns its locked-down
-    // pi subprocess, and admits the raw verdict. This mirrors the provider role
-    // vector pattern but for the reviewer capture operation.
-    // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Execute vector for review.capture-result (gentle-pi execute-native compat)
+//
+// A self-contained execute vector for `review.capture-result` with
+// `--agent=pi --execute=true`. Unlike the materialize path (which materializes
+// a prompt, runs Pi, and submits the result), the execute path is handled
+// by the native CLI directly: Go materializes the prompt, spawns its locked-down
+// pi subprocess, and admits the raw verdict. This mirrors the provider role
+// vector pattern but for the reviewer capture operation.
+// ---------------------------------------------------------------------------
 
-    export interface ReviewHostRelayExecuteSlot {
-    	/** Every provider-issued argument token, verbatim, in provider order. */
-    	readonly captureArgumentTokens: readonly string[];
-    	readonly lens?: string;
-    	readonly order?: string;
-    	readonly subjectHash?: string;
-    }
+export interface ReviewHostRelayExecuteSlot {
+	/** Every provider-issued argument token, verbatim, in provider order. */
+	readonly captureArgumentTokens: readonly string[];
+	readonly lens?: string;
+	readonly order?: string;
+	readonly subjectHash?: string;
+}
 
-    /**
-     * Classifies a collect input as an execute vector for review.capture-result.
-     * Matches: captureOperation === "review.capture-result" && agent === "pi" && execute === "true"
-     *
-     * This is distinct from the materialize path which requires materialize === "true".
-     */
-    export function isReviewHostRelayExecuteInput(input: ReviewCollectInputV3): boolean {
-    	return input.captureOperation === "review.capture-result"
-    		&& argumentValue(input, "agent") === "pi"
-    		&& argumentValue(input, "execute") === "true";
-    }
+/**
+ * Classifies a collect input as an execute vector for review.capture-result.
+ * Matches: captureOperation === "review.capture-result" && agent === "pi" && execute === "true"
+ *
+ * This is distinct from the materialize path which requires materialize === "true".
+ */
+export function isReviewHostRelayExecuteInput(
+	input: ReviewCollectInputV3,
+): boolean {
+	return (
+		input.captureOperation === "review.capture-result" &&
+		argumentValue(input, "agent") === "pi" &&
+		argumentValue(input, "execute") === "true"
+	);
+}
 
-    /**
-     * Extracts execute vector slots from collect inputs.
-     * Returns slots for review.capture-result with agent=pi and execute=true.
-     */
-    export function reviewHostRelayExecuteSlots(inputs: readonly ReviewCollectInputV3[]): readonly ReviewHostRelayExecuteSlot[] {
-    	return inputs.filter((input) => isReviewHostRelayExecuteInput(input)).map((input) => ({
-    		captureArgumentTokens: input.arguments.map((argument) => renderToken(argument)),
-    		...(argumentValue(input, "lens") === undefined ? {} : { lens: argumentValue(input, "lens") }),
-    		...(argumentValue(input, "order") === undefined ? {} : { order: argumentValue(input, "order") }),
-    		...(input.artifactSubject === undefined ? {} : { subjectHash: input.artifactSubject.subjectHash }),
-    	}));
-    }
+/**
+ * Extracts execute vector slots from collect inputs.
+ * Returns slots for review.capture-result with agent=pi and execute=true.
+ */
+export function reviewHostRelayExecuteSlots(
+	inputs: readonly ReviewCollectInputV3[],
+): readonly ReviewHostRelayExecuteSlot[] {
+	return inputs
+		.filter((input) => isReviewHostRelayExecuteInput(input))
+		.map((input) => ({
+			captureArgumentTokens: input.arguments.map((argument) =>
+				renderToken(argument),
+			),
+			...(argumentValue(input, "lens") === undefined
+				? {}
+				: { lens: argumentValue(input, "lens") }),
+			...(argumentValue(input, "order") === undefined
+				? {}
+				: { order: argumentValue(input, "order") }),
+			...(input.artifactSubject === undefined
+				? {}
+				: { subjectHash: input.artifactSubject.subjectHash }),
+		}));
+}
 
-    // Resolves the provider-owned submission form into an executable binding.
+// Resolves the provider-owned submission form into an executable binding.
 // Fails closed with a typed contract-mismatch error whenever the completing
 // form is absent or cannot bind exactly one artifact value; the relay never
 // repairs, filters, or synthesizes it.
@@ -274,25 +352,65 @@ export interface ReviewHostRelaySubmissionBinding {
 	readonly substitutionLocation: number;
 }
 
-export function resolveReviewHostRelaySubmission(submission: ReviewCaptureSubmissionV1 | undefined): ReviewHostRelaySubmissionBinding {
+export function resolveReviewHostRelaySubmission(
+	submission: ReviewCaptureSubmissionV1 | undefined,
+): ReviewHostRelaySubmissionBinding {
 	if (submission === undefined) {
-		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_CONTRACT_MISMATCH, "binding", REVIEW_HOST_RELAY_SUBMISSION_MISSING_MESSAGE);
+		throw new ReviewHostRelayError(
+			REVIEW_HOST_RELAY_FAILURE.SUBMISSION_CONTRACT_MISMATCH,
+			"binding",
+			REVIEW_HOST_RELAY_SUBMISSION_MISSING_MESSAGE,
+		);
 	}
-	if (submission.operationToken.length === 0 || submission.argumentTokens.length === 0 || submission.argumentTokens.some((token) => typeof token !== "string" || token.length === 0)) {
-		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_CONTRACT_MISMATCH, "binding", "provider contract mismatch: the submission form carries an empty operation or argument token");
+	if (
+		submission.operationToken.length === 0 ||
+		submission.argumentTokens.length === 0 ||
+		submission.argumentTokens.some(
+			(token) => typeof token !== "string" || token.length === 0,
+		)
+	) {
+		throw new ReviewHostRelayError(
+			REVIEW_HOST_RELAY_FAILURE.SUBMISSION_CONTRACT_MISMATCH,
+			"binding",
+			"provider contract mismatch: the submission form carries an empty operation or argument token",
+		);
 	}
 	if (submission.values.length !== 1) {
-		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_CONTRACT_MISMATCH, "binding", `provider contract mismatch: the submission form must bind exactly one artifact value, received ${submission.values.length}`);
+		throw new ReviewHostRelayError(
+			REVIEW_HOST_RELAY_FAILURE.SUBMISSION_CONTRACT_MISMATCH,
+			"binding",
+			`provider contract mismatch: the submission form must bind exactly one artifact value, received ${submission.values.length}`,
+		);
 	}
 	const value = submission.values[0]!;
 	const location = value.substitutionLocation;
-	if (!Number.isSafeInteger(location) || location < 0 || location >= submission.argumentTokens.length) {
-		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_CONTRACT_MISMATCH, "binding", "provider contract mismatch: the submission substitution location is outside its argument tokens");
+	if (
+		!Number.isSafeInteger(location) ||
+		location < 0 ||
+		location >= submission.argumentTokens.length
+	) {
+		throw new ReviewHostRelayError(
+			REVIEW_HOST_RELAY_FAILURE.SUBMISSION_CONTRACT_MISMATCH,
+			"binding",
+			"provider contract mismatch: the submission substitution location is outside its argument tokens",
+		);
 	}
-	if (!submission.argumentTokens[location]!.includes(REVIEW_HOST_RELAY_SUBMISSION_VALUE_SLOT)) {
-		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_CONTRACT_MISMATCH, "binding", `provider contract mismatch: the submission token at location ${location} carries no ${REVIEW_HOST_RELAY_SUBMISSION_VALUE_SLOT} slot`);
+	if (
+		!submission.argumentTokens[location]!.includes(
+			REVIEW_HOST_RELAY_SUBMISSION_VALUE_SLOT,
+		)
+	) {
+		throw new ReviewHostRelayError(
+			REVIEW_HOST_RELAY_FAILURE.SUBMISSION_CONTRACT_MISMATCH,
+			"binding",
+			`provider contract mismatch: the submission token at location ${location} carries no ${REVIEW_HOST_RELAY_SUBMISSION_VALUE_SLOT} slot`,
+		);
 	}
-	return { operationToken: submission.operationToken, argumentTokens: submission.argumentTokens, substitutionLocation: location };
+	return {
+		operationToken: submission.operationToken,
+		argumentTokens: submission.argumentTokens,
+		substitutionLocation: location,
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -336,11 +454,20 @@ export interface ReviewHostRelayPreparedResult {
 	readonly resultByteLength: number;
 }
 
-const preparedResultBytes = new WeakMap<ReviewHostRelayPreparedResult, Buffer>();
+const preparedResultBytes = new WeakMap<
+	ReviewHostRelayPreparedResult,
+	Buffer
+>();
 
-export type ReviewHostRelayRunner = (request: ReviewHostRelayRequest) => Promise<ReviewHostRelayResult>;
-export type ReviewHostRelayPreparationRunner = (request: ReviewHostRelayRequest) => Promise<ReviewHostRelayPreparedResult>;
-export type ReviewHostRelaySubmissionRunner = (prepared: ReviewHostRelayPreparedResult) => Promise<ReviewHostRelayResult>;
+export type ReviewHostRelayRunner = (
+	request: ReviewHostRelayRequest,
+) => Promise<ReviewHostRelayResult>;
+export type ReviewHostRelayPreparationRunner = (
+	request: ReviewHostRelayRequest,
+) => Promise<ReviewHostRelayPreparedResult>;
+export type ReviewHostRelaySubmissionRunner = (
+	prepared: ReviewHostRelayPreparedResult,
+) => Promise<ReviewHostRelayResult>;
 
 const DEFAULT_GENTLE_AI_TIMEOUT_MS = 120_000;
 
@@ -370,29 +497,47 @@ const DEFAULT_GENTLE_AI_TIMEOUT_MS = 120_000;
 // turn a foreground FINALIZE into an unbounded child process.
 // ---------------------------------------------------------------------------
 
-export const REVIEW_HOST_RELAY_PI_TIMEOUT_ENV = "GENTLE_PI_REVIEW_RELAY_PI_TIMEOUT_MS";
+export const REVIEW_HOST_RELAY_PI_TIMEOUT_ENV =
+	"GENTLE_PI_REVIEW_RELAY_PI_TIMEOUT_MS";
 export const REVIEW_HOST_RELAY_PI_TIMEOUT_FLOOR_MS = 900_000;
 export const REVIEW_HOST_RELAY_PI_TIMEOUT_PER_MEBIBYTE_MS = 900_000;
 export const REVIEW_HOST_RELAY_PI_TIMEOUT_MAX_MS = 7_200_000;
 const BYTES_PER_MEBIBYTE = 1024 * 1024;
 
-export function resolveReviewHostRelayPiTimeoutMs(promptByteLength: number, environment: NodeJS.ProcessEnv = process.env): number {
+export function resolveReviewHostRelayPiTimeoutMs(
+	promptByteLength: number,
+	environment: NodeJS.ProcessEnv = process.env,
+): number {
 	const configured = environment[REVIEW_HOST_RELAY_PI_TIMEOUT_ENV];
 	if (configured !== undefined && /^[1-9]\d*$/.test(configured)) {
 		const parsed = Number(configured);
-		if (Number.isSafeInteger(parsed)) return Math.min(parsed, REVIEW_HOST_RELAY_PI_TIMEOUT_MAX_MS);
+		if (Number.isSafeInteger(parsed))
+			return Math.min(parsed, REVIEW_HOST_RELAY_PI_TIMEOUT_MAX_MS);
 	}
-	const bytes = Number.isSafeInteger(promptByteLength) && promptByteLength > 0 ? promptByteLength : 0;
-	const scaled = REVIEW_HOST_RELAY_PI_TIMEOUT_FLOOR_MS + Math.ceil((bytes / BYTES_PER_MEBIBYTE) * REVIEW_HOST_RELAY_PI_TIMEOUT_PER_MEBIBYTE_MS);
+	const bytes =
+		Number.isSafeInteger(promptByteLength) && promptByteLength > 0
+			? promptByteLength
+			: 0;
+	const scaled =
+		REVIEW_HOST_RELAY_PI_TIMEOUT_FLOOR_MS +
+		Math.ceil(
+			(bytes / BYTES_PER_MEBIBYTE) * REVIEW_HOST_RELAY_PI_TIMEOUT_PER_MEBIBYTE_MS,
+		);
 	return Math.min(scaled, REVIEW_HOST_RELAY_PI_TIMEOUT_MAX_MS);
 }
 
 // The reviewer ran out of time; it did not crash. The message states both
 // measurements and names the two things that can change the outcome, because
 // the one thing that cannot is relaunching the identical slot.
-export function reviewHostRelayPiTimeoutMessage(elapsedMs: number, timeoutMs: number, promptByteLength: number): string {
-	return `pi reviewer subprocess exceeded the relay bound: killed after ${elapsedMs}ms against a ${timeoutMs}ms limit for a ${promptByteLength}-byte materialized prompt. `
-		+ `Relaunching the same slot unchanged reaches the same wall. Raise ${REVIEW_HOST_RELAY_PI_TIMEOUT_ENV} above the reviewer's real wall time (ceiling ${REVIEW_HOST_RELAY_PI_TIMEOUT_MAX_MS}ms) or reduce the candidate scope so the materialized prompt is smaller.`;
+export function reviewHostRelayPiTimeoutMessage(
+	elapsedMs: number,
+	timeoutMs: number,
+	promptByteLength: number,
+): string {
+	return (
+		`pi reviewer subprocess exceeded the relay bound: killed after ${elapsedMs}ms against a ${timeoutMs}ms limit for a ${promptByteLength}-byte materialized prompt. ` +
+		`Relaunching the same slot unchanged reaches the same wall. Raise ${REVIEW_HOST_RELAY_PI_TIMEOUT_ENV} above the reviewer's real wall time (ceiling ${REVIEW_HOST_RELAY_PI_TIMEOUT_MAX_MS}ms) or reduce the candidate scope so the materialized prompt is smaller.`
+	);
 }
 
 interface ProcessCapture {
@@ -406,7 +551,13 @@ interface ProcessCapture {
 function collectGentleAiProcess(
 	file: string,
 	arguments_: readonly string[],
-	options: { cwd: string; env: NodeJS.ProcessEnv; stdin?: Buffer; timeoutMs: number; signal?: AbortSignal },
+	options: {
+		cwd: string;
+		env: NodeJS.ProcessEnv;
+		stdin?: Buffer;
+		timeoutMs: number;
+		signal?: AbortSignal;
+	},
 ): Promise<ProcessCapture> {
 	return new Promise((resolve, reject) => {
 		const startedAt = Date.now();
@@ -422,12 +573,13 @@ function collectGentleAiProcess(
 		const stderr: Buffer[] = [];
 		let timedOut = false;
 		let settled = false;
-		const timer = options.timeoutMs > 0
-			? setTimeout(() => {
-				timedOut = true;
-				child.kill("SIGKILL");
-			}, options.timeoutMs)
-			: undefined;
+		const timer =
+			options.timeoutMs > 0
+				? setTimeout(() => {
+						timedOut = true;
+						child.kill("SIGKILL");
+					}, options.timeoutMs)
+				: undefined;
 		timer?.unref();
 		child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
 		child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
@@ -441,7 +593,13 @@ function collectGentleAiProcess(
 			if (settled) return;
 			settled = true;
 			if (timer !== undefined) clearTimeout(timer);
-			resolve({ stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr), exitCode: code, timedOut, elapsedMs: Date.now() - startedAt });
+			resolve({
+				stdout: Buffer.concat(stdout),
+				stderr: Buffer.concat(stderr),
+				exitCode: code,
+				timedOut,
+				elapsedMs: Date.now() - startedAt,
+			});
 		});
 		if (options.stdin === undefined) {
 			child.stdin.end();
@@ -452,7 +610,11 @@ function collectGentleAiProcess(
 	});
 }
 
-function relayPiTransportError(error: unknown, promptByteLength: number, piTimeoutMs: number): ReviewHostRelayError {
+function relayPiTransportError(
+	error: unknown,
+	promptByteLength: number,
+	piTimeoutMs: number,
+): ReviewHostRelayError {
 	if (!(error instanceof OpaquePiReviewerTransportError)) {
 		return new ReviewHostRelayError(
 			REVIEW_HOST_RELAY_FAILURE.PI_LAUNCH_FAILED,
@@ -468,50 +630,92 @@ function relayPiTransportError(error: unknown, promptByteLength: number, piTimeo
 		...(error.timeoutMs === null ? {} : { timeoutMs: error.timeoutMs }),
 	};
 	if (
-		error.kind === OPAQUE_PI_REVIEWER_TRANSPORT_FAILURE.TIMED_OUT
-		&& error.elapsedMs !== null
-		&& error.timeoutMs !== null
+		error.kind === OPAQUE_PI_REVIEWER_TRANSPORT_FAILURE.TIMED_OUT &&
+		error.elapsedMs !== null &&
+		error.timeoutMs !== null
 	) {
 		return new ReviewHostRelayError(
 			REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT,
 			"pi",
-			reviewHostRelayPiTimeoutMessage(error.elapsedMs, error.timeoutMs, promptByteLength),
-			{ ...details, timedOut: true, elapsedMs: error.elapsedMs, timeoutMs: error.timeoutMs },
+			reviewHostRelayPiTimeoutMessage(
+				error.elapsedMs,
+				error.timeoutMs,
+				promptByteLength,
+			),
+			{
+				...details,
+				timedOut: true,
+				elapsedMs: error.elapsedMs,
+				timeoutMs: error.timeoutMs,
+			},
 		);
 	}
 	if (error.kind === OPAQUE_PI_REVIEWER_TRANSPORT_FAILURE.EMPTY_OUTPUT) {
-		return new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_EMPTY_OUTPUT, "pi", "pi subprocess produced no output bytes", details);
+		return new ReviewHostRelayError(
+			REVIEW_HOST_RELAY_FAILURE.PI_EMPTY_OUTPUT,
+			"pi",
+			"pi subprocess produced no output bytes",
+			details,
+		);
 	}
 	if (
-		error.kind === OPAQUE_PI_REVIEWER_TRANSPORT_FAILURE.LAUNCH_FAILED
-		|| error.kind === OPAQUE_PI_REVIEWER_TRANSPORT_FAILURE.SCRATCH_FAILED
+		error.kind === OPAQUE_PI_REVIEWER_TRANSPORT_FAILURE.LAUNCH_FAILED ||
+		error.kind === OPAQUE_PI_REVIEWER_TRANSPORT_FAILURE.SCRATCH_FAILED
 	) {
-		return new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_LAUNCH_FAILED, "pi", `pi subprocess could not start: ${error.message}`, details);
+		return new ReviewHostRelayError(
+			REVIEW_HOST_RELAY_FAILURE.PI_LAUNCH_FAILED,
+			"pi",
+			`pi subprocess could not start: ${error.message}`,
+			details,
+		);
 	}
-	return new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_FAILED, "pi", "pi subprocess failed", details);
+	return new ReviewHostRelayError(
+		REVIEW_HOST_RELAY_FAILURE.PI_FAILED,
+		"pi",
+		"pi subprocess failed",
+		details,
+	);
 }
 
 function assertTokens(name: string, tokens: readonly string[]): void {
-	if (tokens.length === 0) throw new TypeError(`Pi host relay requires the provider-issued ${name} tokens`);
+	if (tokens.length === 0)
+		throw new TypeError(
+			`Pi host relay requires the provider-issued ${name} tokens`,
+		);
 	if (tokens.some((token) => typeof token !== "string" || token.length === 0)) {
-		throw new TypeError(`Pi host relay ${name} tokens must all be non-empty strings`);
+		throw new TypeError(
+			`Pi host relay ${name} tokens must all be non-empty strings`,
+		);
 	}
 }
 
-function snapshotReviewHostRelayRequest(request: ReviewHostRelayRequest): ReviewHostRelayRequest {
+function snapshotReviewHostRelayRequest(
+	request: ReviewHostRelayRequest,
+): ReviewHostRelayRequest {
 	assertTokens("capture", request.captureArgumentTokens);
 	// The completing form is validated before any process launches: a materialize
 	// slot without a provider-owned submission is a typed contract mismatch,
 	// never a synthesized invocation.
 	resolveReviewHostRelaySubmission(request.submission);
-	const gentleAiExecutable = request.gentleAiExecutable ?? resolveGentleAiBinary();
-	if (!isAbsolute(gentleAiExecutable)) throw new TypeError("Pi host relay requires an absolute gentle-ai executable path");
-	const environment = Object.freeze({ ...(request.environment ?? process.env) }) as NodeJS.ProcessEnv;
-	const submission = request.submission === undefined ? undefined : Object.freeze({
-		operationToken: request.submission.operationToken,
-		argumentTokens: Object.freeze([...request.submission.argumentTokens]),
-		values: Object.freeze(request.submission.values.map((value) => Object.freeze({ ...value }))),
-	});
+	const gentleAiExecutable =
+		request.gentleAiExecutable ?? resolveGentleAiBinary();
+	if (!isAbsolute(gentleAiExecutable))
+		throw new TypeError(
+			"Pi host relay requires an absolute gentle-ai executable path",
+		);
+	const environment = Object.freeze({
+		...(request.environment ?? process.env),
+	}) as NodeJS.ProcessEnv;
+	const submission =
+		request.submission === undefined
+			? undefined
+			: Object.freeze({
+					operationToken: request.submission.operationToken,
+					argumentTokens: Object.freeze([...request.submission.argumentTokens]),
+					values: Object.freeze(
+						request.submission.values.map((value) => Object.freeze({ ...value })),
+					),
+				});
 	return Object.freeze({
 		...request,
 		captureArgumentTokens: Object.freeze([...request.captureArgumentTokens]),
@@ -541,62 +745,112 @@ export async function prepareReviewHostRelaySlot(
 	// surface is available. No version sniffing or prompt reconstruction occurs.
 	let materialized: ProcessCapture;
 	try {
-		materialized = await collectGentleAiProcess(preparedRequest.gentleAiExecutable!, ["review", "capture-result", ...preparedRequest.captureArgumentTokens], {
-			cwd: preparedRequest.targetCwd!,
-			env: { ...preparedRequest.environment!, [GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV]: GENTLE_PI_REVIEW_RELAY_CONTRACT },
-			timeoutMs: preparedRequest.gentleAiTimeoutMs!,
-			...(preparedRequest.signal === undefined ? {} : { signal: preparedRequest.signal }),
-		});
+		materialized = await collectGentleAiProcess(
+			preparedRequest.gentleAiExecutable!,
+			["review", "capture-result", ...preparedRequest.captureArgumentTokens],
+			{
+				cwd: preparedRequest.targetCwd!,
+				env: {
+					...preparedRequest.environment!,
+					[GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV]: GENTLE_PI_REVIEW_RELAY_CONTRACT,
+				},
+				timeoutMs: preparedRequest.gentleAiTimeoutMs!,
+				...(preparedRequest.signal === undefined
+					? {}
+					: { signal: preparedRequest.signal }),
+			},
+		);
 	} catch (error) {
-		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.MATERIALIZE_FAILED, "materialize", `gentle-ai prompt materialization could not start: ${error instanceof Error ? error.message : String(error)}`);
+		throw new ReviewHostRelayError(
+			REVIEW_HOST_RELAY_FAILURE.MATERIALIZE_FAILED,
+			"materialize",
+			`gentle-ai prompt materialization could not start: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
 	if (materialized.exitCode !== 0 || materialized.timedOut) {
 		const stderr = materialized.stderr.toString("utf8");
 		const refusal = classifyReviewHostRelayRefusal(stderr);
-		const timing = { elapsedMs: materialized.elapsedMs, timeoutMs: preparedRequest.gentleAiTimeoutMs! };
+		const timing = {
+			elapsedMs: materialized.elapsedMs,
+			timeoutMs: preparedRequest.gentleAiTimeoutMs!,
+		};
 		if (refusal === "unknown-flag") {
-			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.RELAY_UNAVAILABLE, "materialize", REVIEW_HOST_RELAY_UNAVAILABLE_MESSAGE, {
-				exitCode: materialized.exitCode,
-				stderr,
-				timedOut: materialized.timedOut,
-				...timing,
-			});
+			throw new ReviewHostRelayError(
+				REVIEW_HOST_RELAY_FAILURE.RELAY_UNAVAILABLE,
+				"materialize",
+				REVIEW_HOST_RELAY_UNAVAILABLE_MESSAGE,
+				{
+					exitCode: materialized.exitCode,
+					stderr,
+					timedOut: materialized.timedOut,
+					...timing,
+				},
+			);
 		}
 		if (refusal === "handshake") {
-			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.HANDSHAKE_REFUSED, "materialize", stderr, {
+			throw new ReviewHostRelayError(
+				REVIEW_HOST_RELAY_FAILURE.HANDSHAKE_REFUSED,
+				"materialize",
+				stderr,
+				{
+					exitCode: materialized.exitCode,
+					stderr,
+					timedOut: materialized.timedOut,
+					...timing,
+				},
+			);
+		}
+		throw new ReviewHostRelayError(
+			REVIEW_HOST_RELAY_FAILURE.MATERIALIZE_FAILED,
+			"materialize",
+			materialized.timedOut
+				? `gentle-ai prompt materialization exceeded its ${preparedRequest.gentleAiTimeoutMs!}ms bound after ${materialized.elapsedMs}ms`
+				: "gentle-ai prompt materialization failed",
+			{
 				exitCode: materialized.exitCode,
 				stderr,
 				timedOut: materialized.timedOut,
 				...timing,
-			});
-		}
-		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.MATERIALIZE_FAILED, "materialize", materialized.timedOut
-			? `gentle-ai prompt materialization exceeded its ${preparedRequest.gentleAiTimeoutMs!}ms bound after ${materialized.elapsedMs}ms`
-			: "gentle-ai prompt materialization failed", { exitCode: materialized.exitCode, stderr, timedOut: materialized.timedOut, ...timing });
+			},
+		);
 	}
 	const promptBytes = materialized.stdout;
 	if (promptBytes.length === 0) {
-		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.EMPTY_PROMPT, "materialize", "gentle-ai prompt materialization produced no bytes", {
-			exitCode: 0,
-			stderr: materialized.stderr.toString("utf8"),
-			elapsedMs: materialized.elapsedMs,
-			timeoutMs: preparedRequest.gentleAiTimeoutMs!,
-		});
+		throw new ReviewHostRelayError(
+			REVIEW_HOST_RELAY_FAILURE.EMPTY_PROMPT,
+			"materialize",
+			"gentle-ai prompt materialization produced no bytes",
+			{
+				exitCode: 0,
+				stderr: materialized.stderr.toString("utf8"),
+				elapsedMs: materialized.elapsedMs,
+				timeoutMs: preparedRequest.gentleAiTimeoutMs!,
+			},
+		);
 	}
 	// The reviewer bound is derived from the prompt the provider actually
 	// materialized. The explicit request timeout is a test seam that wins over
 	// both the user-owned environment override and the scale-derived bound.
-	const piTimeoutMs = preparedRequest.piTimeoutMs ?? resolveReviewHostRelayPiTimeoutMs(promptBytes.length, preparedRequest.environment);
+	const piTimeoutMs =
+		preparedRequest.piTimeoutMs ??
+		resolveReviewHostRelayPiTimeoutMs(
+			promptBytes.length,
+			preparedRequest.environment,
+		);
 
 	// The pure adapter owns the fresh isolated Pi process. Its input and output
 	// are opaque bytes; this coordinator only maps transport failures.
 	let piResult: OpaquePiReviewerResult;
 	try {
 		piResult = await reviewer(promptBytes, {
-			...(preparedRequest.piExecutable === undefined ? {} : { piExecutable: preparedRequest.piExecutable }),
+			...(preparedRequest.piExecutable === undefined
+				? {}
+				: { piExecutable: preparedRequest.piExecutable }),
 			environment: preparedRequest.environment,
 			timeoutMs: piTimeoutMs,
-			...(preparedRequest.signal === undefined ? {} : { signal: preparedRequest.signal }),
+			...(preparedRequest.signal === undefined
+				? {}
+				: { signal: preparedRequest.signal }),
 		});
 	} catch (error) {
 		throw relayPiTransportError(error, promptBytes.length, piTimeoutMs);
@@ -620,25 +874,37 @@ export async function runReviewHostRelayReviewerGroup(
 	prepare: ReviewHostRelayPreparationRunner = prepareReviewHostRelaySlot,
 ): Promise<readonly ReviewHostRelayPreparedResult[]> {
 	if (requests.length === 0) {
-		throw new TypeError("Pi host relay reviewer group requires at least one provider-bound request");
+		throw new TypeError(
+			"Pi host relay reviewer group requires at least one provider-bound request",
+		);
 	}
-	const settled = await Promise.allSettled(requests.map(async (request) => await prepare(request)));
+	const settled = await Promise.allSettled(
+		requests.map(async (request) => await prepare(request)),
+	);
 	const failed = settled.find((result) => result.status === "rejected");
 	if (failed?.status === "rejected") throw failed.reason;
-	return settled.map((result) => (result as PromiseFulfilledResult<ReviewHostRelayPreparedResult>).value);
+	return settled.map(
+		(result) =>
+			(result as PromiseFulfilledResult<ReviewHostRelayPreparedResult>).value,
+	);
 }
 
 /**
  * Submits one already-reviewed opaque result through the exact provider-owned
  * completing form. Only the provider-declared artifact slot is substituted.
  */
-export async function submitReviewHostRelayPreparedResult(prepared: ReviewHostRelayPreparedResult): Promise<ReviewHostRelayResult> {
+export async function submitReviewHostRelayPreparedResult(
+	prepared: ReviewHostRelayPreparedResult,
+): Promise<ReviewHostRelayResult> {
 	const resultBytes = preparedResultBytes.get(prepared);
-	if (resultBytes === undefined) throw new TypeError("Pi host relay requires a recognized prepared result");
+	if (resultBytes === undefined)
+		throw new TypeError("Pi host relay requires a recognized prepared result");
 	const { request } = prepared;
 	assertTokens("capture", request.captureArgumentTokens);
 	const submissionBinding = resolveReviewHostRelaySubmission(request.submission);
-	const stagingDirectory = await mkdtemp(join(tmpdir(), "gentle-pi-host-relay-result-"));
+	const stagingDirectory = await mkdtemp(
+		join(tmpdir(), "gentle-pi-host-relay-result-"),
+	);
 	let primaryFailure = false;
 	try {
 		await chmod(stagingDirectory, 0o700);
@@ -652,29 +918,60 @@ export async function submitReviewHostRelayPreparedResult(prepared: ReviewHostRe
 		);
 		let submission: ProcessCapture;
 		try {
-			submission = await collectGentleAiProcess(request.gentleAiExecutable!, ["review", submissionBinding.operationToken, ...submitTokens], {
-				cwd: request.targetCwd!,
-				env: { ...request.environment!, [GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV]: GENTLE_PI_REVIEW_RELAY_CONTRACT },
-				timeoutMs: request.gentleAiTimeoutMs!,
-				...(request.signal === undefined ? {} : { signal: request.signal }),
-			});
+			submission = await collectGentleAiProcess(
+				request.gentleAiExecutable!,
+				["review", submissionBinding.operationToken, ...submitTokens],
+				{
+					cwd: request.targetCwd!,
+					env: {
+						...request.environment!,
+						[GENTLE_PI_REVIEW_RELAY_CONTRACT_ENV]: GENTLE_PI_REVIEW_RELAY_CONTRACT,
+					},
+					timeoutMs: request.gentleAiTimeoutMs!,
+					...(request.signal === undefined ? {} : { signal: request.signal }),
+				},
+			);
 		} catch (error) {
-			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", `gentle-ai capture submission could not start: ${error instanceof Error ? error.message : String(error)}`);
+			throw new ReviewHostRelayError(
+				REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED,
+				"submit",
+				`gentle-ai capture submission could not start: ${error instanceof Error ? error.message : String(error)}`,
+			);
 		}
-		if (submission.exitCode !== 0 || submission.timedOut || submission.stdout.length === 0) {
+		if (
+			submission.exitCode !== 0 ||
+			submission.timedOut ||
+			submission.stdout.length === 0
+		) {
 			const stderr = submission.stderr.toString("utf8");
-			const details = { exitCode: submission.exitCode, stderr, timedOut: submission.timedOut, elapsedMs: submission.elapsedMs, timeoutMs: request.gentleAiTimeoutMs! };
+			const details = {
+				exitCode: submission.exitCode,
+				stderr,
+				timedOut: submission.timedOut,
+				elapsedMs: submission.elapsedMs,
+				timeoutMs: request.gentleAiTimeoutMs!,
+			};
 			// A typed admission refusal proves the provider consumed no slot.
 			// Every other launched submission stays unknown pending fresh STATUS.
 			if (isReviewHostRelayAdmissionRefusal(submission, stderr)) {
-				throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", stderr.trim(), {
-					...details,
-					mutationOutcome: "none",
-				});
+				throw new ReviewHostRelayError(
+					REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED,
+					"submit",
+					stderr.trim(),
+					{
+						...details,
+						mutationOutcome: "none",
+					},
+				);
 			}
-			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", submission.timedOut
-				? `gentle-ai capture submission exceeded its ${request.gentleAiTimeoutMs!}ms bound after ${submission.elapsedMs}ms`
-				: "gentle-ai refused the relayed capture submission", details);
+			throw new ReviewHostRelayError(
+				REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED,
+				"submit",
+				submission.timedOut
+					? `gentle-ai capture submission exceeded its ${request.gentleAiTimeoutMs!}ms bound after ${submission.elapsedMs}ms`
+					: "gentle-ai refused the relayed capture submission",
+				details,
+			);
 		}
 		return {
 			promptByteLength: prepared.promptByteLength,
@@ -703,6 +1000,10 @@ export async function submitReviewHostRelayPreparedResult(prepared: ReviewHostRe
  * Compatibility one-binding path: materialize → opaque Pi adapter → submit.
  * It preserves the established API and its typed failure behavior exactly.
  */
-export async function runReviewHostRelaySlot(request: ReviewHostRelayRequest): Promise<ReviewHostRelayResult> {
-	return await submitReviewHostRelayPreparedResult(await prepareReviewHostRelaySlot(request));
+export async function runReviewHostRelaySlot(
+	request: ReviewHostRelayRequest,
+): Promise<ReviewHostRelayResult> {
+	return await submitReviewHostRelayPreparedResult(
+		await prepareReviewHostRelaySlot(request),
+	);
 }
