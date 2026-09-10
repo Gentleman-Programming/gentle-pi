@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { join, relative, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
 import { pendingReviewMutation, REVIEW_REMINDER_RECEIPT } from "../lib/review-reminder-receipt.ts";
 import { SESSION_WORKTREE_ENTRY, SESSION_WORKTREE_CHANGED } from "../lib/session-worktree-registry.ts";
 import test, { after, afterEach, mock } from "node:test";
@@ -31,6 +31,21 @@ interface Registered {
 
 const plainTheme = { fg: (_color: string, text: string) => text };
 const fakeTui = { requestRender() {} };
+
+const inertSessionTransport: SessionTransportFactory = {
+	createRegistry: async () => ({ list: async () => [], listActivations: async () => [] }),
+	createListener: (registry) => ({ registry, start: async () => {}, close: async () => {} }),
+	createClient: () => ({ close() {}, sendNotification: async () => ({ id: "inert", accepted: false }) }),
+};
+
+function containsResolvedPath(
+	candidate: string,
+	path: string,
+	paths: Pick<typeof win32, "isAbsolute" | "relative" | "sep"> = { isAbsolute, relative, sep },
+): boolean {
+	const fromCandidate = paths.relative(candidate, path);
+	return fromCandidate === "" || (!paths.isAbsolute(fromCandidate) && fromCandidate !== ".." && !fromCandidate.startsWith(`..${paths.sep}`));
+}
 
 type Overlay = {
 	render(width: number): string[];
@@ -174,6 +189,7 @@ function deps(): { deps: Partial<AgentsDeps>; children: FakeChild[]; spawned: st
 			home,
 			resolveWorktree: (path, base) => ({ root: resolve(base, path), commonDir: "/fixture/common" }),
 			env: { PATH: "/bin" },
+			sessionTransport: inertSessionTransport,
 		},
 	};
 }
@@ -651,7 +667,7 @@ for (const scenario of ["own", "other-root", "escaped", "sibling", "session-swit
 		ctx.sessionManager.getBranch = (() => h.entries) as typeof ctx.sessionManager.getBranch;
 		d.deps.resolveWorktree = (path, base) => {
 			const absolute = resolve(base, path);
-			const worktree = [cwd, sibling].find((candidate) => absolute === candidate || absolute.startsWith(`${candidate}/`));
+			const worktree = [cwd, sibling].find((candidate) => containsResolvedPath(candidate, absolute));
 			return worktree ? { root: worktree, commonDir: "/fixture/common" } : undefined;
 		};
 		const spawn = d.deps.spawn!;
@@ -682,6 +698,14 @@ for (const scenario of ["own", "other-root", "escaped", "sibling", "session-swit
 		await tick();
 	});
 }
+
+test("worktree attribution containment respects Windows path boundaries", () => {
+	const candidate = win32.resolve("C:\\fixture", "project");
+	assert.equal(containsResolvedPath(candidate, win32.resolve(candidate), win32), true, "the worktree root itself is contained");
+	assert.equal(containsResolvedPath(candidate, win32.resolve(candidate, "nested", "file.ts"), win32), true, "Windows descendants are contained");
+	assert.equal(containsResolvedPath(candidate, win32.resolve(candidate, ".."), win32), false, "the parent is excluded");
+	assert.equal(containsResolvedPath(candidate, win32.resolve("C:\\fixture", "project-sibling", "file.ts"), win32), false, "a sibling prefix is excluded");
+});
 
 test("default Node spawn adapter distinguishes IPC-only and permission-capable canonical Git children", async () => {
 	const childProcess = createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process");
@@ -716,7 +740,7 @@ test("default Node spawn adapter distinguishes IPC-only and permission-capable c
 	try {
 		const launch = async (mode: "task" | "background", env: NodeJS.ProcessEnv, sessionCwd = nonGitCwd) => {
 			const h = fakePi();
-			gentleAgents(h.pi, env, { home, agentHome: join(home, ".pi", "agent"), env, pi: { command: "/fixture/pi", args: ["--host-flag"] }, resolveWorktree: () => undefined });
+			gentleAgents(h.pi, env, { home, agentHome: join(home, ".pi", "agent"), env, pi: { command: "/fixture/pi", args: ["--host-flag"] }, resolveWorktree: () => undefined, sessionTransport: inertSessionTransport });
 			const { ctx } = fakeContext();
 			(ctx.sessionManager as unknown as { getCwd(): string }).getCwd = () => sessionCwd;
 			await h.fire("session_start", ctx);
@@ -781,7 +805,7 @@ test("native spawn interception restores CommonJS and ESM exports after rejected
 				return undefined;
 			};
 		}
-		gentleAgents(h.pi, {}, { home, agentHome: join(home, ".pi", "agent"), env: { PATH: "/bin" }, pi: { command: "/fixture/pi", args: [] }, resolveWorktree: () => undefined });
+		gentleAgents(h.pi, {}, { home, agentHome: join(home, ".pi", "agent"), env: { PATH: "/bin" }, pi: { command: "/fixture/pi", args: [] }, resolveWorktree: () => undefined, sessionTransport: inertSessionTransport });
 		const { ctx } = fakeContext();
 		await h.fire("session_start", ctx);
 		await h.tools.get("subagent_run")!.execute("cleanup", { agent: "explore", task: "Keep cleanup live", mode: "background" }, undefined, undefined, ctx);
@@ -928,16 +952,16 @@ test("delayed child spawn retains the originating session and cannot append into
 
 test("agentRuntimePaths isolates sessions and transcripts by profile and retains the explicit-home fallback", () => {
 	assert.deepEqual(agentRuntimePaths("/home/x", "/profiles/pi-principal/agent"), {
-		sessions: "/profiles/pi-principal/agent/gentle-agents/sessions",
-		transcripts: "/profiles/pi-principal/agent/gentle-agents/transcripts",
+		sessions: join("/profiles/pi-principal/agent", "gentle-agents", "sessions"),
+		transcripts: join("/profiles/pi-principal/agent", "gentle-agents", "transcripts"),
 	});
 	assert.deepEqual(agentRuntimePaths("/home/x", "/profiles/pi-lab/agent"), {
-		sessions: "/profiles/pi-lab/agent/gentle-agents/sessions",
-		transcripts: "/profiles/pi-lab/agent/gentle-agents/transcripts",
+		sessions: join("/profiles/pi-lab/agent", "gentle-agents", "sessions"),
+		transcripts: join("/profiles/pi-lab/agent", "gentle-agents", "transcripts"),
 	});
 	assert.deepEqual(agentRuntimePaths("/home/x"), {
-		sessions: "/home/x/.pi/agent/gentle-agents/sessions",
-		transcripts: "/home/x/.pi/agent/gentle-agents/transcripts",
+		sessions: join("/home/x", ".pi", "agent", "gentle-agents", "sessions"),
+		transcripts: join("/home/x", ".pi", "agent", "gentle-agents", "transcripts"),
 	});
 });
 
