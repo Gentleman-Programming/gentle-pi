@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { classifyPiCatalogName } from "./runtime-metrics-pi-identity.ts";
 
 // Pure local accounting, not a telemetry transport or Pi event adapter.
@@ -13,11 +14,32 @@ const FAMILIES = ["claude", "gpt", "o-series", "gemini", "llama", "qwen", "deeps
 export const EFFORTS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "not_selected", "unsupported", "unavailable"] as const;
 const ERRORS = ["none", "aborted", "rate_limit", "authentication", "network", "provider", "unknown"] as const;
 const TOKEN_FIELDS = ["input", "output", "cacheRead", "cacheWrite", "reasoning", "totalTokens"] as const;
-export const AGENT_CLASSES = ["orchestrator", "worker", "explore", "verify", "unknown",
-	"sdd-apply", "sdd-archive", "sdd-design", "sdd-explore", "sdd-init", "sdd-onboard", "sdd-proposal",
-	"sdd-research", "sdd-spec", "sdd-status", "sdd-sync", "sdd-tasks", "sdd-verify",
-	"review-readability", "review-reliability", "review-resilience", "review-risk", "jd-fix-agent", "jd-judge-a", "jd-judge-b"] as const;
-export type AgentClass = typeof AGENT_CLASSES[number];
+declare const agentClassBrand: unique symbol;
+export type AgentClass = string & { readonly [agentClassBrand]: "AgentClass" };
+
+function agentClasses(): readonly AgentClass[] {
+	const schema = JSON.parse(readFileSync(new URL("../contracts/telemetry/runtime-aggregate-v1.schema.json", import.meta.url), "utf8"));
+	const values: unknown = schema?.$defs?.row?.properties?.agent_class?.enum;
+	if (!Array.isArray(values) || !values.length || values.some(value => typeof value !== "string")) {
+		throw new Error("Invalid runtime telemetry agent_class schema");
+	}
+	return Object.freeze([...values]) as readonly AgentClass[];
+}
+
+// The mirrored transport contract is the runtime source of truth. Keeping this
+// data-driven lets packaged agent updates follow the closed enum without a
+// second name registry drifting in TypeScript.
+export const AGENT_CLASSES = agentClasses();
+export function parseAgentClass(value: unknown): AgentClass | undefined {
+	return typeof value === "string" && (AGENT_CLASSES as readonly string[]).includes(value) ? value as AgentClass : undefined;
+}
+function requiredAgentClass(value: string): AgentClass {
+	const parsed = parseAgentClass(value);
+	if (!parsed) throw new Error(`Runtime telemetry schema is missing required agent_class ${value}`);
+	return parsed;
+}
+export const UNKNOWN_AGENT_CLASS = requiredAgentClass("unknown");
+export const ORCHESTRATOR_AGENT_CLASS = requiredAgentClass("orchestrator");
 
 type Missing = { state: "unavailable" | "unsupported" };
 export type TokenMeasurement = Missing | { state: "reported"; value: number };
@@ -138,14 +160,17 @@ export class RuntimeMetrics {
 	#buckets = new Map<string, RuntimeMetricBucket>();
 	#maxResponses: number;
 	#maxBuckets: number;
+	#classifyModel: typeof classifyPiCatalogName;
 
-	constructor({ maxResponses = 1024, maxBuckets = 64 }: { maxResponses?: number; maxBuckets?: number } = {}) {
+	constructor({ maxResponses = 1024, maxBuckets = 64, classifyModel = classifyPiCatalogName }:
+		{ maxResponses?: number; maxBuckets?: number; classifyModel?: typeof classifyPiCatalogName } = {}) {
 		if (!Number.isInteger(maxResponses) || maxResponses < 1 || maxResponses > 1024
 			|| !Number.isInteger(maxBuckets) || maxBuckets < 1 || maxBuckets > 64) {
 			throw new RangeError("Invalid runtime metrics capacity");
 		}
 		this.#maxResponses = maxResponses;
 		this.#maxBuckets = maxBuckets;
+		this.#classifyModel = classifyModel;
 	}
 
 	record(response: FinalResponse): "recorded" | "duplicate" | "invalid" | "capacity" {
@@ -154,11 +179,11 @@ export class RuntimeMetrics {
 		const selectedProvider = response.selectedProvider ?? response.provider;
 		const dimensions = {
 			hostAgent: "pi" as const,
-			agentClass: category(AGENT_CLASSES, response.agentClass, "unknown"),
-			observedModelId: classifyPiCatalogName({ provider: response.provider, modelId: response.observedModelId }).modelId,
-			responseModelId: classifyPiCatalogName({ provider: response.provider, modelId: response.responseModelId }).modelId,
+			agentClass: category(AGENT_CLASSES, response.agentClass, UNKNOWN_AGENT_CLASS),
+			observedModelId: this.#classifyModel({ provider: response.provider, modelId: response.observedModelId }).modelId,
+			responseModelId: this.#classifyModel({ provider: response.provider, modelId: response.responseModelId }).modelId,
 			providerThinkingLevel: category(EFFORTS, response.providerThinkingLevel, "unavailable"),
-			selectedModelId: classifyPiCatalogName({ provider: selectedProvider, modelId: response.selectedModelId }).modelId,
+			selectedModelId: this.#classifyModel({ provider: selectedProvider, modelId: response.selectedModelId }).modelId,
 			selectedProvider: category(PROVIDERS, selectedProvider, typeof selectedProvider === "string" && selectedProvider ? "custom" : "unknown"),
 			executor: category(EXECUTORS, response.executor, "unknown"),
 			provider: category(PROVIDERS, response.provider, typeof response.provider === "string" && response.provider ? "custom" : "unknown"),

@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import runtimeMetrics from "../extensions/runtime-metrics.ts";
-import type { RuntimeMetricBucket } from "../lib/runtime-metrics.ts";
+import { parseAgentClass, type RuntimeMetricBucket } from "../lib/runtime-metrics.ts";
+import { createPiCatalogNameLookup, type PiCatalogName } from "../lib/runtime-metrics-pi-identity.ts";
 import { CHILD_METRICS_EVENT, childEvent } from "../lib/runtime-metrics-children.ts";
 import { normalizeRpcEvent, TASK_EVENT } from "../lib/agents-protocol.ts";
 
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
-function harness(env: NodeJS.ProcessEnv = {}) {
+type CatalogLookup = NonNullable<NonNullable<Parameters<typeof runtimeMetrics>[2]>["lookup"]>;
+function harness(env: NodeJS.ProcessEnv = {}, lookup?: CatalogLookup,
+	classify?: (input: unknown) => PiCatalogName) {
 	const handlers = new Map<string, Function>();
 	const listeners = new Map<string, Function>();
 	let session = "first";
@@ -20,7 +23,7 @@ function harness(env: NodeJS.ProcessEnv = {}) {
 		getThinkingLevel: () => "high", registerCommand() {},
 		appendEntry: () => assert.fail("no metrics persistence"),
 		events: { on: (name: string, handler: Function) => { listeners.set(name, handler); return () => listeners.delete(name); } } };
-	runtimeMetrics(pi, env, { now: () => 0, send: (rows, _cwd, deps) => {
+	runtimeMetrics(pi, env, { lookup, classify, now: () => 0, send: (rows, _cwd, deps) => {
 		sent.push(structuredClone(rows)); launches.push(structuredClone(deps?.launches)); signal = deps!.signal!;
 		return new Promise(resolve => { finish = () => resolve("discarded"); });
 	} });
@@ -34,6 +37,32 @@ function harness(env: NodeJS.ProcessEnv = {}) {
 const final = (input = 7) => ({ role: "assistant", provider: "openai", model: "gpt-4o", responseModel: "gpt-4o",
 	providerThinkingLevel: "low", stopReason: "stop", usage: { input, output: 3, cacheRead: 0 },
 	content: [{ text: "private response" }], errorMessage: "private error", path: "/private" });
+
+test("message classification retries a failed catalog load without awaiting it", async () => {
+	let calls = 0;
+	const publicName = Object.freeze({ classification: "catalog_public", modelId: "gpt-4o" }) satisfies PiCatalogName;
+	const catalog = new Map([[JSON.stringify(["openai", "gpt-4o"]), publicName]]);
+	const catalogLookup = createPiCatalogNameLookup(async () => {
+		calls++;
+		if (calls === 1) throw new Error("transient catalog failure");
+		return catalog;
+	});
+	const h = harness({}, catalogLookup.lookup, catalogLookup.classify);
+	h.emit("session_start");
+	await tick();
+	assert.equal(calls, 1);
+	assert.equal(h.emit("message_end", { message: final() }), undefined);
+	assert.equal(calls, 2);
+	await tick();
+	assert.equal(h.sent.length, 1);
+	assert.equal(h.sent[0][0].observedModelId, "unknown", "the racing row remains fail-closed");
+	await h.finish();
+	h.emit("message_end", { message: final(8) });
+	await tick();
+	assert.equal(h.sent[1][0].observedModelId, "gpt-4o", "a later row uses the recovered catalog");
+	await h.finish();
+	h.emit("session_shutdown");
+});
 
 test("final callback returns before blocked transport; busy and duplicate messages drop", async () => {
 	const h = harness(); await h.emit("session_start");
@@ -94,7 +123,7 @@ test("child completion consumed once, busy children drop, and primary usage stay
 		.find(event => event.type === TASK_EVENT.RESPONSE_OBSERVATION);
 	assert.ok(observation?.type === TASK_EVENT.RESPONSE_OBSERVATION);
 	const event = (taskId: string) => childEvent("first", taskId,
-		{ agentClass: "verify", selectedProvider: "openai", selectedModelId: "gpt-4o", selectedEffort: "high" }, "completed",
+		{ agentClass: parseAgentClass("verify")!, selectedProvider: "openai", selectedModelId: "gpt-4o", selectedEffort: "high" }, "completed",
 		{ coverage: "final_assistant_messages_only", agentSettled: true, droppedResponses: 0, responses: [observation.observation] }, 0)!;
 	h.bus(event("one")); h.bus(event("one")); h.bus(event("busy"));
 	await tick(); assert.equal(h.sent.length, 1);

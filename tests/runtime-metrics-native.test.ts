@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { readFileSync, realpathSync } from "node:fs";
 import { setGentleAiDevBinaryEnvironmentForTesting } from "../lib/gentle-ai-binary.ts";
 import * as native from "../lib/runtime-metrics-native.ts";
-import type { RuntimeMetricBucket } from "../lib/runtime-metrics.ts";
+import { parseAgentClass, type RuntimeMetricBucket } from "../lib/runtime-metrics.ts";
 import { createHash } from "node:crypto";
 import schema from "../contracts/telemetry/runtime-aggregate-v1.schema.json" with { type: "json" };
 import fixturePayloads from "./fixtures/runtime-metrics-native-batches.json" with { type: "json" };
@@ -13,7 +13,7 @@ import fixturePayloads from "./fixtures/runtime-metrics-native-batches.json" wit
 function source(): RuntimeMetricBucket {
 	const token = () => ({ reported: 1, unavailable: 0, unsupported: 0, sum: 7 });
 	const duration = () => ({ measured: 0, unavailable: 1, unsupported: 0, sum: 0 });
-	return { hostAgent: "pi", agentClass: "worker", executor: "worker", provider: "openai", modelFamily: "gpt",
+	return { hostAgent: "pi", agentClass: parseAgentClass("worker")!, executor: "worker", provider: "openai", modelFamily: "gpt",
 		selectedProvider: "openai", selectedModelId: "gpt-5.4", observedModelId: "private-alias", responseModelId: "gpt-5.4",
 		effort: "high", providerThinkingLevel: "low", error: "none", responses: 1,
 		tokens: { input: token(), output: token(), cacheRead: token(), cacheWrite: token(), reasoning: token(), totalTokens: token() },
@@ -39,7 +39,7 @@ test("production encoder emits exact one-shot fixture with source occurrence cov
 });
 
 test("child launch occurrence retains selection evidence separately from response evidence", () => {
-	const payload = native.encodeNativeRuntimeEvent([source()], [{ evidence: "launch_configuration", agentClass: "worker",
+	const payload = native.encodeNativeRuntimeEvent([source()], [{ evidence: "launch_configuration", agentClass: parseAgentClass("worker")!,
 		selectedProvider: "openai", selectedModelId: "gpt-5.4", selectedEffort: "high", launches: 1 }]);
 	const rows = JSON.parse(payload!).rows;
 	assert.equal(rows.length, 2);

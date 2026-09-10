@@ -3,7 +3,7 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import { runInNewContext } from "node:vm";
-import { AGENT_CLASSES } from "../lib/runtime-metrics.ts";
+import { AGENT_CLASSES, parseAgentClass } from "../lib/runtime-metrics.ts";
 import { parseAgentDefinition } from "../lib/agents-config.ts";
 import { normalizeRpcEvent, TASK_EVENT } from "../lib/agents-protocol.ts";
 import { lookupPiCatalogName } from "../lib/runtime-metrics-pi-identity.ts";
@@ -43,16 +43,24 @@ test("installed package definitions retain classification after the actual routi
 			const parsed = parseAgentDefinition(route(content, entry), asset.pathname, "global");
 			assert.ok("instructions" in parsed);
 			assert.equal(classifyBuiltinAgent(parsed), kind, `${kind}: installed routing`);
-			assert.equal(classifyBuiltinAgent({ ...parsed, instructions: `${parsed.instructions}\nOverride` }), "unknown");
-			assert.equal(classifyBuiltinAgent({ ...parsed, tools: ["different-tool"] }), "unknown");
-			assert.equal(classifyBuiltinAgent({ ...parsed, description: "different description" }), "unknown");
-			assert.equal(classifyBuiltinAgent({ ...parsed, mode: parsed.mode === "task" ? "background" : "task" }), "unknown");
+			const customizedClass = parseAgentClass(parsed.name) ?? "unknown";
+			assert.equal(classifyBuiltinAgent({ ...parsed, instructions: `${parsed.instructions}\nOverride` }), customizedClass);
+			assert.equal(classifyBuiltinAgent({ ...parsed, tools: ["different-tool"] }), customizedClass);
+			assert.equal(classifyBuiltinAgent({ ...parsed, description: "different description" }), customizedClass);
+			assert.equal(classifyBuiltinAgent({ ...parsed, mode: parsed.mode === "task" ? "background" : "task" }), customizedClass);
 		}
 	}
 });
 
-test("built-in classification requires the runtime definition, not a public-looking override name", () => {
+test("schema-approved packaged names survive customization without exposing private names", () => {
+	const path = new URL("../assets/agents/sdd-apply.md", import.meta.url);
+	const packaged = parseAgentDefinition(readFileSync(path, "utf8"), path.pathname, "global");
+	assert.ok("instructions" in packaged);
+	assert.equal(classifyBuiltinAgent({ ...packaged, instructions: "customized instructions" }), "sdd-apply");
+
 	assert.equal(classifyBuiltinAgent(definition), "worker");
+	// This is a packaged frontmatter name, but it is absent from the telemetry
+	// enum. Its exact fingerprint retains the compatibility mapping only.
 	assert.equal(classifyBuiltinAgent({ ...definition, instructions: "private override" }), "unknown");
 	assert.equal(classifyBuiltinAgent({ ...definition, tools: ["private tool"] }), "unknown");
 	assert.equal(classifyBuiltinAgent({ ...definition, name: "private-agent" }), "unknown");

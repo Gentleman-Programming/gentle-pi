@@ -1,8 +1,8 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { parseAgentDefinition, type AgentDefinition, type ModelRef } from "./agents-config.ts";
 import type { ChildObservationSnapshot } from "./agents-runner.ts";
 import { FINISHED_STATUSES, type TaskStatus } from "./agents-protocol.ts";
-import { AGENT_CLASSES, EFFORTS, RuntimeMetrics, validRuntimeResponse, type AgentClass, type FinalResponse, type RuntimeMetricBucket } from "./runtime-metrics.ts";
+import { EFFORTS, parseAgentClass, RuntimeMetrics, UNKNOWN_AGENT_CLASS, validRuntimeResponse, type AgentClass, type FinalResponse, type RuntimeMetricBucket } from "./runtime-metrics.ts";
 import { classifyPiCatalogName } from "./runtime-metrics-pi-identity.ts";
 export const CHILD_METRICS_EVENT = "gentle:runtime-metrics:child/v1";
 // Local revocation notification invalidates active observations. Contains only
@@ -11,30 +11,33 @@ export const CHILD_METRICS_REVOKED = "gentle:runtime-metrics:revoked/v1";
 const missing = { state: "unavailable" } as const;
 const providers = ["anthropic", "openai", "openai-codex", "google", "google-vertex", "amazon-bedrock", "openrouter", "custom", "unknown"];
 const tokenFields = ["input", "output", "cacheRead", "cacheWrite", "reasoning", "totalTokens"] as const;
-const builtinFiles = AGENT_CLASSES.filter(name => name !== "orchestrator" && name !== "unknown")
-	.map(name => [name, ["worker", "explore", "verify"].includes(name) ? `gentle-ai-${name}` : name] as const);
-
-/** Compare the runtime definition against this package's fixed assets, not its
- * public-looking name/path. Normalize only model/thinking routing, which the
- * package's gentle-ai.ts updateFrontmatterRouting writer changes on installation
- * and model configuration. Instructions, tools, description and mode must match.
- * No installed files are read; this class is not execution/review authority.
+/** Recognize only names from this package's fixed assets and the transport's
+ * closed agent_class enum. Customized packaged agents retain their schema name;
+ * user-defined names never enter telemetry. Exact fingerprints preserve the
+ * worker/explore/verify compatibility mapping whose packaged names are prefixed.
+ * Model/thinking routing is excluded from fingerprints because installation
+ * rewrites it. No installed files are read; this class is not execution/review authority.
  * Only the fixed package catalog is cached; runtime instructions are not retained.
  */
-let definitions: Array<{ agentClass: AgentClass; fingerprint: string }> | undefined;
+let definitions: Array<{ name: string; fingerprint: string; fingerprintClass?: AgentClass }> | undefined;
 function fingerprint(agent: AgentDefinition): string {
 	return JSON.stringify([agent.name, agent.description, agent.instructions, agent.tools, agent.mode]);
 }
 export function classifyBuiltinAgent(agent: AgentDefinition): AgentClass {
 	try {
-		definitions ??= builtinFiles.map(([agentClass, file]) => {
-			const path = new URL(`../assets/agents/${file}.md`, import.meta.url);
+		definitions ??= readdirSync(new URL("../assets/agents/", import.meta.url))
+			.filter(file => file.endsWith(".md")).map(file => {
+			const path = new URL(`../assets/agents/${file}`, import.meta.url);
 			const parsed = parseAgentDefinition(readFileSync(path, "utf8"), path.pathname, "global");
 			if (!("instructions" in parsed)) throw new Error("Invalid packaged definition");
-			return { agentClass, fingerprint: fingerprint(parsed) };
+			const compatibilityName = parsed.name.startsWith("gentle-ai-") ? parsed.name.slice("gentle-ai-".length) : parsed.name;
+			return { name: parsed.name, fingerprint: fingerprint(parsed),
+				fingerprintClass: parseAgentClass(compatibilityName) };
 		});
-		return definitions.find(entry => entry.fingerprint === fingerprint(agent))?.agentClass ?? "unknown";
-	} catch { return "unknown"; }
+		const namedClass = parseAgentClass(agent.name);
+		if (namedClass && definitions.some(entry => entry.name === agent.name)) return namedClass;
+		return definitions.find(entry => entry.fingerprintClass && entry.fingerprint === fingerprint(agent))?.fingerprintClass ?? UNKNOWN_AGENT_CLASS;
+	} catch { return UNKNOWN_AGENT_CLASS; }
 }
 function provider(value: unknown): FinalResponse["provider"] {
 	return providers.includes(value as string) ? value as FinalResponse["provider"] : value ? "custom" : "unknown";
@@ -98,7 +101,7 @@ function validEvent(value: unknown): value is ChildMetricsEvent {
 		&& Number.isFinite(e.launchedAt) && e.launchedAt >= 0
 		&& e.coverage === "final_assistant_messages_only" && typeof e.agentSettled === "boolean"
 		&& FINISHED_STATUSES.includes(e.status) && Number.isSafeInteger(e.droppedResponses) && e.droppedResponses >= 0
-		&& e.droppedResponses <= Number.MAX_SAFE_INTEGER && !!l && AGENT_CLASSES.includes(l.agentClass) && l.agentClass !== "orchestrator"
+		&& e.droppedResponses <= Number.MAX_SAFE_INTEGER && !!l && !!parseAgentClass(l.agentClass) && l.agentClass !== "orchestrator"
 		&& provider(l.selectedProvider) === l.selectedProvider && modelId(l.selectedProvider, l.selectedModelId) === l.selectedModelId
 		&& effort(l.selectedEffort) === l.selectedEffort && Array.isArray(e.responses) && e.responses.length <= 128
 		&& e.responses.every(row => validRuntimeResponse(row) && row.agentClass === l.agentClass
