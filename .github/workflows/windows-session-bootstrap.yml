@@ -12,7 +12,7 @@ jobs:
   test:
     if: github.repository == 'decode2/gentle-pi'
     runs-on: windows-latest
-    timeout-minutes: 3
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -21,3 +21,6 @@ jobs:
       - name: Run Windows bootstrap startup control
         shell: cmd
         run: node --experimental-strip-types --test --test-name-pattern="^Windows bootstrap startup control$" tests/windows-session-bootstrap.test.ts
+      - name: Run Windows profile bootstrap acceptance
+        shell: cmd
+        run: node --experimental-strip-types --test --test-name-pattern="^Windows-native " tests/windows-session-bootstrap.test.ts
