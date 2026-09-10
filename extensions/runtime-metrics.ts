@@ -7,13 +7,15 @@ import { sendNativeRuntimeEvent, type NativeRuntimeTransportDeps } from "../lib/
 import { runtimeMetricsEnvAllows } from "../lib/runtime-metrics-policy.ts";
 
 /** Available final usage -> one deferred attempt -> discard. No history reads,
- * cumulative session accounting, policy leases, delivery queue or shutdown join.
+ * cumulative session accounting, policy leases, delivery queue or retry. Print
+ * mode alone joins its accepted attempt for at most 1.5 seconds at shutdown.
  * Pi hooks lack request correlation: latency and SDK-zero presence are unknown.
  */
 export default function runtimeMetrics(pi: ExtensionAPI, env = process.env,
-	{ lookup = lookupPiCatalogName, classify = classifyPiCatalogName, native, send = sendNativeRuntimeEvent, now = () => performance.now() }:
+	{ lookup = lookupPiCatalogName, classify = classifyPiCatalogName, native, send = sendNativeRuntimeEvent,
+		now = () => performance.now(), shutdownWaitMs = 1500 }:
 	{ lookup?: typeof lookupPiCatalogName; classify?: typeof classifyPiCatalogName; native?: NativeRuntimeTransportDeps;
-		send?: typeof sendNativeRuntimeEvent; now?: () => number } = {}): void {
+		send?: typeof sendNativeRuntimeEvent; now?: () => number; shutdownWaitMs?: number } = {}): void {
 	const allows = () => env.GENTLE_PI_AGENTS_CHILD !== "1" && runtimeMetricsEnvAllows(env);
 	if (!allows()) return;
 	type Selection = Pick<FinalResponse, "selectedModelId" | "selectedProvider" | "effort">;
@@ -74,7 +76,12 @@ export default function runtimeMetrics(pi: ExtensionAPI, env = process.env,
 		live = owner;
 		refreshCatalog(owner, { provider: "openai", modelId: "gpt-4o" });
 	});
-	pi.on("session_shutdown", () => { dispose(); offChild(); offRevoke(); });
+	pi.on("session_shutdown", (_event, ctx) => {
+		const teardown = () => { dispose(); offChild(); offRevoke(); };
+		const owner = live;
+		if (ctx.mode !== "print" || !owner) { teardown(); return; }
+		return owner.attempt.waitForSettled(shutdownWaitMs).finally(teardown);
+	});
 	pi.on("turn_start", () => { ambiguous = active; active = true; requestSeen = false; selection = undefined; });
 	pi.on("turn_end", () => { active = false; invalidate(); });
 	pi.on("agent_end", () => { active = false; invalidate(); });

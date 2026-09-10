@@ -9,7 +9,7 @@ import { normalizeRpcEvent, TASK_EVENT } from "../lib/agents-protocol.ts";
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 type CatalogLookup = NonNullable<NonNullable<Parameters<typeof runtimeMetrics>[2]>["lookup"]>;
 function harness(env: NodeJS.ProcessEnv = {}, lookup?: CatalogLookup,
-	classify?: (input: unknown) => PiCatalogName) {
+	classify?: (input: unknown) => PiCatalogName, mode: "tui" | "print" = "tui", shutdownWaitMs = 1500) {
 	const handlers = new Map<string, Function>();
 	const listeners = new Map<string, Function>();
 	let session = "first";
@@ -17,13 +17,13 @@ function harness(env: NodeJS.ProcessEnv = {}, lookup?: CatalogLookup,
 	let signal!: AbortSignal;
 	const sent: RuntimeMetricBucket[][] = [];
 	const launches: unknown[] = [];
-	const ctx: any = { cwd: "/fixture", model: { provider: "openai", id: "gpt-4o" },
+	const ctx: any = { cwd: "/fixture", mode, model: { provider: "openai", id: "gpt-4o" },
 		sessionManager: { getSessionId: () => session, getEntries: () => assert.fail("no reconstruction") } };
 	const pi: any = { on: (name: string, handler: Function) => handlers.set(name, handler),
 		getThinkingLevel: () => "high", registerCommand() {},
 		appendEntry: () => assert.fail("no metrics persistence"),
 		events: { on: (name: string, handler: Function) => { listeners.set(name, handler); return () => listeners.delete(name); } } };
-	runtimeMetrics(pi, env, { lookup, classify, now: () => 0, send: (rows, _cwd, deps) => {
+	runtimeMetrics(pi, env, { lookup, classify, now: () => 0, shutdownWaitMs, send: (rows, _cwd, deps) => {
 		sent.push(structuredClone(rows)); launches.push(structuredClone(deps?.launches)); signal = deps!.signal!;
 		return new Promise(resolve => { finish = () => resolve("discarded"); });
 	} });
@@ -90,6 +90,52 @@ test("replacement before launch cancels stale work; shutdown does not await a bl
 	h.emit("message_end", { message: final() });
 	h.replace(); await h.emit("session_start"); await tick();
 	assert.equal(h.sent.length, 0);
+	h.emit("message_end", { message: final() }); await tick();
+	assert.equal(h.emit("session_shutdown"), undefined);
+	assert.equal(h.signal().aborted, true);
+	await h.finish();
+});
+
+test("print shutdown joins an accepted orchestrator delivery before disposing", async () => {
+	const h = harness({}, undefined, undefined, "print", 50); await h.emit("session_start");
+	h.emit("message_end", { message: final() }); await tick();
+	let stopped = false;
+	const shutdown = h.emit("session_shutdown").then(() => { stopped = true; });
+	await tick();
+	assert.equal(stopped, false);
+	assert.equal(h.signal().aborted, false);
+	await h.finish(); await shutdown;
+	assert.equal(stopped, true);
+});
+
+test("print shutdown joins an accepted child launch and response delivery", async () => {
+	const h = harness({}, undefined, undefined, "print", 50); await h.emit("session_start");
+	const observation = normalizeRpcEvent({ type: "message_end", message: final() }, { observeResponses: true })
+		.find(event => event.type === TASK_EVENT.RESPONSE_OBSERVATION);
+	assert.ok(observation?.type === TASK_EVENT.RESPONSE_OBSERVATION);
+	h.bus(childEvent("first", "child", {
+		agentClass: parseAgentClass("sdd-explore")!, selectedProvider: "openai", selectedModelId: "gpt-4o", selectedEffort: "high",
+	}, "completed", { coverage: "final_assistant_messages_only", agentSettled: true, droppedResponses: 0,
+		responses: [observation.observation] }, 0)!);
+	await tick();
+	const shutdown = h.emit("session_shutdown");
+	assert.equal(h.sent[0][0].agentClass, "sdd-explore");
+	assert.deepEqual(h.launches[0], [{ evidence: "launch_configuration", agentClass: "sdd-explore", selectedProvider: "openai",
+		selectedModelId: "gpt-4o", selectedEffort: "high", launches: 1 }]);
+	assert.equal(h.signal().aborted, false);
+	await h.finish(); await shutdown;
+});
+
+test("print shutdown aborts a delivery after the bounded join deadline", async () => {
+	const h = harness({}, undefined, undefined, "print", 5); await h.emit("session_start");
+	h.emit("message_end", { message: final() }); await tick();
+	await h.emit("session_shutdown");
+	assert.equal(h.signal().aborted, true);
+	await h.finish();
+});
+
+test("interactive shutdown never joins a blocked delivery", async () => {
+	const h = harness({}, undefined, undefined, "tui", 50); await h.emit("session_start");
 	h.emit("message_end", { message: final() }); await tick();
 	assert.equal(h.emit("session_shutdown"), undefined);
 	assert.equal(h.signal().aborted, true);
