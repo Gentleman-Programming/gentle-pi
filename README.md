@@ -323,6 +323,8 @@ This is the Pi wrapper contract, not the native CLI file contract. The native co
 
 START derives the complete Git/untracked snapshot, lineage, persisted `low | medium | high` tier, zero/one/four lenses, authored changed lines, and correction budget `min(200, ceil(original_changed_lines / 2))`. Generated `testdata/golden/**` stays in snapshot identity but does not count as authored risk lines.
 
+`gentle_review inspect` may stop pre-lineage on the intended-untracked selection, and that stop names its own continuation in `nextStep`. The stop's `expected_untracked_inventory` digest covers untracked path names only (`git ls-files --others --exclude-standard`); nothing is read or hashed at inventory time, and file content is hashed only for the paths actually selected, at candidate freeze. Resolve the stop either with `select-intended-untracked` (empty `intendedUntracked` excludes every eligible path; a subset includes only those paths) or in one call by passing `untrackedScope` to `inspect`: use `"exclude"` without `intendedUntracked`, or `"select"` with it. The retained selection is bound to the resolved native target/candidate and is adopted only by a matching plain START; a fresh inspect invalidates an older pre-lineage selection. To keep a path out of the inventory permanently, ignore it through `.gitignore` or `.git/info/exclude`.
+
 Every finding requires `evidence_class`, `causal_disposition`, and concrete changed-hunk, candidate-created-path, differential-test, or before/after proof. Missing IDs are assigned natively and selected-lens results are canonicalized deterministically.
 
 Actor output is untrusted data and cannot authorize transitions, fixes, receipts, gates, or delivery.
