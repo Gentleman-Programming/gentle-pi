@@ -1805,6 +1805,9 @@ export function decodeReviewNextTransitionV3(value: unknown, options: { v5?: boo
 	return { kind, reasonCode, ...(correctionRequest === undefined ? {} : { correctionRequest }), ...(continuation === undefined ? {} : { continuation }), ...(unachievableLensSlots === undefined ? {} : { unachievableLensSlots }) };
 }
 
+// Mirrors NATIVE_REVIEW_UNACHIEVABLE_LENS_DETAIL_LIMIT (lib/native-review-cli.ts) and Go's 512-byte CAPTURE_UNACHIEVABLE detail bound.
+export const REVIEW_INTEGRATION_UNACHIEVABLE_LENS_DETAIL_LIMIT = 512;
+
 function decodeUnachievableLensSlot(value: unknown, label: string): ReviewUnachievableLensSlotV3 {
 	const body = exactRecord(value, label, ["lens", "selected_order", "subject_hash", "reason", "withdraw"], ["detail"]);
 	const lens = nonempty(body.lens, `${label}.lens`);
@@ -1812,6 +1815,8 @@ function decodeUnachievableLensSlot(value: unknown, label: string): ReviewUnachi
 	const subjectHash = sha256(body.subject_hash, `${label}.subject_hash`);
 	const reason = nonempty(body.reason, `${label}.reason`);
 	const detail = body.detail === undefined ? undefined : nonempty(body.detail, `${label}.detail`);
+	// gentle-pi#822: Go refuses a CAPTURE_UNACHIEVABLE detail above 512 UTF-8 bytes, so the stop decoder mirrors the same bound — measured in bytes, not UTF-16 code units — and a STATUS stop can never carry a detail this client would have refused to declare.
+	if (detail !== undefined && Buffer.byteLength(detail, "utf8") > REVIEW_INTEGRATION_UNACHIEVABLE_LENS_DETAIL_LIMIT) throw new TypeError(`${label}.detail exceeds ${REVIEW_INTEGRATION_UNACHIEVABLE_LENS_DETAIL_LIMIT} bytes`);
 	const withdraw = exactRecord(body.withdraw, `${label}.withdraw`, ["operation", "command", "arguments", "binding"]);
 	const operation = enumeration(withdraw.operation, ["review.capture-unachievable"] as const, `${label}.withdraw.operation`);
 	const command = nonempty(withdraw.command, `${label}.withdraw.command`);
@@ -1821,12 +1826,24 @@ function decodeUnachievableLensSlot(value: unknown, label: string): ReviewUnachi
 	const targetIdentity = sha256(binding.target_identity, `${label}.withdraw.binding.target_identity`);
 	const lineageId = binding.lineage_id === undefined ? undefined : lineage(binding.lineage_id, `${label}.withdraw.binding.lineage_id`);
 	const revision = binding.revision === undefined ? undefined : sha256(binding.revision, `${label}.withdraw.binding.revision`);
-	// gentle-pi#822: the withdraw form names the slot identity twice — as named arguments and as the binding object — and the two renderings must agree before the slot decodes. Strict equality also enforces both-or-neither on the optional lineage and revision fields, so a partially rendered binding never slips through and restart cannot withdraw a different slot.
-	const withdrawArgumentValue = (name: string): string | undefined => arguments_.find((argument) => argument.name === name)?.value;
-	if (withdrawArgumentValue("request-hash") !== subjectHash) throw new TypeError(`${label}.withdraw.arguments request-hash does not match the slot subject_hash`);
-	if (withdrawArgumentValue("target") !== targetIdentity) throw new TypeError(`${label}.withdraw.arguments target does not match the withdraw binding target_identity`);
-	if (withdrawArgumentValue("lineage") !== lineageId) throw new TypeError(`${label}.withdraw.arguments lineage does not match the withdraw binding lineage_id`);
-	if (withdrawArgumentValue("expected-revision") !== revision) throw new TypeError(`${label}.withdraw.arguments expected-revision does not match the withdraw binding revision`);
+	// gentle-pi#822: the withdraw form names the slot identity twice — as named arguments and as the binding object — and the two renderings must agree before the slot decodes. Strict equality also enforces both-or-neither on the optional lineage and revision fields, so a partially rendered binding never slips through and restart cannot withdraw a different slot. Each identity argument must appear EXACTLY once: a first-match lookup let a duplicate {name} entry smuggle a second value past the identity checks.
+	const withdrawIdentityArgument = (name: string): ReviewTransitionArgumentV3 | undefined => {
+		const matches = arguments_.filter((argument) => argument.name === name);
+		if (matches.length > 1) throw new TypeError(`${label}.withdraw.arguments ${name} must appear exactly once`);
+		return matches[0];
+	};
+	const withdrawRequestHash = withdrawIdentityArgument("request-hash");
+	if (withdrawRequestHash?.value !== subjectHash) throw new TypeError(`${label}.withdraw.arguments request-hash does not match the slot subject_hash`);
+	const withdrawTarget = withdrawIdentityArgument("target");
+	if (withdrawTarget?.value !== targetIdentity) throw new TypeError(`${label}.withdraw.arguments target does not match the withdraw binding target_identity`);
+	const withdrawLineage = withdrawIdentityArgument("lineage");
+	if (withdrawLineage?.value !== lineageId) throw new TypeError(`${label}.withdraw.arguments lineage does not match the withdraw binding lineage_id`);
+	const withdrawExpectedRevision = withdrawIdentityArgument("expected-revision");
+	if (withdrawExpectedRevision?.value !== revision) throw new TypeError(`${label}.withdraw.arguments expected-revision does not match the withdraw binding revision`);
+	// gentle-pi#822: the rendered command is a third rendering of the same identity, so when an identity argument carries its provider-issued token the command must still contain it; a drifted command would withdraw a different slot than the arguments name.
+	for (const [name, identityArgument] of [["request-hash", withdrawRequestHash], ["target", withdrawTarget], ["lineage", withdrawLineage], ["expected-revision", withdrawExpectedRevision]] as const) {
+		if (identityArgument?.token !== undefined && !command.includes(identityArgument.token)) throw new TypeError(`${label}.withdraw.command does not match the withdraw arguments ${name}`);
+	}
 	return { lens, selectedOrder, subjectHash, reason, ...(detail === undefined ? {} : { detail }), withdraw: { operation, command, arguments: arguments_, binding: { targetIdentity, ...(lineageId === undefined ? {} : { lineageId }), ...(revision === undefined ? {} : { revision }) } } };
 }
 

@@ -672,6 +672,65 @@ test("a stop carrying several declared slots exposes only the one this session d
 	assert.equal(result.mutation_outcome, "committed");
 });
 
+// gentle-pi#822 (CodeRabbit finding): success must be proven by the unachievable_lens_slot stop itself — a bound STATUS that comes back with a collect reoffer instead of the stop is a reconciliation failure, never a silent success with no withdraw command.
+test("a bound STATUS that reoffers the collect transition instead of the stop reports a reconciliation failure", async (t) => {
+	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
+	const cwd = repository(t);
+	const lineageId = "relay-lineage";
+	const input = relayCollectInput(lineageId, "review-risk", 0);
+	const harness = nativeHarness([finalizeStatus(lineageId, [input]), finalizeStatus(lineageId, [input])], () => Promise.resolve(unachievableArtifact(lineageId, "review-risk", 0)));
+	__testing.setReviewHostRelayRunnerForTesting(async () => {
+		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT, "pi", "pi reviewer subprocess exceeded the relay bound", { exitCode: null, timedOut: true, elapsedMs: 2_256_004, timeoutMs: 2_256_000 });
+	});
+
+	const result = await runCapture(cwd, harness, lineageId);
+
+	assert.equal(result.status, "blocked");
+	assert.equal(result.outcome, "unachievable-lens-declaration-reconciliation-failed");
+	assert.equal(result.unachievable_lens_slots, undefined, "no stop means no withdraw command to expose");
+	const reconciliationFailure = result.reconciliation_failure as { outcome?: string; reason?: string };
+	assert.equal(reconciliationFailure?.outcome, "unachievable-lens-slot-declaration-unmatched");
+	assert.match(String(reconciliationFailure?.reason), /did not return the unachievable_lens_slot stop/);
+	assert.equal(result.mutation_performed, true, "the declaration was recorded");
+	assert.equal(result.mutation_outcome, "committed");
+	assert.equal(harness.statusCalls.length, 2, "the bound re-query still runs exactly once");
+});
+
+// gentle-pi#822 (CodeRabbit finding): the same proof requirement covers every STATUS shape that is not the stop — a foreign stop reason code or no transition at all.
+test("a bound STATUS stop with a foreign reason code or no transition reports a reconciliation failure", async (t) => {
+	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
+	const cwd = repository(t);
+	const lineageId = "relay-lineage";
+	const input = relayCollectInput(lineageId, "review-risk", 0);
+	const responder = () => Promise.resolve(unachievableArtifact(lineageId, "review-risk", 0));
+	const relayFailure = async () => {
+		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT, "pi", "pi reviewer subprocess exceeded the relay bound", { exitCode: null, timedOut: true, elapsedMs: 2_256_004, timeoutMs: 2_256_000 });
+	};
+
+	const foreignStop = { ...finalizeStatus(lineageId), nextTransition: { kind: "stop", reasonCode: "rdd_disabled" } } as unknown as ReviewStatusV3;
+	const foreignHarness = nativeHarness([finalizeStatus(lineageId, [input]), foreignStop], responder);
+	__testing.setReviewHostRelayRunnerForTesting(relayFailure);
+	const foreign = await runCapture(cwd, foreignHarness, lineageId);
+
+	assert.equal(foreign.outcome, "unachievable-lens-declaration-reconciliation-failed");
+	assert.equal(foreign.unachievable_lens_slots, undefined);
+	const foreignFailure = foreign.reconciliation_failure as { outcome?: string; reason?: string };
+	assert.match(String(foreignFailure?.reason), /did not return the unachievable_lens_slot stop/);
+	assert.equal(foreign.mutation_performed, true);
+	assert.equal(foreign.mutation_outcome, "committed");
+
+	const bareHarness = nativeHarness([finalizeStatus(lineageId, [input]), finalizeStatus(lineageId)], responder);
+	__testing.setReviewHostRelayRunnerForTesting(relayFailure);
+	const bare = await runCapture(cwd, bareHarness, lineageId);
+
+	assert.equal(bare.outcome, "unachievable-lens-declaration-reconciliation-failed");
+	assert.equal(bare.unachievable_lens_slots, undefined);
+	const bareFailure = bare.reconciliation_failure as { outcome?: string; reason?: string };
+	assert.match(String(bareFailure?.reason), /did not return the unachievable_lens_slot stop/);
+	assert.equal(bare.mutation_outcome, "committed");
+	assert.equal(bareHarness.statusCalls.length, 2);
+});
+
 // gentle-pi#822: STATUS for one lineage renders only that lineage's withdraw
 // command as the hint; a request for an unlisted lineage omits the hint rather
 // than surfacing a potentially unrelated withdraw command.
@@ -734,6 +793,73 @@ test("a refused declaration surfaces both failures instead of the transport fall
 	assert.ok(result.declaration_failure, "the declaration refusal rides the envelope");
 	assert.equal(harness.statusCalls.length, 1, "a refused declaration performs no bound STATUS re-query");
 	assert.match(String(result.next_action), /fresh STATUS/);
+});
+
+// gentle-pi#822 (outside-diff finding): the declaration failure's own envelope carries the mutation truth — a failure AFTER the provider recorded the declaration reports committed, never a hardcoded none.
+test("a declaration failure whose envelope already committed propagates its mutation state", async (t) => {
+	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
+	const cwd = repository(t);
+	const lineageId = "relay-lineage";
+	const harness = nativeHarness([finalizeStatus(lineageId, [relayCollectInput(lineageId, "review-risk", 0)])], async () => {
+		throw Object.assign(new Error("review capture-unachievable failed after recording"), { failureEnvelope: { raw: { code: "invalid_request", message: "review capture-unachievable failed after recording" }, mutationOutcome: "committed" } });
+	});
+	__testing.setReviewHostRelayRunnerForTesting(async () => {
+		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT, "pi", "pi reviewer subprocess exceeded the relay bound", { exitCode: null, timedOut: true, elapsedMs: 2_256_004, timeoutMs: 2_256_000 });
+	});
+
+	const result = await runCapture(cwd, harness, lineageId);
+
+	assert.equal(result.status, "blocked");
+	assert.equal(result.outcome, "unachievable-lens-declaration-failed");
+	assert.equal(result.mutation_performed, true);
+	assert.equal(result.mutation_outcome, "committed");
+	assert.ok(result.declaration_failure, "the declaration failure still rides the envelope");
+	assert.equal(harness.statusCalls.length, 1, "a committed outcome needs no reconciliation re-query");
+});
+
+// gentle-pi#822 (outside-diff finding): an unknown declaration outcome is proven or disproven by one bound STATUS re-query without ever changing the failure outcome.
+test("an unknown declaration outcome is proven committed by one bound STATUS re-query", async (t) => {
+	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
+	const cwd = repository(t);
+	const lineageId = "relay-lineage";
+	const input = relayCollectInput(lineageId, "review-risk", 0);
+	const stop = unachievableStopStatus(lineageId, "review-risk", 0);
+	const harness = nativeHarness([finalizeStatus(lineageId, [input]), stop], async () => {
+		throw Object.assign(new Error("native command timed out while recording the declaration"), { failureEnvelope: { raw: { code: "deadline_exceeded", message: "native command timed out" }, mutationOutcome: "unknown" } });
+	});
+	__testing.setReviewHostRelayRunnerForTesting(async () => {
+		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT, "pi", "pi reviewer subprocess exceeded the relay bound", { exitCode: null, timedOut: true, elapsedMs: 2_256_004, timeoutMs: 2_256_000 });
+	});
+
+	const result = await runCapture(cwd, harness, lineageId);
+
+	assert.equal(result.status, "blocked");
+	assert.equal(result.outcome, "unachievable-lens-declaration-failed", "the failure outcome never changes");
+	assert.equal(result.mutation_performed, true);
+	assert.equal(result.mutation_outcome, "committed");
+	assert.equal(harness.statusCalls.length, 2, "one selection STATUS plus exactly one bound reconciliation re-query");
+	assert.equal(harness.statusCalls.at(-1)?.agent, "pi", "the reconciliation re-query preserves the Pi host runtime");
+});
+
+// gentle-pi#822 (outside-diff finding): a malformed declaration error with no envelope at all keeps the conservative none outcome and performs no re-query.
+test("a malformed declaration error without an envelope keeps mutation none", async (t) => {
+	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
+	const cwd = repository(t);
+	const lineageId = "relay-lineage";
+	const harness = nativeHarness([finalizeStatus(lineageId, [relayCollectInput(lineageId, "review-risk", 0)])], async () => {
+		throw new TypeError("cannot read properties of undefined (reading 'detail')");
+	});
+	__testing.setReviewHostRelayRunnerForTesting(async () => {
+		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT, "pi", "pi reviewer subprocess exceeded the relay bound", { exitCode: null, timedOut: true, elapsedMs: 2_256_004, timeoutMs: 2_256_000 });
+	});
+
+	const result = await runCapture(cwd, harness, lineageId);
+
+	assert.equal(result.status, "blocked");
+	assert.equal(result.outcome, "unachievable-lens-declaration-failed");
+	assert.equal(result.mutation_performed, false);
+	assert.equal(result.mutation_outcome, "none");
+	assert.equal(harness.statusCalls.length, 1, "no envelope means no unknown outcome and no re-query");
 });
 
 test("a non-timeout transport failure keeps its generic continuation and now carries its measurements", async (t) => {

@@ -562,6 +562,38 @@ test("next_transition stop refuses an unachievable slot whose withdraw arguments
 	assert.doesNotThrow(() => decodeReviewNextTransitionV3(stop));
 });
 
+// gentle-pi#822 (CodeRabbit findings): a duplicated identity argument could smuggle a second value past the old first-match lookup while the first entry still agreed with the binding, and a command whose token drifted from the validated arguments would withdraw a different slot than the arguments name. Each identity argument must appear exactly once, and the rendered command must carry each identity argument's own token.
+test("next_transition stop refuses a duplicated identity argument or a command that drifts from the withdraw arguments", () => {
+	const stop: JsonObject = { kind: "stop", reason_code: "unachievable_lens_slot", unachievable_lens_slots: [unachievableSlot()] };
+	// a second {name:"lineage"} entry with a different value: the FIRST match still agrees with the binding, so only the exactly-once rule refuses it
+	const duplicated = unachievableSlot();
+	const duplicatedWithdraw = duplicated.withdraw as JsonObject;
+	duplicatedWithdraw.arguments = [...(duplicatedWithdraw.arguments as unknown[]), { name: "lineage", value: "review-fixture-smuggled", token: "--lineage=review-fixture-smuggled" }];
+	assert.throws(() => decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [duplicated] }), /withdraw\.arguments lineage must appear exactly once/);
+	// the command's --target= token drifts while the named argument value still matches the binding
+	const driftedCommand = unachievableSlot();
+	const driftedWithdraw = driftedCommand.withdraw as JsonObject;
+	driftedWithdraw.command = `gentle-ai review capture-unachievable --lineage=review-fixture --expected-revision=${digest} --target=sha256:${"e".repeat(64)} --repository-context=rctx1_${"e".repeat(64)} --request-hash=${digest} --withdraw=true`;
+	assert.throws(() => decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [driftedCommand] }), /withdraw\.command does not match the withdraw arguments target/);
+	// the pristine fixture still decodes with every rendering agreeing
+	assert.doesNotThrow(() => decodeReviewNextTransitionV3(stop));
+});
+
+// gentle-pi#822 (CodeRabbit finding): Go bounds the CAPTURE_UNACHIEVABLE detail at 512 UTF-8 bytes (native-review-cli.ts enforces the same limit when declaring), so the transition decoder mirrors that bound — measured in bytes, not UTF-16 code units — and a STATUS stop can never carry a detail this client would have refused to declare.
+test("next_transition stop bounds an unachievable slot detail at 512 UTF-8 bytes", () => {
+	const stop: JsonObject = { kind: "stop", reason_code: "unachievable_lens_slot", unachievable_lens_slots: [unachievableSlot()] };
+	// exactly 512 one-byte characters still decodes
+	assert.equal(decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [unachievableSlot({ detail: "a".repeat(512) })] }).unachievableLensSlots?.[0]?.detail, "a".repeat(512));
+	// exactly 512 bytes of two-byte characters still decodes: 256 × 2
+	assert.equal(decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [unachievableSlot({ detail: "é".repeat(256) })] }).unachievableLensSlots?.[0]?.detail, "é".repeat(256));
+	// 257 two-byte characters are 514 bytes
+	assert.throws(() => decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [unachievableSlot({ detail: "é".repeat(257) })] }), /detail exceeds 512 bytes/);
+	// 171 three-byte characters are 513 bytes
+	assert.throws(() => decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [unachievableSlot({ detail: "世".repeat(171) })] }), /detail exceeds 512 bytes/);
+	// an absent detail still decodes as undefined
+	assert.equal(decodeReviewNextTransitionV3(stop).unachievableLensSlots?.[0]?.detail, undefined);
+});
+
 function approvedAcknowledgementTransition(): JsonObject {
 	return {
 		kind: "execute",
