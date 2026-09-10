@@ -389,6 +389,18 @@ test("Windows bootstrap diagnostic guards wrapped Add-Type entries under StrictM
 	assert.doesNotMatch(source, /\$record\.CategoryInfo|\$record\.ErrorDetails|\$record\.Exception/);
 });
 
+test("Windows bootstrap source guard—not native proof—extracts only structured compiler ErrorNumber values", async (t) => {
+	t.diagnostic("source guard, not native Windows proof");
+	const source = await readFile(runtime, "utf8");
+	assert.match(source, /TargetObject/);
+	assert.match(source, /function Get-BootstrapCompilerErrorCode/);
+	assert.match(source, /\$target -isnot \[System\.CodeDom\.Compiler\.CompilerError\]/);
+	assert.match(source, /Get-BootstrapProperty \$target 'ErrorNumber'/);
+	assert.ok(source.includes(String.raw`$errorNumber -cmatch '\ACS[0-9]{4}\z'`));
+	assert.doesNotMatch(source, /TargetObject\.ToString/);
+	assert.doesNotMatch(source, /Get-BootstrapProperty \$target 'ErrorText'/);
+});
+
 test("Windows bootstrap diagnostic parser accepts fixed Add-Type evidence", () => {
 	assert.deepEqual(parseBootstrapDiagnostic('{"kind":"windows-session-bootstrap-diagnostic","category":"compiler","compilerCodes":["CS1001","CS1739"],"reason":"source-code-error","languageMode":"full"}\n'), {
 		kind: "windows-session-bootstrap-diagnostic", category: "compiler", compilerCodes: ["CS1001", "CS1739"], reason: "source-code-error", languageMode: "full",

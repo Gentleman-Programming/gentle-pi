@@ -50,11 +50,13 @@ function ConvertTo-BootstrapDiagnosticRecord([object]$entry) {
 			$errorDetails = Get-BootstrapProperty $candidate 'ErrorDetails'
 			$errorDetailsMessage = Get-BootstrapProperty $errorDetails 'Message'
 			$exception = Get-BootstrapProperty $candidate 'Exception'
+			$targetObject = Get-BootstrapProperty $candidate 'TargetObject'
 			return [pscustomobject]@{
 				FullyQualifiedErrorId = if ($fqid -is [string]) { $fqid } else { $null }
 				Category = if ($category -is [System.Management.Automation.ErrorCategory]) { $category } else { $null }
 				ErrorDetailsMessage = if ($errorDetailsMessage -is [string]) { $errorDetailsMessage } else { $null }
 				Exception = if ($exception -is [System.Exception]) { $exception } else { $null }
+				TargetObject = if ($targetObject -is [System.CodeDom.Compiler.CompilerError]) { $targetObject } else { $null }
 			}
 		}
 		$wrapped = Get-BootstrapProperty $candidate 'ErrorRecord'
@@ -67,6 +69,15 @@ function ConvertTo-BootstrapDiagnosticRecord([object]$entry) {
 		}
 		$candidate = $wrapped
 	}
+	return $null
+}
+
+function Get-BootstrapCompilerErrorCode([object]$target) {
+	try {
+		if ($target -isnot [System.CodeDom.Compiler.CompilerError]) { return $null }
+		$errorNumber = Get-BootstrapProperty $target 'ErrorNumber'
+		if ($errorNumber -is [string] -and $errorNumber -cmatch '\ACS[0-9]{4}\z') { return $errorNumber }
+	} catch {}
 	return $null
 }
 
@@ -127,6 +138,10 @@ function Write-BootstrapDiagnostic([object[]]$records) {
 			if ($reason -eq 'unknown') { $reason = Get-BootstrapAddTypeReason $record }
 			Add-BootstrapDiagnosticText $text (Get-BootstrapProperty $record 'FullyQualifiedErrorId')
 			Add-BootstrapDiagnosticText $text (Get-BootstrapProperty $record 'ErrorDetailsMessage')
+		}
+		foreach ($record in $captured) {
+			$code = Get-BootstrapCompilerErrorCode (Get-BootstrapProperty $record 'TargetObject')
+			if ($code -is [string] -and $seenCompilerCodes.Add($code) -and $compilerCodes.Count -lt 8) { $compilerCodes.Add($code) }
 		}
 		foreach ($record in $captured) {
 			$exception = Get-BootstrapProperty $record 'Exception'
