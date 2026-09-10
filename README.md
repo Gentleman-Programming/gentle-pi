@@ -855,19 +855,19 @@ Memory contract for SDD delegation:
 
 ## Telemetry
 
-`gentle-pi` does not collect anything itself. [gentle-ai](https://github.com/Gentleman-Programming/gentle-ai) owns anonymous usage telemetry end to end — install and heartbeat events, what fields are sent, rate limiting, and every opt-out. See its README/docs for the exact contract.
+`gentle-pi` observes approved sanitized runtime usage fields in memory and asynchronously invokes `gentle-ai telemetry runtime send --json` once per accepted event. It never persists metric data, retries, or waits for delivery in provider callbacks; busy or failed attempts are silently discarded. [gentle-ai](https://github.com/Gentleman-Programming/gentle-ai) owns native delivery and the existing opt-out policy. See [Telemetry](docs/telemetry.md) for fields and source limitations.
 
-At session start, for a primary session only (never for a named or SDD sub-agent), Gentle Pi asks the local `gentle-ai` binary to send its own telemetry: it spawns `gentle-ai telemetry trigger --json` detached, with a 3 s deadline, discards its output, and never blocks session start or surfaces an error — an older binary without the verb is silently treated as nothing to do. This runs at most once per process.
+Separately, at primary session start (never for a named or SDD sub-agent), Gentle Pi asks the local `gentle-ai` binary to handle its own install/heartbeat telemetry: it spawns `gentle-ai telemetry trigger --json` detached, with a 3 s deadline, discards its output, and never blocks session start or surfaces an error — an older binary without the verb is silently treated as nothing to do. This runs at most once per process.
 
 Install counts for `gentle-pi` and `gentle-engram` come from npm download statistics; the package itself never emits an install event.
 
 To opt out:
 
 - `/gentle:telemetry disable` — asks the local `gentle-ai` binary to disable telemetry (also `status` and `preview` to inspect it without leaving Pi).
-- `DO_NOT_TRACK=1` — Gentle Pi itself will not spawn the trigger, and `gentle-ai` also honors this standard on its own.
+- `DO_NOT_TRACK=1` — Gentle Pi suppresses runtime usage telemetry and the install/heartbeat trigger; `gentle-ai` also honors this standard independently.
 - `GENTLE_AI_TELEMETRY=0` — same effect, `gentle-ai`'s own environment switch.
 
-`CI=true` also suppresses the trigger, since automated runs are not a real usage signal.
+`CI=true` also suppresses runtime usage telemetry and the trigger, since automated runs are not a real usage signal.
 
 ## Package contents
 
