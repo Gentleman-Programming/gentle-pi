@@ -1399,6 +1399,8 @@ const SDD_AGENT_NAMES = [
 	"sdd-archive",
 ] as const;
 const SDD_AGENT_NAME_SET = new Set<string>(SDD_AGENT_NAMES);
+const SDD_CHANGE_FLAG = "gentle-sdd-change";
+const SDD_CHANGE_KEYS = ["changeName", "phase", "workspaceRoot"] as const;
 
 const JUDGMENT_DAY_AGENT_NAMES = [
 	"jd-judge-a",
@@ -1488,6 +1490,56 @@ function sddPhaseFromAgentStartEvent(event: unknown): SddPhase | undefined {
 	if (/\bSDD sync executor\b/i.test(systemPrompt)) return "sync";
 	if (/\bSDD archive executor\b/i.test(systemPrompt)) return "archive";
 	return undefined;
+}
+
+function resolveSddChangeStartup(
+	serialized: unknown,
+	cwd: string,
+	agentName: string,
+	resolver: (options: Parameters<typeof resolveSddStatus>[0]) => ReturnType<typeof resolveSddStatus> = resolveSddStatus,
+) {
+	if (typeof serialized !== "string") throw new Error("SDD selection must be a JSON string.");
+	let value: unknown;
+	try {
+		value = JSON.parse(serialized);
+	} catch {
+		throw new Error("SDD selection is malformed.");
+	}
+	if (!isRecord(value) || Object.keys(value).sort().join(",") !== SDD_CHANGE_KEYS.join(",")) {
+		throw new Error("SDD selection must contain only changeName, workspaceRoot, and phase.");
+	}
+	const { changeName, workspaceRoot, phase } = value;
+	if (typeof changeName !== "string" || changeName.length === 0 ||
+		typeof workspaceRoot !== "string" || workspaceRoot.length === 0 ||
+		(phase !== "apply" && phase !== "verify" && phase !== "sync" && phase !== "archive")) {
+		throw new Error("SDD selection has an invalid identity.");
+	}
+	if (agentName !== `sdd-${phase}`) throw new Error("SDD selection phase does not match the child agent.");
+	let canonicalCwd: string;
+	let canonicalSelectionRoot: string;
+	try {
+		canonicalCwd = realpathSync(cwd);
+		canonicalSelectionRoot = realpathSync(workspaceRoot);
+	} catch {
+		throw new Error("SDD selection workspaceRoot cannot be resolved.");
+	}
+	if (canonicalCwd !== canonicalSelectionRoot || workspaceRoot !== canonicalSelectionRoot) {
+		throw new Error("SDD selection workspaceRoot does not match the canonical child root.");
+	}
+	const status = resolver({ cwd: canonicalCwd, workspaceRoot: canonicalCwd, changeName, includeInstructions: true });
+	if (status.actionContext.workspaceRoot !== canonicalCwd || status.changeName !== changeName) {
+		throw new Error("SDD selection resolver returned a mismatched status.");
+	}
+	return { selection: { changeName, workspaceRoot: canonicalCwd, phase }, status };
+}
+
+function readSddChangeFlag(pi: ExtensionAPI): unknown {
+	try {
+		const value = (pi as unknown as { getFlag?: (name: string) => unknown }).getFlag?.(SDD_CHANGE_FLAG);
+		return value === false ? undefined : value;
+	} catch {
+		return null;
+	}
 }
 
 function normalizePolicyPath(value: string): string {
@@ -6414,6 +6466,8 @@ export const __testing = {
 	clearNativeReviewOutcomeMemoForTesting,
 	resolveControllerSddStatus,
 	resolveStartupControllerSddStatus,
+	resolveSddChangeStartup,
+	readSddChangeFlag,
 	resetTelemetryTriggerGuardForTesting,
 	createGentleAiExtension: createGentleAiExtensionForTesting,
 };
@@ -6484,6 +6538,11 @@ function createGentleAiExtensionForTesting(
 	const resolveTelemetryTriggerBinary = dependencies.resolveTelemetryTriggerBinary ?? resolveGentleAiBinary;
 	const telemetryExecFileAdapter = dependencies.telemetryExecFileAdapter ?? createNodeExecFileAdapter();
 	return function gentleAi(pi: ExtensionAPI): void {
+		const flags = pi as unknown as { registerFlag?: (name: string, definition: { description: string; type: "string"; default?: string }) => void };
+		flags.registerFlag?.(SDD_CHANGE_FLAG, {
+			description: "Internal launch-local selected SDD change identity for package-owned child agents.",
+			type: "string",
+		});
 	declareReviewRelayHandshake(dependencies.processEnv ?? process.env);
 	const pendingReviewConsentFallbackKey = Symbol("pending-review-consent-fallback");
 	const candidateViews = dependencies.candidateViews === undefined ? new CandidateViewRegistry() : dependencies.candidateViews;
@@ -6916,14 +6975,32 @@ function createGentleAiExtensionForTesting(
 				? `\n\n${renderSddPreflightPrompt(prefs)}`
 				: "";
 		const phase = isSddAgent ? sddPhaseFromAgentStartEvent(event) : undefined;
+		const launchSddChange = isSddAgent ? readSddChangeFlag(pi) : undefined;
 		const nativeStatusPrompt = phase
-			? `\n\n${renderNativeSddPhasePrompt(resolveStartupControllerSddStatus(
-				ctx.cwd,
-				undefined,
-				true,
-				prefs?.artifactStore,
-			), phase)}`
-			: "";
+			? (() => {
+				if (launchSddChange === undefined) {
+					return `\n\n${renderNativeSddPhasePrompt(resolveStartupControllerSddStatus(
+						ctx.cwd,
+						undefined,
+						true,
+						prefs?.artifactStore,
+					), phase)}`;
+				}
+				try {
+					const names = readAgentStartNames(event);
+					const agentName = names.find((name) => name === `sdd-${phase}`);
+					if (!agentName) throw new Error("SDD selection requires a matching named SDD phase agent.");
+					const startup = resolveSddChangeStartup(launchSddChange, ctx.cwd, agentName, (options) =>
+						resolveControllerSddStatus(options.cwd, options.changeName, true, prefs?.artifactStore),
+					);
+					return `\n\n${renderNativeSddPhasePrompt(startup.status, phase)}`;
+				} catch (error) {
+					return `\n\n## Native SDD Status Engine\nSDD selection blocked: ${error instanceof Error ? error.message : String(error)}\nDo not run phase work; return this blocker to the parent.`;
+				}
+			})()
+			: launchSddChange === undefined
+				? ""
+				: "\n\n## Native SDD Status Engine\nSDD selection blocked: the receiving agent has no recognized SDD phase.\nDo not run phase work; return this blocker to the parent.";
 		// gentle-pi#661: the RDD status line (and the rest of the gentle prompt)
 		// is built only for the primary session, mirrored on the
 		// reviewContractPrompt condition below -- named/SDD agents never reach
