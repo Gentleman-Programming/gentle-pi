@@ -128,6 +128,7 @@ import {
 import {
 	createNativeReviewCli,
 	createNodeExecFileAdapter,
+	decodeNativeSddStatusV2,
 	isCanonicalProcessString,
 	nativeReviewAbandonAuthorization,
 	nativeReviewLegacyAliasRepairAuthorization,
@@ -148,6 +149,7 @@ import {
 	NATIVE_REVIEW_RECONCILE_ANOMALIES,
 	sanitizeForeignNativeReviewDiagnostics,
 	type NativeReviewCli,
+	type NativeSddStatusV2,
 	type NativeIntendedUntrackedSelectionSubmission,
 	type NativeReviewAcknowledgeApprovedOutcome,
 	type NativeReviewAcknowledgeApprovedRequest,
@@ -1492,12 +1494,7 @@ function sddPhaseFromAgentStartEvent(event: unknown): SddPhase | undefined {
 	return undefined;
 }
 
-function resolveSddChangeStartup(
-	serialized: unknown,
-	cwd: string,
-	agentName: string,
-	resolver: (options: Parameters<typeof resolveSddStatus>[0]) => ReturnType<typeof resolveSddStatus> = resolveSddStatus,
-) {
+function resolveSddChangeSelection(serialized: unknown, cwd: string, agentName: string) {
 	if (typeof serialized !== "string") throw new Error("SDD selection must be a JSON string.");
 	let value: unknown;
 	try {
@@ -1526,11 +1523,52 @@ function resolveSddChangeStartup(
 	if (canonicalCwd !== canonicalSelectionRoot || workspaceRoot !== canonicalSelectionRoot) {
 		throw new Error("SDD selection workspaceRoot does not match the canonical child root.");
 	}
-	const status = resolver({ cwd: canonicalCwd, workspaceRoot: canonicalCwd, changeName, includeInstructions: true });
-	if (status.actionContext.workspaceRoot !== canonicalCwd || status.changeName !== changeName) {
+	return { changeName, workspaceRoot: canonicalCwd, phase };
+}
+
+function resolveSddChangeStartup(
+	serialized: unknown,
+	cwd: string,
+	agentName: string,
+	resolver: (options: Parameters<typeof resolveSddStatus>[0]) => ReturnType<typeof resolveSddStatus> = resolveSddStatus,
+) {
+	const selection = resolveSddChangeSelection(serialized, cwd, agentName);
+	const status = resolver({ cwd: selection.workspaceRoot, workspaceRoot: selection.workspaceRoot, changeName: selection.changeName, includeInstructions: true });
+	if (status.actionContext.workspaceRoot !== selection.workspaceRoot || status.changeName !== selection.changeName) {
 		throw new Error("SDD selection resolver returned a mismatched status.");
 	}
-	return { selection: { changeName, workspaceRoot: canonicalCwd, phase }, status };
+	return { selection, status };
+}
+
+async function resolveSelectedNativeSddChangeStartup(
+	serialized: unknown,
+	cwd: string,
+	agentName: string,
+	native: Pick<NativeReviewCli, "sddStatus"> | null | undefined,
+	localResolver: (options: Parameters<typeof resolveSddStatus>[0]) => ReturnType<typeof resolveSddStatus> = resolveSddStatus,
+): Promise<{ selection: { changeName: string; workspaceRoot: string; phase: SddPhase }; status: NativeSddStatusV2 | ReturnType<typeof resolveSddStatus> }> {
+	const selection = resolveSddChangeSelection(serialized, cwd, agentName);
+	if (selection.phase === "sync") {
+		const status = localResolver({ cwd: selection.workspaceRoot, workspaceRoot: selection.workspaceRoot, changeName: selection.changeName, includeInstructions: true });
+		if (status.actionContext.workspaceRoot !== selection.workspaceRoot || status.changeName !== selection.changeName) {
+			throw new Error("SDD selection resolver returned a mismatched status.");
+		}
+		return { selection, status };
+	}
+	if (native?.sddStatus === undefined) throw new Error("SDD selection native status is unavailable.");
+	let status: NativeSddStatusV2;
+	try {
+		status = decodeNativeSddStatusV2(
+			await native.sddStatus({ changeName: selection.changeName, workspaceRoot: selection.workspaceRoot }),
+			{ changeName: selection.changeName, workspaceRoot: selection.workspaceRoot },
+		);
+	} catch (error) {
+		throw new Error(`SDD selection native status is blocked: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!(selection.phase in status.dependencies) || !(selection.phase in status.instructions)) {
+		throw new Error(`SDD selection native status cannot represent phase ${selection.phase}.`);
+	}
+	return { selection, status };
 }
 
 function readSddChangeFlag(pi: ExtensionAPI): unknown {
@@ -6461,6 +6499,7 @@ export const __testing = {
 	resolveControllerSddStatus,
 	resolveStartupControllerSddStatus,
 	resolveSddChangeStartup,
+	resolveSelectedNativeSddChangeStartup,
 	readSddChangeFlag,
 	resetTelemetryTriggerGuardForTesting,
 	createGentleAiExtension: createGentleAiExtensionForTesting,
@@ -6971,7 +7010,7 @@ function createGentleAiExtensionForTesting(
 		const phase = isSddAgent ? sddPhaseFromAgentStartEvent(event) : undefined;
 		const launchSddChange = isSddAgent ? readSddChangeFlag(pi) : undefined;
 		const nativeStatusPrompt = phase
-			? (() => {
+			? await (async () => {
 				if (launchSddChange === undefined) {
 					return `\n\n${renderNativeSddPhasePrompt(resolveStartupControllerSddStatus(
 						ctx.cwd,
@@ -6984,10 +7023,19 @@ function createGentleAiExtensionForTesting(
 					const names = readAgentStartNames(event);
 					const agentName = names.find((name) => name === `sdd-${phase}`);
 					if (!agentName) throw new Error("SDD selection requires a matching named SDD phase agent.");
-					const startup = resolveSddChangeStartup(launchSddChange, ctx.cwd, agentName, (options) =>
-						resolveControllerSddStatus(options.cwd, options.changeName, true, prefs?.artifactStore),
+					const startup = await resolveSelectedNativeSddChangeStartup(
+						launchSddChange,
+						ctx.cwd,
+						agentName,
+						nativeReviewCli,
+						(options) => resolveControllerSddStatus(
+							options.cwd,
+							options.changeName,
+							true,
+							prefs?.artifactStore,
+						),
 					);
-					return `\n\n${renderNativeSddPhasePrompt(startup.status, phase)}`;
+					return `\n\n${renderNativeSddPhasePrompt(startup.status as never, phase)}`;
 				} catch (error) {
 					return `\n\n## Native SDD Status Engine\nSDD selection blocked: ${error instanceof Error ? error.message : String(error)}\nDo not run phase work; return this blocker to the parent.`;
 				}

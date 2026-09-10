@@ -6,6 +6,7 @@ import test from "node:test";
 import { AGENT_MODE, type AgentDefinition } from "../lib/agents-config.ts";
 import { AgentRunner, type TaskRequest } from "../lib/agents-runner.ts";
 import { TaskStore } from "../lib/agents-protocol.ts";
+import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError } from "../lib/native-review-cli.ts";
 import { __testing } from "../extensions/gentle-ai.ts";
 import { fakeChild } from "./agents-fake-child.ts";
 
@@ -74,6 +75,121 @@ test("selected SDD change snapshots at task construction and reaches child start
 	const startup = __testing.resolveSddChangeStartup(serialized, root, "sdd-apply");
 	assert.equal(startup.status.changeName, "alpha");
 	assert.equal(startup.status.nextRecommended, "sdd-propose");
+});
+
+test("selected native v2 archive authority is injected whole and never falls back to the local resolver", async (t) => {
+	const root = workspace(t);
+	const serialized = JSON.stringify({ changeName: "alpha", workspaceRoot: root, phase: "archive" });
+	const nativeAuthority = {
+		schemaName: "gentle-ai.sdd-status",
+		schemaVersion: 2,
+		changeName: "alpha",
+		actionContext: { workspaceRoot: root },
+		dependencies: { apply: "all_done", verify: "all_done", archive: "ready" },
+		instructions: { apply: ["done"], verify: ["done"], archive: ["archive now"] },
+		blockedReasons: [],
+		nextRecommended: "archive",
+	};
+	const nativeCalls: unknown[] = [];
+	let localResolverCalls = 0;
+	const startup = await (__testing as unknown as {
+		resolveSelectedNativeSddChangeStartup(
+			serialized: unknown,
+			cwd: string,
+			agentName: string,
+			native: { sddStatus?: (request: unknown) => Promise<unknown> },
+			localResolver: () => unknown,
+		): Promise<{ selection: { changeName: string; workspaceRoot: string; phase: string }; status: unknown }>;
+	}).resolveSelectedNativeSddChangeStartup(serialized, root, "sdd-archive", {
+		sddStatus: async (request) => { nativeCalls.push(request); return nativeAuthority; },
+	}, () => {
+		localResolverCalls += 1;
+		// Simulates local v1's missing sync-report.md result: it must never
+		// overlay the native archive-ready authority.
+		return { dependencies: { verify: "all_done", sync: "blocked", archive: "blocked" } };
+	});
+
+	assert.deepEqual(startup.selection, { changeName: "alpha", workspaceRoot: root, phase: "archive" });
+	assert.equal(startup.status, nativeAuthority, "the validated native status object is injected without a local overlay");
+	assert.deepEqual(nativeCalls, [{ changeName: "alpha", workspaceRoot: root }]);
+	assert.equal(localResolverCalls, 0);
+});
+
+test("selected native v2 failures fail closed without consulting the local resolver", async (t) => {
+	const root = workspace(t);
+	const serialized = JSON.stringify({ changeName: "alpha", workspaceRoot: root, phase: "archive" });
+	const valid = {
+		schemaName: "gentle-ai.sdd-status", schemaVersion: 2, changeName: "alpha",
+		actionContext: { workspaceRoot: root },
+		dependencies: { apply: "all_done", verify: "all_done", archive: "blocked" },
+		instructions: { apply: ["done"], verify: ["done"], archive: ["blocked"] },
+		blockedReasons: ["native archive blocker"], nextRecommended: "verify",
+	};
+	const failures: Array<{ sddStatus?: () => Promise<unknown> }> = [
+		{},
+		{ sddStatus: async () => { throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.TIMEOUT, "sdd-status", true, false, "native timeout"); } },
+		{ sddStatus: async () => { throw new NativeReviewCliError(NATIVE_REVIEW_ERROR_CODE.NON_ZERO, "sdd-status", true, false, "native nonzero"); } },
+		{ sddStatus: async () => { throw new Error("native command threw"); } },
+		{ sddStatus: async () => ({}) },
+		{ sddStatus: async () => ({ ...valid, schemaVersion: 1 }) },
+		{ sddStatus: async () => ({ ...valid, changeName: "other" }) },
+		{ sddStatus: async () => ({ ...valid, actionContext: { workspaceRoot: "/other" } }) },
+		{ sddStatus: async () => ({ ...valid, dependencies: { apply: "all_done", verify: "all_done" } }) },
+		{ sddStatus: async () => ({ ...valid, instructions: { apply: ["done"], verify: ["done"] } }) },
+		{ sddStatus: async () => ({ ...valid, blockedReasons: "invalid" }) },
+	];
+	for (const native of failures) {
+		let localResolverCalls = 0;
+		await assert.rejects(
+			() => (__testing as unknown as {
+				resolveSelectedNativeSddChangeStartup(
+					serialized: unknown, cwd: string, agentName: string,
+					native: { sddStatus?: () => Promise<unknown> }, localResolver: () => unknown,
+				): Promise<unknown>;
+			}).resolveSelectedNativeSddChangeStartup(serialized, root, "sdd-archive", native, () => { localResolverCalls += 1; return {}; }),
+			/SDD selection native status/i,
+		);
+		assert.equal(localResolverCalls, 0);
+	}
+
+	const blocked = await (__testing as unknown as {
+		resolveSelectedNativeSddChangeStartup(
+			serialized: unknown, cwd: string, agentName: string,
+			native: { sddStatus?: () => Promise<unknown> }, localResolver: () => unknown,
+		): Promise<{ status: typeof valid }>;
+	}).resolveSelectedNativeSddChangeStartup(serialized, root, "sdd-archive", { sddStatus: async () => valid }, () => {
+		throw new Error("local resolver must not run");
+	});
+	assert.deepEqual(blocked.status, valid, "a native archive blocker remains authoritative over a locally-ready result");
+
+	const syncSerialized = JSON.stringify({ changeName: "alpha", workspaceRoot: root, phase: "sync" });
+	const localStatus = __testing.resolveSddChangeStartup(syncSerialized, root, "sdd-sync").status;
+	const syncNativeCalls: unknown[] = [];
+	const syncLocalCalls: unknown[] = [];
+	const sync = await (__testing as unknown as {
+		resolveSelectedNativeSddChangeStartup(
+			serialized: unknown, cwd: string, agentName: string,
+			native: { sddStatus?: (request: unknown) => Promise<unknown> }, localResolver: (options: unknown) => unknown,
+		): Promise<{ status: unknown }>;
+	}).resolveSelectedNativeSddChangeStartup(syncSerialized, root, "sdd-sync", {
+		sddStatus: async (request) => { syncNativeCalls.push(request); throw new Error("native must not run"); },
+	}, (options) => {
+		syncLocalCalls.push(options);
+		return localStatus;
+	});
+	assert.equal(sync.status, localStatus, "selected sync injects the exact local status");
+	assert.deepEqual(syncLocalCalls, [{ cwd: root, workspaceRoot: root, changeName: "alpha", includeInstructions: true }]);
+	assert.deepEqual(syncNativeCalls, []);
+
+	await assert.rejects(
+		() => (__testing as unknown as {
+			resolveSelectedNativeSddChangeStartup(
+				serialized: unknown, cwd: string, agentName: string,
+				native: { sddStatus?: () => Promise<unknown> }, localResolver: () => typeof localStatus,
+			): Promise<unknown>;
+		}).resolveSelectedNativeSddChangeStartup(syncSerialized, root, "sdd-sync", undefined, () => ({ ...localStatus, changeName: "beta" })),
+		/mismatched status/i,
+	);
 });
 
 test("a throwing SDD selection flag reader fails closed without resolving an unselected status", (t) => {
