@@ -234,6 +234,42 @@ test("a stale-layout release clears an active left gesture in both views", () =>
 	}
 });
 
+test("non-left gestures pass through with current, stale, and missing layouts in both views", () => {
+	let standaloneRows = 12;
+	let accordionRows = 8;
+	const { view: standalone } = view({ rows: () => standaloneRows });
+	const accordion = new WorktreeChangesView([{ root: "/main", branch: "main", model: changesModel([file("a.ts", 1, 0)]) }], {
+		theme: plainTheme, rows: () => accordionRows, loadDiff: async () => "+preview", onOpen() {}, onClose() {}, onRefresh() {}, requestRender() {},
+	});
+	accordion.handleInput("\r");
+	standalone.render(80);
+	accordion.render(80);
+	for (const [component, y, currentHeight, staleHeight, resize] of [
+		[standalone, 1, 12, 8, () => { standaloneRows = 8; }],
+		[accordion, 2, 8, 6, () => { accordionRows = 6; }],
+	] as const) {
+		resize();
+		assert.deepEqual(component.handleMouse(mouseButton("press", "left", 3, y, staleHeight)), { handled: true, render: false }, "stale geometry does not capture a left press");
+		for (const button of ["right", "middle"] as const) {
+			assert.equal(component.handleMouse(mouseButton("press", button, 3, y, staleHeight)), undefined, `${button} press must reach pi-tui with stale geometry`);
+			assert.equal(component.handleMouse(mouseButton("release", button, 3, y, staleHeight)), undefined, `${button} release must reach pi-tui with stale geometry`);
+		}
+		component.render(80);
+		assert.deepEqual(component.handleMouse(mouseButton("press", "left", 3, y, staleHeight)), { handled: true, capture: true, render: false }, "current geometry captures a left press");
+		assert.deepEqual(component.handleMouse(mouseButton("release", "none", 3, y, staleHeight)), { handled: true, render: false }, "current geometry clears the active left release");
+		for (const button of ["right", "middle"] as const) {
+			assert.equal(component.handleMouse(mouseButton("press", button, 3, y, staleHeight)), undefined, `${button} press must reach pi-tui with current geometry`);
+			assert.equal(component.handleMouse(mouseButton("release", button, 3, y, staleHeight)), undefined, `${button} release must reach pi-tui with current geometry`);
+		}
+		component.invalidate();
+		assert.deepEqual(component.handleMouse(mouseButton("press", "left", 3, y, currentHeight)), { handled: true, render: false }, "missing geometry does not capture a left press");
+		for (const button of ["right", "middle"] as const) {
+			assert.equal(component.handleMouse(mouseButton("press", button, 3, y, currentHeight)), undefined, `${button} press must reach pi-tui without geometry`);
+			assert.equal(component.handleMouse(mouseButton("release", button, 3, y, currentHeight)), undefined, `${button} release must reach pi-tui without geometry`);
+		}
+	}
+});
+
 test("right press reaches the native Windows paste fallback when eligible", () => {
 	let onInput: ((data: string) => void) | undefined;
 	let pasted = 0;

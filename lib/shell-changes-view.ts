@@ -224,6 +224,7 @@ export class WorktreeChangesView {
 			}
 			return undefined;
 		}
+		if (event.type === "press" && event.button !== "left") return undefined;
 		const layout = this.pointerLayout;
 		if (!layout || event.width !== layout.width || event.height !== layout.height) return { handled: true, render: false };
 		const inBody = event.y >= 1 && event.y <= layout.bodyRows;
@@ -396,6 +397,7 @@ export class ChangesView {
 			}
 			return undefined;
 		}
+		if (event.type === "press" && event.button !== "left") return undefined;
 		const layout = this.pointerLayout;
 		if (!layout || event.width !== layout.width || event.height !== layout.height) return { handled: true, render: false };
 		const inBody = event.y >= 1 && event.y <= layout.bodyRows;
