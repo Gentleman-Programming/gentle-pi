@@ -502,7 +502,7 @@ function Write-BootstrapRejectionDiagnostic([BootstrapFailure]$failure) {
 }
 
 function Write-Reply([string]$requestId, [bool]$ok, $result, [string]$error) {
-	if ($ok) { [Console]::Out.WriteLine((@{ requestId = $requestId; ok = $true; result = $result } | ConvertTo-Json -Compress)) }
+	if ($ok) { [Console]::Out.WriteLine((@{ requestId = $requestId; ok = $true; result = $result } | ConvertTo-Json -Compress -Depth 4)) }
 	else { [Console]::Out.WriteLine((@{ requestId = $requestId; ok = $false; error = $error } | ConvertTo-Json -Compress)) }
 }
 function Get-CurrentPrivateDescriptor {

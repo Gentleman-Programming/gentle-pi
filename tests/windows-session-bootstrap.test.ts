@@ -673,6 +673,7 @@ test("Windows presence source guard uses rooted no-replace publication and same-
 	assert.match(source, /info\.NumberOfLinks != 1/);
 	assert.match(source, /!identity\.Equals\(retained\)/);
 	assert.match(source, /try \{\s*if \(owned\.Sid != sid\) Fail\("unsafe"\); RecordIdentity retained = AssertRetainedPublication/);
+	assert.match(source, /function Write-Reply\([\s\S]*?result = \$result \} \| ConvertTo-Json -Compress -Depth 4/);
 	assert.match(source, /public static PresenceRecord\[\] List\(string sid\) \{ return List\(null, sid\); \}/);
 	assert.match(source, /public static PresenceRecord\[\] List\(string excluded, string sid\)/);
 	assert.match(source, /\$nativeRecords = if \(\$hasExcludeSessionId\) \{ \[WindowsSessionBootstrap\]::List\(\$excludeSessionId, \$identity\.Sid\) \} else \{ \[WindowsSessionBootstrap\]::List\(\$identity\.Sid\) \}/);
