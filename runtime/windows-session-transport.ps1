@@ -19,34 +19,140 @@ function Add-BootstrapDiagnosticText([System.Text.StringBuilder]$builder, [objec
 	[void]$builder.Append($text)
 }
 
-function Write-BootstrapDiagnostic([object]$record) {
-	$category = 'other'
-	$compilerCodes = [System.Collections.Generic.List[string]]::new()
-	$seenCompilerCodes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-	$text = [System.Text.StringBuilder]::new()
-	$exception = $record.Exception
-	for ($depth = 0; $depth -lt 8 -and $null -ne $exception; $depth++) {
-		$typeName = $exception.GetType().FullName
-		if ($typeName -in @('System.IO.FileLoadException', 'System.IO.FileNotFoundException', 'System.BadImageFormatException')) { $category = 'assembly-load' }
-		elseif ($category -eq 'other' -and $typeName -in @('System.TypeLoadException', 'System.Reflection.ReflectionTypeLoadException')) { $category = 'type-load' }
-		Add-BootstrapDiagnosticText $text $typeName
-		Add-BootstrapDiagnosticText $text $exception.Message
-		$exception = $exception.InnerException
-	}
-	Add-BootstrapDiagnosticText $text $record.FullyQualifiedErrorId
-	if ($null -ne $record.ErrorDetails) { Add-BootstrapDiagnosticText $text $record.ErrorDetails.Message }
-	foreach ($match in [regex]::Matches($text.ToString(), 'CS[0-9]{4}')) {
-		$code = $match.Value
-		if ($category -eq 'other' -and $seenCompilerCodes.Add($code)) {
-			if ($compilerCodes.Count -lt 8) { $compilerCodes.Add($code) }
+function Get-BootstrapLanguageMode {
+	try {
+		switch ([string]$ExecutionContext.SessionState.LanguageMode) {
+			'FullLanguage' { return 'full' }
+			'ConstrainedLanguage' { return 'constrained' }
+			'RestrictedLanguage' { return 'restricted' }
+			'NoLanguage' { return 'no-language' }
+			default { return 'unknown' }
 		}
-	}
-	if ($compilerCodes.Count -gt 0) { $category = 'compiler' } else { $compilerCodes.Clear() }
-	[Console]::Error.WriteLine(([pscustomobject]@{ kind = 'windows-session-bootstrap-diagnostic'; category = $category; compilerCodes = @($compilerCodes.ToArray()) } | ConvertTo-Json -Compress))
+	} catch { return 'unknown' }
 }
 
+function Get-BootstrapProperty([object]$value, [string]$name) {
+	try {
+		if ($null -eq $value) { return $null }
+		$property = $value.PSObject.Properties[$name]
+		if ($null -eq $property) { return $null }
+		return $property.Value
+	} catch { return $null }
+}
+
+function ConvertTo-BootstrapDiagnosticRecord([object]$entry) {
+	$candidate = $entry
+	for ($depth = 0; $depth -lt 8 -and $null -ne $candidate; $depth++) {
+		if ($candidate -is [System.Management.Automation.ErrorRecord]) {
+			$fqid = Get-BootstrapProperty $candidate 'FullyQualifiedErrorId'
+			$categoryInfo = Get-BootstrapProperty $candidate 'CategoryInfo'
+			$category = Get-BootstrapProperty $categoryInfo 'Category'
+			$errorDetails = Get-BootstrapProperty $candidate 'ErrorDetails'
+			$errorDetailsMessage = Get-BootstrapProperty $errorDetails 'Message'
+			$exception = Get-BootstrapProperty $candidate 'Exception'
+			return [pscustomobject]@{
+				FullyQualifiedErrorId = if ($fqid -is [string]) { $fqid } else { $null }
+				Category = if ($category -is [System.Management.Automation.ErrorCategory]) { $category } else { $null }
+				ErrorDetailsMessage = if ($errorDetailsMessage -is [string]) { $errorDetailsMessage } else { $null }
+				Exception = if ($exception -is [System.Exception]) { $exception } else { $null }
+			}
+		}
+		$wrapped = Get-BootstrapProperty $candidate 'ErrorRecord'
+		if ($wrapped -is [System.Management.Automation.ErrorRecord]) {
+			$candidate = $wrapped
+			continue
+		}
+		if ($candidate -is [System.Exception]) {
+			return [pscustomobject]@{ FullyQualifiedErrorId = $null; Category = $null; ErrorDetailsMessage = $null; Exception = $candidate }
+		}
+		$candidate = $wrapped
+	}
+	return $null
+}
+
+function Get-BootstrapAddTypeReason([object]$record) {
+	$fqid = Get-BootstrapProperty $record 'FullyQualifiedErrorId'
+	if ($fqid -isnot [string]) { return 'unknown' }
+	$id = [regex]::Match($fqid, '^[^,]+').Value
+	switch ($id) {
+		'SOURCE_CODE_ERROR' { return 'source-code-error' }
+		'TYPE_ALREADY_EXISTS' { return 'type-already-exists' }
+		default { return 'unknown' }
+	}
+}
+
+function Get-BootstrapDiagnosticCategory([object]$record) {
+	$recordCategory = Get-BootstrapProperty $record 'Category'
+	switch ($recordCategory) {
+		([System.Management.Automation.ErrorCategory]::InvalidArgument) { return 'argument' }
+		([System.Management.Automation.ErrorCategory]::InvalidOperation) { return 'invalid-operation' }
+		([System.Management.Automation.ErrorCategory]::NotImplemented) { return 'not-supported' }
+		([System.Management.Automation.ErrorCategory]::SecurityError) { return 'security' }
+	}
+	$exception = Get-BootstrapProperty $record 'Exception'
+	for ($depth = 0; $depth -lt 8 -and $exception -is [System.Exception]; $depth++) {
+		if ($exception -is [System.ArgumentException]) { return 'argument' }
+		if ($exception -is [System.InvalidOperationException]) { return 'invalid-operation' }
+		if ($exception -is [System.NotSupportedException]) { return 'not-supported' }
+		if ($exception -is [System.Security.SecurityException] -or $exception -is [System.UnauthorizedAccessException]) { return 'security' }
+		if ($exception -is [System.IO.FileLoadException] -or $exception -is [System.IO.FileNotFoundException] -or $exception -is [System.BadImageFormatException]) { return 'assembly-load' }
+		if ($exception -is [System.TypeLoadException] -or $exception -is [System.Reflection.ReflectionTypeLoadException]) { return 'type-load' }
+		$next = Get-BootstrapProperty $exception 'InnerException'
+		$exception = if ($next -is [System.Exception]) { $next } else { $null }
+	}
+	return 'other'
+}
+
+function Write-BootstrapDiagnosticFallback {
+	try {
+		[Console]::Error.WriteLine(([pscustomobject]@{ kind = 'windows-session-bootstrap-diagnostic'; category = 'other'; compilerCodes = @(); reason = 'unknown'; languageMode = 'unknown' } | ConvertTo-Json -Compress))
+	} catch {}
+}
+
+function Write-BootstrapDiagnostic([object[]]$records) {
+	try {
+		$category = 'other'
+		$reason = 'unknown'
+		$compilerCodes = [System.Collections.Generic.List[string]]::new()
+		$seenCompilerCodes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+		$text = [System.Text.StringBuilder]::new()
+		$captured = @()
+		foreach ($entry in $records) {
+			if ($captured.Count -ge 8) { break }
+			$record = ConvertTo-BootstrapDiagnosticRecord $entry
+			if ($null -ne $record) { $captured += $record }
+		}
+		foreach ($record in $captured) {
+			if ($category -eq 'other') { $category = Get-BootstrapDiagnosticCategory $record }
+			if ($reason -eq 'unknown') { $reason = Get-BootstrapAddTypeReason $record }
+			Add-BootstrapDiagnosticText $text (Get-BootstrapProperty $record 'FullyQualifiedErrorId')
+			Add-BootstrapDiagnosticText $text (Get-BootstrapProperty $record 'ErrorDetailsMessage')
+		}
+		foreach ($record in $captured) {
+			$exception = Get-BootstrapProperty $record 'Exception'
+			for ($depth = 0; $depth -lt 8 -and $exception -is [System.Exception]; $depth++) {
+				$message = Get-BootstrapProperty $exception 'Message'
+				if ($message -is [string]) { Add-BootstrapDiagnosticText $text $message }
+				$next = Get-BootstrapProperty $exception 'InnerException'
+				$exception = if ($next -is [System.Exception]) { $next } else { $null }
+			}
+		}
+		foreach ($match in [regex]::Matches($text.ToString(), 'CS[0-9]{4}')) {
+			$code = $match.Value
+			if ($seenCompilerCodes.Add($code) -and $compilerCodes.Count -lt 8) { $compilerCodes.Add($code) }
+		}
+		if ($compilerCodes.Count -gt 0) {
+			$category = 'compiler'
+			if ($reason -eq 'unknown') { $reason = 'compiler-errors' }
+		}
+		$languageMode = Get-BootstrapLanguageMode
+		[Console]::Error.WriteLine(([pscustomobject]@{ kind = 'windows-session-bootstrap-diagnostic'; category = $category; compilerCodes = @($compilerCodes.ToArray()); reason = $reason; languageMode = $languageMode } | ConvertTo-Json -Compress))
+	} catch { Write-BootstrapDiagnosticFallback }
+}
+
+$addTypeErrors = @()
 try {
-	Add-Type -ErrorAction Stop -TypeDefinition @'
+	Add-Type -ErrorAction Stop -ErrorVariable +addTypeErrors -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -207,7 +313,7 @@ public static class WindowsSessionBootstrap {
 	$nativeReady = $true
 } catch {
 	$nativeReady = $false
-	Write-BootstrapDiagnostic $_
+	Write-BootstrapDiagnostic (@($addTypeErrors) + @($_))
 }
 
 function Write-Reply([string]$requestId, [bool]$ok, $result, [string]$error) {

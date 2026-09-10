@@ -92,8 +92,10 @@ async function settleOwnedChild(child: CleanupChild, lifecycle: ChildLifecycle, 
 }
 
 const maxBootstrapDiagnosticBytes = 512;
-const bootstrapDiagnosticCategories = new Set(["compiler", "assembly-load", "type-load", "other"]);
-type BootstrapDiagnostic = Readonly<{ kind: "windows-session-bootstrap-diagnostic"; category: "compiler" | "assembly-load" | "type-load" | "other"; compilerCodes: readonly string[] }>;
+const bootstrapDiagnosticCategories = new Set(["compiler", "argument", "invalid-operation", "not-supported", "security", "assembly-load", "type-load", "other"]);
+const bootstrapDiagnosticReasons = new Set(["compiler-errors", "source-code-error", "type-already-exists", "reference-load", "unsupported", "unknown"]);
+const bootstrapLanguageModes = new Set(["full", "constrained", "restricted", "no-language", "unknown"]);
+type BootstrapDiagnostic = Readonly<{ kind: "windows-session-bootstrap-diagnostic"; category: "compiler" | "argument" | "invalid-operation" | "not-supported" | "security" | "assembly-load" | "type-load" | "other"; compilerCodes: readonly string[]; reason: "compiler-errors" | "source-code-error" | "type-already-exists" | "reference-load" | "unsupported" | "unknown"; languageMode: "full" | "constrained" | "restricted" | "no-language" | "unknown" }>;
 
 function parseBootstrapDiagnostic(stderr: string): BootstrapDiagnostic | undefined {
 	if (Buffer.byteLength(stderr, "utf8") > maxBootstrapDiagnosticBytes || !stderr.endsWith("\n")) return undefined;
@@ -104,10 +106,10 @@ function parseBootstrapDiagnostic(stderr: string): BootstrapDiagnostic | undefin
 	if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const record = value as Record<string, unknown>;
 	const keys = Object.keys(record).sort();
-	if (keys.length !== 3 || keys.join(",") !== "category,compilerCodes,kind" || record.kind !== "windows-session-bootstrap-diagnostic" || typeof record.category !== "string" || !bootstrapDiagnosticCategories.has(record.category) || !Array.isArray(record.compilerCodes) || record.compilerCodes.length > 8 || record.compilerCodes.some((code) => typeof code !== "string")) return undefined;
+	if (keys.length !== 5 || keys.join(",") !== "category,compilerCodes,kind,languageMode,reason" || record.kind !== "windows-session-bootstrap-diagnostic" || typeof record.category !== "string" || !bootstrapDiagnosticCategories.has(record.category) || typeof record.reason !== "string" || !bootstrapDiagnosticReasons.has(record.reason) || typeof record.languageMode !== "string" || !bootstrapLanguageModes.has(record.languageMode) || !Array.isArray(record.compilerCodes) || record.compilerCodes.length > 8 || record.compilerCodes.some((code) => typeof code !== "string")) return undefined;
 	const compilerCodes = record.compilerCodes as string[];
 	if (new Set(compilerCodes).size !== compilerCodes.length || compilerCodes.some((code) => !/^CS[0-9]{4}$/.test(code)) || (record.category !== "compiler" && compilerCodes.length !== 0)) return undefined;
-	return Object.freeze({ kind: "windows-session-bootstrap-diagnostic", category: record.category as BootstrapDiagnostic["category"], compilerCodes: Object.freeze([...compilerCodes]) });
+	return Object.freeze({ kind: "windows-session-bootstrap-diagnostic", category: record.category as BootstrapDiagnostic["category"], compilerCodes: Object.freeze([...compilerCodes]), reason: record.reason as BootstrapDiagnostic["reason"], languageMode: record.languageMode as BootstrapDiagnostic["languageMode"] });
 }
 
 function appendBoundedOutput(output: string, chunk: Buffer, limit: number): Readonly<{ output: string; overflow: boolean }> {
@@ -362,19 +364,47 @@ test("Windows helper request plans correlate standalone and enumeration reply co
 
 test("Windows bootstrap Add-Type failures use an owned bounded diagnostic", async () => {
 	const source = await readFile(runtime, "utf8");
-	assert.match(source, /Add-Type -ErrorAction Stop -TypeDefinition @'/);
-	assert.match(source, /catch \{\s*\$nativeReady = \$false\s*Write-BootstrapDiagnostic \$_\s*\}/);
+	assert.match(source, /Add-Type -ErrorAction Stop -ErrorVariable \+addTypeErrors -TypeDefinition @'/);
+	assert.match(source, /catch \{\s*\$nativeReady = \$false\s*Write-BootstrapDiagnostic \(@\(\$addTypeErrors\) \+ @\(\$_\)\)\s*\}/);
 });
 
-test("Windows bootstrap diagnostic parser accepts bounded compiler codes", () => {
-	assert.deepEqual(parseBootstrapDiagnostic('{"kind":"windows-session-bootstrap-diagnostic","category":"compiler","compilerCodes":["CS1001","CS1739"]}\n'), {
-		kind: "windows-session-bootstrap-diagnostic", category: "compiler", compilerCodes: ["CS1001", "CS1739"],
+test("Windows bootstrap captures only local Add-Type records and fixed metadata", async () => {
+	const source = await readFile(runtime, "utf8");
+	assert.match(source, /\$addTypeErrors = @\(\)/);
+	assert.match(source, /-ErrorVariable \+addTypeErrors/);
+	assert.match(source, /reason = \$reason; languageMode = \$languageMode/);
+	assert.doesNotMatch(source, /\$Error\b/);
+});
+
+test("Windows bootstrap diagnostic guards wrapped Add-Type entries under StrictMode", async () => {
+	const source = await readFile(runtime, "utf8");
+	assert.match(source, /function Get-BootstrapProperty/);
+	assert.match(source, /function ConvertTo-BootstrapDiagnosticRecord/);
+	assert.match(source, /\.PSObject\.Properties\[\$name\]/);
+	assert.match(source, /\$candidate -is \[System\.Management\.Automation\.ErrorRecord\]/);
+	assert.match(source, /\$wrapped = Get-BootstrapProperty \$candidate 'ErrorRecord'/);
+	assert.match(source, /\$wrapped -is \[System\.Management\.Automation\.ErrorRecord\]/);
+	assert.match(source, /function Write-BootstrapDiagnosticFallback/);
+	assert.match(source, /catch \{ Write-BootstrapDiagnosticFallback \}/);
+	assert.doesNotMatch(source, /\$record\.CategoryInfo|\$record\.ErrorDetails|\$record\.Exception/);
+});
+
+test("Windows bootstrap diagnostic parser accepts fixed Add-Type evidence", () => {
+	assert.deepEqual(parseBootstrapDiagnostic('{"kind":"windows-session-bootstrap-diagnostic","category":"compiler","compilerCodes":["CS1001","CS1739"],"reason":"source-code-error","languageMode":"full"}\n'), {
+		kind: "windows-session-bootstrap-diagnostic", category: "compiler", compilerCodes: ["CS1001", "CS1739"], reason: "source-code-error", languageMode: "full",
+	});
+	assert.deepEqual(parseBootstrapDiagnostic('{"kind":"windows-session-bootstrap-diagnostic","category":"other","compilerCodes":[],"reason":"unknown","languageMode":"constrained"}\n'), {
+		kind: "windows-session-bootstrap-diagnostic", category: "other", compilerCodes: [], reason: "unknown", languageMode: "constrained",
+	});
+	assert.deepEqual(parseBootstrapDiagnostic('{"kind":"windows-session-bootstrap-diagnostic","category":"other","compilerCodes":[],"reason":"unknown","languageMode":"unknown"}\n'), {
+		kind: "windows-session-bootstrap-diagnostic", category: "other", compilerCodes: [], reason: "unknown", languageMode: "unknown",
 	});
 });
 
 test("Windows bootstrap diagnostic parser fails closed for unsafe input", () => {
-	assert.equal(parseBootstrapDiagnostic('{"kind":"windows-session-bootstrap-diagnostic","category":"other","compilerCodes":["CS1001"]}\n'), undefined);
-	assert.equal(parseBootstrapDiagnostic('{"kind":"windows-session-bootstrap-diagnostic","category":"compiler","compilerCodes":["CS1001","CS1001"]}\n'), undefined);
+	assert.equal(parseBootstrapDiagnostic('{"kind":"windows-session-bootstrap-diagnostic","category":"other","compilerCodes":["CS1001"],"reason":"unknown","languageMode":"full"}\n'), undefined);
+	assert.equal(parseBootstrapDiagnostic('{"kind":"windows-session-bootstrap-diagnostic","category":"compiler","compilerCodes":["CS1001","CS1001"],"reason":"source-code-error","languageMode":"full"}\n'), undefined);
+	assert.equal(parseBootstrapDiagnostic('{"kind":"windows-session-bootstrap-diagnostic","category":"compiler","compilerCodes":[],"reason":"untrusted-error-id","languageMode":"full"}\n'), undefined);
 	assert.equal(parseBootstrapDiagnostic("x".repeat(maxBootstrapDiagnosticBytes + 1)), undefined);
 });
 
