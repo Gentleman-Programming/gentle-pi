@@ -211,6 +211,29 @@ test("an outside release clears an active left gesture in both views", () => {
 	}
 });
 
+test("a stale-layout release clears an active left gesture in both views", () => {
+	let standaloneRows = 12;
+	let accordionRows = 8;
+	const { view: standalone } = view({ rows: () => standaloneRows });
+	const accordion = new WorktreeChangesView([{ root: "/main", branch: "main", model: changesModel([file("a.ts", 1, 0)]) }], {
+		theme: plainTheme, rows: () => accordionRows, loadDiff: async () => "+preview", onOpen() {}, onClose() {}, onRefresh() {}, requestRender() {},
+	});
+	accordion.handleInput("\r");
+	standalone.render(80);
+	accordion.render(80);
+	for (const [component, y, beforeHeight, afterHeight, resize] of [
+		[standalone, 1, 12, 8, () => { standaloneRows = 8; }],
+		[accordion, 2, 8, 6, () => { accordionRows = 6; }],
+	] as const) {
+		assert.deepEqual(component.handleMouse(mouseButton("press", "left", 3, y, beforeHeight)), { handled: true, capture: true, render: false });
+		resize();
+		for (const button of ["right", "middle"] as const) assert.equal(component.handleMouse(mouseButton("release", button, 3, y, afterHeight)), undefined, `${button} release must still reach pi-tui with stale geometry`);
+		assert.deepEqual(component.handleMouse(mouseButton("release", "none", 3, y, afterHeight)), { handled: true, render: false }, "the captured release is accepted despite stale geometry");
+		component.render(80);
+		assert.equal(component.handleMouse(mouseButton("release", "none", 3, y, afterHeight)), undefined, "a later unrelated release must not consume stale state");
+	}
+});
+
 test("right press reaches the native Windows paste fallback when eligible", () => {
 	let onInput: ((data: string) => void) | undefined;
 	let pasted = 0;

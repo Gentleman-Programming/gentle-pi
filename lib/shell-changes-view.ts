@@ -217,6 +217,13 @@ export class WorktreeChangesView {
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		if (this.disposed) return { handled: true, render: false };
+		if (event.type === "release") {
+			if (this.leftPressActive && (event.button === "left" || event.button === "none")) {
+				this.leftPressActive = false;
+				return { handled: true, render: false };
+			}
+			return undefined;
+		}
 		const layout = this.pointerLayout;
 		if (!layout || event.width !== layout.width || event.height !== layout.height) return { handled: true, render: false };
 		const inBody = event.y >= 1 && event.y <= layout.bodyRows;
@@ -229,10 +236,6 @@ export class WorktreeChangesView {
 				return { handled: true, render: row?.file ? Boolean(this.previews.get(rowKey(row))?.view.scrollDiffBy(event.wheelDelta ?? 0, layout.bodyRows)) : false };
 			}
 			return undefined;
-		}
-		if (event.type === "release" && this.leftPressActive && (event.button === "left" || event.button === "none")) {
-			this.leftPressActive = false;
-			return { handled: true, render: false };
 		}
 		if (!inFiles) return undefined;
 		if (event.type === "press") {
@@ -386,6 +389,13 @@ export class ChangesView {
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		if (this.disposed) return { handled: true, render: false };
+		if (event.type === "release") {
+			if (this.leftPressActive && (event.button === "left" || event.button === "none")) {
+				this.leftPressActive = false;
+				return { handled: true, render: false };
+			}
+			return undefined;
+		}
 		const layout = this.pointerLayout;
 		if (!layout || event.width !== layout.width || event.height !== layout.height) return { handled: true, render: false };
 		const inBody = event.y >= 1 && event.y <= layout.bodyRows;
@@ -395,10 +405,6 @@ export class ChangesView {
 			if (inFiles) return { handled: true, render: this.scrollFiles(event.wheelDelta ?? 0, layout.bodyRows) };
 			if (inDiff) return { handled: true, render: this.scrollDiff(event.wheelDelta ?? 0, layout.bodyRows) };
 			return undefined;
-		}
-		if (event.type === "release" && this.leftPressActive && (event.button === "left" || event.button === "none")) {
-			this.leftPressActive = false;
-			return { handled: true, render: false };
 		}
 		if (!inFiles) return undefined;
 		if (event.type === "press") {
