@@ -2267,10 +2267,12 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 			if (!/^sha256:[0-9a-f]{64}$/.test(value)) throw new TypeError(`Native CAPTURE_UNACHIEVABLE ${field} must be a canonical SHA-256 identity`);
 		}
 		const detail = request.detail === undefined ? "" : request.detail.trim();
-		if (detail.length > NATIVE_REVIEW_UNACHIEVABLE_LENS_DETAIL_LIMIT) throw new TypeError(`Native CAPTURE_UNACHIEVABLE detail exceeds ${NATIVE_REVIEW_UNACHIEVABLE_LENS_DETAIL_LIMIT} bytes`);
+		// gentle-pi#822: the native limit is 512 UTF-8 bytes, not 512 UTF-16 code units — the Go side measures the encoded payload, so a multibyte detail needs Buffer.byteLength; a .length check would let 300 two-byte characters through.
+		if (Buffer.byteLength(detail, "utf8") > NATIVE_REVIEW_UNACHIEVABLE_LENS_DETAIL_LIMIT) throw new TypeError(`Native CAPTURE_UNACHIEVABLE detail exceeds ${NATIVE_REVIEW_UNACHIEVABLE_LENS_DETAIL_LIMIT} bytes`);
 		if (request.repositoryContext !== undefined && !isCanonicalProcessString(request.repositoryContext)) throw new TypeError("Native CAPTURE_UNACHIEVABLE repositoryContext must be a non-empty, trimmed, NUL-free string");
 		const executable = this.executablePath(NATIVE_REVIEW_OPERATION.CAPTURE_UNACHIEVABLE, true);
-		const execution = await this.invoke(NATIVE_REVIEW_OPERATION.CAPTURE_UNACHIEVABLE, request.cwd, ["review", "capture-unachievable", "--lineage", request.lineageId, "--target", request.targetIdentity, "--expected-revision", request.expectedRevision, "--request-hash", request.requestHash, "--reason", request.reason, ...(detail === "" ? [] : ["--detail", detail]), ...(request.repositoryContext === undefined ? [] : ["--repository-context", request.repositoryContext]), "--cwd", request.cwd], true, request.signal, executable);
+		// gentle-pi#822: --repository-context is authoritative and mutually exclusive with a path (the captureProviderRole discipline), so --cwd rides the invocation only when no repository context names it; the process working directory stays request.cwd either way.
+		const execution = await this.invoke(NATIVE_REVIEW_OPERATION.CAPTURE_UNACHIEVABLE, request.cwd, ["review", "capture-unachievable", "--lineage", request.lineageId, "--target", request.targetIdentity, "--expected-revision", request.expectedRevision, "--request-hash", request.requestHash, "--reason", request.reason, ...(detail === "" ? [] : ["--detail", detail]), ...(request.repositoryContext === undefined ? ["--cwd", request.cwd] : ["--repository-context", request.repositoryContext])], true, request.signal, executable);
 		return decode(NATIVE_REVIEW_OPERATION.CAPTURE_UNACHIEVABLE, true, () => decodeNativeUnachievableLensCaptureArtifact(execution.body));
 	}
 

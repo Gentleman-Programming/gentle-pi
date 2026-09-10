@@ -14,6 +14,7 @@ import {
 	createNodeExecFileAdapter,
 	isNativeReviewUnachievableVerbRefused,
 	type ExecFileAdapter,
+	type NativeTargetStatusRequest,
 } from "../lib/native-review-cli.ts";
 
 const fixture = (name: string): Record<string, unknown> => JSON.parse(
@@ -154,13 +155,30 @@ test("capture-unachievable declares the exact slot binding and decodes its recor
 	const queue = queuedAdapter([{ stdout: JSON.stringify(UNACHIEVABLE_ARTIFACT) }]);
 	const result = await client(queue.adapter).captureUnachievableLens({ ...unachievableRequest(), detail: "killed after 2256004ms against a 2256000ms relay bound", repositoryContext: "rctx1_" + "e".repeat(64) });
 	assert.deepEqual(result, { schema: "gentle-ai.review-capture-unachievable/v1", lineageId: "relay-lineage", targetIdentity: UNACHIEVABLE_TARGET, lens: "review-reliability", selectedOrder: 0, reason: "relay_transport_bound_exceeded", recorded: true });
-	assert.deepEqual(queue.calls[0]?.arguments, ["review", "capture-unachievable", "--lineage", "relay-lineage", "--target", UNACHIEVABLE_TARGET, "--expected-revision", UNACHIEVABLE_REVISION, "--request-hash", UNACHIEVABLE_REQUEST_HASH, "--reason", "relay_transport_bound_exceeded", "--detail", "killed after 2256004ms against a 2256000ms relay bound", "--repository-context", "rctx1_" + "e".repeat(64), "--cwd", "/repo"]);
+	// gentle-pi#822: --repository-context is authoritative and mutually exclusive with a path, so a declaration carrying one names no --cwd; the process still runs from request.cwd.
+	assert.deepEqual(queue.calls[0]?.arguments, ["review", "capture-unachievable", "--lineage", "relay-lineage", "--target", UNACHIEVABLE_TARGET, "--expected-revision", UNACHIEVABLE_REVISION, "--request-hash", UNACHIEVABLE_REQUEST_HASH, "--reason", "relay_transport_bound_exceeded", "--detail", "killed after 2256004ms against a 2256000ms relay bound", "--repository-context", "rctx1_" + "e".repeat(64)]);
+	assert.equal(queue.calls[0]?.cwd, "/repo", "the process working directory stays request.cwd even when --cwd is not passed as an argument");
 	assert.equal(queue.calls[0]?.timeoutMs, undefined, "the mutating declaration runs without the read-only negotiation timeout");
 
 	// the optional detail and repository context are genuinely optional
 	const bare = queuedAdapter([{ stdout: JSON.stringify(UNACHIEVABLE_ARTIFACT) }]);
 	await client(bare.adapter).captureUnachievableLens(unachievableRequest());
 	assert.deepEqual(bare.calls[0]?.arguments, ["review", "capture-unachievable", "--lineage", "relay-lineage", "--target", UNACHIEVABLE_TARGET, "--expected-revision", UNACHIEVABLE_REVISION, "--request-hash", UNACHIEVABLE_REQUEST_HASH, "--reason", "relay_transport_bound_exceeded", "--cwd", "/repo"]);
+	assert.equal(bare.calls[0]?.cwd, "/repo");
+});
+
+test("capture-unachievable measures detail in UTF-8 bytes, not UTF-16 code units", async () => {
+	const atLimit = queuedAdapter([{ stdout: JSON.stringify(UNACHIEVABLE_ARTIFACT) }]);
+	await client(atLimit.adapter).captureUnachievableLens({ ...unachievableRequest(), detail: "é".repeat(256) });
+	assert.equal(atLimit.calls.length, 1, "256 two-byte characters are exactly the 512-byte limit and must pass");
+
+	const oneCharBeyond = queuedAdapter([]);
+	await assert.rejects(() => client(oneCharBeyond.adapter).captureUnachievableLens({ ...unachievableRequest(), detail: "é".repeat(257) }), TypeError);
+	assert.equal(oneCharBeyond.calls.length, 0, "257 two-byte characters are 514 bytes and are refused before any process launches");
+
+	const shortButHeavy = queuedAdapter([]);
+	await assert.rejects(() => client(shortButHeavy.adapter).captureUnachievableLens({ ...unachievableRequest(), detail: "é".repeat(300) }), TypeError);
+	assert.equal(shortButHeavy.calls.length, 0, "300 code units pass a .length check but encode to 600 bytes and must throw");
 });
 
 test("capture-unachievable validates its request and artifact shape before and after the invocation", async () => {
@@ -316,7 +334,8 @@ test("negotiated STATUS rejects malformed committed selectors before launching a
 		{ cwd: "/repo", baseRef: "refs/heads/main", committedOnly: "true" },
 	]) {
 		const queue = queuedAdapter([]);
-		await assert.rejects(() => client(queue.adapter).targetStatus(request), TypeError);
+		// gentle-pi#822: these fixtures are intentionally mistyped (a numeric baseRef, a string committedOnly) — the repo's `as unknown as` idiom keeps the invalid shapes reaching the validator instead of widening the request type.
+		await assert.rejects(() => client(queue.adapter).targetStatus(request as unknown as NativeTargetStatusRequest), TypeError);
 		assert.equal(queue.calls.length, 0);
 	}
 });

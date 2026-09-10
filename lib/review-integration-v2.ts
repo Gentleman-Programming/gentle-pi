@@ -1821,6 +1821,12 @@ function decodeUnachievableLensSlot(value: unknown, label: string): ReviewUnachi
 	const targetIdentity = sha256(binding.target_identity, `${label}.withdraw.binding.target_identity`);
 	const lineageId = binding.lineage_id === undefined ? undefined : lineage(binding.lineage_id, `${label}.withdraw.binding.lineage_id`);
 	const revision = binding.revision === undefined ? undefined : sha256(binding.revision, `${label}.withdraw.binding.revision`);
+	// gentle-pi#822: the withdraw form names the slot identity twice — as named arguments and as the binding object — and the two renderings must agree before the slot decodes. Strict equality also enforces both-or-neither on the optional lineage and revision fields, so a partially rendered binding never slips through and restart cannot withdraw a different slot.
+	const withdrawArgumentValue = (name: string): string | undefined => arguments_.find((argument) => argument.name === name)?.value;
+	if (withdrawArgumentValue("request-hash") !== subjectHash) throw new TypeError(`${label}.withdraw.arguments request-hash does not match the slot subject_hash`);
+	if (withdrawArgumentValue("target") !== targetIdentity) throw new TypeError(`${label}.withdraw.arguments target does not match the withdraw binding target_identity`);
+	if (withdrawArgumentValue("lineage") !== lineageId) throw new TypeError(`${label}.withdraw.arguments lineage does not match the withdraw binding lineage_id`);
+	if (withdrawArgumentValue("expected-revision") !== revision) throw new TypeError(`${label}.withdraw.arguments expected-revision does not match the withdraw binding revision`);
 	return { lens, selectedOrder, subjectHash, reason, ...(detail === undefined ? {} : { detail }), withdraw: { operation, command, arguments: arguments_, binding: { targetIdentity, ...(lineageId === undefined ? {} : { lineageId }), ...(revision === undefined ? {} : { revision }) } } };
 }
 

@@ -561,6 +561,31 @@ export const REVIEW_PROVIDER_ROLE_CAPTURE_OPERATIONS = Object.freeze(Object.valu
 
 
 
+// gentle-pi#638: one selected lens slot the host declared unachievable
+// through the native capture-unachievable verb, mirrored from Go's
+// ReviewUnachievableLensSlot (internal/cli/review_next_transition.go). The
+// withdraw form is deliberately narrower than a full execute transition:
+// it is the literally runnable retraction command for exactly this slot, so
+// a restart that never saw the collect offer can still take the declaration
+// back from the stop alone.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1713,7 +1738,7 @@ export function decodeReviewManagedAssetsContinuationV1(value         , label   
 export function decodeReviewNextTransitionV3(value         , options                                 = {})                         {
 	const v6 = options.v6 === true;
 	const v5 = options.v5 === true || v6;
-	const transition = exactRecord(value, "next_transition", ["kind", "reason_code"], ["execute", "collect", ...(v5 ? ["correction_request"] : []), "continuation"]);
+	const transition = exactRecord(value, "next_transition", ["kind", "reason_code"], ["execute", "collect", ...(v5 ? ["correction_request"] : []), "continuation", "unachievable_lens_slots"]);
 	const kind = enumeration(transition.kind, ["execute", "collect", "stop"]         , "next_transition.kind");
 	const reasonCode = text(transition.reason_code, "next_transition.reason_code", { minimum: 1, pattern: /^[a-z0-9_]+$/ });
 	const continuation = transition.continuation === undefined ? undefined : decodeReviewManagedAssetsContinuationV1(transition.continuation, "next_transition.continuation");
@@ -1722,6 +1747,13 @@ export function decodeReviewNextTransitionV3(value         , options            
 	// all, and decode must not refuse the whole envelope for that. When present
 	// it is only valid on a stop with this exact reason_code.
 	if (continuation !== undefined && !(kind === "stop" && reasonCode === "managed_assets_outdated")) throw new TypeError("next_transition.continuation is only valid for a stop transition with reason_code managed_assets_outdated");
+
+	// gentle-pi#638: the unachievable stop names one entry per declared slot, each carrying its complete withdraw command (schemas/status-v7.schema.json, the stop variant). Like the continuation, the field is only valid on its own exact stop reason code, and an entry is refused rather than silently dropped when the provider drifts.
+	let unachievableLensSlots                                                     ;
+	if (transition.unachievable_lens_slots !== undefined) {
+		if (!(kind === "stop" && reasonCode === "unachievable_lens_slot")) throw new TypeError("next_transition.unachievable_lens_slots is only valid for a stop transition with reason_code unachievable_lens_slot");
+		unachievableLensSlots = array(transition.unachievable_lens_slots, "next_transition.unachievable_lens_slots", decodeUnachievableLensSlot, { minimum: 1 });
+	}
 
 	// status/v5: the bounded correction plan request rides exactly its two
 	// reason codes and never any other (vendored status-v5.schema.json).
@@ -1771,7 +1803,32 @@ export function decodeReviewNextTransitionV3(value         , options            
 		return { kind, reasonCode, collect: { inputs }, ...(correctionRequest === undefined ? {} : { correctionRequest }) };
 	}
 	if (transition.execute !== undefined || transition.collect !== undefined) throw new TypeError("next_transition stop cannot carry a transition");
-	return { kind, reasonCode, ...(correctionRequest === undefined ? {} : { correctionRequest }), ...(continuation === undefined ? {} : { continuation }) };
+	return { kind, reasonCode, ...(correctionRequest === undefined ? {} : { correctionRequest }), ...(continuation === undefined ? {} : { continuation }), ...(unachievableLensSlots === undefined ? {} : { unachievableLensSlots }) };
+}
+
+function decodeUnachievableLensSlot(value         , label        )                               {
+	const body = exactRecord(value, label, ["lens", "selected_order", "subject_hash", "reason", "withdraw"], ["detail"]);
+	const lens = nonempty(body.lens, `${label}.lens`);
+	const selectedOrder = integer(body.selected_order, `${label}.selected_order`);
+	const subjectHash = sha256(body.subject_hash, `${label}.subject_hash`);
+	const reason = nonempty(body.reason, `${label}.reason`);
+	const detail = body.detail === undefined ? undefined : nonempty(body.detail, `${label}.detail`);
+	const withdraw = exactRecord(body.withdraw, `${label}.withdraw`, ["operation", "command", "arguments", "binding"]);
+	const operation = enumeration(withdraw.operation, ["review.capture-unachievable"]         , `${label}.withdraw.operation`);
+	const command = nonempty(withdraw.command, `${label}.withdraw.command`);
+	const arguments_ = decodeTransitionArguments(withdraw.arguments, `${label}.withdraw.arguments`);
+	// The binding keeps the execute branch's open-record discipline: the Go shape is target_identity plus optional lineage_id, revision, and repository_context, and closing it here would make Pi stricter than the contract it implements.
+	const binding = exactRecord(withdraw.binding, `${label}.withdraw.binding`, ["target_identity"], ["lineage_id", "revision", "repository_context"], true);
+	const targetIdentity = sha256(binding.target_identity, `${label}.withdraw.binding.target_identity`);
+	const lineageId = binding.lineage_id === undefined ? undefined : lineage(binding.lineage_id, `${label}.withdraw.binding.lineage_id`);
+	const revision = binding.revision === undefined ? undefined : sha256(binding.revision, `${label}.withdraw.binding.revision`);
+	// gentle-pi#822: the withdraw form names the slot identity twice — as named arguments and as the binding object — and the two renderings must agree before the slot decodes. Strict equality also enforces both-or-neither on the optional lineage and revision fields, so a partially rendered binding never slips through and restart cannot withdraw a different slot.
+	const withdrawArgumentValue = (name        )                     => arguments_.find((argument) => argument.name === name)?.value;
+	if (withdrawArgumentValue("request-hash") !== subjectHash) throw new TypeError(`${label}.withdraw.arguments request-hash does not match the slot subject_hash`);
+	if (withdrawArgumentValue("target") !== targetIdentity) throw new TypeError(`${label}.withdraw.arguments target does not match the withdraw binding target_identity`);
+	if (withdrawArgumentValue("lineage") !== lineageId) throw new TypeError(`${label}.withdraw.arguments lineage does not match the withdraw binding lineage_id`);
+	if (withdrawArgumentValue("expected-revision") !== revision) throw new TypeError(`${label}.withdraw.arguments expected-revision does not match the withdraw binding revision`);
+	return { lens, selectedOrder, subjectHash, reason, ...(detail === undefined ? {} : { detail }), withdraw: { operation, command, arguments: arguments_, binding: { targetIdentity, ...(lineageId === undefined ? {} : { lineageId }), ...(revision === undefined ? {} : { revision }) } } };
 }
 
 // ---------------------------------------------------------------------------

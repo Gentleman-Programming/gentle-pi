@@ -66,6 +66,7 @@ export const NATIVE_REVIEW_OPERATION = {
 	CAPTURE_RESULT: "review/capture-result",
 	CAPTURE_CORRECTION_PLAN: "review/capture-correction-plan",
 	CAPTURE_PROVIDER_ROLE: "review/capture-provider-role",
+	CAPTURE_UNACHIEVABLE: "review/capture-unachievable",
 	ACKNOWLEDGE_APPROVED: "review/acknowledge-approved",
 }         ;
 
@@ -86,6 +87,8 @@ export const NATIVE_REVIEW_ERROR_CODE = {
 	PACKAGE_BINARY_MISSING: "package-local-binary-missing",
 	UNSUPPORTED_TRANSITION_OPERATION: "unsupported-transition-operation",
 }         ;
+
+
 
 
 
@@ -431,6 +434,49 @@ function isNativeReviewProviderRoleCaptureOperation(operation        )          
 
 
 
+
+// gentle-pi#638: the typed declaration that one bound selected lens slot cannot be completed under current conditions. Mirrored from Go's reviewUnachievableLensCaptureArtifact (internal/cli/review_capture_unachievable.go): same schema identity, same closed field set, and the same 512-byte detail bound Go enforces, so a declaration this client refuses locally can never reach a binary that would accept it, and vice versa.
+export const NATIVE_REVIEW_UNACHIEVABLE_LENS_CAPTURE_SCHEMA = "gentle-ai.review-capture-unachievable/v1";
+export const NATIVE_REVIEW_UNACHIEVABLE_LENS_DETAIL_LIMIT = 512;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// gentle-pi#638 fail-open capability gate: `review capture-unachievable` is younger than every released binary pinned in NATIVE_CLI_CONTRACTS, so the verb is gated invocation-adjacent instead of by a capability row. An older binary renders Go's exact `unknown review command "capture-unachievable"` refusal (internal/cli/review_facade.go) on stderr with no stdout, so the invocation rejects before any decode and the captured diagnostics are the only place that text survives. Every other failure -- a typed binding-mismatch refusal, a timeout, a decode failure -- is a real outcome the caller must surface, never a capability signal. Duck-typed on purpose: the classifier must survive a duplicated module instance exactly like the error it inspects.
+const NATIVE_REVIEW_UNKNOWN_UNACHIEVABLE_VERB_REFUSAL = /unknown review command "capture-unachievable"/;
+
+export function isNativeReviewUnachievableVerbRefused(error         )          {
+	if (typeof error !== "object" || error === null) return false;
+	const stderr = (error                                          ).diagnostics?.stderr;
+	return typeof stderr === "string" && NATIVE_REVIEW_UNKNOWN_UNACHIEVABLE_VERB_REFUSAL.test(stderr);
+}
 
 /** Refuter and validator captures close only when they are the native last event. */
 
@@ -1830,6 +1876,23 @@ function decodeNativeProviderRoleCaptureArtifact(value         )                
 	});
 }
 
+// gentle-pi#638: the recorded declaration Go prints for one unachievable slot. Closed key set, exact schema identity, and the lens Go itself resolved from the request hash -- the host never asserts which lens failed, only reads back the one the provider bound.
+function decodeNativeUnachievableLensCaptureArtifact(value         )                                              {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("native unachievable lens capture artifact must be an object");
+	const body = value                           ;
+	const allowed = new Set(["schema", "lineage_id", "target_identity", "lens", "selected_order", "reason", "recorded"]);
+	for (const key of Object.keys(body)) if (!allowed.has(key)) throw new TypeError(`native unachievable lens capture artifact carries unexpected key ${key}`);
+	const text = (key        )         => {
+		const found = body[key];
+		if (typeof found !== "string" || found.trim() !== found || found.length === 0) throw new TypeError(`native unachievable lens capture artifact ${key} must be a non-empty trimmed string`);
+		return found;
+	};
+	if (text("schema") !== NATIVE_REVIEW_UNACHIEVABLE_LENS_CAPTURE_SCHEMA) throw new TypeError(`native unachievable lens capture artifact schema must be ${NATIVE_REVIEW_UNACHIEVABLE_LENS_CAPTURE_SCHEMA}`);
+	if (typeof body.selected_order !== "number" || !Number.isSafeInteger(body.selected_order) || body.selected_order < 0) throw new TypeError("native unachievable lens capture artifact selected_order must be a non-negative integer");
+	if (body.recorded !== true) throw new TypeError("native unachievable lens capture artifact must report recorded: true");
+	return Object.freeze({ schema: NATIVE_REVIEW_UNACHIEVABLE_LENS_CAPTURE_SCHEMA, lineageId: text("lineage_id"), targetIdentity: text("target_identity"), lens: text("lens"), selectedOrder: body.selected_order, reason: text("reason"), recorded: true });
+}
+
 export class NativeReviewCliV216                            {
 	                 plain                      ;
 	                 adapter                 ;
@@ -2193,6 +2256,25 @@ export class NativeReviewCliV216                            {
 			}
 			return decodeNativeProviderRoleCaptureArtifact(body);
 		});
+	}
+
+	// gentle-pi#638: `gentle-ai review capture-unachievable` records one bound declaration that the exact slot the collect transition offered cannot be completed under current conditions. Unlike every other capture verb the host runs, this one reports a failure instead of a result, so it never takes the provider-issued tokens verbatim: the declaration's binding values are named fields re-derived from the slot, and Go verifies them against the frozen lineage, revision, target, and subject hash before recording anything (internal/cli/review_capture_unachievable.go). A binding that no longer matches is a typed refusal the caller surfaces, never a host-side reconstruction.
+	async captureUnachievableLens(request                                            )                                                       {
+		for (const [field, value] of (["lineageId", "reason"]         ).map((field) => [field, request[field]]         )) {
+			if (!isCanonicalProcessString(value)) throw new TypeError(`Native CAPTURE_UNACHIEVABLE ${field} must be a non-empty, trimmed, NUL-free string`);
+		}
+		// The three identity fields are digests on every slot the provider offers, so a non-sha value means the declaration binding was parsed wrong; refuse it locally instead of invoking a doomed process.
+		for (const [field, value] of (["targetIdentity", "expectedRevision", "requestHash"]         ).map((field) => [field, request[field]]         )) {
+			if (!/^sha256:[0-9a-f]{64}$/.test(value)) throw new TypeError(`Native CAPTURE_UNACHIEVABLE ${field} must be a canonical SHA-256 identity`);
+		}
+		const detail = request.detail === undefined ? "" : request.detail.trim();
+		// gentle-pi#822: the native limit is 512 UTF-8 bytes, not 512 UTF-16 code units — the Go side measures the encoded payload, so a multibyte detail needs Buffer.byteLength; a .length check would let 300 two-byte characters through.
+		if (Buffer.byteLength(detail, "utf8") > NATIVE_REVIEW_UNACHIEVABLE_LENS_DETAIL_LIMIT) throw new TypeError(`Native CAPTURE_UNACHIEVABLE detail exceeds ${NATIVE_REVIEW_UNACHIEVABLE_LENS_DETAIL_LIMIT} bytes`);
+		if (request.repositoryContext !== undefined && !isCanonicalProcessString(request.repositoryContext)) throw new TypeError("Native CAPTURE_UNACHIEVABLE repositoryContext must be a non-empty, trimmed, NUL-free string");
+		const executable = this.executablePath(NATIVE_REVIEW_OPERATION.CAPTURE_UNACHIEVABLE, true);
+		// gentle-pi#822: --repository-context is authoritative and mutually exclusive with a path (the captureProviderRole discipline), so --cwd rides the invocation only when no repository context names it; the process working directory stays request.cwd either way.
+		const execution = await this.invoke(NATIVE_REVIEW_OPERATION.CAPTURE_UNACHIEVABLE, request.cwd, ["review", "capture-unachievable", "--lineage", request.lineageId, "--target", request.targetIdentity, "--expected-revision", request.expectedRevision, "--request-hash", request.requestHash, "--reason", request.reason, ...(detail === "" ? [] : ["--detail", detail]), ...(request.repositoryContext === undefined ? ["--cwd", request.cwd] : ["--repository-context", request.repositoryContext])], true, request.signal, executable);
+		return decode(NATIVE_REVIEW_OPERATION.CAPTURE_UNACHIEVABLE, true, () => decodeNativeUnachievableLensCaptureArtifact(execution.body));
 	}
 
 	// gentle-pi#311 P5: executes one provider-rendered `review.finalize`

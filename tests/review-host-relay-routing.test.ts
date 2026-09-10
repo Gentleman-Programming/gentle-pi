@@ -583,7 +583,8 @@ test("a deterministic pi timeout declares the slot unachievable and renders the 
 	assert.match(slots[0]!.withdraw, /capture-unachievable.*--withdraw=true/);
 	assert.match(String(result.next_action), /withdraw/);
 	assert.equal(result.mutation_performed, true);
-	assert.equal(result.mutation_outcome, "none");
+	// gentle-pi#822: the native declaration was recorded, so the flow reports the mutation as committed, not none.
+	assert.equal(result.mutation_outcome, "committed");
 	assert.equal(harness.statusCalls.length, 2, "one selection STATUS plus exactly one bound re-query");
 	assert.equal(harness.statusCalls.at(-1)?.agent, "pi", "the bound re-query preserves the Pi host runtime");
 });
@@ -611,7 +612,80 @@ test("an admission refusal declares the slot unachievable with its own reason", 
 	assert.equal(harness.unachievableCalls[0]?.detail, undefined, "the refusal text rides failure.stderr, not the declaration detail");
 	assert.equal(result.declaration?.reason, "lens_admission_refused");
 	assert.equal(result.mutation_performed, true);
+	assert.equal(result.mutation_outcome, "committed");
 	assert.equal(harness.statusCalls.length, 2);
+});
+
+// gentle-pi#822: a stop carrying slots that do not match the identity this
+// session declared is a reconciliation failure — never a success rendering
+// someone else's withdraw command.
+test("a stop whose slots do not match the declared identity reports a reconciliation failure", async (t) => {
+	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
+	const cwd = repository(t);
+	const lineageId = "relay-lineage";
+	const input = relayCollectInput(lineageId, "review-risk", 0);
+	const foreignStop = unachievableStopStatus(lineageId, "review-risk", 1);
+	const harness = nativeHarness([finalizeStatus(lineageId, [input]), foreignStop], () => Promise.resolve(unachievableArtifact(lineageId, "review-risk", 0)));
+	__testing.setReviewHostRelayRunnerForTesting(async () => {
+		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT, "pi", "pi reviewer subprocess exceeded the relay bound", { exitCode: null, timedOut: true, elapsedMs: 2_256_004, timeoutMs: 2_256_000 });
+	});
+
+	const result = await runCapture(cwd, harness, lineageId);
+
+	assert.equal(result.status, "blocked");
+	assert.equal(result.outcome, "unachievable-lens-declaration-reconciliation-failed");
+	assert.deepEqual(result.declaration, { lens: "review-risk", selected_order: 0, subject_hash: `sha256:${"0".repeat(64)}`, reason: "relay_transport_bound_exceeded" });
+	assert.equal(result.unachievable_lens_slots, undefined, "a foreign slot is never exposed as this session's withdraw command");
+	const reconciliationFailure = result.reconciliation_failure as { outcome?: string; reason?: string } | undefined;
+	assert.equal(reconciliationFailure?.outcome, "unachievable-lens-slot-declaration-unmatched");
+	assert.match(String(reconciliationFailure?.reason), /no unachievable_lens_slots entry matches the declared slot identity/);
+	assert.equal(result.mutation_performed, true);
+	assert.equal(result.mutation_outcome, "committed");
+	assert.match(String(result.next_action), /refused the unachievable declaration/);
+	assert.equal(harness.statusCalls.length, 2, "the bound re-query still runs exactly once");
+});
+
+// gentle-pi#822: with several declared entries on the stop, only the matching
+// identity is exposed — never the withdraw commands of other runs.
+test("a stop carrying several declared slots exposes only the one this session declared", async (t) => {
+	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
+	const cwd = repository(t);
+	const lineageId = "relay-lineage";
+	const input = relayCollectInput(lineageId, "review-risk", 0);
+	const stop = unachievableStopStatus(lineageId, "review-risk", 0);
+	const foreign = unachievableStopStatus(lineageId, "review-reliability", 2).nextTransition?.unachievableLensSlots?.[0];
+	assert.ok(foreign !== undefined);
+	stop.nextTransition = { ...stop.nextTransition!, unachievableLensSlots: [...stop.nextTransition!.unachievableLensSlots!, foreign] };
+	const harness = nativeHarness([finalizeStatus(lineageId, [input]), stop], () => Promise.resolve(unachievableArtifact(lineageId, "review-risk", 0)));
+	__testing.setReviewHostRelayRunnerForTesting(async () => {
+		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT, "pi", "pi reviewer subprocess exceeded the relay bound", { exitCode: null, timedOut: true, elapsedMs: 2_256_004, timeoutMs: 2_256_000 });
+	});
+
+	const result = await runCapture(cwd, harness, lineageId);
+
+	assert.equal(result.outcome, "unachievable-lens-slot-declared");
+	const slots = result.unachievable_lens_slots as Array<{ lens: string; selected_order: number; subject_hash: string }>;
+	assert.equal(slots.length, 1, "only the declared entry is exposed");
+	assert.equal(slots[0]!.lens, "review-risk");
+	assert.equal(slots[0]!.selected_order, 0);
+	assert.equal(slots[0]!.subject_hash, `sha256:${"0".repeat(64)}`);
+	assert.equal(result.mutation_outcome, "committed");
+});
+
+// gentle-pi#822: STATUS for one lineage renders only that lineage's withdraw
+// command as the hint; a request for an unlisted lineage omits the hint rather
+// than surfacing a potentially unrelated withdraw command.
+test("an unachievable stop renders the withdraw hint only for the requested lineage", async (t) => {
+	const cwd = repository(t);
+	const matchedHarness = nativeHarness([unachievableStopStatus("other-lineage", "review-risk", 0)]);
+	const matched = (await __testing.executeReviewControllerOperation({ operation: "status", lineageId: "other-lineage" }, cwd, matchedHarness.native)) as Record<string, unknown>;
+	assert.match(String(matched.hint), /capture-unachievable.*--withdraw=true/);
+	assert.equal(matched.requested_lineage_id, "other-lineage");
+
+	const unmatchedHarness = nativeHarness([unachievableStopStatus("other-lineage", "review-risk", 0)]);
+	const unmatched = (await __testing.executeReviewControllerOperation({ operation: "status", lineageId: "relay-lineage" }, cwd, unmatchedHarness.native)) as Record<string, unknown>;
+	assert.equal(unmatched.hint, undefined, "no hint when no slot matches the requested lineage");
+	assert.equal(unmatched.requested_lineage_id, "relay-lineage");
 });
 
 // The fail-open capability gate: an older binary that refuses the whole verb

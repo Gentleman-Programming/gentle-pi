@@ -546,6 +546,22 @@ test("next_transition stop decodes unachievable_lens_slots and their withdraw bi
 	assert.equal(decodeReviewNextTransitionV3({ kind: "stop", reason_code: "rdd_disabled" }).unachievableLensSlots, undefined);
 });
 
+// gentle-pi#822: the withdraw form names the slot identity twice — as named arguments and as the binding object — and a slot whose two renderings disagree never decodes, so restart cannot withdraw a different slot.
+test("next_transition stop refuses an unachievable slot whose withdraw arguments disagree with its identity", () => {
+	const stop: JsonObject = { kind: "stop", reason_code: "unachievable_lens_slot", unachievable_lens_slots: [unachievableSlot()] };
+	const drift = (name: string, value: string): JsonObject => {
+		const drifted = unachievableSlot();
+		const withdraw = drifted.withdraw as JsonObject;
+		withdraw.arguments = (withdraw.arguments as unknown[]).map((argument) => (argument as JsonObject).name === name ? { ...(argument as JsonObject), value } : argument);
+		return drifted;
+	};
+	for (const [name, value] of [["request-hash", `sha256:${"b".repeat(64)}`], ["target", `sha256:${"c".repeat(64)}`], ["lineage", "review-fixture-drifted"], ["expected-revision", `sha256:${"d".repeat(64)}`]] as const) {
+		assert.throws(() => decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [drift(name, value)] }), new RegExp(`${name} does not match`), name);
+	}
+	// the pristine fixture still decodes with both renderings agreeing
+	assert.doesNotThrow(() => decodeReviewNextTransitionV3(stop));
+});
+
 function approvedAcknowledgementTransition(): JsonObject {
 	return {
 		kind: "execute",

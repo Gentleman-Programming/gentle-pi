@@ -3855,14 +3855,16 @@ function mapNativeTargetStatus(operation: ReviewControllerOperation, status: Rev
 			hint: `run ${status.nextTransition.continuation.command}`,
 		};
 	}
-	// gentle-pi#638: an unachievable-lens stop carries the exact withdraw command for every declared slot; render the first as the one actionable hint, mirroring the managed_assets_outdated precedent. A restart that never saw the collect offer still finds its way back from this hint alone.
+	// gentle-pi#638: an unachievable-lens stop carries the exact withdraw command for every declared slot, mirroring the managed_assets_outdated precedent. A restart that never saw the collect offer still finds its way back from this hint alone.
+	// gentle-pi#822: when the caller asked about one lineage, render only that lineage's withdraw command; the first entry may belong to an unrelated lineage, so an unmatched request omits the hint instead of surfacing a potentially unrelated withdraw command. Without a requested lineage the first entry stays the fallback.
 	if (status.nextTransition?.kind === "stop" && status.nextTransition.reasonCode === "unachievable_lens_slot" && status.nextTransition.unachievableLensSlots !== undefined) {
+		const withdrawSlot = requestedLineageId === undefined ? status.nextTransition.unachievableLensSlots[0] : status.nextTransition.unachievableLensSlots.find((slot) => slot.withdraw.binding.lineageId === requestedLineageId);
 		return {
 			operation,
 			status: "blocked",
 			result: status.raw,
 			...(requestedLineageId === undefined ? {} : { requested_lineage_id: requestedLineageId }),
-			hint: `run ${status.nextTransition.unachievableLensSlots[0]!.withdraw.command}`,
+			...(withdrawSlot === undefined ? {} : { hint: `run ${withdrawSlot.withdraw.command}` }),
 		};
 	}
 	return {
@@ -4941,6 +4943,22 @@ async function executeReviewHostRelayCapture(
 					const status = await reconcileUnknownReviewLastEventCapture(nativeReviewCli, cwd, binding, route === undefined ? { agent: REVIEW_HOST_AGENT } : { ...route, agent: REVIEW_HOST_AGENT });
 					syncRetainedNativeStatusSelections(selections, cwd, status, route?.baseRef);
 					const stop = status.nextTransition?.kind === "stop" && status.nextTransition.reasonCode === "unachievable_lens_slot" ? status.nextTransition : undefined;
+					// gentle-pi#822: the stop may also carry slots declared by other runs, so expose only the entry matching the identity this session just declared. A stop with slots but no matching entry is a reconciliation failure, never a success rendering someone else's withdraw command.
+					const declaredSlot = stop?.unachievableLensSlots?.find((slot) => slot.lens === declaration.lens && slot.selectedOrder === declaration.selected_order && slot.subjectHash === declaration.subject_hash && slot.withdraw.binding.targetIdentity === declarationBinding.targetIdentity && slot.withdraw.binding.lineageId === declarationBinding.lineageId && slot.withdraw.binding.revision === declarationBinding.expectedRevision);
+					if (stop?.unachievableLensSlots !== undefined && declaredSlot === undefined) {
+						return {
+							tool: "gentle_review_capture",
+							status: "blocked",
+							outcome: "unachievable-lens-declaration-reconciliation-failed",
+							reason: error.message,
+							failure: reviewHostRelayFailureReport(error),
+							declaration,
+							reconciliation_failure: { operation: "gentle_review_capture", status: "blocked", outcome: "unachievable-lens-slot-declaration-unmatched", reason: "no unachievable_lens_slots entry matches the declared slot identity", declared_slot: { lens: declaration.lens, selected_order: declaration.selected_order, subject_hash: declaration.subject_hash }, mutation_performed: true, mutation_outcome: "committed" },
+							mutation_performed: true,
+							mutation_outcome: "committed",
+							next_action: REVIEW_HOST_RELAY_DECLARATION_FAILED_ACTION,
+						};
+					}
 					return {
 						tool: "gentle_review_capture",
 						status: "blocked",
@@ -4950,11 +4968,11 @@ async function executeReviewHostRelayCapture(
 						declaration,
 						provider_action: status.action,
 						...(status.nextTransition === undefined ? {} : { next_transition: status.nextTransition }),
-						...(stop?.unachievableLensSlots === undefined ? {} : { unachievable_lens_slots: stop.unachievableLensSlots.map((slot) => ({ lens: slot.lens, selected_order: slot.selectedOrder, subject_hash: slot.subjectHash, reason: slot.reason, ...(slot.detail === undefined ? {} : { detail: slot.detail }), withdraw: slot.withdraw.command })) }),
+						...(declaredSlot === undefined ? {} : { unachievable_lens_slots: [{ lens: declaredSlot.lens, selected_order: declaredSlot.selectedOrder, subject_hash: declaredSlot.subjectHash, reason: declaredSlot.reason, ...(declaredSlot.detail === undefined ? {} : { detail: declaredSlot.detail }), withdraw: declaredSlot.withdraw.command }] }),
 						result: status.raw,
 						next_action: REVIEW_HOST_RELAY_UNACHIEVABLE_ACTION,
 						mutation_performed: true,
-						mutation_outcome: "none",
+						mutation_outcome: "committed",
 					};
 				} catch (statusError) {
 					return {
@@ -4966,7 +4984,7 @@ async function executeReviewHostRelayCapture(
 						declaration,
 						reconciliation_failure: nativeOperationFailure("gentle_review_capture", statusError),
 						mutation_performed: true,
-						mutation_outcome: "none",
+						mutation_outcome: "committed",
 						next_action: REVIEW_HOST_RELAY_DECLARATION_FAILED_ACTION,
 					};
 				}
