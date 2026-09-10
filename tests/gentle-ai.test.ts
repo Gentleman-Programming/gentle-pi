@@ -257,9 +257,9 @@ function routingConsumerFixture(t: test.TestContext) {
 	};
 }
 
-test("models rejects invalid project routing with its selected source path", async (t) => {
+test("models rejects padded project routing with its selected source path", async (t) => {
 	const fixture = routingConsumerFixture(t);
-	writeFileSync(fixture.projectPath, "[]");
+	writeFileSync(fixture.projectPath, '{" worker":"openai/gpt-5"}');
 	await fixture.run("gentle:models");
 	assert.equal(fixture.notifications[0]?.severity, "warning");
 	assert.ok(fixture.notifications[0]?.message.includes(fixture.projectPath));
@@ -296,7 +296,7 @@ test("models exports missing, normalized project, and global-precedence saved ro
 	for (const source of ["missing", "project", "global"] as const) {
 		await t.test(source, async (t) => {
 			const fixture = routingConsumerFixture(t);
-			if (source !== "missing") writeFileSync(fixture.projectPath, '{"worker":" openai/gpt-5 ","ignored":null}');
+			if (source !== "missing") writeFileSync(fixture.projectPath, '{"worker":" openai/gpt-5 "}');
 			if (source === "global") writeMarkdown(fixture.globalPath, '{"worker":{"model":" anthropic/opus ","thinking":"high"}}');
 			fixture.onPanel(() => ({ type: fixture.panelVisits() === 1 ? "export" : "cancel", config: {} }));
 			await fixture.run("gentle:models");
@@ -450,6 +450,72 @@ test("agent discovery skips skills directories", async (t) => {
 		asyncAgents.map((agent) => agent.name),
 		["review-risk", "worker"],
 	);
+});
+
+test("agent metadata canonicalizes whitespace and rejects unsafe names in both readers", async (t) => {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-agent-metadata-"));
+	const agents = join(root, "agents");
+	mkdirSync(agents, { recursive: true });
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	writeMarkdown(join(agents, "valid.md"), "name:  worker helper!  \n");
+	writeMarkdown(join(agents, "quote.md"), "name: bad\"name\n");
+	writeMarkdown(join(agents, "c0.md"), "name: bad\u0000name\n");
+	writeMarkdown(join(agents, "c1.md"), "name: bad\u0080name\n");
+	writeMarkdown(join(agents, "package.md"), "name: worker\npackage: bad\u0000package\n");
+
+	assert.deepEqual(__testing.listAgentsFromDir(agents, "user").map((agent) => agent.name), ["worker helper!"]);
+	assert.deepEqual((await __testing.listAgentsFromDirAsync(agents, "user")).map((agent) => agent.name), ["worker helper!"]);
+});
+
+test("routing aliases are denied before models can migrate profiles", async (t) => {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-routing-alias-"));
+	const configDir = join(root, ".pi", "gentle-ai");
+	const profilePath = join(root, ".pi", "subagents.json");
+	const settingsPath = join(root, ".pi", "settings.json");
+	const previousConfigHome = process.env.GENTLE_PI_CONFIG_HOME;
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const previousHome = process.env.HOME;
+	process.env.HOME = root;
+	delete process.env.GENTLE_PI_CONFIG_HOME;
+	process.env.GENTLE_PI_AGENT_HOME = join(root, ".pi");
+	mkdirSync(join(root, "agents"), { recursive: true });
+	mkdirSync(configDir, { recursive: true });
+	writeFileSync(join(configDir, "models.json"), '{"worker":"openai/gpt-5"}\n');
+	const profileBytes = '{"unrelated":true}\n';
+	const settingsBytes = '{"subagents":{"agentOverrides":{"worker":"openai/gpt-5"}}}\n';
+	writeFileSync(profilePath, profileBytes);
+	writeFileSync(settingsPath, settingsBytes);
+	t.after(() => {
+		if (previousConfigHome === undefined) delete process.env.GENTLE_PI_CONFIG_HOME;
+		else process.env.GENTLE_PI_CONFIG_HOME = previousConfigHome;
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		rmSync(root, { recursive: true, force: true });
+	});
+	const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+	createGentleAiExtension({ nativeReviewCli: null })({
+		on() {}, registerTool() {}, registerCommand(name, command) { commands.set(name, command); },
+	} as ExtensionAPI);
+	const notifications: string[] = [];
+	await commands.get("gentle:models")!.handler("", {
+		cwd: root,
+		hasUI: true,
+		modelRegistry: { getAvailable: async () => [] },
+		ui: {
+			notify(message: string) { notifications.push(message); },
+			custom: async () => ({ type: "cancel", config: {} }),
+		},
+	} as unknown as ExtensionContext);
+
+	assert.ok(notifications.length > 0);
+	assert.equal(readFileSync(join(configDir, "models.json"), "utf8"), '{"worker":"openai/gpt-5"}\n');
+	assert.equal(readFileSync(profilePath, "utf8"), profileBytes);
+	assert.equal(readFileSync(settingsPath, "utf8"), settingsBytes);
+	assert.equal(__testing.sameModelRoutingPath("C:\\Home\\.pi\\models.json", "c:/home/.pi/models.json", "win32"), true);
+	assert.equal(__testing.sameModelRoutingPath("/Home/.pi/models.json", "/home/.pi/models.json", "posix"), false);
+	assert.equal(__testing.sameModelRoutingPath("/home/project/../.pi/models.json/", "/home//.pi/models.json", "posix"), true);
 });
 
 test("managed routing timeout leaves its profile, agent, and manifest unchanged", (t) => {

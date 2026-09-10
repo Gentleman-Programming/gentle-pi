@@ -23,7 +23,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
 	ExtensionAPI,
@@ -51,6 +51,7 @@ import {
 } from "../lib/sdd-preflight.ts";
 import {
 	THINKING_LEVELS,
+	normalizeAgentName,
 	normalizeModelConfig,
 	normalizeModelId,
 	normalizeRoutingEntry,
@@ -1791,6 +1792,71 @@ function legacyProjectModelConfigPath(cwd: string): string {
 	return join(cwd, ".pi", "gentle-ai", "models.json");
 }
 
+type ModelRoutingPathPlatform = "posix" | "win32";
+
+interface ModelRoutingTarget {
+	label: string;
+	path: string;
+}
+
+interface ModelRoutingTargets {
+	globalConfigPath: string;
+	projectConfigPath: string;
+	globalProfilePath: string;
+	projectProfilePath: string;
+}
+
+class ModelRoutingTargetAuthorityError extends Error {
+	readonly path: string;
+	readonly aliasPath: string;
+
+	constructor(path: string, aliasPath: string) {
+		super(`Model routing targets alias: ${path} and ${aliasPath}`);
+		this.path = path;
+		this.aliasPath = aliasPath;
+	}
+}
+
+function sameModelRoutingPath(
+	left: string,
+	right: string,
+	platform: ModelRoutingPathPlatform = process.platform === "win32" ? "win32" : "posix",
+): boolean {
+	const pathApi = platform === "win32" ? win32 : posix;
+	const normalizePath = (path: string) => pathApi.normalize(pathApi.resolve(path));
+	const normalizedLeft = normalizePath(left);
+	const normalizedRight = normalizePath(right);
+	return platform === "win32"
+		? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+		: normalizedLeft === normalizedRight;
+}
+
+function resolveModelRoutingTargetAuthority(
+	cwd: string,
+	platform?: ModelRoutingPathPlatform,
+): ModelRoutingTargets {
+	const targets: ModelRoutingTargets = {
+		globalConfigPath: modelConfigPath(cwd),
+		projectConfigPath: legacyProjectModelConfigPath(cwd),
+		globalProfilePath: agentModelProfileConfigPath(cwd, "builtin"),
+		projectProfilePath: agentModelProfileConfigPath(cwd, "project"),
+	};
+	const namedTargets: ModelRoutingTarget[] = [
+		{ label: "global model config", path: targets.globalConfigPath },
+		{ label: "project model config", path: targets.projectConfigPath },
+		{ label: "global model profile", path: targets.globalProfilePath },
+		{ label: "project model profile", path: targets.projectProfilePath },
+	];
+	for (const [index, target] of namedTargets.entries()) {
+		for (const candidate of namedTargets.slice(index + 1)) {
+			if (sameModelRoutingPath(target.path, candidate.path, platform)) {
+				throw new ModelRoutingTargetAuthorityError(target.path, candidate.path);
+			}
+		}
+	}
+	return targets;
+}
+
 function projectPersonaConfigPath(cwd: string): string {
 	return join(cwd, ".pi", "gentle-ai", "persona.json");
 }
@@ -1830,9 +1896,9 @@ function writePersonaMode(cwd: string, mode: PersonaMode): string[] {
 }
 
 function readSavedModelConfig(cwd: string): ModelConfigFileResult {
-	const projectPath = legacyProjectModelConfigPath(cwd);
-	const result = readModelRoutingAuthority(modelConfigPath(cwd), projectPath);
-	return result.status === "invalid" && result.path === projectPath
+	const targets = resolveModelRoutingTargetAuthority(cwd);
+	const result = readModelRoutingAuthority(targets.globalConfigPath, targets.projectConfigPath);
+	return result.status === "invalid" && result.path === targets.projectConfigPath
 		? { status: "valid", config: {} }
 		: result;
 }
@@ -1840,9 +1906,9 @@ function readSavedModelConfig(cwd: string): ModelConfigFileResult {
 async function readSavedModelConfigAsync(
 	cwd: string,
 ): Promise<ModelConfigFileResult> {
-	const projectPath = legacyProjectModelConfigPath(cwd);
-	const result = await readModelRoutingAuthorityAsync(modelConfigPath(cwd), projectPath);
-	return result.status === "invalid" && result.path === projectPath
+	const targets = resolveModelRoutingTargetAuthority(cwd);
+	const result = await readModelRoutingAuthorityAsync(targets.globalConfigPath, targets.projectConfigPath);
+	return result.status === "invalid" && result.path === targets.projectConfigPath
 		? { status: "valid", config: {} }
 		: result;
 }
@@ -1860,14 +1926,14 @@ export async function readModelConfigAsync(
 }
 
 function writeModelConfig(cwd: string, config: AgentModelConfig): void {
-	const path = modelConfigPath(cwd);
+	const path = resolveModelRoutingTargetAuthority(cwd).globalConfigPath;
 	mkdirSync(dirname(path), { recursive: true });
 	const cleaned = normalizeModelConfig(config) ?? {};
 	writeFileSync(path, `${JSON.stringify(cleaned, null, 2)}\n`);
 }
 
 async function writeModelConfigAsync(cwd: string, config: AgentModelConfig): Promise<void> {
-	const path = modelConfigPath(cwd);
+	const path = resolveModelRoutingTargetAuthority(cwd).globalConfigPath;
 	await mkdir(dirname(path), { recursive: true });
 	const cleaned = normalizeModelConfig(config) ?? {};
 	await writeFile(path, `${JSON.stringify(cleaned, null, 2)}\n`);
@@ -1880,9 +1946,10 @@ function parseModelExport(value: unknown): AgentModelConfig | undefined {
 }
 
 async function exportSavedModelConfig(ctx: ExtensionContext): Promise<number> {
+	const targets = resolveModelRoutingTargetAuthority(ctx.cwd);
 	const saved = await readModelRoutingAuthorityAsync(
-		modelConfigPath(ctx.cwd),
-		legacyProjectModelConfigPath(ctx.cwd),
+		targets.globalConfigPath,
+		targets.projectConfigPath,
 	);
 	if (saved.status === "invalid") throw new Error(`Invalid model config: ${saved.path}`);
 	const agents = saved.status === "valid" ? saved.config : {};
@@ -1944,12 +2011,14 @@ function parseAgentName(filePath: string): string | undefined {
 	} catch {
 		return undefined;
 	}
-	const name = content.match(/^name:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1]?.trim();
+	const name = normalizeAgentName(
+		content.match(/^name:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1],
+	);
 	if (!name) return undefined;
-	const packageName = content
-		.match(/^package:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1]
-		?.trim();
-	return packageName ? `${packageName}.${name}` : name;
+	const rawPackageName = content.match(/^package:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1];
+	const packageName = normalizeAgentName(rawPackageName);
+	if (rawPackageName !== undefined && !packageName) return undefined;
+	return normalizeAgentName(packageName ? `${packageName}.${name}` : name);
 }
 
 async function parseAgentNameAsync(
@@ -1961,12 +2030,14 @@ async function parseAgentNameAsync(
 	} catch {
 		return undefined;
 	}
-	const name = content.match(/^name:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1]?.trim();
+	const name = normalizeAgentName(
+		content.match(/^name:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1],
+	);
 	if (!name) return undefined;
-	const packageName = content
-		.match(/^package:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1]
-		?.trim();
-	return packageName ? `${packageName}.${name}` : name;
+	const rawPackageName = content.match(/^package:\s*["']?([^"'\n]+)["']?\s*$/m)?.[1];
+	const packageName = normalizeAgentName(rawPackageName);
+	if (rawPackageName !== undefined && !packageName) return undefined;
+	return normalizeAgentName(packageName ? `${packageName}.${name}` : name);
 }
 
 function listAgentFilesRecursive(dir: string): string[] {
@@ -2267,6 +2338,7 @@ function isValidJsonObjectFileOrMissing(path: string): boolean {
 }
 
 function migrateLegacyProjectModelOverrides(cwd: string): number {
+	resolveModelRoutingTargetAuthority(cwd);
 	const settingsPath = projectSettingsPath(cwd);
 	if (!existsSync(settingsPath)) return 0;
 	let settings: Record<string, unknown>;
@@ -2322,6 +2394,7 @@ export function applyModelConfig(
 	cwd: string,
 	config: AgentModelConfig,
 ): { updated: number; skipped: number } {
+	resolveModelRoutingTargetAuthority(cwd);
 	let updated = 0;
 	let skipped = 0;
 	const seenAgents = new Set<string>();
@@ -2367,6 +2440,7 @@ export async function applyModelConfigAsync(
 	cwd: string,
 	config: AgentModelConfig,
 ): Promise<{ updated: number; skipped: number }> {
+	resolveModelRoutingTargetAuthority(cwd);
 	let updated = 0;
 	let skipped = 0;
 	const seenAgents = new Set<string>();
@@ -2415,9 +2489,10 @@ export async function applySavedModelConfig(
 	ctx: ExtensionContext,
 	applyConfig: typeof applyModelConfigAsync = applyModelConfigAsync,
 ): Promise<{ updated: number; skipped: number; invalidPath?: string }> {
+	const targets = resolveModelRoutingTargetAuthority(ctx.cwd);
 	const result = await readModelRoutingAuthorityAsync(
-		modelConfigPath(ctx.cwd),
-		legacyProjectModelConfigPath(ctx.cwd),
+		targets.globalConfigPath,
+		targets.projectConfigPath,
 	);
 	if (result.status === "invalid") {
 		return { updated: 0, skipped: 0, invalidPath: result.path };
@@ -2960,10 +3035,17 @@ async function showSddModelPanel(
 }
 
 async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
+	let targets: ModelRoutingTargets;
+	try {
+		targets = resolveModelRoutingTargetAuthority(ctx.cwd);
+	} catch (error) {
+		ctx.ui.notify(`el Gentleman cannot open model config: ${error instanceof Error ? error.message : String(error)}`, "warning");
+		return;
+	}
 	migrateLegacyProjectModelOverrides(ctx.cwd);
 	const savedConfig = await readModelRoutingAuthorityAsync(
-		modelConfigPath(ctx.cwd),
-		legacyProjectModelConfigPath(ctx.cwd),
+		targets.globalConfigPath,
+		targets.projectConfigPath,
 	);
 	if (savedConfig.status === "invalid") {
 		ctx.ui.notify(
@@ -6856,6 +6938,8 @@ export const __testing = {
 	listAgentsFromDir,
 	listAgentsFromDirAsync,
 	listDiscoverableAgents,
+	sameModelRoutingPath,
+	resolveModelRoutingTargetAuthority,
 	orderDiscoverableAgents,
 	classifyGuardedCommand,
 	loadRuntimeGuardrailsConfig,
@@ -7870,9 +7954,10 @@ function createGentleAiExtensionForTesting(
 			const openspecConfigured = existsSync(
 				join(ctx.cwd, "openspec", "config.yaml"),
 			);
+			const targets = resolveModelRoutingTargetAuthority(ctx.cwd);
 			const savedConfig = await readModelRoutingAuthorityAsync(
-				modelConfigPath(ctx.cwd),
-				legacyProjectModelConfigPath(ctx.cwd),
+				targets.globalConfigPath,
+				targets.projectConfigPath,
 			);
 			const devBinary = await describeDevBinaryOverride();
 			ctx.ui.notify(

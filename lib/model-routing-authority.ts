@@ -26,7 +26,7 @@ export type ModelConfigFileResult =
 	| { status: "valid"; config: AgentModelConfig };
 
 const SAFE_MODEL_ID_PATTERN = /^[A-Za-z0-9._~:@/+%-]+$/;
-const SAFE_AGENT_NAME_PATTERN = /^[A-Za-z0-9._:@/+%-]+$/;
+const UNSAFE_AGENT_NAME_CHARACTERS = /["'\u0000-\u001F\u007F-\u009F]/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -56,6 +56,13 @@ export function normalizeModelId(value: unknown): string | undefined {
 	return model;
 }
 
+/** Canonical names allow unknown punctuation and internal whitespace. */
+export function normalizeAgentName(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const name = value.trim();
+	return name.length > 0 && !UNSAFE_AGENT_NAME_CHARACTERS.test(name) ? name : undefined;
+}
+
 export function normalizeRoutingEntry(value: unknown): AgentRoutingEntry | undefined {
 	if (typeof value === "string") {
 		const model = normalizeModelId(value);
@@ -74,18 +81,20 @@ export function normalizeModelConfig(value: unknown): AgentModelConfig | undefin
 	if (!isRecord(value)) return undefined;
 	const cleaned: AgentModelConfig = {};
 	for (const [name, entryValue] of Object.entries(value)) {
-		if (!SAFE_AGENT_NAME_PATTERN.test(name)) continue;
+		const canonicalName = normalizeAgentName(name);
 		const entry = normalizeRoutingEntry(entryValue);
-		if (entry) cleaned[name] = entry;
+		if (canonicalName && entry) cleaned[canonicalName] = entry;
 	}
 	return cleaned;
 }
 
-function parseModelConfigFileValue(value: Record<string, unknown>): AgentModelConfig {
+function parseModelConfigFileValue(value: Record<string, unknown>): AgentModelConfig | undefined {
 	const config: AgentModelConfig = {};
 	for (const [name, entryValue] of Object.entries(value)) {
+		const canonicalName = normalizeAgentName(name);
 		const entry = normalizeRoutingEntry(entryValue);
-		if (entry) config[name] = entry;
+		if (!canonicalName || canonicalName !== name || !entry) return undefined;
+		config[canonicalName] = entry;
 	}
 	return config;
 }
@@ -95,7 +104,8 @@ export function readModelConfigFile(path: string): ModelConfigFileResult {
 	try {
 		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
 		if (!isRecord(parsed)) return { status: "invalid", path };
-		return { status: "valid", config: parseModelConfigFileValue(parsed) };
+		const config = parseModelConfigFileValue(parsed);
+		return config === undefined ? { status: "invalid", path } : { status: "valid", config };
 	} catch {
 		return { status: "invalid", path };
 	}
@@ -108,7 +118,8 @@ export async function readModelConfigFileAsync(
 	try {
 		const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
 		if (!isRecord(parsed)) return { status: "invalid", path };
-		return { status: "valid", config: parseModelConfigFileValue(parsed) };
+		const config = parseModelConfigFileValue(parsed);
+		return config === undefined ? { status: "invalid", path } : { status: "valid", config };
 	} catch {
 		return { status: "invalid", path };
 	}
