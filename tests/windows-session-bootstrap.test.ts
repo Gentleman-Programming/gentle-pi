@@ -142,6 +142,33 @@ function parseBootstrapRejectionDiagnostic(stderr: string): BootstrapRejectionDi
 	return Object.freeze({ kind: "windows-session-bootstrap-rejection", stage: record.stage as BootstrapRejectionDiagnostic["stage"], ntstatus: record.ntstatus as number | null });
 }
 
+const maxFixtureFailureDiagnosticBytes = 256;
+const fixtureFailureStages = new Set(["replacement-copy", "replacement-acl", "replacement-rename"]);
+const fixtureFailureCodeKinds = new Set(["hresult", "win32", "unknown"]);
+type FixtureFailureDiagnostic = Readonly<{ kind: "windows-session-bootstrap-fixture-failure"; stage: "replacement-copy" | "replacement-acl" | "replacement-rename"; codeKind: "hresult" | "win32" | "unknown"; code: number | null }>;
+
+function parseFixtureFailureDiagnostic(stdout: string): FixtureFailureDiagnostic | undefined {
+	if (Buffer.byteLength(stdout, "utf8") > maxFixtureFailureDiagnosticBytes || !stdout.endsWith("\n")) return undefined;
+	const lines = stdout.slice(0, -1).split("\n");
+	if (lines.length !== 1 || lines[0].length === 0) return undefined;
+	let value: unknown;
+	try { value = JSON.parse(lines[0]); } catch { return undefined; }
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record).sort();
+	if (keys.length !== 5 || keys.join(",") !== "code,codeKind,kind,ok,stage" || record.ok !== false || record.kind !== "windows-session-bootstrap-fixture-failure" || typeof record.stage !== "string" || !fixtureFailureStages.has(record.stage) || typeof record.codeKind !== "string" || !fixtureFailureCodeKinds.has(record.codeKind)) return undefined;
+	const diagnosticCode = record.code;
+	if (diagnosticCode !== null && (typeof diagnosticCode !== "number" || !Number.isSafeInteger(diagnosticCode) || diagnosticCode < -0x80000000 || diagnosticCode > 0x7fffffff || (record.codeKind === "win32" && diagnosticCode <= 0) || (record.codeKind === "hresult" && diagnosticCode === 0) || record.codeKind === "unknown")) return undefined;
+	if (diagnosticCode === null && record.codeKind !== "unknown") return undefined;
+	return Object.freeze({ kind: "windows-session-bootstrap-fixture-failure", stage: record.stage as FixtureFailureDiagnostic["stage"], codeKind: record.codeKind as FixtureFailureDiagnostic["codeKind"], code: diagnosticCode as number | null });
+}
+
+function fixtureFailureMessage(code: number, stdout: string): string {
+	if (code === 0) return "Windows fixture failed";
+	const diagnostic = parseFixtureFailureDiagnostic(stdout);
+	return diagnostic ? `Windows replacement fixture failed: ${diagnostic.stage}:${diagnostic.codeKind}:${diagnostic.code ?? "unknown"}` : "Windows fixture failed";
+}
+
 async function runBootstrapStartupControl(options: Readonly<{ spawnProcess?: (...args: any[]) => CleanupChild; startupDeadlineMs?: number; terminateMs?: number; killMs?: number }> = {}): Promise<Readonly<{ code: number; stdout: string; stderr: string; outputOverflow: boolean }>> {
 	const child = (options.spawnProcess ?? spawn)(FIXED_WINDOWS_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", runtime], { shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }) as CleanupChild;
 	const lifecycle = observeChildLifecycle(child);
@@ -326,7 +353,7 @@ async function helper(agentHome: string, enumerate = false, options: Readonly<{ 
 
 async function fixtureResult(mode: "capture" | "equals" | "measure" | "add-extra-ace" | "junction" | "rename" | "replace-identical" | "hardlink" | "append" | "exclusive-open", path: string, extra: string[] = []) {
 	const result = await runPowerShell(fixture, ["-Mode", mode, "-Path", path, ...extra]);
-	assert.equal(result.code, 0);
+	assert.equal(result.code, 0, fixtureFailureMessage(result.code, result.stdout));
 	return JSON.parse(result.stdout) as Record<string, boolean>;
 }
 
@@ -650,6 +677,30 @@ test("Windows bootstrap rejection parser admits only fixed native phase evidence
 	assert.equal(parseBootstrapRejectionDiagnostic('{"kind":"windows-session-bootstrap-rejection","stage":"transport-assert-owned","ntstatus":1.5}\n'), undefined);
 	assert.equal(parseBootstrapRejectionDiagnostic('{"kind":"windows-session-bootstrap-rejection","stage":"transport-assert-owned","ntstatus":0,"sid":"S-1-5-18"}\n'), undefined);
 	assert.equal(parseBootstrapRejectionDiagnostic('{"kind":"windows-session-bootstrap-rejection","stage":"transport-assert-owned","ntstatus":null}' + " ".repeat(maxBootstrapDiagnosticBytes) + "\n"), undefined);
+});
+
+test("Windows fixture replacement failure parser admits only fixed diagnostic evidence", () => {
+	const copyFailure = '{"ok":false,"kind":"windows-session-bootstrap-fixture-failure","stage":"replacement-copy","codeKind":"hresult","code":-2147024864}\n';
+	assert.deepEqual(parseFixtureFailureDiagnostic(copyFailure), { kind: "windows-session-bootstrap-fixture-failure", stage: "replacement-copy", codeKind: "hresult", code: -2147024864 });
+	assert.deepEqual(parseFixtureFailureDiagnostic('{"ok":false,"kind":"windows-session-bootstrap-fixture-failure","stage":"replacement-rename","codeKind":"unknown","code":null}\n'), { kind: "windows-session-bootstrap-fixture-failure", stage: "replacement-rename", codeKind: "unknown", code: null });
+	assert.equal(fixtureFailureMessage(1, copyFailure), "Windows replacement fixture failed: replacement-copy:hresult:-2147024864");
+	assert.equal(fixtureFailureMessage(1, '{"ok":false,"kind":"windows-session-bootstrap-fixture-failure","stage":"replacement-copy","codeKind":"hresult","code":-2147024864,"path":"private"}\n'), "Windows fixture failed");
+	assert.equal(parseFixtureFailureDiagnostic('{"ok":false,"kind":"windows-session-bootstrap-fixture-failure","stage":"replacement-acl","codeKind":"win32","code":-1}\n'), undefined);
+	assert.equal(parseFixtureFailureDiagnostic('{"ok":false,"kind":"windows-session-bootstrap-fixture-failure","stage":"replacement-acl","codeKind":"win32","code":0}\n'), undefined);
+	assert.equal(parseFixtureFailureDiagnostic('{"ok":false,"kind":"windows-session-bootstrap-fixture-failure","stage":"replacement-acl","codeKind":"hresult","code":0}\n'), undefined);
+	assert.equal(parseFixtureFailureDiagnostic('{"ok":false,"kind":"windows-session-bootstrap-fixture-failure","stage":"replacement-copy","codeKind":"unknown","code":0}\n'), undefined);
+	assert.equal(parseFixtureFailureDiagnostic("x".repeat(maxFixtureFailureDiagnosticBytes + 1)), undefined);
+});
+
+test("Windows fixture replacement failures expose only fixed stages and numeric codes", async (t) => {
+	t.diagnostic("source guard, not native Windows proof");
+	const source = await readFile(fixture, "utf8");
+	assert.match(source, /\$replacementStage = 'replacement-copy'[\s\S]*?\[IO\.File\]::Copy/);
+	assert.match(source, /\$replacementStage = 'replacement-acl'\s*Set-Acl/);
+	assert.match(source, /\$replacementStage = 'replacement-rename'[\s\S]*?MoveFileEx\(\$temp, \$Path, 1\)/);
+	assert.match(source, /\[Runtime\.InteropServices\.Marshal\]::GetLastWin32Error\(\)/);
+	assert.match(source, /kind = 'windows-session-bootstrap-fixture-failure'; stage = \$replacementStage; codeKind = \$replacementCodeKind; code = \$replacementCode/);
+	assert.doesNotMatch(source, /replacementStage[\s\S]*?\.Message|replacementStage[\s\S]*?\.ToString\(\)|replacementStage[\s\S]*?StackTrace/);
 });
 
 test("Windows presence source guard uses rooted no-replace publication and same-handle deletion", async (t) => {

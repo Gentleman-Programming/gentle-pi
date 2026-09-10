@@ -8,6 +8,16 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 function Write-Result([hashtable]$result) { [Console]::Out.WriteLine(($result | ConvertTo-Json -Compress)) }
+function Get-ReplacementHResult($errorRecord) {
+	if ($null -eq $errorRecord) { return $null }
+	$exceptionProperty = $errorRecord.PSObject.Properties['Exception']
+	if ($null -eq $exceptionProperty -or $exceptionProperty.Value -isnot [Exception]) { return $null }
+	try { $baseException = $exceptionProperty.Value.GetBaseException() } catch { return $null }
+	if ($baseException -isnot [IO.IOException] -and $baseException -isnot [UnauthorizedAccessException] -and $baseException -isnot [Security.SecurityException] -and $baseException -isnot [ComponentModel.Win32Exception]) { return $null }
+	$hresultProperty = $baseException.PSObject.Properties['HResult']
+	if ($null -eq $hresultProperty -or $hresultProperty.Value -isnot [int] -or $hresultProperty.Value -eq 0) { return $null }
+	return [int]$hresultProperty.Value
+}
 try {
 	if ($Mode -eq 'capture') {
 		if ([string]::IsNullOrEmpty($BaselinePath)) { throw 'baseline-required' }
@@ -32,16 +42,32 @@ try {
 	}
 	if ($Mode -eq 'replace-identical') {
 		$temp = "$Path.replacement"
-		[IO.File]::Copy($Path, $temp, $true)
-		Set-Acl -LiteralPath $temp -AclObject (Get-Acl -LiteralPath $Path)
-		Add-Type -TypeDefinition @'
+		$replacementStage = 'replacement-copy'
+		try {
+			[IO.File]::Copy($Path, $temp, $true)
+			$replacementStage = 'replacement-acl'
+			Set-Acl -LiteralPath $temp -AclObject (Get-Acl -LiteralPath $Path)
+			$replacementStage = 'replacement-rename'
+			Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 public static class WindowsSessionBootstrapFixture {
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool MoveFileEx(string source, string destination, uint flags);
 }
 '@ -ErrorAction Stop
-		if (-not [WindowsSessionBootstrapFixture]::MoveFileEx($temp, $Path, 1)) { throw 'replace-failed' }
+			if (-not [WindowsSessionBootstrapFixture]::MoveFileEx($temp, $Path, 1)) {
+				$replacementCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+				$replacementCodeKind = if ($replacementCode -eq 0) { 'unknown' } else { 'win32' }
+				if ($replacementCodeKind -eq 'unknown') { $replacementCode = $null }
+				Write-Result @{ ok = $false; kind = 'windows-session-bootstrap-fixture-failure'; stage = $replacementStage; codeKind = $replacementCodeKind; code = $replacementCode }
+				exit 1
+			}
+		} catch {
+			$replacementCode = Get-ReplacementHResult $_
+			$replacementCodeKind = if ($null -eq $replacementCode) { 'unknown' } else { 'hresult' }
+			Write-Result @{ ok = $false; kind = 'windows-session-bootstrap-fixture-failure'; stage = $replacementStage; codeKind = $replacementCodeKind; code = $replacementCode }
+			exit 1
+		}
 		Write-Result @{ ok = $true; replaced = $true }
 		exit 0
 	}
