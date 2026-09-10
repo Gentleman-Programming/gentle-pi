@@ -587,6 +587,46 @@ test("next_transition stop refuses duplicate identities and non-exact withdraw c
 	assert.doesNotThrow(() => decodeReviewNextTransitionV3(stop));
 });
 
+// gentle-pi#822 (CodeRabbit finding): withdrawal is a narrowly scoped, runnable
+// retraction. Its one affirmative flag is part of the exact native vector, not
+// just another provider-defined argument that a malformed STATUS can omit or
+// negate while still rendering a plausible command.
+test("next_transition stop requires exactly one canonical --withdraw=true argument", () => {
+	const stop: JsonObject = { kind: "stop", reason_code: "unachievable_lens_slot", unachievable_lens_slots: [unachievableSlot()] };
+	const canonicalCommand = (slot: JsonObject): string => {
+		const withdraw = slot.withdraw as JsonObject;
+		return `gentle-ai review capture-unachievable ${(withdraw.arguments as JsonObject[]).map((argument) => String(argument.token)).join(" ")}`;
+	};
+
+	const omitted = unachievableSlot();
+	const omittedWithdraw = omitted.withdraw as JsonObject;
+	omittedWithdraw.arguments = (omittedWithdraw.arguments as JsonObject[]).filter((argument) => argument.name !== "withdraw");
+	omittedWithdraw.command = canonicalCommand(omitted);
+	assert.throws(() => decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [omitted] }), /withdraw must appear exactly once/);
+
+	const falseValue = unachievableSlot();
+	const falseWithdraw = falseValue.withdraw as JsonObject;
+	falseWithdraw.arguments = (falseWithdraw.arguments as JsonObject[]).map((argument) => argument.name === "withdraw"
+		? { ...argument, value: "false", token: "--withdraw=false" }
+		: argument);
+	falseWithdraw.command = canonicalCommand(falseValue);
+	assert.throws(() => decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [falseValue] }), /withdraw must be true/);
+
+	const noncanonicalToken = unachievableSlot();
+	const tokenWithdraw = noncanonicalToken.withdraw as JsonObject;
+	tokenWithdraw.arguments = (tokenWithdraw.arguments as JsonObject[]).map((argument) => argument.name === "withdraw"
+		? { ...argument, token: "--withdraw true" }
+		: argument);
+	tokenWithdraw.command = canonicalCommand(noncanonicalToken);
+	assert.throws(() => decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [noncanonicalToken] }), /token must exactly render/);
+
+	const duplicate = unachievableSlot();
+	const duplicateWithdraw = duplicate.withdraw as JsonObject;
+	duplicateWithdraw.arguments = [...duplicateWithdraw.arguments as JsonObject[], { name: "withdraw", value: "true", token: "--withdraw=true" }];
+	duplicateWithdraw.command = canonicalCommand(duplicate);
+	assert.throws(() => decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [duplicate] }), /withdraw must appear exactly once/);
+});
+
 // gentle-pi#822 (CodeRabbit finding): Go bounds the CAPTURE_UNACHIEVABLE detail at 512 UTF-8 bytes (native-review-cli.ts enforces the same limit when declaring), so the transition decoder mirrors that bound — measured in bytes, not UTF-16 code units — and a STATUS stop can never carry a detail this client would have refused to declare.
 test("next_transition stop bounds an unachievable slot detail at 512 UTF-8 bytes", () => {
 	const stop: JsonObject = { kind: "stop", reason_code: "unachievable_lens_slot", unachievable_lens_slots: [unachievableSlot()] };

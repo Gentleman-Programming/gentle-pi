@@ -1822,6 +1822,12 @@ function decodeUnachievableLensSlot(value         , label        )              
 	const operation = enumeration(withdraw.operation, ["review.capture-unachievable"]         , `${label}.withdraw.operation`);
 	const command = nonempty(withdraw.command, `${label}.withdraw.command`);
 	const arguments_ = decodeTransitionArguments(withdraw.arguments, `${label}.withdraw.arguments`);
+	// Withdrawal is a single affirmative native action, never an optional or
+	// negatable provider argument. The general token and command checks below
+	// then prove its exact --withdraw=true rendering is the complete vector.
+	const withdrawArguments = arguments_.filter((argument) => argument.name === "withdraw");
+	if (withdrawArguments.length !== 1) throw new TypeError(`${label}.withdraw.arguments withdraw must appear exactly once`);
+	if (withdrawArguments[0] .value !== "true") throw new TypeError(`${label}.withdraw.arguments withdraw must be true`);
 	// The binding keeps the execute branch's open-record discipline: the Go shape is target_identity plus optional lineage_id, revision, and repository_context, and closing it here would make Pi stricter than the contract it implements.
 	const binding = exactRecord(withdraw.binding, `${label}.withdraw.binding`, ["target_identity"], ["lineage_id", "revision", "repository_context"], true);
 	const targetIdentity = sha256(binding.target_identity, `${label}.withdraw.binding.target_identity`);
