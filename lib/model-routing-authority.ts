@@ -88,11 +88,31 @@ export function normalizeModelConfig(value: unknown): AgentModelConfig | undefin
 	return cleaned;
 }
 
+function decodeSavedRoutingEntry(value: unknown): AgentRoutingEntry | undefined {
+	if (typeof value === "string") {
+		const model = normalizeModelId(value);
+		return model ? { model } : undefined;
+	}
+	if (!isRecord(value)) return undefined;
+	const entries = Object.entries(value);
+	if (entries.some(([key]) => key !== "model" && key !== "thinking")) {
+		return undefined;
+	}
+	if (entries.length === 0) return {};
+
+	const modelEntry = entries.find(([key]) => key === "model");
+	const thinkingEntry = entries.find(([key]) => key === "thinking");
+	const model = modelEntry ? normalizeModelId(modelEntry[1]) : undefined;
+	const thinking = thinkingEntry && isThinkingLevel(thinkingEntry[1]) ? thinkingEntry[1] : undefined;
+	if ((modelEntry && !model) || (thinkingEntry && !thinking)) return undefined;
+	return { model, thinking };
+}
+
 function parseModelConfigFileValue(value: Record<string, unknown>): AgentModelConfig | undefined {
 	const config: AgentModelConfig = {};
 	for (const [name, entryValue] of Object.entries(value)) {
 		const canonicalName = normalizeAgentName(name);
-		const entry = normalizeRoutingEntry(entryValue);
+		const entry = decodeSavedRoutingEntry(entryValue);
 		if (!canonicalName || canonicalName !== name || !entry) return undefined;
 		config[canonicalName] = entry;
 	}

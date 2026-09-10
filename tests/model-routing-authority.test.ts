@@ -76,12 +76,31 @@ test("model routing authority normalizes and preserves sync/async source status"
 		["c1", { worker: "inherit", [`bad\u0080name`]: "openai/gpt-5" }],
 		["null", { valid: "inherit", worker: null }],
 		["entry", { valid: "inherit", worker: { model: "not valid" } }],
+		[
+			"partial-model",
+			{ valid: "inherit", worker: { model: "not valid", thinking: "high" } },
+		],
+		[
+			"partial-thinking",
+			{ valid: "inherit", worker: { model: "openai/gpt-5", thinking: "invalid" } },
+		],
+		[
+			"unknown-entry-field",
+			{ valid: "inherit", worker: { model: "openai/gpt-5", extra: true } },
+		],
 	] as const) {
-		const path = join(globalDir, `${label}.json`);
-		writeFileSync(path, JSON.stringify(value));
-		const expected = { status: "invalid" as const, path };
-		assert.deepEqual(authority.readModelConfigFile(path), expected, label);
-		assert.deepEqual(await authority.readModelConfigFileAsync(path), expected, label);
+		await t.test(label, async () => {
+			const path = join(globalDir, `${label}.json`);
+			writeFileSync(path, JSON.stringify(value));
+			const expected = { status: "invalid" as const, path };
+			assert.deepEqual(
+				[
+					authority.readModelConfigFile(path),
+					await authority.readModelConfigFileAsync(path),
+				],
+				[expected, expected],
+			);
+		});
 	}
 
 	const invalidGlobalPath = join(globalDir, "invalid.json");
