@@ -883,6 +883,7 @@ To opt out:
 | `extensions/startup-banner.ts` | Shows and configures the startup intro, color presets, and compact runtime panel.     |
 | `extensions/sdd-init.ts`       | Registers `/gentle-sdd-init` for OpenSpec initialization.                                                         |
 | `extensions/skill-registry.ts` | Maintains `.atl/skill-registry.md` from project/user skills and closes file watchers on shutdown.          |
+| `extensions/shift-selection-extension/` | Shift+Home/End text-selection editor: alt+a select all, selection replace/delete with one-step undo, reverse-video highlight, and a `PI_SHIFT_SELECTION_DEBUG` key tap. |
 | `assets/orchestrator.md`       | Parent-session orchestration contract (always-on core).                                                    |
 | `assets/orchestrator-delegation.md` | Lazy-loaded delegation/routing/review detail, including the mirrored gentle-ai canon.                 |
 | `assets/orchestrator-memory.md` | Lazy-loaded SDD memory phase table, artifact keys, and lifecycle rule.                                    |
