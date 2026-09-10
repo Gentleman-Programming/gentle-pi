@@ -11,7 +11,7 @@ import { sidebarPart } from "../lib/shell-sidebar.ts";
 import { invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
 import { AGENT_MODE, discoverAgents, loadAgentsConfig, resolveAgentProfile, type AgentDefinition, type AgentMode } from "../lib/agents-config.ts";
 import { isFinished, TASK_STATUS, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
-import { AgentRunner, piCommand, type AskAnswer, type RunnerDeps, type TaskRequest } from "../lib/agents-runner.ts";
+import { AgentRunner, piCommand, type AskAnswer, type RunnerDeps, type SddChangeSelection, type TaskRequest } from "../lib/agents-runner.ts";
 import { ChildMessenger, type IpcEndpoint } from "../lib/agents-messaging.ts";
 import { hasReviewSessionPermission, resolveCanonicalGitRepositoryIdentitySync, type ReviewSessionManager } from "../lib/review-session-standing-permission.ts";
 import { historyDir, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
@@ -43,6 +43,32 @@ const STOP_KEY_DEFAULT = "alt+s";
 const RENDER_COALESCE_MS = 400;
 const CLOCK_TICK_MS = 1000;
 const TOOL_PREFIX = "subagent_";
+const SDD_PHASE_BY_AGENT = {
+	"sdd-apply": "apply",
+	"sdd-verify": "verify",
+	"sdd-sync": "sync",
+	"sdd-archive": "archive",
+} as const;
+
+function sddPhaseForAgent(name: string): SddChangeSelection["phase"] | undefined {
+	return SDD_PHASE_BY_AGENT[name as keyof typeof SDD_PHASE_BY_AGENT];
+}
+
+function parseSddChange(value: unknown, agentName: string): SddChangeSelection | undefined {
+	if (value === undefined) return undefined;
+	const expectedPhase = sddPhaseForAgent(agentName);
+	if (!expectedPhase) throw new Error("sdd_change is allowed only for SDD apply, verify, sync, or archive agents.");
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("sdd_change must be an object with changeName, workspaceRoot, and phase.");
+	const selection = value as Record<string, unknown>;
+	const keys = Object.keys(selection).sort();
+	if (keys.join(",") !== "changeName,phase,workspaceRoot" ||
+		typeof selection.changeName !== "string" || selection.changeName.length === 0 ||
+		typeof selection.workspaceRoot !== "string" || selection.workspaceRoot.length === 0 ||
+		selection.phase !== expectedPhase) {
+		throw new Error("sdd_change must contain only a non-empty changeName, workspaceRoot, and the agent's matching phase.");
+	}
+	return { changeName: selection.changeName, workspaceRoot: selection.workspaceRoot, phase: selection.phase };
+}
 
 export interface AgentsDeps extends RunnerDeps {
 	home: string;
@@ -598,14 +624,21 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 
 	const roots = (ctx: ExtensionContext) => ({ cwd: ctx.sessionManager.getCwd(), home: deps.home, agentHome });
 
-	const buildRequest = (ctx: ExtensionContext, agent: AgentDefinition, prompt: string, label: string | undefined, context: string | undefined, mode: AgentMode, resume?: string, workspaceRoot?: string): TaskRequest => {
+	const buildRequest = (ctx: ExtensionContext, agent: AgentDefinition, prompt: string, label: string | undefined, context: string | undefined, mode: AgentMode, resume?: string, workspaceRoot?: string, sddChange?: SddChangeSelection): TaskRequest => {
 		const registry = registryFor(ctx);
 		const parentCwd = ctx.sessionManager.getCwd();
 		// An explicit target is validated before any queue or session-dir writes.
 		const parentIdentity = deps.resolveWorktree(parentCwd, parentCwd);
+		const selectedRoot = workspaceRoot ?? sddChange?.workspaceRoot;
 		// Preserve ordinary non-Git continuation, without admitting any new root.
-		const sameNonGitContinuation = resume !== undefined && workspaceRoot === parentCwd && !parentIdentity;
-		const target = workspaceRoot !== undefined && !sameNonGitContinuation ? registry.validate(workspaceRoot) : parentIdentity?.root;
+		const sameNonGitContinuation = resume !== undefined && selectedRoot === parentCwd && !parentIdentity;
+		const target = selectedRoot !== undefined && !sameNonGitContinuation ? registry.validate(selectedRoot) : parentIdentity?.root;
+		if (sddChange && target !== sddChange.workspaceRoot && target !== resolve(sddChange.workspaceRoot)) {
+			throw new Error("sdd_change workspaceRoot must resolve to the selected child worktree.");
+		}
+		const launchSddChange = sddChange === undefined || target === undefined
+			? undefined
+			: { ...sddChange, workspaceRoot: target };
 		const config = loadAgentsConfig(roots(ctx));
 		const profile = resolveAgentProfile(agent, config);
 		const research = agent.name === "sdd-research" ? researchAgent(agent, pi) : undefined;
@@ -629,6 +662,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			sessionDir,
 			resumeSessionPath: resume,
 			env: research ? { ...deps.env, [RESEARCH_CHILD_TOOLS_ENV]: JSON.stringify(research.agent.tools) } : deps.env,
+			...(launchSddChange === undefined ? {} : { sddChange: launchSddChange }),
 			...(parentRepositoryIdentity === undefined ? {} : {
 				authorizeParentStandingReviewPermission: (repositoryIdentity: string) => {
 					try {
@@ -722,6 +756,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				label: { type: "string", description: "Three to six words naming the work, shown on the agents card, e.g. 'map footer data sources'." },
 				context: { type: "string", description: "Optional extra context appended to the task." },
 				workspace_root: { type: "string", description: "Optional worktree in the same Git clone. Validated before queueing; the child runs at its canonical root and registers it on actual launch." },
+				sdd_change: { type: "object", additionalProperties: false, required: ["changeName", "workspaceRoot", "phase"], properties: { changeName: { type: "string" }, workspaceRoot: { type: "string" }, phase: { type: "string", enum: ["apply", "verify", "sync", "archive"] } }, description: "Launch-local selected SDD identity, accepted only by matching SDD phase agents." },
 				mode: { type: "string", enum: ["task", "background"], description: "task waits for the result (default); background returns immediately." },
 			},
 		},
@@ -730,7 +765,10 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			const agent = agents.find((candidate) => candidate.name === params.agent);
 			if (!agent) return text(`Error: no subagent named "${String(params.agent)}". Known: ${agents.map((candidate) => candidate.name).join(", ") || "none"}`, { error: "unknown agent" });
 			const mode = (params.mode as AgentMode | undefined) ?? agent.mode ?? loadAgentsConfig(roots(ctx)).defaultMode;
-			return launch(ctx, buildRequest(ctx, agent, String(params.task ?? ""), typeof params.label === "string" ? params.label : undefined, typeof params.context === "string" ? params.context : undefined, mode, undefined, typeof params.workspace_root === "string" ? params.workspace_root : undefined));
+			let sddChange: SddChangeSelection | undefined;
+			try { sddChange = parseSddChange(params.sdd_change, agent.name); }
+			catch (error) { return text(`Error: ${error instanceof Error ? error.message : String(error)}`, { error: "invalid sdd_change" }); }
+			return launch(ctx, buildRequest(ctx, agent, String(params.task ?? ""), typeof params.label === "string" ? params.label : undefined, typeof params.context === "string" ? params.context : undefined, mode, undefined, typeof params.workspace_root === "string" ? params.workspace_root : undefined, sddChange));
 		},
 	);
 
@@ -768,7 +806,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	tool(
 		"continue",
 		"Resume a finished subagent task in its own session with a follow-up prompt.",
-		{ required: ["task_id", "prompt"], properties: { task_id: { type: "string" }, prompt: { type: "string" }, label: { type: "string", description: "Three to six words naming the follow-up." }, mode: { type: "string", enum: ["task", "background"] } } },
+		{ required: ["task_id", "prompt"], properties: { task_id: { type: "string" }, prompt: { type: "string" }, label: { type: "string", description: "Three to six words naming the follow-up." }, sdd_change: { type: "object", additionalProperties: false, required: ["changeName", "workspaceRoot", "phase"], properties: { changeName: { type: "string" }, workspaceRoot: { type: "string" }, phase: { type: "string", enum: ["apply", "verify", "sync", "archive"] } }, description: "Fresh launch-local selected SDD identity, required when continuing an SDD phase agent." }, mode: { type: "string", enum: ["task", "background"] } } },
 		async (params, ctx) => {
 			const previous = await resolveTask(String(params.task_id));
 			if (!previous) return text(`Error: no task ${String(params.task_id)}`, { error: "unknown task" });
@@ -776,7 +814,11 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			const agent = discoverAgents(roots(ctx)).agents.find((candidate) => candidate.name === previous.agent);
 			if (!agent) return text(`Error: subagent "${previous.agent}" is no longer defined.`, { error: "unknown agent" });
 			const mode = (params.mode as AgentMode | undefined) ?? (previous.mode as AgentMode);
-			return launch(ctx, buildRequest(ctx, agent, String(params.prompt ?? ""), typeof params.label === "string" ? params.label : undefined, undefined, mode, previous.sessionPath, previous.cwd));
+			let sddChange: SddChangeSelection | undefined;
+			try { sddChange = parseSddChange(params.sdd_change, agent.name); }
+			catch (error) { return text(`Error: ${error instanceof Error ? error.message : String(error)}`, { error: "invalid sdd_change" }); }
+			if (sddPhaseForAgent(agent.name) && !sddChange) return text("Error: continuing an SDD phase agent requires a fresh sdd_change selection.", { error: "missing sdd_change" });
+			return launch(ctx, buildRequest(ctx, agent, String(params.prompt ?? ""), typeof params.label === "string" ? params.label : undefined, undefined, mode, previous.sessionPath, sddChange?.workspaceRoot ?? previous.cwd, sddChange));
 		},
 	);
 

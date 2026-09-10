@@ -1015,6 +1015,39 @@ test("explicit child roots launch and continue in the actual cwd, persist withou
 	await tick();
 });
 
+test("SDD phase continuation requires a fresh selection and launches only that selection", async () => {
+	const h = fakePi();
+	const runtime = deps();
+	const fixtureHome = join(root, "sdd-selection-home");
+	mkdirSync(join(fixtureHome, ".pi", "agent", "agents"), { recursive: true });
+	writeFileSync(join(fixtureHome, ".pi", "agent", "agents", "sdd-apply.md"), "---\ndescription: apply\ntools: [read]\n---\nSDD apply executor");
+	gentleAgents(h.pi, {}, { ...runtime.deps, home: fixtureHome });
+	const { ctx } = fakeContext();
+	await h.fire("session_start", ctx);
+	const run = await h.tools.get("subagent_run")!.execute("run", {
+		agent: "sdd-apply", task: "Apply alpha", mode: "background",
+		sdd_change: { changeName: "alpha", workspaceRoot: cwd, phase: "apply" },
+	}, undefined, undefined, ctx);
+	await tick();
+	const taskId = (run.details.gentleAgents as { taskId: string }).taskId;
+	const first = runtime.spawned[0]!;
+	assert.deepEqual(JSON.parse(first[first.indexOf("--gentle-sdd-change") + 1]!), { changeName: "alpha", workspaceRoot: cwd, phase: "apply" });
+	runtime.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] });
+	runtime.children[0].emit({ type: "agent_settled" });
+	await tick();
+	const missing = await h.tools.get("subagent_continue")!.execute("missing", { task_id: taskId, prompt: "Continue", mode: "background" }, undefined, undefined, ctx);
+	assert.match(missing.content[0].text, /requires a fresh sdd_change/i);
+	assert.equal(runtime.spawned.length, 1);
+	await h.tools.get("subagent_continue")!.execute("continue", {
+		task_id: taskId, prompt: "Apply beta", mode: "background",
+		sdd_change: { changeName: "beta", workspaceRoot: cwd, phase: "apply" },
+	}, undefined, undefined, ctx);
+	await tick();
+	const second = runtime.spawned[1]!;
+	assert.deepEqual(JSON.parse(second[second.indexOf("--gentle-sdd-change") + 1]!), { changeName: "beta", workspaceRoot: cwd, phase: "apply" });
+	await h.fire("session_shutdown", ctx);
+});
+
 test("ordinary non-Git tasks still continue in their original cwd without registering a worktree", async () => {
 	const h = fakePi();
 	const runtime = deps();
