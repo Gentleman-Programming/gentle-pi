@@ -12,7 +12,8 @@ import { AGENT_MODE, discoverAgents, loadAgentsConfig, resolveAgentProfile, type
 import { isFinished, TASK_STATUS, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
 import { AgentRunner, piCommand, type AskAnswer, type RunnerDeps, type TaskRequest } from "../lib/agents-runner.ts";
 import { ChildMessenger, type IpcEndpoint } from "../lib/agents-messaging.ts";
-import { ActiveSessionClient, ActiveSessionListener, SessionPresenceRegistry, type PresenceRecord, type ReceivedNotification } from "../lib/agents-session-transport.ts";
+import { ActiveSessionClient, ActiveSessionListener, SessionPresenceRegistry, type PresenceRecord, type ReceivedNotification, type SentNotification, type SessionPresenceCandidate } from "../lib/agents-session-transport.ts";
+import { WindowsActiveSessionClient, WindowsActiveSessionListener, WindowsSessionPresenceRegistry } from "../lib/windows-session-transport.ts";
 import { hasReviewSessionPermission, resolveCanonicalGitRepositoryIdentitySync, type ReviewSessionManager } from "../lib/review-session-standing-permission.ts";
 import { historyDir, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
 import { sessionToMarkdown } from "../lib/agents-transcript.ts";
@@ -41,10 +42,27 @@ const RENDER_COALESCE_MS = 400;
 const CLOCK_TICK_MS = 1000;
 const TOOL_PREFIX = "subagent_";
 
+export interface SessionTransportRegistry {
+	list(excludeSessionId?: string): Promise<readonly SessionPresenceCandidate[]>;
+	listActivations(excludeSessionId?: string): Promise<readonly PresenceRecord[]>;
+	close?(): Promise<void>;
+}
+
+export interface SessionTransportListener {
+	readonly registry: SessionTransportRegistry;
+	start(): Promise<void>;
+	close(): Promise<void>;
+}
+
+export interface SessionTransportClient {
+	close(): void;
+	sendNotification(recipientSessionId: string, message: string, options?: { id?: string; expectedActivation?: PresenceRecord; beforeConnect?: () => boolean | Promise<boolean>; signal?: AbortSignal }): Promise<SentNotification>;
+}
+
 export interface SessionTransportFactory {
-	createRegistry(agentHome: string): Promise<SessionPresenceRegistry>;
-	createListener(registry: SessionPresenceRegistry, sessionId: string, onNotification: (notification: ReceivedNotification) => Promise<void>): ActiveSessionListener;
-	createClient(registry: SessionPresenceRegistry, sessionId: string): ActiveSessionClient;
+	createRegistry(agentHome: string): Promise<SessionTransportRegistry>;
+	createListener(registry: SessionTransportRegistry, sessionId: string, onNotification: (notification: ReceivedNotification) => Promise<void>): SessionTransportListener;
+	createClient(registry: SessionTransportRegistry, sessionId: string): SessionTransportClient;
 }
 
 export interface AgentsDeps extends RunnerDeps {
@@ -160,11 +178,21 @@ function registerChildMessaging(pi: ExtensionAPI, ipc: IpcEndpoint): void {
 	});
 }
 
-const defaultSessionTransport: SessionTransportFactory = {
-	createRegistry: (agentHome) => SessionPresenceRegistry.create(agentHome),
-	createListener: (registry, sessionId, onNotification) => new ActiveSessionListener(registry, sessionId, onNotification),
-	createClient: (registry, sessionId) => new ActiveSessionClient(registry, sessionId),
+const posixSessionTransport: SessionTransportFactory = {
+	createRegistry(agentHome) { return SessionPresenceRegistry.create(agentHome); },
+	createListener(registry: SessionPresenceRegistry, sessionId, onNotification) { return new ActiveSessionListener(registry, sessionId, onNotification); },
+	createClient(registry: SessionPresenceRegistry, sessionId) { return new ActiveSessionClient(registry, sessionId); },
 };
+
+const windowsSessionTransport: SessionTransportFactory = {
+	createRegistry(agentHome) { return WindowsSessionPresenceRegistry.create(agentHome); },
+	createListener(registry: WindowsSessionPresenceRegistry, sessionId, onNotification) { return new WindowsActiveSessionListener(registry, sessionId, onNotification); },
+	createClient(registry: WindowsSessionPresenceRegistry, sessionId) { return new WindowsActiveSessionClient(registry, sessionId); },
+};
+
+export function createDefaultSessionTransport(platform: NodeJS.Platform = process.platform): SessionTransportFactory {
+	return platform === "win32" ? windowsSessionTransport : posixSessionTransport;
+}
 
 function text(value: string, details: Record<string, unknown> = {}, terminate = false): ToolText {
 	return { content: [{ type: "text", text: value }], details, ...(terminate ? { terminate: true } : {}) };
@@ -243,7 +271,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		: environmentHome && (selectedHome.startsWith("~/") || (process.platform === "win32" && selectedHome.startsWith("~\\"))) ? join(deps.home, selectedHome.slice(2)) : selectedHome;
 	// Freeze the host's root before a child uses a different session cwd.
 	const agentHome = resolve(expandedHome);
-	const sessionTransport = deps.sessionTransport ?? defaultSessionTransport;
+	const sessionTransport = deps.sessionTransport ?? createDefaultSessionTransport();
 	if (legacySubagentsInstalledAt(agentHome)) {
 		pi.on("session_start", (_event, ctx) => {
 			if (ctx.hasUI) ctx.ui.notify(`${AGENTS_GLYPH} Gentle Agents is waiting: remove the old package first with "pi remove npm:${LEGACY_SUBAGENTS_PACKAGE}"`, "warning");
@@ -292,7 +320,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	// its session. Before the first session_start there is nothing to scope by.
 	const activeSessionId = (): string | undefined => (sessions === undefined ? undefined : sessions.getSessionId() ?? "");
 	const visibleTasks = (): TaskRecord[] => store.list(activeSessionId());
-	type SessionTransport = { generation: number; sessionId: string; sessionManager: ExtensionContext["sessionManager"]; client: ActiveSessionClient; listener: ActiveSessionListener };
+	type SessionTransport = { generation: number; sessionId: string; sessionManager: ExtensionContext["sessionManager"]; client: SessionTransportClient; listener: SessionTransportListener };
 	let transportGeneration = 0;
 	let activeSessionTransport: SessionTransport | undefined;
 	let transportStartup: Promise<void> | undefined;
@@ -308,14 +336,23 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const sessionManager = ctx.sessionManager;
 		activeSessionTransport = undefined;
 		const operation = (async () => {
-			let listener: ActiveSessionListener | undefined;
-			let client: ActiveSessionClient | undefined;
+			let registry: SessionTransportRegistry | undefined;
+			let listener: SessionTransportListener | undefined;
+			let client: SessionTransportClient | undefined;
+			const closeStartupTransport = async () => {
+				client?.close();
+				await listener?.close().catch(() => {});
+				await registry?.close?.().catch(() => {});
+			};
 			try {
 				await closeSessionTransport(previous);
 				const sessionId = sessionManager.getSessionId();
 				if (!validTransportSessionId(sessionId) || sessions !== sessionManager || generation !== transportGeneration) return;
-				const registry = await sessionTransport.createRegistry(agentHome);
-				if (sessions !== sessionManager || generation !== transportGeneration) return;
+				registry = await sessionTransport.createRegistry(agentHome);
+				if (sessions !== sessionManager || generation !== transportGeneration) {
+					await closeStartupTransport();
+					return;
+				}
 				listener = sessionTransport.createListener(registry, sessionId, async (notification) => {
 					const active = activeSessionTransport;
 					if (!active || active.generation !== generation || active.sessionManager !== sessionManager || active.sessionId !== sessionId || sessions !== sessionManager || activeSessionId() !== sessionId) throw new Error("stale session transport");
@@ -323,8 +360,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				});
 				client = sessionTransport.createClient(registry, sessionId);
 				if (sessions !== sessionManager || generation !== transportGeneration || activeSessionId() !== sessionId) {
-					client.close();
-					await listener.close();
+					await closeStartupTransport();
 					return;
 				}
 				const transport = { generation, sessionId, sessionManager, client, listener };
@@ -334,14 +370,12 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				await listener.start();
 				if (sessions !== sessionManager || generation !== transportGeneration || activeSessionId() !== sessionId) {
 					if (activeSessionTransport === transport) activeSessionTransport = undefined;
-					client.close();
-					await listener.close();
+					await closeStartupTransport();
 					return;
 				}
 			} catch {
 				if (activeSessionTransport?.generation === generation) activeSessionTransport = undefined;
-				client?.close();
-				await listener?.close().catch(() => {});
+				await closeStartupTransport();
 			}
 		})();
 		transportStartup = operation;

@@ -8,7 +8,9 @@ import { SESSION_WORKTREE_ENTRY, SESSION_WORKTREE_CHANGED } from "../lib/session
 import test, { after, afterEach, mock } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, answerThroughUi, completionText, legacySubagentsInstalled, type AgentsDeps } from "../extensions/gentle-agents.ts";
+import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, answerThroughUi, completionText, createDefaultSessionTransport, legacySubagentsInstalled, type AgentsDeps, type SessionTransportFactory } from "../extensions/gentle-agents.ts";
+import { ActiveSessionClient, ActiveSessionListener, SessionPresenceRegistry } from "../lib/agents-session-transport.ts";
+import { WindowsActiveSessionClient, WindowsActiveSessionListener } from "../lib/windows-session-transport.ts";
 import { historyDir, loadHistory, saveTask } from "../lib/agents-history.ts";
 import { emptyThread, TASK_EVENT, TASK_STATUS, TaskStore, type TaskRecord } from "../lib/agents-protocol.ts";
 import { NativePointerScope } from "../lib/native-pointer-region.ts";
@@ -1554,6 +1556,53 @@ test("the production overlay reads terminal rows at render time without a minimu
 	assert.equal(overlay.render(80).length, 1, "tiny terminals retain bounded controls rather than forced chrome");
 	overlay.handleInput("\x1b");
 	await opened;
+});
+
+test("default session transport selects Windows or POSIX classes without mutating the process platform", () => {
+	const registry = {} as never;
+	const onNotification = async () => {};
+	const windows = createDefaultSessionTransport("win32");
+	assert.ok(windows.createListener(registry, "s1", onNotification) instanceof WindowsActiveSessionListener);
+	assert.ok(windows.createClient(registry, "s1") instanceof WindowsActiveSessionClient);
+	const posix = createDefaultSessionTransport("linux");
+	assert.ok(posix.createListener(registry, "s1", onNotification) instanceof ActiveSessionListener);
+	assert.ok(posix.createClient(registry, "s1") instanceof ActiveSessionClient);
+	assert.equal(posix.createRegistry, createDefaultSessionTransport("darwin").createRegistry);
+	assert.equal(windows.createRegistry, createDefaultSessionTransport("win32").createRegistry);
+	assert.notEqual(windows.createRegistry, posix.createRegistry);
+});
+
+test("session transport startup failure cleans the constructed Windows-capable transport and stays unavailable", async () => {
+	const h = fakePi();
+	const runtime = deps();
+	let registryCloses = 0;
+	let listenerCloses = 0;
+	let clientCloses = 0;
+	const registry = {
+		list: async () => [],
+		listActivations: async () => [],
+		close: async () => { registryCloses += 1; },
+	};
+	const transport: SessionTransportFactory = {
+		createRegistry: async () => registry,
+		createListener: () => ({
+			registry,
+			start: async () => { throw new Error("unavailable"); },
+			close: async () => { listenerCloses += 1; },
+		}),
+		createClient: () => ({
+			close: () => { clientCloses += 1; },
+			sendNotification: async () => ({ id: "unused", accepted: true }),
+		}),
+	};
+	runtime.deps.sessionTransport = transport;
+	gentleAgents(h.pi, {}, runtime.deps);
+	const { ctx } = fakeContext();
+	await h.fire("session_start", ctx);
+	assert.equal(clientCloses, 1);
+	assert.equal(listenerCloses, 1);
+	assert.equal(registryCloses, 1);
+	assert.match((await h.tools.get("orchestrator_session_id")!.execute("id", {}, undefined, undefined, ctx)).content[0].text, /not ready/);
 });
 
 test("session transport adds host tools, forwards notifications, and closes on shutdown", async () => {
