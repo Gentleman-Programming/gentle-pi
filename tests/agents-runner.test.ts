@@ -25,7 +25,7 @@ interface Harness {
 	spawnOptions: Array<{ env: NodeJS.ProcessEnv; stdio?: string[] }>;
 }
 
-function harness(options: { maxConcurrency?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean; onNotification?: RunnerHooks["onNotification"]; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"] } = {}): Harness {
+function harness(options: { maxConcurrency?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean; onNotification?: RunnerHooks["onNotification"]; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"]; onFinish?: RunnerHooks["onFinish"] } = {}): Harness {
 	const children: FakeChild[] = [];
 	const timers: Harness["timers"] = [];
 	const asks: Harness["asks"] = [];
@@ -64,7 +64,7 @@ function harness(options: { maxConcurrency?: number; answer?: Record<string, unk
 			asks.push({ taskId, method: ask.method });
 			return options.answer ?? { value: "yes" };
 		},
-		onFinish: (task) => finishes.push(task.id),
+		onFinish: (task, observations) => { finishes.push(task.id); options.onFinish?.(task, observations); },
 		onNotification: options.onNotification,
 		onSuccessfulMutation: options.onSuccessfulMutation,
 	});
@@ -72,6 +72,102 @@ function harness(options: { maxConcurrency?: number; answer?: Record<string, unk
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test("synchronous cancellation before dequeue never invokes the policy callback", async () => {
+	const h = harness(); let checks = 0;
+	const task = h.runner.run(request({ prepareResponseObservations: async () => { checks++; return true; } }));
+	h.runner.cancel(task.id);
+	await tick();
+	assert.equal(checks, 0);
+	assert.equal(h.children.length, 0);
+});
+
+test("hanging preparation never blocks spawn or queued core work; late grants are dropped", async () => {
+	const h = harness({ maxConcurrency: 1 });
+	let grant!: (value: boolean) => void;
+	let checks = 0;
+	const first = h.runner.run(request({ prepareResponseObservations: () => { checks++; return new Promise(resolve => { grant = resolve; }); } }));
+	const second = h.runner.run(request());
+	await tick();
+	assert.equal(checks, 1);
+	assert.equal(h.children.length, 1);
+	assert.equal(h.store.get(second.id)?.status, TASK_STATUS.QUEUED);
+	assert.equal(h.runner.cancel(first.id), true);
+	await tick();
+	assert.equal(h.children.length, 2);
+	grant(true);
+	await tick();
+	assert.equal(h.children.length, 2);
+	assert.equal((await h.runner.waitFor(first.id)).status, TASK_STATUS.CANCELLED);
+	h.runner.cancel(second.id);
+});
+
+for (const outcome of ["ready", "late", "reject", "throw"] as const) {
+	test(`parallel preparation ${outcome} cannot delay execution or revive dropped observations`, async () => {
+		const snapshots: Parameters<NonNullable<RunnerHooks["onFinish"]>>[1][] = [];
+		const h = harness({ onFinish: (_task, snapshot) => snapshots.push(snapshot) });
+		let grant!: (value: boolean) => void;
+		const task = h.runner.run(request({ prepareResponseObservations: () => {
+			if (outcome === "throw") throw new Error("preparation failed");
+			if (outcome === "reject") return Promise.reject(new Error("preparation failed"));
+			return new Promise(resolve => { grant = resolve; });
+		} }));
+		await tick();
+		assert.equal(h.children.length, 1);
+		if (outcome === "ready") { grant(true); await tick(); }
+		const message = { type: "message_end", message: { role: "assistant", provider: "openai", model: "gpt-4o", stopReason: "stop", content: [{ type: "text", text: "done" }] } };
+		h.children[0].emit(message);
+		if (outcome === "late") { grant(true); await tick(); }
+		h.children[0].emit(message);
+		h.children[0].emit({ type: "agent_end" });
+		h.children[0].emit({ type: "agent_settled" });
+		await h.runner.waitFor(task.id);
+		assert.equal(snapshots.length, 1);
+		assert.equal(snapshots[0]?.responses.length, outcome === "ready" ? 2 : undefined);
+	});
+}
+
+for (const checkpoint of ["launch", "stream", "finish", "throw"] as const) {
+	test(`child observation guard discards permanently at ${checkpoint} without changing task execution`, async () => {
+		let allowed = checkpoint !== "launch";
+		let calls = 0;
+		const snapshots: Parameters<NonNullable<RunnerHooks["onFinish"]>>[1][] = [];
+		const h = harness({ onFinish: (_task, snapshot) => snapshots.push(snapshot) });
+		const task = h.runner.run(request({ collectResponseObservations: true,
+			canCollectResponseObservations: () => {
+				calls++;
+				if (checkpoint === "throw") throw new Error("private policy failure");
+				return allowed;
+			} }));
+		await tick();
+		const child = h.children[0];
+		const response = { type: "message_end", message: { role: "assistant", stopReason: "stop", usage: { input: 3 } } };
+		child.emit(response);
+		if (checkpoint === "stream") {
+			allowed = false;
+			child.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "progress" } });
+			allowed = true;
+			child.emit(response);
+		}
+		if (checkpoint === "finish") allowed = false;
+		h.runner.cancel(task.id);
+		await tick();
+		assert.equal((await h.runner.waitFor(task.id)).status, TASK_STATUS.CANCELLED);
+		assert.deepEqual(snapshots, [undefined]);
+		assert.ok(calls > 0);
+	});
+}
+
+test("child observation guard is never consulted when collection is default-off", async () => {
+	let calls = 0;
+	const h = harness();
+	const task = h.runner.run(request({ canCollectResponseObservations: () => { calls++; return true; } }));
+	await tick();
+	h.children[0].emit({ type: "message_end", message: { role: "assistant", stopReason: "stop" } });
+	h.runner.cancel(task.id);
+	await tick();
+	assert.equal(calls, 0);
+});
 
 for (const ending of ["cancel", "failure", "hook-error", "hook-async-error"] as const) {
 	test(`successful child mutations require paired RPC events and survive ${ending}`, async () => {
@@ -174,6 +270,86 @@ test("runner captures resolved model and effort, retaining omitted launch values
 	assert.equal(h.store.get(task.id)?.model, "default");
 	assert.equal(h.store.get(task.id)?.thinking, undefined);
 	h.runner.cancel(task.id);
+});
+
+test("runner delivers each response combination once at finish, never attributing launch selection", async () => {
+	const snapshots: NonNullable<Parameters<NonNullable<RunnerHooks["onFinish"]>>[1]>[] = [];
+	const h = harness({ exitOnKill: false, state: { model: { provider: "anthropic", id: "launch" }, thinkingLevel: "max" },
+		onFinish: (_task, snapshot) => { assert.ok(snapshot); snapshots.push(snapshot); } });
+	const task = h.runner.run(request({ collectResponseObservations: true }));
+	await tick();
+	const child = h.children[0];
+	const responses = [
+		{ provider: "openai", model: "gpt-4o", providerThinkingLevel: "low", stopReason: "error" },
+		{ provider: "anthropic", model: "claude-sonnet-4", providerThinkingLevel: "high", stopReason: "toolUse" },
+		{ provider: "openai", model: "gpt-4o", providerThinkingLevel: "high", stopReason: "stop" },
+	];
+	for (const response of responses) {
+		const message = { role: "assistant", ...response, usage: { input: 10, totalTokens: 10, cost: { total: 0.1 } }, content: [{ type: "text", text: "private report" }] };
+		child.emit({ type: "message_start", message });
+		child.emit({ type: "message_end", message });
+		child.emit({ type: "turn_end", message });
+		child.emit({ type: "agent_end", messages: [message] });
+	}
+	assert.deepEqual(snapshots, [], "agent_end is not settlement");
+	child.emit({ type: "agent_settled" });
+	assert.deepEqual(snapshots, [], "settlement still waits for process cleanup");
+	child.exit(0);
+	await tick();
+	assert.equal(snapshots.length, 1);
+	const snapshot = snapshots[0];
+	assert.equal(snapshot.agentSettled, true);
+	assert.equal(snapshot.droppedResponses, 0);
+	assert.equal(snapshot.coverage, "final_assistant_messages_only");
+	assert.deepEqual(snapshot.responses.map((response) => [response.provider, response.model, response.providerThinkingLevel]),
+		responses.map((response) => [response.provider, response.model, response.providerThinkingLevel].map((value) => ({ state: "observed", value }))));
+	assert.ok(snapshot.responses.every((response) => Object.values(response.selected).every((field) => field.state === "unavailable")));
+	assert.equal(h.store.get(task.id)?.tokens, 30);
+	assert.equal(h.store.get(task.id)?.cost, 0.1 + 0.1 + 0.1);
+	assert.equal(h.store.get(task.id)?.model, "anthropic/launch");
+	assert.deepEqual(child.written.map((command) => command.type), ["get_state", "prompt"]);
+	assert.doesNotMatch(JSON.stringify(snapshot), /private|launch|s1|modelVersion/);
+	assert.ok(Object.isFrozen(snapshot) && Object.isFrozen(snapshot.responses) && Object.isFrozen(snapshot.responses[0].tokens.input));
+	child.emit({ type: "agent_settled" }); child.exit(0);
+	assert.equal(snapshots.length, 1);
+});
+
+for (const ending of ["cancel", "exit", "error", "timeout", "settled-error"] as const) test(`bounded response coverage survives ${ending} honestly`, async () => {
+	let snapshot: Parameters<NonNullable<RunnerHooks["onFinish"]>>[1];
+	const h = harness({ onFinish: (_task, observations) => { snapshot = observations; } });
+	const task = h.runner.run(request({ collectResponseObservations: true }));
+	await tick();
+	const child = h.children[0];
+	for (let index = 0; index < 130; index++) child.emit({ type: "message_end", message: {
+		role: "assistant", model: `model-${index}`, stopReason: "error", usage: { totalTokens: 1 } } });
+	if (ending === "cancel") h.runner.cancel(task.id);
+	else if (ending === "exit") child.exit(1);
+	else if (ending === "error") child.fail("private process error");
+	else if (ending === "timeout") h.timers.filter((timer) => !timer.cancelled && timer.ms === 10_000).at(-1)!.fn();
+	else { child.emit({ type: "agent_end", messages: [{ role: "assistant", stopReason: "error" }] }); child.emit({ type: "agent_settled" }); }
+	await h.runner.waitFor(task.id);
+	assert.ok(snapshot);
+	assert.equal(snapshot.responses.length, 128);
+	assert.equal(snapshot.droppedResponses, 2);
+	assert.equal(snapshot.agentSettled, ending === "settled-error");
+	assert.equal(h.store.get(task.id)?.tokens, 130, "buffer cap never caps existing UI totals");
+	assert.notEqual(h.store.get(task.id)?.status, TASK_STATUS.COMPLETED);
+	child.emit({ type: "message_end", message: { role: "assistant", stopReason: "stop" } });
+	assert.equal(snapshot.responses.length, 128);
+	assert.equal(h.finishes.length, 1);
+});
+
+test("response buffering is disabled by default and absent for tasks cancelled before launch", async () => {
+	const snapshots: unknown[] = [];
+	const h = harness({ maxConcurrency: 1, onFinish: (_task, snapshot) => snapshots.push(snapshot) });
+	const task = h.runner.run(request());
+	const queued = h.runner.run(request({ collectResponseObservations: true }));
+	await tick();
+	h.children[0].emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", usage: { totalTokens: 7 } } });
+	h.runner.cancel(queued.id); h.runner.cancel(task.id);
+	await tick();
+	assert.deepEqual(snapshots, [undefined, undefined]);
+	assert.equal(h.store.get(task.id)?.tokens, 7);
 });
 
 test("childArguments builds an rpc launch with model, thinking, tools, session dir, and instructions", () => {
@@ -536,6 +712,7 @@ for (const lateEvents of [false, true]) test(`AgentRunner releases quarantined c
 	let launches = 0;
 	let asks = 0;
 	const finishes: string[] = [];
+	const observations: Parameters<NonNullable<RunnerHooks["onFinish"]>>[1][] = [];
 	let resolveAnswer!: (answer: { value: string }) => void;
 	const answer = new Promise<{ value: string }>((resolve) => { resolveAnswer = resolve; });
 	const child = fakeChild({ exitOnKill: false, pid: 71 });
@@ -551,11 +728,12 @@ for (const lateEvents of [false, true]) test(`AgentRunner releases quarantined c
 		process: { platform: "linux", kill: (_pid, signal) => {
 			if (signal === 0) throw Object.assign(new Error("group probe"), { code: groupGone ? "ESRCH" : "EPERM" });
 		} },
-	}, { askUser: async () => { asks += 1; return answer; }, onFinish: (task) => finishes.push(task.id) });
-	const first = runner.run(request());
+	}, { askUser: async () => { asks += 1; return answer; }, onFinish: (task, snapshot) => { finishes.push(task.id); observations.push(snapshot); } });
+	const first = runner.run(request({ collectResponseObservations: true }));
 	const second = runner.run(request({ prompt: "queued" }));
 	await tick();
 	const waiter = runner.waitFor(first.id);
+	child.emit({ type: "message_end", message: { role: "assistant", stopReason: "aborted", usage: { input: 3 } } });
 	if (lateEvents) child.emit({ type: "extension_ui_request", id: "early", method: "input", title: "Pending?" });
 	runner.cancel(first.id);
 	const grace = timers.find((timer) => timer.ms === 250);
@@ -569,6 +747,9 @@ for (const lateEvents of [false, true]) test(`AgentRunner releases quarantined c
 	assert.equal(store.get(first.id)?.status, TASK_STATUS.FAILED);
 	assert.equal((await waiter).status, TASK_STATUS.FAILED);
 	assert.match(store.get(first.id)?.error ?? "", /cleanup unconfirmed/);
+	assert.equal(observations.length, 1);
+	assert.equal(observations[0]?.agentSettled, false);
+	assert.equal(observations[0]?.responses.length, 1);
 	assert.equal(store.get(second.id)?.status, TASK_STATUS.QUEUED, "the unconfirmed group retains its capacity");
 	assert.equal(timers.filter((timer) => timer.ms === 25 && !timer.cancelled).length, 0, "confirmation polling stops at its deadline");
 	const finished = structuredClone(store.get(first.id));
@@ -598,5 +779,6 @@ for (const lateEvents of [false, true]) test(`AgentRunner releases quarantined c
 	child.exit(0);
 	await tick();
 	assert.deepEqual(finishes, [first.id], "cleanup must not finish the quarantined task twice");
+	assert.equal(observations.length, 1, "late cleanup does not redeliver observations");
 	assert.deepEqual(store.get(first.id), finished);
 });
