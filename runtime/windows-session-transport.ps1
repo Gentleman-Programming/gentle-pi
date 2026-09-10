@@ -307,7 +307,6 @@ public static class WindowsSessionBootstrap {
               if (next == 0) { offset = available; } else { offset += next; }
         }
       }
-      return names.ToArray();
     } finally { Marshal.FreeHGlobal(buffer); }
   }
   public static int EnumeratePresence() { lock (Gate) { if (Presence == IntPtr.Zero) Fail("unavailable"); return EnumeratePinned(Presence).Length; } }

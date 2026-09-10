@@ -108,6 +108,15 @@ test("Windows bootstrap CSharp compile control parser accepts only consistent bo
 	assert.equal(parseCompilerControl('{"kind":"windows-session-csharp-compile-control","success":false,"sourceExtracted":false,"stage":"source-contract","outcome":"not-compiled","errorlist":[]}\n')?.outcome, "not-compiled");
 });
 
+test("Windows bootstrap pinned enumeration has no unreachable post-loop return", async () => {
+	const source = await readFile(runtime, "utf8");
+	const start = source.indexOf("static string[] EnumeratePinned(IntPtr directory)");
+	const end = source.indexOf("public static int EnumeratePresence()", start);
+	assert.ok(start >= 0 && end > start, "source guard: pinned enumeration bounds were not found");
+	const enumeration = source.slice(start, end);
+	assert.equal((enumeration.match(/return names\.ToArray\(\);/g) ?? []).length, 1, "source guard: the infinite enumeration loop must not have a post-loop return");
+});
+
 test("Windows bootstrap CSharp compile control source guard uses an owned created temp root", async () => {
 	const source = await readFile(fixture, "utf8");
 	assert.match(source, /\[System\.Management\.Automation\.Language\.Parser\]::ParseFile\(/);
