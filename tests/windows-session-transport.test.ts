@@ -5,14 +5,14 @@ import { FIXED_WINDOWS_POWERSHELL, WindowsActiveSessionListener, WindowsSessionP
 import type { PresenceRecord } from "../lib/agents-session-transport.ts";
 
 class FakeTransportChild extends EventEmitter {
-	stdin = { writable: true, write: (line: string, callback: (error?: Error) => void) => { this.lines.push(line); callback(); return true; } };
+	stdin = Object.assign(new EventEmitter(), { writable: true, endCalls: 0, write: (line: string, callback: (error?: Error) => void) => { this.lines.push(line); callback(); return true; }, end: () => { this.stdin.endCalls++; } });
 	stdout = new EventEmitter();
 	stderr = new EventEmitter();
 	exitCode: number | null = null;
 	signalCode: NodeJS.Signals | null = null;
 	lines: string[] = [];
 	killCalls = 0;
-	kill() { this.killCalls++; return true; }
+	kill() { this.killCalls++; this.emit("close", 1, null); return true; }
 }
 
 const testEndpoint = "\\\\.\\pipe\\gentle-pi-0123456789abcdef0123456789abcdef";
@@ -98,7 +98,7 @@ test("Windows bridge decodes a bounded base64 notification event before semantic
 
 test("Windows bridge correlates callback acknowledgement and rejects pending RPCs when its host exits", async () => {
 	class FakeChild extends EventEmitter {
-		stdin = { writable: true, write: (line: string, callback: (error?: Error) => void) => { this.lines.push(line); callback(); return true; } };
+		stdin = Object.assign(new EventEmitter(), { writable: true, write: (line: string, callback: (error?: Error) => void) => { this.lines.push(line); callback(); return true; }, end: () => {} });
 		stdout = new EventEmitter();
 		stderr = new EventEmitter();
 		exitCode: number | null = null;
@@ -136,7 +136,7 @@ test("Windows bridge correlates callback acknowledgement and rejects pending RPC
 
 test("Windows bridge keeps ACK capacity separate from ordinary RPCs and suppresses stale generations", async () => {
 	class FakeChild extends EventEmitter {
-		stdin = { writable: true, write: (line: string, callback: (error?: Error) => void) => { this.lines.push(line); callback(); return true; } };
+		stdin = Object.assign(new EventEmitter(), { writable: true, write: (line: string, callback: (error?: Error) => void) => { this.lines.push(line); callback(); return true; }, end: () => {} });
 		stdout = new EventEmitter(); stderr = new EventEmitter(); exitCode: number | null = null; signalCode: NodeJS.Signals | null = null; lines: string[] = [];
 		kill() { return true; }
 	}
@@ -173,6 +173,9 @@ test("Windows listener registers its callback before listen and cancels a start/
 	let stopped: PresenceRecord | undefined;
 	const registry = {
 		setNotification(callback: unknown) { registered = callback; },
+		clearNotification() {},
+		setListenerFailure() {},
+		clearListenerFailure() {},
 		async startListener() { assert.ok(registered, "callback must be registered before listen"); await startGate; return record; },
 		async stopListener(value: PresenceRecord) { stopped = value; },
 		async close() {},
@@ -188,9 +191,9 @@ test("Windows listener registers its callback before listen and cancels a start/
 
 test("Windows bridge isolates a malformed helper wire event and continues with the next valid notification", async () => {
 	class FakeChild extends EventEmitter {
-		stdin = { writable: true, write: (line: string, callback: (error?: Error) => void) => { this.lines.push(line); callback(); return true; } };
+		stdin = Object.assign(new EventEmitter(), { writable: true, write: (line: string, callback: (error?: Error) => void) => { this.lines.push(line); callback(); return true; }, end: () => {} });
 		stdout = new EventEmitter(); stderr = new EventEmitter(); exitCode: number | null = null; signalCode: NodeJS.Signals | null = null; lines: string[] = []; killCalls = 0;
-		kill() { this.killCalls++; return true; }
+		kill() { this.killCalls++; this.emit("close", 1, null); return true; }
 	}
 	const child = new FakeChild();
 	let callbacks = 0;
@@ -240,11 +243,233 @@ test("Windows bridge accepts batched bounded private events beyond the public co
 	child.emit("exit", 1, null);
 });
 
-test("Windows bridge fail-closes oversized unterminated and invalid helper control frames", async () => {
-	for (const line of ["x".repeat(90_000), '{"event":"notification","connectionId":"c1","generation":1,"wire":"not-base64"}', '{"event":"notification","connectionId":"c1","generation":1,"wire":"eA==","extra":true}']) {
+test("Windows bridge fail-closes oversized and malformed helper control frames", async () => {
+	for (const line of ["x".repeat(90_000), '{"event":"notification","connectionId":"c1","generation":1,"wire":"not-base64"}', '{"event":"notification","connectionId":"c1","generation":1,"wire":"eA==","extra":true}', '{"event":"listener-failed","generation":1,"error":"C:\\\\private"}']) {
 		const { child, emit } = await createListeningFakeHost(async () => true);
 		if (line.startsWith("x")) child.stdout.emit("data", Buffer.from(line)); else emit(line);
 		assert.equal(child.killCalls, 1, "invalid helper control input must close its owned child");
 	}
+});
 
+function createListenerBridge() {
+	const child = new FakeTransportChild();
+	const host = new WindowsSessionTransportHost({ spawnProcess: () => child as never });
+	const Registry = WindowsSessionPresenceRegistry as unknown as { new(host: WindowsSessionTransportHost): WindowsSessionPresenceRegistry };
+	const registry = new Registry(host);
+	const emit = (line: string) => child.stdout.emit("data", Buffer.from(`${line}\n`));
+	return { child, host, registry, emit };
+}
+
+async function startBridgeListener(bridge: ReturnType<typeof createListenerBridge>, listener: WindowsActiveSessionListener, requestId: string, createdAt: number) {
+	const starting = listener.start();
+	bridge.emit(`{"requestId":"${requestId}","ok":true,"result":{"version":1,"sessionId":"recipient","endpoint":"${testEndpoint.replaceAll("\\", "\\\\")}","createdAt":${createdAt}}}`);
+	await starting;
+}
+
+test("Windows listener invalidates only its current native generation and clears activation state", async () => {
+	const bridge = createListenerBridge();
+	const ready = bridge.host.start();
+	bridge.emit('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}');
+	await ready;
+	const listener = new WindowsActiveSessionListener(bridge.registry, "recipient", async () => {});
+	await startBridgeListener(bridge, listener, "listen-2", 1);
+	assert.equal(listener.status, "active");
+	assert.ok(listener.record);
+	const pendingAck = bridge.host.request("ack", { connectionId: "connection-1", generation: 1, id: "ack-1", accepted: true });
+	const ackRejected = assert.rejects(pendingAck, /listener failed/);
+	bridge.emit('{"event":"listener-failed","generation":1,"error":"unavailable"}');
+	await ackRejected;
+	await nextTurn();
+	assert.equal(listener.status, "idle");
+	assert.equal(listener.record, undefined);
+	assert.deepEqual(listener.failure, { code: "io_error", message: "listener failed" });
+
+	await startBridgeListener(bridge, listener, "listen-4", 2);
+	bridge.emit('{"event":"listener-failed","generation":1,"error":"unavailable"}');
+	await nextTurn();
+	assert.equal(listener.status, "active", "a stale failure cannot invalidate a replacement listener");
+	assert.equal(listener.record?.createdAt, 2);
+	bridge.child.emit("exit", 1, null);
+});
+
+test("Windows listener failure during a listen reply race cannot reactivate it", async () => {
+	const bridge = createListenerBridge();
+	const ready = bridge.host.start();
+	bridge.emit('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}');
+	await ready;
+	const listener = new WindowsActiveSessionListener(bridge.registry, "recipient", async () => {});
+	const starting = listener.start();
+	const rejected = assert.rejects(starting, /listener failed/);
+	bridge.emit('{"event":"listener-failed","generation":1,"error":"unavailable"}');
+	bridge.emit(`{"requestId":"listen-2","ok":true,"result":{"version":1,"sessionId":"recipient","endpoint":"${testEndpoint.replaceAll("\\", "\\\\")}","createdAt":1}}`);
+	await nextTurn();
+	bridge.emit('{"requestId":"stop-listener-3","ok":true,"result":{"state":"initialized","bootstrap":"complete"}}');
+	await rejected;
+	assert.equal(listener.status, "idle");
+	assert.equal(listener.record, undefined);
+	bridge.child.emit("exit", 1, null);
+});
+
+test("Windows listener propagates unexpected helper exit or abort while normal close remains idempotent", async () => {
+	for (const failure of ["exit", "abort"] as const) {
+		const bridge = createListenerBridge();
+		const ready = bridge.host.start();
+		bridge.emit('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}');
+		await ready;
+		const listener = new WindowsActiveSessionListener(bridge.registry, "recipient", async () => {});
+		await startBridgeListener(bridge, listener, "listen-2", 1);
+		if (failure === "exit") bridge.child.emit("exit", 1, null);
+		else bridge.child.stdout.emit("error", new Error("stdout failed"));
+		assert.equal(listener.status, "idle");
+		assert.equal(listener.record, undefined);
+		assert.deepEqual(listener.failure, { code: "io_error", message: "listener failed" });
+		await listener.close();
+		await listener.close();
+		assert.equal(listener.status, "closed");
+	}
+});
+
+test("Windows listener maps a shared host generation to its replacement object without settling its current ACK for an old failure", async () => {
+	const bridge = createListenerBridge();
+	const ready = bridge.host.start();
+	bridge.emit('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}');
+	await ready;
+	const first = new WindowsActiveSessionListener(bridge.registry, "recipient", async () => {});
+	await startBridgeListener(bridge, first, "listen-2", 1);
+	const stopping = bridge.registry.stopListener(first.record!);
+	bridge.emit('{"requestId":"stop-listener-3","ok":true,"result":{"state":"initialized","bootstrap":"complete"}}');
+	await stopping;
+	const second = new WindowsActiveSessionListener(bridge.registry, "recipient", async () => {});
+	await startBridgeListener(bridge, second, "listen-4", 2);
+	const pendingAck = bridge.host.request("ack", { connectionId: "replacement-1", generation: 2, id: "replacement-ack-1", accepted: true });
+	let ackSettled = false;
+	void pendingAck.then(() => { ackSettled = true; }, () => { ackSettled = true; });
+	bridge.emit('{"event":"listener-failed","generation":1,"error":"unavailable"}');
+	await nextTurn();
+	assert.equal(second.status, "active");
+	assert.equal(ackSettled, false, "an old host failure must not settle the replacement ACK");
+	const ackRejected = assert.rejects(pendingAck, /listener failed/);
+	bridge.emit('{"event":"listener-failed","generation":2,"error":"unavailable"}');
+	await ackRejected;
+	assert.equal(second.status, "idle");
+	assert.equal(second.record, undefined);
+	bridge.child.emit("close", 0, null);
+});
+
+class CleanupFakeChild extends EventEmitter {
+	readonly stdin = Object.assign(new EventEmitter(), { writable: true, endCalls: 0, write: (_line: string, callback: (error?: Error) => void) => { callback(); return true; }, end: () => { this.stdin.endCalls++; } });
+	stdout = new EventEmitter();
+	stderr = new EventEmitter();
+	exitCode: number | null = null;
+	signalCode: NodeJS.Signals | null = null;
+	killCalls = 0;
+	closeObserved = false;
+	private readonly closeOnKill: boolean;
+	constructor(closeOnKill: boolean) {
+		super();
+		this.closeOnKill = closeOnKill;
+		this.on("close", () => { this.closeObserved = true; });
+	}
+	kill() {
+		this.killCalls++;
+		if (this.closeOnKill) this.emit("close", 1, null);
+		return true;
+	}
+}
+
+test("Windows host abort releases its owned child before close and bounds a missing child close", async () => {
+	for (const closeOnKill of [true, false]) {
+		const child = new CleanupFakeChild(closeOnKill);
+		const host = new WindowsSessionTransportHost({ spawnProcess: () => child as never });
+		const ready = host.start();
+		child.stdout.emit("data", Buffer.from('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}\n'));
+		await ready;
+		child.stdout.emit("error", new Error("stdout failed"));
+		assert.equal(child.killCalls, 1, "abort must immediately terminate its owned child");
+		assert.equal(child.stdin.endCalls, 1, "abort must close owned input");
+		if (closeOnKill) {
+			await host.close();
+			assert.equal(child.closeObserved, true);
+		} else await assert.rejects(host.close(), /did not close/);
+	}
+});
+
+test("Windows host disposes only owned lifecycle listeners and retains late error guards until actual close", async () => {
+	const external = () => {};
+	for (const closeOnKill of [true, false]) {
+		const child = new CleanupFakeChild(closeOnKill);
+		child.on("error", external); child.on("close", external);
+		child.stdin.on("error", external); child.stdout.on("data", external); child.stdout.on("error", external); child.stderr.on("error", external);
+		const host = new WindowsSessionTransportHost({ spawnProcess: () => child as never });
+		const ready = host.start();
+		child.stdout.emit("data", Buffer.from('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}\n'));
+		await ready;
+		child.stdout.emit("error", new Error("stdout failed"));
+		if (closeOnKill) {
+			await host.close();
+			assert.equal(child.listenerCount("error"), 1);
+			assert.equal(child.listenerCount("close"), 2, "fixture and external close listeners remain");
+			assert.equal(child.stdin.listenerCount("error"), 1);
+			assert.equal(child.stdout.listenerCount("data"), 1);
+			assert.equal(child.stdout.listenerCount("error"), 1);
+			assert.equal(child.stderr.listenerCount("error"), 1);
+		} else {
+			await assert.rejects(host.close(), /did not close/);
+			assert.equal(child.listenerCount("error"), 2, "late child error sink remains until close");
+			assert.equal(child.listenerCount("close"), 3, "fixture, external, and owned close listeners remain until close");
+			assert.equal(child.stdin.listenerCount("error"), 2);
+			assert.equal(child.stdout.listenerCount("data"), 1, "normal stdout data listener is disposed at timeout");
+			assert.equal(child.stdout.listenerCount("error"), 2);
+			assert.equal(child.stderr.listenerCount("error"), 2);
+			assert.doesNotThrow(() => { child.emit("error", new Error("late child")); child.stdin.emit("error", new Error("late stdin")); child.stdout.emit("error", new Error("late stdout")); child.stderr.emit("error", new Error("late stderr")); });
+			child.emit("close", 1, null);
+			assert.equal(child.listenerCount("error"), 1);
+			assert.equal(child.listenerCount("close"), 2);
+			assert.equal(child.stdin.listenerCount("error"), 1);
+			assert.equal(child.stdout.listenerCount("data"), 1);
+			assert.equal(child.stdout.listenerCount("error"), 1);
+			assert.equal(child.stderr.listenerCount("error"), 1);
+		}
+	}
+});
+
+test("Windows host cleanup handoff removes guards when child close reenters late-guard installation", async () => {
+	const child = new CleanupFakeChild(false);
+	let armed = false;
+	let closedDuringGuardInstall = false;
+	child.on("newListener", (event: string) => {
+		if (armed && !closedDuringGuardInstall && event === "error") {
+			closedDuringGuardInstall = true;
+			child.emit("close", 1, null);
+		}
+	});
+	const host = new WindowsSessionTransportHost({ spawnProcess: () => child as never });
+	const ready = host.start();
+	child.stdout.emit("data", Buffer.from('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}\n'));
+	await ready;
+	armed = true;
+	child.stdout.emit("error", new Error("stdout failed"));
+	await host.close();
+	assert.equal(closedDuringGuardInstall, true);
+	assert.equal(child.listenerCount("error"), 0, "no child guard may be installed after its close");
+	assert.equal(child.stdin.listenerCount("error"), 0);
+	assert.equal(child.stdout.listenerCount("error"), 0);
+	assert.equal(child.stderr.listenerCount("error"), 0);
+	assert.equal(child.listenerCount("close"), 1, "only the fixture close observer remains");
+});
+
+test("Windows host late guards prevent unhandled errors without external error listeners until actual close", async () => {
+	const child = new CleanupFakeChild(false);
+	const host = new WindowsSessionTransportHost({ spawnProcess: () => child as never });
+	const ready = host.start();
+	child.stdout.emit("data", Buffer.from('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}\n'));
+	await ready;
+	child.stdout.emit("error", new Error("stdout failed"));
+	await assert.rejects(host.close(), /did not close/);
+	assert.doesNotThrow(() => { child.emit("error", new Error("late child")); child.stdin.emit("error", new Error("late stdin")); child.stdout.emit("error", new Error("late stdout")); child.stderr.emit("error", new Error("late stderr")); });
+	child.emit("close", 1, null);
+	assert.equal(child.listenerCount("error"), 0);
+	assert.equal(child.stdin.listenerCount("error"), 0);
+	assert.equal(child.stdout.listenerCount("error"), 0);
+	assert.equal(child.stderr.listenerCount("error"), 0);
 });

@@ -35,8 +35,9 @@ const SESSION = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 type HostState = Readonly<{ state: "partial" }> | Readonly<{ state: "initialized"; bootstrap: "complete" }> | Readonly<{ state: "initialized"; bootstrap: "complete"; entries: number }>;
 type HostReply = Readonly<{ requestId: string; ok: boolean; result?: HostState | WindowsRecord | Readonly<{ records: readonly WindowsRecord[] }>; error?: "unavailable" | "unsafe" | "busy" | "not_found" | "invalid" }>;
-type HostEvent = Readonly<{ event: "notification"; connectionId: string; generation: number; frame: NotificationFrame }>;
+type HostEvent = Readonly<{ event: "notification"; connectionId: string; generation: number; frame: NotificationFrame }> | Readonly<{ event: "listener-failed"; generation: number; error: "unavailable" }>;
 type Pending = { kind: "rpc" | "ack"; resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
+type WindowsHostFailureCallback = (generation: number) => void;
 type SpawnedHost = ChildProcessWithoutNullStreams;
 export type WindowsHostCallback = (notification: Readonly<{ connectionId: string; id: string; senderSessionId: string; recipientSessionId: string; message: string }>) => Promise<boolean>;
 export type WindowsSessionTransportHostOptions = Readonly<{
@@ -48,6 +49,43 @@ export type WindowsSessionTransportHostOptions = Readonly<{
 
 const defaultRuntimeScript = fileURLToPath(new URL("../runtime/windows-session-transport.ps1", import.meta.url));
 const safeError = (message: string) => new Error(message);
+// This sink intentionally captures no host state. It prevents a late stream error from
+// becoming unhandled after bounded cleanup times out but before the child confirms close.
+const lateChildErrorSink = () => {};
+type DetachedChildCleanup = Readonly<{ closed: () => boolean; install: () => void; close: () => void }>;
+/**
+ * This state is handed to the child only after host cleanup times out. Its callbacks
+ * retain the child streams and their own exact callback references, never the host.
+ */
+const createDetachedChildCleanup = (child: SpawnedHost): DetachedChildCleanup => {
+	let closed = false;
+	const removeGuards = () => {
+		child.removeListener("error", lateChildErrorSink);
+		child.stdin.removeListener("error", lateChildErrorSink);
+		child.stdout.removeListener("error", lateChildErrorSink);
+		child.stderr.removeListener("error", lateChildErrorSink);
+	};
+	const close = () => {
+		if (closed) return;
+		closed = true;
+		child.removeListener("close", close);
+		removeGuards();
+	};
+	const addGuard = (emitter: NodeJS.EventEmitter) => {
+		if (closed) return;
+		emitter.on("error", lateChildErrorSink);
+		// An external newListener hook can synchronously close the child before on()
+		// returns; remove this just-added guard rather than leaving it after close.
+		if (closed) emitter.removeListener("error", lateChildErrorSink);
+	};
+	const install = () => {
+		if (closed) return;
+		child.once("close", close);
+		if (closed) { child.removeListener("close", close); return; }
+		addGuard(child); addGuard(child.stdin); addGuard(child.stdout); addGuard(child.stderr);
+	};
+	return Object.freeze({ closed: () => closed, install, close });
+};
 /** A syntactically valid private envelope can contain one untrusted pipe frame. */
 class InvalidClientWireError extends Error {}
 const controlId = (value: unknown) => typeof value === "string" && /^[A-Za-z0-9-]{1,128}$/.test(value);
@@ -92,13 +130,17 @@ export function parseWindowsHostFrame(line: string): HostReply {
 	return Object.freeze({ requestId: frame.requestId, ok: false, error: frame.error as HostReply["error"] });
 }
 
-/** Decode the helper's one-frame base64 event before allowing application acknowledgement. */
-export function parseWindowsHostNotification(line: string): HostEvent | undefined {
+/** Decode the helper's bounded private events before allowing application acknowledgement. */
+function parseWindowsHostEvent(line: string): HostEvent | undefined {
 	if (typeof line !== "string" || Buffer.byteLength(line, "utf8") > MAX_PRIVATE_EVENT_BYTES) throw safeError("invalid Windows transport frame");
 	let value: unknown;
 	try { value = JSON.parse(line); } catch { throw safeError("invalid Windows transport frame"); }
 	if (!value || typeof value !== "object" || Array.isArray(value) || hasPrivateData(value)) throw safeError("invalid Windows transport frame");
 	const event = value as Record<string, unknown>;
+	if (event.event === "listener-failed") {
+		if (Object.keys(event).length !== 3 || !Number.isSafeInteger(event.generation) || (event.generation as number) < 1 || (event.generation as number) > 0x7fffffff || event.error !== "unavailable") throw safeError("invalid Windows transport frame");
+		return Object.freeze({ event: "listener-failed", generation: event.generation as number, error: "unavailable" });
+	}
 	if (event.event !== "notification") return undefined;
 	if (Object.keys(event).length !== 4 || !controlId(event.connectionId) || !Number.isSafeInteger(event.generation) || (event.generation as number) < 1 || (event.generation as number) > 0x7fffffff || typeof event.wire !== "string" || event.wire.length > MAX_PRIVATE_WIRE_BASE64_BYTES || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(event.wire)) throw safeError("invalid Windows transport frame");
 	let bytes: Buffer;
@@ -112,6 +154,12 @@ export function parseWindowsHostNotification(line: string): HostEvent | undefine
 		if (frame.kind !== "notification") throw new Error();
 		return Object.freeze({ event: "notification", connectionId: event.connectionId as string, generation: event.generation as number, frame });
 	} catch { throw new InvalidClientWireError("invalid client wire frame"); }
+}
+
+/** Decode a notification event while preserving the existing public notification parser. */
+export function parseWindowsHostNotification(line: string): Extract<HostEvent, { event: "notification" }> | undefined {
+	const event = parseWindowsHostEvent(line);
+	return event?.event === "notification" ? event : undefined;
 }
 
 export class WindowsSessionTransportHost {
@@ -128,7 +176,24 @@ export class WindowsSessionTransportHost {
 	private pendingAcks = 0;
 	private listenerGeneration = 0;
 	private listenerActive = false;
+	private listenerFailure?: WindowsHostFailureCallback;
 	private stopped = false;
+	private childClosed = false;
+	private inputClosed = false;
+	private childKillRequested = false;
+	private cleanup?: Promise<void>;
+	private resolveCleanup?: () => void;
+	private rejectCleanup?: (error: Error) => void;
+	private cleanupTimer?: ReturnType<typeof setTimeout>;
+	private readonly onStdoutData = (chunk: Buffer) => this.onOutput(chunk);
+	private readonly onStdoutError = () => this.abort("Windows transport host unavailable", true);
+	private readonly onStdinError = () => this.abort("Windows transport host unavailable", true);
+	private readonly onStderrError = () => this.abort("Windows transport host unavailable", true);
+	private readonly onChildError = () => this.abort("Windows transport host unavailable", true);
+	private readonly onChildExit = () => this.abort("Windows transport host exited");
+	private readonly onChildClose = () => this.handleChildClose();
+	// Set only while handing close ownership from the host observer to detached state.
+	private handoffCloseState?: DetachedChildCleanup;
 
 	constructor(options: WindowsSessionTransportHostOptions = {}) {
 		this.runtimeScript = options.runtimeScript ?? defaultRuntimeScript;
@@ -144,11 +209,14 @@ export class WindowsSessionTransportHost {
 		try {
 			this.child = this.spawnProcess(FIXED_WINDOWS_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", this.runtimeScript], { shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }) as SpawnedHost;
 		} catch { return Promise.reject(safeError("Windows transport host unavailable")); }
-		this.child.stdout.on("data", (chunk: Buffer) => this.onOutput(chunk));
-		this.child.stdout.on("error", () => this.abort("Windows transport host unavailable"));
+		this.child.stdout.on("data", this.onStdoutData);
+		this.child.stdout.on("error", this.onStdoutError);
+		this.child.stdin.on("error", this.onStdinError);
+		this.child.stderr.on("error", this.onStderrError);
 		this.child.stderr.resume?.();
-		this.child.once("error", () => this.abort("Windows transport host unavailable"));
-		this.child.once("exit", () => this.abort("Windows transport host exited"));
+		this.child.once("error", this.onChildError);
+		this.child.once("exit", this.onChildExit);
+		this.child.once("close", this.onChildClose);
 		this.started = this.request("start", {}).then((result) => {
 			if (result.state !== "partial") throw safeError("Windows transport host unavailable");
 		});
@@ -172,11 +240,19 @@ export class WindowsSessionTransportHost {
 		});
 	}
 
+	setListenerFailure(callback?: WindowsHostFailureCallback) { this.listenerFailure = callback; }
+
 	async listen(sessionId: string, createdAt = Date.now()): Promise<WindowsRecord> {
-		const result = validRecord(await this.request("listen", { sessionId, createdAt }));
-		this.listenerGeneration++;
+		const generation = ++this.listenerGeneration;
 		this.listenerActive = true;
-		return result;
+		try {
+			const result = validRecord(await this.request("listen", { sessionId, createdAt }));
+			if (!this.listenerActive || this.listenerGeneration !== generation) throw safeError("Windows transport listener failed");
+			return result;
+		} catch (error) {
+			if (this.listenerGeneration === generation) this.listenerActive = false;
+			throw error;
+		}
 	}
 
 	async stopListener(record: PresenceRecord) {
@@ -186,14 +262,14 @@ export class WindowsSessionTransportHost {
 
 	async close() {
 		this.listenerActive = false;
-		if (this.stopped) return;
+		if (this.cleanup) return this.cleanup;
 		const child = this.child;
 		if (!child) { this.stopped = true; return; }
-		if (!this.stopped) await this.request("shutdown", {}).catch(() => {});
-		this.stopped = true;
-		if (child.exitCode !== null || child.signalCode !== null) return;
-		await new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_GRACE_MS));
-		if (child.exitCode === null && child.signalCode === null) child.kill();
+		if (!this.stopped) {
+			await this.request("shutdown", {}).catch(() => {});
+			this.stopped = true;
+		}
+		await this.releaseOwnedChild(false);
 	}
 
 	private onOutput(chunk: Buffer) {
@@ -218,8 +294,12 @@ export class WindowsSessionTransportHost {
 				line = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 			} catch { this.abort("Windows transport host unavailable", true); return; }
 			try {
-				const event = parseWindowsHostNotification(line);
-				if (event) { void this.acknowledge(event); continue; }
+				const event = parseWindowsHostEvent(line);
+				if (event) {
+					if (event.event === "notification") void this.acknowledge(event);
+					else this.failListener(event.generation);
+					continue;
+				}
 				const reply = parseWindowsHostFrame(line);
 				this.settle(reply.requestId, reply.ok ? undefined : safeError("Windows transport request unavailable"), reply.result);
 			} catch (error) {
@@ -231,7 +311,7 @@ export class WindowsSessionTransportHost {
 		}
 	}
 
-	private async acknowledge(event: HostEvent) {
+	private async acknowledge(event: Extract<HostEvent, { event: "notification" }>) {
 		if (this.stopped || !this.listenerActive || event.generation !== this.listenerGeneration) return;
 		const callback = this.callback;
 		let timer: ReturnType<typeof setTimeout> | undefined;
@@ -252,13 +332,108 @@ export class WindowsSessionTransportHost {
 		if (pending.kind === "ack") this.pendingAcks--; else this.pendingRpcs--;
 		if (error) pending.reject(error); else pending.resolve(result ?? {});
 	}
+	private failListener(generation: number) {
+		if (this.stopped || !this.listenerActive || generation !== this.listenerGeneration) return;
+		this.listenerActive = false;
+		for (const [id, pending] of [...this.pending]) if (pending.kind === "ack") this.settle(id, safeError("Windows transport listener failed"));
+		try { this.listenerFailure?.(generation); } catch {}
+	}
+	private detachOwnedListeners(keepClose: boolean) {
+		const child = this.child;
+		if (!child) return;
+		child.stdout.removeListener("data", this.onStdoutData);
+		child.stdout.removeListener("error", this.onStdoutError);
+		child.stdin.removeListener("error", this.onStdinError);
+		child.stderr.removeListener("error", this.onStderrError);
+		child.removeListener("error", this.onChildError);
+		child.removeListener("exit", this.onChildExit);
+		if (!keepClose) child.removeListener("close", this.onChildClose);
+	}
+	private handOffTimedOutClose(child: SpawnedHost) {
+		const detached = createDetachedChildCleanup(child);
+		this.handoffCloseState = detached;
+		detached.install();
+		if (!detached.closed()) child.removeListener("close", this.onChildClose);
+		this.handoffCloseState = undefined;
+		return detached.closed();
+	}
+	private handleChildClose() {
+		this.childClosed = true;
+		if (this.cleanupTimer) clearTimeout(this.cleanupTimer);
+		this.cleanupTimer = undefined;
+		this.handoffCloseState?.close();
+		if (!this.stopped) this.abort("Windows transport host exited");
+		this.detachOwnedListeners(false);
+		const resolve = this.resolveCleanup;
+		this.resolveCleanup = undefined;
+		this.rejectCleanup = undefined;
+		this.cleanup = undefined;
+		this.output = Buffer.alloc(0);
+		this.child = undefined;
+		resolve?.();
+	}
+	private closeInput() {
+		if (this.inputClosed) return;
+		this.inputClosed = true;
+		try { this.child?.stdin.end(); } catch {}
+	}
+	private failCleanup() {
+		if (this.childClosed) return;
+		this.cleanupTimer = undefined;
+		const child = this.child;
+		if (!child) return;
+		// Timeout is not physical closure. Hand close/error safety to callbacks that
+		// capture only this child and its streams, then release host protocol state.
+		this.detachOwnedListeners(true);
+		const closedDuringHandoff = this.handOffTimedOutClose(child);
+		this.output = Buffer.alloc(0);
+		this.child = undefined;
+		if (closedDuringHandoff) return;
+		const reject = this.rejectCleanup;
+		this.resolveCleanup = undefined;
+		this.rejectCleanup = undefined;
+		reject?.(safeError("Windows transport host did not close"));
+	}
+	private requestChildKill() {
+		if (this.childClosed || this.childKillRequested) return;
+		this.childKillRequested = true;
+		try { this.child?.kill(); } catch {}
+	}
+	private scheduleCleanupKill() {
+		if (this.childClosed || this.childKillRequested) return;
+		if (this.cleanupTimer) clearTimeout(this.cleanupTimer);
+		this.cleanupTimer = setTimeout(() => {
+			this.cleanupTimer = undefined;
+			this.requestChildKill();
+			if (!this.childClosed) this.cleanupTimer = setTimeout(() => this.failCleanup(), SHUTDOWN_GRACE_MS);
+		}, SHUTDOWN_GRACE_MS);
+	}
+	private releaseOwnedChild(killNow: boolean): Promise<void> {
+		if (this.cleanup) return this.cleanup;
+		const child = this.child;
+		if (!child) return Promise.resolve();
+		if (!this.cleanup) {
+			if (this.childClosed) return Promise.resolve();
+			this.cleanup = new Promise<void>((resolve, reject) => { this.resolveCleanup = resolve; this.rejectCleanup = reject; });
+		}
+		const cleanup = this.cleanup;
+		this.closeInput();
+		if (killNow) {
+			if (this.cleanupTimer) clearTimeout(this.cleanupTimer);
+			this.cleanupTimer = undefined;
+			this.requestChildKill();
+			if (!this.childClosed) this.cleanupTimer = setTimeout(() => this.failCleanup(), SHUTDOWN_GRACE_MS);
+		} else this.scheduleCleanupKill();
+		return cleanup;
+	}
 	private abort(message: string, closeChild = false) {
 		if (this.stopped) return;
+		const generation = this.listenerActive ? this.listenerGeneration : undefined;
 		this.stopped = true;
 		this.listenerActive = false;
 		for (const id of [...this.pending.keys()]) this.settle(id, safeError(message));
-		const child = this.child;
-		if (closeChild && child && child.exitCode === null && child.signalCode === null) { try { child.kill(); } catch {} }
+		if (generation !== undefined) { try { this.listenerFailure?.(generation); } catch {} }
+		void this.releaseOwnedChild(closeChild).catch(() => {});
 	}
 }
 
@@ -278,7 +453,11 @@ export class WindowsSessionPresenceRegistry {
 	readonly paths = Object.freeze({ root: "", presence: "", sockets: "" });
 	private readonly host: WindowsSessionTransportHost;
 	private notification?: WindowsHostCallback;
-	private constructor(host: WindowsSessionTransportHost) { this.host = host; }
+	private listenerFailure?: WindowsHostFailureCallback;
+	private constructor(host: WindowsSessionTransportHost) {
+		this.host = host;
+		this.host.setListenerFailure((generation) => this.listenerFailure?.(generation));
+	}
 	static async create(agentHome: string) {
 		if (process.platform !== "win32") throw new SessionPresenceError("io_error", "transport I/O failed");
 		if (typeof agentHome !== "string" || !/^[A-Za-z]:\\/.test(agentHome)) throw new SessionPresenceError("unsafe_path", "unsafe transport path");
@@ -292,7 +471,10 @@ export class WindowsSessionPresenceRegistry {
 			return registry;
 		} catch { await host.close(); registryError(undefined); }
 	}
-	setNotification(callback: WindowsHostCallback) { this.notification = callback; }
+	setNotification(callback?: WindowsHostCallback) { this.notification = callback; }
+	clearNotification(callback: WindowsHostCallback) { if (this.notification === callback) this.notification = undefined; }
+	setListenerFailure(callback?: WindowsHostFailureCallback) { this.listenerFailure = callback; }
+	clearListenerFailure(callback: WindowsHostFailureCallback) { if (this.listenerFailure === callback) this.listenerFailure = undefined; }
 	async record(sessionId: string, createdAt = Date.now()) { try { return validRecord(await this.host.request("record", { sessionId, createdAt })); } catch { registryError(undefined); } }
 	presencePath(_record: PresenceRecord) { throw new SessionPresenceError("unsafe_path", "unsafe transport path"); }
 	async publish(record: PresenceRecord) { try { await this.host.request("publish", { record: validRecord(record as unknown as Record<string, unknown>) }); } catch { registryError(undefined); } }
@@ -318,6 +500,8 @@ export class WindowsActiveSessionListener {
 	private state: "idle" | "starting" | "active" | "closed" = "idle";
 	private generation = 0;
 	private resolveClosed!: () => void;
+	private readonly notification = (notification: Readonly<{ connectionId: string; id: string; senderSessionId: string; recipientSessionId: string; message: string }>) => this.receive(notification);
+	private listenerFailure?: WindowsHostFailureCallback;
 	constructor(registry: WindowsSessionPresenceRegistry, sessionID: string, onNotification: (notification: ReceivedNotification) => Promise<void>) { this.registry = registry; this.sessionID = sessionID; this.onNotification = onNotification; this.closed = new Promise((resolve) => { this.resolveClosed = resolve; }); }
 	get status() { return this.state; }
 	get activeConnections() { return 0; }
@@ -325,16 +509,51 @@ export class WindowsActiveSessionListener {
 		if (this.state !== "idle") return;
 		const generation = ++this.generation;
 		this.state = "starting";
-		this.registry.setNotification((notification) => this.receive(notification));
+		this.registry.setNotification(this.notification);
+		// Host generations are shared by the helper. This closure binds its validated
+		// current host generation to this object's independent local start token.
+		const listenerFailure: WindowsHostFailureCallback = () => this.fail(generation);
+		this.listenerFailure = listenerFailure;
+		this.registry.setListenerFailure(listenerFailure);
 		try {
 			const record = await this.registry.startListener(this.sessionID);
-			if (this.state === "closed" || this.generation !== generation) { await this.registry.stopListener(record); throw new SessionPresenceError("io_error", "listener is closed"); }
+			if (this.state !== "starting" || this.generation !== generation) {
+				await this.registry.stopListener(record);
+				throw new SessionPresenceError("io_error", this.state === "closed" ? "listener is closed" : "listener failed");
+			}
 			this.record = record;
 			this.state = "active";
-		} catch (error) { if (this.state !== "closed" && this.generation === generation) this.state = "idle"; throw error; }
+		} catch (error) {
+			const failed = this.state === "idle" && this.generation === generation && this.failure !== undefined;
+			if (this.state !== "closed" && this.generation === generation) this.state = "idle";
+			if (failed) throw new SessionPresenceError("io_error", "listener failed");
+			throw error;
+		}
 	}
 	async receive(notification: Readonly<{ id: string; senderSessionId: string; recipientSessionId: string; message: string }>) { if ((this.state !== "starting" && this.state !== "active") || notification.recipientSessionId !== this.sessionID) return false; try { await this.onNotification(Object.freeze({ id: notification.id, senderSessionId: notification.senderSessionId, message: notification.message })); return true; } catch { return false; } }
-	async close() { if (this.state === "closed") return; this.generation++; this.state = "closed"; if (this.record) await this.registry.stopListener(this.record); await this.registry.close(); this.resolveClosed(); }
+	private fail(generation: number) {
+		if ((this.state !== "starting" && this.state !== "active") || this.generation !== generation) return;
+		const listenerFailure = this.listenerFailure;
+		this.record = undefined;
+		this.failure = Object.freeze({ code: "io_error", message: "listener failed" });
+		this.state = "idle";
+		this.registry.clearNotification(this.notification);
+		if (listenerFailure) this.registry.clearListenerFailure(listenerFailure);
+		if (this.listenerFailure === listenerFailure) this.listenerFailure = undefined;
+	}
+	async close() {
+		if (this.state === "closed") return;
+		this.generation++;
+		this.state = "closed";
+		const record = this.record;
+		const listenerFailure = this.listenerFailure;
+		this.record = undefined;
+		this.listenerFailure = undefined;
+		this.registry.clearNotification(this.notification);
+		if (listenerFailure) this.registry.clearListenerFailure(listenerFailure);
+		try { if (record) await this.registry.stopListener(record); }
+		finally { try { await this.registry.close(); } finally { this.resolveClosed(); } }
+	}
 }
 
 export class WindowsActiveSessionClient {

@@ -1094,6 +1094,27 @@ test("Windows listener source guard publishes only from its Gate-protected readi
 	assert.doesNotMatch(failure, /RemoveOwn\(/);
 });
 
+test("Windows listener failure source guard emits only a fixed post-cleanup generation event", async (t) => {
+	t.diagnostic("source guard, not native Windows proof");
+	const source = await readFile(runtime, "utf8");
+	const reportStart = source.indexOf("static void ReportListenerFailure(");
+	const reportEnd = source.indexOf("static void FailListener(", reportStart);
+	assert.ok(reportStart >= 0 && reportEnd > reportStart, "source guard: failure reporter was not found");
+	const report = source.slice(reportStart, reportEnd);
+	assert.match(report, /ThreadPool\.QueueUserWorkItem/);
+	assert.match(report, /WriteControl\("\{\\"event\\":\\"listener-failed\\",\\"generation\\":" \+ generation\.ToString\(System\.Globalization\.CultureInfo\.InvariantCulture\) \+ ",\\"error\\":\\"unavailable\\"\}"\)/);
+	assert.doesNotMatch(report, /lock\s*\(Gate\)/);
+	const failureStart = reportEnd;
+	const failureEnd = source.indexOf("static void ClosePipe", failureStart);
+	assert.ok(failureEnd > failureStart, "source guard: failed-listener cleanup was not found");
+	const failure = source.slice(failureStart, failureEnd);
+	assert.match(failure, /RemoveListenerPublication\(listener\)[\s\S]*?foreach \(PipeClient client in listener\.Clients\.ToArray\(\)\) ClosePipe\(client\);[\s\S]*?ReportListenerFailure\(listener\.Generation\);/);
+	const stopStart = source.indexOf("public static void StopListener(");
+	const stopEnd = source.indexOf("public static void Initialize", stopStart);
+	assert.ok(stopEnd > stopStart, "source guard: explicit listener stop was not found");
+	assert.doesNotMatch(source.slice(stopStart, stopEnd), /ReportListenerFailure\(/);
+});
+
 test("Windows listener source guard retains owned pipe continuity across the last close", async (t) => {
 	t.diagnostic("source guard, not native Windows proof");
 	const source = await readFile(runtime, "utf8");

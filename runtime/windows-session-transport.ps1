@@ -506,6 +506,13 @@ public static class WindowsSessionBootstrap {
           try { AssertPipeOwned(pipe, listener.Sid); return pipe; } catch { pipe.Dispose(); throw; }
         } finally { Close(handle); if (attributes != IntPtr.Zero) Marshal.FreeHGlobal(attributes); if (descriptor != IntPtr.Zero) Marshal.FreeHGlobal(descriptor); }
       }
+      // Native failure notification has a fixed schema and is queued only after Gate-owned
+      // cleanup, so stdout backpressure cannot delay timer or handle release transitions.
+      static void ReportListenerFailure(int generation) {
+        ThreadPool.QueueUserWorkItem(delegate(object ignored) {
+          try { WriteControl("{\"event\":\"listener-failed\",\"generation\":" + generation.ToString(System.Globalization.CultureInfo.InvariantCulture) + ",\"error\":\"unavailable\"}"); } catch {}
+        });
+      }
       static void FailListener(OwnedListener listener) {
             if (listener == null || listener.Stopped) return;
             listener.Stopped = true;
@@ -514,6 +521,7 @@ public static class WindowsSessionBootstrap {
             try { RemoveListenerPublication(listener); } catch {}
             foreach (PipeClient client in listener.Clients.ToArray()) ClosePipe(client);
             if (Listener == listener) Listener = null;
+            ReportListenerFailure(listener.Generation);
           }
           static void ClosePipe(PipeClient client) {
         if (client == null || client.Closed) return;
