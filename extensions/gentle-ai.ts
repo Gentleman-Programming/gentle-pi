@@ -273,18 +273,20 @@ function packageAssetDiagnosticLines(cwd: string): string[] {
 
 function localAgentOverrideCount(cwd: string, owner: PackageAssetOwner): number {
 	const packageSddAgentsDir = join(ASSETS_DIR, "agents");
-	const packageSddAgentNames = existsSync(packageSddAgentsDir)
-		? new Set(
-				readdirSync(packageSddAgentsDir, { withFileTypes: true })
-					.filter((entry) => entry.isFile() && getPackageAssetOwner(`agents/${entry.name}`) === owner)
-					.map((entry) => entry.name),
+	const packageSddAgentNames = new Set(
+		listAgentsFromDir(packageSddAgentsDir, "builtin")
+			.filter((agent) =>
+				getPackageAssetOwner(
+					`agents/${relative(packageSddAgentsDir, agent.filePath).split(sep).join("/")}`,
+				) === owner,
 			)
-		: new Set<string>();
+			.map((agent) => agent.name),
+	);
 	let count = 0;
-	for (const { dir, packageManaged } of discoverableNonBuiltinAgentRoots(cwd)) {
+	for (const { dir, source, packageManaged } of discoverableNonBuiltinAgentRoots(cwd)) {
 		if (packageManaged || !existsSync(dir)) continue;
-		for (const entry of readdirSync(dir, { withFileTypes: true })) {
-			if (entry.isFile() && packageSddAgentNames.has(entry.name)) count += 1;
+		for (const agent of listAgentsFromDir(dir, source)) {
+			if (packageSddAgentNames.has(agent.name)) count += 1;
 		}
 	}
 	return count;
@@ -1959,11 +1961,17 @@ function discoverableNonBuiltinAgentRoots(cwd: string): DiscoverableNonBuiltinAg
 		}
 		const existing = unique.get(canonical);
 		if (existing) {
-			// Later roots keep their existing discovery precedence even when two
-			// configured paths resolve to the same physical directory.
-			existing.dir = root.dir;
-			existing.source = root.source;
-			existing.packageManaged ||= root.packageManaged;
+			// Reinsert so a later alias keeps true later-root precedence even when
+			// another physical root appears between the duplicate entries. A merged
+			// package-managed root must keep its installer-owned path: ownership
+			// updates validate that lexical path against the managed manifest root.
+			const managedRoot = existing.packageManaged ? existing : root.packageManaged ? root : undefined;
+			unique.delete(canonical);
+			unique.set(canonical, {
+				dir: managedRoot?.dir ?? root.dir,
+				source: root.source,
+				packageManaged: managedRoot !== undefined,
+			});
 		} else unique.set(canonical, root);
 	}
 	return [...unique.values()];
@@ -2224,22 +2232,27 @@ export function applyModelConfig(
 			skipped += 1;
 			continue;
 		}
-		if (updateSubagentModelProfile(cwd, agent.source, agent.name, entry)) updated += 1;
-		else skipped += 1;
-		if (agent.source === "builtin") continue;
+		if (agent.source === "builtin") {
+			if (updateSubagentModelProfile(cwd, agent.source, agent.name, entry)) updated += 1;
+			else skipped += 1;
+			continue;
+		}
 		if (!agent.filePath || !existsSync(agent.filePath)) {
 			skipped += 1;
-			continue;
+		} else {
+			const original = readFileSync(agent.filePath, "utf8");
+			const next = updateFrontmatterRouting(original, entry);
+			if (next === original) {
+				skipped += 1;
+			} else {
+				if (!updatePackageManagedSddAgentOwnership(agent.filePath, original, next)) {
+					writeFileSync(agent.filePath, next);
+				}
+				updated += 1;
+			}
 		}
-		const original = readFileSync(agent.filePath, "utf8");
-		const next = updateFrontmatterRouting(original, entry);
-		if (next === original) {
-			skipped += 1;
-			continue;
-		}
-		writeFileSync(agent.filePath, next);
-		updatePackageManagedSddAgentOwnership(agent.filePath, original, next);
-		updated += 1;
+		if (updateSubagentModelProfile(cwd, agent.source, agent.name, entry)) updated += 1;
+		else skipped += 1;
 	}
 	for (const [name, entry] of Object.entries(config)) {
 		if (!seenAgents.has(name) && isClearRoutingEntry(entry)) {
@@ -2264,23 +2277,29 @@ export async function applyModelConfigAsync(
 			skipped += 1;
 			continue;
 		}
+		if (agent.source === "builtin") {
+			if (await updateSubagentModelProfileAsync(cwd, agent.source, agent.name, entry))
+				updated += 1;
+			else skipped += 1;
+			continue;
+		}
+		if (!agent.filePath || !(await pathExists(agent.filePath))) {
+			skipped += 1;
+		} else {
+			const original = await readFile(agent.filePath, "utf8");
+			const next = updateFrontmatterRouting(original, entry);
+			if (next === original) {
+				skipped += 1;
+			} else {
+				if (!updatePackageManagedSddAgentOwnership(agent.filePath, original, next)) {
+					await writeFile(agent.filePath, next);
+				}
+				updated += 1;
+			}
+		}
 		if (await updateSubagentModelProfileAsync(cwd, agent.source, agent.name, entry))
 			updated += 1;
 		else skipped += 1;
-		if (agent.source === "builtin") continue;
-		if (!agent.filePath || !(await pathExists(agent.filePath))) {
-			skipped += 1;
-			continue;
-		}
-		const original = await readFile(agent.filePath, "utf8");
-		const next = updateFrontmatterRouting(original, entry);
-		if (next === original) {
-			skipped += 1;
-			continue;
-		}
-		await writeFile(agent.filePath, next);
-		updatePackageManagedSddAgentOwnership(agent.filePath, original, next);
-		updated += 1;
 	}
 	for (const [name, entry] of Object.entries(config)) {
 		if (!seenAgents.has(name) && isClearRoutingEntry(entry)) {

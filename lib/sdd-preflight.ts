@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -433,10 +433,36 @@ function migrateLegacyAssetContent(
 	return updateAgentFrontmatterRouting(packagedContent, routingLines);
 }
 
+function replaceManagedAssetFileAtomically(path: string, content: string): void {
+	const temporaryPath = join(dirname(path), `.${randomUUID()}.tmp`);
+	let mode: number | undefined;
+	try {
+		const stat = lstatSync(path);
+		if (stat.isFile()) mode = stat.mode & 0o777;
+	} catch (error) {
+		if (!isRecord(error) || error.code !== "ENOENT") throw error;
+	}
+	try {
+		writeFileSync(temporaryPath, content, {
+			encoding: "utf8",
+			flag: "wx",
+			...(mode === undefined ? {} : { mode }),
+		});
+		renameSync(temporaryPath, path);
+	} finally {
+		try {
+			unlinkSync(temporaryPath);
+		} catch {
+			// A renamed or otherwise inaccessible temporary file needs no further action.
+		}
+	}
+}
+
 export function updatePackageManagedSddAgentOwnership(
 	installedPath: string,
 	previousContent: string,
 	nextContent: string,
+	lockOptions?: PackageAssetInstallLockOptions,
 ): boolean {
 	const agentHome = gentlePiAgentHome();
 	const relativePath = relative(join(agentHome, "agents"), installedPath);
@@ -449,21 +475,42 @@ export function updatePackageManagedSddAgentOwnership(
 		return false;
 	}
 	const ownershipKey = `agents/${relativePath.split(sep).join("/")}`;
-	try {
-		return withManagedAssetsLock(agentHome, () => {
-			const manifestPath = join(agentHome, "gentle-ai", MANAGED_ASSETS_MANIFEST);
-			const manifest = readManagedAssetsManifest(manifestPath);
-			if (manifest.assets[ownershipKey] !== managedAssetHash(previousContent)) {
-				return false;
+	return withManagedAssetsLock(agentHome, () => {
+		const manifestPath = join(agentHome, "gentle-ai", MANAGED_ASSETS_MANIFEST);
+		const manifest = readManagedAssetsManifest(manifestPath);
+		if (manifest.assets[ownershipKey] !== managedAssetHash(previousContent)) {
+			return false;
+		}
+		const installedContent = readFileSync(installedPath, "utf8");
+		// The next-content branch preserves the prior internal caller contract:
+		// callers that wrote the file before this function still receive a managed
+		// manifest update. New callers take the previous-content branch below so
+		// the file and manifest update share this lock.
+		if (installedContent !== nextContent && installedContent !== previousContent) {
+			return false;
+		}
+		try {
+			if (installedContent === previousContent) {
+				replaceManagedAssetFileAtomically(installedPath, nextContent);
 			}
-			if (readFileSync(installedPath, "utf8") !== nextContent) return false;
 			manifest.assets[ownershipKey] = managedAssetHash(nextContent);
-			writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
-			return true;
-		}, undefined);
-	} catch {
-		return false;
-	}
+			replaceManagedAssetFileAtomically(
+				manifestPath,
+				JSON.stringify(manifest, null, 2),
+			);
+		} catch (error) {
+			try {
+				replaceManagedAssetFileAtomically(installedPath, previousContent);
+			} catch (rollbackError) {
+				throw new Error(
+					`Managed routing update failed and could not restore ${installedPath}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+					{ cause: error },
+				);
+			}
+			throw error;
+		}
+		return true;
+	}, lockOptions);
 }
 
 export function hasPackageAssetOwnerInstallation(owner: PackageAssetOwner): boolean {

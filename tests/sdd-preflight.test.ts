@@ -126,7 +126,13 @@ function spawnOwnerInstall(agentHome: string, owner: "delegation" | "review", ho
 	return { completion, hasExited: () => exited };
 }
 
-test("managed ownership update waits for installer lock and preserves other owners", async () => {
+test("managed asset replacements use exclusive same-directory temporary files", () => {
+	const source = readFileSync(join(import.meta.dirname, "..", "lib", "sdd-preflight.ts"), "utf8");
+	assert.match(source, /function replaceManagedAssetFileAtomically\([\s\S]*?flag: "wx"/);
+	assert.match(source, /renameSync\(temporaryPath, path\)/);
+});
+
+test("managed ownership update waits for installer lock and atomically updates the file and manifest", async () => {
 	const agentHome = await workspace();
 	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
 	try {
@@ -135,16 +141,45 @@ test("managed ownership update waits for installer lock and preserves other owne
 		const target = join(agentHome, "agents", "sdd-apply.md");
 		const previous = readFileSync(target, "utf8");
 		const next = `${previous}\nmanaged routing update\n`;
-		writeFileSync(target, next);
 		const held = spawnOwnerInstall(agentHome, "delegation", 400);
 		await waitForFile(join(agentHome, "gentle-ai", "managed-assets.lock"));
 		const startedAt = Date.now();
 		assert.equal(updatePackageManagedSddAgentOwnership(target, previous, next), true);
 		assert.ok(Date.now() - startedAt >= 250, "ownership update must not bypass an active installer lock");
 		await held.completion;
+		assert.equal(readFileSync(target, "utf8"), next, "the managed file must be written under the installer lock");
 		const manifest = JSON.parse(readFileSync(join(agentHome, "gentle-ai", "managed-assets.json"), "utf8")) as { assets: Record<string, string> };
 		assert.ok(manifest.assets["agents/gentle-ai-worker.md"], "delegation ownership must survive the routed SDD update");
 		assert.equal(manifest.assets["agents/sdd-apply.md"], createHash("sha256").update(next).digest("hex"));
+	} finally {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		rmSync(agentHome, { recursive: true, force: true });
+	}
+});
+
+test("managed ownership update exposes lock timeout without writing a partial routed file", async () => {
+	const agentHome = await workspace();
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	try {
+		process.env.GENTLE_PI_AGENT_HOME = agentHome;
+		installPackageAssets(agentHome, false, ["sdd"]);
+		const target = join(agentHome, "agents", "sdd-apply.md");
+		const previous = readFileSync(target, "utf8");
+		const next = `${previous}\nmanaged routing update\n`;
+		const manifestPath = join(agentHome, "gentle-ai", "managed-assets.json");
+		const manifestBefore = readFileSync(manifestPath, "utf8");
+		writeFileSync(
+			join(agentHome, "gentle-ai", "managed-assets.lock"),
+			JSON.stringify({ schemaVersion: 1, token: "foreign", pid: process.pid, createdAtMs: Date.now() }),
+		);
+
+		assert.throws(
+			() => updatePackageManagedSddAgentOwnership(target, previous, next, { timeoutMs: 0 }),
+			/Timed out acquiring managed-assets lock file/i,
+		);
+		assert.equal(readFileSync(target, "utf8"), previous, "a timed-out managed update must not write the agent file");
+		assert.equal(readFileSync(manifestPath, "utf8"), manifestBefore, "a timed-out managed update must not write the manifest");
 	} finally {
 		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
 		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;

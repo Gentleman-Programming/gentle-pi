@@ -1640,15 +1640,33 @@ async function run() {
 			[join(staleAssetsCwd, ".pi", "subagents"), "sdd-sync.md"],
 		]) {
 			await mkdir(dir, { recursive: true });
-			await writeFile(join(dir, name), "intentional SDD override\n");
+			await writeFile(
+				join(dir, name),
+				`---\nname: ${name.replace(/\.md$/, "")}\n---\nintentional SDD override\n`,
+			);
 		}
+		await mkdir(join(diagnosticsAgentHome, "subagents", "nested"), { recursive: true });
+		await mkdir(join(diagnosticsAgentHome, "agents", "nested"), { recursive: true });
+		await mkdir(join(staleAssetsCwd, ".agents", "skills", "ignored"), { recursive: true });
+		await writeFile(
+			join(diagnosticsAgentHome, "subagents", "nested", "renamed-agent.md"),
+			"---\nname: sdd-apply\n---\nintentional nested SDD override\n",
+		);
+		await writeFile(
+			join(diagnosticsAgentHome, "agents", "nested", "managed-copy.md"),
+			"---\nname: sdd-apply\n---\npackage-managed root is excluded\n",
+		);
+		await writeFile(
+			join(staleAssetsCwd, ".agents", "skills", "ignored", "SKILL.md"),
+			"---\nname: sdd-apply\n---\nskills are not agent definitions\n",
+		);
 		await mkdir(join(staleAssetsCwd, ".pi", "chains"), { recursive: true });
 		await mkdir(join(staleAssetsCwd, ".pi", "gentle-ai", "support"), { recursive: true });
 		await writeFile(join(staleAssetsCwd, ".pi", "chains", "sdd-full.chain.md"), "stale chain\n");
 		await writeFile(join(staleAssetsCwd, ".pi", "gentle-ai", "support", "sdd-status-contract.md"), "stale status contract\n");
 		const ctx = createCtx(staleAssetsCwd, true);
 		await commands.get("gentle:status").handler("", ctx);
-		assert.match(ctx.ui.notifications.at(-1).message, /Active SDD agent overrides: 5 file\(s\)/);
+		assert.match(ctx.ui.notifications.at(-1).message, /Active SDD agent overrides: 6 file\(s\)/);
 		assert.match(ctx.ui.notifications.at(-1).message, /active non-builtin SDD agents shadow package assets/);
 		await commands.get("gentle:doctor").handler("", ctx);
 		assert.match(ctx.ui.notifications.at(-1).message, /el Gentleman doctor/);
