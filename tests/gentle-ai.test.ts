@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -204,6 +204,148 @@ test("registered Gentle Review tools preserve result envelopes and redact collap
 	}
 });
 
+function routingConsumerFixture(t: test.TestContext) {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-routing-consumers-"));
+	const configHome = join(root, "global");
+	const agentHome = join(root, "agent-home");
+	const projectPath = join(root, ".pi", "gentle-ai", "models.json");
+	const globalPath = join(configHome, "models.json");
+	const exportPath = join(configHome, "models.export.json");
+	for (const dir of [dirname(projectPath), join(root, "agents"), join(agentHome, "agents"), join(agentHome, "subagents")]) {
+		mkdirSync(dir, { recursive: true });
+	}
+	writeMarkdown(join(root, ".pi", "agents", "worker.md"), "---\nname: worker\ndescription: Worker\n---\nbody\n");
+	const previousConfigHome = process.env.GENTLE_PI_CONFIG_HOME;
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	process.env.GENTLE_PI_CONFIG_HOME = configHome;
+	process.env.GENTLE_PI_AGENT_HOME = agentHome;
+	t.after(() => {
+		if (previousConfigHome === undefined) delete process.env.GENTLE_PI_CONFIG_HOME;
+		else process.env.GENTLE_PI_CONFIG_HOME = previousConfigHome;
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		rmSync(root, { recursive: true, force: true });
+	});
+	const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+	createGentleAiExtension({ nativeReviewCli: null })({
+		on() {},
+		registerTool() {},
+		registerCommand(name, command) { commands.set(name, command); },
+	} as ExtensionAPI);
+	const notifications: Array<{ message: string; severity: string }> = [];
+	let panelVisits = 0;
+	const panels: string[] = [];
+	let onPanel = () => ({ type: "cancel", config: {} });
+	const ctx = {
+		cwd: root,
+		hasUI: true,
+		modelRegistry: { getAvailable: async () => [] },
+		ui: {
+			notify(message: string, severity: string) { notifications.push({ message, severity }); },
+			custom: async (factory: (tui: unknown, theme: Theme, keybindings: unknown, done: () => void) => { render(width: number): string[] }) => {
+				panels.push(stripAnsi(renderComponent(factory(undefined, { fg: (_color: string, text: string) => text } as unknown as Theme, undefined, () => {}))));
+				panelVisits += 1;
+				return onPanel();
+			},
+		},
+	} as unknown as Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1];
+	return {
+		configHome, projectPath, globalPath, exportPath, notifications, panels,
+		panelVisits: () => panelVisits,
+		onPanel(action: typeof onPanel) { onPanel = action; },
+		run: (name: string) => commands.get(name)!.handler("", ctx),
+	};
+}
+
+test("models rejects invalid project routing with its selected source path", async (t) => {
+	const fixture = routingConsumerFixture(t);
+	writeFileSync(fixture.projectPath, "[]");
+	await fixture.run("gentle:models");
+	assert.equal(fixture.notifications[0]?.severity, "warning");
+	assert.ok(fixture.notifications[0]?.message.includes(fixture.projectPath));
+	assert.equal(fixture.panelVisits(), 0);
+});
+
+test("export re-reads saved routing and rejects invalid project before creating its destination parent", async (t) => {
+	const fixture = routingConsumerFixture(t);
+	writeFileSync(fixture.projectPath, '{"worker":"openai/gpt-5"}');
+	fixture.onPanel(() => {
+		if (fixture.panelVisits() > 1) return { type: "cancel", config: {} };
+		writeFileSync(fixture.projectPath, "[]");
+		return { type: "export", config: {} };
+	});
+	await fixture.run("gentle:models");
+	assert.equal(fixture.notifications[0]?.severity, "warning");
+	assert.ok(fixture.notifications[0]?.message.includes(`Invalid model config: ${fixture.projectPath}`));
+	assert.equal(existsSync(fixture.exportPath), false);
+	assert.equal(existsSync(fixture.configHome), false);
+});
+
+test("status reports invalid saved routing path instead of default agent routing", async (t) => {
+	const fixture = routingConsumerFixture(t);
+	writeFileSync(fixture.projectPath, "[]");
+	await fixture.run("gentle:status");
+	const report = fixture.notifications.at(-1)!;
+	assert.match(report.message, /Saved model routing: invalid/);
+	assert.ok(report.message.includes(fixture.projectPath));
+	assert.equal(report.severity, "warning");
+	assert.doesNotMatch(report.message, /worker: model=/);
+});
+
+test("models exports missing, normalized project, and global-precedence saved routing", async (t) => {
+	for (const source of ["missing", "project", "global"] as const) {
+		await t.test(source, async (t) => {
+			const fixture = routingConsumerFixture(t);
+			if (source !== "missing") writeFileSync(fixture.projectPath, '{"worker":" openai/gpt-5 ","ignored":null}');
+			if (source === "global") writeMarkdown(fixture.globalPath, '{"worker":{"model":" anthropic/opus ","thinking":"high"}}');
+			fixture.onPanel(() => ({ type: fixture.panelVisits() === 1 ? "export" : "cancel", config: {} }));
+			await fixture.run("gentle:models");
+			const agents = source === "missing" ? {} : source === "project"
+				? { worker: { model: "openai/gpt-5" } }
+				: { worker: { model: "anthropic/opus", thinking: "high" } };
+			assert.deepEqual(JSON.parse(readFileSync(fixture.exportPath, "utf8")).agents, agents);
+			assert.equal(fixture.notifications[0]?.severity, "info");
+			assert.match(fixture.notifications[0]!.message, /exported/);
+			assert.equal(fixture.panelVisits(), 2);
+			await fixture.run("gentle:status");
+			const report = fixture.notifications.at(-1)!.message;
+			assert.ok(report.includes(`Saved model routing: ${source === "missing" ? "missing" : "valid"}`));
+			assert.ok(report.includes(`Global model config: ${source === "global" ? "present" : "missing"}`));
+			const expectedRouting = source === "missing" ? "inherit, effort=inherit"
+				: source === "project" ? "openai/gpt-5, effort=inherit" : "anthropic/opus, effort=high";
+			assert.ok(report.includes(`worker: model=${expectedRouting}`), report);
+			assert.ok(fixture.panels[0].includes(`model=${expectedRouting}`), fixture.panels[0]);
+		});
+	}
+});
+
+test("invalid global routing overrides valid project in models, status, and export re-read", async (t) => {
+	for (const atExport of [false, true]) {
+		await t.test(atExport ? "invalidated during panel" : "invalid before panel", async (t) => {
+			const fixture = routingConsumerFixture(t);
+			writeFileSync(fixture.projectPath, '{"worker":"openai/gpt-5"}');
+			if (!atExport) writeMarkdown(fixture.globalPath, "[]");
+			fixture.onPanel(() => {
+				if (fixture.panelVisits() > 1) return { type: "cancel", config: {} };
+				writeMarkdown(fixture.globalPath, "[]");
+				return { type: "export", config: {} };
+			});
+			await fixture.run("gentle:models");
+			assert.equal(fixture.notifications[0]?.severity, "warning");
+			assert.ok(fixture.notifications[0]?.message.includes(fixture.globalPath));
+			assert.match(fixture.notifications[0]!.message, atExport ? /export failed/ : /cannot open model config/);
+			assert.equal(fixture.panelVisits(), atExport ? 2 : 0);
+			assert.equal(existsSync(fixture.exportPath), false);
+			await fixture.run("gentle:status");
+			const report = fixture.notifications.at(-1)!;
+			assert.match(report.message, /Global model config: present\nSaved model routing: invalid/);
+			assert.ok(report.message.includes(fixture.globalPath));
+			assert.doesNotMatch(report.message, /worker: model=/);
+			assert.equal(report.severity, "warning");
+		});
+	}
+});
+
 test("session startup reports invalid project routing without mutating the profile", async (t) => {
 	const root = mkdtempSync(join(tmpdir(), "gentle-pi-model-routing-startup-"));
 	const configHome = join(root, "global");
@@ -267,6 +409,21 @@ test("session startup reports invalid project routing without mutating the profi
 	assert.ok(warning, JSON.stringify(notifications));
 	assert.equal(warning!.severity, "warning");
 	assert.match(warning!.message, /skipped model config/);
+	assert.equal(readFileSync(profilePath, "utf8"), before);
+
+	writeFileSync(join(projectConfigDir, "models.json"), '{"worker":"openai/gpt-5"}');
+	const globalPath = join(configHome, "models.json");
+	writeFileSync(globalPath, "[]");
+	notifications.length = 0;
+	await sessionStart!({}, {
+		cwd: root,
+		hasUI: true,
+		ui: { notify(message: string, severity: string) { notifications.push({ message, severity }); } },
+	} as unknown as ExtensionContext);
+	const globalWarning = notifications.find((entry) => entry.message.includes(globalPath));
+	assert.ok(globalWarning, JSON.stringify(notifications));
+	assert.equal(globalWarning.severity, "warning");
+	assert.match(globalWarning.message, /skipped model config/);
 	assert.equal(readFileSync(profilePath, "utf8"), before);
 });
 
