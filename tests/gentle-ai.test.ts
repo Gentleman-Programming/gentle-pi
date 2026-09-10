@@ -1328,7 +1328,6 @@ test("permission lifecycle is inactive for unguarded and headless commands", asy
 		rmSync(cwd, { recursive: true, force: true });
 	}
 });
-
 test("registered Gentle Review capture tools name the lens they run", () => {
 	const tools = registeredGentleTools();
 	const binding = (lens: string) => JSON.stringify({ name: "reviewer_result", captureOperation: "review.capture-result", arguments: [], artifactSubject: { lens } });
@@ -1342,4 +1341,104 @@ test("registered Gentle Review capture tools name the lens they run", () => {
 		lifecycleContext({ executionStarted: true }),
 	);
 	assert.equal(cardTitle(renderComponent(group)), "🌹︎ Gentle AI · running · review capture group · risk · resilience · readability · reliability");
+});
+
+test("bash tool_call confirms a late guarded npm publish and denies on non-approval", async () => {
+	type ToolCallHandler = (
+		event: { toolName: string; input: unknown },
+		ctx: ExtensionContext,
+	) => Promise<ToolCallEventResult | undefined>;
+
+	const confirmArgs: Array<[string, string]> = [];
+	const handlers = new Map<string, ToolCallHandler>();
+	const pi = {
+		on(name: string, handler: ToolCallHandler) {
+			handlers.set(name, handler);
+		},
+		events: { emit() {} },
+		registerCommand() {},
+		registerTool() {},
+	} as unknown as ExtensionAPI;
+	createGentleAiExtension({ nativeReviewCli: null })(pi);
+	const toolCall = handlers.get("tool_call");
+	assert.equal(typeof toolCall, "function");
+
+	const configHome = mkdtempSync(join(tmpdir(), "gentle-pi-guard-confirm-"));
+	const ctx = {
+		cwd: process.cwd(),
+		hasUI: true,
+		ui: {
+			confirm: async (title: string, message: string) => {
+				confirmArgs.push([title, message]);
+				return false;
+			},
+		},
+	} as ExtensionContext;
+
+	const prefix = "noise ".repeat(80);
+	const command = `${prefix}npm publish --tag beta`;
+	const previousConfigHome = process.env.GENTLE_PI_CONFIG_HOME;
+	process.env.GENTLE_PI_CONFIG_HOME = configHome;
+	try {
+		const result = await toolCall!({ toolName: "bash", input: { command } }, ctx);
+		assert.deepEqual(result, {
+			block: true,
+			reason:
+				"Gentle AI safety policy blocked the command because it was not confirmed.",
+		});
+	} finally {
+		if (previousConfigHome === undefined) delete process.env.GENTLE_PI_CONFIG_HOME;
+		else process.env.GENTLE_PI_CONFIG_HOME = previousConfigHome;
+		rmSync(configHome, { recursive: true, force: true });
+	}
+
+	assert.equal(confirmArgs.length, 1, "guard asks exactly one confirmation before denying");
+	const [title, preview] = confirmArgs[0];
+	assert.equal(title, "Allow guarded npm publish?");
+	assert.match(preview, /npm publish --tag beta/);
+	assert.ok(preview.startsWith("…"), "preview elides leading context near a late match");
+});
+
+test("bash tool_call confirms every compound action and centers a long git -C push", async () => {
+	type ToolCallHandler = (
+		event: { toolName: string; input: unknown },
+		ctx: ExtensionContext,
+	) => Promise<ToolCallEventResult | undefined>;
+	const confirmArgs: Array<[string, string]> = [];
+	const handlers = new Map<string, ToolCallHandler>();
+	const pi = {
+		on(name: string, handler: ToolCallHandler) { handlers.set(name, handler); },
+		events: { emit() {} },
+		registerCommand() {},
+		registerTool() {},
+	} as unknown as ExtensionAPI;
+	createGentleAiExtension({ nativeReviewCli: null })(pi);
+	const toolCall = handlers.get("tool_call");
+	assert.equal(typeof toolCall, "function");
+
+	const configHome = mkdtempSync(join(tmpdir(), "gentle-pi-guard-compound-"));
+	const previousConfigHome = process.env.GENTLE_PI_CONFIG_HOME;
+	process.env.GENTLE_PI_CONFIG_HOME = configHome;
+	try {
+		const command = `git -C /${"very-long-path/".repeat(30)} push origin main && npm publish --tag beta`;
+		const result = await toolCall!({ toolName: "bash", input: { command } }, {
+			cwd: process.cwd(),
+			hasUI: true,
+			ui: { confirm: async (title: string, message: string) => (confirmArgs.push([title, message]), false) },
+		} as ExtensionContext);
+		assert.deepEqual(result, {
+			block: true,
+			reason: "Gentle AI safety policy blocked the command because it was not confirmed.",
+		});
+	} finally {
+		if (previousConfigHome === undefined) delete process.env.GENTLE_PI_CONFIG_HOME;
+		else process.env.GENTLE_PI_CONFIG_HOME = previousConfigHome;
+		rmSync(configHome, { recursive: true, force: true });
+	}
+
+	assert.equal(confirmArgs.length, 1);
+	const [title, preview] = confirmArgs[0];
+	assert.equal(title, "Allow guarded actions: git push; npm publish?");
+	assert.match(preview, /push origin main && npm publish --tag beta/);
+	assert.ok(preview.startsWith("…"));
 });
