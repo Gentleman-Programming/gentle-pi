@@ -508,6 +508,29 @@ test("Windows helper constructs the native Volume GUID path with exactly one nat
 	assert.ok(source.includes('return @"\\??\\" + volume.Substring(4);'));
 });
 
+test("Windows bootstrap source guard permits object-manager alias resolution only for the canonical volume root", async (t) => {
+	t.diagnostic("source guard, not native Windows proof");
+	const source = await readFile(runtime, "utf8");
+	assert.match(source, /static OpenResult OpenVolume\(string volumePath\)/);
+	assert.match(source, /static IntPtr RequireVolumeOpen\(string volumePath, uint volumeSerial\)/);
+	assert.match(source, /SetStage\("volume-open"\); IntPtr volume = RequireVolumeOpen\(VolumePath\(agentHome, out volumeSerial\), volumeSerial\)/);
+	assert.doesNotMatch(source, /RequireOpen\(IntPtr\.Zero, VolumePath\(agentHome\)/);
+	const volumeStart = source.indexOf("static OpenResult OpenVolume(string volumePath)");
+	const volumeEnd = source.indexOf("static void AssertDirectory", volumeStart);
+	assert.ok(volumeStart >= 0 && volumeEnd > volumeStart, "source guard: canonical-volume root opener was not found");
+	const volumeOpen = source.slice(volumeStart, volumeEnd);
+	assert.match(volumeOpen, /attributes\.Attributes = OBJ_CASE_INSENSITIVE;/);
+	assert.doesNotMatch(volumeOpen, /OBJ_DONT_REPARSE/);
+	assert.match(volumeOpen, /FILE_DIRECTORY_FILE \| FILE_SYNCHRONOUS_IO_NONALERT \| FILE_OPEN_REPARSE_POINT/);
+	const componentStart = source.indexOf("static OpenResult Open(IntPtr root, string name, bool privateDirectory, bool create, byte[] descriptor)");
+	const componentEnd = source.indexOf("// OBJ_DONT_REPARSE", componentStart);
+	assert.ok(componentStart >= 0 && componentEnd > componentStart, "source guard: component opener was not found");
+	const componentOpen = source.slice(componentStart, componentEnd);
+	assert.match(componentOpen, /attributes\.Attributes = OBJ_CASE_INSENSITIVE \| OBJ_DONT_REPARSE;/);
+	assert.match(componentOpen, /FILE_DIRECTORY_FILE \| FILE_SYNCHRONOUS_IO_NONALERT \| FILE_OPEN_REPARSE_POINT/);
+	assert.match(source, /if \(!GetFileInformationByHandle\(result\.Handle, out info\) \|\| info\.VolumeSerialNumber != volumeSerial\) Fail\("unsafe"\);/);
+});
+
 test("Windows bootstrap bridge admits only explicit partial or initialized public states", () => {
 	assert.deepEqual(parseWindowsHostFrame('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}'), {
 		requestId: "start-1", ok: true, result: { state: "partial" },
@@ -649,7 +672,8 @@ test("Windows-native bootstrap pins ancestors, creates exact private boundaries,
 });
 
 test("Windows-native bootstrap rejects a corrupted private boundary and preserves a failed bootstrap without recursive cleanup", { skip: process.platform !== "win32", timeout: 20_000 }, async (t) => {
-	const diagnostics: BootstrapDiagnosticContext = t;
+	const emitted: string[] = [];
+	const diagnostics: BootstrapDiagnosticContext = { diagnostic: (message) => { emitted.push(message); t.diagnostic(message); } };
 	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-bootstrap-"));
 	const agentHome = join(root, "profile", "agent");
 	const routing = join(agentHome, "gentle-agents");
@@ -661,6 +685,7 @@ test("Windows-native bootstrap rejects a corrupted private boundary and preserve
 	const frames = await helper(agentHome, false, { diagnostics });
 	assert.equal(frames[1].ok, false);
 	assert.equal(frames[1].error, "unsafe");
+	assert.deepEqual(emitted, ['{"kind":"windows-session-bootstrap-rejection","stage":"transport-assert-owned","ntstatus":null}']);
 	await stat(badBoundary);
 	assert.equal((await fixtureResult("equals", badBoundary, ["-BaselinePath", badBaseline])).equal, true);
 	await assert.rejects(stat(join(badBoundary, "presence")));
@@ -725,7 +750,8 @@ test("Windows-native bootstrap closes pinned handles after malformed input", { s
 });
 
 test("Windows-native bootstrap rejects a reparse routing parent and concurrent initialize does not hang", { skip: process.platform !== "win32", timeout: 20_000 }, async (t) => {
-	const diagnostics: BootstrapDiagnosticContext = t;
+	const emitted: string[] = [];
+	const diagnostics: BootstrapDiagnosticContext = { diagnostic: (message) => { emitted.push(message); t.diagnostic(message); } };
 	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-bootstrap-"));
 	const agentHome = join(root, "profile", "agent");
 	const routing = join(agentHome, "gentle-agents");
@@ -734,6 +760,7 @@ test("Windows-native bootstrap rejects a reparse routing parent and concurrent i
 	await mkdir(target);
 	await fixtureResult("junction", routing, ["-Target", target]);
 	assert.equal((await helper(agentHome, false, { diagnostics }))[1].error, "unsafe");
+	assert.deepEqual(emitted, ['{"kind":"windows-session-bootstrap-rejection","stage":"routing-open","ntstatus":3221226763}']);
 	const concurrentRoot = await mkdtemp(join(os.tmpdir(), "gentle-pi-bootstrap-"));
 	const concurrentHome = join(concurrentRoot, "profile", "agent");
 	await mkdir(join(concurrentHome, "gentle-agents"), { recursive: true });

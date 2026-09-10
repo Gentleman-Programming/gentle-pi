@@ -218,6 +218,7 @@ public static class WindowsSessionBootstrap {
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetFileInformationByHandle(IntPtr handle, out BY_HANDLE_FILE_INFORMATION info);
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool GetVolumeNameForVolumeMountPoint(string rootPathName, System.Text.StringBuilder volumeName, uint cchBufferLength);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool GetVolumeInformation(string rootPathName, IntPtr volumeNameBuffer, uint volumeNameSize, out uint volumeSerialNumber, out uint maximumComponentLength, out uint fileSystemFlags, IntPtr fileSystemNameBuffer, uint fileSystemNameSize);
   [DllImport("advapi32.dll", SetLastError=true)] static extern uint GetSecurityInfo(IntPtr handle, uint objectType, uint securityInformation, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr descriptor);
   [DllImport("advapi32.dll")] static extern uint GetSecurityDescriptorLength(IntPtr descriptor);
   [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
@@ -245,11 +246,36 @@ public static class WindowsSessionBootstrap {
       return new OpenResult(handle, status);
     } finally { if (security != IntPtr.Zero) Marshal.FreeHGlobal(security); if (unicode != IntPtr.Zero) Marshal.FreeHGlobal(unicode); if (chars != IntPtr.Zero) Marshal.FreeHGlobal(chars); }
   }
+  // OBJ_DONT_REPARSE returns STATUS_REPARSE_POINT_ENCOUNTERED (0xC000050B) before file-system parsing.
+  // The canonical Volume GUID name is returned by the OS for the validated drive root, so only this opener
+  // permits that Object Manager alias resolution; every user-derived component still uses Open above.
+  static OpenResult OpenVolume(string volumePath) {
+    IntPtr chars = IntPtr.Zero, unicode = IntPtr.Zero, handle = IntPtr.Zero;
+    try {
+      unicode = Unicode(volumePath, out chars); var attributes = new OBJECT_ATTRIBUTES();
+      attributes.Length = (uint)Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES)); attributes.RootDirectory = IntPtr.Zero; attributes.ObjectName = unicode;
+      attributes.Attributes = OBJ_CASE_INSENSITIVE;
+      uint access = SYNCHRONIZE | FILE_TRAVERSE | FILE_READ_ATTRIBUTES;
+      IO_STATUS_BLOCK statusBlock; uint status = NtCreateFile(out handle, access, ref attributes, out statusBlock, IntPtr.Zero, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN, FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT, IntPtr.Zero, 0);
+      if (status != 0) { Close(handle); return new OpenResult(IntPtr.Zero, status); }
+      return new OpenResult(handle, status);
+    } finally { if (unicode != IntPtr.Zero) Marshal.FreeHGlobal(unicode); if (chars != IntPtr.Zero) Marshal.FreeHGlobal(chars); }
+  }
   static void AssertDirectory(IntPtr handle) {
     if (handle == IntPtr.Zero) Fail("unsafe");
     BY_HANDLE_FILE_INFORMATION info;
     if (!GetFileInformationByHandle(handle, out info)) Fail("unsafe");
     if ((info.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != FILE_ATTRIBUTE_DIRECTORY) Fail("unsafe");
+  }
+  static IntPtr RequireVolumeOpen(string volumePath, uint volumeSerial) {
+    OpenResult result = OpenVolume(volumePath);
+    if (result.Handle == IntPtr.Zero) { SetNtStatus(result.Status); Fail(result.Status == STATUS_OBJECT_NAME_NOT_FOUND ? "unavailable" : "unsafe"); }
+    try {
+      AssertDirectory(result.Handle);
+      BY_HANDLE_FILE_INFORMATION info;
+      if (!GetFileInformationByHandle(result.Handle, out info) || info.VolumeSerialNumber != volumeSerial) Fail("unsafe");
+      return result.Handle;
+    } catch { Close(result.Handle); throw; }
   }
   static IntPtr RequireOpen(IntPtr root, string component, bool privateDirectory) {
     OpenResult result = Open(root, component, privateDirectory, false, null);
@@ -284,10 +310,12 @@ public static class WindowsSessionBootstrap {
     foreach (string part in parts) if (part.Length == 0 || part == "." || part == ".." || part.IndexOf(':') >= 0 || part.IndexOfAny(new char[] {'/', '\0'}) >= 0) Fail("invalid");
     return parts;
   }
-  static string VolumePath(string agentHome) {
+  static string VolumePath(string agentHome, out uint volumeSerial) {
     var name = new System.Text.StringBuilder(128); string mount = agentHome.Substring(0, 3);
     if (!GetVolumeNameForVolumeMountPoint(mount, name, (uint)name.Capacity)) Fail("unavailable");
     string volume = name.ToString(); if (!Regex.IsMatch(volume, @"^\\\\\?\\Volume\{[0-9A-Fa-f-]+\}\\$") /* "^\\\\\\?\\\\Volume\\{[0-9A-Fa-f-]+\\}\\\\$")) */ ) Fail("unsafe");
+    uint maximumComponentLength, fileSystemFlags;
+    if (!GetVolumeInformation(volume, IntPtr.Zero, 0, out volumeSerial, out maximumComponentLength, out fileSystemFlags, IntPtr.Zero, 0)) Fail("unavailable");
     return @"\??\" + volume.Substring(4);
   }
   // The helper keeps this capability local. Publication/list RPCs are intentionally absent.
@@ -322,7 +350,8 @@ public static class WindowsSessionBootstrap {
       CloseAll();
       try {
         string[] components = Components(agentHome);
-        SetStage("volume-open"); IntPtr volume = RequireOpen(IntPtr.Zero, VolumePath(agentHome), false); Handles.Add(volume); IntPtr parent = volume;
+        uint volumeSerial;
+        SetStage("volume-open"); IntPtr volume = RequireVolumeOpen(VolumePath(agentHome, out volumeSerial), volumeSerial); Handles.Add(volume); IntPtr parent = volume;
         foreach (string component in components) { SetStage("ancestor-open"); IntPtr child = RequireOpen(parent, component, false); Handles.Add(child); parent = child; }
         // gentle-agents is a shared routing parent created by the host lifecycle; never repair or create it here.
         SetStage("routing-open"); IntPtr routing = RequireOpen(parent, "gentle-agents", false); Handles.Add(routing);
