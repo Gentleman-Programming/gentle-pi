@@ -20,6 +20,11 @@ const tokenFields = ["input", "output", "cacheRead", "cacheWrite", "reasoning", 
  * Only the fixed package catalog is cached; runtime instructions are not retained.
  */
 let definitions: Array<{ name: string; fingerprint: string; fingerprintClass?: AgentClass }> | undefined;
+const packagedAgentClassAliases = new Map([["sdd-proposal", "sdd-propose"]] as const);
+function fingerprintAgentClassName(name: string): string {
+	const compatibilityName = name.startsWith("gentle-ai-") ? name.slice("gentle-ai-".length) : name;
+	return packagedAgentClassAliases.get(compatibilityName) ?? compatibilityName;
+}
 function fingerprint(agent: AgentDefinition): string {
 	return JSON.stringify([agent.name, agent.description, agent.instructions, agent.tools, agent.mode]);
 }
@@ -30,11 +35,10 @@ export function classifyBuiltinAgent(agent: AgentDefinition): AgentClass {
 			const path = new URL(`../assets/agents/${file}`, import.meta.url);
 			const parsed = parseAgentDefinition(readFileSync(path, "utf8"), path.pathname, "global");
 			if (!("instructions" in parsed)) throw new Error("Invalid packaged definition");
-			const compatibilityName = parsed.name.startsWith("gentle-ai-") ? parsed.name.slice("gentle-ai-".length) : parsed.name;
 			return { name: parsed.name, fingerprint: fingerprint(parsed),
-				fingerprintClass: parseAgentClass(compatibilityName) };
+				fingerprintClass: parseAgentClass(fingerprintAgentClassName(parsed.name)) };
 		});
-		const namedClass = parseAgentClass(agent.name);
+		const namedClass = parseAgentClass(packagedAgentClassAliases.get(agent.name) ?? agent.name);
 		if (namedClass && definitions.some(entry => entry.name === agent.name)) return namedClass;
 		return definitions.find(entry => entry.fingerprintClass && entry.fingerprint === fingerprint(agent))?.fingerprintClass ?? UNKNOWN_AGENT_CLASS;
 	} catch { return UNKNOWN_AGENT_CLASS; }

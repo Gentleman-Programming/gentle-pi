@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import { runInNewContext } from "node:vm";
-import { AGENT_CLASSES, parseAgentClass } from "../lib/runtime-metrics.ts";
+import { parseAgentClass } from "../lib/runtime-metrics.ts";
 import { parseAgentDefinition } from "../lib/agents-config.ts";
 import { normalizeRpcEvent, TASK_EVENT } from "../lib/agents-protocol.ts";
 import { lookupPiCatalogName } from "../lib/runtime-metrics-pi-identity.ts";
 import { ChildComposition, childEvent, classifyBuiltinAgent, launchSelection } from "../lib/runtime-metrics-children.ts";
+import { encodeNativeRuntimeEvent } from "../lib/runtime-metrics-native.ts";
 
 await lookupPiCatalogName({ provider: "openai", modelId: "gpt-4o" });
 const asset = new URL("../assets/agents/gentle-ai-worker.md", import.meta.url);
@@ -32,8 +33,12 @@ test("installed package definitions retain classification after the actual routi
 	const transform = source.match(/function updateFrontmatterRouting\([\s\S]*?\n\}/)?.[0];
 	assert.ok(transform);
 	const route = runInNewContext(`(${stripTypeScriptTypes(transform)})`);
-	for (const kind of AGENT_CLASSES.filter(kind => kind !== "orchestrator" && kind !== "unknown")) {
-		const file = ["worker", "explore", "verify"].includes(kind) ? `gentle-ai-${kind}` : kind;
+	for (const entry of readdirSync(new URL("../assets/agents/", import.meta.url)).filter(file => file.endsWith(".md"))) {
+		const file = entry.slice(0, -3);
+		const className = file === "sdd-proposal" ? "sdd-propose"
+			: file.startsWith("gentle-ai-") ? file.slice("gentle-ai-".length) : file;
+		const kind = parseAgentClass(className);
+		assert.ok(kind, `${file}: telemetry class`);
 		const asset = new URL(`../assets/agents/${file}.md`, import.meta.url);
 		const content = readFileSync(asset, "utf8");
 		const copied = parseAgentDefinition(content, asset.pathname, "global");
@@ -43,13 +48,33 @@ test("installed package definitions retain classification after the actual routi
 			const parsed = parseAgentDefinition(route(content, entry), asset.pathname, "global");
 			assert.ok("instructions" in parsed);
 			assert.equal(classifyBuiltinAgent(parsed), kind, `${kind}: installed routing`);
-			const customizedClass = parseAgentClass(parsed.name) ?? "unknown";
+			const customizedClass = parsed.name === "sdd-proposal" ? "sdd-propose" : parseAgentClass(parsed.name) ?? "unknown";
 			assert.equal(classifyBuiltinAgent({ ...parsed, instructions: `${parsed.instructions}\nOverride` }), customizedClass);
 			assert.equal(classifyBuiltinAgent({ ...parsed, tools: ["different-tool"] }), customizedClass);
 			assert.equal(classifyBuiltinAgent({ ...parsed, description: "different description" }), customizedClass);
 			assert.equal(classifyBuiltinAgent({ ...parsed, mode: parsed.mode === "task" ? "background" : "task" }), customizedClass);
 		}
 	}
+});
+
+test("packaged sdd-proposal is encoded only as canonical sdd-propose", () => {
+	const path = new URL("../assets/agents/sdd-proposal.md", import.meta.url);
+	const packaged = parseAgentDefinition(readFileSync(path, "utf8"), path.pathname, "global");
+	assert.ok("instructions" in packaged);
+	const selection = launchSelection(packaged, { provider: "openai", id: "gpt-4o" }, "high");
+	assert.equal(selection.agentClass, "sdd-propose");
+	const completed = childEvent("local-session", "sdd-propose-task", selection, "completed", {
+		coverage: "final_assistant_messages_only", agentSettled: true, responses: [response()], droppedResponses: 0,
+	});
+	assert.ok(completed);
+	const composition = new ChildComposition();
+	assert.equal(composition.reserve(completed, "local-session"), true);
+	composition.record(completed);
+	const snapshot = composition.snapshot();
+	const payload = encodeNativeRuntimeEvent(snapshot.responses, snapshot.launches);
+	assert.ok(payload);
+	assert.equal(JSON.parse(payload).rows[0].agent_class, "sdd-propose");
+	assert.ok(!payload.includes("sdd-proposal"));
 });
 
 test("schema-approved packaged names survive customization without exposing private names", () => {
