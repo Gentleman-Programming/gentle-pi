@@ -77,6 +77,7 @@ import {
 	REVIEW_HOST_RELAY_SUBMISSION_MISSING_MESSAGE,
 	REVIEW_HOST_RELAY_UNAVAILABLE_MESSAGE,
 	ReviewHostRelayError,
+	reviewHostRelayExecuteSlots,
 	reviewHostRelaySlots,
 	reviewProviderRoleVectorSlots,
 	resolveReviewHostRelaySubmission,
@@ -87,6 +88,7 @@ import {
 	type ReviewHostRelayRequest,
 	type ReviewHostRelayRunner,
 	type ReviewHostRelaySlot,
+	type ReviewHostRelayExecuteSlot,
 	type ReviewProviderRoleVectorSlot,
 } from "../lib/review-host-relay.ts";
 import {
@@ -157,6 +159,8 @@ import {
 	type NativeReviewProcessDiagnostics,
 	type NativeStartResult,
 	type NativeReviewAssessRequest,
+	type NativeReviewCaptureExecuteRequest,
+	type NativeReviewCaptureExecuteOutcome,
 	type ExecFileAdapter,
 	type ExecFileResult,
 } from "../lib/native-review-cli.ts";
@@ -557,7 +561,7 @@ function isTaskScopedRepositoryRelativePath(value: string, isWholeEntryBackticke
 		return false;
 	}
 
-	return !/[?*\[\]{}]/.test(withoutCurrentDirectory.split("/")[0]);
+	return !/[?*[\]{}]/.test(withoutCurrentDirectory.split("/")[0]);
 }
 
 type AllowedEditSurfaceEntry = {
@@ -929,7 +933,7 @@ async function resolveReviewAssessmentPlan(
 	const targetIdentity = input.nativeReviewOutcome === undefined ? await readCurrentTargetIdentityBestEffort(nativeReviewCli, cwd, signal) : undefined;
 	const derived = targetIdentity === undefined ? undefined : readNativeReviewOutcome(cwd, targetIdentity);
 	const nativeReviewOutcome: NativeReviewOutcome = input.nativeReviewOutcome ?? derived ?? NATIVE_REVIEW_OUTCOME.UNKNOWN;
-	const outcomeSource: "explicit" | "derived" | "unknown" = input.nativeReviewOutcome !== undefined ? "explicit" : derived === undefined ? "unknown" : "derived";
+	const outcomeSource: "explicit" | "derived" | "unknown" = input.nativeReviewOutcome === undefined ? derived === undefined ? "unknown" : "derived" : "explicit";
 	const plan = verificationPlan({ rddLine, risk, writerProfile, nativeReviewOutcome });
 	return {
 		schema: "gentle-pi.review-assessment-plan/v1",
@@ -3376,10 +3380,10 @@ async function authorizeDestructiveReviewOperation(
 	}
 	const maintenanceAuthorization = maintenance === undefined ? undefined : nativeMaintenanceAuthorization(maintenance, input);
 	const approved = await ctx.ui.confirm(
-		maintenance !== undefined ? `Authorize review authority ${parameters.operation.toUpperCase()}?` : `Authorize destructive review authority ${parameters.operation.toUpperCase()}?`,
-		maintenance !== undefined
-			? [`Operation: ${parameters.operation.toUpperCase()}`, "Exact published authorization binding:", maintenanceAuthorization!, maintenance === "abandon" ? "The native command may quarantine only an eligible pristine compact-v2 lineage." : maintenance === "quarantineLegacy" ? "The native command may quarantine only the published malformed freeze-findings legacy diagnostic." : "The native command may quarantine only the bound invalid recovery successor; the predecessor stays untouched."].join("\n")
-			: [`Operation: ${parameters.operation.toUpperCase()}`, `Repository: ${input.repositoryId}`, `Exact challenge: ${input.confirmation}`, "This invalidates all prior review authority for this repository."].join("\n"),
+		maintenance === undefined ? `Authorize destructive review authority ${parameters.operation.toUpperCase()}?` : `Authorize review authority ${parameters.operation.toUpperCase()}?`,
+		maintenance === undefined
+			? [`Operation: ${parameters.operation.toUpperCase()}`, `Repository: ${input.repositoryId}`, `Exact challenge: ${input.confirmation}`, "This invalidates all prior review authority for this repository."].join("\n")
+			: [`Operation: ${parameters.operation.toUpperCase()}`, "Exact published authorization binding:", maintenanceAuthorization!, maintenance === "abandon" ? "The native command may quarantine only an eligible pristine compact-v2 lineage." : maintenance === "quarantineLegacy" ? "The native command may quarantine only the published malformed freeze-findings legacy diagnostic." : "The native command may quarantine only the bound invalid recovery successor; the predecessor stays untouched."].join("\n"),
 	);
 	if (!approved) throw new Error(`Review controller ${parameters.operation.toUpperCase()} was not explicitly authorized`);
 }
@@ -5023,6 +5027,51 @@ async function executeProviderRoleVectorCapture(
 	}
 }
 
+// gentle-pi execute-native compat: self-contained execute vector for one
+// `review.capture-result` slot with `--agent=pi --execute=true`. Go materializes
+// the prompt, spawns its locked-down pi subprocess, and admits the raw verdict.
+// The host never materializes, launches pi, or submits anything — it runs one
+// CLI invocation verbatim and re-queries negotiated STATUS.
+async function executeReviewHostRelayExecuteCapture(
+	slot: ReviewHostRelayExecuteSlot,
+	nativeReviewCli: NativeReviewCli,
+	cwd: string,
+	binding: ReviewLastEventClosureBinding,
+	selections: Map<string, RetainedNativeStatusSelection>,
+	route: RetainedNativeCaptureRoute | undefined,
+	signal?: AbortSignal,
+): Promise<Record<string, unknown>> {
+	if (nativeReviewCli.captureExecute === undefined) {
+		return {
+			tool: "gentle_review_capture",
+			status: "blocked",
+			outcome: "execute-capture-unsupported",
+			reason: "The provider issued a self-contained execute capture vector, but this runtime has no native execute capture surface.",
+			mutation_performed: false,
+			mutation_outcome: "none",
+		};
+	}
+	try {
+		const result = await nativeReviewCli.captureExecute({
+			argumentTokens: slot.captureArgumentTokens,
+			cwd,
+			...(signal === undefined ? {} : { signal }),
+		});
+		if ("operation" in result) return mapAndClearLastEventClosure(result, binding, selections, cwd);
+		return {
+			tool: "gentle_review_capture",
+			status: "captured",
+			outcome: "native-execute-captured",
+			lineage_id: result.lineageId,
+			target_identity: result.targetIdentity,
+			transport: "go_owned_pi_process",
+			capture_operation: "review.capture-result",
+		};
+	} catch (error) {
+		return await reconcileUnknownReviewCaptureFailure(error, nativeReviewCli, cwd, binding, selections, route);
+	}
+}
+
 // The provider-named lenses still awaiting a reviewer result: one lens per
 // pending `review.capture-result` collect input, in provider order.
 function pendingReviewerLenses(status: ReviewStatusV3): readonly string[] {
@@ -5106,7 +5155,7 @@ function hostTransportUnavailable(
 			operation: REVIEW_CONTROLLER_OPERATION.INSPECT,
 			...(isCapture ? { then: operation } : {}),
 		},
-		next_action: `Install a native gentle-ai provider that supports \`review status --agent pi\`, then re-enter negotiated STATUS with gentle_review {"operation":"inspect"}${!isCapture ? " and follow the transition it returns" : operation === "gentle_review_capture_group" ? " and resubmit gentle_review_capture_group with the complete exact ordered collectBindings that fresh STATUS returns" : " and resubmit gentle_review_capture with the exact one-slot collectBinding that fresh STATUS returns"}. A provider-printed raw CLI continuation does not run in this runtime, and Pi never falls back to an agent-less lifecycle route.`,
+		next_action: `Install a native gentle-ai provider that supports \`review status --agent pi\`, then re-enter negotiated STATUS with gentle_review {"operation":"inspect"}${isCapture ? operation === "gentle_review_capture_group" ? " and resubmit gentle_review_capture_group with the complete exact ordered collectBindings that fresh STATUS returns" : " and resubmit gentle_review_capture with the exact one-slot collectBinding that fresh STATUS returns" : " and follow the transition it returns"}. A provider-printed raw CLI continuation does not run in this runtime, and Pi never falls back to an agent-less lifecycle route.`,
 	};
 }
 
@@ -5443,6 +5492,18 @@ async function executeReviewCaptureOperation(
 			};
 		}
 		return withCorrectionTarget(await executeReviewHostRelayCapture(hostRelaySlots[0]!, nativeReviewCli, cwd, selected.binding, retainedUntrackedSelections, route, signal));
+	}
+
+	// gentle-pi execute-native compat: self-contained execute vector for
+	// `review.capture-result` with `--agent=pi --execute=true`. Go materializes
+	// the prompt, spawns its locked-down pi subprocess, and admits the raw
+	// verdict. This mirrors the provider role vector pattern.
+	const executeSlots = reviewHostRelayExecuteSlots([selected.input]);
+	if (executeSlots.length === 1) {
+		if (parameters.reviewerRunAcknowledged !== undefined || parameters.correctionLines !== undefined) {
+			return captureBindingRejected("reviewerRunAcknowledged and correctionLines are not valid for an execute capture");
+		}
+		return withCorrectionTarget(await executeReviewHostRelayExecuteCapture(executeSlots[0]!, nativeReviewCli, cwd, selected.binding, retainedUntrackedSelections, route, signal));
 	}
 
 	if (selected.input.captureOperation === "review.capture-correction-plan") {
@@ -6521,8 +6582,7 @@ function createGentleAiExtensionForTesting(
 		try { candidateViews?.cleanupAll(); } catch { /* Preserve failed owned views for later recovery. */ }
 		const reason = (event as { reason?: unknown }).reason;
 		if (reason !== "reload") {
-			if (childStandingReviewPermissionLease !== undefined) childStandingReviewPermissionLease.closeIfCurrent();
-			else childStandingReviewPermission?.close();
+			if (childStandingReviewPermissionLease === undefined) childStandingReviewPermission?.close(); else childStandingReviewPermissionLease.closeIfCurrent();
 			revokeCurrentReviewSessionPermission(context);
 		}
 		const sessionKey = pendingReviewConsentSessionKey(context, pendingReviewConsentFallbackKey);

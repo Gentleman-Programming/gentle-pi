@@ -212,15 +212,59 @@ export function isReviewProviderRoleVectorInput(input: ReviewCollectInputV3): bo
 		&& argumentValue(input, "agent") === "pi";
 }
 
-export function reviewProviderRoleVectorSlots(inputs: readonly ReviewCollectInputV3[]): readonly ReviewProviderRoleVectorSlot[] {
-	return inputs.filter((input) => isReviewProviderRoleVectorInput(input)).map((input) => ({
-		captureOperation: input.captureOperation as ReviewProviderRoleVectorSlot["captureOperation"],
-		argumentTokens: input.arguments.map((argument) => renderToken(argument)),
-		name: input.name,
-	}));
-}
+    export function reviewProviderRoleVectorSlots(inputs: readonly ReviewCollectInputV3[]): readonly ReviewProviderRoleVectorSlot[] {
+    	return inputs.filter((input) => isReviewProviderRoleVectorInput(input)).map((input) => ({
+    		captureOperation: input.captureOperation as ReviewProviderRoleVectorSlot["captureOperation"],
+    		argumentTokens: input.arguments.map((argument) => renderToken(argument)),
+    		name: input.name,
+    	}));
+    }
 
-// Resolves the provider-owned submission form into an executable binding.
+    // ---------------------------------------------------------------------------
+    // Execute vector for review.capture-result (gentle-pi execute-native compat)
+    //
+    // A self-contained execute vector for `review.capture-result` with
+    // `--agent=pi --execute=true`. Unlike the materialize path (which materializes
+    // a prompt, runs Pi, and submits the result), the execute path is handled
+    // by the native CLI directly: Go materializes the prompt, spawns its locked-down
+    // pi subprocess, and admits the raw verdict. This mirrors the provider role
+    // vector pattern but for the reviewer capture operation.
+    // ---------------------------------------------------------------------------
+
+    export interface ReviewHostRelayExecuteSlot {
+    	/** Every provider-issued argument token, verbatim, in provider order. */
+    	readonly captureArgumentTokens: readonly string[];
+    	readonly lens?: string;
+    	readonly order?: string;
+    	readonly subjectHash?: string;
+    }
+
+    /**
+     * Classifies a collect input as an execute vector for review.capture-result.
+     * Matches: captureOperation === "review.capture-result" && agent === "pi" && execute === "true"
+     *
+     * This is distinct from the materialize path which requires materialize === "true".
+     */
+    export function isReviewHostRelayExecuteInput(input: ReviewCollectInputV3): boolean {
+    	return input.captureOperation === "review.capture-result"
+    		&& argumentValue(input, "agent") === "pi"
+    		&& argumentValue(input, "execute") === "true";
+    }
+
+    /**
+     * Extracts execute vector slots from collect inputs.
+     * Returns slots for review.capture-result with agent=pi and execute=true.
+     */
+    export function reviewHostRelayExecuteSlots(inputs: readonly ReviewCollectInputV3[]): readonly ReviewHostRelayExecuteSlot[] {
+    	return inputs.filter((input) => isReviewHostRelayExecuteInput(input)).map((input) => ({
+    		captureArgumentTokens: input.arguments.map((argument) => renderToken(argument)),
+    		...(argumentValue(input, "lens") === undefined ? {} : { lens: argumentValue(input, "lens") }),
+    		...(argumentValue(input, "order") === undefined ? {} : { order: argumentValue(input, "order") }),
+    		...(input.artifactSubject === undefined ? {} : { subjectHash: input.artifactSubject.subjectHash }),
+    	}));
+    }
+
+    // Resolves the provider-owned submission form into an executable binding.
 // Fails closed with a typed contract-mismatch error whenever the completing
 // form is absent or cannot bind exactly one artifact value; the relay never
 // repairs, filters, or synthesizes it.

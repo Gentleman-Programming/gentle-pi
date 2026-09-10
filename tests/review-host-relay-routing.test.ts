@@ -568,3 +568,161 @@ test("collect inputs without the provider-issued materialize token never reach t
 	}
 	assert.equal(relayCalls, 0);
 });
+
+// ---------------------------------------------------------------------------
+// gentle-pi execute-native compat: execute vector for `review.capture-result`
+// with `--agent=pi --execute=true`. Go materializes the prompt, spawns its
+// locked-down pi subprocess, and admits the raw verdict. The host never
+// materializes, launches pi, or submits anything — it runs one CLI invocation
+// verbatim and re-queries negotiated STATUS.
+// ---------------------------------------------------------------------------
+
+function executeCollectInput(lineageId: string, lens: ReviewArtifactSubjectV2["lens"], order: number, revision = SHA): ReviewCollectInputV3 {
+	return {
+		name: "reviewer_result",
+		schema: "https://gentle-ai.dev/schema/review/reviewer/v1",
+		captureOperation: "review.capture-result",
+		arguments: [
+			...bindingArguments(lineageId, lens, order, revision),
+			{ name: "agent", value: "pi", token: "--agent=pi" },
+			{ name: "execute", value: "true", token: "--execute=true" },
+		],
+		artifactSubject: {
+			schema: "gentle-ai.review-artifact-subject/v2", subjectHash: `sha256:${String(order).repeat(64)}`,
+			lineageId, authorityRevision: revision, targetIdentity: SHA, baseTree: TREE, candidateTree: TREE,
+			changedPathManifestSha256: SHA, lens, selectedOrder: order,
+		},
+		baseTree: TREE, candidateTree: TREE, changedPathManifest: [],
+	};
+}
+
+test("one execute binding routes exactly one provider slot through the native execute surface", async (t) => {
+	const cwd = repository(t);
+	const lineageId = "execute-lineage";
+	const input = executeCollectInput(lineageId, "review-risk", 0);
+	const harness = nativeHarness([finalizeStatus(lineageId, [input])]);
+	let executeCalls = 0;
+	harness.native.captureExecute = async (request) => {
+		executeCalls += 1;
+		assert.deepEqual(request.argumentTokens, input.arguments.map((argument) => argument.token));
+		return {
+			schema: "gentle-ai.review-capture-execute/v1",
+			lineageId,
+			targetIdentity: SHA,
+			captured: true,
+		};
+	};
+
+	// Execute routing does not accept reviewerRunAcknowledged because it's self-contained
+	const result = await runCapture(cwd, harness, lineageId, {});
+
+	assert.equal(executeCalls, 1);
+	assert.equal(result.status, "captured");
+	assert.equal(result.outcome, "native-execute-captured");
+	assert.equal(result.transport, "go_owned_pi_process");
+	assert.equal(result.capture_operation, "review.capture-result");
+	assert.equal(result.lineage_id, lineageId);
+	assert.equal(result.target_identity, SHA);
+});
+
+test("execute capture with closure response returns closed status", async (t) => {
+	const cwd = repository(t);
+	const lineageId = "execute-closure-lineage";
+	const input = executeCollectInput(lineageId, "review-risk", 0);
+	const harness = nativeHarness([finalizeStatus(lineageId, [input])]);
+	harness.native.captureExecute = async () => {
+		return {
+			schema: "gentle-ai.review-last-event-closure/v1",
+			operation: "review/capture-result",
+			lineageId,
+			state: "approved",
+			storeRevision: SHA,
+			action: "stop",
+		};
+	};
+
+	// Execute routing does not accept reviewerRunAcknowledged
+	const result = await runCapture(cwd, harness, lineageId, {});
+
+	assert.equal(result.status, "closed");
+	assert.equal(result.outcome, "native-last-event-closure");
+});
+
+test("execute capture rejects reviewerRunAcknowledged and correctionLines", async (t) => {
+	const cwd = repository(t);
+	const lineageId = "execute-reject-params-lineage";
+	const harness = nativeHarness([
+		finalizeStatus(lineageId, [executeCollectInput(lineageId, "review-risk", 0)]),
+		finalizeStatus(lineageId, [executeCollectInput(lineageId, "review-risk", 0)]),
+	]);
+	harness.native.captureExecute = async () => {
+		throw new Error("should not be called");
+	};
+
+	const resultWithAck = await runCapture(cwd, harness, lineageId, { reviewerRunAcknowledged: true });
+	assert.equal(resultWithAck.outcome, "capture-binding-rejected");
+
+	const resultWithCorrection = await runCapture(cwd, harness, lineageId, { correctionLines: 5 });
+	assert.equal(resultWithCorrection.outcome, "capture-binding-rejected");
+});
+
+test("execute capture without native surface reports unsupported", async (t) => {
+	const cwd = repository(t);
+	const lineageId = "execute-unsupported-lineage";
+	const input = executeCollectInput(lineageId, "review-risk", 0);
+	const statusQueue = [finalizeStatus(lineageId, [input])];
+	const harness = {
+		statusQueue,
+		statusCalls: [] as Array<{ cwd: string; lineageId?: string; agent?: "pi" }>,
+		native: {
+			targetStatus: async (request: { cwd: string; lineageId?: string; agent?: string }) => {
+				harness.statusCalls.push({ cwd: request.cwd, ...(request.lineageId === undefined ? {} : { lineageId: request.lineageId }), ...(request.agent === undefined ? {} : { agent: request.agent as "pi" }) });
+				const next = harness.statusQueue.shift();
+				if (next === undefined) throw new Error("status queue exhausted");
+				return next;
+			},
+			// Intentionally do NOT set captureExecute
+		} as unknown as NativeReviewCli,
+	};
+
+	const result = await __testing.executeReviewCaptureOperation(
+		{ lineageId, collectBinding: JSON.stringify(input) },
+		cwd,
+		harness.native,
+	);
+
+	assert.equal(result.status, "blocked");
+	assert.equal(result.outcome, "execute-capture-unsupported");
+	assert.match(String(result.reason), /self-contained execute capture vector/);
+});
+
+test("execute capture failure is reported as native operation failure", async (t) => {
+	const cwd = repository(t);
+	const lineageId = "execute-fail-lineage";
+	const input = executeCollectInput(lineageId, "review-risk", 0);
+	const statusQueue = [finalizeStatus(lineageId, [input]), finalizeStatus(lineageId)];
+	const harness = {
+		statusQueue,
+		statusCalls: [] as Array<{ cwd: string; lineageId?: string; agent?: "pi" }>,
+		native: {
+			targetStatus: async (request: { cwd: string; lineageId?: string; agent?: string }) => {
+				harness.statusCalls.push({ cwd: request.cwd, ...(request.lineageId === undefined ? {} : { lineageId: request.lineageId }), ...(request.agent === undefined ? {} : { agent: request.agent as "pi" }) });
+				const next = harness.statusQueue.shift();
+				if (next === undefined) throw new Error("status queue exhausted");
+				return next;
+			},
+			captureExecute: async () => {
+				throw new Error("execute capture failed");
+			},
+		} as unknown as NativeReviewCli,
+	};
+
+	const result = await __testing.executeReviewCaptureOperation(
+		{ lineageId, collectBinding: JSON.stringify(input) },
+		cwd,
+		harness.native,
+	);
+
+	assert.equal(result.status, "blocked");
+	assert.equal(result.outcome, "native-operation-failed");
+});

@@ -65,6 +65,7 @@ export const NATIVE_REVIEW_OPERATION = {
 	CAPTURE_RESULT: "review/capture-result",
 	CAPTURE_CORRECTION_PLAN: "review/capture-correction-plan",
 	CAPTURE_PROVIDER_ROLE: "review/capture-provider-role",
+	CAPTURE_EXECUTE: "review/capture-execute",
 	ACKNOWLEDGE_APPROVED: "review/acknowledge-approved",
 } as const;
 export type NativeReviewOperation = (typeof NATIVE_REVIEW_OPERATION)[keyof typeof NATIVE_REVIEW_OPERATION];
@@ -106,6 +107,7 @@ export interface NativeReviewCli {
 	captureResult?(request: NativeReviewCaptureResultRequest): Promise<NativeReviewCaptureResultOutcome>;
 	captureCorrectionPlan?(request: NativeReviewCorrectionPlanCaptureRequest): Promise<ReviewLastEventClosureV1>;
 	captureProviderRole?(request: NativeReviewProviderRoleCaptureRequest): Promise<NativeReviewProviderRoleCaptureOutcome>;
+	captureExecute?(request: NativeReviewCaptureExecuteRequest): Promise<NativeReviewCaptureExecuteOutcome>;
 	// Dark until a negotiated version reports the `mode` capability true
 	// (Design Decision #7, organic-rdd-parity). Plain versioned CLI operation,
 	// outside the negotiated review-integration protocol — same shape as
@@ -433,6 +435,34 @@ export interface NativeReviewProviderRoleCaptureArtifact {
 
 /** Refuter and validator captures close only when they are the native last event. */
 export type NativeReviewProviderRoleCaptureOutcome = NativeReviewProviderRoleCaptureArtifact | ReviewLastEventClosureV1;
+
+// ---------------------------------------------------------------------------
+// Execute vector for review.capture-result (gentle-pi execute-native compat)
+//
+// A self-contained execute vector for `review.capture-result` with
+// `--agent=pi --execute=true`. Mirrors the provider role vector pattern
+// (capture-refuter, capture-validation) but for the reviewer capture operation.
+// ---------------------------------------------------------------------------
+
+export const NATIVE_REVIEW_CAPTURE_EXECUTE_SCHEMA = "gentle-ai.review-capture-execute/v1";
+
+export interface NativeReviewCaptureExecuteRequest {
+	/** Every provider-issued argument token, verbatim, in provider order. */
+	readonly argumentTokens: readonly string[];
+	/** Process working directory only; never rendered into the invocation. */
+	readonly cwd: string;
+	readonly signal?: AbortSignal;
+}
+
+export interface NativeReviewCaptureExecuteResult {
+	readonly schema: typeof NATIVE_REVIEW_CAPTURE_EXECUTE_SCHEMA;
+	readonly lineageId: string;
+	readonly targetIdentity: string;
+	readonly captured: true;
+}
+
+/** Execute capture outcome: either an admitted artifact or a terminal closure. */
+export type NativeReviewCaptureExecuteOutcome = NativeReviewCaptureExecuteResult | ReviewLastEventClosureV1;
 
 export const NATIVE_UNTRACKED_SCOPE = {
 	EXCLUDE: "exclude",
@@ -1820,14 +1850,37 @@ function decodeNativeProviderRoleCaptureArtifact(value: unknown): NativeReviewPr
 	const role = text("role");
 	if (role !== "refuter" && role !== "targeted-validator") throw new TypeError(`native provider role capture artifact role must be refuter or targeted-validator, received ${role}`);
 	if (body.captured !== true) throw new TypeError("native provider role capture artifact must report captured: true");
+    return Object.freeze({
+    	schema: NATIVE_REVIEW_PROVIDER_ROLE_CAPTURE_SCHEMA,
+    	lineageId: text("lineage_id"),
+    	targetIdentity: text("target_identity"),
+    	role,
+    	captured: true,
+    });
+    }
+
+// gentle-pi execute-native compat: the strict acknowledgement for one executed
+// reviewer capture vector. The immutable verdict bytes live in the Go-owned
+// compact store slot; this envelope only names the binding the capture proved.
+function decodeNativeReviewCaptureExecuteResult(value: unknown): NativeReviewCaptureExecuteResult {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("native review capture execute result must be an object");
+	const body = value as Record<string, unknown>;
+	const allowed = new Set(["schema", "lineage_id", "target_identity", "captured"]);
+	for (const key of Object.keys(body)) if (!allowed.has(key)) throw new TypeError(`native review capture execute result carries unexpected key ${key}`);
+	const text = (key: string): string => {
+		const found = body[key];
+		if (typeof found !== "string" || found.trim() !== found || found.length === 0) throw new TypeError(`native review capture execute result ${key} must be a non-empty trimmed string`);
+		return found;
+	};
+	if (text("schema") !== NATIVE_REVIEW_CAPTURE_EXECUTE_SCHEMA) throw new TypeError(`native review capture execute result schema must be ${NATIVE_REVIEW_CAPTURE_EXECUTE_SCHEMA}`);
+	if (body.captured !== true) throw new TypeError("native review capture execute result must report captured: true");
 	return Object.freeze({
-		schema: NATIVE_REVIEW_PROVIDER_ROLE_CAPTURE_SCHEMA,
+		schema: NATIVE_REVIEW_CAPTURE_EXECUTE_SCHEMA,
 		lineageId: text("lineage_id"),
 		targetIdentity: text("target_identity"),
-		role,
 		captured: true,
 	});
-}
+    }
 
 export class NativeReviewCliV216 implements NativeReviewCli {
 	private readonly plain: NativeReviewPlainCli;
@@ -2193,6 +2246,31 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 			return decodeNativeProviderRoleCaptureArtifact(body);
 		});
 	}
+
+	// gentle-pi execute-native compat: executes one provider-rendered self-contained
+	// reviewer capture execute vector (`review.capture-result --agent=pi --execute=true`)
+	// exactly as rendered — one CLI invocation, verbatim tokens in provider order, in
+	// the foreground. Go materializes the reviewer prompt, spawns its own locked-down
+	// pi subprocess, and admits the raw verdict. Pi never adds, removes, or reorders
+	// a single token (not even --cwd: the vector's --repository-context is
+	// authoritative and mutually exclusive with a path).
+	async captureExecute(request: NativeReviewCaptureExecuteRequest): Promise<NativeReviewCaptureExecuteOutcome> {
+		if (request.argumentTokens.length === 0) throw new TypeError("Native CAPTURE_EXECUTE requires the provider-rendered argument tokens");
+		if (request.argumentTokens.some((token) => typeof token !== "string" || token.length === 0)) throw new TypeError("Native CAPTURE_EXECUTE argument tokens must all be non-empty strings");
+		const executable = this.executablePath(NATIVE_REVIEW_OPERATION.CAPTURE_EXECUTE, true);
+		const execution = await this.invoke(NATIVE_REVIEW_OPERATION.CAPTURE_EXECUTE, request.cwd, [
+			"review", "capture-result",
+			...request.argumentTokens,
+		], true, request.signal, executable);
+		return decode(NATIVE_REVIEW_OPERATION.CAPTURE_EXECUTE, true, () => {
+			const body = object(execution.body);
+			if (body.schema === "gentle-ai.review-last-event-closure/v1") {
+				return decodeReviewLastEventClosureV1(body);
+			}
+			return decodeNativeReviewCaptureExecuteResult(body);
+		});
+	}
+
 
 	// gentle-pi#311 P5: executes one provider-rendered `review.finalize`
 	// execute transition exactly as rendered. The tokens come verbatim from
