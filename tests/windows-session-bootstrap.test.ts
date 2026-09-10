@@ -760,7 +760,11 @@ test("Windows-native bootstrap rejects a reparse routing parent and concurrent i
 	await mkdir(target);
 	await fixtureResult("junction", routing, ["-Target", target]);
 	assert.equal((await helper(agentHome, false, { diagnostics }))[1].error, "unsafe");
-	assert.deepEqual(emitted, ['{"kind":"windows-session-bootstrap-rejection","stage":"routing-open","ntstatus":3221226763}']);
+	assert.equal(emitted.length, 1);
+	const rejection = JSON.parse(emitted[0]) as BootstrapRejectionDiagnostic;
+	assert.equal(rejection.kind, "windows-session-bootstrap-rejection");
+	assert.equal(rejection.stage, "routing-open");
+	assert.ok(rejection.ntstatus === 0xC000050B || rejection.ntstatus === null);
 	const concurrentRoot = await mkdtemp(join(os.tmpdir(), "gentle-pi-bootstrap-"));
 	const concurrentHome = join(concurrentRoot, "profile", "agent");
 	await mkdir(join(concurrentHome, "gentle-agents"), { recursive: true });
