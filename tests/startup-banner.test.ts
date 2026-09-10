@@ -2,10 +2,24 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { syncBuiltinESMExports } from "node:module";
 import fs from "node:fs/promises";
-import startup from "../extensions/startup-banner.ts";
+import startup, { readGitBranch } from "../extensions/startup-banner.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { stripAnsi } from "../lib/terminal-theme.ts";
+
+test("startup branch lookup uses direct git argv and hides its Windows child", async () => {
+	const calls: Array<{ command: string; args: readonly string[]; options: Record<string, unknown> }> = [];
+	const run = ((command: string, args: readonly string[], options: Record<string, unknown>, callback: (error: Error | null, stdout: string) => void) => {
+		calls.push({ command, args, options });
+		callback(null, "main\n");
+	}) as typeof import("node:child_process").execFile;
+	assert.equal(await readGitBranch("/repo with spaces & metacharacters", run), "On branch main");
+	assert.deepEqual(calls, [{
+		command: "git",
+		args: ["-C", "/repo with spaces & metacharacters", "branch", "--show-current"],
+		options: { encoding: "utf8", shell: false, windowsHide: true },
+	}]);
+});
 
 // Drive the real header factory; background git/home reads never run.
 for (const showRose of [false, true]) for (const showTextLogo of [false, true]) {
