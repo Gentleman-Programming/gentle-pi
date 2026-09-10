@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -12,8 +12,10 @@ import type {
 	Theme,
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
-import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
-import type { NativeReviewCli } from "../lib/native-review-cli.ts";
+import { __testing, applyModelConfig, createGentleAiExtension } from "../extensions/gentle-ai.ts";
+import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError, type NativeReviewCli } from "../lib/native-review-cli.ts";
+import { CandidateViewError, type CandidateViewRegistry } from "../lib/review-candidate-view.ts";
+import { installPackageAssets } from "../lib/sdd-preflight.ts";
 import type { ReviewCollectInputV3, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { cardBody, cardHint, cardTitle, cardTone } from "./gentle-card-text.ts";
@@ -60,6 +62,31 @@ function lifecycleContext(overrides: Record<string, unknown> = {}): Record<strin
 		...overrides,
 	};
 }
+
+test("missing package-local binaries give a direct recovery without attributing the cause to lifecycle scripts", async () => {
+	const result = await __testing.executeReviewControllerOperation(
+		{ operation: "inspect" },
+		process.cwd(),
+		{
+			targetStatus: async () => {
+				throw new NativeReviewCliError(
+					NATIVE_REVIEW_ERROR_CODE.PACKAGE_BINARY_MISSING,
+					"review/status",
+					false,
+					false,
+					"package binary missing",
+				);
+			},
+		} as unknown as NativeReviewCli,
+	);
+
+	assert.equal(result.outcome, "native-status-package-binary-missing");
+	assert.equal(result.recovery_command, "node scripts/install-gentle-ai.mjs");
+	assert.match(String(result.next_action), /installed gentle-pi package directory/);
+	assert.match(String(result.next_action), /GENTLE_PI_SKIP_GENTLE_AI_INSTALL/);
+	assert.match(String(result.next_action), /remove or unset it before/);
+	assert.match(String(result.reason), /does not prove install lifecycle scripts were disabled/);
+});
 
 test("registered Gentle Review tools render reusable rose lifecycle call rows", () => {
 	const tools = registeredGentleTools();
@@ -177,6 +204,148 @@ test("registered Gentle Review tools preserve result envelopes and redact collap
 	}
 });
 
+function routingConsumerFixture(t: test.TestContext) {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-routing-consumers-"));
+	const configHome = join(root, "global");
+	const agentHome = join(root, "agent-home");
+	const projectPath = join(root, ".pi", "gentle-ai", "models.json");
+	const globalPath = join(configHome, "models.json");
+	const exportPath = join(configHome, "models.export.json");
+	for (const dir of [dirname(projectPath), join(root, "agents"), join(agentHome, "agents"), join(agentHome, "subagents")]) {
+		mkdirSync(dir, { recursive: true });
+	}
+	writeMarkdown(join(root, ".pi", "agents", "worker.md"), "---\nname: worker\ndescription: Worker\n---\nbody\n");
+	const previousConfigHome = process.env.GENTLE_PI_CONFIG_HOME;
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	process.env.GENTLE_PI_CONFIG_HOME = configHome;
+	process.env.GENTLE_PI_AGENT_HOME = agentHome;
+	t.after(() => {
+		if (previousConfigHome === undefined) delete process.env.GENTLE_PI_CONFIG_HOME;
+		else process.env.GENTLE_PI_CONFIG_HOME = previousConfigHome;
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		rmSync(root, { recursive: true, force: true });
+	});
+	const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+	createGentleAiExtension({ nativeReviewCli: null })({
+		on() {},
+		registerTool() {},
+		registerCommand(name, command) { commands.set(name, command); },
+	} as ExtensionAPI);
+	const notifications: Array<{ message: string; severity: string }> = [];
+	let panelVisits = 0;
+	const panels: string[] = [];
+	let onPanel = () => ({ type: "cancel", config: {} });
+	const ctx = {
+		cwd: root,
+		hasUI: true,
+		modelRegistry: { getAvailable: async () => [] },
+		ui: {
+			notify(message: string, severity: string) { notifications.push({ message, severity }); },
+			custom: async (factory: (tui: unknown, theme: Theme, keybindings: unknown, done: () => void) => { render(width: number): string[] }) => {
+				panels.push(stripAnsi(renderComponent(factory(undefined, { fg: (_color: string, text: string) => text } as unknown as Theme, undefined, () => {}))));
+				panelVisits += 1;
+				return onPanel();
+			},
+		},
+	} as unknown as Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1];
+	return {
+		configHome, projectPath, globalPath, exportPath, notifications, panels,
+		panelVisits: () => panelVisits,
+		onPanel(action: typeof onPanel) { onPanel = action; },
+		run: (name: string) => commands.get(name)!.handler("", ctx),
+	};
+}
+
+test("models rejects invalid project routing with its selected source path", async (t) => {
+	const fixture = routingConsumerFixture(t);
+	writeFileSync(fixture.projectPath, "[]");
+	await fixture.run("gentle:models");
+	assert.equal(fixture.notifications[0]?.severity, "warning");
+	assert.ok(fixture.notifications[0]?.message.includes(fixture.projectPath));
+	assert.equal(fixture.panelVisits(), 0);
+});
+
+test("export re-reads saved routing and rejects invalid project before creating its destination parent", async (t) => {
+	const fixture = routingConsumerFixture(t);
+	writeFileSync(fixture.projectPath, '{"worker":"openai/gpt-5"}');
+	fixture.onPanel(() => {
+		if (fixture.panelVisits() > 1) return { type: "cancel", config: {} };
+		writeFileSync(fixture.projectPath, "[]");
+		return { type: "export", config: {} };
+	});
+	await fixture.run("gentle:models");
+	assert.equal(fixture.notifications[0]?.severity, "warning");
+	assert.ok(fixture.notifications[0]?.message.includes(`Invalid model config: ${fixture.projectPath}`));
+	assert.equal(existsSync(fixture.exportPath), false);
+	assert.equal(existsSync(fixture.configHome), false);
+});
+
+test("status reports invalid saved routing path instead of default agent routing", async (t) => {
+	const fixture = routingConsumerFixture(t);
+	writeFileSync(fixture.projectPath, "[]");
+	await fixture.run("gentle:status");
+	const report = fixture.notifications.at(-1)!;
+	assert.match(report.message, /Saved model routing: invalid/);
+	assert.ok(report.message.includes(fixture.projectPath));
+	assert.equal(report.severity, "warning");
+	assert.doesNotMatch(report.message, /worker: model=/);
+});
+
+test("models exports missing, normalized project, and global-precedence saved routing", async (t) => {
+	for (const source of ["missing", "project", "global"] as const) {
+		await t.test(source, async (t) => {
+			const fixture = routingConsumerFixture(t);
+			if (source !== "missing") writeFileSync(fixture.projectPath, '{"worker":" openai/gpt-5 ","ignored":null}');
+			if (source === "global") writeMarkdown(fixture.globalPath, '{"worker":{"model":" anthropic/opus ","thinking":"high"}}');
+			fixture.onPanel(() => ({ type: fixture.panelVisits() === 1 ? "export" : "cancel", config: {} }));
+			await fixture.run("gentle:models");
+			const agents = source === "missing" ? {} : source === "project"
+				? { worker: { model: "openai/gpt-5" } }
+				: { worker: { model: "anthropic/opus", thinking: "high" } };
+			assert.deepEqual(JSON.parse(readFileSync(fixture.exportPath, "utf8")).agents, agents);
+			assert.equal(fixture.notifications[0]?.severity, "info");
+			assert.match(fixture.notifications[0]!.message, /exported/);
+			assert.equal(fixture.panelVisits(), 2);
+			await fixture.run("gentle:status");
+			const report = fixture.notifications.at(-1)!.message;
+			assert.ok(report.includes(`Saved model routing: ${source === "missing" ? "missing" : "valid"}`));
+			assert.ok(report.includes(`Global model config: ${source === "global" ? "present" : "missing"}`));
+			const expectedRouting = source === "missing" ? "inherit, effort=inherit"
+				: source === "project" ? "openai/gpt-5, effort=inherit" : "anthropic/opus, effort=high";
+			assert.ok(report.includes(`worker: model=${expectedRouting}`), report);
+			assert.ok(fixture.panels[0].includes(`model=${expectedRouting}`), fixture.panels[0]);
+		});
+	}
+});
+
+test("invalid global routing overrides valid project in models, status, and export re-read", async (t) => {
+	for (const atExport of [false, true]) {
+		await t.test(atExport ? "invalidated during panel" : "invalid before panel", async (t) => {
+			const fixture = routingConsumerFixture(t);
+			writeFileSync(fixture.projectPath, '{"worker":"openai/gpt-5"}');
+			if (!atExport) writeMarkdown(fixture.globalPath, "[]");
+			fixture.onPanel(() => {
+				if (fixture.panelVisits() > 1) return { type: "cancel", config: {} };
+				writeMarkdown(fixture.globalPath, "[]");
+				return { type: "export", config: {} };
+			});
+			await fixture.run("gentle:models");
+			assert.equal(fixture.notifications[0]?.severity, "warning");
+			assert.ok(fixture.notifications[0]?.message.includes(fixture.globalPath));
+			assert.match(fixture.notifications[0]!.message, atExport ? /export failed/ : /cannot open model config/);
+			assert.equal(fixture.panelVisits(), atExport ? 2 : 0);
+			assert.equal(existsSync(fixture.exportPath), false);
+			await fixture.run("gentle:status");
+			const report = fixture.notifications.at(-1)!;
+			assert.match(report.message, /Global model config: present\nSaved model routing: invalid/);
+			assert.ok(report.message.includes(fixture.globalPath));
+			assert.doesNotMatch(report.message, /worker: model=/);
+			assert.equal(report.severity, "warning");
+		});
+	}
+});
+
 test("session startup reports invalid project routing without mutating the profile", async (t) => {
 	const root = mkdtempSync(join(tmpdir(), "gentle-pi-model-routing-startup-"));
 	const configHome = join(root, "global");
@@ -241,6 +410,21 @@ test("session startup reports invalid project routing without mutating the profi
 	assert.equal(warning!.severity, "warning");
 	assert.match(warning!.message, /skipped model config/);
 	assert.equal(readFileSync(profilePath, "utf8"), before);
+
+	writeFileSync(join(projectConfigDir, "models.json"), '{"worker":"openai/gpt-5"}');
+	const globalPath = join(configHome, "models.json");
+	writeFileSync(globalPath, "[]");
+	notifications.length = 0;
+	await sessionStart!({}, {
+		cwd: root,
+		hasUI: true,
+		ui: { notify(message: string, severity: string) { notifications.push({ message, severity }); } },
+	} as unknown as ExtensionContext);
+	const globalWarning = notifications.find((entry) => entry.message.includes(globalPath));
+	assert.ok(globalWarning, JSON.stringify(notifications));
+	assert.equal(globalWarning.severity, "warning");
+	assert.match(globalWarning.message, /skipped model config/);
+	assert.equal(readFileSync(profilePath, "utf8"), before);
 });
 
 test("agent discovery skips skills directories", async (t) => {
@@ -266,6 +450,82 @@ test("agent discovery skips skills directories", async (t) => {
 		asyncAgents.map((agent) => agent.name),
 		["review-risk", "worker"],
 	);
+});
+
+test("managed routing timeout leaves its profile, agent, and manifest unchanged", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-managed-routing-timeout-"));
+	const agentHome = join(root, "agent-home");
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	t.after(() => {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	process.env.GENTLE_PI_AGENT_HOME = agentHome;
+	installPackageAssets(root, false, ["sdd"]);
+	const agentPath = join(agentHome, "agents", "sdd-apply.md");
+	const manifestPath = join(agentHome, "gentle-ai", "managed-assets.json");
+	const profilePath = join(agentHome, "subagents.json");
+	const profileBefore = "{\n  \"unrelated\": true\n}\n";
+	writeFileSync(profilePath, profileBefore);
+	const agentBefore = readFileSync(agentPath, "utf8");
+	const manifestBefore = readFileSync(manifestPath, "utf8");
+	writeFileSync(
+		join(agentHome, "gentle-ai", "managed-assets.lock"),
+		JSON.stringify({ schemaVersion: 1, token: "foreign", pid: process.pid, createdAtMs: Date.now() }),
+	);
+
+	assert.throws(
+		() => applyModelConfig(root, { "sdd-apply": { model: "test/managed", thinking: "high" } }),
+		/Timed out acquiring managed-assets lock file/i,
+	);
+	assert.equal(readFileSync(profilePath, "utf8"), profileBefore);
+	assert.equal(readFileSync(agentPath, "utf8"), agentBefore);
+	assert.equal(readFileSync(manifestPath, "utf8"), manifestBefore);
+});
+
+test("a later alias keeps managed-root precedence and manifest ownership", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-agent-root-alias-"));
+	const agentHome = join(root, "agent-home");
+	const home = join(root, "home");
+	const cwd = join(root, "project");
+	const managed = join(agentHome, "agents");
+	const intervening = join(agentHome, "subagents");
+	const alias = join(home, ".agents");
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const previousHome = process.env.HOME;
+	const previousUserProfile = process.env.USERPROFILE;
+	t.after(() => {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousUserProfile;
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	process.env.GENTLE_PI_AGENT_HOME = agentHome;
+	process.env.HOME = home;
+	process.env.USERPROFILE = home;
+	installPackageAssets(cwd, false, ["sdd"]);
+	writeMarkdown(join(intervening, "sdd-apply.md"), "---\nname: sdd-apply\n---\nintervening override\n");
+	mkdirSync(home, { recursive: true });
+	try {
+		symlinkSync(managed, alias, process.platform === "win32" ? "junction" : "dir");
+	} catch (error) {
+		t.skip(`directory aliases unavailable: ${error instanceof Error ? error.message : String(error)}`);
+		return;
+	}
+
+	const selected = __testing.listDiscoverableAgents(cwd).find((agent) => agent.name === "sdd-apply");
+	assert.equal(selected?.filePath, join(managed, "sdd-apply.md"));
+	applyModelConfig(cwd, { "sdd-apply": { model: "test/managed", thinking: "high" } });
+	const manifest = JSON.parse(readFileSync(join(agentHome, "gentle-ai", "managed-assets.json"), "utf8")) as { assets: Record<string, string> };
+	const routed = readFileSync(join(managed, "sdd-apply.md"), "utf8");
+	assert.match(routed, /^model: test\/managed$/m);
+	assert.equal(manifest.assets["agents/sdd-apply.md"], createHash("sha256").update(routed).digest("hex"));
 });
 
 test("runtime guidance keeps review policy out of the static orchestrator", () => {
@@ -375,6 +635,83 @@ test("ordinary native capture exposes a registered schema and STATUS binding cop
 	}, process.cwd(), native);
 	assert.equal(captured.status, "captured");
 	assert.equal(launches, 1);
+});
+
+test("ordinary START reports candidate-owner preparation failure as pre-native no mutation", async () => {
+	let nativeStarts = 0;
+	const target = {
+		contract: "gentle-ai.review-integration/v2",
+		applicability: "unrelated",
+		action: "start",
+		replayability: "not_replayable",
+		targetIdentity: "a".repeat(64),
+		projection: {
+			schema: "gentle-ai.review-candidate-projection/v1",
+			kind: "current-changes",
+			projection: "workspace",
+			baseTree: "b".repeat(40),
+			initialReviewTree: "b".repeat(40),
+			currentCandidateTree: "b".repeat(40),
+			pathsDigest: "a".repeat(64),
+			paths: [],
+			intendedUntracked: [],
+			intendedUntrackedProof: "a".repeat(64),
+			initialSnapshotIdentity: "a".repeat(64),
+			currentSnapshotIdentity: "a".repeat(64),
+		},
+		candidates: [],
+		raw: { schema: "gentle-ai.review-integration.status/v5" },
+	} as unknown as ReviewStatusV3;
+	const native = {
+		targetStatus: async () => target,
+		start: async () => { nativeStarts += 1; throw new Error("native START must not run"); },
+	} as unknown as NativeReviewCli;
+	const candidateViews = {
+		createOrReuse: () => { throw new CandidateViewError("candidate view owner preparation failed", "candidate-owner-preparation-failed"); },
+	} as unknown as CandidateViewRegistry;
+	const result = await __testing.executeReviewControllerOperation(
+		{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+		process.cwd(),
+		native,
+		undefined,
+		candidateViews,
+	);
+	assert.equal(nativeStarts, 0);
+	assert.equal(result.outcome, "native-operation-failed");
+	assert.equal(result.mutation_outcome, "none");
+	assert.deepEqual(result.diagnostics, {
+		code: "candidate-owner-preparation-failed",
+		message: "candidate view rejected before native START",
+	});
+
+	let statusCalls = 0;
+	const afterNative = await __testing.executeReviewControllerOperation(
+		{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+		process.cwd(),
+		{
+			targetStatus: async () => { statusCalls += 1; return target; },
+			start: async () => {
+				nativeStarts += 1;
+				throw new CandidateViewError("post-native candidate verification failed", "candidate-view-timeout", {
+					phase: "candidate-view",
+					category: "timeout",
+					git_subcommand: "worktree",
+					timeout_ms: 10_000,
+					max_buffer_bytes: 64 * 1024 * 1024,
+					message: "candidate-view Git command worktree timed out after 10000ms; inspect the candidate state before any new START",
+				});
+			},
+		} as unknown as NativeReviewCli,
+		undefined,
+		null,
+	);
+	assert.equal(nativeStarts, 1);
+	assert.equal(statusCalls, 2, "a post-native diagnostic must reconcile STATUS");
+	assert.equal(afterNative.mutation_outcome, "unknown");
+	assert.deepEqual(afterNative.diagnostics, {
+		code: "candidate-view-timeout",
+		message: "post-native candidate verification failed",
+	});
 });
 
 test("agent model discovery prioritizes SDD and Judgment Day agents", (t) => {

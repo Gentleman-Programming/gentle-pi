@@ -1,17 +1,20 @@
 import { CustomEditor, keyHint, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import * as os from "node:os";
 import { join } from "node:path";
-import { renderShellBar, shellEnabled, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
-import { CHANGE_STATUS, ChangesTracker, renderChangesWidget, type ChangedFile, type ChangesModel, type GitRunner, type LineCounter } from "../lib/shell-changes.ts";
-import { ChangesView } from "../lib/shell-changes-view.ts";
+import { renderShellBar, renderShellSidebarBar, shellEnabled, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
+import { CHANGE_STATUS, WorktreeChangesTracker, renderChangesWidget, type ChangedFile, type ChangesModel, type GitRunner, type LineCounter, type WorktreeChanges } from "../lib/shell-changes.ts";
+import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
+import { SessionWorktreeRegistry, SESSION_WORKTREE_CHANGED, resolveSessionWorktree, toolWorktreePath, worktreeGitEnvironment, type WorktreeResolver } from "../lib/session-worktree-registry.ts";
 import { CARD_TONE, renderCard, type Card, type CardTheme } from "../lib/shell-card.ts";
 import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
-import { framePromptLines, panelPainter, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
+import { framePromptLines, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
 import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, parseCodexUsage, parseUsageHeaders, UsageStore, type ProviderUsage } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
+import { sidebarPart } from "../lib/shell-sidebar.ts";
+import { installSidebar, invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
 
 // Gentle Shell: the visual layer gentle-pi puts on top of pi. It installs the
 // status bar, the petal prompt, the working-tree changes widget and overlay,
@@ -26,6 +29,7 @@ export interface ShellFooterData {
 
 interface ShellRenderHost {
 	requestRender(): void;
+	invalidateSidebar?(): void;
 }
 
 interface ShellBarComponent {
@@ -46,6 +50,8 @@ export interface ShellDeps {
 	fetch: typeof fetch;
 	now(): number;
 	devBinary(): DevBinaryNotice | undefined;
+	resolveWorktree: WorktreeResolver;
+	gitRunner(cwd: string): GitRunner;
 }
 
 function ambientDevBinary(): DevBinaryNotice | undefined {
@@ -58,7 +64,7 @@ function ambientDevBinary(): DevBinaryNotice | undefined {
 	}
 }
 
-const defaultShellDeps: ShellDeps = { fetch: (...args) => globalThis.fetch(...args), now: () => Date.now(), devBinary: ambientDevBinary };
+const defaultShellDeps: ShellDeps = { fetch: (...args) => globalThis.fetch(...args), now: () => Date.now(), devBinary: ambientDevBinary, resolveWorktree: resolveSessionWorktree, gitRunner: shellGitRunner };
 
 interface AssistantUsageEntry {
 	type: string;
@@ -121,7 +127,10 @@ export function createShellBarComponent(
 	dirty: () => number | undefined = () => undefined,
 	usage: () => ProviderUsage | undefined = () => undefined,
 ): ShellBarComponent {
-	const unsubscribe = footerData.onBranchChange(() => host.requestRender());
+	const unsubscribe = footerData.onBranchChange(() => {
+		host.invalidateSidebar?.();
+		host.requestRender();
+	});
 	return {
 		render(width: number) {
 			return renderShellBar(buildShellBarModel(pi, ctx, footerData, { dirty: dirty(), usage: usage() }), theme, width);
@@ -136,7 +145,6 @@ export function createShellBarComponent(
 interface PromptEditorDeps {
 	fg: (color: string, text: string) => string;
 	bold: (text: string) => string;
-	paint?: (line: string) => string;
 	requestRender(): void;
 	pending(): boolean;
 }
@@ -181,7 +189,6 @@ export class GentlePromptEditor extends CustomEditor {
 			borderColor: (text) => this.deps.fg(PROMPT_FRAME_ROLE, text),
 			fg: this.deps.fg,
 			bold: this.deps.bold,
-			paint: this.deps.paint,
 		});
 	}
 
@@ -202,7 +209,6 @@ function installPrompt(ctx: ExtensionContext, onCreated: (prompt: GentlePromptEd
 		const prompt = new GentlePromptEditor(tui, theme, keybindings, {
 			fg: (color, text) => ctx.ui.theme.fg(color as Parameters<typeof ctx.ui.theme.fg>[0], text),
 			bold: (text) => ctx.ui.theme.bold(text),
-			paint: panelPainter(ctx.ui.theme.getBgAnsi("customMessageBg")),
 			requestRender: () => tui.requestRender(),
 			pending: () => ctx.hasPendingMessages(),
 		});
@@ -220,11 +226,24 @@ const GIT_TIMEOUT_MS = 5000;
 const OVERLAY_HEIGHT_RATIO = 0.8;
 const OVERLAY_MIN_ROWS = 8;
 
-function gitRunner(pi: ExtensionAPI, cwd: string): GitRunner {
-	return async (args: string[]) => {
-		const result = await pi.exec("git", ["-C", cwd, ...args], { timeout: GIT_TIMEOUT_MS });
-		return { stdout: result.stdout, code: result.code };
-	};
+export function shellGitRunner(cwd: string, env: NodeJS.ProcessEnv = process.env, run: typeof execFile = execFile): GitRunner {
+	// Pi exec cannot replace the inherited environment. Use argv directly and
+	// a complete sanitized environment for discovery, status, and lazy diffs.
+	const childEnv = worktreeGitEnvironment(env);
+	return (args) => new Promise((resolve) => {
+		run("git", ["-C", cwd, ...args], {
+			env: childEnv,
+			encoding: "utf8",
+			shell: false,
+			windowsHide: true,
+			timeout: GIT_TIMEOUT_MS,
+			// Pi exec accumulates output without a maxBuffer cap. In particular,
+			// large porcelain inventories must not become partial successful scans.
+			maxBuffer: Infinity,
+		}, (error, stdout) => {
+			resolve({ stdout, code: error ? typeof error.code === "number" ? error.code : 1 : 0 });
+		});
+	});
 }
 
 function lineCounter(cwd: string): LineCounter {
@@ -247,13 +266,13 @@ export interface ExternalEditorHost {
 	requestRender(force?: boolean): void;
 }
 
-export function openInExternalEditor(host: ExternalEditorHost, path: string, env: NodeJS.ProcessEnv = process.env, spawn: typeof spawnSync = spawnSync): boolean {
+export function openInExternalEditor(host: ExternalEditorHost, path: string, env: NodeJS.ProcessEnv = process.env, spawn: typeof spawnSync = spawnSync, cwd?: string): boolean {
 	const command = env.VISUAL || env.EDITOR;
 	if (!command) return false;
 	const [editor, ...editorArgs] = command.split(" ");
 	host.stop();
 	try {
-		spawn(editor, [...editorArgs, path], { stdio: "inherit", shell: process.platform === "win32" });
+		spawn(editor, [...editorArgs, path], { cwd, stdio: "inherit", shell: process.platform === "win32" });
 	} finally {
 		host.start();
 		host.requestRender(true);
@@ -289,7 +308,8 @@ function changesFingerprint(model: ChangesModel): string {
 }
 
 interface OverlayDeps {
-	git: GitRunner;
+	git(root: string): GitRunner;
+	worktrees(): WorktreeChanges[];
 	refresh(): Promise<ChangesModel>;
 	apply(ctx: ExtensionContext, model: ChangesModel): void;
 	pollMs: number;
@@ -297,24 +317,26 @@ interface OverlayDeps {
 
 // While the overlay is open, git is polled so edits made outside pi (nvim,
 // another agent, a git checkout) show up without reopening it.
-async function showChangesOverlay(ctx: ExtensionContext, model: ChangesModel, deps: OverlayDeps): Promise<void> {
+async function showChangesOverlay(ctx: ExtensionContext, deps: OverlayDeps): Promise<void> {
 	let host: ExternalEditorHost | undefined;
-	let view: ChangesView | undefined;
-	const poll = setInterval(async () => {
+	let view: WorktreeChangesView | undefined;
+	const refresh = async () => {
 		const latest = await deps.refresh();
-		view?.update(latest);
+		view?.update(deps.worktrees());
 		deps.apply(ctx, latest);
-	}, deps.pollMs);
+	};
+	const poll = setInterval(() => void refresh(), deps.pollMs);
 	poll.unref();
 	try {
-		const chosen = await ctx.ui.custom<ChangedFile | null>(
+		const chosen = await ctx.ui.custom<{ root: string; file: ChangedFile } | null>(
 			(tui, theme, _keybindings, done) => {
 				host = tui;
-				view = new ChangesView(model, {
+				view = new WorktreeChangesView(deps.worktrees(), {
 					theme,
 					rows: Math.max(OVERLAY_MIN_ROWS, Math.floor(tui.terminal.rows * OVERLAY_HEIGHT_RATIO)),
-					loadDiff: (file) => loadFileDiff(deps.git, file),
-					onOpen: (file) => done(file),
+					loadDiff: (root, file) => loadFileDiff(deps.git(root), file),
+					onOpen: (root, file) => done({ root, file }),
+					onRefresh: () => void refresh(),
 					onClose: () => done(null),
 					requestRender: () => tui.requestRender(),
 				});
@@ -323,9 +345,10 @@ async function showChangesOverlay(ctx: ExtensionContext, model: ChangesModel, de
 			{ overlay: true, overlayOptions: { width: "92%", anchor: "center" } },
 		);
 		if (!chosen || !host) return;
-		if (!openInExternalEditor(host, chosen.path)) ctx.ui.notify("No editor configured. Set $VISUAL or $EDITOR.", "warning");
+		if (!openInExternalEditor(host, chosen.file.path, process.env, spawnSync, chosen.root)) ctx.ui.notify("No editor configured. Set $VISUAL or $EDITOR.", "warning");
 	} finally {
 		clearInterval(poll);
+		view = undefined;
 	}
 }
 
@@ -336,9 +359,23 @@ function showChanges(ctx: ExtensionContext, model: ChangesModel): void {
 	}
 	ctx.ui.setWidget(
 		CHANGES_WIDGET_KEY,
-		(_tui, theme) => ({
+		(tui, theme) => sidebarPart(tui, "changes", {
 			render(width: number) {
 				return renderChangesWidget(model, theme, width);
+			},
+			invalidate() {},
+		}, {
+			render(width: number) {
+				const noun = model.files.length === 1 ? "file" : "files";
+				return renderCard({
+					title: "Changes",
+					tone: CARD_TONE.INFO,
+					body: [
+						`${model.files.length} ${noun} · ${theme.fg("success", `+${model.added}`)} ${theme.fg("error", `−${model.deleted}`)}`,
+						"",
+						theme.fg("muted", `/${CHANGES_COMMAND_NAME}`),
+					],
+				}, theme, width, { expanded: true });
 			},
 			invalidate() {},
 		}),
@@ -359,7 +396,6 @@ function messageText(content: string | Array<{ type: string; text?: string }>): 
 interface CardComponentOptions {
 	expanded: boolean;
 	hint?: string;
-	paint?: (line: string) => string;
 }
 
 function cardComponent(card: Card, theme: CardTheme, options: CardComponentOptions) {
@@ -429,12 +465,14 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		const fetched = await fetchCodexUsage(token, deps.fetch, deps.now());
 		if (!fetched) return;
 		usage.record(fetched);
+		renderHost?.invalidateSidebar?.();
 		renderHost?.requestRender();
 	};
 	pi.on("after_provider_response", (event) => {
 		const parsed = parseUsageHeaders(event.headers, deps.now());
 		if (!parsed) return;
 		usage.record(parsed);
+		renderHost?.invalidateSidebar?.();
 		renderHost?.requestRender();
 	});
 	pi.registerMessageRenderer(REVIEW_PREFLIGHT_TYPE, (message, options, theme) => {
@@ -461,7 +499,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		},
 	});
 	let prompt: GentlePromptEditor | undefined;
-	let changes: ChangesTracker | undefined;
+	let changes: WorktreeChangesTracker | undefined;
+	let registry: SessionWorktreeRegistry | undefined;
+	let currentContext: ExtensionContext | undefined;
+	const pendingTools = new Map<string, { sessionId: string; path?: string }>();
 	let watch: NodeJS.Timeout | undefined;
 	let shown = "";
 	const applyChanges = (ctx: ExtensionContext, model: ChangesModel) => {
@@ -471,20 +512,53 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		showChanges(ctx, model);
 	};
 	const refreshChanges = async (ctx: ExtensionContext) => {
-		if (!changes || !ctx.hasUI) return;
-		applyChanges(ctx, await changes.refresh());
+		const tracker = changes;
+		if (!tracker || !ctx.hasUI || registry?.sessionId !== ctx.sessionManager.getSessionId()) return;
+		const model = await tracker.refresh();
+		if (changes === tracker) applyChanges(ctx, model);
 	};
 	const stopWatch = () => {
 		if (watch) clearInterval(watch);
 		watch = undefined;
 	};
+	const unsubscribeWorktrees = pi.events.on(SESSION_WORKTREE_CHANGED, (data) => {
+		if (!currentContext || !registry || (data as { sessionId?: string } | undefined)?.sessionId !== registry.sessionId) return;
+		void refreshChanges(currentContext);
+	});
+	pi.registerTool({
+		name: "session_worktree_register",
+		renderShell: "self",
+		label: "Register session worktree",
+		description: "Register a worktree used by this session, including earlier work or opaque shell use. Only the same Git clone is accepted. Shows ALL dirty files in that root, including preexisting and untracked files; never infers roots from shell commands or prose.",
+		parameters: { type: "object", required: ["path"], additionalProperties: false, properties: { path: { type: "string", description: "Worktree path to include in this session." } } } as never,
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			if (!registry || registry.sessionId !== ctx.sessionManager.getSessionId()) throw new Error("No active session worktree registry.");
+			const root = registry.register((params as { path: string }).path, "explicit");
+			await refreshChanges(ctx);
+			return { content: [{ type: "text", text: `Registered session worktree: ${root}` }], details: { root, sessionId: registry.sessionId } };
+		},
+	});
 	pi.on("session_start", async (_event, ctx) => {
+		stopWatch();
+		registry?.close();
+		pendingTools.clear();
+		currentContext = ctx;
+		changes = undefined;
+		registry = new SessionWorktreeRegistry(pi, ctx.sessionManager, ctx.cwd, deps.resolveWorktree);
+		registry.start();
+		const sessionRegistry = registry;
 		if (!ctx.hasUI) return;
-		changes = new ChangesTracker(gitRunner(pi, ctx.cwd), lineCounter(ctx.cwd));
+		changes = new WorktreeChangesTracker(deps.gitRunner(ctx.cwd), deps.gitRunner, lineCounter, () => sessionRegistry.roots());
 		const tracker = changes;
 		ctx.ui.setFooter((tui, theme, footerData) => {
-			renderHost = tui;
-			return createShellBarComponent(pi, ctx, tui, theme, footerData, () => tracker.model.files.length, () => usage.get(ctx.model?.provider ?? ""));
+			renderHost = { requestRender: () => tui.requestRender(), invalidateSidebar: () => invalidateSidebar(tui) };
+			const bottom = createShellBarComponent(pi, ctx, renderHost, theme, footerData, () => tracker.model.files.length, () => usage.get(ctx.model?.provider ?? ""));
+			const part = sidebarPart(tui, "footer", bottom, {
+				render: (width) => renderShellSidebarBar(buildShellBarModel(pi, ctx, footerData, { dirty: tracker.model.files.length, usage: usage.get(ctx.model?.provider ?? "") }), theme, width),
+				invalidate() {},
+			});
+			const uninstall = installSidebar(tui, theme);
+			return { ...part, dispose() { uninstall(); part.dispose(); } };
 		});
 		void refreshUsage(ctx, true);
 		installPrompt(ctx, (created) => {
@@ -496,10 +570,11 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		ctx.ui.setWidget(
 			DEV_BINARY_WIDGET_KEY,
 			notice
-				? (_tui, theme) => spaced(cardComponent(devBinaryCard(notice), theme, { expanded: true, paint: (line) => theme.bg("customMessageBg", line) }))
+				? (_tui, theme) => spaced(cardComponent(devBinaryCard(notice), theme, { expanded: true }))
 				: undefined,
 		);
 		await tracker.start();
+		if (changes !== tracker) return;
 		shown = "";
 		applyChanges(ctx, tracker.model);
 		stopWatch();
@@ -509,7 +584,15 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			watch.unref();
 		}
 	});
-	pi.on("session_shutdown", () => stopWatch());
+	pi.on("session_shutdown", () => {
+		stopWatch();
+		registry?.close();
+		registry = undefined;
+		changes = undefined;
+		currentContext = undefined;
+		pendingTools.clear();
+		unsubscribeWorktrees();
+	});
 	const openChanges = async (ctx: ExtensionContext) => {
 		if (!changes) return;
 		const tracker = changes;
@@ -518,10 +601,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			ctx.ui.notify("No changes in the working tree.", "info");
 			return;
 		}
-		await showChangesOverlay(ctx, model, { git: gitRunner(pi, ctx.cwd), refresh: () => tracker.refresh(), apply: applyChanges, pollMs: changesPollMs(env) });
+		await showChangesOverlay(ctx, { git: deps.gitRunner, worktrees: () => tracker.worktrees, refresh: () => tracker.refresh(), apply: applyChanges, pollMs: changesPollMs(env) });
 	};
 	pi.registerCommand(CHANGES_COMMAND_NAME, {
-		description: "Show the working tree changes against HEAD, with diffs. Press o to open a file in $EDITOR.",
+		description: "Browse this session's registered dirty worktrees and their changes against HEAD. Press o on a file to open $EDITOR.",
 		handler: async (_args, ctx) => openChanges(ctx),
 	});
 	const shortcut = changesShortcut(env);
@@ -541,7 +624,20 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		await refreshChanges(ctx);
 		void refreshUsage(ctx, false);
 	});
-	pi.on("tool_execution_end", async (_event, ctx) => {
+	pi.on("tool_execution_start", (event, ctx) => {
+		pendingTools.set(event.toolCallId, { sessionId: ctx.sessionManager.getSessionId() });
+	});
+	pi.on("tool_result", (event, ctx) => {
+		const pending = pendingTools.get(event.toolCallId);
+		if (pending?.sessionId === ctx.sessionManager.getSessionId()) pending.path = toolWorktreePath(event.toolName, event.input);
+	});
+	pi.on("tool_execution_end", async (event, ctx) => {
+		const pending = pendingTools.get(event.toolCallId);
+		pendingTools.delete(event.toolCallId);
+		if (!event.isError && pending?.path !== undefined && pending.sessionId === registry?.sessionId && pending.sessionId === ctx.sessionManager.getSessionId()) {
+			try { registry.register(pending.path, `tool:${event.toolName}`); }
+			catch { /* Non-project paths and missing roots do not expand the registry. */ }
+		}
 		await refreshChanges(ctx);
 	});
 }

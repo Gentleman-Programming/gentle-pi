@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Box, visibleWidth } from "@earendil-works/pi-tui";
 import { renderGentleAiResult, GentleAiCallCard } from "../lib/gentle-ai-renderer.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
@@ -36,6 +38,42 @@ test("completed review cards fit Pi's default Box at terminal width 57", () => {
 		for (const line of lines) assert.equal(visibleWidth(line), 57, `${operationPath}: ${JSON.stringify(line)}`);
 		if (operationPath === "review inspect") {
 			assert.equal(lines[1], " ╭─ 🌹︎ Gentle AI · completed · review inspect ─────────╮ ");
+		}
+	}
+});
+
+test("review registrations own their shell", () => {
+	const tools: ToolDefinition[] = [];
+	createGentleAiExtension({ nativeReviewCli: null } as never)({
+		on() {}, registerCommand() {}, registerTool(tool: ToolDefinition) { tools.push(tool); },
+	} as unknown as ExtensionAPI);
+	const review = tools.filter((tool) => tool.name.startsWith("gentle_review"));
+	assert.equal(review.length, 4);
+	for (const tool of review) assert.equal(tool.renderShell, "self", tool.name);
+});
+
+test("review call and result cards have no passive background fill", () => {
+	const theme = { ...plainTheme, bg: (_role: string, text: string) => `\x1b[44m${text}\x1b[49m` };
+	for (const options of [
+		{ expanded: true }, { expanded: false },
+		{ expanded: true, isPartial: true }, { expanded: false, isPartial: true },
+		{ expanded: true, isError: true }, { expanded: false, isError: true },
+	]) {
+		const call = new GentleAiCallCard();
+		call.update(options.isPartial ? "running" : "completed", "review capture", theme, "$ capture");
+		const lines = [...call.render(40), ...renderGentleAiResult({ content: [{ type: "text", text: "Result" }] }, options, theme).render(40)];
+		for (const [row, line] of lines.entries()) {
+			let bg = false, column = 0;
+			for (const token of line.match(/\x1b\[[\d;]*m|[^\x1b]/gu) ?? []) {
+				if (token === "\x1b[44m") bg = true;
+				else if (token === "\x1b[49m" || token === "\x1b[0m") bg = false;
+				else if (!token.startsWith("\x1b")) {
+					assert.equal(bg, false, `row ${row}, cell ${column} must remain transparent`);
+					column += visibleWidth(token);
+				}
+			}
+			assert.equal(bg, false);
+			assert.equal(visibleWidth(line), 40);
 		}
 	}
 });

@@ -41,6 +41,31 @@ function nonPiV3Consent() {
 	return decodeReviewConsentV3(consentFixture(), "claude-code");
 }
 
+function consentCustom(select: (title: string, options: string[]) => Promise<string | undefined>) {
+	return async (factory: (...args: never[]) => unknown) => {
+		let result: unknown;
+		const component = factory(
+			{ terminal: { rows: 24 }, requestRender() {} },
+			{ fg: (_color: string, text: string) => text, bold: (text: string) => text },
+			undefined,
+			(value: unknown) => { result = value; },
+		) as { getActionOptions(): readonly string[]; render(width: number): string[]; handleInput?(data: string): void };
+		component.render(80);
+		const options = [...component.getActionOptions()];
+		const selected = await select("", options);
+		const index = options.indexOf(selected ?? "");
+		if (index === -1) component.handleInput?.("\u001b");
+		else {
+			for (let current = 0; current < index; current += 1) {
+				component.handleInput?.("\u001b[B");
+				component.render(80);
+			}
+			component.handleInput?.("\r");
+		}
+		return result;
+	};
+}
+
 test("host UI preserves the complete provider envelope and adds a separately owned third action", () => {
 	const envelope = consent();
 	const before = structuredClone(envelope.raw);
@@ -54,9 +79,16 @@ test("host UI preserves the complete provider envelope and adds a separately own
 		assert.ok(model.options[index]!.includes(choice.label));
 		assert.ok(model.options[index]!.includes(choice.effect));
 	}
+	assert.equal(model.content.actions[2]?.label, "Review and allow this session");
+	assert.equal(model.content.actions[2]?.effect, "Reviews this change and allows later reviews in this session and repository; revoke anytime.");
 	assert.ok(model.options[2]!.includes(HOST_REVIEW_SESSION_PERMISSION_LABEL));
 	assert.match(model.title, /The first two actions are provider-owned and apply only to this candidate/);
 	assert.match(model.title, /The third action is owned by the Pi host/);
+	assert.match(model.content.ownership, /runs the current provider grant for this frozen candidate/);
+	assert.match(model.content.ownership, /one fresh validated provider grant for each later candidate/);
+	assert.match(model.content.ownership, /canonical Git repository identity, including sibling worktrees/);
+	assert.match(model.content.ownership, /Reload preserves it; new, resume, fork, quit, process restart, or explicit revocation ends it/);
+	assert.match(model.content.ownership, /no verdict, acknowledgement, maintenance, delivery, or cross-repository authority/);
 	assert.equal(envelope.choices.length, 2, "the decoded provider envelope must remain a two-choice contract");
 	assert.deepEqual(envelope.raw, before, "formatting must not mutate or append to the provider envelope");
 });
@@ -83,11 +115,27 @@ test("selection maps only exact displayed actions and cancellation or UI failure
 		undefined,
 	];
 	for (let index = 0; index < selections.length; index += 1) {
-		const ctx = { ui: { select: async () => selections[index] } } as unknown as ExtensionContext;
+		const ctx = { mode: "tui", ui: { custom: consentCustom(async () => selections[index]) } } as unknown as ExtensionContext;
 		assert.deepEqual(await presentReviewConsentUi(ctx, envelope), expected[index]);
 	}
-	const failed = { ui: { select: async () => { throw new Error("UI unavailable"); } } } as unknown as ExtensionContext;
+	const failed = { mode: "tui", ui: { custom: consentCustom(async () => { throw new Error("UI unavailable"); }) } } as unknown as ExtensionContext;
 	assert.equal(await presentReviewConsentUi(failed, envelope), undefined);
+});
+
+test("non-TUI selection preserves the existing action and cancellation mapping", async () => {
+	const envelope = consent();
+	const model = formatReviewConsentUi(envelope);
+	const selections = [model.options[0], model.options[1], model.options[2], undefined] as const;
+	const expected = [
+		{ kind: "provider", answer: "granted" },
+		{ kind: "provider", answer: "declined" },
+		{ kind: "host-session" },
+		undefined,
+	];
+	for (let index = 0; index < selections.length; index += 1) {
+		const ctx = { mode: "rpc", ui: { select: async () => selections[index] } } as unknown as ExtensionContext;
+		assert.deepEqual(await presentReviewConsentUi(ctx, envelope), expected[index]);
+	}
 });
 
 interface RegisteredTool {
@@ -253,7 +301,7 @@ function interactiveContext(cwd: string, manager: object, select: (title: string
 		mode: "tui",
 		hasUI: true,
 		sessionManager: Object.assign(manager, { getSessionId: () => sessionId }),
-		ui: { select, notify() {}, setStatus() {}, theme: { fg: (_color: string, text: string) => text } },
+		ui: { custom: consentCustom(select), notify() {}, setStatus() {}, theme: { fg: (_color: string, text: string) => text } },
 	} as unknown as ExtensionContext;
 }
 
@@ -484,7 +532,7 @@ test("headless, child, and changed post-UI identity never use host permission", 
 		hasUI: true,
 		sessionManager: manager,
 		ui: {
-			select: async (_title: string, options: string[]) => { manager.sessionId = "after"; return options[2]; },
+			custom: consentCustom(async (_title: string, options: string[]) => { manager.sessionId = "after"; return options[2]; }),
 			notify() {},
 			setStatus() {},
 			theme: { fg: (_color: string, text: string) => text },

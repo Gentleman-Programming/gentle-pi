@@ -625,6 +625,7 @@ function registerQuietTool(pi: ExtensionAPI, toolName: QuietToolName, commandArg
 
 	pi.registerTool({
 		...registrationTool,
+		renderShell: "self",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const runtimeTool = getBuiltInTools(ctx.cwd)[toolName];
 			return runtimeTool.execute(toolCallId, params, signal, onUpdate, ctx);

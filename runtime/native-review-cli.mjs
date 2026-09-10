@@ -67,6 +67,7 @@ export const NATIVE_REVIEW_OPERATION = {
 	CAPTURE_CORRECTION_PLAN: "review/capture-correction-plan",
 	CAPTURE_PROVIDER_ROLE: "review/capture-provider-role",
 	ACKNOWLEDGE_APPROVED: "review/acknowledge-approved",
+	SDD_STATUS: "sdd-status",
 }         ;
 
 
@@ -119,6 +120,10 @@ export const NATIVE_REVIEW_ERROR_CODE = {
 
 
 
+
+
+
+
 export const NATIVE_REVIEW_MODE_OPERATION = {
 	STATUS: "status",
 	ENABLE: "enable",
@@ -151,6 +156,31 @@ export const NATIVE_REVIEW_MODE_SCOPE = {
 	CLONE: "clone",
 	BOTH: "both",
 }         ;
+
+
+
+
+
+
+
+
+
+
+
+/**
+ * The native CLI owns this complete v2 record. The decoder validates the fields
+ * Pi relies on and returns the original object without adding, omitting, or
+ * reconciling local SDD state.
+ */
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1300,6 +1330,29 @@ function nativeError(code                       , operation                     
 
 
 
+const NATIVE_SDD_PHASES = ["apply", "verify", "archive"]         ;
+const NATIVE_SDD_DEPENDENCY_STATES = ["blocked", "ready", "all_done"]         ;
+
+/** Strictly validates the native v2 contract while preserving its whole record. */
+export function decodeNativeSddStatusV2(value         , request                                                              )                    {
+	const status = object(value);
+	if (status.schemaName !== "gentle-ai.sdd-status" || status.schemaVersion !== 2) throw new Error("wrong native SDD status schema");
+	if (status.changeName !== request.changeName || !isCanonicalProcessString(status.changeName)) throw new Error("native SDD status change identity mismatch");
+	const actionContext = object(status.actionContext);
+	if (actionContext.workspaceRoot !== request.workspaceRoot || !isCanonicalProcessString(actionContext.workspaceRoot)) throw new Error("native SDD status workspace root mismatch");
+	const dependencies = object(status.dependencies);
+	const instructions = object(status.instructions);
+	for (const phase of NATIVE_SDD_PHASES) {
+		if (enumString(dependencies[phase], NATIVE_SDD_DEPENDENCY_STATES) !== dependencies[phase]) throw new Error("invalid native SDD dependency");
+		stringArray(instructions[phase]);
+	}
+	if (Object.keys(dependencies).length !== NATIVE_SDD_PHASES.length || Object.keys(dependencies).some((key) => !NATIVE_SDD_PHASES.includes(key                  ))) throw new Error("native SDD dependencies have an unsupported shape");
+	if (Object.keys(instructions).length !== NATIVE_SDD_PHASES.length || Object.keys(instructions).some((key) => !NATIVE_SDD_PHASES.includes(key                  ))) throw new Error("native SDD instructions have an unsupported shape");
+	stringArray(status.blockedReasons);
+	if (!isCanonicalProcessString(status.nextRecommended)) throw new Error("invalid native SDD next recommendation");
+	return status                     ;
+}
+
 class NativeReviewPlainCli {
 	                 adapter                 ;
 	                 executable                         ;
@@ -1919,6 +1972,20 @@ export class NativeReviewCliV216                            {
 		toleratedStderr                    = [],
 	)                               {
 		return this.invoke(operation, cwd, arguments_, mutating, signal, this.executablePath(operation, mutating), toleratedStderr);
+	}
+
+	async sddStatus(request                        )                             {
+		if (!isCanonicalProcessString(request.changeName) || !isCanonicalProcessString(request.workspaceRoot) || !isAbsolute(request.workspaceRoot)) {
+			throw new TypeError("Native SDD status requires a canonical selected change and absolute workspace root");
+		}
+		const execution = await this.negotiated(
+			NATIVE_REVIEW_OPERATION.SDD_STATUS,
+			request.workspaceRoot,
+			["sdd-status", request.changeName, "--cwd", request.workspaceRoot, "--json", "--instructions"],
+			false,
+			request.signal,
+		);
+		return decode(NATIVE_REVIEW_OPERATION.SDD_STATUS, false, () => decodeNativeSddStatusV2(execution.body, request));
 	}
 
 	async start(request                    )                             {
