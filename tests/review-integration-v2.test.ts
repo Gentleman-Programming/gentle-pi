@@ -562,20 +562,28 @@ test("next_transition stop refuses an unachievable slot whose withdraw arguments
 	assert.doesNotThrow(() => decodeReviewNextTransitionV3(stop));
 });
 
-// gentle-pi#822 (CodeRabbit findings): a duplicated identity argument could smuggle a second value past the old first-match lookup while the first entry still agreed with the binding, and a command whose token drifted from the validated arguments would withdraw a different slot than the arguments name. Each identity argument must appear exactly once, and the rendered command must carry each identity argument's own token.
-test("next_transition stop refuses a duplicated identity argument or a command that drifts from the withdraw arguments", () => {
+// gentle-pi#822: identity arguments appear exactly once, and the rendered
+// command is an exact, ordered rendering of every validated provider token.
+// Substring checks would accept a missing non-identity token, repeated command,
+// suffix, or shell payload despite the command no longer naming this slot alone.
+test("next_transition stop refuses duplicate identities and non-exact withdraw commands", () => {
 	const stop: JsonObject = { kind: "stop", reason_code: "unachievable_lens_slot", unachievable_lens_slots: [unachievableSlot()] };
-	// a second {name:"lineage"} entry with a different value: the FIRST match still agrees with the binding, so only the exactly-once rule refuses it
 	const duplicated = unachievableSlot();
 	const duplicatedWithdraw = duplicated.withdraw as JsonObject;
 	duplicatedWithdraw.arguments = [...(duplicatedWithdraw.arguments as unknown[]), { name: "lineage", value: "review-fixture-smuggled", token: "--lineage=review-fixture-smuggled" }];
 	assert.throws(() => decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [duplicated] }), /withdraw\.arguments lineage must appear exactly once/);
-	// the command's --target= token drifts while the named argument value still matches the binding
-	const driftedCommand = unachievableSlot();
-	const driftedWithdraw = driftedCommand.withdraw as JsonObject;
-	driftedWithdraw.command = `gentle-ai review capture-unachievable --lineage=review-fixture --expected-revision=${digest} --target=sha256:${"e".repeat(64)} --repository-context=rctx1_${"e".repeat(64)} --request-hash=${digest} --withdraw=true`;
-	assert.throws(() => decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [driftedCommand] }), /withdraw\.command does not match the withdraw arguments target/);
-	// the pristine fixture still decodes with every rendering agreeing
+
+	const canonical = `gentle-ai review capture-unachievable --lineage=review-fixture --expected-revision=${digest} --target=${digest} --repository-context=rctx1_${"e".repeat(64)} --request-hash=${digest} --withdraw=true`;
+	for (const [name, command] of [
+		["omitted token", canonical.replace(" --withdraw=true", "")],
+		["duplicate command", `gentle-ai review capture-unachievable ${canonical}`],
+		["extra suffix", `${canonical} --surplus=true`],
+		["shell payload", `${canonical} && printf injected`],
+	] as const) {
+		const malformed = unachievableSlot();
+		(malformed.withdraw as JsonObject).command = command;
+		assert.throws(() => decodeReviewNextTransitionV3({ ...stop, unachievable_lens_slots: [malformed] }), /withdraw\.command must exactly render/, name);
+	}
 	assert.doesNotThrow(() => decodeReviewNextTransitionV3(stop));
 });
 

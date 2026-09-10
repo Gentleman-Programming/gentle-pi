@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, type TUI } from "@earendil-works/pi-tui";
 import { sidebarPart } from "../lib/shell-sidebar.ts";
+import { invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
 import {
 	applyTodo,
 	emptyTodo,
@@ -73,6 +74,7 @@ interface TodoSession {
 	clearOnNextTurn: boolean;
 	ui: ExtensionContext["ui"] | undefined;
 	host: { requestRender(): void } | undefined;
+	tui: TUI | undefined;
 }
 
 function sessionKey(ctx: ExtensionContext): string {
@@ -88,13 +90,14 @@ export default function gentleTodo(pi: ExtensionAPI, env: NodeJS.ProcessEnv = pr
 		const key = sessionKey(ctx);
 		let current = sessions.get(key);
 		if (!current) {
-			current = { state: emptyTodo(), turn: 0, collapsed: false, clearOnNextTurn: false, ui: undefined, host: undefined };
+			current = { state: emptyTodo(), turn: 0, collapsed: false, clearOnNextTurn: false, ui: undefined, host: undefined, tui: undefined };
 			sessions.set(key, current);
 		}
 		return current;
 	};
 
 	const show = (current: TodoSession) => {
+		if (current.tui) invalidateSidebar(current.tui);
 		if (!current.ui) return;
 		if (current.state.tasks.length === 0) {
 			current.ui.setWidget(WIDGET_KEY, undefined);
@@ -103,6 +106,7 @@ export default function gentleTodo(pi: ExtensionAPI, env: NodeJS.ProcessEnv = pr
 		const snapshot = current;
 		current.ui.setWidget(WIDGET_KEY, (tui, theme) => {
 			snapshot.host = tui;
+			snapshot.tui = tui;
 			return sidebarPart(tui, "todo", {
 				render(width: number) {
 					const lines = renderTodoCard(snapshot.state, theme, width, { collapsed: snapshot.collapsed, staleTurns: staleTurns(snapshot.state, snapshot.turn), collapseKey });
@@ -144,6 +148,7 @@ export default function gentleTodo(pi: ExtensionAPI, env: NodeJS.ProcessEnv = pr
 			if (!result.error) {
 				current.state = result.state;
 				current.clearOnNextTurn = false;
+				if (current.tui) invalidateSidebar(current.tui);
 			}
 			return {
 				content: [{ type: "text", text: result.text }],
@@ -158,6 +163,7 @@ export default function gentleTodo(pi: ExtensionAPI, env: NodeJS.ProcessEnv = pr
 			handler: async (ctx) => {
 				const current = session(ctx);
 				current.collapsed = !current.collapsed;
+				if (current.tui) invalidateSidebar(current.tui);
 				current.host?.requestRender();
 			},
 		});
@@ -181,6 +187,7 @@ export default function gentleTodo(pi: ExtensionAPI, env: NodeJS.ProcessEnv = pr
 	pi.on("before_agent_start", (event, ctx) => {
 		const current = session(ctx);
 		current.turn += 1;
+		if (current.tui) invalidateSidebar(current.tui);
 		if (current.clearOnNextTurn) {
 			current.state = { ...current.state, tasks: [] };
 			current.clearOnNextTurn = false;

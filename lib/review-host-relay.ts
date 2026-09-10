@@ -141,35 +141,23 @@ export function classifyReviewHostRelayRefusal(stderr: string): "unknown-flag" |
 }
 
 // ---------------------------------------------------------------------------
-// gentle-pi#638: the two relay failure classes that are deterministic for the
-// slot — the reviewer cannot complete under current conditions and a
-// byte-identical relaunch cannot change the outcome. Only these two may be
-// declared unachievable through the native capture-unachievable verb:
-//
-//   pi-timed-out                the reviewer was killed by the relay bound
-//                               scaled from the materialized prompt bytes (the
-//                               gentle-pi#367 surface); relaunching the same
-//                               slot reaches the same wall.
-//   submission-refused (none)   the provider refused the lens context at
-//                               admission with its typed [invalid_request]
-//                               refusal and stated the slot was not consumed
-//                               (gentle-pi#522 / #524); the refused bytes,
-//                               not transport, are the problem.
-//
-// Every other class — launch and materialize failures, empty output, and
-// any submission whose mutation outcome is genuinely unknown — stays
-// transient and keeps the relaunch-once behavior.
+// gentle-pi#638: only a relay-bound reviewer timeout is deterministic for the
+// exact selected slot: relaunching the same materialized request reaches the
+// same wall. Generic admission refusals, including malformed reviewer JSON and
+// binding_mismatch [invalid_request], describe repairable submitted bytes; a
+// fresh reviewer can change them. They keep the existing exact-reoffer path.
+// A future provider-issued, typed slot-deterministic refusal may be added here
+// only when its schema proves that this exact bound slot cannot be repaired.
 // ---------------------------------------------------------------------------
 
 export const REVIEW_HOST_RELAY_UNACHIEVABLE_REASON = {
 	PI_TIMED_OUT: "relay_transport_bound_exceeded",
-	ADMISSION_REFUSED: "lens_admission_refused",
 } as const;
 
 export function reviewHostRelayUnachievableReason(error: ReviewHostRelayError): string | undefined {
-	if (error.kind === REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT) return REVIEW_HOST_RELAY_UNACHIEVABLE_REASON.PI_TIMED_OUT;
-	if (error.kind === REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED && error.mutationOutcome === "none") return REVIEW_HOST_RELAY_UNACHIEVABLE_REASON.ADMISSION_REFUSED;
-	return undefined;
+	return error.kind === REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT
+		? REVIEW_HOST_RELAY_UNACHIEVABLE_REASON.PI_TIMED_OUT
+		: undefined;
 }
 
 // Optional bounded evidence for the declaration's --detail. Only the killed reviewer carries measurements worth recording; an admission refusal's text already rides failure.stderr, and unmeasured failures never get a fabricated detail.

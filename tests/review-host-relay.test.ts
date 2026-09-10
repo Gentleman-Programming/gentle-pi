@@ -781,22 +781,19 @@ test("refusal classification distinguishes unknown-flag, handshake, and other", 
 	assert.equal(classifyReviewHostRelayRefusal("some unrelated explosion"), "other");
 });
 
-// gentle-pi#638: exactly two relay failure classes are deterministic for the
-// slot, so the relay's catch ladder can declare the slot unachievable
-// instead of leaving the operator to re-spend an identical reviewer run: a
-// reviewer killed by the scaled bound (the gentle-pi#367 surface) and a
-// provider admission refusal of the lens context (gentle-pi#522 / #524). Every
-// transient class — launch failures, empty output, transport timeouts, and
-// any submission whose outcome is genuinely unknown — stays outside the
-// predicate and keeps the relaunch-once behavior.
-test("the unachievable predicate names exactly the two deterministic failure classes", () => {
+// gentle-pi#638: only a reviewer killed by the scaled relay bound is proven
+// deterministic for this exact slot. Generic admission refusals are repairable
+// by a fresh reviewer and retain the ordinary exact-reoffer behavior.
+test("the unachievable predicate names only deterministic slot failures", () => {
 	const killed = new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT, "pi", "pi reviewer subprocess exceeded the relay bound", { timedOut: true, elapsedMs: 2_256_004, timeoutMs: 2_256_000 });
 	assert.equal(reviewHostRelayUnachievableReason(killed), "relay_transport_bound_exceeded");
 	assert.equal(reviewHostRelayUnachievableDetail(killed), "killed after 2256004ms against a 2256000ms relay bound");
 
-	const admitted = new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", "refused [invalid_request]", { exitCode: 1, mutationOutcome: "none" });
-	assert.equal(reviewHostRelayUnachievableReason(admitted), "lens_admission_refused");
-	assert.equal(reviewHostRelayUnachievableDetail(admitted), undefined, "the refusal text rides failure.stderr; the declaration carries no echo of it");
+	for (const refusal of ["reviewer payload contains no complete JSON object", "reviewer artifact admission binding_mismatch"]) {
+		const admitted = new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", `${refusal} [invalid_request]`, { exitCode: 1, mutationOutcome: "none" });
+		assert.equal(reviewHostRelayUnachievableReason(admitted), undefined, `${refusal} is repairable by a fresh reviewer`);
+		assert.equal(reviewHostRelayUnachievableDetail(admitted), undefined);
+	}
 
 	const unknownOutcome = new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", "gentle-ai capture submission exceeded its bound", { timedOut: true });
 	assert.equal(reviewHostRelayUnachievableReason(unknownOutcome), undefined, "an unknown mutation outcome is never deterministic");

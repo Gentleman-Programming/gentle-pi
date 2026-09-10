@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { ScrollView, visibleWidth, type TUI } from "@earendil-works/pi-tui";
+import { renderLayoutFrame } from "@earendil-works/pi-tui/dist/layout.js";
 import { installSidebar } from "../lib/shell-sidebar-layout.ts";
 import { sidebarPart, sidebarState } from "../lib/shell-sidebar.ts";
 import { renderShellSidebarBar } from "../lib/shell-bar.ts";
@@ -136,6 +137,60 @@ test("wheel scrolls the rail and is consumed at both boundaries and blank space"
 	scroll.updateLayout(1, 5, () => {});
 	assert.equal(scroll.handleMouse({ type: "wheel", wheelDelta: 1 } as Parameters<typeof scroll.handleMouse>[0])?.handled, true);
 	assert.equal(scroll.scrollTop, 0);
+});
+
+test("real layout frames reuse unchanged sidebar output and invalidate at state and breakpoint boundaries", (t) => {
+	const f = fixture();
+	const counts = { footer: 0, changes: 0, agents: 0, todo: 0 };
+	let todo = "Todo one";
+	for (const key of Object.keys(counts) as Array<keyof typeof counts>) {
+		sidebarPart(f.tui, key, {
+			render: () => {
+				counts[key]++;
+				return [`${key === "todo" ? todo : key}`];
+			},
+			invalidate() {},
+		});
+	}
+	t.after(installSidebar(f.tui, theme));
+
+	const first = renderLayoutFrame(f.root, 140, 20, () => {});
+	assert.deepEqual(counts, { footer: 1, changes: 1, agents: 1, todo: 1 });
+	const sidebarRail = first.root.children[1]?.component as ScrollView;
+	renderLayoutFrame(f.root, 140, 20, () => {});
+	assert.deepEqual(counts, { footer: 1, changes: 1, agents: 1, todo: 1 });
+
+	todo = "Todo two";
+	sidebarRail.invalidate();
+	const changed = renderLayoutFrame(f.root, 140, 20, () => {});
+	assert.match(changed.lines.join("\n"), /Todo two/);
+	assert.deepEqual(counts, { footer: 2, changes: 2, agents: 2, todo: 2 });
+
+	f.host.terminal.columns = 139;
+	renderLayoutFrame(f.root, 139, 20, () => {});
+	assert.deepEqual(f.bottom.render(80), ["Status"]);
+	f.host.terminal.columns = 140;
+	renderLayoutFrame(f.root, 140, 20, () => {});
+	assert.deepEqual(counts, { footer: 3, changes: 3, agents: 3, todo: 3 });
+
+	f.host.mode = "regular";
+	renderLayoutFrame(f.root, 140, 20, () => {});
+	assert.deepEqual(f.bottom.render(80), ["Status"]);
+	f.host.mode = "fullscreen";
+	renderLayoutFrame(f.root, 140, 20, () => {});
+	assert.deepEqual(counts, { footer: 4, changes: 4, agents: 4, todo: 4 });
+
+	let replacementRenders = 0;
+	sidebarPart(f.tui, "todo", {
+		render: () => {
+			replacementRenders++;
+			return ["Todo replacement"];
+		},
+		invalidate() {},
+	});
+	const replaced = renderLayoutFrame(f.root, 140, 20, () => {});
+	assert.match(replaced.lines.join("\n"), /Todo replacement/);
+	assert.equal(replacementRenders, 1);
 });
 
 test("cleanup restores the native layout and bottom paint without disposing widgets", () => {

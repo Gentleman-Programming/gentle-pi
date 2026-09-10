@@ -1,0 +1,128 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { readFileSync } from "node:fs";
+import { stripTypeScriptTypes } from "node:module";
+import { runInNewContext } from "node:vm";
+import { AGENT_CLASSES } from "../lib/runtime-metrics.ts";
+import { parseAgentDefinition } from "../lib/agents-config.ts";
+import { normalizeRpcEvent, TASK_EVENT } from "../lib/agents-protocol.ts";
+import { lookupPiCatalogName } from "../lib/runtime-metrics-pi-identity.ts";
+import { ChildComposition, childEvent, classifyBuiltinAgent, launchSelection } from "../lib/runtime-metrics-children.ts";
+
+await lookupPiCatalogName({ provider: "openai", modelId: "gpt-4o" });
+const asset = new URL("../assets/agents/gentle-ai-worker.md", import.meta.url);
+const definition = parseAgentDefinition(readFileSync(asset, "utf8"), asset.pathname, "global");
+assert.ok("instructions" in definition);
+const response = (model = "gpt-4o", native = "low") => {
+	const events = normalizeRpcEvent({ type: "message_end", message: { role: "assistant", provider: "openai",
+		model, responseModel: model, providerThinkingLevel: native, stopReason: "stop", usage: { input: 3, output: 2, reasoning: 1 } } }, { observeResponses: true });
+	const event = events.find(event => event.type === TASK_EVENT.RESPONSE_OBSERVATION);
+	assert.ok(event?.type === TASK_EVENT.RESPONSE_OBSERVATION);
+	return event.observation;
+};
+const launch = () => launchSelection(definition, { provider: "openai", id: "gpt-4o" }, "high");
+const event = (taskId = "local-task") => childEvent("local-session", taskId, launch(), "completed", {
+	coverage: "final_assistant_messages_only", agentSettled: true, responses: [response(), response("gpt-4o-mini", "high")], droppedResponses: 2,
+});
+
+test("installed package definitions retain classification after the actual routing transform", () => {
+	// installSddAssets/copyDirectoryFiles copies assets verbatim on first install.
+	// Isolate the real pure routing writer; do not run an installer or read user agents.
+	const source = readFileSync(new URL("../extensions/gentle-ai.ts", import.meta.url), "utf8");
+	const transform = source.match(/function updateFrontmatterRouting\([\s\S]*?\n\}/)?.[0];
+	assert.ok(transform);
+	const route = runInNewContext(`(${stripTypeScriptTypes(transform)})`);
+	for (const kind of AGENT_CLASSES.filter(kind => kind !== "orchestrator" && kind !== "unknown")) {
+		const file = ["worker", "explore", "verify"].includes(kind) ? `gentle-ai-${kind}` : kind;
+		const asset = new URL(`../assets/agents/${file}.md`, import.meta.url);
+		const content = readFileSync(asset, "utf8");
+		const copied = parseAgentDefinition(content, asset.pathname, "global");
+		assert.ok("instructions" in copied);
+		assert.equal(classifyBuiltinAgent(copied), kind, "verbatim first install");
+		for (const entry of [undefined, { model: "openai/gpt-4o", thinking: "high" }]) {
+			const parsed = parseAgentDefinition(route(content, entry), asset.pathname, "global");
+			assert.ok("instructions" in parsed);
+			assert.equal(classifyBuiltinAgent(parsed), kind, `${kind}: installed routing`);
+			assert.equal(classifyBuiltinAgent({ ...parsed, instructions: `${parsed.instructions}\nOverride` }), "unknown");
+			assert.equal(classifyBuiltinAgent({ ...parsed, tools: ["different-tool"] }), "unknown");
+			assert.equal(classifyBuiltinAgent({ ...parsed, description: "different description" }), "unknown");
+			assert.equal(classifyBuiltinAgent({ ...parsed, mode: parsed.mode === "task" ? "background" : "task" }), "unknown");
+		}
+	}
+});
+
+test("built-in classification requires the runtime definition, not a public-looking override name", () => {
+	assert.equal(classifyBuiltinAgent(definition), "worker");
+	assert.equal(classifyBuiltinAgent({ ...definition, instructions: "private override" }), "unknown");
+	assert.equal(classifyBuiltinAgent({ ...definition, tools: ["private tool"] }), "unknown");
+	assert.equal(classifyBuiltinAgent({ ...definition, name: "private-agent" }), "unknown");
+});
+
+test("launch distribution and each observed combination remain independent and privacy-filtered", () => {
+	const composition = new ChildComposition();
+	const value = event();
+	assert.ok(value);
+	assert.equal(composition.reserve(value, "local-session"), true);
+	composition.record(value);
+	const view = composition.snapshot();
+	assert.equal(view.launches[0].launches, 1);
+	assert.equal(view.launches[0].selectedEffort, "high");
+	assert.equal(view.launches[0].agentClass, "worker");
+	assert.equal(view.responses.length, 2);
+	assert.deepEqual(view.responses.map(row => row.observedModelId), ["gpt-4o", "gpt-4o-mini"]);
+	assert.ok(view.responses.every(row => row.effort === "unavailable" && row.selectedProvider === "unknown"));
+	assert.equal(view.responses[0].providerThinkingLevel, "low");
+	assert.equal(view.responses[0].tokens.reasoning.sum, 1);
+	assert.equal(view.droppedResponses, 2);
+	assert.equal(view.settled, 1);
+	assert.equal(view.statuses.completed, 1);
+	assert.ok(!JSON.stringify(view).includes("local-"));
+	const privateLaunch = launchSelection({ ...definition, instructions: "private" }, { provider: "private", id: "private-model" }, "private-effort");
+	const filtered = childEvent("local-session", "other", privateLaunch, "failed", {
+		coverage: "final_assistant_messages_only", agentSettled: false, responses: [response("private-model", "private-native")], droppedResponses: 0,
+	});
+	assert.ok(!JSON.stringify(filtered).includes("private"));
+});
+
+test("dedupe reserves before async policy, rejects old sessions, and survives aggregate clearing", () => {
+	const c = new ChildComposition();
+	const e = event()!;
+	assert.equal(c.reserve(e, "other-session"), false);
+	assert.equal(c.reserve(e, "local-session"), true);
+	assert.equal(c.reserve(structuredClone(e), "local-session"), false);
+	c.record(e);
+	c.clear();
+	assert.equal(c.reserve(e, "local-session"), false);
+	assert.deepEqual(c.snapshot().responses, []);
+	for (let i = 0; i < 255; i++) assert.equal(c.reserve(event(String(i))!, "local-session"), true);
+	assert.equal(c.reserve(event("overflow")!, "local-session"), false);
+	assert.equal(c.snapshot().saturated, true);
+});
+
+test("response capacity retains launch ranking and reports excluded responses without eviction", () => {
+	const c = new ChildComposition();
+	for (let i = 0; i < 9; i++) {
+		const e = childEvent("local-session", String(i), launch(), "completed", {
+			coverage: "final_assistant_messages_only", agentSettled: true, responses: Array(128).fill(response()), droppedResponses: 0,
+		})!;
+		assert.equal(c.reserve(e, "local-session"), true);
+		c.record(e);
+		c.record(e);
+	}
+	const view = c.snapshot();
+	assert.equal(view.responses[0].responses, 1024);
+	assert.equal(view.launches[0].launches, 9);
+	assert.equal(view.droppedResponses, 128);
+	assert.equal(view.saturated, true);
+	assert.equal(view.statuses.completed, 9);
+});
+
+test("malformed and oversized events are rejected without reserving IDs", () => {
+	const c = new ChildComposition();
+	const e = event()!;
+	for (const patch of [{ schema: "old" }, { responses: Array(129).fill(e.responses[0]) }, { taskId: "x".repeat(129) },
+		{ droppedResponses: -1 }, { status: "native_success" }, { launch: { ...e.launch, agentClass: "private" } }]) {
+		assert.equal(c.reserve({ ...e, ...patch }, "local-session"), false);
+	}
+	assert.equal(c.reserve(e, "local-session"), true);
+});

@@ -67,6 +67,7 @@ export const NATIVE_REVIEW_OPERATION = {
 	CAPTURE_PROVIDER_ROLE: "review/capture-provider-role",
 	CAPTURE_UNACHIEVABLE: "review/capture-unachievable",
 	ACKNOWLEDGE_APPROVED: "review/acknowledge-approved",
+	SDD_STATUS: "sdd-status",
 } as const;
 export type NativeReviewOperation = (typeof NATIVE_REVIEW_OPERATION)[keyof typeof NATIVE_REVIEW_OPERATION];
 
@@ -119,6 +120,10 @@ export interface NativeReviewCli {
 	// an older binary without the verb, or any other process/decode failure,
 	// rejects the returned promise -- callers fail closed to `high` risk.
 	assess?(request: NativeReviewAssessRequest): Promise<ReviewAssessmentV1>;
+	// Exact native SDD readiness authority for an explicitly selected phase.
+	// This is intentionally separate from review/RDD gates and carries no
+	// delivery or review-transaction authority.
+	sddStatus?(request: NativeSddStatusRequest): Promise<NativeSddStatusV2>;
 }
 
 export const NATIVE_REVIEW_MODE_OPERATION = {
@@ -154,6 +159,31 @@ export const NATIVE_REVIEW_MODE_SCOPE = {
 	BOTH: "both",
 } as const;
 export type NativeReviewModeScope = (typeof NATIVE_REVIEW_MODE_SCOPE)[keyof typeof NATIVE_REVIEW_MODE_SCOPE];
+
+export interface NativeSddStatusRequest {
+	changeName: string;
+	workspaceRoot: string;
+	signal?: AbortSignal;
+}
+
+export type NativeSddPhase = "apply" | "verify" | "archive";
+export type NativeSddDependencyState = "blocked" | "ready" | "all_done";
+
+/**
+ * The native CLI owns this complete v2 record. The decoder validates the fields
+ * Pi relies on and returns the original object without adding, omitting, or
+ * reconciling local SDD state.
+ */
+export interface NativeSddStatusV2 extends Readonly<Record<string, unknown>> {
+	schemaName: "gentle-ai.sdd-status";
+	schemaVersion: 2;
+	changeName: string;
+	actionContext: Readonly<Record<string, unknown>> & { workspaceRoot: string };
+	dependencies: Readonly<Record<NativeSddPhase, NativeSddDependencyState>>;
+	instructions: Readonly<Record<NativeSddPhase, readonly string[]>>;
+	blockedReasons: readonly string[];
+	nextRecommended: string;
+}
 
 export interface NativeReviewModeRequest {
 	cwd: string;
@@ -1345,6 +1375,29 @@ interface NativeJsonExecution {
 	process: ExecFileResult;
 }
 
+const NATIVE_SDD_PHASES = ["apply", "verify", "archive"] as const;
+const NATIVE_SDD_DEPENDENCY_STATES = ["blocked", "ready", "all_done"] as const;
+
+/** Strictly validates the native v2 contract while preserving its whole record. */
+export function decodeNativeSddStatusV2(value: unknown, request: Pick<NativeSddStatusRequest, "changeName" | "workspaceRoot">): NativeSddStatusV2 {
+	const status = object(value);
+	if (status.schemaName !== "gentle-ai.sdd-status" || status.schemaVersion !== 2) throw new Error("wrong native SDD status schema");
+	if (status.changeName !== request.changeName || !isCanonicalProcessString(status.changeName)) throw new Error("native SDD status change identity mismatch");
+	const actionContext = object(status.actionContext);
+	if (actionContext.workspaceRoot !== request.workspaceRoot || !isCanonicalProcessString(actionContext.workspaceRoot)) throw new Error("native SDD status workspace root mismatch");
+	const dependencies = object(status.dependencies);
+	const instructions = object(status.instructions);
+	for (const phase of NATIVE_SDD_PHASES) {
+		if (enumString(dependencies[phase], NATIVE_SDD_DEPENDENCY_STATES) !== dependencies[phase]) throw new Error("invalid native SDD dependency");
+		stringArray(instructions[phase]);
+	}
+	if (Object.keys(dependencies).length !== NATIVE_SDD_PHASES.length || Object.keys(dependencies).some((key) => !NATIVE_SDD_PHASES.includes(key as NativeSddPhase))) throw new Error("native SDD dependencies have an unsupported shape");
+	if (Object.keys(instructions).length !== NATIVE_SDD_PHASES.length || Object.keys(instructions).some((key) => !NATIVE_SDD_PHASES.includes(key as NativeSddPhase))) throw new Error("native SDD instructions have an unsupported shape");
+	stringArray(status.blockedReasons);
+	if (!isCanonicalProcessString(status.nextRecommended)) throw new Error("invalid native SDD next recommendation");
+	return status as NativeSddStatusV2;
+}
+
 class NativeReviewPlainCli {
 	private readonly adapter: ExecFileAdapter;
 	private readonly executable: string | (() => string);
@@ -1981,6 +2034,20 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		toleratedStderr: readonly string[] = [],
 	): Promise<NegotiatedExecution> {
 		return this.invoke(operation, cwd, arguments_, mutating, signal, this.executablePath(operation, mutating), toleratedStderr);
+	}
+
+	async sddStatus(request: NativeSddStatusRequest): Promise<NativeSddStatusV2> {
+		if (!isCanonicalProcessString(request.changeName) || !isCanonicalProcessString(request.workspaceRoot) || !isAbsolute(request.workspaceRoot)) {
+			throw new TypeError("Native SDD status requires a canonical selected change and absolute workspace root");
+		}
+		const execution = await this.negotiated(
+			NATIVE_REVIEW_OPERATION.SDD_STATUS,
+			request.workspaceRoot,
+			["sdd-status", request.changeName, "--cwd", request.workspaceRoot, "--json", "--instructions"],
+			false,
+			request.signal,
+		);
+		return decode(NATIVE_REVIEW_OPERATION.SDD_STATUS, false, () => decodeNativeSddStatusV2(execution.body, request));
 	}
 
 	async start(request: NativeStartRequest): Promise<NativeStartResult> {

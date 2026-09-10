@@ -2,7 +2,7 @@ import type { Duplex, Readable, Writable } from "node:stream";
 import { AGENT_MODE, formatModelRef, type AgentDefinition, type AgentMode, type ModelRef } from "./agents-config.ts";
 import { CHILD_QUERY_MAX_INFLIGHT, CHILD_QUERY_TIMEOUT_MS, parseChildFrame, validChildMessage, validChildQueryId } from "./agents-messaging.ts";
 import { ParentStandingReviewPermissionBroker } from "./review-session-standing-permission-ipc.ts";
-import { isFinished, normalizeRpcEvent, TASK_EVENT, TASK_STATUS, taskLabel, type AskRequest, type TaskRecord, type TaskStore } from "./agents-protocol.ts";
+import { isFinished, normalizeRpcEvent, TASK_EVENT, TASK_STATUS, taskLabel, type AskRequest, type ChildResponseObservation, type TaskRecord, type TaskStore } from "./agents-protocol.ts";
 
 // Gentle Agents runner. Every subagent is its own `pi --mode rpc` process:
 // the host never runs subagent work on the TUI thread. It writes JSON
@@ -67,15 +67,46 @@ export interface TaskQuery {
 	requestId: string;
 }
 
+export const MAX_CHILD_RESPONSE_OBSERVATIONS = 128;
+
+/** Local producer snapshot only; never native workflow success or export authority.
+ * Scope excludes tools, compaction, hidden provider retries and history replay.
+ * Each message_end is retained separately; RPC supplies no stable dedupe key.
+ * Unsettled shutdown may lose in-flight responses even when droppedResponses is 0.
+ */
+export interface ChildObservationSnapshot {
+	readonly coverage: "final_assistant_messages_only";
+	readonly agentSettled: boolean;
+	readonly responses: readonly ChildResponseObservation[];
+	readonly droppedResponses: number;
+}
+interface ChildObservationBuffer {
+	agentSettled: boolean;
+	responses: ChildResponseObservation[];
+	droppedResponses: number;
+}
+
 export interface RunnerHooks {
 	askUser(taskId: string, request: AskRequest, raw: Record<string, unknown>): Promise<AskAnswer>;
-	onFinish?(task: TaskRecord): void;
+	/** Optional immutable snapshot, delivered once at existing finalization.
+	 * Undefined when collection was disabled or no child handle was created.
+	 * Parent must check task.status AND agentSettled; observations are not success.
+	 */
+	onFinish?(task: TaskRecord, observations?: ChildObservationSnapshot): void;
 	// Accepts a child notification only while the originating parent session is active.
 	onNotification?(task: TaskRecord, message: string): boolean | void;
 	onQuery?(task: TaskRecord, requestId: string, message: string): boolean | void;
 	// Parent-only observation of a paired successful filesystem tool, not prose.
 	onSuccessfulMutation?(task: TaskRecord, tool: { toolName: "write" | "edit"; toolCallId: string; path: string }): void | Promise<void>;
 }
+
+export interface SddChangeSelection {
+	changeName: string;
+	workspaceRoot: string;
+	phase: "apply" | "verify" | "sync" | "archive";
+}
+
+export const SDD_CHANGE_FLAG = "--gentle-sdd-change";
 
 export interface TaskRequest {
 	agent: AgentDefinition;
@@ -90,8 +121,25 @@ export interface TaskRequest {
 	sessionDir: string;
 	resumeSessionPath: string | undefined;
 	env: NodeJS.ProcessEnv;
+	// A launch-local SDD identity. It is never prompt text or shared state.
+	sddChange?: SddChangeSelection;
 	// Captures the originating session; invoked only after successful OS spawn.
 	onLaunch?: () => void;
+	/** Default off. Parent owns policy before opting into bounded local buffering,
+	 * and must recheck policy/catalog privacy before recording or forwarding.
+	 * This flag does not authorize telemetry export or perform policy subprocesses.
+	 */
+	collectResponseObservations?: boolean;
+	/** Optional parallel preparation after dequeue; never delays OS spawn.
+	 * Unready at the first observation checkpoint permanently drops collection. */
+	prepareResponseObservations?: () => Promise<boolean>;
+	/** Optional synchronous parent-local grant check; never perform I/O here.
+	 * Parent checks environment, known revocation and a monotonic expiry against
+	 * its fresh native policy grant. False/throw permanently discards this task's
+	 * buffer. Checked once ready, on RPC values, and finish; this is not a watcher.
+	 * Omission preserves the explicit opt-in producer API, not policy authority.
+	 */
+	canCollectResponseObservations?: () => boolean;
 	// This closure stays only in the parent process. Its presence creates an
 	// inherited fd, never an environment boolean or model-visible permission.
 	authorizeParentStandingReviewPermission?: (repositoryIdentity: string) => boolean;
@@ -118,6 +166,9 @@ interface PendingReply {
 
 interface LiveTask {
 	child: ChildLike;
+	observations?: ChildObservationBuffer;
+	observationGuard?: () => boolean;
+	observationPreparation?: () => boolean;
 	pending: Map<string, Pending>;
 	queries: Map<string, PendingQuery>;
 	replies: Map<string, PendingReply>;
@@ -174,6 +225,7 @@ const hostProcess: ProcessControl = { platform: process.platform, kill: (pid, si
 
 export function childArguments(request: TaskRequest): string[] {
 	const args = ["--mode", "rpc", "--session-dir", request.sessionDir];
+	if (request.sddChange) args.push(SDD_CHANGE_FLAG, JSON.stringify(request.sddChange));
 	if (request.resumeSessionPath) args.push("--session", request.resumeSessionPath);
 	if (request.model) args.push("--model", request.thinking ? `${formatModelRef(request.model)}:${request.thinking}` : formatModelRef(request.model));
 	else if (request.thinking) args.push("--thinking", request.thinking);
@@ -275,7 +327,12 @@ export class AgentRunner {
 			cost: 0,
 		};
 		this.store.add(task);
-		this.queue.push({ task, request });
+		// A caller can retain and mutate its request after dispatch. Preserve only
+		// the identity selected at construction for this child launch.
+		const launchRequest = request.sddChange === undefined
+			? request
+			: { ...request, sddChange: { ...request.sddChange } };
+		this.queue.push({ task, request: launchRequest });
 		queueMicrotask(() => this.pump());
 		return task;
 	}
@@ -330,6 +387,13 @@ export class AgentRunner {
 		return true;
 	}
 
+	/** Parent-known revocation clears buffered metadata immediately, including
+	 * during an idle provider call. No task/store/status mutation. */
+	discardResponseObservations(id: string): void {
+		const live = this.live.get(id);
+		if (live) { live.observations = undefined; live.observationGuard = undefined; }
+	}
+
 	cancelAll(): number {
 		const ids = [...this.queue.map((entry) => entry.task.id), ...this.live.keys()];
 		return ids.filter((id) => this.cancel(id)).length;
@@ -345,7 +409,9 @@ export class AgentRunner {
 	private pump(): void {
 		while (this.live.size < this.limits.maxConcurrency && this.queue.length > 0) {
 			const entry = this.queue.shift();
-			if (entry) this.launch(entry.task.id, entry.request);
+			if (!entry) continue;
+			const { task, request } = entry;
+			this.launch(task.id, request);
 		}
 	}
 
@@ -375,6 +441,17 @@ export class AgentRunner {
 		}
 		const processGroup = detached && typeof child.pid === "number" && child.pid > 0 ? child.pid : undefined;
 		const live: LiveTask = { child, mutationStarts: new Map(), pending: new Map(), queries: new Map(), replies: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0, ipcClosed: false, acknowledgedIpcIds: new Set(), acknowledgedIpcOrder: [] };
+		if (request.prepareResponseObservations) {
+			let ready = false;
+			live.observationPreparation = () => ready;
+			void Promise.resolve().then(() => this.live.get(id) === live && !live.terminal
+				? request.prepareResponseObservations!() : false).then(allowed => { ready = allowed === true; }).catch(() => {});
+		}
+		if (request.collectResponseObservations === true || request.prepareResponseObservations) {
+			live.observationGuard = request.canCollectResponseObservations;
+			live.observations = { agentSettled: false, responses: [], droppedResponses: 0 };
+			if (!request.prepareResponseObservations) this.checkObservationGrant(live);
+		}
 		this.live.set(id, live);
 		const permissionPipe = child.stdio?.[3];
 		if (hasParentPermissionChannel && permissionPipe !== undefined && permissionPipe !== null) {
@@ -541,12 +618,26 @@ export class AgentRunner {
 		}
 	}
 
+	private checkObservationGrant(live: LiveTask): void {
+		if (live.observationPreparation) {
+			if (!live.observationPreparation()) live.observations = undefined;
+			live.observationPreparation = undefined; // One chance; late readiness cannot attach.
+		}
+		if (!live.observations || !live.observationGuard) return;
+		try {
+			if (live.observationGuard() === true) return;
+		} catch { /* Policy bookkeeping must not interrupt child execution. */ }
+		live.observations = undefined;
+		live.observationGuard = undefined;
+	}
+
 	private receive(id: string, request: TaskRequest, value: unknown): void {
 		const live = this.live.get(id);
 		if (!live || live.terminal || !value || typeof value !== "object") return;
 		const raw = value as Record<string, unknown>;
 		this.armStall(id, live);
 		if (raw.type === "response") {
+			if (!live.observationPreparation) this.checkObservationGrant(live);
 			const pending = typeof raw.id === "string" ? live.pending.get(raw.id) : undefined;
 			if (pending) {
 				live.pending.delete(raw.id as string);
@@ -554,7 +645,16 @@ export class AgentRunner {
 			}
 			return;
 		}
-		for (const event of normalizeRpcEvent(raw)) {
+		this.checkObservationGrant(live);
+		for (const event of normalizeRpcEvent(raw, { observeResponses: live.observations !== undefined })) {
+			if (event.type === TASK_EVENT.RESPONSE_OBSERVATION) {
+				const buffer = live.observations;
+				if (buffer) {
+					if (buffer.responses.length < MAX_CHILD_RESPONSE_OBSERVATIONS) buffer.responses.push(event.observation);
+					else buffer.droppedResponses = Math.min(Number.MAX_SAFE_INTEGER, buffer.droppedResponses + 1);
+				}
+				continue; // Separate from store persistence, UI totals and notifications.
+			}
 			this.store.apply(id, event, this.deps.now());
 			if (event.type === TASK_EVENT.TOOL_START && event.callId) {
 				live.mutationStarts.delete(event.callId);
@@ -573,6 +673,7 @@ export class AgentRunner {
 			}
 			if (event.type === TASK_EVENT.ASK) void this.answer(id, request, live, event.request, raw);
 			if (event.type === TASK_EVENT.AGENT_SETTLED) {
+				if (live.observations) live.observations.agentSettled = true;
 				const terminal = this.store.get(id);
 				if (terminal?.error) this.requestStop(id, TASK_STATUS.FAILED, terminal.error);
 				else if (terminal?.result) this.requestStop(id, TASK_STATUS.COMPLETED, null);
@@ -650,7 +751,7 @@ export class AgentRunner {
 			if (this.deps.now() >= (live.cleanupDeadlineAt ?? 0)) {
 				live.cancelGrace();
 				live.quarantined = true;
-				this.finish(id, TASK_STATUS.FAILED, `process cleanup unconfirmed after ${GROUP_CONFIRM_DEADLINE_MS}ms; capacity quarantined`);
+				this.finish(id, TASK_STATUS.FAILED, `process cleanup unconfirmed after ${GROUP_CONFIRM_DEADLINE_MS}ms; capacity quarantined`, live);
 				return;
 			}
 			live.cancelGrace = this.deps.schedule(() => this.confirmGroupExit(id, live), GROUP_CONFIRM_MS);
@@ -673,7 +774,7 @@ export class AgentRunner {
 		live.cancelStall();
 		live.cancelGrace();
 		this.live.delete(id);
-		this.finish(id, TASK_STATUS.FAILED, `could not start pi: ${error.message}`);
+		this.finish(id, TASK_STATUS.FAILED, `could not start pi: ${error.message}`, live);
 	}
 
 	private exited(id: string, code: number | null): void {
@@ -699,15 +800,25 @@ export class AgentRunner {
 			return;
 		}
 		const terminal = live.terminal;
-		this.finish(id, terminal ? terminal.status : TASK_STATUS.FAILED, terminal ? terminal.error : `pi exited with code ${live.childExit ?? "unknown"} before agent_settled`);
+		this.finish(id, terminal ? terminal.status : TASK_STATUS.FAILED, terminal ? terminal.error : `pi exited with code ${live.childExit ?? "unknown"} before agent_settled`, live);
 	}
 
-	private finish(id: string, status: TaskRecord["status"], error: string | null): void {
+	private finish(id: string, status: TaskRecord["status"], error: string | null, live?: LiveTask): void {
 		const current = this.store.get(id);
 		if (!current || isFinished(current.status)) return;
 		const finished = this.store.update(id, { status, endedAt: this.deps.now(), error, lastStep: error ?? "done" });
 		if (finished) {
-			this.hooks.onFinish?.(finished);
+			if (live) this.checkObservationGrant(live);
+			const buffer = live?.observations;
+			const snapshot: ChildObservationSnapshot | undefined = buffer ? Object.freeze({
+				coverage: "final_assistant_messages_only", agentSettled: buffer.agentSettled,
+				responses: Object.freeze(buffer.responses.slice()), droppedResponses: buffer.droppedResponses,
+			}) : undefined;
+			if (live) {
+				live.observations = undefined; // Also release quarantined buffers.
+				live.observationGuard = undefined;
+			}
+			this.hooks.onFinish?.(finished, snapshot);
 			for (const resolve of this.waiters.get(id) ?? []) resolve(finished);
 			this.waiters.delete(id);
 			for (const resolve of this.queryWaiters.get(id) ?? []) resolve(undefined);

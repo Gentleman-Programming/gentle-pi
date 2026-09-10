@@ -14,6 +14,12 @@ export type ArtifactState = "missing" | "done" | "partial";
 export type DependencyState = "blocked" | "ready" | "all_done" | "not_applicable";
 export type ApplyState = "blocked" | "ready" | "all_done" | "not_applicable";
 export type SddPhase = "apply" | "verify" | "sync" | "archive";
+export type SddNextRecommended =
+	| `sdd-${"propose" | "spec" | "design" | "tasks" | SddPhase}`
+	| "fix-task-ownership-marker"
+	| "archived"
+	| "resolve-via-engram"
+	| "blocked";
 
 export interface SddArtifactPaths {
 	proposal: string[];
@@ -107,7 +113,7 @@ export interface SddStatus {
 	 * When set, `nextRecommended` is "archived" and no further phase is recommended.
 	 */
 	archived?: { path: string };
-	nextRecommended: string;
+	nextRecommended: SddNextRecommended;
 	instructions?: SddPhaseInstructions;
 	blockedReasons: string[];
 	/**
@@ -258,6 +264,15 @@ function reportIsClearlyPassing(path: string | undefined): boolean {
 	return hasPassSignal && !hasBlocker;
 }
 
+// Planning routes repair the first incomplete prerequisite; diagnostics remain separate.
+function planningRecommendation(artifacts: SddStatus["artifacts"], taskTotal: number): SddNextRecommended {
+	if (artifacts.proposal !== "done") return "sdd-propose";
+	if (artifacts.specs !== "done") return "sdd-spec";
+	if (artifacts.design !== "done") return "sdd-design";
+	if (artifacts.tasks !== "done" || taskTotal === 0) return "sdd-tasks";
+	return "blocked";
+}
+
 function emptyStatus(cwd: string, changeName: string | null, blockedReasons: string[], artifactStore: SddArtifactStore = "openspec", isNonAuthoritative = false): SddStatus {
 	const root = resolve(cwd);
 	const changesDir = join(root, "openspec", "changes");
@@ -299,7 +314,7 @@ function emptyStatus(cwd: string, changeName: string | null, blockedReasons: str
 			sameDomainActiveChanges: [],
 		},
 		collisions: [],
-		nextRecommended: blockedReasons[0] ?? "Start an SDD change.",
+		nextRecommended: "blocked",
 		blockedReasons,
 		isNonAuthoritative,
 	};
@@ -594,7 +609,7 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 		archive: coreArtifactsReady && verifyClean && syncClean && taskProgress.remaining === 0 && !taskArtifactBlocked ? "ready" : "blocked",
 	};
 	const archiveReady = dependencies.archive === "ready";
-	const nextRecommended = taskArtifactBlocked
+	const nextRecommended: SddNextRecommended = taskArtifactBlocked
 		? "fix-task-ownership-marker"
 		: dependencies.apply === "ready"
 			? "sdd-apply"
@@ -604,7 +619,7 @@ export function resolveSddStatus(options: ResolveSddStatusOptions): SddStatus {
 					? "sdd-sync"
 					: archiveReady
 						? "sdd-archive"
-						: blockedReasons[0] ?? "Resolve blockers.";
+						: planningRecommendation(artifacts, taskProgress.total);
 
 	const status: SddStatus = {
 		schemaName: "gentle-pi.sdd-status",

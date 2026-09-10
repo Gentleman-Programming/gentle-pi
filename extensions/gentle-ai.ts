@@ -37,7 +37,10 @@ import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
 import {
 	ensureSddPreflight,
 	getSddPreflightPreferences,
-	installSddAssets,
+	installPackageAssets,
+	getPackageAssetOwner,
+	hasPackageAssetOwnerInstallation,
+	type PackageAssetOwner,
 	isPackageManagedSddAsset,
 	isSddPreflightTrigger,
 	renderSddPreflightPrompt,
@@ -127,6 +130,7 @@ import {
 import {
 	createNativeReviewCli,
 	createNodeExecFileAdapter,
+	decodeNativeSddStatusV2,
 	isCanonicalProcessString,
 	isNativeReviewUnachievableVerbRefused,
 	nativeReviewAbandonAuthorization,
@@ -148,6 +152,7 @@ import {
 	NATIVE_REVIEW_RECONCILE_ANOMALIES,
 	sanitizeForeignNativeReviewDiagnostics,
 	type NativeReviewCli,
+	type NativeSddStatusV2,
 	type NativeIntendedUntrackedSelectionSubmission,
 	type NativeReviewAcknowledgeApprovedOutcome,
 	type NativeReviewAcknowledgeApprovedRequest,
@@ -205,8 +210,9 @@ function gentlePiAgentHome(): string {
 	return resolveGentlePiAgentHome();
 }
 
-function sddGlobalAssetDriftCount(): number {
+function packageAssetAudit(owner: PackageAssetOwner): { stale: number; overrides: number } {
 	let stale = 0;
+	let overrides = 0;
 	for (const [assetSubdir, installedSubdir, ownershipPrefix] of [
 		["agents", "agents", "agents"],
 		["chains", "chains", "chains"],
@@ -215,7 +221,7 @@ function sddGlobalAssetDriftCount(): number {
 		const assetDir = join(ASSETS_DIR, assetSubdir);
 		if (!existsSync(assetDir)) continue;
 		for (const entry of readdirSync(assetDir, { withFileTypes: true })) {
-			if (!entry.isFile()) continue;
+			if (!entry.isFile() || getPackageAssetOwner(`${ownershipPrefix}/${entry.name}`) !== owner) continue;
 			const installedPath = join(gentlePiAgentHome(), installedSubdir, entry.name);
 			try {
 				if (!existsSync(installedPath)) {
@@ -228,6 +234,7 @@ function sddGlobalAssetDriftCount(): number {
 						`${ownershipPrefix}/${entry.name}`,
 					)
 				) {
+					overrides += 1;
 					continue;
 				}
 				const packaged = readFileSync(join(assetDir, entry.name), "utf8");
@@ -248,26 +255,47 @@ function sddGlobalAssetDriftCount(): number {
 			}
 		}
 	}
-	return stale;
+	return { stale, overrides };
 }
 
-function sddLocalAgentOverrideCount(cwd: string): number {
+function packageAssetDiagnosticLines(cwd: string): string[] {
+	return (["delegation", "review", "sdd"] as const).flatMap((owner) => {
+		const label = owner === "sdd" ? "SDD" : owner;
+		const onDemand = owner === "sdd" && !hasPackageAssetOwnerInstallation(owner);
+		const { stale, overrides } = packageAssetAudit(owner);
+		const local = localAgentOverrideCount(cwd, owner);
+		const lines = [onDemand
+			? `info: Global ${label} assets: on demand (not installed)`
+			: `${stale > 0 ? "warn" : "pass"}: Global ${label} assets stale: ${stale} file(s)`];
+		if (!onDemand && stale > 0) {
+			lines[0] += ` — run /gentle:install-${owner} --force to refresh managed assets`;
+		}
+		if (overrides > 0) {
+			lines.push(`info: Global ${label} user overrides: ${overrides} file(s); preserved, not package drift`);
+		}
+		if (local > 0) {
+			lines.push(`warn: Active ${label} agent overrides: ${local} file(s) — active non-builtin ${label} agents shadow package assets; keep only intentional overrides`);
+		}
+		return lines;
+	});
+}
+
+function localAgentOverrideCount(cwd: string, owner: PackageAssetOwner): number {
 	const packageSddAgentsDir = join(ASSETS_DIR, "agents");
-	const packageSddAgentNames = existsSync(packageSddAgentsDir)
-		? new Set(
-				readdirSync(packageSddAgentsDir, { withFileTypes: true })
-					.filter((entry) => entry.isFile() && /^sdd-.*\.md$/i.test(entry.name))
-					.map((entry) => entry.name),
+	const packageSddAgentNames = new Set(
+		listAgentsFromDir(packageSddAgentsDir, "builtin")
+			.filter((agent) =>
+				getPackageAssetOwner(
+					`agents/${relative(packageSddAgentsDir, agent.filePath).split(sep).join("/")}`,
+				) === owner,
 			)
-		: new Set<string>();
+			.map((agent) => agent.name),
+	);
 	let count = 0;
-	for (const installedDir of [
-		join(cwd, ".pi", "agents"),
-		join(cwd, ".pi", "subagents"),
-	]) {
-		if (!existsSync(installedDir)) continue;
-		for (const entry of readdirSync(installedDir, { withFileTypes: true })) {
-			if (entry.isFile() && packageSddAgentNames.has(entry.name)) count += 1;
+	for (const { dir, source, packageManaged } of discoverableNonBuiltinAgentRoots(cwd)) {
+		if (packageManaged || !existsSync(dir)) continue;
+		for (const agent of listAgentsFromDir(dir, source)) {
+			if (packageSddAgentNames.has(agent.name)) count += 1;
 		}
 	}
 	return count;
@@ -1378,6 +1406,8 @@ const SDD_AGENT_NAMES = [
 	"sdd-archive",
 ] as const;
 const SDD_AGENT_NAME_SET = new Set<string>(SDD_AGENT_NAMES);
+const SDD_CHANGE_FLAG = "gentle-sdd-change";
+const SDD_CHANGE_KEYS = ["changeName", "phase", "workspaceRoot"] as const;
 
 const JUDGMENT_DAY_AGENT_NAMES = [
 	"jd-judge-a",
@@ -1467,6 +1497,92 @@ function sddPhaseFromAgentStartEvent(event: unknown): SddPhase | undefined {
 	if (/\bSDD sync executor\b/i.test(systemPrompt)) return "sync";
 	if (/\bSDD archive executor\b/i.test(systemPrompt)) return "archive";
 	return undefined;
+}
+
+function resolveSddChangeSelection(serialized: unknown, cwd: string, agentName: string) {
+	if (typeof serialized !== "string") throw new Error("SDD selection must be a JSON string.");
+	let value: unknown;
+	try {
+		value = JSON.parse(serialized);
+	} catch {
+		throw new Error("SDD selection is malformed.");
+	}
+	if (!isRecord(value) || Object.keys(value).sort().join(",") !== SDD_CHANGE_KEYS.join(",")) {
+		throw new Error("SDD selection must contain only changeName, workspaceRoot, and phase.");
+	}
+	const { changeName, workspaceRoot, phase } = value;
+	if (typeof changeName !== "string" || changeName.length === 0 ||
+		typeof workspaceRoot !== "string" || workspaceRoot.length === 0 ||
+		(phase !== "apply" && phase !== "verify" && phase !== "sync" && phase !== "archive")) {
+		throw new Error("SDD selection has an invalid identity.");
+	}
+	if (agentName !== `sdd-${phase}`) throw new Error("SDD selection phase does not match the child agent.");
+	let canonicalCwd: string;
+	let canonicalSelectionRoot: string;
+	try {
+		canonicalCwd = realpathSync(cwd);
+		canonicalSelectionRoot = realpathSync(workspaceRoot);
+	} catch {
+		throw new Error("SDD selection workspaceRoot cannot be resolved.");
+	}
+	if (canonicalCwd !== canonicalSelectionRoot || workspaceRoot !== canonicalSelectionRoot) {
+		throw new Error("SDD selection workspaceRoot does not match the canonical child root.");
+	}
+	return { changeName, workspaceRoot: canonicalCwd, phase };
+}
+
+function resolveSddChangeStartup(
+	serialized: unknown,
+	cwd: string,
+	agentName: string,
+	resolver: (options: Parameters<typeof resolveSddStatus>[0]) => ReturnType<typeof resolveSddStatus> = resolveSddStatus,
+) {
+	const selection = resolveSddChangeSelection(serialized, cwd, agentName);
+	const status = resolver({ cwd: selection.workspaceRoot, workspaceRoot: selection.workspaceRoot, changeName: selection.changeName, includeInstructions: true });
+	if (status.actionContext.workspaceRoot !== selection.workspaceRoot || status.changeName !== selection.changeName) {
+		throw new Error("SDD selection resolver returned a mismatched status.");
+	}
+	return { selection, status };
+}
+
+async function resolveSelectedNativeSddChangeStartup(
+	serialized: unknown,
+	cwd: string,
+	agentName: string,
+	native: Pick<NativeReviewCli, "sddStatus"> | null | undefined,
+	localResolver: (options: Parameters<typeof resolveSddStatus>[0]) => ReturnType<typeof resolveSddStatus> = resolveSddStatus,
+): Promise<{ selection: { changeName: string; workspaceRoot: string; phase: SddPhase }; status: NativeSddStatusV2 | ReturnType<typeof resolveSddStatus> }> {
+	const selection = resolveSddChangeSelection(serialized, cwd, agentName);
+	if (selection.phase === "sync") {
+		const status = localResolver({ cwd: selection.workspaceRoot, workspaceRoot: selection.workspaceRoot, changeName: selection.changeName, includeInstructions: true });
+		if (status.actionContext.workspaceRoot !== selection.workspaceRoot || status.changeName !== selection.changeName) {
+			throw new Error("SDD selection resolver returned a mismatched status.");
+		}
+		return { selection, status };
+	}
+	if (native?.sddStatus === undefined) throw new Error("SDD selection native status is unavailable.");
+	let status: NativeSddStatusV2;
+	try {
+		status = decodeNativeSddStatusV2(
+			await native.sddStatus({ changeName: selection.changeName, workspaceRoot: selection.workspaceRoot }),
+			{ changeName: selection.changeName, workspaceRoot: selection.workspaceRoot },
+		);
+	} catch (error) {
+		throw new Error(`SDD selection native status is blocked: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!(selection.phase in status.dependencies) || !(selection.phase in status.instructions)) {
+		throw new Error(`SDD selection native status cannot represent phase ${selection.phase}.`);
+	}
+	return { selection, status };
+}
+
+function readSddChangeFlag(pi: ExtensionAPI): unknown {
+	try {
+		const value = (pi as unknown as { getFlag?: (name: string) => unknown }).getFlag?.(SDD_CHANGE_FLAG);
+		return value === false ? undefined : value;
+	} catch {
+		return null;
+	}
 }
 
 function normalizePolicyPath(value: string): string {
@@ -1764,7 +1880,10 @@ function parseModelExport(value: unknown): AgentModelConfig | undefined {
 }
 
 async function exportSavedModelConfig(ctx: ExtensionContext): Promise<number> {
-	const saved = await readSavedModelConfigAsync(ctx.cwd);
+	const saved = await readModelRoutingAuthorityAsync(
+		modelConfigPath(ctx.cwd),
+		legacyProjectModelConfigPath(ctx.cwd),
+	);
 	if (saved.status === "invalid") throw new Error(`Invalid model config: ${saved.path}`);
 	const agents = saved.status === "valid" ? saved.config : {};
 	const path = modelExportPath(ctx.cwd);
@@ -1915,6 +2034,49 @@ async function listAgentsFromDirAsync(
 	return entries;
 }
 
+interface DiscoverableNonBuiltinAgentRoot {
+	dir: string;
+	source: AgentSource;
+	/** The package installer owns this directory, so packageAssetAudit reports it. */
+	packageManaged: boolean;
+}
+
+function discoverableNonBuiltinAgentRoots(cwd: string): DiscoverableNonBuiltinAgentRoot[] {
+	const globalAgentHome = gentlePiAgentHome();
+	const roots: DiscoverableNonBuiltinAgentRoot[] = [
+		{ dir: join(globalAgentHome, "agents"), source: "user", packageManaged: true },
+		{ dir: join(globalAgentHome, "subagents"), source: "user", packageManaged: false },
+		{ dir: join(homedir(), ".agents"), source: "user", packageManaged: false },
+		{ dir: join(cwd, ".agents"), source: "project", packageManaged: false },
+		{ dir: join(cwd, ".pi", "agents"), source: "project", packageManaged: false },
+		{ dir: join(cwd, ".pi", "subagents"), source: "project", packageManaged: false },
+	];
+	const unique = new Map<string, DiscoverableNonBuiltinAgentRoot>();
+	for (const root of roots) {
+		let canonical: string;
+		try {
+			canonical = realpathSync(root.dir);
+		} catch {
+			canonical = resolve(root.dir);
+		}
+		const existing = unique.get(canonical);
+		if (existing) {
+			// Reinsert so a later alias keeps true later-root precedence even when
+			// another physical root appears between the duplicate entries. A merged
+			// package-managed root must keep its installer-owned path: ownership
+			// updates validate that lexical path against the managed manifest root.
+			const managedRoot = existing.packageManaged ? existing : root.packageManaged ? root : undefined;
+			unique.delete(canonical);
+			unique.set(canonical, {
+				dir: managedRoot?.dir ?? root.dir,
+				source: root.source,
+				packageManaged: managedRoot !== undefined,
+			});
+		} else unique.set(canonical, root);
+	}
+	return [...unique.values()];
+}
+
 function builtinAgentDirs(cwd: string): string[] {
 	return [
 		join(PACKAGE_ROOT, "..", "pi-subagents-j0k3r", "agents"),
@@ -1945,16 +2107,12 @@ async function listBuiltinAgentNamesAsync(cwd: string): Promise<Set<string>> {
 }
 
 function listDiscoverableAgents(cwd: string): AgentEntry[] {
-	const globalAgentHome = gentlePiAgentHome();
 	const builtinDirs = builtinAgentDirs(cwd);
 	const agents = [
 		...builtinDirs.flatMap((dir) => listAgentsFromDir(dir, "builtin")),
-		...listAgentsFromDir(join(globalAgentHome, "agents"), "user"),
-		...listAgentsFromDir(join(globalAgentHome, "subagents"), "user"),
-		...listAgentsFromDir(join(homedir(), ".agents"), "user"),
-		...listAgentsFromDir(join(cwd, ".agents"), "project"),
-		...listAgentsFromDir(join(cwd, ".pi", "agents"), "project"),
-		...listAgentsFromDir(join(cwd, ".pi", "subagents"), "project"),
+		...discoverableNonBuiltinAgentRoots(cwd).flatMap(({ dir, source }) =>
+			listAgentsFromDir(dir, source),
+		),
 	];
 	const byName = new Map<string, AgentEntry>();
 	for (const agent of agents) byName.set(agent.name, agent);
@@ -1962,21 +2120,12 @@ function listDiscoverableAgents(cwd: string): AgentEntry[] {
 }
 
 async function listDiscoverableAgentsAsync(cwd: string): Promise<AgentEntry[]> {
-	const globalAgentHome = gentlePiAgentHome();
 	const builtinDirs = builtinAgentDirs(cwd);
 	const agents: AgentEntry[] = [];
 	for (const dir of builtinDirs) {
 		agents.push(...(await listAgentsFromDirAsync(dir, "builtin")));
 	}
-	const otherDirs: Array<[string, AgentSource]> = [
-		[join(globalAgentHome, "agents"), "user"],
-		[join(globalAgentHome, "subagents"), "user"],
-		[join(homedir(), ".agents"), "user"],
-		[join(cwd, ".agents"), "project"],
-		[join(cwd, ".pi", "agents"), "project"],
-		[join(cwd, ".pi", "subagents"), "project"],
-	];
-	for (const [dir, source] of otherDirs) {
+	for (const { dir, source } of discoverableNonBuiltinAgentRoots(cwd)) {
 		agents.push(...(await listAgentsFromDirAsync(dir, source)));
 	}
 	const byName = new Map<string, AgentEntry>();
@@ -2183,22 +2332,27 @@ export function applyModelConfig(
 			skipped += 1;
 			continue;
 		}
-		if (updateSubagentModelProfile(cwd, agent.source, agent.name, entry)) updated += 1;
-		else skipped += 1;
-		if (agent.source === "builtin") continue;
+		if (agent.source === "builtin") {
+			if (updateSubagentModelProfile(cwd, agent.source, agent.name, entry)) updated += 1;
+			else skipped += 1;
+			continue;
+		}
 		if (!agent.filePath || !existsSync(agent.filePath)) {
 			skipped += 1;
-			continue;
+		} else {
+			const original = readFileSync(agent.filePath, "utf8");
+			const next = updateFrontmatterRouting(original, entry);
+			if (next === original) {
+				skipped += 1;
+			} else {
+				if (!updatePackageManagedSddAgentOwnership(agent.filePath, original, next)) {
+					writeFileSync(agent.filePath, next);
+				}
+				updated += 1;
+			}
 		}
-		const original = readFileSync(agent.filePath, "utf8");
-		const next = updateFrontmatterRouting(original, entry);
-		if (next === original) {
-			skipped += 1;
-			continue;
-		}
-		writeFileSync(agent.filePath, next);
-		updatePackageManagedSddAgentOwnership(agent.filePath, original, next);
-		updated += 1;
+		if (updateSubagentModelProfile(cwd, agent.source, agent.name, entry)) updated += 1;
+		else skipped += 1;
 	}
 	for (const [name, entry] of Object.entries(config)) {
 		if (!seenAgents.has(name) && isClearRoutingEntry(entry)) {
@@ -2223,23 +2377,29 @@ export async function applyModelConfigAsync(
 			skipped += 1;
 			continue;
 		}
+		if (agent.source === "builtin") {
+			if (await updateSubagentModelProfileAsync(cwd, agent.source, agent.name, entry))
+				updated += 1;
+			else skipped += 1;
+			continue;
+		}
+		if (!agent.filePath || !(await pathExists(agent.filePath))) {
+			skipped += 1;
+		} else {
+			const original = await readFile(agent.filePath, "utf8");
+			const next = updateFrontmatterRouting(original, entry);
+			if (next === original) {
+				skipped += 1;
+			} else {
+				if (!updatePackageManagedSddAgentOwnership(agent.filePath, original, next)) {
+					await writeFile(agent.filePath, next);
+				}
+				updated += 1;
+			}
+		}
 		if (await updateSubagentModelProfileAsync(cwd, agent.source, agent.name, entry))
 			updated += 1;
 		else skipped += 1;
-		if (agent.source === "builtin") continue;
-		if (!agent.filePath || !(await pathExists(agent.filePath))) {
-			skipped += 1;
-			continue;
-		}
-		const original = await readFile(agent.filePath, "utf8");
-		const next = updateFrontmatterRouting(original, entry);
-		if (next === original) {
-			skipped += 1;
-			continue;
-		}
-		await writeFile(agent.filePath, next);
-		updatePackageManagedSddAgentOwnership(agent.filePath, original, next);
-		updated += 1;
 	}
 	for (const [name, entry] of Object.entries(config)) {
 		if (!seenAgents.has(name) && isClearRoutingEntry(entry)) {
@@ -2801,7 +2961,10 @@ async function showSddModelPanel(
 
 async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
 	migrateLegacyProjectModelOverrides(ctx.cwd);
-	const savedConfig = await readSavedModelConfigAsync(ctx.cwd);
+	const savedConfig = await readModelRoutingAuthorityAsync(
+		modelConfigPath(ctx.cwd),
+		legacyProjectModelConfigPath(ctx.cwd),
+	);
 	if (savedConfig.status === "invalid") {
 		ctx.ui.notify(
 			`el Gentleman cannot open model config because ${savedConfig.path} is invalid JSON or not an object. Fix or remove the file, then run /gentle:models again.`,
@@ -6276,7 +6439,7 @@ async function executeReviewControllerOperation(
 				retainNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, result.lineageId, retainedUntrackedSelection);
 				return completeNativeStart(parameters.operation, result, defaultCwd, candidateView, candidateViews);
 			} catch (error) {
-				if (error instanceof CandidateViewError && error.diagnostics !== undefined) return nativeOperationFailure(parameters.operation, Object.assign(error, { candidateViewPreNative: true }));
+				if (!nativeStartAttempted && error instanceof CandidateViewError && error.diagnostics !== undefined) return nativeOperationFailure(parameters.operation, Object.assign(error, { candidateViewPreNative: true }));
 				if (error instanceof CandidateViewError && (error.reason === "base-ref-ambiguous" || error.reason === "base-ref-unresolvable" || error.reason === "base-ref-moved")) return nativeStartRejection(error.reason);
 				const value = error as { mutationOutcome?: unknown; nextAction?: unknown };
 				const provenNoMutation = value.mutationOutcome === "none";
@@ -6478,6 +6641,9 @@ export const __testing = {
 	clearNativeReviewOutcomeMemoForTesting,
 	resolveControllerSddStatus,
 	resolveStartupControllerSddStatus,
+	resolveSddChangeStartup,
+	resolveSelectedNativeSddChangeStartup,
+	readSddChangeFlag,
 	resetTelemetryTriggerGuardForTesting,
 	createGentleAiExtension: createGentleAiExtensionForTesting,
 };
@@ -6548,6 +6714,11 @@ function createGentleAiExtensionForTesting(
 	const resolveTelemetryTriggerBinary = dependencies.resolveTelemetryTriggerBinary ?? resolveGentleAiBinary;
 	const telemetryExecFileAdapter = dependencies.telemetryExecFileAdapter ?? createNodeExecFileAdapter();
 	return function gentleAi(pi: ExtensionAPI): void {
+		const flags = pi as unknown as { registerFlag?: (name: string, definition: { description: string; type: "string"; default?: string }) => void };
+		flags.registerFlag?.(SDD_CHANGE_FLAG, {
+			description: "Internal launch-local selected SDD change identity for package-owned child agents.",
+			type: "string",
+		});
 	declareReviewRelayHandshake(dependencies.processEnv ?? process.env);
 	const pendingReviewConsentFallbackKey = Symbol("pending-review-consent-fallback");
 	const candidateViews = dependencies.candidateViews === undefined ? new CandidateViewRegistry() : dependencies.candidateViews;
@@ -6868,7 +7039,7 @@ function createGentleAiExtensionForTesting(
 	});
 
 	function runSddPreflight(ctx: ExtensionContext, promptFields: readonly SddPreflightField[] = []): Promise<SddPreflightPreferences> {
-		return ensureSddPreflight(ctx, { pi, installAssets: (cwd) => installSddAssets(cwd, false), applyModelConfig: async () => applySavedModelConfig(ctx) }, { promptFields });
+		return ensureSddPreflight(ctx, { pi, installAssets: (cwd) => installPackageAssets(cwd, true, ["sdd"]), applyModelConfig: async () => applySavedModelConfig(ctx) }, { promptFields });
 	}
 
 	pi.on("session_start", async (event, ctx) => {
@@ -6888,7 +7059,7 @@ function createGentleAiExtensionForTesting(
 			if (ctx.hasUI) ctx.ui.notify(`Gentle AI dev binary override check failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
 		}
 		try {
-			const installResult = installSddAssets(ctx.cwd, true);
+			const installResult = installPackageAssets(ctx.cwd, true, ["delegation", "review"]);
 			migrateLegacyProjectModelOverrides(ctx.cwd);
 			const modelResult = await applySavedModelConfig(ctx);
 			if (ctx.hasUI && modelResult.invalidPath) {
@@ -6900,7 +7071,7 @@ function createGentleAiExtensionForTesting(
 			}
 			if (ctx.hasUI && modelResult.updated > 0) {
 				ctx.ui.notify(
-					`el Gentleman applied SDD model config to ${modelResult.updated} agent(s). Global SDD assets ready: ${installResult.agents} new agent(s), ${installResult.chains} new chain(s), ${installResult.support} new support file(s).`,
+					`el Gentleman applied saved model config to ${modelResult.updated} agent(s). Global delegation/review assets ready: ${installResult.agents} new agent(s), ${installResult.chains} new chain(s), ${installResult.support} new support file(s).`,
 					"info",
 				);
 			}
@@ -6980,14 +7151,41 @@ function createGentleAiExtensionForTesting(
 				? `\n\n${renderSddPreflightPrompt(prefs)}`
 				: "";
 		const phase = isSddAgent ? sddPhaseFromAgentStartEvent(event) : undefined;
+		const launchSddChange = isSddAgent ? readSddChangeFlag(pi) : undefined;
 		const nativeStatusPrompt = phase
-			? `\n\n${renderNativeSddPhasePrompt(resolveStartupControllerSddStatus(
-				ctx.cwd,
-				undefined,
-				true,
-				prefs?.artifactStore,
-			), phase)}`
-			: "";
+			? await (async () => {
+				if (launchSddChange === undefined) {
+					return `\n\n${renderNativeSddPhasePrompt(resolveStartupControllerSddStatus(
+						ctx.cwd,
+						undefined,
+						true,
+						prefs?.artifactStore,
+					), phase)}`;
+				}
+				try {
+					const names = readAgentStartNames(event);
+					const agentName = names.find((name) => name === `sdd-${phase}`);
+					if (!agentName) throw new Error("SDD selection requires a matching named SDD phase agent.");
+					const startup = await resolveSelectedNativeSddChangeStartup(
+						launchSddChange,
+						ctx.cwd,
+						agentName,
+						nativeReviewCli,
+						(options) => resolveControllerSddStatus(
+							options.cwd,
+							options.changeName,
+							true,
+							prefs?.artifactStore,
+						),
+					);
+					return `\n\n${renderNativeSddPhasePrompt(startup.status as never, phase)}`;
+				} catch (error) {
+					return `\n\n## Native SDD Status Engine\nSDD selection blocked: ${error instanceof Error ? error.message : String(error)}\nDo not run phase work; return this blocker to the parent.`;
+				}
+			})()
+			: launchSddChange === undefined
+				? ""
+				: "\n\n## Native SDD Status Engine\nSDD selection blocked: the receiving agent has no recognized SDD phase.\nDo not run phase work; return this blocker to the parent.";
 		// gentle-pi#661: the RDD status line (and the rest of the gentle prompt)
 		// is built only for the primary session, mirrored on the
 		// reviewContractPrompt condition below -- named/SDD agents never reach
@@ -7092,18 +7290,20 @@ function createGentleAiExtensionForTesting(
 		return await confirmCommand(event.input.command, ctx, pi.events, herdrLifecycle);
 	});
 
-	pi.registerCommand("gentle:install-sdd", {
-		description:
-			"Repair or refresh global Gentle AI SDD subagent and chain assets.",
-		handler: async (args, ctx) => {
-			const force = args.includes("--force");
-			const result = installSddAssets(ctx.cwd, force);
-			ctx.ui.notify(
-				`Global Gentle AI SDD assets installed: ${result.agents} agent(s), ${result.chains} chain(s), ${result.support} support file(s), ${result.skipped} already present.`,
-				"info",
-			);
-		},
-	});
+	for (const owner of ["delegation", "review", "sdd"] as const) {
+		const label = owner === "sdd" ? "SDD" : owner;
+		pi.registerCommand(`gentle:install-${owner}`, {
+			description: `Repair or refresh only global Gentle AI ${label} assets.`,
+			handler: async (args, ctx) => {
+				const force = args.includes("--force");
+				const result = installPackageAssets(ctx.cwd, force, [owner]);
+				ctx.ui.notify(
+					`Global Gentle AI ${label} assets installed: ${result.agents} agent(s), ${result.chains} chain(s), ${result.support} support file(s), ${result.skipped} already present.`,
+					"info",
+				);
+			},
+		});
+	}
 
 	pi.registerCommand("gentle:sdd-preflight", {
 		description:
@@ -7236,29 +7436,19 @@ function createGentleAiExtensionForTesting(
 	pi.registerCommand("gentle:doctor", {
 		description: "Run read-only Gentle AI diagnostics for this Pi workspace.",
 		handler: async (_args, ctx) => {
-			const agentsInstalled = existsSync(
-				join(gentlePiAgentHome(), "agents", "sdd-apply.md"),
-			);
-			const chainsInstalled = existsSync(
-				join(gentlePiAgentHome(), "chains", "sdd-full.chain.md"),
-			);
+			const assetLines = packageAssetDiagnosticLines(ctx.cwd);
 			const openspecConfigured = existsSync(
 				join(ctx.cwd, "openspec", "config.yaml"),
 			);
 			const skillRegistryPresent = existsSync(
 				join(ctx.cwd, ".atl", "skill-registry.md"),
 			);
-			const staleSddAssets = sddGlobalAssetDriftCount();
-			const localSddAgentOverrides = sddLocalAgentOverrideCount(ctx.cwd);
 			const modelConfig = await readSavedModelConfigAsync(ctx.cwd);
 			const engramActive = hasWritableEngramTool(pi);
 			const devBinary = await describeDevBinaryOverride();
 			const lines = [
 				"el Gentleman doctor",
-				`${agentsInstalled ? "pass" : "fail"}: Global SDD agents ${agentsInstalled ? "installed" : "missing"}`,
-				`${chainsInstalled ? "pass" : "fail"}: Global SDD chains ${chainsInstalled ? "installed" : "missing"}`,
-				`${staleSddAssets === 0 ? "pass" : "warn"}: Global SDD asset drift ${staleSddAssets} file(s)`,
-				`${localSddAgentOverrides === 0 ? "pass" : "warn"}: Project-local SDD agent overrides ${localSddAgentOverrides} file(s)`,
+				...assetLines,
 				`${openspecConfigured ? "pass" : "warn"}: OpenSpec config ${openspecConfigured ? "present" : "missing"}`,
 				`${skillRegistryPresent ? "pass" : "warn"}: Skill registry ${skillRegistryPresent ? "present" : "missing"}`,
 				`${modelConfig.status === "invalid" ? "fail" : "pass"}: Global model config ${modelConfig.status}`,
@@ -7267,18 +7457,12 @@ function createGentleAiExtensionForTesting(
 				...(devBinary.state === "active" ? [`warn: ${devBinary.line}`] : []),
 				...(devBinary.state === "invalid" ? [`fail: ${devBinary.line}`, "remedy: fix the dev binary override or clear it with /gentle:dev-binary off (or unset GENTLE_PI_GENTLE_AI_DEV_BINARY)"] : []),
 			];
-			if (!agentsInstalled || !chainsInstalled) {
-				lines.push("remedy: run /gentle:install-sdd --force to refresh global SDD assets intentionally");
-			}
 			if (modelConfig.status === "invalid") {
 				lines.push(`remedy: fix or remove ${modelConfig.path}`);
 			}
-			if (localSddAgentOverrides > 0) {
-				lines.push("remedy: remove project-local SDD agent overrides unless intentionally debugging package assets");
-			}
 			ctx.ui.notify(
 				lines.join("\n"),
-				lines.some((line) => line.startsWith("fail:")) ? "warning" : "info",
+				lines.some((line) => line.startsWith("fail:")) || assetLines.some((line) => line.startsWith("warn:")) ? "warning" : "info",
 			);
 		},
 	});
@@ -7308,7 +7492,7 @@ function createGentleAiExtensionForTesting(
 	});
 
 	pi.registerCommand("gentle:review-mode", {
-		description: "Show or set the Gentle AI review-driven-development kill switch (status|disable|enable). Every sub-action is user-initiated only; Pi automation never toggles it.",
+		description: "Show or set the Gentle AI receipt-driven development kill switch (status|enable|disable). Every sub-action is user-initiated only; Pi automation never toggles it.",
 		handler: async (args, ctx) => {
 			const subAction = args.trim().length === 0 ? NATIVE_REVIEW_MODE_OPERATION.STATUS : args.trim();
 			if (subAction !== NATIVE_REVIEW_MODE_OPERATION.STATUS && subAction !== NATIVE_REVIEW_MODE_OPERATION.ENABLE && subAction !== NATIVE_REVIEW_MODE_OPERATION.DISABLE) {
@@ -7430,41 +7614,27 @@ function createGentleAiExtensionForTesting(
 	pi.registerCommand("gentle:status", {
 		description: "Show Gentle AI package status for this project.",
 		handler: async (_args, ctx) => {
-			const agentsInstalled = existsSync(
-				join(gentlePiAgentHome(), "agents", "sdd-apply.md"),
-			);
-			const chainsInstalled = existsSync(
-				join(gentlePiAgentHome(), "chains", "sdd-full.chain.md"),
-			);
+			const assetLines = packageAssetDiagnosticLines(ctx.cwd);
 			const openspecConfigured = existsSync(
 				join(ctx.cwd, "openspec", "config.yaml"),
 			);
-			const staleSddAssets = sddGlobalAssetDriftCount();
-			const localSddAgentOverrides = sddLocalAgentOverrideCount(ctx.cwd);
-			const modelConfig = await readModelConfigAsync(ctx.cwd);
+			const savedConfig = await readModelRoutingAuthorityAsync(
+				modelConfigPath(ctx.cwd),
+				legacyProjectModelConfigPath(ctx.cwd),
+			);
 			const devBinary = await describeDevBinaryOverride();
 			ctx.ui.notify(
 				[
 					"el Gentleman package is active.",
 					...(devBinary.state === "inactive" ? [] : [devBinary.line]),
 					`Persona: ${readPersonaMode(ctx.cwd)}`,
-					`Global SDD agents: ${agentsInstalled ? "installed" : "not installed"}`,
-					`Global SDD chains: ${chainsInstalled ? "installed" : "not installed"}`,
-					`Global SDD assets stale: ${staleSddAssets} file(s)${
-						staleSddAssets > 0
-							? " — run /gentle:install-sdd --force to refresh intentionally"
-							: ""
-					}`,
-					`Project-local SDD agent overrides: ${localSddAgentOverrides} file(s)${
-						localSddAgentOverrides > 0
-							? " — local SDD agents shadow package assets; remove them unless intentionally debugging"
-							: ""
-					}`,
+					...assetLines,
 					`OpenSpec config: ${openspecConfigured ? "present" : "missing"}`,
 					`Global model config: ${existsSync(modelConfigPath(ctx.cwd)) ? "present" : "missing"}`,
-					...describeModelConfig(ctx.cwd, modelConfig),
+					`Saved model routing: ${savedConfig.status}${savedConfig.status === "invalid" ? ` (${savedConfig.path})` : ""}`,
+					...(savedConfig.status === "invalid" ? [] : describeModelConfig(ctx.cwd, savedConfig.status === "valid" ? savedConfig.config : {})),
 				].join("\n"),
-				staleSddAssets > 0 || localSddAgentOverrides > 0 || devBinary.state !== "inactive" ? "warning" : "info",
+				savedConfig.status === "invalid" || assetLines.some((line) => line.startsWith("warn:")) || devBinary.state !== "inactive" ? "warning" : "info",
 			);
 		},
 	});

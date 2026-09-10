@@ -1841,10 +1841,19 @@ function decodeUnachievableLensSlot(value         , label        )              
 	if (withdrawLineage?.value !== lineageId) throw new TypeError(`${label}.withdraw.arguments lineage does not match the withdraw binding lineage_id`);
 	const withdrawExpectedRevision = withdrawIdentityArgument("expected-revision");
 	if (withdrawExpectedRevision?.value !== revision) throw new TypeError(`${label}.withdraw.arguments expected-revision does not match the withdraw binding revision`);
-	// gentle-pi#822: the rendered command is a third rendering of the same identity, so when an identity argument carries its provider-issued token the command must still contain it; a drifted command would withdraw a different slot than the arguments name.
-	for (const [name, identityArgument] of [["request-hash", withdrawRequestHash], ["target", withdrawTarget], ["lineage", withdrawLineage], ["expected-revision", withdrawExpectedRevision]]         ) {
-		if (identityArgument?.token !== undefined && !command.includes(identityArgument.token)) throw new TypeError(`${label}.withdraw.command does not match the withdraw arguments ${name}`);
-	}
+	// gentle-pi#822: command is executable authority, not a display hint. Every
+	// provider-issued argument token must be the canonical --name=value rendering,
+	// and command must render the canonical operation plus those tokens exactly in
+	// order. This rejects omitted tokens, a second command, suffixes, and shell
+	// payloads rather than merely finding identity-token substrings.
+	const tokens = arguments_.map((argument, index) => {
+		if (argument.token === undefined) throw new TypeError(`${label}.withdraw.arguments[${index}].token is required`);
+		const expectedToken = `--${argument.name}=${argument.value}`;
+		if (argument.token !== expectedToken) throw new TypeError(`${label}.withdraw.arguments[${index}].token must exactly render its name and value`);
+		return argument.token;
+	});
+	const expectedCommand = `gentle-ai review capture-unachievable ${tokens.join(" ")}`;
+	if (command !== expectedCommand) throw new TypeError(`${label}.withdraw.command must exactly render the canonical operation and withdraw arguments`);
 	return { lens, selectedOrder, subjectHash, reason, ...(detail === undefined ? {} : { detail }), withdraw: { operation, command, arguments: arguments_, binding: { targetIdentity, ...(lineageId === undefined ? {} : { lineageId }), ...(revision === undefined ? {} : { revision }) } } };
 }
 

@@ -208,7 +208,7 @@ test("controller SDD status treats removed OpenSpec recovery authority and delet
 	const status = await __testing.resolveControllerSddStatus(fixture.repository, changeName, false, "openspec");
 
 	assert.equal(status.dependencies.archive, "blocked");
-	assert.equal(status.nextRecommended, "Active change not found: recover-legacy-review-authority.");
+	assert.equal(status.nextRecommended, "blocked");
 	assert.match(status.blockedReasons.join("\n"), /active change not found/i);
 });
 

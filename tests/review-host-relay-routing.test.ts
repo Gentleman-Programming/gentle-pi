@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -573,7 +573,7 @@ test("a deterministic pi timeout declares the slot unachievable and renders the 
 	assert.equal(result.status, "blocked");
 	assert.equal(result.outcome, "unachievable-lens-slot-declared");
 	assert.deepEqual(result.failure, { kind: "pi-timed-out", stage: "pi", exit_code: null, timed_out: true, elapsed_ms: 2_256_004, timeout_ms: 2_256_000 });
-	assert.deepEqual(harness.unachievableCalls, [{ cwd, lineageId, targetIdentity: SHA, expectedRevision: SHA, requestHash: `sha256:${"0".repeat(64)}`, reason: "relay_transport_bound_exceeded", detail: "killed after 2256004ms against a 2256000ms relay bound", repositoryContext: `rctx1_${"e".repeat(64)}` }]);
+	assert.deepEqual(harness.unachievableCalls, [{ cwd: realpathSync(cwd), lineageId, targetIdentity: SHA, expectedRevision: SHA, requestHash: `sha256:${"0".repeat(64)}`, reason: "relay_transport_bound_exceeded", detail: "killed after 2256004ms against a 2256000ms relay bound", repositoryContext: `rctx1_${"e".repeat(64)}` }]);
 	assert.deepEqual(result.declaration, { lens: "review-risk", selected_order: 0, subject_hash: `sha256:${"0".repeat(64)}`, reason: "relay_transport_bound_exceeded" });
 	assert.deepEqual(result.result, stop.raw);
 	const slots = result.unachievable_lens_slots as Array<{ lens: string; subject_hash: string; withdraw: string }>;
@@ -589,31 +589,35 @@ test("a deterministic pi timeout declares the slot unachievable and renders the 
 	assert.equal(harness.statusCalls.at(-1)?.agent, "pi", "the bound re-query preserves the Pi host runtime");
 });
 
-// gentle-pi#522 / #524 / #638: a provider admission refusal of the lens
-// context is the second deterministic class; the declaration records it with
-// its own machine-readable reason and no detail echo of the refusal text.
-test("an admission refusal declares the slot unachievable with its own reason", async (t) => {
+// gentle-pi#638: generic admission rejections describe the submitted reviewer
+// bytes, not a deterministic failure of the provider-bound slot. A fresh
+// reviewer can repair malformed JSON or a binding mismatch, so both retain the
+// ordinary exact-reoffer path and must never declare the slot unachievable.
+test("repairable submission refusals retain the exact-slot retry path", async (t) => {
 	t.after(() => __testing.setReviewHostRelayRunnerForTesting());
 	const cwd = repository(t);
 	const lineageId = "relay-lineage";
-	const input = relayCollectInput(lineageId, "review-reliability", 0);
-	const stop = unachievableStopStatus(lineageId, "review-reliability", 0, "lens_admission_refused");
-	const harness = nativeHarness([finalizeStatus(lineageId, [input]), stop], () => Promise.resolve(unachievableArtifact(lineageId, "review-reliability", 0, "lens_admission_refused")));
-	const refusal = "Error: reviewer artifact admission binding_mismatch [invalid_request]\n";
-	__testing.setReviewHostRelayRunnerForTesting(async () => {
-		throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", refusal.trim(), { exitCode: 1, stderr: refusal, mutationOutcome: "none" });
-	});
+	for (const refusal of [
+		"Error: reviewer payload contains no complete JSON object [invalid_request]\n",
+		"Error: reviewer artifact admission binding_mismatch [invalid_request]\n",
+	]) {
+		const input = relayCollectInput(lineageId, "review-reliability", 0);
+		const harness = nativeHarness([finalizeStatus(lineageId, [input])], async () => {
+			throw new Error("a repairable refusal must not call capture-unachievable");
+		});
+		__testing.setReviewHostRelayRunnerForTesting(async () => {
+			throw new ReviewHostRelayError(REVIEW_HOST_RELAY_FAILURE.SUBMISSION_REFUSED, "submit", refusal.trim(), { exitCode: 1, stderr: refusal, mutationOutcome: "none" });
+		});
 
-	const result = await runCapture(cwd, harness, lineageId);
+		const result = await runCapture(cwd, harness, lineageId);
 
-	assert.equal(result.outcome, "unachievable-lens-slot-declared");
-	assert.equal(harness.unachievableCalls.length, 1);
-	assert.equal(harness.unachievableCalls[0]?.reason, "lens_admission_refused");
-	assert.equal(harness.unachievableCalls[0]?.detail, undefined, "the refusal text rides failure.stderr, not the declaration detail");
-	assert.equal(result.declaration?.reason, "lens_admission_refused");
-	assert.equal(result.mutation_performed, true);
-	assert.equal(result.mutation_outcome, "committed");
-	assert.equal(harness.statusCalls.length, 2);
+		assert.equal(result.outcome, "pi-host-relay-transport-failure");
+		assert.equal(result.mutation_performed, false);
+		assert.equal(result.mutation_outcome, "none");
+		assert.match(String(result.next_action), /fresh STATUS/);
+		assert.deepEqual(harness.unachievableCalls, []);
+		assert.equal(harness.statusCalls.length, 1, "a repairable non-mutation needs no reconciliation before the provider reoffers it");
+	}
 });
 
 // gentle-pi#822: a stop carrying slots that do not match the identity this

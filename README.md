@@ -156,7 +156,7 @@ Then start Pi in a project:
 pi
 ```
 
-`gentle-pi` provides SDD agents as global Pi runtime assets, not per-project setup. The first SDD flow in a session still runs a one-time SDD preflight for preferences; for natural-language requests, el Gentleman decides when SDD is needed and runs the explicit preflight first.
+`gentle-pi` installs delegation and review agents at startup. SDD agents, chains, and support are global Pi runtime assets installed on demand, not per-project setup. The first SDD flow in a session runs a one-time SDD preflight for preferences and managed-asset refresh; for natural-language requests, el Gentleman decides when SDD is needed and runs the explicit preflight first.
 
 ## Quick start
 
@@ -168,6 +168,7 @@ pi
 /gentle:models             Assign global model/effort routing to SDD/custom agents.
 /gentle:persona            Switch between gentleman and neutral persona modes.
 /gentle:background-subagents  Show or set the managed background-subagents policy, with its deciding source.
+/gentle:review-mode          Show or set the receipt-driven development mode (status|enable|disable).
 /gentle:banner             Configure startup rose, text logo, and color preset.
 ```
 
@@ -449,7 +450,7 @@ Engram-only mode is different by design: Engram is working memory and does not m
 
 ## SDD preflight and project files
 
-`gentle-pi` does not require SDD agents to be copied into every project. The package ensures global Pi SDD assets exist under the Pi agent home and treats project-local files only as overrides/debug copies. Slash SDD flows such as `/sdd-*`, `/gentle-sdd-init`, and the explicit `/gentle:sdd-preflight` command run a lazy preflight and resolve session-scoped SDD preferences. For natural-language requests, the parent agent decides whether the work should use SDD and must run/reuse `/gentle:sdd-preflight` before continuing.
+`gentle-pi` does not require SDD agents to be copied into every project. The package installs and refreshes global Pi SDD assets under the Pi agent home on SDD activation, and treats project-local files only as overrides/debug copies. Slash SDD flows such as `/sdd-*`, `/gentle-sdd-init`, and the explicit `/gentle:sdd-preflight` command run a lazy preflight and resolve session-scoped SDD preferences. For natural-language requests, the parent agent decides whether the work should use SDD and must run/reuse `/gentle:sdd-preflight` before continuing.
 
 ```text
 ~/.pi/agent/agents/sdd-*.md
@@ -461,11 +462,15 @@ Every new interactive session confirms preflight on its first SDD invocation. Sa
 
 Canonical values are `auto` execution mode, `openspec` artifact store, `ask-on-risk` delivery strategy, and a `400` changed-line review threshold. The delivery strategy domain is `ask-on-risk`, `auto-chain`, `single-pr`, or `exception-ok`; `chain_strategy` remains deferred until chaining is selected. `exception-ok` requires explicit `size:exception` acceptance and is never inferred. Consent, authorization, security, destructive/publishing, interactive phase approval, and ambiguous-scope gates remain human-controlled.
 
-Startup refreshes hash-proven package-owned assets. For the previously unowned `sdd-research.md`, migration recognizes only the known old content hash (ignoring model/thinking routing), preserves routing, and records ownership. Body-edited or unknown assets remain untouched. Manual refresh uses the same ownership checks:
+Startup refreshes only hash-proven delegation and review assets; existing SDD package content is preserved until SDD preflight or an explicit SDD installation command. For the previously unowned `sdd-research.md`, SDD refresh recognizes only the known old content hash (ignoring model/thinking routing), preserves routing, and records ownership. Body-edited or unknown assets remain untouched. Manual refresh uses the same ownership checks, scoped to the selected owner:
 
 ```text
+/gentle:install-delegation --force
+/gentle:install-review --force
 /gentle:install-sdd --force
 ```
+
+SDD preflight (including `/gentle-sdd-init`) installs missing SDD agents, chains, and support files and refreshes hash-proven managed SDD copies only. It preserves user edits and project overrides. Applying explicit saved model settings remains a separate, global concern at startup and preflight; the three installer commands do not apply model settings.
 
 ### Selected research
 
@@ -763,21 +768,25 @@ Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer and editor.
 | -------------------------------- | ------------------------------------------------------------------- |
 | `/gentle:status`              | Shows package, SDD asset, OpenSpec, and global model config status. |
 | `/gentle:doctor`              | Runs read-only diagnostics for SDD assets, model/persona config, memory tools, and safety guards. |
+| `/gentle:sdd-preflight`          | Runs or reuses the lazy SDD preflight for this Pi session.          |
 | `/gentle:models`                 | Opens global model + effort assignment UI. Press `x` to export and `r` to restore saved routing. |
 | `/gentle:persona`                | Switches global persona mode, with project override support.        |
 | `/gentle:background-subagents`   | Shows or sets the managed background-subagents policy (`status\|enable\|disable`), naming the source that decided it. |
 | `/gentle:telemetry`              | Shows or changes the local Gentle AI telemetry trigger (`status\|enable\|disable\|preview`).  |
+| `/gentle:review-mode`            | Shows or sets the receipt-driven development mode (`status\|enable\|disable`); user-initiated only, Pi automation never toggles it. |
 | `/gentle:banner`                 | Configures startup banner rose, text logo, and color preset.        |
 | `/gentle:toggle-rose`            | Toggles the startup rose.                                           |
 | `/gentle:toggle-text-logo`       | Toggles the startup text logo.                                      |
 | `/gentle:banner-color`           | Selects a startup banner color preset.                              |
 | `/gentle-sdd-init`               | Initializes or refreshes `openspec/config.yaml` (openspec/both stores only). |
-| `/gentle:install-sdd`         | Repairs missing global SDD runtime assets without overwriting files. |
-| `/gentle:install-sdd --force` | Force-refreshes installed global SDD assets.                         |
+| `/gentle:install-delegation` | Installs missing global delegation agents only; `--force` refreshes managed copies. |
+| `/gentle:install-review`     | Installs missing global review agents and chains only; `--force` refreshes managed copies. |
+| `/gentle:install-sdd`         | Installs missing global SDD agents, chains, and support only, without overwriting files. |
+| `/gentle:install-sdd --force` | Refreshes only managed global SDD assets, preserving user edits and project overrides. |
 | `/skill-registry:refresh`        | Regenerates `.atl/skill-registry.md`.                               |
 | `/skill-creation`                | Creates or updates an LLM-first skill using the packaged `gentle-ai-skill-creator` contract and style guide. |
 
-Package-owned global SDD runtime assets are also refreshed automatically on session start when `gentle-pi` changes. Project-local `.pi/agents` and `.pi/chains` remain manual overrides and are never overwritten by startup refresh.
+Startup installs and refreshes only delegation and review assets. SDD assets are installed/refreshed on demand; status and doctor report never-installed SDD assets as informational, while missing or stale assets from an existing installation identify their owner-specific repair command. User and project overrides are reported separately from package drift. Package refresh preserves overrides; explicit saved model settings may still update existing SDD or custom-agent routing at startup.
 
 ### Background subagents policy
 
@@ -846,25 +855,25 @@ Memory contract for SDD delegation:
 
 ## Telemetry
 
-`gentle-pi` does not collect anything itself. [gentle-ai](https://github.com/Gentleman-Programming/gentle-ai) owns anonymous usage telemetry end to end — install and heartbeat events, what fields are sent, rate limiting, and every opt-out. See its README/docs for the exact contract.
+`gentle-pi` observes approved sanitized runtime usage fields in memory and asynchronously invokes `gentle-ai telemetry runtime send --json` once per accepted event. It never persists metric data, retries, or waits for delivery in provider callbacks; busy or failed attempts are silently discarded. [gentle-ai](https://github.com/Gentleman-Programming/gentle-ai) owns native delivery and the existing opt-out policy. See [Telemetry](docs/telemetry.md) for fields and source limitations.
 
-At session start, for a primary session only (never for a named or SDD sub-agent), Gentle Pi asks the local `gentle-ai` binary to send its own telemetry: it spawns `gentle-ai telemetry trigger --json` detached, with a 3 s deadline, discards its output, and never blocks session start or surfaces an error — an older binary without the verb is silently treated as nothing to do. This runs at most once per process.
+Separately, at primary session start (never for a named or SDD sub-agent), Gentle Pi asks the local `gentle-ai` binary to handle its own install/heartbeat telemetry: it spawns `gentle-ai telemetry trigger --json` detached, with a 3 s deadline, discards its output, and never blocks session start or surfaces an error — an older binary without the verb is silently treated as nothing to do. This runs at most once per process.
 
 Install counts for `gentle-pi` and `gentle-engram` come from npm download statistics; the package itself never emits an install event.
 
 To opt out:
 
 - `/gentle:telemetry disable` — asks the local `gentle-ai` binary to disable telemetry (also `status` and `preview` to inspect it without leaving Pi).
-- `DO_NOT_TRACK=1` — Gentle Pi itself will not spawn the trigger, and `gentle-ai` also honors this standard on its own.
+- `DO_NOT_TRACK=1` — Gentle Pi suppresses runtime usage telemetry and the install/heartbeat trigger; `gentle-ai` also honors this standard independently.
 - `GENTLE_AI_TELEMETRY=0` — same effect, `gentle-ai`'s own environment switch.
 
-`CI=true` also suppresses the trigger, since automated runs are not a real usage signal.
+`CI=true` also suppresses runtime usage telemetry and the trigger, since automated runs are not a real usage signal.
 
 ## Package contents
 
 | Path                           | Purpose                                                                                                    |
 | ------------------------------ | ---------------------------------------------------------------------------------------------------------- |
-| `extensions/gentle-ai.ts`      | Injects identity, orchestrates native review authority, refreshes global SDD assets, registers commands, applies model/persona config, and enforces runtime safety. |
+| `extensions/gentle-ai.ts`      | Injects identity, orchestrates native review authority, refreshes delegation/review assets at startup and SDD on demand, registers commands, applies model/persona config, and enforces runtime safety. |
 | `lib/native-review-cli.ts`     | Strict package-local adapter for Gentle AI START, FINALIZE, VALIDATE, SDD binding, and status contracts.     |
 | `lib/review-integration-v2.ts` | Strict consumer decoder for negotiated capabilities, operations, target status, projections, repair, and failures against contract `review-integration/v2` (active today).  |
 | `lib/review-candidate-view.ts` | Builds immutable changed-scope actor views while preserving full-tree, path, mode, symlink, and index integrity. |
@@ -882,7 +891,7 @@ To opt out:
 | `assets/orchestrator-memory.md` | Lazy-loaded SDD memory phase table, artifact keys, and lifecycle rule.                                    |
 | `assets/orchestrator-skills.md` | Lazy-loaded skill registry fallback semantics and intent-driven skill discovery.                          |
 | `assets/sdd-orchestrator-workflow.md` | Lazy-loaded SDD workflow surface for the parent orchestrator.                                       |
-| `assets/agents/`               | SDD agents installed as global Pi runtime assets.                                                          |
+| `assets/agents/`               | Delegation, review, and on-demand SDD agents installed as global Pi runtime assets.                                                          |
 | `assets/chains/`               | SDD chains installed as global Pi runtime assets.                                                          |
 | `assets/support/`              | Strict TDD support docs for apply/verify phases.                                                           |
 | `skills/`                      | Gentle AI delivery and collaboration skills.                                                               |
