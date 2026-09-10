@@ -1875,7 +1875,10 @@ function parseModelExport(value: unknown): AgentModelConfig | undefined {
 }
 
 async function exportSavedModelConfig(ctx: ExtensionContext): Promise<number> {
-	const saved = await readSavedModelConfigAsync(ctx.cwd);
+	const saved = await readModelRoutingAuthorityAsync(
+		modelConfigPath(ctx.cwd),
+		legacyProjectModelConfigPath(ctx.cwd),
+	);
 	if (saved.status === "invalid") throw new Error(`Invalid model config: ${saved.path}`);
 	const agents = saved.status === "valid" ? saved.config : {};
 	const path = modelExportPath(ctx.cwd);
@@ -2953,7 +2956,10 @@ async function showSddModelPanel(
 
 async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
 	migrateLegacyProjectModelOverrides(ctx.cwd);
-	const savedConfig = await readSavedModelConfigAsync(ctx.cwd);
+	const savedConfig = await readModelRoutingAuthorityAsync(
+		modelConfigPath(ctx.cwd),
+		legacyProjectModelConfigPath(ctx.cwd),
+	);
 	if (savedConfig.status === "invalid") {
 		ctx.ui.notify(
 			`el Gentleman cannot open model config because ${savedConfig.path} is invalid JSON or not an object. Fix or remove the file, then run /gentle:models again.`,
@@ -7475,7 +7481,10 @@ function createGentleAiExtensionForTesting(
 			const openspecConfigured = existsSync(
 				join(ctx.cwd, "openspec", "config.yaml"),
 			);
-			const modelConfig = await readModelConfigAsync(ctx.cwd);
+			const savedConfig = await readModelRoutingAuthorityAsync(
+				modelConfigPath(ctx.cwd),
+				legacyProjectModelConfigPath(ctx.cwd),
+			);
 			const devBinary = await describeDevBinaryOverride();
 			ctx.ui.notify(
 				[
@@ -7485,9 +7494,10 @@ function createGentleAiExtensionForTesting(
 					...assetLines,
 					`OpenSpec config: ${openspecConfigured ? "present" : "missing"}`,
 					`Global model config: ${existsSync(modelConfigPath(ctx.cwd)) ? "present" : "missing"}`,
-					...describeModelConfig(ctx.cwd, modelConfig),
+					`Saved model routing: ${savedConfig.status}${savedConfig.status === "invalid" ? ` (${savedConfig.path})` : ""}`,
+					...(savedConfig.status === "invalid" ? [] : describeModelConfig(ctx.cwd, savedConfig.status === "valid" ? savedConfig.config : {})),
 				].join("\n"),
-				assetLines.some((line) => line.startsWith("warn:")) || devBinary.state !== "inactive" ? "warning" : "info",
+				savedConfig.status === "invalid" || assetLines.some((line) => line.startsWith("warn:")) || devBinary.state !== "inactive" ? "warning" : "info",
 			);
 		},
 	});
