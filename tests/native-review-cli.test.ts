@@ -11,6 +11,7 @@ import {
 	NATIVE_REVIEW_ERROR_CODE,
 	NativeReviewCliError,
 	NativeReviewCliV216,
+	NativeReviewIntegrationError,
 	createNodeExecFileAdapter,
 	type ExecFileAdapter,
 } from "../lib/native-review-cli.ts";
@@ -199,6 +200,40 @@ test("provider-owned refuter and targeted-validator vectors accept only their ma
 		() => client(queuedAdapter([]).adapter).captureProviderRole({ captureOperation: "review.capture-result", argumentTokens: ["--agent=pi"], cwd: "/repo" }),
 		/CAPTURE_PROVIDER_ROLE supports only/,
 	);
+});
+
+test("nonzero targeted-validator capture preserves its dot-form typed failure", async () => {
+	const failure = {
+		schema: "gentle-ai.review-integration.failure/v2",
+		contract: "gentle-ai.review-integration/v2",
+		operation: "review.capture-validation",
+		phase: "native_running",
+		code: "targeted_validation_failed",
+		message: "the targeted validator rejected the candidate",
+		mutation_outcome: "unknown",
+		authority_applicability: "current_target",
+		retry_safe: false,
+		replayability: "status_required",
+		required_inputs: [],
+		next_action: "review.status",
+	};
+	const queue = queuedAdapter([{ stdout: JSON.stringify(failure), exitCode: 1 }]);
+	await assert.rejects(
+		() => client(queue.adapter).captureProviderRole({
+			captureOperation: "review.capture-validation",
+			argumentTokens: ["--repository-context=rctx1_" + "a".repeat(64), "--agent=pi", "--execute=true"],
+			cwd: "/repo",
+		}),
+		(error: unknown) => {
+			if (!(error instanceof NativeReviewIntegrationError)) return false;
+			assert.equal(error.failureEnvelope.operation, "review.capture-validation");
+			assert.equal(error.mutationOutcome, "unknown");
+			assert.equal(error.nextAction, "review.status");
+			assert.deepEqual(error.failureEnvelope.raw, failure);
+			return true;
+		},
+	);
+	assert.deepEqual(queue.calls[0]?.arguments, ["review", "capture-validation", "--repository-context=rctx1_" + "a".repeat(64), "--agent=pi", "--execute=true"]);
 });
 
 test("malformed closure output remains a typed schema failure and never authorizes a retry", async () => {
