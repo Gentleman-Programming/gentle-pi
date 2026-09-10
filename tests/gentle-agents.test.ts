@@ -447,7 +447,8 @@ for (const boundary of ["allowed", "env", "session", "replacement", "bus-throws"
 			assert.equal(event.launch.agentClass, "worker");
 			assert.equal(event.launch.selectedEffort, "high");
 			assert.equal(event.responses.length, boundary === "long-running" ? 8 : 2);
-			assert.ok(event.responses.every(row => row.agentClass === "worker" && row.effort === "unavailable"));
+			assert.ok(event.responses.every(row => row.agentClass === "worker" && row.effort === "high"
+				&& row.selectedProvider === "openai" && row.selectedModelId === "gpt-4o"));
 			assert.equal(event.agentSettled, true);
 			child.emit({ type: "agent_settled" });
 			await tick();

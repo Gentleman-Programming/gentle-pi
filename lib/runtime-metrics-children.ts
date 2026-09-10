@@ -2,7 +2,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { parseAgentDefinition, type AgentDefinition, type ModelRef } from "./agents-config.ts";
 import type { ChildObservationSnapshot } from "./agents-runner.ts";
 import { FINISHED_STATUSES, type TaskStatus } from "./agents-protocol.ts";
-import { EFFORTS, parseAgentClass, RuntimeMetrics, UNKNOWN_AGENT_CLASS, validRuntimeResponse, type AgentClass, type FinalResponse, type RuntimeMetricBucket } from "./runtime-metrics.ts";
+import { classifyRuntimeModelId, EFFORTS, parseAgentClass, RuntimeMetrics, UNKNOWN_AGENT_CLASS, validRuntimeResponse, type AgentClass, type FinalResponse, type RuntimeMetricBucket } from "./runtime-metrics.ts";
 import { classifyPiCatalogName } from "./runtime-metrics-pi-identity.ts";
 export const CHILD_METRICS_EVENT = "gentle:runtime-metrics:child/v1";
 // Local revocation notification invalidates active observations. Contains only
@@ -48,7 +48,7 @@ function provider(value: unknown): FinalResponse["provider"] {
 }
 function modelId(namespace: unknown, value: unknown): string {
 	if (value === "unknown" || value === undefined) return "unknown";
-	return classifyPiCatalogName({ provider: namespace, modelId: value }).modelId;
+	return classifyRuntimeModelId(namespace, value, classifyPiCatalogName);
 }
 function effort(value: unknown): FinalResponse["effort"] {
 	return EFFORTS.includes(value as FinalResponse["effort"]) ? value as FinalResponse["effort"] : "unavailable";
@@ -90,7 +90,8 @@ export function childEvent(parentSessionId: string, taskId: string, launch: Laun
 			return { kind: "final_assistant_response", responseId: String(index), agentClass: launch.agentClass,
 				executor: "worker", provider: provider(namespace), modelFamily: "unknown", observedModelId: name(row.model),
 				responseModelId: name(row.responseModel), providerThinkingLevel: effort(row.providerThinkingLevel.state === "observed" ? row.providerThinkingLevel.value : undefined),
-				selectedProvider: "unknown", effort: "unavailable", error: row.stopReason === "error" ? "unknown" : row.stopReason === "aborted" ? "aborted" : "none",
+				selectedProvider: launch.selectedProvider, selectedModelId: launch.selectedModelId, effort: launch.selectedEffort,
+				error: row.stopReason === "error" ? "unknown" : row.stopReason === "aborted" ? "aborted" : "none",
 				tokens: Object.fromEntries(tokenFields.map(field => [field, { ...row.tokens[field] }])) as FinalResponse["tokens"],
 				responseHeadersMs: missing, fullResponseMs: missing };
 		}) };
@@ -109,7 +110,7 @@ function validEvent(value: unknown): value is ChildMetricsEvent {
 		&& provider(l.selectedProvider) === l.selectedProvider && modelId(l.selectedProvider, l.selectedModelId) === l.selectedModelId
 		&& effort(l.selectedEffort) === l.selectedEffort && Array.isArray(e.responses) && e.responses.length <= 128
 		&& e.responses.every(row => validRuntimeResponse(row) && row.agentClass === l.agentClass
-			&& row.executor === "worker" && row.effort === "unavailable" && row.selectedProvider === "unknown" && row.selectedModelId === undefined
+			&& row.executor === "worker" && row.effort === l.selectedEffort && row.selectedProvider === l.selectedProvider && row.selectedModelId === l.selectedModelId
 			&& provider(row.provider) === row.provider && effort(row.providerThinkingLevel) === row.providerThinkingLevel
 			&& (row.observedModelId === undefined || modelId(row.provider, row.observedModelId) === row.observedModelId)
 			&& (row.responseModelId === undefined || modelId(row.provider, row.responseModelId) === row.responseModelId)
@@ -127,7 +128,7 @@ export function snapshotChildEvent(value: unknown): ChildMetricsEvent | undefine
 		responses: value.responses.map((row, index) => ({ kind: "final_assistant_response", responseId: String(index),
 			agentClass: row.agentClass, executor: "worker", provider: row.provider, observedModelId: row.observedModelId,
 			responseModelId: row.responseModelId, providerThinkingLevel: row.providerThinkingLevel, modelFamily: "unknown",
-			selectedProvider: "unknown", effort: "unavailable", error: row.error,
+			selectedProvider: l.selectedProvider, selectedModelId: l.selectedModelId, effort: l.selectedEffort, error: row.error,
 			tokens: Object.fromEntries(tokenFields.map(field => {
 				const t = row.tokens[field];
 				return [field, t?.state === "reported" ? { state: "reported", value: t.value } : { state: t?.state ?? "unavailable" }];
@@ -136,7 +137,8 @@ export function snapshotChildEvent(value: unknown): ChildMetricsEvent | undefine
 
 /** Export-facing shape: no IDs, paths, task labels, or raw agent/model names.
  * Rankings are descending counts, NOT quality/success comparisons. Native
- * transport is deliberately absent. Response buckets never inherit launch effort.
+ * transport is deliberately absent. Response buckets retain selected launch
+ * identity and effort separately from effective response evidence.
  */
 export interface ChildCompositionSnapshot {
 	launches: ChildLaunchBucket[];

@@ -176,7 +176,7 @@ test("child completion consumed once, busy children drop, and primary usage stay
 	assert.equal(h.sent[0][0].agentClass, "verify");
 	assert.deepEqual(h.launches[0], [{ evidence: "launch_configuration", agentClass: "verify", selectedProvider: "openai",
 		selectedModelId: "gpt-4o", selectedEffort: "high", launches: 1 }]);
-	assert.equal(h.sent[0][0].effort, "unavailable", "launch effort is not per-response selection proof");
+	assert.equal(h.sent[0][0].effort, "high", "child response retains launch selection separately from response evidence");
 	assert.equal(h.sent[0][0].providerThinkingLevel, "low");
 	await h.finish(); h.bus(event("busy")); await tick();
 	assert.equal(h.sent.length, 1, "busy completion stays consumed");

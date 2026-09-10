@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import { classifyPiCatalogName } from "./runtime-metrics-pi-identity.ts";
 
+const runtimeSchema = JSON.parse(readFileSync(new URL("../contracts/telemetry/runtime-aggregate-v1.schema.json", import.meta.url), "utf8"));
+
 // Pure local accounting, not a telemetry transport or Pi event adapter.
 // Callers supply finalized assistant responses and authoritative classifications.
 // Never infer executor, usage availability, or measured timings from SDK defaults.
@@ -18,8 +20,7 @@ declare const agentClassBrand: unique symbol;
 export type AgentClass = string & { readonly [agentClassBrand]: "AgentClass" };
 
 function agentClasses(): readonly AgentClass[] {
-	const schema = JSON.parse(readFileSync(new URL("../contracts/telemetry/runtime-aggregate-v1.schema.json", import.meta.url), "utf8"));
-	const values: unknown = schema?.$defs?.row?.properties?.agent_class?.enum;
+	const values: unknown = runtimeSchema?.$defs?.row?.properties?.agent_class?.enum;
 	if (!Array.isArray(values) || !values.length || values.some(value => typeof value !== "string")) {
 		throw new Error("Invalid runtime telemetry agent_class schema");
 	}
@@ -40,6 +41,40 @@ function requiredAgentClass(value: string): AgentClass {
 }
 export const UNKNOWN_AGENT_CLASS = requiredAgentClass("unknown");
 export const ORCHESTRATOR_AGENT_CLASS = requiredAgentClass("orchestrator");
+
+function registeredModels(): ReadonlySet<string> {
+	const rules: unknown = runtimeSchema?.$defs?.model?.oneOf;
+	if (!Array.isArray(rules) || !rules.length) throw new Error("Invalid runtime telemetry model schema");
+	const values = (rule: unknown, field: "provider" | "id"): string[] => {
+		if (!object(rule)) throw new Error("Invalid runtime telemetry model schema");
+		const properties = rule.properties;
+		if (!object(properties) || !object(properties[field])) throw new Error("Invalid runtime telemetry model schema");
+		const property = properties[field];
+		const candidates = typeof property.const === "string" ? [property.const] : property.enum;
+		if (!Array.isArray(candidates) || !candidates.length || candidates.some(value => typeof value !== "string")) {
+			throw new Error("Invalid runtime telemetry model schema");
+		}
+		return candidates as string[];
+	};
+	const models = new Set<string>();
+	for (const rule of rules) for (const provider of values(rule, "provider")) {
+		for (const id of values(rule, "id")) models.add(JSON.stringify([provider, id]));
+	}
+	return models;
+}
+
+const REGISTERED_MODELS = registeredModels();
+
+/** The mirrored transport registry is authoritative before the optional Pi
+ * catalog. Unknown registry pairs still pass through the existing privacy
+ * classifier, so private IDs can only become custom/unknown.
+ */
+export function classifyRuntimeModelId(provider: unknown, modelId: unknown,
+	classifyModel: typeof classifyPiCatalogName = classifyPiCatalogName): string {
+	if (typeof provider === "string" && typeof modelId === "string"
+		&& REGISTERED_MODELS.has(JSON.stringify([provider, modelId]))) return modelId;
+	return classifyModel({ provider, modelId }).modelId;
+}
 
 type Missing = { state: "unavailable" | "unsupported" };
 export type TokenMeasurement = Missing | { state: "reported"; value: number };
@@ -180,10 +215,10 @@ export class RuntimeMetrics {
 		const dimensions = {
 			hostAgent: "pi" as const,
 			agentClass: category(AGENT_CLASSES, response.agentClass, UNKNOWN_AGENT_CLASS),
-			observedModelId: this.#classifyModel({ provider: response.provider, modelId: response.observedModelId }).modelId,
-			responseModelId: this.#classifyModel({ provider: response.provider, modelId: response.responseModelId }).modelId,
+			observedModelId: classifyRuntimeModelId(response.provider, response.observedModelId, this.#classifyModel),
+			responseModelId: classifyRuntimeModelId(response.provider, response.responseModelId, this.#classifyModel),
 			providerThinkingLevel: category(EFFORTS, response.providerThinkingLevel, "unavailable"),
-			selectedModelId: this.#classifyModel({ provider: selectedProvider, modelId: response.selectedModelId }).modelId,
+			selectedModelId: classifyRuntimeModelId(selectedProvider, response.selectedModelId, this.#classifyModel),
 			selectedProvider: category(PROVIDERS, selectedProvider, typeof selectedProvider === "string" && selectedProvider ? "custom" : "unknown"),
 			executor: category(EXECUTORS, response.executor, "unknown"),
 			provider: category(PROVIDERS, response.provider, typeof response.provider === "string" && response.provider ? "custom" : "unknown"),

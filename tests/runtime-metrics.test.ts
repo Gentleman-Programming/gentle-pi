@@ -34,6 +34,15 @@ test("selected provider is independent from response provider without relabeling
 	assert.equal(metrics.snapshot()[1].selectedModelId, "custom");
 });
 
+test("mirrored registry identities survive an unavailable Pi catalog", () => {
+	const metrics = new RuntimeMetrics({ classifyModel: () => ({ classification: "unknown", modelId: "unknown" }) });
+	assert.equal(metrics.record({ ...response(), selectedProvider: "openai-codex", selectedModelId: "gpt-5.6-terra",
+		responseModelId: "gpt-5.6-sol" }), "recorded");
+	const [row] = metrics.snapshot();
+	assert.equal(row.selectedModelId, "gpt-5.6-terra");
+	assert.equal(row.responseModelId, "gpt-5.6-sol");
+});
+
 // Deliberately bypass static types to exercise the runtime boundary.
 function recordRaw(metrics: RuntimeMetrics, value: unknown) {
 	return metrics.record(value as FinalResponse);

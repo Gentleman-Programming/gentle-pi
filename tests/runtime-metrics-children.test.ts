@@ -103,9 +103,14 @@ test("launch distribution and each observed combination remain independent and p
 	assert.equal(view.launches[0].agentClass, "worker");
 	assert.equal(view.responses.length, 2);
 	assert.deepEqual(view.responses.map(row => row.observedModelId), ["gpt-4o", "gpt-4o-mini"]);
-	assert.ok(view.responses.every(row => row.effort === "unavailable" && row.selectedProvider === "unknown"));
+	assert.ok(view.responses.every(row => row.effort === "high" && row.selectedProvider === "openai"
+		&& row.selectedModelId === "gpt-4o"));
 	assert.equal(view.responses[0].providerThinkingLevel, "low");
 	assert.equal(view.responses[0].tokens.reasoning.sum, 1);
+	const encoded = encodeNativeRuntimeEvent(view.responses, view.launches);
+	assert.ok(encoded);
+	assert.ok(JSON.parse(encoded).rows.filter((row: { responses: number | null }) => row.responses !== null)
+		.every((row: { model_evidence: string; selected_effort: string }) => row.model_evidence === "response" && row.selected_effort === "high"));
 	assert.equal(view.droppedResponses, 2);
 	assert.equal(view.settled, 1);
 	assert.equal(view.statuses.completed, 1);
@@ -115,6 +120,38 @@ test("launch distribution and each observed combination remain independent and p
 		coverage: "final_assistant_messages_only", agentSettled: false, responses: [response("private-model", "private-native")], droppedResponses: 0,
 	});
 	assert.ok(!JSON.stringify(filtered).includes("private"));
+});
+
+test("registered child launch identity survives catalog state and missing response evidence inherits selection", () => {
+	const path = new URL("../assets/agents/sdd-explore.md", import.meta.url);
+	const agent = parseAgentDefinition(readFileSync(path, "utf8"), path.pathname, "global");
+	assert.ok("instructions" in agent);
+	const selection = launchSelection(agent, { provider: "openai-codex", id: "gpt-5.6-terra" }, "high");
+	const [observation] = normalizeRpcEvent({ type: "message_end", message: { role: "assistant", stopReason: "stop",
+		usage: { input: 3, output: 2 } } }, { observeResponses: true })
+		.filter(event => event.type === TASK_EVENT.RESPONSE_OBSERVATION);
+	assert.ok(observation?.type === TASK_EVENT.RESPONSE_OBSERVATION);
+	const completed = childEvent("local-session", "sdd-explore-task", selection, "completed", {
+		coverage: "final_assistant_messages_only", agentSettled: true,
+		responses: Array(5).fill(observation.observation), droppedResponses: 0,
+	});
+	assert.ok(completed);
+	const composition = new ChildComposition();
+	assert.equal(composition.reserve(completed, "local-session"), true);
+	composition.record(completed);
+	const snapshot = composition.snapshot();
+	const payload = encodeNativeRuntimeEvent(snapshot.responses, snapshot.launches);
+	assert.ok(payload);
+	const rows = JSON.parse(payload).rows;
+	const launchRow = rows.find((row: { launches: number | null }) => row.launches === 1);
+	const responseRow = rows.find((row: { responses: number | null }) => row.responses === 5);
+	assert.deepEqual(launchRow.model, { provider: "openai-codex", id: "gpt-5.6-terra" });
+	assert.equal(launchRow.model_evidence, "selected");
+	assert.equal(launchRow.selected_effort, "high");
+	assert.deepEqual(responseRow.model, { provider: "openai-codex", id: "gpt-5.6-terra" });
+	assert.equal(responseRow.model_evidence, "selected");
+	assert.equal(responseRow.selected_effort, "high");
+	assert.equal(responseRow.responses, 5);
 });
 
 test("dedupe reserves before async policy, rejects old sessions, and survives aggregate clearing", () => {
