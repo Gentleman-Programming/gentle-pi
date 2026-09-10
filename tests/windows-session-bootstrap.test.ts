@@ -11,37 +11,140 @@ import { FIXED_WINDOWS_POWERSHELL, parseWindowsHostFrame } from "../lib/windows-
 const runtime = fileURLToPath(new URL("../runtime/windows-session-transport.ps1", import.meta.url));
 const fixture = fileURLToPath(new URL("fixtures/windows-session-bootstrap.ps1", import.meta.url));
 
-type CleanupChild = EventEmitter & { pid?: number; stdin: EventEmitter & { end(): void }; stdout: EventEmitter & { destroy?(): void }; stderr: EventEmitter & { resume?(): void; destroy?(): void }; kill(): boolean };
+type CleanupChild = EventEmitter & { pid?: number; stdin: EventEmitter & { end(input?: string): void }; stdout: EventEmitter & { destroy?(): void }; stderr: EventEmitter & { resume?(): void; destroy?(): void }; kill(): boolean };
+type ChildLifecycle = Readonly<{ child: CleanupChild; changed: EventEmitter; closeObserved: boolean; exitObserved: boolean; processError?: Error; stdinError?: Error; stdoutError?: Error; stderrError?: Error; stdinClosed: boolean; stdoutClosed: boolean; stderrClosed: boolean; exitCode: number }>;
 
-function waitForChildClose(child: CleanupChild, isClosed: () => boolean, deadlineMs: number): Promise<boolean> {
-	if (isClosed()) return Promise.resolve(true);
+function observeChildLifecycle(child: CleanupChild): ChildLifecycle {
+	const lifecycle = { child, changed: new EventEmitter(), closeObserved: false, exitObserved: false, processError: undefined as Error | undefined, stdinError: undefined as Error | undefined, stdoutError: undefined as Error | undefined, stderrError: undefined as Error | undefined, stdinClosed: false, stdoutClosed: false, stderrClosed: false, exitCode: -1 };
+	const changed = () => lifecycle.changed.emit("changed");
+	child.once("close", (code: number | null) => { lifecycle.closeObserved = true; lifecycle.exitCode = code ?? -1; changed(); });
+	child.once("exit", () => { lifecycle.exitObserved = true; changed(); });
+	child.on("error", (error: Error) => { lifecycle.processError = error; changed(); });
+	child.stdin.on("error", (error: Error) => { lifecycle.stdinError = error; changed(); });
+	child.stdout.on("error", (error: Error) => { lifecycle.stdoutError = error; changed(); });
+	child.stderr.on("error", (error: Error) => { lifecycle.stderrError = error; changed(); });
+	child.stdin.once("close", () => { lifecycle.stdinClosed = true; changed(); });
+	child.stdout.once("close", () => { lifecycle.stdoutClosed = true; changed(); });
+	child.stderr.once("close", () => { lifecycle.stderrClosed = true; changed(); });
+	return lifecycle;
+}
+
+function hasLifecycleError(lifecycle: ChildLifecycle): boolean {
+	return lifecycle.processError !== undefined || lifecycle.stdinError !== undefined || lifecycle.stdoutError !== undefined || lifecycle.stderrError !== undefined;
+}
+
+function noProcessStreamsClosed(lifecycle: ChildLifecycle): boolean {
+	return lifecycle.processError !== undefined && lifecycle.child.pid === undefined && lifecycle.stdinClosed && lifecycle.stdoutClosed && lifecycle.stderrClosed;
+}
+
+function waitForChildClose(lifecycle: ChildLifecycle, deadlineMs: number): Promise<boolean> {
+	if (lifecycle.closeObserved || noProcessStreamsClosed(lifecycle)) return Promise.resolve(true);
 	return new Promise((resolve) => {
 		let settled = false;
 		const finish = (closed: boolean) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
-			child.removeListener("close", onClose);
-			child.removeListener("exit", onClose);
+			lifecycle.changed.removeListener("changed", onChanged);
 			resolve(closed);
 		};
-		const onClose = () => finish(true);
+		const onChanged = () => { if (lifecycle.closeObserved || noProcessStreamsClosed(lifecycle)) finish(true); };
 		const timer = setTimeout(() => finish(false), deadlineMs);
-		child.once("close", onClose);
-		child.once("exit", onClose);
+		lifecycle.changed.on("changed", onChanged);
+		onChanged();
 	});
 }
 
-async function settleOwnedChild(child: CleanupChild, isClosed: () => boolean, spawnError: () => Error | undefined, deadlines: Readonly<{ terminateMs: number; killMs: number }>): Promise<void> {
-	if (isClosed()) return;
-	if (spawnError() && child.pid === undefined) return;
-	try { child.stdin.end(); } catch { /* cleanup continues through process settlement */ }
-	if (await waitForChildClose(child, isClosed, deadlines.terminateMs)) return;
+function waitForStartupControlClose(lifecycle: ChildLifecycle, deadlineMs: number): Promise<boolean> {
+	if (lifecycle.closeObserved) return Promise.resolve(true);
+	if (hasLifecycleError(lifecycle)) return Promise.resolve(false);
+	return new Promise((resolve) => {
+		let settled = false;
+		const finish = (closed: boolean) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			lifecycle.changed.removeListener("changed", onChanged);
+			resolve(closed);
+		};
+		const onChanged = () => { if (lifecycle.closeObserved) finish(true); else if (hasLifecycleError(lifecycle)) finish(false); };
+		const timer = setTimeout(() => finish(false), deadlineMs);
+		lifecycle.changed.on("changed", onChanged);
+		onChanged();
+	});
+}
+
+async function settleOwnedChild(child: CleanupChild, lifecycle: ChildLifecycle, deadlines: Readonly<{ terminateMs: number; killMs: number }>): Promise<void> {
+	if (lifecycle.closeObserved || noProcessStreamsClosed(lifecycle)) return;
+	try { child.stdin.end(); } catch { /* cleanup continues through bounded settlement */ }
+	if (await waitForChildClose(lifecycle, deadlines.terminateMs)) return;
+	if (child.pid === undefined && lifecycle.processError !== undefined) {
+		child.stdout.destroy?.();
+		child.stderr.destroy?.();
+		if (await waitForChildClose(lifecycle, deadlines.killMs)) return;
+		throw new Error("owned Windows helper did not settle after spawn failure");
+	}
 	try { child.kill(); } catch { /* the second bounded wait determines settlement */ }
-	if (await waitForChildClose(child, isClosed, deadlines.killMs)) return;
+	if (await waitForChildClose(lifecycle, deadlines.killMs)) return;
 	child.stdout.destroy?.();
 	child.stderr.destroy?.();
 	throw new Error("owned Windows helper did not settle after termination");
+}
+
+const maxBootstrapDiagnosticBytes = 512;
+const bootstrapDiagnosticCategories = new Set(["compiler", "assembly-load", "type-load", "other"]);
+type BootstrapDiagnostic = Readonly<{ kind: "windows-session-bootstrap-diagnostic"; category: "compiler" | "assembly-load" | "type-load" | "other"; compilerCodes: readonly string[] }>;
+
+function parseBootstrapDiagnostic(stderr: string): BootstrapDiagnostic | undefined {
+	if (Buffer.byteLength(stderr, "utf8") > maxBootstrapDiagnosticBytes || !stderr.endsWith("\n")) return undefined;
+	const lines = stderr.slice(0, -1).split("\n");
+	if (lines.length !== 1 || lines[0].length === 0) return undefined;
+	let value: unknown;
+	try { value = JSON.parse(lines[0]); } catch { return undefined; }
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record).sort();
+	if (keys.length !== 3 || keys.join(",") !== "category,compilerCodes,kind" || record.kind !== "windows-session-bootstrap-diagnostic" || typeof record.category !== "string" || !bootstrapDiagnosticCategories.has(record.category) || !Array.isArray(record.compilerCodes) || record.compilerCodes.length > 8 || record.compilerCodes.some((code) => typeof code !== "string")) return undefined;
+	const compilerCodes = record.compilerCodes as string[];
+	if (new Set(compilerCodes).size !== compilerCodes.length || compilerCodes.some((code) => !/^CS[0-9]{4}$/.test(code)) || (record.category !== "compiler" && compilerCodes.length !== 0)) return undefined;
+	return Object.freeze({ kind: "windows-session-bootstrap-diagnostic", category: record.category as BootstrapDiagnostic["category"], compilerCodes: Object.freeze([...compilerCodes]) });
+}
+
+function appendBoundedOutput(output: string, chunk: Buffer, limit: number): Readonly<{ output: string; overflow: boolean }> {
+	const remaining = limit - Buffer.byteLength(output, "utf8");
+	if (remaining <= 0) return { output, overflow: true };
+	if (chunk.length <= remaining) return { output: output + chunk.toString("utf8"), overflow: false };
+	let end = remaining;
+	while (end > 0 && (chunk[end] & 0xc0) === 0x80) end--;
+	return { output: output + chunk.subarray(0, end).toString("utf8"), overflow: true };
+}
+
+async function runBootstrapStartupControl(options: Readonly<{ spawnProcess?: (...args: any[]) => CleanupChild; startupDeadlineMs?: number; terminateMs?: number; killMs?: number }> = {}): Promise<Readonly<{ code: number; stdout: string; stderr: string; outputOverflow: boolean }>> {
+	const child = (options.spawnProcess ?? spawn)(FIXED_WINDOWS_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", runtime], { shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }) as CleanupChild;
+	const lifecycle = observeChildLifecycle(child);
+	const deadlines = { startupDeadlineMs: options.startupDeadlineMs ?? 30_000, terminateMs: options.terminateMs ?? 2_500, killMs: options.killMs ?? 2_500 };
+	let stdout = "";
+	let stderr = "";
+	let outputOverflow = false;
+	child.stdout.on("data", (chunk: Buffer) => { const captured = appendBoundedOutput(stdout, chunk, maxBootstrapDiagnosticBytes); stdout = captured.output; outputOverflow ||= captured.overflow; });
+	child.stderr.on("data", (chunk: Buffer) => { const captured = appendBoundedOutput(stderr, chunk, maxBootstrapDiagnosticBytes); stderr = captured.output; outputOverflow ||= captured.overflow; });
+	let inputWriteFailed = false;
+	try { child.stdin.end('{"requestId":"start-1","operation":"start"}\n{"requestId":"shutdown-2","operation":"shutdown"}\n'); } catch { inputWriteFailed = true; }
+	const closed = inputWriteFailed ? false : await waitForStartupControlClose(lifecycle, deadlines.startupDeadlineMs);
+	if (!closed || hasLifecycleError(lifecycle)) {
+		let cleanupFailed = false;
+		try { await settleOwnedChild(child, lifecycle, deadlines); } catch { cleanupFailed = true; }
+		throw new Error(cleanupFailed ? "Windows bootstrap startup control did not settle" : "Windows bootstrap startup control did not complete");
+	}
+	if (outputOverflow) throw new Error("Windows bootstrap startup control exceeded bounded output");
+	return { code: lifecycle.exitCode, stdout, stderr, outputOverflow };
+}
+
+function parseStartupControlFrames(stdout: string): readonly ReturnType<typeof parseWindowsHostFrame>[] {
+	if (!stdout.endsWith("\n")) throw new Error("Windows bootstrap startup control returned malformed protocol output");
+	const lines = stdout.slice(0, -1).split("\n");
+	if (lines.length !== 2 || lines.some((line) => line.length === 0)) throw new Error("Windows bootstrap startup control returned malformed protocol output");
+	try { return lines.map(parseWindowsHostFrame); } catch { throw new Error("Windows bootstrap startup control returned malformed protocol output"); }
 }
 
 function runPowerShell(script: string, args: string[], input = ""): Promise<{ code: number; stdout: string }> {
@@ -57,16 +160,10 @@ function runPowerShell(script: string, args: string[], input = ""): Promise<{ co
 
 async function openInitializedHelper(agentHome: string, options: Readonly<{ spawnProcess?: (...args: any[]) => CleanupChild; initialDeadlineMs?: number; responseDeadlineMs?: number; terminateMs?: number; killMs?: number }> = {}) {
 	const child = (options.spawnProcess ?? spawn)(FIXED_WINDOWS_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", runtime], { shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }) as CleanupChild;
+	const lifecycle = observeChildLifecycle(child);
 	const deadlines = { initialDeadlineMs: options.initialDeadlineMs ?? 25_000, responseDeadlineMs: options.responseDeadlineMs ?? 3_000, terminateMs: options.terminateMs ?? 3_000, killMs: options.killMs ?? 3_000 };
 	const frames: ReturnType<typeof parseWindowsHostFrame>[] = [];
 	let buffered = "";
-	let exited = false;
-	let spawnError: Error | undefined;
-	let exitSettled = false;
-	const markExited = () => { if (!exitSettled) { exitSettled = true; exited = true; } };
-	child.once("exit", markExited);
-	child.once("close", markExited);
-	child.once("error", (error) => { spawnError = error; });
 	child.stderr.resume();
 	const waitFor = (count: number, deadlineMs: number) => new Promise<void>((resolve, reject) => {
 		let settled = false;
@@ -80,18 +177,18 @@ async function openInitializedHelper(agentHome: string, options: Readonly<{ spaw
 		};
 		const deadlineTimer = setTimeout(() => settle(new Error("Windows helper did not reply")), deadlineMs);
 		const poll = () => {
-			if (spawnError) return settle(spawnError);
-			if (exited) return settle(new Error("Windows helper exited before its reply"));
+			if (lifecycle.processError) return settle(lifecycle.processError);
+			if (lifecycle.exitObserved || lifecycle.closeObserved) return settle(new Error("Windows helper exited before its reply"));
 			if (frames.length >= count) return settle();
 			pollTimer = setTimeout(poll, 25);
 		};
 		poll();
 	});
 	const exitWithin = async () => {
-		if (await waitForChildClose(child, () => exited, deadlines.responseDeadlineMs)) return;
+		if (await waitForChildClose(lifecycle, deadlines.responseDeadlineMs)) return;
 		try { await closeOwnedChild(); } catch { throw new Error("Windows helper did not exit after a fatal schema error"); }
 		throw new Error("Windows helper did not exit after a fatal schema error");
-	};	const closeOwnedChild = () => settleOwnedChild(child, () => exited, () => spawnError, { terminateMs: deadlines.terminateMs, killMs: deadlines.killMs });
+	};	const closeOwnedChild = () => settleOwnedChild(child, lifecycle, { terminateMs: deadlines.terminateMs, killMs: deadlines.killMs });
 	child.stdout.on("data", (chunk: Buffer) => {
 		buffered += chunk.toString("utf8");
 		for (;;) { const newline = buffered.indexOf("\n"); if (newline < 0) break; frames.push(parseWindowsHostFrame(buffered.slice(0, newline))); buffered = buffered.slice(newline + 1); }
@@ -115,7 +212,7 @@ async function openInitializedHelper(agentHome: string, options: Readonly<{ spaw
 	};
 	return {
 		get frames() { return frames; },
-		get exited() { return exited; },
+		get exited() { return lifecycle.closeObserved; },
 		enumerate: () => request("enumerate"),
 		shutdown: () => request("shutdown"),
 		invalidStartSchema: async () => { child.stdin.write(`${JSON.stringify({ requestId: `invalid-${frames.length + 1}`, operation: "start", extra: true })}\n`); await exitWithin(); },
@@ -169,7 +266,7 @@ test("owned helper cleanup settles a spawn error without an exit event", async (
 	const child = new FakeHelperChild();
 	child.pid = undefined;
 	const spawnError = new Error("spawn failed");
-	queueMicrotask(() => child.emit("error", spawnError));
+	queueMicrotask(() => { child.emit("error", spawnError); child.stdin.emit("close"); child.stdout.emit("close"); child.stderr.emit("close"); });
 	await assert.rejects(openInitializedHelper("C:\\profile\\agent", { spawnProcess: () => child as unknown as CleanupChild, ...fakeCleanupDeadlines }), /spawn failed/);
 	assert.equal(child.endCalls, 0);
 	assert.equal(child.killCalls, 0);
@@ -178,7 +275,7 @@ test("owned helper cleanup settles a spawn error without an exit event", async (
 test("owned helper cleanup reports failure after two bounded termination waits", async () => {
 	const child = new FakeHelperChild();
 	child.killResult = false;
-	await assert.rejects(settleOwnedChild(child as unknown as CleanupChild, () => false, () => undefined, { terminateMs: 10, killMs: 10 }), /did not settle/);
+	await assert.rejects(settleOwnedChild(child as unknown as CleanupChild, observeChildLifecycle(child as unknown as CleanupChild), { terminateMs: 10, killMs: 10 }), /did not settle/);
 	assert.equal(child.endCalls, 1);
 	assert.equal(child.killCalls, 1);
 	assert.equal(child.destroyCalls, 2);
@@ -186,11 +283,51 @@ test("owned helper cleanup reports failure after two bounded termination waits",
 
 test("owned helper cleanup settles normally without escalation", async () => {
 	const child = new FakeHelperChild();
-	let closed = false;
-	child.onEnd = () => { closed = true; child.emit("close"); };
-	await settleOwnedChild(child as unknown as CleanupChild, () => closed, () => undefined, { terminateMs: 20, killMs: 20 });
+	const lifecycle = observeChildLifecycle(child as unknown as CleanupChild);
+	child.onEnd = () => child.emit("close");
+	await settleOwnedChild(child as unknown as CleanupChild, lifecycle, { terminateMs: 20, killMs: 20 });
 	assert.equal(child.endCalls, 1);
 	assert.equal(child.killCalls, 0);
+});
+
+test("owned helper cleanup waits for close after exit", async () => {
+	const child = new FakeHelperChild();
+	const lifecycle = observeChildLifecycle(child as unknown as CleanupChild);
+	queueMicrotask(() => child.emit("exit", 0));
+	setTimeout(() => child.emit("close", 0), 15);
+	assert.equal(await waitForChildClose(lifecycle, 40), true);
+	assert.equal(lifecycle.closeObserved, true);
+});
+
+test("owned helper cleanup fails bounded exit without close", async () => {
+	const child = new FakeHelperChild();
+	const lifecycle = observeChildLifecycle(child as unknown as CleanupChild);
+	queueMicrotask(() => child.emit("exit", 0));
+	assert.equal(await waitForChildClose(lifecycle, 15), false);
+});
+
+test("owned helper cleanup accepts an already observed close", async () => {
+	const child = new FakeHelperChild();
+	const lifecycle = observeChildLifecycle(child as unknown as CleanupChild);
+	child.emit("close", 0);
+	assert.equal(await waitForChildClose(lifecycle, 15), true);
+});
+
+test("startup control contains asynchronous stdin errors and waits for close", async () => {
+	const child = new FakeHelperChild();
+	child.onEnd = () => queueMicrotask(() => { child.stdin.emit("error", new Error("input failed")); child.emit("close", 1); });
+	await assert.rejects(runBootstrapStartupControl({ spawnProcess: () => child as unknown as CleanupChild, startupDeadlineMs: 20, terminateMs: 10, killMs: 10 }), /did not complete/);
+	assert.equal(child.endCalls, 1);
+	assert.equal(child.killCalls, 0);
+});
+
+test("startup control reports a bounded failure when stdin error never closes", async () => {
+	const child = new FakeHelperChild();
+	child.onEnd = () => queueMicrotask(() => child.stdin.emit("error", new Error("input failed")));
+	await assert.rejects(runBootstrapStartupControl({ spawnProcess: () => child as unknown as CleanupChild, startupDeadlineMs: 20, terminateMs: 10, killMs: 10 }), /did not settle/);
+	assert.equal(child.endCalls, 2);
+	assert.equal(child.killCalls, 1);
+	assert.equal(child.destroyCalls, 2);
 });
 
 test("premature helper close rejects initialization and bounded cleanup settles", async () => {
@@ -221,6 +358,41 @@ test("Windows bootstrap bridge admits only explicit partial or initialized publi
 test("Windows helper request plans correlate standalone and enumeration reply counts", () => {
 	assert.deepEqual(plannedHelperRequests("C:\\profile\\agent", false).map((request) => request.requestId), ["start-1", "initialize-2", "shutdown-3"]);
 	assert.deepEqual(plannedHelperRequests("C:\\profile\\agent", true).map((request) => request.requestId), ["start-1", "initialize-2", "enumerate-3", "shutdown-4"]);
+});
+
+test("Windows bootstrap Add-Type failures use an owned bounded diagnostic", async () => {
+	const source = await readFile(runtime, "utf8");
+	assert.match(source, /Add-Type -ErrorAction Stop -TypeDefinition @'/);
+	assert.match(source, /catch \{\s*\$nativeReady = \$false\s*Write-BootstrapDiagnostic \$_\s*\}/);
+});
+
+test("Windows bootstrap diagnostic parser accepts bounded compiler codes", () => {
+	assert.deepEqual(parseBootstrapDiagnostic('{"kind":"windows-session-bootstrap-diagnostic","category":"compiler","compilerCodes":["CS1001","CS1739"]}\n'), {
+		kind: "windows-session-bootstrap-diagnostic", category: "compiler", compilerCodes: ["CS1001", "CS1739"],
+	});
+});
+
+test("Windows bootstrap diagnostic parser fails closed for unsafe input", () => {
+	assert.equal(parseBootstrapDiagnostic('{"kind":"windows-session-bootstrap-diagnostic","category":"other","compilerCodes":["CS1001"]}\n'), undefined);
+	assert.equal(parseBootstrapDiagnostic('{"kind":"windows-session-bootstrap-diagnostic","category":"compiler","compilerCodes":["CS1001","CS1001"]}\n'), undefined);
+	assert.equal(parseBootstrapDiagnostic("x".repeat(maxBootstrapDiagnosticBytes + 1)), undefined);
+});
+
+test("Windows bootstrap startup control", { skip: process.platform !== "win32", timeout: 40_000 }, async (t) => {
+	const result = await runBootstrapStartupControl();
+	assert.equal(result.code, 0, "Windows bootstrap startup control exited unsuccessfully");
+	const frames = parseStartupControlFrames(result.stdout);
+	assert.deepEqual(frames.map((frame) => frame.requestId), ["start-1", "shutdown-2"]);
+	const [start, shutdown] = frames;
+	assert.deepEqual(shutdown, { requestId: "shutdown-2", ok: true, result: { state: "partial" } });
+	if (!start.ok && start.error === "unavailable") {
+		const diagnostic = parseBootstrapDiagnostic(result.stderr);
+		if (!diagnostic) assert.fail("Windows bootstrap startup diagnostic was missing or malformed");
+		t.diagnostic(JSON.stringify(diagnostic));
+		assert.fail("Windows bootstrap start unavailable");
+	}
+	assert.deepEqual(start, { requestId: "start-1", ok: true, result: { state: "partial" } });
+	if (result.stderr !== "") assert.fail("Windows bootstrap startup control emitted unexpected diagnostics");
 });
 
 test("Windows-native bootstrap pins ancestors, creates exact private boundaries, and remains partial", { skip: process.platform !== "win32", timeout: 20_000 }, async () => {

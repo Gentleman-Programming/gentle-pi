@@ -8,10 +8,45 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $maxControlBytes = 16384
+$maxBootstrapDiagnosticText = 4096
 $nativeReady = $false
 
+function Add-BootstrapDiagnosticText([System.Text.StringBuilder]$builder, [object]$value) {
+	if ($null -eq $value -or $builder.Length -ge $maxBootstrapDiagnosticText) { return }
+	$text = [string]$value
+	$remaining = $maxBootstrapDiagnosticText - $builder.Length
+	if ($text.Length -gt $remaining) { $text = $text.Substring(0, $remaining) }
+	[void]$builder.Append($text)
+}
+
+function Write-BootstrapDiagnostic([object]$record) {
+	$category = 'other'
+	$compilerCodes = [System.Collections.Generic.List[string]]::new()
+	$seenCompilerCodes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+	$text = [System.Text.StringBuilder]::new()
+	$exception = $record.Exception
+	for ($depth = 0; $depth -lt 8 -and $null -ne $exception; $depth++) {
+		$typeName = $exception.GetType().FullName
+		if ($typeName -in @('System.IO.FileLoadException', 'System.IO.FileNotFoundException', 'System.BadImageFormatException')) { $category = 'assembly-load' }
+		elseif ($category -eq 'other' -and $typeName -in @('System.TypeLoadException', 'System.Reflection.ReflectionTypeLoadException')) { $category = 'type-load' }
+		Add-BootstrapDiagnosticText $text $typeName
+		Add-BootstrapDiagnosticText $text $exception.Message
+		$exception = $exception.InnerException
+	}
+	Add-BootstrapDiagnosticText $text $record.FullyQualifiedErrorId
+	if ($null -ne $record.ErrorDetails) { Add-BootstrapDiagnosticText $text $record.ErrorDetails.Message }
+	foreach ($match in [regex]::Matches($text.ToString(), 'CS[0-9]{4}')) {
+		$code = $match.Value
+		if ($category -eq 'other' -and $seenCompilerCodes.Add($code)) {
+			if ($compilerCodes.Count -lt 8) { $compilerCodes.Add($code) }
+		}
+	}
+	if ($compilerCodes.Count -gt 0) { $category = 'compiler' } else { $compilerCodes.Clear() }
+	[Console]::Error.WriteLine(([pscustomobject]@{ kind = 'windows-session-bootstrap-diagnostic'; category = $category; compilerCodes = @($compilerCodes.ToArray()) } | ConvertTo-Json -Compress))
+}
+
 try {
-	Add-Type -TypeDefinition @'
+	Add-Type -ErrorAction Stop -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -170,7 +205,10 @@ public static class WindowsSessionBootstrap {
 }
 '@
 	$nativeReady = $true
-} catch { $nativeReady = $false }
+} catch {
+	$nativeReady = $false
+	Write-BootstrapDiagnostic $_
+}
 
 function Write-Reply([string]$requestId, [bool]$ok, $result, [string]$error) {
 	if ($ok) { [Console]::Out.WriteLine((@{ requestId = $requestId; ok = $true; result = $result } | ConvertTo-Json -Compress)) }
