@@ -56,6 +56,74 @@ function client(adapter: ExecFileAdapter): NativeReviewCliV216 {
 	return new NativeReviewCliV216(adapter, "/package/.gentle-ai/gentle-ai", 30_000, 1024 * 1024);
 }
 
+function nativeSddStatus(changeName = "complete-native-review-lifecycle", workspaceRoot = "/repo"): Record<string, unknown> {
+	return {
+		schemaName: "gentle-ai.sdd-status",
+		schemaVersion: 2,
+		changeName,
+		actionContext: { workspaceRoot },
+		dependencies: { apply: "all_done", verify: "all_done", archive: "ready" },
+		instructions: {
+			apply: ["Apply is complete."],
+			verify: ["Verification is complete."],
+			archive: ["Archive the selected change."],
+		},
+		blockedReasons: [],
+		nextRecommended: "archive",
+	};
+}
+
+test("native SDD status executes its exact selected-root argv and returns only a validated v2 authority", async () => {
+	const body = nativeSddStatus();
+	const queue = queuedAdapter([{ stdout: JSON.stringify(body) }]);
+	const status = await (client(queue.adapter) as unknown as {
+		sddStatus(request: { changeName: string; workspaceRoot: string }): Promise<Record<string, unknown>>;
+	}).sddStatus({ changeName: "complete-native-review-lifecycle", workspaceRoot: "/repo" });
+
+	assert.deepEqual(status, body);
+	assert.deepEqual(queue.calls, [{
+		file: "/package/.gentle-ai/gentle-ai",
+		arguments: ["sdd-status", "complete-native-review-lifecycle", "--cwd", "/repo", "--json", "--instructions"],
+		cwd: "/repo",
+		timeoutMs: 30_000,
+	}]);
+});
+
+test("native SDD status rejects malformed v2 identities, dependencies, instructions, and blockers", async () => {
+	const malformed = [
+		{ ...nativeSddStatus(), schemaName: "gentle-pi.sdd-status" },
+		{ ...nativeSddStatus(), schemaVersion: 1 },
+		{ ...nativeSddStatus(), changeName: "other-change" },
+		{ ...nativeSddStatus(), actionContext: { workspaceRoot: "/other" } },
+		{ ...nativeSddStatus(), dependencies: { apply: "all_done", verify: "all_done", archive: "future" } },
+		{ ...nativeSddStatus(), instructions: { apply: ["ok"], verify: ["ok"], archive: [42] } },
+		{ ...nativeSddStatus(), blockedReasons: "not-an-array" },
+	];
+	for (const body of malformed) {
+		await assert.rejects(
+			() => (client(queuedAdapter([{ stdout: JSON.stringify(body) }]).adapter) as unknown as {
+				sddStatus(request: { changeName: string; workspaceRoot: string }): Promise<Record<string, unknown>>;
+			}).sddStatus({ changeName: "complete-native-review-lifecycle", workspaceRoot: "/repo" }),
+			(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE,
+		);
+	}
+});
+
+test("native SDD status keeps malformed JSON, timeout, and nonzero execution fail-closed", async () => {
+	for (const [result, code] of [
+		[{ stdout: "not-json" }, NATIVE_REVIEW_ERROR_CODE.MALFORMED_JSON],
+		[{ stdout: "", timedOut: true }, NATIVE_REVIEW_ERROR_CODE.TIMEOUT],
+		[{ stdout: "{}", exitCode: 1 }, NATIVE_REVIEW_ERROR_CODE.NON_ZERO],
+	] as const) {
+		await assert.rejects(
+			() => (client(queuedAdapter([result]).adapter) as unknown as {
+				sddStatus(request: { changeName: string; workspaceRoot: string }): Promise<Record<string, unknown>>;
+			}).sddStatus({ changeName: "complete-native-review-lifecycle", workspaceRoot: "/repo" }),
+			(error: unknown) => error instanceof NativeReviewCliError && error.code === code && error.mutationOutcome === "none",
+		);
+	}
+});
+
 test("negotiated STATUS accepts the pinned v5 receipt before routing its transition", async () => {
 	const status = fixture("status-v5.captured.json");
 	const queue = queuedAdapter([{ stdout: JSON.stringify(status) }]);
@@ -568,8 +636,8 @@ test("capture-result receives the controller AbortSignal without an automatic mu
 	assert.equal(receivedTimeout, undefined);
 });
 
-test("native review client leaves SDD status resolution to the local SDD engine", () => {
-	assert.equal("sddStatus" in client(queuedAdapter([]).adapter), false);
+test("native review client exposes native v2 SDD status without adding review lifecycle behavior", () => {
+	assert.equal(typeof (client(queuedAdapter([]).adapter) as unknown as { sddStatus?: unknown }).sddStatus, "function");
 });
 
 test("read-only authority inventory rejects a repository identity mismatch after decoding", async () => {
