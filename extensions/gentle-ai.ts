@@ -37,7 +37,10 @@ import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
 import {
 	ensureSddPreflight,
 	getSddPreflightPreferences,
-	installSddAssets,
+	installPackageAssets,
+	getPackageAssetOwner,
+	hasPackageAssetOwnerInstallation,
+	type PackageAssetOwner,
 	isPackageManagedSddAsset,
 	isSddPreflightTrigger,
 	renderSddPreflightPrompt,
@@ -200,8 +203,9 @@ function gentlePiAgentHome(): string {
 	return resolveGentlePiAgentHome();
 }
 
-function sddGlobalAssetDriftCount(): number {
+function packageAssetAudit(owner: PackageAssetOwner): { stale: number; overrides: number } {
 	let stale = 0;
+	let overrides = 0;
 	for (const [assetSubdir, installedSubdir, ownershipPrefix] of [
 		["agents", "agents", "agents"],
 		["chains", "chains", "chains"],
@@ -210,7 +214,7 @@ function sddGlobalAssetDriftCount(): number {
 		const assetDir = join(ASSETS_DIR, assetSubdir);
 		if (!existsSync(assetDir)) continue;
 		for (const entry of readdirSync(assetDir, { withFileTypes: true })) {
-			if (!entry.isFile()) continue;
+			if (!entry.isFile() || getPackageAssetOwner(`${ownershipPrefix}/${entry.name}`) !== owner) continue;
 			const installedPath = join(gentlePiAgentHome(), installedSubdir, entry.name);
 			try {
 				if (!existsSync(installedPath)) {
@@ -223,6 +227,7 @@ function sddGlobalAssetDriftCount(): number {
 						`${ownershipPrefix}/${entry.name}`,
 					)
 				) {
+					overrides += 1;
 					continue;
 				}
 				const packaged = readFileSync(join(assetDir, entry.name), "utf8");
@@ -243,26 +248,47 @@ function sddGlobalAssetDriftCount(): number {
 			}
 		}
 	}
-	return stale;
+	return { stale, overrides };
 }
 
-function sddLocalAgentOverrideCount(cwd: string): number {
+function packageAssetDiagnosticLines(cwd: string): string[] {
+	return (["delegation", "review", "sdd"] as const).flatMap((owner) => {
+		const label = owner === "sdd" ? "SDD" : owner;
+		const onDemand = owner === "sdd" && !hasPackageAssetOwnerInstallation(owner);
+		const { stale, overrides } = packageAssetAudit(owner);
+		const local = localAgentOverrideCount(cwd, owner);
+		const lines = [onDemand
+			? `info: Global ${label} assets: on demand (not installed)`
+			: `${stale > 0 ? "warn" : "pass"}: Global ${label} assets stale: ${stale} file(s)`];
+		if (!onDemand && stale > 0) {
+			lines[0] += ` — run /gentle:install-${owner} --force to refresh managed assets`;
+		}
+		if (overrides > 0) {
+			lines.push(`info: Global ${label} user overrides: ${overrides} file(s); preserved, not package drift`);
+		}
+		if (local > 0) {
+			lines.push(`warn: Active ${label} agent overrides: ${local} file(s) — active non-builtin ${label} agents shadow package assets; keep only intentional overrides`);
+		}
+		return lines;
+	});
+}
+
+function localAgentOverrideCount(cwd: string, owner: PackageAssetOwner): number {
 	const packageSddAgentsDir = join(ASSETS_DIR, "agents");
-	const packageSddAgentNames = existsSync(packageSddAgentsDir)
-		? new Set(
-				readdirSync(packageSddAgentsDir, { withFileTypes: true })
-					.filter((entry) => entry.isFile() && /^sdd-.*\.md$/i.test(entry.name))
-					.map((entry) => entry.name),
+	const packageSddAgentNames = new Set(
+		listAgentsFromDir(packageSddAgentsDir, "builtin")
+			.filter((agent) =>
+				getPackageAssetOwner(
+					`agents/${relative(packageSddAgentsDir, agent.filePath).split(sep).join("/")}`,
+				) === owner,
 			)
-		: new Set<string>();
+			.map((agent) => agent.name),
+	);
 	let count = 0;
-	for (const installedDir of [
-		join(cwd, ".pi", "agents"),
-		join(cwd, ".pi", "subagents"),
-	]) {
-		if (!existsSync(installedDir)) continue;
-		for (const entry of readdirSync(installedDir, { withFileTypes: true })) {
-			if (entry.isFile() && packageSddAgentNames.has(entry.name)) count += 1;
+	for (const { dir, source, packageManaged } of discoverableNonBuiltinAgentRoots(cwd)) {
+		if (packageManaged || !existsSync(dir)) continue;
+		for (const agent of listAgentsFromDir(dir, source)) {
+			if (packageSddAgentNames.has(agent.name)) count += 1;
 		}
 	}
 	return count;
@@ -1910,6 +1936,49 @@ async function listAgentsFromDirAsync(
 	return entries;
 }
 
+interface DiscoverableNonBuiltinAgentRoot {
+	dir: string;
+	source: AgentSource;
+	/** The package installer owns this directory, so packageAssetAudit reports it. */
+	packageManaged: boolean;
+}
+
+function discoverableNonBuiltinAgentRoots(cwd: string): DiscoverableNonBuiltinAgentRoot[] {
+	const globalAgentHome = gentlePiAgentHome();
+	const roots: DiscoverableNonBuiltinAgentRoot[] = [
+		{ dir: join(globalAgentHome, "agents"), source: "user", packageManaged: true },
+		{ dir: join(globalAgentHome, "subagents"), source: "user", packageManaged: false },
+		{ dir: join(homedir(), ".agents"), source: "user", packageManaged: false },
+		{ dir: join(cwd, ".agents"), source: "project", packageManaged: false },
+		{ dir: join(cwd, ".pi", "agents"), source: "project", packageManaged: false },
+		{ dir: join(cwd, ".pi", "subagents"), source: "project", packageManaged: false },
+	];
+	const unique = new Map<string, DiscoverableNonBuiltinAgentRoot>();
+	for (const root of roots) {
+		let canonical: string;
+		try {
+			canonical = realpathSync(root.dir);
+		} catch {
+			canonical = resolve(root.dir);
+		}
+		const existing = unique.get(canonical);
+		if (existing) {
+			// Reinsert so a later alias keeps true later-root precedence even when
+			// another physical root appears between the duplicate entries. A merged
+			// package-managed root must keep its installer-owned path: ownership
+			// updates validate that lexical path against the managed manifest root.
+			const managedRoot = existing.packageManaged ? existing : root.packageManaged ? root : undefined;
+			unique.delete(canonical);
+			unique.set(canonical, {
+				dir: managedRoot?.dir ?? root.dir,
+				source: root.source,
+				packageManaged: managedRoot !== undefined,
+			});
+		} else unique.set(canonical, root);
+	}
+	return [...unique.values()];
+}
+
 function builtinAgentDirs(cwd: string): string[] {
 	return [
 		join(PACKAGE_ROOT, "..", "pi-subagents-j0k3r", "agents"),
@@ -1940,16 +2009,12 @@ async function listBuiltinAgentNamesAsync(cwd: string): Promise<Set<string>> {
 }
 
 function listDiscoverableAgents(cwd: string): AgentEntry[] {
-	const globalAgentHome = gentlePiAgentHome();
 	const builtinDirs = builtinAgentDirs(cwd);
 	const agents = [
 		...builtinDirs.flatMap((dir) => listAgentsFromDir(dir, "builtin")),
-		...listAgentsFromDir(join(globalAgentHome, "agents"), "user"),
-		...listAgentsFromDir(join(globalAgentHome, "subagents"), "user"),
-		...listAgentsFromDir(join(homedir(), ".agents"), "user"),
-		...listAgentsFromDir(join(cwd, ".agents"), "project"),
-		...listAgentsFromDir(join(cwd, ".pi", "agents"), "project"),
-		...listAgentsFromDir(join(cwd, ".pi", "subagents"), "project"),
+		...discoverableNonBuiltinAgentRoots(cwd).flatMap(({ dir, source }) =>
+			listAgentsFromDir(dir, source),
+		),
 	];
 	const byName = new Map<string, AgentEntry>();
 	for (const agent of agents) byName.set(agent.name, agent);
@@ -1957,21 +2022,12 @@ function listDiscoverableAgents(cwd: string): AgentEntry[] {
 }
 
 async function listDiscoverableAgentsAsync(cwd: string): Promise<AgentEntry[]> {
-	const globalAgentHome = gentlePiAgentHome();
 	const builtinDirs = builtinAgentDirs(cwd);
 	const agents: AgentEntry[] = [];
 	for (const dir of builtinDirs) {
 		agents.push(...(await listAgentsFromDirAsync(dir, "builtin")));
 	}
-	const otherDirs: Array<[string, AgentSource]> = [
-		[join(globalAgentHome, "agents"), "user"],
-		[join(globalAgentHome, "subagents"), "user"],
-		[join(homedir(), ".agents"), "user"],
-		[join(cwd, ".agents"), "project"],
-		[join(cwd, ".pi", "agents"), "project"],
-		[join(cwd, ".pi", "subagents"), "project"],
-	];
-	for (const [dir, source] of otherDirs) {
+	for (const { dir, source } of discoverableNonBuiltinAgentRoots(cwd)) {
 		agents.push(...(await listAgentsFromDirAsync(dir, source)));
 	}
 	const byName = new Map<string, AgentEntry>();
@@ -2178,22 +2234,27 @@ export function applyModelConfig(
 			skipped += 1;
 			continue;
 		}
-		if (updateSubagentModelProfile(cwd, agent.source, agent.name, entry)) updated += 1;
-		else skipped += 1;
-		if (agent.source === "builtin") continue;
+		if (agent.source === "builtin") {
+			if (updateSubagentModelProfile(cwd, agent.source, agent.name, entry)) updated += 1;
+			else skipped += 1;
+			continue;
+		}
 		if (!agent.filePath || !existsSync(agent.filePath)) {
 			skipped += 1;
-			continue;
+		} else {
+			const original = readFileSync(agent.filePath, "utf8");
+			const next = updateFrontmatterRouting(original, entry);
+			if (next === original) {
+				skipped += 1;
+			} else {
+				if (!updatePackageManagedSddAgentOwnership(agent.filePath, original, next)) {
+					writeFileSync(agent.filePath, next);
+				}
+				updated += 1;
+			}
 		}
-		const original = readFileSync(agent.filePath, "utf8");
-		const next = updateFrontmatterRouting(original, entry);
-		if (next === original) {
-			skipped += 1;
-			continue;
-		}
-		writeFileSync(agent.filePath, next);
-		updatePackageManagedSddAgentOwnership(agent.filePath, original, next);
-		updated += 1;
+		if (updateSubagentModelProfile(cwd, agent.source, agent.name, entry)) updated += 1;
+		else skipped += 1;
 	}
 	for (const [name, entry] of Object.entries(config)) {
 		if (!seenAgents.has(name) && isClearRoutingEntry(entry)) {
@@ -2218,23 +2279,29 @@ export async function applyModelConfigAsync(
 			skipped += 1;
 			continue;
 		}
+		if (agent.source === "builtin") {
+			if (await updateSubagentModelProfileAsync(cwd, agent.source, agent.name, entry))
+				updated += 1;
+			else skipped += 1;
+			continue;
+		}
+		if (!agent.filePath || !(await pathExists(agent.filePath))) {
+			skipped += 1;
+		} else {
+			const original = await readFile(agent.filePath, "utf8");
+			const next = updateFrontmatterRouting(original, entry);
+			if (next === original) {
+				skipped += 1;
+			} else {
+				if (!updatePackageManagedSddAgentOwnership(agent.filePath, original, next)) {
+					await writeFile(agent.filePath, next);
+				}
+				updated += 1;
+			}
+		}
 		if (await updateSubagentModelProfileAsync(cwd, agent.source, agent.name, entry))
 			updated += 1;
 		else skipped += 1;
-		if (agent.source === "builtin") continue;
-		if (!agent.filePath || !(await pathExists(agent.filePath))) {
-			skipped += 1;
-			continue;
-		}
-		const original = await readFile(agent.filePath, "utf8");
-		const next = updateFrontmatterRouting(original, entry);
-		if (next === original) {
-			skipped += 1;
-			continue;
-		}
-		await writeFile(agent.filePath, next);
-		updatePackageManagedSddAgentOwnership(agent.filePath, original, next);
-		updated += 1;
 	}
 	for (const [name, entry] of Object.entries(config)) {
 		if (!seenAgents.has(name) && isClearRoutingEntry(entry)) {
@@ -6731,7 +6798,7 @@ function createGentleAiExtensionForTesting(
 	});
 
 	function runSddPreflight(ctx: ExtensionContext, promptFields: readonly SddPreflightField[] = []): Promise<SddPreflightPreferences> {
-		return ensureSddPreflight(ctx, { pi, installAssets: (cwd) => installSddAssets(cwd, false), applyModelConfig: async () => applySavedModelConfig(ctx) }, { promptFields });
+		return ensureSddPreflight(ctx, { pi, installAssets: (cwd) => installPackageAssets(cwd, true, ["sdd"]), applyModelConfig: async () => applySavedModelConfig(ctx) }, { promptFields });
 	}
 
 	pi.on("session_start", async (event, ctx) => {
@@ -6751,7 +6818,7 @@ function createGentleAiExtensionForTesting(
 			if (ctx.hasUI) ctx.ui.notify(`Gentle AI dev binary override check failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
 		}
 		try {
-			const installResult = installSddAssets(ctx.cwd, true);
+			const installResult = installPackageAssets(ctx.cwd, true, ["delegation", "review"]);
 			migrateLegacyProjectModelOverrides(ctx.cwd);
 			const modelResult = await applySavedModelConfig(ctx);
 			if (ctx.hasUI && modelResult.invalidPath) {
@@ -6763,7 +6830,7 @@ function createGentleAiExtensionForTesting(
 			}
 			if (ctx.hasUI && modelResult.updated > 0) {
 				ctx.ui.notify(
-					`el Gentleman applied SDD model config to ${modelResult.updated} agent(s). Global SDD assets ready: ${installResult.agents} new agent(s), ${installResult.chains} new chain(s), ${installResult.support} new support file(s).`,
+					`el Gentleman applied saved model config to ${modelResult.updated} agent(s). Global delegation/review assets ready: ${installResult.agents} new agent(s), ${installResult.chains} new chain(s), ${installResult.support} new support file(s).`,
 					"info",
 				);
 			}
@@ -6955,18 +7022,20 @@ function createGentleAiExtensionForTesting(
 		return await confirmCommand(event.input.command, ctx, pi.events, herdrLifecycle);
 	});
 
-	pi.registerCommand("gentle:install-sdd", {
-		description:
-			"Repair or refresh global Gentle AI SDD subagent and chain assets.",
-		handler: async (args, ctx) => {
-			const force = args.includes("--force");
-			const result = installSddAssets(ctx.cwd, force);
-			ctx.ui.notify(
-				`Global Gentle AI SDD assets installed: ${result.agents} agent(s), ${result.chains} chain(s), ${result.support} support file(s), ${result.skipped} already present.`,
-				"info",
-			);
-		},
-	});
+	for (const owner of ["delegation", "review", "sdd"] as const) {
+		const label = owner === "sdd" ? "SDD" : owner;
+		pi.registerCommand(`gentle:install-${owner}`, {
+			description: `Repair or refresh only global Gentle AI ${label} assets.`,
+			handler: async (args, ctx) => {
+				const force = args.includes("--force");
+				const result = installPackageAssets(ctx.cwd, force, [owner]);
+				ctx.ui.notify(
+					`Global Gentle AI ${label} assets installed: ${result.agents} agent(s), ${result.chains} chain(s), ${result.support} support file(s), ${result.skipped} already present.`,
+					"info",
+				);
+			},
+		});
+	}
 
 	pi.registerCommand("gentle:sdd-preflight", {
 		description:
@@ -7099,29 +7168,19 @@ function createGentleAiExtensionForTesting(
 	pi.registerCommand("gentle:doctor", {
 		description: "Run read-only Gentle AI diagnostics for this Pi workspace.",
 		handler: async (_args, ctx) => {
-			const agentsInstalled = existsSync(
-				join(gentlePiAgentHome(), "agents", "sdd-apply.md"),
-			);
-			const chainsInstalled = existsSync(
-				join(gentlePiAgentHome(), "chains", "sdd-full.chain.md"),
-			);
+			const assetLines = packageAssetDiagnosticLines(ctx.cwd);
 			const openspecConfigured = existsSync(
 				join(ctx.cwd, "openspec", "config.yaml"),
 			);
 			const skillRegistryPresent = existsSync(
 				join(ctx.cwd, ".atl", "skill-registry.md"),
 			);
-			const staleSddAssets = sddGlobalAssetDriftCount();
-			const localSddAgentOverrides = sddLocalAgentOverrideCount(ctx.cwd);
 			const modelConfig = await readSavedModelConfigAsync(ctx.cwd);
 			const engramActive = hasWritableEngramTool(pi);
 			const devBinary = await describeDevBinaryOverride();
 			const lines = [
 				"el Gentleman doctor",
-				`${agentsInstalled ? "pass" : "fail"}: Global SDD agents ${agentsInstalled ? "installed" : "missing"}`,
-				`${chainsInstalled ? "pass" : "fail"}: Global SDD chains ${chainsInstalled ? "installed" : "missing"}`,
-				`${staleSddAssets === 0 ? "pass" : "warn"}: Global SDD asset drift ${staleSddAssets} file(s)`,
-				`${localSddAgentOverrides === 0 ? "pass" : "warn"}: Project-local SDD agent overrides ${localSddAgentOverrides} file(s)`,
+				...assetLines,
 				`${openspecConfigured ? "pass" : "warn"}: OpenSpec config ${openspecConfigured ? "present" : "missing"}`,
 				`${skillRegistryPresent ? "pass" : "warn"}: Skill registry ${skillRegistryPresent ? "present" : "missing"}`,
 				`${modelConfig.status === "invalid" ? "fail" : "pass"}: Global model config ${modelConfig.status}`,
@@ -7130,18 +7189,12 @@ function createGentleAiExtensionForTesting(
 				...(devBinary.state === "active" ? [`warn: ${devBinary.line}`] : []),
 				...(devBinary.state === "invalid" ? [`fail: ${devBinary.line}`, "remedy: fix the dev binary override or clear it with /gentle:dev-binary off (or unset GENTLE_PI_GENTLE_AI_DEV_BINARY)"] : []),
 			];
-			if (!agentsInstalled || !chainsInstalled) {
-				lines.push("remedy: run /gentle:install-sdd --force to refresh global SDD assets intentionally");
-			}
 			if (modelConfig.status === "invalid") {
 				lines.push(`remedy: fix or remove ${modelConfig.path}`);
 			}
-			if (localSddAgentOverrides > 0) {
-				lines.push("remedy: remove project-local SDD agent overrides unless intentionally debugging package assets");
-			}
 			ctx.ui.notify(
 				lines.join("\n"),
-				lines.some((line) => line.startsWith("fail:")) ? "warning" : "info",
+				lines.some((line) => line.startsWith("fail:")) || assetLines.some((line) => line.startsWith("warn:")) ? "warning" : "info",
 			);
 		},
 	});
@@ -7293,17 +7346,10 @@ function createGentleAiExtensionForTesting(
 	pi.registerCommand("gentle:status", {
 		description: "Show Gentle AI package status for this project.",
 		handler: async (_args, ctx) => {
-			const agentsInstalled = existsSync(
-				join(gentlePiAgentHome(), "agents", "sdd-apply.md"),
-			);
-			const chainsInstalled = existsSync(
-				join(gentlePiAgentHome(), "chains", "sdd-full.chain.md"),
-			);
+			const assetLines = packageAssetDiagnosticLines(ctx.cwd);
 			const openspecConfigured = existsSync(
 				join(ctx.cwd, "openspec", "config.yaml"),
 			);
-			const staleSddAssets = sddGlobalAssetDriftCount();
-			const localSddAgentOverrides = sddLocalAgentOverrideCount(ctx.cwd);
 			const modelConfig = await readModelConfigAsync(ctx.cwd);
 			const devBinary = await describeDevBinaryOverride();
 			ctx.ui.notify(
@@ -7311,23 +7357,12 @@ function createGentleAiExtensionForTesting(
 					"el Gentleman package is active.",
 					...(devBinary.state === "inactive" ? [] : [devBinary.line]),
 					`Persona: ${readPersonaMode(ctx.cwd)}`,
-					`Global SDD agents: ${agentsInstalled ? "installed" : "not installed"}`,
-					`Global SDD chains: ${chainsInstalled ? "installed" : "not installed"}`,
-					`Global SDD assets stale: ${staleSddAssets} file(s)${
-						staleSddAssets > 0
-							? " — run /gentle:install-sdd --force to refresh intentionally"
-							: ""
-					}`,
-					`Project-local SDD agent overrides: ${localSddAgentOverrides} file(s)${
-						localSddAgentOverrides > 0
-							? " — local SDD agents shadow package assets; remove them unless intentionally debugging"
-							: ""
-					}`,
+					...assetLines,
 					`OpenSpec config: ${openspecConfigured ? "present" : "missing"}`,
 					`Global model config: ${existsSync(modelConfigPath(ctx.cwd)) ? "present" : "missing"}`,
 					...describeModelConfig(ctx.cwd, modelConfig),
 				].join("\n"),
-				staleSddAssets > 0 || localSddAgentOverrides > 0 || devBinary.state !== "inactive" ? "warning" : "info",
+				assetLines.some((line) => line.startsWith("warn:")) || devBinary.state !== "inactive" ? "warning" : "info",
 			);
 		},
 	});

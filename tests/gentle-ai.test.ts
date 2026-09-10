@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -12,9 +12,10 @@ import type {
 	Theme,
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
-import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
-import { CandidateViewError, type CandidateViewRegistry } from "../lib/review-candidate-view.ts";
+import { __testing, applyModelConfig, createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError, type NativeReviewCli } from "../lib/native-review-cli.ts";
+import { CandidateViewError, type CandidateViewRegistry } from "../lib/review-candidate-view.ts";
+import { installPackageAssets } from "../lib/sdd-preflight.ts";
 import type { ReviewCollectInputV3, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { cardBody, cardHint, cardTitle, cardTone } from "./gentle-card-text.ts";
@@ -292,6 +293,82 @@ test("agent discovery skips skills directories", async (t) => {
 		asyncAgents.map((agent) => agent.name),
 		["review-risk", "worker"],
 	);
+});
+
+test("managed routing timeout leaves its profile, agent, and manifest unchanged", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-managed-routing-timeout-"));
+	const agentHome = join(root, "agent-home");
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	t.after(() => {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	process.env.GENTLE_PI_AGENT_HOME = agentHome;
+	installPackageAssets(root, false, ["sdd"]);
+	const agentPath = join(agentHome, "agents", "sdd-apply.md");
+	const manifestPath = join(agentHome, "gentle-ai", "managed-assets.json");
+	const profilePath = join(agentHome, "subagents.json");
+	const profileBefore = "{\n  \"unrelated\": true\n}\n";
+	writeFileSync(profilePath, profileBefore);
+	const agentBefore = readFileSync(agentPath, "utf8");
+	const manifestBefore = readFileSync(manifestPath, "utf8");
+	writeFileSync(
+		join(agentHome, "gentle-ai", "managed-assets.lock"),
+		JSON.stringify({ schemaVersion: 1, token: "foreign", pid: process.pid, createdAtMs: Date.now() }),
+	);
+
+	assert.throws(
+		() => applyModelConfig(root, { "sdd-apply": { model: "test/managed", thinking: "high" } }),
+		/Timed out acquiring managed-assets lock file/i,
+	);
+	assert.equal(readFileSync(profilePath, "utf8"), profileBefore);
+	assert.equal(readFileSync(agentPath, "utf8"), agentBefore);
+	assert.equal(readFileSync(manifestPath, "utf8"), manifestBefore);
+});
+
+test("a later alias keeps managed-root precedence and manifest ownership", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-agent-root-alias-"));
+	const agentHome = join(root, "agent-home");
+	const home = join(root, "home");
+	const cwd = join(root, "project");
+	const managed = join(agentHome, "agents");
+	const intervening = join(agentHome, "subagents");
+	const alias = join(home, ".agents");
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const previousHome = process.env.HOME;
+	const previousUserProfile = process.env.USERPROFILE;
+	t.after(() => {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousUserProfile;
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	process.env.GENTLE_PI_AGENT_HOME = agentHome;
+	process.env.HOME = home;
+	process.env.USERPROFILE = home;
+	installPackageAssets(cwd, false, ["sdd"]);
+	writeMarkdown(join(intervening, "sdd-apply.md"), "---\nname: sdd-apply\n---\nintervening override\n");
+	mkdirSync(home, { recursive: true });
+	try {
+		symlinkSync(managed, alias, process.platform === "win32" ? "junction" : "dir");
+	} catch (error) {
+		t.skip(`directory aliases unavailable: ${error instanceof Error ? error.message : String(error)}`);
+		return;
+	}
+
+	const selected = __testing.listDiscoverableAgents(cwd).find((agent) => agent.name === "sdd-apply");
+	assert.equal(selected?.filePath, join(managed, "sdd-apply.md"));
+	applyModelConfig(cwd, { "sdd-apply": { model: "test/managed", thinking: "high" } });
+	const manifest = JSON.parse(readFileSync(join(agentHome, "gentle-ai", "managed-assets.json"), "utf8")) as { assets: Record<string, string> };
+	const routed = readFileSync(join(managed, "sdd-apply.md"), "utf8");
+	assert.match(routed, /^model: test\/managed$/m);
+	assert.equal(manifest.assets["agents/sdd-apply.md"], createHash("sha256").update(routed).digest("hex"));
 });
 
 test("runtime guidance keeps review policy out of the static orchestrator", () => {
