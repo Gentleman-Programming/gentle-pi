@@ -24,6 +24,9 @@ import { CARD_TONE, renderCard } from "../lib/shell-card.ts";
 import { openInExternalEditor } from "./gentle-shell.ts";
 import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
 import { researchAgent, resolveResearchCapabilities, renderResearchCapabilities, RESEARCH_CHILD_TOOLS_ENV } from "../lib/sdd-research-capabilities.ts";
+import { CHILD_METRICS_EVENT, CHILD_METRICS_REVOKED, childEvent, launchSelection, type LaunchSelection } from "../lib/runtime-metrics-children.ts";
+import { lookupPiCatalogName } from "../lib/runtime-metrics-pi-identity.ts";
+import { runtimeMetricsEnvAllows, type RuntimeMetricsPolicyDeps } from "../lib/runtime-metrics-policy.ts";
 
 // Gentle Agents: subagents as isolated `pi --mode rpc` children, a task
 // store that notifies per task, and a Gentle Shell card above the editor.
@@ -73,6 +76,9 @@ export interface AgentsDeps extends RunnerDeps {
 	childIpc?: IpcEndpoint;
 	env: NodeJS.ProcessEnv;
 	resolveWorktree: WorktreeResolver;
+	runtimeMetricsPolicy?: RuntimeMetricsPolicyDeps;
+	metricsNow?: () => number;
+	metricsSchedule?: RunnerDeps["schedule"];
 }
 
 export function agentRuntimePaths(home: string, agentHome = join(home, ".pi", "agent")): { sessions: string; transcripts: string } {
@@ -311,6 +317,26 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const ownedTaskIds = new Set<string>();
 	const stoppingTaskIds = new Set<string>();
 	const yieldedTaskIds = new Set<string>();
+	const metricsNow = deps.metricsNow ?? (() => performance.now());
+	let metricsOwner = {};
+	const metricTasks = new Map<string, { selection?: LaunchSelection; started: number; launched: boolean; finished: boolean; current(): boolean; valid(): boolean }>();
+	const unsubscribeMetrics = pi.events.on(CHILD_METRICS_REVOKED, id => {
+		if (id === activeSessionId()) {
+			metricsOwner = {};
+			for (const taskId of metricTasks.keys()) runner.discardResponseObservations(taskId);
+			metricTasks.clear();
+		}
+	});
+	const clearTaskMetrics = () => {
+		metricsOwner = {};
+		for (const taskId of metricTasks.keys()) runner.discardResponseObservations(taskId);
+		metricTasks.clear();
+	};
+	pi.on("session_start", clearTaskMetrics);
+	pi.on("session_shutdown", () => {
+		clearTaskMetrics();
+		unsubscribeMetrics();
+	});
 	let stopAllConfirmation: Promise<void> | undefined;
 
 	// The card and its clock follow the session pi has open right now; a task
@@ -393,12 +419,27 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			if (!root || root !== childRoot || !worktrees.roots().includes(root)) return;
 			recordReviewMutation(pi, sessions, root, { source: "subagent", taskId: task.id, toolName: tool.toolName, toolCallId: tool.toolCallId });
 		},
-		onFinish: (task) => {
-			ownedTaskIds.delete(task.id);
-			requestRender();
-			persist(task);
-			const yielded = yieldedTaskIds.delete(task.id);
-			if ((task.mode === AGENT_MODE.BACKGROUND && task.status !== TASK_STATUS.CANCELLED) || (yielded && task.status !== TASK_STATUS.CANCELLED && activeSessionId() === task.parentSessionId)) deliver(task);
+		onFinish: (task, observations) => {
+			// Completion is the only forwarding opportunity. No pending event, policy
+			// query or promise survives this callback; the receiver drops when busy.
+			const { id, parentSessionId, status } = task;
+			const metrics = metricTasks.get(id);
+			metricTasks.delete(id); // Deliver at most once, even if forwarding fails.
+			try {
+				const authorized = metrics?.valid();
+				if (metrics) metrics.finished = true;
+				if (authorized && metrics?.launched && metrics.selection && observations) {
+					const event = childEvent(parentSessionId, id, metrics.selection, status, observations, metrics.started);
+					if (event && metrics.current()) pi.events.emit(CHILD_METRICS_EVENT, event);
+				}
+			} catch { /* Metrics must never interrupt task finalization. */ }
+			try {
+				ownedTaskIds.delete(task.id);
+				requestRender();
+				persist(task);
+				const yielded = yieldedTaskIds.delete(task.id);
+				if ((task.mode === AGENT_MODE.BACKGROUND && task.status !== TASK_STATUS.CANCELLED) || (yielded && task.status !== TASK_STATUS.CANCELLED && activeSessionId() === task.parentSessionId)) deliver(task);
+			} catch { /* Best-effort completion bookkeeping cannot strand runner waiters. */ }
 		},
 	});
 
@@ -643,7 +684,27 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	};
 
 	const launch = async (ctx: ExtensionContext, request: TaskRequest): Promise<ToolText> => {
-		const task = runner.run(request);
+		// Bounded live observation only. Native send owns the fresh policy decision;
+		// child execution never starts a telemetry policy process or renewal timer.
+		const owner = metricsOwner;
+		const metrics = { selection: undefined as LaunchSelection | undefined,
+			started: 0, launched: false, finished: false,
+			current: () => owner === metricsOwner && request.parentSessionId === activeSessionId() && runtimeMetricsEnvAllows(deps.env),
+			valid: () => !metrics.finished && metrics.current() };
+		const observe = runtimeMetricsEnvAllows(deps.env) && metricTasks.size < 256;
+		const task = runner.run({ ...request, collectResponseObservations: false,
+			onLaunch: () => { metrics.launched = true; request.onLaunch?.(); },
+			...(observe ? { canCollectResponseObservations: metrics.valid, prepareResponseObservations: async () => {
+				if (metrics.finished || owner !== metricsOwner || request.parentSessionId !== activeSessionId() || !runtimeMetricsEnvAllows(deps.env)) return false;
+				try { await lookupPiCatalogName({ provider: "openai", modelId: "gpt-4o" }); }
+				catch { return false; }
+				if (!metrics.valid()) return false;
+				metrics.selection = launchSelection(request.agent, request.model, request.thinking);
+				metrics.started = metricsNow();
+				return metrics.valid();
+			} } : {}),
+		});
+		if (observe) metricTasks.set(task.id, metrics);
 		ownedTaskIds.add(task.id);
 		store.subscribe(task.id, () => { publishActivity(); requestRender(); });
 		if (request.mode === AGENT_MODE.BACKGROUND) return text(`Started ${task.agent} in the background as task ${task.id}. Use subagent_status or subagent_result with that id.`, taskDetails(task));
