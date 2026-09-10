@@ -15,7 +15,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { applyModelConfig } from "../extensions/gentle-ai.ts";
 import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
-import { installSddAssets } from "../lib/sdd-preflight.ts";
+import { getPackageAssetOwner, installPackageAssets, installSddAssets, type PackageAssetOwner } from "../lib/sdd-preflight.ts";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const MANAGED_EXEMPLAR_FILE = "gentle-ai-explore.md";
@@ -229,8 +229,12 @@ test("generated runtime modules and packed-package checks are deterministic", ()
 test("package manifest ships and runs the checked-in package-local Gentle AI installer", () => {
 	const packageJson = readPackageJson();
 	const verifier = readFileSync(join(PACKAGE_ROOT, "scripts", "verify-package-files.mjs"), "utf8");
+	const readme = readFileSync(join(PACKAGE_ROOT, "README.md"), "utf8");
 
 	assert.equal(packageJson.scripts?.postinstall, "node scripts/install-gentle-ai.mjs");
+	assert.match(readme, /run `node scripts\/install-gentle-ai\.mjs`/, "missing-binary recovery documentation must use the package postinstall entrypoint");
+	assert.match(readme, /installed `gentle-pi` package directory/, "recovery documentation must name the package working directory");
+	assert.match(readme, /if `GENTLE_PI_SKIP_GENTLE_AI_INSTALL` is set, remove or unset it before/i, "recovery documentation must prevent the installer skip from repeating");
 	assert.ok(packageJson.files?.includes("scripts/"));
 	assert.match(verifier, /"scripts\/install-gentle-ai\.mjs"/);
 	assert.match(verifier, /"scripts\/gentle-ai-installer\.mjs"/);
@@ -466,6 +470,220 @@ test("packaged agents declare only tool names a Pi child session can resolve", (
 				`${file} declares ${unsupported}, which no Pi child session exposes; use find for discovery`,
 			);
 		}
+	}
+});
+
+function withIsolatedAssetHome(run: (agentHome: string) => void): void {
+	const temporary = mkdtempSync(join(tmpdir(), "gentle-asset-owners-"));
+	const previous = process.env.GENTLE_PI_AGENT_HOME;
+	try {
+		process.env.GENTLE_PI_AGENT_HOME = temporary;
+		run(temporary);
+	} finally {
+		if (previous === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previous;
+		rmSync(temporary, { recursive: true, force: true });
+	}
+}
+
+function installedAssetManifest(agentHome: string): ManagedAssetsManifest {
+	return JSON.parse(readFileSync(join(agentHome, "gentle-ai", "managed-assets.json"), "utf8"));
+}
+
+test("selective delegation installation owns only generic agents", () => {
+	withIsolatedAssetHome((agentHome) => {
+		const result = installPackageAssets(agentHome, false, ["delegation"]);
+		assert.deepEqual(Object.keys(installedAssetManifest(agentHome).assets).sort(), [
+			"agents/gentle-ai-explore.md",
+			"agents/gentle-ai-verify.md",
+			"agents/gentle-ai-worker.md",
+		]);
+		assert.deepEqual(result, { agents: 3, chains: 0, support: 0, skipped: 0 });
+		assert.deepEqual(readdirSync(join(agentHome, "agents")).sort(), [
+			"gentle-ai-explore.md", "gentle-ai-verify.md", "gentle-ai-worker.md",
+		]);
+		assert.equal(existsSync(join(agentHome, "chains")), false);
+		assert.equal(existsSync(join(agentHome, "gentle-ai", "support")), false);
+	});
+});
+
+test("selective installation retires only assets belonging to the selected owner", () => {
+	withIsolatedAssetHome((agentHome) => {
+		installSddAssets(agentHome, false);
+		const manifestPath = join(agentHome, "gentle-ai", "managed-assets.json");
+		const manifest = installedAssetManifest(agentHome);
+		for (const name of RETIRED_ADVERSARIAL_AGENTS) {
+			writeFileSync(join(agentHome, "agents", name), "Previously managed review agent\n");
+			manifest.assets[`agents/${name}`] = sha256("Previously managed review agent\n");
+		}
+		writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+		for (const owner of ["delegation", "sdd"] as const) {
+			installPackageAssets(agentHome, true, [owner]);
+			assert.deepEqual(installedAssetManifest(agentHome), manifest);
+			for (const name of RETIRED_ADVERSARIAL_AGENTS) {
+				assert.equal(readFileSync(join(agentHome, "agents", name), "utf8"), "Previously managed review agent\n");
+			}
+		}
+		writeFileSync(join(agentHome, "agents", "review-validator.md"), "User-modified retired agent\n");
+		installPackageAssets(agentHome, false, ["review"]);
+		assert.equal(existsSync(join(agentHome, "agents", "review-refuter.md")), false);
+		assert.equal(readFileSync(join(agentHome, "agents", "review-validator.md"), "utf8"), "User-modified retired agent\n");
+		for (const name of RETIRED_ADVERSARIAL_AGENTS) {
+			assert.equal(installedAssetManifest(agentHome).assets[`agents/${name}`], undefined);
+		}
+	});
+});
+
+const EXPECTED_OWNER_ASSETS: Record<PackageAssetOwner, readonly string[]> = {
+	delegation: [
+		"agents/gentle-ai-explore.md", "agents/gentle-ai-verify.md", "agents/gentle-ai-worker.md",
+	],
+	review: [
+		"agents/jd-fix-agent.md", "agents/jd-judge-a.md", "agents/jd-judge-b.md",
+		"agents/review-readability.md", "agents/review-reliability.md",
+		"agents/review-resilience.md", "agents/review-risk.md", "chains/4r-review.chain.md",
+	],
+	sdd: [
+		"agents/sdd-apply.md", "agents/sdd-archive.md", "agents/sdd-design.md",
+		"agents/sdd-explore.md", "agents/sdd-init.md", "agents/sdd-onboard.md",
+		"agents/sdd-proposal.md", "agents/sdd-research.md", "agents/sdd-spec.md",
+		"agents/sdd-status.md", "agents/sdd-sync.md", "agents/sdd-tasks.md", "agents/sdd-verify.md",
+		"chains/sdd-full.chain.md", "chains/sdd-plan.chain.md", "chains/sdd-verify.chain.md",
+		"gentle-ai/support/sdd-status-contract.md", "gentle-ai/support/strict-tdd-verify.md",
+		"gentle-ai/support/strict-tdd.md",
+	],
+};
+
+function assetFileKeys(root: string, prefix = ""): string[] {
+	if (!existsSync(root)) return [];
+	return readdirSync(root, { withFileTypes: true }).flatMap(entry => {
+		const key = `${prefix}${entry.name}`;
+		return entry.isDirectory() ? assetFileKeys(join(root, entry.name), `${key}/`) : [key];
+	}).sort();
+}
+
+for (const owner of Object.keys(EXPECTED_OWNER_ASSETS) as PackageAssetOwner[]) {
+	test(`selective ${owner} installation covers its catalog without cross-owner files`, () => {
+		withIsolatedAssetHome((agentHome) => {
+			const expected = [...EXPECTED_OWNER_ASSETS[owner]].sort();
+			installPackageAssets(agentHome, false, [owner]);
+			assert.deepEqual(Object.keys(installedAssetManifest(agentHome).assets).sort(), expected);
+			assert.deepEqual(assetFileKeys(agentHome), [...expected, "gentle-ai/managed-assets.json"].sort());
+			for (const key of expected) {
+				assert.equal(getPackageAssetOwner(key), owner);
+				const source = join(PACKAGE_ROOT, "assets", key.replace(/^gentle-ai\//, ""));
+				assert.equal(readFileSync(join(agentHome, key), "utf8"), readFileSync(source, "utf8"));
+			}
+			const counts = installPackageAssets(agentHome, false, [owner, owner]);
+			assert.deepEqual(counts, { agents: 0, chains: 0, support: 0, skipped: expected.length });
+		});
+	});
+}
+
+test("legacy all-assets installation covers every packaged file with explicit ownership", () => {
+	const packaged = ["agents", "chains", "support"].flatMap(group =>
+		assetFileKeys(join(PACKAGE_ROOT, "assets", group), group === "support" ? "gentle-ai/support/" : `${group}/`),
+	).sort();
+	assert.deepEqual(packaged, Object.values(EXPECTED_OWNER_ASSETS).flat().sort());
+	for (const key of packaged) assert.notEqual(getPackageAssetOwner(key), undefined, key);
+	for (const key of ["agents/sdd-new.md", "gentle-ai/support/new.md", "toString", "__proto__"]) {
+		assert.equal(getPackageAssetOwner(key), undefined, "unknown assets must not default to SDD");
+	}
+	withIsolatedAssetHome((agentHome) => {
+		assert.deepEqual(installSddAssets(agentHome, false), { agents: 23, chains: 4, support: 3, skipped: 0 });
+		assert.deepEqual(Object.keys(installedAssetManifest(agentHome).assets).sort(), packaged);
+		assert.deepEqual(installSddAssets(agentHome, false), { agents: 0, chains: 0, support: 0, skipped: 30 });
+		assert.deepEqual(installSddAssets(agentHome, true), { agents: 23, chains: 4, support: 3, skipped: 0 });
+	});
+});
+
+test("selective refresh preserves unselected ownership and selected user changes after an all-assets install", () => {
+	withIsolatedAssetHome((agentHome) => {
+		installSddAssets(agentHome, false);
+		const manifest = installedAssetManifest(agentHome);
+		const selectedUserKey = "agents/gentle-ai-explore.md";
+		const unselectedUserKey = "agents/sdd-apply.md";
+		for (const key of [selectedUserKey, unselectedUserKey, "agents/custom.md"]) {
+			writeFileSync(join(agentHome, key), "User-authored instructions\n");
+		}
+		const before = new Map(assetFileKeys(agentHome).map(key => [key, readFileSync(join(agentHome, key), "utf8")]));
+		assert.deepEqual(installPackageAssets(agentHome, true, ["delegation"]), { agents: 2, chains: 0, support: 0, skipped: 1 });
+		delete manifest.assets[selectedUserKey];
+		assert.deepEqual(installedAssetManifest(agentHome), manifest);
+		for (const [key, content] of before) {
+			if (key !== "gentle-ai/managed-assets.json") assert.equal(readFileSync(join(agentHome, key), "utf8"), content, key);
+		}
+		const manifestBytes = readFileSync(join(agentHome, "gentle-ai", "managed-assets.json"), "utf8");
+		assert.deepEqual(installPackageAssets(agentHome, true, []), { agents: 0, chains: 0, support: 0, skipped: 0 });
+		assert.equal(readFileSync(join(agentHome, "gentle-ai", "managed-assets.json"), "utf8"), manifestBytes);
+	});
+});
+
+test("selective review migration adopts only untouched legacy copies and preserves routing", () => {
+	for (const edited of [false, true]) {
+		withIsolatedAssetHome((agentHome) => {
+			mkdirSync(join(agentHome, "agents"));
+			const legacy = readFileSync(V014_REVIEW_RISK_FIXTURE, "utf8")
+				.replace("name: review-risk\n", "name: review-risk\nmodel: custom/model\nthinking: high\n")
+				+ (edited ? "\nUser review restrictions.\n" : "");
+			const target = join(agentHome, "agents", REVIEW_RISK_FILE);
+			writeFileSync(target, legacy);
+			installPackageAssets(agentHome, true, ["delegation"]);
+			assert.equal(readFileSync(target, "utf8"), legacy);
+			assert.equal(installedAssetManifest(agentHome).assets["agents/review-risk.md"], undefined);
+			const result = installPackageAssets(agentHome, true, ["review"]);
+			const actual = readFileSync(target, "utf8");
+			const manifest = installedAssetManifest(agentHome);
+			assert.equal(result.skipped, edited ? 1 : 0);
+			if (edited) {
+				assert.equal(actual, legacy);
+				assert.equal(manifest.assets["agents/review-risk.md"], undefined);
+			} else {
+				assert.notEqual(actual, legacy);
+				assert.match(actual, /model: custom\/model\nthinking: high/);
+				assert.equal(manifest.assets["agents/review-risk.md"], sha256(actual));
+			}
+			assert.equal(existsSync(join(agentHome, "agents", "sdd-apply.md")), false);
+			assert.equal(existsSync(join(agentHome, "gentle-ai", "support")), false);
+		});
+	}
+});
+
+test("unowned legacy research migrates by exact normalized hash, preserving routing and user edits", () => {
+	const packaged = readFileSync(join(PACKAGE_ROOT, "assets", "agents", "sdd-research.md"), "utf8");
+	const oldAdmission = "- Evidence grants for this runtime are `documentation=[]; open-web=[]`. Never infer evidence capability from bash, persistence tools, or any inherited tool; persistence tools are not evidence grants. Unsupported or undeclared classes deny admission and emit no claims.\n- Because this runtime declares no evidence grants, retain the selected request, persist a `blocked` outcome with no claims, and stop.\n";
+	const legacy = packaged
+		.replace(/  - fetch_content\n  - web_search\n  - source_check\n  - get_search_content\n/, "")
+		.replace(/- Use the injected `## SDD Research Capabilities`[\s\S]*?(?=- Admission denial)/, oldAdmission)
+		.replace(/Use `done` only when all selected questions[\s\S]*?product decisions remain separately confirmed by the parent\./i, "For this runtime the outcome is `blocked` with an admission denial and no claims.");
+	const manifest = JSON.parse(readFileSync(join(PACKAGE_ROOT, "assets", "migrations", "managed-assets-v2.5.0.json"), "utf8"));
+	assert.equal(sha256(legacy), manifest.assets["agents/sdd-research.md"], "fixture reconstruction must match observed old package bytes");
+	const temporary = mkdtempSync(join(tmpdir(), "gentle-research-migration-"));
+	const previous = process.env.GENTLE_PI_AGENT_HOME;
+	try {
+		for (const edited of [false, true]) {
+			const agentHome = join(temporary, edited ? "edited" : "legacy");
+			process.env.GENTLE_PI_AGENT_HOME = agentHome;
+			mkdirSync(join(agentHome, "agents"), { recursive: true });
+			const target = join(agentHome, "agents", "sdd-research.md");
+			const routed = legacy.replace("name: sdd-research\n", "name: sdd-research\nmodel: custom/model\nthinking: high\n") + (edited ? "\nUser research restrictions.\n" : "");
+			writeFileSync(target, routed);
+			installSddAssets(temporary, true);
+			const actual = readFileSync(target, "utf8");
+			if (edited) assert.equal(actual, routed);
+			else {
+				assert.match(actual, /  - fetch_content/);
+				assert.match(actual, /model: custom\/model\nthinking: high/);
+				const ownership = JSON.parse(readFileSync(join(agentHome, "gentle-ai", "managed-assets.json"), "utf8"));
+				assert.equal(ownership.assets["agents/sdd-research.md"], sha256(actual));
+				installSddAssets(temporary, true);
+				assert.equal(readFileSync(target, "utf8"), actual, "subsequent refresh keeps adopted model routing");
+			}
+		}
+	} finally {
+		if (previous === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previous;
+		rmSync(temporary, { recursive: true, force: true });
 	}
 });
 

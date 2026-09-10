@@ -1,7 +1,8 @@
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { GAUGE_CELLS, gaugeTone, paintGauge, renderGauge, type GaugeTone } from "./shell-gauge.ts";
 import { renderUsageBar, type ProviderUsage } from "./shell-usage.ts";
 import { sanitizeTerminalText } from "./terminal-theme.ts";
+import { CARD_TONE, cardInnerWidth, renderCard } from "./shell-card.ts";
 
 export { gaugeTone, renderGauge, type GaugeTone };
 
@@ -114,6 +115,51 @@ function clipText(text: string, max: number): string {
 
 function joinSegments(segments: string[], theme: ShellBarTheme): string {
 	return segments.join(` ${theme.fg(ROLE.SEPARATOR, SHELL_BAR_SEPARATOR)} `);
+}
+
+// Sidebar groups use structured fields, never positional compact-bar segments
+// or inferred meanings from opaque extension status strings.
+export function renderShellSidebarBar(model: ShellBarModel, theme: ShellBarTheme, width: number): string[] {
+	const value = (text: string) => theme.fg(ROLE.VALUE, theme.bold(text));
+	const label = (text: string) => theme.fg(ROLE.LABEL, text);
+	const dirty = model.dirty ? theme.fg(ROLE.DIRTY, `±${model.dirty}`) : "";
+	const branch = model.branch ? `${label("Branch")} ${value(model.branch)}` : "";
+	const percent = model.contextPercent === null ? "?%" : `${Math.round(model.contextPercent)}%`;
+	const capacity = label(`${formatTokens(model.contextWindow)} tokens`);
+	const usage = model.usage ? renderUsageBar(model.usage, theme) : undefined;
+	const groups: Array<{ title: string; lines: string[] }> = [
+		{
+			title: "Project",
+			lines: [
+				value(model.cwd),
+				...((branch || dirty) ? [[branch, dirty].filter(Boolean).join(" ")] : []),
+				...(model.sessionName ? [`${label("Session")} ${value(model.sessionName)}`] : []),
+			],
+		},
+		{
+			title: "Model",
+			lines: [value(model.modelId), ...(model.effort ? [`${label("Effort")} ${theme.fg(ROLE.EFFORT, model.effort)}`] : [])],
+		},
+		{
+			title: "Context",
+			lines: [`${paintGauge(model.contextPercent, theme)} ${value(percent)}  ${capacity}`],
+		},
+		{
+			title: "Usage",
+			lines: [`${label("Cost")} ${value(formatCost(model.costTotal, model.subscription))}`, ...(usage ? [usage] : [])],
+		},
+		...(model.statuses.length ? [{ title: "Integrations", lines: model.statuses.map((status) => theme.fg(ROLE.STATUS, sanitizeStatus(status))) }] : []),
+	];
+	// Pre-wrap values before indenting so Unicode/ANSI continuation lines keep
+	// the same inset without consuming the card's right border.
+	const innerWidth = cardInnerWidth(width);
+	const inset = Math.min(1, innerWidth - 1);
+	const body = groups.flatMap((group, index) => [
+		...(index ? [""] : []),
+		label(group.title),
+		...group.lines.flatMap((line) => wrapTextWithAnsi(line, innerWidth - inset).map((part) => " ".repeat(inset) + part)),
+	]);
+	return renderCard({ title: "Status", body, tone: CARD_TONE.INFO }, theme, width, { expanded: true });
 }
 
 export function renderShellBar(model: ShellBarModel, theme: ShellBarTheme, width: number): string[] {

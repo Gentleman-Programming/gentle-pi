@@ -147,7 +147,6 @@ test("workflow settle command line binds mandatory arguments and routing invaria
 		"--token <token>",
 		"--request-id <id>",
 		"--outcome <failed|interrupted|passed>",
-		"--evidence-revision <sha256:...>",
 		"--diagnosis <text>",
 		"--harness-disposition <reused|invalidated>",
 		"--cleanup-evidence <text>",
@@ -155,7 +154,13 @@ test("workflow settle command line binds mandatory arguments and routing invaria
 	]) {
 		assert.ok(settle.includes(arg), `settle command is missing ${arg}; command: ${settle}`);
 	}
-	assert.match(section, /never `none`/);
+	assert.ok(settle.includes("[--evidence-revision <sha256:...>]"));
+	assert.match(section, /Every settle field except `evidence-revision` is required/);
+	assert.match(
+		section,
+		/For `failed` or `passed`, include `--evidence-revision` with the `sha256:\.\.\.` evidence hash\./,
+	);
+	assert.match(section, /For `interrupted`, omit the entire `--evidence-revision` flag\./);
 	assert.match(section, /proceed\|blocked\|complete/);
 	assert.match(section, /--successor-lineage/);
 	assert.match(section, /--remediates-evidence-revision/);

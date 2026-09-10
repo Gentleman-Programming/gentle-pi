@@ -260,7 +260,12 @@ test("runtime fails closed when the package-local binary is missing", async () =
 		() => resolveGentleAiBinary(packageRoot, "linux"),
 		(error: unknown) => error instanceof PackageLocalGentleAiBinaryMissingError
 			&& error.code === GENTLE_AI_BINARY_MISSING_CODE
-			&& error.message.includes("package-local-binary-missing"),
+			&& error.message.includes("package-local-binary-missing")
+			&& error.message.includes("If GENTLE_PI_SKIP_GENTLE_AI_INSTALL is set, remove or unset it before")
+			&& error.message.includes("installed gentle-pi package directory")
+			&& error.message.includes("GENTLE_PI_SKIP_GENTLE_AI_INSTALL")
+			&& error.message.includes("remove or unset it before")
+			&& error.message.includes("does not prove install lifecycle scripts were disabled"),
 	);
 });
 

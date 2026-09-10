@@ -1,7 +1,8 @@
 import type { Duplex, Readable, Writable } from "node:stream";
-import { formatModelRef, type AgentDefinition, type AgentMode, type ModelRef } from "./agents-config.ts";
+import { AGENT_MODE, formatModelRef, type AgentDefinition, type AgentMode, type ModelRef } from "./agents-config.ts";
+import { CHILD_QUERY_MAX_INFLIGHT, CHILD_QUERY_TIMEOUT_MS, parseChildFrame, validChildMessage, validChildQueryId } from "./agents-messaging.ts";
 import { ParentStandingReviewPermissionBroker } from "./review-session-standing-permission-ipc.ts";
-import { isFinished, normalizeRpcEvent, TASK_EVENT, TASK_STATUS, taskLabel, type AskRequest, type TaskRecord, type TaskStore } from "./agents-protocol.ts";
+import { isFinished, normalizeRpcEvent, TASK_EVENT, TASK_STATUS, taskLabel, type AskRequest, type ChildResponseObservation, type TaskRecord, type TaskStore } from "./agents-protocol.ts";
 
 // Gentle Agents runner. Every subagent is its own `pi --mode rpc` process:
 // the host never runs subagent work on the TUI thread. It writes JSON
@@ -15,15 +16,19 @@ export interface ChildLike {
 	stderr: Readable | null | undefined;
 	stdio?: Array<Duplex | null | undefined>;
 	kill(signal?: NodeJS.Signals): boolean;
+	send?(message: Record<string, unknown>, callback?: (error: Error | null) => void): boolean;
+	disconnect?(): void;
+	channel?: { unref?(): void };
 	on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
 	on(event: "error", listener: (error: Error) => void): unknown;
+	on(event: "spawn" | "message" | "disconnect", listener: (...args: unknown[]) => void): unknown;
 }
 
 export interface SpawnOptions {
 	cwd: string;
 	env: NodeJS.ProcessEnv;
 	detached?: boolean;
-	stdio?: Array<"pipe" | "ignore" | "inherit">;
+	stdio?: Array<"pipe" | "ignore" | "inherit" | "ipc">;
 }
 
 export type Spawn = (command: string, args: string[], options: SpawnOptions) => ChildLike;
@@ -57,10 +62,51 @@ export interface AskAnswer {
 	cancelled?: boolean;
 }
 
+export interface TaskQuery {
+	taskId: string;
+	requestId: string;
+}
+
+export const MAX_CHILD_RESPONSE_OBSERVATIONS = 128;
+
+/** Local producer snapshot only; never native workflow success or export authority.
+ * Scope excludes tools, compaction, hidden provider retries and history replay.
+ * Each message_end is retained separately; RPC supplies no stable dedupe key.
+ * Unsettled shutdown may lose in-flight responses even when droppedResponses is 0.
+ */
+export interface ChildObservationSnapshot {
+	readonly coverage: "final_assistant_messages_only";
+	readonly agentSettled: boolean;
+	readonly responses: readonly ChildResponseObservation[];
+	readonly droppedResponses: number;
+}
+interface ChildObservationBuffer {
+	agentSettled: boolean;
+	responses: ChildResponseObservation[];
+	droppedResponses: number;
+}
+
 export interface RunnerHooks {
 	askUser(taskId: string, request: AskRequest, raw: Record<string, unknown>): Promise<AskAnswer>;
-	onFinish?(task: TaskRecord): void;
+	/** Optional immutable snapshot, delivered once at existing finalization.
+	 * Undefined when collection was disabled or no child handle was created.
+	 * Parent must check task.status AND agentSettled; observations are not success.
+	 */
+	onFinish?(task: TaskRecord, observations?: ChildObservationSnapshot): void;
+	// Accepts a child notification only while the originating parent session is active.
+	onNotification?(task: TaskRecord, message: string): boolean | void;
+	onQuery?(task: TaskRecord, requestId: string, message: string): boolean | void;
+	// Parent-only observation of a paired successful filesystem tool, not prose.
+	onSuccessfulMutation?(task: TaskRecord, tool: { toolName: "write" | "edit"; toolCallId: string; path: string }): void | Promise<void>;
 }
+
+export interface SddChangeSelection {
+	changeName: string;
+	workspaceRoot: string;
+	phase: "apply" | "verify" | "sync" | "archive";
+}
+
+export const SDD_CHANGE_FLAG = "--gentle-sdd-change";
 
 export interface TaskRequest {
 	agent: AgentDefinition;
@@ -75,6 +121,25 @@ export interface TaskRequest {
 	sessionDir: string;
 	resumeSessionPath: string | undefined;
 	env: NodeJS.ProcessEnv;
+	// A launch-local SDD identity. It is never prompt text or shared state.
+	sddChange?: SddChangeSelection;
+	// Captures the originating session; invoked only after successful OS spawn.
+	onLaunch?: () => void;
+	/** Default off. Parent owns policy before opting into bounded local buffering,
+	 * and must recheck policy/catalog privacy before recording or forwarding.
+	 * This flag does not authorize telemetry export or perform policy subprocesses.
+	 */
+	collectResponseObservations?: boolean;
+	/** Optional parallel preparation after dequeue; never delays OS spawn.
+	 * Unready at the first observation checkpoint permanently drops collection. */
+	prepareResponseObservations?: () => Promise<boolean>;
+	/** Optional synchronous parent-local grant check; never perform I/O here.
+	 * Parent checks environment, known revocation and a monotonic expiry against
+	 * its fresh native policy grant. False/throw permanently discards this task's
+	 * buffer. Checked once ready, on RPC values, and finish; this is not a watcher.
+	 * Omission preserves the explicit opt-in producer API, not policy authority.
+	 */
+	canCollectResponseObservations?: () => boolean;
 	// This closure stays only in the parent process. Its presence creates an
 	// inherited fd, never an environment boolean or model-visible permission.
 	authorizeParentStandingReviewPermission?: (repositoryIdentity: string) => boolean;
@@ -90,9 +155,23 @@ interface Pending {
 	resolve(value: Record<string, unknown>): void;
 }
 
+interface PendingQuery {
+	cancel: () => void;
+	replying: boolean;
+}
+
+interface PendingReply {
+	resolve(value: boolean): void;
+}
+
 interface LiveTask {
 	child: ChildLike;
+	observations?: ChildObservationBuffer;
+	observationGuard?: () => boolean;
+	observationPreparation?: () => boolean;
 	pending: Map<string, Pending>;
+	queries: Map<string, PendingQuery>;
+	replies: Map<string, PendingReply>;
 	cancelStall: () => void;
 	cancelGrace: () => void;
 	processGroup: number | undefined;
@@ -102,21 +181,55 @@ interface LiveTask {
 	quarantined: boolean;
 	nextId: number;
 	permissionBroker?: ParentStandingReviewPermissionBroker;
+	ipcClosed: boolean;
+	acknowledgedIpcIds: Set<string>;
+	acknowledgedIpcOrder: string[];
+	mutationStarts: Map<string, { toolName: "write" | "edit"; toolCallId: string; path: string }>;
 }
 
 const CHILD_MARKER = "GENTLE_PI_AGENTS_CHILD";
+const IPC_MARKER = "GENTLE_PI_AGENTS_OWNED_IPC";
+const PARENT_NOTIFICATION_TOOL = "subagent_parent_message";
 const DEFAULT_TOOLS: readonly string[] = [];
 const TERMINATION_GRACE_MS = 250;
 const GROUP_CONFIRM_MS = 25;
 const GROUP_CONFIRM_DEADLINE_MS = 1_000;
+const QUERY_REJECTION_ERRORS = new Set([
+	"invalid child IPC frame",
+	"invalid child IPC correlation",
+	"unsupported child IPC kind",
+	"invalid child IPC message",
+	"task is not a live owned recipient",
+	"task parent cannot accept queries",
+	"task parent is not the active host session",
+	"duplicate query request",
+	"too many pending parent queries",
+	"parent query timed out",
+	"parent rejected query",
+]);
+const QUERY_REJECTION = Symbol("query rejection");
+
+function rejectQuery(error: string): never {
+	throw { [QUERY_REJECTION]: error };
+}
+
+function queryRejection(error: unknown): string {
+	if (error && typeof error === "object" && QUERY_REJECTION in error) {
+		const value = (error as { [QUERY_REJECTION]?: unknown })[QUERY_REJECTION];
+		if (typeof value === "string" && QUERY_REJECTION_ERRORS.has(value)) return value;
+	}
+	return "parent rejected query";
+}
+
 const hostProcess: ProcessControl = { platform: process.platform, kill: (pid, signal) => process.kill(pid, signal) };
 
 export function childArguments(request: TaskRequest): string[] {
 	const args = ["--mode", "rpc", "--session-dir", request.sessionDir];
+	if (request.sddChange) args.push(SDD_CHANGE_FLAG, JSON.stringify(request.sddChange));
 	if (request.resumeSessionPath) args.push("--session", request.resumeSessionPath);
 	if (request.model) args.push("--model", request.thinking ? `${formatModelRef(request.model)}:${request.thinking}` : formatModelRef(request.model));
 	else if (request.thinking) args.push("--thinking", request.thinking);
-	const tools = request.agent.tools.length > 0 ? request.agent.tools : DEFAULT_TOOLS;
+	const tools = request.agent.tools.length > 0 ? [...new Set([...request.agent.tools, PARENT_NOTIFICATION_TOOL])] : DEFAULT_TOOLS;
 	if (tools.length > 0) args.push("--tools", tools.join(","));
 	if (request.agent.instructions.length > 0) args.push("--append-system-prompt", request.agent.instructions);
 	return args;
@@ -174,6 +287,8 @@ export class AgentRunner {
 	private readonly queue: Array<{ task: TaskRecord; request: TaskRequest }> = [];
 	private readonly live = new Map<string, LiveTask>();
 	private readonly waiters = new Map<string, Array<(task: TaskRecord) => void>>();
+	private readonly queryWaiters = new Map<string, Array<(query: TaskQuery | undefined) => void>>();
+	private readonly firstQueries = new Map<string, TaskQuery>();
 	private counter = 0;
 
 	constructor(store: TaskStore, limits: RunnerLimits, deps: RunnerDeps, hooks: RunnerHooks) {
@@ -212,7 +327,12 @@ export class AgentRunner {
 			cost: 0,
 		};
 		this.store.add(task);
-		this.queue.push({ task, request });
+		// A caller can retain and mutate its request after dispatch. Preserve only
+		// the identity selected at construction for this child launch.
+		const launchRequest = request.sddChange === undefined
+			? request
+			: { ...request, sddChange: { ...request.sddChange } };
+		this.queue.push({ task, request: launchRequest });
 		queueMicrotask(() => this.pump());
 		return task;
 	}
@@ -228,6 +348,33 @@ export class AgentRunner {
 		});
 	}
 
+	waitForQuery(id: string): Promise<TaskQuery | undefined> {
+		const current = this.store.get(id);
+		if (!current || isFinished(current.status)) return Promise.resolve(undefined);
+		const first = this.firstQueries.get(id);
+		if (first) return Promise.resolve(first);
+		return new Promise((resolve) => {
+			const list = this.queryWaiters.get(id) ?? [];
+			list.push(resolve);
+			this.queryWaiters.set(id, list);
+		});
+	}
+
+	async reply(id: string, requestId: string, message: string, parentSessionId: string): Promise<boolean> {
+		const task = this.store.get(id);
+		const live = this.live.get(id);
+		if (!task || !live || live.terminal || task.parentSessionId !== parentSessionId || !validChildMessage(message)) return false;
+		const query = live.queries.get(requestId);
+		if (!query || query.replying) return false;
+		query.replying = true;
+		const accepted = await this.sendReply(live, requestId, { id: requestId, kind: "reply", message });
+		if (live.queries.get(requestId) === query) {
+			query.cancel();
+			live.queries.delete(requestId);
+		}
+		return accepted;
+	}
+
 	cancel(id: string): boolean {
 		const queued = this.queue.findIndex((entry) => entry.task.id === id);
 		if (queued >= 0) {
@@ -238,6 +385,13 @@ export class AgentRunner {
 		if (!this.live.has(id)) return false;
 		this.requestStop(id, TASK_STATUS.CANCELLED, "cancelled", true);
 		return true;
+	}
+
+	/** Parent-known revocation clears buffered metadata immediately, including
+	 * during an idle provider call. No task/store/status mutation. */
+	discardResponseObservations(id: string): void {
+		const live = this.live.get(id);
+		if (live) { live.observations = undefined; live.observationGuard = undefined; }
 	}
 
 	cancelAll(): number {
@@ -255,7 +409,9 @@ export class AgentRunner {
 	private pump(): void {
 		while (this.live.size < this.limits.maxConcurrency && this.queue.length > 0) {
 			const entry = this.queue.shift();
-			if (entry) this.launch(entry.task.id, entry.request);
+			if (!entry) continue;
+			const { task, request } = entry;
+			this.launch(task.id, request);
 		}
 	}
 
@@ -267,6 +423,7 @@ export class AgentRunner {
 		const env = {
 			...request.env,
 			[CHILD_MARKER]: "1",
+			[IPC_MARKER]: `${this.deps.now()}-${Math.random().toString(36).slice(2)}`,
 			...(hasParentPermissionChannel ? { GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" } : {}),
 		};
 		let child: ChildLike;
@@ -275,7 +432,7 @@ export class AgentRunner {
 				cwd: request.cwd,
 				env,
 				detached,
-				...(hasParentPermissionChannel ? { stdio: ["pipe", "pipe", "pipe", "pipe"] } : {}),
+				stdio: hasParentPermissionChannel ? ["pipe", "pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe", "ipc"],
 			});
 		} catch (error) {
 			this.store.update(id, { status: TASK_STATUS.RUNNING, startedAt: this.deps.now(), lastStep: "starting" });
@@ -283,7 +440,18 @@ export class AgentRunner {
 			return;
 		}
 		const processGroup = detached && typeof child.pid === "number" && child.pid > 0 ? child.pid : undefined;
-		const live: LiveTask = { child, pending: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0 };
+		const live: LiveTask = { child, mutationStarts: new Map(), pending: new Map(), queries: new Map(), replies: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0, ipcClosed: false, acknowledgedIpcIds: new Set(), acknowledgedIpcOrder: [] };
+		if (request.prepareResponseObservations) {
+			let ready = false;
+			live.observationPreparation = () => ready;
+			void Promise.resolve().then(() => this.live.get(id) === live && !live.terminal
+				? request.prepareResponseObservations!() : false).then(allowed => { ready = allowed === true; }).catch(() => {});
+		}
+		if (request.collectResponseObservations === true || request.prepareResponseObservations) {
+			live.observationGuard = request.canCollectResponseObservations;
+			live.observations = { agentSettled: false, responses: [], droppedResponses: 0 };
+			if (!request.prepareResponseObservations) this.checkObservationGrant(live);
+		}
 		this.live.set(id, live);
 		const permissionPipe = child.stdio?.[3];
 		if (hasParentPermissionChannel && permissionPipe !== undefined && permissionPipe !== null) {
@@ -293,7 +461,17 @@ export class AgentRunner {
 			);
 		}
 		this.store.update(id, { status: TASK_STATUS.RUNNING, startedAt: this.deps.now(), lastStep: "starting" });
+		child.channel?.unref?.();
 		child.on("error", (error) => this.childError(id, error));
+		child.on("message", (value) => this.receiveChildMessage(id, value));
+		child.on("disconnect", () => this.closeIpc(live));
+		let announced = false;
+		child.on("spawn", () => {
+			if (announced || this.live.get(id) !== live || live.terminal) return;
+			announced = true;
+			try { request.onLaunch?.(); }
+			catch (error) { this.requestStop(id, TASK_STATUS.FAILED, `could not register launched worktree: ${error instanceof Error ? error.message : String(error)}`); }
+		});
 		child.stdin.on("error", () => {});
 		this.armStall(id, live);
 		const lines = new JsonLines((value) => this.receive(id, request, value));
@@ -302,8 +480,16 @@ export class AgentRunner {
 		child.stderr?.on("data", () => {});
 		child.on("exit", (code) => this.exited(id, code));
 		void this.send(id, { type: "get_state" }).then((response) => {
-			const data = response.data as { sessionFile?: string } | undefined;
-			if (!live.terminal && this.live.get(id) === live && data?.sessionFile) this.store.update(id, { sessionPath: data.sessionFile });
+			const data = response.data as { sessionFile?: unknown; model?: { provider?: unknown; id?: unknown } | null; thinkingLevel?: unknown } | undefined;
+			if (response.success !== true || live.terminal || this.live.get(id) !== live || !data) return;
+			const resolved: Partial<TaskRecord> = {};
+			if (typeof data.sessionFile === "string" && data.sessionFile) resolved.sessionPath = data.sessionFile;
+			if (data.model === null) resolved.model = "default";
+			else if (typeof data.model?.provider === "string" && data.model.provider && typeof data.model.id === "string" && data.model.id) {
+				resolved.model = formatModelRef({ provider: data.model.provider, id: data.model.id });
+			}
+			if (typeof data.thinkingLevel === "string" && ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(data.thinkingLevel)) resolved.thinking = data.thinkingLevel;
+			this.store.update(id, resolved);
 		});
 		void this.send(id, { type: "prompt", message: promptText(request) }).then((response) => {
 			if (response.success === false) this.requestStop(id, TASK_STATUS.FAILED, String(response.error ?? "prompt rejected"));
@@ -326,6 +512,104 @@ export class AgentRunner {
 		});
 	}
 
+	private receiveChildMessage(id: string, value: unknown): void {
+		const live = this.live.get(id);
+		if (!live || live.ipcClosed) return;
+		const parsed = parseChildFrame(value);
+		if (!parsed.frame) {
+			if (parsed.id && validChildQueryId(parsed.id)) this.sendQueryError(live, parsed.id, parsed.error ?? "invalid child IPC frame");
+			else if (parsed.id) this.acknowledge(live, parsed.id, false, parsed.error ?? "invalid child IPC frame");
+			return;
+		}
+		const task = this.store.get(id);
+		if (!task || live.terminal || isFinished(task.status) || task.parentSessionId === "") {
+			if (parsed.frame.kind === "notification") this.acknowledge(live, parsed.frame.id, false, "task is not a live owned recipient");
+			else this.sendQueryError(live, parsed.frame.id, "task is not a live owned recipient");
+			return;
+		}
+		if (parsed.frame.kind === "notification") {
+			if (live.acknowledgedIpcIds.has(parsed.frame.id)) return;
+			try {
+				if (this.hooks.onNotification?.(task, parsed.frame.message) === false) this.acknowledge(live, parsed.frame.id, false, "task parent is not the active host session");
+				else this.acknowledge(live, parsed.frame.id, true);
+			} catch { this.acknowledge(live, parsed.frame.id, false, "parent rejected notification"); }
+			return;
+		}
+		let query: PendingQuery | undefined;
+		try {
+			if (live.queries.has(parsed.frame.id)) rejectQuery("duplicate query request");
+			if (live.queries.size >= CHILD_QUERY_MAX_INFLIGHT) rejectQuery("too many pending parent queries");
+			query = { replying: false, cancel: this.deps.schedule(() => this.expireQuery(live, parsed.frame!.id), CHILD_QUERY_TIMEOUT_MS) };
+			live.queries.set(parsed.frame.id, query);
+			if (!this.hooks.onQuery) rejectQuery("task parent cannot accept queries");
+			if (this.hooks.onQuery(task, parsed.frame.id, parsed.frame.message) === false) rejectQuery("task parent is not the active host session");
+			if (task.mode === AGENT_MODE.TASK && !this.firstQueries.has(id)) {
+				const first = { taskId: id, requestId: parsed.frame.id };
+				this.firstQueries.set(id, first);
+				for (const resolve of this.queryWaiters.get(id) ?? []) resolve(first);
+				this.queryWaiters.delete(id);
+			}
+		} catch (error) {
+			if (query && live.queries.get(parsed.frame.id) === query) {
+				query.cancel();
+				live.queries.delete(parsed.frame.id);
+			}
+			this.sendQueryError(live, parsed.frame.id, queryRejection(error));
+		}
+	}
+
+	private expireQuery(live: LiveTask, id: string): void {
+		const query = live.queries.get(id);
+		if (!query) return;
+		live.queries.delete(id);
+		if (query.replying) this.settleReply(live, id, false);
+		else this.sendQueryError(live, id, "parent query timed out");
+	}
+
+	private sendQueryError(live: LiveTask, id: string, error: string): void {
+		const safeError = QUERY_REJECTION_ERRORS.has(error) ? error : "parent rejected query";
+		try { live.child.send?.({ id, kind: "reply", error: safeError }, () => {}); }
+		catch { /* Child-owned IPC callback reports transport failure. */ }
+	}
+
+	private acknowledge(live: LiveTask, id: string, accepted: boolean, error?: string): void {
+		if (live.ipcClosed || live.acknowledgedIpcIds.has(id) || !live.child.send) return;
+		live.acknowledgedIpcIds.add(id);
+		live.acknowledgedIpcOrder.push(id);
+		if (live.acknowledgedIpcOrder.length > 64) live.acknowledgedIpcIds.delete(live.acknowledgedIpcOrder.shift()!);
+		try { live.child.send({ id, kind: "ack", accepted, ...(error ? { error } : {}) }, () => {}); }
+		catch { /* Child-owned IPC callback reports transport failure. */ }
+	}
+
+	private sendReply(live: LiveTask, id: string, frame: Record<string, unknown>): Promise<boolean> {
+		return new Promise((resolve) => {
+			live.replies.set(id, { resolve });
+			try {
+				if (!live.child.send) this.settleReply(live, id, false);
+				else live.child.send(frame, (error) => this.settleReply(live, id, !error));
+			} catch { this.settleReply(live, id, false); }
+		});
+	}
+
+	private settleReply(live: LiveTask, id: string, accepted: boolean): void {
+		const pending = live.replies.get(id);
+		if (!pending) return;
+		live.replies.delete(id);
+		pending.resolve(accepted);
+	}
+
+	private closeIpc(live: LiveTask): void {
+		if (live.ipcClosed) return;
+		live.ipcClosed = true;
+		for (const query of live.queries.values()) query.cancel();
+		live.queries.clear();
+		for (const pending of live.replies.values()) pending.resolve(false);
+		live.replies.clear();
+		live.child.channel?.unref?.();
+		try { live.child.disconnect?.(); }
+		catch { /* Channel may already be disconnected. */ }
+	}
+
 	private write(live: LiveTask, payload: Record<string, unknown>): void {
 		try {
 			live.child.stdin.write(`${JSON.stringify(payload)}\n`);
@@ -334,12 +618,26 @@ export class AgentRunner {
 		}
 	}
 
+	private checkObservationGrant(live: LiveTask): void {
+		if (live.observationPreparation) {
+			if (!live.observationPreparation()) live.observations = undefined;
+			live.observationPreparation = undefined; // One chance; late readiness cannot attach.
+		}
+		if (!live.observations || !live.observationGuard) return;
+		try {
+			if (live.observationGuard() === true) return;
+		} catch { /* Policy bookkeeping must not interrupt child execution. */ }
+		live.observations = undefined;
+		live.observationGuard = undefined;
+	}
+
 	private receive(id: string, request: TaskRequest, value: unknown): void {
 		const live = this.live.get(id);
 		if (!live || live.terminal || !value || typeof value !== "object") return;
 		const raw = value as Record<string, unknown>;
 		this.armStall(id, live);
 		if (raw.type === "response") {
+			if (!live.observationPreparation) this.checkObservationGrant(live);
 			const pending = typeof raw.id === "string" ? live.pending.get(raw.id) : undefined;
 			if (pending) {
 				live.pending.delete(raw.id as string);
@@ -347,10 +645,35 @@ export class AgentRunner {
 			}
 			return;
 		}
-		for (const event of normalizeRpcEvent(raw)) {
+		this.checkObservationGrant(live);
+		for (const event of normalizeRpcEvent(raw, { observeResponses: live.observations !== undefined })) {
+			if (event.type === TASK_EVENT.RESPONSE_OBSERVATION) {
+				const buffer = live.observations;
+				if (buffer) {
+					if (buffer.responses.length < MAX_CHILD_RESPONSE_OBSERVATIONS) buffer.responses.push(event.observation);
+					else buffer.droppedResponses = Math.min(Number.MAX_SAFE_INTEGER, buffer.droppedResponses + 1);
+				}
+				continue; // Separate from store persistence, UI totals and notifications.
+			}
 			this.store.apply(id, event, this.deps.now());
+			if (event.type === TASK_EVENT.TOOL_START && event.callId) {
+				live.mutationStarts.delete(event.callId);
+				if ((event.name === "write" || event.name === "edit") && typeof event.args.path === "string" && event.args.path.trim()) {
+					live.mutationStarts.set(event.callId, { toolName: event.name, toolCallId: event.callId, path: event.args.path });
+				}
+			}
+			if (event.type === TASK_EVENT.TOOL_END) {
+				const mutation = live.mutationStarts.get(event.callId);
+				live.mutationStarts.delete(event.callId);
+				const task = this.store.get(id);
+				if (mutation && task && raw.isError === false && !event.isError) {
+					try { void Promise.resolve(this.hooks.onSuccessfulMutation?.(task, mutation)).catch(() => {}); }
+					catch { /* Bookkeeping failure must not rewrite a successful tool or stop the child. */ }
+				}
+			}
 			if (event.type === TASK_EVENT.ASK) void this.answer(id, request, live, event.request, raw);
 			if (event.type === TASK_EVENT.AGENT_SETTLED) {
+				if (live.observations) live.observations.agentSettled = true;
 				const terminal = this.store.get(id);
 				if (terminal?.error) this.requestStop(id, TASK_STATUS.FAILED, terminal.error);
 				else if (terminal?.result) this.requestStop(id, TASK_STATUS.COMPLETED, null);
@@ -398,8 +721,10 @@ export class AgentRunner {
 		const live = this.live.get(id);
 		if (!live || live.terminal) return;
 		live.terminal = { status, error };
+		live.mutationStarts.clear();
 		live.cleanupDeadlineAt = this.deps.now() + GROUP_CONFIRM_DEADLINE_MS;
 		live.permissionBroker?.close();
+		this.closeIpc(live);
 		live.cancelStall();
 		if (abort) void this.send(id, { type: "abort" });
 		this.signal(live, "SIGTERM");
@@ -426,7 +751,7 @@ export class AgentRunner {
 			if (this.deps.now() >= (live.cleanupDeadlineAt ?? 0)) {
 				live.cancelGrace();
 				live.quarantined = true;
-				this.finish(id, TASK_STATUS.FAILED, `process cleanup unconfirmed after ${GROUP_CONFIRM_DEADLINE_MS}ms; capacity quarantined`);
+				this.finish(id, TASK_STATUS.FAILED, `process cleanup unconfirmed after ${GROUP_CONFIRM_DEADLINE_MS}ms; capacity quarantined`, live);
 				return;
 			}
 			live.cancelGrace = this.deps.schedule(() => this.confirmGroupExit(id, live), GROUP_CONFIRM_MS);
@@ -445,10 +770,11 @@ export class AgentRunner {
 			return;
 		}
 		live.permissionBroker?.close();
+		this.closeIpc(live);
 		live.cancelStall();
 		live.cancelGrace();
 		this.live.delete(id);
-		this.finish(id, TASK_STATUS.FAILED, `could not start pi: ${error.message}`);
+		this.finish(id, TASK_STATUS.FAILED, `could not start pi: ${error.message}`, live);
 	}
 
 	private exited(id: string, code: number | null): void {
@@ -464,6 +790,7 @@ export class AgentRunner {
 
 	private completeExit(id: string, live: LiveTask): void {
 		live.permissionBroker?.close();
+		this.closeIpc(live);
 		live.cancelStall();
 		live.cancelGrace();
 		this.live.delete(id);
@@ -473,17 +800,30 @@ export class AgentRunner {
 			return;
 		}
 		const terminal = live.terminal;
-		this.finish(id, terminal ? terminal.status : TASK_STATUS.FAILED, terminal ? terminal.error : `pi exited with code ${live.childExit ?? "unknown"} before agent_settled`);
+		this.finish(id, terminal ? terminal.status : TASK_STATUS.FAILED, terminal ? terminal.error : `pi exited with code ${live.childExit ?? "unknown"} before agent_settled`, live);
 	}
 
-	private finish(id: string, status: TaskRecord["status"], error: string | null): void {
+	private finish(id: string, status: TaskRecord["status"], error: string | null, live?: LiveTask): void {
 		const current = this.store.get(id);
 		if (!current || isFinished(current.status)) return;
 		const finished = this.store.update(id, { status, endedAt: this.deps.now(), error, lastStep: error ?? "done" });
 		if (finished) {
-			this.hooks.onFinish?.(finished);
+			if (live) this.checkObservationGrant(live);
+			const buffer = live?.observations;
+			const snapshot: ChildObservationSnapshot | undefined = buffer ? Object.freeze({
+				coverage: "final_assistant_messages_only", agentSettled: buffer.agentSettled,
+				responses: Object.freeze(buffer.responses.slice()), droppedResponses: buffer.droppedResponses,
+			}) : undefined;
+			if (live) {
+				live.observations = undefined; // Also release quarantined buffers.
+				live.observationGuard = undefined;
+			}
+			this.hooks.onFinish?.(finished, snapshot);
 			for (const resolve of this.waiters.get(id) ?? []) resolve(finished);
 			this.waiters.delete(id);
+			for (const resolve of this.queryWaiters.get(id) ?? []) resolve(undefined);
+			this.queryWaiters.delete(id);
+			this.firstQueries.delete(id);
 		}
 		queueMicrotask(() => this.pump());
 	}

@@ -191,7 +191,7 @@ test("CodeGraph tool rejects incomplete or oversized query requests before runni
 });
 
 test("CodeGraph tool registration exposes a single constrained custom tool", () => {
-	const tools: Array<{ name: string; parameters: Record<string, unknown> }> = [];
+	const tools: Array<{ name: string; renderShell?: string; parameters: Record<string, unknown> }> = [];
 	const pi = {
 		registerTool(tool: { name: string; parameters: Record<string, unknown> }) {
 			tools.push(tool);
@@ -202,6 +202,7 @@ test("CodeGraph tool registration exposes a single constrained custom tool", () 
 
 	assert.equal(tools.length, 1);
 	assert.equal(tools[0]?.name, "codegraph");
+	assert.equal(tools[0]?.renderShell, "self", "CodeGraph must not inherit Pi's painted Box");
 	assert.deepEqual(tools[0]?.parameters, {
 		type: "object",
 		additionalProperties: false,

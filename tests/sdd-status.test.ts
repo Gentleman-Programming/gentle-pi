@@ -40,6 +40,55 @@ function seedChange(cwd: string, change = "add-auth"): string {
 	return root;
 }
 
+test("planning recommendations are executable tokens with separate diagnostics", async () => {
+	const cwd = await workspace();
+	const root = join(cwd, "openspec", "changes", "planning");
+	mkdirSync(root, { recursive: true });
+	for (const [route, diagnostic, artifact] of [
+		["sdd-propose", "proposal.md is missing.", "proposal.md"],
+		["sdd-spec", "domain specs are missing or partial.", "specs/auth/spec.md"],
+		["sdd-design", "design.md is missing.", "design.md"],
+		["sdd-tasks", "tasks.md is missing.", "tasks.md"],
+	] as const) {
+		const status = resolveSddStatus({ cwd });
+		assert.equal(status.nextRecommended, route);
+		assert.ok(status.blockedReasons.includes(diagnostic));
+		assert.equal(status.dependencies.apply, "blocked");
+		write(join(root, artifact), "# Artifact\n- [ ] Implement\n");
+	}
+	assert.equal(resolveSddStatus({ cwd }).nextRecommended, "sdd-apply");
+});
+
+test("partial planning artifacts route to their repair phase", async () => {
+	for (const [artifact, route] of [
+		["proposal.md", "sdd-propose"],
+		["specs/auth/spec.md", "sdd-spec"],
+		["design.md", "sdd-design"],
+		["tasks.md", "sdd-tasks"],
+	] as const) {
+		const cwd = await workspace();
+		const root = seedChange(cwd);
+		write(join(root, artifact), " \n");
+		const status = resolveSddStatus({ cwd });
+		assert.equal(status.nextRecommended, route);
+		assert.ok(status.blockedReasons.length > 0);
+		assert.equal(status.applyState, "blocked");
+		assert.match(renderSddDispatcherMarkdown(status), new RegExp(`nextPhase: ${route}`));
+	}
+});
+
+test("unresolved change selection returns blocked rather than diagnostic prose", async () => {
+	const cwd = await workspace();
+	mkdirSync(join(cwd, "openspec", "changes"), { recursive: true });
+	assert.equal(resolveSddStatus({ cwd }).nextRecommended, "blocked");
+	assert.equal(resolveSddStatus({ cwd, changeName: "absent" }).nextRecommended, "blocked");
+	seedChange(cwd, "first");
+	seedChange(cwd, "second");
+	const ambiguous = resolveSddStatus({ cwd });
+	assert.equal(ambiguous.nextRecommended, "blocked");
+	assert.match(ambiguous.blockedReasons[0], /ambiguous/);
+});
+
 test("listActiveOpenSpecChanges excludes archive and sorts active changes", async () => {
 	const cwd = await workspace();
 	mkdirSync(join(cwd, "openspec", "changes", "b-change"), { recursive: true });
@@ -229,6 +278,7 @@ test("resolveSddStatus blocks apply when tasks has no checkboxes", async () => {
 	assert.equal(status.applyState, "blocked");
 	assert.equal(status.dependencies.apply, "blocked");
 	assert.match(status.blockedReasons.join("\n"), /no implementation task checkboxes/);
+	assert.equal(status.nextRecommended, "sdd-tasks");
 });
 
 test("resolveSddStatus marks legacy flat specs partial and blocks sync", async () => {
@@ -242,6 +292,7 @@ test("resolveSddStatus marks legacy flat specs partial and blocks sync", async (
 	const status = resolveSddStatus({ cwd, changeName: "legacy" });
 
 	assert.equal(status.artifacts.specs, "partial");
+	assert.equal(status.nextRecommended, "sdd-spec");
 	assert.match(status.blockedReasons.join("\n"), /Legacy flat spec/);
 	assert.equal(status.dependencies.sync, "blocked");
 });

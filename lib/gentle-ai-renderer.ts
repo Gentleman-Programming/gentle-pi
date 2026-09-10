@@ -7,7 +7,9 @@ import { sanitizeTerminalText } from "./terminal-theme.ts";
 // gentle_review tool draws the same card as the other Gentle notices. The
 // call component owns the top rule; the result component closes the frame.
 
-export type GentleAiRenderTheme = CardTheme;
+export interface GentleAiRenderTheme extends CardTheme {
+	bg?(color: string, text: string): string;
+}
 
 export interface GentleAiRenderState {
 	lifecycleComponent?: boolean;
@@ -67,12 +69,12 @@ export function getGentleAiRenderState(state: unknown): GentleAiRenderState | un
 // result is in, the result card closes it instead.
 export class GentleAiCallCard {
 	private card: Card = { title: CARD_TITLE, body: [], tone: CARD_TONE.WARNING };
-	private theme: CardTheme = passthroughTheme;
+	private theme: GentleAiRenderTheme = passthroughTheme;
 	private detail: string | undefined;
 	private hint: string | undefined;
 	private open = true;
 
-	update(status: LifecycleStatus, operationPath: string, theme: CardTheme, detail?: string, hint?: string): void {
+	update(status: LifecycleStatus, operationPath: string, theme: GentleAiRenderTheme, detail?: string, hint?: string): void {
 		this.card = { title: CARD_TITLE, subtitle: `${status} · ${operationPath}`, body: [], tone: STATUS_TONE[status], glyph: CARD_GLYPH };
 		this.theme = theme;
 		this.detail = detail;
@@ -98,10 +100,10 @@ export class GentleAiResultCard {
 	private readonly text: string;
 	private readonly expanded: boolean;
 	private readonly tone: CardTone;
-	private readonly theme: CardTheme;
+	private readonly theme: GentleAiRenderTheme;
 	private readonly partial: boolean;
 
-	constructor(text: string, expanded: boolean, tone: CardTone, theme: CardTheme, partial = false) {
+	constructor(text: string, expanded: boolean, tone: CardTone, theme: GentleAiRenderTheme, partial = false) {
 		this.text = text;
 		this.expanded = expanded;
 		this.tone = tone;
@@ -139,7 +141,7 @@ export interface GentleAiResultRenderOptions {
 export function renderGentleAiResult(
 	result: AgentToolResult<unknown>,
 	options: GentleAiResultRenderOptions,
-	theme: CardTheme = passthroughTheme,
+	theme: GentleAiRenderTheme = passthroughTheme,
 	context?: GentleAiRenderContext,
 ): GentleAiResultCard {
 	const textItems = result.content.flatMap((content) => (content.type === "text" ? [sanitizeTerminalText(content.text)] : []));

@@ -10,6 +10,7 @@ import { stripAnsi } from "../lib/terminal-theme.ts";
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 
 interface Registered {
+	renderShell?: string;
 	execute(toolCallId: string, params: unknown, signal: undefined, onUpdate: undefined, ctx: ExtensionContext): Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }>;
 	renderCall(args: unknown, theme: unknown): { render(width: number): string[] };
 	renderResult(result: unknown, options: { expanded: boolean }, theme: unknown): { render(width: number): string[] };
@@ -79,6 +80,12 @@ test("todoEnabled and todoCollapseKey read their environment flags", () => {
 	assert.equal(off.tools.size, 0);
 });
 
+test("todo registration owns its transparent transcript shell", () => {
+	const { pi, tools } = fakePi();
+	gentleTodo(pi, {});
+	assert.equal(tools.get("todo")?.renderShell, "self");
+});
+
 test("the todo tool writes the list, shows the card after the call, and carries the snapshot in details", async () => {
 	const { pi, tools, fire } = fakePi();
 	gentleTodo(pi, {});
@@ -92,7 +99,7 @@ test("the todo tool writes the list, shows the card after the call, and carries 
 	assert.equal((result.details.gentleTodo as { tasks: unknown[] }).tasks.length, 2);
 	await fire("tool_execution_end", ctx, { toolName: "todo" });
 	const lines = widget()!;
-	assert.match(lines[0], /^╭─ ❀ Todos · 0 of 2 ─+╮$/);
+	assert.match(lines[0], /^╭─ ❀ Todos · 0 of 2 ─+ ctrl\+shift\+t collapse ╮$/);
 	assert.match(lines[1], /◐ Write the parser · parsing/);
 	assert.match(lines[2], /○ Add tests/);
 	assert.equal(lines[lines.length - 1], "", "a blank line keeps the card off the prompt");
@@ -120,7 +127,8 @@ test("every turn carries the open tasks in the system prompt and the card goes s
 
 	const stale = (await fire("before_agent_start", ctx, { systemPrompt: "base" })) as { systemPrompt: string };
 	assert.match(stale.systemPrompt, /stale: 2 turns without an update/);
-	assert.match(widget()![0], /stale · 2 turns/);
+	assert.match(widget()![0], /ctrl\+shift\+t collapse/);
+	assert.match(widget()![1], /stale · 2 turns/);
 
 	await tools.get("todo")!.execute("c2", { action: "update", id: 1, status: "in_progress", note: "on it" }, undefined, undefined, ctx);
 	await fire("tool_execution_end", ctx, { toolName: "todo" });

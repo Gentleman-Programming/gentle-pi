@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -12,8 +12,10 @@ import type {
 	Theme,
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
-import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
-import type { NativeReviewCli } from "../lib/native-review-cli.ts";
+import { __testing, applyModelConfig, createGentleAiExtension } from "../extensions/gentle-ai.ts";
+import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError, type NativeReviewCli } from "../lib/native-review-cli.ts";
+import { CandidateViewError, type CandidateViewRegistry } from "../lib/review-candidate-view.ts";
+import { installPackageAssets } from "../lib/sdd-preflight.ts";
 import type { ReviewCollectInputV3, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { cardBody, cardHint, cardTitle, cardTone } from "./gentle-card-text.ts";
@@ -60,6 +62,31 @@ function lifecycleContext(overrides: Record<string, unknown> = {}): Record<strin
 		...overrides,
 	};
 }
+
+test("missing package-local binaries give a direct recovery without attributing the cause to lifecycle scripts", async () => {
+	const result = await __testing.executeReviewControllerOperation(
+		{ operation: "inspect" },
+		process.cwd(),
+		{
+			targetStatus: async () => {
+				throw new NativeReviewCliError(
+					NATIVE_REVIEW_ERROR_CODE.PACKAGE_BINARY_MISSING,
+					"review/status",
+					false,
+					false,
+					"package binary missing",
+				);
+			},
+		} as unknown as NativeReviewCli,
+	);
+
+	assert.equal(result.outcome, "native-status-package-binary-missing");
+	assert.equal(result.recovery_command, "node scripts/install-gentle-ai.mjs");
+	assert.match(String(result.next_action), /installed gentle-pi package directory/);
+	assert.match(String(result.next_action), /GENTLE_PI_SKIP_GENTLE_AI_INSTALL/);
+	assert.match(String(result.next_action), /remove or unset it before/);
+	assert.match(String(result.reason), /does not prove install lifecycle scripts were disabled/);
+});
 
 test("registered Gentle Review tools render reusable rose lifecycle call rows", () => {
 	const tools = registeredGentleTools();
@@ -268,6 +295,82 @@ test("agent discovery skips skills directories", async (t) => {
 	);
 });
 
+test("managed routing timeout leaves its profile, agent, and manifest unchanged", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-managed-routing-timeout-"));
+	const agentHome = join(root, "agent-home");
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	t.after(() => {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	process.env.GENTLE_PI_AGENT_HOME = agentHome;
+	installPackageAssets(root, false, ["sdd"]);
+	const agentPath = join(agentHome, "agents", "sdd-apply.md");
+	const manifestPath = join(agentHome, "gentle-ai", "managed-assets.json");
+	const profilePath = join(agentHome, "subagents.json");
+	const profileBefore = "{\n  \"unrelated\": true\n}\n";
+	writeFileSync(profilePath, profileBefore);
+	const agentBefore = readFileSync(agentPath, "utf8");
+	const manifestBefore = readFileSync(manifestPath, "utf8");
+	writeFileSync(
+		join(agentHome, "gentle-ai", "managed-assets.lock"),
+		JSON.stringify({ schemaVersion: 1, token: "foreign", pid: process.pid, createdAtMs: Date.now() }),
+	);
+
+	assert.throws(
+		() => applyModelConfig(root, { "sdd-apply": { model: "test/managed", thinking: "high" } }),
+		/Timed out acquiring managed-assets lock file/i,
+	);
+	assert.equal(readFileSync(profilePath, "utf8"), profileBefore);
+	assert.equal(readFileSync(agentPath, "utf8"), agentBefore);
+	assert.equal(readFileSync(manifestPath, "utf8"), manifestBefore);
+});
+
+test("a later alias keeps managed-root precedence and manifest ownership", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-agent-root-alias-"));
+	const agentHome = join(root, "agent-home");
+	const home = join(root, "home");
+	const cwd = join(root, "project");
+	const managed = join(agentHome, "agents");
+	const intervening = join(agentHome, "subagents");
+	const alias = join(home, ".agents");
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const previousHome = process.env.HOME;
+	const previousUserProfile = process.env.USERPROFILE;
+	t.after(() => {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousUserProfile;
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	process.env.GENTLE_PI_AGENT_HOME = agentHome;
+	process.env.HOME = home;
+	process.env.USERPROFILE = home;
+	installPackageAssets(cwd, false, ["sdd"]);
+	writeMarkdown(join(intervening, "sdd-apply.md"), "---\nname: sdd-apply\n---\nintervening override\n");
+	mkdirSync(home, { recursive: true });
+	try {
+		symlinkSync(managed, alias, process.platform === "win32" ? "junction" : "dir");
+	} catch (error) {
+		t.skip(`directory aliases unavailable: ${error instanceof Error ? error.message : String(error)}`);
+		return;
+	}
+
+	const selected = __testing.listDiscoverableAgents(cwd).find((agent) => agent.name === "sdd-apply");
+	assert.equal(selected?.filePath, join(managed, "sdd-apply.md"));
+	applyModelConfig(cwd, { "sdd-apply": { model: "test/managed", thinking: "high" } });
+	const manifest = JSON.parse(readFileSync(join(agentHome, "gentle-ai", "managed-assets.json"), "utf8")) as { assets: Record<string, string> };
+	const routed = readFileSync(join(managed, "sdd-apply.md"), "utf8");
+	assert.match(routed, /^model: test\/managed$/m);
+	assert.equal(manifest.assets["agents/sdd-apply.md"], createHash("sha256").update(routed).digest("hex"));
+});
+
 test("runtime guidance keeps review policy out of the static orchestrator", () => {
 	const staticReferences = ["README.md", "skills/gentle-ai/SKILL.md"];
 	const forbiddenGenericRoutes = [
@@ -375,6 +478,83 @@ test("ordinary native capture exposes a registered schema and STATUS binding cop
 	}, process.cwd(), native);
 	assert.equal(captured.status, "captured");
 	assert.equal(launches, 1);
+});
+
+test("ordinary START reports candidate-owner preparation failure as pre-native no mutation", async () => {
+	let nativeStarts = 0;
+	const target = {
+		contract: "gentle-ai.review-integration/v2",
+		applicability: "unrelated",
+		action: "start",
+		replayability: "not_replayable",
+		targetIdentity: "a".repeat(64),
+		projection: {
+			schema: "gentle-ai.review-candidate-projection/v1",
+			kind: "current-changes",
+			projection: "workspace",
+			baseTree: "b".repeat(40),
+			initialReviewTree: "b".repeat(40),
+			currentCandidateTree: "b".repeat(40),
+			pathsDigest: "a".repeat(64),
+			paths: [],
+			intendedUntracked: [],
+			intendedUntrackedProof: "a".repeat(64),
+			initialSnapshotIdentity: "a".repeat(64),
+			currentSnapshotIdentity: "a".repeat(64),
+		},
+		candidates: [],
+		raw: { schema: "gentle-ai.review-integration.status/v5" },
+	} as unknown as ReviewStatusV3;
+	const native = {
+		targetStatus: async () => target,
+		start: async () => { nativeStarts += 1; throw new Error("native START must not run"); },
+	} as unknown as NativeReviewCli;
+	const candidateViews = {
+		createOrReuse: () => { throw new CandidateViewError("candidate view owner preparation failed", "candidate-owner-preparation-failed"); },
+	} as unknown as CandidateViewRegistry;
+	const result = await __testing.executeReviewControllerOperation(
+		{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+		process.cwd(),
+		native,
+		undefined,
+		candidateViews,
+	);
+	assert.equal(nativeStarts, 0);
+	assert.equal(result.outcome, "native-operation-failed");
+	assert.equal(result.mutation_outcome, "none");
+	assert.deepEqual(result.diagnostics, {
+		code: "candidate-owner-preparation-failed",
+		message: "candidate view rejected before native START",
+	});
+
+	let statusCalls = 0;
+	const afterNative = await __testing.executeReviewControllerOperation(
+		{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+		process.cwd(),
+		{
+			targetStatus: async () => { statusCalls += 1; return target; },
+			start: async () => {
+				nativeStarts += 1;
+				throw new CandidateViewError("post-native candidate verification failed", "candidate-view-timeout", {
+					phase: "candidate-view",
+					category: "timeout",
+					git_subcommand: "worktree",
+					timeout_ms: 10_000,
+					max_buffer_bytes: 64 * 1024 * 1024,
+					message: "candidate-view Git command worktree timed out after 10000ms; inspect the candidate state before any new START",
+				});
+			},
+		} as unknown as NativeReviewCli,
+		undefined,
+		null,
+	);
+	assert.equal(nativeStarts, 1);
+	assert.equal(statusCalls, 2, "a post-native diagnostic must reconcile STATUS");
+	assert.equal(afterNative.mutation_outcome, "unknown");
+	assert.deepEqual(afterNative.diagnostics, {
+		code: "candidate-view-timeout",
+		message: "post-native candidate verification failed",
+	});
 });
 
 test("agent model discovery prioritizes SDD and Judgment Day agents", (t) => {

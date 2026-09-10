@@ -1,4 +1,4 @@
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { stripAnsi } from "./terminal-theme.ts";
 
 // Gentle Shell prompt frame. pi's editor renders a top rule, padded content
@@ -33,8 +33,6 @@ export interface PromptFrameOptions {
 	borderColor: (text: string) => string;
 	fg: (color: string, text: string) => string;
 	bold?: (text: string) => string;
-	/** Paints a finished line, e.g. with the panel background. */
-	paint?: (line: string) => string;
 }
 
 // A terminal cell cannot grow, so the petal earns presence with weight and
@@ -78,28 +76,33 @@ function topRule(width: number, options: PromptFrameOptions, indicator: string |
 	const labelText = label ? ` ${options.fg(LABEL_ROLE, label)}` : "";
 	const labelWidth = label ? label.length + 1 : 0;
 	const fill = width - 3 - visibleWidth(glyph) - labelWidth - 1 - 1;
+	if (fill < 0) return options.borderColor(`╭${rule(width - 2)}╮`);
 	return options.borderColor("╭─ ") + petal + labelText + options.borderColor(` ${rule(fill)}╮`);
 }
 
 function bottomRule(width: number, options: PromptFrameOptions, indicator: string | undefined): string {
 	if (!indicator) return options.borderColor(`╰${rule(width - 2)}╯`);
 	const fill = width - 3 - indicator.length - 1 - 1;
+	if (fill < 0) return options.borderColor(`╰${rule(width - 2)}╯`);
 	return options.borderColor("╰─ ") + options.fg(LABEL_ROLE, indicator) + options.borderColor(` ${rule(fill)}╯`);
 }
 
 function sideRules(line: string, innerWidth: number, options: PromptFrameOptions): string {
-	const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(line)));
-	return options.borderColor("│") + line + padding + options.borderColor("│");
+	const clipped = innerWidth === 0 ? "" : truncateToWidth(line, innerWidth, "");
+	const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(clipped)));
+	const content = clipped + padding;
+	return options.borderColor("│") + content + options.borderColor("│");
 }
 
 export function framePromptLines(lines: string[], width: number, options: PromptFrameOptions): string[] {
-	if (lines.length < 2) return lines;
+	width = Math.max(0, Math.floor(width));
+	if (lines.length < 2) return lines.map((line) => truncateToWidth(line, width, ""));
+	if (width < 2) return lines.map((_line, index) => width === 0 ? "" : options.borderColor(index === 0 ? "╭" : index === lines.length - 1 ? "╰" : "│"));
 	const innerWidth = width - 2;
 	const top = lines[0];
 	const bottom = lines[lines.length - 1];
 	const content = lines.slice(1, -1).map((line) => sideRules(line, innerWidth, options));
-	const paint = options.paint ?? ((line: string) => line);
-	return [topRule(width, options, scrollIndicator(top)), ...content, bottomRule(width, options, scrollIndicator(bottom))].map(paint);
+	return [topRule(width, options, scrollIndicator(top)), ...content, bottomRule(width, options, scrollIndicator(bottom))];
 }
 
 export function withPromptHint(line: string, hint: string, fg: PromptFrameOptions["fg"]): string {
@@ -109,11 +112,4 @@ export function withPromptHint(line: string, hint: string, fg: PromptFrameOption
 	const trailing = line.slice(afterCursor);
 	if (trailing.trim() !== "" || trailing.length < hint.length + 1) return line;
 	return `${line.slice(0, afterCursor)} ${fg(HINT_ROLE, hint)}${" ".repeat(trailing.length - hint.length - 1)}`;
-}
-
-// Paints a line with a background that survives the resets pi's editor
-// emits around the cursor, so the panel color runs edge to edge.
-export function panelPainter(bgAnsi: string): (line: string) => string {
-	const RESET = "\x1b[0m";
-	return (line) => `${bgAnsi}${line.split(RESET).join(`${RESET}${bgAnsi}`)}\x1b[49m`;
 }

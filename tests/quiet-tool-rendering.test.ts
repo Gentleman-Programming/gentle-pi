@@ -173,6 +173,7 @@ test("quiet tool rendering registers noisy built-in tools", () => {
 		for (const toolName of ["read", "bash", "grep", "find", "ls", "edit", "write"]) {
 			const tool = tools.get(toolName);
 			assert.ok(tool, `missing quiet renderer for ${toolName}`);
+			assert.equal(tool.renderShell, "self", `${toolName} must opt out of Pi's painted Box`);
 			assert.equal(typeof tool.execute, "function", `${toolName} must delegate execution`);
 			assert.ok(tool.parameters, `${toolName} must preserve built-in parameters`);
 		}

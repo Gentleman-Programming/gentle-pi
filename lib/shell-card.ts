@@ -29,8 +29,6 @@ export interface CardRenderOptions {
 	expanded: boolean;
 	/** Right-aligned hint in the top rule, e.g. the expand key. May carry ANSI. */
 	hint?: string;
-	/** Paints a finished line, e.g. with the panel background. */
-	paint?: (line: string) => string;
 }
 
 export const CARD_GLYPH = "✿";
@@ -119,7 +117,6 @@ export function cardInnerWidth(width: number): number {
 
 export function renderCard(card: Card, theme: CardTheme, width: number, options: CardRenderOptions): string[] {
 	const innerWidth = Math.max(1, width - FRAME_COLUMNS);
-	const paint = options.paint ?? ((line: string) => line);
 	const top = cardTop(card, theme, width, options.hint);
 	const bottom = cardBottom(card.tone, theme, width);
 	const lines = bodyLines(card, innerWidth);
@@ -132,5 +129,5 @@ export function renderCard(card: Card, theme: CardTheme, width: number, options:
 		}
 		return lines.map((line) => cardLine(line === "" ? "" : theme.fg(BODY_ROLE, line), card.tone, theme, width));
 	})();
-	return [top, ...body, bottom].map(paint);
+	return [top, ...body, bottom];
 }
