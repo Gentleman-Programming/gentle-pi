@@ -15,6 +15,8 @@ import { NativePointerScope } from "../lib/native-pointer-region.ts";
 import { PresenceCursor, PresencePublisher, listPresence, readActivity } from "../lib/orchestrator-presence.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
+import { AgentRunner } from "../lib/agents-runner.ts";
+import { CHILD_METRICS_EVENT } from "../lib/runtime-metrics-children.ts";
 
 // Gentle Agents extension: the subagent_* tools drive isolated pi children,
 // the card above the editor follows the store, and dialogs reach the host UI.
@@ -66,9 +68,16 @@ function fakePi() {
 	const renderers = new Map<string, (message: unknown, options: { expanded: boolean }, theme: unknown) => { render(width: number): string[] }>();
 	const entries: Array<{ type: string; customType: string; data: unknown }> = [];
 	const events: Array<{ name: string; data: unknown }> = [];
+	const listeners = new Map<string, Set<(data: unknown) => void>>();
 	const pi = {
 		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }),
-		events: { emit: (name: string, data: unknown) => events.push({ name, data }) },
+		events: {
+			emit: (name: string, data: unknown) => { events.push({ name, data }); for (const listener of listeners.get(name) ?? []) listener(data); },
+			on: (name: string, listener: (data: unknown) => void) => {
+				const set = listeners.get(name) ?? new Set(); listeners.set(name, set); set.add(listener);
+				return () => { set.delete(listener); };
+			},
+		},
 		sendMessage: (message: Record<string, unknown>, options: Record<string, unknown>) => sent.push({ message, options }),
 		registerMessageRenderer: (type: string, renderer: (message: unknown, options: { expanded: boolean }, theme: unknown) => { render(width: number): string[] }) => renderers.set(type, renderer),
 		on: (event: string, handler: Handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
@@ -79,7 +88,7 @@ function fakePi() {
 	const fire = async (event: string, ctx: ExtensionContext, payload: unknown = {}) => {
 		for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
 	};
-	return { pi, tools, shortcuts, commands, fire, sent, renderers, entries, events };
+	return { pi, tools, shortcuts, commands, fire, sent, renderers, entries, events, listeners };
 }
 
 function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (title: string, message: string) => Promise<boolean> = async () => true, inputResult: (title: string, placeholder: string | undefined) => Promise<string | undefined> = async () => undefined, overlayTui: { terminal: { rows: number }; requestRender(): void } = { terminal: { rows: 30 }, requestRender() {} }) {
@@ -138,6 +147,7 @@ function deps(): { deps: Partial<AgentsDeps>; children: FakeChild[]; spawned: st
 		children,
 		spawned,
 		deps: {
+			runtimeMetricsPolicy: { resolve: () => { throw new Error("Policy not configured in fixture"); } },
 			spawn: (command, args) => {
 				spawned.push([command, ...args]);
 				const child = fakeChild();
@@ -332,6 +342,117 @@ test("child parent-message tooling admits notifications and the active parent pr
 	assert.deepEqual(runtime.children[0].sent, [{ id: "n1", kind: "ack", accepted: true }, { id: "n2", kind: "ack", accepted: false, error: "task parent is not the active host session" }]);
 	await parent.fire("session_shutdown", ctx);
 });
+for (const boundary of ["allowed", "env", "session", "replacement", "bus-throws", "no-spawn", "long-running"] as const) {
+	test(`local child composition through real extensions and RPC runner: ${boundary}`, async (t) => {
+		const discarded: number[] = [];
+		const discard = AgentRunner.prototype.discardResponseObservations;
+		t.mock.method(AgentRunner.prototype, "discardResponseObservations", function (this: AgentRunner, id: string) {
+			const live = Reflect.get(this, "live").get(id);
+			discarded.push(live?.observations?.responses.length ?? 0);
+			discard.call(this, id);
+			assert.equal(live?.observations, undefined, "buffer gone synchronously, without another RPC");
+		});
+		const h = fakePi();
+		const runtime = deps();
+		const context = fakeContext();
+		const spawn = runtime.deps.spawn!;
+		runtime.deps.spawn = (...args) => {
+			const child = spawn(...args);
+			const on = child.on.bind(child);
+			child.on = ((event: string, listener: (...args: any[]) => void) => {
+				if (event === "spawn" && boundary !== "no-spawn") queueMicrotask(() => listener());
+				return on(event as any, listener);
+			}) as typeof child.on;
+			return child;
+		};
+		let clock = 1;
+		const renewalTimers = new Map<number, () => void>();
+		const metricsSchedule = (fn: () => void, ms: number) => {
+			const at = clock + ms; renewalTimers.set(at, fn); return () => { renewalTimers.delete(at); };
+		};
+		let calls = 0;
+		const policy = { resolve: () => "fixture", exec: async () => {
+			calls++;
+			return { stdout: JSON.stringify({ schema: "gentle-ai.telemetry-policy/v1", operation: "policy", enabled: true,
+				source: "state", reason: "enabled" }), stderr: "", exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false };
+		} };
+		const env: NodeJS.ProcessEnv = {};
+		const profile = join(root, `metrics-${boundary}`);
+		mkdirSync(join(profile, "agents"), { recursive: true });
+		writeFileSync(join(profile, "agents", "gentle-ai-worker.md"), readFileSync(new URL("../assets/agents/gentle-ai-worker.md", import.meta.url)));
+		writeFileSync(join(profile, "subagents.json"), JSON.stringify({ model_profiles: { "gentle-ai-worker": { model: "openai/gpt-4o", effort: "high" } } }));
+		gentleAgents(h.pi, env, { ...runtime.deps, env, agentHome: profile, runtimeMetricsPolicy: policy, metricsNow: () => clock, metricsSchedule });
+		const listenerCounts = () => [...h.listeners].map(([name, set]) => [name, set.size]);
+		const initialListeners = listenerCounts();
+		await h.fire("session_start", context.ctx);
+		const result = h.tools.get("subagent_run")!.execute("call", { agent: "gentle-ai-worker", task: "private task", mode: "task" }, undefined, undefined, context.ctx);
+		await tick();
+		assert.equal(runtime.children.length, 1);
+		const child = runtime.children[0];
+		const launchedCalls = calls;
+		for (let i = 0; i < 10; i++) child.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "private streamed text" } });
+		assert.equal(calls, launchedCalls, "no per-chunk policy process");
+		if (boundary === "long-running") {
+			for (let i = 0; i < 6; i++) {
+				clock += 20_000;
+				for (const [at, fn] of [...renewalTimers]) if (at <= clock) { renewalTimers.delete(at); fn(); }
+				await tick();
+				child.emit({ type: "message_end", message: { role: "assistant", model: "gpt-4o", provider: "openai",
+					providerThinkingLevel: "low", stopReason: "stop", usage: { input: 7, output: 3 } } });
+			}
+			assert.equal(calls, launchedCalls, "no telemetry policy renewal during a two-minute child");
+			assert.equal(renewalTimers.size, 0, "child telemetry never schedules a lease timer");
+		}
+		if (boundary === "env") env.DO_NOT_TRACK = "yes";
+		if (boundary === "session" || boundary === "replacement") {
+			child.emit({ type: "message_end", message: { role: "assistant", model: "gpt-4o", provider: "openai",
+				stopReason: "stop", usage: { input: 7, output: 3 } } });
+			if (boundary === "replacement") {
+				Object.assign(context.ctx.sessionManager, { getSessionId: () => "replacement" });
+				await h.fire("session_start", context.ctx);
+			} else await h.fire("session_shutdown", context.ctx);
+			assert.deepEqual(discarded, [1], "idle buffered response discarded at lifecycle boundary");
+			assert.equal(renewalTimers.size, 0);
+			if (boundary === "session") {
+				assert.ok([...h.listeners.values()].every(set => set.size === 0), "old bus subscriptions removed");
+				const fresh = fakePi();
+				Object.assign(fresh.pi, { events: h.pi.events });
+				gentleAgents(fresh.pi, env, { ...runtime.deps, env, runtimeMetricsPolicy: policy, metricsSchedule });
+				await fresh.fire("session_start", context.ctx);
+				assert.deepEqual(listenerCounts(), initialListeners, "fresh instance installs one subscription set");
+				await fresh.fire("session_shutdown", context.ctx);
+				assert.ok([...h.listeners.values()].every(set => set.size === 0));
+				assert.equal(renewalTimers.size, 0);
+			}
+		}
+		if (boundary === "bus-throws") h.pi.events.on(CHILD_METRICS_EVENT, () => { throw new Error("private bus error"); });
+		for (const model of ["gpt-4o", "gpt-4o-mini"]) child.emit({ type: "message_end", message: {
+			role: "assistant", model, provider: "openai", providerThinkingLevel: "low", stopReason: "stop", usage: { input: 7, output: 3 } } });
+		child.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] });
+		child.emit({ type: "agent_settled" });
+		assert.match((await result).content[0].text, boundary === "session" ? /cancelled/ : /done/);
+		await tick(); await tick();
+		const events = h.events.filter(event => event.name === CHILD_METRICS_EVENT);
+		const admitted = boundary === "allowed" || boundary === "bus-throws" || boundary === "long-running";
+		assert.equal(events.length, Number(admitted));
+		if (admitted) {
+			assert.ok(!JSON.stringify(events).includes("private"));
+			const event = events[0].data as import("../lib/runtime-metrics-children.ts").ChildMetricsEvent;
+			assert.equal(event.launch.agentClass, "worker");
+			assert.equal(event.launch.selectedEffort, "high");
+			assert.equal(event.responses.length, boundary === "long-running" ? 8 : 2);
+			assert.ok(event.responses.every(row => row.agentClass === "worker" && row.effort === "unavailable"));
+			assert.equal(event.agentSettled, true);
+			child.emit({ type: "agent_settled" });
+			await tick();
+			assert.equal(h.events.filter(event => event.name === CHILD_METRICS_EVENT).length, 1, "completion consumed once, even after bus failure");
+		}
+		assert.equal(calls, 0, "child telemetry performs no launch, renewal or pending-forward policy query");
+		assert.equal(renewalTimers.size, 0, "no renewal timer after the last task finishes");
+		assert.ok(!JSON.stringify(h.entries).includes("launch_configuration"));
+		await h.fire("session_shutdown", context.ctx);
+	});
+}
 
 async function eventually(check: () => boolean, message: string): Promise<void> {
 	for (let attempt = 0; attempt < 120; attempt++) {
@@ -875,7 +996,7 @@ test("explicit child roots launch and continue in the actual cwd, persist withou
 	assert.deepEqual(h.entries, [], "queueing and returning a child handle do not register roots");
 	spawnEvents[0]();
 	assert.deepEqual(h.entries, [{ type: "custom", customType: SESSION_WORKTREE_ENTRY, data: { sessionId: "s1", root: childRoot, evidence: "subagent:spawn" } }]);
-	assert.deepEqual(h.events, [{ name: SESSION_WORKTREE_CHANGED, data: { sessionId: "s1" } }]);
+	assert.deepEqual(h.events.filter(event => event.name === SESSION_WORKTREE_CHANGED), [{ name: SESSION_WORKTREE_CHANGED, data: { sessionId: "s1" } }]);
 	const details = result.details.gentleAgents as { taskId: string; cwd: string };
 	assert.equal(details.cwd, childRoot);
 	runtime.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "mapped" }] }] });
