@@ -77,6 +77,14 @@ export interface RunnerHooks {
 	onSuccessfulMutation?(task: TaskRecord, tool: { toolName: "write" | "edit"; toolCallId: string; path: string }): void | Promise<void>;
 }
 
+export interface SddChangeSelection {
+	changeName: string;
+	workspaceRoot: string;
+	phase: "apply" | "verify" | "sync" | "archive";
+}
+
+export const SDD_CHANGE_FLAG = "--gentle-sdd-change";
+
 export interface TaskRequest {
 	agent: AgentDefinition;
 	prompt: string;
@@ -90,6 +98,8 @@ export interface TaskRequest {
 	sessionDir: string;
 	resumeSessionPath: string | undefined;
 	env: NodeJS.ProcessEnv;
+	// A launch-local SDD identity. It is never prompt text or shared state.
+	sddChange?: SddChangeSelection;
 	// Captures the originating session; invoked only after successful OS spawn.
 	onLaunch?: () => void;
 	// This closure stays only in the parent process. Its presence creates an
@@ -174,6 +184,7 @@ const hostProcess: ProcessControl = { platform: process.platform, kill: (pid, si
 
 export function childArguments(request: TaskRequest): string[] {
 	const args = ["--mode", "rpc", "--session-dir", request.sessionDir];
+	if (request.sddChange) args.push(SDD_CHANGE_FLAG, JSON.stringify(request.sddChange));
 	if (request.resumeSessionPath) args.push("--session", request.resumeSessionPath);
 	if (request.model) args.push("--model", request.thinking ? `${formatModelRef(request.model)}:${request.thinking}` : formatModelRef(request.model));
 	else if (request.thinking) args.push("--thinking", request.thinking);
@@ -275,7 +286,12 @@ export class AgentRunner {
 			cost: 0,
 		};
 		this.store.add(task);
-		this.queue.push({ task, request });
+		// A caller can retain and mutate its request after dispatch. Preserve only
+		// the identity selected at construction for this child launch.
+		const launchRequest = request.sddChange === undefined
+			? request
+			: { ...request, sddChange: { ...request.sddChange } };
+		this.queue.push({ task, request: launchRequest });
 		queueMicrotask(() => this.pump());
 		return task;
 	}
