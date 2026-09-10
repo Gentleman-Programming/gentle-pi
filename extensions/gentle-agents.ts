@@ -6,8 +6,9 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join, resolve } from "node:path";
 import { keyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, type TUI } from "@earendil-works/pi-tui";
 import { sidebarPart } from "../lib/shell-sidebar.ts";
+import { invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
 import { AGENT_MODE, discoverAgents, loadAgentsConfig, resolveAgentProfile, type AgentDefinition, type AgentMode } from "../lib/agents-config.ts";
 import { isFinished, TASK_STATUS, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
 import { AgentRunner, piCommand, type AskAnswer, type RunnerDeps, type TaskRequest } from "../lib/agents-runner.ts";
@@ -256,6 +257,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const tasksDir = historyDir(deps.home, agentHome);
 	let ui: ExtensionContext["ui"] | undefined;
 	let host: { requestRender(): void } | undefined;
+	let sidebarTui: TUI | undefined;
 	let sessions: ExtensionContext["sessionManager"] | undefined;
 	let presence: PresencePublisher | undefined;
 	const overlays = new Set<AgentsView>();
@@ -296,6 +298,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		renderQueued = true;
 		deps.schedule(() => {
 			renderQueued = false;
+			if (sidebarTui) invalidateSidebar(sidebarTui);
 			host?.requestRender();
 		}, RENDER_COALESCE_MS);
 	};
@@ -318,6 +321,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const expiry = widgetExpiryMs(tasks, deps.now());
 		if (expiry === undefined) return;
 		cancelClock = deps.schedule(() => {
+			if (sidebarTui) invalidateSidebar(sidebarTui);
 			host?.requestRender();
 			tickClock();
 		}, expiry);
@@ -526,6 +530,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	// coalesced so a chatty child cannot flood the terminal.
 	store.subscribeSummary(() => {
 		publishActivity();
+		if (sidebarTui) invalidateSidebar(sidebarTui);
 		host?.requestRender();
 		tickClock();
 	});
@@ -536,6 +541,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		tickClock();
 		ui?.setWidget(AGENTS_WIDGET_KEY, (tui, theme) => {
 			host = tui;
+			sidebarTui = tui;
 			return sidebarPart(tui, "agents", {
 				render(width: number) {
 					const lines = renderAgentsCard(visibleTasks(), theme, width, deps.now(), { collapsed, collapseKey, maxRows: widgetRows(tui.terminal?.rows), viewKey });
@@ -718,6 +724,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			description: "Collapse or expand the agents card",
 			handler: async () => {
 				collapsed = !collapsed;
+				if (sidebarTui) invalidateSidebar(sidebarTui);
 				host?.requestRender();
 			},
 		});
@@ -757,6 +764,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		for (const view of overlays) { view.handleInput("q"); view.dispose(); }
 		overlays.clear();
 		sessions = undefined;
+		sidebarTui = undefined;
 		worktrees?.close();
 		worktrees = undefined;
 		runner.cancelAll();

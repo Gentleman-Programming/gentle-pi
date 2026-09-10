@@ -14,7 +14,7 @@ import { framePromptLines, PROMPT_HINT, PROMPT_STATE, withPromptHint, type Promp
 import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, parseCodexUsage, parseUsageHeaders, UsageStore, type ProviderUsage } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
 import { sidebarPart } from "../lib/shell-sidebar.ts";
-import { installSidebar } from "../lib/shell-sidebar-layout.ts";
+import { installSidebar, invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
 
 // Gentle Shell: the visual layer gentle-pi puts on top of pi. It installs the
 // status bar, the petal prompt, the working-tree changes widget and overlay,
@@ -29,6 +29,7 @@ export interface ShellFooterData {
 
 interface ShellRenderHost {
 	requestRender(): void;
+	invalidateSidebar?(): void;
 }
 
 interface ShellBarComponent {
@@ -126,7 +127,10 @@ export function createShellBarComponent(
 	dirty: () => number | undefined = () => undefined,
 	usage: () => ProviderUsage | undefined = () => undefined,
 ): ShellBarComponent {
-	const unsubscribe = footerData.onBranchChange(() => host.requestRender());
+	const unsubscribe = footerData.onBranchChange(() => {
+		host.invalidateSidebar?.();
+		host.requestRender();
+	});
 	return {
 		render(width: number) {
 			return renderShellBar(buildShellBarModel(pi, ctx, footerData, { dirty: dirty(), usage: usage() }), theme, width);
@@ -461,12 +465,14 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		const fetched = await fetchCodexUsage(token, deps.fetch, deps.now());
 		if (!fetched) return;
 		usage.record(fetched);
+		renderHost?.invalidateSidebar?.();
 		renderHost?.requestRender();
 	};
 	pi.on("after_provider_response", (event) => {
 		const parsed = parseUsageHeaders(event.headers, deps.now());
 		if (!parsed) return;
 		usage.record(parsed);
+		renderHost?.invalidateSidebar?.();
 		renderHost?.requestRender();
 	});
 	pi.registerMessageRenderer(REVIEW_PREFLIGHT_TYPE, (message, options, theme) => {
@@ -545,8 +551,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		changes = new WorktreeChangesTracker(deps.gitRunner(ctx.cwd), deps.gitRunner, lineCounter, () => sessionRegistry.roots());
 		const tracker = changes;
 		ctx.ui.setFooter((tui, theme, footerData) => {
-			renderHost = tui;
-			const bottom = createShellBarComponent(pi, ctx, tui, theme, footerData, () => tracker.model.files.length, () => usage.get(ctx.model?.provider ?? ""));
+			renderHost = { requestRender: () => tui.requestRender(), invalidateSidebar: () => invalidateSidebar(tui) };
+			const bottom = createShellBarComponent(pi, ctx, renderHost, theme, footerData, () => tracker.model.files.length, () => usage.get(ctx.model?.provider ?? ""));
 			const part = sidebarPart(tui, "footer", bottom, {
 				render: (width) => renderShellSidebarBar(buildShellBarModel(pi, ctx, footerData, { dirty: tracker.model.files.length, usage: usage.get(ctx.model?.provider ?? "") }), theme, width),
 				invalidate() {},
