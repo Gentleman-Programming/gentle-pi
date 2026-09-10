@@ -2981,8 +2981,8 @@ const REVIEW_CONTROLLER_PARAMETERS = {
 			description: "Bounded review lineage identifier. A failed start creates no lineage; do not use it with status or advance.",
 		},
 		selectionBinding: { type: "string", description: "Opaque provider-issued pre-lineage intended-untracked selection binding." },
-		intendedUntracked: { type: "array", items: { type: "string" }, description: 'Repository-relative paths selected from the provider binding; on inspect they are the paths a untrackedScope "select" selection includes.' },
-		untrackedScope: { type: "string", enum: ["exclude", "select"], description: 'Inspect-only: resolve the intended-untracked selection stop in one call. "exclude" excludes every eligible untracked path (intendedUntracked absent or empty); "select" includes exactly the intendedUntracked paths.' },
+		intendedUntracked: { type: "array", items: { type: "string" }, description: 'Repository-relative paths selected from the provider binding; on inspect they are accepted only with untrackedScope "select".' },
+		untrackedScope: { type: "string", enum: ["exclude", "select"], description: 'Inspect-only: resolve the intended-untracked selection stop in one call. "exclude" excludes every eligible untracked path and forbids intendedUntracked; "select" includes exactly the supplied intendedUntracked paths.' },
 		changeName: {
 			type: "string",
 			description: "Canonical OpenSpec change name required to resolve a recovered authority during lifecycle validate.",
@@ -3176,8 +3176,14 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 		return { operation: value.operation, selectionBinding: value.selectionBinding, intendedUntracked: value.intendedUntracked, ...(typeof value.workspaceRoot === "string" ? { workspaceRoot: value.workspaceRoot } : {}) };
 	}
 	// gentle-pi#706: top-level untrackedScope/intendedUntracked resolve the
-	// intended-untracked stop through inspect alone; every other operation
-	// rejects the scope exactly like a stray field.
+	// intended-untracked stop through inspect alone. intendedUntracked is not a
+	// standalone selector: inspect accepts it only for an explicit select scope.
+	const hasIntendedUntracked = "intendedUntracked" in value;
+	if (hasIntendedUntracked && value.operation !== REVIEW_CONTROLLER_OPERATION.INSPECT) {
+		throw new Error(
+			`Review controller ${value.operation} does not accept intendedUntracked; it is accepted only by inspect with untrackedScope select`,
+		);
+	}
 	if (value.untrackedScope !== undefined) {
 		if (value.operation !== REVIEW_CONTROLLER_OPERATION.INSPECT)
 			throw new Error(
@@ -3190,13 +3196,18 @@ function parseReviewControllerParameters(value: unknown): ReviewControllerParame
 			throw new Error(
 				"Review controller inspect untrackedScope must be exclude or select",
 			);
-		if (
-			value.intendedUntracked !== undefined &&
-			!Array.isArray(value.intendedUntracked)
-		)
+	}
+	if (hasIntendedUntracked) {
+		if (value.untrackedScope !== NATIVE_START_UNTRACKED_SCOPE.SELECT) {
+			throw new Error(
+				"Review controller inspect intendedUntracked requires untrackedScope select",
+			);
+		}
+		if (!Array.isArray(value.intendedUntracked)) {
 			throw new Error(
 				"Review controller inspect intendedUntracked must be an array of repository-relative paths",
 			);
+		}
 	}
 
 	const needsLineage = ![REVIEW_CONTROLLER_OPERATION.START, REVIEW_CONTROLLER_OPERATION.ANSWER_CONSENT, REVIEW_CONTROLLER_OPERATION.STATUS, REVIEW_CONTROLLER_OPERATION.EXPORT, REVIEW_CONTROLLER_OPERATION.IMPORT, REVIEW_CONTROLLER_OPERATION.INSPECT, REVIEW_CONTROLLER_OPERATION.RESET, REVIEW_CONTROLLER_OPERATION.RECOVER, REVIEW_CONTROLLER_OPERATION.RECOVER_LOCK, REVIEW_CONTROLLER_OPERATION.ABANDON, REVIEW_CONTROLLER_OPERATION.QUARANTINE_LEGACY, REVIEW_CONTROLLER_OPERATION.RECONCILE_AUTHORITY, REVIEW_CONTROLLER_OPERATION.REPAIR_LEGACY_ALIAS, REVIEW_CONTROLLER_OPERATION.REPAIR, REVIEW_CONTROLLER_OPERATION.ASSESS].includes(value.operation as ReviewControllerOperation);
@@ -3967,6 +3978,11 @@ interface RetainedNativeUntrackedSelection {
 	readonly submission?: NativeIntendedUntrackedSelectionSubmission;
 }
 
+interface RetainedPreLineageNativeUntrackedSelection extends RetainedNativeUntrackedSelection {
+	readonly targetIdentity: string;
+	readonly candidateTree: string;
+}
+
 interface RetainedNativeCaptureRoute { readonly workspaceRoot: string; readonly lineageId: string; readonly baseRef?: string; readonly committedOnly?: true; }
 
 type RetainedNativeStatusSelection = RetainedNativeUntrackedSelection | RetainedNativeCaptureRoute;
@@ -4668,14 +4684,36 @@ function readRetainedNativeUntrackedSelection(selections: Map<string, RetainedNa
 // gentle-pi#706: inspect's untrackedScope round trip retains the resolved
 // selection under the pre-lineage empty-lineage key so the next plain START in
 // that worktree adopts it without re-deriving the selection.
+function nativePreLineageCandidateIdentity(
+	status: ReviewStatusV3,
+): { targetIdentity: string; candidateTree: string } | undefined {
+	const candidateTree = status.projection.currentCandidateTree;
+	return isCanonicalProcessString(status.targetIdentity) && isCanonicalProcessString(candidateTree)
+		? { targetIdentity: status.targetIdentity, candidateTree }
+		: undefined;
+}
+
 function readRetainedPreLineageNativeUntrackedSelection(
 	selections: Map<string, RetainedNativeStatusSelection>,
 	workspaceRoot: string,
-): RetainedNativeUntrackedSelection | undefined {
+): RetainedPreLineageNativeUntrackedSelection | undefined {
 	const selection = selections.get(reviewLifecycleStorageKey(workspaceRoot, ""));
-	return selection !== undefined && !("baseRef" in selection)
-		? selection
+	return selection !== undefined &&
+		!("baseRef" in selection) &&
+		typeof (selection as Partial<RetainedPreLineageNativeUntrackedSelection>).targetIdentity === "string" &&
+		typeof (selection as Partial<RetainedPreLineageNativeUntrackedSelection>).candidateTree === "string"
+		? selection as RetainedPreLineageNativeUntrackedSelection
 		: undefined;
+}
+
+function sameNativePreLineageCandidate(
+	selection: RetainedPreLineageNativeUntrackedSelection,
+	status: ReviewStatusV3,
+): boolean {
+	const identity = nativePreLineageCandidateIdentity(status);
+	return identity !== undefined &&
+		identity.targetIdentity === selection.targetIdentity &&
+		identity.candidateTree === selection.candidateTree;
 }
 
 function isRetainedNativeCaptureRoute(selection: RetainedNativeStatusSelection | undefined): selection is RetainedNativeCaptureRoute {
@@ -5669,6 +5707,10 @@ async function executeReviewControllerOperation(
 		parameters.operation === REVIEW_CONTROLLER_OPERATION.INSPECT &&
 		nativeReviewCli !== null
 	) {
+		// A new inspect supersedes every pre-lineage selection before its first
+		// STATUS attempt. A failed or changed-candidate inspect cannot leave an
+		// older selection available for a later START.
+		clearRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, "");
 		try {
 			if (nativeReviewCli.targetStatus !== undefined) {
 				const negotiated = await negotiatedStatusForHostTransport(
@@ -5765,20 +5807,25 @@ async function executeReviewControllerOperation(
 						...(includeWorkspaceRoot ? { workspace_root: defaultCwd } : {}),
 					};
 				}
-				retainNativeUntrackedSelection(
-					retainedUntrackedSelections,
-					defaultCwd,
-					"",
-					Object.freeze({
-						untrackedScope: parameters.untrackedScope,
-						expectedUntrackedInventory: inventory!,
-						intendedUntracked: Object.freeze([...selected.intendedUntracked!]),
-						submission,
-					}),
-				);
+				const resolvedStatus = resolved.status!;
+				const candidateIdentity = nativePreLineageCandidateIdentity(resolvedStatus);
+				if (candidateIdentity !== undefined) {
+					retainNativeUntrackedSelection(
+						retainedUntrackedSelections,
+						defaultCwd,
+						"",
+						Object.freeze({
+							untrackedScope: parameters.untrackedScope,
+							expectedUntrackedInventory: inventory!,
+							intendedUntracked: Object.freeze([...selected.intendedUntracked!]),
+							submission,
+							...candidateIdentity,
+						}),
+					);
+				}
 				const resolvedMapped = mapNativeTargetStatus(
 					parameters.operation,
-					resolved.status!,
+					resolvedStatus,
 					undefined,
 				);
 				return {
@@ -6228,6 +6275,20 @@ async function executeReviewControllerOperation(
 				}, retainedUntrackedSelections, defaultCwd);
 				if (negotiated.transport !== undefined) return hostTransportUnavailable(parameters.operation, negotiated.transport);
 				target = negotiated.status!;
+				if (
+					retainedPreLineageSelection !== undefined &&
+					!sameNativePreLineageCandidate(retainedPreLineageSelection, target)
+				) {
+					clearRetainedNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, "");
+					return {
+						operation: parameters.operation,
+						status: "blocked",
+						outcome: "native-start-retained-selection-candidate-mismatch",
+						mutation_performed: false,
+						mutation_outcome: "none",
+						next_action: "inspect-and-resolve-the-current-intended-untracked-selection",
+					};
+				}
 				if (target.nextTransition?.kind === "collect" || target.applicability !== "unrelated" || target.action !== "start") return mapNativeTargetStatus(parameters.operation, target, parameters.lineageId);
 			} catch (error) {
 				return nativeOperationFailure(parameters.operation, error);

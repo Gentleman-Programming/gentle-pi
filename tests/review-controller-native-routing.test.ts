@@ -1161,6 +1161,14 @@ for (const invalid of [
 				return initial;
 			},
 		} as unknown as NativeReviewCli;
+		if (invalid.untrackedScope === "exclude") {
+			await assert.rejects(
+				() => __testing.executeReviewControllerOperation({ operation: "inspect", ...invalid }, cwd, native),
+				/requires untrackedScope select/,
+			);
+			assert.equal(targetCalls, 0);
+			return;
+		}
 		const result = await __testing.executeReviewControllerOperation(
 			{ operation: "inspect", ...invalid },
 			cwd,
@@ -1298,6 +1306,116 @@ test("untrackedScope is accepted only by the inspect operation", async (t) => {
 	);
 });
 
+test("top-level intendedUntracked is accepted only by inspect select", async (t) => {
+		const { cwd, initial } = untrackedStopFixture(t);
+		const native = { targetStatus: async () => initial } as unknown as NativeReviewCli;
+		for (const parameters of [
+			{ operation: "inspect", intendedUntracked: [] },
+			{ operation: "inspect", untrackedScope: "exclude", intendedUntracked: [] },
+			{ operation: "status", intendedUntracked: [] },
+			{ operation: "start", input: JSON.stringify({ mode: "ordinary" }), intendedUntracked: [] },
+		] as const) {
+			await assert.rejects(
+				() => __testing.executeReviewControllerOperation(parameters as never, cwd, native),
+				/intendedUntracked/,
+				JSON.stringify(parameters),
+			);
+		}
+	});
+
+test("a fresh unsuccessful inspect invalidates its prior pre-lineage selection", async (t) => {
+		const { cwd, eligible, initial, target } = untrackedStopFixture(t);
+		const retained = new Map();
+		let failInspect = false;
+		const native = {
+			targetStatus: async (request: Record<string, unknown>) => {
+				if (failInspect) throw new Error("inspect unavailable");
+				return "intendedUntrackedSelection" in request ? target : initial;
+			},
+		} as unknown as NativeReviewCli;
+		await __testing.executeReviewControllerOperation(
+			{ operation: "inspect", untrackedScope: "select", intendedUntracked: [eligible] },
+			cwd, native, undefined, undefined, undefined, retained,
+		);
+		assert.equal(retained.has(`${cwd}\u0000`), true);
+		failInspect = true;
+		const failed = await __testing.executeReviewControllerOperation(
+			{ operation: "inspect" }, cwd, native, undefined, undefined, undefined, retained,
+		);
+		assert.equal(failed.outcome, "native-status-unavailable");
+		assert.equal(retained.has(`${cwd}\u0000`), false);
+	});
+
+test("START rejects a retained pre-lineage selection when fresh STATUS identifies a changed candidate", async (t) => {
+		const { cwd, eligible, initial, target } = untrackedStopFixture(t);
+		const retained = new Map();
+		const candidateA = {
+			...target,
+			targetIdentity: "target-a",
+			projection: { ...target.projection, currentCandidateTree: "candidate-a" },
+		} as ReviewStatusV3;
+		const candidateB = {
+			...target,
+			targetIdentity: "target-b",
+			projection: { ...target.projection, currentCandidateTree: "candidate-b" },
+		} as ReviewStatusV3;
+		let resolved = false;
+		let starts = 0;
+		const native = {
+			targetStatus: async (request: Record<string, unknown>) => {
+				if (!("intendedUntrackedSelection" in request)) return initial;
+				if (!resolved) { resolved = true; return candidateA; }
+				return candidateB;
+			},
+			start: async () => {
+				starts += 1;
+				return { lineageId: "unexpected", state: "reviewing", riskLevel: "low", selectedLenses: [], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: false, riskReasons: [], raw: {} };
+			},
+		} as unknown as NativeReviewCli;
+		await __testing.executeReviewControllerOperation(
+			{ operation: "inspect", untrackedScope: "select", intendedUntracked: [eligible] },
+			cwd, native, undefined, null, undefined, retained,
+		);
+		const rejected = await __testing.executeReviewControllerOperation(
+			{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+			cwd, native, undefined, null, undefined, retained,
+		);
+		assert.equal(rejected.outcome, "native-start-retained-selection-candidate-mismatch");
+		assert.equal(starts, 0);
+		assert.equal(retained.has(`${cwd}\u0000`), false);
+	});
+
+test("a failed START retains a pre-lineage selection for a same-candidate retry", async (t) => {
+		const { cwd, eligible, initial, target } = untrackedStopFixture(t);
+		const retained = new Map();
+		let starts = 0;
+		const native = {
+			targetStatus: async (request: Record<string, unknown>) =>
+				"intendedUntrackedSelection" in request ? target : initial,
+			start: async () => {
+				starts += 1;
+				if (starts === 1) throw Object.assign(new Error("retryable failure"), { mutationOutcome: "none" });
+				return { lineageId: "retried", state: "reviewing", riskLevel: "low", selectedLenses: [], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: false, riskReasons: [], raw: {} };
+			},
+		} as unknown as NativeReviewCli;
+		await __testing.executeReviewControllerOperation(
+			{ operation: "inspect", untrackedScope: "select", intendedUntracked: [eligible] },
+			cwd, native, undefined, null, undefined, retained,
+		);
+		const failed = await __testing.executeReviewControllerOperation(
+			{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+			cwd, native, undefined, null, undefined, retained,
+		);
+		assert.equal(failed.mutation_outcome, "none");
+		assert.equal(retained.has(`${cwd}\u0000`), true);
+		const retried = await __testing.executeReviewControllerOperation(
+			{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+			cwd, native, undefined, null, undefined, retained,
+		);
+		assert.equal(retried.result.lineage_id, "retried");
+		assert.equal(starts, 2);
+		assert.equal(retained.has(`${cwd}\u0000`), false);
+	});
 
 test("ordinary START relays native consent without authoring or advancing it", async (t) => {
 	const cwd = repository(t);
