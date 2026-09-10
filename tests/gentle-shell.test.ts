@@ -544,6 +544,24 @@ test("loadFileDiff asks git for a HEAD diff, or a no-index diff for untracked fi
 	]);
 });
 
+test("shell Git runner hides initial and repeated background polling children", async () => {
+	const calls: Array<{ command: string; args: readonly string[]; options: Record<string, unknown> }> = [];
+	const run = ((command: string, args: readonly string[], options: Record<string, unknown>, callback: (error: Error | null, stdout: string) => void) => {
+		calls.push({ command, args, options });
+		callback(null, "", "");
+	}) as typeof import("node:child_process").execFile;
+	const git = shellGitRunner("/repo with spaces & metacharacters", { PATH: process.env.PATH }, run);
+	await git(["status", "--porcelain=v1", "-z"]);
+	await git(["status", "--porcelain=v1", "-z"]);
+	assert.equal(calls.length, 2, "the same safe runner serves startup and repeated polling");
+	for (const call of calls) {
+		assert.equal(call.command, "git");
+		assert.deepEqual(call.args, ["-C", "/repo with spaces & metacharacters", "status", "--porcelain=v1", "-z"]);
+		assert.equal(call.options.shell, false);
+		assert.equal(call.options.windowsHide, true);
+	}
+});
+
 test("openInExternalEditor stops the TUI around the editor and honors $VISUAL over $EDITOR", () => {
 	const events: string[] = [];
 	const host = { stop: () => events.push("stop"), start: () => events.push("start"), requestRender: (force?: boolean) => events.push(`render:${force}`) };
