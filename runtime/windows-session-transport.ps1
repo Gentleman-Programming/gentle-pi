@@ -241,7 +241,9 @@ public static class WindowsSessionBootstrap {
     } finally { if (security != IntPtr.Zero) Marshal.FreeHGlobal(security); if (unicode != IntPtr.Zero) Marshal.FreeHGlobal(unicode); if (chars != IntPtr.Zero) Marshal.FreeHGlobal(chars); }
   }
   static void AssertDirectory(IntPtr handle) {
-    BY_HANDLE_FILE_INFORMATION info; if (handle == IntPtr.Zero || !GetFileInformationByHandle(handle, out info)) Fail("unsafe");
+    if (handle == IntPtr.Zero) throw new BootstrapFailure("unsafe");
+    BY_HANDLE_FILE_INFORMATION info;
+    if (!GetFileInformationByHandle(handle, out info)) throw new BootstrapFailure("unsafe");
     if ((info.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != FILE_ATTRIBUTE_DIRECTORY) Fail("unsafe");
   }
   static IntPtr RequireOpen(IntPtr root, string component, bool privateDirectory) {
