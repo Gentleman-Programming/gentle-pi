@@ -35,9 +35,26 @@ Rules:
 - `/gentle-sdd-status` is a debug/status command, not the main UX.
 - `/gentle-sdd-continue` is the native dispatcher command: resolve status, choose the next ready phase, and carry status/instructions into the subagent prompt.
 - `sdd-apply`, `sdd-verify`, `sdd-sync`, and `sdd-archive` must obey parent-provided native status; they must not reconstruct readiness from prompt inference when status JSON is present.
-- Do not launch a phase when native status marks that dependency `blocked`.
+- Apply the Bounded Planning Routing contract below: a blocked apply dependency is not a blanket veto on planning. Non-planning phases must still obey their own dependency gates.
 - `sdd-archive` cannot proceed unless native status says `dependencies.archive` is `ready` or `all_done` — UNLESS the store carve-out is active (`nextRecommended: "resolve-via-engram"`), in which case resolve archive readiness from Engram instead of treating `not_applicable` as a gate failure.
 - **Non-authoritative store carve-out:** when `nextRecommended: "resolve-via-engram"` is set, native status is **not authoritative**. This applies to `artifactStore: engram`, `artifactStore: none`, and `artifactStore: both` when the `openspec/` directory does not exist. For non-authoritative stores: resolve readiness from Engram using the Engram memory tools injected by the memory provider on the change topic keys (`sdd/{change-name}/proposal`, `sdd/{change-name}/spec`, `sdd/{change-name}/design`, `sdd/{change-name}/tasks`, etc.). Do **not** treat `blockedReasons` or `not_applicable` dependency states from the native engine as real blockers when the store carve-out is active.
+
+## Bounded Planning Routing
+
+For authoritative native status, route only by the bounded `nextRecommended` token and dependency states; never infer a route from prose. Keep human diagnostics in `blockedReasons`, not in `nextRecommended`, and report them without discarding them to enable a route.
+
+| `nextRecommended` | Planning route |
+| --- | --- |
+| `sdd-propose` | `sdd-proposal` |
+| `sdd-spec` | `sdd-spec` |
+| `sdd-design` | `sdd-design` |
+| `sdd-tasks` | `sdd-tasks` |
+
+These planning routes remain runnable when missing planning artifacts leave `dependencies.apply: blocked`; do not require apply readiness to produce those artifacts. This is a planning-only exception, not permission to run apply or another blocked non-planning phase.
+
+Before any planning launch, stop for ambiguous change selection, unresolved session preflight, or unsafe action context. Carry `actionContext` and prove planned writes are within the authoritative workspace or allowed edit roots; workspace-planning without allowed edit roots remains read-only. Planning does not bypass the init guard, pre-proposal gate, or phase approval requirements.
+
+For non-planning phases, stop when that phase's dependency is `blocked`. When `nextRecommended` is `blocked` or `resolve-blockers`, report `blockedReasons` and stop, even if a planning artifact is missing. Unknown tokens do not authorize a launch. Non-empty `blockedReasons` forbid apply, sync, and archive work; `sdd-verify` may run only when `nextRecommended` is `sdd-verify` and its dependency permits it, to remediate or refresh evidence for the blockers. The non-authoritative `resolve-via-engram` store carve-out remains separate; it does not bypass preflight, selection, or action-context safety.
 
 ## SDD Status Contract
 
