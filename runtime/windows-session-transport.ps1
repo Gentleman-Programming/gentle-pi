@@ -178,6 +178,8 @@ using System.Security.Principal;
 using Microsoft.Win32.SafeHandles;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
+using System.IO.Pipes;
 
 public sealed class BootstrapFailure : Exception {
   public readonly string Code, Stage;
@@ -211,10 +213,12 @@ public static class WindowsSessionBootstrap {
   const uint STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034, STATUS_OBJECT_NAME_COLLISION = 0xC0000035;
   const int FileIdBothDirectoryInformation = 37;
   static readonly object Gate = new object();
+  static readonly object OutputGate = new object();
   static readonly List<IntPtr> Handles = new List<IntPtr>();
   static IntPtr Presence = IntPtr.Zero;
   static string InitializationStage = "unknown";
   static uint? InitializationNtStatus = null;
+  static OwnedListener Listener = null;
 
   [DllImport("ntdll.dll", CallingConvention=CallingConvention.Winapi)] static extern uint NtCreateFile(out IntPtr fileHandle, uint desiredAccess, ref OBJECT_ATTRIBUTES objectAttributes, out IO_STATUS_BLOCK ioStatusBlock, IntPtr allocationSize, uint fileAttributes, uint shareAccess, uint createDisposition, uint createOptions, IntPtr eaBuffer, uint eaLength);
   [DllImport("ntdll.dll", CallingConvention=CallingConvention.Winapi)] static extern uint NtQueryDirectoryFile(IntPtr fileHandle, IntPtr eventHandle, IntPtr apcRoutine, IntPtr apcContext, out IO_STATUS_BLOCK ioStatusBlock, IntPtr fileInformation, uint length, int fileInformationClass, bool returnSingleEntry, IntPtr fileName, bool restartScan);
@@ -225,6 +229,7 @@ public static class WindowsSessionBootstrap {
       [DllImport("kernel32.dll", SetLastError=true)] static extern bool ReadFile(IntPtr handle, byte[] buffer, uint length, out uint read, IntPtr overlapped);
       [DllImport("kernel32.dll", SetLastError=true)] static extern bool WriteFile(IntPtr handle, byte[] buffer, uint length, out uint written, IntPtr overlapped);
       [DllImport("kernel32.dll", SetLastError=true)] static extern bool FlushFileBuffers(IntPtr handle);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateNamedPipe(string name, uint openMode, uint pipeMode, uint maxInstances, uint outBufferSize, uint inBufferSize, uint defaultTimeout, IntPtr securityAttributes);
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool GetVolumeNameForVolumeMountPoint(string rootPathName, System.Text.StringBuilder volumeName, uint cchBufferLength);
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool GetVolumeInformation(string rootPathName, IntPtr volumeNameBuffer, uint volumeNameSize, out uint volumeSerialNumber, out uint maximumComponentLength, out uint fileSystemFlags, IntPtr fileSystemNameBuffer, uint fileSystemNameSize);
   [DllImport("advapi32.dll", SetLastError=true)] static extern uint GetSecurityInfo(IntPtr handle, uint objectType, uint securityInformation, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr descriptor);
@@ -235,6 +240,7 @@ public static class WindowsSessionBootstrap {
   static void SetStage(string stage) { InitializationStage = stage; InitializationNtStatus = null; }
   static void SetNtStatus(uint status) { InitializationNtStatus = status; }
   static void Close(IntPtr handle) { if (handle != IntPtr.Zero) CloseHandle(handle); }
+  public static void WriteControl(string line) { lock (OutputGate) { Console.Out.WriteLine(line); } }
   static IntPtr Unicode(string value, out IntPtr chars) {
     chars = Marshal.StringToHGlobalUni(value); var text = new UNICODE_STRING();
     text.Length = checked((ushort)(value.Length * 2)); text.MaximumLength = text.Length; text.Buffer = chars;
@@ -408,7 +414,7 @@ public static class WindowsSessionBootstrap {
       }
       static void DeletePinnedHandle(IntPtr file) { IntPtr memory = Marshal.AllocHGlobal(1); try { Marshal.WriteByte(memory, 1); IO_STATUS_BLOCK io; if (NtSetInformationFile(file, out io, memory, 1, FileDispositionInformation) != 0) Fail("unsafe"); } finally { Marshal.FreeHGlobal(memory); } }
       public static PresenceRecord NewRecord(string sessionId, long createdAt) { lock (Gate) { RequirePresence(); string token = Guid.NewGuid().ToString("N"), endpoint = PipePrefix + token, ignored; ValidateRecord(sessionId, endpoint, createdAt, out ignored); return new PresenceRecord(sessionId, endpoint, token, createdAt); } }
-      public static void Publish(string sessionId, string endpoint, long createdAt, byte[] descriptor, string sid) {
+      static OwnedPublication PublishOwned(string sessionId, string endpoint, long createdAt, byte[] descriptor, string sid) {
         lock (Gate) {
           RequirePresence(); if (OwnedPublications.Count >= MaxOwnedPublications) Fail("busy");
           string token; ValidateRecord(sessionId, endpoint, createdAt, out token);
@@ -423,13 +429,14 @@ public static class WindowsSessionBootstrap {
             uint status = RenameNoReplace(file, Presence, target);
             if (status != 0) { uint win32 = RtlNtStatusToDosError(status); Fail(win32 == 80 || win32 == 183 ? "busy" : "unsafe"); }
             OwnedPublication owned = new OwnedPublication(new PresenceRecord(sessionId, endpoint, token, createdAt), identity, sid, file);
-            try { OwnedPublications.Add(owned); transferred = true; } catch { try { DeletePinnedHandle(file); } finally { owned.Dispose(); transferred = true; } throw; }
+            try { OwnedPublications.Add(owned); transferred = true; return owned; } catch { try { DeletePinnedHandle(file); } finally { owned.Dispose(); transferred = true; } throw; }
           } finally {
             if (!transferred) { try { DeletePinnedHandle(file); } catch {} Close(file); }
           }
         }
       }
-      public static PresenceRecord[] List(string sid) { return List(null, sid); }
+      public static void Publish(string sessionId, string endpoint, long createdAt, byte[] descriptor, string sid) { PublishOwned(sessionId, endpoint, createdAt, descriptor, sid); }
+          public static PresenceRecord[] List(string sid) { return List(null, sid); }
       public static PresenceRecord[] List(string excluded, string sid) { lock (Gate) { RequirePresence(); if (excluded != null && !Regex.IsMatch(excluded, "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")) Fail("invalid"); var newest = new Dictionary<string, PresenceRecord>(StringComparer.Ordinal); foreach (string name in EnumeratePinned(Presence)) { IntPtr file = IntPtr.Zero; try { RecordIdentity ignoredIdentity; PresenceRecord record = ReadPinnedRecord(name, sid, out file, out ignoredIdentity); if (record.SessionId == excluded) continue; PresenceRecord prior; if (!newest.TryGetValue(record.SessionId, out prior) || record.CreatedAt > prior.CreatedAt || (record.CreatedAt == prior.CreatedAt && String.CompareOrdinal(record.Token, prior.Token) > 0)) newest[record.SessionId] = record; } catch (BootstrapFailure) { } finally { Close(file); } } var records = new List<PresenceRecord>(newest.Values); records.Sort(delegate(PresenceRecord left, PresenceRecord right) { return String.CompareOrdinal(left.SessionId, right.SessionId); }); return records.ToArray(); } }
       public static PresenceRecord Resolve(string sessionId, string sid) { PresenceRecord[] records = List(null, sid); foreach (PresenceRecord record in records) if (record.SessionId == sessionId) return record; Fail("not_found"); return null; }
       static void RemoveOwnedPublication(OwnedPublication owned) {
@@ -443,7 +450,15 @@ public static class WindowsSessionBootstrap {
         } catch (BootstrapFailure failure) { if (failure.Code != "not_found") throw; }
         finally { Close(current); OwnedPublications.Remove(owned); owned.Dispose(); }
       }
-      public static void RemoveOwn(string sessionId, string endpoint, long createdAt, string sid) {
+      static void RemoveListenerPublication(OwnedListener listener) {
+            if (listener == null) return;
+            OwnedPublication owned = listener.Publication; listener.Publication = null;
+            // Reference membership, rather than the public tuple, prevents this listener
+            // from deleting a later publication that reused the same visible record.
+            if (owned == null || !OwnedPublications.Contains(owned)) return;
+            RemoveOwnedPublication(owned);
+          }
+          public static void RemoveOwn(string sessionId, string endpoint, long createdAt, string sid) {
         lock (Gate) {
           RequirePresence(); string token; ValidateRecord(sessionId, endpoint, createdAt, out token);
           OwnedPublication owned = FindOwned(sessionId, endpoint, createdAt); if (owned == null) return;
@@ -455,6 +470,157 @@ public static class WindowsSessionBootstrap {
           } catch (BootstrapFailure failure) { if (failure.Code != "not_found") throw; }
           finally { Close(file); OwnedPublications.Remove(owned); owned.Dispose(); }
         }
+      }
+      // CreateNamedPipeW's documented FILE_FLAG_FIRST_PIPE_INSTANCE guard avoids
+      // relying on PipeOptions.FirstPipeInstance, which PS5.1 may not expose.
+      const uint PIPE_ACCESS_DUPLEX = 3, PIPE_TYPE_BYTE = 0, PIPE_WAIT = 0, FILE_FLAG_OVERLAPPED = 0x40000000, FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000;
+      const int MaxPipeInstances = 4, MaxPipeBytes = 65536, PipeDeadlineMilliseconds = 2000;
+      sealed class PipeClient {
+        public readonly OwnedListener Listener; public readonly NamedPipeServerStream Pipe; public readonly string ConnectionId;
+        public readonly MemoryStream Bytes = new MemoryStream(); public readonly byte[] Buffer = new byte[4096]; public Timer Timer; public string Id; public bool Closed, Writing, Accepting;
+        public PipeClient(OwnedListener listener, NamedPipeServerStream pipe) { Listener = listener; Pipe = pipe; ConnectionId = Guid.NewGuid().ToString("N"); }
+      }
+      sealed class OwnedListener {
+        public readonly PresenceRecord Record; public readonly string Sid; public readonly byte[] Descriptor; public readonly int Generation;
+        public readonly List<PipeClient> Clients = new List<PipeClient>(); public OwnedPublication Publication; public bool FirstCreated; public bool Stopped;
+        public OwnedListener(PresenceRecord record, string sid, byte[] descriptor, int generation) { Record = record; Sid = sid; Descriptor = descriptor; Generation = generation; }
+      }
+      static int ListenerGeneration = 0;
+      static void AssertPipeOwned(NamedPipeServerStream pipe, string sid) {
+        PipeSecurity security = pipe.GetAccessControl();
+        SecurityIdentifier owner = security.GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
+        if (owner == null || owner.Value != sid || !security.AreAccessRulesProtected) Fail("unsafe");
+        AuthorizationRuleCollection rules = security.GetAccessRules(true, true, typeof(SecurityIdentifier)); if (rules.Count != 1) Fail("unsafe");
+        PipeAccessRule rule = rules[0] as PipeAccessRule;
+        if (rule == null || rule.IsInherited || rule.AccessControlType != AccessControlType.Allow || rule.IdentityReference == null || rule.IdentityReference.Value != sid || rule.PipeAccessRights != PipeAccessRights.FullControl) Fail("unsafe");
+      }
+      static NamedPipeServerStream CreateOwnedPipe(OwnedListener listener, bool first) {
+        IntPtr descriptor = IntPtr.Zero, attributes = IntPtr.Zero, handle = IntPtr.Zero;
+        try {
+          descriptor = Marshal.AllocHGlobal(listener.Descriptor.Length); Marshal.Copy(listener.Descriptor, 0, descriptor, listener.Descriptor.Length);
+          int size = IntPtr.Size == 8 ? 24 : 12; attributes = Marshal.AllocHGlobal(size); for (int index = 0; index < size; index++) Marshal.WriteByte(attributes, index, 0);
+          Marshal.WriteInt32(attributes, 0, size); Marshal.WriteIntPtr(attributes, IntPtr.Size == 8 ? 8 : 4, descriptor);
+          handle = CreateNamedPipe(PipePrefix + listener.Record.Token, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0), PIPE_TYPE_BYTE | PIPE_WAIT, MaxPipeInstances, MaxPipeBytes, MaxPipeBytes, PipeDeadlineMilliseconds, attributes);
+          if (handle == IntPtr.Zero || handle.ToInt64() == -1) { Close(handle); Fail("unavailable"); }
+          NamedPipeServerStream pipe = new NamedPipeServerStream(PipeDirection.InOut, true, false, new SafePipeHandle(handle, true)); handle = IntPtr.Zero;
+          try { AssertPipeOwned(pipe, listener.Sid); return pipe; } catch { pipe.Dispose(); throw; }
+        } finally { Close(handle); if (attributes != IntPtr.Zero) Marshal.FreeHGlobal(attributes); if (descriptor != IntPtr.Zero) Marshal.FreeHGlobal(descriptor); }
+      }
+      static void FailListener(OwnedListener listener) {
+            if (listener == null || listener.Stopped) return;
+            listener.Stopped = true;
+            // Remove the identity-checked publication while an owned pipe still holds
+            // the endpoint. An unsafe publication is left untouched rather than deleted.
+            try { RemoveListenerPublication(listener); } catch {}
+            foreach (PipeClient client in listener.Clients.ToArray()) ClosePipe(client);
+            if (Listener == listener) Listener = null;
+          }
+          static void ClosePipe(PipeClient client) {
+        if (client == null || client.Closed) return;
+            OwnedListener listener = client.Listener;
+            bool active = Listener == listener && !listener.Stopped;
+            // Clients owns every server instance, including pending accepts. Before
+            // disposing the final instance, establish its replacement while this
+            // owned handle still prevents a third party from claiming the endpoint.
+            if (active && listener.Clients.Count == 1 && !ArmAccept(listener, client)) { FailListener(listener); return; }
+            client.Closed = true;
+        try { if (client.Timer != null) client.Timer.Dispose(); } catch {} try { client.Pipe.Dispose(); } catch {} client.Listener.Clients.Remove(client);
+        if (active && !ArmAccept(listener, null)) FailListener(listener);
+      }
+      static void SendEvent(PipeClient client) {
+        string wire = Convert.ToBase64String(client.Bytes.ToArray());
+        lock (OutputGate) { Console.Out.WriteLine("{\"event\":\"notification\",\"connectionId\":\"" + client.ConnectionId + "\",\"generation\":" + client.Listener.Generation.ToString(System.Globalization.CultureInfo.InvariantCulture) + ",\"wire\":\"" + wire + "\"}"); }
+      }
+      static void FinishAck(IAsyncResult result) {
+        PipeClient client = (PipeClient)result.AsyncState;
+        try { client.Pipe.EndWrite(result); } catch {}
+        lock (Gate) { ClosePipe(client); }
+      }
+      // Gate owns state transitions; BeginWrite runs only after the transition unlocks.
+      static bool PrepareAckLocked(PipeClient client, out string id) {
+        id = null;
+        if (client == null || client.Closed || client.Writing || Listener != client.Listener || client.Listener.Stopped || String.IsNullOrEmpty(client.Id)) return false;
+        client.Writing = true;
+        try { client.Timer.Change(PipeDeadlineMilliseconds, Timeout.Infinite); }
+        catch { ClosePipe(client); return false; }
+        id = client.Id; return true;
+      }
+      static void BeginAck(PipeClient client, string id, bool accepted, string error) {
+        string value = accepted ? "{\"version\":1,\"kind\":\"ack\",\"id\":\"" + id + "\",\"accepted\":true}\n" : "{\"version\":1,\"kind\":\"ack\",\"id\":\"" + id + "\",\"accepted\":false,\"error\":\"" + error + "\"}\n";
+        try { byte[] bytes = new UTF8Encoding(false).GetBytes(value); client.Pipe.BeginWrite(bytes, 0, bytes.Length, FinishAck, client); }
+        catch { lock (Gate) { ClosePipe(client); } }
+      }
+      static void OnPipeTimeout(object state) {
+        PipeClient timed = (PipeClient)state; string id;
+        lock (Gate) {
+          if (timed.Closed || Listener != timed.Listener || timed.Listener.Stopped) return;
+          // The initial deadline closes an incomplete request; the rearmed deadline
+          // closes an ACK that has not completed, rather than silently returning.
+          if (String.IsNullOrEmpty(timed.Id) || timed.Writing) { ClosePipe(timed); return; }
+          if (!PrepareAckLocked(timed, out id)) return;
+        }
+        BeginAck(timed, id, false, "timeout");
+      }
+      static void ReadPipe(IAsyncResult result) {
+        PipeClient client = (PipeClient)result.AsyncState;
+        try { int count = client.Pipe.EndRead(result); lock (Gate) {
+          if (client.Closed || Listener != client.Listener || client.Listener.Stopped) return;
+          if (count <= 0 || client.Bytes.Length + count > MaxPipeBytes) { ClosePipe(client); return; }
+          client.Bytes.Write(client.Buffer, 0, count); byte[] bytes = client.Bytes.GetBuffer(); int length = (int)client.Bytes.Length, newline = Array.IndexOf(bytes, (byte)10, 0, length);
+          if (newline < 0) { client.Pipe.BeginRead(client.Buffer, 0, client.Buffer.Length, ReadPipe, client); return; }
+          if (newline != length - 1) { ClosePipe(client); return; }
+          string text; try { text = new UTF8Encoding(false, true).GetString(bytes, 0, newline); } catch { ClosePipe(client); return; }
+          Match match = Regex.Match(text, "^\\{\\s*\"version\"\\s*:\\s*1\\s*,\\s*\"kind\"\\s*:\\s*\"notification\"\\s*,\\s*\"id\"\\s*:\\s*\"([A-Za-z0-9][A-Za-z0-9_-]{0,127})\"");
+          if (!match.Success) { ClosePipe(client); return; } client.Id = match.Groups[1].Value; SendEvent(client);
+        }} catch { lock (Gate) { ClosePipe(client); } }
+      }
+      static bool ArmAccept(OwnedListener listener, PipeClient retiring = null) {
+        if (listener.Stopped || Listener != listener) return false;
+            foreach (PipeClient candidate in listener.Clients) if (candidate != retiring && !candidate.Closed && candidate.Accepting) return true;
+            if (listener.Clients.Count >= MaxPipeInstances) return true;
+        NamedPipeServerStream pipe = null; PipeClient client = null;
+        try { pipe = CreateOwnedPipe(listener, !listener.FirstCreated); listener.FirstCreated = true; client = new PipeClient(listener, pipe); client.Accepting = true; pipe = null; listener.Clients.Add(client); client.Pipe.BeginWaitForConnection(AcceptPipe, client); return true; }
+        catch {
+              if (pipe != null) pipe.Dispose();
+              if (client != null) { client.Closed = true; try { client.Pipe.Dispose(); } catch {} listener.Clients.Remove(client); }
+              return false;
+            }
+      }
+      static void AcceptPipe(IAsyncResult result) {
+        PipeClient client = (PipeClient)result.AsyncState;
+        try { client.Pipe.EndWaitForConnection(result); lock (Gate) {
+          if (client.Closed || Listener != client.Listener || client.Listener.Stopped) { ClosePipe(client); return; }
+          client.Accepting = false;
+           if (!ArmAccept(client.Listener)) { FailListener(client.Listener); return; }
+          client.Timer = new Timer(OnPipeTimeout, client, PipeDeadlineMilliseconds, Timeout.Infinite);
+          client.Pipe.BeginRead(client.Buffer, 0, client.Buffer.Length, ReadPipe, client);
+        }} catch { lock (Gate) { ClosePipe(client); } }
+      }
+      public static PresenceRecord Listen(string sessionId, long createdAt, byte[] pipeDescriptor, byte[] presenceDescriptor, string sid) {
+        lock (Gate) {
+          RequirePresence(); if (Listener != null) Fail("busy");
+          PresenceRecord record = NewRecord(sessionId, createdAt);
+          OwnedListener listener = new OwnedListener(record, sid, pipeDescriptor, checked(++ListenerGeneration)); Listener = listener;
+          try {
+            if (!ArmAccept(listener) || listener.Clients.Count == 0) Fail("unavailable");
+            // The returned record is published while Gate still protects readiness,
+            // so a later native failure removes this exact owned publication.
+            listener.Publication = PublishOwned(record.SessionId, record.Endpoint, record.CreatedAt, presenceDescriptor, sid);
+            return record;
+          } catch { FailListener(listener); throw; }
+        }
+      }
+      public static void Acknowledge(string connectionId, int generation, string id, bool accepted) {
+        PipeClient selected = null; string ackId;
+            lock (Gate) {
+              if (Listener == null || Listener.Stopped || Listener.Generation != generation) return;
+              foreach (PipeClient client in Listener.Clients) if (!client.Closed && client.ConnectionId == connectionId && client.Id == id) { selected = client; break; }
+              if (selected == null || !PrepareAckLocked(selected, out ackId)) return;
+            }
+            BeginAck(selected, ackId, accepted, accepted ? null : "rejected");
+      }
+      public static void StopListener(string sessionId, string endpoint, long createdAt, string sid) {
+        lock (Gate) { if (Listener == null) return; string token; ValidateRecord(sessionId, endpoint, createdAt, out token); if (!SameRecord(Listener.Record, sessionId, endpoint, createdAt) || Listener.Sid != sid) Fail("unsafe"); OwnedListener listener = Listener; listener.Stopped = true; try { RemoveListenerPublication(listener); } finally { foreach (PipeClient client in listener.Clients.ToArray()) ClosePipe(client); Listener = null; } }
       }
       public static void Initialize(string agentHome, byte[] descriptor, string sid) {
     lock (Gate) {
@@ -474,6 +640,8 @@ public static class WindowsSessionBootstrap {
   }
   public static void CloseAll() {
         lock (Gate) {
+          // Stop accepts and clients before removing owned presence and ancestor handles.
+          if (Listener != null) { try { StopListener(Listener.Record.SessionId, Listener.Record.Endpoint, Listener.Record.CreatedAt, Listener.Sid); } catch { Listener = null; } }
           // Cleanup is best effort but always releases every retained publication handle before ancestors close.
           for (int index = OwnedPublications.Count - 1; index >= 0; index--) { OwnedPublication owned = OwnedPublications[index]; try { RemoveOwnedPublication(owned); } catch { if (OwnedPublications.Contains(owned)) OwnedPublications.Remove(owned); owned.Dispose(); } }
           for (int index = Handles.Count - 1; index >= 0; index--) Close(Handles[index]);
@@ -502,13 +670,19 @@ function Write-BootstrapRejectionDiagnostic([BootstrapFailure]$failure) {
 }
 
 function Write-Reply([string]$requestId, [bool]$ok, $result, [string]$error) {
-	if ($ok) { [Console]::Out.WriteLine((@{ requestId = $requestId; ok = $true; result = $result } | ConvertTo-Json -Compress -Depth 4)) }
-	else { [Console]::Out.WriteLine((@{ requestId = $requestId; ok = $false; error = $error } | ConvertTo-Json -Compress)) }
+	$line = if ($ok) { @{ requestId = $requestId; ok = $true; result = $result } | ConvertTo-Json -Compress -Depth 4 } else { @{ requestId = $requestId; ok = $false; error = $error } | ConvertTo-Json -Compress }
+	if ($nativeReady) { [WindowsSessionBootstrap]::WriteControl($line) } else { [Console]::Out.WriteLine($line) }
 }
 function Get-CurrentPrivateDescriptor {
 	$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
 	$security = [Security.AccessControl.DirectorySecurity]::new(); $security.SetAccessRuleProtection($true, $false); $security.SetOwner($sid)
 	$security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
+	return [pscustomobject]@{ Sid = $sid.Value; Descriptor = $security.GetSecurityDescriptorBinaryForm() }
+}
+function Get-CurrentPipeDescriptor {
+	$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+	$security = [IO.Pipes.PipeSecurity]::new(); $security.SetAccessRuleProtection($true, $false); $security.SetOwner($sid)
+	$security.AddAccessRule([IO.Pipes.PipeAccessRule]::new($sid, [IO.Pipes.PipeAccessRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
 	return [pscustomobject]@{ Sid = $sid.Value; Descriptor = $security.GetSecurityDescriptorBinaryForm() }
 }
 function ConvertTo-PublicPresenceRecord($record) {
@@ -583,6 +757,9 @@ try {
 			'list' { $hasExcludeSessionId = Is-ExactRequest $request @('requestId', 'operation', 'excludeSessionId'); if ($hasExcludeSessionId) { $excludeSessionId = $request.excludeSessionId; if ($excludeSessionId -isnot [string]) { Write-Reply $id $false $null 'invalid'; break requests } } elseif (-not (Is-ExactRequest $request @('requestId', 'operation'))) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { $identity = Get-CurrentPrivateDescriptor; $nativeRecords = if ($hasExcludeSessionId) { [WindowsSessionBootstrap]::List($excludeSessionId, $identity.Sid) } else { [WindowsSessionBootstrap]::List($identity.Sid) }; $records = @($nativeRecords | ForEach-Object { ConvertTo-PublicPresenceRecord $_ }); Write-Reply $id $true @{ records = $records } $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
 			'resolve' { if (-not (Is-ExactRequest $request @('requestId', 'operation', 'sessionId')) -or $request.sessionId -isnot [string]) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { $identity = Get-CurrentPrivateDescriptor; Write-Reply $id $true (ConvertTo-PublicPresenceRecord ([WindowsSessionBootstrap]::Resolve($request.sessionId, $identity.Sid))) $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
 			'remove' { $createdAt = [int64]0; if (-not (Is-ExactRequest $request @('requestId', 'operation', 'record')) -or -not (Is-PresenceRecord $request.record ([ref]$createdAt))) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { $identity = Get-CurrentPrivateDescriptor; [WindowsSessionBootstrap]::RemoveOwn($request.record.sessionId, $request.record.endpoint, $createdAt, $identity.Sid); Write-Reply $id $true @{ state = 'initialized'; bootstrap = 'complete' } $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
+			'listen' { $createdAt = [int64]0; if (-not (Is-ExactRequest $request @('requestId', 'operation', 'sessionId', 'createdAt')) -or $request.sessionId -isnot [string] -or -not (Try-PresenceCreatedAt $request.createdAt ([ref]$createdAt))) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { $pipeIdentity = Get-CurrentPipeDescriptor; $presenceIdentity = Get-CurrentPrivateDescriptor; if ($pipeIdentity.Sid -ne $presenceIdentity.Sid) { throw [System.InvalidOperationException]::new() }; Write-Reply $id $true (ConvertTo-PublicPresenceRecord ([WindowsSessionBootstrap]::Listen($request.sessionId, $createdAt, $pipeIdentity.Descriptor, $presenceIdentity.Descriptor, $pipeIdentity.Sid))) $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
+			'ack' { $generation = [int64]0; if (-not (Is-ExactRequest $request @('requestId', 'operation', 'connectionId', 'generation', 'id', 'accepted')) -or -not (Is-RequestId $request.connectionId) -or -not (Is-RequestId $request.id) -or -not (Try-PresenceCreatedAt $request.generation ([ref]$generation)) -or $generation -lt 1 -or $generation -gt 2147483647 -or $request.accepted -isnot [bool]) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { [WindowsSessionBootstrap]::Acknowledge($request.connectionId, [int]$generation, $request.id, $request.accepted); Write-Reply $id $true @{ state = 'initialized'; bootstrap = 'complete' } $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
+			'stop-listener' { $createdAt = [int64]0; if (-not (Is-ExactRequest $request @('requestId', 'operation', 'record')) -or -not (Is-PresenceRecord $request.record ([ref]$createdAt))) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { $identity = Get-CurrentPrivateDescriptor; [WindowsSessionBootstrap]::StopListener($request.record.sessionId, $request.record.endpoint, $createdAt, $identity.Sid); Write-Reply $id $true @{ state = 'initialized'; bootstrap = 'complete' } $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
 			'shutdown' { if (-not (Is-ExactRequest $request @('requestId', 'operation'))) { Write-Reply $id $false $null 'invalid'; break requests }; if ($nativeReady) { [WindowsSessionBootstrap]::CloseAll() }; Write-Reply $id $true @{ state = 'partial' } $null; break }
 			default { Write-Reply $id $false $null 'invalid'; break }
 		}

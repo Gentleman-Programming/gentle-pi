@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdtemp, mkdir, readFile, stat } from "node:fs/promises";
+import { createConnection } from "node:net";
 import os from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { FIXED_WINDOWS_POWERSHELL, parseWindowsHostFrame } from "../lib/windows-session-transport.ts";
+import { FIXED_WINDOWS_POWERSHELL, WindowsActiveSessionClient, WindowsActiveSessionListener, WindowsSessionPresenceRegistry, parseWindowsHostFrame } from "../lib/windows-session-transport.ts";
+import { ActiveSessionClientError, FrameDecoder, encodeNotificationFrame, type AckFrame } from "../lib/agents-session-transport.ts";
 
 const runtime = fileURLToPath(new URL("../runtime/windows-session-transport.ps1", import.meta.url));
 const fixture = fileURLToPath(new URL("fixtures/windows-session-bootstrap.ps1", import.meta.url));
@@ -988,4 +990,282 @@ test("Windows-native bootstrap rejects a reparse routing parent and concurrent i
 		for (const frame of results) assert.deepEqual(frame.result, { state: "initialized", bootstrap: "complete", entries: 0 });
 		await Promise.all(helpers.map((candidate) => candidate.shutdown()));
 	}, { diagnostics });
+});
+
+async function withWindowsNativeListener<T>(callback: (notification: Readonly<{ id: string; senderSessionId: string; message: string }>) => Promise<void>, action: (value: Readonly<{ listener: WindowsActiveSessionListener; client: WindowsActiveSessionClient; agentHome: string }>) => Promise<T>, createRegistry: (home: string) => Promise<WindowsSessionPresenceRegistry> = (home) => WindowsSessionPresenceRegistry.create(home)): Promise<T> {
+	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-listener-"));
+	const agentHome = join(root, "profile", "agent");
+	await mkdir(join(agentHome, "gentle-agents"), { recursive: true });
+	let listenerRegistry: WindowsSessionPresenceRegistry | undefined;
+	let clientRegistry: WindowsSessionPresenceRegistry | undefined;
+	let listener: WindowsActiveSessionListener | undefined;
+	let client: WindowsActiveSessionClient | undefined;
+	let listenerClosed = false;
+	try {
+		listenerRegistry = await createRegistry(agentHome);
+		clientRegistry = await createRegistry(agentHome);
+		listener = new WindowsActiveSessionListener(listenerRegistry, "recipient", callback);
+		client = new WindowsActiveSessionClient(clientRegistry, "sender");
+		await listener.start();
+		return await action({ listener, client, agentHome });
+	} finally {
+		client?.close();
+		if (listener) { await listener.close().then(() => { listenerClosed = true; }, () => {}); }
+		if (listenerRegistry && !listenerClosed) await listenerRegistry.close().catch(() => {});
+		if (clientRegistry) await clientRegistry.close().catch(() => {});
+	}
+}
+
+function waitWindowsNativeSignal(signal: Promise<void>, message: string) {
+	return new Promise<void>((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(message)), 2_500);
+		void signal.then(() => { clearTimeout(timer); resolve(); }, () => { clearTimeout(timer); reject(new Error(message)); });
+	});
+}
+
+test("Windows native listener setup closes the first acquired registry when the second acquisition rejects", async () => {
+	let closes = 0;
+	const first = { close: async () => { closes++; } } as unknown as WindowsSessionPresenceRegistry;
+	let calls = 0;
+	await assert.rejects(withWindowsNativeListener(async () => {}, async () => assert.fail("action must not run"), async () => {
+		if (++calls === 1) return first;
+		throw new Error("second registry failed");
+	}), /second registry failed/);
+	assert.equal(closes, 1);
+});
+
+function openWindowsNativePipe(endpoint: string) {
+	return new Promise<ReturnType<typeof createConnection>>((resolve, reject) => {
+		const socket = createConnection(endpoint);
+		const timer = setTimeout(() => { socket.destroy(); reject(new Error("Windows native pipe did not connect")); }, 2_000);
+		socket.once("connect", () => { clearTimeout(timer); resolve(socket); });
+		socket.once("error", () => { clearTimeout(timer); reject(new Error("Windows native pipe did not connect")); });
+	});
+}
+
+function readWindowsNativeAck(socket: ReturnType<typeof createConnection>, expectedId: string) {
+	return new Promise<AckFrame>((resolve, reject) => {
+		const decoder = new FrameDecoder();
+		const timer = setTimeout(() => { socket.destroy(); reject(new Error("Windows native ACK did not arrive")); }, 2_500);
+		const finish = (error?: Error, ack?: AckFrame) => { clearTimeout(timer); socket.removeAllListeners("data"); socket.removeAllListeners("end"); socket.removeAllListeners("error"); error ? reject(error) : resolve(ack!); };
+		socket.on("data", (chunk: Buffer) => { try { decoder.push(chunk); } catch { finish(new Error("Windows native ACK was invalid")); } });
+		socket.once("end", () => { try { const frame = decoder.finish(); if (frame.kind !== "ack" || frame.id !== expectedId) throw new Error(); finish(undefined, frame); } catch { finish(new Error("Windows native ACK was invalid")); } });
+		socket.once("error", () => finish(new Error("Windows native ACK failed")));
+	});
+}
+
+function probeWindowsNativeEndpoint(endpoint: string) {
+	return new Promise<string>((resolve, reject) => {
+		const socket = createConnection(endpoint);
+		const timer = setTimeout(() => { socket.destroy(); reject(new Error("Windows native endpoint release timed out")); }, 1_000);
+		socket.once("connect", () => { clearTimeout(timer); socket.destroy(); reject(new Error("Windows native endpoint remained connectable")); });
+		socket.once("error", (error: NodeJS.ErrnoException) => { clearTimeout(timer); resolve(error.code ?? "unknown"); });
+	});
+}
+
+test("Windows listener source guard publishes only from its Gate-protected readiness transition", async (t) => {
+	t.diagnostic("source guard, not native Windows proof");
+	const source = await readFile(runtime, "utf8");
+	const listenStart = source.indexOf("public static PresenceRecord Listen(");
+	const listenEnd = source.indexOf("public static void Acknowledge", listenStart);
+	assert.ok(listenStart >= 0 && listenEnd > listenStart, "source guard: listener readiness transition was not found");
+	const listen = source.slice(listenStart, listenEnd);
+	assert.match(listen, /byte\[\] pipeDescriptor, byte\[\] presenceDescriptor, string sid/);
+	const lockStart = listen.indexOf("lock (Gate)");
+	const open = listen.indexOf("{", lockStart);
+	assert.ok(lockStart >= 0 && open > lockStart, "source guard: listener readiness must acquire Gate");
+	let depth = 0, close = -1;
+	for (let index = open; index < listen.length; index++) { if (listen[index] === "{") depth++; else if (listen[index] === "}" && --depth === 0) { close = index; break; } }
+	assert.ok(close > open, "source guard: listener readiness Gate region was not balanced");
+	const guarded = listen.slice(open + 1, close);
+	assert.match(guarded, /ArmAccept\(listener\)[\s\S]*?listener\.Publication = PublishOwned\(record\.SessionId, record\.Endpoint, record\.CreatedAt, presenceDescriptor, sid\)[\s\S]*?return record/);
+	assert.match(guarded, /catch \{ FailListener\(listener\); throw; \}/);
+	const cleanupStart = source.indexOf("static void RemoveListenerPublication(");
+	const cleanupEnd = source.indexOf("public static void RemoveOwn", cleanupStart);
+	assert.ok(cleanupStart >= 0 && cleanupEnd > cleanupStart, "source guard: listener publication authority was not found");
+	const cleanup = source.slice(cleanupStart, cleanupEnd);
+	assert.match(cleanup, /OwnedPublication owned = listener\.Publication; listener\.Publication = null;/);
+	assert.match(cleanup, /owned == null \|\| !OwnedPublications\.Contains\(owned\)/);
+	assert.match(cleanup, /RemoveOwnedPublication\(owned\);/);
+	const failureStart = source.indexOf("static void FailListener(");
+	const failureEnd = source.indexOf("static void ClosePipe", failureStart);
+	const failure = source.slice(failureStart, failureEnd);
+	assert.match(failure, /RemoveListenerPublication\(listener\)/);
+	assert.doesNotMatch(failure, /RemoveOwn\(/);
+});
+
+test("Windows listener source guard retains owned pipe continuity across the last close", async (t) => {
+	t.diagnostic("source guard, not native Windows proof");
+	const source = await readFile(runtime, "utf8");
+	assert.match(source, /public bool Closed, Writing, Accepting;/);
+	const closeStart = source.indexOf("static void ClosePipe(");
+	const closeEnd = source.indexOf("static void SendEvent", closeStart);
+	assert.ok(closeStart >= 0 && closeEnd > closeStart, "source guard: pipe close transition was not found");
+	const close = source.slice(closeStart, closeEnd);
+	assert.match(close, /listener\.Clients\.Count == 1[\s\S]*?ArmAccept\(listener, client\)[\s\S]*?client\.Pipe\.Dispose/);
+	assert.match(close, /!ArmAccept\(listener, null\)\) FailListener\(listener\);/);
+	const armStart = source.indexOf("static bool ArmAccept(");
+	const armEnd = source.indexOf("static void AcceptPipe", armStart);
+	assert.ok(armStart >= 0 && armEnd > armStart, "source guard: accept ownership transition was not found");
+	const arm = source.slice(armStart, armEnd);
+	assert.match(arm, /candidate != retiring && !candidate\.Closed && candidate\.Accepting/);
+	assert.match(arm, /client\.Accepting = true;[\s\S]*?client\.Pipe\.BeginWaitForConnection/);
+	const failureStart = source.indexOf("static void FailListener(");
+	const failureEnd = source.indexOf("static void ClosePipe", failureStart);
+	assert.ok(failureStart >= 0 && failureEnd > failureStart, "source guard: failed-listener cleanup was not found");
+	const failure = source.slice(failureStart, failureEnd);
+	assert.match(failure, /listener\.Stopped = true;[\s\S]*?RemoveListenerPublication\(listener\)[\s\S]*?ClosePipe/);
+	const stopStart = source.indexOf("public static void StopListener(");
+	const stopEnd = source.indexOf("public static void Initialize", stopStart);
+	assert.ok(stopStart >= 0 && stopEnd > stopStart, "source guard: explicit listener stop was not found");
+	const stop = source.slice(stopStart, stopEnd);
+	assert.match(stop, /listener\.Stopped = true; try \{ RemoveListenerPublication\(listener\); \} finally \{ foreach \(PipeClient client in listener\.Clients\.ToArray\(\)\) ClosePipe/);
+});
+
+test("Windows listener ACK watchdog source guard releases Gate before asynchronous write", async (t) => {
+	t.diagnostic("source guard, not native Windows proof");
+	const source = await readFile(runtime, "utf8");
+	const prepareStart = source.indexOf("static bool PrepareAckLocked(");
+	const prepareEnd = source.indexOf("static void BeginAck(", prepareStart);
+	assert.ok(prepareStart >= 0 && prepareEnd > prepareStart, "source guard: ACK state transition must be separated from I/O");
+	const prepare = source.slice(prepareStart, prepareEnd);
+	assert.match(prepare, /client\.Writing = true;/);
+	assert.match(prepare, /client\.Timer\.Change\(PipeDeadlineMilliseconds, Timeout\.Infinite\)/);
+	const beginStart = prepareEnd;
+	const beginEnd = source.indexOf("static void OnPipeTimeout", beginStart);
+	assert.ok(beginEnd > beginStart, "source guard: asynchronous ACK dispatch was not found");
+	const begin = source.slice(beginStart, beginEnd);
+	assert.match(begin, /client\.Pipe\.BeginWrite/);
+	assert.doesNotMatch(begin, /lock\s*\(Gate\)[\s\S]*?BeginWrite/);
+	const acknowledgeStart = source.indexOf("public static void Acknowledge(");
+	const acknowledgeEnd = source.indexOf("public static void StopListener", acknowledgeStart);
+	assert.ok(acknowledgeStart >= 0 && acknowledgeEnd > acknowledgeStart, "source guard: acknowledgement entry point was not found");
+	const acknowledge = source.slice(acknowledgeStart, acknowledgeEnd);
+	assert.match(acknowledge, /PrepareAckLocked\(selected, out ackId\)[\s\S]*?\}\s*BeginAck\(selected, ackId/);
+	const timeoutStart = source.indexOf("static void OnPipeTimeout(");
+	const timeoutEnd = source.indexOf("public static PresenceRecord Listen", timeoutStart);
+	assert.ok(timeoutStart >= 0 && timeoutEnd > timeoutStart, "source guard: ACK watchdog callback was not found");
+	const timeout = source.slice(timeoutStart, timeoutEnd);
+	assert.match(timeout, /if \(String\.IsNullOrEmpty\(timed\.Id\) \|\| timed\.Writing\) \{ ClosePipe\(timed\); return; \}/);
+});
+
+test("Windows-native listener readiness registers callback before publication and ACKs only accepted semantic delivery", { skip: process.platform !== "win32", timeout: 30_000 }, async () => {
+	let release!: () => void;
+	const callbackGate = new Promise<void>((resolve) => { release = resolve; });
+	let callbackSeen!: () => void;
+	const seen = new Promise<void>((resolve) => { callbackSeen = resolve; });
+	await withWindowsNativeListener(async (notification) => {
+		assert.deepEqual(notification, { id: "ready-1", senderSessionId: "sender", message: "hello" });
+		callbackSeen();
+		await callbackGate;
+	}, async ({ listener, client }) => {
+		assert.equal(listener.status, "active");
+		const sent = client.sendNotification("recipient", "hello", { id: "ready-1" });
+		void sent.catch(() => {});
+		await waitWindowsNativeSignal(seen, "Windows native callback did not begin");
+		let settled = false;
+		void sent.then(() => { settled = true; }, () => { settled = true; });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(settled, false, "ACK must wait for semantic callback acceptance");
+		release();
+		assert.deepEqual(await sent, { id: "ready-1", accepted: true });
+	});
+});
+
+test("Windows-native listener returns a rejected ACK when semantic delivery rejects", { skip: process.platform !== "win32", timeout: 30_000 }, async () => {
+	await withWindowsNativeListener(async () => { throw new Error("rejected"); }, async ({ client }) => {
+		await assert.rejects(client.sendNotification("recipient", "hello", { id: "reject-1" }), (error: unknown) => error instanceof ActiveSessionClientError && error.code === "remote_rejected");
+	});
+});
+
+test("Windows-native listener isolates one held partial pipe while a parallel complete client succeeds", { skip: process.platform !== "win32", timeout: 30_000 }, async () => {
+	await withWindowsNativeListener(async () => {}, async ({ listener, client }) => {
+		let partial: ReturnType<typeof createConnection> | undefined;
+		try {
+			partial = await openWindowsNativePipe(listener.record!.endpoint);
+			partial.write(Buffer.from('{"version":1,"kind":"notification","id":"partial-1"', "utf8"));
+			assert.deepEqual(await client.sendNotification("recipient", "parallel", { id: "parallel-1" }), { id: "parallel-1", accepted: true });
+		} finally { partial?.destroy(); }
+	});
+});
+
+test("Windows-native malformed wire is isolated to its connection and does not stop the helper listener", { skip: process.platform !== "win32", timeout: 30_000 }, async () => {
+	await withWindowsNativeListener(async () => {}, async ({ listener, client }) => {
+		let malformed: ReturnType<typeof createConnection> | undefined;
+		try {
+			malformed = await openWindowsNativePipe(listener.record!.endpoint);
+			malformed.write(Buffer.from('{"version":1,"kind":"notification","id":"malformed-1","senderSessionId":"sender"}\n', "utf8"));
+			await new Promise<void>((resolve) => setTimeout(resolve, 25));
+			assert.deepEqual(await client.sendNotification("recipient", "still-live", { id: "after-malformed-1" }), { id: "after-malformed-1", accepted: true });
+		} finally { malformed?.destroy(); }
+	});
+});
+
+test("Windows-native stop closes active delivery, removes publication, and releases the endpoint", { skip: process.platform !== "win32", timeout: 30_000 }, async () => {
+	let callbackSeen!: () => void;
+	const seen = new Promise<void>((resolve) => { callbackSeen = resolve; });
+	await withWindowsNativeListener(async () => {
+		callbackSeen();
+		await new Promise<void>(() => {});
+	}, async ({ listener, client, agentHome }) => {
+		const record = listener.record!;
+		const token = record.endpoint.slice("\\\\.\\pipe\\gentle-pi-".length);
+		const publication = join(agentHome, "gentle-agents", "transport", "presence", `recipient.${token}.json`);
+		const pending = client.sendNotification("recipient", "hold", { id: "stop-1" });
+		void pending.catch(() => {});
+		await waitWindowsNativeSignal(seen, "Windows native stop callback did not begin");
+		await listener.close();
+		await assert.rejects(pending);
+		await assert.rejects(stat(publication));
+		assert.equal(listener.status, "closed");
+	});
+});
+
+test("Windows-native listener restores full partial-frame accept capacity after deadline closure", { skip: process.platform !== "win32", timeout: 30_000 }, async () => {
+	let callbacks = 0;
+	await withWindowsNativeListener(async () => { callbacks++; }, async ({ listener, client }) => {
+		const partials: ReturnType<typeof createConnection>[] = [];
+		try {
+			for (let index = 0; index < 4; index++) {
+				const socket = await openWindowsNativePipe(listener.record!.endpoint);
+				partials.push(socket);
+				socket.write(Buffer.from(`{"version":1,"kind":"notification","id":"capacity-${index}"`, "utf8"));
+			}
+			await new Promise<void>((resolve) => setTimeout(resolve, 2_250));
+			assert.deepEqual(await client.sendNotification("recipient", "after-capacity", { id: "after-capacity-1" }), { id: "after-capacity-1", accepted: true });
+			assert.equal(callbacks, 1);
+		} finally { for (const socket of partials) socket.destroy(); }
+	});
+});
+
+test("Windows-native listener returns the exact rejected ACK after its semantic callback executes", { skip: process.platform !== "win32", timeout: 30_000 }, async () => {
+	let callbacks = 0;
+	await withWindowsNativeListener(async () => { callbacks++; throw new Error("rejected"); }, async ({ listener }) => {
+		const socket = await openWindowsNativePipe(listener.record!.endpoint);
+		try {
+			const id = "raw-reject-1";
+			const ack = readWindowsNativeAck(socket, id);
+			socket.write(encodeNotificationFrame({ version: 1, kind: "notification", id, senderSessionId: "sender", recipientSessionId: "recipient", message: "reject" }));
+			const frame = await ack;
+			assert.equal(callbacks, 1);
+			assert.deepEqual(frame, { version: 1, kind: "ack", id, accepted: false, error: "rejected" });
+		} finally { socket.destroy(); }
+	});
+});
+
+test("Windows-native stop removes publication, settles delivery, and releases its returned endpoint", { skip: process.platform !== "win32", timeout: 30_000 }, async () => {
+	let callbackSeen!: () => void;
+	const seen = new Promise<void>((resolve) => { callbackSeen = resolve; });
+	await withWindowsNativeListener(async () => { callbackSeen(); await new Promise<void>(() => {}); }, async ({ listener, client, agentHome }) => {
+		const record = listener.record!;
+		const token = record.endpoint.slice("\\\\.\\pipe\\gentle-pi-".length);
+		const publication = join(agentHome, "gentle-agents", "transport", "presence", `recipient.${token}.json`);
+		const pending = client.sendNotification("recipient", "stop", { id: "stop-probe-1" });
+		void pending.catch(() => {});
+		await waitWindowsNativeSignal(seen, "Windows native endpoint stop callback did not begin");
+		await listener.close();
+		await assert.rejects(pending);
+		await assert.rejects(stat(publication));
+		assert.ok(["ENOENT", "ECONNREFUSED"].includes(await probeWindowsNativeEndpoint(record.endpoint)));
+	});
 });
