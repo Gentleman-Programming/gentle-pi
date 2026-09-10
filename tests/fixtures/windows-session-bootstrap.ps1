@@ -55,7 +55,17 @@ public static class WindowsSessionBootstrapFixture {
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool MoveFileEx(string source, string destination, uint flags);
 }
 '@ -ErrorAction Stop
-			if (-not [WindowsSessionBootstrapFixture]::MoveFileEx($temp, $Path, 1)) {
+			$original = "$Path.original-$([Guid]::NewGuid().ToString('N'))"
+			$movedOriginal = [WindowsSessionBootstrapFixture]::MoveFileEx($Path, $original, 0)
+			if (-not $movedOriginal) {
+				$replacementCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+				$replacementCodeKind = if ($replacementCode -eq 0) { 'unknown' } else { 'win32' }
+				if ($replacementCodeKind -eq 'unknown') { $replacementCode = $null }
+				Write-Result @{ ok = $false; kind = 'windows-session-bootstrap-fixture-failure'; stage = $replacementStage; codeKind = $replacementCodeKind; code = $replacementCode }
+				exit 1
+			}
+			$movedReplacement = [WindowsSessionBootstrapFixture]::MoveFileEx($temp, $Path, 0)
+			if (-not $movedReplacement) {
 				$replacementCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
 				$replacementCodeKind = if ($replacementCode -eq 0) { 'unknown' } else { 'win32' }
 				if ($replacementCodeKind -eq 'unknown') { $replacementCode = $null }

@@ -697,7 +697,10 @@ test("Windows fixture replacement failures expose only fixed stages and numeric 
 	const source = await readFile(fixture, "utf8");
 	assert.match(source, /\$replacementStage = 'replacement-copy'[\s\S]*?\[IO\.File\]::Copy/);
 	assert.match(source, /\$replacementStage = 'replacement-acl'\s*Set-Acl/);
-	assert.match(source, /\$replacementStage = 'replacement-rename'[\s\S]*?MoveFileEx\(\$temp, \$Path, 1\)/);
+	assert.match(source, /\$original = "\$Path\.original-\$\(\[Guid\]::NewGuid\(\)\.ToString\('N'\)\)"/);
+	assert.match(source, /\$replacementStage = 'replacement-rename'[\s\S]*?MoveFileEx\(\$Path, \$original, 0\)/);
+	assert.match(source, /MoveFileEx\(\$temp, \$Path, 0\)/);
+	assert.doesNotMatch(source, /MoveFileEx\(\$temp, \$Path, 1\)/);
 	assert.match(source, /\[Runtime\.InteropServices\.Marshal\]::GetLastWin32Error\(\)/);
 	assert.match(source, /kind = 'windows-session-bootstrap-fixture-failure'; stage = \$replacementStage; codeKind = \$replacementCodeKind; code = \$replacementCode/);
 	assert.doesNotMatch(source, /replacementStage[\s\S]*?\.Message|replacementStage[\s\S]*?\.ToString\(\)|replacementStage[\s\S]*?StackTrace/);
@@ -797,6 +800,7 @@ test("Windows-native presence publishes, resolves, lists, and removes only its o
 		const token = (record.endpoint as string).slice("\\\\.\\pipe\\gentle-pi-".length);
 		const publishedPath = join(agentHome, "gentle-agents", "transport", "presence", `session-a.${token}.json`);
 		assert.deepEqual(await fixtureResult("replace-identical", publishedPath), { ok: true, replaced: true });
+		assert.deepEqual(requirePublicPresenceResult(await held.presence("list")), { records: [record] }, "the replacement retains the public record and accepted ACL");
 		assert.equal((await held.presence("remove", { record })).error, "unsafe", "a replacement with identical public bytes and ACL is not owned");
 		await stat(publishedPath);
 	} finally { await held.closeInput(); }
