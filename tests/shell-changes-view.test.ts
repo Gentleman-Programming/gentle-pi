@@ -58,6 +58,10 @@ function mouse(type: TuiMouseEvent["type"], x: number, y: number, wheelDelta?: n
 	return { type, button: type === "wheel" ? "none" : "left", x, y, screenX: x, screenY: y, width: 80, height, shift: false, alt: false, ctrl: false, wheelDelta };
 }
 
+function mouseButton(type: TuiMouseEvent["type"], button: TuiMouseEvent["button"], x: number, y: number, height: number): TuiMouseEvent {
+	return { type, button, x, y, screenX: x, screenY: y, width: 80, height, shift: false, alt: false, ctrl: false };
+}
+
 test("worktree accordion keeps groups and nested files beside a framed lazy diff", async () => {
 	const trees = ["/main", "/linked"].map((root) => ({ root, branch: root === "/main" ? "main" : undefined, model: changesModel([file("same.ts", 1, 0)]) }));
 	const loaded: string[] = [];
@@ -164,6 +168,58 @@ test("worktree pointer regions scroll independently and expire on refresh or dis
 	assert.doesNotMatch(component.render(80)[1], /@@/);
 	component.dispose();
 	assert.deepEqual(component.handleMouse(mouse("click", 3, 1, undefined, 8)), { handled: true, render: false });
+});
+
+test("file-list pointer capture is limited to an active left gesture in both views", () => {
+	const { view: standalone } = view();
+	const accordion = new WorktreeChangesView([{ root: "/main", branch: "main", model: changesModel([file("a.ts", 1, 0)]) }], {
+		theme: plainTheme, rows: 8, loadDiff: async () => "+preview", onOpen() {}, onClose() {}, onRefresh() {}, requestRender() {},
+	});
+	accordion.handleInput("\r");
+	standalone.render(80);
+	accordion.render(80);
+	for (const [component, y, height] of [[standalone, 1, 12], [accordion, 2, 8]] as const) {
+		for (const button of ["right", "middle"] as const) {
+			assert.equal(component.handleMouse(mouseButton("press", button, 3, y, height)), undefined, `${button} press must reach pi-tui fallback`);
+			assert.equal(component.handleMouse(mouseButton("release", button, 3, y, height)), undefined, `${button} release must reach pi-tui fallback`);
+		}
+		assert.deepEqual(component.handleMouse(mouseButton("press", "left", 3, y, height)), { handled: true, capture: true, render: false });
+		assert.deepEqual(component.handleMouse(mouseButton("release", "none", 3, y, height)), { handled: true, render: false });
+	}
+	standalone.handleMouse(mouseButton("press", "left", 3, 1, 12));
+	standalone.update(changesModel([file("a.ts", 1, 0)]));
+	standalone.render(80);
+	assert.equal(standalone.handleMouse(mouseButton("release", "none", 3, 1, 12)), undefined, "update clears a captured left gesture");
+	accordion.handleMouse(mouseButton("press", "left", 3, 2, 8));
+	accordion.invalidate();
+	accordion.render(80);
+	assert.equal(accordion.handleMouse(mouseButton("release", "none", 3, 2, 8)), undefined, "invalidate clears a captured left gesture");
+});
+
+test("right press reaches the native Windows paste fallback when eligible", () => {
+	let onInput: ((data: string) => void) | undefined;
+	let pasted = 0;
+	const terminal: Terminal = {
+		start(input) { onInput = input; }, stop() {}, async drainInput() {}, write() {}, get columns() { return 80; }, get rows() { return 12; }, get kittyProtocolActive() { return false; }, moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {},
+	};
+	const { view: component } = view();
+	const tui = new TuiAltScreen(terminal, false, undefined, { mouse: true, onRightClickPaste: () => { pasted++; } });
+	const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+	const termProgram = process.env.TERM_PROGRAM;
+	Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+	delete process.env.TERM_PROGRAM;
+	tui.setLayoutRoot(component);
+	tui.start();
+	tui.renderNow(true);
+	try {
+		onInput?.("\x1b[<2;4;2M");
+		assert.equal(pasted, 1);
+	} finally {
+		tui.stop();
+		Object.defineProperty(process, "platform", platform);
+		if (termProgram === undefined) delete process.env.TERM_PROGRAM;
+		else process.env.TERM_PROGRAM = termProgram;
+	}
 });
 
 test("worktree list keeps selection visible, preserves root across reorder and refreshes from either level", async () => {

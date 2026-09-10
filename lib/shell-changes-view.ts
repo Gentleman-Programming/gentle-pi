@@ -156,6 +156,7 @@ export class WorktreeChangesView {
 	private listOffset = 0;
 	private pointerLayout: PointerLayout | undefined;
 	private disposed = false;
+	private leftPressActive = false;
 	private readonly expanded = new Set<string>();
 	private readonly previews = new Map<string, { fingerprint: string; view: ChangesView }>();
 
@@ -169,6 +170,7 @@ export class WorktreeChangesView {
 	}
 
 	update(trees: WorktreeChanges[]): void {
+		this.leftPressActive = false;
 		if (this.disposed) return;
 		this.pointerLayout = undefined;
 		const before = this.visibleRows()[this.selected];
@@ -229,8 +231,16 @@ export class WorktreeChangesView {
 			return undefined;
 		}
 		if (!inFiles) return undefined;
-		if (event.type === "press") return { handled: true, capture: true, render: false };
-		if (event.type === "release") return { handled: true, render: false };
+		if (event.type === "press") {
+			if (event.button !== "left") return undefined;
+			this.leftPressActive = true;
+			return { handled: true, capture: true, render: false };
+		}
+		if (event.type === "release") {
+			if (!this.leftPressActive || (event.button !== "left" && event.button !== "none")) return undefined;
+			this.leftPressActive = false;
+			return { handled: true, render: false };
+		}
 		if (event.type !== "click" || event.button !== "left") return undefined;
 		const index = this.listOffset + event.y - 1;
 		if (index < 0 || index >= this.visibleRows().length) return { handled: true, render: false };
@@ -262,12 +272,14 @@ export class WorktreeChangesView {
 	}
 
 	invalidate(): void {
+		this.leftPressActive = false;
 		this.pointerLayout = undefined;
 		for (const preview of this.previews.values()) preview.view.invalidate();
 	}
 
 	dispose(): void {
 		this.disposed = true;
+		this.leftPressActive = false;
 		this.pointerLayout = undefined;
 		for (const preview of this.previews.values()) preview.view.dispose();
 		this.previews.clear();
@@ -316,6 +328,7 @@ export class ChangesView {
 	private diffScroll = 0;
 	private pointerLayout: PointerLayout | undefined;
 	private disposed = false;
+	private leftPressActive = false;
 	private readonly diffs = new Map<string, string[]>();
 
 	constructor(model: ChangesModel, deps: ChangesViewDeps) {
@@ -327,6 +340,7 @@ export class ChangesView {
 	// Replace the model while open: keep the selection by path and drop cached
 	// diffs for files whose counts moved so they reload.
 	update(model: ChangesModel): void {
+		this.leftPressActive = false;
 		if (this.disposed) return;
 		this.pointerLayout = undefined;
 		const selectedPath = this.model.files[this.selected]?.path;
@@ -349,6 +363,7 @@ export class ChangesView {
 
 	dispose(): void {
 		this.disposed = true;
+		this.leftPressActive = false;
 		this.pointerLayout = undefined;
 	}
 
@@ -383,8 +398,16 @@ export class ChangesView {
 			return undefined;
 		}
 		if (!inFiles) return undefined;
-		if (event.type === "press") return { handled: true, capture: true, render: false };
-		if (event.type === "release") return { handled: true, render: false };
+		if (event.type === "press") {
+			if (event.button !== "left") return undefined;
+			this.leftPressActive = true;
+			return { handled: true, capture: true, render: false };
+		}
+		if (event.type === "release") {
+			if (!this.leftPressActive || (event.button !== "left" && event.button !== "none")) return undefined;
+			this.leftPressActive = false;
+			return { handled: true, render: false };
+		}
 		if (event.type !== "click" || event.button !== "left") return undefined;
 		const index = this.fileScroll + event.y - 1;
 		if (index < 0 || index >= this.model.files.length) return { handled: true, render: false };
@@ -403,6 +426,7 @@ export class ChangesView {
 	}
 
 	invalidate(): void {
+		this.leftPressActive = false;
 		this.pointerLayout = undefined;
 	}
 
