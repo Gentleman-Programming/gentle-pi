@@ -11,6 +11,25 @@ test("Windows bridge accepts only bounded protocol frames and uses the fixed PS5
 	}
 });
 
+test("Windows bridge admits bounded public presence results while rejecting private metadata", () => {
+	const endpoint = "\\\\.\\pipe\\gentle-pi-0123456789abcdef0123456789abcdef";
+	assert.deepEqual(parseWindowsHostFrame(`{"requestId":"record-1","ok":true,"result":{"version":1,"sessionId":"session-a","endpoint":"${endpoint.replaceAll("\\", "\\\\")}","createdAt":1}}`), {
+		requestId: "record-1", ok: true, result: { version: 1, sessionId: "session-a", endpoint, createdAt: 1 },
+	});
+	assert.deepEqual(parseWindowsHostFrame(`{"requestId":"list-2","ok":true,"result":{"records":[{"version":1,"sessionId":"session-a","endpoint":"${endpoint.replaceAll("\\", "\\\\")}","createdAt":1}]}}`), {
+		requestId: "list-2", ok: true, result: { records: [{ version: 1, sessionId: "session-a", endpoint, createdAt: 1 }] },
+	});
+	assert.throws(() => parseWindowsHostFrame(`{"requestId":"record-1","ok":true,"result":{"version":1,"sessionId":"session-a","endpoint":"${endpoint.replaceAll("\\", "\\\\")}","createdAt":1,"path":"C:\\\\private"}}`), /invalid Windows transport frame/);
+});
+
+test("Windows bridge rejects list elements with extra or malformed public fields", () => {
+	const endpoint = "\\\\.\\pipe\\gentle-pi-0123456789abcdef0123456789abcdef".replaceAll("\\", "\\\\");
+	for (const record of [
+		`{"version":1,"sessionId":"session-a","endpoint":"${endpoint}","createdAt":1,"extra":true}`,
+		`{"version":1,"sessionId":"session-a","endpoint":"${endpoint}","createdAt":true}`,
+	]) assert.throws(() => parseWindowsHostFrame(`{"requestId":"list-1","ok":true,"result":{"records":[${record}]}}`), /invalid Windows transport frame/);
+});
+
 test("Windows bridge correlates callback acknowledgement and rejects pending RPCs when its host exits", async () => {
 	class FakeChild extends EventEmitter {
 		stdin = { writable: true, write: (line: string, callback: (error?: Error) => void) => { this.lines.push(line); callback(); return true; } };

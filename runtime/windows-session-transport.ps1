@@ -1,6 +1,6 @@
-# PS5.1 bootstrap helper for the Windows session transport. It intentionally has
-# no pipe server or publication RPCs: start is partial and initialize is the
-# only stateful operation in this batch.
+# PS5.1 helper-owned Windows presence metadata boundary. It intentionally has
+# no pipe server: start remains partial and publication never advertises a
+# fabricated active listener.
 # Native definitions adapted from windows-native-boundary-clean/tests/windows-native-boundary/native.ps1
 # at c59e1598 (NtCreateFile rooted opens, GetSecurityInfo, and ABI layout).
 # API provenance: NtCreateFile / OBJECT_ATTRIBUTES / NtQueryDirectoryFile are
@@ -175,6 +175,8 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
+using Microsoft.Win32.SafeHandles;
+using System.Text;
 using System.Text.RegularExpressions;
 
 public sealed class BootstrapFailure : Exception {
@@ -200,9 +202,10 @@ public static class WindowsSessionBootstrap {
   struct OpenResult { public IntPtr Handle; public uint Status; public OpenResult(IntPtr handle, uint status) { Handle = handle; Status = status; } }
 
   const uint OBJ_CASE_INSENSITIVE = 0x40, OBJ_DONT_REPARSE = 0x1000;
-  const uint FILE_LIST_DIRECTORY = 1, FILE_TRAVERSE = 0x20, FILE_READ_ATTRIBUTES = 0x80, READ_CONTROL = 0x00020000, SYNCHRONIZE = 0x00100000;
-  const uint FILE_SHARE_READ = 1, FILE_SHARE_WRITE = 2;
-  const uint FILE_OPEN = 1, FILE_CREATE = 2, FILE_DIRECTORY_FILE = 1, FILE_SYNCHRONOUS_IO_NONALERT = 0x20, FILE_OPEN_REPARSE_POINT = 0x00200000;
+  const uint FILE_LIST_DIRECTORY = 1, FILE_TRAVERSE = 0x20, FILE_READ_DATA = 1, FILE_WRITE_DATA = 2, FILE_READ_ATTRIBUTES = 0x80, READ_CONTROL = 0x00020000, DELETE = 0x00010000, SYNCHRONIZE = 0x00100000;
+  // Directory pins omit delete sharing; a retained published file permits replacement.
+      const uint FILE_SHARE_READ = 1, FILE_SHARE_WRITE = 2, FILE_SHARE_DELETE = 4;
+  const uint FILE_OPEN = 1, FILE_CREATE = 2, FILE_DIRECTORY_FILE = 1, FILE_NON_DIRECTORY_FILE = 0x40, FILE_SYNCHRONOUS_IO_NONALERT = 0x20, FILE_OPEN_REPARSE_POINT = 0x00200000;
   const uint FILE_ATTRIBUTE_DIRECTORY = 0x10, FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
   const uint SE_FILE_OBJECT = 1, OWNER_SECURITY_INFORMATION = 1, DACL_SECURITY_INFORMATION = 4;
   const uint STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034, STATUS_OBJECT_NAME_COLLISION = 0xC0000035;
@@ -215,8 +218,13 @@ public static class WindowsSessionBootstrap {
 
   [DllImport("ntdll.dll", CallingConvention=CallingConvention.Winapi)] static extern uint NtCreateFile(out IntPtr fileHandle, uint desiredAccess, ref OBJECT_ATTRIBUTES objectAttributes, out IO_STATUS_BLOCK ioStatusBlock, IntPtr allocationSize, uint fileAttributes, uint shareAccess, uint createDisposition, uint createOptions, IntPtr eaBuffer, uint eaLength);
   [DllImport("ntdll.dll", CallingConvention=CallingConvention.Winapi)] static extern uint NtQueryDirectoryFile(IntPtr fileHandle, IntPtr eventHandle, IntPtr apcRoutine, IntPtr apcContext, out IO_STATUS_BLOCK ioStatusBlock, IntPtr fileInformation, uint length, int fileInformationClass, bool returnSingleEntry, IntPtr fileName, bool restartScan);
+      [DllImport("ntdll.dll", CallingConvention=CallingConvention.Winapi)] static extern uint NtSetInformationFile(IntPtr fileHandle, out IO_STATUS_BLOCK ioStatusBlock, IntPtr fileInformation, uint length, int fileInformationClass);
+      [DllImport("ntdll.dll", CallingConvention=CallingConvention.Winapi)] static extern uint RtlNtStatusToDosError(uint status);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetFileInformationByHandle(IntPtr handle, out BY_HANDLE_FILE_INFORMATION info);
+      [DllImport("kernel32.dll", SetLastError=true)] static extern bool ReadFile(IntPtr handle, byte[] buffer, uint length, out uint read, IntPtr overlapped);
+      [DllImport("kernel32.dll", SetLastError=true)] static extern bool WriteFile(IntPtr handle, byte[] buffer, uint length, out uint written, IntPtr overlapped);
+      [DllImport("kernel32.dll", SetLastError=true)] static extern bool FlushFileBuffers(IntPtr handle);
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool GetVolumeNameForVolumeMountPoint(string rootPathName, System.Text.StringBuilder volumeName, uint cchBufferLength);
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool GetVolumeInformation(string rootPathName, IntPtr volumeNameBuffer, uint volumeNameSize, out uint volumeSerialNumber, out uint maximumComponentLength, out uint fileSystemFlags, IntPtr fileSystemNameBuffer, uint fileSystemNameSize);
   [DllImport("advapi32.dll", SetLastError=true)] static extern uint GetSecurityInfo(IntPtr handle, uint objectType, uint securityInformation, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr descriptor);
@@ -344,6 +352,109 @@ public static class WindowsSessionBootstrap {
     } finally { Marshal.FreeHGlobal(buffer); }
   }
   public static int EnumeratePresence() { lock (Gate) { if (Presence == IntPtr.Zero) Fail("unavailable"); return EnumeratePinned(Presence).Length; } }
+      public sealed class PresenceRecord {
+        public readonly string SessionId, Endpoint, Token; public readonly long CreatedAt;
+        public PresenceRecord(string sessionId, string endpoint, string token, long createdAt) { SessionId = sessionId; Endpoint = endpoint; Token = token; CreatedAt = createdAt; }
+      }
+      static readonly string PipePrefix = @"\\.\pipe\gentle-pi-";
+      const int FileDispositionInformation = 13, MaxOwnedPublications = 64;
+      struct RecordIdentity { public uint Volume; public uint IndexHigh, IndexLow; public RecordIdentity(BY_HANDLE_FILE_INFORMATION info) { Volume = info.VolumeSerialNumber; IndexHigh = info.FileIndexHigh; IndexLow = info.FileIndexLow; } public bool Equals(RecordIdentity other) { return Volume == other.Volume && IndexHigh == other.IndexHigh && IndexLow == other.IndexLow; } }
+      sealed class OwnedPublication { public readonly PresenceRecord Record; public readonly RecordIdentity Identity; public readonly string Sid; public SafeFileHandle Handle; public OwnedPublication(PresenceRecord record, RecordIdentity identity, string sid, IntPtr handle) { Record = record; Identity = identity; Sid = sid; Handle = new SafeFileHandle(handle, true); } public void Dispose() { if (Handle != null) { Handle.Dispose(); Handle = null; } } }
+      static readonly List<OwnedPublication> OwnedPublications = new List<OwnedPublication>();
+      static bool SameRecord(PresenceRecord left, string sessionId, string endpoint, long createdAt) { return left.SessionId == sessionId && left.Endpoint == endpoint && left.CreatedAt == createdAt; }
+      static OwnedPublication FindOwned(string sessionId, string endpoint, long createdAt) { foreach (OwnedPublication owned in OwnedPublications) if (SameRecord(owned.Record, sessionId, endpoint, createdAt)) return owned; return null; }
+      static void RequirePresence() { if (Presence == IntPtr.Zero) Fail("unavailable"); }
+      static void ValidateRecord(string sessionId, string endpoint, long createdAt, out string token) {
+        token = null;
+        if (String.IsNullOrEmpty(sessionId) || !Regex.IsMatch(sessionId, "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$") || createdAt < 0 || createdAt > 9007199254740991L || String.IsNullOrEmpty(endpoint) || !endpoint.StartsWith(PipePrefix, StringComparison.Ordinal)) Fail("invalid");
+        token = endpoint.Substring(PipePrefix.Length); if (!Regex.IsMatch(token, "^[0-9a-f]{32}$")) Fail("invalid");
+      }
+      static string RecordName(string sessionId, string token) { return sessionId + "." + token + ".json"; }
+      static string RecordText(string sessionId, string endpoint, long createdAt) { return "{\"version\":1,\"sessionId\":\"" + sessionId + "\",\"endpoint\":\"" + endpoint.Replace("\\", "\\\\") + "\",\"createdAt\":" + createdAt.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}"; }
+      static OpenResult OpenRecord(IntPtr root, string name, bool create, byte[] descriptor, bool allowDeleteSharing) {
+        IntPtr chars = IntPtr.Zero, unicode = IntPtr.Zero, security = IntPtr.Zero, handle = IntPtr.Zero;
+        try {
+          unicode = Unicode(name, out chars); var attributes = new OBJECT_ATTRIBUTES(); attributes.Length = (uint)Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES)); attributes.RootDirectory = root; attributes.ObjectName = unicode; attributes.Attributes = OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE;
+          if (create) { if (descriptor == null || descriptor.Length == 0) Fail("unavailable"); security = Marshal.AllocHGlobal(descriptor.Length); Marshal.Copy(descriptor, 0, security, descriptor.Length); attributes.SecurityDescriptor = security; }
+          IO_STATUS_BLOCK statusBlock; uint status = NtCreateFile(out handle, SYNCHRONIZE | FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE, ref attributes, out statusBlock, IntPtr.Zero, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | (allowDeleteSharing ? FILE_SHARE_DELETE : 0), create ? FILE_CREATE : FILE_OPEN, FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT, IntPtr.Zero, 0);
+          if (status != 0) { Close(handle); return new OpenResult(IntPtr.Zero, status); } return new OpenResult(handle, status);
+        } finally { if (security != IntPtr.Zero) Marshal.FreeHGlobal(security); if (unicode != IntPtr.Zero) Marshal.FreeHGlobal(unicode); if (chars != IntPtr.Zero) Marshal.FreeHGlobal(chars); }
+      }
+      static RecordIdentity AssertRecord(IntPtr handle, string sid) {
+        BY_HANDLE_FILE_INFORMATION info; if (!GetFileInformationByHandle(handle, out info) || info.NumberOfLinks != 1 || (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 || (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) Fail("unsafe"); AssertOwned(handle, sid); return new RecordIdentity(info);
+      }
+      static RecordIdentity AssertRetainedPublication(SafeFileHandle handle, string sid) {
+        if (handle == null || handle.IsInvalid || handle.IsClosed) Fail("unsafe");
+        BY_HANDLE_FILE_INFORMATION info; IntPtr value = handle.DangerousGetHandle();
+        if (!GetFileInformationByHandle(value, out info) || (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 || (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) Fail("unsafe");
+        AssertOwned(value, sid); return new RecordIdentity(info);
+      }
+      static string ReadRecordText(IntPtr handle) {
+        BY_HANDLE_FILE_INFORMATION info; if (!GetFileInformationByHandle(handle, out info) || info.FileSizeHigh != 0 || info.FileSizeLow > 8192) Fail("invalid"); byte[] bytes = new byte[info.FileSizeLow]; uint read;
+        if (!ReadFile(handle, bytes, info.FileSizeLow, out read, IntPtr.Zero) || read != info.FileSizeLow) Fail("invalid"); try { return new UTF8Encoding(false, true).GetString(bytes); } catch { Fail("invalid"); return null; }
+      }
+      static PresenceRecord ParseRecord(string name, string text) {
+        int first = name.IndexOf('.'), second = first < 0 ? -1 : name.IndexOf('.', first + 1); if (first <= 0 || second <= first + 1 || second != name.Length - 5 || !name.EndsWith(".json", StringComparison.Ordinal)) Fail("invalid");
+        string sessionId = name.Substring(0, first), token = name.Substring(first + 1, second - first - 1), endpoint = PipePrefix + token; string ignored; ValidateRecord(sessionId, endpoint, 0, out ignored);
+        string prefix = "{\"version\":1,\"sessionId\":\"" + sessionId + "\",\"endpoint\":\"" + endpoint.Replace("\\", "\\\\") + "\",\"createdAt\":"; if (!text.StartsWith(prefix, StringComparison.Ordinal) || !text.EndsWith("}", StringComparison.Ordinal)) Fail("invalid");
+        string number = text.Substring(prefix.Length, text.Length - prefix.Length - 1); if (number.Length == 0 || number.Length > 16) Fail("invalid"); long createdAt = 0; if (!Int64.TryParse(number, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out createdAt)) Fail("invalid"); ValidateRecord(sessionId, endpoint, createdAt, out ignored); return new PresenceRecord(sessionId, endpoint, token, createdAt);
+      }
+      static PresenceRecord ReadPinnedRecord(string name, string sid, out IntPtr handle, out RecordIdentity identity) {
+        handle = IntPtr.Zero; identity = new RecordIdentity(); OpenResult opened = OpenRecord(Presence, name, false, null, true); if (opened.Handle == IntPtr.Zero) { SetNtStatus(opened.Status); Fail(opened.Status == STATUS_OBJECT_NAME_NOT_FOUND ? "not_found" : "unsafe"); }
+        handle = opened.Handle; try { identity = AssertRecord(handle, sid); return ParseRecord(name, ReadRecordText(handle)); } catch { Close(handle); handle = IntPtr.Zero; throw; }
+      }
+      static uint RenameNoReplace(IntPtr file, IntPtr root, string name) {
+        byte[] chars = Encoding.Unicode.GetBytes(name); int header = IntPtr.Size == 8 ? 20 : 12; IntPtr memory = Marshal.AllocHGlobal(header + chars.Length); try { for (int index = 0; index < header + chars.Length; index++) Marshal.WriteByte(memory, index, 0); Marshal.WriteIntPtr(memory, IntPtr.Size == 8 ? 8 : 4, root); Marshal.WriteInt32(memory, IntPtr.Size == 8 ? 16 : 8, chars.Length); Marshal.Copy(chars, 0, IntPtr.Add(memory, header), chars.Length); IO_STATUS_BLOCK io; return NtSetInformationFile(file, out io, memory, (uint)(header + chars.Length), 10); } finally { Marshal.FreeHGlobal(memory); }
+      }
+      static void DeletePinnedHandle(IntPtr file) { IntPtr memory = Marshal.AllocHGlobal(1); try { Marshal.WriteByte(memory, 1); IO_STATUS_BLOCK io; if (NtSetInformationFile(file, out io, memory, 1, FileDispositionInformation) != 0) Fail("unsafe"); } finally { Marshal.FreeHGlobal(memory); } }
+      public static PresenceRecord NewRecord(string sessionId, long createdAt) { lock (Gate) { RequirePresence(); string token = Guid.NewGuid().ToString("N"), endpoint = PipePrefix + token, ignored; ValidateRecord(sessionId, endpoint, createdAt, out ignored); return new PresenceRecord(sessionId, endpoint, token, createdAt); } }
+      public static void Publish(string sessionId, string endpoint, long createdAt, byte[] descriptor, string sid) {
+        lock (Gate) {
+          RequirePresence(); if (OwnedPublications.Count >= MaxOwnedPublications) Fail("busy");
+          string token; ValidateRecord(sessionId, endpoint, createdAt, out token);
+          string temporary = "." + Guid.NewGuid().ToString("N") + ".tmp", target = RecordName(sessionId, token);
+          OpenResult opened = OpenRecord(Presence, temporary, true, descriptor, true);
+          if (opened.Handle == IntPtr.Zero) { SetNtStatus(opened.Status); Fail(opened.Status == STATUS_OBJECT_NAME_COLLISION ? "busy" : "unsafe"); }
+          IntPtr file = opened.Handle; bool transferred = false;
+          try {
+            RecordIdentity identity = AssertRecord(file, sid);
+            byte[] bytes = new UTF8Encoding(false).GetBytes(RecordText(sessionId, endpoint, createdAt)); uint written;
+            if (bytes.Length > 8192 || !WriteFile(file, bytes, (uint)bytes.Length, out written, IntPtr.Zero) || written != bytes.Length || !FlushFileBuffers(file)) Fail("unavailable");
+            uint status = RenameNoReplace(file, Presence, target);
+            if (status != 0) { uint win32 = RtlNtStatusToDosError(status); Fail(win32 == 80 || win32 == 183 ? "busy" : "unsafe"); }
+            OwnedPublication owned = new OwnedPublication(new PresenceRecord(sessionId, endpoint, token, createdAt), identity, sid, file);
+            try { OwnedPublications.Add(owned); transferred = true; } catch { try { DeletePinnedHandle(file); } finally { owned.Dispose(); transferred = true; } throw; }
+          } finally {
+            if (!transferred) { try { DeletePinnedHandle(file); } catch {} Close(file); }
+          }
+        }
+      }
+      public static PresenceRecord[] List(string excluded, string sid) { lock (Gate) { RequirePresence(); if (excluded != null && !Regex.IsMatch(excluded, "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")) Fail("invalid"); var newest = new Dictionary<string, PresenceRecord>(StringComparer.Ordinal); foreach (string name in EnumeratePinned(Presence)) { IntPtr file = IntPtr.Zero; try { RecordIdentity ignoredIdentity; PresenceRecord record = ReadPinnedRecord(name, sid, out file, out ignoredIdentity); if (record.SessionId == excluded) continue; PresenceRecord prior; if (!newest.TryGetValue(record.SessionId, out prior) || record.CreatedAt > prior.CreatedAt || (record.CreatedAt == prior.CreatedAt && String.CompareOrdinal(record.Token, prior.Token) > 0)) newest[record.SessionId] = record; } catch (BootstrapFailure) { } finally { Close(file); } } var records = new List<PresenceRecord>(newest.Values); records.Sort(delegate(PresenceRecord left, PresenceRecord right) { return String.CompareOrdinal(left.SessionId, right.SessionId); }); return records.ToArray(); } }
+      public static PresenceRecord Resolve(string sessionId, string sid) { PresenceRecord[] records = List(null, sid); foreach (PresenceRecord record in records) if (record.SessionId == sessionId) return record; Fail("not_found"); return null; }
+      static void RemoveOwnedPublication(OwnedPublication owned) {
+        IntPtr current = IntPtr.Zero;
+        try {
+          RecordIdentity retained = AssertRetainedPublication(owned.Handle, owned.Sid);
+          if (!retained.Equals(owned.Identity)) Fail("unsafe");
+          RecordIdentity currentIdentity; PresenceRecord record = ReadPinnedRecord(RecordName(owned.Record.SessionId, owned.Record.Token), owned.Sid, out current, out currentIdentity);
+          if (!SameRecord(record, owned.Record.SessionId, owned.Record.Endpoint, owned.Record.CreatedAt) || !currentIdentity.Equals(retained)) Fail("unsafe");
+          DeletePinnedHandle(current);
+        } catch (BootstrapFailure failure) { if (failure.Code != "not_found") throw; }
+        finally { Close(current); OwnedPublications.Remove(owned); owned.Dispose(); }
+      }
+      public static void RemoveOwn(string sessionId, string endpoint, long createdAt, string sid) {
+        lock (Gate) {
+          RequirePresence(); string token; ValidateRecord(sessionId, endpoint, createdAt, out token);
+          OwnedPublication owned = FindOwned(sessionId, endpoint, createdAt); if (owned == null) return;
+          IntPtr file = IntPtr.Zero;
+          try {
+            if (owned.Sid != sid) Fail("unsafe"); RecordIdentity retained = AssertRetainedPublication(owned.Handle, owned.Sid); if (!retained.Equals(owned.Identity)) Fail("unsafe"); RecordIdentity identity; PresenceRecord record = ReadPinnedRecord(RecordName(sessionId, token), sid, out file, out identity);
+            if (!SameRecord(record, sessionId, endpoint, createdAt) || !identity.Equals(retained)) Fail("unsafe");
+            DeletePinnedHandle(file);
+          } catch (BootstrapFailure failure) { if (failure.Code != "not_found") throw; }
+          finally { Close(file); OwnedPublications.Remove(owned); owned.Dispose(); }
+        }
+      }
       public static void Initialize(string agentHome, byte[] descriptor, string sid) {
     lock (Gate) {
       InitializationStage = "unknown"; InitializationNtStatus = null;
@@ -360,7 +471,14 @@ public static class WindowsSessionBootstrap {
       } catch { CloseAll(); throw; } finally { InitializationStage = "unknown"; InitializationNtStatus = null; }
     }
   }
-  public static void CloseAll() { lock (Gate) { for (int index = Handles.Count - 1; index >= 0; index--) Close(Handles[index]); Handles.Clear(); Presence = IntPtr.Zero; } }
+  public static void CloseAll() {
+        lock (Gate) {
+          // Cleanup is best effort but always releases every retained publication handle before ancestors close.
+          for (int index = OwnedPublications.Count - 1; index >= 0; index--) { OwnedPublication owned = OwnedPublications[index]; try { RemoveOwnedPublication(owned); } catch { if (OwnedPublications.Contains(owned)) OwnedPublications.Remove(owned); owned.Dispose(); } }
+          for (int index = Handles.Count - 1; index >= 0; index--) Close(Handles[index]);
+          Handles.Clear(); OwnedPublications.Clear(); Presence = IntPtr.Zero;
+        }
+      }
 }
 '@
 	$nativeReady = $true
@@ -385,6 +503,30 @@ function Write-BootstrapRejectionDiagnostic([BootstrapFailure]$failure) {
 function Write-Reply([string]$requestId, [bool]$ok, $result, [string]$error) {
 	if ($ok) { [Console]::Out.WriteLine((@{ requestId = $requestId; ok = $true; result = $result } | ConvertTo-Json -Compress)) }
 	else { [Console]::Out.WriteLine((@{ requestId = $requestId; ok = $false; error = $error } | ConvertTo-Json -Compress)) }
+}
+function Get-CurrentPrivateDescriptor {
+	$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+	$security = [Security.AccessControl.DirectorySecurity]::new(); $security.SetAccessRuleProtection($true, $false); $security.SetOwner($sid)
+	$security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
+	return [pscustomobject]@{ Sid = $sid.Value; Descriptor = $security.GetSecurityDescriptorBinaryForm() }
+}
+function ConvertTo-PublicPresenceRecord($record) {
+	return [pscustomobject]@{ version = 1; sessionId = $record.SessionId; endpoint = $record.Endpoint; createdAt = $record.CreatedAt }
+}
+function Try-PresenceCreatedAt([object]$value, [ref]$createdAt) {
+	$candidate = [int64]0
+	if ($value -is [sbyte] -or $value -is [byte] -or $value -is [int16] -or $value -is [uint16] -or $value -is [int32] -or $value -is [uint32] -or $value -is [int64]) { $candidate = [int64]$value }
+	elseif ($value -is [uint64]) { if ($value -gt [uint64]9007199254740991) { return $false }; $candidate = [int64]$value }
+	else { return $false }
+	if ($candidate -lt 0 -or $candidate -gt 9007199254740991) { return $false }
+	$createdAt.Value = $candidate
+	return $true
+}
+function Is-PresenceRecord($record, [ref]$createdAt) {
+	if ($null -eq $record -or $record -isnot [psobject]) { return $false }
+	$names = @($record.PSObject.Properties | ForEach-Object { $_.Name })
+	if ($names.Count -ne 4 -or @($names | Where-Object { $_ -notin @('version', 'sessionId', 'endpoint', 'createdAt') }).Count -ne 0) { return $false }
+	return $record.version -eq 1 -and $record.sessionId -is [string] -and $record.endpoint -is [string] -and (Try-PresenceCreatedAt $record.createdAt $createdAt)
 }
 function Is-RequestId([object]$value) { return $value -is [string] -and $value -match '^[A-Za-z0-9-]{1,128}$' }
 function Is-ExactRequest($request, [string[]]$names) {
@@ -435,6 +577,11 @@ try {
 				break
 			}
 			'enumerate' { if (-not (Is-ExactRequest $request @('requestId', 'operation'))) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { Write-Reply $id $true @{ state = 'initialized'; bootstrap = 'complete'; entries = [WindowsSessionBootstrap]::EnumeratePresence() } $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
+			'record' { $createdAt = [int64]0; if (-not (Is-ExactRequest $request @('requestId', 'operation', 'sessionId', 'createdAt')) -or $request.sessionId -isnot [string] -or -not (Try-PresenceCreatedAt $request.createdAt ([ref]$createdAt))) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { Write-Reply $id $true (ConvertTo-PublicPresenceRecord ([WindowsSessionBootstrap]::NewRecord($request.sessionId, $createdAt))) $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
+			'publish' { $createdAt = [int64]0; if (-not (Is-ExactRequest $request @('requestId', 'operation', 'record')) -or -not (Is-PresenceRecord $request.record ([ref]$createdAt))) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { $identity = Get-CurrentPrivateDescriptor; [WindowsSessionBootstrap]::Publish($request.record.sessionId, $request.record.endpoint, $createdAt, $identity.Descriptor, $identity.Sid); Write-Reply $id $true @{ state = 'initialized'; bootstrap = 'complete' } $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
+			'list' { $excludeSessionId = $null; if (Is-ExactRequest $request @('requestId', 'operation', 'excludeSessionId')) { $excludeSessionId = $request.excludeSessionId; if ($excludeSessionId -isnot [string]) { Write-Reply $id $false $null 'invalid'; break requests } } elseif (-not (Is-ExactRequest $request @('requestId', 'operation'))) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { $identity = Get-CurrentPrivateDescriptor; $records = @([WindowsSessionBootstrap]::List($excludeSessionId, $identity.Sid) | ForEach-Object { ConvertTo-PublicPresenceRecord $_ }); Write-Reply $id $true @{ records = $records } $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
+			'resolve' { if (-not (Is-ExactRequest $request @('requestId', 'operation', 'sessionId')) -or $request.sessionId -isnot [string]) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { $identity = Get-CurrentPrivateDescriptor; Write-Reply $id $true (ConvertTo-PublicPresenceRecord ([WindowsSessionBootstrap]::Resolve($request.sessionId, $identity.Sid))) $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
+			'remove' { $createdAt = [int64]0; if (-not (Is-ExactRequest $request @('requestId', 'operation', 'record')) -or -not (Is-PresenceRecord $request.record ([ref]$createdAt))) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { $identity = Get-CurrentPrivateDescriptor; [WindowsSessionBootstrap]::RemoveOwn($request.record.sessionId, $request.record.endpoint, $createdAt, $identity.Sid); Write-Reply $id $true @{ state = 'initialized'; bootstrap = 'complete' } $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
 			'shutdown' { if (-not (Is-ExactRequest $request @('requestId', 'operation'))) { Write-Reply $id $false $null 'invalid'; break requests }; if ($nativeReady) { [WindowsSessionBootstrap]::CloseAll() }; Write-Reply $id $true @{ state = 'partial' } $null; break }
 			default { Write-Reply $id $false $null 'invalid'; break }
 		}

@@ -25,7 +25,7 @@ const PIPE = /^\\\\\.\\pipe\\gentle-pi-[A-Za-z0-9-]{1,96}$/;
 const SESSION = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 type HostState = Readonly<{ state: "partial" }> | Readonly<{ state: "initialized"; bootstrap: "complete" }> | Readonly<{ state: "initialized"; bootstrap: "complete"; entries: number }>;
-type HostReply = Readonly<{ requestId: string; ok: boolean; result?: HostState; error?: "unavailable" | "unsafe" | "busy" | "not_found" | "invalid" }>;
+type HostReply = Readonly<{ requestId: string; ok: boolean; result?: HostState | WindowsRecord | Readonly<{ records: readonly WindowsRecord[] }>; error?: "unavailable" | "unsafe" | "busy" | "not_found" | "invalid" }>;
 type HostEvent = Readonly<{ event: "notification"; connectionId: string; frame: NotificationFrame }>;
 type Pending = { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
 type SpawnedHost = ChildProcessWithoutNullStreams;
@@ -66,8 +66,16 @@ export function parseWindowsHostFrame(line: string): HostReply {
 		const partial = Object.keys(result).length === 1 && result.state === "partial";
 		const initialized = Object.keys(result).length === 2 && result.state === "initialized" && result.bootstrap === "complete";
 		const enumerated = Object.keys(result).length === 3 && result.state === "initialized" && result.bootstrap === "complete" && Number.isSafeInteger(result.entries) && (result.entries as number) >= 0 && (result.entries as number) <= 64;
-		if (!partial && !initialized && !enumerated) throw safeError("invalid Windows transport frame");
-		return Object.freeze({ requestId: frame.requestId, ok: true, result: Object.freeze({ ...result }) as HostState });
+		let publicResult: HostReply["result"];
+		if (partial || initialized || enumerated) publicResult = Object.freeze({ ...result }) as HostState;
+		else {
+			try {
+				if (Object.keys(result).length === 4) publicResult = validRecord(result);
+				else if (Object.keys(result).length === 1 && Array.isArray(result.records) && result.records.length <= 64) publicResult = Object.freeze({ records: Object.freeze(result.records.map((record) => validRecord(record as Record<string, unknown>))) });
+				else throw new Error();
+			} catch { throw safeError("invalid Windows transport frame"); }
+		}
+		return Object.freeze({ requestId: frame.requestId, ok: true, result: publicResult! });
 	}
 	if (keys.length !== 3 || typeof frame.error !== "string" || !["unavailable", "unsafe", "busy", "not_found", "invalid"].includes(frame.error)) throw safeError("invalid Windows transport frame");
 	return Object.freeze({ requestId: frame.requestId, ok: false, error: frame.error as HostReply["error"] });
@@ -182,7 +190,8 @@ export class WindowsSessionTransportHost {
 
 type WindowsRecord = PresenceRecord;
 const validRecord = (value: Record<string, unknown>): WindowsRecord => {
-	if (value.version !== 1 || typeof value.sessionId !== "string" || !SESSION.test(value.sessionId) || typeof value.endpoint !== "string" || !PIPE.test(value.endpoint) || !Number.isSafeInteger(value.createdAt) || value.createdAt < 0) throw new SessionPresenceError("invalid_presence", "invalid presence record");
+	const keys = Object.keys(value);
+	if (keys.length !== 4 || !["version", "sessionId", "endpoint", "createdAt"].every((key) => keys.includes(key)) || value.version !== 1 || typeof value.sessionId !== "string" || !SESSION.test(value.sessionId) || typeof value.endpoint !== "string" || !PIPE.test(value.endpoint) || !Number.isSafeInteger(value.createdAt) || value.createdAt < 0) throw new SessionPresenceError("invalid_presence", "invalid presence record");
 	return Object.freeze({ version: 1, sessionId: value.sessionId, endpoint: value.endpoint, createdAt: value.createdAt });
 };
 const registryError = (error: unknown): never => {
@@ -216,9 +225,10 @@ export class WindowsSessionPresenceRegistry {
 	async list(excludeSessionId?: string): Promise<readonly SessionPresenceCandidate[]> { return (await this.listActivations(excludeSessionId)).map((record) => Object.freeze({ sessionId: record.sessionId, reachability: "unknown" as const })); }
 	async listActivations(excludeSessionId?: string): Promise<readonly WindowsRecord[]> { try { const value = await this.host.request("list", { ...(excludeSessionId === undefined ? {} : { excludeSessionId }) }); if (!Array.isArray(value.records) || value.records.length > 64) throw new Error(); return Object.freeze(value.records.map((record) => validRecord(record as Record<string, unknown>))); } catch { registryError(undefined); } }
 	async resolve(sessionId: string): Promise<WindowsRecord> { try { return validRecord(await this.host.request("resolve", { sessionId })); } catch { registryError(undefined); } }
-	async removeOwn(record: PresenceRecord) { try { await this.host.request("remove", { record: validRecord(record as unknown as Record<string, unknown>) }); } catch { /* owned cleanup is intentionally best effort */ } }
-	async startListener(sessionId: string) { try { return validRecord(await this.host.request("listen", { sessionId })); } catch { registryError(undefined); } }
-	async stopListener(record: PresenceRecord) { await this.removeOwn(record); await this.host.request("stop-listen", {}).catch(() => {}); }
+	async removeOwn(record: PresenceRecord) { try { await this.host.request("remove", { record: validRecord(record as unknown as Record<string, unknown>) }); } catch { /* identity-bound owned cleanup is intentionally best effort */ } }
+	// Presence metadata is available, but no helper-owned pipe server exists yet.
+	async startListener(_sessionId: string): Promise<never> { throw new SessionPresenceError("io_error", "listener support is unavailable"); }
+	async stopListener(record: PresenceRecord) { await this.removeOwn(record); }
 	async close() { await this.host.close(); }
 }
 

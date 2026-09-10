@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdtemp, mkdir, readFile, stat } from "node:fs/promises";
 import os from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { FIXED_WINDOWS_POWERSHELL, parseWindowsHostFrame } from "../lib/windows-session-transport.ts";
@@ -258,10 +258,10 @@ async function openInitializedHelper(agentHome: string, options: Readonly<{ diag
 		await closeOwnedChild();
 		throw error;
 	}
-	const request = async (operation: "enumerate" | "shutdown") => {
+	const request = async (operation: "enumerate" | "shutdown" | "record" | "publish" | "list" | "resolve" | "remove", values: Record<string, unknown> = {}) => {
 		const count = frames.length + 1;
 		const requestId = `${operation}-${count}`;
-		child.stdin.write(`${JSON.stringify({ requestId, operation })}\n`);
+		child.stdin.write(`${JSON.stringify({ requestId, operation, ...values })}\n`);
 		await waitFor(count, deadlines.responseDeadlineMs);
 		const frame = frames[count - 1];
 		assert.equal(frame.requestId, requestId);
@@ -273,6 +273,7 @@ async function openInitializedHelper(agentHome: string, options: Readonly<{ diag
 		get rejectionDiagnostic() { return stderrOverflow ? undefined : parseBootstrapRejectionDiagnostic(stderr); },
 		enumerate: () => request("enumerate"),
 		shutdown: () => request("shutdown"),
+		presence: (operation: "record" | "publish" | "list" | "resolve" | "remove", values: Record<string, unknown> = {}) => request(operation, values),
 		invalidStartSchema: async () => { child.stdin.write(`${JSON.stringify({ requestId: `invalid-${frames.length + 1}`, operation: "start", extra: true })}\n`); await exitWithin(); },
 		closeInput: closeOwnedChild,
 	};
@@ -323,7 +324,7 @@ async function helper(agentHome: string, enumerate = false, options: Readonly<{ 
 	return frames;
 }
 
-async function fixtureResult(mode: "capture" | "equals" | "measure" | "add-extra-ace" | "junction" | "rename", path: string, extra: string[] = []) {
+async function fixtureResult(mode: "capture" | "equals" | "measure" | "add-extra-ace" | "junction" | "rename" | "replace-identical" | "hardlink" | "append" | "exclusive-open", path: string, extra: string[] = []) {
 	const result = await runPowerShell(fixture, ["-Mode", mode, "-Path", path, ...extra]);
 	assert.equal(result.code, 0);
 	return JSON.parse(result.stdout) as Record<string, boolean>;
@@ -633,6 +634,31 @@ test("Windows bootstrap rejection parser admits only fixed native phase evidence
 	assert.equal(parseBootstrapRejectionDiagnostic('{"kind":"windows-session-bootstrap-rejection","stage":"transport-assert-owned","ntstatus":null}' + " ".repeat(maxBootstrapDiagnosticBytes) + "\n"), undefined);
 });
 
+test("Windows presence source guard uses rooted no-replace publication and same-handle deletion", async (t) => {
+	t.diagnostic("source guard, not native Windows proof");
+	const source = await readFile(runtime, "utf8");
+	assert.match(source, /static OpenResult OpenRecord\(IntPtr root, string name, bool create, byte\[\] descriptor, bool allowDeleteSharing\)/);
+	assert.match(source, /attributes\.Attributes = OBJ_CASE_INSENSITIVE \| OBJ_DONT_REPARSE/);
+	assert.match(source, /NtSetInformationFile\(file, out io, memory, \(uint\)\(header \+ chars\.Length\), 10\)/);
+	assert.match(source, /const int FileDispositionInformation = 13/);
+	assert.match(source, /NtSetInformationFile\(file, out io, memory, 1, FileDispositionInformation\)/);
+	assert.doesNotMatch(source, /NtSetInformationFile\(file, out io, memory, 1, 4\)/);
+	assert.match(source, /RecordIdentity identity = AssertRecord\(file, sid\);/);
+	assert.match(source, /SafeFileHandle Handle/);
+	assert.match(source, /new SafeFileHandle\(handle, true\)/);
+	assert.match(source, /OpenRecord\(Presence, temporary, true, descriptor, true\)/);
+	assert.match(source, /OpenRecord\(Presence, name, false, null, true\)/);
+	assert.match(source, /FILE_SHARE_READ \| FILE_SHARE_WRITE \| \(allowDeleteSharing \? FILE_SHARE_DELETE : 0\)/);
+	assert.match(source, /OwnedPublications\.Add\(owned\)/);
+	assert.match(source, /AssertRetainedPublication\(owned\.Handle, owned\.Sid\)/);
+	assert.match(source, /owned\.Dispose\(\)/);
+	assert.match(source, /info\.NumberOfLinks != 1/);
+	assert.match(source, /!identity\.Equals\(retained\)/);
+	assert.match(source, /try \{\s*if \(owned\.Sid != sid\) Fail\("unsafe"\); RecordIdentity retained = AssertRetainedPublication/);
+	assert.match(source, /public static PresenceRecord\[\] List\(string excluded, string sid\)/);
+	assert.match(source, /public static void RemoveOwn\(string sessionId, string endpoint, long createdAt, string sid\)/);
+});
+
 test("Windows bootstrap startup control", { skip: process.platform !== "win32", timeout: 40_000 }, async (t) => {
 	const result = await runBootstrapStartupControl();
 	assert.equal(result.code, 0, "Windows bootstrap startup control exited unsuccessfully");
@@ -669,6 +695,111 @@ test("Windows-native bootstrap pins ancestors, creates exact private boundaries,
 	await mkdir(join(routing, "transport", "presence", "seed-a"));
 	await mkdir(join(routing, "transport", "presence", "seed-b"));
 	assert.deepEqual((await helper(agentHome, true, { diagnostics }))[2].result, { state: "initialized", bootstrap: "complete", entries: 2 });
+});
+
+test("Windows-native presence publishes, resolves, lists, and removes only its own record", { skip: process.platform !== "win32", timeout: 30_000 }, async (t) => {
+	const diagnostics: BootstrapDiagnosticContext = t;
+	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-presence-"));
+	const agentHome = join(root, "profile", "agent");
+	await mkdir(join(agentHome, "gentle-agents"), { recursive: true });
+	const held = await openInitializedHelper(agentHome, { diagnostics });
+	try {
+		const recorded = await held.presence("record", { sessionId: "session-a", createdAt: 1 });
+		assert.equal(recorded.ok, true);
+		const record = recorded.result as Record<string, unknown>;
+		assert.deepEqual(Object.keys(record).sort(), ["createdAt", "endpoint", "sessionId", "version"]);
+		assert.equal(record.sessionId, "session-a");
+		assert.match(record.endpoint as string, /^\\\\\.\\pipe\\gentle-pi-[0-9a-f]{32}$/);
+		assert.equal((await held.presence("publish", { record })).ok, true);
+		assert.equal((await held.presence("publish", { record })).error, "busy", "no-replace collision preserves the published record");
+		assert.deepEqual((await held.presence("list")).result, { records: [record] }, "an absent optional excludeSessionId lists normally");
+		assert.deepEqual((await held.presence("resolve", { sessionId: "session-a" })).result, record);
+		const token = (record.endpoint as string).slice("\\\\.\\pipe\\gentle-pi-".length);
+		const publishedPath = join(agentHome, "gentle-agents", "transport", "presence", `session-a.${token}.json`);
+		assert.deepEqual(await fixtureResult("replace-identical", publishedPath), { ok: true, replaced: true });
+		assert.equal((await held.presence("remove", { record })).error, "unsafe", "a replacement with identical public bytes and ACL is not owned");
+		await stat(publishedPath);
+	} finally { await held.closeInput(); }
+});
+
+test("Windows-native owned publication removes its unchanged rooted record", { skip: process.platform !== "win32", timeout: 30_000 }, async (t) => {
+	const diagnostics: BootstrapDiagnosticContext = t;
+	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-presence-"));
+	const agentHome = join(root, "profile", "agent");
+	await mkdir(join(agentHome, "gentle-agents"), { recursive: true });
+	const held = await openInitializedHelper(agentHome, { diagnostics });
+	try {
+		const recorded = await held.presence("record", { sessionId: "session-remove", createdAt: 1 });
+		assert.equal(recorded.ok, true);
+		const record = recorded.result as Record<string, unknown>;
+		assert.equal((await held.presence("publish", { record })).ok, true);
+		assert.equal((await held.presence("remove", { record })).ok, true);
+		assert.deepEqual((await held.presence("list")).result, { records: [] });
+		assert.equal((await held.presence("resolve", { sessionId: "session-remove" })).error, "not_found");
+	} finally { await held.closeInput(); }
+});
+
+test("Windows-native shutdown releases and cleans unchanged owned publications", { skip: process.platform !== "win32", timeout: 30_000 }, async (t) => {
+	const diagnostics: BootstrapDiagnosticContext = t;
+	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-presence-"));
+	const agentHome = join(root, "profile", "agent");
+	await mkdir(join(agentHome, "gentle-agents"), { recursive: true });
+	const held = await openInitializedHelper(agentHome, { diagnostics });
+	let publishedPath = "";
+	try {
+		const recorded = await held.presence("record", { sessionId: "session-shutdown", createdAt: 1 });
+		assert.equal(recorded.ok, true);
+		const record = recorded.result as Record<string, unknown>;
+		assert.equal((await held.presence("publish", { record })).ok, true);
+		const token = (record.endpoint as string).slice("\\\\.\\pipe\\gentle-pi-".length);
+		publishedPath = join(agentHome, "gentle-agents", "transport", "presence", `session-shutdown.${token}.json`);
+	} finally { await held.closeInput(); }
+	await assert.rejects(stat(publishedPath));
+});
+
+test("Windows-native invalid owned ACL removal preserves the record and releases ownership before shutdown", { skip: process.platform !== "win32", timeout: 30_000 }, async (t) => {
+	const diagnostics: BootstrapDiagnosticContext = t;
+	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-presence-"));
+	const agentHome = join(root, "profile", "agent");
+	await mkdir(join(agentHome, "gentle-agents"), { recursive: true });
+	const held = await openInitializedHelper(agentHome, { diagnostics });
+	try {
+		const recorded = await held.presence("record", { sessionId: "session-invalid-acl", createdAt: 1 });
+		assert.equal(recorded.ok, true);
+		const record = recorded.result as Record<string, unknown>;
+		assert.equal((await held.presence("publish", { record })).ok, true);
+		const token = (record.endpoint as string).slice("\\\\.\\pipe\\gentle-pi-".length);
+		const publishedPath = join(agentHome, "gentle-agents", "transport", "presence", `session-invalid-acl.${token}.json`);
+		assert.deepEqual(await fixtureResult("add-extra-ace", publishedPath), { ok: true, changed: true });
+		assert.equal((await held.presence("remove", { record })).error, "unsafe");
+		await stat(publishedPath);
+		assert.deepEqual(await fixtureResult("exclusive-open", publishedPath), { ok: true, exclusive: true }, "owned retained handle was released before shutdown");
+	} finally { await held.closeInput(); }
+});
+
+test("Windows-native presence rejects hardlinks, corrupted ACLs, and oversized records", { skip: process.platform !== "win32", timeout: 30_000 }, async (t) => {
+	const diagnostics: BootstrapDiagnosticContext = t;
+	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-presence-"));
+	const agentHome = join(root, "profile", "agent");
+	await mkdir(join(agentHome, "gentle-agents"), { recursive: true });
+	const held = await openInitializedHelper(agentHome, { diagnostics });
+	try {
+		const presence = join(agentHome, "gentle-agents", "transport", "presence");
+		assert.deepEqual(await fixtureResult("junction", join(presence, "reparse.0123456789abcdef0123456789abcdef.json"), ["-Target", root]), { ok: true, reparse: true });
+		assert.deepEqual((await held.presence("list")).result, { records: [] }, "a reparse record is ignored");
+		for (const [sessionId, mutation] of [["hardlink", "hardlink"], ["bad-acl", "add-extra-ace"], ["oversize", "append"]] as const) {
+			const recorded = await held.presence("record", { sessionId, createdAt: 1 });
+			assert.equal(recorded.ok, true);
+			const record = recorded.result as Record<string, unknown>;
+			assert.equal((await held.presence("publish", { record })).ok, true);
+			const token = (record.endpoint as string).slice("\\\\.\\pipe\\gentle-pi-".length);
+			const publishedPath = join(agentHome, "gentle-agents", "transport", "presence", `${sessionId}.${token}.json`);
+			if (mutation === "hardlink") await fixtureResult("hardlink", publishedPath, ["-Target", join(dirname(publishedPath), `other.${token}.json`)]);
+			else await fixtureResult(mutation, publishedPath);
+			assert.deepEqual((await held.presence("list")).result, { records: [] });
+			assert.equal((await held.presence("resolve", { sessionId })).error, "not_found");
+		}
+	} finally { await held.closeInput(); }
 });
 
 test("Windows-native bootstrap rejects a corrupted private boundary and preserves a failed bootstrap without recursive cleanup", { skip: process.platform !== "win32", timeout: 20_000 }, async (t) => {

@@ -1,6 +1,6 @@
 # Test-only ACL/reparse inspector. It never emits SIDs or descriptor bytes.
 param(
-	[Parameter(Mandatory = $true)][ValidateSet('capture', 'equals', 'measure', 'add-extra-ace', 'junction', 'rename')][string]$Mode,
+	[Parameter(Mandatory = $true)][ValidateSet('capture', 'equals', 'measure', 'add-extra-ace', 'junction', 'rename', 'replace-identical', 'hardlink', 'append', 'exclusive-open')][string]$Mode,
 	[Parameter(Mandatory = $true)][string]$Path,
 	[string]$BaselinePath,
 	[string]$Target
@@ -28,6 +28,46 @@ try {
 		$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new('Authenticated Users', [Security.AccessControl.FileSystemRights]::ReadAndExecute, [Security.AccessControl.AccessControlType]::Allow))
 		Set-Acl -LiteralPath $Path -AclObject $acl
 		Write-Result @{ ok = $true; changed = $true }
+		exit 0
+	}
+	if ($Mode -eq 'replace-identical') {
+		$temp = "$Path.replacement"
+		[IO.File]::Copy($Path, $temp, $true)
+		Set-Acl -LiteralPath $temp -AclObject (Get-Acl -LiteralPath $Path)
+		Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class WindowsSessionBootstrapFixture {
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool MoveFileEx(string source, string destination, uint flags);
+}
+'@ -ErrorAction Stop
+		if (-not [WindowsSessionBootstrapFixture]::MoveFileEx($temp, $Path, 1)) { throw 'replace-failed' }
+		Write-Result @{ ok = $true; replaced = $true }
+		exit 0
+	}
+	if ($Mode -eq 'hardlink') {
+		if ([string]::IsNullOrEmpty($Target)) { throw 'target-required' }
+		Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class WindowsSessionBootstrapHardlinkFixture {
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool CreateHardLink(string name, string existing, IntPtr security);
+}
+'@ -ErrorAction Stop
+		if (-not [WindowsSessionBootstrapHardlinkFixture]::CreateHardLink($Target, $Path, [IntPtr]::Zero)) { throw 'hardlink-failed' }
+		Write-Result @{ ok = $true; hardlink = $true }
+		exit 0
+	}
+	if ($Mode -eq 'exclusive-open') {
+		$stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+		try { Write-Result @{ ok = $true; exclusive = $true } } finally { $stream.Dispose() }
+		exit 0
+	}
+	if ($Mode -eq 'append') {
+		$bytes = [Text.Encoding]::UTF8.GetBytes(('x' * 8193))
+		$share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+		$stream = [IO.FileStream]::new($Path, [IO.FileMode]::Append, [IO.FileAccess]::Write, $share)
+		try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush(); Write-Result @{ ok = $true; appended = $true } } finally { $stream.Dispose() }
 		exit 0
 	}
 	if ($Mode -eq 'rename') {
