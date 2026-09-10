@@ -62,6 +62,10 @@ jobs:
         if: matrix.platform != 'windows'
         shell: bash
         run: node --experimental-strip-types --test tests/gentle-agents.test.ts tests/windows-session-compile.test.ts tests/windows-session-transport.test.ts
+      - name: Run standing permission IPC boundary test (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: node --experimental-strip-types --test tests/review-session-standing-permission-ipc.test.ts
       - name: Run POSIX session transport tests
         if: matrix.platform != 'windows'
         shell: bash

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
@@ -713,23 +714,16 @@ test("default Node spawn adapter distinguishes IPC-only and permission-capable c
 	const captured: Array<{ command: string; args: readonly string[]; options: Record<string, unknown> }> = [];
 	const children: FakeChild[] = [];
 	const shutdown: Array<() => Promise<void>> = [];
-	const canonicalGitCwd = join(root, "canonical-git-project");
-	const gitBin = join(root, "canonical-git-bin");
-	mkdirSync(join(canonicalGitCwd, ".git"), { recursive: true });
-	mkdirSync(gitBin, { recursive: true });
-	const gitFixture = join(gitBin, "git");
-	writeFileSync(gitFixture, `#!/bin/sh\nif [ "$1" = "-C" ] && [ "$2" = "${canonicalGitCwd}" ] && [ "$3" = "rev-parse" ] && [ "$4" = "--git-common-dir" ]; then\n  printf '.git\\n'\n  exit 0\nfi\nexit 1\n`);
-	chmodSync(gitFixture, 0o755);
-	const withCanonicalGitFixture = <T>(action: () => T): T => {
-		const previousPath = process.env.PATH;
-		process.env.PATH = gitBin;
-		try {
-			return action();
-		} finally {
-			if (previousPath === undefined) delete process.env.PATH;
-			else process.env.PATH = previousPath;
-		}
-	};
+	const canonicalGitFixture = mkdtempSync(join(tmpdir(), "gentle-agents-canonical-git-"));
+	const canonicalGitCwd = join(canonicalGitFixture, "project");
+	const gitTemplate = join(canonicalGitFixture, "template");
+	try {
+		mkdirSync(gitTemplate);
+		execFileSync("git", ["init", "--quiet", `--template=${gitTemplate}`, canonicalGitCwd]);
+	} catch (error) {
+		rmSync(canonicalGitFixture, { recursive: true, force: true });
+		throw error;
+	}
 	childProcess.spawn = ((command: string, args: readonly string[], options: Record<string, unknown>) => {
 		captured.push({ command, args, options });
 		const child = fakeChild();
@@ -745,7 +739,7 @@ test("default Node spawn adapter distinguishes IPC-only and permission-capable c
 			(ctx.sessionManager as unknown as { getCwd(): string }).getCwd = () => sessionCwd;
 			await h.fire("session_start", ctx);
 			shutdown.push(() => h.fire("session_shutdown", ctx));
-			return { h, ctx, result: withCanonicalGitFixture(() => h.tools.get("subagent_run")!.execute(`spawn-${mode}`, { agent: "explore", task: `Capture ${mode}`, mode }, undefined, undefined, ctx)) };
+			return { h, ctx, result: h.tools.get("subagent_run")!.execute(`spawn-${mode}`, { agent: "explore", task: `Capture ${mode}`, mode }, undefined, undefined, ctx) };
 		};
 		const task = await launch("task", { PATH: "/bin", FIXTURE: "task" });
 		await tick();
@@ -780,7 +774,11 @@ test("default Node spawn adapter distinguishes IPC-only and permission-capable c
 		assert.deepEqual(children[1]?.killed, ["SIGTERM"], "session shutdown cleans up an active background child");
 		shutdown.length = 0;
 	} finally {
-		await shutdownAndRestoreNativeSpawn(childProcess, originalSpawn, () => Promise.all(shutdown.map((close) => close())));
+		try {
+			await shutdownAndRestoreNativeSpawn(childProcess, originalSpawn, () => Promise.all(shutdown.map((close) => close())));
+		} finally {
+			rmSync(canonicalGitFixture, { recursive: true, force: true });
+		}
 	}
 });
 
