@@ -371,7 +371,7 @@ class PromptHistorySelector extends Container implements Focusable {
       new FixedRowText(
         theme.fg(
           "dim",
-          "↑↓ move • PgUp/PgDn page • tab scope • ctrl+shift+↑/↓ preview • ctrl+shift+backspace delete • esc cancel",
+          "↑↓ move • PgUp/PgDn page • tab scope • enter select and quit • ctrl+shift+↑/↓ preview • ctrl+shift+backspace delete • esc cancel",
         ),
         true /* centered */,
       ),
