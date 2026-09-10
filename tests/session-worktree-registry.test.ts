@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { SessionWorktreeRegistry, resolveSessionWorktree, SESSION_WORKTREE_ENTRY, toolWorktreePath, worktreeGitEnvironment } from "../lib/session-worktree-registry.ts";
+import { SessionWorktreeRegistry, resolveSessionWorktree, resolveSessionWorktreeWithGit, SESSION_WORKTREE_ENTRY, toolWorktreePath, worktreeGitEnvironment } from "../lib/session-worktree-registry.ts";
 
 // All Git and session writes belong to unique fixtures, never the live clone.
 function fixture(t: test.TestContext) {
@@ -109,6 +109,22 @@ test("Git child environment removes routing and config overrides without mutatin
 	const before = { ...env };
 	assert.deepEqual(worktreeGitEnvironment(env), { PATH: "/tools", HOME: "/fixture" });
 	assert.deepEqual(env, before);
+});
+
+test("session startup identity lookup hides its direct Git children", (t) => {
+	const f = fixture(t);
+	const calls: Array<{ command: string; args: readonly string[]; options: Record<string, unknown> }> = [];
+	const run = ((command: string, args: readonly string[], options: Record<string, unknown>) => {
+		calls.push({ command, args, options });
+		return args.at(-1) === "--show-toplevel" ? `${f.main}\n` : `${join(f.main, ".git")}\n`;
+	}) as typeof import("node:child_process").execFileSync;
+	assert.equal(resolveSessionWorktreeWithGit(f.main, f.main, run)?.root, f.main);
+	assert.equal(calls.length, 2);
+	for (const call of calls) {
+		assert.equal(call.command, "git");
+		assert.equal(call.options.shell, false);
+		assert.equal(call.options.windowsHide, true);
+	}
 });
 
 test("only standard path-bearing calls have registration candidates; shell and prose never do", () => {

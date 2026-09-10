@@ -222,14 +222,16 @@ const GIT_TIMEOUT_MS = 5000;
 const OVERLAY_HEIGHT_RATIO = 0.8;
 const OVERLAY_MIN_ROWS = 8;
 
-export function shellGitRunner(cwd: string, env: NodeJS.ProcessEnv = process.env): GitRunner {
+export function shellGitRunner(cwd: string, env: NodeJS.ProcessEnv = process.env, run: typeof execFile = execFile): GitRunner {
 	// Pi exec cannot replace the inherited environment. Use argv directly and
 	// a complete sanitized environment for discovery, status, and lazy diffs.
 	const childEnv = worktreeGitEnvironment(env);
 	return (args) => new Promise((resolve) => {
-		execFile("git", ["-C", cwd, ...args], {
+		run("git", ["-C", cwd, ...args], {
 			env: childEnv,
 			encoding: "utf8",
+			shell: false,
+			windowsHide: true,
 			timeout: GIT_TIMEOUT_MS,
 			// Pi exec accumulates output without a maxBuffer cap. In particular,
 			// large porcelain inventories must not become partial successful scans.

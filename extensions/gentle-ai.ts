@@ -113,6 +113,8 @@ import { sanitizeTerminalText, stripAnsi } from "../lib/terminal-theme.ts";
 import { CandidateViewError, CandidateViewRegistry, injectReviewCandidateView, readCandidateContextManifestPage, resolveCanonicalCandidateBase, type CandidateView } from "../lib/review-candidate-view.ts";
 import {
 	GentleAiDevBinaryOverrideError,
+	GENTLE_AI_INSTALL_RECOVERY_COMMAND,
+	GENTLE_AI_INSTALL_RECOVERY_INSTRUCTIONS,
 	registerGentleAiDevBinary,
 	resolveGentleAiBinary,
 	resolveGentleAiDevBinaryOverride,
@@ -3579,7 +3581,9 @@ function nativeStatusPackageBinaryMissing(operation: ReviewControllerOperation, 
 		...(operation === REVIEW_CONTROLLER_OPERATION.START ? nativeStartPreAuthorityRejection() : { lineage_created: false, mutation_performed: false, mutation_outcome: "none" }),
 		inventory_complete: false,
 		diagnostics,
-		next_action: "reinstall-package-local-gentle-ai",
+		reason: `The verified package-local binary is unavailable. ${GENTLE_AI_INSTALL_RECOVERY_INSTRUCTIONS} This does not prove install lifecycle scripts were disabled.`,
+		recovery_command: GENTLE_AI_INSTALL_RECOVERY_COMMAND,
+		next_action: GENTLE_AI_INSTALL_RECOVERY_INSTRUCTIONS,
 	};
 }
 
@@ -6202,7 +6206,7 @@ async function executeReviewControllerOperation(
 				retainNativeUntrackedSelection(retainedUntrackedSelections, defaultCwd, result.lineageId, retainedUntrackedSelection);
 				return completeNativeStart(parameters.operation, result, defaultCwd, candidateView, candidateViews);
 			} catch (error) {
-				if (error instanceof CandidateViewError && error.diagnostics !== undefined) return nativeOperationFailure(parameters.operation, Object.assign(error, { candidateViewPreNative: true }));
+				if (!nativeStartAttempted && error instanceof CandidateViewError && error.diagnostics !== undefined) return nativeOperationFailure(parameters.operation, Object.assign(error, { candidateViewPreNative: true }));
 				if (error instanceof CandidateViewError && (error.reason === "base-ref-ambiguous" || error.reason === "base-ref-unresolvable" || error.reason === "base-ref-moved")) return nativeStartRejection(error.reason);
 				const value = error as { mutationOutcome?: unknown; nextAction?: unknown };
 				const provenNoMutation = value.mutationOutcome === "none";
