@@ -121,6 +121,27 @@ function appendBoundedOutput(output: string, chunk: Buffer, limit: number): Read
 	return { output: output + chunk.subarray(0, end).toString("utf8"), overflow: true };
 }
 
+const bootstrapRejectionStages = new Set(["volume-open", "ancestor-open", "routing-open", "transport-create-or-open", "transport-assert-owned", "presence-create-or-open", "presence-assert-owned", "unknown"]);
+type BootstrapRejectionDiagnostic = Readonly<{ kind: "windows-session-bootstrap-rejection"; stage: "volume-open" | "ancestor-open" | "routing-open" | "transport-create-or-open" | "transport-assert-owned" | "presence-create-or-open" | "presence-assert-owned" | "unknown"; ntstatus: number | null }>;
+type BootstrapDiagnosticContext = Readonly<{ diagnostic(message: string): void }>;
+
+function emitBootstrapRejection(context: BootstrapDiagnosticContext, diagnostic: BootstrapRejectionDiagnostic): void {
+	context.diagnostic(JSON.stringify(diagnostic));
+}
+
+function parseBootstrapRejectionDiagnostic(stderr: string): BootstrapRejectionDiagnostic | undefined {
+	if (Buffer.byteLength(stderr, "utf8") > maxBootstrapDiagnosticBytes || !stderr.endsWith("\n")) return undefined;
+	const lines = stderr.slice(0, -1).split("\n");
+	if (lines.length !== 1 || lines[0].length === 0) return undefined;
+	let value: unknown;
+	try { value = JSON.parse(lines[0]); } catch { return undefined; }
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record).sort();
+	if (keys.length !== 3 || keys.join(",") !== "kind,ntstatus,stage" || record.kind !== "windows-session-bootstrap-rejection" || typeof record.stage !== "string" || !bootstrapRejectionStages.has(record.stage) || (record.ntstatus !== null && (!Number.isInteger(record.ntstatus) || typeof record.ntstatus !== "number" || record.ntstatus < 0 || record.ntstatus > 0xffffffff))) return undefined;
+	return Object.freeze({ kind: "windows-session-bootstrap-rejection", stage: record.stage as BootstrapRejectionDiagnostic["stage"], ntstatus: record.ntstatus as number | null });
+}
+
 async function runBootstrapStartupControl(options: Readonly<{ spawnProcess?: (...args: any[]) => CleanupChild; startupDeadlineMs?: number; terminateMs?: number; killMs?: number }> = {}): Promise<Readonly<{ code: number; stdout: string; stderr: string; outputOverflow: boolean }>> {
 	const child = (options.spawnProcess ?? spawn)(FIXED_WINDOWS_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", runtime], { shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }) as CleanupChild;
 	const lifecycle = observeChildLifecycle(child);
@@ -149,24 +170,33 @@ function parseStartupControlFrames(stdout: string): readonly ReturnType<typeof p
 	try { return lines.map(parseWindowsHostFrame); } catch { throw new Error("Windows bootstrap startup control returned malformed protocol output"); }
 }
 
-function runPowerShell(script: string, args: string[], input = ""): Promise<{ code: number; stdout: string }> {
-	return new Promise((resolve, reject) => {
-		const child = spawn(FIXED_WINDOWS_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", script, ...args], { shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
-		let stdout = "";
-		child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
-		child.once("error", reject);
-		child.once("exit", (code) => resolve({ code: code ?? -1, stdout }));
-		child.stdin.end(input);
-	});
+async function runPowerShell(script: string, args: string[], input = "", options: Readonly<{ spawnProcess?: (...args: any[]) => CleanupChild }> = {}): Promise<{ code: number; stdout: string; stderr: string; stderrOverflow: boolean }> {
+	const child = (options.spawnProcess ?? spawn)(FIXED_WINDOWS_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", script, ...args], { shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }) as CleanupChild;
+	const lifecycle = observeChildLifecycle(child);
+	let stdout = "";
+	let stderr = "";
+	let stderrOverflow = false;
+	child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
+	child.stderr.on("data", (chunk: Buffer) => { const captured = appendBoundedOutput(stderr, chunk, maxBootstrapDiagnosticBytes); stderr = captured.output; stderrOverflow ||= captured.overflow; });
+	try { child.stdin.end(input); } catch { await settleOwnedChild(child, lifecycle, { terminateMs: 2_500, killMs: 2_500 }); throw new Error("Windows helper input could not close"); }
+	if (!await waitForChildClose(lifecycle, 30_000) || hasLifecycleError(lifecycle)) {
+		try { await settleOwnedChild(child, lifecycle, { terminateMs: 2_500, killMs: 2_500 }); } catch { throw new Error("Windows helper did not settle"); }
+		throw new Error("Windows helper did not complete");
+	}
+	return { code: lifecycle.exitCode, stdout, stderr, stderrOverflow };
 }
 
-async function openInitializedHelper(agentHome: string, options: Readonly<{ spawnProcess?: (...args: any[]) => CleanupChild; initialDeadlineMs?: number; responseDeadlineMs?: number; terminateMs?: number; killMs?: number }> = {}) {
+async function openInitializedHelper(agentHome: string, options: Readonly<{ diagnostics: BootstrapDiagnosticContext; spawnProcess?: (...args: any[]) => CleanupChild; initialDeadlineMs?: number; responseDeadlineMs?: number; terminateMs?: number; killMs?: number }>) {
 	const child = (options.spawnProcess ?? spawn)(FIXED_WINDOWS_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", runtime], { shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }) as CleanupChild;
 	const lifecycle = observeChildLifecycle(child);
 	const deadlines = { initialDeadlineMs: options.initialDeadlineMs ?? 25_000, responseDeadlineMs: options.responseDeadlineMs ?? 3_000, terminateMs: options.terminateMs ?? 3_000, killMs: options.killMs ?? 3_000 };
 	const frames: ReturnType<typeof parseWindowsHostFrame>[] = [];
 	let buffered = "";
+	let stderr = "";
+	let stderrOverflow = false;
+	const rejectionChanged = new EventEmitter();
 	child.stderr.resume();
+	child.stderr.on("data", (chunk: Buffer) => { const captured = appendBoundedOutput(stderr, chunk, maxBootstrapDiagnosticBytes); stderr = captured.output; stderrOverflow ||= captured.overflow; rejectionChanged.emit("changed"); });
 	const waitFor = (count: number, deadlineMs: number) => new Promise<void>((resolve, reject) => {
 		let settled = false;
 		let pollTimer: ReturnType<typeof setTimeout> | undefined;
@@ -186,6 +216,27 @@ async function openInitializedHelper(agentHome: string, options: Readonly<{ spaw
 		};
 		poll();
 	});
+	const waitForUnsafeRejection = () => new Promise<BootstrapRejectionDiagnostic>((resolve, reject) => {
+		let settled = false;
+		const finish = (error?: Error, diagnostic?: BootstrapRejectionDiagnostic) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			rejectionChanged.removeListener("changed", check);
+			lifecycle.changed.removeListener("changed", check);
+			if (error) reject(error); else resolve(diagnostic!);
+		};
+		const check = () => {
+			if (stderrOverflow) return finish(new Error("Windows helper unsafe rejection diagnostic exceeded bounded output"));
+			const diagnostic = parseBootstrapRejectionDiagnostic(stderr);
+			if (diagnostic) return finish(undefined, diagnostic);
+			if (lifecycle.closeObserved || lifecycle.processError) return finish(new Error("Windows helper unsafe rejection diagnostic was missing"));
+		};
+		const timer = setTimeout(() => finish(new Error("Windows helper unsafe rejection diagnostic was missing")), deadlines.responseDeadlineMs);
+		rejectionChanged.on("changed", check);
+		lifecycle.changed.on("changed", check);
+		check();
+	});
 	const exitWithin = async () => {
 		if (await waitForChildClose(lifecycle, deadlines.responseDeadlineMs)) return;
 		try { await closeOwnedChild(); } catch { throw new Error("Windows helper did not exit after a fatal schema error"); }
@@ -199,6 +250,10 @@ async function openInitializedHelper(agentHome: string, options: Readonly<{ spaw
 		child.stdin.write('{"requestId":"start-1","operation":"start"}\n');
 		child.stdin.write(`${JSON.stringify({ requestId: "initialize-2", operation: "initialize", agentHome })}\n`);
 		await waitFor(2, deadlines.initialDeadlineMs);
+		if (!frames[1].ok && frames[1].error === "unsafe") {
+			const diagnostic = await waitForUnsafeRejection();
+			emitBootstrapRejection(options.diagnostics, diagnostic);
+		}
 	} catch (error) {
 		await closeOwnedChild();
 		throw error;
@@ -215,11 +270,31 @@ async function openInitializedHelper(agentHome: string, options: Readonly<{ spaw
 	return {
 		get frames() { return frames; },
 		get exited() { return lifecycle.closeObserved; },
+		get rejectionDiagnostic() { return stderrOverflow ? undefined : parseBootstrapRejectionDiagnostic(stderr); },
 		enumerate: () => request("enumerate"),
 		shutdown: () => request("shutdown"),
 		invalidStartSchema: async () => { child.stdin.write(`${JSON.stringify({ requestId: `invalid-${frames.length + 1}`, operation: "start", extra: true })}\n`); await exitWithin(); },
 		closeInput: closeOwnedChild,
 	};
+}
+
+type InitializedHelper = Awaited<ReturnType<typeof openInitializedHelper>>;
+async function withInitializedHelpers<T>(agentHomes: readonly string[], action: (helpers: readonly InitializedHelper[]) => Promise<T>, options: Readonly<{ diagnostics: BootstrapDiagnosticContext; spawnProcess?: (...args: any[]) => CleanupChild; initialDeadlineMs?: number; responseDeadlineMs?: number; terminateMs?: number; killMs?: number }>): Promise<T> {
+	const opened = await Promise.allSettled(agentHomes.map((agentHome) => openInitializedHelper(agentHome, options)));
+	const helpers: InitializedHelper[] = [];
+	let initializationError: unknown;
+	for (const outcome of opened) {
+		if (outcome.status === "fulfilled") helpers.push(outcome.value);
+		else if (initializationError === undefined) initializationError = outcome.reason;
+	}
+	try {
+		if (initializationError !== undefined) throw initializationError;
+		return await action(helpers);
+	} finally {
+		const cleanup = await Promise.allSettled(helpers.map((helper) => helper.closeInput()));
+		const failed = cleanup.find((outcome) => outcome.status === "rejected");
+		if (failed?.status === "rejected") throw failed.reason;
+	}
 }
 
 type HelperRequest = Readonly<{ requestId: string; operation: "start" | "initialize" | "enumerate" | "shutdown"; agentHome?: string }>;
@@ -232,13 +307,19 @@ function plannedHelperRequests(agentHome: string, enumerate: boolean): readonly 
 	]);
 }
 
-async function helper(agentHome: string, enumerate = false) {
+async function helper(agentHome: string, enumerate = false, options: Readonly<{ diagnostics: BootstrapDiagnosticContext; spawnProcess?: (...args: any[]) => CleanupChild }>) {
 	const requests = plannedHelperRequests(agentHome, enumerate);
-	const result = await runPowerShell(runtime, [], requests.map((request) => JSON.stringify(request)).join("\n") + "\n");
+	const result = await runPowerShell(runtime, [], requests.map((request) => JSON.stringify(request)).join("\n") + "\n", options);
 	assert.equal(result.code, 0);
 	const frames = result.stdout.trim().split("\n").map(parseWindowsHostFrame);
 	assert.equal(frames.length, requests.length);
 	assert.deepEqual(frames.map((frame) => frame.requestId), requests.map((request) => request.requestId));
+	if (frames.some((frame) => !frame.ok && frame.error === "unsafe")) {
+		if (result.stderrOverflow) throw new Error("Windows helper unsafe rejection diagnostic exceeded bounded output");
+		const diagnostic = parseBootstrapRejectionDiagnostic(result.stderr);
+		if (!diagnostic) throw new Error("Windows helper unsafe rejection diagnostic was missing");
+		emitBootstrapRejection(options.diagnostics, diagnostic);
+	}
 	return frames;
 }
 
@@ -263,13 +344,14 @@ class FakeHelperChild extends EventEmitter {
 }
 
 const fakeCleanupDeadlines = Object.freeze({ initialDeadlineMs: 40, responseDeadlineMs: 20, terminateMs: 10, killMs: 10 });
+const unexpectedBootstrapDiagnostic: BootstrapDiagnosticContext = Object.freeze({ diagnostic: () => assert.fail("unexpected Windows bootstrap rejection diagnostic") });
 
 test("owned helper cleanup settles a spawn error without an exit event", async () => {
 	const child = new FakeHelperChild();
 	child.pid = undefined;
 	const spawnError = new Error("spawn failed");
 	queueMicrotask(() => { child.emit("error", spawnError); child.stdin.emit("close"); child.stdout.emit("close"); child.stderr.emit("close"); });
-	await assert.rejects(openInitializedHelper("C:\\profile\\agent", { spawnProcess: () => child as unknown as CleanupChild, ...fakeCleanupDeadlines }), /spawn failed/);
+	await assert.rejects(openInitializedHelper("C:\\profile\\agent", { diagnostics: unexpectedBootstrapDiagnostic, spawnProcess: () => child as unknown as CleanupChild, ...fakeCleanupDeadlines }), /spawn failed/);
 	assert.equal(child.endCalls, 0);
 	assert.equal(child.killCalls, 0);
 });
@@ -290,6 +372,88 @@ test("owned helper cleanup settles normally without escalation", async () => {
 	await settleOwnedChild(child as unknown as CleanupChild, lifecycle, { terminateMs: 20, killMs: 20 });
 	assert.equal(child.endCalls, 1);
 	assert.equal(child.killCalls, 0);
+});
+
+test("held helper reports delayed unsafe rejection before an assertion failure and closes input", async () => {
+	const child = new FakeHelperChild();
+	let writes = 0;
+	child.onWrite = () => {
+		writes++;
+		if (writes === 2) queueMicrotask(() => {
+			child.stdout.emit("data", Buffer.from('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}\n'));
+			child.stdout.emit("data", Buffer.from('{"requestId":"initialize-2","ok":false,"error":"unsafe"}\n'));
+			setTimeout(() => child.stderr.emit("data", Buffer.from('{"kind":"windows-session-bootstrap-rejection","stage":"transport-assert-owned","ntstatus":null}\n')), 5);
+		});
+	};
+	child.onEnd = () => child.emit("close", 0);
+	const emitted: string[] = [];
+	const diagnostics: BootstrapDiagnosticContext = { diagnostic: (message) => emitted.push(message) };
+	let owned: InitializedHelper | undefined;
+	await assert.rejects(withInitializedHelpers(["C:\\profile\\agent"], async ([held]) => {
+		owned = held;
+		assert.deepEqual(emitted, ['{"kind":"windows-session-bootstrap-rejection","stage":"transport-assert-owned","ntstatus":null}']);
+		assert.equal(held.frames[1].ok, true, "deliberate assertion failure after initialization");
+	}, { spawnProcess: () => child as unknown as CleanupChild, diagnostics, ...fakeCleanupDeadlines }), /deliberate assertion failure/);
+	assert.equal(child.endCalls, 1);
+	assert.equal(child.killCalls, 0);
+	assert.equal(owned?.exited, true);
+});
+
+test("held helper bounds a missing unsafe rejection diagnostic and closes input", async () => {
+	const child = new FakeHelperChild();
+	let writes = 0;
+	child.onWrite = () => {
+		writes++;
+		if (writes === 2) queueMicrotask(() => {
+			child.stdout.emit("data", Buffer.from('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}\n'));
+			child.stdout.emit("data", Buffer.from('{"requestId":"initialize-2","ok":false,"error":"unsafe"}\n'));
+		});
+	};
+	child.onEnd = () => child.emit("close", 0);
+	await assert.rejects(openInitializedHelper("C:\\profile\\agent", { diagnostics: unexpectedBootstrapDiagnostic, spawnProcess: () => child as unknown as CleanupChild, ...fakeCleanupDeadlines }), /unsafe rejection diagnostic/);
+	assert.equal(child.endCalls, 1);
+	assert.equal(child.killCalls, 0);
+});
+
+test("normal helper emits a validated unsafe rejection through its diagnostic context", async (t) => {
+	const child = new FakeHelperChild();
+	child.onEnd = () => {
+		child.stdout.emit("data", Buffer.from('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}\n'));
+		child.stdout.emit("data", Buffer.from('{"requestId":"initialize-2","ok":false,"error":"unsafe"}\n'));
+		child.stdout.emit("data", Buffer.from('{"requestId":"shutdown-3","ok":true,"result":{"state":"partial"}}\n'));
+		setTimeout(() => {
+			child.stderr.emit("data", Buffer.from('{"kind":"windows-session-bootstrap-rejection","stage":"transport-assert-owned","ntstatus":null}\n'));
+			child.emit("close", 0);
+		}, 5);
+	};
+	const emitted: string[] = [];
+	const diagnostics: BootstrapDiagnosticContext = { diagnostic: (message) => { emitted.push(message); t.diagnostic(message); } };
+	const frames = await helper("C:\\profile\\agent", false, { spawnProcess: () => child as unknown as CleanupChild, diagnostics });
+	assert.equal(frames[1].error, "unsafe");
+	assert.deepEqual(emitted, ['{"kind":"windows-session-bootstrap-rejection","stage":"transport-assert-owned","ntstatus":null}']);
+	assert.equal(child.endCalls, 1);
+});
+
+test("concurrent held helper ownership cleans fulfilled helpers after another initialization rejects", async () => {
+	const fulfilled = new FakeHelperChild();
+	let writes = 0;
+	fulfilled.onWrite = () => {
+		writes++;
+		if (writes === 2) queueMicrotask(() => {
+			fulfilled.stdout.emit("data", Buffer.from('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}\n'));
+			fulfilled.stdout.emit("data", Buffer.from('{"requestId":"initialize-2","ok":true,"result":{"state":"initialized","bootstrap":"complete"}}\n'));
+		});
+	};
+	fulfilled.onEnd = () => fulfilled.emit("close", 0);
+	const rejected = new FakeHelperChild();
+	rejected.onWrite = () => queueMicrotask(() => rejected.emit("close", 1));
+	await assert.rejects(withInitializedHelpers(["C:\\profile\\agent", "C:\\profile\\agent"], async () => assert.fail("should not run after initialization rejection"), {
+		diagnostics: unexpectedBootstrapDiagnostic,
+		spawnProcess: (() => { let calls = 0; return () => (++calls === 1 ? fulfilled : rejected) as unknown as CleanupChild; })(),
+		...fakeCleanupDeadlines,
+	}), /exited before its reply/);
+	assert.equal(fulfilled.endCalls, 1);
+	assert.equal(fulfilled.killCalls, 0);
 });
 
 test("owned helper cleanup waits for close after exit", async () => {
@@ -335,7 +499,7 @@ test("startup control reports a bounded failure when stdin error never closes", 
 test("premature helper close rejects initialization and bounded cleanup settles", async () => {
 	const child = new FakeHelperChild();
 	child.onWrite = () => child.emit("close");
-	await assert.rejects(openInitializedHelper("C:\\profile\\agent", { spawnProcess: () => child as unknown as CleanupChild, ...fakeCleanupDeadlines }), /exited before its reply/);
+	await assert.rejects(openInitializedHelper("C:\\profile\\agent", { diagnostics: unexpectedBootstrapDiagnostic, spawnProcess: () => child as unknown as CleanupChild, ...fakeCleanupDeadlines }), /exited before its reply/);
 	assert.equal(child.killCalls, 0);
 });
 
@@ -401,6 +565,19 @@ test("Windows bootstrap source guard—not native proof—extracts only structur
 	assert.doesNotMatch(source, /Get-BootstrapProperty \$target 'ErrorText'/);
 });
 
+test("Windows bootstrap rejection diagnostic is fixed-stage evidence, not native Windows compile proof", async (t) => {
+	t.diagnostic("source guard, not native Windows compile proof");
+	const source = await readFile(runtime, "utf8");
+	assert.match(source, /public readonly uint\? NtStatus/);
+	assert.match(source, /SetNtStatus\(result\.Status\)/);
+	assert.match(source, /Write-BootstrapRejectionDiagnostic \$_\.Exception/);
+	assert.match(source, /kind = 'windows-session-bootstrap-rejection'; stage = \$stage; ntstatus = \$ntstatus/);
+	assert.doesNotMatch(source, /new BootstrapFailure\("unsafe"\)/);
+	const rejectionWriter = source.match(/function Write-BootstrapRejectionDiagnostic[\s\S]*?\n\}/)?.[0];
+	assert.ok(rejectionWriter);
+	assert.doesNotMatch(rejectionWriter, /\.HasValue|\.Value|GetLastErrorText|ToString\(\)|Message|StackTrace/);
+});
+
 test("Windows bootstrap diagnostic parser accepts fixed Add-Type evidence", () => {
 	assert.deepEqual(parseBootstrapDiagnostic('{"kind":"windows-session-bootstrap-diagnostic","category":"compiler","compilerCodes":["CS1001","CS1739"],"reason":"source-code-error","languageMode":"full"}\n'), {
 		kind: "windows-session-bootstrap-diagnostic", category: "compiler", compilerCodes: ["CS1001", "CS1739"], reason: "source-code-error", languageMode: "full",
@@ -420,6 +597,19 @@ test("Windows bootstrap diagnostic parser fails closed for unsafe input", () => 
 	assert.equal(parseBootstrapDiagnostic("x".repeat(maxBootstrapDiagnosticBytes + 1)), undefined);
 });
 
+test("Windows bootstrap rejection parser admits only fixed native phase evidence", () => {
+	assert.deepEqual(parseBootstrapRejectionDiagnostic('{"kind":"windows-session-bootstrap-rejection","stage":"transport-assert-owned","ntstatus":null}\n'), {
+		kind: "windows-session-bootstrap-rejection", stage: "transport-assert-owned", ntstatus: null,
+	});
+	assert.deepEqual(parseBootstrapRejectionDiagnostic('{"kind":"windows-session-bootstrap-rejection","stage":"ancestor-open","ntstatus":3221225524}\n'), {
+		kind: "windows-session-bootstrap-rejection", stage: "ancestor-open", ntstatus: 3221225524,
+	});
+	assert.equal(parseBootstrapRejectionDiagnostic('{"kind":"windows-session-bootstrap-rejection","stage":"transport-assert-owned","ntstatus":-1}\n'), undefined);
+	assert.equal(parseBootstrapRejectionDiagnostic('{"kind":"windows-session-bootstrap-rejection","stage":"transport-assert-owned","ntstatus":1.5}\n'), undefined);
+	assert.equal(parseBootstrapRejectionDiagnostic('{"kind":"windows-session-bootstrap-rejection","stage":"transport-assert-owned","ntstatus":0,"sid":"S-1-5-18"}\n'), undefined);
+	assert.equal(parseBootstrapRejectionDiagnostic('{"kind":"windows-session-bootstrap-rejection","stage":"transport-assert-owned","ntstatus":null}' + " ".repeat(maxBootstrapDiagnosticBytes) + "\n"), undefined);
+});
+
 test("Windows bootstrap startup control", { skip: process.platform !== "win32", timeout: 40_000 }, async (t) => {
 	const result = await runBootstrapStartupControl();
 	assert.equal(result.code, 0, "Windows bootstrap startup control exited unsuccessfully");
@@ -437,7 +627,8 @@ test("Windows bootstrap startup control", { skip: process.platform !== "win32", 
 	if (result.stderr !== "") assert.fail("Windows bootstrap startup control emitted unexpected diagnostics");
 });
 
-test("Windows-native bootstrap pins ancestors, creates exact private boundaries, and remains partial", { skip: process.platform !== "win32", timeout: 20_000 }, async () => {
+test("Windows-native bootstrap pins ancestors, creates exact private boundaries, and remains partial", { skip: process.platform !== "win32", timeout: 20_000 }, async (t) => {
+	const diagnostics: BootstrapDiagnosticContext = t;
 	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-bootstrap-"));
 	const agentHome = join(root, "profile", "agent");
 	const routing = join(agentHome, "gentle-agents");
@@ -446,7 +637,7 @@ test("Windows-native bootstrap pins ancestors, creates exact private boundaries,
 	await mkdir(routing, { recursive: true });
 	for (const candidate of ancestorBaselines) assert.equal((await fixtureResult("capture", candidate.path, ["-BaselinePath", candidate.baseline])).equal, true);
 	assert.equal((await fixtureResult("capture", routing, ["-BaselinePath", baseline])).equal, true);
-	const frames = await helper(agentHome);
+	const frames = await helper(agentHome, false, { diagnostics });
 	assert.deepEqual(frames.map((frame) => frame.ok ? frame.result : frame.error), [{ state: "partial" }, { state: "initialized", bootstrap: "complete" }, { state: "partial" }]);
 	assert.equal((await fixtureResult("equals", routing, ["-BaselinePath", baseline])).equal, true);
 	for (const candidate of ancestorBaselines) assert.equal((await fixtureResult("equals", candidate.path, ["-BaselinePath", candidate.baseline])).equal, true);
@@ -454,10 +645,11 @@ test("Windows-native bootstrap pins ancestors, creates exact private boundaries,
 	assert.deepEqual(await fixtureResult("measure", join(routing, "transport", "presence")), { ok: true, directory: true, reparse: false, ownerCurrent: true, privateBoundary: true });
 	await mkdir(join(routing, "transport", "presence", "seed-a"));
 	await mkdir(join(routing, "transport", "presence", "seed-b"));
-	assert.deepEqual((await helper(agentHome, true))[2].result, { state: "initialized", bootstrap: "complete", entries: 2 });
+	assert.deepEqual((await helper(agentHome, true, { diagnostics }))[2].result, { state: "initialized", bootstrap: "complete", entries: 2 });
 });
 
-test("Windows-native bootstrap rejects a corrupted private boundary and preserves a failed bootstrap without recursive cleanup", { skip: process.platform !== "win32", timeout: 20_000 }, async () => {
+test("Windows-native bootstrap rejects a corrupted private boundary and preserves a failed bootstrap without recursive cleanup", { skip: process.platform !== "win32", timeout: 20_000 }, async (t) => {
+	const diagnostics: BootstrapDiagnosticContext = t;
 	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-bootstrap-"));
 	const agentHome = join(root, "profile", "agent");
 	const routing = join(agentHome, "gentle-agents");
@@ -466,7 +658,7 @@ test("Windows-native bootstrap rejects a corrupted private boundary and preserve
 	await mkdir(badBoundary, { recursive: true });
 	await fixtureResult("add-extra-ace", badBoundary);
 	assert.equal((await fixtureResult("capture", badBoundary, ["-BaselinePath", badBaseline])).equal, true);
-	const frames = await helper(agentHome);
+	const frames = await helper(agentHome, false, { diagnostics });
 	assert.equal(frames[1].ok, false);
 	assert.equal(frames[1].error, "unsafe");
 	await stat(badBoundary);
@@ -474,42 +666,50 @@ test("Windows-native bootstrap rejects a corrupted private boundary and preserve
 	await assert.rejects(stat(join(badBoundary, "presence")));
 });
 
-test("Windows-native bootstrap releases handles on shutdown before its stdin closes", { skip: process.platform !== "win32", timeout: 20_000 }, async () => {
+test("Windows-native bootstrap releases handles on shutdown before its stdin closes", { skip: process.platform !== "win32", timeout: 20_000 }, async (t) => {
+	const diagnostics: BootstrapDiagnosticContext = t;
 	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-bootstrap-"));
 	const agentHome = join(root, "profile", "agent");
 	const routing = join(agentHome, "gentle-agents");
 	await mkdir(routing, { recursive: true });
-	const held = await openInitializedHelper(agentHome);
-	assert.deepEqual(held.frames[1].result, { state: "initialized", bootstrap: "complete" });
-	await held.shutdown();
-	assert.equal(held.exited, false);
-	assert.deepEqual(await fixtureResult("rename", routing, ["-Target", join(root, "routing-after-shutdown")]), { ok: true, renamed: true });
-	await held.closeInput();
+	const held = await openInitializedHelper(agentHome, { diagnostics });
+	try {
+		assert.deepEqual(held.frames[1].result, { state: "initialized", bootstrap: "complete" });
+		await held.shutdown();
+		assert.equal(held.exited, false);
+		assert.deepEqual(await fixtureResult("rename", routing, ["-Target", join(root, "routing-after-shutdown")]), { ok: true, renamed: true });
+	} finally { await held.closeInput(); }
 });
 
-test("Windows-native bootstrap exits on an invalid recognized schema while stdin remains open", { skip: process.platform !== "win32", timeout: 20_000 }, async () => {
+test("Windows-native bootstrap exits on an invalid recognized schema while stdin remains open", { skip: process.platform !== "win32", timeout: 20_000 }, async (t) => {
+	const diagnostics: BootstrapDiagnosticContext = t;
 	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-bootstrap-"));
 	const agentHome = join(root, "profile", "agent");
 	const routing = join(agentHome, "gentle-agents");
 	await mkdir(routing, { recursive: true });
-	const held = await openInitializedHelper(agentHome);
-	await held.invalidStartSchema();
-	assert.equal(held.exited, true);
-	assert.equal(held.frames[2].error, "invalid");
-	assert.deepEqual(await fixtureResult("rename", routing, ["-Target", join(root, "routing-after-invalid")]), { ok: true, renamed: true });
+	const held = await openInitializedHelper(agentHome, { diagnostics });
+	try {
+		await held.invalidStartSchema();
+		assert.equal(held.exited, true);
+		assert.equal(held.frames[2].error, "invalid");
+		assert.deepEqual(await fixtureResult("rename", routing, ["-Target", join(root, "routing-after-invalid")]), { ok: true, renamed: true });
+	} finally { await held.closeInput(); }
 });
 
-test("Windows-native failed bootstrap releases its handles before stdin closes", { skip: process.platform !== "win32", timeout: 20_000 }, async () => {
+test("Windows-native failed bootstrap releases its handles before stdin closes", { skip: process.platform !== "win32", timeout: 20_000 }, async (t) => {
+	const diagnostics: BootstrapDiagnosticContext = t;
 	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-bootstrap-"));
 	const agentHome = join(root, "profile", "agent");
 	const routing = join(agentHome, "gentle-agents");
 	await mkdir(join(routing, "transport"), { recursive: true });
 	await fixtureResult("add-extra-ace", join(routing, "transport"));
-	const held = await openInitializedHelper(agentHome);
-	assert.equal(held.frames[1].error, "unsafe");
-	assert.equal(held.exited, false);
-	assert.deepEqual(await fixtureResult("rename", routing, ["-Target", join(root, "routing-after-failure")]), { ok: true, renamed: true });
-	await held.closeInput();
+	const held = await openInitializedHelper(agentHome, { diagnostics });
+	try {
+		assert.equal(held.frames[1].error, "unsafe");
+		assert.deepEqual(held.rejectionDiagnostic, { kind: "windows-session-bootstrap-rejection", stage: "transport-assert-owned", ntstatus: null });
+		assert.equal(held.exited, false);
+		assert.deepEqual(await fixtureResult("rename", routing, ["-Target", join(root, "routing-after-failure")]), { ok: true, renamed: true });
+	} finally { await held.closeInput(); }
 });
 
 test("Windows-native bootstrap closes pinned handles after malformed input", { skip: process.platform !== "win32", timeout: 20_000 }, async () => {
@@ -524,7 +724,8 @@ test("Windows-native bootstrap closes pinned handles after malformed input", { s
 	assert.deepEqual(await fixtureResult("rename", routing, ["-Target", join(root, "routing-released")]), { ok: true, renamed: true });
 });
 
-test("Windows-native bootstrap rejects a reparse routing parent and concurrent initialize does not hang", { skip: process.platform !== "win32", timeout: 20_000 }, async () => {
+test("Windows-native bootstrap rejects a reparse routing parent and concurrent initialize does not hang", { skip: process.platform !== "win32", timeout: 20_000 }, async (t) => {
+	const diagnostics: BootstrapDiagnosticContext = t;
 	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-bootstrap-"));
 	const agentHome = join(root, "profile", "agent");
 	const routing = join(agentHome, "gentle-agents");
@@ -532,13 +733,13 @@ test("Windows-native bootstrap rejects a reparse routing parent and concurrent i
 	await mkdir(join(agentHome), { recursive: true });
 	await mkdir(target);
 	await fixtureResult("junction", routing, ["-Target", target]);
-	assert.equal((await helper(agentHome))[1].error, "unsafe");
+	assert.equal((await helper(agentHome, false, { diagnostics }))[1].error, "unsafe");
 	const concurrentRoot = await mkdtemp(join(os.tmpdir(), "gentle-pi-bootstrap-"));
 	const concurrentHome = join(concurrentRoot, "profile", "agent");
 	await mkdir(join(concurrentHome, "gentle-agents"), { recursive: true });
-	const helpers = await Promise.all([openInitializedHelper(concurrentHome), openInitializedHelper(concurrentHome)]);
-	const results = await Promise.all(helpers.map((candidate) => candidate.enumerate()));
-	for (const frame of results) assert.deepEqual(frame.result, { state: "initialized", bootstrap: "complete", entries: 0 });
-	await Promise.all(helpers.map((candidate) => candidate.shutdown()));
-	await Promise.all(helpers.map((candidate) => candidate.closeInput()));
+	await withInitializedHelpers([concurrentHome, concurrentHome], async (helpers) => {
+		const results = await Promise.all(helpers.map((candidate) => candidate.enumerate()));
+		for (const frame of results) assert.deepEqual(frame.result, { state: "initialized", bootstrap: "complete", entries: 0 });
+		await Promise.all(helpers.map((candidate) => candidate.shutdown()));
+	}, { diagnostics });
 });

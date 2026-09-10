@@ -178,8 +178,9 @@ using System.Security.Principal;
 using System.Text.RegularExpressions;
 
 public sealed class BootstrapFailure : Exception {
-  public readonly string Code;
-  public BootstrapFailure(string code) { Code = code; }
+  public readonly string Code, Stage;
+  public readonly uint? NtStatus;
+  public BootstrapFailure(string code, string stage, uint? ntStatus) { Code = code; Stage = stage; NtStatus = ntStatus; }
 }
 
 public static class WindowsSessionBootstrap {
@@ -209,6 +210,8 @@ public static class WindowsSessionBootstrap {
   static readonly object Gate = new object();
   static readonly List<IntPtr> Handles = new List<IntPtr>();
   static IntPtr Presence = IntPtr.Zero;
+  static string InitializationStage = "unknown";
+  static uint? InitializationNtStatus = null;
 
   [DllImport("ntdll.dll", CallingConvention=CallingConvention.Winapi)] static extern uint NtCreateFile(out IntPtr fileHandle, uint desiredAccess, ref OBJECT_ATTRIBUTES objectAttributes, out IO_STATUS_BLOCK ioStatusBlock, IntPtr allocationSize, uint fileAttributes, uint shareAccess, uint createDisposition, uint createOptions, IntPtr eaBuffer, uint eaLength);
   [DllImport("ntdll.dll", CallingConvention=CallingConvention.Winapi)] static extern uint NtQueryDirectoryFile(IntPtr fileHandle, IntPtr eventHandle, IntPtr apcRoutine, IntPtr apcContext, out IO_STATUS_BLOCK ioStatusBlock, IntPtr fileInformation, uint length, int fileInformationClass, bool returnSingleEntry, IntPtr fileName, bool restartScan);
@@ -219,7 +222,9 @@ public static class WindowsSessionBootstrap {
   [DllImport("advapi32.dll")] static extern uint GetSecurityDescriptorLength(IntPtr descriptor);
   [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
 
-  static void Fail(string code) { throw new BootstrapFailure(code); }
+  static void Fail(string code) { throw new BootstrapFailure(code, InitializationStage, InitializationNtStatus); }
+  static void SetStage(string stage) { InitializationStage = stage; InitializationNtStatus = null; }
+  static void SetNtStatus(uint status) { InitializationNtStatus = status; }
   static void Close(IntPtr handle) { if (handle != IntPtr.Zero) CloseHandle(handle); }
   static IntPtr Unicode(string value, out IntPtr chars) {
     chars = Marshal.StringToHGlobalUni(value); var text = new UNICODE_STRING();
@@ -241,14 +246,14 @@ public static class WindowsSessionBootstrap {
     } finally { if (security != IntPtr.Zero) Marshal.FreeHGlobal(security); if (unicode != IntPtr.Zero) Marshal.FreeHGlobal(unicode); if (chars != IntPtr.Zero) Marshal.FreeHGlobal(chars); }
   }
   static void AssertDirectory(IntPtr handle) {
-    if (handle == IntPtr.Zero) throw new BootstrapFailure("unsafe");
+    if (handle == IntPtr.Zero) Fail("unsafe");
     BY_HANDLE_FILE_INFORMATION info;
-    if (!GetFileInformationByHandle(handle, out info)) throw new BootstrapFailure("unsafe");
+    if (!GetFileInformationByHandle(handle, out info)) Fail("unsafe");
     if ((info.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != FILE_ATTRIBUTE_DIRECTORY) Fail("unsafe");
   }
   static IntPtr RequireOpen(IntPtr root, string component, bool privateDirectory) {
     OpenResult result = Open(root, component, privateDirectory, false, null);
-    if (result.Handle == IntPtr.Zero) Fail(result.Status == STATUS_OBJECT_NAME_NOT_FOUND ? "unavailable" : "unsafe");
+    if (result.Handle == IntPtr.Zero) { SetNtStatus(result.Status); Fail(result.Status == STATUS_OBJECT_NAME_NOT_FOUND ? "unavailable" : "unsafe"); }
     try { AssertDirectory(result.Handle); return result.Handle; } catch { Close(result.Handle); throw; }
   }
   static void AssertOwned(IntPtr handle, string sid) {
@@ -263,13 +268,14 @@ public static class WindowsSessionBootstrap {
       if (ace == null || ace.IsCallback || ace.AceFlags != AceFlags.None || ace.AceQualifier != AceQualifier.AccessAllowed || ace.IsInherited || ace.SecurityIdentifier == null || ace.SecurityIdentifier.Value != sid || ace.AccessMask != 0x1F01FF) Fail("unsafe");
     } finally { LocalFree(descriptor); }
   }
-  static IntPtr CreateOrOpenOwned(IntPtr parent, string name, byte[] descriptor, string sid) {
+  static IntPtr CreateOrOpenOwned(IntPtr parent, string name, byte[] descriptor, string sid, string createStage, string assertStage) {
+    SetStage(createStage);
     OpenResult created = Open(parent, name, true, true, descriptor); IntPtr handle = created.Handle;
     if (handle == IntPtr.Zero) {
-      if (created.Status != STATUS_OBJECT_NAME_COLLISION) Fail(created.Status == STATUS_OBJECT_NAME_NOT_FOUND ? "unavailable" : "unsafe");
+      if (created.Status != STATUS_OBJECT_NAME_COLLISION) { SetNtStatus(created.Status); Fail(created.Status == STATUS_OBJECT_NAME_NOT_FOUND ? "unavailable" : "unsafe"); }
       handle = RequireOpen(parent, name, true);
     }
-    try { AssertDirectory(handle); AssertOwned(handle, sid); return handle; } catch { Close(handle); throw; }
+    try { SetStage(assertStage); AssertDirectory(handle); AssertOwned(handle, sid); return handle; } catch { Close(handle); throw; }
   }
   static string[] Components(string agentHome) {
     if (String.IsNullOrEmpty(agentHome) || agentHome.Length > 4096 || !Regex.IsMatch(agentHome, @"^[A-Za-z]:\\(?:[^\\]+\\)*[^\\]+$") /* "^[A-Za-z]:\\\\(?:[^\\\\]+\\\\)*[^\\\\]+$")) */ ) Fail("invalid");
@@ -312,15 +318,17 @@ public static class WindowsSessionBootstrap {
   public static int EnumeratePresence() { lock (Gate) { if (Presence == IntPtr.Zero) Fail("unavailable"); return EnumeratePinned(Presence).Length; } }
       public static void Initialize(string agentHome, byte[] descriptor, string sid) {
     lock (Gate) {
+      InitializationStage = "unknown"; InitializationNtStatus = null;
       CloseAll();
       try {
-        string[] components = Components(agentHome); IntPtr volume = RequireOpen(IntPtr.Zero, VolumePath(agentHome), false); Handles.Add(volume); IntPtr parent = volume;
-        foreach (string component in components) { IntPtr child = RequireOpen(parent, component, false); Handles.Add(child); parent = child; }
+        string[] components = Components(agentHome);
+        SetStage("volume-open"); IntPtr volume = RequireOpen(IntPtr.Zero, VolumePath(agentHome), false); Handles.Add(volume); IntPtr parent = volume;
+        foreach (string component in components) { SetStage("ancestor-open"); IntPtr child = RequireOpen(parent, component, false); Handles.Add(child); parent = child; }
         // gentle-agents is a shared routing parent created by the host lifecycle; never repair or create it here.
-        IntPtr routing = RequireOpen(parent, "gentle-agents", false); Handles.Add(routing);
-        IntPtr transport = CreateOrOpenOwned(routing, "transport", descriptor, sid); Handles.Add(transport);
-        Presence = CreateOrOpenOwned(transport, "presence", descriptor, sid); Handles.Add(Presence);
-      } catch { CloseAll(); throw; }
+        SetStage("routing-open"); IntPtr routing = RequireOpen(parent, "gentle-agents", false); Handles.Add(routing);
+        IntPtr transport = CreateOrOpenOwned(routing, "transport", descriptor, sid, "transport-create-or-open", "transport-assert-owned"); Handles.Add(transport);
+        Presence = CreateOrOpenOwned(transport, "presence", descriptor, sid, "presence-create-or-open", "presence-assert-owned"); Handles.Add(Presence);
+      } catch { CloseAll(); throw; } finally { InitializationStage = "unknown"; InitializationNtStatus = null; }
     }
   }
   public static void CloseAll() { lock (Gate) { for (int index = Handles.Count - 1; index >= 0; index--) Close(Handles[index]); Handles.Clear(); Presence = IntPtr.Zero; } }
@@ -330,6 +338,19 @@ public static class WindowsSessionBootstrap {
 } catch {
 	$nativeReady = $false
 	Write-BootstrapDiagnostic (@($addTypeErrors) + @($_))
+}
+
+function Write-BootstrapRejectionDiagnostic([BootstrapFailure]$failure) {
+	if ($failure.Code -ne 'unsafe') { return }
+	$stage = 'unknown'
+	$ntstatus = $null
+	try {
+		$candidateStage = Get-BootstrapProperty $failure 'Stage'
+		if ($candidateStage -is [string] -and $candidateStage -in @('volume-open', 'ancestor-open', 'routing-open', 'transport-create-or-open', 'transport-assert-owned', 'presence-create-or-open', 'presence-assert-owned')) { $stage = $candidateStage }
+		$candidateStatus = Get-BootstrapProperty $failure 'NtStatus'
+		if ($candidateStatus -is [uint32]) { $ntstatus = [uint64]$candidateStatus }
+	} catch {}
+	[Console]::Error.WriteLine(([pscustomobject]@{ kind = 'windows-session-bootstrap-rejection'; stage = $stage; ntstatus = $ntstatus } | ConvertTo-Json -Compress))
 }
 
 function Write-Reply([string]$requestId, [bool]$ok, $result, [string]$error) {
@@ -381,7 +402,7 @@ try {
 					$security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow))
 					[WindowsSessionBootstrap]::Initialize($request.agentHome, $security.GetSecurityDescriptorBinaryForm(), $sid.Value)
 					Write-Reply $id $true @{ state = 'initialized'; bootstrap = 'complete' } $null
-				} catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }
+				} catch [BootstrapFailure] { Write-BootstrapRejectionDiagnostic $_.Exception; Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }
 				break
 			}
 			'enumerate' { if (-not (Is-ExactRequest $request @('requestId', 'operation'))) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { Write-Reply $id $true @{ state = 'initialized'; bootstrap = 'complete'; entries = [WindowsSessionBootstrap]::EnumeratePresence() } $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
