@@ -330,6 +330,24 @@ async function fixtureResult(mode: "capture" | "equals" | "measure" | "add-extra
 	return JSON.parse(result.stdout) as Record<string, boolean>;
 }
 
+const publicHostErrors = new Set(["unavailable", "unsafe", "busy", "not_found", "invalid"]);
+function requirePublicPresenceResult(reply: unknown): unknown {
+	if (reply && typeof reply === "object") {
+		const frame = reply as Record<string, unknown>;
+		if (frame.ok === true && Object.prototype.hasOwnProperty.call(frame, "result")) return frame.result;
+		if (frame.ok === false && typeof frame.error === "string" && publicHostErrors.has(frame.error)) assert.fail(`Windows presence reply failed: ${frame.error}`);
+	}
+	assert.fail("Windows presence reply failed: unknown");
+}
+
+test("presence reply assertion preserves results and redacts malformed errors", () => {
+	const result = Object.freeze({ records: Object.freeze([]) });
+	assert.strictEqual(requirePublicPresenceResult({ ok: true, result }), result);
+	assert.throws(() => requirePublicPresenceResult({ ok: false, error: "unsafe" }), /Windows presence reply failed: unsafe/);
+	assert.throws(() => requirePublicPresenceResult({ ok: false, error: "C:\\private" }), /Windows presence reply failed: unknown/);
+	assert.throws(() => requirePublicPresenceResult(undefined), /Windows presence reply failed: unknown/);
+});
+
 class FakeHelperChild extends EventEmitter {
 	pid: number | undefined = 42;
 	endCalls = 0;
@@ -712,7 +730,7 @@ test("Windows-native presence publishes, resolves, lists, and removes only its o
 		assert.match(record.endpoint as string, /^\\\\\.\\pipe\\gentle-pi-[0-9a-f]{32}$/);
 		assert.equal((await held.presence("publish", { record })).ok, true);
 		assert.equal((await held.presence("publish", { record })).error, "busy", "no-replace collision preserves the published record");
-		assert.deepEqual((await held.presence("list")).result, { records: [record] }, "an absent optional excludeSessionId lists normally");
+		assert.deepEqual(requirePublicPresenceResult(await held.presence("list")), { records: [record] }, "an absent optional excludeSessionId lists normally");
 		assert.deepEqual((await held.presence("resolve", { sessionId: "session-a" })).result, record);
 		const token = (record.endpoint as string).slice("\\\\.\\pipe\\gentle-pi-".length);
 		const publishedPath = join(agentHome, "gentle-agents", "transport", "presence", `session-a.${token}.json`);
@@ -734,7 +752,7 @@ test("Windows-native owned publication removes its unchanged rooted record", { s
 		const record = recorded.result as Record<string, unknown>;
 		assert.equal((await held.presence("publish", { record })).ok, true);
 		assert.equal((await held.presence("remove", { record })).ok, true);
-		assert.deepEqual((await held.presence("list")).result, { records: [] });
+		assert.deepEqual(requirePublicPresenceResult(await held.presence("list")), { records: [] });
 		assert.equal((await held.presence("resolve", { sessionId: "session-remove" })).error, "not_found");
 	} finally { await held.closeInput(); }
 });
@@ -786,7 +804,7 @@ test("Windows-native presence rejects hardlinks, corrupted ACLs, and oversized r
 	try {
 		const presence = join(agentHome, "gentle-agents", "transport", "presence");
 		assert.deepEqual(await fixtureResult("junction", join(presence, "reparse.0123456789abcdef0123456789abcdef.json"), ["-Target", root]), { ok: true, reparse: true });
-		assert.deepEqual((await held.presence("list")).result, { records: [] }, "a reparse record is ignored");
+		assert.deepEqual(requirePublicPresenceResult(await held.presence("list")), { records: [] }, "a reparse record is ignored");
 		for (const [sessionId, mutation] of [["hardlink", "hardlink"], ["bad-acl", "add-extra-ace"], ["oversize", "append"]] as const) {
 			const recorded = await held.presence("record", { sessionId, createdAt: 1 });
 			assert.equal(recorded.ok, true);
@@ -796,7 +814,7 @@ test("Windows-native presence rejects hardlinks, corrupted ACLs, and oversized r
 			const publishedPath = join(agentHome, "gentle-agents", "transport", "presence", `${sessionId}.${token}.json`);
 			if (mutation === "hardlink") await fixtureResult("hardlink", publishedPath, ["-Target", join(dirname(publishedPath), `other.${token}.json`)]);
 			else await fixtureResult(mutation, publishedPath);
-			assert.deepEqual((await held.presence("list")).result, { records: [] });
+			assert.deepEqual(requirePublicPresenceResult(await held.presence("list")), { records: [] });
 			assert.equal((await held.presence("resolve", { sessionId })).error, "not_found");
 		}
 	} finally { await held.closeInput(); }
