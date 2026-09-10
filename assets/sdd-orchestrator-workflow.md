@@ -220,10 +220,10 @@ Never persist caller-authored attempt counters, tokens, or state in OpenSpec art
 After the external run completes, call the compact settle with a request ID distinct from acquire, reusing an operation's own ID only for idempotent replay of that exact operation:
 
 ```text
-gentle-ai sdd-attempt settle --cwd <repo> --change <change> --token <token> --request-id <id> --outcome <failed|interrupted|passed> --evidence-revision <sha256:...> --diagnosis <text> --harness-disposition <reused|invalidated> --cleanup-evidence <text> --process-evidence <text>
+gentle-ai sdd-attempt settle --cwd <repo> --change <change> --token <token> --request-id <id> --outcome <failed|interrupted|passed> [--evidence-revision <sha256:...>] --diagnosis <text> --harness-disposition <reused|invalidated> --cleanup-evidence <text> --process-evidence <text>
 ```
 
-Every settle field is required: `cwd`, `change`, `token`, `request-id`, `outcome`, `evidence-revision`, `diagnosis`, `harness-disposition`, `cleanup-evidence`, and `process-evidence`. `evidence-revision` is never `none`. Pass `--successor-lineage` only for a distinct approved successor; the current/bound lineage remains itself otherwise. Pass `--remediates-evidence-revision` only when repairing a specific failed evidence revision. Settle derives binding and remediation inputs; the orchestrator never invents them.
+Every settle field except `evidence-revision` is required: `cwd`, `change`, `token`, `request-id`, `outcome`, `diagnosis`, `harness-disposition`, `cleanup-evidence`, and `process-evidence`. For `failed` or `passed`, include `--evidence-revision` with the `sha256:...` evidence hash. For `interrupted`, omit the entire `--evidence-revision` flag. Pass `--successor-lineage` only for a distinct approved successor; the current/bound lineage remains itself otherwise. Pass `--remediates-evidence-revision` only when repairing a specific failed evidence revision. Settle derives binding and remediation inputs; the orchestrator never invents them.
 
 `status`, `begin`, `finish`, and `reset` are diagnostic/compatibility surfaces, not the normal runtime route. Route continuation only from the provider-returned `proceed|blocked|complete`. `reset` is never automatic and requires an explicit maintainer scope decision.
 
