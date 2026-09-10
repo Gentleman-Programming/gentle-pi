@@ -673,7 +673,9 @@ test("Windows presence source guard uses rooted no-replace publication and same-
 	assert.match(source, /info\.NumberOfLinks != 1/);
 	assert.match(source, /!identity\.Equals\(retained\)/);
 	assert.match(source, /try \{\s*if \(owned\.Sid != sid\) Fail\("unsafe"\); RecordIdentity retained = AssertRetainedPublication/);
+	assert.match(source, /public static PresenceRecord\[\] List\(string sid\) \{ return List\(null, sid\); \}/);
 	assert.match(source, /public static PresenceRecord\[\] List\(string excluded, string sid\)/);
+	assert.match(source, /\$nativeRecords = if \(\$hasExcludeSessionId\) \{ \[WindowsSessionBootstrap\]::List\(\$excludeSessionId, \$identity\.Sid\) \} else \{ \[WindowsSessionBootstrap\]::List\(\$identity\.Sid\) \}/);
 	assert.match(source, /public static void RemoveOwn\(string sessionId, string endpoint, long createdAt, string sid\)/);
 });
 
@@ -730,7 +732,15 @@ test("Windows-native presence publishes, resolves, lists, and removes only its o
 		assert.match(record.endpoint as string, /^\\\\\.\\pipe\\gentle-pi-[0-9a-f]{32}$/);
 		assert.equal((await held.presence("publish", { record })).ok, true);
 		assert.equal((await held.presence("publish", { record })).error, "busy", "no-replace collision preserves the published record");
-		assert.deepEqual(requirePublicPresenceResult(await held.presence("list")), { records: [record] }, "an absent optional excludeSessionId lists normally");
+		assert.deepEqual(requirePublicPresenceResult(await held.presence("list")), { records: [record] }, "an omitted excludeSessionId lists one record");
+		const secondReply = await held.presence("record", { sessionId: "session-b", createdAt: 2 });
+		assert.equal(secondReply.ok, true);
+		const secondRecord = secondReply.result as Record<string, unknown>;
+		assert.equal((await held.presence("publish", { record: secondRecord })).ok, true);
+		assert.deepEqual(requirePublicPresenceResult(await held.presence("list")), { records: [record, secondRecord] }, "an omitted excludeSessionId lists multiple records");
+		assert.deepEqual(requirePublicPresenceResult(await held.presence("list", { excludeSessionId: "session-b" })), { records: [record] }, "a valid excludeSessionId is honored");
+		assert.equal((await held.presence("list", { excludeSessionId: "" })).error, "invalid", "an explicit malformed excludeSessionId is rejected");
+		assert.equal((await held.presence("remove", { record: secondRecord })).ok, true);
 		assert.deepEqual((await held.presence("resolve", { sessionId: "session-a" })).result, record);
 		const token = (record.endpoint as string).slice("\\\\.\\pipe\\gentle-pi-".length);
 		const publishedPath = join(agentHome, "gentle-agents", "transport", "presence", `session-a.${token}.json`);
