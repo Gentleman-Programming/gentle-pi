@@ -173,6 +173,7 @@ test("host query delivery exposes correlation and accepts one current-session re
 	harness.children[0].message({ id: "q1", kind: "query", message: "Which file?" });
 	await tick();
 	assert.match(String(sent.at(-1)?.message.content), new RegExp(`Task ID: ${taskId}\\nRequest ID: q1`));
+	assert.equal(sent.at(-1)?.message.display, true, "an explicit child query remains visible");
 	(ctx.sessionManager as { getSessionId(): string }).getSessionId = () => "s2";
 	assert.match((await tools.get("subagent_reply")!.execute("stale", { task_id: taskId, request_id: "q1", message: "wrong" }, undefined, undefined, ctx)).content[0].text, /unavailable/);
 	(ctx.sessionManager as { getSessionId(): string }).getSessionId = () => "s1";
@@ -319,6 +320,7 @@ test("child parent-message tooling admits notifications and the active parent pr
 	runtime.children[0].message({ id: "n1", kind: "notification", message: "raw\u001B[2J text" });
 	await tick();
 	assert.equal(parent.sent[0]?.message.content, "raw\u001B[2J text");
+	assert.equal(parent.sent[0]?.message.display, false, "ordinary child notifications remain model-visible but do not render in the transcript");
 	assert.deepEqual(parent.sent[0]?.options, { deliverAs: "followUp", triggerTurn: true });
 	const rendered = parent.renderers.get("gentle-agents.message")!(parent.sent[0]?.message, { expanded: true }, plainTheme).render(80).join("\n");
 	assert.match(rendered, /raw\\x1B\[2J text/);
@@ -1105,6 +1107,7 @@ test("background runs return at once; status, result, send_message, cancel, and 
 	assert.equal((await tools.get("subagent_result")!.execute("c7", { task_id: id }, undefined, undefined, ctx)).content[0].text, "All done.");
 	assert.equal(sent.length, 1, "a background result is delivered to the model once");
 	assert.equal(sent[0].message.customType, "gentle-agents.result");
+	assert.equal(sent[0].message.display, true, "completion cards remain visible");
 	assert.deepEqual(sent[0].options, { deliverAs: "followUp", triggerTurn: true });
 	assert.match(String(sent[0].message.content), new RegExp(`^Subagent explore \\(task ${id}, "Long job"\\) finished\\.\n\nAll done\\.$`));
 	const card = renderers.get("gentle-agents.result")!(sent[0].message, { expanded: true }, plainTheme).render(70).map(stripAnsi);
