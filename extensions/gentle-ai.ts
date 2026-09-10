@@ -265,7 +265,7 @@ function packageAssetDiagnosticLines(cwd: string): string[] {
 			lines.push(`info: Global ${label} user overrides: ${overrides} file(s); preserved, not package drift`);
 		}
 		if (local > 0) {
-			lines.push(`warn: Project-local ${label} agent overrides: ${local} file(s) — local ${label} agents shadow package assets; keep only intentional overrides`);
+			lines.push(`warn: Active ${label} agent overrides: ${local} file(s) — active non-builtin ${label} agents shadow package assets; keep only intentional overrides`);
 		}
 		return lines;
 	});
@@ -281,12 +281,9 @@ function localAgentOverrideCount(cwd: string, owner: PackageAssetOwner): number 
 			)
 		: new Set<string>();
 	let count = 0;
-	for (const installedDir of [
-		join(cwd, ".pi", "agents"),
-		join(cwd, ".pi", "subagents"),
-	]) {
-		if (!existsSync(installedDir)) continue;
-		for (const entry of readdirSync(installedDir, { withFileTypes: true })) {
+	for (const { dir, packageManaged } of discoverableNonBuiltinAgentRoots(cwd)) {
+		if (packageManaged || !existsSync(dir)) continue;
+		for (const entry of readdirSync(dir, { withFileTypes: true })) {
 			if (entry.isFile() && packageSddAgentNames.has(entry.name)) count += 1;
 		}
 	}
@@ -1935,6 +1932,43 @@ async function listAgentsFromDirAsync(
 	return entries;
 }
 
+interface DiscoverableNonBuiltinAgentRoot {
+	dir: string;
+	source: AgentSource;
+	/** The package installer owns this directory, so packageAssetAudit reports it. */
+	packageManaged: boolean;
+}
+
+function discoverableNonBuiltinAgentRoots(cwd: string): DiscoverableNonBuiltinAgentRoot[] {
+	const globalAgentHome = gentlePiAgentHome();
+	const roots: DiscoverableNonBuiltinAgentRoot[] = [
+		{ dir: join(globalAgentHome, "agents"), source: "user", packageManaged: true },
+		{ dir: join(globalAgentHome, "subagents"), source: "user", packageManaged: false },
+		{ dir: join(homedir(), ".agents"), source: "user", packageManaged: false },
+		{ dir: join(cwd, ".agents"), source: "project", packageManaged: false },
+		{ dir: join(cwd, ".pi", "agents"), source: "project", packageManaged: false },
+		{ dir: join(cwd, ".pi", "subagents"), source: "project", packageManaged: false },
+	];
+	const unique = new Map<string, DiscoverableNonBuiltinAgentRoot>();
+	for (const root of roots) {
+		let canonical: string;
+		try {
+			canonical = realpathSync(root.dir);
+		} catch {
+			canonical = resolve(root.dir);
+		}
+		const existing = unique.get(canonical);
+		if (existing) {
+			// Later roots keep their existing discovery precedence even when two
+			// configured paths resolve to the same physical directory.
+			existing.dir = root.dir;
+			existing.source = root.source;
+			existing.packageManaged ||= root.packageManaged;
+		} else unique.set(canonical, root);
+	}
+	return [...unique.values()];
+}
+
 function builtinAgentDirs(cwd: string): string[] {
 	return [
 		join(PACKAGE_ROOT, "..", "pi-subagents-j0k3r", "agents"),
@@ -1965,16 +1999,12 @@ async function listBuiltinAgentNamesAsync(cwd: string): Promise<Set<string>> {
 }
 
 function listDiscoverableAgents(cwd: string): AgentEntry[] {
-	const globalAgentHome = gentlePiAgentHome();
 	const builtinDirs = builtinAgentDirs(cwd);
 	const agents = [
 		...builtinDirs.flatMap((dir) => listAgentsFromDir(dir, "builtin")),
-		...listAgentsFromDir(join(globalAgentHome, "agents"), "user"),
-		...listAgentsFromDir(join(globalAgentHome, "subagents"), "user"),
-		...listAgentsFromDir(join(homedir(), ".agents"), "user"),
-		...listAgentsFromDir(join(cwd, ".agents"), "project"),
-		...listAgentsFromDir(join(cwd, ".pi", "agents"), "project"),
-		...listAgentsFromDir(join(cwd, ".pi", "subagents"), "project"),
+		...discoverableNonBuiltinAgentRoots(cwd).flatMap(({ dir, source }) =>
+			listAgentsFromDir(dir, source),
+		),
 	];
 	const byName = new Map<string, AgentEntry>();
 	for (const agent of agents) byName.set(agent.name, agent);
@@ -1982,21 +2012,12 @@ function listDiscoverableAgents(cwd: string): AgentEntry[] {
 }
 
 async function listDiscoverableAgentsAsync(cwd: string): Promise<AgentEntry[]> {
-	const globalAgentHome = gentlePiAgentHome();
 	const builtinDirs = builtinAgentDirs(cwd);
 	const agents: AgentEntry[] = [];
 	for (const dir of builtinDirs) {
 		agents.push(...(await listAgentsFromDirAsync(dir, "builtin")));
 	}
-	const otherDirs: Array<[string, AgentSource]> = [
-		[join(globalAgentHome, "agents"), "user"],
-		[join(globalAgentHome, "subagents"), "user"],
-		[join(homedir(), ".agents"), "user"],
-		[join(cwd, ".agents"), "project"],
-		[join(cwd, ".pi", "agents"), "project"],
-		[join(cwd, ".pi", "subagents"), "project"],
-	];
-	for (const [dir, source] of otherDirs) {
+	for (const { dir, source } of discoverableNonBuiltinAgentRoots(cwd)) {
 		agents.push(...(await listAgentsFromDirAsync(dir, source)));
 	}
 	const byName = new Map<string, AgentEntry>();

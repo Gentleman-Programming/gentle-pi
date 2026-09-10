@@ -1623,19 +1623,33 @@ async function run() {
 	}
 
 	const staleAssetsCwd = await tempWorkspace();
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const previousHome = process.env.HOME;
+	const previousUserProfile = process.env.USERPROFILE;
 	try {
-		await mkdir(join(staleAssetsCwd, ".pi", "agents"), { recursive: true });
+		const diagnosticsAgentHome = join(staleAssetsCwd, "agent-home");
+		const diagnosticsHome = staleAssetsCwd;
+		process.env.GENTLE_PI_AGENT_HOME = diagnosticsAgentHome;
+		process.env.HOME = diagnosticsHome;
+		process.env.USERPROFILE = diagnosticsHome;
+		for (const [dir, name] of [
+			[join(diagnosticsAgentHome, "subagents"), "sdd-apply.md"],
+			[join(diagnosticsHome, ".agents"), "sdd-archive.md"],
+			[join(staleAssetsCwd, ".agents"), "sdd-design.md"],
+			[join(staleAssetsCwd, ".pi", "agents"), "sdd-spec.md"],
+			[join(staleAssetsCwd, ".pi", "subagents"), "sdd-sync.md"],
+		]) {
+			await mkdir(dir, { recursive: true });
+			await writeFile(join(dir, name), "intentional SDD override\n");
+		}
 		await mkdir(join(staleAssetsCwd, ".pi", "chains"), { recursive: true });
 		await mkdir(join(staleAssetsCwd, ".pi", "gentle-ai", "support"), { recursive: true });
-		await writeFile(join(staleAssetsCwd, ".pi", "agents", "sdd-apply.md"), "stale apply\n");
-		await writeFile(join(staleAssetsCwd, ".pi", "agents", "sdd-spec.md"), "stale spec\n");
-		await writeFile(join(staleAssetsCwd, ".pi", "agents", "sdd-custom-debug.md"), "custom debug agent\n");
 		await writeFile(join(staleAssetsCwd, ".pi", "chains", "sdd-full.chain.md"), "stale chain\n");
 		await writeFile(join(staleAssetsCwd, ".pi", "gentle-ai", "support", "sdd-status-contract.md"), "stale status contract\n");
 		const ctx = createCtx(staleAssetsCwd, true);
 		await commands.get("gentle:status").handler("", ctx);
-		assert.match(ctx.ui.notifications.at(-1).message, /Project-local SDD agent overrides: 2 file\(s\)/);
-		assert.match(ctx.ui.notifications.at(-1).message, /local SDD agents shadow package assets/);
+		assert.match(ctx.ui.notifications.at(-1).message, /Active SDD agent overrides: 5 file\(s\)/);
+		assert.match(ctx.ui.notifications.at(-1).message, /active non-builtin SDD agents shadow package assets/);
 		await commands.get("gentle:doctor").handler("", ctx);
 		assert.match(ctx.ui.notifications.at(-1).message, /el Gentleman doctor/);
 		assert.match(ctx.ui.notifications.at(-1).message, /Sensitive-path guard active/);
@@ -1647,6 +1661,12 @@ async function run() {
 		assert.match(ctx.ui.notifications.at(-1).message, /Engram memory tools not active in this session/);
 		pi.setActiveTools(["read", "bash", "edit", "write"]);
 	} finally {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousUserProfile;
 		await rm(staleAssetsCwd, { recursive: true, force: true });
 	}
 

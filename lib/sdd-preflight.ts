@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -11,7 +11,10 @@ export type { SddArtifactStore };
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ASSETS_DIR = join(PACKAGE_ROOT, "assets");
 const MANAGED_ASSETS_MANIFEST = "managed-assets.json";
+const MANAGED_ASSETS_LOCK = "managed-assets.lock";
 const MANAGED_ASSETS_SCHEMA_VERSION = 1;
+const MANAGED_ASSETS_LOCK_TIMEOUT_MS = 5_000;
+const MANAGED_ASSETS_LOCK_RETRY_MS = 25;
 const LEGACY_MANAGED_ASSET_MANIFESTS = Object.freeze([
 	{ path: join(ASSETS_DIR, "migrations", "managed-assets-v0.10.7.json"), version: "0.10.7" },
 	{ path: join(ASSETS_DIR, "migrations", "managed-assets-v0.13.json"), version: "0.13.0" },
@@ -130,6 +133,20 @@ interface LegacyManagedAssetsManifest extends ManagedAssetsManifest {
 	packageVersion: string;
 }
 
+interface ManagedAssetsLockOwner {
+	schemaVersion: 1;
+	token: string;
+	pid: number;
+	createdAtMs: number;
+}
+
+/** @internal The hold option exists only to make process-lock regression tests deterministic. */
+interface PackageAssetInstallLockOptions {
+	timeoutMs?: number;
+	retryMs?: number;
+	holdLockMs?: number;
+}
+
 export const DEFAULT_SDD_PREFLIGHT: SddPreflightPreferences = Object.freeze({
 	executionMode: "auto",
 	artifactStore: "openspec",
@@ -242,6 +259,89 @@ function managedAssetHash(content: string): string {
 	return createHash("sha256").update(content).digest("hex");
 }
 
+function readManagedAssetsLockOwner(lockPath: string): ManagedAssetsLockOwner | undefined {
+	try {
+		if (!lstatSync(lockPath).isFile()) return undefined;
+		const parsed: unknown = JSON.parse(readFileSync(lockPath, "utf8"));
+		if (!isRecord(parsed) || parsed.schemaVersion !== 1 || typeof parsed.token !== "string" || parsed.token.length === 0 || !Number.isInteger(parsed.pid) || parsed.pid <= 0 || typeof parsed.createdAtMs !== "number" || !Number.isFinite(parsed.createdAtMs)) return undefined;
+		return parsed as ManagedAssetsLockOwner;
+	} catch {
+		return undefined;
+	}
+}
+
+function waitForManagedAssetsLock(milliseconds: number): void {
+	if (milliseconds <= 0) return;
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function normalizedLockDuration(value: number | undefined, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0
+		? Math.floor(value)
+		: fallback;
+}
+
+function acquireManagedAssetsLock(
+	agentHome: string,
+	options: PackageAssetInstallLockOptions = {},
+): { path: string; owner: ManagedAssetsLockOwner } {
+	const lockParent = join(agentHome, "gentle-ai");
+	const lockPath = join(lockParent, MANAGED_ASSETS_LOCK);
+	const timeoutMs = normalizedLockDuration(options.timeoutMs, MANAGED_ASSETS_LOCK_TIMEOUT_MS);
+	const retryMs = Math.max(1, normalizedLockDuration(options.retryMs, MANAGED_ASSETS_LOCK_RETRY_MS));
+	const deadline = Date.now() + timeoutMs;
+	mkdirSync(lockParent, { recursive: true });
+	for (;;) {
+		const owner: ManagedAssetsLockOwner = {
+			schemaVersion: 1,
+			token: randomUUID(),
+			pid: process.pid,
+			createdAtMs: Date.now(),
+		};
+		try {
+			writeFileSync(lockPath, JSON.stringify(owner), { encoding: "utf8", flag: "wx" });
+			return { path: lockPath, owner };
+		} catch (error) {
+			if (!isRecord(error) || error.code !== "EEXIST") throw error;
+			try {
+				if (!lstatSync(lockPath).isFile()) {
+					throw new Error(`Managed-assets lock path is unsafe and must be a regular file: ${lockPath}`);
+				}
+			} catch (inspectionError) {
+				if (isRecord(inspectionError) && inspectionError.code === "ENOENT") continue;
+				throw inspectionError;
+			}
+			if (Date.now() >= deadline) {
+				throw new Error(`Timed out acquiring managed-assets lock file ${lockPath}. Verify no installer is active before removing this exact lock file.`);
+			}
+			waitForManagedAssetsLock(retryMs);
+		}
+	}
+}
+
+function releaseManagedAssetsLock(lock: { path: string; owner: ManagedAssetsLockOwner }): void {
+	if (readManagedAssetsLockOwner(lock.path)?.token !== lock.owner.token) return;
+	try {
+		unlinkSync(lock.path);
+	} catch {
+		// An unreadable or replaced lock remains for an operator to inspect.
+	}
+}
+
+function withManagedAssetsLock<T>(
+	agentHome: string,
+	action: () => T,
+	options: PackageAssetInstallLockOptions | undefined,
+): T {
+	const lock = acquireManagedAssetsLock(agentHome, options);
+	try {
+		waitForManagedAssetsLock(normalizedLockDuration(options?.holdLockMs, 0));
+		return action();
+	} finally {
+		releaseManagedAssetsLock(lock);
+	}
+}
+
 function readLegacyManagedAssets(
 	path: string,
 	version: string,
@@ -349,16 +449,18 @@ export function updatePackageManagedSddAgentOwnership(
 		return false;
 	}
 	const ownershipKey = `agents/${relativePath.split(sep).join("/")}`;
-	const manifestPath = join(agentHome, "gentle-ai", MANAGED_ASSETS_MANIFEST);
-	const manifest = readManagedAssetsManifest(manifestPath);
-	if (manifest.assets[ownershipKey] !== managedAssetHash(previousContent)) {
-		return false;
-	}
 	try {
-		if (readFileSync(installedPath, "utf8") !== nextContent) return false;
-		manifest.assets[ownershipKey] = managedAssetHash(nextContent);
-		writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
-		return true;
+		return withManagedAssetsLock(agentHome, () => {
+			const manifestPath = join(agentHome, "gentle-ai", MANAGED_ASSETS_MANIFEST);
+			const manifest = readManagedAssetsManifest(manifestPath);
+			if (manifest.assets[ownershipKey] !== managedAssetHash(previousContent)) {
+				return false;
+			}
+			if (readFileSync(installedPath, "utf8") !== nextContent) return false;
+			manifest.assets[ownershipKey] = managedAssetHash(nextContent);
+			writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+			return true;
+		}, undefined);
 	} catch {
 		return false;
 	}
@@ -612,55 +714,58 @@ export function installPackageAssets(
 	_cwd: string,
 	force: boolean,
 	owners?: readonly PackageAssetOwner[],
+	lockOptions?: PackageAssetInstallLockOptions,
 ): { agents: number; chains: number; support: number; skipped: number } {
-	const selected = owners === undefined ? undefined : new Set(
-		Object.entries(ASSET_OWNER_BY_KEY).filter(([, owner]) => owners.includes(owner)).map(([key]) => key),
-	);
 	const agentHome = gentlePiAgentHome();
-	const manifestPath = join(agentHome, "gentle-ai", MANAGED_ASSETS_MANIFEST);
-	let legacyAssetHashes: (() => Readonly<Record<string, readonly string[]>>) | undefined;
-	if (force) {
-		let cachedLegacyAssetHashes: Record<string, readonly string[]> | undefined;
-		legacyAssetHashes = () =>
-			(cachedLegacyAssetHashes ??= readLegacyManagedAssetHashes());
-	}
-	const manifest = readManagedAssetsManifest(manifestPath);
-	removeRetiredManagedAssets(agentHome, manifest, selected);
-	const agents = copyDirectoryFiles(
-		join(ASSETS_DIR, "agents"),
-		join(agentHome, "agents"),
-		"agents",
-		force,
-		manifest,
-		legacyAssetHashes,
-		selected,
-	);
-	const chains = copyDirectoryFiles(
-		join(ASSETS_DIR, "chains"),
-		join(agentHome, "chains"),
-		"chains",
-		force,
-		manifest,
-		legacyAssetHashes,
-		selected,
-	);
-	const support = copyDirectoryFiles(
-		join(ASSETS_DIR, "support"),
-		join(agentHome, "gentle-ai", "support"),
-		"gentle-ai/support",
-		force,
-		manifest,
-		legacyAssetHashes,
-		selected,
-	);
-	mkdirSync(dirname(manifestPath), { recursive: true });
-	writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
-	return {
-		agents: agents.copied,
-		chains: chains.copied,
-		support: support.copied,
-		skipped: agents.skipped + chains.skipped + support.skipped,
-	};
+	return withManagedAssetsLock(agentHome, () => {
+		const selected = owners === undefined ? undefined : new Set(
+			Object.entries(ASSET_OWNER_BY_KEY).filter(([, owner]) => owners.includes(owner)).map(([key]) => key),
+		);
+		const manifestPath = join(agentHome, "gentle-ai", MANAGED_ASSETS_MANIFEST);
+		let legacyAssetHashes: (() => Readonly<Record<string, readonly string[]>>) | undefined;
+		if (force) {
+			let cachedLegacyAssetHashes: Record<string, readonly string[]> | undefined;
+			legacyAssetHashes = () =>
+				(cachedLegacyAssetHashes ??= readLegacyManagedAssetHashes());
+		}
+		const manifest = readManagedAssetsManifest(manifestPath);
+		removeRetiredManagedAssets(agentHome, manifest, selected);
+		const agents = copyDirectoryFiles(
+			join(ASSETS_DIR, "agents"),
+			join(agentHome, "agents"),
+			"agents",
+			force,
+			manifest,
+			legacyAssetHashes,
+			selected,
+		);
+		const chains = copyDirectoryFiles(
+			join(ASSETS_DIR, "chains"),
+			join(agentHome, "chains"),
+			"chains",
+			force,
+			manifest,
+			legacyAssetHashes,
+			selected,
+		);
+		const support = copyDirectoryFiles(
+			join(ASSETS_DIR, "support"),
+			join(agentHome, "gentle-ai", "support"),
+			"gentle-ai/support",
+			force,
+			manifest,
+			legacyAssetHashes,
+			selected,
+		);
+		mkdirSync(dirname(manifestPath), { recursive: true });
+		writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+		return {
+			agents: agents.copied,
+			chains: chains.copied,
+			support: support.copied,
+			skipped: agents.skipped + chains.skipped + support.skipped,
+		};
+	}, lockOptions);
 }
 
 export function isSddPreflightTrigger(text: string): boolean {
@@ -844,7 +949,7 @@ export async function ensureSddPreflight(
 		});
 		const result =
 			(await callbacks.installAssets?.(ctx.cwd)) ??
-			installSddAssets(ctx.cwd, false);
+			installPackageAssets(ctx.cwd, false, ["sdd"]);
 		const modelResult = (await callbacks.applyModelConfig?.(ctx.cwd)) ?? {
 			updated: 0,
 			skipped: 0,
