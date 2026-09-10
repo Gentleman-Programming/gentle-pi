@@ -1178,7 +1178,7 @@ ${getOrchestratorPrompt(cwd, activeTools, rddStatusLine)}`;
 // Matches `git [global-flags] push` — tolerates flags like -C /repo or --work-tree=/tmp
 // between `git` and the subcommand. Short flags may be followed by a separate value token.
 const GIT_GLOBAL_FLAGS_SRC = String.raw`(?:\s+--?\S+(?:\s+[^-\s]\S*)?)* `;
-const GIT_PUSH_RE = new RegExp(String.raw`\bgit${GIT_GLOBAL_FLAGS_SRC}push\b`);
+const GIT_PUSH_RE = new RegExp(String.raw`\bgit${GIT_GLOBAL_FLAGS_SRC}(push)\b`);
 
 const DENIED_BASH_PATTERNS: RegExp[] = [
 	// Block rm -rf targeting /, ~ or ~/subdir, $HOME or $HOME/subdir, .. or .
@@ -1205,6 +1205,19 @@ const GUARD_ACTION = {
 type GuardAction = (typeof GUARD_ACTION)[keyof typeof GUARD_ACTION];
 type GuardClassification = GuardAction | "not-guarded";
 
+interface GuardMatch {
+	key: GuardedCommandKey;
+	action: GuardAction;
+	triggerIndex: number;
+}
+
+interface GuardEvaluation {
+	action: GuardClassification;
+	key?: GuardedCommandKey;
+	triggerIndex: number;
+	matches: GuardMatch[];
+}
+
 const GUARDED_COMMAND_KEY = {
 	GIT_PUSH: "gitPush",
 	GIT_REBASE: "gitRebase",
@@ -1229,10 +1242,10 @@ interface LoadGuardrailsOptions {
 
 const GUARDED_KEY_PATTERNS: Record<GuardedCommandKey, RegExp> = {
 	gitPush: GIT_PUSH_RE,
-	gitRebase: /\bgit\s+rebase\b/,
-	gitBranchDeleteForce: /\bgit\s+branch\s+(?:-[a-zA-Z]*D[a-zA-Z]*|-[a-zA-Z]*d[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*d[a-zA-Z]*|--delete\b[^\n]*--force\b|--force\b[^\n]*--delete\b)/,
-	npmPublish: /\bnpm\s+publish\b/,
-	piRemove: /\bpi\s+remove\b/,
+	gitRebase: /\bgit\s+(rebase)\b/,
+	gitBranchDeleteForce: /\bgit\s+(branch)\s+(?:-[a-zA-Z]*D[a-zA-Z]*|-[a-zA-Z]*d[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*d[a-zA-Z]*|--delete\b[^\r\n;&|]*--force\b|--force\b[^\r\n;&|]*--delete\b)/,
+	npmPublish: /\bnpm\s+(publish)\b/,
+	piRemove: /\bpi\s+(remove)\b/,
 };
 
 const AUTONOMOUS_DEFAULT_ACTIONS: Record<GuardedCommandKey, GuardAction> = {
@@ -1241,6 +1254,14 @@ const AUTONOMOUS_DEFAULT_ACTIONS: Record<GuardedCommandKey, GuardAction> = {
 	gitBranchDeleteForce: "confirm",
 	npmPublish: "block",
 	piRemove: "confirm",
+};
+
+const GUARDED_COMMAND_LABELS: Record<GuardedCommandKey, string> = {
+	gitPush: "git push",
+	gitRebase: "git rebase",
+	gitBranchDeleteForce: "forced git branch deletion",
+	npmPublish: "npm publish",
+	piRemove: "pi remove",
 };
 
 const SAFE_GUARDRAILS_CONFIG: RuntimeGuardrailsConfig = {
@@ -1258,31 +1279,83 @@ const SAFE_GUARDRAILS_CONFIG: RuntimeGuardrailsConfig = {
  *      (applying AUTONOMOUS_DEFAULT_ACTIONS for any key not set in guardedCommands)
  *   4. No match → "not-guarded"
  */
+function collectGuardedMatches(
+	command: string,
+	config: RuntimeGuardrailsConfig,
+): GuardMatch[] {
+	const matches: GuardMatch[] = [];
+	for (const [key, pattern] of Object.entries(GUARDED_KEY_PATTERNS) as [
+		GuardedCommandKey,
+		RegExp,
+	][]) {
+		const globalPattern = new RegExp(pattern.source, `${pattern.flags}g`);
+		for (const match of command.matchAll(globalPattern)) {
+			const action = config.autonomousMode
+				? (config.guardedCommands[key] ?? AUTONOMOUS_DEFAULT_ACTIONS[key])
+				: "confirm";
+			matches.push({
+				key,
+				action,
+				triggerIndex: match.index + match[0].lastIndexOf(match[1]),
+			});
+		}
+	}
+	return matches.sort((left, right) => left.triggerIndex - right.triggerIndex);
+}
+
+function evaluateGuardedCommand(
+	command: string,
+	config: RuntimeGuardrailsConfig,
+): GuardEvaluation {
+	const matches = collectGuardedMatches(command, config);
+
+	// Hard denies override every configured action across the complete command.
+	for (const pattern of DENIED_BASH_PATTERNS) {
+		const denied = pattern.exec(command);
+		if (!denied) continue;
+		const matchedAction = matches.find((match) =>
+			match.triggerIndex >= denied.index && match.triggerIndex < denied.index + denied[0].length,
+		);
+		return {
+			action: "block",
+			key: matchedAction?.key,
+			triggerIndex: matchedAction?.triggerIndex ?? denied.index,
+			matches,
+		};
+	}
+
+	// Configured block, then confirmation, then allow win across all matches.
+	const selected = matches.find((match) => match.action === "block")
+		?? matches.find((match) => match.action === "confirm")
+		?? matches.find((match) => match.action === "allow");
+	if (selected) return { ...selected, matches };
+	return { action: "not-guarded", triggerIndex: 0, matches };
+}
+
 function classifyGuardedCommand(
 	command: string,
 	config: RuntimeGuardrailsConfig,
 ): GuardClassification {
-	// Step 1: hard-deny always wins, regardless of any config
-	for (const pattern of DENIED_BASH_PATTERNS) {
-		if (pattern.test(command)) return "block";
+	return evaluateGuardedCommand(command, config).action;
+}
+
+function guardedCommandPreview(command: string, triggerIndex: number): string {
+	const start = Math.max(0, triggerIndex - 60);
+	const prefix = start > 0 ? "…" : "";
+	return `${prefix}${truncateToWidth(command.slice(start).replace(/\s+/g, " ").trim(), 180 - prefix.length, "…")}`;
+}
+
+/** Confirmation headline for all guarded actions; generic when no key matched. */
+function guardedCommandTitle(
+	key?: GuardedCommandKey,
+	matches: readonly GuardMatch[] = [],
+): string {
+	if (matches.length > 1) {
+		return `Allow guarded actions: ${matches.map((match) => GUARDED_COMMAND_LABELS[match.key]).join("; ")}?`;
 	}
-
-	// Step 2 & 3: find which guarded key (if any) this command matches
-	for (const [key, pattern] of Object.entries(GUARDED_KEY_PATTERNS) as [GuardedCommandKey, RegExp][]) {
-		if (!pattern.test(command)) continue;
-
-		// Matched a guarded key
-		if (!config.autonomousMode) {
-			// Legacy behavior: any match → confirm
-			return "confirm";
-		}
-
-		// Autonomous mode: use configured action, fall back to sensible defaults
-		const configuredAction = config.guardedCommands[key];
-		return configuredAction ?? AUTONOMOUS_DEFAULT_ACTIONS[key];
-	}
-
-	return "not-guarded";
+	return key === undefined
+		? "Allow guarded command?"
+		: `Allow guarded ${GUARDED_COMMAND_LABELS[key]}?`;
 }
 
 function parseGuardrailsConfigFile(
@@ -1702,7 +1775,8 @@ async function confirmCommand(
 	herdrLifecycle: HerdrConfirmationLifecycle,
 ): Promise<ToolCallEventResult | undefined> {
 	const guardrailsConfig = loadRuntimeGuardrailsConfig(ctx.cwd);
-	const classification = classifyGuardedCommand(command, guardrailsConfig);
+	const evaluation = evaluateGuardedCommand(command, guardrailsConfig);
+	const { action: classification } = evaluation;
 
 	if (classification === "block") {
 		return {
@@ -1725,11 +1799,8 @@ async function confirmCommand(
 				"Gentle AI safety policy requires interactive confirmation before this command.",
 		};
 	}
-	const preview = truncateToWidth(
-		command.replace(/\s+/g, " ").trim(),
-		180,
-		"…",
-	);
+	const title = guardedCommandTitle(evaluation.key, evaluation.matches);
+	const preview = guardedCommandPreview(command, evaluation.triggerIndex);
 	const requestId = randomUUID();
 	const emitPermissionRequest = (
 		state: "waiting" | "approved" | "denied",
@@ -1748,7 +1819,7 @@ async function confirmCommand(
 	emitPermissionRequest("waiting");
 	herdrLifecycle.begin();
 	try {
-		approved = await ctx.ui.confirm("Allow guarded command?", preview);
+		approved = await ctx.ui.confirm(title, preview);
 	} catch (error) {
 		confirmationFailed = true;
 		confirmationError = error;
@@ -6858,6 +6929,9 @@ export const __testing = {
 	listDiscoverableAgents,
 	orderDiscoverableAgents,
 	classifyGuardedCommand,
+	evaluateGuardedCommand,
+	guardedCommandPreview,
+	guardedCommandTitle,
 	loadRuntimeGuardrailsConfig,
 	buildGentlePrompt,
 	nativeStatusUnsupported,
