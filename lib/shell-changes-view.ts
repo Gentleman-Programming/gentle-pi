@@ -230,16 +230,15 @@ export class WorktreeChangesView {
 			}
 			return undefined;
 		}
+		if (event.type === "release" && this.leftPressActive && (event.button === "left" || event.button === "none")) {
+			this.leftPressActive = false;
+			return { handled: true, render: false };
+		}
 		if (!inFiles) return undefined;
 		if (event.type === "press") {
 			if (event.button !== "left") return undefined;
 			this.leftPressActive = true;
 			return { handled: true, capture: true, render: false };
-		}
-		if (event.type === "release") {
-			if (!this.leftPressActive || (event.button !== "left" && event.button !== "none")) return undefined;
-			this.leftPressActive = false;
-			return { handled: true, render: false };
 		}
 		if (event.type !== "click" || event.button !== "left") return undefined;
 		const index = this.listOffset + event.y - 1;
@@ -397,16 +396,15 @@ export class ChangesView {
 			if (inDiff) return { handled: true, render: this.scrollDiff(event.wheelDelta ?? 0, layout.bodyRows) };
 			return undefined;
 		}
+		if (event.type === "release" && this.leftPressActive && (event.button === "left" || event.button === "none")) {
+			this.leftPressActive = false;
+			return { handled: true, render: false };
+		}
 		if (!inFiles) return undefined;
 		if (event.type === "press") {
 			if (event.button !== "left") return undefined;
 			this.leftPressActive = true;
 			return { handled: true, capture: true, render: false };
-		}
-		if (event.type === "release") {
-			if (!this.leftPressActive || (event.button !== "left" && event.button !== "none")) return undefined;
-			this.leftPressActive = false;
-			return { handled: true, render: false };
 		}
 		if (event.type !== "click" || event.button !== "left") return undefined;
 		const index = this.fileScroll + event.y - 1;

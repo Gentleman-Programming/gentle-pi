@@ -196,6 +196,21 @@ test("file-list pointer capture is limited to an active left gesture in both vie
 	assert.equal(accordion.handleMouse(mouseButton("release", "none", 3, 2, 8)), undefined, "invalidate clears a captured left gesture");
 });
 
+test("an outside release clears an active left gesture in both views", () => {
+	const { view: standalone } = view();
+	const accordion = new WorktreeChangesView([{ root: "/main", branch: "main", model: changesModel([file("a.ts", 1, 0)]) }], {
+		theme: plainTheme, rows: 8, loadDiff: async () => "+preview", onOpen() {}, onClose() {}, onRefresh() {}, requestRender() {},
+	});
+	accordion.handleInput("\r");
+	standalone.render(80);
+	accordion.render(80);
+	for (const [component, y, height] of [[standalone, 1, 12], [accordion, 2, 8]] as const) {
+		assert.deepEqual(component.handleMouse(mouseButton("press", "left", 3, y, height)), { handled: true, capture: true, render: false });
+		assert.deepEqual(component.handleMouse(mouseButton("release", "none", 50, y, height)), { handled: true, render: false }, "captured release outside the file pane clears state");
+		assert.equal(component.handleMouse(mouseButton("release", "none", 3, y, height)), undefined, "a later unrelated release must not consume stale state");
+	}
+});
+
 test("right press reaches the native Windows paste fallback when eligible", () => {
 	let onInput: ((data: string) => void) | undefined;
 	let pasted = 0;
