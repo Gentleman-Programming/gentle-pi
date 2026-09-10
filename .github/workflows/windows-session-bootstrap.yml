@@ -18,6 +18,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24
-      - name: Run Windows bootstrap CSharp compile control
+      - name: Run Windows bootstrap startup control
         shell: cmd
-        run: node --experimental-strip-types --test --test-name-pattern="Windows bootstrap CSharp compile control" tests/windows-session-compile.test.ts
+        run: node --experimental-strip-types --test --test-name-pattern="^Windows bootstrap startup control$" tests/windows-session-bootstrap.test.ts
