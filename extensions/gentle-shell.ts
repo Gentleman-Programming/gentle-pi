@@ -333,7 +333,7 @@ async function showChangesOverlay(ctx: ExtensionContext, deps: OverlayDeps): Pro
 				host = tui;
 				view = new WorktreeChangesView(deps.worktrees(), {
 					theme,
-					rows: Math.max(OVERLAY_MIN_ROWS, Math.floor(tui.terminal.rows * OVERLAY_HEIGHT_RATIO)),
+					rows: () => Math.max(OVERLAY_MIN_ROWS, Math.floor(tui.terminal.rows * OVERLAY_HEIGHT_RATIO)),
 					loadDiff: (root, file) => loadFileDiff(deps.git(root), file),
 					onOpen: (root, file) => done({ root, file }),
 					onRefresh: () => void refresh(),
@@ -348,6 +348,7 @@ async function showChangesOverlay(ctx: ExtensionContext, deps: OverlayDeps): Pro
 		if (!openInExternalEditor(host, chosen.file.path, process.env, spawnSync, chosen.root)) ctx.ui.notify("No editor configured. Set $VISUAL or $EDITOR.", "warning");
 	} finally {
 		clearInterval(poll);
+		view?.dispose();
 		view = undefined;
 	}
 }
