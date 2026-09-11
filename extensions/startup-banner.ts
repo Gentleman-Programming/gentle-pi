@@ -1051,7 +1051,8 @@ export default function (pi: ExtensionAPI) {
 
             return out;
           },
-          invalidate() {
+          invalidate() {},
+          dispose() {
             cleanup();
           },
         };
