@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,6 +14,12 @@ const MAX_NPM_OUTPUT_BYTES = 1024 * 1024;
 const MAX_UNHOOKED_REPORT_BYTES = 1024;
 const UNHOOKED_STAGES = new Set(["pack", "pack-result", "install", "artifact-check", "import-probe", "post-import-check", "cleanup"]);
 const UNHOOKED_ERROR_CODES = new Set(["spawn-failed", "timed-out", "output-limit", "nonzero-exit", "invalid-result", "assertion-failed", "cleanup-failed", "unknown"]);
+const SDK_LIFECYCLE_STAGES = new Set(["pack", "pack-result", "install", "artifact-check", "lifecycle-probe", "lifecycle-result", "cleanup"]);
+const SDK_LIFECYCLE_ERROR_CODES = new Set(["spawn-failed", "timed-out", "unconfirmed-close", "output-limit", "nonzero-exit", "invalid-result", "assertion-failed", "cleanup-failed", "unknown"]);
+const SDK_LIFECYCLE_EXTENSION_ERROR_PHASES = new Set(["unobserved", "none", "startup", "shutdown"]);
+const SDK_LIFECYCLE_CHECK_IDS = new Set([
+	"not-attempted", "runner-hosted", "runner-temp", "temporary-root", "project-sdk-version", "pack-command", "pack-metadata", "pack-integrity", "install-command", "packed-assets", "native-artifacts", "sdk-manifest", "lifecycle-probe-command", "lifecycle-probe-result", "sdk-lifecycle-complete", "cleanup-owned-root-removal",
+]);
 const UNHOOKED_CHECK_IDS = new Set([
 	"not-attempted", "runner-temp", "temporary-root", "project-sdk-version", "pack-command", "pack-metadata", "pack-integrity", "install-command", "import-probe-command", "import-probe-result", "unhooked-imports-complete", "cleanup-owned-root-removal",
 	"asset-runtime-windows-session-transport-owned", "asset-runtime-windows-session-transport-hash",
@@ -33,8 +39,22 @@ function newUnhookedReceipt() {
 	return { checkId: "not-attempted", packVerified: false, installCompleted: false, cleanupCompleted: false };
 }
 
+function newSdkLifecycleReceipt() {
+	return {
+		checkId: "not-attempted", packVerified: false, installCompleted: false, sdkLoaded: false,
+		extensionErrorCount: null, extensionErrorPhase: "unobserved", sessionsStarted: 0,
+		presenceAfterStart: 0, presenceAfterFirstDispose: 0, presenceAfterSecondDispose: 0,
+		disposedSessions: 0, cleanupCompleted: false,
+	};
+}
+
 function selectUnhookedCheck(receipt, checkId) {
 	if (!UNHOOKED_CHECK_IDS.has(checkId)) throw new Error("invalid unhooked check identifier");
+	receipt.checkId = checkId;
+}
+
+function selectSdkLifecycleCheck(receipt, checkId) {
+	if (!SDK_LIFECYCLE_CHECK_IDS.has(checkId)) throw new Error("invalid SDK lifecycle check identifier");
 	receipt.checkId = checkId;
 }
 
@@ -86,6 +106,15 @@ class UnhookedFailure extends Error {
 	}
 }
 
+class SdkLifecycleFailure extends Error {
+	constructor(stage, code, exitStatus) {
+		super("SDK lifecycle packed proof failed");
+		this.stage = SDK_LIFECYCLE_STAGES.has(stage) ? stage : "cleanup";
+		this.code = SDK_LIFECYCLE_ERROR_CODES.has(code) ? code : "unknown";
+		this.exitStatus = validExitStatus(exitStatus);
+	}
+}
+
 function processFailure(stage, error) {
 	const details = error && typeof error === "object" ? error : {};
 	const exitStatus = validExitStatus(details.status);
@@ -114,6 +143,33 @@ function reportUnhookedReceipt(receipt, error) {
 	const boundedLine = Buffer.byteLength(line, "utf8") <= MAX_UNHOOKED_REPORT_BYTES
 		? line
 		: '{"mode":"unhooked-imports","status":"failed","checkId":"not-attempted","packVerified":false,"installCompleted":false,"cleanupCompleted":false,"stage":"cleanup","code":"unknown"}';
+	try { (failure === undefined ? process.stdout : process.stderr).write(`${boundedLine}\n`); } catch { /* Reporting cannot expose a raw secondary error. */ }
+	if (failure !== undefined) process.exitCode = failure.exitStatus ?? 1;
+}
+
+function reportSdkLifecycleReceipt(receipt, error) {
+	const failure = error instanceof SdkLifecycleFailure ? error : undefined;
+	const report = {
+		mode: "sdk-lifecycle",
+		status: failure === undefined ? "complete" : "failed",
+		checkId: failure === undefined ? "sdk-lifecycle-complete" : receipt.checkId,
+		packVerified: receipt.packVerified,
+		installCompleted: receipt.installCompleted,
+		sdkLoaded: receipt.sdkLoaded,
+		extensionErrorCount: receipt.extensionErrorCount,
+		extensionErrorPhase: receipt.extensionErrorPhase,
+		sessionsStarted: receipt.sessionsStarted,
+		presenceAfterStart: receipt.presenceAfterStart,
+		presenceAfterFirstDispose: receipt.presenceAfterFirstDispose,
+		presenceAfterSecondDispose: receipt.presenceAfterSecondDispose,
+		disposedSessions: receipt.disposedSessions,
+		cleanupCompleted: receipt.cleanupCompleted,
+		...(failure === undefined ? {} : { stage: failure.stage, code: failure.code, ...(failure.exitStatus === undefined ? {} : { exitStatus: failure.exitStatus }) }),
+	};
+	const line = JSON.stringify(report);
+	const boundedLine = Buffer.byteLength(line, "utf8") <= MAX_UNHOOKED_REPORT_BYTES
+		? line
+		: '{"mode":"sdk-lifecycle","status":"failed","checkId":"not-attempted","packVerified":false,"installCompleted":false,"sdkLoaded":false,"extensionErrorCount":null,"extensionErrorPhase":"unobserved","sessionsStarted":0,"presenceAfterStart":0,"presenceAfterFirstDispose":0,"presenceAfterSecondDispose":0,"disposedSessions":0,"cleanupCompleted":false,"stage":"cleanup","code":"unknown"}';
 	try { (failure === undefined ? process.stdout : process.stderr).write(`${boundedLine}\n`); } catch { /* Reporting cannot expose a raw secondary error. */ }
 	if (failure !== undefined) process.exitCode = failure.exitStatus ?? 1;
 }
@@ -167,6 +223,102 @@ function runBoundedProbe(arguments_, env, cwd) {
 	} catch (error) {
 		throw processFailure("import-probe", error);
 	}
+}
+
+function runBoundedSdkLifecycleProbe(arguments_, env, cwd) {
+	return new Promise((resolveProbe, rejectProbe) => {
+		let child;
+		let settled = false;
+		let outputBytes = 0;
+		const stdout = [];
+		let timeout;
+		let forceKill;
+		let closeGrace;
+		let stopFailure;
+		const lateErrorSink = () => {};
+		let onStdout;
+		let onStderr;
+		let onChildError;
+		let onClose;
+		const detachOperationalListeners = () => {
+			if (!child) return;
+			child.stdout?.removeListener("data", onStdout);
+			child.stderr?.removeListener("data", onStderr);
+			child.removeListener("error", onChildError);
+			child.removeListener("close", onClose);
+		};
+		const releaseUnconfirmedClose = () => {
+			if (!child) return;
+			detachOperationalListeners();
+			const removeLateGuards = () => {
+				child?.removeListener("error", lateErrorSink);
+				child?.stdout?.removeListener("error", lateErrorSink);
+				child?.stderr?.removeListener("error", lateErrorSink);
+			};
+			child.once("close", removeLateGuards);
+			child.on("error", lateErrorSink);
+			child.stdout?.on("error", lateErrorSink);
+			child.stderr?.on("error", lateErrorSink);
+			try { child.stdin?.destroy(); } catch { /* The process is already in bounded forced cleanup. */ }
+			try { child.stdout?.destroy(); } catch { /* The process is already in bounded forced cleanup. */ }
+			try { child.stderr?.destroy(); } catch { /* The process is already in bounded forced cleanup. */ }
+			try { child.unref(); } catch { /* The final receipt reports that close was unconfirmed. */ }
+		};
+		const finish = (error, result) => {
+			if (settled) return;
+			settled = true;
+			if (timeout) clearTimeout(timeout);
+			if (forceKill) clearTimeout(forceKill);
+			if (closeGrace) clearTimeout(closeGrace);
+			if (error instanceof SdkLifecycleFailure && error.code === "unconfirmed-close") releaseUnconfirmedClose();
+			else detachOperationalListeners();
+			if (error) rejectProbe(error);
+			else resolveProbe(result);
+		};
+		const requestStop = (failure) => {
+			if (stopFailure !== undefined || settled) return;
+			stopFailure = failure;
+			try { child?.kill(); } catch { /* The close grace below reports an unconfirmed close honestly. */ }
+			forceKill = setTimeout(() => { try { child?.kill("SIGKILL"); } catch { /* The final grace reports an unconfirmed close honestly. */ } }, 2500);
+			closeGrace = setTimeout(() => finish(new SdkLifecycleFailure("lifecycle-probe", "unconfirmed-close")), 5000);
+		};
+		try {
+			child = spawn(process.execPath, arguments_, {
+				cwd,
+				env,
+				stdio: ["ignore", "pipe", "pipe"],
+				windowsHide: true,
+			});
+		} catch {
+			finish(new SdkLifecycleFailure("lifecycle-probe", "spawn-failed"));
+			return;
+		}
+		const collect = (chunk, destination) => {
+			outputBytes += Buffer.byteLength(chunk);
+			if (outputBytes > MAX_NPM_OUTPUT_BYTES) requestStop(new SdkLifecycleFailure("lifecycle-probe", "output-limit"));
+			else if (destination !== undefined) destination.push(Buffer.from(chunk));
+		};
+		onStdout = (chunk) => collect(chunk, stdout);
+		onStderr = (chunk) => collect(chunk);
+		onChildError = () => requestStop(new SdkLifecycleFailure("lifecycle-probe", "spawn-failed"));
+		onClose = (status) => {
+			if (settled) return;
+			if (stopFailure !== undefined) {
+				finish(stopFailure);
+				return;
+			}
+			if (status !== 0) {
+				finish(new SdkLifecycleFailure("lifecycle-probe", "nonzero-exit", status));
+				return;
+			}
+			finish(undefined, Buffer.concat(stdout).toString("utf8"));
+		};
+		child.stdout.on("data", onStdout);
+		child.stderr.on("data", onStderr);
+		child.once("error", onChildError);
+		child.once("close", onClose);
+		timeout = setTimeout(() => requestStop(new SdkLifecycleFailure("lifecycle-probe", "timed-out")), 90000);
+	});
 }
 
 async function testHookedPackedRunner() {
@@ -375,6 +527,246 @@ process.stdout.write(JSON.stringify({ tools: registrations.tools.sort(), command
 `;
 }
 
+function sdkLifecycleProbeSource(packageRoot, consumerPackageJson, sdkPackageJson) {
+	return `
+import assert from "node:assert/strict";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+
+const receipt = {
+  sdkLoaded: false, extensionErrorCount: 0, extensionErrorPhase: "none", sessionsStarted: 0,
+  presenceAfterStart: 0, presenceAfterFirstDispose: 0, presenceAfterSecondDispose: 0, disposedSessions: 0,
+};
+let firstRuntime;
+let secondRuntime;
+let observer;
+let extensionErrorPhase = "startup";
+let extensionErrorCount = 0;
+let extensionErrorsActive = true;
+const recordExtensionError = () => {
+  if (!extensionErrorsActive) return;
+  extensionErrorCount = Math.min(2, extensionErrorCount + 1);
+  if (receipt.extensionErrorPhase === "none") receipt.extensionErrorPhase = extensionErrorPhase;
+  receipt.extensionErrorCount = extensionErrorCount;
+};
+const assertNoExtensionErrors = () => assert.equal(extensionErrorCount, 0, "packaged extension lifecycle error");
+const within = async (operation, milliseconds, label) => {
+  let timer;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(label)), milliseconds); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
+const disposeRuntime = async (runtime) => {
+  if (!runtime) return;
+  extensionErrorPhase = "shutdown";
+  await within(runtime.dispose(), 15000, "runtime teardown timed out");
+  assertNoExtensionErrors();
+  receipt.disposedSessions++;
+};
+const bindRuntime = async (runtime) => {
+  assert.equal(runtime.session.model, undefined, "session must not select a model before binding");
+  extensionErrorPhase = "startup";
+  await within(runtime.session.bindExtensions({ mode: "json", onError: recordExtensionError }), 30000, "session binding timed out");
+  assertNoExtensionErrors();
+  assert.equal(runtime.session.model, undefined, "session must remain model-free after JSON lifecycle startup");
+  receipt.sessionsStarted++;
+};
+try {
+  const sdk = await within(import("@earendil-works/pi-coding-agent"), 30000, "SDK load timed out");
+  receipt.sdkLoaded = true;
+  const { createAgentSessionFromServices, createAgentSessionRuntime, createAgentSessionServices, ModelRuntime, SessionManager, SettingsManager } = sdk;
+  const agentHome = process.env.GENTLE_PI_AGENT_HOME;
+  assert.equal(typeof agentHome, "string");
+  const probeRoot = join(process.cwd(), "sdk-lifecycle-probe");
+  const cwd = join(probeRoot, "cwd");
+  const sessionRoot = join(probeRoot, "sessions");
+  const modelRoot = join(probeRoot, "model-runtime");
+  for (const path of [probeRoot, cwd, sessionRoot, modelRoot, agentHome, join(agentHome, "gentle-agents")]) mkdirSync(path, { recursive: true });
+  const requireFromSdk = createRequire(pathToFileURL(${JSON.stringify(sdkPackageJson)}).href);
+  const { createJiti } = await import(pathToFileURL(requireFromSdk.resolve("jiti/static")).href);
+  const jiti = createJiti(pathToFileURL(${JSON.stringify(consumerPackageJson)}).href, { moduleCache: false });
+  const agentsExtensionPath = join(${JSON.stringify(packageRoot)}, "extensions", "gentle-agents.ts");
+  const gentleAiExtensionPath = join(${JSON.stringify(packageRoot)}, "extensions", "gentle-ai.ts");
+  const { createDefaultSessionTransport } = await jiti.import(pathToFileURL(agentsExtensionPath).href);
+  const expectedExtensionPaths = [agentsExtensionPath, gentleAiExtensionPath];
+  const settingsManager = SettingsManager.inMemory({}, { projectTrusted: false });
+  assert.equal(settingsManager.isProjectTrusted(), false, "in-memory settings must keep project discovery untrusted");
+  assert.equal(settingsManager.getDefaultProvider(), undefined, "in-memory settings must have no default provider");
+  assert.equal(settingsManager.getDefaultModel(), undefined, "in-memory settings must have no default model");
+  const createRuntime = (name) => async ({ cwd: runtimeCwd, sessionManager, sessionStartEvent }) => {
+    const runtimeRoot = join(modelRoot, name);
+    mkdirSync(runtimeRoot, { recursive: true });
+    assert.equal(sessionManager.getEntries().length, 0, "new SDK session must not restore prior entries");
+    const modelRuntime = await within(ModelRuntime.create({
+      authPath: join(runtimeRoot, "auth.json"),
+      modelsPath: join(runtimeRoot, "models.json"),
+      modelsStorePath: join(runtimeRoot, "models-store.json"),
+      refreshOnCreate: false,
+    }), 30000, "model runtime startup timed out");
+    const services = await within(createAgentSessionServices({
+      cwd: runtimeCwd,
+      agentDir: agentHome,
+      modelRuntime,
+      settingsManager,
+      resourceLoaderOptions: {
+        additionalExtensionPaths: expectedExtensionPaths,
+        noExtensions: true,
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+      },
+    }), 30000, "session services startup timed out");
+    assert.strictEqual(services.settingsManager, settingsManager, "services must retain the shared untrusted settings manager");
+    assert.equal(services.settingsManager.isProjectTrusted(), false, "services must keep project discovery untrusted");
+    const loaded = services.resourceLoader.getExtensions();
+    assert.equal(loaded.errors.length, 0, "packaged extension load must not report errors");
+    assert.deepEqual(loaded.extensions.map((extension) => extension.resolvedPath), expectedExtensionPaths, "only the two packaged extensions may load");
+    assert.deepEqual(loaded.extensions.map((extension) => extension.handlers.has("session_start") && extension.handlers.has("session_shutdown")), [true, true], "both packaged extensions must expose lifecycle hooks");
+    assert.equal(services.diagnostics.length, 0, "packaged extension service setup must not report errors");
+    assert.deepEqual(services.resourceLoader.getSkills().skills, [], "ambient skills must stay disabled");
+    assert.deepEqual(services.resourceLoader.getPrompts().prompts, [], "ambient prompts must stay disabled");
+    assert.deepEqual(services.resourceLoader.getThemes().themes, [], "ambient themes must stay disabled");
+    assert.deepEqual(services.resourceLoader.getAgentsFiles().agentsFiles, [], "ambient context files must stay disabled");
+    assert.equal(modelRuntime.getAvailableSnapshot().length, 0, "owned empty auth and model paths must expose no available models");
+    const created = await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent, noTools: "all" });
+    assert.equal(created.session.model, undefined, "SDK must not select a model from an empty availability snapshot");
+    return { ...created, services, diagnostics: services.diagnostics };
+  };
+  firstRuntime = await within(createAgentSessionRuntime(createRuntime("first"), {
+    cwd,
+    agentDir: agentHome,
+    sessionManager: SessionManager.create(cwd, join(sessionRoot, "first")),
+  }), 30000, "first runtime startup timed out");
+  await bindRuntime(firstRuntime);
+  secondRuntime = await within(createAgentSessionRuntime(createRuntime("second"), {
+    cwd,
+    agentDir: agentHome,
+    sessionManager: SessionManager.create(cwd, join(sessionRoot, "second")),
+  }), 30000, "second runtime startup timed out");
+  await bindRuntime(secondRuntime);
+  const firstId = firstRuntime.session.sessionId;
+  const secondId = secondRuntime.session.sessionId;
+  assert.notEqual(firstId, secondId, "SDK must create distinct real session IDs");
+  observer = await within(createDefaultSessionTransport().createRegistry(agentHome), 30000, "presence observer startup timed out");
+  const started = await within(observer.listActivations(), 30000, "presence observation timed out");
+  assert.deepEqual(started.map((record) => record.sessionId).sort(), [firstId, secondId].sort(), "default transport must advertise both SDK sessions");
+  receipt.presenceAfterStart = started.length;
+  assert.equal(firstRuntime.session.model, undefined, "first session must remain model-free through presence lifecycle");
+  assert.equal(secondRuntime.session.model, undefined, "second session must remain model-free through presence lifecycle");
+  assertNoExtensionErrors();
+  await disposeRuntime(firstRuntime);
+  firstRuntime = undefined;
+  const afterFirstDispose = await within(observer.listActivations(), 30000, "first withdrawal observation timed out");
+  assert.deepEqual(afterFirstDispose.map((record) => record.sessionId), [secondId], "disposing one runtime must withdraw only its presence");
+  receipt.presenceAfterFirstDispose = afterFirstDispose.length;
+  assert.equal(secondRuntime.session.model, undefined, "surviving session must remain model-free after peer withdrawal");
+  assertNoExtensionErrors();
+  await disposeRuntime(secondRuntime);
+  secondRuntime = undefined;
+  const afterSecondDispose = await within(observer.listActivations(), 30000, "second withdrawal observation timed out");
+  assert.deepEqual(afterSecondDispose, [], "disposing both runtimes must withdraw both presence records");
+  receipt.presenceAfterSecondDispose = afterSecondDispose.length;
+  assertNoExtensionErrors();
+} finally {
+  let cleanupError;
+  try { await disposeRuntime(firstRuntime); } catch { cleanupError = new Error("first runtime cleanup failed"); }
+  try { await disposeRuntime(secondRuntime); } catch { cleanupError = new Error("second runtime cleanup failed"); }
+  try { await within(Promise.resolve(observer?.close?.()), 15000, "presence observer teardown timed out"); } catch { cleanupError = new Error("presence observer cleanup failed"); }
+  try { assertNoExtensionErrors(); } catch { cleanupError = new Error("packaged extension lifecycle error"); }
+  extensionErrorsActive = false;
+  if (cleanupError) throw cleanupError;
+}
+process.stdout.write(JSON.stringify(receipt));
+`;
+}
+
+async function testSdkLifecyclePackedSession() {
+	const receipt = newSdkLifecycleReceipt();
+	let temporary;
+	let stage = "pack";
+	let failure;
+	try {
+		selectSdkLifecycleCheck(receipt, "runner-hosted");
+		if (process.env.RUNNER_ENVIRONMENT !== "github-hosted") throw new SdkLifecycleFailure("pack", "assertion-failed");
+		selectSdkLifecycleCheck(receipt, "runner-temp");
+		const runnerTemp = process.env.RUNNER_TEMP;
+		if (typeof runnerTemp !== "string" || runnerTemp.length === 0) throw new SdkLifecycleFailure("pack", "assertion-failed");
+		selectSdkLifecycleCheck(receipt, "temporary-root");
+		temporary = mkdtempSync(join(resolve(runnerTemp), "gentle-pi-sdk-lifecycle-"));
+		const packDirectory = join(temporary, "pack");
+		const consumerDirectory = join(temporary, "consumer");
+		mkdirSync(packDirectory);
+		mkdirSync(consumerDirectory);
+		const { env } = isolatedUnhookedEnvironment(temporary);
+		Object.assign(env, { GENTLE_PI_AGENTS: "1", PI_OFFLINE: "1" });
+		selectSdkLifecycleCheck(receipt, "project-sdk-version");
+		const manifest = safeJson(readFileSync(join(root, "package.json")), "project package manifest");
+		const sdkVersion = manifest?.devDependencies?.["@earendil-works/pi-coding-agent"];
+		if (sdkVersion !== "0.85.1") throw new Error("SDK lifecycle probe requires the project-pinned Pi SDK");
+		selectSdkLifecycleCheck(receipt, "pack-command");
+		const packed = safeJson(runBoundedNpm("pack", ["pack", "--ignore-scripts", "--json", "--pack-destination", packDirectory], env, root), "npm pack output");
+		stage = "pack-result";
+		selectSdkLifecycleCheck(receipt, "pack-metadata");
+		const { tarball } = assertPackResult(packed, packDirectory, { checkId: "pack-metadata" });
+		selectSdkLifecycleCheck(receipt, "pack-integrity");
+		receipt.packVerified = true;
+		stage = "install";
+		selectSdkLifecycleCheck(receipt, "install-command");
+		writeFileSync(join(consumerDirectory, "package.json"), JSON.stringify({ name: "gentle-pi-sdk-lifecycle-proof", private: true, dependencies: { "@earendil-works/pi-coding-agent": sdkVersion } }), "utf8");
+		runBoundedNpm("install", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false", "--omit=dev", "--legacy-peer-deps", tarball, `@earendil-works/pi-coding-agent@${sdkVersion}`], env, consumerDirectory);
+		receipt.installCompleted = true;
+		stage = "artifact-check";
+		const packageRoot = join(consumerDirectory, "node_modules", "gentle-pi");
+		selectSdkLifecycleCheck(receipt, "packed-assets");
+		assertPackedAssets(packageRoot, { checkId: "asset-runtime-windows-session-transport-owned" });
+		selectSdkLifecycleCheck(receipt, "native-artifacts");
+		assertNoNativeInstallerArtifacts(packageRoot, consumerDirectory, { checkId: "native-package-cache-absent" });
+		const sdkPackageJson = join(consumerDirectory, "node_modules", "@earendil-works", "pi-coding-agent", "package.json");
+		selectSdkLifecycleCheck(receipt, "sdk-manifest");
+		const installedSdk = safeJson(readFileSync(assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, sdkPackageJson))), "installed Pi SDK manifest");
+		if (installedSdk.name !== "@earendil-works/pi-coding-agent" || installedSdk.version !== sdkVersion) throw new Error("consumer resolved an unexpected Pi SDK");
+		stage = "lifecycle-probe";
+		selectSdkLifecycleCheck(receipt, "lifecycle-probe-command");
+		const probe = await runBoundedSdkLifecycleProbe(["--input-type=module", "--eval", sdkLifecycleProbeSource(packageRoot, join(consumerDirectory, "package.json"), sdkPackageJson)], env, consumerDirectory);
+		stage = "lifecycle-result";
+		selectSdkLifecycleCheck(receipt, "lifecycle-probe-result");
+		const lifecycle = safeJson(probe, "SDK lifecycle probe output");
+		if (!lifecycle || typeof lifecycle !== "object" || lifecycle.sdkLoaded !== true || !SDK_LIFECYCLE_EXTENSION_ERROR_PHASES.has(lifecycle.extensionErrorPhase) || lifecycle.extensionErrorCount !== 0 || lifecycle.extensionErrorPhase !== "none" || lifecycle.sessionsStarted !== 2 || lifecycle.presenceAfterStart !== 2 || lifecycle.presenceAfterFirstDispose !== 1 || lifecycle.presenceAfterSecondDispose !== 0 || lifecycle.disposedSessions !== 2) throw new Error("SDK lifecycle probe returned an invalid receipt");
+		receipt.sdkLoaded = lifecycle.sdkLoaded;
+		receipt.extensionErrorCount = lifecycle.extensionErrorCount;
+		receipt.extensionErrorPhase = lifecycle.extensionErrorPhase;
+		receipt.sessionsStarted = lifecycle.sessionsStarted;
+		receipt.presenceAfterStart = lifecycle.presenceAfterStart;
+		receipt.presenceAfterFirstDispose = lifecycle.presenceAfterFirstDispose;
+		receipt.presenceAfterSecondDispose = lifecycle.presenceAfterSecondDispose;
+		receipt.disposedSessions = lifecycle.disposedSessions;
+		selectSdkLifecycleCheck(receipt, "sdk-lifecycle-complete");
+	} catch (error) {
+		if (error instanceof SdkLifecycleFailure) failure = error;
+		else if (error instanceof UnhookedFailure) failure = new SdkLifecycleFailure(stage, error.code, error.exitStatus);
+		else failure = new SdkLifecycleFailure(stage, stage === "lifecycle-result" ? "invalid-result" : "assertion-failed");
+	}
+	if (temporary !== undefined) {
+		try {
+			if (failure === undefined) selectSdkLifecycleCheck(receipt, "cleanup-owned-root-removal");
+			rmSync(temporary, { recursive: true, force: true });
+			receipt.cleanupCompleted = !existsSync(temporary);
+			if (!receipt.cleanupCompleted) throw new Error("owned temporary root remains after cleanup");
+		} catch {
+			if (failure === undefined) failure = new SdkLifecycleFailure("cleanup", "cleanup-failed");
+		}
+	}
+	return { receipt, failure };
+}
+
 async function testUnhookedPackedImports() {
 	const receipt = newUnhookedReceipt();
 	let temporary;
@@ -469,6 +861,9 @@ async function testUnhookedPackedImports() {
 if (process.argv.includes("--unhooked-imports")) {
 	const { receipt, failure } = await testUnhookedPackedImports();
 	reportUnhookedReceipt(receipt, failure);
+} else if (process.argv.includes("--sdk-lifecycle")) {
+	const { receipt, failure } = await testSdkLifecyclePackedSession();
+	reportSdkLifecycleReceipt(receipt, failure);
 } else {
 	await testHookedPackedRunner();
 }

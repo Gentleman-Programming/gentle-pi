@@ -88,3 +88,11 @@ jobs:
         if: "!cancelled() && matrix.platform != 'windows' && steps.install_unix_dependencies.outcome == 'success'"
         shell: bash
         run: node scripts/test-packed-runner.mjs --unhooked-imports
+      - name: Prove packed real SDK session lifecycle (Windows)
+        if: "!cancelled() && matrix.platform == 'windows' && steps.install_windows_dependencies.outcome == 'success'"
+        shell: cmd
+        run: node scripts\test-packed-runner.mjs --sdk-lifecycle
+      - name: Prove packed real SDK session lifecycle (Unix)
+        if: "!cancelled() && matrix.platform != 'windows' && steps.install_unix_dependencies.outcome == 'success'"
+        shell: bash
+        run: node scripts/test-packed-runner.mjs --sdk-lifecycle
