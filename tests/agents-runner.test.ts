@@ -421,13 +421,41 @@ test("AgentRunner retains permission broker fd3 and assigns messaging IPC to fd4
 	const task = runner.run(request({ authorizeParentStandingReviewPermission: () => true }));
 	await tick();
 	const launch = spawnOptions[0];
+	const permissionChannelStdio = process.platform === "win32" ? "overlapped" : "pipe";
 	assert.match(launch?.env.GENTLE_PI_AGENTS_OWNED_IPC ?? "", /^\d+-[a-z0-9]+$/, "the owned-IPC marker has the runner's opaque shape");
 	assert.deepEqual(launch?.env, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: launch?.env.GENTLE_PI_AGENTS_OWNED_IPC, GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" });
-	assert.deepEqual(launch?.stdio, ["pipe", "pipe", "pipe", "pipe", "ipc"]);
+	assert.deepEqual(launch?.stdio, ["pipe", "pipe", "pipe", permissionChannelStdio, "ipc"]);
 	assert.equal(launch?.stdio?.length, 5);
 	children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "channel checked" }], stopReason: "stop" }] });
 	children[0].emit({ type: "agent_settled" });
 	assert.equal((await runner.waitFor(task.id)).status, TASK_STATUS.COMPLETED);
+});
+
+test("AgentRunner platform matrix scopes permission fd3 transport", async () => {
+	for (const platform of ["win32", "linux", "darwin"] as const) {
+		for (const eligible of [false, true]) {
+			const launches: Array<Parameters<RunnerDeps["spawn"]>[2]> = [];
+			const child = fakeChild();
+			const runner = new AgentRunner(new TaskStore(), { maxConcurrency: 1, stallTimeoutMs: 1_000 }, {
+				spawn: (_command, _args, options) => {
+					launches.push(options);
+					return child.child;
+				},
+				now: () => 1,
+				schedule: () => () => {},
+				pi: { command: "pi-fixture", args: [] },
+				process: { platform, kill: () => {} },
+			}, { askUser: async () => ({ cancelled: true }) });
+			const task = runner.run(request({ authorizeParentStandingReviewPermission: eligible ? () => true : undefined }));
+			await tick();
+			const launch = launches[0];
+			assert.ok(launch, `${platform} ${eligible ? "eligible" : "ineligible"} child launches`);
+			assert.equal(launch.env.GENTLE_PI_AGENTS_PARENT_PERMISSION_FD, eligible ? "3" : undefined, "only eligible children receive the fd3 marker");
+			assert.deepEqual(launch.stdio, eligible ? ["pipe", "pipe", "pipe", platform === "win32" ? "overlapped" : "pipe", "ipc"] : ["pipe", "pipe", "pipe", "ipc"]);
+			assert.equal(launch.stdio?.indexOf("ipc"), eligible ? 4 : 3, "messaging IPC follows fd3 only for eligible children");
+			runner.cancel(task.id);
+		}
+	}
 });
 
 test("AgentRunner answers dialogs through askUser in task mode and cancels them in background mode", async () => {

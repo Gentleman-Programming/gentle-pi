@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { PassThrough, Writable } from "node:stream";
 import test from "node:test";
+import { AGENT_MODE, type AgentDefinition } from "../lib/agents-config.ts";
+import { AgentRunner, type ChildLike, type TaskRequest } from "../lib/agents-runner.ts";
+import { TaskStore } from "../lib/agents-protocol.ts";
 
 const REPOSITORY_ID = `sha256:${"a".repeat(64)}`;
 const OTHER_REPOSITORY_ID = `sha256:${"b".repeat(64)}`;
@@ -57,6 +60,8 @@ type ProductionChildOptions = {
 	diagnosticTrace?: WindowsFd3DiagnosticTrace;
 };
 
+const productionFd3StdioMode: Fd3StdioMode = process.platform === "win32" ? "overlapped" : "pipe";
+
 function windowsFd3DiagnosticTrace(stdioMode: Fd3StdioMode): WindowsFd3DiagnosticTrace {
 	return {
 		stdioMode,
@@ -103,7 +108,7 @@ async function productionChild(requests: number, authorize: () => boolean, optio
 	`;
 	const child = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "--eval", source], {
 		env: { ...process.env, GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" },
-		stdio: options.withoutChannel ? ["ignore", "pipe", "pipe"] : ["ignore", "pipe", "pipe", options.stdioMode ?? "pipe"],
+		stdio: options.withoutChannel ? ["ignore", "pipe", "pipe"] : ["ignore", "pipe", "pipe", options.stdioMode ?? productionFd3StdioMode],
 	});
 	const pipe = child.stdio[3];
 	const trace = options.diagnosticTrace;
@@ -315,7 +320,7 @@ test("fresh Jiti moduleCache:false reloads share fd3 structurally and reject sta
 	`;
 	const child = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "--eval", source], {
 		env: { ...process.env, GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" },
-		stdio: ["ignore", "pipe", "pipe", "pipe"],
+		stdio: ["ignore", "pipe", "pipe", productionFd3StdioMode],
 	});
 	const pipe = child.stdio[3];
 	assert.ok(pipe);
@@ -443,6 +448,175 @@ test("a child disconnect during a pending parent response cannot crash the broke
 		broker.close();
 		childToParent.destroy();
 		parentToChild.destroy();
+	}
+});
+
+test("AgentRunner delivers real fd3 authorization rechecks through its permission launch", { timeout: 15_000 }, async () => {
+	const PROBE_DEADLINE_MS = 12_000;
+	const CLOSE_GRACE_MS = 750;
+	const moduleUrl = new URL("../lib/review-session-standing-permission-ipc.ts", import.meta.url).href;
+	const source = `
+		import { createChildStandingReviewPermissionClient } from ${JSON.stringify(moduleUrl)};
+		const client = createChildStandingReviewPermissionClient();
+		const answers = [];
+		for (let index = 0; index < 2; index += 1) answers.push(await client?.requestAuthorization(${JSON.stringify(REPOSITORY_ID)}) ?? false);
+		client?.close();
+		process.stdout.write(JSON.stringify({ answers, fixtureArgs: process.argv.slice(1) }));
+	`;
+	const agent: AgentDefinition = { name: "permission-fixture", description: "test", filePath: "/test.md", scope: "global", instructions: "", model: undefined, thinking: undefined, mode: undefined, tools: [] };
+	const store = new TaskStore();
+	let authorizationCalls = 0;
+	let child: ReturnType<typeof spawn> | undefined;
+	let childStdout: ReturnType<typeof spawn>["stdout"] | undefined;
+	let taskId: string | undefined;
+	let closeObserved = false;
+	let terminating = false;
+	let launchFailure: Error | undefined;
+	let childFailure: Error | undefined;
+	let terminationFailure: Error | undefined;
+	let deadline: NodeJS.Timeout | undefined;
+	let grace: NodeJS.Timeout | undefined;
+	let stdout = "";
+	let stdoutBytes = 0;
+	let stdoutTruncated = false;
+	let finishProbe!: (result: { closeObserved: boolean; failure: Error | undefined }) => void;
+	const probe = new Promise<{ closeObserved: boolean; failure: Error | undefined }>((resolve) => { finishProbe = resolve; });
+	let probeFinished = false;
+	let runner: AgentRunner;
+	const clearTimers = () => {
+		if (deadline !== undefined) clearTimeout(deadline);
+		if (grace !== undefined) clearTimeout(grace);
+		deadline = undefined;
+		grace = undefined;
+	};
+	const releaseOwnedReferences = () => {
+		const unref = (value: { unref?(): void } | null | undefined) => value?.unref?.();
+		child?.unref();
+		unref(child?.channel);
+		unref(child?.stdout);
+		unref(child?.stderr);
+		for (const stream of child?.stdio ?? []) unref(stream);
+	};
+	const finish = (result: { closeObserved: boolean; failure: Error | undefined }) => {
+		if (probeFinished) return;
+		probeFinished = true;
+		clearTimers();
+		finishProbe(result);
+	};
+	const onStdout = (chunk: Buffer | string) => {
+		if (stdoutBytes >= 4_096) {
+			stdoutTruncated = true;
+			return;
+		}
+		const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+		const captured = bytes.subarray(0, 4_096 - stdoutBytes);
+		if (captured.length !== bytes.length) stdoutTruncated = true;
+		stdout += captured.toString("utf8");
+		stdoutBytes += captured.length;
+	};
+	const removeOperationalListeners = () => {
+		child?.off("error", onChildError);
+		child?.off("close", onChildClose);
+		childStdout?.off("data", onStdout);
+	};
+	const retainLateCloseGuard = () => {
+		const suppressLateStreamError = () => {};
+		child?.once("close", () => {
+			closeObserved = true;
+			releaseOwnedReferences();
+		});
+		child?.once("error", suppressLateStreamError);
+		childStdout?.once("error", suppressLateStreamError);
+		child?.stderr?.once("error", suppressLateStreamError);
+		for (const stream of child?.stdio ?? []) stream?.once("error", suppressLateStreamError);
+	};
+	const terminate = (failure: Error) => {
+		if (terminating || closeObserved) return;
+		terminating = true;
+		terminationFailure ??= failure;
+		clearTimers();
+		if (!taskId || !runner.cancel(taskId)) {
+			try { child?.kill(); } catch { /* The owned child may already have exited. */ }
+		}
+		if (closeObserved) return;
+		grace = setTimeout(() => {
+			if (closeObserved) return;
+			removeOperationalListeners();
+			releaseOwnedReferences();
+			retainLateCloseGuard();
+			finish({ closeObserved: false, failure });
+		}, CLOSE_GRACE_MS);
+	};
+	const onChildError = (error: Error) => {
+		childFailure ??= error;
+		terminate(error);
+	};
+	const onChildClose = () => {
+		closeObserved = true;
+		removeOperationalListeners();
+		releaseOwnedReferences();
+		finish({ closeObserved: true, failure: childFailure ?? terminationFailure });
+	};
+	runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs: 10_000 }, {
+		spawn: (command, args, options) => {
+			try {
+				child = spawn(command, args, { cwd: options.cwd, env: options.env, detached: options.detached, stdio: options.stdio });
+			} catch (error) {
+				launchFailure = error instanceof Error ? error : new Error(String(error));
+				throw error;
+			}
+			childStdout = child.stdout;
+			if (childStdout === null) {
+				launchFailure = new Error("AgentRunner child stdout is required");
+				queueMicrotask(() => terminate(launchFailure!));
+			} else childStdout.on("data", onStdout);
+			child.once("error", onChildError);
+			child.once("close", onChildClose);
+			deadline = setTimeout(() => terminate(new Error(`owned child startup/handshake probe exceeded ${PROBE_DEADLINE_MS}ms`)), PROBE_DEADLINE_MS);
+			return child as unknown as ChildLike;
+		},
+		now: Date.now,
+		schedule: (fn, ms) => {
+			const timer = setTimeout(fn, ms);
+			return () => clearTimeout(timer);
+		},
+		pi: { command: process.execPath, args: ["--experimental-strip-types", "--input-type=module", "--eval", source, "--"] },
+	}, { askUser: async () => ({ cancelled: true }) });
+	const request: TaskRequest = {
+		agent,
+		prompt: "permission fixture",
+		label: undefined,
+		context: undefined,
+		mode: AGENT_MODE.BACKGROUND,
+		cwd: process.cwd(),
+		parentSessionId: "test",
+		model: undefined,
+		thinking: undefined,
+		sessionDir: "/tmp",
+		resumeSessionPath: undefined,
+		env: {},
+		authorizeParentStandingReviewPermission: () => ++authorizationCalls === 1,
+	};
+	try {
+		const task = runner.run(request);
+		taskId = task.id;
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.ifError(launchFailure);
+		assert.ok(child, "AgentRunner must own the real child launch");
+		const result = await probe;
+		assert.equal(result.closeObserved, true, result.failure?.message ?? "owned child close was unconfirmed after bounded cleanup");
+		assert.ifError(result.failure);
+		assert.equal(stdoutTruncated, false, "child stdout capture remains within 4096 bytes");
+		const output = (() => {
+			try { return JSON.parse(stdout) as { answers?: unknown; fixtureArgs?: unknown }; }
+			catch (error) { assert.fail(`could not parse bounded child stdout: ${error instanceof Error ? error.message : String(error)}`); }
+		})();
+		assert.deepEqual(output.answers, [true, false], "the real child receives one grant and one rechecked denial through AgentRunner");
+		assert.ok(Array.isArray(output.fixtureArgs) && output.fixtureArgs.includes("--mode") && output.fixtureArgs.includes("rpc"), "the spawn adapter forwards Runner-appended arguments after Node's -- boundary");
+		assert.equal(authorizationCalls, 2, "AgentRunner invokes its parent callback for both child requests");
+	} finally {
+		if (!closeObserved) terminate(new Error("test cleanup requested owned child termination"));
+		await probe;
 	}
 });
 

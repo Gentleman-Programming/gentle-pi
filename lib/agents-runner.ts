@@ -28,7 +28,7 @@ export interface SpawnOptions {
 	cwd: string;
 	env: NodeJS.ProcessEnv;
 	detached?: boolean;
-	stdio?: Array<"pipe" | "ignore" | "inherit" | "ipc">;
+	stdio?: Array<"pipe" | "ignore" | "inherit" | "ipc" | "overlapped">;
 }
 
 export type Spawn = (command: string, args: string[], options: SpawnOptions) => ChildLike;
@@ -354,6 +354,7 @@ export class AgentRunner {
 	private launch(id: string, request: TaskRequest): void {
 		const detached = this.processControl.platform !== "win32";
 		const hasParentPermissionChannel = request.authorizeParentStandingReviewPermission !== undefined;
+		const permissionChannelStdio = this.processControl.platform === "win32" ? "overlapped" : "pipe";
 		const env = {
 			...request.env,
 			[CHILD_MARKER]: "1",
@@ -366,7 +367,7 @@ export class AgentRunner {
 				cwd: request.cwd,
 				env,
 				detached,
-				stdio: hasParentPermissionChannel ? ["pipe", "pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe", "ipc"],
+				stdio: hasParentPermissionChannel ? ["pipe", "pipe", "pipe", permissionChannelStdio, "ipc"] : ["pipe", "pipe", "pipe", "ipc"],
 			});
 		} catch (error) {
 			this.store.update(id, { status: TASK_STATUS.RUNNING, startedAt: this.deps.now(), lastStep: "starting" });
