@@ -429,18 +429,32 @@ export function writeProfilesFileSync(path: string, file: AgentProfilesFile): vo
 		constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
 		0o600,
 	);
+	// Every step records its own failure and cleanup never throws, so the error
+	// that actually broke the write is the one reported: a failing close or unlink
+	// must not mask a failed write or rename, and the temp file is removed on every
+	// path.
+	const failures: unknown[] = [];
 	try {
+		writeFileSync(descriptor, serializeProfilesFile(file));
+	} catch (error) {
+		failures.push(error);
+	}
+	try {
+		closeSync(descriptor);
+	} catch (error) {
+		failures.push(error);
+	}
+	if (failures.length === 0) {
 		try {
-			writeFileSync(descriptor, serializeProfilesFile(file));
-		} finally {
-			closeSync(descriptor);
-		}
-		renameSync(temporary, path);
-	} finally {
-		try {
-			unlinkSync(temporary);
+			renameSync(temporary, path);
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			failures.push(error);
 		}
 	}
+	try {
+		unlinkSync(temporary);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") failures.push(error);
+	}
+	if (failures.length > 0) throw failures[0];
 }
