@@ -269,20 +269,56 @@ for (const fault of ["write", "rename", "concurrent-change"]) {
 	});
 }
 
-for (const route of ["skip", "success", "failure"]) {
-	test(`postinstall lifecycle: ${route}`, (t) => {
-		const f = fixture(t);
-		const scripts = join(f.packageRoot, "scripts");
-		mkdirSync(scripts);
-		copyFileSync(helperUrl, join(scripts, "install-tui-mode-setting.mjs"));
-		copyFileSync(new URL("../scripts/install-gentle-ai.mjs", import.meta.url), join(scripts, "install-gentle-ai.mjs"));
-		writeFileSync(join(scripts, "gentle-ai-installer.mjs"), `export const INSTALLER_VERSION = "test"; export async function installGentleAi() { ${route === "failure" ? 'throw new Error("native failed")' : 'return { installed: true, binaryPath: "fixture" }'}; }`);
-		const result = spawnSync(process.execPath, [join(scripts, "install-gentle-ai.mjs")], {
-			encoding: "utf8", env: { ...process.env, ...f.env, GENTLE_PI_SKIP_GENTLE_AI_INSTALL: route === "skip" ? "1" : "0" },
-		});
-		assert.equal(result.status, route === "failure" ? 1 : 0, result.stderr);
-		assert.equal(existsSync(f.settings), route !== "failure");
-		if (route !== "failure") assert.equal(JSON.parse(readFileSync(f.settings, "utf8")).tuiMode, "fullscreen");
+type PostinstallRoute = "skip" | "success" | "failure";
+
+function writePostinstallFixture(f: ReturnType<typeof fixture>, route: PostinstallRoute) {
+	const scripts = join(f.packageRoot, "scripts");
+	mkdirSync(scripts);
+	copyFileSync(helperUrl, join(scripts, "install-tui-mode-setting.mjs"));
+	copyFileSync(new URL("../scripts/install-gentle-ai.mjs", import.meta.url), join(scripts, "install-gentle-ai.mjs"));
+	const installer = route === "failure"
+		? 'throw new Error("native failed")'
+		: route === "skip"
+			? 'throw new Error("skip fixture native installer was invoked")'
+			: 'return { installed: true, binaryPath: "fixture" }';
+	writeFileSync(join(scripts, "gentle-ai-installer.mjs"), `export const INSTALLER_VERSION = "test"; export async function installGentleAi() { ${installer}; }`);
+	return scripts;
+}
+
+function runPostinstall(f: ReturnType<typeof fixture>, route: PostinstallRoute) {
+	const scripts = writePostinstallFixture(f, route);
+	return spawnSync(process.execPath, [join(scripts, "install-gentle-ai.mjs")], {
+		encoding: "utf8", env: { ...process.env, ...f.env, GENTLE_PI_SKIP_GENTLE_AI_INSTALL: route === "skip" ? "1" : "0" },
 	});
 }
 
+function assertPostinstallLifecycle(f: ReturnType<typeof fixture>, route: PostinstallRoute, result: ReturnType<typeof runPostinstall>, settingsExists = route !== "failure") {
+	assert.equal(result.status, route === "failure" ? 1 : 0, result.stderr);
+	assert.equal(existsSync(f.settings), settingsExists);
+	if (route === "failure") assert.match(result.stderr, /gentle-pi could not install its package-local Gentle AI vtest binary: native failed/);
+	else {
+		assert.doesNotMatch(result.stderr, /skip fixture native installer was invoked/);
+		assert.equal(JSON.parse(readFileSync(f.settings, "utf8")).tuiMode, "fullscreen");
+	}
+}
+
+for (const [name, packagePath] of [
+	["npm", ["npm", "node_modules", "gentle-pi"]],
+	["Pi Git", ["git", "github.com", "Gentleman-Programming", "gentle-pi"]],
+] as const) {
+	for (const route of ["skip", "success", "failure"] as const) {
+		test(`${name} postinstall lifecycle: ${route}`, (t) => {
+			const f = fixture(t, packagePath);
+			const result = runPostinstall(f, route);
+			assertPostinstallLifecycle(f, route, result);
+			if (route === "failure") {
+				const existing = fixture(t, packagePath);
+				const original = '{"tuiMode":"regular","theme":"kept"}';
+				writeFileSync(existing.settings, original);
+				const existingResult = runPostinstall(existing, route);
+				assertPostinstallLifecycle(existing, route, existingResult, true);
+				assert.equal(readFileSync(existing.settings, "utf8"), original);
+			}
+		});
+	}
+}
