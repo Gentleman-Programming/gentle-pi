@@ -11,9 +11,32 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const MAX_NPM_OUTPUT_BYTES = 1024 * 1024;
-const MAX_UNHOOKED_REPORT_BYTES = 512;
+const MAX_UNHOOKED_REPORT_BYTES = 1024;
 const UNHOOKED_STAGES = new Set(["pack", "pack-result", "install", "artifact-check", "import-probe", "post-import-check", "cleanup"]);
 const UNHOOKED_ERROR_CODES = new Set(["spawn-failed", "timed-out", "output-limit", "nonzero-exit", "invalid-result", "assertion-failed", "cleanup-failed", "unknown"]);
+const UNHOOKED_CHECK_IDS = new Set([
+	"not-attempted", "runner-temp", "temporary-root", "project-sdk-version", "pack-command", "pack-metadata", "pack-integrity", "install-command", "import-probe-command", "import-probe-result", "unhooked-imports-complete", "cleanup-owned-root-removal",
+	"asset-runtime-windows-session-transport-owned", "asset-runtime-windows-session-transport-hash",
+	"asset-lib-windows-session-transport-owned", "asset-lib-windows-session-transport-hash",
+	"asset-lib-agents-session-transport-owned", "asset-lib-agents-session-transport-hash",
+	"asset-extension-gentle-agents-owned", "asset-extension-gentle-agents-hash",
+	"asset-extension-gentle-ai-owned", "asset-extension-gentle-ai-hash",
+	"asset-native-review-cli-owned", "asset-native-review-cli-hash",
+	"asset-review-integration-v2-owned", "asset-review-integration-v2-hash",
+	"asset-installer-gentle-ai-owned", "asset-installer-gentle-ai-hash",
+	"asset-installer-tui-mode-setting-owned", "asset-installer-tui-mode-setting-hash",
+	"native-package-cache-absent", "native-command-absent", "sdk-manifest-owned", "sdk-version", "jiti-entry-owned", "jiti-manifest-owned", "jiti-version",
+	"home-empty", "gentle-pi-agent-empty", "pi-coding-agent-empty", "gentle-pi-config-empty", "xdg-config-empty", "xdg-cache-empty", "xdg-data-empty", "appdata-empty", "local-appdata-empty",
+]);
+
+function newUnhookedReceipt() {
+	return { checkId: "not-attempted", packVerified: false, installCompleted: false, cleanupCompleted: false };
+}
+
+function selectUnhookedCheck(receipt, checkId) {
+	if (!UNHOOKED_CHECK_IDS.has(checkId)) throw new Error("invalid unhooked check identifier");
+	receipt.checkId = checkId;
+}
 
 function isWithin(rootPath, candidatePath) {
 	const root = resolve(rootPath);
@@ -76,13 +99,23 @@ function stageFailure(stage, error, invalidResult = false) {
 	return new UnhookedFailure(stage, invalidResult ? "invalid-result" : "assertion-failed");
 }
 
-function reportUnhookedFailure(error) {
-	const failure = error instanceof UnhookedFailure ? error : new UnhookedFailure("cleanup", "unknown");
-	const report = { mode: "unhooked-imports", stage: failure.stage, code: failure.code, ...(failure.exitStatus === undefined ? {} : { exitStatus: failure.exitStatus }) };
+function reportUnhookedReceipt(receipt, error) {
+	const failure = error instanceof UnhookedFailure ? error : undefined;
+	const report = {
+		mode: "unhooked-imports",
+		status: failure === undefined ? "complete" : "failed",
+		checkId: failure === undefined ? "unhooked-imports-complete" : receipt.checkId,
+		packVerified: receipt.packVerified,
+		installCompleted: receipt.installCompleted,
+		cleanupCompleted: receipt.cleanupCompleted,
+		...(failure === undefined ? {} : { stage: failure.stage, code: failure.code, ...(failure.exitStatus === undefined ? {} : { exitStatus: failure.exitStatus }) }),
+	};
 	const line = JSON.stringify(report);
-	const boundedLine = Buffer.byteLength(line, "utf8") <= MAX_UNHOOKED_REPORT_BYTES ? line : '{"mode":"unhooked-imports","stage":"cleanup","code":"unknown"}';
-	try { process.stderr.write(`${boundedLine}\n`); } catch { /* Reporting cannot expose a raw secondary error. */ }
-	process.exitCode = failure.exitStatus ?? 1;
+	const boundedLine = Buffer.byteLength(line, "utf8") <= MAX_UNHOOKED_REPORT_BYTES
+		? line
+		: '{"mode":"unhooked-imports","status":"failed","checkId":"not-attempted","packVerified":false,"installCompleted":false,"cleanupCompleted":false,"stage":"cleanup","code":"unknown"}';
+	try { (failure === undefined ? process.stdout : process.stderr).write(`${boundedLine}\n`); } catch { /* Reporting cannot expose a raw secondary error. */ }
+	if (failure !== undefined) process.exitCode = failure.exitStatus ?? 1;
 }
 
 function windowsNpmInvocation() {
@@ -249,16 +282,31 @@ function isolatedUnhookedEnvironment(temporary) {
 		env.HOMEDRIVE = home.slice(0, 2);
 		env.HOMEPATH = home.slice(2).replaceAll("/", "\\\\");
 	}
-	return { env, homes: [home, agentHome, piAgentHome, gentleConfigHome, xdgConfigHome, xdgCacheHome, xdgDataHome, appData, localAppData] };
+	return {
+		env,
+		homes: [
+			{ checkId: "home-empty", path: home },
+			{ checkId: "gentle-pi-agent-empty", path: agentHome },
+			{ checkId: "pi-coding-agent-empty", path: piAgentHome },
+			{ checkId: "gentle-pi-config-empty", path: gentleConfigHome },
+			{ checkId: "xdg-config-empty", path: xdgConfigHome },
+			{ checkId: "xdg-cache-empty", path: xdgCacheHome },
+			{ checkId: "xdg-data-empty", path: xdgDataHome },
+			{ checkId: "appdata-empty", path: appData },
+			{ checkId: "local-appdata-empty", path: localAppData },
+		],
+	};
 }
 
-function assertPackResult(packed, packDirectory) {
+function assertPackResult(packed, packDirectory, receipt) {
+	selectUnhookedCheck(receipt, "pack-metadata");
 	if (!Array.isArray(packed) || packed.length !== 1 || !packed[0] || typeof packed[0] !== "object") throw new Error("npm pack did not return exactly one package");
 	const entry = packed[0];
 	if (entry.name !== "gentle-pi" || typeof entry.filename !== "string" || entry.filename !== basename(entry.filename)) throw new Error("npm pack returned an unsafe package identity");
 	if (typeof entry.integrity !== "string" || !/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(entry.integrity)) throw new Error("npm pack did not report a sha512 integrity");
 	const tarball = resolve(packDirectory, entry.filename);
 	if (!isWithin(packDirectory, tarball)) throw new Error("npm pack tarball escapes the owned pack directory");
+	selectUnhookedCheck(receipt, "pack-integrity");
 	assertOwnedRegularFile(packDirectory, entry.filename);
 	const actualIntegrity = `sha512-${createHash("sha512").update(readFileSync(tarball)).digest("base64")}`;
 	if (actualIntegrity !== entry.integrity) throw new Error("npm pack tarball integrity does not match its reported identity");
@@ -266,28 +314,32 @@ function assertPackResult(packed, packDirectory) {
 }
 
 const HASHED_PACKED_ASSETS = [
-
-		"runtime/windows-session-transport.ps1",
-		"lib/windows-session-transport.ts",
-		"lib/agents-session-transport.ts",
-		"extensions/gentle-agents.ts",
-		"extensions/gentle-ai.ts",
-		"runtime/native-review-cli.mjs",
-		"runtime/review-integration-v2.mjs",
-		"scripts/install-gentle-ai.mjs",
-	"scripts/install-tui-mode-setting.mjs",
+	{ ownedCheckId: "asset-runtime-windows-session-transport-owned", hashCheckId: "asset-runtime-windows-session-transport-hash", relativePath: "runtime/windows-session-transport.ps1" },
+	{ ownedCheckId: "asset-lib-windows-session-transport-owned", hashCheckId: "asset-lib-windows-session-transport-hash", relativePath: "lib/windows-session-transport.ts" },
+	{ ownedCheckId: "asset-lib-agents-session-transport-owned", hashCheckId: "asset-lib-agents-session-transport-hash", relativePath: "lib/agents-session-transport.ts" },
+	{ ownedCheckId: "asset-extension-gentle-agents-owned", hashCheckId: "asset-extension-gentle-agents-hash", relativePath: "extensions/gentle-agents.ts" },
+	{ ownedCheckId: "asset-extension-gentle-ai-owned", hashCheckId: "asset-extension-gentle-ai-hash", relativePath: "extensions/gentle-ai.ts" },
+	{ ownedCheckId: "asset-native-review-cli-owned", hashCheckId: "asset-native-review-cli-hash", relativePath: "runtime/native-review-cli.mjs" },
+	{ ownedCheckId: "asset-review-integration-v2-owned", hashCheckId: "asset-review-integration-v2-hash", relativePath: "runtime/review-integration-v2.mjs" },
+	{ ownedCheckId: "asset-installer-gentle-ai-owned", hashCheckId: "asset-installer-gentle-ai-hash", relativePath: "scripts/install-gentle-ai.mjs" },
+	{ ownedCheckId: "asset-installer-tui-mode-setting-owned", hashCheckId: "asset-installer-tui-mode-setting-hash", relativePath: "scripts/install-tui-mode-setting.mjs" },
 ];
 
-function assertPackedAssets(packageRoot) {
-	for (const relativePath of HASHED_PACKED_ASSETS) {
-		const source = readFileSync(join(root, relativePath));
-		const installed = readFileSync(assertOwnedRegularFile(packageRoot, relativePath));
-		if (createHash("sha256").update(source).digest("hex") !== createHash("sha256").update(installed).digest("hex")) throw new Error(`packed asset bytes differ from this checkout: ${relativePath}`);
+function assertPackedAssets(packageRoot, receipt) {
+	for (const asset of HASHED_PACKED_ASSETS) {
+		selectUnhookedCheck(receipt, asset.ownedCheckId);
+		const installedPath = assertOwnedRegularFile(packageRoot, asset.relativePath);
+		selectUnhookedCheck(receipt, asset.hashCheckId);
+		const source = readFileSync(join(root, asset.relativePath));
+		const installed = readFileSync(installedPath);
+		if (createHash("sha256").update(source).digest("hex") !== createHash("sha256").update(installed).digest("hex")) throw new Error("packed asset bytes differ from this checkout");
 	}
 }
 
-function assertNoNativeInstallerArtifacts(packageRoot, consumerDirectory) {
+function assertNoNativeInstallerArtifacts(packageRoot, consumerDirectory, receipt) {
+	selectUnhookedCheck(receipt, "native-package-cache-absent");
 	if (existsSync(join(packageRoot, ".gentle-ai"))) throw new Error("unhooked install unexpectedly contains a native Gentle AI artifact");
+	selectUnhookedCheck(receipt, "native-command-absent");
 	const nativeCommand = process.platform === "win32" ? "gentle-ai.cmd" : "gentle-ai";
 	if (existsSync(join(consumerDirectory, "node_modules", ".bin", nativeCommand))) throw new Error("unhooked install unexpectedly exposed a native Gentle AI executable");
 }
@@ -326,74 +378,93 @@ process.stdout.write(JSON.stringify({ tools: registrations.tools.sort(), command
 }
 
 async function testUnhookedPackedImports() {
-	const runnerTemp = process.env.RUNNER_TEMP;
-	if (typeof runnerTemp !== "string" || runnerTemp.length === 0) throw new UnhookedFailure("pack", "assertion-failed");
+	const receipt = newUnhookedReceipt();
 	let temporary;
-	try {
-		temporary = mkdtempSync(join(resolve(runnerTemp), "gentle-pi-packed-unhooked-"));
-	} catch {
-		throw new UnhookedFailure("pack", "assertion-failed");
-	}
-	const packDirectory = join(temporary, "pack");
-	const consumerDirectory = join(temporary, "consumer");
 	let stage = "pack";
 	let failure;
 	try {
+		selectUnhookedCheck(receipt, "runner-temp");
+		const runnerTemp = process.env.RUNNER_TEMP;
+		if (typeof runnerTemp !== "string" || runnerTemp.length === 0) throw new Error("RUNNER_TEMP is required");
+		selectUnhookedCheck(receipt, "temporary-root");
+		temporary = mkdtempSync(join(resolve(runnerTemp), "gentle-pi-packed-unhooked-"));
+		const packDirectory = join(temporary, "pack");
+		const consumerDirectory = join(temporary, "consumer");
 		mkdirSync(packDirectory);
 		mkdirSync(consumerDirectory);
 		const { env, homes } = isolatedUnhookedEnvironment(temporary);
+		selectUnhookedCheck(receipt, "project-sdk-version");
 		const manifest = safeJson(readFileSync(join(root, "package.json")), "project package manifest");
 		const sdkVersion = manifest?.devDependencies?.["@earendil-works/pi-coding-agent"];
-		if (sdkVersion !== "0.85.1") throw new Error("unhooked probe requires the project-pinned @earendil-works/pi-coding-agent 0.85.1");
+		if (sdkVersion !== "0.85.1") throw new Error("unhooked probe requires the project-pinned Pi SDK");
+		selectUnhookedCheck(receipt, "pack-command");
 		const packOutput = runBoundedNpm("pack", ["pack", "--ignore-scripts", "--json", "--pack-destination", packDirectory], env, root);
 		stage = "pack-result";
+		selectUnhookedCheck(receipt, "pack-metadata");
 		const packed = safeJson(packOutput, "npm pack output");
-		const { entry, tarball } = assertPackResult(packed, packDirectory);
+		const { tarball } = assertPackResult(packed, packDirectory, receipt);
+		receipt.packVerified = true;
 		stage = "install";
+		selectUnhookedCheck(receipt, "install-command");
 		writeFileSync(join(consumerDirectory, "package.json"), JSON.stringify({ name: "gentle-pi-unhooked-import-proof", private: true, dependencies: { "@earendil-works/pi-coding-agent": sdkVersion } }), "utf8");
 		runBoundedNpm("install", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false", "--omit=dev", "--legacy-peer-deps", tarball, `@earendil-works/pi-coding-agent@${sdkVersion}`], env, consumerDirectory);
+		receipt.installCompleted = true;
 		stage = "artifact-check";
 		const packageRoot = join(consumerDirectory, "node_modules", "gentle-pi");
-		assertPackedAssets(packageRoot);
-		assertNoNativeInstallerArtifacts(packageRoot, consumerDirectory);
+		assertPackedAssets(packageRoot, receipt);
+		assertNoNativeInstallerArtifacts(packageRoot, consumerDirectory, receipt);
 		const sdkPackageJson = join(consumerDirectory, "node_modules", "@earendil-works", "pi-coding-agent", "package.json");
+		selectUnhookedCheck(receipt, "sdk-manifest-owned");
 		const checkedSdkPackageJson = assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, sdkPackageJson));
 		const sdkRequire = createRequire(checkedSdkPackageJson);
+		selectUnhookedCheck(receipt, "jiti-entry-owned");
 		const jitiEntry = sdkRequire.resolve("jiti/static");
 		assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, jitiEntry));
-		const jitiPackage = safeJson(readFileSync(assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, join(dirname(dirname(jitiEntry)), "package.json")))), "jiti package manifest");
+		selectUnhookedCheck(receipt, "jiti-manifest-owned");
+		const checkedJitiPackageJson = assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, join(dirname(dirname(jitiEntry)), "package.json")));
+		selectUnhookedCheck(receipt, "jiti-version");
+		const jitiPackage = safeJson(readFileSync(checkedJitiPackageJson), "jiti package manifest");
+		selectUnhookedCheck(receipt, "sdk-version");
 		const installedSdk = safeJson(readFileSync(checkedSdkPackageJson), "installed Pi SDK manifest");
-		if (installedSdk.version !== sdkVersion) throw new Error(`consumer resolved Pi SDK ${String(installedSdk.version)}, expected ${sdkVersion}`);
+		if (installedSdk.version !== sdkVersion) throw new Error("consumer resolved an unexpected Pi SDK");
 		const declaredJiti = installedSdk?.dependencies?.jiti;
+		selectUnhookedCheck(receipt, "jiti-version");
 		if (typeof declaredJiti !== "string" || jitiPackage.version !== declaredJiti) throw new Error("consumer Jiti does not match the installed Pi SDK runtime dependency");
 		// The child calls only default factories on this inert recorder; it never invokes registered tools or event handlers.
-		for (const home of homes) assertEmptyDirectory(home);
+		for (const home of homes) {
+			selectUnhookedCheck(receipt, home.checkId);
+			assertEmptyDirectory(home.path);
+		}
 		stage = "import-probe";
+		selectUnhookedCheck(receipt, "import-probe-command");
 		const probe = runBoundedProbe(["--input-type=module", "--eval", unhookedProbeSource(packageRoot, join(consumerDirectory, "package.json"), sdkPackageJson)], env, consumerDirectory);
-		const registrations = safeJson(probe, "unhooked registration probe output");
+		selectUnhookedCheck(receipt, "import-probe-result");
+		safeJson(probe, "unhooked registration probe output");
 		stage = "post-import-check";
-		assertNoNativeInstallerArtifacts(packageRoot, consumerDirectory);
-		for (const home of homes) assertEmptyDirectory(home);
-		process.stdout.write(`packed unhooked import/default-registration proof passed (gentle-pi ${entry.version ?? "unknown"}; Pi SDK ${installedSdk.version}; Jiti ${jitiPackage.version}; dynamic npm transitive provenance, not lockfile-faithful)\n`);
-		process.stdout.write(`byte-hashed packed assets: ${HASHED_PACKED_ASSETS.join(", ")}; other packaged assets are not byte-equivalence checked.\n`);
-		process.stdout.write(`registered tools: ${registrations.tools.join(", ")}\n`);
+		assertNoNativeInstallerArtifacts(packageRoot, consumerDirectory, receipt);
+		for (const home of homes) {
+			selectUnhookedCheck(receipt, home.checkId);
+			assertEmptyDirectory(home.path);
+		}
 	} catch (error) {
 		failure = stageFailure(stage, error, stage === "pack-result" || stage === "import-probe");
 	}
-	try {
-		rmSync(temporary, { recursive: true, force: true });
-	} catch {
-		if (failure === undefined) failure = new UnhookedFailure("cleanup", "cleanup-failed");
+	if (temporary !== undefined) {
+		try {
+			if (failure === undefined) selectUnhookedCheck(receipt, "cleanup-owned-root-removal");
+			rmSync(temporary, { recursive: true, force: true });
+			receipt.cleanupCompleted = !existsSync(temporary);
+			if (!receipt.cleanupCompleted) throw new Error("owned temporary root remains after cleanup");
+		} catch {
+			if (failure === undefined) failure = new UnhookedFailure("cleanup", "cleanup-failed");
+		}
 	}
-	if (failure !== undefined) throw failure;
+	return { receipt, failure };
 }
 
 if (process.argv.includes("--unhooked-imports")) {
-	try {
-		await testUnhookedPackedImports();
-	} catch (error) {
-		reportUnhookedFailure(error);
-	}
+	const { receipt, failure } = await testUnhookedPackedImports();
+	reportUnhookedReceipt(receipt, failure);
 } else {
 	await testHookedPackedRunner();
 }
