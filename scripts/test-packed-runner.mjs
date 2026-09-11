@@ -19,11 +19,11 @@ const SDK_LIFECYCLE_STAGES = new Set(["pack", "pack-result", "install", "artifac
 const SDK_LIFECYCLE_ERROR_CODES = new Set(["spawn-failed", "timed-out", "unconfirmed-close", "output-limit", "nonzero-exit", "invalid-result", "assertion-failed", "cleanup-failed", "unknown"]);
 const SDK_LIFECYCLE_EXTENSION_ERROR_PHASES = new Set(["unobserved", "none", "startup", "shutdown"]);
 const SDK_LIFECYCLE_CHILD_STAGES = new Set(["bootstrap", "sdk-load", "jiti-load", "agents-module-load", "model-runtime", "services", "extensions-validate", "model-availability", "session-create", "session-bind", "presence-two", "dispose-first", "presence-one", "dispose-second", "presence-none", "cleanup"]);
-const SDK_LIFECYCLE_CHILD_CHECK_IDS = new Set(["bootstrap-builtins", "bootstrap-agent-home", "bootstrap-directories", "sdk-import", "sdk-exports", "jiti-resolve", "jiti-import", "agents-module-import", "agents-module-export", "settings-untrusted", "settings-default-provider", "settings-default-model", "model-runtime-create", "services-create", "services-settings-manager", "services-project-trusted", "extensions-errors", "extensions-paths", "extensions-hooks", "services-diagnostics", "ambient-skills", "ambient-prompts", "ambient-themes", "ambient-context-files", "model-availability-empty", "session-create", "session-model-unbound", "session-bind", "session-bind-extension-errors", "session-model-bound", "session-ids-distinct", "presence-observer-create", "presence-two-records", "presence-first-model-unbound", "presence-second-model-unbound", "presence-two-extension-errors", "dispose-first", "dispose-first-extension-errors", "presence-one-record", "presence-one-model-unbound", "presence-one-extension-errors", "dispose-second", "dispose-second-extension-errors", "presence-no-records", "presence-none-extension-errors", "cleanup-runtime", "cleanup-observer", "cleanup-extension-errors"]);
+const SDK_LIFECYCLE_CHILD_CHECK_IDS = new Set(["bootstrap-builtins", "bootstrap-agent-home", "bootstrap-directories", "sdk-import", "sdk-exports", "jiti-import", "agents-module-import", "agents-module-export", "settings-untrusted", "settings-default-provider", "settings-default-model", "model-runtime-create", "services-create", "services-settings-manager", "services-project-trusted", "extensions-errors", "extensions-paths", "extensions-hooks", "services-diagnostics", "ambient-skills", "ambient-prompts", "ambient-themes", "ambient-context-files", "model-availability-empty", "session-create", "session-model-unbound", "session-bind", "session-bind-extension-errors", "session-model-bound", "session-ids-distinct", "presence-observer-create", "presence-two-records", "presence-first-model-unbound", "presence-second-model-unbound", "presence-two-extension-errors", "dispose-first", "dispose-first-extension-errors", "presence-one-record", "presence-one-model-unbound", "presence-one-extension-errors", "dispose-second", "dispose-second-extension-errors", "presence-no-records", "presence-none-extension-errors", "cleanup-runtime", "cleanup-observer", "cleanup-extension-errors"]);
 const SDK_LIFECYCLE_CHILD_ERROR_CODES = new Set(["assertion-failed", "load-failed", "timed-out", "cleanup-failed", "unknown"]);
 const SDK_LIFECYCLE_CHILD_CLEANUP_STATUSES = new Set(["complete", "failed"]);
 const SDK_LIFECYCLE_CHECK_IDS = new Set([
-	"not-attempted", "runner-hosted", "runner-temp", "temporary-root", "project-sdk-version", "pack-command", "pack-metadata", "pack-integrity", "install-command", "packed-assets", "native-artifacts", "sdk-manifest", "lifecycle-probe-command", "lifecycle-probe-result", "sdk-lifecycle-complete", "cleanup-owned-root-removal",
+	"not-attempted", "runner-hosted", "runner-temp", "temporary-root", "project-sdk-version", "pack-command", "pack-metadata", "pack-integrity", "install-command", "packed-assets", "native-artifacts", "sdk-manifest", "sdk-version", "jiti-manifest-owned", "jiti-static-export", "jiti-entry-owned", "jiti-version", "lifecycle-probe-command", "lifecycle-probe-result", "sdk-lifecycle-complete", "cleanup-owned-root-removal",
 ]);
 const UNHOOKED_CHECK_IDS = new Set([
 	"not-attempted", "runner-temp", "temporary-root", "project-sdk-version", "pack-command", "pack-metadata", "pack-integrity", "install-command", "import-probe-command", "import-probe-result", "unhooked-imports-complete", "cleanup-owned-root-removal",
@@ -509,6 +509,32 @@ function assertNoNativeInstallerArtifacts(packageRoot, consumerDirectory, receip
 	if (existsSync(join(consumerDirectory, "node_modules", ".bin", nativeCommand))) throw new Error("unhooked install unexpectedly exposed a native Gentle AI executable");
 }
 
+function resolveInstalledJitiStaticEntry(consumerDirectory, sdkPackageJson, sdkVersion, selectCheck, checkIds) {
+	selectCheck(checkIds.sdkManifest);
+	const checkedSdkPackageJson = assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, sdkPackageJson));
+	const sdkRequire = createRequire(checkedSdkPackageJson);
+	selectCheck(checkIds.sdkVersion);
+	const installedSdk = safeJson(readFileSync(checkedSdkPackageJson), "installed Pi SDK manifest");
+	if (installedSdk.name !== "@earendil-works/pi-coding-agent" || installedSdk.version !== sdkVersion) throw new Error("consumer resolved an unexpected Pi SDK");
+	const declaredJiti = installedSdk?.dependencies?.jiti;
+	selectCheck(checkIds.jitiManifest);
+	const jitiManifest = sdkRequire.resolve("jiti/package.json");
+	const checkedJitiPackageJson = assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, jitiManifest));
+	const jitiPackage = safeJson(readFileSync(checkedJitiPackageJson), "jiti package manifest");
+	selectCheck(checkIds.jitiStaticExport);
+	const staticExport = jitiPackage?.exports?.["./static"];
+	if (staticExport === null || typeof staticExport !== "object" || Array.isArray(staticExport)
+		|| Object.keys(staticExport).length !== 2 || typeof staticExport.types !== "string" || typeof staticExport.import !== "string") {
+		throw new Error("Jiti manifest does not declare the expected static ESM export");
+	}
+	const jitiPackageRoot = dirname(checkedJitiPackageJson);
+	selectCheck(checkIds.jitiEntry);
+	const jitiStaticEntry = assertOwnedRegularFile(jitiPackageRoot, relative(jitiPackageRoot, resolve(jitiPackageRoot, staticExport.import)));
+	selectCheck(checkIds.jitiVersion);
+	if (jitiPackage.name !== "jiti" || typeof declaredJiti !== "string" || jitiPackage.version !== declaredJiti) throw new Error("consumer Jiti does not match the installed Pi SDK runtime dependency");
+	return jitiStaticEntry;
+}
+
 function unhookedProbeSource(packageRoot, consumerPackageJson, jitiStaticEntry) {
 	return `
 import assert from "node:assert/strict";
@@ -544,7 +570,7 @@ function isSdkLifecycleChildStageCheck(stage, checkId) {
 	const stageChecks = {
 		"bootstrap": ["bootstrap-builtins", "bootstrap-agent-home", "bootstrap-directories"],
 		"sdk-load": ["sdk-import", "sdk-exports"],
-		"jiti-load": ["jiti-resolve", "jiti-import"],
+		"jiti-load": ["jiti-import"],
 		"agents-module-load": ["agents-module-import", "agents-module-export"],
 		"model-runtime": ["model-runtime-create"],
 		"services": ["settings-untrusted", "settings-default-provider", "settings-default-model", "services-create", "services-settings-manager", "services-project-trusted"],
@@ -610,7 +636,7 @@ function mergeSdkLifecycleChildProgress(receipt, childReceipt) {
 	if (childReceipt.disposedSessions !== undefined) receipt.disposedSessions = childReceipt.disposedSessions;
 }
 
-function sdkLifecycleProbeSource(packageRoot, consumerPackageJson, sdkPackageJson) {
+function sdkLifecycleProbeSource(packageRoot, consumerPackageJson, jitiStaticEntry) {
 	return `
 const progress = {};
 let childStage = "bootstrap";
@@ -629,7 +655,6 @@ let extensionLifecycleObserved = false;
 let assert;
 let mkdirSync;
 let join;
-let createRequire;
 let pathToFileURL;
 const checkpoint = (stage, checkId) => { childStage = stage; childCheckId = checkId; };
 const recordCleanupFailure = (checkId) => {
@@ -688,11 +713,10 @@ const bindRuntime = async (runtime) => {
 };
 try {
   checkpoint("bootstrap", "bootstrap-builtins");
-  const [assertModule, fsModule, pathModule, moduleModule, urlModule] = await load(Promise.all([import("node:assert/strict"), import("node:fs"), import("node:path"), import("node:module"), import("node:url")]));
+  const [assertModule, fsModule, pathModule, urlModule] = await load(Promise.all([import("node:assert/strict"), import("node:fs"), import("node:path"), import("node:url")]));
   assert = assertModule.default;
   ({ mkdirSync } = fsModule);
   ({ join } = pathModule);
-  ({ createRequire } = moduleModule);
   ({ pathToFileURL } = urlModule);
   checkpoint("bootstrap", "bootstrap-agent-home");
   const agentHome = process.env.GENTLE_PI_AGENT_HOME;
@@ -709,11 +733,8 @@ try {
   checkpoint("sdk-load", "sdk-exports");
   const { createAgentSessionFromServices, createAgentSessionRuntime, createAgentSessionServices, ModelRuntime, SessionManager, SettingsManager } = sdk;
   for (const value of [createAgentSessionFromServices, createAgentSessionRuntime, createAgentSessionServices, ModelRuntime, SessionManager, SettingsManager]) assert.equal(typeof value, "function", "SDK lifecycle export is unavailable");
-  checkpoint("jiti-load", "jiti-resolve");
-  const requireFromSdk = createRequire(pathToFileURL(${JSON.stringify(sdkPackageJson)}).href);
-  const jitiStaticEntry = requireFromSdk.resolve("jiti/static");
   checkpoint("jiti-load", "jiti-import");
-  const { createJiti } = await within(load(import(pathToFileURL(jitiStaticEntry).href)), 30000);
+  const { createJiti } = await within(load(import(pathToFileURL(${JSON.stringify(jitiStaticEntry)}).href)), 30000);
   assert.equal(typeof createJiti, "function", "Jiti static export is unavailable");
   const jiti = createJiti(pathToFileURL(${JSON.stringify(consumerPackageJson)}).href, { moduleCache: false });
   const agentsExtensionPath = join(${JSON.stringify(packageRoot)}, "extensions", "gentle-agents.ts");
@@ -909,12 +930,13 @@ async function testSdkLifecyclePackedSession() {
 		selectSdkLifecycleCheck(receipt, "native-artifacts");
 		assertNoNativeInstallerArtifacts(packageRoot, consumerDirectory, { checkId: "native-package-cache-absent" });
 		const sdkPackageJson = join(consumerDirectory, "node_modules", "@earendil-works", "pi-coding-agent", "package.json");
-		selectSdkLifecycleCheck(receipt, "sdk-manifest");
-		const installedSdk = safeJson(readFileSync(assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, sdkPackageJson))), "installed Pi SDK manifest");
-		if (installedSdk.name !== "@earendil-works/pi-coding-agent" || installedSdk.version !== sdkVersion) throw new Error("consumer resolved an unexpected Pi SDK");
+		const jitiStaticEntry = resolveInstalledJitiStaticEntry(consumerDirectory, sdkPackageJson, sdkVersion, (checkId) => selectSdkLifecycleCheck(receipt, checkId), {
+			sdkManifest: "sdk-manifest", sdkVersion: "sdk-version", jitiManifest: "jiti-manifest-owned",
+			jitiStaticExport: "jiti-static-export", jitiEntry: "jiti-entry-owned", jitiVersion: "jiti-version",
+		});
 		stage = "lifecycle-probe";
 		selectSdkLifecycleCheck(receipt, "lifecycle-probe-command");
-		const probe = await runBoundedSdkLifecycleProbe(["--input-type=module", "--eval", sdkLifecycleProbeSource(packageRoot, join(consumerDirectory, "package.json"), sdkPackageJson)], env, consumerDirectory);
+		const probe = await runBoundedSdkLifecycleProbe(["--input-type=module", "--eval", sdkLifecycleProbeSource(packageRoot, join(consumerDirectory, "package.json"), jitiStaticEntry)], env, consumerDirectory);
 		stage = "lifecycle-result";
 		selectSdkLifecycleCheck(receipt, "lifecycle-probe-result");
 		const lifecycle = parseSdkLifecycleChildReceipt(probe.stdout, probe.stderr);
@@ -978,28 +1000,10 @@ async function testUnhookedPackedImports() {
 		assertPackedAssets(packageRoot, receipt);
 		assertNoNativeInstallerArtifacts(packageRoot, consumerDirectory, receipt);
 		const sdkPackageJson = join(consumerDirectory, "node_modules", "@earendil-works", "pi-coding-agent", "package.json");
-		selectUnhookedCheck(receipt, "sdk-manifest-owned");
-		const checkedSdkPackageJson = assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, sdkPackageJson));
-		const sdkRequire = createRequire(checkedSdkPackageJson);
-		selectUnhookedCheck(receipt, "sdk-version");
-		const installedSdk = safeJson(readFileSync(checkedSdkPackageJson), "installed Pi SDK manifest");
-		if (installedSdk.name !== "@earendil-works/pi-coding-agent" || installedSdk.version !== sdkVersion) throw new Error("consumer resolved an unexpected Pi SDK");
-		const declaredJiti = installedSdk?.dependencies?.jiti;
-		selectUnhookedCheck(receipt, "jiti-manifest-owned");
-		const jitiManifest = sdkRequire.resolve("jiti/package.json");
-		const checkedJitiPackageJson = assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, jitiManifest));
-		const jitiPackage = safeJson(readFileSync(checkedJitiPackageJson), "jiti package manifest");
-		selectUnhookedCheck(receipt, "jiti-static-export");
-		const staticExport = jitiPackage?.exports?.["./static"];
-		if (staticExport === null || typeof staticExport !== "object" || Array.isArray(staticExport)
-			|| Object.keys(staticExport).length !== 2 || typeof staticExport.types !== "string" || typeof staticExport.import !== "string") {
-			throw new Error("Jiti manifest does not declare the expected static ESM export");
-		}
-		const jitiPackageRoot = dirname(checkedJitiPackageJson);
-		selectUnhookedCheck(receipt, "jiti-entry-owned");
-		const jitiStaticEntry = assertOwnedRegularFile(jitiPackageRoot, relative(jitiPackageRoot, resolve(jitiPackageRoot, staticExport.import)));
-		selectUnhookedCheck(receipt, "jiti-version");
-		if (jitiPackage.name !== "jiti" || typeof declaredJiti !== "string" || jitiPackage.version !== declaredJiti) throw new Error("consumer Jiti does not match the installed Pi SDK runtime dependency");
+		const jitiStaticEntry = resolveInstalledJitiStaticEntry(consumerDirectory, sdkPackageJson, sdkVersion, (checkId) => selectUnhookedCheck(receipt, checkId), {
+			sdkManifest: "sdk-manifest-owned", sdkVersion: "sdk-version", jitiManifest: "jiti-manifest-owned",
+			jitiStaticExport: "jiti-static-export", jitiEntry: "jiti-entry-owned", jitiVersion: "jiti-version",
+		});
 		// The child calls only default factories on this inert recorder; it never invokes registered tools or event handlers.
 		for (const home of homes) {
 			selectUnhookedCheck(receipt, home.checkId);
