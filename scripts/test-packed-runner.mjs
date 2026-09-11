@@ -25,7 +25,7 @@ const UNHOOKED_CHECK_IDS = new Set([
 	"asset-review-integration-v2-owned", "asset-review-integration-v2-hash",
 	"asset-installer-gentle-ai-owned", "asset-installer-gentle-ai-hash",
 	"asset-installer-tui-mode-setting-owned", "asset-installer-tui-mode-setting-hash",
-	"native-package-cache-absent", "native-command-absent", "sdk-manifest-owned", "sdk-version", "jiti-entry-owned", "jiti-manifest-owned", "jiti-version",
+	"native-package-cache-absent", "native-command-absent", "sdk-manifest-owned", "sdk-version", "jiti-manifest-owned", "jiti-static-export", "jiti-entry-owned", "jiti-version",
 	"home-empty", "gentle-pi-agent-empty", "pi-coding-agent-empty", "gentle-pi-config-empty", "xdg-config-empty", "xdg-cache-empty", "xdg-data-empty", "appdata-empty", "local-appdata-empty",
 ]);
 
@@ -344,13 +344,11 @@ function assertNoNativeInstallerArtifacts(packageRoot, consumerDirectory, receip
 	if (existsSync(join(consumerDirectory, "node_modules", ".bin", nativeCommand))) throw new Error("unhooked install unexpectedly exposed a native Gentle AI executable");
 }
 
-function unhookedProbeSource(packageRoot, consumerPackageJson, sdkPackageJson) {
+function unhookedProbeSource(packageRoot, consumerPackageJson, jitiStaticEntry) {
 	return `
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-const sdkRequire = createRequire(${JSON.stringify(sdkPackageJson)});
-const { createJiti } = await import(pathToFileURL(sdkRequire.resolve("jiti/static")).href);
+const { createJiti } = await import(pathToFileURL(${JSON.stringify(jitiStaticEntry)}).href);
 const jiti = createJiti(pathToFileURL(${JSON.stringify(consumerPackageJson)}).href, { moduleCache: false });
 const registrations = { tools: [], commands: [], events: [] };
 const events = new Proxy({}, { get(_target, property) { return (..._args) => { registrations.events.push(\`events.\${String(property)}\`); }; } });
@@ -417,19 +415,25 @@ async function testUnhookedPackedImports() {
 		selectUnhookedCheck(receipt, "sdk-manifest-owned");
 		const checkedSdkPackageJson = assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, sdkPackageJson));
 		const sdkRequire = createRequire(checkedSdkPackageJson);
-		selectUnhookedCheck(receipt, "jiti-entry-owned");
-		const jitiEntry = sdkRequire.resolve("jiti/static");
-		assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, jitiEntry));
-		selectUnhookedCheck(receipt, "jiti-manifest-owned");
-		const checkedJitiPackageJson = assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, join(dirname(dirname(jitiEntry)), "package.json")));
-		selectUnhookedCheck(receipt, "jiti-version");
-		const jitiPackage = safeJson(readFileSync(checkedJitiPackageJson), "jiti package manifest");
 		selectUnhookedCheck(receipt, "sdk-version");
 		const installedSdk = safeJson(readFileSync(checkedSdkPackageJson), "installed Pi SDK manifest");
-		if (installedSdk.version !== sdkVersion) throw new Error("consumer resolved an unexpected Pi SDK");
+		if (installedSdk.name !== "@earendil-works/pi-coding-agent" || installedSdk.version !== sdkVersion) throw new Error("consumer resolved an unexpected Pi SDK");
 		const declaredJiti = installedSdk?.dependencies?.jiti;
+		selectUnhookedCheck(receipt, "jiti-manifest-owned");
+		const jitiManifest = sdkRequire.resolve("jiti/package.json");
+		const checkedJitiPackageJson = assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, jitiManifest));
+		const jitiPackage = safeJson(readFileSync(checkedJitiPackageJson), "jiti package manifest");
+		selectUnhookedCheck(receipt, "jiti-static-export");
+		const staticExport = jitiPackage?.exports?.["./static"];
+		if (staticExport === null || typeof staticExport !== "object" || Array.isArray(staticExport)
+			|| Object.keys(staticExport).length !== 2 || typeof staticExport.types !== "string" || typeof staticExport.import !== "string") {
+			throw new Error("Jiti manifest does not declare the expected static ESM export");
+		}
+		const jitiPackageRoot = dirname(checkedJitiPackageJson);
+		selectUnhookedCheck(receipt, "jiti-entry-owned");
+		const jitiStaticEntry = assertOwnedRegularFile(jitiPackageRoot, relative(jitiPackageRoot, resolve(jitiPackageRoot, staticExport.import)));
 		selectUnhookedCheck(receipt, "jiti-version");
-		if (typeof declaredJiti !== "string" || jitiPackage.version !== declaredJiti) throw new Error("consumer Jiti does not match the installed Pi SDK runtime dependency");
+		if (jitiPackage.name !== "jiti" || typeof declaredJiti !== "string" || jitiPackage.version !== declaredJiti) throw new Error("consumer Jiti does not match the installed Pi SDK runtime dependency");
 		// The child calls only default factories on this inert recorder; it never invokes registered tools or event handlers.
 		for (const home of homes) {
 			selectUnhookedCheck(receipt, home.checkId);
@@ -437,7 +441,7 @@ async function testUnhookedPackedImports() {
 		}
 		stage = "import-probe";
 		selectUnhookedCheck(receipt, "import-probe-command");
-		const probe = runBoundedProbe(["--input-type=module", "--eval", unhookedProbeSource(packageRoot, join(consumerDirectory, "package.json"), sdkPackageJson)], env, consumerDirectory);
+		const probe = runBoundedProbe(["--input-type=module", "--eval", unhookedProbeSource(packageRoot, join(consumerDirectory, "package.json"), jitiStaticEntry)], env, consumerDirectory);
 		selectUnhookedCheck(receipt, "import-probe-result");
 		safeJson(probe, "unhooked registration probe output");
 		stage = "post-import-check";
