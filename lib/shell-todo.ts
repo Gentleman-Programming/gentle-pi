@@ -281,11 +281,12 @@ export function renderTodoCard(state: TodoState, theme: TodoTheme, width: number
 	if (state.tasks.length === 0) return [];
 	const { done, total } = todoSummary(state);
 	const stale = options.staleTurns >= STALE_AFTER_TURNS;
-	const hint = options.collapseKey ? `${options.collapseKey} ${options.collapsed ? "expand" : "collapse"}` : undefined;
+	const action = options.collapsed ? "expand" : "collapse";
+	const hint = options.collapseKey ? `${options.collapseKey} ${action}` : undefined;
 	const rows = options.collapsed ? [collapsedRow(state, theme, width)] : options.scrollable ? state.tasks.map((task) => taskRow(task, theme, width)) : bodyRows(state, theme, width);
 	const body = stale ? [theme.fg(NOTE_ROLE, `stale · ${options.staleTurns} turns`), ...rows] : rows;
 	return renderCard(
-		{ title: "Todos", subtitle: `${done} of ${total}`, body, tone: stale ? CARD_TONE.WARNING : CARD_TONE.INFO, glyph: TODO_GLYPH },
+		{ title: `Todos ${options.collapsed ? "▸" : "▾"}`, subtitle: `${done} of ${total}`, body, tone: stale ? CARD_TONE.WARNING : CARD_TONE.INFO, glyph: TODO_GLYPH },
 		theme,
 		width,
 		{ expanded: true, hint },

@@ -1,4 +1,4 @@
-import { ScrollView, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
+import { ScrollView, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { sidebarState } from "./shell-sidebar.ts";
 import type { ShellBarTheme } from "./shell-bar.ts";
 import { renderSidebarBanner } from "./shell-sidebar-banner.ts";
@@ -14,6 +14,7 @@ type LayoutNode = { type: string; entries?: unknown[]; gap?: number; align?: str
 type LayoutRoot = Component & { [NODE]?: () => LayoutNode };
 type Host = TUI & { mode?: string; layoutRoot?: LayoutRoot };
 type SidebarCache = { revision: number };
+type RailHit = { key: string; component: Component; startY: number; height: number; width: number };
 type PreparedRail = {
 	revision: number;
 	width: number;
@@ -21,8 +22,10 @@ type PreparedRail = {
 	root: LayoutRoot;
 	theme: ShellBarTheme;
 	parts: Array<[string, Component]>;
+	contentWidth: number;
 	active: boolean;
 	lines: string[];
+	hits: RailHit[];
 };
 const CACHE = Symbol.for("gentle-pi.experimental-sidebar.cache");
 
@@ -65,16 +68,35 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme): () => void {
 		scrollbarThumbStyle: (text) => theme.fg("accent", text),
 	});
 	const nativeMouse = scroll.handleMouse.bind(scroll);
+	const dispatchPartMouse = (event: TuiMouseEvent) => {
+		const current = prepared;
+		if (!current || stopped || failed || !current.active || current.revision !== cache.revision ||
+			host.mode !== "fullscreen" || tui.terminal.columns !== current.width || host.layoutRoot !== current.root ||
+			scroll.getContentWidth(event.width) !== current.contentWidth || event.x < RAIL_PADDING ||
+			event.x >= current.contentWidth || event.y < 0 || event.y >= event.height) return undefined;
+		const contentY = scroll.scrollTop + event.y;
+		const hit = current.hits.find((candidate) => contentY >= candidate.startY && contentY < candidate.startY + candidate.height);
+		if (!hit || state.parts.get(hit.key) !== hit.component || event.x >= RAIL_PADDING + hit.width) return undefined;
+		return hit.component.handleMouse?.({
+			...event,
+			x: event.x - RAIL_PADDING,
+			y: contentY - hit.startY,
+			width: hit.width,
+			height: hit.height,
+		});
+	};
 	scroll.handleMouse = (event) => {
-		if (event.type !== "wheel") return nativeMouse(event);
-		// Consume even at the boundary or over blank rail space: Pi 0.85.1
-		// can send unconsumed delta to the primary transcript despite containment.
-		scroll.scrollBy(event.wheelDelta ?? 0);
-		return {
-			handled: true,
-			render: true,
-			target: { component: scroll, originX: event.screenX - event.x, originY: event.screenY - event.y, width: event.width, height: event.height },
-		};
+		if (event.type === "wheel") {
+			// Consume even at the boundary or over blank rail space: Pi 0.85.1
+			// can send unconsumed delta to the primary transcript despite containment.
+			scroll.scrollBy(event.wheelDelta ?? 0);
+			return {
+				handled: true,
+				render: true,
+				target: { component: scroll, originX: event.screenX - event.x, originY: event.screenY - event.y, width: event.width, height: event.height },
+			};
+		}
+		return dispatchPartMouse(event) ?? nativeMouse(event);
 	};
 	const prepare = (width: number, root: LayoutRoot): boolean => {
 		state.active = false;
@@ -94,19 +116,26 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme): () => void {
 		try {
 			const contentWidth = scroll.getContentWidth(RAIL_WIDTH);
 			const sections = ["footer", "changes", "agents", "todo"].map((key) => {
-				const lines = [...(state.parts.get(key)?.render(contentWidth - RAIL_PADDING * 2) ?? [])];
+				const component = state.parts.get(key);
+				const lines = [...(component?.render(contentWidth - RAIL_PADDING * 2) ?? [])];
 				while (lines.length && lines[lines.length - 1]?.trim() === "") lines.pop();
-				return lines;
-			}).filter((lines) => lines.length > 0);
+				return { key, component, lines };
+			}).filter((section) => section.component !== undefined && section.lines.length > 0) as Array<{ key: string; component: Component; lines: string[] }>;
 			const branding = renderSidebarBanner(theme, contentWidth - RAIL_PADDING * 2);
-			if (sections.length && branding.length) sections.unshift(branding);
-			railLines = sections.flatMap((lines, index) => [
-				...(index === 0 ? [] : [""]),
-				...lines.map((line) => " ".repeat(RAIL_PADDING) + line + " ".repeat(RAIL_PADDING)),
-			]);
+			const hits: RailHit[] = [];
+			railLines = [];
+			if (sections.length && branding.length) {
+				railLines.push(...branding.map((line) => " ".repeat(RAIL_PADDING) + line + " ".repeat(RAIL_PADDING)));
+			}
+			for (const section of sections) {
+				if (railLines.length > 0) railLines.push("");
+				const startY = railLines.length;
+				railLines.push(...section.lines.map((line) => " ".repeat(RAIL_PADDING) + line + " ".repeat(RAIL_PADDING)));
+				hits.push({ key: section.key, component: section.component, startY, height: section.lines.length, width: contentWidth - RAIL_PADDING * 2 });
+			}
 			// Height is owned by the native ScrollView, never by the transcript.
 			const active = railLines.length > 0 && railLines.every((line) => visibleWidth(line) <= contentWidth);
-			prepared = { revision: cache.revision, width, mode: host.mode, root, theme, parts, active, lines: railLines };
+			prepared = { revision: cache.revision, width, mode: host.mode, root, theme, parts, contentWidth, active, lines: railLines, hits };
 			state.active = active;
 			return active;
 		} catch {

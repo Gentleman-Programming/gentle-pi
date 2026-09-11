@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ScrollView, visibleWidth, type TUI } from "@earendil-works/pi-tui";
+import { ScrollView, visibleWidth, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { renderLayoutFrame } from "@earendil-works/pi-tui/dist/layout.js";
-import { installSidebar } from "../lib/shell-sidebar-layout.ts";
+import { installSidebar, invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
 import { sidebarPart, sidebarState } from "../lib/shell-sidebar.ts";
 import { renderShellSidebarBar } from "../lib/shell-bar.ts";
 import { renderTodoCard, type TodoState } from "../lib/shell-todo.ts";
@@ -137,6 +137,100 @@ test("wheel scrolls the rail and is consumed at both boundaries and blank space"
 	scroll.updateLayout(1, 5, () => {});
 	assert.equal(scroll.handleMouse({ type: "wheel", wheelDelta: 1 } as Parameters<typeof scroll.handleMouse>[0])?.handled, true);
 	assert.equal(scroll.scrollTop, 0);
+});
+
+test("rail dispatches a clipped, scroll-translated left click to only the matching sidebar part", (t) => {
+	const f = fixture();
+	let clicks = 0;
+	const received: TuiMouseEvent[] = [];
+	const todo = {
+		render: () => ["Todo header", "Todo body"],
+		invalidate() {},
+		handleMouse(event: TuiMouseEvent) {
+			received.push(event);
+			if (event.type !== "click" || event.button !== "left" || event.y !== 0) return undefined;
+			clicks++;
+			return { handled: true, render: true };
+		},
+	};
+	sidebarPart(f.tui, "todo", todo);
+	const dispose = installSidebar(f.tui, theme);
+	t.after(dispose);
+	const scroll = rail(f);
+	const content = scroll.render(50);
+	scroll.updateLayout(content.length, 5, () => {});
+	scroll.scrollBy(1);
+	const headerY = content.findIndex((line) => line.includes("Todo header")) - scroll.scrollTop;
+	assert.ok(headerY >= 0);
+	const mouse = (type: TuiMouseEvent["type"], button: TuiMouseEvent["button"], y: number): TuiMouseEvent => ({
+		type, button, x: 2, y, screenX: 92, screenY: 30 + y, width: 50, height: 5, shift: false, alt: false, ctrl: false,
+	});
+
+	assert.equal(scroll.handleMouse(mouse("press", "left", headerY)), undefined);
+	assert.equal(scroll.handleMouse(mouse("click", "right", headerY)), undefined);
+	assert.equal(scroll.handleMouse(mouse("click", "left", headerY + 1)), undefined);
+	assert.equal(clicks, 0);
+	const hit = scroll.handleMouse(mouse("click", "left", headerY));
+	assert.equal(hit?.handled, true);
+	assert.equal(clicks, 1);
+	assert.deepEqual(received.at(-1) && { x: received.at(-1)!.x, y: received.at(-1)!.y, width: received.at(-1)!.width, height: received.at(-1)!.height }, { x: 1, y: 0, width: 47, height: 2 });
+
+	const gapY = headerY - 1;
+	assert.equal(scroll.handleMouse(mouse("click", "left", gapY)), undefined, "section gaps do not hit a neighbor");
+	assert.equal(scroll.handleMouse({ ...mouse("click", "left", headerY), x: 48 }), undefined, "padding outside the clipped part is inert");
+	invalidateSidebar(f.tui);
+	assert.equal(scroll.handleMouse(mouse("click", "left", headerY)), undefined, "stale geometry is inert");
+	f.host.terminal.columns = 139;
+	assert.equal(scroll.handleMouse(mouse("click", "left", headerY)), undefined, "resized-away rails are inert");
+	dispose();
+	assert.equal(scroll.handleMouse(mouse("click", "left", headerY)), undefined, "disposed rails are inert");
+});
+
+test("rail rejects removed or replaced parts before cached geometry is prepared again", (t) => {
+	const f = fixture();
+	let originalClicks = 0;
+	let replacementClicks = 0;
+	const original = {
+		render: () => ["Todo header"],
+		invalidate() {},
+		handleMouse(event: TuiMouseEvent) {
+			if (event.type !== "click" || event.button !== "left") return undefined;
+			originalClicks++;
+			return { handled: true };
+		},
+	};
+	const mounted = sidebarPart(f.tui, "todo", { render: () => ["Todo bottom"], invalidate() {} }, original);
+	const dispose = installSidebar(f.tui, theme);
+	t.after(dispose);
+	const scroll = rail(f);
+	const content = scroll.render(50);
+	scroll.updateLayout(content.length, 5, () => {});
+	const headerY = content.findIndex((line) => line.includes("Todo header"));
+	const click = (): TuiMouseEvent => ({ type: "click", button: "left", x: 2, y: headerY, screenX: 92, screenY: 30 + headerY, width: 50, height: 5, shift: false, alt: false, ctrl: false });
+	assert.equal(scroll.handleMouse(click())?.handled, true, "healthy cached geometry still dispatches");
+	assert.equal(originalClicks, 1);
+
+	mounted.dispose();
+	assert.equal(scroll.handleMouse(click()), undefined, "removed parts are inert before the next prepare");
+	assert.equal(originalClicks, 1);
+
+	const replacement = {
+		render: () => ["Todo replacement"],
+		invalidate() {},
+		handleMouse(event: TuiMouseEvent) {
+			if (event.type !== "click" || event.button !== "left") return undefined;
+			replacementClicks++;
+			return { handled: true };
+		},
+	};
+	sidebarPart(f.tui, "todo", { render: () => ["Todo bottom"], invalidate() {} }, replacement);
+	assert.equal(scroll.handleMouse(click()), undefined, "a replacement cannot receive stale cached geometry");
+	assert.equal(originalClicks, 1);
+	assert.equal(replacementClicks, 0);
+
+	rail(f);
+	assert.equal(scroll.handleMouse(click())?.handled, true, "prepared replacement dispatches normally");
+	assert.equal(replacementClicks, 1);
 });
 
 test("real layout frames reuse unchanged sidebar output and invalidate at state and breakpoint boundaries", (t) => {
