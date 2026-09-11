@@ -5,7 +5,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -14,12 +14,24 @@ const MAX_NPM_OUTPUT_BYTES = 1024 * 1024;
 const MAX_UNHOOKED_REPORT_BYTES = 1024;
 const MAX_SDK_LIFECYCLE_CHILD_REPORT_BYTES = 2048;
 const MAX_WINDOWS_STARTUP_TIMING_REPORT_BYTES = 1024;
+const MAX_WINDOWS_STARTUP_TIMING_ENVIRONMENT_REPORT_BYTES = 2048;
 const MAX_WINDOWS_STARTUP_TIMING_OUTPUT_BYTES = 32 * 1024;
 const WINDOWS_STARTUP_TIMING_BUDGET_MS = 25_000;
 const WINDOWS_STARTUP_TIMING_CLEANUP_GRACE_MS = 5_000;
 const WINDOWS_STARTUP_TIMING_FORCE_CLOSE_GRACE_MS = 2_500;
 const WINDOWS_STARTUP_TIMING_POWERSHELL = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 const WINDOWS_STARTUP_TIMING_START_REQUEST = '{"requestId":"start-1","operation":"start"}\n';
+const WINDOWS_STARTUP_TIMING_ENVIRONMENT_CASE_NAMES = Object.freeze(["baseline", "windows-paths"]);
+const WINDOWS_STARTUP_TIMING_ENVIRONMENT_RECEIPT_FLAGS = Object.freeze({
+	caseOrder: "baseline-first-fixed",
+	sharedState: "shared-owned-home-and-cache",
+	confounders: "baseline-first-order-and-cache-effects",
+	conclusion: "no-causal-attribution-not-product-ready",
+});
+export const WINDOWS_STARTUP_TIMING_WINDOWS_PATH_KEYS = Object.freeze([
+	"ProgramFiles", "ProgramFiles(x86)", "ProgramW6432",
+	"CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432", "PSModulePath",
+]);
 // Write-Reply uses ConvertTo-Json -Compress on a three-key hashtable. Hashtable
 // enumeration order is not an API guarantee, so admit only its six compact key orders.
 const WINDOWS_STARTUP_TIMING_VALID_START_REPLIES = new Set([
@@ -35,8 +47,9 @@ const UNHOOKED_STAGES = new Set(["pack", "pack-result", "install", "artifact-che
 const UNHOOKED_ERROR_CODES = new Set(["spawn-failed", "timed-out", "output-limit", "nonzero-exit", "invalid-result", "assertion-failed", "cleanup-failed", "unknown"]);
 const SDK_LIFECYCLE_STAGES = new Set(["pack", "pack-result", "install", "artifact-check", "lifecycle-probe", "lifecycle-result", "cleanup"]);
 const WINDOWS_STARTUP_TIMING_STAGES = new Set(["pack", "pack-result", "install", "artifact-check", "helper-start", "helper-result", "cleanup"]);
-const WINDOWS_STARTUP_TIMING_ERROR_CODES = new Set(["spawn-failed", "timed-out", "invalid-output", "rejected", "stream-failed", "write-failed", "exited", "nonzero-exit", "cleanup-unconfirmed", "assertion-failed", "cleanup-failed", "unknown"]);
+const WINDOWS_STARTUP_TIMING_ERROR_CODES = new Set(["spawn-failed", "timed-out", "invalid-output", "rejected", "stream-failed", "write-failed", "exited", "nonzero-exit", "cleanup-unconfirmed", "environment-invalid", "assertion-failed", "cleanup-failed", "unknown"]);
 const WINDOWS_STARTUP_TIMING_OUTCOMES = new Set(["not-attempted", "valid-reply", "rejected", "timed-out", "invalid-output", "spawn-failed", "stream-failed", "write-failed", "exited"]);
+const WINDOWS_STARTUP_TIMING_CLEANUP_OUTCOMES = new Set(["not-attempted", "close-observed", "close-unconfirmed", "blocked"]);
 const SDK_LIFECYCLE_ERROR_CODES = new Set(["spawn-failed", "timed-out", "unconfirmed-close", "output-limit", "nonzero-exit", "invalid-result", "assertion-failed", "cleanup-failed", "unknown"]);
 const SDK_LIFECYCLE_EXTENSION_ERROR_PHASES = new Set(["unobserved", "none", "startup", "shutdown"]);
 const SDK_LIFECYCLE_WINDOWS_OBSERVATION_AVAILABILITY = new Set(["not-applicable", "unavailable", "observed"]);
@@ -56,7 +69,7 @@ const SDK_LIFECYCLE_CHECK_IDS = new Set([
 	"not-attempted", "runner-hosted", "runner-temp", "temporary-root", "project-sdk-version", "pack-command", "pack-metadata", "pack-integrity", "install-command", "packed-assets", "native-artifacts", "sdk-manifest", "sdk-version", "jiti-manifest-owned", "jiti-static-export", "jiti-entry-owned", "jiti-version", "lifecycle-probe-command", "lifecycle-probe-result", "sdk-lifecycle-complete", "cleanup-owned-root-removal",
 ]);
 const WINDOWS_STARTUP_TIMING_CHECK_IDS = new Set([
-	"not-attempted", "runner-hosted", "runner-temp", "temporary-root", "project-sdk-version", "pack-command", "pack-metadata", "pack-integrity", "install-command", "packed-assets", "native-artifacts", "installed-helper", "helper-start", "helper-result", "windows-helper-startup-measured", "cleanup-owned-root-removal",
+	"not-attempted", "runner-hosted", "runner-temp", "temporary-root", "project-sdk-version", "pack-command", "pack-metadata", "pack-integrity", "install-command", "packed-assets", "native-artifacts", "installed-helper", "helper-start", "helper-result", "windows-helper-startup-measured", "windows-helper-startup-environment-measured", "cleanup-owned-root-removal",
 ]);
 const UNHOOKED_CHECK_IDS = new Set([
 	"not-attempted", "runner-temp", "temporary-root", "project-sdk-version", "pack-command", "pack-metadata", "pack-integrity", "install-command", "import-probe-command", "import-probe-result", "unhooked-imports-complete", "cleanup-owned-root-removal",
@@ -91,6 +104,15 @@ function newWindowsStartupTimingReceipt() {
 		checkId: "not-attempted", packVerified: false, installCompleted: false, budgetMs: WINDOWS_STARTUP_TIMING_BUDGET_MS,
 		helperStartOutcome: "not-attempted", startElapsedMs: null, lastStartupMarker: null,
 		cleanup: "not-attempted", physicalCloseObserved: false, cleanupCompleted: false,
+	};
+}
+
+function newWindowsStartupTimingEnvironmentCase(name, pathAdditionKeys) {
+	if (!WINDOWS_STARTUP_TIMING_ENVIRONMENT_CASE_NAMES.includes(name)) throw new Error("invalid Windows startup environment case");
+	return {
+		name, pathAdditionKeys, budgetMs: WINDOWS_STARTUP_TIMING_BUDGET_MS,
+		helperStartOutcome: "not-attempted", startElapsedMs: null, lastStartupMarker: null,
+		cleanup: "not-attempted", physicalCloseObserved: false, failureStage: null, failureCode: null,
 	};
 }
 
@@ -237,6 +259,35 @@ function reportWindowsStartupTimingReceipt(receipt, error) {
 	const boundedLine = Buffer.byteLength(line, "utf8") <= MAX_WINDOWS_STARTUP_TIMING_REPORT_BYTES
 		? line
 		: '{"mode":"windows-startup-timing","status":"failed","checkId":"not-attempted","packVerified":false,"installCompleted":false,"budgetMs":25000,"helperStartOutcome":"not-attempted","startElapsedMs":null,"lastStartupMarker":null,"cleanup":"not-attempted","physicalCloseObserved":false,"cleanupCompleted":false,"stage":"cleanup","code":"unknown"}';
+	try { (failure === undefined ? process.stdout : process.stderr).write(`${boundedLine}\n`); } catch { /* Reporting cannot expose a raw secondary error. */ }
+	if (failure !== undefined) process.exitCode = 1;
+}
+
+function reportWindowsStartupTimingEnvironmentReceipt(receipt, error) {
+	const failure = error instanceof WindowsStartupTimingFailure ? error : undefined;
+	const report = {
+		mode: "windows-startup-timing-environment",
+		status: failure === undefined ? "complete" : "failed",
+		checkId: failure === undefined ? "windows-helper-startup-environment-measured" : receipt.checkId,
+		packVerified: receipt.packVerified,
+		installCompleted: receipt.installCompleted,
+		isolation: "shared-owned-homes-fresh-helper",
+		...WINDOWS_STARTUP_TIMING_ENVIRONMENT_RECEIPT_FLAGS,
+		allowedPathAdditionKeys: WINDOWS_STARTUP_TIMING_WINDOWS_PATH_KEYS,
+		cases: receipt.cases,
+		cleanupCompleted: receipt.cleanupCompleted,
+		stage: failure?.stage ?? null,
+		code: failure?.code ?? null,
+	};
+	const line = JSON.stringify(report);
+	const fallback = JSON.stringify({
+		mode: "windows-startup-timing-environment", status: "failed", checkId: receipt.checkId,
+		packVerified: receipt.packVerified, installCompleted: receipt.installCompleted,
+		isolation: "shared-owned-homes-fresh-helper", ...WINDOWS_STARTUP_TIMING_ENVIRONMENT_RECEIPT_FLAGS,
+		allowedPathAdditionKeys: WINDOWS_STARTUP_TIMING_WINDOWS_PATH_KEYS, cases: receipt.cases,
+		cleanupCompleted: receipt.cleanupCompleted, stage: failure?.stage ?? "unknown", code: failure?.code ?? "unknown",
+	});
+	const boundedLine = Buffer.byteLength(line, "utf8") <= MAX_WINDOWS_STARTUP_TIMING_ENVIRONMENT_REPORT_BYTES ? line : fallback;
 	try { (failure === undefined ? process.stdout : process.stderr).write(`${boundedLine}\n`); } catch { /* Reporting cannot expose a raw secondary error. */ }
 	if (failure !== undefined) process.exitCode = 1;
 }
@@ -670,6 +721,77 @@ function isolatedUnhookedEnvironment(temporary) {
 			{ checkId: "local-appdata-empty", path: localAppData },
 		],
 	};
+}
+
+function isValidatedWindowsMachineRoot(value, leaf) {
+	if (typeof value !== "string" || /[\0-\x1f\x7f]/.test(value)) return false;
+	const match = new RegExp(`^[A-Za-z]:\\\\${leaf}$`, "i").exec(value);
+	return match?.[0] === value;
+}
+
+function readCaseInsensitiveEnvironmentValue(source, name) {
+	if (!source || typeof source !== "object") return undefined;
+	const matches = Object.entries(source).filter(([key]) => key.toLowerCase() === name.toLowerCase()).map(([, value]) => value);
+	if (matches.length === 0 || matches.some((value) => typeof value !== "string")) return undefined;
+	return matches.every((value) => value === matches[0]) ? matches[0] : undefined;
+}
+
+function sameWindowsCanonicalPath(actual, expected) {
+	return typeof actual === "string" && win32.normalize(actual).toLowerCase() === win32.normalize(expected).toLowerCase();
+}
+
+// This deliberately reads only the named machine roots. It never inherits PSModulePath
+// or any profile-derived path, and it returns keys rather than values for receipts.
+export function deriveWindowsStartupTimingPathDelta(source) {
+	const programFiles = readCaseInsensitiveEnvironmentValue(source, "ProgramFiles");
+	const programFilesX86 = readCaseInsensitiveEnvironmentValue(source, "ProgramFiles(x86)");
+	const programFilesW6432 = readCaseInsensitiveEnvironmentValue(source, "ProgramW6432");
+	const systemRoot = readCaseInsensitiveEnvironmentValue(source, "SystemRoot");
+	if (!isValidatedWindowsMachineRoot(programFiles, "Program Files")
+		|| !isValidatedWindowsMachineRoot(programFilesX86, "Program Files \\(x86\\)")
+		|| !isValidatedWindowsMachineRoot(programFilesW6432, "Program Files")
+		|| !isValidatedWindowsMachineRoot(systemRoot, "Windows")) {
+		return Object.freeze({ ready: false, pathAdditionKeys: Object.freeze([]), values: Object.freeze({}) });
+	}
+	const values = Object.freeze({
+		ProgramFiles: programFiles,
+		"ProgramFiles(x86)": programFilesX86,
+		ProgramW6432: programFilesW6432,
+		CommonProgramFiles: win32.join(programFiles, "Common Files"),
+		"CommonProgramFiles(x86)": win32.join(programFilesX86, "Common Files"),
+		CommonProgramW6432: win32.join(programFilesW6432, "Common Files"),
+		PSModulePath: [
+			win32.join(programFiles, "WindowsPowerShell", "Modules"),
+			win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "Modules"),
+		].join(";"),
+	});
+	return Object.freeze({ ready: true, pathAdditionKeys: WINDOWS_STARTUP_TIMING_WINDOWS_PATH_KEYS, values });
+}
+
+export function validateWindowsStartupTimingMachinePaths(delta, operations = { lstat: lstatSync, realpath: realpathSync.native }) {
+	if (!delta?.ready || delta.pathAdditionKeys !== WINDOWS_STARTUP_TIMING_WINDOWS_PATH_KEYS || Object.keys(delta.values).join("\0") !== WINDOWS_STARTUP_TIMING_WINDOWS_PATH_KEYS.join("\0")) return false;
+	const values = delta.values;
+	const modulePaths = typeof values.PSModulePath === "string" ? values.PSModulePath.split(";") : [];
+	const systemRoot = modulePaths.length === 2 ? win32.dirname(win32.dirname(win32.dirname(win32.dirname(modulePaths[1])))) : undefined;
+	const expected = [
+		values.ProgramFiles, values["ProgramFiles(x86)"], values.ProgramW6432, systemRoot,
+		values.CommonProgramFiles, values["CommonProgramFiles(x86)"], values.CommonProgramW6432, ...modulePaths,
+	];
+	if (!isValidatedWindowsMachineRoot(values.ProgramFiles, "Program Files")
+		|| !isValidatedWindowsMachineRoot(values["ProgramFiles(x86)"], "Program Files \\(x86\\)")
+		|| !isValidatedWindowsMachineRoot(values.ProgramW6432, "Program Files")
+		|| !isValidatedWindowsMachineRoot(systemRoot, "Windows")
+		|| values.CommonProgramFiles !== win32.join(values.ProgramFiles, "Common Files")
+		|| values["CommonProgramFiles(x86)"] !== win32.join(values["ProgramFiles(x86)"], "Common Files")
+		|| values.CommonProgramW6432 !== win32.join(values.ProgramW6432, "Common Files")
+		|| modulePaths[0] !== win32.join(values.ProgramFiles, "WindowsPowerShell", "Modules")
+		|| modulePaths[1] !== win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "Modules")) return false;
+	try {
+		return expected.every((path) => {
+			const entry = operations.lstat(path);
+			return entry.isDirectory() && !entry.isSymbolicLink() && sameWindowsCanonicalPath(operations.realpath(path), path);
+		});
+	} catch { return false; }
 }
 
 function assertPackResult(packed, packDirectory, receipt) {
@@ -1399,6 +1521,112 @@ async function testWindowsStartupTimingPackedHelper() {
 	return { receipt, failure };
 }
 
+async function testWindowsStartupTimingEnvironmentExperiment() {
+	const receipt = { checkId: "not-attempted", packVerified: false, installCompleted: false, cases: [], cleanupCompleted: false };
+	let temporary;
+	let stage = "pack";
+	let failure;
+	try {
+		selectWindowsStartupTimingCheck(receipt, "runner-hosted");
+		if (process.env.RUNNER_ENVIRONMENT !== "github-hosted" || process.platform !== "win32") throw new WindowsStartupTimingFailure("pack", "assertion-failed");
+		selectWindowsStartupTimingCheck(receipt, "runner-temp");
+		const runnerTemp = process.env.RUNNER_TEMP;
+		if (typeof runnerTemp !== "string" || runnerTemp.length === 0) throw new WindowsStartupTimingFailure("pack", "assertion-failed");
+		selectWindowsStartupTimingCheck(receipt, "temporary-root");
+		temporary = mkdtempSync(join(resolve(runnerTemp), "gentle-pi-windows-startup-environment-"));
+		const packDirectory = join(temporary, "pack");
+		const consumerDirectory = join(temporary, "consumer");
+		mkdirSync(packDirectory);
+		mkdirSync(consumerDirectory);
+		// Both cases retain this exact existing minimal isolation environment; only
+		// the treatment receives the validated, fixed Windows path-key delta.
+		const { env: isolatedEnv } = isolatedUnhookedEnvironment(temporary);
+		Object.assign(isolatedEnv, { GENTLE_PI_AGENTS: "1", PI_OFFLINE: "1" });
+		const pathDelta = deriveWindowsStartupTimingPathDelta(process.env);
+		const treatmentPathDelta = validateWindowsStartupTimingMachinePaths(pathDelta) ? pathDelta : undefined;
+		selectWindowsStartupTimingCheck(receipt, "project-sdk-version");
+		const manifest = safeJson(readFileSync(join(root, "package.json")), "project package manifest");
+		const sdkVersion = manifest?.devDependencies?.["@earendil-works/pi-coding-agent"];
+		if (sdkVersion !== "0.85.1") throw new Error("Windows startup environment experiment requires the project-pinned Pi SDK");
+		selectWindowsStartupTimingCheck(receipt, "pack-command");
+		const packed = safeJson(runBoundedNpm("pack", ["pack", "--ignore-scripts", "--json", "--pack-destination", packDirectory], isolatedEnv, root), "npm pack output");
+		stage = "pack-result";
+		selectWindowsStartupTimingCheck(receipt, "pack-metadata");
+		const { tarball } = assertPackResult(packed, packDirectory, { checkId: "pack-metadata" });
+		selectWindowsStartupTimingCheck(receipt, "pack-integrity");
+		receipt.packVerified = true;
+		stage = "install";
+		selectWindowsStartupTimingCheck(receipt, "install-command");
+		writeFileSync(join(consumerDirectory, "package.json"), JSON.stringify({ name: "gentle-pi-windows-startup-environment", private: true, dependencies: { "@earendil-works/pi-coding-agent": sdkVersion } }), "utf8");
+		runBoundedNpm("install", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false", "--omit=dev", "--legacy-peer-deps", tarball, `@earendil-works/pi-coding-agent@${sdkVersion}`], isolatedEnv, consumerDirectory);
+		receipt.installCompleted = true;
+		stage = "artifact-check";
+		const packageRoot = join(consumerDirectory, "node_modules", "gentle-pi");
+		selectWindowsStartupTimingCheck(receipt, "packed-assets");
+		assertPackedAssets(packageRoot, { checkId: "asset-runtime-windows-session-transport-owned" });
+		selectWindowsStartupTimingCheck(receipt, "native-artifacts");
+		assertNoNativeInstallerArtifacts(packageRoot, consumerDirectory, { checkId: "native-package-cache-absent" });
+		selectWindowsStartupTimingCheck(receipt, "installed-helper");
+		const installedHelper = assertOwnedRegularFile(packageRoot, "runtime/windows-session-transport.ps1");
+		for (const name of WINDOWS_STARTUP_TIMING_ENVIRONMENT_CASE_NAMES) {
+			const isTreatment = name === "windows-paths";
+			const caseReceipt = newWindowsStartupTimingEnvironmentCase(name, isTreatment && treatmentPathDelta !== undefined ? treatmentPathDelta.pathAdditionKeys : []);
+			receipt.cases.push(caseReceipt);
+			if (isTreatment && receipt.cases[0].physicalCloseObserved !== true) {
+				caseReceipt.cleanup = "blocked";
+				caseReceipt.failureStage = "cleanup";
+				caseReceipt.failureCode = "cleanup-unconfirmed";
+				break;
+			}
+			if (isTreatment && treatmentPathDelta === undefined) {
+				caseReceipt.failureStage = "helper-start";
+				caseReceipt.failureCode = "environment-invalid";
+				if (failure === undefined) failure = new WindowsStartupTimingFailure("helper-start", "environment-invalid");
+				continue;
+			}
+			stage = "helper-start";
+			selectWindowsStartupTimingCheck(receipt, "helper-start");
+			const measured = await runWindowsStartupTimingProbe(installedHelper, isTreatment ? Object.assign({}, isolatedEnv, treatmentPathDelta.values) : isolatedEnv, consumerDirectory);
+			caseReceipt.helperStartOutcome = measured.helperStartOutcome;
+			caseReceipt.startElapsedMs = measured.startElapsedMs;
+			caseReceipt.lastStartupMarker = measured.lastStartupMarker;
+			caseReceipt.cleanup = measured.cleanup;
+			caseReceipt.physicalCloseObserved = measured.physicalCloseObserved;
+			stage = "helper-result";
+			selectWindowsStartupTimingCheck(receipt, "helper-result");
+			if (!WINDOWS_STARTUP_TIMING_CLEANUP_OUTCOMES.has(caseReceipt.cleanup)) throw new WindowsStartupTimingFailure("helper-result", "assertion-failed");
+			if (measured.failure !== undefined) {
+				caseReceipt.failureStage = measured.failure.stage;
+				caseReceipt.failureCode = measured.failure.code;
+				if (failure === undefined) failure = new WindowsStartupTimingFailure(measured.failure.stage, measured.failure.code);
+			} else if (measured.helperStartOutcome !== "valid-reply" || measured.startElapsedMs === null || measured.lastStartupMarker !== "native-ready" || measured.cleanup !== "close-observed" || !measured.physicalCloseObserved) {
+				caseReceipt.failureStage = "helper-result";
+				caseReceipt.failureCode = "assertion-failed";
+				if (failure === undefined) failure = new WindowsStartupTimingFailure("helper-result", "assertion-failed");
+			}
+		}
+		if (receipt.cases.length !== 2) throw new WindowsStartupTimingFailure("helper-result", "assertion-failed");
+		if (failure === undefined) selectWindowsStartupTimingCheck(receipt, "windows-helper-startup-environment-measured");
+	} catch (error) {
+		if (failure === undefined) {
+			if (error instanceof WindowsStartupTimingFailure) failure = error;
+			else if (error instanceof UnhookedFailure) failure = new WindowsStartupTimingFailure(stage, error.code);
+			else failure = new WindowsStartupTimingFailure(stage, "assertion-failed");
+		}
+	}
+	if (temporary !== undefined) {
+		try {
+			if (failure === undefined) selectWindowsStartupTimingCheck(receipt, "cleanup-owned-root-removal");
+			rmSync(temporary, { recursive: true, force: true });
+			receipt.cleanupCompleted = !existsSync(temporary);
+			if (!receipt.cleanupCompleted) throw new Error("owned temporary root remains after cleanup");
+		} catch {
+			if (failure === undefined) failure = new WindowsStartupTimingFailure("cleanup", "cleanup-failed");
+		}
+	}
+	return { receipt, failure };
+}
+
 async function testUnhookedPackedImports() {
 	const receipt = newUnhookedReceipt();
 	let temporary;
@@ -1472,15 +1700,50 @@ async function testUnhookedPackedImports() {
 	return { receipt, failure };
 }
 
-if (process.argv.includes("--unhooked-imports")) {
+function sameEntrypointPath(left, right, platform) {
+	return platform === "win32"
+		? win32.normalize(left).toLowerCase() === win32.normalize(right).toLowerCase()
+		: left === right;
+}
+
+export function decidePackedRunnerEntrypoint(scriptPath, argvEntry, platform, operations = { resolvePath: resolve, realpath: realpathSync.native }) {
+	const importDecision = Object.freeze({ identity: "import", runModes: false, exitCode: null });
+	if (typeof argvEntry !== "string" || argvEntry.length === 0) return importDecision;
+	let resolvedScript;
+	let resolvedEntry;
+	try {
+		resolvedScript = operations.resolvePath(scriptPath);
+		resolvedEntry = operations.resolvePath(argvEntry);
+	} catch { return importDecision; }
+	try {
+		const sameIdentity = sameEntrypointPath(operations.realpath(resolvedScript), operations.realpath(resolvedEntry), platform);
+		return sameIdentity
+			? Object.freeze({ identity: "main", runModes: true, exitCode: null })
+			: importDecision;
+	} catch {
+		// A lexical identity is enough to identify only the direct CLI itself; a
+		// foreign importer with an unresolvable argv entry remains completely inert.
+		return sameEntrypointPath(resolvedScript, resolvedEntry, platform)
+			? Object.freeze({ identity: "direct-unresolved", runModes: false, exitCode: 1 })
+			: importDecision;
+	}
+}
+
+const entrypoint = decidePackedRunnerEntrypoint(fileURLToPath(import.meta.url), process.argv[1], process.platform);
+if (entrypoint.exitCode !== null) {
+	process.exitCode = entrypoint.exitCode;
+} else if (entrypoint.runModes && process.argv.includes("--unhooked-imports")) {
 	const { receipt, failure } = await testUnhookedPackedImports();
 	reportUnhookedReceipt(receipt, failure);
-} else if (process.argv.includes("--sdk-lifecycle")) {
+} else if (entrypoint.runModes && process.argv.includes("--sdk-lifecycle")) {
 	const { receipt, failure } = await testSdkLifecyclePackedSession();
 	reportSdkLifecycleReceipt(receipt, failure);
-} else if (process.argv.includes("--windows-startup-timing")) {
+} else if (entrypoint.runModes && process.argv.includes("--windows-startup-timing")) {
 	const { receipt, failure } = await testWindowsStartupTimingPackedHelper();
 	reportWindowsStartupTimingReceipt(receipt, failure);
-} else {
+} else if (entrypoint.runModes && process.argv.includes("--windows-startup-timing-environment")) {
+	const { receipt, failure } = await testWindowsStartupTimingEnvironmentExperiment();
+	reportWindowsStartupTimingEnvironmentReceipt(receipt, failure);
+} else if (entrypoint.runModes) {
 	await testHookedPackedRunner();
 }

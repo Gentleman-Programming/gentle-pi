@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { FIXED_WINDOWS_POWERSHELL, WindowsActiveSessionClient, WindowsActiveSessionListener, WindowsSessionPresenceRegistry, WindowsSessionRegistryPhaseSequence, type WindowsSessionRegistryPhaseEvent, parseWindowsHostFrame } from "../lib/windows-session-transport.ts";
 import { createDefaultSessionTransport } from "../extensions/gentle-agents.ts";
 import { ActiveSessionClientError, FrameDecoder, encodeNotificationFrame, type AckFrame } from "../lib/agents-session-transport.ts";
+import { decidePackedRunnerEntrypoint, deriveWindowsStartupTimingPathDelta, validateWindowsStartupTimingMachinePaths, WINDOWS_STARTUP_TIMING_WINDOWS_PATH_KEYS } from "../scripts/test-packed-runner.mjs";
 
 const runtime = fileURLToPath(new URL("../runtime/windows-session-transport.ps1", import.meta.url));
 const fixture = fileURLToPath(new URL("fixtures/windows-session-bootstrap.ps1", import.meta.url));
@@ -797,6 +798,88 @@ test("packed Windows startup timing source guard uses the installed helper direc
 	assert.match(helper, /function Write-Reply\([\s\S]*?@\{ requestId = \$requestId; ok = \$true; result = \$result \} \| ConvertTo-Json -Compress -Depth 4/);
 	const timingDriver = source.slice(source.indexOf("function runWindowsStartupTimingProbe"), source.indexOf("async function testHookedPackedRunner"));
 	assert.doesNotMatch(timingDriver, /JSON\.parse/);
+});
+
+test("Windows startup environment delta admits only the fixed machine path allowlist", () => {
+	const source = {
+		ProgramFiles: "C:\\Program Files",
+		"ProgramFiles(x86)": "C:\\Program Files (x86)",
+		ProgramW6432: "C:\\Program Files",
+		SystemRoot: "C:\\Windows",
+	};
+	const delta = deriveWindowsStartupTimingPathDelta(source);
+	assert.equal(delta.ready, true);
+	assert.deepEqual(delta.pathAdditionKeys, WINDOWS_STARTUP_TIMING_WINDOWS_PATH_KEYS);
+	assert.deepEqual(delta.values, {
+		ProgramFiles: "C:\\Program Files",
+		"ProgramFiles(x86)": "C:\\Program Files (x86)",
+		ProgramW6432: "C:\\Program Files",
+		CommonProgramFiles: "C:\\Program Files\\Common Files",
+		"CommonProgramFiles(x86)": "C:\\Program Files (x86)\\Common Files",
+		CommonProgramW6432: "C:\\Program Files\\Common Files",
+		PSModulePath: "C:\\Program Files\\WindowsPowerShell\\Modules;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules",
+	});
+	for (const invalid of [
+		{ ...source, ProgramFiles: "C:\\Program Files\n" },
+		{ ...source, ProgramFiles: "C:\\Program Files\0" },
+		{ ProgramFiles: source.ProgramFiles, "ProgramFiles(x86)": source["ProgramFiles(x86)"], SystemRoot: source.SystemRoot },
+		{ ...source, programfiles: "D:\\Program Files" },
+		{ ...source, ProgramFiles: "C:\\Program Files\\..\\Users" },
+	]) assert.equal(deriveWindowsStartupTimingPathDelta(invalid).ready, false);
+	assert.equal(deriveWindowsStartupTimingPathDelta({ ...source, programfiles: source.ProgramFiles }).ready, true, "same-value aliases have an explicit deterministic policy");
+});
+
+test("Windows startup environment operational validation rejects noncanonical machine paths", () => {
+	const delta = deriveWindowsStartupTimingPathDelta({
+		ProgramFiles: "C:\\Program Files", "ProgramFiles(x86)": "C:\\Program Files (x86)", ProgramW6432: "C:\\Program Files", SystemRoot: "C:\\Windows",
+	});
+	const filesystem = { lstat: () => ({ isDirectory: () => true, isSymbolicLink: () => false }), realpath: (path: string) => path };
+	assert.equal(validateWindowsStartupTimingMachinePaths(delta, filesystem), true);
+	assert.equal(validateWindowsStartupTimingMachinePaths(delta, { ...filesystem, realpath: () => "C:\\Users" }), false);
+	assert.equal(validateWindowsStartupTimingMachinePaths(delta, { ...filesystem, lstat: () => ({ isDirectory: () => true, isSymbolicLink: () => true }) }), false);
+});
+
+test("Windows packed runner entrypoint guard distinguishes imports, aliases, and unresolved entries", () => {
+	const resolvePath = (path: string) => path;
+	const inert = { identity: "import", runModes: false, exitCode: null };
+	assert.deepEqual(decidePackedRunnerEntrypoint("/repo/runner.mjs", undefined, "linux", { resolvePath, realpath: (path: string) => path }), inert);
+	assert.deepEqual(decidePackedRunnerEntrypoint("/repo/runner.mjs", "/repo/alias.mjs", "linux", { resolvePath, realpath: () => "/repo/runner.mjs" }), { identity: "main", runModes: true, exitCode: null });
+	assert.deepEqual(decidePackedRunnerEntrypoint("C:\\Repo Dir\\Runner.mjs", "c:\\repo dir\\runner.mjs", "win32", { resolvePath, realpath: (path: string) => path }), { identity: "main", runModes: true, exitCode: null });
+	assert.deepEqual(decidePackedRunnerEntrypoint("/repo/runner.mjs", "/repo/other.mjs", "linux", { resolvePath, realpath: (path: string) => path }), inert);
+	assert.deepEqual(decidePackedRunnerEntrypoint("/repo/runner.mjs", "/foreign-cli.mjs", "linux", { resolvePath, realpath: () => { throw new Error("unresolved"); } }), inert, "a foreign importer with an unresolvable argv entry cannot set an exit code or run a mode");
+	assert.deepEqual(decidePackedRunnerEntrypoint("/repo/runner.mjs", "/repo/runner.mjs", "linux", { resolvePath, realpath: () => { throw new Error("unresolved"); } }), { identity: "direct-unresolved", runModes: false, exitCode: 1 });
+});
+
+test("Windows packed startup environment experiment source guard selects the paired CI case", async (t) => {
+	t.diagnostic("source guard, not hosted Windows environment experiment proof");
+	const source = await readFile(packedRunner, "utf8");
+	assert.match(source, /WINDOWS_STARTUP_TIMING_ENVIRONMENT_CASE_NAMES = Object\.freeze\(\["baseline", "windows-paths"\]\)/);
+	assert.match(source, /export function deriveWindowsStartupTimingPathDelta\(source\)/);
+	assert.match(source, /const pathDelta = deriveWindowsStartupTimingPathDelta\(process\.env\)/);
+	assert.match(source, /const treatmentPathDelta = validateWindowsStartupTimingMachinePaths\(pathDelta\) \? pathDelta : undefined/);
+	assert.match(source, /isTreatment \? Object\.assign\(\{\}, isolatedEnv, treatmentPathDelta\.values\) : isolatedEnv/);
+	assert.match(source, /caseOrder: "baseline-first-fixed"/);
+	assert.match(source, /sharedState: "shared-owned-home-and-cache"/);
+	assert.match(source, /confounders: "baseline-first-order-and-cache-effects"/);
+	assert.match(source, /conclusion: "no-causal-attribution-not-product-ready"/);
+	assert.match(source, /mode: "windows-startup-timing-environment"/);
+	assert.match(source, /receipt\.cases\[0\]\.physicalCloseObserved !== true/);
+	const environmentFactory = source.slice(source.indexOf("function isValidatedWindowsMachineRoot"), source.indexOf("function assertPackResult"));
+	const environmentExperiment = source.slice(source.indexOf("async function testWindowsStartupTimingEnvironmentExperiment"), source.indexOf("async function testUnhookedPackedImports"));
+	assert.doesNotMatch(environmentFactory, /\.\.\.process\.env/);
+	assert.doesNotMatch(environmentExperiment, /\.\.\.process\.env/);
+	assert.doesNotMatch(environmentFactory, /PSModulePath:\s*process\.env/);
+	const workflow = await readFile(fileURLToPath(new URL("../.github/workflows/windows-session-bootstrap.yml", import.meta.url)), "utf8");
+	assert.match(workflow, /Measure paired packed Windows helper startup environment experiment \(experimental\)/);
+	assert.match(workflow, /if: "!cancelled\(\) && matrix\.platform == 'windows' && steps\.install_windows_dependencies\.outcome == 'success'"/);
+	assert.match(workflow, /node scripts\\test-packed-runner\.mjs --windows-startup-timing-environment/);
+	for (const title of [
+		"Windows startup environment delta admits only the fixed machine path allowlist",
+		"Windows startup environment operational validation rejects noncanonical machine paths",
+		"Windows packed startup environment experiment source guard selects the paired CI case",
+		"Windows packed runner entrypoint guard distinguishes imports, aliases, and unresolved entries",
+	]) assert.ok(workflow.includes(title));
+	assert.doesNotMatch(workflow, /node scripts\\test-packed-runner\.mjs --windows-startup-timing\n/);
 });
 
 test("Windows bootstrap Add-Type failures use an owned bounded diagnostic", async () => {
