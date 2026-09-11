@@ -166,6 +166,7 @@ pi
 /gentle:sdd-preflight   Run or reuse the session SDD preflight explicitly.
 /gentle-sdd-init           Create or refresh openspec/config.yaml (openspec/both stores only).
 /gentle:models             Assign global model/effort routing to SDD/custom agents.
+/gentle:profiles           Create, switch, and manage global agent-model profiles.
 /gentle:persona            Switch between gentleman and neutral persona modes.
 /gentle:background-subagents  Show or set the managed background-subagents policy, with its deciding source.
 /gentle:review-mode          Show or set the receipt-driven development mode (status|enable|disable).
@@ -633,6 +634,59 @@ Config shape (per agent):
 
 Legacy string entries are still accepted and treated as `model`-only config.
 
+## Agent-model profiles
+
+```text
+/gentle:profiles
+```
+
+Profiles are named, switchable snapshots of the global agent-model routing from `/gentle:models`. The panel shows the profile list on the left and a detail pane comparing the selected profile's routing with the currently effective routing. Keys:
+
+| Key     | Action                                                                 |
+| ------- | ---------------------------------------------------------------------- |
+| `enter` | Apply the selected profile live (writes `models.json`, reconciles agents). |
+| `c`     | Create a new, empty profile.                                           |
+| `s`     | Update the selected profile from the current routing.                  |
+| `d`     | Duplicate the selected profile.                                        |
+| `r`     | Rename the selected profile (keeps it active if it was active).        |
+| `x`     | Delete the selected profile (refuses the active profile).              |
+| `e`     | Export the selected profile to `~/.pi/gentle-ai/profiles.export.json`. |
+| `i`     | Import a profile from `~/.pi/gentle-ai/profiles.export.json`.          |
+| `esc`   | Close.                                                                 |
+
+Applying a profile writes `~/.pi/gentle-ai/models.json`, then reconciles agent frontmatter and `subagents.json` the same way `/gentle:models` does. The reconciliation happens on the next subagent launch, and that launch still routes with the previous routing — expect one launch of lag after switching. The active profile is persisted so `/gentle:profiles` reopens with the applied profile marked.
+
+Profiles only cover per-agent routing for SDD/custom agents. The orchestrator model selected in `settings.json` is NOT part of a profile and is never changed by applying one.
+
+When `profiles.json` is missing, the command seeds one profile named `current` captured from the existing `models.json`, marked active only when `models.json` has routing entries. Profiles or routing entries dropped by normalization are named in a warning instead of being lost silently.
+
+Saved globally at:
+
+```text
+~/.pi/gentle-ai/profiles.json
+```
+
+Store shape:
+
+```json
+{
+  "kind": "gentle-pi.agent_model_profiles",
+  "version": 1,
+  "active": "deep-work",
+  "profiles": {
+    "deep-work": {
+      "sdd-design": {
+        "model": "anthropic/claude-sonnet-4",
+        "thinking": "high"
+      }
+    },
+    "current": {}
+  }
+}
+```
+
+The `profiles` values use the same per-agent shape as `models.json`. Profile names are slugs of 1-64 characters (letters, numbers, `.`, `_`, `-`, starting with a letter or number). Export and import use a single-profile envelope (`kind: "gentle-pi.agent_model_profile"`, `version: 1`) at `~/.pi/gentle-ai/profiles.export.json`.
+
 ## Gentle Shell
 
 Gentle Shell is the visual layer gentle-pi puts on top of pi. It follows the Gentle themes: one border language, champagne titles, rose for whatever is alive.
@@ -773,6 +827,7 @@ Set `GENTLE_PI_SHELL=0` to keep pi's built-in footer and editor.
 | `/gentle:doctor`              | Runs read-only diagnostics for SDD assets, model/persona config, memory tools, and safety guards. |
 | `/gentle:sdd-preflight`          | Runs or reuses the lazy SDD preflight for this Pi session.          |
 | `/gentle:models`                 | Opens global model + effort assignment UI. Press `x` to export and `r` to restore saved routing. |
+| `/gentle:profiles`               | Opens global agent-model profiles: apply live, create, update, duplicate, rename, delete, export, and import. |
 | `/gentle:persona`                | Switches global persona mode, with project override support.        |
 | `/gentle:background-subagents`   | Shows or sets the managed background-subagents policy (`status\|enable\|disable`), naming the source that decided it. |
 | `/gentle:telemetry`              | Shows or changes the local Gentle AI telemetry trigger (`status\|enable\|disable\|preview`).  |
