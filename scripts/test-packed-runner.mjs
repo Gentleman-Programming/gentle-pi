@@ -12,11 +12,16 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const MAX_NPM_OUTPUT_BYTES = 1024 * 1024;
 const MAX_UNHOOKED_REPORT_BYTES = 1024;
+const MAX_SDK_LIFECYCLE_CHILD_REPORT_BYTES = 2048;
 const UNHOOKED_STAGES = new Set(["pack", "pack-result", "install", "artifact-check", "import-probe", "post-import-check", "cleanup"]);
 const UNHOOKED_ERROR_CODES = new Set(["spawn-failed", "timed-out", "output-limit", "nonzero-exit", "invalid-result", "assertion-failed", "cleanup-failed", "unknown"]);
 const SDK_LIFECYCLE_STAGES = new Set(["pack", "pack-result", "install", "artifact-check", "lifecycle-probe", "lifecycle-result", "cleanup"]);
 const SDK_LIFECYCLE_ERROR_CODES = new Set(["spawn-failed", "timed-out", "unconfirmed-close", "output-limit", "nonzero-exit", "invalid-result", "assertion-failed", "cleanup-failed", "unknown"]);
 const SDK_LIFECYCLE_EXTENSION_ERROR_PHASES = new Set(["unobserved", "none", "startup", "shutdown"]);
+const SDK_LIFECYCLE_CHILD_STAGES = new Set(["bootstrap", "sdk-load", "jiti-load", "agents-module-load", "model-runtime", "services", "extensions-validate", "model-availability", "session-create", "session-bind", "presence-two", "dispose-first", "presence-one", "dispose-second", "presence-none", "cleanup"]);
+const SDK_LIFECYCLE_CHILD_CHECK_IDS = new Set(["bootstrap-builtins", "bootstrap-agent-home", "bootstrap-directories", "sdk-import", "sdk-exports", "jiti-resolve", "jiti-import", "agents-module-import", "agents-module-export", "settings-untrusted", "settings-default-provider", "settings-default-model", "model-runtime-create", "services-create", "services-settings-manager", "services-project-trusted", "extensions-errors", "extensions-paths", "extensions-hooks", "services-diagnostics", "ambient-skills", "ambient-prompts", "ambient-themes", "ambient-context-files", "model-availability-empty", "session-create", "session-model-unbound", "session-bind", "session-bind-extension-errors", "session-model-bound", "session-ids-distinct", "presence-observer-create", "presence-two-records", "presence-first-model-unbound", "presence-second-model-unbound", "presence-two-extension-errors", "dispose-first", "dispose-first-extension-errors", "presence-one-record", "presence-one-model-unbound", "presence-one-extension-errors", "dispose-second", "dispose-second-extension-errors", "presence-no-records", "presence-none-extension-errors", "cleanup-runtime", "cleanup-observer", "cleanup-extension-errors"]);
+const SDK_LIFECYCLE_CHILD_ERROR_CODES = new Set(["assertion-failed", "load-failed", "timed-out", "cleanup-failed", "unknown"]);
+const SDK_LIFECYCLE_CHILD_CLEANUP_STATUSES = new Set(["complete", "failed"]);
 const SDK_LIFECYCLE_CHECK_IDS = new Set([
 	"not-attempted", "runner-hosted", "runner-temp", "temporary-root", "project-sdk-version", "pack-command", "pack-metadata", "pack-integrity", "install-command", "packed-assets", "native-artifacts", "sdk-manifest", "lifecycle-probe-command", "lifecycle-probe-result", "sdk-lifecycle-complete", "cleanup-owned-root-removal",
 ]);
@@ -41,7 +46,7 @@ function newUnhookedReceipt() {
 
 function newSdkLifecycleReceipt() {
 	return {
-		checkId: "not-attempted", packVerified: false, installCompleted: false, sdkLoaded: false,
+		checkId: "not-attempted", packVerified: false, installCompleted: false, childReceiptObserved: false, sdkLoaded: false,
 		extensionErrorCount: null, extensionErrorPhase: "unobserved", sessionsStarted: 0,
 		presenceAfterStart: 0, presenceAfterFirstDispose: 0, presenceAfterSecondDispose: 0,
 		disposedSessions: 0, cleanupCompleted: false,
@@ -107,11 +112,21 @@ class UnhookedFailure extends Error {
 }
 
 class SdkLifecycleFailure extends Error {
-	constructor(stage, code, exitStatus) {
+	constructor(stage, code, exitStatus, childReceipt) {
 		super("SDK lifecycle packed proof failed");
 		this.stage = SDK_LIFECYCLE_STAGES.has(stage) ? stage : "cleanup";
 		this.code = SDK_LIFECYCLE_ERROR_CODES.has(code) ? code : "unknown";
 		this.exitStatus = validExitStatus(exitStatus);
+		this.childStage = "unknown";
+		this.childCheckId = "unobserved";
+		this.childCleanupStatus = "unobserved";
+		this.childFailureCode = "unknown";
+		if (childReceipt !== undefined) {
+			this.childStage = childReceipt.stage;
+			this.childCheckId = childReceipt.checkId;
+			this.childCleanupStatus = childReceipt.cleanupStatus;
+			this.childFailureCode = childReceipt.childFailureCode;
+		}
 	}
 }
 
@@ -155,6 +170,7 @@ function reportSdkLifecycleReceipt(receipt, error) {
 		checkId: failure === undefined ? "sdk-lifecycle-complete" : receipt.checkId,
 		packVerified: receipt.packVerified,
 		installCompleted: receipt.installCompleted,
+		childReceiptObserved: receipt.childReceiptObserved,
 		sdkLoaded: receipt.sdkLoaded,
 		extensionErrorCount: receipt.extensionErrorCount,
 		extensionErrorPhase: receipt.extensionErrorPhase,
@@ -164,12 +180,12 @@ function reportSdkLifecycleReceipt(receipt, error) {
 		presenceAfterSecondDispose: receipt.presenceAfterSecondDispose,
 		disposedSessions: receipt.disposedSessions,
 		cleanupCompleted: receipt.cleanupCompleted,
-		...(failure === undefined ? {} : { stage: failure.stage, code: failure.code, ...(failure.exitStatus === undefined ? {} : { exitStatus: failure.exitStatus }) }),
+		...(failure === undefined ? {} : { stage: failure.stage, code: failure.code, childStage: failure.childStage, childCheckId: failure.childCheckId, childCleanupStatus: failure.childCleanupStatus, ...(failure.childFailureCode === undefined ? {} : { childFailureCode: failure.childFailureCode }), ...(failure.exitStatus === undefined ? {} : { exitStatus: failure.exitStatus }) }),
 	};
 	const line = JSON.stringify(report);
 	const boundedLine = Buffer.byteLength(line, "utf8") <= MAX_UNHOOKED_REPORT_BYTES
 		? line
-		: '{"mode":"sdk-lifecycle","status":"failed","checkId":"not-attempted","packVerified":false,"installCompleted":false,"sdkLoaded":false,"extensionErrorCount":null,"extensionErrorPhase":"unobserved","sessionsStarted":0,"presenceAfterStart":0,"presenceAfterFirstDispose":0,"presenceAfterSecondDispose":0,"disposedSessions":0,"cleanupCompleted":false,"stage":"cleanup","code":"unknown"}';
+		: '{"mode":"sdk-lifecycle","status":"failed","checkId":"not-attempted","packVerified":false,"installCompleted":false,"childReceiptObserved":false,"sdkLoaded":false,"extensionErrorCount":null,"extensionErrorPhase":"unobserved","sessionsStarted":0,"presenceAfterStart":0,"presenceAfterFirstDispose":0,"presenceAfterSecondDispose":0,"disposedSessions":0,"cleanupCompleted":false,"stage":"cleanup","code":"unknown","childStage":"unknown","childCheckId":"unobserved","childCleanupStatus":"unobserved","childFailureCode":"unknown"}';
 	try { (failure === undefined ? process.stdout : process.stderr).write(`${boundedLine}\n`); } catch { /* Reporting cannot expose a raw secondary error. */ }
 	if (failure !== undefined) process.exitCode = failure.exitStatus ?? 1;
 }
@@ -231,6 +247,7 @@ function runBoundedSdkLifecycleProbe(arguments_, env, cwd) {
 		let settled = false;
 		let outputBytes = 0;
 		const stdout = [];
+		const stderr = [];
 		let timeout;
 		let forceKill;
 		let closeGrace;
@@ -299,7 +316,7 @@ function runBoundedSdkLifecycleProbe(arguments_, env, cwd) {
 			else if (destination !== undefined) destination.push(Buffer.from(chunk));
 		};
 		onStdout = (chunk) => collect(chunk, stdout);
-		onStderr = (chunk) => collect(chunk);
+		onStderr = (chunk) => collect(chunk, stderr);
 		onChildError = () => requestStop(new SdkLifecycleFailure("lifecycle-probe", "spawn-failed"));
 		onClose = (status) => {
 			if (settled) return;
@@ -307,11 +324,7 @@ function runBoundedSdkLifecycleProbe(arguments_, env, cwd) {
 				finish(stopFailure);
 				return;
 			}
-			if (status !== 0) {
-				finish(new SdkLifecycleFailure("lifecycle-probe", "nonzero-exit", status));
-				return;
-			}
-			finish(undefined, Buffer.concat(stdout).toString("utf8"));
+			finish(undefined, { status, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) });
 		};
 		child.stdout.on("data", onStdout);
 		child.stderr.on("data", onStderr);
@@ -527,89 +540,209 @@ process.stdout.write(JSON.stringify({ tools: registrations.tools.sort(), command
 `;
 }
 
+function isSdkLifecycleChildStageCheck(stage, checkId) {
+	const stageChecks = {
+		"bootstrap": ["bootstrap-builtins", "bootstrap-agent-home", "bootstrap-directories"],
+		"sdk-load": ["sdk-import", "sdk-exports"],
+		"jiti-load": ["jiti-resolve", "jiti-import"],
+		"agents-module-load": ["agents-module-import", "agents-module-export"],
+		"model-runtime": ["model-runtime-create"],
+		"services": ["settings-untrusted", "settings-default-provider", "settings-default-model", "services-create", "services-settings-manager", "services-project-trusted"],
+		"extensions-validate": ["extensions-errors", "extensions-paths", "extensions-hooks", "services-diagnostics", "ambient-skills", "ambient-prompts", "ambient-themes", "ambient-context-files"],
+		"model-availability": ["model-availability-empty"],
+		"session-create": ["session-create", "session-model-unbound"],
+		"session-bind": ["session-model-unbound", "session-bind", "session-bind-extension-errors", "session-model-bound", "session-ids-distinct"],
+		"presence-two": ["presence-observer-create", "presence-two-records", "presence-first-model-unbound", "presence-second-model-unbound", "presence-two-extension-errors"],
+		"dispose-first": ["dispose-first", "dispose-first-extension-errors"],
+		"presence-one": ["presence-one-record", "presence-one-model-unbound", "presence-one-extension-errors"],
+		"dispose-second": ["dispose-second", "dispose-second-extension-errors"],
+		"presence-none": ["presence-no-records", "presence-none-extension-errors"],
+		"cleanup": ["cleanup-runtime", "cleanup-observer", "cleanup-extension-errors"],
+	};
+	return SDK_LIFECYCLE_CHILD_STAGES.has(stage) && SDK_LIFECYCLE_CHILD_CHECK_IDS.has(checkId) && stageChecks[stage].includes(checkId);
+}
+
+function parseSdkLifecycleChildReceipt(stdout, stderr) {
+	if (!Buffer.isBuffer(stdout) || !Buffer.isBuffer(stderr) || stdout.length === 0 || stdout.length > MAX_SDK_LIFECYCLE_CHILD_REPORT_BYTES || stderr.length !== 0) return undefined;
+	let parsed;
+	try { parsed = JSON.parse(stdout.toString("utf8")); } catch { return undefined; }
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.getPrototypeOf(parsed) !== Object.prototype) return undefined;
+	const has = (key) => Object.prototype.hasOwnProperty.call(parsed, key);
+	const progressKeys = ["sdkLoaded", "extensionErrorCount", "extensionErrorPhase", "sessionsStarted", "presenceAfterStart", "presenceAfterFirstDispose", "presenceAfterSecondDispose", "disposedSessions"];
+	const baseKeys = ["status", "stage", "checkId", "cleanupStatus"];
+	if (!has("status") || !has("stage") || !has("checkId") || !has("cleanupStatus") || !SDK_LIFECYCLE_CHILD_STAGES.has(parsed.stage) || !SDK_LIFECYCLE_CHILD_CHECK_IDS.has(parsed.checkId) || !isSdkLifecycleChildStageCheck(parsed.stage, parsed.checkId) || !SDK_LIFECYCLE_CHILD_CLEANUP_STATUSES.has(parsed.cleanupStatus)) return undefined;
+	const allowed = new Set([...baseKeys, ...progressKeys, "code"]);
+	if (Object.keys(parsed).some((key) => !allowed.has(key))) return undefined;
+	if (parsed.status !== "complete" && parsed.status !== "failed") return undefined;
+	if (parsed.status === "complete") {
+		const completeKeys = new Set([...baseKeys, ...progressKeys]);
+		if (Object.keys(parsed).length !== completeKeys.size || Object.keys(parsed).some((key) => !completeKeys.has(key)) || parsed.stage !== "presence-none" || parsed.checkId !== "presence-none-extension-errors" || parsed.cleanupStatus !== "complete") return undefined;
+	} else if (!has("code") || !SDK_LIFECYCLE_CHILD_ERROR_CODES.has(parsed.code)) return undefined;
+	if (has("sdkLoaded") && parsed.sdkLoaded !== true) return undefined;
+	const extensionObserved = has("extensionErrorCount") || has("extensionErrorPhase");
+	if (extensionObserved && (!has("extensionErrorCount") || !has("extensionErrorPhase") || !Number.isInteger(parsed.extensionErrorCount) || parsed.extensionErrorCount < 0 || parsed.extensionErrorCount > 2 || !SDK_LIFECYCLE_EXTENSION_ERROR_PHASES.has(parsed.extensionErrorPhase) || parsed.extensionErrorPhase === "unobserved")) return undefined;
+	for (const key of ["sessionsStarted", "presenceAfterStart", "presenceAfterFirstDispose", "presenceAfterSecondDispose", "disposedSessions"]) {
+		if (has(key) && (!Number.isInteger(parsed[key]) || parsed[key] < 0 || parsed[key] > 2)) return undefined;
+	}
+	if (parsed.status === "complete" && (parsed.sdkLoaded !== true || parsed.extensionErrorCount !== 0 || parsed.extensionErrorPhase !== "none" || parsed.sessionsStarted !== 2 || parsed.presenceAfterStart !== 2 || parsed.presenceAfterFirstDispose !== 1 || parsed.presenceAfterSecondDispose !== 0 || parsed.disposedSessions !== 2)) return undefined;
+	const receipt = { status: parsed.status, stage: parsed.stage, checkId: parsed.checkId, cleanupStatus: parsed.cleanupStatus };
+	if (parsed.status === "failed") receipt.childFailureCode = parsed.code;
+	if (has("sdkLoaded")) receipt.sdkLoaded = true;
+	if (extensionObserved) {
+		receipt.extensionErrorCount = parsed.extensionErrorCount;
+		receipt.extensionErrorPhase = parsed.extensionErrorPhase;
+	}
+	for (const key of ["sessionsStarted", "presenceAfterStart", "presenceAfterFirstDispose", "presenceAfterSecondDispose", "disposedSessions"]) if (has(key)) receipt[key] = parsed[key];
+	return receipt;
+}
+
+function mergeSdkLifecycleChildProgress(receipt, childReceipt) {
+	receipt.childReceiptObserved = true;
+	if (childReceipt.sdkLoaded !== undefined) receipt.sdkLoaded = childReceipt.sdkLoaded;
+	if (childReceipt.extensionErrorCount !== undefined) {
+		receipt.extensionErrorCount = childReceipt.extensionErrorCount;
+		receipt.extensionErrorPhase = childReceipt.extensionErrorPhase;
+	}
+	if (childReceipt.sessionsStarted !== undefined) receipt.sessionsStarted = childReceipt.sessionsStarted;
+	if (childReceipt.presenceAfterStart !== undefined) receipt.presenceAfterStart = childReceipt.presenceAfterStart;
+	if (childReceipt.presenceAfterFirstDispose !== undefined) receipt.presenceAfterFirstDispose = childReceipt.presenceAfterFirstDispose;
+	if (childReceipt.presenceAfterSecondDispose !== undefined) receipt.presenceAfterSecondDispose = childReceipt.presenceAfterSecondDispose;
+	if (childReceipt.disposedSessions !== undefined) receipt.disposedSessions = childReceipt.disposedSessions;
+}
+
 function sdkLifecycleProbeSource(packageRoot, consumerPackageJson, sdkPackageJson) {
 	return `
-import assert from "node:assert/strict";
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
-import { createRequire } from "node:module";
-import { pathToFileURL } from "node:url";
-
-const receipt = {
-  sdkLoaded: false, extensionErrorCount: 0, extensionErrorPhase: "none", sessionsStarted: 0,
-  presenceAfterStart: 0, presenceAfterFirstDispose: 0, presenceAfterSecondDispose: 0, disposedSessions: 0,
-};
+const progress = {};
+let childStage = "bootstrap";
+let childCheckId = "bootstrap-builtins";
+let primaryFailure;
+let cleanupFailure;
+let completedCheckpoint;
+let cleanupStatus = "complete";
 let firstRuntime;
 let secondRuntime;
 let observer;
 let extensionErrorPhase = "startup";
 let extensionErrorCount = 0;
 let extensionErrorsActive = true;
-const recordExtensionError = () => {
-  if (!extensionErrorsActive) return;
-  extensionErrorCount = Math.min(2, extensionErrorCount + 1);
-  if (receipt.extensionErrorPhase === "none") receipt.extensionErrorPhase = extensionErrorPhase;
-  receipt.extensionErrorCount = extensionErrorCount;
+let extensionLifecycleObserved = false;
+let assert;
+let mkdirSync;
+let join;
+let createRequire;
+let pathToFileURL;
+const checkpoint = (stage, checkId) => { childStage = stage; childCheckId = checkId; };
+const recordCleanupFailure = (checkId) => {
+  cleanupStatus = "failed";
+  if (cleanupFailure === undefined) cleanupFailure = { stage: "cleanup", checkId, code: "cleanup-failed" };
 };
-const assertNoExtensionErrors = () => assert.equal(extensionErrorCount, 0, "packaged extension lifecycle error");
-const within = async (operation, milliseconds, label) => {
+const failureCode = (error, fallback = "assertion-failed") => error?.childReceiptCode === "timed-out" ? "timed-out" : error?.childReceiptCode === "load-failed" ? "load-failed" : fallback;
+const load = async (operation) => {
+  try { return await operation; } catch { throw { childReceiptCode: "load-failed" }; }
+};
+const within = async (operation, milliseconds) => {
   let timer;
   try {
     return await Promise.race([
       operation,
-      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(label)), milliseconds); }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject({ childReceiptCode: "timed-out" }), milliseconds); }),
     ]);
   } finally {
     if (timer) clearTimeout(timer);
   }
 };
-const disposeRuntime = async (runtime) => {
+const recordExtensionError = () => {
+  if (!extensionErrorsActive) return;
+  extensionLifecycleObserved = true;
+  extensionErrorCount = Math.min(2, extensionErrorCount + 1);
+  progress.extensionErrorCount = extensionErrorCount;
+  progress.extensionErrorPhase = extensionErrorPhase;
+};
+const assertNoExtensionErrors = () => assert.equal(extensionErrorCount, 0, "packaged extension lifecycle error");
+const confirmNoExtensionErrors = () => {
+  assertNoExtensionErrors();
+  if (!extensionLifecycleObserved) return;
+  progress.extensionErrorCount = 0;
+  progress.extensionErrorPhase = "none";
+};
+const disposeRuntime = async (runtime, extensionCheckId) => {
   if (!runtime) return;
   extensionErrorPhase = "shutdown";
-  await within(runtime.dispose(), 15000, "runtime teardown timed out");
-  assertNoExtensionErrors();
-  receipt.disposedSessions++;
+  await within(runtime.dispose(), 15000);
+  checkpoint(childStage, extensionCheckId);
+  confirmNoExtensionErrors();
+  progress.disposedSessions = (progress.disposedSessions ?? 0) + 1;
 };
 const bindRuntime = async (runtime) => {
+  checkpoint("session-bind", "session-model-unbound");
   assert.equal(runtime.session.model, undefined, "session must not select a model before binding");
+  checkpoint("session-bind", "session-bind");
   extensionErrorPhase = "startup";
-  await within(runtime.session.bindExtensions({ mode: "json", onError: recordExtensionError }), 30000, "session binding timed out");
-  assertNoExtensionErrors();
+  extensionLifecycleObserved = true;
+  await within(runtime.session.bindExtensions({ mode: "json", onError: recordExtensionError }), 30000);
+  checkpoint("session-bind", "session-bind-extension-errors");
+  confirmNoExtensionErrors();
+  checkpoint("session-bind", "session-model-bound");
   assert.equal(runtime.session.model, undefined, "session must remain model-free after JSON lifecycle startup");
-  receipt.sessionsStarted++;
+  progress.sessionsStarted = (progress.sessionsStarted ?? 0) + 1;
 };
 try {
-  const sdk = await within(import("@earendil-works/pi-coding-agent"), 30000, "SDK load timed out");
-  receipt.sdkLoaded = true;
-  const { createAgentSessionFromServices, createAgentSessionRuntime, createAgentSessionServices, ModelRuntime, SessionManager, SettingsManager } = sdk;
+  checkpoint("bootstrap", "bootstrap-builtins");
+  const [assertModule, fsModule, pathModule, moduleModule, urlModule] = await load(Promise.all([import("node:assert/strict"), import("node:fs"), import("node:path"), import("node:module"), import("node:url")]));
+  assert = assertModule.default;
+  ({ mkdirSync } = fsModule);
+  ({ join } = pathModule);
+  ({ createRequire } = moduleModule);
+  ({ pathToFileURL } = urlModule);
+  checkpoint("bootstrap", "bootstrap-agent-home");
   const agentHome = process.env.GENTLE_PI_AGENT_HOME;
   assert.equal(typeof agentHome, "string");
+  checkpoint("bootstrap", "bootstrap-directories");
   const probeRoot = join(process.cwd(), "sdk-lifecycle-probe");
   const cwd = join(probeRoot, "cwd");
   const sessionRoot = join(probeRoot, "sessions");
   const modelRoot = join(probeRoot, "model-runtime");
   for (const path of [probeRoot, cwd, sessionRoot, modelRoot, agentHome, join(agentHome, "gentle-agents")]) mkdirSync(path, { recursive: true });
+  checkpoint("sdk-load", "sdk-import");
+  const sdk = await within(load(import("@earendil-works/pi-coding-agent")), 30000);
+  progress.sdkLoaded = true;
+  checkpoint("sdk-load", "sdk-exports");
+  const { createAgentSessionFromServices, createAgentSessionRuntime, createAgentSessionServices, ModelRuntime, SessionManager, SettingsManager } = sdk;
+  for (const value of [createAgentSessionFromServices, createAgentSessionRuntime, createAgentSessionServices, ModelRuntime, SessionManager, SettingsManager]) assert.equal(typeof value, "function", "SDK lifecycle export is unavailable");
+  checkpoint("jiti-load", "jiti-resolve");
   const requireFromSdk = createRequire(pathToFileURL(${JSON.stringify(sdkPackageJson)}).href);
-  const { createJiti } = await import(pathToFileURL(requireFromSdk.resolve("jiti/static")).href);
+  const jitiStaticEntry = requireFromSdk.resolve("jiti/static");
+  checkpoint("jiti-load", "jiti-import");
+  const { createJiti } = await within(load(import(pathToFileURL(jitiStaticEntry).href)), 30000);
+  assert.equal(typeof createJiti, "function", "Jiti static export is unavailable");
   const jiti = createJiti(pathToFileURL(${JSON.stringify(consumerPackageJson)}).href, { moduleCache: false });
   const agentsExtensionPath = join(${JSON.stringify(packageRoot)}, "extensions", "gentle-agents.ts");
   const gentleAiExtensionPath = join(${JSON.stringify(packageRoot)}, "extensions", "gentle-ai.ts");
-  const { createDefaultSessionTransport } = await jiti.import(pathToFileURL(agentsExtensionPath).href);
+  checkpoint("agents-module-load", "agents-module-import");
+  const { createDefaultSessionTransport } = await within(load(jiti.import(pathToFileURL(agentsExtensionPath).href)), 30000);
+  checkpoint("agents-module-load", "agents-module-export");
+  assert.equal(typeof createDefaultSessionTransport, "function", "packaged agents transport export is unavailable");
   const expectedExtensionPaths = [agentsExtensionPath, gentleAiExtensionPath];
+  checkpoint("services", "settings-untrusted");
   const settingsManager = SettingsManager.inMemory({}, { projectTrusted: false });
   assert.equal(settingsManager.isProjectTrusted(), false, "in-memory settings must keep project discovery untrusted");
+  checkpoint("services", "settings-default-provider");
   assert.equal(settingsManager.getDefaultProvider(), undefined, "in-memory settings must have no default provider");
+  checkpoint("services", "settings-default-model");
   assert.equal(settingsManager.getDefaultModel(), undefined, "in-memory settings must have no default model");
   const createRuntime = (name) => async ({ cwd: runtimeCwd, sessionManager, sessionStartEvent }) => {
+    checkpoint("session-create", "session-create");
+    assert.equal(sessionManager.getEntries().length, 0, "new SDK session must not restore prior entries");
+    checkpoint("model-runtime", "model-runtime-create");
     const runtimeRoot = join(modelRoot, name);
     mkdirSync(runtimeRoot, { recursive: true });
-    assert.equal(sessionManager.getEntries().length, 0, "new SDK session must not restore prior entries");
     const modelRuntime = await within(ModelRuntime.create({
       authPath: join(runtimeRoot, "auth.json"),
       modelsPath: join(runtimeRoot, "models.json"),
       modelsStorePath: join(runtimeRoot, "models-store.json"),
       refreshOnCreate: false,
-    }), 30000, "model runtime startup timed out");
+    }), 30000);
+    checkpoint("services", "services-create");
     const services = await within(createAgentSessionServices({
       cwd: runtimeCwd,
       agentDir: agentHome,
@@ -623,68 +756,114 @@ try {
         noThemes: true,
         noContextFiles: true,
       },
-    }), 30000, "session services startup timed out");
+    }), 30000);
+    checkpoint("services", "services-settings-manager");
     assert.strictEqual(services.settingsManager, settingsManager, "services must retain the shared untrusted settings manager");
+    checkpoint("services", "services-project-trusted");
     assert.equal(services.settingsManager.isProjectTrusted(), false, "services must keep project discovery untrusted");
+    checkpoint("extensions-validate", "extensions-errors");
     const loaded = services.resourceLoader.getExtensions();
     assert.equal(loaded.errors.length, 0, "packaged extension load must not report errors");
+    checkpoint("extensions-validate", "extensions-paths");
     assert.deepEqual(loaded.extensions.map((extension) => extension.resolvedPath), expectedExtensionPaths, "only the two packaged extensions may load");
+    checkpoint("extensions-validate", "extensions-hooks");
     assert.deepEqual(loaded.extensions.map((extension) => extension.handlers.has("session_start") && extension.handlers.has("session_shutdown")), [true, true], "both packaged extensions must expose lifecycle hooks");
+    checkpoint("extensions-validate", "services-diagnostics");
     assert.equal(services.diagnostics.length, 0, "packaged extension service setup must not report errors");
+    checkpoint("extensions-validate", "ambient-skills");
     assert.deepEqual(services.resourceLoader.getSkills().skills, [], "ambient skills must stay disabled");
+    checkpoint("extensions-validate", "ambient-prompts");
     assert.deepEqual(services.resourceLoader.getPrompts().prompts, [], "ambient prompts must stay disabled");
+    checkpoint("extensions-validate", "ambient-themes");
     assert.deepEqual(services.resourceLoader.getThemes().themes, [], "ambient themes must stay disabled");
+    checkpoint("extensions-validate", "ambient-context-files");
     assert.deepEqual(services.resourceLoader.getAgentsFiles().agentsFiles, [], "ambient context files must stay disabled");
+    checkpoint("model-availability", "model-availability-empty");
     assert.equal(modelRuntime.getAvailableSnapshot().length, 0, "owned empty auth and model paths must expose no available models");
-    const created = await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent, noTools: "all" });
+    checkpoint("session-create", "session-create");
+    const created = await within(createAgentSessionFromServices({ services, sessionManager, sessionStartEvent, noTools: "all" }), 30000);
+    checkpoint("session-create", "session-model-unbound");
     assert.equal(created.session.model, undefined, "SDK must not select a model from an empty availability snapshot");
     return { ...created, services, diagnostics: services.diagnostics };
   };
+  checkpoint("session-create", "session-create");
   firstRuntime = await within(createAgentSessionRuntime(createRuntime("first"), {
     cwd,
     agentDir: agentHome,
     sessionManager: SessionManager.create(cwd, join(sessionRoot, "first")),
-  }), 30000, "first runtime startup timed out");
+  }), 30000);
   await bindRuntime(firstRuntime);
+  checkpoint("session-create", "session-create");
   secondRuntime = await within(createAgentSessionRuntime(createRuntime("second"), {
     cwd,
     agentDir: agentHome,
     sessionManager: SessionManager.create(cwd, join(sessionRoot, "second")),
-  }), 30000, "second runtime startup timed out");
+  }), 30000);
   await bindRuntime(secondRuntime);
+  checkpoint("session-bind", "session-ids-distinct");
   const firstId = firstRuntime.session.sessionId;
   const secondId = secondRuntime.session.sessionId;
   assert.notEqual(firstId, secondId, "SDK must create distinct real session IDs");
-  observer = await within(createDefaultSessionTransport().createRegistry(agentHome), 30000, "presence observer startup timed out");
-  const started = await within(observer.listActivations(), 30000, "presence observation timed out");
+  checkpoint("presence-two", "presence-observer-create");
+  observer = await within(createDefaultSessionTransport().createRegistry(agentHome), 30000);
+  checkpoint("presence-two", "presence-two-records");
+  const started = await within(observer.listActivations(), 30000);
   assert.deepEqual(started.map((record) => record.sessionId).sort(), [firstId, secondId].sort(), "default transport must advertise both SDK sessions");
-  receipt.presenceAfterStart = started.length;
+  progress.presenceAfterStart = started.length;
+  checkpoint("presence-two", "presence-first-model-unbound");
   assert.equal(firstRuntime.session.model, undefined, "first session must remain model-free through presence lifecycle");
+  checkpoint("presence-two", "presence-second-model-unbound");
   assert.equal(secondRuntime.session.model, undefined, "second session must remain model-free through presence lifecycle");
-  assertNoExtensionErrors();
-  await disposeRuntime(firstRuntime);
+  checkpoint("presence-two", "presence-two-extension-errors");
+  confirmNoExtensionErrors();
+  checkpoint("dispose-first", "dispose-first");
+  await disposeRuntime(firstRuntime, "dispose-first-extension-errors");
   firstRuntime = undefined;
-  const afterFirstDispose = await within(observer.listActivations(), 30000, "first withdrawal observation timed out");
+  checkpoint("presence-one", "presence-one-record");
+  const afterFirstDispose = await within(observer.listActivations(), 30000);
   assert.deepEqual(afterFirstDispose.map((record) => record.sessionId), [secondId], "disposing one runtime must withdraw only its presence");
-  receipt.presenceAfterFirstDispose = afterFirstDispose.length;
+  progress.presenceAfterFirstDispose = afterFirstDispose.length;
+  checkpoint("presence-one", "presence-one-model-unbound");
   assert.equal(secondRuntime.session.model, undefined, "surviving session must remain model-free after peer withdrawal");
-  assertNoExtensionErrors();
-  await disposeRuntime(secondRuntime);
+  checkpoint("presence-one", "presence-one-extension-errors");
+  confirmNoExtensionErrors();
+  checkpoint("dispose-second", "dispose-second");
+  await disposeRuntime(secondRuntime, "dispose-second-extension-errors");
   secondRuntime = undefined;
-  const afterSecondDispose = await within(observer.listActivations(), 30000, "second withdrawal observation timed out");
+  checkpoint("presence-none", "presence-no-records");
+  const afterSecondDispose = await within(observer.listActivations(), 30000);
   assert.deepEqual(afterSecondDispose, [], "disposing both runtimes must withdraw both presence records");
-  receipt.presenceAfterSecondDispose = afterSecondDispose.length;
-  assertNoExtensionErrors();
+  progress.presenceAfterSecondDispose = afterSecondDispose.length;
+  checkpoint("presence-none", "presence-none-extension-errors");
+  confirmNoExtensionErrors();
+  completedCheckpoint = { stage: childStage, checkId: childCheckId };
+} catch (error) {
+  primaryFailure = { stage: childStage, checkId: childCheckId, code: failureCode(error) };
 } finally {
-  let cleanupError;
-  try { await disposeRuntime(firstRuntime); } catch { cleanupError = new Error("first runtime cleanup failed"); }
-  try { await disposeRuntime(secondRuntime); } catch { cleanupError = new Error("second runtime cleanup failed"); }
-  try { await within(Promise.resolve(observer?.close?.()), 15000, "presence observer teardown timed out"); } catch { cleanupError = new Error("presence observer cleanup failed"); }
-  try { assertNoExtensionErrors(); } catch { cleanupError = new Error("packaged extension lifecycle error"); }
+  checkpoint("cleanup", "cleanup-runtime");
+  try { await disposeRuntime(firstRuntime, "cleanup-runtime"); } catch { recordCleanupFailure("cleanup-runtime"); }
+  try { await disposeRuntime(secondRuntime, "cleanup-runtime"); } catch { recordCleanupFailure("cleanup-runtime"); }
+  checkpoint("cleanup", "cleanup-observer");
+  try { await within(Promise.resolve(observer?.close?.()), 15000); } catch { recordCleanupFailure("cleanup-observer"); }
+  checkpoint("cleanup", "cleanup-extension-errors");
+  try { assertNoExtensionErrors(); } catch { recordCleanupFailure("cleanup-extension-errors"); }
   extensionErrorsActive = false;
-  if (cleanupError) throw cleanupError;
+  if (primaryFailure === undefined && cleanupFailure !== undefined) primaryFailure = cleanupFailure;
 }
-process.stdout.write(JSON.stringify(receipt));
+const report = {
+  status: primaryFailure === undefined ? "complete" : "failed",
+  stage: primaryFailure?.stage ?? completedCheckpoint?.stage ?? childStage,
+  checkId: primaryFailure?.checkId ?? completedCheckpoint?.checkId ?? childCheckId,
+  cleanupStatus,
+  ...progress,
+  ...(primaryFailure === undefined ? {} : { code: primaryFailure.code }),
+};
+const line = JSON.stringify(report);
+const boundedLine = Buffer.byteLength(line, "utf8") <= ${MAX_SDK_LIFECYCLE_CHILD_REPORT_BYTES}
+  ? line
+  : '{"status":"failed","stage":"cleanup","checkId":"cleanup-runtime","cleanupStatus":"failed","code":"unknown"}';
+try { process.stdout.write(boundedLine); } catch { process.exitCode = 1; }
+if (boundedLine !== line || primaryFailure !== undefined) process.exitCode = 1;
 `;
 }
 
@@ -738,16 +917,11 @@ async function testSdkLifecyclePackedSession() {
 		const probe = await runBoundedSdkLifecycleProbe(["--input-type=module", "--eval", sdkLifecycleProbeSource(packageRoot, join(consumerDirectory, "package.json"), sdkPackageJson)], env, consumerDirectory);
 		stage = "lifecycle-result";
 		selectSdkLifecycleCheck(receipt, "lifecycle-probe-result");
-		const lifecycle = safeJson(probe, "SDK lifecycle probe output");
-		if (!lifecycle || typeof lifecycle !== "object" || lifecycle.sdkLoaded !== true || !SDK_LIFECYCLE_EXTENSION_ERROR_PHASES.has(lifecycle.extensionErrorPhase) || lifecycle.extensionErrorCount !== 0 || lifecycle.extensionErrorPhase !== "none" || lifecycle.sessionsStarted !== 2 || lifecycle.presenceAfterStart !== 2 || lifecycle.presenceAfterFirstDispose !== 1 || lifecycle.presenceAfterSecondDispose !== 0 || lifecycle.disposedSessions !== 2) throw new Error("SDK lifecycle probe returned an invalid receipt");
-		receipt.sdkLoaded = lifecycle.sdkLoaded;
-		receipt.extensionErrorCount = lifecycle.extensionErrorCount;
-		receipt.extensionErrorPhase = lifecycle.extensionErrorPhase;
-		receipt.sessionsStarted = lifecycle.sessionsStarted;
-		receipt.presenceAfterStart = lifecycle.presenceAfterStart;
-		receipt.presenceAfterFirstDispose = lifecycle.presenceAfterFirstDispose;
-		receipt.presenceAfterSecondDispose = lifecycle.presenceAfterSecondDispose;
-		receipt.disposedSessions = lifecycle.disposedSessions;
+		const lifecycle = parseSdkLifecycleChildReceipt(probe.stdout, probe.stderr);
+		if (lifecycle === undefined) throw new Error("SDK lifecycle probe returned an invalid receipt");
+		mergeSdkLifecycleChildProgress(receipt, lifecycle);
+		if (probe.status !== 0) throw new SdkLifecycleFailure("lifecycle-probe", "nonzero-exit", probe.status, lifecycle);
+		if (lifecycle.status !== "complete") throw new SdkLifecycleFailure("lifecycle-probe", "nonzero-exit", undefined, lifecycle);
 		selectSdkLifecycleCheck(receipt, "sdk-lifecycle-complete");
 	} catch (error) {
 		if (error instanceof SdkLifecycleFailure) failure = error;
