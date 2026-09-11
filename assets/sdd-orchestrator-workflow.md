@@ -41,7 +41,7 @@ Rules:
 
 ## Bounded Planning Routing
 
-For authoritative native status, route only by the bounded `nextRecommended` token and dependency states; never infer a route from prose. Keep human diagnostics in `blockedReasons`, not in `nextRecommended`, and report them without discarding them to enable a route.
+For authoritative native status, route only by the bounded `nextRecommended` token and dependency states; never infer a route from prose. Keep genuine blockers in `blockedReasons` and non-blocking diagnostics in `notes`, never in `nextRecommended`, and report them without discarding them to enable a route.
 
 | `nextRecommended` | Planning route |
 | --- | --- |
@@ -74,7 +74,7 @@ Execution routes accept the native Gentle AI v2 tokens and Gentle Pi's local `sd
 | `sdd-archive` | `sdd-archive` |
 | `sdd-sync` | `sdd-sync` |
 
-For non-planning phases, stop when that phase's dependency is `blocked`. When `nextRecommended` is `blocked` or `resolve-blockers`, report `blockedReasons` and stop. Unknown tokens, including native `remediate`, do not authorize a launch until Pi has an explicit typed remediation transport and executor contract. Non-empty `blockedReasons` forbid apply, sync, and archive work; `verify` or `sdd-verify` may run only when the verify dependency permits it. This alias table does not bypass preflight, selection, action-context, or runtime-attempt authority. The non-authoritative `resolve-via-engram` store carve-out remains separate and does not bypass those gates.
+For non-planning phases, stop when that phase's dependency is `blocked`. When `nextRecommended` is `blocked` or `resolve-blockers`, report `blockedReasons` and stop. Unknown tokens, including native `remediate`, do not authorize a launch until Pi has an explicit typed remediation transport and executor contract. Non-empty `blockedReasons` forbid apply, sync, and archive work; `verify` or `sdd-verify` may run only when the verify dependency permits it. This alias table does not bypass preflight, selection, action-context, or runtime-attempt authority. The non-authoritative `resolve-via-engram` store carve-out remains separate and does not bypass those gates. `notes` is separate from `blockedReasons` and never gates: a non-empty `notes` never withholds apply, sync, archive, or a terminal route, so report it as informational and proceed when the dependency and `blockedReasons` gates allow.
 
 ## SDD Status Contract
 

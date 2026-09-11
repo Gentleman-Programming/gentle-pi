@@ -37,6 +37,7 @@ for (const [index, path] of routingPaths.entries()) {
 			"When `nextRecommended` is `blocked` or `resolve-blockers`, report `blockedReasons` and stop",
 			"Unknown tokens, including native `remediate`, do not authorize a launch until Pi has an explicit typed remediation transport and executor contract",
 			"Non-empty `blockedReasons` forbid apply, sync, and archive work",
+			"`notes` is separate from `blockedReasons` and never gates",
 			"does not bypass preflight, selection, action-context, or runtime-attempt authority",
 			"store carve-out remains separate and does not bypass those gates",
 		]) {
