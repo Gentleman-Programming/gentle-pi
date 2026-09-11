@@ -5,6 +5,7 @@
 # at c59e1598 (NtCreateFile rooted opens, GetSecurityInfo, and ABI layout).
 # API provenance: NtCreateFile / OBJECT_ATTRIBUTES / NtQueryDirectoryFile are
 # documented by Microsoft Win32/WDK; this helper has no external binary dependency.
+[Console]::Out.WriteLine('{"event":"startup-marker","marker":"script-entered"}')
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $maxControlBytes = 16384
@@ -662,6 +663,9 @@ public static class WindowsSessionBootstrap {
 } catch {
 	$nativeReady = $false
 	Write-BootstrapDiagnostic (@($addTypeErrors) + @($_))
+}
+if ($nativeReady) {
+	[WindowsSessionBootstrap]::WriteControl('{"event":"startup-marker","marker":"native-ready"}')
 }
 
 function Write-BootstrapRejectionDiagnostic([BootstrapFailure]$failure) {

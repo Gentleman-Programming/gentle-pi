@@ -23,6 +23,7 @@ const SDK_LIFECYCLE_WINDOWS_OBSERVATION_PROVENANCE = new Set(["not-applicable", 
 const SDK_LIFECYCLE_WINDOWS_OBSERVATION_RESTORATION = new Set(["not-applicable", "not-required", "not-attempted"]);
 const SDK_LIFECYCLE_WINDOWS_OBSERVATION_PHASES = new Set(["start", "initialize", "cleanup"]);
 const SDK_LIFECYCLE_WINDOWS_OBSERVATION_FAILURE_CLASSES = new Set(["timed-out", "rejected", "unknown"]);
+const SDK_LIFECYCLE_WINDOWS_STARTUP_MARKERS = new Set(["script-entered", "native-ready"]);
 // This is the complete source-defined diagnostic vocabulary. The receipt never accepts
 // a native error code, message, property, or process output as rejection evidence.
 const SDK_LIFECYCLE_WINDOWS_OBSERVATION_ERROR_CODES = new Set(["spawn", "stream", "process", "exit", "write", "deadline", "protocol", "start-reply", "stopped", "unwritable", "unknown"]);
@@ -603,11 +604,12 @@ function isSdkLifecycleChildStageCheck(stage, checkId) {
 function parseWindowsRegistryObservation(value) {
 	if (value === null) return null;
 	if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) return undefined;
-	const keys = ["availability", "provenance", "restoration", "startCalls", "initializeCalls", "cleanupCalls", "firstFailurePhase", "firstFailureClass", "firstFailureCode"];
+	const keys = ["availability", "provenance", "restoration", "startCalls", "initializeCalls", "cleanupCalls", "firstFailurePhase", "firstFailureClass", "firstFailureCode", "lastStartupMarker"];
 	if (Object.keys(value).length !== keys.length || keys.some((key) => !Object.prototype.hasOwnProperty.call(value, key))) return undefined;
 	const observation = value;
+	if (observation.lastStartupMarker !== null && !SDK_LIFECYCLE_WINDOWS_STARTUP_MARKERS.has(observation.lastStartupMarker)) return undefined;
 	if (!SDK_LIFECYCLE_WINDOWS_OBSERVATION_AVAILABILITY.has(observation.availability) || !SDK_LIFECYCLE_WINDOWS_OBSERVATION_PROVENANCE.has(observation.provenance) || !SDK_LIFECYCLE_WINDOWS_OBSERVATION_RESTORATION.has(observation.restoration)) return undefined;
-	const nullDetails = ["startCalls", "initializeCalls", "cleanupCalls", "firstFailurePhase", "firstFailureClass", "firstFailureCode"];
+	const nullDetails = ["startCalls", "initializeCalls", "cleanupCalls", "firstFailurePhase", "firstFailureClass", "firstFailureCode", "lastStartupMarker"];
 	if (observation.availability !== "observed") {
 		if ((observation.availability === "not-applicable" && (observation.provenance !== "not-applicable" || observation.restoration !== "not-applicable")) || (observation.availability === "unavailable" && (!["unavailable", "ambiguous"].includes(observation.provenance) || !["not-required", "not-attempted"].includes(observation.restoration))) || nullDetails.some((key) => observation[key] !== null)) return undefined;
 		return Object.freeze({ ...observation });
@@ -645,7 +647,7 @@ function parseSdkLifecycleChildReceipt(stdout, stderr) {
 	if (parsed.status === "failed" && parsed.code === "forbidden-model-invocation" && (!invocationObserved || parsed.modelInvocationCount === 0)) return undefined;
 	const windowsRegistryObservation = has("windowsRegistryObservation") ? parseWindowsRegistryObservation(parsed.windowsRegistryObservation) : undefined;
 	if (has("windowsRegistryObservation") && windowsRegistryObservation === undefined) return undefined;
-	if (parsed.status === "complete" && (windowsRegistryObservation === undefined || windowsRegistryObservation === null || !((windowsRegistryObservation.availability === "not-applicable" && windowsRegistryObservation.restoration === "not-applicable") || (windowsRegistryObservation.availability === "observed" && windowsRegistryObservation.provenance === "owned-instance" && windowsRegistryObservation.restoration === "not-required" && windowsRegistryObservation.startCalls === 1 && windowsRegistryObservation.initializeCalls === 1 && windowsRegistryObservation.cleanupCalls === 1 && windowsRegistryObservation.firstFailurePhase === null && windowsRegistryObservation.firstFailureClass === null && windowsRegistryObservation.firstFailureCode === null)))) return undefined;
+	if (parsed.status === "complete" && (windowsRegistryObservation === undefined || windowsRegistryObservation === null || !((windowsRegistryObservation.availability === "not-applicable" && windowsRegistryObservation.restoration === "not-applicable") || (windowsRegistryObservation.availability === "observed" && windowsRegistryObservation.provenance === "owned-instance" && windowsRegistryObservation.restoration === "not-required" && windowsRegistryObservation.startCalls === 1 && windowsRegistryObservation.initializeCalls === 1 && windowsRegistryObservation.cleanupCalls === 1 && windowsRegistryObservation.firstFailurePhase === null && windowsRegistryObservation.firstFailureClass === null && windowsRegistryObservation.firstFailureCode === null && windowsRegistryObservation.lastStartupMarker === "native-ready")))) return undefined;
 	for (const key of ["sessionsStarted", "presenceAfterStart", "presenceAfterFirstDispose", "presenceAfterSecondDispose", "disposedSessions"]) {
 		if (has(key) && (!Number.isInteger(parsed[key]) || parsed[key] < 0 || parsed[key] > 2)) return undefined;
 	}
@@ -731,7 +733,7 @@ const within = async (operation, milliseconds) => {
     if (timer) clearTimeout(timer);
   }
 };
-const newWindowsRegistryObservation = (availability, provenance, restoration) => ({ availability, provenance, restoration, startCalls: null, initializeCalls: null, cleanupCalls: null, firstFailurePhase: null, firstFailureClass: null, firstFailureCode: null });
+const newWindowsRegistryObservation = (availability, provenance, restoration) => ({ availability, provenance, restoration, startCalls: null, initializeCalls: null, cleanupCalls: null, firstFailurePhase: null, firstFailureClass: null, firstFailureCode: null, lastStartupMarker: null });
     const createWindowsRegistryObservation = (PhaseSequence) => {
       if (process.platform === "win32") return new PhaseSequence();
       return { observe() { return undefined; }, startupSucceeded: true, cleanupComplete: true, admitsFullSuccess: true, snapshot: () => newWindowsRegistryObservation("not-applicable", "not-applicable", "not-applicable") };

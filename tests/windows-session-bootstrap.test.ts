@@ -193,12 +193,82 @@ async function runBootstrapStartupControl(options: Readonly<{ spawnProcess?: (..
 	return { code: lifecycle.exitCode, stdout, stderr, outputOverflow };
 }
 
-function parseStartupControlFrames(stdout: string): readonly ReturnType<typeof parseWindowsHostFrame>[] {
-	if (!stdout.endsWith("\n")) throw new Error("Windows bootstrap startup control returned malformed protocol output");
-	const lines = stdout.slice(0, -1).split("\n");
-	if (lines.length !== 2 || lines.some((line) => line.length === 0)) throw new Error("Windows bootstrap startup control returned malformed protocol output");
-	try { return lines.map(parseWindowsHostFrame); } catch { throw new Error("Windows bootstrap startup control returned malformed protocol output"); }
+type StartupMarker = "script-entered" | "native-ready";
+const maxHelperControlBytes = 16_384;
+
+class HelperControlStream {
+	private markerOrdinal = 0;
+	private startReplySeen = false;
+	private readonly requireStartupMarkers: boolean;
+	private readonly errorMessage: string;
+	constructor(requireStartupMarkers: boolean, errorMessage: string) {
+		this.requireStartupMarkers = requireStartupMarkers;
+		this.errorMessage = errorMessage;
+	}
+	push(rawLine: string): ReturnType<typeof parseWindowsHostFrame> | undefined {
+		const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+		if (Buffer.byteLength(line, "utf8") > maxHelperControlBytes) throw new Error(this.errorMessage);
+		const marker = this.startupMarker(line);
+		if (marker !== undefined) {
+			const expected = this.markerOrdinal === 0 ? "script-entered" : this.markerOrdinal === 1 ? "native-ready" : undefined;
+			if (this.startReplySeen || marker !== expected) throw new Error(this.errorMessage);
+			this.markerOrdinal++;
+			return undefined;
+		}
+		let reply: ReturnType<typeof parseWindowsHostFrame>;
+		try { reply = parseWindowsHostFrame(line); } catch { throw new Error(this.errorMessage); }
+		if (!this.startReplySeen) {
+			if (reply.requestId !== "start-1" || (this.requireStartupMarkers && this.markerOrdinal !== 2) || (!this.requireStartupMarkers && this.markerOrdinal === 1)) throw new Error(this.errorMessage);
+			this.startReplySeen = true;
+		}
+		return reply;
+	}
+	assertStartupComplete() {
+		if (!this.startReplySeen || (this.requireStartupMarkers && this.markerOrdinal !== 2)) throw new Error(this.errorMessage);
+	}
+	private startupMarker(line: string): StartupMarker | undefined {
+		let value: unknown;
+		try { value = JSON.parse(line); } catch { return undefined; }
+		if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype || (value as Record<string, unknown>).event !== "startup-marker") return undefined;
+		const marker = value as Record<string, unknown>;
+		if (Object.keys(marker).length === 2 && marker.marker === "script-entered" && line === '{"event":"startup-marker","marker":"script-entered"}') return "script-entered";
+		if (Object.keys(marker).length === 2 && marker.marker === "native-ready" && line === '{"event":"startup-marker","marker":"native-ready"}') return "native-ready";
+		throw new Error(this.errorMessage);
+	}
 }
+
+function parseHelperControlOutput(stdout: string, requireStartupMarkers: boolean, errorMessage: string): readonly ReturnType<typeof parseWindowsHostFrame>[] {
+	if (!stdout.endsWith("\n")) throw new Error(errorMessage);
+	const stream = new HelperControlStream(requireStartupMarkers, errorMessage);
+	const frames: ReturnType<typeof parseWindowsHostFrame>[] = [];
+	for (const line of stdout.slice(0, -1).split("\n")) {
+		if (line.length === 0) throw new Error(errorMessage);
+		const frame = stream.push(line);
+		if (frame !== undefined) frames.push(frame);
+	}
+	stream.assertStartupComplete();
+	return frames;
+}
+
+function parseStartupControlFrames(stdout: string): readonly ReturnType<typeof parseWindowsHostFrame>[] {
+	return parseHelperControlOutput(stdout, true, "Windows bootstrap startup control returned malformed protocol output");
+}
+
+test("Windows helper control stream enforces fixed marker framing and order", () => {
+	const start = '{"requestId":"start-1","ok":true,"result":{"state":"partial"}}';
+	const shutdown = '{"requestId":"shutdown-2","ok":true,"result":{"state":"partial"}}';
+	const entered = '{"event":"startup-marker","marker":"script-entered"}';
+	const ready = '{"event":"startup-marker","marker":"native-ready"}';
+	assert.deepEqual(parseHelperControlOutput(`${entered}\r\n${ready}\n${start}\r\n${shutdown}\n`, true, "invalid helper control stream").map((frame) => frame.requestId), ["start-1", "shutdown-2"]);
+	assert.deepEqual(parseHelperControlOutput(`${start}\n${shutdown}\n`, false, "invalid helper control stream").map((frame) => frame.requestId), ["start-1", "shutdown-2"], "explicit fixture compatibility permits an uninstrumented helper");
+	for (const stream of [
+		`${ready}\n${start}\n`,
+		`${entered}\n${entered}\n${start}\n`,
+		`${entered}\n${start}\n`,
+		`${entered} \n${ready}\n${start}\n`,
+		`${entered}\n{"event":"startup-marker","marker":"unknown"}\n${start}\n`,
+	]) assert.throws(() => parseHelperControlOutput(stream, true, "invalid helper control stream"), /invalid helper control stream/);
+});
 
 async function runPowerShell(script: string, args: string[], input = "", options: Readonly<{ spawnProcess?: (...args: any[]) => CleanupChild }> = {}): Promise<{ code: number; stdout: string; stderr: string; stderrOverflow: boolean }> {
 	const child = (options.spawnProcess ?? spawn)(FIXED_WINDOWS_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", script, ...args], { shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }) as CleanupChild;
@@ -221,7 +291,22 @@ async function openInitializedHelper(agentHome: string, options: Readonly<{ diag
 	const lifecycle = observeChildLifecycle(child);
 	const deadlines = { initialDeadlineMs: options.initialDeadlineMs ?? 25_000, responseDeadlineMs: options.responseDeadlineMs ?? 3_000, terminateMs: options.terminateMs ?? 3_000, killMs: options.killMs ?? 3_000 };
 	const frames: ReturnType<typeof parseWindowsHostFrame>[] = [];
-	let buffered = "";
+	// Fake spawned children predate startup markers; real helper launches require them.
+	const controlStream = new HelperControlStream(options.spawnProcess === undefined, "Windows helper returned malformed protocol output");
+	let buffered = Buffer.alloc(0);
+	let protocolError: Error | undefined;
+	let outputFinalized = false;
+	const recordProtocolError = () => {
+		if (protocolError !== undefined) return;
+		protocolError = new Error("Windows helper returned malformed protocol output");
+		buffered = Buffer.alloc(0);
+		lifecycle.changed.emit("changed");
+	};
+	const finishOutput = () => {
+		if (outputFinalized) return;
+		outputFinalized = true;
+		if (buffered.length !== 0) recordProtocolError();
+	};
 	let stderr = "";
 	let stderrOverflow = false;
 	const rejectionChanged = new EventEmitter();
@@ -230,20 +315,29 @@ async function openInitializedHelper(agentHome: string, options: Readonly<{ diag
 	const waitFor = (count: number, deadlineMs: number) => new Promise<void>((resolve, reject) => {
 		let settled = false;
 		let pollTimer: ReturnType<typeof setTimeout> | undefined;
+		const onChanged = () => poll();
 		const settle = (error?: Error) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(deadlineTimer);
 			if (pollTimer) clearTimeout(pollTimer);
+			lifecycle.changed.removeListener("changed", onChanged);
 			if (error) reject(error); else resolve();
 		};
 		const deadlineTimer = setTimeout(() => settle(new Error("Windows helper did not reply")), deadlineMs);
 		const poll = () => {
+			if (pollTimer) { clearTimeout(pollTimer); pollTimer = undefined; }
+			if (protocolError !== undefined) return settle(protocolError);
+			if (lifecycle.closeObserved) {
+				finishOutput();
+				return settle(protocolError ?? new Error("Windows helper exited before its reply"));
+			}
 			if (lifecycle.processError) return settle(lifecycle.processError);
-			if (lifecycle.exitObserved || lifecycle.closeObserved) return settle(new Error("Windows helper exited before its reply"));
+			if (lifecycle.exitObserved) return settle(new Error("Windows helper exited before its reply"));
 			if (frames.length >= count) return settle();
 			pollTimer = setTimeout(poll, 25);
 		};
+		lifecycle.changed.on("changed", onChanged);
 		poll();
 	});
 	const waitForUnsafeRejection = () => new Promise<BootstrapRejectionDiagnostic>((resolve, reject) => {
@@ -257,6 +351,7 @@ async function openInitializedHelper(agentHome: string, options: Readonly<{ diag
 			if (error) reject(error); else resolve(diagnostic!);
 		};
 		const check = () => {
+			if (protocolError !== undefined) return finish(protocolError);
 			if (stderrOverflow) return finish(new Error("Windows helper unsafe rejection diagnostic exceeded bounded output"));
 			const diagnostic = parseBootstrapRejectionDiagnostic(stderr);
 			if (diagnostic) return finish(undefined, diagnostic);
@@ -272,23 +367,54 @@ async function openInitializedHelper(agentHome: string, options: Readonly<{ diag
 		try { await closeOwnedChild(); } catch { throw new Error("Windows helper did not exit after a fatal schema error"); }
 		throw new Error("Windows helper did not exit after a fatal schema error");
 	};	const closeOwnedChild = () => settleOwnedChild(child, lifecycle, { terminateMs: deadlines.terminateMs, killMs: deadlines.killMs });
+	const closeWithStreamCheck = async () => {
+		let cleanupError: unknown;
+		try { await closeOwnedChild(); } catch (error) { cleanupError = error; }
+		finally { finishOutput(); }
+		if (protocolError !== undefined) throw protocolError;
+		if (cleanupError !== undefined) throw cleanupError;
+	};
 	child.stdout.on("data", (chunk: Buffer) => {
-		buffered += chunk.toString("utf8");
-		for (;;) { const newline = buffered.indexOf("\n"); if (newline < 0) break; frames.push(parseWindowsHostFrame(buffered.slice(0, newline))); buffered = buffered.slice(newline + 1); }
+		if (protocolError !== undefined) return;
+		if (!Buffer.isBuffer(chunk)) { recordProtocolError(); return; }
+		const output = buffered.length === 0 ? chunk : Buffer.concat([buffered, chunk]);
+		let offset = 0;
+		for (;;) {
+			const newline = output.indexOf(10, offset);
+			if (newline < 0) {
+				const suffix = output.subarray(offset);
+				if (suffix.length > maxHelperControlBytes + 1) recordProtocolError();
+				else buffered = Buffer.from(suffix);
+				return;
+			}
+			const bytes = output.subarray(offset, newline);
+			offset = newline + 1;
+			if (bytes.length > maxHelperControlBytes + 1) { recordProtocolError(); return; }
+			try {
+				const line = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+				const frame = controlStream.push(line);
+				if (frame !== undefined) frames.push(frame);
+			} catch { recordProtocolError(); return; }
+		}
 	});
+	child.stdout.once("end", finishOutput);
+	child.stdout.once("close", finishOutput);
+	child.once("close", finishOutput);
 	try {
 		child.stdin.write('{"requestId":"start-1","operation":"start"}\n');
 		child.stdin.write(`${JSON.stringify({ requestId: "initialize-2", operation: "initialize", agentHome })}\n`);
 		await waitFor(2, deadlines.initialDeadlineMs);
+		controlStream.assertStartupComplete();
 		if (!frames[1].ok && frames[1].error === "unsafe") {
 			const diagnostic = await waitForUnsafeRejection();
 			emitBootstrapRejection(options.diagnostics, diagnostic);
 		}
 	} catch (error) {
-		await closeOwnedChild();
+		try { await closeWithStreamCheck(); } catch { /* preserve the startup failure after owned cleanup */ }
 		throw error;
 	}
 	const request = async (operation: "enumerate" | "shutdown" | "record" | "publish" | "list" | "resolve" | "remove", values: Record<string, unknown> = {}) => {
+		if (protocolError !== undefined) throw protocolError;
 		const count = frames.length + 1;
 		const requestId = `${operation}-${count}`;
 		child.stdin.write(`${JSON.stringify({ requestId, operation, ...values })}\n`);
@@ -305,7 +431,7 @@ async function openInitializedHelper(agentHome: string, options: Readonly<{ diag
 		shutdown: () => request("shutdown"),
 		presence: (operation: "record" | "publish" | "list" | "resolve" | "remove", values: Record<string, unknown> = {}) => request(operation, values),
 		invalidStartSchema: async () => { child.stdin.write(`${JSON.stringify({ requestId: `invalid-${frames.length + 1}`, operation: "start", extra: true })}\n`); await exitWithin(); },
-		closeInput: closeOwnedChild,
+		closeInput: closeWithStreamCheck,
 	};
 }
 
@@ -342,7 +468,7 @@ async function helper(agentHome: string, enumerate = false, options: Readonly<{ 
 	const requests = plannedHelperRequests(agentHome, enumerate);
 	const result = await runPowerShell(runtime, [], requests.map((request) => JSON.stringify(request)).join("\n") + "\n", options);
 	assert.equal(result.code, 0);
-	const frames = result.stdout.trim().split("\n").map(parseWindowsHostFrame);
+	const frames = parseHelperControlOutput(result.stdout, options.spawnProcess === undefined, "Windows helper returned malformed protocol output");
 	assert.equal(frames.length, requests.length);
 	assert.deepEqual(frames.map((frame) => frame.requestId), requests.map((request) => request.requestId));
 	if (frames.some((frame) => !frame.ok && frame.error === "unsafe")) {
@@ -483,6 +609,49 @@ test("normal helper emits a validated unsafe rejection through its diagnostic co
 	assert.equal(child.endCalls, 1);
 });
 
+test("held helper reader rejects deferred malformed and duplicate control frames", async () => {
+	for (const { prefix, deferred, cleanupRejects } of [
+		{ prefix: "", deferred: '{"event":"startup-marker","marker":"unknown"}\n', cleanupRejects: true },
+		{ prefix: '{"event":"startup-marker","marker":"script-entered"}\n{"event":"startup-marker","marker":"native-ready"}\n', deferred: '{"event":"startup-marker","marker":"native-ready"}\n', cleanupRejects: false },
+	]) {
+		const child = new FakeHelperChild();
+		let writes = 0;
+		child.onWrite = () => {
+			if (++writes !== 2) return;
+			queueMicrotask(() => {
+				child.stdout.emit("data", Buffer.from(`${prefix}{"requestId":"start-1","ok":true,"result":{"state":"partial"}}\n{"requestId":"initialize-2","ok":true,"result":{"state":"initialized","bootstrap":"complete"}}\n`));
+				child.stdout.emit("data", Buffer.from(deferred));
+			});
+		};
+		if (cleanupRejects) child.killResult = false;
+		else child.onEnd = () => child.emit("close", 0);
+		await assert.rejects(openInitializedHelper("C:\\profile\\agent", { diagnostics: unexpectedBootstrapDiagnostic, spawnProcess: () => child as unknown as CleanupChild, ...fakeCleanupDeadlines }), /malformed protocol output/);
+		assert.equal(child.endCalls, 1);
+		if (cleanupRejects) {
+			assert.equal(child.killCalls, 1);
+			assert.equal(child.destroyCalls, 2);
+		}
+	}
+});
+
+test("held helper reader rejects truncated and oversized suffixes after valid replies", async () => {
+	for (const suffix of [Buffer.from("{"), Buffer.alloc(maxHelperControlBytes + 2, 0x78)]) {
+		const child = new FakeHelperChild();
+		let writes = 0;
+		child.onWrite = () => {
+			if (++writes !== 2) return;
+			queueMicrotask(() => {
+				child.stdout.emit("data", Buffer.from('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}\n{"requestId":"initialize-2","ok":true,"result":{"state":"initialized","bootstrap":"complete"}}\n'));
+				child.stdout.emit("data", suffix);
+				child.stdout.emit("end");
+			});
+		};
+		child.onEnd = () => child.emit("close", 0);
+		await assert.rejects(openInitializedHelper("C:\\profile\\agent", { diagnostics: unexpectedBootstrapDiagnostic, spawnProcess: () => child as unknown as CleanupChild, ...fakeCleanupDeadlines }), /malformed protocol output/);
+		assert.equal(child.endCalls, 1);
+	}
+});
+
 test("concurrent held helper ownership cleans fulfilled helpers after another initialization rejects", async () => {
 	const fulfilled = new FakeHelperChild();
 	let writes = 0;
@@ -596,6 +765,18 @@ test("Windows bootstrap bridge admits only explicit partial or initialized publi
 test("Windows helper request plans correlate standalone and enumeration reply counts", () => {
 	assert.deepEqual(plannedHelperRequests("C:\\profile\\agent", false).map((request) => request.requestId), ["start-1", "initialize-2", "shutdown-3"]);
 	assert.deepEqual(plannedHelperRequests("C:\\profile\\agent", true).map((request) => request.requestId), ["start-1", "initialize-2", "enumerate-3", "shutdown-4"]);
+});
+
+test("Windows startup marker source emits fixed ordinal control records", async (t) => {
+	t.diagnostic("source guard, not native Windows timing proof");
+	const source = await readFile(runtime, "utf8");
+	const scriptEntered = source.indexOf("[Console]::Out.WriteLine('{\"event\":\"startup-marker\",\"marker\":\"script-entered\"}')");
+	const strictMode = source.indexOf("Set-StrictMode -Version Latest");
+	const addType = source.indexOf("Add-Type -ErrorAction Stop");
+	const nativeReady = source.indexOf("[WindowsSessionBootstrap]::WriteControl('{\"event\":\"startup-marker\",\"marker\":\"native-ready\"}')");
+	assert.ok(scriptEntered >= 0 && strictMode > scriptEntered && addType > strictMode && nativeReady > addType, "startup markers must bound, not replace, the bootstrap interval");
+	assert.match(source.slice(scriptEntered, strictMode), /^\[Console\]::Out\.WriteLine\('\{"event":"startup-marker","marker":"script-entered"\}'\)\r?\n$/);
+	assert.match(source.slice(nativeReady, source.indexOf("\n", nativeReady)), /^\s*\[WindowsSessionBootstrap\]::WriteControl\('\{"event":"startup-marker","marker":"native-ready"\}'\)\r?$/);
 });
 
 test("Windows bootstrap Add-Type failures use an owned bounded diagnostic", async () => {
@@ -963,7 +1144,7 @@ test("Windows-native bootstrap closes pinned handles after malformed input", { s
 	const input = ['{"requestId":"start-1","operation":"start"}', JSON.stringify({ requestId: "initialize-2", operation: "initialize", agentHome }), "{"].join("\n") + "\n";
 	const result = await runPowerShell(runtime, [], input);
 	assert.equal(result.code, 0);
-	assert.equal(result.stdout.trim().split("\n").map(parseWindowsHostFrame)[1].result?.state, "initialized");
+	assert.equal(parseHelperControlOutput(result.stdout, true, "Windows helper returned malformed protocol output")[1].result?.state, "initialized");
 	assert.deepEqual(await fixtureResult("rename", routing, ["-Target", join(root, "routing-released")]), { ok: true, renamed: true });
 });
 
@@ -1059,17 +1240,17 @@ test("Windows default transport emits fixed ordered phase events for its own reg
 	});
 	try {
 		assert.deepEqual(events, [
-			{ phase: "start", status: "succeeded", error: null },
-			{ phase: "initialize", status: "succeeded", error: null },
+			{ phase: "start", status: "succeeded", error: null, lastStartupMarker: "native-ready" },
+			{ phase: "initialize", status: "succeeded", error: null, lastStartupMarker: "native-ready" },
 		]);
-		for (const event of events) assert.deepEqual(Object.keys(event).sort(), ["error", "phase", "status"], "events expose no host capabilities");
+		for (const event of events) assert.deepEqual(Object.keys(event).sort(), ["error", "lastStartupMarker", "phase", "status"], "events expose only fixed startup progress");
 	} finally {
 		await registry.close();
 	}
 	assert.deepEqual(events, [
-		{ phase: "start", status: "succeeded", error: null },
-		{ phase: "initialize", status: "succeeded", error: null },
-		{ phase: "cleanup", status: "succeeded", error: null },
+		{ phase: "start", status: "succeeded", error: null, lastStartupMarker: "native-ready" },
+		{ phase: "initialize", status: "succeeded", error: null, lastStartupMarker: "native-ready" },
+		{ phase: "cleanup", status: "succeeded", error: null, lastStartupMarker: "native-ready" },
 	]);
 	assert.equal(sequence.admitsFullSuccess, true, "the seam callback retains the reducer receiver through its wrapper");
 });
@@ -1084,8 +1265,8 @@ test("Windows default transport rejects asynchronous observer setup without awai
 	await recovered.close();
 });
 
-const successfulPhase = (phase: WindowsSessionRegistryPhaseEvent["phase"]): WindowsSessionRegistryPhaseEvent => Object.freeze({ phase, status: "succeeded", error: null });
-const failedPhase = (phase: WindowsSessionRegistryPhaseEvent["phase"], error: NonNullable<WindowsSessionRegistryPhaseEvent["error"]> = Object.freeze({ class: "rejected", code: "unknown" })): WindowsSessionRegistryPhaseEvent => Object.freeze({ phase, status: "failed", error });
+const successfulPhase = (phase: WindowsSessionRegistryPhaseEvent["phase"], lastStartupMarker: StartupMarker | null = null): WindowsSessionRegistryPhaseEvent => Object.freeze({ phase, status: "succeeded", error: null, lastStartupMarker });
+const failedPhase = (phase: WindowsSessionRegistryPhaseEvent["phase"], error: NonNullable<WindowsSessionRegistryPhaseEvent["error"]> = Object.freeze({ class: "rejected", code: "unknown" }), lastStartupMarker: StartupMarker | null = null): WindowsSessionRegistryPhaseEvent => Object.freeze({ phase, status: "failed", error, lastStartupMarker });
 
 test("Windows phase sequence preserves failed start with successful cleanup", () => {
 	const sequence = new WindowsSessionRegistryPhaseSequence();
@@ -1095,7 +1276,7 @@ test("Windows phase sequence preserves failed start with successful cleanup", ()
 	assert.equal(sequence.terminalSequenceValid, true);
 	assert.equal(sequence.cleanupComplete, true);
 	assert.equal(sequence.admitsFullSuccess, false);
-	assert.deepEqual(sequence.snapshot(), { availability: "observed", provenance: "owned-instance", restoration: "not-required", startCalls: 1, initializeCalls: 0, cleanupCalls: 1, firstFailurePhase: "start", firstFailureClass: "rejected", firstFailureCode: "unknown" });
+	assert.deepEqual(sequence.snapshot(), { availability: "observed", provenance: "owned-instance", restoration: "not-required", startCalls: 1, initializeCalls: 0, cleanupCalls: 1, firstFailurePhase: "start", firstFailureClass: "rejected", firstFailureCode: "unknown", lastStartupMarker: null });
 });
 
 test("Windows phase sequence preserves failed initialize with successful cleanup", () => {
@@ -1107,7 +1288,7 @@ test("Windows phase sequence preserves failed initialize with successful cleanup
 	assert.equal(sequence.terminalSequenceValid, true);
 	assert.equal(sequence.cleanupComplete, true);
 	assert.equal(sequence.admitsFullSuccess, false);
-	assert.deepEqual(sequence.snapshot(), { availability: "observed", provenance: "owned-instance", restoration: "not-required", startCalls: 1, initializeCalls: 1, cleanupCalls: 1, firstFailurePhase: "initialize", firstFailureClass: "rejected", firstFailureCode: "unknown" });
+	assert.deepEqual(sequence.snapshot(), { availability: "observed", provenance: "owned-instance", restoration: "not-required", startCalls: 1, initializeCalls: 1, cleanupCalls: 1, firstFailurePhase: "initialize", firstFailureClass: "rejected", firstFailureCode: "unknown", lastStartupMarker: null });
 });
 
 test("Windows phase sequence admits only complete successful operations", () => {
@@ -1129,7 +1310,7 @@ test("Windows phase sequence preserves an operation failure when cleanup fails",
 	sequence.observe(failedPhase("cleanup", Object.freeze({ class: "rejected", code: "unknown" })));
 	assert.equal(sequence.terminalSequenceValid, true);
 	assert.equal(sequence.cleanupComplete, false);
-	assert.deepEqual(sequence.snapshot(), { availability: "observed", provenance: "owned-instance", restoration: "not-required", startCalls: 1, initializeCalls: 0, cleanupCalls: 1, firstFailurePhase: "start", firstFailureClass: "rejected", firstFailureCode: "spawn" });
+	assert.deepEqual(sequence.snapshot(), { availability: "observed", provenance: "owned-instance", restoration: "not-required", startCalls: 1, initializeCalls: 0, cleanupCalls: 1, firstFailurePhase: "start", firstFailureClass: "rejected", firstFailureCode: "spawn", lastStartupMarker: null });
 });
 
 test("Windows phase sequence preserves bounded rejection sites and the first operation failure", () => {
@@ -1146,6 +1327,14 @@ test("Windows phase sequence preserves bounded rejection sites and the first ope
 	}
 });
 
+test("Windows phase sequence retains a last observed startup marker through deadline and cleanup", () => {
+	const sequence = new WindowsSessionRegistryPhaseSequence();
+	sequence.observe(failedPhase("start", Object.freeze({ class: "timed-out", code: "deadline" }), "script-entered"));
+	sequence.observe(successfulPhase("cleanup", "script-entered"));
+	assert.equal(sequence.admitsFullSuccess, false, "a startup marker is not readiness");
+	assert.deepEqual(sequence.snapshot(), { availability: "observed", provenance: "owned-instance", restoration: "not-required", startCalls: 1, initializeCalls: 0, cleanupCalls: 1, firstFailurePhase: "start", firstFailureClass: "timed-out", firstFailureCode: "deadline", lastStartupMarker: "script-entered" });
+});
+
 test("Windows phase sequence rejects duplicate, out-of-order, and invalid events permanently", () => {
 	for (const events of [
 		[successfulPhase("cleanup")],
@@ -1160,7 +1349,7 @@ test("Windows phase sequence rejects duplicate, out-of-order, and invalid events
 		assert.equal(sequence.terminalSequenceValid, false);
 		assert.equal(sequence.cleanupComplete, false);
 		assert.equal(sequence.admitsFullSuccess, false);
-		assert.deepEqual(sequence.snapshot(), { availability: "unavailable", provenance: "ambiguous", restoration: "not-required", startCalls: null, initializeCalls: null, cleanupCalls: null, firstFailurePhase: null, firstFailureClass: null, firstFailureCode: null });
+		assert.deepEqual(sequence.snapshot(), { availability: "unavailable", provenance: "ambiguous", restoration: "not-required", startCalls: null, initializeCalls: null, cleanupCalls: null, firstFailurePhase: null, firstFailureClass: null, firstFailureCode: null, lastStartupMarker: null });
 	}
 });
 
@@ -1172,6 +1361,8 @@ test("Windows registry source guard preserves operation failure through observer
 	assert.match(source, /transportError\("Windows transport host unavailable", "spawn"\)/);
 	assert.match(source, /transportError\("Windows transport request timed out", "deadline"\)/);
 	assert.match(source, /transportError\("Windows transport host exited", "write"\)/);
+	assert.match(source, /lastStartupMarker: this\.readLastStartupMarker\(\)/);
+	assert.match(source, /new WindowsSessionRegistryObserver\(observePhase, \(\) => host\.lastStartupMarker\)/);
 	assert.match(source, /this\.abort\("Windows transport host unavailable", true, "protocol"\)/);
 	assert.match(source, /if \(result === undefined\) return;\s*this\.active = false;\s*try \{ Promise\.resolve\(result\)\.catch\(\(\) => \{\}\);/);
 	assert.doesNotMatch(source, /WindowsSessionTransportHostObserver|observeHost\?\.\(host\)|Object\.defineProperty\(candidate/);
@@ -1186,6 +1377,8 @@ test("packed lifecycle source uses the exported phase sequence", async (t) => {
 	assert.match(source, /windowsRegistryObservation\.startupSucceeded/);
 	assert.match(source, /windowsRegistryObservation\.cleanupComplete/);
 	assert.match(source, /windowsRegistryObservation\.admitsFullSuccess/);
+	assert.match(source, /lastStartupMarker: null/);
+	assert.match(source, /windowsRegistryObservation\.lastStartupMarker === "native-ready"/);
 	assert.doesNotMatch(source, /Object\.defineProperty\(candidate|Host\.prototype|windowsRegistryObservation\.restore|let expected = "start"/);
 });
 

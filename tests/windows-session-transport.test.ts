@@ -64,6 +64,39 @@ test("Windows bridge accepts only bounded protocol frames and uses the fixed PS5
 	}
 });
 
+test("Windows startup markers are monotonic and never satisfy start readiness", async () => {
+	const child = new FakeTransportChild();
+	const host = new WindowsSessionTransportHost({ spawnProcess: () => child as never });
+	const starting = host.start();
+	child.stdout.emit("data", Buffer.from('{"event":"startup-marker","marker":"script-entered"}\n'));
+	assert.equal(host.lastStartupMarker, "script-entered");
+	child.stdout.emit("data", Buffer.from('{"event":"startup-marker","marker":"native-ready"}\n'));
+	assert.equal(host.lastStartupMarker, "native-ready");
+	let settled = false;
+	void starting.then(() => { settled = true; }, () => { settled = true; });
+	await nextTurn();
+	assert.equal(settled, false, "markers are not RPC replies or readiness");
+	child.stdout.emit("data", Buffer.from('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}\n'));
+	await starting;
+	child.emit("exit", 1, null);
+});
+
+test("Windows startup marker transport rejects unknown, duplicate, and regressive frames", async () => {
+	for (const frames of [
+		['{"event":"startup-marker","marker":"native-ready"}'],
+		['{"event":"startup-marker","marker":"script-entered"}', '{"event":"startup-marker","marker":"script-entered"}'],
+		['{"event":"startup-marker","marker":"script-entered"}', '{"event":"startup-marker","marker":"unknown"}'],
+		['{"event":"startup-marker","marker":"script-entered","extra":true}'],
+	]) {
+		const child = new FakeTransportChild();
+		const host = new WindowsSessionTransportHost({ spawnProcess: () => child as never });
+		const starting = host.start();
+		for (const frame of frames) child.stdout.emit("data", Buffer.from(`${frame}\n`));
+		await assert.rejects(starting, /Windows transport host unavailable/);
+		assert.equal(child.killCalls, 1, "invalid marker input must close the owned child");
+	}
+});
+
 test("Windows bridge admits bounded public presence results while rejecting private metadata", () => {
 	const endpoint = "\\\\.\\pipe\\gentle-pi-0123456789abcdef0123456789abcdef";
 	assert.deepEqual(parseWindowsHostFrame(`{"requestId":"record-1","ok":true,"result":{"version":1,"sessionId":"session-a","endpoint":"${endpoint.replaceAll("\\", "\\\\")}","createdAt":1}}`), {

@@ -35,7 +35,7 @@ const SESSION = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 type HostState = Readonly<{ state: "partial" }> | Readonly<{ state: "initialized"; bootstrap: "complete" }> | Readonly<{ state: "initialized"; bootstrap: "complete"; entries: number }>;
 type HostReply = Readonly<{ requestId: string; ok: boolean; result?: HostState | WindowsRecord | Readonly<{ records: readonly WindowsRecord[] }>; error?: "unavailable" | "unsafe" | "busy" | "not_found" | "invalid" }>;
-type HostEvent = Readonly<{ event: "notification"; connectionId: string; generation: number; frame: NotificationFrame }> | Readonly<{ event: "listener-failed"; generation: number; error: "unavailable" }>;
+type HostEvent = Readonly<{ event: "startup-marker"; marker: WindowsSessionStartupMarker }> | Readonly<{ event: "notification"; connectionId: string; generation: number; frame: NotificationFrame }> | Readonly<{ event: "listener-failed"; generation: number; error: "unavailable" }>;
 type Pending = { kind: "rpc" | "ack"; resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
 type WindowsHostFailureCallback = (generation: number) => void;
 type SpawnedHost = ChildProcessWithoutNullStreams;
@@ -47,10 +47,11 @@ export type WindowsSessionTransportHostOptions = Readonly<{
 	rpcDeadlineMs?: number;
 }>;
 export type WindowsSessionRegistryPhase = "start" | "initialize" | "cleanup";
+export type WindowsSessionStartupMarker = "script-entered" | "native-ready";
 export type WindowsSessionRegistryPhaseErrorCode = "spawn" | "stream" | "process" | "exit" | "write" | "deadline" | "protocol" | "start-reply" | "stopped" | "unwritable" | "unknown";
 export type WindowsSessionRegistryPhaseError = Readonly<{ class: "timed-out" | "rejected" | "unknown"; code: WindowsSessionRegistryPhaseErrorCode }>;
 /** Receives one fixed, synchronous result event for an operation on this registry's own host. */
-export type WindowsSessionRegistryPhaseEvent = Readonly<{ phase: WindowsSessionRegistryPhase; status: "succeeded" | "failed"; error: WindowsSessionRegistryPhaseError | null }>;
+export type WindowsSessionRegistryPhaseEvent = Readonly<{ phase: WindowsSessionRegistryPhase; status: "succeeded" | "failed"; error: WindowsSessionRegistryPhaseError | null; lastStartupMarker: WindowsSessionStartupMarker | null }>;
 export type WindowsSessionRegistryPhaseObserver = (event: WindowsSessionRegistryPhaseEvent) => undefined;
 export type WindowsSessionRegistryObservation = Readonly<{
 	availability: "unavailable" | "observed";
@@ -62,6 +63,7 @@ export type WindowsSessionRegistryObservation = Readonly<{
 	firstFailurePhase: WindowsSessionRegistryPhase | null;
 	firstFailureClass: WindowsSessionRegistryPhaseError["class"] | null;
 	firstFailureCode: WindowsSessionRegistryPhaseError["code"] | null;
+	lastStartupMarker: WindowsSessionStartupMarker | null;
 }>;
 
 /** Pure probe-side reducer for fixed events emitted by one registry's lexical owner. */
@@ -71,9 +73,11 @@ export class WindowsSessionRegistryPhaseSequence {
 	private startStatus?: WindowsSessionRegistryPhaseEvent["status"];
 	private initializeStatus?: WindowsSessionRegistryPhaseEvent["status"];
 	private cleanupStatus?: WindowsSessionRegistryPhaseEvent["status"];
+	private lastStartupMarker: WindowsSessionStartupMarker | null = null;
 	private firstFailure?: Readonly<{ phase: WindowsSessionRegistryPhase; class: WindowsSessionRegistryPhaseError["class"]; code: WindowsSessionRegistryPhaseError["code"] }>;
 	observe(event: unknown): undefined {
-		if (this.invalid || !this.validEvent(event) || event.phase !== this.expected) { this.invalid = true; return undefined; }
+		if (this.invalid || !this.validEvent(event) || event.phase !== this.expected || !this.monotonicStartupMarker(event.lastStartupMarker)) { this.invalid = true; return undefined; }
+		this.lastStartupMarker = event.lastStartupMarker;
 		if (event.phase === "start") this.startStatus = event.status;
 		else if (event.phase === "initialize") this.initializeStatus = event.status;
 		else this.cleanupStatus = event.status;
@@ -89,13 +93,18 @@ export class WindowsSessionRegistryPhaseSequence {
 	get admitsFullSuccess() { return this.operationSucceeded && this.cleanupComplete; }
 	get startupSucceeded() { return !this.invalid && this.expected === "cleanup" && this.operationSucceeded; }
 	snapshot(): WindowsSessionRegistryObservation {
-		if (!this.terminalSequenceValid) return Object.freeze({ availability: "unavailable", provenance: this.invalid ? "ambiguous" : "unavailable", restoration: "not-required", startCalls: null, initializeCalls: null, cleanupCalls: null, firstFailurePhase: null, firstFailureClass: null, firstFailureCode: null });
-		return Object.freeze({ availability: "observed", provenance: "owned-instance", restoration: "not-required", startCalls: this.startStatus === undefined ? 0 : 1, initializeCalls: this.initializeStatus === undefined ? 0 : 1, cleanupCalls: this.cleanupStatus === undefined ? 0 : 1, firstFailurePhase: this.firstFailure?.phase ?? null, firstFailureClass: this.firstFailure?.class ?? null, firstFailureCode: this.firstFailure?.code ?? null });
+		if (!this.terminalSequenceValid) return Object.freeze({ availability: "unavailable", provenance: this.invalid ? "ambiguous" : "unavailable", restoration: "not-required", startCalls: null, initializeCalls: null, cleanupCalls: null, firstFailurePhase: null, firstFailureClass: null, firstFailureCode: null, lastStartupMarker: null });
+		return Object.freeze({ availability: "observed", provenance: "owned-instance", restoration: "not-required", startCalls: this.startStatus === undefined ? 0 : 1, initializeCalls: this.initializeStatus === undefined ? 0 : 1, cleanupCalls: this.cleanupStatus === undefined ? 0 : 1, firstFailurePhase: this.firstFailure?.phase ?? null, firstFailureClass: this.firstFailure?.class ?? null, firstFailureCode: this.firstFailure?.code ?? null, lastStartupMarker: this.lastStartupMarker });
+	}
+	private monotonicStartupMarker(marker: WindowsSessionStartupMarker | null) {
+		const ordinal = marker === null ? 0 : marker === "script-entered" ? 1 : 2;
+		const prior = this.lastStartupMarker === null ? 0 : this.lastStartupMarker === "script-entered" ? 1 : 2;
+		return ordinal >= prior;
 	}
 	private validEvent(event: unknown): event is WindowsSessionRegistryPhaseEvent {
-		if (!event || typeof event !== "object" || Array.isArray(event) || Object.getPrototypeOf(event) !== Object.prototype || Object.keys(event).length !== 3) return false;
+		if (!event || typeof event !== "object" || Array.isArray(event) || Object.getPrototypeOf(event) !== Object.prototype || Object.keys(event).length !== 4) return false;
 		const value = event as Record<string, unknown>;
-		if (!(["start", "initialize", "cleanup"] as const).includes(value.phase as WindowsSessionRegistryPhase) || !(["succeeded", "failed"] as const).includes(value.status as WindowsSessionRegistryPhaseEvent["status"])) return false;
+		if (!(["start", "initialize", "cleanup"] as const).includes(value.phase as WindowsSessionRegistryPhase) || !(["succeeded", "failed"] as const).includes(value.status as WindowsSessionRegistryPhaseEvent["status"]) || (value.lastStartupMarker !== null && value.lastStartupMarker !== "script-entered" && value.lastStartupMarker !== "native-ready")) return false;
 		if (value.status === "succeeded") return value.error === null;
 		if (!value.error || typeof value.error !== "object" || Array.isArray(value.error) || Object.getPrototypeOf(value.error) !== Object.prototype || Object.keys(value.error).length !== 2) return false;
 		const error = value.error as Record<string, unknown>;
@@ -201,6 +210,10 @@ function parseWindowsHostEvent(line: string): HostEvent | undefined {
 	try { value = JSON.parse(line); } catch { throw safeError("invalid Windows transport frame"); }
 	if (!value || typeof value !== "object" || Array.isArray(value) || hasPrivateData(value)) throw safeError("invalid Windows transport frame");
 	const event = value as Record<string, unknown>;
+	if (event.event === "startup-marker") {
+		if (Object.keys(event).length !== 2 || (event.marker !== "script-entered" && event.marker !== "native-ready")) throw safeError("invalid Windows transport frame");
+		return Object.freeze({ event: "startup-marker", marker: event.marker as WindowsSessionStartupMarker });
+	}
 	if (event.event === "listener-failed") {
 		if (Object.keys(event).length !== 3 || !Number.isSafeInteger(event.generation) || (event.generation as number) < 1 || (event.generation as number) > 0x7fffffff || event.error !== "unavailable") throw safeError("invalid Windows transport frame");
 		return Object.freeze({ event: "listener-failed", generation: event.generation as number, error: "unavailable" });
@@ -233,6 +246,8 @@ export class WindowsSessionTransportHost {
 	private readonly deadline: number;
 	private child?: SpawnedHost;
 	private started?: Promise<void>;
+	private startupMarker: WindowsSessionStartupMarker | null = null;
+	private startupReplyObserved = false;
 	private sequence = 0;
 	private output = Buffer.alloc(0);
 	private readonly pending = new Map<string, Pending>();
@@ -266,6 +281,8 @@ export class WindowsSessionTransportHost {
 		this.deadline = options.rpcDeadlineMs ?? RPC_DEADLINE_MS;
 		if (!Number.isInteger(this.deadline) || this.deadline < 1 || this.deadline > RPC_DEADLINE_MS) throw new RangeError("invalid Windows transport deadline");
 	}
+
+	get lastStartupMarker() { return this.startupMarker; }
 
 	start(): Promise<void> {
 		if (this.started) return this.started;
@@ -337,6 +354,12 @@ export class WindowsSessionTransportHost {
 		await this.releaseOwnedChild(false);
 	}
 
+	private observeStartupMarker(marker: WindowsSessionStartupMarker) {
+		const expected = this.startupMarker === null ? "script-entered" : this.startupMarker === "script-entered" ? "native-ready" : undefined;
+		if (this.startupReplyObserved || marker !== expected) return false;
+		this.startupMarker = marker;
+		return true;
+	}
 	private onOutput(chunk: Buffer) {
 		if (!Buffer.isBuffer(chunk)) { this.abort("Windows transport host unavailable", true, "protocol"); return; }
 		const output = this.output.length === 0 ? chunk : Buffer.concat([this.output, chunk]);
@@ -361,11 +384,14 @@ export class WindowsSessionTransportHost {
 			try {
 				const event = parseWindowsHostEvent(line);
 				if (event) {
-					if (event.event === "notification") void this.acknowledge(event);
+					if (event.event === "startup-marker") {
+						if (!this.observeStartupMarker(event.marker)) { this.abort("Windows transport host unavailable", true, "protocol"); return; }
+					} else if (event.event === "notification") void this.acknowledge(event);
 					else this.failListener(event.generation);
 					continue;
 				}
 				const reply = parseWindowsHostFrame(line);
+				if (reply.requestId === "start-1") this.startupReplyObserved = true;
 				this.settle(reply.requestId, reply.ok ? undefined : transportError("Windows transport request unavailable", "protocol"), reply.result);
 			} catch (error) {
 				// Only a schema-validated private event can isolate its embedded client wire.
@@ -520,14 +546,18 @@ const phaseError = (error: unknown): WindowsSessionRegistryPhaseError => {
 class WindowsSessionRegistryObserver {
 	private active = true;
 	private readonly callback: WindowsSessionRegistryPhaseObserver;
-	constructor(callback: WindowsSessionRegistryPhaseObserver) { this.callback = callback; }
+	private readonly readLastStartupMarker: () => WindowsSessionStartupMarker | null;
+	constructor(callback: WindowsSessionRegistryPhaseObserver, readLastStartupMarker: () => WindowsSessionStartupMarker | null) {
+		this.callback = callback;
+		this.readLastStartupMarker = readLastStartupMarker;
+	}
 	async run<T>(phase: WindowsSessionRegistryPhase, operation: () => Promise<T>): Promise<T> {
 		try {
 			const value = await operation();
-			this.observe(Object.freeze({ phase, status: "succeeded", error: null }));
+			this.observe(Object.freeze({ phase, status: "succeeded", error: null, lastStartupMarker: this.readLastStartupMarker() }));
 			return value;
 		} catch (error) {
-			try { this.observe(Object.freeze({ phase, status: "failed", error: phaseError(error) })); } catch { /* the operation rejection remains primary */ }
+			try { this.observe(Object.freeze({ phase, status: "failed", error: phaseError(error), lastStartupMarker: this.readLastStartupMarker() })); } catch { /* the operation rejection remains primary */ }
 			throw error;
 		}
 	}
@@ -560,7 +590,7 @@ export class WindowsSessionPresenceRegistry {
 		if (typeof agentHome !== "string" || !/^[A-Za-z]:\\/.test(agentHome)) throw new SessionPresenceError("unsafe_path", "unsafe transport path");
 		let registry: WindowsSessionPresenceRegistry | undefined;
 		const host = new WindowsSessionTransportHost({ callback: async (notification) => registry?.notification?.(notification) ?? false });
-		const observer = observePhase === undefined ? undefined : new WindowsSessionRegistryObserver(observePhase);
+		const observer = observePhase === undefined ? undefined : new WindowsSessionRegistryObserver(observePhase, () => host.lastStartupMarker);
 		const run = <T>(phase: WindowsSessionRegistryPhase, operation: () => Promise<T>) => observer ? observer.run(phase, operation) : operation();
 		try {
 			await run("start", () => host.start());

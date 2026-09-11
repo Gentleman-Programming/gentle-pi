@@ -56,6 +56,22 @@ jobs:
         if: matrix.platform == 'windows'
         shell: cmd
         run: node --experimental-strip-types --test --test-name-pattern="^Windows-native " tests/windows-session-bootstrap.test.ts
+      - name: Run Windows registry observation semantics
+        if: matrix.platform == 'windows'
+        shell: cmd
+        run: node --experimental-strip-types --test --test-name-pattern="^(Windows native listener setup closes the first acquired registry when the second acquisition rejects|Windows phase sequence (preserves failed start with successful cleanup|preserves failed initialize with successful cleanup|admits only complete successful operations|preserves an operation failure when cleanup fails|preserves bounded rejection sites and the first operation failure|retains a last observed startup marker through deadline and cleanup|rejects duplicate, out-of-order, and invalid events permanently))$" tests/windows-session-bootstrap.test.ts
+      - name: Run Windows registry observer integration
+        if: matrix.platform == 'windows'
+        shell: cmd
+        run: node --experimental-strip-types --test --test-name-pattern="^Windows default transport (creates a registry without an observer|emits fixed ordered phase events for its own registry|rejects asynchronous observer setup without awaiting it)$" tests/windows-session-bootstrap.test.ts
+      - name: Run Windows registry and marker source/stream guards
+        if: matrix.platform == 'windows'
+        shell: cmd
+        run: node --experimental-strip-types --test --test-name-pattern="^(Windows registry source guard preserves operation failure through observer cleanup|packed lifecycle source uses the exported phase sequence|Windows listener (source guard publishes only from its Gate-protected readiness transition|failure source guard emits only a fixed post-cleanup generation event|source guard retains owned pipe continuity across the last close|ACK watchdog source guard releases Gate before asynchronous write)|Windows startup marker source emits fixed ordinal control records|Windows helper control stream enforces fixed marker framing and order|held helper reader rejects deferred malformed and duplicate control frames|held helper reader rejects truncated and oversized suffixes after valid replies)$" tests/windows-session-bootstrap.test.ts
+      - name: Run Windows startup marker transport semantics
+        if: matrix.platform == 'windows'
+        shell: cmd
+        run: node --experimental-strip-types --test --test-name-pattern="^(Windows startup markers are monotonic and never satisfy start readiness|Windows startup marker transport rejects unknown, duplicate, and regressive frames)$" tests/windows-session-transport.test.ts
       - name: Run extension and portable Windows transport tests (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
