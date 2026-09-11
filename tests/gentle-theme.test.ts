@@ -5,6 +5,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+const PI_THEME_SCHEMA_URL =
+	"https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json";
 
 const REQUIRED_THEME_COLOR_KEYS = [
 	"accent",
@@ -115,6 +117,17 @@ test("package manifest exposes bundled themes to Pi discovery", () => {
 		undefined,
 		"package manifest must not auto-apply the bundled theme",
 	);
+});
+
+test("bundled themes use the current Pi theme schema URL", () => {
+	for (const fileName of ["Gentle.json", "Gentleman-Cute.json", "Gentleman-Sexy.json"]) {
+		const theme = readJson<{ $schema?: string }>(
+			join(PACKAGE_ROOT, "themes", fileName),
+		);
+
+		assert.equal(theme.$schema, PI_THEME_SCHEMA_URL, `${fileName} must use the current Pi theme schema`);
+		assert.notEqual(theme.$schema, "https://raw.githubusercontent.com/earendil-works/pi-mono/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json");
+	}
 });
 
 test("bundled Gentleman-Sexy Pi theme is available under its exact name", () => {

@@ -167,6 +167,16 @@ test("sdd-verify phase text carries the verify-result envelope and validate-befo
 	assert.match(chainSource, /sdd-verify-validate/);
 });
 
+test("sdd-design references repository-local implementation surfaces instead of retired prompts", () => {
+	const source = readFileSync(join(assetsAgentsDir, "sdd-design.md"), "utf8");
+
+	assert.match(
+		source,
+		/Keep design centered on the repository-local implementation surfaces \(`lib\/`, `extensions\/`, and `runtime\/`\) unless scope explicitly expands\./,
+	);
+	assert.doesNotMatch(source, /prompts\/(?:gpr|gcl)\.md/);
+});
+
 test("the retired Pi adversarial role agents are not packaged", () => {
 	// gentle-pi#311 P5: the refuter and targeted validator verdicts execute
 	// through Go-owned pi processes via provider-rendered self-contained
