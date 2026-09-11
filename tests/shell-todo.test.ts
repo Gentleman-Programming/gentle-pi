@@ -175,8 +175,11 @@ test("renderTodoCard keeps the configured collapse shortcut in the header while 
 	assert.match(staleCollapsed[1], /^│ stale · 2 turns +│$/);
 	assert.match(staleCollapsed[2], /^│ ◐ Fix quiet tools conflict · fixing conflict +│$/);
 
-	const idle = applyTodo(emptyTodo(), { action: "write", tasks: [{ title: "Only pending" }] }, 1).state;
-	assert.match(renderTodoCard(idle, plainTheme, 70, { collapsed: true, staleTurns: 0 }).map(stripAnsi)[1], /^│ ○ 1 open +│$/);
+	const fallback = applyTodo(emptyTodo(), { action: "write", tasks: [{ title: "Finished first", status: "done" }, { title: "First pending" }, { title: "Later pending" }] }, 1).state;
+	assert.match(renderTodoCard(fallback, plainTheme, 70, { collapsed: true, staleTurns: 0 }).map(stripAnsi)[1], /^│ ○ First pending +│$/);
+
+	const activeAfterPending = applyTodo(emptyTodo(), { action: "write", tasks: [{ title: "Pending first" }, { title: "Active second", status: "in_progress" }, { title: "Pending third" }] }, 1).state;
+	assert.match(renderTodoCard(activeAfterPending, plainTheme, 70, { collapsed: true, staleTurns: 0 }).map(stripAnsi)[1], /^│ ◐ Active second +│$/);
 	assert.deepEqual(renderTodoCard(emptyTodo(), plainTheme, 70, { collapsed: false, staleTurns: 0 }), []);
 });
 

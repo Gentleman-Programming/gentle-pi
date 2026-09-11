@@ -271,6 +271,8 @@ function bodyRows(state: TodoState, theme: TodoTheme, width: number): string[] {
 function collapsedRow(state: TodoState, theme: TodoTheme, width: number): string {
 	const active = state.tasks.find((task) => task.status === TODO_STATUS.IN_PROGRESS);
 	if (active) return taskRow(active, theme, width);
+	const pending = state.tasks.find((task) => task.status === TODO_STATUS.PENDING);
+	if (pending) return taskRow(pending, theme, width);
 	const { open } = todoSummary(state);
 	return `${theme.fg(GLYPH_ROLE[TODO_STATUS.PENDING], STATUS_GLYPH[TODO_STATUS.PENDING])} ${theme.fg(NOTE_ROLE, `${open} open`)}`;
 }
