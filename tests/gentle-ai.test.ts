@@ -12,7 +12,7 @@ import type {
 	Theme,
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
-import { __testing, applyModelConfig, createGentleAiExtension } from "../extensions/gentle-ai.ts";
+import { __testing, applyModelConfig, applyModelConfigAsync, createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError, type NativeReviewCli } from "../lib/native-review-cli.ts";
 import { CandidateViewError, type CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 import { installPackageAssets } from "../lib/sdd-preflight.ts";
@@ -204,7 +204,12 @@ test("registered Gentle Review tools preserve result envelopes and redact collap
 	}
 });
 
-function routingConsumerFixture(t: test.TestContext) {
+interface RoutingConsumerPanel {
+	render(width: number): string[];
+	handleInput(data: string): void;
+}
+
+function routingConsumerFixture(t: test.TestContext, agents = ["worker"]) {
 	const root = mkdtempSync(join(tmpdir(), "gentle-pi-routing-consumers-"));
 	const configHome = join(root, "global");
 	const agentHome = join(root, "agent-home");
@@ -214,9 +219,19 @@ function routingConsumerFixture(t: test.TestContext) {
 	for (const dir of [dirname(projectPath), join(root, "agents"), join(agentHome, "agents"), join(agentHome, "subagents")]) {
 		mkdirSync(dir, { recursive: true });
 	}
-	writeMarkdown(join(root, ".pi", "agents", "worker.md"), "---\nname: worker\ndescription: Worker\n---\nbody\n");
+	for (const name of agents) {
+		writeMarkdown(join(root, ".pi", "agents", `${name}.md`), `---\nname: ${name}\ndescription: Worker\n---\nbody\n`);
+	}
 	const previousConfigHome = process.env.GENTLE_PI_CONFIG_HOME;
 	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const previousHome = process.env.HOME;
+	const previousUserProfile = process.env.USERPROFILE;
+	const isolatedHome = join(root, "home");
+	mkdirSync(isolatedHome, { recursive: true });
+	// Isolate homedir-based discovery on POSIX and Windows.
+	// Package-sibling legacy agents remain subject to discovery assertions.
+	process.env.HOME = isolatedHome;
+	process.env.USERPROFILE = isolatedHome;
 	process.env.GENTLE_PI_CONFIG_HOME = configHome;
 	process.env.GENTLE_PI_AGENT_HOME = agentHome;
 	t.after(() => {
@@ -224,6 +239,10 @@ function routingConsumerFixture(t: test.TestContext) {
 		else process.env.GENTLE_PI_CONFIG_HOME = previousConfigHome;
 		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
 		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousUserProfile;
 		rmSync(root, { recursive: true, force: true });
 	});
 	const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
@@ -236,26 +255,158 @@ function routingConsumerFixture(t: test.TestContext) {
 	let panelVisits = 0;
 	const panels: string[] = [];
 	let onPanel = () => ({ type: "cancel", config: {} });
+	let onInput: ((panel: RoutingConsumerPanel) => void) | undefined;
 	const ctx = {
 		cwd: root,
 		hasUI: true,
-		modelRegistry: { getAvailable: async () => [] },
+		modelRegistry: { getAvailable: async () => [
+			{ provider: "openai", id: "alpha" },
+			{ provider: "openai", id: "beta" },
+		] },
 		ui: {
 			notify(message: string, severity: string) { notifications.push({ message, severity }); },
-			custom: async (factory: (tui: unknown, theme: Theme, keybindings: unknown, done: () => void) => { render(width: number): string[] }) => {
-				panels.push(stripAnsi(renderComponent(factory(undefined, { fg: (_color: string, text: string) => text } as unknown as Theme, undefined, () => {}))));
+			custom: async (factory: (tui: unknown, theme: Theme, keybindings: unknown, done: (result: unknown) => void) => RoutingConsumerPanel) => {
+				let result: unknown;
+				const panel = factory(undefined, { fg: (_color: string, text: string) => text } as unknown as Theme, undefined, (value) => { result = value; });
+				panels.push(stripAnsi(renderComponent(panel)));
 				panelVisits += 1;
+				if (onInput) {
+					onInput(panel);
+					assert.notEqual(result, undefined, "panel input must finish the interaction");
+					return result;
+				}
 				return onPanel();
 			},
 		},
 	} as unknown as Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1];
 	return {
-		configHome, projectPath, globalPath, exportPath, notifications, panels,
+		root, agentHome, configHome, projectPath, globalPath, exportPath, notifications, panels,
 		panelVisits: () => panelVisits,
 		onPanel(action: typeof onPanel) { onPanel = action; },
+		onInput(action: (panel: RoutingConsumerPanel) => void) { onInput = action; },
 		run: (name: string) => commands.get(name)!.handler("", ctx),
 	};
 }
+
+test("models saves and clears independent provider review roles without local artifacts", async (t) => {
+	const fixture = routingConsumerFixture(t, []);
+	const roles = ["review-refuter", "review-validator"];
+	assert.deepEqual(
+		__testing.listDiscoverableAgents(fixture.root).map((agent) => agent.name),
+		[],
+		"requires zero discovered agents; check package-sibling legacy agent directories",
+	);
+
+	const assertNoLocalArtifacts = () => {
+		for (const base of [join(fixture.root, ".pi"), fixture.agentHome]) {
+			assert.equal(existsSync(join(base, "subagents.json")), false);
+			for (const dir of ["agents", "subagents"]) {
+				for (const role of roles) {
+					assert.equal(existsSync(join(base, dir, `${role}.md`)), false);
+				}
+			}
+		}
+	};
+	fixture.onInput((panel) => {
+		const initial = renderComponent(panel);
+		for (const role of roles) {
+			assert.equal(initial.split(role).length - 1, 1);
+		}
+		assert.match(initial, /Pi persisted default model/);
+		assert.match(initial, /Pi persisted default effort/);
+		for (const [index, model] of ["alpha", "beta"].entries()) {
+			panel.handleInput("j");
+			panel.handleInput("\r");
+			assert.match(renderComponent(panel), /Pi persisted default model/);
+			assert.doesNotMatch(renderComponent(panel), /Inherit active\/default model/);
+			for (const character of model) panel.handleInput(character);
+			panel.handleInput("\r");
+			panel.handleInput("e");
+			assert.match(renderComponent(panel), /Pi persisted default effort/);
+			assert.doesNotMatch(renderComponent(panel), /Inherit effort/);
+			for (let step = 0; step <= index; step++) panel.handleInput("j");
+			panel.handleInput("\r");
+		}
+		panel.handleInput("\x13");
+	});
+	await fixture.run("gentle:models");
+	assert.deepEqual(JSON.parse(readFileSync(fixture.globalPath, "utf8")), {
+		"review-refuter": { model: "openai/alpha", thinking: "off" },
+		"review-validator": { model: "openai/beta", thinking: "minimal" },
+	});
+	assertNoLocalArtifacts();
+
+	fixture.onInput((panel) => {
+		panel.handleInput("j");
+		panel.handleInput("i");
+		panel.handleInput("\x13");
+	});
+	await fixture.run("gentle:models");
+	assert.deepEqual(JSON.parse(readFileSync(fixture.globalPath, "utf8")), {
+		"review-refuter": {},
+		"review-validator": { model: "openai/beta", thinking: "minimal" },
+	});
+	assertNoLocalArtifacts();
+
+	fixture.onInput((panel) => {
+		panel.handleInput("j");
+		panel.handleInput("j");
+		panel.handleInput("i");
+		panel.handleInput("\x13");
+	});
+	await fixture.run("gentle:models");
+	assert.deepEqual(JSON.parse(readFileSync(fixture.globalPath, "utf8")), {
+		"review-refuter": {},
+		"review-validator": {},
+	});
+	assertNoLocalArtifacts();
+});
+
+test("provider review roles skip migration and both projection paths even when discoverable", async (t) => {
+	const roles = ["review-refuter", "review-validator"];
+	const fixture = routingConsumerFixture(t, [...roles, "worker"]);
+	assert.deepEqual(
+		__testing.listDiscoverableAgents(fixture.root).map((agent) => agent.name).sort(),
+		[...roles, "worker"].sort(),
+		"requires only seeded agents; check package-sibling legacy agent directories",
+	);
+
+	const rolePaths = roles.map((role) => join(fixture.root, ".pi", "agents", `${role}.md`));
+	const originals = rolePaths.map((path) => readFileSync(path, "utf8"));
+	const profilePaths = [
+		join(fixture.root, ".pi", "subagents.json"),
+		join(fixture.agentHome, "subagents.json"),
+	];
+	const profile = `${JSON.stringify({ model_profiles: {
+		"review-refuter": "existing-refuter",
+		"review-validator": "existing-validator",
+	} }, null, 2)}\n`;
+	for (const path of profilePaths) writeMarkdown(path, profile);
+	const assignments = {
+		"review-refuter": { model: "openai/alpha", thinking: "off" as const },
+		"review-validator": { model: "openai/beta", thinking: "minimal" as const },
+	};
+	writeMarkdown(join(fixture.root, ".pi", "settings.json"), JSON.stringify({
+		subagents: { agentOverrides: assignments },
+	}));
+	const assertReservedUnchanged = () => {
+		rolePaths.forEach((path, index) => assert.equal(readFileSync(path, "utf8"), originals[index]));
+		for (const path of profilePaths) assert.equal(readFileSync(path, "utf8"), profile);
+	};
+	await fixture.run("gentle:models");
+	assertReservedUnchanged();
+	for (const role of roles) assert.equal(fixture.panels[0].split(role).length - 1, 1);
+	assert.match(fixture.panels[0], /worker\s+model=inherit, effort=inherit/);
+	for (const apply of [applyModelConfig, applyModelConfigAsync]) {
+		await apply(fixture.root, assignments);
+		assertReservedUnchanged();
+		await apply(fixture.root, { "review-refuter": {}, "review-validator": {} });
+		assertReservedUnchanged();
+	}
+	await applyModelConfigAsync(fixture.root, { worker: { model: "openai/alpha" } });
+	assert.match(readFileSync(join(fixture.root, ".pi", "agents", "worker.md"), "utf8"), /model: openai\/alpha/);
+	assert.ok(JSON.parse(readFileSync(profilePaths[0], "utf8")).model_profiles.worker);
+});
 
 test("models rejects invalid project routing with its selected source path", async (t) => {
 	const fixture = routingConsumerFixture(t);
