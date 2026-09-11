@@ -858,3 +858,17 @@ export class AgentRunner {
 		queueMicrotask(() => this.pump());
 	}
 }
+
+// Human-readable suffix for an abort signal's reason, so a cancelled tool call is
+// distinguishable in the record and the notification rather than reported only as
+// "aborted". Returns an empty string when there is no usable reason.
+export function abortReasonText(reason: unknown): string {
+	if (reason === undefined) return "";
+	const message =
+		reason instanceof Error && reason.message.length > 0
+			? reason.message
+			: typeof reason === "string" && reason.length > 0
+				? reason
+				: "";
+	return message.length > 0 ? ` (${message})` : "";
+}

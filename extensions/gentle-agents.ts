@@ -12,7 +12,7 @@ import { invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
 import { createCompletionQueue } from "../lib/agents-completion-delivery.ts";
 import { AGENT_MODE, discoverAgents, loadAgentsConfig, resolveAgentProfile, type AgentDefinition, type AgentMode } from "../lib/agents-config.ts";
 import { isFinished, TASK_STATUS, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
-import { AgentRunner, piCommand, type AskAnswer, type RunnerDeps, type SddChangeSelection, type TaskRequest } from "../lib/agents-runner.ts";
+import { AgentRunner, piCommand, abortReasonText, type AskAnswer, type RunnerDeps, type SddChangeSelection, type TaskRequest } from "../lib/agents-runner.ts";
 import { ChildMessenger, type IpcEndpoint } from "../lib/agents-messaging.ts";
 import { hasReviewSessionPermission, resolveCanonicalGitRepositoryIdentitySync, type ReviewSessionManager } from "../lib/review-session-standing-permission.ts";
 import { historyDir, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
@@ -770,7 +770,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		};
 	};
 
-	const launch = async (ctx: ExtensionContext, request: TaskRequest): Promise<ToolText> => {
+	const launch = async (ctx: ExtensionContext, request: TaskRequest, signal?: AbortSignal): Promise<ToolText> => {
 		// Bounded live observation only. Native send owns the fresh policy decision;
 		// child execution never starts a telemetry policy process or renewal timer.
 		const owner = metricsOwner;
@@ -794,17 +794,35 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		ownedTaskIds.add(task.id);
 		store.subscribe(task.id, () => { publishActivity(); requestRender(); });
 		if (request.mode === AGENT_MODE.BACKGROUND) return text(`Started ${task.agent} in the background as task ${task.id}. Use subagent_status or subagent_result with that id.`, taskDetails(task));
-		const query = await runner.waitForQuery(task.id);
-		if (query) {
-			const live = store.get(task.id) ?? task;
-			return text(`Subagent ${live.agent} is waiting for your reply to request ${query.requestId}.`, { gentleAgents: { taskId: live.id, agent: live.agent, status: live.status, mode: live.mode, requestId: query.requestId } }, true);
+		// A tool call aborted by the host (a human interrupting the turn, a timeout)
+		// would otherwise leave the child running and end the call with no result and
+		// no recorded reason. Cancel through the runner so the lifecycle runs and the
+		// record is persisted, and tell the user why.
+		const onAbort = (): void => {
+			if (runner.cancel(task.id)) {
+				ctx.ui.notify(
+					`Subagent ${task.agent} cancelled: the tool call was aborted${abortReasonText(signal?.reason)}. The run is recorded as cancelled.`,
+					"warning",
+				);
+			}
+		};
+		if (signal?.aborted) onAbort();
+		else signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			const query = await runner.waitForQuery(task.id);
+			if (query) {
+				const live = store.get(task.id) ?? task;
+				return text(`Subagent ${live.agent} is waiting for your reply to request ${query.requestId}.`, { gentleAgents: { taskId: live.id, agent: live.agent, status: live.status, mode: live.mode, requestId: query.requestId } }, true);
+			}
+			const finished = await runner.waitFor(task.id);
+			completions.consume(finished.id);
+			return text(finishedText(finished), taskDetails(finished));
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
 		}
-		const finished = await runner.waitFor(task.id);
-		completions.consume(finished.id);
-		return text(finishedText(finished), taskDetails(finished));
 	};
 
-	const tool = (name: string, description: string, parameters: Record<string, unknown>, execute: (params: Record<string, unknown>, ctx: ExtensionContext) => Promise<ToolText>) => {
+	const tool = (name: string, description: string, parameters: Record<string, unknown>, execute: (params: Record<string, unknown>, ctx: ExtensionContext, signal?: AbortSignal) => Promise<ToolText>) => {
 		pi.registerTool({
 			name: `${TOOL_PREFIX}${name}`,
 			renderShell: "self",
@@ -819,8 +837,8 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				const body = result.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
 				return new Text(options.expanded ? body : theme.fg("muted", body.split("\n")[0] ?? ""), 0, 0);
 			},
-			async execute(_id, params, _signal, _onUpdate, ctx) {
-				return execute(params as Record<string, unknown>, ctx);
+			async execute(_id, params, signal, _onUpdate, ctx) {
+				return execute(params as Record<string, unknown>, ctx, signal);
 			},
 		});
 	};
@@ -847,7 +865,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				mode: { type: "string", enum: ["task", "background"], description: "task waits for the result (default); background returns immediately." },
 			},
 		},
-		async (params, ctx) => {
+		async (params, ctx, signal) => {
 			const { agents } = discoverAgents(roots(ctx));
 			const agent = agents.find((candidate) => candidate.name === params.agent);
 			if (!agent) return text(`Error: no subagent named "${String(params.agent)}". Known: ${agents.map((candidate) => candidate.name).join(", ") || "none"}`, { error: "unknown agent" });
@@ -855,7 +873,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			let sddChange: SddChangeSelection | undefined;
 			try { sddChange = parseSddChange(params.sdd_change, agent.name); }
 			catch (error) { return text(`Error: ${error instanceof Error ? error.message : String(error)}`, { error: "invalid sdd_change" }); }
-			return launch(ctx, buildRequest(ctx, agent, String(params.task ?? ""), typeof params.label === "string" ? params.label : undefined, typeof params.context === "string" ? params.context : undefined, mode, undefined, typeof params.workspace_root === "string" ? params.workspace_root : undefined, sddChange));
+			return launch(ctx, buildRequest(ctx, agent, String(params.task ?? ""), typeof params.label === "string" ? params.label : undefined, typeof params.context === "string" ? params.context : undefined, mode, undefined, typeof params.workspace_root === "string" ? params.workspace_root : undefined, sddChange), signal);
 		},
 	);
 
@@ -897,7 +915,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		"continue",
 		"Resume a finished subagent task in its own session with a follow-up prompt.",
 		{ required: ["task_id", "prompt"], properties: { task_id: { type: "string" }, prompt: { type: "string" }, label: { type: "string", description: "Three to six words naming the follow-up." }, sdd_change: { type: "object", additionalProperties: false, required: ["changeName", "workspaceRoot", "phase"], properties: { changeName: { type: "string" }, workspaceRoot: { type: "string" }, phase: { type: "string", enum: ["apply", "verify", "sync", "archive"] } }, description: "Fresh launch-local selected SDD identity, required when continuing an SDD phase agent." }, mode: { type: "string", enum: ["task", "background"] } } },
-		async (params, ctx) => {
+		async (params, ctx, signal) => {
 			const previous = await resolveTask(String(params.task_id));
 			if (!previous) return text(`Error: no task ${String(params.task_id)}`, { error: "unknown task" });
 			if (!isFinished(previous.status) || !previous.sessionPath) return text(`Error: task ${previous.id} cannot be continued yet (${previous.status}).`, { error: "not continuable" });
@@ -911,7 +929,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			try { sddChange = parseSddChange(params.sdd_change, agent.name); }
 			catch (error) { return text(`Error: ${error instanceof Error ? error.message : String(error)}`, { error: "invalid sdd_change" }); }
 			if (sddPhaseForAgent(agent.name) && !sddChange) return text("Error: continuing an SDD phase agent requires a fresh sdd_change selection.", { error: "missing sdd_change" });
-			return launch(ctx, buildRequest(ctx, agent, String(params.prompt ?? ""), typeof params.label === "string" ? params.label : undefined, undefined, mode, previous.sessionPath, sddChange?.workspaceRoot ?? previous.cwd, sddChange));
+			return launch(ctx, buildRequest(ctx, agent, String(params.prompt ?? ""), typeof params.label === "string" ? params.label : undefined, undefined, mode, previous.sessionPath, sddChange?.workspaceRoot ?? previous.cwd, sddChange), signal);
 		},
 	);
 

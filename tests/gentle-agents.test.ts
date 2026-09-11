@@ -26,7 +26,7 @@ type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 interface Registered {
 	renderShell?: string;
 	name: string;
-	execute(id: string, params: unknown, signal: undefined, onUpdate: undefined, ctx: ExtensionContext): Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
+	execute(id: string, params: unknown, signal: AbortSignal | undefined, onUpdate: undefined, ctx: ExtensionContext): Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
 	renderCall(args: unknown, theme: unknown): { render(width: number): string[] };
 }
 
@@ -1863,4 +1863,26 @@ test("a background completion owned by a prior session is dropped, never deliver
 	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 0, "the replacement session receives no completion it does not own");
 	assert.equal(entries.filter((entry) => entry.customType === "gentle-agents.stale-result").length, 0);
 	await fire("session_shutdown", ctx);
+});
+
+test("aborting the caller's signal cancels the subagent, records it, and says why", async () => {
+	const { pi, tools, fire } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, dialogs } = fakeContext();
+	await fire("session_start", ctx);
+	const controller = new AbortController();
+	const pending = tools.get("subagent_run")!.execute("abort", { agent: "explore", task: "keep working" }, controller.signal, undefined, ctx);
+	await tick();
+	controller.abort();
+	await tick();
+	const yielded = await pending;
+	const details = (yielded.details as { gentleAgents?: { taskId: string; status: string } }).gentleAgents!;
+	assert.equal(details.status, "cancelled", "the run is recorded as cancelled");
+	assert.match((yielded as { content: Array<{ text: string }> }).content[0].text, /cancelled/);
+	assert.ok(
+		dialogs.some((entry) => entry.startsWith("notify:") && /cancelled/.test(entry) && /tool call was aborted/.test(entry)),
+		"a warning names the abort and the cancellation",
+	);
+	assert.equal(harness.children[0].killed.length > 0, true, "the runner terminated the child");
 });
