@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join, relative, resolve } from "node:path";
+import type { NativeSddStatusV2 } from "./native-review-cli.ts";
 import {
 	detectActiveDomainCollisions,
 	detectLegacyFlatSpec,
@@ -660,9 +661,15 @@ export function isNonAuthoritativeStatus(status: SddStatus): boolean {
 	return status.isNonAuthoritative;
 }
 
-export function renderNativeSddPhasePrompt(status: SddStatus, phase?: SddPhase): string {
-	const selectedInstructions = phase ? status.instructions?.[phase] : undefined;
-	const isNonAuthoritative = isNonAuthoritativeStatus(status);
+export function renderNativeSddPhasePrompt(status: SddStatus | NativeSddStatusV2, phase?: SddPhase): string {
+	const native = status.schemaName === "gentle-ai.sdd-status";
+	let selectedInstructions: readonly string[] | undefined;
+	if (phase) {
+		selectedInstructions = native
+			? phase === "sync" ? undefined : status.phaseInstructions?.[phase]
+			: status.instructions?.[phase];
+	}
+	const isNonAuthoritative = !native && isNonAuthoritativeStatus(status);
 	const authorityLine = isNonAuthoritative
 		? `This status is non-authoritative (artifact store: ${status.artifactStore}). The orchestrator must resolve readiness from Engram instead.`
 		: "The parent/orchestrator resolved this status deterministically. Treat it as authoritative over prompt inference.";

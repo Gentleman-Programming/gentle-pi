@@ -7,6 +7,7 @@ import {
 	decodeReviewConsentV3,
 } from "../lib/review-integration-v2.ts";
 import {
+	decodeNativeSddStatusV2,
 	NATIVE_REVIEW_DEFAULT_MAX_BUFFER_BYTES,
 	NATIVE_REVIEW_ERROR_CODE,
 	NativeReviewCliError,
@@ -59,16 +60,19 @@ function client(adapter: ExecFileAdapter): NativeReviewCliV216 {
 	return new NativeReviewCliV216(adapter, "/package/.gentle-ai/gentle-ai", 30_000, 1024 * 1024);
 }
 
+// Structural test data follows the 2026-09-11 native 2.7.1-0.20260911070137-350f31554a4b
+// capture: seven dependencies and four phaseInstructions groups, not a legacy alias.
 function nativeSddStatus(changeName = "complete-native-review-lifecycle", workspaceRoot = "/repo"): Record<string, unknown> {
 	return {
 		schemaName: "gentle-ai.sdd-status",
 		schemaVersion: 2,
 		changeName,
 		actionContext: { workspaceRoot },
-		dependencies: { apply: "all_done", verify: "all_done", archive: "ready" },
-		instructions: {
+		dependencies: { proposal: "all_done", specs: "all_done", design: "all_done", tasks: "all_done", apply: "all_done", verify: "all_done", archive: "ready" },
+		phaseInstructions: {
 			apply: ["Apply is complete."],
 			verify: ["Verification is complete."],
+			remediate: ["Bind remediation to failed evidence."],
 			archive: ["Archive the selected change."],
 		},
 		blockedReasons: [],
@@ -99,8 +103,11 @@ test("native SDD status rejects malformed v2 identities, dependencies, instructi
 		{ ...nativeSddStatus(), changeName: "other-change" },
 		{ ...nativeSddStatus(), actionContext: { workspaceRoot: "/other" } },
 		{ ...nativeSddStatus(), dependencies: { apply: "all_done", verify: "all_done", archive: "future" } },
-		{ ...nativeSddStatus(), instructions: { apply: ["ok"], verify: ["ok"], archive: [42] } },
+		{ ...nativeSddStatus(), phaseInstructions: { apply: ["ok"], verify: ["ok"], archive: [42] } },
 		{ ...nativeSddStatus(), blockedReasons: "not-an-array" },
+		{ ...nativeSddStatus(), nextRecommended: "unknown" },
+		{ ...nativeSddStatus(), instructions: {}, phaseInstructions: undefined },
+		{ ...nativeSddStatus(), phaseInstructions: null },
 	];
 	for (const body of malformed) {
 		await assert.rejects(
@@ -110,6 +117,12 @@ test("native SDD status rejects malformed v2 identities, dependencies, instructi
 			(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.SCHEMA_INCOMPATIBLE,
 		);
 	}
+});
+
+test("native v2 read-only decoding preserves omitted optional phaseInstructions", () => {
+	const body = nativeSddStatus();
+	delete body.phaseInstructions;
+	assert.equal(decodeNativeSddStatusV2(body, { changeName: "complete-native-review-lifecycle", workspaceRoot: "/repo" }), body);
 });
 
 test("native SDD status keeps malformed JSON, timeout, and nonzero execution fail-closed", async () => {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -7,7 +7,10 @@ import { AGENT_MODE, type AgentDefinition } from "../lib/agents-config.ts";
 import { AgentRunner, type TaskRequest } from "../lib/agents-runner.ts";
 import { TaskStore } from "../lib/agents-protocol.ts";
 import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError } from "../lib/native-review-cli.ts";
-import { __testing } from "../extensions/gentle-ai.ts";
+import { createGentleAiExtension, __testing } from "../extensions/gentle-ai.ts";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { NativeReviewCli } from "../lib/native-review-cli.ts";
+import { ensureSddPreflight } from "../lib/sdd-preflight.ts";
 import { fakeChild } from "./agents-fake-child.ts";
 
 const applyAgent: AgentDefinition = {
@@ -85,8 +88,8 @@ test("selected native v2 archive authority is injected whole and never falls bac
 		schemaVersion: 2,
 		changeName: "alpha",
 		actionContext: { workspaceRoot: root },
-		dependencies: { apply: "all_done", verify: "all_done", archive: "ready" },
-		instructions: { apply: ["done"], verify: ["done"], archive: ["archive now"] },
+		dependencies: { proposal: "all_done", specs: "all_done", design: "all_done", tasks: "all_done", apply: "all_done", verify: "all_done", archive: "ready" },
+		phaseInstructions: { apply: ["done"], verify: ["done"], remediate: ["failed evidence"], archive: ["archive now"] },
 		blockedReasons: [],
 		nextRecommended: "archive",
 	};
@@ -121,8 +124,8 @@ test("selected native v2 failures fail closed without consulting the local resol
 	const valid = {
 		schemaName: "gentle-ai.sdd-status", schemaVersion: 2, changeName: "alpha",
 		actionContext: { workspaceRoot: root },
-		dependencies: { apply: "all_done", verify: "all_done", archive: "blocked" },
-		instructions: { apply: ["done"], verify: ["done"], archive: ["blocked"] },
+		dependencies: { proposal: "all_done", specs: "all_done", design: "all_done", tasks: "all_done", apply: "all_done", verify: "all_done", archive: "blocked" },
+		phaseInstructions: { apply: ["done"], verify: ["done"], remediate: ["failed evidence"], archive: ["blocked"] },
 		blockedReasons: ["native archive blocker"], nextRecommended: "verify",
 	};
 	const failures: Array<{ sddStatus?: () => Promise<unknown> }> = [
@@ -135,7 +138,7 @@ test("selected native v2 failures fail closed without consulting the local resol
 		{ sddStatus: async () => ({ ...valid, changeName: "other" }) },
 		{ sddStatus: async () => ({ ...valid, actionContext: { workspaceRoot: "/other" } }) },
 		{ sddStatus: async () => ({ ...valid, dependencies: { apply: "all_done", verify: "all_done" } }) },
-		{ sddStatus: async () => ({ ...valid, instructions: { apply: ["done"], verify: ["done"] } }) },
+		{ sddStatus: async () => ({ ...valid, phaseInstructions: { apply: ["done"], verify: ["done"] } }) },
 		{ sddStatus: async () => ({ ...valid, blockedReasons: "invalid" }) },
 	];
 	for (const native of failures) {
@@ -218,6 +221,8 @@ test("selected SDD startup fails closed for malformed identity, root, phase, sym
 	symlinkSync(outside, escaped);
 
 	for (const value of [
+		undefined,
+		null,
 		"not-json",
 		JSON.stringify({ changeName: "alpha", workspaceRoot: root, phase: "apply", extra: true }),
 		JSON.stringify({ changeName: "alpha", workspaceRoot: join(root, "wrong"), phase: "apply" }),
@@ -230,4 +235,70 @@ test("selected SDD startup fails closed for malformed identity, root, phase, sym
 		() => __testing.resolveSddChangeStartup(selected, root, "sdd-apply", () => { throw new Error("resolver failed"); }),
 		/resolver failed/i,
 	);
+});
+
+// Use the packaged executor body without an unsupported agent-name event field.
+test("before_agent_start resolves the unnamed packaged executor and renders native v2 selection", async (t) => {
+	const root = workspace(t);
+	const systemPrompt = readFileSync(new URL("../assets/agents/sdd-apply.md", import.meta.url), "utf8").replace(/^---\n[\s\S]*?\n---\n/, "");
+	const selection = { changeName: "alpha", workspaceRoot: root, phase: "apply" };
+	const status = {
+		schemaName: "gentle-ai.sdd-status", schemaVersion: 2, changeName: "alpha",
+		actionContext: { workspaceRoot: root },
+		dependencies: { proposal: "all_done", specs: "all_done", design: "all_done", tasks: "all_done", apply: "ready", verify: "blocked", archive: "blocked" },
+		phaseInstructions: { apply: ["Read proposal, specs, design, and tasks before editing."], verify: ["Verify implementation."], remediate: ["Bind failed evidence."], archive: ["Archive after verification."] },
+		blockedReasons: [], nextRecommended: "apply",
+	};
+	let serialized: unknown = JSON.stringify(selection);
+	let nativeReply: unknown = status;
+	const calls: unknown[] = [];
+	type Hook = (event: unknown, ctx: ExtensionContext) => Promise<{ systemPrompt: string }>;
+	const hooks = new Map<string, Hook>();
+	const pi = {
+		on(name: string, hook: Hook) { hooks.set(name, hook); },
+		events: { emit() {} }, registerCommand() {}, registerTool() {},
+		getFlag: () => serialized, getActiveTools: () => [],
+	} as unknown as ExtensionAPI;
+	const ctx = { cwd: root, hasUI: false, sessionManager: { getSessionId: () => root } } as unknown as ExtensionContext;
+	await ensureSddPreflight(ctx, { pi, installAssets: () => ({ agents: 0, chains: 0, support: 0, skipped: 0 }) });
+	createGentleAiExtension({
+		nativeReviewCli: { sddStatus: async (request: unknown) => { calls.push(request); return nativeReply; } } as unknown as NativeReviewCli,
+		processEnv: {},
+		resolveTelemetryTriggerBinary: () => { throw new Error("no telemetry in hook tests"); },
+	})(pi);
+	const result = await hooks.get("before_agent_start")!({ systemPrompt }, ctx);
+	assert.doesNotMatch(result.systemPrompt, /SDD selection blocked:/);
+	assert.deepEqual(calls, [{ changeName: "alpha", workspaceRoot: root }]);
+	assert.match(result.systemPrompt, /### apply instructions/);
+	assert.ok(result.systemPrompt.includes(status.phaseInstructions.apply[0]!));
+	assert.ok(result.systemPrompt.includes(JSON.stringify(status, null, 2)));
+	for (const [name, event] of [
+		["contradictory names", { systemPrompt, agentName: "sdd-apply", name: "sdd-verify" }],
+		["contradictory named phase", { systemPrompt, agentName: "sdd-verify" }],
+		["unknown explicit name", { systemPrompt, agentName: "worker" }],
+		["ambiguous executor body", { systemPrompt: `${systemPrompt}\nSDD verify executor` }],
+		["unknown executor body", { systemPrompt: "SDD unknown executor" }],
+	] as const) {
+		await t.test(name, async () => {
+			calls.length = 0;
+			assert.match((await hooks.get("before_agent_start")!(event, ctx)).systemPrompt, /SDD selection blocked:/);
+			assert.deepEqual(calls, []);
+		});
+	}
+	for (const invalid of [null, "not-json", { ...selection, phase: "verify" }, { ...selection, workspaceRoot: "/other" }]) {
+		serialized = typeof invalid === "object" && invalid !== null ? JSON.stringify(invalid) : invalid;
+		calls.length = 0;
+		assert.match((await hooks.get("before_agent_start")!({ systemPrompt }, ctx)).systemPrompt, /SDD selection blocked:/);
+		assert.deepEqual(calls, []);
+	}
+	serialized = JSON.stringify(selection);
+	for (const invalid of [{ ...status, phaseInstructions: undefined }, { ...status, nextRecommended: "unknown" }]) {
+		nativeReply = invalid;
+		assert.match((await hooks.get("before_agent_start")!({ systemPrompt }, ctx)).systemPrompt, /SDD selection blocked:/);
+	}
+	nativeReply = { ...status, dependencies: { ...status.dependencies, apply: "blocked" }, blockedReasons: ["missing native prerequisite"] };
+	const blocked = await hooks.get("before_agent_start")!({ systemPrompt }, ctx);
+	assert.match(blocked.systemPrompt, /Do not run phase work when this status marks the phase blocked/);
+	assert.ok(blocked.systemPrompt.includes(JSON.stringify(nativeReply, null, 2)));
+
 });
