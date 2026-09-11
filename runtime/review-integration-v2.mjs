@@ -2540,6 +2540,29 @@ export function decodeReviewAcknowledgedV1(value         , expected             
 	return decoded;
 }
 
+const REVIEW_LAST_EVENT_FINDING_SEVERITIES = ["BLOCKER", "CRITICAL", "WARNING", "SUGGESTION"]         ;
+const REVIEW_LAST_EVENT_EVIDENCE_CLASSES = ["deterministic", "inferential", "insufficient"]         ;
+const REVIEW_LAST_EVENT_CAUSAL_DISPOSITIONS = ["introduced", "behavior-activated", "worsened", "pre-existing", "base-only", "unknown"]         ;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -2662,8 +2685,38 @@ function decodeReviewStatusContinuationV1(value         )                       
 	};
 }
 
+function decodeReviewLastEventReviewerFindingV1(value         , label        )                                   {
+	const finding = exactRecord(value, label, ["id", "lens", "location", "severity", "claim", "proof_refs"], ["evidence_class", "causal_disposition"]);
+	const evidenceClass = finding.evidence_class === undefined
+		? undefined
+		: enumeration(finding.evidence_class, REVIEW_LAST_EVENT_EVIDENCE_CLASSES, `${label}.evidence_class`);
+	const causalDisposition = finding.causal_disposition === undefined
+		? undefined
+		: enumeration(finding.causal_disposition, REVIEW_LAST_EVENT_CAUSAL_DISPOSITIONS, `${label}.causal_disposition`);
+	return {
+		id: nonempty(finding.id, `${label}.id`),
+		lens: nonempty(finding.lens, `${label}.lens`),
+		location: nonempty(finding.location, `${label}.location`),
+		severity: enumeration(finding.severity, REVIEW_LAST_EVENT_FINDING_SEVERITIES, `${label}.severity`),
+		claim: nonempty(finding.claim, `${label}.claim`),
+		proofRefs: stringArray(finding.proof_refs, `${label}.proof_refs`, { minimum: 1 }),
+		...(evidenceClass === undefined ? {} : { evidenceClass }),
+		...(causalDisposition === undefined ? {} : { causalDisposition }),
+	};
+}
+
+function decodeReviewLastEventReviewerResultV1(value         , label        )                                  {
+	const result = exactRecord(value, label, ["lens", "findings", "evidence", "result_hash"]);
+	return {
+		lens: nonempty(result.lens, `${label}.lens`),
+		findings: array(result.findings, `${label}.findings`, decodeReviewLastEventReviewerFindingV1),
+		evidence: stringArray(result.evidence, `${label}.evidence`),
+		resultHash: sha256(result.result_hash, `${label}.result_hash`),
+	};
+}
+
 export function decodeReviewLastEventClosureV1(value         )                           {
-	const body = exactRecord(value, "last_event_closure", ["schema", "operation", "lineage_id", "state", "store_revision"], ["target_identity", "request_hash", "correction_lines", "action", "advisory_findings", "status_continuation", "acknowledgement"]);
+	const body = exactRecord(value, "last_event_closure", ["schema", "operation", "lineage_id", "state", "store_revision"], ["target_identity", "request_hash", "correction_lines", "action", "advisory_findings", "reviewer_results", "status_continuation", "acknowledgement"]);
 	if (body.schema !== REVIEW_LAST_EVENT_CLOSURE_SCHEMA) throw new TypeError(`last_event_closure.schema must be ${REVIEW_LAST_EVENT_CLOSURE_SCHEMA}`);
 	const operation = enumeration(body.operation, Object.values(REVIEW_LAST_EVENT_CLOSURE_OPERATION), "last_event_closure.operation")                                   ;
 	const state = enumeration(body.state, REVIEW_LAST_EVENT_TERMINAL_STATES, "last_event_closure.state")                               ;
@@ -2675,6 +2728,7 @@ export function decodeReviewLastEventClosureV1(value         )                  
 		storeRevision: sha256(body.store_revision, "last_event_closure.store_revision"),
 	};
 	if (operation === REVIEW_LAST_EVENT_CLOSURE_OPERATION.CAPTURE_CORRECTION_PLAN) {
+		if (body.reviewer_results !== undefined) throw new TypeError("last_event_closure reviewer_results requires approved state");
 		if (body.action !== undefined || body.advisory_findings !== undefined || body.status_continuation !== undefined) throw new TypeError("last_event_closure correction-plan cannot carry action, advisory_findings, or status_continuation");
 		if (state !== "correction_required") throw new TypeError("last_event_closure correction-plan requires correction_required state");
 		return {
@@ -2742,10 +2796,15 @@ export function decodeReviewLastEventClosureV1(value         )                  
 		? undefined
 		: decodeReviewAdvisoryFindingsV1(body.advisory_findings, "last_event_closure.advisory_findings");
 	if (advisoryFindings !== undefined && state !== "approved") throw new TypeError("last_event_closure advisory_findings requires approved state");
+	const reviewerResults = body.reviewer_results === undefined
+		? undefined
+		: array(body.reviewer_results, "last_event_closure.reviewer_results", decodeReviewLastEventReviewerResultV1);
+	if (reviewerResults !== undefined && state !== "approved") throw new TypeError("last_event_closure reviewer_results requires approved state");
 	return {
 		...shared,
 		action,
 		...(advisoryFindings === undefined ? {} : { advisoryFindings }),
+		...(reviewerResults === undefined ? {} : { reviewerResults }),
 		...(statusContinuation === undefined ? {} : { statusContinuation }),
 		...(acknowledgement === undefined ? {} : { acknowledgement }),
 		...(acknowledgementUndecodable ? { acknowledgementUndecodable: true          } : {}),
