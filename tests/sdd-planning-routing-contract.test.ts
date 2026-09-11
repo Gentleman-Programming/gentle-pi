@@ -29,6 +29,19 @@ for (const [index, path] of paths.entries()) {
 		assert.match(contract, /do not require apply readiness to produce those artifacts/);
 	});
 
+	test(`${path}: native Gentle AI planning tokens map to executable Pi phases`, () => {
+		const contract = routingContract(documents[index]);
+		for (const [token, phase] of [
+			["propose", "sdd-proposal"],
+			["spec", "sdd-spec"],
+			["design", "sdd-design"],
+			["tasks", "sdd-tasks"],
+		]) {
+			assert.ok(contract.includes(`| \`${token}\` | \`${phase}\` |`));
+		}
+		assert.match(contract, /unprefixed tokens come from the native Gentle AI v2 status contract/);
+	});
+
 	test(`${path}: planning does not weaken stop conditions or diagnostic ownership`, () => {
 		const contract = routingContract(documents[index]);
 		for (const guard of [

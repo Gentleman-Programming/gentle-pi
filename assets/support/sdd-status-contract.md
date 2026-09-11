@@ -29,10 +29,16 @@ For authoritative native status, route only by the bounded `nextRecommended` tok
 
 | `nextRecommended` | Planning route |
 | --- | --- |
+| `propose` | `sdd-proposal` |
+| `spec` | `sdd-spec` |
+| `design` | `sdd-design` |
+| `tasks` | `sdd-tasks` |
 | `sdd-propose` | `sdd-proposal` |
 | `sdd-spec` | `sdd-spec` |
 | `sdd-design` | `sdd-design` |
 | `sdd-tasks` | `sdd-tasks` |
+
+The unprefixed tokens come from the native Gentle AI v2 status contract; the `sdd-*` tokens come from Gentle Pi's local resolver. Both forms authorize the same bounded planning routes.
 
 These planning routes remain runnable when missing planning artifacts leave `dependencies.apply: blocked`; do not require apply readiness to produce those artifacts. This is a planning-only exception, not permission to run apply or another blocked non-planning phase.
 
