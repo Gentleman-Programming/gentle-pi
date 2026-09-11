@@ -97,13 +97,18 @@ test("native SDD status executes its exact selected-root argv and returns only a
 });
 
 test("native SDD status rejects malformed v2 identities, dependencies, instructions, and blockers", async () => {
+	const invalidInstructions = { apply: ["ok"], verify: ["ok"], remediate: ["ok"], archive: [42] };
+	assert.doesNotThrow(() => decodeNativeSddStatusV2(
+		{ ...nativeSddStatus(), phaseInstructions: { ...invalidInstructions, archive: ["ok"] } },
+		{ changeName: "complete-native-review-lifecycle", workspaceRoot: "/repo" },
+	));
 	const malformed = [
 		{ ...nativeSddStatus(), schemaName: "gentle-pi.sdd-status" },
 		{ ...nativeSddStatus(), schemaVersion: 1 },
 		{ ...nativeSddStatus(), changeName: "other-change" },
 		{ ...nativeSddStatus(), actionContext: { workspaceRoot: "/other" } },
 		{ ...nativeSddStatus(), dependencies: { apply: "all_done", verify: "all_done", archive: "future" } },
-		{ ...nativeSddStatus(), phaseInstructions: { apply: ["ok"], verify: ["ok"], archive: [42] } },
+		{ ...nativeSddStatus(), phaseInstructions: invalidInstructions },
 		{ ...nativeSddStatus(), blockedReasons: "not-an-array" },
 		{ ...nativeSddStatus(), nextRecommended: "unknown" },
 		{ ...nativeSddStatus(), instructions: {}, phaseInstructions: undefined },
