@@ -3326,6 +3326,17 @@ class ProfilesPanel implements OverlayComponent {
 			this.scrollDetail(-this.pageRows());
 			return;
 		}
+		// Agents-view line scroll: j/k move the routing one line at a time. The
+		// arrow keys stay with the profile list, exactly as the letters below stay
+		// profile actions.
+		if (data === "j") {
+			this.scrollDetail(1);
+			return;
+		}
+		if (data === "k") {
+			this.scrollDetail(-1);
+			return;
+		}
 		if (data === "c") return this.finish({ type: "create" });
 		if (data === "i") return this.finish({ type: "import" });
 		if (!name) return this.list.handleInput(data);
@@ -3443,7 +3454,7 @@ class ProfilesPanel implements OverlayComponent {
 
 	private renderFooterRow(width: number): string {
 		const hints =
-			"enter apply · c create · s update · d duplicate · r rename · x delete · e export · i import · pgup/pgdn scroll · esc close";
+			"enter apply · c create · s update · d duplicate · r rename · x delete · e export · i import · j/k line · ctrl+j/k page · esc close";
 		return [
 			this.renderText("│", "border"),
 			" ",
