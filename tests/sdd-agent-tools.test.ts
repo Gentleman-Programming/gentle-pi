@@ -167,15 +167,17 @@ test("sdd-verify phase text carries the verify-result envelope and validate-befo
 	assert.match(chainSource, /sdd-verify-validate/);
 });
 
+/** Reject stale local instructions and tracker targets while allowing external source/schema URLs. */
 function assertCurrentRepositoryInstructions(source: string, label: string): void {
 	// Repository flags are actionable targets, even when their values are URLs.
 	assert.doesNotMatch(source, /--repo(?:\s*=\s*|\s+)["']?https?:\/\/github\.com\/(?:badlogic|earendil-works)\/pi-mono\b/i, label);
 	// Upstream source/schema URLs are references, not local implementation paths.
 	assert.doesNotMatch(source, /github\.com\/(?:badlogic|earendil-works)\/pi-mono\/(?:issues|pulls?|discussions)\b/i, label);
 	const localInstructions = source.replace(/https?:\/\/[^\s<>`"\)]+/g, "");
-	assert.doesNotMatch(localInstructions, /\bpackages\/coding-agent\b|\bpi-mono\b|\bprompts\/(?:gpr|gcl)\.md\b/i, label);
+	assert.doesNotMatch(localInstructions, /\bpackages\/|\bAGENTS\.md\b|\bpi-mono\b|\bprompts\/(?:gpr|gcl)\.md\b/i, label);
 }
 
+/** Collect Markdown instruction files recursively beneath a shipped directory. */
 function markdownFiles(directory: string): string[] {
 	return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
 		const path = join(directory, entry.name);
@@ -217,6 +219,37 @@ test("instruction guard rejects stale local paths and trackers but permits exter
 		'gh issue create --repo="https://github.com/Gentleman-Programming/gentle-pi"',
 		"Read openspec/changes/{change}/proposal.md and follow the approved change scope.",
 	]) assertCurrentRepositoryInstructions(source, "valid fixture");
+});
+
+test("instruction guard rejects local packages outside coding-agent", () => {
+	assert.throws(
+		() => assertCurrentRepositoryInstructions("Edit `packages/other-tool/src/index.ts`.", "local package fixture"),
+		assert.AssertionError,
+	);
+});
+
+test("instruction guard rejects local AGENTS.md references", () => {
+	assert.throws(
+		() => assertCurrentRepositoryInstructions("Read `AGENTS.md` before implementation.", "local agent fixture"),
+		assert.AssertionError,
+	);
+});
+
+test("instruction guard permits external package and agent source/schema URLs", () => {
+	for (const source of [
+		"[Source](https://github.com/example/upstream/blob/main/packages/other-tool/AGENTS.md)",
+		"https://raw.githubusercontent.com/example/upstream/main/packages/other-tool/schema.json",
+		"<https://github.com/example/upstream/blob/main/AGENTS.md>",
+	]) assertCurrentRepositoryInstructions(source, "external reference fixture");
+});
+
+test("instruction guard still rejects local paths alongside external references", () => {
+	for (const source of [
+		"[Source](https://example.com/packages/tool/schema.json) then edit ./packages/widget/index.ts.",
+		"<https://example.com/AGENTS.md> then read docs/agents.MD.",
+	]) {
+		assert.throws(() => assertCurrentRepositoryInstructions(source, "mixed fixture"), assert.AssertionError);
+	}
 });
 
 test("sdd-design follows approved change scope and requires approval before expansion", () => {
