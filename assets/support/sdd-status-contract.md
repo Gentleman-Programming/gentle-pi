@@ -44,7 +44,24 @@ These planning routes remain runnable when missing planning artifacts leave `dep
 
 Before any planning launch, stop for ambiguous change selection, unresolved session preflight, or unsafe action context. Carry `actionContext` and prove planned writes are within the authoritative workspace or allowed edit roots; workspace-planning without allowed edit roots remains read-only. Planning does not bypass the init guard, pre-proposal gate, or phase approval requirements.
 
-For non-planning phases, stop when that phase's dependency is `blocked`. When `nextRecommended` is `blocked` or `resolve-blockers`, report `blockedReasons` and stop, even if a planning artifact is missing. Unknown tokens do not authorize a launch. Non-empty `blockedReasons` forbid apply, sync, and archive work; `sdd-verify` may run only when `nextRecommended` is `sdd-verify` and its dependency permits it, to remediate or refresh evidence for the blockers. The non-authoritative `resolve-via-engram` store carve-out remains separate; it does not bypass preflight, selection, or action-context safety.
+## Bounded Execution Routing
+
+Execution routes accept the native Gentle AI v2 tokens and Gentle Pi's local `sdd-*` tokens without rewriting status:
+
+| `nextRecommended` | Execution route |
+| --- | --- |
+| `apply` | `sdd-apply` |
+| `sdd-apply` | `sdd-apply` |
+| `verify` | `sdd-verify` |
+| `sdd-verify` | `sdd-verify` |
+| `archive` | `sdd-archive` |
+| `sdd-archive` | `sdd-archive` |
+| `sdd-sync` | `sdd-sync` |
+| `remediate` | `sdd-apply` |
+
+Native `remediate` maps to the mutating `sdd-apply` executor, never to the independent `sdd-verify` executor. It authorizes only the fail-closed Native Remediation Mode defined by `sdd-apply`, with the provider's exact remediation state, failed-evidence revision, phase instructions, and runtime-attempt binding.
+
+For ordinary non-planning phases, stop when that phase's dependency is `blocked`. The `remediate` route is the only dependency-blocked exception: it repairs the failed verification that keeps `dependencies.verify` blocked, and it proceeds only when the Native Remediation Mode validates every required field. To prevent unrelated blockers from authorizing mutation, remediation requires the sole blocker to equal `remediationState.reason`; `applyState` and `dependencies.apply` must be `all_done`, while `dependencies.verify` must be `blocked`. When `nextRecommended` is `blocked` or `resolve-blockers`, report `blockedReasons` and stop. Unknown tokens do not authorize a launch. Non-empty `blockedReasons` forbid ordinary apply, sync, and archive work; `verify` or `sdd-verify` may run only when the verify dependency permits it, while `remediate` may run only through the validated remediation mode. This alias table does not bypass preflight, selection, action-context, or runtime-attempt authority. The non-authoritative `resolve-via-engram` store carve-out remains separate and does not bypass those gates.
 
 ## Status Schema
 
