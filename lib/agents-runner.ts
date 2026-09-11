@@ -140,6 +140,7 @@ export interface TaskRequest {
 	 * Omission preserves the explicit opt-in producer API, not policy authority.
 	 */
 	canCollectResponseObservations?: () => boolean;
+	extensions?: string[];
 	// This closure stays only in the parent process. Its presence creates an
 	// inherited fd, never an environment boolean or model-visible permission.
 	authorizeParentStandingReviewPermission?: (repositoryIdentity: string) => boolean;
@@ -229,6 +230,10 @@ export function childArguments(request: TaskRequest): string[] {
 	if (request.resumeSessionPath) args.push("--session", request.resumeSessionPath);
 	if (request.model) args.push("--model", request.thinking ? `${formatModelRef(request.model)}:${request.thinking}` : formatModelRef(request.model));
 	else if (request.thinking) args.push("--thinking", request.thinking);
+	if (request.extensions !== undefined) {
+		args.push("--no-extensions");
+		for (const extension of request.extensions) if (extension.length > 0) args.push("--extension", extension);
+	}
 	const tools = request.agent.tools.length > 0 ? [...new Set([...request.agent.tools, PARENT_NOTIFICATION_TOOL])] : DEFAULT_TOOLS;
 	if (tools.length > 0) args.push("--tools", tools.join(","));
 	if (request.agent.instructions.length > 0) args.push("--append-system-prompt", request.agent.instructions);
@@ -329,9 +334,13 @@ export class AgentRunner {
 		this.store.add(task);
 		// A caller can retain and mutate its request after dispatch. Preserve only
 		// the identity selected at construction for this child launch.
-		const launchRequest = request.sddChange === undefined
+		const launchRequest = request.sddChange === undefined && request.extensions === undefined
 			? request
-			: { ...request, sddChange: { ...request.sddChange } };
+			: {
+				...request,
+				...(request.sddChange !== undefined ? { sddChange: { ...request.sddChange } } : {}),
+				...(request.extensions !== undefined ? { extensions: [...request.extensions] } : {}),
+			};
 		this.queue.push({ task, request: launchRequest });
 		queueMicrotask(() => this.pump());
 		return task;

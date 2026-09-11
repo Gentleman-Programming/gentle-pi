@@ -285,7 +285,7 @@ flowchart TD
         C2 --> C3["Apply scoped fix"]
         C3 --> V["validating"]
         V -->|Validator passes| A1
-		V -->|Fails, malformed, or out of scope| E1["escalated"]
+  V -->|Fails, malformed, or out of scope| E1["escalated"]
     end
 
     A1 --> O["Review outcome is informational"]
@@ -771,7 +771,7 @@ Gentle notices are drawn as cards: the same rounded frame as the prompt, with th
 
 The current package requires Pi 0.85.1 or newer (development tests pin 0.85.1). Use the latest Pi release; gentle-pi does not update your installed Pi automatically. Children, including any `GENTLE_PI_AGENTS_PI` override, must emit `agent_settled`: `agent_end` records a run's output but is not completion because retries or queued continuations may follow.
 
-The `subagent_*` tools and the agents card replace the third-party subagents package (remove `npm:pi-subagents-j0k3r` from your pi packages; while it is still installed the tools stay unregistered and a warning says so at startup). Agent definitions and settings are the ones you already have: markdown agents in `~/.pi/agent/agents/`, `~/.pi/agent/subagents/`, `<cwd>/.pi/agents/`, `<cwd>/.pi/subagents/` (project beats global, `subagents/` beats `agents/`), and `subagents.json` at the global and project level (`default_model`, `default_effort`, `default_mode`, `model_profiles`, `stall_timeout_ms`, `max_concurrency`, `history_max_tasks`).
+The `subagent_*` tools and the agents card replace the third-party subagents package (remove `npm:pi-subagents-j0k3r` from your pi packages; while it is still installed the tools stay unregistered and a warning says so at startup). Agent definitions and settings are the ones you already have: markdown agents in `~/.pi/agent/agents/`, `~/.pi/agent/subagents/`, `<cwd>/.pi/agents/`, `<cwd>/.pi/subagents/` (project beats global, `subagents/` beats `agents/`), and `subagents.json` at the global and project level (`default_model`, `default_effort`, `default_mode`, `model_profiles`, `stall_timeout_ms`, `max_concurrency`, `history_max_tasks`, `extensions`).
 
 Agent paths follow `GENTLE_PI_AGENT_HOME`, then `PI_CODING_AGENT_DIR`, then `~/.pi/agent` for definitions, config, history, child sessions, and transcripts. These overrides select the agent profile; they do not sandbox project or shared global resources.
 
@@ -783,6 +783,8 @@ Agent paths follow `GENTLE_PI_AGENT_HOME`, then `PI_CODING_AGENT_DIR`, then `~/.
 ```
 
 Every subagent is its own `pi --mode rpc` child process, so the terminal never runs subagent work: the host reads JSON lines, applies each one as a small delta to a bounded per-task thread, and notifies only the listeners of that task. A task-mode child's question (`ctx.ui.select`, `confirm`, `input`, `editor`) reaches you as an ordinary pi dialog; a background child's question is dismissed. Subagents have no automatic total execution timeout: a long-running child remains live while it continues emitting RPC events. A silent child still times out through the configurable `stall_timeout_ms` watchdog (default four minutes). Closing pi stops the children that are still running.
+
+`extensions` controls each child's Pi extensions: omit it to use Pi's ambient discovery, set `[]` to launch with only `--no-extensions`, or list paths to launch with `--no-extensions` and those extensions in order. A project value replaces the global value.
 
 - `subagent_list_agents`, `subagent_run` (`agent`, `task`, `label?`, `context?`, `workspace_root?`, `mode?` task or background), `subagent_status`, `subagent_result`, `subagent_list_tasks`, `subagent_reply` (one current-session reply to a live child query), `subagent_cancel`, `subagent_send_message` (steer a running child), `subagent_continue` (resume a finished task in its own session).
 - `subagent_run.workspace_root` selects an existing worktree in the session's Git clone. Validation happens before queueing; the child runs at that canonical root. Successful OS spawn registers the root in the originating parent session, including delayed queued launches, even without an active shell listener. Failed spawns do not register. `subagent_continue` retains the previous task's cwd; status and task details expose it.

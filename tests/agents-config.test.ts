@@ -131,6 +131,14 @@ test("parseAgentsConfig applies defaults, validates values, and silently ignores
 	assert.equal(parseAgentsConfig({ default_mode: "background" }, undefined).defaultMode, AGENT_MODE.BACKGROUND);
 });
 
+test("parseAgentsConfig preserves extensions' absent, isolated, and ordered states across scopes", () => {
+	assert.equal(parseAgentsConfig(undefined, undefined).extensions, undefined);
+	assert.deepEqual(parseAgentsConfig({ extensions: ["/global-a", "/global-b"] }, undefined).extensions, ["/global-a", "/global-b"]);
+	assert.deepEqual(parseAgentsConfig({ extensions: ["/global"] }, { extensions: [] }).extensions, []);
+	assert.equal(parseAgentsConfig({ extensions: ["/global"] }, { extensions: ["/project", 1] }).extensions, undefined);
+	assert.deepEqual(parseAgentsConfig(undefined, { extensions: ["", "/project"] }).extensions, ["/project"]);
+});
+
 test("resolveAgentProfile prefers the profile, then the definition, then the defaults", () => {
 	const config = parseAgentsConfig({ default_model: "openai-codex/gpt-6-astra", default_effort: "medium", model_profiles: { "gentle-ai-explore": { effort: "high" } } }, undefined);
 	const explore = parseAgentDefinition(EXPLORER, "/x/explore.md", "global");
