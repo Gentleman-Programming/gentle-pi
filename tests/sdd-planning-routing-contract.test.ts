@@ -50,7 +50,7 @@ for (const [index, path] of paths.entries()) {
 			"workspace-planning without allowed edit roots remains read-only",
 			"Planning does not bypass the init guard, pre-proposal gate, or phase approval requirements",
 			"never infer a route from prose",
-			"Keep human diagnostics in `blockedReasons`, not in `nextRecommended`",
+			"Keep genuine blockers in `blockedReasons` and non-blocking diagnostics in `notes`, never in `nextRecommended`",
 			"report them without discarding them to enable a route",
 		]) {
 			assert.ok(contract.includes(guard), `missing guard: ${guard}`);
