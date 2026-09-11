@@ -757,7 +757,21 @@ export class AgentRunner {
 			live.cancelGrace = this.deps.schedule(() => this.confirmGroupExit(id, live), GROUP_CONFIRM_MS);
 			return;
 		}
-		if (live.childExit !== undefined) this.completeExit(id, live);
+		if (live.childExit !== undefined) {
+			this.completeExit(id, live);
+			return;
+		}
+		// The group is gone but the child's exit was never observed. Stopping here
+		// would leave the task terminal in memory with no persisted record and no
+		// further attempt to produce one, so keep polling and then finish with the
+		// status the run actually ended with. The group being gone means no process
+		// remains, so this slot is genuinely free and needs no quarantine.
+		if (this.deps.now() >= (live.cleanupDeadlineAt ?? 0)) {
+			live.cancelGrace();
+			this.finish(id, live.terminal?.status ?? TASK_STATUS.FAILED, `child exit unconfirmed after ${GROUP_CONFIRM_DEADLINE_MS}ms`, live);
+			return;
+		}
+		live.cancelGrace = this.deps.schedule(() => this.confirmGroupExit(id, live), GROUP_CONFIRM_MS);
 	}
 
 	private childError(id: string, error: Error): void {

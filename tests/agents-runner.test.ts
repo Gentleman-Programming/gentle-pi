@@ -782,3 +782,44 @@ for (const lateEvents of [false, true]) test(`AgentRunner releases quarantined c
 	assert.equal(observations.length, 1, "late cleanup does not redeliver observations");
 	assert.deepEqual(store.get(first.id), finished);
 });
+
+test("a task whose group is gone but whose exit was never observed still finishes", async () => {
+	// The group probe reports the group gone from the first check while the child's
+	// exit event never arrives. Until this was fixed, confirmGroupExit returned
+	// without rescheduling or finishing, leaving the task terminal in memory with
+	// no persisted record and no further attempt to produce one.
+	const store = new TaskStore();
+	const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+	const finishes: string[] = [];
+	let now = 1_000;
+	const child = fakeChild({ exitOnKill: false, pid: 90 });
+	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs: 10_000 }, {
+		spawn: () => child.child,
+		now: () => now,
+		schedule: (fn, ms) => {
+			const timer = { fn, ms, cancelled: false };
+			timers.push(timer);
+			return () => { timer.cancelled = true; };
+		},
+		pi: { command: "pi", args: [] },
+		process: { platform: "linux", kill: (_pid, signal) => {
+			if (signal === 0) throw Object.assign(new Error("group probe"), { code: "ESRCH" });
+		} },
+	}, { askUser: async () => ({ value: "yes" }), onFinish: (task) => { finishes.push(task.id); } });
+	const task = runner.run(request());
+	await tick();
+	const waiter = runner.waitFor(task.id);
+	runner.cancel(task.id);
+	const grace = timers.find((timer) => timer.ms === 250);
+	assert.ok(grace, "termination grace is scheduled");
+	grace.fn();
+	now = 5_000;
+	const check = timers.filter((timer) => timer.ms === 25).at(-1);
+	assert.ok(check, "an unobserved exit must keep polling instead of stopping silently");
+	check.fn();
+	await tick();
+	assert.equal(store.get(task.id)?.status, TASK_STATUS.CANCELLED);
+	assert.match(store.get(task.id)?.error ?? "", /child exit unconfirmed/);
+	assert.equal((await waiter).status, TASK_STATUS.CANCELLED, "the waiter receives the recorded outcome");
+	assert.equal(finishes.length, 1, "the run is recorded exactly once");
+});
