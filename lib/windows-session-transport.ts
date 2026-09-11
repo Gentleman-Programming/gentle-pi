@@ -28,6 +28,7 @@ const MAX_PRIVATE_EVENT_BYTES = MAX_PRIVATE_WIRE_BASE64_BYTES + MAX_PRIVATE_EVEN
 const MAX_PENDING = 8;
 const MAX_PENDING_ACK = 8;
 const RPC_DEADLINE_MS = 2_000;
+const STARTUP_DEADLINE_MS = 30_000;
 const CALLBACK_DEADLINE_MS = 2_000;
 const SHUTDOWN_GRACE_MS = 500;
 const PIPE = /^\\\\\.\\pipe\\gentle-pi-[A-Za-z0-9-]{1,96}$/;
@@ -45,6 +46,7 @@ export type WindowsSessionTransportHostOptions = Readonly<{
 	spawnProcess?: typeof spawn;
 	callback?: WindowsHostCallback;
 	rpcDeadlineMs?: number;
+	startupDeadlineMs?: number;
 }>;
 export type WindowsSessionRegistryPhase = "start" | "initialize" | "cleanup";
 export type WindowsSessionStartupMarker = "script-entered" | "native-ready";
@@ -244,6 +246,7 @@ export class WindowsSessionTransportHost {
 	private readonly spawnProcess: typeof spawn;
 	private readonly callback?: WindowsHostCallback;
 	private readonly deadline: number;
+	private readonly startupDeadline: number;
 	private child?: SpawnedHost;
 	private started?: Promise<void>;
 	private startupMarker: WindowsSessionStartupMarker | null = null;
@@ -279,7 +282,9 @@ export class WindowsSessionTransportHost {
 		this.spawnProcess = options.spawnProcess ?? spawn;
 		this.callback = options.callback;
 		this.deadline = options.rpcDeadlineMs ?? RPC_DEADLINE_MS;
+		this.startupDeadline = options.startupDeadlineMs ?? STARTUP_DEADLINE_MS;
 		if (!Number.isInteger(this.deadline) || this.deadline < 1 || this.deadline > RPC_DEADLINE_MS) throw new RangeError("invalid Windows transport deadline");
+		if (!Number.isInteger(this.startupDeadline) || this.startupDeadline < 1 || this.startupDeadline > STARTUP_DEADLINE_MS) throw new RangeError("invalid Windows transport startup deadline");
 	}
 
 	get lastStartupMarker() { return this.startupMarker; }
@@ -298,13 +303,17 @@ export class WindowsSessionTransportHost {
 		this.child.once("error", this.onChildError);
 		this.child.once("exit", this.onChildExit);
 		this.child.once("close", this.onChildClose);
-		this.started = this.request("start", {}).then((result) => {
+		this.started = this.requestWithDeadline("start", {}, this.startupDeadline).then((result) => {
 			if (result.state !== "partial") throw transportError("Windows transport host unavailable", "start-reply");
 		});
 		return this.started;
 	}
 
 	request(operation: string, values: Record<string, unknown>): Promise<Record<string, unknown>> {
+		return this.requestWithDeadline(operation, values, operation === "ack" ? CALLBACK_DEADLINE_MS : this.deadline);
+	}
+
+	private requestWithDeadline(operation: string, values: Record<string, unknown>, deadline: number): Promise<Record<string, unknown>> {
 		const kind = operation === "ack" ? "ack" : "rpc";
 		if (!/^[a-z-]{1,32}$/.test(operation) || hasPrivateData(values) || (kind === "rpc" ? this.pendingRpcs >= MAX_PENDING : this.pendingAcks >= MAX_PENDING_ACK)) return Promise.reject(safeError("Windows transport request unavailable"));
 		const child = this.child;
@@ -314,7 +323,7 @@ export class WindowsSessionTransportHost {
 		const line = JSON.stringify({ requestId, operation, ...values });
 		if (Buffer.byteLength(line, "utf8") > MAX_CONTROL_BYTES) return Promise.reject(safeError("Windows transport request unavailable"));
 		return new Promise((resolve, reject) => {
-			const timer = setTimeout(() => this.settle(requestId, transportError("Windows transport request timed out", "deadline")), kind === "ack" ? CALLBACK_DEADLINE_MS : this.deadline);
+			const timer = setTimeout(() => this.settle(requestId, transportError("Windows transport request timed out", "deadline")), deadline);
 			this.pending.set(requestId, { kind, resolve, reject, timer });
 			if (kind === "ack") this.pendingAcks++; else this.pendingRpcs++;
 			try { child.stdin.write(`${line}\n`, (error) => { if (error) this.settle(requestId, transportError("Windows transport host exited", "write")); }); }

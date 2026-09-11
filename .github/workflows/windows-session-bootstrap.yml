@@ -4,6 +4,13 @@ on:
   push:
     branches:
       - test/windows-session-bootstrap-ci
+  workflow_dispatch:
+    inputs:
+      run_windows_startup_experiment:
+        description: "Run the completed paired Windows startup experiment"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -113,6 +120,6 @@ jobs:
         shell: bash
         run: node scripts/test-packed-runner.mjs --sdk-lifecycle
       - name: Measure paired packed Windows helper startup environment experiment (experimental)
-        if: "!cancelled() && matrix.platform == 'windows' && steps.install_windows_dependencies.outcome == 'success'"
+        if: "!cancelled() && inputs.run_windows_startup_experiment == true && matrix.platform == 'windows' && steps.install_windows_dependencies.outcome == 'success'"
         shell: cmd
         run: node scripts\test-packed-runner.mjs --windows-startup-timing-environment

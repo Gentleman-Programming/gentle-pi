@@ -13,6 +13,11 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const MAX_NPM_OUTPUT_BYTES = 1024 * 1024;
 const MAX_UNHOOKED_REPORT_BYTES = 1024;
 const MAX_SDK_LIFECYCLE_CHILD_REPORT_BYTES = 2048;
+// Four sequential 30s imports precede the existing 240s lifecycle allowance: two
+// 30s session factories, two 40s binds, one 40s registry, three 2s lists, two 15s
+// runtime disposals, a 15s observer close, and 9s receipt/scheduling. This finite
+// 360s watchdog bounds reporting, not blocked SDK cancellation.
+const SDK_LIFECYCLE_PROBE_TIMEOUT_MS = 4 * 30_000 + 2 * 30_000 + 2 * 40_000 + 40_000 + 3 * 2_000 + 2 * 15_000 + 15_000 + 4_000 + 5_000;
 const MAX_WINDOWS_STARTUP_TIMING_REPORT_BYTES = 1024;
 const MAX_WINDOWS_STARTUP_TIMING_ENVIRONMENT_REPORT_BYTES = 2048;
 const MAX_WINDOWS_STARTUP_TIMING_OUTPUT_BYTES = 32 * 1024;
@@ -464,7 +469,7 @@ function runBoundedSdkLifecycleProbe(arguments_, env, cwd) {
 		child.stderr.on("data", onStderr);
 		child.once("error", onChildError);
 		child.once("close", onClose);
-		timeout = setTimeout(() => requestStop(new SdkLifecycleFailure("lifecycle-probe", "timed-out")), 90000);
+		timeout = setTimeout(() => requestStop(new SdkLifecycleFailure("lifecycle-probe", "timed-out")), SDK_LIFECYCLE_PROBE_TIMEOUT_MS);
 	});
 }
 
@@ -1007,6 +1012,13 @@ function mergeSdkLifecycleChildProgress(receipt, childReceipt) {
 
 function sdkLifecycleProbeSource(packageRoot, consumerPackageJson, jitiStaticEntry) {
 	return `
+// One bind permits default start (30s), initialize (2s), and listen (2s); its
+// remaining 6s covers SDK lifecycle/error observation. Listen owns publication.
+const SDK_LIFECYCLE_WINDOWS_BIND_DEADLINE_MS = 30_000 + 2_000 + 2_000 + 6_000;
+// A registry failure may need default start/initialize, shutdown (2s), two 500ms
+// cleanup graces, and phase-event propagation before this verification watchdog expires.
+const SDK_LIFECYCLE_WINDOWS_REGISTRY_DEADLINE_MS = 30_000 + 2_000 + 2_000 + 2 * 500 + 5_000;
+const SDK_LIFECYCLE_WINDOWS_LIST_DEADLINE_MS = 2_000;
 const progress = {};
 let childStage = "bootstrap";
 let childCheckId = "bootstrap-builtins";
@@ -1162,7 +1174,7 @@ const INERT_DEFAULT_MODEL = {
   checkpoint("session-bind", "session-bind");
   extensionErrorPhase = "startup";
   extensionLifecycleObserved = true;
-  await within(runtime.session.bindExtensions({ mode: "json", onError: recordExtensionError }), 30000);
+  await within(runtime.session.bindExtensions({ mode: "json", onError: recordExtensionError }), SDK_LIFECYCLE_WINDOWS_BIND_DEADLINE_MS);
   checkpoint("session-bind", "session-bind-extension-errors");
       invocationGuard.assertNotInvoked("session-bind", "session-model-invocation-guard");
   confirmNoExtensionErrors();
@@ -1294,7 +1306,7 @@ try {
   windowsRegistryObservation = createWindowsRegistryObservation(WindowsSessionRegistryPhaseSequence);
       let windowsRegistryFailure;
       try {
-        observer = await within(createDefaultSessionTransport(process.platform).createRegistry(agentHome, (event) => windowsRegistryObservation.observe(event)), 30000);
+        observer = await within(createDefaultSessionTransport(process.platform).createRegistry(agentHome, (event) => windowsRegistryObservation.observe(event)), SDK_LIFECYCLE_WINDOWS_REGISTRY_DEADLINE_MS);
           } catch (error) {
             windowsRegistryFailure = error;
       } finally {
@@ -1303,7 +1315,7 @@ try {
   if (windowsRegistryFailure !== undefined) throw windowsRegistryFailure;
       if (!windowsRegistryObservation.startupSucceeded) throw { childReceiptCode: OBSERVATION_INVALID };
       checkpoint("presence-two", "presence-two-records");
-  const started = await within(observer.listActivations(), 30000);
+  const started = await within(observer.listActivations(), SDK_LIFECYCLE_WINDOWS_LIST_DEADLINE_MS);
   assert.deepEqual(started.map((record) => record.sessionId).sort(), [firstId, secondId].sort(), "default transport must advertise both SDK sessions");
   progress.presenceAfterStart = started.length;
   checkpoint("presence-two", "presence-first-model-unbound");
@@ -1318,7 +1330,7 @@ try {
   await disposeRuntime(firstRuntime, settingsManager, firstInvocationGuard, "dispose-first", "dispose-first", "dispose-first-extension-errors");
   firstRuntime = undefined;
   checkpoint("presence-one", "presence-one-record");
-  const afterFirstDispose = await within(observer.listActivations(), 30000);
+  const afterFirstDispose = await within(observer.listActivations(), SDK_LIFECYCLE_WINDOWS_LIST_DEADLINE_MS);
   assert.deepEqual(afterFirstDispose.map((record) => record.sessionId), [secondId], "disposing one runtime must withdraw only its presence");
   progress.presenceAfterFirstDispose = afterFirstDispose.length;
   checkpoint("presence-one", "presence-one-model-unbound");
@@ -1330,7 +1342,7 @@ try {
   await disposeRuntime(secondRuntime, settingsManager, secondInvocationGuard, "dispose-second", "dispose-second", "dispose-second-extension-errors");
   secondRuntime = undefined;
   checkpoint("presence-none", "presence-no-records");
-  const afterSecondDispose = await within(observer.listActivations(), 30000);
+  const afterSecondDispose = await within(observer.listActivations(), SDK_LIFECYCLE_WINDOWS_LIST_DEADLINE_MS);
   assert.deepEqual(afterSecondDispose, [], "disposing both runtimes must withdraw both presence records");
   progress.presenceAfterSecondDispose = afterSecondDispose.length;
   checkpoint("presence-none", "presence-none-extension-errors");

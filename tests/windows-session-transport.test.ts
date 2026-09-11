@@ -81,6 +81,54 @@ test("Windows startup markers are monotonic and never satisfy start readiness", 
 	child.emit("exit", 1, null);
 });
 
+test("Windows host bounds default startup separately from ordinary RPCs without resetting for markers", async (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	for (const deadline of [0, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2_001]) assert.throws(() => new WindowsSessionTransportHost({ rpcDeadlineMs: deadline }), /invalid Windows transport deadline/);
+	for (const deadline of [0, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 30_001]) assert.throws(() => new WindowsSessionTransportHost({ startupDeadlineMs: deadline }), /invalid Windows transport startup deadline/);
+
+	const startupChild = new FakeTransportChild();
+	const startupHost = new WindowsSessionTransportHost({ spawnProcess: () => startupChild as never });
+	let defaultStartupSettled = false;
+	const starting = startupHost.start();
+	void starting.then(() => { defaultStartupSettled = true; }, () => { defaultStartupSettled = true; });
+	t.mock.timers.tick(2_000);
+	// This test mocks only setTimeout, so the real setImmediate turn drains the
+	// attached rejection reaction before checking the 2s boundary.
+	await nextTurn();
+	assert.equal(defaultStartupSettled, false, "the default start handshake remains pending beyond the default RPC deadline");
+	t.mock.timers.tick(28_000);
+	await assert.rejects(starting, /Windows transport request timed out/);
+	const startupClosing = startupHost.close();
+	startupChild.stdout.emit("data", Buffer.from('{"requestId":"shutdown-2","ok":true,"result":{"state":"partial"}}\n'));
+	startupChild.emit("close", 0, null);
+	await startupClosing;
+
+	const ordinaryChild = new FakeTransportChild();
+	const ordinaryHost = new WindowsSessionTransportHost({ spawnProcess: () => ordinaryChild as never });
+	const ordinaryStarting = ordinaryHost.start();
+	ordinaryChild.stdout.emit("data", Buffer.from('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}\n'));
+	await ordinaryStarting;
+	const ordinary = ordinaryHost.request("list", {});
+	t.mock.timers.tick(2_000);
+	await assert.rejects(ordinary, /Windows transport request timed out/);
+	const ordinaryClosing = ordinaryHost.close();
+	ordinaryChild.stdout.emit("data", Buffer.from('{"requestId":"shutdown-3","ok":true,"result":{"state":"partial"}}\n'));
+	ordinaryChild.emit("close", 0, null);
+	await ordinaryClosing;
+
+	const markerChild = new FakeTransportChild();
+	const markerHost = new WindowsSessionTransportHost({ spawnProcess: () => markerChild as never, startupDeadlineMs: 10 });
+	const markerStarting = markerHost.start();
+	t.mock.timers.tick(5);
+	markerChild.stdout.emit("data", Buffer.from('{"event":"startup-marker","marker":"script-entered"}\n{"event":"startup-marker","marker":"native-ready"}\n'));
+	t.mock.timers.tick(5);
+	await assert.rejects(markerStarting, /Windows transport request timed out/);
+	const markerClosing = markerHost.close();
+	markerChild.stdout.emit("data", Buffer.from('{"requestId":"shutdown-2","ok":true,"result":{"state":"partial"}}\n'));
+	markerChild.emit("close", 0, null);
+	await markerClosing;
+});
+
 test("Windows startup marker transport rejects unknown, duplicate, and regressive frames", async () => {
 	for (const frames of [
 		['{"event":"startup-marker","marker":"native-ready"}'],

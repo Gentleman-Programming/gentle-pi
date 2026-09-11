@@ -870,8 +870,10 @@ test("Windows packed startup environment experiment source guard selects the pai
 	assert.doesNotMatch(environmentExperiment, /\.\.\.process\.env/);
 	assert.doesNotMatch(environmentFactory, /PSModulePath:\s*process\.env/);
 	const workflow = await readFile(fileURLToPath(new URL("../.github/workflows/windows-session-bootstrap.yml", import.meta.url)), "utf8");
+	assert.match(workflow, /workflow_dispatch:\s+inputs:\s+run_windows_startup_experiment:\s+description: "Run the completed paired Windows startup experiment"\s+required: false\s+default: false\s+type: boolean/);
 	assert.match(workflow, /Measure paired packed Windows helper startup environment experiment \(experimental\)/);
-	assert.match(workflow, /if: "!cancelled\(\) && matrix\.platform == 'windows' && steps\.install_windows_dependencies\.outcome == 'success'"/);
+	assert.match(workflow, /if: "!cancelled\(\) && inputs\.run_windows_startup_experiment == true && matrix\.platform == 'windows' && steps\.install_windows_dependencies\.outcome == 'success'"/);
+	assert.match(workflow, /Prove packed real SDK session lifecycle \(Windows\)\s+if: "!cancelled\(\) && matrix\.platform == 'windows' && steps\.install_windows_dependencies\.outcome == 'success'"/);
 	assert.match(workflow, /node scripts\\test-packed-runner\.mjs --windows-startup-timing-environment/);
 	for (const title of [
 		"Windows startup environment delta admits only the fixed machine path allowlist",
@@ -1482,6 +1484,15 @@ test("packed lifecycle source uses the exported phase sequence", async (t) => {
 	assert.match(source, /windowsRegistryObservation\.admitsFullSuccess/);
 	assert.match(source, /lastStartupMarker: null/);
 	assert.match(source, /windowsRegistryObservation\.lastStartupMarker === "native-ready"/);
+	assert.match(source, /const SDK_LIFECYCLE_WINDOWS_BIND_DEADLINE_MS = 30_000 \+ 2_000 \+ 2_000 \+ 6_000;/);
+	assert.match(source, /const SDK_LIFECYCLE_WINDOWS_REGISTRY_DEADLINE_MS = 30_000 \+ 2_000 \+ 2_000 \+ 2 \* 500 \+ 5_000;/);
+	assert.match(source, /const SDK_LIFECYCLE_WINDOWS_LIST_DEADLINE_MS = 2_000;/);
+	assert.match(source, /const SDK_LIFECYCLE_PROBE_TIMEOUT_MS = 4 \* 30_000 \+ 2 \* 30_000 \+ 2 \* 40_000 \+ 40_000 \+ 3 \* 2_000 \+ 2 \* 15_000 \+ 15_000 \+ 4_000 \+ 5_000;/);
+	assert.match(source, /bindExtensions\(\{ mode: "json", onError: recordExtensionError \}\), SDK_LIFECYCLE_WINDOWS_BIND_DEADLINE_MS/);
+	assert.match(source, /createRegistry\(agentHome, \(event\) => windowsRegistryObservation\.observe\(event\)\), SDK_LIFECYCLE_WINDOWS_REGISTRY_DEADLINE_MS/);
+	assert.match(source, /within\(observer\.listActivations\(\), SDK_LIFECYCLE_WINDOWS_LIST_DEADLINE_MS\)/);
+	assert.match(source, /setTimeout\(\(\) => requestStop\(new SdkLifecycleFailure\("lifecycle-probe", "timed-out"\)\), SDK_LIFECYCLE_PROBE_TIMEOUT_MS\)/);
+	assert.doesNotMatch(source, /createRegistry\(agentHome,[\s\S]{0,160}(?:startupDeadlineMs|rpcDeadlineMs)/);
 	assert.doesNotMatch(source, /Object\.defineProperty\(candidate|Host\.prototype|windowsRegistryObservation\.restore|let expected = "start"/);
 });
 
