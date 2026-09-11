@@ -13,6 +13,7 @@ import type {
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
 import { __testing, applyModelConfig, applyModelConfigAsync, createGentleAiExtension } from "../extensions/gentle-ai.ts";
+import { PROFILES_KIND, PROFILES_VERSION } from "../lib/agent-profiles.ts";
 import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError, type NativeReviewCli } from "../lib/native-review-cli.ts";
 import { CandidateViewError, type CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 import { installPackageAssets } from "../lib/sdd-preflight.ts";
@@ -252,6 +253,9 @@ function routingConsumerFixture(t: test.TestContext, agents = ["worker"]) {
 		registerCommand(name, command) { commands.set(name, command); },
 	} as ExtensionAPI);
 	const notifications: Array<{ message: string; severity: string }> = [];
+	// The profiles panel reads the terminal rows to size its full-screen frame, so
+	// the fake UI hands every factory a TUI-shaped stand-in with a mutable height.
+	const fixtureTui = { terminal: { rows: 24 }, requestRender() {} };
 	let panelVisits = 0;
 	const panels: string[] = [];
 	let onPanel = () => ({ type: "cancel", config: {} });
@@ -267,7 +271,7 @@ function routingConsumerFixture(t: test.TestContext, agents = ["worker"]) {
 			notify(message: string, severity: string) { notifications.push({ message, severity }); },
 			custom: async (factory: (tui: unknown, theme: Theme, keybindings: unknown, done: (result: unknown) => void) => RoutingConsumerPanel) => {
 				let result: unknown;
-				const panel = factory(undefined, { fg: (_color: string, text: string) => text } as unknown as Theme, undefined, (value) => { result = value; });
+				const panel = factory(fixtureTui, { fg: (_color: string, text: string) => text } as unknown as Theme, undefined, (value) => { result = value; });
 				panels.push(stripAnsi(renderComponent(panel)));
 				panelVisits += 1;
 				if (onInput) {
@@ -281,6 +285,7 @@ function routingConsumerFixture(t: test.TestContext, agents = ["worker"]) {
 	} as unknown as Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1];
 	return {
 		root, agentHome, configHome, projectPath, globalPath, exportPath, notifications, panels,
+		tui: fixtureTui as { terminal: { rows: number } },
 		panelVisits: () => panelVisits,
 		onPanel(action: typeof onPanel) { onPanel = action; },
 		onInput(action: (panel: RoutingConsumerPanel) => void) { onInput = action; },
@@ -1592,4 +1597,143 @@ test("bash tool_call confirms every compound action and centers a long git -C pu
 	assert.equal(title, "Allow guarded actions: git push; npm publish?");
 	assert.match(preview, /push origin main && npm publish --tag beta/);
 	assert.ok(preview.startsWith("…"));
+});
+// /gentle:profiles reopens its panel after every action, so a test that applies
+// once must confirm on the first visit and close on the next, or the panel and
+// the action loop feed each other forever.
+function applyOnce(
+	fixture: { onInput(action: (panel: { handleInput(data: string): void }) => void): void },
+): void {
+	let visits = 0;
+	fixture.onInput((panel) => {
+		visits += 1;
+		panel.handleInput(visits === 1 ? "\r" : "\x1b");
+	});
+}
+
+function profilesStoreFixture(t: test.TestContext) {
+	const fixture = routingConsumerFixture(t, ["worker"]);
+	const storePath = join(fixture.configHome, "profiles.json");
+	const settingsPath = join(fixture.agentHome, "settings.json");
+	const writeStore = (profiles: Record<string, unknown>, active?: string) => {
+		mkdirSync(fixture.configHome, { recursive: true });
+		const store: Record<string, unknown> = { kind: PROFILES_KIND, version: PROFILES_VERSION, profiles };
+		if (active !== undefined) store.active = active;
+		writeFileSync(storePath, `${JSON.stringify(store, null, 2)}\n`);
+	};
+	const writeSettings = (extra: Record<string, unknown> = {}) => {
+		const settings = {
+			packages: ["npm:pi-mcp-adapter"],
+			theme: "Gentleman-Cute",
+			defaultProvider: "nan",
+			defaultModel: "deepseek-v4-flash",
+			defaultThinkingLevel: "high",
+			...extra,
+		};
+		writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+		return settings;
+	};
+	return { fixture, storePath, settingsPath, writeStore, writeSettings };
+}
+
+test("applying a profile persists its orchestrator and never leaks the key into agent routing", async (t) => {
+	const { fixture, settingsPath, writeStore, writeSettings } = profilesStoreFixture(t);
+	const before = writeSettings();
+	writeStore({
+		team: {
+			orchestrator: { model: "nan/glm5.3", thinking: "max" },
+			worker: { model: "openai/alpha" },
+		},
+	});
+	applyOnce(fixture);
+	await fixture.run("gentle:profiles");
+
+	const after = JSON.parse(readFileSync(settingsPath, "utf8"));
+	assert.equal(after.defaultProvider, "nan");
+	assert.equal(after.defaultModel, "glm5.3");
+	assert.equal(after.defaultThinkingLevel, "max");
+	assert.deepEqual(after.packages, before.packages, "unrelated settings keys survive");
+	assert.equal(after.theme, before.theme, "unrelated settings keys survive");
+
+	// The reserved key is routing, not an agent: it must never reach the
+	// subagent profile store or the agent frontmatter.
+	const projectProfiles = JSON.parse(readFileSync(join(fixture.root, ".pi", "subagents.json"), "utf8"));
+	assert.equal("orchestrator" in projectProfiles.model_profiles, false);
+	assert.equal(readFileSync(join(fixture.root, ".pi", "agents", "worker.md"), "utf8"), readFileSync(join(fixture.root, ".pi", "agents", "worker.md"), "utf8"));
+	assert.match(readFileSync(join(fixture.root, ".pi", "agents", "worker.md"), "utf8"), /model: openai\/alpha/);
+	const applied = fixture.notifications.at(-1)?.message ?? "";
+	assert.match(applied, /Orchestrator set to nan\/glm5\.3 · max/);
+});
+
+test("applying a profile without an orchestrator entry leaves settings.json untouched", async (t) => {
+	const { fixture, settingsPath, writeStore, writeSettings } = profilesStoreFixture(t);
+	writeSettings();
+	writeStore({ team: { worker: { model: "openai/alpha" } } });
+	applyOnce(fixture);
+	await fixture.run("gentle:profiles");
+
+	const after = JSON.parse(readFileSync(settingsPath, "utf8"));
+	assert.equal(after.defaultProvider, "nan");
+	assert.equal(after.defaultModel, "deepseek-v4-flash");
+	assert.equal(after.defaultThinkingLevel, "high");
+	const applied = fixture.notifications.at(-1)?.message ?? "";
+	assert.doesNotMatch(applied, /Orchestrator set to/);
+});
+
+test("a profile store entry with only the orchestrator key counts zero roles", async (t) => {
+	const { fixture, writeStore } = profilesStoreFixture(t);
+	writeStore({ team: { orchestrator: { model: "nan/glm5.3", thinking: "high" } } }, "team");
+	applyOnce(fixture);
+	await fixture.run("gentle:profiles");
+	const applied = fixture.notifications.at(-1)?.message ?? "";
+	assert.match(applied, /0 agents updated/);
+	assert.match(applied, /Orchestrator set to nan\/glm5\.3 · high/);
+});
+
+test("the profiles panel fills the terminal, lists routing per agent, and scrolls", async (t) => {
+	const { fixture, writeStore } = profilesStoreFixture(t);
+	writeStore({
+		team: {
+			orchestrator: { model: "nan/glm5.3", thinking: "high" },
+			worker: { model: "openai/alpha", thinking: "high" },
+			"sdd-design": { model: "nan/glm5.3", thinking: "high" },
+		},
+	}, "team");
+	let rendered: string | undefined;
+	let panel: { render(width: number): string[] } | undefined;
+	fixture.onInput((visited) => {
+		panel = visited;
+		rendered = renderComponent(visited);
+		visited.handleInput("\x1b");
+	});
+	await fixture.run("gentle:profiles");
+
+	assert.ok(rendered);
+	const lines = rendered.split("\n");
+	// The frame spans the terminal height the fake TUI reports.
+	assert.equal(lines.length, 24, `expected 24 rows, got ${lines.length}`);
+	assert.match(lines[0], /^╭/);
+	assert.match(lines.at(-1)!, /^╰/);
+	const text = rendered;
+	// Routing is listed one agent per line, aligned in columns, never collapsed
+	// into "N agents → model: a, b, …" summaries.
+	assert.match(text, /Profile routing/);
+	assert.match(text, /Current routing \(models\.json\)/);
+	assert.match(text, /orchestrator\s+nan\/glm5\.3 · high/);
+	assert.match(text, /worker\s+openai\/alpha\s+high/);
+	assert.match(text, /sdd-design\s+nan\/glm5\.3\s+high/);
+	assert.doesNotMatch(text, /agents? → /);
+
+	// A taller terminal renders a taller frame with the same content.
+	fixture.tui.terminal.rows = 40;
+	const taller = renderComponent(panel);
+	assert.equal(taller.split("\n").length, 40);
+
+	// A short terminal clamps instead of crashing, and keeps both borders.
+	fixture.tui.terminal.rows = 9;
+	const short = stripAnsi(panel.render(120).map((line) => line.replace(/[ \t]+$/g, "")).join("\n"));
+	const shortLines = short.split("\n");
+	assert.equal(shortLines.length, 9);
+	assert.match(shortLines[0], /^╭/);
+	assert.match(shortLines.at(-1)!, /^╰/);
 });

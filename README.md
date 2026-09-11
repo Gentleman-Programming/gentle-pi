@@ -640,23 +640,24 @@ Legacy string entries are still accepted and treated as `model`-only config.
 /gentle:profiles
 ```
 
-Profiles are named, switchable snapshots of the global agent-model routing from `/gentle:models`. The panel shows the profile list on the left and a detail pane comparing the selected profile's routing with the currently effective routing. Keys:
+Profiles are named, switchable snapshots of the global agent-model routing from `/gentle:models`. The panel fills the terminal, shows the profile list on the left, and a detail pane comparing the selected profile's routing with the currently effective routing, one line per agent in shared columns. Keys:
 
 | Key     | Action                                                                 |
 | ------- | ---------------------------------------------------------------------- |
-| `enter` | Apply the selected profile live (writes `models.json`, reconciles agents). |
+| `enter` | Apply the selected profile live (writes `models.json`, reconciles agents, sets the orchestrator when the profile defines one). |
 | `c`     | Create a new, empty profile.                                           |
-| `s`     | Update the selected profile from the current routing.                  |
+| `s`     | Update the selected profile from the current routing (including the orchestrator currently set in `settings.json`). |
 | `d`     | Duplicate the selected profile.                                        |
 | `r`     | Rename the selected profile (keeps it active if it was active).        |
 | `x`     | Delete the selected profile (refuses the active profile).              |
 | `e`     | Export the selected profile to `~/.pi/gentle-ai/profiles.export.json`. |
 | `i`     | Import a profile from `~/.pi/gentle-ai/profiles.export.json`.          |
+| `pgup`/`pgdn`, `ctrl+j`/`ctrl+k`, wheel | Scroll the detail pane.                                |
 | `esc`   | Close.                                                                 |
 
 Applying a profile writes `~/.pi/gentle-ai/models.json`, then reconciles agent frontmatter and `subagents.json` the same way `/gentle:models` does. The reconciliation happens on the next subagent launch, and that launch still routes with the previous routing — expect one launch of lag after switching. The active profile is persisted so `/gentle:profiles` reopens with the applied profile marked.
 
-Profiles only cover per-agent routing for SDD/custom agents. The orchestrator model selected in `settings.json` is NOT part of a profile and is never changed by applying one.
+A profile also carries the orchestrator under the reserved routing key `orchestrator`. Applying a profile that defines it writes `defaultProvider`, `defaultModel`, and `defaultThinkingLevel` to Pi's global `settings.json` (preserving every other key; an unreadable `settings.json` aborts that part and is reported instead of being overwritten). Applying a profile without an `orchestrator` entry never moves the orchestrator, and `s` snapshots the currently effective orchestrator together with the routing. `orchestrator` is reserved: it is not a subagent name, is never written to `subagents.json`, and is not counted as a role.
 
 When `profiles.json` is missing, the command seeds one profile named `current` captured from the existing `models.json`, marked active only when `models.json` has routing entries. Profiles or routing entries dropped by normalization are named in a warning instead of being lost silently.
 
@@ -675,6 +676,10 @@ Store shape:
   "active": "deep-work",
   "profiles": {
     "deep-work": {
+      "orchestrator": {
+        "model": "anthropic/claude-sonnet-4",
+        "thinking": "high"
+      },
       "sdd-design": {
         "model": "anthropic/claude-sonnet-4",
         "thinking": "high"

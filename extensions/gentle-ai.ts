@@ -32,7 +32,7 @@ import type {
 	ThemeColor,
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
-import { isKeyRelease, matchesKey, truncateToWidth, type KeybindingsManager, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { Key, isKeyRelease, matchesKey, truncateToWidth, type KeybindingsManager, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
 import {
 	ensureSddPreflight,
@@ -67,21 +67,33 @@ import {
 	createProfile,
 	deleteProfile,
 	duplicateProfile,
-	formatProfileSummaryLines,
+	formatOrchestratorSelection,
+	formatRoutingRow,
+	isProfileOrchestratorKey,
 	parseProfileExportTextWithDrops,
+	PROFILE_ORCHESTRATOR_KEY,
 	profileExportPath,
+	profileRoutingRows,
 	profilesFilePath,
+	readProfileOrchestrator,
 	readProfilesFileResult,
 	renameProfile,
+	routingColumnWidths,
 	serializeProfileExport,
 	setActiveProfile,
-	summarizeProfile,
 	updateProfile,
 	writeProfilesFileSync,
 	type AgentProfilesFile,
 	type ProfileListItem,
+	type ProfileRoutingRow,
 	type ProfilesParseDrops,
 } from "../lib/agent-profiles.ts";
+import {
+	applyOrchestratorSettings,
+	readOrchestratorSettings,
+	restoreOrchestratorSettings,
+	type OrchestratorSettingsReadResult,
+} from "../lib/profiles-orchestrator.ts";
 import { measureAgentsViewLayout, type AgentsViewLayout } from "../lib/agents-view-layout.ts";
 import { NativeChoiceList } from "../lib/native-choice-list.ts";
 import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-interaction.ts";
@@ -2333,6 +2345,15 @@ function projectSettingsPath(cwd: string): string {
 	return join(cwd, ".pi", "settings.json");
 }
 
+/**
+ * Pi's own global settings file, which is where the orchestrator model lives.
+ * Profiles own the three `default*` keys there; nothing else in this extension
+ * reads or writes that file.
+ */
+function orchestratorSettingsPath(): string {
+	return join(gentlePiAgentHome(), "settings.json");
+}
+
 function removeLegacyAgentOverridesFromSettings(
 	settingsPath: string,
 	settings: Record<string, unknown>,
@@ -2473,6 +2494,9 @@ export function applyModelConfig(
 	}
 	for (const [name, entry] of Object.entries(config)) {
 		if (isProviderReviewRole(name)) continue;
+		// The orchestrator is routing, not an agent: its model lives in Pi's global
+		// settings.json and must never reach subagents.json.
+		if (isProfileOrchestratorKey(name)) continue;
 		if (!seenAgents.has(name) && isClearRoutingEntry(entry)) {
 			if (updateSubagentModelProfile(cwd, "user", name, entry)) updated += 1;
 			else skipped += 1;
@@ -2522,6 +2546,7 @@ export async function applyModelConfigAsync(
 	}
 	for (const [name, entry] of Object.entries(config)) {
 		if (isProviderReviewRole(name)) continue;
+		if (isProfileOrchestratorKey(name)) continue;
 		if (!seenAgents.has(name) && isClearRoutingEntry(entry)) {
 			if (await updateSubagentModelProfileAsync(cwd, "user", name, entry))
 				updated += 1;
@@ -3224,17 +3249,29 @@ function profilesErrorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/** Keep a detail-pane scroll offset inside the bounds of its own content. */
+function clampDetailScroll(offset: number, lineCount: number, bodyRows: number): number {
+	return Math.max(0, Math.min(offset, Math.max(0, lineCount - bodyRows)));
+}
+
 // Left profile list, right detail panes. Rendering and pointer routing share
 // one measured layout; the list rows keep native keyboard, hover, press,
-// click, and wheel handling through NativeChoiceList.
+// click, and wheel handling through NativeChoiceList. The frame takes the full
+// overlay, so its height follows the terminal rows the same way AgentsView does.
 class ProfilesPanel implements OverlayComponent {
 	private completed = false;
 	private pointerLayout: ProfilesPanelPointerLayout | undefined;
+	private detailScroll = 0;
+	private lastDetailLineCount = 0;
+	private lastDetailRows = 0;
+	private lastSelectedId: string | undefined;
 	readonly list: NativeChoiceList<ProfileListItem>;
 	private readonly file: AgentProfilesFile;
 	private readonly currentConfig: AgentModelConfig;
 	private readonly done: (result: ProfilesPanelResult) => void;
 	private readonly theme: Theme | undefined;
+	private readonly rows: () => number;
+	private readonly orchestratorSettings: OrchestratorSettingsReadResult;
 
 	constructor(
 		file: AgentProfilesFile,
@@ -3242,12 +3279,16 @@ class ProfilesPanel implements OverlayComponent {
 		done: (result: ProfilesPanelResult) => void,
 		keybindings: KeybindingsManager | undefined,
 		theme: Theme | undefined,
-		selectedName?: string,
+		selectedName: string | undefined,
+		rows: () => number,
+		orchestratorSettings: OrchestratorSettingsReadResult,
 	) {
 		this.file = file;
 		this.currentConfig = currentConfig;
 		this.done = done;
 		this.theme = theme;
+		this.rows = rows;
+		this.orchestratorSettings = orchestratorSettings;
 		const items = buildProfileListItems(file);
 		this.list = new NativeChoiceList<ProfileListItem>(
 			items,
@@ -3277,6 +3318,14 @@ class ProfilesPanel implements OverlayComponent {
 			return;
 		}
 		const name = this.list.getSelectedItem()?.id;
+		if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.ctrl("j"))) {
+			this.scrollDetail(this.pageRows());
+			return;
+		}
+		if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.ctrl("k"))) {
+			this.scrollDetail(-this.pageRows());
+			return;
+		}
 		if (data === "c") return this.finish({ type: "create" });
 		if (data === "i") return this.finish({ type: "import" });
 		if (!name) return this.list.handleInput(data);
@@ -3291,7 +3340,19 @@ class ProfilesPanel implements OverlayComponent {
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		const layout = this.pointerLayout;
 		if (!layout) return undefined;
-		if (event.y < layout.listTop || event.y >= layout.listTop + layout.bodyRows) return undefined;
+		const inBody = event.y >= layout.listTop && event.y < layout.listTop + layout.bodyRows;
+		if (
+			inBody &&
+			event.type === "wheel" &&
+			event.wheelDelta &&
+			layout.mode === "panes" &&
+			event.x >= layout.threadX &&
+			event.x < layout.threadX + layout.threadWidth
+		) {
+			this.scrollDetail(event.wheelDelta);
+			return { handled: true, render: true };
+		}
+		if (!inBody) return undefined;
 		if (event.x < layout.listX || event.x >= layout.listX + layout.listWidth) return undefined;
 		return this.list.handleMouse({
 			...event,
@@ -3306,14 +3367,24 @@ class ProfilesPanel implements OverlayComponent {
 		const safeWidth = Math.max(1, width);
 		const listWidth = measureAgentsViewLayout(safeWidth, PROFILES_PANEL_MIN_BODY_ROWS + 3).listWidth;
 		const listLines = this.list.render(listWidth);
-		const bodyRows = Math.max(PROFILES_PANEL_MIN_BODY_ROWS, listLines.length);
-		const layout = measureAgentsViewLayout(safeWidth, bodyRows + 3);
+		// The frame fills the overlay, and the overlay fills the terminal, so the
+		// body height comes from the terminal rows rather than from the content.
+		const rows = Math.max(PROFILES_PANEL_MIN_BODY_ROWS + 3, Math.floor(this.rows()));
+		const layout = measureAgentsViewLayout(safeWidth, rows);
 		if (layout.mode === "fallback" || layout.width === 0) {
 			this.pointerLayout = undefined;
 			return [];
 		}
-		this.pointerLayout = { ...layout, listTop: 1 };
+		const selectedId = this.list.getSelectedItem()?.id;
+		if (selectedId !== this.lastSelectedId) {
+			this.lastSelectedId = selectedId;
+			this.detailScroll = 0;
+		}
 		const detailLines = this.renderDetailLines(layout.threadWidth, layout.mode === "panes");
+		this.lastDetailLineCount = detailLines.length;
+		this.lastDetailRows = layout.bodyRows;
+		this.detailScroll = clampDetailScroll(this.detailScroll, detailLines.length, layout.bodyRows);
+		this.pointerLayout = { ...layout, listTop: 1 };
 		const rule = "─".repeat(Math.max(0, layout.width - 2));
 		const lines: string[] = [this.renderText(`╭${rule}╮`, "border")];
 		for (let row = 0; row < layout.bodyRows; row += 1) {
@@ -3322,6 +3393,18 @@ class ProfilesPanel implements OverlayComponent {
 		lines.push(this.renderFooterRow(layout.width));
 		lines.push(this.renderText(`╰${rule}╯`, "border"));
 		return lines;
+	}
+
+	private scrollDetail(delta: number): void {
+		this.detailScroll = clampDetailScroll(
+			this.detailScroll + Math.trunc(delta),
+			this.lastDetailLineCount,
+			this.lastDetailRows,
+		);
+	}
+
+	private pageRows(): number {
+		return Math.max(1, this.lastDetailRows - 1);
 	}
 
 	private finish(result: ProfilesPanelResult): void {
@@ -3345,7 +3428,7 @@ class ProfilesPanel implements OverlayComponent {
 				" ",
 				this.renderText("│", "border"),
 				" ",
-				this.fitPaneLine(detailLines[row] ?? "", layout.threadWidth),
+				this.fitPaneLine(detailLines[this.detailScroll + row] ?? "", layout.threadWidth),
 				this.renderText("│", "border"),
 			].join("");
 		}
@@ -3360,7 +3443,7 @@ class ProfilesPanel implements OverlayComponent {
 
 	private renderFooterRow(width: number): string {
 		const hints =
-			"enter apply · c create · s update · d duplicate · r rename · x delete · e export · i import · esc close";
+			"enter apply · c create · s update · d duplicate · r rename · x delete · e export · i import · pgup/pgdn scroll · esc close";
 		return [
 			this.renderText("│", "border"),
 			" ",
@@ -3377,15 +3460,44 @@ class ProfilesPanel implements OverlayComponent {
 			return [this.renderLine("No profile selected.", width, "muted")];
 		}
 		const config = this.file.profiles[name];
+		const profileRows = profileRoutingRows(config);
+		const currentRows = profileRoutingRows(this.currentConfig);
+		// One shared measurement across both tables, so the same agent sits in the
+		// same column whether it comes from the profile or from models.json.
+		const widths = routingColumnWidths(profileRows, currentRows);
 		return [
 			this.renderLine(name === this.file.active ? `${name} (active)` : name, width, "title"),
+			this.renderLine(
+				`orchestrator  ${formatOrchestratorSelection(readProfileOrchestrator(config))}`,
+				width,
+				"text",
+			),
+			this.renderLine(`now           ${this.effectiveOrchestratorLabel()}`, width, "muted"),
 			"",
 			this.renderLine("Profile routing", width, "accent"),
-			...this.indentLines(formatProfileSummaryLines(summarizeProfile(config)), width),
+			...this.indentLines(this.routingLines(profileRows, widths), width),
 			"",
 			this.renderLine("Current routing (models.json)", width, "accent"),
-			...this.indentLines(formatProfileSummaryLines(summarizeProfile(this.currentConfig)), width),
+			...this.indentLines(this.routingLines(currentRows, widths), width),
 		];
+	}
+
+	private effectiveOrchestratorLabel(): string {
+		const settings = this.orchestratorSettings;
+		if (settings.status === "invalid") {
+			return `unreadable (${sanitizeTerminalText(settings.reason)})`;
+		}
+		return formatOrchestratorSelection(settings.status === "valid" ? settings.entry : undefined);
+	}
+
+	private routingLines(
+		rows: ProfileRoutingRow[],
+		widths: { agent: number; model: number },
+	): string[] {
+		if (rows.length === 0) {
+			return ["No routing entries — every agent inherits its default model."];
+		}
+		return rows.map((row) => formatRoutingRow(row, widths));
 	}
 
 	private indentLines(lines: string[], width: number): string[] {
@@ -3423,9 +3535,21 @@ async function showProfilesPanel(
 	currentConfig: AgentModelConfig,
 	selectedName?: string,
 ): Promise<ProfilesPanelResult> {
+	// Read once, for the panel lifetime. The orchestrator shown as "now" is the
+	// state the panel opened on, not a value that changes mid-panel.
+	const orchestratorSettings = readOrchestratorSettings(orchestratorSettingsPath());
 	return ctx.ui.custom<ProfilesPanelResult>(
 		(tui, theme, keybindings, done) => {
-			const panel = new ProfilesPanel(file, currentConfig, done, keybindings, theme, selectedName);
+			const panel = new ProfilesPanel(
+				file,
+				currentConfig,
+				done,
+				keybindings,
+				theme,
+				selectedName,
+				() => Math.max(0, tui.terminal.rows),
+				orchestratorSettings,
+			);
 			const container = createNativeFullscreenInteraction({
 				keyboardTarget: panel,
 				requestRender: () => tui.requestRender(),
@@ -3438,9 +3562,9 @@ async function showProfilesPanel(
 			overlay: true,
 			overlayOptions: {
 				anchor: "center",
-				width: "70%",
-				minWidth: 72,
-				maxHeight: "85%",
+				width: "100%",
+				maxHeight: "100%",
+				margin: 0,
 			},
 		},
 	);
@@ -3480,12 +3604,14 @@ async function runProfilesPanelAction(
 		case "apply": {
 			if (!hasOwnProfile(file.profiles, result.name)) return file;
 			const normalized = normalizeModelConfig(file.profiles[result.name]) ?? {};
-			// Applying spans two files and there is no cross-file rename, so order the
-			// writes to keep the store truthful and compensate on failure: claim the
-			// profile in the store first, then materialise routing. A claim that fails
-			// leaves routing untouched; anything that fails after the claim restores the
-			// previous claim and, when the previously active profile is known, the
-			// routing that profile implies.
+			const orchestratorEntry = readProfileOrchestrator(normalized);
+			// Applying spans three files — the store, models.json, and Pi's global
+			// settings.json — and there is no cross-file rename, so order the writes to
+			// keep the store truthful and compensate on failure: claim the profile in
+			// the store first, then materialise routing, then the orchestrator. A claim
+			// that fails leaves routing untouched; anything that fails after the claim
+			// restores the previous claim and, when the previously active profile is
+			// known, the routing that profile implies.
 			const claimed = setActiveProfile(file, result.name);
 			try {
 				writeProfilesFileSync(path, claimed);
@@ -3500,6 +3626,11 @@ async function runProfilesPanelAction(
 				file.active !== undefined && hasOwnProfile(file.profiles, file.active)
 					? normalizeModelConfig(file.profiles[file.active]) ?? {}
 					: undefined;
+			// Set only when the orchestrator write succeeded, so the revert knows it has
+			// something to undo. A rollback closure (not a previous-bytes value) is used
+			// because "the file did not exist before" is a real state that must restore
+			// by removing the file, and `undefined` bytes cannot carry that distinction.
+			let orchestratorRollback: (() => void) | undefined;
 			const revertClaim = async (routingWritten: boolean): Promise<AgentProfilesFile> => {
 				let restored = previousActiveConfig === undefined ? "" : "routing";
 				if (routingWritten && previousActiveConfig !== undefined) {
@@ -3507,6 +3638,14 @@ async function runProfilesPanelAction(
 						await writeModelConfigAsync(ctx.cwd, previousActiveConfig);
 					} catch {
 						restored = "";
+					}
+				}
+				if (orchestratorRollback) {
+					try {
+						orchestratorRollback();
+						restored = restored === "" ? "settings" : `${restored} and settings`;
+					} catch {
+						restored = restored === "" ? "" : restored;
 					}
 				}
 				try {
@@ -3538,11 +3677,28 @@ async function runProfilesPanelAction(
 			if (applyResult.invalidPath) {
 				return revertClaim(true);
 			}
+			let orchestratorNote = "";
+			if (orchestratorEntry !== undefined) {
+				const settingsPath = orchestratorSettingsPath();
+				const written = applyOrchestratorSettings(settingsPath, orchestratorEntry);
+				if (written.status === "invalid") {
+					ctx.ui.notify(
+						`el Gentleman could not set the orchestrator from profile "${result.name}": ${sanitizeTerminalText(written.reason)}. ${sanitizeTerminalText(settingsPath)} was left unchanged.`,
+						"warning",
+					);
+					return revertClaim(true);
+				}
+				if (written.status === "written") {
+					const previous = written.previous;
+					orchestratorRollback = () => restoreOrchestratorSettings(settingsPath, previous);
+					orchestratorNote = `\nOrchestrator set to ${formatOrchestratorSelection(orchestratorEntry)} in ${sanitizeTerminalText(settingsPath)}.`;
+				}
+			}
 			ctx.ui.notify(
 				[
 					`el Gentleman applied profile "${result.name}" — ${applyResult.updated} agent${applyResult.updated === 1 ? "" : "s"} updated.`,
 					"New routing takes effect on the next subagent launch.",
-				].join("\n"),
+				].join("\n") + orchestratorNote,
 				"info",
 			);
 			return claimed;
@@ -3561,8 +3717,17 @@ async function runProfilesPanelAction(
 		}
 		case "update": {
 			const current = await readModelConfigAsync(ctx.cwd);
+			// A profile is a complete snapshot, so capturing the current routing also
+			// captures the orchestrator the routing is running under. A settings file
+			// that cannot be read leaves the snapshot without an orchestrator entry
+			// rather than inventing one.
+			const settings = readOrchestratorSettings(orchestratorSettingsPath());
+			const snapshot: AgentModelConfig = cloneModelConfig(current);
+			if (settings.status === "valid" && settings.entry !== undefined) {
+				snapshot[PROFILE_ORCHESTRATOR_KEY] = { ...settings.entry };
+			}
 			try {
-				const next = updateProfile(file, result.name, cloneModelConfig(current));
+				const next = updateProfile(file, result.name, snapshot);
 				writeProfilesFileSync(path, next);
 				ctx.ui.notify(
 					`el Gentleman updated profile "${result.name}" from the current routing in ${modelConfigPath(ctx.cwd)}.`,

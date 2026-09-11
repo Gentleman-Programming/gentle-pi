@@ -11,7 +11,9 @@ import {
 	deleteProfile,
 	duplicateProfile,
 	emptyProfilesFile,
+	formatOrchestratorSelection,
 	formatProfileSummaryLines,
+	formatRoutingRow,
 	isValidProfileName,
 	normalizeProfilesFile,
 	parseProfileExportText,
@@ -19,12 +21,17 @@ import {
 	parseProfilesFileText,
 	PROFILE_EXPORT_KIND,
 	PROFILE_EXPORT_VERSION,
+	PROFILE_ORCHESTRATOR_KEY,
 	PROFILES_KIND,
 	PROFILES_VERSION,
 	profileExportPath,
+	profileRoleEntries,
+	profileRoutingRows,
 	profilesFilePath,
+	readProfileOrchestrator,
 	readProfilesFileResult,
 	renameProfile,
+	routingColumnWidths,
 	serializeProfileExport,
 	serializeProfilesFile,
 	setActiveProfile,
@@ -654,4 +661,62 @@ test("the path helpers resolve both stores inside the config home", () => {
 	const home = join(root, "config-home");
 	assert.equal(profilesFilePath(home), join(home, "profiles.json"));
 	assert.equal(profileExportPath(home), join(home, "profiles.export.json"));
+});
+
+test("the orchestrator key is never counted or listed as an agent role", () => {
+	const config: AgentModelConfig = {
+		[PROFILE_ORCHESTRATOR_KEY]: { model: "nan/glm5.3", thinking: "high" },
+		alpha: { model: "a/one" },
+		beta: { model: "a/one" },
+	};
+	assert.deepEqual(summarizeProfile(config), {
+		models: [{ model: "a/one", count: 2, roles: ["alpha", "beta"] }],
+		total: 2,
+	});
+	const file = createProfile(emptyProfilesFile(), "team", config);
+	assert.deepEqual(buildProfileListItems(file).map((item) => item.description), ["2 roles"]);
+	assert.deepEqual(profileRoleEntries(config).map(([name]) => name), ["alpha", "beta"]);
+	assert.deepEqual(readProfileOrchestrator(config), { model: "nan/glm5.3", thinking: "high" });
+});
+
+test("the orchestrator helper treats an absent or empty entry as undefined", () => {
+	assert.equal(readProfileOrchestrator({}), undefined);
+	assert.equal(readProfileOrchestrator({ alpha: { model: "a/one" } }), undefined);
+	assert.equal(readProfileOrchestrator({ [PROFILE_ORCHESTRATOR_KEY]: {} }), undefined);
+});
+
+test("profileRoutingRows lists one aligned row per agent, in a stable order", () => {
+	const rows = profileRoutingRows({
+		[PROFILE_ORCHESTRATOR_KEY]: { model: "nan/glm5.3" },
+		zeta: { model: "nan/deepseek-v4-flash", thinking: "high" },
+		alpha: { thinking: "high" },
+		mid: { model: "nan/qwen3.8-flash" },
+	});
+	assert.deepEqual(rows, [
+		{ agent: "alpha", model: "inherit", thinking: "high" },
+		{ agent: "mid", model: "nan/qwen3.8-flash", thinking: "inherit" },
+		{ agent: "zeta", model: "nan/deepseek-v4-flash", thinking: "high" },
+	]);
+	assert.deepEqual(profileRoutingRows({}), []);
+
+	const widths = routingColumnWidths(rows, [{ agent: "a-much-longer-agent-name", model: "m/x", thinking: "low" }]);
+	assert.deepEqual(widths, { agent: "a-much-longer-agent-name".length, model: "nan/deepseek-v4-flash".length });
+	assert.equal(
+		formatRoutingRow(rows[0], widths),
+		`${"alpha".padEnd(widths.agent)}  ${"inherit".padEnd(widths.model)}  high`,
+	);
+	assert.equal(
+		formatRoutingRow(rows[2], widths),
+		`${"zeta".padEnd(widths.agent)}  ${"nan/deepseek-v4-flash".padEnd(widths.model)}  high`,
+	);
+});
+
+test("formatOrchestratorSelection separates set, inherit, and inherit-with-thinking", () => {
+	assert.equal(formatOrchestratorSelection(undefined), "inherit");
+	assert.equal(formatOrchestratorSelection({ thinking: "high" }), "inherit · high");
+	assert.equal(formatOrchestratorSelection({ model: "nan/glm5.3" }), "nan/glm5.3");
+	assert.equal(
+		formatOrchestratorSelection({ model: "nan/glm5.3", thinking: "max" }),
+		"nan/glm5.3 · max",
+	);
 });
