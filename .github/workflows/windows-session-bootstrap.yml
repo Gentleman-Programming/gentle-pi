@@ -39,6 +39,7 @@ jobs:
           version: 11.1.1
           dest: ${{ runner.temp }}/setup-pnpm
       - name: Install pinned dependencies without lifecycle scripts (Windows)
+        id: install_windows_dependencies
         if: matrix.platform == 'windows' && runner.environment == 'github-hosted'
         shell: pwsh
         run: pnpm install --frozen-lockfile --ignore-scripts --store-dir "$env:RUNNER_TEMP\pnpm-store"
@@ -63,7 +64,7 @@ jobs:
         shell: bash
         run: node --experimental-strip-types --test tests/gentle-agents.test.ts tests/windows-session-compile.test.ts tests/windows-session-transport.test.ts
       - name: Run standing permission IPC boundary test (Windows)
-        if: matrix.platform == 'windows'
+        if: "!cancelled() && matrix.platform == 'windows' && steps.install_windows_dependencies.outcome == 'success'"
         shell: pwsh
         run: node --experimental-strip-types --test tests/review-session-standing-permission-ipc.test.ts
       - name: Run POSIX session transport tests
