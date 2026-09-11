@@ -35,6 +35,9 @@ jobs:
         env:
           GENTLE_PI_REQUIRE_NATIVE_BINARY: "1"
 
+      - name: Type check
+        run: pnpm run typecheck
+
       - name: Verify generated runtime modules
         run: pnpm run check:runtime-modules
 
