@@ -29,16 +29,36 @@ For authoritative native status, route only by the bounded `nextRecommended` tok
 
 | `nextRecommended` | Planning route |
 | --- | --- |
+| `propose` | `sdd-proposal` |
+| `spec` | `sdd-spec` |
+| `design` | `sdd-design` |
+| `tasks` | `sdd-tasks` |
 | `sdd-propose` | `sdd-proposal` |
 | `sdd-spec` | `sdd-spec` |
 | `sdd-design` | `sdd-design` |
 | `sdd-tasks` | `sdd-tasks` |
 
+The unprefixed tokens come from the native Gentle AI v2 status contract; the `sdd-*` tokens come from Gentle Pi's local resolver. Both forms authorize the same bounded planning routes.
+
 These planning routes remain runnable when missing planning artifacts leave `dependencies.apply: blocked`; do not require apply readiness to produce those artifacts. This is a planning-only exception, not permission to run apply or another blocked non-planning phase.
 
 Before any planning launch, stop for ambiguous change selection, unresolved session preflight, or unsafe action context. Carry `actionContext` and prove planned writes are within the authoritative workspace or allowed edit roots; workspace-planning without allowed edit roots remains read-only. Planning does not bypass the init guard, pre-proposal gate, or phase approval requirements.
 
-For non-planning phases, stop when that phase's dependency is `blocked`. When `nextRecommended` is `blocked` or `resolve-blockers`, report `blockedReasons` and stop, even if a planning artifact is missing. Unknown tokens do not authorize a launch. Non-empty `blockedReasons` forbid apply, sync, and archive work; `sdd-verify` may run only when `nextRecommended` is `sdd-verify` and its dependency permits it, to remediate or refresh evidence for the blockers. The non-authoritative `resolve-via-engram` store carve-out remains separate; it does not bypass preflight, selection, or action-context safety.
+## Bounded Execution Routing
+
+Execution routes accept the native Gentle AI v2 tokens and Gentle Pi's local `sdd-*` tokens without rewriting status:
+
+| `nextRecommended` | Execution route |
+| --- | --- |
+| `apply` | `sdd-apply` |
+| `sdd-apply` | `sdd-apply` |
+| `verify` | `sdd-verify` |
+| `sdd-verify` | `sdd-verify` |
+| `archive` | `sdd-archive` |
+| `sdd-archive` | `sdd-archive` |
+| `sdd-sync` | `sdd-sync` |
+
+For non-planning phases, stop when that phase's dependency is `blocked`. When `nextRecommended` is `blocked` or `resolve-blockers`, report `blockedReasons` and stop. Unknown tokens, including native `remediate`, do not authorize a launch until Pi has an explicit typed remediation transport and executor contract. Non-empty `blockedReasons` forbid apply, sync, and archive work; `verify` or `sdd-verify` may run only when the verify dependency permits it. This alias table does not bypass preflight, selection, action-context, or runtime-attempt authority. The non-authoritative `resolve-via-engram` store carve-out remains separate and does not bypass those gates.
 
 ## Status Schema
 

@@ -354,6 +354,11 @@ for (const boundary of ["allowed", "env", "session", "replacement", "bus-throws"
 		});
 		const h = fakePi();
 		const runtime = deps();
+		let catalogAttempts = 0;
+		if (boundary === "allowed") runtime.deps.lookupPiCatalogName = () => {
+			catalogAttempts++;
+			return new Promise(() => {});
+		};
 		const context = fakeContext();
 		const spawn = runtime.deps.spawn!;
 		runtime.deps.spawn = (...args) => {
@@ -388,6 +393,7 @@ for (const boundary of ["allowed", "env", "session", "replacement", "bus-throws"
 		const result = h.tools.get("subagent_run")!.execute("call", { agent: "gentle-ai-worker", task: "private task", mode: "task" }, undefined, undefined, context.ctx);
 		await tick();
 		assert.equal(runtime.children.length, 1);
+		if (boundary === "allowed") assert.equal(catalogAttempts, 1, "child launch does not await catalog loading");
 		const child = runtime.children[0];
 		const launchedCalls = calls;
 		for (let i = 0; i < 10; i++) child.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "private streamed text" } });
@@ -441,7 +447,8 @@ for (const boundary of ["allowed", "env", "session", "replacement", "bus-throws"
 			assert.equal(event.launch.agentClass, "worker");
 			assert.equal(event.launch.selectedEffort, "high");
 			assert.equal(event.responses.length, boundary === "long-running" ? 8 : 2);
-			assert.ok(event.responses.every(row => row.agentClass === "worker" && row.effort === "unavailable"));
+			assert.ok(event.responses.every(row => row.agentClass === "worker" && row.effort === "high"
+				&& row.selectedProvider === "openai" && row.selectedModelId === "gpt-4o"));
 			assert.equal(event.agentSettled, true);
 			child.emit({ type: "agent_settled" });
 			await tick();

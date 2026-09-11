@@ -1,19 +1,21 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { EFFORTS, RuntimeMetrics, type FinalResponse, type TokenMeasurement } from "../lib/runtime-metrics.ts";
-import { lookupPiCatalogName } from "../lib/runtime-metrics-pi-identity.ts";
+import { EFFORTS, ORCHESTRATOR_AGENT_CLASS, RuntimeMetrics, UNKNOWN_AGENT_CLASS, type FinalResponse, type TokenMeasurement } from "../lib/runtime-metrics.ts";
+import { classifyPiCatalogName, lookupPiCatalogName } from "../lib/runtime-metrics-pi-identity.ts";
 import { CHILD_METRICS_EVENT, CHILD_METRICS_REVOKED, snapshotChildEvent, type ChildLaunchBucket } from "../lib/runtime-metrics-children.ts";
 import { RuntimeMetricsAttempt } from "../lib/runtime-metrics-delivery.ts";
 import { sendNativeRuntimeEvent, type NativeRuntimeTransportDeps } from "../lib/runtime-metrics-native.ts";
 import { runtimeMetricsEnvAllows } from "../lib/runtime-metrics-policy.ts";
 
 /** Available final usage -> one deferred attempt -> discard. No history reads,
- * cumulative session accounting, policy leases, delivery queue or shutdown join.
+ * cumulative session accounting, policy leases, delivery queue or retry. Print
+ * mode alone joins its accepted attempt for at most 1.5 seconds at shutdown.
  * Pi hooks lack request correlation: latency and SDK-zero presence are unknown.
  */
 export default function runtimeMetrics(pi: ExtensionAPI, env = process.env,
-	{ lookup = lookupPiCatalogName, native, send = sendNativeRuntimeEvent, now = () => performance.now() }:
-	{ lookup?: typeof lookupPiCatalogName; native?: NativeRuntimeTransportDeps;
-		send?: typeof sendNativeRuntimeEvent; now?: () => number } = {}): void {
+	{ lookup = lookupPiCatalogName, classify = classifyPiCatalogName, native, send = sendNativeRuntimeEvent,
+		now = () => performance.now(), shutdownWaitMs = 1500 }:
+	{ lookup?: typeof lookupPiCatalogName; classify?: typeof classifyPiCatalogName; native?: NativeRuntimeTransportDeps;
+		send?: typeof sendNativeRuntimeEvent; now?: () => number; shutdownWaitMs?: number } = {}): void {
 	const allows = () => env.GENTLE_PI_AGENTS_CHILD !== "1" && runtimeMetricsEnvAllows(env);
 	if (!allows()) return;
 	type Selection = Pick<FinalResponse, "selectedModelId" | "selectedProvider" | "effort">;
@@ -30,10 +32,15 @@ export default function runtimeMetrics(pi: ExtensionAPI, env = process.env,
 		if (!allows() || live?.id !== ctx.sessionManager.getSessionId()) dispose();
 		return live;
 	}
+	function refreshCatalog(owner: NonNullable<typeof live>, input: { provider: unknown; modelId: unknown }) {
+		void lookup(input).then(result => {
+			if (live === owner && result.classification === "catalog_public") owner.catalog = true;
+		}, () => { /* A later classification callback may retry the bounded load. */ });
+	}
 	function submit(owner: NonNullable<typeof live>, responses: FinalResponse[], launches?: ChildLaunchBucket[]) {
 		if (!responses.length || live !== owner || !current(owner.ctx)) return;
 		// Ephemeral event-local accounting only; source IDs never enter these rows.
-		const metrics = new RuntimeMetrics();
+		const metrics = new RuntimeMetrics({ classifyModel: classify });
 		for (const [index, row] of responses.entries()) metrics.record({ ...row, responseId: String(index) });
 		const rows = metrics.snapshot();
 		if (!rows.length) return;
@@ -61,18 +68,20 @@ export default function runtimeMetrics(pi: ExtensionAPI, env = process.env,
 			invalidate();
 		}
 	});
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", (_event, ctx) => {
 		dispose();
 		if (!allows()) return;
 		const owner = { id: ctx.sessionManager.getSessionId(), started: now(), ctx,
 			attempt: new RuntimeMetricsAttempt(), seen: new WeakSet<object>(), children: new Set<string>(), catalog: false };
 		live = owner;
-		try {
-			await lookup({ provider: "openai", modelId: "gpt-4o" });
-			if (live === owner) owner.catalog = true;
-		} catch { /* Public catalog failure stays silent. */ }
+		refreshCatalog(owner, { provider: "openai", modelId: "gpt-4o" });
 	});
-	pi.on("session_shutdown", () => { dispose(); offChild(); offRevoke(); });
+	pi.on("session_shutdown", (_event, ctx) => {
+		const teardown = () => { dispose(); offChild(); offRevoke(); };
+		const owner = live;
+		if (ctx.mode !== "print" || !owner) { teardown(); return; }
+		return owner.attempt.waitForSettled(shutdownWaitMs).finally(teardown);
+	});
 	pi.on("turn_start", () => { ambiguous = active; active = true; requestSeen = false; selection = undefined; });
 	pi.on("turn_end", () => { active = false; invalidate(); });
 	pi.on("agent_end", () => { active = false; invalidate(); });
@@ -100,12 +109,13 @@ export default function runtimeMetrics(pi: ExtensionAPI, env = process.env,
 			if (!owner || message.role !== "assistant" || message.stopReason === "pending" || message.stopReason === "deferred"
 				|| owner.seen.has(message)) return;
 			owner.seen.add(message);
+			refreshCatalog(owner, { provider: "openai", modelId: "gpt-4o" });
 			const selected = active && !ambiguous ? selection : undefined;
 			submit(owner, [{ kind: "final_assistant_response", responseId: "0",
 				selectedProvider: selected?.selectedProvider ?? "unknown", selectedModelId: selected?.selectedModelId,
 				effort: selected?.effort ?? "unavailable",
 				executor: env.GENTLE_PI_AGENTS_CHILD === undefined ? "orchestrator" : "unknown",
-				agentClass: env.GENTLE_PI_AGENTS_CHILD === undefined ? "orchestrator" : "unknown",
+				agentClass: env.GENTLE_PI_AGENTS_CHILD === undefined ? ORCHESTRATOR_AGENT_CLASS : UNKNOWN_AGENT_CLASS,
 				observedModelId: message.model, responseModelId: message.responseModel,
 				providerThinkingLevel: EFFORTS.includes(message.providerThinkingLevel as FinalResponse["effort"])
 					? message.providerThinkingLevel as FinalResponse["effort"] : "unavailable",

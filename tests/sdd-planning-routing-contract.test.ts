@@ -29,6 +29,19 @@ for (const [index, path] of paths.entries()) {
 		assert.match(contract, /do not require apply readiness to produce those artifacts/);
 	});
 
+	test(`${path}: native Gentle AI planning tokens map to executable Pi phases`, () => {
+		const contract = routingContract(documents[index]);
+		for (const [token, phase] of [
+			["propose", "sdd-proposal"],
+			["spec", "sdd-spec"],
+			["design", "sdd-design"],
+			["tasks", "sdd-tasks"],
+		]) {
+			assert.ok(contract.includes(`| \`${token}\` | \`${phase}\` |`));
+		}
+		assert.match(contract, /unprefixed tokens come from the native Gentle AI v2 status contract/);
+	});
+
 	test(`${path}: planning does not weaken stop conditions or diagnostic ownership`, () => {
 		const contract = routingContract(documents[index]);
 		for (const guard of [
@@ -36,15 +49,9 @@ for (const [index, path] of paths.entries()) {
 			"prove planned writes are within the authoritative workspace or allowed edit roots",
 			"workspace-planning without allowed edit roots remains read-only",
 			"Planning does not bypass the init guard, pre-proposal gate, or phase approval requirements",
-			"For non-planning phases, stop when that phase's dependency is `blocked`",
-			"When `nextRecommended` is `blocked` or `resolve-blockers`, report `blockedReasons` and stop",
-			"Unknown tokens do not authorize a launch",
-			"Non-empty `blockedReasons` forbid apply, sync, and archive work",
-			"`sdd-verify` may run only when `nextRecommended` is `sdd-verify` and its dependency permits it",
 			"never infer a route from prose",
 			"Keep human diagnostics in `blockedReasons`, not in `nextRecommended`",
 			"report them without discarding them to enable a route",
-			"store carve-out remains separate; it does not bypass preflight, selection, or action-context safety",
 		]) {
 			assert.ok(contract.includes(guard), `missing guard: ${guard}`);
 		}

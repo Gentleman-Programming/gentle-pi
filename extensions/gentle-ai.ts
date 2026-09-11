@@ -1202,7 +1202,7 @@ ${getOrchestratorPrompt(cwd, activeTools, rddStatusLine)}`;
 // Matches `git [global-flags] push` — tolerates flags like -C /repo or --work-tree=/tmp
 // between `git` and the subcommand. Short flags may be followed by a separate value token.
 const GIT_GLOBAL_FLAGS_SRC = String.raw`(?:\s+--?\S+(?:\s+[^-\s]\S*)?)* `;
-const GIT_PUSH_RE = new RegExp(String.raw`\bgit${GIT_GLOBAL_FLAGS_SRC}push\b`);
+const GIT_PUSH_RE = new RegExp(String.raw`\bgit${GIT_GLOBAL_FLAGS_SRC}(push)\b`);
 
 const DENIED_BASH_PATTERNS: RegExp[] = [
 	// Block rm -rf targeting /, ~ or ~/subdir, $HOME or $HOME/subdir, .. or .
@@ -1229,6 +1229,19 @@ const GUARD_ACTION = {
 type GuardAction = (typeof GUARD_ACTION)[keyof typeof GUARD_ACTION];
 type GuardClassification = GuardAction | "not-guarded";
 
+interface GuardMatch {
+	key: GuardedCommandKey;
+	action: GuardAction;
+	triggerIndex: number;
+}
+
+interface GuardEvaluation {
+	action: GuardClassification;
+	key?: GuardedCommandKey;
+	triggerIndex: number;
+	matches: GuardMatch[];
+}
+
 const GUARDED_COMMAND_KEY = {
 	GIT_PUSH: "gitPush",
 	GIT_REBASE: "gitRebase",
@@ -1253,10 +1266,10 @@ interface LoadGuardrailsOptions {
 
 const GUARDED_KEY_PATTERNS: Record<GuardedCommandKey, RegExp> = {
 	gitPush: GIT_PUSH_RE,
-	gitRebase: /\bgit\s+rebase\b/,
-	gitBranchDeleteForce: /\bgit\s+branch\s+(?:-[a-zA-Z]*D[a-zA-Z]*|-[a-zA-Z]*d[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*d[a-zA-Z]*|--delete\b[^\n]*--force\b|--force\b[^\n]*--delete\b)/,
-	npmPublish: /\bnpm\s+publish\b/,
-	piRemove: /\bpi\s+remove\b/,
+	gitRebase: /\bgit\s+(rebase)\b/,
+	gitBranchDeleteForce: /\bgit\s+(branch)\s+(?:-[a-zA-Z]*D[a-zA-Z]*|-[a-zA-Z]*d[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*d[a-zA-Z]*|--delete\b[^\r\n;&|]*--force\b|--force\b[^\r\n;&|]*--delete\b)/,
+	npmPublish: /\bnpm\s+(publish)\b/,
+	piRemove: /\bpi\s+(remove)\b/,
 };
 
 const AUTONOMOUS_DEFAULT_ACTIONS: Record<GuardedCommandKey, GuardAction> = {
@@ -1265,6 +1278,14 @@ const AUTONOMOUS_DEFAULT_ACTIONS: Record<GuardedCommandKey, GuardAction> = {
 	gitBranchDeleteForce: "confirm",
 	npmPublish: "block",
 	piRemove: "confirm",
+};
+
+const GUARDED_COMMAND_LABELS: Record<GuardedCommandKey, string> = {
+	gitPush: "git push",
+	gitRebase: "git rebase",
+	gitBranchDeleteForce: "forced git branch deletion",
+	npmPublish: "npm publish",
+	piRemove: "pi remove",
 };
 
 const SAFE_GUARDRAILS_CONFIG: RuntimeGuardrailsConfig = {
@@ -1282,31 +1303,83 @@ const SAFE_GUARDRAILS_CONFIG: RuntimeGuardrailsConfig = {
  *      (applying AUTONOMOUS_DEFAULT_ACTIONS for any key not set in guardedCommands)
  *   4. No match → "not-guarded"
  */
+function collectGuardedMatches(
+	command: string,
+	config: RuntimeGuardrailsConfig,
+): GuardMatch[] {
+	const matches: GuardMatch[] = [];
+	for (const [key, pattern] of Object.entries(GUARDED_KEY_PATTERNS) as [
+		GuardedCommandKey,
+		RegExp,
+	][]) {
+		const globalPattern = new RegExp(pattern.source, `${pattern.flags}g`);
+		for (const match of command.matchAll(globalPattern)) {
+			const action = config.autonomousMode
+				? (config.guardedCommands[key] ?? AUTONOMOUS_DEFAULT_ACTIONS[key])
+				: "confirm";
+			matches.push({
+				key,
+				action,
+				triggerIndex: match.index + match[0].lastIndexOf(match[1]),
+			});
+		}
+	}
+	return matches.sort((left, right) => left.triggerIndex - right.triggerIndex);
+}
+
+function evaluateGuardedCommand(
+	command: string,
+	config: RuntimeGuardrailsConfig,
+): GuardEvaluation {
+	const matches = collectGuardedMatches(command, config);
+
+	// Hard denies override every configured action across the complete command.
+	for (const pattern of DENIED_BASH_PATTERNS) {
+		const denied = pattern.exec(command);
+		if (!denied) continue;
+		const matchedAction = matches.find((match) =>
+			match.triggerIndex >= denied.index && match.triggerIndex < denied.index + denied[0].length,
+		);
+		return {
+			action: "block",
+			key: matchedAction?.key,
+			triggerIndex: matchedAction?.triggerIndex ?? denied.index,
+			matches,
+		};
+	}
+
+	// Configured block, then confirmation, then allow win across all matches.
+	const selected = matches.find((match) => match.action === "block")
+		?? matches.find((match) => match.action === "confirm")
+		?? matches.find((match) => match.action === "allow");
+	if (selected) return { ...selected, matches };
+	return { action: "not-guarded", triggerIndex: 0, matches };
+}
+
 function classifyGuardedCommand(
 	command: string,
 	config: RuntimeGuardrailsConfig,
 ): GuardClassification {
-	// Step 1: hard-deny always wins, regardless of any config
-	for (const pattern of DENIED_BASH_PATTERNS) {
-		if (pattern.test(command)) return "block";
+	return evaluateGuardedCommand(command, config).action;
+}
+
+function guardedCommandPreview(command: string, triggerIndex: number): string {
+	const start = Math.max(0, triggerIndex - 60);
+	const prefix = start > 0 ? "…" : "";
+	return `${prefix}${truncateToWidth(command.slice(start).replace(/\s+/g, " ").trim(), 180 - prefix.length, "…")}`;
+}
+
+/** Confirmation headline for all guarded actions; generic when no key matched. */
+function guardedCommandTitle(
+	key?: GuardedCommandKey,
+	matches: readonly GuardMatch[] = [],
+): string {
+	if (matches.length > 1) {
+		return `Allow guarded actions: ${matches.map((match) => GUARDED_COMMAND_LABELS[match.key]).join("; ")}?`;
 	}
-
-	// Step 2 & 3: find which guarded key (if any) this command matches
-	for (const [key, pattern] of Object.entries(GUARDED_KEY_PATTERNS) as [GuardedCommandKey, RegExp][]) {
-		if (!pattern.test(command)) continue;
-
-		// Matched a guarded key
-		if (!config.autonomousMode) {
-			// Legacy behavior: any match → confirm
-			return "confirm";
-		}
-
-		// Autonomous mode: use configured action, fall back to sensible defaults
-		const configuredAction = config.guardedCommands[key];
-		return configuredAction ?? AUTONOMOUS_DEFAULT_ACTIONS[key];
-	}
-
-	return "not-guarded";
+	return key === undefined
+		? "Allow guarded command?"
+		: `Allow guarded ${GUARDED_COMMAND_LABELS[key]}?`;
 }
 
 function parseGuardrailsConfigFile(
@@ -1509,18 +1582,14 @@ function isNamedAgentStartEvent(event: unknown): boolean {
 }
 
 function sddPhaseFromAgentStartEvent(event: unknown): SddPhase | undefined {
-	for (const name of readAgentStartNames(event)) {
-		if (name === "sdd-apply") return "apply";
-		if (name === "sdd-verify") return "verify";
-		if (name === "sdd-sync") return "sync";
-		if (name === "sdd-archive") return "archive";
-	}
+	const phases = ["apply", "verify", "sync", "archive"] as const;
+	const names = readAgentStartNames(event);
 	const systemPrompt = readStringPath(event, ["systemPrompt"]) ?? "";
-	if (/\bSDD apply executor\b/i.test(systemPrompt)) return "apply";
-	if (/\bSDD verify executor\b/i.test(systemPrompt)) return "verify";
-	if (/\bSDD sync executor\b/i.test(systemPrompt)) return "sync";
-	if (/\bSDD archive executor\b/i.test(systemPrompt)) return "archive";
-	return undefined;
+	const promptPhases = phases.filter((phase) => new RegExp(`\\bSDD ${phase} executor\\b`, "i").test(systemPrompt));
+	if (promptPhases.length > 1) return undefined;
+	if (names.length === 0) return promptPhases[0];
+	return phases.find((phase) => names.every((name) => name === `sdd-${phase}`) &&
+		(promptPhases.length === 0 || promptPhases[0] === phase));
 }
 
 function resolveSddChangeSelection(serialized: unknown, cwd: string, agentName: string) {
@@ -1594,7 +1663,7 @@ async function resolveSelectedNativeSddChangeStartup(
 	} catch (error) {
 		throw new Error(`SDD selection native status is blocked: ${error instanceof Error ? error.message : String(error)}`);
 	}
-	if (!(selection.phase in status.dependencies) || !(selection.phase in status.instructions)) {
+	if (!(selection.phase in status.dependencies) || status.phaseInstructions === undefined || !(selection.phase in status.phaseInstructions)) {
 		throw new Error(`SDD selection native status cannot represent phase ${selection.phase}.`);
 	}
 	return { selection, status };
@@ -1726,7 +1795,8 @@ async function confirmCommand(
 	herdrLifecycle: HerdrConfirmationLifecycle,
 ): Promise<ToolCallEventResult | undefined> {
 	const guardrailsConfig = loadRuntimeGuardrailsConfig(ctx.cwd);
-	const classification = classifyGuardedCommand(command, guardrailsConfig);
+	const evaluation = evaluateGuardedCommand(command, guardrailsConfig);
+	const { action: classification } = evaluation;
 
 	if (classification === "block") {
 		return {
@@ -1749,11 +1819,8 @@ async function confirmCommand(
 				"Gentle AI safety policy requires interactive confirmation before this command.",
 		};
 	}
-	const preview = truncateToWidth(
-		command.replace(/\s+/g, " ").trim(),
-		180,
-		"…",
-	);
+	const title = guardedCommandTitle(evaluation.key, evaluation.matches);
+	const preview = guardedCommandPreview(command, evaluation.triggerIndex);
 	const requestId = randomUUID();
 	const emitPermissionRequest = (
 		state: "waiting" | "approved" | "denied",
@@ -1772,7 +1839,7 @@ async function confirmCommand(
 	emitPermissionRequest("waiting");
 	herdrLifecycle.begin();
 	try {
-		approved = await ctx.ui.confirm("Allow guarded command?", preview);
+		approved = await ctx.ui.confirm(title, preview);
 	} catch (error) {
 		confirmationFailed = true;
 		confirmationError = error;
@@ -2290,6 +2357,30 @@ function isValidJsonObjectFileOrMissing(path: string): boolean {
 	}
 }
 
+const PROVIDER_REVIEW_ROLES = ["review-refuter", "review-validator"] as const;
+
+function isProviderReviewRole(name: string): boolean {
+	return PROVIDER_REVIEW_ROLES.some((role) => role === name);
+}
+
+function modelAssignmentNames(cwd: string): string[] {
+	return [...new Set([
+		...PROVIDER_REVIEW_ROLES,
+		...listDiscoverableAgents(cwd).map((agent) => agent.name),
+	])];
+}
+
+const PROVIDER_ROUTING_DEFAULT_LABELS = {
+	model: "Pi persisted default model",
+	effort: "Pi persisted default effort",
+} as const;
+
+type RoutingDefaultField = keyof typeof PROVIDER_ROUTING_DEFAULT_LABELS;
+
+function routingDefaultLabel(name: string, field: RoutingDefaultField): string {
+	return isProviderReviewRole(name) ? PROVIDER_ROUTING_DEFAULT_LABELS[field] : "inherit";
+}
+
 function migrateLegacyProjectModelOverrides(cwd: string): number {
 	const settingsPath = projectSettingsPath(cwd);
 	if (!existsSync(settingsPath)) return 0;
@@ -2308,6 +2399,7 @@ function migrateLegacyProjectModelOverrides(cwd: string): number {
 	if (!agentOverrides) return 0;
 	const agentsByName = new Map(listDiscoverableAgents(cwd).map((agent) => [agent.name, agent]));
 	const migratableEntries = Object.entries(agentOverrides)
+		.filter(([name]) => !isProviderReviewRole(name))
 		.map(([name, value]) => ({ name, entry: normalizeRoutingEntry(value) }))
 		.filter((item): item is { name: string; entry: AgentRoutingEntry } =>
 			item.entry !== undefined && !isClearRoutingEntry(item.entry),
@@ -2350,6 +2442,7 @@ export function applyModelConfig(
 	let skipped = 0;
 	const seenAgents = new Set<string>();
 	for (const agent of listDiscoverableAgents(cwd)) {
+		if (isProviderReviewRole(agent.name)) continue;
 		seenAgents.add(agent.name);
 		const entry = config[agent.name];
 		if (entry === undefined) {
@@ -2379,6 +2472,7 @@ export function applyModelConfig(
 		else skipped += 1;
 	}
 	for (const [name, entry] of Object.entries(config)) {
+		if (isProviderReviewRole(name)) continue;
 		if (!seenAgents.has(name) && isClearRoutingEntry(entry)) {
 			if (updateSubagentModelProfile(cwd, "user", name, entry)) updated += 1;
 			else skipped += 1;
@@ -2395,6 +2489,7 @@ export async function applyModelConfigAsync(
 	let skipped = 0;
 	const seenAgents = new Set<string>();
 	for (const agent of await listDiscoverableAgentsAsync(cwd)) {
+		if (isProviderReviewRole(agent.name)) continue;
 		seenAgents.add(agent.name);
 		const entry = config[agent.name];
 		if (entry === undefined) {
@@ -2426,6 +2521,7 @@ export async function applyModelConfigAsync(
 		else skipped += 1;
 	}
 	for (const [name, entry] of Object.entries(config)) {
+		if (isProviderReviewRole(name)) continue;
 		if (!seenAgents.has(name) && isClearRoutingEntry(entry)) {
 			if (await updateSubagentModelProfileAsync(cwd, "user", name, entry))
 				updated += 1;
@@ -2453,11 +2549,11 @@ export async function applySavedModelConfig(
 }
 
 function describeModelConfig(cwd: string, config: AgentModelConfig): string[] {
-	return listDiscoverableAgents(cwd).map((agent) => {
-		const entry = config[agent.name];
-		const model = entry?.model ?? "inherit";
-		const thinking = entry?.thinking ?? "inherit";
-		return `${sanitizeTerminalText(agent.name)}: model=${sanitizeTerminalText(model)}, effort=${sanitizeTerminalText(thinking)}`;
+	return modelAssignmentNames(cwd).map((name) => {
+		const entry = config[name];
+		const model = entry?.model ?? routingDefaultLabel(name, "model");
+		const thinking = entry?.thinking ?? routingDefaultLabel(name, "effort");
+		return `${sanitizeTerminalText(name)}: model=${sanitizeTerminalText(model)}, effort=${sanitizeTerminalText(thinking)}`;
 	});
 }
 
@@ -2825,7 +2921,7 @@ class SddModelPanel implements OverlayComponent {
 		lines.push("");
 		lines.push(
 			line(
-				"j/k scroll • enter model/save • e effort • i inherit • c custom • x export • r restore • ctrl+s save • esc back",
+				`j/k scroll • enter model/save • e effort • i ${isProviderReviewRole(this.rows[this.cursor] ?? "") ? "Pi persisted defaults" : "inherit"} • c custom • x export • r restore • ctrl+s save • esc back`,
 				"muted",
 			),
 		);
@@ -2857,7 +2953,9 @@ class SddModelPanel implements OverlayComponent {
 			const focused = i === this.modelCursor;
 			lines.push(
 				`${this.renderCursor(focused)} ${this.renderText(
-					options[i] ?? "",
+					options[i] === INHERIT_MODEL && isProviderReviewRole(this.selectedRow)
+						? routingDefaultLabel(this.selectedRow, "model")
+						: (options[i] ?? ""),
 					focused ? "status" : "text",
 				)}`,
 			);
@@ -2909,7 +3007,9 @@ class SddModelPanel implements OverlayComponent {
 			const focused = i === this.effortCursor;
 			lines.push(
 				`${this.renderCursor(focused)} ${this.renderText(
-					THINKING_OPTIONS[i] ?? "",
+					THINKING_OPTIONS[i] === INHERIT_THINKING && isProviderReviewRole(this.selectedRow)
+						? routingDefaultLabel(this.selectedRow, "effort")
+						: (THINKING_OPTIONS[i] ?? ""),
 					focused ? "status" : "text",
 				)}`,
 			);
@@ -2922,10 +3022,10 @@ class SddModelPanel implements OverlayComponent {
 	private renderSetAllLabel(row: string): string {
 		const models = this.rows
 			.slice(1)
-			.map((name) => this.draft[name]?.model ?? "inherit");
+			.map((name) => this.draft[name]?.model ?? routingDefaultLabel(name, "model"));
 		const efforts = this.rows
 			.slice(1)
-			.map((name) => this.draft[name]?.thinking ?? "inherit");
+			.map((name) => this.draft[name]?.thinking ?? routingDefaultLabel(name, "effort"));
 		const firstModel = models[0] ?? "inherit";
 		const firstEffort = efforts[0] ?? "inherit";
 		const modelLabel = models.every((value) => value === firstModel)
@@ -2941,8 +3041,8 @@ class SddModelPanel implements OverlayComponent {
 	}
 
 	private renderAgentLabel(row: string): string {
-		const model = this.draft[row]?.model ?? "inherit";
-		const effort = this.draft[row]?.thinking ?? "inherit";
+		const model = this.draft[row]?.model ?? routingDefaultLabel(row, "model");
+		const effort = this.draft[row]?.thinking ?? routingDefaultLabel(row, "effort");
 		return `${this.renderText(sanitizeTerminalText(row).padEnd(20), "text")} ${this.renderText("model=", "muted")}${this.renderText(model, "status")}${this.renderText(
 			", effort=",
 			"muted",
@@ -2967,7 +3067,7 @@ async function showSddModelPanel(
 	config: AgentModelConfig,
 ): Promise<ModelPanelResult> {
 	const modelOptions = await getPiModelOptions(ctx);
-	const agents = listDiscoverableAgents(ctx.cwd).map((agent) => agent.name);
+	const agents = modelAssignmentNames(ctx.cwd);
 	return ctx.ui.custom<ModelPanelResult>(
 		(_tui, theme, _keybindings, done) =>
 			new SddModelPanel(config, modelOptions, agents, done, theme),
@@ -3068,9 +3168,9 @@ async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
 			}
 			if (result.agent === "all") {
 				const next: AgentModelConfig = { ...config };
-				for (const agent of listDiscoverableAgents(ctx.cwd)) {
-					next[agent.name] = {
-						...(next[agent.name] ?? {}),
+				for (const name of modelAssignmentNames(ctx.cwd)) {
+					next[name] = {
+						...(next[name] ?? {}),
 						model,
 					};
 				}
@@ -7353,6 +7453,9 @@ export const __testing = {
 	listDiscoverableAgents,
 	orderDiscoverableAgents,
 	classifyGuardedCommand,
+	evaluateGuardedCommand,
+	guardedCommandPreview,
+	guardedCommandTitle,
 	loadRuntimeGuardrailsConfig,
 	buildGentlePrompt,
 	nativeStatusUnsupported,
@@ -7898,7 +8001,7 @@ function createGentleAiExtensionForTesting(
 				? `\n\n${renderSddPreflightPrompt(prefs)}`
 				: "";
 		const phase = isSddAgent ? sddPhaseFromAgentStartEvent(event) : undefined;
-		const launchSddChange = isSddAgent ? readSddChangeFlag(pi) : undefined;
+		const launchSddChange = readSddChangeFlag(pi);
 		const nativeStatusPrompt = phase
 			? await (async () => {
 				if (launchSddChange === undefined) {
@@ -7910,9 +8013,7 @@ function createGentleAiExtensionForTesting(
 					), phase)}`;
 				}
 				try {
-					const names = readAgentStartNames(event);
-					const agentName = names.find((name) => name === `sdd-${phase}`);
-					if (!agentName) throw new Error("SDD selection requires a matching named SDD phase agent.");
+					const agentName = `sdd-${phase}`;
 					const startup = await resolveSelectedNativeSddChangeStartup(
 						launchSddChange,
 						ctx.cwd,
@@ -7925,7 +8026,7 @@ function createGentleAiExtensionForTesting(
 							prefs?.artifactStore,
 						),
 					);
-					return `\n\n${renderNativeSddPhasePrompt(startup.status as never, phase)}`;
+					return `\n\n${renderNativeSddPhasePrompt(startup.status, phase)}`;
 				} catch (error) {
 					return `\n\n## Native SDD Status Engine\nSDD selection blocked: ${error instanceof Error ? error.message : String(error)}\nDo not run phase work; return this blocker to the parent.`;
 				}
