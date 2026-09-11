@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
@@ -624,6 +624,17 @@ test("writeProfilesFileSync replaces the store and leaves no temp file behind", 
 	const round = readProfilesFileResult(path);
 	if (round.status !== "valid") throw new Error(`expected valid, got ${round.status}`);
 	assert.deepEqual(Object.keys(round.file.profiles), ["alpha", "beta"]);
+	assert.deepEqual(readdirSync(root).filter((entry) => entry.includes(".tmp")), []);
+});
+
+test("writeProfilesFileSync reports the operation error and still removes the temp file", () => {
+	// Renaming over a directory fails, so this reaches the failure path with a
+	// real operation error rather than a stubbed one.
+	const occupied = join(root, "occupied");
+	mkdirSync(occupied, { recursive: true });
+	assert.throws(() =>
+		writeProfilesFileSync(occupied, createProfile(emptyProfilesFile(), "team", CONFIG)),
+	);
 	assert.deepEqual(readdirSync(root).filter((entry) => entry.includes(".tmp")), []);
 });
 
