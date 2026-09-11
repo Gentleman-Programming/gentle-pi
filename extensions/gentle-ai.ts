@@ -2337,6 +2337,30 @@ function isValidJsonObjectFileOrMissing(path: string): boolean {
 	}
 }
 
+const PROVIDER_REVIEW_ROLES = ["review-refuter", "review-validator"] as const;
+
+function isProviderReviewRole(name: string): boolean {
+	return PROVIDER_REVIEW_ROLES.some((role) => role === name);
+}
+
+function modelAssignmentNames(cwd: string): string[] {
+	return [...new Set([
+		...PROVIDER_REVIEW_ROLES,
+		...listDiscoverableAgents(cwd).map((agent) => agent.name),
+	])];
+}
+
+const PROVIDER_ROUTING_DEFAULT_LABELS = {
+	model: "Pi persisted default model",
+	effort: "Pi persisted default effort",
+} as const;
+
+type RoutingDefaultField = keyof typeof PROVIDER_ROUTING_DEFAULT_LABELS;
+
+function routingDefaultLabel(name: string, field: RoutingDefaultField): string {
+	return isProviderReviewRole(name) ? PROVIDER_ROUTING_DEFAULT_LABELS[field] : "inherit";
+}
+
 function migrateLegacyProjectModelOverrides(cwd: string): number {
 	const settingsPath = projectSettingsPath(cwd);
 	if (!existsSync(settingsPath)) return 0;
@@ -2355,6 +2379,7 @@ function migrateLegacyProjectModelOverrides(cwd: string): number {
 	if (!agentOverrides) return 0;
 	const agentsByName = new Map(listDiscoverableAgents(cwd).map((agent) => [agent.name, agent]));
 	const migratableEntries = Object.entries(agentOverrides)
+		.filter(([name]) => !isProviderReviewRole(name))
 		.map(([name, value]) => ({ name, entry: normalizeRoutingEntry(value) }))
 		.filter((item): item is { name: string; entry: AgentRoutingEntry } =>
 			item.entry !== undefined && !isClearRoutingEntry(item.entry),
@@ -2397,6 +2422,7 @@ export function applyModelConfig(
 	let skipped = 0;
 	const seenAgents = new Set<string>();
 	for (const agent of listDiscoverableAgents(cwd)) {
+		if (isProviderReviewRole(agent.name)) continue;
 		seenAgents.add(agent.name);
 		const entry = config[agent.name];
 		if (entry === undefined) {
@@ -2426,6 +2452,7 @@ export function applyModelConfig(
 		else skipped += 1;
 	}
 	for (const [name, entry] of Object.entries(config)) {
+		if (isProviderReviewRole(name)) continue;
 		if (!seenAgents.has(name) && isClearRoutingEntry(entry)) {
 			if (updateSubagentModelProfile(cwd, "user", name, entry)) updated += 1;
 			else skipped += 1;
@@ -2442,6 +2469,7 @@ export async function applyModelConfigAsync(
 	let skipped = 0;
 	const seenAgents = new Set<string>();
 	for (const agent of await listDiscoverableAgentsAsync(cwd)) {
+		if (isProviderReviewRole(agent.name)) continue;
 		seenAgents.add(agent.name);
 		const entry = config[agent.name];
 		if (entry === undefined) {
@@ -2473,6 +2501,7 @@ export async function applyModelConfigAsync(
 		else skipped += 1;
 	}
 	for (const [name, entry] of Object.entries(config)) {
+		if (isProviderReviewRole(name)) continue;
 		if (!seenAgents.has(name) && isClearRoutingEntry(entry)) {
 			if (await updateSubagentModelProfileAsync(cwd, "user", name, entry))
 				updated += 1;
@@ -2500,11 +2529,11 @@ export async function applySavedModelConfig(
 }
 
 function describeModelConfig(cwd: string, config: AgentModelConfig): string[] {
-	return listDiscoverableAgents(cwd).map((agent) => {
-		const entry = config[agent.name];
-		const model = entry?.model ?? "inherit";
-		const thinking = entry?.thinking ?? "inherit";
-		return `${sanitizeTerminalText(agent.name)}: model=${sanitizeTerminalText(model)}, effort=${sanitizeTerminalText(thinking)}`;
+	return modelAssignmentNames(cwd).map((name) => {
+		const entry = config[name];
+		const model = entry?.model ?? routingDefaultLabel(name, "model");
+		const thinking = entry?.thinking ?? routingDefaultLabel(name, "effort");
+		return `${sanitizeTerminalText(name)}: model=${sanitizeTerminalText(model)}, effort=${sanitizeTerminalText(thinking)}`;
 	});
 }
 
@@ -2872,7 +2901,7 @@ class SddModelPanel implements OverlayComponent {
 		lines.push("");
 		lines.push(
 			line(
-				"j/k scroll • enter model/save • e effort • i inherit • c custom • x export • r restore • ctrl+s save • esc back",
+				`j/k scroll • enter model/save • e effort • i ${isProviderReviewRole(this.rows[this.cursor] ?? "") ? "Pi persisted defaults" : "inherit"} • c custom • x export • r restore • ctrl+s save • esc back`,
 				"muted",
 			),
 		);
@@ -2904,7 +2933,9 @@ class SddModelPanel implements OverlayComponent {
 			const focused = i === this.modelCursor;
 			lines.push(
 				`${this.renderCursor(focused)} ${this.renderText(
-					options[i] ?? "",
+					options[i] === INHERIT_MODEL && isProviderReviewRole(this.selectedRow)
+						? routingDefaultLabel(this.selectedRow, "model")
+						: (options[i] ?? ""),
 					focused ? "status" : "text",
 				)}`,
 			);
@@ -2956,7 +2987,9 @@ class SddModelPanel implements OverlayComponent {
 			const focused = i === this.effortCursor;
 			lines.push(
 				`${this.renderCursor(focused)} ${this.renderText(
-					THINKING_OPTIONS[i] ?? "",
+					THINKING_OPTIONS[i] === INHERIT_THINKING && isProviderReviewRole(this.selectedRow)
+						? routingDefaultLabel(this.selectedRow, "effort")
+						: (THINKING_OPTIONS[i] ?? ""),
 					focused ? "status" : "text",
 				)}`,
 			);
@@ -2969,10 +3002,10 @@ class SddModelPanel implements OverlayComponent {
 	private renderSetAllLabel(row: string): string {
 		const models = this.rows
 			.slice(1)
-			.map((name) => this.draft[name]?.model ?? "inherit");
+			.map((name) => this.draft[name]?.model ?? routingDefaultLabel(name, "model"));
 		const efforts = this.rows
 			.slice(1)
-			.map((name) => this.draft[name]?.thinking ?? "inherit");
+			.map((name) => this.draft[name]?.thinking ?? routingDefaultLabel(name, "effort"));
 		const firstModel = models[0] ?? "inherit";
 		const firstEffort = efforts[0] ?? "inherit";
 		const modelLabel = models.every((value) => value === firstModel)
@@ -2988,8 +3021,8 @@ class SddModelPanel implements OverlayComponent {
 	}
 
 	private renderAgentLabel(row: string): string {
-		const model = this.draft[row]?.model ?? "inherit";
-		const effort = this.draft[row]?.thinking ?? "inherit";
+		const model = this.draft[row]?.model ?? routingDefaultLabel(row, "model");
+		const effort = this.draft[row]?.thinking ?? routingDefaultLabel(row, "effort");
 		return `${this.renderText(sanitizeTerminalText(row).padEnd(20), "text")} ${this.renderText("model=", "muted")}${this.renderText(model, "status")}${this.renderText(
 			", effort=",
 			"muted",
@@ -3014,7 +3047,7 @@ async function showSddModelPanel(
 	config: AgentModelConfig,
 ): Promise<ModelPanelResult> {
 	const modelOptions = await getPiModelOptions(ctx);
-	const agents = listDiscoverableAgents(ctx.cwd).map((agent) => agent.name);
+	const agents = modelAssignmentNames(ctx.cwd);
 	return ctx.ui.custom<ModelPanelResult>(
 		(_tui, theme, _keybindings, done) =>
 			new SddModelPanel(config, modelOptions, agents, done, theme),
@@ -3115,9 +3148,9 @@ async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
 			}
 			if (result.agent === "all") {
 				const next: AgentModelConfig = { ...config };
-				for (const agent of listDiscoverableAgents(ctx.cwd)) {
-					next[agent.name] = {
-						...(next[agent.name] ?? {}),
+				for (const name of modelAssignmentNames(ctx.cwd)) {
+					next[name] = {
+						...(next[name] ?? {}),
 						model,
 					};
 				}
