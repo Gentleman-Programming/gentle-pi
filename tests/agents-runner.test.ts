@@ -782,3 +782,80 @@ for (const lateEvents of [false, true]) test(`AgentRunner releases quarantined c
 	assert.equal(observations.length, 1, "late cleanup does not redeliver observations");
 	assert.deepEqual(store.get(first.id), finished);
 });
+
+test("a confirmed-gone group completes the exit and frees its slot without an observed exit", async () => {
+	// The group probe reports ESRCH (the group is gone) while the child never emits
+	// its exit event. Returning without finishing left the task terminal in memory
+	// with no record and no retry; finishing without releasing the live entry would
+	// keep the concurrency slot occupied and never pump queued work.
+	const store = new TaskStore();
+	const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+	const finishes: string[] = [];
+	let now = 1_000;
+	let launches = 0;
+	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs: 10_000 }, {
+		spawn: () => fakeChild({ exitOnKill: false, pid: 90 + (launches += 1) }).child,
+		now: () => now,
+		schedule: (fn, ms) => {
+			const timer = { fn, ms, cancelled: false };
+			timers.push(timer);
+			return () => { timer.cancelled = true; };
+		},
+		pi: { command: "pi", args: [] },
+		process: { platform: "linux", kill: (_pid, signal) => {
+			if (signal === 0) throw Object.assign(new Error("group probe"), { code: "ESRCH" });
+		} },
+	}, { askUser: async () => ({ value: "yes" }), onFinish: (task) => { finishes.push(task.id); } });
+	const first = runner.run(request());
+	const second = runner.run(request({ prompt: "queued" }));
+	await tick();
+	const waiter = runner.waitFor(first.id);
+	runner.cancel(first.id);
+	const grace = timers.find((timer) => timer.ms === 250);
+	assert.ok(grace, "termination grace is scheduled");
+	grace.fn();
+	await tick();
+	assert.equal(store.get(first.id)?.status, TASK_STATUS.CANCELLED);
+	assert.equal((await waiter).status, TASK_STATUS.CANCELLED, "the waiter receives the recorded outcome");
+	assert.equal(finishes.length, 1, "the run is recorded exactly once");
+	assert.equal(store.get(second.id)?.status, TASK_STATUS.RUNNING, "the freed slot starts queued work");
+});
+
+test("an unprobeable process group quarantines at its deadline and still records the run", async () => {
+	// On win32 the child is not detached, so there is no process group to probe and
+	// an observed exit is the only confirmation available. With no exit event the
+	// run must still be recorded at the deadline, and its slot must be retained
+	// rather than freed on an unproven assumption.
+	const store = new TaskStore();
+	const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+	const finishes: string[] = [];
+	let now = 1_000;
+	let launches = 0;
+	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs: 10_000 }, {
+		spawn: () => fakeChild({ exitOnKill: false, pid: 90 + (launches += 1) }).child,		now: () => now,
+		schedule: (fn, ms) => {
+			const timer = { fn, ms, cancelled: false };
+			timers.push(timer);
+			return () => { timer.cancelled = true; };
+		},
+		pi: { command: "pi", args: [] },
+		process: { platform: "win32", kill: () => {} },
+	}, { askUser: async () => ({ value: "yes" }), onFinish: (task) => { finishes.push(task.id); } });
+	const first = runner.run(request());
+	const second = runner.run(request({ prompt: "queued" }));
+	await tick();
+	runner.cancel(first.id);
+	const grace = timers.find((timer) => timer.ms === 250);
+	assert.ok(grace, "termination grace is scheduled");
+	grace.fn();
+	now = 5_000;
+	const check = timers.filter((timer) => timer.ms === 25).at(-1);
+	assert.ok(check, "an unprobeable group must keep polling instead of stopping silently");
+	check.fn();
+	await tick();
+	assert.equal(store.get(first.id)?.status, TASK_STATUS.FAILED);
+	assert.match(store.get(first.id)?.error ?? "", /capacity quarantined/);
+	assert.equal(finishes.length, 1, "the run is recorded exactly once");
+	assert.equal(store.get(second.id)?.status, TASK_STATUS.QUEUED, "an unconfirmed exit retains its capacity");
+	assert.equal(launches, 1, "no further launch happens while the slot is quarantined");
+});

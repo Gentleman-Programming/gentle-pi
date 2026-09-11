@@ -735,19 +735,28 @@ export class AgentRunner {
 		}, TERMINATION_GRACE_MS);
 	}
 
-	private groupExists(live: LiveTask): boolean {
-		if (live.processGroup === undefined) return false;
+	// A false result is ambiguous, so the probe reports which one it is: an ESRCH
+	// result proves the group is gone, while an absent process group means the
+	// question cannot be asked at all. Only the first justifies treating the exit as
+	// complete without an observed exit event.
+	private probeGroup(live: LiveTask): "present" | "gone" | "unavailable" {
+		if (live.processGroup === undefined) return "unavailable";
 		try {
 			this.processControl.kill(-live.processGroup, 0);
-			return true;
+			return "present";
 		} catch (error) {
-			return (error as NodeJS.ErrnoException).code !== "ESRCH";
+			return (error as NodeJS.ErrnoException).code === "ESRCH" ? "gone" : "present";
 		}
+	}
+
+	private groupExists(live: LiveTask): boolean {
+		return this.probeGroup(live) === "present";
 	}
 
 	private confirmGroupExit(id: string, live: LiveTask): void {
 		if (this.live.get(id) !== live) return;
-		if (this.groupExists(live)) {
+		const group = this.probeGroup(live);
+		if (group === "present") {
 			if (this.deps.now() >= (live.cleanupDeadlineAt ?? 0)) {
 				live.cancelGrace();
 				live.quarantined = true;
@@ -757,7 +766,28 @@ export class AgentRunner {
 			live.cancelGrace = this.deps.schedule(() => this.confirmGroupExit(id, live), GROUP_CONFIRM_MS);
 			return;
 		}
-		if (live.childExit !== undefined) this.completeExit(id, live);
+		if (group === "gone") {
+			// No process remains in the group, so the exit is complete whether or not
+			// the child's own exit event was ever observed. Completing here also frees
+			// the concurrency slot; finishing without it would leave the task recorded
+			// while its slot stayed occupied and queued work never pumped.
+			this.completeExit(id, live);
+			return;
+		}
+		if (live.childExit !== undefined) {
+			this.completeExit(id, live);
+			return;
+		}
+		// With no process group to probe, an observed exit is the only confirmation
+		// available. Wait for it within the deadline, then quarantine instead of
+		// completing on an assumption, and never return without either.
+		if (this.deps.now() >= (live.cleanupDeadlineAt ?? 0)) {
+			live.cancelGrace();
+			live.quarantined = true;
+			this.finish(id, TASK_STATUS.FAILED, `child exit unconfirmed after ${GROUP_CONFIRM_DEADLINE_MS}ms; capacity quarantined`, live);
+			return;
+		}
+		live.cancelGrace = this.deps.schedule(() => this.confirmGroupExit(id, live), GROUP_CONFIRM_MS);
 	}
 
 	private childError(id: string, error: Error): void {
