@@ -46,6 +46,61 @@ export type WindowsSessionTransportHostOptions = Readonly<{
 	callback?: WindowsHostCallback;
 	rpcDeadlineMs?: number;
 }>;
+export type WindowsSessionRegistryPhase = "start" | "initialize" | "cleanup";
+export type WindowsSessionRegistryPhaseError = Readonly<{ class: "timed-out" | "rejected" | "unknown"; code: "ETIMEDOUT" | "io_error" | "unknown" }>;
+/** Receives one fixed, synchronous result event for an operation on this registry's own host. */
+export type WindowsSessionRegistryPhaseEvent = Readonly<{ phase: WindowsSessionRegistryPhase; status: "succeeded" | "failed"; error: WindowsSessionRegistryPhaseError | null }>;
+export type WindowsSessionRegistryPhaseObserver = (event: WindowsSessionRegistryPhaseEvent) => undefined;
+export type WindowsSessionRegistryObservation = Readonly<{
+	availability: "unavailable" | "observed";
+	provenance: "unavailable" | "ambiguous" | "owned-instance";
+	restoration: "not-required";
+	startCalls: number | null;
+	initializeCalls: number | null;
+	cleanupCalls: number | null;
+	firstFailurePhase: WindowsSessionRegistryPhase | null;
+	firstFailureClass: WindowsSessionRegistryPhaseError["class"] | null;
+	firstFailureCode: WindowsSessionRegistryPhaseError["code"] | null;
+}>;
+
+/** Pure probe-side reducer for fixed events emitted by one registry's lexical owner. */
+export class WindowsSessionRegistryPhaseSequence {
+	private expected: WindowsSessionRegistryPhase | "complete" = "start";
+	private invalid = false;
+	private startStatus?: WindowsSessionRegistryPhaseEvent["status"];
+	private initializeStatus?: WindowsSessionRegistryPhaseEvent["status"];
+	private cleanupStatus?: WindowsSessionRegistryPhaseEvent["status"];
+	private firstFailure?: Readonly<{ phase: WindowsSessionRegistryPhase; class: WindowsSessionRegistryPhaseError["class"]; code: WindowsSessionRegistryPhaseError["code"] }>;
+	observe(event: unknown): undefined {
+		if (this.invalid || !this.validEvent(event) || event.phase !== this.expected) { this.invalid = true; return undefined; }
+		if (event.phase === "start") this.startStatus = event.status;
+		else if (event.phase === "initialize") this.initializeStatus = event.status;
+		else this.cleanupStatus = event.status;
+		if (event.status === "failed" && this.firstFailure === undefined) this.firstFailure = Object.freeze({ phase: event.phase, class: event.error!.class, code: event.error!.code });
+		if (event.phase === "start") this.expected = event.status === "succeeded" ? "initialize" : "cleanup";
+		else if (event.phase === "initialize") this.expected = "cleanup";
+		else this.expected = "complete";
+		return undefined;
+	}
+	get operationSucceeded() { return this.startStatus === "succeeded" && this.initializeStatus === "succeeded"; }
+	get terminalSequenceValid() { return !this.invalid && this.expected === "complete"; }
+	get cleanupComplete() { return this.terminalSequenceValid && this.cleanupStatus === "succeeded"; }
+	get admitsFullSuccess() { return this.operationSucceeded && this.cleanupComplete; }
+	get startupSucceeded() { return !this.invalid && this.expected === "cleanup" && this.operationSucceeded; }
+	snapshot(): WindowsSessionRegistryObservation {
+		if (!this.terminalSequenceValid) return Object.freeze({ availability: "unavailable", provenance: this.invalid ? "ambiguous" : "unavailable", restoration: "not-required", startCalls: null, initializeCalls: null, cleanupCalls: null, firstFailurePhase: null, firstFailureClass: null, firstFailureCode: null });
+		return Object.freeze({ availability: "observed", provenance: "owned-instance", restoration: "not-required", startCalls: this.startStatus === undefined ? 0 : 1, initializeCalls: this.initializeStatus === undefined ? 0 : 1, cleanupCalls: this.cleanupStatus === undefined ? 0 : 1, firstFailurePhase: this.firstFailure?.phase ?? null, firstFailureClass: this.firstFailure?.class ?? null, firstFailureCode: this.firstFailure?.code ?? null });
+	}
+	private validEvent(event: unknown): event is WindowsSessionRegistryPhaseEvent {
+		if (!event || typeof event !== "object" || Array.isArray(event) || Object.getPrototypeOf(event) !== Object.prototype || Object.keys(event).length !== 3) return false;
+		const value = event as Record<string, unknown>;
+		if (!(["start", "initialize", "cleanup"] as const).includes(value.phase as WindowsSessionRegistryPhase) || !(["succeeded", "failed"] as const).includes(value.status as WindowsSessionRegistryPhaseEvent["status"])) return false;
+		if (value.status === "succeeded") return value.error === null;
+		if (!value.error || typeof value.error !== "object" || Array.isArray(value.error) || Object.getPrototypeOf(value.error) !== Object.prototype || Object.keys(value.error).length !== 2) return false;
+		const error = value.error as Record<string, unknown>;
+		return (["timed-out", "rejected", "unknown"] as const).includes(error.class as WindowsSessionRegistryPhaseError["class"]) && (["ETIMEDOUT", "io_error", "unknown"] as const).includes(error.code as WindowsSessionRegistryPhaseError["code"]) && (error.class !== "timed-out" || error.code === "ETIMEDOUT");
+	}
+}
 
 const defaultRuntimeScript = fileURLToPath(new URL("../runtime/windows-session-transport.ps1", import.meta.url));
 const safeError = (message: string) => new Error(message);
@@ -448,28 +503,67 @@ const registryError = (error: unknown): never => {
 	throw new SessionPresenceError("io_error", "transport I/O failed");
 };
 
+const phaseError = (error: unknown): WindowsSessionRegistryPhaseError => {
+	const rawCode = error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string" ? (error as { code: string }).code : undefined;
+	const code = rawCode === "ETIMEDOUT" || rawCode === "io_error" ? rawCode : "unknown";
+	return Object.freeze({ class: code === "ETIMEDOUT" ? "timed-out" : error instanceof Error ? "rejected" : "unknown", code });
+};
+class WindowsSessionRegistryObserver {
+	private active = true;
+	constructor(private readonly callback: WindowsSessionRegistryPhaseObserver) {}
+	async run<T>(phase: WindowsSessionRegistryPhase, operation: () => Promise<T>): Promise<T> {
+		try {
+			const value = await operation();
+			this.observe(Object.freeze({ phase, status: "succeeded", error: null }));
+			return value;
+		} catch (error) {
+			try { this.observe(Object.freeze({ phase, status: "failed", error: phaseError(error) })); } catch { /* the operation rejection remains primary */ }
+			throw error;
+		}
+	}
+	private observe(event: WindowsSessionRegistryPhaseEvent) {
+		if (!this.active) return;
+		let result: unknown;
+		try { result = this.callback(event); }
+		catch { this.active = false; throw safeError("Windows registry observation failed"); }
+		if (result === undefined) return;
+		this.active = false;
+		try { Promise.resolve(result).catch(() => {}); } catch { /* invalid thenables remain observer failures */ }
+		throw safeError("Windows registry observation failed");
+	}
+}
+
 /** Windows metadata stays in the PowerShell owner process; Node sees only public activation records. */
 export class WindowsSessionPresenceRegistry {
 	readonly paths = Object.freeze({ root: "", presence: "", sockets: "" });
 	private readonly host: WindowsSessionTransportHost;
+	private readonly observer?: WindowsSessionRegistryObserver;
 	private notification?: WindowsHostCallback;
 	private listenerFailure?: WindowsHostFailureCallback;
-	private constructor(host: WindowsSessionTransportHost) {
+	private constructor(host: WindowsSessionTransportHost, observer?: WindowsSessionRegistryObserver) {
 		this.host = host;
+		this.observer = observer;
 		this.host.setListenerFailure((generation) => this.listenerFailure?.(generation));
 	}
-	static async create(agentHome: string) {
+	static async create(agentHome: string, observePhase?: WindowsSessionRegistryPhaseObserver) {
 		if (process.platform !== "win32") throw new SessionPresenceError("io_error", "transport I/O failed");
 		if (typeof agentHome !== "string" || !/^[A-Za-z]:\\/.test(agentHome)) throw new SessionPresenceError("unsafe_path", "unsafe transport path");
 		let registry: WindowsSessionPresenceRegistry | undefined;
 		const host = new WindowsSessionTransportHost({ callback: async (notification) => registry?.notification?.(notification) ?? false });
+		const observer = observePhase === undefined ? undefined : new WindowsSessionRegistryObserver(observePhase);
+		const run = <T>(phase: WindowsSessionRegistryPhase, operation: () => Promise<T>) => observer ? observer.run(phase, operation) : operation();
 		try {
-			await host.start();
-			const initialized = await host.request("initialize", { agentHome });
-			if (initialized.state !== "initialized" || initialized.bootstrap !== "complete") throw safeError("Windows transport host unavailable");
-			registry = new WindowsSessionPresenceRegistry(host);
+			await run("start", () => host.start());
+			await run("initialize", async () => {
+				const initialized = await host.request("initialize", { agentHome });
+				if (initialized.state !== "initialized" || initialized.bootstrap !== "complete") throw safeError("Windows transport host unavailable");
+			});
+			registry = new WindowsSessionPresenceRegistry(host, observer);
 			return registry;
-		} catch { await host.close(); registryError(undefined); }
+		} catch (error) {
+			try { await run("cleanup", () => host.close()); } catch { /* registry creation preserves its primary rejection */ }
+			registryError(error);
+		}
 	}
 	setNotification(callback?: WindowsHostCallback) { this.notification = callback; }
 	clearNotification(callback: WindowsHostCallback) { if (this.notification === callback) this.notification = undefined; }
@@ -487,7 +581,7 @@ export class WindowsSessionPresenceRegistry {
 		try { return await this.host.listen(sessionId); } catch (error) { registryError(error); }
 	}
 	async stopListener(record: PresenceRecord) { try { await this.host.stopListener(record); } catch { await this.removeOwn(record); } }
-	async close() { await this.host.close(); }
+	async close() { await (this.observer ? this.observer.run("cleanup", () => this.host.close()) : this.host.close()); }
 }
 
 export class WindowsActiveSessionListener {

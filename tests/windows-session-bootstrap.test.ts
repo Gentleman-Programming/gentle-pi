@@ -7,7 +7,8 @@ import os from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { FIXED_WINDOWS_POWERSHELL, WindowsActiveSessionClient, WindowsActiveSessionListener, WindowsSessionPresenceRegistry, parseWindowsHostFrame } from "../lib/windows-session-transport.ts";
+import { FIXED_WINDOWS_POWERSHELL, WindowsActiveSessionClient, WindowsActiveSessionListener, WindowsSessionPresenceRegistry, WindowsSessionRegistryPhaseSequence, type WindowsSessionRegistryPhaseEvent, parseWindowsHostFrame } from "../lib/windows-session-transport.ts";
+import { createDefaultSessionTransport } from "../extensions/gentle-agents.ts";
 import { ActiveSessionClientError, FrameDecoder, encodeNotificationFrame, type AckFrame } from "../lib/agents-session-transport.ts";
 
 const runtime = fileURLToPath(new URL("../runtime/windows-session-transport.ps1", import.meta.url));
@@ -1032,6 +1033,140 @@ test("Windows native listener setup closes the first acquired registry when the 
 		throw new Error("second registry failed");
 	}), /second registry failed/);
 	assert.equal(closes, 1);
+});
+
+test("Windows default transport creates a registry without an observer", { skip: process.platform !== "win32", timeout: 20_000 }, async () => {
+	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-observer-"));
+	const agentHome = join(root, "profile", "agent");
+	await mkdir(join(agentHome, "gentle-agents"), { recursive: true });
+	const registry = await createDefaultSessionTransport("win32").createRegistry(agentHome);
+	try {
+		assert.deepEqual(await registry.listActivations(), []);
+	} finally {
+		await registry.close();
+	}
+});
+
+test("Windows default transport emits fixed ordered phase events for its own registry", { skip: process.platform !== "win32", timeout: 20_000 }, async () => {
+	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-observer-"));
+	const agentHome = join(root, "profile", "agent");
+	await mkdir(join(agentHome, "gentle-agents"), { recursive: true });
+	const events: WindowsSessionRegistryPhaseEvent[] = [];
+	const sequence = new WindowsSessionRegistryPhaseSequence();
+	const registry = await createDefaultSessionTransport("win32").createRegistry(agentHome, (event) => {
+		events.push(event);
+		return sequence.observe(event);
+	});
+	try {
+		assert.deepEqual(events, [
+			{ phase: "start", status: "succeeded", error: null },
+			{ phase: "initialize", status: "succeeded", error: null },
+		]);
+		for (const event of events) assert.deepEqual(Object.keys(event).sort(), ["error", "phase", "status"], "events expose no host capabilities");
+	} finally {
+		await registry.close();
+	}
+	assert.deepEqual(events, [
+		{ phase: "start", status: "succeeded", error: null },
+		{ phase: "initialize", status: "succeeded", error: null },
+		{ phase: "cleanup", status: "succeeded", error: null },
+	]);
+	assert.equal(sequence.admitsFullSuccess, true, "the seam callback retains the reducer receiver through its wrapper");
+});
+
+test("Windows default transport rejects asynchronous observer setup without awaiting it", { skip: process.platform !== "win32", timeout: 20_000 }, async () => {
+	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-observer-"));
+	const agentHome = join(root, "profile", "agent");
+	await mkdir(join(agentHome, "gentle-agents"), { recursive: true });
+	await assert.rejects(createDefaultSessionTransport("win32").createRegistry(agentHome, () => Promise.reject(new Error("observer rejected")) as never));
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	const recovered = await createDefaultSessionTransport("win32").createRegistry(agentHome);
+	await recovered.close();
+});
+
+const successfulPhase = (phase: WindowsSessionRegistryPhaseEvent["phase"]): WindowsSessionRegistryPhaseEvent => Object.freeze({ phase, status: "succeeded", error: null });
+const failedPhase = (phase: WindowsSessionRegistryPhaseEvent["phase"], error: NonNullable<WindowsSessionRegistryPhaseEvent["error"]> = Object.freeze({ class: "rejected", code: "unknown" })): WindowsSessionRegistryPhaseEvent => Object.freeze({ phase, status: "failed", error });
+
+test("Windows phase sequence preserves failed start with successful cleanup", () => {
+	const sequence = new WindowsSessionRegistryPhaseSequence();
+	sequence.observe(failedPhase("start"));
+	sequence.observe(successfulPhase("cleanup"));
+	assert.equal(sequence.operationSucceeded, false);
+	assert.equal(sequence.terminalSequenceValid, true);
+	assert.equal(sequence.cleanupComplete, true);
+	assert.equal(sequence.admitsFullSuccess, false);
+	assert.deepEqual(sequence.snapshot(), { availability: "observed", provenance: "owned-instance", restoration: "not-required", startCalls: 1, initializeCalls: 0, cleanupCalls: 1, firstFailurePhase: "start", firstFailureClass: "rejected", firstFailureCode: "unknown" });
+});
+
+test("Windows phase sequence preserves failed initialize with successful cleanup", () => {
+	const sequence = new WindowsSessionRegistryPhaseSequence();
+	sequence.observe(successfulPhase("start"));
+	sequence.observe(failedPhase("initialize"));
+	sequence.observe(successfulPhase("cleanup"));
+	assert.equal(sequence.operationSucceeded, false);
+	assert.equal(sequence.terminalSequenceValid, true);
+	assert.equal(sequence.cleanupComplete, true);
+	assert.equal(sequence.admitsFullSuccess, false);
+	assert.deepEqual(sequence.snapshot(), { availability: "observed", provenance: "owned-instance", restoration: "not-required", startCalls: 1, initializeCalls: 1, cleanupCalls: 1, firstFailurePhase: "initialize", firstFailureClass: "rejected", firstFailureCode: "unknown" });
+});
+
+test("Windows phase sequence admits only complete successful operations", () => {
+	const sequence = new WindowsSessionRegistryPhaseSequence();
+	sequence.observe(successfulPhase("start"));
+	assert.equal(sequence.terminalSequenceValid, false);
+	assert.equal(sequence.admitsFullSuccess, false);
+	sequence.observe(successfulPhase("initialize"));
+	sequence.observe(successfulPhase("cleanup"));
+	assert.equal(sequence.operationSucceeded, true);
+	assert.equal(sequence.terminalSequenceValid, true);
+	assert.equal(sequence.cleanupComplete, true);
+	assert.equal(sequence.admitsFullSuccess, true);
+});
+
+test("Windows phase sequence preserves an operation failure when cleanup fails", () => {
+	const sequence = new WindowsSessionRegistryPhaseSequence();
+	sequence.observe(failedPhase("start", Object.freeze({ class: "rejected", code: "io_error" })));
+	sequence.observe(failedPhase("cleanup", Object.freeze({ class: "rejected", code: "unknown" })));
+	assert.equal(sequence.terminalSequenceValid, true);
+	assert.equal(sequence.cleanupComplete, false);
+	assert.deepEqual(sequence.snapshot(), { availability: "observed", provenance: "owned-instance", restoration: "not-required", startCalls: 1, initializeCalls: 0, cleanupCalls: 1, firstFailurePhase: "start", firstFailureClass: "rejected", firstFailureCode: "io_error" });
+});
+
+test("Windows phase sequence rejects duplicate, out-of-order, and invalid events permanently", () => {
+	for (const events of [
+		[successfulPhase("cleanup")],
+		[successfulPhase("start"), successfulPhase("start")],
+		[{ phase: "start", status: "failed", error: { class: "timed-out", code: "unknown" } }],
+	] as const) {
+		const sequence = new WindowsSessionRegistryPhaseSequence();
+		for (const event of events) sequence.observe(event);
+		sequence.observe(successfulPhase("cleanup"));
+		assert.equal(sequence.terminalSequenceValid, false);
+		assert.equal(sequence.cleanupComplete, false);
+		assert.equal(sequence.admitsFullSuccess, false);
+		assert.deepEqual(sequence.snapshot(), { availability: "unavailable", provenance: "ambiguous", restoration: "not-required", startCalls: null, initializeCalls: null, cleanupCalls: null, firstFailurePhase: null, firstFailureClass: null, firstFailureCode: null });
+	}
+});
+
+test("Windows registry source guard preserves operation failure through observer cleanup", async (t) => {
+	t.diagnostic("source guard, not native Windows proof");
+	const source = await readFile(fileURLToPath(new URL("../lib/windows-session-transport.ts", import.meta.url)), "utf8");
+	assert.match(source, /catch \(error\) \{\s*try \{ await run\("cleanup", \(\) => host\.close\(\)\); \} catch \{[^}]*\}\s*registryError\(error\);/);
+	assert.match(source, /export type WindowsSessionRegistryPhaseObserver = \(event: WindowsSessionRegistryPhaseEvent\) => undefined;/);
+	assert.match(source, /if \(result === undefined\) return;\s*this\.active = false;\s*try \{ Promise\.resolve\(result\)\.catch\(\(\) => \{\}\);/);
+	assert.doesNotMatch(source, /WindowsSessionTransportHostObserver|observeHost\?\.\(host\)|Object\.defineProperty\(candidate/);
+});
+
+test("packed lifecycle source uses the exported phase sequence", async (t) => {
+	t.diagnostic("source guard, not packed lifecycle proof");
+	const source = await readFile(fileURLToPath(new URL("../scripts/test-packed-runner.mjs", import.meta.url)), "utf8");
+	assert.match(source, /const \{ WindowsSessionRegistryPhaseSequence \} = await within\(load\(jiti\.import/);
+	assert.match(source, /const createWindowsRegistryObservation = \(PhaseSequence\) => \{\s*if \(process\.platform === "win32"\) return new PhaseSequence\(\);/);
+	assert.match(source, /createWindowsRegistryObservation\(WindowsSessionRegistryPhaseSequence\)/);
+	assert.match(source, /windowsRegistryObservation\.startupSucceeded/);
+	assert.match(source, /windowsRegistryObservation\.cleanupComplete/);
+	assert.match(source, /windowsRegistryObservation\.admitsFullSuccess/);
+	assert.doesNotMatch(source, /Object\.defineProperty\(candidate|Host\.prototype|windowsRegistryObservation\.restore|let expected = "start"/);
 });
 
 function openWindowsNativePipe(endpoint: string) {
