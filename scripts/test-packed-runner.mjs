@@ -746,8 +746,19 @@ const INERT_DEFAULT_MODEL = {
       contextWindow: 0,
       maxTokens: 0,
     };
+    const assertNeutralInitializedSessionHistory = (runtime, description) => {
+      // getEntries excludes the SDK session header; a new session adds neutral initialization metadata after the pre-creation no-restored-history assertion.
+      const entries = runtime.session.sessionManager.getEntries();
+      assert.equal(entries.length, 1, description + ": session history after creation must contain only neutral SDK initialization metadata");
+      const [entry] = entries;
+      assert.equal(entry.type, "thinking_level_change", description + ": session history after creation must not contain restored messages, model changes, or custom entries");
+      assert.equal(entry.thinkingLevel, "off", description + ": neutral SDK initialization metadata must set thinking level off");
+      const context = runtime.session.sessionManager.buildSessionContext();
+      assert.deepEqual(context.messages, [], description + ": neutral SDK initialization metadata must not add context messages");
+      assert.equal(context.model, null, description + ": neutral SDK initialization metadata must not select a model");
+    };
     const assertNoConfiguredModel = (runtime, settingsManager, description) => {
-      assert.equal(runtime.session.sessionManager.getEntries().length, 0, description + ": session must not restore prior entries");
+      assertNeutralInitializedSessionHistory(runtime, description);
       assert.equal(settingsManager.getDefaultProvider(), undefined, description + ": in-memory settings must have no default provider");
       assert.equal(settingsManager.getDefaultModel(), undefined, description + ": in-memory settings must have no default model");
       assert.equal(runtime.services.modelRuntime.getAvailableSnapshot().length, 0, description + ": owned empty auth and model paths must expose no available models");
