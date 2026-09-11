@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
@@ -628,13 +628,25 @@ test("writeProfilesFileSync replaces the store and leaves no temp file behind", 
 });
 
 test("writeProfilesFileSync reports the operation error and still removes the temp file", () => {
-	// Renaming over a directory fails, so this reaches the failure path with a
-	// real operation error rather than a stubbed one.
 	const occupied = join(root, "occupied");
 	mkdirSync(occupied, { recursive: true });
 	assert.throws(() =>
 		writeProfilesFileSync(occupied, createProfile(emptyProfilesFile(), "team", CONFIG)),
 	);
+	assert.deepEqual(readdirSync(root).filter((entry) => entry.includes(".tmp")), []);
+});
+
+test("writeProfilesFileSync reports a serialization failure, skips the rename, and cleans up", () => {
+	// The write path fails before the rename, so this proves the reported error is
+	// the operation's, that the destination is never touched once a failure is
+	// recorded, and that cleanup still runs.
+	const path = join(root, "serialize.json");
+	const file = createProfile(emptyProfilesFile(), "team", CONFIG);
+	const circular: Record<string, unknown> = {};
+	circular.self = circular;
+	(file.profiles.team as Record<string, unknown>).explore = circular;
+	assert.throws(() => writeProfilesFileSync(path, file), /circular/i);
+	assert.equal(existsSync(path), false);
 	assert.deepEqual(readdirSync(root).filter((entry) => entry.includes(".tmp")), []);
 });
 
