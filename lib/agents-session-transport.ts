@@ -326,7 +326,6 @@ export class FrameDecoder {
 export type ReceivedNotification = Readonly<{ id: string; senderSessionId: string; message: string }>;
 type ListenerState = "idle" | "starting" | "accepting" | "active" | "failed" | "closed";
 type ListenerFailure = Readonly<{ code: "io_error"; message: "listener failed" }>;
-type EndpointIdentity = Readonly<{ dev: number; ino: number; uid: number }>;
 type ListenerScheduler = Readonly<{ setTimeout: (callback: () => void, delay: number) => unknown; clearTimeout: (handle: unknown) => void }>;
 export type ActiveSessionListenerOptions = Readonly<{ callbackDeadlineMs?: number; scheduler?: ListenerScheduler; beforeEndpointCleanup?: () => Promise<void> }>;
 const CALLBACK_DEADLINE_MS = 2000, MAX_CALLBACKS = 8, MAX_SEEN_NOTIFICATIONS = 64;
@@ -340,7 +339,6 @@ export class ActiveSessionListener {
 	record?: PresenceRecord;
 	failure?: ListenerFailure;
 	private server?: Server;
-	private endpoint?: EndpointIdentity;
 	private state: ListenerState = "idle";
 	private generation = 0;
 	private startPromise?: Promise<void>;
@@ -431,7 +429,6 @@ export class ActiveSessionListener {
 			const stat = await lstat(record.endpoint);
 			this.assertStartup(generation);
 			if (stat.isSymbolicLink() || !stat.isSocket() || !sameUser(stat)) fail("unsafe_path", "unsafe transport path");
-			this.endpoint = Object.freeze({ dev: stat.dev, ino: stat.ino, uid: stat.uid });
 			await chmod(record.endpoint, FILE_MODE);
 			this.assertStartup(generation);
 			this.state = "accepting";
@@ -530,7 +527,7 @@ export class ActiveSessionListener {
 
 	private cleanup(record?: PresenceRecord) {
 		if (this.cleanupPromise) return this.cleanupPromise;
-		const server = this.server, endpoint = this.endpoint;
+		const server = this.server;
 		this.cleanupPromise = (async () => {
 			const sockets = [...this.sockets];
 			for (const settle of this.settleSockets.values()) settle();
@@ -538,14 +535,9 @@ export class ActiveSessionListener {
 			if (server) await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
 			if (record) {
 				await this.registry.removeOwn(record).catch(() => {});
-				try {
-					try { await this.beforeEndpointCleanup?.(); } catch { /* a test seam cannot leak through cleanup */ }
-					const stat = await lstat(record.endpoint);
-					if (endpoint && !stat.isSymbolicLink() && stat.isSocket() && stat.dev === endpoint.dev && stat.ino === endpoint.ino && stat.uid === endpoint.uid) await unlink(record.endpoint);
-				} catch { /* absent or replaced endpoint remains untouched */ }
+				try { await this.beforeEndpointCleanup?.(); } catch { /* a test seam cannot leak through cleanup */ }
 			}
 			if (this.server === server) this.server = undefined;
-			if (this.endpoint === endpoint) this.endpoint = undefined;
 		})();
 		return this.cleanupPromise;
 	}

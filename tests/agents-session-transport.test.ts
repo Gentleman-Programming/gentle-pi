@@ -680,30 +680,63 @@ test("retains rejected and timed-out IDs and evicts only the oldest of 64", asyn
 	assert.equal(calls, 68);
 });
 
-test("preserves replacement endpoints and removes only its own socket", async (t) => {
-	for (const kind of ["socket", "file", "symlink"] as const) {
-		let replacement: ReturnType<typeof createServer> | undefined;
-		let endpoint = "";
-		const instance = await listener(t, async () => {}, { beforeEndpointCleanup: async () => {
-			if (kind === "socket") {
-				await writeFile(`${endpoint}.burn`, "burn");
-				replacement = createServer();
-				await new Promise<void>((resolve, reject) => { replacement!.once("error", reject); replacement!.listen(endpoint, () => resolve()); });
-				replacement.unref();
-			}
-			else if (kind === "file") await writeFile(endpoint, "replacement");
-			else await symlink("replacement", endpoint);
-		} });
-		endpoint = instance.record!.endpoint;
-		await instance.close();
-		const stat = await lstat(endpoint);
+type EndpointStat = Pick<Awaited<ReturnType<typeof lstat>>, "dev" | "ino" | "uid">;
+const sameEndpointIdentity = (left: EndpointStat | undefined, right: EndpointStat | undefined) => Boolean(left && right && left.dev === right.dev && left.ino === right.ino && left.uid === right.uid);
+const endpointCleanupDiagnostic = (kind: "socket" | "file" | "symlink", original: EndpointStat, replacement: EndpointStat | undefined, after: EndpointStat | undefined, endpointAbsentBeforeReplacement: boolean) => JSON.stringify({
+	kind,
+	originalIdentityEqualsReplacement: sameEndpointIdentity(original, replacement),
+	endpointAbsentBeforeReplacement,
+	replacementSurvived: after !== undefined,
+	afterIdentityMatchesReplacement: sameEndpointIdentity(after, replacement),
+});
+async function preservesReplacementEndpoint(t: test.TestContext, kind: "socket" | "file" | "symlink") {
+	let replacement: ReturnType<typeof createServer> | undefined;
+	let endpoint = "", replacementStat: Awaited<ReturnType<typeof lstat>> | undefined;
+	let endpointAbsentBeforeReplacement = false, closeFailed = false;
+	const instance = await listener(t, async () => {}, { beforeEndpointCleanup: async () => {
+		try { await lstat(endpoint); } catch (error) { endpointAbsentBeforeReplacement = (error as NodeJS.ErrnoException).code === "ENOENT"; }
+		if (kind === "socket") {
+			const candidate = createServer();
+			try {
+				await new Promise<void>((resolve, reject) => { candidate.once("error", reject); candidate.listen(endpoint, resolve); });
+				candidate.unref();
+				replacement = candidate;
+				replacementStat = await lstat(endpoint);
+			} catch { /* diagnostics below retain only fixed fields */ }
+		} else {
+			try {
+				if (kind === "file") await writeFile(endpoint, "replacement"); else await symlink("replacement", endpoint);
+				replacementStat = await lstat(endpoint);
+			} catch { /* diagnostics below retain only fixed fields */ }
+		}
+	} });
+	endpoint = instance.record!.endpoint;
+	const original = await lstat(endpoint);
+	try { await instance.close(); } catch { closeFailed = true; }
+	let after: Awaited<ReturnType<typeof lstat>> | undefined;
+	try { after = await lstat(endpoint); } catch { /* replacementSurvived remains false */ }
+	t.diagnostic(endpointCleanupDiagnostic(kind, original, replacementStat, after, endpointAbsentBeforeReplacement));
+	try {
+		assert.equal(closeFailed, false);
+		assert.equal(original.isSocket(), true, "the listener's original endpoint is a socket");
+		assert.ok(replacementStat, "the cleanup seam created a replacement");
+		assert.ok(after, "the replacement survives listener cleanup");
+		assert.equal(kind === "socket" ? after.isSocket() : kind === "file" ? after.isFile() : after.isSymbolicLink(), true);
+		await rejected(instance.registry.resolve("recipient"), "not_found");
+	} finally {
 		if (replacement) await new Promise<void>((resolve) => replacement!.close(() => resolve()));
-		assert.equal(kind === "socket" ? stat.isSocket() : kind === "file" ? stat.isFile() : stat.isSymbolicLink(), true);
 	}
+}
+
+test("preserves a replacement socket endpoint through listener cleanup", (t) => preservesReplacementEndpoint(t, "socket"));
+test("preserves a replacement file endpoint through listener cleanup", (t) => preservesReplacementEndpoint(t, "file"));
+test("preserves a replacement symlink endpoint through listener cleanup", (t) => preservesReplacementEndpoint(t, "symlink"));
+test("removes an untouched own socket endpoint", async (t) => {
 	const instance = await listener(t);
 	const endpoint = instance.record!.endpoint;
 	await instance.close();
 	await assert.rejects(lstat(endpoint));
+	await rejected(instance.registry.resolve("recipient"), "not_found");
 });
 
 test("waits for an invalidated delayed startup before closing", async (t) => {
