@@ -167,14 +167,63 @@ test("sdd-verify phase text carries the verify-result envelope and validate-befo
 	assert.match(chainSource, /sdd-verify-validate/);
 });
 
-test("sdd-design references repository-local implementation surfaces instead of retired prompts", () => {
-	const source = readFileSync(join(assetsAgentsDir, "sdd-design.md"), "utf8");
+function assertCurrentRepositoryInstructions(source: string, label: string): void {
+	// Repository flags are actionable targets, even when their values are URLs.
+	assert.doesNotMatch(source, /--repo(?:\s*=\s*|\s+)["']?https?:\/\/github\.com\/(?:badlogic|earendil-works)\/pi-mono\b/i, label);
+	// Upstream source/schema URLs are references, not local implementation paths.
+	assert.doesNotMatch(source, /github\.com\/(?:badlogic|earendil-works)\/pi-mono\/(?:issues|pulls?|discussions)\b/i, label);
+	const localInstructions = source.replace(/https?:\/\/[^\s<>`"\)]+/g, "");
+	assert.doesNotMatch(localInstructions, /\bpackages\/coding-agent\b|\bpi-mono\b|\bprompts\/(?:gpr|gcl)\.md\b/i, label);
+}
 
-	assert.match(
-		source,
-		/Keep design centered on the repository-local implementation surfaces \(`lib\/`, `extensions\/`, and `runtime\/`\) unless scope explicitly expands\./,
-	);
-	assert.doesNotMatch(source, /prompts\/(?:gpr|gcl)\.md/);
+function markdownFiles(directory: string): string[] {
+	return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+		const path = join(directory, entry.name);
+		return entry.isDirectory() ? markdownFiles(path) : entry.isFile() && entry.name.endsWith(".md") ? [path] : [];
+	});
+}
+
+test("shipped prompt and agent instructions do not restore monorepo paths or tracker targets", () => {
+	const manifest = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
+	// Assets include agent definitions and the orchestrator's injected/lazy prompts.
+	const assetRoots = manifest.files.filter((path: string) => /^assets\/?$/.test(path));
+	assert.equal(assetRoots.length, 1, "the shipped instruction asset root must be covered");
+	assert.ok(manifest.pi.prompts.length > 0, "Pi prompt discovery must be covered");
+	for (const root of [...assetRoots, ...manifest.pi.prompts]) {
+		const files = markdownFiles(join(repoRoot, root));
+		assert.ok(files.length > 0, `${root} must contain instruction Markdown`);
+		for (const path of files) assertCurrentRepositoryInstructions(readFileSync(path, "utf8"), path);
+	}
+});
+
+test("instruction guard rejects stale local paths and trackers but permits external references", () => {
+	for (const source of [
+		"Keep design centered on `packages/coding-agent`.",
+		"Run tests in pi-mono.",
+		"Read prompts/gpr.md and prompts/gcl.md.",
+		"gh issue create --repo badlogic/pi-mono",
+		"gh issue create --repo https://github.com/badlogic/pi-mono",
+		'gh issue create --repo "https://github.com/badlogic/pi-mono"',
+		"gh issue create --repo='https://github.com/earendil-works/pi-mono'",
+		"gh issue create --repo=https://github.com/badlogic/pi-mono",
+		"File bugs at https://github.com/earendil-works/pi-mono/issues/new",
+	]) {
+		assert.throws(() => assertCurrentRepositoryInstructions(source, "stale fixture"), assert.AssertionError);
+	}
+	for (const source of [
+		"https://raw.githubusercontent.com/earendil-works/pi-mono/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json",
+		"[Upstream source](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/README.md)",
+		"gh issue create --repo Gentleman-Programming/gentle-pi",
+		'gh issue create --repo="https://github.com/Gentleman-Programming/gentle-pi"',
+		"Read openspec/changes/{change}/proposal.md and follow the approved change scope.",
+	]) assertCurrentRepositoryInstructions(source, "valid fixture");
+});
+
+test("sdd-design follows approved change scope and requires approval before expansion", () => {
+	const source = readFileSync(join(assetsAgentsDir, "sdd-design.md"), "utf8");
+	assert.match(source, /within the approved change scope/i);
+	assert.match(source, /obtain explicit approval before expanding (?:the )?scope/i);
+	assert.doesNotMatch(source, /`(?:lib|extensions|runtime)\/`/);
 });
 
 test("the retired Pi adversarial role agents are not packaged", () => {
