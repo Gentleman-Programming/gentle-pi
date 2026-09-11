@@ -26,7 +26,6 @@ const plainTheme = {
 	},
 };
 const fakeTui = { requestRender() {} };
-
 function fakePi() {
 	const handlers = new Map<string, Handler[]>();
 	const tools = new Map<string, Registered>();
@@ -101,7 +100,7 @@ test("the todo tool writes the list, shows the card after the call, and carries 
 	assert.equal((result.details.gentleTodo as { tasks: unknown[] }).tasks.length, 2);
 	await fire("tool_execution_end", ctx, { toolName: "todo" });
 	const lines = widget()!;
-	assert.match(lines[0], /^╭─ ❀ Todos ▾ · 0 of 2 ─+ ctrl\+shift\+t collapse ╮$/);
+	assert.match(lines[0], /^╭─ ❀ Todos ▾ Collapse · 0 of 2 ─+ ctrl\+shift\+t collapse ╮$/);
 	assert.match(lines[1], /◐ Write the parser · parsing/);
 	assert.match(lines[2], /○ Add tests/);
 	assert.equal(lines[lines.length - 1], "", "a blank line keeps the card off the prompt");
@@ -122,16 +121,30 @@ test("the Todo header is a fullscreen left-click control while non-click pointer
 	await fire("tool_execution_end", ctx, { toolName: "todo" });
 
 	const component = widgetComponent()!;
-	assert.match(stripAnsi(component.render(70)[0]!), /Todos ▾/);
+	assert.match(stripAnsi(component.render(70)[0]!), /Todos ▾ Collapse/);
 	const event = (type: "press" | "click", button: "left" | "right", y = 0) => ({
 		type, button, x: 1, y, screenX: 1, screenY: y, width: 70, height: 5, shift: false, alt: false, ctrl: false,
 	});
 	assert.equal(component.handleMouse?.(event("press", "left")), undefined);
 	assert.equal(component.handleMouse?.(event("click", "right")), undefined);
 	assert.equal(component.handleMouse?.(event("click", "left", 1)), undefined);
-	assert.match(stripAnsi(component.render(70)[0]!), /Todos ▾/, "only a left click on the header toggles");
+	assert.match(stripAnsi(component.render(70)[0]!), /Todos ▾ Collapse/, "only a left click on the header toggles");
 	assert.equal(component.handleMouse?.(event("click", "left"))?.handled, true);
-	assert.match(stripAnsi(component.render(70)[0]!), /Todos ▸/);
+	assert.match(stripAnsi(component.render(70)[0]!), /Todos ▸ Expand/);
+});
+
+test("the Todo header remains a static visible control without hover handling", async () => {
+	const { pi, tools, fire } = fakePi();
+	gentleTodo(pi, {});
+	const { ctx, widgetComponent } = fakeContext();
+	await fire("session_start", ctx);
+	await tools.get("todo")!.execute("c1", { action: "write", tasks: [{ title: "A" }] }, undefined, undefined, ctx);
+	await fire("tool_execution_end", ctx, { toolName: "todo" });
+	const component = widgetComponent()!;
+	const move = { type: "move" as const, button: "none" as const, x: 1, y: 0, screenX: 1, screenY: 0, width: 70, height: 5, shift: false, alt: false, ctrl: false };
+	assert.match(stripAnsi(component.render(70)[0]!), /Todos ▾ Collapse/);
+	assert.equal(component.handleMouse?.(move), undefined);
+	assert.match(stripAnsi(component.render(70)[0]!), /Todos ▾ Collapse/);
 });
 
 test("every turn carries the open tasks in the system prompt and the card goes stale after two silent turns", async () => {
@@ -174,7 +187,7 @@ test("a finished list stays for its turn and clears at the next, and the collaps
 	await tools.get("todo")!.execute("c2", { action: "write", tasks: [{ id: 1, title: "A", status: "done" }, { id: 2, title: "B", status: "done" }] }, undefined, undefined, ctx);
 	await fire("tool_execution_end", ctx, { toolName: "todo" });
 	await fire("agent_end", ctx);
-	assert.match(widget()![0], /Todos ▾ · 2 of 2/, "the finished list is still visible at the end of its turn");
+	assert.match(widget()![0], /Todos ▾ Collapse · 2 of 2/, "the finished list is still visible at the end of its turn");
 	const next = await fire("before_agent_start", ctx, { systemPrompt: "base" });
 	assert.equal(next, undefined, "nothing open, nothing to add to the prompt");
 	assert.equal(widget(), undefined, "the card clears at the next turn");
@@ -191,7 +204,7 @@ test("session_start replays the list from the branch, rpiv-todo results included
 	const { ctx, widget } = fakeContext(branch);
 	await fire("session_start", ctx);
 	const lines = widget()!;
-	assert.match(lines[0], /Todos ▾ · 0 of 1/);
+	assert.match(lines[0], /Todos ▾ Collapse · 0 of 1/);
 	assert.match(lines[1], /◐ Old task · still going/);
 	const headless = fakeContext(branch, false);
 	await fire("session_start", headless.ctx);
