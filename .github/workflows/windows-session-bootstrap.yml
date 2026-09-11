@@ -67,7 +67,7 @@ jobs:
       - name: Run Windows registry and marker source/stream guards
         if: matrix.platform == 'windows'
         shell: cmd
-        run: node --experimental-strip-types --test --test-name-pattern="^(Windows registry source guard preserves operation failure through observer cleanup|packed lifecycle source uses the exported phase sequence|Windows listener (source guard publishes only from its Gate-protected readiness transition|failure source guard emits only a fixed post-cleanup generation event|source guard retains owned pipe continuity across the last close|ACK watchdog source guard releases Gate before asynchronous write)|Windows startup marker source emits fixed ordinal control records|Windows helper control stream enforces fixed marker framing and order|held helper reader rejects deferred malformed and duplicate control frames|held helper reader rejects truncated and oversized suffixes after valid replies)$" tests/windows-session-bootstrap.test.ts
+        run: node --experimental-strip-types --test --test-name-pattern="^(Windows registry source guard preserves operation failure through observer cleanup|packed lifecycle source uses the exported phase sequence|Windows listener (source guard publishes only from its Gate-protected readiness transition|failure source guard emits only a fixed post-cleanup generation event|source guard retains owned pipe continuity across the last close|ACK watchdog source guard releases Gate before asynchronous write)|Windows startup marker source emits fixed ordinal control records|packed Windows startup timing source guard uses the installed helper direct driver|Windows helper control stream enforces fixed marker framing and order|held helper reader rejects deferred malformed and duplicate control frames|held helper reader rejects truncated and oversized suffixes after valid replies)$" tests/windows-session-bootstrap.test.ts
       - name: Run Windows startup marker transport semantics
         if: matrix.platform == 'windows'
         shell: cmd
@@ -112,3 +112,7 @@ jobs:
         if: "!cancelled() && matrix.platform != 'windows' && steps.install_unix_dependencies.outcome == 'success'"
         shell: bash
         run: node scripts/test-packed-runner.mjs --sdk-lifecycle
+      - name: Measure packed Windows helper startup (experimental)
+        if: "!cancelled() && matrix.platform == 'windows' && steps.install_windows_dependencies.outcome == 'success'"
+        shell: cmd
+        run: node scripts\test-packed-runner.mjs --windows-startup-timing

@@ -13,9 +13,30 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const MAX_NPM_OUTPUT_BYTES = 1024 * 1024;
 const MAX_UNHOOKED_REPORT_BYTES = 1024;
 const MAX_SDK_LIFECYCLE_CHILD_REPORT_BYTES = 2048;
+const MAX_WINDOWS_STARTUP_TIMING_REPORT_BYTES = 1024;
+const MAX_WINDOWS_STARTUP_TIMING_OUTPUT_BYTES = 32 * 1024;
+const WINDOWS_STARTUP_TIMING_BUDGET_MS = 25_000;
+const WINDOWS_STARTUP_TIMING_CLEANUP_GRACE_MS = 5_000;
+const WINDOWS_STARTUP_TIMING_FORCE_CLOSE_GRACE_MS = 2_500;
+const WINDOWS_STARTUP_TIMING_POWERSHELL = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+const WINDOWS_STARTUP_TIMING_START_REQUEST = '{"requestId":"start-1","operation":"start"}\n';
+// Write-Reply uses ConvertTo-Json -Compress on a three-key hashtable. Hashtable
+// enumeration order is not an API guarantee, so admit only its six compact key orders.
+const WINDOWS_STARTUP_TIMING_VALID_START_REPLIES = new Set([
+	'{"requestId":"start-1","ok":true,"result":{"state":"partial"}}',
+	'{"requestId":"start-1","result":{"state":"partial"},"ok":true}',
+	'{"ok":true,"requestId":"start-1","result":{"state":"partial"}}',
+	'{"ok":true,"result":{"state":"partial"},"requestId":"start-1"}',
+	'{"result":{"state":"partial"},"requestId":"start-1","ok":true}',
+	'{"result":{"state":"partial"},"ok":true,"requestId":"start-1"}',
+]);
+const WINDOWS_STARTUP_TIMING_REJECTED_START_REPLY = /^\{(?:"requestId":"start-1","ok":false,"error":"(?:unavailable|unsafe|busy|not_found|invalid)"|"requestId":"start-1","error":"(?:unavailable|unsafe|busy|not_found|invalid)","ok":false|"ok":false,"requestId":"start-1","error":"(?:unavailable|unsafe|busy|not_found|invalid)"|"ok":false,"error":"(?:unavailable|unsafe|busy|not_found|invalid)","requestId":"start-1"|"error":"(?:unavailable|unsafe|busy|not_found|invalid)","requestId":"start-1","ok":false|"error":"(?:unavailable|unsafe|busy|not_found|invalid)","ok":false,"requestId":"start-1")\}$/;
 const UNHOOKED_STAGES = new Set(["pack", "pack-result", "install", "artifact-check", "import-probe", "post-import-check", "cleanup"]);
 const UNHOOKED_ERROR_CODES = new Set(["spawn-failed", "timed-out", "output-limit", "nonzero-exit", "invalid-result", "assertion-failed", "cleanup-failed", "unknown"]);
 const SDK_LIFECYCLE_STAGES = new Set(["pack", "pack-result", "install", "artifact-check", "lifecycle-probe", "lifecycle-result", "cleanup"]);
+const WINDOWS_STARTUP_TIMING_STAGES = new Set(["pack", "pack-result", "install", "artifact-check", "helper-start", "helper-result", "cleanup"]);
+const WINDOWS_STARTUP_TIMING_ERROR_CODES = new Set(["spawn-failed", "timed-out", "invalid-output", "rejected", "stream-failed", "write-failed", "exited", "nonzero-exit", "cleanup-unconfirmed", "assertion-failed", "cleanup-failed", "unknown"]);
+const WINDOWS_STARTUP_TIMING_OUTCOMES = new Set(["not-attempted", "valid-reply", "rejected", "timed-out", "invalid-output", "spawn-failed", "stream-failed", "write-failed", "exited"]);
 const SDK_LIFECYCLE_ERROR_CODES = new Set(["spawn-failed", "timed-out", "unconfirmed-close", "output-limit", "nonzero-exit", "invalid-result", "assertion-failed", "cleanup-failed", "unknown"]);
 const SDK_LIFECYCLE_EXTENSION_ERROR_PHASES = new Set(["unobserved", "none", "startup", "shutdown"]);
 const SDK_LIFECYCLE_WINDOWS_OBSERVATION_AVAILABILITY = new Set(["not-applicable", "unavailable", "observed"]);
@@ -33,6 +54,9 @@ const SDK_LIFECYCLE_CHILD_ERROR_CODES = new Set(["assertion-failed", "forbidden-
 const SDK_LIFECYCLE_CHILD_CLEANUP_STATUSES = new Set(["complete", "failed"]);
 const SDK_LIFECYCLE_CHECK_IDS = new Set([
 	"not-attempted", "runner-hosted", "runner-temp", "temporary-root", "project-sdk-version", "pack-command", "pack-metadata", "pack-integrity", "install-command", "packed-assets", "native-artifacts", "sdk-manifest", "sdk-version", "jiti-manifest-owned", "jiti-static-export", "jiti-entry-owned", "jiti-version", "lifecycle-probe-command", "lifecycle-probe-result", "sdk-lifecycle-complete", "cleanup-owned-root-removal",
+]);
+const WINDOWS_STARTUP_TIMING_CHECK_IDS = new Set([
+	"not-attempted", "runner-hosted", "runner-temp", "temporary-root", "project-sdk-version", "pack-command", "pack-metadata", "pack-integrity", "install-command", "packed-assets", "native-artifacts", "installed-helper", "helper-start", "helper-result", "windows-helper-startup-measured", "cleanup-owned-root-removal",
 ]);
 const UNHOOKED_CHECK_IDS = new Set([
 	"not-attempted", "runner-temp", "temporary-root", "project-sdk-version", "pack-command", "pack-metadata", "pack-integrity", "install-command", "import-probe-command", "import-probe-result", "unhooked-imports-complete", "cleanup-owned-root-removal",
@@ -62,6 +86,14 @@ function newSdkLifecycleReceipt() {
 	};
 }
 
+function newWindowsStartupTimingReceipt() {
+	return {
+		checkId: "not-attempted", packVerified: false, installCompleted: false, budgetMs: WINDOWS_STARTUP_TIMING_BUDGET_MS,
+		helperStartOutcome: "not-attempted", startElapsedMs: null, lastStartupMarker: null,
+		cleanup: "not-attempted", physicalCloseObserved: false, cleanupCompleted: false,
+	};
+}
+
 function selectUnhookedCheck(receipt, checkId) {
 	if (!UNHOOKED_CHECK_IDS.has(checkId)) throw new Error("invalid unhooked check identifier");
 	receipt.checkId = checkId;
@@ -69,6 +101,11 @@ function selectUnhookedCheck(receipt, checkId) {
 
 function selectSdkLifecycleCheck(receipt, checkId) {
 	if (!SDK_LIFECYCLE_CHECK_IDS.has(checkId)) throw new Error("invalid SDK lifecycle check identifier");
+	receipt.checkId = checkId;
+}
+
+function selectWindowsStartupTimingCheck(receipt, checkId) {
+	if (!WINDOWS_STARTUP_TIMING_CHECK_IDS.has(checkId)) throw new Error("invalid Windows startup timing check identifier");
 	receipt.checkId = checkId;
 }
 
@@ -117,6 +154,14 @@ class UnhookedFailure extends Error {
 		this.stage = UNHOOKED_STAGES.has(stage) ? stage : "cleanup";
 		this.code = UNHOOKED_ERROR_CODES.has(code) ? code : "unknown";
 		this.exitStatus = validExitStatus(exitStatus);
+	}
+}
+
+class WindowsStartupTimingFailure extends Error {
+	constructor(stage, code) {
+		super("Windows helper startup timing experiment failed");
+		this.stage = WINDOWS_STARTUP_TIMING_STAGES.has(stage) ? stage : "cleanup";
+		this.code = WINDOWS_STARTUP_TIMING_ERROR_CODES.has(code) ? code : "unknown";
 	}
 }
 
@@ -169,6 +214,31 @@ function reportUnhookedReceipt(receipt, error) {
 		: '{"mode":"unhooked-imports","status":"failed","checkId":"not-attempted","packVerified":false,"installCompleted":false,"cleanupCompleted":false,"stage":"cleanup","code":"unknown"}';
 	try { (failure === undefined ? process.stdout : process.stderr).write(`${boundedLine}\n`); } catch { /* Reporting cannot expose a raw secondary error. */ }
 	if (failure !== undefined) process.exitCode = failure.exitStatus ?? 1;
+}
+
+function reportWindowsStartupTimingReceipt(receipt, error) {
+	const failure = error instanceof WindowsStartupTimingFailure ? error : undefined;
+	const report = {
+		mode: "windows-startup-timing",
+		status: failure === undefined ? "complete" : "failed",
+		checkId: failure === undefined ? "windows-helper-startup-measured" : receipt.checkId,
+		packVerified: receipt.packVerified,
+		installCompleted: receipt.installCompleted,
+		budgetMs: receipt.budgetMs,
+		helperStartOutcome: receipt.helperStartOutcome,
+		startElapsedMs: receipt.startElapsedMs,
+		lastStartupMarker: receipt.lastStartupMarker,
+		cleanup: receipt.cleanup,
+		physicalCloseObserved: receipt.physicalCloseObserved,
+		cleanupCompleted: receipt.cleanupCompleted,
+		...(failure === undefined ? {} : { stage: failure.stage, code: failure.code }),
+	};
+	const line = JSON.stringify(report);
+	const boundedLine = Buffer.byteLength(line, "utf8") <= MAX_WINDOWS_STARTUP_TIMING_REPORT_BYTES
+		? line
+		: '{"mode":"windows-startup-timing","status":"failed","checkId":"not-attempted","packVerified":false,"installCompleted":false,"budgetMs":25000,"helperStartOutcome":"not-attempted","startElapsedMs":null,"lastStartupMarker":null,"cleanup":"not-attempted","physicalCloseObserved":false,"cleanupCompleted":false,"stage":"cleanup","code":"unknown"}';
+	try { (failure === undefined ? process.stdout : process.stderr).write(`${boundedLine}\n`); } catch { /* Reporting cannot expose a raw secondary error. */ }
+	if (failure !== undefined) process.exitCode = 1;
 }
 
 function reportSdkLifecycleReceipt(receipt, error) {
@@ -344,6 +414,132 @@ function runBoundedSdkLifecycleProbe(arguments_, env, cwd) {
 		child.once("error", onChildError);
 		child.once("close", onClose);
 		timeout = setTimeout(() => requestStop(new SdkLifecycleFailure("lifecycle-probe", "timed-out")), 90000);
+	});
+}
+
+function runWindowsStartupTimingProbe(runtimeScript, env, cwd) {
+	return new Promise((resolveProbe) => {
+		const observation = { helperStartOutcome: "not-attempted", startElapsedMs: null, lastStartupMarker: null, cleanup: "not-attempted", physicalCloseObserved: false };
+		let child;
+		let startedAt;
+		let startTimer;
+		let cleanupTimer;
+		let forceCloseTimer;
+		let settled = false;
+		let startReplyObserved = false;
+		let markerOrdinal = 0;
+		let output = Buffer.alloc(0);
+		let outputBytes = 0;
+		let failure;
+		const clearTimers = () => {
+			if (startTimer) clearTimeout(startTimer);
+			if (cleanupTimer) clearTimeout(cleanupTimer);
+			if (forceCloseTimer) clearTimeout(forceCloseTimer);
+		};
+		const finish = () => {
+			if (settled) return;
+			settled = true;
+			clearTimers();
+			if (observation.cleanup === "close-unconfirmed") {
+				const lateErrorSink = () => {};
+				child?.on("error", lateErrorSink);
+				child?.stdin?.on("error", lateErrorSink);
+				child?.stdout?.on("error", lateErrorSink);
+				child?.stderr?.on("error", lateErrorSink);
+				try { child?.stdin?.destroy(); child?.stdout?.destroy(); child?.stderr?.destroy(); child?.unref(); } catch { /* The receipt records that physical closure was not observed. */ }
+			}
+			resolveProbe({ ...observation, failure });
+		};
+		const setFailure = (stage, code, startOutcome) => {
+			if (failure !== undefined) return;
+			if (!startReplyObserved && WINDOWS_STARTUP_TIMING_OUTCOMES.has(startOutcome)) observation.helperStartOutcome = startOutcome;
+			failure = { stage, code };
+		};
+		const beginBoundedCleanup = () => {
+			if (!child || observation.physicalCloseObserved || cleanupTimer || settled) return;
+			cleanupTimer = setTimeout(() => {
+				try { child.kill(); } catch { /* The final bounded grace records unconfirmed physical closure. */ }
+				forceCloseTimer = setTimeout(() => {
+					if (observation.physicalCloseObserved) return;
+					observation.cleanup = "close-unconfirmed";
+					setFailure("cleanup", "cleanup-unconfirmed", "unknown");
+					finish();
+				}, WINDOWS_STARTUP_TIMING_FORCE_CLOSE_GRACE_MS);
+			}, WINDOWS_STARTUP_TIMING_CLEANUP_GRACE_MS);
+		};
+		const failAndCleanup = (stage, code, startOutcome) => {
+			setFailure(stage, code, startOutcome);
+			beginBoundedCleanup();
+		};
+		const rejectOutput = () => failAndCleanup(startReplyObserved ? "helper-result" : "helper-start", "invalid-output", "invalid-output");
+		const observeControlLine = (rawLine) => {
+			const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+			if (line === '{"event":"startup-marker","marker":"script-entered"}') {
+				if (startReplyObserved || markerOrdinal !== 0) return rejectOutput();
+				markerOrdinal = 1; observation.lastStartupMarker = "script-entered"; return;
+			}
+			if (line === '{"event":"startup-marker","marker":"native-ready"}') {
+				if (startReplyObserved || markerOrdinal !== 1) return rejectOutput();
+				markerOrdinal = 2; observation.lastStartupMarker = "native-ready"; return;
+			}
+			if (startReplyObserved) return rejectOutput();
+			if (WINDOWS_STARTUP_TIMING_REJECTED_START_REPLY.test(line)) return failAndCleanup("helper-start", "rejected", "rejected");
+			if (!WINDOWS_STARTUP_TIMING_VALID_START_REPLIES.has(line) || markerOrdinal !== 2) return rejectOutput();
+			const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+			if (!Number.isFinite(elapsedMs) || elapsedMs > WINDOWS_STARTUP_TIMING_BUDGET_MS) return failAndCleanup("helper-start", "timed-out", "timed-out");
+			startReplyObserved = true;
+			observation.helperStartOutcome = "valid-reply";
+			observation.startElapsedMs = elapsedMs;
+			if (startTimer) clearTimeout(startTimer);
+			// Markers are protocol progress only. This succeeds because the exact start reply is valid.
+			beginBoundedCleanup();
+		};
+		const onStdout = (chunk) => {
+			if (!Buffer.isBuffer(chunk) || settled) return failAndCleanup("helper-start", "stream-failed", "stream-failed");
+			outputBytes += chunk.length;
+			if (outputBytes > MAX_WINDOWS_STARTUP_TIMING_OUTPUT_BYTES) return rejectOutput();
+			const combined = output.length === 0 ? chunk : Buffer.concat([output, chunk]);
+			let offset = 0;
+			for (;;) {
+				const newline = combined.indexOf(10, offset);
+				if (newline < 0) {
+					output = combined.subarray(offset);
+					if (output.length > 16_384) rejectOutput();
+					return;
+				}
+				const line = combined.subarray(offset, newline);
+				offset = newline + 1;
+				if (line.length > 16_385 || (line.length >= 3 && line[0] === 0xef && line[1] === 0xbb && line[2] === 0xbf)) return rejectOutput();
+				try { observeControlLine(new TextDecoder("utf-8", { fatal: true }).decode(line)); } catch { return rejectOutput(); }
+				if (failure !== undefined) return;
+			}
+		};
+		const onClose = (status) => {
+			observation.physicalCloseObserved = true;
+			observation.cleanup = "close-observed";
+			if (output.length !== 0) setFailure(startReplyObserved ? "helper-result" : "helper-start", "invalid-output", "invalid-output");
+			if (!startReplyObserved) setFailure("helper-start", "exited", "exited");
+			else if (status !== 0) setFailure("helper-result", "nonzero-exit", "unknown");
+			finish();
+		};
+		startedAt = process.hrtime.bigint(); // The measurement begins immediately before the exact spawn invocation.
+		try {
+			child = spawn(WINDOWS_STARTUP_TIMING_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", runtimeScript], { cwd, env, shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+		} catch {
+			setFailure("helper-start", "spawn-failed", "spawn-failed");
+			finish();
+			return;
+		}
+		child.stdout.on("data", onStdout);
+		child.stdout.on("error", () => failAndCleanup(startReplyObserved ? "helper-result" : "helper-start", "stream-failed", "stream-failed"));
+		child.stdin.on("error", () => failAndCleanup(startReplyObserved ? "helper-result" : "helper-start", "write-failed", "write-failed"));
+		child.stderr.on("error", () => failAndCleanup(startReplyObserved ? "helper-result" : "helper-start", "stream-failed", "stream-failed"));
+		child.stderr.resume();
+		child.once("error", () => failAndCleanup(startReplyObserved ? "helper-result" : "helper-start", "stream-failed", "stream-failed"));
+		child.once("close", onClose);
+		startTimer = setTimeout(() => failAndCleanup("helper-start", "timed-out", "timed-out"), WINDOWS_STARTUP_TIMING_BUDGET_MS);
+		try { child.stdin.end(WINDOWS_STARTUP_TIMING_START_REQUEST, (error) => { if (error) failAndCleanup(startReplyObserved ? "helper-result" : "helper-start", "write-failed", "write-failed"); }); }
+		catch { failAndCleanup("helper-start", "write-failed", "write-failed"); }
 	});
 }
 
@@ -1129,6 +1325,80 @@ async function testSdkLifecyclePackedSession() {
 	return { receipt, failure };
 }
 
+async function testWindowsStartupTimingPackedHelper() {
+	const receipt = newWindowsStartupTimingReceipt();
+	let temporary;
+	let stage = "pack";
+	let failure;
+	try {
+		selectWindowsStartupTimingCheck(receipt, "runner-hosted");
+		if (process.env.RUNNER_ENVIRONMENT !== "github-hosted" || process.platform !== "win32") throw new WindowsStartupTimingFailure("pack", "assertion-failed");
+		selectWindowsStartupTimingCheck(receipt, "runner-temp");
+		const runnerTemp = process.env.RUNNER_TEMP;
+		if (typeof runnerTemp !== "string" || runnerTemp.length === 0) throw new WindowsStartupTimingFailure("pack", "assertion-failed");
+		selectWindowsStartupTimingCheck(receipt, "temporary-root");
+		temporary = mkdtempSync(join(resolve(runnerTemp), "gentle-pi-windows-startup-timing-"));
+		const packDirectory = join(temporary, "pack");
+		const consumerDirectory = join(temporary, "consumer");
+		mkdirSync(packDirectory);
+		mkdirSync(consumerDirectory);
+		const { env } = isolatedUnhookedEnvironment(temporary);
+		Object.assign(env, { GENTLE_PI_AGENTS: "1", PI_OFFLINE: "1" });
+		selectWindowsStartupTimingCheck(receipt, "project-sdk-version");
+		const manifest = safeJson(readFileSync(join(root, "package.json")), "project package manifest");
+		const sdkVersion = manifest?.devDependencies?.["@earendil-works/pi-coding-agent"];
+		if (sdkVersion !== "0.85.1") throw new Error("Windows startup timing probe requires the project-pinned Pi SDK");
+		selectWindowsStartupTimingCheck(receipt, "pack-command");
+		const packed = safeJson(runBoundedNpm("pack", ["pack", "--ignore-scripts", "--json", "--pack-destination", packDirectory], env, root), "npm pack output");
+		stage = "pack-result";
+		selectWindowsStartupTimingCheck(receipt, "pack-metadata");
+		const { tarball } = assertPackResult(packed, packDirectory, { checkId: "pack-metadata" });
+		selectWindowsStartupTimingCheck(receipt, "pack-integrity");
+		receipt.packVerified = true;
+		stage = "install";
+		selectWindowsStartupTimingCheck(receipt, "install-command");
+		writeFileSync(join(consumerDirectory, "package.json"), JSON.stringify({ name: "gentle-pi-windows-startup-timing", private: true, dependencies: { "@earendil-works/pi-coding-agent": sdkVersion } }), "utf8");
+		runBoundedNpm("install", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false", "--omit=dev", "--legacy-peer-deps", tarball, `@earendil-works/pi-coding-agent@${sdkVersion}`], env, consumerDirectory);
+		receipt.installCompleted = true;
+		stage = "artifact-check";
+		const packageRoot = join(consumerDirectory, "node_modules", "gentle-pi");
+		selectWindowsStartupTimingCheck(receipt, "packed-assets");
+		assertPackedAssets(packageRoot, { checkId: "asset-runtime-windows-session-transport-owned" });
+		selectWindowsStartupTimingCheck(receipt, "native-artifacts");
+		assertNoNativeInstallerArtifacts(packageRoot, consumerDirectory, { checkId: "native-package-cache-absent" });
+		selectWindowsStartupTimingCheck(receipt, "installed-helper");
+		const installedHelper = assertOwnedRegularFile(packageRoot, "runtime/windows-session-transport.ps1");
+		stage = "helper-start";
+		selectWindowsStartupTimingCheck(receipt, "helper-start");
+		const measured = await runWindowsStartupTimingProbe(installedHelper, env, consumerDirectory);
+		receipt.helperStartOutcome = measured.helperStartOutcome;
+		receipt.startElapsedMs = measured.startElapsedMs;
+		receipt.lastStartupMarker = measured.lastStartupMarker;
+		receipt.cleanup = measured.cleanup;
+		receipt.physicalCloseObserved = measured.physicalCloseObserved;
+		stage = "helper-result";
+		selectWindowsStartupTimingCheck(receipt, "helper-result");
+		if (measured.failure !== undefined) throw new WindowsStartupTimingFailure(measured.failure.stage, measured.failure.code);
+		if (measured.helperStartOutcome !== "valid-reply" || measured.startElapsedMs === null || measured.lastStartupMarker !== "native-ready" || measured.cleanup !== "close-observed" || !measured.physicalCloseObserved) throw new WindowsStartupTimingFailure("helper-result", "assertion-failed");
+		selectWindowsStartupTimingCheck(receipt, "windows-helper-startup-measured");
+	} catch (error) {
+		if (error instanceof WindowsStartupTimingFailure) failure = error;
+		else if (error instanceof UnhookedFailure) failure = new WindowsStartupTimingFailure(stage, error.code);
+		else failure = new WindowsStartupTimingFailure(stage, "assertion-failed");
+	}
+	if (temporary !== undefined) {
+		try {
+			if (failure === undefined) selectWindowsStartupTimingCheck(receipt, "cleanup-owned-root-removal");
+			rmSync(temporary, { recursive: true, force: true });
+			receipt.cleanupCompleted = !existsSync(temporary);
+			if (!receipt.cleanupCompleted) throw new Error("owned temporary root remains after cleanup");
+		} catch {
+			if (failure === undefined) failure = new WindowsStartupTimingFailure("cleanup", "cleanup-failed");
+		}
+	}
+	return { receipt, failure };
+}
+
 async function testUnhookedPackedImports() {
 	const receipt = newUnhookedReceipt();
 	let temporary;
@@ -1208,6 +1478,9 @@ if (process.argv.includes("--unhooked-imports")) {
 } else if (process.argv.includes("--sdk-lifecycle")) {
 	const { receipt, failure } = await testSdkLifecyclePackedSession();
 	reportSdkLifecycleReceipt(receipt, failure);
+} else if (process.argv.includes("--windows-startup-timing")) {
+	const { receipt, failure } = await testWindowsStartupTimingPackedHelper();
+	reportWindowsStartupTimingReceipt(receipt, failure);
 } else {
 	await testHookedPackedRunner();
 }

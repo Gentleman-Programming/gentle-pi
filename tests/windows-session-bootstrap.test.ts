@@ -13,6 +13,7 @@ import { ActiveSessionClientError, FrameDecoder, encodeNotificationFrame, type A
 
 const runtime = fileURLToPath(new URL("../runtime/windows-session-transport.ps1", import.meta.url));
 const fixture = fileURLToPath(new URL("fixtures/windows-session-bootstrap.ps1", import.meta.url));
+const packedRunner = fileURLToPath(new URL("../scripts/test-packed-runner.mjs", import.meta.url));
 
 type CleanupChild = EventEmitter & { pid?: number; stdin: EventEmitter & { end(input?: string): void }; stdout: EventEmitter & { destroy?(): void }; stderr: EventEmitter & { resume?(): void; destroy?(): void }; kill(): boolean };
 type ChildLifecycle = Readonly<{ child: CleanupChild; changed: EventEmitter; closeObserved: boolean; exitObserved: boolean; processError?: Error; stdinError?: Error; stdoutError?: Error; stderrError?: Error; stdinClosed: boolean; stdoutClosed: boolean; stderrClosed: boolean; exitCode: number }>;
@@ -777,6 +778,25 @@ test("Windows startup marker source emits fixed ordinal control records", async 
 	assert.ok(scriptEntered >= 0 && strictMode > scriptEntered && addType > strictMode && nativeReady > addType, "startup markers must bound, not replace, the bootstrap interval");
 	assert.match(source.slice(scriptEntered, strictMode), /^\[Console\]::Out\.WriteLine\('\{"event":"startup-marker","marker":"script-entered"\}'\)\r?\n$/);
 	assert.match(source.slice(nativeReady, source.indexOf("\n", nativeReady)), /^\s*\[WindowsSessionBootstrap\]::WriteControl\('\{"event":"startup-marker","marker":"native-ready"\}'\)\r?$/);
+});
+
+test("packed Windows startup timing source guard uses the installed helper direct driver", async (t) => {
+	t.diagnostic("source guard, not hosted Windows timing proof");
+	const source = await readFile(packedRunner, "utf8");
+	assert.match(source, /const WINDOWS_STARTUP_TIMING_BUDGET_MS = 25_000;/);
+	assert.ok(source.includes('const WINDOWS_STARTUP_TIMING_POWERSHELL = "C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe";'));
+	assert.match(source, /spawn\(WINDOWS_STARTUP_TIMING_POWERSHELL, \["-NoLogo", "-NoProfile", "-NonInteractive", "-File", runtimeScript\], \{ cwd, env, shell: false, windowsHide: true, stdio: \["pipe", "pipe", "pipe"\] \}\)/);
+	assert.match(source, /child\.stdin\.end\(WINDOWS_STARTUP_TIMING_START_REQUEST/);
+	assert.match(source, /WINDOWS_STARTUP_TIMING_VALID_START_REPLIES\.has\(line\) \|\| markerOrdinal !== 2/);
+	assert.match(source, /WINDOWS_STARTUP_TIMING_REJECTED_START_REPLY\.test\(line\)/);
+	assert.match(source, /line\.length >= 3 && line\[0\] === 0xef && line\[1\] === 0xbb && line\[2\] === 0xbf/);
+	assert.match(source, /const elapsedMs = Number\(process\.hrtime\.bigint\(\) - startedAt\) \/ 1e6;/);
+	assert.match(source, /mode: "windows-startup-timing"/);
+	assert.doesNotMatch(source, /new WindowsSessionTransportHost\(\{[^}]*rpcDeadlineMs: WINDOWS_STARTUP_TIMING_BUDGET_MS/);
+	const helper = await readFile(runtime, "utf8");
+	assert.match(helper, /function Write-Reply\([\s\S]*?@\{ requestId = \$requestId; ok = \$true; result = \$result \} \| ConvertTo-Json -Compress -Depth 4/);
+	const timingDriver = source.slice(source.indexOf("function runWindowsStartupTimingProbe"), source.indexOf("async function testHookedPackedRunner"));
+	assert.doesNotMatch(timingDriver, /JSON\.parse/);
 });
 
 test("Windows bootstrap Add-Type failures use an owned bounded diagnostic", async () => {
