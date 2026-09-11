@@ -1558,18 +1558,14 @@ function isNamedAgentStartEvent(event: unknown): boolean {
 }
 
 function sddPhaseFromAgentStartEvent(event: unknown): SddPhase | undefined {
-	for (const name of readAgentStartNames(event)) {
-		if (name === "sdd-apply") return "apply";
-		if (name === "sdd-verify") return "verify";
-		if (name === "sdd-sync") return "sync";
-		if (name === "sdd-archive") return "archive";
-	}
+	const phases = ["apply", "verify", "sync", "archive"] as const;
+	const names = readAgentStartNames(event);
 	const systemPrompt = readStringPath(event, ["systemPrompt"]) ?? "";
-	if (/\bSDD apply executor\b/i.test(systemPrompt)) return "apply";
-	if (/\bSDD verify executor\b/i.test(systemPrompt)) return "verify";
-	if (/\bSDD sync executor\b/i.test(systemPrompt)) return "sync";
-	if (/\bSDD archive executor\b/i.test(systemPrompt)) return "archive";
-	return undefined;
+	const promptPhases = phases.filter((phase) => new RegExp(`\\bSDD ${phase} executor\\b`, "i").test(systemPrompt));
+	if (promptPhases.length > 1) return undefined;
+	if (names.length === 0) return promptPhases[0];
+	return phases.find((phase) => names.every((name) => name === `sdd-${phase}`) &&
+		(promptPhases.length === 0 || promptPhases[0] === phase));
 }
 
 function resolveSddChangeSelection(serialized: unknown, cwd: string, agentName: string) {
@@ -1643,7 +1639,7 @@ async function resolveSelectedNativeSddChangeStartup(
 	} catch (error) {
 		throw new Error(`SDD selection native status is blocked: ${error instanceof Error ? error.message : String(error)}`);
 	}
-	if (!(selection.phase in status.dependencies) || !(selection.phase in status.instructions)) {
+	if (!(selection.phase in status.dependencies) || status.phaseInstructions === undefined || !(selection.phase in status.phaseInstructions)) {
 		throw new Error(`SDD selection native status cannot represent phase ${selection.phase}.`);
 	}
 	return { selection, status };
@@ -7477,7 +7473,7 @@ function createGentleAiExtensionForTesting(
 				? `\n\n${renderSddPreflightPrompt(prefs)}`
 				: "";
 		const phase = isSddAgent ? sddPhaseFromAgentStartEvent(event) : undefined;
-		const launchSddChange = isSddAgent ? readSddChangeFlag(pi) : undefined;
+		const launchSddChange = readSddChangeFlag(pi);
 		const nativeStatusPrompt = phase
 			? await (async () => {
 				if (launchSddChange === undefined) {
@@ -7489,9 +7485,7 @@ function createGentleAiExtensionForTesting(
 					), phase)}`;
 				}
 				try {
-					const names = readAgentStartNames(event);
-					const agentName = names.find((name) => name === `sdd-${phase}`);
-					if (!agentName) throw new Error("SDD selection requires a matching named SDD phase agent.");
+					const agentName = `sdd-${phase}`;
 					const startup = await resolveSelectedNativeSddChangeStartup(
 						launchSddChange,
 						ctx.cwd,
@@ -7504,7 +7498,7 @@ function createGentleAiExtensionForTesting(
 							prefs?.artifactStore,
 						),
 					);
-					return `\n\n${renderNativeSddPhasePrompt(startup.status as never, phase)}`;
+					return `\n\n${renderNativeSddPhasePrompt(startup.status, phase)}`;
 				} catch (error) {
 					return `\n\n## Native SDD Status Engine\nSDD selection blocked: ${error instanceof Error ? error.message : String(error)}\nDo not run phase work; return this blocker to the parent.`;
 				}

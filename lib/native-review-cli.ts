@@ -179,8 +179,8 @@ export interface NativeSddStatusV2 extends Readonly<Record<string, unknown>> {
 	schemaVersion: 2;
 	changeName: string;
 	actionContext: Readonly<Record<string, unknown>> & { workspaceRoot: string };
-	dependencies: Readonly<Record<NativeSddPhase, NativeSddDependencyState>>;
-	instructions: Readonly<Record<NativeSddPhase, readonly string[]>>;
+	dependencies: Readonly<Record<(typeof NATIVE_SDD_DEPENDENCIES)[number], NativeSddDependencyState>>;
+	phaseInstructions?: Readonly<Record<(typeof NATIVE_SDD_INSTRUCTION_PHASES)[number], readonly string[]>>;
 	blockedReasons: readonly string[];
 	nextRecommended: string;
 }
@@ -1375,7 +1375,9 @@ interface NativeJsonExecution {
 	process: ExecFileResult;
 }
 
-const NATIVE_SDD_PHASES = ["apply", "verify", "archive"] as const;
+const NATIVE_SDD_DEPENDENCIES = ["proposal", "specs", "design", "tasks", "apply", "verify", "archive"] as const;
+const NATIVE_SDD_INSTRUCTION_PHASES = ["apply", "verify", "remediate", "archive"] as const;
+const NATIVE_SDD_NEXT_RECOMMENDATIONS = ["apply", "verify", "remediate", "archive", "archived", "resolve-blockers", "sdd-new", "select-change", "propose", "spec", "design", "tasks"] as const;
 const NATIVE_SDD_DEPENDENCY_STATES = ["blocked", "ready", "all_done"] as const;
 
 /** Strictly validates the native v2 contract while preserving its whole record. */
@@ -1386,15 +1388,18 @@ export function decodeNativeSddStatusV2(value: unknown, request: Pick<NativeSddS
 	const actionContext = object(status.actionContext);
 	if (actionContext.workspaceRoot !== request.workspaceRoot || !isCanonicalProcessString(actionContext.workspaceRoot)) throw new Error("native SDD status workspace root mismatch");
 	const dependencies = object(status.dependencies);
-	const instructions = object(status.instructions);
-	for (const phase of NATIVE_SDD_PHASES) {
+	for (const phase of NATIVE_SDD_DEPENDENCIES) {
 		if (enumString(dependencies[phase], NATIVE_SDD_DEPENDENCY_STATES) !== dependencies[phase]) throw new Error("invalid native SDD dependency");
-		stringArray(instructions[phase]);
 	}
-	if (Object.keys(dependencies).length !== NATIVE_SDD_PHASES.length || Object.keys(dependencies).some((key) => !NATIVE_SDD_PHASES.includes(key as NativeSddPhase))) throw new Error("native SDD dependencies have an unsupported shape");
-	if (Object.keys(instructions).length !== NATIVE_SDD_PHASES.length || Object.keys(instructions).some((key) => !NATIVE_SDD_PHASES.includes(key as NativeSddPhase))) throw new Error("native SDD instructions have an unsupported shape");
+	if (Object.keys(dependencies).length !== NATIVE_SDD_DEPENDENCIES.length) throw new Error("native SDD dependencies have an unsupported shape");
+	if (status.instructions !== undefined) throw new Error("native SDD status uses phaseInstructions, not instructions");
+	if (status.phaseInstructions !== undefined) {
+		const instructions = object(status.phaseInstructions);
+		for (const phase of NATIVE_SDD_INSTRUCTION_PHASES) stringArray(instructions[phase]);
+		if (Object.keys(instructions).length !== NATIVE_SDD_INSTRUCTION_PHASES.length) throw new Error("native SDD instructions have an unsupported shape");
+	}
 	stringArray(status.blockedReasons);
-	if (!isCanonicalProcessString(status.nextRecommended)) throw new Error("invalid native SDD next recommendation");
+	enumString(status.nextRecommended, NATIVE_SDD_NEXT_RECOMMENDATIONS);
 	return status as NativeSddStatusV2;
 }
 
