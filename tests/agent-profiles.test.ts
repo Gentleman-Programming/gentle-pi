@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test, { after } from "node:test";
 import {
 	AgentProfileError,
 	bootstrapProfilesFile,
@@ -18,12 +21,16 @@ import {
 	PROFILE_EXPORT_VERSION,
 	PROFILES_KIND,
 	PROFILES_VERSION,
+	profileExportPath,
+	profilesFilePath,
+	readProfilesFileResult,
 	renameProfile,
 	serializeProfileExport,
 	serializeProfilesFile,
 	setActiveProfile,
 	summarizeProfile,
 	updateProfile,
+	writeProfilesFileSync,
 } from "../lib/agent-profiles.ts";
 import type { AgentModelConfig } from "../lib/model-routing-authority.ts";
 
@@ -544,4 +551,84 @@ test("an empty profile exports and imports cleanly", () => {
 		config: {},
 		droppedAgents: [],
 	});
+});
+
+test("normalizeProfilesFile reports an active marker that names no profile", () => {
+	const normalized = normalizeProfilesFile({
+		kind: PROFILES_KIND,
+		version: PROFILES_VERSION,
+		active: "gone",
+		profiles: { team: CONFIG },
+	});
+	assert.equal(normalized?.file.active, undefined);
+	assert.equal(normalized?.drops.droppedActive, "gone");
+});
+
+// ---- Filesystem wrappers ----
+//
+// These two wrappers are the only part of the module that touches disk, so they
+// run against a real temporary directory instead of a mock: the atomic replace
+// cannot be proven without a filesystem, and the failure modes that matter here
+// (absent file, unreadable JSON, dropped entries, missing parent directories) are
+// exactly the ones a mock would hide.
+
+const root = mkdtempSync(join(tmpdir(), "gentle-agent-profiles-"));
+after(() => rmSync(root, { recursive: true, force: true }));
+
+test("readProfilesFileResult reports a missing store without throwing", () => {
+	assert.deepEqual(readProfilesFileResult(join(root, "absent.json")), { status: "missing" });
+});
+
+test("readProfilesFileResult reports malformed JSON as invalid", () => {
+	const path = join(root, "malformed.json");
+	writeFileSync(path, "{ not json");
+	assert.deepEqual(readProfilesFileResult(path), { status: "invalid" });
+});
+
+test("readProfilesFileResult rejects a foreign kind or version", () => {
+	const path = join(root, "foreign.json");
+	writeFileSync(path, JSON.stringify({ kind: "other", version: 1, profiles: {} }));
+	assert.deepEqual(readProfilesFileResult(path), { status: "invalid" });
+});
+
+test("readProfilesFileResult returns normalized profiles together with their drops", () => {
+	const path = join(root, "drops.json");
+	writeFileSync(
+		path,
+		JSON.stringify({
+			kind: PROFILES_KIND,
+			version: PROFILES_VERSION,
+			active: "missing-profile",
+			profiles: { team: CONFIG, "bad name": CONFIG },
+		}),
+	);
+	const result = readProfilesFileResult(path);
+	if (result.status !== "valid") throw new Error(`expected valid, got ${result.status}`);
+	assert.deepEqual(Object.keys(result.file.profiles), ["team"]);
+	assert.equal(result.file.active, undefined);
+	assert.deepEqual(result.drops.droppedProfiles, ["bad name"]);
+	assert.equal(result.drops.droppedActive, "missing-profile");
+});
+
+test("writeProfilesFileSync creates missing parent directories", () => {
+	const path = join(root, "nested", "deeper", "profiles.json");
+	writeProfilesFileSync(path, createProfile(emptyProfilesFile(), "team", CONFIG));
+	assert.equal(readProfilesFileResult(path).status, "valid");
+});
+
+test("writeProfilesFileSync replaces the store and leaves no temp file behind", () => {
+	const path = join(root, "atomic.json");
+	const first = createProfile(emptyProfilesFile(), "alpha", CONFIG);
+	writeProfilesFileSync(path, first);
+	writeProfilesFileSync(path, createProfile(first, "beta", CONFIG));
+	const round = readProfilesFileResult(path);
+	if (round.status !== "valid") throw new Error(`expected valid, got ${round.status}`);
+	assert.deepEqual(Object.keys(round.file.profiles), ["alpha", "beta"]);
+	assert.deepEqual(readdirSync(root).filter((entry) => entry.includes(".tmp")), []);
+});
+
+test("the path helpers resolve both stores inside the config home", () => {
+	const home = join(root, "config-home");
+	assert.equal(profilesFilePath(home), join(home, "profiles.json"));
+	assert.equal(profileExportPath(home), join(home, "profiles.export.json"));
 });

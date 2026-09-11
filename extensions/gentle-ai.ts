@@ -3447,16 +3447,24 @@ async function showProfilesPanel(
 }
 
 function reportProfilesDrops(ctx: ExtensionContext, path: string, drops: ProfilesParseDrops): void {
+	// Dropped names are by definition the ones that failed validation, so they are
+	// untrusted input reaching the terminal and must be sanitized like any other
+	// externally supplied text.
 	const parts: string[] = [];
-	if (drops.droppedProfiles.length > 0) parts.push(`profiles: ${drops.droppedProfiles.join(", ")}`);
+	if (drops.droppedProfiles.length > 0) {
+		parts.push(`profiles: ${drops.droppedProfiles.map((name) => sanitizeTerminalText(name)).join(", ")}`);
+	}
 	if (drops.droppedAgents.length > 0) {
 		parts.push(
-			`routing entries: ${drops.droppedAgents.map(({ profile, agent }) => `${profile}/${agent}`).join(", ")}`,
+			`routing entries: ${drops.droppedAgents.map(({ profile, agent }) => `${sanitizeTerminalText(profile)}/${sanitizeTerminalText(agent)}`).join(", ")}`,
 		);
+	}
+	if (drops.droppedActive !== undefined) {
+		parts.push(`active marker: ${sanitizeTerminalText(drops.droppedActive)}`);
 	}
 	if (parts.length > 0) {
 		ctx.ui.notify(
-			`el Gentleman dropped invalid entries while loading ${path} — ${parts.join("; ")}.`,
+			`el Gentleman dropped invalid entries while loading ${sanitizeTerminalText(path)} — ${parts.join("; ")}.`,
 			"warning",
 		);
 	}
@@ -3472,32 +3480,63 @@ async function runProfilesPanelAction(
 		case "apply": {
 			if (!hasOwnProfile(file.profiles, result.name)) return file;
 			const normalized = normalizeModelConfig(file.profiles[result.name]) ?? {};
+			// Applying spans two files and there is no cross-file rename, so order the
+			// writes to keep the store truthful and compensate on failure: claim the
+			// profile in the store first, then materialise routing. A claim that fails
+			// leaves routing untouched; anything that fails after the claim restores the
+			// previous claim and, when the previously active profile is known, the
+			// routing that profile implies.
+			const claimed = setActiveProfile(file, result.name);
+			try {
+				writeProfilesFileSync(path, claimed);
+			} catch (error) {
+				ctx.ui.notify(
+					`el Gentleman could not update ${sanitizeTerminalText(path)}: ${profilesErrorMessage(error)}`,
+					"warning",
+				);
+				return file;
+			}
+			const previousActiveConfig =
+				file.active !== undefined && hasOwnProfile(file.profiles, file.active)
+					? normalizeModelConfig(file.profiles[file.active]) ?? {}
+					: undefined;
+			const revertClaim = async (routingWritten: boolean): Promise<AgentProfilesFile> => {
+				let restored = previousActiveConfig === undefined ? "" : "routing";
+				if (routingWritten && previousActiveConfig !== undefined) {
+					try {
+						await writeModelConfigAsync(ctx.cwd, previousActiveConfig);
+					} catch {
+						restored = "";
+					}
+				}
+				try {
+					writeProfilesFileSync(path, file);
+					restored = restored === "" ? "active marker" : `${restored} and active marker`;
+				} catch {
+					restored = restored === "" ? "nothing" : restored;
+				}
+				const unresolved =
+					routingWritten && previousActiveConfig === undefined
+						? ` ${sanitizeTerminalText(modelConfigPath(ctx.cwd))} still holds this profile's routing because no previously active profile was recorded to restore.`
+						: "";
+				ctx.ui.notify(
+					`el Gentleman could not apply profile "${result.name}". Restored: ${restored}.${unresolved}`,
+					"warning",
+				);
+				return file;
+			};
 			try {
 				await writeModelConfigAsync(ctx.cwd, normalized);
 			} catch (error) {
 				ctx.ui.notify(
-					`el Gentleman could not write ${modelConfigPath(ctx.cwd)}: ${profilesErrorMessage(error)}`,
+					`el Gentleman could not write ${sanitizeTerminalText(modelConfigPath(ctx.cwd))}: ${profilesErrorMessage(error)}`,
 					"warning",
 				);
-				return file;
+				return revertClaim(false);
 			}
 			const applyResult = await applySavedModelConfig(ctx);
 			if (applyResult.invalidPath) {
-				ctx.ui.notify(
-					`el Gentleman applied profile "${result.name}" to ${modelConfigPath(ctx.cwd)}, but agent reconciliation failed because ${applyResult.invalidPath} is invalid.`,
-					"warning",
-				);
-				return file;
-			}
-			const next = setActiveProfile(file, result.name);
-			try {
-				writeProfilesFileSync(path, next);
-			} catch (error) {
-				ctx.ui.notify(
-					`el Gentleman applied profile "${result.name}", but could not update ${path}: ${profilesErrorMessage(error)}`,
-					"warning",
-				);
-				return next;
+				return revertClaim(true);
 			}
 			ctx.ui.notify(
 				[
@@ -3506,7 +3545,7 @@ async function runProfilesPanelAction(
 				].join("\n"),
 				"info",
 			);
-			return next;
+			return claimed;
 		}
 		case "create": {
 			const name = await ctx.ui.input("New profile name", "e.g. deep-work");

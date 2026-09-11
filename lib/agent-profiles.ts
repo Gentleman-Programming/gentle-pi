@@ -5,8 +5,9 @@
 // path helpers and the thin read/write wrappers at the bottom; the extension
 // panel owns all TUI and orchestration concerns.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import {
 	normalizeModelConfig,
 	type AgentModelConfig,
@@ -64,6 +65,8 @@ export function emptyProfilesFile(): AgentProfilesFile {
 export interface ProfilesParseDrops {
 	droppedProfiles: string[];
 	droppedAgents: Array<{ profile: string; agent: string }>;
+	/** An `active` marker that did not name a normalized profile, when present. */
+	droppedActive?: string;
 }
 
 export interface NormalizedProfilesFile {
@@ -112,12 +115,19 @@ export function normalizeProfilesFile(value: unknown): NormalizedProfilesFile | 
 		profiles[name] = config;
 	}
 	let active: string | undefined;
-	if (
-		typeof value.active === "string" &&
-		isValidProfileName(value.active) &&
-		hasOwn(profiles, value.active)
-	) {
-		active = value.active;
+	if (value.active !== undefined) {
+		if (
+			typeof value.active === "string" &&
+			isValidProfileName(value.active) &&
+			hasOwn(profiles, value.active)
+		) {
+			active = value.active;
+		} else {
+			// Never clear the marker silently: a stale `active` is exactly the state
+			// an operator needs to see, not have disappear.
+			drops.droppedActive =
+				typeof value.active === "string" ? value.active : JSON.stringify(value.active);
+		}
 	}
 	return { file: { kind: PROFILES_KIND, version: PROFILES_VERSION, active, profiles }, drops };
 }
@@ -375,7 +385,7 @@ export function parseProfileExportText(text: string): ProfileExport | undefined 
 	return result ? { name: result.name, config: result.config } : undefined;
 }
 
-// ---- Thin path and file wrappers (untested by contract; pure delegation) ----
+// ---- Path helpers and file wrappers ----
 
 export type ProfilesFileReadResult =
 	| { status: "missing" }
@@ -405,7 +415,32 @@ export function readProfilesFileResult(path: string): ProfilesFileReadResult {
 	return { status: "valid", file: normalized.file, drops: normalized.drops };
 }
 
+/**
+ * Replace the store through a sibling temp file and a rename. A direct write that
+ * is interrupted leaves truncated JSON, which `readProfilesFileResult` must then
+ * reject as unreadable, so the destination is only ever swapped for a complete
+ * file and the temp file is removed on every failure path.
+ */
 export function writeProfilesFileSync(path: string, file: AgentProfilesFile): void {
 	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, serializeProfilesFile(file));
+	const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
+	const descriptor = openSync(
+		temporary,
+		constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+		0o600,
+	);
+	try {
+		try {
+			writeFileSync(descriptor, serializeProfilesFile(file));
+		} finally {
+			closeSync(descriptor);
+		}
+		renameSync(temporary, path);
+	} finally {
+		try {
+			unlinkSync(temporary);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
 }
