@@ -26,37 +26,251 @@ function pair() {
 	};
 }
 
-async function productionChild(requests: number, authorize: () => boolean, options: { maxRequests?: number; closeChannel?: boolean; withoutChannel?: boolean } = {}): Promise<boolean[]> {
+type Fd3StdioMode = "pipe" | "overlapped";
+
+type WindowsFd3DiagnosticTrace = {
+	stdioMode: Fd3StdioMode;
+	childClientAttached: boolean | "unknown";
+	childRequestAttemptCount: number;
+	childSettlement: "not-attempted" | "settled-true" | "settled-false" | "unknown";
+	childResponseObserved: "unknown-without-production-instrumentation";
+	childTimeoutObserved: "unknown-without-production-instrumentation";
+	parentRawDataChunkCount: number;
+	parentAuthorizationCallbackCount: number;
+	parentWriteCallback: "unknown-without-production-instrumentation";
+	parentWriteErrorCode: "unknown-without-production-instrumentation";
+	parentFd3Cleanup: "not-needed" | "deadline-termination-requested" | "deadline-confirmed-close" | "deadline-unconfirmed-after-grace";
+	childClose: "pending" | "observed" | "unconfirmed-after-grace";
+	fd3Close: "pending" | "observed" | "unconfirmed-after-grace";
+	probeResult: "pending" | "completed" | "spawn-failure" | "child-error" | "child-exit-nonzero" | "parse-failure" | "stream-error" | "deadline-unconfirmed";
+	capturedOutput: "within-4096-byte-bound" | "truncated-at-4096-bytes";
+	childExit: "unknown" | "zero" | "nonzero" | "error";
+};
+
+type ProductionChildOptions = {
+	maxRequests?: number;
+	closeChannel?: boolean;
+	withoutChannel?: boolean;
+	stdioMode?: Fd3StdioMode;
+	childDeadlineMs?: number;
+	childCloseGraceMs?: number;
+	diagnosticTrace?: WindowsFd3DiagnosticTrace;
+};
+
+function windowsFd3DiagnosticTrace(stdioMode: Fd3StdioMode): WindowsFd3DiagnosticTrace {
+	return {
+		stdioMode,
+		childClientAttached: "unknown",
+		childRequestAttemptCount: 0,
+		childSettlement: "unknown",
+		childResponseObserved: "unknown-without-production-instrumentation",
+		childTimeoutObserved: "unknown-without-production-instrumentation",
+		parentRawDataChunkCount: 0,
+		parentAuthorizationCallbackCount: 0,
+		parentWriteCallback: "unknown-without-production-instrumentation",
+		parentWriteErrorCode: "unknown-without-production-instrumentation",
+		parentFd3Cleanup: "not-needed",
+		childClose: "pending",
+		fd3Close: "pending",
+		probeResult: "pending",
+		capturedOutput: "within-4096-byte-bound",
+		childExit: "unknown",
+	};
+}
+
+async function productionChild(requests: number, authorize: () => boolean, options: ProductionChildOptions = {}): Promise<boolean[]> {
 	const moduleUrl = new URL("../lib/review-session-standing-permission-ipc.ts", import.meta.url).href;
+	const diagnostic = options.diagnosticTrace !== undefined;
 	const source = `
 		import { createChildStandingReviewPermissionClient } from ${JSON.stringify(moduleUrl)};
 		const client = createChildStandingReviewPermissionClient();
 		const answers = [];
-		for (let index = 0; index < ${requests}; index += 1) answers.push(await client?.requestAuthorization(${JSON.stringify(REPOSITORY_ID)}) ?? false);
+		const trace = {
+			childClientAttached: client !== undefined,
+			childRequestAttemptCount: 0,
+			childSettlement: "not-attempted",
+			childResponseObserved: "unknown-without-production-instrumentation",
+			childTimeoutObserved: "unknown-without-production-instrumentation",
+		};
+		for (let index = 0; index < ${requests}; index += 1) {
+			trace.childRequestAttemptCount += 1;
+			const answer = await client?.requestAuthorization(${JSON.stringify(REPOSITORY_ID)}) ?? false;
+			answers.push(answer);
+			trace.childSettlement = answer ? "settled-true" : "settled-false";
+		}
 		client?.close();
-		process.stdout.write(JSON.stringify(answers));
+		process.stdout.write(JSON.stringify(${diagnostic} ? { answers, trace } : answers));
 	`;
 	const child = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "--eval", source], {
 		env: { ...process.env, GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" },
-		stdio: options.withoutChannel ? ["ignore", "pipe", "pipe"] : ["ignore", "pipe", "pipe", "pipe"],
+		stdio: options.withoutChannel ? ["ignore", "pipe", "pipe"] : ["ignore", "pipe", "pipe", options.stdioMode ?? "pipe"],
 	});
 	const pipe = child.stdio[3];
+	const trace = options.diagnosticTrace;
+	const onParentData = () => { if (trace !== undefined) trace.parentRawDataChunkCount += 1; };
+	if (trace !== undefined && pipe !== null && pipe !== undefined) pipe.on("data", onParentData);
+	const parentAuthorize = trace === undefined
+		? authorize
+		: () => {
+			trace.parentAuthorizationCallbackCount += 1;
+			return authorize();
+		};
 	const broker = pipe === null || pipe === undefined
 		? undefined
-		: new ParentStandingReviewPermissionBroker({ readable: pipe, writable: pipe }, authorize, options);
+		: new ParentStandingReviewPermissionBroker({ readable: pipe, writable: pipe }, parentAuthorize, options);
 	if (options.closeChannel && pipe !== null && pipe !== undefined) {
 		broker?.close();
 		pipe.destroy();
 	}
 	let stdout = "";
 	let stderr = "";
-	child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
-	child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
-	return new Promise((resolve, reject) => child.once("exit", (code) => {
-		broker?.close();
-		if (code !== 0) reject(new Error(`child exited ${code}: ${stderr}`));
-		else resolve(JSON.parse(stdout) as boolean[]);
-	}));
+	if (trace === undefined) {
+		child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
+		child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+		return new Promise((resolve, reject) => child.once("exit", (code) => {
+			broker?.close();
+			if (code !== 0) reject(new Error(`child exited ${code}: ${stderr}`));
+			else resolve(JSON.parse(stdout) as boolean[]);
+		}));
+	}
+
+	const diagnosticTrace = trace;
+	const outputLimitBytes = 4_096;
+	let stdoutBytes = 0;
+	let stderrBytes = 0;
+	let cleanupStarted = false;
+	let settled = false;
+	let deadline: NodeJS.Timeout | undefined;
+	let closeGrace: NodeJS.Timeout | undefined;
+	const appendBounded = (current: string, chunk: Buffer, currentBytes: number): { value: string; bytes: number } => {
+		if (currentBytes >= outputLimitBytes) {
+			diagnosticTrace.capturedOutput = "truncated-at-4096-bytes";
+			return { value: current, bytes: currentBytes };
+		}
+		const accepted = chunk.subarray(0, outputLimitBytes - currentBytes);
+		if (accepted.length !== chunk.length) diagnosticTrace.capturedOutput = "truncated-at-4096-bytes";
+		return { value: current + accepted.toString("utf8"), bytes: currentBytes + accepted.length };
+	};
+	const onStdoutData = (chunk: Buffer) => {
+		const captured = appendBounded(stdout, chunk, stdoutBytes);
+		stdout = captured.value;
+		stdoutBytes = captured.bytes;
+	};
+	const onStderrData = (chunk: Buffer) => {
+		const captured = appendBounded(stderr, chunk, stderrBytes);
+		stderr = captured.value;
+		stderrBytes = captured.bytes;
+	};
+	child.stdout.on("data", onStdoutData);
+	child.stderr.on("data", onStderrData);
+
+	return new Promise((resolve) => {
+		const removeOperationalListeners = () => {
+			child.off("exit", onChildExit);
+			child.off("close", onChildClose);
+			child.stdout.off("data", onStdoutData);
+			child.stderr.off("data", onStderrData);
+			pipe?.off("close", onFd3Close);
+			if (pipe !== null && pipe !== undefined) pipe.off("data", onParentData);
+		};
+		const removeInertErrorGuards = () => {
+			child.off("error", onChildError);
+			child.stdout.off("error", onStreamError);
+			child.stderr.off("error", onStreamError);
+			pipe?.off("error", onStreamError);
+		};
+		const finish = (answers: boolean[], retainInertErrorGuards = false) => {
+			if (settled) return;
+			settled = true;
+			if (deadline !== undefined) clearTimeout(deadline);
+			if (closeGrace !== undefined) clearTimeout(closeGrace);
+			removeOperationalListeners();
+			if (retainInertErrorGuards) child.once("close", removeInertErrorGuards);
+			else removeInertErrorGuards();
+			broker?.close();
+			resolve(answers);
+		};
+		const parseCompletedAnswers = (): boolean[] | undefined => {
+			if (diagnosticTrace.capturedOutput !== "within-4096-byte-bound") return undefined;
+			try {
+				const result = JSON.parse(stdout) as { answers?: unknown; trace?: Partial<WindowsFd3DiagnosticTrace> };
+				if (!Array.isArray(result.answers) || !result.answers.every((answer) => typeof answer === "boolean")) return undefined;
+				diagnosticTrace.childClientAttached = result.trace?.childClientAttached === true;
+				diagnosticTrace.childRequestAttemptCount = typeof result.trace?.childRequestAttemptCount === "number" ? result.trace.childRequestAttemptCount : 0;
+				diagnosticTrace.childSettlement = result.trace?.childSettlement === "settled-true" || result.trace?.childSettlement === "settled-false"
+					? result.trace.childSettlement
+					: "unknown";
+				return result.answers;
+			} catch {
+				return undefined;
+			}
+		};
+		const finishFromChildClose = () => {
+			if (settled) return;
+			if (diagnosticTrace.childExit === "nonzero" || diagnosticTrace.childExit === "error") {
+				diagnosticTrace.probeResult = diagnosticTrace.childExit === "error" ? "child-error" : "child-exit-nonzero";
+				finish([]);
+				return;
+			}
+			const answers = parseCompletedAnswers();
+			if (answers === undefined) {
+				diagnosticTrace.probeResult = "parse-failure";
+				finish([]);
+				return;
+			}
+			if (diagnosticTrace.probeResult === "pending") diagnosticTrace.probeResult = "completed";
+			finish(answers);
+		};
+		const finishIfPhysicalCleanupConfirmed = () => {
+			if (!cleanupStarted || diagnosticTrace.childClose !== "observed" || diagnosticTrace.fd3Close !== "observed") return;
+			diagnosticTrace.parentFd3Cleanup = "deadline-confirmed-close";
+			finishFromChildClose();
+		};
+		const onChildExit = (code: number | null) => {
+			diagnosticTrace.childExit = code === 0 ? "zero" : "nonzero";
+		};
+		const onChildClose = (code: number | null) => {
+			diagnosticTrace.childClose = "observed";
+			if (diagnosticTrace.childExit === "unknown") diagnosticTrace.childExit = code === 0 ? "zero" : "nonzero";
+			if (cleanupStarted) finishIfPhysicalCleanupConfirmed();
+			else finishFromChildClose();
+		};
+		const onFd3Close = () => {
+			diagnosticTrace.fd3Close = "observed";
+			finishIfPhysicalCleanupConfirmed();
+		};
+		const onChildError = () => {
+			diagnosticTrace.childExit = "error";
+			if (diagnosticTrace.probeResult === "pending") diagnosticTrace.probeResult = "child-error";
+		};
+		const onStreamError = () => {
+			if (diagnosticTrace.probeResult === "pending") diagnosticTrace.probeResult = "stream-error";
+		};
+		const startDeadlineCleanup = () => {
+			if (settled || cleanupStarted) return;
+			cleanupStarted = true;
+			diagnosticTrace.parentFd3Cleanup = "deadline-termination-requested";
+			broker?.close();
+			pipe?.destroy();
+			try { child.kill(); } catch { /* The owned child may already have exited. */ }
+			closeGrace = setTimeout(() => {
+				if (diagnosticTrace.childClose === "pending") diagnosticTrace.childClose = "unconfirmed-after-grace";
+				if (diagnosticTrace.fd3Close === "pending") diagnosticTrace.fd3Close = "unconfirmed-after-grace";
+				if (diagnosticTrace.fd3Close !== "observed") diagnosticTrace.parentFd3Cleanup = "deadline-unconfirmed-after-grace";
+				diagnosticTrace.probeResult = "deadline-unconfirmed";
+				finish([], true);
+			}, options.childCloseGraceMs ?? 250);
+		};
+
+		child.once("exit", onChildExit);
+		child.once("close", onChildClose);
+		child.on("error", onChildError);
+		child.stdout.on("error", onStreamError);
+		child.stderr.on("error", onStreamError);
+		pipe?.once("close", onFd3Close);
+		pipe?.on("error", onStreamError);
+		deadline = setTimeout(startDeadlineCleanup, options.childDeadlineMs ?? 6_000);
+	});
 }
 
 test("the production child fd3 client gets grant, revocation, closure, denial, and request bounds from its parent broker", async () => {
@@ -231,3 +445,27 @@ test("a child disconnect during a pending parent response cannot crash the broke
 		parentToChild.destroy();
 	}
 });
+
+if (process.platform === "win32") {
+	test("diagnostic: fd3 production child compares pipe and overlapped without inferring a pipe denial", { timeout: 15_000 }, async (t) => {
+		const results: Array<{ answers: boolean[] | undefined; trace: WindowsFd3DiagnosticTrace }> = [];
+		for (const stdioMode of ["pipe", "overlapped"] as const) {
+			const trace = windowsFd3DiagnosticTrace(stdioMode);
+			let answers: boolean[] | undefined;
+			try {
+				answers = await productionChild(1, () => true, { stdioMode, childDeadlineMs: 6_000, childCloseGraceMs: 250, diagnosticTrace: trace });
+			} catch {
+				trace.probeResult = "spawn-failure";
+			}
+			t.diagnostic(JSON.stringify(trace));
+			results.push({ answers, trace });
+		}
+		const overlapped = results.find((result) => result.trace.stdioMode === "overlapped");
+		assert.deepEqual(overlapped?.answers, [true], "overlapped must carry a production-client grant from the direct parent broker");
+		assert.equal(overlapped?.trace.childClientAttached, true, "the production child must attach its fd3 client");
+		assert.equal(overlapped?.trace.childRequestAttemptCount, 1, "the production child must attempt one synthetic request");
+		assert.ok((overlapped?.trace.parentRawDataChunkCount ?? 0) > 0, "the parent must receive child request data without assuming stream chunk framing");
+		assert.equal(overlapped?.trace.parentAuthorizationCallbackCount, 1, "the direct parent broker must authorize one request");
+		assert.equal(overlapped?.trace.probeResult, "completed", "the overlapped probe must close and parse cleanly");
+	});
+}
