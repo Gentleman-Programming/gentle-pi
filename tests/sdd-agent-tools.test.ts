@@ -174,7 +174,8 @@ function assertCurrentRepositoryInstructions(source: string, label: string): voi
 	// Upstream source/schema URLs are references, not local implementation paths.
 	assert.doesNotMatch(source, /github\.com\/(?:badlogic|earendil-works)\/pi-mono\/(?:issues|pulls?|discussions)\b/i, label);
 	const localInstructions = source.replace(/https?:\/\/[^\s<>`"\)]+/g, "");
-	assert.doesNotMatch(localInstructions, /\bpackages\/|\bAGENTS\.md\b|\bpi-mono\b|\bprompts\/(?:gpr|gcl)\.md\b/i, label);
+	// Hyphens belong to names; slashes still delimit actual local path components.
+	assert.doesNotMatch(localInstructions, /(?<![\w-])(?:packages\/|AGENTS\.md(?![\w-])|pi-mono(?![\w-])|prompts\/(?:gpr|gcl)\.md(?![\w-]))/i, label);
 }
 
 /** Collect Markdown instruction files recursively beneath a shipped directory. */
@@ -219,6 +220,32 @@ test("instruction guard rejects stale local paths and trackers but permits exter
 		'gh issue create --repo="https://github.com/Gentleman-Programming/gentle-pi"',
 		"Read openspec/changes/{change}/proposal.md and follow the approved change scope.",
 	]) assertCurrentRepositoryInstructions(source, "valid fixture");
+});
+
+for (const source of ["my-packages/tool", "my-AGENTS.md", "pi-mono-fork"]) {
+	test(`instruction guard permits hyphenated near miss ${source}`, () => {
+		assertCurrentRepositoryInstructions(source, "hyphenated near-miss fixture");
+	});
+}
+
+test("instruction guard distinguishes path components from hyphenated names", () => {
+	for (const source of [
+		"Read ./packages/tool and /workspace/packages/widget.",
+		"Read docs/AGENTS.md.",
+		"Use (pi-mono).",
+		"Read ./prompts/gpr.md.",
+		"Read ./prompts/gcl.md.",
+		"File bugs at https://github.com/badlogic/pi-mono/pull/918",
+		"Discuss at https://github.com/earendil-works/pi-mono/discussions/1",
+	]) {
+		assert.throws(() => assertCurrentRepositoryInstructions(source, "path boundary fixture"), assert.AssertionError);
+	}
+	for (const source of [
+		"Read ./my-packages/tool and docs/my-AGENTS.md.",
+		"Use my-pi-mono and pi-mono-fork.",
+		"Read my-prompts/gpr.md and prompts/gcl.md-backup.",
+		"[Source](https://example.com/packages/tool/AGENTS.md) then edit my-packages/tool.",
+	]) assertCurrentRepositoryInstructions(source, "similar name fixture");
 });
 
 test("instruction guard rejects local packages outside coding-agent", () => {
