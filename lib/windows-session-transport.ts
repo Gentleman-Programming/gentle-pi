@@ -47,7 +47,8 @@ export type WindowsSessionTransportHostOptions = Readonly<{
 	rpcDeadlineMs?: number;
 }>;
 export type WindowsSessionRegistryPhase = "start" | "initialize" | "cleanup";
-export type WindowsSessionRegistryPhaseError = Readonly<{ class: "timed-out" | "rejected" | "unknown"; code: "ETIMEDOUT" | "io_error" | "unknown" }>;
+export type WindowsSessionRegistryPhaseErrorCode = "spawn" | "stream" | "process" | "exit" | "write" | "deadline" | "protocol" | "start-reply" | "stopped" | "unwritable" | "unknown";
+export type WindowsSessionRegistryPhaseError = Readonly<{ class: "timed-out" | "rejected" | "unknown"; code: WindowsSessionRegistryPhaseErrorCode }>;
 /** Receives one fixed, synchronous result event for an operation on this registry's own host. */
 export type WindowsSessionRegistryPhaseEvent = Readonly<{ phase: WindowsSessionRegistryPhase; status: "succeeded" | "failed"; error: WindowsSessionRegistryPhaseError | null }>;
 export type WindowsSessionRegistryPhaseObserver = (event: WindowsSessionRegistryPhaseEvent) => undefined;
@@ -98,12 +99,20 @@ export class WindowsSessionRegistryPhaseSequence {
 		if (value.status === "succeeded") return value.error === null;
 		if (!value.error || typeof value.error !== "object" || Array.isArray(value.error) || Object.getPrototypeOf(value.error) !== Object.prototype || Object.keys(value.error).length !== 2) return false;
 		const error = value.error as Record<string, unknown>;
-		return (["timed-out", "rejected", "unknown"] as const).includes(error.class as WindowsSessionRegistryPhaseError["class"]) && (["ETIMEDOUT", "io_error", "unknown"] as const).includes(error.code as WindowsSessionRegistryPhaseError["code"]) && (error.class !== "timed-out" || error.code === "ETIMEDOUT");
+		return (["timed-out", "rejected", "unknown"] as const).includes(error.class as WindowsSessionRegistryPhaseError["class"]) && (["spawn", "stream", "process", "exit", "write", "deadline", "protocol", "start-reply", "stopped", "unwritable", "unknown"] as const).includes(error.code as WindowsSessionRegistryPhaseErrorCode) && ((error.class === "timed-out") === (error.code === "deadline"));
 	}
 }
 
 const defaultRuntimeScript = fileURLToPath(new URL("../runtime/windows-session-transport.ps1", import.meta.url));
 const safeError = (message: string) => new Error(message);
+// Diagnostics are source-defined and remain private to the phase observer: no native
+// error object, message, property, or stderr is copied into the event.
+const transportFailureCodes = new WeakMap<Error, WindowsSessionRegistryPhaseErrorCode>();
+const transportError = (message: string, code: WindowsSessionRegistryPhaseErrorCode) => {
+	const error = safeError(message);
+	transportFailureCodes.set(error, code);
+	return error;
+};
 // This sink intentionally captures no host state. It prevents a late stream error from
 // becoming unhandled after bounded cleanup times out but before the child confirms close.
 const lateChildErrorSink = () => {};
@@ -241,11 +250,11 @@ export class WindowsSessionTransportHost {
 	private rejectCleanup?: (error: Error) => void;
 	private cleanupTimer?: ReturnType<typeof setTimeout>;
 	private readonly onStdoutData = (chunk: Buffer) => this.onOutput(chunk);
-	private readonly onStdoutError = () => this.abort("Windows transport host unavailable", true);
-	private readonly onStdinError = () => this.abort("Windows transport host unavailable", true);
-	private readonly onStderrError = () => this.abort("Windows transport host unavailable", true);
-	private readonly onChildError = () => this.abort("Windows transport host unavailable", true);
-	private readonly onChildExit = () => this.abort("Windows transport host exited");
+	private readonly onStdoutError = () => this.abort("Windows transport host unavailable", true, "stream");
+	private readonly onStdinError = () => this.abort("Windows transport host unavailable", true, "stream");
+	private readonly onStderrError = () => this.abort("Windows transport host unavailable", true, "stream");
+	private readonly onChildError = () => this.abort("Windows transport host unavailable", true, "process");
+	private readonly onChildExit = () => this.abort("Windows transport host exited", false, "exit");
 	private readonly onChildClose = () => this.handleChildClose();
 	// Set only while handing close ownership from the host observer to detached state.
 	private handoffCloseState?: DetachedChildCleanup;
@@ -260,10 +269,10 @@ export class WindowsSessionTransportHost {
 
 	start(): Promise<void> {
 		if (this.started) return this.started;
-		if (this.stopped) return Promise.reject(safeError("Windows transport host exited"));
+		if (this.stopped) return Promise.reject(transportError("Windows transport host exited", "stopped"));
 		try {
 			this.child = this.spawnProcess(FIXED_WINDOWS_POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", this.runtimeScript], { shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }) as SpawnedHost;
-		} catch { return Promise.reject(safeError("Windows transport host unavailable")); }
+		} catch { return Promise.reject(transportError("Windows transport host unavailable", "spawn")); }
 		this.child.stdout.on("data", this.onStdoutData);
 		this.child.stdout.on("error", this.onStdoutError);
 		this.child.stdin.on("error", this.onStdinError);
@@ -273,7 +282,7 @@ export class WindowsSessionTransportHost {
 		this.child.once("exit", this.onChildExit);
 		this.child.once("close", this.onChildClose);
 		this.started = this.request("start", {}).then((result) => {
-			if (result.state !== "partial") throw safeError("Windows transport host unavailable");
+			if (result.state !== "partial") throw transportError("Windows transport host unavailable", "start-reply");
 		});
 		return this.started;
 	}
@@ -282,16 +291,17 @@ export class WindowsSessionTransportHost {
 		const kind = operation === "ack" ? "ack" : "rpc";
 		if (!/^[a-z-]{1,32}$/.test(operation) || hasPrivateData(values) || (kind === "rpc" ? this.pendingRpcs >= MAX_PENDING : this.pendingAcks >= MAX_PENDING_ACK)) return Promise.reject(safeError("Windows transport request unavailable"));
 		const child = this.child;
-		if (!child || this.stopped || !child.stdin.writable) return Promise.reject(safeError("Windows transport host exited"));
+		if (!child || this.stopped) return Promise.reject(transportError("Windows transport host exited", "stopped"));
+		if (!child.stdin.writable) return Promise.reject(transportError("Windows transport host exited", "unwritable"));
 		const requestId = `${operation}-${++this.sequence}`;
 		const line = JSON.stringify({ requestId, operation, ...values });
 		if (Buffer.byteLength(line, "utf8") > MAX_CONTROL_BYTES) return Promise.reject(safeError("Windows transport request unavailable"));
 		return new Promise((resolve, reject) => {
-			const timer = setTimeout(() => this.settle(requestId, safeError("Windows transport request timed out")), kind === "ack" ? CALLBACK_DEADLINE_MS : this.deadline);
+			const timer = setTimeout(() => this.settle(requestId, transportError("Windows transport request timed out", "deadline")), kind === "ack" ? CALLBACK_DEADLINE_MS : this.deadline);
 			this.pending.set(requestId, { kind, resolve, reject, timer });
 			if (kind === "ack") this.pendingAcks++; else this.pendingRpcs++;
-			try { child.stdin.write(`${line}\n`, (error) => { if (error) this.settle(requestId, safeError("Windows transport host exited")); }); }
-			catch { this.settle(requestId, safeError("Windows transport host exited")); }
+			try { child.stdin.write(`${line}\n`, (error) => { if (error) this.settle(requestId, transportError("Windows transport host exited", "write")); }); }
+			catch { this.settle(requestId, transportError("Windows transport host exited", "write")); }
 		});
 	}
 
@@ -328,26 +338,26 @@ export class WindowsSessionTransportHost {
 	}
 
 	private onOutput(chunk: Buffer) {
-		if (!Buffer.isBuffer(chunk)) { this.abort("Windows transport host unavailable", true); return; }
+		if (!Buffer.isBuffer(chunk)) { this.abort("Windows transport host unavailable", true, "protocol"); return; }
 		const output = this.output.length === 0 ? chunk : Buffer.concat([this.output, chunk]);
 		let offset = 0;
 		for (;;) {
 			const newline = output.indexOf(10, offset);
 			if (newline < 0) {
 				const partial = output.subarray(offset);
-				if (partial.length > MAX_PRIVATE_EVENT_BYTES) this.abort("Windows transport host unavailable", true);
+				if (partial.length > MAX_PRIVATE_EVENT_BYTES) this.abort("Windows transport host unavailable", true, "protocol");
 				else this.output = Buffer.from(partial);
 				return;
 			}
 			const bytes = output.subarray(offset, newline);
 			offset = newline + 1;
-			if (bytes.length > MAX_PRIVATE_EVENT_BYTES) { this.abort("Windows transport host unavailable", true); return; }
+			if (bytes.length > MAX_PRIVATE_EVENT_BYTES) { this.abort("Windows transport host unavailable", true, "protocol"); return; }
 			let line: string;
 			try {
 				// Newlines are single UTF-8 bytes, so retaining only an unterminated byte
 				// suffix preserves split code points without decoding partial chunks.
 				line = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-			} catch { this.abort("Windows transport host unavailable", true); return; }
+			} catch { this.abort("Windows transport host unavailable", true, "protocol"); return; }
 			try {
 				const event = parseWindowsHostEvent(line);
 				if (event) {
@@ -356,11 +366,11 @@ export class WindowsSessionTransportHost {
 					continue;
 				}
 				const reply = parseWindowsHostFrame(line);
-				this.settle(reply.requestId, reply.ok ? undefined : safeError("Windows transport request unavailable"), reply.result);
+				this.settle(reply.requestId, reply.ok ? undefined : transportError("Windows transport request unavailable", "protocol"), reply.result);
 			} catch (error) {
 				// Only a schema-validated private event can isolate its embedded client wire.
 				if (error instanceof InvalidClientWireError) continue;
-				this.abort("Windows transport host unavailable", true);
+				this.abort("Windows transport host unavailable", true, "protocol");
 				return;
 			}
 		}
@@ -417,7 +427,7 @@ export class WindowsSessionTransportHost {
 		if (this.cleanupTimer) clearTimeout(this.cleanupTimer);
 		this.cleanupTimer = undefined;
 		this.handoffCloseState?.close();
-		if (!this.stopped) this.abort("Windows transport host exited");
+		if (!this.stopped) this.abort("Windows transport host exited", false, "exit");
 		this.detachOwnedListeners(false);
 		const resolve = this.resolveCleanup;
 		this.resolveCleanup = undefined;
@@ -481,12 +491,12 @@ export class WindowsSessionTransportHost {
 		} else this.scheduleCleanupKill();
 		return cleanup;
 	}
-	private abort(message: string, closeChild = false) {
+	private abort(message: string, closeChild = false, code: WindowsSessionRegistryPhaseErrorCode = "unknown") {
 		if (this.stopped) return;
 		const generation = this.listenerActive ? this.listenerGeneration : undefined;
 		this.stopped = true;
 		this.listenerActive = false;
-		for (const id of [...this.pending.keys()]) this.settle(id, safeError(message));
+		for (const id of [...this.pending.keys()]) this.settle(id, transportError(message, code));
 		if (generation !== undefined) { try { this.listenerFailure?.(generation); } catch {} }
 		void this.releaseOwnedChild(closeChild).catch(() => {});
 	}
@@ -504,13 +514,13 @@ const registryError = (error: unknown): never => {
 };
 
 const phaseError = (error: unknown): WindowsSessionRegistryPhaseError => {
-	const rawCode = error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string" ? (error as { code: string }).code : undefined;
-	const code = rawCode === "ETIMEDOUT" || rawCode === "io_error" ? rawCode : "unknown";
-	return Object.freeze({ class: code === "ETIMEDOUT" ? "timed-out" : error instanceof Error ? "rejected" : "unknown", code });
+	const code = error instanceof Error ? transportFailureCodes.get(error) ?? "unknown" : "unknown";
+	return Object.freeze({ class: code === "deadline" ? "timed-out" : error instanceof Error ? "rejected" : "unknown", code });
 };
 class WindowsSessionRegistryObserver {
 	private active = true;
-	constructor(private readonly callback: WindowsSessionRegistryPhaseObserver) {}
+	private readonly callback: WindowsSessionRegistryPhaseObserver;
+	constructor(callback: WindowsSessionRegistryPhaseObserver) { this.callback = callback; }
 	async run<T>(phase: WindowsSessionRegistryPhase, operation: () => Promise<T>): Promise<T> {
 		try {
 			const value = await operation();

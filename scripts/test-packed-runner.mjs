@@ -23,9 +23,9 @@ const SDK_LIFECYCLE_WINDOWS_OBSERVATION_PROVENANCE = new Set(["not-applicable", 
 const SDK_LIFECYCLE_WINDOWS_OBSERVATION_RESTORATION = new Set(["not-applicable", "not-required", "not-attempted"]);
 const SDK_LIFECYCLE_WINDOWS_OBSERVATION_PHASES = new Set(["start", "initialize", "cleanup"]);
 const SDK_LIFECYCLE_WINDOWS_OBSERVATION_FAILURE_CLASSES = new Set(["timed-out", "rejected", "unknown"]);
-// The host normally erases its internal deadline error to a plain Error. Only an
-// exported error code on this short list may be reported; every other cause stays unknown.
-const SDK_LIFECYCLE_WINDOWS_OBSERVATION_ERROR_CODES = new Set(["ETIMEDOUT", "io_error"]);
+// This is the complete source-defined diagnostic vocabulary. The receipt never accepts
+// a native error code, message, property, or process output as rejection evidence.
+const SDK_LIFECYCLE_WINDOWS_OBSERVATION_ERROR_CODES = new Set(["spawn", "stream", "process", "exit", "write", "deadline", "protocol", "start-reply", "stopped", "unwritable", "unknown"]);
 const SDK_LIFECYCLE_CHILD_STAGES = new Set(["bootstrap", "sdk-load", "jiti-load", "agents-module-load", "model-runtime", "services", "extensions-validate", "model-availability", "session-create", "session-bind", "presence-two", "dispose-first", "presence-one", "dispose-second", "presence-none", "cleanup"]);
 const SDK_LIFECYCLE_CHILD_CHECK_IDS = new Set(["bootstrap-builtins", "bootstrap-agent-home", "bootstrap-directories", "sdk-import", "sdk-exports", "jiti-import", "agents-module-import", "agents-module-export", "settings-untrusted", "settings-default-provider", "settings-default-model", "model-runtime-create", "services-create", "services-settings-manager", "services-project-trusted", "extensions-errors", "extensions-paths", "extensions-hooks", "services-diagnostics", "ambient-skills", "ambient-prompts", "ambient-themes", "ambient-context-files", "model-availability-empty", "session-create", "session-model-unbound", "session-model-invocation-guard", "session-bind", "session-bind-extension-errors", "session-model-bound", "session-ids-distinct", "presence-observer-create", "presence-two-records", "presence-first-model-unbound", "presence-second-model-unbound", "presence-two-extension-errors", "dispose-first", "dispose-first-extension-errors", "presence-one-record", "presence-one-model-unbound", "presence-one-extension-errors", "dispose-second", "dispose-second-extension-errors", "presence-no-records", "presence-none-extension-errors", "cleanup-runtime", "cleanup-observer", "cleanup-extension-errors"]);
 const SDK_LIFECYCLE_CHILD_ERROR_CODES = new Set(["assertion-failed", "forbidden-model-invocation", "load-failed", "timed-out", "cleanup-failed", "observation-invalid", "unknown"]);
@@ -617,7 +617,7 @@ function parseWindowsRegistryObservation(value) {
 	if (observation.startCalls !== 1 || observation.cleanupCalls !== 1 || (observation.initializeCalls !== 0 && observation.initializeCalls !== 1)) return undefined;
 	const failureFields = [observation.firstFailurePhase, observation.firstFailureClass, observation.firstFailureCode];
 	if (failureFields.every((field) => field === null)) return observation.initializeCalls === 1 ? Object.freeze({ ...observation }) : undefined;
-	if (!SDK_LIFECYCLE_WINDOWS_OBSERVATION_PHASES.has(observation.firstFailurePhase) || !SDK_LIFECYCLE_WINDOWS_OBSERVATION_FAILURE_CLASSES.has(observation.firstFailureClass) || (observation.firstFailureCode !== "unknown" && !SDK_LIFECYCLE_WINDOWS_OBSERVATION_ERROR_CODES.has(observation.firstFailureCode)) || (observation.firstFailureClass === "timed-out" && observation.firstFailureCode !== "ETIMEDOUT")) return undefined;
+	if (!SDK_LIFECYCLE_WINDOWS_OBSERVATION_PHASES.has(observation.firstFailurePhase) || !SDK_LIFECYCLE_WINDOWS_OBSERVATION_FAILURE_CLASSES.has(observation.firstFailureClass) || !SDK_LIFECYCLE_WINDOWS_OBSERVATION_ERROR_CODES.has(observation.firstFailureCode) || ((observation.firstFailureClass === "timed-out") !== (observation.firstFailureCode === "deadline"))) return undefined;
 	return Object.freeze({ ...observation });
 }
 

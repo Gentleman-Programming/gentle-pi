@@ -1125,11 +1125,25 @@ test("Windows phase sequence admits only complete successful operations", () => 
 
 test("Windows phase sequence preserves an operation failure when cleanup fails", () => {
 	const sequence = new WindowsSessionRegistryPhaseSequence();
-	sequence.observe(failedPhase("start", Object.freeze({ class: "rejected", code: "io_error" })));
+	sequence.observe(failedPhase("start", Object.freeze({ class: "rejected", code: "spawn" })));
 	sequence.observe(failedPhase("cleanup", Object.freeze({ class: "rejected", code: "unknown" })));
 	assert.equal(sequence.terminalSequenceValid, true);
 	assert.equal(sequence.cleanupComplete, false);
-	assert.deepEqual(sequence.snapshot(), { availability: "observed", provenance: "owned-instance", restoration: "not-required", startCalls: 1, initializeCalls: 0, cleanupCalls: 1, firstFailurePhase: "start", firstFailureClass: "rejected", firstFailureCode: "io_error" });
+	assert.deepEqual(sequence.snapshot(), { availability: "observed", provenance: "owned-instance", restoration: "not-required", startCalls: 1, initializeCalls: 0, cleanupCalls: 1, firstFailurePhase: "start", firstFailureClass: "rejected", firstFailureCode: "spawn" });
+});
+
+test("Windows phase sequence preserves bounded rejection sites and the first operation failure", () => {
+	for (const failure of [
+		Object.freeze({ class: "timed-out" as const, code: "deadline" as const }),
+		Object.freeze({ class: "rejected" as const, code: "write" as const }),
+		Object.freeze({ class: "rejected" as const, code: "spawn" as const }),
+		Object.freeze({ class: "rejected" as const, code: "protocol" as const }),
+	]) {
+		const sequence = new WindowsSessionRegistryPhaseSequence();
+		sequence.observe(failedPhase("start", failure));
+		sequence.observe(failedPhase("cleanup", Object.freeze({ class: "rejected", code: "unknown" })));
+		assert.equal(sequence.snapshot().firstFailureCode, failure.code);
+	}
 });
 
 test("Windows phase sequence rejects duplicate, out-of-order, and invalid events permanently", () => {
@@ -1137,6 +1151,8 @@ test("Windows phase sequence rejects duplicate, out-of-order, and invalid events
 		[successfulPhase("cleanup")],
 		[successfulPhase("start"), successfulPhase("start")],
 		[{ phase: "start", status: "failed", error: { class: "timed-out", code: "unknown" } }],
+		[{ phase: "start", status: "failed", error: { class: "rejected", code: "deadline" } }],
+		[{ phase: "start", status: "failed", error: { class: "rejected", code: "native-code" } }],
 	] as const) {
 		const sequence = new WindowsSessionRegistryPhaseSequence();
 		for (const event of events) sequence.observe(event);
@@ -1153,6 +1169,10 @@ test("Windows registry source guard preserves operation failure through observer
 	const source = await readFile(fileURLToPath(new URL("../lib/windows-session-transport.ts", import.meta.url)), "utf8");
 	assert.match(source, /catch \(error\) \{\s*try \{ await run\("cleanup", \(\) => host\.close\(\)\); \} catch \{[^}]*\}\s*registryError\(error\);/);
 	assert.match(source, /export type WindowsSessionRegistryPhaseObserver = \(event: WindowsSessionRegistryPhaseEvent\) => undefined;/);
+	assert.match(source, /transportError\("Windows transport host unavailable", "spawn"\)/);
+	assert.match(source, /transportError\("Windows transport request timed out", "deadline"\)/);
+	assert.match(source, /transportError\("Windows transport host exited", "write"\)/);
+	assert.match(source, /this\.abort\("Windows transport host unavailable", true, "protocol"\)/);
 	assert.match(source, /if \(result === undefined\) return;\s*this\.active = false;\s*try \{ Promise\.resolve\(result\)\.catch\(\(\) => \{\}\);/);
 	assert.doesNotMatch(source, /WindowsSessionTransportHostObserver|observeHost\?\.\(host\)|Object\.defineProperty\(candidate/);
 });
