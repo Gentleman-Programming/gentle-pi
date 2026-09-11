@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { AGENT_MODE, type AgentDefinition } from "../lib/agents-config.ts";
 import { TASK_STATUS, TaskStore } from "../lib/agents-protocol.ts";
-import { AgentRunner, childArguments, JsonLines, piCommand, type RunnerDeps, type RunnerHooks, type TaskRequest } from "../lib/agents-runner.ts";
+import { AgentRunner, childArguments, JsonLines, piCommand, abortReasonText, type RunnerDeps, type RunnerHooks, type TaskRequest } from "../lib/agents-runner.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
 
 // Gentle Agents runner: every subagent is a child `pi --mode rpc` process.
@@ -858,4 +858,12 @@ test("an unprobeable process group quarantines at its deadline and still records
 	assert.equal(finishes.length, 1, "the run is recorded exactly once");
 	assert.equal(store.get(second.id)?.status, TASK_STATUS.QUEUED, "an unconfirmed exit retains its capacity");
 	assert.equal(launches, 1, "no further launch happens while the slot is quarantined");
+});
+
+test("abortReasonText renders an Error, a string, and nothing for unknown reasons", () => {
+	assert.equal(abortReasonText(undefined), "");
+	assert.equal(abortReasonText(new Error("interrupted by user")), " (interrupted by user)");
+	assert.equal(abortReasonText("host timeout"), " (host timeout)");
+	assert.equal(abortReasonText(new Error("")), "");
+	assert.equal(abortReasonText(42), "");
 });
