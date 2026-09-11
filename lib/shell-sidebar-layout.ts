@@ -15,6 +15,7 @@ type LayoutRoot = Component & { [NODE]?: () => LayoutNode };
 type Host = TUI & { mode?: string; layoutRoot?: LayoutRoot };
 type SidebarCache = { revision: number };
 type RailHit = { key: string; component: Component; startY: number; height: number; width: number };
+type SidebarPresentation = { scrollTop: number; output: LayoutNode };
 type PreparedRail = {
 	revision: number;
 	width: number;
@@ -26,6 +27,7 @@ type PreparedRail = {
 	active: boolean;
 	lines: string[];
 	hits: RailHit[];
+	presentation?: SidebarPresentation;
 };
 const CACHE = Symbol.for("gentle-pi.experimental-sidebar.cache");
 
@@ -153,12 +155,18 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme): () => void {
 			const original = root[NODE]!;
 			const descriptor = Object.getOwnPropertyDescriptor(root, NODE);
 			const left = { render: (width: number) => root.render(width), invalidate() {}, [NODE]: () => original.call(root) };
-			const replacement = () => prepare(tui.terminal.columns, root)
-				? { type: "hstack", gap: GAP, align: "stretch", entries: [
-					{ component: left, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-					{ component: scroll, basis: RAIL_WIDTH, grow: 0, shrink: 0, minSize: RAIL_WIDTH },
-				] }
-				: original.call(root);
+			const replacement = () => {
+				if (!prepare(tui.terminal.columns, root)) return original.call(root);
+				const current = prepared!;
+				if (current.presentation?.scrollTop === scroll.scrollTop) return current.presentation.output;
+				return (current.presentation = {
+					scrollTop: scroll.scrollTop,
+					output: { type: "hstack", gap: GAP, align: "stretch", entries: [
+						{ component: left, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+						{ component: scroll, basis: RAIL_WIDTH, grow: 0, shrink: 0, minSize: RAIL_WIDTH },
+					] },
+				}).output;
+			};
 			root[NODE] = replacement;
 			roots.add(root);
 			tui.requestRender();

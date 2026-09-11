@@ -287,6 +287,34 @@ test("real layout frames reuse unchanged sidebar output and invalidate at state 
 	assert.equal(replacementRenders, 1);
 });
 
+test("reuses final sidebar presentation until a relevant invalidation", (t) => {
+	const f = fixture();
+	sidebarPart(f.tui, "todo", { render: () => Array.from({ length: 10 }, (_, index) => `Todo ${index}`), invalidate() {} });
+	t.after(installSidebar(f.tui, theme));
+
+	const first = f.root[NODE]();
+	assert.equal(f.root[NODE](), first);
+	const scroll = (first as { entries: { component: ScrollView }[] }).entries[1].component;
+	scroll.updateLayout(scroll.render(50).length, 1, () => {});
+	scroll.scrollBy(1);
+	const scrolled = f.root[NODE]();
+	assert.notEqual(scrolled, first);
+	assert.equal(f.root[NODE](), scrolled);
+
+	scroll.invalidate();
+	const invalidated = f.root[NODE]();
+	assert.notEqual(invalidated, scrolled);
+	assert.equal(f.root[NODE](), invalidated);
+
+	f.host.terminal.columns = 141;
+	const resized = f.root[NODE]();
+	assert.notEqual(resized, invalidated);
+	assert.equal(f.root[NODE](), resized);
+	f.host.mode = "regular";
+	assert.equal(f.root[NODE]().type, "vstack");
+	assert.deepEqual(f.bottom.render(80), ["Status"]);
+});
+
 test("cleanup restores the native layout and bottom paint without disposing widgets", () => {
 	const f = fixture();
 	const dispose = installSidebar(f.tui, theme);
