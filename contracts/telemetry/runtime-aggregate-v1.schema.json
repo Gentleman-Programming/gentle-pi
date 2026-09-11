@@ -49,7 +49,7 @@
       "properties": {
         "reasoning_tokens": {"$ref": "#/$defs/token"},
         "total_tokens": {"$ref": "#/$defs/token"},
-        "agent_class": {"enum": ["orchestrator", "worker", "explore", "verify", "unknown", "sdd-apply", "sdd-archive", "sdd-design", "sdd-explore", "sdd-init", "sdd-onboard", "sdd-proposal", "sdd-research", "sdd-spec", "sdd-status", "sdd-sync", "sdd-tasks", "sdd-verify", "review-readability", "review-reliability", "review-resilience", "review-risk", "jd-fix-agent", "jd-judge-a", "jd-judge-b"]},
+        "agent_class": {"enum": ["orchestrator", "worker", "explore", "verify", "unknown", "sdd-init", "sdd-explore", "sdd-research", "sdd-propose", "sdd-spec", "sdd-design", "sdd-tasks", "sdd-apply", "sdd-verify", "sdd-archive", "sdd-onboard", "sdd-status", "sdd-sync", "jd-judge-a", "jd-judge-b", "jd-fix-agent", "review-risk", "review-readability", "review-reliability", "review-resilience", "review-refuter", "review-validator"]},
         "error_category": {"enum": ["none", "unknown", "auth", "output_length", "aborted", "api", "rate_limit", "server"]},
         "duration": {"$ref": "#/$defs/duration"},
         "model": {"$ref": "#/$defs/model"},

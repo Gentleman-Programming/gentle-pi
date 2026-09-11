@@ -79,6 +79,7 @@ export interface AgentsDeps extends RunnerDeps {
 	runtimeMetricsPolicy?: RuntimeMetricsPolicyDeps;
 	metricsNow?: () => number;
 	metricsSchedule?: RunnerDeps["schedule"];
+	lookupPiCatalogName?: typeof lookupPiCatalogName;
 }
 
 export function agentRuntimePaths(home: string, agentHome = join(home, ".pi", "agent")): { sessions: string; transcripts: string } {
@@ -318,6 +319,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const stoppingTaskIds = new Set<string>();
 	const yieldedTaskIds = new Set<string>();
 	const metricsNow = deps.metricsNow ?? (() => performance.now());
+	const catalogLookup = deps.lookupPiCatalogName ?? lookupPiCatalogName;
 	let metricsOwner = {};
 	const metricTasks = new Map<string, { selection?: LaunchSelection; started: number; launched: boolean; finished: boolean; current(): boolean; valid(): boolean }>();
 	const unsubscribeMetrics = pi.events.on(CHILD_METRICS_REVOKED, id => {
@@ -696,8 +698,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			onLaunch: () => { metrics.launched = true; request.onLaunch?.(); },
 			...(observe ? { canCollectResponseObservations: metrics.valid, prepareResponseObservations: async () => {
 				if (metrics.finished || owner !== metricsOwner || request.parentSessionId !== activeSessionId() || !runtimeMetricsEnvAllows(deps.env)) return false;
-				try { await lookupPiCatalogName({ provider: "openai", modelId: "gpt-4o" }); }
-				catch { return false; }
+				void catalogLookup({ provider: "openai", modelId: "gpt-4o" }).catch(() => {});
 				if (!metrics.valid()) return false;
 				metrics.selection = launchSelection(request.agent, request.model, request.thinking);
 				metrics.started = metricsNow();

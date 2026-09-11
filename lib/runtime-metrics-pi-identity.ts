@@ -13,6 +13,7 @@ const CUSTOM: PiCatalogName = Object.freeze({ classification: "custom", modelId:
 // additions require deliberate review. These are providers, not model-ID lists.
 const CATALOGS = ["anthropic", "openai", "openai-codex", "google", "google-vertex", "amazon-bedrock", "openrouter"] as const;
 const MAX_MODELS = 4096;
+const MAX_LOAD_ATTEMPTS = 3;
 
 function object(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -26,8 +27,6 @@ function key(provider: string, modelId: string): string {
 	return JSON.stringify([provider, modelId]);
 }
 
-let catalogPromise: Promise<ReadonlyMap<string, PiCatalogName>> | undefined;
-let loadedCatalog: ReadonlyMap<string, PiCatalogName> | undefined;
 async function loadCatalog(): Promise<ReadonlyMap<string, PiCatalogName>> {
 	// Node >=22.19 supports findPackageJSON. Verify ESM lookup from this module
 	// selects Pi's own pi-ai package; fail rather than silently use another copy.
@@ -56,6 +55,42 @@ async function loadCatalog(): Promise<ReadonlyMap<string, PiCatalogName>> {
 	return entries;
 }
 
+export function createPiCatalogNameLookup(
+	load: () => Promise<ReadonlyMap<string, PiCatalogName>> = loadCatalog,
+	maxAttempts = MAX_LOAD_ATTEMPTS,
+): { lookup(input: unknown): Promise<PiCatalogName>; classify(input: unknown): PiCatalogName } {
+	let catalogPromise: Promise<ReadonlyMap<string, PiCatalogName>> | undefined;
+	let loadedCatalog: ReadonlyMap<string, PiCatalogName> | undefined;
+	let attempts = 0;
+	const classify = (input: unknown): PiCatalogName => {
+		if (!object(input) || !text(input.provider, 32) || !text(input.modelId, 128)) return UNKNOWN;
+		if (!CATALOGS.includes(input.provider as typeof CATALOGS[number])) return CUSTOM;
+		return loadedCatalog ? loadedCatalog.get(key(input.provider, input.modelId)) ?? CUSTOM : UNKNOWN;
+	};
+	const lookup = async (input: unknown): Promise<PiCatalogName> => {
+		if (!object(input) || !text(input.provider, 32) || !text(input.modelId, 128)) return UNKNOWN;
+		if (!CATALOGS.includes(input.provider as typeof CATALOGS[number])) return CUSTOM;
+		if (!loadedCatalog) {
+			if (!catalogPromise) {
+				if (attempts >= maxAttempts) throw new Error("Pi catalog load attempts exhausted");
+				attempts++;
+				catalogPromise = load().then(catalog => {
+					loadedCatalog = catalog;
+					return catalog;
+				}, error => {
+					catalogPromise = undefined;
+					throw error;
+				});
+			}
+			await catalogPromise;
+		}
+		return classify(input);
+	};
+	return { lookup, classify };
+}
+
+const catalogLookup = createPiCatalogNameLookup();
+
 /**
  * Returns only a privacy-safe catalog name, NOT the model actually dispatched.
  * Matching a public ID remains a public-name fact even on a custom endpoint;
@@ -67,18 +102,12 @@ async function loadCatalog(): Promise<ReadonlyMap<string, PiCatalogName>> {
  * Missing/incompatible dependencies and catalog overflow reject, never skip.
  */
 export async function lookupPiCatalogName(input: unknown): Promise<PiCatalogName> {
-	if (!object(input) || !text(input.provider, 32) || !text(input.modelId, 128)) return UNKNOWN;
-	if (!CATALOGS.includes(input.provider as typeof CATALOGS[number])) return CUSTOM;
-	catalogPromise ??= loadCatalog();
-	loadedCatalog = await catalogPromise;
-	return classifyPiCatalogName(input);
+	return catalogLookup.lookup(input);
 }
 
 /** Pure lookup after async catalog loading; unknown until initialization succeeds.
  * Always recheck membership, never trust a caller's classification/public label.
  */
 export function classifyPiCatalogName(input: unknown): PiCatalogName {
-	if (!object(input) || !text(input.provider, 32) || !text(input.modelId, 128)) return UNKNOWN;
-	if (!CATALOGS.includes(input.provider as typeof CATALOGS[number])) return CUSTOM;
-	return loadedCatalog ? loadedCatalog.get(key(input.provider, input.modelId)) ?? CUSTOM : UNKNOWN;
+	return catalogLookup.classify(input);
 }

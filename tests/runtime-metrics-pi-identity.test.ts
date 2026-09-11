@@ -2,11 +2,38 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { findPackageJSON } from "node:module";
 import { OPENAI_CODEX_MODELS } from "@earendil-works/pi-ai/providers/openai-codex.models";
-import { classifyPiCatalogName, lookupPiCatalogName } from "../lib/runtime-metrics-pi-identity.ts";
+import { classifyPiCatalogName, createPiCatalogNameLookup, lookupPiCatalogName, type PiCatalogName } from "../lib/runtime-metrics-pi-identity.ts";
 import { RuntimeMetrics, type FinalResponse } from "../lib/runtime-metrics.ts";
 
 const model = Object.values(OPENAI_CODEX_MODELS)[0];
 const name = { provider: model.provider, modelId: model.id };
+
+test("a failed catalog load is retried lazily and later classifications recover", async () => {
+	let attempts = 0;
+	const publicName = Object.freeze({ classification: "catalog_public", modelId: name.modelId }) satisfies PiCatalogName;
+	const catalog = new Map([[JSON.stringify([name.provider, name.modelId]), publicName]]);
+	const lookup = createPiCatalogNameLookup(async () => {
+		attempts++;
+		if (attempts === 1) throw new Error("transient catalog failure");
+		return catalog;
+	});
+	await assert.rejects(lookup.lookup(name), /transient catalog failure/);
+	assert.deepEqual(lookup.classify(name), { classification: "unknown", modelId: "unknown" });
+	assert.strictEqual(await lookup.lookup(name), publicName);
+	assert.strictEqual(lookup.classify(name), publicName);
+	assert.equal(attempts, 2);
+});
+
+test("catalog loading attempts are capped per lookup instance", async () => {
+	let attempts = 0;
+	const lookup = createPiCatalogNameLookup(async () => {
+		attempts++;
+		throw new Error(`failure ${attempts}`);
+	});
+	for (let attempt = 0; attempt < 5; attempt++) await assert.rejects(lookup.lookup(name));
+	assert.equal(attempts, 3);
+	assert.deepEqual(lookup.classify(name), { classification: "unknown", modelId: "unknown" });
+});
 
 test("uninitialized synchronous classification fails closed", () => {
 	assert.deepEqual(classifyPiCatalogName(name), { classification: "unknown", modelId: "unknown" });
