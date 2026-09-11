@@ -44,6 +44,7 @@ jobs:
         shell: pwsh
         run: pnpm install --frozen-lockfile --ignore-scripts --store-dir "$env:RUNNER_TEMP\pnpm-store"
       - name: Install pinned dependencies without lifecycle scripts (Unix)
+        id: install_unix_dependencies
         if: matrix.platform != 'windows' && runner.environment == 'github-hosted'
         shell: bash
         run: pnpm install --frozen-lockfile --ignore-scripts --store-dir "$RUNNER_TEMP/pnpm-store"
@@ -79,3 +80,11 @@ jobs:
         if: matrix.platform != 'windows'
         shell: bash
         run: node --experimental-strip-types --test tests/agents-session-transport.test.ts tests/agents-session-transport-process.test.ts
+      - name: Prove packed unhooked imports and default registrations (Windows)
+        if: "!cancelled() && matrix.platform == 'windows' && steps.install_windows_dependencies.outcome == 'success'"
+        shell: cmd
+        run: node scripts\test-packed-runner.mjs --unhooked-imports
+      - name: Prove packed unhooked imports and default registrations (Unix)
+        if: "!cancelled() && matrix.platform != 'windows' && steps.install_unix_dependencies.outcome == 'success'"
+        shell: bash
+        run: node scripts/test-packed-runner.mjs --unhooked-imports

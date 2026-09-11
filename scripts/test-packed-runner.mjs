@@ -3,19 +3,87 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
-const temporary = mkdtempSync(join(tmpdir(), "gentle-pi-packed-runner-"));
-const packDirectory = join(temporary, "pack");
-const installDirectory = join(temporary, "install");
-// Every child inherits only disposable Pi homes, never the operator's settings.
-const agentHome = join(temporary, "agent");
-const piAgentHome = join(temporary, "pi-agent");
-const isolatedEnv = { ...process.env, GENTLE_PI_AGENT_HOME: agentHome, PI_CODING_AGENT_DIR: piAgentHome };
+const MAX_NPM_OUTPUT_BYTES = 1024 * 1024;
+const MAX_UNHOOKED_REPORT_BYTES = 512;
+const UNHOOKED_STAGES = new Set(["pack", "pack-result", "install", "artifact-check", "import-probe", "post-import-check", "cleanup"]);
+const UNHOOKED_ERROR_CODES = new Set(["spawn-failed", "timed-out", "output-limit", "nonzero-exit", "invalid-result", "assertion-failed", "cleanup-failed", "unknown"]);
+
+function isWithin(rootPath, candidatePath) {
+	const root = resolve(rootPath);
+	const candidate = resolve(candidatePath);
+	const remainder = relative(root, candidate);
+	return remainder !== "" && !isAbsolute(remainder) && !remainder.split(sep).includes("..");
+}
+
+function assertOwnedRegularFile(rootPath, relativePath) {
+	const ownedRoot = resolve(rootPath);
+	const rootEntry = lstatSync(ownedRoot);
+	if (!rootEntry.isDirectory() || rootEntry.isSymbolicLink()) throw new Error(`refusing unowned package root: ${rootPath}`);
+	const path = resolve(ownedRoot, relativePath);
+	if (!isWithin(ownedRoot, path)) throw new Error(`path escapes owned root: ${relativePath}`);
+	const normalizedRelativePath = relative(ownedRoot, path);
+	let current = ownedRoot;
+	for (const segment of normalizedRelativePath.split(sep)) {
+		current = join(current, segment);
+		const entry = lstatSync(current);
+		if (entry.isSymbolicLink()) throw new Error(`refusing symbolic link in owned package: ${relativePath}`);
+	}
+	if (!lstatSync(path).isFile()) throw new Error(`expected regular file: ${relativePath}`);
+	return path;
+}
+
+function assertEmptyDirectory(path) {
+	const entries = readdirSync(path);
+	if (entries.length !== 0) throw new Error(`disposable home changed unexpectedly: ${path}`);
+}
+
+function safeJson(buffer, description) {
+	const text = Buffer.isBuffer(buffer) ? buffer.toString("utf8") : String(buffer);
+	if (Buffer.byteLength(text, "utf8") > MAX_NPM_OUTPUT_BYTES) throw new Error(`${description} exceeded 1 MiB`);
+	return JSON.parse(text);
+}
+
+function validExitStatus(value) {
+	return Number.isInteger(value) && value > 0 && value <= 255 ? value : undefined;
+}
+
+class UnhookedFailure extends Error {
+	constructor(stage, code, exitStatus) {
+		super("unhooked packed proof failed");
+		this.stage = UNHOOKED_STAGES.has(stage) ? stage : "cleanup";
+		this.code = UNHOOKED_ERROR_CODES.has(code) ? code : "unknown";
+		this.exitStatus = validExitStatus(exitStatus);
+	}
+}
+
+function processFailure(stage, error) {
+	const details = error && typeof error === "object" ? error : {};
+	const exitStatus = validExitStatus(details.status);
+	if (details.code === "ETIMEDOUT") return new UnhookedFailure(stage, "timed-out", exitStatus);
+	if (details.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return new UnhookedFailure(stage, "output-limit", exitStatus);
+	return new UnhookedFailure(stage, exitStatus === undefined ? "spawn-failed" : "nonzero-exit", exitStatus);
+}
+
+function stageFailure(stage, error, invalidResult = false) {
+	if (error instanceof UnhookedFailure) return error;
+	return new UnhookedFailure(stage, invalidResult ? "invalid-result" : "assertion-failed");
+}
+
+function reportUnhookedFailure(error) {
+	const failure = error instanceof UnhookedFailure ? error : new UnhookedFailure("cleanup", "unknown");
+	const report = { mode: "unhooked-imports", stage: failure.stage, code: failure.code, ...(failure.exitStatus === undefined ? {} : { exitStatus: failure.exitStatus }) };
+	const line = JSON.stringify(report);
+	const boundedLine = Buffer.byteLength(line, "utf8") <= MAX_UNHOOKED_REPORT_BYTES ? line : '{"mode":"unhooked-imports","stage":"cleanup","code":"unknown"}';
+	try { process.stderr.write(`${boundedLine}\n`); } catch { /* Reporting cannot expose a raw secondary error. */ }
+	process.exitCode = failure.exitStatus ?? 1;
+}
 
 function windowsNpmInvocation() {
 	const candidates = [];
@@ -24,7 +92,7 @@ function windowsNpmInvocation() {
 	const installedCli = candidates.find((path) => existsSync(path));
 	if (installedCli !== undefined) return { file: process.execPath, prefix: [installedCli] };
 	let commandPaths = [];
-	try { commandPaths = execFileSync("where.exe", ["npm"], { encoding: "utf8", windowsHide: true }).split(/\r?\n/).filter(Boolean); }
+	try { commandPaths = execFileSync("where.exe", ["npm"], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }).split(/\r?\n/).filter(Boolean); }
 	catch { /* fall through to the explicit resolution error */ }
 	for (const path of commandPaths) {
 		if (basename(path).toLowerCase() === "npm.exe") return { file: path, prefix: [] };
@@ -34,16 +102,54 @@ function windowsNpmInvocation() {
 	throw new Error("could not resolve npm-cli.js without a command shell");
 }
 
-function runNpm(arguments_, options) {
+function runNpmWithEnv(arguments_, env, options) {
 	const invocation = process.platform === "win32" ? windowsNpmInvocation() : { file: "npm", prefix: [] };
-	return execFileSync(invocation.file, [...invocation.prefix, ...arguments_], { ...options, env: isolatedEnv });
+	return execFileSync(invocation.file, [...invocation.prefix, ...arguments_], { ...options, env });
 }
 
-try {
-	mkdirSync(packDirectory);
-	mkdirSync(installDirectory);
-	mkdirSync(agentHome);
-	mkdirSync(piAgentHome);
+function runBoundedNpm(stage, arguments_, env, cwd) {
+	try {
+		return runNpmWithEnv(arguments_, env, {
+			cwd,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+			timeout: 120000,
+			maxBuffer: MAX_NPM_OUTPUT_BYTES,
+		});
+	} catch (error) {
+		throw processFailure(stage, error);
+	}
+}
+
+function runBoundedProbe(arguments_, env, cwd) {
+	try {
+		return execFileSync(process.execPath, arguments_, {
+			cwd,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+			env,
+			timeout: 120000,
+			maxBuffer: MAX_NPM_OUTPUT_BYTES,
+		});
+	} catch (error) {
+		throw processFailure("import-probe", error);
+	}
+}
+
+async function testHookedPackedRunner() {
+	const temporary = mkdtempSync(join(tmpdir(), "gentle-pi-packed-runner-"));
+	const packDirectory = join(temporary, "pack");
+	const installDirectory = join(temporary, "install");
+	// Every child inherits only disposable Pi homes, never the operator's settings.
+	const agentHome = join(temporary, "agent");
+	const piAgentHome = join(temporary, "pi-agent");
+	const isolatedEnv = { ...process.env, GENTLE_PI_AGENT_HOME: agentHome, PI_CODING_AGENT_DIR: piAgentHome };
+	const runNpm = (arguments_, options) => runNpmWithEnv(arguments_, isolatedEnv, options);
+	try {
+		mkdirSync(packDirectory);
+		mkdirSync(installDirectory);
+		mkdirSync(agentHome);
+		mkdirSync(piAgentHome);
 	const originalSettings = '{ "tuiMode": "regular", "theme": "packed-fixture" }\n';
 	writeFileSync(join(agentHome, "settings.json"), originalSettings);
 	const packed = JSON.parse(runNpm(["pack", "--ignore-scripts", "--json", "--pack-destination", packDirectory], {
@@ -107,7 +213,187 @@ try {
 	const decoded = decodeReviewCapabilitiesV2(capabilities, executableDigest);
 	if (decoded.contract !== "gentle-ai.review-integration/v2" || decoded.packageVersion !== versions[0].name.slice(1)) throw new Error("package-local Gentle AI returned incompatible capabilities");
 	const packageManifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
-	process.stdout.write(`packed package E2E passed (gentle-pi ${packageManifest.version ?? "unknown"}; Gentle AI ${decoded.packageVersion ?? "unknown"})\n`);
-} finally {
-	rmSync(temporary, { recursive: true, force: true });
+		process.stdout.write(`packed package E2E passed (gentle-pi ${packageManifest.version ?? "unknown"}; Gentle AI ${decoded.packageVersion ?? "unknown"})\n`);
+	} finally {
+		rmSync(temporary, { recursive: true, force: true });
+	}
+}
+
+function isolatedUnhookedEnvironment(temporary) {
+	const homes = join(temporary, "homes");
+	const home = join(homes, "home");
+	const agentHome = join(homes, "gentle-pi-agent");
+	const piAgentHome = join(homes, "pi-coding-agent");
+	const gentleConfigHome = join(homes, "gentle-pi-config");
+	const xdgConfigHome = join(homes, "xdg-config");
+	const xdgCacheHome = join(homes, "xdg-cache");
+	const xdgDataHome = join(homes, "xdg-data");
+	const appData = join(homes, "appdata");
+	const localAppData = join(homes, "local-appdata");
+	const npmCache = join(temporary, "npm-cache");
+	const npmUserConfig = join(temporary, "npm-userconfig");
+	const passthrough = ["PATH", "SystemRoot", "SYSTEMROOT", "WINDIR", "ComSpec", "PATHEXT", "OS", "CI", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"];
+	const env = {};
+	for (const key of passthrough) if (typeof process.env[key] === "string") env[key] = process.env[key];
+	for (const directory of [homes, home, agentHome, piAgentHome, gentleConfigHome, xdgConfigHome, xdgCacheHome, xdgDataHome, appData, localAppData, npmCache]) mkdirSync(directory, { recursive: true });
+	Object.assign(env, {
+		HOME: home, USERPROFILE: home, APPDATA: appData, LOCALAPPDATA: localAppData,
+		XDG_CONFIG_HOME: xdgConfigHome, XDG_CACHE_HOME: xdgCacheHome, XDG_DATA_HOME: xdgDataHome,
+		TMPDIR: temporary, TMP: temporary, TEMP: temporary,
+		GENTLE_PI_AGENT_HOME: agentHome, GENTLE_PI_CONFIG_HOME: gentleConfigHome, PI_CODING_AGENT_DIR: piAgentHome,
+		NPM_CONFIG_CACHE: npmCache, npm_config_cache: npmCache, NPM_CONFIG_USERCONFIG: npmUserConfig, npm_config_userconfig: npmUserConfig,
+		NPM_CONFIG_TMP: temporary, npm_config_tmp: temporary, NPM_CONFIG_IGNORE_SCRIPTS: "true", npm_config_ignore_scripts: "true",
+		NPM_CONFIG_UPDATE_NOTIFIER: "false", npm_config_update_notifier: "false",
+	});
+	if (process.platform === "win32") {
+		env.HOMEDRIVE = home.slice(0, 2);
+		env.HOMEPATH = home.slice(2).replaceAll("/", "\\\\");
+	}
+	return { env, homes: [home, agentHome, piAgentHome, gentleConfigHome, xdgConfigHome, xdgCacheHome, xdgDataHome, appData, localAppData] };
+}
+
+function assertPackResult(packed, packDirectory) {
+	if (!Array.isArray(packed) || packed.length !== 1 || !packed[0] || typeof packed[0] !== "object") throw new Error("npm pack did not return exactly one package");
+	const entry = packed[0];
+	if (entry.name !== "gentle-pi" || typeof entry.filename !== "string" || entry.filename !== basename(entry.filename)) throw new Error("npm pack returned an unsafe package identity");
+	if (typeof entry.integrity !== "string" || !/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(entry.integrity)) throw new Error("npm pack did not report a sha512 integrity");
+	const tarball = resolve(packDirectory, entry.filename);
+	if (!isWithin(packDirectory, tarball)) throw new Error("npm pack tarball escapes the owned pack directory");
+	assertOwnedRegularFile(packDirectory, entry.filename);
+	const actualIntegrity = `sha512-${createHash("sha512").update(readFileSync(tarball)).digest("base64")}`;
+	if (actualIntegrity !== entry.integrity) throw new Error("npm pack tarball integrity does not match its reported identity");
+	return { entry, tarball };
+}
+
+const HASHED_PACKED_ASSETS = [
+
+		"runtime/windows-session-transport.ps1",
+		"lib/windows-session-transport.ts",
+		"lib/agents-session-transport.ts",
+		"extensions/gentle-agents.ts",
+		"extensions/gentle-ai.ts",
+		"runtime/native-review-cli.mjs",
+		"runtime/review-integration-v2.mjs",
+		"scripts/install-gentle-ai.mjs",
+	"scripts/install-tui-mode-setting.mjs",
+];
+
+function assertPackedAssets(packageRoot) {
+	for (const relativePath of HASHED_PACKED_ASSETS) {
+		const source = readFileSync(join(root, relativePath));
+		const installed = readFileSync(assertOwnedRegularFile(packageRoot, relativePath));
+		if (createHash("sha256").update(source).digest("hex") !== createHash("sha256").update(installed).digest("hex")) throw new Error(`packed asset bytes differ from this checkout: ${relativePath}`);
+	}
+}
+
+function assertNoNativeInstallerArtifacts(packageRoot, consumerDirectory) {
+	if (existsSync(join(packageRoot, ".gentle-ai"))) throw new Error("unhooked install unexpectedly contains a native Gentle AI artifact");
+	const nativeCommand = process.platform === "win32" ? "gentle-ai.cmd" : "gentle-ai";
+	if (existsSync(join(consumerDirectory, "node_modules", ".bin", nativeCommand))) throw new Error("unhooked install unexpectedly exposed a native Gentle AI executable");
+}
+
+function unhookedProbeSource(packageRoot, consumerPackageJson, sdkPackageJson) {
+	return `
+import assert from "node:assert/strict";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+const sdkRequire = createRequire(${JSON.stringify(sdkPackageJson)});
+const { createJiti } = await import(pathToFileURL(sdkRequire.resolve("jiti/static")).href);
+const jiti = createJiti(pathToFileURL(${JSON.stringify(consumerPackageJson)}).href, { moduleCache: false });
+const registrations = { tools: [], commands: [], events: [] };
+const events = new Proxy({}, { get(_target, property) { return (..._args) => { registrations.events.push(\`events.\${String(property)}\`); }; } });
+const pi = {
+  events,
+  on(name, _handler) { registrations.events.push(String(name)); },
+  registerTool(definition) { registrations.tools.push(String(definition.name)); },
+  registerCommand(name, _definition) { registrations.commands.push(String(name)); },
+  registerShortcut() {}, registerMessageRenderer() {}, registerEntryRenderer() {}, registerMarkdownTransformer() {},
+};
+async function register(relativePath) {
+  const loaded = await jiti.import(new URL(relativePath, pathToFileURL(${JSON.stringify(`${packageRoot}/`)}).href).href, { default: true });
+  const factory = typeof loaded === "function" ? loaded : loaded?.default;
+  assert.equal(typeof factory, "function", \`missing default extension factory: \${relativePath}\`);
+  await factory(pi);
+}
+await register("extensions/gentle-agents.ts");
+await register("extensions/gentle-ai.ts");
+for (const name of ["subagent_list_agents", "subagent_run", "orchestrator_session_id", "orchestrator_list", "orchestrator_send_message", "gentle_review", "gentle_review_capture", "gentle_review_capture_group", "gentle_review_scope"]) assert.ok(registrations.tools.includes(name), \`missing registered tool: \${name}\`);
+for (const name of ["gentle:agents", "gentle:status", "gentle:review-mode"]) assert.ok(registrations.commands.includes(name), \`missing registered command: \${name}\`);
+assert.ok(registrations.events.includes("session_start"), "expected session_start registration");
+assert.ok(registrations.events.includes("session_shutdown"), "expected session_shutdown registration");
+process.stdout.write(JSON.stringify({ tools: registrations.tools.sort(), commands: registrations.commands.sort(), loader: "Jiti from @earendil-works/pi-coding-agent dependency" }));
+`;
+}
+
+async function testUnhookedPackedImports() {
+	const runnerTemp = process.env.RUNNER_TEMP;
+	if (typeof runnerTemp !== "string" || runnerTemp.length === 0) throw new UnhookedFailure("pack", "assertion-failed");
+	let temporary;
+	try {
+		temporary = mkdtempSync(join(resolve(runnerTemp), "gentle-pi-packed-unhooked-"));
+	} catch {
+		throw new UnhookedFailure("pack", "assertion-failed");
+	}
+	const packDirectory = join(temporary, "pack");
+	const consumerDirectory = join(temporary, "consumer");
+	let stage = "pack";
+	let failure;
+	try {
+		mkdirSync(packDirectory);
+		mkdirSync(consumerDirectory);
+		const { env, homes } = isolatedUnhookedEnvironment(temporary);
+		const manifest = safeJson(readFileSync(join(root, "package.json")), "project package manifest");
+		const sdkVersion = manifest?.devDependencies?.["@earendil-works/pi-coding-agent"];
+		if (sdkVersion !== "0.85.1") throw new Error("unhooked probe requires the project-pinned @earendil-works/pi-coding-agent 0.85.1");
+		const packOutput = runBoundedNpm("pack", ["pack", "--ignore-scripts", "--json", "--pack-destination", packDirectory], env, root);
+		stage = "pack-result";
+		const packed = safeJson(packOutput, "npm pack output");
+		const { entry, tarball } = assertPackResult(packed, packDirectory);
+		stage = "install";
+		writeFileSync(join(consumerDirectory, "package.json"), JSON.stringify({ name: "gentle-pi-unhooked-import-proof", private: true, dependencies: { "@earendil-works/pi-coding-agent": sdkVersion } }), "utf8");
+		runBoundedNpm("install", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false", "--omit=dev", "--legacy-peer-deps", tarball, `@earendil-works/pi-coding-agent@${sdkVersion}`], env, consumerDirectory);
+		stage = "artifact-check";
+		const packageRoot = join(consumerDirectory, "node_modules", "gentle-pi");
+		assertPackedAssets(packageRoot);
+		assertNoNativeInstallerArtifacts(packageRoot, consumerDirectory);
+		const sdkPackageJson = join(consumerDirectory, "node_modules", "@earendil-works", "pi-coding-agent", "package.json");
+		const checkedSdkPackageJson = assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, sdkPackageJson));
+		const sdkRequire = createRequire(checkedSdkPackageJson);
+		const jitiEntry = sdkRequire.resolve("jiti/static");
+		assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, jitiEntry));
+		const jitiPackage = safeJson(readFileSync(assertOwnedRegularFile(consumerDirectory, relative(consumerDirectory, join(dirname(dirname(jitiEntry)), "package.json")))), "jiti package manifest");
+		const installedSdk = safeJson(readFileSync(checkedSdkPackageJson), "installed Pi SDK manifest");
+		if (installedSdk.version !== sdkVersion) throw new Error(`consumer resolved Pi SDK ${String(installedSdk.version)}, expected ${sdkVersion}`);
+		const declaredJiti = installedSdk?.dependencies?.jiti;
+		if (typeof declaredJiti !== "string" || jitiPackage.version !== declaredJiti) throw new Error("consumer Jiti does not match the installed Pi SDK runtime dependency");
+		// The child calls only default factories on this inert recorder; it never invokes registered tools or event handlers.
+		for (const home of homes) assertEmptyDirectory(home);
+		stage = "import-probe";
+		const probe = runBoundedProbe(["--input-type=module", "--eval", unhookedProbeSource(packageRoot, join(consumerDirectory, "package.json"), sdkPackageJson)], env, consumerDirectory);
+		const registrations = safeJson(probe, "unhooked registration probe output");
+		stage = "post-import-check";
+		assertNoNativeInstallerArtifacts(packageRoot, consumerDirectory);
+		for (const home of homes) assertEmptyDirectory(home);
+		process.stdout.write(`packed unhooked import/default-registration proof passed (gentle-pi ${entry.version ?? "unknown"}; Pi SDK ${installedSdk.version}; Jiti ${jitiPackage.version}; dynamic npm transitive provenance, not lockfile-faithful)\n`);
+		process.stdout.write(`byte-hashed packed assets: ${HASHED_PACKED_ASSETS.join(", ")}; other packaged assets are not byte-equivalence checked.\n`);
+		process.stdout.write(`registered tools: ${registrations.tools.join(", ")}\n`);
+	} catch (error) {
+		failure = stageFailure(stage, error, stage === "pack-result" || stage === "import-probe");
+	}
+	try {
+		rmSync(temporary, { recursive: true, force: true });
+	} catch {
+		if (failure === undefined) failure = new UnhookedFailure("cleanup", "cleanup-failed");
+	}
+	if (failure !== undefined) throw failure;
+}
+
+if (process.argv.includes("--unhooked-imports")) {
+	try {
+		await testUnhookedPackedImports();
+	} catch (error) {
+		reportUnhookedFailure(error);
+	}
+} else {
+	await testHookedPackedRunner();
 }
