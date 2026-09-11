@@ -19,8 +19,8 @@ const SDK_LIFECYCLE_STAGES = new Set(["pack", "pack-result", "install", "artifac
 const SDK_LIFECYCLE_ERROR_CODES = new Set(["spawn-failed", "timed-out", "unconfirmed-close", "output-limit", "nonzero-exit", "invalid-result", "assertion-failed", "cleanup-failed", "unknown"]);
 const SDK_LIFECYCLE_EXTENSION_ERROR_PHASES = new Set(["unobserved", "none", "startup", "shutdown"]);
 const SDK_LIFECYCLE_CHILD_STAGES = new Set(["bootstrap", "sdk-load", "jiti-load", "agents-module-load", "model-runtime", "services", "extensions-validate", "model-availability", "session-create", "session-bind", "presence-two", "dispose-first", "presence-one", "dispose-second", "presence-none", "cleanup"]);
-const SDK_LIFECYCLE_CHILD_CHECK_IDS = new Set(["bootstrap-builtins", "bootstrap-agent-home", "bootstrap-directories", "sdk-import", "sdk-exports", "jiti-import", "agents-module-import", "agents-module-export", "settings-untrusted", "settings-default-provider", "settings-default-model", "model-runtime-create", "services-create", "services-settings-manager", "services-project-trusted", "extensions-errors", "extensions-paths", "extensions-hooks", "services-diagnostics", "ambient-skills", "ambient-prompts", "ambient-themes", "ambient-context-files", "model-availability-empty", "session-create", "session-model-unbound", "session-bind", "session-bind-extension-errors", "session-model-bound", "session-ids-distinct", "presence-observer-create", "presence-two-records", "presence-first-model-unbound", "presence-second-model-unbound", "presence-two-extension-errors", "dispose-first", "dispose-first-extension-errors", "presence-one-record", "presence-one-model-unbound", "presence-one-extension-errors", "dispose-second", "dispose-second-extension-errors", "presence-no-records", "presence-none-extension-errors", "cleanup-runtime", "cleanup-observer", "cleanup-extension-errors"]);
-const SDK_LIFECYCLE_CHILD_ERROR_CODES = new Set(["assertion-failed", "load-failed", "timed-out", "cleanup-failed", "unknown"]);
+const SDK_LIFECYCLE_CHILD_CHECK_IDS = new Set(["bootstrap-builtins", "bootstrap-agent-home", "bootstrap-directories", "sdk-import", "sdk-exports", "jiti-import", "agents-module-import", "agents-module-export", "settings-untrusted", "settings-default-provider", "settings-default-model", "model-runtime-create", "services-create", "services-settings-manager", "services-project-trusted", "extensions-errors", "extensions-paths", "extensions-hooks", "services-diagnostics", "ambient-skills", "ambient-prompts", "ambient-themes", "ambient-context-files", "model-availability-empty", "session-create", "session-model-unbound", "session-model-invocation-guard", "session-bind", "session-bind-extension-errors", "session-model-bound", "session-ids-distinct", "presence-observer-create", "presence-two-records", "presence-first-model-unbound", "presence-second-model-unbound", "presence-two-extension-errors", "dispose-first", "dispose-first-extension-errors", "presence-one-record", "presence-one-model-unbound", "presence-one-extension-errors", "dispose-second", "dispose-second-extension-errors", "presence-no-records", "presence-none-extension-errors", "cleanup-runtime", "cleanup-observer", "cleanup-extension-errors"]);
+const SDK_LIFECYCLE_CHILD_ERROR_CODES = new Set(["assertion-failed", "forbidden-model-invocation", "load-failed", "timed-out", "cleanup-failed", "unknown"]);
 const SDK_LIFECYCLE_CHILD_CLEANUP_STATUSES = new Set(["complete", "failed"]);
 const SDK_LIFECYCLE_CHECK_IDS = new Set([
 	"not-attempted", "runner-hosted", "runner-temp", "temporary-root", "project-sdk-version", "pack-command", "pack-metadata", "pack-integrity", "install-command", "packed-assets", "native-artifacts", "sdk-manifest", "sdk-version", "jiti-manifest-owned", "jiti-static-export", "jiti-entry-owned", "jiti-version", "lifecycle-probe-command", "lifecycle-probe-result", "sdk-lifecycle-complete", "cleanup-owned-root-removal",
@@ -47,7 +47,7 @@ function newUnhookedReceipt() {
 function newSdkLifecycleReceipt() {
 	return {
 		checkId: "not-attempted", packVerified: false, installCompleted: false, childReceiptObserved: false, sdkLoaded: false,
-		extensionErrorCount: null, extensionErrorPhase: "unobserved", sessionsStarted: 0,
+		extensionErrorCount: null, extensionErrorPhase: "unobserved", modelInvocationCount: null, agentStartEventCount: null, turnStartEventCount: null, sessionsStarted: 0,
 		presenceAfterStart: 0, presenceAfterFirstDispose: 0, presenceAfterSecondDispose: 0,
 		disposedSessions: 0, cleanupCompleted: false,
 	};
@@ -179,13 +179,16 @@ function reportSdkLifecycleReceipt(receipt, error) {
 		presenceAfterFirstDispose: receipt.presenceAfterFirstDispose,
 		presenceAfterSecondDispose: receipt.presenceAfterSecondDispose,
 		disposedSessions: receipt.disposedSessions,
+		modelInvocationCount: receipt.modelInvocationCount,
+		agentStartEventCount: receipt.agentStartEventCount,
+		turnStartEventCount: receipt.turnStartEventCount,
 		cleanupCompleted: receipt.cleanupCompleted,
 		...(failure === undefined ? {} : { stage: failure.stage, code: failure.code, childStage: failure.childStage, childCheckId: failure.childCheckId, childCleanupStatus: failure.childCleanupStatus, ...(failure.childFailureCode === undefined ? {} : { childFailureCode: failure.childFailureCode }), ...(failure.exitStatus === undefined ? {} : { exitStatus: failure.exitStatus }) }),
 	};
 	const line = JSON.stringify(report);
 	const boundedLine = Buffer.byteLength(line, "utf8") <= MAX_UNHOOKED_REPORT_BYTES
 		? line
-		: '{"mode":"sdk-lifecycle","status":"failed","checkId":"not-attempted","packVerified":false,"installCompleted":false,"childReceiptObserved":false,"sdkLoaded":false,"extensionErrorCount":null,"extensionErrorPhase":"unobserved","sessionsStarted":0,"presenceAfterStart":0,"presenceAfterFirstDispose":0,"presenceAfterSecondDispose":0,"disposedSessions":0,"cleanupCompleted":false,"stage":"cleanup","code":"unknown","childStage":"unknown","childCheckId":"unobserved","childCleanupStatus":"unobserved","childFailureCode":"unknown"}';
+		: '{"mode":"sdk-lifecycle","status":"failed","checkId":"not-attempted","packVerified":false,"installCompleted":false,"childReceiptObserved":false,"sdkLoaded":false,"extensionErrorCount":null,"extensionErrorPhase":"unobserved","sessionsStarted":0,"presenceAfterStart":0,"presenceAfterFirstDispose":0,"presenceAfterSecondDispose":0,"disposedSessions":0,"modelInvocationCount":null,"agentStartEventCount":null,"turnStartEventCount":null,"cleanupCompleted":false,"stage":"cleanup","code":"unknown","childStage":"unknown","childCheckId":"unobserved","childCleanupStatus":"unobserved","childFailureCode":"unknown"}';
 	try { (failure === undefined ? process.stdout : process.stderr).write(`${boundedLine}\n`); } catch { /* Reporting cannot expose a raw secondary error. */ }
 	if (failure !== undefined) process.exitCode = failure.exitStatus ?? 1;
 }
@@ -577,7 +580,7 @@ function isSdkLifecycleChildStageCheck(stage, checkId) {
 		"extensions-validate": ["extensions-errors", "extensions-paths", "extensions-hooks", "services-diagnostics", "ambient-skills", "ambient-prompts", "ambient-themes", "ambient-context-files"],
 		"model-availability": ["model-availability-empty"],
 		"session-create": ["session-create", "session-model-unbound"],
-		"session-bind": ["session-model-unbound", "session-bind", "session-bind-extension-errors", "session-model-bound", "session-ids-distinct"],
+		"session-bind": ["session-model-unbound", "session-model-invocation-guard", "session-bind", "session-bind-extension-errors", "session-model-bound", "session-ids-distinct"],
 		"presence-two": ["presence-observer-create", "presence-two-records", "presence-first-model-unbound", "presence-second-model-unbound", "presence-two-extension-errors"],
 		"dispose-first": ["dispose-first", "dispose-first-extension-errors"],
 		"presence-one": ["presence-one-record", "presence-one-model-unbound", "presence-one-extension-errors"],
@@ -594,7 +597,7 @@ function parseSdkLifecycleChildReceipt(stdout, stderr) {
 	try { parsed = JSON.parse(stdout.toString("utf8")); } catch { return undefined; }
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.getPrototypeOf(parsed) !== Object.prototype) return undefined;
 	const has = (key) => Object.prototype.hasOwnProperty.call(parsed, key);
-	const progressKeys = ["sdkLoaded", "extensionErrorCount", "extensionErrorPhase", "sessionsStarted", "presenceAfterStart", "presenceAfterFirstDispose", "presenceAfterSecondDispose", "disposedSessions"];
+	const progressKeys = ["sdkLoaded", "extensionErrorCount", "extensionErrorPhase", "modelInvocationCount", "agentStartEventCount", "turnStartEventCount", "sessionsStarted", "presenceAfterStart", "presenceAfterFirstDispose", "presenceAfterSecondDispose", "disposedSessions"];
 	const baseKeys = ["status", "stage", "checkId", "cleanupStatus"];
 	if (!has("status") || !has("stage") || !has("checkId") || !has("cleanupStatus") || !SDK_LIFECYCLE_CHILD_STAGES.has(parsed.stage) || !SDK_LIFECYCLE_CHILD_CHECK_IDS.has(parsed.checkId) || !isSdkLifecycleChildStageCheck(parsed.stage, parsed.checkId) || !SDK_LIFECYCLE_CHILD_CLEANUP_STATUSES.has(parsed.cleanupStatus)) return undefined;
 	const allowed = new Set([...baseKeys, ...progressKeys, "code"]);
@@ -607,16 +610,24 @@ function parseSdkLifecycleChildReceipt(stdout, stderr) {
 	if (has("sdkLoaded") && parsed.sdkLoaded !== true) return undefined;
 	const extensionObserved = has("extensionErrorCount") || has("extensionErrorPhase");
 	if (extensionObserved && (!has("extensionErrorCount") || !has("extensionErrorPhase") || !Number.isInteger(parsed.extensionErrorCount) || parsed.extensionErrorCount < 0 || parsed.extensionErrorCount > 2 || !SDK_LIFECYCLE_EXTENSION_ERROR_PHASES.has(parsed.extensionErrorPhase) || parsed.extensionErrorPhase === "unobserved")) return undefined;
+	const invocationObserved = has("modelInvocationCount") || has("agentStartEventCount") || has("turnStartEventCount");
+	if (invocationObserved && (!has("modelInvocationCount") || !has("agentStartEventCount") || !has("turnStartEventCount") || !Number.isInteger(parsed.modelInvocationCount) || !Number.isInteger(parsed.agentStartEventCount) || !Number.isInteger(parsed.turnStartEventCount) || parsed.modelInvocationCount < 0 || parsed.modelInvocationCount > 2 || parsed.agentStartEventCount < 0 || parsed.agentStartEventCount > 2 || parsed.turnStartEventCount < 0 || parsed.turnStartEventCount > 2)) return undefined;
+	if (parsed.status === "failed" && parsed.code === "forbidden-model-invocation" && (!invocationObserved || parsed.modelInvocationCount === 0)) return undefined;
 	for (const key of ["sessionsStarted", "presenceAfterStart", "presenceAfterFirstDispose", "presenceAfterSecondDispose", "disposedSessions"]) {
 		if (has(key) && (!Number.isInteger(parsed[key]) || parsed[key] < 0 || parsed[key] > 2)) return undefined;
 	}
-	if (parsed.status === "complete" && (parsed.sdkLoaded !== true || parsed.extensionErrorCount !== 0 || parsed.extensionErrorPhase !== "none" || parsed.sessionsStarted !== 2 || parsed.presenceAfterStart !== 2 || parsed.presenceAfterFirstDispose !== 1 || parsed.presenceAfterSecondDispose !== 0 || parsed.disposedSessions !== 2)) return undefined;
+	if (parsed.status === "complete" && (parsed.sdkLoaded !== true || parsed.extensionErrorCount !== 0 || parsed.extensionErrorPhase !== "none" || parsed.modelInvocationCount !== 0 || parsed.agentStartEventCount !== 0 || parsed.turnStartEventCount !== 0 || parsed.sessionsStarted !== 2 || parsed.presenceAfterStart !== 2 || parsed.presenceAfterFirstDispose !== 1 || parsed.presenceAfterSecondDispose !== 0 || parsed.disposedSessions !== 2)) return undefined;
 	const receipt = { status: parsed.status, stage: parsed.stage, checkId: parsed.checkId, cleanupStatus: parsed.cleanupStatus };
 	if (parsed.status === "failed") receipt.childFailureCode = parsed.code;
 	if (has("sdkLoaded")) receipt.sdkLoaded = true;
 	if (extensionObserved) {
 		receipt.extensionErrorCount = parsed.extensionErrorCount;
 		receipt.extensionErrorPhase = parsed.extensionErrorPhase;
+	}
+	if (invocationObserved) {
+		receipt.modelInvocationCount = parsed.modelInvocationCount;
+		receipt.agentStartEventCount = parsed.agentStartEventCount;
+		receipt.turnStartEventCount = parsed.turnStartEventCount;
 	}
 	for (const key of ["sessionsStarted", "presenceAfterStart", "presenceAfterFirstDispose", "presenceAfterSecondDispose", "disposedSessions"]) if (has(key)) receipt[key] = parsed[key];
 	return receipt;
@@ -629,6 +640,9 @@ function mergeSdkLifecycleChildProgress(receipt, childReceipt) {
 		receipt.extensionErrorCount = childReceipt.extensionErrorCount;
 		receipt.extensionErrorPhase = childReceipt.extensionErrorPhase;
 	}
+	if (childReceipt.modelInvocationCount !== undefined) receipt.modelInvocationCount = childReceipt.modelInvocationCount;
+	if (childReceipt.agentStartEventCount !== undefined) receipt.agentStartEventCount = childReceipt.agentStartEventCount;
+	if (childReceipt.turnStartEventCount !== undefined) receipt.turnStartEventCount = childReceipt.turnStartEventCount;
 	if (childReceipt.sessionsStarted !== undefined) receipt.sessionsStarted = childReceipt.sessionsStarted;
 	if (childReceipt.presenceAfterStart !== undefined) receipt.presenceAfterStart = childReceipt.presenceAfterStart;
 	if (childReceipt.presenceAfterFirstDispose !== undefined) receipt.presenceAfterFirstDispose = childReceipt.presenceAfterFirstDispose;
@@ -647,7 +661,9 @@ let completedCheckpoint;
 let cleanupStatus = "complete";
 let firstRuntime;
 let secondRuntime;
-let observer;
+let firstInvocationGuard;
+    let secondInvocationGuard;
+    let observer;
 let extensionErrorPhase = "startup";
 let extensionErrorCount = 0;
 let extensionErrorsActive = true;
@@ -656,12 +672,14 @@ let assert;
 let mkdirSync;
 let join;
 let pathToFileURL;
+    let settingsManager;
 const checkpoint = (stage, checkId) => { childStage = stage; childCheckId = checkId; };
 const recordCleanupFailure = (checkId) => {
   cleanupStatus = "failed";
   if (cleanupFailure === undefined) cleanupFailure = { stage: "cleanup", checkId, code: "cleanup-failed" };
 };
-const failureCode = (error, fallback = "assertion-failed") => error?.childReceiptCode === "timed-out" ? "timed-out" : error?.childReceiptCode === "load-failed" ? "load-failed" : fallback;
+const FORBIDDEN_MODEL_INVOCATION = "forbidden-model-invocation";
+    const failureCode = (error, fallback = "assertion-failed") => error?.childReceiptCode === FORBIDDEN_MODEL_INVOCATION ? FORBIDDEN_MODEL_INVOCATION : error?.childReceiptCode === "timed-out" ? "timed-out" : error?.childReceiptCode === "load-failed" ? "load-failed" : fallback;
 const load = async (operation) => {
   try { return await operation; } catch { throw { childReceiptCode: "load-failed" }; }
 };
@@ -690,25 +708,93 @@ const confirmNoExtensionErrors = () => {
   progress.extensionErrorCount = 0;
   progress.extensionErrorPhase = "none";
 };
-const disposeRuntime = async (runtime, extensionCheckId) => {
+const disposeRuntime = async (runtime, settingsManager, invocationGuard, disposeStage, runtimeCheckId, extensionCheckId) => {
   if (!runtime) return;
-  extensionErrorPhase = "shutdown";
-  await within(runtime.dispose(), 15000);
-  checkpoint(childStage, extensionCheckId);
+      const stableDisposeStage = disposeStage;
+      const stableRuntimeCheckId = runtimeCheckId;
+      const stableExtensionCheckId = extensionCheckId;
+      checkpoint(stableDisposeStage, stableRuntimeCheckId);
+      extensionErrorPhase = "shutdown";
+      let completedDisposal = false;
+      try {
+  assertNoConfiguredModel(runtime, settingsManager, "session must remain unconfigured through disposal");
+        try {
+          await within(runtime.dispose(), 15000);
+        } catch (error) {
+          invocationGuard.assertNotInvoked("session-bind", "session-model-invocation-guard");
+          throw error;
+        }
+  checkpoint(stableDisposeStage, stableExtensionCheckId);
   confirmNoExtensionErrors();
-  progress.disposedSessions = (progress.disposedSessions ?? 0) + 1;
+  invocationGuard.assertNotInvoked("session-bind", "session-model-invocation-guard");
+      invocationGuard.detachAfterSuccessfulDispose();
+      progress.disposedSessions = (progress.disposedSessions ?? 0) + 1;
+      completedDisposal = true;
+      } finally {
+        if (!completedDisposal) { /* Keep the deny stream guard and observer attached until process exit. */ }
+      }
 };
-const bindRuntime = async (runtime) => {
+const INERT_DEFAULT_MODEL = {
+      id: "unknown",
+      name: "unknown",
+      api: "unknown",
+      provider: "unknown",
+      baseUrl: "",
+      reasoning: false,
+      input: [],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 0,
+      maxTokens: 0,
+    };
+    const assertNoConfiguredModel = (runtime, settingsManager, description) => {
+      assert.equal(runtime.session.sessionManager.getEntries().length, 0, description + ": session must not restore prior entries");
+      assert.equal(settingsManager.getDefaultProvider(), undefined, description + ": in-memory settings must have no default provider");
+      assert.equal(settingsManager.getDefaultModel(), undefined, description + ": in-memory settings must have no default model");
+      assert.equal(runtime.services.modelRuntime.getAvailableSnapshot().length, 0, description + ": owned empty auth and model paths must expose no available models");
+      assert.deepEqual(runtime.session.model, INERT_DEFAULT_MODEL, description + ": session must expose the SDK inert no-configured-model sentinel");
+    };
+    const installForbiddenModelInvocationGuard = (runtime) => {
+      const agent = runtime.session.agent;
+            if (progress.modelInvocationCount === undefined) progress.modelInvocationCount = 0;
+          if (progress.agentStartEventCount === undefined) progress.agentStartEventCount = 0;
+          if (progress.turnStartEventCount === undefined) progress.turnStartEventCount = 0;
+      const guardedStreamFunction = (..._args) => {
+        progress.modelInvocationCount = Math.min(2, progress.modelInvocationCount + 1);
+        throw { childReceiptCode: FORBIDDEN_MODEL_INVOCATION };
+      };
+      const unsubscribe = agent.subscribe((event) => {
+        if (event.type === "agent_start") progress.agentStartEventCount = Math.min(2, progress.agentStartEventCount + 1);
+        if (event.type === "turn_start") progress.turnStartEventCount = Math.min(2, progress.turnStartEventCount + 1);
+      });
+      agent.streamFunction = guardedStreamFunction;
+      return {
+        assertNotInvoked: (stage, checkId) => {
+          if (progress.modelInvocationCount !== 0) {
+              checkpoint(stage, checkId);
+              throw { childReceiptCode: FORBIDDEN_MODEL_INVOCATION };
+            }
+          if (progress.agentStartEventCount !== 0 || progress.turnStartEventCount !== 0) {
+              checkpoint(stage, checkId);
+              throw { childReceiptCode: "assertion-failed" };
+            }
+        },
+        detachAfterSuccessfulDispose: () => {
+          unsubscribe();
+        },
+      };
+    };
+    const bindRuntime = async (runtime, settingsManager, invocationGuard) => {
   checkpoint("session-bind", "session-model-unbound");
-  assert.equal(runtime.session.model, undefined, "session must not select a model before binding");
+  assertNoConfiguredModel(runtime, settingsManager, "session must not configure a model before binding");
   checkpoint("session-bind", "session-bind");
   extensionErrorPhase = "startup";
   extensionLifecycleObserved = true;
   await within(runtime.session.bindExtensions({ mode: "json", onError: recordExtensionError }), 30000);
   checkpoint("session-bind", "session-bind-extension-errors");
+      invocationGuard.assertNotInvoked("session-bind", "session-model-invocation-guard");
   confirmNoExtensionErrors();
   checkpoint("session-bind", "session-model-bound");
-  assert.equal(runtime.session.model, undefined, "session must remain model-free after JSON lifecycle startup");
+  assertNoConfiguredModel(runtime, settingsManager, "session must remain unconfigured after JSON lifecycle startup");
   progress.sessionsStarted = (progress.sessionsStarted ?? 0) + 1;
 };
 try {
@@ -745,7 +831,7 @@ try {
   assert.equal(typeof createDefaultSessionTransport, "function", "packaged agents transport export is unavailable");
   const expectedExtensionPaths = [agentsExtensionPath, gentleAiExtensionPath];
   checkpoint("services", "settings-untrusted");
-  const settingsManager = SettingsManager.inMemory({}, { projectTrusted: false });
+  settingsManager = SettingsManager.inMemory({}, { projectTrusted: false });
   assert.equal(settingsManager.isProjectTrusted(), false, "in-memory settings must keep project discovery untrusted");
   checkpoint("services", "settings-default-provider");
   assert.equal(settingsManager.getDefaultProvider(), undefined, "in-memory settings must have no default provider");
@@ -804,8 +890,12 @@ try {
     checkpoint("session-create", "session-create");
     const created = await within(createAgentSessionFromServices({ services, sessionManager, sessionStartEvent, noTools: "all" }), 30000);
     checkpoint("session-create", "session-model-unbound");
-    assert.equal(created.session.model, undefined, "SDK must not select a model from an empty availability snapshot");
-    return { ...created, services, diagnostics: services.diagnostics };
+    const runtime = { ...created, services, diagnostics: services.diagnostics };
+        assertNoConfiguredModel(runtime, settingsManager, "new SDK session");
+        const invocationGuard = installForbiddenModelInvocationGuard(runtime);
+        if (name === "first") firstInvocationGuard = invocationGuard;
+        else secondInvocationGuard = invocationGuard;
+    return runtime;
   };
   checkpoint("session-create", "session-create");
   firstRuntime = await within(createAgentSessionRuntime(createRuntime("first"), {
@@ -813,14 +903,14 @@ try {
     agentDir: agentHome,
     sessionManager: SessionManager.create(cwd, join(sessionRoot, "first")),
   }), 30000);
-  await bindRuntime(firstRuntime);
+  await bindRuntime(firstRuntime, settingsManager, firstInvocationGuard);
   checkpoint("session-create", "session-create");
   secondRuntime = await within(createAgentSessionRuntime(createRuntime("second"), {
     cwd,
     agentDir: agentHome,
     sessionManager: SessionManager.create(cwd, join(sessionRoot, "second")),
   }), 30000);
-  await bindRuntime(secondRuntime);
+  await bindRuntime(secondRuntime, settingsManager, secondInvocationGuard);
   checkpoint("session-bind", "session-ids-distinct");
   const firstId = firstRuntime.session.sessionId;
   const secondId = secondRuntime.session.sessionId;
@@ -832,24 +922,27 @@ try {
   assert.deepEqual(started.map((record) => record.sessionId).sort(), [firstId, secondId].sort(), "default transport must advertise both SDK sessions");
   progress.presenceAfterStart = started.length;
   checkpoint("presence-two", "presence-first-model-unbound");
-  assert.equal(firstRuntime.session.model, undefined, "first session must remain model-free through presence lifecycle");
+  assertNoConfiguredModel(firstRuntime, settingsManager, "first session must remain unconfigured through presence lifecycle");
+      firstInvocationGuard.assertNotInvoked("session-bind", "session-model-invocation-guard");
   checkpoint("presence-two", "presence-second-model-unbound");
-  assert.equal(secondRuntime.session.model, undefined, "second session must remain model-free through presence lifecycle");
+  assertNoConfiguredModel(secondRuntime, settingsManager, "second session must remain unconfigured through presence lifecycle");
+      secondInvocationGuard.assertNotInvoked("session-bind", "session-model-invocation-guard");
   checkpoint("presence-two", "presence-two-extension-errors");
   confirmNoExtensionErrors();
   checkpoint("dispose-first", "dispose-first");
-  await disposeRuntime(firstRuntime, "dispose-first-extension-errors");
+  await disposeRuntime(firstRuntime, settingsManager, firstInvocationGuard, "dispose-first", "dispose-first", "dispose-first-extension-errors");
   firstRuntime = undefined;
   checkpoint("presence-one", "presence-one-record");
   const afterFirstDispose = await within(observer.listActivations(), 30000);
   assert.deepEqual(afterFirstDispose.map((record) => record.sessionId), [secondId], "disposing one runtime must withdraw only its presence");
   progress.presenceAfterFirstDispose = afterFirstDispose.length;
   checkpoint("presence-one", "presence-one-model-unbound");
-  assert.equal(secondRuntime.session.model, undefined, "surviving session must remain model-free after peer withdrawal");
+  assertNoConfiguredModel(secondRuntime, settingsManager, "surviving session must remain unconfigured after peer withdrawal");
+      secondInvocationGuard.assertNotInvoked("session-bind", "session-model-invocation-guard");
   checkpoint("presence-one", "presence-one-extension-errors");
   confirmNoExtensionErrors();
   checkpoint("dispose-second", "dispose-second");
-  await disposeRuntime(secondRuntime, "dispose-second-extension-errors");
+  await disposeRuntime(secondRuntime, settingsManager, secondInvocationGuard, "dispose-second", "dispose-second", "dispose-second-extension-errors");
   secondRuntime = undefined;
   checkpoint("presence-none", "presence-no-records");
   const afterSecondDispose = await within(observer.listActivations(), 30000);
@@ -862,8 +955,8 @@ try {
   primaryFailure = { stage: childStage, checkId: childCheckId, code: failureCode(error) };
 } finally {
   checkpoint("cleanup", "cleanup-runtime");
-  try { await disposeRuntime(firstRuntime, "cleanup-runtime"); } catch { recordCleanupFailure("cleanup-runtime"); }
-  try { await disposeRuntime(secondRuntime, "cleanup-runtime"); } catch { recordCleanupFailure("cleanup-runtime"); }
+  try { await disposeRuntime(firstRuntime, settingsManager, firstInvocationGuard, "cleanup", "cleanup-runtime", "cleanup-runtime"); } catch { recordCleanupFailure("cleanup-runtime"); }
+  try { await disposeRuntime(secondRuntime, settingsManager, secondInvocationGuard, "cleanup", "cleanup-runtime", "cleanup-runtime"); } catch { recordCleanupFailure("cleanup-runtime"); }
   checkpoint("cleanup", "cleanup-observer");
   try { await within(Promise.resolve(observer?.close?.()), 15000); } catch { recordCleanupFailure("cleanup-observer"); }
   checkpoint("cleanup", "cleanup-extension-errors");
