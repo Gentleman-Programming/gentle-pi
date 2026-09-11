@@ -66,11 +66,11 @@ jobs:
       - name: Run AgentRunner permission FD3 platform matrix (Windows)
         if: matrix.platform == 'windows'
         shell: cmd
-        run: node --experimental-strip-types --test --test-name-pattern="^AgentRunner platform matrix scopes permission fd3 transport$" tests/agents-runner.test.ts
+        run: node --experimental-strip-types --test --test-name-pattern="^AgentRunner (platform matrix scopes permission fd3 transport|primary IPC cleanup respects native connection state)$" tests/agents-runner.test.ts
       - name: Run AgentRunner permission FD3 platform matrix (Unix)
         if: matrix.platform != 'windows'
         shell: bash
-        run: node --experimental-strip-types --test --test-name-pattern="^AgentRunner platform matrix scopes permission fd3 transport$" tests/agents-runner.test.ts
+        run: node --experimental-strip-types --test --test-name-pattern="^AgentRunner (platform matrix scopes permission fd3 transport|primary IPC cleanup respects native connection state)$" tests/agents-runner.test.ts
       - name: Run standing permission IPC boundary test (Windows)
         if: "!cancelled() && matrix.platform == 'windows' && steps.install_windows_dependencies.outcome == 'success'"
         shell: pwsh

@@ -11,6 +11,7 @@ import { isFinished, normalizeRpcEvent, TASK_EVENT, TASK_STATUS, taskLabel, type
 
 export interface ChildLike {
 	pid: number | undefined;
+	connected?: boolean;
 	stdin: Writable;
 	stdout: Readable;
 	stderr: Readable | null | undefined;
@@ -530,8 +531,10 @@ export class AgentRunner {
 		for (const pending of live.replies.values()) pending.resolve(false);
 		live.replies.clear();
 		live.child.channel?.unref?.();
-		try { live.child.disconnect?.(); }
-		catch { /* Channel may already be disconnected. */ }
+		if (live.child.connected !== false) {
+			try { live.child.disconnect?.(); }
+			catch { /* Channel may already be disconnected. */ }
+		}
 	}
 
 	private write(live: LiveTask, payload: Record<string, unknown>): void {
