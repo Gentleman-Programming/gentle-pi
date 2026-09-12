@@ -170,12 +170,13 @@ test("sdd-verify phase text carries the verify-result envelope and validate-befo
 /** Reject stale local instructions and tracker targets while allowing external source/schema URLs. */
 function assertCurrentRepositoryInstructions(source: string, label: string): void {
 	// Repository flags are actionable targets, even when their values are URLs.
-	assert.doesNotMatch(source, /--repo(?:\s*=\s*|\s+)["']?https?:\/\/github\.com\/(?:badlogic|earendil-works)\/pi-mono\b/i, label);
+	assert.doesNotMatch(source, /--repo(?:\s*=\s*|\s+)["']?https?:\/\/(?:www\.)?github\.com\/(?:badlogic|earendil-works)\/pi-mono(?![\w-]|\.[\w.-])/i, label);
 	// Upstream source/schema URLs are references, not local implementation paths.
 	assert.doesNotMatch(source, /github\.com\/(?:badlogic|earendil-works)\/pi-mono\/(?:issues|pulls?|discussions)\b/i, label);
 	const localInstructions = source.replace(/https?:\/\/[^\s<>`"\)]+/g, "");
-	// Hyphens belong to names; slashes still delimit actual local path components.
-	assert.doesNotMatch(localInstructions, /(?<![\w-])(?:packages\/|AGENTS\.md(?![\w-])|pi-mono(?![\w-])|prompts\/(?:gpr|gcl)\.md(?![\w-]))/i, label);
+	// Dots and hyphens belong to names; slashes delimit components (including ./ and ../).
+	// A trailing sentence period is punctuation, but a dotted suffix continues the name.
+	assert.doesNotMatch(localInstructions, /(?<![\w.-])(?:packages\/|(?:AGENTS\.md|pi-mono|prompts\/(?:gpr|gcl)\.md)(?![\w-]|\.[\w.-]))/i, label);
 }
 
 /** Collect Markdown instruction files recursively beneath a shipped directory. */
@@ -222,9 +223,9 @@ test("instruction guard rejects stale local paths and trackers but permits exter
 	]) assertCurrentRepositoryInstructions(source, "valid fixture");
 });
 
-for (const source of ["my-packages/tool", "my-AGENTS.md", "pi-mono-fork"]) {
-	test(`instruction guard permits hyphenated near miss ${source}`, () => {
-		assertCurrentRepositoryInstructions(source, "hyphenated near-miss fixture");
+for (const source of ["my-packages/tool", "my-AGENTS.md", "pi-mono-fork", "my.packages/tool", "AGENTS.md.backup", "pi-mono.docs"]) {
+	test(`instruction guard permits hyphenated or dotted near miss ${source}`, () => {
+		assertCurrentRepositoryInstructions(source, "near-miss fixture");
 	});
 }
 
@@ -247,6 +248,54 @@ test("instruction guard distinguishes path components from hyphenated names", ()
 		"[Source](https://example.com/packages/tool/AGENTS.md) then edit my-packages/tool.",
 	]) assertCurrentRepositoryInstructions(source, "similar name fixture");
 });
+
+// Each generated case runs independently so one failed boundary cannot hide another.
+for (const host of ["github.com", "www.github.com"]) {
+	test(`instruction guard preserves references and mixed local checks on ${host}`, () => {
+		for (const source of [
+			`[Source](https://${host}/badlogic/pi-mono/blob/main/packages/tool/AGENTS.md)`,
+			`https://${host}/earendil-works/pi-mono/blob/main/packages/tool/schema.json`,
+			`gh issue create --repo='https://${host}/Gentleman-Programming/gentle-pi'`,
+			`https://${host}/Gentleman-Programming/gentle-pi/issues/298`,
+		]) {
+			assertCurrentRepositoryInstructions(source, "reference matrix");
+			assert.throws(() => assertCurrentRepositoryInstructions(`${source} then read ../AGENTS.md.`, "mixed matrix"), assert.AssertionError);
+		}
+	});
+	for (const owner of ["badlogic", "earendil-works"]) {
+		for (const repo of ["pi-mono", "pi-mono-fork", "pi-mono.docs"]) {
+			const url = `https://${host}/${owner}/${repo}`;
+			for (const source of [
+				...[[" ", ""], ["=", ""], [' "', '"'], ["='", "'"], ["  '", "'"], [' = "', '"']].map(([prefix, suffix]) =>
+					`gh issue create --repo${prefix}${url}${suffix}`),
+				...["issues/new", "pull/918", "pulls/918", "discussions/1"].map((path) => `${url}/${path}`),
+			]) {
+				test(`instruction guard tracker boundary: ${source}`, () => {
+					if (repo === "pi-mono") {
+						assert.throws(() => assertCurrentRepositoryInstructions(source, "tracker matrix"), assert.AssertionError);
+					} else assertCurrentRepositoryInstructions(source, "tracker near-miss matrix");
+				});
+			}
+		}
+	}
+}
+
+for (const path of ["packages/tool", "AGENTS.md", "pi-mono", "prompts/gpr.md", "prompts/gcl.md"]) {
+	for (const prefix of ["", "./", "../", "docs/"]) {
+		for (const suffix of ["", ".", ",", ")", "/child"]) {
+			const source = `Read ${prefix}${path}${suffix}`;
+			test(`instruction guard rejects exact local component: ${source}`, () => {
+				assert.throws(() => assertCurrentRepositoryInstructions(source, "local matrix"), assert.AssertionError);
+			});
+		}
+	}
+	for (const source of [`my.${path}`, `my-${path}`, `https://example.com/${path} then read my.${path}`,
+		...(path === "packages/tool" ? [] : [`${path}.backup`, `${path}-backup`])]) {
+		test(`instruction guard permits local near miss: ${source}`, () => {
+			assertCurrentRepositoryInstructions(source, "local near-miss matrix");
+		});
+	}
+}
 
 test("instruction guard rejects local packages outside coding-agent", () => {
 	assert.throws(
