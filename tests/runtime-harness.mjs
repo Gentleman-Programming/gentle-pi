@@ -14,6 +14,7 @@ import { domainHashV1 } from "../lib/review-canonical.ts";
 import { canonicalHash } from "../lib/review-transaction.ts";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+const { createGentleAiExtension } = await import(pathToFileURL(join(ROOT, "extensions/gentle-ai.ts")).href);
 const EXTENSIONS = [
 	"extensions/gentle-ai.ts",
 	"extensions/quiet-tools.ts",
@@ -312,7 +313,6 @@ async function run() {
 			},
 		};
 		const lastEventPi = createPi();
-		const { createGentleAiExtension } = await import(pathToFileURL(join(ROOT, "extensions/gentle-ai.ts")).href);
 		createGentleAiExtension({ nativeReviewCli })(lastEventPi.pi);
 		const controller = lastEventPi.tools.get("gentle_review");
 		const capture = lastEventPi.tools.get("gentle_review_capture");
@@ -595,6 +595,42 @@ async function run() {
 			undefined,
 			"a writer may dispatch when context carries narrow task-scoped repository-relative paths",
 		);
+
+		const interactiveSddDispatch = {
+			agent: "sdd-remediate",
+			task: "Correct the bound failed verification evidence.",
+			context: "Retain the parent-supplied remediation scope.",
+			mode: "task",
+		};
+		assert.equal(
+			await toolHook({ toolName: "subagent_run", input: interactiveSddDispatch }, createCtx(toolCwd, true, "interactive-sdd-parent")),
+			undefined,
+			"an interactive parent may dispatch an SDD child only after preflight resolves",
+		);
+		assert.match(
+			interactiveSddDispatch.context,
+			/^## SDD Session Preflight\nThese SDD preferences are explicit current-session choices\./,
+			"the parent-confirmed rendered preflight must be transported through the RPC child's context",
+		);
+		const rpcChildCwd = await tempWorkspace();
+		try {
+			const rpcChild = createPi();
+			createGentleAiExtension({ processEnv: { GENTLE_PI_AGENTS_CHILD: "1" } })(rpcChild.pi);
+			const rpcChildCtx = createCtx(rpcChildCwd, false, "delegated-rpc-sdd-child");
+			rpcChildCtx.mode = "rpc";
+			const rpcChildPrompt = await rpcChild.hooks.get("before_agent_start")[0](
+				{ agentName: "sdd-remediate", systemPrompt: "You are the SDD remediate executor for Gentle AI." },
+				rpcChildCtx,
+			);
+			assert.doesNotMatch(rpcChildPrompt.systemPrompt, /## SDD Session Preflight/);
+			assert.equal(
+				existsSync(join(rpcChildCwd, ".pi", "gentle-ai", "sdd-preflight.json")),
+				false,
+				"a delegated RPC child must not silently originate or persist defaults",
+			);
+		} finally {
+			await rm(rpcChildCwd, { recursive: true, force: true });
+		}
 
 		const canonicalFrozenFindingRow = '{"id":"JD-A-001","lens":"judgment-day","location":"extensions/gentle-ai.ts:1","severity":"CRITICAL","status_at_freeze":"open","evidence_class":"deterministic","evidence_claim":"The frozen finding has concrete user impact."}';
 		const canonicalFrozenFindingRows = [JSON.parse(canonicalFrozenFindingRow)];

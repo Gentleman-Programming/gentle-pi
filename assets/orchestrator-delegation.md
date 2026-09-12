@@ -85,7 +85,7 @@ Core principle: **does this inflate the parent context without need?** If yes, u
 | Bash for state (`git`, `gh`) | ✅ | — |
 | Tests, builds, or installs | allowed as a bounded action | ✅ fresh per-action worker without changing route |
 
-Use the platform's native bounded worker for delegated-direct work; reserve `sdd-*` agents for a selected SDD route.
+Use the platform's native bounded worker for delegated-direct work; reserve `sdd-*` agents for a selected SDD route. Before every shipped SDD `subagent_run` dispatch, the parent runtime—not phrase matching or the child—must resolve interactive preflight, fail closed on cancellation/failure, and prepend the exact rendered `## SDD Session Preflight` block to the existing child `context`. Do not create a second preference channel. An RPC child consumes that context and never originates, confirms, or persists defaults.
 
 Keep one writer and a short synthesized handoff. Delegation is mandatory at the mapping, write, preparation, and broad-research boundaries, but it remains a direct implementation route and must not synthesize SDD artifacts.
 

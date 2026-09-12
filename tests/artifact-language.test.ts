@@ -149,6 +149,27 @@ test("SDD proposal questions focus on business and PRD gaps", async () => {
 	);
 });
 
+test("all shipped SDD agents and chains require parent preflight transport", async () => {
+	const agents = [
+		"sdd-init", "sdd-onboard", "sdd-explore", "sdd-research", "sdd-proposal", "sdd-spec", "sdd-design",
+		"sdd-tasks", "sdd-status", "sdd-apply", "sdd-verify", "sdd-sync", "sdd-archive", "sdd-remediate",
+	];
+	const chains = ["sdd-full", "sdd-plan", "sdd-verify"];
+	assert.equal(agents.length, 14);
+	assert.equal(chains.length, 3);
+	for (const agent of agents) {
+		const source = await readFile(join(ROOT, "assets", "agents", `${agent}.md`), "utf8");
+		assert.match(source, /## Parent Preflight Transport/);
+		assert.match(source, /never confirms or persists SDD choices/);
+		assert.doesNotMatch(source, /(?:infer|synthesize) (?:a )?(?:preflight )?(?:confirmation|defaults?) yourself/i);
+	}
+	for (const chain of chains) {
+		const source = await readFile(join(ROOT, "assets", "chains", `${chain}.chain.md`), "utf8");
+		assert.match(source, /## Parent preflight transport guard/);
+		assert.match(source, /Missing or malformed transport blocks the chain before its first phase/);
+	}
+});
+
 test("SDD chain assets distinguish interactive gates from auto execution", async () => {
 	const planChain = await readFile(join(ROOT, "assets/chains/sdd-plan.chain.md"), "utf8");
 	const fullChain = await readFile(join(ROOT, "assets/chains/sdd-full.chain.md"), "utf8");

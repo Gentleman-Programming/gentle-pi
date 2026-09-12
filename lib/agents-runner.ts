@@ -193,6 +193,7 @@ export const REMEDIATION_PLAN_ENV = "GENTLE_PI_SDD_REMEDIATION_PLAN";
 export interface TaskRequest {
 	remediationIntent?: unknown;
 	sddRemediation?: RemediationTaskState;
+	sddPreflightContext?: string;
 	finalizeRemediation?: (task: TaskRecord, facts: RemediationTerminalFacts) => Promise<void>;
 	agent: AgentDefinition;
 	prompt: string;
@@ -404,6 +405,7 @@ export class AgentRunner {
 			id: `${now.toString(36)}-${this.counter.toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
 			agent: request.agent.name,
 			...(request.sddRemediation ? { sddRemediation: structuredClone(request.sddRemediation) } : {}),
+			...(request.sddPreflightContext ? { sddPreflightContext: request.sddPreflightContext } : {}),
 			mode: request.mode,
 			prompt: request.prompt,
 			...(request.researchArtifact ? { researchArtifact: structuredClone(request.researchArtifact) } : {}),

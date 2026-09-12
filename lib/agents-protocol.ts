@@ -124,6 +124,8 @@ export interface RemediationTaskState extends RemediationObservations {
 
 export interface TaskRecord {
 	sddRemediation?: RemediationTaskState;
+	/** Exact runtime-generated SDD preflight block retained only for continuation transport. */
+	sddPreflightContext?: string;
 	id: string;
 	agent: string;
 	mode: string;
