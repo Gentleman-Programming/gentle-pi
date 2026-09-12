@@ -229,7 +229,7 @@ export function renderAgentsCard(tasks: readonly TaskRecord[], theme: CardTheme,
 	if (shown.length === 0) return [];
 	const cols = columns(shown, cardInnerWidth(width), now);
 	const { listed, hidden } = options.collapsed ? { listed: [shown[0]], hidden: 0 } : visibleRows(shown, options.maxRows);
-	const hint = options.collapsed && options.collapseKey ? `${options.collapseKey} expand` : batchElapsed(shown, now);
+	const hint = options.collapsed && options.collapseKey ? `${options.collapseKey} expand` : shown.length > 1 ? batchElapsed(shown, now) : undefined;
 	const body = listed.flatMap((task) => row(task, theme, cols, now, options.maxRows === undefined));
 	if (hidden > 0) body.push(overflowRow(hidden, theme, options.viewKey));
 	return renderCard(
