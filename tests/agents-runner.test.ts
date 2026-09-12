@@ -940,7 +940,8 @@ test("admitted no-PID failure settles interrupted before sending a prompt", asyn
 	assert.equal(h.children[0].written.some(value => value.type === "prompt"), false);
 	await h.runner.waitFor(task.id);
 	assert.equal(facts.spawned, false);
-	assert.equal(facts.cleanupConfirmed, true);
+	assert.equal(facts.exited, false);
+	assert.equal(facts.cleanupConfirmed, false);
 });
 
 

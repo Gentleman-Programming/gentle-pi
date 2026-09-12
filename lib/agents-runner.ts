@@ -959,7 +959,7 @@ export class AgentRunner {
 		if (finalize) {
 			this.finalizingRemediation.add(id);
 			const terminal = { ...current, status, error };
-			void finalize(terminal, { spawned: typeof live?.child.pid === "number", exited: live?.childExit !== undefined, cleanupConfirmed: !live || live.child.pid === undefined || !live.quarantined && live.childExit !== undefined }).then(() => {
+			void finalize(terminal, { spawned: typeof live?.child.pid === "number", exited: live?.childExit !== undefined, cleanupConfirmed: !live || !live.quarantined && live.childExit !== undefined }).then(() => {
 				status = terminal.status;
 				error = terminal.error;
 			}).catch(() => {
