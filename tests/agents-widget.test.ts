@@ -58,6 +58,12 @@ test("renderAgentsCard draws columns for agent, task, and model · tokens · cos
 	assert.deepEqual(renderAgentsCard([], plainTheme, 60, 0, { collapsed: false }), []);
 });
 
+test("renderAgentsCard renders singleton elapsed time only on its task row", () => {
+	const lines = renderAgentsCard([task()], plainTheme, 84, 5_000, { collapsed: false }).map(stripAnsi);
+	assert.equal(lines.join("\n").match(/4s/g)?.length, 1);
+	assert.match(lines[1], /4s/);
+});
+
 test("renderAgentsCard keeps every task on one line, clipping long labels, and drops the task column when the card is narrow", () => {
 	const tasks = [task({ id: "a", label: "write the gentle shell footer and all of its tests before lunch" })];
 	const wide = renderAgentsCard(tasks, plainTheme, 84, 5_000, { collapsed: false }).map(stripAnsi);
