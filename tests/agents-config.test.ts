@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test, { after } from "node:test";
 import {
 	AGENT_MODE,
+	THINKING_LEVEL,
 	agentDirectories,
 	discoverAgents,
 	loadAgentsConfig,
@@ -14,6 +15,7 @@ import {
 	parseModelRef,
 	resolveAgentProfile,
 } from "../lib/agents-config.ts";
+import { THINKING_LEVELS } from "../lib/model-routing-authority.ts";
 
 // Gentle Agents configuration: markdown agent definitions (the same files
 // gentle-ai installs) and subagents.json, both parsed without touching pi.
@@ -75,6 +77,66 @@ test("parseAgentDefinition rejects unknown thinking levels, modes, and empty bod
 	assert.match((parseAgentDefinition("---\nname: a\nthinking: extreme\n---\nbody", "/a.md", "global") as { error: string }).error, /thinking "extreme"/);
 	assert.match((parseAgentDefinition("---\nname: a\nsubagent_mode: forever\n---\nbody", "/a.md", "global") as { error: string }).error, /mode "forever"/);
 	assert.match((parseAgentDefinition("---\nname: a\n---\n   \n", "/a.md", "global") as { error: string }).error, /no instructions/);
+});
+
+test("runtime thinking levels stay aligned with model routing authority", () => {
+	assert.deepEqual(Object.values(THINKING_LEVEL), THINKING_LEVELS);
+	assert.equal(THINKING_LEVEL.MAX, "max");
+});
+
+test("parseAgentDefinition accepts max through every thinking alias", () => {
+	for (const field of ["thinking", "effort", "thinking_level"]) {
+		const agent = parseAgentDefinition(`---\nname: worker\n${field}: max\n---\nbody`, "/worker.md", "global");
+		assert.ok(!("error" in agent), `${field} must accept max`);
+		assert.equal(agent.thinking, "max");
+	}
+});
+
+test("discoverAgents retains max definitions instead of falling back to medium", () => {
+	const home = join(root, "max-home");
+	const cwd = join(root, "max-project");
+	const agentHome = join(home, ".pi", "agent");
+	for (const dir of ["agents", "subagents"]) mkdirSync(join(agentHome, dir), { recursive: true });
+	writeFileSync(join(agentHome, "agents", "worker.md"), "---\nname: worker\nthinking: medium\n---\nlegacy worker");
+	writeFileSync(join(agentHome, "subagents", "worker.md"), "---\nname: worker\nthinking: max\n---\nselected worker");
+	writeFileSync(join(agentHome, "subagents.json"), JSON.stringify({ model_profiles: { worker: { model: "openai-codex/gpt-5.6-luna", effort: "max" } } }));
+	const { agents, errors } = discoverAgents({ cwd, home });
+	assert.deepEqual(errors, []);
+	assert.equal(agents.length, 1);
+	assert.equal(agents[0].thinking, "max");
+	assert.equal(agents[0].instructions, "selected worker");
+	const resolved = resolveAgentProfile(agents[0], loadAgentsConfig({ cwd, home }));
+	assert.equal(resolved.model?.id, "gpt-5.6-luna");
+	assert.equal(resolved.thinking, "max");
+	assert.equal(resolved.source.thinking, "profile");
+});
+
+test("max defaults and model profiles preserve routing precedence", () => {
+	const bare = parseAgentDefinition("---\nname: worker\n---\nbody", "/worker.md", "global");
+	const medium = parseAgentDefinition("---\nname: worker\nthinking: medium\n---\nbody", "/worker.md", "global");
+	assert.ok(!("error" in bare));
+	assert.ok(!("error" in medium));
+	for (const field of ["default_effort", "default_thinking_level", "default_thinking"]) {
+		const config = parseAgentsConfig({ [field]: "max" }, undefined);
+		assert.equal(config.defaultThinking, "max");
+		assert.equal(resolveAgentProfile(bare, config).thinking, "max");
+		assert.equal(resolveAgentProfile(bare, config).source.thinking, "default");
+		assert.equal(resolveAgentProfile(medium, config).thinking, "medium");
+	}
+	for (const field of ["effort", "thinking"]) {
+		const global = { model_profiles: { worker: { [field]: "max" } } };
+		const config = parseAgentsConfig(global, { model_profiles: { worker: { model: "openai-codex/gpt-5.6-luna" } } });
+		assert.equal(config.modelProfiles.worker.thinking, "max");
+		assert.equal(resolveAgentProfile(medium, config).thinking, "max");
+		assert.equal(resolveAgentProfile(medium, config).source.thinking, "profile");
+	}
+	const override = parseAgentsConfig(
+		{ model_profiles: { worker: { model: "openai-codex/gpt-5.6-luna", effort: "high" } } },
+		{ model_profiles: { worker: { effort: "max" } } },
+	);
+	assert.equal(override.modelProfiles.worker.thinking, "max");
+	assert.equal(resolveAgentProfile(medium, override).thinking, "max");
+	assert.equal(resolveAgentProfile(medium, override).model?.id, "gpt-5.6-luna");
 });
 
 test("discoverAgents merges the four directories with project over global and subagents over agents", () => {
