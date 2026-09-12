@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { AgentRunner } from "../lib/agents-runner.ts";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { AgentRunner, type ChildLike, type TaskRequest } from "../lib/agents-runner.ts";
 import { TaskStore } from "../lib/agents-protocol.ts";
 import { parseAgentDefinition } from "../lib/agents-config.ts";
 import { Type } from "typebox";
@@ -44,9 +45,10 @@ export async function launch(): Promise<void> {
 					streamSimple: (model, context) => {
 						writeFileSync(join(process.env.UPTAKE_RUN!, `input-${turn}.json`), JSON.stringify(context));
 						const calls = script[turn++] ?? [];
-						const message = { role: "assistant", content: calls.length ? calls.map(([name, arguments_], i) => ({ type: "toolCall", id: `${turn}-${i}`, name, arguments: arguments_ })) : [{ type: "text", text: "Controlled script exhausted; not acceptance." }], api: model.api, provider: model.provider, model: model.id, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost }, stopReason: calls.length ? "toolUse" : "stop", timestamp: Date.now() };
-						const stream = new ai.AssistantMessageEventStream();
-						queueMicrotask(() => { stream.push({ type: "start", partial: message }); stream.push({ type: "done", reason: message.stopReason, message }); stream.end(message); });
+						const stopReason = calls.length ? "toolUse" as const : "stop" as const;
+						const message: AssistantMessage = { role: "assistant", content: calls.length ? calls.map(([name, arguments_], i) => ({ type: "toolCall", id: `${turn}-${i}`, name, arguments: arguments_ })) : [{ type: "text", text: "Controlled script exhausted; not acceptance." }], api: model.api, provider: model.provider, model: model.id, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost }, stopReason, timestamp: Date.now() };
+						const stream = ai.createAssistantMessageEventStream();
+						queueMicrotask(() => { stream.push({ type: "start", partial: message }); stream.push({ type: "done", reason: stopReason, message }); stream.end(message); });
 						return stream;
 					},
 				});
@@ -101,7 +103,7 @@ if (!childRole) test("installed AI producer → fixed Pi extensions → managed 
 		assert.equal(digest(bytes), manifest.assets[`agents/sdd-${phase}.md`]);
 		assert.equal(bytes, readFileSync(join(pkg, "assets", "agents", `sdd-${phase}.md`), "utf8"));
 		const definition = parseAgentDefinition(bytes, path, "global");
-		assert.ok("instructions" in definition);
+		if (!("instructions" in definition)) throw new Error(`Invalid fixture agent: ${phase}`);
 		return definition;
 	};
 	for (const phase of ["apply", "research", "remediate"]) assert.equal(actor(phase).name, `sdd-${phase}`);
@@ -135,24 +137,24 @@ if (!childRole) test("installed AI producer → fixed Pi extensions → managed 
 	const fixed = [join(pkg, "extensions", "gentle-ai.ts"), join(pkg, "extensions", "gentle-agents.ts")];
 	const docExtension = join(pkg, "tests", "sdd-native-managed-uptake.test.ts");
 	const selection = { documentation: { tools: ["fetch_content"], extensions: { fetch_content: docExtension } } };
-	async function run(id: string, phase: string, script: unknown[], options: Record<string, any> = {}) {
+	async function run(id: string, phase: "apply" | "research" | "remediate", script: unknown[], options: Record<string, any> = {}) {
 		const directory = join(root, id); mkdirSync(directory);
 		const scriptPath = join(directory, "script.json"); writeFileSync(scriptPath, JSON.stringify(script));
 		const events: any[] = [], launches: any[] = [];
 		const runner = new AgentRunner(new TaskStore(), { maxConcurrency: 1, stallTimeoutMs: 15000 }, {
 			pi: { command: process.execPath, args: ["--experimental-strip-types", "--input-type=module", "--eval", `import(${JSON.stringify(docExtension)}).then(m=>m.launch())`, "--"] },
 			now: Date.now, schedule: (fn, ms) => { const timer = setTimeout(fn, ms); return () => clearTimeout(timer); },
-			spawn: (command, args, spawnOptions) => {
+			spawn: (command, args, spawnOptions): ChildLike => {
 				launches.push({ args, cwd: spawnOptions.cwd });
 				const child = spawn(command, args, { ...spawnOptions, stdio: ["pipe", "pipe", "pipe"] });
 				let buffer = "";
 				child.stdout.on("data", data => { buffer += data; const lines = buffer.split("\n"); buffer = lines.pop()!; for (const line of lines) { try { events.push(JSON.parse(line)); } catch { /* Diagnostics are not RPC evidence. */ } } });
 				child.stderr.on("data", data => appendFileSync(join(directory, "stderr.log"), data));
-				return child;
+				return child as unknown as ChildLike;
 			},
 		}, { askUser: async () => ({ cancelled: true }) });
 		try {
-			const task = runner.run({ agent: { ...actor(phase), ...(phase === "research" ? { tools: ["read", "write", "fetch_content"] } : {}) }, prompt: "Controlled boundary probe only; no implementation or acceptance.", context: phase === "research" ? JSON.stringify(status) : undefined, mode: "task", cwd, parentSessionId: "uptake", sessionDir: join(directory, "sessions"), env: { PATH: process.env.PATH, HOME: home, PI_CODING_AGENT_DIR: home, GENTLE_PI_AGENT_HOME: home, PI_OFFLINE: "1", UPTAKE_CHILD: "1", UPTAKE_RUN: directory, UPTAKE_SCRIPT: scriptPath, GENTLE_PI_GENTLE_AI_DEV_BINARY: binary, ...(phase === "research" ? { [RESEARCH_CHILD_TOOLS_ENV]: JSON.stringify(["read", "write", "fetch_content"]) } : {}), ...options.env }, extensionPaths: [...fixed, ...(options.absentTool ? [] : [docExtension])], researchSelection: selection, researchArtifact: options.artifact, sddRemediation: options.remediation, ...(phase === "research" ? {} : { sddChange: { phase, changeName: "uptake", workspaceRoot: cwd, ...options.selection } }) });
+			const task = runner.run({ agent: { ...actor(phase), ...(phase === "research" ? { tools: ["read", "write", "fetch_content"] } : {}) }, prompt: "Controlled boundary probe only; no implementation or acceptance.", label: undefined, context: phase === "research" ? JSON.stringify(status) : undefined, mode: "task", cwd, parentSessionId: "uptake", model: undefined, thinking: undefined, sessionDir: join(directory, "sessions"), resumeSessionPath: undefined, env: { PATH: process.env.PATH, HOME: home, PI_CODING_AGENT_DIR: home, GENTLE_PI_AGENT_HOME: home, PI_OFFLINE: "1", UPTAKE_CHILD: "1", UPTAKE_RUN: directory, UPTAKE_SCRIPT: scriptPath, GENTLE_PI_GENTLE_AI_DEV_BINARY: binary, ...(phase === "research" ? { [RESEARCH_CHILD_TOOLS_ENV]: JSON.stringify(["read", "write", "fetch_content"]) } : {}), ...options.env }, extensionPaths: [...fixed, ...(options.absentTool ? [] : [docExtension])], researchSelection: selection, researchArtifact: options.artifact, sddRemediation: options.remediation, ...(phase === "research" ? {} : { sddChange: { phase, changeName: "uptake", workspaceRoot: cwd, ...options.selection } }) });
 			const result = await runner.waitFor(task.id);
 			assert.equal(launches.length, 1);
 			assert.deepEqual(launches[0].args.flatMap((arg, i, args) => arg === "--extension" ? [args[i + 1]] : []), [...fixed, ...(options.absentTool ? [] : [docExtension])]);
@@ -209,7 +211,7 @@ if (!childRole) test("installed AI producer → fixed Pi extensions → managed 
 		rmSync(definition.filePath);
 		let acquires = 0;
 		try {
-			await assert.rejects(admitManagedRemediation({ agent: definition, cwd, sddChange: { phase: "remediate", changeName: "uptake", workspaceRoot: cwd, failedEvidenceRevision: `sha256:${"a".repeat(64)}` } }, {}, { ...native, sddAttemptAcquire: async () => { acquires++; throw new Error("Must not acquire"); } }, async () => {}), /unsupported/i);
+			await assert.rejects(admitManagedRemediation({ agent: definition, cwd, sddChange: { phase: "remediate", changeName: "uptake", workspaceRoot: cwd, failedEvidenceRevision: `sha256:${"a".repeat(64)}` } } as unknown as TaskRequest, {}, { ...native, sddAttemptAcquire: async () => { acquires++; throw new Error("Must not acquire"); } } as unknown as import("../lib/native-review-cli.ts").NativeReviewCli, async () => {}), /unsupported/i);
 			assert.equal(acquires, 0);
 		} finally { writeFileSync(definition.filePath, bytes); }
 	});

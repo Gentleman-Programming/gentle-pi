@@ -214,7 +214,10 @@ export interface NativeSddStatusV2 extends Readonly<Record<string, unknown>> {
 	schemaName: "gentle-ai.sdd-status";
 	schemaVersion: 2;
 	changeName: string | null;
-	actionContext: Readonly<Record<string, unknown>> & { workspaceRoot: string };
+	artifactStore: "openspec" | "engram" | "hybrid" | "none";
+	planningHome: Readonly<Record<string, unknown>> & { mode: "repo-local"; path: string };
+	changeRoot: string | null;
+	actionContext: Readonly<Record<string, unknown>> & { mode: "repo-local"; workspaceRoot: string; allowedEditRoots: readonly string[] };
 	dependencies: Readonly<Record<(typeof NATIVE_SDD_DEPENDENCIES)[number], NativeSddDependencyState>>;
 	phaseInstructions?: Readonly<Record<(typeof NATIVE_SDD_INSTRUCTION_PHASES)[number], readonly string[]>>;
 	blockedReasons: readonly string[];
@@ -1422,8 +1425,16 @@ export function decodeNativeSddStatusV2(value: unknown, request: Pick<NativeSddS
 	const status = object(value);
 	if (status.schemaName !== "gentle-ai.sdd-status" || status.schemaVersion !== 2) throw new Error("wrong native SDD status schema");
 	if ((request.changeName !== undefined && status.changeName !== request.changeName) || (status.changeName !== null && !isCanonicalProcessString(status.changeName))) throw new Error("native SDD status change identity mismatch");
+	const artifactStore = enumString(status.artifactStore, ["openspec", "engram", "hybrid", "none"]);
+	const planningHome = object(status.planningHome);
+	if (planningHome.mode !== "repo-local" || !isCanonicalProcessString(planningHome.path)) throw new Error("invalid native SDD planning home");
+	const expectedOpenSpecHome = join(request.workspaceRoot, "openspec");
+	if (planningHome.path !== expectedOpenSpecHome && !((artifactStore === "engram" || artifactStore === "hybrid") && planningHome.path === "engram:sdd")) throw new Error("native SDD planning home escaped its workspace");
+	if (status.changeRoot !== null && !isCanonicalProcessString(status.changeRoot)) throw new Error("invalid native SDD change root");
 	const actionContext = object(status.actionContext);
-	if (actionContext.workspaceRoot !== request.workspaceRoot || !isCanonicalProcessString(actionContext.workspaceRoot)) throw new Error("native SDD status workspace root mismatch");
+	if (actionContext.mode !== "repo-local" || actionContext.workspaceRoot !== request.workspaceRoot || !isCanonicalProcessString(actionContext.workspaceRoot)) throw new Error("native SDD status workspace root mismatch");
+	const allowedEditRoots = stringArray(actionContext.allowedEditRoots);
+	if (!allowedEditRoots.includes(request.workspaceRoot) || allowedEditRoots.some((root) => !isAbsolute(root) || root !== join(root))) throw new Error("invalid native SDD allowed edit roots");
 	const dependencies = object(status.dependencies);
 	for (const phase of NATIVE_SDD_DEPENDENCIES) {
 		if (enumString(dependencies[phase], NATIVE_SDD_DEPENDENCY_STATES) !== dependencies[phase]) throw new Error("invalid native SDD dependency");
@@ -2133,7 +2144,7 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		const operation = NATIVE_REVIEW_OPERATION.SDD_ATTEMPT;
 		const { body } = await this.negotiated(operation, request.workspaceRoot, args, true);
 		return decode(operation, true, () => {
-			const result = body as NativeSddAttemptResult;
+			const result = body as unknown as NativeSddAttemptResult;
 			if (!result || !["proceed", "blocked", "complete"].includes(result.state)) throw new TypeError("Invalid compact state");
 			if (verb === "acquire" && result.state === "proceed" && !isCanonicalProcessString(result.token)) throw new TypeError("Missing compact token");
 			if (result.reason !== undefined && typeof result.reason !== "string") throw new TypeError("Invalid compact reason");

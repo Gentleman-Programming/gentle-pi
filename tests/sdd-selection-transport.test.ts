@@ -10,7 +10,7 @@ import { TaskStore } from "../lib/agents-protocol.ts";
 import { createNodeExecFileAdapter, NativeReviewCliV216, decodeNativeSddStatusV2, NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError } from "../lib/native-review-cli.ts";
 import { createGentleAiExtension, __testing } from "../extensions/gentle-ai.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { NativeReviewCli } from "../lib/native-review-cli.ts";
+import type { NativeReviewCli, NativeSddStatusV2 } from "../lib/native-review-cli.ts";
 import { ensureSddPreflight } from "../lib/sdd-preflight.ts";
 import { fakeChild } from "./agents-fake-child.ts";
 
@@ -104,7 +104,10 @@ test("selected native v2 archive authority is injected whole and never falls bac
 		schemaName: "gentle-ai.sdd-status",
 		schemaVersion: 2,
 		changeName: "alpha",
-		actionContext: { workspaceRoot: root },
+		artifactStore: "openspec",
+		planningHome: { mode: "repo-local", path: join(root, "openspec") },
+		changeRoot: join(root, "openspec/changes/alpha"),
+		actionContext: { mode: "repo-local", workspaceRoot: root, allowedEditRoots: [root] },
 		dependencies: { proposal: "all_done", specs: "all_done", design: "all_done", tasks: "all_done", apply: "all_done", verify: "all_done", archive: "ready" },
 		phaseInstructions: { apply: ["done"], verify: ["done"], remediate: ["failed evidence"], archive: ["archive now"] },
 		blockedReasons: [],
@@ -139,8 +142,9 @@ test("selected native v2 failures fail closed without consulting the local resol
 	const root = workspace(t);
 	const serialized = JSON.stringify({ changeName: "alpha", workspaceRoot: root, phase: "archive" });
 	const valid = {
-		schemaName: "gentle-ai.sdd-status", schemaVersion: 2, changeName: "alpha",
-		actionContext: { workspaceRoot: root },
+		schemaName: "gentle-ai.sdd-status", schemaVersion: 2, changeName: "alpha", artifactStore: "openspec",
+		planningHome: { mode: "repo-local", path: join(root, "openspec") }, changeRoot: join(root, "openspec/changes/alpha"),
+		actionContext: { mode: "repo-local", workspaceRoot: root, allowedEditRoots: [root] },
 		dependencies: { proposal: "all_done", specs: "all_done", design: "all_done", tasks: "all_done", apply: "all_done", verify: "all_done", archive: "blocked" },
 		phaseInstructions: { apply: ["done"], verify: ["done"], remediate: ["failed evidence"], archive: ["blocked"] },
 		blockedReasons: ["native archive blocker"], nextRecommended: "verify",
@@ -172,15 +176,17 @@ test("selected native v2 failures fail closed without consulting the local resol
 		assert.equal(localResolverCalls, 0);
 	}
 
-	const blocked = await (__testing as unknown as {
-		resolveSelectedNativeSddChangeStartup(
-			serialized: unknown, cwd: string, agentName: string,
-			native: { sddStatus?: () => Promise<unknown> }, localResolver: () => unknown,
-		): Promise<{ status: typeof valid }>;
-	}).resolveSelectedNativeSddChangeStartup(serialized, root, "sdd-archive", { sddStatus: async () => valid }, () => {
-		throw new Error("local resolver must not run");
-	});
-	assert.deepEqual(blocked.status, valid, "a native archive blocker remains authoritative over a locally-ready result");
+	await assert.rejects(
+		() => (__testing as unknown as {
+			resolveSelectedNativeSddChangeStartup(
+				serialized: unknown, cwd: string, agentName: string,
+				native: { sddStatus?: () => Promise<unknown> }, localResolver: () => unknown,
+			): Promise<unknown>;
+		}).resolveSelectedNativeSddChangeStartup(serialized, root, "sdd-archive", { sddStatus: async () => valid }, () => {
+			throw new Error("local resolver must not run");
+		}),
+		/native status.*blocks|cannot execute/i,
+	);
 
 	const syncSerialized = JSON.stringify({ changeName: "alpha", workspaceRoot: root, phase: "sync" });
 	const localStatus = __testing.resolveSddChangeStartup(syncSerialized, root, "sdd-sync").status;
@@ -260,8 +266,9 @@ test("before_agent_start resolves the unnamed packaged executor and renders nati
 	const systemPrompt = readFileSync(new URL("../assets/agents/sdd-apply.md", import.meta.url), "utf8").replace(/^---\n[\s\S]*?\n---\n/, "");
 	const selection = { changeName: "alpha", workspaceRoot: root, phase: "apply" };
 	const status = {
-		schemaName: "gentle-ai.sdd-status", schemaVersion: 2, changeName: "alpha",
-		actionContext: { workspaceRoot: root },
+		schemaName: "gentle-ai.sdd-status", schemaVersion: 2, changeName: "alpha", artifactStore: "openspec",
+		planningHome: { mode: "repo-local", path: join(root, "openspec") }, changeRoot: join(root, "openspec/changes/alpha"),
+		actionContext: { mode: "repo-local", workspaceRoot: root, allowedEditRoots: [root] },
 		dependencies: { proposal: "all_done", specs: "all_done", design: "all_done", tasks: "all_done", apply: "ready", verify: "blocked", archive: "blocked" },
 		phaseInstructions: { apply: ["Read proposal, specs, design, and tasks before editing."], verify: ["Verify implementation."], remediate: ["Bind failed evidence."], archive: ["Archive after verification."] },
 		blockedReasons: [], nextRecommended: "apply",
@@ -340,10 +347,15 @@ test("before_agent_start resolves the unnamed packaged executor and renders nati
 	assert.doesNotMatch((await hooks.get("before_agent_start")!({ systemPrompt: syncPrompt }, ctx)).systemPrompt, /SDD selection blocked:/);
 	assert.deepEqual(calls, [], "manual sync remains local and never consults native discovery");
 	serialized = JSON.stringify(selection);
-	nativeReply = { ...status, dependencies: { ...status.dependencies, apply: "blocked" }, blockedReasons: ["missing native prerequisite"] };
-	const blocked = await hooks.get("before_agent_start")!({ systemPrompt }, ctx);
-	assert.match(blocked.systemPrompt, /Do not run phase work when this status marks the phase blocked/);
-	assert.ok(blocked.systemPrompt.includes(JSON.stringify(nativeReply, null, 2)));
+	for (const blockedReply of [
+		{ ...status, dependencies: { ...status.dependencies, apply: "blocked" }, blockedReasons: ["missing native prerequisite"] },
+		{ ...status, nextRecommended: "verify" },
+	]) {
+		nativeReply = blockedReply;
+		const blocked = await hooks.get("before_agent_start")!({ systemPrompt }, ctx);
+		assert.match(blocked.systemPrompt, /SDD selection blocked:/);
+		assert.equal((await callTool({ toolName: "write", input: { path: "unsafe.ts" } }, ctx))?.block, true);
+	}
 
 });
 
@@ -457,9 +469,8 @@ test("continuation rejects workspace mismatch and missing UI; marker-only confir
 	const status = commandStatus(root);
 	status.actionContext.allowedEditRoots = [];
 	const markerOnly = commandHarness(root, status, true);
-	await markerOnly.run("continue");
-	assert.deepEqual(markerOnly.calls, ["status", "continue"]);
-	assert.deepEqual(JSON.parse(markerOnly.notices[0]!).actionContext.allowedEditRoots, []);
+	await assert.rejects(() => markerOnly.run("continue"), /allowed edit roots/i);
+	assert.deepEqual(markerOnly.calls, ["status"]);
 });
 
 test("managed apply guidance refuses local reconstruction and preserves native authority", () => {
@@ -485,7 +496,7 @@ test("unsafe planning context and marker symlink refuse before mutation", async 
 test("typed remediation selection preserves native failed evidence and refuses stale binding", async (t) => {
 	const root = workspace(t), revision = `sha256:${"a".repeat(64)}`;
 	const selection = { changeName: "alpha", workspaceRoot: root, phase: "remediate", failedEvidenceRevision: revision };
-	const fixture = { schemaName: "gentle-ai.sdd-status", schemaVersion: 2, changeName: "alpha", actionContext: { workspaceRoot: root }, dependencies: Object.fromEntries(["proposal", "specs", "design", "tasks", "apply", "verify", "archive"].map(key => [key, "ready"])), phaseInstructions: { apply: [], verify: [], remediate: ["Correct failed evidence"], archive: [] }, blockedReasons: [], nextRecommended: "remediate", remediationState: { required: true, complete: false, failedEvidenceRevision: revision } };
+	const fixture: NativeSddStatusV2 = { schemaName: "gentle-ai.sdd-status", schemaVersion: 2, changeName: "alpha", artifactStore: "openspec", planningHome: { mode: "repo-local", path: join(root, "openspec") }, changeRoot: join(root, "openspec/changes/alpha"), actionContext: { mode: "repo-local", workspaceRoot: root, allowedEditRoots: [root] }, dependencies: Object.fromEntries(["proposal", "specs", "design", "tasks", "apply", "verify", "archive"].map(key => [key, "ready"])) as NativeSddStatusV2["dependencies"], phaseInstructions: { apply: [], verify: [], remediate: ["Correct failed evidence"], archive: [] }, blockedReasons: [], nextRecommended: "remediate", remediationState: { required: true, complete: false, failedEvidenceRevision: revision } };
 	const result = await __testing.resolveSelectedNativeSddChangeStartup(JSON.stringify(selection), root, "sdd-remediate", { sddStatus: async () => fixture });
 	assert.equal(result.selection.failedEvidenceRevision, revision);
 	await assert.rejects(__testing.resolveSelectedNativeSddChangeStartup(JSON.stringify({ ...selection, failedEvidenceRevision: `sha256:${"b".repeat(64)}` }), root, "sdd-remediate", { sddStatus: async () => fixture }), /remediation/);

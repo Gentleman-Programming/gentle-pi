@@ -17,6 +17,7 @@ import { PresenceCursor, PresencePublisher, listPresence, readActivity } from ".
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
 import { AgentRunner } from "../lib/agents-runner.ts";
+import type { NativeReviewCli } from "../lib/native-review-cli.ts";
 import { CHILD_METRICS_EVENT } from "../lib/runtime-metrics-children.ts";
 
 // Gentle Agents extension: the subagent_* tools drive isolated pi children,
@@ -875,7 +876,8 @@ for (const scenario of ["own", "other-root", "escaped", "sibling", "session-swit
 test("default Node spawn adapter distinguishes IPC-only and permission-capable canonical Git children", async () => {
 	const childProcess = createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process");
 	const originalSpawn = childProcess.spawn;
-	const captured: Array<{ command: string; args: readonly string[]; options: Record<string, unknown> }> = [];
+	type CapturedSpawnOptions = { cwd: string; env: NodeJS.ProcessEnv; shell?: boolean; windowsHide?: boolean; detached?: boolean; stdio?: string[] };
+	const captured: Array<{ command: string; args: readonly string[]; options: CapturedSpawnOptions }> = [];
 	const children: FakeChild[] = [];
 	const shutdown: Array<() => Promise<void>> = [];
 	const canonicalGitCwd = join(root, "canonical-git-project");
@@ -896,11 +898,11 @@ test("default Node spawn adapter distinguishes IPC-only and permission-capable c
 		}
 	};
 	childProcess.spawn = ((command: string, args: readonly string[], options: Record<string, unknown>) => {
-		captured.push({ command, args, options });
+		captured.push({ command, args, options: options as unknown as CapturedSpawnOptions });
 		const child = fakeChild();
 		children.push(child);
 		return child.child;
-	}) as typeof childProcess.spawn;
+	}) as unknown as typeof childProcess.spawn;
 	syncBuiltinESMExports();
 	try {
 		const launch = async (mode: "task" | "background", env: NodeJS.ProcessEnv, sessionCwd = nonGitCwd) => {
@@ -957,7 +959,7 @@ test("native spawn interception restores CommonJS and ESM exports after rejected
 		assert.equal((await import("node:child_process")).spawn, originalSpawn, "ESM spawn is restored");
 	};
 	const installMock = () => {
-		childProcess.spawn = (() => fakeChild().child) as typeof childProcess.spawn;
+		childProcess.spawn = (() => fakeChild().child) as unknown as typeof childProcess.spawn;
 		syncBuiltinESMExports();
 	};
 	const start = async (rejectShutdown: boolean) => {
@@ -2086,7 +2088,7 @@ test("managed remediation acquires before spawn and finalizes failure without ve
 	mkdirSync(join(fixtureHome, ".pi", "agent", "agents"), { recursive: true });
 	writeFileSync(join(fixtureHome, ".pi", "agent", "agents", "sdd-remediate.md"), readFileSync("assets/agents/sdd-remediate.md"));
 	const revision = `sha256:${"a".repeat(64)}`, calls = [];
-	const nativeSdd = { sddStatus: async () => ({ schemaName: "gentle-ai.sdd-status", schemaVersion: 2, changeName: "alpha", actionContext: { mode: "repo-local", workspaceRoot: cwd, allowedEditRoots: [cwd] }, dependencies: Object.fromEntries(["proposal", "specs", "design", "tasks", "apply", "verify", "archive"].map(key => [key, "ready"])), phaseInstructions: { apply: [], verify: [], remediate: ["Correct evidence"], archive: [] }, blockedReasons: [], nextRecommended: "remediate", remediationState: { required: true, complete: false, failedEvidenceRevision: revision } }), sddAttemptAcquire: async input => { assert.equal(runtime.spawned.length, 0); const [saved] = await loadHistory(historyDir(fixtureHome)); retainedId = saved.task.id; assert.deepEqual(saved.task.sddRemediation.acquire, input); assert.equal(saved.task.sddRemediation.token, undefined); calls.push(input); return { state: "proceed", token: "admitted-fixture" }; }, sddAttemptSettle: async input => { calls.push(input); return { state: "proceed" }; } };
+	const nativeSdd = { sddStatus: async () => ({ schemaName: "gentle-ai.sdd-status", schemaVersion: 2, changeName: "alpha", artifactStore: "openspec", planningHome: { mode: "repo-local", path: join(cwd, "openspec") }, changeRoot: join(cwd, "openspec/changes/alpha"), actionContext: { mode: "repo-local", workspaceRoot: cwd, allowedEditRoots: [cwd] }, dependencies: Object.fromEntries(["proposal", "specs", "design", "tasks", "apply", "verify", "archive"].map(key => [key, "ready"])), phaseInstructions: { apply: [], verify: [], remediate: ["Correct evidence"], archive: [] }, blockedReasons: [], nextRecommended: "remediate", remediationState: { required: true, complete: false, failedEvidenceRevision: revision } }), sddAttemptAcquire: async input => { assert.equal(runtime.spawned.length, 0); const [saved] = await loadHistory(historyDir(fixtureHome)); retainedId = saved.task.id; assert.deepEqual(saved.task.sddRemediation.acquire, input); assert.equal(saved.task.sddRemediation.token, undefined); calls.push(input); return { state: "proceed", token: "admitted-fixture" }; }, sddAttemptSettle: async input => { calls.push(input); return { state: "proceed" as const }; } } as unknown as NativeReviewCli;
 	gentleAgents(h.pi, {}, { ...runtime.deps, home: fixtureHome, nativeSdd });
 	const { ctx } = fakeContext(); await h.fire("session_start", ctx);
 	const result = await h.tools.get("subagent_run").execute("run", { agent: "sdd-remediate", task: "Correct alpha", mode: "background", sdd_change: { changeName: "alpha", workspaceRoot: cwd, phase: "remediate", failedEvidenceRevision: revision }, remediation: { attempt: { requestId: "one", workUnit: "correct", evidenceGoal: "Observed correction", maxAttempts: 1, maxChangedLines: 200 }, plan: { cwd, commands: ["pnpm test"], runtimeHarness: { naReason: "Not applicable because this fixture has no runtime boundary." }, rollback: { boundary: "Revert fixture bytes", command: "git diff --check" } } } }, undefined, undefined, ctx);
@@ -2117,7 +2119,7 @@ test("only remediation children with the retained exact plan override stock bash
 test("managed remediation tools publish the typed exact evidence plan and bracket input", () => {
 	const h = fakePi(); gentleAgents(h.pi, {}, deps().deps);
 	for (const name of ["subagent_run", "subagent_continue"]) {
-		const schema = h.tools.get(name).parameters.properties.remediation;
+		const schema = h.tools.get(name)!.parameters.properties.remediation as unknown as { required: string[]; properties: { plan: { required: string[] }; attempt: { properties: { token: unknown } } } };
 		assert.deepEqual(schema.required, ["plan", "attempt"]);
 		assert.deepEqual(schema.properties.plan.required, ["cwd", "commands", "runtimeHarness", "rollback"]);
 		assert.ok(schema.properties.attempt.properties.token);
@@ -2146,7 +2148,7 @@ test("R3/R4 host reload refuses retained acquire/actor uncertainty without anoth
 		const acquire = { workspaceRoot: cwd, changeName: "alpha", requestId: "retained", workUnit: "correct", evidenceGoal: "Observed correction", remediatesEvidenceRevision: revision };
 		await saveTask(historyDir(fixtureHome), { id: "retained", agent: "sdd-remediate", cwd, status: "failed", createdAt: 1, sddRemediation: { acquire, acquireUncertain: normal ? false : !actorClaimed, actorClaimed: normal ? false : actorClaimed, ...(normal ? { acquireResult: { state: actorClaimed } } : actorClaimed ? { token: "retained-token" } : {}) } } as never, emptyThread());
 		let acquisitions = 0, confirmations = 0;
-		gentleAgents(h.pi, {}, { ...runtime.deps, home: fixtureHome, nativeSdd: { sddStatus: async () => { throw new Error("fresh status reached"); }, sddAttemptSettle: async () => ({}), sddAttemptAcquire: async () => { acquisitions++; return { state: "proceed", token: "unsafe" }; } } });
+		gentleAgents(h.pi, {}, { ...runtime.deps, home: fixtureHome, nativeSdd: { sddStatus: async () => { throw new Error("fresh status reached"); }, sddAttemptSettle: async () => ({ state: "proceed" as const }), sddAttemptAcquire: async () => { acquisitions++; return { state: "proceed", token: "unsafe" }; } } as unknown as NativeReviewCli });
 		const { ctx } = fakeContext(fakeTui, async () => { confirmations++; return true; });
 		await h.fire("session_start", ctx);
 		await assert.rejects(h.tools.get("subagent_run").execute("again", { agent: "sdd-remediate", task: "Correct alpha", mode: "background", sdd_change: { changeName: "alpha", workspaceRoot: cwd, phase: "remediate", failedEvidenceRevision: revision }, remediation: { attempt: { ...acquire, requestId: "different" }, plan: { cwd, commands: ["pnpm test"], runtimeHarness: { naReason: "Not applicable because this fixture has no runtime boundary." }, rollback: { boundary: "Revert fixture", command: "git diff --check" } } } }, undefined, undefined, ctx), normal ? /fresh status reached/ : /reconcile exact history without actor replay/);

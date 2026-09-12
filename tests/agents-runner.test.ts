@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AGENT_MODE, parseAgentsConfig, resolveAgentProfile, type AgentDefinition } from "../lib/agents-config.ts";
-import { TASK_STATUS, TaskStore } from "../lib/agents-protocol.ts";
-import { AgentRunner, childArguments, JsonLines, piCommand, abortReasonText, type RunnerDeps, type RunnerHooks, type TaskRequest } from "../lib/agents-runner.ts";
+import { TASK_STATUS, TaskStore, type RemediationTaskState, type TaskRecord } from "../lib/agents-protocol.ts";
+import { AgentRunner, childArguments, JsonLines, piCommand, abortReasonText, type RemediationPlan, type RemediationTerminalFacts, type RunnerDeps, type RunnerHooks, type TaskRequest } from "../lib/agents-runner.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
 
 // Gentle Agents runner: every subagent is a child `pi --mode rpc` process.
@@ -908,10 +908,11 @@ test("research narrowing transport keeps exact argv paths and replaces inherited
 
 test("runner retains remediation observations and awaits terminal settlement", async () => {
 	const h = harness({ pid: 123 });
-	let finalized;
-	let release;
-	const gate = new Promise(resolve => { release = resolve; });
-	const remediation = { failedEvidenceRevision: `sha256:${"a".repeat(64)}`, plan: { cwd: "/repo", commands: ["pnpm test"], runtimeHarness: { naReason: "Not applicable because the fixture has no runtime boundary." }, rollback: { boundary: "Revert fixture", command: "git diff --check" } }, pending: {}, observations: [], invalid: false, token: "opaque", acquire: {} };
+	let finalized: { record: TaskRecord; facts: RemediationTerminalFacts } | undefined;
+	let release: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	const remediationPlan: RemediationPlan = { cwd: "/repo", commands: ["pnpm test"], runtimeHarness: { naReason: "Not applicable because the fixture has no runtime boundary." }, rollback: { boundary: "Revert fixture", command: "git diff --check" } };
+	const remediation: RemediationTaskState = { failedEvidenceRevision: `sha256:${"a".repeat(64)}`, plan: remediationPlan, pending: {}, observations: [], invalid: false, token: "opaque", acquire: { workspaceRoot: "/repo", changeName: "demo", requestId: "fixture", workUnit: "correct", evidenceGoal: "Observed correction" } };
 	const task = h.runner.run(request({ sddRemediation: remediation, finalizeRemediation: async (record, facts) => { finalized = { record, facts }; await gate; } }));
 	await tick();
 	for (const command of ["pnpm test", "git diff --check"]) {
@@ -921,8 +922,10 @@ test("runner retains remediation observations and awaits terminal settlement", a
 	h.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" }] });
 	h.children[0].emit({ type: "agent_settled" });
 	await tick();
-	assert.equal(finalized.record.sddRemediation.observations.length, 2);
+	assert.ok(finalized);
+	assert.equal(finalized.record.sddRemediation?.observations.length, 2);
 	const prompt = h.children[0].written.find(value => value.type === "prompt").message;
+	assert.ok(typeof prompt === "string");
 	assert.match(prompt, /pnpm test/);
 	assert.doesNotMatch(prompt, /opaque/);
 	assert.equal(finalized.facts.cleanupConfirmed, true);
@@ -935,7 +938,7 @@ test("runner retains remediation observations and awaits terminal settlement", a
 
 test("admitted no-PID failure settles interrupted before sending a prompt", async () => {
 	const h = harness(); let facts;
-	const task = h.runner.run(request({ sddRemediation: { plan: {} }, finalizeRemediation: async (_task, observed) => { facts = observed; } }));
+	const task = h.runner.run(request({ sddRemediation: { plan: {} } as unknown as RemediationTaskState, finalizeRemediation: async (_task, observed) => { facts = observed; } }));
 	await tick();
 	assert.equal(h.children[0].written.some(value => value.type === "prompt"), false);
 	await h.runner.waitFor(task.id);
@@ -949,7 +952,7 @@ test("admitted synchronous spawn failure finalizes without launching another act
 	let spawns = 0, facts;
 	const store = new TaskStore();
 	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs: 100 }, { spawn: () => { spawns++; throw new Error("spawn refused"); }, pi: { command: "pi", args: [] }, now: () => 1, schedule: () => () => {} }, { askUser: async () => ({}) });
-	const task = runner.run(request({ sddRemediation: { plan: {} }, finalizeRemediation: async (_task, value) => { facts = value; } }));
+	const task = runner.run(request({ sddRemediation: { plan: {} } as unknown as RemediationTaskState, finalizeRemediation: async (_task, value) => { facts = value; } }));
 	await runner.waitFor(task.id);
 	assert.deepEqual(facts, { spawned: false, exited: false, cleanupConfirmed: true });
 	assert.equal(spawns, 1);

@@ -4,15 +4,16 @@ import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { parseResearchArtifactIntent, researchArtifactCall, researchArtifactReadback } from "../lib/sdd-research-capabilities.ts";
+import { parseResearchArtifactIntent, researchArtifactCall, researchArtifactReadback, type ResearchArtifactIntent } from "../lib/sdd-research-capabilities.ts";
 import { childArguments } from "../lib/agents-runner.ts";
 import { resolveResearchCapabilities, researchAgent, renderResearchCapabilities } from "../lib/sdd-research-capabilities.ts";
+import type { AgentDefinition } from "../lib/agents-config.ts";
 
 const inventory = (names: string[]) => ({ getActiveTools: () => names, getAllTools: () => names.map(name => ({ name, sourceInfo: { source: "extension", path: "/installed/web.ts" } })) });
 const grant = (tools: string[]) => ({ tools, extensions: Object.fromEntries(tools.map(name => [name, "/installed/web.ts"])) });
 const documentation = { documentation: grant(["fetch_content"]) };
 const both = { ...documentation, "open-web": grant(["web_search", "source_check", "fetch_content", "get_search_content"]) };
-const agent = { name: "sdd-research", tools: ["read", "write", "fetch_content", "web_search", "source_check", "get_search_content"], instructions: "Research" } as never;
+const agent: AgentDefinition = { name: "sdd-research", description: "Research", filePath: "/agents/sdd-research.md", scope: "global", tools: ["read", "write", "fetch_content", "web_search", "source_check", "get_search_content"], instructions: "Research", model: undefined, thinking: undefined, mode: undefined };
 
 test("approved active external tools reach the actual child CLI allowlist", () => {
  const pi = inventory(["read", "write", "fetch_content", "web_search", "source_check", "get_search_content", "bash", "mcp"]);
@@ -125,7 +126,7 @@ test("artifact intent narrows exact paths and topics without granting tools or r
   const bytes = '{"revision":1,"outcome":"blocked"}';
   writeFileSync(path, bytes);
   const locator = { artifact: "research", revision: 1, digest: digest(bytes), path, engram: { id: 7, project: "pi", topic_key: "sdd/demo/research", revision_count: 2 } };
-  const intent = { store: "both", worktree: cwd, changeName: "demo", retainedIntent: "docs requested; fetch missing", locators: [locator] };
+  const intent: ResearchArtifactIntent = { store: "both", worktree: cwd, changeName: "demo", retainedIntent: "docs requested; fetch missing", locators: [locator] };
   const scope = parseResearchArtifactIntent(intent, cwd);
   for (const name of ["read", "edit", "write", "grep"]) assert.equal(researchArtifactCall(scope, cwd, name, { path }), 0);
   assert.equal(researchArtifactCall(scope, cwd, "mem_get_observation", { id: 7 }), 0);
@@ -177,13 +178,13 @@ test("R4 research write crash reload requires durable desired identity and actua
  const { default: gentleAgents } = await import("../extensions/gentle-agents.ts");
  const { appendFileSync } = await import("node:fs");
  const cwd = mkdtempSync(join(tmpdir(), "research-crash-")); t.after(() => rmSync(cwd, { recursive: true, force: true }));
- for (const store of ["openspec", "engram", "both"]) {
+ for (const store of ["openspec", "engram", "both"] as const) {
   const path = join(cwd, "openspec/changes/demo/research.md"), history = join(cwd, `${store}.jsonl`), memory = join(cwd, `${store}-memory.json`);
   mkdirSync(join(cwd, "openspec/changes/demo"), { recursive: true }); writeFileSync(history, "");
   const bytes = '{"revision":1}', next = '{"revision":2}', digest = value => createHash("sha256").update(value).digest("hex");
   const engram = { id: 12, project: "pi", topic_key: "sdd/demo/research", revision_count: 1 };
   writeFileSync(path, bytes); writeFileSync(memory, JSON.stringify({ ...engram, content: bytes }));
-  const scope = { store, worktree: cwd, changeName: "demo", retainedIntent: "retain uncertainty", locators: [{ artifact: "research", revision: 1, digest: digest(bytes), ...(store !== "engram" ? { path } : {}), ...(store !== "openspec" ? { engram } : {}) }] };
+  const scope: ResearchArtifactIntent = { store, worktree: cwd, changeName: "demo", retainedIntent: "retain uncertainty", locators: [{ artifact: "research", revision: 1, digest: digest(bytes), ...(store !== "engram" ? { path } : {}), ...(store !== "openspec" ? { engram } : {}) }] };
   const entries = () => readFileSync(history, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
   const start = (durable = true) => {
    const hooks = new Map(), active = ["read", "write", "mem_get_observation", "mem_save"];
@@ -235,10 +236,10 @@ test("R4 corrupted or broadened durable research scope is not a restart grant", 
  const { parseResearchPersistence } = await import("../lib/sdd-research-capabilities.ts");
  const cwd = mkdtempSync(join(tmpdir(), "research-journal-")); t.after(() => rmSync(cwd, { recursive: true, force: true }));
  const locator = { artifact: "research", revision: 1, digest: "a".repeat(64), engram: { id: 12, project: "pi", topic_key: "sdd/demo/research", revision_count: 1 } };
- const scope = { store: "engram", worktree: cwd, changeName: "demo", retainedIntent: "retain uncertainty", locators: [locator] };
+ const scope: ResearchArtifactIntent = { store: "engram", worktree: cwd, changeName: "demo", retainedIntent: "retain uncertainty", locators: [locator] };
  const snapshot = { version: 1, scope, accepted: {}, writes: { "0:mem_get_observation": { revision: 2, digest: "b".repeat(64) } }, operation: { toolCallId: "write", tool: "mem_save", index: 0 } };
  assert.doesNotThrow(() => parseResearchPersistence(snapshot, scope, cwd));
- const hybrid = { ...scope, store: "both", locators: [{ ...locator, path: join(cwd, "openspec/changes/demo/research.md") }] };
+ const hybrid: ResearchArtifactIntent = { ...scope, store: "both", locators: [{ ...locator, path: join(cwd, "openspec/changes/demo/research.md") }] };
  for (const desired of [{ revision: 3, digest: "b".repeat(64) }, { revision: 2, digest: "c".repeat(64) }]) {
   assert.throws(() => parseResearchPersistence({ ...snapshot, scope: hybrid, writes: { ...snapshot.writes, "0:read": desired } }, hybrid, cwd), /divergent/i);
  }

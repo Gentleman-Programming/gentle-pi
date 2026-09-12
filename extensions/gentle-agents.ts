@@ -493,12 +493,13 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 					const tools = scope.store === "both" ? ["read", "mem_get_observation"] : [scope.store === "openspec" ? "read" : "mem_get_observation"];
 					if (!scope.locators.every((_, i) => tools.every(tool => initialReads.has(`${i}:${tool}`)))) throw new Error("Every selected artifact requires matching initial readback before mutation.");
 					reads.clear();
-					if (event.toolName === "edit" || typeof event.input.content !== "string") throw new Error("Use a full bounded write/save for post-write readback.");
+					const content = "content" in event.input ? event.input.content : undefined;
+					if (event.toolName === "edit" || typeof content !== "string") throw new Error("Use a full bounded write/save for post-write readback.");
 					const key = `${index}:${event.toolName === "write" ? "read" : "mem_get_observation"}`;
 					if (!initialReads.has(key) || writes.has(key)) throw new Error("Fresh matching readback required before mutation.");
-					const revision: unknown = JSON.parse(event.input.content).revision;
+					const revision: unknown = JSON.parse(content).revision;
 					if (!Number.isSafeInteger(revision) || Number(revision) <= (accepted.get(key) ?? scope.locators[index]).revision) throw new Error("Full write requires a newer positive revision.");
-					desired = { revision: Number(revision), digest: createHash("sha256").update(event.input.content).digest("hex") };
+					desired = { revision: Number(revision), digest: createHash("sha256").update(content).digest("hex") };
 					if (scope.store === "both") {
 						const peerKey = `${index}:${event.toolName === "write" ? "mem_get_observation" : "read"}`;
 						const peer = writes.get(peerKey) ?? accepted.get(peerKey);

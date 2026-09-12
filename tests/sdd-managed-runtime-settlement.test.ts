@@ -1,16 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseRemediationPlan, remediationEvidence, observeRemediationTool } from "../lib/agents-runner.ts";
-import { NATIVE_REVIEW_ERROR_CODE, NATIVE_REVIEW_OPERATION, NativeReviewCliError } from "../lib/native-review-cli.ts";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { parseRemediationPlan, remediationEvidence, observeRemediationTool, type RemediationObservations, type RemediationPlan, type RemediationScope, type TaskRequest } from "../lib/agents-runner.ts";
+import { NATIVE_REVIEW_ERROR_CODE, NATIVE_REVIEW_OPERATION, NativeReviewCliError, type NativeReviewCli } from "../lib/native-review-cli.ts";
 import { remediationUnresolved } from "../lib/agents-history.ts";
+import type { TaskRecord } from "../lib/agents-protocol.ts";
 
 const testCwd = process.cwd();
-const human = { hasUI: true, ui: { confirm: async () => true } };
-const shellScope = (cwd, commands) => ({ cwd, commands, editPaths: [], allowedEditRoots: [cwd] });
+const human = { hasUI: true, ui: { confirm: async () => true } } as unknown as Pick<ExtensionContext, "hasUI" | "ui">;
+const shellScope = (cwd: string, commands: string[]): RemediationScope => ({ cwd, commands, editPaths: [], allowedEditRoots: [cwd] });
 const revision = `sha256:${"a".repeat(64)}`;
-const plan = { cwd: testCwd, commands: ["pnpm test"], runtimeHarness: { naReason: "Not applicable because this correction changes only static assets." }, rollback: { boundary: "Revert the changed asset and paired test", command: "git diff --check" } };
-function state() { return { failedEvidenceRevision: revision, plan: parseRemediationPlan(plan, testCwd), observations: [], pending: {}, invalid: false }; }
-function observed(s, command, id, exitCode = 0, overrides = {}) {
+const plan: RemediationPlan = { cwd: testCwd, commands: ["pnpm test"], runtimeHarness: { naReason: "Not applicable because this correction changes only static assets." }, rollback: { boundary: "Revert the changed asset and paired test", command: "git diff --check" } };
+function state(): RemediationObservations { return { failedEvidenceRevision: revision, plan: parseRemediationPlan(plan, testCwd), observations: [], pending: {}, invalid: false }; }
+function observed(s: RemediationObservations, command: string, id: string, exitCode: number | null = 0, overrides: Record<string, unknown> = {}) {
 	observeRemediationTool(s, { type: "tool_execution_start", toolName: "bash", toolCallId: id, args: { command } });
 	observeRemediationTool(s, { type: "tool_execution_end", toolName: "bash", toolCallId: id, isError: false, result: { content: [{ type: "text", text: "concrete command output" }], details: { remediationCommand: { toolCallId: id, command, cwd: testCwd, exitCode, ...overrides } } } });
 }
@@ -50,11 +52,12 @@ test("remediation shell captures numeric exit, preserves stock errors and execut
 		} }, shellScope(testCwd, ["pnpm test"]));
 		const run = shell.definition.execute("call", { command: "pnpm test" }, undefined, undefined, undefined);
 		if (exitCode === 7) await assert.rejects(run, /code 7/); else await run;
-		const patch = shell.result({ toolCallId: "call", details: { fullOutputPath: "/retained", remediationCommand: { exitCode: 99 } } });
-		assert.equal(patch.details.remediationCommand.exitCode, exitCode);
-		assert.equal(patch.details.remediationCommand.command, "pnpm test");
-		assert.equal(patch.details.remediationCommand.cwd, testCwd);
-		assert.equal(patch.details.fullOutputPath, "/retained");
+		const patch = shell.result({ toolCallId: "call", details: { fullOutputPath: "/retained", remediationCommand: { exitCode: 99 } } } as unknown as Parameters<typeof shell.result>[0]);
+		const details = patch.details as typeof patch.details & { fullOutputPath?: string };
+		assert.equal(details.remediationCommand.exitCode, exitCode);
+		assert.equal(details.remediationCommand.command, "pnpm test");
+		assert.equal(details.remediationCommand.cwd, testCwd);
+		assert.equal(details.fullOutputPath, "/retained");
 		assert.equal(shell.result({ toolCallId: "call" }), undefined);
 		assert.equal(calls, 1);
 	}
@@ -71,7 +74,7 @@ test("remediation owner and packaged actor are installed through existing owners
 test("native remediation admission refuses unsupported owner before acquire", async () => {
 	const { admitManagedRemediation } = await import("../extensions/gentle-agents.ts");
 	let acquires = 0;
-	await assert.rejects(admitManagedRemediation({ agent: { name: "sdd-remediate", filePath: "/absent" }, sddChange: { changeName: "fix", workspaceRoot: testCwd, phase: "remediate", failedEvidenceRevision: revision }, cwd: testCwd }, {}, { sddAttemptAcquire: async () => { acquires++; } }, async () => {}), /unsupported/i);
+	await assert.rejects(admitManagedRemediation({ agent: { name: "sdd-remediate", filePath: "/absent" }, sddChange: { changeName: "fix", workspaceRoot: testCwd, phase: "remediate", failedEvidenceRevision: revision }, cwd: testCwd } as unknown as TaskRequest, {}, { sddAttemptAcquire: async () => { acquires++; } } as unknown as NativeReviewCli, async () => {}), /unsupported/i);
 	assert.equal(acquires, 0);
 });
 
@@ -83,11 +86,12 @@ test("admitted remediation retains exact settlement before one lost-reply replay
 	const path = resolve("assets/agents/sdd-remediate.md");
 	const { parseAgentDefinition } = await import("../lib/agents-config.ts");
 	const agent = parseAgentDefinition(readFileSync(path, "utf8"), path, "global");
+	assert.ok("instructions" in agent);
 	const saved = [], calls = [];
-	const request = { agent, sddChange: { changeName: "fix", workspaceRoot: testCwd, phase: "remediate", failedEvidenceRevision: revision }, cwd: testCwd };
-	const native = { sddStatus: async () => ({ schemaName: "gentle-ai.sdd-status", schemaVersion: 2, dependencies: Object.fromEntries(["proposal", "specs", "design", "tasks", "apply", "verify", "archive"].map(key => [key, "ready"])), phaseInstructions: { apply: [], verify: [], remediate: ["Correct evidence"], archive: [] }, blockedReasons: [], nextRecommended: "remediate", changeName: "fix", actionContext: { mode: "repo-local", workspaceRoot: testCwd, allowedEditRoots: [testCwd] }, remediationState: { required: true, complete: false, failedEvidenceRevision: revision } }), sddAttemptAcquire: async input => { calls.push(["acquire", input]); return { state: "proceed", token: "opaque-admitted" }; }, sddAttemptSettle: async input => { assert.equal(saved.at(-1).sddRemediation.settle.requestId, input.requestId); calls.push(["settle", structuredClone(input)]); if (calls.length === 2) throw new Error("lost reply"); return { state: "complete" }; } };
-	const admitted = await admitManagedRemediation(request, { plan, attempt: { requestId: "a", workUnit: "fix", evidenceGoal: "Observed correction", maxAttempts: 1, maxChangedLines: 200 } }, native, async task => { saved.push(structuredClone(task)); }, human, { id: "prepared", cwd: testCwd, agent: "sdd-remediate", status: "queued" });
-	const task = { id: "task", cwd: testCwd, status: "completed", sddRemediation: admitted.sddRemediation };
+	const request = { agent, sddChange: { changeName: "fix", workspaceRoot: testCwd, phase: "remediate", failedEvidenceRevision: revision }, cwd: testCwd } as unknown as TaskRequest;
+	const native = { sddStatus: async () => ({ schemaName: "gentle-ai.sdd-status", schemaVersion: 2, artifactStore: "openspec", planningHome: { mode: "repo-local", path: `${testCwd}/openspec` }, changeRoot: `${testCwd}/openspec/changes/fix`, dependencies: Object.fromEntries(["proposal", "specs", "design", "tasks", "apply", "verify", "archive"].map(key => [key, "ready"])), phaseInstructions: { apply: [], verify: [], remediate: ["Correct evidence"], archive: [] }, blockedReasons: [], nextRecommended: "remediate", changeName: "fix", actionContext: { mode: "repo-local", workspaceRoot: testCwd, allowedEditRoots: [testCwd] }, remediationState: { required: true, complete: false, failedEvidenceRevision: revision } }), sddAttemptAcquire: async input => { calls.push(["acquire", input]); return { state: "proceed", token: "opaque-admitted" }; }, sddAttemptSettle: async input => { assert.equal(saved.at(-1).sddRemediation.settle.requestId, input.requestId); calls.push(["settle", structuredClone(input)]); if (calls.length === 2) throw new Error("lost reply"); return { state: "complete" as const }; } } as unknown as NativeReviewCli;
+	const admitted = await admitManagedRemediation(request, { plan, attempt: { requestId: "a", workUnit: "fix", evidenceGoal: "Observed correction", maxAttempts: 1, maxChangedLines: 200 } }, native, async task => { saved.push(structuredClone(task)); }, human, { id: "prepared", cwd: testCwd, agent: "sdd-remediate", status: "queued" } as unknown as TaskRecord);
+	const task = { id: "task", cwd: testCwd, status: "completed", sddRemediation: admitted.sddRemediation } as unknown as TaskRecord & { sddRemediation: typeof admitted.sddRemediation };
 	observed(task.sddRemediation, "pnpm test", "one"); observed(task.sddRemediation, "git diff --check", "two");
 	await admitted.finalizeRemediation(task, { spawned: true, exited: true, cleanupConfirmed: true });
 	assert.equal(calls.filter(([verb]) => verb === "acquire").length, 1);
@@ -99,24 +103,24 @@ test("admitted remediation retains exact settlement before one lost-reply replay
 });
 
 
-async function admissionFixture(overrides = {}, persist = async () => {}, agentPatch = {}, attemptPatch = {}, context = human) {
+async function admissionFixture(overrides = {}, persist: (task: TaskRecord) => Promise<void> = async () => {}, agentPatch = {}, attemptPatch = {}, context: Pick<ExtensionContext, "hasUI" | "ui"> = human) {
 	const { admitManagedRemediation } = await import("../extensions/gentle-agents.ts");
 	const { parseAgentDefinition } = await import("../lib/agents-config.ts");
 	const { readFileSync } = await import("node:fs");
 	const { resolve } = await import("node:path");
 	const path = resolve("assets/agents/sdd-remediate.md");
-	const request = { agent: { ...parseAgentDefinition(readFileSync(path, "utf8"), path, "global"), ...agentPatch }, cwd: testCwd, sddChange: { changeName: "fix", workspaceRoot: testCwd, phase: "remediate", failedEvidenceRevision: revision } };
+	const request = { agent: { ...parseAgentDefinition(readFileSync(path, "utf8"), path, "global"), ...agentPatch }, cwd: testCwd, sddChange: { changeName: "fix", workspaceRoot: testCwd, phase: "remediate", failedEvidenceRevision: revision } } as unknown as TaskRequest;
 	const calls = [];
-	const native = { sddStatus: async () => ({ schemaName: "gentle-ai.sdd-status", schemaVersion: 2, dependencies: Object.fromEntries(["proposal", "specs", "design", "tasks", "apply", "verify", "archive"].map(key => [key, "ready"])), phaseInstructions: { apply: [], verify: [], remediate: ["Correct evidence"], archive: [] }, blockedReasons: [], nextRecommended: "remediate", changeName: "fix", actionContext: { mode: "repo-local", workspaceRoot: testCwd, allowedEditRoots: [testCwd] }, remediationState: { required: true, complete: false, failedEvidenceRevision: revision } }), sddAttemptAcquire: async input => { calls.push(["acquire", input]); return { state: "proceed", token: "opaque" }; }, sddAttemptSettle: async input => { calls.push(["settle", input]); return { state: "proceed" }; }, ...overrides };
-	const admitted = await admitManagedRemediation(request, { plan, attempt: { requestId: "a", workUnit: "fix", evidenceGoal: "Observed correction", untrackedScope: "select", expectedUntrackedInventory: revision, intendedUntracked: ["new file.ts"], ...attemptPatch } }, native, persist, context, { id: "prepared", cwd: testCwd, agent: "sdd-remediate", status: "queued" });
-	return { admitted, calls, task: { id: "one", status: "failed", sddRemediation: admitted.sddRemediation } };
+	const native = { sddStatus: async () => ({ schemaName: "gentle-ai.sdd-status", schemaVersion: 2, artifactStore: "openspec", planningHome: { mode: "repo-local", path: `${testCwd}/openspec` }, changeRoot: `${testCwd}/openspec/changes/fix`, dependencies: Object.fromEntries(["proposal", "specs", "design", "tasks", "apply", "verify", "archive"].map(key => [key, "ready"])), phaseInstructions: { apply: [], verify: [], remediate: ["Correct evidence"], archive: [] }, blockedReasons: [], nextRecommended: "remediate", changeName: "fix", actionContext: { mode: "repo-local", workspaceRoot: testCwd, allowedEditRoots: [testCwd] }, remediationState: { required: true, complete: false, failedEvidenceRevision: revision } }), sddAttemptAcquire: async input => { calls.push(["acquire", input]); return { state: "proceed", token: "opaque" }; }, sddAttemptSettle: async input => { calls.push(["settle", input]); return { state: "proceed" as const }; }, ...overrides } as unknown as NativeReviewCli;
+	const admitted = await admitManagedRemediation(request, { plan, attempt: { requestId: "a", workUnit: "fix", evidenceGoal: "Observed correction", untrackedScope: "select", expectedUntrackedInventory: revision, intendedUntracked: ["new file.ts"], ...attemptPatch } }, native, persist, context, { id: "prepared", cwd: testCwd, agent: "sdd-remediate", status: "queued" } as unknown as TaskRecord);
+	return { admitted, calls, task: { id: "one", status: "failed", sddRemediation: admitted.sddRemediation } as unknown as TaskRecord & { sddRemediation: typeof admitted.sddRemediation } };
 }
 for (const state of ["blocked", "complete"]) test(`native ${state} refuses without settlement`, async () => {
 	let settles = 0;
 	await assert.rejects(admissionFixture({ sddAttemptAcquire: async () => ({ state }), sddAttemptSettle: async () => { settles++; } }), new RegExp(state));
 	assert.equal(settles, 0);
 });
-for (const status of ["failed", "cancelled", "timed_out"]) test(`terminal ${status} settles without passing evidence and retains exact untracked scope`, async () => {
+for (const status of ["failed", "cancelled", "timed_out"] as const) test(`terminal ${status} settles without passing evidence and retains exact untracked scope`, async () => {
 	const { admitted, calls, task } = await admissionFixture(); task.status = status;
 	await admitted.finalizeRemediation(task, { spawned: true, exited: true, cleanupConfirmed: true });
 	const payload = calls[1][1];
@@ -154,7 +158,9 @@ test("stock local shell wrapper observes real exit zero and preserves cancellati
 	const shell = remediationBash(process.cwd(), undefined, shellScope(process.cwd(), ["printf wrapper-proof", "sleep 30"]));
 	assert.deepEqual(shell.definition.parameters, createBashToolDefinition(process.cwd()).parameters);
 	const result = await shell.definition.execute("real", { command: "printf wrapper-proof" }, undefined, undefined, undefined);
-	assert.equal(result.content[0].text, "wrapper-proof");
+	const [content] = result.content;
+	assert.ok(content?.type === "text");
+	assert.equal(content.text, "wrapper-proof");
 	assert.equal(shell.result({ toolCallId: "real", details: result.details }).details.remediationCommand.exitCode, 0);
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), 30);
@@ -177,8 +183,8 @@ test("history pruning retains admitted unsettled and uncertain task payloads", a
 	const { saveTask, pruneHistory, loadHistory } = await import("../lib/agents-history.ts");
 	const { emptyThread } = await import("../lib/agents-protocol.ts");
 	const dir = await mkdtemp(join(tmpdir(), "remediation-history-")); t.after(() => rm(dir, { recursive: true, force: true }));
-	await saveTask(dir, { id: "retained", agent: "sdd-remediate", status: "failed", createdAt: 1, sddRemediation: { token: "opaque", settlementUncertain: true, settle: { requestId: "exact" } } }, emptyThread());
-	for (const state of ["blocked", "complete"]) await saveTask(dir, { id: state, agent: "sdd-remediate", status: "failed", createdAt: 2, sddRemediation: { acquireResult: { state } } }, emptyThread());
+	await saveTask(dir, { id: "retained", agent: "sdd-remediate", status: "failed", createdAt: 1, sddRemediation: { token: "opaque", settlementUncertain: true, settle: { requestId: "exact" } } } as unknown as TaskRecord, emptyThread());
+	for (const state of ["blocked", "complete"] as const) await saveTask(dir, { id: state, agent: "sdd-remediate", status: "failed", createdAt: 2, sddRemediation: { acquireResult: { state } } } as unknown as TaskRecord, emptyThread());
 	await pruneHistory(dir, 0);
 	const stored = await loadHistory(dir);
 	assert.equal(stored.length, 1); assert.equal(stored[0].task.sddRemediation.settle.requestId, "exact");
@@ -214,6 +220,7 @@ test("remediation actor preserves separately authorized memory artifact tools", 
 	const { parseAgentDefinition } = await import("../lib/agents-config.ts");
 	const { readFileSync } = await import("node:fs");
 	const agent = parseAgentDefinition(readFileSync("assets/agents/sdd-remediate.md", "utf8"), "/agents/sdd-remediate.md", "global");
+	assert.ok("instructions" in agent);
 	for (const tool of ["mem_search", "mem_get_observation", "mem_save", "mem_update"]) assert.ok(agent.tools.includes(tool), tool);
 });
 
@@ -246,7 +253,7 @@ test("R1 confirms exact canonical paths and commands; data, denial and symlinks 
 	const target = join(cwd, "allowed.ts"); writeFileSync(target, "original"); symlinkSync(target, join(cwd, "alias.ts"));
 	const candidate = { ...plan, cwd, editPaths: [target] }, native = { mode: "repo-local", workspaceRoot: cwd, allowedEditRoots: [cwd] };
 	let shown = "", confirmations = 0;
-	const ui = { hasUI: true, ui: { confirm: async (_title, text) => { shown = text; confirmations++; return true; } } };
+	const ui = { hasUI: true, ui: { confirm: async (_title: string, text: string) => { shown = text; confirmations++; return true; } } } as unknown as Pick<ExtensionContext, "hasUI" | "ui">;
 	const scope = await confirmRemediationScope(candidate, native, ui);
 	assert.match(shown, /pnpm test/); assert.ok(shown.includes(target)); assert.ok(shown.includes(cwd));
 	assert.equal(remediationToolAllowed(scope, cwd, "write", { path: target }), true);
@@ -255,7 +262,7 @@ test("R1 confirms exact canonical paths and commands; data, denial and symlinks 
 	assert.equal(remediationToolAllowed(scope, cwd, "bash", { command: "pnpm test; touch outside" }), false);
 	for (const bad of [{ ...candidate, editPaths: [join(cwd, "alias.ts")] }, { ...candidate, editPaths: [cwd] }, { ...candidate, editPaths: [target, target] }]) await assert.rejects(confirmRemediationScope(bad, native, ui));
 	assert.equal(confirmations, 1);
-	for (const context of [undefined, { hasUI: false, ui: ui.ui }, { hasUI: true, ui: { confirm: async () => false } }, { hasUI: true, ui: { confirm: async () => undefined } }]) await assert.rejects(confirmRemediationScope(candidate, native, context), /authorization/);
+	for (const context of [undefined, { hasUI: false, ui: ui.ui }, { hasUI: true, ui: { confirm: async () => false } }, { hasUI: true, ui: { confirm: async () => undefined } }]) await assert.rejects(confirmRemediationScope(candidate, native, context as unknown as Pick<ExtensionContext, "hasUI" | "ui">), /authorization/);
 });
 
 
@@ -281,7 +288,7 @@ test("R3/R4 acquire persistence failure refuses before native mutation", async (
 test("R1 denial/headless/cancellation gives zero acquisition and durable mutation", async () => {
 	for (const context of [{ hasUI: false }, { hasUI: true, ui: { confirm: async () => false } }, { hasUI: true, ui: { confirm: async () => undefined } }, { hasUI: true, ui: { confirm: async () => { throw new Error("cancelled"); } } }]) {
 		let acquisitions = 0, persistence = 0;
-		await assert.rejects(admissionFixture({ sddAttemptAcquire: async () => { acquisitions++; } }, async () => { persistence++; }, {}, {}, context));
+		await assert.rejects(admissionFixture({ sddAttemptAcquire: async () => { acquisitions++; } }, async () => { persistence++; }, {}, {}, context as unknown as Pick<ExtensionContext, "hasUI" | "ui">));
 		assert.equal(acquisitions, 0); assert.equal(persistence, 0);
 	}
 });
@@ -289,7 +296,7 @@ test("R1 child invokes only the exact confirmed command/cwd/count with distinct 
 	const { remediationBash } = await import("../extensions/gentle-agents.ts");
 	let executions = 0;
 	const shell = remediationBash(testCwd, { exec: async () => { executions++; return { exitCode: 0 }; } }, shellScope(testCwd, ["pnpm test", "pnpm test"]));
-	const execute = (id, command, cwd = testCwd) => shell.definition.execute(id, { command }, undefined, undefined, cwd === testCwd ? undefined : { cwd });
+	const execute = (id: string, command: string, cwd = testCwd) => shell.definition.execute(id, { command }, undefined, undefined, cwd === testCwd ? undefined : { cwd } as unknown as ExtensionContext);
 	await assert.rejects(execute("outside", "pnpm test; touch outside"), /authorization/);
 	await assert.rejects(execute("cwd", "pnpm test", "/other"), /authorization/);
 	assert.equal(executions, 0);

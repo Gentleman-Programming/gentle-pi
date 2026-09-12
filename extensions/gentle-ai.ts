@@ -1676,7 +1676,11 @@ async function resolveSelectedNativeSddChangeStartup(
 	if ((selection.phase !== "remediate" && !(selection.phase in status.dependencies)) || status.phaseInstructions === undefined || !(selection.phase in status.phaseInstructions)) {
 		throw new Error(`SDD selection native status cannot represent phase ${selection.phase}.`);
 	}
-	if (selection.phase === "remediate" && (status.nextRecommended !== "remediate" || status.remediationState?.failedEvidenceRevision !== selection.failedEvidenceRevision)) throw new Error("Stale remediation selection");
+	if (selection.phase === "remediate") {
+		if (status.nextRecommended !== "remediate" || status.remediationState?.failedEvidenceRevision !== selection.failedEvidenceRevision) throw new Error("Stale remediation selection");
+	} else if (status.nextRecommended !== selection.phase || status.dependencies[selection.phase] !== "ready" || status.blockedReasons.length > 0) {
+		throw new Error(`SDD selection native status blocks phase ${selection.phase}; it cannot execute.`);
+	}
 	return { selection, status };
 }
 
