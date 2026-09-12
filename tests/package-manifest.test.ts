@@ -546,7 +546,7 @@ const EXPECTED_OWNER_ASSETS: Record<PackageAssetOwner, readonly string[]> = {
 	sdd: [
 		"agents/sdd-apply.md", "agents/sdd-archive.md", "agents/sdd-design.md",
 		"agents/sdd-explore.md", "agents/sdd-init.md", "agents/sdd-onboard.md",
-		"agents/sdd-proposal.md", "agents/sdd-research.md", "agents/sdd-spec.md",
+		"agents/sdd-proposal.md", "agents/sdd-remediate.md", "agents/sdd-research.md", "agents/sdd-spec.md",
 		"agents/sdd-status.md", "agents/sdd-sync.md", "agents/sdd-tasks.md", "agents/sdd-verify.md",
 		"chains/sdd-full.chain.md", "chains/sdd-plan.chain.md", "chains/sdd-verify.chain.md",
 		"gentle-ai/support/sdd-status-contract.md", "gentle-ai/support/strict-tdd-verify.md",
@@ -590,10 +590,10 @@ test("legacy all-assets installation covers every packaged file with explicit ow
 		assert.equal(getPackageAssetOwner(key), undefined, "unknown assets must not default to SDD");
 	}
 	withIsolatedAssetHome((agentHome) => {
-		assert.deepEqual(installSddAssets(agentHome, false), { agents: 23, chains: 4, support: 3, skipped: 0 });
+		assert.deepEqual(installSddAssets(agentHome, false), { agents: 24, chains: 4, support: 3, skipped: 0 });
 		assert.deepEqual(Object.keys(installedAssetManifest(agentHome).assets).sort(), packaged);
-		assert.deepEqual(installSddAssets(agentHome, false), { agents: 0, chains: 0, support: 0, skipped: 30 });
-		assert.deepEqual(installSddAssets(agentHome, true), { agents: 23, chains: 4, support: 3, skipped: 0 });
+		assert.deepEqual(installSddAssets(agentHome, false), { agents: 0, chains: 0, support: 0, skipped: 31 });
+		assert.deepEqual(installSddAssets(agentHome, true), { agents: 24, chains: 4, support: 3, skipped: 0 });
 	});
 });
 
@@ -653,6 +653,7 @@ test("unowned legacy research migrates by exact normalized hash, preserving rout
 	const packaged = readFileSync(join(PACKAGE_ROOT, "assets", "agents", "sdd-research.md"), "utf8");
 	const oldAdmission = "- Evidence grants for this runtime are `documentation=[]; open-web=[]`. Never infer evidence capability from bash, persistence tools, or any inherited tool; persistence tools are not evidence grants. Unsupported or undeclared classes deny admission and emit no claims.\n- Because this runtime declares no evidence grants, retain the selected request, persist a `blocked` outcome with no claims, and stop.\n";
 	const legacy = packaged
+		.replace(/## Bounded artifact handoff\n[\s\S]*?(?=## Memory Contract)/, "")
 		.replace(/  - fetch_content\n  - web_search\n  - source_check\n  - get_search_content\n/, "")
 		.replace(/- Use the injected `## SDD Research Capabilities`[\s\S]*?(?=- Admission denial)/, oldAdmission)
 		.replace(/Use `done` only when all selected questions[\s\S]*?product decisions remain separately confirmed by the parent\./i, "For this runtime the outcome is `blocked` with an admission denial and no claims.");
@@ -1550,4 +1551,9 @@ test("README documents dynamic Gentle AI RDD ownership and the installed permiss
 		assert.ok(readme.includes(clause), `README missing dynamic RDD clause: ${clause}`);
 	}
 	assert.doesNotMatch(readme, /New ordinary review uses compact `gentle_review` `start -> finalize -> validate`\./);
+});
+
+
+test("package verification explicitly requires the managed remediation actor", () => {
+	assert.match(readFileSync(join(PACKAGE_ROOT, "scripts/verify-package-files.mjs"), "utf8"), /assets\/agents\/sdd-remediate\.md/);
 });

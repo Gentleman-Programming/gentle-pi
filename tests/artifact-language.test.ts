@@ -212,8 +212,10 @@ test("SDD assets route completed implementation directly through verify, sync, a
 
 	assert.match(tasks, /<!-- sdd-owner: implementation -->/);
 	assert.match(apply, /next_recommended: "sdd-verify"/);
-	assert.match(status, /verify.*ready/i);
-	assert.match(contract, /apply.*verify.*sync.*archive/is);
+	assert.match(status, /gentle-ai\.sdd-status.*v2/i);
+	assert.match(status, /read-only/i);
+	assert.match(contract, /native.*(?:apply|verify).*archive/is);
+	assert.match(contract, /Manual `sdd-sync` remains its intentional local resolver/);
 	assert.match(chain, /apply.*verification/is);
 	assert.doesNotMatch(assets, /<!-- sdd-owner: parent -->/);
 	assert.doesNotMatch(assets, /parent-lifecycle/);

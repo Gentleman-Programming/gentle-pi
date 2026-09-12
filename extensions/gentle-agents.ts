@@ -1,21 +1,25 @@
+import { fileURLToPath } from "node:url";
+import { getPackageAssetOwner } from "../lib/sdd-preflight.ts";
+import { NativeReviewCliV216, NativeReviewCliError, createNodeExecFileAdapter, decodeNativeSddStatusV2, type NativeReviewCli, type NativeSddAcquireRequest, type NativeSddSettleRequest } from "../lib/native-review-cli.ts";
 import { spawn } from "node:child_process";
 import { recordReviewMutation } from "../lib/review-reminder-receipt.ts";
 import { SessionWorktreeRegistry, resolveSessionWorktree, type WorktreeResolver } from "../lib/session-worktree-registry.ts";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, lstatSync, realpathSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
-import { join, resolve } from "node:path";
-import { keyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { join, resolve, isAbsolute, sep } from "node:path";
+import { createBashToolDefinition, createLocalBashOperations, type BashOperations, keyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text, type TUI } from "@earendil-works/pi-tui";
 import { sidebarPart } from "../lib/shell-sidebar.ts";
 import { invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
 import { createCompletionQueue } from "../lib/agents-completion-delivery.ts";
-import { AGENT_MODE, discoverAgents, loadAgentsConfig, resolveAgentProfile, type AgentDefinition, type AgentMode } from "../lib/agents-config.ts";
+import { AGENT_MODE, discoverAgents, parseAgentDefinition, loadAgentsConfig, resolveAgentProfile, type AgentDefinition, type AgentMode } from "../lib/agents-config.ts";
 import { isFinished, TASK_STATUS, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
-import { AgentRunner, piCommand, abortReasonText, type AskAnswer, type RunnerDeps, type SddChangeSelection, type TaskRequest } from "../lib/agents-runner.ts";
+import { AgentRunner, piCommand, abortReasonText, plannedCommands, type RemediationPlan, type RemediationScope, REMEDIATION_PLAN_ENV, parseRemediationPlan, remediationEvidence, type AskAnswer, type RunnerDeps, type SddChangeSelection, type TaskRequest, type RemediationTerminalFacts } from "../lib/agents-runner.ts";
 import { ChildMessenger, type IpcEndpoint } from "../lib/agents-messaging.ts";
 import { hasReviewSessionPermission, resolveCanonicalGitRepositoryIdentitySync, type ReviewSessionManager } from "../lib/review-session-standing-permission.ts";
-import { historyDir, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
+import { historyDir, remediationUnresolved, loadHistory, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
 import { sessionToMarkdown } from "../lib/agents-transcript.ts";
 import { AgentsView } from "../lib/agents-view.ts";
 import { PresencePublisher } from "../lib/orchestrator-presence.ts";
@@ -24,7 +28,7 @@ import { AGENTS_GLYPH, renderAgentsCard, widgetExpiryMs, widgetRows } from "../l
 import { CARD_TONE, renderCard } from "../lib/shell-card.ts";
 import { openInExternalEditor } from "./gentle-shell.ts";
 import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
-import { researchAgent, resolveResearchCapabilities, renderResearchCapabilities, RESEARCH_CHILD_TOOLS_ENV } from "../lib/sdd-research-capabilities.ts";
+import { assertResearchCheckpoint, parseResearchPersistence, RESEARCH_PERSISTENCE_ENTRY, canonicalArtifactPath, researchAgent, renderResearchCapabilities, RESEARCH_CHILD_TOOLS_ENV, RESEARCH_SELECTION_ENV, RESEARCH_ARTIFACT_ENV, parseResearchArtifactIntent, researchArtifactCall, researchArtifactReadback, type ResearchArtifactIntent, type ResearchWriteIdentity } from "../lib/sdd-research-capabilities.ts";
 import { CHILD_METRICS_EVENT, CHILD_METRICS_REVOKED, childEvent, launchSelection, type LaunchSelection } from "../lib/runtime-metrics-children.ts";
 import { lookupPiCatalogName } from "../lib/runtime-metrics-pi-identity.ts";
 import { runtimeMetricsEnvAllows, type RuntimeMetricsPolicyDeps } from "../lib/runtime-metrics-policy.ts";
@@ -47,13 +51,14 @@ const CLOCK_TICK_MS = 1000;
 const TOOL_PREFIX = "subagent_";
 const SDD_PHASE_BY_AGENT = {
 	"sdd-apply": "apply",
+	"sdd-remediate": "remediate",
 	"sdd-verify": "verify",
 	"sdd-sync": "sync",
 	"sdd-archive": "archive",
 } as const;
 
 function sddPhaseForAgent(name: string): SddChangeSelection["phase"] | undefined {
-	return SDD_PHASE_BY_AGENT[name as keyof typeof SDD_PHASE_BY_AGENT];
+	return Object.hasOwn(SDD_PHASE_BY_AGENT, name) ? SDD_PHASE_BY_AGENT[name as keyof typeof SDD_PHASE_BY_AGENT] : undefined;
 }
 
 function parseSddChange(value: unknown, agentName: string): SddChangeSelection | undefined {
@@ -63,16 +68,172 @@ function parseSddChange(value: unknown, agentName: string): SddChangeSelection |
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("sdd_change must be an object with changeName, workspaceRoot, and phase.");
 	const selection = value as Record<string, unknown>;
 	const keys = Object.keys(selection).sort();
-	if (keys.join(",") !== "changeName,phase,workspaceRoot" ||
+	if (keys.join(",") !== (expectedPhase === "remediate" ? "changeName,failedEvidenceRevision,phase,workspaceRoot" : "changeName,phase,workspaceRoot") ||
 		typeof selection.changeName !== "string" || selection.changeName.length === 0 ||
 		typeof selection.workspaceRoot !== "string" || selection.workspaceRoot.length === 0 ||
 		selection.phase !== expectedPhase) {
 		throw new Error("sdd_change must contain only a non-empty changeName, workspaceRoot, and the agent's matching phase.");
 	}
-	return { changeName: selection.changeName, workspaceRoot: selection.workspaceRoot, phase: selection.phase };
+	if (expectedPhase === "remediate" && (typeof selection.failedEvidenceRevision !== "string" || !/^sha256:[0-9a-f]{64}$/.test(selection.failedEvidenceRevision))) throw new Error("Invalid remediation revision");
+	return { changeName: selection.changeName, workspaceRoot: selection.workspaceRoot, phase: selection.phase, ...(expectedPhase === "remediate" ? { failedEvidenceRevision: selection.failedEvidenceRevision as string } : {}) };
+}
+
+const REMEDIATION_SCHEMA = {
+	type: "object", additionalProperties: false, required: ["plan", "attempt"],
+	properties: {
+		plan: { type: "object", additionalProperties: false, required: ["cwd", "commands", "runtimeHarness", "rollback"], properties: {
+			editPaths: { type: "array", maxItems: 32, items: { type: "string" }, description: "Exact canonical files requested for this launch; no entry means no edit/write authority." }, cwd: { type: "string" }, commands: { type: "array", minItems: 1, maxItems: 16, items: { type: "string" } },
+			runtimeHarness: { type: "object", additionalProperties: false, description: "Exactly one concrete command or prior concrete naReason containing because.", properties: { command: { type: "string" }, naReason: { type: "string" } } },
+			rollback: { type: "object", additionalProperties: false, required: ["boundary", "command"], properties: { boundary: { type: "string" }, command: { type: "string" } } },
+		} },
+		attempt: { type: "object", additionalProperties: false, required: ["requestId", "workUnit", "evidenceGoal"], properties: {
+			requestId: { type: "string" }, workUnit: { type: "string" }, evidenceGoal: { type: "string" }, token: { type: "string" }, expectedRevision: { type: "string" },
+			maxAttempts: { type: "integer", minimum: 1, maximum: 100 }, maxChangedLines: { type: "integer", minimum: 1, maximum: 1000000 },
+			untrackedScope: { type: "string", enum: ["select", "exclude"] }, expectedUntrackedInventory: { type: "string" }, intendedUntracked: { type: "array", items: { type: "string" } },
+		} },
+	},
+};
+
+export async function confirmRemediationScope(plan: RemediationPlan, action: Record<string, unknown>, context?: Pick<ExtensionContext, "hasUI" | "ui">): Promise<RemediationScope> {
+	const cwd = plan.cwd, roots = action.allowedEditRoots;
+	if (realpathSync(cwd) !== cwd || action.workspaceRoot !== cwd || !Array.isArray(roots) || !roots.every(root => typeof root === "string" && isAbsolute(root) && canonicalArtifactPath(root) === root)) throw new Error("Remediation native scope mismatch");
+	const inside = (path: string, root: string) => path === root || path.startsWith(`${root}${sep}`);
+	const editPaths = plan.editPaths ?? [];
+	if (!Array.isArray(editPaths) || editPaths.length > 32 || new Set(editPaths).size !== editPaths.length) throw new Error("Ambiguous remediation paths");
+	for (const path of editPaths) {
+		if (typeof path !== "string" || !isAbsolute(path) || resolve(path) !== path || /[*?\[\]{}]/.test(path) || canonicalArtifactPath(path) !== path || !inside(path, cwd) || !roots.some(root => inside(path, root))) throw new Error("Remediation path outside canonical native scope");
+		if (existsSync(path) && !lstatSync(path).isFile()) throw new Error("Remediation requires exact file paths, not directories");
+	}
+	const scope: RemediationScope = { cwd, editPaths: [...editPaths], commands: plannedCommands(plan), allowedEditRoots: [...roots] };
+	if (!context?.hasUI || !context.ui?.confirm || await context.ui.confirm("Authorize one remediation launch", `Canonical worktree: ${cwd}\nNative allowed roots: ${JSON.stringify(roots)}\nExact edit/write files: ${JSON.stringify(editPaths)}\nExact invocations (not a shell sandbox):\n${scope.commands.map((command, slot) => `${slot}: cwd=${JSON.stringify(cwd)} command=${JSON.stringify(command)}`).join("\n")}`) !== true) throw new Error("Remediation requires fresh human authorization; no actor started");
+	if (realpathSync(cwd) !== cwd || editPaths.some(path => canonicalArtifactPath(path) !== path)) throw new Error("Remediation scope changed during authorization");
+	return scope;
+}
+export function remediationToolAllowed(scope: RemediationScope | undefined, cwd: string, tool: string, input: Record<string, unknown>): boolean {
+	try {
+		if (!scope || scope.cwd !== cwd || canonicalArtifactPath(cwd) !== cwd) return false;
+		if (tool === "bash") return typeof input.command === "string" && scope.commands.includes(input.command);
+		if (["edit", "write"].includes(tool)) {
+			if (typeof input.path !== "string") return false;
+			const path = resolve(cwd, input.path);
+			return scope.editPaths.includes(path) && canonicalArtifactPath(path) === path && scope.allowedEditRoots.some(root => path === root || path.startsWith(`${root}${sep}`));
+		}
+		if (["read", "grep", "find"].includes(tool)) {
+			if (input.path === undefined) return true;
+			if (typeof input.path !== "string" || !input.path || isAbsolute(input.path)) return false;
+			const path = resolve(cwd, input.path);
+			return canonicalArtifactPath(path) === path && (path === cwd || path.startsWith(`${cwd}${sep}`));
+		}
+		return tool === "subagent_parent_message";
+	} catch { return false; }
+}
+
+export async function admitManagedRemediation(request: TaskRequest, input: unknown, native: NativeReviewCli, persist: (task: TaskRecord) => Promise<void>, context?: Pick<ExtensionContext, "hasUI" | "ui">, preparedTask?: TaskRecord): Promise<Partial<TaskRequest>> {
+	const selected = request.sddChange;
+	const asset = fileURLToPath(new URL("../assets/agents/sdd-remediate.md", import.meta.url));
+	if (request.agent.name !== "sdd-remediate" || selected?.phase !== "remediate" || selected.workspaceRoot !== request.cwd || !native.sddStatus || !native.sddAttemptAcquire || !native.sddAttemptSettle || getPackageAssetOwner("agents/sdd-remediate.md") !== "sdd" || !existsSync(request.agent.filePath) ) throw new Error("Unsupported managed remediation owner/asset or native capability; install matching package assets before retrying");
+	const owned = parseAgentDefinition(readFileSync(asset, "utf8"), asset, "global");
+	const installed = parseAgentDefinition(readFileSync(request.agent.filePath, "utf8"), request.agent.filePath, request.agent.scope);
+	if (!("instructions" in owned) || !("instructions" in installed) || [request.agent, installed].some(agent => agent.instructions !== owned.instructions || JSON.stringify(agent.tools) !== JSON.stringify(owned.tools))) throw new Error("Unsupported remediation actor content; install matching managed assets");
+	const value = input as { plan?: unknown; attempt?: NativeSddAcquireRequest };
+	const plan = parseRemediationPlan(value?.plan, request.cwd);
+	const status = decodeNativeSddStatusV2(await native.sddStatus({ workspaceRoot: request.cwd, changeName: selected.changeName }), selected);
+	if (status.nextRecommended !== "remediate" || !status.phaseInstructions?.remediate || status.remediationState?.failedEvidenceRevision !== selected.failedEvidenceRevision) throw new Error("Stale remediation selection; refresh native status");
+	if (!value?.attempt || value.attempt.remediatesEvidenceRevision !== undefined && value.attempt.remediatesEvidenceRevision !== selected.failedEvidenceRevision) throw new Error("Invalid remediation attempt intent");
+	const acquire: NativeSddAcquireRequest = { ...structuredClone(value.attempt), workspaceRoot: request.cwd, changeName: selected.changeName, remediatesEvidenceRevision: selected.failedEvidenceRevision };
+	const scope = await confirmRemediationScope(plan, status.actionContext, context);
+	if (!preparedTask || preparedTask.cwd !== request.cwd || preparedTask.agent !== request.agent.name) throw new Error("Durable prepared remediation task required before acquire");
+	preparedTask.sddRemediation = { scope, failedEvidenceRevision: selected.failedEvidenceRevision!, plan, observations: [], pending: {}, invalid: false, acquire: structuredClone(acquire) };
+	await persist(preparedTask);
+	let admitted;
+	try { admitted = await native.sddAttemptAcquire(structuredClone(acquire)); }
+	catch (error) {
+		if (error instanceof TypeError || error instanceof NativeReviewCliError && error.mutationOutcome === "none") {
+			preparedTask.sddRemediation.acquireResult = { state: "blocked" };
+			await persist(preparedTask);
+			throw error;
+		}
+		try { admitted = await native.sddAttemptAcquire(structuredClone(acquire)); }
+		catch { preparedTask.sddRemediation.acquireUncertain = true; await persist(preparedTask); throw new Error("Unknown acquire outcome; reconcile the exact retained request, never rerun an actor"); }
+	}
+	preparedTask.sddRemediation.acquireResult = structuredClone(admitted);
+	if (admitted.state === "proceed" && admitted.token) preparedTask.sddRemediation.token = admitted.token;
+	await persist(preparedTask); // Token durability precedes any actor dispatch.
+	if (admitted.state !== "proceed" || !admitted.token) throw new Error(`Managed remediation admission ${admitted.state}; no actor started`);
+	let finalizationStarted = false;
+	return {
+		sddRemediation: preparedTask.sddRemediation,
+		finalizeRemediation: async (task: TaskRecord, facts: RemediationTerminalFacts) => {
+			if (finalizationStarted) return;
+			finalizationStarted = true;
+			const state = task.sddRemediation!;
+			const evidence = state.failedEvidenceRevision === acquire.remediatesEvidenceRevision && task.status === TASK_STATUS.COMPLETED && facts.exited && facts.cleanupConfirmed ? remediationEvidence(state) : undefined;
+			const interrupted = !facts.spawned || !facts.exited || !facts.cleanupConfirmed || task.status === TASK_STATUS.CANCELLED || task.status === TASK_STATUS.TIMED_OUT;
+			const payload: NativeSddSettleRequest = {
+				workspaceRoot: acquire.workspaceRoot, changeName: acquire.changeName, token: state.token!, requestId: randomUUID(),
+				outcome: interrupted ? "interrupted" : evidence ? "passed" : "failed",
+				diagnosis: interrupted ? "Managed remediation interrupted; retain observed uncertainty" : evidence ? "All planned remediation commands observed exit zero; independent verification remains required" : "Managed remediation failed or planned command evidence is incomplete",
+				harnessDisposition: facts.cleanupConfirmed ? "reused" : "invalidated",
+				cleanupEvidence: facts.cleanupConfirmed ? "Runner confirmed process cleanup" : "Runner could not confirm process cleanup; effects remain unknown",
+				processEvidence: `spawned=${facts.spawned}; exited=${facts.exited}; task=${task.status}; observations=${state.observations.length}`,
+				remediatesEvidenceRevision: acquire.remediatesEvidenceRevision,
+				...(acquire.untrackedScope === undefined ? {} : { untrackedScope: acquire.untrackedScope, expectedUntrackedInventory: acquire.expectedUntrackedInventory, intendedUntracked: acquire.intendedUntracked }),
+				...(interrupted ? {} : evidence ? { remediationEvidence: JSON.stringify(evidence) } : { evidenceRevision: `sha256:${createHash("sha256").update(JSON.stringify({ facts, observations: state.observations, invalid: state.invalid, pending: state.pending })).digest("hex")}` }),
+			};
+			const actorStatus = task.status;
+			if (actorStatus === TASK_STATUS.COMPLETED) task.status = payload.outcome === "passed" ? TASK_STATUS.WAITING : TASK_STATUS.FAILED;
+			state.settle = structuredClone(payload);
+			await persist(task); // Exact native replay inputs must be durable BEFORE mutation.
+			try { state.settlement = await native.sddAttemptSettle!(structuredClone(payload)); }
+			catch (error) {
+				if (!(error instanceof TypeError) && !(error instanceof NativeReviewCliError && error.mutationOutcome === "none")) {
+					try { state.settlement = await native.sddAttemptSettle!(structuredClone(payload)); }
+					catch { state.settlementUncertain = true; }
+				} else state.settlementUncertain = true;
+			}
+			if (payload.outcome === "failed" && actorStatus === TASK_STATUS.COMPLETED) {
+				task.status = TASK_STATUS.FAILED;
+				task.error = "Managed remediation lacks complete passing planned-command evidence";
+			}
+			if (payload.outcome === "passed" && state.settlement && state.settlement.state !== "blocked") task.status = TASK_STATUS.COMPLETED;
+			if (!state.settlement || state.settlement.state === "blocked") {
+				task.status = TASK_STATUS.FAILED;
+				task.error = "Native remediation settlement unresolved; retain exact history for reconciliation";
+			}
+			await persist(task);
+		},
+	};
+}
+
+// Installed only for the admitted remediation child. Stock shell execution,
+// cancellation, truncation and rendering remain owned by the SDK definition.
+export function remediationBash(cwd: string, operations: BashOperations = createLocalBashOperations(), scope?: RemediationScope) {
+	const captured = new Map<string, { toolCallId: string; command: string; cwd: string; exitCode: number | null }>();
+	const remaining = [...(scope?.commands ?? [])], used = new Set<string>();
+	const stock = createBashToolDefinition(cwd);
+	return {
+		definition: { ...stock, async execute(...input: Parameters<typeof stock.execute>) {
+			const [id, args, signal, onUpdate, ctx] = input;
+			const slot = remaining.indexOf(args.command);
+			if (!remediationToolAllowed(scope, ctx?.cwd ?? cwd, "bash", args) || slot < 0 || used.has(id)) throw new Error("Bash invocation is outside this launch human authorization");
+			remaining.splice(slot, 1); used.add(id);
+			const definition = createBashToolDefinition(cwd, { operations: { exec: async (command, directory, options) => {
+				const result = await operations.exec(command, directory, options);
+				if (captured.size < 32) captured.set(id, { toolCallId: id, command, cwd: directory, exitCode: result.exitCode });
+				return result;
+			} } });
+			return definition.execute(id, args, signal, onUpdate, ctx);
+		} },
+		result(event: { toolCallId: string; details?: unknown }) {
+			const observation = captured.get(event.toolCallId);
+			captured.delete(event.toolCallId);
+			return observation ? { details: { ...(event.details as object ?? {}), remediationCommand: observation } } : undefined;
+		},
+	};
 }
 
 export interface AgentsDeps extends RunnerDeps {
+	nativeSdd?: NativeReviewCli;
 	home: string;
 	agentHome?: string;
 	childIpc?: IpcEndpoint;
@@ -250,6 +411,34 @@ export async function answerThroughUi(ui: ExtensionContext["ui"] | undefined, as
 	}
 }
 
+interface ResearchArtifactCallObservation {
+	index: number;
+	desired?: ResearchWriteIdentity;
+}
+const RESEARCH_ARTIFACT_SCHEMA = {
+	type: "object", description: "Untrusted exact artifact intent, never authorization or readback. Same bounds required on continuation.",
+	required: ["store", "worktree", "changeName", "retainedIntent", "locators"],
+	properties: {
+		store: { type: "string", enum: ["openspec", "engram", "both", "none"] }, worktree: { type: "string" }, changeName: { type: "string" }, retainedIntent: { type: "string" },
+		locators: { type: "array", maxItems: 3, items: { type: "object", required: ["artifact", "revision", "digest"], properties: {
+			artifact: { type: "string", enum: ["research", "preproposal", "explore"] }, revision: { type: "integer", minimum: 1 }, digest: { type: "string", pattern: "^[a-f0-9]{64}$" }, path: { type: "string" },
+			engram: { type: "object", required: ["id", "project", "topic_key", "revision_count"], properties: { id: { type: "integer", minimum: 1 }, project: { type: "string" }, topic_key: { type: "string" }, revision_count: { type: "integer", minimum: 1 } } },
+		} } },
+	},
+};
+const RESEARCH_SELECTION_SCHEMA = {
+	type: "object",
+	additionalProperties: false,
+	description: "Untrusted narrowing intent for sdd-research; exact tools and existing sourceInfo.path per tool. Never grants permissions or installs extensions.",
+	properties: Object.fromEntries(["documentation", "open-web"].map(kind => [kind, {
+		type: "object", additionalProperties: false, required: ["tools", "extensions"],
+		properties: {
+			tools: { type: "array", items: { type: "string" } },
+			extensions: { type: "object", additionalProperties: { type: "string" } },
+		},
+	}])),
+};
+
 export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env, overrides: Partial<AgentsDeps> = {}): void {
 	if (env.GENTLE_PI_AGENTS_CHILD === "1" && env[RESEARCH_CHILD_TOOLS_ENV] !== undefined) {
 		let allowed: string[] = [];
@@ -257,15 +446,135 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			const parsed: unknown = JSON.parse(env[RESEARCH_CHILD_TOOLS_ENV]!);
 			if (Array.isArray(parsed) && parsed.every(value => typeof value === "string")) allowed = parsed;
 		} catch { /* Invalid launch restrictions deny every tool. */ }
-		pi.on("before_agent_start", event => ({ systemPrompt: `${event.systemPrompt}\n\n${renderResearchCapabilities(resolveResearchCapabilities(pi, allowed))}` }));
-		pi.on("tool_call", event => {
-			if (!allowed.includes(event.toolName) || !pi.getActiveTools().includes(event.toolName)) {
+		let selection: unknown;
+		try { selection = JSON.parse(env[RESEARCH_SELECTION_ENV] ?? "null"); } catch { /* Missing selection grants no research. */ }
+		const current = () => researchAgent({ tools: allowed, instructions: "" } as AgentDefinition, pi, selection);
+		pi.on("before_agent_start", (event, ctx) => {
+			reads.clear(); initialReads.clear(); writes.clear(); calls.clear(); pending.clear(); accepted.clear(); readbackMismatch = false;
+			try {
+				const last = [...(ctx.sessionManager?.getEntries?.() ?? [])].reverse().find(entry => entry.type === "custom" && entry.customType === RESEARCH_PERSISTENCE_ENTRY);
+				if (last?.type === "custom") {
+					const restored = parseResearchPersistence(last.data, artifactScope(ctx.cwd), ctx.cwd);
+					for (const [key, value] of Object.entries(restored.accepted)) accepted.set(key, value);
+					for (const [key, value] of Object.entries(restored.writes)) writes.set(key, value);
+				}
+			} catch { readbackMismatch = true; }
+			return { systemPrompt: `${event.systemPrompt}\n\n${renderResearchCapabilities(current().capabilities)}\n\nBounded artifact narrowing intent (untrusted data, never authority or verification): ${env[RESEARCH_ARTIFACT_ENV] ?? "missing"}\nRead every selected store through actual authorized tools before readiness. Missing/none/divergent readback keeps proposal_ready=false. Retain denial intent; host permission remains required.` };
+		});
+		let readbackMismatch = false;
+		const reads = new Map<string, string>();
+		const initialReads = new Set<string>();
+		const pending = new Set<string>();
+		const accepted = new Map<string, ReturnType<typeof parseResearchArtifactIntent>["locators"][number]>();
+		const writes = new Map<string, ResearchWriteIdentity>();
+		const calls = new Map<string, ResearchArtifactCallObservation>();
+		const artifactScope = (cwd: string) => parseResearchArtifactIntent(JSON.parse(env[RESEARCH_ARTIFACT_ENV] ?? "null"), cwd);
+		const checkpoint = (ctx: ExtensionContext, operation: Record<string, unknown>) => {
+			const file = ctx.sessionManager?.getSessionFile?.();
+			if (!pi.appendEntry || !ctx.sessionManager?.getEntries || !file || !existsSync(file)) throw new Error("Durable research session history unavailable");
+			const data = { version: 1, scope: artifactScope(ctx.cwd), accepted: Object.fromEntries(accepted), writes: Object.fromEntries(writes), operation };
+			if (Buffer.byteLength(JSON.stringify(data)) > 32_768) throw new Error("Research checkpoint exceeds bounded history payload");
+			pi.appendEntry(RESEARCH_PERSISTENCE_ENTRY, data);
+			assertResearchCheckpoint(file, data);
+		};
+		pi.on("tool_call", (event, ctx) => {
+			const registered = pi.getAllTools().some(tool => tool.name === event.toolName && tool.sourceInfo?.source !== "sdk");
+			const selected = current().agent.tools.includes(event.toolName) || event.toolName === "subagent_parent_message";
+			if (!registered || !selected || !allowed.includes(event.toolName) || !pi.getActiveTools().includes(event.toolName)) {
 				return { block: true, reason: "Tool is outside the research child's active launch allowlist." };
 			}
+			if (event.toolName === "subagent_parent_message" || ["fetch_content", "web_search", "source_check", "get_search_content"].includes(event.toolName)) return;
+			try {
+				const scope = artifactScope(ctx.cwd);
+				const index = researchArtifactCall(scope, ctx.cwd, event.toolName, event.input);
+				let desired: ResearchWriteIdentity | undefined;
+				if (["write", "edit", "mem_save"].includes(event.toolName)) {
+					if (readbackMismatch || pending.size) throw new Error("Stale/divergent state requires explicit identical-scope re-entry.");
+					const tools = scope.store === "both" ? ["read", "mem_get_observation"] : [scope.store === "openspec" ? "read" : "mem_get_observation"];
+					if (!scope.locators.every((_, i) => tools.every(tool => initialReads.has(`${i}:${tool}`)))) throw new Error("Every selected artifact requires matching initial readback before mutation.");
+					reads.clear();
+					if (event.toolName === "edit" || typeof event.input.content !== "string") throw new Error("Use a full bounded write/save for post-write readback.");
+					const key = `${index}:${event.toolName === "write" ? "read" : "mem_get_observation"}`;
+					if (!initialReads.has(key) || writes.has(key)) throw new Error("Fresh matching readback required before mutation.");
+					const revision: unknown = JSON.parse(event.input.content).revision;
+					if (!Number.isSafeInteger(revision) || Number(revision) <= (accepted.get(key) ?? scope.locators[index]).revision) throw new Error("Full write requires a newer positive revision.");
+					desired = { revision: Number(revision), digest: createHash("sha256").update(event.input.content).digest("hex") };
+					if (scope.store === "both") {
+						const peerKey = `${index}:${event.toolName === "write" ? "mem_get_observation" : "read"}`;
+						const peer = writes.get(peerKey) ?? accepted.get(peerKey);
+						if (peer && peer.revision > (accepted.get(key) ?? scope.locators[index]).revision && (peer.revision !== desired.revision || peer.digest !== desired.digest)) throw new Error("Hybrid desired identity divergence refused before mutation");
+					}
+					calls.clear(); pending.add(event.toolCallId); writes.set(key, desired);
+					checkpoint(ctx, { toolCallId: event.toolCallId, tool: event.toolName, index, desired });
+				}
+				calls.set(event.toolCallId, { index, desired });
+			} catch (error) { return { block: true, reason: `Research scope refused: ${String(error)}. Retain intent and uncertainty; no replacement store.` }; }
+		});
+		pi.on("tool_result", (event, ctx) => {
+			const call = calls.get(event.toolCallId);
+			calls.delete(event.toolCallId);
+			if (!call) return;
+			const { index, desired } = call;
+			if (desired) {
+				let valid = false;
+				try {
+					valid = event.isError === false && Array.isArray(event.content) && event.content.length > 0 && Array.from(event.content).every(part => part !== null && typeof part === "object" && part.type === "text" && typeof part.text === "string" && part.text.trim().length > 0);
+				} catch { /* Malformed mutation results cannot authorize completion. */ }
+				if (!valid) readbackMismatch = true;
+				try { checkpoint(ctx, { toolCallId: event.toolCallId, tool: event.toolName, index, valid, isError: event.isError, resultDigest: createHash("sha256").update(JSON.stringify(event.content) ?? "undefined").digest("hex") }); }
+				catch { readbackMismatch = true; }
+				pending.delete(event.toolCallId); reads.clear();
+				return;
+			}
+			if (!["read", "mem_get_observation"].includes(event.toolName)) return;
+			if (pending.size) return { content: [...event.content, { type: "text" as const, text: "Research readback incomplete: proposal_ready=false; mutation pending." }] };
+			let matched = false, complete = false;
+			try {
+				const scope = artifactScope(ctx.cwd);
+				researchArtifactCall(scope, ctx.cwd, event.toolName, event.input);
+				const bytes = event.content.map(part => part.type === "text" ? part.text : "").join("");
+				const returned = event.toolName === "read" ? bytes : JSON.parse(bytes);
+				const key = `${index}:${event.toolName}`, written = writes.get(key);
+				const expected = { ...(accepted.get(key) ?? scope.locators[index]), ...written };
+				matched = !event.isError && researchArtifactReadback(expected, event.toolName, returned, written !== undefined);
+				if (matched) {
+					reads.set(key, expected.digest);
+					initialReads.add(key);
+					accepted.set(key, event.toolName === "read" ? expected : { ...expected, engram: { ...expected.engram!, revision_count: returned.revision_count } });
+					writes.delete(key);
+					checkpoint(ctx, { toolCallId: event.toolCallId, tool: event.toolName, index, matched: true });
+				}
+				const tools = scope.store === "both" ? ["read", "mem_get_observation"] : [scope.store === "openspec" ? "read" : "mem_get_observation"];
+				const divergent = scope.locators.some((_, i) => tools.every(tool => reads.has(`${i}:${tool}`)) && new Set(tools.map(tool => reads.get(`${i}:${tool}`))).size !== 1);
+				if (divergent) matched = false;
+				complete = matched && !readbackMismatch && scope.store !== "none" && scope.locators.every((_, i) => tools.every(tool => reads.has(`${i}:${tool}`)));
+			} catch { matched = false; /* Unsupported or undurable readback is not evidence. */ }
+			if (!matched) { reads.clear(); readbackMismatch = true; }
+			const note = !matched ? "Research readback mismatch: proposal_ready=false; retain intent and uncertainty." : complete ? "Readback identity matched in all selected stores; not evidence validation or proposal admission." : "Research readback incomplete: proposal_ready=false; read every selected store.";
+			return { content: [...event.content, { type: "text" as const, text: note }], isError: event.isError || !matched };
 		});
 	}
 	const childIpc = ownedChildIpc(env, overrides.childIpc ?? (process.send ? process as unknown as IpcEndpoint : undefined));
 	if (env.GENTLE_PI_AGENTS_CHILD === "1") {
+		if (env[REMEDIATION_PLAN_ENV] !== undefined) {
+			let granted: RemediationScope | undefined;
+			pi.on("tool_call", (event, current) => remediationToolAllowed(granted, current.cwd, event.toolName, event.input) ? undefined : { block: true, reason: "Outside exact remediation human authorization" });
+			pi.on("session_start", (_event, ctx) => {
+				granted = undefined;
+				try {
+					const retained = JSON.parse(env[REMEDIATION_PLAN_ENV]!);
+					// SDK flags are owner-local; the runner transports the same selected context.
+					const selection = Object.hasOwn(retained, "selection") ? retained.selection : JSON.parse(String(pi.getFlag("gentle-sdd-change")));
+					parseSddChange(selection, "sdd-remediate");
+					const plan = parseRemediationPlan(retained.plan, ctx.cwd);
+					if (selection.workspaceRoot !== ctx.cwd || JSON.stringify(plannedCommands(plan)) !== JSON.stringify(retained.scope?.commands) || JSON.stringify(plan.editPaths ?? []) !== JSON.stringify(retained.scope?.editPaths)) throw new Error("Remediation grant/plan mismatch");
+					const shell = remediationBash(ctx.cwd, undefined, retained.scope);
+					pi.registerTool(shell.definition);
+					pi.on("tool_result", event => event.toolName === "bash" ? shell.result(event) : undefined);
+					granted = retained.scope;
+				} catch { /* No valid host grant: deny every tool, even if Pi continues initialization. */ }
+			});
+		}
 		if (childIpc) registerChildMessaging(pi, childIpc);
 		return;
 	}
@@ -711,7 +1020,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 
 	const roots = (ctx: ExtensionContext) => ({ cwd: ctx.sessionManager.getCwd(), home: deps.home, agentHome });
 
-	const buildRequest = (ctx: ExtensionContext, agent: AgentDefinition, prompt: string, label: string | undefined, context: string | undefined, mode: AgentMode, resume?: string, workspaceRoot?: string, sddChange?: SddChangeSelection): TaskRequest => {
+	const buildRequest = (ctx: ExtensionContext, agent: AgentDefinition, prompt: string, label: string | undefined, context: string | undefined, mode: AgentMode, resume?: string, workspaceRoot?: string, sddChange?: SddChangeSelection, researchSelection?: unknown, researchArtifact?: unknown, remediationIntent?: unknown): TaskRequest => {
 		const registry = registryFor(ctx);
 		const parentCwd = ctx.sessionManager.getCwd();
 		// An explicit target is validated before any queue or session-dir writes.
@@ -728,7 +1037,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			: { ...sddChange, workspaceRoot: target };
 		const config = loadAgentsConfig(roots(ctx));
 		const profile = resolveAgentProfile(agent, config);
-		const research = agent.name === "sdd-research" ? researchAgent(agent, pi) : undefined;
+		const research = agent.name === "sdd-research" ? researchAgent(agent, pi, researchSelection) : undefined;
 		const sessionDir = agentRuntimePaths(deps.home, agentHome).sessions;
 		mkdirSync(sessionDir, { recursive: true });
 		const parentSessionManager = ctx.sessionManager as unknown as ReviewSessionManager;
@@ -737,6 +1046,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const parentRepositoryIdentity = resolveCanonicalGitRepositoryIdentitySync(parentWorktreeRoot);
 		return {
 			agent: research?.agent ?? agent,
+			remediationIntent,
 			prompt,
 			label,
 			context,
@@ -748,7 +1058,8 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			thinking: profile.thinking,
 			sessionDir,
 			resumeSessionPath: resume,
-			env: research ? { ...deps.env, [RESEARCH_CHILD_TOOLS_ENV]: JSON.stringify(research.agent.tools) } : deps.env,
+			env: research ? { ...deps.env, [RESEARCH_CHILD_TOOLS_ENV]: JSON.stringify([...research.agent.tools, "subagent_parent_message"]) } : deps.env,
+			...(research ? { researchSelection, extensionPaths: research.extensionPaths, researchArtifact: researchArtifact === undefined ? undefined : parseResearchArtifactIntent(researchArtifact, target ?? parentCwd) } : {}),
 			...(launchSddChange === undefined ? {} : { sddChange: launchSddChange }),
 			...(parentRepositoryIdentity === undefined ? {} : {
 				authorizeParentStandingReviewPermission: (repositoryIdentity: string) => {
@@ -771,6 +1082,20 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	};
 
 	const launch = async (ctx: ExtensionContext, request: TaskRequest, signal?: AbortSignal): Promise<ToolText> => {
+		let prepared: TaskRecord | undefined;
+		if (request.agent.name === "sdd-remediate") {
+			const previous = await loadHistory(tasksDir);
+			if (previous.some(({ task }) => task.cwd === request.cwd && task.sddRemediation?.acquire.changeName === request.sddChange?.changeName && remediationUnresolved(task))) throw new Error("Retained remediation operation unresolved; reconcile exact history without actor replay");
+			prepared = runner.prepareRemediation(request);
+			const persist = (task: TaskRecord) => saveTask(tasksDir, task, store.thread(task.id));
+			try {
+				const native = deps.nativeSdd ?? new NativeReviewCliV216(createNodeExecFileAdapter());
+				Object.assign(request, await admitManagedRemediation(request, request.remediationIntent, native, persist, ctx, prepared));
+				if (activeSessionId() !== request.parentSessionId) throw new Error("Parent session changed; retain admission and refuse actor replay");
+				prepared.sddRemediation!.actorClaimed = true;
+				await persist(prepared); // A crash beyond here is an unknown actor effect, not rerun permission.
+			} catch (error) { store.update(prepared.id, { status: TASK_STATUS.FAILED, error: "Remediation admission/dispatch refused; reconcile retained history" }); throw error; }
+		}
 		// Bounded live observation only. Native send owns the fresh policy decision;
 		// child execution never starts a telemetry policy process or renewal timer.
 		const owner = metricsOwner;
@@ -789,7 +1114,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				metrics.started = metricsNow();
 				return metrics.valid();
 			} } : {}),
-		});
+		}, prepared);
 		if (observe) metricTasks.set(task.id, metrics);
 		ownedTaskIds.add(task.id);
 		store.subscribe(task.id, () => { publishActivity(); requestRender(); });
@@ -861,7 +1186,8 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				label: { type: "string", description: "Three to six words naming the work, shown on the agents card, e.g. 'map footer data sources'." },
 				context: { type: "string", description: "Optional extra context appended to the task." },
 				workspace_root: { type: "string", description: "Optional worktree in the same Git clone. Validated before queueing; the child runs at its canonical root and registers it on actual launch." },
-				sdd_change: { type: "object", additionalProperties: false, required: ["changeName", "workspaceRoot", "phase"], properties: { changeName: { type: "string" }, workspaceRoot: { type: "string" }, phase: { type: "string", enum: ["apply", "verify", "sync", "archive"] } }, description: "Launch-local selected SDD identity, accepted only by matching SDD phase agents." },
+				research_artifact: RESEARCH_ARTIFACT_SCHEMA, research_selection: RESEARCH_SELECTION_SCHEMA,
+				remediation: REMEDIATION_SCHEMA, sdd_change: { type: "object", additionalProperties: false, required: ["changeName", "workspaceRoot", "phase"], properties: { changeName: { type: "string" }, workspaceRoot: { type: "string" }, failedEvidenceRevision: { type: "string" }, phase: { type: "string", enum: ["apply", "verify", "sync", "archive", "remediate"] } }, description: "Launch-local selected SDD identity, accepted only by matching SDD phase agents." },
 				mode: { type: "string", enum: ["task", "background"], description: "task waits for the result (default); background returns immediately." },
 			},
 		},
@@ -873,7 +1199,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			let sddChange: SddChangeSelection | undefined;
 			try { sddChange = parseSddChange(params.sdd_change, agent.name); }
 			catch (error) { return text(`Error: ${error instanceof Error ? error.message : String(error)}`, { error: "invalid sdd_change" }); }
-			return launch(ctx, buildRequest(ctx, agent, String(params.task ?? ""), typeof params.label === "string" ? params.label : undefined, typeof params.context === "string" ? params.context : undefined, mode, undefined, typeof params.workspace_root === "string" ? params.workspace_root : undefined, sddChange), signal);
+			return launch(ctx, buildRequest(ctx, agent, String(params.task ?? ""), typeof params.label === "string" ? params.label : undefined, typeof params.context === "string" ? params.context : undefined, mode, undefined, typeof params.workspace_root === "string" ? params.workspace_root : undefined, sddChange, params.research_selection, params.research_artifact, params.remediation), signal);
 		},
 	);
 
@@ -914,7 +1240,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	tool(
 		"continue",
 		"Resume a finished subagent task in its own session with a follow-up prompt.",
-		{ required: ["task_id", "prompt"], properties: { task_id: { type: "string" }, prompt: { type: "string" }, label: { type: "string", description: "Three to six words naming the follow-up." }, sdd_change: { type: "object", additionalProperties: false, required: ["changeName", "workspaceRoot", "phase"], properties: { changeName: { type: "string" }, workspaceRoot: { type: "string" }, phase: { type: "string", enum: ["apply", "verify", "sync", "archive"] } }, description: "Fresh launch-local selected SDD identity, required when continuing an SDD phase agent." }, mode: { type: "string", enum: ["task", "background"] } } },
+		{ required: ["task_id", "prompt"], properties: { research_artifact: RESEARCH_ARTIFACT_SCHEMA, research_selection: RESEARCH_SELECTION_SCHEMA, task_id: { type: "string" }, prompt: { type: "string" }, label: { type: "string", description: "Three to six words naming the follow-up." }, remediation: REMEDIATION_SCHEMA, sdd_change: { type: "object", additionalProperties: false, required: ["changeName", "workspaceRoot", "phase"], properties: { changeName: { type: "string" }, workspaceRoot: { type: "string" }, failedEvidenceRevision: { type: "string" }, phase: { type: "string", enum: ["apply", "verify", "sync", "archive", "remediate"] } }, description: "Fresh launch-local selected SDD identity, required when continuing an SDD phase agent." }, mode: { type: "string", enum: ["task", "background"] } } },
 		async (params, ctx, signal) => {
 			const previous = await resolveTask(String(params.task_id));
 			if (!previous) return text(`Error: no task ${String(params.task_id)}`, { error: "unknown task" });
@@ -929,7 +1255,14 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			try { sddChange = parseSddChange(params.sdd_change, agent.name); }
 			catch (error) { return text(`Error: ${error instanceof Error ? error.message : String(error)}`, { error: "invalid sdd_change" }); }
 			if (sddPhaseForAgent(agent.name) && !sddChange) return text("Error: continuing an SDD phase agent requires a fresh sdd_change selection.", { error: "missing sdd_change" });
-			return launch(ctx, buildRequest(ctx, agent, String(params.prompt ?? ""), typeof params.label === "string" ? params.label : undefined, undefined, mode, previous.sessionPath, sddChange?.workspaceRoot ?? previous.cwd, sddChange), signal);
+			let artifact: ResearchArtifactIntent | undefined;
+			if (agent.name === "sdd-research") {
+				try {
+					const prior = parseResearchArtifactIntent("researchArtifact" in previous ? previous.researchArtifact : undefined, previous.cwd);
+					artifact = parseResearchArtifactIntent(params.research_artifact ?? prior, previous.cwd, prior);
+				} catch (error) { return text(`Error: research continuation scope refused: ${String(error)}`, { error: "research scope" }); }
+			}
+			return launch(ctx, buildRequest(ctx, agent, String(params.prompt ?? ""), typeof params.label === "string" ? params.label : undefined, undefined, mode, previous.sessionPath, sddChange?.workspaceRoot ?? previous.cwd, sddChange, params.research_selection, artifact, params.remediation), signal);
 		},
 	);
 

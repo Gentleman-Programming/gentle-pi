@@ -92,7 +92,7 @@ test("SDD executor coverage is exhaustive against actual agent files", () => {
 	// the allowlist matches reality so coverage cannot silently drift.
 	const expected = [
 		"sdd-apply.md", "sdd-archive.md", "sdd-design.md", "sdd-explore.md",
-		"sdd-init.md", "sdd-onboard.md", "sdd-proposal.md", "sdd-research.md",
+		"sdd-init.md", "sdd-onboard.md", "sdd-proposal.md", "sdd-remediate.md", "sdd-research.md",
 		"sdd-spec.md", "sdd-status.md", "sdd-sync.md", "sdd-tasks.md",
 		"sdd-verify.md",
 	];

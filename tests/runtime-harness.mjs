@@ -492,11 +492,19 @@ async function run() {
 		assert.match(applyPromptResult.systemPrompt, /### apply instructions/);
 		const statusCtx = createCtx(promptCwd, true);
 		await commands.get("gentle-sdd-status").handler("status-demo --json", statusCtx);
-		assert.match(statusCtx.ui.notifications.at(-1).message, /"schemaName": "gentle-pi\.sdd-status"/);
+		assert.match(statusCtx.ui.notifications.at(-1).message, /"schemaName": "gentle-ai\.sdd-status"/);
 		const continueCtx = createCtx(promptCwd, true);
+		let markerConfirmations = 0;
+		continueCtx.ui.confirm = async (_title, message) => {
+			assert.ok(message.includes(join(promptCwd, "openspec/changes/status-demo/.gentle-ai-instance")));
+			assert.match(message, /no source roots and no persistent authority/);
+			markerConfirmations += 1;
+			return true;
+		};
 		await commands.get("gentle-sdd-continue").handler("status-demo", continueCtx);
-		assert.match(continueCtx.ui.notifications.at(-1).message, /Native SDD Dispatcher/);
-		assert.match(continueCtx.ui.notifications.at(-1).message, /nextPhase: sdd-apply/);
+		assert.equal(markerConfirmations, 1);
+		assert.match(continueCtx.ui.notifications.at(-1).message, /Native SDD Status Engine/);
+		assert.match(continueCtx.ui.notifications.at(-1).message, /"nextRecommended": "apply"/);
 		const { execFileSync } = await import("node:child_process");
 		execFileSync("git", ["init"], { cwd: promptCwd, stdio: "ignore" });
 		const recoveryRequiredDirectory = join(promptCwd, ".git", "gentle-ai", "reviews", "control", "recovery-required-v1");
@@ -508,7 +516,7 @@ async function run() {
 		const blockedContinueCtx = createCtx(promptCwd, true);
 		await commands.get("gentle-sdd-continue").handler("status-demo", blockedContinueCtx);
 		assert.doesNotMatch(blockedContinueCtx.ui.notifications.at(-1).message, /resolve-review:/);
-		assert.match(blockedContinueCtx.ui.notifications.at(-1).message, /nextPhase: sdd-apply/);
+		assert.match(blockedContinueCtx.ui.notifications.at(-1).message, /"nextRecommended": "apply"/);
 	} finally {
 		await rm(promptCwd, { recursive: true, force: true });
 	}

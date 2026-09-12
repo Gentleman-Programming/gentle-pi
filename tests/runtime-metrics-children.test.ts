@@ -38,6 +38,12 @@ test("installed package definitions retain classification after the actual routi
 		const className = file === "sdd-proposal" ? "sdd-propose"
 			: file.startsWith("gentle-ai-") ? file.slice("gentle-ai-".length) : file;
 		const kind = parseAgentClass(className);
+		if (file === "sdd-remediate") {
+			assert.equal(kind, undefined, "remediation stays dark in the existing telemetry taxonomy");
+			const definition = parseAgentDefinition(readFileSync(new URL(`../assets/agents/${file}.md`, import.meta.url), "utf8"), file, "global");
+			assert.equal(classifyBuiltinAgent(definition), "unknown");
+			continue;
+		}
 		assert.ok(kind, `${file}: telemetry class`);
 		const asset = new URL(`../assets/agents/${file}.md`, import.meta.url);
 		const content = readFileSync(asset, "utf8");

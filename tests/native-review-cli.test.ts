@@ -991,3 +991,59 @@ test("acknowledge-approved keeps its fail-closed stderr and typed refusal discip
 		(error: unknown) => error instanceof NativeReviewCliError && error.code === NATIVE_REVIEW_ERROR_CODE.EMPTY_OUTPUT,
 	);
 });
+
+test("native continuation uses a distinct mutating operation and the same v2 decoder", async () => {
+	const queue = queuedAdapter([{ stdout: JSON.stringify(nativeSddStatus()) }, { stdout: "{}" }]);
+	const cli = client(queue.adapter);
+	const request = { changeName: "complete-native-review-lifecycle", workspaceRoot: "/repo" };
+	assert.equal((await cli.sddContinue(request)).nextRecommended, nativeSddStatus().nextRecommended);
+	assert.deepEqual(queue.calls[0]!.arguments, ["sdd-continue", request.changeName, "--cwd", "/repo", "--json", "--instructions"]);
+	assert.equal(queue.calls[0]!.timeoutMs, undefined);
+	await assert.rejects(() => cli.sddContinue(request), (error: unknown) => error instanceof NativeReviewCliError && error.mutating === true);
+});
+
+test("native discovery preserves nullable selection and rejects an invented selected identity", () => {
+	const discovery = { ...nativeSddStatus(), changeName: null, changeRoot: null, nextRecommended: "select-change" };
+	assert.equal(decodeNativeSddStatusV2(discovery, { workspaceRoot: "/repo" }).changeName, null);
+	assert.throws(() => decodeNativeSddStatusV2(discovery, { changeName: "alpha", workspaceRoot: "/repo" }), /identity/);
+});
+
+test("all twelve native actions retain their exact tokens without prose routing", () => {
+	for (const nextRecommended of ["apply", "verify", "remediate", "archive", "archived", "resolve-blockers", "sdd-new", "select-change", "propose", "spec", "design", "tasks"]) {
+		const status = { ...nativeSddStatus(), nextRecommended, ...(nextRecommended === "remediate" ? { remediationState: { required: true, complete: false, failedEvidenceRevision: `sha256:${"a".repeat(64)}` } } : {}) };
+		assert.equal(decodeNativeSddStatusV2(status, { workspaceRoot: "/repo" }).nextRecommended, nextRecommended);
+	}
+});
+
+
+test("compact SDD bracket transports exact selection and remediation binding", async () => {
+	const revision = `sha256:${"a".repeat(64)}`;
+	const queued = queuedAdapter([{ stdout: JSON.stringify({ state: "proceed", token: revision }) }, { stdout: '{"state":"complete"}' }]);
+	const cli = client(queued.adapter);
+	const request = { workspaceRoot: "/repo", changeName: "fix", requestId: "acquire-one", workUnit: "correction", evidenceGoal: "Observed correction", maxAttempts: 1, maxChangedLines: 300, remediatesEvidenceRevision: revision };
+	assert.deepEqual(await cli.sddAttemptAcquire(request), { state: "proceed", token: revision });
+	assert.deepEqual(queued.calls[0].arguments, ["sdd-attempt", "acquire", "--cwd", "/repo", "--change", "fix", "--request-id", "acquire-one", "--work-unit", "correction", "--evidence-goal", "Observed correction", "--max-attempts", "1", "--max-changed-lines", "300", "--remediates-evidence-revision", revision]);
+	assert.deepEqual(await cli.sddAttemptSettle({ workspaceRoot: "/repo", changeName: "fix", token: revision, requestId: "settle-one", outcome: "interrupted", diagnosis: "Child could not spawn", harnessDisposition: "invalidated", cleanupEvidence: "No process created", processEvidence: "Spawn rejected", remediatesEvidenceRevision: revision }), { state: "complete" });
+	assert.equal(queued.calls[1].arguments.includes("--evidence-revision"), false);
+	assert.equal(queued.calls[1].timeoutMs, undefined);
+});
+
+test("compact SDD refuses malformed result and invalid terminal evidence before execution", async () => {
+	const queued = queuedAdapter([{ stdout: '{"state":"proceed"}' }, { stdout: '{"state":"blocked","reason":"budget"}' }]);
+	const cli = client(queued.adapter);
+	const request = { workspaceRoot: "/repo", changeName: "fix", requestId: "one", workUnit: "correction", evidenceGoal: "Observed correction" };
+	await assert.rejects(cli.sddAttemptAcquire(request), /schema incompatible/);
+	assert.deepEqual(await cli.sddAttemptAcquire(request), { state: "blocked", reason: "budget" });
+	await assert.rejects(cli.sddAttemptSettle({ ...request, token: `sha256:${"a".repeat(64)}`, outcome: "failed", diagnosis: "Test failed", harnessDisposition: "reused", cleanupEvidence: "Process exited", processEvidence: "Exit one" }), /evidence/i);
+	assert.equal(queued.calls.length, 2);
+});
+
+
+test("compact admission accepts native empty CAS and never redirects uncertainty into review", async () => {
+	const queued = queuedAdapter([{ stdout: '{"state":"blocked","reason":"budget"}' }, { stdout: "", timedOut: true }]);
+	const cli = client(queued.adapter);
+	const request = { workspaceRoot: "/repo", changeName: "fix", requestId: "one", workUnit: "fix", evidenceGoal: "Observed correction", expectedRevision: "" };
+	await cli.sddAttemptAcquire(request);
+	assert.equal(queued.calls[0].arguments[queued.calls[0].arguments.indexOf("--expected-revision") + 1], "");
+	await assert.rejects(cli.sddAttemptAcquire({ ...request, expectedRevision: undefined }), error => error instanceof NativeReviewCliError && error.mutationOutcome === "unknown" && error.nextAction === undefined);
+});

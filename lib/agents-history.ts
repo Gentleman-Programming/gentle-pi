@@ -12,6 +12,14 @@ export interface StoredTask {
 	thread: TaskThread;
 }
 
+export function remediationUnresolved(task: TaskRecord): boolean {
+	const state = task.sddRemediation;
+	if (!state) return false;
+	if (state.acquireUncertain || state.settlementUncertain) return true;
+	if (state.settlement) return state.settlement.state === "blocked";
+	return !!state.token || !!state.actorClaimed || !["blocked", "complete"].includes(state.acquireResult?.state ?? "");
+}
+
 const FILE_SUFFIX = ".json";
 const SAFE_ID = /^[a-z0-9-]+$/i;
 
@@ -74,7 +82,7 @@ export async function loadHistory(dir: string): Promise<StoredTask[]> {
 // Keep the newest `maxTasks` files; the rest go. Returns how many were removed.
 export async function pruneHistory(dir: string, maxTasks: number): Promise<number> {
 	const stored = await loadHistory(dir);
-	const extra = stored.slice(Math.max(0, maxTasks));
+	const extra = stored.filter(({ task }) => !remediationUnresolved(task)).slice(Math.max(0, maxTasks));
 	await Promise.all(extra.map((entry) => rm(fileFor(dir, entry.task.id), { force: true })));
 	return extra.length;
 }

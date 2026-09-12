@@ -44,6 +44,7 @@ const ASSET_OWNER_BY_KEY = Object.freeze({
 	"agents/sdd-onboard.md": "sdd",
 	"agents/sdd-proposal.md": "sdd",
 	"agents/sdd-research.md": "sdd",
+	"agents/sdd-remediate.md": "sdd",
 	"agents/sdd-spec.md": "sdd",
 	"agents/sdd-status.md": "sdd",
 	"agents/sdd-sync.md": "sdd",
