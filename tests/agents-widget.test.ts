@@ -59,7 +59,7 @@ test("renderAgentsCard draws columns for agent, task, and model · tokens · cos
 });
 
 test("renderAgentsCard renders singleton elapsed time only on its task row", () => {
-	const lines = renderAgentsCard([task()], plainTheme, 84, 5_000, { collapsed: false }).map(stripAnsi);
+	const lines = renderAgentsCard([task({})], plainTheme, 84, 5_000, { collapsed: false }).map(stripAnsi);
 	assert.equal(lines.join("\n").match(/4s/g)?.length, 1);
 	assert.match(lines[1], /4s/);
 });
