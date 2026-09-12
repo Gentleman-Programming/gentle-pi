@@ -273,7 +273,25 @@ On Pi, phase model routing is user-owned and persisted, not prompt-passed: `/gen
 | jd-judge-a   | deep-reasoning | Adversarial review                         |
 | jd-judge-b   | deep-reasoning | Adversarial review                         |
 | jd-fix-agent | balanced       | Surgical confirmed fixes                   |
-| default      | balanced       | SDD/JD phase fallback                      |
+| default      | balanced       | SDD phase fallback; never a Judgment Day role |
+
+## Judgment Day fix routing
+
+Judgment Day phase roles are never generic fallbacks. If the generic writer chain is unavailable, use the documented native generic fallback or stop. Judgment Day is independent: it neither enables nor replaces ordinary review; a separately requested ordinary review remains independent. A standalone Judgment Day fix requires no graph-v1 or native review lineage. Launch `jd-fix-agent` only for an explicit Judgment Day fix batch with this exact runtime-accepted Markdown shape: `## Judgment Day activation` contains only `User explicitly requested Judgment Day.`. Replace the example ID, frozen ledger hash, row data, and surface with controller-authorized values. The correction batch contains only one round (`1 of 2` or `2 of 2`) and one lowercase SHA-256. The exact frozen finding rows are one JSON object per line, use only the canonical row fields, and exactly match the authorized IDs.
+
+```markdown
+## Judgment Day activation
+User explicitly requested Judgment Day.
+## Exact authorized severe IDs
+- `JD-A-001`
+## Judgment Day correction batch
+Round: 1 of 2.
+Frozen ledger SHA-256: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`
+## Exact frozen finding rows
+{"id":"JD-A-001","lens":"judgment-day","location":"path/to/authorized-file.ts:1","severity":"CRITICAL","status_at_freeze":"open","evidence_class":"deterministic","evidence_claim":"Concrete user-impact claim supported by the frozen location."}
+## Allowed edit surfaces
+path/to/authorized-file.ts
+```
 
 ## Sub-Agent Launch Deduplication
 

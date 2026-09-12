@@ -66,11 +66,26 @@ function assertNativeJsonHasNoMetadata(path: string, value: unknown): void {
 	}
 }
 
-const JUDGMENT_DAY_PATTERNS = [
-	/Judgment Day starts only when explicitly requested and replaces ordinary review for that lineage\./,
+const JUDGMENT_DAY_DISCOVERY_PATTERNS = [
 	/Judgment Day starts with exactly two blind judges and zero refuters\./,
 	/Judgment Day alone may iterate discovery and scoped re-judgment, for at most two rounds\./,
 	/Findings surviving round two escalate; no third-round transition exists\./,
+] as const;
+
+const JUDGMENT_DAY_STANDALONE_SEMANTICS =
+	"Judgment Day is independent: it neither enables nor replaces ordinary review; a separately requested ordinary review remains independent.";
+
+const OBSOLETE_JUDGMENT_DAY_REPLACEMENT =
+	/Judgment Day starts only when explicitly requested and replaces ordinary review for that lineage\./;
+
+const JUDGMENT_DAY_SEMANTIC_SURFACES = [
+	CANONICAL,
+	JD_SKILL,
+	JD_PROMPTS,
+	...JUDGES,
+	FIX_AGENT,
+	"assets/orchestrator-delegation.md",
+	SDD_WORKFLOW,
 ] as const;
 
 const JUDGMENT_DAY_REJUDGMENT_PATTERNS = [
@@ -115,7 +130,7 @@ test("canonical contract defines compact risk, causal admission, correction, CAS
 		/reviewer and validator outputs remain semantically untrusted/i,
 		/do not report.*trusted local orchestrator.*security finding/i,
 		/untrusted repository content.*malformed inputs.*stale authority.*path drift.*external callers/i,
-		...JUDGMENT_DAY_PATTERNS,
+		...JUDGMENT_DAY_DISCOVERY_PATTERNS,
 	]);
 	assert.match(read(README), /Review outcomes and receipt state are informational; commit, push, pull-request, and release delivery follow ordinary repository policy\./);
 	assert.doesNotMatch(read(README), /one one-shot authorization for the exact command/i);
@@ -267,7 +282,7 @@ test("the Pi-owned adversarial role agents are retired: roles execute through Go
 for (const path of JUDGES) {
 	test(`${path} preserves graph-v1 Judgment Day discovery and scoped re-judgment`, () => {
 		const content = read(path);
-		assertMatches(path, content, JUDGMENT_DAY_PATTERNS);
+		assertMatches(path, content, JUDGMENT_DAY_DISCOVERY_PATTERNS);
 		assertMatches(path, content, JUDGMENT_DAY_REJUDGMENT_PATTERNS);
 	});
 }
@@ -303,11 +318,51 @@ test("Judgment Day judge prompts contain distinct graph-v1 discovery and re-judg
 	assert.doesNotMatch(judgePrompt, /End with `Skill Resolution:/);
 });
 
+test("Judgment Day canonical and packaged surfaces preserve the independent lifecycle", () => {
+	for (const path of JUDGMENT_DAY_SEMANTIC_SURFACES) {
+		const content = read(path);
+		assert.ok(content.includes(JUDGMENT_DAY_STANDALONE_SEMANTICS), `${path} must use the current standalone Judgment Day sentence`);
+		assert.doesNotMatch(content, OBSOLETE_JUDGMENT_DAY_REPLACEMENT, `${path} must reject the obsolete replacement semantics`);
+	}
+});
+
 test("Judgment Day skill and prompts preserve bounded fix and re-judgment authority", () => {
-	assertMatches(JD_SKILL, read(JD_SKILL), [...JUDGMENT_DAY_PATTERNS, ...JUDGMENT_DAY_REJUDGMENT_PATTERNS, ...FIX_PATTERNS]);
-	assertMatches(JD_PROMPTS, fencedBlock(JD_PROMPTS, "## Judge Prompt"), JUDGMENT_DAY_PATTERNS);
+	const skill = read(JD_SKILL);
+	const judgePrompt = fencedBlock(JD_PROMPTS, "## Judge Prompt");
+	assertMatches(JD_SKILL, skill, [...JUDGMENT_DAY_DISCOVERY_PATTERNS, ...JUDGMENT_DAY_REJUDGMENT_PATTERNS, ...FIX_PATTERNS]);
+	assertMatches(JD_PROMPTS, judgePrompt, JUDGMENT_DAY_DISCOVERY_PATTERNS);
 	assertMatches(JD_PROMPTS, fencedBlock(JD_PROMPTS, "## Fix Agent Prompt"), FIX_PATTERNS);
 	assertMatches(FIX_AGENT, read(FIX_AGENT), FIX_PATTERNS);
+});
+
+test("Judgment Day fix routing has one canonical shape and never falls back to generic roles", () => {
+	const canonicalShape = [
+		"## Judgment Day activation",
+		"User explicitly requested Judgment Day.",
+		"## Exact authorized severe IDs",
+		"- `JD-A-001`",
+		"## Judgment Day correction batch",
+		"Round: 1 of 2.",
+		"Frozen ledger SHA-256: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`",
+		"## Exact frozen finding rows",
+		'{"id":"JD-A-001","lens":"judgment-day","location":"path/to/authorized-file.ts:1","severity":"CRITICAL","status_at_freeze":"open","evidence_class":"deterministic","evidence_claim":"Concrete user-impact claim supported by the frozen location."}',
+		"## Allowed edit surfaces",
+	].join("\n");
+	for (const [path, content] of [
+		[CANONICAL, read(CANONICAL)],
+		[FIX_AGENT, read(FIX_AGENT)],
+		[JD_SKILL, read(JD_SKILL)],
+		[JD_PROMPTS, fencedBlock(JD_PROMPTS, "## Fix Agent Prompt")],
+		["assets/orchestrator-delegation.md", read("assets/orchestrator-delegation.md")],
+		[SDD_WORKFLOW, read(SDD_WORKFLOW)],
+	] as const) {
+		assert.ok(content.includes(canonicalShape), `${path} must carry the canonical Judgment Day fix shape`);
+		assert.match(content, /requires no graph-v1 or native review lineage/i);
+	}
+	const routing = `${read("assets/orchestrator-delegation.md")}\n${read(SDD_WORKFLOW)}`;
+	assert.match(routing, /Judgment Day phase roles are never generic fallbacks\./);
+	assert.match(routing, /If the generic writer chain is unavailable, use the documented native generic fallback or stop\./);
+	assert.match(read(SDD_WORKFLOW), /\| default\s+\| balanced\s+\| SDD phase fallback; never a Judgment Day role\s+\|/);
 });
 
 test("orchestrator, injected skill, and README defer RDD lifecycle ownership to Gentle AI", () => {
