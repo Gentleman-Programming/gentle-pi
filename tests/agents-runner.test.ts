@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AGENT_MODE, type AgentDefinition } from "../lib/agents-config.ts";
+import { AGENT_MODE, parseAgentsConfig, resolveAgentProfile, type AgentDefinition } from "../lib/agents-config.ts";
 import { TASK_STATUS, TaskStore } from "../lib/agents-protocol.ts";
 import { AgentRunner, childArguments, JsonLines, piCommand, abortReasonText, type RunnerDeps, type RunnerHooks, type TaskRequest } from "../lib/agents-runner.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
@@ -363,6 +363,21 @@ test("childArguments builds an rpc launch with model, thinking, tools, session d
 	const resumed = childArguments(request({ resumeSessionPath: "/sessions/old.jsonl", model: undefined, thinking: undefined, agent: { ...explorer, tools: [] } }));
 	assert.equal(resumed[resumed.indexOf("--session") + 1], "/sessions/old.jsonl");
 	assert.ok(!resumed.includes("--model") && !resumed.includes("--tools"));
+});
+
+test("childArguments preserves a max profile instead of the definition's medium effort", () => {
+	const agent: AgentDefinition = { ...explorer, name: "worker", thinking: "medium" };
+	const config = parseAgentsConfig({ model_profiles: { worker: { model: "openai-codex/gpt-5.6-luna", effort: "max" } } }, undefined);
+	const profile = resolveAgentProfile(agent, config);
+	const args = childArguments(request({ agent, model: profile.model, thinking: profile.thinking }));
+	assert.equal(args[args.indexOf("--model") + 1], "openai-codex/gpt-5.6-luna:max");
+});
+
+test("childArguments preserves a max default without a selected model", () => {
+	const profile = resolveAgentProfile(explorer, parseAgentsConfig({ default_effort: "max" }, undefined));
+	const args = childArguments(request({ model: profile.model, thinking: profile.thinking }));
+	assert.ok(!args.includes("--model"));
+	assert.equal(args[args.indexOf("--thinking") + 1], "max");
 });
 
 test("childArguments grants every child the notification-only parent message tool", () => {
