@@ -7402,6 +7402,31 @@ async function executeReviewControllerOperation(
 				}, retainedUntrackedSelections, defaultCwd);
 				if (negotiated.transport !== undefined) return hostTransportUnavailable(parameters.operation, negotiated.transport);
 				target = negotiated.status!;
+				// gentle-pi#874: the STATUS this START already fetched can itself
+				// offer the committed-range START for an empty workspace candidate.
+				// Adopt its own base commit *here*, before the candidate view and the
+				// native START are resolved, and re-derive the target for that range,
+				// so all three agree on one base-diff identity. Adopting the offer
+				// later left the workspace target and the base-diff candidate view
+				// disagreeing, and START failed with identity-mismatch. Both an
+				// explicit caller baseRef and any START with an untracked selection in
+				// play keep today's single-STATUS flow; only an adopted offer pays the
+				// second read-only STATUS.
+				if (canonicalBaseRef === undefined && untrackedSelection.untrackedScope === undefined && untrackedSubmission === undefined) {
+					const offeredBaseRef = offeredCommittedRangeBaseRef(target);
+					if (offeredBaseRef !== undefined) {
+						const renegotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
+							cwd: defaultCwd,
+							...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
+							baseRef: offeredBaseRef,
+							committedOnly: true,
+							...(signal === undefined ? {} : { signal }),
+						}, retainedUntrackedSelections, defaultCwd);
+						if (renegotiated.transport !== undefined) return hostTransportUnavailable(parameters.operation, renegotiated.transport);
+						canonicalBaseRef = offeredBaseRef;
+						target = renegotiated.status!;
+					}
+				}
 				if (
 					retainedPreLineageSelection !== undefined &&
 					!sameNativePreLineageCandidate(retainedPreLineageSelection, target)
@@ -7419,18 +7444,6 @@ async function executeReviewControllerOperation(
 				if (target.nextTransition?.kind === "collect" || target.applicability !== "unrelated" || target.action !== "start") return mapNativeTargetStatus(parameters.operation, target, parameters.lineageId);
 			} catch (error) {
 				return nativeOperationFailure(parameters.operation, error);
-			}
-			// gentle-pi#874: with no explicit caller baseRef, adopt the
-			// committed-range selector this same START's STATUS just offered for
-			// this workspace, so `input: {"mode":"ordinary"}` starts exactly the
-			// route the provider rendered. An explicit caller baseRef was already
-			// resolved above and always wins; an absent or non-committed-range
-			// offer leaves today's workspace candidate byte-for-byte. The adopted
-			// value is the provider's own offered argument passed through
-			// unchanged into the existing START argument assembly, so the existing
-			// candidate-view resolution remains the guard on it.
-			if (canonicalBaseRef === undefined) {
-				canonicalBaseRef = offeredCommittedRangeBaseRef(target);
 			}
 			// gentle-pi#323: the replay key must fold in the current candidate
 			// content identity. Without it, a second START with identical
