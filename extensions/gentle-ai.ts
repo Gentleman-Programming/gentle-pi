@@ -5372,6 +5372,27 @@ function consentBindingRepositoryMismatchOutcome(operation: ReviewControllerOper
 	};
 }
 
+// gentle-pi#874: the committed-range selector a current STATUS owns. A
+// selectorless STATUS on a clean, fully committed worktree answers with a
+// review.start execute transition naming the exact merge-base the provider
+// wants, so a plain START can adopt the route the provider just rendered
+// instead of making the caller hand-copy `base-ref` into its input. Only the
+// provider's own offered argument is read -- never a guess, a persisted value,
+// or a stale transition -- and anything that is not a full commit id paired
+// with committed-only is refused, so every other STATUS keeps today's
+// behaviour byte-for-byte.
+const OFFERED_COMMITTED_RANGE_BASE_REF = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+
+function offeredCommittedRangeBaseRef(target: ReviewStatusV3): string | undefined {
+	const execute = target.nextTransition?.kind === "execute" ? target.nextTransition.execute : undefined;
+	if (execute?.operation !== "review.start") return undefined;
+	if (execute.arguments.some((argument) => argument.name === "workspace-overlay")) return undefined;
+	const baseRef = execute.arguments.find((argument) => argument.name === "base-ref")?.value;
+	if (baseRef === undefined || !OFFERED_COMMITTED_RANGE_BASE_REF.test(baseRef)) return undefined;
+	if (execute.arguments.find((argument) => argument.name === "committed-only")?.value !== "true") return undefined;
+	return baseRef;
+}
+
 function assertNativeStartCandidateBinding(candidateView: CandidateView, target: ReviewStatusV3): void {
 	candidateView.verify();
 	if (
@@ -7381,6 +7402,31 @@ async function executeReviewControllerOperation(
 				}, retainedUntrackedSelections, defaultCwd);
 				if (negotiated.transport !== undefined) return hostTransportUnavailable(parameters.operation, negotiated.transport);
 				target = negotiated.status!;
+				// gentle-pi#874: the STATUS this START already fetched can itself
+				// offer the committed-range START for an empty workspace candidate.
+				// Adopt its own base commit *here*, before the candidate view and the
+				// native START are resolved, and re-derive the target for that range,
+				// so all three agree on one base-diff identity. Adopting the offer
+				// later left the workspace target and the base-diff candidate view
+				// disagreeing, and START failed with identity-mismatch. Both an
+				// explicit caller baseRef and any START with an untracked selection in
+				// play keep today's single-STATUS flow; only an adopted offer pays the
+				// second read-only STATUS.
+				if (canonicalBaseRef === undefined && untrackedSelection.untrackedScope === undefined && untrackedSubmission === undefined) {
+					const offeredBaseRef = offeredCommittedRangeBaseRef(target);
+					if (offeredBaseRef !== undefined) {
+						const renegotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
+							cwd: defaultCwd,
+							...(parameters.lineageId === undefined ? {} : { lineageId: parameters.lineageId }),
+							baseRef: offeredBaseRef,
+							committedOnly: true,
+							...(signal === undefined ? {} : { signal }),
+						}, retainedUntrackedSelections, defaultCwd);
+						if (renegotiated.transport !== undefined) return hostTransportUnavailable(parameters.operation, renegotiated.transport);
+						canonicalBaseRef = offeredBaseRef;
+						target = renegotiated.status!;
+					}
+				}
 				if (
 					retainedPreLineageSelection !== undefined &&
 					!sameNativePreLineageCandidate(retainedPreLineageSelection, target)
