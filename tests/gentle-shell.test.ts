@@ -5,8 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { initTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { TUI } from "@earendil-works/pi-tui";
 import installGentleShell, { buildShellBarModel, changesShortcut, devBinaryCard, fetchCodexUsage, loadFileDiff, shellGitRunner, openInExternalEditor, type GentlePromptEditor } from "../extensions/gentle-shell.ts";
 import { CHANGE_STATUS } from "../lib/shell-changes.ts";
+import { sidebarState, type SidebarRail } from "../lib/shell-sidebar.ts";
 import type { ShellBarTheme } from "../lib/shell-bar.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 
@@ -226,6 +228,49 @@ test("gentleShell installs the footer on session_start when a UI exists", () => 
 	const lines = component.render(120);
 	assert.equal(lines.length, 1);
 	assert.match(lines[0], /main ⟡ gpt-5\.5 · medium/);
+});
+
+test("the fullscreen Status rail carries a live digest so a model switch refreshes it", async () => {
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" });
+	const entries: unknown[] = [];
+	const { ctx, ui } = fakeContext({ entries });
+	await fire(handlers, "session_start", ctx);
+
+	const statuses = new Map<string, string>();
+	const liveFooterData = { getGitBranch: () => "main", getExtensionStatuses: () => statuses, getAvailableProviderCount: () => 1, onBranchChange: () => () => {} };
+	const tui = { terminal: { rows: 40, columns: 160 }, requestRender() {} };
+	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, footerData: unknown) => { render(width: number): string[]; dispose(): void };
+	const component = factory(tui, plainTheme, liveFooterData);
+	try {
+		const rail = sidebarState(tui as unknown as TUI).parts.get("footer") as SidebarRail;
+		const live = () => rail.digest?.();
+		assert.equal(typeof rail.digest, "function", "the Status card paints live state and must declare a digest");
+		assert.match(rail.render(46).join("\n"), /gpt-5\.5/);
+
+		const beforeModel = live();
+		(ctx.model as { id: string }).id = "gpt-5.6";
+		assert.notEqual(live(), beforeModel, "/model must change the digest");
+		assert.match(rail.render(46).join("\n"), /gpt-5\.6/);
+
+		const beforeUsage = live();
+		(ctx as unknown as { getContextUsage: () => unknown }).getContextUsage = () => ({ tokens: 200_000, contextWindow: 272_000, percent: 74 });
+		assert.notEqual(live(), beforeUsage, "context usage must change the digest");
+		assert.match(rail.render(46).join("\n"), /74%/);
+
+		const beforeCost = live();
+		entries.push(assistantEntry({ input: 100, output: 20, cost: 0.42 }));
+		assert.notEqual(live(), beforeCost, "session cost must change the digest");
+		assert.match(rail.render(46).join("\n"), /\$0\.420/);
+
+		const beforeStatus = live();
+		statuses.set("mcp", "MCP: 3 servers enabled");
+		assert.notEqual(live(), beforeStatus, "extension statuses have no event and must change the digest");
+		assert.match(rail.render(46).join("\n"), /MCP: 3 servers enabled/);
+		assert.equal(live(), live(), "an unchanged digest still reuses the prepared rail");
+	} finally {
+		component.dispose();
+	}
 });
 
 test("gentleShell stays out of the way without a UI or when disabled", () => {

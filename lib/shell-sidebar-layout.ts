@@ -1,5 +1,5 @@
 import { ScrollView, visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { sidebarState } from "./shell-sidebar.ts";
+import { sidebarState, type SidebarRail } from "./shell-sidebar.ts";
 import type { ShellBarTheme } from "./shell-bar.ts";
 import { renderSidebarBanner } from "./shell-sidebar-banner.ts";
 
@@ -22,7 +22,8 @@ type PreparedRail = {
 	mode: string | undefined;
 	root: LayoutRoot;
 	theme: ShellBarTheme;
-	parts: Array<[string, Component]>;
+	parts: Array<[string, SidebarRail]>;
+	digests: Array<string | undefined>;
 	contentWidth: number;
 	active: boolean;
 	lines: string[];
@@ -39,6 +40,20 @@ function sidebarCache(tui: TUI): SidebarCache {
 /** Mark terminal-owned fullscreen sidebar output stale after a part state change. */
 export function invalidateSidebar(tui: TUI): void {
 	if (tui.terminal) sidebarCache(tui).revision++;
+}
+
+// The memo keys on part identity and an explicit revision, neither of which can
+// see live session state read inside a rail's render closure: a model switch, a
+// new context percentage or an extension status change leaves the prepared lines
+// intact. A rail that paints such state declares a digest of it, so the memo can
+// notice by itself; a throwing digest degrades that rail to invalidation-only
+// rather than taking the whole sidebar down with it.
+function railDigest(rail: SidebarRail): string | undefined {
+	try {
+		return rail.digest?.();
+	} catch {
+		return undefined;
+	}
 }
 
 export function installSidebar(tui: TUI, theme: ShellBarTheme): () => void {
@@ -107,9 +122,11 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme): () => void {
 			return false;
 		}
 		const parts = [...state.parts.entries()];
+		const digests = parts.map(([, rail]) => railDigest(rail));
 		const unchanged = prepared?.revision === cache.revision &&
 			prepared.width === width && prepared.mode === host.mode && prepared.root === root && prepared.theme === theme &&
-			prepared.parts.length === parts.length && prepared.parts.every(([key, part], index) => parts[index]?.[0] === key && parts[index]?.[1] === part);
+			prepared.parts.length === parts.length && prepared.parts.every(([key, part], index) => parts[index]?.[0] === key && parts[index]?.[1] === part) &&
+			prepared.digests.length === digests.length && prepared.digests.every((digest, index) => digest === digests[index]);
 		if (unchanged) {
 			railLines = prepared.lines;
 			state.active = prepared.active;
@@ -137,7 +154,7 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme): () => void {
 			}
 			// Height is owned by the native ScrollView, never by the transcript.
 			const active = railLines.length > 0 && railLines.every((line) => visibleWidth(line) <= contentWidth);
-			prepared = { revision: cache.revision, width, mode: host.mode, root, theme, parts, contentWidth, active, lines: railLines, hits };
+			prepared = { revision: cache.revision, width, mode: host.mode, root, theme, parts, digests, contentWidth, active, lines: railLines, hits };
 			state.active = active;
 			return active;
 		} catch {

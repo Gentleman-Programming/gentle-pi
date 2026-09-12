@@ -287,6 +287,52 @@ test("real layout frames reuse unchanged sidebar output and invalidate at state 
 	assert.equal(replacementRenders, 1);
 });
 
+test("a rail digest refreshes live state that no invalidation announces", (t) => {
+	const f = fixture();
+	let model = "model-a";
+	let renders = 0;
+	// The digest is the only signal: no part is re-registered and invalidateSidebar
+	// is never called here, which is exactly the /model case in fullscreen.
+	sidebarPart(f.tui, "footer", { render: () => ["Status"], invalidate() {} }, {
+		digest: () => model,
+		render: () => {
+			renders++;
+			return [`Model ${model}`];
+		},
+		invalidate() {},
+	});
+	t.after(installSidebar(f.tui, theme));
+
+	assert.match(renderLayoutFrame(f.root, 140, 20, () => {}).lines.join("\n"), /Model model-a/);
+	assert.equal(renders, 1);
+	renderLayoutFrame(f.root, 140, 20, () => {});
+	assert.equal(renders, 1, "an unchanged digest still reuses the prepared rail");
+
+	model = "model-b";
+	assert.match(renderLayoutFrame(f.root, 140, 20, () => {}).lines.join("\n"), /Model model-b/);
+	assert.equal(renders, 2);
+
+	// Rail digests run inside the layout frame, so a broken one must not disable
+	// the sidebar for the parts that still work.
+	let todoRenders = 0;
+	sidebarPart(f.tui, "todo", { render: () => ["Todo bottom"], invalidate() {} }, {
+		digest: () => { throw new Error("broken digest"); },
+		render: () => {
+			todoRenders++;
+			return ["Todo card"];
+		},
+		invalidate() {},
+	});
+	model = "model-c";
+	assert.match(renderLayoutFrame(f.root, 140, 20, () => {}).lines.join("\n"), /Model model-c/);
+	assert.equal(todoRenders, 1);
+	assert.match(renderLayoutFrame(f.root, 140, 20, () => {}).lines.join("\n"), /Todo card/);
+	assert.equal(todoRenders, 1, "a throwing digest degrades to invalidation-only");
+	invalidateSidebar(f.tui);
+	renderLayoutFrame(f.root, 140, 20, () => {});
+	assert.equal(todoRenders, 2, "explicit invalidation still reaches a rail without a digest");
+});
+
 test("reuses final sidebar presentation until a relevant invalidation", (t) => {
 	const f = fixture();
 	sidebarPart(f.tui, "todo", { render: () => Array.from({ length: 10 }, (_, index) => `Todo ${index}`), invalidate() {} });

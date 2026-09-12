@@ -701,6 +701,8 @@ Gentle Shell is the visual layer gentle-pi puts on top of pi. It follows the Gen
 
 In fullscreen at 140 columns or wider, the right sidebar scrolls **✿ Gentle-Pi ✿ → Status → Changes → Agents → TODO** together. The one-line heading is horizontally centered within the usable rail width, with pink flowers and normal white text in the Gentleman themes. Colors follow the active theme; no artwork scaling or custom fonts are used. Narrow/mobile terminals and regular mode retain bottom widgets without the sidebar heading. The original rose and text logo remain in the main chat startup intro.
 
+The rail reuses its last frame until something it paints changes, so silent frames stay cheap and live session state still lands on the next frame: a model switch, a new thinking level, context growth, session cost, session name and extension statuses all refresh the Status card without a redraw of the rest of the sidebar.
+
 The status bar replaces pi's three-line footer with a single line of segments:
 
 ```text

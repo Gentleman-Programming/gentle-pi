@@ -554,8 +554,14 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			renderHost = { requestRender: () => tui.requestRender(), invalidateSidebar: () => invalidateSidebar(tui) };
 			const bottom = createShellBarComponent(pi, ctx, renderHost, theme, footerData, () => tracker.model.files.length, () => usage.get(ctx.model?.provider ?? ""));
+			// The Status card paints live session state that no event re-registers a
+			// part for: model, effort, context, cost, session name and extension
+			// statuses. The digest is what keeps the fullscreen memo honest, and it
+			// rebuilds the model exactly as the narrow bottom bar does every frame.
+			const footerModel = () => buildShellBarModel(pi, ctx, footerData, { dirty: tracker.model.files.length, usage: usage.get(ctx.model?.provider ?? "") });
 			const part = sidebarPart(tui, "footer", bottom, {
-				render: (width) => renderShellSidebarBar(buildShellBarModel(pi, ctx, footerData, { dirty: tracker.model.files.length, usage: usage.get(ctx.model?.provider ?? "") }), theme, width),
+				digest: () => JSON.stringify(footerModel()),
+				render: (width) => renderShellSidebarBar(footerModel(), theme, width),
 				invalidate() {},
 			});
 			const uninstall = installSidebar(tui, theme);
