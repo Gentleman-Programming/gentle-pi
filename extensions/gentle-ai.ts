@@ -33,6 +33,7 @@ import type {
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
 import { Key, isKeyRelease, matchesKey, truncateToWidth, type KeybindingsManager, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { upsertAgentFrontmatterRouting } from "../lib/agent-frontmatter.ts";
 import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
 import {
 	ensureSddPreflight,
@@ -2180,28 +2181,10 @@ function updateFrontmatterRouting(
 	content: string,
 	entry: AgentRoutingEntry | undefined,
 ): string {
-	if (!content.startsWith("---\n")) return content;
-	const endIndex = content.indexOf("\n---", 4);
-	if (endIndex === -1) return content;
-	const frontmatter = content.slice(4, endIndex);
-	const body = content.slice(endIndex);
-	const lines = frontmatter
-		.split("\n")
-		.filter(
-			(line) => !line.startsWith("model:") && !line.startsWith("thinking:"),
-		);
-	const toInsert: string[] = [];
-	if (entry?.model) toInsert.push(`model: ${entry.model}`);
-	if (entry?.thinking) toInsert.push(`thinking: ${entry.thinking}`);
-	if (toInsert.length > 0) {
-		const descriptionIndex = lines.findIndex((line) =>
-			line.startsWith("description:"),
-		);
-		const insertIndex =
-			descriptionIndex >= 0 ? descriptionIndex + 1 : Math.min(1, lines.length);
-		lines.splice(insertIndex, 0, ...toInsert);
-	}
-	return `---\n${lines.join("\n")}${body}`;
+	const routingLines: string[] = [];
+	if (entry?.model) routingLines.push(`model: ${entry.model}`);
+	if (entry?.thinking) routingLines.push(`thinking: ${entry.thinking}`);
+	return upsertAgentFrontmatterRouting(content, routingLines);
 }
 
 function parseAgentName(filePath: string): string | undefined {
