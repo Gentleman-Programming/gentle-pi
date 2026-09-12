@@ -1737,3 +1737,28 @@ test("the profiles panel fills the terminal, lists routing per agent, and scroll
 	assert.match(shortLines[0], /^╭/);
 	assert.match(shortLines.at(-1)!, /^╰/);
 });
+
+test("j and k scroll the detail pane one line at a time, like the agents view", async (t) => {
+	const { fixture, writeStore } = profilesStoreFixture(t);
+	const routing: Record<string, { model: string; thinking: string }> = {};
+	for (let index = 1; index <= 25; index += 1) {
+		routing[`agent-${String(index).padStart(2, "0")}`] = { model: "openai/alpha", thinking: "high" };
+	}
+	writeStore({ team: routing }, "team");
+	let panel: { handleInput(data: string): void; render(width: number): string[] } | undefined;
+	fixture.onInput((visited) => {
+		panel = visited;
+		visited.handleInput("\x1b");
+	});
+	await fixture.run("gentle:profiles");
+	assert.ok(panel, "the panel must open");
+	const body = () => panel!.render(120).slice(1, -2).map((line) => line.replace(/[ \t]+$/, "")).join("\n");
+	const firstAgentRow = (text: string) => text.split("\n").findIndex((line) => line.includes("agent-01"));
+	const before = body();
+	assert.ok(firstAgentRow(before) >= 0, "the first routing row must be visible before scrolling");
+	panel!.handleInput("j");
+	const afterJ = body();
+	assert.notEqual(firstAgentRow(afterJ), firstAgentRow(before), "j must scroll the detail down by one line");
+	panel!.handleInput("k");
+	assert.equal(firstAgentRow(body()), firstAgentRow(before), "k must scroll the detail back up");
+});

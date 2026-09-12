@@ -652,7 +652,8 @@ Profiles are named, switchable snapshots of the global agent-model routing from 
 | `x`     | Delete the selected profile (refuses the active profile).              |
 | `e`     | Export the selected profile to `~/.pi/gentle-ai/profiles.export.json`. |
 | `i`     | Import a profile from `~/.pi/gentle-ai/profiles.export.json`.          |
-| `pgup`/`pgdn`, `ctrl+j`/`ctrl+k`, wheel | Scroll the detail pane.                                |
+| `j`/`k`, wheel | Scroll the detail pane one line at a time (agents-view style).                                |
+| `pgup`/`pgdn`, `ctrl+j`/`ctrl+k` | Scroll the detail pane by a page.                                |
 | `esc`   | Close.                                                                 |
 
 Applying a profile writes `~/.pi/gentle-ai/models.json`, then reconciles agent frontmatter and `subagents.json` the same way `/gentle:models` does. The reconciliation happens on the next subagent launch, and that launch still routes with the previous routing — expect one launch of lag after switching. The active profile is persisted so `/gentle:profiles` reopens with the applied profile marked.
