@@ -5372,6 +5372,27 @@ function consentBindingRepositoryMismatchOutcome(operation: ReviewControllerOper
 	};
 }
 
+// gentle-pi#874: the committed-range selector a current STATUS owns. A
+// selectorless STATUS on a clean, fully committed worktree answers with a
+// review.start execute transition naming the exact merge-base the provider
+// wants, so a plain START can adopt the route the provider just rendered
+// instead of making the caller hand-copy `base-ref` into its input. Only the
+// provider's own offered argument is read -- never a guess, a persisted value,
+// or a stale transition -- and anything that is not a full commit id paired
+// with committed-only is refused, so every other STATUS keeps today's
+// behaviour byte-for-byte.
+const OFFERED_COMMITTED_RANGE_BASE_REF = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+
+function offeredCommittedRangeBaseRef(target: ReviewStatusV3): string | undefined {
+	const execute = target.nextTransition?.kind === "execute" ? target.nextTransition.execute : undefined;
+	if (execute?.operation !== "review.start") return undefined;
+	if (execute.arguments.some((argument) => argument.name === "workspace-overlay")) return undefined;
+	const baseRef = execute.arguments.find((argument) => argument.name === "base-ref")?.value;
+	if (baseRef === undefined || !OFFERED_COMMITTED_RANGE_BASE_REF.test(baseRef)) return undefined;
+	if (execute.arguments.find((argument) => argument.name === "committed-only")?.value !== "true") return undefined;
+	return baseRef;
+}
+
 function assertNativeStartCandidateBinding(candidateView: CandidateView, target: ReviewStatusV3): void {
 	candidateView.verify();
 	if (
@@ -7398,6 +7419,18 @@ async function executeReviewControllerOperation(
 				if (target.nextTransition?.kind === "collect" || target.applicability !== "unrelated" || target.action !== "start") return mapNativeTargetStatus(parameters.operation, target, parameters.lineageId);
 			} catch (error) {
 				return nativeOperationFailure(parameters.operation, error);
+			}
+			// gentle-pi#874: with no explicit caller baseRef, adopt the
+			// committed-range selector this same START's STATUS just offered for
+			// this workspace, so `input: {"mode":"ordinary"}` starts exactly the
+			// route the provider rendered. An explicit caller baseRef was already
+			// resolved above and always wins; an absent or non-committed-range
+			// offer leaves today's workspace candidate byte-for-byte. The adopted
+			// value is the provider's own offered argument passed through
+			// unchanged into the existing START argument assembly, so the existing
+			// candidate-view resolution remains the guard on it.
+			if (canonicalBaseRef === undefined) {
+				canonicalBaseRef = offeredCommittedRangeBaseRef(target);
 			}
 			// gentle-pi#323: the replay key must fold in the current candidate
 			// content identity. Without it, a second START with identical
