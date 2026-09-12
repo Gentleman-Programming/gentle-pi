@@ -14,6 +14,8 @@ import { AGENT_MODE, discoverAgents, loadAgentsConfig, resolveAgentProfile, type
 import { isFinished, TASK_STATUS, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
 import { AgentRunner, piCommand, abortReasonText, type AskAnswer, type RunnerDeps, type SddChangeSelection, type TaskRequest } from "../lib/agents-runner.ts";
 import { ChildMessenger, type IpcEndpoint } from "../lib/agents-messaging.ts";
+import { ActiveSessionClient, ActiveSessionListener, SessionPresenceRegistry, type PresenceRecord, type ReceivedNotification, type SentNotification, type SessionPresenceCandidate } from "../lib/agents-session-transport.ts";
+import { WindowsActiveSessionClient, WindowsActiveSessionListener, WindowsSessionPresenceRegistry, type WindowsSessionRegistryPhaseObserver } from "../lib/windows-session-transport.ts";
 import { hasReviewSessionPermission, resolveCanonicalGitRepositoryIdentitySync, type ReviewSessionManager } from "../lib/review-session-standing-permission.ts";
 import { historyDir, loadStoredTask, pruneHistory, saveTask } from "../lib/agents-history.ts";
 import { sessionToMarkdown } from "../lib/agents-transcript.ts";
@@ -38,6 +40,7 @@ export const AGENTS_WIDGET_KEY = "gentle-agents";
 export const AGENTS_COMMAND_NAME = "gentle:agents";
 export const AGENTS_RESULT_TYPE = "gentle-agents.result";
 export const AGENTS_MESSAGE_TYPE = "gentle-agents.message";
+export const AGENTS_ORCHESTRATOR_MESSAGE_TYPE = "gentle-agents.orchestrator-message";
 export const AGENTS_STALE_RESULT_TYPE = "gentle-agents.stale-result";
 const COLLAPSE_KEY_DEFAULT = "ctrl+shift+a";
 const VIEW_KEY_DEFAULT = "alt+a";
@@ -72,10 +75,34 @@ function parseSddChange(value: unknown, agentName: string): SddChangeSelection |
 	return { changeName: selection.changeName, workspaceRoot: selection.workspaceRoot, phase: selection.phase };
 }
 
+export interface SessionTransportRegistry {
+	list(excludeSessionId?: string): Promise<readonly SessionPresenceCandidate[]>;
+	listActivations(excludeSessionId?: string): Promise<readonly PresenceRecord[]>;
+	close?(): Promise<void>;
+}
+
+export interface SessionTransportListener {
+	readonly registry: SessionTransportRegistry;
+	start(): Promise<void>;
+	close(): Promise<void>;
+}
+
+export interface SessionTransportClient {
+	close(): void;
+	sendNotification(recipientSessionId: string, message: string, options?: { id?: string; expectedActivation?: PresenceRecord; beforeConnect?: () => boolean | Promise<boolean>; signal?: AbortSignal }): Promise<SentNotification>;
+}
+
+export interface SessionTransportFactory {
+	createRegistry(agentHome: string, observeWindowsPhase?: WindowsSessionRegistryPhaseObserver): Promise<SessionTransportRegistry>;
+	createListener(registry: SessionTransportRegistry, sessionId: string, onNotification: (notification: ReceivedNotification) => Promise<void>): SessionTransportListener;
+	createClient(registry: SessionTransportRegistry, sessionId: string): SessionTransportClient;
+}
+
 export interface AgentsDeps extends RunnerDeps {
 	home: string;
 	agentHome?: string;
 	childIpc?: IpcEndpoint;
+	sessionTransport?: SessionTransportFactory;
 	env: NodeJS.ProcessEnv;
 	resolveWorktree: WorktreeResolver;
 	runtimeMetricsPolicy?: RuntimeMetricsPolicyDeps;
@@ -188,6 +215,22 @@ function registerChildMessaging(pi: ExtensionAPI, ipc: IpcEndpoint): void {
 	});
 }
 
+const posixSessionTransport: SessionTransportFactory = {
+	createRegistry(agentHome) { return SessionPresenceRegistry.create(agentHome); },
+	createListener(registry: SessionPresenceRegistry, sessionId, onNotification) { return new ActiveSessionListener(registry, sessionId, onNotification); },
+	createClient(registry: SessionPresenceRegistry, sessionId) { return new ActiveSessionClient(registry, sessionId); },
+};
+
+const windowsSessionTransport: SessionTransportFactory = {
+	createRegistry(agentHome, observeWindowsPhase) { return WindowsSessionPresenceRegistry.create(agentHome, observeWindowsPhase); },
+	createListener(registry: WindowsSessionPresenceRegistry, sessionId, onNotification) { return new WindowsActiveSessionListener(registry, sessionId, onNotification); },
+	createClient(registry: WindowsSessionPresenceRegistry, sessionId) { return new WindowsActiveSessionClient(registry, sessionId); },
+};
+
+export function createDefaultSessionTransport(platform: NodeJS.Platform = process.platform): SessionTransportFactory {
+	return platform === "win32" ? windowsSessionTransport : posixSessionTransport;
+}
+
 function text(value: string, details: Record<string, unknown> = {}, terminate = false): ToolText {
 	return { content: [{ type: "text", text: value }], details, ...(terminate ? { terminate: true } : {}) };
 }
@@ -278,6 +321,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		: environmentHome && (selectedHome.startsWith("~/") || (process.platform === "win32" && selectedHome.startsWith("~\\"))) ? join(deps.home, selectedHome.slice(2)) : selectedHome;
 	// Freeze the host's root before a child uses a different session cwd.
 	const agentHome = resolve(expandedHome);
+	const sessionTransport = deps.sessionTransport ?? createDefaultSessionTransport();
 	if (legacySubagentsInstalledAt(agentHome)) {
 		pi.on("session_start", (_event, ctx) => {
 			if (ctx.hasUI) ctx.ui.notify(`${AGENTS_GLYPH} Gentle Agents is waiting: remove the old package first with "pi remove npm:${LEGACY_SUBAGENTS_PACKAGE}"`, "warning");
@@ -348,6 +392,79 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	// its session. Before the first session_start there is nothing to scope by.
 	const activeSessionId = (): string | undefined => (sessions === undefined ? undefined : sessions.getSessionId() ?? "");
 	const visibleTasks = (): TaskRecord[] => store.list(activeSessionId());
+	type SessionTransport = { generation: number; sessionId: string; sessionManager: ExtensionContext["sessionManager"]; client: SessionTransportClient; listener: SessionTransportListener };
+	let transportGeneration = 0;
+	let activeSessionTransport: SessionTransport | undefined;
+	let transportStartup: Promise<void> | undefined;
+	const validTransportSessionId = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value);
+	const closeSessionTransport = async (transport: SessionTransport | undefined) => {
+		if (!transport) return;
+		transport.client.close();
+		await transport.listener.close();
+	};
+	const startSessionTransport = (ctx: ExtensionContext) => {
+		const previous = activeSessionTransport;
+		const generation = ++transportGeneration;
+		const sessionManager = ctx.sessionManager;
+		activeSessionTransport = undefined;
+		const operation = (async () => {
+			let registry: SessionTransportRegistry | undefined;
+			let listener: SessionTransportListener | undefined;
+			let client: SessionTransportClient | undefined;
+			const closeStartupTransport = async () => {
+				client?.close();
+				await listener?.close().catch(() => {});
+				await registry?.close?.().catch(() => {});
+			};
+			try {
+				await closeSessionTransport(previous);
+				const sessionId = sessionManager.getSessionId();
+				if (!validTransportSessionId(sessionId) || sessions !== sessionManager || generation !== transportGeneration) return;
+				registry = await sessionTransport.createRegistry(agentHome);
+				if (sessions !== sessionManager || generation !== transportGeneration) {
+					await closeStartupTransport();
+					return;
+				}
+				listener = sessionTransport.createListener(registry, sessionId, async (notification) => {
+					const active = activeSessionTransport;
+					if (!active || active.generation !== generation || active.sessionManager !== sessionManager || active.sessionId !== sessionId || sessions !== sessionManager || activeSessionId() !== sessionId) throw new Error("stale session transport");
+					pi.sendMessage({ customType: AGENTS_ORCHESTRATOR_MESSAGE_TYPE, content: `Session message from ${notification.senderSessionId} (correlation ${notification.id}): ${notification.message}`, display: true, details: { gentleAgents: { senderSessionId: notification.senderSessionId, recipientSessionId: sessionId, correlationId: notification.id, direction: "incoming" } } }, { deliverAs: "followUp", triggerTurn: true });
+				});
+				client = sessionTransport.createClient(registry, sessionId);
+				if (sessions !== sessionManager || generation !== transportGeneration || activeSessionId() !== sessionId) {
+					await closeStartupTransport();
+					return;
+				}
+				const transport = { generation, sessionId, sessionManager, client, listener };
+				// The listener deliberately accepts while publishing. Bind its callback
+				// first so a peer accepted in that interval remains current-session work.
+				activeSessionTransport = transport;
+				await listener.start();
+				if (sessions !== sessionManager || generation !== transportGeneration || activeSessionId() !== sessionId) {
+					if (activeSessionTransport === transport) activeSessionTransport = undefined;
+					await closeStartupTransport();
+					return;
+				}
+			} catch {
+				if (activeSessionTransport?.generation === generation) activeSessionTransport = undefined;
+				await closeStartupTransport();
+			}
+		})();
+		transportStartup = operation;
+		void operation.finally(() => { if (transportStartup === operation) transportStartup = undefined; });
+		return operation;
+	};
+	const shutdownSessionTransport = async () => {
+		const active = activeSessionTransport;
+		activeSessionTransport = undefined;
+		transportGeneration++;
+		await Promise.allSettled([transportStartup, closeSessionTransport(active)].filter((operation): operation is Promise<void> => operation !== undefined));
+	};
+	const activeTransportFor = (ctx: ExtensionContext) => {
+		const active = activeSessionTransport;
+		const sessionId = ctx.sessionManager.getSessionId();
+		return active && active.generation === transportGeneration && active.sessionManager === ctx.sessionManager && active.sessionId === sessionId && sessions === ctx.sessionManager ? active : undefined;
+	};
 
 	const requestRender = () => {
 		if (renderQueued) return;
@@ -513,6 +630,14 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const taskId = typeof details?.taskId === "string" ? details.taskId : "unknown";
 		const agent = typeof details?.agent === "string" ? details.agent : "Subagent";
 		const heading = `${sanitizeTerminalText(agent)} message · Task ${sanitizeTerminalText(taskId)}`;
+		const body = sanitizeTerminalText(messageText(message.content));
+		return new Text(`${theme.fg("customMessageLabel", heading)}\n${theme.fg("customMessageText", body)}`, options.outputPad, 0);
+	});
+
+	pi.registerMessageRenderer(AGENTS_ORCHESTRATOR_MESSAGE_TYPE, (message, options, theme) => {
+		const details = (message.details as { gentleAgents?: { senderSessionId?: unknown } } | undefined)?.gentleAgents;
+		const sender = typeof details?.senderSessionId === "string" ? details.senderSessionId : "unknown";
+		const heading = `⇄ Orchestrator message · Received · From ${sanitizeTerminalText(sender)}`;
 		const body = sanitizeTerminalText(messageText(message.content));
 		return new Text(`${theme.fg("customMessageLabel", heading)}\n${theme.fg("customMessageText", body)}`, options.outputPad, 0);
 	});
@@ -843,6 +968,78 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		});
 	};
 
+	pi.registerTool({
+		name: "orchestrator_session_id",
+		label: "Orchestrator session ID",
+		description: "Return this host session's active ID.",
+		parameters: { type: "object", additionalProperties: false, properties: {} } as never,
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			const transport = activeTransportFor(ctx);
+			return transport ? text(`Active session ID: ${transport.sessionId}`, { gentleAgents: { senderSessionId: transport.sessionId } }) : text("Error: session messaging is not ready.", { error: "not ready" });
+		},
+	});
+	pi.registerTool({
+		name: "orchestrator_list",
+		label: "List orchestrators",
+		description: "List other sessions advertised by the trusted local profile. Advertised reachability is unknown and does not prove a session is live.",
+		parameters: { type: "object", additionalProperties: false, properties: {} } as never,
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			const transport = activeTransportFor(ctx);
+			if (!transport) return text("Error: session discovery is not ready.", { error: "not ready" });
+			try {
+				const peers = await transport.listener.registry.list(transport.sessionId);
+				if (activeTransportFor(ctx) !== transport) return text("Error: session discovery became unavailable before results were confirmed.", { error: "stale" });
+				return peers.length === 0 ? text("No other sessions are currently advertised. Advertisements have unknown reachability and do not guarantee a live session.") : text(`Advertised sessions (reachability is unknown):\n${peers.map((peer) => `- ${peer.sessionId}`).join("\n")}`, { gentleAgents: { candidates: peers } });
+			} catch {
+				return text("Error: session discovery is unavailable.", { error: "unavailable" });
+			}
+		},
+	});
+	pi.registerTool({
+		name: "orchestrator_send_message",
+		label: "Send orchestrator message",
+		description: "Send a notification to another active session in this trusted local profile. If recipient_session_id is omitted, the sole peer is selected or the user selects one. Acceptance means enqueued, not read or completed.",
+		parameters: { type: "object", additionalProperties: false, required: ["message"], properties: { recipient_session_id: { type: "string" }, message: { type: "string" } } } as never,
+		async execute(_id, params, signal, _onUpdate, ctx) {
+			const transport = activeTransportFor(ctx);
+			const input = params as { recipient_session_id?: unknown; message?: unknown };
+			if (!transport) return text("Error: session messaging is not ready.", { error: "not ready" });
+			if (typeof input.message !== "string" || Buffer.byteLength(input.message, "utf8") > 8192) return text("Error: recipient session ID or message is invalid.", { error: "invalid input" });
+			let recipient = input.recipient_session_id;
+			let activation: PresenceRecord | undefined;
+			if (recipient !== undefined && !validTransportSessionId(recipient)) return text("Error: recipient session ID or message is invalid.", { error: "invalid input" });
+			if (recipient === undefined) {
+				try {
+					const candidates = (await transport.listener.registry.listActivations(transport.sessionId)).filter((candidate) => candidate.sessionId !== transport.sessionId);
+					if (activeTransportFor(ctx) !== transport || signal?.aborted) return text("Message selection was cancelled.", { error: "cancelled" });
+					if (candidates.length === 0) return text("No other sessions are currently advertised; message delivery is unavailable.", { error: "unavailable" });
+					if (candidates.length === 1) {
+						recipient = candidates[0].sessionId;
+						activation = candidates[0];
+					} else if (!ctx.hasUI) return text("Several recipient orchestrators are available. Ask the user to choose a recipient label; do not ask for a session ID.", { gentleAgents: { candidates: candidates.map((candidate) => ({ label: `Orchestrator ${candidate.sessionId}`, sessionId: candidate.sessionId })) } });
+					else {
+						const labels = candidates.map((candidate) => `Orchestrator ${candidate.sessionId}`);
+						const selected = await ctx.ui.select("Select recipient orchestrator", labels, { signal });
+						if (selected === undefined || activeTransportFor(ctx) !== transport || signal?.aborted) return text("Message selection was cancelled.", { error: "cancelled" });
+						const index = labels.indexOf(selected);
+						if (index < 0) return text("Message selection was cancelled.", { error: "cancelled" });
+						recipient = candidates[index].sessionId;
+						activation = candidates[index];
+					}
+				} catch {
+					return text("Error: session discovery is unavailable.", { error: "unavailable" });
+				}
+			}
+			if (recipient === transport.sessionId) return text("Error: cannot send a message to the active session.", { error: "self" });
+			try {
+				const accepted = await transport.client.sendNotification(recipient!, input.message, { signal, expectedActivation: activation, beforeConnect: () => activeTransportFor(ctx) === transport });
+				return activeTransportFor(ctx) === transport ? text(`Message ${accepted.id} from ${transport.sessionId} to ${recipient} accepted for delivery; it is not a delivery or read receipt.`, { gentleAgents: { messageId: accepted.id, senderSessionId: transport.sessionId, recipientSessionId: recipient, state: "accepted" } }) : text("Error: session messaging is not ready.", { error: "stale" });
+			} catch {
+				return text("Error: session message was not accepted.", { error: "not accepted" });
+			}
+		},
+	});
+
 	tool("list_agents", "List the subagents defined for this project and user, with their descriptions.", { properties: {} }, async (_params, ctx) => {
 		const { agents, errors } = discoverAgents(roots(ctx));
 		const lines = agents.map((agent) => `- ${agent.name} (${agent.scope}): ${agent.description || "no description"}`);
@@ -961,7 +1158,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		});
 	}
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		// A resumed, reloaded, or replaced session starts with an empty completion
 		// queue so nothing pending from another session can replay here.
 		completions.dropAll();
@@ -973,8 +1170,9 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				label: ctx.sessionManager.getSessionName?.() || ctx.sessionManager.getCwd().split(/[\\/]/).pop() || "Orchestrator", activity: [] });
 			publishActivity();
 		} catch { presence = undefined; }
+		await startSessionTransport(ctx);
 	});
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
 		completions.dropAll();
 		activeAgentRuns = 0;
 		presence?.dispose();
@@ -986,6 +1184,8 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		sidebarTui = undefined;
 		worktrees?.close();
 		worktrees = undefined;
+		const stopped = shutdownSessionTransport();
 		runner.cancelAll();
+		await stopped;
 	});
 }

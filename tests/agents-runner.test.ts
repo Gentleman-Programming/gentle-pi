@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { AGENT_MODE, type AgentDefinition } from "../lib/agents-config.ts";
 import { TASK_STATUS, TaskStore } from "../lib/agents-protocol.ts";
-import { AgentRunner, childArguments, JsonLines, piCommand, abortReasonText, type RunnerDeps, type RunnerHooks, type TaskRequest } from "../lib/agents-runner.ts";
+import { AgentRunner, childArguments, JsonLines, piCommand, abortReasonText, type ChildLike, type RunnerDeps, type RunnerHooks, type TaskRequest } from "../lib/agents-runner.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
 
 // Gentle Agents runner: every subagent is a child `pi --mode rpc` process.
@@ -592,18 +592,106 @@ for (const [platform, detached] of [["win32", false], ["linux", true]] as const)
 	assert.equal((await runner.waitFor(task.id)).status, TASK_STATUS.COMPLETED);
 });
 
+function ipcCleanupHarness(connected: boolean | undefined) {
+	const child = fakeChild({ exitOnKill: false });
+	const disconnectListeners: Array<(...args: unknown[]) => void> = [];
+	const originalOn = child.child.on as unknown as (event: string, listener: (...args: unknown[]) => void) => unknown;
+	child.child.on = ((event: string, listener: (...args: unknown[]) => void) => {
+		if (event === "disconnect") disconnectListeners.push(listener);
+		return originalOn(event, listener);
+	}) as ChildLike["on"];
+	child.child.connected = connected;
+	let resolveAnswer!: (answer: { cancelled: true }) => void;
+	const answer = new Promise<{ cancelled: true }>((resolve) => { resolveAnswer = resolve; });
+	const runner = new AgentRunner(new TaskStore(), { maxConcurrency: 1, stallTimeoutMs: 1_000 }, {
+		spawn: () => child.child,
+		now: () => 1,
+		schedule: () => () => {},
+		pi: { command: "pi", args: [] },
+	}, { askUser: async () => answer });
+	return {
+		child,
+		runner,
+		resolveAnswer,
+		emitNativeDisconnect: () => {
+			assert.equal(disconnectListeners.length, 1, "the runner listens for the native disconnect event");
+			disconnectListeners[0]();
+		},
+	};
+}
+
+test("AgentRunner primary IPC cleanup respects native connection state", async () => {
+	for (const scenario of [
+		{ name: "connected=false finalize", connected: false, ending: "finalize", expectedDisconnects: 0, reentrant: false },
+		{ name: "connected=false cancel", connected: false, ending: "cancel", expectedDisconnects: 0, reentrant: false },
+		{ name: "connected=true reentrant cleanup", connected: true, ending: "cancel", expectedDisconnects: 1, reentrant: true },
+		{ name: "partial fake without connected", connected: undefined, ending: "cancel", expectedDisconnects: 1, reentrant: false },
+	] as const) {
+		const h = ipcCleanupHarness(scenario.connected);
+		const task = h.runner.run(request());
+		await tick();
+		h.child.emit({ type: "extension_ui_request", id: "pending", method: "confirm", title: "Pending?" });
+		await tick();
+		h.emitNativeDisconnect();
+		if (scenario.reentrant) h.emitNativeDisconnect();
+		assert.equal(h.child.disconnects, scenario.expectedDisconnects, `${scenario.name}: native disconnect does not duplicate the physical close`);
+		h.resolveAnswer({ cancelled: true });
+		await tick();
+		assert.equal(h.child.written.filter((command) => command.type === "extension_ui_response").length, 1, `${scenario.name}: IPC closure does not suppress the independent live RPC UI response`);
+		if (scenario.ending === "finalize") {
+			h.child.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" }] });
+			h.child.emit({ type: "agent_settled" });
+			h.child.exit(0);
+			assert.equal((await h.runner.waitFor(task.id)).status, TASK_STATUS.COMPLETED, `${scenario.name}: later finalization remains intact`);
+		} else {
+			h.runner.cancel(task.id);
+			h.child.exit(0);
+			assert.equal((await h.runner.waitFor(task.id)).status, TASK_STATUS.CANCELLED, `${scenario.name}: later cancellation remains intact`);
+		}
+		assert.equal(h.child.disconnects, scenario.expectedDisconnects, `${scenario.name}: later cleanup remains idempotent`);
+	}
+});
+
 test("AgentRunner retains permission broker fd3 and assigns messaging IPC to fd4", async () => {
 	const { runner, children, spawnOptions } = harness();
 	const task = runner.run(request({ authorizeParentStandingReviewPermission: () => true }));
 	await tick();
 	const launch = spawnOptions[0];
+	const permissionChannelStdio = process.platform === "win32" ? "overlapped" : "pipe";
 	assert.match(launch?.env.GENTLE_PI_AGENTS_OWNED_IPC ?? "", /^\d+-[a-z0-9]+$/, "the owned-IPC marker has the runner's opaque shape");
 	assert.deepEqual(launch?.env, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: launch?.env.GENTLE_PI_AGENTS_OWNED_IPC, GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3" });
-	assert.deepEqual(launch?.stdio, ["pipe", "pipe", "pipe", "pipe", "ipc"]);
+	assert.deepEqual(launch?.stdio, ["pipe", "pipe", "pipe", permissionChannelStdio, "ipc"]);
 	assert.equal(launch?.stdio?.length, 5);
 	children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "channel checked" }], stopReason: "stop" }] });
 	children[0].emit({ type: "agent_settled" });
 	assert.equal((await runner.waitFor(task.id)).status, TASK_STATUS.COMPLETED);
+});
+
+test("AgentRunner platform matrix scopes permission fd3 transport", async () => {
+	for (const platform of ["win32", "linux", "darwin"] as const) {
+		for (const eligible of [false, true]) {
+			const launches: Array<Parameters<RunnerDeps["spawn"]>[2]> = [];
+			const child = fakeChild();
+			const runner = new AgentRunner(new TaskStore(), { maxConcurrency: 1, stallTimeoutMs: 1_000 }, {
+				spawn: (_command, _args, options) => {
+					launches.push(options);
+					return child.child;
+				},
+				now: () => 1,
+				schedule: () => () => {},
+				pi: { command: "pi-fixture", args: [] },
+				process: { platform, kill: () => {} },
+			}, { askUser: async () => ({ cancelled: true }) });
+			const task = runner.run(request({ authorizeParentStandingReviewPermission: eligible ? () => true : undefined }));
+			await tick();
+			const launch = launches[0];
+			assert.ok(launch, `${platform} ${eligible ? "eligible" : "ineligible"} child launches`);
+			assert.equal(launch.env.GENTLE_PI_AGENTS_PARENT_PERMISSION_FD, eligible ? "3" : undefined, "only eligible children receive the fd3 marker");
+			assert.deepEqual(launch.stdio, eligible ? ["pipe", "pipe", "pipe", platform === "win32" ? "overlapped" : "pipe", "ipc"] : ["pipe", "pipe", "pipe", "ipc"]);
+			assert.equal(launch.stdio?.indexOf("ipc"), eligible ? 4 : 3, "messaging IPC follows fd3 only for eligible children");
+			runner.cancel(task.id);
+		}
+	}
 });
 
 test("AgentRunner answers dialogs through askUser in task mode and cancels them in background mode", async () => {
