@@ -14,7 +14,7 @@ import { framePromptLines, PROMPT_HINT, PROMPT_STATE, withPromptHint, type Promp
 import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, parseCodexUsage, parseUsageHeaders, UsageStore, type ProviderUsage } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
 import { sidebarPart } from "../lib/shell-sidebar.ts";
-import { installSidebar } from "../lib/shell-sidebar-layout.ts";
+import { installSidebar, invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
 
 // Gentle Shell: the visual layer gentle-pi puts on top of pi. It installs the
 // status bar, the petal prompt, the working-tree changes widget and overlay,
@@ -29,6 +29,7 @@ export interface ShellFooterData {
 
 interface ShellRenderHost {
 	requestRender(): void;
+	invalidateSidebar?(): void;
 }
 
 interface ShellBarComponent {
@@ -126,7 +127,10 @@ export function createShellBarComponent(
 	dirty: () => number | undefined = () => undefined,
 	usage: () => ProviderUsage | undefined = () => undefined,
 ): ShellBarComponent {
-	const unsubscribe = footerData.onBranchChange(() => host.requestRender());
+	const unsubscribe = footerData.onBranchChange(() => {
+		host.invalidateSidebar?.();
+		host.requestRender();
+	});
 	return {
 		render(width: number) {
 			return renderShellBar(buildShellBarModel(pi, ctx, footerData, { dirty: dirty(), usage: usage() }), theme, width);
@@ -222,14 +226,16 @@ const GIT_TIMEOUT_MS = 5000;
 const OVERLAY_HEIGHT_RATIO = 0.8;
 const OVERLAY_MIN_ROWS = 8;
 
-export function shellGitRunner(cwd: string, env: NodeJS.ProcessEnv = process.env): GitRunner {
+export function shellGitRunner(cwd: string, env: NodeJS.ProcessEnv = process.env, run: typeof execFile = execFile): GitRunner {
 	// Pi exec cannot replace the inherited environment. Use argv directly and
 	// a complete sanitized environment for discovery, status, and lazy diffs.
 	const childEnv = worktreeGitEnvironment(env);
 	return (args) => new Promise((resolve) => {
-		execFile("git", ["-C", cwd, ...args], {
+		run("git", ["-C", cwd, ...args], {
 			env: childEnv,
 			encoding: "utf8",
+			shell: false,
+			windowsHide: true,
 			timeout: GIT_TIMEOUT_MS,
 			// Pi exec accumulates output without a maxBuffer cap. In particular,
 			// large porcelain inventories must not become partial successful scans.
@@ -327,7 +333,7 @@ async function showChangesOverlay(ctx: ExtensionContext, deps: OverlayDeps): Pro
 				host = tui;
 				view = new WorktreeChangesView(deps.worktrees(), {
 					theme,
-					rows: Math.max(OVERLAY_MIN_ROWS, Math.floor(tui.terminal.rows * OVERLAY_HEIGHT_RATIO)),
+					rows: () => Math.max(OVERLAY_MIN_ROWS, Math.floor(tui.terminal.rows * OVERLAY_HEIGHT_RATIO)),
 					loadDiff: (root, file) => loadFileDiff(deps.git(root), file),
 					onOpen: (root, file) => done({ root, file }),
 					onRefresh: () => void refresh(),
@@ -342,6 +348,7 @@ async function showChangesOverlay(ctx: ExtensionContext, deps: OverlayDeps): Pro
 		if (!openInExternalEditor(host, chosen.file.path, process.env, spawnSync, chosen.root)) ctx.ui.notify("No editor configured. Set $VISUAL or $EDITOR.", "warning");
 	} finally {
 		clearInterval(poll);
+		view?.dispose();
 		view = undefined;
 	}
 }
@@ -459,12 +466,14 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		const fetched = await fetchCodexUsage(token, deps.fetch, deps.now());
 		if (!fetched) return;
 		usage.record(fetched);
+		renderHost?.invalidateSidebar?.();
 		renderHost?.requestRender();
 	};
 	pi.on("after_provider_response", (event) => {
 		const parsed = parseUsageHeaders(event.headers, deps.now());
 		if (!parsed) return;
 		usage.record(parsed);
+		renderHost?.invalidateSidebar?.();
 		renderHost?.requestRender();
 	});
 	pi.registerMessageRenderer(REVIEW_PREFLIGHT_TYPE, (message, options, theme) => {
@@ -543,8 +552,8 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		changes = new WorktreeChangesTracker(deps.gitRunner(ctx.cwd), deps.gitRunner, lineCounter, () => sessionRegistry.roots());
 		const tracker = changes;
 		ctx.ui.setFooter((tui, theme, footerData) => {
-			renderHost = tui;
-			const bottom = createShellBarComponent(pi, ctx, tui, theme, footerData, () => tracker.model.files.length, () => usage.get(ctx.model?.provider ?? ""));
+			renderHost = { requestRender: () => tui.requestRender(), invalidateSidebar: () => invalidateSidebar(tui) };
+			const bottom = createShellBarComponent(pi, ctx, renderHost, theme, footerData, () => tracker.model.files.length, () => usage.get(ctx.model?.provider ?? ""));
 			const part = sidebarPart(tui, "footer", bottom, {
 				render: (width) => renderShellSidebarBar(buildShellBarModel(pi, ctx, footerData, { dirty: tracker.model.files.length, usage: usage.get(ctx.model?.provider ?? "") }), theme, width),
 				invalidate() {},

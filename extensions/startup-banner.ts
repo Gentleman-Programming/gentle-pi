@@ -2,12 +2,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { VERSION } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import * as os from "node:os";
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
+import { execFile } from "node:child_process";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-const execAsync = promisify(exec);
 const PI_AGENT_DIR = join(os.homedir(), ".pi", "agent");
 const PI_NPM_DIR = join(PI_AGENT_DIR, "npm", "node_modules");
 
@@ -527,6 +525,23 @@ async function countPackageExtensions(packages: unknown[]): Promise<number> {
   return count;
 }
 
+export function readGitBranch(cwd: string, run: typeof execFile = execFile): Promise<string> {
+  return new Promise((resolve) => {
+    run("git", ["-C", cwd, "branch", "--show-current"], {
+      encoding: "utf8",
+      shell: false,
+      windowsHide: true,
+    }, (error, stdout) => {
+      if (error) {
+        resolve("Not a git repo");
+        return;
+      }
+      const branch = String(stdout).trim();
+      resolve(branch ? `On branch ${branch}` : "Detached HEAD");
+    });
+  });
+}
+
 export default function (pi: ExtensionAPI) {
   let disposeHeader = () => {};
   pi.on("session_shutdown", () => disposeHeader());
@@ -632,12 +647,8 @@ export default function (pi: ExtensionAPI) {
     );
 
     setTimeout(() => {
-      execAsync(`git -C "${ctx.cwd}" branch --show-current`)
-        .then(({ stdout }) => {
-          const b = stdout.trim();
-          gitBranch = b ? `On branch ${b}` : "Detached HEAD";
-        })
-        .catch(() => {})
+      readGitBranch(ctx.cwd)
+        .then((branch) => { gitBranch = branch; })
         .finally(() => refreshStats());
     }, 100);
 
@@ -1040,7 +1051,8 @@ export default function (pi: ExtensionAPI) {
 
             return out;
           },
-          invalidate() {
+          invalidate() {},
+          dispose() {
             cleanup();
           },
         };

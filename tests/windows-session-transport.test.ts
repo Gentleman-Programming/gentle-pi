@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { Socket } from "node:net";
 import test from "node:test";
-import { FIXED_WINDOWS_POWERSHELL, WindowsActiveSessionListener, WindowsSessionPresenceRegistry, WindowsSessionTransportHost, parseWindowsHostFrame, parseWindowsHostNotification } from "../lib/windows-session-transport.ts";
+import { FIXED_WINDOWS_POWERSHELL, WindowsActiveSessionClient, WindowsActiveSessionListener, WindowsSessionPresenceRegistry, WindowsSessionTransportHost, parseWindowsHostFrame, parseWindowsHostNotification } from "../lib/windows-session-transport.ts";
 import type { PresenceRecord } from "../lib/agents-session-transport.ts";
 
 class FakeTransportChild extends EventEmitter {
@@ -246,6 +247,154 @@ test("Windows bridge keeps ACK capacity separate from ordinary RPCs and suppress
 	await Promise.all(ordinary.map((request) => assert.rejects(request, /Windows transport host exited/)));
 });
 
+test("Windows listener reserves a skipped local epoch and accepts the next early notification", async () => {
+	const child = new FakeTransportChild();
+	let callbacks = 0;
+	const host = new WindowsSessionTransportHost({ spawnProcess: () => child as never, callback: async () => { callbacks++; return true; } });
+	const emit = (line: string) => child.stdout.emit("data", Buffer.from(`${line}\n`));
+	const starting = host.start();
+	emit('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}');
+	await starting;
+	const saturated = Array.from({ length: 8 }, () => host.request("list", {}));
+	await assert.rejects(host.listen("recipient", 1), /Windows transport request unavailable/);
+	for (let index = 0; index < 8; index++) emit(`{"requestId":"list-${index + 2}","ok":true,"result":{"records":[]}}`);
+	await Promise.all(saturated);
+	const listening = host.listen("recipient", 2);
+	assert.match(child.lines.at(-1) ?? "", /"operation":"listen".*"generation":2/);
+	emit(`{"event":"notification","connectionId":"early-1","generation":2,"wire":"${notificationWire("early-1")}"}`);
+	emit(`{"requestId":"listen-10","ok":true,"result":{"version":1,"sessionId":"recipient","endpoint":"${testEndpoint.replaceAll("\\", "\\\\")}","createdAt":2}}`);
+	await listening;
+	await nextTurn();
+	assert.equal(callbacks, 1, "the first accepted helper generation must receive an early notification and ACK");
+	assert.equal(child.lines.filter((line) => line.includes('"operation":"ack"')).length, 1);
+	child.emit("exit", 1, null);
+});
+
+test("Windows listener reserves a fresh epoch after helper busy or invalid rejection", async () => {
+	for (const rejection of ["busy", "invalid"] as const) {
+		const child = new FakeTransportChild();
+		const host = new WindowsSessionTransportHost({ spawnProcess: () => child as never });
+		const emit = (line: string) => child.stdout.emit("data", Buffer.from(`${line}\n`));
+		const starting = host.start();
+		emit('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}');
+		await starting;
+		const rejected = host.listen("recipient", 1);
+		emit(`{"requestId":"listen-2","ok":false,"error":"${rejection}"}`);
+		await assert.rejects(rejected, /Windows transport request unavailable/);
+		const recovered = host.listen("recipient", 2);
+		assert.match(child.lines.at(-1) ?? "", /"operation":"listen".*"generation":2/);
+		emit(`{"requestId":"listen-3","ok":true,"result":{"version":1,"sessionId":"recipient","endpoint":"${testEndpoint.replaceAll("\\", "\\\\")}","createdAt":2}}`);
+		await recovered;
+		child.emit("exit", 1, null);
+	}
+});
+
+test("Windows listener ignores a late failed epoch while a replacement is pending and ACKs only that replacement", async () => {
+	const child = new FakeTransportChild();
+	let callbacks = 0;
+	const host = new WindowsSessionTransportHost({ spawnProcess: () => child as never, callback: async () => { callbacks++; return true; } });
+	const emit = (line: string) => child.stdout.emit("data", Buffer.from(`${line}\n`));
+	const ready = host.start(); emit('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}'); await ready;
+	const failed = host.listen("recipient", 1);
+	emit('{"requestId":"listen-2","ok":false,"error":"unavailable"}');
+	await assert.rejects(failed, /Windows transport request unavailable/);
+	emit('{"event":"listener-failed","generation":1,"error":"unavailable"}');
+	const replacement = host.listen("recipient", 2);
+	assert.match(child.lines.at(-1) ?? "", /"generation":2/);
+	emit(`{"event":"notification","connectionId":"old-1","generation":1,"wire":"${notificationWire("old-1")}"}`);
+	emit('{"event":"listener-failed","generation":1,"error":"unavailable"}');
+	emit(`{"event":"notification","connectionId":"new-1","generation":2,"wire":"${notificationWire("new-1")}"}`);
+	emit(`{"requestId":"listen-3","ok":true,"result":{"version":1,"sessionId":"recipient","endpoint":"${testEndpoint.replaceAll("\\", "\\\\")}","createdAt":2}}`);
+	await replacement; await nextTurn();
+	assert.equal(callbacks, 1, "only the pending replacement epoch may deliver or ACK");
+	assert.equal(child.lines.filter((line) => line.includes('"operation":"ack"') && line.includes('"generation":2')).length, 1);
+	child.emit("exit", 1, null);
+});
+
+test("Windows client aborts during resolve, pre-connect, connect, and ACK without a late write or revived result", async () => {
+	const record = Object.freeze({ version: 1 as const, sessionId: "recipient", endpoint: testEndpoint, createdAt: 1 });
+	for (const stage of ["resolve", "beforeConnect", "connect", "ack"] as const) {
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const socket = new Socket();
+		socket.on("error", () => {});
+		let writes = 0;
+		(socket as unknown as { write: () => boolean }).write = () => { writes++; return true; };
+		const registry = { resolve: async () => { if (stage === "resolve") await gate; return record; } } as unknown as WindowsSessionPresenceRegistry;
+		const client = new WindowsActiveSessionClient(registry, "sender", { connect: () => socket });
+		const controller = new AbortController();
+		const pending = client.sendNotification("recipient", "cancel", {
+			signal: controller.signal,
+			beforeConnect: stage === "beforeConnect" ? async () => { await gate; return true; } : undefined,
+		});
+		if (stage === "resolve" || stage === "beforeConnect") { controller.abort(); release(); }
+		else {
+			await nextTurn();
+			if (stage === "connect") controller.abort();
+			else { socket.emit("connect"); await nextTurn(); controller.abort(); }
+		}
+		await assert.rejects(pending, (error: unknown) => error instanceof Error && (error as { code?: unknown }).code === "aborted");
+		socket.emit("connect"); socket.emit("end"); socket.emit("error", new Error("late"));
+		assert.equal(writes, stage === "ack" ? 1 : 0, `${stage} abort never permits a late write`);
+		assert.equal(client.pendingCount, 0);
+	}
+});
+
+test("Windows client rejects abort while resolve or beforeConnect remains gated", async () => {
+	const record = Object.freeze({ version: 1 as const, sessionId: "recipient", endpoint: testEndpoint, createdAt: 1 });
+	for (const phase of ["resolve", "beforeConnect"] as const) {
+		let release!: () => void, entered!: () => void, connects = 0;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const enteredGate = new Promise<void>((resolve) => { entered = resolve; });
+		const registry = { resolve: async () => { if (phase === "resolve") { entered(); await gate; } return record; } } as unknown as WindowsSessionPresenceRegistry;
+		const client = new WindowsActiveSessionClient(registry, "sender", { connect: () => { connects++; return new Socket(); } });
+		const controller = new AbortController();
+		const pending = client.sendNotification("recipient", "gated", { signal: controller.signal, beforeConnect: phase === "beforeConnect" ? async () => { entered(); await gate; return true; } : undefined });
+		await enteredGate;
+		controller.abort();
+		await assert.rejects(pending, (error: unknown) => error instanceof Error && (error as { code?: unknown }).code === "aborted");
+		assert.equal(client.pendingCount, 0, "abort settles before the gate opens");
+		assert.equal(connects, 0);
+		release(); await nextTurn();
+		assert.equal(connects, 0, "a released continuation cannot create a socket");
+	}
+});
+
+test("Windows client tears down only its owned listeners through registration, write, and registration-error races", async () => {
+	class FakeSocket extends EventEmitter {
+		writes = 0; destroys = 0; onWrite?: () => void;
+		write() { this.writes++; this.onWrite?.(); return true; }
+		destroy() { this.destroys++; return this; }
+	}
+	const record = Object.freeze({ version: 1 as const, sessionId: "recipient", endpoint: testEndpoint, createdAt: 1 });
+	for (const mode of ["registration", "write", "throw", "laterThrow"] as const) {
+		const socket = new FakeSocket(), controller = new AbortController();
+		const timers = new Set<() => void>();
+		const scheduler = { setTimeout: (callback: () => void) => (timers.add(callback), callback), clearTimeout: (callback: () => void) => { timers.delete(callback); } };
+		const externalData = () => {}, externalError = () => {};
+		socket.on("data", externalData); socket.on("error", externalError);
+		const originalOnce = socket.once.bind(socket) as (event: string, listener: (...args: unknown[]) => void) => FakeSocket;
+		if (mode === "registration") socket.once = ((event: string, listener: (...args: unknown[]) => void) => { const value = originalOnce(event, listener); if (event === "connect") controller.abort(); return value; }) as typeof socket.once;
+		if (mode === "throw") socket.once = (() => { throw new Error("registration failed"); }) as typeof socket.once;
+		if (mode === "laterThrow") socket.once = ((event: string, listener: (...args: unknown[]) => void) => { const value = originalOnce(event, listener); if (event === "end") throw new Error("later registration failed"); return value; }) as typeof socket.once;
+		if (mode === "write") socket.onWrite = () => controller.abort();
+		const registry = { resolve: async () => record } as unknown as WindowsSessionPresenceRegistry;
+		const client = new WindowsActiveSessionClient(registry, "sender", { connect: () => socket as never, scheduler });
+		const pending = client.sendNotification("recipient", "race", { signal: controller.signal });
+		if (mode === "write") { await nextTurn(); socket.emit("connect"); }
+		await assert.rejects(pending, (error: unknown) => error instanceof Error && (error as { code?: unknown }).code === ((mode === "throw" || mode === "laterThrow") ? "io_error" : "aborted"));
+		assert.equal(client.pendingCount, 0);
+		assert.equal(timers.size, 0, "settlement leaves no timer");
+		assert.equal(socket.listenerCount("connect"), 0, `${mode} removes its owned connect listener`);
+		assert.equal(socket.listenerCount("data"), 1, `${mode} preserves external data listeners`);
+		assert.equal(socket.listenerCount("end"), 0, `${mode} removes its owned end listener`);
+		assert.equal(socket.listenerCount("close"), 0, `${mode} removes its owned close listener`);
+		assert.equal(socket.listenerCount("error"), 1, `${mode} preserves external error listeners`);
+		socket.emit("error", new Error("late"));
+		assert.equal(socket.writes, mode === "write" ? 1 : 0);
+	}
+});
+
 test("Windows listener registers its callback before listen and cancels a start/close race", async () => {
 	const record = Object.freeze({ version: 1 as const, sessionId: "recipient", endpoint: "\\\\.\\pipe\\gentle-pi-0123456789abcdef0123456789abcdef", createdAt: 1 });
 	let registered: unknown;
@@ -389,6 +538,55 @@ test("Windows listener failure during a listen reply race cannot reactivate it",
 	assert.equal(listener.status, "idle");
 	assert.equal(listener.record, undefined);
 	bridge.child.emit("exit", 1, null);
+});
+
+test("Windows listener stop revokes a matching pending epoch before its late listen reply", async () => {
+	const child = new FakeTransportChild();
+	let callbacks = 0, failures = 0;
+	const host = new WindowsSessionTransportHost({ spawnProcess: () => child as never, callback: async () => { callbacks++; return true; } });
+	host.setListenerFailure(() => { failures++; });
+	const emit = (line: string) => child.stdout.emit("data", Buffer.from(`${line}\n`));
+	const ready = host.start(); emit('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}'); await ready;
+	const record = Object.freeze({ version: 1 as const, sessionId: "recipient", endpoint: testEndpoint, createdAt: 1 });
+	const pending = host.listen("recipient", 1);
+	const unrelated = host.stopListener(Object.freeze({ ...record, sessionId: "other" }));
+	emit('{"requestId":"stop-listener-3","ok":true,"result":{"state":"initialized","bootstrap":"complete"}}');
+	await unrelated;
+	emit(`{"event":"notification","connectionId":"unrelated-1","generation":1,"wire":"${notificationWire("unrelated-1")}"}`);
+	await nextTurn();
+	assert.equal(callbacks, 1, "a different identity cannot revoke the pending listener");
+	const stopping = host.stopListener(record);
+	emit(`{"event":"notification","connectionId":"stopped-1","generation":1,"wire":"${notificationWire("stopped-1")}"}`);
+	emit('{"event":"listener-failed","generation":1,"error":"unavailable"}');
+	emit('{"requestId":"stop-listener-5","ok":true,"result":{"state":"initialized","bootstrap":"complete"}}');
+	await stopping;
+	emit(`{"requestId":"listen-2","ok":true,"result":{"version":1,"sessionId":"recipient","endpoint":"${testEndpoint.replaceAll("\\", "\\\\")}","createdAt":1}}`);
+	await assert.rejects(pending, /Windows transport listener failed/);
+	await nextTurn();
+	assert.equal(callbacks, 1, "the revoked pending epoch cannot notify");
+	assert.equal(failures, 0, "the revoked pending epoch cannot fail the current listener");
+	const fresh = host.listen("recipient", 2);
+	assert.match(child.lines.at(-1) ?? "", /"operation":"listen".*"generation":2/);
+	emit(`{"requestId":"listen-6","ok":true,"result":{"version":1,"sessionId":"recipient","endpoint":"${testEndpoint.replaceAll("\\", "\\\\")}","createdAt":2}}`);
+	await fresh;
+	emit(`{"event":"notification","connectionId":"fresh-1","generation":2,"wire":"${notificationWire("fresh-1")}"}`);
+	await nextTurn();
+	assert.equal(callbacks, 2, "the fresh reserved epoch remains usable");
+	child.emit("exit", 1, null);
+});
+
+test("Windows helper exit fails a pending listener once before its listen reply", async () => {
+	const child = new FakeTransportChild();
+	let failures = 0;
+	const host = new WindowsSessionTransportHost({ spawnProcess: () => child as never });
+	host.setListenerFailure(() => { failures++; });
+	const emit = (line: string) => child.stdout.emit("data", Buffer.from(`${line}\n`));
+	const ready = host.start(); emit('{"requestId":"start-1","ok":true,"result":{"state":"partial"}}'); await ready;
+	const pending = host.listen("recipient", 1);
+	child.emit("exit", 1, null);
+	await assert.rejects(pending, /Windows transport host exited/);
+	assert.equal(failures, 1, "unexpected helper exit must report the owned pending generation once");
+	child.emit("close", 1, null);
 });
 
 test("Windows listener propagates unexpected helper exit or abort while normal close remains idempotent", async () => {

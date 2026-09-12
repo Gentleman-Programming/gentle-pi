@@ -19,9 +19,46 @@ Any phase that selects, continues, applies, verifies, syncs, or archives an SDD 
 - For non-authoritative stores (`engram`, `none`, and `both` without an `openspec/` directory), do not treat disk status output as authoritative; follow Engine Authority by Store below.
 - Runtime-attempt authority is different from artifact dispatch: normal runtime-bearing OpenSpec and Engram continuations MUST bracket external execution with `gentle-ai sdd-attempt acquire|settle --cwd <repo> --change <change>`. Their bounded result contains only `proceed`, `blocked`, or `complete` plus an opaque continuation token when required, and MAY carry `settle_obligation` on a `proceed`. The Git-common-dir immutable chain remains the sole authority for ordinals, cumulative attempt/line budgets, runtime evidence, and atomic bound remediation.
 - A phase actor launched BY a parent that already holds a `proceed`-state acquire for that exact work unit is a distinct call/process, not a fresh continuation: it MUST NOT `acquire` again blind. Colliding with its own parent's active attempt is not a genuine `blocked: active_attempt` (#2291). It authenticates as that SAME attempt by passing the parent's returned token on its own `acquire --token <token>` call: a token matching the ledger's live active attempt returns `proceed` with that same token and zero mutation, while a non-matching token gets the ordinary `blocked: active_attempt` naming the real active token.
-- When `blockedReasons` is non-empty, do not proceed to terminal, archive, or apply work. Return or report `blockedReasons` and stop unless `nextRecommended` is `verify`, in which case verification may run only to remediate or refresh evidence for the blockers. When `nextRecommended` is `resolve-blockers`, always report `blockedReasons` and stop. When `nextRecommended` is a planning token (`propose`, `spec`, `design`, or `tasks`), launch the corresponding planning phase — missing planning artifacts are the expected output of those phases, not genuine blockers.
-- `nextRecommended` is a bounded machine token for routing, not human prose. Route only by `nextRecommended` and dependency states. Human-readable explanation belongs in `blockedReasons`, not `nextRecommended`.
+- Apply the Bounded Planning Routing contract below: a blocked apply dependency is not a blanket veto on planning. Non-planning phases must still obey their own dependency gates.
+- `nextRecommended` is a bounded machine token for routing, not human prose. Route only by `nextRecommended` and dependency states. A genuine blocker's human-readable explanation belongs in `blockedReasons`; a non-blocking diagnostic belongs in `notes`; neither belongs in `nextRecommended`.
 - If the binary is unavailable, fall back to this prompt contract and the manual status schema below. Manual fallback status MUST stay shape-compatible with the native status JSON even when values are reconstructed manually.
+
+## Bounded Planning Routing
+
+For authoritative native status, route only by the bounded `nextRecommended` token and dependency states; never infer a route from prose. Keep genuine blockers in `blockedReasons` and non-blocking diagnostics in `notes`, never in `nextRecommended`, and report them without discarding them to enable a route.
+
+| `nextRecommended` | Planning route |
+| --- | --- |
+| `propose` | `sdd-proposal` |
+| `spec` | `sdd-spec` |
+| `design` | `sdd-design` |
+| `tasks` | `sdd-tasks` |
+| `sdd-propose` | `sdd-proposal` |
+| `sdd-spec` | `sdd-spec` |
+| `sdd-design` | `sdd-design` |
+| `sdd-tasks` | `sdd-tasks` |
+
+The unprefixed tokens come from the native Gentle AI v2 status contract; the `sdd-*` tokens come from Gentle Pi's local resolver. Both forms authorize the same bounded planning routes.
+
+These planning routes remain runnable when missing planning artifacts leave `dependencies.apply: blocked`; do not require apply readiness to produce those artifacts. This is a planning-only exception, not permission to run apply or another blocked non-planning phase.
+
+Before any planning launch, stop for ambiguous change selection, unresolved session preflight, or unsafe action context. Carry `actionContext` and prove planned writes are within the authoritative workspace or allowed edit roots; workspace-planning without allowed edit roots remains read-only. Planning does not bypass the init guard, pre-proposal gate, or phase approval requirements.
+
+## Bounded Execution Routing
+
+Execution routes accept the native Gentle AI v2 tokens and Gentle Pi's local `sdd-*` tokens without rewriting status:
+
+| `nextRecommended` | Execution route |
+| --- | --- |
+| `apply` | `sdd-apply` |
+| `sdd-apply` | `sdd-apply` |
+| `verify` | `sdd-verify` |
+| `sdd-verify` | `sdd-verify` |
+| `archive` | `sdd-archive` |
+| `sdd-archive` | `sdd-archive` |
+| `sdd-sync` | `sdd-sync` |
+
+For non-planning phases, stop when that phase's dependency is `blocked`. When `nextRecommended` is `blocked` or `resolve-blockers`, report `blockedReasons` and stop. Unknown tokens, including native `remediate`, do not authorize a launch until Pi has an explicit typed remediation transport and executor contract. Non-empty `blockedReasons` forbid apply, sync, and archive work; `verify` or `sdd-verify` may run only when the verify dependency permits it. This alias table does not bypass preflight, selection, action-context, or runtime-attempt authority. The non-authoritative `resolve-via-engram` store carve-out remains separate and does not bypass those gates. `notes` is separate from `blockedReasons` and never gates: a non-empty `notes` never withholds apply, sync, archive, or a terminal route, so report it as informational and proceed when the dependency and `blockedReasons` gates allow.
 
 ## Status Schema
 

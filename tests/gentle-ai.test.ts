@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -12,8 +12,11 @@ import type {
 	Theme,
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
-import { __testing, createGentleAiExtension } from "../extensions/gentle-ai.ts";
-import type { NativeReviewCli } from "../lib/native-review-cli.ts";
+import { __testing, applyModelConfig, applyModelConfigAsync, createGentleAiExtension } from "../extensions/gentle-ai.ts";
+import { PROFILES_KIND, PROFILES_VERSION } from "../lib/agent-profiles.ts";
+import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError, type NativeReviewCli } from "../lib/native-review-cli.ts";
+import { CandidateViewError, type CandidateViewRegistry } from "../lib/review-candidate-view.ts";
+import { installPackageAssets } from "../lib/sdd-preflight.ts";
 import type { ReviewCollectInputV3, ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { cardBody, cardHint, cardTitle, cardTone } from "./gentle-card-text.ts";
@@ -60,6 +63,31 @@ function lifecycleContext(overrides: Record<string, unknown> = {}): Record<strin
 		...overrides,
 	};
 }
+
+test("missing package-local binaries give a direct recovery without attributing the cause to lifecycle scripts", async () => {
+	const result = await __testing.executeReviewControllerOperation(
+		{ operation: "inspect" },
+		process.cwd(),
+		{
+			targetStatus: async () => {
+				throw new NativeReviewCliError(
+					NATIVE_REVIEW_ERROR_CODE.PACKAGE_BINARY_MISSING,
+					"review/status",
+					false,
+					false,
+					"package binary missing",
+				);
+			},
+		} as unknown as NativeReviewCli,
+	);
+
+	assert.equal(result.outcome, "native-status-package-binary-missing");
+	assert.equal(result.recovery_command, "node scripts/install-gentle-ai.mjs");
+	assert.match(String(result.next_action), /installed gentle-pi package directory/);
+	assert.match(String(result.next_action), /GENTLE_PI_SKIP_GENTLE_AI_INSTALL/);
+	assert.match(String(result.next_action), /remove or unset it before/);
+	assert.match(String(result.reason), /does not prove install lifecycle scripts were disabled/);
+});
 
 test("registered Gentle Review tools render reusable rose lifecycle call rows", () => {
 	const tools = registeredGentleTools();
@@ -177,6 +205,303 @@ test("registered Gentle Review tools preserve result envelopes and redact collap
 	}
 });
 
+interface RoutingConsumerPanel {
+	render(width: number): string[];
+	handleInput(data: string): void;
+}
+
+function routingConsumerFixture(t: test.TestContext, agents = ["worker"]) {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-routing-consumers-"));
+	const configHome = join(root, "global");
+	const agentHome = join(root, "agent-home");
+	const projectPath = join(root, ".pi", "gentle-ai", "models.json");
+	const globalPath = join(configHome, "models.json");
+	const exportPath = join(configHome, "models.export.json");
+	for (const dir of [dirname(projectPath), join(root, "agents"), join(agentHome, "agents"), join(agentHome, "subagents")]) {
+		mkdirSync(dir, { recursive: true });
+	}
+	for (const name of agents) {
+		writeMarkdown(join(root, ".pi", "agents", `${name}.md`), `---\nname: ${name}\ndescription: Worker\n---\nbody\n`);
+	}
+	const previousConfigHome = process.env.GENTLE_PI_CONFIG_HOME;
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const previousHome = process.env.HOME;
+	const previousUserProfile = process.env.USERPROFILE;
+	const isolatedHome = join(root, "home");
+	mkdirSync(isolatedHome, { recursive: true });
+	// Isolate homedir-based discovery on POSIX and Windows.
+	// Package-sibling legacy agents remain subject to discovery assertions.
+	process.env.HOME = isolatedHome;
+	process.env.USERPROFILE = isolatedHome;
+	process.env.GENTLE_PI_CONFIG_HOME = configHome;
+	process.env.GENTLE_PI_AGENT_HOME = agentHome;
+	t.after(() => {
+		if (previousConfigHome === undefined) delete process.env.GENTLE_PI_CONFIG_HOME;
+		else process.env.GENTLE_PI_CONFIG_HOME = previousConfigHome;
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousUserProfile;
+		rmSync(root, { recursive: true, force: true });
+	});
+	const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+	createGentleAiExtension({ nativeReviewCli: null })({
+		on() {},
+		registerTool() {},
+		registerCommand(name, command) { commands.set(name, command); },
+	} as ExtensionAPI);
+	const notifications: Array<{ message: string; severity: string }> = [];
+	// The profiles panel reads the terminal rows to size its full-screen frame, so
+	// the fake UI hands every factory a TUI-shaped stand-in with a mutable height.
+	const fixtureTui = { terminal: { rows: 24 }, requestRender() {} };
+	let panelVisits = 0;
+	const panels: string[] = [];
+	let onPanel = () => ({ type: "cancel", config: {} });
+	let onInput: ((panel: RoutingConsumerPanel) => void) | undefined;
+	const ctx = {
+		cwd: root,
+		hasUI: true,
+		modelRegistry: { getAvailable: async () => [
+			{ provider: "openai", id: "alpha" },
+			{ provider: "openai", id: "beta" },
+		] },
+		ui: {
+			notify(message: string, severity: string) { notifications.push({ message, severity }); },
+			custom: async (factory: (tui: unknown, theme: Theme, keybindings: unknown, done: (result: unknown) => void) => RoutingConsumerPanel) => {
+				let result: unknown;
+				const panel = factory(fixtureTui, { fg: (_color: string, text: string) => text } as unknown as Theme, undefined, (value) => { result = value; });
+				panels.push(stripAnsi(renderComponent(panel)));
+				panelVisits += 1;
+				if (onInput) {
+					onInput(panel);
+					assert.notEqual(result, undefined, "panel input must finish the interaction");
+					return result;
+				}
+				return onPanel();
+			},
+		},
+	} as unknown as Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1];
+	return {
+		root, agentHome, configHome, projectPath, globalPath, exportPath, notifications, panels,
+		tui: fixtureTui as { terminal: { rows: number } },
+		panelVisits: () => panelVisits,
+		onPanel(action: typeof onPanel) { onPanel = action; },
+		onInput(action: (panel: RoutingConsumerPanel) => void) { onInput = action; },
+		run: (name: string) => commands.get(name)!.handler("", ctx),
+	};
+}
+
+test("models saves and clears independent provider review roles without local artifacts", async (t) => {
+	const fixture = routingConsumerFixture(t, []);
+	const roles = ["review-refuter", "review-validator"];
+	assert.deepEqual(
+		__testing.listDiscoverableAgents(fixture.root).map((agent) => agent.name),
+		[],
+		"requires zero discovered agents; check package-sibling legacy agent directories",
+	);
+
+	const assertNoLocalArtifacts = () => {
+		for (const base of [join(fixture.root, ".pi"), fixture.agentHome]) {
+			assert.equal(existsSync(join(base, "subagents.json")), false);
+			for (const dir of ["agents", "subagents"]) {
+				for (const role of roles) {
+					assert.equal(existsSync(join(base, dir, `${role}.md`)), false);
+				}
+			}
+		}
+	};
+	fixture.onInput((panel) => {
+		const initial = renderComponent(panel);
+		for (const role of roles) {
+			assert.equal(initial.split(role).length - 1, 1);
+		}
+		assert.match(initial, /Pi persisted default model/);
+		assert.match(initial, /Pi persisted default effort/);
+		for (const [index, model] of ["alpha", "beta"].entries()) {
+			panel.handleInput("j");
+			panel.handleInput("\r");
+			assert.match(renderComponent(panel), /Pi persisted default model/);
+			assert.doesNotMatch(renderComponent(panel), /Inherit active\/default model/);
+			for (const character of model) panel.handleInput(character);
+			panel.handleInput("\r");
+			panel.handleInput("e");
+			assert.match(renderComponent(panel), /Pi persisted default effort/);
+			assert.doesNotMatch(renderComponent(panel), /Inherit effort/);
+			for (let step = 0; step <= index; step++) panel.handleInput("j");
+			panel.handleInput("\r");
+		}
+		panel.handleInput("\x13");
+	});
+	await fixture.run("gentle:models");
+	assert.deepEqual(JSON.parse(readFileSync(fixture.globalPath, "utf8")), {
+		"review-refuter": { model: "openai/alpha", thinking: "off" },
+		"review-validator": { model: "openai/beta", thinking: "minimal" },
+	});
+	assertNoLocalArtifacts();
+
+	fixture.onInput((panel) => {
+		panel.handleInput("j");
+		panel.handleInput("i");
+		panel.handleInput("\x13");
+	});
+	await fixture.run("gentle:models");
+	assert.deepEqual(JSON.parse(readFileSync(fixture.globalPath, "utf8")), {
+		"review-refuter": {},
+		"review-validator": { model: "openai/beta", thinking: "minimal" },
+	});
+	assertNoLocalArtifacts();
+
+	fixture.onInput((panel) => {
+		panel.handleInput("j");
+		panel.handleInput("j");
+		panel.handleInput("i");
+		panel.handleInput("\x13");
+	});
+	await fixture.run("gentle:models");
+	assert.deepEqual(JSON.parse(readFileSync(fixture.globalPath, "utf8")), {
+		"review-refuter": {},
+		"review-validator": {},
+	});
+	assertNoLocalArtifacts();
+});
+
+test("provider review roles skip migration and both projection paths even when discoverable", async (t) => {
+	const roles = ["review-refuter", "review-validator"];
+	const fixture = routingConsumerFixture(t, [...roles, "worker"]);
+	assert.deepEqual(
+		__testing.listDiscoverableAgents(fixture.root).map((agent) => agent.name).sort(),
+		[...roles, "worker"].sort(),
+		"requires only seeded agents; check package-sibling legacy agent directories",
+	);
+
+	const rolePaths = roles.map((role) => join(fixture.root, ".pi", "agents", `${role}.md`));
+	const originals = rolePaths.map((path) => readFileSync(path, "utf8"));
+	const profilePaths = [
+		join(fixture.root, ".pi", "subagents.json"),
+		join(fixture.agentHome, "subagents.json"),
+	];
+	const profile = `${JSON.stringify({ model_profiles: {
+		"review-refuter": "existing-refuter",
+		"review-validator": "existing-validator",
+	} }, null, 2)}\n`;
+	for (const path of profilePaths) writeMarkdown(path, profile);
+	const assignments = {
+		"review-refuter": { model: "openai/alpha", thinking: "off" as const },
+		"review-validator": { model: "openai/beta", thinking: "minimal" as const },
+	};
+	writeMarkdown(join(fixture.root, ".pi", "settings.json"), JSON.stringify({
+		subagents: { agentOverrides: assignments },
+	}));
+	const assertReservedUnchanged = () => {
+		rolePaths.forEach((path, index) => assert.equal(readFileSync(path, "utf8"), originals[index]));
+		for (const path of profilePaths) assert.equal(readFileSync(path, "utf8"), profile);
+	};
+	await fixture.run("gentle:models");
+	assertReservedUnchanged();
+	for (const role of roles) assert.equal(fixture.panels[0].split(role).length - 1, 1);
+	assert.match(fixture.panels[0], /worker\s+model=inherit, effort=inherit/);
+	for (const apply of [applyModelConfig, applyModelConfigAsync]) {
+		await apply(fixture.root, assignments);
+		assertReservedUnchanged();
+		await apply(fixture.root, { "review-refuter": {}, "review-validator": {} });
+		assertReservedUnchanged();
+	}
+	await applyModelConfigAsync(fixture.root, { worker: { model: "openai/alpha" } });
+	assert.match(readFileSync(join(fixture.root, ".pi", "agents", "worker.md"), "utf8"), /model: openai\/alpha/);
+	assert.ok(JSON.parse(readFileSync(profilePaths[0], "utf8")).model_profiles.worker);
+});
+
+test("models rejects invalid project routing with its selected source path", async (t) => {
+	const fixture = routingConsumerFixture(t);
+	writeFileSync(fixture.projectPath, "[]");
+	await fixture.run("gentle:models");
+	assert.equal(fixture.notifications[0]?.severity, "warning");
+	assert.ok(fixture.notifications[0]?.message.includes(fixture.projectPath));
+	assert.equal(fixture.panelVisits(), 0);
+});
+
+test("export re-reads saved routing and rejects invalid project before creating its destination parent", async (t) => {
+	const fixture = routingConsumerFixture(t);
+	writeFileSync(fixture.projectPath, '{"worker":"openai/gpt-5"}');
+	fixture.onPanel(() => {
+		if (fixture.panelVisits() > 1) return { type: "cancel", config: {} };
+		writeFileSync(fixture.projectPath, "[]");
+		return { type: "export", config: {} };
+	});
+	await fixture.run("gentle:models");
+	assert.equal(fixture.notifications[0]?.severity, "warning");
+	assert.ok(fixture.notifications[0]?.message.includes(`Invalid model config: ${fixture.projectPath}`));
+	assert.equal(existsSync(fixture.exportPath), false);
+	assert.equal(existsSync(fixture.configHome), false);
+});
+
+test("status reports invalid saved routing path instead of default agent routing", async (t) => {
+	const fixture = routingConsumerFixture(t);
+	writeFileSync(fixture.projectPath, "[]");
+	await fixture.run("gentle:status");
+	const report = fixture.notifications.at(-1)!;
+	assert.match(report.message, /Saved model routing: invalid/);
+	assert.ok(report.message.includes(fixture.projectPath));
+	assert.equal(report.severity, "warning");
+	assert.doesNotMatch(report.message, /worker: model=/);
+});
+
+test("models exports missing, normalized project, and global-precedence saved routing", async (t) => {
+	for (const source of ["missing", "project", "global"] as const) {
+		await t.test(source, async (t) => {
+			const fixture = routingConsumerFixture(t);
+			if (source !== "missing") writeFileSync(fixture.projectPath, '{"worker":" openai/gpt-5 ","ignored":null}');
+			if (source === "global") writeMarkdown(fixture.globalPath, '{"worker":{"model":" anthropic/opus ","thinking":"high"}}');
+			fixture.onPanel(() => ({ type: fixture.panelVisits() === 1 ? "export" : "cancel", config: {} }));
+			await fixture.run("gentle:models");
+			const agents = source === "missing" ? {} : source === "project"
+				? { worker: { model: "openai/gpt-5" } }
+				: { worker: { model: "anthropic/opus", thinking: "high" } };
+			assert.deepEqual(JSON.parse(readFileSync(fixture.exportPath, "utf8")).agents, agents);
+			assert.equal(fixture.notifications[0]?.severity, "info");
+			assert.match(fixture.notifications[0]!.message, /exported/);
+			assert.equal(fixture.panelVisits(), 2);
+			await fixture.run("gentle:status");
+			const report = fixture.notifications.at(-1)!.message;
+			assert.ok(report.includes(`Saved model routing: ${source === "missing" ? "missing" : "valid"}`));
+			assert.ok(report.includes(`Global model config: ${source === "global" ? "present" : "missing"}`));
+			const expectedRouting = source === "missing" ? "inherit, effort=inherit"
+				: source === "project" ? "openai/gpt-5, effort=inherit" : "anthropic/opus, effort=high";
+			assert.ok(report.includes(`worker: model=${expectedRouting}`), report);
+			assert.ok(fixture.panels[0].includes(`model=${expectedRouting}`), fixture.panels[0]);
+		});
+	}
+});
+
+test("invalid global routing overrides valid project in models, status, and export re-read", async (t) => {
+	for (const atExport of [false, true]) {
+		await t.test(atExport ? "invalidated during panel" : "invalid before panel", async (t) => {
+			const fixture = routingConsumerFixture(t);
+			writeFileSync(fixture.projectPath, '{"worker":"openai/gpt-5"}');
+			if (!atExport) writeMarkdown(fixture.globalPath, "[]");
+			fixture.onPanel(() => {
+				if (fixture.panelVisits() > 1) return { type: "cancel", config: {} };
+				writeMarkdown(fixture.globalPath, "[]");
+				return { type: "export", config: {} };
+			});
+			await fixture.run("gentle:models");
+			assert.equal(fixture.notifications[0]?.severity, "warning");
+			assert.ok(fixture.notifications[0]?.message.includes(fixture.globalPath));
+			assert.match(fixture.notifications[0]!.message, atExport ? /export failed/ : /cannot open model config/);
+			assert.equal(fixture.panelVisits(), atExport ? 2 : 0);
+			assert.equal(existsSync(fixture.exportPath), false);
+			await fixture.run("gentle:status");
+			const report = fixture.notifications.at(-1)!;
+			assert.match(report.message, /Global model config: present\nSaved model routing: invalid/);
+			assert.ok(report.message.includes(fixture.globalPath));
+			assert.doesNotMatch(report.message, /worker: model=/);
+			assert.equal(report.severity, "warning");
+		});
+	}
+});
+
 test("session startup reports invalid project routing without mutating the profile", async (t) => {
 	const root = mkdtempSync(join(tmpdir(), "gentle-pi-model-routing-startup-"));
 	const configHome = join(root, "global");
@@ -241,6 +566,21 @@ test("session startup reports invalid project routing without mutating the profi
 	assert.equal(warning!.severity, "warning");
 	assert.match(warning!.message, /skipped model config/);
 	assert.equal(readFileSync(profilePath, "utf8"), before);
+
+	writeFileSync(join(projectConfigDir, "models.json"), '{"worker":"openai/gpt-5"}');
+	const globalPath = join(configHome, "models.json");
+	writeFileSync(globalPath, "[]");
+	notifications.length = 0;
+	await sessionStart!({}, {
+		cwd: root,
+		hasUI: true,
+		ui: { notify(message: string, severity: string) { notifications.push({ message, severity }); } },
+	} as unknown as ExtensionContext);
+	const globalWarning = notifications.find((entry) => entry.message.includes(globalPath));
+	assert.ok(globalWarning, JSON.stringify(notifications));
+	assert.equal(globalWarning.severity, "warning");
+	assert.match(globalWarning.message, /skipped model config/);
+	assert.equal(readFileSync(profilePath, "utf8"), before);
 });
 
 test("agent discovery skips skills directories", async (t) => {
@@ -266,6 +606,82 @@ test("agent discovery skips skills directories", async (t) => {
 		asyncAgents.map((agent) => agent.name),
 		["review-risk", "worker"],
 	);
+});
+
+test("managed routing timeout leaves its profile, agent, and manifest unchanged", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-managed-routing-timeout-"));
+	const agentHome = join(root, "agent-home");
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	t.after(() => {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	process.env.GENTLE_PI_AGENT_HOME = agentHome;
+	installPackageAssets(root, false, ["sdd"]);
+	const agentPath = join(agentHome, "agents", "sdd-apply.md");
+	const manifestPath = join(agentHome, "gentle-ai", "managed-assets.json");
+	const profilePath = join(agentHome, "subagents.json");
+	const profileBefore = "{\n  \"unrelated\": true\n}\n";
+	writeFileSync(profilePath, profileBefore);
+	const agentBefore = readFileSync(agentPath, "utf8");
+	const manifestBefore = readFileSync(manifestPath, "utf8");
+	writeFileSync(
+		join(agentHome, "gentle-ai", "managed-assets.lock"),
+		JSON.stringify({ schemaVersion: 1, token: "foreign", pid: process.pid, createdAtMs: Date.now() }),
+	);
+
+	assert.throws(
+		() => applyModelConfig(root, { "sdd-apply": { model: "test/managed", thinking: "high" } }),
+		/Timed out acquiring managed-assets lock file/i,
+	);
+	assert.equal(readFileSync(profilePath, "utf8"), profileBefore);
+	assert.equal(readFileSync(agentPath, "utf8"), agentBefore);
+	assert.equal(readFileSync(manifestPath, "utf8"), manifestBefore);
+});
+
+test("a later alias keeps managed-root precedence and manifest ownership", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-agent-root-alias-"));
+	const agentHome = join(root, "agent-home");
+	const home = join(root, "home");
+	const cwd = join(root, "project");
+	const managed = join(agentHome, "agents");
+	const intervening = join(agentHome, "subagents");
+	const alias = join(home, ".agents");
+	const previousAgentHome = process.env.GENTLE_PI_AGENT_HOME;
+	const previousHome = process.env.HOME;
+	const previousUserProfile = process.env.USERPROFILE;
+	t.after(() => {
+		if (previousAgentHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+		else process.env.GENTLE_PI_AGENT_HOME = previousAgentHome;
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousUserProfile;
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	process.env.GENTLE_PI_AGENT_HOME = agentHome;
+	process.env.HOME = home;
+	process.env.USERPROFILE = home;
+	installPackageAssets(cwd, false, ["sdd"]);
+	writeMarkdown(join(intervening, "sdd-apply.md"), "---\nname: sdd-apply\n---\nintervening override\n");
+	mkdirSync(home, { recursive: true });
+	try {
+		symlinkSync(managed, alias, process.platform === "win32" ? "junction" : "dir");
+	} catch (error) {
+		t.skip(`directory aliases unavailable: ${error instanceof Error ? error.message : String(error)}`);
+		return;
+	}
+
+	const selected = __testing.listDiscoverableAgents(cwd).find((agent) => agent.name === "sdd-apply");
+	assert.equal(selected?.filePath, join(managed, "sdd-apply.md"));
+	applyModelConfig(cwd, { "sdd-apply": { model: "test/managed", thinking: "high" } });
+	const manifest = JSON.parse(readFileSync(join(agentHome, "gentle-ai", "managed-assets.json"), "utf8")) as { assets: Record<string, string> };
+	const routed = readFileSync(join(managed, "sdd-apply.md"), "utf8");
+	assert.match(routed, /^model: test\/managed$/m);
+	assert.equal(manifest.assets["agents/sdd-apply.md"], createHash("sha256").update(routed).digest("hex"));
 });
 
 test("runtime guidance keeps review policy out of the static orchestrator", () => {
@@ -375,6 +791,83 @@ test("ordinary native capture exposes a registered schema and STATUS binding cop
 	}, process.cwd(), native);
 	assert.equal(captured.status, "captured");
 	assert.equal(launches, 1);
+});
+
+test("ordinary START reports candidate-owner preparation failure as pre-native no mutation", async () => {
+	let nativeStarts = 0;
+	const target = {
+		contract: "gentle-ai.review-integration/v2",
+		applicability: "unrelated",
+		action: "start",
+		replayability: "not_replayable",
+		targetIdentity: "a".repeat(64),
+		projection: {
+			schema: "gentle-ai.review-candidate-projection/v1",
+			kind: "current-changes",
+			projection: "workspace",
+			baseTree: "b".repeat(40),
+			initialReviewTree: "b".repeat(40),
+			currentCandidateTree: "b".repeat(40),
+			pathsDigest: "a".repeat(64),
+			paths: [],
+			intendedUntracked: [],
+			intendedUntrackedProof: "a".repeat(64),
+			initialSnapshotIdentity: "a".repeat(64),
+			currentSnapshotIdentity: "a".repeat(64),
+		},
+		candidates: [],
+		raw: { schema: "gentle-ai.review-integration.status/v5" },
+	} as unknown as ReviewStatusV3;
+	const native = {
+		targetStatus: async () => target,
+		start: async () => { nativeStarts += 1; throw new Error("native START must not run"); },
+	} as unknown as NativeReviewCli;
+	const candidateViews = {
+		createOrReuse: () => { throw new CandidateViewError("candidate view owner preparation failed", "candidate-owner-preparation-failed"); },
+	} as unknown as CandidateViewRegistry;
+	const result = await __testing.executeReviewControllerOperation(
+		{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+		process.cwd(),
+		native,
+		undefined,
+		candidateViews,
+	);
+	assert.equal(nativeStarts, 0);
+	assert.equal(result.outcome, "native-operation-failed");
+	assert.equal(result.mutation_outcome, "none");
+	assert.deepEqual(result.diagnostics, {
+		code: "candidate-owner-preparation-failed",
+		message: "candidate view rejected before native START",
+	});
+
+	let statusCalls = 0;
+	const afterNative = await __testing.executeReviewControllerOperation(
+		{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+		process.cwd(),
+		{
+			targetStatus: async () => { statusCalls += 1; return target; },
+			start: async () => {
+				nativeStarts += 1;
+				throw new CandidateViewError("post-native candidate verification failed", "candidate-view-timeout", {
+					phase: "candidate-view",
+					category: "timeout",
+					git_subcommand: "worktree",
+					timeout_ms: 10_000,
+					max_buffer_bytes: 64 * 1024 * 1024,
+					message: "candidate-view Git command worktree timed out after 10000ms; inspect the candidate state before any new START",
+				});
+			},
+		} as unknown as NativeReviewCli,
+		undefined,
+		null,
+	);
+	assert.equal(nativeStarts, 1);
+	assert.equal(statusCalls, 2, "a post-native diagnostic must reconcile STATUS");
+	assert.equal(afterNative.mutation_outcome, "unknown");
+	assert.deepEqual(afterNative.diagnostics, {
+		code: "candidate-view-timeout",
+		message: "post-native candidate verification failed",
+	});
 });
 
 test("agent model discovery prioritizes SDD and Judgment Day agents", (t) => {
@@ -991,7 +1484,6 @@ test("permission lifecycle is inactive for unguarded and headless commands", asy
 		rmSync(cwd, { recursive: true, force: true });
 	}
 });
-
 test("registered Gentle Review capture tools name the lens they run", () => {
 	const tools = registeredGentleTools();
 	const binding = (lens: string) => JSON.stringify({ name: "reviewer_result", captureOperation: "review.capture-result", arguments: [], artifactSubject: { lens } });
@@ -1005,4 +1497,243 @@ test("registered Gentle Review capture tools name the lens they run", () => {
 		lifecycleContext({ executionStarted: true }),
 	);
 	assert.equal(cardTitle(renderComponent(group)), "🌹︎ Gentle AI · running · review capture group · risk · resilience · readability · reliability");
+});
+
+test("bash tool_call confirms a late guarded npm publish and denies on non-approval", async () => {
+	type ToolCallHandler = (
+		event: { toolName: string; input: unknown },
+		ctx: ExtensionContext,
+	) => Promise<ToolCallEventResult | undefined>;
+
+	const confirmArgs: Array<[string, string]> = [];
+	const handlers = new Map<string, ToolCallHandler>();
+	const pi = {
+		on(name: string, handler: ToolCallHandler) {
+			handlers.set(name, handler);
+		},
+		events: { emit() {} },
+		registerCommand() {},
+		registerTool() {},
+	} as unknown as ExtensionAPI;
+	createGentleAiExtension({ nativeReviewCli: null })(pi);
+	const toolCall = handlers.get("tool_call");
+	assert.equal(typeof toolCall, "function");
+
+	const configHome = mkdtempSync(join(tmpdir(), "gentle-pi-guard-confirm-"));
+	const ctx = {
+		cwd: process.cwd(),
+		hasUI: true,
+		ui: {
+			confirm: async (title: string, message: string) => {
+				confirmArgs.push([title, message]);
+				return false;
+			},
+		},
+	} as ExtensionContext;
+
+	const prefix = "noise ".repeat(80);
+	const command = `${prefix}npm publish --tag beta`;
+	const previousConfigHome = process.env.GENTLE_PI_CONFIG_HOME;
+	process.env.GENTLE_PI_CONFIG_HOME = configHome;
+	try {
+		const result = await toolCall!({ toolName: "bash", input: { command } }, ctx);
+		assert.deepEqual(result, {
+			block: true,
+			reason:
+				"Gentle AI safety policy blocked the command because it was not confirmed.",
+		});
+	} finally {
+		if (previousConfigHome === undefined) delete process.env.GENTLE_PI_CONFIG_HOME;
+		else process.env.GENTLE_PI_CONFIG_HOME = previousConfigHome;
+		rmSync(configHome, { recursive: true, force: true });
+	}
+
+	assert.equal(confirmArgs.length, 1, "guard asks exactly one confirmation before denying");
+	const [title, preview] = confirmArgs[0];
+	assert.equal(title, "Allow guarded npm publish?");
+	assert.match(preview, /npm publish --tag beta/);
+	assert.ok(preview.startsWith("…"), "preview elides leading context near a late match");
+});
+
+test("bash tool_call confirms every compound action and centers a long git -C push", async () => {
+	type ToolCallHandler = (
+		event: { toolName: string; input: unknown },
+		ctx: ExtensionContext,
+	) => Promise<ToolCallEventResult | undefined>;
+	const confirmArgs: Array<[string, string]> = [];
+	const handlers = new Map<string, ToolCallHandler>();
+	const pi = {
+		on(name: string, handler: ToolCallHandler) { handlers.set(name, handler); },
+		events: { emit() {} },
+		registerCommand() {},
+		registerTool() {},
+	} as unknown as ExtensionAPI;
+	createGentleAiExtension({ nativeReviewCli: null })(pi);
+	const toolCall = handlers.get("tool_call");
+	assert.equal(typeof toolCall, "function");
+
+	const configHome = mkdtempSync(join(tmpdir(), "gentle-pi-guard-compound-"));
+	const previousConfigHome = process.env.GENTLE_PI_CONFIG_HOME;
+	process.env.GENTLE_PI_CONFIG_HOME = configHome;
+	try {
+		const command = `git -C /${"very-long-path/".repeat(30)} push origin main && npm publish --tag beta`;
+		const result = await toolCall!({ toolName: "bash", input: { command } }, {
+			cwd: process.cwd(),
+			hasUI: true,
+			ui: { confirm: async (title: string, message: string) => (confirmArgs.push([title, message]), false) },
+		} as ExtensionContext);
+		assert.deepEqual(result, {
+			block: true,
+			reason: "Gentle AI safety policy blocked the command because it was not confirmed.",
+		});
+	} finally {
+		if (previousConfigHome === undefined) delete process.env.GENTLE_PI_CONFIG_HOME;
+		else process.env.GENTLE_PI_CONFIG_HOME = previousConfigHome;
+		rmSync(configHome, { recursive: true, force: true });
+	}
+
+	assert.equal(confirmArgs.length, 1);
+	const [title, preview] = confirmArgs[0];
+	assert.equal(title, "Allow guarded actions: git push; npm publish?");
+	assert.match(preview, /push origin main && npm publish --tag beta/);
+	assert.ok(preview.startsWith("…"));
+});
+// /gentle:profiles reopens its panel after every action, so a test that applies
+// once must confirm on the first visit and close on the next, or the panel and
+// the action loop feed each other forever.
+function applyOnce(
+	fixture: { onInput(action: (panel: { handleInput(data: string): void }) => void): void },
+): void {
+	let visits = 0;
+	fixture.onInput((panel) => {
+		visits += 1;
+		panel.handleInput(visits === 1 ? "\r" : "\x1b");
+	});
+}
+
+function profilesStoreFixture(t: test.TestContext) {
+	const fixture = routingConsumerFixture(t, ["worker"]);
+	const storePath = join(fixture.configHome, "profiles.json");
+	const settingsPath = join(fixture.agentHome, "settings.json");
+	const writeStore = (profiles: Record<string, unknown>, active?: string) => {
+		mkdirSync(fixture.configHome, { recursive: true });
+		const store: Record<string, unknown> = { kind: PROFILES_KIND, version: PROFILES_VERSION, profiles };
+		if (active !== undefined) store.active = active;
+		writeFileSync(storePath, `${JSON.stringify(store, null, 2)}\n`);
+	};
+	const writeSettings = (extra: Record<string, unknown> = {}) => {
+		const settings = {
+			packages: ["npm:pi-mcp-adapter"],
+			theme: "Gentleman-Cute",
+			defaultProvider: "nan",
+			defaultModel: "deepseek-v4-flash",
+			defaultThinkingLevel: "high",
+			...extra,
+		};
+		writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+		return settings;
+	};
+	return { fixture, storePath, settingsPath, writeStore, writeSettings };
+}
+
+test("applying a profile persists its orchestrator and never leaks the key into agent routing", async (t) => {
+	const { fixture, settingsPath, writeStore, writeSettings } = profilesStoreFixture(t);
+	const before = writeSettings();
+	writeStore({
+		team: {
+			orchestrator: { model: "nan/glm5.3", thinking: "max" },
+			worker: { model: "openai/alpha" },
+		},
+	});
+	applyOnce(fixture);
+	await fixture.run("gentle:profiles");
+
+	const after = JSON.parse(readFileSync(settingsPath, "utf8"));
+	assert.equal(after.defaultProvider, "nan");
+	assert.equal(after.defaultModel, "glm5.3");
+	assert.equal(after.defaultThinkingLevel, "max");
+	assert.deepEqual(after.packages, before.packages, "unrelated settings keys survive");
+	assert.equal(after.theme, before.theme, "unrelated settings keys survive");
+
+	// The reserved key is routing, not an agent: it must never reach the
+	// subagent profile store or the agent frontmatter.
+	const projectProfiles = JSON.parse(readFileSync(join(fixture.root, ".pi", "subagents.json"), "utf8"));
+	assert.equal("orchestrator" in projectProfiles.model_profiles, false);
+	assert.equal(readFileSync(join(fixture.root, ".pi", "agents", "worker.md"), "utf8"), readFileSync(join(fixture.root, ".pi", "agents", "worker.md"), "utf8"));
+	assert.match(readFileSync(join(fixture.root, ".pi", "agents", "worker.md"), "utf8"), /model: openai\/alpha/);
+	const applied = fixture.notifications.at(-1)?.message ?? "";
+	assert.match(applied, /Orchestrator set to nan\/glm5\.3 · max/);
+});
+
+test("applying a profile without an orchestrator entry leaves settings.json untouched", async (t) => {
+	const { fixture, settingsPath, writeStore, writeSettings } = profilesStoreFixture(t);
+	writeSettings();
+	writeStore({ team: { worker: { model: "openai/alpha" } } });
+	applyOnce(fixture);
+	await fixture.run("gentle:profiles");
+
+	const after = JSON.parse(readFileSync(settingsPath, "utf8"));
+	assert.equal(after.defaultProvider, "nan");
+	assert.equal(after.defaultModel, "deepseek-v4-flash");
+	assert.equal(after.defaultThinkingLevel, "high");
+	const applied = fixture.notifications.at(-1)?.message ?? "";
+	assert.doesNotMatch(applied, /Orchestrator set to/);
+});
+
+test("a profile store entry with only the orchestrator key counts zero roles", async (t) => {
+	const { fixture, writeStore } = profilesStoreFixture(t);
+	writeStore({ team: { orchestrator: { model: "nan/glm5.3", thinking: "high" } } }, "team");
+	applyOnce(fixture);
+	await fixture.run("gentle:profiles");
+	const applied = fixture.notifications.at(-1)?.message ?? "";
+	assert.match(applied, /0 agents updated/);
+	assert.match(applied, /Orchestrator set to nan\/glm5\.3 · high/);
+});
+
+test("the profiles panel fills the terminal, lists routing per agent, and scrolls", async (t) => {
+	const { fixture, writeStore } = profilesStoreFixture(t);
+	writeStore({
+		team: {
+			orchestrator: { model: "nan/glm5.3", thinking: "high" },
+			worker: { model: "openai/alpha", thinking: "high" },
+			"sdd-design": { model: "nan/glm5.3", thinking: "high" },
+		},
+	}, "team");
+	let rendered: string | undefined;
+	let panel: { render(width: number): string[] } | undefined;
+	fixture.onInput((visited) => {
+		panel = visited;
+		rendered = renderComponent(visited);
+		visited.handleInput("\x1b");
+	});
+	await fixture.run("gentle:profiles");
+
+	assert.ok(rendered);
+	const lines = rendered.split("\n");
+	// The frame spans the terminal height the fake TUI reports.
+	assert.equal(lines.length, 24, `expected 24 rows, got ${lines.length}`);
+	assert.match(lines[0], /^╭/);
+	assert.match(lines.at(-1)!, /^╰/);
+	const text = rendered;
+	// Routing is listed one agent per line, aligned in columns, never collapsed
+	// into "N agents → model: a, b, …" summaries.
+	assert.match(text, /Profile routing/);
+	assert.match(text, /Current routing \(models\.json\)/);
+	assert.match(text, /orchestrator\s+nan\/glm5\.3 · high/);
+	assert.match(text, /worker\s+openai\/alpha\s+high/);
+	assert.match(text, /sdd-design\s+nan\/glm5\.3\s+high/);
+	assert.doesNotMatch(text, /agents? → /);
+
+	// A taller terminal renders a taller frame with the same content.
+	fixture.tui.terminal.rows = 40;
+	const taller = renderComponent(panel);
+	assert.equal(taller.split("\n").length, 40);
+
+	// A short terminal clamps instead of crashing, and keeps both borders.
+	fixture.tui.terminal.rows = 9;
+	const short = stripAnsi(panel.render(120).map((line) => line.replace(/[ \t]+$/g, "")).join("\n"));
+	const shortLines = short.split("\n");
+	assert.equal(shortLines.length, 9);
+	assert.match(shortLines[0], /^╭/);
+	assert.match(shortLines.at(-1)!, /^╰/);
 });

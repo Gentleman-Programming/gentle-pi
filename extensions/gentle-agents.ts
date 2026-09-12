@@ -6,11 +6,13 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join, resolve } from "node:path";
 import { keyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, type TUI } from "@earendil-works/pi-tui";
 import { sidebarPart } from "../lib/shell-sidebar.ts";
+import { invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
+import { createCompletionQueue } from "../lib/agents-completion-delivery.ts";
 import { AGENT_MODE, discoverAgents, loadAgentsConfig, resolveAgentProfile, type AgentDefinition, type AgentMode } from "../lib/agents-config.ts";
 import { isFinished, TASK_STATUS, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
-import { AgentRunner, piCommand, type AskAnswer, type RunnerDeps, type TaskRequest } from "../lib/agents-runner.ts";
+import { AgentRunner, piCommand, abortReasonText, type AskAnswer, type RunnerDeps, type SddChangeSelection, type TaskRequest } from "../lib/agents-runner.ts";
 import { ChildMessenger, type IpcEndpoint } from "../lib/agents-messaging.ts";
 import { ActiveSessionClient, ActiveSessionListener, SessionPresenceRegistry, type PresenceRecord, type ReceivedNotification, type SentNotification, type SessionPresenceCandidate } from "../lib/agents-session-transport.ts";
 import { WindowsActiveSessionClient, WindowsActiveSessionListener, WindowsSessionPresenceRegistry, type WindowsSessionRegistryPhaseObserver } from "../lib/windows-session-transport.ts";
@@ -24,6 +26,10 @@ import { AGENTS_GLYPH, renderAgentsCard, widgetExpiryMs, widgetRows } from "../l
 import { CARD_TONE, renderCard } from "../lib/shell-card.ts";
 import { openInExternalEditor } from "./gentle-shell.ts";
 import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
+import { researchAgent, resolveResearchCapabilities, renderResearchCapabilities, RESEARCH_CHILD_TOOLS_ENV } from "../lib/sdd-research-capabilities.ts";
+import { CHILD_METRICS_EVENT, CHILD_METRICS_REVOKED, childEvent, launchSelection, type LaunchSelection } from "../lib/runtime-metrics-children.ts";
+import { lookupPiCatalogName } from "../lib/runtime-metrics-pi-identity.ts";
+import { runtimeMetricsEnvAllows, type RuntimeMetricsPolicyDeps } from "../lib/runtime-metrics-policy.ts";
 
 // Gentle Agents: subagents as isolated `pi --mode rpc` children, a task
 // store that notifies per task, and a Gentle Shell card above the editor.
@@ -35,12 +41,39 @@ export const AGENTS_COMMAND_NAME = "gentle:agents";
 export const AGENTS_RESULT_TYPE = "gentle-agents.result";
 export const AGENTS_MESSAGE_TYPE = "gentle-agents.message";
 export const AGENTS_ORCHESTRATOR_MESSAGE_TYPE = "gentle-agents.orchestrator-message";
+export const AGENTS_STALE_RESULT_TYPE = "gentle-agents.stale-result";
 const COLLAPSE_KEY_DEFAULT = "ctrl+shift+a";
 const VIEW_KEY_DEFAULT = "alt+a";
 const STOP_KEY_DEFAULT = "alt+s";
 const RENDER_COALESCE_MS = 400;
 const CLOCK_TICK_MS = 1000;
 const TOOL_PREFIX = "subagent_";
+const SDD_PHASE_BY_AGENT = {
+	"sdd-apply": "apply",
+	"sdd-verify": "verify",
+	"sdd-sync": "sync",
+	"sdd-archive": "archive",
+} as const;
+
+function sddPhaseForAgent(name: string): SddChangeSelection["phase"] | undefined {
+	return SDD_PHASE_BY_AGENT[name as keyof typeof SDD_PHASE_BY_AGENT];
+}
+
+function parseSddChange(value: unknown, agentName: string): SddChangeSelection | undefined {
+	if (value === undefined) return undefined;
+	const expectedPhase = sddPhaseForAgent(agentName);
+	if (!expectedPhase) throw new Error("sdd_change is allowed only for SDD apply, verify, sync, or archive agents.");
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("sdd_change must be an object with changeName, workspaceRoot, and phase.");
+	const selection = value as Record<string, unknown>;
+	const keys = Object.keys(selection).sort();
+	if (keys.join(",") !== "changeName,phase,workspaceRoot" ||
+		typeof selection.changeName !== "string" || selection.changeName.length === 0 ||
+		typeof selection.workspaceRoot !== "string" || selection.workspaceRoot.length === 0 ||
+		selection.phase !== expectedPhase) {
+		throw new Error("sdd_change must contain only a non-empty changeName, workspaceRoot, and the agent's matching phase.");
+	}
+	return { changeName: selection.changeName, workspaceRoot: selection.workspaceRoot, phase: selection.phase };
+}
 
 export interface SessionTransportRegistry {
 	list(excludeSessionId?: string): Promise<readonly SessionPresenceCandidate[]>;
@@ -72,6 +105,10 @@ export interface AgentsDeps extends RunnerDeps {
 	sessionTransport?: SessionTransportFactory;
 	env: NodeJS.ProcessEnv;
 	resolveWorktree: WorktreeResolver;
+	runtimeMetricsPolicy?: RuntimeMetricsPolicyDeps;
+	metricsNow?: () => number;
+	metricsSchedule?: RunnerDeps["schedule"];
+	lookupPiCatalogName?: typeof lookupPiCatalogName;
 }
 
 export function agentRuntimePaths(home: string, agentHome = join(home, ".pi", "agent")): { sessions: string; transcripts: string } {
@@ -257,6 +294,19 @@ export async function answerThroughUi(ui: ExtensionContext["ui"] | undefined, as
 }
 
 export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env, overrides: Partial<AgentsDeps> = {}): void {
+	if (env.GENTLE_PI_AGENTS_CHILD === "1" && env[RESEARCH_CHILD_TOOLS_ENV] !== undefined) {
+		let allowed: string[] = [];
+		try {
+			const parsed: unknown = JSON.parse(env[RESEARCH_CHILD_TOOLS_ENV]!);
+			if (Array.isArray(parsed) && parsed.every(value => typeof value === "string")) allowed = parsed;
+		} catch { /* Invalid launch restrictions deny every tool. */ }
+		pi.on("before_agent_start", event => ({ systemPrompt: `${event.systemPrompt}\n\n${renderResearchCapabilities(resolveResearchCapabilities(pi, allowed))}` }));
+		pi.on("tool_call", event => {
+			if (!allowed.includes(event.toolName) || !pi.getActiveTools().includes(event.toolName)) {
+				return { block: true, reason: "Tool is outside the research child's active launch allowlist." };
+			}
+		});
+	}
 	const childIpc = ownedChildIpc(env, overrides.childIpc ?? (process.send ? process as unknown as IpcEndpoint : undefined));
 	if (env.GENTLE_PI_AGENTS_CHILD === "1") {
 		if (childIpc) registerChildMessaging(pi, childIpc);
@@ -286,6 +336,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const tasksDir = historyDir(deps.home, agentHome);
 	let ui: ExtensionContext["ui"] | undefined;
 	let host: { requestRender(): void } | undefined;
+	let sidebarTui: TUI | undefined;
 	let sessions: ExtensionContext["sessionManager"] | undefined;
 	let presence: PresencePublisher | undefined;
 	const overlays = new Set<AgentsView>();
@@ -313,6 +364,27 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	const ownedTaskIds = new Set<string>();
 	const stoppingTaskIds = new Set<string>();
 	const yieldedTaskIds = new Set<string>();
+	const metricsNow = deps.metricsNow ?? (() => performance.now());
+	const catalogLookup = deps.lookupPiCatalogName ?? lookupPiCatalogName;
+	let metricsOwner = {};
+	const metricTasks = new Map<string, { selection?: LaunchSelection; started: number; launched: boolean; finished: boolean; current(): boolean; valid(): boolean }>();
+	const unsubscribeMetrics = pi.events.on(CHILD_METRICS_REVOKED, id => {
+		if (id === activeSessionId()) {
+			metricsOwner = {};
+			for (const taskId of metricTasks.keys()) runner.discardResponseObservations(taskId);
+			metricTasks.clear();
+		}
+	});
+	const clearTaskMetrics = () => {
+		metricsOwner = {};
+		for (const taskId of metricTasks.keys()) runner.discardResponseObservations(taskId);
+		metricTasks.clear();
+	};
+	pi.on("session_start", clearTaskMetrics);
+	pi.on("session_shutdown", () => {
+		clearTaskMetrics();
+		unsubscribeMetrics();
+	});
 	let stopAllConfirmation: Promise<void> | undefined;
 
 	// The card and its clock follow the session pi has open right now; a task
@@ -399,6 +471,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		renderQueued = true;
 		deps.schedule(() => {
 			renderQueued = false;
+			if (sidebarTui) invalidateSidebar(sidebarTui);
 			host?.requestRender();
 		}, RENDER_COALESCE_MS);
 	};
@@ -421,6 +494,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const expiry = widgetExpiryMs(tasks, deps.now());
 		if (expiry === undefined) return;
 		cancelClock = deps.schedule(() => {
+			if (sidebarTui) invalidateSidebar(sidebarTui);
 			host?.requestRender();
 			tickClock();
 		}, expiry);
@@ -434,17 +508,78 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			.catch(() => {});
 	};
 
-	// A background result is delivered as a message: queued behind the current
-	// turn if the model is busy, or starting a turn right away if it is idle.
+	// A background result used to be handed straight to the host as a followUp
+	// message, but the host only drains that queue when the parent agent stops
+	// calling tools entirely, so in a long orchestrator run the notification
+	// could land nearly an hour after the parent pulled the same result (#867).
+	// Gentle Agents now owns the pending completions: they settle here, are
+	// flushed at the next turn boundary, and a stale one never re-enters the
+	// conversation.
+	const completions = createCompletionQueue<TaskRecord>();
+	let activeAgentRuns = 0;
+
 	const deliver = (task: TaskRecord) => {
-		pi.sendMessage({ customType: AGENTS_RESULT_TYPE, content: completionText(task), display: true, details: taskDetails(task) }, { deliverAs: "followUp", triggerTurn: true });
+		// Ownership is consulted at delivery time, matching onNotification and
+		// onQuery: a completion owned by another session is dropped, not delivered.
+		if (activeSessionId() !== task.parentSessionId) return;
+		// "steer" + triggerTurn keeps delivery bounded to the current turn. While
+		// the parent streams, the host polls steering each turn and injects the
+		// message before the next LLM call; "followUp" is NOT acceptable here
+		// because the host drains the follow-up queue only in the run loop's stop
+		// branch, so a parent that keeps calling tools would see the completion
+		// only when the whole run ends — the original #867 delay. When the parent
+		// is idle, triggerTurn runs the prompt immediately, preserving wake-up.
+		pi.sendMessage({ customType: AGENTS_RESULT_TYPE, content: completionText(task), display: true, details: taskDetails(task) }, { deliverAs: "steer", triggerTurn: true });
 	};
+
+	// A stale completion must not re-enter the LLM conversation, so it is
+	// delivered as durable TUI-only content and the human still sees it.
+	const deliverStale = (task: TaskRecord, settledAt: number) => {
+		if (activeSessionId() !== task.parentSessionId) return;
+		const ageSeconds = Math.max(0, Math.round((deps.now() - settledAt) / 1000));
+		pi.appendEntry(AGENTS_STALE_RESULT_TYPE, { taskId: task.id, agent: task.agent, label: task.label, status: task.status, ageSeconds });
+	};
+
+	const flushCompletions = () => {
+		for (const { task, settledAt, stale } of completions.takeDeliverable(deps.now())) {
+			try {
+				if (stale) deliverStale(task, settledAt);
+				else deliver(task);
+			} catch { /* Best-effort delivery: at most once, even if forwarding fails. */ }
+		}
+	};
+
+	// A completion settles into our queue. An idle parent flushes right away so
+	// the wake-up behavior is unchanged; a busy parent flushes at the next turn
+	// boundary, and the steer mode injects it before that turn's next LLM call
+	// instead of parking it behind the whole run.
+	const settleCompletion = (task: TaskRecord) => {
+		completions.enqueue(task, deps.now());
+		if (activeAgentRuns === 0) flushCompletions();
+	};
+
+	// `agent_start`/`agent_end` bracket a parent agent run; `turn_end` fires at
+	// every turn boundary inside one, so with steering delivery a held
+	// completion is injected before the next LLM call and never outlives the
+	// current turn. `agent_end` stays a flush trigger for runs that end without
+	// a final `turn_end` (an aborted run, or the host's early post-run return
+	// when a run produced no assistant message; the host compensates via
+	// hasQueuedMessages() + continue(), so steering there is still bounded).
+	// `agent_settled` is the final idle boundary after retries — normally a
+	// no-op safety net, since anything enqueued while idle flushes right away.
+	pi.on("agent_start", () => { activeAgentRuns += 1; });
+	pi.on("agent_end", () => {
+		activeAgentRuns = Math.max(0, activeAgentRuns - 1);
+		flushCompletions();
+	});
+	pi.on("agent_settled", () => flushCompletions());
+	pi.on("turn_end", () => flushCompletions());
 
 	const runner = new AgentRunner(store, loadAgentsConfig({ cwd: process.cwd(), home: deps.home, agentHome }), deps, {
 		askUser: (_taskId, ask, raw) => answerThroughUi(ui, ask, raw),
 		onNotification: (task, message) => {
 			if (activeSessionId() !== task.parentSessionId) return false;
-			pi.sendMessage({ customType: AGENTS_MESSAGE_TYPE, content: message, display: true, details: { gentleAgents: { taskId: task.id, agent: task.agent, parentSessionId: task.parentSessionId, kind: "notification" } } }, { deliverAs: "followUp", triggerTurn: true });
+			pi.sendMessage({ customType: AGENTS_MESSAGE_TYPE, content: message, display: false, details: { gentleAgents: { taskId: task.id, agent: task.agent, parentSessionId: task.parentSessionId, kind: "notification" } } }, { deliverAs: "followUp", triggerTurn: true });
 			return true;
 		},
 		onQuery: (task, requestId, message) => {
@@ -466,12 +601,27 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			if (!root || root !== childRoot || !worktrees.roots().includes(root)) return;
 			recordReviewMutation(pi, sessions, root, { source: "subagent", taskId: task.id, toolName: tool.toolName, toolCallId: tool.toolCallId });
 		},
-		onFinish: (task) => {
-			ownedTaskIds.delete(task.id);
-			requestRender();
-			persist(task);
-			const yielded = yieldedTaskIds.delete(task.id);
-			if ((task.mode === AGENT_MODE.BACKGROUND && task.status !== TASK_STATUS.CANCELLED) || (yielded && task.status !== TASK_STATUS.CANCELLED && activeSessionId() === task.parentSessionId)) deliver(task);
+		onFinish: (task, observations) => {
+			// Completion is the only forwarding opportunity. No pending event, policy
+			// query or promise survives this callback; the receiver drops when busy.
+			const { id, parentSessionId, status } = task;
+			const metrics = metricTasks.get(id);
+			metricTasks.delete(id); // Deliver at most once, even if forwarding fails.
+			try {
+				const authorized = metrics?.valid();
+				if (metrics) metrics.finished = true;
+				if (authorized && metrics?.launched && metrics.selection && observations) {
+					const event = childEvent(parentSessionId, id, metrics.selection, status, observations, metrics.started);
+					if (event && metrics.current()) pi.events.emit(CHILD_METRICS_EVENT, event);
+				}
+			} catch { /* Metrics must never interrupt task finalization. */ }
+			try {
+				ownedTaskIds.delete(task.id);
+				requestRender();
+				persist(task);
+				const yielded = yieldedTaskIds.delete(task.id);
+				if ((task.mode === AGENT_MODE.BACKGROUND && task.status !== TASK_STATUS.CANCELLED) || (yielded && task.status !== TASK_STATUS.CANCELLED && activeSessionId() === task.parentSessionId)) settleCompletion(task);
+			} catch { /* Best-effort completion bookkeeping cannot strand runner waiters. */ }
 		},
 	});
 
@@ -501,6 +651,28 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		return {
 			render(width: number) {
 				return renderCard({ title: "Agent result", subtitle: details?.agent, body, tone, glyph: AGENTS_GLYPH }, theme, width, { expanded: options.expanded, hint });
+			},
+			invalidate() {},
+		};
+	});
+
+	// A stale completion is appended as a custom entry: durable transcript
+	// content for the human that never participates in the LLM context.
+	pi.registerEntryRenderer(AGENTS_STALE_RESULT_TYPE, (entry, options, theme) => {
+		const data = (entry.data ?? {}) as { taskId?: unknown; agent?: unknown; label?: unknown; status?: unknown; ageSeconds?: unknown };
+		const taskId = typeof data.taskId === "string" ? data.taskId : "unknown";
+		const agent = typeof data.agent === "string" ? data.agent : "Subagent";
+		const label = typeof data.label === "string" ? data.label : "";
+		const status = typeof data.status === "string" ? data.status.replace("_", " ") : "unknown";
+		const ageSeconds = typeof data.ageSeconds === "number" && Number.isFinite(data.ageSeconds) ? Math.max(0, Math.round(data.ageSeconds)) : 0;
+		const age = ageSeconds < 90 ? `${ageSeconds}s` : ageSeconds < 3600 ? `${Math.round(ageSeconds / 60)}m` : `${Math.round(ageSeconds / 3600)}h`;
+		const body = [
+			`Subagent ${sanitizeTerminalText(agent)} (task ${sanitizeTerminalText(taskId)}, "${sanitizeTerminalText(label)}") ${sanitizeTerminalText(status)} about ${age} ago, while the orchestrator was still busy.`,
+			"Marked stale: the result was not replayed into the conversation. It stays available through subagent_status and subagent_result.",
+		];
+		return {
+			render(width: number) {
+				return renderCard({ title: "Stale agent result", subtitle: `${agent} · task ${taskId}`, body, tone: CARD_TONE.WARNING, glyph: AGENTS_GLYPH }, theme, width, { expanded: options.expanded, hint: expandHint(options.expanded) });
 			},
 			invalidate() {},
 		};
@@ -637,6 +809,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	// coalesced so a chatty child cannot flood the terminal.
 	store.subscribeSummary(() => {
 		publishActivity();
+		if (sidebarTui) invalidateSidebar(sidebarTui);
 		host?.requestRender();
 		tickClock();
 	});
@@ -647,6 +820,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		tickClock();
 		ui?.setWidget(AGENTS_WIDGET_KEY, (tui, theme) => {
 			host = tui;
+			sidebarTui = tui;
 			return sidebarPart(tui, "agents", {
 				render(width: number) {
 					const lines = renderAgentsCard(visibleTasks(), theme, width, deps.now(), { collapsed, collapseKey, maxRows: widgetRows(tui.terminal?.rows), viewKey });
@@ -662,16 +836,24 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 
 	const roots = (ctx: ExtensionContext) => ({ cwd: ctx.sessionManager.getCwd(), home: deps.home, agentHome });
 
-	const buildRequest = (ctx: ExtensionContext, agent: AgentDefinition, prompt: string, label: string | undefined, context: string | undefined, mode: AgentMode, resume?: string, workspaceRoot?: string): TaskRequest => {
+	const buildRequest = (ctx: ExtensionContext, agent: AgentDefinition, prompt: string, label: string | undefined, context: string | undefined, mode: AgentMode, resume?: string, workspaceRoot?: string, sddChange?: SddChangeSelection): TaskRequest => {
 		const registry = registryFor(ctx);
 		const parentCwd = ctx.sessionManager.getCwd();
 		// An explicit target is validated before any queue or session-dir writes.
 		const parentIdentity = deps.resolveWorktree(parentCwd, parentCwd);
+		const selectedRoot = workspaceRoot ?? sddChange?.workspaceRoot;
 		// Preserve ordinary non-Git continuation, without admitting any new root.
-		const sameNonGitContinuation = resume !== undefined && workspaceRoot === parentCwd && !parentIdentity;
-		const target = workspaceRoot !== undefined && !sameNonGitContinuation ? registry.validate(workspaceRoot) : parentIdentity?.root;
+		const sameNonGitContinuation = resume !== undefined && selectedRoot === parentCwd && !parentIdentity;
+		const target = selectedRoot !== undefined && !sameNonGitContinuation ? registry.validate(selectedRoot) : parentIdentity?.root;
+		if (sddChange && target !== sddChange.workspaceRoot && target !== resolve(sddChange.workspaceRoot)) {
+			throw new Error("sdd_change workspaceRoot must resolve to the selected child worktree.");
+		}
+		const launchSddChange = sddChange === undefined || target === undefined
+			? undefined
+			: { ...sddChange, workspaceRoot: target };
 		const config = loadAgentsConfig(roots(ctx));
 		const profile = resolveAgentProfile(agent, config);
+		const research = agent.name === "sdd-research" ? researchAgent(agent, pi) : undefined;
 		const sessionDir = agentRuntimePaths(deps.home, agentHome).sessions;
 		mkdirSync(sessionDir, { recursive: true });
 		const parentSessionManager = ctx.sessionManager as unknown as ReviewSessionManager;
@@ -679,7 +861,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const parentWorktreeRoot = ctx.sessionManager.getCwd();
 		const parentRepositoryIdentity = resolveCanonicalGitRepositoryIdentitySync(parentWorktreeRoot);
 		return {
-			agent,
+			agent: research?.agent ?? agent,
 			prompt,
 			label,
 			context,
@@ -691,7 +873,8 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			thinking: profile.thinking,
 			sessionDir,
 			resumeSessionPath: resume,
-			env: deps.env,
+			env: research ? { ...deps.env, [RESEARCH_CHILD_TOOLS_ENV]: JSON.stringify(research.agent.tools) } : deps.env,
+			...(launchSddChange === undefined ? {} : { sddChange: launchSddChange }),
 			...(parentRepositoryIdentity === undefined ? {} : {
 				authorizeParentStandingReviewPermission: (repositoryIdentity: string) => {
 					try {
@@ -712,21 +895,59 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		};
 	};
 
-	const launch = async (ctx: ExtensionContext, request: TaskRequest): Promise<ToolText> => {
-		const task = runner.run(request);
+	const launch = async (ctx: ExtensionContext, request: TaskRequest, signal?: AbortSignal): Promise<ToolText> => {
+		// Bounded live observation only. Native send owns the fresh policy decision;
+		// child execution never starts a telemetry policy process or renewal timer.
+		const owner = metricsOwner;
+		const metrics = { selection: undefined as LaunchSelection | undefined,
+			started: 0, launched: false, finished: false,
+			current: () => owner === metricsOwner && request.parentSessionId === activeSessionId() && runtimeMetricsEnvAllows(deps.env),
+			valid: () => !metrics.finished && metrics.current() };
+		const observe = runtimeMetricsEnvAllows(deps.env) && metricTasks.size < 256;
+		const task = runner.run({ ...request, collectResponseObservations: false,
+			onLaunch: () => { metrics.launched = true; request.onLaunch?.(); },
+			...(observe ? { canCollectResponseObservations: metrics.valid, prepareResponseObservations: async () => {
+				if (metrics.finished || owner !== metricsOwner || request.parentSessionId !== activeSessionId() || !runtimeMetricsEnvAllows(deps.env)) return false;
+				void catalogLookup({ provider: "openai", modelId: "gpt-4o" }).catch(() => {});
+				if (!metrics.valid()) return false;
+				metrics.selection = launchSelection(request.agent, request.model, request.thinking);
+				metrics.started = metricsNow();
+				return metrics.valid();
+			} } : {}),
+		});
+		if (observe) metricTasks.set(task.id, metrics);
 		ownedTaskIds.add(task.id);
 		store.subscribe(task.id, () => { publishActivity(); requestRender(); });
 		if (request.mode === AGENT_MODE.BACKGROUND) return text(`Started ${task.agent} in the background as task ${task.id}. Use subagent_status or subagent_result with that id.`, taskDetails(task));
-		const query = await runner.waitForQuery(task.id);
-		if (query) {
-			const live = store.get(task.id) ?? task;
-			return text(`Subagent ${live.agent} is waiting for your reply to request ${query.requestId}.`, { gentleAgents: { taskId: live.id, agent: live.agent, status: live.status, mode: live.mode, requestId: query.requestId } }, true);
+		// A tool call aborted by the host (a human interrupting the turn, a timeout)
+		// would otherwise leave the child running and end the call with no result and
+		// no recorded reason. Cancel through the runner so the lifecycle runs and the
+		// record is persisted, and tell the user why.
+		const onAbort = (): void => {
+			if (runner.cancel(task.id)) {
+				ctx.ui.notify(
+					`Subagent ${task.agent} cancelled: the tool call was aborted${abortReasonText(signal?.reason)}. The run is recorded as cancelled.`,
+					"warning",
+				);
+			}
+		};
+		if (signal?.aborted) onAbort();
+		else signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			const query = await runner.waitForQuery(task.id);
+			if (query) {
+				const live = store.get(task.id) ?? task;
+				return text(`Subagent ${live.agent} is waiting for your reply to request ${query.requestId}.`, { gentleAgents: { taskId: live.id, agent: live.agent, status: live.status, mode: live.mode, requestId: query.requestId } }, true);
+			}
+			const finished = await runner.waitFor(task.id);
+			completions.consume(finished.id);
+			return text(finishedText(finished), taskDetails(finished));
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
 		}
-		const finished = await runner.waitFor(task.id);
-		return text(finishedText(finished), taskDetails(finished));
 	};
 
-	const tool = (name: string, description: string, parameters: Record<string, unknown>, execute: (params: Record<string, unknown>, ctx: ExtensionContext) => Promise<ToolText>) => {
+	const tool = (name: string, description: string, parameters: Record<string, unknown>, execute: (params: Record<string, unknown>, ctx: ExtensionContext, signal?: AbortSignal) => Promise<ToolText>) => {
 		pi.registerTool({
 			name: `${TOOL_PREFIX}${name}`,
 			renderShell: "self",
@@ -741,8 +962,8 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				const body = result.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
 				return new Text(options.expanded ? body : theme.fg("muted", body.split("\n")[0] ?? ""), 0, 0);
 			},
-			async execute(_id, params, _signal, _onUpdate, ctx) {
-				return execute(params as Record<string, unknown>, ctx);
+			async execute(_id, params, signal, _onUpdate, ctx) {
+				return execute(params as Record<string, unknown>, ctx, signal);
 			},
 		});
 	};
@@ -837,15 +1058,19 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				label: { type: "string", description: "Three to six words naming the work, shown on the agents card, e.g. 'map footer data sources'." },
 				context: { type: "string", description: "Optional extra context appended to the task." },
 				workspace_root: { type: "string", description: "Optional worktree in the same Git clone. Validated before queueing; the child runs at its canonical root and registers it on actual launch." },
+				sdd_change: { type: "object", additionalProperties: false, required: ["changeName", "workspaceRoot", "phase"], properties: { changeName: { type: "string" }, workspaceRoot: { type: "string" }, phase: { type: "string", enum: ["apply", "verify", "sync", "archive"] } }, description: "Launch-local selected SDD identity, accepted only by matching SDD phase agents." },
 				mode: { type: "string", enum: ["task", "background"], description: "task waits for the result (default); background returns immediately." },
 			},
 		},
-		async (params, ctx) => {
+		async (params, ctx, signal) => {
 			const { agents } = discoverAgents(roots(ctx));
 			const agent = agents.find((candidate) => candidate.name === params.agent);
 			if (!agent) return text(`Error: no subagent named "${String(params.agent)}". Known: ${agents.map((candidate) => candidate.name).join(", ") || "none"}`, { error: "unknown agent" });
 			const mode = (params.mode as AgentMode | undefined) ?? agent.mode ?? loadAgentsConfig(roots(ctx)).defaultMode;
-			return launch(ctx, buildRequest(ctx, agent, String(params.task ?? ""), typeof params.label === "string" ? params.label : undefined, typeof params.context === "string" ? params.context : undefined, mode, undefined, typeof params.workspace_root === "string" ? params.workspace_root : undefined));
+			let sddChange: SddChangeSelection | undefined;
+			try { sddChange = parseSddChange(params.sdd_change, agent.name); }
+			catch (error) { return text(`Error: ${error instanceof Error ? error.message : String(error)}`, { error: "invalid sdd_change" }); }
+			return launch(ctx, buildRequest(ctx, agent, String(params.task ?? ""), typeof params.label === "string" ? params.label : undefined, typeof params.context === "string" ? params.context : undefined, mode, undefined, typeof params.workspace_root === "string" ? params.workspace_root : undefined, sddChange), signal);
 		},
 	);
 
@@ -857,6 +1082,9 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	tool("result", "Return the final answer of a finished subagent task, or its current state if it is still running.", { required: ["task_id"], properties: { task_id: { type: "string" } } }, async (params) => {
 		const task = await resolveTask(String(params.task_id));
 		if (!task) return text(`Error: no task ${String(params.task_id)}`, { error: "unknown task" });
+		// The parent just pulled a finished result; its pending completion must
+		// never be replayed on top of it.
+		if (isFinished(task.status)) completions.consume(task.id);
 		return text(isFinished(task.status) ? finishedText(task) : `Task ${task.id} is still ${task.status} (last: ${task.lastStep}).`, taskDetails(task));
 	});
 
@@ -883,15 +1111,22 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	tool(
 		"continue",
 		"Resume a finished subagent task in its own session with a follow-up prompt.",
-		{ required: ["task_id", "prompt"], properties: { task_id: { type: "string" }, prompt: { type: "string" }, label: { type: "string", description: "Three to six words naming the follow-up." }, mode: { type: "string", enum: ["task", "background"] } } },
-		async (params, ctx) => {
+		{ required: ["task_id", "prompt"], properties: { task_id: { type: "string" }, prompt: { type: "string" }, label: { type: "string", description: "Three to six words naming the follow-up." }, sdd_change: { type: "object", additionalProperties: false, required: ["changeName", "workspaceRoot", "phase"], properties: { changeName: { type: "string" }, workspaceRoot: { type: "string" }, phase: { type: "string", enum: ["apply", "verify", "sync", "archive"] } }, description: "Fresh launch-local selected SDD identity, required when continuing an SDD phase agent." }, mode: { type: "string", enum: ["task", "background"] } } },
+		async (params, ctx, signal) => {
 			const previous = await resolveTask(String(params.task_id));
 			if (!previous) return text(`Error: no task ${String(params.task_id)}`, { error: "unknown task" });
 			if (!isFinished(previous.status) || !previous.sessionPath) return text(`Error: task ${previous.id} cannot be continued yet (${previous.status}).`, { error: "not continuable" });
+			// Continuing acts on the previous result, so any pending completion for
+			// it is already consumed by the parent.
+			completions.consume(previous.id);
 			const agent = discoverAgents(roots(ctx)).agents.find((candidate) => candidate.name === previous.agent);
 			if (!agent) return text(`Error: subagent "${previous.agent}" is no longer defined.`, { error: "unknown agent" });
 			const mode = (params.mode as AgentMode | undefined) ?? (previous.mode as AgentMode);
-			return launch(ctx, buildRequest(ctx, agent, String(params.prompt ?? ""), typeof params.label === "string" ? params.label : undefined, undefined, mode, previous.sessionPath, previous.cwd));
+			let sddChange: SddChangeSelection | undefined;
+			try { sddChange = parseSddChange(params.sdd_change, agent.name); }
+			catch (error) { return text(`Error: ${error instanceof Error ? error.message : String(error)}`, { error: "invalid sdd_change" }); }
+			if (sddPhaseForAgent(agent.name) && !sddChange) return text("Error: continuing an SDD phase agent requires a fresh sdd_change selection.", { error: "missing sdd_change" });
+			return launch(ctx, buildRequest(ctx, agent, String(params.prompt ?? ""), typeof params.label === "string" ? params.label : undefined, undefined, mode, previous.sessionPath, sddChange?.workspaceRoot ?? previous.cwd, sddChange), signal);
 		},
 	);
 
@@ -900,6 +1135,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			description: "Collapse or expand the agents card",
 			handler: async () => {
 				collapsed = !collapsed;
+				if (sidebarTui) invalidateSidebar(sidebarTui);
 				host?.requestRender();
 			},
 		});
@@ -923,6 +1159,9 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		// A resumed, reloaded, or replaced session starts with an empty completion
+		// queue so nothing pending from another session can replay here.
+		completions.dropAll();
 		presence?.dispose();
 		registryFor(ctx);
 		showWidget(ctx);
@@ -934,12 +1173,15 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		await startSessionTransport(ctx);
 	});
 	pi.on("session_shutdown", async () => {
+		completions.dropAll();
+		activeAgentRuns = 0;
 		presence?.dispose();
 		presence = undefined;
 		cancelClock?.();
 		for (const view of overlays) { view.handleInput("q"); view.dispose(); }
 		overlays.clear();
 		sessions = undefined;
+		sidebarTui = undefined;
 		worktrees?.close();
 		worktrees = undefined;
 		const stopped = shutdownSessionTransport();

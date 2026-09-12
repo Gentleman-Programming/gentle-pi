@@ -35,6 +35,9 @@ jobs:
         env:
           GENTLE_PI_REQUIRE_NATIVE_BINARY: "1"
 
+      - name: Type check
+        run: pnpm run typecheck
+
       - name: Verify generated runtime modules
         run: pnpm run check:runtime-modules
 
@@ -98,6 +101,16 @@ jobs:
       - name: Run Windows Git authority probe
         shell: pwsh
         run: pnpm exec node --experimental-strip-types --test tests/review-repository.test.ts
+
+      - name: Run Windows candidate view regression
+        shell: pwsh
+        run: |
+          $output = & pnpm exec node --experimental-strip-types --test --test-reporter=tap --test-name-pattern "candidate owner|candidate contributor root|candidate executable-mode validation|candidate registry forwards explicit Windows mode validation" tests/review-candidate-view.test.ts 2>&1
+          $status = $LASTEXITCODE
+          $output | Write-Output
+          if ($status -ne 0) { exit $status }
+          $passes = [regex]::Match(($output -join "`n"), "(?m)^# pass (\d+)$")
+          if ($output -match "(?m)^1\.\.0$" -or !$passes.Success -or [int]$passes.Groups[1].Value -eq 0) { throw "Windows candidate view regression selected no tests" }
 
       - name: Run Windows native consent boundary
         shell: pwsh

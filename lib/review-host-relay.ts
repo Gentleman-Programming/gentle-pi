@@ -141,6 +141,34 @@ export function classifyReviewHostRelayRefusal(stderr: string): "unknown-flag" |
 }
 
 // ---------------------------------------------------------------------------
+// gentle-pi#638: only a relay-bound reviewer timeout is deterministic for the
+// exact selected slot: relaunching the same materialized request reaches the
+// same wall. Generic admission refusals, including malformed reviewer JSON and
+// binding_mismatch [invalid_request], describe repairable submitted bytes; a
+// fresh reviewer can change them. They keep the existing exact-reoffer path.
+// A future provider-issued, typed slot-deterministic refusal may be added here
+// only when its schema proves that this exact bound slot cannot be repaired.
+// ---------------------------------------------------------------------------
+
+export const REVIEW_HOST_RELAY_UNACHIEVABLE_REASON = {
+	PI_TIMED_OUT: "relay_transport_bound_exceeded",
+} as const;
+
+export function reviewHostRelayUnachievableReason(error: ReviewHostRelayError): string | undefined {
+	return error.kind === REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT
+		? REVIEW_HOST_RELAY_UNACHIEVABLE_REASON.PI_TIMED_OUT
+		: undefined;
+}
+
+// Optional bounded evidence for the declaration's --detail. Only the killed reviewer carries measurements worth recording; an admission refusal's text already rides failure.stderr, and unmeasured failures never get a fabricated detail.
+export function reviewHostRelayUnachievableDetail(error: ReviewHostRelayError): string | undefined {
+	if (error.kind === REVIEW_HOST_RELAY_FAILURE.PI_TIMED_OUT && error.elapsedMs !== null && error.timeoutMs !== null) {
+		return `killed after ${error.elapsedMs}ms against a ${error.timeoutMs}ms relay bound`;
+	}
+	return undefined;
+}
+
+// ---------------------------------------------------------------------------
 // Slot detection — the provider decides. A collect input routes through the
 // host relay ONLY when the provider itself issued the `--materialize` token
 // (with the pi runtime identity) on a `review.capture-result` collection

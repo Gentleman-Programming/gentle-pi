@@ -33,13 +33,13 @@ jobs:
     env:
       npm_config_ignore_scripts: "true"
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
       - name: Setup pnpm
         if: runner.environment == 'github-hosted'
-        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         env:
           npm_config_store_dir: ${{ runner.temp }}/pnpm-store
         with:
@@ -55,6 +55,14 @@ jobs:
         if: matrix.platform != 'windows' && runner.environment == 'github-hosted'
         shell: bash
         run: pnpm install --frozen-lockfile --ignore-scripts --store-dir "$RUNNER_TEMP/pnpm-store"
+      - name: Type check focused Windows package
+        if: "!cancelled() && matrix.platform == 'windows' && steps.install_windows_dependencies.outcome == 'success'"
+        shell: pwsh
+        run: pnpm run typecheck
+      - name: Type check focused Unix package
+        if: "!cancelled() && matrix.platform != 'windows' && steps.install_unix_dependencies.outcome == 'success'"
+        shell: bash
+        run: pnpm run typecheck
       - name: Run Windows bootstrap startup control
         if: matrix.platform == 'windows'
         shell: cmd

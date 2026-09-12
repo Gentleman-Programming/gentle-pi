@@ -256,8 +256,14 @@ export class WindowsSessionTransportHost {
 	private readonly pending = new Map<string, Pending>();
 	private pendingRpcs = 0;
 	private pendingAcks = 0;
-	private listenerGeneration = 0;
-	private listenerActive = false;
+	// Every submitted Node listen reserves a strictly increasing epoch. The helper
+	// accepts a newer epoch, rather than requiring contiguity, so a locally rejected
+	// request or a reply/failure reordering cannot reuse an allocated epoch.
+	private nextListenerGeneration = 0;
+	private listenerActiveGeneration?: number;
+	private listenerPendingGeneration?: number;
+	private listenerActiveIdentity?: WindowsRecord;
+	private listenerPendingIdentity?: Readonly<{ sessionId: string; createdAt: number }>;
 	private listenerFailure?: WindowsHostFailureCallback;
 	private stopped = false;
 	private childClosed = false;
@@ -334,25 +340,49 @@ export class WindowsSessionTransportHost {
 	setListenerFailure(callback?: WindowsHostFailureCallback) { this.listenerFailure = callback; }
 
 	async listen(sessionId: string, createdAt = Date.now()): Promise<WindowsRecord> {
-		const generation = ++this.listenerGeneration;
-		this.listenerActive = true;
+		if (this.listenerActiveGeneration !== undefined || this.listenerPendingGeneration !== undefined || this.nextListenerGeneration >= 0x7fffffff) throw safeError("Windows transport listener failed");
+		const generation = ++this.nextListenerGeneration;
+		this.listenerPendingGeneration = generation;
+		this.listenerPendingIdentity = Object.freeze({ sessionId, createdAt });
 		try {
-			const result = validRecord(await this.request("listen", { sessionId, createdAt }));
-			if (!this.listenerActive || this.listenerGeneration !== generation) throw safeError("Windows transport listener failed");
+			const result = validRecord(await this.request("listen", { sessionId, createdAt, generation }));
+			if (this.listenerPendingGeneration !== generation) throw safeError("Windows transport listener failed");
+			this.listenerPendingGeneration = undefined;
+			this.listenerPendingIdentity = undefined;
+			this.listenerActiveGeneration = generation;
+			this.listenerActiveIdentity = result;
 			return result;
 		} catch (error) {
-			if (this.listenerGeneration === generation) this.listenerActive = false;
+			if (this.listenerPendingGeneration === generation) {
+				this.listenerPendingGeneration = undefined;
+				this.listenerPendingIdentity = undefined;
+			}
 			throw error;
 		}
 	}
 
 	async stopListener(record: PresenceRecord) {
-		this.listenerActive = false;
-		await this.request("stop-listener", { record: validRecord(record as unknown as Record<string, unknown>) });
+		const valid = validRecord(record as unknown as Record<string, unknown>);
+		const matchesPending = this.listenerPendingIdentity?.sessionId === valid.sessionId && this.listenerPendingIdentity.createdAt === valid.createdAt;
+		const matchesActive = this.listenerActiveIdentity?.sessionId === valid.sessionId && this.listenerActiveIdentity.endpoint === valid.endpoint && this.listenerActiveIdentity.createdAt === valid.createdAt;
+		// Revoke a matching pending epoch before awaiting the stop RPC. Its delayed
+		// listen reply, notification, or failure can no longer make it active.
+		if (matchesPending) {
+			this.listenerPendingGeneration = undefined;
+			this.listenerPendingIdentity = undefined;
+		}
+		if (matchesActive) {
+			this.listenerActiveGeneration = undefined;
+			this.listenerActiveIdentity = undefined;
+		}
+		await this.request("stop-listener", { record: valid });
 	}
 
 	async close() {
-		this.listenerActive = false;
+		this.listenerActiveGeneration = undefined;
+		this.listenerPendingGeneration = undefined;
+		this.listenerActiveIdentity = undefined;
+		this.listenerPendingIdentity = undefined;
 		if (this.cleanup) return this.cleanup;
 		const child = this.child;
 		if (!child) { this.stopped = true; return; }
@@ -411,8 +441,12 @@ export class WindowsSessionTransportHost {
 		}
 	}
 
+	private isCurrentListenerGeneration(generation: number) {
+		// Pending replacement ownership is exclusive: old active events are stale.
+		return generation === (this.listenerPendingGeneration ?? this.listenerActiveGeneration);
+	}
 	private async acknowledge(event: Extract<HostEvent, { event: "notification" }>) {
-		if (this.stopped || !this.listenerActive || event.generation !== this.listenerGeneration) return;
+		if (this.stopped || !this.isCurrentListenerGeneration(event.generation)) return;
 		const callback = this.callback;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const deadline = new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), CALLBACK_DEADLINE_MS); });
@@ -421,7 +455,7 @@ export class WindowsSessionTransportHost {
 			deadline,
 		]);
 		if (timer) clearTimeout(timer);
-		if (this.stopped || !this.listenerActive || event.generation !== this.listenerGeneration) return;
+		if (this.stopped || !this.isCurrentListenerGeneration(event.generation)) return;
 		// This is the sole path that lets PowerShell reply on its retained server handle.
 		void this.request("ack", { connectionId: event.connectionId, generation: event.generation, id: event.frame.id, accepted }).catch(() => {});
 	}
@@ -433,8 +467,14 @@ export class WindowsSessionTransportHost {
 		if (error) pending.reject(error); else pending.resolve(result ?? {});
 	}
 	private failListener(generation: number) {
-		if (this.stopped || !this.listenerActive || generation !== this.listenerGeneration) return;
-		this.listenerActive = false;
+		if (this.stopped || !this.isCurrentListenerGeneration(generation)) return;
+		if (this.listenerPendingGeneration === generation) {
+			this.listenerPendingGeneration = undefined;
+			this.listenerPendingIdentity = undefined;
+		} else {
+			this.listenerActiveGeneration = undefined;
+			this.listenerActiveIdentity = undefined;
+		}
 		for (const [id, pending] of [...this.pending]) if (pending.kind === "ack") this.settle(id, safeError("Windows transport listener failed"));
 		try { this.listenerFailure?.(generation); } catch {}
 	}
@@ -528,9 +568,14 @@ export class WindowsSessionTransportHost {
 	}
 	private abort(message: string, closeChild = false, code: WindowsSessionRegistryPhaseErrorCode = "unknown") {
 		if (this.stopped) return;
-		const generation = this.listenerActive ? this.listenerGeneration : undefined;
+		// Snapshot, then revoke, before either request settlement or application code.
+		// This prevents a synchronous callback from observing an owned stale epoch.
+		const generation = this.listenerPendingGeneration ?? this.listenerActiveGeneration;
+		this.listenerPendingGeneration = undefined;
+		this.listenerActiveGeneration = undefined;
+		this.listenerPendingIdentity = undefined;
+		this.listenerActiveIdentity = undefined;
 		this.stopped = true;
-		this.listenerActive = false;
 		for (const id of [...this.pending.keys()]) this.settle(id, transportError(message, code));
 		if (generation !== undefined) { try { this.listenerFailure?.(generation); } catch {} }
 		void this.releaseOwnedChild(closeChild).catch(() => {});
@@ -699,35 +744,128 @@ export class WindowsActiveSessionListener {
 	}
 }
 
+type WindowsClientScheduler = Readonly<{ setTimeout: (callback: () => void, delay: number) => unknown; clearTimeout: (handle: unknown) => void }>;
+export type WindowsActiveSessionClientConfig = Readonly<{ connect?: (endpoint: string) => Socket; scheduler?: WindowsClientScheduler; connectDeadlineMs?: number; ackDeadlineMs?: number }>;
+type WindowsPendingOutbound = { settled: boolean; socket?: Socket; connectTimer?: unknown; ackTimer?: unknown; abort?: () => void; cleanup?: () => void; settle: (error?: ActiveSessionClientError, result?: SentNotification) => void };
+
 export class WindowsActiveSessionClient {
 	readonly registry: WindowsSessionPresenceRegistry;
 	readonly senderSessionId: string;
+	private readonly connect: (endpoint: string) => Socket;
+	private readonly scheduler: WindowsClientScheduler;
+	private readonly connectDeadlineMs: number;
+	private readonly ackDeadlineMs: number;
 	private stopped = false;
-	private readonly pending = new Set<Socket>();
-	constructor(registry: WindowsSessionPresenceRegistry, senderSessionId: string) { this.registry = registry; this.senderSessionId = senderSessionId; }
+	private readonly pending = new Set<WindowsPendingOutbound>();
+	constructor(registry: WindowsSessionPresenceRegistry, senderSessionId: string, config: WindowsActiveSessionClientConfig = {}) {
+		this.registry = registry;
+		this.senderSessionId = senderSessionId;
+		this.connect = config.connect ?? createConnection;
+		this.scheduler = config.scheduler ?? { setTimeout, clearTimeout };
+		this.connectDeadlineMs = config.connectDeadlineMs ?? RPC_DEADLINE_MS;
+		this.ackDeadlineMs = config.ackDeadlineMs ?? RPC_DEADLINE_MS;
+		if (!Number.isInteger(this.connectDeadlineMs) || this.connectDeadlineMs < 1 || this.connectDeadlineMs > RPC_DEADLINE_MS || !Number.isInteger(this.ackDeadlineMs) || this.ackDeadlineMs < 1 || this.ackDeadlineMs > RPC_DEADLINE_MS) throw new RangeError("invalid Windows client deadline");
+	}
 	get pendingCount() { return this.pending.size; }
 	get closed() { return this.stopped; }
-	close() { this.stopped = true; for (const socket of this.pending) socket.destroy(); this.pending.clear(); }
-	async sendNotification(recipientSessionId: string, message: string, options: { id?: string; expectedActivation?: PresenceRecord; beforeConnect?: () => boolean | Promise<boolean>; signal?: AbortSignal } = {}): Promise<SentNotification> {
-		if (this.stopped) throw new ActiveSessionClientError("closed");
-		if (recipientSessionId === this.senderSessionId) throw new ActiveSessionClientError("self");
-		if (this.pending.size >= MAX_PENDING) throw new ActiveSessionClientError("busy");
-		if (options.signal?.aborted) throw new ActiveSessionClientError("aborted");
-		let record: PresenceRecord;
-		try { record = await this.registry.resolve(recipientSessionId); } catch { throw new ActiveSessionClientError(options.expectedActivation ? "stale" : "not_found"); }
-		if (options.expectedActivation && JSON.stringify(record) !== JSON.stringify(options.expectedActivation)) throw new ActiveSessionClientError("stale");
-		if (options.beforeConnect && !await options.beforeConnect()) throw new ActiveSessionClientError("stale");
+	close() {
+		if (this.stopped) return;
+		this.stopped = true;
+		for (const pending of [...this.pending]) pending.settle(new ActiveSessionClientError("closed"));
+	}
+	sendNotification(recipientSessionId: string, message: string, options: { id?: string; expectedActivation?: PresenceRecord; beforeConnect?: () => boolean | Promise<boolean>; signal?: AbortSignal } = {}): Promise<SentNotification> {
+		if (this.stopped) return Promise.reject(new ActiveSessionClientError("closed"));
+		if (recipientSessionId === this.senderSessionId) return Promise.reject(new ActiveSessionClientError("self"));
+		if (this.pending.size >= MAX_PENDING) return Promise.reject(new ActiveSessionClientError("busy"));
+		if (options.signal?.aborted) return Promise.reject(new ActiveSessionClientError("aborted"));
 		const id = options.id ?? crypto.randomUUID().replaceAll("-", "");
-		const request = encodeNotificationFrame(Object.freeze({ version: 1, kind: "notification", id, senderSessionId: this.senderSessionId, recipientSessionId, message }));
+		let pending!: WindowsPendingOutbound;
 		return new Promise<SentNotification>((resolve, reject) => {
-			const socket = createConnection(record.endpoint); this.pending.add(socket);
-			const decoder = new FrameDecoder(); let settled = false;
-			const finish = (error?: ActiveSessionClientError, result?: SentNotification) => { if (settled) return; settled = true; clearTimeout(timer); this.pending.delete(socket); socket.destroy(); error ? reject(error) : resolve(result!); };
-			const timer = setTimeout(() => finish(new ActiveSessionClientError("ack_timeout")), 2_000);
-			socket.once("connect", () => { if (this.stopped) finish(new ActiveSessionClientError("closed")); else socket.write(request); });
-			socket.on("data", (chunk) => { try { decoder.push(chunk); } catch { finish(new ActiveSessionClientError("invalid_ack")); } });
-			socket.once("end", () => { try { const ack = decoder.finish() as AckFrame; finish(ack.kind === "ack" && ack.id === id && ack.accepted ? undefined : new ActiveSessionClientError(ack.kind === "ack" ? "remote_rejected" : "invalid_ack"), { id, accepted: true }); } catch { finish(new ActiveSessionClientError("invalid_ack")); } });
-			socket.once("error", () => finish(new ActiveSessionClientError("io_error")));
+			pending = { settled: false, settle: (error, result) => {
+				if (pending.settled) return;
+				pending.settled = true;
+				for (const timer of [pending.connectTimer, pending.ackTimer]) if (timer !== undefined) try { this.scheduler.clearTimeout(timer); } catch {}
+				pending.connectTimer = pending.ackTimer = undefined;
+				if (pending.abort) options.signal?.removeEventListener("abort", pending.abort);
+				pending.cleanup?.();
+				pending.cleanup = undefined;
+				this.pending.delete(pending);
+				pending.socket?.destroy();
+				if (error) reject(error); else resolve(result!);
+			} };
+			this.pending.add(pending);
+			pending.abort = () => pending.settle(new ActiveSessionClientError(this.stopped ? "closed" : "aborted"));
+			options.signal?.addEventListener("abort", pending.abort, { once: true });
+			void this.begin(pending, recipientSessionId, message, id, options);
 		});
+	}
+	private async begin(pending: WindowsPendingOutbound, recipientSessionId: string, message: string, id: string, options: { expectedActivation?: PresenceRecord; beforeConnect?: () => boolean | Promise<boolean> }) {
+		let record: PresenceRecord;
+		try { record = await this.registry.resolve(recipientSessionId); }
+		catch { pending.settle(new ActiveSessionClientError(options.expectedActivation ? "stale" : "not_found")); return; }
+		if (pending.settled) return;
+		if (this.stopped) { pending.settle(new ActiveSessionClientError("closed")); return; }
+		if (options.expectedActivation && JSON.stringify(record) !== JSON.stringify(options.expectedActivation)) { pending.settle(new ActiveSessionClientError("stale")); return; }
+		try { if (options.beforeConnect && !await options.beforeConnect()) { pending.settle(new ActiveSessionClientError("stale")); return; } }
+		catch { pending.settle(new ActiveSessionClientError("stale")); return; }
+		if (pending.settled) return;
+		if (this.stopped) { pending.settle(new ActiveSessionClientError("closed")); return; }
+		let request: Buffer;
+		try { request = encodeNotificationFrame(Object.freeze({ version: 1, kind: "notification", id, senderSessionId: this.senderSessionId, recipientSessionId, message })); }
+		catch { pending.settle(new ActiveSessionClientError("io_error")); return; }
+		let socket: Socket;
+		try { socket = this.connect(record.endpoint); }
+		catch { pending.settle(new ActiveSessionClientError("io_error")); return; }
+		if (pending.settled) { socket.destroy(); return; }
+		pending.socket = socket;
+		const decoder = new FrameDecoder();
+		const finishAck = () => {
+			if (pending.settled) return;
+			try {
+				const ack = decoder.finish() as AckFrame;
+				if (ack.kind !== "ack" || ack.id !== id) pending.settle(new ActiveSessionClientError("invalid_ack"));
+				else if (!ack.accepted) pending.settle(new ActiveSessionClientError("remote_rejected"));
+				else pending.settle(undefined, Object.freeze({ id, accepted: true }));
+			} catch { pending.settle(new ActiveSessionClientError("invalid_ack")); }
+		};
+		const onConnect = () => {
+			if (pending.settled) return;
+			if (pending.connectTimer !== undefined) { try { this.scheduler.clearTimeout(pending.connectTimer); } catch {} pending.connectTimer = undefined; }
+			try { socket.write(request); } catch { pending.settle(new ActiveSessionClientError("io_error")); return; }
+			if (pending.settled) return;
+			try {
+				const timer = this.scheduler.setTimeout(() => pending.settle(new ActiveSessionClientError("ack_timeout")), this.ackDeadlineMs);
+				if (pending.settled) { try { this.scheduler.clearTimeout(timer); } catch {} return; }
+				pending.ackTimer = timer;
+			} catch { pending.settle(new ActiveSessionClientError("ack_timeout")); }
+		};
+		const onData = (chunk: Buffer) => { if (!pending.settled) try { decoder.push(chunk); } catch { pending.settle(new ActiveSessionClientError("invalid_ack")); } };
+		const onClose = () => { if (!pending.settled) pending.settle(new ActiveSessionClientError("io_error")); };
+		const onError = () => pending.settle(new ActiveSessionClientError("io_error"));
+		const cleanup = () => {
+			socket.removeListener("connect", onConnect);
+			socket.removeListener("data", onData);
+			socket.removeListener("end", finishAck);
+			socket.removeListener("close", onClose);
+			socket.removeListener("error", onError);
+		};
+		// Install cleanup before the first registration: EventEmitter-compatible fakes
+		// may synchronously abort or throw after attaching an individual handler.
+		pending.cleanup = cleanup;
+		try {
+			socket.once("connect", onConnect);
+			if (pending.settled) return;
+			socket.on("data", onData);
+			if (pending.settled) return;
+			socket.once("end", finishAck);
+			if (pending.settled) return;
+			socket.once("close", onClose);
+			if (pending.settled) return;
+			socket.once("error", onError);
+			if (pending.settled) return;
+			const timer = this.scheduler.setTimeout(() => pending.settle(new ActiveSessionClientError("connect_timeout")), this.connectDeadlineMs);
+			if (pending.settled) { try { this.scheduler.clearTimeout(timer); } catch {} return; }
+			pending.connectTimer = timer;
+		} catch { pending.settle(new ActiveSessionClientError("io_error")); }
 	}
 }

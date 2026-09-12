@@ -415,7 +415,7 @@ async function openInitializedHelper(agentHome: string, options: Readonly<{ diag
 		try { await closeWithStreamCheck(); } catch { /* preserve the startup failure after owned cleanup */ }
 		throw error;
 	}
-	const request = async (operation: "enumerate" | "shutdown" | "record" | "publish" | "list" | "resolve" | "remove", values: Record<string, unknown> = {}) => {
+	const request = async (operation: "enumerate" | "shutdown" | "record" | "publish" | "list" | "resolve" | "remove" | "listen" | "stop-listener", values: Record<string, unknown> = {}) => {
 		if (protocolError !== undefined) throw protocolError;
 		const count = frames.length + 1;
 		const requestId = `${operation}-${count}`;
@@ -431,7 +431,7 @@ async function openInitializedHelper(agentHome: string, options: Readonly<{ diag
 		get rejectionDiagnostic() { return stderrOverflow ? undefined : parseBootstrapRejectionDiagnostic(stderr); },
 		enumerate: () => request("enumerate"),
 		shutdown: () => request("shutdown"),
-		presence: (operation: "record" | "publish" | "list" | "resolve" | "remove", values: Record<string, unknown> = {}) => request(operation, values),
+		presence: (operation: "record" | "publish" | "list" | "resolve" | "remove" | "listen" | "stop-listener", values: Record<string, unknown> = {}) => request(operation, values),
 		invalidStartSchema: async () => { child.stdin.write(`${JSON.stringify({ requestId: `invalid-${frames.length + 1}`, operation: "start", extra: true })}\n`); await exitWithin(); },
 		closeInput: closeWithStreamCheck,
 	};
@@ -1524,6 +1524,22 @@ function probeWindowsNativeEndpoint(endpoint: string) {
 		socket.once("error", (error: NodeJS.ErrnoException) => { clearTimeout(timer); resolve(error.code ?? "unknown"); });
 	});
 }
+
+test("Windows-native listener accepts legacy listen then rejects stale epochs and accepts a newer epoch", { skip: process.platform !== "win32", timeout: 30_000 }, async (t) => {
+	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-listen-compat-"));
+	const agentHome = join(root, "profile", "agent");
+	await mkdir(join(agentHome, "gentle-agents"), { recursive: true });
+	const held = await openInitializedHelper(agentHome, { diagnostics: t });
+	try {
+		const legacy = await held.presence("listen", { sessionId: "legacy", createdAt: 1 });
+		assert.equal(legacy.ok, true, "the legacy four-field request remains accepted");
+		const record = legacy.result as Record<string, unknown>;
+		assert.equal((await held.presence("stop-listener", { record })).ok, true);
+		assert.equal((await held.presence("listen", { sessionId: "invalid", createdAt: 2, generation: 1 })).error, "invalid");
+		const newer = await held.presence("listen", { sessionId: "newer", createdAt: 3, generation: 2 });
+		assert.equal(newer.ok, true, "a newer host epoch follows a legacy allocation");
+	} finally { await held.closeInput(); }
+});
 
 test("Windows listener source guard publishes only from its Gate-protected readiness transition", async (t) => {
 	t.diagnostic("source guard, not native Windows proof");

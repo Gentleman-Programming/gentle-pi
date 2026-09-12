@@ -953,6 +953,470 @@ for (const statusSchema of ["gentle-ai.review-integration.status/v6", "gentle-ai
 	assert.equal(requests.every((request) => !("lineageId" in request)), true);
 });
 
+// gentle-pi#706: inspect names the exact continuation for the intended-untracked
+// stop and can resolve it in one call through top-level untrackedScope.
+function untrackedStopFixture(
+	t: test.TestContext,
+	statusSchema = "gentle-ai.review-integration.status/v7",
+): {
+	cwd: string;
+	eligible: string;
+	initial: ReviewStatusV3;
+	target: ReviewStatusV3;
+	selection: ReviewCollectInputV3;
+} {
+	const cwd = repository(t),
+		eligible = "selected.md";
+	writeFileSync(join(cwd, eligible), "selected\n");
+	const initialTarget = startStatus(cwd),
+		target = startStatus(cwd, undefined, [eligible]);
+	const selection: ReviewCollectInputV3 = {
+		name: "intended_untracked_selection",
+		schema: "gentle-ai.review-intended-untracked-selection/v1",
+		captureOperation: "external.select_intended_untracked",
+		arguments: [
+			{ name: "target_identity", value: SHA },
+			{ name: "projection", value: "workspace" },
+			{ name: "base_tree", value: initialTarget.projection.baseTree },
+			{
+				name: "candidate_tree",
+				value: initialTarget.projection.currentCandidateTree,
+			},
+			{ name: "eligible_paths_json", value: JSON.stringify([eligible]) },
+			{ name: "expected_untracked_inventory", value: SHA },
+		],
+		submission: {
+			operationToken: "status",
+			argumentTokens: [
+				"--contract=gentle-ai.review-integration/v2",
+				"--next-transition=true",
+				"--agent=pi",
+				"--projection=workspace",
+				"--intended-untracked-selection={{value}}",
+			],
+			values: [
+				{
+					slot: "intended_untracked_selection",
+					domain: "schema_bound_json",
+					schema: "gentle-ai.review-intended-untracked-selection/v1",
+					substitutionLocation: 4,
+				},
+			],
+		},
+	};
+	const initial = {
+		...initialTarget,
+		nextTransition: {
+			kind: "collect",
+			reasonCode: "intended_untracked_selection_required",
+			collect: { inputs: [selection] },
+		},
+		raw: { schema: statusSchema },
+	} as ReviewStatusV3;
+	return { cwd, eligible, initial, target, selection };
+}
+
+for (const statusSchema of [
+	"gentle-ai.review-integration.status/v6",
+	"gentle-ai.review-integration.status/v7",
+])
+	test(`inspect on the intended-untracked stop returns nextStep and the selection binding (${statusSchema})`, async (t) => {
+		const { cwd, initial } = untrackedStopFixture(t, statusSchema);
+		let targetCalls = 0;
+		const native = {
+			targetStatus: async () => {
+				targetCalls += 1;
+				return initial;
+			},
+		} as unknown as NativeReviewCli;
+		const result = await __testing.executeReviewControllerOperation(
+			{ operation: "inspect" },
+			cwd,
+			native,
+		);
+		assert.equal(result.status, "blocked");
+		assert.equal(typeof result.selectionBinding, "string");
+		assert.equal(typeof result.nextStep, "string");
+		for (const fragment of [
+			"select-intended-untracked",
+			"untrackedScope",
+			".gitignore",
+			"path names",
+		]) {
+			assert.equal((result.nextStep as string).includes(fragment), true, fragment);
+		}
+		assert.equal(targetCalls, 1);
+	});
+
+test("inspect with untrackedScope exclude resolves the intended-untracked stop in one round trip", async (t) => {
+	const { cwd, initial, target, selection } = untrackedStopFixture(t);
+	const requests: Array<Record<string, unknown>> = [],
+		retained = new Map();
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => {
+			requests.push(request);
+			return "intendedUntrackedSelection" in request ? target : initial;
+		},
+	} as unknown as NativeReviewCli;
+	const result = await __testing.executeReviewControllerOperation(
+		{ operation: "inspect", untrackedScope: "exclude" },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		undefined,
+		retained,
+	);
+	assert.equal(result.status, "ready");
+	assert.equal("selectionBinding" in result, false);
+	assert.equal(requests.length, 2);
+	assert.equal(requests[1]!.untrackedScope, "exclude");
+	assert.equal(requests[1]!.expectedUntrackedInventory, SHA);
+	assert.deepEqual(requests[1]!.intendedUntracked, []);
+	assert.deepEqual(requests[1]!.intendedUntrackedSelection, {
+		argumentTokens: selection.submission!.argumentTokens,
+		value: JSON.stringify({
+			schema: "gentle-ai.review-intended-untracked-selection/v1",
+			untracked_scope: "exclude",
+			expected_untracked_inventory: SHA,
+			intended_untracked: [],
+		}),
+	});
+	const retainedEntry = retained.get(`${cwd}\u0000`) as
+		| { untrackedScope: string; submission?: unknown }
+		| undefined;
+	assert.notEqual(retainedEntry, undefined);
+	assert.equal(retainedEntry!.untrackedScope, "exclude");
+	assert.notEqual(retainedEntry!.submission, undefined);
+});
+
+test("inspect with untrackedScope select resolves the stop with exactly the selected paths", async (t) => {
+	const { cwd, eligible, initial, target } = untrackedStopFixture(t);
+	const requests: Array<Record<string, unknown>> = [];
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => {
+			requests.push(request);
+			return "intendedUntrackedSelection" in request ? target : initial;
+		},
+	} as unknown as NativeReviewCli;
+	const result = await __testing.executeReviewControllerOperation(
+		{
+			operation: "inspect",
+			untrackedScope: "select",
+			intendedUntracked: [eligible],
+		},
+		cwd,
+		native,
+	);
+	assert.equal(result.status, "ready");
+	assert.equal(requests.length, 2);
+	assert.equal(requests[1]!.untrackedScope, "select");
+	assert.deepEqual(requests[1]!.intendedUntracked, [eligible]);
+	const submission = requests[1]!.intendedUntrackedSelection as {
+		value: string;
+	};
+	assert.deepEqual(JSON.parse(submission.value), {
+		schema: "gentle-ai.review-intended-untracked-selection/v1",
+		untracked_scope: "select",
+		expected_untracked_inventory: SHA,
+		intended_untracked: [eligible],
+	});
+});
+
+test("inspect with untrackedScope select rejects a path outside the eligible inventory", async (t) => {
+	const { cwd, initial } = untrackedStopFixture(t);
+	let targetCalls = 0;
+	const native = {
+		targetStatus: async () => {
+			targetCalls += 1;
+			return initial;
+		},
+	} as unknown as NativeReviewCli;
+	const result = await __testing.executeReviewControllerOperation(
+		{
+			operation: "inspect",
+			untrackedScope: "select",
+			intendedUntracked: ["docs/unknown.md"],
+		},
+		cwd,
+		native,
+	);
+	assert.equal(result.status, "blocked");
+	assert.equal(result.outcome, "inspect-untracked-scope-invalid");
+	assert.equal(result.mutation_performed, false);
+	assert.equal(result.mutation_outcome, "none");
+	assert.equal(targetCalls, 1);
+});
+
+for (const invalid of [
+	{ untrackedScope: "select" },
+	{ untrackedScope: "exclude", intendedUntracked: ["selected.md"] },
+] as const)
+	test(`inspect rejects an inconsistent untracked scope combination (${JSON.stringify(invalid)})`, async (t) => {
+		const { cwd, initial } = untrackedStopFixture(t);
+		let targetCalls = 0;
+		const native = {
+			targetStatus: async () => {
+				targetCalls += 1;
+				return initial;
+			},
+		} as unknown as NativeReviewCli;
+		if (invalid.untrackedScope === "exclude") {
+			await assert.rejects(
+				() => __testing.executeReviewControllerOperation({ operation: "inspect", ...invalid }, cwd, native),
+				/requires untrackedScope select/,
+			);
+			assert.equal(targetCalls, 0);
+			return;
+		}
+		const result = await __testing.executeReviewControllerOperation(
+			{ operation: "inspect", ...invalid },
+			cwd,
+			native,
+		);
+		assert.equal(result.status, "blocked");
+		assert.equal(result.outcome, "inspect-untracked-scope-invalid");
+		assert.equal(result.mutation_performed, false);
+		assert.equal(result.mutation_outcome, "none");
+		assert.equal(targetCalls, 1);
+	});
+
+test("inspect with untrackedScope and no intended-untracked stop reports not-required", async (t) => {
+	const { cwd, target } = untrackedStopFixture(t);
+	let targetCalls = 0;
+	const native = {
+		targetStatus: async () => {
+			targetCalls += 1;
+			return target;
+		},
+	} as unknown as NativeReviewCli;
+	const result = await __testing.executeReviewControllerOperation(
+		{ operation: "inspect", untrackedScope: "exclude" },
+		cwd,
+		native,
+	);
+	assert.equal(result.status, "ready");
+	assert.equal(result.untracked_selection, "not-required");
+	assert.equal(targetCalls, 1);
+});
+
+test("plain START adopts the pre-lineage selection retained by inspect and deletes it after success", async (t) => {
+	const { cwd, eligible, initial, target, selection } = untrackedStopFixture(t);
+	const requests: Array<Record<string, unknown>> = [],
+		starts: Array<Record<string, unknown>> = [],
+		retained = new Map();
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => {
+			requests.push(request);
+			return "intendedUntrackedSelection" in request ? target : initial;
+		},
+		start: async (request: Record<string, unknown>) => {
+			starts.push(request);
+			return {
+				lineageId: "review-started",
+				state: "reviewing",
+				riskLevel: "low",
+				selectedLenses: [],
+				changedFiles: 1,
+				changedLines: 1,
+				correctionBudget: 1,
+				action: "created",
+				lensesRequired: false,
+				riskReasons: [],
+				raw: {},
+			};
+		},
+	} as unknown as NativeReviewCli;
+	const resolved = await __testing.executeReviewControllerOperation(
+		{
+			operation: "inspect",
+			untrackedScope: "select",
+			intendedUntracked: [eligible],
+		},
+		cwd,
+		native,
+		undefined,
+		undefined,
+		undefined,
+		retained,
+	);
+	assert.equal(resolved.status, "ready");
+	const started = await __testing.executeReviewControllerOperation(
+		{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+		cwd,
+		native,
+		undefined,
+		undefined,
+		undefined,
+		retained,
+	);
+	assert.equal(started.operation, "start");
+	assert.equal(started.result.lineage_id, "review-started");
+	assert.equal(starts.length, 1);
+	assert.equal(requests.length, 3);
+	const startStatusRequest = requests[2]!;
+	assert.equal(startStatusRequest.untrackedScope, "select");
+	assert.equal(startStatusRequest.expectedUntrackedInventory, SHA);
+	assert.deepEqual(startStatusRequest.intendedUntracked, [eligible]);
+	assert.deepEqual(startStatusRequest.intendedUntrackedSelection, {
+		argumentTokens: selection.submission!.argumentTokens,
+		value: JSON.stringify({
+			schema: "gentle-ai.review-intended-untracked-selection/v1",
+			untracked_scope: "select",
+			expected_untracked_inventory: SHA,
+			intended_untracked: [eligible],
+		}),
+	});
+	assert.equal(starts[0]!.untrackedScope, "select");
+	assert.equal(retained.has(`${cwd}\u0000`), false);
+	const lineageEntry = retained.get(`${cwd}\u0000review-started`) as
+		| { untrackedScope: string; submission?: unknown }
+		| undefined;
+	assert.notEqual(lineageEntry, undefined);
+	assert.equal(lineageEntry!.untrackedScope, "select");
+	assert.notEqual(lineageEntry!.submission, undefined);
+});
+
+test("untrackedScope is accepted only by the inspect operation", async (t) => {
+	const { cwd, initial } = untrackedStopFixture(t);
+	const native = {
+		targetStatus: async () => initial,
+	} as unknown as NativeReviewCli;
+	await assert.rejects(
+		() =>
+			__testing.executeReviewControllerOperation(
+				{ operation: "status", untrackedScope: "exclude" } as never,
+				cwd,
+				native,
+			),
+		/does not accept untrackedScope/,
+	);
+	await assert.rejects(
+		() =>
+			__testing.executeReviewControllerOperation(
+				{
+					operation: "start",
+					input: JSON.stringify({ mode: "ordinary" }),
+					untrackedScope: "exclude",
+				} as never,
+				cwd,
+				native,
+			),
+		/does not accept untrackedScope/,
+	);
+});
+
+test("top-level intendedUntracked is accepted only by inspect select", async (t) => {
+		const { cwd, initial } = untrackedStopFixture(t);
+		const native = { targetStatus: async () => initial } as unknown as NativeReviewCli;
+		for (const parameters of [
+			{ operation: "inspect", intendedUntracked: [] },
+			{ operation: "inspect", untrackedScope: "exclude", intendedUntracked: [] },
+			{ operation: "status", intendedUntracked: [] },
+			{ operation: "start", input: JSON.stringify({ mode: "ordinary" }), intendedUntracked: [] },
+		] as const) {
+			await assert.rejects(
+				() => __testing.executeReviewControllerOperation(parameters as never, cwd, native),
+				/intendedUntracked/,
+				JSON.stringify(parameters),
+			);
+		}
+	});
+
+test("a fresh unsuccessful inspect invalidates its prior pre-lineage selection", async (t) => {
+		const { cwd, eligible, initial, target } = untrackedStopFixture(t);
+		const retained = new Map();
+		let failInspect = false;
+		const native = {
+			targetStatus: async (request: Record<string, unknown>) => {
+				if (failInspect) throw new Error("inspect unavailable");
+				return "intendedUntrackedSelection" in request ? target : initial;
+			},
+		} as unknown as NativeReviewCli;
+		await __testing.executeReviewControllerOperation(
+			{ operation: "inspect", untrackedScope: "select", intendedUntracked: [eligible] },
+			cwd, native, undefined, undefined, undefined, retained,
+		);
+		assert.equal(retained.has(`${cwd}\u0000`), true);
+		failInspect = true;
+		const failed = await __testing.executeReviewControllerOperation(
+			{ operation: "inspect" }, cwd, native, undefined, undefined, undefined, retained,
+		);
+		assert.equal(failed.outcome, "native-status-unavailable");
+		assert.equal(retained.has(`${cwd}\u0000`), false);
+	});
+
+test("START rejects a retained pre-lineage selection when fresh STATUS identifies a changed candidate", async (t) => {
+		const { cwd, eligible, initial, target } = untrackedStopFixture(t);
+		const retained = new Map();
+		const candidateA = {
+			...target,
+			targetIdentity: "target-a",
+			projection: { ...target.projection, currentCandidateTree: "candidate-a" },
+		} as ReviewStatusV3;
+		const candidateB = {
+			...target,
+			targetIdentity: "target-b",
+			projection: { ...target.projection, currentCandidateTree: "candidate-b" },
+		} as ReviewStatusV3;
+		let resolved = false;
+		let starts = 0;
+		const native = {
+			targetStatus: async (request: Record<string, unknown>) => {
+				if (!("intendedUntrackedSelection" in request)) return initial;
+				if (!resolved) { resolved = true; return candidateA; }
+				return candidateB;
+			},
+			start: async () => {
+				starts += 1;
+				return { lineageId: "unexpected", state: "reviewing", riskLevel: "low", selectedLenses: [], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: false, riskReasons: [], raw: {} };
+			},
+		} as unknown as NativeReviewCli;
+		await __testing.executeReviewControllerOperation(
+			{ operation: "inspect", untrackedScope: "select", intendedUntracked: [eligible] },
+			cwd, native, undefined, null, undefined, retained,
+		);
+		const rejected = await __testing.executeReviewControllerOperation(
+			{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+			cwd, native, undefined, null, undefined, retained,
+		);
+		assert.equal(rejected.outcome, "native-start-retained-selection-candidate-mismatch");
+		assert.equal(starts, 0);
+		assert.equal(retained.has(`${cwd}\u0000`), false);
+	});
+
+test("a failed START retains a pre-lineage selection for a same-candidate retry", async (t) => {
+		const { cwd, eligible, initial, target } = untrackedStopFixture(t);
+		const retained = new Map();
+		let starts = 0;
+		const native = {
+			targetStatus: async (request: Record<string, unknown>) =>
+				"intendedUntrackedSelection" in request ? target : initial,
+			start: async () => {
+				starts += 1;
+				if (starts === 1) throw Object.assign(new Error("retryable failure"), { mutationOutcome: "none" });
+				return { lineageId: "retried", state: "reviewing", riskLevel: "low", selectedLenses: [], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: false, riskReasons: [], raw: {} };
+			},
+		} as unknown as NativeReviewCli;
+		await __testing.executeReviewControllerOperation(
+			{ operation: "inspect", untrackedScope: "select", intendedUntracked: [eligible] },
+			cwd, native, undefined, null, undefined, retained,
+		);
+		const failed = await __testing.executeReviewControllerOperation(
+			{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+			cwd, native, undefined, null, undefined, retained,
+		);
+		assert.equal(failed.mutation_outcome, "none");
+		assert.equal(retained.has(`${cwd}\u0000`), true);
+		const retried = await __testing.executeReviewControllerOperation(
+			{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+			cwd, native, undefined, null, undefined, retained,
+		);
+		assert.equal(retried.result.lineage_id, "retried");
+		assert.equal(starts, 2);
+		assert.equal(retained.has(`${cwd}\u0000`), false);
+	});
+
 test("ordinary START relays native consent without authoring or advancing it", async (t) => {
 	const cwd = repository(t);
 	const consent = decodeReviewConsentV3(JSON.parse(readFileSync(join(process.cwd(), "tests", "fixtures", "devbinary", "consent-v3.captured.json"), "utf8")));

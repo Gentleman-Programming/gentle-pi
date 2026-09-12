@@ -35,7 +35,8 @@ try {
 	}
 	if ($Mode -eq 'add-extra-ace') {
 		$acl = Get-Acl -LiteralPath $Path
-		$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new('Authenticated Users', [Security.AccessControl.FileSystemRights]::ReadAndExecute, [Security.AccessControl.AccessControlType]::Allow))
+		$authenticatedUsers = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::AuthenticatedUserSid, $null)
+		$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($authenticatedUsers, [Security.AccessControl.FileSystemRights]::ReadAndExecute, [Security.AccessControl.AccessControlType]::Allow))
 		Set-Acl -LiteralPath $Path -AclObject $acl
 		Write-Result @{ ok = $true; changed = $true }
 		exit 0
