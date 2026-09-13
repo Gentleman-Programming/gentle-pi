@@ -1385,7 +1385,12 @@ test("global model routing uses PI_CODING_AGENT_DIR for package-installed agents
 			"gentle-ai-explore": { model: "provider/model", thinking: "high" },
 		});
 
-		assert.equal(result.updated, 2);
+		assert.equal(result.updated, 3);
+		assert.doesNotMatch(
+			readFileSync(join(temporaryPiAgentDir, "agents", "sdd-init.md"), "utf8"),
+			/^model:/m,
+			"an omitted package agent must clear its stale frontmatter routing",
+		);
 		const config = JSON.parse(readFileSync(join(temporaryPiAgentDir, "subagents.json"), "utf8"));
 		assert.deepEqual(config.model_profiles["gentle-ai-explore"], {
 			model: "provider/model",
