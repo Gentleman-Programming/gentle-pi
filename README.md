@@ -616,7 +616,11 @@ Saved globally at:
 
 Existing project-local `.pi/gentle-ai/models.json` files are still read as a legacy fallback when no global model config exists, but `/gentle:models` writes the shared global config.
 
-Inside `/gentle:models`, press `x` to export the saved routing to `~/.pi/gentle-ai/models.export.json`, or `r` to restore from that file after confirmation. Export uses a versioned envelope and restore writes the normal `models.json` shape before applying routing to agents.
+Inside `/gentle:models`, press `p` to preview the **Codex Recommended** provider preset across the complete discovered agent inventory, then save to apply it. The preset routes reasoning/review roles to `gpt-5.6-sol` at high effort, coding roles to `gpt-5.6-terra` at medium effort, and lighter SDD/exploration roles to `gpt-5.6-luna` at low effort. Unknown custom agents are shown explicitly as `inherit`; the preset does not change the orchestrator. Codex is one provider profile, not a required dependency, and manual model assignment remains available for every provider.
+
+Press `x` to export the saved routing to `~/.pi/gentle-ai/models.export.json`, or `r` to restore from that file after confirmation. Export uses a versioned envelope and restore writes the normal `models.json` shape before applying routing to agents.
+
+A valid `models.json` is an authoritative routing snapshot: every discoverable agent is reconciled, and omitted entries clear stale model/effort pins from agent frontmatter and `subagents.json`. A missing config remains a no-op. Provider-owned review roles keep their existing Pi-default semantics, and orchestrator settings change only when a profile explicitly includes `orchestrator`.
 
 Config shape (per agent):
 
@@ -640,7 +644,7 @@ Legacy string entries are still accepted and treated as `model`-only config.
 /gentle:profiles
 ```
 
-Profiles are named, switchable snapshots of the global agent-model routing from `/gentle:models`. The panel fills the terminal, shows the profile list on the left, and a detail pane comparing the selected profile's routing with the currently effective routing, one line per agent in shared columns. Keys:
+Profiles are named, switchable snapshots of the global agent-model routing from `/gentle:models`. The panel fills the terminal, shows the profile list on the left, and previews the complete post-apply snapshot against routing currently materialized in agent frontmatter and `subagents.json`, including discoverable roles omitted by the profile. Keys:
 
 | Key     | Action                                                                 |
 | ------- | ---------------------------------------------------------------------- |

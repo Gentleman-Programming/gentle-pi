@@ -483,6 +483,72 @@ test("models saves and clears independent provider review roles without local ar
 	assertNoLocalArtifacts();
 });
 
+test("Codex Recommended maps known roles by tier and clears unknown discovered roles", () => {
+	const preset = __testing.buildCodexRecommendedPreset([
+		"sdd-design",
+		"sdd-apply",
+		"sdd-archive",
+		"gentle-ai-worker",
+		"gentle-ai-explore",
+		"gentle-ai-verify",
+		"review-risk",
+		"custom-agent",
+	]);
+
+	assert.deepEqual(preset["sdd-design"], { model: "openai-codex/gpt-5.6-sol", thinking: "high" });
+	assert.deepEqual(preset["sdd-apply"], { model: "openai-codex/gpt-5.6-terra", thinking: "medium" });
+	assert.deepEqual(preset["sdd-archive"], { model: "openai-codex/gpt-5.6-luna", thinking: "low" });
+	assert.deepEqual(preset["gentle-ai-worker"], { model: "openai-codex/gpt-5.6-terra", thinking: "medium" });
+	assert.deepEqual(preset["gentle-ai-explore"], { model: "openai-codex/gpt-5.6-luna", thinking: "low" });
+	assert.deepEqual(preset["gentle-ai-verify"], { model: "openai-codex/gpt-5.6-sol", thinking: "high" });
+	assert.deepEqual(preset["review-risk"], { model: "openai-codex/gpt-5.6-sol", thinking: "high" });
+	assert.deepEqual(preset["custom-agent"], {});
+	assert.equal("orchestrator" in preset, false);
+});
+
+test("authoritative routing snapshots clear omitted discoverable agent pins", async (t) => {
+	const fixture = routingConsumerFixture(t, ["worker", "custom-agent"]);
+	const customPath = join(fixture.root, ".pi", "agents", "custom-agent.md");
+	writeMarkdown(customPath, "---\nname: custom-agent\ndescription: Custom\nmodel: anthropic/stale\nthinking: high\n---\nbody\n");
+	writeMarkdown(join(fixture.root, ".pi", "subagents.json"), `${JSON.stringify({
+		model_profiles: {
+			worker: { model: "anthropic/old", effort: "high" },
+			"custom-agent": { model: "anthropic/stale", effort: "high" },
+		},
+	}, null, 2)}\n`);
+
+	await applyModelConfigAsync(fixture.root, {
+		worker: { model: "openai-codex/gpt-5.6-terra", thinking: "medium" },
+	});
+
+	const profiles = JSON.parse(readFileSync(join(fixture.root, ".pi", "subagents.json"), "utf8"));
+	assert.deepEqual(profiles.model_profiles.worker, {
+		model: "openai-codex/gpt-5.6-terra",
+		effort: "medium",
+	});
+	assert.equal(profiles.model_profiles["custom-agent"], undefined);
+	assert.doesNotMatch(readFileSync(customPath, "utf8"), /^model:|^thinking:/m);
+});
+
+test("model panel previews and saves the Codex Recommended complete snapshot", () => {
+	const { preview, result } = __testing.applyCodexModelPanelPreset(
+		{ "custom-agent": { model: "anthropic/stale", thinking: "high" } },
+		["sdd-design", "custom-agent"],
+		100,
+	);
+	const rendered = stripAnsi(preview.join("\n"));
+	assert.match(rendered, /p Codex Recommended/);
+	assert.match(rendered, /sdd-design\s+model=openai-codex\/gpt-5\.6-sol, effort=high/);
+	assert.match(rendered, /custom-agent\s+model=inherit, effort=inherit/);
+	assert.deepEqual(result, {
+		type: "save",
+		config: {
+			"sdd-design": { model: "openai-codex/gpt-5.6-sol", thinking: "high" },
+			"custom-agent": {},
+		},
+	});
+});
+
 test("provider review roles skip migration and both projection paths even when discoverable", async (t) => {
 	const roles = ["review-refuter", "review-validator"];
 	const fixture = routingConsumerFixture(t, [...roles, "worker"]);
@@ -1874,8 +1940,16 @@ test("a profile store entry with only the orchestrator key counts zero roles", a
 	assert.match(applied, /Orchestrator set to nan\/glm5\.3 · high/);
 });
 
-test("the profiles panel fills the terminal, lists routing per agent, and scrolls", async (t) => {
+test("the profiles panel previews omitted roles against materialized routing and scrolls", async (t) => {
 	const { fixture, writeStore } = profilesStoreFixture(t);
+	writeMarkdown(
+		join(fixture.root, ".pi", "agents", "custom-agent.md"),
+		"---\nname: custom-agent\ndescription: Custom\nmodel: anthropic/stale\nthinking: high\n---\n",
+	);
+	writeMarkdown(
+		join(fixture.root, ".pi", "subagents.json"),
+		`${JSON.stringify({ model_profiles: { "custom-agent": { model: "anthropic/stale", effort: "high" } } }, null, 2)}\n`,
+	);
 	writeStore({
 		team: {
 			orchestrator: { model: "nan/glm5.3", thinking: "high" },
@@ -1884,7 +1958,7 @@ test("the profiles panel fills the terminal, lists routing per agent, and scroll
 		},
 	}, "team");
 	let rendered: string | undefined;
-	let panel: { render(width: number): string[] } | undefined;
+	let panel: { render(width: number): string[]; handleInput(data: string): void } | undefined;
 	fixture.onInput((visited) => {
 		panel = visited;
 		rendered = renderComponent(visited);
@@ -1901,11 +1975,14 @@ test("the profiles panel fills the terminal, lists routing per agent, and scroll
 	const text = rendered;
 	// Routing is listed one agent per line, aligned in columns, never collapsed
 	// into "N agents → model: a, b, …" summaries.
-	assert.match(text, /Profile routing/);
-	assert.match(text, /Current routing \(models\.json\)/);
+	assert.match(text, /After apply \(complete snapshot\)/);
+	assert.match(text, /Materialized routing now/);
 	assert.match(text, /orchestrator\s+nan\/glm5\.3 · high/);
 	assert.match(text, /worker\s+openai\/alpha\s+high/);
-	assert.match(text, /sdd-design\s+nan\/glm5\.3\s+high/);
+	assert.match(text, /custom-agent\s+inherit\s+inherit/);
+	panel!.handleInput("j");
+	const scrolledPreview = stripAnsi(panel!.render(120).join("\n"));
+	assert.match(scrolledPreview, /custom-agent\s+anthropic\/stale\s+high/);
 	assert.doesNotMatch(text, /agents? → /);
 
 	// A taller terminal renders a taller frame with the same content.
