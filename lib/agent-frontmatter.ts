@@ -39,8 +39,7 @@ function routingInsertIndex(lines: readonly string[]): number {
 	let insertIndex = descriptionIndex + 1;
 	for (let index = insertIndex; index < lines.length; index += 1) {
 		const line = lines[index];
-		if (line.trim() === "") continue;
-		if (line.startsWith(" ") || line.startsWith("\t")) {
+		if (line.startsWith(" ") || line.startsWith("\t") || line.trim() === "") {
 			insertIndex = index + 1;
 			continue;
 		}

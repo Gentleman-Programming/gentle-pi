@@ -176,3 +176,32 @@ test("the agent body is never modified", () => {
 	const body = BLOCK_SCALAR_AGENT.split("\n---\n")[1];
 	assert.ok(updated.endsWith(body));
 });
+
+test("trailing blank lines in a block scalar are preserved before routing keys", () => {
+	const content = lines(
+		"---",
+		"name: trailing-blank",
+		"description: >+",
+		"  first line",
+		"  second line",
+		"",
+		"subagent: true",
+		"---",
+		"",
+	);
+	assert.equal(
+		upsertAgentFrontmatterRouting(content, [MODEL]),
+		lines(
+			"---",
+			"name: trailing-blank",
+			"description: >+",
+			"  first line",
+			"  second line",
+			"",
+			MODEL,
+			"subagent: true",
+			"---",
+			"",
+		),
+	);
+});
