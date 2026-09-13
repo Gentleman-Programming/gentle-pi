@@ -525,6 +525,53 @@ async function countPackageExtensions(packages: unknown[]): Promise<number> {
   return count;
 }
 
+interface McpServerEntry {
+  disabled?: boolean;
+}
+
+interface McpConfigFile {
+  mcpServers?: Record<string, McpServerEntry | null>;
+}
+
+/** MCP config layers, lowest precedence first. A project layer replaces the
+ *  global entry for a server of the same name, which is how `/mcp disable`
+ *  turns a globally configured server off for one project. */
+export function mcpConfigPaths(cwd: string): string[] {
+  return [join(PI_AGENT_DIR, "mcp.json"), join(cwd, ".pi", "mcp.json")];
+}
+
+/** How many MCP servers this session actually loads.
+ *
+ * Counting the keys of the global config file overstated it twice over: a
+ * server carrying `"disabled": true` connects to nothing and registers no
+ * tools, and a server configured only in the project layer was invisible to a
+ * global-file parse. A layer that is absent or unparseable contributes
+ * nothing and does not discard the others.
+ */
+export async function countEnabledMcpServers(
+  cwd: string,
+  read: (path: string) => Promise<string> = (path) => readFile(path, "utf8"),
+): Promise<number> {
+  const servers = new Map<string, McpServerEntry>();
+  for (const path of mcpConfigPaths(cwd)) {
+    let entries: McpConfigFile["mcpServers"];
+    try {
+      entries = (JSON.parse(await read(path)) as McpConfigFile | null)?.mcpServers;
+    } catch {
+      continue;
+    }
+    if (!entries || typeof entries !== "object" || Array.isArray(entries)) continue;
+    for (const [name, entry] of Object.entries(entries)) {
+      servers.set(name, entry ?? {});
+    }
+  }
+  let enabled = 0;
+  for (const entry of servers.values()) {
+    if (entry?.disabled !== true) enabled += 1;
+  }
+  return enabled;
+}
+
 export function readGitBranch(cwd: string, run: typeof execFile = execFile): Promise<string> {
   return new Promise((resolve) => {
     run("git", ["-C", cwd, "branch", "--show-current"], {
@@ -654,16 +701,7 @@ export default function (pi: ExtensionAPI) {
 
     setTimeout(() => {
       (async () => {
-        try {
-          const raw = await readFile(
-            join(os.homedir(), ".pi", "agent", "mcp.json"),
-            "utf8",
-          );
-          const cfg = JSON.parse(raw);
-          mcpServersCount = Object.keys(cfg.mcpServers || {}).length;
-        } catch {
-          mcpServersCount = 0;
-        }
+        mcpServersCount = await countEnabledMcpServers(ctx.cwd);
         refreshStats();
       })();
     }, 150);
