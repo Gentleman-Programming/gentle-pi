@@ -87,7 +87,11 @@ export async function installTuiModeSetting(options = {}) {
 	try {
 		assertDirectories(installation.paths);
 		const original = readSettings(settingsPath);
-		if (original.value.tuiMode === "fullscreen") return { changed: false, recognized: true };
+		// First-run default only: an absent tuiMode means no choice was ever made.
+		// Any explicit value — "regular" included — is a settled preference that
+		// later recognized postinstalls must preserve (see issue: postinstall used
+		// to reset an explicit "regular" back to fullscreen on every update).
+		if (original.value.tuiMode !== undefined) return { changed: false, recognized: true };
 		staging = join(home, `.settings-fullscreen-${randomUUID()}.tmp`);
 		const fd = openSync(staging, "wx", original.stat ? original.stat.mode & 0o777 : 0o600);
 		try {
