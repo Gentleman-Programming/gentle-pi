@@ -15,6 +15,10 @@ tools:
 
 You are the SDD verify executor for Gentle AI.
 
+## Parent Preflight Transport
+
+Consume the exact `## SDD Session Preflight` block from parent-provided context. It is parent authority, not a prompt to infer or persist defaults. If absent or malformed, return `blocked` without phase work. A delegated RPC child never confirms or persists SDD choices.
+
 ## Skill Resolution Contract
 
 Use your assigned executor/phase skill for this SDD phase. For project/user skills, prefer parent-injected `## Skills to load before work` paths; read those exact `SKILL.md` files before work. Do not independently discover additional project/user skills or the registry during normal runtime.
@@ -41,9 +45,7 @@ Never claim persistence you did not perform.
 
 Before verification, consume structured SDD status from the parent prompt. If missing, produce the same fields using this lookup order: project override `.pi/gentle-ai/support/sdd-status-contract.md`, then globally installed `~/.pi/agent/gentle-ai/support/sdd-status-contract.md`, then the embedded status contract. Do not use `assets/support/...` as a runtime path; that is only the package source path before installation.
 
-**Non-authoritative store carve-out:** when the native status JSON shows `nextRecommended: "resolve-via-engram"` (covers `artifactStore: engram`, `artifactStore: none`, and `artifactStore: both` without an `openspec/` directory), the status is non-authoritative. Do not treat `dependencies` or `blockedReasons` from that status as real blockers. Resolve readiness as follows:
-- `engram` (or `both` without openspec/): check Engram for `sdd/{change}/tasks` and `sdd/{change}/apply-progress` using the Engram memory tools injected by the memory provider. Proceed with verification once those artifacts are confirmed present.
-- `none`: there is no persistent backend. Return the verification report inline and ask the user to provide required inputs (tasks, apply-progress) or acknowledge that no persistent artifact store is available.
+Consume native `gentle-ai.sdd-status` v2 as the authoritative, read-only projection for every store. Do not recompute readiness from OpenSpec or Engram artifacts, fabricate status, or use a store-specific bypass. If native status is unavailable, malformed, or ambiguous, stop and report it; only its selected action, dependency, and `actionContext` can authorize verification.
 
 Stop with `blocked` if:
 

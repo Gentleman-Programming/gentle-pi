@@ -1,3 +1,5 @@
+import type { RemediationObservations, RemediationScope } from "./agents-runner.ts";
+import type { NativeSddAcquireRequest, NativeSddSettleRequest, NativeSddAttemptResult } from "./native-review-cli.ts";
 import { sanitizeTerminalText } from "./terminal-theme.ts";
 
 // Gentle Agents protocol. A child pi process streams RPC events; the host
@@ -108,7 +110,22 @@ export interface TaskThread {
 	limits: ThreadLimits;
 }
 
+export interface RemediationTaskState extends RemediationObservations {
+	scope?: RemediationScope;
+	acquire: NativeSddAcquireRequest;
+	token?: string;
+	acquireResult?: NativeSddAttemptResult;
+	acquireUncertain?: boolean;
+	actorClaimed?: boolean;
+	settle?: NativeSddSettleRequest;
+	settlement?: NativeSddAttemptResult;
+	settlementUncertain?: boolean;
+}
+
 export interface TaskRecord {
+	sddRemediation?: RemediationTaskState;
+	/** Exact runtime-generated SDD preflight block retained only for continuation transport. */
+	sddPreflightContext?: string;
 	id: string;
 	agent: string;
 	mode: string;
