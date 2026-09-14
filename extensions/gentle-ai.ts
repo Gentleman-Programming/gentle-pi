@@ -3554,6 +3554,8 @@ type ProfilesPanelResult =
 	| { type: "import" }
 	| { type: "close" };
 
+type ProfilesSnapshotHandler = (name: string) => AgentProfilesFile;
+
 const PROFILES_PANEL_MIN_BODY_ROWS = 6;
 
 type ProfilesPanelPointerLayout = AgentsViewLayout & { listTop: number };
@@ -3582,10 +3584,14 @@ class ProfilesPanel implements OverlayComponent {
 	private lastDetailLineCount = 0;
 	private lastDetailRows = 0;
 	private lastSelectedId: string | undefined;
+	private feedback: string | undefined;
 	readonly list: NativeChoiceList<ProfileListItem>;
-	private readonly file: AgentProfilesFile;
+	private file: AgentProfilesFile;
 	private readonly currentConfig: AgentModelConfig;
 	private readonly done: (result: ProfilesPanelResult) => void;
+	private readonly saveSnapshot: ProfilesSnapshotHandler;
+	private readonly requestRender: () => void;
+	private readonly listItems: ProfileListItem[];
 	private readonly theme: Theme | undefined;
 	private readonly rows: () => number;
 	private readonly orchestratorSettings: OrchestratorSettingsReadResult;
@@ -3599,14 +3605,19 @@ class ProfilesPanel implements OverlayComponent {
 		selectedName: string | undefined,
 		rows: () => number,
 		orchestratorSettings: OrchestratorSettingsReadResult,
+		saveSnapshot: ProfilesSnapshotHandler,
+		requestRender: () => void,
 	) {
 		this.file = file;
 		this.currentConfig = currentConfig;
 		this.done = done;
+		this.saveSnapshot = saveSnapshot;
+		this.requestRender = requestRender;
 		this.theme = theme;
 		this.rows = rows;
 		this.orchestratorSettings = orchestratorSettings;
 		const items = buildProfileListItems(file);
+		this.listItems = items;
 		this.list = new NativeChoiceList<ProfileListItem>(
 			items,
 			{
@@ -3657,7 +3668,17 @@ class ProfilesPanel implements OverlayComponent {
 		if (data === "c") return this.finish({ type: "create" });
 		if (data === "i") return this.finish({ type: "import" });
 		if (!name) return this.list.handleInput(data);
-		if (data === "s") return this.finish({ type: "update", name });
+		if (data === "s") {
+			try {
+				this.file = this.saveSnapshot(name);
+				this.refreshListItems();
+				this.feedback = `Snapshot saved; live routing unchanged. Profile "${name}" saved from current routing.`;
+			} catch (error) {
+				this.feedback = `Snapshot failed; live routing unchanged. Profile "${name}" was not saved from current routing: ${profilesErrorMessage(error)}`;
+			}
+			this.requestRender();
+			return;
+		}
 		if (data === "d") return this.finish({ type: "duplicate", name });
 		if (data === "r") return this.finish({ type: "rename", name });
 		if (data === "x") return this.finish({ type: "delete", name });
@@ -3731,6 +3752,16 @@ class ProfilesPanel implements OverlayComponent {
 		);
 	}
 
+	private refreshListItems(): void {
+		// Keep the list instance (and its pointer observer) alive while refreshing the
+		// mutable item records that NativeChoiceList already holds by reference.
+		for (const item of buildProfileListItems(this.file)) {
+			const current = this.listItems.find((candidate) => candidate.id === item.id);
+			if (current) Object.assign(current, item);
+		}
+		this.list.refreshItems();
+	}
+
 	private pageRows(): number {
 		return Math.max(1, this.lastDetailRows - 1);
 	}
@@ -3771,11 +3802,12 @@ class ProfilesPanel implements OverlayComponent {
 
 	private renderFooterRow(width: number): string {
 		const hints =
-			"enter apply · c create · s update · d duplicate · r rename · x delete · e export · i import · j/k line · ctrl+j/k page · esc close";
+			"enter apply · c create · s snapshot · d duplicate · r rename · x delete · e export · i import · j/k line · ctrl+j/k page · esc close";
+		const text = this.feedback ?? hints;
 		return [
 			this.renderText("│", "border"),
 			" ",
-			this.fitPaneLine(this.renderText(hints, "muted"), width - 4),
+			this.fitPaneLine(this.renderText(text, this.feedback ? "status" : "muted"), width - 4),
 			" ",
 			this.renderText("│", "border"),
 		].join("");
@@ -3861,7 +3893,8 @@ async function showProfilesPanel(
 	ctx: ExtensionContext,
 	file: AgentProfilesFile,
 	currentConfig: AgentModelConfig,
-	selectedName?: string,
+	selectedName: string | undefined,
+	saveSnapshot: ProfilesSnapshotHandler,
 ): Promise<ProfilesPanelResult> {
 	// Read once, for the panel lifetime. The orchestrator shown as "now" is the
 	// state the panel opened on, not a value that changes mid-panel.
@@ -3877,6 +3910,8 @@ async function showProfilesPanel(
 				selectedName,
 				() => Math.max(0, tui.terminal.rows),
 				orchestratorSettings,
+				saveSnapshot,
+				() => tui.requestRender(),
 			);
 			const container = createNativeFullscreenInteraction({
 				keyboardTarget: panel,
@@ -3920,6 +3955,17 @@ function reportProfilesDrops(ctx: ExtensionContext, path: string, drops: Profile
 			"warning",
 		);
 	}
+}
+
+function profileSnapshotFrom(
+	current: AgentModelConfig,
+	settings: OrchestratorSettingsReadResult,
+): AgentModelConfig {
+	const snapshot = cloneModelConfig(current);
+	if (settings.status === "valid" && settings.entry !== undefined) {
+		snapshot[PROFILE_ORCHESTRATOR_KEY] = { ...settings.entry };
+	}
+	return snapshot;
 }
 
 async function runProfilesPanelAction(
@@ -4063,16 +4109,14 @@ async function runProfilesPanelAction(
 			}
 		}
 		case "update": {
-			const current = await readEffectiveModelConfigAsync(ctx.cwd);
 			// A profile is a complete snapshot, so capturing the current routing also
 			// captures the orchestrator the routing is running under. A settings file
 			// that cannot be read leaves the snapshot without an orchestrator entry
 			// rather than inventing one.
-			const settings = readOrchestratorSettings(orchestratorSettingsPath());
-			const snapshot: AgentModelConfig = cloneModelConfig(current);
-			if (settings.status === "valid" && settings.entry !== undefined) {
-				snapshot[PROFILE_ORCHESTRATOR_KEY] = { ...settings.entry };
-			}
+			const snapshot = profileSnapshotFrom(
+				await readEffectiveModelConfigAsync(ctx.cwd),
+				readOrchestratorSettings(orchestratorSettingsPath()),
+			);
 			try {
 				const next = updateProfile(file, result.name, snapshot);
 				writeProfilesFileSync(path, next);
@@ -4214,12 +4258,37 @@ async function handleProfilesCommand(ctx: ExtensionContext): Promise<void> {
 		file = read.file;
 		reportProfilesDrops(ctx, path, read.drops);
 	}
+	const saveSnapshot: ProfilesSnapshotHandler = (name) => {
+		const next = updateProfile(
+			file,
+			name,
+			profileSnapshotFrom(
+				readEffectiveModelConfig(ctx.cwd),
+				readOrchestratorSettings(orchestratorSettingsPath()),
+			),
+		);
+		writeProfilesFileSync(path, next);
+		file = next;
+		return next;
+	};
 	let selectedName: string | undefined;
-	let result = await showProfilesPanel(ctx, file, await readEffectiveModelConfigAsync(ctx.cwd), selectedName);
+	let result = await showProfilesPanel(
+		ctx,
+		file,
+		await readEffectiveModelConfigAsync(ctx.cwd),
+		selectedName,
+		saveSnapshot,
+	);
 	while (result.type !== "close") {
 		selectedName = "name" in result ? result.name : undefined;
 		file = await runProfilesPanelAction(ctx, path, file, result);
-		result = await showProfilesPanel(ctx, file, await readEffectiveModelConfigAsync(ctx.cwd), selectedName);
+		result = await showProfilesPanel(
+			ctx,
+			file,
+			await readEffectiveModelConfigAsync(ctx.cwd),
+			selectedName,
+			saveSnapshot,
+		);
 	}
 }
 
