@@ -163,10 +163,13 @@ async function captureOwnedRoutes(t: TestContext): Promise<{ captures: Capture[]
 		const traces: Trace[] = [];
 		const graph = codegraph.createCodeGraphTool();
 		assert.equal(typeof graph.execute, "function", "CodeGraph public handler must be registered");
+		const winFallback: ExpectedCall[] = process.platform === "win32"
+			? [{ kind: "execFile", command: process.execPath, args: [join(fallbackRoot!, "node_modules", "@colbymchenry", "codegraph", "entry.js"), "init", cwd] }]
+			: [];
 		const graphResult = await trace(captures, traces, "CodeGraph init", () => graph.execute("capture", { operation: "init" }, undefined, undefined, { cwd } as never), [
 			{ kind: "execFileSync", command: "git", args: ["rev-parse", "--show-toplevel"] },
 			{ kind: "execFile", command: "codegraph", args: ["init", cwd] },
-			...(process.platform === "win32" ? [{ kind: "execFile", command: process.execPath, args: [join(fallbackRoot!, "node_modules", "@colbymchenry", "codegraph", "entry.js"), "init", cwd] }] : []),
+			...winFallback,
 		]);
 		const graphText = String((graphResult as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? "");
 		assert.match(graphText, /indexed/, "CodeGraph must return the fixture command result");
