@@ -1985,7 +1985,103 @@ test("a profile store entry with only the orchestrator key counts zero roles", a
 	assert.match(applied, /Orchestrator set to nan\/glm5\.3 · high/);
 });
 
-test("the profiles panel previews omitted roles against materialized routing and scrolls", async (t) => {
+test("applying a profile replaces materialized routing for agents the profile omits", async (t) => {
+	const { fixture, writeStore, writeSettings } = profilesStoreFixture(t);
+	writeSettings();
+	// Routing materialized earlier (a previous profile, /gentle:models, or a
+	// migration) for an agent the new profile does not mention.
+	const helperPath = join(fixture.root, ".pi", "agents", "helper.md");
+	writeMarkdown(helperPath, "---\nname: helper\ndescription: Helper\nmodel: openai/beta\nthinking: high\n---\nbody\n");
+	const subagentsPath = join(fixture.root, ".pi", "subagents.json");
+	writeFileSync(subagentsPath, `${JSON.stringify({ model_profiles: { helper: { model: "openai/beta", effort: "high" } } }, null, 2)}\n`);
+	writeStore({ team: { worker: { model: "openai/alpha" } } });
+	applyOnce(fixture);
+	await fixture.run("gentle:profiles");
+
+	const profiles = JSON.parse(readFileSync(subagentsPath, "utf8"));
+	assert.deepEqual(profiles.model_profiles, { worker: { model: "openai/alpha" } }, "omitted agents lose their materialized route");
+	const helper = readFileSync(helperPath, "utf8");
+	assert.doesNotMatch(helper, /^model:/m);
+	assert.doesNotMatch(helper, /^thinking:/m);
+	assert.match(readFileSync(join(fixture.root, ".pi", "agents", "worker.md"), "utf8"), /model: openai\/alpha/);
+	// models.json stays the profile itself, not a padded copy.
+	assert.deepEqual(JSON.parse(readFileSync(fixture.globalPath, "utf8")), { worker: { model: "openai/alpha" } });
+	const applied = fixture.notifications.at(-1)?.message ?? "";
+	assert.match(applied, /applied profile "team"/);
+});
+
+test("a failed apply restores the previous profile's routing with the same replacement semantics", async (t) => {
+	const { fixture, settingsPath, writeStore } = profilesStoreFixture(t);
+	// An unreadable settings.json makes the orchestrator write fail after the
+	// routing was already materialized, which triggers the rollback path.
+	writeFileSync(settingsPath, "{ not json\n");
+	const helperPath = join(fixture.root, ".pi", "agents", "helper.md");
+	writeMarkdown(helperPath, "---\nname: helper\ndescription: Helper\nmodel: openai/beta\n---\nbody\n");
+	const subagentsPath = join(fixture.root, ".pi", "subagents.json");
+	writeFileSync(subagentsPath, `${JSON.stringify({ model_profiles: { helper: { model: "openai/beta" } } }, null, 2)}\n`);
+	mkdirSync(fixture.configHome, { recursive: true });
+	writeFileSync(fixture.globalPath, `${JSON.stringify({ helper: { model: "openai/beta" } }, null, 2)}\n`);
+	// "team" is listed first, so Enter applies it while "old" stays the active one.
+	writeStore({
+		team: { orchestrator: { model: "nan/glm5.3" }, worker: { model: "openai/alpha" } },
+		old: { helper: { model: "openai/beta" } },
+	}, "old");
+	applyOnce(fixture);
+	await fixture.run("gentle:profiles");
+
+	const warning = fixture.notifications.find((entry) => /could not apply profile "team"/.test(entry.message));
+	assert.ok(warning, "the failed apply is reported");
+	assert.deepEqual(JSON.parse(readFileSync(fixture.globalPath, "utf8")), { helper: { model: "openai/beta" } });
+	const profiles = JSON.parse(readFileSync(subagentsPath, "utf8"));
+	assert.deepEqual(profiles.model_profiles, { helper: { model: "openai/beta" } }, "the previous routing is materialized again and the failed profile's routes are cleared");
+	assert.match(readFileSync(helperPath, "utf8"), /model: openai\/beta/);
+	assert.doesNotMatch(readFileSync(join(fixture.root, ".pi", "agents", "worker.md"), "utf8"), /^model:/m);
+	const store = JSON.parse(readFileSync(join(fixture.configHome, "profiles.json"), "utf8"));
+	assert.equal(store.active, "old");
+});
+
+test("the profiles command seeds and shows the routing the runtime uses when models.json is sparse", async (t) => {
+	const { fixture } = profilesStoreFixture(t);
+	// No models.json at all, but routing is materialized where the runtime
+	// reads it: subagents.json for worker, frontmatter only for helper.
+	writeMarkdown(join(fixture.root, ".pi", "agents", "helper.md"), "---\nname: helper\ndescription: Helper\nmodel: openai/beta\n---\nbody\n");
+	writeFileSync(join(fixture.root, ".pi", "subagents.json"), `${JSON.stringify({ model_profiles: { worker: { model: "openai/alpha", effort: "high" } } }, null, 2)}\n`);
+	let rendered: string | undefined;
+	fixture.onInput((panel) => {
+		rendered = stripAnsi(renderComponent(panel));
+		panel.handleInput("\x1b");
+	});
+	await fixture.run("gentle:profiles");
+
+	const store = JSON.parse(readFileSync(join(fixture.configHome, "profiles.json"), "utf8"));
+	assert.equal(store.active, "current", "materialized routing counts as existing routing");
+	assert.deepEqual(store.profiles.current, {
+		worker: { model: "openai/alpha", thinking: "high" },
+		helper: { model: "openai/beta" },
+	});
+	assert.ok(rendered);
+	assert.match(rendered, /Current routing \(effective\)/);
+	assert.match(rendered, /worker\s+openai\/alpha\s+high/);
+	assert.match(rendered, /helper\s+openai\/beta/);
+	assert.doesNotMatch(rendered, /No routing entries/);
+});
+
+test("effective routing prefers models.json over the materialized stores", (t) => {
+	const fixture = routingConsumerFixture(t, ["worker", "helper"]);
+	mkdirSync(fixture.configHome, { recursive: true });
+	writeFileSync(fixture.globalPath, `${JSON.stringify({ worker: { model: "openai/alpha" } }, null, 2)}\n`);
+	writeFileSync(join(fixture.root, ".pi", "subagents.json"), `${JSON.stringify({
+		model_profiles: { worker: { model: "openai/beta", effort: "high" }, helper: { model: "openai/beta" } },
+	}, null, 2)}\n`);
+	const effective = JSON.parse(JSON.stringify(__testing.readEffectiveModelConfig(fixture.root)));
+	assert.deepEqual(effective, {
+		worker: { model: "openai/alpha" },
+		helper: { model: "openai/beta" },
+	});
+	assert.equal(existsSync(join(fixture.root, ".pi", "gentle-ai", "models.json")), false, "reading never writes");
+});
+
+test("the profiles panel previews omitted roles against effective routing and scrolls", async (t) => {
 	const { fixture, writeStore } = profilesStoreFixture(t);
 	writeMarkdown(
 		join(fixture.root, ".pi", "agents", "custom-agent.md"),
@@ -2021,7 +2117,7 @@ test("the profiles panel previews omitted roles against materialized routing and
 	// Routing is listed one agent per line, aligned in columns, never collapsed
 	// into "N agents → model: a, b, …" summaries.
 	assert.match(text, /After apply \(complete snapshot\)/);
-	assert.match(text, /Materialized routing now/);
+	assert.match(text, /Current routing \(effective\)/);
 	assert.match(text, /orchestrator\s+nan\/glm5\.3 · high/);
 	assert.match(text, /worker\s+openai\/alpha\s+high/);
 	assert.match(text, /custom-agent\s+inherit\s+inherit/);

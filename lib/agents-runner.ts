@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Duplex, Readable, Writable } from "node:stream";
+import { stripVTControlCharacters } from "node:util";
 import { RESEARCH_SELECTION_ENV, RESEARCH_ARTIFACT_ENV, type ResearchArtifactIntent } from "./sdd-research-capabilities.ts";
 import { AGENT_MODE, formatModelRef, type AgentDefinition, type AgentMode, type ModelRef } from "./agents-config.ts";
 import { CHILD_QUERY_MAX_INFLIGHT, CHILD_QUERY_TIMEOUT_MS, parseChildFrame, validChildMessage, validChildQueryId } from "./agents-messaging.ts";
@@ -275,8 +276,13 @@ interface LiveTask {
 	acknowledgedIpcIds: Set<string>;
 	acknowledgedIpcOrder: string[];
 	mutationStarts: Map<string, { toolName: "write" | "edit"; toolCallId: string; path: string }>;
+	// Bounded ring buffer of the child's raw stderr output, capped to the last
+	// STDERR_TAIL_MAX characters. Only surfaced on the stall and pre-settle exit
+	// terminal paths, never on completed, cancelled, or other failure reasons.
+	stderrTail: string;
 }
 
+const STDERR_TAIL_MAX = 512;
 const CHILD_MARKER = "GENTLE_PI_AGENTS_CHILD";
 const IPC_MARKER = "GENTLE_PI_AGENTS_OWNED_IPC";
 const PARENT_NOTIFICATION_TOOL = "subagent_parent_message";
@@ -487,15 +493,15 @@ export class AgentRunner {
 		return accepted;
 	}
 
-	cancel(id: string): boolean {
+	cancel(id: string, reason = "cancelled"): boolean {
 		const queued = this.queue.findIndex((entry) => entry.task.id === id);
 		if (queued >= 0) {
 			this.queue.splice(queued, 1);
-			this.finish(id, TASK_STATUS.CANCELLED, "cancelled before start");
+			this.finish(id, TASK_STATUS.CANCELLED, `${reason} before start`);
 			return true;
 		}
 		if (!this.live.has(id)) return false;
-		this.requestStop(id, TASK_STATUS.CANCELLED, "cancelled", true);
+		this.requestStop(id, TASK_STATUS.CANCELLED, reason, true);
 		return true;
 	}
 
@@ -506,9 +512,9 @@ export class AgentRunner {
 		if (live) { live.observations = undefined; live.observationGuard = undefined; }
 	}
 
-	cancelAll(): number {
+	cancelAll(reason = "cancelled"): number {
 		const ids = [...this.queue.map((entry) => entry.task.id), ...this.live.keys()];
-		return ids.filter((id) => this.cancel(id)).length;
+		return ids.filter((id) => this.cancel(id, reason)).length;
 	}
 
 	steer(id: string, message: string): boolean {
@@ -555,7 +561,7 @@ export class AgentRunner {
 			return;
 		}
 		const processGroup = detached && typeof child.pid === "number" && child.pid > 0 ? child.pid : undefined;
-		const live: LiveTask = { child, mutationStarts: new Map(), pending: new Map(), queries: new Map(), replies: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0, ipcClosed: false, acknowledgedIpcIds: new Set(), acknowledgedIpcOrder: [] };
+		const live: LiveTask = { child, mutationStarts: new Map(), pending: new Map(), queries: new Map(), replies: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0, ipcClosed: false, acknowledgedIpcIds: new Set(), acknowledgedIpcOrder: [], stderrTail: "" };
 		if (request.prepareResponseObservations) {
 			let ready = false;
 			live.observationPreparation = () => ready;
@@ -592,7 +598,11 @@ export class AgentRunner {
 		const lines = new JsonLines((value) => this.receive(id, request, value));
 		child.stdout.setEncoding("utf8");
 		child.stdout.on("data", (chunk: string) => lines.push(chunk));
-		child.stderr?.on("data", () => {});
+		child.stderr?.setEncoding("utf8");
+		child.stderr?.on("data", (chunk: string) => {
+			const tail = live.stderrTail + chunk;
+			live.stderrTail = tail.length > STDERR_TAIL_MAX ? tail.slice(-STDERR_TAIL_MAX) : tail;
+		});
 		child.on("exit", (code) => this.exited(id, code));
 		if (request.sddRemediation && child.pid === undefined) {
 			this.childError(id, new Error("remediation child has no process ID"));
@@ -602,6 +612,7 @@ export class AgentRunner {
 			const data = response.data as { sessionFile?: unknown; model?: { provider?: unknown; id?: unknown } | null; thinkingLevel?: unknown } | undefined;
 			if (response.success !== true || live.terminal || this.live.get(id) !== live || !data) return;
 			const resolved: Partial<TaskRecord> = {};
+			if (this.canAdvanceLastStep(id, ["starting"])) resolved.lastStep = "pi ready";
 			if (typeof data.sessionFile === "string" && data.sessionFile) resolved.sessionPath = data.sessionFile;
 			if (data.model === null) resolved.model = "default";
 			else if (typeof data.model?.provider === "string" && data.model.provider && typeof data.model.id === "string" && data.model.id) {
@@ -611,13 +622,35 @@ export class AgentRunner {
 			this.store.update(id, resolved);
 		});
 		void this.send(id, { type: "prompt", message: promptText(request) }).then((response) => {
-			if (response.success === false) this.requestStop(id, TASK_STATUS.FAILED, String(response.error ?? "prompt rejected"));
+			if (response.success === false) {
+				this.requestStop(id, TASK_STATUS.FAILED, String(response.error ?? "prompt rejected"));
+				return;
+			}
+			if (!live.terminal && this.live.get(id) === live && this.canAdvanceLastStep(id, ["starting", "pi ready"])) this.store.update(id, { lastStep: "prompt accepted" });
 		});
+	}
+
+	// A late get_state/prompt reply must never overwrite a stage that a child
+	// event (or the other reply) has already advanced lastStep past.
+	private canAdvanceLastStep(id: string, from: readonly string[]): boolean {
+		const current = this.store.get(id)?.lastStep;
+		return current !== undefined && from.includes(current);
+	}
+
+	// Cleaned for display only: raw bytes stay in live.stderrTail so later
+	// appends keep working from the unstripped ring buffer.
+	private stderrSuffix(live: LiveTask): string {
+		const cleaned = stripVTControlCharacters(live.stderrTail).replace(/\s+/g, " ").trim();
+		return cleaned ? `; stderr: ${cleaned}` : "";
 	}
 
 	private armStall(id: string, live: LiveTask): void {
 		live.cancelStall();
-		live.cancelStall = this.deps.schedule(() => this.requestStop(id, TASK_STATUS.TIMED_OUT, `stalled for ${Math.round(this.limits.stallTimeoutMs / 60_000)} min`), this.limits.stallTimeoutMs);
+		live.cancelStall = this.deps.schedule(() => {
+			const lastStep = this.store.get(id)?.lastStep ?? "starting";
+			const minutes = Math.round(this.limits.stallTimeoutMs / 60_000);
+			this.requestStop(id, TASK_STATUS.TIMED_OUT, `stalled for ${minutes} min after: ${lastStep}${this.stderrSuffix(live)}`);
+		}, this.limits.stallTimeoutMs);
 	}
 
 	private send(id: string, command: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -933,7 +966,7 @@ export class AgentRunner {
 		if (!live) return;
 		live.childExit = code;
 		if (this.groupExists(live)) {
-			if (!live.terminal) this.requestStop(id, TASK_STATUS.FAILED, `pi exited with code ${code ?? "unknown"} before agent_settled`);
+			if (!live.terminal) this.requestStop(id, TASK_STATUS.FAILED, `pi exited with code ${code ?? "unknown"} before agent_settled${this.stderrSuffix(live)}`);
 			return;
 		}
 		this.completeExit(id, live);
@@ -951,7 +984,7 @@ export class AgentRunner {
 			return;
 		}
 		const terminal = live.terminal;
-		this.finish(id, terminal ? terminal.status : TASK_STATUS.FAILED, terminal ? terminal.error : `pi exited with code ${live.childExit ?? "unknown"} before agent_settled`, live);
+		this.finish(id, terminal ? terminal.status : TASK_STATUS.FAILED, terminal ? terminal.error : `pi exited with code ${live.childExit ?? "unknown"} before agent_settled${this.stderrSuffix(live)}`, live);
 	}
 
 	private finish(id: string, status: TaskRecord["status"], error: string | null, live?: LiveTask): void {

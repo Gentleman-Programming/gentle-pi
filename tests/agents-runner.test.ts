@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { PassThrough } from "node:stream";
 import { AGENT_MODE, parseAgentsConfig, resolveAgentProfile, type AgentDefinition } from "../lib/agents-config.ts";
 import { TASK_STATUS, TaskStore, type RemediationTaskState, type TaskRecord } from "../lib/agents-protocol.ts";
 import { AgentRunner, childArguments, JsonLines, piCommand, abortReasonText, type RemediationPlan, type RemediationTerminalFacts, type RunnerDeps, type RunnerHooks, type TaskRequest } from "../lib/agents-runner.ts";
@@ -25,7 +26,7 @@ interface Harness {
 	spawnOptions: Array<{ env: NodeJS.ProcessEnv; stdio?: string[] }>;
 }
 
-function harness(options: { pid?: number; maxConcurrency?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean; onNotification?: RunnerHooks["onNotification"]; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"]; onFinish?: RunnerHooks["onFinish"] } = {}): Harness {
+function harness(options: { pid?: number; maxConcurrency?: number; stallTimeoutMs?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean; onNotification?: RunnerHooks["onNotification"]; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"]; onFinish?: RunnerHooks["onFinish"] } = {}): Harness {
 	const children: FakeChild[] = [];
 	const timers: Harness["timers"] = [];
 	const asks: Harness["asks"] = [];
@@ -59,7 +60,7 @@ function harness(options: { pid?: number; maxConcurrency?: number; answer?: Reco
 		pi: { command: "pi", args: [] },
 	};
 	const store = new TaskStore();
-	const runner = new AgentRunner(store, { maxConcurrency: options.maxConcurrency ?? 2, stallTimeoutMs: 10_000 }, deps, {
+	const runner = new AgentRunner(store, { maxConcurrency: options.maxConcurrency ?? 2, stallTimeoutMs: options.stallTimeoutMs ?? 10_000 }, deps, {
 		askUser: async (taskId, ask) => {
 			asks.push({ taskId, method: ask.method });
 			return options.answer ?? { value: "yes" };
@@ -72,6 +73,157 @@ function harness(options: { pid?: number; maxConcurrency?: number; answer?: Reco
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+const FOUR_MIN_MS = 4 * 60_000;
+
+// A child that never answers the launch RPC commands (get_state, prompt), so
+// the task's lastStep never leaves its initial "starting" stage. Used to
+// exercise the stall watchdog before any child response arrives.
+function silentHarness(stallTimeoutMs: number): { store: TaskStore; runner: AgentRunner; timers: Array<{ fn: () => void; ms: number; cancelled: boolean }>; child: () => FakeChild } {
+	const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+	let clock = 1000;
+	let created: FakeChild | undefined;
+	const store = new TaskStore();
+	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs }, {
+		spawn: () => {
+			created = fakeChild();
+			created.child.stdin.removeAllListeners("data");
+			return created.child;
+		},
+		now: () => (clock += 1),
+		schedule: (fn, ms) => {
+			const timer = { fn, ms, cancelled: false };
+			timers.push(timer);
+			return () => {
+				timer.cancelled = true;
+			};
+		},
+		pi: { command: "pi", args: [] },
+	}, { askUser: async () => ({ cancelled: true }) });
+	return { store, runner, timers, child: () => created! };
+}
+
+test("stall before any child response records the last completed stage as starting, with the stderr tail", async () => {
+	const h = silentHarness(FOUR_MIN_MS);
+	const task = h.runner.run(request());
+	await tick();
+	(h.child().child.stderr as unknown as PassThrough).write("Error:   cannot bind\nprovider socket\n");
+	await tick();
+	const stall = h.timers.filter((timer) => timer.ms === FOUR_MIN_MS && !timer.cancelled).at(-1);
+	assert.ok(stall);
+	stall!.fn();
+	await tick();
+	assert.equal(h.store.get(task.id)?.status, TASK_STATUS.TIMED_OUT);
+	assert.equal(h.store.get(task.id)?.error, "stalled for 4 min after: starting; stderr: Error: cannot bind provider socket");
+});
+
+test("stall after get_state and prompt responses records the prompt accepted stage", async () => {
+	const h = harness({ stallTimeoutMs: FOUR_MIN_MS });
+	const task = h.runner.run(request());
+	await tick();
+	assert.deepEqual(h.children[0].written.map((command) => command.type), ["get_state", "prompt"]);
+	assert.equal(h.store.get(task.id)?.lastStep, "prompt accepted");
+	const stall = h.timers.filter((timer) => timer.ms === FOUR_MIN_MS && !timer.cancelled).at(-1);
+	assert.ok(stall);
+	stall!.fn();
+	await tick();
+	assert.equal(h.store.get(task.id)?.error, "stalled for 4 min after: prompt accepted");
+});
+
+test("stderr tail bounds the child's raw output to 512 characters before stripping ANSI escapes", async () => {
+	const h = silentHarness(FOUR_MIN_MS);
+	const task = h.runner.run(request());
+	await tick();
+	const filler = "x".repeat(508);
+	(h.child().child.stderr as unknown as PassThrough).write(`${filler}[31mOK[0m`);
+	await tick();
+	const stall = h.timers.filter((timer) => timer.ms === FOUR_MIN_MS && !timer.cancelled).at(-1)!;
+	stall.fn();
+	await tick();
+	const expectedTail = `${"x".repeat(501)}OK`;
+	assert.equal(h.store.get(task.id)?.error, `stalled for 4 min after: starting; stderr: ${expectedTail}`);
+});
+
+test("child exit before agent_settled includes the stderr tail; a completed task never carries stderr", async () => {
+	const h = harness({ maxConcurrency: 2 });
+	const crashing = h.runner.run(request());
+	const completing = h.runner.run(request({ prompt: "finish clean" }));
+	await tick();
+	const crashChild = h.children[0];
+	const doneChild = h.children[1];
+	(crashChild.child.stderr as unknown as PassThrough).write("panic: provider unavailable");
+	await tick();
+	crashChild.exit(1);
+	await tick();
+	assert.equal(h.store.get(crashing.id)?.status, TASK_STATUS.FAILED);
+	assert.equal(h.store.get(crashing.id)?.error, "pi exited with code 1 before agent_settled; stderr: panic: provider unavailable");
+
+	(doneChild.child.stderr as unknown as PassThrough).write("noisy but irrelevant");
+	await tick();
+	doneChild.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "final report" }], stopReason: "stop" }] });
+	doneChild.emit({ type: "agent_settled" });
+	await h.runner.waitFor(completing.id);
+	assert.equal(h.store.get(completing.id)?.status, TASK_STATUS.COMPLETED);
+	assert.equal(h.store.get(completing.id)?.error, null);
+});
+
+test("cancel(id, reason) records the given reason for a live and a queued task; cancelAll(reason) threads it", async () => {
+	const h = harness({ maxConcurrency: 1 });
+	const running = h.runner.run(request());
+	const queued = h.runner.run(request({ prompt: "queued work" }));
+	await tick();
+	assert.equal(h.store.get(queued.id)?.status, TASK_STATUS.QUEUED);
+	assert.equal(h.runner.cancel(queued.id, "stopped from the agents panel"), true);
+	assert.equal(h.store.get(queued.id)?.status, TASK_STATUS.CANCELLED);
+	assert.equal(h.store.get(queued.id)?.error, "stopped from the agents panel before start");
+	assert.equal(h.runner.cancel(running.id, "stopped from the agents panel"), true);
+	await tick();
+	assert.equal(h.store.get(running.id)?.status, TASK_STATUS.CANCELLED);
+	assert.equal(h.store.get(running.id)?.error, "stopped from the agents panel");
+
+	const h2 = harness({ maxConcurrency: 1 });
+	const runningTwo = h2.runner.run(request());
+	const queuedTwo = h2.runner.run(request({ prompt: "queued work" }));
+	await tick();
+	assert.equal(h2.runner.cancelAll("cancelled: parent session shut down"), 2);
+	await tick();
+	assert.equal(h2.store.get(runningTwo.id)?.error, "cancelled: parent session shut down");
+	assert.equal(h2.store.get(queuedTwo.id)?.error, "cancelled: parent session shut down before start");
+});
+
+test("earlier get_state and prompt responses cannot regress lastStep past a later child event", async () => {
+	const store = new TaskStore();
+	const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+	let clock = 1000;
+	const fake = fakeChild();
+	fake.child.stdin.removeAllListeners("data"); // respond to get_state/prompt manually, out of order
+	const written: Array<Record<string, unknown>> = [];
+	fake.child.stdin.on("data", (chunk: Buffer) => written.push(JSON.parse(chunk.toString())));
+	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs: FOUR_MIN_MS }, {
+		spawn: () => fake.child,
+		now: () => (clock += 1),
+		schedule: (fn, ms) => {
+			const timer = { fn, ms, cancelled: false };
+			timers.push(timer);
+			return () => {
+				timer.cancelled = true;
+			};
+		},
+		pi: { command: "pi", args: [] },
+	}, { askUser: async () => ({ cancelled: true }) });
+	const task = runner.run(request());
+	await tick();
+	assert.deepEqual(written.map((command) => command.type), ["get_state", "prompt"]);
+	// A later child event (a tool call) advances lastStep before either launch reply arrives.
+	fake.emit({ type: "tool_execution_start", toolCallId: "c1", toolName: "bash", args: {} });
+	await tick();
+	assert.equal(store.get(task.id)?.lastStep, "bash");
+	// The get_state and prompt responses arrive late; they must not regress the stage.
+	fake.emit({ type: "response", id: written[0]?.id, command: "get_state", success: true, data: { sessionFile: "/sessions/child.jsonl" } });
+	fake.emit({ type: "response", id: written[1]?.id, command: "prompt", success: true });
+	await tick();
+	assert.equal(store.get(task.id)?.lastStep, "bash", "a late get_state/prompt reply must not regress lastStep");
+});
 
 test("synchronous cancellation before dequeue never invokes the policy callback", async () => {
 	const h = harness(); let checks = 0;

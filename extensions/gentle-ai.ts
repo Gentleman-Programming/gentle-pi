@@ -2262,6 +2262,150 @@ function updateFrontmatterRouting(
 	return `---${parsed.eol}${lines.join(parsed.eol)}${parsed.body}`;
 }
 
+/**
+ * The routing an agent file currently carries, read the same way
+ * `updateFrontmatterRouting` writes it: top-level `model:` and `thinking:`
+ * frontmatter lines. Anything else is "no routing", not an error.
+ */
+function readFrontmatterRouting(content: string): AgentRoutingEntry | undefined {
+	const parsed = parseRoutingFrontmatter(content);
+	if (!parsed) return undefined;
+	const raw: Record<string, string> = {};
+	let thinking: string | undefined;
+	let effort: string | undefined;
+	let thinkingLevel: string | undefined;
+	for (const line of parsed.frontmatter.split(/\r?\n/)) {
+		if (line.startsWith("model:")) raw.model = line.slice("model:".length).trim();
+		else if (line.startsWith("thinking:")) thinking = line.slice("thinking:".length).trim();
+		else if (line.startsWith("effort:")) effort = line.slice("effort:".length).trim();
+		else if (line.startsWith("thinking_level:")) thinkingLevel = line.slice("thinking_level:".length).trim();
+	}
+	raw.thinking = thinking ?? effort ?? thinkingLevel ?? "";
+	if (raw.model === undefined && raw.thinking === "") return undefined;
+	const entry = normalizeRoutingEntry(raw);
+	return entry && !isClearRoutingEntry(entry) ? entry : undefined;
+}
+
+function routingEntryFromModelProfile(value: unknown): AgentRoutingEntry | undefined {
+	if (!isRecord(value)) return undefined;
+	const entry = normalizeRoutingEntry({ model: value.model, thinking: value.effort });
+	return entry && !isClearRoutingEntry(entry) ? entry : undefined;
+}
+
+function readSubagentModelProfiles(path: string): Record<string, unknown> {
+	if (!existsSync(path)) return {};
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+		return isRecord(parsed) && isRecord(parsed.model_profiles) ? parsed.model_profiles : {};
+	} catch {
+		return {};
+	}
+}
+
+async function readSubagentModelProfilesAsync(path: string): Promise<Record<string, unknown>> {
+	if (!(await pathExists(path))) return {};
+	try {
+		const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+		return isRecord(parsed) && isRecord(parsed.model_profiles) ? parsed.model_profiles : {};
+	} catch {
+		return {};
+	}
+}
+
+/**
+ * The routing an agent is materialized with — what subagent launches actually
+ * resolve — regardless of what `models.json` records: the runtime reads
+ * `subagents.json` model profiles first and the agent frontmatter otherwise.
+ */
+function readMaterializedRoutingEntry(
+	cwd: string,
+	agent: AgentEntry,
+	profilesByPath: Map<string, Record<string, unknown>>,
+): AgentRoutingEntry | undefined {
+	const profilesPath = agentModelProfileConfigPath(cwd, agent.source);
+	let profiles = profilesByPath.get(profilesPath);
+	if (!profiles) {
+		profiles = readSubagentModelProfiles(profilesPath);
+		profilesByPath.set(profilesPath, profiles);
+	}
+	const fromProfile = routingEntryFromModelProfile(profiles[agent.name]);
+	if (fromProfile) return fromProfile;
+	if (!agent.filePath || !existsSync(agent.filePath)) return undefined;
+	try {
+		return readFrontmatterRouting(readFileSync(agent.filePath, "utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
+async function readMaterializedRoutingEntryAsync(
+	cwd: string,
+	agent: AgentEntry,
+	profilesByPath: Map<string, Record<string, unknown>>,
+): Promise<AgentRoutingEntry | undefined> {
+	const profilesPath = agentModelProfileConfigPath(cwd, agent.source);
+	let profiles = profilesByPath.get(profilesPath);
+	if (!profiles) {
+		profiles = await readSubagentModelProfilesAsync(profilesPath);
+		profilesByPath.set(profilesPath, profiles);
+	}
+	const fromProfile = routingEntryFromModelProfile(profiles[agent.name]);
+	if (fromProfile) return fromProfile;
+	if (!agent.filePath || !(await pathExists(agent.filePath))) return undefined;
+	try {
+		return readFrontmatterRouting(await readFile(agent.filePath, "utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The routing in effect: `models.json` where it speaks, and the materialized
+ * stores the runtime resolves from for every discoverable agent it is silent
+ * about. A sparse `models.json` therefore never hides routing that is still
+ * live (#1012). Reading never writes.
+ */
+function readEffectiveModelConfig(cwd: string): AgentModelConfig {
+	const effective = cloneModelConfig(readModelConfig(cwd));
+	const profilesByPath = new Map<string, Record<string, unknown>>();
+	for (const agent of listDiscoverableAgents(cwd)) {
+		if (isProviderReviewRole(agent.name) || agent.name in effective) continue;
+		const entry = readMaterializedRoutingEntry(cwd, agent, profilesByPath);
+		if (entry) effective[agent.name] = entry;
+	}
+	return effective;
+}
+
+async function readEffectiveModelConfigAsync(cwd: string): Promise<AgentModelConfig> {
+	const effective = cloneModelConfig(await readModelConfigAsync(cwd));
+	const profilesByPath = new Map<string, Record<string, unknown>>();
+	for (const agent of await listDiscoverableAgentsAsync(cwd)) {
+		if (isProviderReviewRole(agent.name) || agent.name in effective) continue;
+		const entry = await readMaterializedRoutingEntryAsync(cwd, agent, profilesByPath);
+		if (entry) effective[agent.name] = entry;
+	}
+	return effective;
+}
+
+/**
+ * A profile is a complete routing snapshot: applying it must leave every
+ * discoverable agent it omits on inherit, not on whatever was materialized
+ * before. Padding the omitted agents with clear entries makes
+ * `applyModelConfig` remove their model profiles and frontmatter routing, the
+ * same way `/gentle:models` clears an agent set to inherit.
+ */
+async function withOmittedAgentsClearedAsync(
+	cwd: string,
+	config: AgentModelConfig,
+): Promise<AgentModelConfig> {
+	const completed = cloneModelConfig(config);
+	for (const agent of await listDiscoverableAgentsAsync(cwd)) {
+		if (isProviderReviewRole(agent.name) || agent.name in completed) continue;
+		completed[agent.name] = {};
+	}
+	return completed;
+}
+
 function parseAgentName(filePath: string): string | undefined {
 	let content: string;
 	try {
@@ -2507,6 +2651,9 @@ function updateSubagentModelProfileAtPath(
 		? { ...config.model_profiles }
 		: {};
 	const profile = modelProfileForRoutingEntry(entry);
+	// A write that would leave the profile as it is (including removing a
+	// profile that was never there) is not an update and touches no file.
+	if (JSON.stringify(modelProfiles[name]) === JSON.stringify(profile)) return false;
 	if (profile) {
 		if (options.preserveExisting && isRecord(modelProfiles[name])) return false;
 		modelProfiles[name] = profile;
@@ -2540,6 +2687,9 @@ async function updateSubagentModelProfileAtPathAsync(
 		? { ...config.model_profiles }
 		: {};
 	const profile = modelProfileForRoutingEntry(entry);
+	// A write that would leave the profile as it is (including removing a
+	// profile that was never there) is not an update and touches no file.
+	if (JSON.stringify(modelProfiles[name]) === JSON.stringify(profile)) return false;
 	if (profile) {
 		if (options.preserveExisting && isRecord(modelProfiles[name])) return false;
 		modelProfiles[name] = profile;
@@ -2619,30 +2769,10 @@ function modelAssignmentNames(cwd: string): string[] {
 	])];
 }
 
-function readMaterializedProfile(path: string, name: string): AgentRoutingEntry {
-	if (!existsSync(path)) return {};
-	try {
-		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-		if (!isRecord(parsed) || !isRecord(parsed.model_profiles)) return {};
-		const profile = parsed.model_profiles[name];
-		if (!isRecord(profile)) return {};
-		return normalizeRoutingEntry({ model: profile.model, thinking: profile.effort }) ?? {};
-	} catch {
-		return {};
-	}
-}
-
 function readMaterializedFrontmatter(filePath: string | undefined): AgentRoutingEntry {
 	if (!filePath || !existsSync(filePath)) return {};
 	try {
-		const parsed = parseRoutingFrontmatter(readFileSync(filePath, "utf8"));
-		if (!parsed) return {};
-		const scalar = (key: string) =>
-			parsed.frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"))?.[1]?.trim();
-		return normalizeRoutingEntry({
-			model: scalar("model"),
-			thinking: scalar("thinking") ?? scalar("effort") ?? scalar("thinking_level"),
-		}) ?? {};
+		return readFrontmatterRouting(readFileSync(filePath, "utf8")) ?? {};
 	} catch {
 		return {};
 	}
@@ -2654,22 +2784,6 @@ function completeRoutingSnapshot(config: AgentModelConfig, names: string[]): Age
 		...Object.keys(config).filter((name) => !isProfileOrchestratorKey(name)),
 	]);
 	return Object.fromEntries([...completeNames].map((name) => [name, { ...(config[name] ?? {}) }]));
-}
-
-function readMaterializedModelConfig(cwd: string): AgentModelConfig {
-	const saved = readModelConfig(cwd);
-	const config: AgentModelConfig = {};
-	for (const name of PROVIDER_REVIEW_ROLES) config[name] = { ...(saved[name] ?? {}) };
-	for (const agent of listDiscoverableAgents(cwd)) {
-		if (isProviderReviewRole(agent.name)) continue;
-		const frontmatter = readMaterializedFrontmatter(agent.filePath);
-		const profile = readMaterializedProfile(
-			agentModelProfileConfigPath(cwd, agent.source),
-			agent.name,
-		);
-		config[agent.name] = { ...frontmatter, ...profile };
-	}
-	return config;
 }
 
 const PROVIDER_ROUTING_DEFAULT_LABELS = {
@@ -3785,7 +3899,7 @@ class ProfilesPanel implements OverlayComponent {
 			this.renderLine("After apply (complete snapshot)", width, "accent"),
 			...this.indentLines(this.routingLines(profileRows, widths), width),
 			"",
-			this.renderLine("Materialized routing now", width, "accent"),
+			this.renderLine("Current routing (effective)", width, "accent"),
 			...this.indentLines(this.routingLines(currentRows, widths), width),
 		];
 	}
@@ -3850,7 +3964,7 @@ async function showProfilesPanel(
 		(tui, theme, keybindings, done) => {
 			const panel = new ProfilesPanel(
 				file,
-				readMaterializedModelConfig(ctx.cwd),
+				currentConfig,
 				modelAssignmentNames(ctx.cwd),
 				done,
 				keybindings,
@@ -3945,6 +4059,13 @@ async function runProfilesPanelAction(
 				if (routingWritten && previousActiveConfig !== undefined) {
 					try {
 						await writeModelConfigAsync(ctx.cwd, previousActiveConfig);
+						// Materialize the previous profile again with the same
+						// replacement semantics, so the failed profile's routes do not
+						// linger in subagents.json or the agent frontmatter.
+						await applyModelConfigAsync(
+							ctx.cwd,
+							await withOmittedAgentsClearedAsync(ctx.cwd, previousActiveConfig),
+						);
 					} catch {
 						restored = "";
 					}
@@ -3982,8 +4103,20 @@ async function runProfilesPanelAction(
 				);
 				return revertClaim(false);
 			}
-			const applyResult = await applySavedModelConfig(ctx);
-			if (applyResult.invalidPath) {
+			// models.json holds the profile as written; the padding with clear
+			// entries only drives materialization, so agents the profile omits
+			// return to inherit instead of keeping a previously materialized route.
+			let applyResult: { updated: number; skipped: number };
+			try {
+				applyResult = await applyModelConfigAsync(
+					ctx.cwd,
+					await withOmittedAgentsClearedAsync(ctx.cwd, normalized),
+				);
+			} catch (error) {
+				ctx.ui.notify(
+					`el Gentleman could not materialize profile "${result.name}": ${profilesErrorMessage(error)}`,
+					"warning",
+				);
 				return revertClaim(true);
 			}
 			let orchestratorNote = "";
@@ -4025,7 +4158,7 @@ async function runProfilesPanelAction(
 			}
 		}
 		case "update": {
-			const current = await readModelConfigAsync(ctx.cwd);
+			const current = await readEffectiveModelConfigAsync(ctx.cwd);
 			// A profile is a complete snapshot, so capturing the current routing also
 			// captures the orchestrator the routing is running under. A settings file
 			// that cannot be read leaves the snapshot without an orchestrator entry
@@ -4161,7 +4294,7 @@ async function handleProfilesCommand(ctx: ExtensionContext): Promise<void> {
 	}
 	let file: AgentProfilesFile;
 	if (read.status === "missing") {
-		file = bootstrapProfilesFile(await readModelConfigAsync(ctx.cwd));
+		file = bootstrapProfilesFile(await readEffectiveModelConfigAsync(ctx.cwd));
 		try {
 			writeProfilesFileSync(path, file);
 		} catch (error) {
@@ -4171,17 +4304,17 @@ async function handleProfilesCommand(ctx: ExtensionContext): Promise<void> {
 			);
 			return;
 		}
-		ctx.ui.notify(`el Gentleman seeded the "current" profile in ${path} from the saved model routing.`, "info");
+		ctx.ui.notify(`el Gentleman seeded the "current" profile in ${path} from the routing currently in effect.`, "info");
 	} else {
 		file = read.file;
 		reportProfilesDrops(ctx, path, read.drops);
 	}
 	let selectedName: string | undefined;
-	let result = await showProfilesPanel(ctx, file, await readModelConfigAsync(ctx.cwd), selectedName);
+	let result = await showProfilesPanel(ctx, file, await readEffectiveModelConfigAsync(ctx.cwd), selectedName);
 	while (result.type !== "close") {
 		selectedName = "name" in result ? result.name : undefined;
 		file = await runProfilesPanelAction(ctx, path, file, result);
-		result = await showProfilesPanel(ctx, file, await readModelConfigAsync(ctx.cwd), selectedName);
+		result = await showProfilesPanel(ctx, file, await readEffectiveModelConfigAsync(ctx.cwd), selectedName);
 	}
 }
 
@@ -8053,6 +8186,8 @@ async function executeReviewControllerOperation(
 /** @internal */
 export const __testing = {
 	resolveReviewModeGate,
+	readEffectiveModelConfig,
+	readEffectiveModelConfigAsync,
 	listAgentsFromDir,
 	listAgentsFromDirAsync,
 	listDiscoverableAgents,

@@ -216,11 +216,27 @@ test("2.8.2 repeats 2.8.1 because the negotiated lane Pi consumes is unchanged",
 	assert.deepEqual(contract, NATIVE_CLI_CONTRACTS["2.8.1"] as Record<string, boolean>);
 });
 
+test("2.9.0 repeats 2.8.2 because the negotiated lane Pi consumes is unchanged", () => {
+	// v2.9.0 shipped RTK opt-in Community Tool integration (#4560,
+	// installer/sync/TUI only), SDD attempt-ledger fixes (#4564, #4567,
+	// #4569), sync telemetry-runtime symlinked root (#4565), OpenCode
+	// reviewer Task wrapper decoding (#4545), and Engram protocol asset
+	// wording (#4179). Diffing contracts/review-integration/v2 and
+	// contracts/review-provider-contract between the v2.8.2 and v2.9.0 tags
+	// in the gentle-ai source tree showed zero byte changes, so this row
+	// repeats 2.8.2. riskEvidence and hint remain dark because neither is
+	// proven to reach Pi's negotiated START path.
+	const contract = NATIVE_CLI_CONTRACTS["2.9.0"] as Record<string, boolean>;
+	assert.equal(contract.riskEvidence, false);
+	assert.equal(contract.hint, false);
+	assert.deepEqual(contract, NATIVE_CLI_CONTRACTS["2.8.2"] as Record<string, boolean>);
+});
+
 test("no shipped version key was added beyond the pin bump", () => {
 	// Rows are promises to consumers, so a new key only ever appears in a
 	// dedicated commit alongside a pin bump, never as a side effect. v2.2.4 and
 	// v2.3.0 shipped upstream while Pi stayed on 2.2.3 and were never pinned,
 	// so they get no row: a row asserts ground truth measured against a binary
 	// Pi actually ran, and the table only has to be ascending, not gapless.
-	assert.deepEqual(Object.keys(NATIVE_CLI_CONTRACTS), [...DARK_VERSIONS, "2.2.0", "2.2.1", "2.2.2", "2.2.3", "2.4.0", "2.5.0-rc.3", "2.5.0", "2.6.0", "2.7.0", "2.8.0", "2.8.1", "2.8.2"]);
+	assert.deepEqual(Object.keys(NATIVE_CLI_CONTRACTS), [...DARK_VERSIONS, "2.2.0", "2.2.1", "2.2.2", "2.2.3", "2.4.0", "2.5.0-rc.3", "2.5.0", "2.6.0", "2.7.0", "2.8.0", "2.8.1", "2.8.2", "2.9.0"]);
 });

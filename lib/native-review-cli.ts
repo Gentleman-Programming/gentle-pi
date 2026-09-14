@@ -980,6 +980,19 @@ export const NATIVE_CLI_CONTRACTS = Object.freeze({
 	// repeats 2.8.1 exactly. riskEvidence and hint remain dark because neither
 	// is proven to reach the negotiated START path Pi consumes.
 	"2.8.2": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	// v2.9.0 shipped RTK opt-in Community Tool integration (#4560, installer/
+	// sync/TUI only), SDD attempt-ledger fixes (#4564, #4567, #4569 — the
+	// remediation pointer is now decided by chain equality before shape, and
+	// the refusal wording changed), sync telemetry-runtime symlinked root
+	// (#4565), OpenCode reviewer Task wrapper decoding (#4545), and Engram
+	// protocol asset wording (#4179). Ground-truthed by diffing
+	// contracts/review-integration/v2 and contracts/review-provider-contract
+	// between the v2.8.2 and v2.9.0 tags in the gentle-ai source tree: zero
+	// bytes changed. None of the above touch the closed START/STATUS fields
+	// this row negotiates, so it repeats 2.8.2 exactly. riskEvidence and hint
+	// remain dark because neither is proven to reach the negotiated START
+	// path Pi consumes.
+	"2.9.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 });
 
 export interface NativeReviewProcessDiagnostics {
