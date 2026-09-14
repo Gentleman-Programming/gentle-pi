@@ -54,11 +54,22 @@ test("explicit regular is preserved across reruns", async (t) => {
 	writeFileSync(f.settings, '{ "tuiMode": "regular", "packages": ["npm:example"] }');
 	assert.equal((await installTuiModeSetting(f.options)).changed, false);
 	writeFileSync(f.settings, '{ "tuiMode": "regular", "theme": "custom" }');
+	const before = lstatSync(f.settings);
 	await installTuiModeSetting(f.options);
+	assert.equal(lstatSync(f.settings).ino, before.ino);
 	const value = JSON.parse(readFileSync(f.settings, "utf8"));
 	assert.equal(value.theme, "custom");
 	assert.equal(value.tuiMode, "regular");
 });
+
+for (const invalid of [null, "", "fulscreen", 42]) {
+	test(`unrecognized tuiMode keeps the self-heal default: ${JSON.stringify(invalid)}`, async (t) => {
+		const f = fixture(t);
+		writeFileSync(f.settings, JSON.stringify({ tuiMode: invalid, theme: "rose" }));
+		assert.equal((await installTuiModeSetting(f.options)).changed, true);
+		assert.deepEqual(JSON.parse(readFileSync(f.settings, "utf8")), { tuiMode: "fullscreen", theme: "rose" });
+	});
+}
 
 test("already fullscreen preserves bytes and inode", async (t) => {
 	const f = fixture(t);
