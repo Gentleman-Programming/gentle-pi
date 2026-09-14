@@ -661,13 +661,13 @@ export function isNonAuthoritativeStatus(status: SddStatus): boolean {
 	return status.isNonAuthoritative;
 }
 
-export function renderNativeSddPhasePrompt(status: SddStatus | NativeSddStatusV2, phase?: SddPhase): string {
+export function renderNativeSddPhasePrompt(status: SddStatus | NativeSddStatusV2, phase?: SddPhase | "remediate"): string {
 	const native = status.schemaName === "gentle-ai.sdd-status";
 	let selectedInstructions: readonly string[] | undefined;
 	if (phase) {
 		selectedInstructions = native
 			? phase === "sync" ? undefined : status.phaseInstructions?.[phase]
-			: status.instructions?.[phase];
+			: phase === "remediate" ? undefined : status.instructions?.[phase];
 	}
 	const isNonAuthoritative = !native && isNonAuthoritativeStatus(status);
 	const authorityLine = isNonAuthoritative

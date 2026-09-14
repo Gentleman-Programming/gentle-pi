@@ -3,6 +3,10 @@ name: sdd-verify
 description: Apply, verify, and optionally archive an already planned SDD change.
 ---
 
+## Parent preflight transport guard
+
+Run only after the interactive parent has resolved SDD preflight and injected its exact rendered `## SDD Session Preflight` block into every child context. A chain and its RPC children must consume that transport, never infer, confirm, originate, or persist defaults. Missing or malformed transport blocks the chain before its first phase.
+
 ## sdd-init
 
 output: init.md

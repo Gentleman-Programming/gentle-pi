@@ -3,6 +3,10 @@ name: sdd-full
 description: Run the full SDD lifecycle for a change in auto mode or explicit full-lifecycle approval.
 ---
 
+## Parent preflight transport guard
+
+Run only after the interactive parent has resolved SDD preflight and injected its exact rendered `## SDD Session Preflight` block into every child context. A chain and its RPC children must consume that transport, never infer, confirm, originate, or persist defaults. Missing or malformed transport blocks the chain before its first phase.
+
 ## Interactive mode guard
 
 This chain is a continuous lifecycle pipeline. Use it only in auto mode or explicit full-lifecycle approval. In interactive mode the parent/orchestrator must stop at each phase boundary, present the current artifact, and ask the user before continuing. Approval to start SDD is not approval of the generated proposal, specs, design, tasks, apply, verify, sync, or archive phases.

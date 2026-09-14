@@ -44,6 +44,7 @@ const ASSET_OWNER_BY_KEY = Object.freeze({
 	"agents/sdd-onboard.md": "sdd",
 	"agents/sdd-proposal.md": "sdd",
 	"agents/sdd-research.md": "sdd",
+	"agents/sdd-remediate.md": "sdd",
 	"agents/sdd-spec.md": "sdd",
 	"agents/sdd-status.md": "sdd",
 	"agents/sdd-sync.md": "sdd",
@@ -84,6 +85,24 @@ export type SddChainedPrStrategy =
 	| "force-chained";
 export type SddPreflightField = "executionMode" | "artifactStore" | "chainedPrStrategy" | "reviewBudgetLines";
 export const SDD_PREFLIGHT_FIELDS = ["executionMode", "artifactStore", "chainedPrStrategy", "reviewBudgetLines"] as const;
+// The parent dispatch and the process-spawn boundary share this exact shipped
+// inventory so a newly packaged SDD actor cannot bypass preflight transport.
+export const SHIPPED_SDD_AGENT_NAMES = Object.freeze([
+	"sdd-init",
+	"sdd-onboard",
+	"sdd-explore",
+	"sdd-research",
+	"sdd-proposal",
+	"sdd-spec",
+	"sdd-design",
+	"sdd-tasks",
+	"sdd-status",
+	"sdd-apply",
+	"sdd-verify",
+	"sdd-sync",
+	"sdd-archive",
+	"sdd-remediate",
+]);
 
 export interface SddPreflightPreferences {
 	executionMode: SddExecutionMode;
@@ -815,24 +834,26 @@ export function installPackageAssets(
 	}, lockOptions);
 }
 
+function hasAffirmativeSddIntent(text: string): boolean {
+	// Natural-language routing must not depend on a closed list of complete
+	// phrases. An SDD mention becomes an invocation only with an imperative,
+	// request, or first-person intent marker; a neutral statement such as
+	// "I use SDD sometimes" remains ordinary conversation.
+	if (!/\bsdd\b/i.test(text)) return false;
+	return /(?:\b(?:please|por\s+favor)\b|\b(?:want|need|would\s+like|let'?s|quiero|queremos|necesito|quisiera|me\s+gustar[ií]a|vamos|vayamos|hagamos|usemos)\b|^(?:use|run|start|build|create|implement|handle|make|usa|usá|corre|corré|arranca|arrancá|inicia|iniciá|empeza|empezá|hacelo|hazlo|hacerlo)\b)/i.test(text);
+}
+
 export function isSddPreflightTrigger(text: string): boolean {
 	const trimmed = text.trim();
 	if (/^\/(?:gentle-)?sdd(?:[-:][^\s]*)?(?:\s|$)/i.test(trimmed)) return true;
 	if (/[?？]\s*$/.test(trimmed)) return false;
 	if (
-		/\b(?:don't|do\s+not|not\s+use|never\s+use|without\s+using|sin\s+usar|no\s+(?:quiero|queremos|vamos\s+a)?\s*usar)\s+sdd\b/i.test(
-			trimmed,
-		)
+		/(?:\b(?:don't|do\s+not|never)\b|\bnot\s+(?:want|need|plan(?:ning)?|intend|use|using)\b)[^.!?\n]{0,80}\bsdd\b/i.test(trimmed) ||
+		/\b(?:sin\s+usar|no\s+(?:quiero|queremos|necesito|necesitamos|quisiera|quisiéramos|vamos\s+a|pienso|planeo|usar))\b[^.!?\n]{0,80}\bsdd\b/i.test(trimmed)
 	) {
 		return false;
 	}
-	return [
-		/^(?:please\s+)?(?:use|run|start)\s+(?:the\s+|an?\s+)?sdd(?:\s+(?:flow|process|workflow|plan))?\b/i,
-		/^(?:please\s+)?(?:do|handle|implement)\b.+\b(?:with|using)\s+(?:the\s+|an?\s+)?sdd\b/i,
-		/^(?:por\s+favor[\s,]+)?(?:vamos|vayamos)\s+con\s+(?:el\s+)?sdd\b/i,
-		/^(?:por\s+favor[\s,]+)?(?:usa|usá|usemos|corre|corré|arranca|arrancá|inicia|iniciá|empeza|empezá)\s+(?:el\s+)?sdd\b/i,
-		/^(?:por\s+favor[\s,]+)?(?:hacelo|hazlo|hacerlo)\s+(?:con|usando)\s+(?:el\s+)?sdd\b/i,
-	].some((pattern) => pattern.test(trimmed));
+	return hasAffirmativeSddIntent(trimmed);
 }
 
 export function sddPreflightSessionKey(ctx: ExtensionContext): string {
@@ -943,6 +964,16 @@ export async function collectSddPreflightPreferences(
 	};
 }
 
+export function isParentConfirmedSddPreflightContext(context: unknown): context is string {
+	if (typeof context !== "string") return false;
+	return /^## SDD Session Preflight\n(?:These SDD preferences are explicit current-session choices\. Reuse them unless the user explicitly changes them\.|These SDD preferences are canonical defaults or persisted choices\. Treat them as authoritative; do not revisit dependent decisions unless a genuine human-control gate is reached\.)\n- Execution mode: (?:interactive|auto)\n- Artifact store: (?:openspec|engram|hybrid|none)(?: \(Engram unavailable in this session\))?\n- Delivery strategy: (?:ask-on-risk|auto-chain|single-pr|exception-ok)\n- Delivery strategy domain: `ask-on-risk` \| `auto-chain` \| `single-pr` \| `exception-ok`\n- Review budget: [1-9]\d* changed lines \(400 is the canonical threshold unless explicitly changed\)\n- Chain strategy: deferred until chaining is selected\./.test(context);
+}
+
+export function extractParentConfirmedSddPreflightContext(context: unknown): string | undefined {
+	if (!isParentConfirmedSddPreflightContext(context)) return undefined;
+	return context.split("\n\n", 1)[0];
+}
+
 export function renderSddPreflightPrompt(prefs: SddPreflightPreferences): string {
 	const deliveryStrategy = normalizeSddChainedPrStrategy(
 		prefs.chainedPrStrategy,
@@ -982,6 +1013,12 @@ export async function ensureSddPreflight(
 	callbacks: SddPreflightCallbacks,
 	resolutionOptions: SddPreflightResolutionOptions = {},
 ): Promise<SddPreflightPreferences> {
+	// `collectSddPreflightPreferences` remains a pure suggestion resolver for
+	// callers that need to render options. Persisting or promoting those options
+	// is parent-only: an RPC child must consume the transported rendered block.
+	if (ctx.mode === "rpc") {
+		throw new Error("SDD preflight must be resolved by the parent; an RPC child cannot originate or persist defaults.");
+	}
 	const sessionKey = sddPreflightSessionKey(ctx);
 	const existing = sddPreflightBySession.get(sessionKey);
 	if (existing && !(resolutionOptions.promptFields?.length ?? 0)) return existing;

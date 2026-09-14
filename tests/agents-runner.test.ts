@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AGENT_MODE, type AgentDefinition } from "../lib/agents-config.ts";
-import { TASK_STATUS, TaskStore } from "../lib/agents-protocol.ts";
-import { AgentRunner, childArguments, JsonLines, piCommand, type RunnerDeps, type RunnerHooks, type TaskRequest } from "../lib/agents-runner.ts";
+import { PassThrough } from "node:stream";
+import { AGENT_MODE, parseAgentsConfig, resolveAgentProfile, type AgentDefinition } from "../lib/agents-config.ts";
+import { TASK_STATUS, TaskStore, type RemediationTaskState, type TaskRecord } from "../lib/agents-protocol.ts";
+import { AgentRunner, childArguments, JsonLines, piCommand, abortReasonText, type RemediationPlan, type RemediationTerminalFacts, type RunnerDeps, type RunnerHooks, type TaskRequest } from "../lib/agents-runner.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
 
 // Gentle Agents runner: every subagent is a child `pi --mode rpc` process.
@@ -25,7 +26,7 @@ interface Harness {
 	spawnOptions: Array<{ env: NodeJS.ProcessEnv; stdio?: string[] }>;
 }
 
-function harness(options: { maxConcurrency?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean; onNotification?: RunnerHooks["onNotification"]; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"]; onFinish?: RunnerHooks["onFinish"] } = {}): Harness {
+function harness(options: { pid?: number; maxConcurrency?: number; stallTimeoutMs?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean; onNotification?: RunnerHooks["onNotification"]; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"]; onFinish?: RunnerHooks["onFinish"] } = {}): Harness {
 	const children: FakeChild[] = [];
 	const timers: Harness["timers"] = [];
 	const asks: Harness["asks"] = [];
@@ -35,7 +36,7 @@ function harness(options: { maxConcurrency?: number; answer?: Record<string, unk
 	const deps: RunnerDeps = {
 		spawn: (_command, _args, launchOptions) => {
 			spawnOptions.push({ env: launchOptions.env, stdio: launchOptions.stdio });
-			const fake = fakeChild({ exitOnKill: options.exitOnKill });
+			const fake = fakeChild({ exitOnKill: options.exitOnKill, pid: options.pid });
 			if (options.state !== undefined) {
 				fake.child.stdin.removeAllListeners("data");
 				fake.child.stdin.on("data", (chunk) => {
@@ -59,7 +60,7 @@ function harness(options: { maxConcurrency?: number; answer?: Record<string, unk
 		pi: { command: "pi", args: [] },
 	};
 	const store = new TaskStore();
-	const runner = new AgentRunner(store, { maxConcurrency: options.maxConcurrency ?? 2, stallTimeoutMs: 10_000 }, deps, {
+	const runner = new AgentRunner(store, { maxConcurrency: options.maxConcurrency ?? 2, stallTimeoutMs: options.stallTimeoutMs ?? 10_000 }, deps, {
 		askUser: async (taskId, ask) => {
 			asks.push({ taskId, method: ask.method });
 			return options.answer ?? { value: "yes" };
@@ -72,6 +73,157 @@ function harness(options: { maxConcurrency?: number; answer?: Record<string, unk
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+const FOUR_MIN_MS = 4 * 60_000;
+
+// A child that never answers the launch RPC commands (get_state, prompt), so
+// the task's lastStep never leaves its initial "starting" stage. Used to
+// exercise the stall watchdog before any child response arrives.
+function silentHarness(stallTimeoutMs: number): { store: TaskStore; runner: AgentRunner; timers: Array<{ fn: () => void; ms: number; cancelled: boolean }>; child: () => FakeChild } {
+	const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+	let clock = 1000;
+	let created: FakeChild | undefined;
+	const store = new TaskStore();
+	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs }, {
+		spawn: () => {
+			created = fakeChild();
+			created.child.stdin.removeAllListeners("data");
+			return created.child;
+		},
+		now: () => (clock += 1),
+		schedule: (fn, ms) => {
+			const timer = { fn, ms, cancelled: false };
+			timers.push(timer);
+			return () => {
+				timer.cancelled = true;
+			};
+		},
+		pi: { command: "pi", args: [] },
+	}, { askUser: async () => ({ cancelled: true }) });
+	return { store, runner, timers, child: () => created! };
+}
+
+test("stall before any child response records the last completed stage as starting, with the stderr tail", async () => {
+	const h = silentHarness(FOUR_MIN_MS);
+	const task = h.runner.run(request());
+	await tick();
+	(h.child().child.stderr as unknown as PassThrough).write("Error:   cannot bind\nprovider socket\n");
+	await tick();
+	const stall = h.timers.filter((timer) => timer.ms === FOUR_MIN_MS && !timer.cancelled).at(-1);
+	assert.ok(stall);
+	stall!.fn();
+	await tick();
+	assert.equal(h.store.get(task.id)?.status, TASK_STATUS.TIMED_OUT);
+	assert.equal(h.store.get(task.id)?.error, "stalled for 4 min after: starting; stderr: Error: cannot bind provider socket");
+});
+
+test("stall after get_state and prompt responses records the prompt accepted stage", async () => {
+	const h = harness({ stallTimeoutMs: FOUR_MIN_MS });
+	const task = h.runner.run(request());
+	await tick();
+	assert.deepEqual(h.children[0].written.map((command) => command.type), ["get_state", "prompt"]);
+	assert.equal(h.store.get(task.id)?.lastStep, "prompt accepted");
+	const stall = h.timers.filter((timer) => timer.ms === FOUR_MIN_MS && !timer.cancelled).at(-1);
+	assert.ok(stall);
+	stall!.fn();
+	await tick();
+	assert.equal(h.store.get(task.id)?.error, "stalled for 4 min after: prompt accepted");
+});
+
+test("stderr tail bounds the child's raw output to 512 characters before stripping ANSI escapes", async () => {
+	const h = silentHarness(FOUR_MIN_MS);
+	const task = h.runner.run(request());
+	await tick();
+	const filler = "x".repeat(508);
+	(h.child().child.stderr as unknown as PassThrough).write(`${filler}[31mOK[0m`);
+	await tick();
+	const stall = h.timers.filter((timer) => timer.ms === FOUR_MIN_MS && !timer.cancelled).at(-1)!;
+	stall.fn();
+	await tick();
+	const expectedTail = `${"x".repeat(501)}OK`;
+	assert.equal(h.store.get(task.id)?.error, `stalled for 4 min after: starting; stderr: ${expectedTail}`);
+});
+
+test("child exit before agent_settled includes the stderr tail; a completed task never carries stderr", async () => {
+	const h = harness({ maxConcurrency: 2 });
+	const crashing = h.runner.run(request());
+	const completing = h.runner.run(request({ prompt: "finish clean" }));
+	await tick();
+	const crashChild = h.children[0];
+	const doneChild = h.children[1];
+	(crashChild.child.stderr as unknown as PassThrough).write("panic: provider unavailable");
+	await tick();
+	crashChild.exit(1);
+	await tick();
+	assert.equal(h.store.get(crashing.id)?.status, TASK_STATUS.FAILED);
+	assert.equal(h.store.get(crashing.id)?.error, "pi exited with code 1 before agent_settled; stderr: panic: provider unavailable");
+
+	(doneChild.child.stderr as unknown as PassThrough).write("noisy but irrelevant");
+	await tick();
+	doneChild.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "final report" }], stopReason: "stop" }] });
+	doneChild.emit({ type: "agent_settled" });
+	await h.runner.waitFor(completing.id);
+	assert.equal(h.store.get(completing.id)?.status, TASK_STATUS.COMPLETED);
+	assert.equal(h.store.get(completing.id)?.error, null);
+});
+
+test("cancel(id, reason) records the given reason for a live and a queued task; cancelAll(reason) threads it", async () => {
+	const h = harness({ maxConcurrency: 1 });
+	const running = h.runner.run(request());
+	const queued = h.runner.run(request({ prompt: "queued work" }));
+	await tick();
+	assert.equal(h.store.get(queued.id)?.status, TASK_STATUS.QUEUED);
+	assert.equal(h.runner.cancel(queued.id, "stopped from the agents panel"), true);
+	assert.equal(h.store.get(queued.id)?.status, TASK_STATUS.CANCELLED);
+	assert.equal(h.store.get(queued.id)?.error, "stopped from the agents panel before start");
+	assert.equal(h.runner.cancel(running.id, "stopped from the agents panel"), true);
+	await tick();
+	assert.equal(h.store.get(running.id)?.status, TASK_STATUS.CANCELLED);
+	assert.equal(h.store.get(running.id)?.error, "stopped from the agents panel");
+
+	const h2 = harness({ maxConcurrency: 1 });
+	const runningTwo = h2.runner.run(request());
+	const queuedTwo = h2.runner.run(request({ prompt: "queued work" }));
+	await tick();
+	assert.equal(h2.runner.cancelAll("cancelled: parent session shut down"), 2);
+	await tick();
+	assert.equal(h2.store.get(runningTwo.id)?.error, "cancelled: parent session shut down");
+	assert.equal(h2.store.get(queuedTwo.id)?.error, "cancelled: parent session shut down before start");
+});
+
+test("earlier get_state and prompt responses cannot regress lastStep past a later child event", async () => {
+	const store = new TaskStore();
+	const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+	let clock = 1000;
+	const fake = fakeChild();
+	fake.child.stdin.removeAllListeners("data"); // respond to get_state/prompt manually, out of order
+	const written: Array<Record<string, unknown>> = [];
+	fake.child.stdin.on("data", (chunk: Buffer) => written.push(JSON.parse(chunk.toString())));
+	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs: FOUR_MIN_MS }, {
+		spawn: () => fake.child,
+		now: () => (clock += 1),
+		schedule: (fn, ms) => {
+			const timer = { fn, ms, cancelled: false };
+			timers.push(timer);
+			return () => {
+				timer.cancelled = true;
+			};
+		},
+		pi: { command: "pi", args: [] },
+	}, { askUser: async () => ({ cancelled: true }) });
+	const task = runner.run(request());
+	await tick();
+	assert.deepEqual(written.map((command) => command.type), ["get_state", "prompt"]);
+	// A later child event (a tool call) advances lastStep before either launch reply arrives.
+	fake.emit({ type: "tool_execution_start", toolCallId: "c1", toolName: "bash", args: {} });
+	await tick();
+	assert.equal(store.get(task.id)?.lastStep, "bash");
+	// The get_state and prompt responses arrive late; they must not regress the stage.
+	fake.emit({ type: "response", id: written[0]?.id, command: "get_state", success: true, data: { sessionFile: "/sessions/child.jsonl" } });
+	fake.emit({ type: "response", id: written[1]?.id, command: "prompt", success: true });
+	await tick();
+	assert.equal(store.get(task.id)?.lastStep, "bash", "a late get_state/prompt reply must not regress lastStep");
+});
 
 test("synchronous cancellation before dequeue never invokes the policy callback", async () => {
 	const h = harness(); let checks = 0;
@@ -386,6 +538,21 @@ test("childArguments builds an rpc launch with model, thinking, tools, session d
 	const extensions = childArguments(request({ extensions: ["/extensions/first.js", "", "/extensions/second.js"] }));
 	assert.deepEqual(extensions.slice(extensions.indexOf("--no-extensions"), extensions.indexOf("--tools")), ["--no-extensions", "--extension", "/extensions/first.js", "--extension", "/extensions/second.js"]);
 	assert.deepEqual(childArguments(request({ extensions: [] })).filter((arg) => arg === "--no-extensions" || arg === "--extension"), ["--no-extensions"]);
+});
+
+test("childArguments preserves a max profile instead of the definition's medium effort", () => {
+	const agent: AgentDefinition = { ...explorer, name: "worker", thinking: "medium" };
+	const config = parseAgentsConfig({ model_profiles: { worker: { model: "openai-codex/gpt-5.6-luna", effort: "max" } } }, undefined);
+	const profile = resolveAgentProfile(agent, config);
+	const args = childArguments(request({ agent, model: profile.model, thinking: profile.thinking }));
+	assert.equal(args[args.indexOf("--model") + 1], "openai-codex/gpt-5.6-luna:max");
+});
+
+test("childArguments preserves a max default without a selected model", () => {
+	const profile = resolveAgentProfile(explorer, parseAgentsConfig({ default_effort: "max" }, undefined));
+	const args = childArguments(request({ model: profile.model, thinking: profile.thinking }));
+	assert.ok(!args.includes("--model"));
+	assert.equal(args[args.indexOf("--thinking") + 1], "max");
 });
 
 test("childArguments grants every child the notification-only parent message tool", () => {
@@ -804,4 +971,164 @@ for (const lateEvents of [false, true]) test(`AgentRunner releases quarantined c
 	assert.deepEqual(finishes, [first.id], "cleanup must not finish the quarantined task twice");
 	assert.equal(observations.length, 1, "late cleanup does not redeliver observations");
 	assert.deepEqual(store.get(first.id), finished);
+});
+
+test("a confirmed-gone group completes the exit and frees its slot without an observed exit", async () => {
+	// The group probe reports ESRCH (the group is gone) while the child never emits
+	// its exit event. Returning without finishing left the task terminal in memory
+	// with no record and no retry; finishing without releasing the live entry would
+	// keep the concurrency slot occupied and never pump queued work.
+	const store = new TaskStore();
+	const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+	const finishes: string[] = [];
+	let now = 1_000;
+	let launches = 0;
+	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs: 10_000 }, {
+		spawn: () => fakeChild({ exitOnKill: false, pid: 90 + (launches += 1) }).child,
+		now: () => now,
+		schedule: (fn, ms) => {
+			const timer = { fn, ms, cancelled: false };
+			timers.push(timer);
+			return () => { timer.cancelled = true; };
+		},
+		pi: { command: "pi", args: [] },
+		process: { platform: "linux", kill: (_pid, signal) => {
+			if (signal === 0) throw Object.assign(new Error("group probe"), { code: "ESRCH" });
+		} },
+	}, { askUser: async () => ({ value: "yes" }), onFinish: (task) => { finishes.push(task.id); } });
+	const first = runner.run(request());
+	const second = runner.run(request({ prompt: "queued" }));
+	await tick();
+	const waiter = runner.waitFor(first.id);
+	runner.cancel(first.id);
+	const grace = timers.find((timer) => timer.ms === 250);
+	assert.ok(grace, "termination grace is scheduled");
+	grace.fn();
+	await tick();
+	assert.equal(store.get(first.id)?.status, TASK_STATUS.CANCELLED);
+	assert.equal((await waiter).status, TASK_STATUS.CANCELLED, "the waiter receives the recorded outcome");
+	assert.equal(finishes.length, 1, "the run is recorded exactly once");
+	assert.equal(store.get(second.id)?.status, TASK_STATUS.RUNNING, "the freed slot starts queued work");
+});
+
+test("an unprobeable process group quarantines at its deadline and still records the run", async () => {
+	// On win32 the child is not detached, so there is no process group to probe and
+	// an observed exit is the only confirmation available. With no exit event the
+	// run must still be recorded at the deadline, and its slot must be retained
+	// rather than freed on an unproven assumption.
+	const store = new TaskStore();
+	const timers: Array<{ fn: () => void; ms: number; cancelled: boolean }> = [];
+	const finishes: string[] = [];
+	let now = 1_000;
+	let launches = 0;
+	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs: 10_000 }, {
+		spawn: () => fakeChild({ exitOnKill: false, pid: 90 + (launches += 1) }).child,		now: () => now,
+		schedule: (fn, ms) => {
+			const timer = { fn, ms, cancelled: false };
+			timers.push(timer);
+			return () => { timer.cancelled = true; };
+		},
+		pi: { command: "pi", args: [] },
+		process: { platform: "win32", kill: () => {} },
+	}, { askUser: async () => ({ value: "yes" }), onFinish: (task) => { finishes.push(task.id); } });
+	const first = runner.run(request());
+	const second = runner.run(request({ prompt: "queued" }));
+	await tick();
+	runner.cancel(first.id);
+	const grace = timers.find((timer) => timer.ms === 250);
+	assert.ok(grace, "termination grace is scheduled");
+	grace.fn();
+	now = 5_000;
+	const check = timers.filter((timer) => timer.ms === 25).at(-1);
+	assert.ok(check, "an unprobeable group must keep polling instead of stopping silently");
+	check.fn();
+	await tick();
+	assert.equal(store.get(first.id)?.status, TASK_STATUS.FAILED);
+	assert.match(store.get(first.id)?.error ?? "", /capacity quarantined/);
+	assert.equal(finishes.length, 1, "the run is recorded exactly once");
+	assert.equal(store.get(second.id)?.status, TASK_STATUS.QUEUED, "an unconfirmed exit retains its capacity");
+	assert.equal(launches, 1, "no further launch happens while the slot is quarantined");
+});
+
+test("abortReasonText renders an Error, a string, and nothing for unknown reasons", () => {
+	assert.equal(abortReasonText(undefined), "");
+	assert.equal(abortReasonText(new Error("interrupted by user")), " (interrupted by user)");
+	assert.equal(abortReasonText("host timeout"), " (host timeout)");
+	assert.equal(abortReasonText(new Error("")), "");
+	assert.equal(abortReasonText(42), "");
+});
+
+test("research narrowing transport keeps exact argv paths and replaces inherited selection", async () => {
+ const h = harness();
+ const selection = { documentation: { tools: ["fetch_content"], extensions: { fetch_content: "/installed/docs tools.ts" } } };
+ for (const researchSelection of [selection, undefined]) {
+  const artifact = { store: "none" as const, worktree: "/work", changeName: "demo", retainedIntent: "denied questions", locators: [] };
+  const expected = structuredClone(artifact);
+  const launch = request({ researchSelection, researchArtifact: artifact, extensionPaths: researchSelection ? ["/installed/docs tools.ts"] : [],
+   env: { PATH: "/bin", GENTLE_PI_RESEARCH_SELECTION: "stale broad selection", GENTLE_PI_RESEARCH_ARTIFACT: "stale broader scope" } });
+  const argv = childArguments(launch);
+  assert.deepEqual(argv.filter((_, i) => argv[i - 1] === "--extension"), launch.extensionPaths);
+  const task = h.runner.run(launch);
+  artifact.worktree = "/wrong";
+  await tick();
+  assert.deepEqual(JSON.parse(h.spawnOptions.at(-1)!.env.GENTLE_PI_RESEARCH_ARTIFACT!), expected);
+  assert.deepEqual("researchArtifact" in task ? task.researchArtifact : undefined, expected);
+  assert.deepEqual(JSON.parse(h.spawnOptions.at(-1)!.env.GENTLE_PI_RESEARCH_SELECTION!), researchSelection ?? null);
+  assert.equal(h.spawnOptions.at(-1)!.env.PATH, "/bin");
+  h.runner.cancel(task.id);
+  assert.equal((await h.runner.waitFor(task.id)).status, TASK_STATUS.CANCELLED);
+ }
+});
+
+
+test("runner retains remediation observations and awaits terminal settlement", async () => {
+	const h = harness({ pid: 123 });
+	let finalized: { record: TaskRecord; facts: RemediationTerminalFacts } | undefined;
+	let release: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	const remediationPlan: RemediationPlan = { cwd: "/repo", commands: ["pnpm test"], runtimeHarness: { naReason: "Not applicable because the fixture has no runtime boundary." }, rollback: { boundary: "Revert fixture", command: "git diff --check" } };
+	const remediation: RemediationTaskState = { failedEvidenceRevision: `sha256:${"a".repeat(64)}`, plan: remediationPlan, pending: {}, observations: [], invalid: false, token: "opaque", acquire: { workspaceRoot: "/repo", changeName: "demo", requestId: "fixture", workUnit: "correct", evidenceGoal: "Observed correction" } };
+	const task = h.runner.run(request({ sddRemediation: remediation, finalizeRemediation: async (record, facts) => { finalized = { record, facts }; await gate; } }));
+	await tick();
+	for (const command of ["pnpm test", "git diff --check"]) {
+		h.children[0].emit({ type: "tool_execution_start", toolName: "bash", toolCallId: command, args: { command } });
+		h.children[0].emit({ type: "tool_execution_end", toolName: "bash", toolCallId: command, isError: false, result: { content: [{ type: "text", text: "command output" }], details: { remediationCommand: { command, toolCallId: command, cwd: "/repo", exitCode: 0 } } } });
+	}
+	h.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" }] });
+	h.children[0].emit({ type: "agent_settled" });
+	await tick();
+	assert.ok(finalized);
+	assert.equal(finalized.record.sddRemediation?.observations.length, 2);
+	const prompt = h.children[0].written.find(value => value.type === "prompt").message;
+	assert.ok(typeof prompt === "string");
+	assert.match(prompt, /pnpm test/);
+	assert.doesNotMatch(prompt, /opaque/);
+	assert.equal(finalized.facts.cleanupConfirmed, true);
+	assert.equal(h.finishes.length, 0);
+	release(); await h.runner.waitFor(task.id);
+	assert.equal(h.finishes.length, 1);
+	assert.equal(remediation.observations.length, 0);
+});
+
+
+test("admitted no-PID failure settles interrupted before sending a prompt", async () => {
+	const h = harness(); let facts;
+	const task = h.runner.run(request({ sddRemediation: { plan: {} } as unknown as RemediationTaskState, finalizeRemediation: async (_task, observed) => { facts = observed; } }));
+	await tick();
+	assert.equal(h.children[0].written.some(value => value.type === "prompt"), false);
+	await h.runner.waitFor(task.id);
+	assert.equal(facts.spawned, false);
+	assert.equal(facts.exited, false);
+	assert.equal(facts.cleanupConfirmed, false);
+});
+
+
+test("admitted synchronous spawn failure finalizes without launching another actor", async () => {
+	let spawns = 0, facts;
+	const store = new TaskStore();
+	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs: 100 }, { spawn: () => { spawns++; throw new Error("spawn refused"); }, pi: { command: "pi", args: [] }, now: () => 1, schedule: () => () => {} }, { askUser: async () => ({}) });
+	const task = runner.run(request({ sddRemediation: { plan: {} } as unknown as RemediationTaskState, finalizeRemediation: async (_task, value) => { facts = value; } }));
+	await runner.waitFor(task.id);
+	assert.deepEqual(facts, { spawned: false, exited: false, cleanupConfirmed: true });
+	assert.equal(spawns, 1);
 });
