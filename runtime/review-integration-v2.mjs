@@ -597,6 +597,21 @@ export const REVIEW_PROVIDER_ROLE_CAPTURE_OPERATIONS = Object.freeze(Object.valu
 
 
 
+const ESCALATION_CAUSES = ["unknown_causality", "insufficient_evidence", "missing_refuter_outcome", "targeted_validator_rejected", "correction_budget_exceeded", "unresolved_severe_findings"]         ;
+const ESCALATION_REFUTER_OUTCOMES = ["corroborated", "refuted", "inconclusive"]         ;
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1910,7 +1925,7 @@ export function decodeReviewStatusV3(value         )                 {
 	// key set plus the optional forecast and the v5-only next_transition
 	// surfaces. status/v6 adds the intended-untracked selection; status/v7
 	// (gentle-ai v2.6.0, advertised through capabilities/v2.5 alongside v6)
-	// adds only the top-level optional `eligible_untracked_inventory` digest,
+	// adds optional `eligible_untracked_inventory` and escalation metadata,
 	// so it is decoded on the v6 surface. v3 keeps rejecting every v5/v6/v7-only
 	// field.
 	const schema = typeof value === "object" && value !== null ? (value                           ).schema : undefined;
@@ -1919,7 +1934,7 @@ export function decodeReviewStatusV3(value         )                 {
 	const v5 = v6 || schema === "gentle-ai.review-integration.status/v5";
 	const body = exactRecord(value, "status", [
 		"schema", "contract", "operation", "applicability", "action", "replayability", "target_identity", "projection", "repair", "candidates",
-	], ["authority", "frozen", "action_disposition", "eligibility", "next_transition", "authority_target_identity", ...(v5 ? ["receipt", "forecast", "repository_context", "validation_request"] : []), ...(v7 ? ["eligible_untracked_inventory"] : [])]);
+	], ["authority", "frozen", "action_disposition", "eligibility", "next_transition", "authority_target_identity", ...(v5 ? ["receipt", "forecast", "repository_context", "validation_request"] : []), ...(v7 ? ["eligible_untracked_inventory", "escalation"] : [])]);
 	requireIdentity(body, v7 ? "gentle-ai.review-integration.status/v7" : v6 ? "gentle-ai.review-integration.status/v6" : v5 ? "gentle-ai.review-integration.status/v5" : "gentle-ai.review-integration.status/v3", REVIEW_INTEGRATION_OPERATION.STATUS);
 
 	const applicability = enumeration(body.applicability, ["current_target", "unrelated", "ambiguous", "corrupted"]         , "status.applicability");
@@ -2003,6 +2018,24 @@ export function decodeReviewStatusV3(value         )                 {
 		};
 	}
 
+	let escalation                                ;
+	if (Object.hasOwn(body, "escalation")) {
+		const label = "status.escalation";
+		const source = exactRecord(body.escalation, label, ["cause", "finding_ids"], ["refuter_outcomes"]);
+		escalation = {
+			cause: enumeration(source.cause, ESCALATION_CAUSES, `${label}.cause`),
+			findingIds: stringArray(source.finding_ids, `${label}.finding_ids`),
+		};
+		if (Object.hasOwn(source, "refuter_outcomes")) escalation.refuterOutcomes = array(source.refuter_outcomes, `${label}.refuter_outcomes`, (entry, itemLabel) => {
+			const row = exactRecord(entry, itemLabel, ["finding_id", "outcome", "proof"]);
+			return {
+				findingId: nonempty(row.finding_id, `${itemLabel}.finding_id`),
+				outcome: enumeration(row.outcome, ESCALATION_REFUTER_OUTCOMES, `${itemLabel}.outcome`),
+				proof: nonempty(row.proof, `${itemLabel}.proof`),
+			};
+		});
+	}
+
 	// status/v7 top-level optional digest (gentle-ai v2.6.0): resolves #4066's
 	// closed loop where `sdd-attempt finish` named a digest status never
 	// published. Absent on the `staged` projection, which never resolves an
@@ -2030,6 +2063,7 @@ export function decodeReviewStatusV3(value         )                 {
 		...(forecast === undefined ? {} : { forecast }),
 		...(repositoryContext === undefined ? {} : { repositoryContext }),
 		...(validationRequest === undefined ? {} : { validationRequest }),
+		...(escalation === undefined ? {} : { escalation }),
 		...(eligibleUntrackedInventory === undefined ? {} : { eligibleUntrackedInventory }),
 		raw: body,
 	};

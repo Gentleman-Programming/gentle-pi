@@ -68,6 +68,8 @@ export const NATIVE_REVIEW_OPERATION = {
 	CAPTURE_UNACHIEVABLE: "review/capture-unachievable",
 	ACKNOWLEDGE_APPROVED: "review/acknowledge-approved",
 	SDD_STATUS: "sdd-status",
+	SDD_ATTEMPT: "sdd-attempt",
+	SDD_CONTINUE: "sdd-continue",
 } as const;
 export type NativeReviewOperation = (typeof NATIVE_REVIEW_OPERATION)[keyof typeof NATIVE_REVIEW_OPERATION];
 
@@ -124,6 +126,40 @@ export interface NativeReviewCli {
 	// This is intentionally separate from review/RDD gates and carries no
 	// delivery or review-transaction authority.
 	sddStatus?(request: NativeSddStatusRequest): Promise<NativeSddStatusV2>;
+	sddContinue?(request: NativeSddStatusRequest): Promise<NativeSddStatusV2>;
+	sddAttemptAcquire?(request: NativeSddAcquireRequest): Promise<NativeSddAttemptResult>;
+	sddAttemptSettle?(request: NativeSddSettleRequest): Promise<NativeSddAttemptResult>;
+}
+
+export interface NativeSddAttemptRequest extends Pick<NativeUntrackedSelectionRequest, "untrackedScope" | "expectedUntrackedInventory" | "intendedUntracked"> {
+	workspaceRoot: string;
+	changeName: string;
+	requestId: string;
+	remediatesEvidenceRevision?: string;
+}
+export interface NativeSddAcquireRequest extends NativeSddAttemptRequest {
+	workUnit: string;
+	evidenceGoal: string;
+	maxAttempts?: number;
+	maxChangedLines?: number;
+	expectedRevision?: string;
+	token?: string;
+}
+export const SDD_ATTEMPT_OUTCOME = { PASSED: "passed", FAILED: "failed", INTERRUPTED: "interrupted" } as const;
+export interface NativeSddSettleRequest extends NativeSddAttemptRequest {
+	token: string;
+	outcome: (typeof SDD_ATTEMPT_OUTCOME)[keyof typeof SDD_ATTEMPT_OUTCOME];
+	evidenceRevision?: string;
+	remediationEvidence?: string;
+	diagnosis: string;
+	harnessDisposition: "reused" | "invalidated";
+	cleanupEvidence: string;
+	processEvidence: string;
+}
+export interface NativeSddAttemptResult {
+	state: "proceed" | "blocked" | "complete";
+	token?: string;
+	reason?: string;
 }
 
 export const NATIVE_REVIEW_MODE_OPERATION = {
@@ -161,7 +197,7 @@ export const NATIVE_REVIEW_MODE_SCOPE = {
 export type NativeReviewModeScope = (typeof NATIVE_REVIEW_MODE_SCOPE)[keyof typeof NATIVE_REVIEW_MODE_SCOPE];
 
 export interface NativeSddStatusRequest {
-	changeName: string;
+	changeName?: string;
 	workspaceRoot: string;
 	signal?: AbortSignal;
 }
@@ -177,12 +213,16 @@ export type NativeSddDependencyState = "blocked" | "ready" | "all_done";
 export interface NativeSddStatusV2 extends Readonly<Record<string, unknown>> {
 	schemaName: "gentle-ai.sdd-status";
 	schemaVersion: 2;
-	changeName: string;
-	actionContext: Readonly<Record<string, unknown>> & { workspaceRoot: string };
-	dependencies: Readonly<Record<NativeSddPhase, NativeSddDependencyState>>;
-	instructions: Readonly<Record<NativeSddPhase, readonly string[]>>;
+	changeName: string | null;
+	artifactStore: "openspec" | "engram" | "hybrid" | "none";
+	planningHome: Readonly<Record<string, unknown>> & { mode: "repo-local"; path: string };
+	changeRoot: string | null;
+	actionContext: Readonly<Record<string, unknown>> & { mode: "repo-local"; workspaceRoot: string; allowedEditRoots: readonly string[] };
+	dependencies: Readonly<Record<(typeof NATIVE_SDD_DEPENDENCIES)[number], NativeSddDependencyState>>;
+	phaseInstructions?: Readonly<Record<(typeof NATIVE_SDD_INSTRUCTION_PHASES)[number], readonly string[]>>;
 	blockedReasons: readonly string[];
 	nextRecommended: string;
+	remediationState?: { required: boolean; complete: boolean; failedEvidenceRevision: string };
 }
 
 export interface NativeReviewModeRequest {
@@ -919,6 +959,27 @@ export const NATIVE_CLI_CONTRACTS = Object.freeze({
 	// negotiated START path Pi reads. The closed fields Pi consumes did not
 	// change between 2.6.0 and 2.7.0, so the columns match the 2.6.0 row.
 	"2.7.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	// Ground-truthed against the published v2.8.0 linux/amd64 binary from its
+	// signed release archive. The v2 lane still advertises capabilities/v2.5
+	// (protocol minor 5) with status/v7, consent/v3, and start/v4 schemas.
+	// The closed fields Pi consumes did not change between 2.7.0 and 2.8.0,
+	// so this row repeats 2.7.0. riskEvidence and hint remain dark because
+	// neither is proven to reach the negotiated START path Pi consumes.
+	"2.8.0": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	// v2.8.1 only changed runtime telemetry model attribution (gentle-ai#4536);
+	// the closed fields Pi consumes did not change between 2.8.0 and 2.8.1, so
+	// this row repeats 2.8.0 exactly. riskEvidence and hint remain dark
+	// because neither is proven to reach the negotiated START path Pi consumes.
+	"2.8.1": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
+	// v2.8.2 shipped OpenCode SDD preflight plugin fixes, community-tools RTK
+	// acquisition, and Claude Code Stop telemetry. The provider contract semver
+	// stays 1.2.0; the same pin re-mirrors bundle bytes that had drifted under
+	// that semver (lens inspection.status "unavailable", targeted-validator
+	// regressions/inspection members, seven Pi stop reason codes). None of
+	// those touch the closed START/STATUS fields this row negotiates, so it
+	// repeats 2.8.1 exactly. riskEvidence and hint remain dark because neither
+	// is proven to reach the negotiated START path Pi consumes.
+	"2.8.2": Object.freeze({ start: true, finalize: true, validate: true, bindSdd: true, status: true, inventory: true, reclaim: true, recover: true, abandon: true, quarantineLegacy: true, reconcileAuthority: true, repairLegacyAlias: true, mode: true, riskEvidence: false, hint: false, delivery: true }),
 });
 
 export interface NativeReviewProcessDiagnostics {
@@ -950,7 +1011,7 @@ export class NativeReviewCliError extends Error {
 		this.launchAttempted = launchAttempted;
 		this.mutating = mutating;
 		this.mutationOutcome = launchAttempted && mutating ? "unknown" : "none";
-		this.nextAction = this.mutationOutcome === "unknown" ? "review.status" : undefined;
+		this.nextAction = this.mutationOutcome === "unknown" && operation !== NATIVE_REVIEW_OPERATION.SDD_ATTEMPT ? "review.status" : undefined;
 		this.diagnostics = diagnostics ?? { operation, error_code: code, timed_out: false, output_limit_exceeded: false };
 		this.auditRecord = auditRecord;
 	}
@@ -1375,26 +1436,43 @@ interface NativeJsonExecution {
 	process: ExecFileResult;
 }
 
-const NATIVE_SDD_PHASES = ["apply", "verify", "archive"] as const;
+const NATIVE_SDD_DEPENDENCIES = ["proposal", "specs", "design", "tasks", "apply", "verify", "archive"] as const;
+const NATIVE_SDD_INSTRUCTION_PHASES = ["apply", "verify", "remediate", "archive"] as const;
+const NATIVE_SDD_NEXT_RECOMMENDATIONS = ["apply", "verify", "remediate", "archive", "archived", "resolve-blockers", "sdd-new", "select-change", "propose", "spec", "design", "tasks"] as const;
 const NATIVE_SDD_DEPENDENCY_STATES = ["blocked", "ready", "all_done"] as const;
 
 /** Strictly validates the native v2 contract while preserving its whole record. */
 export function decodeNativeSddStatusV2(value: unknown, request: Pick<NativeSddStatusRequest, "changeName" | "workspaceRoot">): NativeSddStatusV2 {
 	const status = object(value);
 	if (status.schemaName !== "gentle-ai.sdd-status" || status.schemaVersion !== 2) throw new Error("wrong native SDD status schema");
-	if (status.changeName !== request.changeName || !isCanonicalProcessString(status.changeName)) throw new Error("native SDD status change identity mismatch");
+	if ((request.changeName !== undefined && status.changeName !== request.changeName) || (status.changeName !== null && !isCanonicalProcessString(status.changeName))) throw new Error("native SDD status change identity mismatch");
+	const artifactStore = enumString(status.artifactStore, ["openspec", "engram", "hybrid", "none"]);
+	const planningHome = object(status.planningHome);
+	if (planningHome.mode !== "repo-local" || !isCanonicalProcessString(planningHome.path)) throw new Error("invalid native SDD planning home");
+	const expectedOpenSpecHome = join(request.workspaceRoot, "openspec");
+	if (planningHome.path !== expectedOpenSpecHome && !((artifactStore === "engram" || artifactStore === "hybrid") && planningHome.path === "engram:sdd")) throw new Error("native SDD planning home escaped its workspace");
+	if (status.changeRoot !== null && !isCanonicalProcessString(status.changeRoot)) throw new Error("invalid native SDD change root");
 	const actionContext = object(status.actionContext);
-	if (actionContext.workspaceRoot !== request.workspaceRoot || !isCanonicalProcessString(actionContext.workspaceRoot)) throw new Error("native SDD status workspace root mismatch");
+	if (actionContext.mode !== "repo-local" || actionContext.workspaceRoot !== request.workspaceRoot || !isCanonicalProcessString(actionContext.workspaceRoot)) throw new Error("native SDD status workspace root mismatch");
+	const allowedEditRoots = stringArray(actionContext.allowedEditRoots);
+	if (!allowedEditRoots.includes(request.workspaceRoot) || allowedEditRoots.some((root) => !isAbsolute(root) || root !== join(root))) throw new Error("invalid native SDD allowed edit roots");
 	const dependencies = object(status.dependencies);
-	const instructions = object(status.instructions);
-	for (const phase of NATIVE_SDD_PHASES) {
+	for (const phase of NATIVE_SDD_DEPENDENCIES) {
 		if (enumString(dependencies[phase], NATIVE_SDD_DEPENDENCY_STATES) !== dependencies[phase]) throw new Error("invalid native SDD dependency");
-		stringArray(instructions[phase]);
 	}
-	if (Object.keys(dependencies).length !== NATIVE_SDD_PHASES.length || Object.keys(dependencies).some((key) => !NATIVE_SDD_PHASES.includes(key as NativeSddPhase))) throw new Error("native SDD dependencies have an unsupported shape");
-	if (Object.keys(instructions).length !== NATIVE_SDD_PHASES.length || Object.keys(instructions).some((key) => !NATIVE_SDD_PHASES.includes(key as NativeSddPhase))) throw new Error("native SDD instructions have an unsupported shape");
+	if (Object.keys(dependencies).length !== NATIVE_SDD_DEPENDENCIES.length) throw new Error("native SDD dependencies have an unsupported shape");
+	if (status.instructions !== undefined) throw new Error("native SDD status uses phaseInstructions, not instructions");
+	if (status.phaseInstructions !== undefined) {
+		const instructions = object(status.phaseInstructions);
+		for (const phase of NATIVE_SDD_INSTRUCTION_PHASES) stringArray(instructions[phase]);
+		if (Object.keys(instructions).length !== NATIVE_SDD_INSTRUCTION_PHASES.length) throw new Error("native SDD instructions have an unsupported shape");
+	}
+	if (status.nextRecommended === "remediate" || status.remediationState !== undefined) {
+		const remediation = object(status.remediationState);
+		if (typeof remediation.required !== "boolean" || typeof remediation.complete !== "boolean" || typeof remediation.failedEvidenceRevision !== "string" || (remediation.failedEvidenceRevision !== "" && !/^sha256:[0-9a-f]{64}$/.test(remediation.failedEvidenceRevision)) || (status.nextRecommended === "remediate" && (!remediation.required || remediation.complete || !remediation.failedEvidenceRevision))) throw new Error("Invalid native remediation state");
+	}
 	stringArray(status.blockedReasons);
-	if (!isCanonicalProcessString(status.nextRecommended)) throw new Error("invalid native SDD next recommendation");
+	enumString(status.nextRecommended, NATIVE_SDD_NEXT_RECOMMENDATIONS);
 	return status as NativeSddStatusV2;
 }
 
@@ -2036,18 +2114,87 @@ export class NativeReviewCliV216 implements NativeReviewCli {
 		return this.invoke(operation, cwd, arguments_, mutating, signal, this.executablePath(operation, mutating), toleratedStderr);
 	}
 
-	async sddStatus(request: NativeSddStatusRequest): Promise<NativeSddStatusV2> {
-		if (!isCanonicalProcessString(request.changeName) || !isCanonicalProcessString(request.workspaceRoot) || !isAbsolute(request.workspaceRoot)) {
-			throw new TypeError("Native SDD status requires a canonical selected change and absolute workspace root");
+	async sddAttemptAcquire(request: NativeSddAcquireRequest): Promise<NativeSddAttemptResult> {
+		return this.sddAttempt("acquire", request);
+	}
+
+	async sddAttemptSettle(request: NativeSddSettleRequest): Promise<NativeSddAttemptResult> {
+		return this.sddAttempt("settle", request);
+	}
+
+	private async sddAttempt(verb: "acquire" | "settle", request: NativeSddAcquireRequest | NativeSddSettleRequest): Promise<NativeSddAttemptResult> {
+		const args = ["sdd-attempt", verb, "--cwd", request.workspaceRoot, "--change", request.changeName, "--request-id", request.requestId];
+		if (!isAbsolute(request.workspaceRoot) || !isCanonicalProcessString(request.workspaceRoot) || !isCanonicalProcessString(request.changeName) || !/^[a-z0-9][a-z0-9._-]{0,127}$/.test(request.requestId)) throw new TypeError("Invalid SDD attempt identity");
+		const text = (flag: string, value: string, max: number) => {
+			if (!isCanonicalProcessString(value) || /[\r\n]/.test(value) || Buffer.byteLength(value) > max) throw new TypeError(`Invalid ${flag}`);
+			args.push(flag, value);
+		};
+		const revision = (flag: string, value: string | undefined) => {
+			if (value === undefined) return;
+			if (!/^sha256:[0-9a-f]{64}$/.test(value)) throw new TypeError(`Invalid ${flag}`);
+			args.push(flag, value);
+		};
+		if (verb === "acquire") {
+			const acquire = request as NativeSddAcquireRequest;
+			text("--work-unit", acquire.workUnit, 160);
+			text("--evidence-goal", acquire.evidenceGoal, 240);
+			for (const [flag, value, max] of [["--max-attempts", acquire.maxAttempts, 100], ["--max-changed-lines", acquire.maxChangedLines, 1_000_000]] as const) {
+				if (value === undefined) continue;
+				if (!Number.isInteger(value) || value < 1 || value > max) throw new TypeError(`Invalid ${flag}`);
+				args.push(flag, String(value));
+			}
+			if (acquire.expectedRevision === "") args.push("--expected-revision", "");
+			else revision("--expected-revision", acquire.expectedRevision);
+			if (acquire.token !== undefined) text("--token", acquire.token, 500);
+		} else {
+			const settle = request as NativeSddSettleRequest;
+			text("--token", settle.token, 500);
+			if (!Object.values(SDD_ATTEMPT_OUTCOME).includes(settle.outcome)) throw new TypeError("Invalid outcome");
+			args.push("--outcome", settle.outcome);
+			if (settle.outcome === "interrupted" ? settle.evidenceRevision !== undefined || settle.remediationEvidence !== undefined : !settle.evidenceRevision && !(settle.outcome === "passed" && settle.remediationEvidence)) throw new TypeError("Invalid terminal evidence");
+			revision("--evidence-revision", settle.evidenceRevision);
+			text("--diagnosis", settle.diagnosis, 500);
+			if (!["reused", "invalidated"].includes(settle.harnessDisposition)) throw new TypeError("Invalid harness disposition");
+			args.push("--harness-disposition", settle.harnessDisposition);
+			text("--cleanup-evidence", settle.cleanupEvidence, 500);
+			text("--process-evidence", settle.processEvidence, 500);
+			if (settle.remediationEvidence !== undefined) args.push("--remediation-evidence", settle.remediationEvidence);
 		}
+		revision("--remediates-evidence-revision", request.remediatesEvidenceRevision);
+		args.push(...nativeUntrackedSelectionArguments(nativeUntrackedSelection(request)));
+		const operation = NATIVE_REVIEW_OPERATION.SDD_ATTEMPT;
+		const { body } = await this.negotiated(operation, request.workspaceRoot, args, true);
+		return decode(operation, true, () => {
+			const result = body as unknown as NativeSddAttemptResult;
+			if (!result || !["proceed", "blocked", "complete"].includes(result.state)) throw new TypeError("Invalid compact state");
+			if (verb === "acquire" && result.state === "proceed" && !isCanonicalProcessString(result.token)) throw new TypeError("Missing compact token");
+			if (result.reason !== undefined && typeof result.reason !== "string") throw new TypeError("Invalid compact reason");
+			return { state: result.state, ...(result.token === undefined ? {} : { token: result.token }), ...(result.reason === undefined ? {} : { reason: result.reason }) };
+		});
+	}
+
+	async sddStatus(request: NativeSddStatusRequest): Promise<NativeSddStatusV2> {
+		return this.sddProjection(request, false);
+	}
+
+	async sddContinue(request: NativeSddStatusRequest): Promise<NativeSddStatusV2> {
+		if (!isCanonicalProcessString(request.changeName)) throw new TypeError("Native SDD continuation requires an exact selected change");
+		return this.sddProjection(request, true);
+	}
+
+	private async sddProjection(request: NativeSddStatusRequest, mutating: boolean): Promise<NativeSddStatusV2> {
+		if ((request.changeName !== undefined && !isCanonicalProcessString(request.changeName)) || !isCanonicalProcessString(request.workspaceRoot) || !isAbsolute(request.workspaceRoot)) {
+			throw new TypeError("Native SDD status requires a canonical change and absolute workspace root");
+		}
+		const operation = mutating ? NATIVE_REVIEW_OPERATION.SDD_CONTINUE : NATIVE_REVIEW_OPERATION.SDD_STATUS;
 		const execution = await this.negotiated(
-			NATIVE_REVIEW_OPERATION.SDD_STATUS,
+			operation,
 			request.workspaceRoot,
-			["sdd-status", request.changeName, "--cwd", request.workspaceRoot, "--json", "--instructions"],
-			false,
+			[operation, ...(request.changeName === undefined ? [] : [request.changeName]), "--cwd", request.workspaceRoot, "--json", "--instructions"],
+			mutating,
 			request.signal,
 		);
-		return decode(NATIVE_REVIEW_OPERATION.SDD_STATUS, false, () => decodeNativeSddStatusV2(execution.body, request));
+		return decode(operation, mutating, () => decodeNativeSddStatusV2(execution.body, request));
 	}
 
 	async start(request: NativeStartRequest): Promise<NativeStartResult> {

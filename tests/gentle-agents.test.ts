@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join, relative, resolve } from "node:path";
@@ -10,27 +10,39 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, answerThroughUi, completionText, legacySubagentsInstalled, type AgentsDeps } from "../extensions/gentle-agents.ts";
 import { historyDir, loadHistory, saveTask } from "../lib/agents-history.ts";
+import { STALE_COMPLETION_MS } from "../lib/agents-completion-delivery.ts";
 import { emptyThread, TASK_EVENT, TASK_STATUS, TaskStore, type TaskRecord } from "../lib/agents-protocol.ts";
 import { NativePointerScope } from "../lib/native-pointer-region.ts";
 import { PresenceCursor, PresencePublisher, listPresence, readActivity } from "../lib/orchestrator-presence.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
 import { AgentRunner } from "../lib/agents-runner.ts";
+import type { NativeReviewCli } from "../lib/native-review-cli.ts";
 import { CHILD_METRICS_EVENT } from "../lib/runtime-metrics-children.ts";
+import { renderSddPreflightPrompt } from "../lib/sdd-preflight.ts";
 
 // Gentle Agents extension: the subagent_* tools drive isolated pi children,
 // the card above the editor follows the store, and dialogs reach the host UI.
 
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 interface Registered {
+	parameters: { properties: Record<string, unknown> };
 	renderShell?: string;
 	name: string;
-	execute(id: string, params: unknown, signal: undefined, onUpdate: undefined, ctx: ExtensionContext): Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
+	execute(id: string, params: unknown, signal: AbortSignal | undefined, onUpdate: undefined, ctx: ExtensionContext): Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
 	renderCall(args: unknown, theme: unknown): { render(width: number): string[] };
 }
 
 const plainTheme = { fg: (_color: string, text: string) => text };
 const fakeTui = { requestRender() {} };
+const PARENT_CONFIRMED_SDD_CONTEXT = renderSddPreflightPrompt({
+	executionMode: "auto",
+	artifactStore: "openspec",
+	chainedPrStrategy: "ask-on-risk",
+	reviewBudgetLines: 400,
+	engramAvailable: false,
+	prompted: true,
+});
 
 type Overlay = {
 	render(width: number): string[];
@@ -66,6 +78,7 @@ function fakePi() {
 	const commands = new Map<string, { handler(args: string, ctx: ExtensionContext): Promise<void> }>();
 	const sent: Array<{ message: Record<string, unknown>; options: Record<string, unknown> }> = [];
 	const renderers = new Map<string, (message: unknown, options: { expanded: boolean }, theme: unknown) => { render(width: number): string[] }>();
+	const entryRenderers = new Map<string, (entry: { type: string; customType: string; data: unknown }, options: { expanded: boolean }, theme: unknown) => { render(width: number): string[] }>();
 	const entries: Array<{ type: string; customType: string; data: unknown }> = [];
 	const events: Array<{ name: string; data: unknown }> = [];
 	const listeners = new Map<string, Set<(data: unknown) => void>>();
@@ -80,6 +93,7 @@ function fakePi() {
 		},
 		sendMessage: (message: Record<string, unknown>, options: Record<string, unknown>) => sent.push({ message, options }),
 		registerMessageRenderer: (type: string, renderer: (message: unknown, options: { expanded: boolean }, theme: unknown) => { render(width: number): string[] }) => renderers.set(type, renderer),
+		registerEntryRenderer: (type: string, renderer: (entry: { type: string; customType: string; data: unknown }, options: { expanded: boolean }, theme: unknown) => { render(width: number): string[] }) => entryRenderers.set(type, renderer),
 		on: (event: string, handler: Handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 		registerTool: (tool: Registered) => tools.set(tool.name, tool),
 		registerShortcut: (key: string, registration: { description: string; handler(ctx: ExtensionContext): Promise<void> }) => shortcuts.set(key, registration),
@@ -88,7 +102,7 @@ function fakePi() {
 	const fire = async (event: string, ctx: ExtensionContext, payload: unknown = {}) => {
 		for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
 	};
-	return { pi, tools, shortcuts, commands, fire, sent, renderers, entries, events, listeners };
+	return { pi, tools, shortcuts, commands, fire, sent, renderers, entryRenderers, entries, events, listeners };
 }
 
 function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (title: string, message: string) => Promise<boolean> = async () => true, inputResult: (title: string, placeholder: string | undefined) => Promise<string | undefined> = async () => undefined, overlayTui: { terminal: { rows: number }; requestRender(): void } = { terminal: { rows: 30 }, requestRender() {} }) {
@@ -98,6 +112,7 @@ function fakeContext(tui: { requestRender(): void } = fakeTui, confirmResult: (t
 	const customCompletions: unknown[] = [];
 	const customOptions: unknown[] = [];
 	const ctx = {
+		cwd,
 		hasUI: true,
 		mode: "tui",
 		sessionManager: { getSessionId: () => "s1", getCwd: () => cwd, getEntries: () => [] },
@@ -354,11 +369,6 @@ for (const boundary of ["allowed", "env", "session", "replacement", "bus-throws"
 		});
 		const h = fakePi();
 		const runtime = deps();
-		let catalogAttempts = 0;
-		if (boundary === "allowed") runtime.deps.lookupPiCatalogName = () => {
-			catalogAttempts++;
-			return new Promise(() => {});
-		};
 		const context = fakeContext();
 		const spawn = runtime.deps.spawn!;
 		runtime.deps.spawn = (...args) => {
@@ -393,7 +403,6 @@ for (const boundary of ["allowed", "env", "session", "replacement", "bus-throws"
 		const result = h.tools.get("subagent_run")!.execute("call", { agent: "gentle-ai-worker", task: "private task", mode: "task" }, undefined, undefined, context.ctx);
 		await tick();
 		assert.equal(runtime.children.length, 1);
-		if (boundary === "allowed") assert.equal(catalogAttempts, 1, "child launch does not await catalog loading");
 		const child = runtime.children[0];
 		const launchedCalls = calls;
 		for (let i = 0; i < 10; i++) child.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "private streamed text" } });
@@ -730,20 +739,58 @@ test("live-only directory traverses presence overflow, excludes expired and othe
 	await panel.opened;
 });
 
-test("research launch passes only active approved external tools to child argv", async () => {
+test("research launch transports selected grants and only matching existing extensions", async () => {
 	const fixtureHome = join(root, "research-home");
 	mkdirSync(join(fixtureHome, ".pi", "agent", "agents"), { recursive: true });
 	writeFileSync(join(fixtureHome, ".pi", "agent", "agents", "sdd-research.md"), "---\nname: sdd-research\ntools: [read, write, fetch_content, web_search, source_check, mcp, bash]\n---\nCollect research.");
 	const fake = fakePi(), runtime = deps(), { ctx } = fakeContext();
 	fake.pi.getActiveTools = () => ["fetch_content", "web_search", "mcp", "bash"];
-	fake.pi.getAllTools = () => fake.pi.getActiveTools().map(name => ({ name })) as never;
-	gentleAgents(fake.pi, {}, { ...runtime.deps, home: fixtureHome });
-	await fake.tools.get("subagent_run")!.execute("research", { agent: "sdd-research", task: "Research docs", mode: "background" }, undefined, undefined, ctx);
+	fake.pi.getAllTools = () => fake.pi.getActiveTools().map(name => ({ name, sourceInfo: { source: "extension", path: "/installed/web.ts" } })) as never;
+	const selection = { documentation: { tools: ["fetch_content"], extensions: { fetch_content: "/installed/web.ts" } } };
+	const artifact = { store: "openspec", worktree: cwd, changeName: "demo", retainedIntent: "preserve denied documentation questions", locators: [{ artifact: "research", path: join(cwd, "openspec/changes/demo/research.md"), revision: 1, digest: "a".repeat(64) }] };
+	let childEnv: NodeJS.ProcessEnv = {};
+	gentleAgents(fake.pi, {}, { ...runtime.deps, home: fixtureHome, spawn: (command, args, options) => {
+		childEnv = options.env!;
+		return runtime.deps.spawn!(command, args, options);
+	} });
+	const result = await fake.tools.get("subagent_run")!.execute("research", { agent: "sdd-research", task: "Research docs", context: PARENT_CONFIRMED_SDD_CONTEXT, mode: "background", research_selection: selection, research_artifact: artifact }, undefined, undefined, ctx);
 	await tick();
 	const argv = runtime.spawned[0];
-	assert.equal(argv[argv.indexOf("--tools") + 1], "read,write,fetch_content,web_search,subagent_parent_message");
+	assert.equal(argv[argv.indexOf("--tools") + 1], "read,write,fetch_content,subagent_parent_message");
+	assert.equal(argv[argv.indexOf("--extension") + 1], "/installed/web.ts");
+	assert.deepEqual(JSON.parse(childEnv.GENTLE_PI_RESEARCH_SELECTION!), selection);
+	assert.deepEqual(JSON.parse(childEnv.GENTLE_PI_RESEARCH_ARTIFACT!), artifact);
+	assert.ok(fake.tools.get("subagent_continue")!.parameters.properties.research_artifact);
+	assert.ok(fake.tools.get("subagent_continue")!.parameters.properties.research_selection, "fresh selection must be expressible on continuation");
+	assert.ok(JSON.parse(childEnv.GENTLE_PI_RESEARCH_TOOLS!).includes("subagent_parent_message"));
 	assert.match(argv[argv.indexOf("--append-system-prompt") + 1], /documentation: available/);
 	assert.match(argv[argv.indexOf("--append-system-prompt") + 1], /open-web: blocked/, "two reachable tools cannot admit open-web");
+	runtime.children[0].emit({ type: "agent_settled" });
+	await tick();
+	const taskId = (result.details.gentleAgents as { taskId: string }).taskId;
+	const rejected = await fake.tools.get("subagent_continue")!.execute("broaden", { task_id: taskId, prompt: "Inspect", mode: "background", research_artifact: { ...artifact, store: "none", locators: [] } }, undefined, undefined, ctx);
+	assert.match(rejected.content[0].text, /scope/);
+	assert.equal(runtime.spawned.length, 1);
+	await fake.tools.get("subagent_continue")!.execute("resume", { task_id: taskId, prompt: "Inspect", mode: "background", research_artifact: artifact }, undefined, undefined, ctx);
+	await tick();
+	assert.equal(runtime.spawned.length, 2);
+	assert.ok(!runtime.spawned[1].includes("--extension"), "no inherited research selection");
+	assert.equal(runtime.spawned[1][runtime.spawned[1].indexOf("--tools") + 1], "read,write,subagent_parent_message");
+	assert.equal(JSON.parse(childEnv.GENTLE_PI_RESEARCH_SELECTION!), null);
+	assert.deepEqual(JSON.parse(childEnv.GENTLE_PI_RESEARCH_ARTIFACT!), artifact, "denial intent and exact store/path survive re-entry");
+	fake.pi.getActiveTools = () => ["web_search"];
+	runtime.children[1].emit({ type: "agent_settled" });
+	await tick();
+	const denied = await fake.tools.get("subagent_continue")!.execute("missing-tool", { task_id: taskId, prompt: "Retry same scope", mode: "background", research_selection: selection, research_artifact: artifact }, undefined, undefined, ctx);
+	await tick();
+	assert.ok(!runtime.spawned[2].includes("--extension"));
+	runtime.children[2].emit({ type: "agent_settled" });
+	await tick();
+	fake.pi.getActiveTools = () => ["fetch_content", "web_search"];
+	await fake.tools.get("subagent_continue")!.execute("corrected", { task_id: (denied.details.gentleAgents as { taskId: string }).taskId, prompt: "Retry same scope", mode: "background", research_selection: selection, research_artifact: artifact }, undefined, undefined, ctx);
+	await tick();
+	assert.equal(runtime.spawned[3][runtime.spawned[3].indexOf("--extension") + 1], "/installed/web.ts");
+	assert.deepEqual(JSON.parse(childEnv.GENTLE_PI_RESEARCH_ARTIFACT!), artifact);
 	await fake.fire("session_shutdown", ctx);
 });
 
@@ -752,8 +799,8 @@ test("research child inventory requires every canonical open-web tool", () => {
 	for (const missing of [undefined, ...required]) {
 		const hooks = new Map<string, (event: any) => any>();
 		const active = required.filter(name => name !== missing);
-		const pi = { on: (name: string, handler: (event: any) => any) => hooks.set(name, handler), getActiveTools: () => active, getAllTools: () => required.map(name => ({ name })) } as never;
-		gentleAgents(pi, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_RESEARCH_TOOLS: JSON.stringify(required) });
+		const pi = { on: (name: string, handler: (event: any) => any) => hooks.set(name, handler), getActiveTools: () => active, getAllTools: () => required.map(name => ({ name, sourceInfo: { source: "extension", path: "/installed/web.ts" } })) } as never;
+		gentleAgents(pi, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_RESEARCH_TOOLS: JSON.stringify(required), GENTLE_PI_RESEARCH_SELECTION: JSON.stringify({ documentation: { tools: ["fetch_content"], extensions: { fetch_content: "/installed/web.ts" } }, "open-web": { tools: required, extensions: Object.fromEntries(required.map(name => [name, "/installed/web.ts"])) } }) });
 		const prompt = hooks.get("before_agent_start")!({ systemPrompt: "research" }).systemPrompt;
 		assert.match(prompt, new RegExp(`open-web: ${missing === undefined ? "available" : "blocked"}`));
 		assert.match(prompt, new RegExp(`documentation: ${missing === "fetch_content" ? "blocked" : "available"}`));
@@ -768,7 +815,7 @@ test("research child rechecks local inventory and blocks gateway calls", async (
 	assert.match(hooks.get("before_agent_start")!({ systemPrompt: "research" }).systemPrompt, /documentation: blocked/);
 	assert.equal(hooks.get("tool_call")!({ toolName: "mcp" }).block, true);
 	assert.equal(hooks.get("tool_call")!({ toolName: "fetch_content" }).block, true);
-	assert.equal(hooks.get("tool_call")!({ toolName: "read" }), undefined);
+	assert.equal(hooks.get("tool_call")!({ toolName: "read" }).block, true, "missing artifact scope cannot authorize a read");
 });
 
 async function shutdownAndRestoreNativeSpawn(
@@ -832,7 +879,8 @@ for (const scenario of ["own", "other-root", "escaped", "sibling", "session-swit
 test("default Node spawn adapter distinguishes IPC-only and permission-capable canonical Git children", async () => {
 	const childProcess = createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process");
 	const originalSpawn = childProcess.spawn;
-	const captured: Array<{ command: string; args: readonly string[]; options: Record<string, unknown> }> = [];
+	type CapturedSpawnOptions = { cwd: string; env: NodeJS.ProcessEnv; shell?: boolean; windowsHide?: boolean; detached?: boolean; stdio?: string[] };
+	const captured: Array<{ command: string; args: readonly string[]; options: CapturedSpawnOptions }> = [];
 	const children: FakeChild[] = [];
 	const shutdown: Array<() => Promise<void>> = [];
 	const canonicalGitCwd = join(root, "canonical-git-project");
@@ -853,11 +901,11 @@ test("default Node spawn adapter distinguishes IPC-only and permission-capable c
 		}
 	};
 	childProcess.spawn = ((command: string, args: readonly string[], options: Record<string, unknown>) => {
-		captured.push({ command, args, options });
+		captured.push({ command, args, options: options as unknown as CapturedSpawnOptions });
 		const child = fakeChild();
 		children.push(child);
 		return child.child;
-	}) as typeof childProcess.spawn;
+	}) as unknown as typeof childProcess.spawn;
 	syncBuiltinESMExports();
 	try {
 		const launch = async (mode: "task" | "background", env: NodeJS.ProcessEnv, sessionCwd = nonGitCwd) => {
@@ -914,7 +962,7 @@ test("native spawn interception restores CommonJS and ESM exports after rejected
 		assert.equal((await import("node:child_process")).spawn, originalSpawn, "ESM spawn is restored");
 	};
 	const installMock = () => {
-		childProcess.spawn = (() => fakeChild().child) as typeof childProcess.spawn;
+		childProcess.spawn = (() => fakeChild().child) as unknown as typeof childProcess.spawn;
 		syncBuiltinESMExports();
 	};
 	const start = async (rejectShutdown: boolean) => {
@@ -1032,7 +1080,7 @@ test("SDD phase continuation requires a fresh selection and launches only that s
 	const { ctx } = fakeContext();
 	await h.fire("session_start", ctx);
 	const run = await h.tools.get("subagent_run")!.execute("run", {
-		agent: "sdd-apply", task: "Apply alpha", mode: "background",
+		agent: "sdd-apply", task: "Apply alpha", context: PARENT_CONFIRMED_SDD_CONTEXT, mode: "background",
 		sdd_change: { changeName: "alpha", workspaceRoot: cwd, phase: "apply" },
 	}, undefined, undefined, ctx);
 	await tick();
@@ -1046,7 +1094,7 @@ test("SDD phase continuation requires a fresh selection and launches only that s
 	assert.match(missing.content[0].text, /requires a fresh sdd_change/i);
 	assert.equal(runtime.spawned.length, 1);
 	await h.tools.get("subagent_continue")!.execute("continue", {
-		task_id: taskId, prompt: "Apply beta", mode: "background",
+		task_id: taskId, prompt: "Apply beta", context: PARENT_CONFIRMED_SDD_CONTEXT, mode: "background",
 		sdd_change: { changeName: "beta", workspaceRoot: cwd, phase: "apply" },
 	}, undefined, undefined, ctx);
 	await tick();
@@ -1224,7 +1272,7 @@ test("subagent_list_agents and subagent_run in task mode launch a child with the
 	assert.equal(args[args.indexOf("--tools") + 1], "read,grep,subagent_parent_message");
 	await tick();
 	assert.match(String(harness.children[0].written[1].message), /Map lib\/ and report every module\.\n\n## Context\nFocus on agents-\*\.ts/);
-	assert.match(widget()![0], /^╭─ ❀ Agents · 1 active ─+ \d+s ╮$/);
+	assert.match(widget()![0], /^╭─ ❀ Agents · 1 active ─+╮$/);
 	assert.match(widget()![1], /^│ ◐  explore  map lib modules +gpt-5\.6-terra · low · \d+s │$/);
 	harness.children[0].emit({ type: "tool_execution_start", toolCallId: "c", toolName: "grep", args: {} });
 	harness.children[0].emit({ type: "message_end", message: { role: "assistant", usage: { totalTokens: 12_000, cost: { total: 0.09 } } } });
@@ -1269,7 +1317,11 @@ test("background runs return at once; status, result, send_message, cancel, and 
 	assert.equal(sent.length, 1, "a background result is delivered to the model once");
 	assert.equal(sent[0].message.customType, "gentle-agents.result");
 	assert.equal(sent[0].message.display, true, "completion cards remain visible");
-	assert.deepEqual(sent[0].options, { deliverAs: "followUp", triggerTurn: true });
+	// The completion path must never regress to "followUp": the host drains the
+	// follow-up queue only when the parent run stops calling tools, which is the
+	// hour-long #867 delay. "steer" keeps the idle wake-up (triggerTurn) while
+	// bounding an active parent's wait to the current turn.
+	assert.deepEqual(sent[0].options, { deliverAs: "steer", triggerTurn: true });
 	assert.match(String(sent[0].message.content), new RegExp(`^Subagent explore \\(task ${id}, "Long job"\\) finished\\.\n\nAll done\\.$`));
 	const card = renderers.get("gentle-agents.result")!(sent[0].message, { expanded: true }, plainTheme).render(70).map(stripAnsi);
 	assert.match(card[0], /^╭─ ❀ Agent result · explore ─+ collapse ╮$/);
@@ -1736,4 +1788,397 @@ test("the production overlay reads terminal rows at render time without a minimu
 	assert.equal(overlay.render(80).length, 1, "tiny terminals retain bounded controls rather than forced chrome");
 	overlay.handleInput("\x1b");
 	await opened;
+});
+
+// Issue #867: a completion settling while the parent agent run is active must
+// be held by the extension and flushed at the next turn boundary, not parked
+// in the host's followUp queue until the whole orchestrator run stops calling
+// tools.
+test("a background completion settling while the parent agent runs is delivered exactly once at the next turn end", async () => {
+	const { pi, tools, fire, sent } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	const started = await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Chained turns", mode: "background" }, undefined, undefined, ctx);
+	const id = (started.details.gentleAgents as { taskId: string }).taskId;
+	await tick();
+	await fire("agent_start", ctx);
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Chained done." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 0, "nothing enters the conversation while the parent agent run is active");
+	await fire("turn_end", ctx);
+	const results = sent.filter((entry) => entry.message.customType === "gentle-agents.result");
+	assert.equal(results.length, 1, "the held completion is delivered exactly once at turn_end");
+	assert.match(String(results[0]!.message.content), new RegExp(`task ${id}, "Chained turns"`));
+	// Pins the delivery mode against the host's drain semantics: "followUp" is
+	// drained by the run loop only in its stop branch, so a parent that keeps
+	// calling tools would see the completion when the whole run ends. "steer" is
+	// polled every turn and injected before the next LLM call, bounding the wait
+	// to the current turn.
+	assert.deepEqual(results[0]!.options, { deliverAs: "steer", triggerTurn: true });
+	await fire("turn_end", ctx);
+	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 1, "a later turn_end never replays the completion");
+	await fire("session_shutdown", ctx);
+});
+
+test("a completion held past the stale window becomes transcript-only content and never re-enters the conversation", async () => {
+	const { pi, tools, fire, sent, entries, entryRenderers } = fakePi();
+	const harness = deps();
+	let clock = 1000;
+	harness.deps.now = () => clock;
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	const started = await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Slow orchestrator", mode: "background" }, undefined, undefined, ctx);
+	const id = (started.details.gentleAgents as { taskId: string }).taskId;
+	await tick();
+	await fire("agent_start", ctx);
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Late answer." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	clock += STALE_COMPLETION_MS + 1_000;
+	await fire("turn_end", ctx);
+	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 0, "a stale completion never enters the model context");
+	const stale = entries.filter((entry) => entry.customType === "gentle-agents.stale-result");
+	assert.equal(stale.length, 1, "the human still sees the stale completion as durable transcript content");
+	assert.match(JSON.stringify(stale[0]!.data), new RegExp(id), "the stale notice names the task");
+	const rendered = entryRenderers.get("gentle-agents.stale-result")!(stale[0]!, { expanded: true }, plainTheme).render(90).map(stripAnsi).join("\n");
+	assert.match(rendered, /stale/i);
+	assert.match(rendered, new RegExp(id));
+	assert.match(rendered, /explore/);
+	assert.match(rendered, /ago/);
+	await fire("session_shutdown", ctx);
+});
+
+test("a completion the parent already pulled is dropped silently at the next turn end", async () => {
+	const { pi, tools, fire, sent } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	const started = await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Pulled early", mode: "background" }, undefined, undefined, ctx);
+	const id = (started.details.gentleAgents as { taskId: string }).taskId;
+	await tick();
+	await fire("agent_start", ctx);
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Pulled answer." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 0);
+	assert.match((await tools.get("subagent_result")!.execute("c2", { task_id: id }, undefined, undefined, ctx)).content[0].text, /Pulled answer\./);
+	await fire("turn_end", ctx);
+	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 0, "a consumed completion is dropped instead of replayed");
+	await fire("session_shutdown", ctx);
+});
+
+test("a session restart never replays a completion still pending from before it", async () => {
+	const { pi, tools, fire, sent } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Restarted", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	await fire("agent_start", ctx);
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Unclaimed answer." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 0);
+	await fire("session_start", ctx, { reason: "resume" });
+	await fire("turn_end", ctx);
+	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 0, "a resumed session starts with an empty completion queue");
+	await fire("session_shutdown", ctx);
+});
+
+test("a background completion owned by a prior session is dropped, never delivered into the current session", async () => {
+	const { pi, tools, fire, sent, entries } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	await tools.get("subagent_run")!.execute("c1", { agent: "explore", task: "Cross session", mode: "background" }, undefined, undefined, ctx);
+	await tick();
+	(ctx.sessionManager as { getSessionId(): string }).getSessionId = () => "s2";
+	await fire("session_start", ctx, { type: "session_start", reason: "new" });
+	harness.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Cross answer." }] }] });
+	harness.children[0].emit({ type: "agent_settled" });
+	await tick();
+	await fire("turn_end", ctx);
+	assert.equal(sent.filter((entry) => entry.message.customType === "gentle-agents.result").length, 0, "the replacement session receives no completion it does not own");
+	assert.equal(entries.filter((entry) => entry.customType === "gentle-agents.stale-result").length, 0);
+	await fire("session_shutdown", ctx);
+});
+
+test("aborting the caller's signal cancels the subagent, records it, and says why", async () => {
+	const { pi, tools, fire } = fakePi();
+	const harness = deps();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx, dialogs } = fakeContext();
+	await fire("session_start", ctx);
+	const controller = new AbortController();
+	const pending = tools.get("subagent_run")!.execute("abort", { agent: "explore", task: "keep working" }, controller.signal, undefined, ctx);
+	await tick();
+	controller.abort();
+	await tick();
+	const yielded = await pending;
+	const details = (yielded.details as { gentleAgents?: { taskId: string; status: string } }).gentleAgents!;
+	assert.equal(details.status, "cancelled", "the run is recorded as cancelled");
+	assert.match((yielded as { content: Array<{ text: string }> }).content[0].text, /cancelled/);
+	assert.ok(
+		dialogs.some((entry) => entry.startsWith("notify:") && /cancelled/.test(entry) && /tool call was aborted/.test(entry)),
+		"a warning names the abort and the cancellation",
+	);
+	assert.equal(harness.children[0].killed.length > 0, true, "the runner terminated the child");
+});
+
+test("selected child routes recheck provenance and keep separately authorized local tools", () => {
+ const names = ["fetch_content", "web_search", "read", "write", "mem_save", "subagent_parent_message"];
+ const selection = { documentation: { tools: ["fetch_content"], extensions: { fetch_content: "/installed/web.ts" } } };
+ const path = join(root, "openspec/changes/demo/research.md");
+ const scope = { store: "both", worktree: root, changeName: "demo", retainedIntent: "docs", locators: [{ artifact: "research", path, revision: 1, digest: "a".repeat(64), engram: { id: 1, project: "pi", topic_key: "sdd/demo/research", revision_count: 1 } }] };
+ for (const mismatch of ["none", "path", "sdk", "inactive", "unregistered", "restriction"]) {
+  const hooks = new Map<string, (event: { toolName?: string; systemPrompt?: string; input?: object }, ctx?: { cwd: string }) => { block?: boolean; systemPrompt?: string } | undefined>();
+  const active = names.filter(name => mismatch !== "inactive" || name !== "fetch_content");
+  const registered = names.filter(name => mismatch !== "unregistered" || name !== "fetch_content");
+  const pi = { on: (name: string, hook: typeof hooks extends Map<string, infer H> ? H : never) => hooks.set(name, hook), getActiveTools: () => active,
+   getAllTools: () => registered.map(name => ({ name, sourceInfo: { source: mismatch === "sdk" && name === "fetch_content" ? "sdk" : "extension", path: mismatch === "path" ? "/other.ts" : "/installed/web.ts" } })) };
+  gentleAgents(pi as never, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_RESEARCH_TOOLS: JSON.stringify(names.filter(name => mismatch !== "restriction" || name !== "fetch_content")), GENTLE_PI_RESEARCH_SELECTION: JSON.stringify(selection), GENTLE_PI_RESEARCH_ARTIFACT: JSON.stringify(scope) });
+  const call = hooks.get("tool_call")!;
+  assert.equal(call({ toolName: "fetch_content" })?.block, mismatch === "none" ? undefined : true, mismatch);
+  assert.equal(call({ toolName: "web_search" })?.block, true, "available but unselected");
+  for (const toolName of names.slice(2)) assert.equal(call({ toolName, input: toolName === "mem_save" ? { project: "pi", topic_key: "sdd/demo/research", content: '{"revision":2}' } : { path, content: '{"revision":2}' } }, { cwd: root })?.block, ["write", "mem_save"].includes(toolName) ? true : undefined, toolName);
+ }
+});
+
+test("research child narrows artifact arguments and observes actual dual-store readbacks", async () => {
+ const { createHash } = await import("node:crypto");
+ const cwd = join(root, "bounded-child");
+ mkdirSync(cwd, { recursive: true });
+ const bytes = '{"revision":1,"outcome":"blocked"}';
+ const locator = { artifact: "research", path: join(cwd, "openspec/changes/demo/research.md"), revision: 1, digest: createHash("sha256").update(bytes).digest("hex"), engram: { id: 12, project: "pi", topic_key: "sdd/demo/research", revision_count: 1 } };
+ const scope = { store: "both", worktree: cwd, changeName: "demo", retainedIntent: "fetch missing; preserve questions", locators: [locator] };
+ const hooks = new Map<string, (...args: unknown[]) => unknown>();
+ let active = ["read", "write", "mem_get_observation", "mem_save", "subagent_parent_message"];
+ const journal = join(cwd, "session.jsonl"); writeFileSync(journal, "");
+ const pi = { appendEntry: (customType, data) => appendFileSync(journal, JSON.stringify({ type: "custom", customType, data }) + "\n"), on: (name: string, fn: (...args: unknown[]) => unknown) => hooks.set(name, fn), getActiveTools: () => active, getAllTools: () => active.map(name => ({ name })) };
+ gentleAgents(pi as never, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_RESEARCH_TOOLS: JSON.stringify(active), GENTLE_PI_RESEARCH_ARTIFACT: JSON.stringify(scope) });
+ const ctx = { cwd, sessionManager: { getEntries: () => [], getSessionFile: () => journal } };
+ const prompt = hooks.get("before_agent_start")!({ systemPrompt: "research" }, ctx) as { systemPrompt: string };
+ assert.match(prompt.systemPrompt, /retainedIntent/);
+ assert.match(prompt.systemPrompt, /never authority/);
+ const call = (toolName: string, input: object, toolCallId = "c") => hooks.get("tool_call")!({ toolName, input, toolCallId }, ctx) as { block: boolean } | undefined;
+ const result = (toolName: string, input: object, content: string, isError = false) => hooks.get("tool_result")!({ toolName, input, toolCallId: "c", content: [{ type: "text", text: content }], isError }, ctx) as { content: { text: string }[]; isError?: boolean };
+ assert.equal(call("write", { path: locator.path, content: '{"revision":2,"outcome":"blocked"}' })?.block, true, "initial readback must precede mutation");
+ assert.equal(call("write", { path: join(cwd, "outside.md") })?.block, true);
+ assert.equal(call("mem_get_observation", { id: 13 })?.block, true);
+ assert.equal(call("mem_save", { project: "pi", topic_key: "sdd/other/research" })?.block, true);
+ assert.equal(call("read", { path: locator.path }), undefined);
+ assert.match(result("read", { path: locator.path }, bytes).content.at(-1)!.text, /incomplete/);
+ assert.equal(call("mem_get_observation", { id: 12 }), undefined);
+ const observed = { ...locator.engram, content: bytes };
+ assert.match(result("mem_get_observation", { id: 12 }, JSON.stringify(observed)).content.at(-1)!.text, /all selected stores/);
+ hooks.get("before_agent_start")!({ systemPrompt: "fresh generation" }, ctx);
+ assert.equal(call("write", { path: locator.path, content: '{"revision":5}' })?.block, true, "new generation cannot reuse initial authorization");
+ call("read", { path: locator.path }); result("read", { path: locator.path }, bytes);
+ call("mem_get_observation", { id: 12 }); result("mem_get_observation", { id: 12 }, JSON.stringify(observed));
+ const next = '{"revision":5,"outcome":"partial"}';
+ assert.equal(call("write", { path: locator.path, content: next }), undefined);
+ call("read", { path: locator.path }, "pending-read");
+ const pendingRead = hooks.get("tool_result")!({ toolName: "read", input: { path: locator.path }, toolCallId: "pending-read", content: [{ type: "text", text: bytes }], isError: false }, ctx) as { content: { text: string }[] };
+ assert.match(pendingRead.content.at(-1)!.text, /incomplete/, "old bytes cannot complete a pending mutation");
+ result("write", { path: locator.path, content: next }, "written");
+ call("read", { path: locator.path });
+ assert.match(result("read", { path: locator.path }, next).content.at(-1)!.text, /incomplete/);
+ assert.equal(call("mem_save", { project: "pi", topic_key: locator.engram.topic_key, content: next }), undefined);
+ result("mem_save", { project: "pi", topic_key: locator.engram.topic_key, content: next }, "saved");
+ call("read", { path: locator.path });
+ result("read", { path: locator.path }, next);
+ call("mem_get_observation", { id: 12 });
+ assert.match(result("mem_get_observation", { id: 12 }, JSON.stringify({ ...observed, content: next, revision_count: 2 })).content.at(-1)!.text, /all selected stores/);
+ assert.equal(call("write", { path: locator.path, content: '{"revision":2}' })?.block, true, "revision 1 to 5 to 2 is refused");
+ const newer = '{"revision":6}';
+ assert.equal(call("mem_save", { project: "pi", topic_key: locator.engram.topic_key, content: newer }), undefined);
+ result("mem_save", { project: "pi", topic_key: locator.engram.topic_key, content: newer }, "saved");
+ call("mem_get_observation", { id: 12 });
+ assert.equal(result("mem_get_observation", { id: 12 }, JSON.stringify({ ...observed, content: newer, revision_count: 2 })).isError, true, "each save must advance the accepted Engram revision count");
+ call("write", { path: locator.path, content: '{"revision":3,"outcome":"partial"}' });
+ result("write", { path: locator.path }, "permission denied", true);
+ call("mem_get_observation", { id: 12 });
+ assert.match(result("mem_get_observation", { id: 12 }, JSON.stringify({ ...observed, content: next, revision_count: 2 })).content.at(-1)!.text, /proposal_ready=false/, "write attempt invalidates prior readback even when denied");
+ call("mem_get_observation", { id: 12 });
+ assert.equal(result("mem_get_observation", { id: 12 }, JSON.stringify({ ...observed, project: "wrong" })).isError, true);
+ assert.equal(call("write", { path: locator.path, content: '{"revision":4}' })?.block, true, "stale/divergent readback must refuse recovery writes");
+ assert.equal(call("mem_save", { project: "pi", topic_key: locator.engram.topic_key, content: '{"revision":4}' })?.block, true);
+ active = active.filter(name => name !== "write");
+ assert.equal(call("write", { path: locator.path })?.block, true);
+ assert.equal((hooks.get("tool_call")!({ toolName: "read", input: { path: locator.path } }, { cwd: root }) as { block: boolean }).block, true);
+ active.push("write");
+ gentleAgents(pi as never, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_RESEARCH_TOOLS: JSON.stringify(active), GENTLE_PI_RESEARCH_ARTIFACT: JSON.stringify(scope) });
+ call("read", { path: locator.path });
+ result("read", { path: locator.path }, bytes);
+ call("mem_get_observation", { id: 12 });
+ result("mem_get_observation", { id: 12 }, JSON.stringify(observed));
+ call("write", { path: locator.path, content: next });
+ result("write", { path: locator.path, content: next }, "written");
+ const divergent = '{"revision":2,"outcome":"done"}';
+ call("mem_save", { project: "pi", topic_key: locator.engram.topic_key, content: divergent });
+ result("mem_save", { project: "pi", topic_key: locator.engram.topic_key, content: divergent }, "saved");
+ call("read", { path: locator.path });
+ result("read", { path: locator.path }, next);
+ call("mem_get_observation", { id: 12 });
+ assert.equal(result("mem_get_observation", { id: 12 }, JSON.stringify({ ...observed, content: divergent, revision_count: 2 })).isError, true, "individually matching but divergent hybrid writes never converge");
+ for (const completion of [[], [{ type: "text", text: "" }], [{ type: "text", text: "denied" }]]) {
+  gentleAgents(pi as never, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_RESEARCH_TOOLS: JSON.stringify(active), GENTLE_PI_RESEARCH_ARTIFACT: JSON.stringify({ ...scope, store: "openspec", locators: [{ ...locator, engram: undefined }] }) });
+  call("read", { path: locator.path }); result("read", { path: locator.path }, bytes);
+  assert.equal(call("write", { path: locator.path, content: next }), undefined);
+  assert.equal(call("write", { path: locator.path, content: next }, "overlap")?.block, true);
+  hooks.get("tool_result")!({ toolName: "write", input: { path: locator.path, content: next }, toolCallId: "c", content: completion, isError: completion.length > 0 && completion[0].text === "denied" }, ctx);
+  call("read", { path: locator.path });
+  assert.match(result("read", { path: locator.path }, next).content.at(-1)!.text, /proposal_ready=false/, "failed or malformed write cannot establish completion");
+  assert.equal(call("write", { path: locator.path, content: '{"revision":6}' })?.block, true);
+ }
+ for (const tool of ["write", "mem_save"]) {
+  const memory = tool === "mem_save", readTool = memory ? "mem_get_observation" : "read";
+  const input = memory ? { id: 12 } : { path: locator.path };
+  const mutation = memory ? { project: "pi", topic_key: locator.engram.topic_key, content: next } : { path: locator.path, content: next };
+  gentleAgents(pi as never, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_RESEARCH_TOOLS: JSON.stringify(active), GENTLE_PI_RESEARCH_ARTIFACT: JSON.stringify({ ...scope, store: memory ? "engram" : "openspec", locators: [{ ...locator, path: memory ? undefined : locator.path, engram: memory ? locator.engram : undefined }] }) });
+  call(readTool, input); result(readTool, input, memory ? JSON.stringify(observed) : bytes);
+  assert.equal(call(tool, mutation), undefined);
+  assert.doesNotThrow(() => hooks.get("tool_result")!({ toolName: tool, input: mutation, toolCallId: "c", content: [null], isError: false }, ctx));
+  call(readTool, input);
+  assert.match(result(readTool, input, memory ? JSON.stringify({ ...observed, content: next, revision_count: 2 }) : next).content.at(-1)!.text, /proposal_ready=false/);
+  assert.equal(call(tool, { ...mutation, content: '{"revision":6}' })?.block, true);
+ }
+ for (const store of ["openspec", "engram", "both"]) {
+  for (const bad of ["missing", "malformed", "revision", "digest", "project", "topic", "id", "worktree"]) {
+   gentleAgents(pi as never, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_RESEARCH_TOOLS: JSON.stringify(active), GENTLE_PI_RESEARCH_ARTIFACT: JSON.stringify({ ...scope, store, locators: [{ ...locator, path: store === "engram" ? undefined : locator.path, engram: store === "openspec" ? undefined : locator.engram }] }) });
+   const memory = store !== "openspec";
+   const tool = memory ? "mem_get_observation" : "read";
+   const input = memory ? { id: 12 } : { path: locator.path };
+   if (store === "both") {
+    call("read", { path: locator.path });
+    result("read", { path: locator.path }, bytes);
+    assert.equal(call("write", { path: locator.path, content: next })?.block, true, "both initial stores must match before either mutation");
+   }
+   if (bad !== "missing") {
+    const content = bad === "revision" ? '{"revision":0}' : bad === "digest" ? '{"revision":1,"different":true}' : bytes;
+    const value = { ...observed, content, ...(bad === "project" ? { project: "wrong" } : bad === "topic" ? { topic_key: "wrong" } : bad === "id" ? { id: 13 } : {}) };
+    if (bad === "worktree") {
+     assert.equal((hooks.get("tool_call")!({ toolName: tool, input, toolCallId: "c" }, { cwd: root }) as { block: boolean }).block, true);
+    } else if (memory || !["project", "topic", "id"].includes(bad)) {
+     call(tool, input);
+     assert.equal(result(tool, input, bad === "malformed" ? "{" : memory ? JSON.stringify(value) : content).isError, true);
+    }
+   }
+   if (store !== "engram") assert.equal(call("write", { path: locator.path, content: next })?.block, true, `${store}/${bad}: zero writes`);
+   if (memory) assert.equal(call("mem_save", { project: "pi", topic_key: locator.engram.topic_key, content: next })?.block, true, `${store}/${bad}: zero saves`);
+  }
+ }
+
+});
+
+
+test("managed remediation acquires before spawn and finalizes failure without verifier success", async () => {
+	const h = fakePi(), runtime = deps(), fixtureHome = join(root, "remediation-home");
+	let retainedId: string;
+	const spawn = runtime.deps.spawn;
+	runtime.deps.spawn = (...args) => {
+		const retained = JSON.parse(readFileSync(join(historyDir(fixtureHome), `${retainedId}.json`), "utf8")).task.sddRemediation;
+		assert.equal(retained.token, "admitted-fixture"); assert.equal(retained.actorClaimed, true);
+		const child = spawn(...args); child.pid = 123; return child; };
+	runtime.deps.process = { platform: "win32", kill() {} };
+	mkdirSync(join(fixtureHome, ".pi", "agent", "agents"), { recursive: true });
+	writeFileSync(join(fixtureHome, ".pi", "agent", "agents", "sdd-remediate.md"), readFileSync("assets/agents/sdd-remediate.md"));
+	const revision = `sha256:${"a".repeat(64)}`, calls = [];
+	const nativeSdd = { sddStatus: async () => ({ schemaName: "gentle-ai.sdd-status", schemaVersion: 2, changeName: "alpha", artifactStore: "openspec", planningHome: { mode: "repo-local", path: join(cwd, "openspec") }, changeRoot: join(cwd, "openspec/changes/alpha"), actionContext: { mode: "repo-local", workspaceRoot: cwd, allowedEditRoots: [cwd] }, dependencies: Object.fromEntries(["proposal", "specs", "design", "tasks", "apply", "verify", "archive"].map(key => [key, "ready"])), phaseInstructions: { apply: [], verify: [], remediate: ["Correct evidence"], archive: [] }, blockedReasons: [], nextRecommended: "remediate", remediationState: { required: true, complete: false, failedEvidenceRevision: revision } }), sddAttemptAcquire: async input => { assert.equal(runtime.spawned.length, 0); const [saved] = await loadHistory(historyDir(fixtureHome)); retainedId = saved.task.id; assert.deepEqual(saved.task.sddRemediation.acquire, input); assert.equal(saved.task.sddRemediation.token, undefined); calls.push(input); return { state: "proceed", token: "admitted-fixture" }; }, sddAttemptSettle: async input => { calls.push(input); return { state: "proceed" as const }; } } as unknown as NativeReviewCli;
+	gentleAgents(h.pi, {}, { ...runtime.deps, home: fixtureHome, nativeSdd });
+	const { ctx } = fakeContext(); await h.fire("session_start", ctx);
+	const result = await h.tools.get("subagent_run").execute("run", { agent: "sdd-remediate", task: "Correct alpha", context: PARENT_CONFIRMED_SDD_CONTEXT, mode: "background", sdd_change: { changeName: "alpha", workspaceRoot: cwd, phase: "remediate", failedEvidenceRevision: revision }, remediation: { attempt: { requestId: "one", workUnit: "correct", evidenceGoal: "Observed correction", maxAttempts: 1, maxChangedLines: 200 }, plan: { cwd, commands: ["pnpm test"], runtimeHarness: { naReason: "Not applicable because this fixture has no runtime boundary." }, rollback: { boundary: "Revert fixture bytes", command: "git diff --check" } } } }, undefined, undefined, ctx);
+	await tick(); assert.equal(runtime.spawned.length, 1, result.content[0].text);
+	assert.equal(calls[0].remediatesEvidenceRevision, revision);
+	runtime.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "All tests passed, trust me" }], stopReason: "stop" }] });
+	runtime.children[0].emit({ type: "agent_settled" });
+	for (let n = 0; n < 30 && calls.length < 2; n++) await new Promise(resolve => setTimeout(resolve, 5));
+	assert.equal(calls.length, 2); assert.equal(calls[1].outcome, "failed");
+	const history = await loadHistory(historyDir(fixtureHome));
+	assert.equal(history[0].task.sddRemediation.settle.token, "admitted-fixture");
+	assert.equal(history[0].task.status, "failed", "prose-only completion cannot advertise successful correction");
+	await h.fire("session_shutdown", ctx);
+});
+
+
+test("only remediation children with the retained exact plan override stock bash", async () => {
+	for (const phase of ["apply", "remediate"]) {
+		const h = fakePi(); h.pi.getFlag = () => JSON.stringify({ phase, workspaceRoot: cwd, changeName: "alpha", ...(phase === "remediate" ? { failedEvidenceRevision: `sha256:${"a".repeat(64)}` } : {}) });
+		gentleAgents(h.pi, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_SDD_REMEDIATION_PLAN: JSON.stringify({ scope: { cwd, commands: ["pnpm test", "git diff --check"], editPaths: [], allowedEditRoots: [cwd] }, plan: { cwd, commands: ["pnpm test"], runtimeHarness: { naReason: "Not applicable because this fixture has no runtime boundary." }, rollback: { boundary: "Revert fixture bytes", command: "git diff --check" } } }) });
+		await h.fire("session_start", { ...fakeContext().ctx, cwd });
+		assert.equal(h.tools.has("bash"), phase === "remediate");
+		assert.equal(h.tools.has("subagent_run"), false);
+	}
+});
+
+
+test("managed remediation tools publish the typed exact evidence plan and bracket input", () => {
+	const h = fakePi(); gentleAgents(h.pi, {}, deps().deps);
+	for (const name of ["subagent_run", "subagent_continue"]) {
+		const schema = h.tools.get(name)!.parameters.properties.remediation as unknown as { required: string[]; properties: { plan: { required: string[] }; attempt: { properties: { token: unknown } } } };
+		assert.deepEqual(schema.required, ["plan", "attempt"]);
+		assert.deepEqual(schema.properties.plan.required, ["cwd", "commands", "runtimeHarness", "rollback"]);
+		assert.ok(schema.properties.attempt.properties.token);
+	}
+});
+
+
+test("R1 malformed child grant denies tools even before/after failed session initialization", () => {
+	const hooks = new Map(), registered = [];
+	const pi = { on: (name, fn) => hooks.set(name, fn), registerTool: tool => registered.push(tool), getFlag: () => "{}" };
+	gentleAgents(pi as never, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_SDD_REMEDIATION_PLAN: "malformed" });
+	const denied = () => hooks.get("tool_call")?.({ toolName: "bash", input: { command: "touch outside" } }, { cwd })?.block;
+	assert.equal(denied(), true);
+	assert.doesNotThrow(() => hooks.get("session_start")({}, { cwd }));
+	assert.equal(denied(), true); assert.equal(registered.length, 0);
+});
+
+
+test("R3/R4 host reload refuses retained acquire/actor uncertainty without another launch", async () => {
+	for (const actorClaimed of [false, true, "blocked", "complete"]) {
+		const normal = typeof actorClaimed === "string";
+		const h = fakePi(), runtime = deps(), fixtureHome = join(root, `remediation-reload-${actorClaimed}`);
+		mkdirSync(join(fixtureHome, ".pi", "agent", "agents"), { recursive: true });
+		writeFileSync(join(fixtureHome, ".pi", "agent", "agents", "sdd-remediate.md"), readFileSync("assets/agents/sdd-remediate.md"));
+		const revision = `sha256:${"a".repeat(64)}`;
+		const acquire = { workspaceRoot: cwd, changeName: "alpha", requestId: "retained", workUnit: "correct", evidenceGoal: "Observed correction", remediatesEvidenceRevision: revision };
+		await saveTask(historyDir(fixtureHome), { id: "retained", agent: "sdd-remediate", cwd, status: "failed", createdAt: 1, sddRemediation: { acquire, acquireUncertain: normal ? false : !actorClaimed, actorClaimed: normal ? false : actorClaimed, ...(normal ? { acquireResult: { state: actorClaimed } } : actorClaimed ? { token: "retained-token" } : {}) } } as never, emptyThread());
+		let acquisitions = 0, confirmations = 0;
+		gentleAgents(h.pi, {}, { ...runtime.deps, home: fixtureHome, nativeSdd: { sddStatus: async () => { throw new Error("fresh status reached"); }, sddAttemptSettle: async () => ({ state: "proceed" as const }), sddAttemptAcquire: async () => { acquisitions++; return { state: "proceed", token: "unsafe" }; } } as unknown as NativeReviewCli });
+		const { ctx } = fakeContext(fakeTui, async () => { confirmations++; return true; });
+		await h.fire("session_start", ctx);
+		await assert.rejects(h.tools.get("subagent_run").execute("again", { agent: "sdd-remediate", task: "Correct alpha", context: PARENT_CONFIRMED_SDD_CONTEXT, mode: "background", sdd_change: { changeName: "alpha", workspaceRoot: cwd, phase: "remediate", failedEvidenceRevision: revision }, remediation: { attempt: { ...acquire, requestId: "different" }, plan: { cwd, commands: ["pnpm test"], runtimeHarness: { naReason: "Not applicable because this fixture has no runtime boundary." }, rollback: { boundary: "Revert fixture", command: "git diff --check" } } } }, undefined, undefined, ctx), normal ? /fresh status reached/ : /reconcile exact history without actor replay/);
+		assert.equal(acquisitions, 0); assert.equal(confirmations, 0); assert.equal(runtime.spawned.length, 0);
+		assert.deepEqual((await loadHistory(historyDir(fixtureHome)))[0].task.sddRemediation.acquire, acquire);
+		await h.fire("session_shutdown", ctx);
+	}
+});
+
+test("R3/R4 a known native-blocked settlement lets native admission decide the next attempt; an uncertain one still refuses locally", async () => {
+	for (const uncertain of [false, true]) {
+		const h = fakePi(), runtime = deps(), fixtureHome = join(root, `remediation-settlement-${uncertain}`);
+		mkdirSync(join(fixtureHome, ".pi", "agent", "agents"), { recursive: true });
+		writeFileSync(join(fixtureHome, ".pi", "agent", "agents", "sdd-remediate.md"), readFileSync("assets/agents/sdd-remediate.md"));
+		const revision = `sha256:${"a".repeat(64)}`;
+		const acquire = { workspaceRoot: cwd, changeName: "alpha", requestId: "retained", workUnit: "correct", evidenceGoal: "Observed correction", remediatesEvidenceRevision: revision };
+		await saveTask(historyDir(fixtureHome), { id: "retained", agent: "sdd-remediate", cwd, status: "failed", createdAt: 1, sddRemediation: uncertain
+			? { acquire, settlementUncertain: true, settle: { requestId: "exact" } }
+			: { acquire, settlement: { state: "blocked", reason: "maintainer_decision" } } } as never, emptyThread());
+		let acquisitions = 0, confirmations = 0;
+		gentleAgents(h.pi, {}, { ...runtime.deps, home: fixtureHome, nativeSdd: { sddStatus: async () => ({ schemaName: "gentle-ai.sdd-status", schemaVersion: 2, changeName: "alpha", artifactStore: "openspec", planningHome: { mode: "repo-local", path: join(cwd, "openspec") }, changeRoot: join(cwd, "openspec/changes/alpha"), actionContext: { mode: "repo-local", workspaceRoot: cwd, allowedEditRoots: [cwd] }, dependencies: Object.fromEntries(["proposal", "specs", "design", "tasks", "apply", "verify", "archive"].map(key => [key, "ready"])), phaseInstructions: { apply: [], verify: [], remediate: ["Correct evidence"], archive: [] }, blockedReasons: [], nextRecommended: "remediate", remediationState: { required: true, complete: false, failedEvidenceRevision: revision } }), sddAttemptSettle: async () => ({ state: "proceed" as const }), sddAttemptAcquire: async () => { acquisitions++; return { state: "blocked" }; } } as unknown as NativeReviewCli });
+		const { ctx } = fakeContext(fakeTui, async () => { confirmations++; return true; });
+		await h.fire("session_start", ctx);
+		await assert.rejects(h.tools.get("subagent_run").execute("again", { agent: "sdd-remediate", task: "Correct alpha", context: PARENT_CONFIRMED_SDD_CONTEXT, mode: "background", sdd_change: { changeName: "alpha", workspaceRoot: cwd, phase: "remediate", failedEvidenceRevision: revision }, remediation: { attempt: { ...acquire, requestId: "different" }, plan: { cwd, commands: ["pnpm test"], runtimeHarness: { naReason: "Not applicable because this fixture has no runtime boundary." }, rollback: { boundary: "Revert fixture", command: "git diff --check" } } } }, undefined, undefined, ctx), uncertain ? /reconcile exact history without actor replay/ : /no actor started/);
+		assert.equal(acquisitions, uncertain ? 0 : 1, "native admission is consulted once local unresolved history is not uncertain");
+		assert.equal(confirmations, uncertain ? 0 : 1);
+		assert.equal(runtime.spawned.length, 0);
+		await h.fire("session_shutdown", ctx);
+	}
 });

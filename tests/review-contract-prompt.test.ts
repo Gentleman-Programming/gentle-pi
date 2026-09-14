@@ -93,6 +93,20 @@ test("before_agent_start does not inject the review execution contract for a nam
 	assert.doesNotMatch(result.systemPrompt, /Gentle AI review execution contract/);
 });
 
+test("before_agent_start does not inject the review execution contract for gentle-ai-worker", async () => {
+	const { beforeAgentStart } = harness({} as NativeReviewCli);
+	const result = await beforeAgentStart({ agentName: "gentle-ai-worker", systemPrompt: "base" }, ctx());
+	assert.equal(result.systemPrompt, "base");
+	assert.doesNotMatch(result.systemPrompt, /Gentle AI review execution contract/);
+});
+
+test("before_agent_start does not inject the review execution contract for jd-fix-agent", async () => {
+	const { beforeAgentStart } = harness({} as NativeReviewCli);
+	const result = await beforeAgentStart({ agentName: "jd-fix-agent", systemPrompt: "base" }, ctx());
+	assert.equal(result.systemPrompt, "base");
+	assert.doesNotMatch(result.systemPrompt, /Gentle AI review execution contract/);
+});
+
 test("before_agent_start does not inject the review execution contract for an SDD executor session", async () => {
 	const { beforeAgentStart } = harness({} as NativeReviewCli);
 	const result = await beforeAgentStart({ systemPrompt: "SDD apply executor body" }, ctx());
