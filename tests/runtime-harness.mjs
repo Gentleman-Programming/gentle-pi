@@ -1929,6 +1929,8 @@ async function run() {
 			await readFile(join(legacyModelsCwd, ".pi", "subagents.json"), "utf8"),
 		);
 		assert.equal(emptyGlobalClearsProfiles.model_profiles, undefined);
+		await writeFile(globalModelsPath, JSON.stringify({ "sdd-apply": "global/provider-model" }, null, 2));
+		await hooks.get("session_start")[0]({ reason: "startup" }, legacyCtx);
 		await writeFile(
 			globalModelsPath,
 			JSON.stringify({ "sdd-apply": { model: "bad\nmodel: injected" } }, null, 2),
@@ -1938,11 +1940,11 @@ async function run() {
 			join(legacyModelsCwd, ".pi", "agents", "sdd-apply.md"),
 			"utf8",
 		);
-		assert.doesNotMatch(invalidEntryPreservesAgent, /model:/);
+		assert.match(invalidEntryPreservesAgent, /model: global\/provider-model/);
 		const invalidEntryPreservesProfiles = JSON.parse(
 			await readFile(join(legacyModelsCwd, ".pi", "subagents.json"), "utf8"),
 		);
-		assert.equal(invalidEntryPreservesProfiles.model_profiles, undefined);
+		assert.equal(invalidEntryPreservesProfiles.model_profiles["sdd-apply"].model, "global/provider-model");
 		await writeFile(globalModelsPath, JSON.stringify({ "sdd-apply": {} }, null, 2));
 		await hooks.get("session_start")[0]({ reason: "startup" }, legacyCtx);
 		const explicitInheritClearsAgent = await readFile(

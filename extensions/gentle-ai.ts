@@ -53,6 +53,7 @@ import {
 } from "../lib/sdd-preflight.ts";
 import {
 	THINKING_LEVELS,
+	isThinkingLevel,
 	normalizeModelConfig,
 	normalizeModelId,
 	normalizeRoutingEntry,
@@ -2943,6 +2944,28 @@ export async function applyModelConfigAsync(
 	return { updated, skipped };
 }
 
+async function savedModelConfigWithDroppedEntries(
+	cwd: string,
+	config: AgentModelConfig,
+): Promise<string | undefined> {
+	const globalPath = modelConfigPath(cwd);
+	const path = await pathExists(globalPath) ? globalPath : legacyProjectModelConfigPath(cwd);
+	try {
+		const raw: unknown = JSON.parse(await readFile(path, "utf8"));
+		if (!isRecord(raw) || Object.keys(raw).length !== Object.keys(config).length) return path;
+		for (const [name, value] of Object.entries(raw)) {
+			if (!(name in config)) return path;
+			if (typeof value === "string") continue;
+			if (!isRecord(value) || Object.keys(value).some((key) => key !== "model" && key !== "thinking")) return path;
+			if ("model" in value && normalizeModelId(value.model) === undefined) return path;
+			if ("thinking" in value && !isThinkingLevel(value.thinking)) return path;
+		}
+		return undefined;
+	} catch {
+		return path;
+	}
+}
+
 export async function applySavedModelConfig(
 	ctx: ExtensionContext,
 	applyConfig: typeof applyModelConfigAsync = applyModelConfigAsync,
@@ -2955,6 +2978,8 @@ export async function applySavedModelConfig(
 		return { updated: 0, skipped: 0, invalidPath: result.path };
 	}
 	if (result.status === "missing") return { updated: 0, skipped: 0 };
+	const droppedPath = await savedModelConfigWithDroppedEntries(ctx.cwd, result.config);
+	if (droppedPath) return { updated: 0, skipped: 0, invalidPath: droppedPath };
 	return applyConfig(ctx.cwd, result.config);
 }
 
