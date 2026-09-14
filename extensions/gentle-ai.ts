@@ -1721,7 +1721,12 @@ const CODEX_STRONG_AGENT_NAMES = new Set([
 	"gentle-ai-verify", "review-risk", "review-reliability", "review-resilience",
 	"review-readability", "review-refuter", "review-validator",
 ]);
-const CODEX_CODE_AGENT_NAMES = new Set(["sdd-apply", "jd-fix-agent", "gentle-ai-worker"]);
+const CODEX_CODE_AGENT_NAMES = new Set([
+	"sdd-apply",
+	"sdd-remediate",
+	"jd-fix-agent",
+	"gentle-ai-worker",
+]);
 const CODEX_LIGHT_AGENT_NAMES = new Set([
 	"sdd-init", "sdd-explore", "sdd-research", "sdd-spec", "sdd-tasks",
 	"sdd-status", "sdd-sync", "sdd-archive", "sdd-onboard", "gentle-ai-explore",
@@ -2214,20 +2219,35 @@ function cloneModelConfig(config: AgentModelConfig): AgentModelConfig {
 	);
 }
 
+interface RoutingFrontmatter {
+	body: string;
+	eol: "\n" | "\r\n";
+	frontmatter: string;
+}
+
+function parseRoutingFrontmatter(content: string): RoutingFrontmatter | undefined {
+	const opening = content.match(/^---(\r?\n)/);
+	if (!opening?.[1]) return undefined;
+	const delimiter = /\r?\n---(?=\r?\n|$)/g;
+	delimiter.lastIndex = opening[0].length;
+	const closing = delimiter.exec(content);
+	if (!closing) return undefined;
+	return {
+		body: content.slice(closing.index),
+		eol: opening[1] as "\n" | "\r\n",
+		frontmatter: content.slice(opening[0].length, closing.index),
+	};
+}
+
 function updateFrontmatterRouting(
 	content: string,
 	entry: AgentRoutingEntry | undefined,
 ): string {
-	if (!content.startsWith("---\n")) return content;
-	const endIndex = content.indexOf("\n---", 4);
-	if (endIndex === -1) return content;
-	const frontmatter = content.slice(4, endIndex);
-	const body = content.slice(endIndex);
-	const lines = frontmatter
-		.split("\n")
-		.filter(
-			(line) => !line.startsWith("model:") && !line.startsWith("thinking:"),
-		);
+	const parsed = parseRoutingFrontmatter(content);
+	if (!parsed) return content;
+	const lines = parsed.frontmatter
+		.split(/\r?\n/)
+		.filter((line) => !/^(?:model|thinking|effort|thinking_level):/.test(line));
 	const toInsert: string[] = [];
 	if (entry?.model) toInsert.push(`model: ${entry.model}`);
 	if (entry?.thinking) toInsert.push(`thinking: ${entry.thinking}`);
@@ -2239,7 +2259,7 @@ function updateFrontmatterRouting(
 			descriptionIndex >= 0 ? descriptionIndex + 1 : Math.min(1, lines.length);
 		lines.splice(insertIndex, 0, ...toInsert);
 	}
-	return `---\n${lines.join("\n")}${body}`;
+	return `---${parsed.eol}${lines.join(parsed.eol)}${parsed.body}`;
 }
 
 function parseAgentName(filePath: string): string | undefined {
@@ -2615,13 +2635,13 @@ function readMaterializedProfile(path: string, name: string): AgentRoutingEntry 
 function readMaterializedFrontmatter(filePath: string | undefined): AgentRoutingEntry {
 	if (!filePath || !existsSync(filePath)) return {};
 	try {
-		const content = readFileSync(filePath, "utf8");
-		const frontmatter = content.startsWith("---\n")
-			? content.slice(4, content.indexOf("\n---", 4))
-			: "";
+		const parsed = parseRoutingFrontmatter(readFileSync(filePath, "utf8"));
+		if (!parsed) return {};
+		const scalar = (key: string) =>
+			parsed.frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"))?.[1]?.trim();
 		return normalizeRoutingEntry({
-			model: frontmatter.match(/^model:\s*(.+)$/m)?.[1]?.trim(),
-			thinking: frontmatter.match(/^thinking:\s*(.+)$/m)?.[1]?.trim(),
+			model: scalar("model"),
+			thinking: scalar("thinking") ?? scalar("effort") ?? scalar("thinking_level"),
 		}) ?? {};
 	} catch {
 		return {};
@@ -8053,6 +8073,8 @@ export const __testing = {
 	renderSddModelPanel: renderSddModelPanelForTesting,
 	applyCodexModelPanelPreset: applyCodexModelPanelPresetForTesting,
 	buildCodexRecommendedPreset,
+	readMaterializedFrontmatter,
+	updateFrontmatterRouting,
 	getOrchestratorPrompt,
 	renderOrchestratorPrompt,
 	loadReviewContractPromptFragment,

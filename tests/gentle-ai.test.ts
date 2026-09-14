@@ -487,6 +487,7 @@ test("Codex Recommended maps known roles by tier and clears unknown discovered r
 	const preset = __testing.buildCodexRecommendedPreset([
 		"sdd-design",
 		"sdd-apply",
+		"sdd-remediate",
 		"sdd-archive",
 		"gentle-ai-worker",
 		"gentle-ai-explore",
@@ -497,6 +498,7 @@ test("Codex Recommended maps known roles by tier and clears unknown discovered r
 
 	assert.deepEqual(preset["sdd-design"], { model: "openai-codex/gpt-5.6-sol", thinking: "high" });
 	assert.deepEqual(preset["sdd-apply"], { model: "openai-codex/gpt-5.6-terra", thinking: "medium" });
+	assert.deepEqual(preset["sdd-remediate"], { model: "openai-codex/gpt-5.6-terra", thinking: "medium" });
 	assert.deepEqual(preset["sdd-archive"], { model: "openai-codex/gpt-5.6-luna", thinking: "low" });
 	assert.deepEqual(preset["gentle-ai-worker"], { model: "openai-codex/gpt-5.6-terra", thinking: "medium" });
 	assert.deepEqual(preset["gentle-ai-explore"], { model: "openai-codex/gpt-5.6-luna", thinking: "low" });
@@ -528,6 +530,48 @@ test("authoritative routing snapshots clear omitted discoverable agent pins", as
 	});
 	assert.equal(profiles.model_profiles["custom-agent"], undefined);
 	assert.doesNotMatch(readFileSync(customPath, "utf8"), /^model:|^thinking:/m);
+});
+
+test("routing reconciliation supports canonical LF and CRLF frontmatter", async (t) => {
+	const fixture = routingConsumerFixture(t, ["alias-agent", "crlf-agent"]);
+	const aliasPath = join(fixture.root, ".pi", "agents", "alias-agent.md");
+	const crlfPath = join(fixture.root, ".pi", "agents", "crlf-agent.md");
+	writeFileSync(aliasPath, "---\nname: alias-agent\ndescription: Alias\nmodel: stale/model\nthinking: high\neffort: xhigh\nthinking_level: max\n---\nbody\n");
+	writeFileSync(crlfPath, "---\r\nname: crlf-agent\r\ndescription: CRLF\r\nmodel: stale/model\r\neffort: high\r\n---\r\nbody\r\n");
+
+	await applyModelConfigAsync(fixture.root, {
+		"alias-agent": {},
+		"crlf-agent": { model: "openai/new", thinking: "medium" },
+	});
+
+	const alias = readFileSync(aliasPath, "utf8");
+	assert.doesNotMatch(alias, /^(?:model|thinking|effort|thinking_level):/m);
+	const crlf = readFileSync(crlfPath, "utf8");
+	assert.match(crlf, /description: CRLF\r\nmodel: openai\/new\r\nthinking: medium\r\n---\r\n/);
+	assert.doesNotMatch(crlf, /\neffort:|\nthinking_level:/);
+	assert.equal(crlf.replaceAll("\r\n", "").includes("\n"), false);
+});
+
+test("materialized frontmatter fails closed on malformed delimiters and reads CRLF aliases", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "gentle-pi-frontmatter-routing-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const missingCloser = join(root, "missing.md");
+	const suffixedCloser = join(root, "suffix.md");
+	const crlf = join(root, "crlf.md");
+	writeFileSync(missingCloser, "---\nname: broken\nbody\nmodel: body/example\nthinking: high\n");
+	writeFileSync(suffixedCloser, "---\nname: broken\n---not-a-delimiter\nmodel: body/example\n");
+	writeFileSync(crlf, "---\r\nname: valid\r\nmodel: openai/crlf\r\neffort: high\r\n---\r\nbody\r\n");
+
+	const missingSource = readFileSync(missingCloser, "utf8");
+	const suffixSource = readFileSync(suffixedCloser, "utf8");
+	assert.equal(__testing.updateFrontmatterRouting(missingSource, { model: "openai/new" }), missingSource);
+	assert.equal(__testing.updateFrontmatterRouting(suffixSource, { model: "openai/new" }), suffixSource);
+	assert.deepEqual(__testing.readMaterializedFrontmatter(missingCloser), {});
+	assert.deepEqual(__testing.readMaterializedFrontmatter(suffixedCloser), {});
+	assert.deepEqual(__testing.readMaterializedFrontmatter(crlf), {
+		model: "openai/crlf",
+		thinking: "high",
+	});
 });
 
 test("model panel previews and saves the Codex Recommended complete snapshot", () => {
