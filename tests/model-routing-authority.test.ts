@@ -196,7 +196,7 @@ test("saved-routing apply fails closed for invalid project and global sources", 
 	assert.equal(statSync(profilePath).mtimeMs, before.mtimeMs);
 });
 
-test("saved-routing apply preserves missing, valid, null, inherit, and omission behavior", async (t) => {
+test("saved-routing apply preserves missing config and fails closed on malformed entries", async (t) => {
 	const root = mkdtempSync(join(tmpdir(), "gentle-pi-model-routing-apply-valid-"));
 	const configHome = join(root, "global");
 	const projectConfigDir = join(root, ".pi", "gentle-ai");
@@ -249,13 +249,11 @@ test("saved-routing apply preserves missing, valid, null, inherit, and omission 
 	assert.doesNotMatch(readFileSync(agentPath, "utf8"), /thinking:/);
 
 	const afterValidBytes = readFileSync(profilePath, "utf8");
-	const afterValid = statSync(profilePath);
 	writeFileSync(projectPath, JSON.stringify({ worker: null }));
 	const nullEntry = await applySavedModelConfig(context);
-	assert.equal(nullEntry.invalidPath, undefined);
+	assert.equal(nullEntry.invalidPath, projectPath);
 	assert.equal(readFileSync(profilePath, "utf8"), afterValidBytes);
-	assert.equal(statSync(profilePath).mtimeMs, afterValid.mtimeMs);
-	assert.doesNotMatch(readFileSync(agentPath, "utf8"), /model: null/);
+	assert.match(readFileSync(agentPath, "utf8"), /model: inherit/);
 
 	let mutatorCalls = 0;
 	const applyConfig = async () => {

@@ -53,6 +53,7 @@ import {
 } from "../lib/sdd-preflight.ts";
 import {
 	THINKING_LEVELS,
+	isThinkingLevel,
 	normalizeModelConfig,
 	normalizeModelId,
 	normalizeRoutingEntry,
@@ -1710,8 +1711,43 @@ const MODEL_CONTROL_OPTIONS = [
 	INHERIT_MODEL,
 	CUSTOM_MODEL,
 ] as const;
+
+const CODEX_RECOMMENDED_TIER = {
+	STRONG: { model: "openai-codex/gpt-5.6-sol", thinking: "high" },
+	CODE: { model: "openai-codex/gpt-5.6-terra", thinking: "medium" },
+	LIGHT: { model: "openai-codex/gpt-5.6-luna", thinking: "low" },
+} as const satisfies Record<string, AgentRoutingEntry>;
+const CODEX_STRONG_AGENT_NAMES = new Set([
+	"sdd-proposal", "sdd-design", "sdd-verify", "jd-judge-a", "jd-judge-b",
+	"gentle-ai-verify", "review-risk", "review-reliability", "review-resilience",
+	"review-readability", "review-refuter", "review-validator",
+]);
+const CODEX_CODE_AGENT_NAMES = new Set([
+	"sdd-apply",
+	"sdd-remediate",
+	"jd-fix-agent",
+	"gentle-ai-worker",
+]);
+const CODEX_LIGHT_AGENT_NAMES = new Set([
+	"sdd-init", "sdd-explore", "sdd-research", "sdd-spec", "sdd-tasks",
+	"sdd-status", "sdd-sync", "sdd-archive", "sdd-onboard", "gentle-ai-explore",
+]);
+
+function buildCodexRecommendedPreset(agents: string[]): AgentModelConfig {
+	return Object.fromEntries(agents.map((name) => {
+		const tier = CODEX_STRONG_AGENT_NAMES.has(name)
+			? CODEX_RECOMMENDED_TIER.STRONG
+			: CODEX_CODE_AGENT_NAMES.has(name)
+				? CODEX_RECOMMENDED_TIER.CODE
+				: CODEX_LIGHT_AGENT_NAMES.has(name)
+					? CODEX_RECOMMENDED_TIER.LIGHT
+					: {};
+		return [name, { ...tier }];
+	}));
+}
+
 const MODEL_PANEL_MAX_RENDER_ROWS = 20;
-const AGENT_LIST_MAX_VISIBLE_ROWS = MODEL_PANEL_MAX_RENDER_ROWS - 13;
+const AGENT_LIST_MAX_VISIBLE_ROWS = MODEL_PANEL_MAX_RENDER_ROWS - 14;
 const MODEL_LIST_MAX_VISIBLE_ROWS = 12;
 
 function readStringPath(value: unknown, path: string[]): string | undefined {
@@ -2184,20 +2220,35 @@ function cloneModelConfig(config: AgentModelConfig): AgentModelConfig {
 	);
 }
 
+interface RoutingFrontmatter {
+	body: string;
+	eol: "\n" | "\r\n";
+	frontmatter: string;
+}
+
+function parseRoutingFrontmatter(content: string): RoutingFrontmatter | undefined {
+	const opening = content.match(/^---(\r?\n)/);
+	if (!opening?.[1]) return undefined;
+	const delimiter = /\r?\n---(?=\r?\n|$)/g;
+	delimiter.lastIndex = opening[0].length;
+	const closing = delimiter.exec(content);
+	if (!closing) return undefined;
+	return {
+		body: content.slice(closing.index),
+		eol: opening[1] as "\n" | "\r\n",
+		frontmatter: content.slice(opening[0].length, closing.index),
+	};
+}
+
 function updateFrontmatterRouting(
 	content: string,
 	entry: AgentRoutingEntry | undefined,
 ): string {
-	if (!content.startsWith("---\n")) return content;
-	const endIndex = content.indexOf("\n---", 4);
-	if (endIndex === -1) return content;
-	const frontmatter = content.slice(4, endIndex);
-	const body = content.slice(endIndex);
-	const lines = frontmatter
-		.split("\n")
-		.filter(
-			(line) => !line.startsWith("model:") && !line.startsWith("thinking:"),
-		);
+	const parsed = parseRoutingFrontmatter(content);
+	if (!parsed) return content;
+	const lines = parsed.frontmatter
+		.split(/\r?\n/)
+		.filter((line) => !/^(?:model|thinking|effort|thinking_level):/.test(line));
 	const toInsert: string[] = [];
 	if (entry?.model) toInsert.push(`model: ${entry.model}`);
 	if (entry?.thinking) toInsert.push(`thinking: ${entry.thinking}`);
@@ -2209,7 +2260,7 @@ function updateFrontmatterRouting(
 			descriptionIndex >= 0 ? descriptionIndex + 1 : Math.min(1, lines.length);
 		lines.splice(insertIndex, 0, ...toInsert);
 	}
-	return `---\n${lines.join("\n")}${body}`;
+	return `---${parsed.eol}${lines.join(parsed.eol)}${parsed.body}`;
 }
 
 /**
@@ -2218,15 +2269,20 @@ function updateFrontmatterRouting(
  * frontmatter lines. Anything else is "no routing", not an error.
  */
 function readFrontmatterRouting(content: string): AgentRoutingEntry | undefined {
-	if (!content.startsWith("---\n")) return undefined;
-	const endIndex = content.indexOf("\n---", 4);
-	if (endIndex === -1) return undefined;
+	const parsed = parseRoutingFrontmatter(content);
+	if (!parsed) return undefined;
 	const raw: Record<string, string> = {};
-	for (const line of content.slice(4, endIndex).split("\n")) {
+	let thinking: string | undefined;
+	let effort: string | undefined;
+	let thinkingLevel: string | undefined;
+	for (const line of parsed.frontmatter.split(/\r?\n/)) {
 		if (line.startsWith("model:")) raw.model = line.slice("model:".length).trim();
-		else if (line.startsWith("thinking:")) raw.thinking = line.slice("thinking:".length).trim();
+		else if (line.startsWith("thinking:")) thinking = line.slice("thinking:".length).trim();
+		else if (line.startsWith("effort:")) effort = line.slice("effort:".length).trim();
+		else if (line.startsWith("thinking_level:")) thinkingLevel = line.slice("thinking_level:".length).trim();
 	}
-	if (raw.model === undefined && raw.thinking === undefined) return undefined;
+	raw.thinking = thinking ?? effort ?? thinkingLevel ?? "";
+	if (raw.model === undefined && raw.thinking === "") return undefined;
 	const entry = normalizeRoutingEntry(raw);
 	return entry && !isClearRoutingEntry(entry) ? entry : undefined;
 }
@@ -2602,7 +2658,10 @@ function updateSubagentModelProfileAtPath(
 	if (profile) {
 		if (options.preserveExisting && isRecord(modelProfiles[name])) return false;
 		modelProfiles[name] = profile;
-	} else delete modelProfiles[name];
+	} else {
+		if (!(name in modelProfiles)) return false;
+		delete modelProfiles[name];
+	}
 	if (Object.keys(modelProfiles).length > 0) config.model_profiles = modelProfiles;
 	else delete config.model_profiles;
 	mkdirSync(dirname(path), { recursive: true });
@@ -2635,7 +2694,10 @@ async function updateSubagentModelProfileAtPathAsync(
 	if (profile) {
 		if (options.preserveExisting && isRecord(modelProfiles[name])) return false;
 		modelProfiles[name] = profile;
-	} else delete modelProfiles[name];
+	} else {
+		if (!(name in modelProfiles)) return false;
+		delete modelProfiles[name];
+	}
 	if (Object.keys(modelProfiles).length > 0) config.model_profiles = modelProfiles;
 	else delete config.model_profiles;
 	await mkdir(dirname(path), { recursive: true });
@@ -2706,6 +2768,23 @@ function modelAssignmentNames(cwd: string): string[] {
 		...PROVIDER_REVIEW_ROLES,
 		...listDiscoverableAgents(cwd).map((agent) => agent.name),
 	])];
+}
+
+function readMaterializedFrontmatter(filePath: string | undefined): AgentRoutingEntry {
+	if (!filePath || !existsSync(filePath)) return {};
+	try {
+		return readFrontmatterRouting(readFileSync(filePath, "utf8")) ?? {};
+	} catch {
+		return {};
+	}
+}
+
+function completeRoutingSnapshot(config: AgentModelConfig, names: string[]): AgentModelConfig {
+	const completeNames = new Set([
+		...names,
+		...Object.keys(config).filter((name) => !isProfileOrchestratorKey(name)),
+	]);
+	return Object.fromEntries([...completeNames].map((name) => [name, { ...(config[name] ?? {}) }]));
 }
 
 const PROVIDER_ROUTING_DEFAULT_LABELS = {
@@ -2782,11 +2861,7 @@ export function applyModelConfig(
 	for (const agent of listDiscoverableAgents(cwd)) {
 		if (isProviderReviewRole(agent.name)) continue;
 		seenAgents.add(agent.name);
-		const entry = config[agent.name];
-		if (entry === undefined) {
-			skipped += 1;
-			continue;
-		}
+		const entry = config[agent.name] ?? {};
 		if (agent.source === "builtin") {
 			if (updateSubagentModelProfile(cwd, agent.source, agent.name, entry)) updated += 1;
 			else skipped += 1;
@@ -2832,11 +2907,7 @@ export async function applyModelConfigAsync(
 	for (const agent of await listDiscoverableAgentsAsync(cwd)) {
 		if (isProviderReviewRole(agent.name)) continue;
 		seenAgents.add(agent.name);
-		const entry = config[agent.name];
-		if (entry === undefined) {
-			skipped += 1;
-			continue;
-		}
+		const entry = config[agent.name] ?? {};
 		if (agent.source === "builtin") {
 			if (await updateSubagentModelProfileAsync(cwd, agent.source, agent.name, entry))
 				updated += 1;
@@ -2873,6 +2944,28 @@ export async function applyModelConfigAsync(
 	return { updated, skipped };
 }
 
+async function savedModelConfigWithDroppedEntries(
+	cwd: string,
+	config: AgentModelConfig,
+): Promise<string | undefined> {
+	const globalPath = modelConfigPath(cwd);
+	const path = await pathExists(globalPath) ? globalPath : legacyProjectModelConfigPath(cwd);
+	try {
+		const raw: unknown = JSON.parse(await readFile(path, "utf8"));
+		if (!isRecord(raw) || Object.keys(raw).length !== Object.keys(config).length) return path;
+		for (const [name, value] of Object.entries(raw)) {
+			if (!(name in config)) return path;
+			if (typeof value === "string") continue;
+			if (!isRecord(value) || Object.keys(value).some((key) => key !== "model" && key !== "thinking")) return path;
+			if ("model" in value && normalizeModelId(value.model) === undefined) return path;
+			if ("thinking" in value && !isThinkingLevel(value.thinking)) return path;
+		}
+		return undefined;
+	} catch {
+		return path;
+	}
+}
+
 export async function applySavedModelConfig(
 	ctx: ExtensionContext,
 	applyConfig: typeof applyModelConfigAsync = applyModelConfigAsync,
@@ -2884,10 +2977,10 @@ export async function applySavedModelConfig(
 	if (result.status === "invalid") {
 		return { updated: 0, skipped: 0, invalidPath: result.path };
 	}
-	return applyConfig(
-		ctx.cwd,
-		result.status === "valid" ? result.config : {},
-	);
+	if (result.status === "missing") return { updated: 0, skipped: 0 };
+	const droppedPath = await savedModelConfigWithDroppedEntries(ctx.cwd, result.config);
+	if (droppedPath) return { updated: 0, skipped: 0, invalidPath: droppedPath };
+	return applyConfig(ctx.cwd, result.config);
 }
 
 function describeModelConfig(cwd: string, config: AgentModelConfig): string[] {
@@ -3067,6 +3160,10 @@ class SddModelPanel implements OverlayComponent {
 			this.applyInherit();
 			return;
 		}
+		if (matchesKey(data, "p")) {
+			this.applyCodexRecommendedPreset();
+			return;
+		}
 		if (matchesKey(data, "e")) {
 			this.selectedRow = this.rows[this.cursor] ?? SET_ALL_AGENTS;
 			this.mode = "effort";
@@ -3189,6 +3286,11 @@ class SddModelPanel implements OverlayComponent {
 		if (row) this.clearEntry(row);
 	}
 
+	private applyCodexRecommendedPreset(): void {
+		for (const name of Object.keys(this.draft)) delete this.draft[name];
+		Object.assign(this.draft, buildCodexRecommendedPreset(this.rows.slice(1)));
+	}
+
 	private setModel(name: string, model: string | undefined): void {
 		const current = this.draft[name] ?? {};
 		if (model === undefined) delete current.model;
@@ -3224,6 +3326,7 @@ class SddModelPanel implements OverlayComponent {
 		lines.push(line("Assign Models and Effort to Agents", "title"));
 		lines.push("");
 		lines.push(line("Current assignments:", "muted"));
+		lines.push(line("p Codex Recommended — preview the complete provider preset", "accent"));
 		lines.push("");
 		const visibleRows = Math.min(AGENT_LIST_MAX_VISIBLE_ROWS, this.rows.length);
 		const listCursor = Math.min(this.cursor, this.rows.length - 1);
@@ -3263,7 +3366,7 @@ class SddModelPanel implements OverlayComponent {
 		lines.push("");
 		lines.push(
 			line(
-				`j/k scroll • enter model/save • e effort • i ${isProviderReviewRole(this.rows[this.cursor] ?? "") ? "Pi persisted defaults" : "inherit"} • c custom • x export • r restore • ctrl+s save • esc back`,
+				`j/k scroll • enter model/save • p preset • e effort • i ${isProviderReviewRole(this.rows[this.cursor] ?? "") ? "Pi persisted defaults" : "inherit"} • c custom • x export • r restore • ctrl+s save • esc back`,
 				"muted",
 			),
 		);
@@ -3402,6 +3505,19 @@ function renderSddModelPanelForTesting(
 	return new SddModelPanel(initialConfig, modelOptions, agents, () => {}, theme).render(
 		width,
 	);
+}
+
+function applyCodexModelPanelPresetForTesting(
+	initialConfig: AgentModelConfig,
+	agents: string[],
+	width: number,
+): { preview: string[]; result: ModelPanelResult | undefined } {
+	let result: ModelPanelResult | undefined;
+	const panel = new SddModelPanel(initialConfig, [], agents, (next) => { result = next; });
+	panel.handleInput("p");
+	const preview = panel.render(width);
+	panel.handleInput("\x13");
+	return { preview, result };
 }
 
 async function showSddModelPanel(
@@ -3584,7 +3700,8 @@ class ProfilesPanel implements OverlayComponent {
 	private lastSelectedId: string | undefined;
 	readonly list: NativeChoiceList<ProfileListItem>;
 	private readonly file: AgentProfilesFile;
-	private readonly currentConfig: AgentModelConfig;
+	private readonly materializedConfig: AgentModelConfig;
+	private readonly routingNames: string[];
 	private readonly done: (result: ProfilesPanelResult) => void;
 	private readonly theme: Theme | undefined;
 	private readonly rows: () => number;
@@ -3592,7 +3709,8 @@ class ProfilesPanel implements OverlayComponent {
 
 	constructor(
 		file: AgentProfilesFile,
-		currentConfig: AgentModelConfig,
+		materializedConfig: AgentModelConfig,
+		routingNames: string[],
 		done: (result: ProfilesPanelResult) => void,
 		keybindings: KeybindingsManager | undefined,
 		theme: Theme | undefined,
@@ -3601,7 +3719,8 @@ class ProfilesPanel implements OverlayComponent {
 		orchestratorSettings: OrchestratorSettingsReadResult,
 	) {
 		this.file = file;
-		this.currentConfig = currentConfig;
+		this.materializedConfig = materializedConfig;
+		this.routingNames = routingNames;
 		this.done = done;
 		this.theme = theme;
 		this.rows = rows;
@@ -3788,10 +3907,10 @@ class ProfilesPanel implements OverlayComponent {
 			return [this.renderLine("No profile selected.", width, "muted")];
 		}
 		const config = this.file.profiles[name];
-		const profileRows = profileRoutingRows(config);
-		const currentRows = profileRoutingRows(this.currentConfig);
+		const profileRows = profileRoutingRows(completeRoutingSnapshot(config, this.routingNames));
+		const currentRows = profileRoutingRows(completeRoutingSnapshot(this.materializedConfig, this.routingNames));
 		// One shared measurement across both tables, so the same agent sits in the
-		// same column whether it comes from the profile or from models.json.
+		// same column before and after applying the complete snapshot.
 		const widths = routingColumnWidths(profileRows, currentRows);
 		return [
 			this.renderLine(name === this.file.active ? `${name} (active)` : name, width, "title"),
@@ -3802,7 +3921,7 @@ class ProfilesPanel implements OverlayComponent {
 			),
 			this.renderLine(`now           ${this.effectiveOrchestratorLabel()}`, width, "muted"),
 			"",
-			this.renderLine("Profile routing", width, "accent"),
+			this.renderLine("After apply (complete snapshot)", width, "accent"),
 			...this.indentLines(this.routingLines(profileRows, widths), width),
 			"",
 			this.renderLine("Current routing (effective)", width, "accent"),
@@ -3871,6 +3990,7 @@ async function showProfilesPanel(
 			const panel = new ProfilesPanel(
 				file,
 				currentConfig,
+				modelAssignmentNames(ctx.cwd),
 				done,
 				keybindings,
 				theme,
@@ -8111,6 +8231,10 @@ export const __testing = {
 	setReviewHostRelayGroupRunnersForTesting,
 	clearReviewTransportProbeForTesting,
 	renderSddModelPanel: renderSddModelPanelForTesting,
+	applyCodexModelPanelPreset: applyCodexModelPanelPresetForTesting,
+	buildCodexRecommendedPreset,
+	readMaterializedFrontmatter,
+	updateFrontmatterRouting,
 	getOrchestratorPrompt,
 	renderOrchestratorPrompt,
 	loadReviewContractPromptFragment,
