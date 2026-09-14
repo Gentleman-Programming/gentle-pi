@@ -33,8 +33,8 @@ for (const [dir, expectedName] of Object.entries(PREFIXED_NAMES)) {
 	});
 }
 
-test("README documents legacy skill-name compatibility aliases", () => {
-	const readme = readFileSync(join(repoRoot, "README.md"), "utf8");
+test("technical reference documents legacy skill-name compatibility aliases", () => {
+	const readme = readFileSync(join(repoRoot, "docs", "readme-reference.md"), "utf8");
 	for (const [legacyName, prefixedName] of [
 		["branch-pr", "gentle-ai-branch-pr"],
 		["judgment-day", "gentle-ai-judgment-day"],

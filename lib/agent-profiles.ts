@@ -11,6 +11,7 @@ import { basename, dirname, join } from "node:path";
 import {
 	normalizeModelConfig,
 	type AgentModelConfig,
+	type AgentRoutingEntry,
 } from "./model-routing-authority.ts";
 
 export const PROFILES_KIND = "gentle-pi.agent_model_profiles";
@@ -47,6 +48,38 @@ const PROFILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const RESERVED_PROFILE_NAMES = new Set(["__proto__", "constructor", "prototype"]);
 
 const INHERIT_MODEL_LABEL = "inherit";
+
+/**
+ * Reserved routing key for the orchestrator selection.
+ *
+ * A profile is a complete snapshot of the routing, and the orchestrator is part
+ * of it, but the orchestrator is not an agent: it is never written to
+ * `subagents.json`, never has an agent file, and its model lives in Pi's global
+ * `settings.json`. The key is reserved so the routing map can carry it while
+ * every agent-facing path skips it.
+ */
+export const PROFILE_ORCHESTRATOR_KEY = "orchestrator";
+
+export function isProfileOrchestratorKey(key: string): boolean {
+	return key === PROFILE_ORCHESTRATOR_KEY;
+}
+
+/** The profile's own orchestrator entry, when the profile defines one. */
+export function readProfileOrchestrator(
+	config: AgentModelConfig,
+): AgentRoutingEntry | undefined {
+	if (!Object.prototype.hasOwnProperty.call(config, PROFILE_ORCHESTRATOR_KEY)) return undefined;
+	const entry = config[PROFILE_ORCHESTRATOR_KEY];
+	return entry && Object.keys(entry).length > 0 ? entry : undefined;
+}
+
+/**
+ * The routing map without its reserved orchestrator key, for every caller that
+ * counts or lists roles: the orchestrator is not a role.
+ */
+export function profileRoleEntries(config: AgentModelConfig): Array<[string, AgentRoutingEntry]> {
+	return Object.entries(config).filter(([agent]) => !isProfileOrchestratorKey(agent));
+}
 
 export function isValidProfileName(value: unknown): value is string {
 	return (
@@ -281,7 +314,7 @@ export interface ProfileSummary {
 
 export function summarizeProfile(config: AgentModelConfig): ProfileSummary {
 	const byModel = new Map<string, string[]>();
-	for (const [agent, entry] of Object.entries(config)) {
+	for (const [agent, entry] of profileRoleEntries(config)) {
 		const model = entry?.model ?? INHERIT_MODEL_LABEL;
 		const roles = byModel.get(model);
 		if (roles) roles.push(agent);
@@ -310,6 +343,63 @@ export function formatProfileSummaryLines(summary: ProfileSummary): string[] {
 	);
 }
 
+export interface ProfileRoutingRow {
+	agent: string;
+	model: string;
+	thinking: string;
+}
+
+/**
+ * One row per agent, in a stable alphabetical order so the profile's routing and
+ * the effective routing can be compared line by line, and with the reserved
+ * orchestrator key excluded because it is rendered on its own line.
+ */
+export function profileRoutingRows(config: AgentModelConfig): ProfileRoutingRow[] {
+	return profileRoleEntries(config)
+		.map(([agent, entry]) => ({
+			agent,
+			model: entry?.model ?? INHERIT_MODEL_LABEL,
+			thinking: entry?.thinking ?? INHERIT_MODEL_LABEL,
+		}))
+		.sort((left, right) => left.agent.localeCompare(right.agent));
+}
+
+/**
+ * Column widths shared by every routing table in one panel, so the profile's
+ * routing and the effective routing align column for column instead of each
+ * section sizing itself.
+ */
+export function routingColumnWidths(
+	...groups: ProfileRoutingRow[][]
+): { agent: number; model: number } {
+	const rows = groups.flat();
+	return {
+		agent: rows.reduce((width, row) => Math.max(width, row.agent.length), 0),
+		model: rows.reduce((width, row) => Math.max(width, row.model.length), 0),
+	};
+}
+
+export function formatRoutingRow(
+	row: ProfileRoutingRow,
+	widths: { agent: number; model: number },
+): string {
+	return `${row.agent.padEnd(widths.agent)}  ${row.model.padEnd(widths.model)}  ${row.thinking}`;
+}
+
+/**
+ * A single line describing an orchestrator selection, for the panel header. The
+ * label distinguishes "this profile sets nothing" from "settings.json cannot be
+ * read", which are different operator states.
+ */
+export function formatOrchestratorSelection(entry: AgentRoutingEntry | undefined): string {
+	if (entry?.model === undefined) {
+		return entry?.thinking === undefined
+			? INHERIT_MODEL_LABEL
+			: `${INHERIT_MODEL_LABEL} · ${entry.thinking}`;
+	}
+	return entry.thinking === undefined ? entry.model : `${entry.model} · ${entry.thinking}`;
+}
+
 export interface ProfileListItem {
 	id: string;
 	label: string;
@@ -318,7 +408,7 @@ export interface ProfileListItem {
 
 export function buildProfileListItems(file: AgentProfilesFile): ProfileListItem[] {
 	return Object.entries(file.profiles).map(([name, config]) => {
-		const roles = Object.keys(config).length;
+		const roles = profileRoleEntries(config).length;
 		return {
 			id: name,
 			label: name === file.active ? `${name} (active)` : name,

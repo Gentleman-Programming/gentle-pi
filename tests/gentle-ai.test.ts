@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -13,6 +14,7 @@ import type {
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
 import { __testing, applyModelConfig, applyModelConfigAsync, createGentleAiExtension } from "../extensions/gentle-ai.ts";
+import { PROFILES_KIND, PROFILES_VERSION } from "../lib/agent-profiles.ts";
 import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError, type NativeReviewCli } from "../lib/native-review-cli.ts";
 import { CandidateViewError, type CandidateViewRegistry } from "../lib/review-candidate-view.ts";
 import { installPackageAssets } from "../lib/sdd-preflight.ts";
@@ -60,6 +62,121 @@ function lifecycleContext(overrides: Record<string, unknown> = {}): Record<strin
 		isError: false,
 		lastComponent: undefined,
 		...overrides,
+	};
+}
+
+// gentle-pi#874: the provider's fresh_target_ready offer. The argument order
+// mirrors the live selectorless STATUS a clean, fully committed worktree
+// receives: it names the merge-base it wants so a plain START can adopt it.
+function offeredCommittedRangeStatus(baseRef: string, baseTree: string, candidateTree: string, paths: readonly string[] = ["app.ts"]): ReviewStatusV3 {
+	const targetIdentity = `sha256:${"a".repeat(64)}`;
+	return {
+		contract: "gentle-ai.review-integration/v2",
+		applicability: "unrelated",
+		action: "start",
+		replayability: "not_replayable",
+		targetIdentity,
+		projection: {
+			schema: "gentle-ai.review-candidate-projection/v1",
+			kind: "base-diff",
+			projection: "workspace",
+			baseTree,
+			initialReviewTree: candidateTree,
+			currentCandidateTree: candidateTree,
+			pathsDigest: `sha256:${"b".repeat(64)}`,
+			paths: [...paths],
+			intendedUntracked: [],
+			intendedUntrackedProof: `sha256:${"c".repeat(64)}`,
+			initialSnapshotIdentity: `sha256:${"d".repeat(64)}`,
+			currentSnapshotIdentity: `sha256:${"d".repeat(64)}`,
+		},
+		candidates: [],
+		nextTransition: {
+			kind: "execute",
+			reasonCode: "fresh_target_ready",
+			execute: {
+				operation: "review.start",
+				arguments: [
+					{ name: "target", value: targetIdentity, token: `--target=${targetIdentity}` },
+					{ name: "target-evidence", value: `v1:base-diff:workspace:${baseTree}:${candidateTree}:sha256:${"e".repeat(64)}`, token: `--target-evidence=v1:base-diff:workspace:${baseTree}:${candidateTree}:sha256:${"e".repeat(64)}` },
+					{ name: "projection", value: "workspace", token: "--projection=workspace" },
+					{ name: "base-ref", value: baseRef, token: `--base-ref=${baseRef}` },
+					{ name: "committed-only", value: "true", token: "--committed-only=true" },
+					{ name: "lineage", value: "review-offered", token: "--lineage=review-offered" },
+					{ name: "agent", value: "pi", token: "--agent=pi" },
+					{ name: "consent", value: "relay", token: "--consent=relay" },
+				],
+				preconditions: [],
+				binding: { targetIdentity },
+			},
+		},
+		raw: { schema: "gentle-ai.review-integration.status/v5" },
+	} as unknown as ReviewStatusV3;
+}
+
+// The clean, fully committed worktree STATUS with no committed-range offer:
+// the current-changes candidate view a plain START builds today.
+function cleanWorkspaceStatus(headTree: string, nextTransition?: ReviewStatusV3["nextTransition"]): ReviewStatusV3 {
+	const targetIdentity = `sha256:${"a".repeat(64)}`;
+	return {
+		contract: "gentle-ai.review-integration/v2",
+		applicability: "unrelated",
+		action: "start",
+		replayability: "not_replayable",
+		targetIdentity,
+		projection: {
+			schema: "gentle-ai.review-candidate-projection/v1",
+			kind: "current-changes",
+			projection: "workspace",
+			baseTree: headTree,
+			initialReviewTree: headTree,
+			currentCandidateTree: headTree,
+			pathsDigest: `sha256:${"b".repeat(64)}`,
+			paths: [],
+			intendedUntracked: [],
+			intendedUntrackedProof: `sha256:${"c".repeat(64)}`,
+			initialSnapshotIdentity: `sha256:${"d".repeat(64)}`,
+			currentSnapshotIdentity: `sha256:${"d".repeat(64)}`,
+		},
+		candidates: [],
+		...(nextTransition === undefined ? {} : { nextTransition }),
+		raw: { schema: "gentle-ai.review-integration.status/v5" },
+	} as unknown as ReviewStatusV3;
+}
+
+function startedReviewResult(): Record<string, unknown> {
+	return { lineageId: "adopted-range", state: "reviewing", riskLevel: "low", selectedLenses: [], changedFiles: 1, changedLines: 1, correctionBudget: 1, action: "created", lensesRequired: false, riskReasons: [], raw: {} };
+}
+
+interface ReviewStartRepository {
+	cwd: string;
+	baseCommit: string;
+	baseTree: string;
+	headTree: string;
+}
+
+// A hermetic two-commit repository whose candidate range is a real committed
+// change, so both the adopted and explicit base-ref paths resolve through the
+// real candidate-view guard.
+function reviewRepository(t: test.TestContext): ReviewStartRepository {
+	const cwd = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-review-start-")));
+	t.after(() => {
+		try { execFileSync("chmod", ["-R", "u+w", cwd], { stdio: "ignore" }); } catch { /* best effort */ }
+		rmSync(cwd, { recursive: true, force: true });
+	});
+	execFileSync("git", ["init", "-b", "main"], { cwd, stdio: "ignore" });
+	writeFileSync(join(cwd, "app.ts"), "export const value = 1;\n");
+	execFileSync("git", ["add", "app.ts"], { cwd, stdio: "ignore" });
+	execFileSync("git", ["-c", "user.name=Review Test", "-c", "user.email=review@example.invalid", "commit", "-m", "base"], { cwd, stdio: "ignore" });
+	const baseCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim();
+	writeFileSync(join(cwd, "app.ts"), "export const value = 2;\n");
+	execFileSync("git", ["add", "app.ts"], { cwd, stdio: "ignore" });
+	execFileSync("git", ["-c", "user.name=Review Test", "-c", "user.email=review@example.invalid", "commit", "-m", "candidate"], { cwd, stdio: "ignore" });
+	return {
+		cwd,
+		baseCommit,
+		baseTree: execFileSync("git", ["rev-parse", `${baseCommit}^{tree}`], { cwd, encoding: "utf8" }).trim(),
+		headTree: execFileSync("git", ["rev-parse", "HEAD^{tree}"], { cwd, encoding: "utf8" }).trim(),
 	};
 }
 
@@ -252,6 +369,9 @@ function routingConsumerFixture(t: test.TestContext, agents = ["worker"]) {
 		registerCommand(name, command) { commands.set(name, command); },
 	} as ExtensionAPI);
 	const notifications: Array<{ message: string; severity: string }> = [];
+	// The profiles panel reads the terminal rows to size its full-screen frame, so
+	// the fake UI hands every factory a TUI-shaped stand-in with a mutable height.
+	const fixtureTui = { terminal: { rows: 24 }, requestRender() {} };
 	let panelVisits = 0;
 	const panels: string[] = [];
 	let onPanel = () => ({ type: "cancel", config: {} });
@@ -267,7 +387,7 @@ function routingConsumerFixture(t: test.TestContext, agents = ["worker"]) {
 			notify(message: string, severity: string) { notifications.push({ message, severity }); },
 			custom: async (factory: (tui: unknown, theme: Theme, keybindings: unknown, done: (result: unknown) => void) => RoutingConsumerPanel) => {
 				let result: unknown;
-				const panel = factory(undefined, { fg: (_color: string, text: string) => text } as unknown as Theme, undefined, (value) => { result = value; });
+				const panel = factory(fixtureTui, { fg: (_color: string, text: string) => text } as unknown as Theme, undefined, (value) => { result = value; });
 				panels.push(stripAnsi(renderComponent(panel)));
 				panelVisits += 1;
 				if (onInput) {
@@ -281,6 +401,7 @@ function routingConsumerFixture(t: test.TestContext, agents = ["worker"]) {
 	} as unknown as Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1];
 	return {
 		root, agentHome, configHome, projectPath, globalPath, exportPath, notifications, panels,
+		tui: fixtureTui as { terminal: { rows: number } },
 		panelVisits: () => panelVisits,
 		onPanel(action: typeof onPanel) { onPanel = action; },
 		onInput(action: (panel: RoutingConsumerPanel) => void) { onInput = action; },
@@ -679,8 +800,9 @@ test("a later alias keeps managed-root precedence and manifest ownership", (t) =
 	assert.equal(manifest.assets["agents/sdd-apply.md"], createHash("sha256").update(routed).digest("hex"));
 });
 
-test("runtime guidance keeps review policy out of the static orchestrator", () => {
-	const staticReferences = ["README.md", "skills/gentle-ai/SKILL.md"];
+test("runtime guidance keeps review policy out of the static orchestrator and technical reference", () => {
+	const staticReferences = ["docs/readme-reference.md", "skills/gentle-ai/SKILL.md"];
+	assert.match(readFileSync("README.md", "utf8"), /\]\(docs\/readme-reference\.md(?:#[^)]+)?\)/);
 	const forbiddenGenericRoutes = [
 		/fresh-context `reviewer`/,
 		/fresh reviewer audits/,
@@ -788,6 +910,57 @@ test("ordinary native capture exposes a registered schema and STATUS binding cop
 	assert.equal(launches, 1);
 });
 
+test("ordinary START adopts the committed-range selectors the provider just offered", async (t) => {
+	const { cwd, baseCommit, baseTree, headTree: candidateTree } = reviewRepository(t);
+	const starts: Array<Record<string, unknown>> = [];
+	const native = {
+		targetStatus: async () => offeredCommittedRangeStatus(baseCommit, baseTree, candidateTree),
+		start: async (request: Record<string, unknown>) => { starts.push(request); return startedReviewResult(); },
+	} as unknown as NativeReviewCli;
+	const result = await __testing.executeReviewControllerOperation({ operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, cwd, native);
+	assert.equal(result.operation, "start");
+	assert.equal(starts.length, 1);
+	assert.equal(starts[0]?.baseRef, baseCommit);
+	assert.equal(starts[0]?.committedOnly, true);
+});
+
+test("ordinary START keeps an explicit caller baseRef and ignores the offered selector", async (t) => {
+	const { cwd, baseCommit, baseTree, headTree: candidateTree } = reviewRepository(t);
+	const starts: Array<Record<string, unknown>> = [];
+	const native = {
+		// A shape-valid but never-invoked offer: the explicit caller value must win
+		// before this is ever considered.
+		targetStatus: async () => offeredCommittedRangeStatus("f".repeat(40), baseTree, candidateTree),
+		start: async (request: Record<string, unknown>) => { starts.push(request); return startedReviewResult(); },
+	} as unknown as NativeReviewCli;
+	const result = await __testing.executeReviewControllerOperation({ operation: "start", input: JSON.stringify({ mode: "ordinary", baseRef: baseCommit, committedOnly: true }) }, cwd, native);
+	assert.equal(result.operation, "start");
+	assert.equal(starts.length, 1);
+	assert.equal(starts[0]?.baseRef, baseCommit);
+	assert.equal(starts[0]?.committedOnly, true);
+});
+
+test("ordinary START keeps today's invocation when STATUS offers no committed-range selector", async (t) => {
+	const { cwd, headTree } = reviewRepository(t);
+	const offeredWithoutBaseRef = cleanWorkspaceStatus(headTree, {
+		kind: "execute",
+		reasonCode: "fresh_target_ready",
+		execute: { operation: "review.start", arguments: [{ name: "projection", value: "workspace", token: "--projection=workspace" }], preconditions: [], binding: { targetIdentity: `sha256:${"a".repeat(64)}` } },
+	});
+	for (const [label, target] of [["no execute transition", cleanWorkspaceStatus(headTree)], ["no base-ref", offeredWithoutBaseRef]] as const) {
+		const starts: Array<Record<string, unknown>> = [];
+		const native = {
+			targetStatus: async () => target,
+			start: async (request: Record<string, unknown>) => { starts.push(request); return startedReviewResult(); },
+		} as unknown as NativeReviewCli;
+		const result = await __testing.executeReviewControllerOperation({ operation: "start", input: JSON.stringify({ mode: "ordinary" }) }, cwd, native);
+		assert.equal(result.operation, "start", label);
+		assert.equal(starts.length, 1, label);
+		assert.equal(starts[0]?.baseRef, undefined, label);
+		assert.equal("committedOnly" in starts[0]!, false, label);
+	}
+});
+
 test("ordinary START reports candidate-owner preparation failure as pre-native no mutation", async () => {
 	let nativeStarts = 0;
 	const target = {
@@ -834,6 +1007,23 @@ test("ordinary START reports candidate-owner preparation failure as pre-native n
 		code: "candidate-owner-preparation-failed",
 		message: "candidate view rejected before native START",
 	});
+
+	let materializationStatusCalls = 0;
+	const rawMaterializationFailure = await __testing.executeReviewControllerOperation(
+		{ operation: "start", input: JSON.stringify({ mode: "ordinary" }) },
+		process.cwd(),
+		{
+			targetStatus: async () => { materializationStatusCalls += 1; return target; },
+			start: async () => { nativeStarts += 1; throw new Error("native START must not run"); },
+		} as unknown as NativeReviewCli,
+		undefined,
+		{ createOrReuse: () => { throw new Error("candidate materialization failed"); } } as unknown as CandidateViewRegistry,
+	);
+	assert.equal(nativeStarts, 0);
+	assert.equal(materializationStatusCalls, 1, "a pre-START materialization failure never triggers reconciliation STATUS");
+	assert.equal(rawMaterializationFailure.outcome, "native-operation-failed");
+	assert.equal(rawMaterializationFailure.mutation_outcome, "none");
+	assert.equal(rawMaterializationFailure.next_action, "resolve-native-operation-failure");
 
 	let statusCalls = 0;
 	const afterNative = await __testing.executeReviewControllerOperation(
@@ -1592,4 +1782,264 @@ test("bash tool_call confirms every compound action and centers a long git -C pu
 	assert.equal(title, "Allow guarded actions: git push; npm publish?");
 	assert.match(preview, /push origin main && npm publish --tag beta/);
 	assert.ok(preview.startsWith("…"));
+});
+// /gentle:profiles reopens its panel after every action, so a test that applies
+// once must confirm on the first visit and close on the next, or the panel and
+// the action loop feed each other forever.
+function applyOnce(
+	fixture: { onInput(action: (panel: { handleInput(data: string): void }) => void): void },
+): void {
+	let visits = 0;
+	fixture.onInput((panel) => {
+		visits += 1;
+		panel.handleInput(visits === 1 ? "\r" : "\x1b");
+	});
+}
+
+function profilesStoreFixture(t: test.TestContext) {
+	const fixture = routingConsumerFixture(t, ["worker"]);
+	const storePath = join(fixture.configHome, "profiles.json");
+	const settingsPath = join(fixture.agentHome, "settings.json");
+	const writeStore = (profiles: Record<string, unknown>, active?: string) => {
+		mkdirSync(fixture.configHome, { recursive: true });
+		const store: Record<string, unknown> = { kind: PROFILES_KIND, version: PROFILES_VERSION, profiles };
+		if (active !== undefined) store.active = active;
+		writeFileSync(storePath, `${JSON.stringify(store, null, 2)}\n`);
+	};
+	const writeSettings = (extra: Record<string, unknown> = {}) => {
+		const settings = {
+			packages: ["npm:pi-mcp-adapter"],
+			theme: "Gentleman-Cute",
+			defaultProvider: "nan",
+			defaultModel: "deepseek-v4-flash",
+			defaultThinkingLevel: "high",
+			...extra,
+		};
+		writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+		return settings;
+	};
+	return { fixture, storePath, settingsPath, writeStore, writeSettings };
+}
+
+test("applying a profile persists its orchestrator and never leaks the key into agent routing", async (t) => {
+	const { fixture, settingsPath, writeStore, writeSettings } = profilesStoreFixture(t);
+	const before = writeSettings();
+	writeStore({
+		team: {
+			orchestrator: { model: "nan/glm5.3", thinking: "max" },
+			worker: { model: "openai/alpha" },
+		},
+	});
+	applyOnce(fixture);
+	await fixture.run("gentle:profiles");
+
+	const after = JSON.parse(readFileSync(settingsPath, "utf8"));
+	assert.equal(after.defaultProvider, "nan");
+	assert.equal(after.defaultModel, "glm5.3");
+	assert.equal(after.defaultThinkingLevel, "max");
+	assert.deepEqual(after.packages, before.packages, "unrelated settings keys survive");
+	assert.equal(after.theme, before.theme, "unrelated settings keys survive");
+
+	// The reserved key is routing, not an agent: it must never reach the
+	// subagent profile store or the agent frontmatter.
+	const projectProfiles = JSON.parse(readFileSync(join(fixture.root, ".pi", "subagents.json"), "utf8"));
+	assert.equal("orchestrator" in projectProfiles.model_profiles, false);
+	assert.equal(readFileSync(join(fixture.root, ".pi", "agents", "worker.md"), "utf8"), readFileSync(join(fixture.root, ".pi", "agents", "worker.md"), "utf8"));
+	assert.match(readFileSync(join(fixture.root, ".pi", "agents", "worker.md"), "utf8"), /model: openai\/alpha/);
+	const applied = fixture.notifications.at(-1)?.message ?? "";
+	assert.match(applied, /Orchestrator set to nan\/glm5\.3 · max/);
+});
+
+test("applying a profile without an orchestrator entry leaves settings.json untouched", async (t) => {
+	const { fixture, settingsPath, writeStore, writeSettings } = profilesStoreFixture(t);
+	writeSettings();
+	writeStore({ team: { worker: { model: "openai/alpha" } } });
+	applyOnce(fixture);
+	await fixture.run("gentle:profiles");
+
+	const after = JSON.parse(readFileSync(settingsPath, "utf8"));
+	assert.equal(after.defaultProvider, "nan");
+	assert.equal(after.defaultModel, "deepseek-v4-flash");
+	assert.equal(after.defaultThinkingLevel, "high");
+	const applied = fixture.notifications.at(-1)?.message ?? "";
+	assert.doesNotMatch(applied, /Orchestrator set to/);
+});
+
+test("a profile store entry with only the orchestrator key counts zero roles", async (t) => {
+	const { fixture, writeStore } = profilesStoreFixture(t);
+	writeStore({ team: { orchestrator: { model: "nan/glm5.3", thinking: "high" } } }, "team");
+	applyOnce(fixture);
+	await fixture.run("gentle:profiles");
+	const applied = fixture.notifications.at(-1)?.message ?? "";
+	assert.match(applied, /0 agents updated/);
+	assert.match(applied, /Orchestrator set to nan\/glm5\.3 · high/);
+});
+
+test("applying a profile replaces materialized routing for agents the profile omits", async (t) => {
+	const { fixture, writeStore, writeSettings } = profilesStoreFixture(t);
+	writeSettings();
+	// Routing materialized earlier (a previous profile, /gentle:models, or a
+	// migration) for an agent the new profile does not mention.
+	const helperPath = join(fixture.root, ".pi", "agents", "helper.md");
+	writeMarkdown(helperPath, "---\nname: helper\ndescription: Helper\nmodel: openai/beta\nthinking: high\n---\nbody\n");
+	const subagentsPath = join(fixture.root, ".pi", "subagents.json");
+	writeFileSync(subagentsPath, `${JSON.stringify({ model_profiles: { helper: { model: "openai/beta", effort: "high" } } }, null, 2)}\n`);
+	writeStore({ team: { worker: { model: "openai/alpha" } } });
+	applyOnce(fixture);
+	await fixture.run("gentle:profiles");
+
+	const profiles = JSON.parse(readFileSync(subagentsPath, "utf8"));
+	assert.deepEqual(profiles.model_profiles, { worker: { model: "openai/alpha" } }, "omitted agents lose their materialized route");
+	const helper = readFileSync(helperPath, "utf8");
+	assert.doesNotMatch(helper, /^model:/m);
+	assert.doesNotMatch(helper, /^thinking:/m);
+	assert.match(readFileSync(join(fixture.root, ".pi", "agents", "worker.md"), "utf8"), /model: openai\/alpha/);
+	// models.json stays the profile itself, not a padded copy.
+	assert.deepEqual(JSON.parse(readFileSync(fixture.globalPath, "utf8")), { worker: { model: "openai/alpha" } });
+	const applied = fixture.notifications.at(-1)?.message ?? "";
+	assert.match(applied, /applied profile "team"/);
+});
+
+test("a failed apply restores the previous profile's routing with the same replacement semantics", async (t) => {
+	const { fixture, settingsPath, writeStore } = profilesStoreFixture(t);
+	// An unreadable settings.json makes the orchestrator write fail after the
+	// routing was already materialized, which triggers the rollback path.
+	writeFileSync(settingsPath, "{ not json\n");
+	const helperPath = join(fixture.root, ".pi", "agents", "helper.md");
+	writeMarkdown(helperPath, "---\nname: helper\ndescription: Helper\nmodel: openai/beta\n---\nbody\n");
+	const subagentsPath = join(fixture.root, ".pi", "subagents.json");
+	writeFileSync(subagentsPath, `${JSON.stringify({ model_profiles: { helper: { model: "openai/beta" } } }, null, 2)}\n`);
+	mkdirSync(fixture.configHome, { recursive: true });
+	writeFileSync(fixture.globalPath, `${JSON.stringify({ helper: { model: "openai/beta" } }, null, 2)}\n`);
+	// "team" is listed first, so Enter applies it while "old" stays the active one.
+	writeStore({
+		team: { orchestrator: { model: "nan/glm5.3" }, worker: { model: "openai/alpha" } },
+		old: { helper: { model: "openai/beta" } },
+	}, "old");
+	applyOnce(fixture);
+	await fixture.run("gentle:profiles");
+
+	const warning = fixture.notifications.find((entry) => /could not apply profile "team"/.test(entry.message));
+	assert.ok(warning, "the failed apply is reported");
+	assert.deepEqual(JSON.parse(readFileSync(fixture.globalPath, "utf8")), { helper: { model: "openai/beta" } });
+	const profiles = JSON.parse(readFileSync(subagentsPath, "utf8"));
+	assert.deepEqual(profiles.model_profiles, { helper: { model: "openai/beta" } }, "the previous routing is materialized again and the failed profile's routes are cleared");
+	assert.match(readFileSync(helperPath, "utf8"), /model: openai\/beta/);
+	assert.doesNotMatch(readFileSync(join(fixture.root, ".pi", "agents", "worker.md"), "utf8"), /^model:/m);
+	const store = JSON.parse(readFileSync(join(fixture.configHome, "profiles.json"), "utf8"));
+	assert.equal(store.active, "old");
+});
+
+test("the profiles command seeds and shows the routing the runtime uses when models.json is sparse", async (t) => {
+	const { fixture } = profilesStoreFixture(t);
+	// No models.json at all, but routing is materialized where the runtime
+	// reads it: subagents.json for worker, frontmatter only for helper.
+	writeMarkdown(join(fixture.root, ".pi", "agents", "helper.md"), "---\nname: helper\ndescription: Helper\nmodel: openai/beta\n---\nbody\n");
+	writeFileSync(join(fixture.root, ".pi", "subagents.json"), `${JSON.stringify({ model_profiles: { worker: { model: "openai/alpha", effort: "high" } } }, null, 2)}\n`);
+	let rendered: string | undefined;
+	fixture.onInput((panel) => {
+		rendered = stripAnsi(renderComponent(panel));
+		panel.handleInput("\x1b");
+	});
+	await fixture.run("gentle:profiles");
+
+	const store = JSON.parse(readFileSync(join(fixture.configHome, "profiles.json"), "utf8"));
+	assert.equal(store.active, "current", "materialized routing counts as existing routing");
+	assert.deepEqual(store.profiles.current, {
+		worker: { model: "openai/alpha", thinking: "high" },
+		helper: { model: "openai/beta" },
+	});
+	assert.ok(rendered);
+	assert.match(rendered, /Current routing \(effective\)/);
+	assert.match(rendered, /worker\s+openai\/alpha\s+high/);
+	assert.match(rendered, /helper\s+openai\/beta/);
+	assert.doesNotMatch(rendered, /No routing entries/);
+});
+
+test("effective routing prefers models.json over the materialized stores", (t) => {
+	const fixture = routingConsumerFixture(t, ["worker", "helper"]);
+	mkdirSync(fixture.configHome, { recursive: true });
+	writeFileSync(fixture.globalPath, `${JSON.stringify({ worker: { model: "openai/alpha" } }, null, 2)}\n`);
+	writeFileSync(join(fixture.root, ".pi", "subagents.json"), `${JSON.stringify({
+		model_profiles: { worker: { model: "openai/beta", effort: "high" }, helper: { model: "openai/beta" } },
+	}, null, 2)}\n`);
+	const effective = JSON.parse(JSON.stringify(__testing.readEffectiveModelConfig(fixture.root)));
+	assert.deepEqual(effective, {
+		worker: { model: "openai/alpha" },
+		helper: { model: "openai/beta" },
+	});
+	assert.equal(existsSync(join(fixture.root, ".pi", "gentle-ai", "models.json")), false, "reading never writes");
+});
+
+test("the profiles panel fills the terminal, lists routing per agent, and scrolls", async (t) => {
+	const { fixture, writeStore } = profilesStoreFixture(t);
+	writeStore({
+		team: {
+			orchestrator: { model: "nan/glm5.3", thinking: "high" },
+			worker: { model: "openai/alpha", thinking: "high" },
+			"sdd-design": { model: "nan/glm5.3", thinking: "high" },
+		},
+	}, "team");
+	let rendered: string | undefined;
+	let panel: { render(width: number): string[] } | undefined;
+	fixture.onInput((visited) => {
+		panel = visited;
+		rendered = renderComponent(visited);
+		visited.handleInput("\x1b");
+	});
+	await fixture.run("gentle:profiles");
+
+	assert.ok(rendered);
+	const lines = rendered.split("\n");
+	// The frame spans the terminal height the fake TUI reports.
+	assert.equal(lines.length, 24, `expected 24 rows, got ${lines.length}`);
+	assert.match(lines[0], /^╭/);
+	assert.match(lines.at(-1)!, /^╰/);
+	const text = rendered;
+	// Routing is listed one agent per line, aligned in columns, never collapsed
+	// into "N agents → model: a, b, …" summaries.
+	assert.match(text, /Profile routing/);
+	assert.match(text, /Current routing \(effective\)/);
+	assert.match(text, /orchestrator\s+nan\/glm5\.3 · high/);
+	assert.match(text, /worker\s+openai\/alpha\s+high/);
+	assert.match(text, /sdd-design\s+nan\/glm5\.3\s+high/);
+	assert.doesNotMatch(text, /agents? → /);
+
+	// A taller terminal renders a taller frame with the same content.
+	fixture.tui.terminal.rows = 40;
+	const taller = renderComponent(panel);
+	assert.equal(taller.split("\n").length, 40);
+
+	// A short terminal clamps instead of crashing, and keeps both borders.
+	fixture.tui.terminal.rows = 9;
+	const short = stripAnsi(panel.render(120).map((line) => line.replace(/[ \t]+$/g, "")).join("\n"));
+	const shortLines = short.split("\n");
+	assert.equal(shortLines.length, 9);
+	assert.match(shortLines[0], /^╭/);
+	assert.match(shortLines.at(-1)!, /^╰/);
+});
+
+test("j and k scroll the detail pane one line at a time, like the agents view", async (t) => {
+	const { fixture, writeStore } = profilesStoreFixture(t);
+	const routing: Record<string, { model: string; thinking: string }> = {};
+	for (let index = 1; index <= 25; index += 1) {
+		routing[`agent-${String(index).padStart(2, "0")}`] = { model: "openai/alpha", thinking: "high" };
+	}
+	writeStore({ team: routing }, "team");
+	let panel: { handleInput(data: string): void; render(width: number): string[] } | undefined;
+	fixture.onInput((visited) => {
+		panel = visited;
+		visited.handleInput("\x1b");
+	});
+	await fixture.run("gentle:profiles");
+	assert.ok(panel, "the panel must open");
+	const body = () => panel!.render(120).slice(1, -2).map((line) => line.replace(/[ \t]+$/, "")).join("\n");
+	const firstAgentRow = (text: string) => text.split("\n").findIndex((line) => line.includes("agent-01"));
+	const before = body();
+	assert.ok(firstAgentRow(before) >= 0, "the first routing row must be visible before scrolling");
+	panel!.handleInput("j");
+	const afterJ = body();
+	assert.notEqual(firstAgentRow(afterJ), firstAgentRow(before), "j must scroll the detail down by one line");
+	panel!.handleInput("k");
+	assert.equal(firstAgentRow(body()), firstAgentRow(before), "k must scroll the detail back up");
 });

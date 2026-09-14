@@ -699,3 +699,47 @@ test("review-acknowledged/v1 is disjoint from every prior captured identity in b
 		assert.throws(() => decoder(clone(acknowledged)), `${name} must reject the acknowledged envelope`);
 	}
 });
+
+// Producer-shaped projection: gentle-ai d521b5e, target_status.go and
+// last-event-closure.schema.json#/properties/escalation (not a live capture).
+function escalatedStatusV7(): JsonObject {
+	const body = currentStatusFixture("status-v5-capture-result-submission.captured.json");
+	body.schema = "gentle-ai.review-integration.status/v7";
+	(body.authority as JsonObject).state = "escalated";
+	body.action = "stop";
+	body.replayability = "manual_action_required";
+	body.next_transition = { kind: "stop", reason_code: "escalated" };
+	delete body.forecast;
+	body.escalation = { cause: "unknown_causality", finding_ids: ["R1"] };
+	return body;
+}
+
+test("v7 escalation is typed metadata and preserves native stop authority", () => {
+	const body = escalatedStatusV7();
+	const decoded = decodeReviewStatusV3(body);
+	assert.deepEqual(decoded.escalation, { cause: "unknown_causality", findingIds: ["R1"] });
+	delete body.escalation;
+	const older = decodeReviewStatusV3(body);
+	assert.deepEqual({ ...decoded, escalation: undefined, raw: undefined }, { ...older, escalation: undefined, raw: undefined });
+	assert.equal(decoded.action, "stop");
+	assert.equal(decoded.authority?.state, "escalated");
+	assert.deepEqual(decoded.nextTransition, { kind: "stop", reasonCode: "escalated" });
+});
+
+test("v7 escalation strictly decodes all causes and optional refuter evidence", () => {
+	for (const cause of ["unknown_causality", "insufficient_evidence", "missing_refuter_outcome", "targeted_validator_rejected", "correction_budget_exceeded", "unresolved_severe_findings"]) {
+		const body = escalatedStatusV7();
+		const rows = ["corroborated", "refuted", "inconclusive"].map((outcome) => ({ finding_id: "R2", outcome, proof: "observed evidence" }));
+		body.escalation = { cause, finding_ids: [], refuter_outcomes: rows };
+		assert.deepEqual(decodeReviewStatusV3(body).escalation, { cause, findingIds: [], refuterOutcomes: rows.map(({ finding_id, ...row }) => ({ findingId: finding_id, ...row })) });
+	}
+	for (const escalation of [null, undefined, [], {}, { cause: "future", finding_ids: [] }, { cause: "unknown_causality" }, { cause: "unknown_causality", finding_ids: [""] }, { cause: "unknown_causality", finding_ids: "R1" }, { cause: "unknown_causality", finding_ids: [], extra: true }]) {
+		assert.throws(() => decodeReviewStatusV3({ ...escalatedStatusV7(), escalation }), /status\.escalation/);
+	}
+	for (const refuter_outcomes of [null, undefined, {}, [null], [{}], [{ finding_id: "R1", outcome: "future", proof: "proof" }], [{ finding_id: "", outcome: "refuted", proof: "proof" }], [{ finding_id: "R1", outcome: "refuted", proof: "" }], [{ finding_id: "R1", outcome: "refuted", proof: "proof", extra: true }]]) {
+		assert.throws(() => decodeReviewStatusV3({ ...escalatedStatusV7(), escalation: { cause: "missing_refuter_outcome", finding_ids: ["R1"], refuter_outcomes } }), /refuter_outcomes/);
+	}
+	for (const version of [3, 5, 6]) {
+		assert.throws(() => decodeReviewStatusV3({ ...escalatedStatusV7(), schema: `gentle-ai.review-integration.status/v${version}` }), /not allowed/);
+	}
+});

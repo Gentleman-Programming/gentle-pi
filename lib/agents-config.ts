@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
+import { THINKING_LEVELS as ROUTING_THINKING_LEVELS, type ThinkingLevel as RoutingThinkingLevel } from "./model-routing-authority.ts";
 
 // Gentle Agents configuration. Agent definitions are markdown files with YAML
 // frontmatter (the format gentle-ai installs) and runtime settings come from
@@ -13,16 +14,12 @@ export const AGENT_MODE = {
 
 export type AgentMode = (typeof AGENT_MODE)[keyof typeof AGENT_MODE];
 
-export const THINKING_LEVEL = {
-	OFF: "off",
-	MINIMAL: "minimal",
-	LOW: "low",
-	MEDIUM: "medium",
-	HIGH: "high",
-	XHIGH: "xhigh",
-} as const;
+export type ThinkingLevel = RoutingThinkingLevel;
 
-export type ThinkingLevel = (typeof THINKING_LEVEL)[keyof typeof THINKING_LEVEL];
+// Preserve the uppercase compatibility keys without maintaining a second level list.
+export const THINKING_LEVEL = Object.fromEntries(
+	ROUTING_THINKING_LEVELS.map((level) => [level.toUpperCase(), level]),
+) as { readonly [Level in ThinkingLevel as Uppercase<Level>]: Level };
 
 export const AGENT_SCOPE = {
 	GLOBAL: "global",
@@ -109,7 +106,7 @@ export interface Frontmatter {
 const DEFAULT_STALL_TIMEOUT_MS = 4 * 60_000;
 const DEFAULT_MAX_CONCURRENCY = 5;
 const DEFAULT_HISTORY_MAX_TASKS = 200;
-const THINKING_LEVELS = Object.values(THINKING_LEVEL) as string[];
+const THINKING_LEVELS: readonly string[] = ROUTING_THINKING_LEVELS;
 const AGENT_MODES = Object.values(AGENT_MODE) as string[];
 
 function unquote(value: string): string {
